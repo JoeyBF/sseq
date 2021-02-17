@@ -8,9 +8,9 @@ use fp::prime::ValidPrime;
 use fp::matrix::{Matrix, Basis, Subspace};
 use fp::vector::{FpVector, FpVectorT};
 
-
-use std::sync::{RwLock, RwLockWriteGuard, Mutex};
-use std::collections::{BTreeMap, HashMap};
+use std::sync::{RwLock, Mutex};
+// use std::sync::{RwLock, RwLockWriteGuard, Mutex};
+// use std::collections::{BTreeMap, HashMap};
 
 pub type Indecomposable = (i32, i32, usize);
 
@@ -87,7 +87,6 @@ impl DenseBigradedAlgebra {
             min_x,
             min_y,
             data : OnceBiVec::new(min_x),
-            named_indecomposables : RwLock::new(BTreeMap::new()),
             updated_bidegrees : Mutex::new(Vec::new()),
         }
     }
@@ -350,76 +349,76 @@ impl DenseBigradedAlgebra {
         // )
     }
 
-    pub fn update_indecomposable_decompositions(&self) -> Result<(), ()> {
-        let invalidated_bidegrees = self.updated_bidegrees.lock().unwrap();
-        for mut data in self.data.iter().flat_map(|x| x.iter()).map(|x| x.write().unwrap()) {
-            data.indecomposable_decompositions.drain_filter(|(vect, mono)|
-                invalidated_bidegrees.iter().any(|&(x,y)| mono.contains_bidegree(x, y) )
-            );
-        }
-        let prev_decompositions = {
-            let mut prev_decompositions = Vec::new();
-            for (x, r) in self.data.iter_enum() {
-                for (y, data) in r.iter_enum() {
-                    prev_decompositions.extend(
-                        data.read().unwrap().indecomposable_decompositions.iter()
-                        .map(|t| t.clone())
-                        .map(|(vec, mono)|
-                            (x, y, vec, mono)
-                        )
-                    );
-                }
-            }
-            prev_decompositions
-        };
-        let mut sv_left = FpVector::new(self.prime(), 0);
-        let mut sv_right = FpVector::new(self.prime(), 0);
-        let mut sv_out = FpVector::new(self.prime(), 0);
-        let new_indecs = self.new_named_indecomposables.lock().unwrap();
-        self.update_indecomposable_decompositions_helper(
-            &new_indecs,
-            prev_decompositions,
-            &mut sv_left, &mut sv_right, &mut sv_out
-        )
-    }
+    // pub fn update_indecomposable_decompositions(&self) -> Result<(), ()> {
+    //     let invalidated_bidegrees = self.updated_bidegrees.lock().unwrap();
+    //     for mut data in self.data.iter().flat_map(|x| x.iter()).map(|x| x.write().unwrap()) {
+    //         data.indecomposable_decompositions.drain_filter(|(vect, mono)|
+    //             invalidated_bidegrees.iter().any(|&(x,y)| mono.contains_bidegree(x, y) )
+    //         );
+    //     }
+    //     let prev_decompositions = {
+    //         let mut prev_decompositions = Vec::new();
+    //         for (x, r) in self.data.iter_enum() {
+    //             for (y, data) in r.iter_enum() {
+    //                 prev_decompositions.extend(
+    //                     data.read().unwrap().indecomposable_decompositions.iter()
+    //                     .map(|t| t.clone())
+    //                     .map(|(vec, mono)|
+    //                         (x, y, vec, mono)
+    //                     )
+    //                 );
+    //             }
+    //         }
+    //         prev_decompositions
+    //     };
+    //     let mut sv_left = FpVector::new(self.prime(), 0);
+    //     let mut sv_right = FpVector::new(self.prime(), 0);
+    //     let mut sv_out = FpVector::new(self.prime(), 0);
+    //     let new_indecs = self.new_named_indecomposables.lock().unwrap();
+    //     self.update_indecomposable_decompositions_helper(
+    //         &new_indecs,
+    //         prev_decompositions,
+    //         &mut sv_left, &mut sv_right, &mut sv_out
+    //     )
+    // }
 
-    fn update_indecomposable_decompositions_helper(&self, 
-        new_indecs : &[(i32, i32, usize)], 
-        prev_decompositions : Vec<(i32, i32, FpVector, Monomial)>,
-        sv_left : &mut FpVector, sv_right : &mut FpVector, 
-        sv_out : &mut FpVector
-    ) -> Result<(), ()> {
-        for (i, &(gen_x, gen_y, gen_idx)) in new_indecs.iter().enumerate() {
-            let mut new_decompositions = Vec::new();
-            for (dec_x, dec_y, dec_vec, mono) in &prev_decompositions {
-                let dec_x = *dec_x;
-                let dec_y = *dec_y;
-                let out_x = gen_x + dec_x;
-                let out_y = gen_y + dec_y;
-                let mut result = FpVector::new(self.prime(), self.dimension(out_x, out_y));
-                self.multiply_element_by_basis_element(
-                    &mut result, 1,
-                    dec_x, dec_y, &dec_vec, 
-                    gen_x, gen_y, gen_idx,
-                    sv_left, sv_right, sv_out
-                )?;
-                if result.is_zero(){
-                    continue;
-                }
-                let result_mono = mono.multiply(&Monomial::indecomposable(gen_x, gen_y, gen_idx));
-                self.data[out_x][out_y].write().unwrap().indecomposable_decompositions
-                    .push((result.clone(), result_mono.clone()));
-                new_decompositions.push((out_x, out_y, result, result_mono));
-            }
-            if !new_decompositions.is_empty() {
-                self.update_indecomposable_decompositions_helper(
-                    &new_indecs[i..], new_decompositions, 
-                    sv_left, sv_right, sv_out
-                )?;
-            }
-        }
-        Ok(())
-    }   
+    // fn update_indecomposable_decompositions_helper(&self, 
+    //     new_indecs : &[(i32, i32, usize)], 
+    //     prev_decompositions : Vec<(i32, i32, FpVector, Monomial)>,
+    //     sv_left : &mut FpVector, sv_right : &mut FpVector, 
+    //     sv_out : &mut FpVector
+    // ) -> Result<(), ()> {
+    //     for (i, &(gen_x, gen_y, gen_idx)) in new_indecs.iter().enumerate() {
+    //         let mut new_decompositions = Vec::new();
+    //         for (dec_x, dec_y, dec_vec, mono) in &prev_decompositions {
+    //             let dec_x = *dec_x;
+    //             let dec_y = *dec_y;
+    //             let out_x = gen_x + dec_x;
+    //             let out_y = gen_y + dec_y;
+    //             let mut result = FpVector::new(self.prime(), self.dimension(out_x, out_y));
+    //             self.multiply_element_by_basis_element(
+    //                 &mut result, 1,
+    //                 dec_x, dec_y, &dec_vec, 
+    //                 gen_x, gen_y, gen_idx,
+    //                 sv_left, sv_right, sv_out
+    //             )?;
+    //             if result.is_zero(){
+    //                 continue;
+    //             }
+    //             let result_mono = mono.multiply(&Monomial::indecomposable(gen_x, gen_y, gen_idx));
+    //             self.data[out_x][out_y].write().unwrap().indecomposable_decompositions
+    //                 .push((result.clone(), result_mono.clone()));
+    //             new_decompositions.push((out_x, out_y, result, result_mono));
+    //         }
+    //         if !new_decompositions.is_empty() {
+    //             self.update_indecomposable_decompositions_helper(
+    //                 &new_indecs[i..], new_decompositions, 
+    //                 sv_left, sv_right, sv_out
+    //             )?;
+    //         }
+    //     }
+    //     Ok(())
+    // }   
 }
 
 #[cfg(test)]
