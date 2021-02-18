@@ -201,7 +201,7 @@ fn algebra_expr(i: &str) -> IResult<&str, AlgebraParseNode> {
 fn module_generator(i: &str) -> IResult<&str, ModuleParseNode> {
     let (rest, (a, more_str)) = pair(alpha1, alphanumeric0)(i)?;
     if a.starts_with("Sq") || a.starts_with('P') || a.starts_with('Q') {
-        return Err(nom::Err::Error(("Module generators are not allowed to start with P, Q, or Sq", Char)));
+        return Err(nom::Err::Error(nom::error::Error::new("Module generators are not allowed to start with P, Q, or Sq", Char)));
     }
     Ok((rest, ModuleParseNode::ModuleBasisElt(a.to_string() + more_str)))
 }

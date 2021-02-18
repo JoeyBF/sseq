@@ -18,7 +18,7 @@ use nom::{
     bytes::complete::{is_not, take},
     character::complete::{char, digit1, space0, space1},
     combinator::map,
-    multi::separated_list,
+    multi::separated_list0,
     sequence::delimited,
     sequence::tuple,
     IResult,
@@ -554,7 +554,7 @@ impl<A: Algebra> FiniteDimensionalModule<A> {
         overwrite: bool,
     ) -> error::Result<()> {
         let algebra = self.algebra();
-        let lhs = tuple((
+        let mut lhs = tuple(( // `lhs` has to be mutable now, and I have no clue why.
             |e| algebra.string_to_generator(e),
             is_not("="),
             take(1usize),
@@ -578,7 +578,7 @@ impl<A: Algebra> FiniteDimensionalModule<A> {
         }
 
         // Need explicit type here
-        let (_, values) = <IResult<_, _>>::unwrap(separated_list(take(1usize), is_not("+"))(entry));
+        let (_, values) = <IResult<_, _>>::unwrap(separated_list0(take(1usize), is_not("+"))(entry));
 
         for value in values {
             let (_, (coef, gen)) = Self::take_element(value)
