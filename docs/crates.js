@@ -1,0 +1,10 @@
+window.ALL_CRATES = ['algebra',
+'bivec',
+'chart',
+'error',
+'fp',
+'once',
+'query',
+'saveload',
+'sseq',
+'thread-token','ext'];

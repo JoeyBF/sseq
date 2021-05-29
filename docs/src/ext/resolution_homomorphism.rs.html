@@ -1,10 +1,10 @@
-<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="Source of the Rust file `src/resolution_homomorphism.rs`."><meta name="keywords" content="rust, rustlang, rust-lang"><title>resolution_homomorphism.rs - source</title><link rel="stylesheet" type="text/css" href="../../normalize.css"><link rel="stylesheet" type="text/css" href="../../rustdoc.css" id="mainThemeStyle"><link rel="stylesheet" type="text/css" href="../../light.css"  id="themeStyle"><link rel="stylesheet" type="text/css" href="../../dark.css" disabled ><link rel="stylesheet" type="text/css" href="../../ayu.css" disabled ><script id="default-settings"></script><script src="../../storage.js"></script><noscript><link rel="stylesheet" href="../../noscript.css"></noscript><link rel="icon" type="image/svg+xml" href="../../favicon.svg">
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="Source of the Rust file `src/resolution_homomorphism.rs`."><meta name="keywords" content="rust, rustlang, rust-lang"><title>resolution_homomorphism.rs - source</title><link rel="stylesheet" type="text/css" href="../../normalize.css"><link rel="stylesheet" type="text/css" href="../../rustdoc.css" id="mainThemeStyle"><link rel="stylesheet" type="text/css" href="../../light.css"  id="themeStyle"><link rel="stylesheet" type="text/css" href="../../dark.css" disabled ><link rel="stylesheet" type="text/css" href="../../ayu.css" disabled ><script id="default-settings"></script><script src="../../storage.js"></script><script src="../../crates.js"></script><noscript><link rel="stylesheet" href="../../noscript.css"></noscript><link rel="icon" type="image/svg+xml" href="../../favicon.svg">
 <link rel="alternate icon" type="image/png" href="../../favicon-16x16.png">
-<link rel="alternate icon" type="image/png" href="../../favicon-32x32.png"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.10.2/dist/katex.min.css" integrity="sha384-yFRtMMDnQtDRO8rLpMIKrtPCD5jdktao2TV19YiZYWMDkUR5GQZR/NOVTdquEx1j" crossorigin="anonymous">
+<link rel="alternate icon" type="image/png" href="../../favicon-32x32.png"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.13.3/dist/katex.min.css" integrity="sha384-ThssJ7YtjywV52Gj4JE/1SQEDoMEckXyhkFVwaf4nDSm5OBlXeedVYjuuUd0Yua+" crossorigin="anonymous">
 <!-- The loading of KaTeX is deferred to speed up page rendering -->
-<script defer src="https://cdn.jsdelivr.net/npm/katex@0.10.2/dist/katex.min.js" integrity="sha384-9Nhn55MVVN0/4OFx7EE5kpFBPsEMZxKTCnA+4fqDmg12eCTqGi6+BB2LjY8brQxJ" crossorigin="anonymous"></script>
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.13.3/dist/katex.min.js" integrity="sha384-Bi8OWqMXO1ta+a4EPkZv7bYGIes7C3krGSZoTGNTAnAn5eYQc7IIXrJ/7ck1drAi" crossorigin="anonymous"></script>
 <!-- To automatically render math in text elements, include the auto-render extension: -->
-<script defer src="https://cdn.jsdelivr.net/npm/katex@0.10.2/dist/contrib/auto-render.min.js" integrity="sha384-kWPLUVMOks5AQFrykwIup5lo0m3iMkkHrD0uJ4H5cjeGihAutqP0yW0J6dpFiVkI" crossorigin="anonymous" onload="renderMathInElement(document.body);"></script>
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.13.3/dist/contrib/auto-render.min.js" integrity="sha384-vZTG03m+2yp6N6BNi5iM4rW4oIwk5DfcNdFfxkk9ZWpDriOkXX8voJBFrAO7MpVl" crossorigin="anonymous" onload="renderMathInElement(document.body);"></script>
 <script>
     document.addEventListener("DOMContentLoaded", function() {
         renderMathInElement(document.body, {
@@ -13,13 +13,19 @@
                 {left: "\\(", right: "\\)", display: false},
                 {left: "$", right: "$", display: false},
                 {left: "\\[", right: "\\]", display: true}
-            ]
+            ],
+            macros: {
+                "\\Ext": "\\operatorname{Ext}",
+                "\\Hom": "\\operatorname{Hom}",
+                "\\Sq": "\\operatorname{Sq}",
+                "\\F": "\\mathbb{F}",
+            }
         });
     });
 </script>
 
-<style type="text/css">#crate-search{background-image:url("../../down-arrow.svg");}</style></head><body class="rustdoc source"><!--[if lte IE 8]><div class="warning">This old browser is unsupported and will most likely display funky things.</div><![endif]--><nav class="sidebar"><div class="sidebar-menu">&#9776;</div><a href='../../ext/index.html'><div class='logo-container rust-logo'><img src='../../rust-logo.png' alt='logo'></div></a></nav><div class="theme-picker"><button id="theme-picker" aria-label="Pick another theme!" aria-haspopup="menu"><img src="../../brush.svg" width="18" alt="Pick another theme!"></button><div id="theme-choices" role="menu"></div></div><script src="../../theme.js"></script><nav class="sub"><form class="search-form"><div class="search-container"><div><select id="crate-search"><option value="All crates">All crates</option></select><input class="search-input" name="search" disabled autocomplete="off" spellcheck="false" placeholder="Click or press ‘S’ to search, ‘?’ for more options…" type="search"></div><button type="button" class="help-button">?</button>
-                <a id="settings-menu" href="../../settings.html"><img src="../../wheel.svg" width="18" alt="Change settings"></a></div></form></nav><section id="main" class="content"><pre class="line-numbers"><span id="1">  1</span>
+<style type="text/css">#crate-search{background-image:url("../../down-arrow.svg");}</style></head><body class="rustdoc source"><!--[if lte IE 11]><div class="warning">This old browser is unsupported and will most likely display funky things.</div><![endif]--><nav class="sidebar"><div class="sidebar-menu" role="button">&#9776;</div><a href='../../ext/index.html'><div class='logo-container rust-logo'><img src='../../rust-logo.png' alt='logo'></div></a></nav><div class="theme-picker"><button id="theme-picker" aria-label="Pick another theme!" aria-haspopup="menu"><img src="../../brush.svg" width="18" height="18" alt="Pick another theme!"></button><div id="theme-choices" role="menu"></div></div><nav class="sub"><form class="search-form"><div class="search-container"><div><select id="crate-search"><option value="All crates">All crates</option></select><input class="search-input" name="search" disabled autocomplete="off" spellcheck="false" placeholder="Click or press ‘S’ to search, ‘?’ for more options…" type="search"></div><button type="button" class="help-button">?</button>
+                <a id="settings-menu" href="../../settings.html"><img src="../../wheel.svg" width="18" height="18" alt="Change settings"></a></div></form></nav><section id="main" class="content"><div class="example-wrap"><pre class="line-numbers"><span id="1">  1</span>
 <span id="2">  2</span>
 <span id="3">  3</span>
 <span id="4">  4</span>
@@ -261,249 +267,539 @@
 <span id="240">240</span>
 <span id="241">241</span>
 <span id="242">242</span>
-</pre><div class="example-wrap"><pre class="rust ">
-<span class="attribute">#![<span class="ident">cfg_attr</span>(<span class="ident">rustfmt</span>, <span class="ident">rustfmt_skip</span>)]</span>
-<span class="kw">use</span> <span class="ident">std</span>::<span class="ident">sync</span>::{<span class="ident">Weak</span>, <span class="ident">Arc</span>};
+<span id="243">243</span>
+<span id="244">244</span>
+<span id="245">245</span>
+<span id="246">246</span>
+<span id="247">247</span>
+<span id="248">248</span>
+<span id="249">249</span>
+<span id="250">250</span>
+<span id="251">251</span>
+<span id="252">252</span>
+<span id="253">253</span>
+<span id="254">254</span>
+<span id="255">255</span>
+<span id="256">256</span>
+<span id="257">257</span>
+<span id="258">258</span>
+<span id="259">259</span>
+<span id="260">260</span>
+<span id="261">261</span>
+<span id="262">262</span>
+<span id="263">263</span>
+<span id="264">264</span>
+<span id="265">265</span>
+<span id="266">266</span>
+<span id="267">267</span>
+<span id="268">268</span>
+<span id="269">269</span>
+<span id="270">270</span>
+<span id="271">271</span>
+<span id="272">272</span>
+<span id="273">273</span>
+<span id="274">274</span>
+<span id="275">275</span>
+<span id="276">276</span>
+<span id="277">277</span>
+<span id="278">278</span>
+<span id="279">279</span>
+<span id="280">280</span>
+<span id="281">281</span>
+<span id="282">282</span>
+<span id="283">283</span>
+<span id="284">284</span>
+<span id="285">285</span>
+<span id="286">286</span>
+<span id="287">287</span>
+<span id="288">288</span>
+<span id="289">289</span>
+<span id="290">290</span>
+<span id="291">291</span>
+<span id="292">292</span>
+<span id="293">293</span>
+<span id="294">294</span>
+<span id="295">295</span>
+<span id="296">296</span>
+<span id="297">297</span>
+<span id="298">298</span>
+<span id="299">299</span>
+<span id="300">300</span>
+<span id="301">301</span>
+<span id="302">302</span>
+<span id="303">303</span>
+<span id="304">304</span>
+<span id="305">305</span>
+<span id="306">306</span>
+<span id="307">307</span>
+<span id="308">308</span>
+<span id="309">309</span>
+<span id="310">310</span>
+<span id="311">311</span>
+<span id="312">312</span>
+<span id="313">313</span>
+<span id="314">314</span>
+<span id="315">315</span>
+<span id="316">316</span>
+<span id="317">317</span>
+<span id="318">318</span>
+<span id="319">319</span>
+<span id="320">320</span>
+<span id="321">321</span>
+<span id="322">322</span>
+<span id="323">323</span>
+<span id="324">324</span>
+<span id="325">325</span>
+<span id="326">326</span>
+<span id="327">327</span>
+<span id="328">328</span>
+<span id="329">329</span>
+<span id="330">330</span>
+<span id="331">331</span>
+<span id="332">332</span>
+<span id="333">333</span>
+<span id="334">334</span>
+<span id="335">335</span>
+<span id="336">336</span>
+<span id="337">337</span>
+<span id="338">338</span>
+<span id="339">339</span>
+<span id="340">340</span>
+<span id="341">341</span>
+<span id="342">342</span>
+<span id="343">343</span>
+<span id="344">344</span>
+<span id="345">345</span>
+<span id="346">346</span>
+<span id="347">347</span>
+<span id="348">348</span>
+<span id="349">349</span>
+<span id="350">350</span>
+<span id="351">351</span>
+<span id="352">352</span>
+<span id="353">353</span>
+<span id="354">354</span>
+<span id="355">355</span>
+<span id="356">356</span>
+<span id="357">357</span>
+<span id="358">358</span>
+<span id="359">359</span>
+<span id="360">360</span>
+<span id="361">361</span>
+<span id="362">362</span>
+<span id="363">363</span>
+<span id="364">364</span>
+<span id="365">365</span>
+<span id="366">366</span>
+<span id="367">367</span>
+<span id="368">368</span>
+<span id="369">369</span>
+<span id="370">370</span>
+<span id="371">371</span>
+<span id="372">372</span>
+<span id="373">373</span>
+<span id="374">374</span>
+<span id="375">375</span>
+<span id="376">376</span>
+<span id="377">377</span>
+<span id="378">378</span>
+<span id="379">379</span>
+<span id="380">380</span>
+<span id="381">381</span>
+<span id="382">382</span>
+<span id="383">383</span>
+<span id="384">384</span>
+<span id="385">385</span>
+<span id="386">386</span>
+<span id="387">387</span>
+</pre><pre class="rust">
+<span class="kw">use</span> <span class="ident">std::sync::Arc</span>;
 
-<span class="kw">use</span> <span class="ident">once</span>::<span class="ident">OnceVec</span>;
-<span class="kw">use</span> <span class="ident">fp</span>::<span class="ident">vector</span>::{<span class="ident">FpVector</span>, <span class="ident">SliceMut</span>};
-<span class="kw">use</span> <span class="ident">fp</span>::<span class="ident">matrix</span>::<span class="ident">Matrix</span>;
-<span class="kw">use</span> <span class="kw">crate</span>::<span class="ident">algebra</span>::<span class="ident">SteenrodAlgebra</span>;
-<span class="kw">use</span> <span class="kw">crate</span>::<span class="ident">module</span>::<span class="ident">Module</span>;
-<span class="kw">use</span> <span class="kw">crate</span>::<span class="ident">module</span>::<span class="ident">homomorphism</span>::{<span class="ident">FreeModuleHomomorphism</span>, <span class="ident">ModuleHomomorphism</span>};
-<span class="kw">use</span> <span class="kw">crate</span>::<span class="ident">chain_complex</span>::{<span class="ident">AugmentedChainComplex</span>, <span class="ident">FreeChainComplex</span>};
-<span class="kw">use</span> <span class="kw">crate</span>::<span class="ident">resolution</span>::<span class="ident">ResolutionInner</span>;
-<span class="kw">use</span> <span class="kw">crate</span>::<span class="ident">CCC</span>; 
+<span class="kw">use</span> <span class="kw">crate</span><span class="ident">::chain_complex</span>::{<span class="ident">AugmentedChainComplex</span>, <span class="ident">FreeChainComplex</span>};
+<span class="kw">use</span> <span class="kw">crate</span><span class="ident">::resolution::Resolution</span>;
+<span class="kw">use</span> <span class="kw">crate</span><span class="ident">::CCC</span>;
+<span class="kw">use</span> <span class="ident">algebra::module::homomorphism</span>::{<span class="ident">FreeModuleHomomorphism</span>, <span class="ident">ModuleHomomorphism</span>};
+<span class="kw">use</span> <span class="ident">algebra::module::Module</span>;
+<span class="kw">use</span> <span class="ident">algebra::SteenrodAlgebra</span>;
+<span class="kw">use</span> <span class="ident">fp::matrix::Matrix</span>;
+<span class="kw">use</span> <span class="ident">fp::vector</span>::{<span class="ident">FpVector</span>, <span class="ident">SliceMut</span>};
+<span class="kw">use</span> <span class="ident">once::OnceBiVec</span>;
+
+<span class="attribute">#[<span class="ident">cfg</span>(<span class="ident">feature</span> <span class="op">=</span> <span class="string">&quot;concurrent&quot;</span>)]</span>
+<span class="kw">use</span> {
+    <span class="ident">crossbeam_channel</span>::{<span class="ident">unbounded</span>, <span class="ident">Receiver</span>},
+    <span class="ident">thread_token::TokenBucket</span>,
+};
 
 <span class="kw">pub</span> <span class="kw">struct</span> <span class="ident">ResolutionHomomorphism</span><span class="op">&lt;</span><span class="ident">CC1</span>, <span class="ident">CC2</span><span class="op">&gt;</span>
-<span class="kw">where</span> <span class="ident">CC1</span>: <span class="ident">FreeChainComplex</span><span class="op">&lt;</span><span class="ident">Algebra</span> <span class="op">=</span> <span class="op">&lt;</span><span class="ident">CC2</span>::<span class="ident">Module</span> <span class="kw">as</span> <span class="ident">Module</span><span class="op">&gt;</span>::<span class="ident">Algebra</span><span class="op">&gt;</span>,
-      <span class="ident">CC2</span>: <span class="ident">AugmentedChainComplex</span>
+<span class="kw">where</span>
+    <span class="ident">CC1</span>: <span class="ident">FreeChainComplex</span><span class="op">&lt;</span><span class="ident">Algebra</span> <span class="op">=</span> <span class="op">&lt;</span><span class="ident">CC2::Module</span> <span class="kw">as</span> <span class="ident">Module</span><span class="op">&gt;</span><span class="ident">::Algebra</span><span class="op">&gt;</span>,
+    <span class="ident">CC2</span>: <span class="ident">AugmentedChainComplex</span>,
 {
     <span class="attribute">#[<span class="ident">allow</span>(<span class="ident">dead_code</span>)]</span>
-    <span class="ident">name</span> : <span class="ident">String</span>,
-    <span class="kw">pub</span> <span class="ident">source</span> : <span class="ident">Weak</span><span class="op">&lt;</span><span class="ident">CC1</span><span class="op">&gt;</span>,
-    <span class="kw">pub</span> <span class="ident">target</span> : <span class="ident">Weak</span><span class="op">&lt;</span><span class="ident">CC2</span><span class="op">&gt;</span>,
-    <span class="ident">maps</span> : <span class="ident">OnceVec</span><span class="op">&lt;</span><span class="ident">FreeModuleHomomorphism</span><span class="op">&lt;</span><span class="ident">CC2</span>::<span class="ident">Module</span><span class="op">&gt;</span><span class="op">&gt;</span>,
-    <span class="kw">pub</span> <span class="ident">homological_degree_shift</span> : <span class="ident">u32</span>,
-    <span class="kw">pub</span> <span class="ident">internal_degree_shift</span> : <span class="ident">i32</span>
+    <span class="ident">name</span>: <span class="ident">String</span>,
+    <span class="kw">pub</span> <span class="ident">source</span>: <span class="ident">Arc</span><span class="op">&lt;</span><span class="ident">CC1</span><span class="op">&gt;</span>,
+    <span class="kw">pub</span> <span class="ident">target</span>: <span class="ident">Arc</span><span class="op">&lt;</span><span class="ident">CC2</span><span class="op">&gt;</span>,
+    <span class="ident">maps</span>: <span class="ident">OnceBiVec</span><span class="op">&lt;</span><span class="ident">FreeModuleHomomorphism</span><span class="op">&lt;</span><span class="ident">CC2::Module</span><span class="op">&gt;</span><span class="op">&gt;</span>,
+    <span class="kw">pub</span> <span class="ident">shift_s</span>: <span class="ident">u32</span>,
+    <span class="kw">pub</span> <span class="ident">shift_t</span>: <span class="ident">i32</span>,
 }
 
 <span class="kw">impl</span><span class="op">&lt;</span><span class="ident">CC1</span>, <span class="ident">CC2</span><span class="op">&gt;</span> <span class="ident">ResolutionHomomorphism</span><span class="op">&lt;</span><span class="ident">CC1</span>, <span class="ident">CC2</span><span class="op">&gt;</span>
-<span class="kw">where</span> <span class="ident">CC1</span>: <span class="ident">FreeChainComplex</span><span class="op">&lt;</span><span class="ident">Algebra</span> <span class="op">=</span> <span class="op">&lt;</span><span class="ident">CC2</span>::<span class="ident">Module</span> <span class="kw">as</span> <span class="ident">Module</span><span class="op">&gt;</span>::<span class="ident">Algebra</span><span class="op">&gt;</span>,
-      <span class="ident">CC2</span>: <span class="ident">AugmentedChainComplex</span>
+<span class="kw">where</span>
+    <span class="ident">CC1</span>: <span class="ident">FreeChainComplex</span><span class="op">&lt;</span><span class="ident">Algebra</span> <span class="op">=</span> <span class="op">&lt;</span><span class="ident">CC2::Module</span> <span class="kw">as</span> <span class="ident">Module</span><span class="op">&gt;</span><span class="ident">::Algebra</span><span class="op">&gt;</span>,
+    <span class="ident">CC2</span>: <span class="ident">AugmentedChainComplex</span>,
 {
     <span class="kw">pub</span> <span class="kw">fn</span> <span class="ident">new</span>(
-        <span class="ident">name</span> : <span class="ident">String</span>,
-        <span class="ident">source</span> : <span class="ident">Weak</span><span class="op">&lt;</span><span class="ident">CC1</span><span class="op">&gt;</span>, <span class="ident">target</span> : <span class="ident">Weak</span><span class="op">&lt;</span><span class="ident">CC2</span><span class="op">&gt;</span>,
-        <span class="ident">homological_degree_shift</span> : <span class="ident">u32</span>, <span class="ident">internal_degree_shift</span> : <span class="ident">i32</span>
+        <span class="ident">name</span>: <span class="ident">String</span>,
+        <span class="ident">source</span>: <span class="ident">Arc</span><span class="op">&lt;</span><span class="ident">CC1</span><span class="op">&gt;</span>,
+        <span class="ident">target</span>: <span class="ident">Arc</span><span class="op">&lt;</span><span class="ident">CC2</span><span class="op">&gt;</span>,
+        <span class="ident">shift_s</span>: <span class="ident">u32</span>,
+        <span class="ident">shift_t</span>: <span class="ident">i32</span>,
     ) <span class="op">-</span><span class="op">&gt;</span> <span class="self">Self</span> {
         <span class="self">Self</span> {
             <span class="ident">name</span>,
             <span class="ident">source</span>,
             <span class="ident">target</span>,
-            <span class="ident">maps</span> : <span class="ident">OnceVec</span>::<span class="ident">new</span>(),
-            <span class="ident">homological_degree_shift</span>,
-            <span class="ident">internal_degree_shift</span>
+            <span class="ident">maps</span>: <span class="ident">OnceBiVec::new</span>(<span class="ident">shift_s</span> <span class="kw">as</span> <span class="ident">i32</span>),
+            <span class="ident">shift_s</span>,
+            <span class="ident">shift_t</span>,
         }
     }
 
-    <span class="kw">fn</span> <span class="ident">get_map_ensure_length</span>(<span class="kw-2">&amp;</span><span class="self">self</span>, <span class="ident">output_homological_degree</span> : <span class="ident">u32</span>) <span class="op">-</span><span class="op">&gt;</span> <span class="kw-2">&amp;</span><span class="ident">FreeModuleHomomorphism</span><span class="op">&lt;</span><span class="ident">CC2</span>::<span class="ident">Module</span><span class="op">&gt;</span> {
-        <span class="kw">if</span> <span class="ident">output_homological_degree</span> <span class="kw">as</span> <span class="ident">usize</span> <span class="op">&gt;</span><span class="op">=</span> <span class="self">self</span>.<span class="ident">maps</span>.<span class="ident">len</span>() {
-            <span class="kw">let</span> <span class="ident">input_homological_degree</span> <span class="op">=</span> <span class="ident">output_homological_degree</span> <span class="op">+</span> <span class="self">self</span>.<span class="ident">homological_degree_shift</span>;
-            <span class="self">self</span>.<span class="ident">maps</span>.<span class="ident">push</span>(<span class="ident">FreeModuleHomomorphism</span>::<span class="ident">new</span>(<span class="self">self</span>.<span class="ident">source</span>.<span class="ident">upgrade</span>().<span class="ident">unwrap</span>().<span class="ident">module</span>(<span class="ident">input_homological_degree</span>), <span class="self">self</span>.<span class="ident">target</span>.<span class="ident">upgrade</span>().<span class="ident">unwrap</span>().<span class="ident">module</span>(<span class="ident">output_homological_degree</span>), <span class="self">self</span>.<span class="ident">internal_degree_shift</span>));
+    <span class="kw">pub</span> <span class="kw">fn</span> <span class="ident">from_class</span>(
+        <span class="ident">name</span>: <span class="ident">String</span>,
+        <span class="ident">source</span>: <span class="ident">Arc</span><span class="op">&lt;</span><span class="ident">CC1</span><span class="op">&gt;</span>,
+        <span class="ident">target</span>: <span class="ident">Arc</span><span class="op">&lt;</span><span class="ident">CC2</span><span class="op">&gt;</span>,
+        <span class="ident">shift_s</span>: <span class="ident">u32</span>,
+        <span class="ident">shift_t</span>: <span class="ident">i32</span>,
+        <span class="ident">class</span>: <span class="kw-2">&amp;</span>[<span class="ident">u32</span>],
+    ) <span class="op">-</span><span class="op">&gt;</span> <span class="self">Self</span> {
+        <span class="kw">let</span> <span class="ident">result</span> <span class="op">=</span> <span class="self">Self</span><span class="ident">::new</span>(<span class="ident">name</span>, <span class="ident">source</span>, <span class="ident">target</span>, <span class="ident">shift_s</span>, <span class="ident">shift_t</span>);
+
+        <span class="kw">let</span> <span class="ident">num_gens</span> <span class="op">=</span> <span class="ident">result</span>
+            .<span class="ident">source</span>
+            .<span class="ident">module</span>(<span class="ident">shift_s</span>)
+            .<span class="ident">number_of_gens_in_degree</span>(<span class="ident">shift_t</span>);
+        <span class="macro">assert_eq!</span>(<span class="ident">num_gens</span>, <span class="ident">class</span>.<span class="ident">len</span>());
+
+        <span class="kw">let</span> <span class="kw-2">mut</span> <span class="ident">matrix</span> <span class="op">=</span> <span class="ident">Matrix::new</span>(<span class="ident">result</span>.<span class="ident">source</span>.<span class="ident">prime</span>(), <span class="ident">num_gens</span>, <span class="number">1</span>);
+        <span class="kw">for</span> (<span class="ident">k</span>, <span class="kw-2">&amp;</span><span class="ident">v</span>) <span class="kw">in</span> <span class="ident">class</span>.<span class="ident">iter</span>().<span class="ident">enumerate</span>() {
+            <span class="ident">matrix</span>[<span class="ident">k</span>].<span class="ident">set_entry</span>(<span class="number">0</span>, <span class="ident">v</span>);
         }
-        <span class="kw-2">&amp;</span><span class="self">self</span>.<span class="ident">maps</span>[<span class="ident">output_homological_degree</span> <span class="kw">as</span> <span class="ident">usize</span>]
+
+        <span class="ident">result</span>.<span class="ident">extend_step</span>(<span class="ident">shift_s</span>, <span class="ident">shift_t</span>, <span class="prelude-val">Some</span>(<span class="kw-2">&amp;</span><span class="ident">matrix</span>));
+        <span class="ident">result</span>
     }
 
-    <span class="kw">pub</span> <span class="kw">fn</span> <span class="ident">get_map</span>(<span class="kw-2">&amp;</span><span class="self">self</span>, <span class="ident">output_homological_degree</span> : <span class="ident">u32</span>) <span class="op">-</span><span class="op">&gt;</span> <span class="kw-2">&amp;</span><span class="ident">FreeModuleHomomorphism</span><span class="op">&lt;</span><span class="ident">CC2</span>::<span class="ident">Module</span><span class="op">&gt;</span> {
-        <span class="kw-2">&amp;</span><span class="self">self</span>.<span class="ident">maps</span>[<span class="ident">output_homological_degree</span> <span class="kw">as</span> <span class="ident">usize</span>]
+    <span class="kw">fn</span> <span class="ident">get_map_ensure_length</span>(<span class="kw-2">&amp;</span><span class="self">self</span>, <span class="ident">input_s</span>: <span class="ident">u32</span>) <span class="op">-</span><span class="op">&gt;</span> <span class="kw-2">&amp;</span><span class="ident">FreeModuleHomomorphism</span><span class="op">&lt;</span><span class="ident">CC2::Module</span><span class="op">&gt;</span> {
+        <span class="self">self</span>.<span class="ident">maps</span>.<span class="ident">extend</span>(<span class="ident">input_s</span> <span class="kw">as</span> <span class="ident">i32</span>, <span class="op">|</span><span class="ident">input_s</span><span class="op">|</span> {
+            <span class="kw">let</span> <span class="ident">output_s</span> <span class="op">=</span> <span class="ident">input_s</span> <span class="kw">as</span> <span class="ident">u32</span> <span class="op">-</span> <span class="self">self</span>.<span class="ident">shift_s</span>;
+            <span class="ident">FreeModuleHomomorphism::new</span>(
+                <span class="self">self</span>.<span class="ident">source</span>.<span class="ident">module</span>(<span class="ident">input_s</span> <span class="kw">as</span> <span class="ident">u32</span>),
+                <span class="self">self</span>.<span class="ident">target</span>.<span class="ident">module</span>(<span class="ident">output_s</span>),
+                <span class="self">self</span>.<span class="ident">shift_t</span>,
+            )
+        });
+        <span class="kw-2">&amp;</span><span class="self">self</span>.<span class="ident">maps</span>[<span class="ident">input_s</span> <span class="kw">as</span> <span class="ident">i32</span>]
     }
 
-    <span class="kw">pub</span> <span class="kw">fn</span> <span class="ident">into_chain_maps</span>(<span class="self">self</span>) <span class="op">-</span><span class="op">&gt;</span> <span class="ident">Vec</span><span class="op">&lt;</span><span class="ident">FreeModuleHomomorphism</span><span class="op">&lt;</span><span class="ident">CC2</span>::<span class="ident">Module</span><span class="op">&gt;</span><span class="op">&gt;</span> {
-        <span class="self">self</span>.<span class="ident">maps</span>.<span class="ident">into_vec</span>()
+    <span class="kw">pub</span> <span class="kw">fn</span> <span class="ident">get_map</span>(<span class="kw-2">&amp;</span><span class="self">self</span>, <span class="ident">input_s</span>: <span class="ident">u32</span>) <span class="op">-</span><span class="op">&gt;</span> <span class="kw-2">&amp;</span><span class="ident">FreeModuleHomomorphism</span><span class="op">&lt;</span><span class="ident">CC2::Module</span><span class="op">&gt;</span> {
+        <span class="kw-2">&amp;</span><span class="self">self</span>.<span class="ident">maps</span>[<span class="ident">input_s</span> <span class="kw">as</span> <span class="ident">i32</span>]
     }
 
     <span class="doccomment">/// Extend the resolution homomorphism such that it is defined on degrees</span>
-    <span class="doccomment">/// (`source_homological_degree`, `source_degree`).</span>
-    <span class="kw">pub</span> <span class="kw">fn</span> <span class="ident">extend</span>(<span class="kw-2">&amp;</span><span class="self">self</span>, <span class="ident">source_homological_degree</span> : <span class="ident">u32</span>, <span class="ident">source_degree</span> : <span class="ident">i32</span>){
-        <span class="self">self</span>.<span class="ident">source</span>.<span class="ident">upgrade</span>().<span class="ident">unwrap</span>().<span class="ident">compute_through_bidegree</span>(<span class="ident">source_homological_degree</span>, <span class="ident">source_degree</span>);
-        <span class="self">self</span>.<span class="ident">target</span>.<span class="ident">upgrade</span>().<span class="ident">unwrap</span>().<span class="ident">compute_through_bidegree</span>(<span class="ident">source_homological_degree</span> <span class="op">-</span> <span class="self">self</span>.<span class="ident">homological_degree_shift</span>, <span class="ident">source_degree</span> <span class="op">-</span> <span class="self">self</span>.<span class="ident">internal_degree_shift</span>);
-        <span class="kw">for</span> <span class="ident">i</span> <span class="kw">in</span> <span class="self">self</span>.<span class="ident">homological_degree_shift</span> ..<span class="op">=</span> <span class="ident">source_homological_degree</span> {
-            <span class="kw">let</span> <span class="ident">f_cur</span> <span class="op">=</span> <span class="self">self</span>.<span class="ident">get_map_ensure_length</span>(<span class="ident">i</span> <span class="op">-</span> <span class="self">self</span>.<span class="ident">homological_degree_shift</span>);
-            <span class="kw">for</span> <span class="ident">j</span> <span class="kw">in</span> <span class="ident">f_cur</span>.<span class="ident">next_degree</span>() ..<span class="op">=</span> <span class="ident">source_degree</span> {
-                <span class="self">self</span>.<span class="ident">extend_step</span>(<span class="ident">i</span>, <span class="ident">j</span>, <span class="prelude-val">None</span>);
+    <span class="doccomment">/// (`max_s`, `max_t`).</span>
+    <span class="kw">pub</span> <span class="kw">fn</span> <span class="ident">extend</span>(<span class="kw-2">&amp;</span><span class="self">self</span>, <span class="ident">max_s</span>: <span class="ident">u32</span>, <span class="ident">max_t</span>: <span class="ident">i32</span>) {
+        <span class="self">self</span>.<span class="ident">extend_profile</span>(<span class="ident">max_s</span>, <span class="op">|</span><span class="ident">_s</span><span class="op">|</span> <span class="ident">max_t</span>)
+    }
+
+    <span class="attribute">#[<span class="ident">cfg</span>(<span class="ident">feature</span> <span class="op">=</span> <span class="string">&quot;concurrent&quot;</span>)]</span>
+    <span class="kw">pub</span> <span class="kw">fn</span> <span class="ident">extend_concurrent</span>(<span class="kw-2">&amp;</span><span class="self">self</span>, <span class="ident">max_s</span>: <span class="ident">u32</span>, <span class="ident">max_t</span>: <span class="ident">i32</span>, <span class="ident">bucket</span>: <span class="kw-2">&amp;</span><span class="ident">TokenBucket</span>) {
+        <span class="self">self</span>.<span class="ident">extend_profile_concurrent</span>(<span class="ident">max_s</span>, <span class="op">|</span><span class="ident">_s</span><span class="op">|</span> <span class="ident">max_t</span> <span class="kw">as</span> <span class="ident">i32</span>, <span class="ident">bucket</span>)
+    }
+
+    <span class="kw">pub</span> <span class="kw">fn</span> <span class="ident">extend_through_stem</span>(<span class="kw-2">&amp;</span><span class="self">self</span>, <span class="ident">max_s</span>: <span class="ident">u32</span>, <span class="ident">max_n</span>: <span class="ident">i32</span>) {
+        <span class="self">self</span>.<span class="ident">extend_profile</span>(<span class="ident">max_s</span>, <span class="op">|</span><span class="ident">s</span><span class="op">|</span> <span class="ident">max_n</span> <span class="op">+</span> <span class="ident">s</span> <span class="kw">as</span> <span class="ident">i32</span>)
+    }
+
+    <span class="attribute">#[<span class="ident">cfg</span>(<span class="ident">feature</span> <span class="op">=</span> <span class="string">&quot;concurrent&quot;</span>)]</span>
+    <span class="kw">pub</span> <span class="kw">fn</span> <span class="ident">extend_through_stem_concurrent</span>(<span class="kw-2">&amp;</span><span class="self">self</span>, <span class="ident">max_s</span>: <span class="ident">u32</span>, <span class="ident">max_n</span>: <span class="ident">i32</span>, <span class="ident">bucket</span>: <span class="kw-2">&amp;</span><span class="ident">TokenBucket</span>) {
+        <span class="self">self</span>.<span class="ident">extend_profile_concurrent</span>(<span class="ident">max_s</span>, <span class="op">|</span><span class="ident">s</span><span class="op">|</span> <span class="ident">max_n</span> <span class="op">+</span> <span class="ident">s</span> <span class="kw">as</span> <span class="ident">i32</span>, <span class="ident">bucket</span>)
+    }
+
+    <span class="kw">pub</span> <span class="kw">fn</span> <span class="ident">extend_all</span>(<span class="kw-2">&amp;</span><span class="self">self</span>) {
+        <span class="self">self</span>.<span class="ident">extend_profile</span>(
+            <span class="ident">std::cmp::min</span>(
+                <span class="self">self</span>.<span class="ident">target</span>.<span class="ident">next_homological_degree</span>() <span class="op">+</span> <span class="self">self</span>.<span class="ident">shift_s</span>,
+                <span class="self">self</span>.<span class="ident">source</span>.<span class="ident">next_homological_degree</span>(),
+            ) <span class="op">-</span> <span class="number">1</span>,
+            <span class="op">|</span><span class="ident">s</span><span class="op">|</span> {
+                <span class="ident">std::cmp::min</span>(
+                    <span class="self">self</span>.<span class="ident">target</span>.<span class="ident">module</span>(<span class="ident">s</span> <span class="op">-</span> <span class="self">self</span>.<span class="ident">shift_s</span>).<span class="ident">max_computed_degree</span>() <span class="op">+</span> <span class="self">self</span>.<span class="ident">shift_t</span>,
+                    <span class="self">self</span>.<span class="ident">source</span>.<span class="ident">module</span>(<span class="ident">s</span>).<span class="ident">max_computed_degree</span>(),
+                )
+            },
+        );
+    }
+
+    <span class="attribute">#[<span class="ident">cfg</span>(<span class="ident">feature</span> <span class="op">=</span> <span class="string">&quot;concurrent&quot;</span>)]</span>
+    <span class="kw">pub</span> <span class="kw">fn</span> <span class="ident">extend_all_concurrent</span>(<span class="kw-2">&amp;</span><span class="self">self</span>, <span class="ident">bucket</span>: <span class="kw-2">&amp;</span><span class="ident">TokenBucket</span>) {
+        <span class="self">self</span>.<span class="ident">extend_profile_concurrent</span>(
+            <span class="ident">std::cmp::min</span>(
+                <span class="self">self</span>.<span class="ident">target</span>.<span class="ident">next_homological_degree</span>() <span class="op">+</span> <span class="self">self</span>.<span class="ident">shift_s</span>,
+                <span class="self">self</span>.<span class="ident">source</span>.<span class="ident">next_homological_degree</span>(),
+            ) <span class="op">-</span> <span class="number">1</span>,
+            <span class="op">|</span><span class="ident">s</span><span class="op">|</span> {
+                <span class="ident">std::cmp::min</span>(
+                    <span class="self">self</span>.<span class="ident">target</span>.<span class="ident">module</span>(<span class="ident">s</span> <span class="op">-</span> <span class="self">self</span>.<span class="ident">shift_s</span>).<span class="ident">max_computed_degree</span>() <span class="op">+</span> <span class="self">self</span>.<span class="ident">shift_t</span>,
+                    <span class="self">self</span>.<span class="ident">source</span>.<span class="ident">module</span>(<span class="ident">s</span>).<span class="ident">max_computed_degree</span>(),
+                )
+            },
+            <span class="ident">bucket</span>,
+        );
+    }
+
+    <span class="kw">pub</span> <span class="kw">fn</span> <span class="ident">extend_profile</span>(<span class="kw-2">&amp;</span><span class="self">self</span>, <span class="ident">max_s</span>: <span class="ident">u32</span>, <span class="kw-2">mut</span> <span class="ident">max_t</span>: <span class="kw">impl</span> <span class="ident">FnMut</span>(<span class="ident">u32</span>) <span class="op">-</span><span class="op">&gt;</span> <span class="ident">i32</span>) {
+        <span class="self">self</span>.<span class="ident">get_map_ensure_length</span>(<span class="ident">max_s</span>);
+        <span class="kw">for</span> <span class="ident">s</span> <span class="kw">in</span> <span class="self">self</span>.<span class="ident">shift_s</span>..<span class="op">=</span><span class="ident">max_s</span> {
+            <span class="kw">let</span> <span class="ident">f_cur</span> <span class="op">=</span> <span class="self">self</span>.<span class="ident">get_map_ensure_length</span>(<span class="ident">s</span>);
+            <span class="kw">for</span> <span class="ident">t</span> <span class="kw">in</span> <span class="ident">f_cur</span>.<span class="ident">next_degree</span>()..<span class="op">=</span><span class="ident">max_t</span>(<span class="ident">s</span>) {
+                <span class="self">self</span>.<span class="ident">extend_step</span>(<span class="ident">s</span>, <span class="ident">t</span>, <span class="prelude-val">None</span>);
             }
         }
     }
 
-    <span class="kw">pub</span> <span class="kw">fn</span> <span class="ident">extend_step</span>(<span class="kw-2">&amp;</span><span class="self">self</span>, <span class="ident">input_homological_degree</span> : <span class="ident">u32</span>, <span class="ident">input_internal_degree</span> : <span class="ident">i32</span>, <span class="ident">extra_images</span> : <span class="prelude-ty">Option</span><span class="op">&lt;</span><span class="kw-2">&amp;</span><span class="ident">Matrix</span><span class="op">&gt;</span>){
-        <span class="kw">let</span> <span class="ident">output_homological_degree</span> <span class="op">=</span> <span class="ident">input_homological_degree</span> <span class="op">-</span> <span class="self">self</span>.<span class="ident">homological_degree_shift</span>;
-        <span class="kw">let</span> <span class="ident">output_internal_degree</span> <span class="op">=</span> <span class="ident">input_internal_degree</span> <span class="op">-</span> <span class="self">self</span>.<span class="ident">internal_degree_shift</span>;
-        <span class="self">self</span>.<span class="ident">target</span>.<span class="ident">upgrade</span>().<span class="ident">unwrap</span>().<span class="ident">compute_through_bidegree</span>(<span class="ident">output_homological_degree</span>, <span class="ident">output_internal_degree</span>);
+    <span class="attribute">#[<span class="ident">cfg</span>(<span class="ident">feature</span> <span class="op">=</span> <span class="string">&quot;concurrent&quot;</span>)]</span>
+    <span class="kw">pub</span> <span class="kw">fn</span> <span class="ident">extend_profile_concurrent</span>(
+        <span class="kw-2">&amp;</span><span class="self">self</span>,
+        <span class="ident">max_s</span>: <span class="ident">u32</span>,
+        <span class="ident">max_t</span>: <span class="kw">impl</span> <span class="ident">Fn</span>(<span class="ident">u32</span>) <span class="op">-</span><span class="op">&gt;</span> <span class="ident">i32</span> <span class="op">+</span> <span class="ident">Send</span> <span class="op">+</span> <span class="ident">Clone</span>,
+        <span class="ident">bucket</span>: <span class="kw-2">&amp;</span><span class="ident">TokenBucket</span>,
+    ) {
+        <span class="self">self</span>.<span class="ident">get_map_ensure_length</span>(<span class="ident">max_s</span>);
+        <span class="ident">crossbeam_utils::thread::scope</span>(<span class="op">|</span><span class="ident">scope</span><span class="op">|</span> {
+            <span class="kw">let</span> <span class="kw-2">mut</span> <span class="ident">last_receiver</span>: <span class="prelude-ty">Option</span><span class="op">&lt;</span><span class="ident">Receiver</span><span class="op">&lt;</span>()<span class="op">&gt;</span><span class="op">&gt;</span> <span class="op">=</span> <span class="prelude-val">None</span>;
+            <span class="kw">for</span> <span class="ident">s</span> <span class="kw">in</span> <span class="self">self</span>.<span class="ident">shift_s</span>..<span class="op">=</span><span class="ident">max_s</span> {
+                <span class="kw">let</span> (<span class="ident">sender</span>, <span class="ident">receiver</span>) <span class="op">=</span> <span class="ident">unbounded</span>();
+                <span class="kw">let</span> <span class="ident">max_t</span> <span class="op">=</span> <span class="ident">max_t</span>.<span class="ident">clone</span>();
+                <span class="ident">scope</span>
+                    .<span class="ident">builder</span>()
+                    .<span class="ident">name</span>(<span class="macro">format!</span>(<span class="string">&quot;s = {}&quot;</span>, <span class="ident">s</span>))
+                    .<span class="ident">spawn</span>(<span class="kw">move</span> <span class="op">|</span><span class="kw">_</span><span class="op">|</span> {
+                        <span class="kw">let</span> <span class="kw-2">mut</span> <span class="ident">token</span> <span class="op">=</span> <span class="ident">bucket</span>.<span class="ident">take_token</span>();
+                        <span class="ident">sender</span>.<span class="ident">send</span>(()).<span class="ident">ok</span>();
+                        <span class="kw">for</span> <span class="ident">t</span> <span class="kw">in</span> <span class="self">self</span>.<span class="ident">source</span>.<span class="ident">min_degree</span>()..<span class="op">=</span><span class="ident">max_t</span>(<span class="ident">s</span>) {
+                            <span class="ident">token</span> <span class="op">=</span> <span class="ident">bucket</span>.<span class="ident">recv_or_release</span>(<span class="ident">token</span>, <span class="kw-2">&amp;</span><span class="ident">last_receiver</span>);
+                            <span class="self">self</span>.<span class="ident">extend_step</span>(<span class="ident">s</span>, <span class="ident">t</span>, <span class="prelude-val">None</span>);
+                            <span class="ident">sender</span>.<span class="ident">send</span>(()).<span class="ident">ok</span>();
+                        }
+                    })
+                    .<span class="ident">unwrap</span>();
+                <span class="ident">last_receiver</span> <span class="op">=</span> <span class="prelude-val">Some</span>(<span class="ident">receiver</span>);
+            }
+        })
+        .<span class="ident">unwrap</span>();
+    }
 
-        <span class="kw">let</span> <span class="ident">f_cur</span> <span class="op">=</span> <span class="self">self</span>.<span class="ident">get_map_ensure_length</span>(<span class="ident">output_homological_degree</span>);
-        <span class="kw">if</span> <span class="ident">input_internal_degree</span> <span class="op">&lt;</span> <span class="ident">f_cur</span>.<span class="ident">next_degree</span>() {
-            <span class="macro">assert</span><span class="macro">!</span>(<span class="ident">extra_images</span>.<span class="ident">is_none</span>());
+    <span class="kw">pub</span> <span class="kw">fn</span> <span class="ident">extend_step</span>(<span class="kw-2">&amp;</span><span class="self">self</span>, <span class="ident">input_s</span>: <span class="ident">u32</span>, <span class="ident">input_t</span>: <span class="ident">i32</span>, <span class="ident">extra_images</span>: <span class="prelude-ty">Option</span><span class="op">&lt;</span><span class="kw-2">&amp;</span><span class="ident">Matrix</span><span class="op">&gt;</span>) {
+        <span class="kw">let</span> <span class="ident">output_s</span> <span class="op">=</span> <span class="ident">input_s</span> <span class="op">-</span> <span class="self">self</span>.<span class="ident">shift_s</span>;
+        <span class="kw">let</span> <span class="ident">output_t</span> <span class="op">=</span> <span class="ident">input_t</span> <span class="op">-</span> <span class="self">self</span>.<span class="ident">shift_t</span>;
+        <span class="macro">assert!</span>(<span class="self">self</span>.<span class="ident">target</span>.<span class="ident">has_computed_bidegree</span>(<span class="ident">output_s</span>, <span class="ident">output_t</span>));
+        <span class="macro">assert!</span>(<span class="self">self</span>.<span class="ident">source</span>.<span class="ident">has_computed_bidegree</span>(<span class="ident">input_s</span>, <span class="ident">input_t</span>));
+        <span class="macro">assert!</span>(<span class="ident">input_s</span> <span class="op">&gt;</span><span class="op">=</span> <span class="self">self</span>.<span class="ident">shift_s</span>);
+
+        <span class="kw">let</span> <span class="ident">f_cur</span> <span class="op">=</span> <span class="self">self</span>.<span class="ident">get_map_ensure_length</span>(<span class="ident">input_s</span>);
+        <span class="kw">if</span> <span class="ident">input_t</span> <span class="op">&lt;</span> <span class="ident">f_cur</span>.<span class="ident">next_degree</span>() {
+            <span class="macro">assert!</span>(<span class="ident">extra_images</span>.<span class="ident">is_none</span>());
             <span class="kw">return</span>;
         }
-        <span class="kw">let</span> <span class="kw-2">mut</span> <span class="ident">outputs</span> <span class="op">=</span> <span class="self">self</span>.<span class="ident">extend_step_helper</span>(<span class="ident">input_homological_degree</span>, <span class="ident">input_internal_degree</span>, <span class="ident">extra_images</span>);
-        <span class="kw">let</span> <span class="ident">lock</span> <span class="op">=</span> <span class="ident">f_cur</span>.<span class="ident">lock</span>();
-        <span class="ident">f_cur</span>.<span class="ident">add_generators_from_matrix_rows</span>(<span class="kw-2">&amp;</span><span class="ident">lock</span>, <span class="ident">input_internal_degree</span>, <span class="ident">outputs</span>.<span class="ident">as_slice_mut</span>());
-    }
 
-    <span class="kw">fn</span> <span class="ident">extend_step_helper</span>(<span class="kw-2">&amp;</span><span class="self">self</span>, <span class="ident">input_homological_degree</span> : <span class="ident">u32</span>, <span class="ident">input_internal_degree</span> : <span class="ident">i32</span>, <span class="kw-2">mut</span> <span class="ident">extra_images</span> : <span class="prelude-ty">Option</span><span class="op">&lt;</span><span class="kw-2">&amp;</span><span class="ident">Matrix</span><span class="op">&gt;</span>) <span class="op">-</span><span class="op">&gt;</span> <span class="ident">Matrix</span> {
-        <span class="kw">let</span> <span class="ident">source</span> <span class="op">=</span> <span class="self">self</span>.<span class="ident">source</span>.<span class="ident">upgrade</span>().<span class="ident">unwrap</span>();
-        <span class="kw">let</span> <span class="ident">target</span> <span class="op">=</span> <span class="self">self</span>.<span class="ident">target</span>.<span class="ident">upgrade</span>().<span class="ident">unwrap</span>();
-        <span class="kw">let</span> <span class="ident">p</span> <span class="op">=</span> <span class="ident">source</span>.<span class="ident">prime</span>();
-        <span class="macro">assert</span><span class="macro">!</span>(<span class="ident">input_homological_degree</span> <span class="op">&gt;</span><span class="op">=</span> <span class="self">self</span>.<span class="ident">homological_degree_shift</span>);
-        <span class="kw">let</span> <span class="ident">output_homological_degree</span> <span class="op">=</span> <span class="ident">input_homological_degree</span> <span class="op">-</span> <span class="self">self</span>.<span class="ident">homological_degree_shift</span>;
-        <span class="kw">let</span> <span class="ident">output_internal_degree</span> <span class="op">=</span> <span class="ident">input_internal_degree</span> <span class="op">-</span> <span class="self">self</span>.<span class="ident">internal_degree_shift</span>;        
-        <span class="kw">let</span> <span class="ident">f_cur</span> <span class="op">=</span> <span class="self">self</span>.<span class="ident">get_map</span>(<span class="ident">output_homological_degree</span>);
-        <span class="kw">let</span> <span class="ident">num_gens</span> <span class="op">=</span> <span class="ident">f_cur</span>.<span class="ident">source</span>().<span class="ident">number_of_gens_in_degree</span>(<span class="ident">input_internal_degree</span>);
-        <span class="kw">let</span> <span class="ident">fx_dimension</span> <span class="op">=</span> <span class="ident">f_cur</span>.<span class="ident">target</span>().<span class="ident">dimension</span>(<span class="ident">output_internal_degree</span>);
-        <span class="kw">let</span> <span class="kw-2">mut</span> <span class="ident">outputs_matrix</span> <span class="op">=</span> <span class="ident">Matrix</span>::<span class="ident">new</span>(<span class="ident">p</span>, <span class="ident">num_gens</span>, <span class="ident">fx_dimension</span>);
+        <span class="kw">let</span> <span class="ident">p</span> <span class="op">=</span> <span class="self">self</span>.<span class="ident">source</span>.<span class="ident">prime</span>();
+
+        <span class="kw">let</span> <span class="ident">num_gens</span> <span class="op">=</span> <span class="ident">f_cur</span>.<span class="ident">source</span>().<span class="ident">number_of_gens_in_degree</span>(<span class="ident">input_t</span>);
+        <span class="kw">let</span> <span class="ident">fx_dimension</span> <span class="op">=</span> <span class="ident">f_cur</span>.<span class="ident">target</span>().<span class="ident">dimension</span>(<span class="ident">output_t</span>);
+
+        <span class="kw">let</span> <span class="kw-2">mut</span> <span class="ident">outputs</span> <span class="op">=</span> <span class="macro">vec!</span>[<span class="ident">FpVector::new</span>(<span class="ident">p</span>, <span class="ident">fx_dimension</span>); <span class="ident">num_gens</span>];
         <span class="kw">if</span> <span class="ident">num_gens</span> <span class="op">=</span><span class="op">=</span> <span class="number">0</span> <span class="op">|</span><span class="op">|</span> <span class="ident">fx_dimension</span> <span class="op">=</span><span class="op">=</span> <span class="number">0</span> {
-            <span class="kw">return</span> <span class="ident">outputs_matrix</span>;
+            <span class="ident">f_cur</span>.<span class="ident">add_generators_from_rows</span>(<span class="ident">input_t</span>, <span class="ident">outputs</span>);
+            <span class="kw">return</span>;
         }
-        <span class="kw">if</span> <span class="ident">output_homological_degree</span> <span class="op">=</span><span class="op">=</span> <span class="number">0</span> {
+        <span class="kw">if</span> <span class="ident">output_s</span> <span class="op">=</span><span class="op">=</span> <span class="number">0</span> {
             <span class="kw">if</span> <span class="kw">let</span> <span class="prelude-val">Some</span>(<span class="ident">extra_images_matrix</span>) <span class="op">=</span> <span class="ident">extra_images</span> {
-                <span class="kw">let</span> <span class="ident">target_chain_map</span> <span class="op">=</span> <span class="ident">target</span>.<span class="ident">chain_map</span>(<span class="ident">output_homological_degree</span>);
-                <span class="kw">let</span> <span class="ident">target_cc_dimension</span> <span class="op">=</span> <span class="ident">target_chain_map</span>.<span class="ident">target</span>().<span class="ident">dimension</span>(<span class="ident">output_internal_degree</span>);
-                <span class="macro">assert</span><span class="macro">!</span>(<span class="ident">target_cc_dimension</span> <span class="op">=</span><span class="op">=</span> <span class="ident">extra_images_matrix</span>.<span class="ident">columns</span>());
+                <span class="kw">let</span> <span class="ident">target_chain_map</span> <span class="op">=</span> <span class="self">self</span>.<span class="ident">target</span>.<span class="ident">chain_map</span>(<span class="ident">output_s</span>);
+                <span class="kw">let</span> <span class="ident">target_cc_dimension</span> <span class="op">=</span> <span class="ident">target_chain_map</span>.<span class="ident">target</span>().<span class="ident">dimension</span>(<span class="ident">output_t</span>);
+                <span class="macro">assert!</span>(<span class="ident">target_cc_dimension</span> <span class="op">=</span><span class="op">=</span> <span class="ident">extra_images_matrix</span>.<span class="ident">columns</span>());
 
-                <span class="ident">target_chain_map</span>.<span class="ident">compute_kernels_and_quasi_inverses_through_degree</span>(<span class="ident">output_internal_degree</span>);
-                <span class="macro">assert</span><span class="macro">!</span>(<span class="ident">num_gens</span> <span class="op">=</span><span class="op">=</span> <span class="ident">extra_images_matrix</span>.<span class="ident">rows</span>(),
+                <span class="ident">target_chain_map</span>.<span class="ident">compute_auxiliary_data_through_degree</span>(<span class="ident">output_t</span>);
+                <span class="macro">assert!</span>(
+                    <span class="ident">num_gens</span> <span class="op">=</span><span class="op">=</span> <span class="ident">extra_images_matrix</span>.<span class="ident">rows</span>(),
                     <span class="string">&quot;num_gens : {} greater than rows : {} hom_deg : {}, int_deg : {}&quot;</span>,
-                    <span class="ident">num_gens</span>, <span class="ident">extra_images_matrix</span>.<span class="ident">rows</span>(), <span class="ident">input_homological_degree</span>, <span class="ident">input_internal_degree</span>);
-                <span class="kw">for</span> <span class="ident">k</span> <span class="kw">in</span> <span class="number">0</span> .. <span class="ident">num_gens</span> {
-                    <span class="ident">target_chain_map</span>.<span class="ident">apply_quasi_inverse</span>(<span class="ident">outputs_matrix</span>[<span class="ident">k</span>].<span class="ident">as_slice_mut</span>(), <span class="ident">output_internal_degree</span>, <span class="ident">extra_images_matrix</span>[<span class="ident">k</span>].<span class="ident">as_slice</span>());
+                    <span class="ident">num_gens</span>,
+                    <span class="ident">extra_images_matrix</span>.<span class="ident">rows</span>(),
+                    <span class="ident">input_s</span>,
+                    <span class="ident">input_t</span>
+                );
+                <span class="kw">for</span> <span class="ident">k</span> <span class="kw">in</span> <span class="number">0</span>..<span class="ident">num_gens</span> {
+                    <span class="ident">target_chain_map</span>.<span class="ident">apply_quasi_inverse</span>(
+                        <span class="ident">outputs</span>[<span class="ident">k</span>].<span class="ident">as_slice_mut</span>(),
+                        <span class="ident">output_t</span>,
+                        <span class="ident">extra_images_matrix</span>[<span class="ident">k</span>].<span class="ident">as_slice</span>(),
+                    );
                 }
             }
-            <span class="kw">return</span> <span class="ident">outputs_matrix</span>;            
+            <span class="ident">f_cur</span>.<span class="ident">add_generators_from_rows</span>(<span class="ident">input_t</span>, <span class="ident">outputs</span>);
+            <span class="kw">return</span>;
         }
-        <span class="kw">let</span> <span class="ident">d_source</span> <span class="op">=</span> <span class="ident">source</span>.<span class="ident">differential</span>(<span class="ident">input_homological_degree</span>);
-        <span class="kw">let</span> <span class="ident">d_target</span> <span class="op">=</span> <span class="ident">target</span>.<span class="ident">differential</span>(<span class="ident">output_homological_degree</span>);
-        <span class="kw">let</span> <span class="ident">f_prev</span> <span class="op">=</span> <span class="self">self</span>.<span class="ident">get_map</span>(<span class="ident">output_homological_degree</span> <span class="op">-</span> <span class="number">1</span>);
-        <span class="macro">assert</span><span class="macro">!</span>(<span class="ident">Arc</span>::<span class="ident">ptr_eq</span>(<span class="kw-2">&amp;</span><span class="ident">d_source</span>.<span class="ident">source</span>(), <span class="kw-2">&amp;</span><span class="ident">f_cur</span>.<span class="ident">source</span>()));
-        <span class="macro">assert</span><span class="macro">!</span>(<span class="ident">Arc</span>::<span class="ident">ptr_eq</span>(<span class="kw-2">&amp;</span><span class="ident">d_source</span>.<span class="ident">target</span>(), <span class="kw-2">&amp;</span><span class="ident">f_prev</span>.<span class="ident">source</span>()));
-        <span class="macro">assert</span><span class="macro">!</span>(<span class="ident">Arc</span>::<span class="ident">ptr_eq</span>(<span class="kw-2">&amp;</span><span class="ident">d_target</span>.<span class="ident">source</span>(), <span class="kw-2">&amp;</span><span class="ident">f_cur</span>.<span class="ident">target</span>()));
-        <span class="macro">assert</span><span class="macro">!</span>(<span class="ident">Arc</span>::<span class="ident">ptr_eq</span>(<span class="kw-2">&amp;</span><span class="ident">d_target</span>.<span class="ident">target</span>(), <span class="kw-2">&amp;</span><span class="ident">f_prev</span>.<span class="ident">target</span>()));
-        <span class="kw">let</span> <span class="ident">fdx_dimension</span> <span class="op">=</span> <span class="ident">f_prev</span>.<span class="ident">target</span>().<span class="ident">dimension</span>(<span class="ident">output_internal_degree</span>);
-        <span class="kw">let</span> <span class="kw-2">mut</span> <span class="ident">fdx_vector</span> <span class="op">=</span> <span class="ident">FpVector</span>::<span class="ident">new</span>(<span class="ident">p</span>, <span class="ident">fdx_dimension</span>);
+        <span class="kw">let</span> <span class="ident">d_source</span> <span class="op">=</span> <span class="self">self</span>.<span class="ident">source</span>.<span class="ident">differential</span>(<span class="ident">input_s</span>);
+        <span class="kw">let</span> <span class="ident">d_target</span> <span class="op">=</span> <span class="self">self</span>.<span class="ident">target</span>.<span class="ident">differential</span>(<span class="ident">output_s</span>);
+        <span class="kw">let</span> <span class="ident">f_prev</span> <span class="op">=</span> <span class="self">self</span>.<span class="ident">get_map</span>(<span class="ident">input_s</span> <span class="op">-</span> <span class="number">1</span>);
+        <span class="macro">assert!</span>(<span class="ident">Arc::ptr_eq</span>(<span class="kw-2">&amp;</span><span class="ident">d_source</span>.<span class="ident">source</span>(), <span class="kw-2">&amp;</span><span class="ident">f_cur</span>.<span class="ident">source</span>()));
+        <span class="macro">assert!</span>(<span class="ident">Arc::ptr_eq</span>(<span class="kw-2">&amp;</span><span class="ident">d_source</span>.<span class="ident">target</span>(), <span class="kw-2">&amp;</span><span class="ident">f_prev</span>.<span class="ident">source</span>()));
+        <span class="macro">assert!</span>(<span class="ident">Arc::ptr_eq</span>(<span class="kw-2">&amp;</span><span class="ident">d_target</span>.<span class="ident">source</span>(), <span class="kw-2">&amp;</span><span class="ident">f_cur</span>.<span class="ident">target</span>()));
+        <span class="macro">assert!</span>(<span class="ident">Arc::ptr_eq</span>(<span class="kw-2">&amp;</span><span class="ident">d_target</span>.<span class="ident">target</span>(), <span class="kw-2">&amp;</span><span class="ident">f_prev</span>.<span class="ident">target</span>()));
+        <span class="kw">let</span> <span class="ident">fdx_dimension</span> <span class="op">=</span> <span class="ident">f_prev</span>.<span class="ident">target</span>().<span class="ident">dimension</span>(<span class="ident">output_t</span>);
+        <span class="kw">let</span> <span class="kw-2">mut</span> <span class="ident">fdx_vector</span> <span class="op">=</span> <span class="ident">FpVector::new</span>(<span class="ident">p</span>, <span class="ident">fdx_dimension</span>);
         <span class="kw">let</span> <span class="kw-2">mut</span> <span class="ident">extra_image_row</span> <span class="op">=</span> <span class="number">0</span>;
-        <span class="kw">for</span> <span class="ident">k</span> <span class="kw">in</span> <span class="number">0</span> .. <span class="ident">num_gens</span> {
-            <span class="kw">let</span> <span class="ident">dx_vector</span> <span class="op">=</span> <span class="ident">d_source</span>.<span class="ident">output</span>(<span class="ident">input_internal_degree</span>, <span class="ident">k</span>);
+        <span class="kw">for</span> (<span class="ident">k</span>, <span class="ident">output_row</span>) <span class="kw">in</span> <span class="ident">outputs</span>.<span class="ident">iter_mut</span>().<span class="ident">enumerate</span>() {
+            <span class="kw">let</span> <span class="ident">dx_vector</span> <span class="op">=</span> <span class="ident">d_source</span>.<span class="ident">output</span>(<span class="ident">input_t</span>, <span class="ident">k</span>);
             <span class="kw">if</span> <span class="ident">dx_vector</span>.<span class="ident">is_zero</span>() {
-                <span class="kw">let</span> <span class="ident">target_chain_map</span> <span class="op">=</span> <span class="ident">target</span>.<span class="ident">chain_map</span>(<span class="ident">output_homological_degree</span>);
-                <span class="kw">let</span> <span class="ident">target_cc_dimension</span> <span class="op">=</span> <span class="ident">target_chain_map</span>.<span class="ident">target</span>().<span class="ident">dimension</span>(<span class="ident">output_internal_degree</span>);
+                <span class="kw">let</span> <span class="ident">target_chain_map</span> <span class="op">=</span> <span class="self">self</span>.<span class="ident">target</span>.<span class="ident">chain_map</span>(<span class="ident">output_s</span>);
+                <span class="kw">let</span> <span class="ident">target_cc_dimension</span> <span class="op">=</span> <span class="ident">target_chain_map</span>.<span class="ident">target</span>().<span class="ident">dimension</span>(<span class="ident">output_t</span>);
                 <span class="kw">if</span> <span class="kw">let</span> <span class="prelude-val">Some</span>(<span class="ident">extra_images_matrix</span>) <span class="op">=</span> <span class="kw-2">&amp;</span><span class="ident">extra_images</span> {
-                    <span class="macro">assert</span><span class="macro">!</span>(<span class="ident">target_cc_dimension</span> <span class="op">=</span><span class="op">=</span> <span class="ident">extra_images_matrix</span>.<span class="ident">columns</span>());
+                    <span class="macro">assert!</span>(<span class="ident">target_cc_dimension</span> <span class="op">=</span><span class="op">=</span> <span class="ident">extra_images_matrix</span>.<span class="ident">columns</span>());
                 }
 
-                <span class="kw">let</span> <span class="ident">extra_image_matrix</span> <span class="op">=</span> <span class="ident">extra_images</span>.<span class="ident">as_mut</span>().<span class="ident">expect</span>(<span class="string">&quot;Missing extra image rows&quot;</span>);
-                <span class="ident">target_chain_map</span>.<span class="ident">compute_kernels_and_quasi_inverses_through_degree</span>(<span class="ident">output_internal_degree</span>);
-                <span class="ident">target_chain_map</span>.<span class="ident">apply_quasi_inverse</span>(<span class="ident">outputs_matrix</span>[<span class="ident">k</span>].<span class="ident">as_slice_mut</span>(), <span class="ident">output_internal_degree</span>, <span class="ident">extra_image_matrix</span>[<span class="ident">extra_image_row</span>].<span class="ident">as_slice</span>());
+                <span class="kw">let</span> <span class="ident">extra_image_matrix</span> <span class="op">=</span> <span class="ident">extra_images</span>.<span class="ident">as_ref</span>().<span class="ident">expect</span>(<span class="string">&quot;Missing extra image rows&quot;</span>);
+                <span class="ident">target_chain_map</span>.<span class="ident">compute_auxiliary_data_through_degree</span>(<span class="ident">output_t</span>);
+                <span class="ident">target_chain_map</span>.<span class="ident">apply_quasi_inverse</span>(
+                    <span class="ident">output_row</span>.<span class="ident">as_slice_mut</span>(),
+                    <span class="ident">output_t</span>,
+                    <span class="ident">extra_image_matrix</span>[<span class="ident">extra_image_row</span>].<span class="ident">as_slice</span>(),
+                );
                 <span class="ident">extra_image_row</span> <span class="op">+</span><span class="op">=</span> <span class="number">1</span>;
             } <span class="kw">else</span> {
-                <span class="ident">d_target</span>.<span class="ident">compute_kernels_and_quasi_inverses_through_degree</span>(<span class="ident">output_internal_degree</span>);
-                <span class="ident">f_prev</span>.<span class="ident">apply</span>(<span class="ident">fdx_vector</span>.<span class="ident">as_slice_mut</span>(), <span class="number">1</span>, <span class="ident">input_internal_degree</span>, <span class="ident">dx_vector</span>.<span class="ident">as_slice</span>());
-                <span class="ident">d_target</span>.<span class="ident">apply_quasi_inverse</span>(<span class="ident">outputs_matrix</span>[<span class="ident">k</span>].<span class="ident">as_slice_mut</span>(), <span class="ident">output_internal_degree</span>, <span class="ident">fdx_vector</span>.<span class="ident">as_slice</span>());
+                <span class="ident">d_target</span>.<span class="ident">compute_auxiliary_data_through_degree</span>(<span class="ident">output_t</span>);
+                <span class="ident">f_prev</span>.<span class="ident">apply</span>(<span class="ident">fdx_vector</span>.<span class="ident">as_slice_mut</span>(), <span class="number">1</span>, <span class="ident">input_t</span>, <span class="ident">dx_vector</span>.<span class="ident">as_slice</span>());
+                <span class="ident">d_target</span>.<span class="ident">apply_quasi_inverse</span>(
+                    <span class="ident">output_row</span>.<span class="ident">as_slice_mut</span>(),
+                    <span class="ident">output_t</span>,
+                    <span class="ident">fdx_vector</span>.<span class="ident">as_slice</span>(),
+                );
                 <span class="ident">fdx_vector</span>.<span class="ident">set_to_zero</span>();
             }
         }
-        <span class="comment">// let num_extra_image_rows = extra_images.map_or(0, |matrix| matrix.rows());</span>
-        <span class="comment">// assert!(extra_image_row == num_extra_image_rows, &quot;Extra image rows&quot;);</span>
-        <span class="ident">outputs_matrix</span>
+        <span class="ident">f_cur</span>.<span class="ident">add_generators_from_rows</span>(<span class="ident">input_t</span>, <span class="ident">outputs</span>);
     }
 }
 
-<span class="kw">use</span> <span class="kw">crate</span>::<span class="ident">chain_complex</span>::{<span class="ident">ChainComplex</span>, <span class="ident">BoundedChainComplex</span>};
-<span class="kw">use</span> <span class="kw">crate</span>::<span class="ident">module</span>::<span class="ident">homomorphism</span>::<span class="ident">FiniteModuleHomomorphism</span>;
-<span class="kw">use</span> <span class="kw">crate</span>::<span class="ident">module</span>::{<span class="ident">BoundedModule</span>, <span class="ident">FiniteModule</span>};
+<span class="kw">use</span> <span class="kw">crate</span><span class="ident">::chain_complex</span>::{<span class="ident">BoundedChainComplex</span>, <span class="ident">ChainComplex</span>};
+<span class="kw">use</span> <span class="ident">algebra::module::homomorphism::FiniteModuleHomomorphism</span>;
+<span class="kw">use</span> <span class="ident">algebra::module</span>::{<span class="ident">BoundedModule</span>, <span class="ident">FiniteModule</span>};
 
-<span class="kw">impl</span><span class="op">&lt;</span><span class="ident">M</span>, <span class="ident">ACC</span>, <span class="ident">TCC</span><span class="op">&gt;</span> <span class="ident">ResolutionHomomorphism</span><span class="op">&lt;</span><span class="ident">ResolutionInner</span><span class="op">&lt;</span><span class="ident">CCC</span><span class="op">&gt;</span>, <span class="ident">ACC</span><span class="op">&gt;</span>
-<span class="kw">where</span> <span class="ident">M</span>: <span class="ident">Module</span><span class="op">&lt;</span><span class="ident">Algebra</span> <span class="op">=</span> <span class="ident">SteenrodAlgebra</span><span class="op">&gt;</span>,
-      <span class="ident">ACC</span>: <span class="ident">AugmentedChainComplex</span><span class="op">&lt;</span><span class="ident">Algebra</span> <span class="op">=</span> <span class="ident">SteenrodAlgebra</span>, <span class="ident">TargetComplex</span><span class="op">=</span><span class="ident">TCC</span><span class="op">&gt;</span>,
-      <span class="ident">TCC</span>: <span class="ident">BoundedChainComplex</span><span class="op">&lt;</span><span class="ident">Algebra</span> <span class="op">=</span> <span class="ident">SteenrodAlgebra</span>, <span class="ident">Module</span><span class="op">=</span><span class="ident">M</span><span class="op">&gt;</span>,
+<span class="kw">impl</span><span class="op">&lt;</span><span class="ident">M</span>, <span class="ident">ACC</span>, <span class="ident">TCC</span><span class="op">&gt;</span> <span class="ident">ResolutionHomomorphism</span><span class="op">&lt;</span><span class="ident">Resolution</span><span class="op">&lt;</span><span class="ident">CCC</span><span class="op">&gt;</span>, <span class="ident">ACC</span><span class="op">&gt;</span>
+<span class="kw">where</span>
+    <span class="ident">M</span>: <span class="ident">Module</span><span class="op">&lt;</span><span class="ident">Algebra</span> <span class="op">=</span> <span class="ident">SteenrodAlgebra</span><span class="op">&gt;</span>,
+    <span class="ident">ACC</span>: <span class="ident">AugmentedChainComplex</span><span class="op">&lt;</span><span class="ident">Algebra</span> <span class="op">=</span> <span class="ident">SteenrodAlgebra</span>, <span class="ident">TargetComplex</span> <span class="op">=</span> <span class="ident">TCC</span><span class="op">&gt;</span>,
+    <span class="ident">TCC</span>: <span class="ident">BoundedChainComplex</span><span class="op">&lt;</span><span class="ident">Algebra</span> <span class="op">=</span> <span class="ident">SteenrodAlgebra</span>, <span class="ident">Module</span> <span class="op">=</span> <span class="ident">M</span><span class="op">&gt;</span>,
 {
-    <span class="kw">pub</span> <span class="kw">fn</span> <span class="ident">from_module_homomorphism</span>(<span class="ident">name</span>: <span class="ident">String</span>, <span class="ident">source</span>: <span class="ident">Arc</span><span class="op">&lt;</span><span class="ident">ResolutionInner</span><span class="op">&lt;</span><span class="ident">CCC</span><span class="op">&gt;</span><span class="op">&gt;</span>, <span class="ident">target</span>: <span class="ident">Arc</span><span class="op">&lt;</span><span class="ident">ACC</span><span class="op">&gt;</span>, <span class="ident">f</span>: <span class="kw-2">&amp;</span><span class="ident">FiniteModuleHomomorphism</span><span class="op">&lt;</span><span class="ident">M</span><span class="op">&gt;</span>) <span class="op">-</span><span class="op">&gt;</span> <span class="self">Self</span> {
-        <span class="macro">assert_eq</span><span class="macro">!</span>(<span class="ident">source</span>.<span class="ident">target</span>().<span class="ident">max_s</span>(), <span class="number">1</span>);
-        <span class="macro">assert_eq</span><span class="macro">!</span>(<span class="ident">target</span>.<span class="ident">target</span>().<span class="ident">max_s</span>(), <span class="number">1</span>);
+    <span class="kw">pub</span> <span class="kw">fn</span> <span class="ident">from_module_homomorphism</span>(
+        <span class="ident">name</span>: <span class="ident">String</span>,
+        <span class="ident">source</span>: <span class="ident">Arc</span><span class="op">&lt;</span><span class="ident">Resolution</span><span class="op">&lt;</span><span class="ident">CCC</span><span class="op">&gt;</span><span class="op">&gt;</span>,
+        <span class="ident">target</span>: <span class="ident">Arc</span><span class="op">&lt;</span><span class="ident">ACC</span><span class="op">&gt;</span>,
+        <span class="ident">f</span>: <span class="kw-2">&amp;</span><span class="ident">FiniteModuleHomomorphism</span><span class="op">&lt;</span><span class="ident">M</span><span class="op">&gt;</span>,
+    ) <span class="op">-</span><span class="op">&gt;</span> <span class="self">Self</span> {
+        <span class="macro">assert_eq!</span>(<span class="ident">source</span>.<span class="ident">target</span>().<span class="ident">max_s</span>(), <span class="number">1</span>);
+        <span class="macro">assert_eq!</span>(<span class="ident">target</span>.<span class="ident">target</span>().<span class="ident">max_s</span>(), <span class="number">1</span>);
 
         <span class="kw">let</span> <span class="ident">source_module</span> <span class="op">=</span> <span class="ident">source</span>.<span class="ident">target</span>().<span class="ident">module</span>(<span class="number">0</span>);
         <span class="kw">let</span> <span class="ident">target_module</span> <span class="op">=</span> <span class="ident">target</span>.<span class="ident">target</span>().<span class="ident">module</span>(<span class="number">0</span>);
-        <span class="macro">assert</span><span class="macro">!</span>(<span class="ident">Arc</span>::<span class="ident">ptr_eq</span>(<span class="kw-2">&amp;</span><span class="ident">source_module</span>, <span class="kw-2">&amp;</span><span class="ident">f</span>.<span class="ident">source</span>()));
-        <span class="macro">assert</span><span class="macro">!</span>(<span class="ident">Arc</span>::<span class="ident">ptr_eq</span>(<span class="kw-2">&amp;</span><span class="ident">target_module</span>, <span class="kw-2">&amp;</span><span class="ident">f</span>.<span class="ident">target</span>()));
+        <span class="macro">assert!</span>(<span class="ident">Arc::ptr_eq</span>(<span class="kw-2">&amp;</span><span class="ident">source_module</span>, <span class="kw-2">&amp;</span><span class="ident">f</span>.<span class="ident">source</span>()));
+        <span class="macro">assert!</span>(<span class="ident">Arc::ptr_eq</span>(<span class="kw-2">&amp;</span><span class="ident">target_module</span>, <span class="kw-2">&amp;</span><span class="ident">f</span>.<span class="ident">target</span>()));
 
         <span class="kw">let</span> <span class="ident">p</span> <span class="op">=</span> <span class="ident">source</span>.<span class="ident">prime</span>();
         <span class="kw">let</span> <span class="ident">degree_shift</span> <span class="op">=</span> <span class="ident">f</span>.<span class="ident">degree_shift</span>();
 
         <span class="kw">let</span> <span class="ident">max_degree</span> <span class="op">=</span> <span class="kw">match</span> <span class="kw-2">&amp;</span><span class="kw-2">*</span><span class="ident">source_module</span> {
-            <span class="ident">FiniteModule</span>::<span class="ident">FDModule</span>(<span class="ident">m</span>) <span class="op">=</span><span class="op">&gt;</span> <span class="ident">m</span>.<span class="ident">max_degree</span>(),
-            <span class="ident">FiniteModule</span>::<span class="ident">FPModule</span>(<span class="ident">m</span>) <span class="op">=</span><span class="op">&gt;</span> <span class="ident">m</span>.<span class="ident">generators</span>.<span class="ident">get_max_generator_degree</span>(),
-            <span class="ident">FiniteModule</span>::<span class="ident">RealProjectiveSpace</span>(<span class="kw">_</span>) <span class="op">=</span><span class="op">&gt;</span> <span class="macro">panic</span><span class="macro">!</span>(<span class="string">&quot;Real Projective Space not supported&quot;</span>),
+            <span class="ident">FiniteModule::FDModule</span>(<span class="ident">m</span>) <span class="op">=</span><span class="op">&gt;</span> <span class="ident">m</span>.<span class="ident">max_degree</span>(),
+            <span class="ident">FiniteModule::FPModule</span>(<span class="ident">m</span>) <span class="op">=</span><span class="op">&gt;</span> <span class="ident">m</span>.<span class="ident">generators</span>().<span class="ident">get_max_generator_degree</span>(),
+            <span class="ident">FiniteModule::RealProjectiveSpace</span>(<span class="kw">_</span>) <span class="op">=</span><span class="op">&gt;</span> <span class="macro">panic!</span>(<span class="string">&quot;Real Projective Space not supported&quot;</span>),
         };
 
-        <span class="kw">let</span> <span class="ident">hom</span> <span class="op">=</span> <span class="self">Self</span>::<span class="ident">new</span>(<span class="ident">name</span>, <span class="ident">Arc</span>::<span class="ident">downgrade</span>(<span class="kw-2">&amp;</span><span class="ident">source</span>), <span class="ident">Arc</span>::<span class="ident">downgrade</span>(<span class="kw-2">&amp;</span><span class="ident">target</span>), <span class="number">0</span>, <span class="ident">degree_shift</span>);
+        <span class="kw">let</span> <span class="ident">hom</span> <span class="op">=</span> <span class="self">Self</span><span class="ident">::new</span>(<span class="ident">name</span>, <span class="ident">source</span>, <span class="ident">target</span>, <span class="number">0</span>, <span class="ident">degree_shift</span>);
 
         <span class="ident">source_module</span>.<span class="ident">compute_basis</span>(<span class="ident">max_degree</span>);
         <span class="ident">target_module</span>.<span class="ident">compute_basis</span>(<span class="ident">degree_shift</span> <span class="op">+</span> <span class="ident">max_degree</span>);
 
-        <span class="comment">// These are just asserts.</span>
-        <span class="ident">source</span>.<span class="ident">compute_through_bidegree</span>(<span class="number">0</span>, <span class="ident">max_degree</span>);
-        <span class="ident">target</span>.<span class="ident">compute_through_bidegree</span>(<span class="number">0</span>, <span class="ident">degree_shift</span> <span class="op">+</span> <span class="ident">max_degree</span>);
+        <span class="ident">hom</span>.<span class="ident">source</span>.<span class="ident">compute_through_bidegree</span>(<span class="number">0</span>, <span class="ident">max_degree</span>);
+        <span class="ident">hom</span>.<span class="ident">target</span>
+            .<span class="ident">compute_through_bidegree</span>(<span class="number">0</span>, <span class="ident">degree_shift</span> <span class="op">+</span> <span class="ident">max_degree</span>);
 
-        <span class="kw">let</span> <span class="ident">source_chain_map</span> <span class="op">=</span> <span class="ident">source</span>.<span class="ident">chain_map</span>(<span class="number">0</span>);
-        <span class="kw">let</span> <span class="ident">target_chain_map</span> <span class="op">=</span> <span class="ident">target</span>.<span class="ident">chain_map</span>(<span class="number">0</span>);
-        <span class="ident">target_chain_map</span>.<span class="ident">compute_kernels_and_quasi_inverses_through_degree</span>(<span class="ident">degree_shift</span> <span class="op">+</span> <span class="ident">max_degree</span>);
+        <span class="kw">let</span> <span class="ident">source_chain_map</span> <span class="op">=</span> <span class="ident">hom</span>.<span class="ident">source</span>.<span class="ident">chain_map</span>(<span class="number">0</span>);
+        <span class="kw">let</span> <span class="ident">target_chain_map</span> <span class="op">=</span> <span class="ident">hom</span>.<span class="ident">target</span>.<span class="ident">chain_map</span>(<span class="number">0</span>);
+        <span class="ident">target_chain_map</span>.<span class="ident">compute_auxiliary_data_through_degree</span>(<span class="ident">degree_shift</span> <span class="op">+</span> <span class="ident">max_degree</span>);
 
         <span class="kw">let</span> <span class="ident">g</span> <span class="op">=</span> <span class="ident">hom</span>.<span class="ident">get_map_ensure_length</span>(<span class="number">0</span>);
-        <span class="kw">let</span> <span class="ident">lock</span> <span class="op">=</span> <span class="ident">g</span>.<span class="ident">lock</span>();
 
-        <span class="kw">for</span> <span class="ident">t</span> <span class="kw">in</span> <span class="ident">source_module</span>.<span class="ident">min_degree</span>() ..<span class="op">=</span> <span class="ident">max_degree</span> {
-            <span class="kw">let</span> <span class="ident">num_gens</span> <span class="op">=</span> <span class="ident">source</span>.<span class="ident">module</span>(<span class="number">0</span>).<span class="ident">number_of_gens_in_degree</span>(<span class="ident">t</span>);
+        <span class="kw">for</span> <span class="ident">t</span> <span class="kw">in</span> <span class="ident">source_module</span>.<span class="ident">min_degree</span>()..<span class="op">=</span><span class="ident">max_degree</span> {
+            <span class="kw">let</span> <span class="ident">num_gens</span> <span class="op">=</span> <span class="ident">hom</span>.<span class="ident">source</span>.<span class="ident">module</span>(<span class="number">0</span>).<span class="ident">number_of_gens_in_degree</span>(<span class="ident">t</span>);
 
-            <span class="kw">let</span> <span class="kw-2">mut</span> <span class="ident">fx</span> <span class="op">=</span> <span class="ident">FpVector</span>::<span class="ident">new</span>(<span class="ident">p</span>, <span class="ident">target_module</span>.<span class="ident">dimension</span>(<span class="ident">t</span> <span class="op">+</span> <span class="ident">degree_shift</span>));
+            <span class="kw">let</span> <span class="kw-2">mut</span> <span class="ident">fx</span> <span class="op">=</span> <span class="ident">FpVector::new</span>(<span class="ident">p</span>, <span class="ident">target_module</span>.<span class="ident">dimension</span>(<span class="ident">t</span> <span class="op">+</span> <span class="ident">degree_shift</span>));
 
-            <span class="kw">let</span> <span class="kw-2">mut</span> <span class="ident">outputs_matrix</span> <span class="op">=</span> <span class="ident">Matrix</span>::<span class="ident">new</span>(<span class="ident">p</span>, <span class="ident">num_gens</span>, <span class="ident">target</span>.<span class="ident">module</span>(<span class="number">0</span>).<span class="ident">dimension</span>(<span class="ident">t</span> <span class="op">+</span> <span class="ident">degree_shift</span>));
-            <span class="kw">if</span> <span class="ident">num_gens</span> <span class="op">=</span><span class="op">=</span> <span class="number">0</span> <span class="op">|</span><span class="op">|</span> <span class="ident">fx</span>.<span class="ident">dimension</span>() <span class="op">=</span><span class="op">=</span> <span class="number">0</span> {
-                <span class="ident">g</span>.<span class="ident">add_generators_from_matrix_rows</span>(<span class="kw-2">&amp;</span><span class="ident">lock</span>, <span class="ident">t</span>, <span class="ident">outputs_matrix</span>.<span class="ident">as_slice_mut</span>());
+            <span class="kw">let</span> <span class="kw-2">mut</span> <span class="ident">outputs_matrix</span> <span class="op">=</span> <span class="ident">Matrix::new</span>(
+                <span class="ident">p</span>,
+                <span class="ident">num_gens</span>,
+                <span class="ident">hom</span>.<span class="ident">target</span>.<span class="ident">module</span>(<span class="number">0</span>).<span class="ident">dimension</span>(<span class="ident">t</span> <span class="op">+</span> <span class="ident">degree_shift</span>),
+            );
+            <span class="kw">if</span> <span class="ident">num_gens</span> <span class="op">=</span><span class="op">=</span> <span class="number">0</span> <span class="op">|</span><span class="op">|</span> <span class="ident">fx</span>.<span class="ident">is_empty</span>() {
+                <span class="ident">g</span>.<span class="ident">add_generators_from_matrix_rows</span>(<span class="ident">t</span>, <span class="ident">outputs_matrix</span>.<span class="ident">as_slice_mut</span>());
                 <span class="kw">continue</span>;
             }
-            <span class="kw">for</span> <span class="ident">j</span> <span class="kw">in</span> <span class="number">0</span> .. <span class="ident">num_gens</span> {
-                <span class="ident">f</span>.<span class="ident">apply</span>(<span class="ident">fx</span>.<span class="ident">as_slice_mut</span>(), <span class="number">1</span>, <span class="ident">t</span>, <span class="ident">source_chain_map</span>.<span class="ident">output</span>(<span class="ident">t</span>, <span class="ident">j</span>).<span class="ident">as_slice</span>());
-                <span class="ident">target_chain_map</span>.<span class="ident">apply_quasi_inverse</span>(<span class="ident">outputs_matrix</span>[<span class="ident">j</span>].<span class="ident">as_slice_mut</span>(), <span class="ident">t</span> <span class="op">+</span> <span class="ident">degree_shift</span>, <span class="ident">fx</span>.<span class="ident">as_slice</span>());
+            <span class="kw">for</span> <span class="ident">j</span> <span class="kw">in</span> <span class="number">0</span>..<span class="ident">num_gens</span> {
+                <span class="ident">f</span>.<span class="ident">apply</span>(
+                    <span class="ident">fx</span>.<span class="ident">as_slice_mut</span>(),
+                    <span class="number">1</span>,
+                    <span class="ident">t</span>,
+                    <span class="ident">source_chain_map</span>.<span class="ident">output</span>(<span class="ident">t</span>, <span class="ident">j</span>).<span class="ident">as_slice</span>(),
+                );
+                <span class="ident">target_chain_map</span>.<span class="ident">apply_quasi_inverse</span>(
+                    <span class="ident">outputs_matrix</span>[<span class="ident">j</span>].<span class="ident">as_slice_mut</span>(),
+                    <span class="ident">t</span> <span class="op">+</span> <span class="ident">degree_shift</span>,
+                    <span class="ident">fx</span>.<span class="ident">as_slice</span>(),
+                );
                 <span class="ident">fx</span>.<span class="ident">set_to_zero</span>();
             }
-            <span class="ident">g</span>.<span class="ident">add_generators_from_matrix_rows</span>(<span class="kw-2">&amp;</span><span class="ident">lock</span>, <span class="ident">t</span>, <span class="ident">outputs_matrix</span>.<span class="ident">as_slice_mut</span>());
+            <span class="ident">g</span>.<span class="ident">add_generators_from_matrix_rows</span>(<span class="ident">t</span>, <span class="ident">outputs_matrix</span>.<span class="ident">as_slice_mut</span>());
         }
-        <span class="ident">drop</span>(<span class="ident">lock</span>);
         <span class="ident">hom</span>
     }
 }
 
 <span class="kw">impl</span><span class="op">&lt;</span><span class="ident">CC1</span>, <span class="ident">CC2</span><span class="op">&gt;</span> <span class="ident">ResolutionHomomorphism</span><span class="op">&lt;</span><span class="ident">CC1</span>, <span class="ident">CC2</span><span class="op">&gt;</span>
-<span class="kw">where</span> <span class="ident">CC1</span>: <span class="ident">FreeChainComplex</span>,
-      <span class="ident">CC2</span>: <span class="ident">AugmentedChainComplex</span> <span class="op">+</span> <span class="ident">FreeChainComplex</span><span class="op">&lt;</span><span class="ident">Algebra</span> <span class="op">=</span> <span class="ident">CC1</span>::<span class="ident">Algebra</span><span class="op">&gt;</span>
+<span class="kw">where</span>
+    <span class="ident">CC1</span>: <span class="ident">FreeChainComplex</span>,
+    <span class="ident">CC2</span>: <span class="ident">AugmentedChainComplex</span> <span class="op">+</span> <span class="ident">FreeChainComplex</span><span class="op">&lt;</span><span class="ident">Algebra</span> <span class="op">=</span> <span class="ident">CC1::Algebra</span><span class="op">&gt;</span>,
 {
-    <span class="kw">pub</span> <span class="kw">fn</span> <span class="ident">act</span>(<span class="kw-2">&amp;</span><span class="self">self</span>, <span class="kw-2">mut</span> <span class="ident">result</span>: <span class="ident">SliceMut</span>, <span class="ident">s</span>: <span class="ident">u32</span>, <span class="ident">t</span>: <span class="ident">i32</span>, <span class="ident">idx</span>: <span class="ident">usize</span>) {
-        <span class="kw">let</span> <span class="ident">source_s</span> <span class="op">=</span> <span class="ident">s</span> <span class="op">-</span> <span class="self">self</span>.<span class="ident">homological_degree_shift</span>;
-        <span class="kw">let</span> <span class="ident">source_t</span> <span class="op">=</span> <span class="ident">t</span> <span class="op">-</span> <span class="self">self</span>.<span class="ident">internal_degree_shift</span>;
+    <span class="kw">pub</span> <span class="kw">fn</span> <span class="ident">act</span>(<span class="kw-2">&amp;</span><span class="self">self</span>, <span class="kw-2">mut</span> <span class="ident">result</span>: <span class="ident">SliceMut</span>, <span class="ident">coef</span>: <span class="ident">u32</span>, <span class="ident">s</span>: <span class="ident">u32</span>, <span class="ident">t</span>: <span class="ident">i32</span>, <span class="ident">idx</span>: <span class="ident">usize</span>) {
+        <span class="kw">let</span> <span class="ident">source_s</span> <span class="op">=</span> <span class="ident">s</span> <span class="op">+</span> <span class="self">self</span>.<span class="ident">shift_s</span>;
+        <span class="kw">let</span> <span class="ident">source_t</span> <span class="op">=</span> <span class="ident">t</span> <span class="op">+</span> <span class="self">self</span>.<span class="ident">shift_t</span>;
 
-        <span class="kw">let</span> <span class="ident">source</span> <span class="op">=</span> <span class="self">self</span>.<span class="ident">source</span>.<span class="ident">upgrade</span>().<span class="ident">unwrap</span>();
-        <span class="kw">let</span> <span class="ident">target</span> <span class="op">=</span> <span class="self">self</span>.<span class="ident">target</span>.<span class="ident">upgrade</span>().<span class="ident">unwrap</span>();
-        <span class="macro">assert_eq</span><span class="macro">!</span>(<span class="ident">result</span>.<span class="ident">as_slice</span>().<span class="ident">dimension</span>(), <span class="ident">source</span>.<span class="ident">module</span>(<span class="ident">source_s</span>).<span class="ident">number_of_gens_in_degree</span>(<span class="ident">source_t</span>));
+        <span class="macro">assert_eq!</span>(
+            <span class="ident">result</span>.<span class="ident">as_slice</span>().<span class="ident">len</span>(),
+            <span class="self">self</span>.<span class="ident">source</span>
+                .<span class="ident">module</span>(<span class="ident">source_s</span>)
+                .<span class="ident">number_of_gens_in_degree</span>(<span class="ident">source_t</span>)
+        );
 
-        <span class="kw">let</span> <span class="ident">target_module</span> <span class="op">=</span> <span class="ident">target</span>.<span class="ident">module</span>(<span class="ident">s</span>);
+        <span class="kw">let</span> <span class="ident">target_module</span> <span class="op">=</span> <span class="self">self</span>.<span class="ident">target</span>.<span class="ident">module</span>(<span class="ident">s</span>);
 
-        <span class="kw">let</span> <span class="ident">map</span> <span class="op">=</span> <span class="self">self</span>.<span class="ident">get_map</span>(<span class="ident">s</span>);
-        <span class="kw">for</span> <span class="ident">i</span> <span class="kw">in</span> <span class="number">0</span> .. <span class="ident">result</span>.<span class="ident">as_slice</span>().<span class="ident">dimension</span>() {
-            <span class="kw">let</span> <span class="ident">j</span> <span class="op">=</span> <span class="ident">target_module</span>.<span class="ident">operation_generator_to_index</span>(<span class="number">0</span>, <span class="number">0</span>, <span class="ident">t</span>, <span class="ident">idx</span>);
-            <span class="ident">result</span>.<span class="ident">add_basis_element</span>(<span class="ident">i</span>, <span class="ident">map</span>.<span class="ident">output</span>(<span class="ident">t</span>, <span class="ident">i</span>).<span class="ident">entry</span>(<span class="ident">j</span>));
+        <span class="kw">let</span> <span class="ident">map</span> <span class="op">=</span> <span class="self">self</span>.<span class="ident">get_map</span>(<span class="ident">source_s</span>);
+        <span class="kw">let</span> <span class="ident">j</span> <span class="op">=</span> <span class="ident">target_module</span>.<span class="ident">operation_generator_to_index</span>(<span class="number">0</span>, <span class="number">0</span>, <span class="ident">t</span>, <span class="ident">idx</span>);
+        <span class="kw">for</span> <span class="ident">i</span> <span class="kw">in</span> <span class="number">0</span>..<span class="ident">result</span>.<span class="ident">as_slice</span>().<span class="ident">len</span>() {
+            <span class="ident">result</span>.<span class="ident">add_basis_element</span>(<span class="ident">i</span>, <span class="ident">coef</span> <span class="op">*</span> <span class="ident">map</span>.<span class="ident">output</span>(<span class="ident">source_t</span>, <span class="ident">i</span>).<span class="ident">entry</span>(<span class="ident">j</span>));
         }
     }
 }
-<span class="kw">pub</span> <span class="kw">type</span> <span class="ident">ResolutionHomomorphismToUnit</span><span class="op">&lt;</span><span class="ident">CC</span><span class="op">&gt;</span> <span class="op">=</span> <span class="ident">ResolutionHomomorphism</span><span class="op">&lt;</span><span class="ident">ResolutionInner</span><span class="op">&lt;</span><span class="ident">CC</span><span class="op">&gt;</span>, <span class="ident">ResolutionInner</span><span class="op">&lt;</span><span class="ident">CC</span><span class="op">&gt;</span><span class="op">&gt;</span>;
 </pre></div>
-</section><section id="search" class="content hidden"></section><section class="footer"></section><div id="rustdoc-vars" data-root-path="../../" data-current-crate="ext"></div>
-    <script src="../../main.js"></script><script src="../../source-script.js"></script><script src="../../source-files.js"></script><script defer src="../../search-index.js"></script></body></html>
+</section><section id="search" class="content hidden"></section><div id="rustdoc-vars" data-root-path="../../" data-current-crate="ext" data-search-index-js="../../search-index.js" data-search-js="../../search.js"></div>
+    <script src="../../main.js"></script><script src="../../source-script.js"></script><script src="../../source-files.js"></script></body></html>
