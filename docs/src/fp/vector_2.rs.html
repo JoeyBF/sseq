@@ -143,16 +143,14 @@
 <span id="119">119</span>
 <span id="120">120</span>
 <span id="121">121</span>
-<span id="122">122</span>
 </pre><pre class="rust">
 <span class="doccomment">//! This module replaces `vector` when `odd-primes` is disabled. Instead of producing enum</span>
 <span class="doccomment">//! wrappers, it simply rexports `FooP&lt;2&gt;` as `Foo`.</span>
 
 <span class="kw">use</span> <span class="kw">crate</span><span class="ident">::prime::ValidPrime</span>;
-<span class="kw">pub</span> <span class="kw">use</span> <span class="kw">crate</span><span class="ident">::vector_inner::initialize_limb_bit_index_table</span>;
-<span class="kw">use</span> <span class="kw">crate</span><span class="ident">::vector_inner</span>::{
-    <span class="ident">entries_per_limb</span>, <span class="ident">FpVectorNonZeroIteratorP</span>, <span class="ident">FpVectorP</span>, <span class="ident">Limb</span>, <span class="ident">SliceMutP</span>, <span class="ident">SliceP</span>,
-};
+<span class="comment">// pub use crate::vector_inner::initialize_limb_bit_index_table;</span>
+<span class="kw">use</span> <span class="kw">crate</span><span class="ident">::limb</span>::{<span class="ident">entries_per_limb_const</span>, <span class="ident">Limb</span>};
+<span class="kw">use</span> <span class="kw">crate</span><span class="ident">::vector_inner</span>::{<span class="ident">FpVectorNonZeroIteratorP</span>, <span class="ident">FpVectorP</span>, <span class="ident">SliceMutP</span>, <span class="ident">SliceP</span>};
 <span class="kw">use</span> <span class="ident">itertools::Itertools</span>;
 <span class="attribute">#[<span class="ident">cfg</span>(<span class="ident">feature</span> <span class="op">=</span> <span class="string">&quot;json&quot;</span>)]</span>
 <span class="kw">use</span> <span class="ident">serde</span>::{<span class="ident">Deserialize</span>, <span class="ident">Deserializer</span>, <span class="ident">Serialize</span>, <span class="ident">Serializer</span>};
@@ -175,8 +173,8 @@
         <span class="self">Self</span><span class="ident">::from</span>(<span class="kw-2">&amp;</span><span class="ident">slice</span>)
     }
 
-    <span class="kw">pub</span> <span class="kw">fn</span> <span class="ident">padded_len</span>(<span class="ident">p</span>: <span class="ident">ValidPrime</span>, <span class="ident">len</span>: <span class="ident">usize</span>) <span class="op">-</span><span class="op">&gt;</span> <span class="ident">usize</span> {
-        <span class="kw">let</span> <span class="ident">entries_per_limb</span> <span class="op">=</span> <span class="ident">entries_per_limb</span>(<span class="ident">p</span>);
+    <span class="kw">pub</span> <span class="kw">fn</span> <span class="ident">padded_len</span>(<span class="ident">_p</span>: <span class="ident">ValidPrime</span>, <span class="ident">len</span>: <span class="ident">usize</span>) <span class="op">-</span><span class="op">&gt;</span> <span class="ident">usize</span> {
+        <span class="kw">let</span> <span class="ident">entries_per_limb</span> <span class="op">=</span> <span class="ident">entries_per_limb_const</span>::<span class="op">&lt;</span><span class="number">2</span><span class="op">&gt;</span>();
         ((<span class="ident">len</span> <span class="op">+</span> <span class="ident">entries_per_limb</span> <span class="op">-</span> <span class="number">1</span>) <span class="op">/</span> <span class="ident">entries_per_limb</span>) <span class="op">*</span> <span class="ident">entries_per_limb</span>
     }
 }
@@ -256,7 +254,7 @@
             <span class="kw">return</span> <span class="prelude-val">Ok</span>(<span class="ident">FpVector::new</span>(<span class="ident">p</span>, <span class="number">0</span>));
         }
 
-        <span class="kw">let</span> <span class="ident">entries_per_limb</span> <span class="op">=</span> <span class="ident">entries_per_limb</span>(<span class="ident">p</span>);
+        <span class="kw">let</span> <span class="ident">entries_per_limb</span> <span class="op">=</span> <span class="ident">entries_per_limb_const</span>::<span class="op">&lt;</span><span class="number">2</span><span class="op">&gt;</span>();
         <span class="kw">let</span> <span class="ident">num_limbs</span> <span class="op">=</span> (<span class="ident">len</span> <span class="op">-</span> <span class="number">1</span>) <span class="op">/</span> <span class="ident">entries_per_limb</span> <span class="op">+</span> <span class="number">1</span>;
         <span class="kw">let</span> <span class="kw-2">mut</span> <span class="ident">v</span> <span class="op">=</span> <span class="ident">FpVector::new</span>(<span class="ident">p</span>, <span class="ident">len</span>);
 

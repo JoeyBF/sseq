@@ -355,14 +355,6 @@
 <span id="331">331</span>
 <span id="332">332</span>
 <span id="333">333</span>
-<span id="334">334</span>
-<span id="335">335</span>
-<span id="336">336</span>
-<span id="337">337</span>
-<span id="338">338</span>
-<span id="339">339</span>
-<span id="340">340</span>
-<span id="341">341</span>
 </pre><pre class="rust">
 <span class="kw">use</span> <span class="ident">itertools::Itertools</span>;
 <span class="kw">use</span> <span class="ident">rustc_hash::FxHashMap</span> <span class="kw">as</span> <span class="ident">HashMap</span>;
@@ -405,18 +397,10 @@
     }
 }
 
+<span class="attribute">#[<span class="ident">derive</span>(<span class="ident">Default</span>)]</span>
 <span class="kw">pub</span> <span class="kw">struct</span> <span class="ident">PolynomialAlgebraTableEntry</span> {
     <span class="kw">pub</span> <span class="ident">index_to_monomial</span>: <span class="ident">Vec</span><span class="op">&lt;</span><span class="ident">PolynomialAlgebraMonomial</span><span class="op">&gt;</span>, <span class="comment">// degree -&gt; index -&gt; AdemBasisElement</span>
     <span class="kw">pub</span> <span class="ident">monomial_to_index</span>: <span class="ident">HashMap</span><span class="op">&lt;</span><span class="ident">PolynomialAlgebraMonomial</span>, <span class="ident">usize</span><span class="op">&gt;</span>, <span class="comment">// degree -&gt; AdemBasisElement -&gt; index</span>
-}
-
-<span class="kw">impl</span> <span class="ident">Default</span> <span class="kw">for</span> <span class="ident">PolynomialAlgebraTableEntry</span> {
-    <span class="kw">fn</span> <span class="ident">default</span>() <span class="op">-</span><span class="op">&gt;</span> <span class="self">Self</span> {
-        <span class="self">Self</span> {
-            <span class="ident">index_to_monomial</span>: <span class="ident">Vec::new</span>(),
-            <span class="ident">monomial_to_index</span>: <span class="ident">HashMap::default</span>(),
-        }
-    }
 }
 
 <span class="kw">impl</span> <span class="ident">PolynomialAlgebraTableEntry</span> {

@@ -54,6 +54,8 @@
 <span id="30">30</span>
 <span id="31">31</span>
 <span id="32">32</span>
+<span id="33">33</span>
+<span id="34">34</span>
 </pre><pre class="rust">
 <span class="macro">cfg_if::cfg_if!</span> {
     <span class="kw">if</span> <span class="attribute">#[<span class="ident">cfg</span>(<span class="ident">target_arch</span> <span class="op">=</span> <span class="string">&quot;x86_64&quot;</span>)]</span> {
@@ -65,9 +67,11 @@
     }
 }
 
-<span class="kw">const</span> <span class="ident">LIMBS_PER_SIMD</span>: <span class="ident">usize</span> <span class="op">=</span> <span class="ident">std::mem::size_of</span>::<span class="op">&lt;</span><span class="ident">SimdLimb</span><span class="op">&gt;</span>() <span class="op">/</span> <span class="kw">crate</span><span class="ident">::vector_inner::BYTES_PER_LIMB</span>;
+<span class="kw">use</span> <span class="kw">super</span><span class="ident">::limb::Limb</span>;
 
-<span class="kw">pub</span>(<span class="kw">crate</span>) <span class="kw">fn</span> <span class="ident">add_simd</span>(<span class="ident">target</span>: <span class="kw-2">&amp;</span><span class="kw-2">mut</span> [<span class="ident">u64</span>], <span class="ident">source</span>: <span class="kw-2">&amp;</span>[<span class="ident">u64</span>], <span class="ident">min_limb</span>: <span class="ident">usize</span>) {
+<span class="kw">const</span> <span class="ident">LIMBS_PER_SIMD</span>: <span class="ident">usize</span> <span class="op">=</span> <span class="ident">std::mem::size_of</span>::<span class="op">&lt;</span><span class="ident">SimdLimb</span><span class="op">&gt;</span>() <span class="op">/</span> <span class="kw">crate</span><span class="ident">::constants::BYTES_PER_LIMB</span>;
+
+<span class="kw">pub</span>(<span class="kw">crate</span>) <span class="kw">fn</span> <span class="ident">add_simd</span>(<span class="ident">target</span>: <span class="kw-2">&amp;</span><span class="kw-2">mut</span> [<span class="ident">Limb</span>], <span class="ident">source</span>: <span class="kw-2">&amp;</span>[<span class="ident">Limb</span>], <span class="ident">min_limb</span>: <span class="ident">usize</span>) {
     <span class="kw">let</span> <span class="ident">max_limb</span> <span class="op">=</span> <span class="ident">target</span>.<span class="ident">len</span>();
     <span class="kw">let</span> <span class="ident">target</span> <span class="op">=</span> <span class="ident">target</span>.<span class="ident">as_mut_ptr</span>();
     <span class="kw">let</span> <span class="ident">source</span> <span class="op">=</span> <span class="ident">source</span>.<span class="ident">as_ptr</span>();

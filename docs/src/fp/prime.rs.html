@@ -609,80 +609,16 @@
 <span id="585">585</span>
 <span id="586">586</span>
 <span id="587">587</span>
-<span id="588">588</span>
-<span id="589">589</span>
-<span id="590">590</span>
-<span id="591">591</span>
-<span id="592">592</span>
-<span id="593">593</span>
-<span id="594">594</span>
-<span id="595">595</span>
-<span id="596">596</span>
-<span id="597">597</span>
-<span id="598">598</span>
-<span id="599">599</span>
-<span id="600">600</span>
-<span id="601">601</span>
-<span id="602">602</span>
-<span id="603">603</span>
-<span id="604">604</span>
-<span id="605">605</span>
-<span id="606">606</span>
-<span id="607">607</span>
-<span id="608">608</span>
-<span id="609">609</span>
-<span id="610">610</span>
-<span id="611">611</span>
-<span id="612">612</span>
-<span id="613">613</span>
-<span id="614">614</span>
-<span id="615">615</span>
-<span id="616">616</span>
-<span id="617">617</span>
-<span id="618">618</span>
-<span id="619">619</span>
-<span id="620">620</span>
-<span id="621">621</span>
-<span id="622">622</span>
-<span id="623">623</span>
-<span id="624">624</span>
-<span id="625">625</span>
-<span id="626">626</span>
-<span id="627">627</span>
-<span id="628">628</span>
-<span id="629">629</span>
-<span id="630">630</span>
-<span id="631">631</span>
-<span id="632">632</span>
-<span id="633">633</span>
-<span id="634">634</span>
-<span id="635">635</span>
-<span id="636">636</span>
-<span id="637">637</span>
-<span id="638">638</span>
-<span id="639">639</span>
-<span id="640">640</span>
-<span id="641">641</span>
 </pre><pre class="rust">
-<span class="kw">pub</span> <span class="kw">const</span> <span class="ident">NUM_PRIMES</span>: <span class="ident">usize</span> <span class="op">=</span> <span class="number">8</span>;
-<span class="kw">pub</span> <span class="kw">const</span> <span class="ident">MAX_PRIME</span>: <span class="ident">usize</span> <span class="op">=</span> <span class="number">19</span>;
-<span class="attribute">#[<span class="ident">cfg</span>(<span class="ident">feature</span> <span class="op">=</span> <span class="string">&quot;odd-primes&quot;</span>)]</span>
-<span class="kw">const</span> <span class="ident">NOT_A_PRIME</span>: <span class="ident">usize</span> <span class="op">=</span> <span class="op">!</span><span class="number">1</span>;
-<span class="kw">pub</span> <span class="kw">const</span> <span class="ident">MAX_MULTINOMIAL_LEN</span>: <span class="ident">usize</span> <span class="op">=</span> <span class="number">10</span>;
 <span class="attribute">#[<span class="ident">cfg</span>(<span class="ident">feature</span> <span class="op">=</span> <span class="string">&quot;json&quot;</span>)]</span>
 <span class="kw">use</span> <span class="ident">serde</span>::{<span class="ident">de::Error</span>, <span class="ident">Deserialize</span>, <span class="ident">Deserializer</span>, <span class="ident">Serialize</span>, <span class="ident">Serializer</span>};
 <span class="kw">use</span> <span class="ident">std::convert::TryFrom</span>;
 
-<span class="attribute">#[<span class="ident">macro_export</span>]</span>
-<span class="macro">macro_rules!</span> <span class="ident">const_for</span> {
-    (<span class="macro-nonterminal">$</span><span class="macro-nonterminal">i</span>:<span class="ident">ident</span> <span class="kw">in</span> <span class="macro-nonterminal">$</span><span class="macro-nonterminal">a</span>:<span class="ident">literal</span> .. <span class="macro-nonterminal">$</span><span class="macro-nonterminal">b</span>:<span class="ident">ident</span> <span class="macro-nonterminal">$</span><span class="macro-nonterminal">contents</span>:<span class="ident">block</span>) <span class="op">=</span><span class="op">&gt;</span> {
-        <span class="kw">let</span> <span class="kw-2">mut</span> <span class="macro-nonterminal">$</span><span class="macro-nonterminal">i</span> <span class="op">=</span> <span class="macro-nonterminal">$</span><span class="macro-nonterminal">a</span>;
-        <span class="kw">while</span> <span class="macro-nonterminal">$</span><span class="macro-nonterminal">i</span> <span class="op">&lt;</span> <span class="macro-nonterminal">$</span><span class="macro-nonterminal">b</span> {
-            <span class="macro-nonterminal">$</span><span class="macro-nonterminal">contents</span>;
-            <span class="macro-nonterminal">$</span><span class="macro-nonterminal">i</span> <span class="op">+</span><span class="op">=</span> <span class="number">1</span>;
-        }
-    };
-}
+<span class="kw">use</span> <span class="kw">crate</span><span class="ident">::constants</span>::{
+    <span class="ident">BINOMIAL4_TABLE</span>, <span class="ident">BINOMIAL4_TABLE_SIZE</span>, <span class="ident">BINOMIAL_TABLE</span>, <span class="ident">INVERSE_TABLE</span>, <span class="ident">PRIME_TO_INDEX_MAP</span>,
+};
+<span class="attribute">#[<span class="ident">allow</span>(<span class="ident">unused_imports</span>)]</span>
+<span class="kw">use</span> <span class="kw">crate</span><span class="ident">::constants</span>::{<span class="ident">MAX_PRIME</span>, <span class="ident">NOT_A_PRIME</span>, <span class="ident">NUM_PRIMES</span>};
 
 <span class="attribute">#[<span class="ident">derive</span>(<span class="ident">Copy</span>, <span class="ident">Clone</span>, <span class="ident">Debug</span>, <span class="ident">PartialEq</span>, <span class="ident">Eq</span>)]</span>
 <span class="kw">pub</span> <span class="kw">struct</span> <span class="ident">ValidPrime</span> {
@@ -1168,6 +1104,7 @@
 <span class="attribute">#[<span class="ident">cfg</span>(<span class="ident">test</span>)]</span>
 <span class="kw">mod</span> <span class="ident">tests</span> {
     <span class="kw">use</span> <span class="kw">super</span>::<span class="kw-2">*</span>;
+    <span class="kw">use</span> <span class="kw">crate</span><span class="ident">::constants::PRIMES</span>;
 
     <span class="attribute">#[<span class="ident">test</span>]</span>
     <span class="kw">fn</span> <span class="ident">inverse_test</span>() {
@@ -1260,51 +1197,6 @@
         <span class="macro">assert_eq!</span>(<span class="ident">iter</span>.<span class="ident">next</span>(), <span class="prelude-val">Some</span>(<span class="number">0b110011</span>));
     }
 }
-
-<span class="kw">pub</span> <span class="kw">const</span> <span class="ident">PRIMES</span>: [<span class="ident">u32</span>; <span class="ident">NUM_PRIMES</span>] <span class="op">=</span> [<span class="number">2</span>, <span class="number">3</span>, <span class="number">5</span>, <span class="number">7</span>, <span class="number">11</span>, <span class="number">13</span>, <span class="number">17</span>, <span class="number">19</span>];
-
-<span class="kw">pub</span> <span class="kw">const</span> <span class="ident">PRIME_TO_INDEX_MAP</span>: [<span class="ident">usize</span>; <span class="ident">MAX_PRIME</span> <span class="op">+</span> <span class="number">1</span>] <span class="op">=</span> [
-    <span class="op">!</span><span class="number">1</span>, <span class="op">!</span><span class="number">1</span>, <span class="number">0</span>, <span class="number">1</span>, <span class="op">!</span><span class="number">1</span>, <span class="number">2</span>, <span class="op">!</span><span class="number">1</span>, <span class="number">3</span>, <span class="op">!</span><span class="number">1</span>, <span class="op">!</span><span class="number">1</span>, <span class="op">!</span><span class="number">1</span>, <span class="number">4</span>, <span class="op">!</span><span class="number">1</span>, <span class="number">5</span>, <span class="op">!</span><span class="number">1</span>, <span class="op">!</span><span class="number">1</span>, <span class="op">!</span><span class="number">1</span>, <span class="number">6</span>, <span class="op">!</span><span class="number">1</span>, <span class="number">7</span>,
-];
-
-<span class="kw">const</span> <span class="ident">INVERSE_TABLE</span>: [[<span class="ident">u32</span>; <span class="ident">MAX_PRIME</span>]; <span class="ident">NUM_PRIMES</span>] <span class="op">=</span> {
-    <span class="kw">let</span> <span class="kw-2">mut</span> <span class="ident">result</span> <span class="op">=</span> [[<span class="number">0</span>; <span class="ident">MAX_PRIME</span>]; <span class="ident">NUM_PRIMES</span>];
-    <span class="macro">const_for!</span> { <span class="ident">i</span> <span class="kw">in</span> <span class="number">0</span> .. <span class="ident">NUM_PRIMES</span> {
-        <span class="kw">let</span> <span class="ident">p</span> <span class="op">=</span> <span class="ident">PRIMES</span>[<span class="ident">i</span>];
-        <span class="macro">const_for!</span> { <span class="ident">k</span> <span class="kw">in</span> <span class="number">1</span> .. <span class="ident">p</span> {
-            <span class="ident">result</span>[<span class="ident">i</span> <span class="kw">as</span> <span class="ident">usize</span>][<span class="ident">k</span> <span class="kw">as</span> <span class="ident">usize</span>] <span class="op">=</span> <span class="ident">power_mod</span>(<span class="ident">p</span>, <span class="ident">k</span>, <span class="ident">p</span> <span class="op">-</span> <span class="number">2</span>);
-        }}
-    }};
-    <span class="ident">result</span>
-};
-
-<span class="macro">macro_rules!</span> <span class="ident">populate_binomial_table</span> {
-    (<span class="macro-nonterminal">$</span><span class="macro-nonterminal">res</span>:<span class="ident">expr</span>, <span class="macro-nonterminal">$</span><span class="macro-nonterminal">size</span>:<span class="ident">ident</span>, <span class="macro-nonterminal">$</span><span class="kw">mod</span>:<span class="macro-nonterminal">expr</span>) <span class="op">=</span><span class="op">&gt;</span> {
-        <span class="macro">const_for!</span> { <span class="ident">n</span> <span class="kw">in</span> <span class="number">0</span> .. <span class="macro-nonterminal">$</span><span class="macro-nonterminal">size</span> {
-            <span class="macro-nonterminal">$</span><span class="macro-nonterminal">res</span>[<span class="ident">n</span>][<span class="number">0</span>] <span class="op">=</span> <span class="number">1</span>;
-            <span class="macro">const_for!</span> { <span class="ident">k</span> <span class="kw">in</span> <span class="number">0</span> .. <span class="ident">n</span> {
-                <span class="macro-nonterminal">$</span><span class="macro-nonterminal">res</span>[<span class="ident">n</span>][<span class="ident">k</span> <span class="op">+</span> <span class="number">1</span>] <span class="op">=</span> (<span class="macro-nonterminal">$</span><span class="macro-nonterminal">res</span>[<span class="ident">n</span> <span class="op">-</span> <span class="number">1</span>][<span class="ident">k</span>] <span class="op">+</span> <span class="macro-nonterminal">$</span><span class="macro-nonterminal">res</span>[<span class="ident">n</span> <span class="op">-</span> <span class="number">1</span>][<span class="ident">k</span> <span class="op">+</span> <span class="number">1</span>]) <span class="op">%</span> <span class="macro-nonterminal">$</span><span class="kw">mod</span>;
-            }}
-        }}
-    };
-}
-<span class="kw">const</span> <span class="macro-nonterminal">BINOMIAL4_TABLE_SIZE</span>: <span class="ident">usize</span> <span class="op">=</span> <span class="number">50</span>;
-
-<span class="kw">const</span> <span class="ident">BINOMIAL4_TABLE</span>: [[<span class="ident">u32</span>; <span class="ident">BINOMIAL4_TABLE_SIZE</span>]; <span class="ident">BINOMIAL4_TABLE_SIZE</span>] <span class="op">=</span> {
-    <span class="kw">let</span> <span class="kw-2">mut</span> <span class="ident">res</span> <span class="op">=</span> [[<span class="number">0</span>; <span class="ident">BINOMIAL4_TABLE_SIZE</span>]; <span class="ident">BINOMIAL4_TABLE_SIZE</span>];
-    <span class="macro">populate_binomial_table!</span>(<span class="ident">res</span>, <span class="ident">BINOMIAL4_TABLE_SIZE</span>, <span class="number">4</span>);
-    <span class="ident">res</span>
-};
-
-<span class="kw">static</span> <span class="ident">BINOMIAL_TABLE</span>: [[[<span class="ident">u32</span>; <span class="ident">MAX_PRIME</span>]; <span class="ident">MAX_PRIME</span>]; <span class="ident">NUM_PRIMES</span>] <span class="op">=</span> {
-    <span class="kw">let</span> <span class="kw-2">mut</span> <span class="ident">result</span> <span class="op">=</span> [[[<span class="number">0</span>; <span class="ident">MAX_PRIME</span>]; <span class="ident">MAX_PRIME</span>]; <span class="ident">NUM_PRIMES</span>];
-    <span class="macro">const_for!</span> { <span class="ident">i</span> <span class="kw">in</span> <span class="number">0</span> .. <span class="ident">NUM_PRIMES</span> {
-        <span class="kw">let</span> <span class="ident">p</span> <span class="op">=</span> <span class="ident">PRIMES</span>[<span class="ident">i</span>];
-        <span class="kw">let</span> <span class="ident">pu</span> <span class="op">=</span> <span class="ident">p</span> <span class="kw">as</span> <span class="ident">usize</span>;
-        <span class="macro">populate_binomial_table!</span>(<span class="ident">result</span>[<span class="ident">i</span>], <span class="ident">pu</span>, <span class="ident">p</span>);
-    }}
-    <span class="ident">result</span>
-};
 </pre></div>
 </section><section id="search" class="content hidden"></section><div id="rustdoc-vars" data-root-path="../../" data-current-crate="fp" data-search-index-js="../../search-index.js" data-search-js="../../search.js"></div>
     <script src="../../main.js"></script><script src="../../source-script.js"></script><script src="../../source-files.js"></script>
