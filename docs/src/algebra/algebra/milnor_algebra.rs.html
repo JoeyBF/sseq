@@ -1697,8 +1697,6 @@
 <span id="1673">1673</span>
 <span id="1674">1674</span>
 <span id="1675">1675</span>
-<span id="1676">1676</span>
-<span id="1677">1677</span>
 </pre><pre class="rust">
 <span class="kw">use</span> <span class="ident">itertools::Itertools</span>;
 <span class="kw">use</span> <span class="ident">rustc_hash::FxHashMap</span> <span class="kw">as</span> <span class="ident">HashMap</span>;
@@ -1850,8 +1848,6 @@
 
 <span class="kw">impl</span> <span class="ident">MilnorAlgebra</span> {
     <span class="kw">pub</span> <span class="kw">fn</span> <span class="ident">new</span>(<span class="ident">p</span>: <span class="ident">ValidPrime</span>) <span class="op">-</span><span class="op">&gt;</span> <span class="self">Self</span> {
-        <span class="comment">// fp::vector::initialize_limb_bit_index_table(p);</span>
-
         <span class="kw">let</span> <span class="ident">profile</span> <span class="op">=</span> <span class="ident">MilnorProfile</span> {
             <span class="ident">truncated</span>: <span class="bool-val">false</span>,
             <span class="ident">q_part</span>: <span class="op">!</span><span class="number">0</span>,

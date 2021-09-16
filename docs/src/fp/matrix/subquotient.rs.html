@@ -204,7 +204,6 @@
 <span id="180">180</span>
 <span id="181">181</span>
 <span id="182">182</span>
-<span id="183">183</span>
 </pre><pre class="rust">
 <span class="kw">use</span> <span class="kw">super</span><span class="ident">::Subspace</span>;
 <span class="kw">use</span> <span class="kw">crate</span><span class="ident">::matrix::Matrix</span>;
@@ -360,7 +359,6 @@
     <span class="attribute">#[<span class="ident">test</span>]</span>
     <span class="kw">fn</span> <span class="ident">test_add_gen</span>() {
         <span class="kw">let</span> <span class="ident">p</span> <span class="op">=</span> <span class="ident">ValidPrime::new</span>(<span class="number">3</span>);
-        <span class="comment">// crate::vector::initialize_limb_bit_index_table(p);</span>
 
         <span class="kw">let</span> <span class="kw-2">mut</span> <span class="ident">sq</span> <span class="op">=</span> <span class="ident">Subquotient::new</span>(<span class="ident">p</span>, <span class="number">5</span>);
         <span class="ident">sq</span>.<span class="ident">quotient</span>(<span class="ident">FpVector::from_slice</span>(<span class="ident">p</span>, <span class="kw-2">&amp;</span>[<span class="number">1</span>, <span class="number">1</span>, <span class="number">0</span>, <span class="number">0</span>, <span class="number">1</span>]).<span class="ident">as_slice</span>());

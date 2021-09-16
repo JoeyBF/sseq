@@ -1408,11 +1408,6 @@
 <span id="1384">1384</span>
 <span id="1385">1385</span>
 <span id="1386">1386</span>
-<span id="1387">1387</span>
-<span id="1388">1388</span>
-<span id="1389">1389</span>
-<span id="1390">1390</span>
-<span id="1391">1391</span>
 </pre><pre class="rust">
 <span class="doccomment">//! This module is provides wrappers around the contents of [`crate::vector_inner`]. The main</span>
 <span class="doccomment">//! purpose is to put [`FpVectorP`] for different `p` into a single enum. It does the same for the</span>
@@ -1423,9 +1418,8 @@
 <span class="doccomment">//!</span>
 <span class="doccomment">//! This module is only used when the `odd-primes` feature is enabled.</span>
 
-<span class="kw">use</span> <span class="kw">crate</span><span class="ident">::prime::ValidPrime</span>;
-<span class="comment">// pub use crate::vector_inner::initialize_limb_bit_index_table;</span>
 <span class="kw">use</span> <span class="kw">crate</span><span class="ident">::limb</span>::{<span class="ident">entries_per_limb</span>, <span class="ident">Limb</span>};
+<span class="kw">use</span> <span class="kw">crate</span><span class="ident">::prime::ValidPrime</span>;
 <span class="kw">use</span> <span class="kw">crate</span><span class="ident">::vector_inner</span>::{
     <span class="ident">FpVectorIterator</span>, <span class="ident">FpVectorNonZeroIteratorP</span>, <span class="ident">FpVectorP</span>, <span class="ident">SliceMutP</span>, <span class="ident">SliceP</span>,
 };
@@ -1928,7 +1922,6 @@
             <span class="attribute">#[<span class="ident">trace</span>]</span>
             <span class="kw">fn</span> <span class="macro-nonterminal">$</span><span class="macro-nonterminal">name</span>(<span class="attribute">#[<span class="ident">values</span>(<span class="number">2</span>, <span class="number">3</span>, <span class="number">5</span>, <span class="number">7</span>)]</span> <span class="ident">p</span>: <span class="ident">u32</span>) {
                 <span class="kw">let</span> <span class="macro-nonterminal">$</span><span class="macro-nonterminal">p</span> <span class="op">=</span> <span class="ident">ValidPrime::new</span>(<span class="ident">p</span>);
-                <span class="comment">// initialize_limb_bit_index_table($p);</span>
 
                 <span class="macro-nonterminal">$</span><span class="macro-nonterminal">body</span>
             }
@@ -1939,7 +1932,6 @@
             <span class="attribute">#[<span class="ident">trace</span>]</span>
             <span class="kw">fn</span> <span class="macro-nonterminal">$</span><span class="macro-nonterminal">name</span>(<span class="attribute">#[<span class="ident">values</span>(<span class="number">2</span>, <span class="number">3</span>, <span class="number">5</span>, <span class="number">7</span>)]</span> <span class="ident">p</span>: <span class="ident">u32</span>, <span class="attribute">#[<span class="ident">values</span>(<span class="number">10</span>, <span class="number">20</span>, <span class="number">70</span>, <span class="number">100</span>, <span class="number">1000</span>)]</span> <span class="macro-nonterminal">$</span><span class="macro-nonterminal">dim</span>: <span class="ident">usize</span>) {
                 <span class="kw">let</span> <span class="macro-nonterminal">$</span><span class="macro-nonterminal">p</span> <span class="op">=</span> <span class="ident">ValidPrime::new</span>(<span class="ident">p</span>);
-                <span class="comment">// initialize_limb_bit_index_table($p);</span>
 
                 <span class="macro-nonterminal">$</span><span class="macro-nonterminal">body</span>
             }
@@ -1950,7 +1942,6 @@
             <span class="attribute">#[<span class="ident">trace</span>]</span>
             <span class="kw">fn</span> <span class="macro-nonterminal">$</span><span class="macro-nonterminal">name</span>(<span class="attribute">#[<span class="ident">values</span>(<span class="number">2</span>, <span class="number">3</span>, <span class="number">5</span>, <span class="number">7</span>)]</span> <span class="ident">p</span>: <span class="ident">u32</span>, <span class="attribute">#[<span class="ident">values</span>(<span class="number">10</span>, <span class="number">20</span>, <span class="number">70</span>, <span class="number">100</span>, <span class="number">1000</span>)]</span> <span class="macro-nonterminal">$</span><span class="macro-nonterminal">dim</span>: <span class="ident">usize</span>) {
                 <span class="kw">let</span> <span class="macro-nonterminal">$</span><span class="macro-nonterminal">p</span> <span class="op">=</span> <span class="ident">ValidPrime::new</span>(<span class="ident">p</span>);
-                <span class="comment">// initialize_limb_bit_index_table($p);</span>
 
                 <span class="kw">let</span> <span class="macro-nonterminal">$</span><span class="macro-nonterminal">slice_start</span> <span class="op">=</span> <span class="kw">match</span> <span class="macro-nonterminal">$</span><span class="macro-nonterminal">dim</span> {
                     <span class="number">10</span> <span class="op">=</span><span class="op">&gt;</span> <span class="number">5</span>,
@@ -2081,7 +2072,7 @@
             <span class="kw">let</span> <span class="ident">w</span> <span class="op">=</span> <span class="ident">FpVector::from_slice</span>(<span class="ident">p</span>, <span class="kw-2">&amp;</span><span class="ident">w_arr</span>);
 
             <span class="ident">v</span>.<span class="ident">slice_mut</span>(<span class="ident">slice_start</span>, <span class="ident">slice_end</span>)
-            .<span class="ident">add</span>(<span class="ident">w</span>.<span class="ident">slice</span>(<span class="ident">slice_start</span>, <span class="ident">slice_end</span>), <span class="number">1</span>);
+                .<span class="ident">add</span>(<span class="ident">w</span>.<span class="ident">slice</span>(<span class="ident">slice_start</span>, <span class="ident">slice_end</span>), <span class="number">1</span>);
 
             <span class="kw">for</span> <span class="ident">i</span> <span class="kw">in</span> <span class="ident">slice_start</span>..<span class="ident">slice_end</span> {
                 <span class="ident">v_arr</span>[<span class="ident">i</span>] <span class="op">=</span> (<span class="ident">v_arr</span>[<span class="ident">i</span>] <span class="op">+</span> <span class="ident">w_arr</span>[<span class="ident">i</span>]) <span class="op">%</span> <span class="kw-2">*</span><span class="ident">p</span>;
@@ -2284,7 +2275,6 @@
     <span class="attribute">#[<span class="ident">trace</span>]</span>
     <span class="kw">fn</span> <span class="ident">test_add_carry</span>(<span class="attribute">#[<span class="ident">values</span>(<span class="number">2</span>)]</span> <span class="ident">p</span>: <span class="ident">u32</span>, <span class="attribute">#[<span class="ident">values</span>(<span class="number">10</span>, <span class="number">20</span>, <span class="number">70</span>, <span class="number">100</span>, <span class="number">1000</span>)]</span> <span class="ident">dim</span>: <span class="ident">usize</span>) {
         <span class="kw">let</span> <span class="ident">p</span> <span class="op">=</span> <span class="ident">ValidPrime::new</span>(<span class="ident">p</span>);
-        <span class="comment">// initialize_limb_bit_index_table(p);</span>
         <span class="kw">const</span> <span class="ident">E_MAX</span>: <span class="ident">usize</span> <span class="op">=</span> <span class="number">4</span>;
         <span class="kw">let</span> <span class="ident">pto_the_e_max</span> <span class="op">=</span> (<span class="kw-2">*</span><span class="ident">p</span> <span class="op">*</span> <span class="kw-2">*</span><span class="ident">p</span> <span class="op">*</span> <span class="kw-2">*</span><span class="ident">p</span> <span class="op">*</span> <span class="kw-2">*</span><span class="ident">p</span>) <span class="op">*</span> <span class="kw-2">*</span><span class="ident">p</span>;
         <span class="kw">let</span> <span class="kw-2">mut</span> <span class="ident">v</span> <span class="op">=</span> <span class="ident">Vec::with_capacity</span>(<span class="ident">E_MAX</span> <span class="op">+</span> <span class="number">1</span>);
