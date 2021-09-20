@@ -205,7 +205,6 @@
 <span id="181">181</span>
 <span id="182">182</span>
 <span id="183">183</span>
-<span id="184">184</span>
 </pre><pre class="rust">
 <span class="kw">pub</span>(<span class="kw">crate</span>) <span class="kw">use</span> <span class="kw">crate</span><span class="ident">::constants::Limb</span>;
 
@@ -346,7 +345,6 @@
 
 <span class="doccomment">/// Return the number of limbs required to hold `dim` entries.</span>
 <span class="kw">pub</span>(<span class="kw">crate</span>) <span class="kw">const</span> <span class="kw">fn</span> <span class="ident">number</span><span class="op">&lt;</span><span class="kw">const</span> <span class="ident">P</span>: <span class="ident">u32</span><span class="op">&gt;</span>(<span class="ident">dim</span>: <span class="ident">usize</span>) <span class="op">-</span><span class="op">&gt;</span> <span class="ident">usize</span> {
-    <span class="comment">// debug_assert!(dim &lt; MAX_LEN);</span>
     <span class="kw">if</span> <span class="ident">dim</span> <span class="op">=</span><span class="op">=</span> <span class="number">0</span> {
         <span class="number">0</span>
     } <span class="kw">else</span> {
