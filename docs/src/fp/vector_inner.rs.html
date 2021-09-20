@@ -1504,7 +1504,7 @@
     <span class="doccomment">/// Find the index and value of the first non-zero entry of the vector. `None` if the vector is zero.</span>
     <span class="kw">pub</span> <span class="kw">fn</span> <span class="ident">first_nonzero</span>(<span class="kw-2">&amp;</span><span class="self">self</span>) <span class="op">-</span><span class="op">&gt;</span> <span class="prelude-ty">Option</span><span class="op">&lt;</span>(<span class="ident">usize</span>, <span class="ident">u32</span>)<span class="op">&gt;</span> {
         <span class="kw">let</span> <span class="ident">entries_per_limb</span> <span class="op">=</span> <span class="ident">limb::entries_per_limb_const</span>::<span class="op">&lt;</span><span class="ident">P</span><span class="op">&gt;</span>();
-        <span class="kw">let</span> <span class="ident">bit_length</span> <span class="op">=</span> <span class="ident">limb::bit_length</span>::<span class="op">&lt;</span><span class="ident">P</span><span class="op">&gt;</span>();
+        <span class="kw">let</span> <span class="ident">bit_length</span> <span class="op">=</span> <span class="ident">limb::bit_length_const</span>::<span class="op">&lt;</span><span class="ident">P</span><span class="op">&gt;</span>();
         <span class="kw">let</span> <span class="ident">bitmask</span> <span class="op">=</span> <span class="ident">limb::bitmask</span>::<span class="op">&lt;</span><span class="ident">P</span><span class="op">&gt;</span>();
         <span class="kw">for</span> (<span class="ident">i</span>, <span class="kw-2">&amp;</span><span class="ident">limb</span>) <span class="kw">in</span> <span class="self">self</span>.<span class="ident">limbs</span>.<span class="ident">iter</span>().<span class="ident">enumerate</span>() {
             <span class="kw">if</span> <span class="ident">limb</span> <span class="op">=</span><span class="op">=</span> <span class="number">0</span> {
@@ -1658,7 +1658,7 @@
 <span class="kw">impl</span><span class="op">&lt;</span><span class="lifetime">&#39;a</span>, <span class="kw">const</span> <span class="ident">P</span>: <span class="ident">u32</span><span class="op">&gt;</span> <span class="ident">SliceP</span><span class="op">&lt;</span><span class="lifetime">&#39;a</span>, <span class="ident">P</span><span class="op">&gt;</span> {
     <span class="attribute">#[<span class="ident">inline</span>]</span>
     <span class="kw">fn</span> <span class="ident">offset</span>(<span class="kw-2">&amp;</span><span class="self">self</span>) <span class="op">-</span><span class="op">&gt;</span> <span class="ident">usize</span> {
-        <span class="kw">let</span> <span class="ident">bit_length</span> <span class="op">=</span> <span class="ident">limb::bit_length</span>::<span class="op">&lt;</span><span class="ident">P</span><span class="op">&gt;</span>();
+        <span class="kw">let</span> <span class="ident">bit_length</span> <span class="op">=</span> <span class="ident">limb::bit_length_const</span>::<span class="op">&lt;</span><span class="ident">P</span><span class="op">&gt;</span>();
         <span class="kw">let</span> <span class="ident">entries_per_limb</span> <span class="op">=</span> <span class="ident">limb::entries_per_limb_const</span>::<span class="op">&lt;</span><span class="ident">P</span><span class="op">&gt;</span>();
         (<span class="self">self</span>.<span class="ident">start</span> <span class="op">%</span> <span class="ident">entries_per_limb</span>) <span class="op">*</span> <span class="ident">bit_length</span>
     }
@@ -1676,7 +1676,7 @@
     <span class="attribute">#[<span class="ident">inline</span>(<span class="ident">always</span>)]</span>
     <span class="kw">fn</span> <span class="ident">max_limb_mask</span>(<span class="kw-2">&amp;</span><span class="self">self</span>) <span class="op">-</span><span class="op">&gt;</span> <span class="ident">Limb</span> {
         <span class="kw">let</span> <span class="ident">num_entries</span> <span class="op">=</span> <span class="number">1</span> <span class="op">+</span> (<span class="self">self</span>.<span class="ident">end</span> <span class="op">-</span> <span class="number">1</span>) <span class="op">%</span> <span class="ident">limb::entries_per_limb_const</span>::<span class="op">&lt;</span><span class="ident">P</span><span class="op">&gt;</span>();
-        <span class="kw">let</span> <span class="ident">bit_max</span> <span class="op">=</span> <span class="ident">num_entries</span> <span class="op">*</span> <span class="ident">limb::bit_length</span>::<span class="op">&lt;</span><span class="ident">P</span><span class="op">&gt;</span>();
+        <span class="kw">let</span> <span class="ident">bit_max</span> <span class="op">=</span> <span class="ident">num_entries</span> <span class="op">*</span> <span class="ident">limb::bit_length_const</span>::<span class="op">&lt;</span><span class="ident">P</span><span class="op">&gt;</span>();
 
         (<span class="op">!</span><span class="number">0</span>) <span class="op">&gt;</span><span class="op">&gt;</span> (<span class="ident">BITS_PER_LIMB</span> <span class="op">-</span> <span class="ident">bit_max</span>)
     }
@@ -1999,7 +1999,7 @@
             <span class="ident">source</span>.<span class="ident">len</span>()
         );
         <span class="kw">let</span> <span class="ident">offset_shift</span> <span class="op">=</span> <span class="ident">source</span>.<span class="ident">offset</span>() <span class="op">-</span> <span class="ident">target</span>.<span class="ident">offset</span>();
-        <span class="kw">let</span> <span class="ident">bit_length</span> <span class="op">=</span> <span class="ident">limb::bit_length</span>::<span class="op">&lt;</span><span class="ident">P</span><span class="op">&gt;</span>();
+        <span class="kw">let</span> <span class="ident">bit_length</span> <span class="op">=</span> <span class="ident">limb::bit_length_const</span>::<span class="op">&lt;</span><span class="ident">P</span><span class="op">&gt;</span>();
         <span class="kw">let</span> <span class="ident">entries_per_limb</span> <span class="op">=</span> <span class="ident">limb::entries_per_limb_const</span>::<span class="op">&lt;</span><span class="ident">P</span><span class="op">&gt;</span>();
         <span class="kw">let</span> <span class="ident">usable_bits_per_limb</span> <span class="op">=</span> <span class="ident">bit_length</span> <span class="op">*</span> <span class="ident">entries_per_limb</span>;
         <span class="kw">let</span> <span class="ident">tail_shift</span> <span class="op">=</span> <span class="ident">usable_bits_per_limb</span> <span class="op">-</span> <span class="ident">offset_shift</span>;
@@ -2069,7 +2069,7 @@
             <span class="ident">source</span>.<span class="ident">len</span>()
         );
         <span class="kw">let</span> <span class="ident">offset_shift</span> <span class="op">=</span> <span class="ident">target</span>.<span class="ident">offset</span>() <span class="op">-</span> <span class="ident">source</span>.<span class="ident">offset</span>();
-        <span class="kw">let</span> <span class="ident">bit_length</span> <span class="op">=</span> <span class="ident">limb::bit_length</span>::<span class="op">&lt;</span><span class="ident">P</span><span class="op">&gt;</span>();
+        <span class="kw">let</span> <span class="ident">bit_length</span> <span class="op">=</span> <span class="ident">limb::bit_length_const</span>::<span class="op">&lt;</span><span class="ident">P</span><span class="op">&gt;</span>();
         <span class="kw">let</span> <span class="ident">entries_per_limb</span> <span class="op">=</span> <span class="ident">limb::entries_per_limb_const</span>::<span class="op">&lt;</span><span class="ident">P</span><span class="op">&gt;</span>();
         <span class="kw">let</span> <span class="ident">usable_bits_per_limb</span> <span class="op">=</span> <span class="ident">bit_length</span> <span class="op">*</span> <span class="ident">entries_per_limb</span>;
         <span class="kw">let</span> <span class="ident">tail_shift</span> <span class="op">=</span> <span class="ident">usable_bits_per_limb</span> <span class="op">-</span> <span class="ident">offset_shift</span>;
@@ -2171,7 +2171,7 @@
         }
         <span class="kw">let</span> <span class="ident">pair</span> <span class="op">=</span> <span class="ident">limb::limb_bit_index_pair</span>::<span class="op">&lt;</span><span class="ident">P</span><span class="op">&gt;</span>(<span class="ident">vec</span>.<span class="ident">start</span>);
 
-        <span class="kw">let</span> <span class="ident">bit_length</span> <span class="op">=</span> <span class="ident">limb::bit_length</span>::<span class="op">&lt;</span><span class="ident">P</span><span class="op">&gt;</span>();
+        <span class="kw">let</span> <span class="ident">bit_length</span> <span class="op">=</span> <span class="ident">limb::bit_length_const</span>::<span class="op">&lt;</span><span class="ident">P</span><span class="op">&gt;</span>();
         <span class="kw">let</span> <span class="ident">cur_limb</span> <span class="op">=</span> <span class="ident">limbs</span>[<span class="ident">pair</span>.<span class="ident">limb</span>] <span class="op">&gt;</span><span class="op">&gt;</span> <span class="ident">pair</span>.<span class="ident">bit_index</span>;
 
         <span class="kw">let</span> <span class="ident">entries_per_limb</span> <span class="op">=</span> <span class="ident">limb::entries_per_limb_const</span>::<span class="op">&lt;</span><span class="ident">P</span><span class="op">&gt;</span>();
@@ -2291,7 +2291,7 @@
 <span class="kw">impl</span><span class="op">&lt;</span><span class="lifetime">&#39;a</span>, <span class="kw">const</span> <span class="ident">P</span>: <span class="ident">u32</span><span class="op">&gt;</span> <span class="ident">Iterator</span> <span class="kw">for</span> <span class="ident">FpVectorNonZeroIteratorP</span><span class="op">&lt;</span><span class="lifetime">&#39;a</span>, <span class="ident">P</span><span class="op">&gt;</span> {
     <span class="kw">type</span> <span class="ident">Item</span> <span class="op">=</span> (<span class="ident">usize</span>, <span class="ident">u32</span>);
     <span class="kw">fn</span> <span class="ident">next</span>(<span class="kw-2">&amp;</span><span class="kw-2">mut</span> <span class="self">self</span>) <span class="op">-</span><span class="op">&gt;</span> <span class="prelude-ty">Option</span><span class="op">&lt;</span><span class="self">Self</span><span class="ident">::Item</span><span class="op">&gt;</span> {
-        <span class="kw">let</span> <span class="ident">bit_length</span>: <span class="ident">usize</span> <span class="op">=</span> <span class="ident">limb::bit_length</span>::<span class="op">&lt;</span><span class="ident">P</span><span class="op">&gt;</span>();
+        <span class="kw">let</span> <span class="ident">bit_length</span>: <span class="ident">usize</span> <span class="op">=</span> <span class="ident">limb::bit_length_const</span>::<span class="op">&lt;</span><span class="ident">P</span><span class="op">&gt;</span>();
         <span class="kw">let</span> <span class="ident">bitmask</span>: <span class="ident">Limb</span> <span class="op">=</span> <span class="ident">limb::bitmask</span>::<span class="op">&lt;</span><span class="ident">P</span><span class="op">&gt;</span>();
         <span class="kw">let</span> <span class="ident">entries_per_limb</span>: <span class="ident">usize</span> <span class="op">=</span> <span class="ident">limb::entries_per_limb_const</span>::<span class="op">&lt;</span><span class="ident">P</span><span class="op">&gt;</span>();
         <span class="kw">loop</span> {

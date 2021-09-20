@@ -1406,8 +1406,6 @@
 <span id="1382">1382</span>
 <span id="1383">1383</span>
 <span id="1384">1384</span>
-<span id="1385">1385</span>
-<span id="1386">1386</span>
 </pre><pre class="rust">
 <span class="doccomment">//! This module is provides wrappers around the contents of [`crate::vector_inner`]. The main</span>
 <span class="doccomment">//! purpose is to put [`FpVectorP`] for different `p` into a single enum. It does the same for the</span>
@@ -1830,8 +1828,7 @@
 <span class="attribute">#[<span class="ident">cfg</span>(<span class="ident">test</span>)]</span>
 <span class="kw">mod</span> <span class="ident">test</span> {
     <span class="kw">use</span> <span class="kw">super</span>::<span class="kw-2">*</span>;
-    <span class="kw">use</span> <span class="kw">crate</span><span class="ident">::limb::sign_rule</span>;
-    <span class="comment">// use crate::vector_inner::limb;</span>
+    <span class="kw">use</span> <span class="kw">crate</span><span class="ident">::limb</span>;
     <span class="kw">use</span> <span class="ident">rand::Rng</span>;
     <span class="kw">use</span> <span class="ident">rstest::rstest</span>;
 
@@ -2064,7 +2061,6 @@
         }
 
         <span class="kw">fn</span> <span class="ident">test_add_slice_to_slice</span>(<span class="ident">p</span>: <span class="ident">ValidPrime</span>, <span class="ident">dim</span>: <span class="ident">usize</span>, <span class="ident">slice_start</span>: <span class="ident">usize</span>, <span class="ident">slice_end</span>: <span class="ident">usize</span>) {
-            <span class="macro">eprintln!</span>(<span class="string">&quot;slice_start: {}, slice_end: {}&quot;</span>, <span class="ident">slice_start</span>, <span class="ident">slice_end</span>);
             <span class="kw">let</span> <span class="kw-2">mut</span> <span class="ident">v_arr</span> <span class="op">=</span> <span class="ident">random_vector</span>(<span class="ident">p</span>, <span class="ident">dim</span>);
             <span class="kw">let</span> <span class="ident">w_arr</span> <span class="op">=</span> <span class="ident">random_vector</span>(<span class="ident">p</span>, <span class="ident">dim</span>);
 
@@ -2348,10 +2344,10 @@
 
     <span class="attribute">#[<span class="ident">test</span>]</span>
     <span class="kw">fn</span> <span class="ident">test_sign_rule_limb</span>() {
-        <span class="macro">assert!</span>(<span class="ident">sign_rule</span>(<span class="number">1</span>, <span class="number">0b10</span>) <span class="op">=</span><span class="op">=</span> <span class="number">1</span>);
-        <span class="macro">assert!</span>(<span class="ident">sign_rule</span>(<span class="number">0b10</span>, <span class="number">1</span>) <span class="op">=</span><span class="op">=</span> <span class="number">0</span>);
-        <span class="macro">assert!</span>(<span class="ident">sign_rule</span>(<span class="number">0x84012c02</span>, <span class="number">0x6b920241</span>) <span class="op">=</span><span class="op">=</span> <span class="number">1</span>);
-        <span class="macro">assert!</span>(<span class="ident">sign_rule</span>(<span class="number">0x6b920241</span>, <span class="number">0x84012c02</span>) <span class="op">=</span><span class="op">=</span> <span class="number">0</span>);
+        <span class="macro">assert!</span>(<span class="ident">limb::sign_rule</span>(<span class="number">1</span>, <span class="number">0b10</span>) <span class="op">=</span><span class="op">=</span> <span class="number">1</span>);
+        <span class="macro">assert!</span>(<span class="ident">limb::sign_rule</span>(<span class="number">0b10</span>, <span class="number">1</span>) <span class="op">=</span><span class="op">=</span> <span class="number">0</span>);
+        <span class="macro">assert!</span>(<span class="ident">limb::sign_rule</span>(<span class="number">0x84012c02</span>, <span class="number">0x6b920241</span>) <span class="op">=</span><span class="op">=</span> <span class="number">1</span>);
+        <span class="macro">assert!</span>(<span class="ident">limb::sign_rule</span>(<span class="number">0x6b920241</span>, <span class="number">0x84012c02</span>) <span class="op">=</span><span class="op">=</span> <span class="number">0</span>);
     }
 
     <span class="attribute">#[<span class="ident">test</span>]</span>
