@@ -270,6 +270,30 @@ impl Matrix {
     pub fn row_mut(&mut self, row: usize) -> SliceMut {
         self.vectors[row].as_slice_mut()
     }
+
+    pub fn to_image<Q: AsRef<std::path::Path>>(&self, path: Q) -> Result<(), image::ImageError> {
+        let height = self.rows() as u32;
+        let (yes, no) = (u8::MAX, 0);
+        if height == 0 {
+            Ok(())
+        } else {
+            let width = self[0].len() as u32;
+            image::ImageBuffer::from_fn(width, height, |x, y| {
+                image::Luma([if self[y as usize].entry(x as usize) == 1 {
+                    yes
+                } else {
+                    no
+                }])
+            })
+            .save(path)
+        }
+    }
+}
+
+impl From<Matrix> for Vec<FpVector> {
+    fn from(matrix: Matrix) -> Vec<FpVector> {
+        matrix.vectors
+    }
 }
 
 impl Matrix {
@@ -1171,6 +1195,31 @@ impl<'a> MatrixSliceMut<'a> {
         debug_assert_eq!(self.rows(), self.columns());
         for (i, row) in self.vectors.iter_mut().enumerate() {
             row.add_basis_element(self.col_start + i, 1);
+        }
+    }
+
+    pub fn to_image<Q: AsRef<std::path::Path>>(
+        &mut self,
+        path: Q,
+    ) -> Result<(), image::ImageError> {
+        let height = self.rows() as u32;
+        let (yes, no) = (u8::MAX, 0);
+        if height == 0 {
+            Ok(())
+        } else {
+            let width = self.row(0).len() as u32;
+            if width == 0 {
+                Ok(())
+            } else {
+                image::ImageBuffer::from_fn(width, height, |x, y| {
+                    image::Luma([if self.row(y as usize).entry(x as usize) == 1 {
+                        yes
+                    } else {
+                        no
+                    }])
+                })
+                .save(path)
+            }
         }
     }
 

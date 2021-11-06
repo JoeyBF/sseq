@@ -476,6 +476,12 @@ where
         current_differential.get_matrix(matrix.segment(1, 1), t);
         matrix.segment(2, 2).add_identity();
 
+        matrix
+            .segment(1, 1)
+            .to_image(format!("target/images_cropped/init_{}_{}.png", s, t))
+            .unwrap_or_else(|e| panic!("Unable to save image at ({},{}): {}", s, t, e));
+
+        // This slices the underling matrix. Be sure to revert this.
         matrix.row_reduce();
 
         if !self.has_computed_bidegree(s + 1, t) {
@@ -631,7 +637,20 @@ where
                 }
             }
         }
+
+        matrix
+            .segment(1, 1)
+            .to_image(format!("target/images_cropped/mat_{}_{}.png", s, t))
+            .unwrap_or_else(|e| panic!("Unable to save image at ({},{}): {}", s, t, e));
         let (cm_qi, res_qi) = matrix.compute_quasi_inverses();
+        // cm_qi
+        //     .preimage()
+        //     .to_image(format!("target/images_cropped/cm_{}_{}.png", s, t))
+        //     .unwrap_or_else(|e| panic!("Unable to save image at ({},{}): {}", s, t, e));
+        res_qi
+            .preimage()
+            .to_image(format!("target/images_cropped/res_{}_{}.png", s, t))
+            .unwrap_or_else(|e| panic!("Unable to save image at ({},{}): {}", s, t, e));
 
         timer.end(format_args!(
             "Computed bidegree ({n}, {s}), num new gens = {num_new_gens}, density = {density:.2}%",
