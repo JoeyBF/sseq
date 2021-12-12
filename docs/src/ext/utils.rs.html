@@ -1,4 +1,5 @@
-<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="Source of the Rust file `src&#x2F;utils.rs`."><meta name="keywords" content="rust, rustlang, rust-lang"><title>utils.rs - source</title><link rel="stylesheet" type="text/css" href="../../normalize.css"><link rel="stylesheet" type="text/css" href="../../rustdoc.css" id="mainThemeStyle"><link rel="stylesheet" type="text/css" href="../../light.css"  id="themeStyle"><link rel="stylesheet" type="text/css" href="../../dark.css" disabled ><link rel="stylesheet" type="text/css" href="../../ayu.css" disabled ><script id="default-settings" ></script><script src="../../storage.js"></script><script src="../../crates.js"></script><noscript><link rel="stylesheet" href="../../noscript.css"></noscript><link rel="alternate icon" type="image/png" href="../../favicon-16x16.png"><link rel="alternate icon" type="image/png" href="../../favicon-32x32.png"><link rel="icon" type="image/svg+xml" href="../../favicon.svg"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.13.3/dist/katex.min.css" integrity="sha384-ThssJ7YtjywV52Gj4JE/1SQEDoMEckXyhkFVwaf4nDSm5OBlXeedVYjuuUd0Yua+" crossorigin="anonymous">
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="Source of the Rust file `src&#x2F;utils.rs`."><meta name="keywords" content="rust, rustlang, rust-lang"><title>utils.rs - source</title><link rel="stylesheet" type="text/css" href="../../normalize.css"><link rel="stylesheet" type="text/css" href="../../rustdoc.css" id="mainThemeStyle"><link rel="stylesheet" type="text/css" href="../../light.css"  id="themeStyle"><link rel="stylesheet" type="text/css" href="../../dark.css" disabled ><link rel="stylesheet" type="text/css" href="../../ayu.css" disabled ><script id="default-settings" ></script><script src="../../storage.js"></script><script src="../../crates.js"></script><script defer src="../../main.js"></script><script defer src="../../source-script.js"></script><script defer src="../../source-files.js"></script>
+    <noscript><link rel="stylesheet" href="../../noscript.css"></noscript><link rel="alternate icon" type="image/png" href="../../favicon-16x16.png"><link rel="alternate icon" type="image/png" href="../../favicon-32x32.png"><link rel="icon" type="image/svg+xml" href="../../favicon.svg"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.13.3/dist/katex.min.css" integrity="sha384-ThssJ7YtjywV52Gj4JE/1SQEDoMEckXyhkFVwaf4nDSm5OBlXeedVYjuuUd0Yua+" crossorigin="anonymous">
 <!-- The loading of KaTeX is deferred to speed up page rendering -->
 <script defer src="https://cdn.jsdelivr.net/npm/katex@0.13.3/dist/katex.min.js" integrity="sha384-Bi8OWqMXO1ta+a4EPkZv7bYGIes7C3krGSZoTGNTAnAn5eYQc7IIXrJ/7ck1drAi" crossorigin="anonymous"></script>
 <!-- To automatically render math in text elements, include the auto-render extension: -->
@@ -406,6 +407,34 @@
 <span id="381">381</span>
 <span id="382">382</span>
 <span id="383">383</span>
+<span id="384">384</span>
+<span id="385">385</span>
+<span id="386">386</span>
+<span id="387">387</span>
+<span id="388">388</span>
+<span id="389">389</span>
+<span id="390">390</span>
+<span id="391">391</span>
+<span id="392">392</span>
+<span id="393">393</span>
+<span id="394">394</span>
+<span id="395">395</span>
+<span id="396">396</span>
+<span id="397">397</span>
+<span id="398">398</span>
+<span id="399">399</span>
+<span id="400">400</span>
+<span id="401">401</span>
+<span id="402">402</span>
+<span id="403">403</span>
+<span id="404">404</span>
+<span id="405">405</span>
+<span id="406">406</span>
+<span id="407">407</span>
+<span id="408">408</span>
+<span id="409">409</span>
+<span id="410">410</span>
+<span id="411">411</span>
 </pre><pre class="rust"><code><span class="kw">use</span> <span class="ident"><span class="kw">crate</span>::chain_complex</span>::{<span class="ident">ChainComplex</span>, <span class="ident">FiniteChainComplex</span>, <span class="ident">FreeChainComplex</span>};
 <span class="kw">use</span> <span class="ident"><span class="kw">crate</span>::resolution::Resolution</span>;
 <span class="kw">use</span> <span class="ident"><span class="kw">crate</span>::CCC</span>;
@@ -737,28 +766,6 @@
     <span class="ident">thread_token::TokenBucket::new</span>(<span class="ident">query_num_threads</span>())
 }
 
-<span class="kw">use</span> <span class="ident">std::collections::HashMap</span>;
-<span class="kw">use</span> <span class="ident">std::hash</span>::{<span class="ident">BuildHasher</span>, <span class="ident">Hash</span>, <span class="ident">Hasher</span>};
-
-<span class="kw">pub</span> <span class="kw">trait</span> <span class="ident">HashMapTuple</span><span class="op">&lt;</span><span class="ident">A</span>, <span class="ident">B</span>, <span class="ident">C</span><span class="op">&gt;</span> {
-    <span class="kw">fn</span> <span class="ident">get_tuple</span>(<span class="kw-2">&amp;</span><span class="self">self</span>, <span class="ident">a</span>: <span class="kw-2">&amp;</span><span class="ident">A</span>, <span class="ident">b</span>: <span class="kw-2">&amp;</span><span class="ident">B</span>) -&gt; <span class="prelude-ty">Option</span><span class="op">&lt;</span><span class="kw-2">&amp;</span><span class="ident">C</span><span class="op">&gt;</span>;
-}
-
-<span class="kw">impl</span><span class="op">&lt;</span><span class="ident">A</span>: <span class="ident">Eq</span> <span class="op">+</span> <span class="ident">Hash</span>, <span class="ident">B</span>: <span class="ident">Eq</span> <span class="op">+</span> <span class="ident">Hash</span>, <span class="ident">C</span>, <span class="ident">S</span>: <span class="ident">BuildHasher</span><span class="op">&gt;</span> <span class="ident">HashMapTuple</span><span class="op">&lt;</span><span class="ident">A</span>, <span class="ident">B</span>, <span class="ident">C</span><span class="op">&gt;</span>
-    <span class="kw">for</span> <span class="ident">HashMap</span><span class="op">&lt;</span>(<span class="ident">A</span>, <span class="ident">B</span>), <span class="ident">C</span>, <span class="ident">S</span><span class="op">&gt;</span>
-{
-    <span class="kw">fn</span> <span class="ident">get_tuple</span>(<span class="kw-2">&amp;</span><span class="self">self</span>, <span class="ident">a</span>: <span class="kw-2">&amp;</span><span class="ident">A</span>, <span class="ident">b</span>: <span class="kw-2">&amp;</span><span class="ident">B</span>) -&gt; <span class="prelude-ty">Option</span><span class="op">&lt;</span><span class="kw-2">&amp;</span><span class="ident">C</span><span class="op">&gt;</span> {
-        <span class="kw">let</span> <span class="kw-2">mut</span> <span class="ident">hasher</span> <span class="op">=</span> <span class="self">self</span>.<span class="ident">hasher</span>().<span class="ident">build_hasher</span>();
-        <span class="ident">a</span>.<span class="ident">hash</span>(<span class="kw-2">&amp;mut</span> <span class="ident">hasher</span>);
-        <span class="ident">b</span>.<span class="ident">hash</span>(<span class="kw-2">&amp;mut</span> <span class="ident">hasher</span>);
-        <span class="kw">let</span> <span class="ident">raw_entry</span> <span class="op">=</span> <span class="self">self</span>.<span class="ident">raw_entry</span>();
-
-        <span class="ident">raw_entry</span>
-            .<span class="ident">from_hash</span>(<span class="ident">hasher</span>.<span class="ident">finish</span>(), <span class="op">|</span><span class="ident">v</span><span class="op">|</span> <span class="kw-2">&amp;</span><span class="ident">v</span>.<span class="number">0</span> <span class="op">==</span> <span class="ident">a</span> <span class="op">&amp;&amp;</span> <span class="kw-2">&amp;</span><span class="ident">v</span>.<span class="number">1</span> <span class="op">==</span> <span class="ident">b</span>)
-            .<span class="ident">map</span>(<span class="op">|</span>(<span class="kw">_</span>, <span class="ident">y</span>)<span class="op">|</span> <span class="ident">y</span>)
-    }
-}
-
 <span class="doccomment">/// Prints an element in the bidegree `(n, s)` to stdout. For example, `[0, 2, 1]` will be printed</span>
 <span class="doccomment">/// as `2 x_(n, s, 1) + x_(f, s, 2)`.</span>
 <span class="kw">pub</span> <span class="kw">fn</span> <span class="ident">print_element</span>(<span class="ident">v</span>: <span class="ident">fp::vector::Slice</span>, <span class="ident">n</span>: <span class="ident">i32</span>, <span class="ident">s</span>: <span class="ident">u32</span>) {
@@ -775,21 +782,70 @@
     }
 }
 
-<span class="attribute">#[<span class="ident">cfg</span>(<span class="ident">test</span>)]</span>
-<span class="kw">mod</span> <span class="ident">test</span> {
-    <span class="kw">use</span> <span class="kw">super</span>::<span class="kw-2">*</span>;
+<span class="doccomment">/// Given a function f(s, t), compute it for every `s` in `[min_s, max_s]` and every `t` in</span>
+<span class="doccomment">/// `[min_t, max_t(s)]`.  Further, we only compute `f(s, t)` when `f(s - 1, t&#39;)` has been computed</span>
+<span class="doccomment">/// for all `t&#39; &lt; t`.</span>
+<span class="doccomment">///</span>
+<span class="doccomment">/// The function `f` should return a range starting from t and ending at the largest `T` such that</span>
+<span class="doccomment">/// `f(s, t&#39;)` has already been computed for every `t&#39; &lt; T`.</span>
+<span class="doccomment">///</span>
+<span class="doccomment">/// While `iter_s_t` could have had kept track of that data, it is usually the case that `f` would</span>
+<span class="doccomment">/// compute something and write it to a `OnceBiVec`, and</span>
+<span class="doccomment">/// [`OnceBiVec::push_ooo`](once::OnceBiVec::push_ooo) would return this range for us.</span>
+<span class="doccomment">///</span>
+<span class="doccomment">/// This uses [`rayon`] under the hood, and `f` should feel free to use further rayon parallelism.</span>
+<span class="doccomment">///</span>
+<span class="doccomment">/// # Arguments:</span>
+<span class="doccomment">///  - `max_s`: This is exclusive</span>
+<span class="doccomment">///  - `max_t`: This is exclusive</span>
+<span class="attribute">#[<span class="ident">cfg</span>(<span class="ident">feature</span> <span class="op">=</span> <span class="string">&quot;concurrent&quot;</span>)]</span>
+<span class="kw">pub</span> <span class="kw">fn</span> <span class="ident">iter_s_t</span>(
+    <span class="ident">f</span>: <span class="kw-2">&amp;</span>(<span class="kw">impl</span> <span class="ident">Fn</span>(<span class="ident">u32</span>, <span class="ident">i32</span>) -&gt; <span class="ident">std::ops::Range</span><span class="op">&lt;</span><span class="ident">i32</span><span class="op">&gt;</span> <span class="op">+</span> <span class="ident">Sync</span>),
+    <span class="ident">min_s</span>: <span class="ident">u32</span>,
+    <span class="ident">min_t</span>: <span class="ident">i32</span>,
+    <span class="ident">max_s</span>: <span class="ident">u32</span>,
+    <span class="ident">max_t</span>: <span class="kw-2">&amp;</span>(<span class="kw">impl</span> <span class="ident">Fn</span>(<span class="ident">u32</span>) -&gt; <span class="ident">i32</span> <span class="op">+</span> <span class="ident">Sync</span>),
+) {
+    <span class="kw">use</span> <span class="ident">rayon::prelude</span>::<span class="kw-2">*</span>;
 
-    <span class="attribute">#[<span class="ident">test</span>]</span>
-    <span class="kw">fn</span> <span class="ident">test_hashmap_tuple</span>() {
-        <span class="kw">let</span> <span class="kw-2">mut</span> <span class="ident">x</span>: <span class="ident">HashMap</span><span class="op">&lt;</span>(<span class="ident">u32</span>, <span class="ident">u32</span>), <span class="ident">bool</span><span class="op">&gt;</span> <span class="op">=</span> <span class="ident">HashMap::new</span>();
-        <span class="ident">x</span>.<span class="ident">insert</span>((<span class="number">5</span>, <span class="number">3</span>), <span class="bool-val">true</span>);
+    <span class="ident">rayon::scope</span>(<span class="op">|</span><span class="ident">scope</span><span class="op">|</span> {
+        <span class="comment">// Rust does not support recursive closures, so we have to pass everything along as</span>
+        <span class="comment">// arguments.</span>
+        <span class="kw">fn</span> <span class="ident">run</span><span class="op">&lt;</span><span class="lifetime">&#39;a</span><span class="op">&gt;</span>(
+            <span class="ident">scope</span>: <span class="kw-2">&amp;</span><span class="ident">rayon::Scope</span><span class="op">&lt;</span><span class="lifetime">&#39;a</span><span class="op">&gt;</span>,
+            <span class="ident">f</span>: <span class="kw-2">&amp;</span><span class="lifetime">&#39;a</span> (<span class="kw">impl</span> <span class="ident">Fn</span>(<span class="ident">u32</span>, <span class="ident">i32</span>) -&gt; <span class="ident">std::ops::Range</span><span class="op">&lt;</span><span class="ident">i32</span><span class="op">&gt;</span> <span class="op">+</span> <span class="ident">Sync</span> <span class="op">+</span> <span class="lifetime">&#39;a</span>),
+            <span class="ident">max_s</span>: <span class="ident">u32</span>,
+            <span class="ident">max_t</span>: <span class="kw-2">&amp;</span><span class="lifetime">&#39;a</span> (<span class="kw">impl</span> <span class="ident">Fn</span>(<span class="ident">u32</span>) -&gt; <span class="ident">i32</span> <span class="op">+</span> <span class="ident">Sync</span> <span class="op">+</span> <span class="lifetime">&#39;a</span>),
+            <span class="ident">s</span>: <span class="ident">u32</span>,
+            <span class="ident">t</span>: <span class="ident">i32</span>,
+        ) {
+            <span class="kw">let</span> <span class="kw-2">mut</span> <span class="ident">ret</span> <span class="op">=</span> <span class="ident">f</span>(<span class="ident">s</span>, <span class="ident">t</span>);
+            <span class="kw">if</span> <span class="ident">s</span> <span class="op">+</span> <span class="number">1</span> <span class="op">&lt;</span> <span class="ident">max_s</span> {
+                <span class="ident">ret</span>.<span class="ident">start</span> <span class="op">+</span><span class="op">=</span> <span class="number">1</span>;
+                <span class="ident">ret</span>.<span class="ident">end</span> <span class="op">=</span> <span class="ident">std::cmp::min</span>(<span class="ident">ret</span>.<span class="ident">end</span> <span class="op">+</span> <span class="number">1</span>, <span class="ident">max_t</span>(<span class="ident">s</span> <span class="op">+</span> <span class="number">1</span>));
 
-        <span class="macro">assert_eq!</span>(<span class="ident">x</span>.<span class="ident">get_tuple</span>(<span class="kw-2">&amp;</span><span class="number">5</span>, <span class="kw-2">&amp;</span><span class="number">3</span>), <span class="prelude-val">Some</span>(<span class="kw-2">&amp;</span><span class="bool-val">true</span>));
-        <span class="macro">assert_eq!</span>(<span class="ident">x</span>.<span class="ident">get_tuple</span>(<span class="kw-2">&amp;</span><span class="number">3</span>, <span class="kw-2">&amp;</span><span class="number">5</span>), <span class="prelude-val">None</span>);
-        <span class="macro">assert_eq!</span>(<span class="ident">x</span>.<span class="ident">get_tuple</span>(<span class="kw-2">&amp;</span><span class="number">7</span>, <span class="kw-2">&amp;</span><span class="number">12</span>), <span class="prelude-val">None</span>);
-    }
+                <span class="kw">if</span> <span class="op">!</span><span class="ident">ret</span>.<span class="ident">is_empty</span>() {
+                    <span class="comment">// We spawn a new scope to avoid recursion, which may blow the stack</span>
+                    <span class="ident">scope</span>.<span class="ident">spawn</span>(<span class="kw">move</span> <span class="op">|</span><span class="ident">scope</span><span class="op">|</span> {
+                        <span class="ident">ret</span>.<span class="ident">into_par_iter</span>()
+                            .<span class="ident">for_each</span>(<span class="op">|</span><span class="ident">t</span><span class="op">|</span> <span class="ident">run</span>(<span class="ident">scope</span>, <span class="ident">f</span>, <span class="ident">max_s</span>, <span class="ident">max_t</span>, <span class="ident">s</span> <span class="op">+</span> <span class="number">1</span>, <span class="ident">t</span>));
+                    });
+                }
+            }
+        }
+
+        <span class="ident">scope</span>.<span class="ident">spawn</span>(<span class="kw">move</span> <span class="op">|</span><span class="ident">scope</span><span class="op">|</span> {
+            (<span class="ident">min_t</span>..<span class="ident">max_t</span>(<span class="ident">min_s</span>))
+                .<span class="ident">into_par_iter</span>()
+                .<span class="ident">for_each</span>(<span class="op">|</span><span class="ident">t</span><span class="op">|</span> <span class="ident">run</span>(<span class="kw-2">&amp;</span><span class="ident">scope</span>, <span class="ident">f</span>, <span class="ident">max_s</span>, <span class="ident">max_t</span>, <span class="ident">min_s</span>, <span class="ident">t</span>))
+        });
+        <span class="ident">scope</span>.<span class="ident">spawn</span>(<span class="kw">move</span> <span class="op">|</span><span class="ident">scope</span><span class="op">|</span> {
+            (<span class="ident">min_s</span> <span class="op">+</span> <span class="number">1</span>..<span class="ident">max_s</span>)
+                .<span class="ident">into_par_iter</span>()
+                .<span class="ident">for_each</span>(<span class="op">|</span><span class="ident">s</span><span class="op">|</span> <span class="ident">run</span>(<span class="kw-2">&amp;</span><span class="ident">scope</span>, <span class="ident">f</span>, <span class="ident">max_s</span>, <span class="ident">max_t</span>, <span class="ident">s</span>, <span class="ident">min_t</span>))
+        });
+    });
 }
 </code></pre></div>
 </section><section id="search" class="content hidden"></section><div id="rustdoc-vars" data-root-path="../../" data-current-crate="ext" data-search-index-js="../../search-index.js" data-search-js="../../search.js"></div>
-    <script src="../../main.js"></script><script src="../../source-script.js"></script><script src="../../source-files.js"></script>
 </body></html>
