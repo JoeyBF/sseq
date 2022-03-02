@@ -1014,7 +1014,16 @@
 <span id="987">987</span>
 <span id="988">988</span>
 <span id="989">989</span>
-</pre><pre class="rust"><code><span class="kw">use</span> <span class="ident">std::sync</span>::{<span class="ident">Arc</span>, <span class="ident">Mutex</span>};
+<span id="990">990</span>
+<span id="991">991</span>
+<span id="992">992</span>
+<span id="993">993</span>
+<span id="994">994</span>
+<span id="995">995</span>
+<span id="996">996</span>
+</pre><pre class="rust"><code><span class="doccomment">//! This module exports the [`Resolution`] object, which is a chain complex resolving a module. In</span>
+<span class="doccomment">//! particular, this contains the core logic that compute minimal resolutions.</span>
+<span class="kw">use</span> <span class="ident">std::sync</span>::{<span class="ident">Arc</span>, <span class="ident">Mutex</span>};
 
 <span class="kw">use</span> <span class="ident"><span class="kw">crate</span>::chain_complex</span>::{<span class="ident">AugmentedChainComplex</span>, <span class="ident">ChainComplex</span>, <span class="ident">FreeChainComplex</span>};
 <span class="kw">use</span> <span class="ident"><span class="kw">crate</span>::save::SaveKind</span>;
@@ -1072,7 +1081,8 @@
 <span class="doccomment">/// number if needs be, but up to the 140th stem we only see at most 8 new generators.</span>
 <span class="kw">const</span> <span class="ident">MAX_NEW_GENS</span>: <span class="ident">usize</span> <span class="op">=</span> <span class="number">10</span>;
 
-<span class="doccomment">/// A resolution of a chain complex.</span>
+<span class="doccomment">/// A minimal resolution of a chain complex. The functions [`Resolution::compute_through_stem`] and</span>
+<span class="doccomment">/// [`Resolution::compute_through_bidegree`] extends the minimal resolution to the given bidegree.</span>
 <span class="kw">pub</span> <span class="kw">struct</span> <span class="ident">Resolution</span><span class="op">&lt;</span><span class="ident">CC</span>: <span class="ident">ChainComplex</span><span class="op">&gt;</span> {
     <span class="ident">name</span>: <span class="ident">String</span>,
     <span class="ident">lock</span>: <span class="ident">Mutex</span><span class="op">&lt;</span>()<span class="op">&gt;</span>,
@@ -1641,7 +1651,11 @@
         <span class="attribute">#[<span class="ident">cfg</span>(<span class="ident">feature</span> <span class="op">=</span> <span class="string">&quot;logging&quot;</span>)]</span>
         <span class="ident"><span class="kw">crate</span>::utils::log_time</span>(
             <span class="ident">start</span>.<span class="ident">elapsed</span>(),
-            <span class="macro">format_args!</span>(<span class="string">&quot;Computed bidegree ({n}, {s})&quot;</span>, <span class="ident">n</span> <span class="op">=</span> <span class="ident">t</span> <span class="op">-</span> <span class="ident">s</span> <span class="kw">as</span> <span class="ident">i32</span>),
+            <span class="macro">format_args!</span>(
+                <span class="string">&quot;Computed bidegree ({n}, {s}), num new gens = {num_new_gens}, density = {density:.2}%&quot;</span>,
+                <span class="ident">n</span> <span class="op">=</span> <span class="ident">t</span> <span class="op">-</span> <span class="ident">s</span> <span class="kw">as</span> <span class="ident">i32</span>,
+                <span class="ident">density</span> <span class="op">=</span> <span class="ident">current_differential</span>.<span class="ident">differential_density</span>(<span class="ident">t</span>) <span class="op">*</span> <span class="number">100.0</span>
+            ),
         );
 
         <span class="kw">if</span> <span class="self">self</span>.<span class="ident">should_save</span> {
