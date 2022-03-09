@@ -414,8 +414,8 @@ impl<A: Algebra> SaveFile<A> {
             .create_new(!overwrite)
             .create(true)
             .open(&p)
-            .with_context(|| format!("Failed to create save file {p:?}"))
-            .unwrap();
+            .unwrap_or_else(|e| panic!("Failed to create save file {p:?}: {e}"));
+
         let mut f = ChecksumWriter::new(p, BufWriter::new(f));
         self.write_header(&mut f).unwrap();
         f
