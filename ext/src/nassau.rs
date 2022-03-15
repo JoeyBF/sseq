@@ -36,6 +36,9 @@ use fp::vector::{FpVector, Slice, SliceMut};
 use itertools::Itertools;
 use once::OnceVec;
 
+#[cfg(feature = "logging")]
+use logging::Task;
+
 #[cfg(feature = "concurrent")]
 use std::sync::mpsc;
 
@@ -518,9 +521,16 @@ impl Resolution {
     }
 
     fn step_resolution_with_subalgebra(&self, s: u32, t: i32, subalgebra: MilnorSubalgebra) {
+        #[allow(unused_variables)]
         let start = Instant::now();
+
+        #[cfg(feature = "logging")]
+        let previous_task = logging::set_current_task(Task::StepResolution(start, s, t));
+
         let end = || {
-            if cfg!(feature = "logging") {
+            #[cfg(feature = "logging")]
+            {
+                logging::set_current_task(previous_task);
                 crate::utils::log_time(
                     start.elapsed(),
                     format_args!(

@@ -12,6 +12,7 @@ resolver = "2"
 algebra = { path = "crates/algebra", default-features = false, features = ["json"] }
 bivec = { path = "crates/bivec"}
 fp = { path = "crates/fp", default-features = false }
+logging = { path = "crates/logging", optional = true }
 once = { path = "crates/once"}
 query = { path = "crates/query" }
 sseq = { path = "crates/sseq", default-features = false }
@@ -42,7 +43,6 @@ default = ["odd-primes"]
 cache-multiplication = ["algebra/cache-multiplication"]
 concurrent = ["rayon", "once/concurrent", "fp/concurrent", "algebra/concurrent"]
 odd-primes = ["fp/odd-primes", "algebra/odd-primes", "sseq/odd-primes"]
-logging = []
 nassau = []
 
 [workspace]
@@ -50,6 +50,7 @@ members = [
     "crates/algebra",
     "crates/bivec",
     "crates/fp",
+    "crates/logging",
     "crates/once",
     "crates/chart",
     "crates/sseq",
