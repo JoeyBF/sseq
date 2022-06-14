@@ -169,10 +169,9 @@
 #![allow(clippy::upper_case_acronyms)]
 
 pub mod chain_complex;
+pub mod products;
 pub mod resolution;
 pub mod resolution_homomorphism;
-pub mod save;
-
 pub mod yoneda;
 
 use crate::chain_complex::FiniteChainComplex;
@@ -180,6 +179,7 @@ use algebra::module::SteenrodModule;
 pub type CCC = FiniteChainComplex<SteenrodModule>;
 
 pub mod nassau;
+pub mod save;
 pub mod secondary;
 pub mod utils;
 
