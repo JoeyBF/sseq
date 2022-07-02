@@ -12,6 +12,7 @@ use anyhow::Context;
 /// function for the first time, we set the ctrlc handler to delete currently opened files, then
 /// exit.
 fn open_files() -> &'static Mutex<HashSet<PathBuf>> {
+    use crate::utils::log;
     use std::mem::MaybeUninit;
     use std::sync::Once;
 
@@ -22,10 +23,12 @@ fn open_files() -> &'static Mutex<HashSet<PathBuf>> {
             OPEN_FILES.write(Default::default());
             #[cfg(unix)]
             ctrlc::set_handler(move || {
+                log(format_args!("Interrupt signal caught, stopping"));
                 let files = open_files().lock().unwrap();
                 for file in &*files {
                     std::fs::remove_file(file)
                         .unwrap_or_else(|_| panic!("Error when deleting {file:?}"));
+                    log(format_args!("Deleted partially-written file {file:?}"));
                 }
                 std::process::exit(130);
             })

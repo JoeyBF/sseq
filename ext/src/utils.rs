@@ -600,6 +600,10 @@ mod logging {
                 .end(format_args!("[{mib_per_second:>9.3} MiB/s] {msg}"));
         }
     }
+
+    pub fn log(msg: std::fmt::Arguments) {
+        eprintln!("{msg}");
+    }
 }
 
 #[cfg(not(feature = "logging"))]
@@ -635,8 +639,11 @@ mod logging {
 
         pub fn finalize(self, _msg: std::fmt::Arguments) {}
     }
+
+    pub fn log(_msg: std::fmt::Arguments) {}
 }
 
+pub use logging::log;
 pub use logging::LogWriter;
 pub use logging::Timer;
 
