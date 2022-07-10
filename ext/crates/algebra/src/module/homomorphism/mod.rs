@@ -7,8 +7,8 @@ use fp::vector::{prelude::*, Slice, SliceMut};
 
 #[cfg(feature = "concurrent")]
 use {
+    once_cell::sync::Lazy,
     rayon::{prelude::*, ThreadPool, ThreadPoolBuilder},
-    std::sync::Once,
 };
 
 mod free_module_homomorphism;
@@ -26,24 +26,13 @@ pub use hom_pullback::HomPullback;
 pub use quotient_homomorphism::{QuotientHomomorphism, QuotientHomomorphismSource};
 
 #[cfg(feature = "concurrent")]
-static mut GET_MATRIX_THREADPOOL: Option<Arc<ThreadPool>> = None;
-#[cfg(feature = "concurrent")]
-static GET_MATRIX_THREADPOOL_ONCE: Once = Once::new();
-
-#[cfg(feature = "concurrent")]
-fn get_matrix_threadpool() -> Arc<ThreadPool> {
-    GET_MATRIX_THREADPOOL_ONCE.call_once(|| unsafe {
-        let _ = GET_MATRIX_THREADPOOL.insert(Arc::new(
-            ThreadPoolBuilder::new()
-                .thread_name(|i| format!("Algebra {i}"))
-                .num_threads(10)
-                .build()
-                .expect("Unable to create Algebra thread pool"),
-        ));
-    });
-
-    unsafe { GET_MATRIX_THREADPOOL.clone().unwrap() }
-}
+static GET_MATRIX_THREADPOOL: Lazy<ThreadPool> = Lazy::new(|| {
+    ThreadPoolBuilder::new()
+        .thread_name(|i| format!("Algebra {i}"))
+        .num_threads(10)
+        .build()
+        .expect("Unable to create Algebra thread pool")
+});
 
 /// Each `ModuleHomomorphism` may come with auxiliary data, namely the kernel, image and
 /// quasi_inverse at each degree (the quasi-inverse is a map that is a right inverse when
@@ -151,7 +140,7 @@ pub trait ModuleHomomorphism: Send + Sync {
         }
 
         #[cfg(feature = "concurrent")]
-        get_matrix_threadpool().install(|| {
+        GET_MATRIX_THREADPOOL.install(|| {
             matrix
                 .par_iter_mut()
                 .enumerate()
@@ -173,7 +162,7 @@ pub trait ModuleHomomorphism: Send + Sync {
         }
 
         #[cfg(feature = "concurrent")]
-        get_matrix_threadpool().install(|| {
+        GET_MATRIX_THREADPOOL.install(|| {
             matrix.par_iter_mut().enumerate().for_each(|(i, row)| {
                 self.apply_to_basis_element(row.as_slice_mut(), 1, degree, inputs[i])
             });
