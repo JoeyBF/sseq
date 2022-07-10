@@ -915,52 +915,56 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
         }
 
         #[cfg(feature = "concurrent")]
-        rayon::in_place_scope(|scope| {
-            // This algorithm is not optimal, as we compute (s, t) only after computing (s - 1, t)
-            // and (s, t - 1). In theory, it suffices to wait for (s, t - 1) and (s - 1, t - 1),
-            // but having the dimensions of the modules change halfway through the computation is
-            // annoying to do correctly. It seems more prudent to improve parallelism elsewhere.
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(6)
+            .thread_name(|i| format!("Nassau {i}"))
+            .build()
+            .expect("Unable to create Nassau thread pool")
+            .in_place_scope(|scope| {
+                // This algorithm is not optimal, as we compute (s, t) only after computing (s - 1, t)
+                // and (s, t - 1). In theory, it suffices to wait for (s, t - 1) and (s - 1, t - 1),
+                // but having the dimensions of the modules change halfway through the computation is
+                // annoying to do correctly. It seems more prudent to improve parallelism elsewhere.
 
-            // Things that we have finished computing.
-            let mut progress: Vec<i32> = vec![-1; max_s as usize + 1];
-            // We will kickstart the process by pretending we have computed (0, - 1). So
-            // we must pretend we have only computed up to (0, - 2);
-            progress[0] = -2;
+                // Things that we have finished computing.
+                let mut progress: Vec<i32> = vec![-1; max_s as usize + 1];
+                // We will kickstart the process by pretending we have computed (0, - 1). So
+                // we must pretend we have only computed up to (0, - 2);
+                progress[0] = -2;
 
-            let (sender, receiver) = mpsc::channel();
-            SenderData::send(0, -1, sender);
+                let (sender, receiver) = mpsc::channel();
+                SenderData::send(0, -1, sender);
 
-            let f = |s, t, sender| {
-                if self.has_computed_bidegree(s, t) {
-                    SenderData::send(s, t, sender);
-                } else {
-                    let sender = sender.clone();
-                    scope.spawn(move |_| {
-                        self.step_resolution(s, t);
+                let f = |s, t, sender| {
+                    if self.has_computed_bidegree(s, t) {
                         SenderData::send(s, t, sender);
-                    });
+                    } else {
+                        scope.spawn(move |_| {
+                            self.step_resolution(s, t);
+                            SenderData::send(s, t, sender);
+                        });
+                    }
+                };
+
+                while let Ok(SenderData { s, t, sender }) = receiver.recv() {
+                    assert!(progress[s as usize] == t - 1);
+                    progress[s as usize] = t;
+
+                    // How far we are from the last one for this s.
+                    let distance = max_n + 1 - (t - s as i32);
+
+                    if s < max_s && progress[s as usize + 1] == t - 1 {
+                        f(s + 1, t, sender.clone());
+                    }
+
+                    if distance > 1 && (s == 0 || progress[s as usize - 1] > t) {
+                        // We are computing a normal step
+                        f(s, t + 1, sender);
+                    } else if distance == 1 && s < max_s {
+                        SenderData::send(s, t + 1, sender);
+                    }
                 }
-            };
-
-            while let Ok(SenderData { s, t, sender }) = receiver.recv() {
-                assert!(progress[s as usize] == t - 1);
-                progress[s as usize] = t;
-
-                // How far we are from the last one for this s.
-                let distance = max_n + 1 - (t - s as i32);
-
-                if s < max_s && progress[s as usize + 1] == t - 1 {
-                    f(s + 1, t, sender.clone());
-                }
-
-                if distance > 1 && (s == 0 || progress[s as usize - 1] > t) {
-                    // We are computing a normal step
-                    f(s, t + 1, sender);
-                } else if distance == 1 && s < max_s {
-                    SenderData::send(s, t + 1, sender);
-                }
-            }
-        });
+            });
     }
 }
 
