@@ -7,6 +7,7 @@ test:
 	cargo test --examples
 	cargo test --features concurrent --lib --tests --workspace
 	cargo test --features concurrent --doc --workspace
+	cargo run --features nassau --example bruner -- 20
 
 lint:
 	cargo fmt --all -- --check
