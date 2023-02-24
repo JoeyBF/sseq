@@ -199,6 +199,7 @@ impl<P: SseqProfile> Sseq<P> {
         }
     }
 
+    // TODO: Maybe convert to using `BidegreeElement`s instead?
     /// Add a $d_r$ differential from bidegree $(x, y)$, with the given `source` and `target`
     /// classes.
     ///
