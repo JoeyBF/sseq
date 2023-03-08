@@ -7,7 +7,7 @@ use crate::{
 use algebra::module::homomorphism::{FreeModuleHomomorphism, ModuleHomomorphism};
 use algebra::module::Module;
 use fp::prime::ValidPrime;
-use fp::vector::FpVector;
+use fp::vector::{prelude::*, FpVector};
 use once::OnceBiVec;
 use sseq::coordinates::{Bidegree, BidegreeRange};
 

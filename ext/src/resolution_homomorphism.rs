@@ -13,7 +13,7 @@ use algebra::module::homomorphism::{ModuleHomomorphism, MuFreeModuleHomomorphism
 use algebra::module::Module;
 use algebra::MuAlgebra;
 use fp::matrix::Matrix;
-use fp::vector::{FpVector, SliceMut};
+use fp::vector::{prelude::*, FpVector, SliceMut};
 use once::OnceBiVec;
 use sseq::coordinates::{Bidegree, BidegreeGenerator, BidegreeRange};
 
@@ -521,7 +521,7 @@ where
         let source = gen.degree() + self.shift;
 
         assert_eq!(
-            result.as_slice().len(),
+            result.len(),
             self.source
                 .module(source.s())
                 .number_of_gens_in_degree(source.t())
@@ -531,7 +531,7 @@ where
 
         let map = self.get_map(source.s());
         let j = target_module.operation_generator_to_index(0, 0, gen.t(), gen.idx());
-        for i in 0..result.as_slice().len() {
+        for i in 0..result.len() {
             result.add_basis_element(i, coef * map.output(source.t(), i).entry(j));
         }
     }

@@ -33,7 +33,7 @@ use anyhow::anyhow;
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use fp::matrix::{AugmentedMatrix, Matrix};
 use fp::prime::{ValidPrime, TWO};
-use fp::vector::{FpVector, Slice, SliceMut};
+use fp::vector::{prelude::*, FpVector, Slice, SliceMut};
 use itertools::Itertools;
 use once::OnceVec;
 use sseq::coordinates::Bidegree;
@@ -162,8 +162,7 @@ impl MilnorSubalgebra {
             scratch.set_to_zero();
             hom.apply_to_basis_element(scratch.as_slice_mut(), 1, degree, masked_index);
 
-            row.as_slice_mut()
-                .add_masked(scratch.as_slice(), 1, &target_mask);
+            row.add_masked(&scratch, 1, &target_mask);
         }
         result
     }
@@ -515,12 +514,12 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
             f.write_u64::<LittleEndian>(next_mask[col] as u64)?;
             let preimage = masked_matrix.row_segment(row as usize, 1, 1);
             scratch.set_scratch_vector_size(preimage.len());
-            scratch.as_slice_mut().assign(preimage);
+            scratch.assign(preimage);
             scratch.to_bytes(f)?;
 
             scratch.set_scratch_vector_size(full_matrix.columns());
             for (i, _) in preimage.iter_nonzero() {
-                scratch.as_slice_mut().add(full_matrix.row(i), 1);
+                scratch.add(full_matrix.row(i), 1);
             }
             scratch.to_bytes(f)?;
         }
@@ -646,8 +645,7 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
         let mut dxs = vec![FpVector::new(p, next.dimension(b.t())); num_new_gens];
 
         for ((x, x_masked), dx) in xs.iter_mut().zip_eq(&n[next_row..]).zip_eq(&mut dxs) {
-            x.as_slice_mut()
-                .add_unmasked(x_masked.as_slice(), 1, &target_mask);
+            x.add_unmasked(x_masked, 1, &target_mask);
             for (i, _) in x_masked.iter_nonzero() {
                 dx.add(&full_matrix[i], 1);
             }
@@ -1035,7 +1033,7 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> ChainComplex for Resolution<M> {
         let target = &self.modules[b.s() - 1];
         let algebra = target.algebra();
 
-        let mut inputs: Vec<FpVector> = inputs.iter().map(|x| x.into().to_owned()).collect();
+        let mut inputs: Vec<FpVector> = inputs.iter().map(|x| x.into().into_owned()).collect();
         let mut mask: Vec<usize> = Vec::with_capacity(zero_mask_dim + 8);
         mask.extend(subalgebra.signature_mask(
             &algebra,
@@ -1083,7 +1081,7 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> ChainComplex for Resolution<M> {
                 matrix
                     .row_segment_mut(i, 1, 1)
                     .slice_mut(0, dx.len())
-                    .add(dx.as_slice(), 1);
+                    .add(dx, 1);
                 matrix
                     .row_segment_mut(i, 2, 2)
                     .add_basis_element(zero_mask_dim + i, 1);
@@ -1130,7 +1128,7 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> ChainComplex for Resolution<M> {
                             output
                                 .into()
                                 .add_unmasked(dx_matrix.row_segment(i, 2, 2), 1, &mask);
-                            input.as_slice_mut().add(dx_matrix.row_segment(i, 1, 1), 1);
+                            input.add(dx_matrix.row_segment(i, 1, 1), 1);
                         }
                     }
                 }
@@ -1146,9 +1144,7 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> ChainComplex for Resolution<M> {
                     if entry != 0 {
                         output.into().add_unmasked(scratch0.as_slice(), 1, &mask);
                         // If we resume a resolve_through_stem, input may be longer than scratch1.
-                        input
-                            .slice_mut(0, scratch1.len())
-                            .add(scratch1.as_slice(), 1);
+                        input.slice_mut(0, scratch1.len()).add(&scratch1, 1);
                     }
                 }
 
@@ -1159,11 +1155,11 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> ChainComplex for Resolution<M> {
                             dx_matrix
                                 .row_segment_mut(i, 2, 2)
                                 .slice_mut(0, zero_mask_dim)
-                                .add(scratch0.as_slice(), 1);
+                                .add(&scratch0, 1);
                             dx_matrix
                                 .row_segment_mut(i, 1, 1)
                                 .slice_mut(0, target_dim)
-                                .add(scratch1.as_slice(), 1);
+                                .add(&scratch1, 1);
                         }
                     }
                 }
