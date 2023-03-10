@@ -3,6 +3,7 @@ use crate::prime::ValidPrime;
 use crate::vector::{prelude::*, FpVector, Slice, SliceMut};
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
+use itertools::Itertools;
 use std::io::{Read, Write};
 
 /// A subspace of a vector space.
@@ -162,6 +163,24 @@ impl Subspace {
         &self.matrix[..self.dimension()]
     }
 
+    pub fn sum(&self, other: &Subspace) -> Subspace {
+        assert_eq!(self.matrix.columns(), other.matrix.columns());
+        let self_rows = self.matrix.rows();
+        let mut matrix = Matrix::new(
+            self.prime(),
+            self_rows + other.matrix.rows(),
+            self.matrix.columns(),
+        );
+        for (row_idx, self_row) in self.matrix.iter().enumerate() {
+            matrix.row_mut(row_idx).assign(self_row);
+        }
+        for (row_idx, other_row) in other.matrix.iter().enumerate() {
+            matrix.row_mut(row_idx + self_rows).assign(other_row);
+        }
+        matrix.row_reduce();
+        Subspace { matrix }
+    }
+
     /// Sets the subspace to be the zero subspace.
     pub fn set_to_zero(&mut self) {
         self.matrix.set_to_zero();
@@ -177,6 +196,21 @@ impl Subspace {
             self.matrix.row_mut(i).set_entry(i, 1);
             self.matrix.pivots_mut()[i] = i as isize;
         }
+    }
+
+    pub fn to_string_oneline(&self) -> String {
+        let inner = self
+            .matrix
+            .iter()
+            .filter_map(|row| {
+                if !row.is_zero() {
+                    Some(row.to_string())
+                } else {
+                    None
+                }
+            })
+            .join(", ");
+        format!("[{inner}]")
     }
 
     pub fn iter(&self) -> impl Iterator<Item = Slice> {
@@ -354,5 +388,57 @@ mod test {
         for (v1, v2) in all_vectors_manual.zip(space.iter_all_vectors()) {
             assert_eq!(v1, v2);
         }
+    }
+
+    #[test]
+    fn sum_test() {
+        let p = ValidPrime::new(2);
+        let space_1 = Subspace {
+            matrix: {
+                let mut matrix = Matrix::from_vec(
+                    p,
+                    &[
+                        vec![0, 1, 0, 0, 0],
+                        vec![0, 0, 0, 0, 0],
+                        vec![1, 0, 1, 0, 0],
+                        vec![0, 0, 0, 0, 0],
+                    ],
+                );
+                matrix.row_reduce();
+                matrix
+            },
+        };
+        let space_2 = Subspace {
+            matrix: {
+                let mut matrix = Matrix::from_vec(
+                    p,
+                    &[
+                        vec![0, 0, 0, 0, 0],
+                        vec![0, 0, 0, 0, 0],
+                        vec![0, 0, 1, 1, 1],
+                        vec![0, 0, 0, 0, 0],
+                    ],
+                );
+                matrix.row_reduce();
+                matrix
+            },
+        };
+        let space_sum_manual = Subspace {
+            matrix: {
+                let mut matrix = Matrix::from_vec(
+                    p,
+                    &[
+                        vec![1, 0, 0, 1, 1],
+                        vec![0, 1, 0, 0, 0],
+                        vec![0, 0, 1, 1, 1],
+                    ],
+                );
+                matrix.row_reduce();
+                matrix
+            },
+        };
+        let mut space_sum = space_1.sum(&space_2);
+        space_sum.matrix.trim(0, space_sum.dimension(), 0);
+        assert_eq!(space_sum, space_sum_manual);
     }
 }

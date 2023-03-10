@@ -204,7 +204,6 @@ impl ProductStructure {
             .generator_offset(a.t(), a.t(), 0);
 
         let mut answer = vec![0; target_num_gens];
-        let mut nonzero = false;
         for (i, ans) in answer.iter_mut().enumerate().take(target_num_gens) {
             let output = htpy_map.output(tot.t(), i);
             for (k, entry) in a.vec().iter().enumerate() {
@@ -213,12 +212,14 @@ impl ProductStructure {
                     *ans += entry * output.entry(offset_a + k);
                 }
             }
-            if *ans != 0 {
-                nonzero = true;
-            }
         }
-        if nonzero {
-            println!("<{a}, {b}, {c}> = {answer:?}",);
+        let answer = FpVector::from_slice(self.p, &answer);
+        let indeterminacy = self.compute_indeterminacy(&a, b.degree(), &c);
+        if !indeterminacy.contains(answer.as_slice()) {
+            println!(
+                "<{a}, {b}, {c}> = {answer} + {indeterminacy_string}",
+                indeterminacy_string = indeterminacy.to_string_oneline()
+            );
         }
     }
 
@@ -348,11 +349,49 @@ impl ProductStructure {
     }
 
     fn compute_indeterminacy(
-        a: BidegreeElement<FpVector>,
+        &self,
+        a: &BidegreeElement<FpVector>,
         b_deg: Bidegree,
-        c: BidegreeElement<FpVector>,
+        c: &BidegreeElement<FpVector>,
     ) -> Subspace {
-        todo!()
+        let left = a.degree() + b_deg - Bidegree::s_t(1, 0);
+        let right = b_deg + c.degree() - Bidegree::s_t(1, 0);
+        let total = Bidegree::massey_bidegree(a.degree(), b_deg, c.degree());
+
+        let left_dim = self.resolution().number_of_gens_in_bidegree(left);
+        let right_dim = self.resolution().number_of_gens_in_bidegree(right);
+        let total_dim = self.resolution().number_of_gens_in_bidegree(total);
+
+        let l_indet = if right_dim == 0 {
+            Subspace::new(self.p, right_dim, total_dim)
+        } else {
+            let mut a_mul = Matrix::new(self.p, right_dim, total_dim);
+
+            for (idx, _) in a.vec().iter_nonzero() {
+                let gen = BidegreeGenerator::new(a.degree(), idx);
+                a_mul += &self.multiplication_table.get(&(gen, right)).unwrap();
+            }
+
+            let (padded_cols, mut matrix) = Matrix::augmented_from_vec(self.p, &a_mul.to_vec());
+            matrix.row_reduce();
+            matrix.compute_image(a_mul.columns(), padded_cols)
+        };
+
+        let r_indet = if left_dim == 0 {
+            Subspace::new(self.p, left_dim, total_dim)
+        } else {
+            let mut c_mul = Matrix::new(self.p, left_dim, total_dim);
+
+            for (idx, _) in c.vec().iter_nonzero() {
+                let gen = BidegreeGenerator::new(c.degree(), idx);
+                c_mul += &self.multiplication_table.get(&(gen, left)).unwrap();
+            }
+
+            let (padded_cols, mut matrix) = Matrix::augmented_from_vec(self.p, &c_mul.to_vec());
+            matrix.row_reduce();
+            matrix.compute_image(c_mul.columns(), padded_cols)
+        };
+        l_indet.sum(&r_indet)
     }
 
     fn product_is_zero(
