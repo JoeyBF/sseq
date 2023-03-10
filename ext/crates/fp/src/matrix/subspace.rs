@@ -185,6 +185,10 @@ impl Subspace {
             .map(FpVector::as_slice)
             .take(self.dimension())
     }
+
+    pub fn iter_all_vectors(&self) -> impl Iterator<Item = FpVector> {
+        AllVectorsIterator::new(self)
+    }
 }
 
 impl std::fmt::Display for Subspace {
@@ -198,5 +202,157 @@ impl std::fmt::Display for Subspace {
             }
         }
         Ok(())
+    }
+}
+
+pub struct AllVectorsIterator {
+    basis: Matrix,
+    coeffs: Option<FpVector>,
+    current: FpVector,
+}
+
+impl AllVectorsIterator {
+    pub fn new(space: &Subspace) -> Self {
+        let p = space.prime();
+        let basis_slice = space.basis();
+        let dim = basis_slice.len();
+        let mut basis = Matrix::new(p, dim, space.ambient_dimension());
+        for (row_idx, row) in basis.iter_mut().enumerate() {
+            row.assign(basis_slice[row_idx].as_slice())
+        }
+        Self {
+            basis,
+            coeffs: Some(FpVector::new(p, dim)),
+            current: FpVector::new(p, space.ambient_dimension()),
+        }
+    }
+}
+
+impl Iterator for AllVectorsIterator {
+    type Item = FpVector;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let p = self.basis.prime();
+        if let Some(coeffs) = &self.coeffs {
+            if let Some((idx, entry)) = coeffs.iter().enumerate().find_map(|(idx, entry)| {
+                if entry < *p - 1 {
+                    Some((idx, entry))
+                } else {
+                    None
+                }
+            }) {
+                let mut next_coeffs = coeffs.clone();
+                for i in 0..idx {
+                    next_coeffs.set_entry(i, 0);
+                }
+                next_coeffs.set_entry(idx, entry + 1);
+
+                let mut result = FpVector::new(p, self.basis.columns());
+                for (row_idx, row) in self.basis.iter().enumerate() {
+                    result.add(row, next_coeffs.entry(row_idx));
+                }
+
+                self.coeffs = Some(next_coeffs);
+                Some(std::mem::replace(&mut self.current, result))
+            } else {
+                self.coeffs = None;
+                Some(self.current.clone())
+            }
+        } else {
+            None
+        }
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use crate::{matrix::Matrix, prime::ValidPrime, vector::FpVector};
+
+    use super::Subspace;
+
+    #[test]
+    fn test_all_vectors_iterator_2() {
+        let p = ValidPrime::new(2);
+        let mut matrix = Matrix::from_vec(
+            p,
+            &[
+                vec![1, 0, 1, 0],
+                vec![0, 1, 0, 0],
+                vec![0, 0, 0, 1],
+                vec![0, 0, 0, 0],
+            ],
+        );
+        matrix.row_reduce();
+        let space = Subspace { matrix };
+
+        let all_vectors_manual = [
+            [0, 0, 0, 0],
+            [1, 0, 1, 0],
+            [0, 1, 0, 0],
+            [1, 1, 1, 0],
+            [0, 0, 0, 1],
+            [1, 0, 1, 1],
+            [0, 1, 0, 1],
+            [1, 1, 1, 1],
+        ]
+        .map(|row| FpVector::from_slice(p, &row))
+        .into_iter();
+        let all_vectors = space.iter_all_vectors();
+
+        for (v1, v2) in all_vectors_manual.zip(all_vectors) {
+            assert_eq!(v1, v2);
+        }
+    }
+
+    #[test]
+    fn test_all_vectors_iterator_3() {
+        let p = ValidPrime::new(3);
+        let mut matrix = Matrix::from_vec(
+            p,
+            &[
+                vec![1, 0, 1, 0],
+                vec![0, 1, 0, 0],
+                vec![0, 0, 0, 1],
+                vec![0, 0, 0, 0],
+            ],
+        );
+        matrix.row_reduce();
+        let space = Subspace { matrix };
+
+        let all_vectors_manual = [
+            [0, 0, 0, 0],
+            [1, 0, 1, 0],
+            [2, 0, 2, 0],
+            [0, 1, 0, 0],
+            [1, 1, 1, 0],
+            [2, 1, 2, 0],
+            [0, 2, 0, 0],
+            [1, 2, 1, 0],
+            [2, 2, 2, 0],
+            [0, 0, 0, 1],
+            [1, 0, 1, 1],
+            [2, 0, 2, 1],
+            [0, 1, 0, 1],
+            [1, 1, 1, 1],
+            [2, 1, 2, 1],
+            [0, 2, 0, 1],
+            [1, 2, 1, 1],
+            [2, 2, 2, 1],
+            [0, 0, 0, 2],
+            [1, 0, 1, 2],
+            [2, 0, 2, 2],
+            [0, 1, 0, 2],
+            [1, 1, 1, 2],
+            [2, 1, 2, 2],
+            [0, 2, 0, 2],
+            [1, 2, 1, 2],
+            [2, 2, 2, 2],
+        ]
+        .map(|row| FpVector::from_slice(p, &row))
+        .into_iter();
+
+        for (v1, v2) in all_vectors_manual.zip(space.iter_all_vectors()) {
+            assert_eq!(v1, v2);
+        }
     }
 }
