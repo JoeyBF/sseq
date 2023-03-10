@@ -270,6 +270,7 @@ mod save_option {
         save::SaveOption, utils::construct,
     };
     use rstest::rstest;
+    use sseq::coordinates::Bidegree;
 
     use super::lock_tempdir;
 
@@ -278,17 +279,17 @@ mod save_option {
     #[case(SaveOption::ReadOnly)]
     fn test_morphism_locked(#[case] save_option: SaveOption) {
         let tempdir = tempfile::TempDir::new().unwrap();
+        let h0_degree = Bidegree::n_s(0, 1);
 
         let resolution = Arc::new(construct("S_2", Some(tempdir.path().into())).unwrap());
-        resolution.compute_through_stem(1, 0);
+        resolution.compute_through_stem(h0_degree);
 
         lock_tempdir(tempdir.path());
         ResolutionHomomorphism::from_class_with_save_option(
             "h0".into(),
             Arc::clone(&resolution),
             Arc::clone(&resolution),
-            1,
-            1,
+            h0_degree,
             &[1],
             save_option,
         )
@@ -300,16 +301,17 @@ mod save_option {
     #[case(SaveOption::ReadOnly)]
     fn test_homotopy_locked(#[case] save_option: SaveOption) {
         let tempdir = tempfile::TempDir::new().unwrap();
+        let h0_degree = Bidegree::n_s(0, 1);
+        let h1_degree = Bidegree::n_s(1, 1);
 
         let resolution = Arc::new(construct("S_2", Some(tempdir.path().into())).unwrap());
-        resolution.compute_through_stem(2, 2);
+        resolution.compute_through_stem(h0_degree + h1_degree);
 
         let h0 = ResolutionHomomorphism::from_class(
             "h0".into(),
             Arc::clone(&resolution),
             Arc::clone(&resolution),
-            1,
-            1,
+            h0_degree,
             &[1],
         );
         h0.extend_all();
@@ -317,8 +319,7 @@ mod save_option {
             "h1".into(),
             Arc::clone(&resolution),
             Arc::clone(&resolution),
-            1,
-            2,
+            h1_degree,
             &[1],
         );
         h1.extend_all();
@@ -330,15 +331,15 @@ mod save_option {
     #[test]
     #[should_panic]
     fn test_force() {
+        let h0_degree = Bidegree::n_s(0, 1);
         let resolution = Arc::new(construct("S_2", None).unwrap());
-        resolution.compute_through_stem(1, 0);
+        resolution.compute_through_stem(h0_degree);
 
         ResolutionHomomorphism::from_class_with_save_option(
             "h0".into(),
             Arc::clone(&resolution),
             Arc::clone(&resolution),
-            1,
-            1,
+            h0_degree,
             &[1],
             SaveOption::Force,
         );
