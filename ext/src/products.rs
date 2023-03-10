@@ -2,22 +2,24 @@ use std::sync::Arc;
 
 use algebra::{module::Module, MuAlgebra};
 use dashmap::DashMap;
-use fp::{matrix::Matrix, vector::FpVector};
+use fp::{
+    matrix::{Matrix, Subspace},
+    prime::ValidPrime,
+    vector::{prelude::*, FpVector},
+};
+use sseq::coordinates::{Bidegree, BidegreeElement, BidegreeGenerator};
 
 use crate::{
-    chain_complex::{AugmentedChainComplex, BoundedChainComplex, ChainComplex, FreeChainComplex},
+    chain_complex::{
+        AugmentedChainComplex, BoundedChainComplex, ChainComplex, ChainHomotopy, FreeChainComplex,
+    },
     resolution_homomorphism::MuResolutionHomomorphism,
+    save::SaveOption,
     utils::QueryModuleResolution,
 };
 
-/// (s, t)
-pub type Bidegree = (u32, i32);
-/// (s, t, vec)
-pub type BidegreeElement = (u32, i32, FpVector);
-/// (s, t, idx)
-pub type BidegreeGenerator = (u32, i32, usize);
-
 pub struct ProductStructure {
+    p: ValidPrime,
     resolution: Arc<QueryModuleResolution>,
     cache: MuResolutionHomomorphismCache<false, QueryModuleResolution, QueryModuleResolution>,
     multiplication_table: DashMap<(BidegreeGenerator, Bidegree), Matrix>,
@@ -35,6 +37,7 @@ impl ProductStructure {
             homs: DashMap::new(),
         };
         Self {
+            p: ValidPrime::new(2),
             resolution,
             cache,
             multiplication_table: DashMap::new(),
@@ -45,40 +48,59 @@ impl ProductStructure {
         Arc::clone(&self.resolution)
     }
 
+    pub fn product(
+        &self,
+        x: &BidegreeElement<FpVector>,
+        y: &BidegreeElement<FpVector>,
+    ) -> Result<BidegreeElement<FpVector>, String> {
+        let tot = x.degree() + y.degree();
+        if !self.resolution().has_computed_bidegree(tot) {
+            return Err(format!("Bidegree {tot} not computed"));
+        }
+        let target_dim = self
+            .resolution()
+            .number_of_gens_in_bidegree(x.degree() + y.degree());
+        let mut result = FpVector::new(self.p, target_dim);
+        for (x_gen, x_coeff) in x.decompose() {
+            for (y_gen, y_coeff) in y.decompose() {
+                result.add(self.product_gen(x_gen, y_gen)?.vec(), x_coeff * y_coeff);
+            }
+        }
+        Ok(BidegreeElement::new(x.degree(), result))
+    }
+
     pub fn product_gen(
         &self,
         x: BidegreeGenerator,
         y: BidegreeGenerator,
-    ) -> Result<BidegreeElement, String> {
-        let (x_s, x_t, x_idx) = x;
-        let (y_s, y_t, y_idx) = y;
-        let (tot_s, tot_t) = (x_s + y_s, x_t + y_t);
-        if !self.resolution.has_computed_bidegree(tot_s, tot_t) {
-            return Err(format!("Bidegree ({tot_s}, {tot_t}) not computed"));
+    ) -> Result<BidegreeElement<FpVector>, String> {
+        let tot = x.degree() + y.degree();
+        if !self.resolution.has_computed_bidegree(tot) {
+            return Err(format!("Bidegree {tot} not computed"));
         }
-        if let Some(matrix) = self.multiplication_table.get(&(x, (y_s, y_t))) {
-            let result_vec = matrix.row(y_idx).to_owned();
-            Ok((tot_s, tot_t, result_vec))
+        if let Some(matrix) = self.multiplication_table.get(&(x, y.degree())) {
+            let result_vec = matrix.row(y.idx()).into_owned();
+            Ok(BidegreeElement::new(tot, result_vec))
         } else {
-            let x_num_gens = self.resolution.module(x_s).number_of_gens_in_degree(x_t);
-            // let y_num_gens = self.resolution.module(y_s).number_of_gens_in_degree(y_t);
-            // let tot_num_gens = self
-            //     .resolution
-            //     .module(tot_s)
-            //     .number_of_gens_in_degree(tot_t);
+            let x_num_gens = self.resolution.number_of_gens_in_bidegree(x.degree());
             let x_class = {
                 let mut class = vec![0; x_num_gens];
-                class[x_idx] = 1;
+                class[x.idx()] = 1;
                 class
             };
-            let x_hom = self
-                .cache
-                .from_class(format!("({x_s},{x_t},{x_idx})"), x_s, x_t, &x_class);
-            let matrix_vec = x_hom.get_map(tot_s).hom_k(y_t);
+            let x_hom = self.cache.from_class(
+                format!("{x}"),
+                BidegreeElement::new(x.degree(), FpVector::from_slice(self.p, &x_class)),
+            );
+            let matrix_vec = x_hom.get_map(tot.s()).hom_k(y.t());
             let matrix = Matrix::from_vec(self.resolution.prime(), &matrix_vec);
-            let result_vec = matrix.row(y_idx).to_owned();
-            self.multiplication_table.insert((x, (y_s, y_t)), matrix);
-            Ok((tot_s, tot_t, result_vec))
+            let result_vec = matrix.row(y.idx()).into_owned();
+            let h0_degree = Bidegree::n_s(0, 1);
+            if x.degree() == h0_degree && y.degree() == h0_degree {
+                eprintln!("h0 * h0 = [{result_vec:?}]");
+            }
+            self.multiplication_table.insert((x, y.degree()), matrix);
+            Ok(BidegreeElement::new(tot, result_vec))
         }
     }
 
@@ -89,65 +111,256 @@ impl ProductStructure {
         self.compute_all_products_serial();
     }
 
+    pub fn compute_all_massey_products(&self) {
+        #[cfg(feature = "concurrent")]
+        self.compute_all_massey_products_concurrent();
+        #[cfg(not(feature = "concurrent"))]
+        self.compute_all_massey_products_serial();
+    }
+
     #[cfg(feature = "concurrent")]
     fn compute_all_products_concurrent(&self) {
         use rayon::prelude::*;
 
-        self.resolution
-            .iter_stem()
-            .par_bridge()
-            .for_each(|(x_s, _, x_t)| {
-                if (x_s, x_t) == (0, 0) {
-                    // We don't compute products with the identity.
-                    return;
-                }
-                if !self.resolution.has_computed_bidegree(x_s, x_t) {
-                    return;
-                }
-                (0..self.resolution.module(x_s).number_of_gens_in_degree(x_t))
-                    .into_par_iter()
-                    .for_each(|x_idx| {
-                        let timer = crate::utils::Timer::start();
-                        self.resolution
-                            .iter_stem()
-                            .par_bridge()
-                            .for_each(|(y_s, _, y_t)| {
-                                if !self.resolution.has_computed_bidegree(y_s, y_t)
-                                    || !self.resolution.has_computed_bidegree(x_s + y_s, x_t + y_t)
-                                {
-                                    return;
-                                }
+        self.resolution.iter_stem().par_bridge().for_each(|x| {
+            if x == Bidegree::zero() {
+                // We don't compute products with the identity.
+                return;
+            }
+            if !self.resolution.has_computed_bidegree(x) {
+                return;
+            }
+            (0..self.resolution.number_of_gens_in_bidegree(x))
+                .into_par_iter()
+                .for_each(|x_idx| {
+                    self.resolution.iter_stem().par_bridge().for_each(|y| {
+                        if !self.resolution.has_computed_bidegree(y)
+                            || !self.resolution.has_computed_bidegree(x + y)
+                        {
+                            return;
+                        }
 
-                                (0..self.resolution.module(y_s).number_of_gens_in_degree(y_t))
-                                    .into_par_iter()
-                                    .for_each(|y_idx| {
-                                        if let Err(e) =
-                                            self.product_gen((x_s, x_t, x_idx), (y_s, y_t, y_idx))
-                                        {
-                                            panic!("Failed to compute products: {e}");
-                                        }
-                                    });
+                        (0..self.resolution.number_of_gens_in_bidegree(y))
+                            .into_par_iter()
+                            .for_each(|y_idx| {
+                                if let Err(e) = self.product_gen(
+                                    BidegreeGenerator::new(x, x_idx),
+                                    BidegreeGenerator::new(y, y_idx),
+                                ) {
+                                    panic!("Failed to compute products: {e}");
+                                }
                             });
-                        timer.end(format_args!(
-                            "Computed products ({x_s}, {x_t}, {x_idx}) * y"
-                        ));
                     });
-            });
+                });
+        });
     }
 
     #[cfg_attr(feature = "concurrent", allow(dead_code))]
     fn compute_all_products_serial(&self) {
-        for (x_s, _, x_t) in self.resolution.iter_stem() {
-            for x_idx in 0..self.resolution.module(x_s).number_of_gens_in_degree(x_t) {
-                for (y_s, _, y_t) in self.resolution.iter_stem() {
-                    for y_idx in 0..self.resolution.module(y_s).number_of_gens_in_degree(y_t) {
-                        if let Err(e) = self.product_gen((x_s, x_t, x_idx), (y_s, y_t, y_idx)) {
-                            panic!("Failed to compute products: {e}");
-                        }
+        for x_deg in self.resolution.iter_stem() {
+            let x_space =
+                Subspace::entire_space(self.p, self.resolution.number_of_gens_in_bidegree(x_deg));
+            for x_vec in x_space.iter_all_vectors() {
+                let x = BidegreeElement::new(x_deg, x_vec);
+                for y_deg in self.resolution.iter_stem() {
+                    let y_space = Subspace::entire_space(
+                        self.p,
+                        self.resolution.number_of_gens_in_bidegree(y_deg),
+                    );
+                    for y_vec in y_space.iter_all_vectors() {
+                        _ = self.product(&x, &BidegreeElement::new(y_deg, y_vec));
                     }
                 }
             }
         }
+    }
+
+    fn compute_massey_products_a_b_c(
+        &self,
+        a: BidegreeElement<FpVector>,
+        b: BidegreeElement<FpVector>,
+        c: BidegreeElement<FpVector>,
+        bc: Arc<ChainHomotopy<QueryModuleResolution, QueryModuleResolution, QueryModuleResolution>>,
+    ) {
+        // The Massey product shifts the bidegree by this amount
+        let shift = b.degree() + c.degree() - Bidegree::s_t(1, 0);
+
+        if !self.resolution.has_computed_bidegree(a.degree() + shift) {
+            return;
+        }
+
+        let tot = a.degree() + shift;
+
+        let target_num_gens = self.resolution.number_of_gens_in_bidegree(tot);
+        if target_num_gens == 0 {
+            return;
+        }
+
+        bc.extend(tot);
+        let htpy_map = bc.homotopy(tot.s());
+        let offset_a = self
+            .resolution
+            .module(a.s())
+            .generator_offset(a.t(), a.t(), 0);
+
+        let mut answer = vec![0; target_num_gens];
+        let mut nonzero = false;
+        for (i, ans) in answer.iter_mut().enumerate().take(target_num_gens) {
+            let output = htpy_map.output(tot.t(), i);
+            for (k, entry) in a.vec().iter().enumerate() {
+                if entry != 0 {
+                    //answer[i] += entry * output.entry(self.resolution.module(s1).generator_offset(t1,t1,k));
+                    *ans += entry * output.entry(offset_a + k);
+                }
+            }
+            if *ans != 0 {
+                nonzero = true;
+            }
+        }
+        if nonzero {
+            println!("<{a}, {b}, {c}> = {answer:?}",);
+        }
+    }
+
+    pub fn compute_massey_product_b_c(
+        &self,
+        b: &BidegreeElement<FpVector>,
+        c: &BidegreeElement<FpVector>,
+    ) -> anyhow::Result<()> {
+        match self.product_is_zero(&b, &c) {
+            Ok(false) | Err(_) => return Ok(()),
+            _ => {}
+        };
+
+        // The Massey product shifts the bidegree by this amount
+        let shift = b.degree() + c.degree() - Bidegree::s_t(1, 0);
+
+        if !self
+            .resolution
+            .has_computed_bidegree(shift + Bidegree::s_t(0, self.resolution.min_degree()))
+        {
+            return Ok(());
+        }
+
+        let b_hom = self.cache.from_class(String::new(), b.clone());
+        let c_hom = self.cache.from_class(String::new(), c.clone());
+
+        let homotopy = Arc::new(ChainHomotopy::new_with_save_option(
+            Arc::clone(&c_hom),
+            Arc::clone(&b_hom),
+            SaveOption::No,
+        ));
+
+        for a_deg in self.resolution.iter_stem() {
+            if a_deg == Bidegree::zero() {
+                continue;
+            }
+            let a_space =
+                Subspace::entire_space(self.p, self.resolution.number_of_gens_in_bidegree(a_deg));
+            for a_vec in a_space.iter_all_vectors().skip(1) {
+                let a = BidegreeElement::new(a_deg, a_vec);
+                match self.product_is_zero(&a, &b) {
+                    Ok(false) | Err(_) => continue,
+                    _ => {}
+                };
+
+                self.compute_massey_products_a_b_c(a, b.clone(), c.clone(), Arc::clone(&homotopy))
+            }
+        }
+
+        Ok(())
+    }
+
+    #[cfg(feature = "concurrent")]
+    fn compute_all_massey_products_concurrent(&self) {
+        use rayon::prelude::*;
+
+        self.resolution.iter_stem().par_bridge().for_each(|c_deg| {
+            if c_deg == Bidegree::zero() {
+                // We don't compute products with the identity.
+                return;
+            }
+            if !self.resolution.has_computed_bidegree(c_deg) {
+                return;
+            }
+            let c_space =
+                Subspace::entire_space(self.p, self.resolution.number_of_gens_in_bidegree(c_deg));
+            c_space
+                .iter_all_vectors()
+                .skip(1)
+                .par_bridge()
+                .for_each(|c_vec| {
+                    let c = BidegreeElement::new(c_deg, c_vec);
+                    self.resolution.iter_stem().par_bridge().for_each(|b_deg| {
+                        if !self.resolution.has_computed_bidegree(b_deg)
+                            || !self.resolution.has_computed_bidegree(b_deg + c_deg)
+                        {
+                            return;
+                        }
+                        let b_num_gens = self.resolution.number_of_gens_in_bidegree(b_deg);
+                        let b_space = Subspace::entire_space(self.p, b_num_gens);
+                        b_space
+                            .iter_all_vectors()
+                            .skip(1)
+                            .par_bridge()
+                            .for_each(|b_vec| {
+                                let b = BidegreeElement::new(b_deg, b_vec);
+                                if let Err(e) = self.compute_massey_product_b_c(&b, &c) {
+                                    panic!("Failed to compute products: {e}");
+                                }
+                            });
+                    });
+                });
+        });
+    }
+
+    #[cfg_attr(feature = "concurrent", allow(dead_code))]
+    fn compute_all_massey_products_serial(&self) {
+        self.resolution.iter_stem().for_each(|c_deg| {
+            if c_deg == Bidegree::zero() {
+                // We don't compute products with the identity.
+                return;
+            }
+            if !self.resolution.has_computed_bidegree(c_deg) {
+                return;
+            }
+            let c_space =
+                Subspace::entire_space(self.p, self.resolution.number_of_gens_in_bidegree(c_deg));
+            c_space.iter_all_vectors().skip(1).for_each(|c_vec| {
+                let c = BidegreeElement::new(c_deg, c_vec);
+                self.resolution.iter_stem().for_each(|b_deg| {
+                    if !self.resolution.has_computed_bidegree(b_deg)
+                        || !self.resolution.has_computed_bidegree(b_deg + c_deg)
+                    {
+                        return;
+                    }
+                    let b_num_gens = self.resolution.number_of_gens_in_bidegree(b_deg);
+                    let b_space = Subspace::entire_space(self.p, b_num_gens);
+                    b_space.iter_all_vectors().skip(1).for_each(|b_vec| {
+                        let b = BidegreeElement::new(b_deg, b_vec);
+                        if let Err(e) = self.compute_massey_product_b_c(&b, &c) {
+                            panic!("Failed to compute products: {e}");
+                        }
+                    });
+                });
+            });
+        });
+    }
+
+    fn compute_indeterminacy(
+        a: BidegreeElement<FpVector>,
+        b_deg: Bidegree,
+        c: BidegreeElement<FpVector>,
+    ) -> Subspace {
+        todo!()
+    }
+
+    fn product_is_zero(
+        &self,
+        a: &BidegreeElement<FpVector>,
+        b: &BidegreeElement<FpVector>,
+    ) -> Result<bool, String> {
+        self.product(a, b).map(|prod| prod.vec().is_zero())
     }
 }
 
@@ -159,7 +372,7 @@ where
 {
     source: Arc<CC1>,
     target: Arc<CC2>,
-    homs: DashMap<(String, u32, i32, Vec<u32>), Arc<MuResolutionHomomorphism<U, CC1, CC2>>>,
+    homs: DashMap<BidegreeElement<FpVector>, Arc<MuResolutionHomomorphism<U, CC1, CC2>>>,
 }
 
 impl<const U: bool, CC1, CC2> MuResolutionHomomorphismCache<U, CC1, CC2>
@@ -171,35 +384,19 @@ where
     pub fn from_class(
         &self,
         name: String,
-        shift_s: u32,
-        shift_t: i32,
-        class: &[u32],
+        element: BidegreeElement<FpVector>,
     ) -> Arc<MuResolutionHomomorphism<U, CC1, CC2>> {
         let x = self
             .homs
-            .entry((name.clone(), shift_s, shift_t, class.into()))
+            .entry(element.clone().into_owned())
             .or_insert_with(|| {
-                let result = MuResolutionHomomorphism::new_with_save(
+                let result = MuResolutionHomomorphism::from_class(
                     name,
                     Arc::clone(&self.source),
                     Arc::clone(&self.target),
-                    shift_s,
-                    shift_t,
-                    false,
+                    element.degree(),
+                    &element.vec().iter().collect::<Vec<_>>(),
                 );
-
-                let num_gens = result
-                    .source
-                    .module(shift_s)
-                    .number_of_gens_in_degree(shift_t);
-                assert_eq!(num_gens, class.len());
-
-                let mut matrix = Matrix::new(result.source.prime(), num_gens, 1);
-                for (k, &v) in class.iter().enumerate() {
-                    matrix[k].set_entry(0, v);
-                }
-
-                result.extend_step(shift_s, shift_t, Some(&matrix));
                 result.extend_all();
                 Arc::new(result)
             })
