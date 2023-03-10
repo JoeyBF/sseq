@@ -2,6 +2,7 @@ use super::{Bidegree, BidegreeElement};
 
 use std::fmt::{self, Display, Formatter};
 
+use fp::vector::prelude::*;
 #[cfg(feature = "json")]
 use serde::{Deserialize, Serialize};
 
@@ -68,10 +69,10 @@ impl From<(Bidegree, usize)> for BidegreeGenerator {
     }
 }
 
-impl TryFrom<BidegreeElement<'_>> for BidegreeGenerator {
+impl<T: BaseVector> TryFrom<BidegreeElement<T>> for BidegreeGenerator {
     type Error = ();
 
-    fn try_from(value: BidegreeElement) -> Result<Self, Self::Error> {
+    fn try_from(value: BidegreeElement<T>) -> Result<Self, Self::Error> {
         if value.vec().iter().sum::<u32>() == 1 {
             let (idx, _) = value.vec().iter_nonzero().next().unwrap();
             Ok((value.degree(), idx).into())

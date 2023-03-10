@@ -6,20 +6,20 @@ use algebra::{
     module::{Module, MuFreeModule},
     MuAlgebra,
 };
-use fp::vector::Slice;
+use fp::vector::{prelude::*, FpVector, Slice};
 
 /// An element of a bigraded vector space. Most commonly used to index elements of spectral
 /// sequences.
-#[derive(Debug, Clone)]
-pub struct BidegreeElement<'a> {
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct BidegreeElement<T> {
     /// Bidegree of the element
     degree: Bidegree,
     /// Representing vector
-    vec: Slice<'a>,
+    vec: T,
 }
 
-impl<'a> BidegreeElement<'a> {
-    pub fn new(degree: Bidegree, vec: Slice) -> BidegreeElement {
+impl<T> BidegreeElement<T> {
+    pub fn new(degree: Bidegree, vec: T) -> Self {
         BidegreeElement { degree, vec }
     }
 
@@ -39,8 +39,30 @@ impl<'a> BidegreeElement<'a> {
         self.degree.n()
     }
 
-    pub fn vec(&self) -> Slice {
-        self.vec
+    pub fn vec(&self) -> &T {
+        &self.vec
+    }
+}
+
+impl<T: BaseVector> BidegreeElement<T> {
+    pub fn into_owned(self) -> BidegreeElement<FpVector> {
+        BidegreeElement {
+            degree: self.degree(),
+            vec: self.vec.into_owned(),
+        }
+    }
+
+    pub fn to_slice(&self) -> BidegreeElement<Slice> {
+        BidegreeElement {
+            degree: self.degree,
+            vec: self.vec().as_slice(),
+        }
+    }
+
+    pub fn decompose(&self) -> impl Iterator<Item = (BidegreeGenerator, u32)> + '_ {
+        self.vec()
+            .iter_nonzero()
+            .map(|(idx, coeff)| (BidegreeGenerator::new(self.degree(), idx), coeff))
     }
 
     /// Prints the element to stdout. For example, an element in bidegree `(n,s)` with vector
@@ -104,7 +126,7 @@ impl<'a> BidegreeElement<'a> {
     }
 }
 
-impl Display for BidegreeElement<'_> {
+impl<T: Display> Display for BidegreeElement<T> {
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
         write!(f, "({}, {}, {})", self.n(), self.s(), self.vec())
     }
