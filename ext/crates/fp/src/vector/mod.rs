@@ -131,7 +131,7 @@ mod test {
         (fn $name:ident($p:ident: ValidPrime, $dim:ident: usize) $body:tt $($rest:tt)*) => {
             #[rstest]
             #[trace]
-            fn $name(#[values(2, 3, 5, 7)] p: u32, #[values(10, 20, 70, 100, 1000)] $dim: usize) {
+            fn $name(#[values(2, 3, 5, 7)] p: u32, #[values(0, 10, 20, 70, 100, 1000)] $dim: usize) {
                 let $p = ValidPrime::new(p);
 
                 $body
@@ -175,7 +175,7 @@ mod test {
         (fn $name:ident($p:ident: ValidPrime, $dim:ident: usize) $body:tt $($rest:tt)*) => {
             #[rstest]
             #[trace]
-            fn $name(#[values(2)] p: u32, #[values(10, 20, 70, 100, 1000)] $dim: usize) {
+            fn $name(#[values(2)] p: u32, #[values(0, 10, 20, 70, 100, 1000)] $dim: usize) {
                 let $p = ValidPrime::new(p);
 
                 $body
@@ -220,14 +220,17 @@ mod test {
 
         fn test_is_zero(p: ValidPrime, dim: usize) {
             let zero_vec = FpVector::from_slice(p, &vec![0; dim]);
-            let nonzero_vec = {
-                let mut v = random_vector(p, dim);
-                v[0] = 1;
-                FpVector::from_slice(p, &v)
-            };
-
             assert!(zero_vec.is_zero());
-            assert!(!nonzero_vec.is_zero());
+
+            if dim > 0 {
+                let nonzero_vec = {
+                    let mut v = random_vector(p, dim);
+                    v[0] = 1;
+                    FpVector::from_slice(p, &v)
+                };
+
+                assert!(!nonzero_vec.is_zero());
+            }
         }
 
         fn test_add(p: ValidPrime, dim: usize) {
@@ -244,6 +247,9 @@ mod test {
         }
 
         fn test_add_basis_element(p: ValidPrime, dim: usize, slice_start: usize, slice_end: usize) {
+            if dim == 0 {
+                return;
+            }
             let mut v_arr = random_vector(p, dim);
             let mut v = FpVector::from_slice(p, &v_arr);
             let mut slice = v.slice_mut(slice_start, slice_end);
