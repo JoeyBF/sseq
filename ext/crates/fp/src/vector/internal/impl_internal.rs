@@ -1,3 +1,5 @@
+use std::cmp::Ordering;
+
 use itertools::Itertools;
 
 use super::{InternalBaseVectorMutP, InternalBaseVectorP};
@@ -85,6 +87,28 @@ impl<const P: u32> InternalBaseVectorMutP<P> for FpVectorP<P> {
                     *limb = limb::pack::<_, P>(limb::unpack::<P>(*limb).map(|x| (x * c) % P));
                 }
             }
+        }
+    }
+
+    fn _add<T: InternalBaseVectorP<P>>(&mut self, other: T, c: u32) {
+        if other._len().start == 0 {
+            self._add_offset(other, c, 0);
+            return;
+        }
+        if P == 2 {
+            if c != 0 {
+                match self._len().bit_offset().cmp(&other._len().bit_offset()) {
+                    Ordering::Equal => self._add_shift_none(other, 1),
+                    Ordering::Less => self._add_shift_left(other, 1),
+                    Ordering::Greater => self._add_shift_right(other, 1),
+                };
+            }
+        } else {
+            match self._len().bit_offset().cmp(&other._len().bit_offset()) {
+                Ordering::Equal => self._add_shift_none(other, c),
+                Ordering::Less => self._add_shift_left(other, c),
+                Ordering::Greater => self._add_shift_right(other, c),
+            };
         }
     }
 
