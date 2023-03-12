@@ -1,7 +1,6 @@
 use std::sync::Arc;
 
 use algebra::{module::Module, MuAlgebra};
-use dashmap::DashMap;
 use fp::{
     matrix::{Matrix, Subspace},
     prime::ValidPrime,
@@ -17,6 +16,8 @@ use crate::{
     save::SaveOption,
     utils::QueryModuleResolution,
 };
+
+type DashMap<K, V> = dashmap::DashMap<K, V, std::hash::BuildHasherDefault<rustc_hash::FxHasher>>;
 
 pub struct ProductStructure {
     p: ValidPrime,
@@ -34,13 +35,13 @@ impl ProductStructure {
         let cache = MuResolutionHomomorphismCache {
             source: Arc::clone(&resolution),
             target: Arc::clone(&resolution),
-            homs: DashMap::new(),
+            homs: DashMap::default(),
         };
         Self {
             p: ValidPrime::new(2),
             resolution,
             cache,
-            multiplication_table: DashMap::new(),
+            multiplication_table: DashMap::default(),
         }
     }
 
