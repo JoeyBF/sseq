@@ -441,12 +441,13 @@ where
             .homs
             .entry(element.clone().into_owned())
             .or_insert_with(|| {
-                let result = MuResolutionHomomorphism::from_class(
+                let result = MuResolutionHomomorphism::from_class_with_save_option(
                     name,
                     Arc::clone(&self.source),
                     Arc::clone(&self.target),
                     element.degree(),
                     &element.vec().iter().collect::<Vec<_>>(),
+                    SaveOption::No,
                 );
                 result.extend_all();
                 Arc::new(result)
