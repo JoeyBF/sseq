@@ -17,6 +17,9 @@ use crate::{
     utils::QueryModuleResolution,
 };
 
+#[cfg(feature = "concurrent")]
+use rayon::prelude::*;
+
 type DashMap<K, V> = dashmap::DashMap<K, V, std::hash::BuildHasherDefault<rustc_hash::FxHasher>>;
 
 pub struct ProductStructure {
@@ -259,24 +262,35 @@ impl ProductStructure {
             SaveOption::No,
         ));
 
-        for a_deg in self.resolution.iter_stem() {
+        #[cfg(not(feature = "concurrent"))]
+        let iter_stem = self.resolution.iter_stem();
+        #[cfg(feature = "concurrent")]
+        let iter_stem = self.resolution.iter_stem().par_bridge();
+
+        iter_stem.for_each(|a_deg| {
             if (a_deg.n(), a_deg.s()) > (c.degree().n(), c.degree().s())
                 || a_deg == Bidegree::zero()
             {
-                continue;
+                return;
             }
             let a_space =
                 Subspace::entire_space(self.p, self.resolution.number_of_gens_in_bidegree(a_deg));
-            for a_vec in a_space.iter_all_vectors().skip(1) {
+
+            #[cfg(not(feature = "concurrent"))]
+            let all_vectors = a_space.iter_all_vectors().skip(1);
+            #[cfg(feature = "concurrent")]
+            let all_vectors = a_space.iter_all_vectors().skip(1).par_bridge();
+
+            all_vectors.for_each(|a_vec| {
                 let a = BidegreeElement::new(a_deg, a_vec);
                 match self.product_is_zero(&a, &b) {
-                    Ok(false) | Err(_) => continue,
+                    Ok(false) | Err(_) => return,
                     _ => {}
                 };
 
                 self.compute_massey_products_a_b_c(a, b.clone(), c.clone(), Arc::clone(&homotopy))
-            }
-        }
+            });
+        });
 
         Ok(())
     }
