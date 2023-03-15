@@ -159,17 +159,28 @@ impl ProductStructure {
     #[cfg_attr(feature = "concurrent", allow(dead_code))]
     fn compute_all_products_serial(&self) {
         for x_deg in self.resolution.iter_stem() {
-            let x_space =
-                Subspace::entire_space(self.p, self.resolution.number_of_gens_in_bidegree(x_deg));
-            for x_vec in x_space.iter_all_vectors() {
-                let x = BidegreeElement::new(x_deg, x_vec);
+            if x_deg == Bidegree::zero() {
+                // We don't compute products with the identity.
+                return;
+            }
+            if !self.resolution.has_computed_bidegree(x_deg) {
+                return;
+            }
+            for x_idx in 0..self.resolution.number_of_gens_in_bidegree(x_deg) {
                 for y_deg in self.resolution.iter_stem() {
-                    let y_space = Subspace::entire_space(
-                        self.p,
-                        self.resolution.number_of_gens_in_bidegree(y_deg),
-                    );
-                    for y_vec in y_space.iter_all_vectors() {
-                        _ = self.product(&x, &BidegreeElement::new(y_deg, y_vec));
+                    if !self.resolution.has_computed_bidegree(y_deg)
+                        || !self.resolution.has_computed_bidegree(x_deg + y_deg)
+                    {
+                        return;
+                    }
+
+                    for y_idx in 0..self.resolution.number_of_gens_in_bidegree(y_deg) {
+                        if let Err(e) = self.product_gen(
+                            BidegreeGenerator::new(x_deg, x_idx),
+                            BidegreeGenerator::new(y_deg, y_idx),
+                        ) {
+                            panic!("Failed to compute products: {e}");
+                        }
                     }
                 }
             }
