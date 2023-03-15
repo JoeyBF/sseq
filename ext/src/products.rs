@@ -32,11 +32,8 @@ impl ProductStructure {
             resolution.target().max_s() == 1 && resolution.target().module(0).is_unit(),
             "Product structure not supported for non-unit resolution"
         );
-        let cache = MuResolutionHomomorphismCache {
-            source: Arc::clone(&resolution),
-            target: Arc::clone(&resolution),
-            homs: DashMap::default(),
-        };
+        let cache =
+            MuResolutionHomomorphismCache::new(Arc::clone(&resolution), Arc::clone(&resolution));
         Self {
             p: ValidPrime::new(2),
             resolution,
@@ -58,9 +55,7 @@ impl ProductStructure {
         if !self.resolution().has_computed_bidegree(tot) {
             return Err(format!("Bidegree {tot} not computed"));
         }
-        let target_dim = self
-            .resolution()
-            .number_of_gens_in_bidegree(x.degree() + y.degree());
+        let target_dim = self.resolution().number_of_gens_in_bidegree(tot);
         let mut result = FpVector::new(self.p, target_dim);
         for (x_gen, x_coeff) in x.decompose() {
             for (y_gen, y_coeff) in y.decompose() {
@@ -432,6 +427,14 @@ where
     CC1::Algebra: MuAlgebra<U>,
     CC2: AugmentedChainComplex<Algebra = CC1::Algebra>,
 {
+    pub fn new(source: Arc<CC1>, target: Arc<CC2>) -> Self {
+        Self {
+            source: Arc::clone(&source),
+            target: Arc::clone(&target),
+            homs: DashMap::default(),
+        }
+    }
+
     pub fn from_class(
         &self,
         name: String,
