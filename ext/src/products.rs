@@ -260,7 +260,9 @@ impl ProductStructure {
         ));
 
         for a_deg in self.resolution.iter_stem() {
-            if a_deg == Bidegree::zero() {
+            if (a_deg.n(), a_deg.s()) > (c.degree().n(), c.degree().s())
+                || a_deg == Bidegree::zero()
+            {
                 continue;
             }
             let a_space =
