@@ -101,12 +101,10 @@ impl M4riTable {
     pub fn reduce_naive(&self, matrix: &mut Matrix, target: usize) {
         for (&row, col) in self.rows.iter().zip_eq(&self.columns) {
             assert!(target != row);
-            unsafe {
-                let coef = (matrix[target].limbs()[col.0] >> col.1) & 1;
-                if coef != 0 {
-                    let (target, source) = matrix.split_borrow(target, row);
-                    simd::add_simd(target.limbs_mut(), source.limbs(), col.0)
-                }
+            let coef = (matrix[target].limbs()[col.0] >> col.1) & 1;
+            if coef != 0 {
+                let (target, source) = unsafe { matrix.split_borrow(target, row) };
+                simd::add_simd(target.limbs_mut(), source.limbs(), col.0)
             }
         }
     }

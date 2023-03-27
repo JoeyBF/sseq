@@ -10,6 +10,12 @@ use crate::{
     prime::ValidPrime,
 };
 
+impl<const P: u32> Drop for FpVectorP<P> {
+    fn drop(&mut self) {
+        eprintln!("Dropping {self:?}");
+    }
+}
+
 /// An `FpVectorP` is a vector over $\mathbb{F}_p$ for a fixed prime, implemented using const
 /// generics. Due to limitations with const generics, we cannot constrain P to actually be a prime,
 /// so we allow it to be any u32. However, most functions will panic if P is not a prime.
@@ -143,11 +149,9 @@ impl<const P: u32> FpVectorP<P> {
 
         if cfg!(target_endian = "little") {
             let num_bytes = num_limbs * constants::BYTES_PER_LIMB;
-            unsafe {
-                let buf: &mut [u8] =
-                    std::slice::from_raw_parts_mut(limbs.as_mut_ptr() as *mut u8, num_bytes);
-                data.read_exact(buf).unwrap();
-            }
+            let buf: &mut [u8] =
+                unsafe { std::slice::from_raw_parts_mut(limbs.as_mut_ptr() as *mut u8, num_bytes) };
+            data.read_exact(buf).unwrap();
         } else {
             for entry in limbs {
                 let mut bytes: [u8; constants::BYTES_PER_LIMB] = [0; constants::BYTES_PER_LIMB];
@@ -171,11 +175,10 @@ impl<const P: u32> FpVectorP<P> {
 
         if cfg!(target_endian = "little") {
             let num_bytes = num_limbs * constants::BYTES_PER_LIMB;
-            unsafe {
-                let buf: &[u8] =
-                    std::slice::from_raw_parts_mut(self.limbs.as_ptr() as *mut u8, num_bytes);
-                buffer.write_all(buf)?;
-            }
+            let buf: &[u8] = unsafe {
+                std::slice::from_raw_parts_mut(self.limbs.as_ptr() as *mut u8, num_bytes)
+            };
+            buffer.write_all(buf)?;
         } else {
             for limb in &self.limbs[0..num_limbs] {
                 let bytes = limb.to_le_bytes();
@@ -186,6 +189,7 @@ impl<const P: u32> FpVectorP<P> {
     }
 
     pub(crate) fn limbs(&self) -> &[Limb] {
+        // Safety: `_limbs` is safe for an `FpVectorP`
         self._limbs()
     }
 

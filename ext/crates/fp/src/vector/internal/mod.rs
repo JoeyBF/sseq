@@ -9,7 +9,9 @@ use crate::{
 
 mod impl_internal;
 
-pub trait InternalBaseVectorP<const P: u32>: Sized {
+/// Trait containing methods common to all vector-like types.
+/// 
+pub unsafe trait InternalBaseVectorP<const P: u32>: Sized {
     /// Returns a pointer to the allocation containing the actual data. This is a raw pointer and
     /// does not take lifetimes into account. It is the responsibility of the caller to ensure that
     /// the pointer is not dereferenced after the allocation is freed.
@@ -24,6 +26,8 @@ pub trait InternalBaseVectorP<const P: u32>: Sized {
     fn _len(&self) -> LimbLength<P>;
 
     fn _limbs(&self) -> &[Limb] {
+        // Safety: It is the implementor's responsibility to ensure that `self._as_ptr()` stays
+        // valid for the lifetime of `self`. This is why this trait is marked as unsafe.
         unsafe { std::slice::from_raw_parts(self._as_ptr(), self._len().limbs()) }
     }
 

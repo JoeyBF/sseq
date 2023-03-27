@@ -76,7 +76,7 @@ impl<const P: u32> LimbLength<P> {
     }
 
     pub(crate) const fn restrict_to(&self, other: Self) -> Self {
-        debug_assert!(self.contains(&other));
+        assert!(self.contains(&other));
         Self::from_start_end(other.start + self.start, other.end + self.start)
     }
 

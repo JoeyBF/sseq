@@ -103,10 +103,8 @@ impl Matrix {
     /// Read a vector of `isize`
     pub(crate) fn write_pivot(v: &[isize], buffer: &mut impl Write) -> std::io::Result<()> {
         if cfg!(all(target_endian = "little", target_pointer_width = "64")) {
-            unsafe {
-                let buf: &[u8] = std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 8);
-                buffer.write_all(buf).unwrap();
-            }
+            let buf = unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 8) };
+            buffer.write_all(buf).unwrap();
         } else {
             use byteorder::{LittleEndian, WriteBytesExt};
             for &i in v {
@@ -120,11 +118,9 @@ impl Matrix {
     pub(crate) fn read_pivot(dim: usize, data: &mut impl Read) -> std::io::Result<Vec<isize>> {
         if cfg!(all(target_endian = "little", target_pointer_width = "64")) {
             let mut image = vec![0; dim];
-            unsafe {
-                let buf: &mut [u8] =
-                    std::slice::from_raw_parts_mut(image.as_mut_ptr() as *mut u8, dim * 8);
-                data.read_exact(buf).unwrap();
-            }
+            let buf: &mut [u8] =
+                unsafe { std::slice::from_raw_parts_mut(image.as_mut_ptr() as *mut u8, dim * 8) };
+            data.read_exact(buf).unwrap();
             Ok(image)
         } else {
             use byteorder::{LittleEndian, ReadBytesExt};

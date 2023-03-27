@@ -200,6 +200,9 @@ impl ProductStructure {
         }
 
         let tot = a.degree() + shift;
+        if tot != Bidegree::n_s(48, 9) || a.degree() != Bidegree::n_s(37, 7) {
+            return;
+        }
 
         let target_num_gens = self.resolution.number_of_gens_in_bidegree(tot);
         if target_num_gens == 0 {

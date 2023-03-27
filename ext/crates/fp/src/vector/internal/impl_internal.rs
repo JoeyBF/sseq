@@ -9,7 +9,7 @@ use crate::{
     vector::generic::{FpVectorP, SliceMutP, SliceP},
 };
 
-impl<const P: u32> InternalBaseVectorP<P> for FpVectorP<P> {
+unsafe impl<const P: u32> InternalBaseVectorP<P> for FpVectorP<P> {
     fn _as_ptr(&self) -> *const Limb {
         self.limbs.as_ptr()
     }
@@ -189,7 +189,7 @@ impl<const P: u32> InternalBaseVectorMutP<P> for FpVectorP<P> {
     }
 }
 
-impl<'a, const P: u32> InternalBaseVectorP<P> for SliceP<'a, P> {
+unsafe impl<'a, const P: u32> InternalBaseVectorP<P> for SliceP<'a, P> {
     fn _as_ptr(&self) -> *const Limb {
         self.limbs.as_ptr()
     }
@@ -203,7 +203,7 @@ impl<'a, const P: u32> InternalBaseVectorP<P> for SliceP<'a, P> {
     }
 }
 
-impl<'a, const P: u32> InternalBaseVectorP<P> for SliceMutP<'a, P> {
+unsafe impl<'a, const P: u32> InternalBaseVectorP<P> for SliceMutP<'a, P> {
     fn _as_ptr(&self) -> *const Limb {
         self.limbs.as_ptr()
     }
@@ -229,7 +229,7 @@ impl<'a, const P: u32> InternalBaseVectorMutP<P> for SliceMutP<'a, P> {
 
 // Tautological impls
 
-impl<T: InternalBaseVectorP<P>, const P: u32> InternalBaseVectorP<P> for &T {
+unsafe impl<T: InternalBaseVectorP<P>, const P: u32> InternalBaseVectorP<P> for &T {
     fn _as_ptr(&self) -> *const Limb {
         T::_as_ptr(self)
     }
@@ -239,7 +239,7 @@ impl<T: InternalBaseVectorP<P>, const P: u32> InternalBaseVectorP<P> for &T {
     }
 }
 
-impl<T: InternalBaseVectorP<P>, const P: u32> InternalBaseVectorP<P> for &mut T {
+unsafe impl<T: InternalBaseVectorP<P>, const P: u32> InternalBaseVectorP<P> for &mut T {
     fn _as_ptr(&self) -> *const Limb {
         T::_as_ptr(self)
     }

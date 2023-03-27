@@ -306,7 +306,9 @@ impl<'a> Iterator for PartitionIterator<'a> {
             found = self.search();
         }
         if found {
-            Some(unsafe { std::mem::transmute::<_, Self::Item>((self.remaining, &self.partition)) })
+            Some((self.remaining, unsafe {
+                std::mem::transmute(&self.partition)
+            }))
         } else {
             None
         }

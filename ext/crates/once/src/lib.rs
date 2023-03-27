@@ -164,23 +164,21 @@ impl<T> Drop for OnceVec<T> {
     fn drop(&mut self) {
         let len = self.len();
 
-        unsafe {
-            // The lock may be poisoned. Access is always safe because we have mutable reference,
-            // but if we can acquire the lock we want to drop the elements inside. If the lock is
-            // poisoned, then we are probably panicking so we don't care about memory leakage.
-            if let Ok(ooo) = self.ooo.lock() {
-                let ooo_iter = ooo.0.iter();
-                for entry in ooo_iter {
-                    std::ptr::drop_in_place(self.entry_ptr(*entry));
-                }
+        // The lock may be poisoned. Access is always safe because we have mutable reference,
+        // but if we can acquire the lock we want to drop the elements inside. If the lock is
+        // poisoned, then we are probably panicking so we don't care about memory leakage.
+        if let Ok(ooo) = self.ooo.lock() {
+            let ooo_iter = ooo.0.iter();
+            for entry in ooo_iter {
+                unsafe { std::ptr::drop_in_place(self.entry_ptr(*entry)) };
             }
-            for idx in 0..MAX_OUTER_LENGTH {
-                // We have mutable reference so we can do whatever we want
-                let page = &mut *self.data.as_ptr().add(idx);
-                page.deallocate(len, idx);
-            }
-            alloc::alloc::dealloc(self.data.as_ptr() as *mut u8, DATA_LAYOUT);
         }
+        for idx in 0..MAX_OUTER_LENGTH {
+            // We have mutable reference so we can do whatever we want
+            let page = unsafe { &mut *self.data.as_ptr().add(idx) };
+            unsafe { page.deallocate(len, idx) };
+        }
+        unsafe { alloc::alloc::dealloc(self.data.as_ptr() as *mut u8, DATA_LAYOUT) };
     }
 }
 

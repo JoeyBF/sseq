@@ -61,10 +61,8 @@ impl std::ops::Deref for ValidPrime {
     #[cfg(feature = "odd-primes")]
     fn deref(&self) -> &Self::Target {
         let p = self.p;
-        unsafe {
-            if !is_valid_prime(p) || p == 0 || PRIME_TO_INDEX_MAP[p as usize] >= NUM_PRIMES {
-                std::hint::unreachable_unchecked()
-            }
+        if !is_valid_prime(p) || p == 0 || PRIME_TO_INDEX_MAP[p as usize] >= NUM_PRIMES {
+            unsafe { std::hint::unreachable_unchecked() }
         }
         &self.p
     }
