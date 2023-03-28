@@ -10,22 +10,11 @@ use crate::{
 mod impl_internal;
 
 pub trait InternalBaseVectorP<const P: u32>: Sized {
-    /// Returns a pointer to the allocation containing the actual data. This is a raw pointer and
-    /// does not take lifetimes into account. It is the responsibility of the caller to ensure that
-    /// the pointer is not dereferenced after the allocation is freed.
-    ///
-    /// We use a pointer instead of a slice because otherwise handling the lifetimes is a huge mess.
-    /// In practice it is almost always better to use [`InternalBaseVectorP::_limbs`] to manipulate
-    /// the underlying data.
-    fn _as_ptr(&self) -> *const Limb;
+    fn _limbs(&self) -> &[Limb];
 
     /// Returns a description of the vector as a [`LimbLength`]. See there for the available
     /// information.
     fn _len(&self) -> LimbLength<P>;
-
-    fn _limbs(&self) -> &[Limb] {
-        unsafe { std::slice::from_raw_parts(self._as_ptr(), self._len().limbs()) }
-    }
 
     fn _prime(&self) -> ValidPrime {
         ValidPrime::new(P)
@@ -55,13 +44,9 @@ pub trait InternalBaseVectorP<const P: u32>: Sized {
         true
     }
 
-    fn _slice<'a>(&self, range: LimbLength<P>) -> SliceP<'a, P>
-    where
-        Self: 'a,
-    {
+    fn _slice(&self, range: LimbLength<P>) -> SliceP<P> {
         let (new_len, offset) = self._len().restrict_to(range).apply_shift();
-        let limbs_ptr = unsafe { self._as_ptr().add(offset) };
-        let limbs = unsafe { std::slice::from_raw_parts(limbs_ptr, new_len.limbs()) };
+        let limbs = &self._limbs()[offset..(offset + new_len.limbs())];
         SliceP {
             limbs,
             range: new_len,

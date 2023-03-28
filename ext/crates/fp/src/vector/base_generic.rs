@@ -9,9 +9,7 @@ pub trait BaseVectorP<const P: u32>: InternalBaseVectorP<P> {
     fn len(&self) -> usize;
     fn is_empty(&self) -> bool;
     fn entry(&self, index: usize) -> u32;
-    fn slice<'a>(&self, start: usize, end: usize) -> SliceP<'a, P>
-    where
-        Self: 'a;
+    fn slice(&self, start: usize, end: usize) -> SliceP<P>;
     fn as_slice(&self) -> SliceP<P>;
     fn is_zero(&self) -> bool;
     fn iter(&self) -> FpVectorIterator;
@@ -55,10 +53,7 @@ impl<T: InternalBaseVectorP<P>, const P: u32> BaseVectorP<P> for T {
         self._entry(index)
     }
 
-    fn slice<'a>(&self, start: usize, end: usize) -> SliceP<'a, P>
-    where
-        Self: 'a,
-    {
+    fn slice(&self, start: usize, end: usize) -> SliceP<P> {
         self._slice(LimbLength::from_start_end(start, end))
     }
 

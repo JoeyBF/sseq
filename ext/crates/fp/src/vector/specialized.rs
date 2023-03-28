@@ -75,6 +75,7 @@ macro_rules! dispatch_basevector {
             fn len(&self) -> usize;
             fn is_empty(&self) -> bool;
             fn entry(&self, index: usize) -> u32;
+            fn slice(&self, start: usize, end: usize) -> (dispatch Slice);
             fn as_slice(&self) -> (dispatch Slice);
             fn is_zero(&self) -> bool;
             fn iter(&self) -> FpVectorIterator;
@@ -82,18 +83,6 @@ macro_rules! dispatch_basevector {
             fn first_nonzero(&self) -> (Option<(usize, u32)>);
             fn sign_rule(&self, other: &Self) -> bool;
             fn density(&self) -> f32;
-        }
-
-        fn slice<'b>(&self, start: usize, end: usize) -> Slice<'b>
-        where
-            Self: 'b,
-        {
-            match self {
-                Self::_2(x) => Slice::_2(x.slice(start, end)),
-                Self::_3(x) => Slice::_3(x.slice(start, end)),
-                Self::_5(x) => Slice::_5(x.slice(start, end)),
-                Self::_7(x) => Slice::_7(x.slice(start, end)),
-            }
         }
     };
 }
@@ -127,9 +116,7 @@ pub trait BaseVector {
     fn len(&self) -> usize;
     fn is_empty(&self) -> bool;
     fn entry(&self, index: usize) -> u32;
-    fn slice<'a>(&self, start: usize, end: usize) -> Slice<'a>
-    where
-        Self: 'a;
+    fn slice(&self, start: usize, end: usize) -> Slice;
     fn as_slice(&self) -> Slice;
     fn into_owned(self) -> FpVector;
     fn is_zero(&self) -> bool;
@@ -158,6 +145,36 @@ pub trait BaseVectorMut: BaseVector {
 }
 
 // impls for `FpVector`
+
+impl FpVector {
+    dispatch_prime! {
+        pub fn assign_partial(&mut self, other: &Self);
+        pub fn extend_len(&mut self, len: usize);
+        pub fn set_scratch_vector_size(&mut self, len: usize);
+        pub(crate) fn trim_start(&mut self, n: usize);
+        pub fn add_carry(&mut self, other: &Self, c: u32, rest: &mut [FpVector]) -> bool;
+        pub fn update_from_bytes(&mut self, data: &mut impl Read) -> (std::io::Result<()>);
+        pub fn to_bytes(&self, buffer: &mut impl Write) -> (std::io::Result<()>);
+        pub(crate) fn limbs(&self) -> (&[Limb]);
+        pub(crate) fn limbs_mut(&mut self) -> (&mut [Limb]);
+    }
+
+    pub fn new(p: ValidPrime, len: usize) -> FpVector {
+        match_p!(p, FpVectorP::new_(len))
+    }
+
+    pub fn new_with_capacity(p: ValidPrime, len: usize, capacity: usize) -> FpVector {
+        match_p!(p, FpVectorP::new_with_capacity_(len, capacity))
+    }
+
+    pub fn from_slice(p: ValidPrime, slice: &[u32]) -> Self {
+        match_p!(p, FpVectorP::from(&slice))
+    }
+
+    pub fn from_bytes(p: ValidPrime, len: usize, data: &mut impl Read) -> std::io::Result<Self> {
+        Ok(match_p!(p, FpVectorP::from_bytes(p, len, data)?))
+    }
+}
 
 impl BaseVector for FpVector {
     dispatch_basevector!();
@@ -236,55 +253,7 @@ impl<'de> Deserialize<'de> for FpVector {
     }
 }
 
-impl FpVector {
-    dispatch_prime! {
-        pub fn assign_partial(&mut self, other: &Self);
-        pub fn extend_len(&mut self, len: usize);
-        pub fn set_scratch_vector_size(&mut self, len: usize);
-        pub(crate) fn trim_start(&mut self, n: usize);
-        pub fn add_carry(&mut self, other: &Self, c: u32, rest: &mut [FpVector]) -> bool;
-        pub fn update_from_bytes(&mut self, data: &mut impl Read) -> (std::io::Result<()>);
-        pub fn to_bytes(&self, buffer: &mut impl Write) -> (std::io::Result<()>);
-        pub(crate) fn limbs(&self) -> (&[Limb]);
-        pub(crate) fn limbs_mut(&mut self) -> (&mut [Limb]);
-    }
-
-    pub fn new(p: ValidPrime, len: usize) -> FpVector {
-        match_p!(p, FpVectorP::new_(len))
-    }
-
-    pub fn new_with_capacity(p: ValidPrime, len: usize, capacity: usize) -> FpVector {
-        match_p!(p, FpVectorP::new_with_capacity_(len, capacity))
-    }
-
-    pub fn from_slice(p: ValidPrime, slice: &[u32]) -> Self {
-        match_p!(p, FpVectorP::from(&slice))
-    }
-
-    pub fn from_bytes(p: ValidPrime, len: usize, data: &mut impl Read) -> std::io::Result<Self> {
-        Ok(match_p!(p, FpVectorP::from_bytes(p, len, data)?))
-    }
-}
-
 // impls for `SliceMut`
-
-impl<'a> BaseVector for SliceMut<'a> {
-    dispatch_basevector!();
-
-    dispatch_prime! {
-        fn into_owned(self) -> (dispatch FpVector);
-    }
-}
-
-impl<'a> BaseVectorMut for SliceMut<'a> {
-    dispatch_basevectormut!();
-}
-
-impl<'a> From<&'a mut FpVector> for SliceMut<'a> {
-    fn from(vec: &'a mut FpVector) -> Self {
-        vec.as_slice_mut()
-    }
-}
 
 impl<'a> SliceMut<'a> {
     dispatch_prime! {
@@ -312,7 +281,36 @@ impl<'a> SliceMut<'a> {
     }
 }
 
+impl<'a> BaseVector for SliceMut<'a> {
+    dispatch_basevector!();
+
+    dispatch_prime! {
+        fn into_owned(self) -> (dispatch FpVector);
+    }
+}
+
+impl<'a> BaseVectorMut for SliceMut<'a> {
+    dispatch_basevectormut!();
+}
+
+impl<'a> From<&'a mut FpVector> for SliceMut<'a> {
+    fn from(vec: &'a mut FpVector) -> Self {
+        vec.as_slice_mut()
+    }
+}
+
 // impls for `Slice`
+
+impl<'a> Slice<'a> {
+    pub fn slice(&self, start: usize, end: usize) -> Slice<'a> {
+        match self {
+            Slice::_2(x) => Slice::_2(x.slice(start, end)),
+            Slice::_3(x) => Slice::_3(x.slice(start, end)),
+            Slice::_5(x) => Slice::_5(x.slice(start, end)),
+            Slice::_7(x) => Slice::_7(x.slice(start, end)),
+        }
+    }
+}
 
 impl<'a> BaseVector for Slice<'a> {
     dispatch_basevector!();
@@ -349,17 +347,17 @@ impl<'a> From<&'a mut FpVector> for Slice<'a> {
 
 // impls for `FpVectorNonZeroIterator`
 
+impl<'a> FpVectorNonZeroIterator<'a> {
+    dispatch_prime! {
+        fn next(&mut self) -> (Option<(usize, u32)>);
+    }
+}
+
 impl<'a> Iterator for FpVectorNonZeroIterator<'a> {
     type Item = (usize, u32);
 
     fn next(&mut self) -> Option<Self::Item> {
         self.next()
-    }
-}
-
-impl<'a> FpVectorNonZeroIterator<'a> {
-    dispatch_prime! {
-        fn next(&mut self) -> (Option<(usize, u32)>);
     }
 }
 
@@ -432,6 +430,7 @@ impl<T: BaseVector> BaseVector for &T {
         fn len(&self) -> usize;
         fn is_empty(&self) -> bool;
         fn entry(&self, index: usize) -> u32;
+        fn slice(&self, start: usize, end: usize) -> Slice;
         fn as_slice(&self) -> Slice;
         fn is_zero(&self) -> bool;
         fn iter(&self) -> FpVectorIterator;
@@ -439,13 +438,6 @@ impl<T: BaseVector> BaseVector for &T {
         fn first_nonzero(&self) -> Option<(usize, u32)>;
         fn sign_rule(&self, other: &Self) -> bool;
         fn density(&self) -> f32;
-    }
-
-    fn slice<'b>(&self, start: usize, end: usize) -> Slice<'b>
-    where
-        Self: 'b,
-    {
-        T::slice(self, start, end)
     }
 
     fn into_owned(self) -> FpVector {
@@ -459,6 +451,7 @@ impl<T: BaseVector> BaseVector for &mut T {
         fn len(&self) -> usize;
         fn is_empty(&self) -> bool;
         fn entry(&self, index: usize) -> u32;
+        fn slice(&self, start: usize, end: usize) -> Slice;
         fn as_slice(&self) -> Slice;
         fn is_zero(&self) -> bool;
         fn iter(&self) -> FpVectorIterator;
@@ -466,13 +459,6 @@ impl<T: BaseVector> BaseVector for &mut T {
         fn first_nonzero(&self) -> Option<(usize, u32)>;
         fn sign_rule(&self, other: &Self) -> bool;
         fn density(&self) -> f32;
-    }
-
-    fn slice<'b>(&self, start: usize, end: usize) -> Slice<'b>
-    where
-        Self: 'b,
-    {
-        T::slice(self, start, end)
     }
 
     fn into_owned(self) -> FpVector {

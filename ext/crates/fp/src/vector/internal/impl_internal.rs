@@ -8,20 +8,16 @@ use crate::{
 };
 
 impl<const P: u32> InternalBaseVectorP<P> for FpVectorP<P> {
-    fn _as_ptr(&self) -> *const Limb {
-        self.limbs.as_ptr()
-    }
-
     fn _len(&self) -> LimbLength<P> {
         self.len
     }
 
-    fn _is_zero(&self) -> bool {
-        self.limbs.iter().all(|&x| x == 0)
-    }
-
     fn _limbs(&self) -> &[Limb] {
         &self.limbs
+    }
+
+    fn _is_zero(&self) -> bool {
+        self.limbs.iter().all(|&x| x == 0)
     }
 
     fn _into_owned(self) -> FpVectorP<P> {
@@ -166,10 +162,6 @@ impl<const P: u32> InternalBaseVectorMutP<P> for FpVectorP<P> {
 }
 
 impl<'a, const P: u32> InternalBaseVectorP<P> for SliceP<'a, P> {
-    fn _as_ptr(&self) -> *const Limb {
-        self.limbs.as_ptr()
-    }
-
     fn _len(&self) -> LimbLength<P> {
         self.range
     }
@@ -180,10 +172,6 @@ impl<'a, const P: u32> InternalBaseVectorP<P> for SliceP<'a, P> {
 }
 
 impl<'a, const P: u32> InternalBaseVectorP<P> for SliceMutP<'a, P> {
-    fn _as_ptr(&self) -> *const Limb {
-        self.limbs.as_ptr()
-    }
-
     fn _len(&self) -> LimbLength<P> {
         self.range
     }
@@ -206,22 +194,22 @@ impl<'a, const P: u32> InternalBaseVectorMutP<P> for SliceMutP<'a, P> {
 // Tautological impls
 
 impl<T: InternalBaseVectorP<P>, const P: u32> InternalBaseVectorP<P> for &T {
-    fn _as_ptr(&self) -> *const Limb {
-        T::_as_ptr(self)
-    }
-
     fn _len(&self) -> LimbLength<P> {
         T::_len(self)
+    }
+
+    fn _limbs(&self) -> &[Limb] {
+        T::_limbs(self)
     }
 }
 
 impl<T: InternalBaseVectorP<P>, const P: u32> InternalBaseVectorP<P> for &mut T {
-    fn _as_ptr(&self) -> *const Limb {
-        T::_as_ptr(self)
-    }
-
     fn _len(&self) -> LimbLength<P> {
         T::_len(self)
+    }
+
+    fn _limbs(&self) -> &[Limb] {
+        T::_limbs(self)
     }
 }
 

@@ -212,6 +212,18 @@ impl<'a, const P: u32> From<&'a mut FpVectorP<P>> for SliceMutP<'a, P> {
     }
 }
 
+impl<'a, const P: u32> SliceP<'a, P> {
+    pub fn slice(&self, start: usize, end: usize) -> SliceP<'a, P> {
+        let range = LimbLength::<P>::from_start_end(start, end);
+        let (new_len, offset) = self._len().restrict_to(range).apply_shift();
+        let limbs = &self.limbs[offset..(offset + new_len.limbs())];
+        SliceP {
+            limbs,
+            range: new_len,
+        }
+    }
+}
+
 impl<'a, const P: u32> SliceMutP<'a, P> {
     /// `coeff` need not be reduced mod p.
     /// Adds v otimes w to self.
