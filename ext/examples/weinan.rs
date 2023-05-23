@@ -197,7 +197,14 @@ fn main() {
     }
 
     let resolution = ext::utils::construct("S_2@milnor", save_dir).unwrap();
+
+    #[cfg(not(feature = "nassau"))]
     resolution.compute_through_stem(max_s, max_n);
+    #[cfg(feature = "nassau")]
+    // We need to resolve one homological degree further so that the quasi-inverse is defined up to
+    // *and including* `max_s`.
+    resolution.compute_through_stem(max_s + 1, max_n);
+
     let resolution = Arc::new(resolution);
 
     // Create a ResolutionHomomorphism object
@@ -209,7 +216,7 @@ fn main() {
 
     // Now print the results
     println!("sseq_basis | weinan_basis");
-    for (s, n, t) in hom.target.iter_stem() {
+    for (s, n, t) in hom.iter_stem() {
         let matrix = hom.get_map(s).hom_k(t);
 
         for (i, row) in matrix.into_iter().enumerate() {
