@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::chain_complex::{
-    AugmentedChainComplex, BoundedChainComplex, ChainComplex, FreeChainComplex,
+    AugmentedChainComplex, BoundedChainComplex, ChainComplex, FreeChainComplex, StemIterator,
 };
 use crate::save::SaveKind;
 use algebra::module::homomorphism::{ModuleHomomorphism, MuFreeModuleHomomorphism};
@@ -105,6 +105,13 @@ where
     pub fn save_dir(&self) -> Option<&std::path::Path> {
         self.save_dir.as_deref()
     }
+
+    pub fn iter_stem(&self) -> HomStemIterator<'_, U, CC1, CC2> {
+        HomStemIterator {
+            cc_stem_iterator: self.target.iter_stem(),
+            map: &self,
+        }
+    }
 }
 
 impl<const U: bool, CC1, CC2> MuResolutionHomomorphism<U, CC1, CC2>
@@ -140,9 +147,14 @@ where
     /// decomposables (e.g. it is trivial). More precisely, we assume
     /// [`MuResolutionHomomorphism::extend_step_raw`] can be called with `extra_images = None`.
     pub fn extend_all(&self) {
+        #[cfg(not(feature = "nassau"))]
+        let largest_computed_qi = self.target.next_homological_degree();
+        #[cfg(feature = "nassau")]
+        let largest_computed_qi = self.target.next_homological_degree() - 1;
+
         self.extend_profile(
             std::cmp::min(
-                self.target.next_homological_degree() + self.shift_s,
+                largest_computed_qi + self.shift_s,
                 self.source.next_homological_degree(),
             ),
             |s| {
@@ -504,6 +516,38 @@ where
         let j = target_module.operation_generator_to_index(0, 0, t, idx);
         for i in 0..result.as_slice().len() {
             result.add_basis_element(i, coef * map.output(source_t, i).entry(j));
+        }
+    }
+}
+
+pub struct HomStemIterator<'a, const U: bool, CC1, CC2>
+where
+    CC1: FreeChainComplex<U>,
+    CC1::Algebra: MuAlgebra<U>,
+    CC2: ChainComplex<Algebra = CC1::Algebra>,
+{
+    cc_stem_iterator: StemIterator<'a, CC2>,
+    map: &'a MuResolutionHomomorphism<U, CC1, CC2>,
+}
+
+impl<'a, const U: bool, CC1, CC2> Iterator for HomStemIterator<'a, U, CC1, CC2>
+where
+    CC1: FreeChainComplex<U>,
+    CC1::Algebra: MuAlgebra<U>,
+    CC2: ChainComplex<Algebra = CC1::Algebra>,
+{
+    // (s, n, t)
+    type Item = (u32, i32, i32);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let next = self.cc_stem_iterator.next()?;
+
+        // This condition should really be "if `self.map` is defined on `next`", but that seems to
+        // be sufficient.
+        if (next.0 as i32) < self.map.maps.len() {
+            Some(next)
+        } else {
+            self.next()
         }
     }
 }
