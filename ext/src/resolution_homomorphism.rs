@@ -338,13 +338,17 @@ where
             .collect();
 
         if !fdx_vectors.is_empty() {
-            assert!(CC2::apply_quasi_inverse(
-                &*self.target,
-                &mut qi_outputs,
-                output_s,
-                output_t,
-                &fdx_vectors
-            ));
+            assert!(
+                CC2::apply_quasi_inverse(
+                    &*self.target,
+                    &mut qi_outputs,
+                    output_s,
+                    output_t,
+                    &fdx_vectors
+                ),
+                "Failed to apply quasi-inverse at bidegree (n, s) = ({n}, {input_s})",
+                n = input_t - input_s as i32
+            );
         }
 
         if let Some(dir) = &self.save_dir {
