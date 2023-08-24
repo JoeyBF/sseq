@@ -978,7 +978,6 @@
 <a href="#953" id="953">953</a>
 <a href="#954" id="954">954</a>
 <a href="#955" id="955">955</a>
-<a href="#956" id="956">956</a>
 </pre></div><pre class="rust"><code><span class="kw">use </span><span class="kw">crate</span>::bigraded::DenseBigradedModule;
 <span class="kw">use </span><span class="kw">crate</span>::differential::Differential;
 <span class="kw">use </span>bivec::BiVec;
@@ -1049,10 +1048,9 @@
     <span class="doccomment">/// x -&gt; y -&gt; validity. A bidegree is invalid if the page_data is no longer accurate.
     </span>invalid: BiVec&lt;BiVec&lt;bool&gt;&gt;,
 
-    <span class="comment">// Docs: If your struct does not in fact own the data of type T, it is better to use a
-    // reference type, like PhantomData&lt;&amp;&#39;a T&gt; (ideally) or PhantomData&lt;*const T&gt; (if no lifetime
-    // applies), so as not to indicate ownership.
-    </span>profile: PhantomData&lt;<span class="kw-2">*const </span>P&gt;,
+    <span class="comment">// `P` is itself a marker, so it&#39;s safe to claim that we own one. As opposed to
+    // `PhantomData&lt;*const P&gt;`, this lets us implement `Send` and `Sync`.
+    </span>profile: PhantomData&lt;P&gt;,
 }
 
 <span class="kw">impl</span>&lt;P: SseqProfile&gt; Sseq&lt;P&gt; {

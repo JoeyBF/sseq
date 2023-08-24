@@ -384,7 +384,7 @@
             Arc::clone(<span class="kw-2">&amp;</span>zero_module),
             <span class="number">0</span>,
         )));
-        all_differentials.extend(differentials.into_iter());
+        all_differentials.extend(differentials);
         all_differentials.push(Arc::new(F::zero_homomorphism(
             Arc::clone(<span class="kw-2">&amp;</span>zero_module),
             Arc::clone(<span class="kw-2">&amp;</span>modules[modules.len() - <span class="number">1</span>]),
