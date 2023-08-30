@@ -1,4 +1,4 @@
-<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="Source of the Rust file `src/nassau.rs`."><title>nassau.rs - source</title><link rel="preload" as="font" type="font/woff2" crossorigin href="../../static.files/SourceSerif4-Regular-46f98efaafac5295.ttf.woff2"><link rel="preload" as="font" type="font/woff2" crossorigin href="../../static.files/FiraSans-Regular-018c141bf0843ffd.woff2"><link rel="preload" as="font" type="font/woff2" crossorigin href="../../static.files/FiraSans-Medium-8f9a781e4970d388.woff2"><link rel="preload" as="font" type="font/woff2" crossorigin href="../../static.files/SourceCodePro-Regular-562dcc5011b6de7d.ttf.woff2"><link rel="preload" as="font" type="font/woff2" crossorigin href="../../static.files/SourceSerif4-Bold-a2c9cd1067f8b328.ttf.woff2"><link rel="preload" as="font" type="font/woff2" crossorigin href="../../static.files/SourceCodePro-Semibold-d899c5a5c4aeb14a.ttf.woff2"><link rel="stylesheet" href="../../static.files/normalize-76eba96aa4d2e634.css"><link rel="stylesheet" href="../../static.files/rustdoc-f3501f0f5ae15dfb.css" id="mainThemeStyle"><div id="rustdoc-vars" data-root-path="../../" data-static-root-path="../../static.files/" data-current-crate="ext" data-themes="" data-resource-suffix="" data-rustdoc-version="1.71.1 (eb26296b5 2023-08-03)" data-search-js="search-4926e5fc22a5646a.js" data-settings-js="settings-de11bff964e9d4e5.js" data-settings-css="settings-8c76f75bfb6bd192.css" data-theme-light-css="light-0f8c037637f9eb3e.css" data-theme-dark-css="dark-1097f8e92a01e3cf.css" data-theme-ayu-css="ayu-614652228113ac93.css" ></div><script src="../../static.files/storage-62ce34ea385b278a.js"></script><script defer src="../../static.files/source-script-11255107d0a65077.js"></script><script defer src="../../source-files.js"></script><script defer src="../../static.files/main-f0540c1d82cde29b.js"></script><noscript><link rel="stylesheet" media="(prefers-color-scheme:light)" href="../../static.files/light-0f8c037637f9eb3e.css"><link rel="stylesheet" media="(prefers-color-scheme:dark)" href="../../static.files/dark-1097f8e92a01e3cf.css"><link rel="stylesheet" href="../../static.files/noscript-13285aec31fa243e.css"></noscript><link rel="alternate icon" type="image/png" href="../../static.files/favicon-16x16-8b506e7a72182f1c.png"><link rel="alternate icon" type="image/png" href="../../static.files/favicon-32x32-422f7d1d52889060.png"><link rel="icon" type="image/svg+xml" href="../../static.files/favicon-2c020d218678b618.svg"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.13.3/dist/katex.min.css" integrity="sha384-ThssJ7YtjywV52Gj4JE/1SQEDoMEckXyhkFVwaf4nDSm5OBlXeedVYjuuUd0Yua+" crossorigin="anonymous">
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="Source of the Rust file `src/nassau.rs`."><title>nassau.rs - source</title><link rel="preload" as="font" type="font/woff2" crossorigin href="../../static.files/SourceSerif4-Regular-46f98efaafac5295.ttf.woff2"><link rel="preload" as="font" type="font/woff2" crossorigin href="../../static.files/FiraSans-Regular-018c141bf0843ffd.woff2"><link rel="preload" as="font" type="font/woff2" crossorigin href="../../static.files/FiraSans-Medium-8f9a781e4970d388.woff2"><link rel="preload" as="font" type="font/woff2" crossorigin href="../../static.files/SourceCodePro-Regular-562dcc5011b6de7d.ttf.woff2"><link rel="preload" as="font" type="font/woff2" crossorigin href="../../static.files/SourceSerif4-Bold-a2c9cd1067f8b328.ttf.woff2"><link rel="preload" as="font" type="font/woff2" crossorigin href="../../static.files/SourceCodePro-Semibold-d899c5a5c4aeb14a.ttf.woff2"><link rel="stylesheet" href="../../static.files/normalize-76eba96aa4d2e634.css"><link rel="stylesheet" href="../../static.files/rustdoc-9bb858ba049f1f21.css" id="mainThemeStyle"><meta name="rustdoc-vars" data-root-path="../../" data-static-root-path="../../static.files/" data-current-crate="ext" data-themes="" data-resource-suffix="" data-rustdoc-version="1.72.0 (5680fa18f 2023-08-23)" data-channel="1.72.0" data-search-js="search-f6292fe389d70017.js" data-settings-js="settings-de11bff964e9d4e5.js" data-settings-css="settings-8c76f75bfb6bd192.css" data-theme-light-css="light-0f8c037637f9eb3e.css" data-theme-dark-css="dark-1097f8e92a01e3cf.css" data-theme-ayu-css="ayu-614652228113ac93.css" ><script src="../../static.files/storage-59fd9b8ccb335783.js"></script><script defer src="../../static.files/source-script-106908c7a7964ba4.js"></script><script defer src="../../source-files.js"></script><script defer src="../../static.files/main-0795b7d26be81095.js"></script><noscript><link rel="stylesheet" media="(prefers-color-scheme:light)" href="../../static.files/light-0f8c037637f9eb3e.css"><link rel="stylesheet" media="(prefers-color-scheme:dark)" href="../../static.files/dark-1097f8e92a01e3cf.css"><link rel="stylesheet" href="../../static.files/noscript-13285aec31fa243e.css"></noscript><link rel="alternate icon" type="image/png" href="../../static.files/favicon-16x16-8b506e7a72182f1c.png"><link rel="alternate icon" type="image/png" href="../../static.files/favicon-32x32-422f7d1d52889060.png"><link rel="icon" type="image/svg+xml" href="../../static.files/favicon-2c020d218678b618.svg"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.13.3/dist/katex.min.css" integrity="sha384-ThssJ7YtjywV52Gj4JE/1SQEDoMEckXyhkFVwaf4nDSm5OBlXeedVYjuuUd0Yua+" crossorigin="anonymous">
 <!-- The loading of KaTeX is deferred to speed up page rendering -->
 <script defer src="https://cdn.jsdelivr.net/npm/katex@0.13.3/dist/katex.min.js" integrity="sha384-Bi8OWqMXO1ta+a4EPkZv7bYGIes7C3krGSZoTGNTAnAn5eYQc7IIXrJ/7ck1drAi" crossorigin="anonymous"></script>
 <!-- To automatically render math in text elements, include the auto-render extension: -->
@@ -1310,11 +1310,6 @@
 <a href="#1285" id="1285">1285</a>
 <a href="#1286" id="1286">1286</a>
 <a href="#1287" id="1287">1287</a>
-<a href="#1288" id="1288">1288</a>
-<a href="#1289" id="1289">1289</a>
-<a href="#1290" id="1290">1290</a>
-<a href="#1291" id="1291">1291</a>
-<a href="#1292" id="1292">1292</a>
 </pre></div><pre class="rust"><code><span class="doccomment">//! This module implements [Nassau&#39;s algorithm](https://arxiv.org/abs/1910.04063). The main export
 //! is the [`Resolution`] object, which is a resolution of the sphere at the prime 2 using Nassau&#39;s
 //! algorithm. It aims to provide an API similar to
@@ -1353,6 +1348,7 @@
 <span class="kw">use </span>fp::vector::{FpVector, Slice, SliceMut};
 <span class="kw">use </span>itertools::Itertools;
 <span class="kw">use </span>once::OnceVec;
+<span class="kw">use </span>sseq::coordinates::Bidegree;
 
 <span class="attr">#[cfg(feature = <span class="string">&quot;concurrent&quot;</span>)]
 </span><span class="kw">use </span>std::sync::mpsc;
@@ -1360,18 +1356,16 @@
 <span class="attr">#[cfg(feature = <span class="string">&quot;concurrent&quot;</span>)]
 </span><span class="doccomment">/// See [`resolution::SenderData`](../resolution/struct.SenderData.html). This differs by not having the `new` field.
 </span><span class="kw">struct </span>SenderData {
-    s: u32,
-    t: i32,
+    b: Bidegree,
     sender: mpsc::Sender&lt;SenderData&gt;,
 }
 
 <span class="attr">#[cfg(feature = <span class="string">&quot;concurrent&quot;</span>)]
 </span><span class="kw">impl </span>SenderData {
-    <span class="kw">pub</span>(<span class="kw">crate</span>) <span class="kw">fn </span>send(s: u32, t: i32, sender: mpsc::Sender&lt;<span class="self">Self</span>&gt;) {
+    <span class="kw">pub</span>(<span class="kw">crate</span>) <span class="kw">fn </span>send(b: Bidegree, sender: mpsc::Sender&lt;<span class="self">Self</span>&gt;) {
         sender
             .send(<span class="self">Self </span>{
-                s,
-                t,
+                b,
                 sender: sender.clone(),
             })
             .unwrap()
@@ -1501,11 +1495,11 @@
             .sum()
     }
 
-    <span class="kw">fn </span>optimal_for(s: u32, t: i32) -&gt; MilnorSubalgebra {
+    <span class="kw">fn </span>optimal_for(b: Bidegree) -&gt; MilnorSubalgebra {
         <span class="kw">let </span><span class="kw-2">mut </span>result = MilnorSubalgebra::zero_algebra();
         <span class="kw">for </span>subalgebra <span class="kw">in </span>SubalgebraIterator::new() {
             <span class="kw">let </span>coeff = (<span class="number">1 </span>&lt;&lt; subalgebra.profile.len()) - <span class="number">1</span>;
-            <span class="kw">if </span>t &lt; coeff * (s <span class="kw">as </span>i32 + <span class="number">1</span>) + subalgebra.top_degree() {
+            <span class="kw">if </span>b.t() &lt; coeff * (b.s() <span class="kw">as </span>i32 + <span class="number">1</span>) + subalgebra.top_degree() {
                 <span class="comment">// (s,t) is not in the vanishing region of `subalgebra` or any further subalgebra
                 </span><span class="kw">break</span>;
             }
@@ -1798,8 +1792,7 @@
 
     <span class="kw">fn </span>write_qi(
         f: <span class="kw-2">&amp;mut </span><span class="prelude-ty">Option</span>&lt;<span class="kw">impl </span>Write&gt;,
-        s: u32,
-        t: i32,
+        b: Bidegree,
         subalgebra: <span class="kw-2">&amp;</span>MilnorSubalgebra,
         scratch: <span class="kw-2">&amp;mut </span>FpVector,
         signature: <span class="kw-2">&amp;</span>[PPartEntry],
@@ -1845,28 +1838,26 @@
         }
 
         own_f.finalize(<span class="macro">format_args!</span>(
-            <span class="string">&quot;Written quasi-inverse for bidegree ({n}, {s}) and signature {signature:?}, with {subalgebra}&quot;</span>,
-            n = t - s <span class="kw">as </span>i32,
-        ));
+            <span class="string">&quot;Written quasi-inverse for bidegree {b} and signature {signature:?}, with {subalgebra}&quot;
+        </span>));
         <span class="prelude-val">Ok</span>(())
     }
 
     <span class="kw">fn </span>write_differential(
         <span class="kw-2">&amp;</span><span class="self">self</span>,
-        s: u32,
-        t: i32,
+        b: Bidegree,
         num_new_gens: usize,
         target_dim: usize,
     ) -&gt; anyhow::Result&lt;()&gt; {
         <span class="kw">if let </span><span class="prelude-val">Some</span>(dir) = <span class="kw-2">&amp;</span><span class="self">self</span>.save_dir {
             <span class="kw">let </span><span class="kw-2">mut </span>f = <span class="self">self
-                </span>.save_file(SaveKind::NassauDifferential, s, t)
+                </span>.save_file(SaveKind::NassauDifferential, b)
                 .create_file(dir.clone(), <span class="bool-val">false</span>);
             f.write_u64::&lt;LittleEndian&gt;(num_new_gens <span class="kw">as </span>u64)<span class="question-mark">?</span>;
             f.write_u64::&lt;LittleEndian&gt;(target_dim <span class="kw">as </span>u64)<span class="question-mark">?</span>;
 
             <span class="kw">for </span>n <span class="kw">in </span><span class="number">0</span>..num_new_gens {
-                <span class="self">self</span>.differential(s).output(t, n).to_bytes(<span class="kw-2">&amp;mut </span>f)<span class="question-mark">?</span>;
+                <span class="self">self</span>.differential(b.s()).output(b.t(), n).to_bytes(<span class="kw-2">&amp;mut </span>f)<span class="question-mark">?</span>;
             }
         }
         <span class="prelude-val">Ok</span>(())
@@ -1874,18 +1865,16 @@
 
     <span class="kw">fn </span>step_resolution_with_subalgebra(
         <span class="kw-2">&amp;</span><span class="self">self</span>,
-        s: u32,
-        t: i32,
+        b: Bidegree,
         subalgebra: MilnorSubalgebra,
     ) -&gt; anyhow::Result&lt;()&gt; {
         <span class="kw">let </span>timer = Timer::start();
         <span class="kw">let </span>end = || {
             timer.end(
                 <span class="macro">format_args!</span>(
-                    <span class="string">&quot;Computed bidegree ({n}, {s}) with {subalgebra}, num new gens = {num_new_gens}, density = {density:.2}%&quot;</span>,
-                    n = t - s <span class="kw">as </span>i32,
-                    num_new_gens = <span class="self">self</span>.number_of_gens_in_bidegree(s, t),
-                    density = <span class="self">self</span>.differentials[s].differential_density(t) * <span class="number">100.0</span>,
+                    <span class="string">&quot;Computed bidegree {b} with {subalgebra}, num new gens = {num_new_gens}, density = {density:.2}%&quot;</span>,
+                    num_new_gens = <span class="self">self</span>.number_of_gens_in_bidegree(b),
+                    density = <span class="self">self</span>.differentials[b.s()].differential_density(b.t()) * <span class="number">100.0</span>,
                 ),
             );
         };
@@ -1893,25 +1882,25 @@
         <span class="kw">let </span>p = <span class="self">self</span>.prime();
         <span class="kw">let </span><span class="kw-2">mut </span>scratch = FpVector::new(p, <span class="number">0</span>);
 
-        <span class="kw">let </span>source = <span class="kw-2">&amp;*</span><span class="self">self</span>.modules[s];
-        <span class="kw">let </span>target = <span class="kw-2">&amp;*</span><span class="self">self</span>.modules[s - <span class="number">1</span>];
+        <span class="kw">let </span>source = <span class="kw-2">&amp;*</span><span class="self">self</span>.modules[b.s()];
+        <span class="kw">let </span>target = <span class="kw-2">&amp;*</span><span class="self">self</span>.modules[b.s() - <span class="number">1</span>];
         <span class="kw">let </span>algebra = target.algebra();
 
         <span class="kw">let </span>zero_sig = subalgebra.zero_signature();
-        <span class="kw">let </span>target_dim = target.dimension(t);
+        <span class="kw">let </span>target_dim = target.dimension(b.t());
         <span class="kw">let </span>target_mask: Vec&lt;usize&gt; = subalgebra
-            .signature_mask(<span class="kw-2">&amp;</span>algebra, target, t, <span class="kw-2">&amp;</span>zero_sig)
+            .signature_mask(<span class="kw-2">&amp;</span>algebra, target, b.t(), <span class="kw-2">&amp;</span>zero_sig)
             .collect();
         <span class="kw">let </span>target_masked_dim = target_mask.len();
 
-        <span class="kw">let </span>next = <span class="kw-2">&amp;</span><span class="self">self</span>.modules[s - <span class="number">2</span>];
-        next.compute_basis(t);
+        <span class="kw">let </span>next = <span class="kw-2">&amp;</span><span class="self">self</span>.modules[b.s() - <span class="number">2</span>];
+        next.compute_basis(b.t());
 
         <span class="kw">let </span><span class="kw-2">mut </span>f = <span class="kw">if let </span><span class="prelude-val">Some</span>(dir) = <span class="self">self</span>.save_dir() {
             <span class="kw">let </span><span class="kw-2">mut </span>f = <span class="self">self
-                </span>.save_file(SaveKind::NassauQi, s - <span class="number">1</span>, t)
+                </span>.save_file(SaveKind::NassauQi, b - Bidegree::s_t(<span class="number">1</span>, <span class="number">0</span>))
                 .create_file(dir.to_owned(), <span class="bool-val">true</span>);
-            f.write_u64::&lt;LittleEndian&gt;(next.dimension(t) <span class="kw">as </span>u64)<span class="question-mark">?</span>;
+            f.write_u64::&lt;LittleEndian&gt;(next.dimension(b.t()) <span class="kw">as </span>u64)<span class="question-mark">?</span>;
             f.write_u64::&lt;LittleEndian&gt;(target_masked_dim <span class="kw">as </span>u64)<span class="question-mark">?</span>;
             subalgebra.to_bytes(<span class="kw-2">&amp;mut </span>f)<span class="question-mark">?</span>;
             <span class="prelude-val">Some</span>(f)
@@ -1920,11 +1909,11 @@
         </span>};
 
         <span class="kw">let </span>next_mask: Vec&lt;usize&gt; = subalgebra
-            .signature_mask(<span class="kw-2">&amp;</span>algebra, <span class="kw-2">&amp;</span><span class="self">self</span>.modules[s - <span class="number">2</span>], t, <span class="kw-2">&amp;</span>zero_sig)
+            .signature_mask(<span class="kw-2">&amp;</span>algebra, <span class="kw-2">&amp;</span><span class="self">self</span>.modules[b.s() - <span class="number">2</span>], b.t(), <span class="kw-2">&amp;</span>zero_sig)
             .collect();
         <span class="kw">let </span>next_masked_dim = next_mask.len();
 
-        <span class="kw">let </span>full_matrix = <span class="self">self</span>.differentials[s - <span class="number">1</span>].get_partial_matrix(t, <span class="kw-2">&amp;</span>target_mask);
+        <span class="kw">let </span>full_matrix = <span class="self">self</span>.differentials[b.s() - <span class="number">1</span>].get_partial_matrix(b.t(), <span class="kw-2">&amp;</span>target_mask);
         <span class="kw">let </span><span class="kw-2">mut </span>masked_matrix =
             AugmentedMatrix::new(p, target_masked_dim, [next_masked_dim, target_masked_dim]);
 
@@ -1937,8 +1926,7 @@
 
         <span class="self">Self</span>::write_qi(
             <span class="kw-2">&amp;mut </span>f,
-            s,
-            t,
+            b,
             <span class="kw-2">&amp;</span>subalgebra,
             <span class="kw-2">&amp;mut </span>scratch,
             <span class="kw-2">&amp;</span>zero_sig,
@@ -1948,26 +1936,26 @@
         )<span class="question-mark">?</span>;
 
         <span class="kw">if let </span><span class="prelude-val">Some</span>(f) = <span class="kw-2">&amp;mut </span>f {
-            <span class="kw">if </span>target.max_computed_degree() &lt; t {
+            <span class="kw">if </span>target.max_computed_degree() &lt; b.t() {
                 f.write_u64::&lt;LittleEndian&gt;(Magic::Fix <span class="kw">as </span>u64)<span class="question-mark">?</span>;
             }
         }
 
         <span class="comment">// Compute image
-        </span><span class="kw">let </span><span class="kw-2">mut </span>n = subalgebra.signature_matrix(<span class="kw-2">&amp;</span><span class="self">self</span>.differentials[s], t, <span class="kw-2">&amp;</span>zero_sig);
+        </span><span class="kw">let </span><span class="kw-2">mut </span>n = subalgebra.signature_matrix(<span class="kw-2">&amp;</span><span class="self">self</span>.differentials[b.s()], b.t(), <span class="kw-2">&amp;</span>zero_sig);
         n.row_reduce();
         <span class="kw">let </span>next_row = n.rows();
 
         <span class="kw">let </span>num_new_gens = n.extend_image(<span class="number">0</span>, n.columns(), <span class="kw-2">&amp;</span>kernel, <span class="number">0</span>).len();
 
-        <span class="kw">if </span>t &lt; s <span class="kw">as </span>i32 {
-            <span class="macro">assert_eq!</span>(num_new_gens, <span class="number">0</span>, <span class="string">&quot;Adding generators at t = {t}, s = {s}&quot;</span>);
+        <span class="kw">if </span>b.t() &lt; b.s() <span class="kw">as </span>i32 {
+            <span class="macro">assert_eq!</span>(num_new_gens, <span class="number">0</span>, <span class="string">&quot;Adding generators at {b}&quot;</span>);
         }
 
-        source.add_generators(t, num_new_gens, <span class="prelude-val">None</span>);
+        source.add_generators(b.t(), num_new_gens, <span class="prelude-val">None</span>);
 
         <span class="kw">let </span><span class="kw-2">mut </span>xs = <span class="macro">vec!</span>[FpVector::new(p, target_dim); num_new_gens];
-        <span class="kw">let </span><span class="kw-2">mut </span>dxs = <span class="macro">vec!</span>[FpVector::new(p, next.dimension(t)); num_new_gens];
+        <span class="kw">let </span><span class="kw-2">mut </span>dxs = <span class="macro">vec!</span>[FpVector::new(p, next.dimension(b.t())); num_new_gens];
 
         <span class="kw">for </span>((x, x_masked), dx) <span class="kw">in </span>xs.iter_mut().zip_eq(<span class="kw-2">&amp;</span>n[next_row..]).zip_eq(<span class="kw-2">&amp;mut </span>dxs) {
             x.as_slice_mut()
@@ -1981,13 +1969,15 @@
         </span><span class="kw">let </span><span class="kw-2">mut </span>target_mask: Vec&lt;usize&gt; = Vec::new();
         <span class="kw">let </span><span class="kw-2">mut </span>next_mask: Vec&lt;usize&gt; = Vec::new();
 
-        <span class="kw">for </span>signature <span class="kw">in </span>subalgebra.iter_signatures(t) {
+        <span class="kw">for </span>signature <span class="kw">in </span>subalgebra.iter_signatures(b.t()) {
             target_mask.clear();
             next_mask.clear();
-            target_mask.extend(subalgebra.signature_mask(<span class="kw-2">&amp;</span>algebra, target, t, <span class="kw-2">&amp;</span>signature));
-            next_mask.extend(subalgebra.signature_mask(<span class="kw-2">&amp;</span>algebra, next, t, <span class="kw-2">&amp;</span>signature));
+            target_mask.extend(subalgebra.signature_mask(<span class="kw-2">&amp;</span>algebra, target, b.t(), <span class="kw-2">&amp;</span>signature));
+            next_mask.extend(subalgebra.signature_mask(<span class="kw-2">&amp;</span>algebra, next, b.t(), <span class="kw-2">&amp;</span>signature));
 
-            <span class="kw">let </span>full_matrix = <span class="self">self</span>.differential(s - <span class="number">1</span>).get_partial_matrix(t, <span class="kw-2">&amp;</span>target_mask);
+            <span class="kw">let </span>full_matrix = <span class="self">self
+                </span>.differential(b.s() - <span class="number">1</span>)
+                .get_partial_matrix(b.t(), <span class="kw-2">&amp;</span>target_mask);
 
             <span class="kw">let </span><span class="kw-2">mut </span>masked_matrix =
                 AugmentedMatrix::new(p, target_mask.len(), [next_mask.len(), target_mask.len()]);
@@ -2020,8 +2010,7 @@
             }
             <span class="self">Self</span>::write_qi(
                 <span class="kw-2">&amp;mut </span>f,
-                s,
-                t,
+                b,
                 <span class="kw-2">&amp;</span>subalgebra,
                 <span class="kw-2">&amp;mut </span>scratch,
                 <span class="kw-2">&amp;</span>signature,
@@ -2031,9 +2020,9 @@
             )<span class="question-mark">?</span>;
         }
         <span class="kw">for </span>dx <span class="kw">in </span><span class="kw-2">&amp;</span>dxs {
-            <span class="macro">assert!</span>(dx.is_zero(), <span class="string">&quot;dx non-zero at t = {t}, s = {s}&quot;</span>);
+            <span class="macro">assert!</span>(dx.is_zero(), <span class="string">&quot;dx non-zero at {b}&quot;</span>);
         }
-        <span class="self">self</span>.differential(s).add_generators_from_rows(t, xs);
+        <span class="self">self</span>.differential(b.s()).add_generators_from_rows(b.t(), xs);
 
         end();
 
@@ -2041,7 +2030,7 @@
             f.write_u64::&lt;LittleEndian&gt;(Magic::End <span class="kw">as </span>u64)<span class="question-mark">?</span>;
         }
 
-        <span class="self">self</span>.write_differential(s, t, num_new_gens, target_dim)<span class="question-mark">?</span>;
+        <span class="self">self</span>.write_differential(b, num_new_gens, target_dim)<span class="question-mark">?</span>;
         <span class="prelude-val">Ok</span>(())
     }
 
@@ -2135,37 +2124,37 @@
                 .row_slice(source_dim, source_dim + num_new_gens),
         );
 
-        <span class="self">self</span>.write_differential(<span class="number">1</span>, t, num_new_gens, target_dim)<span class="question-mark">?</span>;
+        <span class="self">self</span>.write_differential(Bidegree::s_t(<span class="number">1</span>, t), num_new_gens, target_dim)<span class="question-mark">?</span>;
         <span class="prelude-val">Ok</span>(())
     }
 
-    <span class="kw">fn </span>step_resolution_with_result(<span class="kw-2">&amp;</span><span class="self">self</span>, s: u32, t: i32) -&gt; anyhow::Result&lt;()&gt; {
+    <span class="kw">fn </span>step_resolution_with_result(<span class="kw-2">&amp;</span><span class="self">self</span>, b: Bidegree) -&gt; anyhow::Result&lt;()&gt; {
         <span class="kw">let </span>p = <span class="self">self</span>.prime();
         <span class="kw">let </span>set_data = || {
-            <span class="kw">let </span>d = <span class="kw-2">&amp;</span><span class="self">self</span>.differentials[s];
-            <span class="kw">let </span>c = <span class="kw-2">&amp;</span><span class="self">self</span>.chain_maps[s];
+            <span class="kw">let </span>d = <span class="kw-2">&amp;</span><span class="self">self</span>.differentials[b.s()];
+            <span class="kw">let </span>c = <span class="kw-2">&amp;</span><span class="self">self</span>.chain_maps[b.s()];
 
-            d.set_kernel(t, <span class="prelude-val">None</span>);
-            d.set_image(t, <span class="prelude-val">None</span>);
-            d.set_quasi_inverse(t, <span class="prelude-val">None</span>);
+            d.set_kernel(b.t(), <span class="prelude-val">None</span>);
+            d.set_image(b.t(), <span class="prelude-val">None</span>);
+            d.set_quasi_inverse(b.t(), <span class="prelude-val">None</span>);
 
-            c.set_kernel(t, <span class="prelude-val">None</span>);
-            c.set_image(t, <span class="prelude-val">None</span>);
-            c.set_quasi_inverse(t, <span class="prelude-val">None</span>);
+            c.set_kernel(b.t(), <span class="prelude-val">None</span>);
+            c.set_image(b.t(), <span class="prelude-val">None</span>);
+            c.set_quasi_inverse(b.t(), <span class="prelude-val">None</span>);
         };
-        <span class="self">self</span>.modules[s].compute_basis(t);
-        <span class="kw">if </span>s &gt; <span class="number">0 </span>{
-            <span class="self">self</span>.modules[s - <span class="number">1</span>].compute_basis(t);
+        <span class="self">self</span>.modules[b.s()].compute_basis(b.t());
+        <span class="kw">if </span>b.s() &gt; <span class="number">0 </span>{
+            <span class="self">self</span>.modules[b.s() - <span class="number">1</span>].compute_basis(b.t());
         }
 
-        <span class="kw">if </span>s == <span class="number">0 </span>{
-            <span class="self">self</span>.step0(t);
+        <span class="kw">if </span>b.s() == <span class="number">0 </span>{
+            <span class="self">self</span>.step0(b.t());
             <span class="kw">return </span><span class="prelude-val">Ok</span>(());
         }
 
         <span class="kw">if let </span><span class="prelude-val">Some</span>(dir) = <span class="kw-2">&amp;</span><span class="self">self</span>.save_dir {
             <span class="kw">if let </span><span class="prelude-val">Some</span>(<span class="kw-2">mut </span>f) = <span class="self">self
-                </span>.save_file(SaveKind::NassauDifferential, s, t)
+                </span>.save_file(SaveKind::NassauDifferential, b)
                 .open_file(dir.clone())
             {
                 <span class="kw">let </span>num_new_gens = f.read_u64::&lt;LittleEndian&gt;()<span class="question-mark">? </span><span class="kw">as </span>usize;
@@ -2175,7 +2164,7 @@
                 // want to resolve further, it will be bigger.
                 </span><span class="kw">let </span>saved_target_res_dimension = f.read_u64::&lt;LittleEndian&gt;()<span class="question-mark">? </span><span class="kw">as </span>usize;
 
-                <span class="self">self</span>.modules[s].add_generators(t, num_new_gens, <span class="prelude-val">None</span>);
+                <span class="self">self</span>.modules[b.s()].add_generators(b.t(), num_new_gens, <span class="prelude-val">None</span>);
 
                 <span class="kw">let </span><span class="kw-2">mut </span>d_targets = Vec::with_capacity(num_new_gens);
 
@@ -2183,7 +2172,7 @@
                     d_targets.push(FpVector::from_bytes(p, saved_target_res_dimension, <span class="kw-2">&amp;mut </span>f)<span class="question-mark">?</span>);
                 }
 
-                <span class="self">self</span>.differentials[s].add_generators_from_rows(t, d_targets);
+                <span class="self">self</span>.differentials[b.s()].add_generators_from_rows(b.t(), d_targets);
 
                 set_data();
 
@@ -2191,45 +2180,43 @@
             }
         }
 
-        <span class="kw">if </span>s == <span class="number">1 </span>{
-            <span class="self">self</span>.step1(t)<span class="question-mark">?</span>;
+        <span class="kw">if </span>b.s() == <span class="number">1 </span>{
+            <span class="self">self</span>.step1(b.t())<span class="question-mark">?</span>;
             set_data();
             <span class="kw">return </span><span class="prelude-val">Ok</span>(());
         }
 
         <span class="self">self</span>.step_resolution_with_subalgebra(
-            s,
-            t,
-            MilnorSubalgebra::optimal_for(s, t - <span class="self">self</span>.max_degree),
+            b,
+            MilnorSubalgebra::optimal_for(b - Bidegree::s_t(<span class="number">0</span>, <span class="self">self</span>.max_degree)),
         )<span class="question-mark">?</span>;
-        <span class="self">self</span>.chain_maps[s].extend_by_zero(t);
+        <span class="self">self</span>.chain_maps[b.s()].extend_by_zero(b.t());
 
         set_data();
         <span class="prelude-val">Ok</span>(())
     }
 
-    <span class="kw">fn </span>step_resolution(<span class="kw-2">&amp;</span><span class="self">self</span>, s: u32, t: i32) {
-        <span class="self">self</span>.step_resolution_with_result(s, t).unwrap_or_else(|e| {
-            <span class="macro">panic!</span>(<span class="string">&quot;Error computing bidegree ({n}, {s}): {e}&quot;</span>, n = t - s <span class="kw">as </span>i32)
-        });
+    <span class="kw">fn </span>step_resolution(<span class="kw-2">&amp;</span><span class="self">self</span>, b: Bidegree) {
+        <span class="self">self</span>.step_resolution_with_result(b)
+            .unwrap_or_else(|e| <span class="macro">panic!</span>(<span class="string">&quot;Error computing bidegree {b}: {e}&quot;</span>));
     }
 
     <span class="doccomment">/// This function resolves up till a fixed stem instead of a fixed t.
-    </span><span class="kw">pub fn </span>compute_through_stem(<span class="kw-2">&amp;</span><span class="self">self</span>, max_s: u32, max_n: i32) {
+    </span><span class="kw">pub fn </span>compute_through_stem(<span class="kw-2">&amp;</span><span class="self">self</span>, max: Bidegree) {
         <span class="kw">let </span>_lock = <span class="self">self</span>.lock.lock();
-        <span class="kw">let </span>max_t = max_s <span class="kw">as </span>i32 + max_n;
 
-        <span class="self">self</span>.extend_through_degree(max_s);
-        <span class="self">self</span>.algebra().compute_basis(max_t);
+        <span class="self">self</span>.extend_through_degree(max.s());
+        <span class="self">self</span>.algebra().compute_basis(max.t());
 
         <span class="attr">#[cfg(not(feature = <span class="string">&quot;concurrent&quot;</span>))]
-        </span><span class="kw">for </span>t <span class="kw">in </span><span class="number">0</span>..=max_t {
-            <span class="kw">let </span>start_s = std::cmp::max(<span class="number">0</span>, t - max_n) <span class="kw">as </span>u32;
-            <span class="kw">for </span>s <span class="kw">in </span>start_s..=max_s {
-                <span class="kw">if </span><span class="self">self</span>.has_computed_bidegree(s, t) {
+        </span><span class="kw">for </span>t <span class="kw">in </span><span class="number">0</span>..=max.t() {
+            <span class="kw">let </span>start_s = std::cmp::max(<span class="number">0</span>, t - max.n()) <span class="kw">as </span>u32;
+            <span class="kw">for </span>s <span class="kw">in </span>start_s..=max.s() {
+                <span class="kw">let </span>b = Bidegree::s_t(s, t);
+                <span class="kw">if </span><span class="self">self</span>.has_computed_bidegree(b) {
                     <span class="kw">continue</span>;
                 }
-                <span class="self">self</span>.step_resolution(s, t);
+                <span class="self">self</span>.step_resolution(b);
             }
         }
 
@@ -2241,41 +2228,41 @@
             // annoying to do correctly. It seems more prudent to improve parallelism elsewhere.
 
             // Things that we have finished computing.
-            </span><span class="kw">let </span><span class="kw-2">mut </span>progress: Vec&lt;i32&gt; = <span class="macro">vec!</span>[-<span class="number">1</span>; max_s <span class="kw">as </span>usize + <span class="number">1</span>];
+            </span><span class="kw">let </span><span class="kw-2">mut </span>progress: Vec&lt;i32&gt; = <span class="macro">vec!</span>[-<span class="number">1</span>; max.s() <span class="kw">as </span>usize + <span class="number">1</span>];
             <span class="comment">// We will kickstart the process by pretending we have computed (0, - 1). So
             // we must pretend we have only computed up to (0, - 2);
             </span>progress[<span class="number">0</span>] = -<span class="number">2</span>;
 
             <span class="kw">let </span>(sender, receiver) = mpsc::channel();
-            SenderData::send(<span class="number">0</span>, -<span class="number">1</span>, sender);
+            SenderData::send(Bidegree::s_t(<span class="number">0</span>, -<span class="number">1</span>), sender);
 
-            <span class="kw">let </span>f = |s, t, sender| {
-                <span class="kw">if </span><span class="self">self</span>.has_computed_bidegree(s, t) {
-                    SenderData::send(s, t, sender);
+            <span class="kw">let </span>f = |b, sender| {
+                <span class="kw">if </span><span class="self">self</span>.has_computed_bidegree(b) {
+                    SenderData::send(b, sender);
                 } <span class="kw">else </span>{
                     scope.spawn(<span class="kw">move </span>|<span class="kw">_</span>| {
-                        <span class="self">self</span>.step_resolution(s, t);
-                        SenderData::send(s, t, sender);
+                        <span class="self">self</span>.step_resolution(b);
+                        SenderData::send(b, sender);
                     });
                 }
             };
 
-            <span class="kw">while let </span><span class="prelude-val">Ok</span>(SenderData { s, t, sender }) = receiver.recv() {
-                <span class="macro">assert!</span>(progress[s <span class="kw">as </span>usize] == t - <span class="number">1</span>);
-                progress[s <span class="kw">as </span>usize] = t;
+            <span class="kw">while let </span><span class="prelude-val">Ok</span>(SenderData { b, sender }) = receiver.recv() {
+                <span class="macro">assert!</span>(progress[b.s() <span class="kw">as </span>usize] == b.t() - <span class="number">1</span>);
+                progress[b.s() <span class="kw">as </span>usize] = b.t();
 
                 <span class="comment">// How far we are from the last one for this s.
-                </span><span class="kw">let </span>distance = max_n + <span class="number">1 </span>- (t - s <span class="kw">as </span>i32);
+                </span><span class="kw">let </span>distance = max.n() - b.n() + <span class="number">1</span>;
 
-                <span class="kw">if </span>s &lt; max_s &amp;&amp; progress[s <span class="kw">as </span>usize + <span class="number">1</span>] == t - <span class="number">1 </span>{
-                    f(s + <span class="number">1</span>, t, sender.clone());
+                <span class="kw">if </span>b.s() &lt; max.s() &amp;&amp; progress[b.s() <span class="kw">as </span>usize + <span class="number">1</span>] == b.t() - <span class="number">1 </span>{
+                    f(b + Bidegree::s_t(<span class="number">1</span>, <span class="number">0</span>), sender.clone());
                 }
 
-                <span class="kw">if </span>distance &gt; <span class="number">1 </span>&amp;&amp; (s == <span class="number">0 </span>|| progress[s <span class="kw">as </span>usize - <span class="number">1</span>] &gt; t) {
+                <span class="kw">if </span>distance &gt; <span class="number">1 </span>&amp;&amp; (b.s() == <span class="number">0 </span>|| progress[b.s() <span class="kw">as </span>usize - <span class="number">1</span>] &gt; b.t()) {
                     <span class="comment">// We are computing a normal step
-                    </span>f(s, t + <span class="number">1</span>, sender);
-                } <span class="kw">else if </span>distance == <span class="number">1 </span>&amp;&amp; s &lt; max_s {
-                    SenderData::send(s, t + <span class="number">1</span>, sender);
+                    </span>f(b + Bidegree::s_t(<span class="number">0</span>, <span class="number">1</span>), sender);
+                } <span class="kw">else if </span>distance == <span class="number">1 </span>&amp;&amp; b.s() &lt; max.s() {
+                    SenderData::send(b + Bidegree::s_t(<span class="number">0</span>, <span class="number">1</span>), sender);
                 }
             }
         });
@@ -2303,26 +2290,27 @@
         <span class="number">0
     </span>}
 
-    <span class="kw">fn </span>has_computed_bidegree(<span class="kw-2">&amp;</span><span class="self">self</span>, s: u32, t: i32) -&gt; bool {
-        <span class="self">self</span>.differentials.len() &gt; s <span class="kw">as </span>usize &amp;&amp; <span class="self">self</span>.differential(s).next_degree() &gt; t
+    <span class="kw">fn </span>has_computed_bidegree(<span class="kw-2">&amp;</span><span class="self">self</span>, b: Bidegree) -&gt; bool {
+        <span class="self">self</span>.differentials.len() &gt; b.s() <span class="kw">as </span>usize &amp;&amp; <span class="self">self</span>.differential(b.s()).next_degree() &gt; b.t()
     }
 
     <span class="kw">fn </span>differential(<span class="kw-2">&amp;</span><span class="self">self</span>, s: u32) -&gt; Arc&lt;<span class="self">Self</span>::Homomorphism&gt; {
         Arc::clone(<span class="kw-2">&amp;</span><span class="self">self</span>.differentials[s <span class="kw">as </span>usize])
     }
 
-    <span class="kw">fn </span>compute_through_bidegree(<span class="kw-2">&amp;</span><span class="self">self</span>, max_s: u32, max_t: i32) {
+    <span class="kw">fn </span>compute_through_bidegree(<span class="kw-2">&amp;</span><span class="self">self</span>, max: Bidegree) {
         <span class="kw">let </span>_lock = <span class="self">self</span>.lock.lock();
 
-        <span class="self">self</span>.extend_through_degree(max_s);
-        <span class="self">self</span>.algebra().compute_basis(max_t);
+        <span class="self">self</span>.extend_through_degree(max.s());
+        <span class="self">self</span>.algebra().compute_basis(max.t());
 
-        <span class="kw">for </span>t <span class="kw">in </span><span class="number">0</span>..=max_t {
-            <span class="kw">for </span>s <span class="kw">in </span><span class="number">0</span>..=max_s {
-                <span class="kw">if </span><span class="self">self</span>.has_computed_bidegree(s, t) {
+        <span class="kw">for </span>t <span class="kw">in </span><span class="number">0</span>..=max.t() {
+            <span class="kw">for </span>s <span class="kw">in </span><span class="number">0</span>..=max.s() {
+                <span class="kw">let </span>b = Bidegree::s_t(s, t);
+                <span class="kw">if </span><span class="self">self</span>.has_computed_bidegree(b) {
                     <span class="kw">continue</span>;
                 }
-                <span class="self">self</span>.step_resolution(s, t);
+                <span class="self">self</span>.step_resolution(b);
             }
         }
     }
@@ -2335,16 +2323,13 @@
         <span class="self">self</span>.save_dir.as_deref()
     }
 
-    <span class="kw">fn </span>apply_quasi_inverse&lt;T, S&gt;(<span class="kw-2">&amp;</span><span class="self">self</span>, results: <span class="kw-2">&amp;mut </span>[T], s: u32, t: i32, inputs: <span class="kw-2">&amp;</span>[S]) -&gt; bool
+    <span class="kw">fn </span>apply_quasi_inverse&lt;T, S&gt;(<span class="kw-2">&amp;</span><span class="self">self</span>, results: <span class="kw-2">&amp;mut </span>[T], b: Bidegree, inputs: <span class="kw-2">&amp;</span>[S]) -&gt; bool
     <span class="kw">where
         for</span>&lt;<span class="lifetime">&#39;a</span>&gt; <span class="kw-2">&amp;</span><span class="lifetime">&#39;a </span><span class="kw-2">mut </span>T: Into&lt;SliceMut&lt;<span class="lifetime">&#39;a</span>&gt;&gt;,
         <span class="kw">for</span>&lt;<span class="lifetime">&#39;a</span>&gt; <span class="kw-2">&amp;</span><span class="lifetime">&#39;a </span>S: Into&lt;Slice&lt;<span class="lifetime">&#39;a</span>&gt;&gt;,
     {
         <span class="kw">let </span><span class="kw-2">mut </span>f = <span class="kw">if let </span><span class="prelude-val">Some</span>(dir) = <span class="kw-2">&amp;</span><span class="self">self</span>.save_dir {
-            <span class="kw">if let </span><span class="prelude-val">Some</span>(f) = <span class="self">self
-                </span>.save_file(SaveKind::NassauQi, s, t)
-                .open_file(dir.clone())
-            {
+            <span class="kw">if let </span><span class="prelude-val">Some</span>(f) = <span class="self">self</span>.save_file(SaveKind::NassauQi, b).open_file(dir.clone()) {
                 f
             } <span class="kw">else </span>{
                 <span class="kw">return </span><span class="bool-val">false</span>;
@@ -2358,13 +2343,18 @@
         <span class="kw">let </span>target_dim = f.read_u64::&lt;LittleEndian&gt;().unwrap() <span class="kw">as </span>usize;
         <span class="kw">let </span>zero_mask_dim = f.read_u64::&lt;LittleEndian&gt;().unwrap() <span class="kw">as </span>usize;
         <span class="kw">let </span>subalgebra = MilnorSubalgebra::from_bytes(<span class="kw-2">&amp;mut </span>f).unwrap();
-        <span class="kw">let </span>source = <span class="kw-2">&amp;</span><span class="self">self</span>.modules[s];
-        <span class="kw">let </span>target = <span class="kw-2">&amp;</span><span class="self">self</span>.modules[s - <span class="number">1</span>];
+        <span class="kw">let </span>source = <span class="kw-2">&amp;</span><span class="self">self</span>.modules[b.s()];
+        <span class="kw">let </span>target = <span class="kw-2">&amp;</span><span class="self">self</span>.modules[b.s() - <span class="number">1</span>];
         <span class="kw">let </span>algebra = target.algebra();
 
         <span class="kw">let </span><span class="kw-2">mut </span>inputs: Vec&lt;FpVector&gt; = inputs.iter().map(|x| x.into().to_owned()).collect();
         <span class="kw">let </span><span class="kw-2">mut </span>mask: Vec&lt;usize&gt; = Vec::with_capacity(zero_mask_dim + <span class="number">8</span>);
-        mask.extend(subalgebra.signature_mask(<span class="kw-2">&amp;</span>algebra, source, t, <span class="kw-2">&amp;</span>subalgebra.zero_signature()));
+        mask.extend(subalgebra.signature_mask(
+            <span class="kw-2">&amp;</span>algebra,
+            source,
+            b.t(),
+            <span class="kw-2">&amp;</span>subalgebra.zero_signature(),
+        ));
 
         <span class="kw">let </span><span class="kw-2">mut </span>scratch0 = FpVector::new(p, zero_mask_dim);
         <span class="kw">let </span><span class="kw-2">mut </span>scratch1 = FpVector::new(p, target_dim);
@@ -2388,20 +2378,20 @@
         // the pivot columns of the quasi-inverse. We can then use (the rref of) this matrix to
         // lift remaining elements with zero signature.
         </span><span class="kw">let </span>(<span class="kw-2">mut </span>target_zero_mask, <span class="kw-2">mut </span>dx_matrix) = <span class="kw">if </span>zero_mask_dim != mask.len() {
-            <span class="kw">let </span>num_new_gens = source.number_of_gens_in_degree(t);
+            <span class="kw">let </span>num_new_gens = source.number_of_gens_in_degree(b.t());
             <span class="macro">assert_eq!</span>(mask.len(), zero_mask_dim + num_new_gens);
 
             <span class="kw">let </span>target_zero_mask: Vec&lt;usize&gt; = subalgebra
-                .signature_mask(<span class="kw-2">&amp;</span>algebra, target, t, <span class="kw-2">&amp;</span>subalgebra.zero_signature())
+                .signature_mask(<span class="kw-2">&amp;</span>algebra, target, b.t(), <span class="kw-2">&amp;</span>subalgebra.zero_signature())
                 .collect();
             <span class="kw">let </span><span class="kw-2">mut </span>matrix = AugmentedMatrix::&lt;<span class="number">3</span>&gt;::new(
                 p,
                 num_new_gens,
-                [target_zero_mask.len(), target.dimension(t), mask.len()],
+                [target_zero_mask.len(), target.dimension(b.t()), mask.len()],
             );
 
             <span class="kw">for </span>i <span class="kw">in </span><span class="number">0</span>..num_new_gens {
-                <span class="kw">let </span>dx = <span class="self">self</span>.differentials[s].output(t, i);
+                <span class="kw">let </span>dx = <span class="self">self</span>.differentials[b.s()].output(b.t(), i);
                 matrix
                     .row_segment_mut(i, <span class="number">1</span>, <span class="number">1</span>)
                     .slice_mut(<span class="number">0</span>, dx.len())
@@ -2424,7 +2414,7 @@
                 <span class="kw">let </span>signature = subalgebra.signature_from_bytes(<span class="kw-2">&amp;mut </span>f).unwrap();
 
                 mask.clear();
-                mask.extend(subalgebra.signature_mask(<span class="kw-2">&amp;</span>algebra, source, t, <span class="kw-2">&amp;</span>signature));
+                mask.extend(subalgebra.signature_mask(<span class="kw-2">&amp;</span>algebra, source, b.t(), <span class="kw-2">&amp;</span>signature));
                 scratch0.set_scratch_vector_size(mask.len());
             } <span class="kw">else if </span>col == Magic::Fix <span class="kw">as </span>usize {
                 <span class="comment">// We need to fix the differential problem
@@ -2497,8 +2487,8 @@
         <span class="kw">for </span>dx <span class="kw">in </span>inputs {
             <span class="macro">assert!</span>(
                 dx.is_zero(),
-                <span class="string">&quot;remainder non-zero at t = {t}, s = {s}\nAlgebra: {subalgebra}\ndx: {}&quot;</span>,
-                target.element_to_string(t, dx.as_slice())
+                <span class="string">&quot;remainder non-zero at {b}\nAlgebra: {subalgebra}\ndx: {}&quot;</span>,
+                target.element_to_string(b.t(), dx.as_slice())
             );
         }
         <span class="bool-val">true
@@ -2527,8 +2517,8 @@
     <span class="attr">#[test]
     </span><span class="kw">fn </span>test_restart_stem() {
         <span class="kw">let </span>res = <span class="kw">crate</span>::utils::construct_nassau(<span class="string">&quot;S_2&quot;</span>, <span class="prelude-val">None</span>).unwrap();
-        res.compute_through_stem(<span class="number">8</span>, <span class="number">14</span>);
-        res.compute_through_bidegree(<span class="number">5</span>, <span class="number">19</span>);
+        res.compute_through_stem(Bidegree::n_s(<span class="number">14</span>, <span class="number">8</span>));
+        res.compute_through_bidegree(Bidegree::s_t(<span class="number">5</span>, <span class="number">19</span>));
 
         <span class="macro">expect!</span>[[<span class="string">r#&quot;
             ·                             

@@ -26,7 +26,7 @@ var sourcesIndex = JSON.parse('{\
 "secondary_massey":["",[],["secondary_massey.rs"]],\
 "secondary_product":["",[],["secondary_product.rs"]],\
 "sq0":["",[],["sq0.rs"]],\
-"sseq":["",[],["bigraded.rs","differential.rs","lib.rs","sseq.rs"]],\
+"sseq":["",[["coordinates",[],["bidegree.rs","element.rs","generator.rs","mod.rs","range.rs"]]],["bigraded.rs","differential.rs","lib.rs","sseq.rs"]],\
 "steenrod":["",[],["steenrod.rs"]],\
 "tensor":["",[],["tensor.rs"]],\
 "unstable_chart":["",[],["unstable_chart.rs"]],\
