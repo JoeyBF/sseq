@@ -17,9 +17,13 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::limb::{entries_per_limb, Limb};
 use crate::prime::ValidPrime;
-use crate::vector::inner::{FpVectorP, SliceMutP, SliceP};
+use crate::vector::inner::FpVectorP;
 
-use super::iter::{FpVectorIterator, FpVectorNonZeroIteratorP};
+use super::{
+    inner::FpVectorBaseP,
+    iter::{FpVectorIterator, FpVectorNonZeroIteratorP},
+    repr::{OwnedRepr, Repr, ReprMut, ViewMutRepr, ViewRepr},
+};
 
 macro_rules! dispatch_vector_inner {
     // other is a type, but marking it as a :ty instead of :tt means we cannot use it to access its
@@ -142,14 +146,28 @@ macro_rules! dispatch_vector_inner {
                 Self::_7(x) => x.$method($($arg),*),
             }
         }
-    }
+    };
+    ($vis:vis fn $method:ident<$gen:ident : $bound:ident>(&mut self, other: $other:ty $(, $arg:ident: $ty:ty )* ) $(-> $ret:ty)?) => {
+        $vis fn $method<$gen: $bound>(&mut self, other: $other, $($arg: $ty),* ) $(-> $ret)* {
+            let other = other.into();
+            match (self, other) {
+                (Self::_2(x), FpVectorBase::<$gen>::_2(y)) => x.$method(y, $($arg),*),
+                (Self::_3(x), FpVectorBase::<$gen>::_3(y)) => x.$method(y, $($arg),*),
+                (Self::_5(x), FpVectorBase::<$gen>::_5(y)) => x.$method(y, $($arg),*),
+                (Self::_7(x), FpVectorBase::<$gen>::_7(y)) => x.$method(y, $($arg),*),
+                (l, r) => {
+                    panic!("Applying {} to vectors over different primes ({} and {})", stringify!($method), l.prime(), r.prime());
+                }
+            }
+        }
+    };
 }
 
 macro_rules! dispatch_vector {
     () => {};
-    ($vis:vis fn $method:ident $tt:tt $(-> $ret:tt)?; $($tail:tt)*) => {
+    ($vis:vis fn $method:ident $(<$gen:ident : $bound:ident>)? ($($tt:tt)*) $(-> $ret:tt)?; $($tail:tt)*) => {
         dispatch_vector_inner! {
-            $vis fn $method $tt $(-> $ret)*
+            $vis fn $method $(<$gen : $bound>)? ($($tt)*) $(-> $ret)*
         }
         dispatch_vector!{$($tail)*}
     }
@@ -167,35 +185,57 @@ macro_rules! match_p {
     }
 }
 
-#[derive(Debug, Hash, Eq, PartialEq, Clone)]
-pub enum FpVector {
-    _2(FpVectorP<2>),
-    _3(FpVectorP<3>),
-    _5(FpVectorP<5>),
-    _7(FpVectorP<7>),
+#[derive(Debug, Hash, Eq, PartialEq, Clone, Copy)]
+pub enum FpVectorBase<R: Repr> {
+    _2(FpVectorBaseP<R, 2>),
+    _3(FpVectorBaseP<R, 3>),
+    _5(FpVectorBaseP<R, 5>),
+    _7(FpVectorBaseP<R, 7>),
 }
 
-#[derive(Debug, Copy, Clone)]
-pub enum Slice<'a> {
-    _2(SliceP<'a, 2>),
-    _3(SliceP<'a, 3>),
-    _5(SliceP<'a, 5>),
-    _7(SliceP<'a, 7>),
-}
-
-#[derive(Debug)]
-pub enum SliceMut<'a> {
-    _2(SliceMutP<'a, 2>),
-    _3(SliceMutP<'a, 3>),
-    _5(SliceMutP<'a, 5>),
-    _7(SliceMutP<'a, 7>),
-}
+pub type FpVector = FpVectorBase<OwnedRepr>;
+pub type Slice<'a> = FpVectorBase<ViewRepr<'a>>;
+pub type SliceMut<'a> = FpVectorBase<ViewMutRepr<'a>>;
 
 pub enum FpVectorNonZeroIterator<'a> {
     _2(FpVectorNonZeroIteratorP<'a, 2>),
     _3(FpVectorNonZeroIteratorP<'a, 3>),
     _5(FpVectorNonZeroIteratorP<'a, 5>),
     _7(FpVectorNonZeroIteratorP<'a, 7>),
+}
+
+impl<R: Repr> FpVectorBase<R> {
+    dispatch_vector! {
+        pub fn prime(&self) -> ValidPrime;
+        pub fn len(&self) -> usize;
+        pub fn is_empty(&self) -> bool;
+        pub fn entry(&self, index: usize) -> u32;
+        pub fn as_slice(&self) -> (dispatch Slice);
+        pub fn is_zero(&self) -> bool;
+        pub fn iter(&self) -> FpVectorIterator;
+        pub fn iter_nonzero(&self) -> (dispatch FpVectorNonZeroIterator);
+        pub fn to_owned(self) -> (dispatch FpVector);
+
+        pub(crate) fn limbs(&self) -> (&[Limb]);
+    }
+}
+
+impl<R: ReprMut> FpVectorBase<R> {
+    dispatch_vector! {
+        pub fn scale(&mut self, c: u32);
+        pub fn set_to_zero(&mut self);
+        pub fn add<R2: Repr>(&mut self, other: impl Into<FpVectorBase<R2>>, c: u32);
+        pub fn add_offset<R2: Repr>(&mut self, other: impl Into<FpVectorBase<R2>>, c: u32, offset: usize);
+        pub fn assign<R2: Repr>(&mut self, other: impl Into<FpVectorBase<R2>>);
+        pub fn set_entry(&mut self, index: usize, value: u32);
+        pub fn slice_mut(&mut self, start: usize, end: usize) -> (dispatch SliceMut);
+        pub fn as_slice_mut(&mut self) -> (dispatch SliceMut);
+        pub fn add_basis_element(&mut self, index: usize, value: u32);
+        pub fn add_masked<R2: Repr>(&mut self, other: impl Into<FpVectorBase<R2>>, c: u32, mask: &[usize]);
+        pub fn add_unmasked<R2: Repr>(&mut self, other: impl Into<FpVectorBase<R2>>, c: u32, mask: &[usize]);
+
+        pub(crate) fn limbs_mut(&mut self) -> (&mut [Limb]);
+    }
 }
 
 impl FpVector {
@@ -267,29 +307,10 @@ impl FpVector {
     }
 
     dispatch_vector! {
-        pub fn prime(&self) -> ValidPrime;
-        pub fn len(&self) -> usize;
-        pub fn is_empty(&self) -> bool;
-        pub fn scale(&mut self, c: u32);
-        pub fn set_to_zero(&mut self);
-        pub fn entry(&self, index: usize) -> u32;
-        pub fn set_entry(&mut self, index: usize, value: u32);
-        pub fn assign(&mut self, other: &Self);
         pub fn assign_partial(&mut self, other: &Self);
-        pub fn add(&mut self, other: &Self, c: u32);
-        pub fn add_nosimd(&mut self, other: &Self, c: u32);
-        pub fn add_offset(&mut self, other: &Self, c: u32, offset: usize);
-        pub fn add_offset_nosimd(&mut self, other: &Self, c: u32, offset: usize);
         pub fn slice(&self, start: usize, end: usize) -> (dispatch Slice);
-        pub fn as_slice(&self) -> (dispatch Slice);
-        pub fn slice_mut(&mut self, start: usize, end: usize) -> (dispatch SliceMut);
-        pub fn as_slice_mut(&mut self) -> (dispatch SliceMut);
-        pub fn is_zero(&self) -> bool;
-        pub fn iter(&self) -> FpVectorIterator;
-        pub fn iter_nonzero(&self) -> (dispatch FpVectorNonZeroIterator);
         pub fn extend_len(&mut self, dim: usize);
         pub fn set_scratch_vector_size(&mut self, dim: usize);
-        pub fn add_basis_element(&mut self, index: usize, value: u32);
         pub fn copy_from_slice(&mut self, slice: &[u32]);
         pub(crate) fn trim_start(&mut self, n: usize);
         pub fn add_truncate(&mut self, other: &Self, c: u32) -> (Option<()>);
@@ -297,40 +318,18 @@ impl FpVector {
         pub fn add_carry(&mut self, other: &Self, c: u32, rest: &mut [FpVector]) -> bool;
         pub fn first_nonzero(&self) -> (Option<(usize, u32)>);
         pub fn density(&self) -> f32;
-
-        pub(crate) fn limbs(&self) -> (&[Limb]);
-        pub(crate) fn limbs_mut(&mut self) -> (&mut [Limb]);
     }
 }
 
 impl<'a> Slice<'a> {
     dispatch_vector! {
-        pub fn prime(&self) -> ValidPrime;
-        pub fn len(&self) -> usize;
-        pub fn is_empty(&self) -> bool;
-        pub fn entry(&self, index: usize) -> u32;
-        pub fn iter(self) -> (FpVectorIterator<'a>);
-        pub fn iter_nonzero(self) -> (dispatch FpVectorNonZeroIterator 'a);
-        pub fn is_zero(&self) -> bool;
         pub fn slice(self, start: usize, end: usize) -> (dispatch Slice 'a);
-        pub fn to_owned(self) -> (dispatch FpVector);
     }
 }
 
 impl<'a> SliceMut<'a> {
     dispatch_vector! {
-        pub fn prime(&self) -> ValidPrime;
-        pub fn scale(&mut self, c: u32);
-        pub fn set_to_zero(&mut self);
-        pub fn add(&mut self, other: Slice, c: u32);
-        pub fn assign(&mut self, other: Slice);
-        pub fn set_entry(&mut self, index: usize, value: u32);
-        pub fn as_slice(&self) -> (dispatch Slice);
-        pub fn slice_mut(&mut self, start: usize, end: usize) -> (dispatch SliceMut);
-        pub fn add_basis_element(&mut self, index: usize, value: u32);
         pub fn copy(&mut self) -> (dispatch SliceMut);
-        pub fn add_masked(&mut self, other: Slice, c: u32, mask: &[usize]);
-        pub fn add_unmasked(&mut self, other: Slice, c: u32, mask: &[usize]);
     }
 
     pub fn add_tensor(&mut self, offset: usize, coeff: u32, left: Slice, right: Slice) {
@@ -352,13 +351,7 @@ impl<'a> FpVectorNonZeroIterator<'a> {
     }
 }
 
-impl std::fmt::Display for FpVector {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        self.as_slice().fmt(f)
-    }
-}
-
-impl<'a> std::fmt::Display for Slice<'a> {
+impl<R: Repr> std::fmt::Display for FpVectorBase<R> {
     /// # Example
     /// ```
     /// # use fp::vector::FpVector;
@@ -379,15 +372,15 @@ impl<'a> std::fmt::Display for Slice<'a> {
     }
 }
 
-impl From<&FpVector> for Vec<u32> {
-    fn from(v: &FpVector) -> Vec<u32> {
-        v.iter().collect()
+impl<R1: Repr, R2: ReprMut> std::ops::AddAssign<&FpVectorBase<R1>> for FpVectorBase<R2> {
+    fn add_assign(&mut self, other: &FpVectorBase<R1>) {
+        self.add(other, 1);
     }
 }
 
-impl std::ops::AddAssign<&FpVector> for FpVector {
-    fn add_assign(&mut self, other: &FpVector) {
-        self.add(other, 1);
+impl<R: Repr> From<&FpVectorBase<R>> for Vec<u32> {
+    fn from(v: &FpVectorBase<R>) -> Vec<u32> {
+        v.iter().collect()
     }
 }
 
@@ -449,32 +442,14 @@ impl<'de> Deserialize<'de> for FpVector {
     }
 }
 
-impl<'a, 'b> From<&'a mut SliceMut<'b>> for SliceMut<'a> {
-    fn from(slice: &'a mut SliceMut<'b>) -> SliceMut<'a> {
-        slice.copy()
+impl<'a, R: Repr> From<&'a FpVectorBase<R>> for Slice<'a> {
+    fn from(value: &'a FpVectorBase<R>) -> Self {
+        value.as_slice()
     }
 }
 
-impl<'a, 'b> From<&'a Slice<'b>> for Slice<'a> {
-    fn from(slice: &'a Slice<'b>) -> Slice<'a> {
-        *slice
-    }
-}
-
-impl<'a, 'b> From<&'a SliceMut<'b>> for Slice<'a> {
-    fn from(slice: &'a SliceMut<'b>) -> Slice<'a> {
-        slice.as_slice()
-    }
-}
-
-impl<'a> From<&'a FpVector> for Slice<'a> {
-    fn from(v: &'a FpVector) -> Slice<'a> {
-        v.as_slice()
-    }
-}
-
-impl<'a> From<&'a mut FpVector> for SliceMut<'a> {
-    fn from(v: &'a mut FpVector) -> SliceMut<'a> {
-        v.as_slice_mut()
+impl<'a, R: ReprMut> From<&'a mut FpVectorBase<R>> for SliceMut<'a> {
+    fn from(value: &'a mut FpVectorBase<R>) -> Self {
+        value.slice_mut(0, value.len())
     }
 }

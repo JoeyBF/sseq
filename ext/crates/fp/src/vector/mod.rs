@@ -15,6 +15,8 @@ mod impl_slicemutp;
 mod impl_slicep;
 mod iter;
 
+mod repr;
+
 #[cfg(test)]
 mod test {
     use itertools::Itertools;

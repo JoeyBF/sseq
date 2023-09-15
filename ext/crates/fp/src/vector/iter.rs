@@ -1,6 +1,9 @@
 use crate::limb::{self, Limb};
 
-use super::inner::SliceP;
+use super::{
+    inner::{FpVectorBaseP, SliceP},
+    repr::Repr,
+};
 
 pub struct FpVectorIterator<'a> {
     limbs: &'a [Limb],
@@ -16,7 +19,7 @@ pub struct FpVectorIterator<'a> {
 impl<'a> FpVectorIterator<'a> {
     pub(super) fn new<const P: u32>(vec: SliceP<'a, P>) -> Self {
         let counter = vec.len();
-        let limbs = &vec.limbs;
+        let limbs = vec.into_limbs();
 
         if counter == 0 {
             return Self {
@@ -30,7 +33,7 @@ impl<'a> FpVectorIterator<'a> {
                 counter,
             };
         }
-        let pair = limb::limb_bit_index_pair::<P>(vec.start);
+        let pair = limb::limb_bit_index_pair::<P>(vec.start());
 
         let bit_length = limb::bit_length_const::<P>();
         let cur_limb = limbs[pair.limb] >> pair.bit_index;
@@ -42,7 +45,7 @@ impl<'a> FpVectorIterator<'a> {
             entries_per_limb_m_1: entries_per_limb - 1,
             bit_mask: limb::bitmask::<P>(),
             limb_index: pair.limb,
-            entries_left: entries_per_limb - (vec.start % entries_per_limb),
+            entries_left: entries_per_limb - (vec.start() % entries_per_limb),
             cur_limb,
             counter,
         }
@@ -118,11 +121,11 @@ pub struct FpVectorNonZeroIteratorP<'a, const P: u32> {
 }
 
 impl<'a, const P: u32> FpVectorNonZeroIteratorP<'a, P> {
-    pub(super) fn new(vec: SliceP<'a, P>) -> Self {
+    pub(super) fn new<R: Repr>(vec: &'a FpVectorBaseP<R, P>) -> Self {
         let entries_per_limb = limb::entries_per_limb_const::<P>();
 
         let dim = vec.len();
-        let limbs = vec.limbs;
+        let limbs = vec.limbs();
 
         if dim == 0 {
             return Self {
@@ -134,7 +137,7 @@ impl<'a, const P: u32> FpVectorNonZeroIteratorP<'a, P> {
                 dim: 0,
             };
         }
-        let min_index = vec.start;
+        let min_index = vec.start();
         let pair = limb::limb_bit_index_pair::<P>(min_index);
         let cur_limb = limbs[pair.limb] >> pair.bit_index;
         let cur_limb_entries_left = entries_per_limb - (min_index % entries_per_limb);
