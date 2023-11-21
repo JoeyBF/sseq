@@ -12,13 +12,13 @@ chart = { path = "../chart/" }
 fp = { path = "../fp/", default-features = false }
 once = { path = "../once/" }
 
-rayon = { version = "1.5", optional = true }
-serde = { version = "1.0.0", optional = true }
-serde_json = { version = "1.0.0", optional = true }
+rayon = { version = "1.8.0", optional = true }
+serde = { version = "1.0.193", optional = true }
+serde_json = { version = "1.0.108", optional = true }
 
 [dev-dependencies]
-expect-test = "1.1.0"
-rand = "0.8"
+expect-test = "1.4.1"
+rand = "0.8.5"
 
 [features]
 default = ["odd-primes"]
