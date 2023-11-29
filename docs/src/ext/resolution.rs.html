@@ -1,4 +1,4 @@
-<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="Source of the Rust file `src/resolution.rs`."><title>resolution.rs - source</title><link rel="preload" as="font" type="font/woff2" crossorigin href="../../static.files/SourceSerif4-Regular-46f98efaafac5295.ttf.woff2"><link rel="preload" as="font" type="font/woff2" crossorigin href="../../static.files/FiraSans-Regular-018c141bf0843ffd.woff2"><link rel="preload" as="font" type="font/woff2" crossorigin href="../../static.files/FiraSans-Medium-8f9a781e4970d388.woff2"><link rel="preload" as="font" type="font/woff2" crossorigin href="../../static.files/SourceCodePro-Regular-562dcc5011b6de7d.ttf.woff2"><link rel="preload" as="font" type="font/woff2" crossorigin href="../../static.files/SourceSerif4-Bold-a2c9cd1067f8b328.ttf.woff2"><link rel="preload" as="font" type="font/woff2" crossorigin href="../../static.files/SourceCodePro-Semibold-d899c5a5c4aeb14a.ttf.woff2"><link rel="stylesheet" href="../../static.files/normalize-76eba96aa4d2e634.css"><link rel="stylesheet" href="../../static.files/rustdoc-cb6f1f67f1bcd037.css" id="mainThemeStyle"><meta name="rustdoc-vars" data-root-path="../../" data-static-root-path="../../static.files/" data-current-crate="ext" data-themes="" data-resource-suffix="" data-rustdoc-version="1.73.0 (cc66ad468 2023-10-03)" data-channel="1.73.0" data-search-js="search-6dfdfced5eff6596.js" data-settings-js="settings-de11bff964e9d4e5.js" data-settings-css="settings-8c76f75bfb6bd192.css" data-theme-light-css="light-1596385f77d47ef2.css" data-theme-dark-css="dark-0a43001d3fc2282c.css" data-theme-ayu-css="ayu-fd19013d6ce078bf.css" ><script src="../../static.files/storage-db41da1a38ea3cb8.js"></script><script defer src="../../static.files/src-script-3280b574d94e47b4.js"></script><script defer src="../../src-files.js"></script><script defer src="../../static.files/main-0795b7d26be81095.js"></script><noscript><link rel="stylesheet" media="(prefers-color-scheme:light)" href="../../static.files/light-1596385f77d47ef2.css"><link rel="stylesheet" media="(prefers-color-scheme:dark)" href="../../static.files/dark-0a43001d3fc2282c.css"><link rel="stylesheet" href="../../static.files/noscript-cffde32267a19fd6.css"></noscript><link rel="alternate icon" type="image/png" href="../../static.files/favicon-16x16-8b506e7a72182f1c.png"><link rel="alternate icon" type="image/png" href="../../static.files/favicon-32x32-422f7d1d52889060.png"><link rel="icon" type="image/svg+xml" href="../../static.files/favicon-2c020d218678b618.svg"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.13.3/dist/katex.min.css" integrity="sha384-ThssJ7YtjywV52Gj4JE/1SQEDoMEckXyhkFVwaf4nDSm5OBlXeedVYjuuUd0Yua+" crossorigin="anonymous">
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="Source of the Rust file `src/resolution.rs`."><title>resolution.rs - source</title><link rel="preload" as="font" type="font/woff2" crossorigin href="../../static.files/SourceSerif4-Regular-46f98efaafac5295.ttf.woff2"><link rel="preload" as="font" type="font/woff2" crossorigin href="../../static.files/FiraSans-Regular-018c141bf0843ffd.woff2"><link rel="preload" as="font" type="font/woff2" crossorigin href="../../static.files/FiraSans-Medium-8f9a781e4970d388.woff2"><link rel="preload" as="font" type="font/woff2" crossorigin href="../../static.files/SourceCodePro-Regular-562dcc5011b6de7d.ttf.woff2"><link rel="preload" as="font" type="font/woff2" crossorigin href="../../static.files/SourceSerif4-Bold-a2c9cd1067f8b328.ttf.woff2"><link rel="preload" as="font" type="font/woff2" crossorigin href="../../static.files/SourceCodePro-Semibold-d899c5a5c4aeb14a.ttf.woff2"><link rel="stylesheet" href="../../static.files/normalize-76eba96aa4d2e634.css"><link rel="stylesheet" href="../../static.files/rustdoc-fa3bb1812debf86c.css"><meta name="rustdoc-vars" data-root-path="../../" data-static-root-path="../../static.files/" data-current-crate="ext" data-themes="" data-resource-suffix="" data-rustdoc-version="1.74.0 (79e9716c9 2023-11-13)" data-channel="1.74.0" data-search-js="search-8be46b629f5f14a8.js" data-settings-js="settings-74424d7eec62a23e.js" ><script src="../../static.files/storage-fec3eaa3851e447d.js"></script><script defer src="../../static.files/src-script-3280b574d94e47b4.js"></script><script defer src="../../src-files.js"></script><script defer src="../../static.files/main-c5bd66d33317d69f.js"></script><noscript><link rel="stylesheet" href="../../static.files/noscript-5d8b3c7633ad77ba.css"></noscript><link rel="alternate icon" type="image/png" href="../../static.files/favicon-16x16-8b506e7a72182f1c.png"><link rel="alternate icon" type="image/png" href="../../static.files/favicon-32x32-422f7d1d52889060.png"><link rel="icon" type="image/svg+xml" href="../../static.files/favicon-2c020d218678b618.svg"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.13.3/dist/katex.min.css" integrity="sha384-ThssJ7YtjywV52Gj4JE/1SQEDoMEckXyhkFVwaf4nDSm5OBlXeedVYjuuUd0Yua+" crossorigin="anonymous">
 <!-- The loading of KaTeX is deferred to speed up page rendering -->
 <script defer src="https://cdn.jsdelivr.net/npm/katex@0.13.3/dist/katex.min.js" integrity="sha384-Bi8OWqMXO1ta+a4EPkZv7bYGIes7C3krGSZoTGNTAnAn5eYQc7IIXrJ/7ck1drAi" crossorigin="anonymous"></script>
 <!-- To automatically render math in text elements, include the auto-render extension: -->
@@ -978,36 +978,6 @@
 <a href="#953" id="953">953</a>
 <a href="#954" id="954">954</a>
 <a href="#955" id="955">955</a>
-<a href="#956" id="956">956</a>
-<a href="#957" id="957">957</a>
-<a href="#958" id="958">958</a>
-<a href="#959" id="959">959</a>
-<a href="#960" id="960">960</a>
-<a href="#961" id="961">961</a>
-<a href="#962" id="962">962</a>
-<a href="#963" id="963">963</a>
-<a href="#964" id="964">964</a>
-<a href="#965" id="965">965</a>
-<a href="#966" id="966">966</a>
-<a href="#967" id="967">967</a>
-<a href="#968" id="968">968</a>
-<a href="#969" id="969">969</a>
-<a href="#970" id="970">970</a>
-<a href="#971" id="971">971</a>
-<a href="#972" id="972">972</a>
-<a href="#973" id="973">973</a>
-<a href="#974" id="974">974</a>
-<a href="#975" id="975">975</a>
-<a href="#976" id="976">976</a>
-<a href="#977" id="977">977</a>
-<a href="#978" id="978">978</a>
-<a href="#979" id="979">979</a>
-<a href="#980" id="980">980</a>
-<a href="#981" id="981">981</a>
-<a href="#982" id="982">982</a>
-<a href="#983" id="983">983</a>
-<a href="#984" id="984">984</a>
-<a href="#985" id="985">985</a>
 </pre></div><pre class="rust"><code><span class="doccomment">//! This module exports the [`Resolution`] object, which is a chain complex resolving a module. In
 //! particular, this contains the core logic that compute minimal resolutions.
 </span><span class="kw">use </span>std::sync::{Arc, Mutex};
@@ -1032,13 +1002,11 @@
 
 <span class="kw">use </span>itertools::Itertools;
 
-<span class="attr">#[cfg(feature = <span class="string">&quot;concurrent&quot;</span>)]
-</span><span class="kw">use </span>std::sync::mpsc;
+<span class="kw">use </span>std::sync::mpsc;
 
 <span class="doccomment">/// In [`MuResolution::compute_through_stem`] and [`MuResolution::compute_through_bidegree`], we pass
 /// this struct around to inform the supervisor what bidegrees have been computed. We use an
 /// explicit struct instead of a tuple to avoid an infinite type problem.
-</span><span class="attr">#[cfg(feature = <span class="string">&quot;concurrent&quot;</span>)]
 </span><span class="kw">struct </span>SenderData {
     b: Bidegree,
     <span class="doccomment">/// Whether this bidegree was newly calculated or have already been calculated.
@@ -1050,8 +1018,7 @@
     </span>sender: mpsc::Sender&lt;SenderData&gt;,
 }
 
-<span class="attr">#[cfg(feature = <span class="string">&quot;concurrent&quot;</span>)]
-</span><span class="kw">impl </span>SenderData {
+<span class="kw">impl </span>SenderData {
     <span class="kw">fn </span>send(b: Bidegree, new: bool, sender: mpsc::Sender&lt;<span class="self">Self</span>&gt;) {
         sender
             .send(<span class="self">Self </span>{
@@ -1723,20 +1690,7 @@
         <span class="self">self</span>.extend_through_degree(max.s());
         <span class="self">self</span>.algebra().compute_basis(max.t() - min_degree);
 
-        <span class="attr">#[cfg(not(feature = <span class="string">&quot;concurrent&quot;</span>))]
-        </span><span class="kw">for </span>t <span class="kw">in </span>min_degree..=max.t() {
-            <span class="kw">for </span>s <span class="kw">in </span><span class="number">0</span>..=max.s() {
-                <span class="kw">let </span>b = Bidegree::s_t(s, t);
-                <span class="kw">if </span><span class="self">self</span>.has_computed_bidegree(b) {
-                    <span class="kw">continue</span>;
-                }
-                <span class="self">self</span>.step_resolution(b);
-                cb(b);
-            }
-        }
-
-        <span class="attr">#[cfg(feature = <span class="string">&quot;concurrent&quot;</span>)]
-        </span>rayon::in_place_scope(|scope| {
+        maybe_rayon::in_place_scope(|scope| {
             <span class="comment">// Things that we have finished computing.
             </span><span class="kw">let </span><span class="kw-2">mut </span>progress: Vec&lt;i32&gt; = <span class="macro">vec!</span>[min_degree - <span class="number">1</span>; max.s() <span class="kw">as </span>usize + <span class="number">1</span>];
             <span class="comment">// We will kickstart the process by pretending we have computed (0, min_degree - 1). So
@@ -1788,21 +1742,7 @@
         <span class="self">self</span>.extend_through_degree(max.s());
         <span class="self">self</span>.algebra().compute_basis(max.t() - min_degree);
 
-        <span class="attr">#[cfg(not(feature = <span class="string">&quot;concurrent&quot;</span>))]
-        </span><span class="kw">for </span>t <span class="kw">in </span>min_degree..=max.t() {
-            <span class="kw">let </span>start_s = std::cmp::max(<span class="number">0</span>, t - max.n()) <span class="kw">as </span>u32;
-            <span class="kw">for </span>s <span class="kw">in </span>start_s..=max.s() {
-                <span class="kw">let </span>b = Bidegree::s_t(s, t);
-                <span class="kw">if </span><span class="self">self</span>.has_computed_bidegree(b) {
-                    <span class="kw">continue</span>;
-                }
-                <span class="self">self</span>.step_resolution(b);
-                cb(b);
-            }
-        }
-
-        <span class="attr">#[cfg(feature = <span class="string">&quot;concurrent&quot;</span>)]
-        </span>rayon::in_place_scope(|scope| {
+        maybe_rayon::in_place_scope(|scope| {
             <span class="comment">// Things that we have finished computing.
             </span><span class="kw">let </span><span class="kw-2">mut </span>progress: Vec&lt;i32&gt; = <span class="macro">vec!</span>[min_degree - <span class="number">1</span>; max.s() <span class="kw">as </span>usize + <span class="number">1</span>];
             <span class="comment">// We will kickstart the process by pretending we have computed (0, min_degree - 1). So
