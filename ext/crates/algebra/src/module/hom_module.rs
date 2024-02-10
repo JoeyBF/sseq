@@ -1,31 +1,43 @@
 use std::sync::Arc;
 
 use bivec::BiVec;
-
-use crate::algebra::Field;
-use crate::module::block_structure::BlockStructure;
-use crate::module::{FreeModule, Module};
 use fp::vector::SliceMut;
 use once::OnceBiVec;
+
+use super::MuFreeModule;
+use crate::{
+    algebra::Field,
+    module::{block_structure::BlockStructure, Module},
+    MuAlgebra,
+};
 
 /// Given a module N and a free module M, this is the module Hom(M, N) as a module over the ground
 /// field. This requires N to be bounded, and is graded *opposite* to the usual grading so that
 /// Hom(M, N) is bounded below.
-pub struct HomModule<M: Module> {
+pub struct HomModule<M: Module, const U: bool = false>
+where
+    M::Algebra: MuAlgebra<U>,
+{
     algebra: Arc<Field>,
-    source: Arc<FreeModule<M::Algebra>>,
+    source: Arc<MuFreeModule<U, M::Algebra>>,
     target: Arc<M>,
     pub block_structures: OnceBiVec<BlockStructure>,
 }
 
-impl<M: Module> std::fmt::Display for HomModule<M> {
+impl<M: Module, const U: bool> std::fmt::Display for HomModule<M, U>
+where
+    M::Algebra: MuAlgebra<U>,
+{
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         write!(f, "Hom({}, {})", self.source, self.target)
     }
 }
 
-impl<M: Module> HomModule<M> {
-    pub fn new(source: Arc<FreeModule<M::Algebra>>, target: Arc<M>) -> Self {
+impl<M: Module, const U: bool> HomModule<M, U>
+where
+    M::Algebra: MuAlgebra<U>,
+{
+    pub fn new(source: Arc<MuFreeModule<U, M::Algebra>>, target: Arc<M>) -> Self {
         let p = source.prime();
         let algebra = Arc::new(Field::new(p));
         let min_degree = source.min_degree()
@@ -40,7 +52,7 @@ impl<M: Module> HomModule<M> {
         }
     }
 
-    pub fn source(&self) -> Arc<FreeModule<M::Algebra>> {
+    pub fn source(&self) -> Arc<MuFreeModule<U, M::Algebra>> {
         Arc::clone(&self.source)
     }
 
@@ -49,7 +61,10 @@ impl<M: Module> HomModule<M> {
     }
 }
 
-impl<M: Module> Module for HomModule<M> {
+impl<const U: bool, M: Module> Module for HomModule<M, U>
+where
+    M::Algebra: MuAlgebra<U>,
+{
     type Algebra = Field;
 
     fn algebra(&self) -> Arc<Self::Algebra> {
@@ -121,8 +136,10 @@ impl<M: Module> Module for HomModule<M> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::module::FDModule;
-    use crate::MilnorAlgebra;
+    use crate::{
+        module::{FDModule, FreeModule},
+        MilnorAlgebra,
+    };
 
     #[test]
     fn test_hom_dim() {

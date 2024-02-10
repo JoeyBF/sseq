@@ -1,20 +1,23 @@
 //! A module containing various utility functions related to user interaction in some way.
-use crate::chain_complex::{
-    AugmentedChainComplex, BoundedChainComplex, ChainComplex, FiniteChainComplex,
+use std::{
+    convert::{TryFrom, TryInto},
+    path::PathBuf,
+    sync::Arc,
 };
 
-use crate::resolution::{Resolution, UnstableResolution};
-use crate::CCC;
-use algebra::module::{steenrod_module, FDModule, Module, SteenrodModule};
-use algebra::{AlgebraType, MilnorAlgebra, SteenrodAlgebra};
-
+use algebra::{
+    module::{steenrod_module, FDModule, Module, SteenrodModule},
+    AlgebraType, MilnorAlgebra, SteenrodAlgebra,
+};
 use anyhow::{anyhow, Context};
 use serde_json::Value;
 use sseq::coordinates::{Bidegree, BidegreeGenerator};
 
-use std::convert::{TryFrom, TryInto};
-use std::path::PathBuf;
-use std::sync::Arc;
+use crate::{
+    chain_complex::{AugmentedChainComplex, BoundedChainComplex, ChainComplex, FiniteChainComplex},
+    resolution::{Resolution, UnstableResolution},
+    CCC,
+};
 
 // We build docs with --all-features so the docs are at the feature = "nassau" version
 #[cfg(not(feature = "nassau"))]
@@ -216,9 +219,9 @@ where
     let cofiber = &json["cofiber"];
     if !cofiber.is_null() {
         assert!(!U, "Cofiber not supported for unstable resolution");
-        use crate::chain_complex::ChainMap;
-        use crate::yoneda::yoneda_representative;
         use algebra::module::homomorphism::FreeModuleHomomorphism;
+
+        use crate::{chain_complex::ChainMap, yoneda::yoneda_representative};
 
         let shift = json["shift"].as_i64().unwrap_or(0) as i32;
 
@@ -396,8 +399,8 @@ pub fn query_module(
     Ok(resolution)
 }
 
-pub fn query_unstable_module_only() -> anyhow::Result<SteenrodModule> {
-    let spec: Config = query::raw("Module", |x| x.try_into());
+pub fn query_unstable_module_only(prompt: &str) -> anyhow::Result<SteenrodModule> {
+    let spec: Config = query::raw(prompt, |x| x.try_into());
     let algebra = Arc::new(SteenrodAlgebra::from_json(
         &spec.module,
         spec.algebra,
@@ -407,7 +410,7 @@ pub fn query_unstable_module_only() -> anyhow::Result<SteenrodModule> {
 }
 
 pub fn query_unstable_module(load_quasi_inverse: bool) -> anyhow::Result<UnstableResolution<CCC>> {
-    let module = Arc::new(query_unstable_module_only()?);
+    let module = Arc::new(query_unstable_module_only("Module")?);
     let cc = Arc::new(FiniteChainComplex::ccdz(module));
 
     let save_dir = query::optional("Module save directory", |x| {
@@ -462,8 +465,7 @@ pub fn get_unit(
 
 #[cfg(feature = "logging")]
 mod logging {
-    use std::io::Write;
-    use std::time::Instant;
+    use std::{io::Write, time::Instant};
 
     /// If the `logging` feature is enabled, this can be used to time how long an operation takes.
     /// If the `logging` features is disabled, this is a no-op.
@@ -567,8 +569,7 @@ mod logging {
     }
 }
 
-pub use logging::LogWriter;
-pub use logging::Timer;
+pub use logging::{LogWriter, Timer};
 
 /// The value of the SECONDARY_JOB environment variable. This is used for distributing the
 /// `secondary`. If set, only data with `s = SECONDARY_JOB` will be computed. The minimum value of

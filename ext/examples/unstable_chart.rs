@@ -18,15 +18,19 @@
 
 use std::{path::PathBuf, sync::Arc};
 
-use algebra::module::{Module, SuspensionModule};
-use algebra::Algebra;
+use algebra::{
+    module::{Module, SuspensionModule},
+    Algebra,
+};
 use chart::{Backend, Orientation, TikzBackend};
-use ext::chain_complex::{FiniteChainComplex, FreeChainComplex};
-use ext::resolution::UnstableResolution;
+use ext::{
+    chain_complex::{FiniteChainComplex, FreeChainComplex},
+    resolution::UnstableResolution,
+};
 use sseq::coordinates::Bidegree;
 
 fn main() -> anyhow::Result<()> {
-    let module = Arc::new(ext::utils::query_unstable_module_only()?);
+    let module = Arc::new(ext::utils::query_unstable_module_only("Module")?);
     let save_dir = {
         let base = query::optional("Module save directory", |x| {
             core::result::Result::<PathBuf, std::convert::Infallible>::Ok(PathBuf::from(x))

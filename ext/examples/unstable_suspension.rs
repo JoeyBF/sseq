@@ -19,15 +19,16 @@
 use std::{path::PathBuf, sync::Arc};
 
 use algebra::module::{Module, SuspensionModule};
-use ext::chain_complex::{FiniteChainComplex, FreeChainComplex};
 use ext::{
-    resolution::UnstableResolution, resolution_homomorphism::UnstableResolutionHomomorphism,
+    chain_complex::{FiniteChainComplex, FreeChainComplex},
+    resolution::UnstableResolution,
+    resolution_homomorphism::UnstableResolutionHomomorphism,
 };
 use fp::vector::FpVector;
 use sseq::coordinates::Bidegree;
 
 fn main() -> anyhow::Result<()> {
-    let module = Arc::new(ext::utils::query_unstable_module_only()?);
+    let module = Arc::new(ext::utils::query_unstable_module_only("Module")?);
     let save_dir = {
         let base = query::optional("Module save directory", |x| {
             core::result::Result::<PathBuf, std::convert::Infallible>::Ok(PathBuf::from(x))

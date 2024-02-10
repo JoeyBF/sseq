@@ -1,28 +1,41 @@
 use std::sync::Arc;
 
-use crate::module::block_structure::GeneratorBasisEltPair;
-use crate::module::homomorphism::{FreeModuleHomomorphism, ModuleHomomorphism};
-use crate::module::HomModule;
-use crate::module::{FreeModule, Module};
-use fp::matrix::{QuasiInverse, Subspace};
-use fp::vector::SliceMut;
+use fp::{
+    matrix::{QuasiInverse, Subspace},
+    vector::SliceMut,
+};
 use once::OnceBiVec;
 
+use crate::{
+    module::{
+        block_structure::GeneratorBasisEltPair,
+        homomorphism::{ModuleHomomorphism, MuFreeModuleHomomorphism},
+        HomModule, Module, MuFreeModule,
+    },
+    MuAlgebra,
+};
+
 /// Given a map $\mathtt{map}: A \to B$ and hom modules $\mathtt{source} = \Hom(B, X)$, $\mathtt{target} = \Hom(A, X)$, produce the induced pullback map $\Hom(B, X) \to \Hom(A, X)$.
-pub struct HomPullback<M: Module> {
-    source: Arc<HomModule<M>>,
-    target: Arc<HomModule<M>>,
-    map: Arc<FreeModuleHomomorphism<FreeModule<M::Algebra>>>,
+pub struct HomPullback<M: Module, const U: bool = false>
+where
+    M::Algebra: MuAlgebra<U>,
+{
+    source: Arc<HomModule<M, U>>,
+    target: Arc<HomModule<M, U>>,
+    map: Arc<MuFreeModuleHomomorphism<U, MuFreeModule<U, M::Algebra>>>,
     images: OnceBiVec<Subspace>,
     kernels: OnceBiVec<Subspace>,
     quasi_inverses: OnceBiVec<QuasiInverse>,
 }
 
-impl<M: Module> HomPullback<M> {
+impl<M: Module, const U: bool> HomPullback<M, U>
+where
+    M::Algebra: MuAlgebra<U>,
+{
     pub fn new(
-        source: Arc<HomModule<M>>,
-        target: Arc<HomModule<M>>,
-        map: Arc<FreeModuleHomomorphism<FreeModule<M::Algebra>>>,
+        source: Arc<HomModule<M, U>>,
+        target: Arc<HomModule<M, U>>,
+        map: Arc<MuFreeModuleHomomorphism<U, MuFreeModule<U, M::Algebra>>>,
     ) -> Self {
         assert!(Arc::ptr_eq(&source.source(), &map.target()));
         assert!(Arc::ptr_eq(&target.source(), &map.source()));
@@ -40,9 +53,12 @@ impl<M: Module> HomPullback<M> {
     }
 }
 
-impl<M: Module> ModuleHomomorphism for HomPullback<M> {
-    type Source = HomModule<M>;
-    type Target = HomModule<M>;
+impl<M: Module, const U: bool> ModuleHomomorphism for HomPullback<M, U>
+where
+    M::Algebra: MuAlgebra<U>,
+{
+    type Source = HomModule<M, U>;
+    type Target = HomModule<M, U>;
 
     fn source(&self) -> Arc<Self::Source> {
         Arc::clone(&self.source)
@@ -137,12 +153,14 @@ impl<M: Module> ModuleHomomorphism for HomPullback<M> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::module::FDModule;
-    use crate::MilnorAlgebra;
     use bivec::BiVec;
-    use fp::matrix::Matrix;
-    use fp::vector::FpVector;
+    use fp::{matrix::Matrix, vector::FpVector};
+
+    use super::*;
+    use crate::{
+        module::{homomorphism::FreeModuleHomomorphism, FDModule, FreeModule},
+        MilnorAlgebra,
+    };
 
     #[test]
     fn test_pullback_id() {
