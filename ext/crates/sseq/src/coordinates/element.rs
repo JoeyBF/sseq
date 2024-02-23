@@ -10,7 +10,7 @@ use crate::coordinates::{Bidegree, BidegreeGenerator};
 
 /// An element of a bigraded vector space. Most commonly used to index elements of spectral
 /// sequences.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct BidegreeElement {
     /// Bidegree of the element
     degree: Bidegree,
@@ -47,14 +47,24 @@ impl BidegreeElement {
         self.vec
     }
 
-    /// Get the string representation of the element as a linear combination of generators. For
-    /// example, an element in bidegree `(n,s)` with vector `[0,2,1]` will be printed as `2 x_(n, s,
-    /// 1) + x_(n, s, 2)`.
-    pub fn to_basis_string(&self) -> String {
+    pub fn decompose(&self) -> impl Iterator<Item = (BidegreeGenerator, u32)> + '_ {
         self.vec
             .iter_nonzero()
-            .map(|(i, v)| {
-                let gen = BidegreeGenerator::new(self.degree(), i);
+            .map(|(i, v)| (BidegreeGenerator::new(self.degree(), i), v))
+    }
+
+    /// Get the string representation of the element as a linear combination of generators.
+    /// ```
+    /// # use fp::{prime::P3, vector::FpVector};
+    /// # use sseq::coordinates::{Bidegree, BidegreeElement};
+    /// let v = FpVector::from_slice(P3, &[0, 2, 1]);
+    /// let element = BidegreeElement::new(Bidegree::n_s(23, 5), v);
+    ///
+    /// assert_eq!(element.to_basis_string(), "2 x_(23, 5, 1) + x_(23, 5, 2)");
+    /// ```
+    pub fn to_basis_string(&self) -> String {
+        self.decompose()
+            .map(|(gen, v)| {
                 let coeff_str = if v != 1 {
                     format!("{v} ")
                 } else {
