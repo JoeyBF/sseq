@@ -168,8 +168,9 @@ impl Matrix {
         &mut self.pivots
     }
 
-    pub fn from_rows(p: ValidPrime, rows: Vec<FpVector>) -> Matrix {
-        let columns = rows.first().map(FpVector::len).unwrap_or(0);
+    /// Produces a Matrix from a vector of FpVectors. We need to know the number of columns if the
+    /// vector is empty.
+    pub fn from_rows(p: ValidPrime, rows: Vec<FpVector>, columns: usize) -> Matrix {
         Matrix {
             p,
             columns,

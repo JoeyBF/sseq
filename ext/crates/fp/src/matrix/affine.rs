@@ -1,5 +1,8 @@
 use super::Subspace;
-use crate::vector::{FpVector, Slice};
+use crate::{
+    matrix::Matrix,
+    vector::{FpVector, Slice},
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AffineSubspace {
@@ -31,6 +34,13 @@ impl AffineSubspace {
         let mut offset = self.offset.clone();
         offset.add(&other.offset, 1);
 
+        Self::new(offset, linear_part)
+    }
+
+    pub fn apply_matrix(&self, matrix: &Matrix) -> Self {
+        let linear_part = self.linear_part.apply_matrix(matrix);
+        let mut offset = FpVector::new(matrix.prime(), matrix.columns());
+        matrix.apply(offset.as_slice_mut(), 1, self.offset.as_slice());
         Self::new(offset, linear_part)
     }
 

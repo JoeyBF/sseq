@@ -220,6 +220,7 @@ impl FpVector {
         pub fn as_slice(&self) -> (dispatch Slice);
         pub fn slice_mut(&mut self, start: usize, end: usize) -> (dispatch SliceMut);
         pub fn as_slice_mut(&mut self) -> (dispatch SliceMut);
+        pub fn truncate(&mut self);
         pub fn is_zero(&self) -> bool;
         pub fn iter(&self) -> FpVectorIterator;
         pub fn iter_nonzero(&self) -> (dispatch FpVectorNonZeroIterator);

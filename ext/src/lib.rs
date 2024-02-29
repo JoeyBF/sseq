@@ -182,6 +182,7 @@ use crate::chain_complex::FiniteChainComplex;
 pub type CCC = FiniteChainComplex<SteenrodModule>;
 
 pub mod nassau;
+pub mod products;
 pub mod secondary;
 pub mod utils;
 

@@ -19,7 +19,7 @@ maybe-rayon = { path = "../maybe-rayon" }
 criterion = { version = "0.3.5", features = ["html_reports"] }
 expect-test = "1.1.0"
 iai = "0.1.1"
-proptest = "1.2"
+proptest = "1.4"
 rand = "0.8.4"
 rstest = "0.17.0"
 

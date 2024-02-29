@@ -189,6 +189,16 @@ impl<P: Prime> FpVectorP<P> {
         }
     }
 
+    pub fn truncate(&mut self) {
+        let min_num_limbs = limb::number(self.p, self.len);
+        self.limbs.truncate(min_num_limbs);
+
+        let max_mask = self.as_slice().max_limb_mask();
+        if let Some(last) = self.limbs.last_mut() {
+            *last &= max_mask;
+        }
+    }
+
     pub fn is_zero(&self) -> bool {
         self.limbs.iter().all(|&x| x == 0)
     }
@@ -351,7 +361,7 @@ impl<T: AsRef<[u32]>, P: Prime> From<(P, &T)> for FpVectorP<P> {
             slice
                 .as_ref()
                 .chunks(limb::entries_per_limb(p))
-                .map(|x| limb::pack(p, x.iter().copied())),
+                .map(|x| limb::pack(p, x.iter().map(|e| *e % p.as_u32()))),
         );
         v
     }

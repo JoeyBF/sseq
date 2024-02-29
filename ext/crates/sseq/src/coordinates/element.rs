@@ -1,4 +1,7 @@
-use std::fmt::{self, Display, Formatter};
+use std::{
+    fmt::{self, Display, Formatter},
+    ops::Add,
+};
 
 use algebra::{
     module::{Module, MuFreeModule},
@@ -120,5 +123,18 @@ impl BidegreeElement {
 impl Display for BidegreeElement {
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
         write!(f, "({}, {}, {})", self.n(), self.s(), self.vec())
+    }
+}
+
+impl Add for BidegreeElement {
+    type Output = BidegreeElement;
+
+    fn add(mut self, other: BidegreeElement) -> BidegreeElement {
+        assert_eq!(self.degree, other.degree);
+        self.vec.add(&other.vec, 1);
+        BidegreeElement {
+            degree: self.degree,
+            vec: self.vec,
+        }
     }
 }

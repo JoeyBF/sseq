@@ -21,7 +21,7 @@ use crate::{
 /// # Fields
 ///  * `matrix` - A matrix in reduced row echelon, whose number of columns is the dimension of the
 ///  ambient space and each row is a basis vector of the subspace.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Eq)]
 #[repr(transparent)]
 pub struct Subspace {
     matrix: Matrix,
@@ -154,6 +154,15 @@ impl Subspace {
         }
     }
 
+    pub fn apply_matrix(&self, matrix: &Matrix) -> Self {
+        let new_ambient_dimension = matrix.columns();
+        let mut new_space = Self::new(self.prime(), new_ambient_dimension);
+        for (basis_vec, new_vec) in self.matrix.iter().zip(new_space.matrix.iter_mut()) {
+            matrix.apply(new_vec.as_slice_mut(), 1, basis_vec.as_slice());
+        }
+        new_space
+    }
+
     pub fn contains(&self, vector: Slice) -> bool {
         let mut vector: FpVector = vector.to_owned();
         self.reduce(vector.as_slice_mut());
@@ -172,7 +181,7 @@ impl Subspace {
             .map_or(0, |&i| i as usize + 1)
     }
 
-    /// Whether the subspace is empty. This assumes the subspace is row reduced.
+    /// Whether the subspace is empty.
     pub fn is_empty(&self) -> bool {
         self.matrix.rows() == 0 || self.matrix[0].is_zero()
     }
@@ -248,13 +257,26 @@ impl Subspace {
     }
 
     pub fn sum(&self, other: &Self) -> Self {
+        assert_eq!(self.prime(), other.prime());
+        assert_eq!(self.ambient_dimension(), other.ambient_dimension());
+
         let self_rows = self.matrix.clone().into_iter();
         let other_rows = other.matrix.clone().into_iter();
         let new_rows = self_rows.chain(other_rows).collect();
 
-        let mut ret = Self::from_matrix(Matrix::from_rows(self.prime(), new_rows));
+        let mut ret = Self::from_matrix(Matrix::from_rows(
+            self.prime(),
+            new_rows,
+            self.ambient_dimension(),
+        ));
         ret.matrix.trim(0, self.matrix.columns() + 1, 0);
         ret
+    }
+}
+
+impl PartialEq for Subspace {
+    fn eq(&self, other: &Self) -> bool {
+        self.basis() == other.basis()
     }
 }
 
