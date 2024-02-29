@@ -48,7 +48,7 @@ impl ProductStructure {
         Arc::clone(&self.resolution)
     }
 
-    fn iterate_all_vectors<F: FnMut(BidegreeElement) + Send>(&self, mut f: F) {
+    fn iterate_all_vectors<F: FnMut(BidegreeElement) + Clone + Sync>(&self, f: F) {
         self.resolution
             .iter_stem()
             .maybe_par_bridge()
@@ -69,7 +69,7 @@ impl ProductStructure {
                         let tracing_span = tracing::info_span!("iterate_all_vectors", deg = %deg);
                         let _tracing_guard = tracing_span.enter();
                         let a = BidegreeElement::new(deg, vec);
-                        f(a);
+                        (f.clone())(a);
                     });
             });
     }
