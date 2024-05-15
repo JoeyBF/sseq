@@ -465,7 +465,7 @@
 <span class="kw">impl </span>BocksteinOrSq {
     <span class="kw">pub</span>(<span class="kw">crate</span>) <span class="kw">fn </span>to_adem_basis_elt(<span class="self">self</span>, q: i32) -&gt; AdemBasisElement {
         <span class="kw">match </span><span class="self">self </span>{
-            BocksteinOrSq::Bockstein =&gt; {
+            <span class="self">Self</span>::Bockstein =&gt; {
                 <span class="kw">if </span>q == <span class="number">1 </span>{
                     AdemBasisElement {
                         degree: <span class="number">1</span>,
@@ -482,7 +482,7 @@
                     }
                 }
             }
-            BocksteinOrSq::Sq(x) =&gt; AdemBasisElement {
+            <span class="self">Self</span>::Sq(x) =&gt; AdemBasisElement {
                 degree: x <span class="kw">as </span>i32 * q,
                 bocksteins: <span class="number">0</span>,
                 ps: <span class="macro">vec!</span>[x],

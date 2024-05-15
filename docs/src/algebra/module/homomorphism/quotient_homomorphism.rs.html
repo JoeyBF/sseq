@@ -145,7 +145,7 @@
         s: Arc&lt;QuotientModule&lt;F::Source&gt;&gt;,
         t: Arc&lt;QuotientModule&lt;F::Target&gt;&gt;,
     ) -&gt; <span class="self">Self </span>{
-        QuotientHomomorphism { f, s, t }
+        <span class="self">Self </span>{ f, s, t }
     }
 }
 
@@ -194,7 +194,7 @@
 
 <span class="kw">impl</span>&lt;F: ModuleHomomorphism&gt; QuotientHomomorphismSource&lt;F&gt; {
     <span class="kw">pub fn </span>new(f: Arc&lt;F&gt;, s: Arc&lt;QuotientModule&lt;F::Source&gt;&gt;) -&gt; <span class="self">Self </span>{
-        QuotientHomomorphismSource { f, s }
+        <span class="self">Self </span>{ f, s }
     }
 }
 

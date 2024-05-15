@@ -557,19 +557,19 @@
         }
     }
 
-    <span class="kw">pub fn </span>resolution_data() -&gt; <span class="kw">impl </span>Iterator&lt;Item = SaveKind&gt; {
+    <span class="kw">pub fn </span>resolution_data() -&gt; <span class="kw">impl </span>Iterator&lt;Item = <span class="self">Self</span>&gt; {
         <span class="kw">use </span>SaveKind::<span class="kw-2">*</span>;
         <span class="kw">static </span>KINDS: [SaveKind; <span class="number">4</span>] = [Kernel, Differential, ResQi, AugmentationQi];
         KINDS.iter().copied()
     }
 
-    <span class="kw">pub fn </span>nassau_data() -&gt; <span class="kw">impl </span>Iterator&lt;Item = SaveKind&gt; {
+    <span class="kw">pub fn </span>nassau_data() -&gt; <span class="kw">impl </span>Iterator&lt;Item = <span class="self">Self</span>&gt; {
         <span class="kw">use </span>SaveKind::<span class="kw-2">*</span>;
         <span class="kw">static </span>KINDS: [SaveKind; <span class="number">2</span>] = [NassauDifferential, NassauQi];
         KINDS.iter().copied()
     }
 
-    <span class="kw">pub fn </span>secondary_data() -&gt; <span class="kw">impl </span>Iterator&lt;Item = SaveKind&gt; {
+    <span class="kw">pub fn </span>secondary_data() -&gt; <span class="kw">impl </span>Iterator&lt;Item = <span class="self">Self</span>&gt; {
         <span class="kw">use </span>SaveKind::<span class="kw-2">*</span>;
         <span class="kw">static </span>KINDS: [SaveKind; <span class="number">3</span>] =
             [SecondaryComposite, SecondaryIntermediate, SecondaryHomotopy];

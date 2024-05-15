@@ -1489,8 +1489,8 @@
             .sum()
     }
 
-    <span class="kw">fn </span>optimal_for(b: Bidegree) -&gt; MilnorSubalgebra {
-        <span class="kw">let </span><span class="kw-2">mut </span>result = MilnorSubalgebra::zero_algebra();
+    <span class="kw">fn </span>optimal_for(b: Bidegree) -&gt; <span class="self">Self </span>{
+        <span class="kw">let </span><span class="kw-2">mut </span>result = <span class="self">Self</span>::zero_algebra();
         <span class="kw">for </span>subalgebra <span class="kw">in </span>SubalgebraIterator::new() {
             <span class="kw">let </span>coeff = (<span class="number">1 </span>&lt;&lt; subalgebra.profile.len()) - <span class="number">1</span>;
             <span class="kw">if </span>b.t() &lt; coeff * (b.s() <span class="kw">as </span>i32 + <span class="number">1</span>) + subalgebra.top_degree() {

@@ -166,7 +166,7 @@
 
     <span class="doccomment">/// Returns difference as a bidegree if the difference in homological degrees is nonnegative,
     /// otherwise returns None.
-    </span><span class="kw">pub fn </span>try_subtract(<span class="kw-2">&amp;</span><span class="self">self</span>, smaller: Bidegree) -&gt; <span class="prelude-ty">Option</span>&lt;Bidegree&gt; {
+    </span><span class="kw">pub fn </span>try_subtract(<span class="kw-2">&amp;</span><span class="self">self</span>, smaller: <span class="self">Self</span>) -&gt; <span class="prelude-ty">Option</span>&lt;<span class="self">Self</span>&gt; {
         <span class="kw">if </span><span class="self">self</span>.s &gt;= smaller.s {
             <span class="prelude-val">Some</span>(<span class="kw-2">*</span><span class="self">self </span>- smaller)
         } <span class="kw">else </span>{
@@ -179,9 +179,9 @@
     /// # Panics
     /// Panics if every element is in homological degree 0. This is the only case that would result
     /// in a bidegree in negative homological degree.
-    </span><span class="kw">pub fn </span>massey_bidegree(a: Bidegree, b: Bidegree, c: Bidegree) -&gt; Bidegree {
+    </span><span class="kw">pub fn </span>massey_bidegree(a: <span class="self">Self</span>, b: <span class="self">Self</span>, c: <span class="self">Self</span>) -&gt; <span class="self">Self </span>{
         (a + b + c)
-            .try_subtract(Bidegree::s_t(<span class="number">1</span>, <span class="number">0</span>))
+            .try_subtract(<span class="self">Self</span>::s_t(<span class="number">1</span>, <span class="number">0</span>))
             .expect(<span class="string">"Trying to compute Massey product of elements in s = 0"</span>)
     }
 }

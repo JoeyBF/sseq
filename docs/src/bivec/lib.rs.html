@@ -325,7 +325,11 @@
 <a href="#298" id="298">298</a>
 <a href="#299" id="299">299</a>
 <a href="#300" id="300">300</a>
-</pre></div><pre class="rust"><code><span class="kw">use </span>core::ops::{Index, IndexMut};
+<a href="#301" id="301">301</a>
+<a href="#302" id="302">302</a>
+</pre></div><pre class="rust"><code><span class="attr">#![deny(clippy::use_self)]
+
+</span><span class="kw">use </span>core::ops::{Index, IndexMut};
 <span class="kw">use </span>std::{
     fmt,
     slice::{Iter, IterMut},
@@ -393,7 +397,7 @@
         <span class="self">Self </span>{ data, min_degree }
     }
 
-    <span class="kw">pub fn </span>into_vec(<span class="self">self</span>: BiVec&lt;T&gt;) -&gt; Vec&lt;T&gt; {
+    <span class="kw">pub fn </span>into_vec(<span class="self">self</span>) -&gt; Vec&lt;T&gt; {
         <span class="self">self</span>.data
     }
 

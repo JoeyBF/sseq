@@ -930,7 +930,11 @@
 <a href="#903" id="903">903</a>
 <a href="#904" id="904">904</a>
 <a href="#905" id="905">905</a>
-</pre></div><pre class="rust"><code><span class="kw">extern crate </span>alloc;
+<a href="#906" id="906">906</a>
+<a href="#907" id="907">907</a>
+</pre></div><pre class="rust"><code><span class="attr">#![deny(clippy::use_self)]
+
+</span><span class="kw">extern crate </span>alloc;
 
 <span class="kw">use </span>alloc::alloc::Layout;
 <span class="kw">use </span>core::ops::{Index, IndexMut};
@@ -1156,7 +1160,7 @@
 <span class="kw">where
     </span>T: PartialEq,
 {
-    <span class="kw">fn </span>eq(<span class="kw-2">&amp;</span><span class="self">self</span>, other: <span class="kw-2">&amp;</span>OnceVec&lt;T&gt;) -&gt; bool {
+    <span class="kw">fn </span>eq(<span class="kw-2">&amp;</span><span class="self">self</span>, other: <span class="kw-2">&amp;</span><span class="self">Self</span>) -&gt; bool {
         <span class="self">self</span>.len() == other.len() &amp;&amp; <span class="self">self</span>.iter().eq(other.iter())
     }
 }

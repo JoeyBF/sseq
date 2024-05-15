@@ -378,7 +378,7 @@
     N: Module&lt;Algebra = A&gt;,
 {
     <span class="kw">pub fn </span>new(left: Arc&lt;M&gt;, right: Arc&lt;N&gt;) -&gt; <span class="self">Self </span>{
-        TensorModule {
+        <span class="self">Self </span>{
             block_structures: OnceBiVec::new(left.min_degree() + right.min_degree()),
             left,
             right,
@@ -653,7 +653,7 @@
     N: Module&lt;Algebra = A&gt; + ZeroModule,
 {
     <span class="kw">fn </span>zero_module(algebra: Arc&lt;A&gt;, min_degree: i32) -&gt; <span class="self">Self </span>{
-        TensorModule::new(
+        <span class="self">Self</span>::new(
             Arc::new(M::zero_module(Arc::clone(<span class="kw-2">&amp;</span>algebra), min_degree)),
             Arc::new(N::zero_module(algebra, min_degree)),
         )

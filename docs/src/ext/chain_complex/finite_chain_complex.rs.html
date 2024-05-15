@@ -658,7 +658,7 @@
     F1: ModuleHomomorphism&lt;Source = M, Target = M&gt;,
     F2: ModuleHomomorphism&lt;Source = M, Target = CC::Module&gt;,
 {
-    <span class="kw">fn </span>from(c: FiniteAugmentedChainComplex&lt;M, F1, F2, CC&gt;) -&gt; FiniteChainComplex&lt;M, F1&gt; {
+    <span class="kw">fn </span>from(c: FiniteAugmentedChainComplex&lt;M, F1, F2, CC&gt;) -&gt; <span class="self">Self </span>{
         c.cc
     }
 }

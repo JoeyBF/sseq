@@ -412,8 +412,8 @@
 <span class="kw">impl </span>std::fmt::Display <span class="kw">for </span>SteenrodAlgebra {
     <span class="kw">fn </span>fmt(<span class="kw-2">&amp;</span><span class="self">self</span>, f: <span class="kw-2">&amp;mut </span>std::fmt::Formatter) -&gt; std::fmt::Result {
         <span class="kw">match </span><span class="self">self </span>{
-            SteenrodAlgebra::AdemAlgebra(a) =&gt; a.fmt(f),
-            SteenrodAlgebra::MilnorAlgebra(a) =&gt; a.fmt(f),
+            <span class="self">Self</span>::AdemAlgebra(a) =&gt; a.fmt(f),
+            <span class="self">Self</span>::MilnorAlgebra(a) =&gt; a.fmt(f),
         }
     }
 }
@@ -421,8 +421,8 @@
 <span class="kw">impl </span>SteenrodAlgebraT <span class="kw">for </span>SteenrodAlgebra {
     <span class="kw">fn </span>steenrod_algebra(<span class="kw-2">&amp;</span><span class="self">self</span>) -&gt; SteenrodAlgebraBorrow {
         <span class="kw">match </span><span class="self">self </span>{
-            SteenrodAlgebra::AdemAlgebra(a) =&gt; SteenrodAlgebraBorrow::BorrowAdem(a),
-            SteenrodAlgebra::MilnorAlgebra(a) =&gt; SteenrodAlgebraBorrow::BorrowMilnor(a),
+            <span class="self">Self</span>::AdemAlgebra(a) =&gt; SteenrodAlgebraBorrow::BorrowAdem(a),
+            <span class="self">Self</span>::MilnorAlgebra(a) =&gt; SteenrodAlgebraBorrow::BorrowMilnor(a),
         }
     }
 }
@@ -474,15 +474,15 @@
 <span class="kw">impl </span>Bialgebra <span class="kw">for </span>SteenrodAlgebra {
     <span class="kw">fn </span>decompose(<span class="kw-2">&amp;</span><span class="self">self</span>, op_deg: i32, op_idx: usize) -&gt; Vec&lt;(i32, usize)&gt; {
         <span class="kw">match </span><span class="self">self </span>{
-            SteenrodAlgebra::AdemAlgebra(a) =&gt; a.decompose(op_deg, op_idx),
-            SteenrodAlgebra::MilnorAlgebra(a) =&gt; a.decompose(op_deg, op_idx),
+            <span class="self">Self</span>::AdemAlgebra(a) =&gt; a.decompose(op_deg, op_idx),
+            <span class="self">Self</span>::MilnorAlgebra(a) =&gt; a.decompose(op_deg, op_idx),
         }
     }
 
     <span class="kw">fn </span>coproduct(<span class="kw-2">&amp;</span><span class="self">self</span>, op_deg: i32, op_idx: usize) -&gt; Vec&lt;(i32, usize, i32, usize)&gt; {
         <span class="kw">match </span><span class="self">self </span>{
-            SteenrodAlgebra::AdemAlgebra(a) =&gt; a.coproduct(op_deg, op_idx),
-            SteenrodAlgebra::MilnorAlgebra(a) =&gt; a.coproduct(op_deg, op_idx),
+            <span class="self">Self</span>::AdemAlgebra(a) =&gt; a.coproduct(op_deg, op_idx),
+            <span class="self">Self</span>::MilnorAlgebra(a) =&gt; a.coproduct(op_deg, op_idx),
         }
     }
 }
@@ -499,7 +499,7 @@
         json: <span class="kw-2">&amp;</span>Value,
         <span class="kw-2">mut </span>algebra_type: AlgebraType,
         unstable: bool,
-    ) -&gt; anyhow::Result&lt;SteenrodAlgebra&gt; {
+    ) -&gt; anyhow::Result&lt;<span class="self">Self</span>&gt; {
         <span class="kw">let </span>spec: AlgebraSpec = AlgebraSpec::deserialize(json)<span class="question-mark">?</span>;
 
         <span class="kw">if let </span><span class="prelude-val">Some</span>(list) = spec.algebra {

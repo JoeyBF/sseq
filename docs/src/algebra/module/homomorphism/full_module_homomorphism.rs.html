@@ -375,7 +375,7 @@
         matrices: BiVec&lt;Matrix&gt;,
     ) -&gt; <span class="self">Self </span>{
         <span class="kw">let </span>min_degree = target.min_degree();
-        FullModuleHomomorphism {
+        <span class="self">Self </span>{
             source,
             target,
             degree_shift,
@@ -417,7 +417,7 @@
             matrices.push_checked(matrix, target_deg);
         }
 
-        FullModuleHomomorphism {
+        <span class="self">Self </span>{
             source,
             target,
             degree_shift,

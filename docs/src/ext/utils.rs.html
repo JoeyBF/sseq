@@ -654,7 +654,7 @@
             <span class="prelude-val">None </span>=&gt; AlgebraType::Milnor,
         };
 
-        <span class="prelude-val">Ok</span>(Config {
+        <span class="prelude-val">Ok</span>(<span class="self">Self </span>{
             module: parse_module_name(module_name)
                 .with_context(|| <span class="macro">format!</span>(<span class="string">"Failed to load module: {module_name}"</span>))<span class="question-mark">?</span>,
             algebra,
@@ -678,7 +678,7 @@
                 <span class="kw">return </span><span class="prelude-val">Err</span>(<span class="macro">anyhow!</span>(<span class="string">"Invalid algebra supplied. Must be {}"</span>, algebra));
             }
         }
-        <span class="prelude-val">Ok</span>(Config {
+        <span class="prelude-val">Ok</span>(<span class="self">Self </span>{
             module: parse_module_name(spec.<span class="number">0</span>)<span class="question-mark">?</span>,
             algebra,
         })
@@ -689,7 +689,7 @@
     <span class="kw">type </span>Error = T::Error;
 
     <span class="kw">fn </span>try_from(spec: (Value, T)) -&gt; <span class="prelude-ty">Result</span>&lt;<span class="self">Self</span>, <span class="self">Self</span>::Error&gt; {
-        <span class="prelude-val">Ok</span>(Config {
+        <span class="prelude-val">Ok</span>(<span class="self">Self </span>{
             module: spec.<span class="number">0</span>,
             algebra: spec.<span class="number">1</span>.try_into()<span class="question-mark">?</span>,
         })
@@ -1063,7 +1063,7 @@
 
     <span class="kw">impl</span>&lt;T&gt; LogWriter&lt;T&gt; {
         <span class="kw">pub fn </span>new(writer: T) -&gt; <span class="self">Self </span>{
-            LogWriter {
+            <span class="self">Self </span>{
                 writer,
                 bytes: <span class="number">0</span>,
                 start: std::time::Instant::now(),

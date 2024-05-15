@@ -933,8 +933,8 @@
             }
             gen_names.push(names);
         }
-        <span class="kw">let </span>actions = FiniteDimensionalModule::allocate_actions(<span class="kw-2">&amp;</span>algebra, <span class="kw-2">&amp;</span>graded_dimension);
-        FiniteDimensionalModule {
+        <span class="kw">let </span>actions = <span class="self">Self</span>::allocate_actions(<span class="kw-2">&amp;</span>algebra, <span class="kw-2">&amp;</span>graded_dimension);
+        <span class="self">Self </span>{
             algebra,
             name,
             graded_dimension,
