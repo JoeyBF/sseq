@@ -1,0 +1,6 @@
+{
+    "p": 2,
+    "type": "finite dimensional module",
+    "gens": { "x0": 0, "x1": 1, "x64": 64 },
+    "actions": ["Sq1 x0 = x1", "Sq64 x0 = x64"]
+}
