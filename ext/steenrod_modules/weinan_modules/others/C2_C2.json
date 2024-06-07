@@ -1,0 +1,11 @@
+{
+    "p": 2,
+    "type": "finite dimensional module",
+    "gens": {
+        "x0": 0,
+        "x1_0": 1,
+        "x1_1": 1,
+        "x2": 2
+    },
+    "actions": ["Sq1 x0 = x1_0", "Sq2 x0 = x2", "Sq1 x1_1 = x2"]
+}
