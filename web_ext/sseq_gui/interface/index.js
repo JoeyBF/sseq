@@ -10,6 +10,10 @@ window.commandQueue = [];
 var modal = document.getElementById('optionsModal');
 
 // Open the modal with the options button
+/**
+ * @description Sets the `display` CSS property of an HTML element with the ID "modal"
+ * to "block".
+ */
 document.getElementById('optionsButton').addEventListener('click', () => {
     modal.style.display = 'block';
 });
@@ -21,6 +25,10 @@ window.onclick = event => {
     }
 };
 
+/**
+ * @description Enables or disables a text input field based on the selected state
+ * of a checkbox.
+ */
 document
     .getElementById('saveDirectoryCheckbox')
     .addEventListener('change', function () {
@@ -33,6 +41,14 @@ document
     });
 
 // Populate the datalist with existing saves
+/**
+ * @description Clears any existing options in a `<datalist>` element with ID
+ * `'saveNames'`, then adds a new option for each `save` parameter provided, with
+ * each option's value set to the corresponding `save`.
+ * 
+ * @param { array } saves - an array of saves for which options will be generated and
+ * added to the `datalist`.
+ */
 function populateSaveNames(saves) {
     const datalist = document.getElementById('saveNames');
     datalist.innerHTML = ''; // Clear existing options
@@ -49,6 +65,22 @@ populateSaveNames([]);
 // Use this function when you need the save name
 console.log(getSaveName());
 
+/**
+ * @description Manages the queue of JSON commands and sends them to the corresponding
+ * sequence servers (main or unit) based on their type and status of resolution.
+ * 
+ * @returns { undefined` value since no return statement has been implemented inside
+ * the function } a series of SSEQ commands sent to the Main and Unit queues based
+ * on the contents of the command queue.
+ * 
+ * 		- `block`: An object with `recipients` and `action`. The `recipients` array
+ * contains the IDs of the sequencing units to which the block should be sent, while
+ * the `action` object contains a single property, `BlockRefresh`, which is an object
+ * with two properties: `block` (a boolean indicating whether the block should be
+ * displayed) and `reason` (a string explaining why the block was refreshed).
+ * 		- `commandText`: A string representing the text of the command that was popped
+ * from the command queue.
+ */
 function processCommandQueue() {
     if (window.commandQueue.length == 0) return;
 
@@ -175,6 +207,13 @@ window.send = msg => {
     window.sendSocket(msg);
 };
 
+/**
+ * @description Parses a JSON message, identifies the command from the message's data
+ * key, and executes the corresponding handler function with the data provided.
+ * 
+ * @param { object } e - message object passed through the event listener and provides
+ * the necessary data for processing.
+ */
 function onMessage(e) {
     const data = JSON.parse(e.data);
     try {
@@ -200,6 +239,13 @@ function onMessage(e) {
     }
 }
 
+/**
+ * @description Populates a list with historical commands and actions, then joins
+ * them into a single string of JSON objects using the `JSON.stringify()` method.
+ * 
+ * @returns { array } a concatenation of JSON-stringified historical data for various
+ * sequences, including `window.mainSseq` and `window.unitSseq`.
+ */
 function generateHistory() {
     const list = [window.constructCommand];
     list.push({
@@ -226,6 +272,10 @@ function generateHistory() {
     return list.concat(window.mainSseq.history).map(JSON.stringify).join('\n');
 }
 
+/**
+ * @description Opens a dialog box displaying a input field for the file name, followed
+ * by an action to download a generated history file as a text plain file.
+ */
 function save() {
     dialog(
         'Save history',
@@ -241,6 +291,13 @@ function save() {
 }
 window.save = save;
 
+/**
+ * @description Loads history data from a string and separates it into commands and
+ * resolve messages. It also sets the `window.constructCommand` and `window.sendSocket`.
+ * 
+ * @param { string } hist - history of commands and their responses, which is split
+ * into an array of strings and then processed in the function.
+ */
 function loadHistory(hist) {
     const lines = hist.split('\n');
     // Do reverse loop because we are removing things from the array.
@@ -262,6 +319,35 @@ function loadHistory(hist) {
 }
 
 const messageHandler = {};
+/**
+ * @description Manages sequence data passed from parent functions, determining if
+ * it belongs to a unit or main sequence based on `msg.sseq`. If a unit sequence, it
+ * initializes a `UnitDisplay` instance, else an `MainDisplay` instance. Processes
+ * resolving and updates display as needed.
+ * 
+ * @param { object } data - resolving event that triggered the function, providing
+ * information such as the sequence number and minimum degree of the event.
+ * 
+ * @param { object } msg - message passed from the event listener, which determines
+ * the branch of code executed based on its `sseq` property value.
+ * 
+ * @returns { undefined` value } a process of resolving sequences based on the input
+ * data.
+ * 
+ * 		- `window.unitSseq`: This is an instance of `ExtSseq` with a `name` of `'Unit'`
+ * and an `id` of `'Unitsseq-body'`. It represents a sequence of units for the current
+ * degree.
+ * 		- `window.mainSseq`: This is an instance of `ExtSseq` with a `name` of `'Main'`
+ * and an `id` of `'Main-body'`. It represents the main sequence of symbols for the
+ * current degree.
+ * 		- `window.unitDisplay`: This is an instance of `UnitDisplay` with an `id` of
+ * `'Unitsseq-body'`. It is responsible for rendering the units sequence.
+ * 		- `window.mainDisplay`: This is an instance of `MainDisplay` with an `id` of
+ * `'Main'`. It is responsible for rendering the main sequence of symbols.
+ * 		- `data.min_degree`: This is the minimum degree of the symbol being processed.
+ * 		- `data.is_unit`: This is a boolean indicating whether the symbol is a unit. If
+ * it is, then `window.unitSseq` will be set to `window.mainSseq`.
+ */
 messageHandler.Resolving = (data, msg) => {
     if (msg.sseq == 'Unit') {
         if (!window.unitSseq) {
@@ -296,6 +382,11 @@ messageHandler.Resolving = (data, msg) => {
     }
 };
 
+/**
+ * @description Decrements `window.commandCounter` and checks if it is equal to 0.
+ * If it is, it hides the `window.display.runningSign` element and executes the
+ * `processCommandQueue()` function.
+ */
 messageHandler.Complete = () => {
     window.commandCounter--;
     if (window.commandCounter == 0) {
@@ -327,6 +418,10 @@ messageHandler.Error = m => {
 };
 
 // Set up upload button
+/**
+ * @description Reads the contents of a selected JSON file using `FileReader` and
+ * replaces them with a URL parameter for further processing.
+ */
 document.getElementById('json-upload').addEventListener('change', () => {
     const file = document.getElementById('json-upload').files[0];
     const fileReader = new FileReader();
@@ -345,6 +440,10 @@ document.getElementById('json-upload').addEventListener('change', () => {
     fileReader.readAsText(file, 'UTF-8');
 });
 
+/**
+ * @description Loads a file selected by a user from an HTML input element with ID
+ * "history-upload" into the history of a web application using `FileReader`.
+ */
 document.getElementById('history-upload').addEventListener('change', () => {
     const file = document.getElementById('history-upload').files[0];
 
