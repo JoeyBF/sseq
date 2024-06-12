@@ -14,6 +14,34 @@
     <body>
         <div id="home" style="display: none">
             <h1>Adams spectral sequence calculator</h1>
+            <!-- Options button -->
+            <span class="flex-grid" id="optionsButton" style="margin: 0 auto">
+                <label class="button">Options</label>
+            </span>
+            <!-- Options Modal -->
+            <div id="optionsModal" class="modal">
+                <!-- Modal content -->
+                <div class="modal-content">
+                    <label for="saveDirectoryCheckbox">Specify save:</label>
+                    <input
+                        type="checkbox"
+                        id="saveDirectoryCheckbox"
+                        name="saveDirectoryCheckbox"
+                        value="SaveDirectory"
+                    />
+
+                    <label for="saveName">Save Name:</label>
+                    <input
+                        list="saveNames"
+                        id="saveName"
+                        name="saveName"
+                        disabled
+                    />
+                    <datalist id="saveNames">
+                        <!-- Options will be populated dynamically -->
+                    </datalist>
+                </div>
+            </div>
             <section>
                 <h2>p = 2</h2>
                 <div>

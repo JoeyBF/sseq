@@ -6,6 +6,49 @@ import { openSocket } from './socket.js';
 window.commandCounter = 0;
 window.commandQueue = [];
 
+// Options modal
+var modal = document.getElementById('optionsModal');
+
+// Open the modal with the options button
+document.getElementById('optionsButton').addEventListener('click', () => {
+    modal.style.display = 'block';
+});
+
+// When the user clicks anywhere outside of the modal, close it
+window.onclick = event => {
+    if (event.target == modal) {
+        modal.style.display = 'none';
+    }
+};
+
+document
+    .getElementById('saveDirectoryCheckbox')
+    .addEventListener('change', function () {
+        var directoryInput = document.getElementById('saveName');
+        if (this.checked) {
+            directoryInput.disabled = false;
+        } else {
+            directoryInput.disabled = true;
+        }
+    });
+
+// Populate the datalist with existing saves
+function populateSaveNames(saves) {
+    const datalist = document.getElementById('saveNames');
+    datalist.innerHTML = ''; // Clear existing options
+    saves.forEach(save => {
+        const option = document.createElement('option');
+        option.value = save;
+        datalist.appendChild(option);
+    });
+}
+
+// Call this function with the list of saves when the page loads or the saves are updated
+populateSaveNames([]);
+
+// Use this function when you need the save name
+console.log(getSaveName());
+
 function processCommandQueue() {
     if (window.commandQueue.length == 0) return;
 
@@ -58,21 +101,24 @@ for (const [k, v] of url.searchParams.entries()) {
 
 if (params.module || params.module_json) {
     const maxDegree = parseInt(params.degree ? params.degree : 40);
+    const saveName = params.save ? params.save : null;
     const algebra = params.algebra ? params.algebra : 'milnor';
 
     const action = params.module
         ? {
-              Construct: {
-                  algebra_name: algebra,
-                  module_name: params.module,
-              },
-          }
+            Construct: {
+                algebra_name: algebra,
+                module_name: params.module,
+                save_name: saveName,
+            },
+        }
         : {
-              ConstructJson: {
-                  algebra_name: 'milnor',
-                  data: params.module_json,
-              },
-          };
+            ConstructJson: {
+                algebra_name: 'milnor',
+                data: params.module_json,
+                save_name: saveName,
+            },
+        };
 
     // Record this for the save functionality, since the wasm version modifies it
     window.constructCommand = {
@@ -109,7 +155,13 @@ if (params.module || params.module_json) {
         n.children[1].children.forEach(a => {
             if (a.tagName == 'A') {
                 a.innerHTML = renderLaTeX(a.innerHTML);
-                a.href = `?module=${a.getAttribute('data')}&degree=40`;
+                a.addEventListener('click', function (event) {
+                    event.preventDefault();
+                    window.location.href = `?module=${a.getAttribute(
+                        'data',
+                    )}&degree=40&save=${document.getElementById('saveName').value
+                        }`;
+                });
             }
         });
     });
@@ -269,7 +321,7 @@ messageHandler.Error = m => {
     dialog(
         'Fatal error encountered',
         `<section><pre>${m.message}</pre></section>`,
-        () => {},
+        () => { },
         'OK',
     );
 };
