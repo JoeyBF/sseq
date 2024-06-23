@@ -71,6 +71,38 @@ impl<'scope> Scope<'scope> {
     }
 }
 
+pub struct MaybeThreadPool;
+
+#[derive(Debug, Default)]
+pub struct MaybeThreadPoolBuilder;
+
+#[derive(Debug)]
+pub struct MaybeThreadPoolBuildError;
+
+impl MaybeThreadPool {
+    pub fn install<OP, R>(&self, op: OP) -> R
+    where
+        OP: FnOnce() -> R + Send,
+        R: Send,
+    {
+        op()
+    }
+}
+
+impl MaybeThreadPoolBuilder {
+    pub fn new() -> Self {
+        Self
+    }
+
+    pub fn full_blocking(self) -> Self {
+        self
+    }
+
+    pub fn build(self) -> Result<MaybeThreadPool, MaybeThreadPoolBuildError> {
+        Ok(MaybeThreadPool)
+    }
+}
+
 pub fn join<A, B, RA, RB>(oper_a: A, oper_b: B) -> (RA, RB)
 where
     A: FnOnce() -> RA + Send,

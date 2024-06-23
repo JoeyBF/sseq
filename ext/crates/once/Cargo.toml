@@ -13,12 +13,12 @@ bivec = { path = "../bivec" }
 maybe-rayon = { path = "../maybe-rayon" }
 
 [dev-dependencies]
-criterion = "0.3"
+# criterion = "0.3"
 
 [features]
 default = []
 concurrent = ["maybe-rayon/concurrent"]
 
-[[bench]]
-name = "criterion"
-harness = false
+# [[bench]]
+# name = "criterion"
+# harness = false
