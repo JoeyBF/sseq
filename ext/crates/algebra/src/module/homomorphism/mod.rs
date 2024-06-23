@@ -124,10 +124,12 @@ pub trait ModuleHomomorphism: Send + Sync {
             return;
         }
 
-        matrix
-            .maybe_par_iter_mut()
-            .enumerate()
-            .for_each(|(i, row)| self.apply_to_basis_element(row, 1, degree, i));
+        crate::MAYBE_THREADPOOL.install(|| {
+            matrix
+                .maybe_par_iter_mut()
+                .enumerate()
+                .for_each(|(i, row)| self.apply_to_basis_element(row, 1, degree, i));
+        })
     }
 
     /// Get the values of the homomorphism on the specified inputs to `matrix`.
@@ -138,12 +140,14 @@ pub trait ModuleHomomorphism: Send + Sync {
             return matrix;
         }
 
-        matrix
-            .maybe_par_iter_mut()
-            .enumerate()
-            .for_each(|(i, row)| {
-                self.apply_to_basis_element(row.as_slice_mut(), 1, degree, inputs[i])
-            });
+        crate::MAYBE_THREADPOOL.install(|| {
+            matrix
+                .maybe_par_iter_mut()
+                .enumerate()
+                .for_each(|(i, row)| {
+                    self.apply_to_basis_element(row.as_slice_mut(), 1, degree, inputs[i])
+                });
+        });
 
         matrix
     }

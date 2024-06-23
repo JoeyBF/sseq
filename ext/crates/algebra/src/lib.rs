@@ -13,7 +13,20 @@ pub(crate) mod steenrod_parser;
 
 mod algebra;
 
+use maybe_rayon::MaybeThreadPool;
+use once_cell::sync::Lazy;
+
 pub use crate::algebra::*;
+
+/// This is a custom `MaybeThreadPool` that we use to execute operations within this crate that may
+/// be concurrent. Using this pool ensures that threads only steal work from each other and not from
+/// the global pool. Not enforcing this could lead to priority inversions, causing deadlocks.
+static MAYBE_THREADPOOL: Lazy<MaybeThreadPool> = Lazy::new(|| {
+    maybe_rayon::MaybeThreadPoolBuilder::new()
+        .full_blocking()
+        .build()
+        .unwrap()
+});
 
 pub(crate) fn module_gens_from_json(
     gens: &serde_json::Value,

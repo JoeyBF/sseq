@@ -16,7 +16,7 @@ serde_json = "1.0.0"
 maybe-rayon = { path = "../maybe-rayon" }
 
 [dev-dependencies]
-criterion = { version = "0.3.5", features = ["html_reports"] }
+# criterion = { version = "0.3.5", features = ["html_reports"] }
 expect-test = "1.1.0"
 iai = "0.1.1"
 proptest = "1.2"
@@ -31,9 +31,9 @@ default = ["odd-primes"]
 concurrent = ["maybe-rayon/concurrent"]
 odd-primes = []
 
-[[bench]]
-name = "criterion"
-harness = false
+# [[bench]]
+# name = "criterion"
+# harness = false
 
 [[bench]]
 name = "iai"

@@ -45,6 +45,8 @@ pub mod prelude {
     impl<I: ParallelBridge> MaybeParallelBridge for I {}
 }
 
+pub use rayon::{ThreadPool as MaybeThreadPool, ThreadPoolBuilder as MaybeThreadPoolBuilder};
+
 pub fn join<A, B, RA, RB>(oper_a: A, oper_b: B) -> (RA, RB)
 where
     A: FnOnce() -> RA + Send,
