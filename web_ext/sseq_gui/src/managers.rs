@@ -1,12 +1,16 @@
+use std::{sync::Arc, vec};
+
 use algebra::{module::Module, Algebra};
 use anyhow::{anyhow, Context};
 use ext::{
-    chain_complex::{BoundedChainComplex, ChainComplex},
+    chain_complex::{BoundedChainComplex, ChainComplex, FreeChainComplex},
+    resolution::Resolution as ResolutionInner,
+    secondary::{SecondaryLift, SecondaryResolution},
     utils::load_module_json,
     CCC,
 };
 use serde_json::json;
-use sseq::coordinates::Bidegree;
+use sseq::coordinates::{Bidegree, BidegreeGenerator};
 
 use crate::{actions::*, resolution_wrapper::Resolution, sseq::SseqWrapper, Sender};
 
@@ -23,6 +27,7 @@ pub struct ResolutionManager {
     sender: Sender,
     is_unit: bool,
     resolution: Option<Resolution<CCC>>,
+    secondary: Option<SecondaryResolution<ResolutionInner<CCC>>>,
 }
 
 impl ResolutionManager {
@@ -33,8 +38,9 @@ impl ResolutionManager {
     pub fn new(sender: Sender) -> Self {
         Self {
             sender,
-            resolution: None,
             is_unit: false,
+            resolution: None,
+            secondary: None,
         }
     }
 
@@ -56,6 +62,7 @@ impl ResolutionManager {
             Action::Construct(a) => self.construct(a)?,
             Action::ConstructJson(a) => self.construct_json(a)?,
             Action::Resolve(a) => self.resolve(a, msg.sseq)?,
+            Action::ResolveSecondary(a) => self.resolve_secondary(a)?,
             Action::BlockRefresh(_) => self.sender.send(msg)?,
             _ => {
                 let resolution = self
@@ -183,6 +190,68 @@ impl ResolutionManager {
             action.max_degree,
             action.max_degree as u32 / 2 + 5,
         ));
+
+        Ok(())
+    }
+
+    fn resolve_secondary(&mut self, _action: ResolveSecondary) -> anyhow::Result<()> {
+        let resolution = self
+            .resolution
+            .as_ref()
+            .ok_or_else(|| anyhow!("Calling ResolveSecondary before Construct"))?;
+
+        let secondary = if let Some(lift) = self.secondary.as_ref() {
+            lift
+        } else {
+            self.secondary = Some(SecondaryResolution::new(Arc::clone(&resolution.inner)));
+            self.secondary.as_ref().unwrap()
+        };
+
+        let d2_shift = Bidegree::n_s(-1, 2);
+
+        secondary.extend_all_with_callback(|b| {
+            if b.s() < 3 {
+                return;
+            }
+
+            if b.t() - 1 > resolution.module(b.s() - 2).max_computed_degree() {
+                return;
+            }
+            if resolution.inner.number_of_gens_in_bidegree(b) == 0 {
+                return;
+            }
+            let homotopy = secondary.homotopy(b.s());
+            let m = homotopy.homotopies.hom_k(b.t() - 1);
+
+            for (i, entry) in m.into_iter().enumerate() {
+                if entry.iter().all(|x| *x == 0) {
+                    // Differential is zero, skip
+                    continue;
+                }
+                let source_gen = BidegreeGenerator::new(b - d2_shift, i);
+                let source_vec = {
+                    let num = resolution
+                        .inner
+                        .number_of_gens_in_bidegree(source_gen.degree());
+                    let mut vec = vec![0; num];
+                    vec[source_gen.idx()] = 1;
+                    vec
+                };
+                self.sender
+                    .send(Message {
+                        recipients: vec![],
+                        sseq: SseqChoice::Main,
+                        action: Action::from(AddDifferential {
+                            x: source_gen.n(),
+                            y: source_gen.s() as i32,
+                            r: 2,
+                            source: source_vec,
+                            target: entry,
+                        }),
+                    })
+                    .unwrap();
+            }
+        });
 
         Ok(())
     }

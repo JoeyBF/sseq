@@ -466,6 +466,16 @@ export class ExtSseq {
         );
     }
 
+    resolveSecondary() {
+        this.send({
+            recipients: ['Resolver'],
+            action: {
+                ResolveSecondary: {},
+            },
+        })
+        console.log('Resolving secondary');
+    }
+
     queryCocycleString(x, y) {
         const classes = this.classes.get(x, y);
         if (!classes) return;

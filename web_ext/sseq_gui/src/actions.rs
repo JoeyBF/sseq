@@ -63,6 +63,7 @@ pub enum Action {
     Construct,
     ConstructJson,
     Resolve,
+    ResolveSecondary,
 
     // Sseq -> JS
     SetStructline,
@@ -316,6 +317,10 @@ pub struct Resolve {
     pub max_degree: i32,
 }
 impl ActionT for Resolve {}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResolveSecondary {}
+impl ActionT for ResolveSecondary {}
 
 // Now actions for sseq -> js
 #[derive(Debug, Clone, Serialize, Deserialize)]

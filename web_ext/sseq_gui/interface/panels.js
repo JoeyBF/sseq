@@ -416,6 +416,7 @@ function* overviewPanel(sseq) {
     yield intercept;
 
     yield createButton('Resolve further', () => sseq.resolveFurther());
+    yield createButton('Resolve secondary', () => sseq.resolveSecondary());
 }
 
 function* structlinePanel(sseq) {

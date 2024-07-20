@@ -304,7 +304,16 @@ impl<T> OnceVec<T> {
     pub fn get(&self, index: usize) -> Option<&T> {
         if index < self.len() {
             // This is safe because the original index is < len.
-            unsafe { Some(&*self.entry_ptr(index)) }
+            Some(unsafe { &*self.entry_ptr(index) })
+        } else if let Ok(x) = self.ooo.lock() {
+            if x.0.contains(&index) {
+                // This is safe because we were able to aquire the lock on the tracker and saw that
+                // it contained the index. This can only happen after `push_ooo` has been called and
+                // fully wrote a value at the index in question.
+                Some(unsafe { &*self.entry_ptr(index) })
+            } else {
+                None
+            }
         } else {
             None
         }

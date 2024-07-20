@@ -623,8 +623,12 @@ pub trait SecondaryLift: Sync + Sized {
             .add_generators_from_rows_ooo(b.t(), results)
     }
 
-    #[tracing::instrument(skip(self))]
     fn compute_homotopies(&self) {
+        self.compute_homotopies_with_callback(|_| ())
+    }
+
+    #[tracing::instrument(skip(self, cb))]
+    fn compute_homotopies_with_callback(&self, cb: impl Fn(Bidegree) + Sync) {
         let tracing_span = tracing::Span::current();
         let shift = self.shift();
 
@@ -641,19 +645,25 @@ pub trait SecondaryLift: Sync + Sized {
         sseq::coordinates::iter_s_t(
             &|b| {
                 let _tracing_guard = tracing_span.enter();
-                self.compute_homotopy_step(b)
+                let ret = self.compute_homotopy_step(b);
+                cb(b);
+                ret
             },
             min,
             max,
         );
     }
 
-    #[tracing::instrument(skip(self))]
-    fn extend_all(&self) {
+    #[tracing::instrument(skip(self, cb))]
+    fn extend_all_with_callback(&self, cb: impl Fn(Bidegree) + Sync) {
         self.initialize_homotopies();
         self.compute_composites();
         self.compute_intermediates();
-        self.compute_homotopies();
+        self.compute_homotopies_with_callback(cb);
+    }
+
+    fn extend_all(&self) {
+        self.extend_all_with_callback(|_| ())
     }
 }
 
