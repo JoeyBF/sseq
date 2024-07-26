@@ -13,7 +13,25 @@ export const STATE_ADD_DIFFERENTIAL = 1;
 export const STATE_QUERY_TABLE = 2;
 export const STATE_QUERY_BOUNDARY_STRING = 3;
 
+/**
+ * @description Initializes and manages the user interface for a sequence display
+ * application, including a sidebar with panels, a chart area, and a footer with
+ * buttons and a running sign. It handles events such as key presses, clicks, and
+ * page changes to update the displayed information.
+ */
 export class MainDisplay {
+    /**
+     * @description Initializes and configures a main display container with a chart,
+     * sidebar, panels, and footer. It sets up event listeners for key presses, new pages,
+     * and clicks on the chart and sidebar. The constructor also populates the sidebar
+     * with general and class panels and a footer with buttons.
+     * 
+     * @param {string} container - Used to identify an HTML element to hold other elements.
+     * 
+     * @param {object} sseq - Used to manage sequence data.
+     * 
+     * @param {boolean} isUnit - Used to indicate whether this is a unit or not.
+     */
     constructor(container, sseq, isUnit) {
         container = document.getElementById(container);
 
@@ -84,6 +102,13 @@ export class MainDisplay {
         inner.appendChild(this.footer);
     }
 
+    /**
+     * @description Handles keyboard events, processing key presses to navigate between
+     * tabs, change the state, and interact with the `sseq` object, while also handling
+     * the focus on input fields and preventing default actions when necessary.
+     * 
+     * @param {KeyboardEvent} e - Used to retrieve information about the key pressed.
+     */
     _onKeyDown(e) {
         if (dialogOpen > 0 || e.target !== document.body) {
             return;
@@ -130,6 +155,11 @@ export class MainDisplay {
         }
     }
 
+    /**
+     * @description Toggles between showing and hiding two panels (`classPanel` and
+     * `generalPanel`) depending on whether `sseq.selected` is true or false, updating
+     * the current panel accordingly.
+     */
     refreshPanel() {
         if (this.sseq.selected) {
             this.generalPanel.hide();
@@ -142,6 +172,13 @@ export class MainDisplay {
         }
     }
 
+    /**
+     * @description Handles a click event, updating the state based on the current selection
+     * and performing corresponding actions such as querying tables or adding differentials
+     * to a sequence set.
+     * 
+     * @param {(number[]) | null} oldSelected - Used to track previous selection state.
+     */
     _onClick(oldSelected) {
         if (!this.sseq.selected) {
             this.state = null;
@@ -175,7 +212,23 @@ export class MainDisplay {
     }
 }
 
+/**
+ * @description Manages and displays a sequence of units (sseq) within a container
+ * element, providing user interactions such as adding products or differentials to
+ * the sseq.
+ */
 export class UnitDisplay {
+    /**
+     * @description Initializes an instance by setting properties, appending charts to
+     * containers, and attaching event listeners to modal elements. The listeners trigger
+     * actions such as opening modals, adding products, resolving further information,
+     * and handling mouseup events.
+     * 
+     * @param {string} container - Used to specify the HTML container for appending the
+     * chart element.
+     * 
+     * @param {object} sseq - A part of a sequence set.
+     */
     constructor(container, sseq) {
         this.sseq = sseq;
         this.modal = document.querySelector('#unitsseq-dialog');
@@ -183,11 +236,15 @@ export class UnitDisplay {
         document.getElementById(container).appendChild(sseq.chart);
 
         document.querySelector('#modal-diff').addEventListener('click', () => {
+            // Handles click event on an HTML element.
+
             this.modal.setAttribute('header', 'Select target element');
             this.state = STATE_ADD_DIFFERENTIAL;
         });
 
         document.querySelector('#modal-ok').addEventListener('click', () => {
+            // Adds product and closes modal on click.
+
             const [x, y] = this.sseq.selected;
             const num = this.sseq.getClasses(x, y, MIN_PAGE).length;
             window.mainSseq.addProductInteractive(x, y, num);
@@ -206,6 +263,10 @@ export class UnitDisplay {
         sseq.onClick = this._onClick.bind(this);
     }
 
+    /**
+     * @description Resolves further data up to 10 records, disables certain buttons,
+     * shows a modal window, and triggers chart resizing upon opening the modal window.
+     */
     openModal() {
         this.sseq.resolveFurther(10);
 
@@ -216,6 +277,13 @@ export class UnitDisplay {
         this.sseq.chart.onResize();
     }
 
+    /**
+     * @description Handles events when an element is clicked. It checks if an element
+     * is selected, then either adds a differential product or resets the state depending
+     * on the current state and the previously selected element.
+     * 
+     * @param {number[]} oldSelected - Used to track previous selection.
+     */
     _onClick(oldSelected) {
         if (!this.sseq.selected) {
             this.state = null;
