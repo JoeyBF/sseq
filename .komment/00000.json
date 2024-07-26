@@ -1,0 +1,2296 @@
+[
+  {
+    "name": "display.js",
+    "path": "web_ext/sseq_gui/interface/display.js",
+    "content": {
+      "structured": {
+        "description": "Two classes: MainDisplay and UnitDisplay. The main purpose of these classes is to handle user interaction with a sequence chart, providing tools for querying the sequence, adding elements to it, and manipulating its structure. The classes utilize various HTML elements, including panels, buttons, and a modal dialog, as well as external functions from other modules. They also listen to keyboard events and mouse clicks to respond to user input.",
+        "items": [
+          {
+            "id": "a46773c7-a7d5-8592-7044-0980f718764b",
+            "ancestors": [],
+            "description": "Initializes and manages the user interface for a sequence display application, including a sidebar with panels, a chart area, and a footer with buttons and a running sign. It handles events such as key presses, clicks, and page changes to update the displayed information.",
+            "interfaces": [],
+            "superclass": null,
+            "is_abstract": false,
+            "fields": [],
+            "name": "MainDisplay",
+            "location": {
+              "start": 16,
+              "insert": 16,
+              "offset": " ",
+              "indent": 0,
+              "comment": null
+            },
+            "item_type": "class",
+            "length": 161,
+            "docLength": null
+          },
+          {
+            "id": "ab5ecc6e-4917-be82-3049-acb45565fc0d",
+            "ancestors": [
+              "a46773c7-a7d5-8592-7044-0980f718764b"
+            ],
+            "description": "Initializes and configures a main display container with a chart, sidebar, panels, and footer. It sets up event listeners for key presses, new pages, and clicks on the chart and sidebar. The constructor also populates the sidebar with general and class panels and a footer with buttons.",
+            "params": [
+              {
+                "name": "container",
+                "type_name": "string",
+                "optional": false,
+                "description": "Used to identify an HTML element to hold other elements.",
+                "default_value": null
+              },
+              {
+                "name": "sseq",
+                "type_name": "object",
+                "optional": false,
+                "description": "Used to manage sequence data.",
+                "default_value": null
+              },
+              {
+                "name": "isUnit",
+                "type_name": "boolean",
+                "optional": false,
+                "description": "Used to indicate whether this is a unit or not.",
+                "default_value": null
+              }
+            ],
+            "usage": {
+              "language": "javascript",
+              "code": "let container = document.getElementById('main-container');\nlet sseq = new SSeq();\nlet isUnit = true;\nnew MainDisplay(container, sseq, isUnit);\n",
+              "description": ""
+            },
+            "name": null,
+            "location": {
+              "start": 17,
+              "insert": 17,
+              "offset": " ",
+              "indent": 4,
+              "comment": null
+            },
+            "item_type": "constructor",
+            "length": 69,
+            "docLength": null
+          },
+          {
+            "id": "1b155968-8808-1ab4-db4c-085077576776",
+            "ancestors": [
+              "a46773c7-a7d5-8592-7044-0980f718764b"
+            ],
+            "description": "Handles keyboard events, processing key presses to navigate between tabs, change the state, and interact with the `sseq` object, while also handling the focus on input fields and preventing default actions when necessary.",
+            "params": [
+              {
+                "name": "e",
+                "default_value": null,
+                "optional": false,
+                "type_name": "KeyboardEvent",
+                "description": "Used to retrieve information about the key pressed."
+              }
+            ],
+            "usage": {
+              "language": "javascript",
+              "code": "const mainDisplay = new MainDisplay('main-display', sseq, isUnit);\ndocument.addEventListener('keydown', (e) => mainDisplay._onKeyDown(e));",
+              "description": ""
+            },
+            "name": "_onKeyDown",
+            "location": {
+              "start": 87,
+              "insert": 87,
+              "offset": " ",
+              "indent": 4,
+              "comment": null
+            },
+            "item_type": "function",
+            "length": 45,
+            "docLength": null
+          },
+          {
+            "id": "f838e885-2e00-1ca9-6f4e-ccc02b06b008",
+            "ancestors": [
+              "a46773c7-a7d5-8592-7044-0980f718764b"
+            ],
+            "description": "Toggles between showing and hiding two panels (`classPanel` and `generalPanel`) depending on whether `sseq.selected` is true or false, updating the current panel accordingly.",
+            "params": [],
+            "usage": {
+              "language": "javascript",
+              "code": "new MainDisplay('main', sseq, true).refreshPanel();\n",
+              "description": "\nHide and show the respective panels based on the state of `sseq.selected`."
+            },
+            "name": "refreshPanel",
+            "location": {
+              "start": 133,
+              "insert": 133,
+              "offset": " ",
+              "indent": 4,
+              "comment": null
+            },
+            "item_type": "function",
+            "length": 11,
+            "docLength": null
+          },
+          {
+            "id": "3ef5ad1b-9a76-a6aa-4a4b-0d42c500cebe",
+            "ancestors": [
+              "a46773c7-a7d5-8592-7044-0980f718764b"
+            ],
+            "description": "Handles a click event, updating the state based on the current selection and performing corresponding actions such as querying tables or adding differentials to a sequence set.",
+            "params": [
+              {
+                "name": "oldSelected",
+                "default_value": null,
+                "optional": false,
+                "type_name": "(number[]) | null",
+                "description": "Used to track previous selection state."
+              }
+            ],
+            "usage": {
+              "language": "javascript",
+              "code": "const mainDisplay = new MainDisplay('container', sseq, true);\ndocument.getElementById('container').addEventListener('click', (e) => {\n    if (e.target === document.getElementById('sseq')) {\n        mainDisplay._onClick([1, 2]);\n    }\n});\n",
+              "description": ""
+            },
+            "name": "_onClick",
+            "location": {
+              "start": 145,
+              "insert": 145,
+              "offset": " ",
+              "indent": 4,
+              "comment": null
+            },
+            "item_type": "function",
+            "length": 31,
+            "docLength": null
+          },
+          {
+            "id": "bdeebc65-9671-80a4-0e4f-70537eea4d62",
+            "ancestors": [],
+            "description": "Manages and displays a sequence of units (sseq) within a container element, providing user interactions such as adding products or differentials to the sseq.",
+            "interfaces": [],
+            "superclass": null,
+            "is_abstract": false,
+            "fields": [],
+            "name": "UnitDisplay",
+            "location": {
+              "start": 178,
+              "insert": 178,
+              "offset": " ",
+              "indent": 0,
+              "comment": null
+            },
+            "item_type": "class",
+            "length": 79,
+            "docLength": null
+          },
+          {
+            "id": "32e09ec6-bdc7-0e9e-8743-a0fbdadcb22d",
+            "ancestors": [
+              "bdeebc65-9671-80a4-0e4f-70537eea4d62"
+            ],
+            "description": "Initializes an instance by setting properties, appending charts to containers, and attaching event listeners to modal elements. The listeners trigger actions such as opening modals, adding products, resolving further information, and handling mouseup events.",
+            "params": [
+              {
+                "name": "container",
+                "type_name": "string",
+                "optional": false,
+                "description": "Used to specify the HTML container for appending the chart element.",
+                "default_value": null
+              },
+              {
+                "name": "sseq",
+                "type_name": "object",
+                "optional": false,
+                "description": "A part of a sequence set.",
+                "default_value": null
+              }
+            ],
+            "usage": {
+              "language": "javascript",
+              "code": "const container = 'myContainer';\nconst sseq = new Sequencer();\nnew UnitDisplay(container, sseq);",
+              "description": ""
+            },
+            "name": null,
+            "location": {
+              "start": 179,
+              "insert": 179,
+              "offset": " ",
+              "indent": 4,
+              "comment": null
+            },
+            "item_type": "constructor",
+            "length": 29,
+            "docLength": null
+          },
+          {
+            "id": "0d32b956-98d3-ee9e-5042-d4815cc416f4",
+            "ancestors": [
+              "bdeebc65-9671-80a4-0e4f-70537eea4d62",
+              "32e09ec6-bdc7-0e9e-8743-a0fbdadcb22d"
+            ],
+            "description": "Handles click event on an HTML element.",
+            "name": null,
+            "location": {
+              "start": 185,
+              "insert": 186,
+              "offset": " ",
+              "indent": 12,
+              "comment": null
+            },
+            "item_type": "higher_order_invocation",
+            "length": 4,
+            "docLength": null
+          },
+          {
+            "id": "97cf626f-9f30-b5b3-a94b-090afc01ab48",
+            "ancestors": [
+              "bdeebc65-9671-80a4-0e4f-70537eea4d62",
+              "32e09ec6-bdc7-0e9e-8743-a0fbdadcb22d"
+            ],
+            "description": "Adds product and closes modal on click.",
+            "name": null,
+            "location": {
+              "start": 190,
+              "insert": 191,
+              "offset": " ",
+              "indent": 12,
+              "comment": null
+            },
+            "item_type": "higher_order_invocation",
+            "length": 6,
+            "docLength": null
+          },
+          {
+            "id": "1b3f5484-5407-77b5-5a43-70ae6df5584b",
+            "ancestors": [
+              "bdeebc65-9671-80a4-0e4f-70537eea4d62"
+            ],
+            "description": "Resolves further data up to 10 records, disables certain buttons, shows a modal window, and triggers chart resizing upon opening the modal window.",
+            "params": [],
+            "usage": {
+              "language": "javascript",
+              "code": "const container = 'unitsseq-container';\nconst sseq = new Sequence();\ndocument.getElementById(container).appendChild(sseq.chart);\nconst unitDisplay = new UnitDisplay(container, sseq);\nunitDisplay.openModal();",
+              "description": ""
+            },
+            "name": "openModal",
+            "location": {
+              "start": 209,
+              "insert": 209,
+              "offset": " ",
+              "indent": 4,
+              "comment": null
+            },
+            "item_type": "function",
+            "length": 9,
+            "docLength": null
+          },
+          {
+            "id": "390767d2-763a-b788-dc42-a7eb756207d8",
+            "ancestors": [
+              "bdeebc65-9671-80a4-0e4f-70537eea4d62"
+            ],
+            "description": "Handles events when an element is clicked. It checks if an element is selected, then either adds a differential product or resets the state depending on the current state and the previously selected element.",
+            "params": [
+              {
+                "name": "oldSelected",
+                "default_value": null,
+                "optional": false,
+                "type_name": "number[]",
+                "description": "Used to track previous selection."
+              }
+            ],
+            "usage": {
+              "language": "javascript",
+              "code": "const container = 'unitsseq-container';\nconst sseq = new Ssequence();\ndocument.getElementById(container).appendChild(sseq.chart);\nsseq.onClick = function(oldSelected) {\n    this._onClick(oldSelected);\n};\nnew UnitDisplay(container, sseq);\n",
+              "description": ""
+            },
+            "name": "_onClick",
+            "location": {
+              "start": 219,
+              "insert": 219,
+              "offset": " ",
+              "indent": 4,
+              "comment": null
+            },
+            "item_type": "function",
+            "length": 37,
+            "docLength": null
+          }
+        ]
+      }
+    }
+  },
+  {
+    "name": "index.js",
+    "path": "web_ext/sseq_gui/interface/index.js",
+    "content": {
+      "structured": {
+        "description": "A real-time collaborative mathematics software that allows users to construct algebraic objects and manipulate them using a socket.io based communication protocol. It uses ExtSseq, MainDisplay, UnitDisplay, dialog, renderLaTeX, download, openSocket modules for constructing algebraic sequences, displaying results, handling user input, and saving/loading data respectively. The code provides features like command queuing, error handling, and file uploads for JSON and history files.",
+        "items": [
+          {
+            "id": "d4c9b629-49a5-97a1-4d4a-686f0685e465",
+            "ancestors": [],
+            "description": "Processes a queue of commands and sends them to either main or unit Sseq, depending on their type. It waits for all non-\"Resolve\" commands to be processed before sending a \"BlockRefresh\" command to Sseq.",
+            "params": [],
+            "usage": {
+              "language": "javascript",
+              "code": "window.commandQueue.push('{\"sseq\": \"Main\", \"action\": \"AddClass\"}');\nprocessCommandQueue();\n",
+              "description": ""
+            },
+            "name": "processCommandQueue",
+            "location": {
+              "start": 9,
+              "insert": 9,
+              "offset": " ",
+              "indent": 0,
+              "comment": null
+            },
+            "item_type": "function",
+            "length": 43,
+            "docLength": null
+          },
+          {
+            "id": "20b3d935-b9b0-c98d-984b-84eb74497296",
+            "ancestors": [],
+            "description": "Traverses nested HTML elements and updates specific tags.",
+            "name": null,
+            "location": {
+              "start": 108,
+              "insert": 109,
+              "offset": " ",
+              "indent": 8,
+              "comment": null
+            },
+            "item_type": "higher_order_invocation",
+            "length": 8,
+            "docLength": null
+          },
+          {
+            "id": "35f9e592-7e69-12ba-ed40-d79509e3c928",
+            "ancestors": [
+              "20b3d935-b9b0-c98d-984b-84eb74497296"
+            ],
+            "description": "Traverses and transforms HTML links.",
+            "name": null,
+            "location": {
+              "start": 109,
+              "insert": 110,
+              "offset": " ",
+              "indent": 12,
+              "comment": null
+            },
+            "item_type": "higher_order_invocation",
+            "length": 6,
+            "docLength": null
+          },
+          {
+            "id": "fc7f23e1-9f65-5499-0447-867e5945ea67",
+            "ancestors": [],
+            "description": "Processes incoming messages by parsing JSON data and invoking corresponding handlers based on command types, either using `messageHandler` or `window.sseq` properties. It also logs errors and relevant data if processing fails.",
+            "params": [
+              {
+                "name": "e",
+                "default_value": null,
+                "optional": false,
+                "type_name": "Event",
+                "description": "The event object triggered by a message receipt."
+              }
+            ],
+            "usage": {
+              "language": "javascript",
+              "code": "onMessage({ data: '{\"action\":{\"myCommand\":\"someValue\"}}' });\n",
+              "description": "\n\nThis code will trigger the processing of a message with specific action and command."
+            },
+            "name": "onMessage",
+            "location": {
+              "start": 126,
+              "insert": 126,
+              "offset": " ",
+              "indent": 0,
+              "comment": null
+            },
+            "item_type": "function",
+            "length": 24,
+            "docLength": null
+          },
+          {
+            "id": "9db77816-254a-1f9e-3c4c-1a3559c902cd",
+            "ancestors": [],
+            "description": "Constructs a command history by concatenating and stringifying an array of objects, including the main sequence commands and additional unit sequence commands if applicable, separated by newline characters.",
+            "params": [],
+            "returns": {
+              "type_name": "string",
+              "description": "A newline-separated concatenation of JSON-serialized arrays containing objects with recipients, sseq, and action properties."
+            },
+            "usage": {
+              "language": "javascript",
+              "code": "let result = generateHistory();\nalert(result);",
+              "description": ""
+            },
+            "name": "generateHistory",
+            "location": {
+              "start": 151,
+              "insert": 151,
+              "offset": " ",
+              "indent": 0,
+              "comment": null
+            },
+            "item_type": "function",
+            "length": 25,
+            "docLength": null
+          },
+          {
+            "id": "a29b3098-3dca-a796-dd4c-4b8c29a18eb7",
+            "ancestors": [],
+            "description": "Prompts the user to enter a file name, generates a text representation of the history data using `generateHistory`, and then downloads it as a plain text file with the specified name.",
+            "params": [],
+            "usage": {
+              "language": "javascript",
+              "code": "save();\n",
+              "description": ""
+            },
+            "name": "save",
+            "location": {
+              "start": 177,
+              "insert": 177,
+              "offset": " ",
+              "indent": 0,
+              "comment": null
+            },
+            "item_type": "function",
+            "length": 13,
+            "docLength": null
+          },
+          {
+            "id": "fb7bf63c-7ae3-31b6-be47-74e1c3f8d939",
+            "ancestors": [],
+            "description": "Loads a history string into an array, removes empty lines and comments, parses the first two commands, and assigns them to global variables. It also populates a command queue with the remaining lines, which can be executed later.",
+            "params": [
+              {
+                "name": "hist",
+                "default_value": null,
+                "optional": false,
+                "type_name": "string",
+                "description": "History data loaded from file or socket connection."
+              }
+            ],
+            "usage": {
+              "language": "javascript",
+              "code": "loadHistory(\"command1\\n//comment\\ncommand2\\ncommand3\");\n",
+              "description": ""
+            },
+            "name": "loadHistory",
+            "location": {
+              "start": 192,
+              "insert": 192,
+              "offset": " ",
+              "indent": 0,
+              "comment": null
+            },
+            "item_type": "function",
+            "length": 19,
+            "docLength": null
+          },
+          {
+            "id": "08b2f6ab-4b62-a8b3-a54c-4be241997997",
+            "ancestors": [],
+            "description": "Handles changes to a JSON upload field.",
+            "name": null,
+            "location": {
+              "start": 278,
+              "insert": 279,
+              "offset": " ",
+              "indent": 4,
+              "comment": null
+            },
+            "item_type": "higher_order_invocation",
+            "length": 17,
+            "docLength": null
+          },
+          {
+            "id": "d66602e8-d908-68be-9946-33cc6540b0af",
+            "ancestors": [],
+            "description": "Reads an uploaded file and hides a home page element.",
+            "name": null,
+            "location": {
+              "start": 296,
+              "insert": 297,
+              "offset": " ",
+              "indent": 4,
+              "comment": null
+            },
+            "item_type": "higher_order_invocation",
+            "length": 11,
+            "docLength": null
+          }
+        ]
+      }
+    }
+  },
+  {
+    "name": "sseq.js",
+    "path": "web_ext/sseq_gui/interface/sseq.js",
+    "content": {
+      "structured": {
+        "description": "A class `ExtSseq` that represents an Extensive Sequence, a data structure used in algebraic topology and homological algebra. It manages a chart with multiple pages, each representing a different degree of an extensive sequence. The class provides methods for adding classes to the chart, resolving further degrees, and querying boundaries.",
+        "items": [
+          {
+            "id": "c9671af4-4267-ed91-6143-c42e0d4f1e06",
+            "ancestors": [],
+            "description": "Represents a two-dimensional vector space with adjustable minimum degree. It provides methods for setting and retrieving values at specific indices within this space, while ensuring that the underlying data structure is initialized to accommodate all possible indices.",
+            "interfaces": [],
+            "superclass": null,
+            "is_abstract": false,
+            "fields": [],
+            "name": "BiVec",
+            "location": {
+              "start": 49,
+              "insert": 49,
+              "offset": " ",
+              "indent": 0,
+              "comment": null
+            },
+            "item_type": "class",
+            "length": 15,
+            "docLength": null
+          },
+          {
+            "id": "d1e654ad-8b88-3488-c04b-0a6dd76fda68",
+            "ancestors": [
+              "c9671af4-4267-ed91-6143-c42e0d4f1e06"
+            ],
+            "description": "Initializes an instance with two parameters: `minDegree` and `data`. If `data` is provided, it assigns the value to the `data` property; otherwise, it defaults to an empty array. The `minDegree` parameter sets the minimum degree of the BiVec object.",
+            "params": [
+              {
+                "name": "minDegree",
+                "type_name": "number",
+                "optional": false,
+                "description": "Set as the minimum degree for an object.",
+                "default_value": null
+              },
+              {
+                "name": "data",
+                "type_name": "(string | object)[]",
+                "optional": false,
+                "description": "Optional. It initializes an array for storing data.",
+                "default_value": null
+              }
+            ],
+            "usage": {
+              "language": "javascript",
+              "code": "const biVec = new BiVec(5, [[1, 2], [3, 4]]);\nbiVec.set(8, 9, 'value');\n",
+              "description": "\n\nNote:"
+            },
+            "name": null,
+            "location": {
+              "start": 50,
+              "insert": 50,
+              "offset": " ",
+              "indent": 4,
+              "comment": null
+            },
+            "item_type": "constructor",
+            "length": 4,
+            "docLength": null
+          },
+          {
+            "id": "45beb66b-77fb-f0b0-4644-101c9f062c4f",
+            "ancestors": [
+              "c9671af4-4267-ed91-6143-c42e0d4f1e06"
+            ],
+            "description": "Sets a value at a specific location (x, y) in the internal data structure (`this.data`). If necessary, it expands the array to accommodate new elements by pushing empty arrays until its length is greater than or equal to x - minDegree.",
+            "params": [
+              {
+                "name": "x",
+                "default_value": null,
+                "optional": false,
+                "type_name": "number",
+                "description": "0-indexed row index for data storage."
+              },
+              {
+                "name": "y",
+                "default_value": null,
+                "optional": false,
+                "type_name": "number",
+                "description": "0-indexed."
+              },
+              {
+                "name": "data",
+                "default_value": null,
+                "optional": false,
+                "type_name": "any",
+                "description": "Used to store a value at a specific location."
+              }
+            ],
+            "usage": {
+              "language": "javascript",
+              "code": "let bv = new BiVec(2, []);\nbv.set(1, 0, 'Hello');\nbv.set(3, 1, 'World!');\n",
+              "description": "\nThis code creates a new instance of `BiVec` with a minimum degree of 2 and initializes the data as an empty array. Then it sets values at coordinates (1, 0) and (3, 1)."
+            },
+            "name": "set",
+            "location": {
+              "start": 54,
+              "insert": 54,
+              "offset": " ",
+              "indent": 4,
+              "comment": null
+            },
+            "item_type": "function",
+            "length": 6,
+            "docLength": null
+          },
+          {
+            "id": "2aba8549-6297-599e-e742-8f3a24e2feba",
+            "ancestors": [
+              "c9671af4-4267-ed91-6143-c42e0d4f1e06"
+            ],
+            "description": "Retrieves a value from a nested data structure based on provided coordinates (x, y). The x-coordinate is adjusted by subtracting the `minDegree` property to access the corresponding nested object or array.",
+            "params": [
+              {
+                "name": "x",
+                "default_value": null,
+                "optional": false,
+                "type_name": "number",
+                "description": "0-based index for accessing data structure."
+              },
+              {
+                "name": "y",
+                "default_value": null,
+                "optional": false,
+                "type_name": "number",
+                "description": "An index for accessing data within the returned value."
+              }
+            ],
+            "returns": {
+              "type_name": "any",
+              "description": "Retrieved from a multi-dimensional array-like data structure at the specified indices `x` and `y`."
+            },
+            "usage": {
+              "language": "javascript",
+              "code": "let biVec = new BiVec(2, [[1, 2], [3, 4]]);\nbiVec.set(2, 0, 5);\nalert(biVec.get(2, 0));",
+              "description": ""
+            },
+            "name": "get",
+            "location": {
+              "start": 60,
+              "insert": 60,
+              "offset": " ",
+              "indent": 4,
+              "comment": null
+            },
+            "item_type": "function",
+            "length": 3,
+            "docLength": null
+          },
+          {
+            "id": "522663fc-261b-4dbd-4244-3160029db1fa",
+            "ancestors": [],
+            "description": "Represents an extended spectral sequence, providing a graphical interface for manipulating and visualizing its structure. It enables users to add classes, differentials, and products, as well as resolve further, query boundaries, and show/hide structural lines.",
+            "interfaces": [],
+            "superclass": null,
+            "is_abstract": false,
+            "fields": [],
+            "name": "ExtSseq",
+            "location": {
+              "start": 65,
+              "insert": 65,
+              "offset": " ",
+              "indent": 0,
+              "comment": null
+            },
+            "item_type": "class",
+            "length": 828,
+            "docLength": null
+          },
+          {
+            "id": "f84831b7-d874-78b9-3d47-1b7a7a4571f4",
+            "ancestors": [
+              "522663fc-261b-4dbd-4244-3160029db1fa"
+            ],
+            "description": "Initializes an object with various properties and sets up event listeners. It creates several data structures, including `BiVec` instances for classes, decompositions, and products, as well as a DOM element for rendering charts.",
+            "params": [
+              {
+                "name": "name",
+                "type_name": "string",
+                "optional": false,
+                "description": "Used to set the name of an object.",
+                "default_value": null
+              },
+              {
+                "name": "minDegree",
+                "type_name": "number",
+                "optional": false,
+                "description": "Used to set the minimum degree for various data structures.",
+                "default_value": null
+              }
+            ],
+            "usage": {
+              "language": "javascript",
+              "code": "const extSseq = new ExtSseq(\"Example\", 2);\nextSseq.chart.addEventListener('click', () => console.log(extSseq.select(null)));\n",
+              "description": "\nIt creates a new instance of the `ExtSseq` class with name \"Example\" and minimum degree 2."
+            },
+            "name": null,
+            "location": {
+              "start": 66,
+              "insert": 66,
+              "offset": " ",
+              "indent": 4,
+              "comment": null
+            },
+            "item_type": "constructor",
+            "length": 33,
+            "docLength": null
+          },
+          {
+            "id": "ef4afc02-a4b9-e59b-1e4a-5b73ee49fc81",
+            "ancestors": [
+              "522663fc-261b-4dbd-4244-3160029db1fa"
+            ],
+            "description": "Returns the current page number plus a constant `MIN_PAGE`, providing an offset from the base page number to obtain the actual page number used by the chart.",
+            "params": [],
+            "returns": {
+              "type_name": "number",
+              "description": "The sum of `chart.page` and a constant `MIN_PAGE`."
+            },
+            "usage": {
+              "language": "javascript",
+              "code": "const sseq = new ExtSseq('MySequence', 1);\nsseq.newPage();\nalert(sseq.page); // returns a value",
+              "description": ""
+            },
+            "name": "page",
+            "location": {
+              "start": 100,
+              "insert": 100,
+              "offset": " ",
+              "indent": 4,
+              "comment": null
+            },
+            "item_type": "function",
+            "length": 3,
+            "docLength": null
+          },
+          {
+            "id": "df72bb3f-7382-33b7-d045-9288c676efcc",
+            "ancestors": [
+              "522663fc-261b-4dbd-4244-3160029db1fa"
+            ],
+            "description": "Creates a new page by cloning the previous page and appending it to the chart. It also sets an event listener for click events on nodes with the class 'class-group' within the cloned page.",
+            "params": [],
+            "usage": {
+              "language": "javascript",
+              "code": "const mySseq = new ExtSseq('My Sequence', 2);\nmySseq.newPage();",
+              "description": ""
+            },
+            "name": "newPage",
+            "location": {
+              "start": 104,
+              "insert": 104,
+              "offset": " ",
+              "indent": 4,
+              "comment": null
+            },
+            "item_type": "function",
+            "length": 8,
+            "docLength": null
+          },
+          {
+            "id": "c80c3615-2486-17b5-674c-6b5dc8dcacd8",
+            "ancestors": [
+              "522663fc-261b-4dbd-4244-3160029db1fa"
+            ],
+            "description": "Sends data to an unknown destination, possibly logging it depending on the presence of certain action keys and the value of the `log` parameter. The data is modified by adding a sequence number before being sent.",
+            "params": [
+              {
+                "name": "data",
+                "default_value": null,
+                "optional": false,
+                "type_name": "object",
+                "description": "Used to send data to somewhere."
+              },
+              {
+                "name": "log",
+                "default_value": "true",
+                "optional": true,
+                "type_name": "boolean",
+                "description": "Used to log the data."
+              }
+            ],
+            "usage": {
+              "language": "javascript",
+              "code": "const sseq = new ExtSseq(\"Example\", 3);\nsseq.send({action: {ExampleAction: \"some data\"}}, true);",
+              "description": ""
+            },
+            "name": "send",
+            "location": {
+              "start": 113,
+              "insert": 113,
+              "offset": " ",
+              "indent": 4,
+              "comment": null
+            },
+            "item_type": "function",
+            "length": 10,
+            "docLength": null
+          },
+          {
+            "id": "f6dc2aa2-31ee-98ab-6a44-ba85f4b2aa62",
+            "ancestors": [
+              "522663fc-261b-4dbd-4244-3160029db1fa"
+            ],
+            "description": "Removes an action from its history, prompting the user to confirm before doing so. If confirmed, it sends a \"Clear\" action and then resends all previous actions to restore the state.",
+            "params": [
+              {
+                "name": "msg",
+                "default_value": null,
+                "optional": false,
+                "type_name": "object",
+                "description": "Used to store an action message from the history stack."
+              }
+            ],
+            "usage": {
+              "language": "javascript",
+              "code": "const extSseq = new ExtSseq('My Sequence', 3);\nextSseq.send({ recipients: ['Sseq'], action: { Add: { name: 'Class1' } } });\n// Perform some actions...\nextSseq.removeHistoryItem(extSseq.history[0]);\n",
+              "description": "\nUndo an action."
+            },
+            "name": "removeHistoryItem",
+            "location": {
+              "start": 124,
+              "insert": 124,
+              "offset": " ",
+              "indent": 4,
+              "comment": null
+            },
+            "item_type": "function",
+            "length": 32,
+            "docLength": null
+          },
+          {
+            "id": "4d6ba8ae-a89b-b3ae-1242-0383a4033273",
+            "ancestors": [
+              "522663fc-261b-4dbd-4244-3160029db1fa",
+              "f6dc2aa2-31ee-98ab-6a44-ba85f4b2aa62"
+            ],
+            "description": "\"Undo\" an action.",
+            "name": null,
+            "location": {
+              "start": 126,
+              "insert": 136,
+              "offset": " ",
+              "indent": 16,
+              "comment": null
+            },
+            "item_type": "higher_order_invocation",
+            "length": 29,
+            "docLength": null
+          },
+          {
+            "id": "9e332f81-1ad7-c9a2-f24a-71478b53ece3",
+            "ancestors": [
+              "522663fc-261b-4dbd-4244-3160029db1fa"
+            ],
+            "description": "Sends a request to refresh the block with the specified value for the parameter `block`, targeting recipients 'Sseq'.",
+            "params": [
+              {
+                "name": "block",
+                "default_value": "true",
+                "optional": true,
+                "type_name": "boolean",
+                "description": "Used to determine whether to block or unblock a user."
+              }
+            ],
+            "usage": {
+              "language": "javascript",
+              "code": "const myExtSseq = new ExtSseq('My Sseq', 3);\nmyExtSseq.block();\n",
+              "description": "\nIt creates a new instance of `ExtSseq` with name 'My Sseq' and degree 3, then calls the `block` method."
+            },
+            "name": "block",
+            "location": {
+              "start": 157,
+              "insert": 157,
+              "offset": " ",
+              "indent": 4,
+              "comment": null
+            },
+            "item_type": "function",
+            "length": 6,
+            "docLength": null
+          },
+          {
+            "id": "74ae7da6-bd5e-789f-fa48-f8afc5746de6",
+            "ancestors": [
+              "522663fc-261b-4dbd-4244-3160029db1fa"
+            ],
+            "description": "Undoes the previous action by removing it from the history and redoing it on top of the redo stack, then clears all messages, refreshes the panel, and releases any blocks.",
+            "params": [],
+            "usage": {
+              "language": "javascript",
+              "code": "var sseq = new ExtSseq(\"mySequence\", 3);\nsseq.send({recipients: ['Sseq'], action: {AddClass: {'class': 'c1'}}});\nsseq.undo();\n",
+              "description": ""
+            },
+            "name": "undo",
+            "location": {
+              "start": 164,
+              "insert": 164,
+              "offset": " ",
+              "indent": 4,
+              "comment": null
+            },
+            "item_type": "function",
+            "length": 15,
+            "docLength": null
+          },
+          {
+            "id": "374c8c5f-a780-4486-aa49-0474a8a883ab",
+            "ancestors": [
+              "522663fc-261b-4dbd-4244-3160029db1fa"
+            ],
+            "description": "Pops and sends an item from the `redoStack`, effectively redoing the last undone action.",
+            "params": [],
+            "usage": {
+              "language": "javascript",
+              "code": "const sseq = new ExtSseq('MySequence', 1);\nsseq.send({ action: { Create: { type: 'class' } } });\nsseq.redo();\n",
+              "description": "\nredo()"
+            },
+            "name": "redo",
+            "location": {
+              "start": 180,
+              "insert": 180,
+              "offset": " ",
+              "indent": 4,
+              "comment": null
+            },
+            "item_type": "function",
+            "length": 3,
+            "docLength": null
+          },
+          {
+            "id": "78140314-0dad-df9e-2948-fa4d5c2530bd",
+            "ancestors": [
+              "522663fc-261b-4dbd-4244-3160029db1fa"
+            ],
+            "description": "Sends a message to a specified recipient (`'Sseq'`) with an action to add a permanent CSS class to an element. The method takes three parameters: `x`, `y`, and `target`, which represent the coordinates and the class to be added, respectively.",
+            "params": [
+              {
+                "name": "x",
+                "default_value": null,
+                "optional": false,
+                "type_name": "number",
+                "description": "The x-coordinate of the target element."
+              },
+              {
+                "name": "y",
+                "default_value": null,
+                "optional": false,
+                "type_name": "number",
+                "description": "Used to specify a y-coordinate."
+              },
+              {
+                "name": "target",
+                "default_value": null,
+                "optional": false,
+                "type_name": "string",
+                "description": "Used to specify the target class name."
+              }
+            ],
+            "usage": {
+              "language": "javascript",
+              "code": "const extSseq = new ExtSseq('Example', 3);\nextSseq.addPermanentClass(1, 2, 'class_name');\n",
+              "description": "\nThis example demonstrates the use of `addPermanentClass` method in a class named `ExtSseq`."
+            },
+            "name": "addPermanentClass",
+            "location": {
+              "start": 184,
+              "insert": 184,
+              "offset": " ",
+              "indent": 4,
+              "comment": null
+            },
+            "item_type": "function",
+            "length": 12,
+            "docLength": null
+          },
+          {
+            "id": "c69b3c3a-c876-b1a3-e347-c8a070f15421",
+            "ancestors": [
+              "522663fc-261b-4dbd-4244-3160029db1fa"
+            ],
+            "description": "Converts a page basis to an E2 basis, given coordinates (x, y), radius r, and coefficients c. It multiplies corresponding elements, takes modulo p, and returns the resulting vector.",
+            "params": [
+              {
+                "name": "r",
+                "default_value": null,
+                "optional": false,
+                "type_name": "number",
+                "description": "Used for calculations."
+              },
+              {
+                "name": "x",
+                "default_value": null,
+                "optional": false,
+                "type_name": "number",
+                "description": "Used as an index for accessing class data."
+              },
+              {
+                "name": "y",
+                "default_value": null,
+                "optional": false,
+                "type_name": "number",
+                "description": "Used to access specific elements in an array."
+              },
+              {
+                "name": "c",
+                "default_value": null,
+                "optional": false,
+                "type_name": "number[]",
+                "description": "Used for coefficient calculation."
+              }
+            ],
+            "returns": {
+              "type_name": "number[]",
+              "description": "A list of coefficients of a polynomial over the finite field with modulus `p`, representing the result of transforming basis vectors from page-basis to e2-basis."
+            },
+            "usage": {
+              "language": "javascript",
+              "code": "const extSseq = new ExtSseq('Example', 2);\nextSseq.newPage();\nlet result = extSseq.pageBasisToE2Basis(1, 0, 0, [3, 4]);\n// The result is a new page basis.",
+              "description": ""
+            },
+            "name": "pageBasisToE2Basis",
+            "location": {
+              "start": 197,
+              "insert": 197,
+              "offset": " ",
+              "indent": 4,
+              "comment": null
+            },
+            "item_type": "function",
+            "length": 19,
+            "docLength": null
+          },
+          {
+            "id": "7bb1a964-7ae6-af92-f449-f113b0fca827",
+            "ancestors": [
+              "522663fc-261b-4dbd-4244-3160029db1fa"
+            ],
+            "description": "Creates an interactive dialog box for users to input differential equations between two pages of an extension sequence. The input fields are defined based on the dimensions of the source and target vectors, which depend on the current page.",
+            "params": [
+              {
+                "name": "source",
+                "default_value": null,
+                "optional": false,
+                "type_name": "[number, number]",
+                "description": "2D coordinates of a point."
+              },
+              {
+                "name": "target",
+                "default_value": null,
+                "optional": false,
+                "type_name": "[number, number]",
+                "description": "Used as the target point for calculating differential."
+              }
+            ],
+            "usage": {
+              "language": "javascript",
+              "code": "const extSseq = new ExtSseq('Example', 2);\nextSseq.addDifferentialInteractive([0, 1], [2, 3]);\n",
+              "description": ""
+            },
+            "name": "addDifferentialInteractive",
+            "location": {
+              "start": 217,
+              "insert": 217,
+              "offset": " ",
+              "indent": 4,
+              "comment": null
+            },
+            "item_type": "function",
+            "length": 41,
+            "docLength": null
+          },
+          {
+            "id": "495edd2d-ea3d-a1a2-ab42-96bf9605f645",
+            "ancestors": [
+              "522663fc-261b-4dbd-4244-3160029db1fa",
+              "7bb1a964-7ae6-af92-f449-f113b0fca827"
+            ],
+            "description": "Opens a dialog.",
+            "name": null,
+            "location": {
+              "start": 222,
+              "insert": 235,
+              "offset": " ",
+              "indent": 16,
+              "comment": null
+            },
+            "item_type": "higher_order_invocation",
+            "length": 35,
+            "docLength": null
+          },
+          {
+            "id": "491816c4-2217-7794-ed4a-557f11c8b87f",
+            "ancestors": [
+              "522663fc-261b-4dbd-4244-3160029db1fa"
+            ],
+            "description": "Sends a request to set a new class name for an object at specific coordinates (x, y) and index idx. The new name is provided as a parameter. The recipients of this message are specified by 'Sseq'.",
+            "params": [
+              {
+                "name": "x",
+                "default_value": null,
+                "optional": false,
+                "type_name": "number",
+                "description": "Used to set the class name."
+              },
+              {
+                "name": "y",
+                "default_value": null,
+                "optional": false,
+                "type_name": "number",
+                "description": "Unspecified in this description."
+              },
+              {
+                "name": "idx",
+                "default_value": null,
+                "optional": false,
+                "type_name": "number",
+                "description": "Used to set class name at specific index."
+              },
+              {
+                "name": "name",
+                "default_value": null,
+                "optional": false,
+                "type_name": "string",
+                "description": "Used to set the name of a class."
+              }
+            ],
+            "usage": {
+              "language": "javascript",
+              "code": "const extSseq = new ExtSseq(\"Sequence\", 3);\nextSseq.setClassName(1, 2, 0, \"Test\");\n",
+              "description": "\nThis will set a class name in an instance of `ExtSseq`."
+            },
+            "name": "setClassName",
+            "location": {
+              "start": 259,
+              "insert": 259,
+              "offset": " ",
+              "indent": 4,
+              "comment": null
+            },
+            "item_type": "function",
+            "length": 6,
+            "docLength": null
+          },
+          {
+            "id": "cf187991-2702-c19d-704a-3b162578083f",
+            "ancestors": [
+              "522663fc-261b-4dbd-4244-3160029db1fa"
+            ],
+            "description": "Opens a dialog to add a product at a specified position (x, y). The dialog contains input fields for product name and E2 page basis class, and an option for permanent product. On submission, it sends an action with the provided information to recipients 'Sseq' and 'Resolver'.",
+            "params": [
+              {
+                "name": "x",
+                "default_value": null,
+                "optional": false,
+                "type_name": "number",
+                "description": "Used as an x-coordinate."
+              },
+              {
+                "name": "y",
+                "default_value": null,
+                "optional": false,
+                "type_name": "number",
+                "description": "Used to specify the y-coordinate of the product's location."
+              },
+              {
+                "name": "num",
+                "default_value": null,
+                "optional": false,
+                "type_name": "number",
+                "description": "Used to set the length of an input field."
+              }
+            ],
+            "usage": {
+              "language": "javascript",
+              "code": "const extSseq = new ExtSseq('Name', 2);\nextSseq.addProductInteractive(1, 1, 3);",
+              "description": ""
+            },
+            "name": "addProductInteractive",
+            "location": {
+              "start": 267,
+              "insert": 267,
+              "offset": " ",
+              "indent": 4,
+              "comment": null
+            },
+            "item_type": "function",
+            "length": 32,
+            "docLength": null
+          },
+          {
+            "id": "017cb001-9cc2-968f-784c-b7fa54aabfa4",
+            "ancestors": [
+              "522663fc-261b-4dbd-4244-3160029db1fa",
+              "cf187991-2702-c19d-704a-3b162578083f"
+            ],
+            "description": "Opens a dialogue to add product at specific coordinates and send relevant data.",
+            "name": null,
+            "location": {
+              "start": 268,
+              "insert": 279,
+              "offset": " ",
+              "indent": 16,
+              "comment": null
+            },
+            "item_type": "higher_order_invocation",
+            "length": 30,
+            "docLength": null
+          },
+          {
+            "id": "a9918959-c8b9-7c9a-a043-019cff9758c8",
+            "ancestors": [
+              "522663fc-261b-4dbd-4244-3160029db1fa"
+            ],
+            "description": "Creates an interactive dialog to add product differential at a specified position on a grid, allowing users to input source and target expressions and names, then sends this data to the main Sseq module for processing.",
+            "params": [
+              {
+                "name": "sourceX",
+                "default_value": null,
+                "optional": false,
+                "type_name": "number",
+                "description": "Used to specify the x-coordinate of the source product."
+              },
+              {
+                "name": "sourceY",
+                "default_value": null,
+                "optional": false,
+                "type_name": "number",
+                "description": "Utilized as an input to calculate the target class."
+              },
+              {
+                "name": "page",
+                "default_value": null,
+                "optional": false,
+                "type_name": "number",
+                "description": "Used to calculate coordinates for adding products differentially."
+              },
+              {
+                "name": "sourceClass",
+                "default_value": null,
+                "optional": false,
+                "type_name": "string[][]",
+                "description": "Used to define the source class."
+              },
+              {
+                "name": "targetClass",
+                "default_value": null,
+                "optional": false,
+                "type_name": "(number | string[])[]",
+                "description": "Used to express target in E page basis."
+              }
+            ],
+            "usage": {
+              "language": "javascript",
+              "code": "const extSseq = new ExtSseq('Example Ssequence', 3);\nextSseq.addProductDifferentialInteractive(1, 2, 1, [], []);",
+              "description": ""
+            },
+            "name": "addProductDifferentialInteractive",
+            "location": {
+              "start": 300,
+              "insert": 300,
+              "offset": " ",
+              "indent": 4,
+              "comment": null
+            },
+            "item_type": "function",
+            "length": 80,
+            "docLength": null
+          },
+          {
+            "id": "7be7812d-5a39-8682-2143-a02c4674534b",
+            "ancestors": [
+              "522663fc-261b-4dbd-4244-3160029db1fa",
+              "a9918959-c8b9-7c9a-a043-019cff9758c8"
+            ],
+            "description": "Adds product differential.",
+            "name": null,
+            "location": {
+              "start": 313,
+              "insert": 342,
+              "offset": " ",
+              "indent": 16,
+              "comment": null
+            },
+            "item_type": "higher_order_invocation",
+            "length": 66,
+            "docLength": null
+          },
+          {
+            "id": "0a154069-8e31-4784-ee49-f309d153bdbc",
+            "ancestors": [
+              "522663fc-261b-4dbd-4244-3160029db1fa"
+            ],
+            "description": "Allows adding a permanent class at a specified position (x, y) on a grid-like structure. The method offers interactive options for selecting a class to add, based on existing classes in that position.",
+            "params": [
+              {
+                "name": "x",
+                "default_value": null,
+                "optional": false,
+                "type_name": "number",
+                "description": "1D spatial coordinate."
+              },
+              {
+                "name": "y",
+                "default_value": null,
+                "optional": false,
+                "type_name": "number",
+                "description": "2D coordinate's y-axis value."
+              }
+            ],
+            "usage": {
+              "language": "javascript",
+              "code": "var sseq = new ExtSseq(\"Example S-Sequence\", 2);\nsseq.addPermanentClassInteractive(0, 0, \"A\");\n",
+              "description": "\nRemove"
+            },
+            "name": "addPermanentClassInteractive",
+            "location": {
+              "start": 381,
+              "insert": 381,
+              "offset": " ",
+              "indent": 4,
+              "comment": null
+            },
+            "item_type": "function",
+            "length": 28,
+            "docLength": null
+          },
+          {
+            "id": "0fc6da15-0bb6-9db4-5140-8ad2aa6f77b5",
+            "ancestors": [
+              "522663fc-261b-4dbd-4244-3160029db1fa"
+            ],
+            "description": "Sends a request to add a differential link between two nodes in a network, specifying the source node coordinates (`source_x`, `source_y`), source and target node identifiers (`source`, `target`), and other properties.",
+            "params": [
+              {
+                "name": "r",
+                "default_value": null,
+                "optional": false,
+                "type_name": "number",
+                "description": "Used for specifying a value."
+              },
+              {
+                "name": "source_x",
+                "default_value": null,
+                "optional": false,
+                "type_name": "number",
+                "description": "Part of the differential coordinates."
+              },
+              {
+                "name": "source_y",
+                "default_value": null,
+                "optional": false,
+                "type_name": "number",
+                "description": "Used to represent y-coordinate of the source."
+              },
+              {
+                "name": "source",
+                "default_value": null,
+                "optional": false,
+                "type_name": "object",
+                "description": "Used to represent the source node or edge."
+              },
+              {
+                "name": "target",
+                "default_value": null,
+                "optional": false,
+                "type_name": "string",
+                "description": "Intended to specify the target point for the differential."
+              }
+            ],
+            "usage": {
+              "language": "javascript",
+              "code": "var sseq = new ExtSseq('Example', 3);\nsseq.addDifferential(1, 2, 3, 'source', 'target');\n",
+              "description": ""
+            },
+            "name": "addDifferential",
+            "location": {
+              "start": 410,
+              "insert": 410,
+              "offset": " ",
+              "indent": 4,
+              "comment": null
+            },
+            "item_type": "function",
+            "length": 14,
+            "docLength": null
+          },
+          {
+            "id": "1f24c9c7-82a1-b7b6-b648-9fb8f8dd1bf7",
+            "ancestors": [
+              "522663fc-261b-4dbd-4244-3160029db1fa"
+            ],
+            "description": "Resolves further to obtain a new maximum degree from the user if the input is not an integer, and then sends the updated maximum degree to the 'Resolver'.",
+            "params": [
+              {
+                "name": "newmax",
+                "default_value": null,
+                "optional": false,
+                "type_name": "number | string",
+                "description": "Used to update the maximum degree."
+              }
+            ],
+            "usage": {
+              "language": "javascript",
+              "code": "const myExtSseq = new ExtSseq('My Sequence', 3);\nmyExtSseq.resolveFurther(5);",
+              "description": ""
+            },
+            "name": "resolveFurther",
+            "location": {
+              "start": 425,
+              "insert": 425,
+              "offset": " ",
+              "indent": 4,
+              "comment": null
+            },
+            "item_type": "function",
+            "length": 40,
+            "docLength": null
+          },
+          {
+            "id": "c4b28489-b86a-bf90-1c49-96945149159f",
+            "ancestors": [
+              "522663fc-261b-4dbd-4244-3160029db1fa",
+              "1f24c9c7-82a1-b7b6-b648-9fb8f8dd1bf7"
+            ],
+            "description": "Resolves further.",
+            "name": null,
+            "location": {
+              "start": 439,
+              "insert": 447,
+              "offset": " ",
+              "indent": 16,
+              "comment": null
+            },
+            "item_type": "higher_order_invocation",
+            "length": 25,
+            "docLength": null
+          },
+          {
+            "id": "da1b01ed-9514-5bb4-914c-12b4944c265a",
+            "ancestors": [
+              "522663fc-261b-4dbd-4244-3160029db1fa"
+            ],
+            "description": "Retrieves a set of classes from a 2D array at a specified position (x, y). If the set exists, it sends a query to the 'Resolver' for each element in the set, providing the row number (y), column number plus row number (x+y), and index.",
+            "params": [
+              {
+                "name": "x",
+                "default_value": null,
+                "optional": false,
+                "type_name": "number",
+                "description": "Used to identify a specific location."
+              },
+              {
+                "name": "y",
+                "default_value": null,
+                "optional": false,
+                "type_name": "string",
+                "description": "Used as an input for boundary string querying."
+              }
+            ],
+            "usage": {
+              "language": "javascript",
+              "code": "const extSseq = new ExtSseq(\"MyExtSseq\", 3);\nextSseq.queryBoundaryString(5, 7);",
+              "description": ""
+            },
+            "name": "queryBoundaryString",
+            "location": {
+              "start": 466,
+              "insert": 466,
+              "offset": " ",
+              "indent": 4,
+              "comment": null
+            },
+            "item_type": "function",
+            "length": 22,
+            "docLength": null
+          },
+          {
+            "id": "4e671f8f-1794-c2be-804d-e8ce9ccd35d9",
+            "ancestors": [
+              "522663fc-261b-4dbd-4244-3160029db1fa"
+            ],
+            "description": "Sends a query to 'Resolver' when the parameter `y` is non-negative, requesting data for a table with specified start row (`s`) and total rows (`t`). If `y` is negative, no action is taken.",
+            "params": [
+              {
+                "name": "x",
+                "default_value": null,
+                "optional": false,
+                "type_name": "number",
+                "description": "Used as an input value for table querying."
+              },
+              {
+                "name": "y",
+                "default_value": null,
+                "optional": false,
+                "type_name": "number",
+                "description": "Used to determine query logic."
+              }
+            ],
+            "usage": {
+              "language": "javascript",
+              "code": "const sseq = new ExtSseq('Test', 5);\nsseq.queryTable(3, 4);",
+              "description": ""
+            },
+            "name": "queryTable",
+            "location": {
+              "start": 489,
+              "insert": 489,
+              "offset": " ",
+              "indent": 4,
+              "comment": null
+            },
+            "item_type": "function",
+            "length": 18,
+            "docLength": null
+          },
+          {
+            "id": "f7203d68-3853-30a6-4b42-093d39b3773f",
+            "ancestors": [
+              "522663fc-261b-4dbd-4244-3160029db1fa"
+            ],
+            "description": "Initializes instance variables `p` and `maxDegree` from input data, then calls the `updateDegrees` method to update degrees based on the initialized values.",
+            "params": [
+              {
+                "name": "data",
+                "default_value": null,
+                "optional": false,
+                "type_name": "object",
+                "description": "Used to initialize class properties."
+              }
+            ],
+            "usage": {
+              "language": "javascript",
+              "code": "const extSseq = new ExtSseq('Example', 2);\nextSseq.processResolving({\n    p: 5,\n    max_degree: 10,\n});\n",
+              "description": "\n\nProcessResolving sets properties of the `ExtSseq` object and then calls `updateDegrees`."
+            },
+            "name": "processResolving",
+            "location": {
+              "start": 508,
+              "insert": 508,
+              "offset": " ",
+              "indent": 4,
+              "comment": null
+            },
+            "item_type": "function",
+            "length": 5,
+            "docLength": null
+          },
+          {
+            "id": "e406f85c-0ff6-e79c-8b49-d26d6b0fe36f",
+            "ancestors": [
+              "522663fc-261b-4dbd-4244-3160029db1fa"
+            ],
+            "description": "Updates the attributes of an SVG chart, setting its minimum and maximum x-coordinates to `minDegree` and `maxDegree`, respectively. It also calculates and sets the maximum y-coordinate based on a mathematical formula involving `vanishingSlope` and `vanishingIntercept`.",
+            "params": [],
+            "usage": {
+              "language": "javascript",
+              "code": "const sseq = new ExtSseq('Sample', 10);\nsseq.updateDegrees();\n",
+              "description": "\nThis creates a new instance of `ExtSseq` named 'Sample' with initial degree as 10 and then calls the `updateDegrees()` method."
+            },
+            "name": "updateDegrees",
+            "location": {
+              "start": 514,
+              "insert": 514,
+              "offset": " ",
+              "indent": 4,
+              "comment": null
+            },
+            "item_type": "function",
+            "length": 13,
+            "docLength": null
+          },
+          {
+            "id": "3edd17c2-c607-fe99-c84a-e11559c186e7",
+            "ancestors": [
+              "522663fc-261b-4dbd-4244-3160029db1fa"
+            ],
+            "description": "Removes elements from a specified part of an HTML document based on their class name, which follows a specific pattern. The method iterates through all such elements and clears them.",
+            "params": [
+              {
+                "name": "type",
+                "default_value": null,
+                "optional": false,
+                "type_name": "string",
+                "description": "Used to filter elements by class name."
+              },
+              {
+                "name": "x",
+                "default_value": null,
+                "optional": false,
+                "type_name": "string",
+                "description": "Used to identify specific elements."
+              },
+              {
+                "name": "y",
+                "default_value": null,
+                "optional": false,
+                "type_name": "number",
+                "description": "Used to specify a unique identifier for an element."
+              },
+              {
+                "name": "p",
+                "default_value": null,
+                "optional": false,
+                "type_name": "object",
+                "description": "Used to define the target element for class name selection."
+              }
+            ],
+            "usage": {
+              "language": "javascript",
+              "code": "let chart = new ExtSseq(\"Sequence\", 2);\nchart.clearOld('class', 0, 1);\n",
+              "description": "\nRemove classes with names 'class-0-1'."
+            },
+            "name": "clearOld",
+            "location": {
+              "start": 528,
+              "insert": 528,
+              "offset": " ",
+              "indent": 4,
+              "comment": null
+            },
+            "item_type": "function",
+            "length": 10,
+            "docLength": null
+          },
+          {
+            "id": "9e2d72d5-8478-18ad-ba4d-3af27fc07ab0",
+            "ancestors": [
+              "522663fc-261b-4dbd-4244-3160029db1fa"
+            ],
+            "description": "Calculates and returns the position on an axis given the current position `x`, dimensionality `dim`, and index `i`. It applies an offset to `x` based on `i` and the dimensionality, effectively shifting the position along the axis.",
+            "params": [
+              {
+                "name": "x",
+                "default_value": null,
+                "optional": false,
+                "type_name": "number",
+                "description": "Likely an initial position."
+              },
+              {
+                "name": "dim",
+                "default_value": null,
+                "optional": false,
+                "type_name": "number",
+                "description": "2D dimension."
+              },
+              {
+                "name": "i",
+                "default_value": null,
+                "optional": false,
+                "type_name": "number",
+                "description": "1-indexed."
+              }
+            ],
+            "returns": {
+              "type_name": "number",
+              "description": "A position calculated from the input parameters."
+            },
+            "usage": {
+              "language": "javascript",
+              "code": "const extSseq = new ExtSseq('Sequence', 3);\nconst position1 = ExtSseq.getPosition(10, 5, 2); // returns 10.4\n",
+              "description": "\nThe getPosition method is called on the static object of the class to get a calculated value based on an initial x value and dimensional parameters."
+            },
+            "name": "getPosition",
+            "location": {
+              "start": 539,
+              "insert": 539,
+              "offset": " ",
+              "indent": 4,
+              "comment": null
+            },
+            "item_type": "function",
+            "length": 4,
+            "docLength": null
+          },
+          {
+            "id": "d12dd54d-08be-38a4-2d46-c2ac7a456957",
+            "ancestors": [
+              "522663fc-261b-4dbd-4244-3160029db1fa"
+            ],
+            "description": "Intercepts click events on elements with data-x and data-y attributes, extracts these coordinates, and updates the state by calling the `select` method with the extracted values.",
+            "params": [
+              {
+                "name": "e",
+                "default_value": null,
+                "optional": false,
+                "type_name": "Event",
+                "description": "Used to capture the click event."
+              }
+            ],
+            "usage": {
+              "language": "javascript",
+              "code": "const chart = document.createElement('paged-chart');\nchart.addStyle(CHART_STYLE);\n\nconst sseq = new ExtSseq('Test', 2);\nsseq.chart = chart;\n\n// Create and display a new page with class groups\nsseq.newPage();\n\n// Click on a class group to select a class\nchart.addEventListener('click', (e) => sseq.__onClassClick(e));\n",
+              "description": ""
+            },
+            "name": "__onClassClick",
+            "location": {
+              "start": 544,
+              "insert": 544,
+              "offset": " ",
+              "indent": 4,
+              "comment": null
+            },
+            "item_type": "function",
+            "length": 6,
+            "docLength": null
+          },
+          {
+            "id": "2a91bb8d-e30d-d198-974c-36b361bc5d17",
+            "ancestors": [
+              "522663fc-261b-4dbd-4244-3160029db1fa"
+            ],
+            "description": "Updates the visualization of classes for a given data set by clearing and recreating graphical representations based on new data, taking into account the state of classes (done or error) and applying visual styling accordingly.",
+            "params": [
+              {
+                "name": "data",
+                "default_value": null,
+                "optional": false,
+                "type_name": "object",
+                "description": "Expected to contain page data."
+              }
+            ],
+            "usage": {
+              "language": "javascript",
+              "code": "const sseq = new ExtSseq('Example', 3);\nsseq.processSetClass({ x: 0, y: 1, classes: [[], [1]], state: 'Done' });\n",
+              "description": ""
+            },
+            "name": "processSetClass",
+            "location": {
+              "start": 551,
+              "insert": 551,
+              "offset": " ",
+              "indent": 4,
+              "comment": null
+            },
+            "item_type": "function",
+            "length": 67,
+            "docLength": null
+          },
+          {
+            "id": "05e5a403-0667-f48a-614a-848c21fa4fe3",
+            "ancestors": [
+              "522663fc-261b-4dbd-4244-3160029db1fa"
+            ],
+            "description": "Checks if a cell at coordinates `(x, y)` is selected by comparing it with the current `selected` property, which is an array of two values representing the currently selected cell's coordinates.",
+            "params": [
+              {
+                "name": "x",
+                "default_value": null,
+                "optional": false,
+                "type_name": "number",
+                "description": "A coordinate value."
+              },
+              {
+                "name": "y",
+                "default_value": null,
+                "optional": false,
+                "type_name": "number",
+                "description": "Part of coordinates."
+              }
+            ],
+            "returns": {
+              "type_name": "boolean",
+              "description": "True if a selection exists and its coordinates match the specified x and y values, false otherwise."
+            },
+            "usage": {
+              "language": "javascript",
+              "code": "var sseq = new ExtSseq(\"Sequence\", 2);\nsseq.selected = [1, 2];\nif (sseq.hasSelected(1, 2)) {\n    alert(\"Selected!\");\n}",
+              "description": ""
+            },
+            "name": "hasSelected",
+            "location": {
+              "start": 619,
+              "insert": 619,
+              "offset": " ",
+              "indent": 4,
+              "comment": null
+            },
+            "item_type": "function",
+            "length": 7,
+            "docLength": null
+          },
+          {
+            "id": "4c96c519-f158-a68f-7746-c93bcc898e12",
+            "ancestors": [
+              "522663fc-261b-4dbd-4244-3160029db1fa"
+            ],
+            "description": "Updates the selection state by removing the previous selection and adding a new one. It also calls the `onClick` and `refreshPanel` methods if they are defined.",
+            "params": [
+              {
+                "name": "select",
+                "default_value": null,
+                "optional": false,
+                "type_name": "(number|string)[]",
+                "description": "Selected element or elements to be highlighted on the chart."
+              }
+            ],
+            "usage": {
+              "language": "javascript",
+              "code": "const sseq = new ExtSseq('Sequence', 2);\nsseq.onClick = () => console.log(`Select changed: ${sseq.selected}`);\nsseq.refreshPanel = () => console.log('Refresh panel triggered');\n\nsseq.select([0, 1]); // Select a class group with index [0, 1]\n",
+              "description": ""
+            },
+            "name": "select",
+            "location": {
+              "start": 627,
+              "insert": 627,
+              "offset": " ",
+              "indent": 4,
+              "comment": null
+            },
+            "item_type": "function",
+            "length": 14,
+            "docLength": null
+          },
+          {
+            "id": "d83dd174-6656-35ae-0648-ff194c4fbb6f",
+            "ancestors": [
+              "522663fc-261b-4dbd-4244-3160029db1fa"
+            ],
+            "description": "Draws a matrix of lines or curves on an SVG canvas, based on the input matrix and bend parameter. It generates elements for the SVG document and yields them for further processing. The bend parameter determines whether to draw straight lines or curved paths.",
+            "params": [
+              {
+                "name": "matrix",
+                "default_value": null,
+                "optional": false,
+                "type_name": "object[][]",
+                "description": "2D matrix of values to be drawn on an SVG."
+              },
+              {
+                "name": "sourceX",
+                "default_value": null,
+                "optional": false,
+                "type_name": "number",
+                "description": "Used to calculate positions of lines or curves."
+              },
+              {
+                "name": "targetX",
+                "default_value": null,
+                "optional": false,
+                "type_name": "number",
+                "description": "Used to determine the target x-coordinate for drawing lines."
+              },
+              {
+                "name": "sourceY",
+                "default_value": null,
+                "optional": false,
+                "type_name": "number",
+                "description": "Used to specify the y-coordinate of the source point."
+              },
+              {
+                "name": "targetY",
+                "default_value": null,
+                "optional": false,
+                "type_name": "number",
+                "description": "Utilized as the y-coordinate for the target position."
+              },
+              {
+                "name": "bend",
+                "default_value": "0",
+                "optional": true,
+                "type_name": "number",
+                "description": "Used to control curve bending during drawing process."
+              }
+            ],
+            "usage": {
+              "language": "javascript",
+              "code": "const myExtSseq = new ExtSseq(\"mySeq\", 3);\nconst svgNS = \"http://www.w3.org/2000/svg\";\nlet matrix = [\n    [1, 2],\n    [4, 5]\n];\n\nfor (let path of myExtSseq.drawMatrix(matrix, 100, 300, 50, 250)) {\n    document.body.appendChild(path);\n}",
+              "description": ""
+            },
+            "name": "drawMatrix",
+            "location": {
+              "start": 642,
+              "insert": 642,
+              "offset": " ",
+              "indent": 4,
+              "comment": null
+            },
+            "item_type": "function",
+            "length": 36,
+            "docLength": null
+          },
+          {
+            "id": "f8400fa8-dbbc-2caa-204b-d19d46d81ef1",
+            "ancestors": [
+              "522663fc-261b-4dbd-4244-3160029db1fa"
+            ],
+            "description": "Processes differential data by updating the chart pages, clearing old data, drawing new matrices, and adding them to the pages. It also refreshes a panel if a specific selection is made.",
+            "params": [
+              {
+                "name": "data",
+                "default_value": null,
+                "optional": false,
+                "type_name": "object",
+                "description": "Used to set differentials."
+              }
+            ],
+            "usage": {
+              "language": "javascript",
+              "code": "const mySseq = new ExtSseq(\"My Ssequence\", 5);\nmySseq.processSetDifferential({\n    x: 2,\n    y: 3,\n    differentials: [\n        {r: 1, diffs: [[1, 0], [0, 1]]},\n        {r: 2, diffs: [[0, 1], [1, 0]]}\n    ],\n    true_differentials: [[1, 1]]\n});\n",
+              "description": ""
+            },
+            "name": "processSetDifferential",
+            "location": {
+              "start": 679,
+              "insert": 679,
+              "offset": " ",
+              "indent": 4,
+              "comment": null
+            },
+            "item_type": "function",
+            "length": 31,
+            "docLength": null
+          },
+          {
+            "id": "cf298dd5-2cd0-91b0-ba40-c25b4a371f7a",
+            "ancestors": [
+              "522663fc-261b-4dbd-4244-3160029db1fa"
+            ],
+            "description": "Iterates through an array of structlines, updating product information and matrices, and then redraws the corresponding lines based on the updated matrices. It also updates the visibility of these lines if necessary.",
+            "params": [
+              {
+                "name": "data",
+                "default_value": null,
+                "optional": false,
+                "type_name": "object",
+                "description": "Used to process struct lines."
+              }
+            ],
+            "usage": {
+              "language": "javascript",
+              "code": "const sseq = new ExtSseq('example', 2);\nsseq.processSetStructline({\n    x: 0,\n    y: 0,\n    structlines: [\n        { name: 'h_0', mult_x: 1, mult_y: 1, matrices: [{}, {}] },\n        { name: 'a_0', mult_x: 2, mult_y: 3, matrices: [{}, {}] }\n    ]\n});\n",
+              "description": ""
+            },
+            "name": "processSetStructline",
+            "location": {
+              "start": 711,
+              "insert": 711,
+              "offset": " ",
+              "indent": 4,
+              "comment": null
+            },
+            "item_type": "function",
+            "length": 62,
+            "docLength": null
+          },
+          {
+            "id": "19c3609d-ab38-aba3-0341-faae53b8e31f",
+            "ancestors": [
+              "522663fc-261b-4dbd-4244-3160029db1fa"
+            ],
+            "description": "Hides a structline with a given name by removing it from the `visibleStructlines` collection and from the DOM tree, if it exists. If the structline is not visible initially, the method does nothing.",
+            "params": [
+              {
+                "name": "name",
+                "default_value": null,
+                "optional": false,
+                "type_name": "string",
+                "description": "Used to identify struct lines to be hidden."
+              }
+            ],
+            "usage": {
+              "language": "javascript",
+              "code": "const sseq = new ExtSseq('Example', 3);\nsseq.hideStructlines('h_0');\n",
+              "description": "\n\nThe code creates a new instance of class `ExtSseq` with name 'Example' and minimum degree 3. Then, it calls the `hideStructlines` method to hide all lines named 'h_0'."
+            },
+            "name": "hideStructlines",
+            "location": {
+              "start": 774,
+              "insert": 774,
+              "offset": " ",
+              "indent": 4,
+              "comment": null
+            },
+            "item_type": "function",
+            "length": 9,
+            "docLength": null
+          },
+          {
+            "id": "ba790366-44fd-67b6-7e4f-e6051420b778",
+            "ancestors": [
+              "522663fc-261b-4dbd-4244-3160029db1fa"
+            ],
+            "description": "Makes certain lines visible and inserts them into an HTML page. The lines are derived from matrices based on product information, with their position and style determined by the product's mult object.",
+            "params": [
+              {
+                "name": "name",
+                "default_value": null,
+                "optional": false,
+                "type_name": "string",
+                "description": "Used to identify specific structural lines."
+              }
+            ],
+            "usage": {
+              "language": "javascript",
+              "code": "const sseq = new ExtSseq('sseq', 1);\nsseq.showStructlines('h_0');",
+              "description": ""
+            },
+            "name": "showStructlines",
+            "location": {
+              "start": 784,
+              "insert": 784,
+              "offset": " ",
+              "indent": 4,
+              "comment": null
+            },
+            "item_type": "function",
+            "length": 35,
+            "docLength": null
+          },
+          {
+            "id": "9c76a0fa-cec4-8e80-1d42-725cf123be92",
+            "ancestors": [
+              "522663fc-261b-4dbd-4244-3160029db1fa",
+              "e01a8fdb-eea8-14b7-8940-37c4bc2128a2"
+            ],
+            "description": "Compares two input values, `a` and `b`, and returns an integer value indicating their relative magnitude. It returns 0 if they are equal, 1 if `a` is greater than `b`, and -1 if `a` is less than `b`.",
+            "params": [
+              {
+                "name": "a",
+                "default_value": null,
+                "optional": false,
+                "type_name": "number",
+                "description": "Compared with the `b` parameter."
+              },
+              {
+                "name": "b",
+                "default_value": null,
+                "optional": false,
+                "type_name": "number",
+                "description": "Another value to be compared with `a`."
+              }
+            ],
+            "returns": {
+              "type_name": "number",
+              "description": "0 if a and b are equal, 1 if a is greater than b, and -1 if a is less than b."
+            },
+            "usage": {
+              "language": "javascript",
+              "code": "compare(2, 3);",
+              "description": ""
+            },
+            "name": "compare",
+            "location": {
+              "start": 825,
+              "insert": 825,
+              "offset": " ",
+              "indent": 8,
+              "comment": null
+            },
+            "item_type": "function",
+            "length": 9,
+            "docLength": null
+          },
+          {
+            "id": "ebada734-4371-a1b3-ba43-77e2b08fcdb2",
+            "ancestors": [
+              "522663fc-261b-4dbd-4244-3160029db1fa"
+            ],
+            "description": "Retrieves and returns a differential value from a cache stored as a nested structure. The cache is accessed using the keys `x` and `y`, with the `page` parameter specifying which page in the nested structure to retrieve from.",
+            "params": [
+              {
+                "name": "x",
+                "default_value": null,
+                "optional": false,
+                "type_name": "string",
+                "description": "Used as a key."
+              },
+              {
+                "name": "y",
+                "default_value": null,
+                "optional": false,
+                "type_name": "number",
+                "description": "Used for indexing."
+              },
+              {
+                "name": "page",
+                "default_value": null,
+                "optional": false,
+                "type_name": "number",
+                "description": "1-indexed."
+              }
+            ],
+            "returns": {
+              "type_name": "any",
+              "description": "Retrieved from a nested data structure within a map named `differentials`. The returned value corresponds to a specific key-value pair in the nested structure and is indexed by subtracting a constant `MIN_PAGE` from the given page number."
+            },
+            "usage": {
+              "language": "javascript",
+              "code": "const extSseq = new ExtSseq('Sequence', 2);\nextSseq.getChart().newPage();\nalert(extSseq.getDifferentials(1, 1, 3));\n",
+              "description": ""
+            },
+            "name": "getDifferentials",
+            "location": {
+              "start": 856,
+              "insert": 856,
+              "offset": " ",
+              "indent": 4,
+              "comment": null
+            },
+            "item_type": "function",
+            "length": 3,
+            "docLength": null
+          },
+          {
+            "id": "e3314092-1852-4dbb-5748-3914998ea828",
+            "ancestors": [
+              "522663fc-261b-4dbd-4244-3160029db1fa"
+            ],
+            "description": "Determines whether there are any classes found for a given combination of parameters `x`, `y`, and `page`. It returns a boolean value indicating whether classes exist and are not empty.",
+            "params": [
+              {
+                "name": "x",
+                "default_value": null,
+                "optional": false,
+                "type_name": "number",
+                "description": "Used for computation."
+              },
+              {
+                "name": "y",
+                "default_value": null,
+                "optional": false,
+                "type_name": "number",
+                "description": "Irrelevant for the function's operation."
+              },
+              {
+                "name": "page",
+                "default_value": null,
+                "optional": false,
+                "type_name": "object",
+                "description": "Used to identify classes within a web page."
+              }
+            ],
+            "returns": {
+              "type_name": "boolean",
+              "description": "True if the length of the array returned by `this.getClasses(x, y, page)` is greater than zero and false otherwise."
+            },
+            "usage": {
+              "language": "javascript",
+              "code": "const sseq = new ExtSseq('Test', 1);\nif (sseq.hasClasses(0, 2, 3)) {\n    // do something\n}\n",
+              "description": "\nNote: The actual data provided to `hasClasses` may vary based on the specific use case."
+            },
+            "name": "hasClasses",
+            "location": {
+              "start": 860,
+              "insert": 860,
+              "offset": " ",
+              "indent": 4,
+              "comment": null
+            },
+            "item_type": "function",
+            "length": 4,
+            "docLength": null
+          },
+          {
+            "id": "ad0e4b37-45b5-f58c-a749-bb22dbd8bb7c",
+            "ancestors": [
+              "522663fc-261b-4dbd-4244-3160029db1fa"
+            ],
+            "description": "Retrieves a page from an array-like object (`v`) based on the given row index (`r`). If `v` is undefined, it returns undefined. Otherwise, it adjusts `r` to ensure it's within the valid range and returns the element at that index.",
+            "params": [
+              {
+                "name": "v",
+                "default_value": null,
+                "optional": false,
+                "type_name": "(string | number)[]",
+                "description": "An array to be retrieved from."
+              },
+              {
+                "name": "r",
+                "default_value": null,
+                "optional": false,
+                "type_name": "number",
+                "description": "Used to retrieve an element from an array `v`."
+              }
+            ],
+            "returns": {
+              "type_name": "v[r]",
+              "description": "One element from an array v at index r, where r is adjusted according to certain conditions. If the returned value is undefined, it means that the array is empty. Otherwise, it is a specific element from the array."
+            },
+            "usage": {
+              "language": "javascript",
+              "code": "const ext = new ExtSseq('mySequence', 3);\nlet result = ExtSseq.getPage(ext.vanishingSlope, 2);\n",
+              "description": ""
+            },
+            "name": "getPage",
+            "location": {
+              "start": 865,
+              "insert": 865,
+              "offset": " ",
+              "indent": 4,
+              "comment": null
+            },
+            "item_type": "function",
+            "length": 8,
+            "docLength": null
+          },
+          {
+            "id": "69114c62-9bed-1aac-7c47-1497270f2db4",
+            "ancestors": [
+              "522663fc-261b-4dbd-4244-3160029db1fa"
+            ],
+            "description": "Adds a 'highlight' class to all elements with the class name `.class-group-${x}-${y}` within the shadow root of a chart, where `x` and `y` are parameters passed to the method.",
+            "params": [
+              {
+                "name": "x",
+                "default_value": null,
+                "optional": false,
+                "type_name": "number",
+                "description": "Used to identify a class group."
+              },
+              {
+                "name": "y",
+                "default_value": null,
+                "optional": false,
+                "type_name": "string",
+                "description": "Used to identify specific elements."
+              }
+            ],
+            "usage": {
+              "language": "javascript",
+              "code": "var sseq = new ExtSseq(\"MySequence\", 5);\nsseq.highlightClass(2, 3);",
+              "description": ""
+            },
+            "name": "highlightClass",
+            "location": {
+              "start": 881,
+              "insert": 881,
+              "offset": " ",
+              "indent": 4,
+              "comment": null
+            },
+            "item_type": "function",
+            "length": 5,
+            "docLength": null
+          },
+          {
+            "id": "be7748d3-828e-6597-664d-f872a733b1bd",
+            "ancestors": [
+              "522663fc-261b-4dbd-4244-3160029db1fa"
+            ],
+            "description": "Removes the \"highlight\" class from all elements with the class name \".highlight\" within its chart's shadow root subtree, effectively clearing any previous highlighting.",
+            "params": [],
+            "usage": {
+              "language": "javascript",
+              "code": "const sseq = new ExtSseq(\"MySseq\", 2);\nsseq.newPage();\n// do some operations...\nsseq.clearHighlight();",
+              "description": ""
+            },
+            "name": "clearHighlight",
+            "location": {
+              "start": 887,
+              "insert": 887,
+              "offset": " ",
+              "indent": 4,
+              "comment": null
+            },
+            "item_type": "function",
+            "length": 5,
+            "docLength": null
+          }
+        ]
+      }
+    }
+  }
+]
