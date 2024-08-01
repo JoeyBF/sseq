@@ -70,10 +70,15 @@ fn main() -> anyhow::Result<()> {
         unit_sseq,
     };
 
+    let restrict_s = std::env::var("HOMOLOGICAL_DEGREE")
+        .ok()
+        .and_then(|s| str::parse::<u32>(&s).ok());
+
     let span = tracing::Span::current();
     resolution
         .iter_stem()
         .skip(1)
+        .filter(|b| restrict_s.map_or(true, |s| b.s() == s))
         .maybe_par_bridge()
         .try_for_each(|b| -> anyhow::Result<()> {
             let _tracing_guard = span.enter();
@@ -93,6 +98,7 @@ fn get_page_data(sseq: &sseq::Sseq<sseq::Adams>, b: Bidegree) -> &fp::matrix::Su
     &d[std::cmp::min(3, d.len() - 1)]
 }
 
+#[tracing::instrument(skip(data), fields(%generator))]
 fn compute_products(
     generator: BidegreeGenerator,
     data: ProductComputationData,
@@ -134,10 +140,6 @@ fn compute_products(
     hom.extend_through_stem(extend_max);
 
     if !data.is_unit {
-        let res_max = Bidegree::n_s(
-            data.resolution.module(0).max_computed_degree(),
-            data.resolution.next_homological_degree() - 1,
-        );
         data.unit.compute_through_stem(res_max - shift);
     }
 
@@ -170,11 +172,19 @@ fn compute_products(
     let name = hom_lift.name();
     // Iterate through the multiplicand
     for b in data.unit.iter_stem().skip(1) {
+        let b_span = tracing::info_span!("output", b = %b);
+        let _b_span_guard = b_span.enter();
+
         if (b.n(), b.s()) > (generator.n(), generator.s()) {
             // By symmetry, it's enough to compute products with cycles in degrees at most as large
             // as the generator (in the lexicographic order). The `iter_stem` iterator returns
             // bidegrees that are lexicographically increasing.
-            return Ok(());
+            break;
+        }
+
+        if (b + shift).n() > 200 {
+            // Stems increase, and we are only computing up to 200.
+            break;
         }
 
         // The potential target has to be hit, and we need to have computed (the data need for) the
