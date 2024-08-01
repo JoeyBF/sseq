@@ -345,9 +345,8 @@ pub fn query_module_only(
         ))
     });
 
-    let save_dir = query::optional(&format!("{prompt} save directory"), |x| {
-        core::result::Result::<PathBuf, std::convert::Infallible>::Ok(PathBuf::from(x))
-    });
+    let save_dir = query::optional(&format!("{prompt} save directory"), str::parse)
+        .unwrap_or(SaveDirectory::None);
 
     let mut resolution =
         construct(module, save_dir).context("Failed to load module from save file")?;
