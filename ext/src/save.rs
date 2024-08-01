@@ -3,6 +3,7 @@ use std::{
     fs::File,
     io::{BufRead, BufReader, BufWriter, Error, ErrorKind, Read, Write},
     path::{Path, PathBuf},
+    str::FromStr,
     sync::{Arc, Mutex},
 };
 
@@ -62,6 +63,26 @@ impl From<Option<PathBuf>> for SaveDirectory {
         match x {
             None => Self::None,
             Some(x) => Self::Combined(x),
+        }
+    }
+}
+
+impl FromStr for SaveDirectory {
+    type Err = std::convert::Infallible;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if s.is_empty() {
+            Ok(Self::None)
+        } else if s.contains(':') {
+            let mut parts = s.split(':');
+            let read = parts.next().unwrap();
+            let write = parts.next().unwrap();
+            Ok(Self::Split {
+                read: read.to_owned().into(),
+                write: write.to_owned().into(),
+            })
+        } else {
+            Ok(Self::Combined(s.to_owned().into()))
         }
     }
 }
