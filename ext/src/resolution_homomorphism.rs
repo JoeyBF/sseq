@@ -231,7 +231,7 @@ where
             );
         }
 
-        if let Some(dir) = self.save_dir.read() {
+        for dir in self.save_dir.read() {
             let mut outputs = Vec::with_capacity(num_gens);
 
             if let Some(mut f) = self

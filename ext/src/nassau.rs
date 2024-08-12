@@ -839,7 +839,7 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
             return Ok(());
         }
 
-        if let Some(dir) = self.save_dir.read() {
+        for dir in self.save_dir.read() {
             if let Some(mut f) = self
                 .save_file(SaveKind::NassauDifferential, b)
                 .open_file(dir.clone())
@@ -1009,12 +1009,13 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> ChainComplex for Resolution<M> {
         for<'a> &'a mut T: Into<SliceMut<'a>>,
         for<'a> &'a S: Into<Slice<'a>>,
     {
-        let mut f = if let Some(dir) = self.save_dir.read() {
-            if let Some(f) = self.save_file(SaveKind::NassauQi, b).open_file(dir.clone()) {
-                f
-            } else {
-                return false;
-            }
+        let mut f = if let Some(f) = self
+            .save_dir
+            .read()
+            .flat_map(|dir| self.save_file(SaveKind::NassauQi, b).open_file(dir.clone()))
+            .next()
+        {
+            f
         } else {
             return false;
         };

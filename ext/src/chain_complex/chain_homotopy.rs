@@ -180,7 +180,7 @@ impl<
                 .add_generators_from_rows_ooo(source.t(), outputs);
         }
 
-        if let Some(dir) = self.save_dir.read() {
+        for dir in self.save_dir.read() {
             if let Some(mut f) = self
                 .left
                 .source

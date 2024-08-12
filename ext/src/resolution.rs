@@ -199,7 +199,7 @@ where
 
         let p = self.prime();
 
-        if let Some(dir) = self.save_dir.read() {
+        for dir in self.save_dir.read() {
             if let Some(mut f) = self.save_file(SaveKind::Kernel, b).open_file(dir.clone()) {
                 return Subspace::from_bytes(p, &mut f)
                     .with_context(|| format!("Failed to read kernel at {b}"))
@@ -370,7 +370,7 @@ where
         target_res.compute_basis(b.t());
         let target_res_dimension = target_res.dimension(b.t());
 
-        if let Some(dir) = self.save_dir.read() {
+        for dir in self.save_dir.read() {
             if let Some(mut f) = self
                 .save_file(SaveKind::Differential, b)
                 .open_file(dir.clone())
@@ -814,12 +814,13 @@ where
                 } else if distance == 1 && b.s() < max.s() {
                     // We compute the kernel at the edge if necessary
                     let next_b = b + Bidegree::s_t(0, 1);
-                    if !self.has_computed_bidegree(b + Bidegree::s_t(1, 1))
-                        && (self.save_dir.is_none()
-                            || !self
-                                .save_file(SaveKind::Differential, b + Bidegree::s_t(1, 1))
-                                .exists(self.save_dir.read().cloned().unwrap()))
-                    {
+                    let kernel_bidegree_not_computed =
+                        !self.has_computed_bidegree(b + Bidegree::s_t(1, 1));
+                    let save_does_not_exist = !self.save_dir.read().any(|dir| {
+                        self.save_file(SaveKind::Differential, b + Bidegree::s_t(1, 1))
+                            .exists(dir.clone())
+                    });
+                    if kernel_bidegree_not_computed && save_does_not_exist {
                         scope.spawn(move |_| {
                             self.kernels.insert(next_b, self.get_kernel(next_b));
                             SenderData::send(next_b, false, sender);
@@ -888,17 +889,15 @@ where
             for (input, result) in inputs.iter().zip_eq(results) {
                 qi.apply(result.into(), 1, input.into());
             }
-            true
-        } else if let Some(dir) = self.save_dir.read() {
+            return true;
+        }
+        for dir in self.save_dir.read() {
             if let Some(mut f) = self.save_file(SaveKind::ResQi, b).open_file(dir.clone()) {
                 QuasiInverse::stream_quasi_inverse(self.prime(), &mut f, results, inputs).unwrap();
-                true
-            } else {
-                false
+                return true;
             }
-        } else {
-            false
         }
+        false
     }
 
     fn save_dir(&self) -> &SaveDirectory {

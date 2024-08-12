@@ -253,7 +253,7 @@ impl<A: PairAlgebra + Send + Sync> SecondaryHomotopy<A> {
                 b: gen.degree(),
                 idx: Some(gen.idx()),
             };
-            if let Some(dir) = dir.read() {
+            for dir in dir.read() {
                 if let Some(mut f) = save_file.open_file(dir.to_owned()) {
                     return SecondaryComposite::from_bytes(
                         Arc::clone(&self.target),
@@ -421,7 +421,7 @@ pub trait SecondaryLift: Sync + Sized {
             idx: Some(gen.idx()),
         };
 
-        if let Some(dir) = self.save_dir().read() {
+        for dir in self.save_dir().read() {
             if let Some(mut f) = save_file.open_file(dir.to_owned()) {
                 // The target dimension can depend on whether we resolved to stem
                 let dim = f.read_u64::<LittleEndian>().unwrap() as usize;
@@ -484,7 +484,7 @@ pub trait SecondaryLift: Sync + Sized {
                 return;
             }
             // Check if we have a saved homotopy
-            if let Some(dir) = self.save_dir().read() {
+            for dir in self.save_dir().read() {
                 let save_file = SaveFile {
                     algebra: self.algebra(),
                     kind: SaveKind::SecondaryHomotopy,
@@ -533,7 +533,7 @@ pub trait SecondaryLift: Sync + Sized {
         let num_gens = source.number_of_gens_in_degree(b.t());
         let target_dim = target.module(target_b.s()).dimension(target_b.t());
 
-        if let Some(dir) = self.save_dir().read() {
+        for dir in self.save_dir().read() {
             let save_file = SaveFile {
                 algebra: self.algebra(),
                 kind: SaveKind::SecondaryHomotopy,

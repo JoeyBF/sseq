@@ -16,14 +16,16 @@ pub enum SaveDirectory {
     None,
     Combined(PathBuf),
     Split { read: PathBuf, write: PathBuf },
+    MultiRead { read: Vec<PathBuf>, write: PathBuf },
 }
 
 impl SaveDirectory {
-    pub fn read(&self) -> Option<&PathBuf> {
+    pub fn read(&self) -> Box<dyn Iterator<Item = &PathBuf> + '_> {
         match self {
-            Self::None => None,
-            Self::Combined(x) => Some(x),
-            Self::Split { read, .. } => Some(read),
+            Self::None => Box::new(std::iter::empty()),
+            Self::Combined(x) => Box::new(std::iter::once(x)),
+            Self::Split { read, .. } => Box::new(std::iter::once(read)),
+            Self::MultiRead { read, .. } => Box::new(read.iter()),
         }
     }
 
@@ -32,6 +34,7 @@ impl SaveDirectory {
             Self::None => None,
             Self::Combined(x) => Some(x),
             Self::Split { write, .. } => Some(write),
+            Self::MultiRead { write, .. } => Some(write),
         }
     }
 
@@ -43,6 +46,10 @@ impl SaveDirectory {
             }
             Self::Split { read, write } => {
                 read.push(&p);
+                write.push(p);
+            }
+            Self::MultiRead { read, write } => {
+                read.iter_mut().for_each(|r| r.push(&p));
                 write.push(p);
             }
         }
