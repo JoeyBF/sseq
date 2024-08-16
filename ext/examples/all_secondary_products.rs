@@ -45,47 +45,47 @@ fn main() -> anyhow::Result<()> {
 
     let res_lift = Arc::new(SecondaryResolution::new(Arc::clone(&resolution)));
 
-    let compute_nth_stem = |n| {
-    let unit_lift = if is_unit {
-        Arc::clone(&res_lift)
-    } else {
-            Arc::new(SecondaryResolution::new(Arc::clone(&unit)))
-    };
-
-    // Compute E3 page
-    let res_sseq = Arc::new(res_lift.e3_page());
-    let unit_sseq = if is_unit {
-        Arc::clone(&res_sseq)
-    } else {
-        Arc::new(unit_lift.e3_page())
-    };
-
-    let data = ProductComputationData {
-        p,
-        resolution: Arc::clone(&resolution),
-            unit: Arc::clone(&unit),
-        is_unit,
-            res_lift: Arc::clone(&res_lift),
-        unit_lift,
-        res_sseq,
-        unit_sseq,
-    };
-
-    let restrict_s = std::env::var("HOMOLOGICAL_DEGREE")
-        .ok()
-        .and_then(|s| str::parse::<u32>(&s).ok());
-
     let span = tracing::Span::current();
-    resolution
-        .iter_stem()
-        .skip(1)
+    let compute_nth_stem = |n| {
+        let unit_lift = if is_unit {
+            Arc::clone(&res_lift)
+        } else {
+            Arc::new(SecondaryResolution::new(Arc::clone(&unit)))
+        };
+
+        // Compute E3 page
+        let res_sseq = Arc::new(res_lift.e3_page());
+        let unit_sseq = if is_unit {
+            Arc::clone(&res_sseq)
+        } else {
+            Arc::new(unit_lift.e3_page())
+        };
+
+        let data = ProductComputationData {
+            p,
+            resolution: Arc::clone(&resolution),
+            unit: Arc::clone(&unit),
+            is_unit,
+            res_lift: Arc::clone(&res_lift),
+            unit_lift,
+            res_sseq,
+            unit_sseq,
+        };
+
+        let restrict_s = std::env::var("HOMOLOGICAL_DEGREE")
+            .ok()
+            .and_then(|s| str::parse::<u32>(&s).ok());
+
+        resolution
+            .iter_stem()
+            .skip(1)
             .filter(|b| b.n() == n && restrict_s.map_or(true, |s| b.s() == s))
-        .maybe_par_bridge()
-        .try_for_each(|b| -> anyhow::Result<()> {
-            let _tracing_guard = span.enter();
-            let dim = resolution.number_of_gens_in_bidegree(b);
+            .maybe_par_bridge()
+            .try_for_each(|b| -> anyhow::Result<()> {
+                let _tracing_guard = span.enter();
+                let dim = resolution.number_of_gens_in_bidegree(b);
                 (0..dim).maybe_par_bridge().try_for_each(|i| {
-                let g = BidegreeGenerator::new(b, i);
+                    let g = BidegreeGenerator::new(b, i);
                     compute_products(g, data.clone())
                 })
             })?;
@@ -191,9 +191,6 @@ fn compute_products(
     let name = hom_lift.name();
     // Iterate through the multiplicand
     for b in data.unit.iter_stem().skip(1) {
-        let b_span = tracing::info_span!("output", b = %b);
-        let _b_span_guard = b_span.enter();
-
         if (b.n(), b.s()) > (generator.n(), generator.s()) {
             // By symmetry, it's enough to compute products with cycles in degrees at most as large
             // as the generator (in the lexicographic order). The `iter_stem` iterator returns
@@ -235,6 +232,9 @@ fn compute_products(
         if target_num_gens == 0 && tau_num_gens == 0 {
             continue;
         }
+
+        let b_span = tracing::info_span!("output", b = %b);
+        let _b_span_guard = b_span.enter();
 
         // First print the products with non-surviving classes
         if target_num_gens > 0 {
