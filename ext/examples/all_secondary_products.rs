@@ -7,7 +7,7 @@ use ext::{
     chain_complex::{ChainComplex, FreeChainComplex},
     resolution_homomorphism::ResolutionHomomorphism,
     secondary::*,
-    utils::{query_module, QueryModuleResolution},
+    utils::QueryModuleResolution,
 };
 use fp::{matrix::Matrix, prime::ValidPrime, vector::FpVector};
 use itertools::Itertools;
@@ -32,23 +32,24 @@ struct ProductComputationData {
 fn main() -> anyhow::Result<()> {
     ext::utils::init_logging();
 
-    let resolution = Arc::new(query_module(Some(algebra::AlgebraType::Milnor), true)?);
-
+    let resolution = Arc::new(
+        ext::utils::query_module_only("Module", Some(algebra::AlgebraType::Milnor), true).unwrap(),
+    );
     let (is_unit, unit) = ext::utils::get_unit(Arc::clone(&resolution))?;
-
     let p = resolution.prime();
 
-    let res_lift = SecondaryResolution::new(Arc::clone(&resolution));
-    res_lift.extend_all();
+    let max = Bidegree::n_s(
+        query::with_default("Max n", "30", str::parse),
+        query::with_default("Max s", "7", str::parse),
+    );
 
-    let res_lift = Arc::new(res_lift);
+    let res_lift = Arc::new(SecondaryResolution::new(Arc::clone(&resolution)));
 
+    let compute_nth_stem = |n| {
     let unit_lift = if is_unit {
         Arc::clone(&res_lift)
     } else {
-        let lift = SecondaryResolution::new(Arc::clone(&unit));
-        lift.extend_all();
-        Arc::new(lift)
+            Arc::new(SecondaryResolution::new(Arc::clone(&unit)))
     };
 
     // Compute E3 page
@@ -62,9 +63,9 @@ fn main() -> anyhow::Result<()> {
     let data = ProductComputationData {
         p,
         resolution: Arc::clone(&resolution),
-        unit,
+            unit: Arc::clone(&unit),
         is_unit,
-        res_lift,
+            res_lift: Arc::clone(&res_lift),
         unit_lift,
         res_sseq,
         unit_sseq,
@@ -78,17 +79,34 @@ fn main() -> anyhow::Result<()> {
     resolution
         .iter_stem()
         .skip(1)
-        .filter(|b| restrict_s.map_or(true, |s| b.s() == s))
+            .filter(|b| b.n() == n && restrict_s.map_or(true, |s| b.s() == s))
         .maybe_par_bridge()
         .try_for_each(|b| -> anyhow::Result<()> {
             let _tracing_guard = span.enter();
             let dim = resolution.number_of_gens_in_bidegree(b);
-            for i in 0..dim {
+                (0..dim).maybe_par_bridge().try_for_each(|i| {
                 let g = BidegreeGenerator::new(b, i);
-                compute_products(g, data.clone())?;
-            }
-            Ok(())
-        })?;
+                    compute_products(g, data.clone())
+                })
+            })?;
+        anyhow::Ok(())
+    };
+
+    let half_max_stem = max.n() / 2;
+    for n in 0..half_max_stem {
+        let current_max = Bidegree::n_s(i32::min(2 * n + 1, max.n()), max.s());
+        resolution.compute_through_stem(current_max);
+        res_lift.extend_all();
+
+        compute_nth_stem(n)?;
+    }
+
+    // We can do the rest in parallel
+    resolution.compute_through_stem(max);
+    res_lift.extend_all();
+    (half_max_stem..=max.n())
+        .maybe_par_bridge()
+        .try_for_each(compute_nth_stem)?;
 
     Ok(())
 }
@@ -129,15 +147,16 @@ fn compute_products(
     matrix[generator.idx()].set_entry(0, 1);
 
     hom.extend_step(shift, Some(&matrix));
-    let extend_max = shift + generator.degree() + TAU_BIDEGREE;
+    // let extend_max = shift + generator.degree() + TAU_BIDEGREE;
     let res_max = Bidegree::n_s(
         data.resolution.module(0).max_computed_degree(),
         data.resolution.next_homological_degree() - 1,
     );
     // This is the maximum bidegree of the region containing the entire stem of `generator` and
     // everything to its left.
-    let extend_max = Bidegree::n_s(std::cmp::min(extend_max.n(), res_max.n()), res_max.s());
-    hom.extend_through_stem(extend_max);
+    // let extend_max = Bidegree::n_s(std::cmp::min(extend_max.n(), res_max.n()), res_max.s());
+    // hom.extend_through_stem(extend_max);
+    hom.extend_all();
 
     if !data.is_unit {
         data.unit.compute_through_stem(res_max - shift);
