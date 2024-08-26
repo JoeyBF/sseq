@@ -45,7 +45,7 @@ class DriverWrapper:
         # not have been sent out yet when we call wait_complete. Sleep for a
         # very small amount of time to ensure these callbacks have been
         # handled.
-        time.sleep(0.01)
+        time.sleep(0.1)
         WebDriverWait(self.driver, timeout).until(
             lambda driver: driver.execute_script(
                 "return window.display !== undefined && window.display.runningSign.style.display == 'none'"
