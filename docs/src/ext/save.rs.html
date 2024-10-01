@@ -503,18 +503,12 @@
 <a href="#478" id="478">478</a>
 <a href="#479" id="479">479</a>
 <a href="#480" id="480">480</a>
-<a href="#481" id="481">481</a>
-<a href="#482" id="482">482</a>
-<a href="#483" id="483">483</a>
-<a href="#484" id="484">484</a>
-<a href="#485" id="485">485</a>
-<a href="#486" id="486">486</a>
 </pre></div><pre class="rust"><code><span class="kw">use </span>std::{
     collections::HashSet,
     fs::File,
     io::{BufRead, BufReader, BufWriter, Error, ErrorKind, Read, Write},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{Arc, LazyLock, Mutex},
 };
 
 <span class="kw">use </span>algebra::Algebra;
@@ -578,31 +572,25 @@
 }
 
 <span class="doccomment">/// A DashSet&lt;PathBuf&gt;&gt; of files that are currently opened and being written to. When calling this
-/// function for the first time, we set the ctrlc handler to delete currently opened files, then
+/// function for the first time, we set the ctrlc handler to delete currently opened files then
 /// exit.
 </span><span class="kw">fn </span>open_files() -&gt; <span class="kw-2">&amp;</span><span class="lifetime">'static </span>Mutex&lt;HashSet&lt;PathBuf&gt;&gt; {
-    <span class="kw">use </span>std::{mem::MaybeUninit, sync::Once};
-
-    <span class="kw">static </span><span class="kw-2">mut </span>OPEN_FILES: MaybeUninit&lt;Mutex&lt;HashSet&lt;PathBuf&gt;&gt;&gt; = MaybeUninit::uninit();
-    <span class="kw">static </span>ONCE: Once = Once::new();
-    <span class="kw">unsafe </span>{
-        ONCE.call_once(|| {
-            OPEN_FILES.write(Default::default());
-            <span class="attr">#[cfg(unix)]
-            </span>ctrlc::set_handler(<span class="kw">move </span>|| {
-                <span class="macro">tracing::warn!</span>(<span class="string">"Ctrl-C detected. Deleting open files and exiting."</span>);
-                <span class="kw">let </span>files = open_files().lock().unwrap();
-                <span class="kw">for </span>file <span class="kw">in </span><span class="kw-2">&amp;*</span>files {
-                    std::fs::remove_file(file)
-                        .unwrap_or_else(|<span class="kw">_</span>| <span class="macro">panic!</span>(<span class="string">"Error when deleting {file:?}"</span>));
-                    <span class="macro">tracing::warn!</span>(<span class="string">"Deleted {}"</span>, file.to_string_lossy());
-                }
-                std::process::exit(<span class="number">130</span>);
-            })
-            .expect(<span class="string">"Error setting Ctrl-C handler"</span>);
-        });
-        OPEN_FILES.assume_init_ref()
-    }
+    <span class="kw">static </span>OPEN_FILES: LazyLock&lt;Mutex&lt;HashSet&lt;PathBuf&gt;&gt;&gt; = LazyLock::new(|| {
+        <span class="attr">#[cfg(unix)]
+        </span>ctrlc::set_handler(<span class="kw">move </span>|| {
+            <span class="macro">tracing::warn!</span>(<span class="string">"Ctrl-C detected. Deleting open files and exiting."</span>);
+            <span class="kw">let </span>files = open_files().lock().unwrap();
+            <span class="kw">for </span>file <span class="kw">in </span><span class="kw-2">&amp;*</span>files {
+                std::fs::remove_file(file)
+                    .unwrap_or_else(|<span class="kw">_</span>| <span class="macro">panic!</span>(<span class="string">"Error when deleting {file:?}"</span>));
+                <span class="macro">tracing::warn!</span>(<span class="string">"Deleted {}"</span>, file.to_string_lossy());
+            }
+            std::process::exit(<span class="number">130</span>);
+        })
+        .expect(<span class="string">"Error setting Ctrl-C handler"</span>);
+        Default::default()
+    });
+    <span class="kw-2">&amp;</span>OPEN_FILES
 }
 
 <span class="attr">#[derive(Debug, Copy, Clone, Eq, PartialEq)]
