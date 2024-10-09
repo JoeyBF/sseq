@@ -401,10 +401,6 @@ pub struct Resolution<M: ZeroModule<Algebra = MilnorAlgebra>> {
 }
 
 impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
-    pub fn prime(&self) -> ValidPrime {
-        TWO
-    }
-
     pub fn name(&self) -> &str {
         &self.name
     }
@@ -955,6 +951,10 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> ChainComplex for Resolution<M> {
     type Algebra = MilnorAlgebra;
     type Homomorphism = FreeModuleHomomorphism<FreeModule<Self::Algebra>>;
     type Module = FreeModule<Self::Algebra>;
+
+    fn prime(&self) -> ValidPrime {
+        TWO
+    }
 
     fn algebra(&self) -> Arc<Self::Algebra> {
         self.zero_module.algebra()
