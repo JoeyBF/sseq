@@ -68,7 +68,7 @@ fn main() -> anyhow::Result<()> {
             is_unit,
             res_lift: Arc::clone(&res_lift),
             unit_lift,
-            res_sseq,
+            res_sseq: Arc::clone(&res_sseq),
             unit_sseq,
         };
 
@@ -83,11 +83,14 @@ fn main() -> anyhow::Result<()> {
             .maybe_par_bridge()
             .try_for_each(|b| -> anyhow::Result<()> {
                 let _tracing_guard = span.enter();
-                let dim = resolution.number_of_gens_in_bidegree(b);
-                (0..dim).maybe_par_bridge().try_for_each(|i| {
-                    let g = BidegreeGenerator::new(b, i);
-                    compute_products(g, data.clone())
-                })
+                let element_vecs = get_page_data(&res_sseq, b);
+                element_vecs
+                    .subspace_gens()
+                    .maybe_par_bridge()
+                    .try_for_each(|v| {
+                        let elt = BidegreeElement::new(b, v.to_owned());
+                        compute_products(elt, data.clone())
+                    })
             })?;
         anyhow::Ok(())
     };
@@ -116,13 +119,10 @@ fn get_page_data(sseq: &sseq::Sseq<sseq::Adams>, b: Bidegree) -> &fp::matrix::Su
     &d[std::cmp::min(3, d.len() - 1)]
 }
 
-#[tracing::instrument(skip(data), fields(%generator))]
-fn compute_products(
-    generator: BidegreeGenerator,
-    data: ProductComputationData,
-) -> anyhow::Result<()> {
-    let name = format!("x_{}", generator);
-    let shift = generator.degree();
+#[tracing::instrument(skip(data), fields(%elt))]
+fn compute_products(elt: BidegreeElement, data: ProductComputationData) -> anyhow::Result<()> {
+    let name = format!("x_{}", elt);
+    let shift = elt.degree();
 
     if data.resolution.next_homological_degree() <= shift.s() + 2 {
         eprintln!("Adams filtration of {name} too large, skipping");
@@ -136,15 +136,12 @@ fn compute_products(
         shift,
     ));
 
-    let mut matrix = Matrix::new(data.p, hom.source.number_of_gens_in_bidegree(shift), 1);
-
-    if matrix.rows() == 0 || matrix.columns() == 0 {
-        panic!("No classes in this bidegree");
-    }
-
-    let mut v = vec![0; matrix.rows()];
-    v[generator.idx()] = 1;
-    matrix[generator.idx()].set_entry(0, 1);
+    let matrix = Matrix::from_row(
+        data.p,
+        elt.vec().to_owned(),
+        hom.source.number_of_gens_in_bidegree(shift),
+    )
+    .transpose();
 
     hom.extend_step(shift, Some(&matrix));
     // let extend_max = shift + generator.degree() + TAU_BIDEGREE;
@@ -162,24 +159,6 @@ fn compute_products(
         data.unit.compute_through_stem(res_max - shift);
     }
 
-    // Check that class survives to E3.
-    {
-        let m = data
-            .res_lift
-            .homotopy(shift.s() + 2)
-            .homotopies
-            .hom_k(shift.t());
-        assert_eq!(m.len(), v.len());
-        let mut sum = vec![0; m[0].len()];
-        for (x, d2) in v.iter().zip_eq(&m) {
-            sum.iter_mut().zip_eq(d2).for_each(|(a, b)| *a += x * b);
-        }
-        if sum.iter().any(|x| *x % data.p != 0) {
-            eprintln!("{name} supports a non-zero d2, skipping");
-            return Ok(());
-        }
-    }
-
     let hom_lift = SecondaryResolutionHomomorphism::new(
         Arc::clone(&data.res_lift),
         Arc::clone(&data.unit_lift),
@@ -191,7 +170,7 @@ fn compute_products(
     let name = hom_lift.name();
     // Iterate through the multiplicand
     for b in data.unit.iter_stem().skip(1) {
-        if (b.n(), b.s()) > (generator.n(), generator.s()) {
+        if (b.n(), b.s()) > (elt.n(), elt.s()) {
             // By symmetry, it's enough to compute products with cycles in degrees at most as large
             // as the generator (in the lexicographic order). The `iter_stem` iterator returns
             // bidegrees that are lexicographically increasing.
