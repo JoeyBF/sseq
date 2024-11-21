@@ -6,6 +6,11 @@ import { openSocket } from './socket.js';
 window.commandCounter = 0;
 window.commandQueue = [];
 
+/**
+ * @description Processes a queue of commands and sends them to either main or unit
+ * Sseq, depending on their type. It waits for all non-"Resolve" commands to be
+ * processed before sending a "BlockRefresh" command to Sseq.
+ */
 function processCommandQueue() {
     if (window.commandQueue.length == 0) return;
 
@@ -106,7 +111,11 @@ if (params.module || params.module_json) {
         .getElementsByTagName('section');
 
     sections.forEach(n => {
+        // Traverses nested HTML elements and updates specific tags.
+
         n.children[1].children.forEach(a => {
+            // Traverses and transforms HTML links.
+
             if (a.tagName == 'A') {
                 a.innerHTML = renderLaTeX(a.innerHTML);
                 a.href = `?module=${a.getAttribute('data')}&degree=40`;
@@ -123,6 +132,13 @@ window.send = msg => {
     window.sendSocket(msg);
 };
 
+/**
+ * @description Processes incoming messages by parsing JSON data and invoking
+ * corresponding handlers based on command types, either using `messageHandler` or
+ * `window.sseq` properties. It also logs errors and relevant data if processing fails.
+ * 
+ * @param {Event} e - The event object triggered by a message receipt.
+ */
 function onMessage(e) {
     const data = JSON.parse(e.data);
     try {
@@ -148,6 +164,14 @@ function onMessage(e) {
     }
 }
 
+/**
+ * @description Constructs a command history by concatenating and stringifying an
+ * array of objects, including the main sequence commands and additional unit sequence
+ * commands if applicable, separated by newline characters.
+ * 
+ * @returns {string} A newline-separated concatenation of JSON-serialized arrays
+ * containing objects with recipients, sseq, and action properties.
+ */
 function generateHistory() {
     const list = [window.constructCommand];
     list.push({
@@ -174,6 +198,11 @@ function generateHistory() {
     return list.concat(window.mainSseq.history).map(JSON.stringify).join('\n');
 }
 
+/**
+ * @description Prompts the user to enter a file name, generates a text representation
+ * of the history data using `generateHistory`, and then downloads it as a plain text
+ * file with the specified name.
+ */
 function save() {
     dialog(
         'Save history',
@@ -189,6 +218,13 @@ function save() {
 }
 window.save = save;
 
+/**
+ * @description Loads a history string into an array, removes empty lines and comments,
+ * parses the first two commands, and assigns them to global variables. It also
+ * populates a command queue with the remaining lines, which can be executed later.
+ * 
+ * @param {string} hist - History data loaded from file or socket connection.
+ */
 function loadHistory(hist) {
     const lines = hist.split('\n');
     // Do reverse loop because we are removing things from the array.
@@ -276,6 +312,8 @@ messageHandler.Error = m => {
 
 // Set up upload button
 document.getElementById('json-upload').addEventListener('change', () => {
+    // Handles changes to a JSON upload field.
+
     const file = document.getElementById('json-upload').files[0];
     const fileReader = new FileReader();
 
@@ -294,6 +332,8 @@ document.getElementById('json-upload').addEventListener('change', () => {
 });
 
 document.getElementById('history-upload').addEventListener('change', () => {
+    // Reads an uploaded file and hides a home page element.
+
     const file = document.getElementById('history-upload').files[0];
 
     const fileReader = new FileReader();
