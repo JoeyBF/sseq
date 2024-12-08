@@ -192,20 +192,41 @@ impl SaveKind {
     }
 }
 
-/// In addition to checking the checksum, we also keep track of which files are open, and we delete
-/// the open files if the program is terminated halfway.
+/// In addition to compressing, we also keep track of which files are open, and we delete the open
+/// files if the program is terminated halfway.
 pub struct ChecksumWriter<T: io::Write> {
-    writer: T,
     path: PathBuf,
-    adler: adler::Adler32,
+    writer: zstd::stream::AutoFinishEncoder<'static, T>,
 }
 
 impl<T: io::Write> ChecksumWriter<T> {
+    /// Create a new `ChecksumWriter` that writes to `writer`. The file is compressed using zstd.
+    ///
+    /// The zstd library maintains an internal buffer (currently 128 kB) that it uses for
+    /// compression. Therefore, unless we want a bigger buffer, it's not necessary to wrap `writer`
+    /// in a `BufWriter`.
     pub fn new(path: PathBuf, writer: T) -> Self {
+        // We use the environment variable EXT_ZSTD_LEVEL to set the compression level
+        let level = std::env::var("EXT_ZSTD_LEVEL")
+            .ok()
+            .and_then(|x| x.parse().ok())
+            .unwrap_or(0);
+
+        let mut zstd_writer = zstd::Encoder::new(writer, level).unwrap();
+        zstd_writer.include_checksum(true).unwrap();
+
+        #[cfg(feature = "concurrent")]
+        {
+            let zstd_threads = std::env::var("EXT_ZSTD_THREADS")
+                .ok()
+                .and_then(|x| x.parse().ok())
+                .unwrap_or(0);
+            zstd_writer.multithread(zstd_threads).unwrap();
+        }
+
         Self {
             path,
-            writer,
-            adler: adler::Adler32::new(),
+            writer: zstd_writer.auto_finish(),
         }
     }
 }
@@ -213,9 +234,7 @@ impl<T: io::Write> ChecksumWriter<T> {
 /// We only implement the functions required and the ones we actually use.
 impl<T: io::Write> io::Write for ChecksumWriter<T> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        let bytes_written = self.writer.write(buf)?;
-        self.adler.write_slice(&buf[0..bytes_written]);
-        Ok(bytes_written)
+        self.writer.write(buf)
     }
 
     fn flush(&mut self) -> io::Result<()> {
@@ -223,21 +242,18 @@ impl<T: io::Write> io::Write for ChecksumWriter<T> {
     }
 
     fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
-        self.writer.write_all(buf)?;
-        self.adler.write_slice(buf);
-        Ok(())
+        self.writer.write_all(buf)
     }
 }
 
 impl<T: io::Write> std::ops::Drop for ChecksumWriter<T> {
     fn drop(&mut self) {
+        use io::Write;
+
+        self.writer.flush().unwrap();
+
+        // Panic in panic is bad, so we avoid it
         if !std::thread::panicking() {
-            // We may not have finished writing, so the data is wrong. It should not be given a
-            // valid checksum
-            self.writer
-                .write_u32::<LittleEndian>(self.adler.checksum())
-                .unwrap();
-            self.writer.flush().unwrap();
             assert!(
                 open_files().lock().unwrap().remove(&self.path),
                 "File {:?} already dropped",
@@ -247,62 +263,37 @@ impl<T: io::Write> std::ops::Drop for ChecksumWriter<T> {
     }
 }
 
-pub struct ChecksumReader<T: io::Read> {
-    reader: T,
-    adler: adler::Adler32,
+pub struct ChecksumReader<T> {
+    reader: zstd::Decoder<'static, T>,
 }
 
-impl<T: io::Read> ChecksumReader<T> {
-    pub fn new(reader: T) -> Self {
-        Self {
-            reader,
-            adler: adler::Adler32::new(),
-        }
+impl<T: io::BufRead> ChecksumReader<T> {
+    pub fn new(reader: T) -> io::Result<Self> {
+        Ok(Self {
+            reader: zstd::Decoder::with_buffer(reader)?,
+        })
     }
 }
 
 /// We only implement the functions required and the ones we actually use.
-impl<T: io::Read> io::Read for ChecksumReader<T> {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let bytes_read = self.reader.read(buf)?;
-        self.adler.write_slice(&buf[0..bytes_read]);
-        Ok(bytes_read)
+impl<T: io::BufRead> io::Read for ChecksumReader<T> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.reader.read(buf)
     }
 
     fn read_exact(&mut self, buf: &mut [u8]) -> io::Result<()> {
-        self.reader.read_exact(buf)?;
-        self.adler.write_slice(buf);
-        Ok(())
+        self.reader.read_exact(buf)
     }
 }
 
-impl<T: io::Read> std::ops::Drop for ChecksumReader<T> {
-    fn drop(&mut self) {
-        if !std::thread::panicking() {
-            // If we are panicking, we may not have read everything, and panic in panic
-            // is bad.
-            assert_eq!(
-                self.adler.checksum(),
-                self.reader.read_u32::<LittleEndian>().unwrap(),
-                "Invalid file checksum"
-            );
-            let mut buf = [0];
-            // Check EOF
-            assert_eq!(self.reader.read(&mut buf).unwrap(), 0, "EOF not reached");
-        }
-    }
-}
-
-/// Open the file pointed to by `path` as a `Box<dyn Read>`. If the file does not exist, look for
-/// compressed versions.
+/// Open the file pointed to by `path` as a `Box<dyn Read>`.
 fn open_file(path: PathBuf) -> Option<Box<dyn io::Read>> {
     use io::BufRead;
 
-    // We should try in decreasing order of access speed.
     match File::open(&path) {
         Ok(f) => {
-            let mut reader = io::BufReader::new(f);
-            if reader
+            let mut buf_reader = io::BufReader::new(f);
+            if buf_reader
                 .fill_buf()
                 .unwrap_or_else(|e| panic!("Error when reading from {path:?}: {e}"))
                 .is_empty()
@@ -312,34 +303,13 @@ fn open_file(path: PathBuf) -> Option<Box<dyn io::Read>> {
                     .unwrap_or_else(|e| panic!("Error when deleting empty file {path:?}: {e}"));
                 return None;
             }
-            return Some(Box::new(ChecksumReader::new(reader)));
+            Some(Box::new(ChecksumReader::new(buf_reader).unwrap()))
         }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => None,
         Err(e) => {
-            if e.kind() != io::ErrorKind::NotFound {
-                panic!("Error when opening {path:?}: {e}");
-            }
+            panic!("Error when opening {path:?}: {e}");
         }
     }
-
-    #[cfg(feature = "zstd")]
-    {
-        let mut path = path;
-        path.set_extension("zst");
-        match File::open(&path) {
-            Ok(f) => {
-                return Some(Box::new(ChecksumReader::new(
-                    zstd::stream::Decoder::new(f).unwrap(),
-                )))
-            }
-            Err(e) => {
-                if e.kind() != io::ErrorKind::NotFound {
-                    panic!("Error when opening {path:?}");
-                }
-            }
-        }
-    }
-
-    None
 }
 
 pub struct SaveFile<A: Algebra> {
@@ -475,8 +445,64 @@ impl<A: Algebra> SaveFile<A> {
             .open(&p)
             .with_context(|| format!("Failed to create save file {p:?}"))
             .unwrap();
-        let mut f = ChecksumWriter::new(p, io::BufWriter::new(f));
+        let mut f = ChecksumWriter::new(p, f);
         self.write_header(&mut f).unwrap();
         f
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn checksum_roundtrip<F: FnOnce(&mut Vec<u8>)>(
+        tag: &str,
+        msg: &[u8],
+        intermezzo: F,
+    ) -> Vec<u8> {
+        use io::{Read, Write};
+
+        // We want each test to have a unique tag, because `open_files` handles a global table and
+        // we don't want tests to interfere with each other if they're run concurrently.
+        let path = PathBuf::from(tag);
+
+        let mut data = Vec::new();
+        open_files().lock().unwrap().insert(path.clone());
+
+        let mut writer = ChecksumWriter::new(path, &mut data);
+        writer.write_all(msg).unwrap();
+        drop(writer);
+
+        intermezzo(&mut data);
+
+        let mut reader = ChecksumReader::new(&data[..]).unwrap();
+        let mut buf = vec![0; msg.len()];
+        reader.read_exact(&mut buf).unwrap();
+        drop(reader);
+
+        buf
+    }
+
+    #[test]
+    fn test_checksum_valid() {
+        let msg = b"Hello, world!";
+
+        let buf = checksum_roundtrip("checksum_valid", msg, |_| {});
+
+        assert_eq!(buf, msg);
+    }
+
+    #[test]
+    #[should_panic(expected = "Restored data doesn't match checksum")]
+    fn test_checksum_invalid() {
+        let msg = b"Hello, world!";
+
+        // Dropping a reader with an invalid checksum should already panic
+        checksum_roundtrip("checksum_invalid", msg, |data| {
+            // Corrupt the data. The zstd header is at most 18 bytes long, so we modify data past
+            // that range. In practice, it's very unlikely that any file corruption will happen to
+            // affect the first few bytes of the file.
+            data[18] += 1;
+        });
     }
 }
