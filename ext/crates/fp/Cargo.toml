@@ -40,6 +40,6 @@ odd-primes = []
 # name = "criterion"
 # harness = false
 
-[[bench]]
-name = "smallfq"
-harness = false
+# [[bench]]
+# name = "smallfq"
+# harness = false
