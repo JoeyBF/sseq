@@ -555,7 +555,7 @@ where
             matrix.extend_column_dimension(columns + num_new_gens);
 
             for i in source_dimension..new_rows {
-                matrix.inner[i].set_entry(matrix.start[2] + i, 1);
+                matrix.inner.row_mut(i).set_entry(matrix.start[2] + i, 1);
             }
 
             // We are now supposed to row reduce the matrix. However, running the full row

@@ -9,18 +9,21 @@ pub mod prelude {
         fn into_maybe_par_iter(self) -> Self::Iter;
     }
 
-    pub trait MaybeIntoParallelRefMutIterator<'data> {
-        type Iter;
-
-        fn maybe_par_iter_mut(&'data mut self) -> Self::Iter;
-    }
-
     pub struct MaybeIterBridge<Iter>(Iter);
 
     pub trait MaybeParallelBridge: Sized {
         fn maybe_par_bridge(self) -> MaybeIterBridge<Self> {
             MaybeIterBridge(self)
         }
+    }
+
+    pub trait MaybeParallelSliceMut<T> {
+        fn maybe_par_chunks_mut<'data>(
+            &'data mut self,
+            chunk_size: usize,
+        ) -> impl MaybeIndexedParallelIterator<Item = &'data mut [T]>
+        where
+            T: 'data;
     }
 
     // Implementations
@@ -37,17 +40,6 @@ pub mod prelude {
         }
     }
 
-    impl<'data, I: 'data + ?Sized> MaybeIntoParallelRefMutIterator<'data> for I
-    where
-        &'data mut I: IntoIterator,
-    {
-        type Iter = <&'data mut I as IntoIterator>::IntoIter;
-
-        fn maybe_par_iter_mut(&'data mut self) -> Self::Iter {
-            self.into_iter()
-        }
-    }
-
     impl<Iter: Iterator> Iterator for MaybeIterBridge<Iter> {
         type Item = Iter::Item;
 
@@ -57,6 +49,18 @@ pub mod prelude {
     }
 
     impl<T: Iterator> MaybeParallelBridge for T {}
+
+    impl<T> MaybeParallelSliceMut<T> for [T] {
+        fn maybe_par_chunks_mut<'data>(
+            &'data mut self,
+            chunk_size: usize,
+        ) -> impl MaybeIndexedParallelIterator<Item = &'data mut [T]>
+        where
+            T: 'data,
+        {
+            self.chunks_mut(chunk_size)
+        }
+    }
 }
 
 #[allow(dead_code)]
