@@ -29,8 +29,10 @@ dashmap = "4.0.0"
 itertools = { version = "0.10.0", default-features = false, features = [
     "use_alloc",
 ] }
+regex = "1"
 rustc-hash = "1.1.0"
 serde_json = { version = "1.0.0", features = ["preserve_order"] }
+tokio = { version = "1.43.0", features = ["full"] }
 tracing = "0.1.40"
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
 
