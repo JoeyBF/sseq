@@ -8,4 +8,3 @@ print("Listening for logs...")
 for message in pubsub.listen():
     if message["type"] == "message":
         print(message["data"].decode("utf-8"))
-

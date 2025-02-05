@@ -1,18 +1,14 @@
 import asyncio
+import datetime
 import os
-import sys
 import re
-from pathlib import Path
+import sys
 from compressor import compress_file_task  # Import Celery task
 
 LOG_FILE = sys.argv[1]  # Path to the log file
 
 LOG_PATTERN = re.compile(r"closing file=\"(.+)\"")
 
-def extract_file_path(line):
-    """Extracts the file path from a log line if it matches the pattern."""
-    match = LOG_PATTERN.search(line)
-    return match.group(1) if match else None
 
 async def main():
     fd = os.open(LOG_FILE, os.O_RDONLY | os.O_NONBLOCK)
@@ -23,11 +19,11 @@ async def main():
             if not line:
                 await asyncio.sleep(0.1)
                 continue
-            file_path = extract_file_path(line)
-            if file_path:
+            file_paths = LOG_PATTERN.findall(line)
+            for file_path in file_paths:
                 print(f"Dispatching {file_path} to Celery")
                 compress_file_task.delay(file_path)  # Send task to Celery
 
+
 if __name__ == "__main__":
     asyncio.run(main())
-
