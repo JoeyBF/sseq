@@ -73,6 +73,15 @@ impl<'scope> Scope<'scope> {
 
 pub struct MaybeThreadPool;
 
+impl MaybeThreadPool {
+    pub fn in_place_scope<'scope, OP, R>(&self, op: OP) -> R
+    where
+        OP: FnOnce(&Scope<'scope>) -> R,
+    {
+        op(&Scope(&()))
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct MaybeThreadPoolBuilder;
 
@@ -92,6 +101,10 @@ impl MaybeThreadPool {
 impl MaybeThreadPoolBuilder {
     pub fn new() -> Self {
         Self
+    }
+
+    pub fn num_threads(self, _num_threads: usize) -> Self {
+        self
     }
 
     pub fn full_blocking(self) -> Self {

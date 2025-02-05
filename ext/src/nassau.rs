@@ -886,7 +886,22 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
         self.algebra().compute_basis(max.t());
 
         let tracing_span = tracing::Span::current();
-        maybe_rayon::in_place_scope(|scope| {
+
+        let num_threads = std::env::var("NASSAU_NUM_THREADS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .or_else(|| {
+                std::thread::available_parallelism()
+                    .map(std::num::NonZeroUsize::get)
+                    .ok()
+            })
+            .unwrap_or(1);
+        let nassau_threadpool = maybe_rayon::MaybeThreadPoolBuilder::new()
+            .num_threads(num_threads)
+            .build()
+            .unwrap();
+
+        nassau_threadpool.in_place_scope(|scope| {
             let _tracing_guard = tracing_span.enter();
 
             // This algorithm is not optimal, as we compute (s, t) only after computing (s - 1, t)

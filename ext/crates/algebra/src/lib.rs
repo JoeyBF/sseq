@@ -22,7 +22,17 @@ pub use crate::algebra::*;
 /// be concurrent. Using this pool ensures that threads only steal work from each other and not from
 /// the global pool. Not enforcing this could lead to priority inversions, causing deadlocks.
 static MAYBE_THREADPOOL: Lazy<MaybeThreadPool> = Lazy::new(|| {
+    let num_threads = std::env::var("ALGEBRA_NUM_THREADS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .or_else(|| {
+            std::thread::available_parallelism()
+                .map(std::num::NonZeroUsize::get)
+                .ok()
+        })
+        .unwrap_or(1);
     maybe_rayon::MaybeThreadPoolBuilder::new()
+        .num_threads(num_threads)
         .full_blocking()
         .build()
         .unwrap()
