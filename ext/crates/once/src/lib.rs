@@ -17,6 +17,16 @@ use std::{
 
 use maybe_rayon::prelude::*;
 
+pub mod kdtrie;
+
+mod std_or_loom {
+    #[cfg(not(all(feature = "loom", test)))]
+    pub(crate) use std::*;
+
+    #[cfg(all(feature = "loom", test))]
+    pub(crate) use loom::*;
+}
+
 const USIZE_LEN: u32 = 0usize.count_zeros();
 
 /// The maximum length of a OnceVec is 2^{MAX_OUTER_LENGTH} - 1. The performance cost of increasing

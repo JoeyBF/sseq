@@ -14,10 +14,12 @@ maybe-rayon = { path = "../maybe-rayon" }
 
 [dev-dependencies]
 criterion = "0.3"
+loom = { version = "0.7.2", features = ["checkpoint"] }
 
 [features]
 default = []
 concurrent = ["maybe-rayon/concurrent"]
+loom = []
 
 [[bench]]
 name = "criterion"
