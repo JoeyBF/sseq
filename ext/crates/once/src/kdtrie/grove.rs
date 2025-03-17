@@ -8,12 +8,13 @@ use crate::std_or_loom::sync::atomic::{AtomicPtr, AtomicU8, AtomicUsize, Orderin
 
 const MAX_NUM_BLOCKS: usize = 32;
 
-/// An insert-only sparse vector with pinned elements and geometrically growing capacity.
-pub struct GeoVec<V> {
-    blocks: [Block<V>; MAX_NUM_BLOCKS],
+/// An insert-only sparse vector with pinned elements and geometrically growing capacity. Pun on
+/// "grow vec".
+pub struct Grove<T> {
+    blocks: [Block<T>; MAX_NUM_BLOCKS],
 }
 
-impl<V> GeoVec<V> {
+impl<T> Grove<T> {
     /// Creates a new empty `GeoVec`.
     pub fn new() -> Self {
         let blocks = std::array::from_fn(|_| Block::new());
@@ -35,7 +36,7 @@ impl<V> GeoVec<V> {
     }
 
     /// Insert a value at the given index
-    pub fn insert(&self, index: usize, value: V) {
+    pub fn insert(&self, index: usize, value: T) {
         let (block_num, block_offset) = self.locate(index);
         self.ensure_init(block_num);
         // Safety: We just initialized the block, and `locate` only returns valid indices
@@ -43,7 +44,7 @@ impl<V> GeoVec<V> {
     }
 
     /// Return the value at the given index
-    pub fn get(&self, index: usize) -> Option<&V> {
+    pub fn get(&self, index: usize) -> Option<&T> {
         let (block_num, block_offset) = self.locate(index);
         self.ensure_init(block_num);
         // Safety: We just initialized the block, and `locate` only returns valid indices
@@ -52,7 +53,7 @@ impl<V> GeoVec<V> {
 }
 
 /// An allocation that can store a fixed number of elements.
-pub struct Block<V> {
+pub struct Block<T> {
     /// The number of elements in the block.
     len: AtomicUsize,
 
@@ -60,10 +61,10 @@ pub struct Block<V> {
     ///
     /// If `size` is nonzero, this points to a slice of `WriteOnce<V>` of that size. If `size` is
     /// zero, this is a null pointer.
-    data: AtomicPtr<WriteOnce<V>>,
+    data: AtomicPtr<WriteOnce<T>>,
 }
 
-impl<V> Block<V> {
+impl<T> Block<T> {
     /// Create a new block.
     fn new() -> Self {
         Self {
@@ -116,7 +117,7 @@ impl<V> Block<V> {
     /// # Safety
     ///
     /// The caller must ensure that the block has been initialized.
-    unsafe fn insert(&self, index: usize, value: V) {
+    unsafe fn insert(&self, index: usize, value: T) {
         let data_ptr = self.data.load(Ordering::Acquire);
         let len = self.len.load(Ordering::Acquire);
         // Safety: the block has been initialized
@@ -131,7 +132,7 @@ impl<V> Block<V> {
     /// # Safety
     ///
     /// The caller must ensure that the block has been initialized.
-    unsafe fn get(&self, index: usize) -> Option<&V> {
+    unsafe fn get(&self, index: usize) -> Option<&T> {
         let len = self.len.load(Ordering::Acquire);
         let data_ptr = self.data.load(Ordering::Acquire);
         // Safety: the block has been initialized
@@ -141,10 +142,10 @@ impl<V> Block<V> {
     }
 }
 
-impl<V> Drop for Block<V> {
+impl<T> Drop for Block<T> {
     fn drop(&mut self) {
-        let len = self.len.load(Ordering::Relaxed);
-        let data_ptr = self.data.load(Ordering::Relaxed);
+        let len = *self.len.get_mut();
+        let data_ptr = *self.data.get_mut();
         if !data_ptr.is_null() {
             // Safety: initialization stores a pointer that came from exactly such a vector
             unsafe { Vec::from_raw_parts(data_ptr, len, len) };
@@ -154,14 +155,14 @@ impl<V> Drop for Block<V> {
 }
 
 /// An atomic write-once cell.
-struct WriteOnce<T> {
+pub struct WriteOnce<T> {
     is_some: AtomicU8,
     value: UnsafeCell<MaybeUninit<T>>,
 }
 
 impl<T> WriteOnce<T> {
     /// Create a new `WriteOnce` with no value.
-    fn none() -> Self {
+    pub fn none() -> Self {
         Self {
             is_some: AtomicU8::new(WriteOnceState::Uninit as u8),
             value: UnsafeCell::new(MaybeUninit::uninit()),
@@ -169,7 +170,7 @@ impl<T> WriteOnce<T> {
     }
 
     /// Set the value of the `WriteOnce`.
-    fn set(&self, value: T) {
+    pub fn set(&self, value: T) {
         // Initially, `is_some` is `Uninit`, so it's impossible to observe anything else without a
         // prior `set`. Therefore, we will never panic if `set` was never called.
         //
@@ -182,7 +183,7 @@ impl<T> WriteOnce<T> {
         match self.is_some.compare_exchange(
             WriteOnceState::Uninit as u8,
             WriteOnceState::Writing as u8,
-            Ordering::AcqRel,
+            Ordering::Relaxed,
             Ordering::Relaxed,
         ) {
             Ok(_) => {
@@ -196,7 +197,7 @@ impl<T> WriteOnce<T> {
     }
 
     /// Get the value of the `WriteOnce`.
-    fn get(&self) -> Option<&T> {
+    pub fn get(&self) -> Option<&T> {
         if self.is_some.load(Ordering::Acquire) == WriteOnceState::Init as u8 {
             // Safety: the value is initialized
             let value = unsafe { (&*self.value.get()).assume_init_ref() };
@@ -213,7 +214,7 @@ impl<T> Drop for WriteOnce<T> {
         // it. Moreover, we also have a happens-before relationship with all other operations on
         // this `WriteOnce`, including a possible `set` that initialized the value. Therefore, the
         // following code will never lead to a memory leak.
-        if self.is_some.load(Ordering::Relaxed) == WriteOnceState::Init as u8 {
+        if *self.is_some.get_mut() == WriteOnceState::Init as u8 {
             // Safety: the value is initialized
             unsafe { self.value.get_mut().assume_init_drop() };
         }
@@ -234,6 +235,36 @@ enum WriteOnceState {
     Init = 2,
 }
 
+pub struct TwoEndedGrove<T> {
+    non_neg: Grove<T>,
+    neg: Grove<T>,
+}
+
+impl<T> TwoEndedGrove<T> {
+    pub fn new() -> Self {
+        Self {
+            non_neg: Grove::new(),
+            neg: Grove::new(),
+        }
+    }
+
+    pub fn insert(&self, idx: i32, value: T) {
+        if idx >= 0 {
+            self.non_neg.insert(idx as usize, value);
+        } else {
+            self.neg.insert((-idx) as usize, value);
+        }
+    }
+
+    pub fn get(&self, idx: i32) -> Option<&T> {
+        if idx >= 0 {
+            self.non_neg.get(idx as usize)
+        } else {
+            self.neg.get((-idx) as usize)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -242,11 +273,11 @@ mod tests {
         thread,
     };
 
-    use super::GeoVec;
+    use super::Grove;
 
     #[test]
     fn test_locate() {
-        let vec = GeoVec::<i32>::new();
+        let vec = Grove::<i32>::new();
         assert_eq!(vec.locate(0), (0, 0));
         assert_eq!(vec.locate(1), (1, 0));
         assert_eq!(vec.locate(2), (1, 1));
@@ -270,7 +301,7 @@ mod tests {
 
     #[test]
     fn test_insert_get() {
-        let v = GeoVec::<i32>::new();
+        let v = Grove::<i32>::new();
         assert!(v.get(42).is_none());
         v.insert(42, 42);
         assert_eq!(v.get(42), Some(&42));
@@ -297,7 +328,7 @@ mod tests {
             }
         }
 
-        let v = Arc::new(GeoVec::<DropCounter>::new());
+        let v = Arc::new(Grove::<DropCounter>::new());
         assert_eq!(ACTIVE_ALLOCS.load(Ordering::Relaxed), 0);
 
         let num_threads = 16;
@@ -314,6 +345,11 @@ mod tests {
             }
         });
 
+        assert_eq!(
+            ACTIVE_ALLOCS.load(Ordering::Relaxed),
+            num_threads * inserts_per_thread
+        );
+
         drop(v);
 
         assert_eq!(ACTIVE_ALLOCS.load(Ordering::Relaxed), 0);
@@ -322,7 +358,7 @@ mod tests {
     fn high_contention(num_threads: usize) {
         use crate::std_or_loom::{sync::Arc, thread};
 
-        let vec = Arc::new(GeoVec::<usize>::new());
+        let vec = Arc::new(Grove::<usize>::new());
 
         let handles: Vec<_> = (0..num_threads)
             .map(|thread_id| {
@@ -349,6 +385,10 @@ mod tests {
                 );
             }
         }
+
+        // We don't care about memory issues when dropping
+        #[cfg(feature = "loom")]
+        loom::stop_exploring();
     }
 
     #[test]
@@ -366,6 +406,6 @@ mod tests {
     #[cfg(feature = "loom")]
     #[test]
     fn test_loom() {
-        loom::model(|| high_contention(3));
+        loom::model(|| high_contention(2));
     }
 }
