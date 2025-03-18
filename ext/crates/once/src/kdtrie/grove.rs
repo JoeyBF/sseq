@@ -4,7 +4,7 @@ use std::{
     num::NonZero,
 };
 
-use crate::std_or_loom::sync::atomic::{AtomicPtr, AtomicU8, AtomicUsize, Ordering};
+use crate::std_or_loom::sync::atomic::{AtomicI32, AtomicPtr, AtomicU8, AtomicUsize, Ordering};
 
 const MAX_NUM_BLOCKS: usize = 32;
 
@@ -12,13 +12,21 @@ const MAX_NUM_BLOCKS: usize = 32;
 /// "grow vec".
 pub struct Grove<T> {
     blocks: [Block<T>; MAX_NUM_BLOCKS],
+    /// The maximum index that has been inserted into the `GeoVec`.
+    ///
+    /// We actually store the maximum index plus one, so that we can use zero as a sentinel value
+    /// for "empty".
+    max: AtomicUsize,
 }
 
 impl<T> Grove<T> {
     /// Creates a new empty `GeoVec`.
     pub fn new() -> Self {
         let blocks = std::array::from_fn(|_| Block::new());
-        Self { blocks }
+        Self {
+            blocks,
+            max: AtomicUsize::new(0),
+        }
     }
 
     /// Find the block and offset within the block for index `index`.
@@ -41,6 +49,7 @@ impl<T> Grove<T> {
         self.ensure_init(block_num);
         // Safety: We just initialized the block, and `locate` only returns valid indices
         unsafe { self.blocks[block_num].insert(block_offset, value) };
+        self.max.fetch_max(index + 1, Ordering::Release);
     }
 
     /// Return the value at the given index
@@ -49,6 +58,23 @@ impl<T> Grove<T> {
         self.ensure_init(block_num);
         // Safety: We just initialized the block, and `locate` only returns valid indices
         unsafe { self.blocks[block_num].get(block_offset) }
+    }
+
+    /// Return a mutable reference to the value at the given index
+    pub fn get_mut(&mut self, index: usize) -> Option<&mut T> {
+        let (block_num, block_offset) = self.locate(index);
+        self.ensure_init(block_num);
+        self.blocks[block_num].get_mut(block_offset)
+    }
+
+    pub fn is_set(&self, index: usize) -> bool {
+        let (block_num, block_offset) = self.locate(index);
+        self.ensure_init(block_num);
+        self.blocks[block_num].is_set(block_offset)
+    }
+
+    pub fn len(&self) -> Option<usize> {
+        self.max.load(Ordering::Acquire).checked_sub(1)
     }
 }
 
@@ -123,7 +149,7 @@ impl<T> Block<T> {
         // Safety: the block has been initialized
         assert!(len > 0);
         assert!(!data_ptr.is_null());
-        let data = unsafe { std::slice::from_raw_parts_mut(data_ptr, len) };
+        let data = unsafe { std::slice::from_raw_parts(data_ptr, len) };
         data[index].set(value);
     }
 
@@ -136,9 +162,35 @@ impl<T> Block<T> {
         let len = self.len.load(Ordering::Acquire);
         let data_ptr = self.data.load(Ordering::Acquire);
         // Safety: the block has been initialized
-        let data = std::slice::from_raw_parts_mut(data_ptr, len);
+        let data = unsafe { std::slice::from_raw_parts(data_ptr, len) };
         // Safety: the index is within the allocation
         data.get(index).and_then(|w| w.get())
+    }
+
+    /// Return a mutable reference to the value at the given index.
+    ///
+    /// This is safe because we hold an exclusive reference.
+    fn get_mut(&mut self, index: usize) -> Option<&mut T> {
+        let len = *self.len.get_mut();
+        let data_ptr = *self.data.get_mut();
+        // Safety: the block has been initialized
+        let data = unsafe { std::slice::from_raw_parts_mut(data_ptr, len) };
+        // Safety: the index is within the allocation
+        data.get_mut(index).and_then(|w| w.get_mut())
+    }
+
+    /// Return the value at the given index.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that the block has been initialized.
+    fn is_set(&self, index: usize) -> bool {
+        let len = self.len.load(Ordering::Acquire);
+        let data_ptr = self.data.load(Ordering::Acquire);
+        // Safety: the block has been initialized
+        let data = unsafe { std::slice::from_raw_parts(data_ptr, len) };
+        // Safety: the index is within the allocation
+        data.get(index).map_or(false, |w| w.is_set())
     }
 }
 
@@ -198,10 +250,25 @@ impl<T> WriteOnce<T> {
 
     /// Get the value of the `WriteOnce`.
     pub fn get(&self) -> Option<&T> {
-        if self.is_some.load(Ordering::Acquire) == WriteOnceState::Init as u8 {
+        if self.is_set() {
             // Safety: the value is initialized
             let value = unsafe { (&*self.value.get()).assume_init_ref() };
             Some(&value)
+        } else {
+            None
+        }
+    }
+
+    pub fn is_set(&self) -> bool {
+        self.is_some.load(Ordering::Acquire) == WriteOnceState::Init as u8
+    }
+
+    /// Get a mutable reference to the value of the `WriteOnce`.
+    pub fn get_mut(&mut self) -> Option<&mut T> {
+        if *self.is_some.get_mut() == WriteOnceState::Init as u8 {
+            // Safety: the value is initialized
+            let value = unsafe { (&mut *self.value.get()).assume_init_mut() };
+            Some(value)
         } else {
             None
         }
@@ -238,6 +305,10 @@ enum WriteOnceState {
 pub struct TwoEndedGrove<T> {
     non_neg: Grove<T>,
     neg: Grove<T>,
+    /// The minimum index that has been inserted (inclusive)
+    min: AtomicI32,
+    /// The maximum index that has been inserted (inclusive)
+    max: AtomicI32,
 }
 
 impl<T> TwoEndedGrove<T> {
@@ -245,6 +316,8 @@ impl<T> TwoEndedGrove<T> {
         Self {
             non_neg: Grove::new(),
             neg: Grove::new(),
+            min: AtomicI32::new(i32::MAX),
+            max: AtomicI32::new(i32::MIN),
         }
     }
 
@@ -254,6 +327,8 @@ impl<T> TwoEndedGrove<T> {
         } else {
             self.neg.insert((-idx) as usize, value);
         }
+        self.min.fetch_min(idx, Ordering::Release);
+        self.max.fetch_max(idx, Ordering::Release);
     }
 
     pub fn get(&self, idx: i32) -> Option<&T> {
@@ -262,6 +337,55 @@ impl<T> TwoEndedGrove<T> {
         } else {
             self.neg.get((-idx) as usize)
         }
+    }
+
+    pub fn get_mut(&mut self, idx: i32) -> Option<&mut T> {
+        if idx >= 0 {
+            self.non_neg.get_mut(idx as usize)
+        } else {
+            self.neg.get_mut((-idx) as usize)
+        }
+    }
+
+    pub fn raw_min(&self) -> i32 {
+        self.min.load(Ordering::Acquire)
+    }
+
+    pub fn min(&self) -> Option<i32> {
+        let min = self.raw_min();
+        if min == i32::MAX {
+            None
+        } else {
+            Some(min)
+        }
+    }
+
+    pub fn raw_max(&self) -> i32 {
+        self.max.load(Ordering::Acquire)
+    }
+
+    pub fn max(&self) -> Option<i32> {
+        let max = self.raw_max();
+        if max == i32::MIN {
+            None
+        } else {
+            Some(max)
+        }
+    }
+
+    pub fn is_set(&self, idx: i32) -> bool {
+        if idx >= 0 {
+            self.non_neg.is_set(idx as usize)
+        } else {
+            self.neg.is_set((-idx) as usize)
+        }
+    }
+
+    pub fn iter_range(&self) -> impl Iterator<Item = i32> {
+        (self.raw_min()..=self.raw_max())
+            .filter(move |idx| self.is_set(*idx))
+            .collect::<Vec<_>>() // Collect to Vec to avoid borrowing `self` in the iterator
+            .into_iter()
     }
 }
 
