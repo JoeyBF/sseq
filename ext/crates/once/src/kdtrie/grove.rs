@@ -1,10 +1,7 @@
-use std::{
-    cell::UnsafeCell,
-    mem::{ManuallyDrop, MaybeUninit},
-    num::NonZero,
-};
+use std::num::NonZero;
 
-use crate::std_or_loom::sync::atomic::{AtomicI32, AtomicPtr, AtomicU8, AtomicUsize, Ordering};
+use super::block::Block;
+use crate::std_or_loom::sync::atomic::{AtomicUsize, Ordering};
 
 const MAX_NUM_BLOCKS: usize = 32;
 
@@ -12,7 +9,7 @@ const MAX_NUM_BLOCKS: usize = 32;
 /// "grow vec".
 pub struct Grove<T> {
     blocks: [Block<T>; MAX_NUM_BLOCKS],
-    /// The maximum index that has been inserted into the `GeoVec`.
+    /// The maximum index that has been inserted into the `Grove`.
     ///
     /// We actually store the maximum index plus one, so that we can use zero as a sentinel value
     /// for "empty".
@@ -73,242 +70,22 @@ impl<T> Grove<T> {
         self.blocks[block_num].is_set(block_offset)
     }
 
-    pub fn len(&self) -> Option<usize> {
-        self.max.load(Ordering::Acquire).checked_sub(1)
-    }
+    // pub fn len(&self) -> Option<usize> {
+    //     self.max.load(Ordering::Acquire).checked_sub(1)
+    // }
 }
 
-/// An allocation that can store a fixed number of elements.
-pub struct Block<T> {
-    /// The number of elements in the block.
-    len: AtomicUsize,
+// We implement the derives manually to avoid the bounds on `T`
 
-    /// A pointer to the data buffer.
-    ///
-    /// If `size` is nonzero, this points to a slice of `WriteOnce<V>` of that size. If `size` is
-    /// zero, this is a null pointer.
-    data: AtomicPtr<WriteOnce<T>>,
-}
-
-impl<T> Block<T> {
-    /// Create a new block.
-    fn new() -> Self {
-        Self {
-            len: AtomicUsize::new(0),
-            data: AtomicPtr::new(std::ptr::null_mut()),
-        }
+impl<T> Default for Grove<T> {
+    fn default() -> Self {
+        Self::new()
     }
-
-    /// Initialize the block with a given size.
-    ///
-    /// # Safety
-    ///
-    /// For any given block, this method must always be called with the same size.
-    unsafe fn init(&self, size: NonZero<usize>) {
-        if self.data.load(Ordering::Acquire).is_null() {
-            // We need to initialize the block
-            let mut data_buffer = ManuallyDrop::new(Vec::with_capacity(size.get()));
-            for _ in 0..size.get() {
-                data_buffer.push(WriteOnce::none());
-            }
-            let data_ptr = data_buffer.as_mut_ptr();
-
-            // We can use `Relaxed` here because we will release-store the data pointer, and so any
-            // aquire-load of the data pointer will also see the instructions before it, in
-            // particular this store.
-            self.len.store(size.get(), Ordering::Relaxed);
-
-            // `Release` means that any thread that sees the data pointer will also see the size. We
-            // can use `Relaxed` for the failure case because we don't need to synchronize with any
-            // other atomic operation.
-            if self
-                .data
-                .compare_exchange(
-                    std::ptr::null_mut(),
-                    data_ptr,
-                    Ordering::Release,
-                    Ordering::Relaxed,
-                )
-                .is_err()
-            {
-                // Another thread initialized the block before us
-                // Safety: the block has been initialized
-                unsafe { ManuallyDrop::drop(&mut data_buffer) };
-            }
-        }
-    }
-
-    /// Insert a value at the given index.
-    ///
-    /// # Safety
-    ///
-    /// The caller must ensure that the block has been initialized.
-    unsafe fn insert(&self, index: usize, value: T) {
-        let data_ptr = self.data.load(Ordering::Acquire);
-        let len = self.len.load(Ordering::Acquire);
-        // Safety: the block has been initialized
-        assert!(len > 0);
-        assert!(!data_ptr.is_null());
-        let data = unsafe { std::slice::from_raw_parts(data_ptr, len) };
-        data[index].set(value);
-    }
-
-    /// Return the value at the given index.
-    ///
-    /// # Safety
-    ///
-    /// The caller must ensure that the block has been initialized.
-    unsafe fn get(&self, index: usize) -> Option<&T> {
-        let len = self.len.load(Ordering::Acquire);
-        let data_ptr = self.data.load(Ordering::Acquire);
-        // Safety: the block has been initialized
-        let data = unsafe { std::slice::from_raw_parts(data_ptr, len) };
-        // Safety: the index is within the allocation
-        data.get(index).and_then(|w| w.get())
-    }
-
-    /// Return a mutable reference to the value at the given index.
-    ///
-    /// This is safe because we hold an exclusive reference.
-    fn get_mut(&mut self, index: usize) -> Option<&mut T> {
-        let len = *self.len.get_mut();
-        let data_ptr = *self.data.get_mut();
-        // Safety: the block has been initialized
-        let data = unsafe { std::slice::from_raw_parts_mut(data_ptr, len) };
-        // Safety: the index is within the allocation
-        data.get_mut(index).and_then(|w| w.get_mut())
-    }
-
-    /// Return the value at the given index.
-    ///
-    /// # Safety
-    ///
-    /// The caller must ensure that the block has been initialized.
-    fn is_set(&self, index: usize) -> bool {
-        let len = self.len.load(Ordering::Acquire);
-        let data_ptr = self.data.load(Ordering::Acquire);
-        // Safety: the block has been initialized
-        let data = unsafe { std::slice::from_raw_parts(data_ptr, len) };
-        // Safety: the index is within the allocation
-        data.get(index).map_or(false, |w| w.is_set())
-    }
-}
-
-impl<T> Drop for Block<T> {
-    fn drop(&mut self) {
-        let len = *self.len.get_mut();
-        let data_ptr = *self.data.get_mut();
-        if !data_ptr.is_null() {
-            // Safety: initialization stores a pointer that came from exactly such a vector
-            unsafe { Vec::from_raw_parts(data_ptr, len, len) };
-            // vector is dropped here
-        }
-    }
-}
-
-/// An atomic write-once cell.
-pub struct WriteOnce<T> {
-    is_some: AtomicU8,
-    value: UnsafeCell<MaybeUninit<T>>,
-}
-
-impl<T> WriteOnce<T> {
-    /// Create a new `WriteOnce` with no value.
-    pub fn none() -> Self {
-        Self {
-            is_some: AtomicU8::new(WriteOnceState::Uninit as u8),
-            value: UnsafeCell::new(MaybeUninit::uninit()),
-        }
-    }
-
-    /// Set the value of the `WriteOnce`.
-    pub fn set(&self, value: T) {
-        // Initially, `is_some` is `Uninit`, so it's impossible to observe anything else without a
-        // prior `set`. Therefore, we will never panic if `set` was never called.
-        //
-        // However, we have no guarantee of observing `Init` if some other thread recently called
-        // `set`. If so, the `Ok` branch will silently replace the value. This may be confusing if,
-        // between the `compare_exchange` and the `write`, some other thread calls `get` and
-        // receives a reference. The reference will not be dangling, but will instead point to the
-        // value we just wrote. This is fine because the reference points to the contents of an
-        // `UnsafeCell`, which explicitly allows mutation through shared references.
-        match self.is_some.compare_exchange(
-            WriteOnceState::Uninit as u8,
-            WriteOnceState::Writing as u8,
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-        ) {
-            Ok(_) => {
-                unsafe { self.value.get().write(MaybeUninit::new(value)) }
-                // This store creates a happens-before relationship with the load in `get`
-                self.is_some
-                    .store(WriteOnceState::Init as u8, Ordering::Release);
-            }
-            Err(_) => panic!("WriteOnce already set"),
-        }
-    }
-
-    /// Get the value of the `WriteOnce`.
-    pub fn get(&self) -> Option<&T> {
-        if self.is_set() {
-            // Safety: the value is initialized
-            let value = unsafe { (&*self.value.get()).assume_init_ref() };
-            Some(&value)
-        } else {
-            None
-        }
-    }
-
-    pub fn is_set(&self) -> bool {
-        self.is_some.load(Ordering::Acquire) == WriteOnceState::Init as u8
-    }
-
-    /// Get a mutable reference to the value of the `WriteOnce`.
-    pub fn get_mut(&mut self) -> Option<&mut T> {
-        if *self.is_some.get_mut() == WriteOnceState::Init as u8 {
-            // Safety: the value is initialized
-            let value = unsafe { (&mut *self.value.get()).assume_init_mut() };
-            Some(value)
-        } else {
-            None
-        }
-    }
-}
-
-impl<T> Drop for WriteOnce<T> {
-    fn drop(&mut self) {
-        // We have an exclusive reference to `self`, so we know that no other thread is accessing
-        // it. Moreover, we also have a happens-before relationship with all other operations on
-        // this `WriteOnce`, including a possible `set` that initialized the value. Therefore, the
-        // following code will never lead to a memory leak.
-        if *self.is_some.get_mut() == WriteOnceState::Init as u8 {
-            // Safety: the value is initialized
-            unsafe { self.value.get_mut().assume_init_drop() };
-        }
-    }
-}
-
-/// The possible states of a `WriteOnce`.
-///
-/// We distinguish between `Uninit` and `Writing` so that we reach the `Err` branch of `set` if
-/// `set` has been called by any thread before.
-///
-/// We distinguish between `Writing` and `Init` so that loading `Init` has a happens-before
-/// relationship with the write in `set`.
-#[repr(u8)]
-enum WriteOnceState {
-    Uninit = 0,
-    Writing = 1,
-    Init = 2,
 }
 
 pub struct TwoEndedGrove<T> {
     non_neg: Grove<T>,
     neg: Grove<T>,
-    /// The minimum index that has been inserted (inclusive)
-    min: AtomicI32,
-    /// The maximum index that has been inserted (inclusive)
-    max: AtomicI32,
 }
 
 impl<T> TwoEndedGrove<T> {
@@ -316,8 +93,6 @@ impl<T> TwoEndedGrove<T> {
         Self {
             non_neg: Grove::new(),
             neg: Grove::new(),
-            min: AtomicI32::new(i32::MAX),
-            max: AtomicI32::new(i32::MIN),
         }
     }
 
@@ -327,8 +102,6 @@ impl<T> TwoEndedGrove<T> {
         } else {
             self.neg.insert((-idx) as usize, value);
         }
-        self.min.fetch_min(idx, Ordering::Release);
-        self.max.fetch_max(idx, Ordering::Release);
     }
 
     pub fn get(&self, idx: i32) -> Option<&T> {
@@ -347,30 +120,12 @@ impl<T> TwoEndedGrove<T> {
         }
     }
 
-    pub fn raw_min(&self) -> i32 {
-        self.min.load(Ordering::Acquire)
+    pub fn min(&self) -> i32 {
+        -(self.neg.max.load(Ordering::Acquire).saturating_sub(1) as i32)
     }
 
-    pub fn min(&self) -> Option<i32> {
-        let min = self.raw_min();
-        if min == i32::MAX {
-            None
-        } else {
-            Some(min)
-        }
-    }
-
-    pub fn raw_max(&self) -> i32 {
-        self.max.load(Ordering::Acquire)
-    }
-
-    pub fn max(&self) -> Option<i32> {
-        let max = self.raw_max();
-        if max == i32::MIN {
-            None
-        } else {
-            Some(max)
-        }
+    pub fn max(&self) -> i32 {
+        self.non_neg.max.load(Ordering::Acquire).saturating_sub(1) as i32
     }
 
     pub fn is_set(&self, idx: i32) -> bool {
@@ -382,7 +137,7 @@ impl<T> TwoEndedGrove<T> {
     }
 
     pub fn iter_range(&self) -> impl Iterator<Item = i32> {
-        (self.raw_min()..=self.raw_max())
+        (self.min()..=self.max())
             .filter(move |idx| self.is_set(*idx))
             .collect::<Vec<_>>() // Collect to Vec to avoid borrowing `self` in the iterator
             .into_iter()

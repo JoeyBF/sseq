@@ -6,24 +6,32 @@ use std::mem::ManuallyDrop;
 
 use grove::TwoEndedGrove;
 
+mod block;
 pub mod grove;
+mod write_once;
 
-// K=0:
-// Root=Leaf
-//
-// K=1:
-// Root=Inner -> Leaf
-//
-// K=2:
-// Root=Inner -> Inner -> Leaf
-// ...
+pub struct MultiGraded<const K: usize, V>(KdTrie<V>);
 
-pub struct ConcurrentNDArray<V> {
+impl<const K: usize, V> MultiGraded<K, V> {
+    pub fn new() -> Self {
+        Self(KdTrie::new(K))
+    }
+
+    pub fn insert(&self, coords: [i32; K], value: V) {
+        self.0.insert(&coords, value);
+    }
+
+    pub fn get(&self, coords: [i32; K]) -> Option<&V> {
+        self.0.get(&coords)
+    }
+}
+
+pub struct KdTrie<V> {
     root: Node<V>,
     dimensions: usize,
 }
 
-impl<V> ConcurrentNDArray<V> {
+impl<V> KdTrie<V> {
     pub fn new(dimensions: usize) -> Self {
         assert!(dimensions > 0);
 
@@ -65,7 +73,7 @@ impl<V> ConcurrentNDArray<V> {
     }
 }
 
-impl<V> Drop for ConcurrentNDArray<V> {
+impl<V> Drop for KdTrie<V> {
     fn drop(&mut self) {
         self.root.drop_level(self.dimensions, 0);
     }
@@ -152,7 +160,7 @@ mod tests {
 
     #[test]
     fn test_basic() {
-        let arr = ConcurrentNDArray::new(3);
+        let arr = KdTrie::new(3);
 
         arr.insert(&[1, 2, 3], 42);
         arr.insert(&[1, 2, 4], 43);
@@ -180,7 +188,7 @@ mod tests {
 
     #[test]
     fn test_large() {
-        let arr = ConcurrentNDArray::new(8);
+        let arr = KdTrie::new(8);
         for (idx, coord) in get_n_coords(10_000, [0, 0, 0, 0, 0, 0, 0, 0])
             .iter()
             .enumerate()
@@ -216,7 +224,7 @@ mod tests {
             }
         }
 
-        let v = Arc::new(ConcurrentNDArray::<DropCounter>::new(3));
+        let v = Arc::new(KdTrie::<DropCounter>::new(3));
         assert_eq!(ACTIVE_ALLOCS.load(Ordering::Relaxed), 0);
 
         let num_threads = 16;

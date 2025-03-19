@@ -17,6 +17,9 @@ use std::{
 
 use maybe_rayon::prelude::*;
 
+mod sparse_kvec;
+pub use sparse_kvec::{get_nth_diagonal, SparseKVec, SparseVec};
+
 pub mod kdtrie;
 
 mod std_or_loom {
@@ -165,6 +168,9 @@ pub const DATA_LAYOUT: Layout = {
 ///
 /// The other safety invariant we maintain is that we only write to pages when the lock has been
 /// taken.
+
+// pub struct OnceVec<T>(MultiGraded<1, T>);
+
 pub struct OnceVec<T> {
     len: AtomicUsize,
     /// [`BTreeSet`] of elements that have been added out of order. We also use this mutex to
