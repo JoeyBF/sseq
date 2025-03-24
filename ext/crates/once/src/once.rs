@@ -167,7 +167,7 @@ impl<T> OnceVec<T> {
     /// ```
     pub fn from_vec(vec: Vec<T>) -> Self {
         let data = Grove::from_vec(vec);
-        let len = data.len() as usize;
+        let len = data.len();
         Self {
             len: AtomicUsize::new(len),
             ooo: Mutex::new(OooTracker::default()),
@@ -936,7 +936,7 @@ mod tests {
 
     #[test]
     fn test_from_iterator() {
-        let data = vec![1, 2, 3, 4, 5];
+        let data = [1, 2, 3, 4, 5];
         let v: OnceVec<_> = data.iter().copied().collect();
 
         assert_eq!(v.len(), data.len());
@@ -1131,8 +1131,8 @@ mod tests {
         assert_eq!(iter.next(), None);
 
         // Check enumerated iterator
-        let expected_indices = vec![-3, -2, -1];
-        let expected_values = vec![10, 20, 30];
+        let expected_indices = [-3, -2, -1];
+        let expected_values = [10, 20, 30];
         let actual_pairs: Vec<_> = v.iter_enum().collect();
 
         for (i, (idx, val)) in actual_pairs.iter().enumerate() {

@@ -17,9 +17,6 @@ trait Benchable<const K: usize, T> {
 
     /// Get a value at the given coordinates if it exists and is within bounds
     fn get(&self, coords: [i32; K]) -> Option<&T>;
-
-    /// Get all values within a given range (inclusive)
-    fn range_query(&self, min: [i32; K], max: [i32; K]) -> Vec<&T>;
 }
 
 impl<T, const K: usize> Benchable<K, T> for MultiIndexed<K, T> {
@@ -38,23 +35,6 @@ impl<T, const K: usize> Benchable<K, T> for MultiIndexed<K, T> {
     fn get(&self, coords: [i32; K]) -> Option<&T> {
         self.get(coords)
     }
-
-    fn range_query(&self, min: [i32; K], max: [i32; K]) -> Vec<&T> {
-        todo!()
-
-        //     let mut result = Vec::new();
-        //     for i in min[0]..=max[0] {
-        //         for j in min[1]..=max[1] {
-        //             for k in min[2]..=max[2] {
-        //                 let coord = [i, j, k];
-        //                 if let Some(value) = self.get(coord) {
-        //                     result.push(value);
-        //                 }
-        //             }
-        //         }
-        //     }
-        //     result
-    }
 }
 
 impl<T> Benchable<1, T> for TwoEndedGrove<T> {
@@ -72,11 +52,6 @@ impl<T> Benchable<1, T> for TwoEndedGrove<T> {
 
     fn get(&self, coords: [i32; 1]) -> Option<&T> {
         self.get(coords[0])
-    }
-
-    fn range_query(&self, min: [i32; 1], max: [i32; 1]) -> Vec<&T> {
-        todo!()
-        // self.range(min[0], max[0]).map(|(_, v)| v).collect()
     }
 }
 
@@ -100,10 +75,6 @@ mod benchable_oncebivec {
 
         fn get(&self, coords: [i32; 1]) -> Option<&T> {
             self.get(coords[0])
-        }
-
-        fn range_query(&self, min: [i32; 1], max: [i32; 1]) -> Vec<&T> {
-            (min[0]..=max[0]).filter_map(|i| self.get(i)).collect()
         }
     }
 
@@ -144,20 +115,6 @@ mod benchable_oncebivec {
             } else {
                 None
             }
-        }
-
-        fn range_query(&self, min: [i32; 2], max: [i32; 2]) -> Vec<&T> {
-            let mut result = Vec::new();
-            for i in min[0]..=max[0] {
-                if let Some(inner) = self.get(i) {
-                    for j in min[1]..=max[1] {
-                        if let Some(value) = inner.get(j) {
-                            result.push(value);
-                        }
-                    }
-                }
-            }
-            result
         }
     }
 
@@ -215,24 +172,6 @@ mod benchable_oncebivec {
             } else {
                 None
             }
-        }
-
-        fn range_query(&self, min: [i32; 3], max: [i32; 3]) -> Vec<&T> {
-            let mut result = Vec::new();
-            for i in min[0]..=max[0] {
-                if let Some(middle) = self.get(i) {
-                    for j in min[1]..=max[1] {
-                        if let Some(inner) = middle.get(j) {
-                            for k in min[2]..=max[2] {
-                                if let Some(value) = inner.get(k) {
-                                    result.push(value);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            result
         }
     }
 
@@ -308,28 +247,6 @@ mod benchable_oncebivec {
             } else {
                 None
             }
-        }
-
-        fn range_query(&self, min: [i32; 4], max: [i32; 4]) -> Vec<&T> {
-            let mut result = Vec::new();
-            for i in min[0]..=max[0] {
-                if let Some(layer1) = self.get(i) {
-                    for j in min[1]..=max[1] {
-                        if let Some(layer2) = layer1.get(j) {
-                            for k in min[2]..=max[2] {
-                                if let Some(layer3) = layer2.get(k) {
-                                    for l in min[3]..=max[3] {
-                                        if let Some(value) = layer3.get(l) {
-                                            result.push(value);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            result
         }
     }
 
@@ -426,32 +343,6 @@ mod benchable_oncebivec {
             } else {
                 None
             }
-        }
-
-        fn range_query(&self, min: [i32; 5], max: [i32; 5]) -> Vec<&T> {
-            let mut result = Vec::new();
-            for i in min[0]..=max[0] {
-                if let Some(layer1) = self.get(i) {
-                    for j in min[1]..=max[1] {
-                        if let Some(layer2) = layer1.get(j) {
-                            for k in min[2]..=max[2] {
-                                if let Some(layer3) = layer2.get(k) {
-                                    for l in min[3]..=max[3] {
-                                        if let Some(layer4) = layer3.get(l) {
-                                            for m in min[4]..=max[4] {
-                                                if let Some(value) = layer4.get(m) {
-                                                    result.push(value);
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            result
         }
     }
 }
@@ -647,170 +538,11 @@ fn run_lookup_benchmarks<T>(c: &mut Criterion, make_value: &dyn Fn(usize) -> T) 
     g.finish();
 }
 
-// Helper functions to generate different types of ranges
-fn hypercube_range<const K: usize>(min: [i32; K], size: i32) -> ([i32; K], [i32; K]) {
-    let mut max = min;
-    for i in 0..K {
-        max[i] += size;
-    }
-    (min, max)
-}
-
-fn hyperplane_range<const K: usize>(
-    min: [i32; K],
-    fixed_dim: usize,
-    fixed_val: i32,
-    size: i32,
-) -> ([i32; K], [i32; K]) {
-    let mut range_min = min;
-    let mut range_max = min;
-    range_min[fixed_dim] = fixed_val;
-    range_max[fixed_dim] = fixed_val;
-    for i in 0..K {
-        if i != fixed_dim {
-            range_max[i] += size;
-        }
-    }
-    (range_min, range_max)
-}
-
-fn codim2_range<const K: usize>(
-    min: [i32; K],
-    fixed_dim1: usize,
-    fixed_val1: i32,
-    fixed_dim2: usize,
-    fixed_val2: i32,
-    size: i32,
-) -> ([i32; K], [i32; K]) {
-    let mut range_min = min;
-    let mut range_max = min;
-    range_min[fixed_dim1] = fixed_val1;
-    range_max[fixed_dim1] = fixed_val1;
-    range_min[fixed_dim2] = fixed_val2;
-    range_max[fixed_dim2] = fixed_val2;
-    for i in 0..K {
-        if i != fixed_dim1 && i != fixed_dim2 {
-            range_max[i] += size;
-        }
-    }
-    (range_min, range_max)
-}
-
-// Benchmark range queries for different dimensions and shapes
-fn bench_range_k<const K: usize, T, B: Benchable<K, T>>(
-    c: &mut BenchmarkGroup<'_, WallTime>,
-    min: [i32; K],
-    make_value: &dyn Fn(usize) -> T,
-) {
-    let vec = B::new(min);
-    let coords = get_n_coords(NUM_ELEMENTS, min);
-
-    // Insert data
-    for (i, coord) in coords.iter().enumerate() {
-        vec.push_checked(*coord, make_value(i));
-    }
-
-    // Test hypercubes of different sizes
-    for size in [2, 5, 10] {
-        let (range_min, range_max) = hypercube_range(min, size);
-        c.bench_function(&format!("{}_range_k{}_cube_{}", B::name(), K, size), |b| {
-            b.iter(|| {
-                black_box(vec.range_query(range_min, range_max));
-            })
-        });
-    }
-
-    // Test hyperplanes in different dimensions
-    if K > 1 {
-        for fixed_dim in 0..K {
-            let fixed_val = min[fixed_dim] + 5;
-            let (range_min, range_max) = hyperplane_range(min, fixed_dim, fixed_val, 10);
-            c.bench_function(
-                &format!("{}_range_k{}_plane_dim{}", B::name(), K, fixed_dim),
-                |b| {
-                    b.iter(|| {
-                        black_box(vec.range_query(range_min, range_max));
-                    })
-                },
-            );
-        }
-    }
-
-    // Test codimension 2 subspaces
-    if K > 2 {
-        for fixed_dim1 in 0..K {
-            for fixed_dim2 in (fixed_dim1 + 1)..K {
-                let fixed_val1 = min[fixed_dim1] + 5;
-                let fixed_val2 = min[fixed_dim2] + 5;
-                let (range_min, range_max) =
-                    codim2_range(min, fixed_dim1, fixed_val1, fixed_dim2, fixed_val2, 10);
-                c.bench_function(
-                    &format!(
-                        "{}_range_k{}_codim2_dim{}_{}",
-                        B::name(),
-                        K,
-                        fixed_dim1,
-                        fixed_dim2
-                    ),
-                    |b| {
-                        b.iter(|| {
-                            black_box(vec.range_query(range_min, range_max));
-                        })
-                    },
-                );
-            }
-        }
-    }
-}
-
-fn run_range_benchmark<const K: usize, T, B1: Benchable<K, T>, B2: Benchable<K, T>>(
-    c: &mut Criterion,
-    min: [i32; K],
-    make_value: &dyn Fn(usize) -> T,
-) {
-    let mut g = c.benchmark_group(format!("range_dim{K}"));
-    bench_range_k::<K, _, B1>(&mut g, min, make_value);
-    bench_range_k::<K, _, B2>(&mut g, min, make_value);
-    g.finish();
-}
-
-fn run_range_benchmarks<T>(c: &mut Criterion, make_value: &dyn Fn(usize) -> i32) {
-    // Dim 1
-    let mut g = c.benchmark_group("range_dim1");
-    bench_range_k::<1, _, OnceBiVec<_>>(&mut g, [0], make_value);
-    bench_range_k::<1, _, TwoEndedGrove<_>>(&mut g, [0], make_value);
-    bench_range_k::<1, _, MultiIndexed<1, _>>(&mut g, [0], make_value);
-    g.finish();
-
-    run_range_benchmark::<2, _, OnceBiVec<OnceBiVec<_>>, MultiIndexed<2, _>>(c, [0, 0], make_value);
-    run_range_benchmark::<3, _, OnceBiVec<OnceBiVec<OnceBiVec<_>>>, MultiIndexed<3, _>>(
-        c,
-        [0, 0, 0],
-        make_value,
-    );
-    run_range_benchmark::<4, _, OnceBiVec<OnceBiVec<OnceBiVec<OnceBiVec<_>>>>, MultiIndexed<4, _>>(
-        c,
-        [0, 0, 0, 0],
-        make_value,
-    );
-    run_range_benchmark::<
-        5,
-        _,
-        OnceBiVec<OnceBiVec<OnceBiVec<OnceBiVec<OnceBiVec<_>>>>>,
-        MultiIndexed<5, _>,
-    >(c, [0, 0, 0, 0, 0], make_value);
-
-    let mut g = c.benchmark_group("range_dim6");
-    bench_range_k::<6, _, MultiIndexed<6, _>>(&mut g, [0, 0, 0, 0, 0, 0], make_value);
-    g.finish();
-}
-
 fn run_benchmarks(c: &mut Criterion) {
-    // run_insert_benchmarks(c, &|i| i as i32);
-    // run_insert_benchmarks(c, &|i| [i; 1000]);
+    run_insert_benchmarks(c, &|i| i as i32);
+    run_insert_benchmarks(c, &|i| [i; 1000]);
     run_lookup_benchmarks(c, &|i| i as i32);
     run_lookup_benchmarks(c, &|i| [i; 1000]);
-    // run_range_benchmarks(c);
 }
 
 use pprof::criterion::{Output, PProfProfiler};

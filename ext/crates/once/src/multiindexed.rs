@@ -210,6 +210,12 @@ impl<const K: usize, V> MultiIndexed<K, V> {
     }
 }
 
+impl<const K: usize, V> Default for MultiIndexed<K, V> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// A K-dimensional trie data structure that efficiently stores values indexed by multi-dimensional
 /// coordinates.
 ///
@@ -562,6 +568,7 @@ impl<V> Node<V> {
 
 #[cfg(test)]
 mod tests {
+    #![cfg_attr(miri, allow(dead_code))]
     use std::collections::HashMap;
 
     use super::*;
@@ -767,9 +774,11 @@ mod tests {
                 match op {
                     Operation::Insert(coords, value) => {
                         // Only insert if the key doesn't exist yet (to avoid panics)
-                        if !reference.contains_key(&coords) {
+                        if let std::collections::hash_map::Entry::Vacant(e) =
+                            reference.entry(coords)
+                        {
                             arr.insert(coords, value);
-                            reference.insert(coords, value);
+                            e.insert(value);
                         } else {
                             // If the key already exists, test that try_insert returns an error
                             assert!(arr.try_insert(coords, value).is_err());

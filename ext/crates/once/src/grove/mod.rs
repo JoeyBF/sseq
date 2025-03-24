@@ -233,10 +233,16 @@ impl<T> Grove<T> {
         self.blocks[block_num].get_mut(block_offset)
     }
 
+    /// Retrieves a reference to the value at the specified index without checking that a value
+    /// exists.
+    ///
+    /// # Safety
+    ///
+    /// A value must have been previously inserted at the specified index.
     pub unsafe fn get_unchecked(&self, index: usize) -> &T {
         let (block_num, block_offset) = self.locate(index);
         let data_ptr = self.blocks[block_num].data().load(Ordering::Acquire);
-        (&*data_ptr.add(block_offset)).get_unchecked()
+        (*data_ptr.add(block_offset)).get_unchecked()
     }
 
     /// Checks if a value exists at the specified index.
@@ -291,6 +297,10 @@ impl<T> Grove<T> {
     /// ```
     pub fn len(&self) -> usize {
         self.max.load(Ordering::Acquire)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 
     /// Creates a `Grove` from a `Vec`.
@@ -653,6 +663,12 @@ impl<T> TwoEndedGrove<T> {
                 f(value);
             }
         }
+    }
+}
+
+impl<T> Default for TwoEndedGrove<T> {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
