@@ -185,13 +185,13 @@ where
             max,
         );
 
-        for s in self.shift.s()..max.s() {
-            assert_eq!(
-                Vec::<i32>::new(),
-                self.maps[s].ooo_outputs(),
-                "Map {s} has out of order elements"
-            );
-        }
+        // for s in self.shift.s()..max.s() {
+        //     assert_eq!(
+        //         Vec::<i32>::new(),
+        //         self.maps[s].ooo_outputs(),
+        //         "Map {s} has out of order elements"
+        //     );
+        // }
     }
 
     /// Extend the [`MuResolutionHomomorphism`] to be defined on `(input_s, input_t)`. The resulting

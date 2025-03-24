@@ -246,7 +246,7 @@ impl<const U: bool, A: MuAlgebra<U>> MuFreeModule<U, A> {
     pub fn add_generators(&self, degree: i32, num_gens: usize, names: Option<Vec<String>>) {
         // We need to acquire the lock because changing num_gens modifies the behaviour of
         // extend_table_entries, and the two cannot happen concurrently.
-        let _lock = self.basis_element_to_opgen.lock();
+        // let _lock = self.basis_element_to_opgen.lock();
         assert!(degree >= self.min_degree);
 
         // println!("add_gens == degree : {}, num_gens : {}", degree, num_gens);

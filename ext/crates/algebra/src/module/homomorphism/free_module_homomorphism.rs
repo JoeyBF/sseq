@@ -238,10 +238,10 @@ where
         self.outputs.push_ooo(rows, degree)
     }
 
-    /// List of outputs that have been added out of order
-    pub fn ooo_outputs(&self) -> Vec<i32> {
-        self.outputs.ooo_elements()
-    }
+    // /// List of outputs that have been added out of order
+    // pub fn ooo_outputs(&self) -> Vec<i32> {
+    //     self.outputs.ooo_elements()
+    // }
 
     pub fn apply_to_generator(&self, result: &mut FpVector, coeff: u32, degree: i32, idx: usize) {
         let output_on_gen = self.output(degree, idx);

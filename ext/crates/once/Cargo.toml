@@ -10,21 +10,20 @@ edition = "2021"
 
 [dependencies]
 bivec = { path = "../bivec" }
-dashmap = { version = "6.1.0", features = ["serde"] }
-fxhash = "0.2.1"
 maybe-rayon = { path = "../maybe-rayon" }
-nohash-hasher = "0.2.0"
-rand = "0.9.0"
 
 [dev-dependencies]
-criterion = "0.5.1"
-loom = { version = "0.7.2", features = ["checkpoint"] }
-pprof = { version = "0.14.0", features = ["criterion", "flamegraph"] }
+criterion = "0.5"
+pprof = { version = "0.14", features = ["criterion", "flamegraph"] }
+proptest = "1.6.0"
+rand = "0.9"
 
 [features]
 default = []
 concurrent = ["maybe-rayon/concurrent"]
-loom = []
+
+[target.'cfg(loom)'.dependencies]
+loom = { version = "0.7", features = ["checkpoint"] }
 
 [[bench]]
 name = "criterion"

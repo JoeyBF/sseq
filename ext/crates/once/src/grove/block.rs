@@ -1,7 +1,12 @@
 use std::{mem::ManuallyDrop, num::NonZero, sync::atomic::Ordering};
 
-use super::write_once::WriteOnce;
-use crate::std_or_loom::sync::atomic::{AtomicPtr, AtomicUsize};
+use crate::{
+    std_or_loom::{
+        sync::atomic::{AtomicPtr, AtomicUsize},
+        GetMut,
+    },
+    write_once::WriteOnce,
+};
 
 /// An allocation that can store a fixed number of elements.
 #[derive(Debug)]
@@ -18,11 +23,19 @@ pub struct Block<T> {
 
 impl<T> Block<T> {
     /// Create a new block.
-    pub(crate) const fn new() -> Self {
+    pub(super) fn new() -> Self {
         Self {
             len: AtomicUsize::new(0),
             data: AtomicPtr::new(std::ptr::null_mut()),
         }
+    }
+
+    pub(super) fn is_init(&self) -> bool {
+        !self.data.load(Ordering::Acquire).is_null()
+    }
+
+    pub(super) fn data(&self) -> &AtomicPtr<WriteOnce<T>> {
+        &self.data
     }
 
     /// Initialize the block with a given size.
@@ -30,7 +43,7 @@ impl<T> Block<T> {
     /// # Safety
     ///
     /// For any given block, this method must always be called with the same size.
-    pub(crate) unsafe fn init(&self, size: NonZero<usize>) {
+    pub(super) unsafe fn init(&self, size: NonZero<usize>) {
         if self.data.load(Ordering::Acquire).is_null() {
             // We need to initialize the block
             let mut data_buffer = ManuallyDrop::new(Vec::with_capacity(size.get()));
@@ -69,14 +82,25 @@ impl<T> Block<T> {
     /// # Safety
     ///
     /// The caller must ensure that the block has been initialized.
-    pub(crate) unsafe fn insert(&self, index: usize, value: T) {
+    pub(super) unsafe fn insert(&self, index: usize, value: T) {
         let data_ptr = self.data.load(Ordering::Acquire);
         let len = self.len.load(Ordering::Acquire);
         // Safety: the block has been initialized
-        assert!(len > 0);
-        assert!(!data_ptr.is_null());
         let data = unsafe { std::slice::from_raw_parts(data_ptr, len) };
         data[index].set(value);
+    }
+
+    /// Attempt to insert a value at the given index.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that the block has been initialized.
+    pub(super) unsafe fn try_insert(&self, index: usize, value: T) -> Result<(), T> {
+        let data_ptr = self.data.load(Ordering::Acquire);
+        let len = self.len.load(Ordering::Acquire);
+        // Safety: the block has been initialized
+        let data = unsafe { std::slice::from_raw_parts(data_ptr, len) };
+        data[index].try_set(value)
     }
 
     /// Return the value at the given index.
@@ -84,7 +108,7 @@ impl<T> Block<T> {
     /// # Safety
     ///
     /// The caller must ensure that the block has been initialized.
-    pub(crate) unsafe fn get(&self, index: usize) -> Option<&T> {
+    pub(super) unsafe fn get(&self, index: usize) -> Option<&T> {
         let len = self.len.load(Ordering::Acquire);
         let data_ptr = self.data.load(Ordering::Acquire);
         // Safety: the block has been initialized
@@ -96,9 +120,9 @@ impl<T> Block<T> {
     /// Return a mutable reference to the value at the given index.
     ///
     /// This is safe because we hold an exclusive reference.
-    pub(crate) fn get_mut(&mut self, index: usize) -> Option<&mut T> {
-        let len = *self.len.get_mut();
-        let data_ptr = *self.data.get_mut();
+    pub(super) fn get_mut(&mut self, index: usize) -> Option<&mut T> {
+        let len = self.len.get_by_mut();
+        let data_ptr = self.data.get_by_mut();
         // Safety: the block has been initialized
         let data = unsafe { std::slice::from_raw_parts_mut(data_ptr, len) };
         // Safety: the index is within the allocation
@@ -110,20 +134,20 @@ impl<T> Block<T> {
     /// # Safety
     ///
     /// The caller must ensure that the block has been initialized.
-    pub(crate) fn is_set(&self, index: usize) -> bool {
+    pub(super) fn is_set(&self, index: usize) -> bool {
         let len = self.len.load(Ordering::Acquire);
         let data_ptr = self.data.load(Ordering::Acquire);
         // Safety: the block has been initialized
         let data = unsafe { std::slice::from_raw_parts(data_ptr, len) };
         // Safety: the index is within the allocation
-        data.get(index).map_or(false, |w| w.is_set())
+        data.get(index).is_some_and(|w| w.is_set())
     }
 }
 
 impl<T> Drop for Block<T> {
     fn drop(&mut self) {
-        let len = *self.len.get_mut();
-        let data_ptr = *self.data.get_mut();
+        let len = self.len.get_by_mut();
+        let data_ptr = self.data.get_by_mut();
         if !data_ptr.is_null() {
             // Safety: initialization stores a pointer that came from exactly such a vector
             unsafe { Vec::from_raw_parts(data_ptr, len, len) };

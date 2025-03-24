@@ -1,10 +1,7 @@
 use criterion::{
     black_box, criterion_group, criterion_main, measurement::WallTime, BenchmarkGroup, Criterion,
 };
-use once::{
-    kdtrie::{grove::TwoEndedGrove, MultiGraded},
-    OnceBiVec, SparseKVec, SparseVec,
-};
+use once::{MultiIndexed, OnceBiVec, TwoEndedGrove};
 use rand::{rng, seq::SliceRandom};
 
 /// A trait that matches OnceBiVec's semantics for benchmarking
@@ -25,51 +22,7 @@ trait Benchable<const K: usize, T> {
     fn range_query(&self, min: [i32; K], max: [i32; K]) -> Vec<&T>;
 }
 
-impl<T> Benchable<1, T> for SparseVec<T> {
-    fn name() -> &'static str {
-        "sparse_vec"
-    }
-
-    fn new(_min: [i32; 1]) -> Self {
-        SparseVec::new()
-    }
-
-    fn push_checked(&self, coords: [i32; 1], value: T) {
-        self.insert(coords[0], value);
-    }
-
-    fn get(&self, coords: [i32; 1]) -> Option<&T> {
-        self.get(coords[0])
-    }
-
-    fn range_query(&self, min: [i32; 1], max: [i32; 1]) -> Vec<&T> {
-        self.range(min[0], max[0]).map(|(_, v)| v).collect()
-    }
-}
-
-impl<T, const K: usize> Benchable<K, T> for SparseKVec<T, K> {
-    fn name() -> &'static str {
-        "sparse_kvec"
-    }
-
-    fn new(_min: [i32; K]) -> Self {
-        SparseKVec::new()
-    }
-
-    fn push_checked(&self, coords: [i32; K], value: T) {
-        self.insert(coords, value);
-    }
-
-    fn get(&self, coords: [i32; K]) -> Option<&T> {
-        self.get(coords)
-    }
-
-    fn range_query(&self, min: [i32; K], max: [i32; K]) -> Vec<&T> {
-        self.range(min, max).map(|(_, v)| v).collect()
-    }
-}
-
-impl<T, const K: usize> Benchable<K, T> for MultiGraded<K, T> {
+impl<T, const K: usize> Benchable<K, T> for MultiIndexed<K, T> {
     fn name() -> &'static str {
         "multi_graded"
     }
@@ -503,9 +456,39 @@ mod benchable_oncebivec {
     }
 }
 
+pub fn get_nth_diagonal<const K: usize>(n: usize) -> Vec<[i32; K]> {
+    let mut result = Vec::new();
+    let mut tuple = vec![0; K];
+
+    // Generate all tuples where the sum of coordinates equals n
+    generate_tuples::<K>(&mut tuple, 0, n, &mut result);
+
+    result
+}
+
+/// Helper function to recursively generate the tuples
+fn generate_tuples<const K: usize>(
+    tuple: &mut Vec<i32>,
+    index: usize,
+    sum: usize,
+    result: &mut Vec<[i32; K]>,
+) {
+    if index == K - 1 {
+        // The last element gets whatever is left to reach the sum
+        tuple[index] = sum as i32;
+        result.push(tuple.clone().try_into().unwrap()); // Convert to [i32; K]
+        return;
+    }
+
+    for i in 0..=sum {
+        tuple[index] = i as i32;
+        generate_tuples::<K>(tuple, index + 1, sum - i, result);
+    }
+}
+
 fn get_n_coords<const K: usize>(n: usize, min: [i32; K]) -> Vec<[i32; K]> {
     (0..)
-        .flat_map(|i| once::get_nth_diagonal::<K>(i))
+        .flat_map(get_nth_diagonal)
         .map(|mut v| {
             for (xi, mi) in v.iter_mut().zip(min.iter()) {
                 *xi += mi;
@@ -570,21 +553,14 @@ fn bench_lookup_k<const K: usize, T, B: Benchable<K, T>>(
     );
 }
 
-fn run_insert_benchmark<
-    const K: usize,
-    T,
-    B1: Benchable<K, T>,
-    B2: Benchable<K, T>,
-    B3: Benchable<K, T>,
->(
+fn run_insert_benchmark<const K: usize, T, B1: Benchable<K, T>, B2: Benchable<K, T>>(
     c: &mut Criterion,
     min: [i32; K],
     make_value: &dyn Fn(usize) -> T,
 ) {
     let mut g = c.benchmark_group(format!("insert_dim{K}_{}", std::any::type_name::<T>()));
     bench_insert_k::<K, _, B1>(&mut g, min, make_value);
-    // bench_insert_k::<K, _, B2>(&mut g, min, make_value);
-    bench_insert_k::<K, _, B3>(&mut g, min, make_value);
+    bench_insert_k::<K, _, B2>(&mut g, min, make_value);
     g.finish();
 }
 
@@ -592,60 +568,46 @@ fn run_insert_benchmarks<T>(c: &mut Criterion, make_value: &dyn Fn(usize) -> T) 
     // Dim 1
     let mut g = c.benchmark_group(format!("insert_dim1_{}", std::any::type_name::<T>()));
     bench_insert_k::<1, _, OnceBiVec<_>>(&mut g, [0], make_value);
-    // bench_insert_k::<1, _, SparseVec<_>>(&mut g, [0], make_value);
-    // bench_insert_k::<1, _, SparseKVec<_, 1>>(&mut g, [0], make_value);
     bench_insert_k::<1, _, TwoEndedGrove<_>>(&mut g, [0], make_value);
-    bench_insert_k::<1, _, MultiGraded<1, _>>(&mut g, [0], make_value);
+    bench_insert_k::<1, _, MultiIndexed<1, _>>(&mut g, [0], make_value);
     g.finish();
 
-    run_insert_benchmark::<2, _, OnceBiVec<OnceBiVec<_>>, SparseKVec<_, 2>, MultiGraded<2, _>>(
+    run_insert_benchmark::<2, _, OnceBiVec<OnceBiVec<_>>, MultiIndexed<2, _>>(
         c,
         [0, 0],
         make_value,
     );
-    run_insert_benchmark::<
-        3,
-        _,
-        OnceBiVec<OnceBiVec<OnceBiVec<_>>>,
-        SparseKVec<_, 3>,
-        MultiGraded<3, _>,
-    >(c, [0, 0, 0], make_value);
-    run_insert_benchmark::<
-        4,
-        _,
-        OnceBiVec<OnceBiVec<OnceBiVec<OnceBiVec<_>>>>,
-        SparseKVec<_, 4>,
-        MultiGraded<4, _>,
-    >(c, [0, 0, 0, 0], make_value);
+    run_insert_benchmark::<3, _, OnceBiVec<OnceBiVec<OnceBiVec<_>>>, MultiIndexed<3, _>>(
+        c,
+        [0, 0, 0],
+        make_value,
+    );
+    run_insert_benchmark::<4, _, OnceBiVec<OnceBiVec<OnceBiVec<OnceBiVec<_>>>>, MultiIndexed<4, _>>(
+        c,
+        [0, 0, 0, 0],
+        make_value,
+    );
     run_insert_benchmark::<
         5,
         _,
         OnceBiVec<OnceBiVec<OnceBiVec<OnceBiVec<OnceBiVec<_>>>>>,
-        SparseKVec<_, 5>,
-        MultiGraded<5, _>,
+        MultiIndexed<5, _>,
     >(c, [0, 0, 0, 0, 0], make_value);
 
     let mut g = c.benchmark_group(format!("insert_dim6_{}", std::any::type_name::<T>()));
-    // bench_insert_k::<6, _, SparseKVec<_, 6>>(&mut g, [0, 0, 0, 0, 0, 0], make_value);
-    bench_insert_k::<6, _, MultiGraded<6, _>>(&mut g, [0, 0, 0, 0, 0, 0], make_value);
+    // bench_insert_k::<6, _, MultiIndexed<_, 6>>(&mut g, [0, 0, 0, 0, 0, 0], make_value);
+    bench_insert_k::<6, _, MultiIndexed<6, _>>(&mut g, [0, 0, 0, 0, 0, 0], make_value);
     g.finish();
 }
 
-fn run_lookup_benchmark<
-    const K: usize,
-    T,
-    B1: Benchable<K, T>,
-    B2: Benchable<K, T>,
-    B3: Benchable<K, T>,
->(
+fn run_lookup_benchmark<const K: usize, T, B1: Benchable<K, T>, B2: Benchable<K, T>>(
     c: &mut Criterion,
     min: [i32; K],
     make_value: &dyn Fn(usize) -> T,
 ) {
     let mut g = c.benchmark_group(format!("lookup_dim{K}_{}", std::any::type_name::<T>()));
     bench_lookup_k::<K, _, B1>(&mut g, min, make_value);
-    // bench_lookup_k::<K, _, B2>(&mut g, min, make_value);
-    bench_lookup_k::<K, _, B3>(&mut g, min, make_value);
+    bench_lookup_k::<K, _, B2>(&mut g, min, make_value);
     g.finish();
 }
 
@@ -653,42 +615,35 @@ fn run_lookup_benchmarks<T>(c: &mut Criterion, make_value: &dyn Fn(usize) -> T) 
     // Dim 1
     let mut g = c.benchmark_group(format!("lookup_dim1_{}", std::any::type_name::<T>()));
     bench_lookup_k::<1, _, OnceBiVec<_>>(&mut g, [0], make_value);
-    // bench_lookup_k::<1, _, SparseVec<_>>(&mut g, [0], make_value);
-    // bench_lookup_k::<1, _, SparseKVec<_, 1>>(&mut g, [0], make_value);
     bench_lookup_k::<1, _, TwoEndedGrove<_>>(&mut g, [0], make_value);
-    bench_lookup_k::<1, _, MultiGraded<1, _>>(&mut g, [0], make_value);
+    bench_lookup_k::<1, _, MultiIndexed<1, _>>(&mut g, [0], make_value);
     g.finish();
 
-    run_lookup_benchmark::<2, _, OnceBiVec<OnceBiVec<_>>, SparseKVec<_, 2>, MultiGraded<2, _>>(
+    run_lookup_benchmark::<2, _, OnceBiVec<OnceBiVec<_>>, MultiIndexed<2, _>>(
         c,
         [0, 0],
         make_value,
     );
-    run_lookup_benchmark::<
-        3,
-        _,
-        OnceBiVec<OnceBiVec<OnceBiVec<_>>>,
-        SparseKVec<_, 3>,
-        MultiGraded<3, _>,
-    >(c, [0, 0, 0], make_value);
-    run_lookup_benchmark::<
-        4,
-        _,
-        OnceBiVec<OnceBiVec<OnceBiVec<OnceBiVec<_>>>>,
-        SparseKVec<_, 4>,
-        MultiGraded<4, _>,
-    >(c, [0, 0, 0, 0], make_value);
+    run_lookup_benchmark::<3, _, OnceBiVec<OnceBiVec<OnceBiVec<_>>>, MultiIndexed<3, _>>(
+        c,
+        [0, 0, 0],
+        make_value,
+    );
+    run_lookup_benchmark::<4, _, OnceBiVec<OnceBiVec<OnceBiVec<OnceBiVec<_>>>>, MultiIndexed<4, _>>(
+        c,
+        [0, 0, 0, 0],
+        make_value,
+    );
     run_lookup_benchmark::<
         5,
         _,
         OnceBiVec<OnceBiVec<OnceBiVec<OnceBiVec<OnceBiVec<_>>>>>,
-        SparseKVec<_, 5>,
-        MultiGraded<5, _>,
+        MultiIndexed<5, _>,
     >(c, [0, 0, 0, 0, 0], make_value);
 
     let mut g = c.benchmark_group(format!("lookup_dim6_{}", std::any::type_name::<T>()));
-    // bench_lookup_k::<6, _, SparseKVec<_, 6>>(&mut g, [0, 0, 0, 0, 0, 0], make_value);
-    bench_lookup_k::<6, _, MultiGraded<6, _>>(&mut g, [0, 0, 0, 0, 0, 0], make_value);
+    // bench_lookup_k::<6, _, MultiIndexed<_, 6>>(&mut g, [0, 0, 0, 0, 0, 0], make_value);
+    bench_lookup_k::<6, _, MultiIndexed<6, _>>(&mut g, [0, 0, 0, 0, 0, 0], make_value);
     g.finish();
 }
 
@@ -823,17 +778,17 @@ fn run_range_benchmarks<T>(c: &mut Criterion, make_value: &dyn Fn(usize) -> i32)
     // Dim 1
     let mut g = c.benchmark_group("range_dim1");
     bench_range_k::<1, _, OnceBiVec<_>>(&mut g, [0], make_value);
-    bench_range_k::<1, _, SparseVec<_>>(&mut g, [0], make_value);
-    bench_range_k::<1, _, SparseKVec<_, 1>>(&mut g, [0], make_value);
+    bench_range_k::<1, _, TwoEndedGrove<_>>(&mut g, [0], make_value);
+    bench_range_k::<1, _, MultiIndexed<1, _>>(&mut g, [0], make_value);
     g.finish();
 
-    run_range_benchmark::<2, _, OnceBiVec<OnceBiVec<_>>, SparseKVec<_, 2>>(c, [0, 0], make_value);
-    run_range_benchmark::<3, _, OnceBiVec<OnceBiVec<OnceBiVec<_>>>, SparseKVec<_, 3>>(
+    run_range_benchmark::<2, _, OnceBiVec<OnceBiVec<_>>, MultiIndexed<2, _>>(c, [0, 0], make_value);
+    run_range_benchmark::<3, _, OnceBiVec<OnceBiVec<OnceBiVec<_>>>, MultiIndexed<3, _>>(
         c,
         [0, 0, 0],
         make_value,
     );
-    run_range_benchmark::<4, _, OnceBiVec<OnceBiVec<OnceBiVec<OnceBiVec<_>>>>, SparseKVec<_, 4>>(
+    run_range_benchmark::<4, _, OnceBiVec<OnceBiVec<OnceBiVec<OnceBiVec<_>>>>, MultiIndexed<4, _>>(
         c,
         [0, 0, 0, 0],
         make_value,
@@ -842,17 +797,17 @@ fn run_range_benchmarks<T>(c: &mut Criterion, make_value: &dyn Fn(usize) -> i32)
         5,
         _,
         OnceBiVec<OnceBiVec<OnceBiVec<OnceBiVec<OnceBiVec<_>>>>>,
-        SparseKVec<_, 5>,
+        MultiIndexed<5, _>,
     >(c, [0, 0, 0, 0, 0], make_value);
 
     let mut g = c.benchmark_group("range_dim6");
-    bench_range_k::<6, _, SparseKVec<_, 6>>(&mut g, [0, 0, 0, 0, 0, 0], make_value);
+    bench_range_k::<6, _, MultiIndexed<6, _>>(&mut g, [0, 0, 0, 0, 0, 0], make_value);
     g.finish();
 }
 
 fn run_benchmarks(c: &mut Criterion) {
-    run_insert_benchmarks(c, &|i| i as i32);
-    run_insert_benchmarks(c, &|i| [i; 1000]);
+    // run_insert_benchmarks(c, &|i| i as i32);
+    // run_insert_benchmarks(c, &|i| [i; 1000]);
     run_lookup_benchmarks(c, &|i| i as i32);
     run_lookup_benchmarks(c, &|i| [i; 1000]);
     // run_range_benchmarks(c);
@@ -862,7 +817,7 @@ use pprof::criterion::{Output, PProfProfiler};
 
 criterion_group! {
     name = benches;
-    config = Criterion::default().measurement_time(std::time::Duration::from_secs(30)).with_profiler(PProfProfiler::new(100, Output::Flamegraph(None)));
+    config = Criterion::default().measurement_time(std::time::Duration::from_secs(5)).with_profiler(PProfProfiler::new(100, Output::Flamegraph(None)));
     targets = run_benchmarks
 }
 criterion_main!(benches);
