@@ -1,0 +1,17 @@
+{
+  "meta": {
+    "version": "1",
+    "updated_at": "2024-07-26T08:05:01.510Z",
+    "created_at": "2024-07-26T08:05:05.241Z",
+    "pipelines": [
+      "c638d0ec-0b20-4372-b9ee-8428f4eeb579"
+    ]
+  },
+  "lookup": [
+    [
+      "web_ext/sseq_gui/interface/display.js",
+      "web_ext/sseq_gui/interface/index.js",
+      "web_ext/sseq_gui/interface/sseq.js"
+    ]
+  ]
+}
