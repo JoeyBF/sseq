@@ -180,8 +180,8 @@ jobs:
 
   selenium:
     if: ${{ github.event_name == 'push' || github.event.pull_request.head.repo.full_name != github.repository }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
+    runs-on: ubuntu-24.04
+    # timeout-minutes: 10
     needs: [webserver]
     env:
       RUST_BACKTRACE: 1
@@ -212,6 +212,13 @@ jobs:
         id: rustup
         with:
           toolchain: ${{ matrix.toolchain }}
+
+      - name: Breakpoint
+        # if: never()
+        uses: namespacelabs/breakpoint-action@v0
+        with:
+          duration: 30m
+          authorized-users: JoeyBF
 
       - name: Install dependencies
         run: sudo apt-get install --no-install-recommends python3-pytest python3-selenium
