@@ -56,3 +56,8 @@ selenium:
 
 selenium-update:
 	python3 -m pytest tests --driver firefox --update
+
+install-deps:
+	sudo apt-get update
+	sudo apt-get install firefox chromium-browser
+	pip install pytest selenium

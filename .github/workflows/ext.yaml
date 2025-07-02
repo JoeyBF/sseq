@@ -187,6 +187,7 @@ jobs:
       RUST_BACKTRACE: 1
       RUSTFLAGS: "-D warnings"
       RUSTUP_TOOLCHAIN: ${{ matrix.toolchain }}
+      SELENIUM_MANAGER_LOG_LEVEL: DEBUG
 
     strategy:
       matrix:
@@ -221,7 +222,7 @@ jobs:
           authorized-users: JoeyBF
 
       - name: Install dependencies
-        run: sudo apt-get install --no-install-recommends python3-pytest python3-selenium
+        run: make install-deps
 
       - name: Cache files
         uses: actions/cache@v4
