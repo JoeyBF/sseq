@@ -6,13 +6,14 @@ Python translation of secondary.rs example.
 
 import os
 import ext_py
+from ext_py import algebra_py, sseq_py
 
 
 def main():
-    ext_py.init_logging()
-
     # Query for module (must use Milnor basis)
-    resolution = ext_py.query_module(algebra_type=ext_py.AlgebraType.MILNOR, save=True)
+    resolution = ext_py.query_module(
+        algebra_type=algebra_py.AlgebraType.Milnor, save=True
+    )
 
     # Create secondary resolution
     lift = ext_py.SecondaryResolution(resolution)
@@ -28,7 +29,7 @@ def main():
     lift.extend_all()
 
     # d_2 differential has bidegree shift (-1, 2)
-    d2_shift = ext_py.Bidegree.from_n_s(-1, 2)
+    d2_shift = sseq_py.Bidegree.n_s(-1, 2)
 
     # Iterate through targets of d_2
     for bidegree in lift.underlying().iter_nonzero_stem():
