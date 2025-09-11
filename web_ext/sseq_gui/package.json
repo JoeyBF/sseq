@@ -1,0 +1,13 @@
+{
+  "name": "sseq_gui_tests",
+  "version": "1.0.0",
+  "description": "Playwright tests for sseq_gui",
+  "scripts": {
+    "test": "playwright test",
+    "test:firefox": "playwright test --project=firefox",
+    "test:chromium": "playwright test --project=chromium"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.40.0"
+  }
+}

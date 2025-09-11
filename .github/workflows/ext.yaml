@@ -122,7 +122,7 @@ jobs:
         run: make -C web_ext/sseq_gui lint
 
       - name: Lint sseq_gui tests
-        run: make -C web_ext/sseq_gui lint-selenium
+        run: make -C web_ext/sseq_gui lint-playwright
 
   webserver:
     if: ${{ github.event_name == 'push' || github.event.pull_request.head.repo.full_name != github.repository }}
@@ -213,8 +213,15 @@ jobs:
         with:
           toolchain: ${{ matrix.toolchain }}
 
-      - name: Install dependencies
-        run: sudo apt-get install --no-install-recommends python3-pytest python3-selenium
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          
+      - name: Install Playwright
+        run: |
+          npm install
+          npx playwright install --with-deps
 
       - name: Cache files
         uses: actions/cache@v4
@@ -228,19 +235,19 @@ jobs:
       - name: Test wasm
         run: |
           make serve-wasm &
-          (sleep 1 && make selenium)
+          (sleep 1 && make playwright)
 
       - name: Test local
         run: |
           cargo build &&
           (target/debug/sseq_gui &
-          (sleep 1 && make selenium))
+          (sleep 1 && make playwright))
 
       - name: Test local concurrent
         run: |
           cargo build --features concurrent &&
           (target/debug/sseq_gui &
-          (sleep 1 && make selenium))
+          (sleep 1 && make playwright))
 
       - name: Upload Artifact
         if: ${{ failure() }}

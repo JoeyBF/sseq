@@ -18,8 +18,6 @@
       pythonEnv = pkgs.python3.withPackages (ps: [
         ps.flake8
         ps.black
-        ps.pytest
-        ps.selenium
       ]);
 
       commonPackages = [
@@ -28,28 +26,37 @@
 
         pythonEnv
         pkgs.openssl
+      ] ++ pkgs.lib.optionals pkgs.stdenv.isLinux [
+        # NixOS-specific packages for Playwright
+        pkgs.playwright-test
+        pkgs.playwright-driver
+        pkgs.playwright-driver.browsers
       ];
 
       runTestScript = pkgs.writeShellScript "run-tests" ''
         set -euo pipefail
 
+        echo "Configuring Playwright for NixOS..."
+        export PLAYWRIGHT_BROWSERS_PATH=${pkgs.playwright-driver.browsers}
+        export PLAYWRIGHT_SKIP_VALIDATE_HOST_REQUIREMENTS=true
+
         make lint
-        make lint-selenium
+        make lint-playwright
 
         cargo install wasm-bindgen-cli --debug
         make lint-wasm
         make wasm
 
         make serve-wasm &
-        (sleep 1 && make selenium)
+        (sleep 1 && NIXOS=1 make playwright)
 
         cargo build &&
         (target/debug/sseq_gui &
-         (sleep 1 && make selenium))
+         (sleep 1 && NIXOS=1 make playwright))
 
         cargo build --features concurrent &&
         (target/debug/sseq_gui &
-         (sleep 1 && make selenium))
+         (sleep 1 && NIXOS=1 make playwright))
       '';
     in {
       devShells.default = pkgs.mkShell {
@@ -57,6 +64,8 @@
 
         shellHook = ''
           export RUST_LOG=info
+          export PLAYWRIGHT_BROWSERS_PATH=${pkgs.playwright-driver.browsers}
+          export PLAYWRIGHT_SKIP_VALIDATE_HOST_REQUIREMENTS=true
         '';
       };
 

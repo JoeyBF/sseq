@@ -2,3 +2,5 @@ dist/
 tests/benchmarks/*-new.svg
 geckodriver.log
 **/__pycache__
+playwright-report/
+test-results/

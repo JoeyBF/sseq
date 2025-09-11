@@ -28,7 +28,7 @@ $(WASM_FILE): $(WASM_LIB)
 	wasm-bindgen --no-typescript --target no-modules --out-dir $(WASM_OUT) --out-name $(NAME)_wasm $(WASM_LIB)
 	wasm-opt -O3 $(WASM_FILE) -o $(WASM_FILE) || true
 
-.PHONY: wasm serve-wasm clean-wasm clean dummy test selenium selenium-update
+.PHONY: wasm serve-wasm clean-wasm clean dummy test playwright playwright-update
 
 wasm: $(WASM_FILE) $(wildcard interface/*) $(wildcard wasm/*) $(wildcard $(EXT)/steenrod_modules/*)
 	# Must be done in this order since both contain index.js and we want the wasm version
@@ -46,13 +46,11 @@ clean-wasm:
 clean: clean-wasm
 	rm -r target
 
-lint-selenium:
-	flake8 --ignore E501 tests
-	black --diff --check tests
+lint-playwright:
+	echo "Playwright tests don't need separate linting"
 
-selenium:
-	python3 -m pytest -s tests --driver firefox
-	python3 -m pytest -s tests --driver chrome
+playwright:
+	npm run test
 
-selenium-update:
-	python3 -m pytest tests --driver firefox --update
+playwright-update:
+	UPDATE_BENCHMARKS=1 npm run test
