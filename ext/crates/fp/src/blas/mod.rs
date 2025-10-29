@@ -38,7 +38,10 @@ impl std::ops::Mul for &Matrix {
         assert_eq!(self.prime(), rhs.prime());
         assert_eq!(self.columns(), rhs.rows());
 
-        if self.prime() == 2 && self.physical_rows() % 64 == 0 && rhs.physical_rows() % 64 == 0 {
+        if self.prime() == 2
+            && self.physical_rows().is_multiple_of(64)
+            && rhs.physical_rows().is_multiple_of(64)
+        {
             // Can use optimized BLAS operations (matrix rows are padded to multiple of 64)
             // TODO: Use different block sizes and loop orders based on the size of the matrices
             self.fast_mul_concurrent(rhs)
