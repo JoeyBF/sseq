@@ -141,8 +141,7 @@ mod tests {
 
     fn arb_multipliable_matrices(max: Option<usize>) -> impl Strategy<Value = (Matrix, Matrix)> {
         let max_idx = max
-            .map(|max| DIMS.iter().position(|&size| size > max))
-            .flatten()
+            .and_then(|max| DIMS.iter().position(|&size| size > max))
             .unwrap_or(DIMS.len());
         let arb_dim = proptest::sample::select(&DIMS[0..max_idx]);
         arb_dim.clone().prop_flat_map(move |size| {
