@@ -5,7 +5,7 @@ use crate::limb::Limb;
 /// Each limb represents one row of 64 bits. The 128-byte alignment ensures efficient SIMD
 /// operations and cache line alignment.
 #[repr(align(128))]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MatrixBlock {
     pub limbs: [Limb; 64],
 }
@@ -73,11 +73,8 @@ impl<'a> MatrixBlockSlice<'a> {
     /// expects contiguous data.
     #[inline]
     pub fn gather(self) -> MatrixBlock {
-        if is_x86_feature_detected!("avx512f") {
-            super::avx512::gather_block_avx512(self).as_matrix_block()
-        } else {
-            super::scalar::gather_block_scalar(self)
-        }
+        // Delegate to SIMD specializations
+        crate::simd::gather_block_simd(self)
     }
 }
 
@@ -146,3 +143,50 @@ unsafe impl<'a> Send for MatrixBlockSlice<'a> {}
 unsafe impl<'a> Send for MatrixBlockSliceMut<'a> {}
 
 unsafe impl<'a> Sync for MatrixBlockSlice<'a> {}
+
+/// Performs block-level GEMM: `C = alpha * A * B + beta * C` for 64 x 64 bit blocks.
+///
+/// # Arguments
+///
+/// * `alpha` - If `false`, the `A * B` term is skipped (for F_2, this is the only scaling)
+/// * `a` - Left input block (64 x 64 bits)
+/// * `b` - Right input block (64 x 64 bits)
+/// * `beta` - If `false`, C is zeroed before accumulation
+/// * `c` - Accumulator block (64 x 64 bits)
+///
+/// Returns the block `C`.
+///
+/// # Implementation Selection
+///
+/// - **x86_64 with AVX-512**: Uses optimized assembly kernel
+/// - **Other platforms**: Falls back to scalar implementation
+#[inline]
+pub fn gemm_block(
+    alpha: bool,
+    a: MatrixBlock,
+    b: MatrixBlock,
+    beta: bool,
+    c: MatrixBlock,
+) -> MatrixBlock {
+    // Delegate to SIMD specializations
+    crate::simd::gemm_block_simd(alpha, a, b, beta, c)
+}
+
+#[cfg(feature = "proptest")]
+mod arbitrary {
+
+    use proptest::prelude::*;
+
+    use super::*;
+
+    impl Arbitrary for MatrixBlock {
+        type Parameters = ();
+        type Strategy = BoxedStrategy<Self>;
+
+        fn arbitrary_with(_args: Self::Parameters) -> Self::Strategy {
+            proptest::array::uniform(any::<Limb>())
+                .prop_map(|limbs| MatrixBlock { limbs })
+                .boxed()
+        }
+    }
+}

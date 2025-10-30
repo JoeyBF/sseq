@@ -3,7 +3,10 @@ mod avx2;
 mod avx512;
 mod sse2;
 
-use crate::limb::Limb;
+use crate::{
+    blas::block::{MatrixBlock, MatrixBlockSlice},
+    limb::Limb,
+};
 
 macro_rules! add_simd_arch {
     ($arch:tt) => {
@@ -47,5 +50,52 @@ pub(super) fn add_simd(target: &mut [Limb], source: &[Limb], min_limb: usize) {
         unsafe { sse2::add_simd(target, source, min_limb) }
     } else {
         super::generic::add_simd(target, source, min_limb)
+    }
+}
+
+pub(super) fn gather_block_simd(slice: MatrixBlockSlice) -> MatrixBlock {
+    if is_x86_feature_detected!("avx512f") {
+        unsafe { avx512::gather_simd(slice) }
+    } else {
+        super::generic::gather_block_simd(slice)
+    }
+}
+
+pub(super) fn gemm_block_simd(
+    alpha: bool,
+    a: MatrixBlock,
+    b: MatrixBlock,
+    beta: bool,
+    c: MatrixBlock,
+) -> MatrixBlock {
+    if is_x86_feature_detected!("avx512f") {
+        unsafe { avx512::gemm_block_simd(alpha, a, b, beta, c) }
+    } else {
+        super::generic::gemm_block_simd(alpha, a, b, beta, c)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use proptest::prelude::*;
+
+    use super::*;
+
+    proptest! {
+        #[test]
+        #[cfg(target_feature = "avx512f")]
+        fn test_gemm_block_avx512(
+            alpha: bool,
+            a: MatrixBlock,
+            b: MatrixBlock,
+            beta: bool,
+            c: MatrixBlock,
+        ) {
+            let c2 = c.clone();
+            let c = crate::simd::generic::gemm_block_simd(alpha, a, b, beta, c);
+            let c2 = unsafe { super::avx512::gemm_block_simd(alpha, a, b, beta, c2) };
+            prop_assert_eq!(c, c2);
+        }
+
     }
 }
