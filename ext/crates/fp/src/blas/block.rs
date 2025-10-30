@@ -185,7 +185,7 @@ mod arbitrary {
 
         fn arbitrary_with(_args: Self::Parameters) -> Self::Strategy {
             proptest::array::uniform(any::<Limb>())
-                .prop_map(|limbs| MatrixBlock { limbs })
+                .prop_map(|limbs| Self { limbs })
                 .boxed()
         }
     }

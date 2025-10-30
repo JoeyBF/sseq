@@ -79,6 +79,8 @@ pub(super) fn gemm_block_simd(
 mod tests {
     use proptest::prelude::*;
 
+    // There are no tests if we don't support avx512
+    #[allow(unused_imports)]
     use super::*;
 
     proptest! {
@@ -91,7 +93,7 @@ mod tests {
             beta: bool,
             c: MatrixBlock,
         ) {
-            let c2 = c.clone();
+            let c2 = c;
             let c = crate::simd::generic::gemm_block_simd(alpha, a, b, beta, c);
             let c2 = unsafe { super::avx512::gemm_block_simd(alpha, a, b, beta, c2) };
             prop_assert_eq!(c, c2);
