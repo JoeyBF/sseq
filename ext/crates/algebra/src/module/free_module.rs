@@ -133,7 +133,8 @@ impl<const U: bool, A: MuAlgebra<U>> Module for MuFreeModule<U, A> {
         }
         format!(
             "{}{}",
-            op_str, self.gen_names[opgen.generator_degree][opgen.generator_index]
+            op_str,
+            self.gen_name(opgen.generator_degree, opgen.generator_index)
         )
     }
 
@@ -234,6 +235,10 @@ impl<const U: bool, A: MuAlgebra<U>> ZeroModule for MuFreeModule<U, A> {
 impl<const U: bool, A: MuAlgebra<U>> MuFreeModule<U, A> {
     pub fn gen_names(&self) -> &OnceBiVec<Vec<String>> {
         &self.gen_names
+    }
+
+    pub fn gen_name(&self, degree: i32, idx: usize) -> &str {
+        &*self.gen_names()[degree][idx]
     }
 
     pub fn number_of_gens_in_degree(&self, degree: i32) -> usize {
