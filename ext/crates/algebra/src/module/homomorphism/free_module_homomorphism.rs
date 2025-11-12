@@ -1,9 +1,11 @@
+use core::fmt;
 use std::sync::Arc;
 
 use fp::{
     matrix::{MatrixSliceMut, QuasiInverse, Subspace},
     vector::{FpSlice, FpSliceMut, FpVector},
 };
+use itertools::Itertools;
 use once::OnceBiVec;
 
 use crate::{
@@ -295,5 +297,31 @@ impl<const U: bool, A: MuAlgebra<U>> MuFreeModuleHomomorphism<U, MuFreeModule<U,
             }
         }
         result
+    }
+}
+
+impl<const U: bool, M: Module> fmt::Display for MuFreeModuleHomomorphism<U, M>
+where
+    M::Algebra: MuAlgebra<U>,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> fmt::Result {
+        let source = self.source();
+
+        let repr = source
+            .iter_gens(source.max_computed_degree())
+            .map(|(deg, idx)| {
+                let target_degree = deg + self.degree_shift();
+                let out = self.output(deg, idx);
+
+                format!(
+                    "{} -> {}",
+                    source.gen_name(deg, idx),
+                    self.target()
+                        .element_to_string(target_degree, out.as_slice())
+                )
+            })
+            .join("\n");
+
+        write!(f, "{repr}")
     }
 }
