@@ -1,22 +1,15 @@
 //! This prints all the differentials in the resolution.
 
-use ext::{
-    chain_complex::{ChainComplex, FreeChainComplex},
-    utils::query_module,
-};
-use sseq::coordinates::BidegreeGenerator;
+use ext::{chain_complex::ChainComplex, utils::query_module};
 
 fn main() -> anyhow::Result<()> {
     ext::utils::init_logging()?;
 
     let resolution = query_module(None, false)?;
 
-    for b in resolution.iter_stem() {
-        for i in 0..resolution.number_of_gens_in_bidegree(b) {
-            let g = BidegreeGenerator::new(b, i);
-            let boundary = resolution.boundary_string(g);
-            println!("d x_{g:#} = {boundary}");
-        }
+    for s in 0..resolution.next_homological_degree() {
+        println!("{}", resolution.differential(s));
     }
+
     Ok(())
 }
