@@ -1,1 +1,1 @@
-window.SIDEBAR_ITEMS = {"enum":["AlgebraType","SteenrodAlgebra"],"macro":["dispatch_steenrod"],"struct":["AlgebraSpec"]};
+window.SIDEBAR_ITEMS = {"enum":["AlgebraType","SteenrodAlgebra","SteenrodAlgebraBorrow"],"macro":["dispatch_steenrod"],"struct":["AlgebraSpec"],"trait":["SteenrodAlgebraT"]};

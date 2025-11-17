@@ -46,14 +46,6 @@ const KEEP_LOG = new Set([
     'SetClassName',
 ]);
 
-function bidegreeToCoordinates({ n, s }) {
-    return [n, s];
-}
-
-function coordinatesToBidegree(x, y) {
-    return { n: x, s: y };
-}
-
 export class BiVec {
     constructor(minDegree, data) {
         this.data = data ? data : [];
@@ -190,12 +182,12 @@ export class ExtSseq {
     }
 
     addPermanentClass(x, y, target) {
-        const b = coordinatesToBidegree(x, y);
         this.send({
             recipients: ['Sseq'],
             action: {
                 AddPermanentClass: {
-                    b: b,
+                    x: x,
+                    y: y,
                     class: target,
                 },
             },
@@ -273,7 +265,6 @@ export class ExtSseq {
 
     // addProductInteractive takes in the number of classes in bidegree (x, y), because this should be the number of classes in the *unit* spectral sequence, not the main spectral sequence
     addProductInteractive(x, y, num) {
-        const b = coordinatesToBidegree(x, y);
         dialog(
             `Add product at (${x}, ${y})`,
             `<section style="display: flex; justify-content: center; align-items: center; gap: 1em">
@@ -292,7 +283,8 @@ export class ExtSseq {
                             permanent:
                                 dialog.querySelector('checkbox-switch')
                                     .checked === true,
-                            b: b,
+                            x: x,
+                            y: y,
                             class: eval(
                                 dialog.querySelector("input[name='class']")
                                     .value,
@@ -318,8 +310,6 @@ export class ExtSseq {
             sourceY + page,
             MIN_PAGE,
         ).length;
-        const sourceB = coordinatesToBidegree(sourceX, sourceY);
-        const targetB = coordinatesToBidegree(sourceX - 1, sourceY + page);
         dialog(
             `Add product differential at (${sourceX}, ${sourceY})`,
             `<section style="text-align: center">
@@ -355,7 +345,8 @@ export class ExtSseq {
                         AddProductDifferential: {
                             source: {
                                 permanent: false,
-                                b: sourceB,
+                                x: sourceX,
+                                y: sourceY,
                                 class: eval(
                                     dialog.querySelector("input[name='source']")
                                         .value,
@@ -368,7 +359,8 @@ export class ExtSseq {
                             },
                             target: {
                                 permanent: false,
-                                b: targetB,
+                                x: sourceX - 1,
+                                y: sourceY + page,
                                 class: eval(
                                     dialog.querySelector("input[name='target']")
                                         .value,
@@ -416,13 +408,13 @@ export class ExtSseq {
     }
 
     addDifferential(r, source_x, source_y, source, target) {
-        const sourceB = coordinatesToBidegree(source_x, source_y);
         this.send({
             recipients: ['Sseq'],
             action: {
                 AddDifferential: {
                     r: r,
-                    b: sourceB,
+                    x: source_x,
+                    y: source_y,
                     source: source,
                     target: target,
                 },
@@ -557,7 +549,8 @@ export class ExtSseq {
     }
 
     processSetClass(data) {
-        const [x, y] = bidegreeToCoordinates(data.b);
+        const x = data.x;
+        const y = data.y;
 
         const oldClasses = this.classes.get(x, y);
         // classes is a list, and each member of the list corresponds to a
@@ -684,7 +677,8 @@ export class ExtSseq {
     }
 
     processSetDifferential(data) {
-        const [x, y] = bidegreeToCoordinates(data.b);
+        const x = data.x;
+        const y = data.y;
 
         while (this.chart.pages.length <= data.differentials.length) {
             this.newPage();
@@ -715,14 +709,14 @@ export class ExtSseq {
     }
 
     processSetStructline(data) {
-        const [x, y] = bidegreeToCoordinates(data.b);
+        const x = data.x;
+        const y = data.y;
 
         for (const mult of data.structlines) {
-            const [mult_x, mult_y] = bidegreeToCoordinates(mult.mult_b);
             if (!this.products.has(mult.name)) {
                 this.products.set(mult.name, {
-                    x: mult_x,
-                    y: mult_y,
+                    x: mult.mult_x,
+                    y: mult.mult_y,
                     matrices: new BiVec(this.minDegree),
                     style: {
                         bend: 0,
@@ -758,9 +752,9 @@ export class ExtSseq {
                     for (const line of ExtSseq.drawMatrix(
                         matrix,
                         x,
-                        x + mult_x,
+                        x + mult.mult_x,
                         y,
-                        y + mult_y,
+                        y + mult.mult_y,
                         product.style.bend,
                     )) {
                         line.classList.add(`structline`);

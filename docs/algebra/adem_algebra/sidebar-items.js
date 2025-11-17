@@ -1,1 +1,1 @@
-window.SIDEBAR_ITEMS = {"enum":["PorBockstein"],"struct":["AdemAlgebra","AdemBasisElement"]};
+window.SIDEBAR_ITEMS = {"enum":["PorBockstein"],"struct":["AdemAlgebra","AdemBasisElement"],"trait":["AdemAlgebraT"]};
