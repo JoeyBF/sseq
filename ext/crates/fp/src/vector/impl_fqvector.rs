@@ -248,12 +248,12 @@ impl<F: Field> FqVector<F> {
     /// Permanently remove the first `n` elements in the vector. `n` must be a multiple of
     /// the number of entries per limb
     pub(crate) fn trim_start(&mut self, n: usize) {
-        assert!(n <= self.len);
+        assert!(n <= self.len());
         let entries_per = self.fq().entries_per_limb();
         assert_eq!(n % entries_per, 0);
         let num_limbs = n / entries_per;
         self.limbs.drain(0..num_limbs);
-        self.len -= n;
+        *self.len_mut() -= n;
     }
 
     pub fn sign_rule(&self, other: &Self) -> bool {
