@@ -18,11 +18,7 @@ impl<'a, F: Field> FqSlice<'a, F> {
         self.fq().characteristic().to_dyn()
     }
 
-    pub fn len(&self) -> usize {
-        self.end() - self.start()
-    }
-
-    pub const fn is_empty(&self) -> bool {
+    pub fn is_empty(&self) -> bool {
         self.start() == self.end()
     }
 
@@ -76,7 +72,7 @@ impl<'a, F: Field> FqSlice<'a, F> {
 
         FqSlice::new(
             self.fq(),
-            self.limbs(),
+            self.into_limbs(),
             self.start() + start,
             self.start() + end,
         )

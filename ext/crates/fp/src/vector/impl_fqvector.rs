@@ -81,7 +81,7 @@ impl<F: Field> FqVector<F> {
         Ok(())
     }
 
-    pub const fn is_empty(&self) -> bool {
+    pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 

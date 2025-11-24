@@ -5,6 +5,7 @@ mod impl_fqslice;
 mod impl_fqslicemut;
 mod impl_fqvector;
 mod iter;
+mod repr;
 
 pub use fp_wrapper::*;
 #[cfg(feature = "proptest")]
