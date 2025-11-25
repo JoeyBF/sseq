@@ -19,7 +19,7 @@ pub struct FqVector<F: Field> {
 /// This immutably borrows the vector and implements `Copy`.
 #[derive(Debug, Copy, Clone)]
 pub struct FqSlice<'a, F: Field> {
-    pub(super) fq: F,
+    fq: F,
     pub(super) limbs: &'a [Limb],
     pub(super) start: usize,
     pub(super) end: usize,
@@ -81,6 +81,10 @@ impl<'a, F: Field> FqSlice<'a, F> {
             start,
             end,
         }
+    }
+
+    pub fn fq(&self) -> F {
+        self.fq
     }
 }
 
