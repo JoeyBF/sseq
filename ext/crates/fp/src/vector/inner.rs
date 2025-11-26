@@ -4,6 +4,7 @@
 use crate::{
     field::Field,
     limb::Limb,
+    prime::{Prime, ValidPrime},
     vector::repr::{CowRepr, OwnedRepr, Repr, ReprMut, ViewMutRepr, ViewRepr},
 };
 
@@ -58,6 +59,10 @@ pub type FqCow<'a, F> = FqVectorBase<CowRepr<'a>, F>;
 impl<R: Repr, F: Field> FqVectorBase<R, F> {
     pub fn fq(&self) -> F {
         self.fq
+    }
+
+    pub fn prime(&self) -> ValidPrime {
+        self.fq().characteristic().to_dyn()
     }
 
     pub fn len(&self) -> usize {
