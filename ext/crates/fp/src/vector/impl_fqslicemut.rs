@@ -510,7 +510,7 @@ impl<F: Field> FqSliceMut<'_, F> {
     #[inline]
     #[must_use]
     pub fn as_slice(&self) -> FqSlice<'_, F> {
-        FqSlice::new(self.fq(), self.limbs(), self.start(), self.end)
+        FqSlice::new(self.fq(), self.limbs(), self.start(), self.end())
     }
 
     /// Generates a version of itself with a shorter lifetime
@@ -518,7 +518,7 @@ impl<F: Field> FqSliceMut<'_, F> {
     #[must_use]
     pub fn copy(&mut self) -> FqSliceMut<'_, F> {
         let start = self.start();
-        let end = self.end;
+        let end = self.end();
 
         FqSliceMut::new(self.fq(), self.limbs_mut(), start, end)
     }
