@@ -18,7 +18,7 @@ impl<F: Field> FqSliceMut<'_, F> {
     pub fn add_basis_element(&mut self, index: usize, value: FieldElement<F>) {
         assert_eq!(self.fq(), value.field());
         if self.fq().q() == 2 {
-            let pair = self.fq().limb_bit_index_pair(index + self.start);
+            let pair = self.fq().limb_bit_index_pair(index + self.start());
             self.limbs_mut()[pair.limb] ^= self.fq().encode(value) << pair.bit_index;
         } else {
             let mut x = self.as_slice().entry(index);
@@ -31,7 +31,7 @@ impl<F: Field> FqSliceMut<'_, F> {
         assert_eq!(self.fq(), value.field());
         assert!(index < self.as_slice().len());
         let bit_mask = self.fq().bitmask();
-        let limb_index = self.fq().limb_bit_index_pair(index + self.start);
+        let limb_index = self.fq().limb_bit_index_pair(index + self.start());
         let mut result = self.limbs()[limb_index.limb];
         result &= !(bit_mask << limb_index.bit_index);
         result |= self.fq().encode(value) << limb_index.bit_index;
@@ -497,7 +497,7 @@ impl<F: Field> FqSliceMut<'_, F> {
 
     pub fn slice_mut(&mut self, start: usize, end: usize) -> FqSliceMut<'_, F> {
         assert!(start <= end && end <= self.as_slice().len());
-        let orig_start = self.start;
+        let orig_start = self.start();
 
         FqSliceMut::new(
             self.fq(),
@@ -510,14 +510,14 @@ impl<F: Field> FqSliceMut<'_, F> {
     #[inline]
     #[must_use]
     pub fn as_slice(&self) -> FqSlice<'_, F> {
-        FqSlice::new(self.fq(), self.limbs(), self.start, self.end)
+        FqSlice::new(self.fq(), self.limbs(), self.start(), self.end)
     }
 
     /// Generates a version of itself with a shorter lifetime
     #[inline]
     #[must_use]
     pub fn copy(&mut self) -> FqSliceMut<'_, F> {
-        let start = self.start;
+        let start = self.start();
         let end = self.end;
 
         FqSliceMut::new(self.fq(), self.limbs_mut(), start, end)
