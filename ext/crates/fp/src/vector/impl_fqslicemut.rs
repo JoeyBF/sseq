@@ -7,14 +7,9 @@ use crate::{
     constants,
     field::{Field, element::FieldElement},
     limb::Limb,
-    prime::{Prime, ValidPrime},
 };
 
 impl<F: Field> FqSliceMut<'_, F> {
-    pub fn prime(&self) -> ValidPrime {
-        self.fq().characteristic().to_dyn()
-    }
-
     pub fn add_basis_element(&mut self, index: usize, value: FieldElement<F>) {
         assert_eq!(self.fq(), value.field());
         if self.fq().q() == 2 {

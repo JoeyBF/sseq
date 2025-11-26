@@ -9,7 +9,6 @@ use super::{
 use crate::{
     field::{Field, element::FieldElement},
     limb::Limb,
-    prime::{Prime, ValidPrime},
 };
 
 impl<F: Field> FqVector<F> {
@@ -79,10 +78,6 @@ impl<F: Field> FqVector<F> {
             }
         }
         Ok(())
-    }
-
-    pub fn prime(&self) -> ValidPrime {
-        self.fq().characteristic().to_dyn()
     }
 
     #[must_use]
