@@ -7,7 +7,10 @@ use crate::{
     field::{Field, element::FieldElement},
     limb::Limb,
     prime::{Prime, ValidPrime},
-    vector::repr::{CowRepr, OwnedRepr, Repr, ReprKind, ReprMut, ViewMutRepr, ViewRepr},
+    vector::{
+        iter::FqVectorIterator,
+        repr::{CowRepr, OwnedRepr, Repr, ReprKind, ReprMut, ViewMutRepr, ViewRepr},
+    },
 };
 
 // /// A vector over a finite field.
@@ -89,6 +92,11 @@ impl<R: Repr, F: Field> FqVectorBase<R, F> {
 
     pub fn as_slice(&self) -> FqSlice<'_, F> {
         self.slice(0, self.len())
+    }
+
+    /// TODO: implement prime 2 version
+    pub fn iter(&self) -> FqVectorIterator<'_, F> {
+        FqVectorIterator::new(self.as_slice())
     }
 
     pub fn is_zero(&self) -> bool {

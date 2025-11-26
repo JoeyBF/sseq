@@ -2,18 +2,13 @@ use itertools::Itertools;
 
 use super::{
     inner::{FqSlice, FqVector},
-    iter::{FqVectorIterator, FqVectorNonZeroIterator},
+    iter::FqVectorNonZeroIterator,
 };
 use crate::field::Field;
 
 // Public methods
 
 impl<'a, F: Field> FqSlice<'a, F> {
-    /// TODO: implement prime 2 version
-    pub fn iter(self) -> FqVectorIterator<'a, F> {
-        FqVectorIterator::new(self)
-    }
-
     pub fn iter_nonzero(self) -> FqVectorNonZeroIterator<'a, F> {
         FqVectorNonZeroIterator::new(self)
     }
