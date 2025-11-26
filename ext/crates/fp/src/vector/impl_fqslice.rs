@@ -1,5 +1,8 @@
 use super::inner::{FqSlice, FqVector};
-use crate::field::Field;
+use crate::{
+    field::Field,
+    vector::{FqVectorBase, repr::Repr},
+};
 
 // Public methods
 
@@ -34,8 +37,8 @@ impl<'a, F: Field> FqSlice<'a, F> {
     }
 }
 
-impl<'a, F: Field> From<&'a FqVector<F>> for FqSlice<'a, F> {
-    fn from(v: &'a FqVector<F>) -> Self {
-        v.slice(0, v.len())
+impl<'a, R: Repr, F: Field> From<&'a FqVectorBase<R, F>> for FqSlice<'a, F> {
+    fn from(v: &'a FqVectorBase<R, F>) -> Self {
+        v.as_slice()
     }
 }
