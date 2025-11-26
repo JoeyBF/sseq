@@ -87,6 +87,30 @@ impl<R: Repr, F: Field> FqVectorBase<R, F> {
         )
     }
 
+    pub fn is_zero(&self) -> bool {
+        if R::repr_kind() == ReprKind::Owned {
+            return self.limbs().iter().all(|&x| x == 0);
+        }
+
+        let limb_range = self.limb_range();
+        if limb_range.is_empty() {
+            return true;
+        }
+        let (min_mask, max_mask) = self.limb_masks();
+        if self.limbs()[limb_range.start] & min_mask != 0 {
+            return false;
+        }
+
+        let inner_range = self.limb_range_inner();
+        if !inner_range.is_empty() && self.limbs()[inner_range].iter().any(|&x| x != 0) {
+            return false;
+        }
+        if self.limbs()[limb_range.end - 1] & max_mask != 0 {
+            return false;
+        }
+        true
+    }
+
     pub fn entry(&self, index: usize) -> FieldElement<F> {
         debug_assert!(
             index < self.len(),

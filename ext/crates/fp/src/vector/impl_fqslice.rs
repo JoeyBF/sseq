@@ -18,26 +18,6 @@ impl<'a, F: Field> FqSlice<'a, F> {
         FqVectorNonZeroIterator::new(self)
     }
 
-    pub fn is_zero(&self) -> bool {
-        let limb_range = self.limb_range();
-        if limb_range.is_empty() {
-            return true;
-        }
-        let (min_mask, max_mask) = self.limb_masks();
-        if self.limbs()[limb_range.start] & min_mask != 0 {
-            return false;
-        }
-
-        let inner_range = self.limb_range_inner();
-        if !inner_range.is_empty() && self.limbs()[inner_range].iter().any(|&x| x != 0) {
-            return false;
-        }
-        if self.limbs()[limb_range.end - 1] & max_mask != 0 {
-            return false;
-        }
-        true
-    }
-
     #[must_use]
     pub fn restrict(self, start: usize, end: usize) -> Self {
         assert!(start <= end && end <= self.len());
