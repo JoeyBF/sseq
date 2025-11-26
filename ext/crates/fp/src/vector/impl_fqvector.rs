@@ -2,10 +2,7 @@ use std::io;
 
 use itertools::Itertools;
 
-use super::{
-    inner::FqVector,
-    iter::{FqVectorIterator, FqVectorNonZeroIterator},
-};
+use super::{inner::FqVector, iter::FqVectorNonZeroIterator};
 use crate::{
     field::{Field, element::FieldElement},
     limb::Limb,
@@ -78,10 +75,6 @@ impl<F: Field> FqVector<F> {
             }
         }
         Ok(())
-    }
-
-    pub fn iter(&self) -> FqVectorIterator<'_, F> {
-        self.as_slice().iter()
     }
 
     pub fn iter_nonzero(&self) -> FqVectorNonZeroIterator<'_, F> {
