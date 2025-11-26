@@ -60,16 +60,20 @@ impl<R: Repr, F: Field> FqVectorBase<R, F> {
         self.fq
     }
 
+    pub fn len(&self) -> usize {
+        self.repr.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     pub(super) fn start(&self) -> usize {
         self.repr.start()
     }
 
     pub(super) fn end(&self) -> usize {
         self.repr.end()
-    }
-
-    pub fn len(&self) -> usize {
-        self.repr.len()
     }
 
     pub(super) fn limbs(&self) -> &[Limb] {

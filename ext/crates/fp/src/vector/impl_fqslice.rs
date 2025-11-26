@@ -18,10 +18,6 @@ impl<'a, F: Field> FqSlice<'a, F> {
         self.fq().characteristic().to_dyn()
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.start() == self.end()
-    }
-
     pub fn entry(&self, index: usize) -> FieldElement<F> {
         debug_assert!(
             index < self.len(),

@@ -81,10 +81,6 @@ impl<F: Field> FqVector<F> {
         Ok(())
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-
     pub fn prime(&self) -> ValidPrime {
         self.fq().characteristic().to_dyn()
     }
