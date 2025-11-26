@@ -255,6 +255,17 @@ impl<R: ReprMut, F: Field> FqVectorBase<R, F> {
     pub(super) fn limbs_mut(&mut self) -> &mut [Limb] {
         self.repr.limbs_mut()
     }
+
+    pub(super) fn reduce_limbs(&mut self) {
+        let fq = self.fq();
+        if fq.q() != 2 {
+            let limb_range = self.limb_range();
+
+            for limb in self.limbs_mut()[limb_range].iter_mut() {
+                *limb = fq.reduce(*limb);
+            }
+        }
+    }
 }
 
 // Accessors
