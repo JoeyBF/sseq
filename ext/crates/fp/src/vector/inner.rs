@@ -87,6 +87,10 @@ impl<R: Repr, F: Field> FqVectorBase<R, F> {
         )
     }
 
+    pub fn as_slice(&self) -> FqSlice<'_, F> {
+        self.slice(0, self.len())
+    }
+
     pub fn is_zero(&self) -> bool {
         if R::repr_kind() == ReprKind::Owned {
             return self.limbs().iter().all(|&x| x == 0);
