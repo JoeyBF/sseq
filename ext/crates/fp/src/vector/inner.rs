@@ -7,7 +7,7 @@ use crate::{
     field::{Field, element::FieldElement},
     limb::Limb,
     prime::{Prime, ValidPrime},
-    vector::repr::{CowRepr, OwnedRepr, Repr, ReprMut, ViewMutRepr, ViewRepr},
+    vector::repr::{CowRepr, OwnedRepr, Repr, ReprKind, ReprMut, ViewMutRepr, ViewRepr},
 };
 
 // /// A vector over a finite field.
@@ -167,6 +167,29 @@ impl<R: Repr, F: Field> FqVectorBase<R, F> {
 }
 
 impl<R: ReprMut, F: Field> FqVectorBase<R, F> {
+    pub fn set_to_zero(&mut self) {
+        if R::repr_kind() == ReprKind::Owned {
+            // This is sound because `fq.encode(fq.zero())` is always zero.
+            for limb in self.limbs_mut() {
+                *limb = 0;
+            }
+            return;
+        }
+
+        let limb_range = self.limb_range();
+        if limb_range.is_empty() {
+            return;
+        }
+        let (min_mask, max_mask) = self.limb_masks();
+        self.limbs_mut()[limb_range.start] &= !min_mask;
+
+        let inner_range = self.limb_range_inner();
+        for limb in self.limbs_mut()[inner_range].iter_mut() {
+            *limb = 0;
+        }
+        self.limbs_mut()[limb_range.end - 1] &= !max_mask;
+    }
+
     pub fn set_entry(&mut self, index: usize, value: FieldElement<F>) {
         assert_eq!(self.fq(), value.field());
         assert!(index < self.len());
