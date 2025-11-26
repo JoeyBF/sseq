@@ -132,7 +132,7 @@ impl<'a> FpSlice<'a> {
         pub fn is_empty(&self) -> bool;
         pub fn @entry(&self, index: usize) -> u32;
         pub fn iter(&self) -> (dispatch FpVectorIterator<'_>);
-        pub fn iter_nonzero(self) -> (dispatch FpVectorNonZeroIterator<'a>);
+        pub fn iter_nonzero(&self) -> (dispatch FpVectorNonZeroIterator<'_>);
         pub fn is_zero(&self) -> bool;
         pub fn slice(&self, start: usize, end: usize) -> (dispatch FpSlice<'_>);
         pub fn restrict(self, start: usize, end: usize) -> (dispatch FpSlice<'a>);

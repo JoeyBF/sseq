@@ -2,7 +2,7 @@ use std::io;
 
 use itertools::Itertools;
 
-use super::{inner::FqVector, iter::FqVectorNonZeroIterator};
+use super::inner::FqVector;
 use crate::{
     field::{Field, element::FieldElement},
     limb::Limb,
@@ -75,10 +75,6 @@ impl<F: Field> FqVector<F> {
             }
         }
         Ok(())
-    }
-
-    pub fn iter_nonzero(&self) -> FqVectorNonZeroIterator<'_, F> {
-        self.as_slice().iter_nonzero()
     }
 
     /// Add `other` to `self` on the assumption that the first `offset` entries of `other` are

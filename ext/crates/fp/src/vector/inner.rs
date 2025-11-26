@@ -8,7 +8,7 @@ use crate::{
     limb::Limb,
     prime::{Prime, ValidPrime},
     vector::{
-        iter::FqVectorIterator,
+        iter::{FqVectorIterator, FqVectorNonZeroIterator},
         repr::{CowRepr, OwnedRepr, Repr, ReprKind, ReprMut, ViewMutRepr, ViewRepr},
     },
 };
@@ -97,6 +97,10 @@ impl<R: Repr, F: Field> FqVectorBase<R, F> {
     /// TODO: implement prime 2 version
     pub fn iter(&self) -> FqVectorIterator<'_, F> {
         FqVectorIterator::new(self.as_slice())
+    }
+
+    pub fn iter_nonzero(&self) -> FqVectorNonZeroIterator<'_, F> {
+        FqVectorNonZeroIterator::new(self.as_slice())
     }
 
     pub fn is_zero(&self) -> bool {

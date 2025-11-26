@@ -1,18 +1,11 @@
 use itertools::Itertools;
 
-use super::{
-    inner::{FqSlice, FqVector},
-    iter::FqVectorNonZeroIterator,
-};
+use super::inner::{FqSlice, FqVector};
 use crate::field::Field;
 
 // Public methods
 
 impl<'a, F: Field> FqSlice<'a, F> {
-    pub fn iter_nonzero(self) -> FqVectorNonZeroIterator<'a, F> {
-        FqVectorNonZeroIterator::new(self)
-    }
-
     #[must_use]
     pub fn restrict(self, start: usize, end: usize) -> Self {
         assert!(start <= end && end <= self.len());
