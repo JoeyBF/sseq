@@ -22,7 +22,10 @@ use crate::{
     field::{Fp, field_internal::FieldInternal},
     limb::Limb,
     prime::Prime,
-    vector::inner::{FqSlice, FqSliceMut, FqVector},
+    vector::{
+        FqSlice, FqSliceMut, FqVector, FqVectorBase,
+        repr::{OwnedRepr, Repr, ViewMutRepr, ViewRepr},
+    },
 };
 
 mod helpers;
@@ -43,20 +46,24 @@ use macros_2::{dispatch_struct, dispatch_vector, impl_try_into, use_primes};
 
 use_primes!();
 
-dispatch_struct! {
-    #[derive(Debug, Hash, Eq, PartialEq, Clone)]
-    pub FpVector from FqVector
+cfg_if::cfg_if! {
+    if #[cfg(feature = "odd-primes")] {
+        #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
+        pub enum FpVectorBase<R> {
+            _2(FqVectorBase<R, Fp<P2>>),
+            _3(FqVectorBase<R, Fp<P3>>),
+            _5(FqVectorBase<R, Fp<P5>>),
+            _7(FqVectorBase<R, Fp<P7>>),
+            Big(FqVectorBase<R, Fp<ValidPrime>>),
+        }
+    } else {
+        pub struct FpVectorBase<R>(FqVectorBase<R, Fp<P2>>);
+    }
 }
 
-dispatch_struct! {
-    #[derive(Debug, Copy, Clone)]
-    pub FpSlice<'a> from FqSlice
-}
-
-dispatch_struct! {
-    #[derive(Debug)]
-    pub FpSliceMut<'a> from FqSliceMut
-}
+pub type FpVector = FpVectorBase<OwnedRepr>;
+pub type FpSlice<'a> = FpVectorBase<ViewRepr<'a>>;
+pub type FpSliceMut<'a> = FpVectorBase<ViewMutRepr<'a>>;
 
 dispatch_struct! {
     pub FpVectorIterator<'a> from FqVectorIterator
