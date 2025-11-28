@@ -16,6 +16,7 @@ use itertools::Itertools;
 
 use super::{
     FqSlice, FqSliceMut, FqVector, FqVectorBase, FqVectorIterator, FqVectorNonZeroIterator, Repr,
+    ReprMut,
 };
 use crate::field::Field;
 
@@ -25,7 +26,7 @@ impl<const A: bool, R: Repr, F: Field> FqVectorBase<A, R, F> {
     }
 }
 
-impl<F: Field> FqVector<F> {
+impl<const A: bool, R: ReprMut, F: Field> FqVectorBase<A, R, F> {
     pub(super) fn scale_helper(&mut self, c: F::ElementContainer) {
         self.scale(self.fq().el(c))
     }
@@ -34,6 +35,12 @@ impl<F: Field> FqVector<F> {
         self.set_entry(index, self.fq().el(value))
     }
 
+    pub(super) fn add_basis_element_helper(&mut self, index: usize, value: F::ElementContainer) {
+        self.add_basis_element(index, self.fq().el(value))
+    }
+}
+
+impl<F: Field> FqVector<F> {
     pub(super) fn add_helper(&mut self, other: &Self, c: F::ElementContainer) {
         self.add(other, self.fq().el(c))
     }
@@ -45,10 +52,6 @@ impl<F: Field> FqVector<F> {
         offset: usize,
     ) {
         self.add_offset(other, self.fq().el(c), offset)
-    }
-
-    pub(super) fn add_basis_element_helper(&mut self, index: usize, value: F::ElementContainer) {
-        self.add_basis_element(index, self.fq().el(value))
     }
 
     pub(super) fn copy_from_slice_helper(&mut self, other: &[F::ElementContainer]) {
@@ -81,20 +84,8 @@ impl<F: Field> FqVector<F> {
 }
 
 impl<F: Field> FqSliceMut<'_, F> {
-    pub(super) fn scale_helper(&mut self, c: F::ElementContainer) {
-        self.scale(self.fq().el(c))
-    }
-
     pub(super) fn add_helper(&mut self, other: FqSlice<F>, c: F::ElementContainer) {
         self.add(other, self.fq().el(c))
-    }
-
-    pub(super) fn set_entry_helper(&mut self, index: usize, value: F::ElementContainer) {
-        self.set_entry(index, self.fq().el(value))
-    }
-
-    pub(super) fn add_basis_element_helper(&mut self, index: usize, value: F::ElementContainer) {
-        self.add_basis_element(index, self.fq().el(value))
     }
 
     pub(super) fn add_masked_helper(
