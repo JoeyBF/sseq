@@ -15,15 +15,20 @@
 use itertools::Itertools;
 
 use super::{FqSlice, FqSliceMut, FqVector, FqVectorIterator, FqVectorNonZeroIterator};
-use crate::field::Field;
+use crate::{
+    field::Field,
+    vector::{FqVectorBase, repr::Repr},
+};
+
+impl<R: Repr, F: Field> FqVectorBase<R, F> {
+    pub(super) fn entry_helper(&self, index: usize) -> F::ElementContainer {
+        self.entry(index).val()
+    }
+}
 
 impl<F: Field> FqVector<F> {
     pub(super) fn scale_helper(&mut self, c: F::ElementContainer) {
         self.scale(self.fq().el(c))
-    }
-
-    pub(super) fn entry_helper(&self, index: usize) -> F::ElementContainer {
-        self.entry(index).val()
     }
 
     pub(super) fn set_entry_helper(&mut self, index: usize, value: F::ElementContainer) {
@@ -73,12 +78,6 @@ impl<F: Field> FqVector<F> {
 
     pub(super) fn first_nonzero_helper(&self) -> Option<(usize, F::ElementContainer)> {
         self.first_nonzero().map(|(idx, c)| (idx, c.val()))
-    }
-}
-
-impl<F: Field> FqSlice<'_, F> {
-    pub(super) fn entry_helper(&self, index: usize) -> F::ElementContainer {
-        self.entry(index).val()
     }
 }
 
