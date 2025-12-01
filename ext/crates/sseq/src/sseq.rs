@@ -371,7 +371,11 @@ impl<P: SseqProfile> Sseq<P> {
 
     /// Compute the product between `product` and the class `class` at `(x, y)`. Returns `None` if
     /// the product is not yet computed.
-    pub fn multiply(&self, elem: &BidegreeElement, prod: &Product) -> Option<BidegreeElement> {
+    pub fn multiply(
+        &self,
+        elem: &BidegreeElement,
+        prod: &Product,
+    ) -> Option<BidegreeElement<'static>> {
         let mut result = FpVector::new(self.p, self.classes.get_dimension(elem.degree() + prod.b)?);
         if let Some(matrix) = &prod.matrices.get(elem.x())?.get(elem.y())? {
             matrix.apply(result.as_slice_mut(), 1, elem.vec());
@@ -400,7 +404,7 @@ impl<P: SseqProfile> Sseq<P> {
         elem: &BidegreeElement,
         source_product: &Product,
         target_product: Option<&Product>,
-    ) -> Option<(i32, BidegreeElement)> {
+    ) -> Option<(i32, BidegreeElement<'static>)> {
         let source = self.multiply(elem, source_product)?;
 
         // The class and the product are both permanent.

@@ -59,7 +59,7 @@ impl BidegreeGenerator {
         self.idx
     }
 
-    pub fn into_element(self, p: ValidPrime, ambient: usize) -> BidegreeElement {
+    pub fn into_element(self, p: ValidPrime, ambient: usize) -> BidegreeElement<'static> {
         let mut vec = FpVector::new(p, ambient);
         vec.set_entry(self.idx, 1);
         BidegreeElement::new(self.degree, vec)
@@ -83,7 +83,7 @@ impl From<(Bidegree, usize)> for BidegreeGenerator {
     }
 }
 
-impl TryFrom<BidegreeElement> for BidegreeGenerator {
+impl TryFrom<BidegreeElement<'_>> for BidegreeGenerator {
     type Error = ();
 
     fn try_from(value: BidegreeElement) -> Result<Self, Self::Error> {

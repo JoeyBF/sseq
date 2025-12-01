@@ -1,23 +1,36 @@
 use std::fmt::{self, Display, Formatter};
 
-use fp::vector::{FpSlice, FpVector};
-use serde::{Deserialize, Serialize};
+use fp::vector::{FpCow, FpSlice, FpVector};
 
 use crate::coordinates::{Bidegree, BidegreeGenerator};
 
 /// An element of a bigraded vector space. Most commonly used to index elements of spectral
 /// sequences.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct BidegreeElement {
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct BidegreeElement<'a> {
     /// Bidegree of the element
     degree: Bidegree,
     /// Representing vector
-    vec: FpVector,
+    vec: FpCow<'a>,
 }
 
-impl BidegreeElement {
+impl BidegreeElement<'static> {
     pub fn new(degree: Bidegree, vec: FpVector) -> Self {
+        Self::from_cow(degree, vec.into_cow())
+    }
+
+    pub fn into_vec(self) -> FpVector {
+        self.vec.into_vec()
+    }
+}
+
+impl<'a> BidegreeElement<'a> {
+    pub fn from_cow(degree: Bidegree, vec: FpCow<'a>) -> Self {
         Self { degree, vec }
+    }
+
+    pub fn from_slice(degree: Bidegree, vec: FpSlice<'a>) -> Self {
+        Self::from_cow(degree, vec.into_cow())
     }
 
     pub fn s(&self) -> i32 {
@@ -48,10 +61,6 @@ impl BidegreeElement {
         self.vec.as_slice()
     }
 
-    pub fn into_vec(self) -> FpVector {
-        self.vec
-    }
-
     /// Get the string representation of the element as a linear combination of generators. For
     /// example, an element in bidegree `(n,s)` with vector `[0,2,1]` will be printed as `2 x_(n, s,
     /// 1) + x_(n, s, 2)`.
@@ -72,7 +81,7 @@ impl BidegreeElement {
     }
 }
 
-impl Display for BidegreeElement {
+impl<'a> Display for BidegreeElement<'a> {
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
         if f.alternate() {
             write!(f, "({},{}){}", self.n(), self.s(), self.vec())
