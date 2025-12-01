@@ -12,7 +12,7 @@
 //! we can't simply define `type FpVector = FqVector<Fp<2>>` like we previously did: we need to use
 //! a transparent wrapper.
 
-use std::{convert::TryInto, io};
+use std::{borrow::Cow, convert::TryInto, io};
 
 use itertools::Itertools;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -63,6 +63,7 @@ cfg_if::cfg_if! {
 pub type FpVector = FpVectorBase<true, Vec<Limb>>;
 pub type FpSlice<'a> = FpVectorBase<false, &'a [Limb]>;
 pub type FpSliceMut<'a> = FpVectorBase<false, &'a mut [Limb]>;
+pub type FpCow<'a> = FpVectorBase<false, Cow<'a, [Limb]>>;
 
 dispatch_struct! {
     pub FpVectorIterator<'a> from FqVectorIterator
@@ -120,6 +121,8 @@ impl FpVector {
         pub fn new<P: Prime>(p: P, len: usize) -> (from FqVector);
         pub fn new_with_capacity<P: Prime>(p: P, len: usize, capacity: usize) -> (from FqVector);
 
+        pub fn into_cow(self) -> (dispatch FpCow<'static>);
+
         pub fn update_from_bytes(&mut self, data: &mut impl io::Read) -> (io::Result<()>);
         pub fn from_bytes<P: Prime>(p: P, len: usize, data: &mut impl io::Read) -> (from io FqVector);
         pub fn to_bytes(&self, buffer: &mut impl io::Write) -> (io::Result<()>);
@@ -146,6 +149,7 @@ impl<'a> FpSlice<'a> {
     dispatch_vector! {
         pub fn restrict(self, start: usize, end: usize) -> (dispatch FpSlice<'a>);
         pub fn to_owned(self) -> (dispatch FpVector);
+        pub fn into_cow(self) -> (dispatch FpCow<'a>);
     }
 }
 
@@ -157,6 +161,12 @@ impl FpSliceMut<'_> {
         pub fn @add_masked(&mut self, other: FpSlice, c: u32, mask: &[usize]);
         pub fn @add_unmasked(&mut self, other: FpSlice, c: u32, mask: &[usize]);
         pub fn @add_tensor(&mut self, offset: usize, coeff: u32, @left: FpSlice, right: FpSlice);
+    }
+}
+
+impl FpCow<'static> {
+    dispatch_vector! {
+        pub fn into_vec(self) -> (dispatch FpVector);
     }
 }
 

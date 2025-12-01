@@ -404,6 +404,17 @@ impl<F: Field> FqVector<F> {
         Self::_new(fq, limbs, 0, len)
     }
 
+    pub fn into_cow(self) -> FqCow<'static, F> {
+        let FqVector {
+            fq,
+            limbs,
+            start,
+            end,
+        } = self;
+
+        FqCow::_new(fq, Cow::Owned(limbs), start, end)
+    }
+
     pub(super) fn vec_mut(&mut self) -> &mut Vec<Limb> {
         &mut self.limbs
     }
@@ -414,7 +425,37 @@ impl<F: Field> FqVector<F> {
 }
 
 impl<'a, F: Field> FqSlice<'a, F> {
+    pub fn into_cow(self) -> FqCow<'a, F> {
+        let FqSlice {
+            fq,
+            limbs,
+            start,
+            end,
+        } = self;
+
+        FqCow::_new(fq, Cow::Borrowed(limbs), start, end)
+    }
+
     pub(super) fn into_limbs(self) -> &'a [Limb] {
         self.limbs
+    }
+}
+
+impl<F: Field> FqCow<'static, F> {
+    pub fn into_vec(self) -> FqVector<F> {
+        let FqCow {
+            fq,
+            limbs,
+            start,
+            end,
+        } = self;
+
+        let owned = limbs.into_owned();
+
+        if start != 0 {
+            todo!("Nontrivial alignment of FqCow")
+        } else {
+            FqVector::from_raw_parts(fq, end, owned)
+        }
     }
 }
