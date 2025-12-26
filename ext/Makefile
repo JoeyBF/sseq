@@ -4,8 +4,9 @@ all:
 	cargo build
 
 test:
-	cargo test --examples
-	cargo test --features concurrent --lib --tests --workspace
+	cargo nextest run --examples
+	cargo nextest run --features concurrent --lib --tests --workspace
+	# We don't use nextest for concurrent tests
 	cargo test --features concurrent --doc --workspace
 	pytest
 

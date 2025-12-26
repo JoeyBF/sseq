@@ -39,6 +39,9 @@ jobs:
       - name: Install testing requirements
         run: pip install pytest
 
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+
       - name: Run ext tests
         run: make -C ext test
 
