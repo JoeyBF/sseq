@@ -1,4 +1,4 @@
-<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="Source of the Rust file `examples/secondary_massey.rs`."><title>secondary_massey.rs - source</title><script>if(window.location.protocol!=="file:")document.head.insertAdjacentHTML("beforeend","SourceSerif4-Regular-6b053e98.ttf.woff2,FiraSans-Italic-81dc35de.woff2,FiraSans-Regular-0fe48ade.woff2,FiraSans-MediumItalic-ccf7e434.woff2,FiraSans-Medium-e1aa3f0a.woff2,SourceCodePro-Regular-8badfe75.ttf.woff2,SourceCodePro-Semibold-aa29a496.ttf.woff2".split(",").map(f=>`<link rel="preload" as="font" type="font/woff2"href="../../static.files/${f}">`).join(""))</script><link rel="stylesheet" href="../../static.files/normalize-9960930a.css"><link rel="stylesheet" href="../../static.files/rustdoc-ca0dd0c4.css"><meta name="rustdoc-vars" data-root-path="../../" data-static-root-path="../../static.files/" data-current-crate="secondary_massey" data-themes="" data-resource-suffix="" data-rustdoc-version="1.92.0 (ded5c06cf 2025-12-08)" data-channel="1.92.0" data-search-js="search-d69d8955.js" data-stringdex-js="stringdex-c3e638e9.js" data-settings-js="settings-c38705f0.js" ><script src="../../static.files/storage-e2aeef58.js"></script><script defer src="../../static.files/src-script-813739b1.js"></script><script defer src="../../src-files.js"></script><script defer src="../../static.files/main-ce535bd0.js"></script><noscript><link rel="stylesheet" href="../../static.files/noscript-263c88ec.css"></noscript><link rel="alternate icon" type="image/png" href="../../static.files/favicon-32x32-eab170b8.png"><link rel="icon" type="image/svg+xml" href="../../static.files/favicon-044be391.svg"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.13.3/dist/katex.min.css" integrity="sha384-ThssJ7YtjywV52Gj4JE/1SQEDoMEckXyhkFVwaf4nDSm5OBlXeedVYjuuUd0Yua+" crossorigin="anonymous">
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="Source of the Rust file `examples/secondary_massey.rs`."><title>secondary_massey.rs - source</title><script>if(window.location.protocol!=="file:")document.head.insertAdjacentHTML("beforeend","SourceSerif4-Regular-6b053e98.ttf.woff2,FiraSans-Italic-81dc35de.woff2,FiraSans-Regular-0fe48ade.woff2,FiraSans-MediumItalic-ccf7e434.woff2,FiraSans-Medium-e1aa3f0a.woff2,SourceCodePro-Regular-8badfe75.ttf.woff2,SourceCodePro-Semibold-aa29a496.ttf.woff2".split(",").map(f=>`<link rel="preload" as="font" type="font/woff2"href="../../static.files/${f}">`).join(""))</script><link rel="stylesheet" href="../../static.files/normalize-9960930a.css"><link rel="stylesheet" href="../../static.files/rustdoc-ca0dd0c4.css"><meta name="rustdoc-vars" data-root-path="../../" data-static-root-path="../../static.files/" data-current-crate="secondary_massey" data-themes="" data-resource-suffix="" data-rustdoc-version="1.93.0 (254b59607 2026-01-19)" data-channel="1.93.0" data-search-js="search-9e2438ea.js" data-stringdex-js="stringdex-a3946164.js" data-settings-js="settings-c38705f0.js" ><script src="../../static.files/storage-e2aeef58.js"></script><script defer src="../../static.files/src-script-813739b1.js"></script><script defer src="../../src-files.js"></script><script defer src="../../static.files/main-a410ff4d.js"></script><noscript><link rel="stylesheet" href="../../static.files/noscript-263c88ec.css"></noscript><link rel="alternate icon" type="image/png" href="../../static.files/favicon-32x32-eab170b8.png"><link rel="icon" type="image/svg+xml" href="../../static.files/favicon-044be391.svg"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.13.3/dist/katex.min.css" integrity="sha384-ThssJ7YtjywV52Gj4JE/1SQEDoMEckXyhkFVwaf4nDSm5OBlXeedVYjuuUd0Yua+" crossorigin="anonymous">
 <!-- The loading of KaTeX is deferred to speed up page rendering -->
 <script defer src="https://cdn.jsdelivr.net/npm/katex@0.13.3/dist/katex.min.js" integrity="sha384-Bi8OWqMXO1ta+a4EPkZv7bYGIes7C3krGSZoTGNTAnAn5eYQc7IIXrJ/7ck1drAi" crossorigin="anonymous"></script>
 <!-- To automatically render math in text elements, include the auto-render extension: -->
@@ -415,7 +415,7 @@
 <a href=#390 id=390 data-nosnippet>390</a>            </span>{
 <a href=#391 id=391 data-nosnippet>391</a>                <span class="macro">print!</span>(<span class="string">"&lt;{a_name}, {b_name}, "</span>);
 <a href=#392 id=392 data-nosnippet>392</a>                <span class="kw">let </span>has_ext = {
-<a href=#393 id=393 data-nosnippet>393</a>                    <span class="kw">let </span>ext_part = g.slice(<span class="number">0</span>, target_num_gens);
+<a href=#393 id=393 data-nosnippet>393</a>                    <span class="kw">let </span>ext_part = g.restrict(<span class="number">0</span>, target_num_gens);
 <a href=#394 id=394 data-nosnippet>394</a>                    <span class="kw">if </span>ext_part.iter_nonzero().count() &gt; <span class="number">0 </span>{
 <a href=#395 id=395 data-nosnippet>395</a>                        <span class="macro">print!</span>(
 <a href=#396 id=396 data-nosnippet>396</a>                            <span class="string">"[{basis_string}]"</span>,
@@ -428,7 +428,7 @@
 <a href=#403 id=403 data-nosnippet>403</a>                    </span>}
 <a href=#404 id=404 data-nosnippet>404</a>                };
 <a href=#405 id=405 data-nosnippet>405</a>
-<a href=#406 id=406 data-nosnippet>406</a>                <span class="kw">let </span>lambda_part = g.slice(target_num_gens, target_all_gens);
+<a href=#406 id=406 data-nosnippet>406</a>                <span class="kw">let </span>lambda_part = g.restrict(target_num_gens, target_all_gens);
 <a href=#407 id=407 data-nosnippet>407</a>                <span class="kw">let </span>num_entries = lambda_part.iter_nonzero().count();
 <a href=#408 id=408 data-nosnippet>408</a>                <span class="kw">if </span>num_entries &gt; <span class="number">0 </span>{
 <a href=#409 id=409 data-nosnippet>409</a>                    <span class="kw">if </span>has_ext {
@@ -438,7 +438,7 @@
 <a href=#413 id=413 data-nosnippet>413</a>
 <a href=#414 id=414 data-nosnippet>414</a>                    <span class="kw">let </span>basis_string = BidegreeElement::new(
 <a href=#415 id=415 data-nosnippet>415</a>                        c + LAMBDA_BIDEGREE,
-<a href=#416 id=416 data-nosnippet>416</a>                        g.slice(target_num_gens, target_all_gens).to_owned(),
+<a href=#416 id=416 data-nosnippet>416</a>                        g.restrict(target_num_gens, target_all_gens).to_owned(),
 <a href=#417 id=417 data-nosnippet>417</a>                    )
 <a href=#418 id=418 data-nosnippet>418</a>                    .to_basis_string();
 <a href=#419 id=419 data-nosnippet>419</a>                    <span class="kw">if </span>num_entries == <span class="number">1 </span>{
@@ -455,14 +455,14 @@
 <a href=#430 id=430 data-nosnippet>430</a>            scratch1.set_scratch_vector_size(source_lambda_num_gens);
 <a href=#431 id=431 data-nosnippet>431</a>
 <a href=#432 id=432 data-nosnippet>432</a>            <span class="comment">// First deal with the null-homotopy of ab
-<a href=#433 id=433 data-nosnippet>433</a>            </span><span class="kw">for </span>(i, v) <span class="kw">in </span>g.slice(<span class="number">0</span>, target_num_gens).iter_nonzero() {
+<a href=#433 id=433 data-nosnippet>433</a>            </span><span class="kw">for </span>(i, v) <span class="kw">in </span>g.restrict(<span class="number">0</span>, target_num_gens).iter_nonzero() {
 <a href=#434 id=434 data-nosnippet>434</a>                scratch0
 <a href=#435 id=435 data-nosnippet>435</a>                    .iter_mut()
 <a href=#436 id=436 data-nosnippet>436</a>                    .zip_eq(<span class="kw-2">&amp;</span>m0[i])
 <a href=#437 id=437 data-nosnippet>437</a>                    .for_each(|(a, b)| <span class="kw-2">*</span>a += v * b);
 <a href=#438 id=438 data-nosnippet>438</a>                scratch1.as_slice_mut().add(m1.row(i), v);
 <a href=#439 id=439 data-nosnippet>439</a>            }
-<a href=#440 id=440 data-nosnippet>440</a>            <span class="kw">for </span>(i, v) <span class="kw">in </span>g.slice(target_num_gens, target_all_gens).iter_nonzero() {
+<a href=#440 id=440 data-nosnippet>440</a>            <span class="kw">for </span>(i, v) <span class="kw">in </span>g.restrict(target_num_gens, target_all_gens).iter_nonzero() {
 <a href=#441 id=441 data-nosnippet>441</a>                scratch1.as_slice_mut().add(mt.row(i), v);
 <a href=#442 id=442 data-nosnippet>442</a>            }
 <a href=#443 id=443 data-nosnippet>443</a>            <span class="comment">// Now do the -1 part of the null-homotopy of bc.
@@ -489,7 +489,7 @@
 <a href=#464 id=464 data-nosnippet>464</a>            </span>scratch0.clear();
 <a href=#465 id=465 data-nosnippet>465</a>            scratch0.resize(prod_num_gens, <span class="number">0</span>);
 <a href=#466 id=466 data-nosnippet>466</a>
-<a href=#467 id=467 data-nosnippet>467</a>            <span class="kw">for </span>(i, v) <span class="kw">in </span>g.slice(<span class="number">0</span>, target_num_gens).iter_nonzero() {
+<a href=#467 id=467 data-nosnippet>467</a>            <span class="kw">for </span>(i, v) <span class="kw">in </span>g.restrict(<span class="number">0</span>, target_num_gens).iter_nonzero() {
 <a href=#468 id=468 data-nosnippet>468</a>                scratch0
 <a href=#469 id=469 data-nosnippet>469</a>                    .iter_mut()
 <a href=#470 id=470 data-nosnippet>470</a>                    .zip_eq(<span class="kw-2">&amp;</span>mb[i])
@@ -516,4 +516,5 @@
 <a href=#491 id=491 data-nosnippet>491</a>        }
 <a href=#492 id=492 data-nosnippet>492</a>    }
 <a href=#493 id=493 data-nosnippet>493</a>    <span class="prelude-val">Ok</span>(())
-<a href=#494 id=494 data-nosnippet>494</a>}</code></pre></div></section></main></body></html>
+<a href=#494 id=494 data-nosnippet>494</a>}
+</code></pre></div></section></main></body></html>
