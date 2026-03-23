@@ -43,7 +43,6 @@
           make lint
           make test
           make benchmarks
-          make benchmarks-nassau
           make benchmarks-concurrent
           make miri
         '');

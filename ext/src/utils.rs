@@ -2,10 +2,13 @@
 use std::{path::PathBuf, sync::Arc};
 
 use algebra::{
-    AlgebraType, MilnorAlgebra, SteenrodAlgebra,
-    module::{FDModule, Module, SteenrodModule, steenrod_module},
+    AlgebraType, SteenrodAlgebra,
+    module::{
+        FDModule, Module, SteenrodModule, homomorphism::FreeModuleHomomorphism, steenrod_module,
+    },
 };
 use anyhow::{Context, anyhow};
+use fp::vector::{FpSlice, FpSliceMut};
 use serde_json::Value;
 use sseq::coordinates::{Bidegree, BidegreeGenerator};
 
@@ -16,16 +19,113 @@ use crate::{
     save::SaveDirectory,
 };
 
-// We build docs with --all-features so the docs are at the feature = "nassau" version
-#[cfg(not(feature = "nassau"))]
-pub type QueryModuleResolution = Resolution<CCC>;
+/// The type returned by [`query_module`]. This is an augmented free chain complex over
+/// [`SteenrodAlgebra`] that dispatches to either the standard resolution algorithm or
+/// [Nassau's algorithm](crate::nassau) at runtime.
+pub enum QueryModuleResolution {
+    Standard(Resolution<CCC>),
+    Nassau(crate::nassau::Resolution),
+}
 
-/// The type returned by [`query_module`]. The value of this type depends on whether
-/// [`nassau`](crate::nassau) is enabled. In any case, it is an augmented free chain complex over
-/// either [`SteenrodAlgebra`] or [`MilnorAlgebra`] and supports the `compute_through_stem`
-/// function.
-#[cfg(feature = "nassau")]
-pub type QueryModuleResolution = crate::nassau::Resolution<FDModule<MilnorAlgebra>>;
+/// Delegate a method call to both enum variants.
+macro_rules! delegate {
+    ($self:ident, $method:ident ( $($arg:expr),* )) => {
+        match $self {
+            Self::Standard(r) => r.$method($($arg),*),
+            Self::Nassau(r) => r.$method($($arg),*),
+        }
+    };
+}
+
+impl ChainComplex for QueryModuleResolution {
+    type Algebra = SteenrodAlgebra;
+    type Homomorphism = FreeModuleHomomorphism<algebra::module::FreeModule<SteenrodAlgebra>>;
+    type Module = algebra::module::FreeModule<SteenrodAlgebra>;
+
+    fn algebra(&self) -> Arc<Self::Algebra> {
+        delegate!(self, algebra())
+    }
+
+    fn min_degree(&self) -> i32 {
+        delegate!(self, min_degree())
+    }
+
+    fn zero_module(&self) -> Arc<Self::Module> {
+        delegate!(self, zero_module())
+    }
+
+    fn module(&self, s: i32) -> Arc<Self::Module> {
+        delegate!(self, module(s))
+    }
+
+    fn differential(&self, s: i32) -> Arc<Self::Homomorphism> {
+        delegate!(self, differential(s))
+    }
+
+    fn has_computed_bidegree(&self, b: Bidegree) -> bool {
+        delegate!(self, has_computed_bidegree(b))
+    }
+
+    fn compute_through_bidegree(&self, b: Bidegree) {
+        delegate!(self, compute_through_bidegree(b))
+    }
+
+    fn next_homological_degree(&self) -> i32 {
+        delegate!(self, next_homological_degree())
+    }
+
+    fn apply_quasi_inverse<T, S>(&self, results: &mut [T], b: Bidegree, inputs: &[S]) -> bool
+    where
+        for<'a> &'a mut T: Into<FpSliceMut<'a>>,
+        for<'a> &'a S: Into<FpSlice<'a>>,
+    {
+        delegate!(self, apply_quasi_inverse(results, b, inputs))
+    }
+
+    fn save_dir(&self) -> &SaveDirectory {
+        delegate!(self, save_dir())
+    }
+}
+
+impl AugmentedChainComplex for QueryModuleResolution {
+    type ChainMap = FreeModuleHomomorphism<SteenrodModule>;
+    type TargetComplex = CCC;
+
+    fn target(&self) -> Arc<Self::TargetComplex> {
+        delegate!(self, target())
+    }
+
+    fn chain_map(&self, s: i32) -> Arc<Self::ChainMap> {
+        delegate!(self, chain_map(s))
+    }
+}
+
+impl QueryModuleResolution {
+    pub fn name(&self) -> &str {
+        delegate!(self, name())
+    }
+
+    pub fn set_name(&mut self, name: String) {
+        delegate!(self, set_name(name))
+    }
+
+    pub fn compute_through_stem(&self, max: Bidegree) {
+        delegate!(self, compute_through_stem(max))
+    }
+
+    pub fn set_load_quasi_inverse(&mut self, value: bool) {
+        match self {
+            Self::Standard(r) => r.load_quasi_inverse = value,
+            Self::Nassau(_) => {
+                assert!(
+                    !value,
+                    "Quasi inverse loading not supported with Nassau. Please use a save directory \
+                     instead"
+                );
+            }
+        }
+    }
+}
 
 const STATIC_MODULES_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../ext/steenrod_modules");
 
@@ -133,8 +233,14 @@ impl<T: TryInto<AlgebraType>> TryFrom<(Value, T)> for Config {
 ///  - `save_file`: The save file for the module. If it points to an invalid save file, an error is
 ///    returned.
 ///
-/// This dispatches to either [`construct_nassau`] or [`construct_standard`] depending on whether
-/// the `nassau` feature is enabled.
+/// This automatically dispatches to [`construct_nassau`] when all of the following hold:
+/// - The algebra type is Milnor
+/// - The prime is 2
+/// - The module is finite dimensional
+/// - No profile is specified
+/// - No cofiber is specified
+///
+/// Otherwise, it dispatches to [`construct_standard`].
 pub fn construct<T, E>(
     module_spec: T,
     save_dir: impl Into<SaveDirectory>,
@@ -143,31 +249,53 @@ where
     anyhow::Error: From<E>,
     T: TryInto<Config, Error = E>,
 {
-    #[cfg(feature = "nassau")]
-    {
-        construct_nassau(module_spec, save_dir)
+    let config: Config = module_spec.try_into()?;
+    let save_dir = save_dir.into();
+    if should_use_nassau(&config, &save_dir) {
+        Ok(QueryModuleResolution::Nassau(construct_nassau_inner(
+            config, save_dir,
+        )?))
+    } else {
+        Ok(QueryModuleResolution::Standard(construct_standard_inner::<
+            false,
+        >(config, save_dir)?))
     }
+}
 
-    #[cfg(not(feature = "nassau"))]
-    {
-        construct_standard(module_spec, save_dir)
+fn should_use_nassau(config: &Config, save_dir: &SaveDirectory) -> bool {
+    // Nassau requires a save directory because its quasi-inverses are only available from disk.
+    // Without one, code that depends on quasi-inverses (ResolutionHomomorphism,
+    // SecondaryResolution) would silently fail.
+    if save_dir.is_none() {
+        return false;
     }
+    let json = &config.module;
+    config.algebra == AlgebraType::Milnor
+        && json["p"].as_i64() == Some(2)
+        && json["type"].as_str() == Some("finite dimensional module")
+        && json["profile"].is_null()
+        && json["cofiber"].is_null()
 }
 
 /// See [`construct`]
 pub fn construct_nassau<T, E>(
     module_spec: T,
     save_dir: impl Into<SaveDirectory>,
-) -> anyhow::Result<crate::nassau::Resolution<FDModule<MilnorAlgebra>>>
+) -> anyhow::Result<crate::nassau::Resolution>
 where
     anyhow::Error: From<E>,
     T: TryInto<Config, Error = E>,
 {
-    let Config {
+    construct_nassau_inner(module_spec.try_into()?, save_dir.into())
+}
+
+fn construct_nassau_inner(
+    Config {
         module: json,
         algebra,
-    } = module_spec.try_into()?;
-
+    }: Config,
+    save_dir: SaveDirectory,
+) -> anyhow::Result<crate::nassau::Resolution> {
     if algebra == AlgebraType::Adem {
         return Err(anyhow!("Nassau's algorithm requires Milnor's basis"));
     }
@@ -184,14 +312,19 @@ where
             "Nassau's algorithm only supports finite dimensional modules"
         ));
     }
-
-    let algebra = Arc::new(MilnorAlgebra::new(fp::prime::TWO, false));
-    let module = Arc::new(FDModule::from_json(Arc::clone(&algebra), &json)?);
-
     if !json["cofiber"].is_null() {
         return Err(anyhow!("Nassau's algorithm does not support cofiber"));
     }
-    crate::nassau::Resolution::new_with_save(module, save_dir)
+
+    let algebra = Arc::new(SteenrodAlgebra::from_json(
+        &json,
+        AlgebraType::Milnor,
+        false,
+    )?);
+    let module = Arc::new(steenrod_module::from_json(Arc::clone(&algebra), &json)?);
+    let target = Arc::new(FiniteChainComplex::ccdz(module));
+
+    crate::nassau::Resolution::new_with_save(target, save_dir)
 }
 
 /// See [`construct`]
@@ -204,11 +337,19 @@ where
     T: TryInto<Config, Error = E>,
     SteenrodAlgebra: algebra::MuAlgebra<U>,
 {
-    let Config {
+    construct_standard_inner(module_spec.try_into()?, save_dir.into())
+}
+
+fn construct_standard_inner<const U: bool>(
+    Config {
         module: json,
         algebra,
-    } = module_spec.try_into()?;
-
+    }: Config,
+    save_dir: SaveDirectory,
+) -> anyhow::Result<crate::resolution::MuResolution<U, CCC>>
+where
+    SteenrodAlgebra: algebra::MuAlgebra<U>,
+{
     let algebra = Arc::new(SteenrodAlgebra::from_json(&json, algebra, U)?);
     let module = Arc::new(steenrod_module::from_json(Arc::clone(&algebra), &json)?);
     let mut chain_complex = Arc::new(FiniteChainComplex::ccdz(Arc::clone(&module)));
@@ -328,8 +469,7 @@ pub fn unicode_num(n: usize) -> char {
 ///   they must be accessed via `apply_quasi_inverse`.
 ///
 /// # Returns
-/// A [`QueryModuleResolution`]. Note that this type depends on whether the `nassau` feature is
-/// enabled.
+/// A [`QueryModuleResolution`].
 pub fn query_module_only(
     prompt: &str,
     algebra: Option<AlgebraType>,
@@ -353,17 +493,7 @@ pub fn query_module_only(
         construct(module, save_dir).context("Failed to load module from save file")?;
 
     let load_quasi_inverse = load_quasi_inverse && resolution.save_dir().is_none();
-
-    #[cfg(not(feature = "nassau"))]
-    {
-        resolution.load_quasi_inverse = load_quasi_inverse;
-    }
-
-    #[cfg(feature = "nassau")]
-    assert!(
-        !load_quasi_inverse,
-        "Quasi inverse loading not support with Nassau. Please use a save directory instead"
-    );
+    resolution.set_load_quasi_inverse(load_quasi_inverse);
 
     resolution.set_name(name);
 
@@ -446,19 +576,17 @@ pub fn get_unit(
             String::from("unit"),
             bivec::BiVec::from_vec(0, vec![1]),
         );
+        let cc = Arc::new(FiniteChainComplex::ccdz(Arc::new(
+            Box::new(module) as SteenrodModule
+        )));
 
-        #[cfg(feature = "nassau")]
-        {
-            Arc::new(crate::nassau::Resolution::new_with_save(
-                Arc::new(module),
-                save_dir,
-            )?)
-        }
-
-        #[cfg(not(feature = "nassau"))]
-        {
-            let cc = FiniteChainComplex::ccdz(Arc::new(Box::new(module) as SteenrodModule));
-            Arc::new(Resolution::new_with_save(Arc::new(cc), save_dir)?)
+        match &*resolution {
+            QueryModuleResolution::Nassau(_) => Arc::new(QueryModuleResolution::Nassau(
+                crate::nassau::Resolution::new_with_save(cc, save_dir)?,
+            )),
+            QueryModuleResolution::Standard(_) => Arc::new(QueryModuleResolution::Standard(
+                Resolution::new_with_save(cc, save_dir)?,
+            )),
         }
     };
 
