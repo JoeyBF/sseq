@@ -8,7 +8,12 @@ use ext::{
 use serde_json::json;
 use sseq::coordinates::Bidegree;
 
-use crate::{Sender, actions::*, resolution_wrapper::Resolution, sseq::SseqWrapper};
+use crate::{
+    Sender,
+    actions::*,
+    resolution_wrapper::{Resolution, resolution_event_to_message},
+    sseq::SseqWrapper,
+};
 
 /// A struct that manipulates a Resolution.
 ///
@@ -63,12 +68,17 @@ impl ResolutionManager {
                     .resolution
                     .as_mut()
                     .ok_or_else(|| anyhow!("Resolution not yet constructed"))?;
-                let resolution = match msg.sseq {
-                    SseqChoice::Main => resolution,
-                    SseqChoice::Unit => resolution.unit_resolution_mut(),
+                let inner = match msg.sseq {
+                    SseqChoice::Main => &mut resolution.inner,
+                    SseqChoice::Unit => resolution.inner.unit_resolution_mut(),
                 };
-
-                ret = msg.action.act_resolution(resolution);
+                let sender = self.sender.clone();
+                let sseq = target_sseq;
+                ret = msg.action.act_resolution(inner, &mut |event| {
+                    sender
+                        .send(resolution_event_to_message(event, sseq))
+                        .unwrap();
+                });
             }
         };
 
@@ -161,12 +171,11 @@ impl ResolutionManager {
             .resolution
             .as_ref()
             .ok_or_else(|| anyhow!("Calling Resolve before Construct"))?;
-        let resolution = match sseq {
-            SseqChoice::Main => resolution,
-            SseqChoice::Unit => resolution.unit_resolution(),
-        };
 
-        let min_degree = resolution.min_degree();
+        let min_degree = match sseq {
+            SseqChoice::Main => resolution.min_degree(),
+            SseqChoice::Unit => resolution.inner.unit_resolution().min_degree(),
+        };
 
         let msg = Message {
             recipients: vec![],
@@ -180,8 +189,21 @@ impl ResolutionManager {
         };
         self.sender.send(msg)?;
 
-        resolution
-            .compute_through_stem(Bidegree::n_s(action.max_degree, action.max_degree / 2 + 5));
+        let b = Bidegree::n_s(action.max_degree, action.max_degree / 2 + 5);
+        match sseq {
+            SseqChoice::Main => resolution.compute_through_stem(b),
+            SseqChoice::Unit => {
+                let sender = &self.sender;
+                resolution
+                    .inner
+                    .unit_resolution()
+                    .compute_through_stem(b, |event| {
+                        sender
+                            .send(resolution_event_to_message(event, sseq))
+                            .unwrap();
+                    });
+            }
+        }
 
         Ok(())
     }

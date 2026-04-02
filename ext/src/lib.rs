@@ -180,6 +180,7 @@ use crate::chain_complex::FiniteChainComplex;
 pub type CCC = FiniteChainComplex<SteenrodModule>;
 
 pub mod nassau;
+pub mod resolution_with_products;
 pub mod secondary;
 pub mod utils;
 

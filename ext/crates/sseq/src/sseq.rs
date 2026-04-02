@@ -39,6 +39,9 @@ impl SseqProfile for Adams {
     }
 }
 
+/// # Fields
+/// * `matrices[b]` : This encodes the matrix of the product. If it is None, it means the target of
+///    the product has dimension 0.
 pub struct Product {
     pub b: Bidegree,
     /// Whether the product acts on the left or not. This affects the sign in the Leibniz rule.

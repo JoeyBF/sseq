@@ -4,6 +4,7 @@ mod bigraded;
 pub mod charting;
 pub mod coordinates;
 mod differential;
+pub mod managed;
 mod sseq;
 
 pub use bigraded::Bigraded;

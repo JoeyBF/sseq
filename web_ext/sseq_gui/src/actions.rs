@@ -1,16 +1,17 @@
 use algebra::module::Module;
-use bivec::BiVec;
 use enum_dispatch::enum_dispatch;
-use ext::{CCC, chain_complex::FreeChainComplex};
+use ext::{CCC, chain_complex::FreeChainComplex, resolution_with_products::ResolutionWithProducts};
 use fp::vector::FpVector;
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
-use sseq::coordinates::{Bidegree, BidegreeElement, BidegreeGenerator};
-
-use crate::{
-    resolution_wrapper::Resolution,
-    sseq::{ClassState, ProductItem, SseqWrapper},
+use sseq::{
+    coordinates::{Bidegree, BidegreeElement, BidegreeGenerator},
+    managed::{ClassData, DifferentialData, EdgeData},
 };
+
+use crate::sseq::SseqWrapper;
+
+pub type ResolutionCallback<'a> = &'a mut dyn FnMut(ext::resolution_with_products::ResolutionEvent);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Message {
@@ -98,7 +99,11 @@ pub trait ActionT: std::fmt::Debug {
     fn act_sseq(&self, sseq: &mut SseqWrapper) -> Option<Message> {
         unimplemented!();
     }
-    fn act_resolution(&self, resolution: &mut Resolution<CCC>) -> Option<Message> {
+    fn act_resolution(
+        &self,
+        resolution: &mut ResolutionWithProducts<CCC>,
+        callback: ResolutionCallback<'_>,
+    ) -> Option<Message> {
         unimplemented!();
     }
     fn to_string(&self) -> String {
@@ -116,12 +121,12 @@ pub struct AddDifferential {
 
 impl ActionT for AddDifferential {
     fn act_sseq(&self, sseq: &mut SseqWrapper) -> Option<Message> {
-        let source = BidegreeElement::new(self.b, FpVector::from_slice(sseq.p, &self.source));
-        let target_vec = FpVector::from_slice(sseq.p, &self.target);
+        let source =
+            BidegreeElement::new(self.b, FpVector::from_slice(sseq.managed.p, &self.source));
+        let target_vec = FpVector::from_slice(sseq.managed.p, &self.target);
 
-        sseq.inner
+        sseq.managed
             .add_differential(self.r, &source, target_vec.as_slice());
-        sseq.add_differential_propagate(self.r, &source, 0);
         None
     }
 }
@@ -136,12 +141,17 @@ pub struct AddProductType {
 
 impl ActionT for AddProductType {
     fn act_sseq(&self, sseq: &mut SseqWrapper) -> Option<Message> {
-        sseq.add_product_type(&self.name, self.b, true, self.permanent);
+        sseq.managed
+            .add_product_type(&self.name, self.b, true, self.permanent);
         None
     }
 
-    fn act_resolution(&self, resolution: &mut Resolution<CCC>) -> Option<Message> {
-        resolution.add_product(self.b, self.class.clone(), &self.name);
+    fn act_resolution(
+        &self,
+        resolution: &mut ResolutionWithProducts<CCC>,
+        callback: ResolutionCallback<'_>,
+    ) -> Option<Message> {
+        resolution.add_product(self.b, self.class.clone(), &self.name, &mut |e| callback(e));
         None
     }
 }
@@ -154,11 +164,8 @@ pub struct AddPermanentClass {
 
 impl ActionT for AddPermanentClass {
     fn act_sseq(&self, sseq: &mut SseqWrapper) -> Option<Message> {
-        let class = BidegreeElement::new(self.b, FpVector::from_slice(sseq.p, &self.class));
-
-        sseq.inner.add_permanent_class(&class);
-        sseq.add_differential_propagate(i32::MAX, &class, 0);
-
+        let class = BidegreeElement::new(self.b, FpVector::from_slice(sseq.managed.p, &self.class));
+        sseq.managed.add_permanent_class(&class);
         None
     }
 }
@@ -172,7 +179,8 @@ pub struct SetClassName {
 
 impl ActionT for SetClassName {
     fn act_sseq(&self, sseq: &mut SseqWrapper) -> Option<Message> {
-        sseq.set_class_name(self.b, self.idx, self.name.clone());
+        sseq.managed
+            .set_class_name(self.b, self.idx, self.name.clone());
         None
     }
 }
@@ -181,7 +189,7 @@ impl ActionT for SetClassName {
 pub struct Clear {}
 impl ActionT for Clear {
     fn act_sseq(&self, sseq: &mut SseqWrapper) -> Option<Message> {
-        sseq.clear();
+        sseq.managed.clear();
         None
     }
 }
@@ -219,28 +227,28 @@ pub struct AddClass {
 
 impl ActionT for AddClass {
     fn act_sseq(&self, sseq: &mut SseqWrapper) -> Option<Message> {
-        sseq.set_dimension(self.b, self.num);
+        sseq.managed.set_dimension(self.b, self.num);
         None
     }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AddProduct {
-    pub mult_b: Bidegree,
-    pub source_b: Bidegree,
     pub name: String,
-    pub product: Vec<Vec<u32>>,
+    pub source_b: Bidegree,
+    pub mult_b: Bidegree,
     pub left: bool,
+    pub matrix: Vec<Vec<u32>>,
 }
 
 impl ActionT for AddProduct {
     fn act_sseq(&self, sseq: &mut SseqWrapper) -> Option<Message> {
-        sseq.add_product(
+        sseq.managed.add_product(
             &self.name,
             self.source_b,
             self.mult_b,
             self.left,
-            &self.product,
+            &*self.matrix,
         );
         None
     }
@@ -256,13 +264,18 @@ impl ActionT for AddProductDifferential {
     fn act_sseq(&self, sseq: &mut SseqWrapper) -> Option<Message> {
         self.source.act_sseq(sseq);
         self.target.act_sseq(sseq);
-        sseq.add_product_differential(&self.source.name, &self.target.name);
+        sseq.managed
+            .add_product_differential(&self.source.name, &self.target.name);
         None
     }
 
-    fn act_resolution(&self, resolution: &mut Resolution<CCC>) -> Option<Message> {
-        self.source.act_resolution(resolution);
-        self.target.act_resolution(resolution);
+    fn act_resolution(
+        &self,
+        resolution: &mut ResolutionWithProducts<CCC>,
+        callback: ResolutionCallback<'_>,
+    ) -> Option<Message> {
+        self.source.act_resolution(resolution, &mut *callback);
+        self.target.act_resolution(resolution, callback);
         None
     }
 
@@ -307,29 +320,18 @@ impl ActionT for Resolve {}
 
 // Now actions for sseq -> js
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SetStructline {
-    pub b: Bidegree,
-    pub structlines: Vec<ProductItem>,
-}
+#[serde(transparent)]
+pub struct SetStructline(pub EdgeData);
 impl ActionT for SetStructline {}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SetDifferential {
-    pub b: Bidegree,
-    pub true_differentials: Vec<Vec<(Vec<u32>, Vec<u32>)>>,
-    pub differentials: BiVec<Vec<Vec<u32>>>,
-}
+#[serde(transparent)]
+pub struct SetDifferential(pub DifferentialData);
 impl ActionT for SetDifferential {}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SetClass {
-    pub b: Bidegree,
-    pub state: ClassState,
-    pub permanents: Vec<FpVector>,
-    pub classes: Vec<Vec<FpVector>>,
-    pub decompositions: Vec<(FpVector, String, Bidegree)>,
-    pub class_names: Vec<String>,
-}
+#[serde(transparent)]
+pub struct SetClass(pub ClassData);
 impl ActionT for SetClass {}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -343,7 +345,11 @@ pub struct QueryTable {
     pub b: Bidegree,
 }
 impl ActionT for QueryTable {
-    fn act_resolution(&self, resolution: &mut Resolution<CCC>) -> Option<Message> {
+    fn act_resolution(
+        &self,
+        resolution: &mut ResolutionWithProducts<CCC>,
+        _callback: ResolutionCallback<'_>,
+    ) -> Option<Message> {
         let module = resolution.module(self.b.s());
         if self.b.t() < module.min_degree() {
             return None;
@@ -375,7 +381,11 @@ pub struct QueryBoundaryString {
     g: BidegreeGenerator,
 }
 impl ActionT for QueryBoundaryString {
-    fn act_resolution(&self, resolution: &mut Resolution<CCC>) -> Option<Message> {
+    fn act_resolution(
+        &self,
+        resolution: &mut ResolutionWithProducts<CCC>,
+        _callback: ResolutionCallback<'_>,
+    ) -> Option<Message> {
         // Ensure bidegree is defined
         let module = resolution.module(self.g.s());
         if self.g.t() < module.min_degree() {
