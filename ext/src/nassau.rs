@@ -1,16 +1,13 @@
 //! This module implements [Nassau's algorithm](https://arxiv.org/abs/1910.04063).
 //!
 //! The main export is the [`Resolution`] object, which is a resolution of the sphere at the prime 2
-//! using Nassau's algorithm. It aims to provide an API similar to
-//! [`resolution::Resolution`](crate::resolution::Resolution). From an API point of view, the main
-//! difference between the two is that our `Resolution` is a chain complex over [`MilnorAlgebra`]
-//! over [`SteenrodAlgebra`](algebra::SteenrodAlgebra).
+//! using Nassau's algorithm. It provides the same [`ChainComplex`] interface as
+//! [`resolution::Resolution`](crate::resolution::Resolution), using [`SteenrodAlgebra`] as its
+//! algebra type.
 //!
-//! To make use of this resolution in the example scripts, enable the `nassau` feature. This will
-//! cause [`utils::query_module`](crate::utils::query_module) to return the `Resolution` from this
-//! module instead of [`resolution`](crate::resolution). There is no formal polymorphism involved;
-//! the feature changes the return type of the function. While this is an incorrect use of features,
-//! we find that this the easiest way to make all scripts support both types of resolutions.
+//! When the conditions for Nassau's algorithm are met (prime 2, Milnor basis, finite-dimensional
+//! module, no profile, no cofiber), [`utils::construct`](crate::utils::construct) will
+//! automatically use this implementation.
 
 use std::{
     fmt::Display,
@@ -19,11 +16,11 @@ use std::{
 };
 
 use algebra::{
-    Algebra, combinatorics,
+    Algebra, SteenrodAlgebra, combinatorics,
     milnor_algebra::{MilnorAlgebra, PPartEntry},
     module::{
-        FreeModule, GeneratorData, Module, ZeroModule,
-        homomorphism::{FreeModuleHomomorphism, FullModuleHomomorphism, ModuleHomomorphism},
+        FreeModule, GeneratorData, Module, SteenrodModule,
+        homomorphism::{FreeModuleHomomorphism, ModuleHomomorphism},
     },
 };
 use anyhow::anyhow;
@@ -38,7 +35,8 @@ use once::OnceBiVec;
 use sseq::coordinates::{Bidegree, BidegreeGenerator};
 
 use crate::{
-    chain_complex::{AugmentedChainComplex, ChainComplex, FiniteChainComplex, FreeChainComplex},
+    CCC,
+    chain_complex::{AugmentedChainComplex, ChainComplex, FreeChainComplex},
     save::{SaveDirectory, SaveKind},
     utils::LogWriter,
 };
@@ -61,6 +59,17 @@ impl SenderData {
 }
 
 const MAX_NEW_GENS: usize = 10;
+
+/// Extract the inner [`MilnorAlgebra`] from a [`SteenrodAlgebra`].
+///
+/// # Panics
+/// Panics if the algebra is not in Milnor mode.
+fn milnor_algebra(a: &SteenrodAlgebra) -> &MilnorAlgebra {
+    match a {
+        SteenrodAlgebra::MilnorAlgebra(m) => m,
+        _ => unreachable!("Nassau resolution always uses Milnor algebra"),
+    }
+}
 
 /// A Milnor subalgebra to be used in [Nassau's algorithm](https://arxiv.org/abs/1910.04063). This
 /// is equipped with an ordering of the signature as in Lemma 2.4 of the paper.
@@ -107,18 +116,19 @@ impl MilnorSubalgebra {
     /// This requires passing the algebra for borrow checker reasons.
     fn signature_mask<'a>(
         &'a self,
-        algebra: &'a MilnorAlgebra,
-        module: &'a FreeModule<MilnorAlgebra>,
+        algebra: &'a SteenrodAlgebra,
+        module: &'a FreeModule<SteenrodAlgebra>,
         degree: i32,
         signature: &'a [PPartEntry],
     ) -> impl Iterator<Item = usize> + 'a {
+        let milnor = milnor_algebra(algebra);
         module.iter_gen_offsets([degree]).flat_map(
             move |GeneratorData {
                       gen_deg,
                       start: [offset],
                       end: _,
                   }| {
-                algebra
+                milnor
                     .ppart_table(degree - gen_deg)
                     .iter()
                     .enumerate()
@@ -137,7 +147,7 @@ impl MilnorSubalgebra {
     /// the signature.
     fn signature_matrix(
         &self,
-        hom: &FreeModuleHomomorphism<FreeModule<MilnorAlgebra>>,
+        hom: &FreeModuleHomomorphism<FreeModule<SteenrodAlgebra>>,
         degree: i32,
         signature: &[PPartEntry],
     ) -> Matrix {
@@ -375,25 +385,24 @@ enum Magic {
     Fix = -3,
 }
 
-/// A resolution of `S_2` using Nassau's algorithm.
+/// A resolution using Nassau's algorithm.
 ///
-/// This aims to have an API similar to that of
-/// [`resolution::Resolution`](crate::resolution::Resolution). From an API point of view, the main
-/// difference between the two is that this is a chain complex over [`MilnorAlgebra`] over
-/// [`SteenrodAlgebra`](algebra::SteenrodAlgebra).
-pub struct Resolution<M: ZeroModule<Algebra = MilnorAlgebra>> {
+/// This provides the same [`ChainComplex`] interface as
+/// [`resolution::Resolution`](crate::resolution::Resolution), using [`SteenrodAlgebra`] as its
+/// algebra type. Internally, it extracts the [`MilnorAlgebra`] for Nassau-specific computations.
+pub struct Resolution {
     lock: Mutex<()>,
     name: String,
     max_degree: i32,
-    modules: OnceBiVec<Arc<FreeModule<MilnorAlgebra>>>,
-    zero_module: Arc<FreeModule<MilnorAlgebra>>,
-    differentials: OnceBiVec<Arc<FreeModuleHomomorphism<FreeModule<MilnorAlgebra>>>>,
-    target: Arc<FiniteChainComplex<M>>,
-    chain_maps: OnceBiVec<Arc<FreeModuleHomomorphism<M>>>,
+    modules: OnceBiVec<Arc<FreeModule<SteenrodAlgebra>>>,
+    zero_module: Arc<FreeModule<SteenrodAlgebra>>,
+    differentials: OnceBiVec<Arc<FreeModuleHomomorphism<FreeModule<SteenrodAlgebra>>>>,
+    target: Arc<CCC>,
+    chain_maps: OnceBiVec<Arc<FreeModuleHomomorphism<SteenrodModule>>>,
     save_dir: SaveDirectory,
 }
 
-impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
+impl Resolution {
     pub fn name(&self) -> &str {
         &self.name
     }
@@ -402,19 +411,19 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
         self.name = name;
     }
 
-    pub fn new(module: Arc<M>) -> Self {
-        Self::new_with_save(module, None).unwrap()
+    pub fn new(target: Arc<CCC>) -> Self {
+        Self::new_with_save(target, None).unwrap()
     }
 
     pub fn new_with_save(
-        module: Arc<M>,
+        target: Arc<CCC>,
         save_dir: impl Into<SaveDirectory>,
     ) -> anyhow::Result<Self> {
         let save_dir = save_dir.into();
-        let max_degree = module
+        let max_degree = target
+            .module(0)
             .max_degree()
             .ok_or_else(|| anyhow!("Nassau's algorithm requires bounded module"))?;
-        let target = Arc::new(FiniteChainComplex::ccdz(module));
 
         if let Some(p) = save_dir.write() {
             for subdir in SaveKind::nassau_data() {
@@ -954,10 +963,10 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
     }
 }
 
-impl<M: ZeroModule<Algebra = MilnorAlgebra>> ChainComplex for Resolution<M> {
-    type Algebra = MilnorAlgebra;
-    type Homomorphism = FreeModuleHomomorphism<FreeModule<Self::Algebra>>;
-    type Module = FreeModule<Self::Algebra>;
+impl ChainComplex for Resolution {
+    type Algebra = SteenrodAlgebra;
+    type Homomorphism = FreeModuleHomomorphism<FreeModule<SteenrodAlgebra>>;
+    type Module = FreeModule<SteenrodAlgebra>;
 
     fn prime(&self) -> ValidPrime {
         TWO
@@ -1185,9 +1194,9 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> ChainComplex for Resolution<M> {
     }
 }
 
-impl<M: ZeroModule<Algebra = MilnorAlgebra>> AugmentedChainComplex for Resolution<M> {
-    type ChainMap = FreeModuleHomomorphism<M>;
-    type TargetComplex = FiniteChainComplex<M, FullModuleHomomorphism<M, M>>;
+impl AugmentedChainComplex for Resolution {
+    type ChainMap = FreeModuleHomomorphism<SteenrodModule>;
+    type TargetComplex = CCC;
 
     fn target(&self) -> Arc<Self::TargetComplex> {
         Arc::clone(&self.target)
