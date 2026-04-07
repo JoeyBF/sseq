@@ -23,6 +23,8 @@ sseq = { path = "crates/sseq", default-features = false }
 
 adler = "1"
 anyhow = "1.0.98"
+bitcode = { version = "0.6", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
 byteorder = "1.5.0"
 dashmap = "6.1.0"
 itertools = { version = "0.14.0", default-features = false, features = [
@@ -32,6 +34,7 @@ rustc-hash = "2.1.1"
 serde_json = { version = "1.0.141", features = ["preserve_order"] }
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
+zarrs = { version = "0.23", default-features = false, features = ["filesystem", "sharding", "crc32c", "zstd"] }
 
 zstd = { version = "0.13.3", optional = true }
 

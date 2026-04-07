@@ -15,6 +15,7 @@ either = "1.15.0"
 itertools = { version = "0.14.0" }
 paste = "1.0.15"
 proptest = { version = "1.7", optional = true }
+bitcode = { version = "0.6", features = ["serde"] }
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0.141"
 
