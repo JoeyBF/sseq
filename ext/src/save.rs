@@ -253,6 +253,61 @@ impl ZarrSaveStore {
         })
     }
 
+    /// Bind this store to a specific algebra, catching accidental algebra / prime mismatches.
+    ///
+    /// On a fresh store (the root group's `algebra_magic` attribute is unset) this writes
+    /// `algebra_magic`, `prime`, and `algebra_prefix` to the root group so a later load can
+    /// verify them. On an already-bound store the stored magic is compared against
+    /// `algebra_magic` and a mismatch returns an error citing both values.
+    ///
+    /// Callers should invoke this once per resolution setup — typically from
+    /// `Resolution::new_with_save` — before any data is read or written. Subgroups
+    /// (`products/…`, `homotopies/…`) share the same underlying store and therefore the same
+    /// root attributes, so they inherit the check without a second call.
+    pub fn bind_to_algebra(
+        &self,
+        algebra_magic: u32,
+        prime: u32,
+        algebra_prefix: &str,
+    ) -> anyhow::Result<()> {
+        let root = zarrs::group::Group::open(self.store.clone(), "/").map_err(zarr_err)?;
+        let attrs = root.attributes();
+        if let Some(stored) = attrs.get("algebra_magic").and_then(|v| v.as_u64()) {
+            let stored = stored as u32;
+            if stored != algebra_magic {
+                let stored_prefix = attrs
+                    .get("algebra_prefix")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("?");
+                let stored_prime = attrs
+                    .get("prime")
+                    .and_then(|v| v.as_u64())
+                    .map(|p| p.to_string())
+                    .unwrap_or_else(|| "?".into());
+                anyhow::bail!(
+                    "Save store at {:?} was created with a different algebra: stored magic \
+                     {stored:#010x} ({stored_prefix} at p={stored_prime}), expected magic \
+                     {algebra_magic:#010x} ({algebra_prefix} at p={prime})",
+                    self.path,
+                );
+            }
+            return Ok(());
+        }
+
+        // Unbound store: write the magic and related fields now. We rebuild the root group's
+        // attributes map with the new entries merged in.
+        let mut new_attrs = attrs.clone();
+        new_attrs.insert("algebra_magic".into(), (u64::from(algebra_magic)).into());
+        new_attrs.insert("prime".into(), (u64::from(prime)).into());
+        new_attrs.insert("algebra_prefix".into(), algebra_prefix.into());
+        let group = GroupBuilder::new()
+            .attributes(new_attrs)
+            .build(self.store.clone(), "/")
+            .map_err(zarr_err)?;
+        group.store_metadata().map_err(zarr_err)?;
+        Ok(())
+    }
+
     /// Open a subgroup at `{self.group}/{name}`.
     ///
     /// Shares the same underlying store as `self`. The subgroup's `zarr.json` is created if

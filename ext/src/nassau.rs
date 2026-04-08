@@ -29,7 +29,7 @@ use anyhow::anyhow;
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use fp::{
     matrix::{AugmentedMatrix, Matrix},
-    prime::{TWO, ValidPrime},
+    prime::{Prime, TWO, ValidPrime},
     vector::{FpSlice, FpSliceMut, FpVector},
 };
 use itertools::Itertools;
@@ -344,6 +344,10 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
             .max_degree()
             .ok_or_else(|| anyhow!("Nassau's algorithm requires bounded module"))?;
         let target = Arc::new(FiniteChainComplex::ccdz(module));
+        if let Some(store) = save_dir.store() {
+            let algebra = target.algebra();
+            store.bind_to_algebra(algebra.magic(), algebra.prime().as_u32(), algebra.prefix())?;
+        }
 
         Ok(Self {
             lock: Mutex::new(()),

@@ -35,6 +35,20 @@ fn test_save_load() {
     );
 }
 
+/// Resolving once with the Adem algebra and then attempting to reuse the same save dir with the
+/// Milnor algebra must fail loudly via the `bind_to_algebra` check, not silently mix data from
+/// the two bases. Resurrected from the pre-zarr `wrong_algebra` test in master.
+#[test]
+#[should_panic(expected = "different algebra")]
+fn test_wrong_algebra() {
+    let tempdir = tempfile::TempDir::new().unwrap();
+    let resolution1 =
+        construct_standard::<false, _, _>("S_2@adem", Some(tempdir.path().into())).unwrap();
+    resolution1.compute_through_bidegree(Bidegree::s_t(2, 2));
+
+    construct_standard::<false, _, _>("S_2@milnor", Some(tempdir.path().into())).unwrap();
+}
+
 #[test]
 fn test_save_load_stem() {
     let tempdir = tempfile::TempDir::new().unwrap();
