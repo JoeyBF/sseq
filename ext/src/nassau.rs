@@ -965,14 +965,32 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> ChainComplex for Resolution<M> {
         for<'a> &'a mut T: Into<FpSliceMut<'a>>,
         for<'a> &'a S: Into<FpSlice<'a>>,
     {
-        let mut reader = if let Some(store) = self.save_dir.store() {
-            if let Some(reader) = store.nassau_qi_reader(b).unwrap() {
-                reader
-            } else {
-                return false;
-            }
-        } else {
-            return false;
+        self.apply_quasi_inverse_fallible(results, b, inputs)
+            .unwrap_or_else(|e| panic!("apply_quasi_inverse failed at {b}: {e:#}"))
+    }
+}
+
+impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
+    /// The fallible core of [`ChainComplex::apply_quasi_inverse`].
+    ///
+    /// Returns `Ok(false)` when no quasi-inverse is available (no save store or no saved qi for
+    /// this bidegree), `Ok(true)` when the qi was successfully applied, and propagates
+    /// `anyhow::Error` from the structured zarr reader or `FpVector::update_from_bytes`.
+    fn apply_quasi_inverse_fallible<T, S>(
+        &self,
+        results: &mut [T],
+        b: Bidegree,
+        inputs: &[S],
+    ) -> anyhow::Result<bool>
+    where
+        for<'a> &'a mut T: Into<FpSliceMut<'a>>,
+        for<'a> &'a S: Into<FpSlice<'a>>,
+    {
+        let Some(store) = self.save_dir.store() else {
+            return Ok(false);
+        };
+        let Some(reader) = store.nassau_qi_reader(b)? else {
+            return Ok(false);
         };
 
         let p = self.prime();
@@ -996,24 +1014,24 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> ChainComplex for Resolution<M> {
         let mut scratch0 = FpVector::new(p, zero_mask_dim);
         let mut scratch1 = FpVector::new(p, target_dim);
 
-        // If the quasi-inverse was computed using incomplete information, we need to figure out
-        // what the differentials in this bidegree hit and use them to lift. these variables are
-        // trivial if there is no such problem.
+        // If the quasi-inverse was computed using incomplete information, we need to figure
+        // out what the differentials in this bidegree hit and use them to lift. these
+        // variables are trivial if there is no such problem.
         //
         // target_zero_mask is the signature mask of the target under the zero signature.
         //
         // dx_matrix is an AugmentedMatrix::<3>.
         //
-        // Each row of this matrix is of the form [r; dx; x], where x is an element of the source
-        // of signature zero, expressed in the masked basis, and dx is the value of the
-        // differential on x. Then r is the entries of dx that have zero signature, which we
-        // include so that the rref of the matix is nice. In practice, we keep r empty until the
-        // very end, and then populate it manually.
+        // Each row of this matrix is of the form [r; dx; x], where x is an element of the
+        // source of signature zero, expressed in the masked basis, and dx is the value of
+        // the differential on x. Then r is the entries of dx that have zero signature,
+        // which we include so that the rref of the matix is nice. In practice, we keep r
+        // empty until the very end, and then populate it manually.
         //
-        // At the beginning the x's will be the new generators in this bidegree. As we read in the
-        // quasi-inverses for the zero signature, we keep on reducing this so that dx is zero in
-        // the pivot columns of the quasi-inverse. We can then use (the rref of) this matrix to
-        // lift remaining elements with zero signature.
+        // At the beginning the x's will be the new generators in this bidegree. As we read
+        // in the quasi-inverses for the zero signature, we keep on reducing this so that dx
+        // is zero in the pivot columns of the quasi-inverse. We can then use (the rref of)
+        // this matrix to lift remaining elements with zero signature.
         let (mut target_zero_mask, mut dx_matrix) = if zero_mask_dim != mask.len() {
             let num_new_gens = source.number_of_gens_in_degree(b.t());
             assert_eq!(mask.len(), zero_mask_dim + num_new_gens);
@@ -1043,8 +1061,8 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> ChainComplex for Resolution<M> {
             (Vec::new(), AugmentedMatrix::<3>::new(p, 0, [0, 0, 0]))
         };
 
-        while let Some(cmd) = reader.next_command().unwrap() {
-            match cmd {
+        for cmd in reader {
+            match cmd? {
                 NassauCommand::Signature(sig_u16) => {
                     let signature: Vec<PPartEntry> =
                         sig_u16.iter().map(|&x| x as PPartEntry).collect();
@@ -1055,8 +1073,8 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> ChainComplex for Resolution<M> {
                 NassauCommand::Fix => {
                     // We need to fix the differential problem
                     //
-                    // First manually add_masked the second segment to the first, which we use
-                    // for row reduction. We do this manually for borrow checker reasons.
+                    // First manually add_masked the second segment to the first, which we
+                    // use for row reduction. We do this manually for borrow checker reasons.
                     for (j, &k) in target_zero_mask.iter().enumerate() {
                         for i in 0..dx_matrix.rows() {
                             if dx_matrix.row_segment(i, 1, 1).entry(k) != 0 {
@@ -1095,13 +1113,14 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> ChainComplex for Resolution<M> {
                     image_bytes,
                 } => {
                     let col = col as usize;
-                    scratch0.update_from_bytes(&mut &lift_bytes[..]).unwrap();
-                    scratch1.update_from_bytes(&mut &image_bytes[..]).unwrap();
+                    scratch0.update_from_bytes(&mut &lift_bytes[..])?;
+                    scratch1.update_from_bytes(&mut &image_bytes[..])?;
                     for (input, output) in inputs.iter_mut().zip(results.iter_mut()) {
                         let entry = input.entry(col);
                         if entry != 0 {
                             output.into().add_unmasked(scratch0.as_slice(), 1, &mask);
-                            // If we resume a resolve_through_stem, input may be longer than scratch1.
+                            // If we resume a resolve_through_stem, input may be longer
+                            // than scratch1.
                             input
                                 .slice_mut(0, scratch1.len())
                                 .add(scratch1.as_slice(), 1);
@@ -1134,7 +1153,7 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> ChainComplex for Resolution<M> {
                 target.element_to_string(b.t(), dx.as_slice())
             );
         }
-        true
+        Ok(true)
     }
 }
 

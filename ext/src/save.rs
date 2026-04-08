@@ -1,3 +1,59 @@
+//! Two-tier zarr save system for resolutions, chain maps, and chain homotopies.
+//!
+//! # Layout
+//!
+//! One zarr v3 store with per-namespace subgroups for named homomorphisms and chain homotopies:
+//!
+//! ```text
+//! save_dir.zarr/
+//!   zarr.json                              # root group
+//!
+//!   # Main resolution — shard + stream tier at root
+//!   {kind}/zarr.json + c/...               # 2D or 3D vlen-bytes shard
+//!   qi/n{n}_s{s}/{kind}/                   # per-bidegree group, kind-specific sub-arrays
+//!
+//!   # Named ResolutionHomomorphism — one subgroup per name
+//!   products/{name}/
+//!     chain_map/, secondary_composite/, secondary_intermediate/, secondary_homotopy/
+//!
+//!   # Named ChainHomotopy — one subgroup per (left_name, right_name)
+//!   homotopies/{left}__{right}/
+//!     chain_homotopy/, secondary_composite/, secondary_intermediate/, secondary_homotopy/
+//! ```
+//!
+//! # Two tiers
+//!
+//! **Shard tier.** Small payloads (differentials, kernels, chain maps, secondary data) use a
+//! `vlen-bytes` sharded array per kind, with shard shape `[SHARD_N, SHARD_S(, SHARD_IDX)]`,
+//! inner chunk shape `[1, 1(, 1)]`, and CRC32C over each shard (no zstd — the payloads are too
+//! small to benefit).
+//!
+//! **Stream tier.** Large payloads ([`SaveKind::ResQi`], [`SaveKind::NassauQi`]) use
+//! per-bidegree zarr *groups* with kind-specific sub-arrays:
+//!
+//! - `res_qi/` — group attributes hold the scalar dimensions; `pivots/` is a 1D `i64` array,
+//!   `rows/` is a 2D `u8` array shaped `[image_dim, num_limbs * 8]`, chunked over rows.
+//! - `nassau_qi/` — group attributes hold `target_dim`, `zero_mask_dim`, `subalgebra_profile`,
+//!   `num_commands`, `finished`. `commands/` is a 1D vlen-bytes array with one element per
+//!   [`NassauCommand`].
+//!
+//! Group attributes include a `finished` flag, which is the source of truth — readers treat the
+//! data as missing if the writer was dropped before calling `finish()`.
+//!
+//! Subgroups share the same underlying [`FilesystemStore`] via `Arc` clone; only the `group`
+//! prefix differs. Shard arrays are created lazily on first write so that subgroups don't
+//! populate kinds they never use.
+//!
+//! # Coordinate system
+//!
+//! Shard arrays are indexed by `(n, s)`, matching `MultiDegree<2>::coords()` and generalizing to
+//! `MultiDegree<N>` for `N > 2`. Stems can be negative (e.g. `RP^\infty_{-k}`, A-module shifts),
+//! and zarr v3 has no native support for negative chunk indices, so we apply a fixed internal
+//! offset: every caller-supplied `n` is shifted to `n - N_MIN` before becoming a zarr index.
+//! `N_MIN` is intentionally generous (-1024) and never exposed in the public API; sparse zarr
+//! arrays cost essentially nothing for the empty negative regions, so the overhead is purely in
+//! `zarr.json` metadata.
+
 use std::{
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
@@ -22,208 +78,50 @@ use zarrs::{
     storage::{ReadableWritableListableStorage, ReadableWritableListableStorageTraits},
 };
 
-/// Anything that names a save location, parameterised by its dimension `N`.
-/// `Bidegree` is `SaveCoords<2>` and `BidegreeGenerator` is `SaveCoords<3>`,
-/// so methods that only make sense in one of those dimensions (e.g. the
-/// stream-tier `writer` / `reader`, which are per-bidegree) can take
-/// `impl SaveCoords<2>` and refuse the other type at compile time. The
-/// store reads `(n, s, [idx])` from this, shifts `n` by the internal
-/// `N_MIN` offset, and uses the result as a zarr index. Implementing this
-/// trait for `MultiDegree<N>` / `MultiDegreeGenerator<N>` would extend the
-/// same API to higher-N gradings without further changes here.
-pub trait SaveCoords<const N: usize> {
-    fn save_coords(&self) -> [i32; N];
-}
-
-impl SaveCoords<2> for Bidegree {
-    fn save_coords(&self) -> [i32; 2] {
-        [self.n(), self.s()]
-    }
-}
-
-impl SaveCoords<3> for BidegreeGenerator {
-    fn save_coords(&self) -> [i32; 3] {
-        [self.n(), self.s(), self.idx() as i32]
-    }
-}
-
-#[derive(Debug, Copy, Clone, Eq, PartialEq, Hash)]
-#[non_exhaustive]
-pub enum SaveKind {
-    Kernel,
-    Differential,
-    ResQi,
-    AugmentationQi,
-    SecondaryComposite,
-    SecondaryIntermediate,
-    SecondaryHomotopy,
-    ChainMap,
-    ChainHomotopy,
-    NassauDifferential,
-    NassauQi,
-}
-
-impl SaveKind {
-    pub fn name(self) -> &'static str {
-        match self {
-            Self::Kernel => "kernel",
-            Self::Differential => "differential",
-            Self::ResQi => "res_qi",
-            Self::AugmentationQi => "augmentation_qi",
-            Self::SecondaryComposite => "secondary_composite",
-            Self::SecondaryIntermediate => "secondary_intermediate",
-            Self::SecondaryHomotopy => "secondary_homotopy",
-            Self::ChainMap => "chain_map",
-            Self::ChainHomotopy => "chain_homotopy",
-            Self::NassauDifferential => "nassau_differential",
-            Self::NassauQi => "nassau_qi",
-        }
-    }
-
-    /// Whether this kind uses 3D indexing `(n, s, idx)`. The third coordinate
-    /// is an intra-lift enumeration over basis elements; multi-hom
-    /// disambiguation is handled by the store's group prefix, not by an
-    /// extra coordinate. `SecondaryHomotopy` is per-bidegree (data for all
-    /// generators is concatenated), so it stays 2D.
-    fn is_indexed(self) -> bool {
-        matches!(self, Self::SecondaryComposite | Self::SecondaryIntermediate)
-    }
-
-    pub fn resolution_data() -> impl Iterator<Item = Self> {
-        use SaveKind::*;
-        static KINDS: [SaveKind; 4] = [Kernel, Differential, ResQi, AugmentationQi];
-        KINDS.iter().copied()
-    }
-
-    pub fn nassau_data() -> impl Iterator<Item = Self> {
-        use SaveKind::*;
-        static KINDS: [SaveKind; 2] = [NassauDifferential, NassauQi];
-        KINDS.iter().copied()
-    }
-
-    pub fn secondary_data() -> impl Iterator<Item = Self> {
-        use SaveKind::*;
-        static KINDS: [SaveKind; 3] =
-            [SecondaryComposite, SecondaryIntermediate, SecondaryHomotopy];
-        KINDS.iter().copied()
-    }
-}
-
-// --- SaveDirectory ---
-
-#[derive(Debug)]
-pub enum SaveDirectory {
-    None,
-    Store(ZarrSaveStore),
-}
-
-impl SaveDirectory {
-    pub fn is_none(&self) -> bool {
-        matches!(self, Self::None)
-    }
-
-    pub fn is_some(&self) -> bool {
-        !self.is_none()
-    }
-
-    pub fn store(&self) -> Option<&ZarrSaveStore> {
-        match self {
-            Self::None => None,
-            Self::Store(s) => Some(s),
-        }
-    }
-}
-
-impl From<Option<PathBuf>> for SaveDirectory {
-    fn from(x: Option<PathBuf>) -> Self {
-        match x {
-            None => Self::None,
-            Some(p) => Self::Store(ZarrSaveStore::create(p).expect("Failed to create zarr store")),
-        }
-    }
-}
-
-// --- Two-Tier ZarrSaveStore ---
-//
-// Layout: two tiers of storage within one zarr store, plus per-namespace
-// subgroups for named homomorphisms and chain homotopies.
-//
-//   save_dir.zarr/
-//     zarr.json                              # root group
-//
-//     # Main resolution — shard + stream tier at root
-//     {kind}/zarr.json + c/...               # 2D or 3D vlen-bytes shard
-//     qi/s{s}_t{t}/{kind}/zarr.json + c/0    # 1D uint8 stream chunk
-//
-//     # Named ResolutionHomomorphism — one subgroup per name
-//     products/{name}/
-//       chain_map/, secondary_composite/, secondary_intermediate/, secondary_homotopy/
-//
-//     # Named ChainHomotopy — one subgroup per (left_name, right_name)
-//     homotopies/{left}__{right}/
-//       chain_homotopy/, secondary_composite/, secondary_intermediate/, secondary_homotopy/
-//
-// Shard tier: vlen-bytes dtype, shard shape [SHARD_N, SHARD_S(, SHARD_IDX)],
-//   inner chunk [1, 1(, 1)], CRC32C on each shard, no zstd.
-//
-// Stream tier: per-bidegree zarr *groups*, with kind-specific sub-arrays.
-//
-//   res_qi/                    # group, attributes hold scalar dimensions
-//     pivots/                  # 1D i64, shape = [target_dim]
-//     rows/                    # 1D vlen-bytes, one element per matrix row
-//                              # chunk_shape = [CHUNK_RES_QI_ROWS]
-//
-//   nassau_qi/                 # group, attributes hold target_dim,
-//                              # zero_mask_dim, subalgebra_profile,
-//                              # num_commands, has_fix, finished
-//     commands/                # 1D vlen-bytes, one element per command
-//                              # chunk_shape = [CHUNK_NASSAU_COMMANDS]
-//                              # Each element starts with an i64 code
-//                              # (= pivot col, or -2/-3 magic) followed by a
-//                              # command-specific payload.
-//
-// `finished` is the source of truth — readers treat the data as missing if
-// the writer was dropped before calling finish().
-//
-// Subgroups share the same underlying FilesystemStore via Arc clone; only the
-// `group` prefix differs. Shard arrays are created lazily on first write to
-// avoid populating subgroups with kinds they never use.
-
-// Shard arrays use `(n, s)` coordinates to match `MultiDegree<2>::coords()`
-// and to generalize to `MultiDegree<N>` for N > 2. Stems can be negative
-// (e.g. RP_-k_inf, A-mod-…[-k]), and zarr v3 has no native support for
-// negative chunk indices, so we apply a fixed offset internally: every
-// caller-supplied n is shifted to `n - N_MIN` before becoming a zarr index.
-// `N_MIN` is intentionally generous (-1024) and never exposed in the
-// public API; sparse zarr arrays cost essentially nothing for the empty
-// negative regions, so the overhead is purely in zarr.json metadata.
-
-/// Most-negative stem the on-disk layout can store. Hidden from callers.
+/// Most-negative stem the on-disk layout can store.
+///
+/// Hidden from callers; used internally to shift caller-supplied `n` values into the unsigned
+/// zarr index space. See the module docs.
 const N_MIN: i32 = -1024;
-/// Number of slots in the n dimension. Effective n range: `[N_MIN, N_MIN + N_SPAN)`
-/// = `[-1024, 3072)` — well beyond any conceivable production stem.
+
+/// Number of slots in the n dimension.
+///
+/// Effective `n` range is `[N_MIN, N_MIN + N_SPAN)` = `[-1024, 3072)` — well beyond any
+/// conceivable production stem.
 const N_SPAN: u64 = 4096;
-/// Number of slots in the s dimension. s is unsigned: `[0, S_SPAN)`.
+
+/// Number of slots in the s dimension. `s` is unsigned: `[0, S_SPAN)`.
 const S_SPAN: u64 = 1024;
+
 /// Number of slots reserved for the intra-bidegree index of indexed kinds.
 const IDX_SPAN: u64 = 256;
+
 /// Shard shape in the n dimension.
 const SHARD_N: u64 = 8;
+
 /// Shard shape in the s dimension.
 const SHARD_S: u64 = 8;
+
 /// Shard shape in the idx dimension.
 const SHARD_IDX: u64 = 8;
+
 /// zstd compression level for the stream tier.
 const ZSTD_LEVEL: i32 = 19;
-/// Number of matrix rows per chunk in the ResQi `rows` array. Bounds the
-/// memory needed to read one chunk worth of rows.
+
+/// Number of matrix rows per chunk in the ResQi `rows` array.
+///
+/// Bounds the memory needed to read one chunk worth of rows.
 const CHUNK_RES_QI_ROWS: u64 = 1024;
-/// Number of commands per chunk in the NassauQi `commands` array. Bounds
-/// the memory the writer buffers between chunk flushes.
+
+/// Number of commands per chunk in the NassauQi `commands` array.
+///
+/// Bounds the memory the writer buffers between chunk flushes.
 const CHUNK_NASSAU_COMMANDS: u64 = 1024;
-/// Upper bound on the number of commands in a NassauQi `commands` array,
-/// used as the array shape at creation time. The actual count is committed
-/// to the `num_commands` group attribute on `finish()`.
+
+/// Upper bound on the number of commands in a NassauQi `commands` array.
+///
+/// Used as the array shape at creation time. The actual count is committed to the `num_commands`
+/// group attribute on `finish()`.
 const NASSAU_QI_MAX_COMMANDS: u64 = 1 << 24;
 
 pub struct ZarrSaveStore {
@@ -231,20 +129,23 @@ pub struct ZarrSaveStore {
     path: PathBuf,
     /// Underlying zarr storage. Cheap to clone via `Arc`.
     store: ReadableWritableListableStorage,
-    /// Group prefix applied to every operation. Empty for the root store;
-    /// e.g. `"/products/foo"` or `"/homotopies/foo__bar"` for subgroups.
+    /// Group prefix applied to every operation.
+    ///
+    /// Empty for the root store; e.g. `"/products/foo"` or `"/homotopies/foo__bar"` for
+    /// subgroups.
     group: String,
-    /// Tracks shard-tier arrays already known to exist on disk for this
-    /// (store, group). Used to skip the meta_path check on subsequent writes.
+    /// Tracks shard-tier arrays already known to exist on disk for this `(store, group)`.
+    ///
+    /// Used to skip the `meta_path` check on subsequent writes.
     created: DashSet<SaveKind>,
-    /// Per-kind write lock. Since zarrs 0.14, `Array::store_array_subset`
-    /// is documented as requiring caller-side synchronization for
-    /// "regions sharing any chunks" — the codec does a read-modify-write
-    /// on the entire shard internally, so concurrent calls touching
-    /// different inner chunks of the same shard race and lose writes.
-    /// We serialize per kind, which is coarser than required (per shard
-    /// would suffice) but simpler and entirely sufficient for our
-    /// workload, since cross-kind parallelism dominates.
+    /// Per-kind write lock.
+    ///
+    /// Since zarrs 0.14, `Array::store_array_subset` is documented as requiring caller-side
+    /// synchronization for "regions sharing any chunks" — the codec does a read-modify-write on
+    /// the entire shard internally, so concurrent calls touching different inner chunks of the
+    /// same shard race and lose writes. We serialize per kind, which is coarser than required
+    /// (per shard would suffice) but simpler and entirely sufficient for our workload, since
+    /// cross-kind parallelism dominates.
     write_locks: DashMap<SaveKind, Arc<Mutex<()>>>,
 }
 
@@ -280,8 +181,10 @@ impl ZarrSaveStore {
         })
     }
 
-    /// Open a subgroup at `{self.group}/{name}`. Shares the same underlying
-    /// store as `self`. The subgroup's zarr.json is created if missing.
+    /// Open a subgroup at `{self.group}/{name}`.
+    ///
+    /// Shares the same underlying store as `self`. The subgroup's `zarr.json` is created if
+    /// missing.
     pub fn subgroup(&self, name: &str) -> anyhow::Result<Self> {
         let group = format!("{}/{}", self.group, name);
         let group_path = self.path.join(group.trim_start_matches('/'));
@@ -302,8 +205,8 @@ impl ZarrSaveStore {
         })
     }
 
-    /// Walk every prefix of `group` and create a zarr group for any prefix
-    /// that doesn't already have one (e.g. `/products/` before `/products/foo`).
+    /// Walk every prefix of `group` and create a zarr group for any prefix that doesn't already
+    /// have one (e.g. `/products/` before `/products/foo`).
     fn ensure_intermediate_groups(&self, group: &str) -> anyhow::Result<()> {
         // Split on '/', skipping the leading empty segment.
         let segments: Vec<&str> = group.split('/').filter(|s| !s.is_empty()).collect();
@@ -327,6 +230,7 @@ impl ZarrSaveStore {
     }
 
     /// Filesystem path corresponding to this store's group prefix.
+    ///
     /// Returns `self.path` for the root store.
     fn group_fs_path(&self) -> PathBuf {
         if self.group.is_empty() {
@@ -340,9 +244,11 @@ impl ZarrSaveStore {
         format!("{}/{}", self.group, kind.name())
     }
 
-    /// Translate signed `(n, s, [idx])` coordinates into the unsigned zarr
-    /// indices used for shard arrays. The first coordinate (`n`) is offset
-    /// by `-N_MIN`; later coordinates are passed through as-is.
+    /// Translate signed `(n, s, [idx])` coordinates into the unsigned zarr indices used for
+    /// shard arrays.
+    ///
+    /// The first coordinate (`n`) is offset by `-N_MIN`; later coordinates are passed through
+    /// as-is.
     fn shard_zarr_coords<const N: usize>(coords: [i32; N]) -> Vec<u64> {
         let mut out = Vec::with_capacity(N);
         out.push((coords[0] - N_MIN) as u64);
@@ -352,8 +258,9 @@ impl ZarrSaveStore {
         out
     }
 
-    /// Get-or-create the per-kind write lock for this store. See the comment
-    /// on `write_locks` for why this exists.
+    /// Get-or-create the per-kind write lock for this store.
+    ///
+    /// See the comment on the `write_locks` field for why this exists.
     fn write_lock(&self, kind: SaveKind) -> Arc<Mutex<()>> {
         Arc::clone(
             self.write_locks
@@ -417,13 +324,15 @@ impl ZarrSaveStore {
         Ok(())
     }
 
-    /// Write a sharded byte payload. Streamed kinds (ResQi, NassauQi) are
-    /// not supported here — use [`Self::writer`] instead, since they may be
-    /// multi-GB and would OOM the in-memory `Vec`.
+    /// Write a sharded byte payload.
     ///
-    /// `location` is anything that implements [`SaveCoords`] — [`Bidegree`]
-    /// for 2D kinds and [`BidegreeGenerator`] for 3D kinds. Negative `n` is
-    /// fine; the offset is handled internally.
+    /// Streamed kinds ([`SaveKind::ResQi`], [`SaveKind::NassauQi`]) are not supported here — use
+    /// [`Self::nassau_qi_writer`] / [`Self::write_res_qi`] instead, since they may be multi-GB
+    /// and would OOM the in-memory `Vec`.
+    ///
+    /// `location` is anything that implements [`SaveCoords`] — [`Bidegree`] for 2D kinds and
+    /// [`BidegreeGenerator`] for 3D kinds. Negative `n` is fine; the offset is handled
+    /// internally.
     pub fn write<const N: usize>(
         &self,
         kind: SaveKind,
@@ -441,11 +350,10 @@ impl ZarrSaveStore {
         let arr = zarrs::array::Array::open(self.store.clone(), &self.shard_array_path(kind))?;
         let zarr_coords = Self::shard_zarr_coords(location.save_coords());
         let subset = ArraySubset::new_with_start_shape(zarr_coords, vec![1; N])?;
-        // Force sequential codec execution. Holding our std::sync::Mutex
-        // across `store_array_subset` is unsafe with rayon, because zarrs's
-        // sharding codec uses rayon internally — the worker that holds the
-        // mutex would join on inner tasks and could be assigned a new task
-        // that also needs the mutex, deadlocking. Sequential execution
+        // Force sequential codec execution. Holding our std::sync::Mutex across
+        // `store_array_subset` is unsafe with rayon, because zarrs's sharding codec uses rayon
+        // internally — the worker that holds the mutex would join on inner tasks and could be
+        // assigned a new task that also needs the mutex, deadlocking. Sequential execution
         // avoids the join entirely.
         arr.store_array_subset_opt(
             &subset,
@@ -455,9 +363,10 @@ impl ZarrSaveStore {
         Ok(())
     }
 
-    /// Read a sharded byte payload. Returns `None` if no data has been
-    /// written. ResQi/NassauQi are not supported here; use the dedicated
-    /// per-kind APIs.
+    /// Read a sharded byte payload.
+    ///
+    /// Returns `None` if no data has been written. [`SaveKind::ResQi`] / [`SaveKind::NassauQi`]
+    /// are not supported here; use the dedicated per-kind APIs.
     pub fn read<const N: usize>(
         &self,
         kind: SaveKind,
@@ -503,9 +412,8 @@ impl ZarrSaveStore {
             "delete() is only for sharded kinds, got {:?}",
             kind
         );
-        // Overwrite with fill value (empty vec). The array must already
-        // exist for delete to be meaningful. Same locking + sequential
-        // codec story as `write`.
+        // Overwrite with fill value (empty vec). The array must already exist for delete to be
+        // meaningful. Same locking + sequential codec story as `write`.
         let lock = self.write_lock(kind);
         let _guard = lock.lock().unwrap();
         let arr = zarrs::array::Array::open(self.store.clone(), &self.shard_array_path(kind))?;
@@ -526,7 +434,7 @@ impl ZarrSaveStore {
         format!("{}/qi/n{}_s{}/res_qi", self.group, b.n(), b.s())
     }
 
-    /// Write a `QuasiInverse` as a structured zarr group at `qi/n{n}_s{s}/res_qi`.
+    /// Write a [`QuasiInverse`] as a structured zarr group at `qi/n{n}_s{s}/res_qi`.
     ///
     /// Layout:
     ///
@@ -534,9 +442,8 @@ impl ZarrSaveStore {
     /// - `pivots`: 1D `i64`, shape `[target_dim]`
     /// - `rows`: 2D `u8`, shape `[image_dim, num_limbs * 8]`, chunked over rows
     ///
-    /// `finished` is set to `true` only on success, so a writer that crashes
-    /// mid-write leaves the group in a state the matching reader treats as
-    /// missing.
+    /// `finished` is set to `true` only on success, so a writer that crashes mid-write leaves
+    /// the group in a state the matching reader treats as missing.
     pub fn write_res_qi(&self, b: Bidegree, qi: &QuasiInverse) -> anyhow::Result<()> {
         self.ensure_qi_bidegree(b)?;
         let group_path = self.res_qi_group_path(b);
@@ -601,9 +508,9 @@ impl ZarrSaveStore {
         rows_array.store_metadata()?;
 
         if image_dim > 0 && row_bytes > 0 {
-            // Write rows in chunks of `chunk_rows` rows. Pad the last chunk
-            // with zeros so the chunk-shape constraint is satisfied; the
-            // reader knows `image_dim` and ignores the padded rows.
+            // Write rows in chunks of `chunk_rows` rows. Pad the last chunk with zeros so the
+            // chunk-shape constraint is satisfied; the reader knows `image_dim` and ignores the
+            // padded rows.
             let chunk_byte_len = (chunk_rows as usize) * row_bytes;
             let mut chunk_buf: Vec<u8> = Vec::with_capacity(chunk_byte_len);
             let mut chunk_idx: u64 = 0;
@@ -633,9 +540,10 @@ impl ZarrSaveStore {
         Ok(())
     }
 
-    /// Open a streaming reader for the ResQi at bidegree `b`. Returns `None`
-    /// if no finished group exists. The reader fetches one chunk of rows at
-    /// a time so peak memory is bounded by `CHUNK_RES_QI_ROWS * row_bytes`.
+    /// Open a streaming reader for the ResQi at bidegree `b`.
+    ///
+    /// Returns `None` if no finished group exists. The reader fetches one chunk of rows at a
+    /// time so peak memory is bounded by `CHUNK_RES_QI_ROWS * row_bytes`.
     pub fn stream_res_qi(&self, b: Bidegree, p: ValidPrime) -> anyhow::Result<Option<ResQiReader>> {
         let group_path = self.res_qi_group_path(b);
         let group = match zarrs::group::Group::open(self.store.clone(), &group_path) {
@@ -694,10 +602,11 @@ impl ZarrSaveStore {
         format!("{}/qi/n{}_s{}/nassau_qi", self.group, b.n(), b.s())
     }
 
-    /// Open a writer for a NassauQi at bidegree `b`. The header (target/zero
-    /// mask dimensions and the subalgebra profile bytes) goes into group
-    /// attributes; the body of the bytecode becomes a 1D vlen-bytes
-    /// `commands` array, with each element holding one command.
+    /// Open a writer for a NassauQi at bidegree `b`.
+    ///
+    /// The header (target/zero mask dimensions and the subalgebra profile bytes) goes into group
+    /// attributes; the body of the bytecode becomes a 1D vlen-bytes `commands` array, with each
+    /// element holding one command.
     pub fn nassau_qi_writer(
         &self,
         b: Bidegree,
@@ -750,11 +659,11 @@ impl ZarrSaveStore {
         })
     }
 
-    /// Open a streaming reader for the NassauQi at bidegree `b`. Returns
-    /// `None` if no finished group exists. The reader yields one
-    /// [`NassauCommand`] at a time and fetches one chunk of commands at a
-    /// time, so peak memory is bounded by `CHUNK_NASSAU_COMMANDS *
-    /// avg_command_bytes`.
+    /// Open a streaming reader for the NassauQi at bidegree `b`.
+    ///
+    /// Returns `None` if no finished group exists. The reader yields one [`NassauCommand`] at a
+    /// time and fetches one chunk of commands at a time, so peak memory is bounded by
+    /// `CHUNK_NASSAU_COMMANDS * avg_command_bytes`.
     pub fn nassau_qi_reader(&self, b: Bidegree) -> anyhow::Result<Option<NassauQiReader>> {
         let group_path = self.nassau_qi_group_path(b);
         let group = match zarrs::group::Group::open(self.store.clone(), &group_path) {
@@ -810,8 +719,9 @@ impl ZarrSaveStore {
 
 // --- ResQi reader ---
 
-/// Streaming reader for a structured ResQi. Reads matrix rows from the
-/// underlying chunked 2D `rows` array on demand.
+/// Streaming reader for a structured ResQi.
+///
+/// Reads matrix rows from the underlying chunked 2D `rows` array on demand.
 pub struct ResQiReader {
     p: ValidPrime,
     source_dim: usize,
@@ -848,9 +758,10 @@ impl ResQiReader {
         &self.pivots
     }
 
-    /// Read the next matrix row into `dest`. Returns whether a row was read.
-    /// Rows are returned in the order they were written (one per non-trivial
-    /// pivot column).
+    /// Read the next matrix row into `dest`.
+    ///
+    /// Returns whether a row was read. Rows are returned in the order they were written (one per
+    /// non-trivial pivot column).
     pub fn next_row(&mut self, dest: &mut FpVector) -> anyhow::Result<bool> {
         if self.image_dim == 0 || self.row_bytes == 0 {
             return Ok(false);
@@ -878,10 +789,11 @@ impl ResQiReader {
         Ok(true)
     }
 
-    /// Apply this quasi-inverse to all the vectors in `inputs`, accumulating
-    /// the results into `results`. Mirrors the semantics of the legacy
-    /// `QuasiInverse::stream_quasi_inverse` but reads from the structured
-    /// zarr layout.
+    /// Apply this quasi-inverse to all the vectors in `inputs`, accumulating the results into
+    /// `results`.
+    ///
+    /// Mirrors the semantics of the legacy `QuasiInverse::stream_quasi_inverse` but reads from
+    /// the structured zarr layout.
     pub fn apply<T, S>(mut self, results: &mut [T], inputs: &[S]) -> anyhow::Result<()>
     where
         for<'a> &'a mut T: Into<FpSliceMut<'a>>,
@@ -904,8 +816,9 @@ impl ResQiReader {
         Ok(())
     }
 
-    /// Materialize the full `QuasiInverse` in memory. Used by the load-on-
-    /// resume path; for streaming application, prefer [`Self::apply`].
+    /// Materialize the full [`QuasiInverse`] in memory.
+    ///
+    /// Used by the load-on-resume path; for streaming application, prefer [`Self::apply`].
     pub fn into_quasi_inverse(mut self) -> anyhow::Result<QuasiInverse> {
         let mut rows: Vec<FpVector> = Vec::with_capacity(self.image_dim);
         for _ in 0..self.image_dim {
@@ -921,21 +834,25 @@ impl ResQiReader {
 
 // --- NassauQi commands and writer/reader ---
 
-/// One command in a NassauQi command stream. Mirrors the original bytecode
-/// but as discrete typed values instead of an inline `i64` magic number
-/// stream.
+/// One command in a NassauQi command stream.
+///
+/// Mirrors the original bytecode but as discrete typed values instead of an inline `i64` magic
+/// number stream.
 #[derive(Debug, Clone)]
 pub enum NassauCommand {
-    /// Switch to a new subalgebra signature. Subsequent pivot lifts are
-    /// expressed in the masked basis under this signature.
+    /// Switch to a new subalgebra signature.
+    ///
+    /// Subsequent pivot lifts are expressed in the masked basis under this signature.
     Signature(Vec<u16>),
-    /// "Differential fix" — emitted (at most once) at the end of the
-    /// zero-signature section when the bidegree was resolved through stem
-    /// rather than through `t`. Carries no payload.
+    /// "Differential fix" — emitted (at most once) at the end of the zero-signature section
+    /// when the bidegree was resolved through stem rather than through `t`.
+    ///
+    /// Carries no payload.
     Fix,
-    /// A pivot column with its lift and image. `lift_bytes` and `image_bytes`
-    /// are raw `FpVector` limb serialisations; the caller knows the
-    /// dimensions from the current signature state and `target_dim`.
+    /// A pivot column with its lift and image.
+    ///
+    /// `lift_bytes` and `image_bytes` are raw `FpVector` limb serialisations; the caller knows
+    /// the dimensions from the current signature state and `target_dim`.
     Pivot {
         col: u64,
         lift_bytes: Vec<u8>,
@@ -946,11 +863,12 @@ pub enum NassauCommand {
 const NASSAU_CODE_SIGNATURE: i64 = -2;
 const NASSAU_CODE_FIX: i64 = -3;
 
-/// Writer for a structured NassauQi. Each call to a `write_*` method
-/// appends one command to the in-memory buffer; the buffer is flushed
-/// to the underlying zarr `commands` array when `CHUNK_NASSAU_COMMANDS`
-/// commands have accumulated. `finish()` flushes any remaining commands
-/// and commits the `num_commands` and `finished` group attributes.
+/// Writer for a structured NassauQi.
+///
+/// Each call to a `write_*` method appends one command to the in-memory buffer; the buffer is
+/// flushed to the underlying zarr `commands` array when `CHUNK_NASSAU_COMMANDS` commands have
+/// accumulated. `finish()` flushes any remaining commands and commits the `num_commands` and
+/// `finished` group attributes.
 pub struct NassauQiWriter {
     store: ReadableWritableListableStorage,
     group_path: String,
@@ -977,8 +895,8 @@ impl NassauQiWriter {
         }
         let mut chunk = std::mem::take(&mut self.command_buf);
         if pad {
-            // Pad to chunk shape with empty elements; the reader knows
-            // num_commands and ignores them.
+            // Pad to chunk shape with empty elements; the reader knows num_commands and ignores
+            // them.
             chunk.resize_with(CHUNK_NASSAU_COMMANDS as usize, Vec::new);
         }
         self.commands_array.store_chunk(&[self.chunk_idx], chunk)?;
@@ -1017,8 +935,8 @@ impl NassauQiWriter {
         self.add_command(bytes)
     }
 
-    /// Finalize: flush the partial last chunk and commit the
-    /// `num_commands` and `finished = true` attributes.
+    /// Finalize: flush the partial last chunk and commit the `num_commands` and
+    /// `finished = true` attributes.
     pub fn finish(mut self) -> anyhow::Result<()> {
         let total = self.commands_written;
         self.flush_chunk(true)?;
@@ -1032,9 +950,10 @@ impl NassauQiWriter {
     }
 }
 
-/// Streaming reader for a structured NassauQi. Yields one [`NassauCommand`]
-/// at a time, fetching chunks from the underlying `commands` array on
-/// demand.
+/// Streaming reader for a structured NassauQi.
+///
+/// Yields one [`NassauCommand`] at a time, fetching chunks from the underlying `commands` array
+/// on demand.
 pub struct NassauQiReader {
     target_dim: u64,
     zero_mask_dim: u64,
@@ -1060,24 +979,7 @@ impl NassauQiReader {
         &self.subalgebra_profile
     }
 
-    /// Yield the next command, or `None` if all `num_commands` have been
-    /// consumed.
-    pub fn next_command(&mut self) -> anyhow::Result<Option<NassauCommand>> {
-        if self.consumed >= self.num_commands {
-            return Ok(None);
-        }
-        if self.pos_in_chunk >= self.chunk_buf.len() {
-            self.chunk_buf = self.commands_array.retrieve_chunk(&[self.chunk_idx])?;
-            self.chunk_idx += 1;
-            self.pos_in_chunk = 0;
-        }
-        let bytes = std::mem::take(&mut self.chunk_buf[self.pos_in_chunk]);
-        self.pos_in_chunk += 1;
-        self.consumed += 1;
-        Self::parse(bytes)
-    }
-
-    fn parse(bytes: Vec<u8>) -> anyhow::Result<Option<NassauCommand>> {
+    fn parse(bytes: Vec<u8>) -> anyhow::Result<NassauCommand> {
         if bytes.len() < 8 {
             anyhow::bail!("NassauQi command too short: {} bytes", bytes.len());
         }
@@ -1089,9 +991,9 @@ impl NassauQiReader {
                     .chunks_exact(2)
                     .map(|c| u16::from_le_bytes([c[0], c[1]]))
                     .collect();
-                Ok(Some(NassauCommand::Signature(sig)))
+                Ok(NassauCommand::Signature(sig))
             }
-            NASSAU_CODE_FIX => Ok(Some(NassauCommand::Fix)),
+            NASSAU_CODE_FIX => Ok(NassauCommand::Fix),
             col if col >= 0 => {
                 if bytes.len() < 12 {
                     anyhow::bail!("NassauQi pivot command too short: {} bytes", bytes.len());
@@ -1106,13 +1008,162 @@ impl NassauQiReader {
                 }
                 let lift_bytes = bytes[12..12 + lift_byte_len].to_vec();
                 let image_bytes = bytes[12 + lift_byte_len..].to_vec();
-                Ok(Some(NassauCommand::Pivot {
+                Ok(NassauCommand::Pivot {
                     col: col as u64,
                     lift_bytes,
                     image_bytes,
-                }))
+                })
             }
             _ => anyhow::bail!("Unknown NassauQi command code: {code}"),
+        }
+    }
+}
+
+impl Iterator for NassauQiReader {
+    type Item = anyhow::Result<NassauCommand>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.consumed >= self.num_commands {
+            return None;
+        }
+        if self.pos_in_chunk >= self.chunk_buf.len() {
+            match self.commands_array.retrieve_chunk(&[self.chunk_idx]) {
+                Ok(buf) => self.chunk_buf = buf,
+                Err(e) => return Some(Err(e.into())),
+            }
+            self.chunk_idx += 1;
+            self.pos_in_chunk = 0;
+        }
+        let bytes = std::mem::take(&mut self.chunk_buf[self.pos_in_chunk]);
+        self.pos_in_chunk += 1;
+        self.consumed += 1;
+        Some(Self::parse(bytes))
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = (self.num_commands - self.consumed) as usize;
+        (remaining, Some(remaining))
+    }
+}
+
+// --- SaveCoords, SaveKind, SaveDirectory ---
+
+/// Anything that names a save location, parameterised by its dimension `N`.
+///
+/// [`Bidegree`] is `SaveCoords<2>` and [`BidegreeGenerator`] is `SaveCoords<3>`, so methods that
+/// only make sense in one of those dimensions (e.g. the stream-tier writer / reader, which are
+/// per-bidegree) can take `impl SaveCoords<2>` and refuse the other type at compile time. The
+/// store reads `(n, s, [idx])` from this, shifts `n` by the internal `N_MIN` offset, and uses
+/// the result as a zarr index. Implementing this trait for `MultiDegree<N>` /
+/// `MultiDegreeGenerator<N>` would extend the same API to higher-`N` gradings without further
+/// changes here.
+pub trait SaveCoords<const N: usize> {
+    fn save_coords(&self) -> [i32; N];
+}
+
+impl SaveCoords<2> for Bidegree {
+    fn save_coords(&self) -> [i32; 2] {
+        [self.n(), self.s()]
+    }
+}
+
+impl SaveCoords<3> for BidegreeGenerator {
+    fn save_coords(&self) -> [i32; 3] {
+        [self.n(), self.s(), self.idx() as i32]
+    }
+}
+
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Hash)]
+#[non_exhaustive]
+pub enum SaveKind {
+    Kernel,
+    Differential,
+    ResQi,
+    AugmentationQi,
+    SecondaryComposite,
+    SecondaryIntermediate,
+    SecondaryHomotopy,
+    ChainMap,
+    ChainHomotopy,
+    NassauDifferential,
+    NassauQi,
+}
+
+impl SaveKind {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Kernel => "kernel",
+            Self::Differential => "differential",
+            Self::ResQi => "res_qi",
+            Self::AugmentationQi => "augmentation_qi",
+            Self::SecondaryComposite => "secondary_composite",
+            Self::SecondaryIntermediate => "secondary_intermediate",
+            Self::SecondaryHomotopy => "secondary_homotopy",
+            Self::ChainMap => "chain_map",
+            Self::ChainHomotopy => "chain_homotopy",
+            Self::NassauDifferential => "nassau_differential",
+            Self::NassauQi => "nassau_qi",
+        }
+    }
+
+    /// Whether this kind uses 3D indexing `(n, s, idx)`.
+    ///
+    /// The third coordinate is an intra-lift enumeration over basis elements; multi-hom
+    /// disambiguation is handled by the store's group prefix, not by an extra coordinate.
+    /// `SecondaryHomotopy` is per-bidegree (data for all generators is concatenated), so it
+    /// stays 2D.
+    fn is_indexed(self) -> bool {
+        matches!(self, Self::SecondaryComposite | Self::SecondaryIntermediate)
+    }
+
+    pub fn resolution_data() -> impl Iterator<Item = Self> {
+        use SaveKind::*;
+        static KINDS: [SaveKind; 4] = [Kernel, Differential, ResQi, AugmentationQi];
+        KINDS.iter().copied()
+    }
+
+    pub fn nassau_data() -> impl Iterator<Item = Self> {
+        use SaveKind::*;
+        static KINDS: [SaveKind; 2] = [NassauDifferential, NassauQi];
+        KINDS.iter().copied()
+    }
+
+    pub fn secondary_data() -> impl Iterator<Item = Self> {
+        use SaveKind::*;
+        static KINDS: [SaveKind; 3] =
+            [SecondaryComposite, SecondaryIntermediate, SecondaryHomotopy];
+        KINDS.iter().copied()
+    }
+}
+
+#[derive(Debug)]
+pub enum SaveDirectory {
+    None,
+    Store(ZarrSaveStore),
+}
+
+impl SaveDirectory {
+    pub fn is_none(&self) -> bool {
+        matches!(self, Self::None)
+    }
+
+    pub fn is_some(&self) -> bool {
+        !self.is_none()
+    }
+
+    pub fn store(&self) -> Option<&ZarrSaveStore> {
+        match self {
+            Self::None => None,
+            Self::Store(s) => Some(s),
+        }
+    }
+}
+
+impl From<Option<PathBuf>> for SaveDirectory {
+    fn from(x: Option<PathBuf>) -> Self {
+        match x {
+            None => Self::None,
+            Some(p) => Self::Store(ZarrSaveStore::create(p).expect("Failed to create zarr store")),
         }
     }
 }
