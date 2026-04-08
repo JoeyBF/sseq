@@ -39,14 +39,15 @@ zstd = { version = "0.13.3", optional = true }
 
 # Zarrs is declared twice with target-specific feature sets. On native targets we enable the
 # `filesystem` feature so the save system persists to disk; on `wasm32-unknown-unknown` we
-# disable it because `zarrs_filesystem` pulls in `positioned-io::RandomAccessFile`, which is
-# gated to `cfg(any(windows, unix))` and doesn't compile for WASM. The WASM build falls back
-# to an in-memory store (see `src/save/zarr.rs`).
+# fall back to an in-memory store (see `src/save.rs`). The `filesystem` feature pulls in
+# `positioned-io::RandomAccessFile`, which is gated to `cfg(any(windows, unix))` and doesn't
+# compile on wasm, and the `zstd` feature pulls in `zstd-sys`, whose C build expects POSIX
+# symbols like `qsort_r` that wasm's libc shim doesn't expose — so both are dropped on wasm.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 zarrs = { version = "0.23", default-features = false, features = ["filesystem", "sharding", "crc32c", "zstd"] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-zarrs = { version = "0.23", default-features = false, features = ["sharding", "crc32c", "zstd"] }
+zarrs = { version = "0.23", default-features = false, features = ["sharding", "crc32c"] }
 
 [target.'cfg(unix)'.dependencies]
 ctrlc = { version = "3", features = ["termination"] }

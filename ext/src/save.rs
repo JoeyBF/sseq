@@ -75,6 +75,8 @@ use fp::{
     vector::{FpSlice, FpSliceMut, FpVector},
 };
 use sseq::coordinates::{Bidegree, BidegreeGenerator};
+#[cfg(not(target_arch = "wasm32"))]
+use zarrs::array::codec::ZstdCodec;
 // The concrete backing store depends on the target: native uses a `FilesystemStore` for real
 // on-disk persistence; WASM uses an in-memory `MemoryStore` so `zarrs_filesystem` (which pulls
 // in `positioned-io::RandomAccessFile`, gated to windows/unix) doesn't need to compile. The
@@ -85,11 +87,7 @@ use zarrs::filesystem::FilesystemStore;
 #[cfg(target_arch = "wasm32")]
 use zarrs::storage::store::MemoryStore;
 use zarrs::{
-    array::{
-        ArrayBuilder, ArraySubset, CodecOptions,
-        codec::{Crc32cCodec, ZstdCodec},
-        data_type,
-    },
+    array::{ArrayBuilder, ArraySubset, CodecOptions, codec::Crc32cCodec, data_type},
     group::GroupBuilder,
     storage::{ReadableWritableListableStorage, ReadableWritableListableStorageTraits},
 };
@@ -122,7 +120,39 @@ const SHARD_S: u64 = 8;
 const SHARD_IDX: u64 = 8;
 
 /// zstd compression level for the stream tier.
+#[cfg(not(target_arch = "wasm32"))]
 const ZSTD_LEVEL: i32 = 19;
+
+/// Convert a zarrs error into `anyhow::Error`.
+///
+/// On `wasm32-unknown-unknown` some zarrs error types contain `Arc<dyn TraitObj>` with only
+/// `MaybeSend + MaybeSync` bounds (no-ops on wasm), so `anyhow::Error`'s `Send + Sync`
+/// requirement rejects them via the blanket `From` impl. Formatting the error as a string
+/// sidesteps the bound and works on both targets; the tradeoff is that the original error's
+/// source chain is collapsed into its `Display` output.
+fn zarr_err<E: std::fmt::Display>(e: E) -> anyhow::Error {
+    anyhow::anyhow!("{e}")
+}
+
+/// Build the bytes-to-bytes codec chain for stream-tier arrays.
+///
+/// On native targets this is `zstd(level=19) + crc32c`. On wasm32 the `zstd` feature is
+/// disabled (its C build expects POSIX symbols the wasm libc shim doesn't expose) so we fall
+/// back to `crc32c` alone — the memory-backed store on wasm is ephemeral, so skipping
+/// compression is fine.
+fn stream_tier_codecs() -> Vec<Arc<dyn zarrs::array::BytesToBytesCodecTraits>> {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        vec![
+            Arc::new(ZstdCodec::new(ZSTD_LEVEL, false)),
+            Arc::new(Crc32cCodec::new()),
+        ]
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        vec![Arc::new(Crc32cCodec::new())]
+    }
+}
 
 /// Number of matrix rows per chunk in the ResQi `rows` array.
 ///
@@ -144,6 +174,14 @@ pub struct ZarrSaveStore {
     /// Filesystem root of the underlying store. Same for all subgroups.
     path: PathBuf,
     /// Underlying zarr storage. Cheap to clone via `Arc`.
+    ///
+    /// On `wasm32-unknown-unknown` this wraps a trait object bounded only by
+    /// `MaybeSend + MaybeSync` (no-ops on wasm), so the `Arc` isn't `Send`/`Sync` in Rust's
+    /// eyes. The rest of `ext` requires chain complexes to be `Send + Sync`, and rippling
+    /// that relaxation through the whole crate to accommodate the WASM frontend isn't worth
+    /// it. Instead we force `Send + Sync` via the `unsafe impl`s below — sound because
+    /// wasm32 is single-threaded, so the absent cross-thread guarantees are vacuously
+    /// satisfied.
     store: ReadableWritableListableStorage,
     /// Group prefix applied to every operation.
     ///
@@ -164,6 +202,13 @@ pub struct ZarrSaveStore {
     /// cross-kind parallelism dominates.
     write_locks: DashMap<SaveKind, Arc<Mutex<()>>>,
 }
+
+// See the doc comment on `ZarrSaveStore::store` for why this is sound on wasm. On native the
+// trait object is already `Send + Sync`, so the cfg gate avoids a redundant-impl warning.
+#[cfg(target_arch = "wasm32")]
+unsafe impl Send for ZarrSaveStore {}
+#[cfg(target_arch = "wasm32")]
+unsafe impl Sync for ZarrSaveStore {}
 
 impl std::fmt::Debug for ZarrSaveStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -386,7 +431,8 @@ impl ZarrSaveStore {
             &subset,
             vec![data.to_vec()],
             &CodecOptions::default().with_concurrent_target(1),
-        )?;
+        )
+        .map_err(zarr_err)?;
         Ok(())
     }
 
@@ -411,7 +457,7 @@ impl ZarrSaveStore {
         };
         let zarr_coords = Self::shard_zarr_coords(location.save_coords());
         let subset = ArraySubset::new_with_start_shape(zarr_coords, vec![1; N])?;
-        let data: Vec<Vec<u8>> = arr.retrieve_array_subset(&subset)?;
+        let data: Vec<Vec<u8>> = arr.retrieve_array_subset(&subset).map_err(zarr_err)?;
         match data.into_iter().next() {
             Some(element) if !element.is_empty() => Ok(Some(element)),
             _ => Ok(None),
@@ -450,7 +496,8 @@ impl ZarrSaveStore {
             &subset,
             vec![Vec::<u8>::new()],
             &CodecOptions::default().with_concurrent_target(1),
-        )?;
+        )
+        .map_err(zarr_err)?;
         Ok(())
     }
 
@@ -502,10 +549,7 @@ impl ZarrSaveStore {
             data_type::int64(),
             zarrs::array::FillValue::from(0i64),
         )
-        .bytes_to_bytes_codecs(vec![
-            Arc::new(ZstdCodec::new(ZSTD_LEVEL, false)),
-            Arc::new(Crc32cCodec::new()),
-        ])
+        .bytes_to_bytes_codecs(stream_tier_codecs())
         .build(self.store.clone(), &format!("{}/pivots", group_path))?;
         pivots_array.store_metadata()?;
         let mut pivots_data: Vec<i64> = match qi.pivots() {
@@ -515,7 +559,9 @@ impl ZarrSaveStore {
         if pivots_data.is_empty() {
             pivots_data.push(0);
         }
-        pivots_array.store_chunk(&[0], pivots_data)?;
+        pivots_array
+            .store_chunk(&[0], pivots_data)
+            .map_err(zarr_err)?;
 
         // rows array: 2D u8 [image_dim, row_bytes], chunked over rows.
         let rows_shape_0 = std::cmp::max(image_dim as u64, 1);
@@ -527,10 +573,7 @@ impl ZarrSaveStore {
             data_type::uint8(),
             zarrs::array::FillValue::from(0u8),
         )
-        .bytes_to_bytes_codecs(vec![
-            Arc::new(ZstdCodec::new(ZSTD_LEVEL, false)),
-            Arc::new(Crc32cCodec::new()),
-        ])
+        .bytes_to_bytes_codecs(stream_tier_codecs())
         .build(self.store.clone(), &format!("{}/rows", group_path))?;
         rows_array.store_metadata()?;
 
@@ -547,14 +590,18 @@ impl ZarrSaveStore {
                 row_vec.to_bytes(&mut chunk_buf)?;
                 debug_assert_eq!(chunk_buf.len() - buf_before, row_bytes);
                 if chunk_buf.len() == chunk_byte_len {
-                    rows_array.store_chunk(&[chunk_idx, 0], std::mem::take(&mut chunk_buf))?;
+                    rows_array
+                        .store_chunk(&[chunk_idx, 0], std::mem::take(&mut chunk_buf))
+                        .map_err(zarr_err)?;
                     chunk_idx += 1;
                     chunk_buf.reserve(chunk_byte_len);
                 }
             }
             if !chunk_buf.is_empty() {
                 chunk_buf.resize(chunk_byte_len, 0);
-                rows_array.store_chunk(&[chunk_idx, 0], chunk_buf)?;
+                rows_array
+                    .store_chunk(&[chunk_idx, 0], chunk_buf)
+                    .map_err(zarr_err)?;
             }
         }
 
@@ -597,7 +644,7 @@ impl ZarrSaveStore {
 
         let pivots_array =
             zarrs::array::Array::open(self.store.clone(), &format!("{}/pivots", group_path))?;
-        let pivots_chunk: Vec<i64> = pivots_array.retrieve_chunk(&[0])?;
+        let pivots_chunk: Vec<i64> = pivots_array.retrieve_chunk(&[0]).map_err(zarr_err)?;
         let pivots: Vec<isize> = pivots_chunk
             .into_iter()
             .take(target_dim)
@@ -668,10 +715,7 @@ impl ZarrSaveStore {
             data_type::bytes(),
             zarrs::array::FillValue::from(Vec::<u8>::new()),
         )
-        .bytes_to_bytes_codecs(vec![
-            Arc::new(ZstdCodec::new(ZSTD_LEVEL, false)),
-            Arc::new(Crc32cCodec::new()),
-        ])
+        .bytes_to_bytes_codecs(stream_tier_codecs())
         .build(self.store.clone(), &format!("{}/commands", group_path))?;
         commands_array.store_metadata()?;
 
@@ -800,7 +844,10 @@ impl ResQiReader {
         }
         if self.chunk_buf.is_empty() || self.pos_in_chunk * self.row_bytes >= self.chunk_buf.len() {
             // Refill from the next chunk.
-            let chunk: Vec<u8> = self.rows_array.retrieve_chunk(&[self.chunk_idx, 0])?;
+            let chunk: Vec<u8> = self
+                .rows_array
+                .retrieve_chunk(&[self.chunk_idx, 0])
+                .map_err(zarr_err)?;
             // Cache rows-per-chunk on first fetch.
             if self.chunk_rows == 0 && self.row_bytes > 0 {
                 self.chunk_rows = chunk.len() / self.row_bytes;
@@ -926,7 +973,9 @@ impl NassauQiWriter {
             // them.
             chunk.resize_with(CHUNK_NASSAU_COMMANDS as usize, Vec::new);
         }
-        self.commands_array.store_chunk(&[self.chunk_idx], chunk)?;
+        self.commands_array
+            .store_chunk(&[self.chunk_idx], chunk)
+            .map_err(zarr_err)?;
         self.chunk_idx += 1;
         self.command_buf.reserve(CHUNK_NASSAU_COMMANDS as usize);
         Ok(())
@@ -1056,7 +1105,7 @@ impl Iterator for NassauQiReader {
         if self.pos_in_chunk >= self.chunk_buf.len() {
             match self.commands_array.retrieve_chunk(&[self.chunk_idx]) {
                 Ok(buf) => self.chunk_buf = buf,
-                Err(e) => return Some(Err(e.into())),
+                Err(e) => return Some(Err(zarr_err(e))),
             }
             self.chunk_idx += 1;
             self.pos_in_chunk = 0;
