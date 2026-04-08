@@ -34,9 +34,19 @@ rustc-hash = "2.1.1"
 serde_json = { version = "1.0.141", features = ["preserve_order"] }
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
-zarrs = { version = "0.23", default-features = false, features = ["filesystem", "sharding", "crc32c", "zstd"] }
 
 zstd = { version = "0.13.3", optional = true }
+
+# Zarrs is declared twice with target-specific feature sets. On native targets we enable the
+# `filesystem` feature so the save system persists to disk; on `wasm32-unknown-unknown` we
+# disable it because `zarrs_filesystem` pulls in `positioned-io::RandomAccessFile`, which is
+# gated to `cfg(any(windows, unix))` and doesn't compile for WASM. The WASM build falls back
+# to an in-memory store (see `src/save/zarr.rs`).
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+zarrs = { version = "0.23", default-features = false, features = ["filesystem", "sharding", "crc32c", "zstd"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+zarrs = { version = "0.23", default-features = false, features = ["sharding", "crc32c", "zstd"] }
 
 [target.'cfg(unix)'.dependencies]
 ctrlc = { version = "3", features = ["termination"] }

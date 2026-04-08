@@ -1,5 +1,13 @@
 //! Two-tier zarr save system for resolutions, chain maps, and chain homotopies.
 //!
+//! On native targets the store is backed by a real zarr v3 store on the local filesystem via
+//! [`zarrs::filesystem::FilesystemStore`]. On `wasm32-unknown-unknown` we swap in
+//! [`zarrs::storage::store::MemoryStore`] instead — `zarrs_filesystem` transitively pulls in
+//! `positioned-io::RandomAccessFile`, which is gated to `cfg(any(windows, unix))` and doesn't
+//! compile for WASM. The WASM frontend has no filesystem to persist to anyway, so the memory
+//! store just acts as a no-op sink that's dropped at session end; the same code paths
+//! exercise it on both targets.
+//!
 //! # Layout
 //!
 //! One zarr v3 store with per-namespace subgroups for named homomorphisms and chain homotopies:
@@ -67,13 +75,21 @@ use fp::{
     vector::{FpSlice, FpSliceMut, FpVector},
 };
 use sseq::coordinates::{Bidegree, BidegreeGenerator};
+// The concrete backing store depends on the target: native uses a `FilesystemStore` for real
+// on-disk persistence; WASM uses an in-memory `MemoryStore` so `zarrs_filesystem` (which pulls
+// in `positioned-io::RandomAccessFile`, gated to windows/unix) doesn't need to compile. The
+// WASM frontend has no filesystem to persist to anyway, so the memory store just serves as a
+// no-op sink and is dropped at session end.
+#[cfg(not(target_arch = "wasm32"))]
+use zarrs::filesystem::FilesystemStore;
+#[cfg(target_arch = "wasm32")]
+use zarrs::storage::store::MemoryStore;
 use zarrs::{
     array::{
         ArrayBuilder, ArraySubset, CodecOptions,
         codec::{Crc32cCodec, ZstdCodec},
         data_type,
     },
-    filesystem::FilesystemStore,
     group::GroupBuilder,
     storage::{ReadableWritableListableStorage, ReadableWritableListableStorageTraits},
 };
@@ -163,10 +179,21 @@ impl ZarrSaveStore {
         let path = std::path::absolute(path.as_ref())
             .with_context(|| format!("Failed to resolve path: {:?}", path.as_ref()))?;
 
+        #[cfg(not(target_arch = "wasm32"))]
         let store: ReadableWritableListableStorage = Arc::new(FilesystemStore::new(&path)?);
+        #[cfg(target_arch = "wasm32")]
+        let store: ReadableWritableListableStorage = Arc::new(MemoryStore::new());
 
-        // Root group
-        if !path.join("zarr.json").exists() {
+        // Root group.
+        //
+        // On WASM the store is in-memory, so `zarr.json` never "exists" on disk; we
+        // unconditionally build the root group (the memory store silently overwrites any
+        // existing entry).
+        #[cfg(not(target_arch = "wasm32"))]
+        let needs_root_group = !path.join("zarr.json").exists();
+        #[cfg(target_arch = "wasm32")]
+        let needs_root_group = true;
+        if needs_root_group {
             GroupBuilder::new()
                 .build(store.clone(), "/")?
                 .store_metadata()?;
@@ -832,7 +859,7 @@ impl ResQiReader {
     }
 }
 
-// --- NassauQi commands and writer/reader ---
+// --- NassauQi writer/reader ---
 
 /// One command in a NassauQi command stream.
 ///
