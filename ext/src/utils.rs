@@ -561,14 +561,16 @@ pub(crate) mod parallel {
 
     impl ParallelGuard {
         pub(crate) fn new() -> Self {
-            PARALLEL_DEPTH.fetch_add(1, Ordering::Release);
+            let counter_was = PARALLEL_DEPTH.fetch_add(1, Ordering::Release);
+            tracing::info!(counter_was, "parallel_guard_acquire");
             Self
         }
     }
 
     impl Drop for ParallelGuard {
         fn drop(&mut self) {
-            PARALLEL_DEPTH.fetch_sub(1, Ordering::Release);
+            let counter_was = PARALLEL_DEPTH.fetch_sub(1, Ordering::Release);
+            tracing::info!(counter_was, "parallel_guard_drop");
         }
     }
 
