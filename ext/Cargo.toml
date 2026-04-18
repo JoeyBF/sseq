@@ -85,6 +85,10 @@ members = [
     "crates/sseq",
 ]
 
+[patch.crates-io]
+rayon = { git = "https://github.com/JoeyBF/rayon", branch = "tracing-integration" }
+rayon-core = { git = "https://github.com/JoeyBF/rayon", branch = "tracing-integration" }
+
 [[bench]]
 name = "resolve"
 harness = false
