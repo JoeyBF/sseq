@@ -26,7 +26,7 @@ static PTX_IMAGE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/matmul_b1.pt
 const TILE_M: usize = 64;
 const TILE_K: usize = 256;
 const KL: usize = TILE_K / 64; // 4
-const THREADS: u32 = 128;
+const THREADS: u32 = 256; // 2 warpgroups: producer (0..128) + consumer (128..256)
 const NG: u32 = 4;
 
 pub struct GpuContext {
