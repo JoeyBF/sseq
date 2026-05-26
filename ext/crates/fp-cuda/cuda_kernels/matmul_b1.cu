@@ -102,30 +102,39 @@ extern "C" __global__ void matmul_b1_kernel(
 
     const int nchunks = (K + TK - 1) / TK;
 
+    // NG accumulators stay resident across the K loop so we load A once per
+    // K-chunk instead of NG times. ~128 s32 regs/thread for `tot`, +32 for
+    // the per-wgmma `acc` scratch = ~160 regs, well inside Hopper's budget.
+    int32_t tot[NG][32];
+    #pragma unroll
     for (int g = 0; g < NG; ++g) {
-        int col = col0 + g;
-        if (col >= (int)nlim) continue;
-
-        int32_t tot[32];
         #pragma unroll
-        for (int r = 0; r < 32; ++r) tot[r] = 0;
+        for (int r = 0; r < 32; ++r) tot[g][r] = 0;
+    }
 
-        for (int kk = 0; kk < nchunks; ++kk) {
-            uint32_t phase = kk & 1;
+    for (int kk = 0; kk < nchunks; ++kk) {
+        uint32_t phase = kk & 1;
 
-            // TMA load A (thread 0 only, all others just wait).
-            if (t == 0) {
-                mbar_tx(mbar, 2048);
-                tma_2d(sA, &tma_a, 0, (kk * m_tiles + bi) * 16, mbar);
-            }
+        // TMA load A (thread 0 only, all others just wait) — once per K chunk.
+        if (t == 0) {
+            mbar_tx(mbar, 2048);
+            tma_2d(sA, &tma_a, 0, (kk * m_tiles + bi) * 16, mbar);
+        }
+
+        // Wait for TMA to finish writing sA before the first wgmma below.
+        mbar_wait(mbar, phase);
+
+        // For each output column-group, load its B tile and run wgmma.
+        // The same A tile in sA is reused across all NG iterations.
+        for (int g = 0; g < NG; ++g) {
+            int col = col0 + g;
+            if (col >= (int)nlim) continue;
 
             // Load pre-transposed B tile (all threads).
             const uint64_t* tile = &Bt[(kk * nlim + col) * TILE];
             for (int i = t; i < TILE; i += blockDim.x)
                 sB[i] = tile[i];
 
-            // Wait for TMA to finish writing sA.
-            mbar_wait(mbar, phase);
             // Ensure thread stores to sB are visible to wgmma async proxy.
             __syncthreads();
             asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
@@ -143,20 +152,25 @@ extern "C" __global__ void matmul_b1_kernel(
             wgmma_fence();
 
             #pragma unroll
-            for (int r = 0; r < 32; ++r) tot[r] += acc[r];
+            for (int r = 0; r < 32; ++r) tot[g][r] += acc[r];
         }
+    }
 
-        // Pack this column group's output.
-        const int wid = t >> 5, lane = t & 31;
-        const int rb = wid*16 + (lane>>2), cb = (lane&3)*2;
+    // Pack each column group's accumulator into sC.
+    const int wid = t >> 5, lane = t & 31;
+    const int rb = wid*16 + (lane>>2), cb = (lane&3)*2;
+    for (int g = 0; g < NG; ++g) {
+        int col = col0 + g;
+        if (col >= (int)nlim) continue;
+
         uint64_t b0 = 0, b8 = 0;
         #pragma unroll
         for (int gi = 0; gi < 8; ++gi) {
             int c0 = cb + gi*8, c1 = c0+1;
-            b0 |= (uint64_t)(tot[gi*4+0]&1) << c0;
-            b0 |= (uint64_t)(tot[gi*4+1]&1) << c1;
-            b8 |= (uint64_t)(tot[gi*4+2]&1) << c0;
-            b8 |= (uint64_t)(tot[gi*4+3]&1) << c1;
+            b0 |= (uint64_t)(tot[g][gi*4+0]&1) << c0;
+            b0 |= (uint64_t)(tot[g][gi*4+1]&1) << c1;
+            b8 |= (uint64_t)(tot[g][gi*4+2]&1) << c0;
+            b8 |= (uint64_t)(tot[g][gi*4+3]&1) << c1;
         }
         uint32_t* c32 = reinterpret_cast<uint32_t*>(sC[g]);
         atomicXor(&c32[rb*2],     (uint32_t)b0);
