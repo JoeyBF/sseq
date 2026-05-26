@@ -81,8 +81,8 @@ constexpr int NG = 4;
 
 extern "C" __global__ void matmul_b1_kernel(
     const __grid_constant__ CUtensorMap tma_a,
+    const __grid_constant__ CUtensorMap tma_b,
     uint32_t m_tiles,
-    const uint64_t* __restrict__ Bt,
     uint32_t M, uint32_t K, uint32_t nlim,
     uint64_t* __restrict__ C)
 {
@@ -90,17 +90,19 @@ extern "C" __global__ void matmul_b1_kernel(
     // consumes sA[kk&1]. Each buffer has its own mbarrier so prefetch and
     // consume don't share completion state.
     __shared__ alignas(128) uint64_t sA[2][TILE]; // 2*2048 B — filled by TMA
-    __shared__ alignas(128) uint64_t sB[TILE];    // 2048 B — filled by threads
+    __shared__ alignas(128) uint64_t sB[TILE];    // 2048 B — filled by TMA
     __shared__ uint64_t sC[NG][TM];
-    __shared__ alignas(8) uint64_t mbar[2];
+    __shared__ alignas(8) uint64_t mbar_a[2];
+    __shared__ alignas(8) uint64_t mbar_b[1];
 
     const int bi = blockIdx.y, bj = blockIdx.x, t = threadIdx.x;
     const int row0 = bi * TM, col0 = bj * NG;
     if (row0 >= (int)M) return;
 
     if (t == 0) {
-        mbar_init(&mbar[0], 1);
-        mbar_init(&mbar[1], 1);
+        mbar_init(&mbar_a[0], 1);
+        mbar_init(&mbar_a[1], 1);
+        mbar_init(&mbar_b[0], 1);
     }
     for (int g = 0; g < NG; ++g)
         if (t < TM) sC[g][t] = 0;
@@ -119,12 +121,13 @@ extern "C" __global__ void matmul_b1_kernel(
     }
 
     // Per-buffer phase counters for parity-based mbarrier waits.
-    uint32_t phase[2] = {0, 0};
+    uint32_t phase_a[2] = {0, 0};
+    uint32_t phase_b = 0;
 
     // Prelude: kick off TMA for K-chunk 0 into sA[0].
     if (nchunks > 0 && t == 0) {
-        mbar_tx(&mbar[0], 2048);
-        tma_2d(sA[0], &tma_a, 0, (0 * m_tiles + bi) * 16, &mbar[0]);
+        mbar_tx(&mbar_a[0], 2048);
+        tma_2d(sA[0], &tma_a, 0, (0 * m_tiles + bi) * 16, &mbar_a[0]);
     }
 
     for (int kk = 0; kk < nchunks; ++kk) {
@@ -135,35 +138,37 @@ extern "C" __global__ void matmul_b1_kernel(
         // overlap: cp.async.bulk.tensor for kk+1 starts now and runs in
         // parallel with the wgmma below that consumes kk.
         if (kk + 1 < nchunks && t == 0) {
-            mbar_tx(&mbar[nxt], 2048);
-            tma_2d(sA[nxt], &tma_a, 0, ((kk + 1) * m_tiles + bi) * 16, &mbar[nxt]);
+            mbar_tx(&mbar_a[nxt], 2048);
+            tma_2d(sA[nxt], &tma_a, 0, ((kk + 1) * m_tiles + bi) * 16, &mbar_a[nxt]);
         }
 
         // Wait for this chunk's A to land.
-        mbar_wait(&mbar[cur], phase[cur]);
-        phase[cur] ^= 1;
+        mbar_wait(&mbar_a[cur], phase_a[cur]);
+        phase_a[cur] ^= 1;
 
-        // For each output column-group, load its B tile and run wgmma.
+        // For each output column-group, TMA-load its B tile and run wgmma.
         // The same A tile in sA[cur] is reused across all NG iterations.
         for (int g = 0; g < NG; ++g) {
             int col = col0 + g;
             if (col >= (int)nlim) continue;
 
-            // Load pre-transposed B tile (all threads).
-            const uint64_t* tile = &Bt[(kk * nlim + col) * TILE];
-            for (int i = t; i < TILE; i += blockDim.x)
-                sB[i] = tile[i];
+            // TMA-load pre-transposed B tile (thread 0).
+            if (t == 0) {
+                mbar_tx(&mbar_b[0], 2048);
+                tma_2d(sB, &tma_b, 0, (kk * nlim + col) * 16, &mbar_b[0]);
+            }
+            mbar_wait(&mbar_b[0], phase_b);
+            phase_b ^= 1;
 
-            // Ensure thread stores to sB are visible to wgmma async proxy.
-            __syncthreads();
-            asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+            // No fence.proxy needed: TMA stores and wgmma reads are both
+            // in the async proxy.
 
-            // Fire wgmma. A uses 128B swizzle (layout_type=1), B uses none.
+            // Fire wgmma. Both descriptors use swizzle=0 (linear SMEM).
             int32_t acc[32];
             #pragma unroll
             for (int r = 0; r < 32; ++r) acc[r] = 0;
             uint64_t da = make_desc(sA[cur], 128, 256, 0);
-            uint64_t db = make_desc(sB,      128, 256, 0);  // no swizzle
+            uint64_t db = make_desc(sB,      128, 256, 0);
             wgmma_fence();
             wgmma_go(acc, da, db);
             wgmma_commit();
