@@ -1,60 +1,37 @@
 //! CUDA backend for `fp::blas` F_2 matrix multiplication on Hopper.
 //!
-//! The kernel lives in `cuda_kernels/matmul_b1.cu` and is compiled to PTX by
-//! `build.rs` (via nvcc with `-arch=sm_90a`). It uses the Hopper memory
-//! pipeline end-to-end: TMA bulk loads (`cp.async.bulk.tensor.2d`) +
-//! `mbarrier` sync + `wgmma.mma_async.sync.aligned.m64n64k256.row.col.s32.b1.b1.s32.and.popc`.
-//!
-//! This Rust side uses [NVlabs/cuda-oxide](https://github.com/NVlabs/cuda-oxide)'s
-//! `cuda-core` crate for the host driver-API surface (context, stream, device
-//! buffers, untyped module + function loading, raw kernel launch). No
-//! Rust-to-PTX path is involved — the kernel is C++ all the way down.
-//!
-//! The host side builds two `CUtensorMap` descriptors per matmul (one for A,
-//! one for B) via the raw `sys::cuTensorMapEncodeTiled` binding and passes
-//! them to the kernel as `__grid_constant__` parameters.
+//! A is pre-interleaved on the host and loaded via TMA with 128B swizzle.
+//! B is pre-transposed + CM-blocked on the host and loaded via memcpy.
+//! The kernel is a thin wrapper around wgmma.b1 m64n64k256.
 
 use std::{ffi::c_void, mem::MaybeUninit, sync::Arc};
 
 use cuda_core::{
-    CudaContext, CudaFunction, CudaModule, CudaStream, DeviceBuffer, launch_kernel_on_stream,
+    CudaContext, CudaFunction, CudaModule, DeviceBuffer, launch_kernel_on_stream,
     sys::{
-        CUdeviceptr, CUresult, CUtensorMap, cuTensorMapEncodeTiled,
-        // bindgen emits CUDA enum variants prefixed with the original C enum name
-        // (e.g. `CUtensorMapDataType_enum_CU_TENSOR_MAP_DATA_TYPE_UINT64`). Alias
-        // them to readable names at the import site so the call site stays clean.
-        CUtensorMapDataType_enum_CU_TENSOR_MAP_DATA_TYPE_UINT64 as CU_TENSOR_MAP_DATA_TYPE_UINT64,
-        CUtensorMapFloatOOBfill_enum_CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE as CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE,
-        CUtensorMapInterleave_enum_CU_TENSOR_MAP_INTERLEAVE_NONE as CU_TENSOR_MAP_INTERLEAVE_NONE,
-        CUtensorMapL2promotion_enum_CU_TENSOR_MAP_L2_PROMOTION_NONE as CU_TENSOR_MAP_L2_PROMOTION_NONE,
-        CUtensorMapSwizzle_enum_CU_TENSOR_MAP_SWIZZLE_NONE as CU_TENSOR_MAP_SWIZZLE_NONE,
+        CUdeviceptr, CUresult, CUtensorMap,
+        CUtensorMapDataType_enum_CU_TENSOR_MAP_DATA_TYPE_UINT32 as DATA_UINT32,
+        CUtensorMapFloatOOBfill_enum_CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE as OOB_NONE,
+        CUtensorMapInterleave_enum_CU_TENSOR_MAP_INTERLEAVE_NONE as INTERLEAVE_NONE,
+        CUtensorMapL2promotion_enum_CU_TENSOR_MAP_L2_PROMOTION_NONE as L2_NONE,
+        CUtensorMapSwizzle_enum_CU_TENSOR_MAP_SWIZZLE_128B as SWIZZLE_128B,
+        CUtensorMapSwizzle_enum_CU_TENSOR_MAP_SWIZZLE_NONE as SWIZZLE_NONE, cuTensorMapEncodeTiled,
         cudaError_enum_CUDA_SUCCESS as CUDA_SUCCESS,
     },
 };
 use fp::{matrix::Matrix, prime::TWO};
 
-/// PTX image emitted by `build.rs` from `cuda_kernels/matmul_b1.cu`.
 static PTX_IMAGE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/matmul_b1.ptx"));
 
-/// Kernel symbol name (must match the `extern "C"` function in matmul_b1.cu).
-const KERNEL_NAME: &str = "matmul_b1_kernel";
+const TILE_M: usize = 64;
+const TILE_K: usize = 256;
+const KL: usize = TILE_K / 64; // 4
+const THREADS: u32 = 128;
+const NG: u32 = 4;
 
-/// CTA-level tile shape. Must match the constants in matmul_b1.cu.
-const TILE_M: u32 = 64;
-const TILE_K: u32 = 256;
-const TILE_N_BITS: u32 = 64;
-const THREADS_PER_CTA: u32 = 128;
-
-/// TMA box dimensions in elements (u64), matching the kernel's `boxDim`.
-const BOX_A_X: u32 = TILE_K / 64; // 4 u64s along K
-const BOX_A_Y: u32 = TILE_M; // 64 rows along M
-const BOX_B_X: u32 = 1; // 1 u64 along N (one column-limb per CTA)
-const BOX_B_Y: u32 = TILE_K; // 256 rows along K
-
-/// Long-lived CUDA handle bundling context + loaded module + function pointer.
 pub struct GpuContext {
     ctx: Arc<CudaContext>,
-    #[allow(dead_code)] // module must outlive the function
+    #[allow(dead_code)]
     module: Arc<CudaModule>,
     kernel: CudaFunction,
 }
@@ -63,7 +40,7 @@ impl GpuContext {
     pub fn new(device_id: usize) -> Result<Self, Box<dyn std::error::Error>> {
         let ctx = CudaContext::new(device_id)?;
         let module = ctx.load_module_from_image(PTX_IMAGE)?;
-        let kernel = module.load_function(KERNEL_NAME)?;
+        let kernel = module.load_function("matmul_b1_kernel")?;
         Ok(Self {
             ctx,
             module,
@@ -75,102 +52,112 @@ impl GpuContext {
         Ok(self.ctx.compute_capability()?)
     }
 
-    pub fn default_stream(&self) -> Arc<CudaStream> {
+    pub fn default_stream(&self) -> Arc<cuda_core::CudaStream> {
         self.ctx.default_stream()
+    }
+
+    pub fn kernel(&self) -> &CudaFunction {
+        &self.kernel
     }
 }
 
-/// Multiply two F_2 matrices on the GPU and return the product.
-///
-/// Asserts `a.prime() == b.prime() == 2` and `a.columns() == b.rows()`. The
-/// inputs are bridged to GPU memory via `Matrix::to_bytes`; the output comes
-/// back via `Matrix::from_data`.
 pub fn matmul_b1(
     gpu: &GpuContext,
     a: &Matrix,
     b: &Matrix,
 ) -> Result<Matrix, Box<dyn std::error::Error>> {
-    assert_eq!(a.prime(), TWO, "fp-cuda matmul_b1 requires prime 2");
-    assert_eq!(b.prime(), TWO, "fp-cuda matmul_b1 requires prime 2");
-    assert_eq!(
-        a.columns(),
-        b.rows(),
-        "shape mismatch: a.columns()={}, b.rows()={}",
-        a.columns(),
-        b.rows()
-    );
+    assert_eq!(a.prime(), TWO);
+    assert_eq!(b.prime(), TWO);
+    assert_eq!(a.columns(), b.rows());
 
-    let m_usize = a.rows();
-    let k_usize = a.columns();
-    let n_usize = b.columns();
-    let stride_a_usize = k_usize.div_ceil(64);
-    let stride_b_usize = n_usize.div_ceil(64);
-    let n_lim_usize = stride_b_usize;
+    let m = a.rows();
+    let k = a.columns();
+    let n = b.columns();
+    let n_lim = n.div_ceil(64);
+
+    let k_padded = k.next_multiple_of(TILE_K);
+    let m_padded = m.next_multiple_of(TILE_M);
+    let m_tiles = m_padded / TILE_M;
+    let k_chunks = k_padded / TILE_K;
 
     let stream = gpu.ctx.default_stream();
 
     let a_limbs = matrix_to_u64s(a);
     let b_limbs = matrix_to_u64s(b);
-    debug_assert_eq!(a_limbs.len(), m_usize * stride_a_usize);
-    debug_assert_eq!(b_limbs.len(), k_usize * stride_b_usize);
 
-    let a_dev = DeviceBuffer::from_host(&stream, &a_limbs)?;
-    let b_dev = DeviceBuffer::from_host(&stream, &b_limbs)?;
-    let c_dev = DeviceBuffer::<u64>::zeroed(&stream, m_usize * n_lim_usize)?;
+    let a_padded = pad_2d(&a_limbs, m, k.div_ceil(64), m_padded, k_padded / 64);
+    let b_padded = pad_2d(&b_limbs, k, n_lim, k_padded, n_lim);
 
-    // Build CUtensorMap descriptors for A and B.
-    let tensor_map_a = encode_tensor_map_2d(
-        a_dev.cu_deviceptr(),
-        stride_a_usize as u64,     // innermost (X) dim length in u64s
-        m_usize as u64,            // outermost (Y) dim length in rows
-        stride_a_usize as u64 * 8, // row stride in bytes (Y stride)
-        BOX_A_X,
-        BOX_A_Y,
-    )?;
-    let tensor_map_b = encode_tensor_map_2d(
-        b_dev.cu_deviceptr(),
-        stride_b_usize as u64,
-        k_usize as u64,
-        stride_b_usize as u64 * 8,
-        BOX_B_X,
-        BOX_B_Y,
-    )?;
+    // Pre-arrange A into interleaved 128-byte blocks for TMA 128B swizzle.
+    let a_interleaved = interleave_a(&a_padded, m_padded, k_padded);
+    // Pre-transpose B into CM-blocked tiles.
+    let bt = transpose_b(&b_padded, k_padded, n_lim);
 
-    // Pack kernel parameters. Order matches the C++ signature:
-    //   (const __grid_constant__ CUtensorMap tensor_map_a,
-    //    const __grid_constant__ CUtensorMap tensor_map_b,
-    //    uint32_t m, uint32_t k, uint32_t n_lim,
-    //    uint64_t* c)
-    let mut tma_a_storage = tensor_map_a;
-    let mut tma_b_storage = tensor_map_b;
-    let mut m_val: u32 = m_usize as u32;
-    let mut k_val: u32 = k_usize as u32;
-    let mut n_lim_val: u32 = n_lim_usize as u32;
+    let a_dev = DeviceBuffer::from_host(&stream, &a_interleaved)?;
+    let bt_dev = DeviceBuffer::from_host(&stream, &bt)?;
+    let c_dev = DeviceBuffer::<u64>::zeroed(&stream, m_padded * n_lim)?;
+
+    // TMA tensor map for A.
+    // The interleaved A is a 2D array of UINT32 elements:
+    //   dim[0] = 32 (32 × 4 bytes = 128 bytes per super-row)
+    //   dim[1] = k_chunks × m_tiles × 16 (16 super-rows per tile)
+    //   stride[0] = 128 bytes (tightly packed)
+    //   box = [32, 16] → 2048 bytes per TMA load
+    let tma_a = {
+        let mut tmap = MaybeUninit::<CUtensorMap>::uninit();
+        let total_rows = (k_chunks * m_tiles * 16) as u64;
+        let gdim: [u64; 2] = [32, total_rows];
+        let gstride: [u64; 1] = [128]; // bytes per row
+        let boxdim: [u32; 2] = [32, 16];
+        let elemstride: [u32; 2] = [1, 1];
+        let res: CUresult = unsafe {
+            cuTensorMapEncodeTiled(
+                tmap.as_mut_ptr(),
+                DATA_UINT32,
+                2,
+                a_dev.cu_deviceptr() as *mut c_void,
+                gdim.as_ptr(),
+                gstride.as_ptr(),
+                boxdim.as_ptr(),
+                elemstride.as_ptr(),
+                INTERLEAVE_NONE,
+                SWIZZLE_NONE,
+                L2_NONE,
+                OOB_NONE,
+            )
+        };
+        if res != CUDA_SUCCESS {
+            return Err(format!("cuTensorMapEncodeTiled failed: {res:?}").into());
+        }
+        unsafe { tmap.assume_init() }
+    };
+
+    let mut tma_storage = tma_a;
+    let mut mt: u32 = m_tiles as u32;
+    let mut bt_ptr: CUdeviceptr = bt_dev.cu_deviceptr();
+    let mut m_val: u32 = m_padded as u32;
+    let mut k_val: u32 = k_padded as u32;
+    let mut nl: u32 = n_lim as u32;
     let mut c_ptr: CUdeviceptr = c_dev.cu_deviceptr();
 
-    let mut params: [*mut c_void; 6] = [
-        &mut tma_a_storage as *mut _ as *mut c_void,
-        &mut tma_b_storage as *mut _ as *mut c_void,
+    let mut params: [*mut c_void; 7] = [
+        &mut tma_storage as *mut _ as *mut c_void,
+        &mut mt as *mut _ as *mut c_void,
+        &mut bt_ptr as *mut _ as *mut c_void,
         &mut m_val as *mut _ as *mut c_void,
         &mut k_val as *mut _ as *mut c_void,
-        &mut n_lim_val as *mut _ as *mut c_void,
+        &mut nl as *mut _ as *mut c_void,
         &mut c_ptr as *mut _ as *mut c_void,
     ];
 
-    let grid_x = n_lim_val;
-    let grid_y = m_val.div_ceil(TILE_M);
-    let _ = (TILE_K, TILE_N_BITS); // referenced by the kernel; pinned in const above
+    let grid_x = (nl + NG - 1) / NG;
+    let grid_y = m_val / TILE_M as u32;
 
-    // SAFETY: PTX was compiled from a kernel matching this signature; tensor
-    // maps were just encoded with valid global addresses owned by a_dev/b_dev;
-    // params[i] points to a value with matching size/alignment; buffers and
-    // tensor-map storage outlive the call because we synchronize before
-    // returning.
     unsafe {
         launch_kernel_on_stream(
             &gpu.kernel,
             (grid_x, grid_y, 1),
-            (THREADS_PER_CTA, 1, 1),
+            (THREADS, 1, 1),
             0,
             &stream,
             &mut params,
@@ -178,74 +165,100 @@ pub fn matmul_b1(
     }
     stream.synchronize()?;
 
-    let c_limbs = c_dev.to_host_vec(&stream)?;
-    Ok(Matrix::from_data(TWO, m_usize, n_usize, c_limbs))
+    let c_all = c_dev.to_host_vec(&stream)?;
+    let c_limbs: Vec<u64> = c_all
+        .chunks_exact(n_lim)
+        .take(m)
+        .flat_map(|row| row.iter().copied())
+        .collect();
+    Ok(Matrix::from_data(TWO, m, n, c_limbs))
 }
 
-/// Build a 2D `CUtensorMap` for a u64-packed binary tile, no swizzle.
+/// CM-blocked index within a 64-col × 4-K-limb tile (256 u64s).
+fn cm(row: usize, kl: usize) -> usize {
+    (row / 8) * 32 + (kl / 2) * 16 + (row % 8) * 2 + (kl % 2)
+}
+
+/// Pre-interleave A for TMA 128B swizzle.
 ///
-/// `global_addr` is the device pointer to the tensor's element-zero. The
-/// tensor is interpreted as 2D row-major with `global_dim = (dim_x, dim_y)`
-/// u64 elements; `row_stride_bytes` is the byte distance from one Y row to
-/// the next (= `dim_x * 8` for tightly packed data). `box_x` × `box_y` is
-/// the tile size the kernel pulls per TMA load.
-fn encode_tensor_map_2d(
-    global_addr: CUdeviceptr,
-    dim_x: u64,
-    dim_y: u64,
-    row_stride_bytes: u64,
-    box_x: u32,
-    box_y: u32,
-) -> Result<CUtensorMap, Box<dyn std::error::Error>> {
-    let mut tmap: MaybeUninit<CUtensorMap> = MaybeUninit::uninit();
+/// Output: contiguous tiles, each 2048 bytes = 16 super-rows of 128 bytes.
+/// Each super-row holds one core matrix: 8 rows × 2 K-limbs = 16 u64s = 128 bytes.
+/// Layout within tile matches cm() ordering:
+///   super_row[rg*2 + kg], where rg=0..7 (row group) and kg=0..1 (K group).
+///   Within super-row: u64 at offset 2*r + kl_sub.
+///
+/// Tiles are ordered: for K-chunk kk=0..k_chunks-1, then M-tile bi=0..m_tiles-1.
+fn interleave_a(a: &[u64], m: usize, k: usize) -> Vec<u64> {
+    let sa = k / 64;
+    let k_chunks = k / TILE_K;
+    let m_tiles = m / TILE_M;
+    let tile_u64s = TILE_M * KL; // 256
+    let mut out = vec![0u64; k_chunks * m_tiles * tile_u64s];
 
-    let global_dim: [u64; 2] = [dim_x, dim_y];
-    // `globalStrides` has length `tensorRank - 1` and gives the byte stride
-    // between successive elements along the OUTER dimension(s). For 2D:
-    // a single entry = bytes per row.
-    let global_strides: [u64; 1] = [row_stride_bytes];
-    let box_dim: [u32; 2] = [box_x, box_y];
-    let element_strides: [u32; 2] = [1, 1];
-
-    // SAFETY: `cuTensorMapEncodeTiled` writes into `tmap`. All pointers are
-    // valid for the duration of the call; the rank is 2 (matches both array
-    // lengths); the data type is UINT64 (8 bytes per element). The function
-    // is host-only and does not require an active context.
-    let res: CUresult = unsafe {
-        cuTensorMapEncodeTiled(
-            tmap.as_mut_ptr(),
-            CU_TENSOR_MAP_DATA_TYPE_UINT64,
-            2,
-            global_addr as *mut c_void,
-            global_dim.as_ptr(),
-            global_strides.as_ptr(),
-            box_dim.as_ptr(),
-            element_strides.as_ptr(),
-            CU_TENSOR_MAP_INTERLEAVE_NONE,
-            CU_TENSOR_MAP_SWIZZLE_NONE,
-            CU_TENSOR_MAP_L2_PROMOTION_NONE,
-            CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE,
-        )
-    };
-    if res != CUDA_SUCCESS {
-        return Err(format!("cuTensorMapEncodeTiled failed: {res:?}").into());
+    for kk in 0..k_chunks {
+        for bi in 0..m_tiles {
+            let base = (kk * m_tiles + bi) * tile_u64s;
+            for row in 0..TILE_M {
+                for kl in 0..KL {
+                    let global_row = bi * TILE_M + row;
+                    let global_kl = kk * KL + kl;
+                    let val = if global_row < m && global_kl < sa {
+                        a[global_row * sa + global_kl]
+                    } else {
+                        0
+                    };
+                    out[base + cm(row, kl)] = val;
+                }
+            }
+        }
     }
-    // SAFETY: the call returned CUDA_SUCCESS, so tmap is now fully initialised.
-    Ok(unsafe { tmap.assume_init() })
+    out
 }
 
-/// Serialize a `Matrix` into row-major bit-packed `u64` limbs.
-///
-/// Round-trips through `Matrix::to_bytes` because the underlying limb-slice
-/// accessor on `Matrix` is `pub(crate)`. Little-endian byte order of
-/// `to_bytes` matches the natural `u64` interpretation, so limb values are
-/// preserved verbatim.
+/// Pre-transpose B into CM-blocked tiles.
+fn transpose_b(b: &[u64], k: usize, n_lim: usize) -> Vec<u64> {
+    let k_chunks = k / TILE_K;
+    let tile = 64 * KL;
+    let mut out = vec![0u64; k_chunks * n_lim * tile];
+    let mut buf = [0u64; 256];
+
+    for kk in 0..k_chunks {
+        for cl in 0..n_lim {
+            let base = (kk * n_lim + cl) * tile;
+            for i in 0..256usize {
+                let br = kk * 256 + i;
+                buf[i] = if br < k { b[br * n_lim + cl] } else { 0 };
+            }
+            for kl in 0..KL {
+                for j in 0..64usize {
+                    let mut val: u64 = 0;
+                    for bit in 0..64usize {
+                        val |= ((buf[kl * 64 + bit] >> j) & 1) << bit;
+                    }
+                    out[base + cm(j, kl)] = val;
+                }
+            }
+        }
+    }
+    out
+}
+
+fn pad_2d(src: &[u64], rows: usize, stride: usize, nr: usize, ns: usize) -> Vec<u64> {
+    if rows == nr && stride == ns {
+        return src.to_vec();
+    }
+    let mut out = vec![0u64; nr * ns];
+    for r in 0..rows {
+        let n = stride.min(ns);
+        out[r * ns..r * ns + n].copy_from_slice(&src[r * stride..r * stride + n]);
+    }
+    out
+}
+
 fn matrix_to_u64s(m: &Matrix) -> Vec<u64> {
     let stride = m.columns().div_ceil(64);
-    let len = m.rows() * stride;
-    let mut bytes = Vec::with_capacity(len * 8);
+    let mut bytes = Vec::with_capacity(m.rows() * stride * 8);
     m.to_bytes(&mut bytes).expect("Vec writes never fail");
-    debug_assert_eq!(bytes.len(), len * 8);
     bytes
         .chunks_exact(8)
         .map(|c| u64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]))

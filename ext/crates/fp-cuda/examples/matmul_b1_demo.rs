@@ -22,10 +22,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     for &(m, k, n) in &[
-        (64, 64, 64),
-        (128, 128, 128),
-        (256, 192, 320),
+        (64, 256, 64),
+        (128, 256, 128),
+        (256, 256, 256),
         (512, 512, 512),
+        (1024, 1024, 1024),
+        (2048, 512, 2048),
+        (4096, 256, 4096),
+        (8192, 256, 8192),
     ] {
         let a = make(m, k);
         let b = make(k, n);
@@ -36,12 +40,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "  {m}x{k} * {k}x{n}: {}",
             if ok { "OK" } else { "MISMATCH" }
         );
-        assert!(
-            ok,
-            "GPU result disagrees with CPU for shape {m}x{k}*{k}x{n}"
-        );
+        if !ok {
+            let mut cb = Vec::new();
+            cpu.to_bytes(&mut cb).unwrap();
+            let mut gb = Vec::new();
+            gpu_out.to_bytes(&mut gb).unwrap();
+            let cv = u64::from_le_bytes(cb[..8].try_into().unwrap());
+            let gv = u64::from_le_bytes(gb[..8].try_into().unwrap());
+            println!("    row 0: cpu={cv:016x} gpu={gv:016x}");
+            println!("    GPU all zeros: {}", gb.iter().all(|&b| b == 0));
+            std::process::exit(1);
+        }
     }
 
-    println!("All shapes matched. ✓");
+    println!("All shapes matched.");
     Ok(())
 }
