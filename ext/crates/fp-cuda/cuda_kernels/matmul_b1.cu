@@ -86,16 +86,22 @@ extern "C" __global__ void matmul_b1_kernel(
     uint32_t M, uint32_t K, uint32_t nlim,
     uint64_t* __restrict__ C)
 {
-    __shared__ alignas(128) uint64_t sA[TILE];   // 2048 B — filled by TMA
-    __shared__ alignas(128) uint64_t sB[TILE];   // 2048 B — filled by threads
+    // Double-buffered A: TMA[kk+1] streams into sA[(kk+1)&1] while wgmma
+    // consumes sA[kk&1]. Each buffer has its own mbarrier so prefetch and
+    // consume don't share completion state.
+    __shared__ alignas(128) uint64_t sA[2][TILE]; // 2*2048 B — filled by TMA
+    __shared__ alignas(128) uint64_t sB[TILE];    // 2048 B — filled by threads
     __shared__ uint64_t sC[NG][TM];
-    __shared__ alignas(8) uint64_t mbar[1];
+    __shared__ alignas(8) uint64_t mbar[2];
 
     const int bi = blockIdx.y, bj = blockIdx.x, t = threadIdx.x;
     const int row0 = bi * TM, col0 = bj * NG;
     if (row0 >= (int)M) return;
 
-    if (t == 0) mbar_init(mbar, 1);
+    if (t == 0) {
+        mbar_init(&mbar[0], 1);
+        mbar_init(&mbar[1], 1);
+    }
     for (int g = 0; g < NG; ++g)
         if (t < TM) sC[g][t] = 0;
     __syncthreads();
@@ -112,20 +118,33 @@ extern "C" __global__ void matmul_b1_kernel(
         for (int r = 0; r < 32; ++r) tot[g][r] = 0;
     }
 
-    for (int kk = 0; kk < nchunks; ++kk) {
-        uint32_t phase = kk & 1;
+    // Per-buffer phase counters for parity-based mbarrier waits.
+    uint32_t phase[2] = {0, 0};
 
-        // TMA load A (thread 0 only, all others just wait) — once per K chunk.
-        if (t == 0) {
-            mbar_tx(mbar, 2048);
-            tma_2d(sA, &tma_a, 0, (kk * m_tiles + bi) * 16, mbar);
+    // Prelude: kick off TMA for K-chunk 0 into sA[0].
+    if (nchunks > 0 && t == 0) {
+        mbar_tx(&mbar[0], 2048);
+        tma_2d(sA[0], &tma_a, 0, (0 * m_tiles + bi) * 16, &mbar[0]);
+    }
+
+    for (int kk = 0; kk < nchunks; ++kk) {
+        const int cur = kk & 1;
+        const int nxt = (kk + 1) & 1;
+
+        // Issue the *next* TMA before waiting on this one. This is the
+        // overlap: cp.async.bulk.tensor for kk+1 starts now and runs in
+        // parallel with the wgmma below that consumes kk.
+        if (kk + 1 < nchunks && t == 0) {
+            mbar_tx(&mbar[nxt], 2048);
+            tma_2d(sA[nxt], &tma_a, 0, ((kk + 1) * m_tiles + bi) * 16, &mbar[nxt]);
         }
 
-        // Wait for TMA to finish writing sA before the first wgmma below.
-        mbar_wait(mbar, phase);
+        // Wait for this chunk's A to land.
+        mbar_wait(&mbar[cur], phase[cur]);
+        phase[cur] ^= 1;
 
         // For each output column-group, load its B tile and run wgmma.
-        // The same A tile in sA is reused across all NG iterations.
+        // The same A tile in sA[cur] is reused across all NG iterations.
         for (int g = 0; g < NG; ++g) {
             int col = col0 + g;
             if (col >= (int)nlim) continue;
@@ -143,8 +162,8 @@ extern "C" __global__ void matmul_b1_kernel(
             int32_t acc[32];
             #pragma unroll
             for (int r = 0; r < 32; ++r) acc[r] = 0;
-            uint64_t da = make_desc(sA, 128, 256, 0);
-            uint64_t db = make_desc(sB, 128, 256, 0);  // no swizzle
+            uint64_t da = make_desc(sA[cur], 128, 256, 0);
+            uint64_t db = make_desc(sB,      128, 256, 0);  // no swizzle
             wgmma_fence();
             wgmma_go(acc, da, db);
             wgmma_commit();
