@@ -8,10 +8,11 @@ tensor cores
 (`wgmma.mma_async.sync.aligned.m64n64k256.row.col.s32.b1.b1.and.popc`).
 Both operands are pre-arranged into plain row-major K-major tiles on the host;
 the TMA applies the swizzle that the wgmma matrix descriptors expect.
-Rust-side glue uses [NVlabs/cuda-oxide](https://github.com/NVlabs/cuda-oxide)'s
-`cuda-core` crate for the host driver-API surface (untyped module loading +
-raw kernel launch) and its `sys` re-export of `cuda-bindings` for the
-`cuTensorMapEncodeTiled` call that builds the TMA descriptors.
+Rust-side glue uses [`cudarc`](https://crates.io/crates/cudarc) for the host
+driver-API surface (module load, device buffers, typed launch) and its
+`driver::sys` raw bindings for the `cuTensorMapEncodeTiled` call that builds the
+TMA descriptors. `cudarc` is stable Rust and dynamically loads the CUDA driver
+at runtime, so the Rust side builds with no CUDA present.
 
 This crate is **excluded from the workspace's `default-members`**, so plain
 `cargo build` / `nix run .#test` ignore it. It is opt-in: building requires
@@ -26,8 +27,8 @@ nvcc on `PATH` and (at runtime) a Hopper-class GPU.
    will fail on pre-Hopper devices because the kernel emits `wgmma.*` and
    `cp.async.bulk.tensor.*` instructions that only exist on sm_90+.
 
-No cargo-oxide CLI, no special Rust toolchain, no LLVM 21 — `cuda-core`
-compiles with stable rustc.
+Builds on **stable** Rust — no nightly toolchain required. (`nvcc` is still
+needed at build time to compile the kernel to PTX, and a CUDA driver at runtime.)
 
 ## Building
 

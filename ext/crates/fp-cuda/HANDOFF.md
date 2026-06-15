@@ -17,10 +17,12 @@
 > active working set in L2) and clusters + TMA multicast (one HBM read per
 > B-panel per cluster). The validation steps below are kept for the record.
 >
-> Server-box setup notes for next time: Rust wasn't installed — `rustup` +
-> **nightly** toolchain is required (`cuda-core` uses `#![feature(f16)]`);
-> bindgen needs `libclang-dev`; the shared `target/` dir throws transient
-> `Stale file handle (os error 116)` — just retry the cargo command.
+> Server-box setup notes for next time: the host layer now uses `cudarc`
+> (stable Rust, dynamic-loads the driver), so **stable** rustc works — no
+> nightly, no `cuda-core`, no `libclang-dev`/bindgen needed. `nvcc` is still
+> required at build time (PTX) and a CUDA driver at runtime. The shared
+> `target/` dir can throw a transient `Stale file handle (os error 116)` — just
+> retry the cargo command.
 
 Note to the Claude instance running this on the GPU server. This branch
 (`fp_cuda_hopper`) has a batch of kernel optimizations that were written
