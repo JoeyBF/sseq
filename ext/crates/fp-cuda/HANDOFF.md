@@ -1,6 +1,40 @@
-# fp-cuda handoff — H100 validation of the Phase 3–7 batch
+# fp-cuda handoff — H100 validation of the Phase 8–9 batch
 
-> **RESOLVED 2026-06-15 (H100 NVL, sm_90, CUDA 13.0 driver / 12.8 toolkit).**
+> **CURRENT BATCH (Phase 8–9), code-only, UNVALIDATED — validate this.**
+> On top of the validated Phase 3–7 kernel are two new commits targeting the
+> diagnosed L2-residency-of-B cliff (>16384). Both compile (nvcc → PTX with
+> `.reqnctapercluster 2,1,1` + the multicast/cluster asm; rustc links). Neither
+> has run on hardware.
+>
+> | Commit | Change | If it breaks, suspect… |
+> |--------|--------|------------------------|
+> | Phase 9 (newest) | thread-block **clusters (CLUSTER=2 along M) + TMA multicast of B**; cluster-wide empty barrier; barriers init once and flow continuously across tiles | **highest risk.** Hang → cluster barrier / mbarrier scope / the `expect_tx`-before-multicast-`complete_tx` ordering. Wrong bits only for odd M-tiles (rank 1) → multicast target mapping or `bi = sbi*CLUSTER+rank` schedule. Mirrors `pranjalssh/fast.cu` matmul_9 — diff against it if stuck. |
+> | `27c801c` Phase 8 | **persistent 1-D grid + grouped-along-M rasterization** (`GROUP_M=8`); per-tile compute byte-identical to Phase 7 | hang → cross-tile barrier handling; wrong tiles → the rasterizer `(bi,bj)` mapping or the `n_groups` kernel arg |
+>
+> **Validate Phase 8 first, then Phase 9** (Phase 9 builds on the persistent
+> grid). Bisect anchor for Phase 9 = `27c801c` (Phase 8). Bisect anchor for
+> Phase 8 = `ceb1d92` (the validated Phase 3–7 + cudarc state).
+>
+> Order: (1) `cargo build -p fp-cuda` — Phase 9 is where the cluster launch /
+> `__cluster_dims__` and multicast first hit the device at module load/launch.
+> (2) the 64×256×64 identity case (`matmul_b1_demo`) — for Phase 9 this is one
+> cluster of 2, so it exercises the multicast/cluster path at the smallest size.
+> (3) full `matmul_b1_demo` sweep. (4) `bench_kernel_only` + `bench_shapes` —
+> the **point** of this batch: confirm 32768² and the B-spilling shapes now
+> scale (Phase 7 baseline ~2,200 TOPS @32768; equal-FLOPs B-spill ~2,272).
+> (5) sweep `GROUP_M` (8/16/32) and `CLUSTER` (2/4) for the best 32768 number —
+> both are `constexpr` in the kernel and `const` in `src/lib.rs` and **must
+> match** across the two files (like `STAGES`).
+>
+> Known design tradeoff to revisit if perf underwhelms: the per-tile epilogue
+> `__syncthreads` plus rank-0-issues-all-B multicast serialize the cluster per
+> tile (correct, but limits cross-tile overlap). matmul_9 avoids this with a
+> consumer-only epilogue and balanced multicast issue.
+>
+> ---
+>
+> **RESOLVED 2026-06-15 (H100 NVL, sm_90, CUDA 13.0 driver / 12.8 toolkit) —
+> Phase 3–7.**
 > The whole batch is **hardware-validated and bit-exact.** PTX JITs at load; the
 > dynamic-SMEM opt-in (~122 KB at STAGES=3) and all three TMA descriptors are
 > accepted. `matmul_b1_demo` (64…8192) and `bench_kernel_only` (4096…32768, incl.
@@ -24,12 +58,11 @@
 > `target/` dir can throw a transient `Stale file handle (os error 116)` — just
 > retry the cargo command.
 
-Note to the Claude instance running this on the GPU server. This branch
-(`fp_cuda_hopper`) has a batch of kernel optimizations that were written
-**code-only, with no GPU available** — they compile (nvcc → PTX + rustc) but
-have **not been validated on hardware**. Your job is to validate (and tune).
+_The sections below are the original Phase 3–7 handoff, kept for the record._
+_That batch is now hardware-validated (see the RESOLVED note above); the live,_
+_unvalidated work is the Phase 8–9 batch documented at the top of this file._
 
-## What's in the batch (newest first)
+## What was in the Phase 3–7 batch (newest first)
 
 | Commit | Change | If correctness breaks, suspect this for… |
 |--------|--------|------------------------------------------|
