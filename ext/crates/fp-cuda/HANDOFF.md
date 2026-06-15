@@ -1,5 +1,27 @@
 # fp-cuda handoff — H100 validation of the Phase 3–7 batch
 
+> **RESOLVED 2026-06-15 (H100 NVL, sm_90, CUDA 13.0 driver / 12.8 toolkit).**
+> The whole batch is **hardware-validated and bit-exact.** PTX JITs at load; the
+> dynamic-SMEM opt-in (~122 KB at STAGES=3) and all three TMA descriptors are
+> accepted. `matmul_b1_demo` (64…8192) and `bench_kernel_only` (4096…32768, incl.
+> a full 32768³ CPU cross-check) all match the CPU path bit-for-bit, so the
+> swizzle (`5c40830`), n256 bit-pack (`af251a5`), and TMA store (`0dcd0ff`) paths
+> are all sound — no bisect needed. Kernel-only throughput peaks at ~5,800 binary
+> TOPS @16384 (~50–58× the ~100-TOPS pre-swizzle baseline; see README table).
+> The >16384 throughput drop is diagnosed (not power/compute-bound: 136 W of
+> 310 W, SM 0–12 %): the kernel is HBM-bandwidth bound on **L2 residency of B**
+> — each B column-panel is reused across every M-tile, so once `K*N/8` > 50 MB
+> L2 (true at 32768²: 134 MB) B is re-streamed from HBM per M-tile.
+> `examples/bench_shapes` proves it with equal-FLOPs shapes. This is exactly
+> what the next rungs fix: persistent kernel + tile rasterization (keep the
+> active working set in L2) and clusters + TMA multicast (one HBM read per
+> B-panel per cluster). The validation steps below are kept for the record.
+>
+> Server-box setup notes for next time: Rust wasn't installed — `rustup` +
+> **nightly** toolchain is required (`cuda-core` uses `#![feature(f16)]`);
+> bindgen needs `libclang-dev`; the shared `target/` dir throws transient
+> `Stale file handle (os error 116)` — just retry the cargo command.
+
 Note to the Claude instance running this on the GPU server. This branch
 (`fp_cuda_hopper`) has a batch of kernel optimizations that were written
 **code-only, with no GPU available** — they compile (nvcc → PTX + rustc) but

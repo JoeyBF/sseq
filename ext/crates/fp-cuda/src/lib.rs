@@ -5,7 +5,7 @@
 //! swizzled wgmma matrix descriptors expect. The kernel is a thin wrapper around
 //! wgmma.b1 m64n256k256.
 
-use std::{ffi::c_void, mem::MaybeUninit, sync::Arc};
+use std::{ffi::c_void, mem::MaybeUninit, sync::Arc, time::Instant};
 
 use cuda_core::{
     CudaContext, CudaFunction, CudaModule, DeviceBuffer, launch_kernel_on_stream,
@@ -70,6 +70,34 @@ pub fn matmul_b1(
     a: &Matrix,
     b: &Matrix,
 ) -> Result<Matrix, Box<dyn std::error::Error>> {
+    Ok(matmul_b1_inner(gpu, a, b, 1)?.0)
+}
+
+/// Like [`matmul_b1`], but also returns the average **kernel-only** wall time
+/// (seconds) over `time_iters` back-to-back launches, excluding host
+/// (de)serialization, the TMA-layout pre-arrangement, and the H2D/D2H copies.
+///
+/// The kernel zeroes its SMEM accumulator and writes C with a bulk-tensor
+/// *store* (overwrite, not accumulate), so repeated launches against the same
+/// device buffers are idempotent and the returned `Matrix` is the correct
+/// product. Use this to compare against the ~100-binary-TOPS pre-swizzle
+/// kernel baseline; the end-to-end `cargo bench` figures are dominated by host
+/// serialization and understate kernel throughput.
+pub fn matmul_b1_timed(
+    gpu: &GpuContext,
+    a: &Matrix,
+    b: &Matrix,
+    time_iters: usize,
+) -> Result<(Matrix, f64), Box<dyn std::error::Error>> {
+    matmul_b1_inner(gpu, a, b, time_iters.max(1))
+}
+
+fn matmul_b1_inner(
+    gpu: &GpuContext,
+    a: &Matrix,
+    b: &Matrix,
+    time_iters: usize,
+) -> Result<(Matrix, f64), Box<dyn std::error::Error>> {
     assert_eq!(a.prime(), TWO);
     assert_eq!(b.prime(), TWO);
     assert_eq!(a.columns(), b.rows());
@@ -220,17 +248,33 @@ pub fn matmul_b1(
         return Err(format!("cuFuncSetAttribute(MAX_DYNAMIC_SHARED) failed: {res:?}").into());
     }
 
-    unsafe {
-        launch_kernel_on_stream(
-            &gpu.kernel,
-            (grid_x, grid_y, 1),
-            (THREADS, 1, 1),
-            smem_bytes,
-            &stream,
-            &mut params,
-        )?;
+    let launch = |params: &mut [*mut c_void; 6]| -> Result<(), Box<dyn std::error::Error>> {
+        unsafe {
+            launch_kernel_on_stream(
+                &gpu.kernel,
+                (grid_x, grid_y, 1),
+                (THREADS, 1, 1),
+                smem_bytes,
+                &stream,
+                params,
+            )?;
+        }
+        Ok(())
+    };
+
+    // Warm up once (untimed) when measuring, so the timed loop excludes any
+    // first-launch JIT/allocation costs.
+    if time_iters > 1 {
+        launch(&mut params)?;
+        stream.synchronize()?;
+    }
+
+    let start = Instant::now();
+    for _ in 0..time_iters {
+        launch(&mut params)?;
     }
     stream.synchronize()?;
+    let kernel_secs = start.elapsed().as_secs_f64() / time_iters as f64;
 
     let c_all = c_dev.to_host_vec(&stream)?;
     let c_limbs: Vec<u64> = c_all
@@ -238,7 +282,7 @@ pub fn matmul_b1(
         .take(m)
         .flat_map(|row| row[..n_lim].iter().copied())
         .collect();
-    Ok(Matrix::from_data(TWO, m, n, c_limbs))
+    Ok((Matrix::from_data(TWO, m, n, c_limbs), kernel_secs))
 }
 
 /// Gather A into plain row-major K-major tiles for TMA 128B swizzle.
