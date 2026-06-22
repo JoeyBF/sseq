@@ -42,7 +42,7 @@
 use std::{path::PathBuf, sync::Arc};
 
 use algebra::module::Module;
-use anyhow::{Context, anyhow};
+use anyhow::Context;
 use ext::{
     chain_complex::{AugmentedChainComplex, ChainComplex, FreeChainComplex},
     resolution_homomorphism::ResolutionHomomorphism,
@@ -61,11 +61,9 @@ fn main() -> anyhow::Result<()> {
     );
 
     let source_name = source.name();
-    let target = query::with_default("Target module", source_name, |s| {
+    let target = query::with_default("Target module", source_name, |s| -> anyhow::Result<_> {
         if s == source_name {
             Ok(Arc::clone(&source))
-        } else if cfg!(feature = "nassau") {
-            Err(anyhow!("Can only resolve S_2 with nassau"))
         } else {
             let config: utils::Config = s.try_into()?;
             let save_dir = query::optional("Target save directory", |x| {
@@ -78,10 +76,6 @@ fn main() -> anyhow::Result<()> {
 
             target.set_name(s.to_owned());
 
-            #[cfg(feature = "nassau")]
-            unreachable!();
-
-            #[cfg(not(feature = "nassau"))]
             Ok(Arc::new(target))
         }
     });
