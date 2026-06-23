@@ -2588,18 +2588,24 @@ pub mod fp_py {
 
         #[test]
         fn affine_subspace_offset_and_linear_part() {
-            // linear_part = span{[0,1,0],[0,0,1]}, offset = [1,0,0].
+            // linear_part = span{[0,1,0],[0,0,1]} (pivots in columns 1 and 2),
+            // offset = [1,1,0], which is NOT already reduced: its column-1 entry
+            // sits in a pivot column of the linear part.
             let linear = subspace_from_rows(2, &[vec![0, 1, 0], vec![0, 0, 1]]);
-            let offset = PyFpVector::from_slice(2, vec![1, 0, 0]).unwrap();
+            let offset = PyFpVector::from_slice(2, vec![1, 1, 0]).unwrap();
             let aff = PyAffineSubspace::new(&offset, &linear).unwrap();
 
             assert_eq!(aff.prime(), 2);
             assert_eq!(aff.ambient_dimension(), 3);
             assert_eq!(aff.dimension(), 2);
 
-            // Offset is reduced against the linear part; first coordinate kept.
+            // Subspace::reduce subtracts the pivot rows: [1,1,0] - [0,1,0] gives
+            // [1,0,0] (column-2 entry is already 0), so the stored offset is the
+            // reduced form [1,0,0]. Mirrors Python's test_offset_is_reduced.
             let stored = aff.offset();
             assert_eq!(stored.entry(0).unwrap(), 1);
+            assert_eq!(stored.entry(1).unwrap(), 0);
+            assert_eq!(stored.entry(2).unwrap(), 0);
             // linear_part round-trips dimension/ambient.
             assert_eq!(aff.linear_part().dimension(), 2);
             assert_eq!(aff.linear_part().ambient_dimension(), 3);
@@ -2657,9 +2663,13 @@ pub mod fp_py {
                 )
                 .unwrap();
 
-                // sum: linear = span{[0,1,0],[0,0,1]} (dim 2); offset =
-                // [1,0,0]+[0,0,1] = [1,0,1], reduced against the linear part to
-                // [1,0,0].
+                // sum adds the already-stored, already-reduced offsets, not
+                // the constructor arguments. a.offset stays [1,0,0] (already
+                // reduced against span{[0,1,0]}); b's offset [0,0,1] reduces to
+                // [0,0,0] against span{[0,0,1]} when b is constructed. So the
+                // sum offset is a.offset [1,0,0] + b.offset [0,0,0] = [1,0,0],
+                // re-reduced against span{[0,1,0],[0,0,1]} (dim 2) to [1,0,0].
+                // No [1,0,1] intermediate ever occurs.
                 let s = a.sum(&b).unwrap();
                 assert_eq!(s.dimension(), 2);
                 assert_eq!(s.offset().entry(0).unwrap(), 1);
