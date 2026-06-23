@@ -1245,10 +1245,17 @@ pub mod fp_py {
                     "mask index {index} out of range for matrix with {other_columns} columns"
                 )));
             }
-            // Clone `other` so the rectangle's `borrow_mut` cannot alias it even
-            // if the same matrix object is passed as both parent and source.
-            let other_matrix = other.0.clone();
-            self.with_slice_mut(py, |mut s| s.add_masked(&other_matrix, &mask))
+            // No aliasing guard is needed here. `other: &PyMatrix` holds a live
+            // immutable borrow of its Python object for the whole method, so if
+            // the same object is passed as both the slice's parent and `other`,
+            // `with_slice_mut`'s `try_borrow_mut` already fails and raises
+            // `RuntimeError` (via `borrow_error`) before any data is touched.
+            // We therefore read straight through the borrowed `other` rather
+            // than cloning the matrix: the borrow checker is satisfied because
+            // `&other.0` and the parent's `&mut` are distinct references, and an
+            // earlier `other.0.clone()` would not have prevented the conflict
+            // anyway (the conflict comes from the held `PyRef`, not the data).
+            self.with_slice_mut(py, |mut s| s.add_masked(&other.0, &mask))
         }
 
         pub fn __repr__(&self, py: Python<'_>) -> PyResult<String> {
@@ -3530,6 +3537,27 @@ pub mod fp_py {
         }
 
         #[test]
+        fn matrix_slice_mut_add_masked_self_raises_runtime_error() {
+            // Passing the slice's own parent matrix as `other` keeps an
+            // immutable `PyRef` alive (through the `&PyMatrix` argument) while
+            // `with_slice_mut` tries to `try_borrow_mut` the same object, so the
+            // operation raises `RuntimeError` instead of aliasing. This pins the
+            // behavior the `add_masked` comment now describes.
+            Python::initialize();
+            Python::attach(|py| {
+                let matrix = Py::new(
+                    py,
+                    PyMatrix::from_vec(3, vec![vec![1, 2], vec![0, 1]]).unwrap(),
+                )
+                .unwrap();
+                let rect = PyMatrix::slice_mut(matrix.borrow(py), 0, 2, 0, 2).unwrap();
+                let borrowed = matrix.borrow(py);
+                let err = unwrap_py_err(rect.add_masked(py, &borrowed, vec![0, 1]));
+                assert!(err.is_instance_of::<PyRuntimeError>(py));
+            });
+        }
+
+        #[test]
         fn matrix_slice_mut_stale_handle_raises() {
             Python::initialize();
             Python::attach(|py| {
@@ -3565,6 +3593,33 @@ pub mod fp_py {
                 let row = PyAugmentedMatrix2::row_segment_mut(m.borrow(py), 0, 0, 0).unwrap();
                 row.set_entry(py, 0, 1).unwrap();
                 assert_eq!(m.borrow(py).to_vec()[0][0], 1);
+            });
+        }
+
+        #[test]
+        fn augmented_matrix3_segment_mutates_inner() {
+            // The shared `segment`/`row_segment_mut` glue is generated for every
+            // arity; this exercises the `MatrixParent::Augmented3` arm (the
+            // `Augmented2` and bare-`Matrix` arms are covered elsewhere).
+            Python::initialize();
+            Python::attach(|py| {
+                let m = Py::new(py, PyAugmentedMatrix3::new(3, 2, vec![2, 2, 2]).unwrap()).unwrap();
+
+                // Add identity into segment 1 via the MatrixSliceMut handle.
+                let seg = PyAugmentedMatrix3::segment(m.borrow(py), 1, 1).unwrap();
+                assert_eq!(seg.rows(py).unwrap(), 2);
+                assert_eq!(seg.columns(py).unwrap(), 2);
+                seg.add_identity(py).unwrap();
+                let start1 = m.borrow(py).segment_starts()[1];
+                assert_eq!(m.borrow(py).to_vec()[0][start1], 1);
+                assert_eq!(m.borrow(py).to_vec()[1][start1 + 1], 1);
+
+                // row_segment_mut writes through to the inner matrix and is
+                // observable via row_segment.
+                let row = PyAugmentedMatrix3::row_segment_mut(m.borrow(py), 0, 0, 0).unwrap();
+                row.set_entry(py, 0, 2).unwrap();
+                assert_eq!(m.borrow(py).to_vec()[0][0], 2);
+                assert_eq!(m.borrow(py).row_segment(0, 0, 0).unwrap().0.entry(0), 2);
             });
         }
 
