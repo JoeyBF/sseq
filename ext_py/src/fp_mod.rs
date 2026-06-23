@@ -1258,13 +1258,15 @@ pub mod fp_py {
         pub fn sum(&self, other: &Self) -> PyResult<Self> {
             checked_same_prime(self.0.prime().as_u32(), other.0.prime().as_u32())?;
             checked_equal_len(self.0.ambient_dimension(), other.0.ambient_dimension())?;
-            // `Subspace::sum` calls `Matrix::trim` after `from_matrix`, which
-            // discards the matrix pivots and leaves the returned subspace with
-            // an empty pivot table (so `dimension`/`iter`/`reduce` would all
-            // misbehave). Re-wrap the resulting matrix through `from_matrix` to
-            // re-row-reduce and rebuild the pivots before exposing it.
-            let summed = self.0.sum(&other.0);
-            Ok(Self(RustSubspace::from_matrix((*summed).clone())))
+            // `Subspace::sum` trims the row count of the result (a sum cannot
+            // have rank greater than the ambient dimension), which clears the
+            // pivots. That trimming is intentional, but `dimension`/`iter` need
+            // pivots, so we regenerate them in place. The matrix is already in
+            // RREF, so a no-op `update_then_row_reduce` just rebuilds the pivot
+            // table without cloning.
+            let mut summed = self.0.sum(&other.0);
+            summed.update_then_row_reduce(|_| {});
+            Ok(Self(summed))
         }
 
         /// Return the basis of the subspace as a list of owned `FpVector`s.
@@ -1789,9 +1791,12 @@ pub mod fp_py {
         }
 
         #[test]
-        fn subspace_sum_rebuilds_pivots() {
-            // `Subspace::sum` upstream leaves empty pivots; the binding re-wraps
-            // through `from_matrix` so the result is a usable subspace.
+        fn subspace_sum_is_span_of_both() {
+            // The sum of two subspaces is the span of both summands. Its
+            // dimension equals the rank of the combined span, capped by the
+            // ambient dimension.
+
+            // Two complementary lines span a 2-dimensional subspace.
             let mut a = PySubspace::new(3, 3).unwrap();
             a.add_vector(&PyFpVector::from_slice(3, vec![1, 0, 0]).unwrap())
                 .unwrap();
@@ -1803,7 +1808,32 @@ pub mod fp_py {
             assert_eq!(s.dimension(), 2);
             assert!(s.contains_space(&a).unwrap());
             assert!(s.contains_space(&b).unwrap());
+            assert!(s
+                .contains(&PyFpVector::from_slice(3, vec![1, 0, 0]).unwrap())
+                .unwrap());
+            assert!(s
+                .contains(&PyFpVector::from_slice(3, vec![0, 1, 0]).unwrap())
+                .unwrap());
             assert_eq!(s.iter().len(), 2);
+
+            // Overlapping subspaces: the sum's dimension is the union's rank.
+            let mut c = PySubspace::new(3, 3).unwrap();
+            c.add_vector(&PyFpVector::from_slice(3, vec![1, 0, 0]).unwrap())
+                .unwrap();
+            c.add_vector(&PyFpVector::from_slice(3, vec![0, 1, 0]).unwrap())
+                .unwrap();
+            let mut d = PySubspace::new(3, 3).unwrap();
+            d.add_vector(&PyFpVector::from_slice(3, vec![1, 0, 0]).unwrap())
+                .unwrap();
+            let overlap = c.sum(&d).unwrap();
+            assert_eq!(overlap.dimension(), 2);
+            assert!(overlap.contains_space(&c).unwrap());
+            assert!(overlap.contains_space(&d).unwrap());
+
+            // The sum is capped by the ambient dimension.
+            let full = c.sum(&b).unwrap();
+            assert_eq!(full.dimension(), 2);
+            assert!(full.dimension() <= full.ambient_dimension());
 
             // Prime/ambient mismatches raise.
             let other_prime = PySubspace::new(5, 3).unwrap();
