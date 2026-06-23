@@ -5,7 +5,9 @@ pub mod fp_py {
     use fp::field::{
         element::FieldElement as RustFieldElement, Field, Fp as RustFp, SmallFq as RustSmallFq,
     };
-    use fp::matrix::{Matrix as RustMatrix, Subspace as RustSubspace};
+    use fp::matrix::{
+        Matrix as RustMatrix, QuasiInverse as RustQuasiInverse, Subspace as RustSubspace,
+    };
     use fp::prime::{self, Binomial, Prime};
     use fp::vector::{
         FpSlice as RustFpSlice, FpSliceMut as RustFpSliceMut, FpVector as RustFpVector,
@@ -155,6 +157,9 @@ pub mod fp_py {
 
     #[pyclass(name = "Subspace")]
     struct PySubspace(RustSubspace);
+
+    #[pyclass(name = "QuasiInverse")]
+    struct PyQuasiInverse(RustQuasiInverse);
 
     /// Lazy iterator over every vector in a subspace.
     ///
@@ -1188,6 +1193,34 @@ pub mod fp_py {
             self.0.row_reduce()
         }
 
+        /// Compute the quasi-inverse of a row-reduced augmented matrix `[A|0|I]`.
+        ///
+        /// `last_target_col` is the last column of `A`, and `first_source_col`
+        /// is the first column of `I` (typically the padded column count
+        /// returned by `augmented_from_vec`). The matrix is expected to already
+        /// be row reduced.
+        pub fn compute_quasi_inverse(
+            &self,
+            last_target_col: usize,
+            first_source_col: usize,
+        ) -> PyResult<PyQuasiInverse> {
+            let columns = self.0.columns();
+            if last_target_col > columns {
+                return Err(PyIndexError::new_err(format!(
+                    "last_target_col {last_target_col} out of range for matrix with {columns} columns"
+                )));
+            }
+            if first_source_col > columns {
+                return Err(PyIndexError::new_err(format!(
+                    "first_source_col {first_source_col} out of range for matrix with {columns} columns"
+                )));
+            }
+            Ok(PyQuasiInverse(
+                self.0
+                    .compute_quasi_inverse(last_target_col, first_source_col),
+            ))
+        }
+
         pub fn __len__(&self) -> usize {
             self.0.rows()
         }
@@ -1334,6 +1367,120 @@ pub mod fp_py {
                 self.prime(),
                 self.0.dimension(),
                 self.0.ambient_dimension()
+            )
+        }
+    }
+
+    /// Extract an owned copy of a vector-like argument (`FpVector` or
+    /// `FpSlice`) for use as an immutable input.
+    fn extract_input_owned(py: Python<'_>, obj: &Bound<'_, PyAny>) -> PyResult<RustFpVector> {
+        if let Ok(vector) = obj.extract::<PyRef<'_, PyFpVector>>() {
+            Ok(vector.0.clone())
+        } else if let Ok(slice) = obj.extract::<PyRef<'_, PyFpSlice>>() {
+            slice.to_owned_checked(py)
+        } else {
+            Err(PyValueError::new_err("expected an FpVector or FpSlice"))
+        }
+    }
+
+    /// Run `f` on the mutable slice backing a vector-like argument
+    /// (`FpVector` or `FpSliceMut`), used as an output target.
+    fn with_target_slice_mut<R>(
+        py: Python<'_>,
+        obj: &Bound<'_, PyAny>,
+        f: impl FnOnce(RustFpSliceMut<'_>) -> PyResult<R>,
+    ) -> PyResult<R> {
+        if let Ok(mut vector) = obj.extract::<PyRefMut<'_, PyFpVector>>() {
+            f(vector.0.as_slice_mut())
+        } else if let Ok(slice) = obj.extract::<PyRef<'_, PyFpSliceMut>>() {
+            slice.with_slice_mut(py, f)?
+        } else {
+            Err(PyValueError::new_err("expected an FpVector or FpSliceMut"))
+        }
+    }
+
+    #[pymethods]
+    impl PyQuasiInverse {
+        #[new]
+        #[pyo3(signature = (image, preimage))]
+        pub fn new(image: Option<Vec<isize>>, preimage: &PyMatrix) -> Self {
+            Self(RustQuasiInverse::new(image, preimage.0.clone()))
+        }
+
+        #[staticmethod]
+        pub fn from_bytes(p: u32, data: &[u8]) -> PyResult<Self> {
+            RustQuasiInverse::from_bytes(valid_prime(p)?, &mut Cursor::new(data))
+                .map(Self)
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        }
+
+        pub fn prime(&self) -> u32 {
+            self.0.prime().as_u32()
+        }
+
+        pub fn image_dimension(&self) -> usize {
+            self.0.image_dimension()
+        }
+
+        pub fn source_dimension(&self) -> usize {
+            self.0.source_dimension()
+        }
+
+        pub fn target_dimension(&self) -> usize {
+            self.0.target_dimension()
+        }
+
+        pub fn preimage(&self) -> PyMatrix {
+            PyMatrix(self.0.preimage().clone())
+        }
+
+        pub fn pivots(&self) -> Option<Vec<isize>> {
+            self.0.pivots().map(<[isize]>::to_vec)
+        }
+
+        /// Apply the quasi-inverse to `input` and add `coeff` times the result
+        /// to `target`.
+        ///
+        /// `input` is a vector in the target space (length `target_dimension`)
+        /// and `target` receives the result in the source space (length
+        /// `source_dimension`). Both accept either an `FpVector` or the
+        /// corresponding slice handle.
+        pub fn apply(
+            &self,
+            py: Python<'_>,
+            target: &Bound<'_, PyAny>,
+            coeff: u32,
+            input: &Bound<'_, PyAny>,
+        ) -> PyResult<()> {
+            let input_owned = extract_input_owned(py, input)?;
+            checked_same_prime(self.0.prime().as_u32(), input_owned.prime().as_u32())?;
+            checked_equal_len(input_owned.len(), self.0.target_dimension())?;
+            with_target_slice_mut(py, target, |target_slice| {
+                checked_same_prime(
+                    self.0.prime().as_u32(),
+                    target_slice.as_slice().prime().as_u32(),
+                )?;
+                checked_equal_len(target_slice.as_slice().len(), self.0.source_dimension())?;
+                self.0.apply(target_slice, coeff, input_owned.as_slice());
+                Ok(())
+            })
+        }
+
+        pub fn to_bytes<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
+            let mut buffer = Vec::new();
+            self.0
+                .to_bytes(&mut buffer)
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            Ok(PyBytes::new(py, &buffer))
+        }
+
+        pub fn __repr__(&self) -> String {
+            format!(
+                "QuasiInverse({}, image_dim={}, source_dim={}, target_dim={})",
+                self.prime(),
+                self.0.image_dimension(),
+                self.0.source_dimension(),
+                self.0.target_dimension()
             )
         }
     }
@@ -1893,6 +2040,26 @@ pub mod fp_py {
             assert!(a.sum(&other_prime).is_err());
             let other_dim = PySubspace::new(3, 4).unwrap();
             assert!(a.contains_space(&other_dim).is_err());
+        }
+
+        #[test]
+        fn quasi_inverse_compute_and_dims() {
+            // Example from `Matrix::compute_quasi_inverse` doc.
+            let input = vec![
+                vec![1, 2, 1, 1, 0],
+                vec![1, 0, 2, 1, 1],
+                vec![2, 2, 0, 2, 1],
+            ];
+            let (padded_cols, mut m) = PyMatrix::augmented_from_vec(3, input.clone()).unwrap();
+            m.row_reduce();
+            let qi = m
+                .compute_quasi_inverse(input[0].len(), padded_cols)
+                .unwrap();
+            assert_eq!(qi.prime(), 3);
+            assert_eq!(qi.source_dimension(), 3);
+            assert_eq!(qi.preimage().to_vec(), vec![vec![0, 1, 0], vec![0, 2, 2]]);
+            // Out-of-range columns raise rather than panic.
+            assert!(m.compute_quasi_inverse(input[0].len(), 999).is_err());
         }
     }
 }
