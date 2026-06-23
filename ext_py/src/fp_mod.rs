@@ -4,9 +4,12 @@ use pyo3::prelude::*;
 pub mod fp_py {
     use fp::field::{element::FieldElement, Field, Fp as RustFp, SmallFq as RustSmallFq};
     use fp::prime::{self, Binomial, Prime};
+    use fp::vector::FpVector as RustFpVector;
     use pyo3::basic::CompareOp;
-    use pyo3::exceptions::{PyValueError, PyZeroDivisionError};
+    use pyo3::exceptions::{PyIndexError, PyRuntimeError, PyValueError, PyZeroDivisionError};
+    use pyo3::types::PyBytes;
     use std::hash::{DefaultHasher, Hash, Hasher};
+    use std::io::Cursor;
 
     use super::*;
 
@@ -34,6 +37,15 @@ pub mod fp_py {
     #[pyclass(name = "FieldElement", frozen, from_py_object)]
     #[derive(Clone, Copy)]
     pub struct PyFieldElement(FieldElementKind);
+
+    #[pyclass(name = "FpVector")]
+    pub struct PyFpVector(RustFpVector);
+
+    #[pyclass(name = "FpVectorIterator")]
+    pub struct PyFpVectorIterator {
+        entries: Vec<u32>,
+        index: usize,
+    }
 
     fn valid_prime(p: u32) -> PyResult<prime::ValidPrime> {
         if p < 2 || p >= MAX_VALID_PRIME {
@@ -70,6 +82,31 @@ pub mod fp_py {
         match hasher.finish() as isize {
             -1 => -2,
             hash => hash,
+        }
+    }
+
+    fn checked_index(index: usize, len: usize) -> PyResult<usize> {
+        if index < len {
+            Ok(index)
+        } else {
+            Err(PyIndexError::new_err(format!(
+                "index {index} out of range for vector of length {len}"
+            )))
+        }
+    }
+
+    fn py_index(index: isize, len: usize) -> PyResult<usize> {
+        let index = if index < 0 {
+            len as isize + index
+        } else {
+            index
+        };
+        if index >= 0 && (index as usize) < len {
+            Ok(index as usize)
+        } else {
+            Err(PyIndexError::new_err(format!(
+                "index {index} out of range for vector of length {len}"
+            )))
         }
     }
 
@@ -325,6 +362,141 @@ pub mod fp_py {
         }
     }
 
+    #[pymethods]
+    impl PyFpVector {
+        #[new]
+        pub fn new(p: u32, len: usize) -> PyResult<Self> {
+            Ok(Self(RustFpVector::new(valid_prime(p)?, len)))
+        }
+
+        #[staticmethod]
+        pub fn new_with_capacity(p: u32, len: usize, capacity: usize) -> PyResult<Self> {
+            Ok(Self(RustFpVector::new_with_capacity(
+                valid_prime(p)?,
+                len,
+                capacity,
+            )))
+        }
+
+        #[staticmethod]
+        pub fn from_slice(p: u32, entries: Vec<u32>) -> PyResult<Self> {
+            Ok(Self(RustFpVector::from_slice(valid_prime(p)?, &entries)))
+        }
+
+        #[staticmethod]
+        pub fn from_bytes(p: u32, len: usize, data: &[u8]) -> PyResult<Self> {
+            RustFpVector::from_bytes(valid_prime(p)?, len, &mut Cursor::new(data))
+                .map(Self)
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        }
+
+        pub fn prime(&self) -> u32 {
+            self.0.prime().as_u32()
+        }
+
+        pub fn len(&self) -> usize {
+            self.0.len()
+        }
+
+        pub fn is_empty(&self) -> bool {
+            self.0.is_empty()
+        }
+
+        pub fn entry(&self, index: usize) -> PyResult<u32> {
+            Ok(self.0.entry(checked_index(index, self.0.len())?))
+        }
+
+        pub fn density(&self) -> f32 {
+            self.0.density()
+        }
+
+        pub fn is_zero(&self) -> bool {
+            self.0.is_zero()
+        }
+
+        pub fn first_nonzero(&self) -> Option<(usize, u32)> {
+            self.0.first_nonzero()
+        }
+
+        pub fn set_entry(&mut self, index: usize, value: u32) -> PyResult<()> {
+            self.0.set_entry(checked_index(index, self.0.len())?, value);
+            Ok(())
+        }
+
+        pub fn scale(&mut self, c: u32) {
+            self.0.scale(c)
+        }
+
+        pub fn set_to_zero(&mut self) {
+            self.0.set_to_zero()
+        }
+
+        pub fn add_basis_element(&mut self, index: usize, value: u32) -> PyResult<()> {
+            self.0
+                .add_basis_element(checked_index(index, self.0.len())?, value);
+            Ok(())
+        }
+
+        pub fn extend_len(&mut self, len: usize) {
+            self.0.extend_len(len)
+        }
+
+        pub fn set_scratch_vector_size(&mut self, len: usize) {
+            self.0.set_scratch_vector_size(len)
+        }
+
+        pub fn to_bytes<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
+            let mut buffer = Vec::new();
+            self.0
+                .to_bytes(&mut buffer)
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            Ok(PyBytes::new(py, &buffer))
+        }
+
+        pub fn update_from_bytes(&mut self, data: &[u8]) -> PyResult<()> {
+            self.0
+                .update_from_bytes(&mut Cursor::new(data))
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        }
+
+        pub fn __len__(&self) -> usize {
+            self.0.len()
+        }
+
+        pub fn __getitem__(&self, index: isize) -> PyResult<u32> {
+            Ok(self.0.entry(py_index(index, self.0.len())?))
+        }
+
+        pub fn __setitem__(&mut self, index: isize, value: u32) -> PyResult<()> {
+            self.0.set_entry(py_index(index, self.0.len())?, value);
+            Ok(())
+        }
+
+        pub fn __iter__(slf: PyRef<'_, Self>) -> PyFpVectorIterator {
+            PyFpVectorIterator {
+                entries: slf.0.iter().collect(),
+                index: 0,
+            }
+        }
+
+        pub fn __repr__(&self) -> String {
+            format!("FpVector({}, {})", self.prime(), self.0)
+        }
+    }
+
+    #[pymethods]
+    impl PyFpVectorIterator {
+        pub fn __iter__(slf: PyRefMut<'_, Self>) -> PyRefMut<'_, Self> {
+            slf
+        }
+
+        pub fn __next__(&mut self) -> Option<u32> {
+            let value = self.entries.get(self.index).copied();
+            self.index += usize::from(value.is_some());
+            value
+        }
+    }
+
     #[pyfunction]
     pub fn power_mod(p: u32, b: u32, e: u32) -> PyResult<u32> {
         Ok(valid_prime(p)?.pow_mod(b, e))
@@ -534,6 +706,93 @@ pub mod fp_py {
             assert!(err.to_string().contains("SmallFq(2, 3) and SmallFq(2, 2)"));
             let err = unwrap_py_err(a.__add__(PyFp::new(2).unwrap().one()));
             assert!(err.to_string().contains("SmallFq(2, 3) and Fp(2)"));
+        }
+
+        #[test]
+        fn fp_vector_constructors_and_prime_return() {
+            let v = PyFpVector::new(5, 4).unwrap();
+            assert_eq!(v.prime(), 5);
+            assert_eq!(v.len(), 4);
+            assert_eq!(v.__len__(), 4);
+            assert!(!v.is_empty());
+            assert!(v.is_zero());
+            assert_eq!(v.__repr__(), "FpVector(5, [0, 0, 0, 0])");
+
+            let empty = PyFpVector::new_with_capacity(3, 0, 8).unwrap();
+            assert_eq!(empty.prime(), 3);
+            assert!(empty.is_empty());
+
+            let from_slice = PyFpVector::from_slice(5, vec![0, 1, 7, 4]).unwrap();
+            assert_eq!(from_slice.prime(), 5);
+            assert_eq!(from_slice.len(), 4);
+            assert_eq!(from_slice.entry(2).unwrap(), 2);
+            assert_eq!(from_slice.first_nonzero(), Some((1, 1)));
+            assert_eq!(from_slice.density(), 0.75);
+        }
+
+        #[test]
+        fn fp_vector_indexing_and_mutation() {
+            let mut v = PyFpVector::new(5, 3).unwrap();
+            v.set_entry(0, 7).unwrap();
+            v.__setitem__(-1, 4).unwrap();
+            assert_eq!(v.entry(0).unwrap(), 2);
+            assert_eq!(v.__getitem__(-3).unwrap(), 2);
+            assert_eq!(v.__getitem__(2).unwrap(), 4);
+            assert!(v.entry(3).is_err());
+            assert!(v.__getitem__(-4).is_err());
+
+            v.add_basis_element(0, 4).unwrap();
+            assert_eq!(v.entry(0).unwrap(), 1);
+            v.scale(3);
+            assert_eq!(v.entry(0).unwrap(), 3);
+            assert_eq!(v.entry(2).unwrap(), 2);
+            v.extend_len(5);
+            assert_eq!(v.len(), 5);
+            assert_eq!(v.entry(4).unwrap(), 0);
+            v.set_scratch_vector_size(2);
+            assert_eq!(v.len(), 2);
+            assert!(v.is_zero());
+            v.set_entry(1, 1).unwrap();
+            v.set_to_zero();
+            assert!(v.is_zero());
+        }
+
+        #[test]
+        fn fp_vector_rejects_invalid_prime() {
+            assert!(PyFpVector::new(1, 3).is_err());
+            assert!(PyFpVector::new_with_capacity(9, 3, 8).is_err());
+            assert!(PyFpVector::from_slice(4, vec![1, 2]).is_err());
+            assert!(PyFpVector::from_bytes(0, 2, &[]).is_err());
+        }
+
+        #[test]
+        fn fp_vector_bytes_roundtrip() {
+            Python::initialize();
+            Python::attach(|py| {
+                let v = PyFpVector::from_slice(5, vec![0, 1, 2, 3, 4, 7]).unwrap();
+                let bytes = v.to_bytes(py).unwrap();
+                let w = PyFpVector::from_bytes(5, v.len(), bytes.as_bytes()).unwrap();
+                assert_eq!(w.__getitem__(5).unwrap(), 2);
+                assert_eq!(w.__repr__(), "FpVector(5, [0, 1, 2, 3, 4, 2])");
+
+                let mut z = PyFpVector::new(5, v.len()).unwrap();
+                z.update_from_bytes(bytes.as_bytes()).unwrap();
+                assert_eq!(z.__repr__(), w.__repr__());
+            });
+        }
+
+        #[test]
+        fn fp_vector_iteration() {
+            let v = PyFpVector::from_slice(3, vec![0, 1, 2, 4]).unwrap();
+            let mut iter = PyFpVectorIterator {
+                entries: v.0.iter().collect(),
+                index: 0,
+            };
+            assert_eq!(iter.__next__(), Some(0));
+            assert_eq!(iter.__next__(), Some(1));
+            assert_eq!(iter.__next__(), Some(2));
+            assert_eq!(iter.__next__(), Some(1));
+            assert_eq!(iter.__next__(), None);
         }
 
         #[test]
