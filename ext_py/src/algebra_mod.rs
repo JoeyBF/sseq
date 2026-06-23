@@ -343,11 +343,35 @@ pub mod algebra_py {
         }
 
         /// Parse a basis element, returning `(degree, index)`. Raises
-        /// `ValueError` if the string does not parse.
+        /// `ValueError` if the string does not parse, or if it names an element
+        /// that is not present in this (possibly profiled) algebra.
+        ///
+        /// Upstream's `basis_element_from_string` is *not* total: once a name
+        /// parses syntactically, the nom closures call the panicking
+        /// `beps_pn(..).unwrap()` (milnor_algebra.rs ~984) and
+        /// `basis_element_to_index` (which `panic!`s on a missing element,
+        /// ~338). So inputs like `"Sq0"`, `"P0"`, `"Q_5"`, or out-of-profile
+        /// names abort across the FFI boundary. The `steenrod_parser`
+        /// primitives those closures use are `pub(crate)`, so we cannot re-run
+        /// the parse with the `Option`-returning (`try_*`) primitives from the
+        /// binding, nor intercept the panicking calls buried inside the parser.
+        /// We therefore contain the panic with `catch_unwind` and translate it
+        /// into a `ValueError`. This is sound: the panic originates after
+        /// `compute_basis` has already returned (it is a failed lookup/unwrap,
+        /// not a half-finished mutation), so no inconsistent shared state
+        /// survives the unwind, and the panic is caught before it can reach
+        /// Python.
         pub fn basis_element_from_string(&self, elt: &str) -> PyResult<(i32, usize)> {
-            self.0.basis_element_from_string(elt).ok_or_else(|| {
-                PyValueError::new_err(format!("could not parse basis element: {elt}"))
-            })
+            use std::panic::{catch_unwind, AssertUnwindSafe};
+            match catch_unwind(AssertUnwindSafe(|| self.0.basis_element_from_string(elt))) {
+                Ok(Some(res)) => Ok(res),
+                Ok(None) => Err(PyValueError::new_err(format!(
+                    "could not parse basis element: {elt}"
+                ))),
+                Err(_) => Err(PyValueError::new_err(format!(
+                    "{elt} does not name a basis element of this algebra"
+                ))),
+            }
         }
 
         pub fn element_to_string(
@@ -375,6 +399,12 @@ pub mod algebra_py {
             s_idx: usize,
         ) -> PyResult<()> {
             let p = self.0.prime().as_u32();
+            // Reduce the coefficient mod p before handing it to upstream, which
+            // computes `coeff * v` (milnor_algebra.rs ~555) before reducing and
+            // would overflow (panicking in debug, wrapping in release) for large
+            // `coeff`. The algebra is over F_p, so this is mathematically
+            // equivalent.
+            let coeff = coeff % p;
             let target = self.product_target(r_degree, s_degree)?;
             let dim = self.0.dimension(target);
             self.checked_basis_index(r_degree, r_idx)?;
@@ -399,6 +429,9 @@ pub mod algebra_py {
             s: &Bound<'_, PyAny>,
         ) -> PyResult<()> {
             let p = self.0.prime().as_u32();
+            // See `multiply_basis_elements`: reduce mod p to avoid the upstream
+            // `coeff * v` overflow.
+            let coeff = coeff % p;
             let target = self.product_target(r_degree, s_degree)?;
             let dim = self.0.dimension(target);
             self.checked_basis_index(r_degree, r_idx)?;
@@ -431,6 +464,9 @@ pub mod algebra_py {
             s_idx: usize,
         ) -> PyResult<()> {
             let p = self.0.prime().as_u32();
+            // See `multiply_basis_elements`: reduce mod p to avoid the upstream
+            // `coeff * v` overflow.
+            let coeff = coeff % p;
             let target = self.product_target(r_degree, s_degree)?;
             let dim = self.0.dimension(target);
             self.checked_basis_index(s_degree, s_idx)?;
@@ -463,6 +499,9 @@ pub mod algebra_py {
             s: &Bound<'_, PyAny>,
         ) -> PyResult<()> {
             let p = self.0.prime().as_u32();
+            // See `multiply_basis_elements`: reduce mod p to avoid the upstream
+            // `coeff * v` overflow.
+            let coeff = coeff % p;
             let target = self.product_target(r_degree, s_degree)?;
             let dim = self.0.dimension(target);
             let r = crate::fp_py::extract_input_owned(py, r)?;
@@ -515,6 +554,19 @@ pub mod algebra_py {
             non_negative_degree(degree)?;
             self.ensure_basis(degree);
             self.checked_basis_index(degree, idx)?;
+            // The degree-0 unit has an empty `p_part`; upstream's
+            // `decompose_basis_element_ppart` computes `p_part[0..len - 1]`
+            // with `len == 0`, underflowing and panicking
+            // (milnor_algebra.rs ~1607). The unit is the identity and is
+            // indecomposable -- the trait docs note it is invalid to decompose
+            // a generator, and there is no product of strictly-smaller basis
+            // elements that equals the unit -- so we surface a `ValueError`
+            // instead of aborting. (Empty `p_part` with `q_part == 0` can only
+            // be the degree-0 unit, since any such element has degree 0.)
+            let basis = self.0.basis_element_from_index(degree, idx);
+            if basis.q_part == 0 && basis.p_part.is_empty() {
+                return Err(PyValueError::new_err("the degree-0 unit is indecomposable"));
+            }
             Ok(self.0.decompose_basis_element(degree, idx))
         }
 
@@ -657,6 +709,9 @@ pub mod algebra_py {
             m2: PyRef<'_, MilnorBasisElement>,
         ) -> PyResult<()> {
             let p = self.0.prime().as_u32();
+            // See `multiply_basis_elements`: reduce mod p to avoid the upstream
+            // `coeff * v` overflow.
+            let coeff = coeff % p;
             let target = self.product_target(m1.0.degree, m2.0.degree)?;
             let dim = self.0.dimension(target);
             // Reject elements that are not genuine basis elements of this
@@ -775,6 +830,56 @@ pub mod algebra_py {
             let a = MilnorAlgebra::new(3, false).unwrap();
             a.compute_basis(4);
             assert!(a.coproduct(0, 0).is_err());
+        }
+
+        #[test]
+        #[should_panic]
+        fn confirm_upstream_basis_element_from_string_panics() {
+            // Documents the upstream panic the binding guards against: calling
+            // the raw upstream method (no `catch_unwind`) on a parseable but
+            // absent name aborts.
+            let a = MilnorAlgebra::new(2, false).unwrap();
+            a.compute_basis(8);
+            let _ = a.0.basis_element_from_string("Sq0");
+        }
+
+        #[test]
+        #[should_panic]
+        fn confirm_upstream_decompose_unit_panics() {
+            // Documents the underflow the binding guards against.
+            let a = MilnorAlgebra::new(2, false).unwrap();
+            a.compute_basis(4);
+            let _ = a.0.decompose_basis_element(0, 0);
+        }
+
+        #[test]
+        fn basis_element_from_string_rejects_absent_names() {
+            let a = MilnorAlgebra::new(2, false).unwrap();
+            a.compute_basis(8);
+            // Parseable but absent / out-of-range names must raise, not panic.
+            assert!(a.basis_element_from_string("Sq0").is_err());
+            assert!(a.basis_element_from_string("P0").is_err());
+            assert!(a.basis_element_from_string("Q_5").is_err());
+            // Pure nonsense still raises.
+            assert!(a.basis_element_from_string("not an element").is_err());
+            // Valid names still round-trip.
+            for d in 0..=6 {
+                for i in 0..a.dimension(d) {
+                    let s = a.basis_element_to_string(d, i).unwrap();
+                    assert_eq!(a.basis_element_from_string(&s).unwrap(), (d, i));
+                }
+            }
+        }
+
+        #[test]
+        fn decompose_degree_zero_unit_raises() {
+            let a = MilnorAlgebra::new(2, false).unwrap();
+            a.compute_basis(4);
+            // The degree-0 unit is indecomposable; must raise, not underflow.
+            assert!(a.decompose_basis_element(0, 0).is_err());
+            // A non-trivial decomposable element still works (Sq^3 = Sq^1 Sq^2-ish).
+            // Degree 3 has a decomposable basis element.
+            let _ = a.decompose_basis_element(3, 0);
         }
 
         #[test]
