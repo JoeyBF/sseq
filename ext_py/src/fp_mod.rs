@@ -4,7 +4,9 @@ use pyo3::prelude::*;
 pub mod fp_py {
     use fp::field::{element::FieldElement, Field, Fp as RustFp, SmallFq as RustSmallFq};
     use fp::prime::{self, Binomial, Prime};
-    use pyo3::exceptions::PyValueError;
+    use pyo3::basic::CompareOp;
+    use pyo3::exceptions::{PyValueError, PyZeroDivisionError};
+    use std::hash::{DefaultHasher, Hash, Hasher};
 
     use super::*;
 
@@ -23,7 +25,7 @@ pub mod fp_py {
     #[derive(Clone, Copy)]
     pub struct PySmallFq(DynSmallFq);
 
-    #[derive(Clone, Copy)]
+    #[derive(Clone, Copy, PartialEq, Eq, Hash)]
     enum FieldElementKind {
         Fp(DynFpElement),
         SmallFq(DynSmallFqElement),
@@ -62,19 +64,31 @@ pub mod fp_py {
         Ok(DynSmallFq::new(p, degree))
     }
 
+    fn py_hash<T: Hash>(value: &T) -> isize {
+        let mut hasher = DefaultHasher::new();
+        value.hash(&mut hasher);
+        match hasher.finish() as isize {
+            -1 => -2,
+            hash => hash,
+        }
+    }
+
     impl FieldElementKind {
-        fn field_name(self) -> &'static str {
+        fn field_repr(self) -> String {
             match self {
-                Self::Fp(_) => "Fp",
-                Self::SmallFq(_) => "SmallFq",
+                Self::Fp(x) => format!("Fp({})", x.field().characteristic().as_u32()),
+                Self::SmallFq(x) => {
+                    let f = x.field();
+                    format!("SmallFq({}, {})", f.characteristic().as_u32(), f.degree())
+                }
             }
         }
 
         fn mismatched_field_error(lhs: Self, rhs: Self) -> PyErr {
             PyValueError::new_err(format!(
-                "cannot combine {} element with {} element",
-                lhs.field_name(),
-                rhs.field_name()
+                "cannot combine elements from {} and {}",
+                lhs.field_repr(),
+                rhs.field_repr()
             ))
         }
     }
@@ -108,6 +122,21 @@ pub mod fp_py {
 
         pub fn __repr__(&self) -> String {
             format!("Fp({})", self.characteristic())
+        }
+
+        pub fn __richcmp__(&self, other: &Bound<'_, PyAny>, op: CompareOp) -> bool {
+            let eq = other
+                .extract::<PyRef<Self>>()
+                .is_ok_and(|other| self.0 == other.0);
+            match op {
+                CompareOp::Eq => eq,
+                CompareOp::Ne => !eq,
+                _ => false,
+            }
+        }
+
+        pub fn __hash__(&self) -> isize {
+            py_hash(&self.0)
         }
     }
 
@@ -144,6 +173,21 @@ pub mod fp_py {
 
         pub fn __repr__(&self) -> String {
             format!("SmallFq({}, {})", self.p(), self.degree())
+        }
+
+        pub fn __richcmp__(&self, other: &Bound<'_, PyAny>, op: CompareOp) -> bool {
+            let eq = other
+                .extract::<PyRef<Self>>()
+                .is_ok_and(|other| self.0 == other.0);
+            match op {
+                CompareOp::Eq => eq,
+                CompareOp::Ne => !eq,
+                _ => false,
+            }
+        }
+
+        pub fn __hash__(&self) -> isize {
+            py_hash(&self.0)
         }
     }
 
@@ -216,15 +260,18 @@ pub mod fp_py {
             }
         }
 
-        pub fn __truediv__(&self, rhs: Self) -> PyResult<Option<Self>> {
+        pub fn __truediv__(&self, rhs: Self) -> PyResult<Self> {
             match (self.0, rhs.0) {
-                (FieldElementKind::Fp(a), FieldElementKind::Fp(b)) if a.field() == b.field() => {
-                    Ok((a / b).map(|x| Self(FieldElementKind::Fp(x))))
-                }
+                (FieldElementKind::Fp(a), FieldElementKind::Fp(b)) if a.field() == b.field() => (a
+                    / b)
+                    .map(|x| Self(FieldElementKind::Fp(x)))
+                    .ok_or_else(|| PyZeroDivisionError::new_err("division by zero")),
                 (FieldElementKind::SmallFq(a), FieldElementKind::SmallFq(b))
                     if a.field() == b.field() =>
                 {
-                    Ok((a / b).map(|x| Self(FieldElementKind::SmallFq(x))))
+                    (a / b)
+                        .map(|x| Self(FieldElementKind::SmallFq(x)))
+                        .ok_or_else(|| PyZeroDivisionError::new_err("division by zero"))
                 }
                 (a, b) => Err(FieldElementKind::mismatched_field_error(a, b)),
             }
@@ -260,6 +307,21 @@ pub mod fp_py {
                     )
                 }
             }
+        }
+
+        pub fn __richcmp__(&self, other: &Bound<'_, PyAny>, op: CompareOp) -> bool {
+            let eq = other
+                .extract::<PyRef<Self>>()
+                .is_ok_and(|other| self.0 == other.0);
+            match op {
+                CompareOp::Eq => eq,
+                CompareOp::Ne => !eq,
+                _ => false,
+            }
+        }
+
+        pub fn __hash__(&self) -> isize {
+            py_hash(&self.0)
         }
     }
 
@@ -352,6 +414,18 @@ pub mod fp_py {
     mod tests {
         use super::*;
 
+        fn unwrap_py_err<T>(result: PyResult<T>) -> PyErr {
+            match result {
+                Ok(_) => panic!("expected Python error"),
+                Err(err) => err,
+            }
+        }
+
+        fn assert_zero_division(err: PyErr) {
+            Python::initialize();
+            Python::attach(|py| assert!(err.is_instance_of::<PyZeroDivisionError>(py)));
+        }
+
         #[test]
         fn valid_prime_conversion_stays_private() {
             let p = valid_prime(5).unwrap();
@@ -420,15 +494,15 @@ pub mod fp_py {
             assert_eq!(two.__add__(four).unwrap().__int__().unwrap(), 1);
             assert_eq!(two.__sub__(four).unwrap().__int__().unwrap(), 3);
             assert_eq!(two.__mul__(four).unwrap().__int__().unwrap(), 3);
-            assert_eq!(
-                two.__truediv__(four).unwrap().unwrap().__int__().unwrap(),
-                3
-            );
+            assert_eq!(two.__truediv__(four).unwrap().__int__().unwrap(), 3);
             assert_eq!(two.__neg__().__int__().unwrap(), 3);
             assert_eq!(two.inv().unwrap().__int__().unwrap(), 3);
             assert_eq!(two.frobenius().__int__().unwrap(), 2);
             assert!(f.zero().inv().is_none());
-            assert!(two.__add__(PyFp::new(7).unwrap().one()).is_err());
+            let err = unwrap_py_err(two.__truediv__(f.zero()));
+            assert_zero_division(err);
+            let err = unwrap_py_err(two.__add__(PyFp::new(7).unwrap().one()));
+            assert!(err.to_string().contains("Fp(5) and Fp(7)"));
         }
 
         #[test]
@@ -452,13 +526,50 @@ pub mod fp_py {
                 a.__mul__(a).unwrap().__repr__(),
                 "FieldElement(SmallFq(2, 3), a^2)"
             );
-            assert_eq!(
-                a.__truediv__(a).unwrap().unwrap().__repr__(),
-                one.__repr__()
-            );
+            assert_eq!(a.__truediv__(a).unwrap().__repr__(), one.__repr__());
             assert_eq!(a.frobenius().__repr__(), "FieldElement(SmallFq(2, 3), a^2)");
-            assert!(a.__add__(PySmallFq::new(2, 2).unwrap().one()).is_err());
-            assert!(a.__add__(PyFp::new(2).unwrap().one()).is_err());
+            let err = unwrap_py_err(a.__truediv__(zero));
+            assert_zero_division(err);
+            let err = unwrap_py_err(a.__add__(PySmallFq::new(2, 2).unwrap().one()));
+            assert!(err.to_string().contains("SmallFq(2, 3) and SmallFq(2, 2)"));
+            let err = unwrap_py_err(a.__add__(PyFp::new(2).unwrap().one()));
+            assert!(err.to_string().contains("SmallFq(2, 3) and Fp(2)"));
+        }
+
+        #[test]
+        fn field_value_equality_and_hashing() {
+            Python::initialize();
+            Python::attach(|py| {
+                let fp5 = PyFp::new(5).unwrap();
+                let fp5_again = Py::new(py, PyFp::new(5).unwrap()).unwrap();
+                let fp7 = Py::new(py, PyFp::new(7).unwrap()).unwrap();
+                let small = Py::new(py, PySmallFq::new(2, 3).unwrap()).unwrap();
+
+                assert!(fp5.__richcmp__(fp5_again.bind(py).as_any(), CompareOp::Eq));
+                assert!(!fp5.__richcmp__(fp7.bind(py).as_any(), CompareOp::Eq));
+                assert!(fp5.__richcmp__(small.bind(py).as_any(), CompareOp::Ne));
+                assert_eq!(fp5.__hash__(), PyFp::new(5).unwrap().__hash__());
+
+                let small23 = PySmallFq::new(2, 3).unwrap();
+                let small23_again = Py::new(py, PySmallFq::new(2, 3).unwrap()).unwrap();
+                let small22 = Py::new(py, PySmallFq::new(2, 2).unwrap()).unwrap();
+
+                assert!(small23.__richcmp__(small23_again.bind(py).as_any(), CompareOp::Eq));
+                assert!(!small23.__richcmp__(small22.bind(py).as_any(), CompareOp::Eq));
+                assert!(small23.__richcmp__(fp5_again.bind(py).as_any(), CompareOp::Ne));
+                assert_eq!(small23.__hash__(), PySmallFq::new(2, 3).unwrap().__hash__());
+
+                let f = PyFp::new(5).unwrap();
+                let two = f.element(2);
+                let seven = Py::new(py, f.element(7)).unwrap();
+                let two_in_fp7 = Py::new(py, PyFp::new(7).unwrap().element(2)).unwrap();
+                let small_one = Py::new(py, PySmallFq::new(2, 3).unwrap().one()).unwrap();
+
+                assert!(two.__richcmp__(seven.bind(py).as_any(), CompareOp::Eq));
+                assert!(!two.__richcmp__(two_in_fp7.bind(py).as_any(), CompareOp::Eq));
+                assert!(two.__richcmp__(small_one.bind(py).as_any(), CompareOp::Ne));
+                assert_eq!(two.__hash__(), f.element(7).__hash__());
+            });
         }
     }
 }
