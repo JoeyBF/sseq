@@ -288,7 +288,7 @@
 <a href=#263 id=263 data-nosnippet>263</a>        <span class="kw">let </span><span class="kw-2">mut </span>yoneda = FiniteChainComplex::from(yoneda);
 <a href=#264 id=264 data-nosnippet>264</a>        yoneda.pop();
 <a href=#265 id=265 data-nosnippet>265</a>
-<a href=#266 id=266 data-nosnippet>266</a>        chain_complex = Arc::new(yoneda.map(|m| Box::new(m.clone()) <span class="kw">as </span>SteenrodModule));
+<a href=#266 id=266 data-nosnippet>266</a>        chain_complex = Arc::new(yoneda.map(|m| steenrod_module::erase(m.clone())));
 <a href=#267 id=267 data-nosnippet>267</a>    }
 <a href=#268 id=268 data-nosnippet>268</a>
 <a href=#269 id=269 data-nosnippet>269</a>    <span class="kw">crate</span>::resolution::MuResolution::new_with_save(chain_complex, save_dir)
@@ -482,7 +482,7 @@
 <a href=#457 id=457 data-nosnippet>457</a>
 <a href=#458 id=458 data-nosnippet>458</a>        <span class="attr">#[cfg(not(feature = <span class="string">"nassau"</span>))]
 <a href=#459 id=459 data-nosnippet>459</a>        </span>{
-<a href=#460 id=460 data-nosnippet>460</a>            <span class="kw">let </span>cc = FiniteChainComplex::ccdz(Arc::new(Box::new(module) <span class="kw">as </span>SteenrodModule));
+<a href=#460 id=460 data-nosnippet>460</a>            <span class="kw">let </span>cc = FiniteChainComplex::ccdz(Arc::new(steenrod_module::erase(module)));
 <a href=#461 id=461 data-nosnippet>461</a>            Arc::new(Resolution::new_with_save(Arc::new(cc), save_dir)<span class="question-mark">?</span>)
 <a href=#462 id=462 data-nosnippet>462</a>        }
 <a href=#463 id=463 data-nosnippet>463</a>    };
