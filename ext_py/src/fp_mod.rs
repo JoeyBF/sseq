@@ -6,8 +6,8 @@ pub mod fp_py {
         element::FieldElement as RustFieldElement, Field, Fp as RustFp, SmallFq as RustSmallFq,
     };
     use fp::matrix::{
-        Matrix as RustMatrix, QuasiInverse as RustQuasiInverse, Subquotient as RustSubquotient,
-        Subspace as RustSubspace,
+        AffineSubspace as RustAffineSubspace, Matrix as RustMatrix,
+        QuasiInverse as RustQuasiInverse, Subquotient as RustSubquotient, Subspace as RustSubspace,
     };
     use fp::prime::{self, Binomial, Prime};
     use fp::vector::{
@@ -164,6 +164,9 @@ pub mod fp_py {
 
     #[pyclass(name = "Subquotient")]
     struct PySubquotient(RustSubquotient);
+
+    #[pyclass(name = "AffineSubspace")]
+    struct PyAffineSubspace(RustAffineSubspace);
 
     /// Lazy iterator over every vector in a subspace.
     ///
@@ -1730,6 +1733,93 @@ pub mod fp_py {
         }
     }
 
+    impl PyAffineSubspace {
+        /// Validate that `other` matches this affine subspace's prime and
+        /// ambient dimension, returning an error otherwise.
+        fn check_compatible_space(&self, other: &Self) -> PyResult<()> {
+            checked_same_prime(self.prime(), other.prime())?;
+            checked_equal_len(self.ambient_dimension(), other.ambient_dimension())?;
+            Ok(())
+        }
+    }
+
+    #[pymethods]
+    impl PyAffineSubspace {
+        /// Construct an affine subspace `offset + linear_part`.
+        ///
+        /// Upstream `AffineSubspace::new` `assert_eq!`s that the offset length
+        /// matches the linear part's ambient dimension and reduces the offset
+        /// against the linear part (which requires a shared prime), so we
+        /// pre-check both here to raise `ValueError` instead of panicking.
+        #[new]
+        pub fn new(offset: &PyFpVector, linear_part: &PySubspace) -> PyResult<Self> {
+            checked_same_prime(offset.0.prime().as_u32(), linear_part.0.prime().as_u32())?;
+            checked_equal_len(offset.0.len(), linear_part.0.ambient_dimension())?;
+            Ok(Self(RustAffineSubspace::new(
+                offset.0.clone(),
+                linear_part.0.clone(),
+            )))
+        }
+
+        pub fn prime(&self) -> u32 {
+            self.0.linear_part().prime().as_u32()
+        }
+
+        pub fn ambient_dimension(&self) -> usize {
+            self.0.linear_part().ambient_dimension()
+        }
+
+        pub fn dimension(&self) -> usize {
+            self.0.linear_part().dimension()
+        }
+
+        /// Return an owned copy of the (reduced) offset vector.
+        ///
+        /// We return an owned `FpVector` rather than a borrowed view, matching
+        /// the owned-return precedent used by `Subspace`/`Subquotient`. The
+        /// offset stored upstream is the input reduced against the linear part,
+        /// so it may differ from the vector passed to `new`.
+        pub fn offset(&self) -> PyFpVector {
+            PyFpVector(self.0.offset().clone())
+        }
+
+        /// Return an owned copy (clone) of the linear part `Subspace`,
+        /// consistent with the owned-return precedent.
+        pub fn linear_part(&self) -> PySubspace {
+            PySubspace(self.0.linear_part().clone())
+        }
+
+        /// Test whether `vector` (an `FpVector` or `FpSlice`) lies in this
+        /// affine subspace.
+        pub fn contains(&self, py: Python<'_>, vector: &Bound<'_, PyAny>) -> PyResult<bool> {
+            let vector = extract_input_owned(py, vector)?;
+            checked_same_prime(self.prime(), vector.prime().as_u32())?;
+            checked_equal_len(vector.len(), self.ambient_dimension())?;
+            Ok(self.0.contains(vector.as_slice()))
+        }
+
+        pub fn contains_space(&self, other: &Self) -> PyResult<bool> {
+            self.check_compatible_space(other)?;
+            Ok(self.0.contains_space(&other.0))
+        }
+
+        /// Return the affine subspace spanned by the union of `self` and
+        /// `other`: the sum of the linear parts translated by the sum of the
+        /// offsets.
+        pub fn sum(&self, other: &Self) -> PyResult<Self> {
+            self.check_compatible_space(other)?;
+            Ok(Self(self.0.sum(&other.0)))
+        }
+
+        pub fn __contains__(&self, py: Python<'_>, vector: &Bound<'_, PyAny>) -> PyResult<bool> {
+            self.contains(py, vector)
+        }
+
+        pub fn __repr__(&self) -> String {
+            format!("AffineSubspace({})", self.0)
+        }
+    }
+
     #[pymethods]
     impl PyFpVectorIterator {
         pub fn __iter__(slf: PyRefMut<'_, Self>) -> PyRefMut<'_, Self> {
@@ -2483,6 +2573,165 @@ pub mod fp_py {
             // Mismatched ambient dimension raises.
             let bad = PySubspace::new(2, 4).unwrap();
             assert!(PySubquotient::from_parts(&sub, &bad).is_err());
+        }
+
+        /// Build a `PySubspace` over prime `p` from explicit basis rows.
+        fn subspace_from_rows(p: u32, rows: &[Vec<u32>]) -> PySubspace {
+            let dim = rows[0].len();
+            let mut s = PySubspace::new(p, dim).unwrap();
+            for row in rows {
+                s.add_vector(&PyFpVector::from_slice(p, row.clone()).unwrap())
+                    .unwrap();
+            }
+            s
+        }
+
+        #[test]
+        fn affine_subspace_offset_and_linear_part() {
+            // linear_part = span{[0,1,0],[0,0,1]}, offset = [1,0,0].
+            let linear = subspace_from_rows(2, &[vec![0, 1, 0], vec![0, 0, 1]]);
+            let offset = PyFpVector::from_slice(2, vec![1, 0, 0]).unwrap();
+            let aff = PyAffineSubspace::new(&offset, &linear).unwrap();
+
+            assert_eq!(aff.prime(), 2);
+            assert_eq!(aff.ambient_dimension(), 3);
+            assert_eq!(aff.dimension(), 2);
+
+            // Offset is reduced against the linear part; first coordinate kept.
+            let stored = aff.offset();
+            assert_eq!(stored.entry(0).unwrap(), 1);
+            // linear_part round-trips dimension/ambient.
+            assert_eq!(aff.linear_part().dimension(), 2);
+            assert_eq!(aff.linear_part().ambient_dimension(), 3);
+            assert_eq!(
+                aff.__repr__(),
+                "AffineSubspace([1, 0, 0] + {[0, 1, 0], [0, 0, 1]})"
+            );
+        }
+
+        #[test]
+        fn affine_subspace_contains() {
+            Python::initialize();
+            Python::attach(|py| {
+                let linear = subspace_from_rows(2, &[vec![0, 1, 0], vec![0, 0, 1]]);
+                let offset = PyFpVector::from_slice(2, vec![1, 0, 0]).unwrap();
+                let aff = PyAffineSubspace::new(&offset, &linear).unwrap();
+
+                let inside = PyFpVector::from_slice(2, vec![1, 1, 0])
+                    .unwrap()
+                    .into_pyobject(py)
+                    .unwrap()
+                    .into_any();
+                assert!(aff.contains(py, &inside).unwrap());
+
+                let outside = PyFpVector::from_slice(2, vec![0, 1, 0])
+                    .unwrap()
+                    .into_pyobject(py)
+                    .unwrap()
+                    .into_any();
+                assert!(!aff.contains(py, &outside).unwrap());
+
+                // Wrong ambient dimension raises.
+                let bad = PyFpVector::from_slice(2, vec![1, 1])
+                    .unwrap()
+                    .into_pyobject(py)
+                    .unwrap()
+                    .into_any();
+                assert!(aff.contains(py, &bad).is_err());
+            });
+        }
+
+        #[test]
+        fn affine_subspace_sum() {
+            Python::initialize();
+            Python::attach(|py| {
+                // a = [1,0,0] + span{[0,1,0]}, b = [0,0,1] + span{[0,0,1]}.
+                let a = PyAffineSubspace::new(
+                    &PyFpVector::from_slice(2, vec![1, 0, 0]).unwrap(),
+                    &subspace_from_rows(2, &[vec![0, 1, 0]]),
+                )
+                .unwrap();
+                let b = PyAffineSubspace::new(
+                    &PyFpVector::from_slice(2, vec![0, 0, 1]).unwrap(),
+                    &subspace_from_rows(2, &[vec![0, 0, 1]]),
+                )
+                .unwrap();
+
+                // sum: linear = span{[0,1,0],[0,0,1]} (dim 2); offset =
+                // [1,0,0]+[0,0,1] = [1,0,1], reduced against the linear part to
+                // [1,0,0].
+                let s = a.sum(&b).unwrap();
+                assert_eq!(s.dimension(), 2);
+                assert_eq!(s.offset().entry(0).unwrap(), 1);
+                assert_eq!(s.offset().entry(1).unwrap(), 0);
+                assert_eq!(s.offset().entry(2).unwrap(), 0);
+
+                let inside = PyFpVector::from_slice(2, vec![1, 1, 1])
+                    .unwrap()
+                    .into_pyobject(py)
+                    .unwrap()
+                    .into_any();
+                assert!(s.contains(py, &inside).unwrap());
+                let outside = PyFpVector::from_slice(2, vec![0, 0, 0])
+                    .unwrap()
+                    .into_pyobject(py)
+                    .unwrap()
+                    .into_any();
+                assert!(!s.contains(py, &outside).unwrap());
+            });
+        }
+
+        #[test]
+        fn affine_subspace_contains_space() {
+            // a = origin + span{[0,1,0],[0,0,1]} (a linear subspace).
+            let a = PyAffineSubspace::new(
+                &PyFpVector::from_slice(2, vec![0, 0, 0]).unwrap(),
+                &subspace_from_rows(2, &[vec![0, 1, 0], vec![0, 0, 1]]),
+            )
+            .unwrap();
+            // b = [0,1,0] + span{[0,1,0]}: linear part and offset both lie in a.
+            let b = PyAffineSubspace::new(
+                &PyFpVector::from_slice(2, vec![0, 1, 0]).unwrap(),
+                &subspace_from_rows(2, &[vec![0, 1, 0]]),
+            )
+            .unwrap();
+            // c = [1,0,0] + span{[0,1,0]}: offset is outside a.
+            let c = PyAffineSubspace::new(
+                &PyFpVector::from_slice(2, vec![1, 0, 0]).unwrap(),
+                &subspace_from_rows(2, &[vec![0, 1, 0]]),
+            )
+            .unwrap();
+
+            assert!(a.contains_space(&b).unwrap());
+            assert!(!a.contains_space(&c).unwrap());
+
+            // Mismatched prime/dimension raise.
+            let other_prime = PyAffineSubspace::new(
+                &PyFpVector::from_slice(3, vec![1, 0, 0]).unwrap(),
+                &subspace_from_rows(3, &[vec![0, 1, 0]]),
+            )
+            .unwrap();
+            assert!(a.sum(&other_prime).is_err());
+            assert!(a.contains_space(&other_prime).is_err());
+
+            let other_dim = PyAffineSubspace::new(
+                &PyFpVector::from_slice(2, vec![1, 0, 0, 0]).unwrap(),
+                &subspace_from_rows(2, &[vec![0, 1, 0, 0]]),
+            )
+            .unwrap();
+            assert!(a.sum(&other_dim).is_err());
+        }
+
+        #[test]
+        fn affine_subspace_new_validates() {
+            // Mismatched offset length vs linear ambient dimension.
+            let linear = subspace_from_rows(2, &[vec![0, 1, 0]]);
+            let bad_len = PyFpVector::from_slice(2, vec![1, 0]).unwrap();
+            assert!(PyAffineSubspace::new(&bad_len, &linear).is_err());
+
+            // Mismatched prime.
+            let bad_prime = PyFpVector::from_slice(3, vec![1, 0, 0]).unwrap();
+            assert!(PyAffineSubspace::new(&bad_prime, &linear).is_err());
         }
     }
 }
