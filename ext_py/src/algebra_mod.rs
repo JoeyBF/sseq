@@ -66,6 +66,66 @@ pub mod algebra_py {
         }
     }
 
+    /// Convert a Python value (`dict`/`list`/`int`/`float`/`str`/`bool`/`None`)
+    /// into a `serde_json::Value`. This is the minimal hand-rolled half of the
+    /// `serde_json::Value` <-> Python bridge described in API_PROPOSAL §2.6
+    /// (we have no `pythonize` dependency); only the directions exercised by
+    /// `SteenrodAlgebra.from_json` are implemented. Booleans are checked before
+    /// integers because Python `bool` is a subclass of `int`. Raises
+    /// `ValueError` for unsupported types or non-finite floats rather than
+    /// panicking.
+    fn py_to_json(value: &Bound<'_, PyAny>) -> PyResult<serde_json::Value> {
+        use pyo3::types::{PyBool, PyDict, PyFloat, PyInt, PyList, PyString, PyTuple};
+        if value.is_none() {
+            return Ok(serde_json::Value::Null);
+        }
+        if let Ok(b) = value.cast::<PyBool>() {
+            return Ok(serde_json::Value::Bool(b.is_true()));
+        }
+        if let Ok(i) = value.cast::<PyInt>() {
+            let n: i64 = i.extract()?;
+            return Ok(serde_json::Value::from(n));
+        }
+        if let Ok(f) = value.cast::<PyFloat>() {
+            let f: f64 = f.extract()?;
+            return serde_json::Number::from_f64(f)
+                .map(serde_json::Value::Number)
+                .ok_or_else(|| PyValueError::new_err("cannot represent non-finite float as JSON"));
+        }
+        if let Ok(s) = value.cast::<PyString>() {
+            return Ok(serde_json::Value::String(s.extract()?));
+        }
+        if let Ok(dict) = value.cast::<PyDict>() {
+            let mut map = serde_json::Map::with_capacity(dict.len());
+            for (k, v) in dict.iter() {
+                let key: String = k
+                    .cast::<PyString>()
+                    .map_err(|_| PyValueError::new_err("JSON object keys must be strings"))?
+                    .extract()?;
+                map.insert(key, py_to_json(&v)?);
+            }
+            return Ok(serde_json::Value::Object(map));
+        }
+        if let Ok(list) = value.cast::<PyList>() {
+            let mut arr = Vec::with_capacity(list.len());
+            for item in list.iter() {
+                arr.push(py_to_json(&item)?);
+            }
+            return Ok(serde_json::Value::Array(arr));
+        }
+        if let Ok(tuple) = value.cast::<PyTuple>() {
+            let mut arr = Vec::with_capacity(tuple.len());
+            for item in tuple.iter() {
+                arr.push(py_to_json(&item)?);
+            }
+            return Ok(serde_json::Value::Array(arr));
+        }
+        Err(PyValueError::new_err(format!(
+            "cannot convert {} to JSON",
+            value.get_type().name()?
+        )))
+    }
+
     #[pyclass] // This will be part of the module
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
     pub enum AlgebraType {
@@ -1280,6 +1340,421 @@ pub mod algebra_py {
         }
     }
 
+    /// The `enum_dispatch` union of the Adem and Milnor Steenrod algebras
+    /// (`::algebra::SteenrodAlgebra`). A single value is *either* Adem or Milnor
+    /// at runtime; every `Algebra`/`GeneratedAlgebra`/`Bialgebra` method
+    /// dispatches to the active variant. This is one pyclass that wraps the
+    /// union and dispatches; it does not inherit from `MilnorAlgebra`/
+    /// `AdemAlgebra`.
+    #[pyclass]
+    pub struct SteenrodAlgebra(::algebra::SteenrodAlgebra);
+
+    impl SteenrodAlgebra {
+        /// Lazily compute book-keeping up to `degree`. Both underlying algebras
+        /// are infinite-dimensional with `OnceVec` tables that panic when
+        /// indexed past the computed range, so every degree-indexed Python
+        /// method funnels through here first (idempotent; no-op for negative
+        /// degrees). The dispatch is identical for either variant.
+        fn ensure_basis(&self, degree: i32) {
+            if degree >= 0 {
+                self.0.compute_basis(degree);
+            }
+        }
+
+        fn product_target(&self, r_degree: i32, s_degree: i32) -> PyResult<i32> {
+            non_negative_degree(r_degree)?;
+            non_negative_degree(s_degree)?;
+            let target = r_degree
+                .checked_add(s_degree)
+                .ok_or_else(|| PyValueError::new_err("product degree overflows i32"))?;
+            self.ensure_basis(target);
+            Ok(target)
+        }
+
+        fn checked_basis_index(&self, degree: i32, idx: usize) -> PyResult<()> {
+            let dim = self.0.dimension(degree);
+            if idx < dim {
+                Ok(())
+            } else {
+                Err(PyIndexError::new_err(format!(
+                    "index {idx} out of range for degree {degree} (dimension {dim})"
+                )))
+            }
+        }
+    }
+
+    #[pymethods]
+    impl SteenrodAlgebra {
+        // --- §5.2 constructors ------------------------------------------------
+
+        /// Construct a `SteenrodAlgebra` from a module-spec `dict` (the JSON the
+        /// crate reads from a module file), the desired `AlgebraType`, and the
+        /// `unstable` flag. Mirrors `::algebra::SteenrodAlgebra::from_json`,
+        /// which reads `{"p": <int>, "algebra": [..]?, "profile": {..}?}`. If
+        /// the spec's `algebra` list does not contain the requested type, the
+        /// upstream falls back to the first listed type. The prime is validated
+        /// by serde's `ValidPrime` deserializer; a bad spec/prime maps to
+        /// `ValueError` (parse) or `PyRuntimeError` (other `anyhow` errors),
+        /// consistent with API_PROPOSAL §2.4.
+        #[staticmethod]
+        #[pyo3(signature = (value, ty, unstable = false))]
+        pub fn from_json(
+            value: &Bound<'_, PyAny>,
+            ty: AlgebraType,
+            unstable: bool,
+        ) -> PyResult<Self> {
+            let json = py_to_json(value)?;
+            ::algebra::SteenrodAlgebra::from_json(&json, ty.into(), unstable)
+                .map(SteenrodAlgebra)
+                .map_err(|e| {
+                    use pyo3::exceptions::PyRuntimeError;
+                    PyRuntimeError::new_err(e.to_string())
+                })
+        }
+
+        /// Construct the Adem variant at prime `p`. Validates the prime ->
+        /// `ValueError`.
+        #[staticmethod]
+        #[pyo3(signature = (p, unstable = false))]
+        pub fn adem(p: u32, unstable: bool) -> PyResult<Self> {
+            let p = valid_prime(p)?;
+            Ok(SteenrodAlgebra(::algebra::SteenrodAlgebra::AdemAlgebra(
+                ::algebra::AdemAlgebra::new(p, unstable),
+            )))
+        }
+
+        /// Construct the Milnor variant at prime `p`. Validates the prime ->
+        /// `ValueError`.
+        #[staticmethod]
+        #[pyo3(signature = (p, unstable = false))]
+        pub fn milnor(p: u32, unstable: bool) -> PyResult<Self> {
+            let p = valid_prime(p)?;
+            Ok(SteenrodAlgebra(::algebra::SteenrodAlgebra::MilnorAlgebra(
+                ::algebra::MilnorAlgebra::new(p, unstable),
+            )))
+        }
+
+        /// Which variant this value is (`AlgebraType.ADEM`/`MILNOR`).
+        pub fn algebra_type(&self) -> AlgebraType {
+            match &self.0 {
+                ::algebra::SteenrodAlgebra::AdemAlgebra(_) => AlgebraType::Adem,
+                ::algebra::SteenrodAlgebra::MilnorAlgebra(_) => AlgebraType::Milnor,
+            }
+        }
+
+        // --- Algebra trait surface --------------------------------------------
+
+        /// The prime as a plain `int` (`ValidPrime` is never exposed).
+        pub fn prime(&self) -> u32 {
+            self.0.prime().as_u32()
+        }
+
+        pub fn compute_basis(&self, degree: i32) {
+            self.ensure_basis(degree);
+        }
+
+        pub fn dimension(&self, degree: i32) -> usize {
+            if degree < 0 {
+                return 0;
+            }
+            self.ensure_basis(degree);
+            self.0.dimension(degree)
+        }
+
+        pub fn basis_element_to_string(&self, degree: i32, idx: usize) -> PyResult<String> {
+            non_negative_degree(degree)?;
+            self.ensure_basis(degree);
+            self.checked_basis_index(degree, idx)?;
+            Ok(self.0.basis_element_to_string(degree, idx))
+        }
+
+        /// Parse a basis element, returning `(degree, index)`. Raises
+        /// `ValueError` if the string does not parse or names an element not in
+        /// this algebra.
+        ///
+        /// The union dispatches straight to the active variant's
+        /// `basis_element_from_string`, so it inherits exactly the panic the
+        /// `MilnorAlgebra`/`AdemAlgebra` bindings guard against: a parseable but
+        /// absent/inadmissible name (e.g. `"Sq0"`) calls the panicking
+        /// `basis_element_to_index`. We contain it with `catch_unwind` and
+        /// translate to `ValueError`, exactly as those bindings do (sound for
+        /// the same reason: the panic is a failed lookup after `compute_basis`
+        /// has returned, not a half-finished mutation).
+        pub fn basis_element_from_string(&self, elt: &str) -> PyResult<(i32, usize)> {
+            use std::panic::{catch_unwind, AssertUnwindSafe};
+            match catch_unwind(AssertUnwindSafe(|| self.0.basis_element_from_string(elt))) {
+                Ok(Some(res)) => Ok(res),
+                Ok(None) => Err(PyValueError::new_err(format!(
+                    "could not parse basis element: {elt}"
+                ))),
+                Err(_) => Err(PyValueError::new_err(format!(
+                    "{elt} does not name a basis element of this algebra"
+                ))),
+            }
+        }
+
+        pub fn element_to_string(
+            &self,
+            py: Python<'_>,
+            degree: i32,
+            element: &Bound<'_, PyAny>,
+        ) -> PyResult<String> {
+            non_negative_degree(degree)?;
+            self.ensure_basis(degree);
+            let element = crate::fp_py::extract_input_owned(py, element)?;
+            checked_same_prime(element.prime().as_u32(), self.0.prime().as_u32())?;
+            checked_equal_len(element.len(), self.0.dimension(degree))?;
+            Ok(self.0.element_to_string(degree, element.as_slice()))
+        }
+
+        pub fn multiply_basis_elements(
+            &self,
+            py: Python<'_>,
+            result: &Bound<'_, PyAny>,
+            coeff: u32,
+            r_degree: i32,
+            r_idx: usize,
+            s_degree: i32,
+            s_idx: usize,
+        ) -> PyResult<()> {
+            let p = self.0.prime().as_u32();
+            // Reduce mod p before handing to upstream, which computes
+            // `coeff * value` before reducing and would overflow for large
+            // `coeff`. The algebra is over F_p, so this is equivalent.
+            let coeff = coeff % p;
+            let target = self.product_target(r_degree, s_degree)?;
+            let dim = self.0.dimension(target);
+            self.checked_basis_index(r_degree, r_idx)?;
+            self.checked_basis_index(s_degree, s_idx)?;
+            crate::fp_py::with_target_slice_mut(py, result, |mut res| {
+                checked_same_prime(res.prime().as_u32(), p)?;
+                checked_result_len(res.as_slice().len(), dim)?;
+                self.0
+                    .multiply_basis_elements(res.copy(), coeff, r_degree, r_idx, s_degree, s_idx);
+                Ok(())
+            })
+        }
+
+        pub fn multiply_basis_element_by_element(
+            &self,
+            py: Python<'_>,
+            result: &Bound<'_, PyAny>,
+            coeff: u32,
+            r_degree: i32,
+            r_idx: usize,
+            s_degree: i32,
+            s: &Bound<'_, PyAny>,
+        ) -> PyResult<()> {
+            let p = self.0.prime().as_u32();
+            let coeff = coeff % p;
+            let target = self.product_target(r_degree, s_degree)?;
+            let dim = self.0.dimension(target);
+            self.checked_basis_index(r_degree, r_idx)?;
+            let s = crate::fp_py::extract_input_owned(py, s)?;
+            checked_same_prime(s.prime().as_u32(), p)?;
+            checked_equal_len(s.len(), self.0.dimension(s_degree))?;
+            crate::fp_py::with_target_slice_mut(py, result, |mut res| {
+                checked_same_prime(res.prime().as_u32(), p)?;
+                checked_result_len(res.as_slice().len(), dim)?;
+                self.0.multiply_basis_element_by_element(
+                    res.copy(),
+                    coeff,
+                    r_degree,
+                    r_idx,
+                    s_degree,
+                    s.as_slice(),
+                );
+                Ok(())
+            })
+        }
+
+        pub fn multiply_element_by_basis_element(
+            &self,
+            py: Python<'_>,
+            result: &Bound<'_, PyAny>,
+            coeff: u32,
+            r_degree: i32,
+            r: &Bound<'_, PyAny>,
+            s_degree: i32,
+            s_idx: usize,
+        ) -> PyResult<()> {
+            let p = self.0.prime().as_u32();
+            let coeff = coeff % p;
+            let target = self.product_target(r_degree, s_degree)?;
+            let dim = self.0.dimension(target);
+            self.checked_basis_index(s_degree, s_idx)?;
+            let r = crate::fp_py::extract_input_owned(py, r)?;
+            checked_same_prime(r.prime().as_u32(), p)?;
+            checked_equal_len(r.len(), self.0.dimension(r_degree))?;
+            crate::fp_py::with_target_slice_mut(py, result, |mut res| {
+                checked_same_prime(res.prime().as_u32(), p)?;
+                checked_result_len(res.as_slice().len(), dim)?;
+                self.0.multiply_element_by_basis_element(
+                    res.copy(),
+                    coeff,
+                    r_degree,
+                    r.as_slice(),
+                    s_degree,
+                    s_idx,
+                );
+                Ok(())
+            })
+        }
+
+        pub fn multiply_element_by_element(
+            &self,
+            py: Python<'_>,
+            result: &Bound<'_, PyAny>,
+            coeff: u32,
+            r_degree: i32,
+            r: &Bound<'_, PyAny>,
+            s_degree: i32,
+            s: &Bound<'_, PyAny>,
+        ) -> PyResult<()> {
+            let p = self.0.prime().as_u32();
+            let coeff = coeff % p;
+            let target = self.product_target(r_degree, s_degree)?;
+            let dim = self.0.dimension(target);
+            let r = crate::fp_py::extract_input_owned(py, r)?;
+            let s = crate::fp_py::extract_input_owned(py, s)?;
+            checked_same_prime(r.prime().as_u32(), p)?;
+            checked_same_prime(s.prime().as_u32(), p)?;
+            checked_equal_len(r.len(), self.0.dimension(r_degree))?;
+            checked_equal_len(s.len(), self.0.dimension(s_degree))?;
+            crate::fp_py::with_target_slice_mut(py, result, |mut res| {
+                checked_same_prime(res.prime().as_u32(), p)?;
+                checked_result_len(res.as_slice().len(), dim)?;
+                self.0.multiply_element_by_element(
+                    res.copy(),
+                    coeff,
+                    r_degree,
+                    r.as_slice(),
+                    s_degree,
+                    s.as_slice(),
+                );
+                Ok(())
+            })
+        }
+
+        pub fn default_filtration_one_products(&self) -> Vec<(String, i32, usize)> {
+            self.0.default_filtration_one_products()
+        }
+
+        // --- GeneratedAlgebra trait surface -----------------------------------
+
+        pub fn generators(&self, degree: i32) -> PyResult<Vec<usize>> {
+            if degree < 0 {
+                return Ok(Vec::new());
+            }
+            self.ensure_basis(degree);
+            Ok(self.0.generators(degree))
+        }
+
+        pub fn generator_to_string(&self, degree: i32, idx: usize) -> PyResult<String> {
+            non_negative_degree(degree)?;
+            self.ensure_basis(degree);
+            self.checked_basis_index(degree, idx)?;
+            Ok(self.0.generator_to_string(degree, idx))
+        }
+
+        pub fn decompose_basis_element(
+            &self,
+            degree: i32,
+            idx: usize,
+        ) -> PyResult<Vec<(u32, (i32, usize), (i32, usize))>> {
+            non_negative_degree(degree)?;
+            self.ensure_basis(degree);
+            self.checked_basis_index(degree, idx)?;
+            // Decomposition is invalid for indecomposables. The union dispatches
+            // to the active variant's (panicking) implementation, so we apply
+            // the same per-variant guard the `MilnorAlgebra`/`AdemAlgebra`
+            // bindings use: for Milnor, the degree-0 unit has an empty `p_part`
+            // and underflows in `decompose_basis_element_ppart`; for Adem the
+            // degree-0 unit and the algebra generators index out of bounds /
+            // hit a panicking `basis_element_to_index`.
+            match &self.0 {
+                ::algebra::SteenrodAlgebra::MilnorAlgebra(a) => {
+                    let basis = a.basis_element_from_index(degree, idx);
+                    if basis.q_part == 0 && basis.p_part.is_empty() {
+                        return Err(PyValueError::new_err("the degree-0 unit is indecomposable"));
+                    }
+                }
+                ::algebra::SteenrodAlgebra::AdemAlgebra(a) => {
+                    if degree == 0 || a.generators(degree).contains(&idx) {
+                        return Err(PyValueError::new_err(
+                            "the unit and algebra generators are indecomposable",
+                        ));
+                    }
+                }
+            }
+            Ok(self.0.decompose_basis_element(degree, idx))
+        }
+
+        pub fn generating_relations(
+            &self,
+            degree: i32,
+        ) -> PyResult<Vec<Vec<(u32, (i32, usize), (i32, usize))>>> {
+            if degree < 0 {
+                return Ok(Vec::new());
+            }
+            self.ensure_basis(degree);
+            Ok(self.0.generating_relations(degree))
+        }
+
+        // --- Bialgebra trait surface ------------------------------------------
+
+        /// Compute a coproduct. The underlying assertions differ by variant, so
+        /// we apply the same guards the concrete bindings use: Milnor only
+        /// supports `p = 2`; generic Adem expects a degree divisible by
+        /// `q = 2p - 2` (except degree 1), and `p = 2` Adem expects index 0.
+        pub fn coproduct(
+            &self,
+            degree: i32,
+            idx: usize,
+        ) -> PyResult<Vec<(i32, usize, i32, usize)>> {
+            non_negative_degree(degree)?;
+            self.ensure_basis(degree);
+            self.checked_basis_index(degree, idx)?;
+            match &self.0 {
+                ::algebra::SteenrodAlgebra::MilnorAlgebra(_) => {
+                    if self.0.prime().as_u32() != 2 {
+                        return Err(PyValueError::new_err(
+                            "coproduct is only supported at p = 2",
+                        ));
+                    }
+                }
+                ::algebra::SteenrodAlgebra::AdemAlgebra(a) => {
+                    if a.generic() {
+                        if degree != 1 {
+                            let q = 2 * self.0.prime().as_u32() - 2;
+                            if (degree as u32) % q != 0 {
+                                return Err(PyValueError::new_err(format!(
+                                    "coproduct expects a degree divisible by {q}, got {degree}"
+                                )));
+                            }
+                        }
+                    } else if idx != 0 {
+                        return Err(PyValueError::new_err(
+                            "at p = 2 the coproduct expects index 0",
+                        ));
+                    }
+                }
+            }
+            Ok(self.0.coproduct(degree, idx))
+        }
+
+        pub fn decompose(&self, degree: i32, idx: usize) -> PyResult<Vec<(i32, usize)>> {
+            non_negative_degree(degree)?;
+            self.ensure_basis(degree);
+            self.checked_basis_index(degree, idx)?;
+            Ok(self.0.decompose(degree, idx))
+        }
+
+        pub fn __repr__(&self) -> String {
+            format!("{}", self.0)
+        }
+    }
+
     #[pymodule_init]
     fn init(_m: &Bound<'_, PyModule>) -> PyResult<()> {
         // Arbitrary code to run at the module initialization
@@ -1551,6 +2026,109 @@ pub mod algebra_py {
             assert!(a.decompose_basis_element(2, 0).is_err());
             // A non-generator decomposes successfully.
             assert!(a.decompose_basis_element(3, 0).is_ok());
+        }
+
+        // --- SteenrodAlgebra --------------------------------------------------
+
+        #[test]
+        fn steenrod_constructors_and_variant() {
+            assert!(SteenrodAlgebra::adem(4, false).is_err());
+            assert!(SteenrodAlgebra::milnor(0, false).is_err());
+
+            let adem = SteenrodAlgebra::adem(2, false).unwrap();
+            assert_eq!(adem.prime(), 2);
+            assert_eq!(adem.algebra_type(), AlgebraType::Adem);
+
+            let milnor = SteenrodAlgebra::milnor(3, false).unwrap();
+            assert_eq!(milnor.prime(), 3);
+            assert_eq!(milnor.algebra_type(), AlgebraType::Milnor);
+        }
+
+        #[test]
+        fn steenrod_dimension_p2() {
+            for a in [
+                SteenrodAlgebra::adem(2, false).unwrap(),
+                SteenrodAlgebra::milnor(2, false).unwrap(),
+            ] {
+                a.compute_basis(8);
+                assert_eq!(a.dimension(0), 1);
+                assert_eq!(a.dimension(1), 1);
+                assert_eq!(a.dimension(2), 1);
+                assert_eq!(a.dimension(3), 2);
+                assert_eq!(a.dimension(-3), 0);
+            }
+        }
+
+        #[test]
+        fn steenrod_known_products_p2() {
+            use ::fp::vector::FpVector;
+            for a in [
+                SteenrodAlgebra::adem(2, false).unwrap(),
+                SteenrodAlgebra::milnor(2, false).unwrap(),
+            ] {
+                a.compute_basis(8);
+                // Sq1 * Sq1 = 0.
+                let mut v = FpVector::new(::fp::prime::TWO, a.dimension(2));
+                a.0.multiply_basis_elements(v.as_slice_mut(), 1, 1, 0, 1, 0);
+                assert!(v.is_zero(), "Sq1 * Sq1 should be 0");
+
+                // Sq1 * Sq2 = Sq3 (single basis term in degree 3).
+                let mut v = FpVector::new(::fp::prime::TWO, a.dimension(3));
+                a.0.multiply_basis_elements(v.as_slice_mut(), 1, 1, 0, 2, 0);
+                let (_d, idx) = a.basis_element_from_string("Sq3").unwrap();
+                assert_eq!(v.entry(idx), 1);
+                assert_eq!(v.iter_nonzero().count(), 1);
+            }
+        }
+
+        #[test]
+        fn steenrod_string_roundtrip_and_absent_names() {
+            for a in [
+                SteenrodAlgebra::adem(2, false).unwrap(),
+                SteenrodAlgebra::milnor(2, false).unwrap(),
+            ] {
+                a.compute_basis(8);
+                for d in 0..=8 {
+                    for i in 0..a.dimension(d) {
+                        let s = a.basis_element_to_string(d, i).unwrap();
+                        assert_eq!(a.basis_element_from_string(&s).unwrap(), (d, i));
+                    }
+                }
+                // Parseable but absent names raise, never panic.
+                assert!(a.basis_element_from_string("Sq0").is_err());
+                assert!(a.basis_element_from_string("not an element").is_err());
+                // Degree-0 unit is indecomposable.
+                assert!(a.decompose_basis_element(0, 0).is_err());
+                // A non-generator decomposes successfully.
+                assert!(a.decompose_basis_element(3, 0).is_ok());
+                // Out-of-range index raises.
+                assert!(a.basis_element_to_string(2, 99).is_err());
+            }
+        }
+
+        #[test]
+        fn steenrod_from_json_roundtrip() {
+            Python::initialize();
+            Python::attach(|py| {
+                let dict = pyo3::types::PyDict::new(py);
+                dict.set_item("p", 2).unwrap();
+                let adem =
+                    SteenrodAlgebra::from_json(dict.as_any(), AlgebraType::Adem, false).unwrap();
+                assert_eq!(adem.prime(), 2);
+                assert_eq!(adem.algebra_type(), AlgebraType::Adem);
+
+                let milnor =
+                    SteenrodAlgebra::from_json(dict.as_any(), AlgebraType::Milnor, false).unwrap();
+                assert_eq!(milnor.prime(), 2);
+                assert_eq!(milnor.algebra_type(), AlgebraType::Milnor);
+
+                // A bad prime in the spec surfaces as an error, not a panic.
+                let bad = pyo3::types::PyDict::new(py);
+                bad.set_item("p", 4).unwrap();
+                assert!(
+                    SteenrodAlgebra::from_json(bad.as_any(), AlgebraType::Adem, false).is_err()
+                );
+            });
         }
     }
 }
