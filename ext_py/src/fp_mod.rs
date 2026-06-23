@@ -5,7 +5,7 @@ pub mod fp_py {
     use fp::field::{
         element::FieldElement as RustFieldElement, Field, Fp as RustFp, SmallFq as RustSmallFq,
     };
-    use fp::matrix::Matrix as RustMatrix;
+    use fp::matrix::{Matrix as RustMatrix, Subspace as RustSubspace};
     use fp::prime::{self, Binomial, Prime};
     use fp::vector::{
         FpSlice as RustFpSlice, FpSliceMut as RustFpSliceMut, FpVector as RustFpVector,
@@ -152,6 +152,9 @@ pub mod fp_py {
 
     #[pyclass(name = "Matrix")]
     struct PyMatrix(RustMatrix);
+
+    #[pyclass(name = "Subspace")]
+    struct PySubspace(RustSubspace);
 
     fn valid_prime(p: u32) -> PyResult<prime::ValidPrime> {
         if p < 2 || p >= MAX_VALID_PRIME {
@@ -1182,6 +1185,135 @@ pub mod fp_py {
         }
     }
 
+    impl PySubspace {
+        /// Validate that `vector` matches this subspace's prime and ambient
+        /// dimension, returning an error otherwise.
+        fn check_compatible(&self, vector: &RustFpVector) -> PyResult<()> {
+            checked_same_prime(self.0.prime().as_u32(), vector.prime().as_u32())?;
+            checked_equal_len(vector.len(), self.0.ambient_dimension())?;
+            Ok(())
+        }
+    }
+
+    #[pymethods]
+    impl PySubspace {
+        #[new]
+        pub fn new(p: u32, dim: usize) -> PyResult<Self> {
+            Ok(Self(RustSubspace::new(valid_prime(p)?, dim)))
+        }
+
+        #[staticmethod]
+        pub fn from_matrix(matrix: &PyMatrix) -> Self {
+            Self(RustSubspace::from_matrix(matrix.0.clone()))
+        }
+
+        #[staticmethod]
+        pub fn entire_space(p: u32, dim: usize) -> PyResult<Self> {
+            Ok(Self(RustSubspace::entire_space(valid_prime(p)?, dim)))
+        }
+
+        #[staticmethod]
+        pub fn from_bytes(p: u32, data: &[u8]) -> PyResult<Self> {
+            RustSubspace::from_bytes(valid_prime(p)?, &mut Cursor::new(data))
+                .map(Self)
+                .map_err(|e| PyValueError::new_err(e.to_string()))
+        }
+
+        pub fn prime(&self) -> u32 {
+            self.0.prime().as_u32()
+        }
+
+        pub fn dimension(&self) -> usize {
+            self.0.dimension()
+        }
+
+        pub fn ambient_dimension(&self) -> usize {
+            self.0.ambient_dimension()
+        }
+
+        pub fn contains(&self, vector: &PyFpVector) -> PyResult<bool> {
+            self.check_compatible(&vector.0)?;
+            Ok(self.0.contains(vector.0.as_slice()))
+        }
+
+        pub fn contains_space(&self, other: &Self) -> PyResult<bool> {
+            checked_same_prime(self.0.prime().as_u32(), other.0.prime().as_u32())?;
+            checked_equal_len(self.0.ambient_dimension(), other.0.ambient_dimension())?;
+            Ok(self.0.contains_space(&other.0))
+        }
+
+        pub fn add_vector(&mut self, vector: &PyFpVector) -> PyResult<usize> {
+            self.check_compatible(&vector.0)?;
+            Ok(self.0.add_vector(vector.0.as_slice()))
+        }
+
+        /// Reduce `vector` in place against this subspace, projecting it onto a
+        /// complement of the subspace.
+        pub fn reduce(&self, vector: &mut PyFpVector) -> PyResult<()> {
+            self.check_compatible(&vector.0)?;
+            self.0.reduce(vector.0.as_slice_mut());
+            Ok(())
+        }
+
+        pub fn sum(&self, other: &Self) -> PyResult<Self> {
+            checked_same_prime(self.0.prime().as_u32(), other.0.prime().as_u32())?;
+            checked_equal_len(self.0.ambient_dimension(), other.0.ambient_dimension())?;
+            // `Subspace::sum` calls `Matrix::trim` after `from_matrix`, which
+            // discards the matrix pivots and leaves the returned subspace with
+            // an empty pivot table (so `dimension`/`iter`/`reduce` would all
+            // misbehave). Re-wrap the resulting matrix through `from_matrix` to
+            // re-row-reduce and rebuild the pivots before exposing it.
+            let summed = self.0.sum(&other.0);
+            Ok(Self(RustSubspace::from_matrix((*summed).clone())))
+        }
+
+        /// Return the basis of the subspace as a list of owned `FpVector`s.
+        pub fn iter(&self) -> Vec<PyFpVector> {
+            self.0
+                .iter()
+                .map(|row| PyFpVector(row.to_owned()))
+                .collect()
+        }
+
+        /// Return every vector in the subspace as a list of owned `FpVector`s.
+        pub fn iter_all_vectors(&self) -> Vec<PyFpVector> {
+            self.0.iter_all_vectors().map(PyFpVector).collect()
+        }
+
+        pub fn set_to_zero(&mut self) {
+            self.0.set_to_zero()
+        }
+
+        pub fn set_to_entire(&mut self) {
+            self.0.set_to_entire()
+        }
+
+        pub fn to_bytes<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
+            let mut buffer = Vec::new();
+            self.0
+                .to_bytes(&mut buffer)
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            Ok(PyBytes::new(py, &buffer))
+        }
+
+        pub fn __len__(&self) -> usize {
+            self.0.dimension()
+        }
+
+        pub fn __contains__(&self, vector: &PyFpVector) -> PyResult<bool> {
+            self.contains(vector)
+        }
+
+        pub fn __repr__(&self) -> String {
+            format!(
+                "Subspace({}, dim={}, ambient={})",
+                self.prime(),
+                self.0.dimension(),
+                self.0.ambient_dimension()
+            )
+        }
+    }
+
     #[pymethods]
     impl PyFpVectorIterator {
         pub fn __iter__(slf: PyRefMut<'_, Self>) -> PyRefMut<'_, Self> {
@@ -1616,6 +1748,68 @@ pub mod fp_py {
                 assert!(two.__richcmp__(small_one.bind(py).as_any(), CompareOp::Ne));
                 assert_eq!(two.__hash__(), f.element(7).__hash__());
             });
+        }
+
+        #[test]
+        fn subspace_basic_and_bytes_roundtrip() {
+            Python::initialize();
+            Python::attach(|py| {
+                let mut s = PySubspace::new(3, 3).unwrap();
+                assert_eq!(s.prime(), 3);
+                assert_eq!(s.ambient_dimension(), 3);
+                assert_eq!(s.dimension(), 0);
+
+                let v = PyFpVector::from_slice(3, vec![1, 0, 0]).unwrap();
+                assert_eq!(s.add_vector(&v).unwrap(), 1);
+                assert!(s.contains(&v).unwrap());
+                assert_eq!(s.__len__(), 1);
+
+                let w = PyFpVector::from_slice(3, vec![0, 1, 0]).unwrap();
+                assert!(!s.contains(&w).unwrap());
+
+                // Prime/dimension mismatches raise rather than panic.
+                let wrong_prime = PyFpVector::from_slice(5, vec![1, 0, 0]).unwrap();
+                assert!(s.contains(&wrong_prime).is_err());
+                let wrong_dim = PyFpVector::from_slice(3, vec![1, 0]).unwrap();
+                assert!(s.add_vector(&wrong_dim).is_err());
+
+                // reduce in place projects onto the complement.
+                let mut to_reduce = PyFpVector::from_slice(3, vec![2, 1, 0]).unwrap();
+                s.reduce(&mut to_reduce).unwrap();
+                assert_eq!(to_reduce.0.entry(0), 0);
+                assert_eq!(to_reduce.0.entry(1), 1);
+
+                // Bytes roundtrip.
+                let bytes = s.to_bytes(py).unwrap();
+                let restored = PySubspace::from_bytes(3, bytes.as_bytes()).unwrap();
+                assert_eq!(restored.dimension(), 1);
+                assert!(restored.contains(&v).unwrap());
+                assert!(PySubspace::from_bytes(3, &[0, 1, 2]).is_err());
+            });
+        }
+
+        #[test]
+        fn subspace_sum_rebuilds_pivots() {
+            // `Subspace::sum` upstream leaves empty pivots; the binding re-wraps
+            // through `from_matrix` so the result is a usable subspace.
+            let mut a = PySubspace::new(3, 3).unwrap();
+            a.add_vector(&PyFpVector::from_slice(3, vec![1, 0, 0]).unwrap())
+                .unwrap();
+            let mut b = PySubspace::new(3, 3).unwrap();
+            b.add_vector(&PyFpVector::from_slice(3, vec![0, 1, 0]).unwrap())
+                .unwrap();
+
+            let s = a.sum(&b).unwrap();
+            assert_eq!(s.dimension(), 2);
+            assert!(s.contains_space(&a).unwrap());
+            assert!(s.contains_space(&b).unwrap());
+            assert_eq!(s.iter().len(), 2);
+
+            // Prime/ambient mismatches raise.
+            let other_prime = PySubspace::new(5, 3).unwrap();
+            assert!(a.sum(&other_prime).is_err());
+            let other_dim = PySubspace::new(3, 4).unwrap();
+            assert!(a.contains_space(&other_dim).is_err());
         }
     }
 }
