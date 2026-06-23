@@ -2,12 +2,30 @@ use pyo3::prelude::*;
 
 #[pymodule]
 pub mod algebra_py {
+    use std::sync::Arc;
+
+    use ::algebra::module::{
+        steenrod_module, FDModule as RsFDModule, FreeModule as RsFreeModule, Module,
+        OperationGeneratorPair as RsOperationGeneratorPair, SteenrodModule as RsSteenrodModule,
+    };
     use ::algebra::{Algebra, Bialgebra, GeneratedAlgebra};
     use ::fp::prime::{self, Prime};
     use pyo3::basic::CompareOp;
     use pyo3::exceptions::{PyIndexError, PyValueError};
 
     use super::*;
+
+    /// The concrete monomorphisations the §5.3 module bindings are built over.
+    /// Every concrete module the proposal exposes is taken over the
+    /// `SteenrodAlgebra` union (see `SteenrodModule` below), so we never need a
+    /// generic-over-algebra binding.
+    type RsSteenrodAlgebra = ::algebra::SteenrodAlgebra;
+    type FDModuleInner = RsFDModule<RsSteenrodAlgebra>;
+    type FreeModuleInner = RsFreeModule<RsSteenrodAlgebra>;
+    /// A borrowed trait object over the algebra union. The flattened `Module`
+    /// method set is implemented once against this type and shared by every
+    /// concrete module pyclass and by `SteenrodModule` via dynamic dispatch.
+    type DynModule = dyn Module<Algebra = RsSteenrodAlgebra>;
 
     /// Upper bound on accepted primes, mirroring `fp_py::valid_prime`.
     const MAX_VALID_PRIME: u32 = 1 << 31;
@@ -1365,9 +1383,23 @@ pub mod algebra_py {
     /// union and dispatches; it does not inherit from `MilnorAlgebra`/
     /// `AdemAlgebra`.
     #[pyclass]
-    pub struct SteenrodAlgebra(::algebra::SteenrodAlgebra);
+    pub struct SteenrodAlgebra(Arc<::algebra::SteenrodAlgebra>);
 
     impl SteenrodAlgebra {
+        /// Wrap an already-shared algebra (e.g. the `Arc` a module hands back
+        /// from `Module::algebra`) into the bound pyclass without cloning the
+        /// underlying algebra. This is how a module's `algebra()` accessor
+        /// returns a `SteenrodAlgebra` to Python.
+        pub(crate) fn from_arc(algebra: Arc<::algebra::SteenrodAlgebra>) -> Self {
+            SteenrodAlgebra(algebra)
+        }
+
+        /// A cheap clone of the shared algebra handle, for feeding module
+        /// constructors that take `Arc<SteenrodAlgebra>` upstream.
+        pub(crate) fn arc(&self) -> Arc<::algebra::SteenrodAlgebra> {
+            Arc::clone(&self.0)
+        }
+
         /// Lazily compute book-keeping up to `degree`. Both underlying algebras
         /// are infinite-dimensional with `OnceVec` tables that panic when
         /// indexed past the computed range, so every degree-indexed Python
@@ -1424,7 +1456,7 @@ pub mod algebra_py {
         ) -> PyResult<Self> {
             let json = py_to_json(value)?;
             ::algebra::SteenrodAlgebra::from_json(&json, ty.into(), unstable)
-                .map(SteenrodAlgebra)
+                .map(|a| SteenrodAlgebra(Arc::new(a)))
                 .map_err(|e| {
                     use pyo3::exceptions::PyRuntimeError;
                     PyRuntimeError::new_err(e.to_string())
@@ -1437,8 +1469,8 @@ pub mod algebra_py {
         #[pyo3(signature = (p, unstable = false))]
         pub fn adem(p: u32, unstable: bool) -> PyResult<Self> {
             let p = valid_prime(p)?;
-            Ok(SteenrodAlgebra(::algebra::SteenrodAlgebra::AdemAlgebra(
-                ::algebra::AdemAlgebra::new(p, unstable),
+            Ok(SteenrodAlgebra(Arc::new(
+                ::algebra::SteenrodAlgebra::AdemAlgebra(::algebra::AdemAlgebra::new(p, unstable)),
             )))
         }
 
@@ -1448,14 +1480,16 @@ pub mod algebra_py {
         #[pyo3(signature = (p, unstable = false))]
         pub fn milnor(p: u32, unstable: bool) -> PyResult<Self> {
             let p = valid_prime(p)?;
-            Ok(SteenrodAlgebra(::algebra::SteenrodAlgebra::MilnorAlgebra(
-                ::algebra::MilnorAlgebra::new(p, unstable),
+            Ok(SteenrodAlgebra(Arc::new(
+                ::algebra::SteenrodAlgebra::MilnorAlgebra(::algebra::MilnorAlgebra::new(
+                    p, unstable,
+                )),
             )))
         }
 
         /// Which variant this value is (`AlgebraType.ADEM`/`MILNOR`).
         pub fn algebra_type(&self) -> AlgebraType {
-            match &self.0 {
+            match self.0.as_ref() {
                 ::algebra::SteenrodAlgebra::AdemAlgebra(_) => AlgebraType::Adem,
                 ::algebra::SteenrodAlgebra::MilnorAlgebra(_) => AlgebraType::Milnor,
             }
@@ -1725,7 +1759,7 @@ pub mod algebra_py {
             non_negative_degree(degree)?;
             self.ensure_basis(degree);
             self.checked_basis_index(degree, idx)?;
-            match &self.0 {
+            match self.0.as_ref() {
                 ::algebra::SteenrodAlgebra::MilnorAlgebra(_) => {
                     if self.0.prime().as_u32() != 2 {
                         return Err(PyValueError::new_err(
@@ -1762,6 +1796,1023 @@ pub mod algebra_py {
 
         pub fn __repr__(&self) -> String {
             format!("{}", self.0)
+        }
+    }
+
+    // =========================================================================
+    // §5.3 modules over the Steenrod algebra
+    //
+    // All modules are taken over the `SteenrodAlgebra` union. A module holds its
+    // algebra as `Arc<SteenrodAlgebra>` upstream; the bound algebra pyclass also
+    // holds an `Arc<SteenrodAlgebra>`, so module constructors take a
+    // `SteenrodAlgebra` pyclass and clone its `Arc` (`SteenrodAlgebra::arc`),
+    // while a module's `algebra()` accessor re-wraps the `Arc` upstream hands
+    // back (`SteenrodAlgebra::from_arc`) -- no algebra is ever deep-copied.
+    //
+    // The flattened `Module` method set is shared by every concrete module and
+    // by `SteenrodModule` through the `&DynModule` helpers below, which apply a
+    // uniform panic-guard before each degree-indexed read. The upstream
+    // `OnceVec`/`BiVec` tables panic when indexed past the computed range, and
+    // `act*`/`basis_element_to_string` assert on out-of-range op/module indices,
+    // so we always `compute_basis` (idempotent) and range-check first.
+    // =========================================================================
+
+    /// Compute book-keeping so that degree-`degree` data of `m` (and the algebra
+    /// operations landing there) can be queried. Idempotent; a no-op below the
+    /// module's `min_degree`. Both the algebra and the module are advanced,
+    /// because a `FreeModule`'s own `compute_basis` reads (but does not extend)
+    /// the algebra's tables.
+    fn module_ensure(m: &DynModule, degree: i32) {
+        if degree >= m.min_degree() {
+            // op degrees landing in `degree` are at most `degree - min_degree`.
+            m.algebra().compute_basis(degree - m.min_degree());
+            m.compute_basis(degree);
+        }
+    }
+
+    /// Dimension of `m` in `degree`, guarded so the `FreeModule` `OnceVec`
+    /// length assertion can never fire across the boundary. Degrees below
+    /// `min_degree` are empty.
+    fn module_dimension(m: &DynModule, degree: i32) -> usize {
+        if degree < m.min_degree() {
+            return 0;
+        }
+        module_ensure(m, degree);
+        m.dimension(degree)
+    }
+
+    fn module_basis_element_to_string(m: &DynModule, degree: i32, idx: usize) -> PyResult<String> {
+        let dim = module_dimension(m, degree);
+        if idx >= dim {
+            return Err(PyIndexError::new_err(format!(
+                "index {idx} out of range for degree {degree} (dimension {dim})"
+            )));
+        }
+        Ok(m.basis_element_to_string(degree, idx))
+    }
+
+    fn module_element_to_string(
+        m: &DynModule,
+        py: Python<'_>,
+        degree: i32,
+        element: &Bound<'_, PyAny>,
+    ) -> PyResult<String> {
+        let dim = module_dimension(m, degree);
+        let element = crate::fp_py::extract_input_owned(py, element)?;
+        checked_same_prime(element.prime().as_u32(), m.prime().as_u32())?;
+        checked_equal_len(element.len(), dim)?;
+        Ok(m.element_to_string(degree, element.as_slice()))
+    }
+
+    /// Validate the output degree of an action and ensure every degree it
+    /// touches is computed. Returns `(prime, reduced_coeff, output_degree)`.
+    fn action_target(m: &DynModule, coeff: u32, op_degree: i32, mod_degree: i32) -> PyResult<i32> {
+        non_negative_degree(op_degree)?;
+        let _ = coeff;
+        let output_degree = mod_degree
+            .checked_add(op_degree)
+            .ok_or_else(|| PyValueError::new_err("output degree overflows i32"))?;
+        module_ensure(m, output_degree);
+        // The op degree must be computed in the algebra to range-check op_index.
+        m.algebra().compute_basis(op_degree);
+        Ok(output_degree)
+    }
+
+    fn checked_op_index(m: &DynModule, op_degree: i32, op_index: usize) -> PyResult<()> {
+        let dim = m.algebra().dimension(op_degree);
+        if op_index < dim {
+            Ok(())
+        } else {
+            Err(PyIndexError::new_err(format!(
+                "operation index {op_index} out of range for degree {op_degree} (algebra \
+                 dimension {dim})"
+            )))
+        }
+    }
+
+    fn checked_mod_index(m: &DynModule, mod_degree: i32, mod_index: usize) -> PyResult<()> {
+        let dim = module_dimension(m, mod_degree);
+        if mod_index < dim {
+            Ok(())
+        } else {
+            Err(PyIndexError::new_err(format!(
+                "module index {mod_index} out of range for degree {mod_degree} (dimension {dim})"
+            )))
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn module_act_on_basis(
+        m: &DynModule,
+        py: Python<'_>,
+        result: &Bound<'_, PyAny>,
+        coeff: u32,
+        op_degree: i32,
+        op_index: usize,
+        mod_degree: i32,
+        mod_index: usize,
+    ) -> PyResult<()> {
+        let p = m.prime().as_u32();
+        let coeff = coeff % p;
+        let output_degree = action_target(m, coeff, op_degree, mod_degree)?;
+        let out_dim = module_dimension(m, output_degree);
+        checked_op_index(m, op_degree, op_index)?;
+        checked_mod_index(m, mod_degree, mod_index)?;
+        crate::fp_py::with_target_slice_mut(py, result, |mut res| {
+            checked_same_prime(res.prime().as_u32(), p)?;
+            checked_result_len(res.as_slice().len(), out_dim)?;
+            m.act_on_basis(
+                res.copy(),
+                coeff,
+                op_degree,
+                op_index,
+                mod_degree,
+                mod_index,
+            );
+            Ok(())
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn module_act(
+        m: &DynModule,
+        py: Python<'_>,
+        result: &Bound<'_, PyAny>,
+        coeff: u32,
+        op_degree: i32,
+        op_index: usize,
+        input_degree: i32,
+        input: &Bound<'_, PyAny>,
+    ) -> PyResult<()> {
+        let p = m.prime().as_u32();
+        let coeff = coeff % p;
+        let output_degree = action_target(m, coeff, op_degree, input_degree)?;
+        let in_dim = module_dimension(m, input_degree);
+        let out_dim = module_dimension(m, output_degree);
+        checked_op_index(m, op_degree, op_index)?;
+        // Own the input before taking the mutable borrow of `result`.
+        let input = crate::fp_py::extract_input_owned(py, input)?;
+        checked_same_prime(input.prime().as_u32(), p)?;
+        // Upstream `act` allows a short input (missing trailing entries treated
+        // as 0) but asserts `input.len() <= dimension(input_degree)`.
+        if input.len() > in_dim {
+            return Err(PyValueError::new_err(format!(
+                "input has length {} but degree {input_degree} has dimension {in_dim}",
+                input.len()
+            )));
+        }
+        crate::fp_py::with_target_slice_mut(py, result, |mut res| {
+            checked_same_prime(res.prime().as_u32(), p)?;
+            checked_result_len(res.as_slice().len(), out_dim)?;
+            m.act(
+                res.copy(),
+                coeff,
+                op_degree,
+                op_index,
+                input_degree,
+                input.as_slice(),
+            );
+            Ok(())
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn module_act_by_element(
+        m: &DynModule,
+        py: Python<'_>,
+        result: &Bound<'_, PyAny>,
+        coeff: u32,
+        op_degree: i32,
+        op: &Bound<'_, PyAny>,
+        input_degree: i32,
+        input: &Bound<'_, PyAny>,
+    ) -> PyResult<()> {
+        let p = m.prime().as_u32();
+        let coeff = coeff % p;
+        let output_degree = action_target(m, coeff, op_degree, input_degree)?;
+        let in_dim = module_dimension(m, input_degree);
+        let out_dim = module_dimension(m, output_degree);
+        let op_dim = m.algebra().dimension(op_degree);
+        // Own both inputs before the mutable borrow of `result`.
+        let op = crate::fp_py::extract_input_owned(py, op)?;
+        let input = crate::fp_py::extract_input_owned(py, input)?;
+        checked_same_prime(op.prime().as_u32(), p)?;
+        checked_same_prime(input.prime().as_u32(), p)?;
+        // Upstream `act_by_element` asserts both lengths exactly.
+        checked_equal_len(op.len(), op_dim)?;
+        checked_equal_len(input.len(), in_dim)?;
+        crate::fp_py::with_target_slice_mut(py, result, |mut res| {
+            checked_same_prime(res.prime().as_u32(), p)?;
+            checked_result_len(res.as_slice().len(), out_dim)?;
+            m.act_by_element(
+                res.copy(),
+                coeff,
+                op_degree,
+                op.as_slice(),
+                input_degree,
+                input.as_slice(),
+            );
+            Ok(())
+        })
+    }
+
+    fn module_total_dimension(m: &DynModule) -> PyResult<usize> {
+        match m.max_degree() {
+            Some(max) => {
+                module_ensure(m, max);
+                Ok(m.total_dimension())
+            }
+            None => Err(PyValueError::new_err(
+                "total_dimension requires the module to be bounded above",
+            )),
+        }
+    }
+
+    /// The boxed (`Arc`'d) dynamic module accepted downstream by chain complexes
+    /// and resolutions. Wraps `::algebra::module::SteenrodModule`, i.e.
+    /// `Arc<dyn Module<Algebra = SteenrodAlgebra>>`. This is the type
+    /// `into_steenrod_module()` produces; every flattened `Module` method
+    /// dispatches dynamically to the underlying concrete module.
+    #[pyclass(name = "SteenrodModule")]
+    pub struct SteenrodModule(RsSteenrodModule);
+
+    #[pymethods]
+    impl SteenrodModule {
+        pub fn algebra(&self) -> SteenrodAlgebra {
+            SteenrodAlgebra::from_arc(self.0.algebra())
+        }
+
+        pub fn min_degree(&self) -> i32 {
+            self.0.min_degree()
+        }
+
+        pub fn max_computed_degree(&self) -> i32 {
+            self.0.max_computed_degree()
+        }
+
+        pub fn max_degree(&self) -> Option<i32> {
+            self.0.max_degree()
+        }
+
+        /// The prime as a plain `int` (`ValidPrime` is never exposed).
+        pub fn prime(&self) -> u32 {
+            self.0.prime().as_u32()
+        }
+
+        pub fn compute_basis(&self, degree: i32) {
+            module_ensure(&*self.0, degree);
+        }
+
+        pub fn dimension(&self, degree: i32) -> usize {
+            module_dimension(&*self.0, degree)
+        }
+
+        pub fn total_dimension(&self) -> PyResult<usize> {
+            module_total_dimension(&*self.0)
+        }
+
+        pub fn is_unit(&self) -> bool {
+            self.0.is_unit()
+        }
+
+        pub fn basis_element_to_string(&self, degree: i32, idx: usize) -> PyResult<String> {
+            module_basis_element_to_string(&*self.0, degree, idx)
+        }
+
+        pub fn element_to_string(
+            &self,
+            py: Python<'_>,
+            degree: i32,
+            element: &Bound<'_, PyAny>,
+        ) -> PyResult<String> {
+            module_element_to_string(&*self.0, py, degree, element)
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        pub fn act_on_basis(
+            &self,
+            py: Python<'_>,
+            result: &Bound<'_, PyAny>,
+            coeff: u32,
+            op_degree: i32,
+            op_index: usize,
+            mod_degree: i32,
+            mod_index: usize,
+        ) -> PyResult<()> {
+            module_act_on_basis(
+                &*self.0, py, result, coeff, op_degree, op_index, mod_degree, mod_index,
+            )
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        pub fn act(
+            &self,
+            py: Python<'_>,
+            result: &Bound<'_, PyAny>,
+            coeff: u32,
+            op_degree: i32,
+            op_index: usize,
+            input_degree: i32,
+            input: &Bound<'_, PyAny>,
+        ) -> PyResult<()> {
+            module_act(
+                &*self.0,
+                py,
+                result,
+                coeff,
+                op_degree,
+                op_index,
+                input_degree,
+                input,
+            )
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        pub fn act_by_element(
+            &self,
+            py: Python<'_>,
+            result: &Bound<'_, PyAny>,
+            coeff: u32,
+            op_degree: i32,
+            op: &Bound<'_, PyAny>,
+            input_degree: i32,
+            input: &Bound<'_, PyAny>,
+        ) -> PyResult<()> {
+            module_act_by_element(
+                &*self.0,
+                py,
+                result,
+                coeff,
+                op_degree,
+                op,
+                input_degree,
+                input,
+            )
+        }
+
+        pub fn __repr__(&self) -> String {
+            format!("SteenrodModule({})", self.0)
+        }
+    }
+
+    /// A pair `(operation, generator)` indexing a basis element of a
+    /// `FreeModule`: the basis element is `operation * generator`. Mirrors
+    /// upstream `OperationGeneratorPair`'s four integer fields.
+    #[pyclass(name = "OperationGeneratorPair", skip_from_py_object)]
+    #[derive(Clone)]
+    pub struct OperationGeneratorPair(RsOperationGeneratorPair);
+
+    #[pymethods]
+    impl OperationGeneratorPair {
+        #[getter]
+        pub fn operation_degree(&self) -> i32 {
+            self.0.operation_degree
+        }
+
+        #[getter]
+        pub fn operation_index(&self) -> usize {
+            self.0.operation_index
+        }
+
+        #[getter]
+        pub fn generator_degree(&self) -> i32 {
+            self.0.generator_degree
+        }
+
+        #[getter]
+        pub fn generator_index(&self) -> usize {
+            self.0.generator_index
+        }
+
+        pub fn __repr__(&self) -> String {
+            format!(
+                "OperationGeneratorPair(operation_degree={}, operation_index={}, \
+                 generator_degree={}, generator_index={})",
+                self.0.operation_degree,
+                self.0.operation_index,
+                self.0.generator_degree,
+                self.0.generator_index
+            )
+        }
+    }
+
+    /// A finite-dimensional module over the Steenrod algebra. The graded
+    /// dimensions are given as a `list[int]` starting at `min_degree`.
+    #[pyclass(name = "FDModule")]
+    pub struct FDModule(FDModuleInner);
+
+    impl FDModule {
+        fn as_dyn(&self) -> &DynModule {
+            &self.0
+        }
+    }
+
+    #[pymethods]
+    impl FDModule {
+        /// Build a finite-dimensional module with `graded_dims[i]` generators in
+        /// degree `min_degree + i`. All actions are initialised to zero; use
+        /// `add_generator`/`set_action`/`extend_actions` to populate them, or
+        /// build from JSON via `steenrod_module_from_json`.
+        #[new]
+        #[pyo3(signature = (algebra, name, graded_dims, min_degree = 0))]
+        pub fn new(
+            algebra: PyRef<'_, SteenrodAlgebra>,
+            name: String,
+            graded_dims: Vec<usize>,
+            min_degree: i32,
+        ) -> Self {
+            let graded_dimension = ::bivec::BiVec::from_vec(min_degree, graded_dims);
+            FDModule(FDModuleInner::new(algebra.arc(), name, graded_dimension))
+        }
+
+        // --- flattened Module method set --------------------------------------
+
+        pub fn algebra(&self) -> SteenrodAlgebra {
+            SteenrodAlgebra::from_arc(self.0.algebra())
+        }
+
+        pub fn min_degree(&self) -> i32 {
+            self.0.min_degree()
+        }
+
+        pub fn max_computed_degree(&self) -> i32 {
+            self.0.max_computed_degree()
+        }
+
+        pub fn max_degree(&self) -> Option<i32> {
+            self.0.max_degree()
+        }
+
+        pub fn prime(&self) -> u32 {
+            self.0.prime().as_u32()
+        }
+
+        pub fn compute_basis(&self, degree: i32) {
+            module_ensure(self.as_dyn(), degree);
+        }
+
+        pub fn dimension(&self, degree: i32) -> usize {
+            module_dimension(self.as_dyn(), degree)
+        }
+
+        pub fn total_dimension(&self) -> PyResult<usize> {
+            module_total_dimension(self.as_dyn())
+        }
+
+        pub fn is_unit(&self) -> bool {
+            self.0.is_unit()
+        }
+
+        pub fn basis_element_to_string(&self, degree: i32, idx: usize) -> PyResult<String> {
+            module_basis_element_to_string(self.as_dyn(), degree, idx)
+        }
+
+        pub fn element_to_string(
+            &self,
+            py: Python<'_>,
+            degree: i32,
+            element: &Bound<'_, PyAny>,
+        ) -> PyResult<String> {
+            module_element_to_string(self.as_dyn(), py, degree, element)
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        pub fn act_on_basis(
+            &self,
+            py: Python<'_>,
+            result: &Bound<'_, PyAny>,
+            coeff: u32,
+            op_degree: i32,
+            op_index: usize,
+            mod_degree: i32,
+            mod_index: usize,
+        ) -> PyResult<()> {
+            module_act_on_basis(
+                self.as_dyn(),
+                py,
+                result,
+                coeff,
+                op_degree,
+                op_index,
+                mod_degree,
+                mod_index,
+            )
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        pub fn act(
+            &self,
+            py: Python<'_>,
+            result: &Bound<'_, PyAny>,
+            coeff: u32,
+            op_degree: i32,
+            op_index: usize,
+            input_degree: i32,
+            input: &Bound<'_, PyAny>,
+        ) -> PyResult<()> {
+            module_act(
+                self.as_dyn(),
+                py,
+                result,
+                coeff,
+                op_degree,
+                op_index,
+                input_degree,
+                input,
+            )
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        pub fn act_by_element(
+            &self,
+            py: Python<'_>,
+            result: &Bound<'_, PyAny>,
+            coeff: u32,
+            op_degree: i32,
+            op: &Bound<'_, PyAny>,
+            input_degree: i32,
+            input: &Bound<'_, PyAny>,
+        ) -> PyResult<()> {
+            module_act_by_element(
+                self.as_dyn(),
+                py,
+                result,
+                coeff,
+                op_degree,
+                op,
+                input_degree,
+                input,
+            )
+        }
+
+        // --- FDModule-specific (thin) -----------------------------------------
+
+        /// Rename a basis element. Raises `IndexError` if `(degree, idx)` is not
+        /// a basis element (upstream indexes `gen_names` and would panic).
+        pub fn set_basis_element_name(
+            &mut self,
+            degree: i32,
+            idx: usize,
+            name: String,
+        ) -> PyResult<()> {
+            checked_mod_index(&self.0, degree, idx)?;
+            self.0.set_basis_element_name(degree, idx, name);
+            Ok(())
+        }
+
+        /// Append a new generator in `degree`, returning its index.
+        pub fn add_generator(&mut self, degree: i32, name: String) {
+            self.0.add_generator(degree, name);
+        }
+
+        /// Set the action `op * x = output`, where `op = (op_degree, op_index)`
+        /// and `x = (input_degree, input_index)`. `output` is a coefficient
+        /// vector in degree `input_degree + op_degree`. Raises `IndexError`/
+        /// `ValueError` rather than letting an upstream assertion/`copy_from_slice`
+        /// length-mismatch panic.
+        #[allow(clippy::too_many_arguments)]
+        pub fn set_action(
+            &mut self,
+            op_degree: i32,
+            op_index: usize,
+            input_degree: i32,
+            input_index: usize,
+            output: Vec<u32>,
+        ) -> PyResult<()> {
+            non_negative_degree(op_degree)?;
+            self.0.algebra().compute_basis(op_degree);
+            checked_op_index(&self.0, op_degree, op_index)?;
+            checked_mod_index(&self.0, input_degree, input_index)?;
+            let output_degree = input_degree
+                .checked_add(op_degree)
+                .ok_or_else(|| PyValueError::new_err("output degree overflows i32"))?;
+            let out_dim = module_dimension(&self.0, output_degree);
+            checked_equal_len(output.len(), out_dim)?;
+            let p = self.0.prime().as_u32();
+            for v in &output {
+                if *v >= p {
+                    return Err(PyValueError::new_err(format!(
+                        "coefficient {v} is not reduced mod {p}"
+                    )));
+                }
+            }
+            self.0
+                .set_action(op_degree, op_index, input_degree, input_index, &output);
+            Ok(())
+        }
+
+        /// The stored action `op * x` as a coefficient vector. Raises rather
+        /// than panicking for out-of-range indices or an empty output degree.
+        pub fn action(
+            &self,
+            op_degree: i32,
+            op_index: usize,
+            input_degree: i32,
+            input_index: usize,
+        ) -> PyResult<Vec<u32>> {
+            non_negative_degree(op_degree)?;
+            self.0.algebra().compute_basis(op_degree);
+            checked_op_index(&self.0, op_degree, op_index)?;
+            checked_mod_index(&self.0, input_degree, input_index)?;
+            let output_degree = input_degree
+                .checked_add(op_degree)
+                .ok_or_else(|| PyValueError::new_err("output degree overflows i32"))?;
+            if module_dimension(&self.0, output_degree) == 0 {
+                return Err(PyValueError::new_err(format!(
+                    "output degree {output_degree} is empty"
+                )));
+            }
+            let vec = self
+                .0
+                .action(op_degree, op_index, input_degree, input_index);
+            Ok(vec.iter().collect())
+        }
+
+        /// Fill in actions of decomposable operations in the given bidegree from
+        /// the actions of the algebra generators. Raises if `output_deg <=
+        /// input_deg` (upstream asserts).
+        pub fn extend_actions(&mut self, input_degree: i32, output_degree: i32) -> PyResult<()> {
+            if output_degree <= input_degree {
+                return Err(PyValueError::new_err(
+                    "output_degree must be strictly greater than input_degree",
+                ));
+            }
+            self.0.algebra().compute_basis(output_degree - input_degree);
+            self.0.extend_actions(input_degree, output_degree);
+            Ok(())
+        }
+
+        /// Check that the stored actions satisfy the algebra's relations in the
+        /// given bidegree. Raises `ValueError` (with the failing relation) if a
+        /// relation fails, or if `output_deg <= input_deg`.
+        pub fn check_validity(&self, input_degree: i32, output_degree: i32) -> PyResult<()> {
+            if output_degree <= input_degree {
+                return Err(PyValueError::new_err(
+                    "output_degree must be strictly greater than input_degree",
+                ));
+            }
+            self.0.algebra().compute_basis(output_degree - input_degree);
+            self.0
+                .check_validity(input_degree, output_degree)
+                .map_err(|e| PyValueError::new_err(e.to_string()))
+        }
+
+        /// Look up a basis element by its name, returning `(degree, index)` or
+        /// `None`.
+        pub fn string_to_basis_element(&self, string: &str) -> Option<(i32, usize)> {
+            self.0.string_to_basis_element(string)
+        }
+
+        /// Box this module into a `SteenrodModule` for downstream use.
+        pub fn into_steenrod_module(&self) -> SteenrodModule {
+            SteenrodModule(steenrod_module::erase(self.0.clone()))
+        }
+
+        pub fn __repr__(&self) -> String {
+            format!("FDModule({})", self.0)
+        }
+    }
+
+    /// A free module over the Steenrod algebra, determined by its list of
+    /// generators (added in increasing degree).
+    #[pyclass(name = "FreeModule")]
+    pub struct FreeModule(Arc<FreeModuleInner>);
+
+    impl FreeModule {
+        fn as_dyn(&self) -> &DynModule {
+            &*self.0
+        }
+    }
+
+    #[pymethods]
+    impl FreeModule {
+        #[new]
+        #[pyo3(signature = (algebra, name, min_degree = 0))]
+        pub fn new(algebra: PyRef<'_, SteenrodAlgebra>, name: String, min_degree: i32) -> Self {
+            FreeModule(Arc::new(FreeModuleInner::new(
+                algebra.arc(),
+                name,
+                min_degree,
+            )))
+        }
+
+        // --- flattened Module method set --------------------------------------
+
+        pub fn algebra(&self) -> SteenrodAlgebra {
+            SteenrodAlgebra::from_arc(self.0.algebra())
+        }
+
+        pub fn min_degree(&self) -> i32 {
+            self.0.min_degree()
+        }
+
+        pub fn max_computed_degree(&self) -> i32 {
+            self.0.max_computed_degree()
+        }
+
+        pub fn max_degree(&self) -> Option<i32> {
+            self.0.max_degree()
+        }
+
+        pub fn prime(&self) -> u32 {
+            self.0.prime().as_u32()
+        }
+
+        pub fn compute_basis(&self, degree: i32) {
+            module_ensure(self.as_dyn(), degree);
+        }
+
+        pub fn dimension(&self, degree: i32) -> usize {
+            module_dimension(self.as_dyn(), degree)
+        }
+
+        pub fn total_dimension(&self) -> PyResult<usize> {
+            module_total_dimension(self.as_dyn())
+        }
+
+        pub fn is_unit(&self) -> bool {
+            self.0.is_unit()
+        }
+
+        pub fn basis_element_to_string(&self, degree: i32, idx: usize) -> PyResult<String> {
+            module_basis_element_to_string(self.as_dyn(), degree, idx)
+        }
+
+        pub fn element_to_string(
+            &self,
+            py: Python<'_>,
+            degree: i32,
+            element: &Bound<'_, PyAny>,
+        ) -> PyResult<String> {
+            module_element_to_string(self.as_dyn(), py, degree, element)
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        pub fn act_on_basis(
+            &self,
+            py: Python<'_>,
+            result: &Bound<'_, PyAny>,
+            coeff: u32,
+            op_degree: i32,
+            op_index: usize,
+            mod_degree: i32,
+            mod_index: usize,
+        ) -> PyResult<()> {
+            module_act_on_basis(
+                self.as_dyn(),
+                py,
+                result,
+                coeff,
+                op_degree,
+                op_index,
+                mod_degree,
+                mod_index,
+            )
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        pub fn act(
+            &self,
+            py: Python<'_>,
+            result: &Bound<'_, PyAny>,
+            coeff: u32,
+            op_degree: i32,
+            op_index: usize,
+            input_degree: i32,
+            input: &Bound<'_, PyAny>,
+        ) -> PyResult<()> {
+            module_act(
+                self.as_dyn(),
+                py,
+                result,
+                coeff,
+                op_degree,
+                op_index,
+                input_degree,
+                input,
+            )
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        pub fn act_by_element(
+            &self,
+            py: Python<'_>,
+            result: &Bound<'_, PyAny>,
+            coeff: u32,
+            op_degree: i32,
+            op: &Bound<'_, PyAny>,
+            input_degree: i32,
+            input: &Bound<'_, PyAny>,
+        ) -> PyResult<()> {
+            module_act_by_element(
+                self.as_dyn(),
+                py,
+                result,
+                coeff,
+                op_degree,
+                op,
+                input_degree,
+                input,
+            )
+        }
+
+        // --- FreeModule-specific (thin) ---------------------------------------
+
+        /// Add `num_gens` generators in `degree`, optionally naming them. Raises
+        /// `ValueError` if `degree < min_degree` (upstream asserts).
+        #[pyo3(signature = (degree, num_gens, names = None))]
+        pub fn add_generators(
+            &self,
+            degree: i32,
+            num_gens: usize,
+            names: Option<Vec<String>>,
+        ) -> PyResult<()> {
+            if degree < self.0.min_degree() {
+                return Err(PyValueError::new_err(format!(
+                    "degree {degree} is below the module's min_degree {}",
+                    self.0.min_degree()
+                )));
+            }
+            if let Some(names) = &names {
+                checked_equal_len(names.len(), num_gens)?;
+            }
+            // `add_generators` reads the algebra/opgen tables up to the current
+            // computed degree, so make sure they are populated through `degree`.
+            module_ensure(self.as_dyn(), degree);
+            self.0.add_generators(degree, num_gens, names);
+            Ok(())
+        }
+
+        pub fn number_of_gens_in_degree(&self, degree: i32) -> usize {
+            self.0.number_of_gens_in_degree(degree)
+        }
+
+        /// The generator names up to the maximum computed generator degree, as a
+        /// list (indexed from `min_degree`) of lists.
+        pub fn gen_names(&self) -> Vec<Vec<String>> {
+            self.0.gen_names().iter().map(|(_, v)| v.clone()).collect()
+        }
+
+        /// The offset in `degree` of the first basis element coming from the
+        /// generator `(gen_degree, gen_index)`.
+        pub fn generator_offset(
+            &self,
+            degree: i32,
+            gen_degree: i32,
+            gen_index: usize,
+        ) -> PyResult<usize> {
+            if gen_degree < self.0.min_degree() {
+                return Err(PyValueError::new_err(format!(
+                    "generator degree {gen_degree} is below min_degree {}",
+                    self.0.min_degree()
+                )));
+            }
+            if gen_index >= self.0.number_of_gens_in_degree(gen_degree) {
+                return Err(PyIndexError::new_err(format!(
+                    "generator index {gen_index} out of range in degree {gen_degree}"
+                )));
+            }
+            module_ensure(self.as_dyn(), degree);
+            Ok(self.0.generator_offset(degree, gen_degree, gen_index))
+        }
+
+        /// The offset in `degree` of the first basis element coming from the
+        /// generator with internal index `internal_gen_idx`.
+        pub fn internal_generator_offset(
+            &self,
+            degree: i32,
+            internal_gen_idx: usize,
+        ) -> PyResult<usize> {
+            module_ensure(self.as_dyn(), degree);
+            let dim = module_dimension(self.as_dyn(), degree);
+            // `generator_to_index[degree]` has one entry per generator with a
+            // basis element in `degree`; guard against an out-of-range internal
+            // index to avoid the upstream `OnceVec` panic.
+            if degree < self.0.min_degree() {
+                return Err(PyIndexError::new_err(format!(
+                    "degree {degree} is below min_degree {}",
+                    self.0.min_degree()
+                )));
+            }
+            let _ = dim;
+            let count = self.0.iter_gens(degree).count();
+            if internal_gen_idx >= count {
+                return Err(PyIndexError::new_err(format!(
+                    "internal generator index {internal_gen_idx} out of range (only {count} \
+                     generators up to degree {degree})"
+                )));
+            }
+            Ok(self.0.internal_generator_offset(degree, internal_gen_idx))
+        }
+
+        /// The basis index of `op * gen`, where `op = (op_degree, op_index)` and
+        /// `gen = (gen_degree, gen_index)`.
+        #[allow(clippy::too_many_arguments)]
+        pub fn operation_generator_to_index(
+            &self,
+            op_degree: i32,
+            op_index: usize,
+            gen_degree: i32,
+            gen_index: usize,
+        ) -> PyResult<usize> {
+            non_negative_degree(op_degree)?;
+            if gen_degree < self.0.min_degree() {
+                return Err(PyValueError::new_err(format!(
+                    "generator degree {gen_degree} is below min_degree {}",
+                    self.0.min_degree()
+                )));
+            }
+            if gen_index >= self.0.number_of_gens_in_degree(gen_degree) {
+                return Err(PyIndexError::new_err(format!(
+                    "generator index {gen_index} out of range in degree {gen_degree}"
+                )));
+            }
+            let output_degree = op_degree
+                .checked_add(gen_degree)
+                .ok_or_else(|| PyValueError::new_err("degree overflows i32"))?;
+            module_ensure(self.as_dyn(), output_degree);
+            self.0.algebra().compute_basis(op_degree);
+            checked_op_index(self.as_dyn(), op_degree, op_index)?;
+            Ok(self
+                .0
+                .operation_generator_to_index(op_degree, op_index, gen_degree, gen_index))
+        }
+
+        /// The `(operation, generator)` pair for the basis element at
+        /// `(degree, index)`.
+        pub fn index_to_op_gen(
+            &self,
+            degree: i32,
+            index: usize,
+        ) -> PyResult<OperationGeneratorPair> {
+            checked_mod_index(self.as_dyn(), degree, index)?;
+            Ok(OperationGeneratorPair(
+                self.0.index_to_op_gen(degree, index).clone(),
+            ))
+        }
+
+        /// Add zero generators in every degree up to (and including) `degree`.
+        pub fn extend_by_zero(&self, degree: i32) {
+            self.0.extend_by_zero(degree);
+        }
+
+        /// Iterate the `(degree, index)` of every generator up to `degree`.
+        pub fn iter_gens(&self, degree: i32) -> Vec<(i32, usize)> {
+            self.0.iter_gens(degree).collect()
+        }
+
+        /// Box this module into a `SteenrodModule` for downstream use.
+        pub fn into_steenrod_module(&self) -> SteenrodModule {
+            // `Arc<FreeModule>` unsizes directly to `Arc<dyn Module>`.
+            SteenrodModule(Arc::clone(&self.0) as RsSteenrodModule)
+        }
+
+        pub fn __repr__(&self) -> String {
+            format!("FreeModule({})", self.0)
+        }
+    }
+
+    /// Build a `SteenrodModule` from a module-spec `dict` (the JSON the crate
+    /// reads from a module file) over the given `algebra`. Mirrors
+    /// `::algebra::module::steenrod_module::from_json`, which dispatches on the
+    /// spec's `"type"` field (finite dimensional / finitely presented / real
+    /// projective space). Upstream returns an `anyhow::Error` for every failure
+    /// (unknown/missing type, malformed spec, parse error) without
+    /// distinguishing them, so all `from_json` failures map to `ValueError`.
+    /// (Type conversion of the Python value, in `py_to_json`, also raises
+    /// `ValueError`.)
+    ///
+    /// Two panic hazards are guarded explicitly. First, upstream `from_json`
+    /// does *not* check the spec's prime against the supplied algebra: a
+    /// mismatch makes the action parser compute the wrong output degree and
+    /// index `actions` out of bounds (finite_dimensional_module.rs ~396), so we
+    /// reject a `p` that disagrees with `algebra.prime()` up front. Second, we
+    /// still wrap the upstream call in `catch_unwind` (as the `from_string`
+    /// bindings do) so that any remaining internal `unwrap`/index panic on a
+    /// malformed spec surfaces as a `ValueError` rather than aborting across the
+    /// FFI boundary.
+    #[pyfunction]
+    pub fn steenrod_module_from_json(
+        algebra: PyRef<'_, SteenrodAlgebra>,
+        value: &Bound<'_, PyAny>,
+    ) -> PyResult<SteenrodModule> {
+        use std::panic::{catch_unwind, AssertUnwindSafe};
+        let json = py_to_json(value)?;
+        if let Some(spec_p) = json["p"].as_u64() {
+            let algebra_p = algebra.prime() as u64;
+            if spec_p != algebra_p {
+                return Err(PyValueError::new_err(format!(
+                    "module spec is over p = {spec_p} but the algebra is over p = {algebra_p}"
+                )));
+            }
+        }
+        let arc = algebra.arc();
+        match catch_unwind(AssertUnwindSafe(|| steenrod_module::from_json(arc, &json))) {
+            Ok(Ok(module)) => Ok(SteenrodModule(module)),
+            Ok(Err(e)) => Err(PyValueError::new_err(e.to_string())),
+            Err(_) => Err(PyValueError::new_err(
+                "failed to build module from JSON (malformed spec)",
+            )),
         }
     }
 
@@ -2204,6 +3255,160 @@ pub mod algebra_py {
                 assert!(
                     SteenrodAlgebra::from_json(bad.as_any(), AlgebraType::Adem, false).is_err()
                 );
+            });
+        }
+
+        // --- §5.3 modules -----------------------------------------------------
+
+        /// The C2 module: x0 in degree 0, x1 in degree 1, Sq1 x0 = x1.
+        const C2_JSON: &str = r#"{
+            "p": 2,
+            "type": "finite dimensional module",
+            "gens": { "x0": 0, "x1": 1 },
+            "actions": ["Sq1 x0 = x1"]
+        }"#;
+
+        fn c2_module(py: Python<'_>) -> SteenrodModule {
+            let algebra = Py::new(py, SteenrodAlgebra::milnor(2, false).unwrap()).unwrap();
+            let json: serde_json::Value = serde_json::from_str(C2_JSON).unwrap();
+            let arc = algebra.borrow(py).arc();
+            let m = steenrod_module::from_json(arc, &json)
+                .map(SteenrodModule)
+                .unwrap();
+            m
+        }
+
+        #[test]
+        fn fdmodule_construct_and_invariants() {
+            Python::initialize();
+            Python::attach(|py| {
+                let algebra = Py::new(py, SteenrodAlgebra::milnor(2, false).unwrap()).unwrap();
+                // Two cells: one generator each in degrees 0 and 1.
+                let mut m = FDModule::new(algebra.borrow(py), "C2".to_string(), vec![1, 1], 0);
+                assert_eq!(m.prime(), 2);
+                assert_eq!(m.min_degree(), 0);
+                assert_eq!(m.dimension(0), 1);
+                assert_eq!(m.dimension(1), 1);
+                assert_eq!(m.dimension(2), 0);
+                assert_eq!(m.dimension(-1), 0);
+                assert_eq!(m.max_degree(), Some(1));
+                assert_eq!(m.total_dimension().unwrap(), 2);
+
+                // Set Sq1 x0 = x1 (Sq1 is op (degree 1, index 0)).
+                m.set_action(1, 0, 0, 0, vec![1]).unwrap();
+                assert_eq!(m.action(1, 0, 0, 0).unwrap(), vec![1]);
+
+                // act_on_basis: Sq1 . x0 = x1.
+                let res = Py::new(
+                    py,
+                    crate::fp_py::PyFpVector::new(2, m.dimension(1)).unwrap(),
+                )
+                .unwrap();
+                m.act_on_basis(py, res.bind(py).as_any(), 1, 1, 0, 0, 0)
+                    .unwrap();
+                assert_eq!(res.borrow(py).entry(0).unwrap(), 1);
+            });
+        }
+
+        #[test]
+        fn fdmodule_set_action_out_of_range_raises() {
+            Python::initialize();
+            Python::attach(|py| {
+                let algebra = Py::new(py, SteenrodAlgebra::milnor(2, false).unwrap()).unwrap();
+                let mut m = FDModule::new(algebra.borrow(py), "C2".to_string(), vec![1, 1], 0);
+                // Output degree 2 is empty -> wrong length raises, never panics.
+                assert!(m.set_action(2, 0, 0, 0, vec![1]).is_err());
+                // Out-of-range module index raises.
+                assert!(m.set_action(1, 0, 0, 5, vec![1]).is_err());
+            });
+        }
+
+        #[test]
+        fn steenrod_module_from_json_c2() {
+            Python::initialize();
+            Python::attach(|py| {
+                let m = c2_module(py);
+                assert_eq!(m.prime(), 2);
+                assert_eq!(m.min_degree(), 0);
+                assert_eq!(m.dimension(0), 1);
+                assert_eq!(m.dimension(1), 1);
+                assert_eq!(m.dimension(2), 0);
+                assert_eq!(m.basis_element_to_string(0, 0).unwrap(), "x0");
+            });
+        }
+
+        #[test]
+        fn fdmodule_into_steenrod_module_matches() {
+            Python::initialize();
+            Python::attach(|py| {
+                let algebra = Py::new(py, SteenrodAlgebra::milnor(2, false).unwrap()).unwrap();
+                let mut m = FDModule::new(algebra.borrow(py), "C2".to_string(), vec![1, 1], 0);
+                m.set_action(1, 0, 0, 0, vec![1]).unwrap();
+                let boxed = m.into_steenrod_module();
+                assert_eq!(boxed.prime(), m.prime());
+                assert_eq!(boxed.dimension(0), m.dimension(0));
+                assert_eq!(boxed.dimension(1), m.dimension(1));
+            });
+        }
+
+        #[test]
+        fn freemodule_add_generators_and_opgen() {
+            Python::initialize();
+            Python::attach(|py| {
+                let algebra = Py::new(py, SteenrodAlgebra::milnor(2, false).unwrap()).unwrap();
+                let m = FreeModule::new(algebra.borrow(py), "F".to_string(), 0);
+                m.compute_basis(4);
+                // One generator in degree 0.
+                m.add_generators(0, 1, None).unwrap();
+                assert_eq!(m.number_of_gens_in_degree(0), 1);
+                // dimension(t) = dimension of the algebra in degree t (one gen).
+                assert_eq!(m.dimension(0), 1);
+                assert_eq!(m.dimension(1), 1); // Sq1
+                assert_eq!(m.dimension(2), 1); // Sq2
+                assert_eq!(m.dimension(3), 2); // Sq3, Sq2 Sq1
+
+                // index_to_op_gen of basis element in degree 1 is (Sq1, gen 0).
+                let opgen = m.index_to_op_gen(1, 0).unwrap();
+                assert_eq!(opgen.generator_degree(), 0);
+                assert_eq!(opgen.generator_index(), 0);
+                assert_eq!(opgen.operation_degree(), 1);
+
+                // Out-of-range index raises.
+                assert!(m.index_to_op_gen(1, 9).is_err());
+            });
+        }
+
+        #[test]
+        fn steenrod_module_from_json_prime_mismatch_raises() {
+            Python::initialize();
+            Python::attach(|py| {
+                // A p = 3 algebra against a p = 2 spec must raise, not panic
+                // (upstream would index `actions` out of bounds).
+                let algebra = Py::new(py, SteenrodAlgebra::milnor(3, false).unwrap()).unwrap();
+                let dict = pyo3::types::PyDict::new(py);
+                dict.set_item("p", 2).unwrap();
+                dict.set_item("type", "finite dimensional module").unwrap();
+                let gens = pyo3::types::PyDict::new(py);
+                gens.set_item("x0", 0).unwrap();
+                gens.set_item("x1", 1).unwrap();
+                dict.set_item("gens", gens).unwrap();
+                dict.set_item("actions", vec!["Sq1 x0 = x1"]).unwrap();
+                match steenrod_module_from_json(algebra.borrow(py), dict.as_any()) {
+                    Ok(_) => panic!("expected a prime-mismatch error"),
+                    Err(err) => assert!(err.is_instance_of::<PyValueError>(py)),
+                }
+            });
+        }
+
+        #[test]
+        fn freemodule_total_dimension_unbounded_raises() {
+            Python::initialize();
+            Python::attach(|py| {
+                let algebra = Py::new(py, SteenrodAlgebra::milnor(2, false).unwrap()).unwrap();
+                let m = FreeModule::new(algebra.borrow(py), "F".to_string(), 0);
+                m.add_generators(0, 1, None).unwrap();
+                // FreeModule is unbounded above -> total_dimension raises.
+                assert!(m.total_dimension().is_err());
             });
         }
     }
