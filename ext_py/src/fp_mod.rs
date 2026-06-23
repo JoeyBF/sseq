@@ -358,6 +358,35 @@ pub mod fp_py {
         }
     }
 
+    /// Guard that a matrix has had its pivots initialized (via `row_reduce`)
+    /// before a `compute_*` method reads them.
+    ///
+    /// Upstream's `compute_kernel`/`compute_image`/`compute_quasi_inverse(s)`
+    /// funnel through `Matrix::find_first_row_in_block`, which slices
+    /// `pivots[first_source_col..]`. `pivots` is an empty `Vec` until row
+    /// reduction (`row_reduce` calls `initialize_pivots`, which resizes it to
+    /// `columns`), so with a positive `first_source_col` the slice range would
+    /// be out of bounds and panic across the PyO3 boundary.
+    ///
+    /// The only two reachable pivot states in the upstream API are "empty"
+    /// (never initialized) or "length == columns" (initialized by
+    /// `initialize_pivots`/`row_reduce`/`extend_column_dimension`); there is no
+    /// partial-pivots state. We therefore use `pivots().len() == columns()` as
+    /// the exact "initialized" invariant. We deliberately raise an explicit
+    /// error rather than silently row-reducing, since auto-reduction would
+    /// mutate the matrix and change observable state. Note this guards only the
+    /// panic: an `initialize_pivots`-only matrix passes the check but is not a
+    /// true rref, so callers are still responsible for having row reduced.
+    fn ensure_pivots_initialized(pivots_len: usize, columns: usize) -> PyResult<()> {
+        if pivots_len == columns {
+            Ok(())
+        } else {
+            Err(PyValueError::new_err(
+                "matrix must be row-reduced before compute_*",
+            ))
+        }
+    }
+
     #[pymethods]
     impl PyFp {
         #[new]
@@ -1213,6 +1242,7 @@ pub mod fp_py {
             first_source_col: usize,
         ) -> PyResult<PyQuasiInverse> {
             let columns = self.0.columns();
+            ensure_pivots_initialized(self.0.pivots().len(), columns)?;
             if last_target_col > columns {
                 return Err(PyIndexError::new_err(format!(
                     "last_target_col {last_target_col} out of range for matrix with {columns} columns"
@@ -1970,9 +2000,11 @@ pub mod fp_py {
 
                 /// Compute the kernel of the augmented matrix (which must be row
                 /// reduced), returning an owned `Subspace`. Available for all
-                /// arities.
-                fn compute_kernel(&self) -> PySubspace {
-                    PySubspace(self.0.compute_kernel())
+                /// arities. Raises `ValueError` if the matrix has not been row
+                /// reduced (its pivots are uninitialized), instead of panicking.
+                fn compute_kernel(&self) -> PyResult<PySubspace> {
+                    ensure_pivots_initialized(self.0.pivots().len(), self.0.columns())?;
+                    Ok(PySubspace(self.0.compute_kernel()))
                 }
 
                 /// Return the inner `Matrix` as an owned `Matrix`.
@@ -2000,15 +2032,20 @@ pub mod fp_py {
 
     augmented_matrix_pyclass!(PyAugmentedMatrix2, "AugmentedMatrix2", 2, {
         /// Compute the image of the augmented matrix `[A | I]` (which must be
-        /// row reduced), returning an owned `Subspace`.
-        fn compute_image(&self) -> PySubspace {
-            PySubspace(self.0.compute_image())
+        /// row reduced), returning an owned `Subspace`. Raises `ValueError` if
+        /// the matrix has not been row reduced, instead of panicking.
+        fn compute_image(&self) -> PyResult<PySubspace> {
+            ensure_pivots_initialized(self.0.pivots().len(), self.0.columns())?;
+            Ok(PySubspace(self.0.compute_image()))
         }
 
         /// Compute the quasi-inverse of the augmented matrix `[A | I]` (which
-        /// must be row reduced), returning an owned `QuasiInverse`.
-        fn compute_quasi_inverse(&self) -> PyQuasiInverse {
-            PyQuasiInverse(self.0.compute_quasi_inverse())
+        /// must be row reduced), returning an owned `QuasiInverse`. Raises
+        /// `ValueError` if the matrix has not been row reduced, instead of
+        /// panicking.
+        fn compute_quasi_inverse(&self) -> PyResult<PyQuasiInverse> {
+            ensure_pivots_initialized(self.0.pivots().len(), self.0.columns())?;
+            Ok(PyQuasiInverse(self.0.compute_quasi_inverse()))
         }
     });
 
@@ -2020,9 +2057,13 @@ pub mod fp_py {
         /// Upstream `compute_quasi_inverses` consumes and heavily mutates the
         /// matrix; since PyO3 cannot move out of a borrowed pyclass we operate
         /// on a clone, leaving the original augmented matrix unchanged.
-        fn compute_quasi_inverses(&self) -> (PyQuasiInverse, PyQuasiInverse) {
+        ///
+        /// Raises `ValueError` if the matrix has not been row reduced (its
+        /// pivots are uninitialized), instead of panicking.
+        fn compute_quasi_inverses(&self) -> PyResult<(PyQuasiInverse, PyQuasiInverse)> {
+            ensure_pivots_initialized(self.0.pivots().len(), self.0.columns())?;
             let (a, b) = self.0.clone().compute_quasi_inverses();
-            (PyQuasiInverse(a), PyQuasiInverse(b))
+            Ok((PyQuasiInverse(a), PyQuasiInverse(b)))
         }
     });
 
@@ -3014,10 +3055,10 @@ pub mod fp_py {
             // Put A = identity in segment 0 as well so [I | I]; image is full.
             m.add_identity(0, 0).unwrap();
             m.row_reduce();
-            let image = m.compute_image();
+            let image = m.compute_image().unwrap();
             assert_eq!(image.prime(), 2);
             assert_eq!(image.dimension(), 2);
-            let qi = m.compute_quasi_inverse();
+            let qi = m.compute_quasi_inverse().unwrap();
             assert_eq!(qi.prime(), 2);
             assert_eq!(qi.source_dimension(), 2);
             // into_matrix returns an owned Matrix leaving the original usable.
@@ -3034,11 +3075,98 @@ pub mod fp_py {
             m.add_identity(1, 1).unwrap();
             m.add_identity(2, 2).unwrap();
             m.row_reduce();
-            let ker = m.compute_kernel();
+            let ker = m.compute_kernel().unwrap();
             assert_eq!(ker.prime(), 3);
-            let (a, b) = m.compute_quasi_inverses();
+            // [A | B | I] with all identity blocks: A is the identity, so it is
+            // injective and surjective. The kernel of an injective map is zero.
+            assert_eq!(ker.dimension(), 0);
+            let (a, b) = m.compute_quasi_inverses().unwrap();
             assert_eq!(a.prime(), 3);
             assert_eq!(b.prime(), 3);
+            // A = I is surjective onto F3^2, so its quasi-inverse has source
+            // and target dimension 2; the residual quasi-inverse is then trivial
+            // (target dimension 0).
+            assert_eq!(a.source_dimension(), 2);
+            assert_eq!(a.target_dimension(), 2);
+            // The residual quasi-inverse b inverts B (= I) on the kernel of A.
+            // With every block the 2x2 identity it is itself a full-rank 2->2
+            // map, so its source, target and image dimensions are all 2.
+            assert_eq!(b.source_dimension(), 2);
+            assert_eq!(b.target_dimension(), 2);
+            assert_eq!(b.image_dimension(), 2);
+        }
+
+        #[test]
+        fn augmented_matrix_compute_requires_row_reduce() {
+            // Reproduction from the review: compute_* on a freshly constructed
+            // (not row-reduced) augmented matrix must raise ValueError rather
+            // than panic across the boundary on the empty-pivots slice.
+            Python::initialize();
+            Python::attach(|py| {
+                let m2 = PyAugmentedMatrix2::new(2, 2, vec![2, 2]).unwrap();
+                for err in [
+                    unwrap_py_err(m2.compute_kernel()),
+                    unwrap_py_err(m2.compute_image()),
+                    unwrap_py_err(m2.compute_quasi_inverse()),
+                ] {
+                    assert!(err.is_instance_of::<PyValueError>(py));
+                }
+
+                let m3 = PyAugmentedMatrix3::new(3, 2, vec![2, 2, 2]).unwrap();
+                assert!(unwrap_py_err(m3.compute_kernel()).is_instance_of::<PyValueError>(py));
+                assert!(
+                    unwrap_py_err(m3.compute_quasi_inverses()).is_instance_of::<PyValueError>(py)
+                );
+
+                // A bare Matrix.compute_quasi_inverse shares the gap.
+                let raw = PyMatrix::new(2, 2, 4).unwrap();
+                assert!(unwrap_py_err(raw.compute_quasi_inverse(2, 2))
+                    .is_instance_of::<PyValueError>(py));
+            });
+        }
+
+        #[test]
+        fn augmented_matrix2_compute_nontrivial_values() {
+            // The Python layer cannot yet set arbitrary interior entries of an
+            // augmented matrix (no MatrixSliceMut / segment-mut binding), so we
+            // build a non-trivial example directly with the upstream API.
+            //
+            // This mirrors the F3 doctest of `Matrix::compute_image` /
+            // `Matrix::compute_quasi_inverse` (matrix_inner.rs), with the same
+            // rank-2 input A and the committed expected image and preimage. We
+            // build [A | I] as an `AugmentedMatrix<2>` with segment widths
+            // [5, 3] (A is 3x5, I is 3x3) so the augmented wrappers exercise the
+            // same code path as the bare-matrix doctest.
+            let p = valid_prime(3).unwrap();
+            let a = [
+                vec![1, 2, 1, 1, 0],
+                vec![1, 0, 2, 1, 1],
+                vec![2, 2, 0, 2, 1],
+            ];
+            let mut aug = RustAugmentedMatrix::<2>::new(p, 3, [5, 3]);
+            for (i, row) in a.iter().enumerate() {
+                for (j, &v) in row.iter().enumerate() {
+                    aug.inner.row_mut(i).set_entry(j, v);
+                }
+            }
+            aug.segment(1, 1).add_identity();
+            aug.row_reduce();
+
+            let m2 = PyAugmentedMatrix2(aug);
+
+            // Image basis and dimension exactly as in the upstream doctest:
+            // image = [[1,0,2,1,1],[0,1,1,0,1]], a 2-dim subspace of F3^5.
+            let image = m2.compute_image().unwrap();
+            assert_eq!(image.dimension(), 2);
+            let image_rows: Vec<Vec<u32>> =
+                image.iter().iter().map(|v| v.0.iter().collect()).collect();
+            assert_eq!(image_rows, vec![vec![1, 0, 2, 1, 1], vec![0, 1, 1, 0, 1]]);
+
+            // Quasi-inverse preimage exactly as in the upstream doctest:
+            // preimage = [[0,1,0],[0,2,2]]; source dimension is 3 (the I block).
+            let qi = m2.compute_quasi_inverse().unwrap();
+            assert_eq!(qi.source_dimension(), 3);
+            assert_eq!(qi.preimage().to_vec(), vec![vec![0, 1, 0], vec![0, 2, 2]]);
         }
     }
 }
