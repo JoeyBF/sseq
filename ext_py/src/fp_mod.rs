@@ -2376,6 +2376,91 @@ pub mod fp_py {
         }
 
         #[test]
+        fn subquotient_subspace_gens_quotient_pivots_dimension() {
+            // Non-trivial subquotient mirroring upstream `test_add_gen`.
+            let mut sq = PySubquotient::new(3, 5).unwrap();
+            sq.quotient(&PyFpVector::from_slice(3, vec![1, 1, 0, 0, 1]).unwrap())
+                .unwrap();
+            sq.quotient(&PyFpVector::from_slice(3, vec![0, 2, 0, 0, 1]).unwrap())
+                .unwrap();
+            sq.add_gen(&PyFpVector::from_slice(3, vec![1, 1, 0, 0, 0]).unwrap())
+                .unwrap();
+            sq.add_gen(&PyFpVector::from_slice(3, vec![0, 1, 0, 0, 0]).unwrap())
+                .unwrap();
+
+            assert_eq!(sq.dimension(), 1);
+            assert_eq!(sq.zeros().dimension(), 2);
+
+            // subspace_dimension == dimension + quotient.dimension().
+            assert_eq!(
+                sq.subspace_dimension(),
+                sq.dimension() + sq.zeros().dimension()
+            );
+            assert_eq!(sq.subspace_dimension(), 3);
+
+            // subspace_gens chains gens() with the quotient basis.
+            let subspace_gens: Vec<Vec<u32>> = sq
+                .subspace_gens()
+                .iter()
+                .map(|v| v.0.iter().collect())
+                .collect();
+            assert_eq!(
+                subspace_gens,
+                vec![
+                    vec![0, 0, 0, 0, 1],
+                    vec![1, 0, 0, 0, 2],
+                    vec![0, 1, 0, 0, 2],
+                ]
+            );
+
+            // quotient_pivots: pivots[col] = pivot row index, else -1.
+            assert_eq!(sq.quotient_pivots(), vec![0, 1, -1, -1, -1]);
+        }
+
+        #[test]
+        fn subquotient_reduce_matrix_values_with_nontrivial_quotient() {
+            // source = full dim-2 space: gens [1,0] and [0,1].
+            let source = PySubquotient::new_full(3, 2).unwrap();
+
+            // target has a non-trivial quotient killing column 1, gen [1,0].
+            let mut target = PySubquotient::new(3, 2).unwrap();
+            target
+                .quotient(&PyFpVector::from_slice(3, vec![0, 1]).unwrap())
+                .unwrap();
+            target
+                .add_gen(&PyFpVector::from_slice(3, vec![1, 0]).unwrap())
+                .unwrap();
+
+            // apply computes input * matrix: gen [1,0] -> [2,1]; [0,1] -> [0,1].
+            let m = PyMatrix::from_vec(3, vec![vec![2, 1], vec![0, 1]]).unwrap();
+
+            // Reduced in target: [2,1] -> [2]; [0,1] -> [0].
+            let result = PySubquotient::reduce_matrix(&m, &source, &target).unwrap();
+            assert_eq!(result, vec![vec![2], vec![0]]);
+
+            // Dimension/prime mismatches raise.
+            let bad_rows = PyMatrix::from_vec(3, vec![vec![1, 0], vec![0, 1], vec![0, 0]]).unwrap();
+            assert!(PySubquotient::reduce_matrix(&bad_rows, &source, &target).is_err());
+            let bad_cols = PyMatrix::from_vec(3, vec![vec![1, 0, 0], vec![0, 1, 0]]).unwrap();
+            assert!(PySubquotient::reduce_matrix(&bad_cols, &source, &target).is_err());
+            let bad_prime = PyMatrix::from_vec(5, vec![vec![1, 0], vec![0, 1]]).unwrap();
+            assert!(PySubquotient::reduce_matrix(&bad_prime, &source, &target).is_err());
+        }
+
+        #[test]
+        fn subquotient_set_to_full_stale_dimension() {
+            // set_to_full clears the quotient and fills gens, but upstream does
+            // NOT sync the cached `dimension`. Pin the surprising current state.
+            let mut sq = PySubquotient::new(2, 3).unwrap();
+            sq.set_to_full();
+            assert_eq!(sq.zeros().dimension(), 0);
+            // Stale: dimension stays 0 while gens() actually has 3 rows.
+            assert_eq!(sq.dimension(), 0);
+            assert_eq!(sq.__len__(), 0);
+            assert_eq!(sq.gens().len(), 3);
+        }
+
+        #[test]
         fn subquotient_new_full_and_from_parts() {
             let full = PySubquotient::new_full(2, 4).unwrap();
             assert_eq!(full.dimension(), 4);
