@@ -5789,7 +5789,20 @@ pub mod algebra_py {
         ) -> PyResult<Self> {
             Self::check_same_algebra(&source.0, &target.0)?;
             let p = source.0.prime().as_u32();
-            let min_degree = min_degree.unwrap_or_else(|| target.0.min_degree());
+            let target_min = target.0.min_degree();
+            let min_degree = min_degree.unwrap_or(target_min);
+            // Upstream `FullModuleHomomorphism::from_matrices` always builds the
+            // kernels/images/quasi_inverses `OnceBiVec`s starting at
+            // `target.min_degree()`, regardless of the `matrices` BiVec's min.
+            // A `min_degree` below `target.min_degree()` would therefore record
+            // matrices whose auxiliary data is never computed — a silent
+            // correctness surprise. Reject it up front.
+            if min_degree < target_min {
+                return Err(PyValueError::new_err(format!(
+                    "min_degree {min_degree} is below the target min_degree {target_min}; \
+                     auxiliary data is only computed at and above target.min_degree()"
+                )));
+            }
             let mut bivec = ::bivec::BiVec::new(min_degree);
             for (offset, m) in matrices.iter().enumerate() {
                 let offset = i32::try_from(offset)
@@ -8018,6 +8031,45 @@ pub mod algebra_py {
                     None,
                 )
                 .is_err());
+            });
+        }
+
+        #[test]
+        fn full_mh_from_matrices_rejects_min_degree_below_target_min() {
+            Python::initialize();
+            Python::attach(|py| {
+                let algebra = Py::new(py, SteenrodAlgebra::milnor(2, false).unwrap()).unwrap();
+                let m = Py::new(py, c2_module_over(py, &algebra)).unwrap();
+                let target_min = m.borrow(py).0.min_degree();
+                assert_eq!(target_min, 0);
+                // min_degree below target.min_degree() would record matrices
+                // whose auxiliary data is never computed -> rejected.
+                assert!(FullModuleHomomorphism::from_matrices(
+                    m.borrow(py),
+                    m.borrow(py),
+                    vec![],
+                    0,
+                    Some(target_min - 1),
+                )
+                .is_err());
+                // min_degree == target.min_degree() is accepted.
+                assert!(FullModuleHomomorphism::from_matrices(
+                    m.borrow(py),
+                    m.borrow(py),
+                    vec![],
+                    0,
+                    Some(target_min),
+                )
+                .is_ok());
+                // The default (None) path is unaffected.
+                assert!(FullModuleHomomorphism::from_matrices(
+                    m.borrow(py),
+                    m.borrow(py),
+                    vec![],
+                    0,
+                    None,
+                )
+                .is_ok());
             });
         }
     }
