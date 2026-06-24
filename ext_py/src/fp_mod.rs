@@ -407,6 +407,7 @@ pub mod fp_py {
             self.value.take().ok_or_else(|| consumed_error(self.label))
         }
 
+        #[cfg_attr(not(test), allow(dead_code))]
         pub(crate) fn is_consumed(&self) -> bool {
             self.value.is_none()
         }
