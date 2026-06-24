@@ -21,10 +21,10 @@ def adem(p=2):
 
 
 def make_c2(algebra):
-    """Build a C2 SteenrodModule over the given algebra via an FDModule."""
-    m = algebra_py.FDModule(algebra, "C2", [1, 1])
+    """Build a C2 SteenrodModule over the given algebra via an FDModuleBuilder."""
+    m = algebra_py.FDModuleBuilder(algebra, "C2", [1, 1])
     m.set_action(1, 0, 0, 0, [1])
-    return m.into_steenrod_module()
+    return m.build()
 
 
 # --- TensorModule ---------------------------------------------------------
@@ -78,7 +78,7 @@ def test_tensor_module_offset_empty_block_raises():
     # range [0, 2] but addresses an empty block; upstream would index
     # `blocks[1][0]` out of bounds. We must raise IndexError, not panic.
     algebra = milnor(2)
-    gap = algebra_py.FDModule(algebra, "g", [1, 0, 1]).into_steenrod_module()
+    gap = algebra_py.FDModuleBuilder(algebra, "g", [1, 0, 1]).build()
     t = algebra_py.TensorModule(gap, make_c2(algebra))
     t.compute_basis(4)
     assert gap.dimension(1) == 0
@@ -143,9 +143,9 @@ def test_tensor_module_odd_prime_action_runs():
     # hand value.
     algebra = adem(3)
     # A two-cell module with a degree-1 generator carrying a Bockstein action.
-    m = algebra_py.FDModule(algebra, "M", [1, 1])
+    m = algebra_py.FDModuleBuilder(algebra, "M", [1, 1])
     m.set_action(1, 0, 0, 0, [1])  # beta . x0 = x1
-    m = m.into_steenrod_module()
+    m = m.build()
     t = algebra_py.TensorModule(m, m)
     t.compute_basis(6)
     # Dimensions: convolution of [1, 1] with [1, 1] = [1, 2, 1].
