@@ -1,52 +1,47 @@
 #!/usr/bin/env python3
-"""
-Compute tensor product of two modules.
-Python translation of tensor.rs example.
+"""Tensor two modules together and print the result as module JSON.
+
+Python port of ext/examples/tensor.rs.
 """
 
-import ext_py
 import json
+
+import _query as query
+import ext_py
+from ext_py import algebra_py
 
 
 def main():
-    # Get left module
-    left_name = input("Left module (default 'S_2'): ").strip() or "S_2"
-    left_module_json = ext_py.parse_module_name(left_name)
+    left = query.with_default("Left module", "S_2", ext_py.parse_module_name)
+    p = left["p"]
 
-    p = left_module_json["p"]
+    def parse_right(name):
+        module = ext_py.parse_module_name(name)
+        if module["p"] != p:
+            raise ValueError("Two modules must be over the same prime")
+        return module
 
-    # Get right module (must have same prime)
-    while True:
-        right_name = input("Right module (default 'S_2'): ").strip() or "S_2"
-        right_module_json = ext_py.parse_module_name(right_name)
+    right = query.with_default("Right module", "S_2", parse_right)
 
-        if right_module_json["p"] == p:
-            break
-        else:
-            print("Error: Two modules must be over the same prime")
+    algebra = algebra_py.SteenrodAlgebra.adem(p)
 
-    # Create algebra
-    algebra = ext_py.SteenrodAlgebra.adem_algebra(prime=p, truncated=False)
+    left_module = algebra_py.steenrod_module_from_json(algebra, left)
+    right_module = algebra_py.steenrod_module_from_json(algebra, right)
 
-    # Load modules from JSON
-    left_module = ext_py.steenrod_module_from_json(algebra, left_module_json)
-    right_module = ext_py.steenrod_module_from_json(algebra, right_module_json)
+    tensor_module = algebra_py.TensorModule(left_module, right_module)
 
-    # Create tensor product
-    tensor_module = ext_py.TensorModule(left_module, right_module)
-
-    # Convert to finite dimensional module for output.
+    # Convert to a finite dimensional module for output.
     # NOTE: `from_tensor_module` is NOT yet bound (aspirational API); the class
     # was renamed FDModule -> FDModuleBuilder, but this conversion constructor is
     # still pending in the bindings. This line will not run until it is bound.
-    fd_tensor = ext_py.FDModuleBuilder.from_tensor_module(tensor_module)
-    fd_tensor.name = ""
+    tensor = algebra_py.FDModuleBuilder.from_tensor_module(tensor_module)
+    tensor.name = ""
 
-    # Output as JSON
     output = {"p": p}
-    output.update(fd_tensor.to_json())
+    output.update(tensor.to_json())
 
-    print(json.dumps(output, indent=2))
+    # serde_json's Display is compact (no spaces) and preserves insertion order.
+    print(json.dumps(output, separators=(",", ":"), ensure_ascii=False))
 
 
 if __name__ == "__main__":

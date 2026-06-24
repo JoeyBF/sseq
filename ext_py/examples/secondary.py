@@ -1,50 +1,45 @@
 #!/usr/bin/env python3
-"""
-Compute d_2 differentials in the Adams spectral sequence.
-Python translation of secondary.rs example.
+"""Compute d_2 differentials in the Adams spectral sequence (Milnor basis only).
+
+Differentials are omitted where the target bidegree is zero.
+
+Python port of ext/examples/secondary.rs.
 """
 
 import os
+
+import _query as query
 import ext_py
 from ext_py import algebra_py, sseq_py
 
 
 def main():
-    # Query for module (must use Milnor basis)
-    resolution = ext_py.query_module(
-        algebra_type=algebra_py.AlgebraType.Milnor, save=True
-    )
+    resolution = query.query_module(algebra_py.AlgebraType.Milnor)
 
-    # Create secondary resolution
     lift = ext_py.SecondaryResolution(resolution)
 
-    # Check for distributed computation
     secondary_job = os.environ.get("SECONDARY_JOB")
-    if secondary_job:
-        s = int(secondary_job)
-        lift.compute_partial(s)
+    if secondary_job is not None:
+        lift.compute_partial(int(secondary_job))
         return
 
-    # Extend all homotopies
     lift.extend_all()
 
-    # d_2 differential has bidegree shift (-1, 2)
     d2_shift = sseq_py.Bidegree.n_s(-1, 2)
 
-    # Iterate through targets of d_2
-    for bidegree in lift.underlying().iter_nonzero_stem():
-        if bidegree.s < 3:
+    # Iterate through the target of the d2.
+    for b in lift.underlying().iter_nonzero_stem():
+        if b.s() < 3:
+            continue
+        if b.t() - 1 > resolution.module(b.s() - 2).max_computed_degree():
             continue
 
-        if bidegree.t - 1 > resolution.module(bidegree.s - 2).max_computed_degree():
-            continue
-
-        homotopy = lift.homotopy(bidegree.s)
-        m = homotopy.homotopies.hom_k(bidegree.t - 1)
+        homotopy = lift.homotopy(b.s())
+        m = homotopy.homotopies.hom_k(b.t() - 1)
 
         for i, entry in enumerate(m):
-            source_gen = ext_py.BidegreeGenerator(bidegree - d2_shift, i)
-            print(f"d_2 x_{source_gen} = {entry}")
+            source_gen = sseq_py.BidegreeGenerator(b - d2_shift, i)
+            print(f"d_2 x_{source_gen} = {list(entry)}")
 
 
 if __name__ == "__main__":
