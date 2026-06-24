@@ -7224,5 +7224,104 @@ pub mod algebra_py {
                 assert!(hom.differential_density(9).is_err());
             });
         }
+
+        /// Build `f: F -> C2` with `degree_shift = 1`, where `F` has a single
+        /// generator `g` in degree 1 and `f(g) = x0` (the bottom cell of `C2`,
+        /// living in target degree `1 - degree_shift = 0`). Mirrors the Python
+        /// `c2_differential_shift` helper; see `free_module_homomorphism.rs`
+        /// (`output_degree = input_degree - degree_shift`, lines 64/83) for the
+        /// expected values.
+        fn c2_differential_shift(
+            py: Python<'_>,
+        ) -> (FreeModuleHomomorphism, ::fp::prime::ValidPrime) {
+            let p = ::fp::prime::ValidPrime::new(2);
+            let algebra = Py::new(py, SteenrodAlgebra::milnor(2, false).unwrap()).unwrap();
+            let source =
+                Py::new(py, FreeModule::new(algebra.borrow(py), "F".to_string(), 0)).unwrap();
+            source.borrow(py).compute_basis(3);
+            // No generators in degree 0; a single generator g in degree 1.
+            source.borrow(py).0.add_generators(0, 0, None);
+            source.borrow(py).0.add_generators(1, 1, None);
+            source.borrow(py).0.add_generators(2, 0, None);
+            source.borrow(py).0.compute_basis(3);
+            let target = Py::new(py, c2_module_over(py, &algebra)).unwrap();
+            let hom = FreeModuleHomomorphism::new(source.borrow(py), target.borrow(py), 1).unwrap();
+            // f(g) = x0 = [1] in target degree 0 (dimension 1); the outputs
+            // table starts at min_degree = max(0, 0 + 1) = 1.
+            let mut row = ::fp::vector::FpVector::new(p, 1);
+            row.set_entry(0, 1);
+            hom.0.add_generators_from_rows(1, vec![row]);
+            (hom, p)
+        }
+
+        #[test]
+        fn fmh_degree_shift_known_values() {
+            Python::initialize();
+            Python::attach(|py| {
+                let (hom, _) = c2_differential_shift(py);
+                assert_eq!(hom.degree_shift(), 1);
+                assert_eq!(hom.min_degree(), 1);
+                assert_eq!(hom.next_degree(), 2);
+
+                // output(1, 0) = x0 = [1] in target degree 0.
+                assert_eq!(hom.output(1, 0).unwrap().entry(0).unwrap(), 1);
+
+                // apply_to_basis_element(degree 1, idx 0) = f(g) = x0 = [1]
+                // (target degree 1 - 1 = 0).
+                let res0 = Py::new(py, crate::fp_py::PyFpVector::new(2, 1).unwrap()).unwrap();
+                hom.apply_to_basis_element(py, res0.bind(py).as_any(), 1, 1, 0)
+                    .unwrap();
+                assert_eq!(res0.borrow(py).entry(0).unwrap(), 1);
+
+                // apply_to_basis_element(degree 2, idx 0) = f(Sq1 . g)
+                // = Sq1 . x0 = x1 = [1] (target degree 2 - 1 = 1).
+                let res1 = Py::new(py, crate::fp_py::PyFpVector::new(2, 1).unwrap()).unwrap();
+                hom.apply_to_basis_element(py, res1.bind(py).as_any(), 1, 2, 0)
+                    .unwrap();
+                assert_eq!(res1.borrow(py).entry(0).unwrap(), 1);
+
+                // apply_to_generator agrees with output.
+                let res2 = Py::new(py, crate::fp_py::PyFpVector::new(2, 1).unwrap()).unwrap();
+                hom.apply_to_generator(py, res2.bind(py).as_any(), 1, 1, 0)
+                    .unwrap();
+                assert_eq!(res2.borrow(py).entry(0).unwrap(), 1);
+            });
+        }
+
+        #[test]
+        fn fmh_degree_shift_get_partial_matrix_guard() {
+            Python::initialize();
+            Python::attach(|py| {
+                let (hom, _) = c2_differential_shift(py);
+                // degree 1: target.dimension(1) == target.dimension(0) == 1, so
+                // the matrix is well-defined (a 1x1 matrix [[1]]).
+                let m = hom.get_partial_matrix(1, vec![0]).unwrap();
+                assert_eq!(m.rows(), 1);
+                assert_eq!(m.columns(), 1);
+                assert_eq!(m.to_vec(), vec![vec![1]]);
+
+                // degree 2: target.dimension(2) = 0 but target.dimension(1) = 1,
+                // so the documented guard raises rather than panicking.
+                assert!(hom.get_partial_matrix(2, vec![0]).is_err());
+
+                // output above next_degree raises (not panic).
+                assert!(hom.output(2, 0).is_err());
+                // output below min_degree raises (not panic).
+                assert!(hom.output(0, 0).is_err());
+            });
+        }
+
+        #[test]
+        fn fmh_auxiliary_data_out_of_sync_raises() {
+            Python::initialize();
+            Python::attach(|py| {
+                let (hom, _) = c2_differential(py);
+                // Advance only the images table; the three auxiliary tables are
+                // now out of sync and `compute_auxiliary_data_through_degree`
+                // must raise rather than letting `push_checked` panic.
+                hom.set_image(0, None).unwrap();
+                assert!(hom.compute_auxiliary_data_through_degree(0).is_err());
+            });
+        }
     }
 }
