@@ -2386,7 +2386,18 @@ pub mod algebra_py {
             let output_degree = input_degree
                 .checked_add(op_degree)
                 .ok_or_else(|| PyValueError::new_err("output degree overflows i32"))?;
+            // Upstream indexes `actions[input_degree][output_degree]`, whose
+            // `BiVec::Index` panics when `output_degree` is outside the module's
+            // graded range (e.g. above `max_degree`). An empty `output` with an
+            // empty (out-of-range) `output_degree` passes the length check but
+            // would then panic, so reject it the same way the `action` getter
+            // does: an empty output degree is a `ValueError`.
             let out_dim = module_dimension(&self.0, output_degree);
+            if out_dim == 0 {
+                return Err(PyValueError::new_err(format!(
+                    "output degree {output_degree} is empty"
+                )));
+            }
             checked_equal_len(output.len(), out_dim)?;
             let p = self.0.prime().as_u32();
             for v in &output {
@@ -2464,6 +2475,12 @@ pub mod algebra_py {
         }
 
         /// Box this module into a `SteenrodModule` for downstream use.
+        ///
+        /// This returns an independent snapshot: the `FDModule` is deep-cloned
+        /// into the boxed `SteenrodModule`, so later `set_action`/`add_generator`
+        /// calls on this `FDModule` do *not* propagate to the returned module.
+        /// (`FreeModule.into_steenrod_module`, by contrast, shares state via an
+        /// `Arc`.)
         pub fn into_steenrod_module(&self) -> SteenrodModule {
             SteenrodModule(steenrod_module::erase(self.0.clone()))
         }
@@ -2481,6 +2498,23 @@ pub mod algebra_py {
     impl FreeModule {
         fn as_dyn(&self) -> &DynModule {
             &*self.0
+        }
+
+        /// The number of generators in `degree`, returning 0 (never panicking)
+        /// for degrees outside the populated `num_gens` range. Upstream
+        /// `number_of_gens_in_degree` only guards `degree < min_degree` and then
+        /// indexes `num_gens[degree]`, whose `OnceBiVec::Index` asserts
+        /// `degree < num_gens.len()`. `num_gens` is extended only by
+        /// `add_generators`/`extend_by_zero` (not by `compute_basis`), and its
+        /// populated upper bound is exactly `max_computed_degree()` (defined
+        /// upstream as `num_gens.max_degree() == num_gens.len() - 1`). So a
+        /// degree `>= min_degree` but `> max_computed_degree()` has no
+        /// generators added yet and must read as 0 rather than panic.
+        fn num_gens_safe(&self, degree: i32) -> usize {
+            if degree < self.0.min_degree() || degree > self.0.max_computed_degree() {
+                return 0;
+            }
+            self.0.number_of_gens_in_degree(degree)
         }
     }
 
@@ -2618,8 +2652,15 @@ pub mod algebra_py {
 
         // --- FreeModule-specific (thin) ---------------------------------------
 
-        /// Add `num_gens` generators in `degree`, optionally naming them. Raises
-        /// `ValueError` if `degree < min_degree` (upstream asserts).
+        /// Add `num_gens` generators in `degree`, optionally naming them.
+        /// Generators must be added at exactly the next consecutive degree:
+        /// upstream `add_generators` does `num_gens.push_checked(.., degree)`,
+        /// whose `OnceBiVec::push_checked` asserts the appended index equals
+        /// `degree`, i.e. `degree == num_gens.len()`. `num_gens.len()` is
+        /// `max_computed_degree() + 1` (upstream `max_computed_degree` returns
+        /// `num_gens.max_degree() == num_gens.len() - 1`). Raises `ValueError`
+        /// for `degree < min_degree`, for a non-consecutive degree (a gap must
+        /// be filled with `extend_by_zero` first), or for re-adding a degree.
         #[pyo3(signature = (degree, num_gens, names = None))]
         pub fn add_generators(
             &self,
@@ -2633,6 +2674,13 @@ pub mod algebra_py {
                     self.0.min_degree()
                 )));
             }
+            let next_expected = self.0.max_computed_degree() + 1;
+            if degree != next_expected {
+                return Err(PyValueError::new_err(format!(
+                    "generators must be added at the next consecutive degree \
+                     {next_expected}, got {degree}; use extend_by_zero to fill gaps"
+                )));
+            }
             if let Some(names) = &names {
                 checked_equal_len(names.len(), num_gens)?;
             }
@@ -2643,8 +2691,12 @@ pub mod algebra_py {
             Ok(())
         }
 
+        /// The number of generators in `degree`. Returns 0 for degrees that
+        /// have not had generators added yet (including a fresh module or any
+        /// degree above the highest generator degree), rather than panicking on
+        /// the upstream `num_gens[degree]` index assertion.
         pub fn number_of_gens_in_degree(&self, degree: i32) -> usize {
-            self.0.number_of_gens_in_degree(degree)
+            self.num_gens_safe(degree)
         }
 
         /// The generator names up to the maximum computed generator degree, as a
@@ -2667,7 +2719,7 @@ pub mod algebra_py {
                     self.0.min_degree()
                 )));
             }
-            if gen_index >= self.0.number_of_gens_in_degree(gen_degree) {
+            if gen_index >= self.num_gens_safe(gen_degree) {
                 return Err(PyIndexError::new_err(format!(
                     "generator index {gen_index} out of range in degree {gen_degree}"
                 )));
@@ -2722,7 +2774,7 @@ pub mod algebra_py {
                     self.0.min_degree()
                 )));
             }
-            if gen_index >= self.0.number_of_gens_in_degree(gen_degree) {
+            if gen_index >= self.num_gens_safe(gen_degree) {
                 return Err(PyIndexError::new_err(format!(
                     "generator index {gen_index} out of range in degree {gen_degree}"
                 )));
@@ -2757,7 +2809,14 @@ pub mod algebra_py {
         }
 
         /// Iterate the `(degree, index)` of every generator up to `degree`.
+        /// Returns an empty list for `degree < min_degree`: upstream computes
+        /// `take((degree - min_degree + 1) as usize)`, which for a negative
+        /// difference wraps to a huge `usize` and would otherwise yield *all*
+        /// generators.
         pub fn iter_gens(&self, degree: i32) -> Vec<(i32, usize)> {
+            if degree < self.0.min_degree() {
+                return Vec::new();
+            }
             self.0.iter_gens(degree).collect()
         }
 
@@ -3375,6 +3434,157 @@ pub mod algebra_py {
 
                 // Out-of-range index raises.
                 assert!(m.index_to_op_gen(1, 9).is_err());
+            });
+        }
+
+        #[test]
+        fn freemodule_number_of_gens_in_degree_safe() {
+            Python::initialize();
+            Python::attach(|py| {
+                let algebra = Py::new(py, SteenrodAlgebra::milnor(2, false).unwrap()).unwrap();
+                let m = FreeModule::new(algebra.borrow(py), "F".to_string(), 0);
+                // Fresh module: degree 0 has no generators yet -> 0, not panic.
+                assert_eq!(m.number_of_gens_in_degree(0), 0);
+                assert_eq!(m.number_of_gens_in_degree(5), 0);
+                assert_eq!(m.number_of_gens_in_degree(-1), 0);
+                // After adding degree-0 generators, degree 1 (above the
+                // populated range) still reads 0 rather than panicking.
+                m.add_generators(0, 1, None).unwrap();
+                assert_eq!(m.number_of_gens_in_degree(0), 1);
+                assert_eq!(m.number_of_gens_in_degree(1), 0);
+                assert_eq!(m.number_of_gens_in_degree(99), 0);
+            });
+        }
+
+        #[test]
+        #[should_panic]
+        fn confirm_upstream_number_of_gens_in_degree_panics() {
+            // Documents the upstream `num_gens[degree]` index panic the binding
+            // guards against: a fresh module has an empty `num_gens`.
+            Python::initialize();
+            Python::attach(|py| {
+                let algebra = Py::new(py, SteenrodAlgebra::milnor(2, false).unwrap()).unwrap();
+                let m = FreeModule::new(algebra.borrow(py), "F".to_string(), 0);
+                let _ = m.0.number_of_gens_in_degree(0);
+            });
+        }
+
+        #[test]
+        fn freemodule_generator_offset_out_of_range_raises() {
+            Python::initialize();
+            Python::attach(|py| {
+                let algebra = Py::new(py, SteenrodAlgebra::milnor(2, false).unwrap()).unwrap();
+                let m = FreeModule::new(algebra.borrow(py), "F".to_string(), 0);
+                m.add_generators(0, 1, None).unwrap();
+                m.compute_basis(4);
+                // gen_degree above the populated range -> IndexError, not panic.
+                assert!(m.generator_offset(4, 3, 0).is_err());
+                // gen_index out of range in a populated degree -> IndexError.
+                assert!(m.generator_offset(4, 0, 5).is_err());
+                // operation_generator_to_index with the same out-of-range inputs.
+                assert!(m.operation_generator_to_index(0, 0, 3, 0).is_err());
+                assert!(m.operation_generator_to_index(0, 0, 0, 5).is_err());
+                // Happy path still works: op = 1 (identity), gen (0, 0).
+                assert!(m.operation_generator_to_index(0, 0, 0, 0).is_ok());
+            });
+        }
+
+        #[test]
+        fn freemodule_add_generators_consecutive_only() {
+            Python::initialize();
+            Python::attach(|py| {
+                let algebra = Py::new(py, SteenrodAlgebra::milnor(2, false).unwrap()).unwrap();
+                let m = FreeModule::new(algebra.borrow(py), "F".to_string(), 0);
+                // Consecutive happy path.
+                m.add_generators(0, 1, None).unwrap();
+                m.add_generators(1, 1, None).unwrap();
+                // Non-consecutive (gap) raises.
+                assert!(m.add_generators(3, 1, None).is_err());
+                // Duplicate (re-adding the current top degree) raises.
+                assert!(m.add_generators(1, 1, None).is_err());
+                // extend_by_zero fills the gap, then the filled degree works.
+                m.extend_by_zero(3);
+                m.add_generators(4, 1, None).unwrap();
+                assert_eq!(m.number_of_gens_in_degree(4), 1);
+            });
+        }
+
+        #[test]
+        #[should_panic]
+        fn confirm_upstream_add_generators_nonconsecutive_panics() {
+            // Documents the `push_checked` assertion the binding guards against.
+            Python::initialize();
+            Python::attach(|py| {
+                let algebra = Py::new(py, SteenrodAlgebra::milnor(2, false).unwrap()).unwrap();
+                let m = FreeModule::new(algebra.borrow(py), "F".to_string(), 0);
+                m.0.add_generators(0, 1, None);
+                // Skipping degree 1 trips `num_gens.push_checked(.., 2)`.
+                m.0.add_generators(2, 1, None);
+            });
+        }
+
+        #[test]
+        fn freemodule_iter_gens_below_min_degree_empty() {
+            Python::initialize();
+            Python::attach(|py| {
+                let algebra = Py::new(py, SteenrodAlgebra::milnor(2, false).unwrap()).unwrap();
+                let m = FreeModule::new(algebra.borrow(py), "F".to_string(), 0);
+                m.add_generators(0, 1, None).unwrap();
+                m.add_generators(1, 1, None).unwrap();
+                // Below min_degree must be empty, not "all generators".
+                assert!(m.iter_gens(-1).is_empty());
+                // In-range still works.
+                assert_eq!(m.iter_gens(1).len(), 2);
+            });
+        }
+
+        #[test]
+        fn fdmodule_set_action_out_of_range_output_degree_raises() {
+            Python::initialize();
+            Python::attach(|py| {
+                let algebra = Py::new(py, SteenrodAlgebra::milnor(2, false).unwrap()).unwrap();
+                let mut m = FDModule::new(algebra.borrow(py), "C2".to_string(), vec![1, 1], 0);
+                // op_degree 5 lands in output degree 5, above max_degree 1: an
+                // empty output passes the length check but used to panic.
+                assert!(m.set_action(5, 0, 0, 0, vec![]).is_err());
+                // Valid set_action still works.
+                m.set_action(1, 0, 0, 0, vec![1]).unwrap();
+                assert_eq!(m.action(1, 0, 0, 0).unwrap(), vec![1]);
+            });
+        }
+
+        #[test]
+        #[should_panic]
+        fn confirm_upstream_set_action_out_of_range_output_degree_panics() {
+            // Documents the `actions[input][output]` BiVec index panic.
+            Python::initialize();
+            Python::attach(|py| {
+                let algebra = Py::new(py, SteenrodAlgebra::milnor(2, false).unwrap()).unwrap();
+                let mut m = FDModule::new(algebra.borrow(py), "C2".to_string(), vec![1, 1], 0);
+                m.0.set_action(5, 0, 0, 0, &[]);
+            });
+        }
+
+        #[test]
+        fn fdmodule_into_steenrod_module_is_snapshot() {
+            Python::initialize();
+            Python::attach(|py| {
+                let algebra = Py::new(py, SteenrodAlgebra::milnor(2, false).unwrap()).unwrap();
+                let mut m = FDModule::new(algebra.borrow(py), "C2".to_string(), vec![1, 1], 0);
+                let boxed = m.into_steenrod_module();
+                // Mutating the FDModule after boxing does not affect the boxed
+                // snapshot (deep clone, not Arc-shared).
+                m.set_action(1, 0, 0, 0, vec![1]).unwrap();
+                let res = Py::new(
+                    py,
+                    crate::fp_py::PyFpVector::new(2, boxed.dimension(1)).unwrap(),
+                )
+                .unwrap();
+                boxed
+                    .act_on_basis(py, res.bind(py).as_any(), 1, 1, 0, 0, 0)
+                    .unwrap();
+                // The snapshot still has the zero action.
+                assert_eq!(res.borrow(py).entry(0).unwrap(), 0);
             });
         }
 
