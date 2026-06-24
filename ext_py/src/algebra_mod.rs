@@ -2712,45 +2712,14 @@ pub mod algebra_py {
         }
 
         // --- FreeModule-specific (thin) ---------------------------------------
-
-        /// Add `num_gens` generators in `degree`, optionally naming them.
-        /// Generators must be added at exactly the next consecutive degree:
-        /// upstream `add_generators` does `num_gens.push_checked(.., degree)`,
-        /// whose `OnceBiVec::push_checked` asserts the appended index equals
-        /// `degree`, i.e. `degree == num_gens.len()`. `num_gens.len()` is
-        /// `max_computed_degree() + 1` (upstream `max_computed_degree` returns
-        /// `num_gens.max_degree() == num_gens.len() - 1`). Raises `ValueError`
-        /// for `degree < min_degree`, for a non-consecutive degree (a gap must
-        /// be filled with `extend_by_zero` first), or for re-adding a degree.
-        #[pyo3(signature = (degree, num_gens, names = None))]
-        pub fn add_generators(
-            &self,
-            degree: i32,
-            num_gens: usize,
-            names: Option<Vec<String>>,
-        ) -> PyResult<()> {
-            if degree < self.0.min_degree() {
-                return Err(PyValueError::new_err(format!(
-                    "degree {degree} is below the module's min_degree {}",
-                    self.0.min_degree()
-                )));
-            }
-            let next_expected = self.0.max_computed_degree() + 1;
-            if degree != next_expected {
-                return Err(PyValueError::new_err(format!(
-                    "generators must be added at the next consecutive degree \
-                     {next_expected}, got {degree}; use extend_by_zero to fill gaps"
-                )));
-            }
-            if let Some(names) = &names {
-                checked_equal_len(names.len(), num_gens)?;
-            }
-            // `add_generators` reads the algebra/opgen tables up to the current
-            // computed degree, so make sure they are populated through `degree`.
-            module_ensure(self.as_dyn(), degree);
-            self.0.add_generators(degree, num_gens, names);
-            Ok(())
-        }
+        //
+        // `FreeModule` is intentionally query-only from Python: it has no
+        // mutating methods (no `add_generators`/`extend_by_zero`). A populated
+        // `FreeModule` is only ever obtained from a path that owns its
+        // generators (e.g. `FPModule.generators()` or a resolution), so a
+        // handed-out `FreeModule` can never desync the state of whatever module
+        // produced it. Construction of generators happens through the owning
+        // module's builder (`FPModuleBuilder`) or upstream Rust APIs.
 
         /// The number of generators in `degree`. Returns 0 for degrees that
         /// have not had generators added yet (including a fresh module or any
@@ -2862,11 +2831,6 @@ pub mod algebra_py {
             Ok(OperationGeneratorPair(
                 self.0.index_to_op_gen(degree, index).clone(),
             ))
-        }
-
-        /// Add zero generators in every degree up to (and including) `degree`.
-        pub fn extend_by_zero(&self, degree: i32) {
-            self.0.extend_by_zero(degree);
         }
 
         /// Iterate the `(degree, index)` of every generator up to `degree`.
@@ -4286,54 +4250,26 @@ pub mod algebra_py {
     /// of *relations*. Build it by adding generators (in consecutive degrees)
     /// and then relations, or all at once with `from_json`.
     ///
-    /// The inner module is held in an `Arc`. `into_steenrod_module()` shares
-    /// that `Arc` (the `FreeModule` pattern); while a boxed `SteenrodModule`
-    /// from this module is alive the mutating `add_generators`/`add_relations`
-    /// raise `RuntimeError` (the `QuotientModule` pattern), since the box
-    /// observes the same state. Drop every such box to mutate again.
+    /// `FPModule` is an *immutable* view: it has no mutating methods and is not
+    /// directly constructible from Python (no `#[new]`). Obtain one from
+    /// `FPModuleBuilder.build()` or `FPModule.from_json(...)`. The inner module
+    /// is held in an `Arc`; `into_steenrod_module()` shares that `Arc` (the
+    /// `FreeModule` pattern). Because `FPModule` exposes no `add_relations`/
+    /// `add_generators`, the relation-counter desync that a mutable
+    /// `from_json` result could exhibit is impossible by construction.
     #[pyclass(name = "FPModule")]
     pub struct FPModule {
         inner: Arc<FPModuleInner>,
-        /// The degree at which the next batch of relations must be added.
-        /// Upstream pushes relations into an `OnceBiVec` starting at
-        /// `min_degree` via `push_checked`, which asserts the appended index is
-        /// exactly the next one; we track that next degree here so we can raise
-        /// `ValueError` instead of letting the assertion fire. Mutated only by
-        /// `add_relations` (which needs `&mut self` anyway).
-        next_relation_degree: i32,
     }
 
     impl FPModule {
         fn as_dyn(&self) -> &DynModule {
             &*self.inner
         }
-
-        /// Mutable access for `add_generators`/`add_relations`, which upstream
-        /// take `&mut self`. Fails while the `Arc` is shared (a boxed
-        /// `SteenrodModule` from `into_steenrod_module()` is still alive), since
-        /// that box observes the same state.
-        fn inner_mut(&mut self) -> PyResult<&mut FPModuleInner> {
-            Arc::get_mut(&mut self.inner).ok_or_else(|| {
-                PyRuntimeError::new_err(
-                    "cannot mutate an FPModule after it has been boxed into a SteenrodModule",
-                )
-            })
-        }
     }
 
     #[pymethods]
     impl FPModule {
-        /// Build an empty finitely presented module over `algebra`, named
-        /// `name`, with generators living in degrees `>= min_degree`.
-        #[new]
-        #[pyo3(signature = (algebra, name, min_degree = 0))]
-        pub fn new(algebra: PyRef<'_, SteenrodAlgebra>, name: String, min_degree: i32) -> Self {
-            FPModule {
-                inner: Arc::new(FPModuleInner::new(algebra.arc(), name, min_degree)),
-                next_relation_degree: min_degree,
-            }
-        }
-
         // --- flattened Module method set --------------------------------------
 
         pub fn algebra(&self) -> SteenrodAlgebra {
@@ -4463,83 +4399,6 @@ pub mod algebra_py {
             FreeModule(self.inner.generators())
         }
 
-        /// Add generators in `degree`, one per name in `gen_names`. Generators
-        /// must be added at the next consecutive degree (mirroring
-        /// `FreeModule.add_generators`, which `push_checked`s into an
-        /// `OnceBiVec` keyed by degree): `degree` must equal
-        /// `generators().max_computed_degree() + 1` and be `>= min_degree`.
-        /// Raises `ValueError` (never panics) otherwise.
-        pub fn add_generators(&mut self, degree: i32, gen_names: Vec<String>) -> PyResult<()> {
-            let min_degree = self.inner.min_degree();
-            if degree < min_degree {
-                return Err(PyValueError::new_err(format!(
-                    "degree {degree} is below the module's min_degree {min_degree}"
-                )));
-            }
-            let next_expected = self.inner.generators().max_computed_degree() + 1;
-            if degree != next_expected {
-                return Err(PyValueError::new_err(format!(
-                    "generators must be added at the next consecutive degree {next_expected}, got \
-                     {degree}"
-                )));
-            }
-            // `add_generators` reads the algebra/opgen tables up to the current
-            // computed degree, so make sure they are populated through `degree`.
-            module_ensure(&*self.inner.generators(), degree);
-            self.inner_mut()?.add_generators(degree, gen_names);
-            Ok(())
-        }
-
-        /// Add relations in `degree`: each relation is a coefficient vector over
-        /// the generators' basis in `degree` (length
-        /// `generators().dimension(degree)`, same prime as the module). Pass an
-        /// empty list to register a degree with no relations.
-        ///
-        /// Relations are stored in an `OnceBiVec` starting at `min_degree` and
-        /// pushed with `push_checked`, so they must be added at consecutive
-        /// degrees starting from `min_degree`: `degree` must equal the next
-        /// pending relation degree. Fill intervening degrees with empty lists.
-        /// Raises `ValueError` for a wrong degree, prime, or length (never
-        /// panics).
-        pub fn add_relations(
-            &mut self,
-            py: Python<'_>,
-            degree: i32,
-            relations: Vec<Bound<'_, PyAny>>,
-        ) -> PyResult<()> {
-            let min_degree = self.inner.min_degree();
-            if degree < min_degree {
-                return Err(PyValueError::new_err(format!(
-                    "degree {degree} is below the module's min_degree {min_degree}"
-                )));
-            }
-            if degree != self.next_relation_degree {
-                return Err(PyValueError::new_err(format!(
-                    "relations must be added at consecutive degrees starting from min_degree; \
-                     expected degree {} but got {degree} (fill gaps with empty relation lists)",
-                    self.next_relation_degree
-                )));
-            }
-            let p = self.inner.prime().as_u32();
-            // The relation vectors live in the generators' space in `degree`;
-            // make sure it is computed, then validate every vector's prime and
-            // length before handing them to the upstream (which pushes them
-            // verbatim and would only panic much later, in `compute_basis`).
-            let gens = self.inner.generators();
-            module_ensure(&*gens, degree);
-            let gen_dim = module_dimension(&*gens, degree);
-            let mut rows = Vec::with_capacity(relations.len());
-            for reln in &relations {
-                let v = crate::fp_py::extract_input_owned(py, reln)?;
-                checked_same_prime(v.prime().as_u32(), p)?;
-                checked_equal_len(v.len(), gen_dim)?;
-                rows.push(v);
-            }
-            self.inner_mut()?.add_relations(degree, rows);
-            self.next_relation_degree = degree + 1;
-            Ok(())
-        }
-
         /// Map a generator basis index `idx` in `degree` to its index in the FP
         /// module's basis, or `-1` if that generator is killed by a relation.
         /// Raises `IndexError` for an out-of-range `idx` or a `degree` below
@@ -4617,13 +4476,9 @@ pub mod algebra_py {
             }
             let arc = algebra.arc();
             match catch_unwind(AssertUnwindSafe(|| FPModuleInner::from_json(arc, &json))) {
-                Ok(Ok(module)) => {
-                    let next_relation_degree = module.max_computed_degree() + 1;
-                    Ok(FPModule {
-                        inner: Arc::new(module),
-                        next_relation_degree,
-                    })
-                }
+                Ok(Ok(module)) => Ok(FPModule {
+                    inner: Arc::new(module),
+                }),
                 Ok(Err(e)) => Err(PyValueError::new_err(e.to_string())),
                 Err(_) => Err(PyValueError::new_err(
                     "failed to build FPModule from JSON (malformed spec)",
@@ -4631,17 +4486,184 @@ pub mod algebra_py {
             }
         }
 
-        /// Box this module into a `SteenrodModule` for downstream use. Shares
-        /// state with this `FPModule` via an `Arc` (the `FreeModule` pattern);
-        /// while a boxed `SteenrodModule` from this module is alive the
-        /// `add_generators`/`add_relations` setters raise `RuntimeError`, and
-        /// they work again once every such box is dropped.
+        /// Box this immutable module into a `SteenrodModule` for downstream
+        /// use. Shares state with this `FPModule` via an `Arc` (the
+        /// `FreeModule` pattern).
         pub fn into_steenrod_module(&self) -> SteenrodModule {
             SteenrodModule(Arc::clone(&self.inner) as RsSteenrodModule)
         }
 
         pub fn __repr__(&self) -> String {
             format!("FPModule({})", self.inner)
+        }
+    }
+
+    /// A mutable builder for a finitely presented module. Add generators (in
+    /// consecutive degrees starting at `min_degree`) and then relations, then
+    /// call [`FPModuleBuilder::build`] to obtain an immutable [`FPModule`].
+    ///
+    /// The builder owns the in-progress module in an `Arc` that is unique while
+    /// building, so the mutating upstream `add_generators`/`add_relations`
+    /// (which take `&mut self`) reach it via `Arc::get_mut`. `build()` clones
+    /// that `Arc` into the returned `FPModule` and flips a `built` flag; any
+    /// further mutation then raises `RuntimeError` (it never panics). The
+    /// builder is built incrementally from empty, so the `next_relation_degree`
+    /// counter is always correct — there is no `from_json` path into the
+    /// builder, which is why the builder cannot exhibit the relation-counter
+    /// desync.
+    #[pyclass(name = "FPModuleBuilder")]
+    pub struct FPModuleBuilder {
+        inner: Arc<FPModuleInner>,
+        /// The degree at which the next batch of relations must be added.
+        /// Upstream pushes relations into an `OnceBiVec` starting at
+        /// `min_degree` via `push_checked`, which asserts the appended index is
+        /// exactly the next one; we track that next degree here so we can raise
+        /// `ValueError` instead of letting the assertion fire.
+        next_relation_degree: i32,
+        /// Set by `build()`; once set, all mutators raise `RuntimeError`.
+        built: bool,
+    }
+
+    impl FPModuleBuilder {
+        /// Mutable access for `add_generators`/`add_relations`. Fails (rather
+        /// than panicking) once `build()` has been called: either the `built`
+        /// flag is set, or the shared `Arc` makes `Arc::get_mut` return `None`.
+        fn inner_mut(&mut self) -> PyResult<&mut FPModuleInner> {
+            if self.built {
+                return Err(PyRuntimeError::new_err(
+                    "cannot mutate an FPModuleBuilder after build()",
+                ));
+            }
+            Arc::get_mut(&mut self.inner).ok_or_else(|| {
+                PyRuntimeError::new_err("cannot mutate an FPModuleBuilder after build()")
+            })
+        }
+    }
+
+    #[pymethods]
+    impl FPModuleBuilder {
+        /// Build an empty finitely presented module over `algebra`, named
+        /// `name`, with generators living in degrees `>= min_degree`.
+        #[new]
+        #[pyo3(signature = (algebra, name, min_degree = 0))]
+        pub fn new(algebra: PyRef<'_, SteenrodAlgebra>, name: String, min_degree: i32) -> Self {
+            FPModuleBuilder {
+                inner: Arc::new(FPModuleInner::new(algebra.arc(), name, min_degree)),
+                next_relation_degree: min_degree,
+                built: false,
+            }
+        }
+
+        pub fn prime(&self) -> u32 {
+            self.inner.prime().as_u32()
+        }
+
+        pub fn min_degree(&self) -> i32 {
+            self.inner.min_degree()
+        }
+
+        /// Add generators in `degree`, one per name in `gen_names`. Generators
+        /// must be added at the next consecutive degree (mirroring upstream
+        /// `FreeModule::add_generators`, which `push_checked`s into an
+        /// `OnceBiVec` keyed by degree): `degree` must equal
+        /// `generators().max_computed_degree() + 1` and be `>= min_degree`.
+        /// Raises `ValueError` (never panics) otherwise, or `RuntimeError`
+        /// after `build()`.
+        pub fn add_generators(&mut self, degree: i32, gen_names: Vec<String>) -> PyResult<()> {
+            if self.built {
+                return Err(PyRuntimeError::new_err(
+                    "cannot mutate an FPModuleBuilder after build()",
+                ));
+            }
+            let min_degree = self.inner.min_degree();
+            if degree < min_degree {
+                return Err(PyValueError::new_err(format!(
+                    "degree {degree} is below the module's min_degree {min_degree}"
+                )));
+            }
+            let next_expected = self.inner.generators().max_computed_degree() + 1;
+            if degree != next_expected {
+                return Err(PyValueError::new_err(format!(
+                    "generators must be added at the next consecutive degree {next_expected}, got \
+                     {degree}"
+                )));
+            }
+            // `add_generators` reads the algebra/opgen tables up to the current
+            // computed degree, so make sure they are populated through `degree`.
+            module_ensure(&*self.inner.generators(), degree);
+            self.inner_mut()?.add_generators(degree, gen_names);
+            Ok(())
+        }
+
+        /// Add relations in `degree`: each relation is a coefficient vector over
+        /// the generators' basis in `degree` (length
+        /// `generators().dimension(degree)`, same prime as the module). Pass an
+        /// empty list to register a degree with no relations.
+        ///
+        /// Relations are stored in an `OnceBiVec` starting at `min_degree` and
+        /// pushed with `push_checked`, so they must be added at consecutive
+        /// degrees starting from `min_degree`: `degree` must equal the next
+        /// pending relation degree. Fill intervening degrees with empty lists.
+        /// Raises `ValueError` for a wrong degree, prime, or length (never
+        /// panics), or `RuntimeError` after `build()`.
+        pub fn add_relations(
+            &mut self,
+            py: Python<'_>,
+            degree: i32,
+            relations: Vec<Bound<'_, PyAny>>,
+        ) -> PyResult<()> {
+            if self.built {
+                return Err(PyRuntimeError::new_err(
+                    "cannot mutate an FPModuleBuilder after build()",
+                ));
+            }
+            let min_degree = self.inner.min_degree();
+            if degree < min_degree {
+                return Err(PyValueError::new_err(format!(
+                    "degree {degree} is below the module's min_degree {min_degree}"
+                )));
+            }
+            if degree != self.next_relation_degree {
+                return Err(PyValueError::new_err(format!(
+                    "relations must be added at consecutive degrees starting from min_degree; \
+                     expected degree {} but got {degree} (fill gaps with empty relation lists)",
+                    self.next_relation_degree
+                )));
+            }
+            let p = self.inner.prime().as_u32();
+            // The relation vectors live in the generators' space in `degree`;
+            // make sure it is computed, then validate every vector's prime and
+            // length before handing them to the upstream (which pushes them
+            // verbatim and would only panic much later, in `compute_basis`).
+            let gens = self.inner.generators();
+            module_ensure(&*gens, degree);
+            let gen_dim = module_dimension(&*gens, degree);
+            let mut rows = Vec::with_capacity(relations.len());
+            for reln in &relations {
+                let v = crate::fp_py::extract_input_owned(py, reln)?;
+                checked_same_prime(v.prime().as_u32(), p)?;
+                checked_equal_len(v.len(), gen_dim)?;
+                rows.push(v);
+            }
+            self.inner_mut()?.add_relations(degree, rows);
+            self.next_relation_degree = degree + 1;
+            Ok(())
+        }
+
+        /// Finalize the builder and return an immutable [`FPModule`] sharing the
+        /// underlying module via an `Arc`. After `build()`, any further
+        /// mutation on this builder raises `RuntimeError` (never panics).
+        /// `build()` may be called again to obtain another handle to the same
+        /// immutable module.
+        pub fn build(&mut self) -> FPModule {
+            self.built = true;
+            FPModule {
+                inner: Arc::clone(&self.inner),
+            }
+        }
+
+        pub fn __repr__(&self) -> String {
+            format!("FPModuleBuilder({})", self.inner)
         }
     }
 
@@ -5429,8 +5451,9 @@ pub mod algebra_py {
                 let algebra = Py::new(py, SteenrodAlgebra::milnor(2, false).unwrap()).unwrap();
                 let m = FreeModule::new(algebra.borrow(py), "F".to_string(), 0);
                 m.compute_basis(4);
-                // One generator in degree 0.
-                m.add_generators(0, 1, None).unwrap();
+                // One generator in degree 0. `FreeModule` exposes no Python
+                // mutators; populate via the upstream inner API for the test.
+                m.0.add_generators(0, 1, None);
                 assert_eq!(m.number_of_gens_in_degree(0), 1);
                 // dimension(t) = dimension of the algebra in degree t (one gen).
                 assert_eq!(m.dimension(0), 1);
@@ -5461,7 +5484,7 @@ pub mod algebra_py {
                 assert_eq!(m.number_of_gens_in_degree(-1), 0);
                 // After adding degree-0 generators, degree 1 (above the
                 // populated range) still reads 0 rather than panicking.
-                m.add_generators(0, 1, None).unwrap();
+                m.0.add_generators(0, 1, None);
                 assert_eq!(m.number_of_gens_in_degree(0), 1);
                 assert_eq!(m.number_of_gens_in_degree(1), 0);
                 assert_eq!(m.number_of_gens_in_degree(99), 0);
@@ -5487,7 +5510,7 @@ pub mod algebra_py {
             Python::attach(|py| {
                 let algebra = Py::new(py, SteenrodAlgebra::milnor(2, false).unwrap()).unwrap();
                 let m = FreeModule::new(algebra.borrow(py), "F".to_string(), 0);
-                m.add_generators(0, 1, None).unwrap();
+                m.0.add_generators(0, 1, None);
                 m.compute_basis(4);
                 // gen_degree above the populated range -> IndexError, not panic.
                 assert!(m.generator_offset(4, 3, 0).is_err());
@@ -5501,25 +5524,12 @@ pub mod algebra_py {
             });
         }
 
-        #[test]
-        fn freemodule_add_generators_consecutive_only() {
-            Python::initialize();
-            Python::attach(|py| {
-                let algebra = Py::new(py, SteenrodAlgebra::milnor(2, false).unwrap()).unwrap();
-                let m = FreeModule::new(algebra.borrow(py), "F".to_string(), 0);
-                // Consecutive happy path.
-                m.add_generators(0, 1, None).unwrap();
-                m.add_generators(1, 1, None).unwrap();
-                // Non-consecutive (gap) raises.
-                assert!(m.add_generators(3, 1, None).is_err());
-                // Duplicate (re-adding the current top degree) raises.
-                assert!(m.add_generators(1, 1, None).is_err());
-                // extend_by_zero fills the gap, then the filled degree works.
-                m.extend_by_zero(3);
-                m.add_generators(4, 1, None).unwrap();
-                assert_eq!(m.number_of_gens_in_degree(4), 1);
-            });
-        }
+        // NOTE: the former `freemodule_add_generators_consecutive_only` test
+        // exercised the Python-side consecutiveness guard on
+        // `FreeModule.add_generators`. That mutator has been removed from the
+        // `FreeModule` pyclass (FreeModule is query-only), so the guard now
+        // lives on `FPModuleBuilder.add_generators` and is covered by
+        // `fp_module_builder_add_generators_non_consecutive_raises`.
 
         #[test]
         #[should_panic]
@@ -5541,8 +5551,8 @@ pub mod algebra_py {
             Python::attach(|py| {
                 let algebra = Py::new(py, SteenrodAlgebra::milnor(2, false).unwrap()).unwrap();
                 let m = FreeModule::new(algebra.borrow(py), "F".to_string(), 0);
-                m.add_generators(0, 1, None).unwrap();
-                m.add_generators(1, 1, None).unwrap();
+                m.0.add_generators(0, 1, None);
+                m.0.add_generators(1, 1, None);
                 // Below min_degree must be empty, not "all generators".
                 assert!(m.iter_gens(-1).is_empty());
                 // In-range still works.
@@ -5628,7 +5638,7 @@ pub mod algebra_py {
             Python::attach(|py| {
                 let algebra = Py::new(py, SteenrodAlgebra::milnor(2, false).unwrap()).unwrap();
                 let m = FreeModule::new(algebra.borrow(py), "F".to_string(), 0);
-                m.add_generators(0, 1, None).unwrap();
+                m.0.add_generators(0, 1, None);
                 // FreeModule is unbounded above -> total_dimension raises.
                 assert!(m.total_dimension().is_err());
             });
@@ -5972,7 +5982,7 @@ pub mod algebra_py {
                 // algebra basis. `QuotientModule::new` now pre-extends.
                 let algebra = Py::new(py, SteenrodAlgebra::milnor(2, false).unwrap()).unwrap();
                 let f = FreeModule::new(algebra.borrow(py), "F".to_string(), 0);
-                f.add_generators(0, 1, None).unwrap();
+                f.0.add_generators(0, 1, None);
                 let inner = Py::new(py, f.into_steenrod_module()).unwrap();
                 let q = QuotientModule::new(inner.borrow(py), 20).unwrap();
                 assert_eq!(q.prime(), 2);
@@ -5997,7 +6007,7 @@ pub mod algebra_py {
             Python::attach(|py| {
                 let algebra = Py::new(py, SteenrodAlgebra::milnor(2, false).unwrap()).unwrap();
                 let f = FreeModule::new(algebra.borrow(py), "F".to_string(), 0);
-                f.add_generators(0, 1, None).unwrap();
+                f.0.add_generators(0, 1, None);
                 // No pre-extension: feed the boxed module straight to the
                 // upstream constructor.
                 let sm = f.into_steenrod_module();
@@ -6010,7 +6020,7 @@ pub mod algebra_py {
         /// A free module with one generator in degree 0, sharing `algebra`.
         fn free_one_gen(py: Python<'_>, algebra: &Py<SteenrodAlgebra>) -> FreeModule {
             let f = FreeModule::new(algebra.borrow(py), "F".to_string(), 0);
-            f.add_generators(0, 1, None).unwrap();
+            f.0.add_generators(0, 1, None);
             f.compute_basis(2);
             f
         }
@@ -6142,17 +6152,17 @@ pub mod algebra_py {
         /// degree 0, one relation `Sq1 x0` (the length-1 vector `[1]`) in
         /// degree 1.
         fn a_mod_sq1(py: Python<'_>, algebra: &Py<SteenrodAlgebra>) -> FPModule {
-            let mut m = FPModule::new(algebra.borrow(py), "A/(Sq1)".to_string(), 0);
-            m.add_generators(0, vec!["x0".to_string()]).unwrap();
+            let mut b = FPModuleBuilder::new(algebra.borrow(py), "A/(Sq1)".to_string(), 0);
+            b.add_generators(0, vec!["x0".to_string()]).unwrap();
             // Empty relations at degree 0 (consecutiveness from min_degree).
-            m.add_relations(py, 0, vec![]).unwrap();
+            b.add_relations(py, 0, vec![]).unwrap();
             // The relation Sq1 x0 lives in degree 1, where the generators have
             // dimension 1; the vector [1] kills it.
             let v = Py::new(py, crate::fp_py::PyFpVector::new(2, 1).unwrap()).unwrap();
             v.borrow_mut(py).set_entry(0, 1).unwrap();
-            m.add_relations(py, 1, vec![v.bind(py).as_any().clone()])
+            b.add_relations(py, 1, vec![v.bind(py).as_any().clone()])
                 .unwrap();
-            m
+            b.build()
         }
 
         #[test]
@@ -6199,53 +6209,65 @@ pub mod algebra_py {
             Python::initialize();
             Python::attach(|py| {
                 let algebra = Py::new(py, SteenrodAlgebra::milnor(2, false).unwrap()).unwrap();
-                let mut m = a_mod_sq1(py, &algebra);
+                let m = a_mod_sq1(py, &algebra);
                 let boxed = m.into_steenrod_module();
                 assert_eq!(boxed.prime(), m.prime());
                 assert_eq!(boxed.dimension(0), m.dimension(0));
                 assert_eq!(boxed.dimension(2), m.dimension(2));
-                // While the box is alive, mutation raises rather than panics.
-                assert!(m.add_generators(1, vec!["y".to_string()]).is_err());
             });
         }
 
         #[test]
-        fn fp_module_add_generators_non_consecutive_raises() {
+        fn fp_module_builder_mutation_after_build_raises() {
             Python::initialize();
             Python::attach(|py| {
                 let algebra = Py::new(py, SteenrodAlgebra::milnor(2, false).unwrap()).unwrap();
-                let mut m = FPModule::new(algebra.borrow(py), "M".to_string(), 0);
+                let mut b = FPModuleBuilder::new(algebra.borrow(py), "M".to_string(), 0);
+                b.add_generators(0, vec!["x0".to_string()]).unwrap();
+                let _m = b.build();
+                // After build(), mutating the builder raises rather than panics.
+                assert!(b.add_generators(1, vec!["y".to_string()]).is_err());
+                assert!(b.add_relations(py, 0, vec![]).is_err());
+            });
+        }
+
+        #[test]
+        fn fp_module_builder_add_generators_non_consecutive_raises() {
+            Python::initialize();
+            Python::attach(|py| {
+                let algebra = Py::new(py, SteenrodAlgebra::milnor(2, false).unwrap()).unwrap();
+                let mut b = FPModuleBuilder::new(algebra.borrow(py), "M".to_string(), 0);
                 // Skipping degree 0 (the first expected) raises.
-                assert!(m.add_generators(2, vec!["x".to_string()]).is_err());
-                m.add_generators(0, vec!["x0".to_string()]).unwrap();
+                assert!(b.add_generators(2, vec!["x".to_string()]).is_err());
+                b.add_generators(0, vec!["x0".to_string()]).unwrap();
                 // Re-adding degree 0 raises.
-                assert!(m.add_generators(0, vec!["x0b".to_string()]).is_err());
+                assert!(b.add_generators(0, vec!["x0b".to_string()]).is_err());
                 // Below min_degree raises.
-                assert!(m.add_generators(-1, vec![]).is_err());
+                assert!(b.add_generators(-1, vec![]).is_err());
             });
         }
 
         #[test]
-        fn fp_module_add_relations_bad_input_raises() {
+        fn fp_module_builder_add_relations_bad_input_raises() {
             Python::initialize();
             Python::attach(|py| {
                 let algebra = Py::new(py, SteenrodAlgebra::milnor(2, false).unwrap()).unwrap();
-                let mut m = FPModule::new(algebra.borrow(py), "M".to_string(), 0);
-                m.add_generators(0, vec!["x0".to_string()]).unwrap();
+                let mut b = FPModuleBuilder::new(algebra.borrow(py), "M".to_string(), 0);
+                b.add_generators(0, vec!["x0".to_string()]).unwrap();
                 // Relations must start at min_degree 0; degree 1 first raises.
                 let v = Py::new(py, crate::fp_py::PyFpVector::new(2, 1).unwrap()).unwrap();
-                assert!(m
+                assert!(b
                     .add_relations(py, 1, vec![v.bind(py).as_any().clone()])
                     .is_err());
                 // Wrong length at degree 1 raises (gen dim there is 1).
-                m.add_relations(py, 0, vec![]).unwrap();
+                b.add_relations(py, 0, vec![]).unwrap();
                 let bad_len = Py::new(py, crate::fp_py::PyFpVector::new(2, 3).unwrap()).unwrap();
-                assert!(m
+                assert!(b
                     .add_relations(py, 1, vec![bad_len.bind(py).as_any().clone()])
                     .is_err());
                 // Wrong prime raises.
                 let bad_p = Py::new(py, crate::fp_py::PyFpVector::new(3, 1).unwrap()).unwrap();
-                assert!(m
+                assert!(b
                     .add_relations(py, 1, vec![bad_p.bind(py).as_any().clone()])
                     .is_err());
             });
@@ -6268,7 +6290,6 @@ pub mod algebra_py {
                 let module = FPModuleInner::from_json(arc, &json).unwrap();
                 let m = FPModule {
                     inner: Arc::new(module),
-                    next_relation_degree: 0,
                 };
                 assert_eq!(m.prime(), 2);
                 assert_eq!(m.min_degree(), 0);
