@@ -6,7 +6,9 @@ pub mod algebra_py {
 
     use ::algebra::module::{
         steenrod_module, FDModule as RsFDModule, FreeModule as RsFreeModule, Module,
-        OperationGeneratorPair as RsOperationGeneratorPair, SteenrodModule as RsSteenrodModule,
+        OperationGeneratorPair as RsOperationGeneratorPair,
+        RealProjectiveSpace as RsRealProjectiveSpace, SteenrodModule as RsSteenrodModule,
+        SuspensionModule as RsSuspensionModule, TensorModule as RsTensorModule,
     };
     use ::algebra::{Algebra, Bialgebra, GeneratedAlgebra};
     use ::fp::prime::{self, Prime};
@@ -22,6 +24,19 @@ pub mod algebra_py {
     type RsSteenrodAlgebra = ::algebra::SteenrodAlgebra;
     type FDModuleInner = RsFDModule<RsSteenrodAlgebra>;
     type FreeModuleInner = RsFreeModule<RsSteenrodAlgebra>;
+    /// The derived modules are monomorphised over `RsSteenrodModule`
+    /// (`Arc<dyn Module>`), the boxed dynamic module. The `Module` trait carries
+    /// `#[auto_impl(Arc, Box)]`, so `Arc<dyn Module>` itself implements `Module`
+    /// (and is `Sized`, unlike `dyn Module`, which the upstream
+    /// `TensorModule<M>`/`SuspensionModule<M>` type parameters require). The
+    /// factors are therefore accepted as the bound `SteenrodModule` pyclass and
+    /// the upstream `new` is given `Arc<RsSteenrodModule>`. Both
+    /// `TensorModule<RsSteenrodModule, RsSteenrodModule>` and
+    /// `SuspensionModule<RsSteenrodModule>` implement `Module`, so
+    /// `into_steenrod_module()` unsizes an `Arc` of either directly.
+    type TensorModuleInner = RsTensorModule<RsSteenrodModule, RsSteenrodModule>;
+    type SuspensionModuleInner = RsSuspensionModule<RsSteenrodModule>;
+    type RpInner = RsRealProjectiveSpace<RsSteenrodAlgebra>;
     /// A borrowed trait object over the algebra union. The flattened `Module`
     /// method set is implemented once against this type and shared by every
     /// concrete module pyclass and by `SteenrodModule` via dynamic dispatch.
@@ -2831,6 +2846,747 @@ pub mod algebra_py {
         }
     }
 
+    // =========================================================================
+    // Derived / standalone modules (§5.3)
+    //
+    // Each holds its concrete module in an `Arc`, both so the flattened `Module`
+    // method set can dispatch through `&DynModule` (the shared guard helpers)
+    // and so `into_steenrod_module()` can unsize the `Arc` directly into a
+    // `SteenrodModule` (the `FreeModule` Arc-unsizing pattern), sharing state
+    // rather than deep-cloning. The two derived modules (`TensorModule`,
+    // `SuspensionModule`) accept their factor(s) as the already-boxed
+    // `SteenrodModule` trait object; callers box concrete modules first with
+    // `.into_steenrod_module()`.
+    // =========================================================================
+
+    /// The tensor product `left (x) right` of two modules over the Steenrod
+    /// algebra. The factors are passed as `SteenrodModule`s (box concrete
+    /// modules with `.into_steenrod_module()` first).
+    #[pyclass(name = "TensorModule")]
+    pub struct TensorModule(Arc<TensorModuleInner>);
+
+    impl TensorModule {
+        fn as_dyn(&self) -> &DynModule {
+            &*self.0
+        }
+    }
+
+    #[pymethods]
+    impl TensorModule {
+        /// Build `left (x) right`. The two factors must be over the same
+        /// algebra: upstream takes the coproduct from `left`'s algebra and
+        /// applies it to `right`'s basis, so a prime mismatch would panic on a
+        /// length/prime mismatch inside the `FpVector` action and an algebra
+        /// mismatch would silently compute the wrong answer. We therefore
+        /// reject both up front with `ValueError` (upstream `new` does no such
+        /// check).
+        #[new]
+        pub fn new(
+            left: PyRef<'_, SteenrodModule>,
+            right: PyRef<'_, SteenrodModule>,
+        ) -> PyResult<Self> {
+            let left_alg = left.0.algebra();
+            let right_alg = right.0.algebra();
+            checked_same_prime(left_alg.prime().as_u32(), right_alg.prime().as_u32())?;
+            if !Arc::ptr_eq(&left_alg, &right_alg) {
+                return Err(PyValueError::new_err(
+                    "tensor factors must be built over the same algebra",
+                ));
+            }
+            Ok(TensorModule(Arc::new(TensorModuleInner::new(
+                Arc::new(Arc::clone(&left.0)),
+                Arc::new(Arc::clone(&right.0)),
+            ))))
+        }
+
+        // --- flattened Module method set --------------------------------------
+
+        pub fn algebra(&self) -> SteenrodAlgebra {
+            SteenrodAlgebra::from_arc(self.0.algebra())
+        }
+
+        pub fn min_degree(&self) -> i32 {
+            self.0.min_degree()
+        }
+
+        pub fn max_computed_degree(&self) -> i32 {
+            self.0.max_computed_degree()
+        }
+
+        pub fn max_degree(&self) -> Option<i32> {
+            self.0.max_degree()
+        }
+
+        pub fn prime(&self) -> u32 {
+            self.0.prime().as_u32()
+        }
+
+        pub fn compute_basis(&self, degree: i32) {
+            module_ensure(self.as_dyn(), degree);
+        }
+
+        pub fn dimension(&self, degree: i32) -> usize {
+            module_dimension(self.as_dyn(), degree)
+        }
+
+        pub fn total_dimension(&self) -> PyResult<usize> {
+            module_total_dimension(self.as_dyn())
+        }
+
+        pub fn is_unit(&self) -> bool {
+            self.0.is_unit()
+        }
+
+        pub fn basis_element_to_string(&self, degree: i32, idx: usize) -> PyResult<String> {
+            module_basis_element_to_string(self.as_dyn(), degree, idx)
+        }
+
+        pub fn element_to_string(
+            &self,
+            py: Python<'_>,
+            degree: i32,
+            element: &Bound<'_, PyAny>,
+        ) -> PyResult<String> {
+            module_element_to_string(self.as_dyn(), py, degree, element)
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        pub fn act_on_basis(
+            &self,
+            py: Python<'_>,
+            result: &Bound<'_, PyAny>,
+            coeff: u32,
+            op_degree: i32,
+            op_index: usize,
+            mod_degree: i32,
+            mod_index: usize,
+        ) -> PyResult<()> {
+            module_act_on_basis(
+                self.as_dyn(),
+                py,
+                result,
+                coeff,
+                op_degree,
+                op_index,
+                mod_degree,
+                mod_index,
+            )
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        pub fn act(
+            &self,
+            py: Python<'_>,
+            result: &Bound<'_, PyAny>,
+            coeff: u32,
+            op_degree: i32,
+            op_index: usize,
+            input_degree: i32,
+            input: &Bound<'_, PyAny>,
+        ) -> PyResult<()> {
+            module_act(
+                self.as_dyn(),
+                py,
+                result,
+                coeff,
+                op_degree,
+                op_index,
+                input_degree,
+                input,
+            )
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        pub fn act_by_element(
+            &self,
+            py: Python<'_>,
+            result: &Bound<'_, PyAny>,
+            coeff: u32,
+            op_degree: i32,
+            op: &Bound<'_, PyAny>,
+            input_degree: i32,
+            input: &Bound<'_, PyAny>,
+        ) -> PyResult<()> {
+            module_act_by_element(
+                self.as_dyn(),
+                py,
+                result,
+                coeff,
+                op_degree,
+                op,
+                input_degree,
+                input,
+            )
+        }
+
+        // --- TensorModule-specific (thin) -------------------------------------
+
+        /// The degree of the left tensor factor of basis element `index` in
+        /// total degree `degree`. Raises `IndexError` rather than panicking on
+        /// an out-of-range basis index (upstream indexes the block structure).
+        pub fn seek_module_num(&self, degree: i32, index: usize) -> PyResult<i32> {
+            checked_mod_index(self.as_dyn(), degree, index)?;
+            Ok(self.0.seek_module_num(degree, index))
+        }
+
+        /// The offset, within total degree `degree`, of the block of basis
+        /// elements whose left factor lives in `left_degree`. Raises
+        /// `IndexError`/`ValueError` rather than letting the block structure
+        /// index out of range.
+        pub fn offset(&self, degree: i32, left_degree: i32) -> PyResult<usize> {
+            // The block structure is indexed by total degree; ensure it is
+            // computed and `degree` is a populated degree of the tensor module.
+            module_ensure(self.as_dyn(), degree);
+            if degree < self.0.min_degree() || degree > self.0.max_computed_degree() {
+                return Err(PyIndexError::new_err(format!(
+                    "degree {degree} is outside the computed range of the tensor module"
+                )));
+            }
+            // `left_degree` must index a left block: the left factor's degree
+            // ranges over `[left.min_degree(), degree - right.min_degree()]`.
+            let left_min = self.0.left.min_degree();
+            let left_max = degree - self.0.right.min_degree();
+            if left_degree < left_min || left_degree > left_max {
+                return Err(PyIndexError::new_err(format!(
+                    "left_degree {left_degree} out of range [{left_min}, {left_max}] for total \
+                     degree {degree}"
+                )));
+            }
+            Ok(self.0.offset(degree, left_degree))
+        }
+
+        /// Box this module into a `SteenrodModule` for downstream use. Shares
+        /// state with this `TensorModule` via an `Arc` (the `FreeModule`
+        /// pattern), so the boxed module sees the same computed basis.
+        pub fn into_steenrod_module(&self) -> SteenrodModule {
+            SteenrodModule(Arc::clone(&self.0) as RsSteenrodModule)
+        }
+
+        pub fn __repr__(&self) -> String {
+            format!("TensorModule({})", self.0)
+        }
+    }
+
+    /// A degree shift of a module: `SuspensionModule(inner, shift)` is `inner`
+    /// with every degree raised by `shift`. The inner module is passed as a
+    /// `SteenrodModule` (box concrete modules with `.into_steenrod_module()`).
+    #[pyclass(name = "SuspensionModule")]
+    pub struct SuspensionModule {
+        inner: Arc<SuspensionModuleInner>,
+        // The `shift` field is private upstream with no accessor, so we keep our
+        // own copy to back the `shift()` getter.
+        shift: i32,
+    }
+
+    impl SuspensionModule {
+        fn as_dyn(&self) -> &DynModule {
+            &*self.inner
+        }
+    }
+
+    #[pymethods]
+    impl SuspensionModule {
+        #[new]
+        pub fn new(inner: PyRef<'_, SteenrodModule>, shift: i32) -> Self {
+            SuspensionModule {
+                inner: Arc::new(SuspensionModuleInner::new(
+                    Arc::new(Arc::clone(&inner.0)),
+                    shift,
+                )),
+                shift,
+            }
+        }
+
+        // --- flattened Module method set --------------------------------------
+
+        pub fn algebra(&self) -> SteenrodAlgebra {
+            SteenrodAlgebra::from_arc(self.inner.algebra())
+        }
+
+        pub fn min_degree(&self) -> i32 {
+            self.inner.min_degree()
+        }
+
+        pub fn max_computed_degree(&self) -> i32 {
+            self.inner.max_computed_degree()
+        }
+
+        pub fn max_degree(&self) -> Option<i32> {
+            self.inner.max_degree()
+        }
+
+        pub fn prime(&self) -> u32 {
+            self.inner.prime().as_u32()
+        }
+
+        pub fn compute_basis(&self, degree: i32) {
+            module_ensure(self.as_dyn(), degree);
+        }
+
+        pub fn dimension(&self, degree: i32) -> usize {
+            module_dimension(self.as_dyn(), degree)
+        }
+
+        pub fn total_dimension(&self) -> PyResult<usize> {
+            module_total_dimension(self.as_dyn())
+        }
+
+        pub fn is_unit(&self) -> bool {
+            self.inner.is_unit()
+        }
+
+        pub fn basis_element_to_string(&self, degree: i32, idx: usize) -> PyResult<String> {
+            module_basis_element_to_string(self.as_dyn(), degree, idx)
+        }
+
+        pub fn element_to_string(
+            &self,
+            py: Python<'_>,
+            degree: i32,
+            element: &Bound<'_, PyAny>,
+        ) -> PyResult<String> {
+            module_element_to_string(self.as_dyn(), py, degree, element)
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        pub fn act_on_basis(
+            &self,
+            py: Python<'_>,
+            result: &Bound<'_, PyAny>,
+            coeff: u32,
+            op_degree: i32,
+            op_index: usize,
+            mod_degree: i32,
+            mod_index: usize,
+        ) -> PyResult<()> {
+            module_act_on_basis(
+                self.as_dyn(),
+                py,
+                result,
+                coeff,
+                op_degree,
+                op_index,
+                mod_degree,
+                mod_index,
+            )
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        pub fn act(
+            &self,
+            py: Python<'_>,
+            result: &Bound<'_, PyAny>,
+            coeff: u32,
+            op_degree: i32,
+            op_index: usize,
+            input_degree: i32,
+            input: &Bound<'_, PyAny>,
+        ) -> PyResult<()> {
+            module_act(
+                self.as_dyn(),
+                py,
+                result,
+                coeff,
+                op_degree,
+                op_index,
+                input_degree,
+                input,
+            )
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        pub fn act_by_element(
+            &self,
+            py: Python<'_>,
+            result: &Bound<'_, PyAny>,
+            coeff: u32,
+            op_degree: i32,
+            op: &Bound<'_, PyAny>,
+            input_degree: i32,
+            input: &Bound<'_, PyAny>,
+        ) -> PyResult<()> {
+            module_act_by_element(
+                self.as_dyn(),
+                py,
+                result,
+                coeff,
+                op_degree,
+                op,
+                input_degree,
+                input,
+            )
+        }
+
+        // --- SuspensionModule-specific (thin) ---------------------------------
+
+        /// The degree shift this suspension applies. (Upstream's `shift` field
+        /// is private with no accessor, so we report our stored copy.)
+        pub fn shift(&self) -> i32 {
+            self.shift
+        }
+
+        /// Box this module into a `SteenrodModule` for downstream use. Shares
+        /// state with this `SuspensionModule` via an `Arc`.
+        pub fn into_steenrod_module(&self) -> SteenrodModule {
+            SteenrodModule(Arc::clone(&self.inner) as RsSteenrodModule)
+        }
+
+        pub fn __repr__(&self) -> String {
+            format!("SuspensionModule({})", self.inner)
+        }
+    }
+
+    /// The zero module over the Steenrod algebra with the given `min_degree`
+    /// (an empty finite-dimensional module). Dimension 0 in every degree.
+    #[pyclass(name = "ZeroModule")]
+    pub struct ZeroModule(Arc<FDModuleInner>);
+
+    impl ZeroModule {
+        fn as_dyn(&self) -> &DynModule {
+            &*self.0
+        }
+    }
+
+    #[pymethods]
+    impl ZeroModule {
+        /// Build the zero module. Mirrors upstream
+        /// `FDModule::zero_module(algebra, min_degree)`, i.e. an `FDModule` with
+        /// an empty graded dimension starting at `min_degree`.
+        #[new]
+        #[pyo3(signature = (algebra, min_degree = 0))]
+        pub fn new(algebra: PyRef<'_, SteenrodAlgebra>, min_degree: i32) -> Self {
+            let graded_dimension = ::bivec::BiVec::new(min_degree);
+            ZeroModule(Arc::new(FDModuleInner::new(
+                algebra.arc(),
+                "zero".to_string(),
+                graded_dimension,
+            )))
+        }
+
+        // --- flattened Module method set --------------------------------------
+
+        pub fn algebra(&self) -> SteenrodAlgebra {
+            SteenrodAlgebra::from_arc(self.0.algebra())
+        }
+
+        pub fn min_degree(&self) -> i32 {
+            self.0.min_degree()
+        }
+
+        pub fn max_computed_degree(&self) -> i32 {
+            self.0.max_computed_degree()
+        }
+
+        pub fn max_degree(&self) -> Option<i32> {
+            self.0.max_degree()
+        }
+
+        pub fn prime(&self) -> u32 {
+            self.0.prime().as_u32()
+        }
+
+        pub fn compute_basis(&self, degree: i32) {
+            module_ensure(self.as_dyn(), degree);
+        }
+
+        pub fn dimension(&self, degree: i32) -> usize {
+            module_dimension(self.as_dyn(), degree)
+        }
+
+        pub fn total_dimension(&self) -> PyResult<usize> {
+            module_total_dimension(self.as_dyn())
+        }
+
+        pub fn is_unit(&self) -> bool {
+            self.0.is_unit()
+        }
+
+        pub fn basis_element_to_string(&self, degree: i32, idx: usize) -> PyResult<String> {
+            module_basis_element_to_string(self.as_dyn(), degree, idx)
+        }
+
+        pub fn element_to_string(
+            &self,
+            py: Python<'_>,
+            degree: i32,
+            element: &Bound<'_, PyAny>,
+        ) -> PyResult<String> {
+            module_element_to_string(self.as_dyn(), py, degree, element)
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        pub fn act_on_basis(
+            &self,
+            py: Python<'_>,
+            result: &Bound<'_, PyAny>,
+            coeff: u32,
+            op_degree: i32,
+            op_index: usize,
+            mod_degree: i32,
+            mod_index: usize,
+        ) -> PyResult<()> {
+            module_act_on_basis(
+                self.as_dyn(),
+                py,
+                result,
+                coeff,
+                op_degree,
+                op_index,
+                mod_degree,
+                mod_index,
+            )
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        pub fn act(
+            &self,
+            py: Python<'_>,
+            result: &Bound<'_, PyAny>,
+            coeff: u32,
+            op_degree: i32,
+            op_index: usize,
+            input_degree: i32,
+            input: &Bound<'_, PyAny>,
+        ) -> PyResult<()> {
+            module_act(
+                self.as_dyn(),
+                py,
+                result,
+                coeff,
+                op_degree,
+                op_index,
+                input_degree,
+                input,
+            )
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        pub fn act_by_element(
+            &self,
+            py: Python<'_>,
+            result: &Bound<'_, PyAny>,
+            coeff: u32,
+            op_degree: i32,
+            op: &Bound<'_, PyAny>,
+            input_degree: i32,
+            input: &Bound<'_, PyAny>,
+        ) -> PyResult<()> {
+            module_act_by_element(
+                self.as_dyn(),
+                py,
+                result,
+                coeff,
+                op_degree,
+                op,
+                input_degree,
+                input,
+            )
+        }
+
+        /// Box this module into a `SteenrodModule` for downstream use. Shares
+        /// state with this `ZeroModule` via an `Arc`.
+        pub fn into_steenrod_module(&self) -> SteenrodModule {
+            SteenrodModule(Arc::clone(&self.0) as RsSteenrodModule)
+        }
+
+        pub fn __repr__(&self) -> String {
+            format!("ZeroModule({})", self.0)
+        }
+    }
+
+    /// The real projective space module
+    /// `RP_min^max` over the Steenrod algebra at `p = 2`. `max = None` gives
+    /// `RP_min^oo`. `clear_bottom` mods out the `A(2)`-submodule generated below
+    /// `min` (see the upstream docs); note it always shifts `min` to `-1 mod 8`.
+    #[pyclass(name = "RealProjectiveSpace")]
+    pub struct RealProjectiveSpace(Arc<RpInner>);
+
+    impl RealProjectiveSpace {
+        fn as_dyn(&self) -> &DynModule {
+            &*self.0
+        }
+    }
+
+    #[pymethods]
+    impl RealProjectiveSpace {
+        /// Build `RP_min^max`. Raises `ValueError` for a non-`p = 2` algebra or
+        /// `max < min` (upstream `new` asserts both).
+        #[new]
+        #[pyo3(signature = (algebra, min, max = None, clear_bottom = false))]
+        pub fn new(
+            algebra: PyRef<'_, SteenrodAlgebra>,
+            min: i32,
+            max: Option<i32>,
+            clear_bottom: bool,
+        ) -> PyResult<Self> {
+            if algebra.prime() != 2 {
+                return Err(PyValueError::new_err(
+                    "RealProjectiveSpace is only defined at p = 2",
+                ));
+            }
+            if let Some(max) = max {
+                if max < min {
+                    return Err(PyValueError::new_err(format!(
+                        "max {max} must be at least min {min}"
+                    )));
+                }
+            }
+            Ok(RealProjectiveSpace(Arc::new(RpInner::new(
+                algebra.arc(),
+                min,
+                max,
+                clear_bottom,
+            ))))
+        }
+
+        // --- flattened Module method set --------------------------------------
+
+        pub fn algebra(&self) -> SteenrodAlgebra {
+            SteenrodAlgebra::from_arc(self.0.algebra())
+        }
+
+        pub fn min_degree(&self) -> i32 {
+            self.0.min_degree()
+        }
+
+        pub fn max_computed_degree(&self) -> i32 {
+            self.0.max_computed_degree()
+        }
+
+        pub fn max_degree(&self) -> Option<i32> {
+            self.0.max_degree()
+        }
+
+        pub fn prime(&self) -> u32 {
+            self.0.prime().as_u32()
+        }
+
+        pub fn compute_basis(&self, degree: i32) {
+            module_ensure(self.as_dyn(), degree);
+        }
+
+        pub fn dimension(&self, degree: i32) -> usize {
+            module_dimension(self.as_dyn(), degree)
+        }
+
+        pub fn total_dimension(&self) -> PyResult<usize> {
+            module_total_dimension(self.as_dyn())
+        }
+
+        pub fn is_unit(&self) -> bool {
+            self.0.is_unit()
+        }
+
+        pub fn basis_element_to_string(&self, degree: i32, idx: usize) -> PyResult<String> {
+            module_basis_element_to_string(self.as_dyn(), degree, idx)
+        }
+
+        pub fn element_to_string(
+            &self,
+            py: Python<'_>,
+            degree: i32,
+            element: &Bound<'_, PyAny>,
+        ) -> PyResult<String> {
+            module_element_to_string(self.as_dyn(), py, degree, element)
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        pub fn act_on_basis(
+            &self,
+            py: Python<'_>,
+            result: &Bound<'_, PyAny>,
+            coeff: u32,
+            op_degree: i32,
+            op_index: usize,
+            mod_degree: i32,
+            mod_index: usize,
+        ) -> PyResult<()> {
+            module_act_on_basis(
+                self.as_dyn(),
+                py,
+                result,
+                coeff,
+                op_degree,
+                op_index,
+                mod_degree,
+                mod_index,
+            )
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        pub fn act(
+            &self,
+            py: Python<'_>,
+            result: &Bound<'_, PyAny>,
+            coeff: u32,
+            op_degree: i32,
+            op_index: usize,
+            input_degree: i32,
+            input: &Bound<'_, PyAny>,
+        ) -> PyResult<()> {
+            module_act(
+                self.as_dyn(),
+                py,
+                result,
+                coeff,
+                op_degree,
+                op_index,
+                input_degree,
+                input,
+            )
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        pub fn act_by_element(
+            &self,
+            py: Python<'_>,
+            result: &Bound<'_, PyAny>,
+            coeff: u32,
+            op_degree: i32,
+            op: &Bound<'_, PyAny>,
+            input_degree: i32,
+            input: &Bound<'_, PyAny>,
+        ) -> PyResult<()> {
+            module_act_by_element(
+                self.as_dyn(),
+                py,
+                result,
+                coeff,
+                op_degree,
+                op,
+                input_degree,
+                input,
+            )
+        }
+
+        // --- RealProjectiveSpace-specific (thin) ------------------------------
+
+        #[getter]
+        pub fn min(&self) -> i32 {
+            self.0.min
+        }
+
+        #[getter]
+        pub fn max(&self) -> Option<i32> {
+            self.0.max
+        }
+
+        #[getter]
+        pub fn clear_bottom(&self) -> bool {
+            self.0.clear_bottom
+        }
+
+        /// Box this module into a `SteenrodModule` for downstream use. Shares
+        /// state via an `Arc`.
+        pub fn into_steenrod_module(&self) -> SteenrodModule {
+            SteenrodModule(Arc::clone(&self.0) as RsSteenrodModule)
+        }
+
+        pub fn __repr__(&self) -> String {
+            format!("RealProjectiveSpace({})", self.0)
+        }
+    }
+
     /// Build a `SteenrodModule` from a module-spec `dict` (the JSON the crate
     /// reads from a module file) over the given `algebra`. Mirrors
     /// `::algebra::module::steenrod_module::from_json`, which dispatches on the
@@ -3337,6 +4093,15 @@ pub mod algebra_py {
             m
         }
 
+        /// A C2 `SteenrodModule` built over the given (shared) algebra, so two
+        /// such factors share the same `Arc<SteenrodAlgebra>`.
+        fn c2_module_over(py: Python<'_>, algebra: &Py<SteenrodAlgebra>) -> SteenrodModule {
+            let json: serde_json::Value = serde_json::from_str(C2_JSON).unwrap();
+            steenrod_module::from_json(algebra.borrow(py).arc(), &json)
+                .map(SteenrodModule)
+                .unwrap()
+        }
+
         #[test]
         fn fdmodule_construct_and_invariants() {
             Python::initialize();
@@ -3619,6 +4384,182 @@ pub mod algebra_py {
                 m.add_generators(0, 1, None).unwrap();
                 // FreeModule is unbounded above -> total_dimension raises.
                 assert!(m.total_dimension().is_err());
+            });
+        }
+
+        // --- §5.3 derived / standalone modules --------------------------------
+
+        #[test]
+        fn tensor_module_dimensions_and_action() {
+            Python::initialize();
+            Python::attach(|py| {
+                let algebra = Py::new(py, SteenrodAlgebra::milnor(2, false).unwrap()).unwrap();
+                let left = Py::new(py, c2_module_over(py, &algebra)).unwrap();
+                let right = Py::new(py, c2_module_over(py, &algebra)).unwrap();
+                let t = TensorModule::new(left.borrow(py), right.borrow(py)).unwrap();
+                t.compute_basis(4);
+                assert_eq!(t.prime(), 2);
+                assert_eq!(t.min_degree(), 0);
+                // C2 (x) C2: dims are the convolution of [1,1] with [1,1].
+                assert_eq!(t.dimension(0), 1); // x0.x0
+                assert_eq!(t.dimension(1), 2); // x1.x0, x0.x1
+                assert_eq!(t.dimension(2), 1); // x1.x1
+                assert_eq!(t.dimension(3), 0);
+                assert_eq!(t.max_degree(), Some(2));
+                assert_eq!(t.total_dimension().unwrap(), 4);
+
+                // seek_module_num / offset thin extras.
+                // In total degree 1, index 0 has left factor in degree 0 (or 1).
+                assert!(t.seek_module_num(1, 0).is_ok());
+                assert!(t.offset(1, 0).is_ok());
+                // Out-of-range basis index / left_degree raise.
+                assert!(t.seek_module_num(1, 9).is_err());
+                assert!(t.offset(1, 9).is_err());
+
+                // Sq1 . (x0 (x) x0) = x1 (x) x0 + x0 (x) x1 (both entries 1 at p=2).
+                let res = Py::new(
+                    py,
+                    crate::fp_py::PyFpVector::new(2, t.dimension(1)).unwrap(),
+                )
+                .unwrap();
+                t.act_on_basis(py, res.bind(py).as_any(), 1, 1, 0, 0, 0)
+                    .unwrap();
+                assert_eq!(res.borrow(py).entry(0).unwrap(), 1);
+                assert_eq!(res.borrow(py).entry(1).unwrap(), 1);
+            });
+        }
+
+        #[test]
+        fn tensor_module_prime_mismatch_raises() {
+            Python::initialize();
+            Python::attach(|py| {
+                // Two C2 modules over algebras at different primes must raise.
+                let alg3 = Py::new(py, SteenrodAlgebra::milnor(3, false).unwrap()).unwrap();
+                let zero3 = ZeroModule::new(alg3.borrow(py), 0);
+                let left = Py::new(py, zero3.into_steenrod_module()).unwrap();
+                let right = Py::new(py, c2_module(py)).unwrap();
+                assert!(TensorModule::new(left.borrow(py), right.borrow(py)).is_err());
+
+                // Same prime but distinct algebra objects also raise.
+                let alg_a = Py::new(py, SteenrodAlgebra::milnor(2, false).unwrap()).unwrap();
+                let alg_b = Py::new(py, SteenrodAlgebra::milnor(2, false).unwrap()).unwrap();
+                let za = Py::new(
+                    py,
+                    ZeroModule::new(alg_a.borrow(py), 0).into_steenrod_module(),
+                )
+                .unwrap();
+                let zb = Py::new(
+                    py,
+                    ZeroModule::new(alg_b.borrow(py), 0).into_steenrod_module(),
+                )
+                .unwrap();
+                assert!(TensorModule::new(za.borrow(py), zb.borrow(py)).is_err());
+            });
+        }
+
+        #[test]
+        fn suspension_module_shifts_degrees() {
+            Python::initialize();
+            Python::attach(|py| {
+                let inner = Py::new(py, c2_module(py)).unwrap();
+                let s = SuspensionModule::new(inner.borrow(py), 3);
+                s.compute_basis(8);
+                assert_eq!(s.shift(), 3);
+                assert_eq!(s.prime(), 2);
+                assert_eq!(s.min_degree(), 3);
+                assert_eq!(s.dimension(0), 0);
+                assert_eq!(s.dimension(3), 1); // shifted x0
+                assert_eq!(s.dimension(4), 1); // shifted x1
+                assert_eq!(s.dimension(5), 0);
+                assert_eq!(s.max_degree(), Some(4));
+
+                // Suspension preserves the inner action: Sq1 . (shifted x0) = shifted x1.
+                let res = Py::new(
+                    py,
+                    crate::fp_py::PyFpVector::new(2, s.dimension(4)).unwrap(),
+                )
+                .unwrap();
+                s.act_on_basis(py, res.bind(py).as_any(), 1, 1, 0, 3, 0)
+                    .unwrap();
+                assert_eq!(res.borrow(py).entry(0).unwrap(), 1);
+            });
+        }
+
+        #[test]
+        fn zero_module_is_empty() {
+            Python::initialize();
+            Python::attach(|py| {
+                let algebra = Py::new(py, SteenrodAlgebra::milnor(2, false).unwrap()).unwrap();
+                let z = ZeroModule::new(algebra.borrow(py), 0);
+                z.compute_basis(8);
+                assert_eq!(z.prime(), 2);
+                assert_eq!(z.min_degree(), 0);
+                for d in -2..=8 {
+                    assert_eq!(z.dimension(d), 0);
+                }
+                assert_eq!(z.total_dimension().unwrap(), 0);
+                // Round-trips into a SteenrodModule that is also empty.
+                let boxed = z.into_steenrod_module();
+                assert_eq!(boxed.dimension(0), 0);
+            });
+        }
+
+        #[test]
+        fn real_projective_space_dimensions_and_action() {
+            Python::initialize();
+            Python::attach(|py| {
+                let algebra = Py::new(py, SteenrodAlgebra::adem(2, false).unwrap()).unwrap();
+                let rp = RealProjectiveSpace::new(algebra.borrow(py), 1, Some(4), false).unwrap();
+                rp.compute_basis(6);
+                assert_eq!(rp.prime(), 2);
+                assert_eq!(rp.min_degree(), 1);
+                assert_eq!(rp.min(), 1);
+                assert_eq!(rp.max(), Some(4));
+                assert!(!rp.clear_bottom());
+                for d in 1..=4 {
+                    assert_eq!(rp.dimension(d), 1);
+                }
+                assert_eq!(rp.dimension(0), 0);
+                assert_eq!(rp.dimension(5), 0);
+                assert_eq!(rp.total_dimension().unwrap(), 4);
+
+                // Sq1 . x^1 = x^2 (binomial(1, 1) = 1 mod 2).
+                let res = Py::new(
+                    py,
+                    crate::fp_py::PyFpVector::new(2, rp.dimension(2)).unwrap(),
+                )
+                .unwrap();
+                rp.act_on_basis(py, res.bind(py).as_any(), 1, 1, 0, 1, 0)
+                    .unwrap();
+                assert_eq!(res.borrow(py).entry(0).unwrap(), 1);
+            });
+        }
+
+        #[test]
+        fn real_projective_space_rejects_odd_prime_and_bad_range() {
+            Python::initialize();
+            Python::attach(|py| {
+                let alg3 = Py::new(py, SteenrodAlgebra::milnor(3, false).unwrap()).unwrap();
+                assert!(RealProjectiveSpace::new(alg3.borrow(py), 1, Some(4), false).is_err());
+                let alg2 = Py::new(py, SteenrodAlgebra::adem(2, false).unwrap()).unwrap();
+                // max < min raises.
+                assert!(RealProjectiveSpace::new(alg2.borrow(py), 4, Some(1), false).is_err());
+            });
+        }
+
+        #[test]
+        fn derived_modules_out_of_range_no_panic() {
+            Python::initialize();
+            Python::attach(|py| {
+                let algebra = Py::new(py, SteenrodAlgebra::milnor(2, false).unwrap()).unwrap();
+                let left = Py::new(py, c2_module_over(py, &algebra)).unwrap();
+                let right = Py::new(py, c2_module_over(py, &algebra)).unwrap();
+                let t = TensorModule::new(left.borrow(py), right.borrow(py)).unwrap();
+                // Negative / above-range degrees read as empty, never panic.
+                assert_eq!(t.dimension(-5), 0);
+                assert_eq!(t.dimension(100), 0);
+                assert!(t.basis_element_to_string(100, 0).is_err());
+                assert!(t.basis_element_to_string(-1, 0).is_err());
             });
         }
     }
