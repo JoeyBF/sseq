@@ -78,8 +78,8 @@ pub mod fp_py {
         fn with_matrix<R>(&self, py: Python<'_>, f: impl FnOnce(&RustMatrix) -> R) -> PyResult<R> {
             match self {
                 Self::Matrix(m) => Ok(f(&m.try_borrow(py).map_err(borrow_error)?.0)),
-                Self::Augmented2(m) => Ok(f(&m.try_borrow(py).map_err(borrow_error)?.0)),
-                Self::Augmented3(m) => Ok(f(&m.try_borrow(py).map_err(borrow_error)?.0)),
+                Self::Augmented2(m) => Ok(f(m.try_borrow(py).map_err(borrow_error)?.0.get()?)),
+                Self::Augmented3(m) => Ok(f(m.try_borrow(py).map_err(borrow_error)?.0.get()?)),
             }
         }
 
@@ -105,8 +105,16 @@ pub mod fp_py {
         ) -> PyResult<R> {
             match self {
                 Self::Matrix(m) => Ok(f(&mut m.try_borrow_mut(py).map_err(borrow_error)?.0)),
-                Self::Augmented2(m) => Ok(f(&mut m.try_borrow_mut(py).map_err(borrow_error)?.0)),
-                Self::Augmented3(m) => Ok(f(&mut m.try_borrow_mut(py).map_err(borrow_error)?.0)),
+                Self::Augmented2(m) => Ok(f(m
+                    .try_borrow_mut(py)
+                    .map_err(borrow_error)?
+                    .0
+                    .get_mut()?)),
+                Self::Augmented3(m) => Ok(f(m
+                    .try_borrow_mut(py)
+                    .map_err(borrow_error)?
+                    .0
+                    .get_mut()?)),
             }
         }
     }
@@ -2338,8 +2346,14 @@ pub mod fp_py {
     /// `#[pymodule_init]`.
     macro_rules! augmented_matrix_pyclass {
         ($name:ident, $pyname:literal, $n:literal, $variant:ident, { $($extra:tt)* }) => {
+            /// The inner `AugmentedMatrix<N>` is held in a [`Consumable`] so the
+            /// consuming methods (`into_matrix`, `compute_quasi_inverses`) can
+            /// `take()` it out and run the upstream by-value operation. Once
+            /// consumed, every other method raises
+            /// `RuntimeError("<name> has been consumed")` instead of panicking
+            /// or reading stale data.
             #[pyclass(name = $pyname)]
-            struct $name(RustAugmentedMatrix<$n>);
+            struct $name(Consumable<RustAugmentedMatrix<$n>>);
 
             #[pymethods]
             impl $name {
@@ -2355,23 +2369,22 @@ pub mod fp_py {
                             $n
                         ))
                     })?;
-                    Ok(Self(RustAugmentedMatrix::<$n>::new(
-                        valid_prime(p)?,
-                        rows,
-                        cols,
+                    Ok(Self(Consumable::new(
+                        $pyname,
+                        RustAugmentedMatrix::<$n>::new(valid_prime(p)?, rows, cols),
                     )))
                 }
 
-                fn prime(&self) -> u32 {
-                    self.0.prime().as_u32()
+                fn prime(&self) -> PyResult<u32> {
+                    Ok(self.0.get()?.prime().as_u32())
                 }
 
-                fn rows(&self) -> usize {
-                    self.0.rows()
+                fn rows(&self) -> PyResult<usize> {
+                    Ok(self.0.get()?.rows())
                 }
 
-                fn columns(&self) -> usize {
-                    self.0.columns()
+                fn columns(&self) -> PyResult<usize> {
+                    Ok(self.0.get()?.columns())
                 }
 
                 /// Number of column segments (`N`).
@@ -2380,29 +2393,29 @@ pub mod fp_py {
                 }
 
                 /// The starting column index of each segment.
-                fn segment_starts(&self) -> Vec<usize> {
-                    self.0.start.to_vec()
+                fn segment_starts(&self) -> PyResult<Vec<usize>> {
+                    Ok(self.0.get()?.start.to_vec())
                 }
 
                 /// The (exclusive) ending column index of each segment.
-                fn segment_ends(&self) -> Vec<usize> {
-                    self.0.end.to_vec()
+                fn segment_ends(&self) -> PyResult<Vec<usize>> {
+                    Ok(self.0.get()?.end.to_vec())
                 }
 
-                fn pivots(&self) -> Vec<isize> {
-                    self.0.pivots().to_vec()
+                fn pivots(&self) -> PyResult<Vec<isize>> {
+                    Ok(self.0.get()?.pivots().to_vec())
                 }
 
-                fn is_zero(&self) -> bool {
-                    self.0.is_zero()
+                fn is_zero(&self) -> PyResult<bool> {
+                    Ok(self.0.get()?.is_zero())
                 }
 
-                fn to_vec(&self) -> Vec<Vec<u32>> {
-                    self.0.to_vec()
+                fn to_vec(&self) -> PyResult<Vec<Vec<u32>>> {
+                    Ok(self.0.get()?.to_vec())
                 }
 
-                fn row_reduce(&mut self) -> usize {
-                    self.0.row_reduce()
+                fn row_reduce(&mut self) -> PyResult<usize> {
+                    Ok(self.0.get_mut()?.row_reduce())
                 }
 
                 /// Add an identity matrix into the rectangular segment spanning
@@ -2411,15 +2424,16 @@ pub mod fp_py {
                 /// `MatrixSliceMut::add_identity` invariant; otherwise a
                 /// `ValueError` is raised rather than panicking.
                 fn add_identity(&mut self, start: usize, end: usize) -> PyResult<()> {
-                    let cols = segment_cols(&self.0, start, end)?;
-                    if self.0.rows() != cols {
+                    let m = self.0.get_mut()?;
+                    let cols = segment_cols(m, start, end)?;
+                    if m.rows() != cols {
                         return Err(PyValueError::new_err(format!(
                             "add_identity requires a square segment: matrix has {} rows but \
                              segment [{start}, {end}] has {cols} columns",
-                            self.0.rows()
+                            m.rows()
                         )));
                     }
-                    self.0.segment(start, end).add_identity();
+                    m.segment(start, end).add_identity();
                     Ok(())
                 }
 
@@ -2437,9 +2451,10 @@ pub mod fp_py {
                     start: usize,
                     end: usize,
                 ) -> PyResult<PyFpVector> {
-                    checked_row(i, self.0.rows())?;
-                    segment_cols(&self.0, start, end)?;
-                    Ok(PyFpVector(self.0.row_segment(i, start, end).to_owned()))
+                    let m = self.0.get()?;
+                    checked_row(i, m.rows())?;
+                    segment_cols(m, start, end)?;
+                    Ok(PyFpVector(m.row_segment(i, start, end).to_owned()))
                 }
 
                 /// Return a mutable rectangular view spanning all rows and the
@@ -2453,10 +2468,11 @@ pub mod fp_py {
                     start: usize,
                     end: usize,
                 ) -> PyResult<PyMatrixSliceMut> {
-                    segment_cols(&slf.0, start, end)?;
-                    let row_end = slf.0.rows();
-                    let col_start = slf.0.start[start];
-                    let col_end = slf.0.end[end];
+                    let (row_end, col_start, col_end) = {
+                        let m = slf.0.get()?;
+                        segment_cols(m, start, end)?;
+                        (m.rows(), m.start[start], m.end[end])
+                    };
                     let py = slf.py();
                     Ok(PyMatrixSliceMut {
                         parent: MatrixParent::$variant(slf.into_pyobject(py)?.unbind()),
@@ -2479,10 +2495,12 @@ pub mod fp_py {
                     start: usize,
                     end: usize,
                 ) -> PyResult<PyFpSliceMut> {
-                    checked_row(i, slf.0.rows())?;
-                    segment_cols(&slf.0, start, end)?;
-                    let col_start = slf.0.start[start];
-                    let col_end = slf.0.end[end];
+                    let (col_start, col_end) = {
+                        let m = slf.0.get()?;
+                        checked_row(i, m.rows())?;
+                        segment_cols(m, start, end)?;
+                        (m.start[start], m.end[end])
+                    };
                     let py = slf.py();
                     Ok(PyFpSliceMut {
                         parent: SliceParent::MatrixRow {
@@ -2499,26 +2517,32 @@ pub mod fp_py {
                 /// arities. Raises `ValueError` if the matrix has not been row
                 /// reduced (its pivots are uninitialized), instead of panicking.
                 fn compute_kernel(&self) -> PyResult<PySubspace> {
-                    ensure_pivots_initialized(self.0.pivots().len(), self.0.columns())?;
-                    Ok(PySubspace(self.0.compute_kernel()))
+                    let m = self.0.get()?;
+                    ensure_pivots_initialized(m.pivots().len(), m.columns())?;
+                    Ok(PySubspace(m.compute_kernel()))
                 }
 
-                /// Return the inner `Matrix` as an owned `Matrix`.
+                /// Return the inner `Matrix` as an owned `Matrix`, **consuming**
+                /// this augmented matrix.
                 ///
-                /// Upstream `into_matrix` consumes `self`, but PyO3 methods
-                /// borrow the pyclass and cannot move out of it, so we clone the
-                /// inner matrix. The augmented matrix remains usable afterward.
-                fn into_matrix(&self) -> PyMatrix {
-                    PyMatrix(self.0.inner.clone())
+                /// Upstream `into_matrix` consumes `self`; we mirror that by
+                /// `take()`-ing the inner matrix out of the [`Consumable`]. After
+                /// this call the augmented matrix is consumed, so any further use
+                /// raises `RuntimeError`.
+                fn into_matrix(&mut self) -> PyResult<PyMatrix> {
+                    Ok(PyMatrix(self.0.take()?.into_matrix()))
                 }
 
                 fn __repr__(&self) -> String {
-                    format!(
-                        concat!($pyname, "({}, {}x{})"),
-                        self.0.prime().as_u32(),
-                        self.0.rows(),
-                        self.0.columns()
-                    )
+                    match self.0.get() {
+                        Ok(m) => format!(
+                            concat!($pyname, "({}, {}x{})"),
+                            m.prime().as_u32(),
+                            m.rows(),
+                            m.columns()
+                        ),
+                        Err(_) => concat!($pyname, "(consumed)").to_string(),
+                    }
                 }
 
                 $($extra)*
@@ -2531,8 +2555,9 @@ pub mod fp_py {
         /// row reduced), returning an owned `Subspace`. Raises `ValueError` if
         /// the matrix has not been row reduced, instead of panicking.
         fn compute_image(&self) -> PyResult<PySubspace> {
-            ensure_pivots_initialized(self.0.pivots().len(), self.0.columns())?;
-            Ok(PySubspace(self.0.compute_image()))
+            let m = self.0.get()?;
+            ensure_pivots_initialized(m.pivots().len(), m.columns())?;
+            Ok(PySubspace(m.compute_image()))
         }
 
         /// Compute the quasi-inverse of the augmented matrix `[A | I]` (which
@@ -2540,8 +2565,9 @@ pub mod fp_py {
         /// `ValueError` if the matrix has not been row reduced, instead of
         /// panicking.
         fn compute_quasi_inverse(&self) -> PyResult<PyQuasiInverse> {
-            ensure_pivots_initialized(self.0.pivots().len(), self.0.columns())?;
-            Ok(PyQuasiInverse(self.0.compute_quasi_inverse()))
+            let m = self.0.get()?;
+            ensure_pivots_initialized(m.pivots().len(), m.columns())?;
+            Ok(PyQuasiInverse(m.compute_quasi_inverse()))
         }
     });
 
@@ -2551,14 +2577,18 @@ pub mod fp_py {
         /// pair `(quasi_inverse_of_A, residual_quasi_inverse)`.
         ///
         /// Upstream `compute_quasi_inverses` consumes and heavily mutates the
-        /// matrix; since PyO3 cannot move out of a borrowed pyclass we operate
-        /// on a clone, leaving the original augmented matrix unchanged.
+        /// matrix; we mirror that by `take()`-ing the inner matrix out, so this
+        /// **consumes** the augmented matrix. After this call any further use
+        /// raises `RuntimeError`.
         ///
-        /// Raises `ValueError` if the matrix has not been row reduced (its
-        /// pivots are uninitialized), instead of panicking.
-        fn compute_quasi_inverses(&self) -> PyResult<(PyQuasiInverse, PyQuasiInverse)> {
-            ensure_pivots_initialized(self.0.pivots().len(), self.0.columns())?;
-            let (a, b) = self.0.clone().compute_quasi_inverses();
+        /// Raises `ValueError` (without consuming) if the matrix has not been
+        /// row reduced (its pivots are uninitialized), instead of panicking.
+        fn compute_quasi_inverses(&mut self) -> PyResult<(PyQuasiInverse, PyQuasiInverse)> {
+            {
+                let m = self.0.get()?;
+                ensure_pivots_initialized(m.pivots().len(), m.columns())?;
+            }
+            let (a, b) = self.0.take()?.compute_quasi_inverses();
             Ok((PyQuasiInverse(a), PyQuasiInverse(b)))
         }
     });
@@ -3534,13 +3564,13 @@ pub mod fp_py {
         #[test]
         fn augmented_matrix_construction_and_queries() {
             let m = PyAugmentedMatrix2::new(3, 2, vec![2, 2]).unwrap();
-            assert_eq!(m.prime(), 3);
-            assert_eq!(m.rows(), 2);
+            assert_eq!(m.prime().unwrap(), 3);
+            assert_eq!(m.rows().unwrap(), 2);
             assert_eq!(m.segments(), 2);
             // start[0] = 0; start[1] = padded_len(3, 2). columns() = end[1].
-            assert_eq!(m.segment_starts()[0], 0);
-            assert_eq!(m.segment_ends()[1], m.columns());
-            assert!(m.is_zero());
+            assert_eq!(m.segment_starts().unwrap()[0], 0);
+            assert_eq!(m.segment_ends().unwrap()[1], m.columns().unwrap());
+            assert!(m.is_zero().unwrap());
 
             // Wrong number of segment widths raises.
             assert!(PyAugmentedMatrix2::new(3, 2, vec![2]).is_err());
@@ -3556,9 +3586,9 @@ pub mod fp_py {
             let mut m = PyAugmentedMatrix2::new(2, 2, vec![2, 2]).unwrap();
             m.add_identity(1, 1).unwrap();
             // The identity sits in the second segment; row 0 has a 1 at start[1].
-            let start1 = m.segment_starts()[1];
-            assert_eq!(m.to_vec()[0][start1], 1);
-            assert_eq!(m.to_vec()[1][start1 + 1], 1);
+            let start1 = m.segment_starts().unwrap()[1];
+            assert_eq!(m.to_vec().unwrap()[0][start1], 1);
+            assert_eq!(m.to_vec().unwrap()[1][start1 + 1], 1);
 
             // Out-of-range segment indices raise.
             assert!(m.add_identity(0, 2).is_err());
@@ -3589,17 +3619,25 @@ pub mod fp_py {
             m.add_identity(1, 1).unwrap();
             // Put A = identity in segment 0 as well so [I | I]; image is full.
             m.add_identity(0, 0).unwrap();
-            m.row_reduce();
+            m.row_reduce().unwrap();
             let image = m.compute_image().unwrap();
             assert_eq!(image.prime(), 2);
             assert_eq!(image.dimension(), 2);
             let qi = m.compute_quasi_inverse().unwrap();
             assert_eq!(qi.prime(), 2);
             assert_eq!(qi.source_dimension(), 2);
-            // into_matrix returns an owned Matrix leaving the original usable.
-            let inner = m.into_matrix();
+            // `into_matrix` now consumes the augmented matrix.
+            assert!(!m.0.is_consumed());
+            let inner = m.into_matrix().unwrap();
             assert_eq!(inner.rows(), 2);
-            assert_eq!(m.rows(), 2);
+            // After consumption the wrapper is marked consumed and any further
+            // use raises `RuntimeError`.
+            assert!(m.0.is_consumed());
+            Python::initialize();
+            Python::attach(|py| {
+                assert!(unwrap_py_err(m.rows()).is_instance_of::<PyRuntimeError>(py));
+                assert!(unwrap_py_err(m.into_matrix()).is_instance_of::<PyRuntimeError>(py));
+            });
         }
 
         #[test]
@@ -3609,13 +3647,15 @@ pub mod fp_py {
             m.add_identity(0, 0).unwrap();
             m.add_identity(1, 1).unwrap();
             m.add_identity(2, 2).unwrap();
-            m.row_reduce();
+            m.row_reduce().unwrap();
             let ker = m.compute_kernel().unwrap();
             assert_eq!(ker.prime(), 3);
             // [A | B | I] with all identity blocks: A is the identity, so it is
             // injective and surjective. The kernel of an injective map is zero.
             assert_eq!(ker.dimension(), 0);
             let (a, b) = m.compute_quasi_inverses().unwrap();
+            // `compute_quasi_inverses` consumes the augmented matrix.
+            assert!(m.0.is_consumed());
             assert_eq!(a.prime(), 3);
             assert_eq!(b.prime(), 3);
             // A = I is surjective onto F3^2, so its quasi-inverse has source
@@ -3647,11 +3687,13 @@ pub mod fp_py {
                     assert!(err.is_instance_of::<PyValueError>(py));
                 }
 
-                let m3 = PyAugmentedMatrix3::new(3, 2, vec![2, 2, 2]).unwrap();
+                let mut m3 = PyAugmentedMatrix3::new(3, 2, vec![2, 2, 2]).unwrap();
                 assert!(unwrap_py_err(m3.compute_kernel()).is_instance_of::<PyValueError>(py));
                 assert!(
                     unwrap_py_err(m3.compute_quasi_inverses()).is_instance_of::<PyValueError>(py)
                 );
+                // The failed (not row-reduced) call must not have consumed it.
+                assert!(!m3.0.is_consumed());
 
                 // A bare Matrix.compute_quasi_inverse shares the gap.
                 let raw = PyMatrix::new(2, 2, 4).unwrap();
@@ -3782,14 +3824,14 @@ pub mod fp_py {
                 assert_eq!(seg.rows(py).unwrap(), 2);
                 assert_eq!(seg.columns(py).unwrap(), 2);
                 seg.add_identity(py).unwrap();
-                let start1 = m.borrow(py).segment_starts()[1];
-                assert_eq!(m.borrow(py).to_vec()[0][start1], 1);
-                assert_eq!(m.borrow(py).to_vec()[1][start1 + 1], 1);
+                let start1 = m.borrow(py).segment_starts().unwrap()[1];
+                assert_eq!(m.borrow(py).to_vec().unwrap()[0][start1], 1);
+                assert_eq!(m.borrow(py).to_vec().unwrap()[1][start1 + 1], 1);
 
                 // row_segment_mut writes through to the inner matrix.
                 let row = PyAugmentedMatrix2::row_segment_mut(m.borrow(py), 0, 0, 0).unwrap();
                 row.set_entry(py, 0, 1).unwrap();
-                assert_eq!(m.borrow(py).to_vec()[0][0], 1);
+                assert_eq!(m.borrow(py).to_vec().unwrap()[0][0], 1);
             });
         }
 
@@ -3807,15 +3849,15 @@ pub mod fp_py {
                 assert_eq!(seg.rows(py).unwrap(), 2);
                 assert_eq!(seg.columns(py).unwrap(), 2);
                 seg.add_identity(py).unwrap();
-                let start1 = m.borrow(py).segment_starts()[1];
-                assert_eq!(m.borrow(py).to_vec()[0][start1], 1);
-                assert_eq!(m.borrow(py).to_vec()[1][start1 + 1], 1);
+                let start1 = m.borrow(py).segment_starts().unwrap()[1];
+                assert_eq!(m.borrow(py).to_vec().unwrap()[0][start1], 1);
+                assert_eq!(m.borrow(py).to_vec().unwrap()[1][start1 + 1], 1);
 
                 // row_segment_mut writes through to the inner matrix and is
                 // observable via row_segment.
                 let row = PyAugmentedMatrix3::row_segment_mut(m.borrow(py), 0, 0, 0).unwrap();
                 row.set_entry(py, 0, 2).unwrap();
-                assert_eq!(m.borrow(py).to_vec()[0][0], 2);
+                assert_eq!(m.borrow(py).to_vec().unwrap()[0][0], 2);
                 assert_eq!(m.borrow(py).row_segment(0, 0, 0).unwrap().0.entry(0), 2);
             });
         }
@@ -3848,7 +3890,7 @@ pub mod fp_py {
             aug.segment(1, 1).add_identity();
             aug.row_reduce();
 
-            let m2 = PyAugmentedMatrix2(aug);
+            let m2 = PyAugmentedMatrix2(Consumable::new("AugmentedMatrix2", aug));
 
             // Image basis and dimension exactly as in the upstream doctest:
             // image = [[1,0,2,1,1],[0,1,1,0,1]], a 2-dim subspace of F3^5.
