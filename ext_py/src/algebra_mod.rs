@@ -5,12 +5,13 @@ pub mod algebra_py {
     use std::sync::Arc;
 
     use ::algebra::module::{
-        block_structure::BlockStructure as RsBlockStructure, steenrod_module,
-        FDModule as RsFDModule, FPModule as RsFPModule, FreeModule as RsFreeModule,
-        HomModule as RsHomModule, Module, OperationGeneratorPair as RsOperationGeneratorPair,
-        QuotientModule as RsQuotientModule, RealProjectiveSpace as RsRealProjectiveSpace,
-        SteenrodModule as RsSteenrodModule, SuspensionModule as RsSuspensionModule,
-        TensorModule as RsTensorModule,
+        block_structure::BlockStructure as RsBlockStructure,
+        homomorphism::{FreeModuleHomomorphism as RsFreeModuleHomomorphism, ModuleHomomorphism},
+        steenrod_module, FDModule as RsFDModule, FPModule as RsFPModule,
+        FreeModule as RsFreeModule, HomModule as RsHomModule, Module,
+        OperationGeneratorPair as RsOperationGeneratorPair, QuotientModule as RsQuotientModule,
+        RealProjectiveSpace as RsRealProjectiveSpace, SteenrodModule as RsSteenrodModule,
+        SuspensionModule as RsSuspensionModule, TensorModule as RsTensorModule,
     };
     use ::algebra::{Algebra, Bialgebra, Field as RsField, GeneratedAlgebra};
     use ::fp::prime::{self, Prime};
@@ -66,6 +67,18 @@ pub mod algebra_py {
     /// `add_generators`/`add_relations` can take `&mut` via `Arc::get_mut` (the
     /// `QuotientModule` pattern: mutation fails while a box shares the `Arc`).
     type FPModuleInner = RsFPModule<RsSteenrodAlgebra>;
+    /// A `FreeModuleHomomorphism` whose *target* is the boxed dynamic module
+    /// `RsSteenrodModule` (`Arc<dyn Module>`), mirroring the Tensor/Suspension/
+    /// Quotient monomorphisation. Upstream's
+    /// `FreeModuleHomomorphism<M>::Source` is then
+    /// `FreeModule<M::Algebra> = FreeModule<SteenrodAlgebra> = FreeModuleInner`
+    /// (since `RsSteenrodModule::Algebra = SteenrodAlgebra`), so the source is
+    /// exactly the bound `FreeModule` pyclass and the target is the bound
+    /// `SteenrodModule` pyclass; both share their `Arc`-held state with the
+    /// homomorphism. All of its mutators use interior mutability (`OnceVec`/
+    /// `OnceBiVec`) and take `&self`, so the pyclass holds the value directly
+    /// (no `Consumable`/`Arc::get_mut` dance is required).
+    type FreeModuleHomomorphismInner = RsFreeModuleHomomorphism<RsSteenrodModule>;
     /// A borrowed trait object over the algebra union. The flattened `Module`
     /// method set is implemented once against this type and shared by every
     /// concrete module pyclass and by `SteenrodModule` via dynamic dispatch.
@@ -4956,6 +4969,645 @@ pub mod algebra_py {
         }
     }
 
+    /// A homomorphism `f: F -> M` out of a `FreeModule` `F` (the *source*) into
+    /// an arbitrary module `M` (the *target*), with `output_degree =
+    /// input_degree - degree_shift`. This is the workhorse of resolution
+    /// machinery: a differential is a `FreeModuleHomomorphism` built up
+    /// degree-by-degree by specifying the image of each new generator.
+    ///
+    /// The source is the bound `FreeModule` pyclass and the target is the bound
+    /// `SteenrodModule` pyclass; both share their `Arc`-held state with this
+    /// homomorphism (the `source()`/`target()` accessors hand back the same
+    /// underlying module, not a copy). Box a concrete target module with
+    /// `.into_steenrod_module()` first.
+    ///
+    /// Every degree-indexed access is pre-checked so that an uncomputed degree,
+    /// out-of-range index, prime/length mismatch, or non-consecutive mutation
+    /// raises `ValueError`/`IndexError` rather than panicking across the FFI
+    /// boundary. The internal `outputs`/`images`/`kernels`/`quasi_inverses`
+    /// tables use interior mutability (`OnceBiVec`), so every method takes
+    /// `&self`.
+    #[pyclass(name = "FreeModuleHomomorphism")]
+    pub struct FreeModuleHomomorphism(FreeModuleHomomorphismInner);
+
+    impl FreeModuleHomomorphism {
+        /// Dimension of the source `FreeModule` in `degree` (guarded; computes
+        /// the basis first and reads 0 below `min_degree`).
+        fn source_dim(&self, degree: i32) -> usize {
+            module_dimension(&*self.0.source() as &DynModule, degree)
+        }
+
+        /// Dimension of the target module in `degree` (guarded).
+        fn target_dim(&self, degree: i32) -> usize {
+            module_dimension(&**self.0.target() as &DynModule, degree)
+        }
+
+        /// Ensure both the source basis through `input_degree` and the target
+        /// basis through `output_degree` are computed.
+        fn ensure_through(&self, input_degree: i32, output_degree: i32) {
+            module_ensure(&*self.0.source() as &DynModule, input_degree);
+            module_ensure(&**self.0.target() as &DynModule, output_degree);
+        }
+
+        /// `input_degree - degree_shift`, raising `ValueError` on overflow.
+        fn output_degree(&self, input_degree: i32) -> PyResult<i32> {
+            input_degree
+                .checked_sub(self.0.degree_shift())
+                .ok_or_else(|| PyValueError::new_err("output degree overflows i32"))
+        }
+
+        /// Number of generators of the source in `degree`, reading 0 (never
+        /// panicking) outside the populated generator range — mirrors
+        /// `FreeModule::num_gens_safe`.
+        fn source_num_gens(&self, degree: i32) -> usize {
+            let source = self.0.source();
+            if degree < source.min_degree() || degree > source.max_computed_degree() {
+                return 0;
+            }
+            source.number_of_gens_in_degree(degree)
+        }
+
+        /// Verify the outputs are defined on every source generator that can
+        /// appear in a basis element of degree `<= hi`. `apply_to_basis_element`
+        /// reads `outputs[generator_degree]` (panicking if `generator_degree >=
+        /// next_degree()`), so a basis element built on a generator whose output
+        /// is not yet set would abort across the boundary. A generator in degree
+        /// `d` only exists once it has been added to the source, i.e. for `d <=
+        /// source.max_computed_degree()`. We therefore reject if any such
+        /// generator degree in `[next_degree(), hi]` carries generators. (Used
+        /// by the methods that touch *every* basis element in a degree —
+        /// `get_partial_matrix`/`compute_auxiliary_data_through_degree`.)
+        fn check_outputs_cover(&self, hi: i32) -> PyResult<()> {
+            let source = self.0.source();
+            let lo = self.0.next_degree().max(source.min_degree());
+            let hi = hi.min(source.max_computed_degree());
+            for d in lo..=hi {
+                if source.number_of_gens_in_degree(d) > 0 {
+                    return Err(PyValueError::new_err(format!(
+                        "the homomorphism's outputs are not defined on the source generators in \
+                         degree {d}; define them (extend_by_zero / add_generators_from_rows) up to \
+                         degree {hi} first"
+                    )));
+                }
+            }
+            Ok(())
+        }
+
+        /// Verify that the single basis element `(input_degree, input_idx)` only
+        /// involves a generator whose output is defined. Returns `Ok` for a
+        /// generator below `min_degree()` (which `apply_to_basis_element` treats
+        /// as contributing zero) and for any generator degree `< next_degree()`;
+        /// rejects a generator degree `>= next_degree()` (which would index the
+        /// `outputs` table out of range). The caller must have already computed
+        /// the source basis through `input_degree` and bounds-checked
+        /// `input_idx`.
+        fn check_basis_element_defined(&self, input_degree: i32, input_idx: usize) -> PyResult<()> {
+            let source = self.0.source();
+            let generator_degree = source
+                .index_to_op_gen(input_degree, input_idx)
+                .generator_degree;
+            if generator_degree >= self.0.next_degree() {
+                return Err(PyValueError::new_err(format!(
+                    "the homomorphism's output is not defined on the source generator in degree \
+                     {generator_degree} (define it with add_generators_from_rows / extend_by_zero \
+                     first)"
+                )));
+            }
+            Ok(())
+        }
+    }
+
+    #[pymethods]
+    impl FreeModuleHomomorphism {
+        /// Build the zero homomorphism `source -> target` with the given
+        /// `degree_shift` (`output_degree = input_degree - degree_shift`). The
+        /// outputs on generators are all unset; populate them with
+        /// `add_generators_from_rows`/`add_generators_from_matrix_rows`/
+        /// `extend_by_zero`. The factors must be built over the *same* algebra
+        /// object (checked by prime and `Arc` identity, like `TensorModule`),
+        /// since the homomorphism applies the source's algebra action on the
+        /// target.
+        #[new]
+        #[pyo3(signature = (source, target, degree_shift = 0))]
+        pub fn new(
+            source: PyRef<'_, FreeModule>,
+            target: PyRef<'_, SteenrodModule>,
+            degree_shift: i32,
+        ) -> PyResult<Self> {
+            let source_alg = source.0.algebra();
+            let target_alg = target.0.algebra();
+            checked_same_prime(source_alg.prime().as_u32(), target_alg.prime().as_u32())?;
+            if !Arc::ptr_eq(&source_alg, &target_alg) {
+                return Err(PyValueError::new_err(
+                    "source and target must be built over the same algebra",
+                ));
+            }
+            Ok(FreeModuleHomomorphism(FreeModuleHomomorphismInner::new(
+                Arc::clone(&source.0),
+                Arc::new(Arc::clone(&target.0)),
+                degree_shift,
+            )))
+        }
+
+        // --- flattened ModuleHomomorphism method set --------------------------
+
+        /// The source `FreeModule` (shares state via `Arc`).
+        pub fn source(&self) -> FreeModule {
+            FreeModule(self.0.source())
+        }
+
+        /// The target module, boxed as a `SteenrodModule` (shares state via
+        /// `Arc`).
+        pub fn target(&self) -> SteenrodModule {
+            SteenrodModule((*self.0.target()).clone())
+        }
+
+        /// The degree shift: `output_degree = input_degree - degree_shift`.
+        pub fn degree_shift(&self) -> i32 {
+            self.0.degree_shift()
+        }
+
+        /// The smallest input degree the homomorphism is defined on,
+        /// `max(source.min_degree(), target.min_degree() + degree_shift)`.
+        pub fn min_degree(&self) -> i32 {
+            self.0.min_degree()
+        }
+
+        /// The prime as a plain `int` (`ValidPrime` is never exposed).
+        pub fn prime(&self) -> u32 {
+            self.0.prime().as_u32()
+        }
+
+        /// Apply the homomorphism to the basis element `input_idx` in
+        /// `input_degree`, adding `coeff` times its image into `result` (a
+        /// vector of length `target.dimension(input_degree - degree_shift)`).
+        pub fn apply_to_basis_element(
+            &self,
+            py: Python<'_>,
+            result: &Bound<'_, PyAny>,
+            coeff: u32,
+            input_degree: i32,
+            input_idx: usize,
+        ) -> PyResult<()> {
+            let p = self.0.prime().as_u32();
+            let coeff = coeff % p;
+            if input_degree < self.0.source().min_degree() {
+                return Err(PyIndexError::new_err(format!(
+                    "input degree {input_degree} is below the source min_degree {}",
+                    self.0.source().min_degree()
+                )));
+            }
+            let output_degree = self.output_degree(input_degree)?;
+            self.ensure_through(input_degree, output_degree);
+            let src_dim = self.source_dim(input_degree);
+            if input_idx >= src_dim {
+                return Err(PyIndexError::new_err(format!(
+                    "input index {input_idx} out of range for source degree {input_degree} \
+                     (dimension {src_dim})"
+                )));
+            }
+            self.check_basis_element_defined(input_degree, input_idx)?;
+            let out_dim = self.target_dim(output_degree);
+            crate::fp_py::with_target_slice_mut(py, result, |mut res| {
+                checked_same_prime(res.prime().as_u32(), p)?;
+                checked_equal_len(res.as_slice().len(), out_dim)?;
+                self.0
+                    .apply_to_basis_element(res.copy(), coeff, input_degree, input_idx);
+                Ok(())
+            })
+        }
+
+        /// Apply the homomorphism to a general `input` element of
+        /// `source` in `input_degree` (length `source.dimension(input_degree)`),
+        /// adding `coeff` times its image into `result`.
+        pub fn apply(
+            &self,
+            py: Python<'_>,
+            result: &Bound<'_, PyAny>,
+            coeff: u32,
+            input_degree: i32,
+            input: &Bound<'_, PyAny>,
+        ) -> PyResult<()> {
+            let p = self.0.prime().as_u32();
+            let coeff = coeff % p;
+            if input_degree < self.0.source().min_degree() {
+                return Err(PyIndexError::new_err(format!(
+                    "input degree {input_degree} is below the source min_degree {}",
+                    self.0.source().min_degree()
+                )));
+            }
+            let output_degree = self.output_degree(input_degree)?;
+            self.ensure_through(input_degree, output_degree);
+            let src_dim = self.source_dim(input_degree);
+            let out_dim = self.target_dim(output_degree);
+            crate::fp_py::with_input_slice(py, input, |in_slice| {
+                checked_same_prime(in_slice.prime().as_u32(), p)?;
+                checked_equal_len(in_slice.len(), src_dim)?;
+                // Every basis element with a nonzero coefficient must be built
+                // on a generator whose output is defined, else
+                // `apply_to_basis_element` would index the `outputs` table out
+                // of range. Check precisely so a partially-defined map can still
+                // be applied to inputs that only touch the defined part.
+                for (i, _) in in_slice.iter_nonzero() {
+                    self.check_basis_element_defined(input_degree, i)?;
+                }
+                crate::fp_py::with_target_slice_mut(py, result, |mut res| {
+                    checked_same_prime(res.prime().as_u32(), p)?;
+                    checked_equal_len(res.as_slice().len(), out_dim)?;
+                    self.0.apply(res.copy(), coeff, input_degree, in_slice);
+                    Ok(())
+                })
+            })
+        }
+
+        /// The kernel of the homomorphism in `degree`, if it has been computed
+        /// (via `compute_auxiliary_data_through_degree` or `set_kernel`).
+        /// Returns `None` otherwise (never panics).
+        pub fn kernel(&self, degree: i32) -> Option<crate::fp_py::PySubspace> {
+            self.0
+                .kernel(degree)
+                .map(|s| crate::fp_py::PySubspace::from_rust(s.clone()))
+        }
+
+        /// The image of the homomorphism in `degree`, if it has been computed.
+        pub fn image(&self, degree: i32) -> Option<crate::fp_py::PySubspace> {
+            self.0
+                .image(degree)
+                .map(|s| crate::fp_py::PySubspace::from_rust(s.clone()))
+        }
+
+        /// The quasi-inverse of the homomorphism in `degree`, if it has been
+        /// computed.
+        pub fn quasi_inverse(&self, degree: i32) -> Option<crate::fp_py::PyQuasiInverse> {
+            self.0
+                .quasi_inverse(degree)
+                .map(|qi| crate::fp_py::PyQuasiInverse::from_rust(qi.clone()))
+        }
+
+        /// Compute (and cache) the image, kernel and quasi-inverse at every
+        /// input degree up to `degree`. Requires the outputs on generators to be
+        /// defined through `degree` (otherwise raises `ValueError`); also raises
+        /// `ValueError` if a previous manual `set_image`/`set_kernel`/
+        /// `set_quasi_inverse` has left the three auxiliary tables out of sync
+        /// (which would otherwise panic on a non-consecutive insert).
+        pub fn compute_auxiliary_data_through_degree(&self, degree: i32) -> PyResult<()> {
+            let kernels_len = self.0.kernels.len();
+            // The auxiliary data is only computed for degrees `>= kernels_len`;
+            // each such degree's matrix touches every basis element, so the
+            // outputs must be defined on every source generator up to `degree`.
+            if degree >= kernels_len {
+                self.check_outputs_cover(degree)?;
+            }
+            if self.0.images.len() != kernels_len || self.0.quasi_inverses.len() != kernels_len {
+                return Err(PyValueError::new_err(
+                    "auxiliary data tables are out of sync (a prior set_image/set_kernel/\
+                     set_quasi_inverse advanced them unequally); cannot compute",
+                ));
+            }
+            self.0.compute_auxiliary_data_through_degree(degree);
+            Ok(())
+        }
+
+        /// The matrix whose rows are the images of the source basis elements
+        /// `inputs` in `degree`. Columns index `target.dimension(degree)`.
+        ///
+        /// Note: upstream sizes the matrix columns by `target.dimension(degree)`
+        /// but the per-row application lands in `target.dimension(degree -
+        /// degree_shift)`; the two agree (so the call is well-defined) exactly
+        /// when those dimensions coincide — always the case for `degree_shift ==
+        /// 0`. We pre-check that equality and raise `ValueError` otherwise rather
+        /// than letting the dimension assertion panic.
+        pub fn get_partial_matrix(
+            &self,
+            degree: i32,
+            inputs: Vec<usize>,
+        ) -> PyResult<crate::fp_py::PyMatrix> {
+            if degree < self.0.source().min_degree() {
+                return Err(PyIndexError::new_err(format!(
+                    "degree {degree} is below the source min_degree {}",
+                    self.0.source().min_degree()
+                )));
+            }
+            let output_degree = self.output_degree(degree)?;
+            self.ensure_through(degree, output_degree);
+            let src_dim = self.source_dim(degree);
+            for &i in &inputs {
+                if i >= src_dim {
+                    return Err(PyIndexError::new_err(format!(
+                        "input index {i} out of range for source degree {degree} (dimension \
+                         {src_dim})"
+                    )));
+                }
+            }
+            self.check_outputs_cover(degree)?;
+            if self.target_dim(degree) != self.target_dim(output_degree) {
+                return Err(PyValueError::new_err(
+                    "get_partial_matrix is only well-defined when target.dimension(degree) == \
+                     target.dimension(degree - degree_shift) (e.g. degree_shift == 0)",
+                ));
+            }
+            Ok(crate::fp_py::PyMatrix::from_rust(
+                self.0.get_partial_matrix(degree, &inputs),
+            ))
+        }
+
+        /// Apply the quasi-inverse at `degree` to `input`, adding the result
+        /// into `result`. Returns `True` if the quasi-inverse was available (and
+        /// applied), `False` otherwise. `input` has length
+        /// `target.dimension(degree - degree_shift)` and `result` has length
+        /// `source.dimension(degree)`.
+        pub fn apply_quasi_inverse(
+            &self,
+            py: Python<'_>,
+            result: &Bound<'_, PyAny>,
+            degree: i32,
+            input: &Bound<'_, PyAny>,
+        ) -> PyResult<bool> {
+            let p = self.0.prime().as_u32();
+            let Some(qi) = self.0.quasi_inverse(degree) else {
+                return Ok(false);
+            };
+            let source_dim = qi.source_dimension();
+            let target_dim = qi.target_dimension();
+            crate::fp_py::with_input_slice(py, input, |in_slice| {
+                checked_same_prime(in_slice.prime().as_u32(), p)?;
+                checked_equal_len(in_slice.len(), target_dim)?;
+                crate::fp_py::with_target_slice_mut(py, result, |mut res| {
+                    checked_same_prime(res.prime().as_u32(), p)?;
+                    checked_equal_len(res.as_slice().len(), source_dim)?;
+                    qi.apply(res.copy(), 1, in_slice);
+                    Ok(())
+                })
+            })?;
+            Ok(true)
+        }
+
+        // --- FreeModuleHomomorphism-specific methods --------------------------
+
+        /// The first input degree whose outputs on generators have *not* yet
+        /// been defined (i.e. the length of the `outputs` table).
+        pub fn next_degree(&self) -> i32 {
+            self.0.next_degree()
+        }
+
+        /// The image of the generator `(generator_degree, generator_index)`, a
+        /// vector of length `target.dimension(generator_degree - degree_shift)`.
+        pub fn output(
+            &self,
+            generator_degree: i32,
+            generator_index: usize,
+        ) -> PyResult<crate::fp_py::PyFpVector> {
+            if generator_degree < self.0.min_degree() {
+                return Err(PyIndexError::new_err(format!(
+                    "generator degree {generator_degree} is below min_degree {}",
+                    self.0.min_degree()
+                )));
+            }
+            if generator_degree >= self.0.next_degree() {
+                return Err(PyValueError::new_err(format!(
+                    "outputs are only defined through degree {} (add generators / extend_by_zero \
+                     first)",
+                    self.0.next_degree() - 1
+                )));
+            }
+            let num_gens = self.source_num_gens(generator_degree);
+            if generator_index >= num_gens {
+                return Err(PyIndexError::new_err(format!(
+                    "generator index {generator_index} out of range in degree {generator_degree} \
+                     ({num_gens} generators)"
+                )));
+            }
+            Ok(crate::fp_py::PyFpVector::from_rust(
+                self.0.output(generator_degree, generator_index).clone(),
+            ))
+        }
+
+        /// Apply the homomorphism to the generator `idx` in `degree`, adding
+        /// `coeff` times its image (`output(degree, idx)`) into `result`.
+        pub fn apply_to_generator(
+            &self,
+            py: Python<'_>,
+            result: &Bound<'_, PyAny>,
+            coeff: u32,
+            degree: i32,
+            idx: usize,
+        ) -> PyResult<()> {
+            let p = self.0.prime().as_u32();
+            let coeff = coeff % p;
+            if degree < self.0.min_degree() {
+                return Err(PyIndexError::new_err(format!(
+                    "generator degree {degree} is below min_degree {}",
+                    self.0.min_degree()
+                )));
+            }
+            if degree >= self.0.next_degree() {
+                return Err(PyValueError::new_err(format!(
+                    "outputs are only defined through degree {} (add generators / extend_by_zero \
+                     first)",
+                    self.0.next_degree() - 1
+                )));
+            }
+            let num_gens = self.source_num_gens(degree);
+            if idx >= num_gens {
+                return Err(PyIndexError::new_err(format!(
+                    "generator index {idx} out of range in degree {degree} ({num_gens} generators)"
+                )));
+            }
+            let output_degree = self.output_degree(degree)?;
+            let out_dim = self.target_dim(output_degree);
+            crate::fp_py::with_target_slice_mut(py, result, |mut res| {
+                checked_same_prime(res.prime().as_u32(), p)?;
+                checked_equal_len(res.as_slice().len(), out_dim)?;
+                res.add(self.0.output(degree, idx).as_slice(), coeff);
+                Ok(())
+            })
+        }
+
+        /// Set the outputs on the generators in `degree` to zero, extending the
+        /// `outputs` table up to `degree`. Requires the source's generator
+        /// counts to be defined through `degree`.
+        pub fn extend_by_zero(&self, degree: i32) -> PyResult<()> {
+            if degree >= self.0.next_degree() && degree > self.0.source().max_computed_degree() {
+                return Err(PyValueError::new_err(format!(
+                    "source generators are only defined through degree {} (cannot extend \
+                     outputs to degree {degree})",
+                    self.0.source().max_computed_degree()
+                )));
+            }
+            let output_degree = self.output_degree(degree)?;
+            self.ensure_through(degree, output_degree);
+            self.0.extend_by_zero(degree);
+            Ok(())
+        }
+
+        /// Define the outputs on the generators in `degree` from `rows`, one
+        /// vector per generator (each of length `target.dimension(degree -
+        /// degree_shift)`). `degree` must be the next undefined degree
+        /// (`next_degree()`), consistent with the consecutive `OnceVec` push.
+        pub fn add_generators_from_rows(
+            &self,
+            py: Python<'_>,
+            degree: i32,
+            rows: Vec<Bound<'_, PyAny>>,
+        ) -> PyResult<()> {
+            let p = self.0.prime().as_u32();
+            if degree != self.0.next_degree() {
+                return Err(PyValueError::new_err(format!(
+                    "generators must be added consecutively: expected degree {}, got {degree}",
+                    self.0.next_degree()
+                )));
+            }
+            if degree > self.0.source().max_computed_degree() {
+                return Err(PyValueError::new_err(format!(
+                    "source generators are only defined through degree {}",
+                    self.0.source().max_computed_degree()
+                )));
+            }
+            let num_gens = self.source_num_gens(degree);
+            if rows.len() != num_gens {
+                return Err(PyValueError::new_err(format!(
+                    "expected {num_gens} rows (one per generator in degree {degree}), got {}",
+                    rows.len()
+                )));
+            }
+            let output_degree = self.output_degree(degree)?;
+            self.ensure_through(degree, output_degree);
+            let out_dim = self.target_dim(output_degree);
+            let mut owned: Vec<::fp::vector::FpVector> = Vec::with_capacity(rows.len());
+            for row in &rows {
+                let vec = crate::fp_py::extract_input_owned(py, row)?;
+                checked_same_prime(vec.prime().as_u32(), p)?;
+                checked_equal_len(vec.len(), out_dim)?;
+                owned.push(vec);
+            }
+            self.0.add_generators_from_rows(degree, owned);
+            Ok(())
+        }
+
+        /// Define the outputs on the generators in `degree` from the rows of
+        /// `matrix` (the first `num_gens` rows are used). `degree` must be the
+        /// next undefined degree. The matrix must have at least `num_gens` rows
+        /// and exactly `target.dimension(degree - degree_shift)` columns.
+        pub fn add_generators_from_matrix_rows(
+            &self,
+            degree: i32,
+            matrix: PyRef<'_, crate::fp_py::PyMatrix>,
+        ) -> PyResult<()> {
+            let p = self.0.prime().as_u32();
+            if degree != self.0.next_degree() {
+                return Err(PyValueError::new_err(format!(
+                    "generators must be added consecutively: expected degree {}, got {degree}",
+                    self.0.next_degree()
+                )));
+            }
+            if degree > self.0.source().max_computed_degree() {
+                return Err(PyValueError::new_err(format!(
+                    "source generators are only defined through degree {}",
+                    self.0.source().max_computed_degree()
+                )));
+            }
+            let num_gens = self.source_num_gens(degree);
+            let output_degree = self.output_degree(degree)?;
+            self.ensure_through(degree, output_degree);
+            let out_dim = self.target_dim(output_degree);
+            let m = matrix.as_rust();
+            checked_same_prime(m.prime().as_u32(), p)?;
+            if m.rows() < num_gens {
+                return Err(PyValueError::new_err(format!(
+                    "matrix has {} rows but {num_gens} generators in degree {degree}",
+                    m.rows()
+                )));
+            }
+            if out_dim != 0 && m.columns() != out_dim {
+                return Err(PyValueError::new_err(format!(
+                    "matrix has {} columns but the target degree has dimension {out_dim}",
+                    m.columns()
+                )));
+            }
+            let mut owned = m.clone();
+            self.0
+                .add_generators_from_matrix_rows(degree, owned.as_slice_mut());
+            Ok(())
+        }
+
+        /// The average density (fraction of nonzero entries) of the output
+        /// vectors on the generators in `degree`. Returns `nan` if there are no
+        /// generators in `degree`. Requires the outputs in `degree` to be
+        /// defined.
+        pub fn differential_density(&self, degree: i32) -> PyResult<f32> {
+            if degree < self.0.min_degree() || degree >= self.0.next_degree() {
+                return Err(PyValueError::new_err(format!(
+                    "outputs are not defined in degree {degree} (defined for {}..{})",
+                    self.0.min_degree(),
+                    self.0.next_degree()
+                )));
+            }
+            Ok(self.0.differential_density(degree))
+        }
+
+        /// Manually set the cached image in `degree`. `degree` must be the next
+        /// undefined image degree (consecutive `OnceVec` push).
+        pub fn set_image(
+            &self,
+            degree: i32,
+            image: Option<PyRef<'_, crate::fp_py::PySubspace>>,
+        ) -> PyResult<()> {
+            if degree != self.0.images.len() {
+                return Err(PyValueError::new_err(format!(
+                    "image must be set consecutively: expected degree {}, got {degree}",
+                    self.0.images.len()
+                )));
+            }
+            self.0.set_image(degree, image.map(|s| s.as_rust().clone()));
+            Ok(())
+        }
+
+        /// Manually set the cached kernel in `degree`. `degree` must be the next
+        /// undefined kernel degree.
+        pub fn set_kernel(
+            &self,
+            degree: i32,
+            kernel: Option<PyRef<'_, crate::fp_py::PySubspace>>,
+        ) -> PyResult<()> {
+            if degree != self.0.kernels.len() {
+                return Err(PyValueError::new_err(format!(
+                    "kernel must be set consecutively: expected degree {}, got {degree}",
+                    self.0.kernels.len()
+                )));
+            }
+            self.0
+                .set_kernel(degree, kernel.map(|s| s.as_rust().clone()));
+            Ok(())
+        }
+
+        /// Manually set the cached quasi-inverse in `degree`. `degree` must be
+        /// the next undefined quasi-inverse degree.
+        pub fn set_quasi_inverse(
+            &self,
+            degree: i32,
+            quasi_inverse: Option<PyRef<'_, crate::fp_py::PyQuasiInverse>>,
+        ) -> PyResult<()> {
+            if degree != self.0.quasi_inverses.len() {
+                return Err(PyValueError::new_err(format!(
+                    "quasi-inverse must be set consecutively: expected degree {}, got {degree}",
+                    self.0.quasi_inverses.len()
+                )));
+            }
+            self.0
+                .set_quasi_inverse(degree, quasi_inverse.map(|qi| qi.as_rust().clone()));
+            Ok(())
+        }
+
+        pub fn __repr__(&self) -> String {
+            format!(
+                "FreeModuleHomomorphism(source={}, target={}, degree_shift={})",
+                self.0.source(),
+                self.0.target(),
+                self.0.degree_shift()
+            )
+        }
+    }
+
     #[pymodule_init]
     fn init(_m: &Bound<'_, PyModule>) -> PyResult<()> {
         // Arbitrary code to run at the module initialization
@@ -6408,6 +7060,169 @@ pub mod algebra_py {
             assert_eq!(p.generator_degree, 3);
             assert_eq!(p.generator_index, 1);
             assert_eq!(p.basis_index, 2);
+        }
+
+        // --- §5.4 FreeModuleHomomorphism --------------------------------------
+
+        /// Build `f: F -> C2` where `F` has a single generator `g` in degree 0
+        /// and `f(g) = x0` (the bottom cell of `C2`). The source basis is
+        /// computed through degree 2; the output on `g` is set via the inner
+        /// API. Returns `(hom, prime)`.
+        fn c2_differential(py: Python<'_>) -> (FreeModuleHomomorphism, ::fp::prime::ValidPrime) {
+            let p = ::fp::prime::ValidPrime::new(2);
+            let algebra = Py::new(py, SteenrodAlgebra::milnor(2, false).unwrap()).unwrap();
+            let source =
+                Py::new(py, FreeModule::new(algebra.borrow(py), "F".to_string(), 0)).unwrap();
+            source.borrow(py).compute_basis(3);
+            source.borrow(py).0.add_generators(0, 1, None);
+            // Define the (empty) generator counts through degree 2 as well, so
+            // the source's `num_gens` table is populated and `extend_by_zero`
+            // can extend the homomorphism's outputs past degree 0.
+            source.borrow(py).0.add_generators(1, 0, None);
+            source.borrow(py).0.add_generators(2, 0, None);
+            source.borrow(py).0.compute_basis(3);
+            let target = Py::new(py, c2_module_over(py, &algebra)).unwrap();
+            let hom = FreeModuleHomomorphism::new(source.borrow(py), target.borrow(py), 0).unwrap();
+            // f(g) = x0 = [1] in target degree 0 (dimension 1).
+            let mut row = ::fp::vector::FpVector::new(p, 1);
+            row.set_entry(0, 1);
+            hom.0.add_generators_from_rows(0, vec![row]);
+            (hom, p)
+        }
+
+        #[test]
+        fn fmh_basic_invariants_and_source_target() {
+            Python::initialize();
+            Python::attach(|py| {
+                let (hom, _) = c2_differential(py);
+                assert_eq!(hom.prime(), 2);
+                assert_eq!(hom.degree_shift(), 0);
+                assert_eq!(hom.min_degree(), 0);
+                assert_eq!(hom.next_degree(), 1);
+                // source/target share state and report faithfully.
+                assert_eq!(hom.source().number_of_gens_in_degree(0), 1);
+                let target = hom.target();
+                assert_eq!(target.dimension(0), 1);
+                assert_eq!(target.dimension(1), 1);
+            });
+        }
+
+        #[test]
+        fn fmh_apply_known_values() {
+            Python::initialize();
+            Python::attach(|py| {
+                let (hom, _) = c2_differential(py);
+
+                // f(g) = x0: basis element (degree 0, idx 0) -> [1].
+                let res0 = Py::new(py, crate::fp_py::PyFpVector::new(2, 1).unwrap()).unwrap();
+                hom.apply_to_basis_element(py, res0.bind(py).as_any(), 1, 0, 0)
+                    .unwrap();
+                assert_eq!(res0.borrow(py).entry(0).unwrap(), 1);
+
+                // f(Sq1 . g) = Sq1 . x0 = x1: basis element (degree 1, idx 0) ->
+                // [1] in target degree 1.
+                let res1 = Py::new(py, crate::fp_py::PyFpVector::new(2, 1).unwrap()).unwrap();
+                hom.apply_to_basis_element(py, res1.bind(py).as_any(), 1, 1, 0)
+                    .unwrap();
+                assert_eq!(res1.borrow(py).entry(0).unwrap(), 1);
+
+                // apply on a general element [1] in degree 0 agrees.
+                let input = Py::new(
+                    py,
+                    crate::fp_py::PyFpVector::from_slice(2, vec![1]).unwrap(),
+                )
+                .unwrap();
+                let res2 = Py::new(py, crate::fp_py::PyFpVector::new(2, 1).unwrap()).unwrap();
+                hom.apply(py, res2.bind(py).as_any(), 1, 0, input.bind(py).as_any())
+                    .unwrap();
+                assert_eq!(res2.borrow(py).entry(0).unwrap(), 1);
+
+                // apply_to_generator(g) and output(0, 0) both give [1].
+                let res3 = Py::new(py, crate::fp_py::PyFpVector::new(2, 1).unwrap()).unwrap();
+                hom.apply_to_generator(py, res3.bind(py).as_any(), 1, 0, 0)
+                    .unwrap();
+                assert_eq!(res3.borrow(py).entry(0).unwrap(), 1);
+                assert_eq!(hom.output(0, 0).unwrap().entry(0).unwrap(), 1);
+            });
+        }
+
+        #[test]
+        fn fmh_auxiliary_data_dimensions() {
+            Python::initialize();
+            Python::attach(|py| {
+                let (hom, _) = c2_differential(py);
+                // Need outputs through degree 1 for the degree-1 matrix.
+                hom.extend_by_zero(1).unwrap();
+                hom.compute_auxiliary_data_through_degree(1).unwrap();
+
+                // Degree 0: f is an iso k -> k, image dim 1, kernel dim 0.
+                assert_eq!(hom.image(0).unwrap().dimension(), 1);
+                assert_eq!(hom.kernel(0).unwrap().dimension(), 0);
+                // Degree 1: f(Sq1 g) = x1, again an iso k -> k.
+                assert_eq!(hom.image(1).unwrap().dimension(), 1);
+                assert_eq!(hom.kernel(1).unwrap().dimension(), 0);
+
+                // quasi_inverse exists and inverts: qi(x0) = g in degree 0.
+                assert!(hom.quasi_inverse(0).is_some());
+                let res = Py::new(py, crate::fp_py::PyFpVector::new(2, 1).unwrap()).unwrap();
+                let input = Py::new(
+                    py,
+                    crate::fp_py::PyFpVector::from_slice(2, vec![1]).unwrap(),
+                )
+                .unwrap();
+                let applied = hom
+                    .apply_quasi_inverse(py, res.bind(py).as_any(), 0, input.bind(py).as_any())
+                    .unwrap();
+                assert!(applied);
+                assert_eq!(res.borrow(py).entry(0).unwrap(), 1);
+
+                // get_partial_matrix on input [g] in degree 0: 1x1 matrix.
+                let m = hom.get_partial_matrix(0, vec![0]).unwrap();
+                assert_eq!(m.rows(), 1);
+                assert_eq!(m.columns(), 1);
+            });
+        }
+
+        #[test]
+        fn fmh_guards_raise_not_panic() {
+            Python::initialize();
+            Python::attach(|py| {
+                let (hom, _) = c2_differential(py);
+                let res = Py::new(py, crate::fp_py::PyFpVector::new(2, 1).unwrap()).unwrap();
+
+                // Out-of-range source index -> IndexError.
+                assert!(hom
+                    .apply_to_basis_element(py, res.bind(py).as_any(), 1, 0, 9)
+                    .is_err());
+                // Wrong result length -> ValueError.
+                let bad = Py::new(py, crate::fp_py::PyFpVector::new(2, 3).unwrap()).unwrap();
+                assert!(hom
+                    .apply_to_basis_element(py, bad.bind(py).as_any(), 1, 0, 0)
+                    .is_err());
+                // Prime mismatch -> ValueError.
+                let badp = Py::new(py, crate::fp_py::PyFpVector::new(3, 1).unwrap()).unwrap();
+                assert!(hom
+                    .apply_to_basis_element(py, badp.bind(py).as_any(), 1, 0, 0)
+                    .is_err());
+
+                // Non-consecutive add_generators_from_rows -> ValueError.
+                let row = Py::new(
+                    py,
+                    crate::fp_py::PyFpVector::from_slice(2, vec![1]).unwrap(),
+                )
+                .unwrap();
+                assert!(hom
+                    .add_generators_from_rows(py, 5, vec![row.bind(py).as_any().clone()])
+                    .is_err());
+
+                // Uncomputed kernel reads as None (never panics).
+                assert!(hom.kernel(7).is_none());
+                assert!(hom.image(7).is_none());
+                assert!(hom.quasi_inverse(7).is_none());
+
+                // differential_density on an undefined degree -> ValueError.
+                assert!(hom.differential_density(9).is_err());
+            });
         }
     }
 }
