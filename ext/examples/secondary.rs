@@ -50,41 +50,47 @@ use std::sync::Arc;
 use algebra::module::Module;
 use ext::{
     chain_complex::{ChainComplex, FreeChainComplex},
-    secondary::*,
+    ext_algebra::{ExtAlgebra, secondary::SecondaryExtAlgebra},
     utils::query_module,
 };
-use sseq::coordinates::{Bidegree, BidegreeGenerator};
+use sseq::coordinates::Bidegree;
 
 fn main() -> anyhow::Result<()> {
     ext::utils::init_logging()?;
 
     let resolution = Arc::new(query_module(Some(algebra::AlgebraType::Milnor), true)?);
 
-    let lift = SecondaryResolution::new(Arc::clone(&resolution));
+    // The d2 differential is intrinsic to the resolution and needs no unit, so we avoid the unit
+    // setup with `without_unit`.
+    let sec = SecondaryExtAlgebra::new(Arc::new(ExtAlgebra::without_unit(resolution)));
+
     if let Some(s) = ext::utils::secondary_job() {
-        lift.compute_partial(s);
+        sec.compute_partial(s);
         return Ok(());
     }
 
-    lift.extend_all();
+    sec.extend_all();
 
+    let alg = sec.ext_algebra();
     let d2_shift = Bidegree::n_s(-1, 2);
 
-    // Iterate through target of the d2
-    for b in lift.underlying().iter_nonzero_stem() {
+    // Iterate through the target of the d2, in the same order as before.
+    for b in alg.resolution().iter_nonzero_stem() {
         if b.s() < 3 {
             continue;
         }
 
-        if b.t() - 1 > resolution.module(b.s() - 2).max_computed_degree() {
+        // The source of the d2 must be computed (its degree may exceed what `module(b.s() - 2)`
+        // reaches when resolving through a stem).
+        if b.t() - 1 > alg.resolution().module(b.s() - 2).max_computed_degree() {
             continue;
         }
-        let homotopy = lift.homotopy(b.s());
-        let m = homotopy.homotopies.hom_k(b.t() - 1);
 
-        for (i, entry) in m.into_iter().enumerate() {
-            let source_gen = BidegreeGenerator::new(b - d2_shift, i);
-            println!("d_2 x_{source_gen} = {entry:?}");
+        for g in alg.basis(b - d2_shift) {
+            if let Some(dx) = sec.d2(&alg.generator(g)) {
+                let entry: Vec<u32> = dx.vec().iter().collect();
+                println!("d_2 x_{g} = {entry:?}");
+            }
         }
     }
 
