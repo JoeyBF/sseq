@@ -19,6 +19,7 @@
 //! The secondary differential ($d_2$) and the $\Mod_{C\lambda^2}$ secondary product live in the
 //! [`secondary`] submodule ([`SecondaryExtAlgebra`](secondary::SecondaryExtAlgebra)).
 
+pub mod massey;
 pub mod secondary;
 
 use std::sync::Arc;
