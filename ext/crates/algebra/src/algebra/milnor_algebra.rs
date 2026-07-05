@@ -238,9 +238,13 @@ pub mod profile {
             );
             eprintln!("  fraction of term-work in R's with ≥ W terms (W = workgroup size):");
             for w in [32u64, 64, 128, 256, 512, 1024] {
-                let (n_r, work): (u64, u64) = r_terms.values().fold((0, 0), |(n, s), &t| {
-                    if t >= w { (n + 1, s + t) } else { (n, s) }
-                });
+                let (n_r, work): (u64, u64) =
+                    r_terms.values().fold(
+                        (0, 0),
+                        |(n, s), &t| {
+                            if t >= w { (n + 1, s + t) } else { (n, s) }
+                        },
+                    );
                 eprintln!(
                     "    W={w:<4} : {n_r:>6} R's ({:>5.1}% of R's) cover {:>5.1}% of term-work",
                     100.0 * n_r as f64 / distinct.max(1) as f64,
