@@ -85,8 +85,14 @@ pub mod profile {
         /// Histogram of `(operation_degree, element_degree)` per call.
         pub static DEG_HIST: LazyLock<Mutex<FxHashMap<(i32, i32), u64>>> =
             LazyLock::new(|| Mutex::new(FxHashMap::default()));
+        /// Total element terms multiplied by each distinct operation `R = (degree, index)`. This is
+        /// the GPU-occupancy metric for Nassau's `Sq(R) · Σ Sq(Sⱼ)` kernel: batching all work sharing
+        /// one `R` (uniform matrix enumeration) gives this many threads' worth of uniform work, so
+        /// the distribution says how well workgroups would fill.
+        pub static R_TERMS: LazyLock<Mutex<FxHashMap<(i32, usize), u64>>> =
+            LazyLock::new(|| Mutex::new(FxHashMap::default()));
 
-        pub fn record_call(nnz: usize, r_degree: i32, s_degree: i32) {
+        pub fn record_call(nnz: usize, r_degree: i32, r_index: usize, s_degree: i32) {
             MBE_CALLS.fetch_add(1, Relaxed);
             *NNZ_HIST.lock().unwrap().entry(nnz).or_default() += 1;
             *DEG_HIST
@@ -94,6 +100,11 @@ pub mod profile {
                 .unwrap()
                 .entry((r_degree, s_degree))
                 .or_default() += 1;
+            *R_TERMS
+                .lock()
+                .unwrap()
+                .entry((r_degree, r_index))
+                .or_default() += nnz as u64;
         }
 
         pub fn admissible() {
@@ -209,6 +220,31 @@ pub mod profile {
                 eprintln!(
                     "  op={r:<3} elt={s:<3} : {v} ({:.1}%)",
                     100.0 * *v as f64 / calls as f64
+                );
+            }
+
+            // GPU-occupancy view: group all element terms by the operation `R` they are multiplied
+            // by. Nassau's kernel (`Sq(R) · Σ Sq(Sⱼ)`) parallelizes over terms sharing one `R` with
+            // uniform matrix enumeration, so a workgroup of size `W` is well-filled only by `R`s that
+            // accumulate ≥ `W` terms. We report what fraction of all term-work lives in such `R`s.
+            let r_terms = R_TERMS.lock().unwrap();
+            let distinct = r_terms.len() as u64;
+            let total_terms: u64 = r_terms.values().sum();
+            let max_terms = r_terms.values().copied().max().unwrap_or(0);
+            eprintln!(
+                "GPU occupancy — distinct operations R: {distinct}, total element terms: \
+                 {total_terms}, mean terms/R: {:.1}, max: {max_terms}",
+                total_terms as f64 / distinct.max(1) as f64
+            );
+            eprintln!("  fraction of term-work in R's with ≥ W terms (W = workgroup size):");
+            for w in [32u64, 64, 128, 256, 512, 1024] {
+                let (n_r, work): (u64, u64) = r_terms.values().fold((0, 0), |(n, s), &t| {
+                    if t >= w { (n + 1, s + t) } else { (n, s) }
+                });
+                eprintln!(
+                    "    W={w:<4} : {n_r:>6} R's ({:>5.1}% of R's) cover {:>5.1}% of term-work",
+                    100.0 * n_r as f64 / distinct.max(1) as f64,
+                    100.0 * work as f64 / total_terms.max(1) as f64
                 );
             }
             eprintln!("===========================================================");
@@ -1304,6 +1340,7 @@ impl MilnorAlgebra {
         profile!(profile::record_call(
             s.iter_nonzero().count(),
             r_degree,
+            r_idx,
             s_degree
         ));
 
