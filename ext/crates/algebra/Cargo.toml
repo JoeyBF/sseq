@@ -51,3 +51,7 @@ harness = false
 [[bench]]
 name = "module_action"
 harness = false
+
+[[bench]]
+name = "nassau_milnor"
+harness = false
