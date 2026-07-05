@@ -1432,6 +1432,11 @@ impl MilnorAlgebra {
         mut allocation: PPartAllocation,
     ) -> PPartAllocation {
         let target_deg = m1.degree + m2.degree;
+        // The unstable dimension only depends on `target_deg` and `excess`, both loop-invariant, so
+        // compute the truncation bound once instead of per output term. In Nassau's stable path
+        // (`excess = i32::MAX`) this is the full dimension and the check never fires, but keeping it
+        // hoisted is correct for the unstable callers too.
+        let dim = self.dimension_unstable(target_deg, excess);
         if self.generic() {
             let m1f = self.multiply_qpart(m1, m2.q_part);
             for (cc, basis) in m1f {
@@ -1446,7 +1451,7 @@ impl MilnorAlgebra {
 
                 while let Some(c) = multiplier.next() {
                     let idx = self.basis_element_to_index(&multiplier.ans);
-                    if idx < self.dimension_unstable(target_deg, excess) {
+                    if idx < dim {
                         res.add_basis_element(idx, c * cc * coef);
                     }
                 }
@@ -1467,7 +1472,7 @@ impl MilnorAlgebra {
                 profile!(profile::ppart_term());
                 let idx = self.basis_element_to_index(&multiplier.ans);
                 profile!(profile::index_lookup());
-                if idx < self.dimension_unstable(target_deg, excess) {
+                if idx < dim {
                     res.add_basis_element(idx, c * coef);
                     profile!(profile::output_add());
                 }
