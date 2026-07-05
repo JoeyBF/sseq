@@ -11,6 +11,211 @@ use serde::{Deserialize, Serialize};
 
 use crate::algebra::{Algebra, Bialgebra, GeneratedAlgebra, UnstableAlgebra, combinatorics};
 
+/// Wrap profiling-only statements. Expands to nothing unless the crate is built with the
+/// `MILNOR_PROFILE` environment variable set (which turns on `cfg(milnor_profile)`; see `build.rs`),
+/// so the hot-path hooks below cost *nothing* — not even argument evaluation — in normal builds.
+macro_rules! profile {
+    ($($body:tt)*) => {
+        #[cfg(milnor_profile)]
+        {
+            $($body)*
+        }
+    };
+}
+
+/// Compile-time-gated counters for the Milnor multiplication hot path, to pinpoint what to
+/// optimize (how sparse the operands are, how much matrix enumeration is wasted, how many index
+/// lookups we pay, which path is taken, …).
+///
+/// Enable by building with `MILNOR_PROFILE=1` (e.g.
+/// `MILNOR_PROFILE=1 cargo run --release --example nassau_e2e -- 80 42 1`); otherwise every counter
+/// and hook is removed by `#[cfg]`. Call [`report`] to print a summary to stderr.
+pub mod profile {
+    #[cfg(milnor_profile)]
+    pub use enabled::*;
+
+    /// Print the collected multiply statistics to stderr (or a note if profiling is disabled).
+    #[cfg(not(milnor_profile))]
+    pub fn report() {
+        eprintln!(
+            "[milnor profile] disabled — rebuild with `MILNOR_PROFILE=1` to collect multiply stats"
+        );
+    }
+
+    #[cfg(milnor_profile)]
+    mod enabled {
+        use std::sync::{
+            LazyLock, Mutex,
+            atomic::{AtomicU64, Ordering::Relaxed},
+        };
+
+        use rustc_hash::FxHashMap;
+
+        macro_rules! counters {
+            ($($(#[$m:meta])* $name:ident),* $(,)?) => {
+                $($(#[$m])* pub static $name: AtomicU64 = AtomicU64::new(0);)*
+            };
+        }
+        counters! {
+            /// `multiply_basis_element_by_element` (p=2) calls that do work.
+            MBE_CALLS,
+            /// … that took the admissible-matrix sweep.
+            MBE_ADMISSIBLE,
+            /// … that fell back to the per-term `PPartMultiplier` path.
+            MBE_PERTERM,
+            /// … where the operation was the identity `Sq(∅)`.
+            MBE_IDENTITY,
+            /// Basis×basis `multiply_with_allocation` invocations.
+            KERNEL_CALLS,
+            /// `PPartMultiplier` candidate terms yielded (before the index/bound checks).
+            PPART_TERMS,
+            /// `basis_element_to_index` lookups on the multiply hot path.
+            INDEX_LOOKUPS,
+            /// `add_basis_element` calls that actually contribute an output term.
+            OUTPUT_ADDS,
+            /// Admissible matrices enumerated (admissible path only).
+            ADM_MATRICES,
+            /// (matrix, term) compatibility tests (admissible path only).
+            ADM_TESTS,
+        }
+
+        /// Histogram of `nnz(s)` — the number of non-zero terms of the element being acted on.
+        pub static NNZ_HIST: LazyLock<Mutex<FxHashMap<usize, u64>>> =
+            LazyLock::new(|| Mutex::new(FxHashMap::default()));
+        /// Histogram of `(operation_degree, element_degree)` per call.
+        pub static DEG_HIST: LazyLock<Mutex<FxHashMap<(i32, i32), u64>>> =
+            LazyLock::new(|| Mutex::new(FxHashMap::default()));
+
+        pub fn record_call(nnz: usize, r_degree: i32, s_degree: i32) {
+            MBE_CALLS.fetch_add(1, Relaxed);
+            *NNZ_HIST.lock().unwrap().entry(nnz).or_default() += 1;
+            *DEG_HIST
+                .lock()
+                .unwrap()
+                .entry((r_degree, s_degree))
+                .or_default() += 1;
+        }
+
+        pub fn admissible() {
+            MBE_ADMISSIBLE.fetch_add(1, Relaxed);
+        }
+        pub fn perterm() {
+            MBE_PERTERM.fetch_add(1, Relaxed);
+        }
+        pub fn identity() {
+            MBE_IDENTITY.fetch_add(1, Relaxed);
+        }
+        pub fn kernel_call() {
+            KERNEL_CALLS.fetch_add(1, Relaxed);
+        }
+        pub fn ppart_term() {
+            PPART_TERMS.fetch_add(1, Relaxed);
+        }
+        pub fn index_lookup() {
+            INDEX_LOOKUPS.fetch_add(1, Relaxed);
+        }
+        pub fn output_add() {
+            OUTPUT_ADDS.fetch_add(1, Relaxed);
+        }
+        pub fn adm_matrix() {
+            ADM_MATRICES.fetch_add(1, Relaxed);
+        }
+        pub fn adm_test() {
+            ADM_TESTS.fetch_add(1, Relaxed);
+        }
+
+        pub fn report() {
+            let calls = MBE_CALLS.load(Relaxed);
+            if calls == 0 {
+                eprintln!("[milnor profile] no multiply_basis_element_by_element (p=2) calls seen");
+                return;
+            }
+            let (adm, per, ident) = (
+                MBE_ADMISSIBLE.load(Relaxed),
+                MBE_PERTERM.load(Relaxed),
+                MBE_IDENTITY.load(Relaxed),
+            );
+            let zero = calls - adm - per - ident;
+            let adds = OUTPUT_ADDS.load(Relaxed);
+            let pct = |x: u64| 100.0 * x as f64 / calls as f64;
+            let per_add = |x: u64| {
+                if adds > 0 {
+                    x as f64 / adds as f64
+                } else {
+                    0.0
+                }
+            };
+
+            eprintln!("================= Milnor multiply profile =================");
+            eprintln!("multiply_basis_element_by_element (p=2) calls : {calls}");
+            eprintln!("  admissible-matrix path : {adm:>12} ({:5.1}%)", pct(adm));
+            eprintln!("  per-term path          : {per:>12} ({:5.1}%)", pct(per));
+            eprintln!(
+                "  identity Sq(∅)         : {ident:>12} ({:5.1}%)",
+                pct(ident)
+            );
+            eprintln!("  zero element (nnz=0)   : {zero:>12} ({:5.1}%)", pct(zero));
+
+            let hist = NNZ_HIST.lock().unwrap();
+            let n: u64 = hist.values().sum();
+            let weighted: u64 = hist.iter().map(|(k, v)| *k as u64 * v).sum();
+            eprintln!(
+                "element term-count nnz : mean {:.2} over {n} calls",
+                weighted as f64 / n.max(1) as f64
+            );
+            let mut keys: Vec<usize> = hist.keys().copied().collect();
+            keys.sort_unstable();
+            let mut cum = 0u64;
+            for k in keys {
+                let v = hist[&k];
+                cum += v;
+                if k <= 6 || k.is_multiple_of(10) {
+                    eprintln!(
+                        "  nnz={k:<3} {:>6.2}%  cum {:>6.2}%",
+                        100.0 * v as f64 / n as f64,
+                        100.0 * cum as f64 / n as f64
+                    );
+                }
+            }
+
+            eprintln!(
+                "kernel basis×basis multiply_with_allocation : {}",
+                KERNEL_CALLS.load(Relaxed)
+            );
+            eprintln!("output basis-element adds : {adds}");
+            eprintln!(
+                "PPartMultiplier candidate terms : {} ({:.2} per output add)",
+                PPART_TERMS.load(Relaxed),
+                per_add(PPART_TERMS.load(Relaxed))
+            );
+            eprintln!(
+                "basis_element_to_index lookups  : {} ({:.2} per output add)",
+                INDEX_LOOKUPS.load(Relaxed),
+                per_add(INDEX_LOOKUPS.load(Relaxed))
+            );
+            let matrices = ADM_MATRICES.load(Relaxed);
+            if matrices > 0 {
+                eprintln!(
+                    "admissible matrices enumerated  : {matrices} ({:.1} term-tests each)",
+                    ADM_TESTS.load(Relaxed) as f64 / matrices as f64
+                );
+            }
+
+            let deg = DEG_HIST.lock().unwrap();
+            let mut pairs: Vec<((i32, i32), u64)> = deg.iter().map(|(k, v)| (*k, *v)).collect();
+            pairs.sort_by_key(|(_, v)| std::cmp::Reverse(*v));
+            eprintln!("top (operation_degree, element_degree) call sites:");
+            for ((r, s), v) in pairs.iter().take(10) {
+                eprintln!(
+                    "  op={r:<3} elt={s:<3} : {v} ({:.1}%)",
+                    100.0 * *v as f64 / calls as f64
+                );
+            }
+            eprintln!("===========================================================");
+        }
+    }
+}
+
 fn q_part_default() -> u32 {
     !0
 }
@@ -1096,11 +1301,17 @@ impl MilnorAlgebra {
         if coeff.is_multiple_of(2) {
             return;
         }
+        profile!(profile::record_call(
+            s.iter_nonzero().count(),
+            r_degree,
+            s_degree
+        ));
 
         let r = self.basis_element_from_index(r_degree, r_idx);
         // `Sq(∅) = 1`, so `Sq(R) * s = s`. (Also avoids an empty `AdmissibleMatrix`.) The output
         // degree equals `s_degree`, so basis indices are unchanged.
         if r.p_part.is_empty() {
+            profile!(profile::identity());
             for (i, _) in s.iter_nonzero() {
                 result.add_basis_element(i, 1);
             }
@@ -1118,6 +1329,7 @@ impl MilnorAlgebra {
             return; // s = 0
         };
         let Some((i1, _)) = second else {
+            profile!(profile::perterm());
             PPartAllocation::with_local(|allocation| {
                 self.multiply_with_allocation(
                     result,
@@ -1137,6 +1349,7 @@ impl MilnorAlgebra {
         terms.push(self.basis_element_from_index(s_degree, i0));
         terms.push(self.basis_element_from_index(s_degree, i1));
         terms.extend(nonzero.map(|(i, _)| self.basis_element_from_index(s_degree, i)));
+        profile!(profile::admissible());
 
         let out_degree = r_degree + s_degree;
         let mut matrix = AdmissibleMatrix::new(&r.p_part);
@@ -1147,7 +1360,9 @@ impl MilnorAlgebra {
         };
 
         loop {
+            profile!(profile::adm_matrix());
             'outer: for term in &terms {
+                profile!(profile::adm_test());
                 let basis = &term.p_part;
                 working.p_part.clear();
 
@@ -1197,7 +1412,9 @@ impl MilnorAlgebra {
                 }
 
                 let idx = self.basis_element_to_index(&working);
+                profile!(profile::index_lookup());
                 result.add_basis_element(idx, 1);
+                profile!(profile::output_add());
             }
             if !matrix.next() {
                 break;
@@ -1236,6 +1453,7 @@ impl MilnorAlgebra {
                 allocation = multiplier.into_allocation()
             }
         } else {
+            profile!(profile::kernel_call());
             let mut multiplier = PPartMultiplier::<false>::new_from_allocation(
                 self.prime(),
                 &m1.p_part,
@@ -1246,9 +1464,12 @@ impl MilnorAlgebra {
             );
 
             while let Some(c) = multiplier.next() {
+                profile!(profile::ppart_term());
                 let idx = self.basis_element_to_index(&multiplier.ans);
+                profile!(profile::index_lookup());
                 if idx < self.dimension_unstable(target_deg, excess) {
                     res.add_basis_element(idx, c * coef);
+                    profile!(profile::output_add());
                 }
             }
             allocation = multiplier.into_allocation()

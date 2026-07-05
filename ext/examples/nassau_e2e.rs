@@ -43,4 +43,7 @@ fn main() {
         );
     }
     println!("S_2 @ p=2  stem={n}  filtration={s}  runs={runs}  best={best:.2}s");
+
+    // Prints Milnor-multiply counters when built with `MILNOR_PROFILE=1`, else a one-line note.
+    algebra::milnor_algebra::profile::report();
 }
