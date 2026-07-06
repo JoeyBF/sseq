@@ -132,8 +132,12 @@ pub trait ModuleHomomorphism: Send + Sync {
 
         // One matrix build is the largest unit a GPU kernel could batch without buffering across
         // the streaming algorithm; mark it as a launch scope for the realizable-occupancy metric.
+        // The `(self pointer, degree)` key groups builds of the same differential at one bidegree.
         #[cfg(milnor_profile)]
-        crate::algebra::milnor_algebra::profile::scope_begin();
+        crate::algebra::milnor_algebra::profile::scope_begin(
+            std::ptr::from_ref(self) as *const () as usize,
+            degree,
+        );
         matrix
             .maybe_par_iter_mut()
             .enumerate()
@@ -152,8 +156,12 @@ pub trait ModuleHomomorphism: Send + Sync {
 
         // One matrix build is the largest unit a GPU kernel could batch without buffering across
         // the streaming algorithm; mark it as a launch scope for the realizable-occupancy metric.
+        // The `(self pointer, degree)` key groups builds of the same differential at one bidegree.
         #[cfg(milnor_profile)]
-        crate::algebra::milnor_algebra::profile::scope_begin();
+        crate::algebra::milnor_algebra::profile::scope_begin(
+            std::ptr::from_ref(self) as *const () as usize,
+            degree,
+        );
         matrix
             .maybe_par_iter_mut()
             .enumerate()

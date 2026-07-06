@@ -117,14 +117,27 @@ pub mod profile {
         /// feature would let two launches interleave into one scope and inflate the batch sizes.)
         struct ScopeState {
             depth: u32,
+            /// `(homomorphism id, degree)` of the currently open launch — its merged-scope key.
+            key: (usize, i32),
             map: FxHashMap<(i32, usize), u64>,
         }
         static SCOPE: LazyLock<Mutex<ScopeState>> = LazyLock::new(|| {
             Mutex::new(ScopeState {
                 depth: 0,
+                key: (0, 0),
                 map: FxHashMap::default(),
             })
         });
+
+        /// Coarser accumulation: `R → element-terms` merged across every launch sharing a
+        /// `(homomorphism id, degree)` key — i.e. all the per-signature `get_partial_matrix` builds
+        /// of one differential at one bidegree, which all read the same matrix and so *could* be
+        /// fused into a single kernel launch (computing the full matrix once and slicing it). Held to
+        /// report time and folded there, to measure how much the realizable occupancy improves when
+        /// the launch scope is widened from one masked build to one whole bidegree.
+        #[allow(clippy::type_complexity)]
+        static MERGED: LazyLock<Mutex<FxHashMap<(usize, i32), FxHashMap<(i32, usize), u64>>>> =
+            LazyLock::new(|| Mutex::new(FxHashMap::default()));
 
         /// Workgroup sizes for the realizable-coverage report (mirrors the global one).
         const SCOPE_WS: [u64; 6] = [32, 64, 128, 256, 512, 1024];
@@ -144,24 +157,38 @@ pub mod profile {
             AtomicU64::new(0),
         ];
 
-        /// Open a launch scope around a matrix build. Reentrancy-safe (see [`ScopeState`]).
-        pub fn scope_begin() {
+        /// Open a launch scope around a matrix build of homomorphism `hom_id` at `degree`.
+        /// Reentrancy-safe (see [`ScopeState`]); the key is set by the outermost open.
+        pub fn scope_begin(hom_id: usize, degree: i32) {
             let mut s = SCOPE.lock().unwrap();
             if s.depth == 0 {
                 s.map.clear();
+                s.key = (hom_id, degree);
             }
             s.depth += 1;
         }
 
-        /// Attribute `nnz` element-terms of operation `R = (r_degree, r_index)` to the open launch.
+        /// Attribute `nnz` element-terms of operation `R = (r_degree, r_index)` to the open launch,
+        /// both to its per-launch histogram and to its `(hom, degree)` merged bucket.
         pub fn scope_record(r_degree: i32, r_index: usize, nnz: usize) {
             if nnz == 0 {
                 return;
             }
-            let mut s = SCOPE.lock().unwrap();
-            if s.depth > 0 {
+            let key = {
+                let mut s = SCOPE.lock().unwrap();
+                if s.depth == 0 {
+                    return;
+                }
                 *s.map.entry((r_degree, r_index)).or_default() += nnz as u64;
-            }
+                s.key
+            };
+            *MERGED
+                .lock()
+                .unwrap()
+                .entry(key)
+                .or_default()
+                .entry((r_degree, r_index))
+                .or_default() += nnz as u64;
         }
 
         /// Close a launch scope; the outermost close folds the scope's `R`-histogram into the
@@ -356,6 +383,38 @@ pub mod profile {
                     eprintln!(
                         "    W={w:<4} : {:>5.1}% of term-work",
                         100.0 * work as f64 / scope_terms.max(1) as f64
+                    );
+                }
+            }
+
+            // Coarser scope: merge the per-signature builds of one differential at one bidegree into
+            // a single launch (they read the same matrix, so fusing them is free of extra multiply
+            // work). This upper-bounds the realizable occupancy for a kernel that computes the full
+            // bidegree matrix once instead of one masked slice per signature.
+            let merged = MERGED.lock().unwrap();
+            if !merged.is_empty() {
+                let n_launches = merged.len() as u64;
+                let mut total = 0u64;
+                let mut max_terms = 0u64;
+                let mut cover = [0u64; 6];
+                for hist in merged.values() {
+                    let t: u64 = hist.values().sum();
+                    total += t;
+                    max_terms = max_terms.max(t);
+                    for (i, &w) in SCOPE_WS.iter().enumerate() {
+                        cover[i] += hist.values().filter(|&&x| x >= w).sum::<u64>();
+                    }
+                }
+                eprintln!(
+                    "GPU occupancy — MERGED per (differential, bidegree) launch ({n_launches} \
+                     launches, mean {:.1} terms/launch, max {max_terms}):",
+                    total as f64 / n_launches.max(1) as f64
+                );
+                eprintln!("  fraction of term-work in R's reaching ≥ W terms *within one launch*:");
+                for (i, w) in SCOPE_WS.iter().enumerate() {
+                    eprintln!(
+                        "    W={w:<4} : {:>5.1}% of term-work",
+                        100.0 * cover[i] as f64 / total.max(1) as f64
                     );
                 }
             }
