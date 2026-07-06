@@ -490,6 +490,16 @@ impl<V> MilnorHashMap<V> {
     }
 }
 
+/// Flat, contiguous storage for the "seqno" (hash-free index) computation. See
+/// [`MilnorAlgebra::compute_seqno_tables`] for how `g` is derived and [`MilnorAlgebra::seqno`] for
+/// how it is read. Row-major with a fixed `width` (the number of ξ-degrees), so entry `(e, h)` lives
+/// at `g[e * width + h]`; degrees `0..=max_degree` are populated.
+struct SeqnoTables {
+    max_degree: i32,
+    width: usize,
+    g: Vec<usize>,
+}
+
 pub struct MilnorAlgebra {
     profile: MilnorProfile,
     p: ValidPrime,
@@ -510,14 +520,14 @@ pub struct MilnorAlgebra {
     /// degree -> MilnorBasisElement -> index
     basis_element_to_index_map: OnceVec<MilnorHashMap<usize>>,
 
-    /// Tables backing the O(log degree) "seqno" (index) computation, populated only when
-    /// [`Self::seqno_applicable`] holds (p = 2, trivial profile, stable). `n_table[e][m]` is the
-    /// number of `P(R)` of degree `e` using only `ξ₁ … ξ_{m+1}` (partitions of `e` into the first
-    /// `m+1` Mersenne parts); `g_table[e][h]` sums that count along the arithmetic progression of
-    /// step `ξ_{h+1}`. Together they let [`Self::seqno`] rank a `p_part` without a hash lookup.
-    /// See [`Self::compute_seqno_tables`].
-    n_table: OnceVec<Vec<usize>>,
-    g_table: OnceVec<Vec<usize>>,
+    /// Table backing the "seqno" (hash-free index) computation, populated only when
+    /// [`Self::seqno_applicable`] holds (p = 2, trivial profile, stable). It holds the flat,
+    /// row-major `g` array described in [`Self::compute_seqno_tables`]; [`Self::seqno`] ranks a
+    /// `p_part` from it with plain array indexing and no hash lookup. Stored behind an
+    /// [`arc_swap::ArcSwapOption`] rather than a [`OnceVec`] so that reads on the hot path are a
+    /// single guard load followed by direct indexing — the earlier `OnceVec<Vec<_>>` layout paid two
+    /// atomics *per table access*, which is what made the table lose to the hashmap.
+    seqno_tables: arc_swap::ArcSwapOption<SeqnoTables>,
 
     #[cfg(feature = "cache-multiplication")]
     /// source_deg -> target_deg -> source_op -> target_op
@@ -547,8 +557,7 @@ impl MilnorAlgebra {
             basis_table: OnceVec::new(),
             excess_table: OnceVec::new(),
             basis_element_to_index_map: OnceVec::new(),
-            n_table: OnceVec::new(),
-            g_table: OnceVec::new(),
+            seqno_tables: arc_swap::ArcSwapOption::empty(),
             #[cfg(feature = "cache-multiplication")]
             multiplication_table: OnceVec::new(),
         }
@@ -584,11 +593,14 @@ impl MilnorAlgebra {
     }
 
     pub fn try_basis_element_to_index(&self, elt: &MilnorBasisElement) -> Option<usize> {
-        // NB: the table-based [`Self::seqno`] computes this same index without a hash, but measured
-        // ~20–34% *slower* than this hashmap on the CPU — the `OnceVec` table access costs more than
-        // a probe, and the classic seqno win was against binary search, not a good hashmap. `seqno`
-        // is therefore kept as the GPU-oriented index (a GPU kernel cannot use a hashmap), not for
-        // the CPU hot path.
+        // NB: the table-based [`Self::seqno`] computes this same index without a hash, but it loses
+        // to this hashmap on the CPU. Even after moving its tables to flat, contiguous
+        // `arc_swap`-backed storage (removing the earlier `OnceVec` per-access atomics), the
+        // `benches/seqno` A/B still measures raw lookups at ~50 Melem/s for `seqno` vs ~115 Melem/s
+        // for this hashmap — a ~2.3× gap that is flat across degree: computing the rank (a degree
+        // sum plus two indexed table reads per populated ξ-position) is simply more work than one
+        // hash and probe. `seqno` is therefore kept as the GPU-oriented index (a GPU kernel cannot
+        // carry a hashmap, and the flat table uploads directly), not for the CPU hot path.
         self.basis_element_to_index_map[elt.degree as usize]
             .get(elt)
             .copied()
@@ -1164,53 +1176,71 @@ impl MilnorAlgebra {
         !self.generic() && !self.unstable_enabled && self.profile.is_trivial()
     }
 
-    /// Populate [`Self::n_table`] and [`Self::g_table`] up to `max_degree`, so that [`Self::seqno`]
-    /// can be used. Rows have fixed width `MAX_XI_TAU` (a `p_part` has at most that many entries),
-    /// so they are independent of `max_degree` and extend cleanly. Requires
-    /// [`Self::seqno_applicable`]; idempotent and cheap to call again.
+    /// Build the flat [`SeqnoTables`] up to `max_degree`, so that [`Self::seqno`] can be used.
+    /// Requires [`Self::seqno_applicable`]. Idempotent: if the stored tables already reach
+    /// `max_degree` this returns immediately; otherwise it rebuilds the whole (cheap,
+    /// `O(max_degree · width)`) table from scratch and atomically swaps it in, so readers always see
+    /// either the old complete table or the new one.
+    ///
+    /// The `n[e][m]` intermediate — the number of `P(R)` of degree `e` using only `ξ₁ … ξ_{m+1}` —
+    /// is built locally and discarded; only the `g` row-progression it feeds is stored, since that
+    /// is all [`Self::seqno`] reads. `g[e][h]` sums `n[·][h−1]` along the arithmetic progression of
+    /// step `ξ_{h+1}`, letting `seqno` rank a `p_part` without a hash lookup.
     pub fn compute_seqno_tables(&self, max_degree: i32) {
         assert!(self.seqno_applicable());
-        let xi = combinatorics::xi_degrees(self.prime());
-        let len = xi.len();
+        if let Some(t) = &*self.seqno_tables.load() {
+            if t.max_degree >= max_degree {
+                return;
+            }
+        }
 
-        // n_table[e][m] = #{ P(R) of degree e using only ξ₁ … ξ_{m+1} }
-        //              = n_table[e][m-1] + [ξ_{m+1} ≤ e] · n_table[e − ξ_{m+1}][m]
-        self.n_table.extend(max_degree as usize, |e| {
-            let e = e as i32;
-            let mut row = vec![0usize; len];
-            for m in 0..len {
+        let xi = combinatorics::xi_degrees(self.prime());
+        let width = xi.len();
+        let rows = max_degree as usize + 1;
+
+        // n[e * width + m] = #{ P(R) of degree e using only ξ₁ … ξ_{m+1} }
+        //                  = n[e][m-1] + [ξ_{m+1} ≤ e] · n[e − ξ_{m+1}][m]
+        let mut n = vec![0usize; rows * width];
+        for e in 0..=max_degree {
+            let base = e as usize * width;
+            for m in 0..width {
                 // m = 0: partitions into {1} — always exactly one, P(e), for e ≥ 0.
                 let without = if m == 0 {
                     (e == 0) as usize
                 } else {
-                    row[m - 1]
+                    n[base + m - 1]
                 };
                 let with = if xi[m] <= e {
-                    self.n_table[(e - xi[m]) as usize][m]
+                    n[(e - xi[m]) as usize * width + m]
                 } else {
                     0
                 };
-                row[m] = without + with;
+                n[base + m] = without + with;
             }
-            row
-        });
+        }
 
-        // g_table[e][h] = Σ_{j ≥ 0} n_table[e − j·ξ_{h+1}][h−1]   (h ≥ 1; g_table[·][0] unused)
-        //              = n_table[e][h−1] + [ξ_{h+1} ≤ e] · g_table[e − ξ_{h+1}][h]
-        self.g_table.extend(max_degree as usize, |e| {
-            let e = e as i32;
-            let mut row = vec![0usize; len];
-            for h in 1..len {
-                let head = self.n_table[e as usize][h - 1];
+        // g[e * width + h] = Σ_{j ≥ 0} n[e − j·ξ_{h+1}][h−1]   (h ≥ 1; g[·][0] unused)
+        //                  = n[e][h−1] + [ξ_{h+1} ≤ e] · g[e − ξ_{h+1}][h]
+        let mut g = vec![0usize; rows * width];
+        for e in 0..=max_degree {
+            let base = e as usize * width;
+            for h in 1..width {
+                let head = n[base + h - 1];
                 let tail = if xi[h] <= e {
-                    self.g_table[(e - xi[h]) as usize][h]
+                    g[(e - xi[h]) as usize * width + h]
                 } else {
                     0
                 };
-                row[h] = head + tail;
+                g[base + h] = head + tail;
             }
-            row
-        });
+        }
+
+        self.seqno_tables
+            .store(Some(std::sync::Arc::new(SeqnoTables {
+                max_degree,
+                width,
+                g,
+            })));
     }
 
     /// The index ("sequence number") of `P(p_part)` in the Milnor basis of its degree, computed in
@@ -1223,6 +1253,11 @@ impl MilnorAlgebra {
     /// that position.
     pub fn seqno(&self, p_part: &[PPartEntry]) -> usize {
         let xi = combinatorics::xi_degrees(self.prime());
+        let guard = self.seqno_tables.load();
+        let t = guard
+            .as_ref()
+            .expect("seqno tables not built; call compute_seqno_tables first");
+        let w = t.width;
         let mut cur_d: i32 = p_part.iter().zip(xi).map(|(&r, &x)| r as i32 * x).sum();
         let mut rank = 0;
         // Consume positions from the highest down; position 0 contributes nothing.
@@ -1232,7 +1267,7 @@ impl MilnorAlgebra {
                 continue;
             }
             let below = cur_d - r * xi[h];
-            rank += self.g_table[cur_d as usize][h] - self.g_table[below as usize][h];
+            rank += t.g[cur_d as usize * w + h] - t.g[below as usize * w + h];
             cur_d = below;
         }
         rank
