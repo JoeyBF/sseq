@@ -130,10 +130,16 @@ pub trait ModuleHomomorphism: Send + Sync {
             return;
         }
 
+        // One matrix build is the largest unit a GPU kernel could batch without buffering across
+        // the streaming algorithm; mark it as a launch scope for the realizable-occupancy metric.
+        #[cfg(milnor_profile)]
+        crate::algebra::milnor_algebra::profile::scope_begin();
         matrix
             .maybe_par_iter_mut()
             .enumerate()
             .for_each(|(i, row)| self.apply_to_basis_element(row, 1, degree, i));
+        #[cfg(milnor_profile)]
+        crate::algebra::milnor_algebra::profile::scope_end();
     }
 
     /// Get the values of the homomorphism on the specified inputs to `matrix`.
@@ -144,10 +150,16 @@ pub trait ModuleHomomorphism: Send + Sync {
             return matrix;
         }
 
+        // One matrix build is the largest unit a GPU kernel could batch without buffering across
+        // the streaming algorithm; mark it as a launch scope for the realizable-occupancy metric.
+        #[cfg(milnor_profile)]
+        crate::algebra::milnor_algebra::profile::scope_begin();
         matrix
             .maybe_par_iter_mut()
             .enumerate()
             .for_each(|(i, row)| self.apply_to_basis_element(row, 1, degree, inputs[i]));
+        #[cfg(milnor_profile)]
+        crate::algebra::milnor_algebra::profile::scope_end();
 
         matrix
     }

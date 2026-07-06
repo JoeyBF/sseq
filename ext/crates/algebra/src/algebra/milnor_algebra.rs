@@ -107,6 +107,88 @@ pub mod profile {
                 .or_default() += nnz as u64;
         }
 
+        /// Per–GPU-launch accumulation of `R → element-terms`, where one launch = one
+        /// `get_partial_matrix` (matrix build). Unlike [`R_TERMS`], which sums an operation `R`
+        /// across the *whole* resolution, this asks how much same-`R` work is co-located within a
+        /// single matrix build — the largest unit a kernel could batch without buffering across the
+        /// streaming algorithm. `depth` keeps [`scope_begin`]/[`scope_end`] reentrancy-safe: only the
+        /// outermost pair clears and folds, so any nested matrix build is attributed to the outer
+        /// launch rather than corrupting it. (Measurement must be run serially — the `concurrent`
+        /// feature would let two launches interleave into one scope and inflate the batch sizes.)
+        struct ScopeState {
+            depth: u32,
+            map: FxHashMap<(i32, usize), u64>,
+        }
+        static SCOPE: LazyLock<Mutex<ScopeState>> = LazyLock::new(|| {
+            Mutex::new(ScopeState {
+                depth: 0,
+                map: FxHashMap::default(),
+            })
+        });
+
+        /// Workgroup sizes for the realizable-coverage report (mirrors the global one).
+        const SCOPE_WS: [u64; 6] = [32, 64, 128, 256, 512, 1024];
+        /// Number of launch scopes (matrix builds) that did any work.
+        static SCOPE_COUNT: AtomicU64 = AtomicU64::new(0);
+        /// Sum over scopes of each scope's total element-terms (equals the global term-work).
+        static SCOPE_TERMS: AtomicU64 = AtomicU64::new(0);
+        /// Largest single-scope total element-terms.
+        static SCOPE_TERMS_MAX: AtomicU64 = AtomicU64::new(0);
+        /// Per `W`, term-work in `R`s that reach ≥ `W` terms *within their own launch*.
+        static SCOPE_COVER: [AtomicU64; 6] = [
+            AtomicU64::new(0),
+            AtomicU64::new(0),
+            AtomicU64::new(0),
+            AtomicU64::new(0),
+            AtomicU64::new(0),
+            AtomicU64::new(0),
+        ];
+
+        /// Open a launch scope around a matrix build. Reentrancy-safe (see [`ScopeState`]).
+        pub fn scope_begin() {
+            let mut s = SCOPE.lock().unwrap();
+            if s.depth == 0 {
+                s.map.clear();
+            }
+            s.depth += 1;
+        }
+
+        /// Attribute `nnz` element-terms of operation `R = (r_degree, r_index)` to the open launch.
+        pub fn scope_record(r_degree: i32, r_index: usize, nnz: usize) {
+            if nnz == 0 {
+                return;
+            }
+            let mut s = SCOPE.lock().unwrap();
+            if s.depth > 0 {
+                *s.map.entry((r_degree, r_index)).or_default() += nnz as u64;
+            }
+        }
+
+        /// Close a launch scope; the outermost close folds the scope's `R`-histogram into the
+        /// realizable-coverage accumulators.
+        pub fn scope_end() {
+            let mut s = SCOPE.lock().unwrap();
+            if s.depth == 0 {
+                return;
+            }
+            s.depth -= 1;
+            if s.depth > 0 {
+                return;
+            }
+            let total: u64 = s.map.values().sum();
+            if total == 0 {
+                return;
+            }
+            SCOPE_COUNT.fetch_add(1, Relaxed);
+            SCOPE_TERMS.fetch_add(total, Relaxed);
+            SCOPE_TERMS_MAX.fetch_max(total, Relaxed);
+            for (i, &w) in SCOPE_WS.iter().enumerate() {
+                let work: u64 = s.map.values().filter(|&&t| t >= w).sum();
+                SCOPE_COVER[i].fetch_add(work, Relaxed);
+            }
+            s.map.clear();
+        }
+
         pub fn admissible() {
             MBE_ADMISSIBLE.fetch_add(1, Relaxed);
         }
@@ -250,6 +332,32 @@ pub mod profile {
                     100.0 * n_r as f64 / distinct.max(1) as f64,
                     100.0 * work as f64 / total_terms.max(1) as f64
                 );
+            }
+
+            // The number above aggregates each R across the *whole* resolution. A kernel can only
+            // batch work that is co-located in one launch, so this is the realizable version: R-work
+            // is re-counted per `get_partial_matrix` (matrix build), the largest unit batchable
+            // without buffering across the streaming algorithm. If these percentages collapse
+            // relative to the global ones, the amortization-by-R shape does not survive at launch
+            // granularity, and a GPU kernel must lean on raw parallel width (many independent
+            // products per launch) rather than on many terms sharing one R.
+            let scopes = SCOPE_COUNT.load(Relaxed);
+            if scopes > 0 {
+                let scope_terms = SCOPE_TERMS.load(Relaxed);
+                eprintln!(
+                    "GPU occupancy — REALIZABLE per matrix-build launch ({scopes} launches, mean \
+                     {:.1} terms/launch, max {}):",
+                    scope_terms as f64 / scopes as f64,
+                    SCOPE_TERMS_MAX.load(Relaxed)
+                );
+                eprintln!("  fraction of term-work in R's reaching ≥ W terms *within one launch*:");
+                for (i, w) in SCOPE_WS.iter().enumerate() {
+                    let work = SCOPE_COVER[i].load(Relaxed);
+                    eprintln!(
+                        "    W={w:<4} : {:>5.1}% of term-work",
+                        100.0 * work as f64 / scope_terms.max(1) as f64
+                    );
+                }
             }
             eprintln!("===========================================================");
         }
@@ -807,6 +915,16 @@ impl Algebra for MilnorAlgebra {
         // for which the up-front enumeration cannot be amortized. It is retained as the reference
         // model for a future GPU kernel (where the enumerate-once/test-all-terms shape is ideal),
         // not wired here. See the commit history for the measurements.
+        profile!({
+            let nnz = s.iter_nonzero().count();
+            profile::record_call(nnz, r_degree, r_idx, s_degree);
+            if r_degree == 0 {
+                profile::identity();
+            } else if nnz > 0 {
+                profile::perterm();
+            }
+            profile::scope_record(r_degree, r_idx, nnz);
+        });
         let p = self.prime();
         let r = self.basis_element_from_index(r_degree, r_idx);
         PPartAllocation::with_local(|mut allocation| {
