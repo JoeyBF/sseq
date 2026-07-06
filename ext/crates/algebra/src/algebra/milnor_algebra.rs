@@ -798,13 +798,15 @@ impl Algebra for MilnorAlgebra {
         s_degree: i32,
         s: FpSlice,
     ) {
-        // At p = 2 we use the admissible-matrix algorithm, which enumerates the admissible matrices
-        // for the fixed operation `r` *once* and tests every term of `s` against them, instead of
-        // re-running the `PPartMultiplier` sweep once per term of `s`.
-        if !self.generic() {
-            self.multiply_basis_element_by_element_2(result, coeff, r_degree, r_idx, s_degree, s);
-            return;
-        }
+        // Per-term reference sweep: run the `PPartMultiplier` multiply once for each term of `s`,
+        // reusing one `PPartAllocation`. At p = 2 the admissible-matrix algorithm
+        // ([`Self::multiply_basis_element_by_element_2`]) computes the same product by enumerating
+        // `Sq(R)`'s admissible matrices once and amortizing over the terms of `s`, but end-to-end
+        // A/Bs of Nassau's `S_2` regime measured it a consistent net regression on the CPU (~8% at
+        // stem 80, ~3% at stem 100): the regime is dominated by sparse elements (≈31% single-term),
+        // for which the up-front enumeration cannot be amortized. It is retained as the reference
+        // model for a future GPU kernel (where the enumerate-once/test-all-terms shape is ideal),
+        // not wired here. See the commit history for the measurements.
         let p = self.prime();
         let r = self.basis_element_from_index(r_degree, r_idx);
         PPartAllocation::with_local(|mut allocation| {
@@ -1457,10 +1459,18 @@ impl MilnorAlgebra {
     /// a matrix contributes iff each column sum is at most the corresponding entry of `Sₖ` and the
     /// relevant bits are disjoint. This amortizes the (expensive) matrix enumeration over the whole
     /// element, whereas [`Self::multiply_with_allocation`] re-runs it per term of `s`.
+    ///
+    /// **Not on the CPU hot path.** End-to-end A/Bs of Nassau's `S_2` regime measured this a net
+    /// regression versus the per-term sweep in [`Self::multiply_basis_element_by_element`] (the
+    /// regime is too sparse for the up-front enumeration to pay off). It is kept as the reference
+    /// model for a future GPU kernel: enumerate `Sq(R)`'s matrices once per operation and test every
+    /// element term against them in parallel — a shape that batches extremely well on a GPU (a real
+    /// resolution presents tens of thousands of terms per distinct `R`). Exercised by the
+    /// `admissible_multiply_agrees_with_reference` test.
     // The `working`-building loops below legitimately index `basis`, `col_sums`, and `masks` by the
     // same `j`, so a range loop is clearer than zipping three slices.
     #[allow(clippy::needless_range_loop)]
-    fn multiply_basis_element_by_element_2(
+    pub fn multiply_basis_element_by_element_2(
         &self,
         mut result: FpSliceMut,
         coeff: u32,
@@ -2470,10 +2480,11 @@ mod tests {
         }
     }
 
-    /// The `p = 2` admissible-matrix multiply (`multiply_basis_element_by_element_2`, reached via
-    /// the `multiply_basis_element_by_element` override) must agree bit-for-bit with the reference
-    /// `PPartMultiplier` path (`multiply_basis_elements`), both for single basis elements and for
-    /// dense (multi-term) elements — the latter also exercising mod-2 cancellation.
+    /// The `p = 2` admissible-matrix multiply ([`MilnorAlgebra::multiply_basis_element_by_element_2`],
+    /// retained as the GPU reference model — no longer wired into the CPU path) must agree
+    /// bit-for-bit with the reference `PPartMultiplier` path (`multiply_basis_elements`), both for
+    /// single basis elements and for dense (multi-term) elements — the latter also exercising mod-2
+    /// cancellation.
     #[test]
     fn admissible_multiply_agrees_with_reference() {
         let p = ValidPrime::new(2);
@@ -2504,11 +2515,11 @@ mod tests {
                         );
                         expected_dense.add(&expected, 1);
 
-                        // New path: element `s = e_j`.
+                        // Admissible model: element `s = e_j`.
                         let mut s = FpVector::new(p, s_dim);
                         s.set_entry(j, 1);
                         let mut got = FpVector::new(p, out_dim);
-                        algebra.multiply_basis_element_by_element(
+                        algebra.multiply_basis_element_by_element_2(
                             got.as_slice_mut(),
                             1,
                             r_degree,
@@ -2530,7 +2541,7 @@ mod tests {
                             s.set_entry(j, 1);
                         }
                         let mut got = FpVector::new(p, out_dim);
-                        algebra.multiply_basis_element_by_element(
+                        algebra.multiply_basis_element_by_element_2(
                             got.as_slice_mut(),
                             1,
                             r_degree,
