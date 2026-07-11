@@ -698,9 +698,12 @@ impl MotivicResolution {
     /// [`Sseq::update`] then computes $E_2 = H(d_1)$, whose [`page_data`] are the
     /// `Subquotient`s.
     ///
-    /// This is the foundation: $d_1$ and the permanent (δ = 0) cycles. The higher
-    /// $d_r$ — revealed by leading-term cancellation, requiring the filtered-complex
-    /// zig-zag — and the products (via [`Sseq::multiply`]/`leibniz`) build on it.
+    /// The higher $d_r$ are then computed by the **τ-Bockstein zig-zag** on the full
+    /// $\mathbb{F}_2[\tau]$-linear δ (`slice`/`inject`/`apply_delta` below), pushing
+    /// $\delta(\tilde x)$ up in weight one order at a time — each correction solved by
+    /// $d_1$'s stored quasi-inverse — and reading the weight-$(w+r)$ part, until a
+    /// page adds nothing ($E_\infty$). The products (via [`Sseq::multiply`]) build on
+    /// this.
     ///
     /// [`page_data`]: Sseq::page_data
     pub fn deformation_sseq(&self) -> Sseq<3, Deformation> {
@@ -756,8 +759,99 @@ impl MotivicResolution {
                 sseq.add_differential(1, &MultiDegreeElement::new(deg, source), target.as_slice());
             }
         }
-
         sseq.update();
+
+        // Higher d_r by the τ-Bockstein zig-zag on the full δ. `apply_delta`
+        // evaluates δ on a raw cochain over the generators at (s, t); `slice`
+        // extracts a fixed-weight part into (n,s,w)-group coordinates; `inject` adds
+        // a group-coordinate vector back into a raw cochain.
+        let apply_delta = |xtilde: &FpVector, s: i32, t: i32| -> FpVector {
+            let mut dvec = FpVector::new(TWO, self.num_gens(s - 1, t));
+            for (gi, _) in xtilde.iter_nonzero() {
+                for (gj, _power) in self.delta(Gen { s, t, idx: gi }) {
+                    dvec.add_basis_element(gj.idx, 1);
+                }
+            }
+            dvec
+        };
+        let slice = |dvec: &FpVector, key: [i32; 3]| -> FpVector {
+            let g = groups.get(&key).map(Vec::as_slice).unwrap_or(&[]);
+            let mut y = FpVector::new(TWO, g.len());
+            for (p, &gi) in g.iter().enumerate() {
+                if dvec.entry(gi) != 0 {
+                    y.set_entry(p, 1);
+                }
+            }
+            y
+        };
+        let inject = |xtilde: &mut FpVector, key: [i32; 3], gv: &FpVector| {
+            if let Some(g) = groups.get(&key) {
+                for (p, _) in gv.iter_nonzero() {
+                    xtilde.add_basis_element(g[p], 1);
+                }
+            }
+        };
+
+        let degrees: Vec<MultiDegree<3>> = sseq.iter_degrees().collect();
+        let mut r = 2;
+        loop {
+            let mut to_add: Vec<(MultiDegree<3>, FpVector, FpVector)> = Vec::new();
+            for &b in &degrees {
+                let [n, s, w] = b.coords();
+                if s < 1 {
+                    continue;
+                }
+                let page = sseq.page_data(b);
+                if page.len() <= r {
+                    continue;
+                }
+                let t = n + s;
+                for rep in page[r].gens() {
+                    // x̃ = the E_r representative, lifted to a raw cochain over (s, t).
+                    let mut xtilde = FpVector::new(TWO, self.num_gens(s, t));
+                    if let Some(g) = groups.get(&[n, s, w]) {
+                        for (p, _) in rep.iter_nonzero() {
+                            xtilde.add_basis_element(g[p], 1);
+                        }
+                    }
+                    // Push δ(x̃) up in weight, correcting each intermediate order.
+                    let mut ok = true;
+                    for k in 1..r {
+                        let y = slice(&apply_delta(&xtilde, s, t), [n + 1, s - 1, w + k]);
+                        if y.is_zero() {
+                            continue;
+                        }
+                        let src = MultiDegree::from([n, s, w + k - 1]);
+                        if !sseq.defined(src) || sseq.differentials(src).len() <= 1 {
+                            ok = false; // no d₁ to invert (should not happen for a genuine cycle)
+                            break;
+                        }
+                        let mut c = FpVector::new(TWO, sseq.dimension(src));
+                        sseq.differentials(src)[1].quasi_inverse(c.as_slice_mut(), y.as_slice());
+                        inject(&mut xtilde, [n, s, w + k - 1], &c);
+                    }
+                    if !ok {
+                        continue;
+                    }
+                    let target = slice(&apply_delta(&xtilde, s, t), [n + 1, s - 1, w + r]);
+                    if !target.is_zero() {
+                        to_add.push((b, rep.to_owned(), target));
+                    }
+                }
+            }
+            let mut added = false;
+            for (b, source, target) in to_add {
+                if sseq.add_differential(r, &MultiDegreeElement::new(b, source), target.as_slice()) {
+                    added = true;
+                }
+            }
+            sseq.update();
+            if !added {
+                break;
+            }
+            r += 1;
+        }
+
         sseq
     }
 
@@ -911,6 +1005,32 @@ mod tests {
         // Every d₁ we added is consistent.
         for deg in sseq.iter_degrees() {
             assert!(!sseq.inconsistent(deg), "inconsistent differential at {deg}");
+        }
+    }
+
+    #[test]
+    fn deformation_sseq_converges_to_classical() {
+        // The strong oracle for the full d_r tower: E_∞ survivors summed over weight
+        // = the classical Adams E₂ (invert τ). Every differential is validated —
+        // a wrong d_r would leave the free rank off at some bidegree.
+        let max = Bidegree::n_s(8, 5);
+        let res = MotivicResolution::new(max);
+        let sseq = res.deformation_sseq();
+
+        let mut einf: HashMap<(i32, i32), usize> = HashMap::new();
+        for deg in sseq.iter_degrees() {
+            let [n, s, _] = deg.coords();
+            let page = sseq.page_data(deg);
+            let last = page.len() - 1; // the final (E_∞) page for this degree
+            *einf.entry((n, s)).or_default() += page[last].dimension();
+        }
+
+        for s in 0..res.max_s() {
+            for n in 0..=8 {
+                let got = einf.get(&(n, s)).copied().unwrap_or(0);
+                let want = res.classical_ext_rank(s, n + s);
+                assert_eq!(got, want, "E_∞ free rank at (n={n}, s={s})");
+            }
         }
     }
 
