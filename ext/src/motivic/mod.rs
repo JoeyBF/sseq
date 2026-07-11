@@ -121,7 +121,20 @@ impl MotivicResolution {
         // Pad the resolved box: lifting reaches a few stems out (and needs
         // quasi-inverses one stem beyond the report box).
         let compute = Bidegree::n_s(max.n() + max.s() + 3, max.s());
+        let profile = std::env::var("MOT_PROFILE").is_ok();
+        let t0 = std::time::Instant::now();
         resolution.compute_through_stem(compute);
+        if profile {
+            use std::sync::atomic::Ordering;
+            use algebra::motivic::milnor::{PRODUCT_HITS, PRODUCT_MISSES, PRODUCT_NANOS};
+            eprintln!("[profile] resolution: {:?}", t0.elapsed());
+            eprintln!(
+                "[profile]   products: {} miss + {} hit, {:?} in closed-form",
+                PRODUCT_MISSES.load(Ordering::Relaxed),
+                PRODUCT_HITS.load(Ordering::Relaxed),
+                std::time::Duration::from_nanos(PRODUCT_NANOS.load(Ordering::Relaxed)),
+            );
+        }
 
         let mut this = Self {
             algebra,
@@ -131,8 +144,16 @@ impl MotivicResolution {
             max,
             compute,
         };
+        let t1 = std::time::Instant::now();
         this.compute_weights();
+        if profile {
+            eprintln!("[profile] weights:    {:?}", t1.elapsed());
+        }
+        let t2 = std::time::Instant::now();
         this.lift();
+        if profile {
+            eprintln!("[profile] lift:       {:?}", t2.elapsed());
+        }
         this
     }
 

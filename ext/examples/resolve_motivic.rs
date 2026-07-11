@@ -28,6 +28,9 @@ fn main() -> anyhow::Result<()> {
 
     let res = MotivicResolution::new(max);
 
+    let profile = std::env::var("MOT_PROFILE").is_ok();
+    let t_coh = std::time::Instant::now();
+
     // The classical rank needs the lift one homological degree up, so the top
     // reported filtration is `max.s() - 1`.
     let top_s = max.s() - 1;
@@ -54,6 +57,10 @@ fn main() -> anyhow::Result<()> {
         })
         .collect();
     lines.sort_by_key(|&(s, n, _)| (s, n));
+
+    if profile {
+        eprintln!("[profile] cohomology: {:?}", t_coh.elapsed());
+    }
 
     println!("n,s,alg_nov,classical,tau_torsion");
     for (_, _, line) in lines {

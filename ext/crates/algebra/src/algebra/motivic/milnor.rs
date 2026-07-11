@@ -39,7 +39,19 @@
 //! *negative* of the weight of the dual monomial it pairs with, so that products
 //! are weight-homogeneous with $\tau$ (weight $-1$) absorbing the difference.
 
-use std::{collections::BTreeMap, sync::RwLock};
+use std::{
+    collections::BTreeMap,
+    sync::{
+        RwLock,
+        atomic::{AtomicU64, Ordering},
+    },
+};
+
+/// Profiling counters for [`MotivicMilnorAlgebra::product_indexed`] (cache hits,
+/// misses, and nanoseconds spent computing the closed-form product on misses).
+pub static PRODUCT_HITS: AtomicU64 = AtomicU64::new(0);
+pub static PRODUCT_MISSES: AtomicU64 = AtomicU64::new(0);
+pub static PRODUCT_NANOS: AtomicU64 = AtomicU64::new(0);
 
 use fp::prime::Binomial;
 use itertools::Itertools;
@@ -915,8 +927,10 @@ impl MotivicMilnorAlgebra {
     ) -> Vec<(Tau, usize)> {
         let key = (t1, idx1, t2, idx2);
         if let Some(cached) = self.products.read().unwrap().get(&key) {
+            PRODUCT_HITS.fetch_add(1, Ordering::Relaxed);
             return cached.clone();
         }
+        let start = std::time::Instant::now();
         let a = self.basis[t1 as usize][idx1].clone();
         let b = self.basis[t2 as usize][idx2].clone();
         let t = t1 + t2;
@@ -934,6 +948,8 @@ impl MotivicMilnorAlgebra {
             })
             .collect();
         self.products.write().unwrap().insert(key, result.clone());
+        PRODUCT_MISSES.fetch_add(1, Ordering::Relaxed);
+        PRODUCT_NANOS.fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
         result
     }
 }
