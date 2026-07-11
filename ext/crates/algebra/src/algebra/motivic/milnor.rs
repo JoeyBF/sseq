@@ -44,7 +44,7 @@ use std::{
     collections::BTreeMap,
     rc::Rc,
     sync::{
-        RwLock,
+        Arc, OnceLock, RwLock,
         atomic::{AtomicU64, Ordering},
     },
 };
@@ -57,6 +57,7 @@ pub static PRODUCT_NANOS: AtomicU64 = AtomicU64::new(0);
 
 use fp::prime::Binomial;
 use itertools::Itertools;
+use maybe_rayon::prelude::*;
 use once::OnceVec;
 use rustc_hash::FxHashMap;
 
@@ -903,18 +904,41 @@ pub struct MotivicMilnorAlgebra {
     /// `basis[t]` is the $\mathbb{F}_2[\tau]$-basis in topological degree `t`, sorted for stable
     /// indexing.
     basis: OnceVec<Vec<(u32, Vec<u32>)>>,
-    /// Memoized basis-element products, keyed by `(t1, idx1, t2, idx2)`. The
-    /// duality product is correctness-oriented and expensive; a resolution asks
-    /// for the same structure constants repeatedly, so we cache them (the same
-    /// role the classical Milnor algebra's `cache-multiplication` table plays).
-    products: RwLock<FxHashMap<(i32, usize, i32, usize), Vec<(Tau, usize)>>>,
+    /// Memoized basis-element products, one dense [`ProductBlock`] per pair of
+    /// topological degrees `(t1, t2)`. The duality product is expensive and a
+    /// resolution asks for the same structure constants repeatedly, so we cache
+    /// them (the role the classical Milnor algebra's `cache-multiplication` table
+    /// plays). Blocking by degree pair — rather than a flat `(t1, idx1, t2, idx2)`
+    /// map — makes the cache the natural *batch unit* (see [`ProductBlock`]): the
+    /// per-degree-pair registry is small and read-mostly, and each block's entries
+    /// fill through independent [`OnceLock`]s, so a concurrent resolution reads
+    /// hits lock-free instead of serializing on one global product lock.
+    blocks: RwLock<FxHashMap<(i32, i32), Arc<ProductBlock>>>,
+}
+
+/// A dense block of basis-element products for one pair of topological degrees
+/// `(t1, t2)`. Entry `(idx1, idx2)`, at flat position `idx1 * dim2 + idx2`, is the
+/// product of the `idx1`-th basis element in degree `t1` with the `idx2`-th in
+/// degree `t2` — the `(Tau, index-in-degree-(t1+t2))` list [`multiply_closed`]
+/// returns.
+///
+/// This is the natural **batch unit** for the product: every structure constant
+/// the resolution needs for a given degree pair lives in one block. Entries fill
+/// lazily (each an independent [`OnceLock`], so reads are lock-free and a
+/// concurrent resolution never serializes on a global product lock), and
+/// [`MotivicMilnorAlgebra::fill_block`] computes the whole block at once — the
+/// shape a GPU kernel would fill in a single launch.
+pub struct ProductBlock {
+    /// The number of basis elements in degree `t2` (the block's row stride).
+    dim2: usize,
+    entries: Vec<OnceLock<Vec<(Tau, usize)>>>,
 }
 
 impl MotivicMilnorAlgebra {
     pub fn new() -> Self {
         Self {
             basis: OnceVec::new(),
-            products: RwLock::new(FxHashMap::default()),
+            blocks: RwLock::new(FxHashMap::default()),
         }
     }
 
@@ -970,6 +994,49 @@ impl MotivicMilnorAlgebra {
         }
     }
 
+    /// The dense [`ProductBlock`] for the degree pair `(t1, t2)`, created (with all
+    /// entries empty) on first request and shared thereafter. Creation is the only
+    /// step that touches the block registry's write lock; entry computation happens
+    /// lock-free through the block's [`OnceLock`]s.
+    fn block(&self, t1: i32, t2: i32) -> Arc<ProductBlock> {
+        if let Some(block) = self.blocks.read().unwrap().get(&(t1, t2)) {
+            return Arc::clone(block);
+        }
+        // Ensure the operand and output bases exist before sizing/indexing.
+        self.compute_basis(t1);
+        self.compute_basis(t2);
+        self.compute_basis(t1 + t2);
+        let dim1 = self.dimension(t1);
+        let dim2 = self.dimension(t2);
+        let mut w = self.blocks.write().unwrap();
+        Arc::clone(w.entry((t1, t2)).or_insert_with(|| {
+            Arc::new(ProductBlock {
+                dim2,
+                entries: (0..dim1 * dim2).map(|_| OnceLock::new()).collect(),
+            })
+        }))
+    }
+
+    /// The closed-form product (Kong–Lin Theorem 5.1) of the two basis elements at
+    /// `(t1, idx1)` and `(t2, idx2)`, mapped into the degree-`(t1+t2)` basis. The
+    /// bases must already be computed (the caller through [`Self::block`] ensures
+    /// this).
+    fn compute_product(&self, t1: i32, idx1: usize, t2: i32, idx2: usize) -> Vec<(Tau, usize)> {
+        let a = &self.basis[t1 as usize][idx1];
+        let b = &self.basis[t2 as usize][idx2];
+        let t = t1 + t2;
+        multiply_closed(a, b)
+            .into_iter()
+            .map(|(z, c)| {
+                (
+                    c,
+                    self.index_of(t, &z)
+                        .expect("product landed outside the basis"),
+                )
+            })
+            .collect()
+    }
+
     /// The product of two basis elements, as an $\mathbb{F}_2[\tau]$-linear combination of basis
     /// elements in degree `t1 + t2`: a list of `(coefficient, index)` pairs. The product of two
     /// homogeneous basis elements is weight-homogeneous, so each coefficient is a single power of
@@ -981,32 +1048,48 @@ impl MotivicMilnorAlgebra {
         t2: i32,
         idx2: usize,
     ) -> Vec<(Tau, usize)> {
-        let key = (t1, idx1, t2, idx2);
-        if let Some(cached) = self.products.read().unwrap().get(&key) {
+        let block = self.block(t1, t2);
+        let cell = &block.entries[idx1 * block.dim2 + idx2];
+        if let Some(cached) = cell.get() {
             PRODUCT_HITS.fetch_add(1, Ordering::Relaxed);
             return cached.clone();
         }
-        let start = std::time::Instant::now();
-        let a = self.basis[t1 as usize][idx1].clone();
-        let b = self.basis[t2 as usize][idx2].clone();
-        let t = t1 + t2;
-        self.compute_basis(t);
         // The closed-form product (Kong–Lin Theorem 5.1), validated exhaustively
         // against the duality oracle `multiply`.
-        let result: Vec<(Tau, usize)> = multiply_closed(&a, &b)
-            .into_iter()
-            .map(|(z, c)| {
-                (
-                    c,
-                    self.index_of(t, &z)
-                        .expect("product landed outside the basis"),
-                )
-            })
-            .collect();
-        self.products.write().unwrap().insert(key, result.clone());
-        PRODUCT_MISSES.fetch_add(1, Ordering::Relaxed);
-        PRODUCT_NANOS.fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
-        result
+        cell.get_or_init(|| {
+            let start = std::time::Instant::now();
+            let result = self.compute_product(t1, idx1, t2, idx2);
+            PRODUCT_MISSES.fetch_add(1, Ordering::Relaxed);
+            PRODUCT_NANOS.fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            result
+        })
+        .clone()
+    }
+
+    /// Compute *every* entry of the `(t1, t2)` product block at once, filling it in
+    /// parallel (under the `concurrent` feature) — the batch shape a GPU kernel
+    /// fills in a single launch. Idempotent: entries already present are kept, and
+    /// a second call is a cheap no-op. This is the batching boundary the GPU port
+    /// hooks into; on CPU it lets a caller warm a whole degree pair up front
+    /// instead of paying a lock-free-but-serial miss per structure constant.
+    pub fn fill_block(&self, t1: i32, t2: i32) {
+        let block = self.block(t1, t2);
+        let dim2 = block.dim2;
+        if dim2 == 0 || block.entries.is_empty() {
+            return;
+        }
+        let dim1 = block.entries.len() / dim2;
+        (0..dim1).into_maybe_par_iter().for_each(|idx1| {
+            for idx2 in 0..dim2 {
+                block.entries[idx1 * dim2 + idx2].get_or_init(|| {
+                    let start = std::time::Instant::now();
+                    let result = self.compute_product(t1, idx1, t2, idx2);
+                    PRODUCT_MISSES.fetch_add(1, Ordering::Relaxed);
+                    PRODUCT_NANOS.fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                    result
+                });
+            }
+        });
     }
 }
 
@@ -1577,6 +1660,32 @@ mod tests {
                     multiply(a, b),
                     "closed form ≠ oracle for {a:?} · {b:?}"
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn test_fill_block_matches_lazy_products() {
+        // The batch path (`fill_block`, which a GPU kernel would drive) must agree
+        // entry-for-entry with the lazy per-product path. Fill whole degree-pair
+        // blocks up front on one algebra, compute the same products lazily on
+        // another, and compare every structure constant.
+        let batched = MotivicMilnorAlgebra::new();
+        let lazy = MotivicMilnorAlgebra::new();
+        batched.compute_basis(12);
+        lazy.compute_basis(12);
+        for t1 in 0..=6 {
+            for t2 in 0..=6 {
+                batched.fill_block(t1, t2);
+                for idx1 in 0..batched.dimension(t1) {
+                    for idx2 in 0..batched.dimension(t2) {
+                        assert_eq!(
+                            batched.product_indexed(t1, idx1, t2, idx2),
+                            lazy.product_indexed(t1, idx1, t2, idx2),
+                            "batch ≠ lazy at ({t1},{idx1})·({t2},{idx2})"
+                        );
+                    }
+                }
             }
         }
     }

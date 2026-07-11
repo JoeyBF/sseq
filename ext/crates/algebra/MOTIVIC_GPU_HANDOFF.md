@@ -131,6 +131,27 @@ R₁)`; parallelize the term tests across `s`).
 > signature algorithm and inherit its boundary and the classical §5 analysis
 > wholesale. (b) is the cleaner long-term path and the one that reuses the most.
 
+> **CPU-side batch primitive already in place.** `MotivicMilnorAlgebra` now caches
+> products as one dense [`ProductBlock`] per topological-degree pair `(t1, t2)`
+> (`entry (idx1, idx2) = basis[t1][idx1] · basis[t2][idx2]`), with per-entry
+> `OnceLock` fill. `MotivicMilnorAlgebra::fill_block(t1, t2)` computes an entire
+> block in one (parallel) pass — this is the ready-made host handle for the GPU
+> launch: hand the kernel a `(t1, t2)` block, get all `dim1 × dim2` structure
+> constants back, store into the block's cells.
+>
+> **But do not fill whole blocks blindly.** Measured block *density* during a real
+> resolution is only **~50%** (stem 30 and 40 both ≈ 50%): the standard engine
+> requests roughly half of each touched block's `(idx1, idx2)` grid. So a GPU (or
+> CPU) pass that fills the *entire* block does ~2× the necessary
+> `multiply_closed` work — and since product compute is ~95% of resolution time,
+> eager full-block fill is a **net CPU loss** (confirmed by measurement; that is
+> why the CPU path stays lazy-per-entry). For the GPU this means either (i) pass
+> the kernel only the *requested* `(idx1, idx2)` sublist of the block (keep the
+> engine's demand-driven set), accepting a ragged batch; or (ii) fill the full
+> block and eat the 2× overcompute, betting GPU throughput makes it a wash. Decide
+> with an A/B on the GPU box; the ragged-batch path (i) is the safer default and
+> mirrors what the lazy CPU cache already does.
+
 ---
 
 ## 4. The math to port (`multiply_closed`, ρ = 0)
