@@ -100,8 +100,9 @@ struct MotivicCoboundary {
     deltas: HashMap<Gen, Vec<(Gen, u32)>>,
     /// The motivic weight of every generator — the $\mathbb{F}_2[\tau]$ grading
     /// the capped cohomology slices by. A generator absent here is weightless and
-    /// excluded from every slice (matching the old `gen_list`).
-    weights: HashMap<Gen, i32>,
+    /// excluded from every slice (matching the old `gen_list`). `Arc`-shared with
+    /// [`MotivicResolution`], not copied.
+    weights: Arc<HashMap<Gen, i32>>,
 }
 
 impl MotivicCoboundary {
@@ -172,8 +173,9 @@ pub struct MotivicResolution {
     /// resolution/functor split — the raw differential stays in the resolution
     /// (`lifted`); δ lives here.
     ext: OnceLock<ExtAlgebra<CTauResolution>>,
-    /// Motivic weight of each generator.
-    weights: HashMap<Gen, i32>,
+    /// Motivic weight of each generator. `Arc`-shared with the Ext DGA's
+    /// [`MotivicCoboundary`] (which slices by it) rather than copied.
+    weights: Arc<HashMap<Gen, i32>>,
     /// The lifted $A_C$ differential of each generator: the set of $F_{s-1}$ basis
     /// elements in its image. The coefficient of each is $1 \in \mathbb{F}_2$ and
     /// its $\tau$-power is forced by the weights, so the support is the whole
@@ -239,7 +241,7 @@ impl MotivicResolution {
             algebra,
             resolution,
             ext: OnceLock::new(),
-            weights: HashMap::new(),
+            weights: Arc::new(HashMap::new()),
             lifted: HashMap::new(),
             max,
             compute,
@@ -535,8 +537,10 @@ impl MotivicResolution {
     /// if any generator turns out weight-inhomogeneous (which would violate the
     /// bigraded structure and break the valuation representation).
     fn compute_weights(&mut self) {
+        // Built locally, then `Arc`-shared into `self.weights` (and the Ext DGA) — no copy.
+        let mut weights: HashMap<Gen, i32> = HashMap::new();
         // s = 0: the single generator is the unit, weight 0.
-        self.weights.insert(Gen { s: 0, t: 0, idx: 0 }, 0);
+        weights.insert(Gen { s: 0, t: 0, idx: 0 }, 0);
 
         for s in 1..=self.max_s() {
             let d = self.resolution.differential(s);
@@ -557,7 +561,7 @@ impl MotivicResolution {
                             t: og.generator_degree,
                             idx: og.generator_index,
                         };
-                        let Some(&tgt_w) = self.weights.get(&tgt) else {
+                        let Some(&tgt_w) = weights.get(&tgt) else {
                             continue;
                         };
                         let w = op_w + tgt_w;
@@ -570,11 +574,12 @@ impl MotivicResolution {
                         }
                     }
                     if let Some(w) = weight {
-                        self.weights.insert(Gen { s, t, idx }, w);
+                        weights.insert(Gen { s, t, idx }, w);
                     }
                 }
             }
         }
+        self.weights = Arc::new(weights);
     }
 
     /// The $\delta$-entries out of generator `g`: the identity-operation
@@ -640,7 +645,7 @@ impl MotivicResolution {
         let coboundary = Arc::new(MotivicCoboundary {
             resolution: Arc::clone(&self.resolution),
             deltas,
-            weights: self.weights.clone(),
+            weights: Arc::clone(&self.weights),
         });
         ExtAlgebra::without_unit(Arc::clone(&self.resolution)).with_differential(coboundary)
     }
