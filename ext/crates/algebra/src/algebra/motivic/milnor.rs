@@ -786,37 +786,42 @@ pub fn multiply_closed(a: &(u32, Vec<u32>), b: &(u32, Vec<u32>)) -> DualElement 
             y_col_opts.push(columns_eq(t as u32));
         }
 
+        let sigma_sprime: u32 = sprime.iter().sum();
         for ycols in cartesian(&y_col_opts) {
             let y = Mat(&ycols);
             if y.b() == 0 {
                 continue;
             }
             let sy: Vec<u32> = (0..y.n_rows()).map(|i| y.row_sum(i)).collect();
-            // Match against the τ-rewriting: the term with exterior part E₁ and
-            // ξ-part S′ contributes c(S(Y), S′) (already ≠ 0 here) at τ^{Σ(S′)}.
-            for term in rewrite_tau(&sy) {
-                if term.e_mask != e1_mask || trim(term.r.clone()) != trim(sprime.clone()) {
-                    continue;
-                }
-                // E_out = E₂ + T(Y) must be square-free (Seq₁).
-                let n_e = (y.n_rows() + y.n_cols()).max(32);
-                let mut out_e_mask = 0u32;
-                let mut square_free = true;
-                for i in 0..n_e {
-                    let val = ((e2_mask >> i) & 1) + y.anti_diag(i);
-                    if val > 1 {
-                        square_free = false;
-                        break;
-                    }
-                    if val == 1 {
-                        out_e_mask |= 1 << i;
-                    }
-                }
-                if !square_free {
-                    continue;
-                }
-                add_term(&mut out, (out_e_mask, out_r.clone()), Tau::power(term.tau_pow));
+            // The rewriting τ(S(Y)) = Σ c(S(Y), R) τ^{Σ(R)} ρ^… τ(E) ξ(R) contains the
+            // term with exterior part E₁ and ξ-part S′ iff:
+            //  * Σ₂(E₁) + Σ₂(S′) = Σ₂(S(Y)) — forced by the Y-column construction;
+            //  * Σ(E₁) + 2Σ(S′) = Σ(S(Y)) — the ρ = 0 constraint (Σ(E₁) = popcount);
+            //  * c(S(Y), S′) ≠ 0.
+            // That term contributes at τ^{Σ(S′)}. (This replaces a per-candidate
+            // `rewrite_tau` DFS with a direct check.)
+            let sigma_sy: u32 = sy.iter().sum();
+            if e1_mask.count_ones() + 2 * sigma_sprime != sigma_sy || c_coeff(&sy, &sprime) == 0 {
+                continue;
             }
+            // E_out = E₂ + T(Y) must be square-free (Seq₁).
+            let n_e = (y.n_rows() + y.n_cols()).max(32);
+            let mut out_e_mask = 0u32;
+            let mut square_free = true;
+            for i in 0..n_e {
+                let val = ((e2_mask >> i) & 1) + y.anti_diag(i);
+                if val > 1 {
+                    square_free = false;
+                    break;
+                }
+                if val == 1 {
+                    out_e_mask |= 1 << i;
+                }
+            }
+            if !square_free {
+                continue;
+            }
+            add_term(&mut out, (out_e_mask, out_r.clone()), Tau::power(sigma_sprime));
         }
     }
 
