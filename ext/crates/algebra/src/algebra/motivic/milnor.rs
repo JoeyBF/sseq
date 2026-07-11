@@ -39,11 +39,12 @@
 //! *negative* of the weight of the dual monomial it pairs with, so that products
 //! are weight-homogeneous with $\tau$ (weight $-1$) absorbing the difference.
 
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, sync::Mutex};
 
 use fp::prime::Binomial;
 use itertools::Itertools;
 use once::OnceVec;
+use rustc_hash::FxHashMap;
 
 use super::Tau;
 
@@ -578,12 +579,18 @@ pub struct MotivicMilnorAlgebra {
     /// `basis[t]` is the $\mathbb{F}_2[\tau]$-basis in topological degree `t`, sorted for stable
     /// indexing.
     basis: OnceVec<Vec<(u32, Vec<u32>)>>,
+    /// Memoized basis-element products, keyed by `(t1, idx1, t2, idx2)`. The
+    /// duality product is correctness-oriented and expensive; a resolution asks
+    /// for the same structure constants repeatedly, so we cache them (the same
+    /// role the classical Milnor algebra's `cache-multiplication` table plays).
+    products: Mutex<FxHashMap<(i32, usize, i32, usize), Vec<(Tau, usize)>>>,
 }
 
 impl MotivicMilnorAlgebra {
     pub fn new() -> Self {
         Self {
             basis: OnceVec::new(),
+            products: Mutex::new(FxHashMap::default()),
         }
     }
 
@@ -650,11 +657,15 @@ impl MotivicMilnorAlgebra {
         t2: i32,
         idx2: usize,
     ) -> Vec<(Tau, usize)> {
+        let key = (t1, idx1, t2, idx2);
+        if let Some(cached) = self.products.lock().unwrap().get(&key) {
+            return cached.clone();
+        }
         let a = self.basis[t1 as usize][idx1].clone();
         let b = self.basis[t2 as usize][idx2].clone();
         let t = t1 + t2;
         self.compute_basis(t);
-        multiply(&a, &b)
+        let result: Vec<(Tau, usize)> = multiply(&a, &b)
             .into_iter()
             .map(|(z, c)| {
                 (
@@ -663,7 +674,9 @@ impl MotivicMilnorAlgebra {
                         .expect("product landed outside the basis"),
                 )
             })
-            .collect()
+            .collect();
+        self.products.lock().unwrap().insert(key, result.clone());
+        result
     }
 }
 
