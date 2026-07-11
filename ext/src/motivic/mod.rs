@@ -117,25 +117,25 @@ impl MotivicResolution {
         let cc: Arc<FiniteChainComplex<FDModule<CTauAlgebra>>> =
             Arc::new(FiniteChainComplex::ccdz(trivial));
         let resolution = Resolution::new(cc);
-        // Resolve a **square** `{stem ≤ max.n + margin, filt ≤ max.s}` with
-        // `compute_through_stem`, which computes exactly that box with no
-        // out-of-bounds work (generators at `(s, t)` depend on `(s-1, t-1)`, not
-        // `(s-1, t)`, so a stem-bounded square is self-contained).
+        // Resolve the report box **plus exactly one stem** with
+        // `compute_through_stem`. Ext at `(s, t)` is `H(δ)`, and δ maps `(s, t) →
+        // (s-1, t)` — same internal degree, one lower Novikov filtration, hence
+        // stem `n → n+1`. So computing Ext at stem `n` needs the δ *out of* stem
+        // `n`, whose targets are the generators at stem `n+1`; those must exist
+        // (`delta_star_rank` reads `num_gens` there). That is the whole margin: a
+        // hard, structural `+1`, not a fudge.
         //
-        // The lift needs a little more than the report box: the δ corrections push
-        // one stem out per augmentation step, so a report generator at stem `n`
-        // references data at stem `n + (chain depth)`. That depth is the number of
-        // filtrations carrying a generator at the *same internal degree* — a small
-        // constant for the sphere (measured reach ≤ 1 up to stem 50), not `max.s`.
-        // `LIFT_STEM_MARGIN` is that reach plus headroom. It is a hard bound, not a
-        // silent one: if it is ever too small, `composite` panics on a missing
-        // lifted generator (never returns a wrong answer), and `MOT_MARGIN`
-        // overrides it without a rebuild.
-        const LIFT_STEM_MARGIN: i32 = 3;
+        // Nothing at stem `n+2` is needed, and `compute_through_stem` gives the
+        // `n+1` strip cheaply: at its edge it records only *kernels* one stem out
+        // (`resolution.rs`), never resolving generators there. The lift of the
+        // stem-`(n+1)` boundary generators therefore can't emit δ-terms into
+        // stem `n+2` (those generators don't exist), and such a term would land in
+        // internal degree `> n+s` anyway — invisible to every stem-`n` composite.
+        // So `+1` is provably sufficient; `MOT_MARGIN` is only an escape hatch.
         let margin: i32 = std::env::var("MOT_MARGIN")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(LIFT_STEM_MARGIN);
+            .unwrap_or(1);
         let compute = Bidegree::n_s(max.n() + margin, max.s());
         let profile = std::env::var("MOT_PROFILE").is_ok();
         let t0 = std::time::Instant::now();
