@@ -39,7 +39,7 @@
 //! *negative* of the weight of the dual monomial it pairs with, so that products
 //! are weight-homogeneous with $\tau$ (weight $-1$) absorbing the difference.
 
-use std::{collections::BTreeMap, sync::Mutex};
+use std::{collections::BTreeMap, sync::RwLock};
 
 use fp::prime::Binomial;
 use itertools::Itertools;
@@ -839,14 +839,14 @@ pub struct MotivicMilnorAlgebra {
     /// duality product is correctness-oriented and expensive; a resolution asks
     /// for the same structure constants repeatedly, so we cache them (the same
     /// role the classical Milnor algebra's `cache-multiplication` table plays).
-    products: Mutex<FxHashMap<(i32, usize, i32, usize), Vec<(Tau, usize)>>>,
+    products: RwLock<FxHashMap<(i32, usize, i32, usize), Vec<(Tau, usize)>>>,
 }
 
 impl MotivicMilnorAlgebra {
     pub fn new() -> Self {
         Self {
             basis: OnceVec::new(),
-            products: Mutex::new(FxHashMap::default()),
+            products: RwLock::new(FxHashMap::default()),
         }
     }
 
@@ -914,7 +914,7 @@ impl MotivicMilnorAlgebra {
         idx2: usize,
     ) -> Vec<(Tau, usize)> {
         let key = (t1, idx1, t2, idx2);
-        if let Some(cached) = self.products.lock().unwrap().get(&key) {
+        if let Some(cached) = self.products.read().unwrap().get(&key) {
             return cached.clone();
         }
         let a = self.basis[t1 as usize][idx1].clone();
@@ -933,7 +933,7 @@ impl MotivicMilnorAlgebra {
                 )
             })
             .collect();
-        self.products.lock().unwrap().insert(key, result.clone());
+        self.products.write().unwrap().insert(key, result.clone());
         result
     }
 }
