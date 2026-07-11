@@ -98,10 +98,10 @@ pub struct MotivicResolution {
     lifted: HashMap<Gen, BTreeSet<usize>>,
     /// The box the results are trusted/reported in.
     max: Bidegree,
-    /// The (padded) box actually resolved. Lifting a generator at stem `n` reaches
-    /// data at stems up to `n + 2` and needs the quasi-inverse of the previous
-    /// differential one stem out, so we resolve a margin beyond `max` and only
-    /// verify/report within `max`.
+    /// The (padded) box actually resolved, as `(filt ≤ compute.s(), internal
+    /// degree ≤ compute.t())`. Resolved by internal degree because the lift and
+    /// its `d²`/δ all preserve `t`; the report box's referenced generators live at
+    /// `t ≤ max.n + max.s`, and we add a small edge margin (see [`Self::new`]).
     compute: Bidegree,
 }
 
@@ -118,12 +118,21 @@ impl MotivicResolution {
         let cc: Arc<FiniteChainComplex<FDModule<CTauAlgebra>>> =
             Arc::new(FiniteChainComplex::ccdz(trivial));
         let resolution = Resolution::new(cc);
-        // Pad the resolved box: lifting reaches a few stems out (and needs
-        // quasi-inverses one stem beyond the report box).
-        let compute = Bidegree::n_s(max.n() + max.s() + 3, max.s());
+        // Resolve by *internal degree*, not stem. The lift, the composite
+        // d_{s-1}d_s, and δ all preserve internal degree `t`, so cohomology at
+        // `(s, t)` depends only on generators at that same `t`. The report box
+        // (stem ≤ max.n, filt ≤ max.s) tops out at internal degree
+        // `max.n + max.s`, and every generator it references (transitively,
+        // through the lift) sits at `t ≤ max.n + max.s`. So resolving
+        // `{t ≤ max.n + max.s + margin, filt ≤ max.s}` is exactly what is needed —
+        // and it avoids the high-stem/low-filtration corner a stem-padded box
+        // (`compute_through_stem(max.n + max.s + 3, …)`, which reaches internal
+        // degree `max.n + 2·max.s`) wastes most of its time on. The `+3` is a
+        // small quasi-inverse/edge margin.
+        let compute = Bidegree::s_t(max.s(), max.n() + max.s() + 3);
         let profile = std::env::var("MOT_PROFILE").is_ok();
         let t0 = std::time::Instant::now();
-        resolution.compute_through_stem(compute);
+        resolution.compute_through_bidegree(compute);
         if profile {
             use std::sync::atomic::Ordering;
             use algebra::motivic::milnor::{PRODUCT_HITS, PRODUCT_MISSES, PRODUCT_NANOS};
@@ -221,7 +230,7 @@ impl MotivicResolution {
         // n+1), and runs its own weight-loop locally. So `s` is a sequential
         // barrier, but at each `s` every generator is independent — fan them out.
         for s in 1..=self.max_s() {
-            let t_max = self.compute.n() + s;
+            let t_max = self.compute.t();
             let gens: Vec<Gen> = (0..=t_max)
                 .flat_map(|t| (0..self.num_gens(s, t)).map(move |idx| Gen { s, t, idx }))
                 .collect();
@@ -394,7 +403,7 @@ impl MotivicResolution {
         for s in 1..=self.max_s() {
             let d = self.resolution.differential(s);
             let target = self.module(s - 1);
-            let t_max = self.compute.n() + s;
+            let t_max = self.compute.t();
             for t in 0..=t_max {
                 for idx in 0..self.num_gens(s, t) {
                     let out = d.output(t, idx);
