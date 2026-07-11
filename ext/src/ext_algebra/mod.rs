@@ -56,6 +56,23 @@ pub trait ExtDifferential: Send + Sync {
     /// of `b` is out of the computed range; a computed-but-empty bidegree yields a
     /// valid zero-size matrix, not `None`.
     fn matrix(&self, b: Bidegree) -> Option<Matrix>;
+
+    /// For a **graded** coefficient (e.g. $\mathbb{F}_2[\tau]$, graded by motivic
+    /// weight), the number of cochain generators at `b` whose grade is `≤ cap`.
+    /// The default — an ungraded (field) coefficient — returns `None`, meaning "no
+    /// grading", and the capped cohomology falls back to the full dimension.
+    fn graded_dimension(&self, b: Bidegree, cap: i32) -> Option<usize> {
+        let _ = (b, cap);
+        None
+    }
+
+    /// The differential [`matrix`](Self::matrix) restricted to generators of grade
+    /// `≤ cap` at both ends (rows and columns compacted to the kept generators).
+    /// The default ignores `cap` (ungraded), returning the full matrix.
+    fn matrix_capped(&self, b: Bidegree, cap: i32) -> Option<Matrix> {
+        let _ = cap;
+        self.matrix(b)
+    }
 }
 
 /// $\Ext(M, k)$ as a bigraded module over the bigraded algebra $\Ext(k, k)$, backed by a
@@ -144,14 +161,24 @@ impl<CC: FreeChainComplex> ExtAlgebra<CC> {
     /// range; a missing incoming differential (no source bidegree, or empty) counts
     /// as rank $0$.
     pub fn cohomology_dimension(&self, b: Bidegree) -> Option<usize> {
-        let gens = self.dimension(b);
+        self.cohomology_dimension_capped(b, i32::MAX)
+    }
+
+    /// The dimension of the DGA's cohomology at `b` restricted to the coefficient's
+    /// weight slice `≤ cap` — for a graded coefficient like $\mathbb{F}_2[\tau]$
+    /// this is a slice of the Ext *module*, and sweeping `cap` exposes the
+    /// $\tau$-torsion (dimension above the free/`cap = ∞` rank). For an ungraded
+    /// (field) coefficient the differential reports no grading and this is just
+    /// [`cohomology_dimension`](Self::cohomology_dimension) for every `cap`.
+    pub fn cohomology_dimension_capped(&self, b: Bidegree, cap: i32) -> Option<usize> {
         let Some(d) = &self.differential else {
-            return Some(gens);
+            return Some(self.dimension(b));
         };
+        let gens = d.graded_dimension(b, cap).unwrap_or_else(|| self.dimension(b));
         let shift = d.shift();
         let source = Bidegree::n_s(b.n() - shift.n(), b.s() - shift.s());
-        let rank_out = d.matrix(b)?.row_reduce();
-        let rank_in = d.matrix(source).map_or(0, |mut m| m.row_reduce());
+        let rank_out = d.matrix_capped(b, cap)?.row_reduce();
+        let rank_in = d.matrix_capped(source, cap).map_or(0, |mut m| m.row_reduce());
         Some(gens - rank_out - rank_in)
     }
 

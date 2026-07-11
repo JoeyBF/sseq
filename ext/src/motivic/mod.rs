@@ -98,6 +98,24 @@ struct MotivicCoboundary {
     /// `g ↦ [(target generator, τ-power)]` for the augmentation part of `d(g)`.
     /// Generators with no δ-terms are absent.
     deltas: HashMap<Gen, Vec<(Gen, u32)>>,
+    /// The motivic weight of every generator — the $\mathbb{F}_2[\tau]$ grading
+    /// the capped cohomology slices by. A generator absent here is weightless and
+    /// excluded from every slice (matching the old `gen_list`).
+    weights: HashMap<Gen, i32>,
+}
+
+impl MotivicCoboundary {
+    /// The generators at filtration `s`, internal degree `t` with weight `≤ cap`
+    /// (weightless generators excluded), as their indices.
+    fn kept(&self, s: i32, t: i32, cap: i32) -> Vec<usize> {
+        (0..self.resolution.module(s).number_of_gens_in_degree(t))
+            .filter(|&idx| {
+                self.weights
+                    .get(&Gen { s, t, idx })
+                    .is_some_and(|&w| w <= cap)
+            })
+            .collect()
+    }
 }
 
 impl ExtDifferential for MotivicCoboundary {
@@ -106,21 +124,36 @@ impl ExtDifferential for MotivicCoboundary {
     }
 
     fn matrix(&self, b: Bidegree) -> Option<Matrix> {
+        self.matrix_capped(b, i32::MAX)
+    }
+
+    fn graded_dimension(&self, b: Bidegree, cap: i32) -> Option<usize> {
+        if b.s() < 0 {
+            return Some(0);
+        }
+        Some(self.kept(b.s(), b.t(), cap).len())
+    }
+
+    fn matrix_capped(&self, b: Bidegree, cap: i32) -> Option<Matrix> {
         let (t, s) = (b.t(), b.s());
         if s < 0 {
             return None;
         }
-        let rows = self.resolution.module(s).number_of_gens_in_degree(t);
+        let rows = self.kept(s, t, cap);
         if s == 0 {
             // δ out of filtration 0 lands in filtration −1: no targets.
-            return Some(Matrix::new(TWO, rows, 0));
+            return Some(Matrix::new(TWO, rows.len(), 0));
         }
-        let cols = self.resolution.module(s - 1).number_of_gens_in_degree(t);
-        let mut m = Matrix::new(TWO, rows, cols);
-        for idx in 0..rows {
+        let cols = self.kept(s - 1, t, cap);
+        let col_pos: HashMap<usize, usize> =
+            cols.iter().enumerate().map(|(p, &i)| (i, p)).collect();
+        let mut m = Matrix::new(TWO, rows.len(), cols.len());
+        for (rp, &idx) in rows.iter().enumerate() {
             if let Some(targets) = self.deltas.get(&Gen { s, t, idx }) {
                 for &(tgt, _power) in targets {
-                    m.row_mut(idx).set_entry(tgt.idx, 1);
+                    if let Some(&cp) = col_pos.get(&tgt.idx) {
+                        m.row_mut(rp).set_entry(cp, 1);
+                    }
                 }
             }
         }
@@ -578,59 +611,10 @@ impl MotivicResolution {
     // δ is a differential on the free F₂[τ]-modules of generators (fixed internal
     // degree `t`), with δ↓: gens(s,t) → gens(s−1,t) given by [`delta`]. Because
     // everything is weight-graded and τ is the only homogeneous prime, `Ext = H(δ)`
-    // is a graded F₂[τ]-module: free ⊕ F₂[τ]/τᵏ. Two facts make this pure-F₂ work:
-    //
-    //  * δ↓ raises the (algebra) weight (a δ-entry g_k → g_j carries τ^{w_j−w_k},
-    //    w_j ≥ w_k), so the dual δ* lowers it and `{weight ≤ cap}` is a subcomplex.
-    //  * The free rank (what survives inverting τ = the classical Adams E₂) is the
-    //    stable value, obtained with *all* generators (cap = ∞); each lower cap
-    //    removes high-weight generators and exposes τ-torsion.
-
-    /// The generators at `(s, t)` with algebra weight `≤ cap`, as their indices.
-    fn gen_list(&self, s: i32, t: i32, cap: i32) -> Vec<usize> {
-        (0..self.num_gens(s, t))
-            .filter(|&idx| self.weights.get(&Gen { s, t, idx }).is_some_and(|&w| w <= cap))
-            .collect()
-    }
-
-    /// The rank over $\mathbb{F}_2$ of the dual differential
-    /// $\delta^*_{s} : C^{s} \to C^{s+1}$ (the transpose of $\delta$ from
-    /// $(s+1,t)$ to $(s,t)$), restricted to generators of algebra weight `≤ cap`.
-    fn delta_star_rank(&self, s: i32, t: i32, cap: i32) -> usize {
-        let cols = self.gen_list(s, t, cap); // C^s   (source, g_k at s)
-        let rows = self.gen_list(s + 1, t, cap); // C^{s+1} (g_l at s+1)
-        if cols.is_empty() || rows.is_empty() {
-            return 0;
-        }
-        let col_pos: HashMap<usize, usize> =
-            cols.iter().enumerate().map(|(i, &g)| (g, i)).collect();
-        let mut m = Matrix::new(TWO, rows.len(), cols.len());
-        for (ri, &l) in rows.iter().enumerate() {
-            for (gk, _power) in self.delta(Gen { s: s + 1, t, idx: l }) {
-                if let Some(&cj) = col_pos.get(&gk.idx) {
-                    m.row_mut(ri).set_entry(cj, 1);
-                }
-            }
-        }
-        m.row_reduce()
-    }
-
-    /// The $\mathbb{F}_2$-dimension of `Ext^{s,t}` in the weight slice `≤ cap`:
-    /// $\dim H^s = \dim C^s - \mathrm{rank}\,\delta^*_s - \mathrm{rank}\,\delta^*_{s-1}$.
-    ///
-    /// With `cap = i32::MAX` this is the classical Adams $E_2$ rank (invert $\tau$);
-    /// with finite caps it exposes the motivic $\tau$-torsion. Requires the lift to
-    /// be computed at `s+1` (so `s + 1 ≤ max_s`).
-    fn ext_dim(&self, s: i32, t: i32, cap: i32) -> usize {
-        let n = self.gen_list(s, t, cap).len();
-        let r_s = self.delta_star_rank(s, t, cap);
-        let r_prev = if s > 0 {
-            self.delta_star_rank(s - 1, t, cap)
-        } else {
-            0
-        };
-        n - r_s - r_prev
-    }
+    // is a graded F₂[τ]-module: free ⊕ F₂[τ]/τᵏ. δ↓ raises the weight, so
+    // `{weight ≤ cap}` is a subcomplex — and taking that cohomology (free rank at
+    // cap = ∞, torsion exposed at lower caps) is now the job of the [`ExtAlgebra`]
+    // built by [`Self::build_ext`], via [`MotivicCoboundary`] as its differential.
 
     /// Build the Ext DGA: apply $\Hom(-, k)$ to the raw lifted differential
     /// (`lifted`), producing the dualized coboundary δ, and hand it to an
@@ -656,6 +640,7 @@ impl MotivicResolution {
         let coboundary = Arc::new(MotivicCoboundary {
             resolution: Arc::clone(&self.resolution),
             deltas,
+            weights: self.weights.clone(),
         });
         ExtAlgebra::without_unit(Arc::clone(&self.resolution)).with_differential(coboundary)
     }
@@ -677,7 +662,9 @@ impl MotivicResolution {
     /// dimension is a class that dies when $\tau$ is inverted — genuine motivic
     /// $\tau$-torsion. Scans weight caps within the generators' weight range.
     pub fn has_tau_torsion(&self, s: i32, t: i32) -> bool {
-        let free = self.classical_ext_rank(s, t);
+        let b = Bidegree::n_s(t - s, s);
+        let ext = self.ext.get_or_init(|| self.build_ext());
+        let free = ext.cohomology_dimension(b).unwrap_or(0);
         // The generator weights at these degrees bound the useful cap range.
         let weights: Vec<i32> = ((s - 1).max(0)..=s + 1)
             .flat_map(|ss| (0..self.num_gens(ss, t)).map(move |idx| (ss, idx)))
@@ -686,7 +673,7 @@ impl MotivicResolution {
         let (Some(&lo), Some(&hi)) = (weights.iter().min(), weights.iter().max()) else {
             return false;
         };
-        (lo..=hi).any(|cap| self.ext_dim(s, t, cap) > free)
+        (lo..=hi).any(|cap| ext.cohomology_dimension_capped(b, cap).unwrap_or(0) > free)
     }
 
     /// The mod-$\tau$ support of `d_s(g)`: the lifted terms whose forced
