@@ -1048,22 +1048,37 @@ impl MotivicMilnorAlgebra {
         t2: i32,
         idx2: usize,
     ) -> Vec<(Tau, usize)> {
+        self.product_indexed_with(t1, idx1, t2, idx2, <[_]>::to_vec)
+    }
+
+    /// Run `f` on the cached product of the two basis elements **by reference**,
+    /// without cloning the term list. A hot consumer (the Phase 2 lift's
+    /// `composite`, which walks millions of cached products) should prefer this to
+    /// [`Self::product_indexed`] to avoid a `Vec` clone per structure constant.
+    pub fn product_indexed_with<R>(
+        &self,
+        t1: i32,
+        idx1: usize,
+        t2: i32,
+        idx2: usize,
+        f: impl FnOnce(&[(Tau, usize)]) -> R,
+    ) -> R {
         let block = self.block(t1, t2);
         let cell = &block.entries[idx1 * block.dim2 + idx2];
         if let Some(cached) = cell.get() {
             PRODUCT_HITS.fetch_add(1, Ordering::Relaxed);
-            return cached.clone();
+            return f(cached);
         }
         // The closed-form product (Kong–Lin Theorem 5.1), validated exhaustively
         // against the duality oracle `multiply`.
-        cell.get_or_init(|| {
+        let terms = cell.get_or_init(|| {
             let start = std::time::Instant::now();
             let result = self.compute_product(t1, idx1, t2, idx2);
             PRODUCT_MISSES.fetch_add(1, Ordering::Relaxed);
             PRODUCT_NANOS.fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
             result
-        })
-        .clone()
+        });
+        f(terms)
     }
 
     /// Compute *every* entry of the `(t1, t2)` product block at once, filling it in

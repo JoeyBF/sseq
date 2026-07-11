@@ -289,7 +289,11 @@ impl MotivicResolution {
         let f_sm2 = self.module(s - 2);
         let engine = self.algebra.engine();
 
-        let mut parity: HashMap<usize, u32> = HashMap::new();
+        // Accumulate `d_{s-1} d_s(g_k)` mod 2 as a dense F₂ vector over the
+        // $F_{s-2}$ basis in degree `t`: every term is one XOR into a bit, which
+        // beats a `HashMap` over the millions of terms this walks. Both the
+        // product term-list (read by reference, no clone) and the parity are hot.
+        let mut parity = FpVector::new(TWO, f_sm2.dimension(t));
         for &bidx in support {
             let og = f_sm1.index_to_op_gen(t, bidx);
             let (m_deg, m_idx) = (og.operation_degree, og.operation_index);
@@ -312,16 +316,18 @@ impl MotivicResolution {
                 let (mp_deg, mp_idx) = (og2.operation_degree, og2.operation_index);
                 let (gl_deg, gl_idx) = (og2.generator_degree, og2.generator_index);
                 let z_deg = m_deg + mp_deg;
-                for (_tau, z_idx) in engine.product_indexed(m_deg, m_idx, mp_deg, mp_idx) {
-                    let fidx = f_sm2.operation_generator_to_index(z_deg, z_idx, gl_deg, gl_idx);
-                    *parity.entry(fidx).or_insert(0) ^= 1;
-                }
+                engine.product_indexed_with(m_deg, m_idx, mp_deg, mp_idx, |terms| {
+                    for &(_tau, z_idx) in terms {
+                        let fidx =
+                            f_sm2.operation_generator_to_index(z_deg, z_idx, gl_deg, gl_idx);
+                        parity.add_basis_element(fidx, 1); // XOR at p = 2
+                    }
+                });
             }
         }
 
         parity
-            .into_iter()
-            .filter(|(_, p)| p & 1 == 1)
+            .iter_nonzero()
             .map(|(fidx, _)| {
                 // Every path to `fidx` has the same τ-power = W(fidx) − W(g_k)
                 // (weight-homogeneity), so the parity above is well-defined.
