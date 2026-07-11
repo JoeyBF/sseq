@@ -60,6 +60,7 @@ use std::{
 use algebra::{
     CTauAlgebra,
     module::{FDModule, FreeModule, Module, homomorphism::ModuleHomomorphism},
+    motivic::MotivicMilnorAlgebra,
 };
 use bivec::BiVec;
 use fp::{matrix::Matrix, prime::TWO, vector::FpVector};
@@ -277,10 +278,58 @@ impl MotivicResolution {
         support
     }
 
+    /// XOR the contribution of a single `d_s(g_k)` support element `bidx` (a basis
+    /// element of $F_{s-1}$ in degree `t`) into a running `d_{s-1} d_s` parity
+    /// vector over the $F_{s-2}$ basis in degree `t`.
+    ///
+    /// `composite` is mod-2 linear in the support and each output basis element's
+    /// $\tau$-power is a function of that element alone (weight-homogeneity), so
+    /// this per-term atom is all both [`Self::composite`] and the incremental
+    /// [`Self::correct`] need: toggling a term in or out of the support is exactly
+    /// one call here (XOR is its own inverse).
+    fn accumulate_term(
+        &self,
+        s: i32,
+        t: i32,
+        f_sm1: &FreeModule<CTauAlgebra>,
+        f_sm2: &FreeModule<CTauAlgebra>,
+        engine: &MotivicMilnorAlgebra,
+        bidx: usize,
+        parity: &mut FpVector,
+    ) {
+        let og = f_sm1.index_to_op_gen(t, bidx);
+        let (m_deg, m_idx) = (og.operation_degree, og.operation_index);
+        let gj = Gen {
+            s: s - 1,
+            t: og.generator_degree,
+            idx: og.generator_index,
+        };
+        let gj_lifted = self.lifted.get(&gj).unwrap_or_else(|| {
+            panic!(
+                "composite references generator {gj:?} outside the resolved box \
+                 (stem {} > compute stem {}); increase the lift stem margin (MOT_MARGIN)",
+                gj.t - gj.s,
+                self.compute.n(),
+            )
+        });
+        for &bidx2 in gj_lifted {
+            let og2 = f_sm2.index_to_op_gen(gj.t, bidx2);
+            let (mp_deg, mp_idx) = (og2.operation_degree, og2.operation_index);
+            let (gl_deg, gl_idx) = (og2.generator_degree, og2.generator_index);
+            let z_deg = m_deg + mp_deg;
+            engine.product_indexed_with(m_deg, m_idx, mp_deg, mp_idx, |terms| {
+                for &(_tau, z_idx) in terms {
+                    let fidx = f_sm2.operation_generator_to_index(z_deg, z_idx, gl_deg, gl_idx);
+                    parity.add_basis_element(fidx, 1); // XOR at p = 2
+                }
+            });
+        }
+    }
+
     /// The composite `d_{s-1} d_s(g_k)` over `A_C`, as a map from $F_{s-2}$ basis
-    /// element (in degree `g_k.t`) to `(parity mod 2, forced τ-power)`. Only
-    /// odd-parity (surviving) terms are returned. The `A_C` products
-    /// `m · m'` are where the $\tau$-divisible terms are generated.
+    /// element (in degree `g_k.t`) to its forced $\tau$-power. Only odd-parity
+    /// (surviving) terms are returned. The `A_C` products `m · m'` are where the
+    /// $\tau$-divisible terms are generated.
     fn composite(&self, g_k: Gen, support: &BTreeSet<usize>) -> BTreeMap<usize, i32> {
         let s = g_k.s;
         let t = g_k.t;
@@ -289,41 +338,9 @@ impl MotivicResolution {
         let f_sm2 = self.module(s - 2);
         let engine = self.algebra.engine();
 
-        // Accumulate `d_{s-1} d_s(g_k)` mod 2 as a dense F₂ vector over the
-        // $F_{s-2}$ basis in degree `t`: every term is one XOR into a bit, which
-        // beats a `HashMap` over the millions of terms this walks. Both the
-        // product term-list (read by reference, no clone) and the parity are hot.
         let mut parity = FpVector::new(TWO, f_sm2.dimension(t));
         for &bidx in support {
-            let og = f_sm1.index_to_op_gen(t, bidx);
-            let (m_deg, m_idx) = (og.operation_degree, og.operation_index);
-            let gj = Gen {
-                s: s - 1,
-                t: og.generator_degree,
-                idx: og.generator_index,
-            };
-            let gj_lifted = self.lifted.get(&gj).unwrap_or_else(|| {
-                panic!(
-                    "composite references generator {gj:?} outside the resolved box \
-                     (stem {} > compute stem {}); increase the lift stem margin \
-                     (MOT_MARGIN)",
-                    gj.t - gj.s,
-                    self.compute.n(),
-                )
-            });
-            for &bidx2 in gj_lifted {
-                let og2 = f_sm2.index_to_op_gen(gj.t, bidx2);
-                let (mp_deg, mp_idx) = (og2.operation_degree, og2.operation_index);
-                let (gl_deg, gl_idx) = (og2.generator_degree, og2.generator_index);
-                let z_deg = m_deg + mp_deg;
-                engine.product_indexed_with(m_deg, m_idx, mp_deg, mp_idx, |terms| {
-                    for &(_tau, z_idx) in terms {
-                        let fidx =
-                            f_sm2.operation_generator_to_index(z_deg, z_idx, gl_deg, gl_idx);
-                        parity.add_basis_element(fidx, 1); // XOR at p = 2
-                    }
-                });
-            }
+            self.accumulate_term(s, t, &f_sm1, &f_sm2, engine, bidx, &mut parity);
         }
 
         parity
@@ -347,10 +364,12 @@ impl MotivicResolution {
         let s = g_k.s;
         let t = g_k.t;
         let p = self.resolution.prime();
+        let w_k = self.weights[&g_k];
         let f_sm1 = self.module(s - 1);
         let f_sm2 = self.module(s - 2);
         let f_sm1_dim = f_sm1.dimension(t);
         let f_sm2_dim = f_sm2.dimension(t);
+        let engine = self.algebra.engine();
         let d_prev = self.resolution.differential(s - 1);
 
         // The quasi-inverse of the mod-τ differential at this degree. If it was
@@ -359,12 +378,24 @@ impl MotivicResolution {
             return;
         };
 
+        // Maintain the composite `d_{s-1} d_s(g_k)` incrementally. `composite` is
+        // mod-2 linear in the support, so instead of re-sweeping the whole support
+        // every τ-order (the old inner loop), we keep a running parity vector and
+        // XOR in only each term we toggle. Seed it with the current support.
+        let mut parity = FpVector::new(p, f_sm2_dim);
+        for &bidx in support.iter() {
+            self.accumulate_term(s, t, &f_sm1, &f_sm2, engine, bidx, &mut parity);
+        }
+
         for _ in 0..256 {
-            let err = self.composite(g_k, support);
-            if err.is_empty() {
-                return;
-            }
-            let min_power = *err.values().min().unwrap();
+            // The lowest τ-order among the surviving error terms.
+            let min_power = parity
+                .iter_nonzero()
+                .map(|(fidx, _)| self.entry_weight(s - 2, t, fidx) - w_k)
+                .min();
+            let Some(min_power) = min_power else {
+                return; // d_{s-1} d_s(g_k) = 0
+            };
             assert!(
                 min_power >= 1,
                 "mod-τ composite d̄² ≠ 0 at (s={}, t={}, idx={}) — model is not a complex",
@@ -375,8 +406,8 @@ impl MotivicResolution {
 
             // The error at the lowest τ-order, as an F_{s-2} vector.
             let mut e_bar = FpVector::new(p, f_sm2_dim);
-            for (&fidx, &power) in &err {
-                if power == min_power {
+            for (fidx, _) in parity.iter_nonzero() {
+                if self.entry_weight(s - 2, t, fidx) - w_k == min_power {
                     e_bar.set_entry(fidx, 1);
                 }
             }
@@ -385,20 +416,22 @@ impl MotivicResolution {
             let mut c = FpVector::new(p, f_sm1_dim);
             qi.apply(c.as_slice_mut(), 1, e_bar.as_slice());
 
-            // Toggle c's support into d_s(g_k). Each such basis element is forced
-            // (by weight) to τ-power min_power, cancelling this order.
+            // Toggle c's support into d_s(g_k), updating the running parity in
+            // lockstep. Each such basis element is forced (by weight) to τ-power
+            // min_power, cancelling this order.
             for (idx, v) in c.iter_nonzero() {
                 if v == 0 {
                     continue;
                 }
                 debug_assert_eq!(
-                    self.entry_weight(s - 1, t, idx) - self.weights[&g_k],
+                    self.entry_weight(s - 1, t, idx) - w_k,
                     min_power,
                     "correction term at inconsistent τ-power"
                 );
                 if !support.insert(idx) {
                     support.remove(&idx);
                 }
+                self.accumulate_term(s, t, &f_sm1, &f_sm2, engine, idx, &mut parity);
             }
         }
         // Non-convergence within the iteration cap means the generator's cone
