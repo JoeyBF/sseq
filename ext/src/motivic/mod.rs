@@ -202,6 +202,10 @@ pub struct MotivicResolution {
     /// resolution/functor split — the raw differential stays in the resolution
     /// (`lifted`); δ lives here.
     ext: OnceLock<ExtAlgebra<CTauResolution>>,
+    /// The deformation (algebraic Novikov / τ-Bockstein) spectral sequence, built
+    /// lazily — the source of truth for the free rank and τ-torsion. See
+    /// [`Self::deformation_sseq`].
+    deformation: OnceLock<Sseq<3, Deformation>>,
     /// Motivic weight of each generator. `Arc`-shared with the Ext DGA's
     /// [`MotivicCoboundary`] (which slices by it) rather than copied.
     weights: Arc<HashMap<Gen, i32>>,
@@ -270,6 +274,7 @@ impl MotivicResolution {
             algebra,
             resolution,
             ext: OnceLock::new(),
+            deformation: OnceLock::new(),
             weights: Arc::new(HashMap::new()),
             lifted: HashMap::new(),
             max,
@@ -774,7 +779,11 @@ impl MotivicResolution {
     /// this.
     ///
     /// [`page_data`]: Sseq::page_data
-    pub fn deformation_sseq(&self) -> Sseq<3, Deformation> {
+    pub fn deformation_sseq(&self) -> &Sseq<3, Deformation> {
+        self.deformation.get_or_init(|| self.build_deformation_sseq())
+    }
+
+    fn build_deformation_sseq(&self) -> Sseq<3, Deformation> {
         let mut sseq = Sseq::<3, Deformation>::new(TWO);
 
         // Group generators by (n, s, w) — a generator's position within its group
@@ -851,7 +860,11 @@ impl MotivicResolution {
             let mut to_add: Vec<(MultiDegree<3>, FpVector, FpVector)> = Vec::new();
             for &b in &degrees {
                 let [n, s, w] = b.coords();
-                if s < 1 {
+                // Only report-box sources: their δ-targets (stem n+1 ≤ compute.n())
+                // are resolved, and every differential touching a report degree has
+                // a report-box source, so the report E_∞ is unaffected. Margin
+                // sources would reach stem max.n+2 (unresolved).
+                if s < 1 || n > self.max.n() {
                     continue;
                 }
                 let page = sseq.page_data(b);
@@ -909,20 +922,35 @@ impl MotivicResolution {
     }
 
     /// The classical Adams $E_2$ rank at `(s, t)` — invert $\tau$: the free rank of
-    /// `H(δ)`, computed with all generators.
+    /// the motivic $E_2$.
     ///
-    /// This is [`ExtAlgebra::cohomology_dimension`] of the Ext DGA — the motivic
-    /// Adams $E_2$ as the cohomology of the dualized differential δ.
+    /// Read off the deformation SS: the $E_\infty$ survivors at `(n, s)` summed over
+    /// weight. Inverting $\tau$ ($w \to \infty$) is exactly the classical Adams
+    /// $E_2$; the τ-torsion classes die on finite pages and drop out.
     pub fn classical_ext_rank(&self, s: i32, t: i32) -> usize {
-        self.ext()
-            .cohomology_dimension(Bidegree::n_s(t - s, s))
-            .unwrap_or(0)
+        let n = t - s;
+        let sseq = self.deformation_sseq();
+        sseq.iter_degrees()
+            .filter(|d| {
+                let c = d.coords();
+                c[0] == n && c[1] == s
+            })
+            .map(|d| {
+                let page = sseq.page_data(d);
+                page[page.len() - 1].dimension() // E_∞ at (n, s, w)
+            })
+            .sum()
     }
 
     /// Whether `(s, t)` carries a $\tau$-torsion class in the motivic $E_2$: some
     /// weight slice has larger `H(δ)` than the free (classical) rank. The extra
     /// dimension is a class that dies when $\tau$ is inverted — genuine motivic
-    /// $\tau$-torsion. Scans weight caps within the generators' weight range.
+    /// $\tau$-torsion.
+    ///
+    /// Computed on the direct (ExtAlgebra) cohomology path. The equivalent read off
+    /// the Sseq — counting $d_r$ sources — needs care to exclude differential
+    /// *targets* (τ-divisible free classes, not torsion), so it is deferred; the
+    /// free rank ([`Self::classical_ext_rank`]) is the Sseq quantity here.
     pub fn has_tau_torsion(&self, s: i32, t: i32) -> bool {
         let b = Bidegree::n_s(t - s, s);
         let ext = self.ext();
@@ -1102,7 +1130,11 @@ mod tests {
         for s in 0..res.max_s() {
             for n in 0..=8 {
                 let got = einf.get(&(n, s)).copied().unwrap_or(0);
-                let want = res.classical_ext_rank(s, n + s);
+                // Cross-check the Sseq E_∞ against the independent ExtAlgebra path.
+                let want = res
+                    .ext()
+                    .cohomology_dimension(Bidegree::n_s(n, s))
+                    .unwrap_or(0);
                 assert_eq!(got, want, "E_∞ free rank at (n={n}, s={s})");
             }
         }
