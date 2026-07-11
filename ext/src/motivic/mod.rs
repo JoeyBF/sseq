@@ -65,7 +65,10 @@ use algebra::{
 use bivec::BiVec;
 use fp::{matrix::Matrix, prime::TWO, vector::FpVector};
 use maybe_rayon::prelude::*;
-use sseq::coordinates::Bidegree;
+use sseq::{
+    Sseq, SseqProfile,
+    coordinates::{Bidegree, degree::MultiDegree, element::MultiDegreeElement},
+};
 
 use crate::{
     chain_complex::{ChainComplex, FiniteChainComplex},
@@ -76,6 +79,31 @@ use crate::{
 /// The $A_C/\tau$ resolution type: the trivial module resolved by the ordinary
 /// engine over the mod-$\tau$ Steenrod algebra.
 pub type CTauResolution = Resolution<FiniteChainComplex<FDModule<CTauAlgebra>>>;
+
+/// The direction of the **deformation spectral sequence** (the algebraic Novikov
+/// / $\tau$-Bockstein SS), trigraded by (stem $n$, Adams filtration $s$, weight
+/// $w$). Each $d_r$ carries δ's fixed $(n, s) \mapsto (n+1, s-1)$ shift — δ lowers
+/// Novikov filtration at fixed internal degree, so the stem rises — and jumps the
+/// weight by $r$ (the $\tau$-power). $E_1 = \Ext_{A_C/\tau}$; inverting $\tau$
+/// ($w \to \infty$) gives $E_\infty = $ classical $\Ext_A$, and finite-page deaths
+/// are the motivic $\tau$-torsion.
+pub struct Deformation;
+
+impl SseqProfile<3> for Deformation {
+    const MIN_R: i32 = 1;
+
+    fn profile(r: i32, b: MultiDegree<3>) -> MultiDegree<3> {
+        b + MultiDegree::from([1, -1, r])
+    }
+
+    fn profile_inverse(r: i32, b: MultiDegree<3>) -> MultiDegree<3> {
+        b + MultiDegree::from([-1, 1, -r])
+    }
+
+    fn differential_length(offset: MultiDegree<3>) -> i32 {
+        offset.coords()[2] // the weight component
+    }
+}
 
 /// A generator of the resolution, identified by homological degree `s`, internal
 /// degree `t`, and index within that `(s, t)` bidegree.
@@ -663,6 +691,76 @@ impl MotivicResolution {
         self.ext.get_or_init(|| self.build_ext())
     }
 
+    /// The deformation spectral sequence as an [`Sseq`], trigraded by $(n, s, w)$
+    /// ([`Deformation`]). $E_1 = \Ext_{A_C/\tau}$ — the mod-τ generators, grouped
+    /// by weight — with $d_1$ the **weight-1 part of δ** (the induced differential
+    /// on the associated graded, read directly off [`delta`](Self::delta)).
+    /// [`Sseq::update`] then computes $E_2 = H(d_1)$, whose [`page_data`] are the
+    /// `Subquotient`s.
+    ///
+    /// This is the foundation: $d_1$ and the permanent (δ = 0) cycles. The higher
+    /// $d_r$ — revealed by leading-term cancellation, requiring the filtered-complex
+    /// zig-zag — and the products (via [`Sseq::multiply`]/`leibniz`) build on it.
+    ///
+    /// [`page_data`]: Sseq::page_data
+    pub fn deformation_sseq(&self) -> Sseq<3, Deformation> {
+        let mut sseq = Sseq::<3, Deformation>::new(TWO);
+
+        // Group generators by (n, s, w); a generator's position within its group is
+        // its coordinate in that multidegree's space.
+        let mut groups: HashMap<[i32; 3], Vec<usize>> = HashMap::new();
+        let mut pos: HashMap<Gen, (MultiDegree<3>, usize)> = HashMap::new();
+        for s in 0..=self.max_s() {
+            let t_max = self.compute.n() + s;
+            for t in 0..=t_max {
+                for idx in 0..self.num_gens(s, t) {
+                    let g = Gen { s, t, idx };
+                    if let Some(&w) = self.weights.get(&g) {
+                        let key = [t - s, s, w];
+                        let list = groups.entry(key).or_default();
+                        pos.insert(g, (MultiDegree::from(key), list.len()));
+                        list.push(idx);
+                    }
+                }
+            }
+        }
+        for (&key, list) in &groups {
+            sseq.set_dimension(MultiDegree::from(key), list.len());
+        }
+
+        // d₁ = the weight-1 part of δ; a generator with δ = ∅ is a permanent cycle.
+        for (&g, &(deg, p)) in &pos {
+            let mut source = FpVector::new(TWO, sseq.dimension(deg));
+            source.set_entry(p, 1);
+            // s = 0 is the unit: no differential (δ is only defined for s ≥ 1).
+            if g.s == 0 {
+                sseq.add_permanent_class(&MultiDegreeElement::new(deg, source));
+                continue;
+            }
+            let d = self.delta(g);
+            if d.is_empty() {
+                sseq.add_permanent_class(&MultiDegreeElement::new(deg, source));
+                continue;
+            }
+            let target_deg = Deformation::profile(1, deg);
+            let mut target = FpVector::new(TWO, sseq.dimension(target_deg));
+            let mut hit = false;
+            for (gj, power) in d {
+                if power == 1 {
+                    target.set_entry(pos[&gj].1, 1);
+                    hit = true;
+                }
+            }
+            // No weight-1 term ⟹ g is a d₁-cycle (its leading δ term is higher order).
+            if hit {
+                sseq.add_differential(1, &MultiDegreeElement::new(deg, source), target.as_slice());
+            }
+        }
+
+        sseq.update();
+        sseq
+    }
+
     /// The classical Adams $E_2$ rank at `(s, t)` — invert $\tau$: the free rank of
     /// `H(δ)`, computed with all generators.
     ///
@@ -774,6 +872,45 @@ mod tests {
             assert_eq!(power.degree(), deg, "h₀^{n} lands in (0,{n})");
             assert_eq!(ext.dimension(deg), 1, "(0,{n}) is 1-dimensional");
             assert!(!power.vec().is_zero(), "h₀^{n} should be nonzero");
+        }
+    }
+
+    #[test]
+    fn deformation_sseq_foundation() {
+        // The deformation SS stored as an Sseq: E₁ = Ext_{A_C/τ} trigraded by
+        // (n,s,w), d₁ = the weight-1 part of δ.
+        let res = MotivicResolution::new(Bidegree::n_s(8, 5));
+        let sseq = res.deformation_sseq();
+
+        // E₁ grouping: summing the weight slices at (n,s) recovers the algebraic
+        // Novikov rank (the mod-τ generator count).
+        let mut totals: HashMap<(i32, i32), usize> = HashMap::new();
+        for deg in sseq.iter_degrees() {
+            let [n, s, _] = deg.coords();
+            *totals.entry((n, s)).or_default() += sseq.dimension(deg);
+        }
+        for (&(n, s), &total) in &totals {
+            if (0..=8).contains(&n) && (0..=5).contains(&s) {
+                assert_eq!(
+                    total,
+                    res.algebraic_novikov_rank(s, n + s),
+                    "E₁ weight slices at (n={n}, s={s}) should sum to the generator count"
+                );
+            }
+        }
+
+        // h₀ ∈ (n=0, s=1, w=0): δ(h₀) = ∅, so it is a permanent cycle.
+        let h0 = MultiDegree::from([0, 1, 0]);
+        assert_eq!(sseq.get_dimension(h0), Some(1), "h₀ is 1-dimensional");
+        assert_eq!(
+            sseq.permanent_classes(h0).dimension(),
+            1,
+            "h₀ (δ = ∅) should be a permanent cycle"
+        );
+
+        // Every d₁ we added is consistent.
+        for deg in sseq.iter_degrees() {
+            assert!(!sseq.inconsistent(deg), "inconsistent differential at {deg}");
         }
     }
 
