@@ -15,6 +15,7 @@
 //! `Max s`, defaulting to 12 / 8).
 
 use ext::motivic::MotivicResolution;
+use maybe_rayon::prelude::*;
 use sseq::coordinates::Bidegree;
 
 fn main() -> anyhow::Result<()> {
@@ -31,20 +32,32 @@ fn main() -> anyhow::Result<()> {
     // reported filtration is `max.s() - 1`.
     let top_s = max.s() - 1;
 
-    println!("n,s,alg_nov,classical,tau_torsion");
-    for s in 0..=top_s {
-        for n in 0..=max.n() {
+    // The cohomology at each (s, n) is independent — compute the chart in
+    // parallel, then print in deterministic order.
+    let cells: Vec<(i32, i32)> = (0..=top_s)
+        .flat_map(|s| (0..=max.n()).map(move |n| (s, n)))
+        .collect();
+    let mut lines: Vec<(i32, i32, String)> = cells
+        .into_maybe_par_iter()
+        .filter_map(|(s, n)| {
             let t = n + s;
             let alg_nov = res.algebraic_novikov_rank(s, t);
             let classical = res.classical_ext_rank(s, t);
             let torsion = res.has_tau_torsion(s, t);
-            if alg_nov > 0 || classical > 0 || torsion {
-                println!(
-                    "{n},{s},{alg_nov},{classical},{}",
-                    if torsion { "*" } else { "" }
-                );
-            }
-        }
+            (alg_nov > 0 || classical > 0 || torsion).then(|| {
+                (
+                    s,
+                    n,
+                    format!("{n},{s},{alg_nov},{classical},{}", if torsion { "*" } else { "" }),
+                )
+            })
+        })
+        .collect();
+    lines.sort_by_key(|&(s, n, _)| (s, n));
+
+    println!("n,s,alg_nov,classical,tau_torsion");
+    for (_, _, line) in lines {
+        println!("{line}");
     }
 
     Ok(())

@@ -42,8 +42,8 @@
 //! motivic Adams $E_2$ is `Ext_{A_C} = H(δ)`, a graded $\mathbb{F}_2[\tau]$-module
 //! — free $\oplus\ \mathbb{F}_2[\tau]/\tau^k$, since $\tau$ is the only homogeneous
 //! prime. Because $\delta$ raises the weight, `{weight ≤ cap}` is a subcomplex and
-//! the whole computation is pure $\mathbb{F}_2$ linear algebra
-//! ([`MotivicResolution::ext_dim`]). The three anchors fall out:
+//! the whole computation is pure $\mathbb{F}_2$ linear algebra. The three anchors
+//! fall out:
 //!
 //! - **invert $\tau$** — the free rank (all generators): the classical Adams $E_2$
 //!   ([`MotivicResolution::classical_ext_rank`], regressed against `Ext_A`).
@@ -63,6 +63,7 @@ use algebra::{
 };
 use bivec::BiVec;
 use fp::{matrix::Matrix, prime::TWO, vector::FpVector};
+use maybe_rayon::prelude::*;
 use sseq::coordinates::Bidegree;
 
 use crate::{
@@ -194,37 +195,49 @@ impl MotivicResolution {
     /// augmentation ideal. For `s ≥ 2` we start from the mod-$\tau$ support and
     /// cancel the $\tau$-divisible remainder of `d_{s-1} d_s`.
     fn lift(&mut self) {
+        // Wavefront over `s`: correcting a generator reads only its `s-1`
+        // neighbors (the mod-τ targets at stem ≤ n and the δ-targets at stem
+        // n+1), and runs its own weight-loop locally. So `s` is a sequential
+        // barrier, but at each `s` every generator is independent — fan them out.
         for s in 1..=self.max_s() {
             let t_max = self.compute.n() + s;
-            for t in 0..=t_max {
-                for idx in 0..self.num_gens(s, t) {
-                    let g = Gen { s, t, idx };
-                    // Start from the mod-τ differential support (τ^0 terms).
-                    let mut support: BTreeSet<usize> = self
-                        .resolution
-                        .differential(s)
-                        .output(t, idx)
-                        .iter_nonzero()
-                        .filter(|(_, v)| *v != 0)
-                        .map(|(i, _)| i)
-                        .collect();
-                    // Correct only generators whose δ-correction cone stays inside
-                    // the padded box. The cone of a generator at stem `n` reaches
-                    // up to stem `n + s` (each augmentation correction pushes one
-                    // stem out), so a generator with stem `> report.n + report.s`
-                    // cannot converge — and it is never referenced by the report
-                    // cohomology (differentials go to stem ≤ n, δ-terms to n+1, and
-                    // the report cone is bounded by report.n + report.s). Leaving
-                    // those as their mod-τ support is correct.
-                    let stem = t - s;
-                    let in_cone = stem <= self.max.n() + self.max.s();
-                    if s >= 2 && in_cone && self.weights.contains_key(&g) {
-                        self.correct(g, &mut support);
-                    }
-                    self.lifted.insert(g, support);
-                }
-            }
+            let gens: Vec<Gen> = (0..=t_max)
+                .flat_map(|t| (0..self.num_gens(s, t)).map(move |idx| Gen { s, t, idx }))
+                .collect();
+            let lifted: Vec<(Gen, BTreeSet<usize>)> = gens
+                .into_maybe_par_iter()
+                .map(|g| (g, self.lift_generator(g)))
+                .collect();
+            self.lifted.extend(lifted);
         }
+    }
+
+    /// Lift a single generator's differential to `A_C`. Parallel-safe: it reads
+    /// only already-finalized `s-1` data (and the shared, thread-safe product
+    /// cache), writing nothing.
+    fn lift_generator(&self, g: Gen) -> BTreeSet<usize> {
+        // Start from the mod-τ differential support (τ^0 terms).
+        let mut support: BTreeSet<usize> = self
+            .resolution
+            .differential(g.s)
+            .output(g.t, g.idx)
+            .iter_nonzero()
+            .filter(|(_, v)| *v != 0)
+            .map(|(i, _)| i)
+            .collect();
+        // Correct only generators whose δ-correction cone stays inside the padded
+        // box. The cone of a generator at stem `n` reaches up to stem `n + s` (each
+        // augmentation correction pushes one stem out), so a generator with stem
+        // `> report.n + report.s` cannot converge — and it is never referenced by
+        // the report cohomology (differentials go to stem ≤ n, δ-terms to n+1, and
+        // the report cone is bounded by report.n + report.s). Leaving those as
+        // their mod-τ support is correct.
+        let stem = g.t - g.s;
+        let in_cone = stem <= self.max.n() + self.max.s();
+        if g.s >= 2 && in_cone && self.weights.contains_key(&g) {
+            self.correct(g, &mut support);
+        }
+        support
     }
 
     /// The composite `d_{s-1} d_s(g_k)` over `A_C`, as a map from $F_{s-2}$ basis
