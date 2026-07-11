@@ -33,6 +33,24 @@
 //! by the engine) yields a $\tau$-power correction to $d_s$ that cancels the
 //! lowest-order remainder; iterating to bounded $\tau$-order gives $d_{s-1}d_s=0$.
 //! (Guozhen Wang's Adams–Novikov lift, module side; see `MOTIVIC_PLAN.md` §5.)
+//!
+//! # The cohomology $H(\delta)$ — the motivic Adams $E_2$
+//!
+//! The lift creates $\delta$, the identity-operation (augmentation) part of the
+//! differential ([`MotivicResolution::delta`]): a differential on the free
+//! $\mathbb{F}_2[\tau]$-modules of generators at fixed internal degree $t$. The
+//! motivic Adams $E_2$ is `Ext_{A_C} = H(δ)`, a graded $\mathbb{F}_2[\tau]$-module
+//! — free $\oplus\ \mathbb{F}_2[\tau]/\tau^k$, since $\tau$ is the only homogeneous
+//! prime. Because $\delta$ raises the weight, `{weight ≤ cap}` is a subcomplex and
+//! the whole computation is pure $\mathbb{F}_2$ linear algebra
+//! ([`MotivicResolution::ext_dim`]). The three anchors fall out:
+//!
+//! - **invert $\tau$** — the free rank (all generators): the classical Adams $E_2$
+//!   ([`MotivicResolution::classical_ext_rank`], regressed against `Ext_A`).
+//! - **$\tau = 0$** — the generator counts: the algebraic Novikov $E_2$ (Phase 1).
+//! - **keep $\tau$** — free plus $\tau$-torsion: the motivic $E_2$, including the
+//!   $h_1$-tower classes ($h_1^n$ for all $n$) that the classical page kills
+//!   ([`MotivicResolution::has_tau_torsion`]).
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
@@ -44,7 +62,7 @@ use algebra::{
     module::{FDModule, FreeModule, Module, homomorphism::ModuleHomomorphism},
 };
 use bivec::BiVec;
-use fp::vector::FpVector;
+use fp::{matrix::Matrix, prime::TWO, vector::FpVector};
 use sseq::coordinates::Bidegree;
 
 use crate::{
@@ -383,6 +401,88 @@ impl MotivicResolution {
         out
     }
 
+    // ---- Phase 3: the cohomology H(δ) = the motivic Adams E₂ ----
+    //
+    // δ is a differential on the free F₂[τ]-modules of generators (fixed internal
+    // degree `t`), with δ↓: gens(s,t) → gens(s−1,t) given by [`delta`]. Because
+    // everything is weight-graded and τ is the only homogeneous prime, `Ext = H(δ)`
+    // is a graded F₂[τ]-module: free ⊕ F₂[τ]/τᵏ. Two facts make this pure-F₂ work:
+    //
+    //  * δ↓ raises the (algebra) weight (a δ-entry g_k → g_j carries τ^{w_j−w_k},
+    //    w_j ≥ w_k), so the dual δ* lowers it and `{weight ≤ cap}` is a subcomplex.
+    //  * The free rank (what survives inverting τ = the classical Adams E₂) is the
+    //    stable value, obtained with *all* generators (cap = ∞); each lower cap
+    //    removes high-weight generators and exposes τ-torsion.
+
+    /// The generators at `(s, t)` with algebra weight `≤ cap`, as their indices.
+    fn gen_list(&self, s: i32, t: i32, cap: i32) -> Vec<usize> {
+        (0..self.num_gens(s, t))
+            .filter(|&idx| self.weights.get(&Gen { s, t, idx }).is_some_and(|&w| w <= cap))
+            .collect()
+    }
+
+    /// The rank over $\mathbb{F}_2$ of the dual differential
+    /// $\delta^*_{s} : C^{s} \to C^{s+1}$ (the transpose of $\delta$ from
+    /// $(s+1,t)$ to $(s,t)$), restricted to generators of algebra weight `≤ cap`.
+    fn delta_star_rank(&self, s: i32, t: i32, cap: i32) -> usize {
+        let cols = self.gen_list(s, t, cap); // C^s   (source, g_k at s)
+        let rows = self.gen_list(s + 1, t, cap); // C^{s+1} (g_l at s+1)
+        if cols.is_empty() || rows.is_empty() {
+            return 0;
+        }
+        let col_pos: HashMap<usize, usize> =
+            cols.iter().enumerate().map(|(i, &g)| (g, i)).collect();
+        let mut m = Matrix::new(TWO, rows.len(), cols.len());
+        for (ri, &l) in rows.iter().enumerate() {
+            for (gk, _power) in self.delta(Gen { s: s + 1, t, idx: l }) {
+                if let Some(&cj) = col_pos.get(&gk.idx) {
+                    m.row_mut(ri).set_entry(cj, 1);
+                }
+            }
+        }
+        m.row_reduce()
+    }
+
+    /// The $\mathbb{F}_2$-dimension of `Ext^{s,t}` in the weight slice `≤ cap`:
+    /// $\dim H^s = \dim C^s - \mathrm{rank}\,\delta^*_s - \mathrm{rank}\,\delta^*_{s-1}$.
+    ///
+    /// With `cap = i32::MAX` this is the classical Adams $E_2$ rank (invert $\tau$);
+    /// with finite caps it exposes the motivic $\tau$-torsion. Requires the lift to
+    /// be computed at `s+1` (so `s + 1 ≤ max_s`).
+    fn ext_dim(&self, s: i32, t: i32, cap: i32) -> usize {
+        let n = self.gen_list(s, t, cap).len();
+        let r_s = self.delta_star_rank(s, t, cap);
+        let r_prev = if s > 0 {
+            self.delta_star_rank(s - 1, t, cap)
+        } else {
+            0
+        };
+        n - r_s - r_prev
+    }
+
+    /// The classical Adams $E_2$ rank at `(s, t)` — invert $\tau$: the free rank of
+    /// `H(δ)`, computed with all generators.
+    pub fn classical_ext_rank(&self, s: i32, t: i32) -> usize {
+        self.ext_dim(s, t, i32::MAX)
+    }
+
+    /// Whether `(s, t)` carries a $\tau$-torsion class in the motivic $E_2$: some
+    /// weight slice has larger `H(δ)` than the free (classical) rank. The extra
+    /// dimension is a class that dies when $\tau$ is inverted — genuine motivic
+    /// $\tau$-torsion. Scans weight caps within the generators' weight range.
+    pub fn has_tau_torsion(&self, s: i32, t: i32) -> bool {
+        let free = self.classical_ext_rank(s, t);
+        // The generator weights at these degrees bound the useful cap range.
+        let weights: Vec<i32> = (s - 1..=s + 1)
+            .flat_map(|ss| (0..self.num_gens(ss, t)).map(move |idx| (ss, idx)))
+            .filter_map(|(ss, idx)| self.weights.get(&Gen { s: ss, t, idx }).copied())
+            .collect();
+        let (Some(&lo), Some(&hi)) = (weights.iter().min(), weights.iter().max()) else {
+            return false;
+        };
+        (lo..=hi).any(|cap| self.ext_dim(s, t, cap) > free)
+    }
+
     /// The mod-$\tau$ support of `d_s(g)`: the lifted terms whose forced
     /// $\tau$-power is $0$. These should reproduce the engine's $\bar d_s$ exactly.
     fn mod_tau_support(&self, g: Gen) -> BTreeSet<usize> {
@@ -482,5 +582,61 @@ mod tests {
             }
         }
         assert!(delta_entries > 0, "the lift produced no δ (augmentation) terms");
+    }
+
+    #[test]
+    fn anchor_invert_tau_is_classical_adams_e2() {
+        // Anchor 1: inverting τ (the free rank of H(δ), all generators) reproduces
+        // the classical Adams E₂ — Ext over the mod-2 Steenrod algebra. We resolve
+        // the classical sphere in-process and compare rank-for-rank. This is where
+        // the τ-torsion (e.g. the h₁-tower classes beyond h₁⁴) is *killed*: the
+        // motivic algebraic-Novikov extras collapse back onto classical Ext.
+        use crate::{chain_complex::FreeChainComplex, utils::construct_standard};
+
+        let max = Bidegree::n_s(8, 5);
+        let res = MotivicResolution::new(max);
+
+        let classical = construct_standard::<false, _, _>("S_2", None).unwrap();
+        classical.compute_through_stem(max);
+
+        // classical_ext_rank(s, t) needs the lift at s+1, so s ≤ max_s − 1.
+        for s in 0..res.max_s() {
+            for t in s..=(max.n() + s) {
+                let n = t - s;
+                if n > max.n() {
+                    continue;
+                }
+                let got = res.classical_ext_rank(s, t);
+                let want = classical.number_of_gens_in_bidegree(Bidegree::n_s(n, s));
+                assert_eq!(
+                    got, want,
+                    "invert-τ mismatch at (n={n}, s={s}): H(δ) free rank {got} ≠ classical {want}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn anchor_keep_tau_has_h1_tower_torsion() {
+        // Anchor 3: keeping τ, the motivic E₂ carries τ-torsion the classical page
+        // does not. The cleanest witness is the h₁-tower: h₁ⁿ ∈ Ext^{n,2n} is
+        // nonzero for all n motivically, but classically h₁⁴ = 0. So at (s,t)=(4,8)
+        // the free (classical) rank is 0, yet a τ-torsion class is present.
+        let max = Bidegree::n_s(8, 5);
+        let res = MotivicResolution::new(max);
+
+        assert_eq!(
+            res.classical_ext_rank(4, 8),
+            0,
+            "classical h₁⁴ should vanish"
+        );
+        assert!(
+            res.has_tau_torsion(4, 8),
+            "motivic E₂ should carry τ-torsion (h₁⁴) at (s=4, t=8)"
+        );
+
+        // Sanity: h₁³ (s=3, t=6) is already nonzero classically, so it is free —
+        // not flagged as (extra) torsion beyond its classical class.
+        assert_eq!(res.classical_ext_rank(3, 6), 1, "classical h₁³ should survive");
     }
 }
