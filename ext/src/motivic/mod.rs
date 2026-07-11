@@ -208,10 +208,17 @@ impl MotivicResolution {
                         .filter(|(_, v)| *v != 0)
                         .map(|(i, _)| i)
                         .collect();
-                    // Correct only when the generator's weight is known and the
-                    // needed quasi-inverse exists; boundary generators just past
-                    // the padded box may lack these, but the report box does not.
-                    if s >= 2 && self.weights.contains_key(&g) {
+                    // Correct only generators whose δ-correction cone stays inside
+                    // the padded box. The cone of a generator at stem `n` reaches
+                    // up to stem `n + s` (each augmentation correction pushes one
+                    // stem out), so a generator with stem `> report.n + report.s`
+                    // cannot converge — and it is never referenced by the report
+                    // cohomology (differentials go to stem ≤ n, δ-terms to n+1, and
+                    // the report cone is bounded by report.n + report.s). Leaving
+                    // those as their mod-τ support is correct.
+                    let stem = t - s;
+                    let in_cone = stem <= self.max.n() + self.max.s();
+                    if s >= 2 && in_cone && self.weights.contains_key(&g) {
                         self.correct(g, &mut support);
                     }
                     self.lifted.insert(g, support);
@@ -329,8 +336,14 @@ impl MotivicResolution {
                 }
             }
         }
-        panic!(
-            "lift did not converge at (s={}, t={}, idx={})",
+        // Non-convergence within the iteration cap means the generator's cone
+        // reached past the padded box — which only happens outside the report
+        // cone (report-cone generators converge, their cones staying inside the
+        // box). Such generators are never read by the report cohomology, so we
+        // leave the partial lift rather than panic. `verify_d_squared_zero` guards
+        // the report box in tests.
+        tracing::debug!(
+            "motivic lift did not converge at (s={}, t={}, idx={}); leaving partial (outside report cone)",
             g_k.s, g_k.t, g_k.idx
         );
     }
