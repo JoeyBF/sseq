@@ -98,10 +98,9 @@ pub struct MotivicResolution {
     lifted: HashMap<Gen, BTreeSet<usize>>,
     /// The box the results are trusted/reported in.
     max: Bidegree,
-    /// The (padded) box actually resolved, as `(filt ≤ compute.s(), internal
-    /// degree ≤ compute.t())`. Resolved by internal degree because the lift and
-    /// its `d²`/δ all preserve `t`; the report box's referenced generators live at
-    /// `t ≤ max.n + max.s`, and we add a small edge margin (see [`Self::new`]).
+    /// The (padded) square actually resolved: `{stem ≤ compute.n(), filt ≤
+    /// compute.s()}`. It is the report box `max` with a small stem margin for the
+    /// lift's δ-reach (see [`Self::new`]).
     compute: Bidegree,
 }
 
@@ -118,21 +117,29 @@ impl MotivicResolution {
         let cc: Arc<FiniteChainComplex<FDModule<CTauAlgebra>>> =
             Arc::new(FiniteChainComplex::ccdz(trivial));
         let resolution = Resolution::new(cc);
-        // Resolve by *internal degree*, not stem. The lift, the composite
-        // d_{s-1}d_s, and δ all preserve internal degree `t`, so cohomology at
-        // `(s, t)` depends only on generators at that same `t`. The report box
-        // (stem ≤ max.n, filt ≤ max.s) tops out at internal degree
-        // `max.n + max.s`, and every generator it references (transitively,
-        // through the lift) sits at `t ≤ max.n + max.s`. So resolving
-        // `{t ≤ max.n + max.s + margin, filt ≤ max.s}` is exactly what is needed —
-        // and it avoids the high-stem/low-filtration corner a stem-padded box
-        // (`compute_through_stem(max.n + max.s + 3, …)`, which reaches internal
-        // degree `max.n + 2·max.s`) wastes most of its time on. The `+3` is a
-        // small quasi-inverse/edge margin.
-        let compute = Bidegree::s_t(max.s(), max.n() + max.s() + 3);
+        // Resolve a **square** `{stem ≤ max.n + margin, filt ≤ max.s}` with
+        // `compute_through_stem`, which computes exactly that box with no
+        // out-of-bounds work (generators at `(s, t)` depend on `(s-1, t-1)`, not
+        // `(s-1, t)`, so a stem-bounded square is self-contained).
+        //
+        // The lift needs a little more than the report box: the δ corrections push
+        // one stem out per augmentation step, so a report generator at stem `n`
+        // references data at stem `n + (chain depth)`. That depth is the number of
+        // filtrations carrying a generator at the *same internal degree* — a small
+        // constant for the sphere (measured reach ≤ 1 up to stem 50), not `max.s`.
+        // `LIFT_STEM_MARGIN` is that reach plus headroom. It is a hard bound, not a
+        // silent one: if it is ever too small, `composite` panics on a missing
+        // lifted generator (never returns a wrong answer), and `MOT_MARGIN`
+        // overrides it without a rebuild.
+        const LIFT_STEM_MARGIN: i32 = 3;
+        let margin: i32 = std::env::var("MOT_MARGIN")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(LIFT_STEM_MARGIN);
+        let compute = Bidegree::n_s(max.n() + margin, max.s());
         let profile = std::env::var("MOT_PROFILE").is_ok();
         let t0 = std::time::Instant::now();
-        resolution.compute_through_bidegree(compute);
+        resolution.compute_through_stem(compute);
         if profile {
             use std::sync::atomic::Ordering;
             use algebra::motivic::milnor::{PRODUCT_HITS, PRODUCT_MISSES, PRODUCT_NANOS};
@@ -230,7 +237,7 @@ impl MotivicResolution {
         // n+1), and runs its own weight-loop locally. So `s` is a sequential
         // barrier, but at each `s` every generator is independent — fan them out.
         for s in 1..=self.max_s() {
-            let t_max = self.compute.t();
+            let t_max = self.compute.n() + s;
             let gens: Vec<Gen> = (0..=t_max)
                 .flat_map(|t| (0..self.num_gens(s, t)).map(move |idx| Gen { s, t, idx }))
                 .collect();
@@ -291,7 +298,16 @@ impl MotivicResolution {
                 t: og.generator_degree,
                 idx: og.generator_index,
             };
-            for &bidx2 in &self.lifted[&gj] {
+            let gj_lifted = self.lifted.get(&gj).unwrap_or_else(|| {
+                panic!(
+                    "composite references generator {gj:?} outside the resolved box \
+                     (stem {} > compute stem {}); increase the lift stem margin \
+                     (MOT_MARGIN)",
+                    gj.t - gj.s,
+                    self.compute.n(),
+                )
+            });
+            for &bidx2 in gj_lifted {
                 let og2 = f_sm2.index_to_op_gen(gj.t, bidx2);
                 let (mp_deg, mp_idx) = (og2.operation_degree, og2.operation_index);
                 let (gl_deg, gl_idx) = (og2.generator_degree, og2.generator_index);
@@ -403,7 +419,7 @@ impl MotivicResolution {
         for s in 1..=self.max_s() {
             let d = self.resolution.differential(s);
             let target = self.module(s - 1);
-            let t_max = self.compute.t();
+            let t_max = self.compute.n() + s;
             for t in 0..=t_max {
                 for idx in 0..self.num_gens(s, t) {
                     let out = d.output(t, idx);
