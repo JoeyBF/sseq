@@ -140,6 +140,17 @@ impl MotivicResolution {
         &self.resolution
     }
 
+    /// The box results are reported/trusted in.
+    pub fn max(&self) -> Bidegree {
+        self.max
+    }
+
+    /// The algebraic Novikov $E_2$ rank at `(s, t)` — set $\tau = 0$: the number
+    /// of generators (with $\delta \equiv 0 \bmod \tau$, `Ext = generators`).
+    pub fn algebraic_novikov_rank(&self, s: i32, t: i32) -> usize {
+        self.num_gens(s, t)
+    }
+
     /// The maximum homological degree computed.
     fn max_s(&self) -> i32 {
         self.max.s()
@@ -473,7 +484,7 @@ impl MotivicResolution {
     pub fn has_tau_torsion(&self, s: i32, t: i32) -> bool {
         let free = self.classical_ext_rank(s, t);
         // The generator weights at these degrees bound the useful cap range.
-        let weights: Vec<i32> = (s - 1..=s + 1)
+        let weights: Vec<i32> = ((s - 1).max(0)..=s + 1)
             .flat_map(|ss| (0..self.num_gens(ss, t)).map(move |idx| (ss, idx)))
             .filter_map(|(ss, idx)| self.weights.get(&Gen { s: ss, t, idx }).copied())
             .collect();

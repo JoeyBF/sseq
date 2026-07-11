@@ -113,3 +113,35 @@ fn ctau_dominates_classical() {
         "expected an algebraic Novikov class at (4, 4)"
     );
 }
+
+/// Phase 3/4 regression: the full motivic chart (all three pages) matches the
+/// committed golden fixture, end to end through the deformation pipeline.
+#[test]
+fn motivic_chart_matches_golden() {
+    use ext::motivic::MotivicResolution;
+
+    let golden = include_str!("../examples/benchmarks/motivic-S_2");
+    let max = Bidegree::n_s(8, 6);
+    let res = MotivicResolution::new(max);
+
+    let mut out = String::from("n,s,alg_nov,classical,tau_torsion\n");
+    for s in 0..=(max.s() - 1) {
+        for n in 0..=max.n() {
+            let t = n + s;
+            let alg_nov = res.algebraic_novikov_rank(s, t);
+            let classical = res.classical_ext_rank(s, t);
+            let torsion = res.has_tau_torsion(s, t);
+            if alg_nov > 0 || classical > 0 || torsion {
+                out.push_str(&format!(
+                    "{n},{s},{alg_nov},{classical},{}\n",
+                    if torsion { "*" } else { "" }
+                ));
+            }
+        }
+    }
+
+    assert_eq!(
+        out, golden,
+        "motivic chart drifted from the golden fixture (examples/benchmarks/motivic-S_2)"
+    );
+}

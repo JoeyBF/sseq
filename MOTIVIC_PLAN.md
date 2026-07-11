@@ -9,6 +9,19 @@ the existing `ext` engine without disturbing the classical path.
 > `73de90ee4671068b3a018640e993ad1a61f0d272` and is recoverable for porting the
 > validated *algebra* (`motivic_milnor.rs`), which is the only piece we reuse.
 
+> **Status (implemented).** Phases 0–4 are done. Phase 0: `algebra::motivic`
+> (`Tau`, `MotivicMilnorAlgebra`, `CTauAlgebra`). Phase 1:
+> `examples/resolve_motivic_ctau.rs` + `tests/motivic_ctau.rs`. Phases 2–3:
+> `ext::motivic` (weight-homogeneous lift, `H(δ)`). Phase 4:
+> `examples/resolve_motivic.rs` + the `examples/benchmarks/motivic-S_2` golden
+> fixture. **All three anchors pass**: invert `τ` reproduces classical `Ext_A`
+> rank-for-rank; `τ = 0` gives the algebraic Novikov ranks; keeping `τ` exhibits
+> the `h₁`-tower `τ`-torsion (`h₁⁴`, `h₁⁵`). The classical path is untouched and
+> the 69 resolution benchmarks stay bit-identical. One deviation from §2.5: the
+> lift and `H(δ)` live in `ext::motivic` (they consume the resolution's
+> quasi-inverses, populated by the `ext` engine) rather than the `algebra` crate;
+> the pure `Tau` linear algebra could still be factored down later.
+
 ---
 
 ## 0. Success criteria (the three anchors)
