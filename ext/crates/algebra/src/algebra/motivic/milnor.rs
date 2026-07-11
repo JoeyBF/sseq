@@ -645,28 +645,10 @@ fn col0_x_options(r1: &[u32]) -> Vec<Vec<u32>> {
     result
 }
 
-/// The Cartesian product of per-column options, yielding matrices as a `Vec` of
-/// columns.
-fn cartesian(options: &[Vec<Vec<u32>>]) -> Vec<Vec<Vec<u32>>> {
-    let mut result: Vec<Vec<Vec<u32>>> = vec![vec![]];
-    for opts in options {
-        let mut next = Vec::with_capacity(result.len() * opts.len());
-        for prefix in &result {
-            for opt in opts {
-                let mut m = prefix.clone();
-                m.push(opt.clone());
-                next.push(m);
-            }
-        }
-        result = next;
-    }
-    result
-}
+/// A matrix as a slice of column slices; `cols[j][i]` is the entry `x_{i,j}`.
+struct Mat<'a, 'b>(&'a [&'b [u32]]);
 
-/// A matrix as a slice of columns; `cols[j][i]` is the entry `x_{i,j}`.
-struct Mat<'a>(&'a [Vec<u32>]);
-
-impl Mat<'_> {
+impl Mat<'_, '_> {
     fn entry(&self, i: usize, j: usize) -> u32 {
         self.0.get(j).and_then(|c| c.get(i)).copied().unwrap_or(0)
     }
@@ -690,7 +672,7 @@ impl Mat<'_> {
 
     /// The number of rows (highest nonzero row index + 1) across all columns.
     fn n_rows(&self) -> usize {
-        self.0.iter().map(Vec::len).max().unwrap_or(0)
+        self.0.iter().map(|c| c.len()).max().unwrap_or(0)
     }
 
     /// The number of columns.
@@ -718,6 +700,174 @@ fn trim(mut v: Vec<u32>) -> Vec<u32> {
     v
 }
 
+/// Immutable context for the closed-form product recursion (Theorem 5.1, ρ = 0).
+struct Closed<'a> {
+    r1v: &'a [u32],
+    r2v: &'a [u32],
+    l: usize,
+    e1_mask: u32,
+    e2_mask: u32,
+    sigma2_e1: i64,
+    /// Per-column candidate columns for the `X` matrix.
+    x_cands: &'a [Vec<Vec<u32>>],
+}
+
+impl<'a> Closed<'a> {
+    /// Enumerate the `X` matrix column by column, pruning as soon as a row sum
+    /// would exceed `R₁` (columns beyond `R₁`'s support may only touch row 0,
+    /// whose sum is absorbed by ξ₀ = 1). `xcols` and `row_sums` are reused across
+    /// the recursion.
+    fn enum_x(
+        &self,
+        j: usize,
+        xcols: &mut Vec<&'a [u32]>,
+        row_sums: &mut [u32],
+        out: &mut DualElement,
+    ) {
+        if j == self.l {
+            self.on_x(xcols, row_sums, out);
+            return;
+        }
+        for cand in &self.x_cands[j] {
+            // Row budget: entries in rows i ≥ 1 must fit R₁[i] − row_sums[i]
+            // (row 0 is free). Rows beyond R₁'s support have budget 0.
+            if cand
+                .iter()
+                .enumerate()
+                .any(|(i, &v)| i >= 1 && row_sums[i] + v > self.r1v.get(i).copied().unwrap_or(0))
+            {
+                continue;
+            }
+            for (i, &v) in cand.iter().enumerate() {
+                row_sums[i] += v;
+            }
+            xcols.push(cand);
+            self.enum_x(j + 1, xcols, row_sums, out);
+            xcols.pop();
+            for (i, &v) in cand.iter().enumerate() {
+                row_sums[i] -= v;
+            }
+        }
+    }
+
+    /// A complete `X`: check `b(X)`, form `S′`, the `Y` column targets, and the
+    /// output P-part `T(X)`, then enumerate `Y`.
+    fn on_x(&self, xcols: &[&'a [u32]], row_sums: &[u32], out: &mut DualElement) {
+        let x = Mat(xcols);
+        if x.b() == 0 {
+            return;
+        }
+        // S′ = R₁ − S(X) on indices ≥ 1 (S′[0] = 0); τ-power = Σ(S′). Row sums are
+        // already pruned to ≤ R₁ during enumeration.
+        let sprime: Vec<u32> = (0..self.l)
+            .map(|j| if j == 0 { 0 } else { self.r1v[j] - row_sums[j] })
+            .collect();
+        let sigma2_sprime: i64 = sprime.iter().enumerate().map(|(j, &v)| (v as i64) << j).sum();
+        let sigma_sprime: u32 = sprime.iter().sum();
+
+        // RY targets: column j ≥ 1 of Y has weighted sum R₂[j] − R(X)[j].
+        let mut ry: Vec<i64> = vec![0; self.l];
+        for (j, ry_j) in ry.iter_mut().enumerate().skip(1) {
+            *ry_j = self.r2v[j] as i64 - x.col_weight(j) as i64;
+            if *ry_j < 0 {
+                return;
+            }
+        }
+        // Σ₂(S(Y)) = Σ₂(E₁) + Σ₂(S′) is forced and equals Σ_{j≥0} R(Y)[j], so column
+        // 0 of Y has a determined weighted sum.
+        let ry0 = (self.sigma2_e1 + sigma2_sprime) - ry[1..].iter().sum::<i64>();
+        if ry0 < 0 {
+            return;
+        }
+
+        // The output P-part T(X) (index 0 dropped: ξ₀ = 1).
+        let out_r = trim(
+            std::iter::once(0)
+                .chain((1..=x.n_rows() + x.n_cols()).map(|k| x.anti_diag(k)))
+                .collect(),
+        );
+
+        let mut y_cands: Vec<Vec<Vec<u32>>> = Vec::with_capacity(self.l);
+        y_cands.push(columns_eq(ry0 as u32));
+        for &t in ry.iter().skip(1) {
+            y_cands.push(columns_eq(t as u32));
+        }
+
+        let mut ycols: Vec<&[u32]> = Vec::with_capacity(self.l);
+        enum_y(
+            &y_cands,
+            0,
+            &mut ycols,
+            self.e1_mask,
+            self.e2_mask,
+            &sprime,
+            sigma_sprime,
+            &out_r,
+            out,
+        );
+    }
+}
+
+/// Enumerate the `Y` matrix column by column (each column an exact weighted sum),
+/// accumulating each matching contribution.
+#[allow(clippy::too_many_arguments)]
+fn enum_y<'b>(
+    y_cands: &'b [Vec<Vec<u32>>],
+    j: usize,
+    ycols: &mut Vec<&'b [u32]>,
+    e1_mask: u32,
+    e2_mask: u32,
+    sprime: &[u32],
+    sigma_sprime: u32,
+    out_r: &[u32],
+    out: &mut DualElement,
+) {
+    if j == y_cands.len() {
+        let y = Mat(ycols);
+        if y.b() == 0 {
+            return;
+        }
+        let sy: Vec<u32> = (0..y.n_rows()).map(|i| y.row_sum(i)).collect();
+        // The rewriting τ(S(Y)) contains the term with exterior part E₁ and ξ-part
+        // S′ iff the ρ = 0 degree equation Σ(E₁) + 2Σ(S′) = Σ(S(Y)) holds (with
+        // Σ(E₁) = popcount) and c(S(Y), S′) ≠ 0. (Σ₂(E₁) + Σ₂(S′) = Σ₂(S(Y)) is
+        // forced by the Y-column construction.) That term contributes at τ^{Σ(S′)}.
+        let sigma_sy: u32 = sy.iter().sum();
+        if e1_mask.count_ones() + 2 * sigma_sprime != sigma_sy || c_coeff(&sy, sprime) == 0 {
+            return;
+        }
+        // E_out = E₂ + T(Y) must be square-free (Seq₁).
+        let n_e = (y.n_rows() + y.n_cols()).max(32);
+        let mut out_e_mask = 0u32;
+        for i in 0..n_e {
+            let val = ((e2_mask >> i) & 1) + y.anti_diag(i);
+            if val > 1 {
+                return;
+            }
+            if val == 1 {
+                out_e_mask |= 1 << i;
+            }
+        }
+        add_term(out, (out_e_mask, out_r.to_vec()), Tau::power(sigma_sprime));
+        return;
+    }
+    for cand in &y_cands[j] {
+        ycols.push(cand);
+        enum_y(
+            y_cands,
+            j + 1,
+            ycols,
+            e1_mask,
+            e2_mask,
+            sprime,
+            sigma_sprime,
+            out_r,
+            out,
+        );
+        ycols.pop();
+    }
+}
+
 /// The product `a · b` in `A_C` via Kong–Lin Theorem 5.1 (ρ = 0). Same contract
 /// as [`multiply`] (the duality oracle it is validated against).
 pub fn multiply_closed(a: &(u32, Vec<u32>), b: &(u32, Vec<u32>)) -> DualElement {
@@ -726,105 +876,36 @@ pub fn multiply_closed(a: &(u32, Vec<u32>), b: &(u32, Vec<u32>)) -> DualElement 
     let l = r1.len().max(r2.len()).max(1);
     let r1v: Vec<u32> = (0..l).map(|j| r1.get(j).copied().unwrap_or(0)).collect();
     let r2v: Vec<u32> = (0..l).map(|j| r2.get(j).copied().unwrap_or(0)).collect();
-    let sigma2_e1 = e1_mask as i64; // Σ (bit i)·2ⁱ = e1_mask
 
-    let mut out = DualElement::new();
-
-    // Enumerate X: column 0 bounded by R₁ rows; columns j ≥ 1 by R₂[j] weighted.
-    let mut x_col_opts = vec![col0_x_options(&r1v)];
+    // Per-column candidate columns for X: column 0 bounded by R₁ rows, columns
+    // j ≥ 1 by R₂[j] weighted.
+    let mut x_cands: Vec<Vec<Vec<u32>>> = Vec::with_capacity(l);
+    x_cands.push(col0_x_options(&r1v));
     for &bound in r2v.iter().skip(1) {
-        x_col_opts.push(columns_le(bound));
+        x_cands.push(columns_le(bound));
     }
+    let max_rows = x_cands
+        .iter()
+        .flatten()
+        .map(Vec::len)
+        .max()
+        .unwrap_or(0)
+        .max(l)
+        + 2;
 
-    for xcols in cartesian(&x_col_opts) {
-        let x = Mat(&xcols);
-        if x.b() == 0 {
-            continue;
-        }
-        // S(X)_r ≤ R₁[r] for r ≥ 1.
-        let max_r = x.n_rows().max(l) + 1;
-        if (1..max_r).any(|r| x.row_sum(r) > r1v.get(r).copied().unwrap_or(0)) {
-            continue;
-        }
-        // S′ = R₁ − S(X) on indices ≥ 1 (S′[0] = 0); τ-power = Σ(S′).
-        let sprime: Vec<u32> = (0..l)
-            .map(|j| if j == 0 { 0 } else { r1v[j] - x.row_sum(j) })
-            .collect();
-        let sigma2_sprime: i64 = sprime.iter().enumerate().map(|(j, &v)| (v as i64) << j).sum();
-
-        // RY targets: column j ≥ 1 of Y has weighted sum R₂[j] − R(X)[j].
-        let mut ry: Vec<i64> = vec![0; l];
-        let mut feasible = true;
-        for j in 1..l {
-            ry[j] = r2v[j] as i64 - x.col_weight(j) as i64;
-            if ry[j] < 0 {
-                feasible = false;
-                break;
-            }
-        }
-        if !feasible {
-            continue;
-        }
-        // Σ₂(S(Y)) = Σ₂(E₁) + Σ₂(S′) is forced, and equals Σ_{j≥0} R(Y)[j], so
-        // column 0 of Y has a determined weighted sum.
-        let target_sigma2_sy = sigma2_e1 + sigma2_sprime;
-        let ry0 = target_sigma2_sy - ry[1..].iter().sum::<i64>();
-        if ry0 < 0 {
-            continue;
-        }
-
-        // The output P-part T(X) (index 0 dropped: ξ₀ = 1).
-        let out_r = trim(
-            std::iter::once(0)
-                .chain((1..=x.n_rows() + x.n_cols()).map(|j| x.anti_diag(j)))
-                .collect(),
-        );
-
-        // Enumerate Y: column 0 weighted = RY0, columns j ≥ 1 weighted = RY[j].
-        let mut y_col_opts = vec![columns_eq(ry0 as u32)];
-        for &t in ry.iter().skip(1) {
-            y_col_opts.push(columns_eq(t as u32));
-        }
-
-        let sigma_sprime: u32 = sprime.iter().sum();
-        for ycols in cartesian(&y_col_opts) {
-            let y = Mat(&ycols);
-            if y.b() == 0 {
-                continue;
-            }
-            let sy: Vec<u32> = (0..y.n_rows()).map(|i| y.row_sum(i)).collect();
-            // The rewriting τ(S(Y)) = Σ c(S(Y), R) τ^{Σ(R)} ρ^… τ(E) ξ(R) contains the
-            // term with exterior part E₁ and ξ-part S′ iff:
-            //  * Σ₂(E₁) + Σ₂(S′) = Σ₂(S(Y)) — forced by the Y-column construction;
-            //  * Σ(E₁) + 2Σ(S′) = Σ(S(Y)) — the ρ = 0 constraint (Σ(E₁) = popcount);
-            //  * c(S(Y), S′) ≠ 0.
-            // That term contributes at τ^{Σ(S′)}. (This replaces a per-candidate
-            // `rewrite_tau` DFS with a direct check.)
-            let sigma_sy: u32 = sy.iter().sum();
-            if e1_mask.count_ones() + 2 * sigma_sprime != sigma_sy || c_coeff(&sy, &sprime) == 0 {
-                continue;
-            }
-            // E_out = E₂ + T(Y) must be square-free (Seq₁).
-            let n_e = (y.n_rows() + y.n_cols()).max(32);
-            let mut out_e_mask = 0u32;
-            let mut square_free = true;
-            for i in 0..n_e {
-                let val = ((e2_mask >> i) & 1) + y.anti_diag(i);
-                if val > 1 {
-                    square_free = false;
-                    break;
-                }
-                if val == 1 {
-                    out_e_mask |= 1 << i;
-                }
-            }
-            if !square_free {
-                continue;
-            }
-            add_term(&mut out, (out_e_mask, out_r.clone()), Tau::power(sigma_sprime));
-        }
-    }
-
+    let ctx = Closed {
+        r1v: &r1v,
+        r2v: &r2v,
+        l,
+        e1_mask,
+        e2_mask,
+        sigma2_e1: e1_mask as i64, // Σ (bit i)·2ⁱ = e1_mask
+        x_cands: &x_cands,
+    };
+    let mut out = DualElement::new();
+    let mut xcols: Vec<&[u32]> = Vec::with_capacity(l);
+    let mut row_sums = vec![0u32; max_rows];
+    ctx.enum_x(0, &mut xcols, &mut row_sums, &mut out);
     out
 }
 
