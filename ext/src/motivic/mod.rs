@@ -65,9 +65,10 @@ use algebra::{
 use bivec::BiVec;
 use fp::{matrix::Matrix, prime::TWO, vector::FpVector};
 use maybe_rayon::prelude::*;
+use once::MultiIndexed;
 use sseq::{
-    Sseq, SseqProfile,
-    coordinates::{Bidegree, degree::MultiDegree, element::MultiDegreeElement},
+    Product, Sseq, SseqProfile,
+    coordinates::{Bidegree, BidegreeGenerator, degree::MultiDegree, element::MultiDegreeElement},
 };
 
 use crate::{
@@ -691,6 +692,73 @@ impl MotivicResolution {
         self.ext.get_or_init(|| self.build_ext())
     }
 
+    /// Group generators by their multidegree `(n, s, w)`. Returns the per-multidegree
+    /// generator-index lists (a generator's position in its list is its Sseq
+    /// coordinate) and the reverse map `Gen ↦ (multidegree, position)`.
+    fn sseq_grouping(
+        &self,
+    ) -> (
+        HashMap<[i32; 3], Vec<usize>>,
+        HashMap<Gen, (MultiDegree<3>, usize)>,
+    ) {
+        let mut groups: HashMap<[i32; 3], Vec<usize>> = HashMap::new();
+        let mut pos: HashMap<Gen, (MultiDegree<3>, usize)> = HashMap::new();
+        for s in 0..=self.max_s() {
+            let t_max = self.compute.n() + s;
+            for t in 0..=t_max {
+                for idx in 0..self.num_gens(s, t) {
+                    let g = Gen { s, t, idx };
+                    if let Some(&w) = self.weights.get(&g) {
+                        let key = [t - s, s, w];
+                        let list = groups.entry(key).or_default();
+                        pos.insert(g, (MultiDegree::from(key), list.len()));
+                        list.push(idx);
+                    }
+                }
+            }
+        }
+        (groups, pos)
+    }
+
+    /// A [`Product`] on the deformation SS for each requested Cτ generator `a`
+    /// (given as `(bidegree, index)`): multiplication by `a`, taken from
+    /// [`ExtAlgebra::multiply_into`] on the mod-τ resolution and split into weight
+    /// blocks for the trigrading. Feeding one to [`Sseq::multiply`] applies it on
+    /// any page — the Cτ ring on $E_1$, the motivic Adams $E_2$ ring on $E_\infty$.
+    pub fn deformation_products(&self, gens: &[(Bidegree, usize)]) -> Vec<Product<3>> {
+        let ext = self.ext();
+        let (groups, _) = self.sseq_grouping();
+        let empty = Vec::new();
+        gens.iter()
+            .map(|&(a_deg, a_idx)| {
+                let a_gen = Gen { s: a_deg.s(), t: a_deg.t(), idx: a_idx };
+                let a_w = self.weights[&a_gen];
+                let a_elem = ext.generator(BidegreeGenerator::new(a_deg, a_idx));
+                let matrices = MultiIndexed::new();
+                for (&[n, s, w], src_group) in &groups {
+                    let Some(full) = ext.multiply_into(&a_elem, Bidegree::n_s(n, s)) else {
+                        continue;
+                    };
+                    let tgt = groups
+                        .get(&[n + a_deg.n(), s + a_deg.s(), w + a_w])
+                        .unwrap_or(&empty);
+                    // Row `i` = a · (source generator i), restricted to the
+                    // weight-`(w + a_w)` target generators, in group coordinates.
+                    let rows: Vec<Vec<u32>> = src_group
+                        .iter()
+                        .map(|&raw_i| tgt.iter().map(|&raw_j| full.row(raw_i).entry(raw_j)).collect())
+                        .collect();
+                    matrices.insert(MultiDegree::from([n, s, w]), Matrix::from_vec(TWO, &rows));
+                }
+                Product {
+                    b: MultiDegree::from([a_deg.n(), a_deg.s(), a_w]),
+                    left: true,
+                    matrices,
+                }
+            })
+            .collect()
+    }
+
     /// The deformation spectral sequence as an [`Sseq`], trigraded by $(n, s, w)$
     /// ([`Deformation`]). $E_1 = \Ext_{A_C/\tau}$ — the mod-τ generators, grouped
     /// by weight — with $d_1$ the **weight-1 part of δ** (the induced differential
@@ -709,24 +777,9 @@ impl MotivicResolution {
     pub fn deformation_sseq(&self) -> Sseq<3, Deformation> {
         let mut sseq = Sseq::<3, Deformation>::new(TWO);
 
-        // Group generators by (n, s, w); a generator's position within its group is
-        // its coordinate in that multidegree's space.
-        let mut groups: HashMap<[i32; 3], Vec<usize>> = HashMap::new();
-        let mut pos: HashMap<Gen, (MultiDegree<3>, usize)> = HashMap::new();
-        for s in 0..=self.max_s() {
-            let t_max = self.compute.n() + s;
-            for t in 0..=t_max {
-                for idx in 0..self.num_gens(s, t) {
-                    let g = Gen { s, t, idx };
-                    if let Some(&w) = self.weights.get(&g) {
-                        let key = [t - s, s, w];
-                        let list = groups.entry(key).or_default();
-                        pos.insert(g, (MultiDegree::from(key), list.len()));
-                        list.push(idx);
-                    }
-                }
-            }
-        }
+        // Group generators by (n, s, w) — a generator's position within its group
+        // is its coordinate in that multidegree.
+        let (groups, pos) = self.sseq_grouping();
         for (&key, list) in &groups {
             sseq.set_dimension(MultiDegree::from(key), list.len());
         }
@@ -1005,6 +1058,27 @@ mod tests {
         // Every d₁ we added is consistent.
         for deg in sseq.iter_degrees() {
             assert!(!sseq.inconsistent(deg), "inconsistent differential at {deg}");
+        }
+    }
+
+    #[test]
+    fn deformation_products_h0_tower() {
+        // Products wired into the Sseq: multiplication by h₀ (from ExtAlgebra on the
+        // mod-τ resolution) climbs the h₀-tower via Sseq::multiply. h₀ ∈ (0,1,0),
+        // and h₀ⁿ ∈ (0,n,0) stays nonzero (Cτ has an infinite h₀-tower), on E₁ and
+        // hence on every page.
+        let res = MotivicResolution::new(Bidegree::n_s(8, 5));
+        let sseq = res.deformation_sseq();
+        let prods = res.deformation_products(&[(Bidegree::n_s(0, 1), 0)]);
+        let h0 = &prods[0];
+
+        let mut v = FpVector::new(TWO, 1);
+        v.set_entry(0, 1);
+        let mut class = MultiDegreeElement::new(MultiDegree::from([0, 1, 0]), v);
+        for n in 2..=4 {
+            class = sseq.multiply(&class, h0).expect("h₀ product in range");
+            assert_eq!(class.degree(), MultiDegree::from([0, n, 0]), "h₀^{n} degree");
+            assert!(!class.vec().is_zero(), "h₀^{n} should be nonzero");
         }
     }
 
