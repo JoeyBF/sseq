@@ -40,7 +40,9 @@
 //! are weight-homogeneous with $\tau$ (weight $-1$) absorbing the difference.
 
 use std::{
+    cell::RefCell,
     collections::BTreeMap,
+    rc::Rc,
     sync::{
         RwLock,
         atomic::{AtomicU64, Ordering},
@@ -582,20 +584,6 @@ pub fn multiply(a: &(u32, Vec<u32>), b: &(u32, Vec<u32>)) -> DualElement {
 // Σ₂ constraint, and the ρ = 0 filter — is exactly [`rewrite_tau`], which we
 // reuse rather than re-derive.
 
-/// The mod-2 multinomial coefficient of `entries` (the coefficient `b` of an
-/// anti-diagonal): `1` iff the entries are bitwise disjoint (no carries in the
-/// binary sum), else `0`.
-fn multinomial_mod2(entries: &[u32]) -> u32 {
-    let mut acc = 0u32;
-    for &e in entries {
-        if acc & e != 0 {
-            return 0;
-        }
-        acc |= e;
-    }
-    1
-}
-
 /// All columns `(v₀, v₁, …)` of non-negative integers with `Σᵢ 2ⁱ vᵢ == target`.
 fn columns_eq(target: u32) -> Vec<Vec<u32>> {
     if target == 0 {
@@ -622,6 +610,23 @@ fn columns_le(bound: u32) -> Vec<Vec<u32>> {
     (0..=bound).flat_map(columns_eq).collect()
 }
 
+thread_local! {
+    /// Per-thread memo of [`columns_eq`] / [`columns_le`], keyed by target/bound.
+    /// The candidate lists are pure functions of one integer and are requested
+    /// over and over across products; caching them avoids re-enumerating and
+    /// re-allocating. (`Rc` is confined to a single product's call stack.)
+    static COLS_EQ: RefCell<FxHashMap<u32, Rc<Vec<Vec<u32>>>>> = RefCell::new(FxHashMap::default());
+    static COLS_LE: RefCell<FxHashMap<u32, Rc<Vec<Vec<u32>>>>> = RefCell::new(FxHashMap::default());
+}
+
+fn columns_eq_cached(target: u32) -> Rc<Vec<Vec<u32>>> {
+    COLS_EQ.with(|c| Rc::clone(c.borrow_mut().entry(target).or_insert_with(|| Rc::new(columns_eq(target)))))
+}
+
+fn columns_le_cached(bound: u32) -> Rc<Vec<Vec<u32>>> {
+    COLS_LE.with(|c| Rc::clone(c.borrow_mut().entry(bound).or_insert_with(|| Rc::new(columns_le(bound)))))
+}
+
 /// The column-0 options for the `X` matrix: `x_{0,0} = 0`, and `x_{i,0} ≤ R₁[i]`
 /// for `i ≥ 1` (bounded because it feeds the row sum `S(X)_i ≤ R₁[i]`).
 fn col0_x_options(r1: &[u32]) -> Vec<Vec<u32>> {
@@ -645,53 +650,10 @@ fn col0_x_options(r1: &[u32]) -> Vec<Vec<u32>> {
     result
 }
 
-/// A matrix as a slice of column slices; `cols[j][i]` is the entry `x_{i,j}`.
-struct Mat<'a, 'b>(&'a [&'b [u32]]);
-
-impl Mat<'_, '_> {
-    fn entry(&self, i: usize, j: usize) -> u32 {
-        self.0.get(j).and_then(|c| c.get(i)).copied().unwrap_or(0)
-    }
-
-    /// Row-`r` sum `S(M)_r`.
-    fn row_sum(&self, r: usize) -> u32 {
-        self.0.iter().map(|c| c.get(r).copied().unwrap_or(0)).sum()
-    }
-
-    /// Column-`j` weighted sum `R(M)_j = Σᵢ 2ⁱ x_{i,j}`.
-    fn col_weight(&self, j: usize) -> u32 {
-        self.0
-            .get(j)
-            .map_or(0, |c| c.iter().enumerate().map(|(i, &v)| v << i).sum())
-    }
-
-    /// Anti-diagonal-`r` sum `T(M)_r = Σ_{i+j=r} x_{i,j}`.
-    fn anti_diag(&self, r: usize) -> u32 {
-        (0..=r).map(|i| self.entry(i, r - i)).sum()
-    }
-
-    /// The number of rows (highest nonzero row index + 1) across all columns.
-    fn n_rows(&self) -> usize {
-        self.0.iter().map(|c| c.len()).max().unwrap_or(0)
-    }
-
-    /// The number of columns.
-    fn n_cols(&self) -> usize {
-        self.0.len()
-    }
-
-    /// The mod-2 coefficient `b(M) = Πᵣ multinomial(anti-diagonal r)`.
-    fn b(&self) -> u32 {
-        let max_r = self.n_rows() + self.n_cols();
-        for r in 0..=max_r {
-            let entries: Vec<u32> = (0..=r).map(|i| self.entry(i, r - i)).filter(|&v| v > 0).collect();
-            if multinomial_mod2(&entries) == 0 {
-                return 0;
-            }
-        }
-        1
-    }
-}
+/// Buffer size for row / column / anti-diagonal indices. All are bounded by
+/// ~2·log₂(degree) + (number of ξ generators), far below this for any feasible
+/// stem (a ξ or τ at index `i` already has degree ≥ 2^i).
+const NB: usize = 64;
 
 fn trim(mut v: Vec<u32>) -> Vec<u32> {
     while let Some(&0) = v.last() {
@@ -709,58 +671,70 @@ struct Closed<'a> {
     e2_mask: u32,
     sigma2_e1: i64,
     /// Per-column candidate columns for the `X` matrix.
-    x_cands: &'a [Vec<Vec<u32>>],
+    x_cands: &'a [Rc<Vec<Vec<u32>>>],
+}
+
+/// Incrementally maintained matrix state: row sums `S`, a running XOR per
+/// anti-diagonal (`or`, which equals the OR because we only keep disjoint entries)
+/// for the `b`-coefficient pruning, and the anti-diagonal sums `T`.
+struct Acc {
+    rows: [u32; NB],
+    or: [u32; NB],
+    sum: [u32; NB],
+}
+
+impl Acc {
+    fn zero() -> Self {
+        Self {
+            rows: [0; NB],
+            or: [0; NB],
+            sum: [0; NB],
+        }
+    }
 }
 
 impl<'a> Closed<'a> {
-    /// Enumerate the `X` matrix column by column, pruning as soon as a row sum
-    /// would exceed `R₁` (columns beyond `R₁`'s support may only touch row 0,
-    /// whose sum is absorbed by ξ₀ = 1). `xcols` and `row_sums` are reused across
-    /// the recursion.
-    fn enum_x(
-        &self,
-        j: usize,
-        xcols: &mut Vec<&'a [u32]>,
-        row_sums: &mut [u32],
-        out: &mut DualElement,
-    ) {
+    /// Enumerate the `X` matrix column by column. A column is rejected — pruning
+    /// the whole subtree — if a row sum would exceed `R₁` (rows ≥ 1; row 0 is
+    /// absorbed by ξ₀ = 1) or if any entry collides on its anti-diagonal (which
+    /// would make `b(X) = 0`). So only `b = 1` matrices are visited, and `b`/`T`/`S`
+    /// never need recomputing. The accumulator `acc` and `xcols` are reused.
+    fn enum_x(&self, j: usize, xcols: &mut Vec<&'a [u32]>, acc: &mut Acc, out: &mut DualElement) {
         if j == self.l {
-            self.on_x(xcols, row_sums, out);
+            self.on_x(xcols, acc, out);
             return;
         }
-        for cand in &self.x_cands[j] {
-            // Row budget: entries in rows i ≥ 1 must fit R₁[i] − row_sums[i]
-            // (row 0 is free). Rows beyond R₁'s support have budget 0.
-            if cand
-                .iter()
-                .enumerate()
-                .any(|(i, &v)| i >= 1 && row_sums[i] + v > self.r1v.get(i).copied().unwrap_or(0))
-            {
+        for cand in self.x_cands[j].iter() {
+            let fits = cand.iter().enumerate().all(|(i, &v)| {
+                v == 0
+                    || (!(i >= 1 && acc.rows[i] + v > self.r1v.get(i).copied().unwrap_or(0))
+                        && acc.or[i + j] & v == 0)
+            });
+            if !fits {
                 continue;
             }
             for (i, &v) in cand.iter().enumerate() {
-                row_sums[i] += v;
+                acc.rows[i] += v;
+                acc.or[i + j] ^= v;
+                acc.sum[i + j] += v;
             }
             xcols.push(cand);
-            self.enum_x(j + 1, xcols, row_sums, out);
+            self.enum_x(j + 1, xcols, acc, out);
             xcols.pop();
             for (i, &v) in cand.iter().enumerate() {
-                row_sums[i] -= v;
+                acc.rows[i] -= v;
+                acc.or[i + j] ^= v;
+                acc.sum[i + j] -= v;
             }
         }
     }
 
-    /// A complete `X`: check `b(X)`, form `S′`, the `Y` column targets, and the
-    /// output P-part `T(X)`, then enumerate `Y`.
-    fn on_x(&self, xcols: &[&'a [u32]], row_sums: &[u32], out: &mut DualElement) {
-        let x = Mat(xcols);
-        if x.b() == 0 {
-            return;
-        }
-        // S′ = R₁ − S(X) on indices ≥ 1 (S′[0] = 0); τ-power = Σ(S′). Row sums are
-        // already pruned to ≤ R₁ during enumeration.
+    /// A complete `X` (already `b = 1`): form `S′`, the `Y` column targets, and the
+    /// output P-part `T(X) = acc.sum`, then enumerate `Y`.
+    fn on_x(&self, xcols: &[&'a [u32]], acc: &Acc, out: &mut DualElement) {
+        // S′ = R₁ − S(X) on indices ≥ 1 (S′[0] = 0); τ-power = Σ(S′).
         let sprime: Vec<u32> = (0..self.l)
-            .map(|j| if j == 0 { 0 } else { self.r1v[j] - row_sums[j] })
+            .map(|j| if j == 0 { 0 } else { self.r1v[j] - acc.rows[j] })
             .collect();
         let sigma2_sprime: i64 = sprime.iter().enumerate().map(|(j, &v)| (v as i64) << j).sum();
         let sigma_sprime: u32 = sprime.iter().sum();
@@ -768,7 +742,8 @@ impl<'a> Closed<'a> {
         // RY targets: column j ≥ 1 of Y has weighted sum R₂[j] − R(X)[j].
         let mut ry: Vec<i64> = vec![0; self.l];
         for (j, ry_j) in ry.iter_mut().enumerate().skip(1) {
-            *ry_j = self.r2v[j] as i64 - x.col_weight(j) as i64;
+            let rxj: u32 = xcols[j].iter().enumerate().map(|(i, &v)| v << i).sum();
+            *ry_j = self.r2v[j] as i64 - rxj as i64;
             if *ry_j < 0 {
                 return;
             }
@@ -781,23 +756,21 @@ impl<'a> Closed<'a> {
         }
 
         // The output P-part T(X) (index 0 dropped: ξ₀ = 1).
-        let out_r = trim(
-            std::iter::once(0)
-                .chain((1..=x.n_rows() + x.n_cols()).map(|k| x.anti_diag(k)))
-                .collect(),
-        );
+        let out_r = trim(std::iter::once(0).chain((1..NB).map(|d| acc.sum[d])).collect());
 
-        let mut y_cands: Vec<Vec<Vec<u32>>> = Vec::with_capacity(self.l);
-        y_cands.push(columns_eq(ry0 as u32));
+        let mut y_cands: Vec<Rc<Vec<Vec<u32>>>> = Vec::with_capacity(self.l);
+        y_cands.push(columns_eq_cached(ry0 as u32));
         for &t in ry.iter().skip(1) {
-            y_cands.push(columns_eq(t as u32));
+            y_cands.push(columns_eq_cached(t as u32));
         }
 
         let mut ycols: Vec<&[u32]> = Vec::with_capacity(self.l);
+        let mut yacc = Acc::zero();
         enum_y(
             &y_cands,
             0,
             &mut ycols,
+            &mut yacc,
             self.e1_mask,
             self.e2_mask,
             &sprime,
@@ -809,12 +782,14 @@ impl<'a> Closed<'a> {
 }
 
 /// Enumerate the `Y` matrix column by column (each column an exact weighted sum),
-/// accumulating each matching contribution.
+/// pruning on anti-diagonal collisions (`b(Y) = 0`) and accumulating each matching
+/// contribution.
 #[allow(clippy::too_many_arguments)]
 fn enum_y<'b>(
-    y_cands: &'b [Vec<Vec<u32>>],
+    y_cands: &'b [Rc<Vec<Vec<u32>>>],
     j: usize,
     ycols: &mut Vec<&'b [u32]>,
+    acc: &mut Acc,
     e1_mask: u32,
     e2_mask: u32,
     sprime: &[u32],
@@ -823,24 +798,22 @@ fn enum_y<'b>(
     out: &mut DualElement,
 ) {
     if j == y_cands.len() {
-        let y = Mat(ycols);
-        if y.b() == 0 {
-            return;
-        }
-        let sy: Vec<u32> = (0..y.n_rows()).map(|i| y.row_sum(i)).collect();
         // The rewriting τ(S(Y)) contains the term with exterior part E₁ and ξ-part
         // S′ iff the ρ = 0 degree equation Σ(E₁) + 2Σ(S′) = Σ(S(Y)) holds (with
         // Σ(E₁) = popcount) and c(S(Y), S′) ≠ 0. (Σ₂(E₁) + Σ₂(S′) = Σ₂(S(Y)) is
         // forced by the Y-column construction.) That term contributes at τ^{Σ(S′)}.
-        let sigma_sy: u32 = sy.iter().sum();
-        if e1_mask.count_ones() + 2 * sigma_sprime != sigma_sy || c_coeff(&sy, sprime) == 0 {
+        let sigma_sy: u32 = acc.rows.iter().sum();
+        if e1_mask.count_ones() + 2 * sigma_sprime != sigma_sy {
             return;
         }
-        // E_out = E₂ + T(Y) must be square-free (Seq₁).
-        let n_e = (y.n_rows() + y.n_cols()).max(32);
+        let sy_len = (0..NB).rev().find(|&i| acc.rows[i] > 0).map_or(0, |i| i + 1);
+        if c_coeff(&acc.rows[..sy_len], sprime) == 0 {
+            return;
+        }
+        // E_out = E₂ + T(Y) must be square-free (Seq₁). Q indices fit in a u32.
         let mut out_e_mask = 0u32;
-        for i in 0..n_e {
-            let val = ((e2_mask >> i) & 1) + y.anti_diag(i);
+        for i in 0..32 {
+            let val = ((e2_mask >> i) & 1) + acc.sum[i];
             if val > 1 {
                 return;
             }
@@ -851,20 +824,25 @@ fn enum_y<'b>(
         add_term(out, (out_e_mask, out_r.to_vec()), Tau::power(sigma_sprime));
         return;
     }
-    for cand in &y_cands[j] {
+    for cand in y_cands[j].iter() {
+        if !cand.iter().enumerate().all(|(i, &v)| acc.or[i + j] & v == 0) {
+            continue;
+        }
+        for (i, &v) in cand.iter().enumerate() {
+            acc.rows[i] += v;
+            acc.or[i + j] ^= v;
+            acc.sum[i + j] += v;
+        }
         ycols.push(cand);
         enum_y(
-            y_cands,
-            j + 1,
-            ycols,
-            e1_mask,
-            e2_mask,
-            sprime,
-            sigma_sprime,
-            out_r,
-            out,
+            y_cands, j + 1, ycols, acc, e1_mask, e2_mask, sprime, sigma_sprime, out_r, out,
         );
         ycols.pop();
+        for (i, &v) in cand.iter().enumerate() {
+            acc.rows[i] -= v;
+            acc.or[i + j] ^= v;
+            acc.sum[i + j] -= v;
+        }
     }
 }
 
@@ -879,19 +857,11 @@ pub fn multiply_closed(a: &(u32, Vec<u32>), b: &(u32, Vec<u32>)) -> DualElement 
 
     // Per-column candidate columns for X: column 0 bounded by R₁ rows, columns
     // j ≥ 1 by R₂[j] weighted.
-    let mut x_cands: Vec<Vec<Vec<u32>>> = Vec::with_capacity(l);
-    x_cands.push(col0_x_options(&r1v));
+    let mut x_cands: Vec<Rc<Vec<Vec<u32>>>> = Vec::with_capacity(l);
+    x_cands.push(Rc::new(col0_x_options(&r1v)));
     for &bound in r2v.iter().skip(1) {
-        x_cands.push(columns_le(bound));
+        x_cands.push(columns_le_cached(bound));
     }
-    let max_rows = x_cands
-        .iter()
-        .flatten()
-        .map(Vec::len)
-        .max()
-        .unwrap_or(0)
-        .max(l)
-        + 2;
 
     let ctx = Closed {
         r1v: &r1v,
@@ -904,8 +874,8 @@ pub fn multiply_closed(a: &(u32, Vec<u32>), b: &(u32, Vec<u32>)) -> DualElement 
     };
     let mut out = DualElement::new();
     let mut xcols: Vec<&[u32]> = Vec::with_capacity(l);
-    let mut row_sums = vec![0u32; max_rows];
-    ctx.enum_x(0, &mut xcols, &mut row_sums, &mut out);
+    let mut acc = Acc::zero();
+    ctx.enum_x(0, &mut xcols, &mut acc, &mut out);
     out
 }
 
