@@ -54,7 +54,7 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
-    sync::Arc,
+    sync::{Arc, OnceLock},
 };
 
 use algebra::{
@@ -69,6 +69,7 @@ use sseq::coordinates::Bidegree;
 
 use crate::{
     chain_complex::{ChainComplex, FiniteChainComplex},
+    ext_algebra::{ExtAlgebra, ExtDifferential},
     resolution::Resolution,
 };
 
@@ -85,11 +86,59 @@ pub struct Gen {
     pub idx: usize,
 }
 
+/// The dualized differential $\delta = \Hom(d, k)$ of the motivic resolution,
+/// stored on the [`ExtAlgebra`] side (see the resolution/functor split in
+/// [`MotivicResolution`]). It maps each generator to the target generators of the
+/// augmentation (unit-operation) part of its lifted $A_C$ differential, together
+/// with the forced $\tau$-power. As an [`ExtDifferential`] it shifts by
+/// $(n, s) \mapsto (n+1, s-1)$ — δ lowers Novikov filtration at fixed internal
+/// degree, which raises the stem — and its cohomology is the motivic Adams $E_2$.
+struct MotivicCoboundary {
+    resolution: Arc<CTauResolution>,
+    /// `g ↦ [(target generator, τ-power)]` for the augmentation part of `d(g)`.
+    /// Generators with no δ-terms are absent.
+    deltas: HashMap<Gen, Vec<(Gen, u32)>>,
+}
+
+impl ExtDifferential for MotivicCoboundary {
+    fn shift(&self) -> Bidegree {
+        Bidegree::n_s(1, -1)
+    }
+
+    fn matrix(&self, b: Bidegree) -> Option<Matrix> {
+        let (t, s) = (b.t(), b.s());
+        if s < 0 {
+            return None;
+        }
+        let rows = self.resolution.module(s).number_of_gens_in_degree(t);
+        if s == 0 {
+            // δ out of filtration 0 lands in filtration −1: no targets.
+            return Some(Matrix::new(TWO, rows, 0));
+        }
+        let cols = self.resolution.module(s - 1).number_of_gens_in_degree(t);
+        let mut m = Matrix::new(TWO, rows, cols);
+        for idx in 0..rows {
+            if let Some(targets) = self.deltas.get(&Gen { s, t, idx }) {
+                for &(tgt, _power) in targets {
+                    m.row_mut(idx).set_entry(tgt.idx, 1);
+                }
+            }
+        }
+        Some(m)
+    }
+}
+
 /// The C-motivic resolution: the mod-$\tau$ model plus the weight assignment and
 /// (Phase 2) the lifted $A_C$ differentials.
 pub struct MotivicResolution {
     algebra: Arc<CTauAlgebra>,
-    resolution: CTauResolution,
+    resolution: Arc<CTauResolution>,
+    /// The Ext DGA: the mod-τ resolution wrapped so it stores the *dualized*
+    /// differential δ = Hom(d, k) and takes its cohomology (the motivic Adams
+    /// E₂). Built lazily on first cohomology query. This is the "Ext side" of the
+    /// resolution/functor split — the raw differential stays in the resolution
+    /// (`lifted`); δ lives here.
+    ext: OnceLock<ExtAlgebra<CTauResolution>>,
     /// Motivic weight of each generator.
     weights: HashMap<Gen, i32>,
     /// The lifted $A_C$ differential of each generator: the set of $F_{s-1}$ basis
@@ -117,7 +166,7 @@ impl MotivicResolution {
         ));
         let cc: Arc<FiniteChainComplex<FDModule<CTauAlgebra>>> =
             Arc::new(FiniteChainComplex::ccdz(trivial));
-        let resolution = Resolution::new(cc);
+        let resolution = Arc::new(Resolution::new(cc));
         // Resolve the report box **plus exactly one stem** with
         // `compute_through_stem`. Ext at `(s, t)` is `H(δ)`, and δ maps `(s, t) →
         // (s-1, t)` — same internal degree, one lower Novikov filtration, hence
@@ -156,6 +205,7 @@ impl MotivicResolution {
         let mut this = Self {
             algebra,
             resolution,
+            ext: OnceLock::new(),
             weights: HashMap::new(),
             lifted: HashMap::new(),
             max,
@@ -582,10 +632,44 @@ impl MotivicResolution {
         n - r_s - r_prev
     }
 
+    /// Build the Ext DGA: apply $\Hom(-, k)$ to the raw lifted differential
+    /// (`lifted`), producing the dualized coboundary δ, and hand it to an
+    /// [`ExtAlgebra`] over the mod-τ resolution. This is where the $\Hom$ functor
+    /// is applied and its result stored on the Ext side; the resolution keeps only
+    /// the raw differential.
+    fn build_ext(&self) -> ExtAlgebra<CTauResolution> {
+        let mut deltas: HashMap<Gen, Vec<(Gen, u32)>> = HashMap::new();
+        for s in 1..=self.max_s() {
+            let t_max = self.compute.n() + s;
+            for t in 0..=t_max {
+                for idx in 0..self.num_gens(s, t) {
+                    let g = Gen { s, t, idx };
+                    if self.lifted.contains_key(&g) && self.weights.contains_key(&g) {
+                        let d = self.delta(g);
+                        if !d.is_empty() {
+                            deltas.insert(g, d);
+                        }
+                    }
+                }
+            }
+        }
+        let coboundary = Arc::new(MotivicCoboundary {
+            resolution: Arc::clone(&self.resolution),
+            deltas,
+        });
+        ExtAlgebra::without_unit(Arc::clone(&self.resolution)).with_differential(coboundary)
+    }
+
     /// The classical Adams $E_2$ rank at `(s, t)` — invert $\tau$: the free rank of
     /// `H(δ)`, computed with all generators.
+    ///
+    /// This is [`ExtAlgebra::cohomology_dimension`] of the Ext DGA — the motivic
+    /// Adams $E_2$ as the cohomology of the dualized differential δ.
     pub fn classical_ext_rank(&self, s: i32, t: i32) -> usize {
-        self.ext_dim(s, t, i32::MAX)
+        self.ext
+            .get_or_init(|| self.build_ext())
+            .cohomology_dimension(Bidegree::n_s(t - s, s))
+            .unwrap_or(0)
     }
 
     /// Whether `(s, t)` carries a $\tau$-torsion class in the motivic $E_2$: some
