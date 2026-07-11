@@ -650,14 +650,26 @@ impl MotivicResolution {
         ExtAlgebra::without_unit(Arc::clone(&self.resolution)).with_differential(coboundary)
     }
 
+    /// The Ext DGA (built lazily): the mod-τ resolution wrapped so it stores the
+    /// dualized differential δ.
+    ///
+    /// Its cochain level is `Ext_{A_C/τ}` — the algebraic Novikov $E_2$, equal to
+    /// the Adams $E_2$ of $C\tau$ — so its [`multiply`](ExtAlgebra::multiply) and
+    /// Massey products are the **$C\tau$ (E₁-page) products**. Its
+    /// [`cohomology_dimension`](ExtAlgebra::cohomology_dimension) is the motivic
+    /// Adams $E_2$ = `H(δ)`. (Products *on* `H(δ)` — the motivic ring — are the
+    /// cochain products descended through the cohomology, which is separate.)
+    pub fn ext(&self) -> &ExtAlgebra<CTauResolution> {
+        self.ext.get_or_init(|| self.build_ext())
+    }
+
     /// The classical Adams $E_2$ rank at `(s, t)` — invert $\tau$: the free rank of
     /// `H(δ)`, computed with all generators.
     ///
     /// This is [`ExtAlgebra::cohomology_dimension`] of the Ext DGA — the motivic
     /// Adams $E_2$ as the cohomology of the dualized differential δ.
     pub fn classical_ext_rank(&self, s: i32, t: i32) -> usize {
-        self.ext
-            .get_or_init(|| self.build_ext())
+        self.ext()
             .cohomology_dimension(Bidegree::n_s(t - s, s))
             .unwrap_or(0)
     }
@@ -668,7 +680,7 @@ impl MotivicResolution {
     /// $\tau$-torsion. Scans weight caps within the generators' weight range.
     pub fn has_tau_torsion(&self, s: i32, t: i32) -> bool {
         let b = Bidegree::n_s(t - s, s);
-        let ext = self.ext.get_or_init(|| self.build_ext());
+        let ext = self.ext();
         let free = ext.cohomology_dimension(b).unwrap_or(0);
         // The generator weights at these degrees bound the useful cap range.
         let weights: Vec<i32> = ((s - 1).max(0)..=s + 1)
@@ -738,7 +750,32 @@ impl MotivicResolution {
 
 #[cfg(test)]
 mod tests {
+    use sseq::coordinates::BidegreeGenerator;
+
     use super::*;
+
+    #[test]
+    fn ctau_products_run_via_ext_algebra() {
+        // ExtAlgebra's product machinery runs on the motivic (mod-τ) resolution:
+        // the cochain ring is Ext_{A_C/τ} = the algebraic Novikov E₂ = the Adams
+        // E₂ of Cτ. Exercise the h₀-tower, which is present there:
+        //   h₀ ∈ (n=0, s=1); h₀ⁿ is the (single) nonzero class of (n=0, s=n).
+        let res = MotivicResolution::new(Bidegree::n_s(8, 5));
+        let ext = res.ext();
+
+        assert_eq!(ext.dimension(Bidegree::n_s(0, 1)), 1, "h₀ is 1-dimensional");
+        let h0 = ext.generator(BidegreeGenerator::new(Bidegree::n_s(0, 1), 0));
+
+        // h₀ⁿ = h₀·h₀ⁿ⁻¹ stays nonzero up the tower (Cτ has an infinite h₀-tower).
+        let mut power = h0.clone();
+        for n in 2..=4 {
+            power = ext.multiply(&h0, &power);
+            let deg = Bidegree::n_s(0, n);
+            assert_eq!(power.degree(), deg, "h₀^{n} lands in (0,{n})");
+            assert_eq!(ext.dimension(deg), 1, "(0,{n}) is 1-dimensional");
+            assert!(!power.vec().is_zero(), "h₀^{n} should be nonzero");
+        }
+    }
 
     #[test]
     fn lift_is_a_complex_and_reduces_correctly() {
