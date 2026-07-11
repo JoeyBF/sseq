@@ -556,6 +556,262 @@ pub fn multiply(a: &(u32, Vec<u32>), b: &(u32, Vec<u32>)) -> DualElement {
 }
 
 // ---------------------------------------------------------------------------
+// The closed-form product (Kong–Lin Theorem 5.1, C-motivic ρ = 0).
+// ---------------------------------------------------------------------------
+//
+// Theorem 5.1 computes Q(E₁)P(R₁)·Q(E₂)P(R₂) as a sum over two Milnor-style
+// matrices X, Y with the output monomial Q(E₂ + T(Y)) P(T(X)). The subtlety that
+// makes the motivic case "much more complex than classical" (and that trips a
+// naive reading) is the ξ₀ = 1 / τ₀ ≠ 1 asymmetry (Remark 4.3): **ξ-type**
+// sequences (R₁, R₂, S(X), R(X), T(X)) are compared on indices ≥ 1 — index 0 is
+// absorbed — while **τ-type** sequences (E, S(Y), T(Y)) keep index 0.
+//
+// The τ-rewriting piece of the formula — the coefficient c(S(Y), R₁−S(X)), the
+// Σ₂ constraint, and the ρ = 0 filter — is exactly [`rewrite_tau`], which we
+// reuse rather than re-derive.
+
+/// The mod-2 multinomial coefficient of `entries` (the coefficient `b` of an
+/// anti-diagonal): `1` iff the entries are bitwise disjoint (no carries in the
+/// binary sum), else `0`.
+fn multinomial_mod2(entries: &[u32]) -> u32 {
+    let mut acc = 0u32;
+    for &e in entries {
+        if acc & e != 0 {
+            return 0;
+        }
+        acc |= e;
+    }
+    1
+}
+
+/// All columns `(v₀, v₁, …)` of non-negative integers with `Σᵢ 2ⁱ vᵢ == target`.
+fn columns_eq(target: u32) -> Vec<Vec<u32>> {
+    if target == 0 {
+        return vec![vec![]];
+    }
+    let mut out = Vec::new();
+    let mut v0 = target % 2;
+    while v0 <= target {
+        for rest in columns_eq((target - v0) / 2) {
+            let mut col = vec![v0];
+            col.extend(rest);
+            while let Some(&0) = col.last() {
+                col.pop();
+            }
+            out.push(col);
+        }
+        v0 += 2;
+    }
+    out
+}
+
+/// All columns with `Σᵢ 2ⁱ vᵢ ≤ bound` (distinct weighted sums, so no duplicates).
+fn columns_le(bound: u32) -> Vec<Vec<u32>> {
+    (0..=bound).flat_map(columns_eq).collect()
+}
+
+/// The column-0 options for the `X` matrix: `x_{0,0} = 0`, and `x_{i,0} ≤ R₁[i]`
+/// for `i ≥ 1` (bounded because it feeds the row sum `S(X)_i ≤ R₁[i]`).
+fn col0_x_options(r1: &[u32]) -> Vec<Vec<u32>> {
+    let mut result = vec![vec![0u32]];
+    for &bound in r1.iter().skip(1) {
+        let mut next = Vec::new();
+        for base in &result {
+            for v in 0..=bound {
+                let mut c = base.clone();
+                c.push(v);
+                next.push(c);
+            }
+        }
+        result = next;
+    }
+    for c in &mut result {
+        while let Some(&0) = c.last() {
+            c.pop();
+        }
+    }
+    result
+}
+
+/// The Cartesian product of per-column options, yielding matrices as a `Vec` of
+/// columns.
+fn cartesian(options: &[Vec<Vec<u32>>]) -> Vec<Vec<Vec<u32>>> {
+    let mut result: Vec<Vec<Vec<u32>>> = vec![vec![]];
+    for opts in options {
+        let mut next = Vec::with_capacity(result.len() * opts.len());
+        for prefix in &result {
+            for opt in opts {
+                let mut m = prefix.clone();
+                m.push(opt.clone());
+                next.push(m);
+            }
+        }
+        result = next;
+    }
+    result
+}
+
+/// A matrix as a slice of columns; `cols[j][i]` is the entry `x_{i,j}`.
+struct Mat<'a>(&'a [Vec<u32>]);
+
+impl Mat<'_> {
+    fn entry(&self, i: usize, j: usize) -> u32 {
+        self.0.get(j).and_then(|c| c.get(i)).copied().unwrap_or(0)
+    }
+
+    /// Row-`r` sum `S(M)_r`.
+    fn row_sum(&self, r: usize) -> u32 {
+        self.0.iter().map(|c| c.get(r).copied().unwrap_or(0)).sum()
+    }
+
+    /// Column-`j` weighted sum `R(M)_j = Σᵢ 2ⁱ x_{i,j}`.
+    fn col_weight(&self, j: usize) -> u32 {
+        self.0
+            .get(j)
+            .map_or(0, |c| c.iter().enumerate().map(|(i, &v)| v << i).sum())
+    }
+
+    /// Anti-diagonal-`r` sum `T(M)_r = Σ_{i+j=r} x_{i,j}`.
+    fn anti_diag(&self, r: usize) -> u32 {
+        (0..=r).map(|i| self.entry(i, r - i)).sum()
+    }
+
+    /// The number of rows (highest nonzero row index + 1) across all columns.
+    fn n_rows(&self) -> usize {
+        self.0.iter().map(Vec::len).max().unwrap_or(0)
+    }
+
+    /// The number of columns.
+    fn n_cols(&self) -> usize {
+        self.0.len()
+    }
+
+    /// The mod-2 coefficient `b(M) = Πᵣ multinomial(anti-diagonal r)`.
+    fn b(&self) -> u32 {
+        let max_r = self.n_rows() + self.n_cols();
+        for r in 0..=max_r {
+            let entries: Vec<u32> = (0..=r).map(|i| self.entry(i, r - i)).filter(|&v| v > 0).collect();
+            if multinomial_mod2(&entries) == 0 {
+                return 0;
+            }
+        }
+        1
+    }
+}
+
+fn trim(mut v: Vec<u32>) -> Vec<u32> {
+    while let Some(&0) = v.last() {
+        v.pop();
+    }
+    v
+}
+
+/// The product `a · b` in `A_C` via Kong–Lin Theorem 5.1 (ρ = 0). Same contract
+/// as [`multiply`] (the duality oracle it is validated against).
+pub fn multiply_closed(a: &(u32, Vec<u32>), b: &(u32, Vec<u32>)) -> DualElement {
+    let (e1_mask, r1) = (a.0, &a.1);
+    let (e2_mask, r2) = (b.0, &b.1);
+    let l = r1.len().max(r2.len()).max(1);
+    let r1v: Vec<u32> = (0..l).map(|j| r1.get(j).copied().unwrap_or(0)).collect();
+    let r2v: Vec<u32> = (0..l).map(|j| r2.get(j).copied().unwrap_or(0)).collect();
+    let sigma2_e1 = e1_mask as i64; // Σ (bit i)·2ⁱ = e1_mask
+
+    let mut out = DualElement::new();
+
+    // Enumerate X: column 0 bounded by R₁ rows; columns j ≥ 1 by R₂[j] weighted.
+    let mut x_col_opts = vec![col0_x_options(&r1v)];
+    for &bound in r2v.iter().skip(1) {
+        x_col_opts.push(columns_le(bound));
+    }
+
+    for xcols in cartesian(&x_col_opts) {
+        let x = Mat(&xcols);
+        if x.b() == 0 {
+            continue;
+        }
+        // S(X)_r ≤ R₁[r] for r ≥ 1.
+        let max_r = x.n_rows().max(l) + 1;
+        if (1..max_r).any(|r| x.row_sum(r) > r1v.get(r).copied().unwrap_or(0)) {
+            continue;
+        }
+        // S′ = R₁ − S(X) on indices ≥ 1 (S′[0] = 0); τ-power = Σ(S′).
+        let sprime: Vec<u32> = (0..l)
+            .map(|j| if j == 0 { 0 } else { r1v[j] - x.row_sum(j) })
+            .collect();
+        let sigma2_sprime: i64 = sprime.iter().enumerate().map(|(j, &v)| (v as i64) << j).sum();
+
+        // RY targets: column j ≥ 1 of Y has weighted sum R₂[j] − R(X)[j].
+        let mut ry: Vec<i64> = vec![0; l];
+        let mut feasible = true;
+        for j in 1..l {
+            ry[j] = r2v[j] as i64 - x.col_weight(j) as i64;
+            if ry[j] < 0 {
+                feasible = false;
+                break;
+            }
+        }
+        if !feasible {
+            continue;
+        }
+        // Σ₂(S(Y)) = Σ₂(E₁) + Σ₂(S′) is forced, and equals Σ_{j≥0} R(Y)[j], so
+        // column 0 of Y has a determined weighted sum.
+        let target_sigma2_sy = sigma2_e1 + sigma2_sprime;
+        let ry0 = target_sigma2_sy - ry[1..].iter().sum::<i64>();
+        if ry0 < 0 {
+            continue;
+        }
+
+        // The output P-part T(X) (index 0 dropped: ξ₀ = 1).
+        let out_r = trim(
+            std::iter::once(0)
+                .chain((1..=x.n_rows() + x.n_cols()).map(|j| x.anti_diag(j)))
+                .collect(),
+        );
+
+        // Enumerate Y: column 0 weighted = RY0, columns j ≥ 1 weighted = RY[j].
+        let mut y_col_opts = vec![columns_eq(ry0 as u32)];
+        for &t in ry.iter().skip(1) {
+            y_col_opts.push(columns_eq(t as u32));
+        }
+
+        for ycols in cartesian(&y_col_opts) {
+            let y = Mat(&ycols);
+            if y.b() == 0 {
+                continue;
+            }
+            let sy: Vec<u32> = (0..y.n_rows()).map(|i| y.row_sum(i)).collect();
+            // Match against the τ-rewriting: the term with exterior part E₁ and
+            // ξ-part S′ contributes c(S(Y), S′) (already ≠ 0 here) at τ^{Σ(S′)}.
+            for term in rewrite_tau(&sy) {
+                if term.e_mask != e1_mask || trim(term.r.clone()) != trim(sprime.clone()) {
+                    continue;
+                }
+                // E_out = E₂ + T(Y) must be square-free (Seq₁).
+                let n_e = (y.n_rows() + y.n_cols()).max(32);
+                let mut out_e_mask = 0u32;
+                let mut square_free = true;
+                for i in 0..n_e {
+                    let val = ((e2_mask >> i) & 1) + y.anti_diag(i);
+                    if val > 1 {
+                        square_free = false;
+                        break;
+                    }
+                    if val == 1 {
+                        out_e_mask |= 1 << i;
+                    }
+                }
+                if !square_free {
+                    continue;
+                }
+                add_term(&mut out, (out_e_mask, out_r.clone()), Tau::power(term.tau_pow));
+            }
+        }
+    }
+
+    out
+}
+
+// ---------------------------------------------------------------------------
 // The C-motivic Steenrod algebra A_C as a free 𝔽₂[τ]-module on the Milnor basis.
 // ---------------------------------------------------------------------------
 
@@ -665,7 +921,9 @@ impl MotivicMilnorAlgebra {
         let b = self.basis[t2 as usize][idx2].clone();
         let t = t1 + t2;
         self.compute_basis(t);
-        let result: Vec<(Tau, usize)> = multiply(&a, &b)
+        // The closed-form product (Kong–Lin Theorem 5.1), validated exhaustively
+        // against the duality oracle `multiply`.
+        let result: Vec<(Tau, usize)> = multiply_closed(&a, &b)
             .into_iter()
             .map(|(z, c)| {
                 (
@@ -1203,6 +1461,52 @@ mod tests {
             }],
             "τ_0^4 = τ^2 ξ_1^2 (ρ=0)"
         );
+    }
+
+    #[test]
+    fn test_closed_form_small_cases() {
+        // The case a naive reading of Theorem 5.1 gets wrong (the ξ₀ = 1 index
+        // absorption): Q_0 · P(ξ_1) = Q_1 + Q_0 P(ξ_1).
+        let q0 = (0b1, vec![]);
+        let p_xi1 = (0, vec![0, 1]);
+        assert_eq!(multiply_closed(&q0, &p_xi1), multiply(&q0, &p_xi1));
+
+        // The τ-generating case: P(ξ_1)² has a τ Q_0 Q_1 term.
+        assert_eq!(
+            multiply_closed(&p_xi1, &p_xi1),
+            multiply(&p_xi1, &p_xi1)
+        );
+
+        // Q_i² = 0.
+        for i in 0..3 {
+            assert_eq!(
+                multiply_closed(&(1 << i, vec![]), &(1 << i, vec![])),
+                multiply(&(1 << i, vec![]), &(1 << i, vec![]))
+            );
+        }
+    }
+
+    #[test]
+    fn test_closed_form_matches_duality_oracle() {
+        // Exhaustive fuzz: the closed form (Theorem 5.1) agrees with the duality
+        // oracle on every ordered pair of basis elements with deg(a)+deg(b) ≤ 18,
+        // including the τ-carrying and multi-Q cases. (The bound is kept modest
+        // because the *oracle* is slow; the closed form is not.)
+        let basis: Vec<(i32, (u32, Vec<u32>))> = (0..=14)
+            .flat_map(|t| enum_basis(t).into_iter().map(move |m| (t, m)))
+            .collect();
+        for (ta, a) in &basis {
+            for (tb, b) in &basis {
+                if ta + tb > 18 {
+                    continue;
+                }
+                assert_eq!(
+                    multiply_closed(a, b),
+                    multiply(a, b),
+                    "closed form ≠ oracle for {a:?} · {b:?}"
+                );
+            }
+        }
     }
 
     #[test]
