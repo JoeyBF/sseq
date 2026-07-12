@@ -438,39 +438,67 @@ impl MotivicResolution {
     /// this per-term atom is all both [`Self::composite`] and the incremental
     /// [`Self::correct`] need: toggling a term in or out of the support is exactly
     /// one call here (XOR is its own inverse).
+    #[allow(clippy::too_many_arguments)]
     fn accumulate_term(
         &self,
         s: i32,
         t: i32,
         f_sm1: &FreeModule<CTauAlgebra>,
         f_sm2: &FreeModule<CTauAlgebra>,
-        engine: &MotivicMilnorAlgebra,
+        _engine: &MotivicMilnorAlgebra,
         bidx: usize,
         parity: &mut FpVector,
     ) {
-        let og = f_sm1.index_to_op_gen(t, bidx);
+        // The differential's own composite: compose with `d = self.lifted`
+        // (degree-preserving, so inner_shift_t = 0).
+        self.compose_into(f_sm1, t, s - 1, &self.lifted, 0, f_sm2, bidx, parity);
+    }
+
+    /// The shared atom of every τ-adic lift: compose the outer basis element `bidx`
+    /// of `outer_mod` (internal degree `outer_t`, generators at homological degree
+    /// `outer_s`) with the lifted map `inner` (whose value on a generator lives in
+    /// `inner_out_mod`), XORing the resulting $A_C$ products into `parity`.
+    ///
+    /// `bidx` decodes to `m ⊗ gⱼ`; `inner[gⱼ]` to `m′ ⊗ gₗ`; the term contributed is
+    /// `(m·m′) ⊗ gₗ` (all $\tau$-powers of the $A_C$ product `m·m′`, since the
+    /// forced power of each output basis element is fixed by weight-homogeneity and
+    /// recovered later). For the differential `inner = d` (`self.lifted`); for a
+    /// product chain map `inner = φₐ`. A generator absent from `inner` contributes 0.
+    #[allow(clippy::too_many_arguments)]
+    fn compose_into(
+        &self,
+        outer_mod: &FreeModule<CTauAlgebra>,
+        outer_t: i32,
+        outer_s: i32,
+        inner: &HashMap<Gen, BTreeSet<usize>>,
+        inner_shift_t: i32,
+        inner_out_mod: &FreeModule<CTauAlgebra>,
+        bidx: usize,
+        parity: &mut FpVector,
+    ) {
+        let engine = self.algebra.engine();
+        let og = outer_mod.index_to_op_gen(outer_t, bidx);
         let (m_deg, m_idx) = (og.operation_degree, og.operation_index);
         let gj = Gen {
-            s: s - 1,
+            s: outer_s,
             t: og.generator_degree,
             idx: og.generator_index,
         };
-        let gj_lifted = self.lifted.get(&gj).unwrap_or_else(|| {
-            panic!(
-                "composite references generator {gj:?} outside the resolved box \
-                 (stem {} > compute stem {}); increase the lift stem margin (MOT_MARGIN)",
-                gj.t - gj.s,
-                self.compute.n(),
-            )
-        });
-        for &bidx2 in gj_lifted {
-            let og2 = f_sm2.index_to_op_gen(gj.t, bidx2);
+        let Some(gj_inner) = inner.get(&gj) else {
+            return; // inner map is zero on gⱼ (e.g. outside φₐ's range) ⇒ no term
+        };
+        // `inner[gⱼ]` lives at degree `gⱼ.t − inner_shift_t` (0 for the
+        // degree-preserving differential, aₜ for the chain map φₐ).
+        let inner_t = gj.t - inner_shift_t;
+        for &bidx2 in gj_inner {
+            let og2 = inner_out_mod.index_to_op_gen(inner_t, bidx2);
             let (mp_deg, mp_idx) = (og2.operation_degree, og2.operation_index);
             let (gl_deg, gl_idx) = (og2.generator_degree, og2.generator_index);
             let z_deg = m_deg + mp_deg;
             engine.product_indexed_with(m_deg, m_idx, mp_deg, mp_idx, |terms| {
                 for &(_tau, z_idx) in terms {
-                    let fidx = f_sm2.operation_generator_to_index(z_deg, z_idx, gl_deg, gl_idx);
+                    let fidx =
+                        inner_out_mod.operation_generator_to_index(z_deg, z_idx, gl_deg, gl_idx);
                     parity.add_basis_element(fidx, 1); // XOR at p = 2
                 }
             });
@@ -636,6 +664,96 @@ impl MotivicResolution {
     /// cochain products descended through the cohomology, which is separate.)
     pub fn ext(&self) -> &ExtAlgebra<CTauResolution> {
         self.ext.get_or_init(|| self.build_ext())
+    }
+
+    /// Lift the product chain map $\varphi_a$ (left-multiplication by the generator
+    /// `a`) to $A_C$ over $\mathbb{F}_2[\tau]$: `g ↦ φₐ(g)` supports keyed by source
+    /// generator, computed up to source homological degree `max_s`.
+    ///
+    /// The mod-τ seeds are the ExtAlgebra's [`ResolutionHomomorphism`] (the Cτ
+    /// product); the τ-corrections make it an honest chain map over $A_C$
+    /// (`dφₐ = φₐd`), via the [`TauLift`] driver ([`ProductCells`]). Processed with
+    /// `s` ascending, since a cell's constant defect `φₐ(dg)` reads `φₐ` at `s-1`.
+    /// This is the motivic product: reducing mod τ recovers the Cτ product, and the
+    /// τ-powers are the hidden extensions (e.g. `h₀²h₂ = τ·h₁³`).
+    fn lift_product(&self, a: Gen, max_s: i32) -> HashMap<Gen, BTreeSet<usize>> {
+        let wa = self.weights[&a];
+        let a_deg = Bidegree::n_s(a.t - a.s, a.s);
+        let hom = self
+            .ext()
+            .generator_product_map(BidegreeGenerator::new(a_deg, a.idx));
+        hom.extend_all();
+
+        // Mod-τ seeds: φₐ(g) mod τ = the ExtAlgebra chain map on each generator.
+        // φₐ shifts degree by aₜ, so it is zero on source generators below degree aₜ.
+        let mut seeds: HashMap<Gen, BTreeSet<usize>> = HashMap::new();
+        for s in a.s..=max_s {
+            let map = hom.get_map(s);
+            for t in a.t..=(self.compute.n() + s) {
+                for idx in 0..self.num_gens(s, t) {
+                    let support: BTreeSet<usize> = map
+                        .output(t, idx)
+                        .iter_nonzero()
+                        .filter(|(_, v)| *v != 0)
+                        .map(|(i, _)| i)
+                        .collect();
+                    if !support.is_empty() {
+                        seeds.insert(Gen { s, t, idx }, support);
+                    }
+                }
+            }
+        }
+
+        // Lift, s ascending.
+        let mut phi: HashMap<Gen, BTreeSet<usize>> = HashMap::new();
+        for s in a.s..=max_s {
+            let gens: Vec<Gen> = (a.t..=(self.compute.n() + s))
+                .flat_map(|t| (0..self.num_gens(s, t)).map(move |idx| Gen { s, t, idx }))
+                .collect();
+            let lifted: Vec<(Gen, BTreeSet<usize>)> = gens
+                .into_maybe_par_iter()
+                .map(|g| {
+                    let cells = ProductCells {
+                        res: self,
+                        a,
+                        wa,
+                        seeds: &seeds,
+                        phi: &phi,
+                    };
+                    (g, cells.lift_or_seed(g))
+                })
+                .collect();
+            phi.extend(lifted);
+        }
+        phi
+    }
+
+    /// The motivic product `a · b` of two resolution generators, over
+    /// $\mathbb{F}_2[\tau]$: a list of `(target generator, τ-power)` at bidegree
+    /// `(aₛ+bₛ, aₜ+bₜ)`. The τ-powers are the hidden extensions — 0 for a product
+    /// visible mod τ (the Cτ product), positive where the Cτ product vanishes but
+    /// the motivic product does not (e.g. `h₀·(h₀h₂) = τ·h₁³`).
+    ///
+    /// Read off the lifted chain map [`Self::lift_product`]: `a·b` is the cocycle
+    /// `gₖ ↦ ε_b(φₐ(gₖ))` — the coefficient of the augmentation term `1 ⊗ b` in
+    /// `φₐ(gₖ)`. Since `φₐ(gₖ)` has weight `w(gₖ) − w(a)` and `1 ⊗ b` has weight
+    /// `w(b)`, that coefficient's forced τ-power is `w(a) + w(b) − w(gₖ)`.
+    pub fn motivic_product(&self, a: Gen, b: Gen) -> Vec<(Gen, u32)> {
+        let target_s = a.s + b.s;
+        let target_t = a.t + b.t;
+        let phi = self.lift_product(a, target_s);
+        let out_mod = self.module(b.s); // φₐ(gₖ) ∈ F_{bₛ} at degree bₜ
+        let idx_1b = out_mod.operation_generator_to_index(0, 0, b.t, b.idx);
+        let wa = self.weights[&a];
+        let wb = self.weights[&b];
+        (0..self.num_gens(target_s, target_t))
+            .filter_map(|k| {
+                let gk = Gen { s: target_s, t: target_t, idx: k };
+                phi.get(&gk)
+                    .filter(|support| support.contains(&idx_1b))
+                    .map(|_| (gk, (wa + wb - self.weights[&gk]) as u32))
+            })
+            .collect()
     }
 
     /// Group generators by their multidegree `(n, s, w)`. Returns the per-multidegree
@@ -1164,6 +1282,101 @@ impl TauLift for DifferentialCells<'_> {
     }
 }
 
+/// The product-lift instance of [`TauLift`]: lift the chain map `φₐ` (multiplication
+/// by the generator `a`) so that `d φₐ = φₐ d` over `A_C`. For a source generator
+/// `g` at `(s, t)`, `φₐ(g)` lives in `F_{s−aₛ}` at degree `t−aₜ`; the defect module
+/// is `F_{s−aₛ−1}`, the variable part of the defect is `d(φₐ g)` and the constant
+/// part is `φₐ(dg)` (using `φₐ` already lifted at `s−1`), and `d̄_{s−aₛ}`'s
+/// quasi-inverse solves the corrections.
+struct ProductCells<'a> {
+    res: &'a MotivicResolution,
+    a: Gen,
+    wa: i32,
+    /// Mod-τ seeds `φₐ(g)` from the ExtAlgebra chain map.
+    seeds: &'a HashMap<Gen, BTreeSet<usize>>,
+    /// `φₐ` lifted at strictly lower homological degree (read by the constant defect).
+    phi: &'a HashMap<Gen, BTreeSet<usize>>,
+}
+
+impl ProductCells<'_> {
+    /// Correct `φₐ(g)` if the cell admits a defect and stays in the box; else return
+    /// the mod-τ seed unchanged.
+    fn lift_or_seed(&self, g: Gen) -> BTreeSet<usize> {
+        let out_s = g.s - self.a.s;
+        let stem = g.t - g.s;
+        let in_cone = stem <= self.res.max.n() + self.res.max.s();
+        if out_s >= 1
+            && in_cone
+            && self.res.weights.contains_key(&g)
+            && self.res.lifted.contains_key(&g)
+        {
+            self.lift_cell(g)
+        } else {
+            self.seed(g)
+        }
+    }
+}
+
+impl TauLift for ProductCells<'_> {
+    fn source_weight(&self, g: Gen) -> i32 {
+        // φₐ(g) has weight w(g) − w(a): the chain map for left-multiplication by `a`
+        // lowers weight by w(a) (its τ⁰ entries recover the Cτ product).
+        self.res.weights[&g] - self.wa
+    }
+
+    fn seed(&self, g: Gen) -> BTreeSet<usize> {
+        self.seeds.get(&g).cloned().unwrap_or_default()
+    }
+
+    fn defect_module(&self, g: Gen) -> (Arc<FreeModule<CTauAlgebra>>, i32) {
+        (self.res.module(g.s - self.a.s - 1), g.t - self.a.t)
+    }
+
+    fn defect_weight(&self, g: Gen, bidx: usize) -> i32 {
+        self.res
+            .entry_weight(g.s - self.a.s - 1, g.t - self.a.t, bidx)
+    }
+
+    fn seed_constant(&self, g: Gen, parity: &mut FpVector) {
+        // The support-independent part of the defect: φₐ(dg) = Σ φₐ over the lifted
+        // differential of g, landing in F_{s−aₛ−1}.
+        let f_sm1 = self.res.module(g.s - 1);
+        let inner_out = self.res.module(g.s - self.a.s - 1);
+        for &bidx in &self.res.lifted[&g] {
+            // inner = φₐ shifts degree by aₜ.
+            self.res
+                .compose_into(&f_sm1, g.t, g.s - 1, self.phi, self.a.t, &inner_out, bidx, parity);
+        }
+    }
+
+    fn accumulate(&self, g: Gen, bidx: usize, parity: &mut FpVector) {
+        // The variable part: d(φₐ g), applying the lifted differential to the current
+        // φₐ(g) support (which lives in F_{s−aₛ}). inner = d is degree-preserving.
+        let out_mod = self.res.module(g.s - self.a.s);
+        let inner_out = self.res.module(g.s - self.a.s - 1);
+        self.res.compose_into(
+            &out_mod,
+            g.t - self.a.t,
+            g.s - self.a.s,
+            &self.res.lifted,
+            0,
+            &inner_out,
+            bidx,
+            parity,
+        );
+    }
+
+    fn solve(&self, g: Gen, e: &FpVector) -> Option<FpVector> {
+        let out_s = g.s - self.a.s;
+        let out_t = g.t - self.a.t;
+        let d = self.res.resolution.differential(out_s);
+        let qi = d.quasi_inverse(out_t)?;
+        let mut c = FpVector::new(TWO, self.res.module(out_s).dimension(out_t));
+        qi.apply(c.as_slice_mut(), 1, e.as_slice());
+        Some(c)
+    }
+}
+
 /// Minimal $\mathbb{F}_2[\tau]$ polynomial arithmetic and Smith normal form —
 /// enough to extract the invariant factors of a small δ matrix, so the
 /// $\tau$-torsion of the motivic $E_2$ can be read as an $\mathbb{F}_2[\tau]$-module
@@ -1455,6 +1668,90 @@ mod tests {
             c
         };
         assert!(is_zero(&h0sq_h2), "h₀²h₂ vanishes in the Cτ ring (the τ is hidden)");
+    }
+
+    #[test]
+    fn product_lift_is_a_chain_map_and_reduces_mod_tau() {
+        // The lifted product chain map φₐ must be an honest chain map over A_C —
+        // dφₐ = φₐd — and reduce mod τ (its weight-w(g)−w(a) part) to the Cτ product.
+        // The product analogue of verify_d_squared_zero. Cover h₀ (weight 0) and h₁
+        // (weight −1) so the weight convention w(φₐ g) = w(g) − w(a) is exercised.
+        let res = MotivicResolution::new(Bidegree::n_s(12, 8));
+        for a in [Gen { s: 1, t: 1, idx: 0 }, Gen { s: 1, t: 2, idx: 0 }] {
+            let wa = res.weights[&a];
+            let phi = res.lift_product(a, 6);
+
+            for (&g, support) in &phi {
+                let out_s = g.s - a.s;
+                let stem = g.t - g.s;
+                let in_cone = stem <= res.max().n() + res.max().s();
+                if out_s < 1 || !in_cone || !res.lifted.contains_key(&g) {
+                    continue;
+                }
+
+                // The chain-map defect d(φₐ g) + φₐ(dg) over A_C, in F_{s−aₛ−1}.
+                let def_mod = res.module(out_s - 1);
+                let mut parity = FpVector::new(TWO, def_mod.dimension(g.t - a.t));
+                let out_mod = res.module(out_s);
+                for &bidx in support {
+                    res.compose_into(&out_mod, g.t - a.t, out_s, &res.lifted, 0, &def_mod, bidx, &mut parity);
+                }
+                let f_sm1 = res.module(g.s - 1);
+                for &bidx in &res.lifted[&g] {
+                    res.compose_into(&f_sm1, g.t, g.s - 1, &phi, a.t, &def_mod, bidx, &mut parity);
+                }
+                assert!(parity.is_zero(), "product chain-map defect ≠ 0 at {g:?} (a={a:?})");
+
+                // Mod-τ reduction: the τ⁰ part of φₐ(g) — its entries at weight
+                // w(g) − w(a) — is the Cτ product; corrections sit at higher weight.
+                let w_src = res.weights[&g] - wa;
+                let mod_tau: BTreeSet<usize> = support
+                    .iter()
+                    .copied()
+                    .filter(|&b| res.entry_weight(out_s, g.t - a.t, b) == w_src)
+                    .collect();
+                let seed: BTreeSet<usize> = res
+                    .ext()
+                    .generator_product_map(BidegreeGenerator::new(Bidegree::n_s(a.t - a.s, a.s), a.idx))
+                    .get_map(g.s)
+                    .output(g.t, g.idx)
+                    .iter_nonzero()
+                    .filter(|(_, v)| *v != 0)
+                    .map(|(i, _)| i)
+                    .collect();
+                assert_eq!(mod_tau, seed, "φₐ(g) mod τ ≠ Cτ product at {g:?} (a={a:?})");
+            }
+        }
+    }
+
+    #[test]
+    fn motivic_product_recovers_hidden_tau_extension() {
+        // The headline hidden extension h₀²h₂ = τ·h₁³, computed from first principles
+        // by the F₂[τ] product lift. In the Cτ ring h₀²h₂ = 0 (motivic_ctau_ring_
+        // relations); here the τ appears.
+        let res = MotivicResolution::new(Bidegree::n_s(8, 6));
+        let h0 = Gen { s: 1, t: 1, idx: 0 };
+        let h2 = Gen { s: 1, t: 4, idx: 0 };
+        let h1cubed = Gen { s: 3, t: 6, idx: 0 }; // the sole generator at (3,3)
+
+        // h₀·h₂ is the Cτ-visible generator at (3,2) (τ⁰).
+        let h0h2 = res.motivic_product(h0, h2);
+        assert_eq!(h0h2, vec![(Gen { s: 2, t: 5, idx: 0 }, 0)], "h₀h₂ at (3,2), τ⁰");
+
+        // h₀·(h₀h₂) = τ¹·h₁³ — the hidden extension.
+        let h0sq_h2 = res.motivic_product(h0, h0h2[0].0);
+        assert_eq!(h0sq_h2, vec![(h1cubed, 1)], "h₀²h₂ = τ·h₁³");
+
+        // Sanity: the h₁-tower products stay τ⁰ (h₁ⁿ is the honest Cτ product, no
+        // hidden τ), even though h₁ⁿ is τ-torsion for n ≥ 4.
+        let h1 = Gen { s: 1, t: 2, idx: 0 };
+        let h1sq = res.motivic_product(h1, h1);
+        assert_eq!(h1sq, vec![(Gen { s: 2, t: 4, idx: 0 }, 0)], "h₁² τ⁰");
+        assert_eq!(
+            res.motivic_product(h1, h1sq[0].0),
+            vec![(h1cubed, 0)],
+            "h₁³ τ⁰"
+        );
     }
 
     #[test]
