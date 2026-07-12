@@ -27,11 +27,27 @@
           pkgs.perf
         ]
         ++ super.defaultPackages.devTools.${system};
+
+      # Runtime libraries that `winit` / `glutin` dlopen for the optional `3d` visualizer
+      # (`cargo run -p sseq --features 3d --example viz3d`, and the offscreen screenshot path).
+      # Nix shells don't expose the host's system libraries, so these must be on
+      # `LD_LIBRARY_PATH` or creating the window / GL context fails to initialize. `wayland`
+      # covers Wayland compositors such as Hyprland; the `xorg.*` set covers X11 / XWayland.
+      guiLibs = with pkgs; [
+        libGL
+        libxkbcommon
+        wayland
+        xorg.libX11
+        xorg.libXcursor
+        xorg.libXi
+        xorg.libXrandr
+      ];
     in {
       devShells.default = pkgs.mkShell {
         packages = commonPackages;
         shellHook = ''
           export RUST_LOG=info
+          export LD_LIBRARY_PATH="${pkgs.lib.makeLibraryPath guiLibs}:''${LD_LIBRARY_PATH:-}"
         '';
       };
 

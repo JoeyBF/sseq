@@ -13,6 +13,11 @@ all:
 viz3d:
     cargo run -p sseq --features 3d --example viz3d
 
+# Render the 3D visualizer's first page offscreen to a PNG (no interactive window).
+# Still needs a GL context; on a headless machine prefix with `xvfb-run -a`.
+viz3d-screenshot OUT="viz3d.png":
+    SSEQ_VIZ3D_SCREENSHOT="{{OUT}}" cargo run -p sseq --features 3d --example viz3d
+
 test:
     cargo test --examples
     cargo test --features concurrent --lib --tests --workspace

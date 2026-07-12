@@ -9,6 +9,9 @@
 //! This builds a small synthetic `Sseq<3>` (there is no `Sseq<3>` producer in the resolver yet),
 //! with a placeholder profile, and opens the `three-d` window. Orbit with the mouse, zoom with the
 //! scroll wheel, and switch pages `E_r` with the left/right arrow keys.
+//!
+//! Set `SSEQ_VIZ3D_SCREENSHOT=<path.png>` to instead render page E_2 offscreen to a PNG and exit
+//! (no interactive window). On a headless machine, run it under `xvfb-run`.
 
 use fp::{matrix::Matrix, prime::ValidPrime, vector::FpVector};
 use once::MultiIndexed;
@@ -94,5 +97,10 @@ fn main() {
     };
     let products = vec![("v".to_string(), product)];
 
-    sseq::viz3d::show(&sseq, &products);
+    // Offscreen capture mode when a screenshot path is provided; otherwise open the window.
+    if let Ok(path) = std::env::var("SSEQ_VIZ3D_SCREENSHOT") {
+        sseq::viz3d::render_to_png_from(&sseq, &products, 0, 1280, 800, &path);
+    } else {
+        sseq::viz3d::show(&sseq, &products);
+    }
 }

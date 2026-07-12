@@ -21,5 +21,5 @@
 pub mod render;
 pub mod scene;
 
-pub use render::{run, show};
+pub use render::{render_to_png, render_to_png_from, run, show};
 pub use scene::{Edge, EdgeKind, Node, Page, SseqScene, extract_scene};

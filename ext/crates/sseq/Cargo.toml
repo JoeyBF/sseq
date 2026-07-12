@@ -18,8 +18,10 @@ serde_arrays = "0.1.0"
 tracing = "0.1.41"
 
 # Optional: interactive 3D visualizer for `Sseq<3>`, enabled by the `3d` feature. `three-d` is a
-# lightweight wgpu-based renderer; it is never pulled into the default or wasm builds.
+# lightweight wgpu-based renderer; it is never pulled into the default or wasm builds. `png` backs
+# the headless render-to-PNG path (it is already in the tree transitively via `three-d`).
 three-d = { version = "0.19", optional = true }
+png = { version = "0.17", optional = true }
 
 [dev-dependencies]
 expect-test = "1.5.1"
@@ -30,7 +32,7 @@ default = ["odd-primes"]
 concurrent = ["maybe-rayon/concurrent"]
 odd-primes = ["fp/odd-primes"]
 # A 3D visualizer for `Sseq<3>` built on `three-d`. Native-only in practice (opens a window).
-"3d" = ["dep:three-d"]
+"3d" = ["dep:three-d", "dep:png"]
 
 [[example]]
 name = "viz3d"
