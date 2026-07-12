@@ -1334,6 +1334,69 @@ mod tests {
     }
 
     #[test]
+    fn motivic_ctau_ring_relations() {
+        // The Cτ ring (= algebraic Novikov E₂ = E₁ of the deformation SS) acting
+        // through Sseq::multiply, checked against the standard Adams-E₂ relations.
+        // hᵢ lives at (2ⁱ−1, 1) with weight −(2ⁱ−1) (this presentation's sign).
+        let res = MotivicResolution::new(Bidegree::n_s(16, 10));
+        let sseq = res.deformation_sseq();
+
+        let h = [(0, "h0"), (1, "h1"), (3, "h2"), (7, "h3")];
+        let prods =
+            res.deformation_products(&h.iter().map(|&(n, _)| (Bidegree::n_s(n, 1), 0)).collect::<Vec<_>>());
+        let wt = |n: i32| res.generator_weight(Gen { s: 1, t: n + 1, idx: 0 });
+        let class_at = |n: i32, s: i32, w: i32| -> MultiDegreeElement<3> {
+            let deg = MultiDegree::from([n, s, w]);
+            let mut v = FpVector::new(TWO, sseq.get_dimension(deg).unwrap_or(0).max(1));
+            v.set_entry(0, 1);
+            MultiDegreeElement::new(deg, v)
+        };
+        // A product landing in an empty (undefined) bidegree is zero: Sseq::multiply
+        // returns None exactly then, so treat None as the zero class.
+        let is_zero = |c: &Option<MultiDegreeElement<3>>| {
+            c.as_ref().is_none_or(|x| x.vec().is_zero())
+        };
+
+        // h₁-tower: h₁ⁿ ≠ 0 for all n (into the τ-torsion range n ≥ 4), at (n, n, −n).
+        let mut c = Some(class_at(1, 1, wt(1)));
+        for n in 2..=6 {
+            c = c.and_then(|x| sseq.multiply(&x, &prods[1]));
+            let x = c.as_ref().unwrap_or_else(|| panic!("h₁^{n} fell out of range"));
+            assert_eq!(x.degree(), MultiDegree::from([n, n, -n]), "h₁^{n} degree");
+            assert!(!x.vec().is_zero(), "h₁^{n} should be nonzero (Cτ h₁-tower)");
+        }
+
+        // Adjacent Hopf elements multiply to zero: h₀h₁ = h₁h₂ = h₂h₃ = 0.
+        for i in 0..3 {
+            let (n, _) = h[i];
+            let prod = sseq.multiply(&class_at(n, 1, wt(n)), &prods[i + 1]);
+            assert!(is_zero(&prod), "{}·{} should vanish", h[i].1, h[i + 1].1);
+        }
+
+        // The motivic relation h₀²h₂ = τ·h₁³ shows up here as a *hidden τ-extension*:
+        // h₁³ ≠ 0 at weight −3, while h₀²h₂ vanishes in the Cτ ring (τ = 0) — it would
+        // land at (3, 3, −2), one weight up, empty on E₁. Recovering the τ requires
+        // the F₂[τ] product lift; the Cτ ring only sees the τ = 0 shadow.
+        let h1_cubed = {
+            let mut c = Some(class_at(1, 1, wt(1)));
+            for _ in 0..2 {
+                c = c.and_then(|x| sseq.multiply(&x, &prods[1]));
+            }
+            c.expect("h₁³ in range")
+        };
+        assert_eq!(h1_cubed.degree(), MultiDegree::from([3, 3, -3]));
+        assert!(!h1_cubed.vec().is_zero(), "h₁³ ≠ 0");
+        let h0sq_h2 = {
+            let mut c = Some(class_at(3, 1, wt(3)));
+            for _ in 0..2 {
+                c = c.and_then(|x| sseq.multiply(&x, &prods[0]));
+            }
+            c
+        };
+        assert!(is_zero(&h0sq_h2), "h₀²h₂ vanishes in the Cτ ring (the τ is hidden)");
+    }
+
+    #[test]
     fn deformation_sseq_converges_to_classical() {
         // The strong oracle for the full d_r tower: E_∞ survivors summed over weight
         // = the classical Adams E₂ (invert τ). Every differential is validated —
