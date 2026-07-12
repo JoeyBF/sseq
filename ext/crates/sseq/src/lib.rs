@@ -4,6 +4,8 @@ pub mod charting;
 pub mod coordinates;
 mod differential;
 mod sseq;
+#[cfg(feature = "3d")]
+pub mod viz3d;
 
 pub use differential::*;
 

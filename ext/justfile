@@ -9,6 +9,10 @@ BENCH_DIR := "examples/benchmarks"
 all:
     cargo build
 
+# Launch the interactive 3D visualizer for `Sseq<3>` (requires the `3d` feature).
+viz3d:
+    cargo run -p sseq --features 3d --example viz3d
+
 test:
     cargo test --examples
     cargo test --features concurrent --lib --tests --workspace
