@@ -73,7 +73,7 @@ use sseq::{
 };
 
 use crate::{
-    chain_complex::{ChainComplex, FiniteChainComplex},
+    chain_complex::{ChainComplex, ChainHomotopy, FiniteChainComplex},
     ext_algebra::{ExtAlgebra, ExtDifferential},
     resolution::Resolution,
 };
@@ -756,6 +756,104 @@ impl MotivicResolution {
             .collect()
     }
 
+    /// Lift the null-homotopy `H` of `φ_b ∘ φ_a` (the product `ab`, which must vanish
+    /// mod τ) to $A_C$ over $\mathbb{F}_2[\tau]$: `g ↦ H(g)` supports keyed by source
+    /// generator, up to source degree `max_s`. The mod-τ seed is the ExtAlgebra
+    /// [`ChainHomotopy`]; the τ-corrections make `dH + Hd = φ_bφ_a` hold over $A_C$,
+    /// via the third [`TauLift`] instance ([`NullHomotopyCells`]). This is the datum
+    /// a Massey product `⟨a, b, c⟩` is built from.
+    fn lift_nullhomotopy(&self, a: Gen, b: Gen, max_s: i32) -> HashMap<Gen, BTreeSet<usize>> {
+        let (wa, wb) = (self.weights[&a], self.weights[&b]);
+        let phi_a = self.lift_product(a, max_s);
+        let phi_b = self.lift_product(b, max_s);
+
+        let hom_a = self
+            .ext()
+            .generator_product_map(BidegreeGenerator::new(Bidegree::n_s(a.t - a.s, a.s), a.idx));
+        let hom_b = self
+            .ext()
+            .generator_product_map(BidegreeGenerator::new(Bidegree::n_s(b.t - b.s, b.s), b.idx));
+        hom_a.extend_all();
+        hom_b.extend_all();
+        let ch = ChainHomotopy::new(hom_a, hom_b); // null-homotopy of φ_b ∘ φ_a
+        ch.extend_all();
+
+        let shift_s = a.s + b.s;
+        let shift_t = a.t + b.t;
+
+        // Mod-τ seeds: H(g) mod τ ∈ F_{s+1−shiftₛ} at degree t−shiftₜ.
+        let mut seeds: HashMap<Gen, BTreeSet<usize>> = HashMap::new();
+        for s in (shift_s - 1).max(0)..=max_s {
+            let map = ch.homotopy(s);
+            for t in shift_t..=(self.compute.n() + s) {
+                for idx in 0..self.num_gens(s, t) {
+                    let support: BTreeSet<usize> = map
+                        .output(t, idx)
+                        .iter_nonzero()
+                        .filter(|(_, v)| *v != 0)
+                        .map(|(i, _)| i)
+                        .collect();
+                    if !support.is_empty() {
+                        seeds.insert(Gen { s, t, idx }, support);
+                    }
+                }
+            }
+        }
+
+        // Lift, s ascending (the constant defect Hd reads H at s−1).
+        let mut h_phi: HashMap<Gen, BTreeSet<usize>> = HashMap::new();
+        for s in (shift_s - 1).max(0)..=max_s {
+            let gens: Vec<Gen> = (shift_t..=(self.compute.n() + s))
+                .flat_map(|t| (0..self.num_gens(s, t)).map(move |idx| Gen { s, t, idx }))
+                .collect();
+            let lifted: Vec<(Gen, BTreeSet<usize>)> = gens
+                .into_maybe_par_iter()
+                .map(|g| {
+                    let cells = NullHomotopyCells {
+                        res: self,
+                        a,
+                        b,
+                        wa,
+                        wb,
+                        seeds: &seeds,
+                        phi_a: &phi_a,
+                        phi_b: &phi_b,
+                        h_phi: &h_phi,
+                    };
+                    (g, cells.lift_or_seed(g))
+                })
+                .collect();
+            h_phi.extend(lifted);
+        }
+        h_phi
+    }
+
+    /// The motivic Massey product `⟨a, b, c⟩` of three generators (requires
+    /// `ab = 0` and `bc = 0` mod τ), over $\mathbb{F}_2[\tau]$: a list of
+    /// `(target generator, τ-power)` at bidegree `(aₛ+bₛ+cₛ−1, aₜ+bₜ+cₜ)`. A
+    /// representative modulo the indeterminacy `a·⟨·⟩ + ⟨·⟩·c`.
+    ///
+    /// Read off the lifted null-homotopy `H` of `φ_b ∘ φ_c` ([`Self::lift_nullhomotopy`]):
+    /// evaluated at the top degree `H(gₖ)` lands in `F_{aₛ}` at degree `aₜ`, and the
+    /// bracket is the coefficient of the augmentation `1 ⊗ a`, whose forced τ-power is
+    /// `w(a) + w(b) + w(c) − w(gₖ)`.
+    pub fn motivic_massey(&self, a: Gen, b: Gen, c: Gen) -> Vec<(Gen, u32)> {
+        let tot_s = a.s + b.s + c.s - 1;
+        let tot_t = a.t + b.t + c.t;
+        let h = self.lift_nullhomotopy(c, b, tot_s);
+        let a_mod = self.module(a.s);
+        let idx_1a = a_mod.operation_generator_to_index(0, 0, a.t, a.idx);
+        let wsum = self.weights[&a] + self.weights[&b] + self.weights[&c];
+        (0..self.num_gens(tot_s, tot_t))
+            .filter_map(|k| {
+                let gk = Gen { s: tot_s, t: tot_t, idx: k };
+                h.get(&gk)
+                    .filter(|support| support.contains(&idx_1a))
+                    .map(|_| (gk, (wsum - self.weights[&gk]) as u32))
+            })
+            .collect()
+    }
+
     /// Group generators by their multidegree `(n, s, w)`. Returns the per-multidegree
     /// generator-index lists (a generator's position in its list is its Sseq
     /// coordinate) and the reverse map `Gen ↦ (multidegree, position)`.
@@ -1377,6 +1475,122 @@ impl TauLift for ProductCells<'_> {
     }
 }
 
+/// The null-homotopy-lift instance of [`TauLift`]: lift `H` (a null-homotopy of
+/// `φ_b ∘ φ_a`) so that `dH + Hd = φ_bφ_a` over `A_C`. For a source generator `g`
+/// at `(s, t)`, `H(g)` lives in `F_{s+1−aₛ−bₛ}` at degree `t−aₜ−bₜ`; the defect
+/// module is `F_{s−aₛ−bₛ}`, the variable part of the defect is `d(Hg)`, and the
+/// constant part is `H(dg) + φ_b(φ_a g)`.
+struct NullHomotopyCells<'a> {
+    res: &'a MotivicResolution,
+    a: Gen,
+    b: Gen,
+    wa: i32,
+    wb: i32,
+    /// Mod-τ seeds `H(g)` from the ExtAlgebra chain homotopy.
+    seeds: &'a HashMap<Gen, BTreeSet<usize>>,
+    phi_a: &'a HashMap<Gen, BTreeSet<usize>>,
+    phi_b: &'a HashMap<Gen, BTreeSet<usize>>,
+    /// `H` lifted at strictly lower homological degree (read by `H(dg)`).
+    h_phi: &'a HashMap<Gen, BTreeSet<usize>>,
+}
+
+impl NullHomotopyCells<'_> {
+    fn shift_s(&self) -> i32 {
+        self.a.s + self.b.s
+    }
+    fn shift_t(&self) -> i32 {
+        self.a.t + self.b.t
+    }
+
+    fn lift_or_seed(&self, g: Gen) -> BTreeSet<usize> {
+        let out_s = g.s + 1 - self.shift_s();
+        let stem = g.t - g.s;
+        let in_cone = stem <= self.res.max.n() + self.res.max.s();
+        if out_s >= 1
+            && in_cone
+            && self.res.weights.contains_key(&g)
+            && self.res.lifted.contains_key(&g)
+        {
+            self.lift_cell(g)
+        } else {
+            self.seed(g)
+        }
+    }
+}
+
+impl TauLift for NullHomotopyCells<'_> {
+    fn source_weight(&self, g: Gen) -> i32 {
+        // H(g) has weight w(g) − w(a) − w(b) (it witnesses the weight-(wₐ+w_b) product).
+        self.res.weights[&g] - self.wa - self.wb
+    }
+
+    fn seed(&self, g: Gen) -> BTreeSet<usize> {
+        self.seeds.get(&g).cloned().unwrap_or_default()
+    }
+
+    fn defect_module(&self, g: Gen) -> (Arc<FreeModule<CTauAlgebra>>, i32) {
+        (self.res.module(g.s - self.shift_s()), g.t - self.shift_t())
+    }
+
+    fn defect_weight(&self, g: Gen, bidx: usize) -> i32 {
+        self.res
+            .entry_weight(g.s - self.shift_s(), g.t - self.shift_t(), bidx)
+    }
+
+    fn seed_constant(&self, g: Gen, parity: &mut FpVector) {
+        let def_mod = self.res.module(g.s - self.shift_s());
+        // H(dg): apply H to the lifted differential of g (inner = H shifts by shiftₜ).
+        let f_sm1 = self.res.module(g.s - 1);
+        for &bidx in &self.res.lifted[&g] {
+            self.res
+                .compose_into(&f_sm1, g.t, g.s - 1, self.h_phi, self.shift_t(), &def_mod, bidx, parity);
+        }
+        // φ_b(φ_a g): apply φ_b to the lifted φ_a(g) (inner = φ_b shifts by bₜ).
+        if let Some(pa) = self.phi_a.get(&g) {
+            let a_mod = self.res.module(g.s - self.a.s);
+            for &bidx in pa {
+                self.res.compose_into(
+                    &a_mod,
+                    g.t - self.a.t,
+                    g.s - self.a.s,
+                    self.phi_b,
+                    self.b.t,
+                    &def_mod,
+                    bidx,
+                    parity,
+                );
+            }
+        }
+    }
+
+    fn accumulate(&self, g: Gen, bidx: usize, parity: &mut FpVector) {
+        // d(Hg): apply the lifted differential to the current H(g) support, which
+        // lives in F_{s+1−shiftₛ}. inner = d is degree-preserving.
+        let out_mod = self.res.module(g.s + 1 - self.shift_s());
+        let inner_out = self.res.module(g.s - self.shift_s());
+        self.res.compose_into(
+            &out_mod,
+            g.t - self.shift_t(),
+            g.s + 1 - self.shift_s(),
+            &self.res.lifted,
+            0,
+            &inner_out,
+            bidx,
+            parity,
+        );
+    }
+
+    fn solve(&self, g: Gen, e: &FpVector) -> Option<FpVector> {
+        let out_s = g.s + 1 - self.shift_s();
+        let out_t = g.t - self.shift_t();
+        let d = self.res.resolution.differential(out_s);
+        let qi = d.quasi_inverse(out_t)?;
+        let mut c = FpVector::new(TWO, self.res.module(out_s).dimension(out_t));
+        qi.apply(c.as_slice_mut(), 1, e.as_slice());
+        Some(c)
+    }
+}
+
 /// Minimal $\mathbb{F}_2[\tau]$ polynomial arithmetic and Smith normal form —
 /// enough to extract the invariant factors of a small δ matrix, so the
 /// $\tau$-torsion of the motivic $E_2$ can be read as an $\mathbb{F}_2[\tau]$-module
@@ -1722,6 +1936,78 @@ mod tests {
                 assert_eq!(mod_tau, seed, "φₐ(g) mod τ ≠ Cτ product at {g:?} (a={a:?})");
             }
         }
+    }
+
+    #[test]
+    fn nullhomotopy_lift_satisfies_dh_plus_hd_eq_product() {
+        // The lifted null-homotopy H of φ_b∘φ_a (a = h₀, b = h₁, so h₀h₁ = 0) must
+        // satisfy dH + Hd = φ_bφ_a over A_C — the defining equation of the homotopy,
+        // now with τ-powers. This is the third TauLift instance's verify.
+        let res = MotivicResolution::new(Bidegree::n_s(12, 8));
+        let a = Gen { s: 1, t: 1, idx: 0 }; // h₀
+        let b = Gen { s: 1, t: 2, idx: 0 }; // h₁
+        let (shift_s, shift_t) = (a.s + b.s, a.t + b.t);
+        let max_s = 6;
+        let phi_a = res.lift_product(a, max_s);
+        let phi_b = res.lift_product(b, max_s);
+        let h = res.lift_nullhomotopy(a, b, max_s);
+
+        let mut checked = 0;
+        for (&g, hg) in &h {
+            let out_s = g.s + 1 - shift_s;
+            let stem = g.t - g.s;
+            let in_cone = stem <= res.max().n() + res.max().s();
+            if out_s < 1 || !in_cone || !res.lifted.contains_key(&g) {
+                continue;
+            }
+            // defect = d(Hg) + H(dg) + φ_b(φ_a g), in F_{s−shiftₛ} at t−shiftₜ.
+            let def_mod = res.module(g.s - shift_s);
+            let mut parity = FpVector::new(TWO, def_mod.dimension(g.t - shift_t));
+            let out_mod = res.module(out_s);
+            for &bidx in hg {
+                res.compose_into(&out_mod, g.t - shift_t, out_s, &res.lifted, 0, &def_mod, bidx, &mut parity);
+            }
+            let f_sm1 = res.module(g.s - 1);
+            for &bidx in &res.lifted[&g] {
+                res.compose_into(&f_sm1, g.t, g.s - 1, &h, shift_t, &def_mod, bidx, &mut parity);
+            }
+            if let Some(pa) = phi_a.get(&g) {
+                let a_mod = res.module(g.s - a.s);
+                for &bidx in pa {
+                    res.compose_into(&a_mod, g.t - a.t, g.s - a.s, &phi_b, b.t, &def_mod, bidx, &mut parity);
+                }
+            }
+            assert!(parity.is_zero(), "dH + Hd ≠ φ_bφ_a at {g:?}");
+            checked += 1;
+        }
+        assert!(checked > 0, "no null-homotopy cells were checked");
+    }
+
+    #[test]
+    fn motivic_massey_products_with_tau() {
+        // Triple Massey products over F₂[τ], read off the lifted null-homotopy.
+        let res = MotivicResolution::new(Bidegree::n_s(10, 7));
+        let h0 = Gen { s: 1, t: 1, idx: 0 };
+        let h1 = Gen { s: 1, t: 2, idx: 0 };
+        let h2 = Gen { s: 1, t: 4, idx: 0 };
+
+        // ⟨h₁, h₀, h₁⟩ = h₀h₂ (τ⁰): the classic Massey relation. The target is the
+        // (3,2) generator, which is exactly h₀·h₂.
+        let h0h2 = res.motivic_product(h0, h2)[0].0;
+        assert_eq!(
+            res.motivic_massey(h1, h0, h1),
+            vec![(h0h2, 0)],
+            "⟨h₁,h₀,h₁⟩ = h₀h₂"
+        );
+
+        // ⟨h₀, h₁, h₀⟩ = τ·h₁²: the C-motivic hidden-τ Massey product. The target is
+        // the (2,2) generator h₁², carried by τ¹ (the Cτ bracket vanishes).
+        let h1sq = res.motivic_product(h1, h1)[0].0;
+        assert_eq!(
+            res.motivic_massey(h0, h1, h0),
+            vec![(h1sq, 1)],
+            "⟨h₀,h₁,h₀⟩ = τ·h₁²"
+        );
     }
 
     #[test]
