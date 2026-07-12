@@ -143,6 +143,23 @@ impl std::fmt::Display for TauModule {
     }
 }
 
+/// A motivic Massey product `⟨a, b, c⟩` as a coset in the motivic Ext: a
+/// representative together with the $\mathbb{F}_2[\tau]$-submodule of indeterminacy
+/// `a·Ext + Ext·c` it is defined modulo. Produced by
+/// [`MotivicResolution::motivic_massey_coset`].
+#[derive(Debug, Clone)]
+pub struct MotivicMassey {
+    /// The bracket bidegree `(aₛ+bₛ+cₛ−1, aₜ+bₜ+cₜ)`.
+    pub degree: Bidegree,
+    /// A representative, as `(target generator, τ-power)` terms.
+    pub representative: Vec<(Gen, u32)>,
+    /// $\mathbb{F}_2[\tau]$-module generators of the indeterminacy.
+    pub indeterminacy: Vec<Vec<(Gen, u32)>>,
+    /// Whether the bracket contains zero — the representative lies in the
+    /// indeterminacy submodule (so the bracket is the trivial coset).
+    pub is_zero: bool,
+}
+
 /// A generator of the resolution, identified by homological degree `s`, internal
 /// degree `t`, and index within that `(s, t)` bidegree.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -852,6 +869,60 @@ impl MotivicResolution {
                     .map(|_| (gk, (wsum - self.weights[&gk]) as u32))
             })
             .collect()
+    }
+
+    /// The motivic Massey product `⟨a, b, c⟩` as a full coset (see [`MotivicMassey`]):
+    /// the [representative](Self::motivic_massey) together with its indeterminacy
+    /// `a·Ext^{tot−|a|} + Ext^{tot−|c|}·c` (an $\mathbb{F}_2[\tau]$-submodule), and
+    /// whether the bracket is the trivial coset. The representative is reduced
+    /// against the indeterminacy over $\mathbb{F}_2[\tau]$ to decide `is_zero`.
+    pub fn motivic_massey_coset(&self, a: Gen, b: Gen, c: Gen) -> MotivicMassey {
+        let tot_s = a.s + b.s + c.s - 1;
+        let tot_t = a.t + b.t + c.t;
+        let representative = self.motivic_massey(a, b, c);
+        let ncols = self.num_gens(tot_s, tot_t);
+
+        // Indeterminacy generators: a·y for y ∈ Ext^{tot−|a|}, and x·c for
+        // x ∈ Ext^{tot−|c|}.
+        let mut indeterminacy: Vec<Vec<(Gen, u32)>> = Vec::new();
+        let (ya_s, ya_t) = (tot_s - a.s, tot_t - a.t);
+        if ya_s >= 0 {
+            for idx in 0..self.num_gens(ya_s, ya_t) {
+                let prod = self.motivic_product(a, Gen { s: ya_s, t: ya_t, idx });
+                if !prod.is_empty() {
+                    indeterminacy.push(prod);
+                }
+            }
+        }
+        let (xc_s, xc_t) = (tot_s - c.s, tot_t - c.t);
+        if xc_s >= 0 {
+            for idx in 0..self.num_gens(xc_s, xc_t) {
+                let prod = self.motivic_product(Gen { s: xc_s, t: xc_t, idx }, c);
+                if !prod.is_empty() {
+                    indeterminacy.push(prod);
+                }
+            }
+        }
+
+        // Reduce the representative modulo the indeterminacy over F₂[τ]: pack each
+        // term list into a coefficient vector (τ-powers as F₂[τ] monomials).
+        let to_vec = |terms: &[(Gen, u32)]| -> Vec<u128> {
+            let mut v = vec![0u128; ncols];
+            for &(g, p) in terms {
+                v[g.idx] ^= 1u128 << p;
+            }
+            v
+        };
+        let rows: Vec<Vec<u128>> = indeterminacy.iter().map(|t| to_vec(t)).collect();
+        let remainder = f2tau::reduce_mod(rows, to_vec(&representative));
+        let is_zero = remainder.iter().all(|&x| x == 0);
+
+        MotivicMassey {
+            degree: Bidegree::n_s(tot_t - tot_s, tot_s),
+            representative,
+            indeterminacy,
+            is_zero,
+        }
     }
 
     /// Group generators by their multidegree `(n, s, w)`. Returns the per-multidegree
@@ -1636,6 +1707,64 @@ mod f2tau {
         q
     }
 
+    /// Reduce the vector `target` modulo the $\mathbb{F}_2[\tau]$-submodule spanned by
+    /// `rows`. Row-reduces `rows` to an echelon form (a minimal-degree pivot per
+    /// column, cleared below via Euclidean division), then reduces `target` against
+    /// the pivots. The returned remainder is a canonical coset representative — zero
+    /// iff `target` lies in the submodule.
+    #[allow(clippy::needless_range_loop)]
+    pub fn reduce_mod(mut rows: Vec<Vec<u128>>, mut target: Vec<u128>) -> Vec<u128> {
+        let ncols = target.len();
+        let nrows = rows.len();
+        let mut r = 0; // next pivot row
+        for col in 0..ncols {
+            if r >= nrows {
+                break;
+            }
+            // Euclidean-reduce column `col` among rows[r..] until one row carries the
+            // gcd there and the rest are zero in that column.
+            loop {
+                let mut piv = None;
+                for i in r..nrows {
+                    if rows[i][col] != 0
+                        && piv.is_none_or(|p: usize| deg(rows[i][col]) < deg(rows[p][col]))
+                    {
+                        piv = Some(i);
+                    }
+                }
+                let Some(pi) = piv else { break };
+                rows.swap(r, pi);
+                let p = rows[r][col];
+                let mut changed = false;
+                for i in 0..nrows {
+                    if i != r && rows[i][col] != 0 {
+                        let q = div(rows[i][col], p);
+                        if q != 0 {
+                            for j in 0..ncols {
+                                rows[i][j] ^= mul(q, rows[r][j]);
+                            }
+                            changed = true;
+                        }
+                    }
+                }
+                if !changed {
+                    break;
+                }
+            }
+            if rows[r][col] != 0 {
+                // Reduce target's entry in this pivot column modulo the pivot.
+                let q = div(target[col], rows[r][col]);
+                if q != 0 {
+                    for j in 0..ncols {
+                        target[j] ^= mul(q, rows[r][j]);
+                    }
+                }
+                r += 1;
+            }
+        }
+        target
+    }
+
     /// The non-unit invariant factors (degree $\ge 1$) of `m` over
     /// $\mathbb{F}_2[\tau]$, by Smith normal form. `m` is consumed.
     ///
@@ -2008,6 +2137,29 @@ mod tests {
             vec![(h1sq, 1)],
             "⟨h₀,h₁,h₀⟩ = τ·h₁²"
         );
+
+        // Both brackets have zero indeterminacy in this range (Ext vanishes at the
+        // relevant source degrees), so they are genuine non-trivial elements.
+        for (a, b, c) in [(h1, h0, h1), (h0, h1, h0)] {
+            let coset = res.motivic_massey_coset(a, b, c);
+            assert!(coset.indeterminacy.is_empty(), "expected zero indeterminacy");
+            assert!(!coset.is_zero, "bracket should be non-trivial");
+        }
+    }
+
+    #[test]
+    fn f2tau_reduce_mod_detects_membership() {
+        use super::f2tau::reduce_mod;
+        // Over F₂[τ], reduce vectors modulo the submodule spanned by rows.
+        // Rows: (1, τ) and (0, τ²). Column 0 pivot is the unit 1.
+        let rows = vec![vec![0b1u128, 0b10], vec![0, 0b100]];
+        // (1, τ) is in the span → reduces to 0.
+        assert!(reduce_mod(rows.clone(), vec![0b1, 0b10]).iter().all(|&x| x == 0));
+        // (1, 0): col-0 pivot kills entry 0, leaving (0, τ) from the first row; then
+        // (0, τ) mod (0, τ²) stays τ (τ has lower degree than τ²) → not in submodule.
+        assert!(reduce_mod(rows.clone(), vec![0b1, 0]).iter().any(|&x| x != 0));
+        // (0, τ³) = τ·(0, τ²) is in the span → reduces to 0.
+        assert!(reduce_mod(rows, vec![0, 0b1000]).iter().all(|&x| x == 0));
     }
 
     #[test]
