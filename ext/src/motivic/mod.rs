@@ -758,6 +758,10 @@ impl MotivicResolution {
     pub fn motivic_product(&self, a: Gen, b: Gen) -> Vec<(Gen, u32)> {
         let target_s = a.s + b.s;
         let target_t = a.t + b.t;
+        // Out of the stem-computed box ⇒ uncomputed, reported as the zero product.
+        if target_s > self.max.s() || target_t - target_s > self.compute.n() {
+            return Vec::new();
+        }
         let phi = self.lift_product(a, target_s);
         let out_mod = self.module(b.s); // φₐ(gₖ) ∈ F_{bₛ} at degree bₜ
         let idx_1b = out_mod.operation_generator_to_index(0, 0, b.t, b.idx);
@@ -790,10 +794,14 @@ impl MotivicResolution {
         let hom_b = self
             .ext()
             .generator_product_map(BidegreeGenerator::new(Bidegree::n_s(b.t - b.s, b.s), b.idx));
-        hom_a.extend_all();
-        hom_b.extend_all();
+        // Extend only to the box we lift over (stem ≤ compute.n(), s ≤ max_s); the
+        // resolution is stem-computed, so extend_all would over-reach into unresolved
+        // bidegrees.
+        let box_max = Bidegree::n_s(self.compute.n(), max_s);
+        hom_a.extend_through_stem(box_max);
+        hom_b.extend_through_stem(box_max);
         let ch = ChainHomotopy::new(hom_a, hom_b); // null-homotopy of φ_b ∘ φ_a
-        ch.extend_all();
+        ch.extend(box_max);
 
         let shift_s = a.s + b.s;
         let shift_t = a.t + b.t;
@@ -857,6 +865,9 @@ impl MotivicResolution {
     pub fn motivic_massey(&self, a: Gen, b: Gen, c: Gen) -> Vec<(Gen, u32)> {
         let tot_s = a.s + b.s + c.s - 1;
         let tot_t = a.t + b.t + c.t;
+        if tot_s > self.max.s() || tot_t - tot_s > self.compute.n() {
+            return Vec::new();
+        }
         let h = self.lift_nullhomotopy(c, b, tot_s);
         let a_mod = self.module(a.s);
         let idx_1a = a_mod.operation_generator_to_index(0, 0, a.t, a.idx);
