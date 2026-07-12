@@ -55,8 +55,11 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
+    path::PathBuf,
     sync::{Arc, OnceLock},
 };
+
+use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 
 use algebra::{
     CTauAlgebra,
@@ -277,18 +280,47 @@ pub struct MotivicResolution {
 }
 
 impl MotivicResolution {
-    /// Resolve $A_C/\tau$ through the stem/filtration box `max` and assign weights
-    /// to every generator.
+    /// Resolve the trivial module $k$ over $A_C/\tau$ (the sphere) through the box
+    /// `max`, in memory. Shorthand for [`Self::with_module`] on `k` with no save
+    /// directory.
     pub fn new(max: Bidegree) -> Self {
+        Self::with_module(Self::trivial_module(), max, None)
+    }
+
+    /// The trivial module $k = \mathbb{F}_2$ (concentrated in degree 0) over
+    /// $A_C/\tau$: the module whose resolution is the sphere.
+    pub fn trivial_module() -> Arc<FDModule<CTauAlgebra>> {
         let algebra = Arc::new(CTauAlgebra::new());
-        let trivial = Arc::new(FDModule::new(
-            Arc::clone(&algebra),
+        Arc::new(FDModule::new(
+            algebra,
             "F2".to_string(),
             BiVec::from_vec(0, vec![1]),
-        ));
+        ))
+    }
+
+    /// Resolve `module` over $A_C/\tau$ through the box `max`, lift to $A_C$, and
+    /// assign weights, optionally caching to `save_dir` on disk.
+    ///
+    /// If `save_dir` is set, the mod-τ resolution is saved/loaded there (via
+    /// [`Resolution::new_with_save`]) and the weights + lifted differentials are
+    /// cached alongside it (`motivic-lift.bin`), so re-running the same box reloads
+    /// the whole computation instead of recomputing the resolution and the lift.
+    ///
+    /// The generators of `module` must be weight-homogeneous, seeded by
+    /// [`Self::compute_weights`] from the s=0 cells; the trivial module needs no
+    /// input (its one cell is the weight-0 unit).
+    pub fn with_module(
+        module: Arc<FDModule<CTauAlgebra>>,
+        max: Bidegree,
+        save_dir: Option<PathBuf>,
+    ) -> Self {
+        let algebra = module.algebra();
         let cc: Arc<FiniteChainComplex<FDModule<CTauAlgebra>>> =
-            Arc::new(FiniteChainComplex::ccdz(trivial));
-        let resolution = Arc::new(Resolution::new(cc));
+            Arc::new(FiniteChainComplex::ccdz(module));
+        let resolution = Arc::new(
+            Resolution::new_with_save(cc, save_dir.clone())
+                .expect("failed to open the resolution save directory"),
+        );
         // Resolve the report box **plus exactly one stem** with
         // `compute_through_stem`. Ext at `(s, t)` is `H(δ)`, and δ maps `(s, t) →
         // (s-1, t)` — same internal degree, one lower Novikov filtration, hence
@@ -334,17 +366,130 @@ impl MotivicResolution {
             max,
             compute,
         };
-        let t1 = std::time::Instant::now();
-        this.compute_weights();
-        if profile {
-            eprintln!("[profile] weights:    {:?}", t1.elapsed());
-        }
-        let t2 = std::time::Instant::now();
-        this.lift();
-        if profile {
-            eprintln!("[profile] lift:       {:?}", t2.elapsed());
+        // Load the weights + lifted differentials from disk if a matching cache
+        // exists; otherwise compute them and save.
+        if this.load_lift(&save_dir) {
+            if profile {
+                eprintln!("[profile] lift:       loaded from disk");
+            }
+        } else {
+            let t1 = std::time::Instant::now();
+            this.compute_weights();
+            if profile {
+                eprintln!("[profile] weights:    {:?}", t1.elapsed());
+            }
+            let t2 = std::time::Instant::now();
+            this.lift();
+            if profile {
+                eprintln!("[profile] lift:       {:?}", t2.elapsed());
+            }
+            this.save_lift(&save_dir);
         }
         this
+    }
+
+    /// Path of the weights + lifted-differential cache within `save_dir`.
+    fn lift_cache_path(save_dir: &Option<PathBuf>) -> Option<PathBuf> {
+        save_dir.as_ref().map(|d| d.join("motivic-lift.bin"))
+    }
+
+    /// Save the weights and lifted differentials to `save_dir/motivic-lift.bin`,
+    /// tagged with the compute box so a stale cache is never loaded. No-op if
+    /// `save_dir` is `None`.
+    fn save_lift(&self, save_dir: &Option<PathBuf>) {
+        let Some(path) = Self::lift_cache_path(save_dir) else {
+            return;
+        };
+        let Ok(file) = std::fs::File::create(&path) else {
+            return;
+        };
+        let mut w = std::io::BufWriter::new(file);
+        let write = |w: &mut std::io::BufWriter<std::fs::File>| -> std::io::Result<()> {
+            // Header: magic + the (max, compute) box this lift was computed for.
+            w.write_u32::<LittleEndian>(0x004D_0004)?;
+            for v in [self.max.n(), self.max.s(), self.compute.n(), self.compute.s()] {
+                w.write_i32::<LittleEndian>(v)?;
+            }
+            // Weights: (s, t, idx, weight).
+            w.write_u64::<LittleEndian>(self.weights.len() as u64)?;
+            for (g, &wt) in self.weights.iter() {
+                w.write_i32::<LittleEndian>(g.s)?;
+                w.write_i32::<LittleEndian>(g.t)?;
+                w.write_u64::<LittleEndian>(g.idx as u64)?;
+                w.write_i32::<LittleEndian>(wt)?;
+            }
+            // Lifted differentials: (s, t, idx, len, [indices]).
+            w.write_u64::<LittleEndian>(self.lifted.len() as u64)?;
+            for (g, support) in &self.lifted {
+                w.write_i32::<LittleEndian>(g.s)?;
+                w.write_i32::<LittleEndian>(g.t)?;
+                w.write_u64::<LittleEndian>(g.idx as u64)?;
+                w.write_u64::<LittleEndian>(support.len() as u64)?;
+                for &b in support {
+                    w.write_u64::<LittleEndian>(b as u64)?;
+                }
+            }
+            Ok(())
+        };
+        let _ = write(&mut w);
+    }
+
+    /// Load the weights and lifted differentials from the cache, returning whether a
+    /// valid cache for this exact `(max, compute)` box was found and read.
+    fn load_lift(&mut self, save_dir: &Option<PathBuf>) -> bool {
+        let Some(path) = Self::lift_cache_path(save_dir) else {
+            return false;
+        };
+        let Ok(file) = std::fs::File::open(&path) else {
+            return false;
+        };
+        let mut r = std::io::BufReader::new(file);
+        let read = |r: &mut std::io::BufReader<std::fs::File>| -> std::io::Result<Option<(HashMap<Gen, i32>, HashMap<Gen, BTreeSet<usize>>)>> {
+            if r.read_u32::<LittleEndian>()? != 0x004D_0004 {
+                return Ok(None);
+            }
+            let hdr = [
+                r.read_i32::<LittleEndian>()?,
+                r.read_i32::<LittleEndian>()?,
+                r.read_i32::<LittleEndian>()?,
+                r.read_i32::<LittleEndian>()?,
+            ];
+            if hdr != [self.max.n(), self.max.s(), self.compute.n(), self.compute.s()] {
+                return Ok(None); // cache is for a different box
+            }
+            let mut weights = HashMap::new();
+            for _ in 0..r.read_u64::<LittleEndian>()? {
+                let g = Gen {
+                    s: r.read_i32::<LittleEndian>()?,
+                    t: r.read_i32::<LittleEndian>()?,
+                    idx: r.read_u64::<LittleEndian>()? as usize,
+                };
+                weights.insert(g, r.read_i32::<LittleEndian>()?);
+            }
+            let mut lifted = HashMap::new();
+            for _ in 0..r.read_u64::<LittleEndian>()? {
+                let g = Gen {
+                    s: r.read_i32::<LittleEndian>()?,
+                    t: r.read_i32::<LittleEndian>()?,
+                    idx: r.read_u64::<LittleEndian>()? as usize,
+                };
+                let len = r.read_u64::<LittleEndian>()?;
+                let mut support = BTreeSet::new();
+                for _ in 0..len {
+                    support.insert(r.read_u64::<LittleEndian>()? as usize);
+                }
+                lifted.insert(g, support);
+            }
+            Ok(Some((weights, lifted)))
+        };
+        match read(&mut r) {
+            Ok(Some((weights, lifted))) => {
+                self.weights = Arc::new(weights);
+                self.lifted = lifted;
+                true
+            }
+            _ => false,
+        }
     }
 
     /// The mod-$\tau$ resolution (the Phase 1 model).
@@ -2121,6 +2266,42 @@ mod tests {
             checked += 1;
         }
         assert!(checked > 0, "no null-homotopy cells were checked");
+    }
+
+    #[test]
+    fn save_load_round_trips() {
+        // Resolving with a save directory, then reloading, reproduces the weights and
+        // lifted differentials exactly (and hence every downstream invariant).
+        let dir = std::env::temp_dir().join(format!("motivic-save-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let max = Bidegree::n_s(8, 5);
+
+        let fresh = MotivicResolution::with_module(
+            MotivicResolution::trivial_module(),
+            max,
+            Some(dir.clone()),
+        );
+        // A second construction with the same save dir must load, not recompute.
+        let loaded = MotivicResolution::with_module(
+            MotivicResolution::trivial_module(),
+            max,
+            Some(dir.clone()),
+        );
+
+        assert_eq!(*fresh.weights, *loaded.weights, "weights survive save/load");
+        assert_eq!(fresh.lifted, loaded.lifted, "lifted differentials survive save/load");
+        // And a spot-check that downstream data agrees.
+        for s in 0..max.s() {
+            for n in 0..=8 {
+                assert_eq!(
+                    fresh.tau_module(s, n + s).torsion,
+                    loaded.tau_module(s, n + s).torsion,
+                    "τ-module at (n={n}, s={s})"
+                );
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

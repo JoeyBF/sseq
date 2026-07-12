@@ -29,7 +29,10 @@ fn main() -> anyhow::Result<()> {
         query::with_default("Max s", "8", str::parse),
     );
 
-    let res = MotivicResolution::new(max);
+    // Set MOT_SAVE=<dir> to cache the resolution + lift to disk (and reload it on a
+    // later run of the same box).
+    let save_dir = std::env::var_os("MOT_SAVE").map(std::path::PathBuf::from);
+    let res = MotivicResolution::with_module(MotivicResolution::trivial_module(), max, save_dir);
 
     let profile = std::env::var("MOT_PROFILE").is_ok();
     let t_coh = std::time::Instant::now();
