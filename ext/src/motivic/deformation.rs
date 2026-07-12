@@ -160,19 +160,25 @@ impl MotivicResolution {
                 sseq.add_permanent_class(&MultiDegreeElement::new(deg, source));
                 continue;
             }
+            // d₁ = the weight-1 part of δ. A δ with no weight-1 term makes g a
+            // d₁-cycle (its leading δ term is higher order); it is left to the
+            // τ-Bockstein zig-zag below. Checking this before sizing `target` also
+            // avoids `sseq.dimension(profile(1, deg))` on an empty d₁-target degree:
+            // that degree need not carry any generators (e.g. at the top-stem edge of
+            // the box), and `Sseq::dimension` panics on a degree that was never
+            // `set_dimension`'d. A weight-1 term, by contrast, points to a generator
+            // *at* that degree, so its presence guarantees the degree is populated.
+            if !d.iter().any(|&(_, power)| power == 1) {
+                continue;
+            }
             let target_deg = Deformation::profile(1, deg);
             let mut target = FpVector::new(TWO, sseq.dimension(target_deg));
-            let mut hit = false;
             for (gj, power) in d {
                 if power == 1 {
                     target.set_entry(pos[&gj].1, 1);
-                    hit = true;
                 }
             }
-            // No weight-1 term ⟹ g is a d₁-cycle (its leading δ term is higher order).
-            if hit {
-                sseq.add_differential(1, &MultiDegreeElement::new(deg, source), target.as_slice());
-            }
+            sseq.add_differential(1, &MultiDegreeElement::new(deg, source), target.as_slice());
         }
         sseq.update();
 
