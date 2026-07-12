@@ -409,29 +409,24 @@ impl MotivicResolution {
     /// Lift a single generator's differential to `A_C`. Parallel-safe: it reads
     /// only already-finalized `s-1` data (and the shared, thread-safe product
     /// cache), writing nothing.
+    ///
+    /// The correction is the [`TauLift`] driver applied to the differential cell
+    /// (via [`DifferentialCells`]); it runs only for generators whose δ-correction
+    /// cone stays inside the padded box. The cone of a generator at stem `n` reaches
+    /// up to stem `n + s` (each augmentation correction pushes one stem out), so a
+    /// generator with stem `> report.n + report.s` cannot converge — and it is never
+    /// referenced by the report cohomology (differentials go to stem ≤ n, δ-terms to
+    /// n+1, and the report cone is bounded by report.n + report.s). Leaving those as
+    /// their mod-τ support is correct.
     fn lift_generator(&self, g: Gen) -> BTreeSet<usize> {
-        // Start from the mod-τ differential support (τ^0 terms).
-        let mut support: BTreeSet<usize> = self
-            .resolution
-            .differential(g.s)
-            .output(g.t, g.idx)
-            .iter_nonzero()
-            .filter(|(_, v)| *v != 0)
-            .map(|(i, _)| i)
-            .collect();
-        // Correct only generators whose δ-correction cone stays inside the padded
-        // box. The cone of a generator at stem `n` reaches up to stem `n + s` (each
-        // augmentation correction pushes one stem out), so a generator with stem
-        // `> report.n + report.s` cannot converge — and it is never referenced by
-        // the report cohomology (differentials go to stem ≤ n, δ-terms to n+1, and
-        // the report cone is bounded by report.n + report.s). Leaving those as
-        // their mod-τ support is correct.
+        let cells = DifferentialCells(self);
         let stem = g.t - g.s;
         let in_cone = stem <= self.max.n() + self.max.s();
         if g.s >= 2 && in_cone && self.weights.contains_key(&g) {
-            self.correct(g, &mut support);
+            cells.lift_cell(g)
+        } else {
+            cells.seed(g)
         }
-        support
     }
 
     /// XOR the contribution of a single `d_s(g_k)` support element `bidx` (a basis
@@ -510,97 +505,6 @@ impl MotivicResolution {
             .collect()
     }
 
-    /// Correct `d_s(g_k)` (its `support`) so that `d_{s-1} d_s(g_k) = 0` over
-    /// `A_C`. The remainder is `≡ 0 mod τ`; we cancel it one $\tau$-order at a
-    /// time using the quasi-inverse of the mod-$\tau$ differential `d̄_{s-1}` (which
-    /// the engine already computed). Each correction is weight-homogeneous of the
-    /// weight matching the current $\tau$-order, so its $F_{s-1}$ support enters at
-    /// a single forced $\tau$-power.
-    fn correct(&self, g_k: Gen, support: &mut BTreeSet<usize>) {
-        let s = g_k.s;
-        let t = g_k.t;
-        let p = self.resolution.prime();
-        let w_k = self.weights[&g_k];
-        let f_sm1 = self.module(s - 1);
-        let f_sm2 = self.module(s - 2);
-        let f_sm1_dim = f_sm1.dimension(t);
-        let f_sm2_dim = f_sm2.dimension(t);
-        let engine = self.algebra.engine();
-        let d_prev = self.resolution.differential(s - 1);
-
-        // The quasi-inverse of the mod-τ differential at this degree. If it was
-        // not computed (a generator just past the padded box), skip correction.
-        let Some(qi) = d_prev.quasi_inverse(t) else {
-            return;
-        };
-
-        // Maintain the composite `d_{s-1} d_s(g_k)` incrementally. `composite` is
-        // mod-2 linear in the support, so instead of re-sweeping the whole support
-        // every τ-order (the old inner loop), we keep a running parity vector and
-        // XOR in only each term we toggle. Seed it with the current support.
-        let mut parity = FpVector::new(p, f_sm2_dim);
-        for &bidx in support.iter() {
-            self.accumulate_term(s, t, &f_sm1, &f_sm2, engine, bidx, &mut parity);
-        }
-
-        for _ in 0..256 {
-            // The lowest τ-order among the surviving error terms.
-            let min_power = parity
-                .iter_nonzero()
-                .map(|(fidx, _)| self.entry_weight(s - 2, t, fidx) - w_k)
-                .min();
-            let Some(min_power) = min_power else {
-                return; // d_{s-1} d_s(g_k) = 0
-            };
-            assert!(
-                min_power >= 1,
-                "mod-τ composite d̄² ≠ 0 at (s={}, t={}, idx={}) — model is not a complex",
-                g_k.s,
-                g_k.t,
-                g_k.idx
-            );
-
-            // The error at the lowest τ-order, as an F_{s-2} vector.
-            let mut e_bar = FpVector::new(p, f_sm2_dim);
-            for (fidx, _) in parity.iter_nonzero() {
-                if self.entry_weight(s - 2, t, fidx) - w_k == min_power {
-                    e_bar.set_entry(fidx, 1);
-                }
-            }
-
-            // Solve d̄_{s-1}(c') = e_bar via the stored quasi-inverse.
-            let mut c = FpVector::new(p, f_sm1_dim);
-            qi.apply(c.as_slice_mut(), 1, e_bar.as_slice());
-
-            // Toggle c's support into d_s(g_k), updating the running parity in
-            // lockstep. Each such basis element is forced (by weight) to τ-power
-            // min_power, cancelling this order.
-            for (idx, v) in c.iter_nonzero() {
-                if v == 0 {
-                    continue;
-                }
-                debug_assert_eq!(
-                    self.entry_weight(s - 1, t, idx) - w_k,
-                    min_power,
-                    "correction term at inconsistent τ-power"
-                );
-                if !support.insert(idx) {
-                    support.remove(&idx);
-                }
-                self.accumulate_term(s, t, &f_sm1, &f_sm2, engine, idx, &mut parity);
-            }
-        }
-        // Non-convergence within the iteration cap means the generator's cone
-        // reached past the padded box — which only happens outside the report
-        // cone (report-cone generators converge, their cones staying inside the
-        // box). Such generators are never read by the report cohomology, so we
-        // leave the partial lift rather than panic. `verify_d_squared_zero` guards
-        // the report box in tests.
-        tracing::debug!(
-            "motivic lift did not converge at (s={}, t={}, idx={}); leaving partial (outside report cone)",
-            g_k.s, g_k.t, g_k.idx
-        );
-    }
 
     /// Assign a motivic weight to every generator by descending its differential:
     /// weight-homogeneity forces `w(g) = w(m) + w(g')` for every term `m ⊗ g'` of
@@ -1100,6 +1004,163 @@ impl MotivicResolution {
                 }
             }
         }
+    }
+}
+
+/// The shared τ-adic lifting problem, in the style of [`crate::secondary::SecondaryLift`].
+///
+/// Every "make it motivic" step in this module has the same shape: a map given over
+/// the mod-τ algebra $A_C/\tau$ must be lifted to an honest map over $A_C$
+/// (coefficients in $\mathbb{F}_2[\tau]$). The lift starts from the mod-τ datum (the
+/// $\tau^0$ part) and cancels the τ-divisible *defect* — the amount by which the
+/// defining equation fails over $A_C$ — one weight-order at a time, solving each
+/// order with the quasi-inverse of the target complex's mod-τ differential.
+/// Weight-homogeneity forces every correction to a single τ-power, so the
+/// order-by-order cancellation converges.
+///
+/// The differential lift ($d^2 = 0$, [`DifferentialCells`]) is the first instance;
+/// the product lift ($d\varphi = \varphi d$) and — eventually — the chain-homotopy
+/// lift (Massey products) are the same driver with a different *defect*. An
+/// implementor supplies the object-specific hooks and inherits [`Self::lift_cell`].
+trait TauLift {
+    /// The weight the defect is graded against — the source generator's weight.
+    fn source_weight(&self, g: Gen) -> i32;
+
+    /// The mod-τ ($\tau^0$) support to start from, as basis-element indices of the
+    /// output module (where the lifted support and the corrections live).
+    fn seed(&self, g: Gen) -> BTreeSet<usize>;
+
+    /// The defect module `(module, t)` — where the error `e` lives — used to size
+    /// the running parity vector.
+    fn defect_module(&self, g: Gen) -> (Arc<FreeModule<CTauAlgebra>>, i32);
+
+    /// The weight of defect-module basis element `bidx`.
+    fn defect_weight(&self, g: Gen, bidx: usize) -> i32;
+
+    /// Seed the running defect with the part that does not depend on the output
+    /// support (e.g. the `φ(dg)` term of a chain map). Default: none — the
+    /// differential's `d²` is entirely a function of its support.
+    fn seed_constant(&self, _g: Gen, _parity: &mut FpVector) {}
+
+    /// XOR into `parity` the defect contribution of output-support element `bidx`.
+    fn accumulate(&self, g: Gen, bidx: usize, parity: &mut FpVector);
+
+    /// Solve `d̄(c) = e` for a correction `c` in the output module, via the target's
+    /// mod-τ quasi-inverse. `None` when the quasi-inverse is unavailable (a cell just
+    /// past the padded box) — the driver then leaves the mod-τ seed uncorrected.
+    fn solve(&self, g: Gen, e: &FpVector) -> Option<FpVector>;
+
+    /// The shared driver: cancel the τ-divisible defect one weight-order at a time.
+    /// Returns the lifted support — the seed if there is nothing to correct, or a
+    /// partial lift if a cell outside the report cone does not converge (those are
+    /// never read by the report cohomology).
+    fn lift_cell(&self, g: Gen) -> BTreeSet<usize> {
+        let (def_mod, def_t) = self.defect_module(g);
+        let def_dim = def_mod.dimension(def_t);
+        let w_k = self.source_weight(g);
+
+        // Maintain the defect incrementally: it is mod-2 linear in the support, so we
+        // keep a running parity vector and XOR in only each term we toggle.
+        let mut support = self.seed(g);
+        let mut parity = FpVector::new(TWO, def_dim);
+        self.seed_constant(g, &mut parity);
+        for &bidx in support.iter() {
+            self.accumulate(g, bidx, &mut parity);
+        }
+
+        for _ in 0..256 {
+            // The lowest τ-order among the surviving error terms.
+            let Some(min_power) = parity
+                .iter_nonzero()
+                .map(|(fidx, _)| self.defect_weight(g, fidx) - w_k)
+                .min()
+            else {
+                return support; // defect fully cancelled
+            };
+            assert!(
+                min_power >= 1,
+                "mod-τ defect ≠ 0 at (s={}, t={}, idx={}) — the model is not a complex",
+                g.s, g.t, g.idx
+            );
+
+            // The error at that lowest τ-order, as a defect-module vector.
+            let mut e = FpVector::new(TWO, def_dim);
+            for (fidx, _) in parity.iter_nonzero() {
+                if self.defect_weight(g, fidx) - w_k == min_power {
+                    e.set_entry(fidx, 1);
+                }
+            }
+
+            // Solve d̄(c) = e and toggle c into the support, updating the running
+            // parity in lockstep. Each correction term is forced (by weight) to
+            // τ-power min_power, cancelling this order.
+            let Some(c) = self.solve(g, &e) else {
+                return support; // out of range: leave the partial lift
+            };
+            for (idx, v) in c.iter_nonzero() {
+                if v == 0 {
+                    continue;
+                }
+                if !support.insert(idx) {
+                    support.remove(&idx);
+                }
+                self.accumulate(g, idx, &mut parity);
+            }
+        }
+        // Non-convergence within the cap: only outside the report cone (report-cone
+        // cells converge). Never read by the report cohomology, so leave the partial.
+        tracing::debug!(
+            "motivic lift did not converge at (s={}, t={}, idx={}); leaving partial (outside report cone)",
+            g.s, g.t, g.idx
+        );
+        support
+    }
+}
+
+/// The differential-lift instance of [`TauLift`]: lift `d_s(g)` so that
+/// `d_{s-1} d_s(g) = 0` over `A_C`. Output module `F_{s-1}`, defect module
+/// `F_{s-2}`, defect the composite `d_{s-1} d_s(g)` (accumulated by
+/// [`MotivicResolution::accumulate_term`]); `d̄_{s-1}`'s quasi-inverse solves the
+/// corrections.
+struct DifferentialCells<'a>(&'a MotivicResolution);
+
+impl TauLift for DifferentialCells<'_> {
+    fn source_weight(&self, g: Gen) -> i32 {
+        self.0.weights[&g]
+    }
+
+    fn seed(&self, g: Gen) -> BTreeSet<usize> {
+        self.0
+            .resolution
+            .differential(g.s)
+            .output(g.t, g.idx)
+            .iter_nonzero()
+            .filter(|(_, v)| *v != 0)
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    fn defect_module(&self, g: Gen) -> (Arc<FreeModule<CTauAlgebra>>, i32) {
+        (self.0.module(g.s - 2), g.t)
+    }
+
+    fn defect_weight(&self, g: Gen, bidx: usize) -> i32 {
+        self.0.entry_weight(g.s - 2, g.t, bidx)
+    }
+
+    fn accumulate(&self, g: Gen, bidx: usize, parity: &mut FpVector) {
+        let f_sm1 = self.0.module(g.s - 1);
+        let f_sm2 = self.0.module(g.s - 2);
+        self.0
+            .accumulate_term(g.s, g.t, &f_sm1, &f_sm2, self.0.algebra.engine(), bidx, parity);
+    }
+
+    fn solve(&self, g: Gen, e: &FpVector) -> Option<FpVector> {
+        let d_prev = self.0.resolution.differential(g.s - 1);
+        let qi = d_prev.quasi_inverse(g.t)?;
+        let mut c = FpVector::new(TWO, self.0.module(g.s - 1).dimension(g.t));
+        qi.apply(c.as_slice_mut(), 1, e.as_slice());
+        Some(c)
     }
 }
 
