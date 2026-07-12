@@ -6,9 +6,12 @@
 //!
 //! - **alg-Nov** — the algebraic Novikov $E_2$ (set $\tau = 0$: generator counts).
 //! - **classical** — the classical Adams $E_2$ (invert $\tau$: free rank of $H(δ)$).
-//! - **τ-tors** — a `*` marks bidegrees carrying genuine motivic $\tau$-torsion
-//!   (a class that dies when $\tau$ is inverted, e.g. the $h_1$-tower beyond
-//!   $h_1^3$).
+//! - **τ-torsion** — the $\tau$-torsion part of the motivic $E_2$ as an
+//!   $\mathbb{F}_2[\tau]$-module (structure theorem): the orders of the
+//!   $\mathbb{F}_2[\tau]/\tau^k$ summands, e.g. `τ` or `τ^2` or `τ+τ`. Empty when
+//!   the bidegree is $\tau$-torsion-free. (A class is $\tau^k$-torsion when its own
+//!   δ is $\tau^k$ times a cycle, so the $h_1$-tower torsion sits on $h_1^n$ itself
+//!   — e.g. $h_1^4$ at $(4, 4)$.)
 //!
 //! Output is `n,s,alg_nov,classical,tau_torsion`, one line per nonzero bidegree.
 //! Run with e.g. `cargo run --release --example resolve_motivic` (reads `Max n` /
@@ -45,14 +48,17 @@ fn main() -> anyhow::Result<()> {
         .filter_map(|(s, n)| {
             let t = n + s;
             let alg_nov = res.algebraic_novikov_rank(s, t);
-            let classical = res.classical_ext_rank(s, t);
-            let torsion = res.has_tau_torsion(s, t);
-            (alg_nov > 0 || classical > 0 || torsion).then(|| {
-                (
-                    s,
-                    n,
-                    format!("{n},{s},{alg_nov},{classical},{}", if torsion { "*" } else { "" }),
-                )
+            let module = res.tau_module(s, t);
+            let classical = module.free;
+            // The τ-torsion part: orders of the F₂[τ]/τ^k summands, e.g. "τ+τ^2".
+            let torsion: String = module
+                .torsion
+                .iter()
+                .map(|&k| if k == 1 { "τ".to_string() } else { format!("τ^{k}") })
+                .collect::<Vec<_>>()
+                .join("+");
+            (alg_nov > 0 || classical > 0 || !torsion.is_empty()).then(|| {
+                (s, n, format!("{n},{s},{alg_nov},{classical},{torsion}"))
             })
         })
         .collect();

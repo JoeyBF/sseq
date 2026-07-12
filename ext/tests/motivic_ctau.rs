@@ -129,13 +129,15 @@ fn motivic_chart_matches_golden() {
         for n in 0..=max.n() {
             let t = n + s;
             let alg_nov = res.algebraic_novikov_rank(s, t);
-            let classical = res.classical_ext_rank(s, t);
-            let torsion = res.has_tau_torsion(s, t);
-            if alg_nov > 0 || classical > 0 || torsion {
-                out.push_str(&format!(
-                    "{n},{s},{alg_nov},{classical},{}\n",
-                    if torsion { "*" } else { "" }
-                ));
+            let module = res.tau_module(s, t);
+            let torsion: String = module
+                .torsion
+                .iter()
+                .map(|&k| if k == 1 { "τ".to_string() } else { format!("τ^{k}") })
+                .collect::<Vec<_>>()
+                .join("+");
+            if alg_nov > 0 || module.free > 0 || !torsion.is_empty() {
+                out.push_str(&format!("{n},{s},{alg_nov},{},{torsion}\n", module.free));
             }
         }
     }

@@ -48,9 +48,10 @@
 //! - **invert $\tau$** — the free rank (all generators): the classical Adams $E_2$
 //!   ([`MotivicResolution::classical_ext_rank`], regressed against `Ext_A`).
 //! - **$\tau = 0$** — the generator counts: the algebraic Novikov $E_2$ (Phase 1).
-//! - **keep $\tau$** — free plus $\tau$-torsion: the motivic $E_2$, including the
-//!   $h_1$-tower classes ($h_1^n$ for all $n$) that the classical page kills
-//!   ([`MotivicResolution::has_tau_torsion`]).
+//! - **keep $\tau$** — free plus $\tau$-torsion: the motivic $E_2$ as a full
+//!   $\mathbb{F}_2[\tau]$-module ([`MotivicResolution::tau_module`], structure
+//!   theorem), including the $h_1$-tower classes ($h_1^n$, which are
+//!   $\mathbb{F}_2[\tau]/\tau$-torsion for $n \ge 4$) that the classical page kills.
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
@@ -103,6 +104,42 @@ impl SseqProfile<3> for Deformation {
 
     fn differential_length(offset: MultiDegree<3>) -> i32 {
         offset.coords()[2] // the weight component
+    }
+}
+
+/// The motivic Adams $E_2$ at one bidegree as an $\mathbb{F}_2[\tau]$-module
+/// (structure theorem over the PID $\mathbb{F}_2[\tau]$):
+/// $\mathbb{F}_2[\tau]^{\,\mathrm{free}} \oplus \bigoplus_i
+/// \mathbb{F}_2[\tau]/\tau^{k_i}$. Produced by [`MotivicResolution::tau_module`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TauModule {
+    /// The free rank — the classical Adams $E_2$ (invert $\tau$).
+    pub free: usize,
+    /// The orders $k_i$ of the $\tau$-torsion summands $\mathbb{F}_2[\tau]/\tau^{k_i}$,
+    /// ascending. Empty iff the module is $\tau$-torsion-free.
+    pub torsion: Vec<u32>,
+}
+
+impl std::fmt::Display for TauModule {
+    /// A compact chart label, e.g. `2` (free rank 2, no torsion), `τ` (one
+    /// $\mathbb{F}_2[\tau]/\tau$), `1+τ²`, or `·` for the zero module.
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        let mut parts: Vec<String> = Vec::new();
+        if self.free > 0 {
+            parts.push(self.free.to_string());
+        }
+        for &k in &self.torsion {
+            parts.push(if k == 1 {
+                "τ".to_string()
+            } else {
+                format!("τ^{k}")
+            });
+        }
+        if parts.is_empty() {
+            write!(f, "·")
+        } else {
+            write!(f, "{}", parts.join("+"))
+        }
     }
 }
 
@@ -942,28 +979,73 @@ impl MotivicResolution {
             .sum()
     }
 
-    /// Whether `(s, t)` carries a $\tau$-torsion class in the motivic $E_2$: some
-    /// weight slice has larger `H(δ)` than the free (classical) rank. The extra
-    /// dimension is a class that dies when $\tau$ is inverted — genuine motivic
-    /// $\tau$-torsion.
+    /// The motivic Adams $E_2$ at `(s, t)` as an $\mathbb{F}_2[\tau]$-module, via the
+    /// structure theorem for modules over the PID $\mathbb{F}_2[\tau]$:
+    /// $$H(\delta)^{n,s} \;\cong\; \mathbb{F}_2[\tau]^{\,\mathrm{free}} \;\oplus\;
+    /// \bigoplus_i \mathbb{F}_2[\tau]/\tau^{k_i}.$$
+    /// The free rank is the classical Adams $E_2$ (invert $\tau$); the torsion orders
+    /// $k_i$ are the sizes of the $\tau$-torsion summands the classical page cannot
+    /// see (e.g. the $h_1$-tower).
     ///
-    /// Computed on the direct (ExtAlgebra) cohomology path. The equivalent read off
-    /// the Sseq — counting $d_r$ sources — needs care to exclude differential
-    /// *targets* (τ-divisible free classes, not torsion), so it is deferred; the
-    /// free rank ([`Self::classical_ext_rank`]) is the Sseq quantity here.
+    /// $(C^\bullet, \delta)$ is a complex of *free* $\mathbb{F}_2[\tau]$-modules of
+    /// generators. `Ext = H(δ)` is its *cohomology*, so by universal coefficients its
+    /// torsion at $s$ is the torsion of the homology one degree down, i.e. the
+    /// non-unit invariant factors of the *outgoing* boundary
+    /// $\delta\colon \mathrm{gens}(s, t) \to \mathrm{gens}(s{-}1, t)$: a class is
+    /// $\tau^{k}$-torsion exactly when its own δ is $\tau^{k}$ times a cycle
+    /// (e.g. $\delta(h_1^4) = \tau\, y$ puts $\mathbb{F}_2[\tau]/\tau$ at $h_1^4$).
+    /// Those factors are read off the Smith normal form of that δ matrix over
+    /// $\mathbb{F}_2[\tau]$ ([`Self::tau_torsion_orders`]); the only homogeneous prime
+    /// is $\tau$, so every invariant factor is a power $\tau^{k_i}$. This is the same
+    /// data the deformation SS carries as its $d_r$ differentials *supported* at
+    /// `(n, s)` (order $= r$), computed locally here so it is exact up to the resolved
+    /// range rather than the SS's report box.
+    pub fn tau_module(&self, s: i32, t: i32) -> TauModule {
+        TauModule {
+            free: self.classical_ext_rank(s, t),
+            torsion: self.tau_torsion_orders(s, t),
+        }
+    }
+
+    /// Whether `(s, t)` carries a $\tau$-torsion class in the motivic $E_2$ — a class
+    /// that dies when $\tau$ is inverted, invisible to the classical Adams $E_2$.
+    /// The boolean shadow of [`Self::tau_module`].
     pub fn has_tau_torsion(&self, s: i32, t: i32) -> bool {
-        let b = Bidegree::n_s(t - s, s);
-        let ext = self.ext();
-        let free = ext.cohomology_dimension(b).unwrap_or(0);
-        // The generator weights at these degrees bound the useful cap range.
-        let weights: Vec<i32> = ((s - 1).max(0)..=s + 1)
-            .flat_map(|ss| (0..self.num_gens(ss, t)).map(move |idx| (ss, idx)))
-            .filter_map(|(ss, idx)| self.weights.get(&Gen { s: ss, t, idx }).copied())
+        !self.tau_torsion_orders(s, t).is_empty()
+    }
+
+    /// The orders $k_i$ of the $\tau$-torsion summands $\mathbb{F}_2[\tau]/\tau^{k_i}$
+    /// of the motivic $E_2$ at `(s, t)`, ascending: the non-unit invariant factors
+    /// (as powers of $\tau$) of the outgoing coboundary
+    /// $\delta\colon \mathrm{gens}(s, t) \to \mathrm{gens}(s{-}1, t)$, over
+    /// $\mathbb{F}_2[\tau]$. (Outgoing, not incoming: `Ext = H(δ)` is cohomology, so
+    /// the torsion sits on the class whose own δ is $\tau$-divisible.)
+    fn tau_torsion_orders(&self, s: i32, t: i32) -> Vec<u32> {
+        if s < 1 {
+            return Vec::new(); // the s = 0 unit is free; no outgoing δ.
+        }
+        let rows = self.num_gens(s, t);
+        let cols = self.num_gens(s - 1, t);
+        if rows == 0 || cols == 0 {
+            return Vec::new();
+        }
+        // The δ matrix over F₂[τ]: entry (i, j) is the sum of τ^power over the terms
+        // of δ(gᵢ) hitting the j-th generator at (s-1, t). Packed as a bitmask of
+        // τ-exponents (F₂ coefficients).
+        let mut m = vec![vec![0u128; cols]; rows];
+        for (ri, row) in m.iter_mut().enumerate() {
+            for (gj, power) in self.delta(Gen { s, t, idx: ri }) {
+                if gj.s == s - 1 && gj.idx < cols {
+                    row[gj.idx] ^= 1u128 << power;
+                }
+            }
+        }
+        let mut orders: Vec<u32> = f2tau::invariant_factors(m)
+            .into_iter()
+            .map(|f| f2tau::deg(f) as u32)
             .collect();
-        let (Some(&lo), Some(&hi)) = (weights.iter().min(), weights.iter().max()) else {
-            return false;
-        };
-        (lo..=hi).any(|cap| ext.cohomology_dimension_capped(b, cap).unwrap_or(0) > free)
+        orders.sort_unstable();
+        orders
     }
 
     /// The mod-$\tau$ support of `d_s(g)`: the lifted terms whose forced
@@ -1018,6 +1100,147 @@ impl MotivicResolution {
                 }
             }
         }
+    }
+}
+
+/// Minimal $\mathbb{F}_2[\tau]$ polynomial arithmetic and Smith normal form —
+/// enough to extract the invariant factors of a small δ matrix, so the
+/// $\tau$-torsion of the motivic $E_2$ can be read as an $\mathbb{F}_2[\tau]$-module
+/// (see [`MotivicResolution::tau_module`]).
+///
+/// Polynomials are packed into a `u128` bitmask: bit `i` is the $\mathbb{F}_2$
+/// coefficient of $\tau^i$. δ matrices here are tiny and their entries low-degree,
+/// so 128 exponent bits are ample.
+mod f2tau {
+    /// Degree of `a` (`-1` for the zero polynomial).
+    pub fn deg(a: u128) -> i32 {
+        if a == 0 {
+            -1
+        } else {
+            127 - a.leading_zeros() as i32
+        }
+    }
+
+    /// Polynomial product over $\mathbb{F}_2$ (carryless multiply).
+    fn mul(mut a: u128, b: u128) -> u128 {
+        let mut r = 0;
+        let mut shift = 0;
+        while a != 0 {
+            if a & 1 == 1 {
+                r ^= b << shift;
+            }
+            a >>= 1;
+            shift += 1;
+        }
+        r
+    }
+
+    /// Quotient $\lfloor a / b \rfloor$ over $\mathbb{F}_2[\tau]$ (the remainder is
+    /// dropped). `b` must be nonzero.
+    fn div(a: u128, b: u128) -> u128 {
+        let db = deg(b);
+        let (mut q, mut rem) = (0u128, a);
+        while deg(rem) >= db {
+            let sh = deg(rem) - db;
+            q ^= 1u128 << sh;
+            rem ^= b << sh;
+        }
+        q
+    }
+
+    /// The non-unit invariant factors (degree $\ge 1$) of `m` over
+    /// $\mathbb{F}_2[\tau]$, by Smith normal form. `m` is consumed.
+    ///
+    /// Standard Euclidean SNF: pivot on the minimum-degree nonzero entry, clear its
+    /// row and column by division, and pull any lower-degree residual back into the
+    /// pivot until the pivot divides the remaining block; then recurse on the
+    /// complementary submatrix.
+    // The row/column clears index two rows (or columns) at once — `m[i][j]` against
+    // `m[r0][j]` — so index loops are clearer than split-borrow iterator gymnastics.
+    #[allow(clippy::needless_range_loop)]
+    pub fn invariant_factors(mut m: Vec<Vec<u128>>) -> Vec<u128> {
+        let rows = m.len();
+        let cols = m.first().map_or(0, Vec::len);
+        let mut factors = Vec::new();
+        let (mut r0, mut c0) = (0, 0);
+        while r0 < rows && c0 < cols {
+            // Pivot = minimum-degree nonzero entry of the active submatrix.
+            let mut piv: Option<(usize, usize)> = None;
+            for i in r0..rows {
+                for j in c0..cols {
+                    if m[i][j] != 0
+                        && piv.is_none_or(|(pi, pj)| deg(m[i][j]) < deg(m[pi][pj]))
+                    {
+                        piv = Some((i, j));
+                    }
+                }
+            }
+            let Some((pi, pj)) = piv else { break };
+            m.swap(r0, pi);
+            for row in &mut m {
+                row.swap(c0, pj);
+            }
+
+            loop {
+                let mut changed = false;
+                let p = m[r0][c0];
+                for i in 0..rows {
+                    if i != r0 && m[i][c0] != 0 {
+                        let q = div(m[i][c0], p);
+                        if q != 0 {
+                            for j in 0..cols {
+                                m[i][j] ^= mul(q, m[r0][j]);
+                            }
+                            changed = true;
+                        }
+                    }
+                }
+                let p = m[r0][c0];
+                for j in 0..cols {
+                    if j != c0 && m[r0][j] != 0 {
+                        let q = div(m[r0][j], p);
+                        if q != 0 {
+                            for i in 0..rows {
+                                m[i][j] ^= mul(q, m[i][c0]);
+                            }
+                            changed = true;
+                        }
+                    }
+                }
+                // A nonzero residual left in the pivot row/column (degree below the
+                // pivot): swap it in and keep reducing.
+                let mut resid = None;
+                for i in r0 + 1..rows {
+                    if m[i][c0] != 0 {
+                        resid = Some((i, c0));
+                    }
+                }
+                for j in c0 + 1..cols {
+                    if m[r0][j] != 0 {
+                        resid = Some((r0, j));
+                    }
+                }
+                if let Some((i, j)) = resid {
+                    m.swap(r0, i);
+                    if j != c0 {
+                        for row in &mut m {
+                            row.swap(c0, j);
+                        }
+                    }
+                    changed = true;
+                }
+                if !changed {
+                    break;
+                }
+            }
+
+            if deg(m[r0][c0]) >= 1 {
+                factors.push(m[r0][c0]);
+            }
+            r0 += 1;
+            c0 += 1;
+        }
+        factors
     }
 }
 
@@ -1217,24 +1440,75 @@ mod tests {
     #[test]
     fn anchor_keep_tau_has_h1_tower_torsion() {
         // Anchor 3: keeping τ, the motivic E₂ carries τ-torsion the classical page
-        // does not. The cleanest witness is the h₁-tower: h₁ⁿ ∈ Ext^{n,2n} is
-        // nonzero for all n motivically, but classically h₁⁴ = 0. So at (s,t)=(4,8)
-        // the free (classical) rank is 0, yet a τ-torsion class is present.
+        // does not. The cleanest witness is the h₁-tower: h₁ⁿ = (h₁)ⁿ ∈ Ext^{n,2n}
+        // is nonzero for all n motivically, but classically h₁⁴ = 0. So at
+        // (s,t)=(4,8) the free (classical) rank is 0, yet h₁⁴ itself is a τ-torsion
+        // class there — δ(h₁⁴) = τ·y, so τ·[h₁⁴] = 0: an F₂[τ]/τ summand at (4,4).
         let max = Bidegree::n_s(8, 5);
         let res = MotivicResolution::new(max);
 
+        let m = res.tau_module(4, 8);
+        assert_eq!(m.free, 0, "classical h₁⁴ should vanish (free rank 0)");
         assert_eq!(
-            res.classical_ext_rank(4, 8),
-            0,
-            "classical h₁⁴ should vanish"
+            m.torsion,
+            vec![1],
+            "h₁⁴ at (s=4, t=8) should be a single F₂[τ]/τ torsion summand"
         );
-        assert!(
-            res.has_tau_torsion(4, 8),
-            "motivic E₂ should carry τ-torsion (h₁⁴) at (s=4, t=8)"
-        );
+        assert!(res.has_tau_torsion(4, 8));
 
         // Sanity: h₁³ (s=3, t=6) is already nonzero classically, so it is free —
         // not flagged as (extra) torsion beyond its classical class.
-        assert_eq!(res.classical_ext_rank(3, 6), 1, "classical h₁³ should survive");
+        let m3 = res.tau_module(3, 6);
+        assert_eq!(m3.free, 1, "classical h₁³ should survive");
+        assert!(m3.torsion.is_empty(), "h₁³ is free, not τ-torsion");
+    }
+
+    #[test]
+    fn tau_module_h1_tower_is_free_then_tau_torsion() {
+        // The whole h₁-tower h₁ⁿ ∈ Ext^{n,2n} (stem n, filtration n): free (a genuine
+        // classical class) for n ≤ 3, then a single F₂[τ]/τ summand for n ≥ 4 — the
+        // motivic τ-torsion the classical page cannot see.
+        let res = MotivicResolution::new(Bidegree::n_s(10, 9));
+        for n in 1..=3 {
+            let m = res.tau_module(n, 2 * n);
+            assert_eq!((m.free, m.torsion.as_slice()), (1, [].as_slice()), "h₁^{n} free");
+        }
+        for n in 4..=8 {
+            let m = res.tau_module(n, 2 * n);
+            assert_eq!((m.free, m.torsion.as_slice()), (0, [1].as_slice()), "h₁^{n} = F₂[τ]/τ");
+        }
+    }
+
+    #[test]
+    fn tau_module_torsion_matches_deformation_sseq_sources() {
+        // The F₂[τ]-module torsion (SNF of the outgoing δ) is exactly the data the
+        // deformation SS carries: a class at (n, s) is F₂[τ]/τ^r-torsion iff it
+        // supports a d_r there. Cross-check the local SNF reading against the SS's
+        // differential sources over the interior (away from the report edge, where
+        // the finite compute box makes the SS over-count).
+        let res = MotivicResolution::new(Bidegree::n_s(16, 11));
+        let sseq = res.deformation_sseq();
+
+        let mut sources: HashMap<(i32, i32), Vec<i32>> = HashMap::new();
+        for b in sseq.iter_degrees() {
+            let [n, s, _] = b.coords();
+            let diffs = sseq.differentials(b);
+            for r in diffs.min_degree()..diffs.len() {
+                for _ in 0..diffs[r].get_source_target_pairs().len() {
+                    sources.entry((n, s)).or_default().push(r);
+                }
+            }
+        }
+
+        for n in 0..=12 {
+            for s in 1..=10 {
+                let mut snf: Vec<i32> =
+                    res.tau_module(s, n + s).torsion.iter().map(|&k| k as i32).collect();
+                snf.sort_unstable();
+                let mut ss = sources.get(&(n, s)).cloned().unwrap_or_default();
+                ss.sort_unstable();
+                assert_eq!(snf, ss, "torsion vs d_r sources at (n={n}, s={s})");
+            }
+        }
     }
 }
