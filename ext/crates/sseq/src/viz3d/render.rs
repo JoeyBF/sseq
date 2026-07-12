@@ -94,12 +94,32 @@ pub fn run(scene: SseqScene) {
         edges.set_instances(i);
     }
     if let Some(r) = page_rs.get(current) {
-        println!("Showing page E_{r}  (←/→ to change, {n_pages} pages)");
+        println!("Showing page E_{r}  ({n_pages} pages)");
     }
+    println!("Controls: left-drag orbit · right/middle-drag pan · scroll zoom · ←/→ change page");
 
     window.render_loop(move |mut frame_input| {
         control.handle_events(&mut camera, &mut frame_input.events);
         camera.set_viewport(frame_input.viewport);
+
+        // Pan with a right- or middle-mouse drag (OrbitControl only orbits + zooms). Translate the
+        // camera in its screen plane and shift the orbit target with it, so orbiting stays centered.
+        for event in &frame_input.events {
+            if let Event::MouseMotion {
+                delta,
+                button: Some(MouseButton::Right | MouseButton::Middle),
+                handled: false,
+                ..
+            } = event
+            {
+                let dist = camera.position().distance(control.target).max(0.1);
+                let speed = dist * 0.0015;
+                let pan = camera.right_direction() * (-delta.0 * speed)
+                    + camera.up_orthogonal() * (delta.1 * speed);
+                camera.translate(pan);
+                control.target += pan;
+            }
+        }
 
         let mut changed = false;
         for event in &frame_input.events {
