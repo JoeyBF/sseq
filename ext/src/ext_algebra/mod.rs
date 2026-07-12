@@ -174,11 +174,15 @@ impl<CC: FreeChainComplex> ExtAlgebra<CC> {
         let Some(d) = &self.differential else {
             return Some(self.dimension(b));
         };
-        let gens = d.graded_dimension(b, cap).unwrap_or_else(|| self.dimension(b));
+        let gens = d
+            .graded_dimension(b, cap)
+            .unwrap_or_else(|| self.dimension(b));
         let shift = d.shift();
         let source = Bidegree::n_s(b.n() - shift.n(), b.s() - shift.s());
         let rank_out = d.matrix_capped(b, cap)?.row_reduce();
-        let rank_in = d.matrix_capped(source, cap).map_or(0, |mut m| m.row_reduce());
+        let rank_in = d
+            .matrix_capped(source, cap)
+            .map_or(0, |mut m| m.row_reduce());
         Some(gens - rank_out - rank_in)
     }
 

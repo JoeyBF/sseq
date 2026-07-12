@@ -50,7 +50,13 @@ fn main() -> anyhow::Result<()> {
             let torsion: String = m
                 .torsion
                 .iter()
-                .map(|&k| if k == 1 { "τ".to_string() } else { format!("τ^{k}") })
+                .map(|&k| {
+                    if k == 1 {
+                        "τ".to_string()
+                    } else {
+                        format!("τ^{k}")
+                    }
+                })
                 .collect::<Vec<_>>()
                 .join("+");
             if alg_nov > 0 || m.free > 0 || !torsion.is_empty() {

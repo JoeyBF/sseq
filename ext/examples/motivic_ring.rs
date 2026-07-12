@@ -33,7 +33,16 @@ fn main() -> anyhow::Result<()> {
     let hopf: Vec<(i32, Gen)> = (0..)
         .map(|i| (1 << i) - 1)
         .take_while(|&n| n <= max.n())
-        .map(|n| (n, Gen { s: 1, t: n + 1, idx: 0 }))
+        .map(|n| {
+            (
+                n,
+                Gen {
+                    s: 1,
+                    t: n + 1,
+                    idx: 0,
+                },
+            )
+        })
         .filter(|(_, g)| res.algebraic_novikov_rank(g.s, g.t) > 0)
         .collect();
     let name = |g: Gen| -> String {
@@ -57,7 +66,11 @@ fn main() -> anyhow::Result<()> {
                                 "  {}·{} = τ{}·{}",
                                 name(*a),
                                 name(b),
-                                if power == 1 { String::new() } else { format!("^{power}") },
+                                if power == 1 {
+                                    String::new()
+                                } else {
+                                    format!("^{power}")
+                                },
                                 name(g),
                             );
                             found = true;
@@ -80,9 +93,25 @@ fn main() -> anyhow::Result<()> {
         let terms: Vec<String> = coset
             .representative
             .iter()
-            .map(|&(g, p)| format!("τ{}·{}", if p == 0 { "⁰".into() } else if p == 1 { String::new() } else { format!("^{p}") }, name(g)))
+            .map(|&(g, p)| {
+                format!(
+                    "τ{}·{}",
+                    if p == 0 {
+                        "⁰".into()
+                    } else if p == 1 {
+                        String::new()
+                    } else {
+                        format!("^{p}")
+                    },
+                    name(g)
+                )
+            })
             .collect();
-        let val = if terms.is_empty() { "0".to_string() } else { terms.join(" + ") };
+        let val = if terms.is_empty() {
+            "0".to_string()
+        } else {
+            terms.join(" + ")
+        };
         println!(
             "  ⟨{}, {}, {}⟩ = {val}   (indeterminacy: {} gen(s){})",
             name(a),

@@ -57,12 +57,17 @@ fn main() -> anyhow::Result<()> {
             let torsion: String = module
                 .torsion
                 .iter()
-                .map(|&k| if k == 1 { "τ".to_string() } else { format!("τ^{k}") })
+                .map(|&k| {
+                    if k == 1 {
+                        "τ".to_string()
+                    } else {
+                        format!("τ^{k}")
+                    }
+                })
                 .collect::<Vec<_>>()
                 .join("+");
-            (alg_nov > 0 || classical > 0 || !torsion.is_empty()).then(|| {
-                (s, n, format!("{n},{s},{alg_nov},{classical},{torsion}"))
-            })
+            (alg_nov > 0 || classical > 0 || !torsion.is_empty())
+                .then(|| (s, n, format!("{n},{s},{alg_nov},{classical},{torsion}")))
         })
         .collect();
     lines.sort_by_key(|&(s, n, _)| (s, n));
