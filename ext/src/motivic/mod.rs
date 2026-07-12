@@ -2269,6 +2269,31 @@ mod tests {
     }
 
     #[test]
+    fn resolves_a_nontrivial_module_moore_space() {
+        // Resolve S/2 (cofiber of 2 = h₀): cells x₀, x₁ joined by Q₀ = Sq¹. The whole
+        // deformation pipeline runs on a non-trivial module, and because 2 = h₀ is
+        // coned off, the h₀-tower on the bottom cell is truncated — the sphere has
+        // h₀ⁿ ≠ 0 at (0, n) for all n, but S/2 has only the bottom class.
+        use algebra::{Algebra, module::FDModule};
+        use bivec::BiVec;
+
+        let algebra = Arc::new(CTauAlgebra::new());
+        algebra.compute_basis(12);
+        let mut module = FDModule::new(algebra, "S/2".to_string(), BiVec::from_vec(0, vec![1, 1]));
+        module.set_action(1, 0, 0, 0, &[1]); // Q₀·x₀ = x₁
+        let sphere = MotivicResolution::new(Bidegree::n_s(8, 6));
+        let moore = MotivicResolution::with_module(Arc::new(module), Bidegree::n_s(8, 6), None);
+
+        // The bottom class survives on both.
+        assert_eq!(moore.classical_ext_rank(0, 0), 1, "S/2 bottom cell");
+        // The h₀-tower (stem 0, filtration ≥ 1): present on the sphere, gone on S/2.
+        for s in 1..=4 {
+            assert_eq!(sphere.classical_ext_rank(s, s), 1, "sphere h₀^{s}");
+            assert_eq!(moore.classical_ext_rank(s, s), 0, "S/2 kills h₀^{s}");
+        }
+    }
+
+    #[test]
     fn save_load_round_trips() {
         // Resolving with a save directory, then reloading, reproduces the weights and
         // lifted differentials exactly (and hence every downstream invariant).
