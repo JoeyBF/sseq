@@ -295,91 +295,25 @@ impl MotivicResolution {
     /// { "gens": { "x0": 0, "x1": 1 }, "actions": ["Q_0 x0 = x1"] }
     /// ```
     ///
-    /// Every nonzero action must be listed explicitly: unlike the classical
-    /// [`FDModule::from_json`], this does not auto-extend the action of composite
-    /// operations from the generators (that needs a full `GeneratedAlgebra` impl for
-    /// the motivic Steenrod algebra — a follow-up). For the usual "attach a few
-    /// cells by single operations" modules the two coincide.
+    /// This is exactly the classical [`FDModule::from_json`] path, made available by
+    /// the [`GeneratedAlgebra`](algebra::GeneratedAlgebra) implementation of
+    /// $A_C/\tau$: only the actions of the *generators* ($Q_0$ and the $P(\xi_1^{2^k})
+    /// = \mathrm{Sq}^{2^{k+1}}$) need be listed, and the action of every composite
+    /// operation is extended from them and cross-checked against the Steenrod
+    /// relations. Inconsistent descriptors are rejected.
     pub fn module_from_json(json: &serde_json::Value) -> anyhow::Result<Arc<FDModule<CTauAlgebra>>> {
-        use anyhow::Context;
-
         let algebra = Arc::new(CTauAlgebra::new());
-        let gens = json["gens"]
+        // Size the algebra to the top cell so operation names and composite-action
+        // extension resolve; `from_json` drives the rest.
+        let max_d = json["gens"]
             .as_object()
-            .context("module descriptor is missing a `gens` object")?;
-
-        // Group the cells by degree (JSON order within a degree fixes their indices).
-        let mut by_degree: BTreeMap<i32, Vec<String>> = BTreeMap::new();
-        for (name, deg) in gens {
-            let d = deg.as_i64().context("each gen's value must be its degree")? as i32;
-            by_degree.entry(d).or_default().push(name.clone());
-        }
-        let (&min_d, &max_d) = match (by_degree.keys().min(), by_degree.keys().max()) {
-            (Some(a), Some(b)) => (a, b),
-            _ => anyhow::bail!("module descriptor has no generators"),
-        };
-        let counts: Vec<usize> = (min_d..=max_d)
-            .map(|d| by_degree.get(&d).map_or(0, Vec::len))
-            .collect();
-        let mut gen_to_idx: HashMap<String, (i32, usize)> = HashMap::new();
-        for (&d, names) in &by_degree {
-            for (idx, name) in names.iter().enumerate() {
-                gen_to_idx.insert(name.clone(), (d, idx));
-            }
-        }
-
-        algebra.compute_basis(max_d.max(0));
-        let name = json["name"].as_str().unwrap_or("").to_string();
-        let mut module = FDModule::new(Arc::clone(&algebra), name, BiVec::from_vec(min_d, counts));
-        for (name, &(d, idx)) in &gen_to_idx {
-            module.set_basis_element_name(d, idx, name.clone());
-        }
-
-        // Parse each `op gen = rhs` action and install it (mirrors
-        // `FDModule::parse_action`, which needs `GeneratedAlgebra`).
-        let lookup = |g: &str| -> anyhow::Result<(i32, usize)> {
-            gen_to_idx
-                .get(g.trim())
-                .copied()
-                .with_context(|| format!("unknown generator `{g}`"))
-        };
-        if let Some(actions) = json.get("actions").and_then(|a| a.as_array()) {
-            for action in actions {
-                let a = action.as_str().context("each action must be a string")?;
-                let (lhs, rhs) = a
-                    .split_once(" = ")
-                    .with_context(|| format!("action `{a}` must be `op gen = rhs`"))?;
-                let (op_str, gen_str) = lhs
-                    .rsplit_once(' ')
-                    .with_context(|| format!("action `{a}` must name an operation and a generator"))?;
-                let (op_deg, op_idx) = algebra
-                    .basis_element_from_string(op_str.trim())
-                    .with_context(|| format!("action `{a}`: unknown operation `{op_str}`"))?;
-                let (in_deg, in_idx) = lookup(gen_str)?;
-                let out_deg = in_deg + op_deg;
-                if !(min_d..=max_d).contains(&out_deg) {
-                    continue; // the action lands outside the module ⇒ zero
-                }
-                let mut out = vec![0u32; module.dimension(out_deg)];
-                if rhs.trim() != "0" {
-                    for item in rhs.split(" + ") {
-                        let (coef, g) = match item.trim().split_once(' ') {
-                            Some((c, g)) => (
-                                c.parse::<u32>()
-                                    .with_context(|| format!("action `{a}`: bad coefficient `{c}`"))?,
-                                g,
-                            ),
-                            None => (1, item.trim()),
-                        };
-                        let (od, oi) = lookup(g)?;
-                        anyhow::ensure!(od == out_deg, "action `{a}`: right side is not in degree {out_deg}");
-                        out[oi] = coef % 2;
-                    }
-                }
-                module.set_action(op_deg, op_idx, in_deg, in_idx, &out);
-            }
-        }
-        Ok(Arc::new(module))
+            .into_iter()
+            .flat_map(|g| g.values())
+            .filter_map(serde_json::Value::as_i64)
+            .max()
+            .unwrap_or(0);
+        algebra.compute_basis(max_d.max(0) as i32);
+        Ok(Arc::new(FDModule::from_json(algebra, json)?))
     }
 
     /// The trivial module $k = \mathbb{F}_2$ (concentrated in degree 0) over
@@ -2386,6 +2320,68 @@ mod tests {
             assert_eq!(sphere.classical_ext_rank(s, s), 1, "sphere h₀^{s}");
             assert_eq!(moore.classical_ext_rank(s, s), 0, "S/2 kills h₀^{s}");
         }
+    }
+
+    #[test]
+    fn module_descriptor_auto_extends_composite_operations() {
+        // The `.json` path now goes through the standard `FDModule::from_json`, backed
+        // by the `GeneratedAlgebra` impl of A_C/τ: a descriptor lists only *generator*
+        // actions and the action of every composite operation is extended from them.
+        // Here x₀ --P(0,1)--> x₂ --Q₀--> x₃; the composite operation `Q_0 P(0, 1)` (a
+        // non-generator basis element in degree 3) is never listed, yet must act
+        // x₀ ↦ x₃ — the parity win over an explicit-actions-only loader.
+        let descriptor = serde_json::json!({
+            "gens": { "x0": 0, "x2": 2, "x3": 3 },
+            "actions": ["P(0, 1) x0 = x2", "Q_0 x2 = x3"],
+        });
+        let module = MotivicResolution::module_from_json(&descriptor).unwrap();
+        let algebra = module.algebra();
+        let (_, q0) = algebra.basis_element_from_string("Q_0").unwrap();
+        let (_, p01) = algebra.basis_element_from_string("P(0, 1)").unwrap();
+
+        // The two-step generator action Q₀(P(0,1)·x₀) = Q₀·x₂ = x₃.
+        let mut x2 = FpVector::new(TWO, module.dimension(2));
+        module.act_on_basis(x2.as_slice_mut(), 1, 2, p01, 0, 0);
+        let mut two_step = FpVector::new(TWO, module.dimension(3));
+        module.act(two_step.as_slice_mut(), 1, 1, q0, 2, x2.as_slice());
+        let mut x3 = FpVector::new(TWO, module.dimension(3));
+        x3.add_basis_element(0, 1);
+        assert_eq!(two_step, x3, "Q₀(P(0,1)·x₀) should be x₃");
+
+        // The single-step action by the algebra product Q₀·P(0,1) = Q₁ + Q₀P(0,1)
+        // (both degree-3 non-generators, extended not listed) must agree — the module
+        // axiom that composite auto-extension is responsible for.
+        let mut product = FpVector::new(TWO, algebra.dimension(3));
+        algebra.multiply_basis_elements(product.as_slice_mut(), 1, 1, q0, 2, p01);
+        assert!(product.iter_nonzero().count() >= 2, "Q₀·P(0,1) is a genuine composite");
+        let mut one_step = FpVector::new(TWO, module.dimension(3));
+        for (b, _) in product.iter_nonzero() {
+            module.act_on_basis(one_step.as_slice_mut(), 1, 3, b, 0, 0);
+        }
+        assert_eq!(
+            one_step, two_step,
+            "acting by the extended composite Q₀·P(0,1) must match the two-step action"
+        );
+    }
+
+    #[test]
+    fn module_descriptor_rejects_inconsistent_actions() {
+        // A descriptor whose generator actions violate a Steenrod relation is rejected
+        // by `check_validity`, using `GeneratedAlgebra::generating_relations`. Here
+        // Q₀ x₀ = x₁ and Q₀ x₁ = x₂ would force Q₀² x₀ = x₂ ≠ 0, but Q₀² = 0 in A_C/τ.
+        let descriptor = serde_json::json!({
+            "gens": { "x0": 0, "x1": 1, "x2": 2 },
+            "actions": ["Q_0 x0 = x1", "Q_0 x1 = x2"],
+        });
+        let err = match MotivicResolution::module_from_json(&descriptor) {
+            Err(e) => e,
+            Ok(_) => panic!("Q₀² = 0 must reject this descriptor"),
+        };
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("Relation failed") && msg.contains("Q_0"),
+            "expected a Q_0² relation failure, got: {msg}"
+        );
     }
 
     #[test]

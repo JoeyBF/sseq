@@ -10,6 +10,12 @@
 //! coned off, the $h_0$-tower on the bottom cell is truncated (compare
 //! `resolve_motivic`, where $h_0^n \ne 0$ for all $n$).
 //!
+//! The descriptor is the *standard* format: it lists only the actions of the
+//! algebra generators ($Q_0$ and the $P(\xi_1^{2^k}) = \mathrm{Sq}^{2^{k+1}}$), and
+//! the action of every composite operation is extended automatically (and
+//! cross-checked against the Steenrod relations) — exactly as on the classical
+//! side, courtesy of the `GeneratedAlgebra` implementation of $A_C/\tau$.
+//!
 //! Prompts for `Max n` / `Max s` (default 12 / 8). Set `MOT_SAVE=<dir>` to cache.
 
 use ext::motivic::MotivicResolution;
