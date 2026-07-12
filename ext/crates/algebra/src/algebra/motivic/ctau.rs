@@ -117,8 +117,10 @@ impl Algebra for CTauAlgebra {
         self.ac.basis_element_to_string(degree, idx)
     }
 
-    fn basis_element_from_string(&self, _elt: &str) -> Option<(i32, usize)> {
-        None
+    fn basis_element_from_string(&self, elt: &str) -> Option<(i32, usize)> {
+        // A_C/τ shares its basis with A_C, so the parse is the engine's — letting
+        // `.json` module descriptors be written over A_C/τ (see [`FDModule::from_json`]).
+        self.ac.basis_element_from_string(elt)
     }
 }
 
@@ -154,6 +156,31 @@ mod tests {
         assert_eq!(alg.weight(1, 0), alg.engine().bidegree(1, 0).1);
         assert_eq!(alg.weight(1, 0), 0);
         assert_eq!(alg.weight(2, 0), -1);
+    }
+
+    #[test]
+    fn test_ctau_basis_element_from_string_round_trips() {
+        // `basis_element_from_string` inverts `basis_element_to_string` on every basis
+        // element in range — so `.json` module descriptors can name motivic operations.
+        let alg = CTauAlgebra::new();
+        alg.compute_basis(12);
+        for degree in 0..=12 {
+            for idx in 0..alg.dimension(degree) {
+                let s = alg.basis_element_to_string(degree, idx);
+                assert_eq!(
+                    alg.basis_element_from_string(&s),
+                    Some((degree, idx)),
+                    "round-trip failed for {s:?} at ({degree}, {idx})"
+                );
+            }
+        }
+        // Spot-check known names, including the P(…) block with spaces.
+        assert_eq!(alg.basis_element_from_string("1"), Some((0, 0)));
+        assert_eq!(alg.basis_element_from_string("Q_0"), Some((1, 0)));
+        assert_eq!(alg.basis_element_from_string("P(0, 1)"), Some((2, 0)));
+        // Malformed input is rejected, not panicked on.
+        assert_eq!(alg.basis_element_from_string("Sq1"), None);
+        assert_eq!(alg.basis_element_from_string("Q_"), None);
     }
 
     #[test]

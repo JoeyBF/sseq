@@ -2,18 +2,16 @@
 //! the mod-2 Moore space $S/2$ (the cofiber of $2 = h_0$), whose two cells are
 //! joined by $Q_0 = \mathrm{Sq}^1$.
 //!
-//! Demonstrates [`MotivicResolution::with_module`]: any [`FDModule`] over
-//! [`CTauAlgebra`] flows through the whole deformation pipeline — weights, the
-//! $A_C$ lift, the $\mathbb{F}_2[\tau]$-module structure, products, Masseys.
-//! Because $2 = h_0$ is coned off, the $h_0$-tower on the bottom cell is truncated
-//! (compare `resolve_motivic`, where $h_0^n \ne 0$ for all $n$).
+//! Demonstrates the `.json` module descriptor format over the motivic Steenrod
+//! algebra ([`MotivicResolution::module_from_json`]) and
+//! [`MotivicResolution::with_module`]: any module over $A_C/\tau$ flows through the
+//! whole deformation pipeline — weights, the $A_C$ lift, the
+//! $\mathbb{F}_2[\tau]$-module structure, products, Masseys. Because $2 = h_0$ is
+//! coned off, the $h_0$-tower on the bottom cell is truncated (compare
+//! `resolve_motivic`, where $h_0^n \ne 0$ for all $n$).
 //!
 //! Prompts for `Max n` / `Max s` (default 12 / 8). Set `MOT_SAVE=<dir>` to cache.
 
-use std::sync::Arc;
-
-use algebra::{Algebra, CTauAlgebra, module::FDModule};
-use bivec::BiVec;
 use ext::motivic::MotivicResolution;
 use sseq::coordinates::Bidegree;
 
@@ -25,14 +23,18 @@ fn main() -> anyhow::Result<()> {
         query::with_default("Max s", "8", str::parse),
     );
 
-    // Build S/2: cells x₀ (degree 0) and x₁ (degree 1), with Q₀·x₀ = x₁.
-    let algebra = Arc::new(CTauAlgebra::new());
-    algebra.compute_basis(max.t() + 2);
-    let mut module = FDModule::new(algebra, "S/2".to_string(), BiVec::from_vec(0, vec![1, 1]));
-    module.set_action(1, 0, 0, 0, &[1]);
+    // S/2 as a `.json` module descriptor: two cells x₀ (deg 0), x₁ (deg 1), joined
+    // by Q₀ = Sq¹. Actions name motivic operations as the algebra prints them.
+    let descriptor = serde_json::json!({
+        "type": "finite dimensional module",
+        "name": "S/2",
+        "gens": { "x0": 0, "x1": 1 },
+        "actions": ["Q_0 x0 = x1"],
+    });
+    let module = MotivicResolution::module_from_json(&descriptor)?;
 
     let save_dir = std::env::var_os("MOT_SAVE").map(std::path::PathBuf::from);
-    let res = MotivicResolution::with_module(Arc::new(module), max, save_dir);
+    let res = MotivicResolution::with_module(module, max, save_dir);
 
     println!("n,s,alg_nov,classical,tau_torsion");
     for s in 0..=(max.s() - 1) {

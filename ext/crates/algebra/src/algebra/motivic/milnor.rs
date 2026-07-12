@@ -977,6 +977,59 @@ impl MotivicMilnorAlgebra {
         (t, -w)
     }
 
+    /// Parse a basis element written as `basis_element_to_string` prints it —
+    /// `1`, `Q_i`, `P(r_0, r_1, …)`, or a space-separated product `Q_i … P(R)` —
+    /// into its `(topological degree, index)`. The inverse of
+    /// [`Self::basis_element_to_string`]; returns `None` on a malformed string or a
+    /// monomial absent from the basis. This is what lets `.json` module descriptors
+    /// be written over the motivic Steenrod algebra.
+    pub fn basis_element_from_string(&self, elt: &str) -> Option<(i32, usize)> {
+        let mut e_mask: u32 = 0;
+        let mut r: Vec<u32> = Vec::new();
+        // The `P(…)` block (if any) is last and may contain spaces after commas, so
+        // split it off before whitespace-tokenizing the `Q_i` factors.
+        let (q_part, p_part) = match elt.split_once("P(") {
+            Some((q, rest)) => (q, Some(rest.strip_suffix(')')?)),
+            None => (elt, None),
+        };
+        for token in q_part.split_whitespace() {
+            if token == "1" {
+                continue; // the unit factor
+            }
+            let i: u32 = token.strip_prefix("Q_")?.parse().ok()?;
+            e_mask |= 1 << i;
+        }
+        if let Some(p) = p_part {
+            r = p
+                .split(',')
+                .map(|x| x.trim().parse::<u32>())
+                .collect::<Result<_, _>>()
+                .ok()?;
+        }
+
+        let degree = paper_bidegree(e_mask, &r).0;
+        if degree < 0 {
+            return None;
+        }
+        self.compute_basis(degree);
+        // Match up to trailing zeros in the ξ-exponent vector (its canonical length
+        // is degree-dependent).
+        let trim = |v: &[u32]| {
+            let mut v = v.to_vec();
+            while v.last() == Some(&0) {
+                v.pop();
+            }
+            v
+        };
+        let want = trim(&r);
+        (0..self.dimension(degree))
+            .find(|&idx| {
+                let (e2, r2) = self.basis_element(degree, idx);
+                *e2 == e_mask && trim(r2) == want
+            })
+            .map(|idx| (degree, idx))
+    }
+
     /// A display string for a basis element (`Q_i … P(R)`).
     pub fn basis_element_to_string(&self, degree: i32, idx: usize) -> String {
         let (e_mask, r) = self.basis_element(degree, idx);

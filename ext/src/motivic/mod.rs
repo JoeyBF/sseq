@@ -62,7 +62,7 @@ use std::{
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 
 use algebra::{
-    CTauAlgebra,
+    Algebra, CTauAlgebra,
     module::{FDModule, FreeModule, Module, homomorphism::ModuleHomomorphism},
     motivic::MotivicMilnorAlgebra,
 };
@@ -285,6 +285,101 @@ impl MotivicResolution {
     /// directory.
     pub fn new(max: Bidegree) -> Self {
         Self::with_module(Self::trivial_module(), max, None)
+    }
+
+    /// Build a module over $A_C/\tau$ from a `.json` descriptor — the standard module
+    /// format (`gens` naming cells by degree, `actions` naming operations as the
+    /// motivic Steenrod algebra prints them: `Q_i`, `P(R)`, or products `Q_i … P(R)`)
+    /// — ready for [`Self::with_module`]. For example, the Moore space $S/2$ is
+    /// ```json
+    /// { "gens": { "x0": 0, "x1": 1 }, "actions": ["Q_0 x0 = x1"] }
+    /// ```
+    ///
+    /// Every nonzero action must be listed explicitly: unlike the classical
+    /// [`FDModule::from_json`], this does not auto-extend the action of composite
+    /// operations from the generators (that needs a full `GeneratedAlgebra` impl for
+    /// the motivic Steenrod algebra — a follow-up). For the usual "attach a few
+    /// cells by single operations" modules the two coincide.
+    pub fn module_from_json(json: &serde_json::Value) -> anyhow::Result<Arc<FDModule<CTauAlgebra>>> {
+        use anyhow::Context;
+
+        let algebra = Arc::new(CTauAlgebra::new());
+        let gens = json["gens"]
+            .as_object()
+            .context("module descriptor is missing a `gens` object")?;
+
+        // Group the cells by degree (JSON order within a degree fixes their indices).
+        let mut by_degree: BTreeMap<i32, Vec<String>> = BTreeMap::new();
+        for (name, deg) in gens {
+            let d = deg.as_i64().context("each gen's value must be its degree")? as i32;
+            by_degree.entry(d).or_default().push(name.clone());
+        }
+        let (&min_d, &max_d) = match (by_degree.keys().min(), by_degree.keys().max()) {
+            (Some(a), Some(b)) => (a, b),
+            _ => anyhow::bail!("module descriptor has no generators"),
+        };
+        let counts: Vec<usize> = (min_d..=max_d)
+            .map(|d| by_degree.get(&d).map_or(0, Vec::len))
+            .collect();
+        let mut gen_to_idx: HashMap<String, (i32, usize)> = HashMap::new();
+        for (&d, names) in &by_degree {
+            for (idx, name) in names.iter().enumerate() {
+                gen_to_idx.insert(name.clone(), (d, idx));
+            }
+        }
+
+        algebra.compute_basis(max_d.max(0));
+        let name = json["name"].as_str().unwrap_or("").to_string();
+        let mut module = FDModule::new(Arc::clone(&algebra), name, BiVec::from_vec(min_d, counts));
+        for (name, &(d, idx)) in &gen_to_idx {
+            module.set_basis_element_name(d, idx, name.clone());
+        }
+
+        // Parse each `op gen = rhs` action and install it (mirrors
+        // `FDModule::parse_action`, which needs `GeneratedAlgebra`).
+        let lookup = |g: &str| -> anyhow::Result<(i32, usize)> {
+            gen_to_idx
+                .get(g.trim())
+                .copied()
+                .with_context(|| format!("unknown generator `{g}`"))
+        };
+        if let Some(actions) = json.get("actions").and_then(|a| a.as_array()) {
+            for action in actions {
+                let a = action.as_str().context("each action must be a string")?;
+                let (lhs, rhs) = a
+                    .split_once(" = ")
+                    .with_context(|| format!("action `{a}` must be `op gen = rhs`"))?;
+                let (op_str, gen_str) = lhs
+                    .rsplit_once(' ')
+                    .with_context(|| format!("action `{a}` must name an operation and a generator"))?;
+                let (op_deg, op_idx) = algebra
+                    .basis_element_from_string(op_str.trim())
+                    .with_context(|| format!("action `{a}`: unknown operation `{op_str}`"))?;
+                let (in_deg, in_idx) = lookup(gen_str)?;
+                let out_deg = in_deg + op_deg;
+                if !(min_d..=max_d).contains(&out_deg) {
+                    continue; // the action lands outside the module ⇒ zero
+                }
+                let mut out = vec![0u32; module.dimension(out_deg)];
+                if rhs.trim() != "0" {
+                    for item in rhs.split(" + ") {
+                        let (coef, g) = match item.trim().split_once(' ') {
+                            Some((c, g)) => (
+                                c.parse::<u32>()
+                                    .with_context(|| format!("action `{a}`: bad coefficient `{c}`"))?,
+                                g,
+                            ),
+                            None => (1, item.trim()),
+                        };
+                        let (od, oi) = lookup(g)?;
+                        anyhow::ensure!(od == out_deg, "action `{a}`: right side is not in degree {out_deg}");
+                        out[oi] = coef % 2;
+                    }
+                }
+                module.set_action(op_deg, op_idx, in_deg, in_idx, &out);
+            }
+        }
+        Ok(Arc::new(module))
     }
 
     /// The trivial module $k = \mathbb{F}_2$ (concentrated in degree 0) over
@@ -2274,15 +2369,15 @@ mod tests {
         // deformation pipeline runs on a non-trivial module, and because 2 = h₀ is
         // coned off, the h₀-tower on the bottom cell is truncated — the sphere has
         // h₀ⁿ ≠ 0 at (0, n) for all n, but S/2 has only the bottom class.
-        use algebra::{Algebra, module::FDModule};
-        use bivec::BiVec;
-
-        let algebra = Arc::new(CTauAlgebra::new());
-        algebra.compute_basis(12);
-        let mut module = FDModule::new(algebra, "S/2".to_string(), BiVec::from_vec(0, vec![1, 1]));
-        module.set_action(1, 0, 0, 0, &[1]); // Q₀·x₀ = x₁
+        // Build S/2 from a .json descriptor (exercising module_from_json /
+        // basis_element_from_string over the motivic Steenrod algebra).
+        let descriptor = serde_json::json!({
+            "gens": { "x0": 0, "x1": 1 },
+            "actions": ["Q_0 x0 = x1"],
+        });
+        let module = MotivicResolution::module_from_json(&descriptor).unwrap();
         let sphere = MotivicResolution::new(Bidegree::n_s(8, 6));
-        let moore = MotivicResolution::with_module(Arc::new(module), Bidegree::n_s(8, 6), None);
+        let moore = MotivicResolution::with_module(module, Bidegree::n_s(8, 6), None);
 
         // The bottom class survives on both.
         assert_eq!(moore.classical_ext_rank(0, 0), 1, "S/2 bottom cell");
