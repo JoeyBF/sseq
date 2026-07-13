@@ -3,6 +3,7 @@ use std::sync::Arc;
 use algebra::{
     AdemAlgebra, Algebra, GeneratedAlgebra, MilnorAlgebra, SteenrodAlgebra,
     module::{
+        ModuleExt,
         FDModule, FreeModule, Module, QuotientModule as QM,
         homomorphism::{
             FreeModuleHomomorphism, FullModuleHomomorphism, IdentityHomomorphism,

@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use algebra::module::{
+    ModuleExt,
     Module,
     homomorphism::{FullModuleHomomorphism, IdentityHomomorphism},
 };

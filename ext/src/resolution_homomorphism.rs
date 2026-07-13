@@ -5,6 +5,7 @@ use std::{ops::Range, sync::Arc};
 use algebra::{
     MuAlgebra,
     module::{
+        ModuleExt,
         Module,
         homomorphism::{ModuleHomomorphism, MuFreeModuleHomomorphism},
     },
@@ -501,7 +502,7 @@ pub(crate) mod secondary {
     use std::sync::Arc;
 
     use algebra::{
-        module::{Module, homomorphism::ModuleHomomorphism},
+        module::{ModuleExt, homomorphism::ModuleHomomorphism},
         pair_algebra::PairAlgebra,
     };
     use dashmap::DashMap;

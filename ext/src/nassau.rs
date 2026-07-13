@@ -22,6 +22,7 @@ use algebra::{
     Algebra, combinatorics,
     milnor_algebra::{MilnorAlgebra, PPartEntry},
     module::{
+        ModuleExt,
         FreeModule, GeneratorData, Module, ZeroModule,
         homomorphism::{FreeModuleHomomorphism, FullModuleHomomorphism, ModuleHomomorphism},
     },

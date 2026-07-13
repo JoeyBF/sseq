@@ -1,4 +1,4 @@
-use algebra::module::Module;
+use algebra::module::{Module, ModuleExt};
 use ext::{
     chain_complex::{AugmentedChainComplex, ChainComplex},
     utils::construct,

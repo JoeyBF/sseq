@@ -1,6 +1,7 @@
 use std::sync::{Arc, Mutex};
 
 use algebra::module::{
+        ModuleExt,
     Module,
     homomorphism::{FreeModuleHomomorphism, ModuleHomomorphism},
 };
@@ -294,7 +295,7 @@ pub(crate) mod secondary {
     use std::sync::Arc;
 
     use algebra::{
-        module::{Module, homomorphism::ModuleHomomorphism},
+        module::{ModuleExt, homomorphism::ModuleHomomorphism},
         pair_algebra::PairAlgebra,
     };
     use dashmap::DashMap;
