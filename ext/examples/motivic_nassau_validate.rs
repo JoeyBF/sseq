@@ -35,7 +35,7 @@ fn main() -> anyhow::Result<()> {
     println!("# motivic-Nassau validation  (box: max_n={max_n}, max_s={max_s}, max_t={max_t})");
 
     // --- Signature engine ---
-    let mut sres = SignatureResolution::new();
+    let mut sres = SignatureResolution::motivic();
     let start = Instant::now();
     sres.compute_through_stem(max_s, max_t);
     let sig_time = start.elapsed();

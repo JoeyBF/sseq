@@ -9,6 +9,17 @@
 //! bidegree, this engine **falls back** to a plain (all-of-`A_C/τ`) step there, so
 //! the composite is always correct.
 //!
+//! # Unified engine over a [`PAlgebra`]
+//!
+//! The resolution engine [`SignatureResolution`] is generic over the [`PAlgebra`]
+//! trait — the data Nassau's algorithm needs from an algebra (profiles,
+//! signatures, masks, vanishing-line `B`-selection). It is instantiated over both
+//! the motivic $A_C/\tau$ (via the opposite algebra [`CTauOpAlgebra`]) **and** the
+//! classical mod-$2$ Steenrod algebra (`MilnorAlgebra`, reusing the proven
+//! [`MilnorSubalgebra`] from [`crate::nassau`]). One engine, two algebras; the
+//! handedness (which the note in `notes/opposite-algebra-nassau.tex` explains)
+//! lives entirely in the trait implementations.
+//!
 //! # The odd-primary shape
 //!
 //! `A_C/τ ≅ F₂[ξ₁, ξ₂, …] ⊗ E(τ₀, τ₁, …)` is the *odd-primary-shaped* Steenrod
@@ -39,6 +50,7 @@ use std::{
 
 use algebra::{
     Algebra,
+    milnor_algebra::{MilnorAlgebra, PPartEntry},
     module::{
         FDModule, FreeModule, GeneratorData, Module,
         homomorphism::{FreeModuleHomomorphism, ModuleHomomorphism},
@@ -51,8 +63,12 @@ use fp::{
     prime::{TWO, ValidPrime},
     vector::{FpSliceMut, FpVector},
 };
+use sseq::coordinates::Bidegree;
 
-use crate::chain_complex::{ChainComplex, FiniteChainComplex};
+use crate::{
+    chain_complex::{ChainComplex, FiniteChainComplex},
+    nassau::MilnorSubalgebra,
+};
 
 /// Cap on new generators introduced at a single `(1, t)` bidegree (mirrors the
 /// classical engine's headroom for the augmented matrix).
@@ -440,35 +456,6 @@ impl MotivicSubalgebra {
         out
     }
 
-    /// The matrix of a free-module homomorphism restricted to the signature-graded
-    /// piece: rows = source basis of `signature` in `degree`, columns = target
-    /// basis of `signature` in `degree - shift`. This is `d : E_signature C →
-    /// E_signature C_{s-1}` in the masked bases.
-    pub(crate) fn signature_matrix(
-        &self,
-        alg: &CTauOpAlgebra,
-        hom: &FreeModuleHomomorphism<FreeModule<CTauOpAlgebra>>,
-        degree: i32,
-        signature: &Signature,
-    ) -> Matrix {
-        let source = hom.source();
-        let target = hom.target();
-        let target_degree = degree - hom.degree_shift();
-
-        let target_mask = self.signature_mask(alg, &target, target_degree, signature);
-        let source_mask = self.signature_mask(alg, &source, degree, signature);
-
-        let mut scratch = FpVector::new(TWO, target.dimension(target_degree));
-        let mut result = Matrix::new(TWO, source_mask.len(), target_mask.len());
-
-        for (mut row, &masked_index) in std::iter::zip(result.iter_mut(), &source_mask) {
-            scratch.set_to_zero();
-            hom.apply_to_basis_element(scratch.as_slice_mut(), 1, degree, masked_index);
-            row.add_masked(scratch.as_slice(), 1, &target_mask);
-        }
-        result
-    }
-
     /// The largest exterior index in `B` (`Q_{q_len-1}`), or `None` if `B` has no
     /// exterior part.
     fn max_bockstein(&self) -> Option<usize> {
@@ -564,7 +551,190 @@ pub(crate) fn basis_monomials(alg: &CTauOpAlgebra, degree: i32) -> Vec<(u32, Vec
 }
 
 // ---------------------------------------------------------------------------
-// M3/M4: the standalone signature-filtration resolution engine (Algorithm 2).
+// The `PAlgebra` abstraction: the data Nassau's algorithm needs from an algebra.
+// ---------------------------------------------------------------------------
+
+/// A **P-algebra** (in Margolis's sense): a graded connected $\mathbb{F}_2$-Hopf
+/// algebra equipped with the signature-filtration structure of Nassau's algorithm
+/// — a family of finite sub-Hopf-algebras (**profiles**) whose $B$-signatures
+/// decompose each free module into a small zero-signature piece plus
+/// signature-graded corrections.
+///
+/// Implementing this trait makes an algebra resolvable by the generic
+/// [`SignatureResolution`] engine, which is thereby shared between the classical
+/// mod-$2$ Steenrod algebra (`MilnorAlgebra`) and the motivic $A_C/\tau$
+/// ([`CTauOpAlgebra`]). The implementor is responsible for presenting the algebra
+/// in the **handedness** the sweep requires: the signature filtration must be by
+/// *right* ideals, so that the free-left-module differential is filtered (see the
+/// note in `notes/opposite-algebra-nassau.tex`). For $A_C/\tau$ that means
+/// implementing the trait on the *opposite* algebra [`CTauOpAlgebra`]; for the
+/// classical algebra the standard Milnor basis is already right-stable.
+pub trait PAlgebra: Algebra + Sized {
+    /// A finite sub-Hopf-algebra `B` (a profile).
+    type Profile: Clone;
+    /// A `B`-signature.
+    type Signature: Clone;
+
+    /// The profile to use at bidegree `(s, t)` — the applicable one of largest
+    /// dimension, or [`Self::trivial_profile`] for a plain step.
+    fn optimal_profile(s: i32, t: i32) -> Self::Profile;
+    /// The trivial profile `F₂` (its zero-signature block is the whole module, so
+    /// the step degenerates to the ordinary generic step).
+    fn trivial_profile() -> Self::Profile;
+    fn profile_is_trivial(profile: &Self::Profile) -> bool;
+    /// A display name for the profile (for stats).
+    fn profile_name(profile: &Self::Profile) -> String;
+    /// The `F₂`-dimension of `B` (the ideal shrink factor `dim C / dim E₀C`).
+    fn profile_dim(profile: &Self::Profile) -> u64;
+
+    /// The zero signature of `B`.
+    fn zero_signature(&self, profile: &Self::Profile) -> Self::Signature;
+    /// The nonzero signatures with a representative of degree `≤ degree`, in the
+    /// correction order (a linear extension of "left-multiplication raises
+    /// signature").
+    fn iter_signatures(&self, profile: &Self::Profile, degree: i32) -> Vec<Self::Signature>;
+    /// The free-module basis indices in `degree` whose operation part has the given
+    /// `signature` — the mask defining `E_signature(module)_degree`.
+    fn signature_mask(
+        &self,
+        profile: &Self::Profile,
+        module: &FreeModule<Self>,
+        degree: i32,
+        signature: &Self::Signature,
+    ) -> Vec<usize>;
+}
+
+/// The matrix of a free-module homomorphism restricted to a signature-graded piece
+/// (rows = source basis of `signature`, columns = target basis of `signature`).
+/// Generic over any [`PAlgebra`]; this is `d : E_signature C → E_signature C_{s-1}`
+/// in the masked bases.
+fn signature_matrix<A: PAlgebra>(
+    alg: &A,
+    profile: &A::Profile,
+    hom: &FreeModuleHomomorphism<FreeModule<A>>,
+    degree: i32,
+    signature: &A::Signature,
+) -> Matrix {
+    let source = hom.source();
+    let target = hom.target();
+    let target_degree = degree - hom.degree_shift();
+
+    let target_mask = alg.signature_mask(profile, &target, target_degree, signature);
+    let source_mask = alg.signature_mask(profile, &source, degree, signature);
+
+    let mut scratch = FpVector::new(TWO, target.dimension(target_degree));
+    let mut result = Matrix::new(TWO, source_mask.len(), target_mask.len());
+    for (mut row, &masked_index) in std::iter::zip(result.iter_mut(), &source_mask) {
+        scratch.set_to_zero();
+        hom.apply_to_basis_element(scratch.as_slice_mut(), 1, degree, masked_index);
+        row.add_masked(scratch.as_slice(), 1, &target_mask);
+    }
+    result
+}
+
+/// [`PAlgebra`] for the motivic $A_C/\tau$, on the opposite algebra so the
+/// filtration is right-stable (see [`CTauOpAlgebra`]). Profiles are
+/// [`MotivicSubalgebra`]; signatures are [`Signature`].
+impl PAlgebra for CTauOpAlgebra {
+    type Profile = MotivicSubalgebra;
+    type Signature = Signature;
+
+    fn optimal_profile(s: i32, t: i32) -> MotivicSubalgebra {
+        MotivicSubalgebra::optimal_for(s, t)
+    }
+
+    fn trivial_profile() -> MotivicSubalgebra {
+        MotivicSubalgebra::trivial()
+    }
+
+    fn profile_is_trivial(profile: &MotivicSubalgebra) -> bool {
+        profile.is_trivial()
+    }
+
+    fn profile_name(profile: &MotivicSubalgebra) -> String {
+        profile.to_string()
+    }
+
+    fn profile_dim(profile: &MotivicSubalgebra) -> u64 {
+        profile.dimension()
+    }
+
+    fn zero_signature(&self, profile: &MotivicSubalgebra) -> Signature {
+        profile.zero_signature()
+    }
+
+    fn iter_signatures(&self, profile: &MotivicSubalgebra, degree: i32) -> Vec<Signature> {
+        profile.iter_signatures(degree)
+    }
+
+    fn signature_mask(
+        &self,
+        profile: &MotivicSubalgebra,
+        module: &FreeModule<Self>,
+        degree: i32,
+        signature: &Signature,
+    ) -> Vec<usize> {
+        profile.signature_mask(self, module, degree, signature)
+    }
+}
+
+/// [`PAlgebra`] for the **classical** mod-$2$ Steenrod algebra, reusing the proven
+/// [`MilnorSubalgebra`] signature machinery from the classical Nassau engine
+/// ([`crate::nassau`]). The standard Milnor basis is already right-stable, so the
+/// algebra is used directly (no opposite). This is the unification: the same
+/// [`SignatureResolution`] engine drives both the classical and motivic cases,
+/// differing only in this trait implementation.
+impl PAlgebra for MilnorAlgebra {
+    type Profile = MilnorSubalgebra;
+    type Signature = Vec<PPartEntry>;
+
+    fn optimal_profile(s: i32, t: i32) -> MilnorSubalgebra {
+        // The trivial module `k` has top degree 0, so no `max_degree` shift.
+        MilnorSubalgebra::optimal_for(Bidegree::s_t(s, t))
+    }
+
+    fn trivial_profile() -> MilnorSubalgebra {
+        MilnorSubalgebra::zero_algebra()
+    }
+
+    fn profile_is_trivial(profile: &MilnorSubalgebra) -> bool {
+        profile.profile.is_empty()
+    }
+
+    fn profile_name(profile: &MilnorSubalgebra) -> String {
+        profile.to_string()
+    }
+
+    fn profile_dim(profile: &MilnorSubalgebra) -> u64 {
+        // dim B = Π_i 2^{profile[i]} = 2^{Σ profile[i]}.
+        1u64 << profile.profile.iter().map(|&e| e as u32).sum::<u32>()
+    }
+
+    fn zero_signature(&self, profile: &MilnorSubalgebra) -> Vec<PPartEntry> {
+        profile.zero_signature()
+    }
+
+    fn iter_signatures(&self, profile: &MilnorSubalgebra, degree: i32) -> Vec<Vec<PPartEntry>> {
+        profile.iter_signatures(degree).collect()
+    }
+
+    fn signature_mask(
+        &self,
+        profile: &MilnorSubalgebra,
+        module: &FreeModule<Self>,
+        degree: i32,
+        signature: &Vec<PPartEntry>,
+    ) -> Vec<usize> {
+        profile
+            .signature_mask(self, module, degree, signature)
+            .collect()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The generic signature-filtration resolution engine (Algorithm 2), over any
+// `PAlgebra`. Instantiated as `SignatureResolution<CTauOpAlgebra>` (motivic) and
+// `SignatureResolution<MilnorAlgebra>` (classical).
 // ---------------------------------------------------------------------------
 
 /// One bidegree's shrink record: `dim E₀C_s` vs `dim C_s` (the space the homology
@@ -579,40 +749,42 @@ pub struct ShrinkRecord {
     pub dim_e0: usize,
 }
 
-/// A standalone minimal resolution of the trivial module `k` over `A_C/τ` computed
-/// by Nassau's **signature-filtration** Algorithm 2 (over the opposite algebra —
-/// see [`CTauOpAlgebra`]). Additive and decoupled from the generic engine: it
-/// carries its own free modules and differentials, and its generator ranks are
-/// validated against the generic engine's golden fixture.
+/// A standalone minimal resolution of the trivial module `k` over a [`PAlgebra`],
+/// computed by Nassau's **signature-filtration** Algorithm 2. Additive and
+/// decoupled from the generic engine: it carries its own free modules and
+/// differentials, and its generator ranks are validated against the generic
+/// engine.
 ///
 /// At each bidegree `(s, t)` with `s ≥ 2` it chooses the largest applicable
-/// `A(n)` ([`MotivicSubalgebra::optimal_for`]); where none applies it uses `B =
-/// F₂`, which makes the algorithm's zero-signature block the whole module — i.e.
-/// the ordinary (generic) step. So the composite is **always correct**, and the
-/// signature shortcut is used only where provably applicable.
-pub struct SignatureResolution {
-    algebra: Arc<CTauOpAlgebra>,
-    target: Arc<FiniteChainComplex<FDModule<CTauOpAlgebra>>>,
-    zero_module: Arc<FreeModule<CTauOpAlgebra>>,
-    modules: Vec<Arc<FreeModule<CTauOpAlgebra>>>,
-    differentials: Vec<Arc<FreeModuleHomomorphism<FreeModule<CTauOpAlgebra>>>>,
-    chain_maps: Vec<Arc<FreeModuleHomomorphism<FDModule<CTauOpAlgebra>>>>,
+/// profile ([`PAlgebra::optimal_profile`]); where none applies it uses the trivial
+/// profile, which makes the algorithm's zero-signature block the whole module —
+/// i.e. the ordinary (generic) step. So the composite is **always correct**, and
+/// the signature shortcut is used only where provably applicable.
+///
+/// Instantiated as `SignatureResolution<CTauOpAlgebra>` (motivic $A_C/\tau$) or
+/// `SignatureResolution<MilnorAlgebra>` (classical mod-$2$ Steenrod algebra).
+pub struct SignatureResolution<A: PAlgebra> {
+    algebra: Arc<A>,
+    target: Arc<FiniteChainComplex<FDModule<A>>>,
+    zero_module: Arc<FreeModule<A>>,
+    modules: Vec<Arc<FreeModule<A>>>,
+    differentials: Vec<Arc<FreeModuleHomomorphism<FreeModule<A>>>>,
+    chain_maps: Vec<Arc<FreeModuleHomomorphism<FDModule<A>>>>,
     max_s: i32,
     shrink: RefCell<Vec<ShrinkRecord>>,
     fallbacks: Cell<usize>,
     sig_steps: Cell<usize>,
 }
 
-impl SignatureResolution {
-    /// A resolution of the trivial module `k = F₂` over `A_C/τ`.
-    pub fn new() -> Self {
-        let algebra = Arc::new(CTauOpAlgebra::new());
+impl<A: PAlgebra> SignatureResolution<A> {
+    /// A resolution of the trivial module `k = F₂` over the given algebra.
+    pub fn new(algebra: Arc<A>) -> Self {
         let module = Arc::new(FDModule::new(
             Arc::clone(&algebra),
             "k".to_string(),
             BiVec::from_vec(0, vec![1]),
         ));
-        let target = Arc::new(FiniteChainComplex::<FDModule<CTauOpAlgebra>>::ccdz(module));
+        let target = Arc::new(FiniteChainComplex::<FDModule<A>>::ccdz(module));
         let zero_module = Arc::new(FreeModule::new(
             Arc::clone(&algebra),
             "F_{-1}".to_string(),
@@ -710,13 +882,13 @@ impl SignatureResolution {
         } else if s == 1 {
             self.step1(t);
         } else {
-            let b = MotivicSubalgebra::optimal_for(s, t);
+            let b = A::optimal_profile(s, t);
             // Attempt the signature step; on any residual inconsistency fall back
             // to the plain (trivial-B) step, which is the generic algorithm.
             if !self.step_general(s, t, &b) {
                 self.fallbacks.set(self.fallbacks.get() + 1);
-                self.step_general(s, t, &MotivicSubalgebra::trivial());
-            } else if b.is_trivial() {
+                self.step_general(s, t, &A::trivial_profile());
+            } else if A::profile_is_trivial(&b) {
                 self.fallbacks.set(self.fallbacks.get() + 1);
             } else {
                 self.sig_steps.set(self.sig_steps.get() + 1);
@@ -806,23 +978,23 @@ impl SignatureResolution {
     /// The Algorithm 2 inductive step at `(s, t)` with subalgebra `b`. Returns
     /// `false` if the correction sweep left `d² ≠ 0` (signature order insufficient
     /// at this bidegree), signalling the caller to fall back to a plain step.
-    fn step_general(&self, s: i32, t: i32, b: &MotivicSubalgebra) -> bool {
+    fn step_general(&self, s: i32, t: i32, b: &A::Profile) -> bool {
         let alg = &*self.algebra;
         let target = &self.modules[s as usize - 1];
         let next = &self.modules[s as usize - 2];
         next.compute_basis(t);
 
-        let zero_sig = b.zero_signature();
+        let zero_sig = alg.zero_signature(b);
         let target_dim = target.dimension(t);
-        let target_mask = b.signature_mask(alg, target, t, &zero_sig);
-        let next_mask = b.signature_mask(alg, next, t, &zero_sig);
+        let target_mask = alg.signature_mask(b, target, t, &zero_sig);
+        let next_mask = alg.signature_mask(b, next, t, &zero_sig);
 
         // Shrink record: E₀ (zero-sig) masked dim vs full dim of C_{s-1}.
-        if !b.is_trivial() {
+        if !A::profile_is_trivial(b) {
             self.shrink.borrow_mut().push(ShrinkRecord {
                 s,
                 t,
-                b: b.to_string(),
+                b: A::profile_name(b),
                 dim_c: target_dim,
                 dim_e0: target_mask.len(),
             });
@@ -838,7 +1010,7 @@ impl SignatureResolution {
         let kernel = masked.compute_kernel();
 
         // Image of d_s in the zero-signature block; new generators cover the rest.
-        let mut n = b.signature_matrix(alg, &self.differentials[s as usize], t, &zero_sig);
+        let mut n = signature_matrix(alg, b, &self.differentials[s as usize], t, &zero_sig);
         n.row_reduce();
         let next_row = n.rows();
         let num_new_gens = n.extend_image(0, n.columns(), &kernel, 0).len();
@@ -860,11 +1032,11 @@ impl SignatureResolution {
         // Signature-ordered corrections.
         let mut tmask: Vec<usize> = Vec::new();
         let mut nmask: Vec<usize> = Vec::new();
-        for signature in b.iter_signatures(t) {
+        for signature in alg.iter_signatures(b, t) {
             tmask.clear();
             nmask.clear();
-            tmask.extend(b.signature_mask(alg, target, t, &signature));
-            nmask.extend(b.signature_mask(alg, next, t, &signature));
+            tmask.extend(alg.signature_mask(b, target, t, &signature));
+            nmask.extend(alg.signature_mask(b, next, t, &signature));
 
             let full_matrix = self.differentials[s as usize - 1].get_partial_matrix(t, &tmask);
             let mut masked = AugmentedMatrix::new(TWO, tmask.len(), [nmask.len(), tmask.len()]);
@@ -912,9 +1084,16 @@ impl SignatureResolution {
     }
 }
 
-impl Default for SignatureResolution {
+impl SignatureResolution<CTauOpAlgebra> {
+    /// A resolution of `k` over the motivic $A_C/\tau$ (via its opposite algebra).
+    pub fn motivic() -> Self {
+        Self::new(Arc::new(CTauOpAlgebra::new()))
+    }
+}
+
+impl Default for SignatureResolution<CTauOpAlgebra> {
     fn default() -> Self {
-        Self::new()
+        Self::motivic()
     }
 }
 
@@ -1093,7 +1272,7 @@ mod tests {
         gres.compute_through_stem(Bidegree::s_t(max_s, max_t));
 
         // Signature engine.
-        let mut sres = SignatureResolution::new();
+        let mut sres = SignatureResolution::motivic();
         sres.compute_through_stem(max_s, max_t);
 
         // Compare over the bidegrees the generic engine actually computed (a stem
@@ -1115,6 +1294,66 @@ mod tests {
             checked += 1;
         }
         assert!(checked > 100, "too few bidegrees checked: {checked}");
+    }
+
+    #[test]
+    fn classical_signature_resolution_matches_generic() {
+        // The unification payoff: the SAME generic engine, instantiated over the
+        // classical MilnorAlgebra via `impl PAlgebra for MilnorAlgebra`, reproduces
+        // the classical Adams E₂ — validated rank-for-rank against the generic
+        // minimal-resolution engine over the same algebra. No opposite algebra:
+        // the standard Milnor basis is right-stable.
+        use std::sync::Arc;
+
+        use algebra::{milnor_algebra::MilnorAlgebra, module::FDModule};
+        use bivec::BiVec;
+        use fp::prime::TWO;
+        use sseq::coordinates::Bidegree;
+
+        use crate::{
+            chain_complex::{ChainComplex, FiniteChainComplex, FreeChainComplex},
+            resolution::Resolution,
+        };
+
+        let max_s = 10;
+        let max_t = 20;
+
+        // Generic reference over MilnorAlgebra.
+        let galg = Arc::new(MilnorAlgebra::new(TWO, false));
+        let gmod = Arc::new(FDModule::new(
+            Arc::clone(&galg),
+            "k".to_string(),
+            BiVec::from_vec(0, vec![1]),
+        ));
+        let gcc = Arc::new(FiniteChainComplex::<FDModule<MilnorAlgebra>>::ccdz(gmod));
+        let gres = Resolution::new(gcc);
+        gres.compute_through_stem(Bidegree::s_t(max_s, max_t));
+
+        // The generic signature engine over the classical algebra.
+        let mut sres = SignatureResolution::new(Arc::new(MilnorAlgebra::new(TWO, false)));
+        sres.compute_through_stem(max_s, max_t);
+
+        let mut checked = 0usize;
+        for b in gres.iter_stem() {
+            if b.t() > max_t {
+                continue;
+            }
+            let want = gres.number_of_gens_in_bidegree(b);
+            let got = sres.number_of_gens_in_bidegree(b.s(), b.t());
+            assert_eq!(
+                got,
+                want,
+                "classical rank mismatch at (s={}, t={}): signature={got} generic={want}",
+                b.s(),
+                b.t()
+            );
+            checked += 1;
+        }
+        assert!(checked > 50, "too few bidegrees checked: {checked}");
+        // Sanity spot-check: h_0, h_1, h_2, h_3 are the degree-(1, 2^i) classes.
+        assert_eq!(sres.number_of_gens_in_bidegree(1, 1), 1); // h_0
+        assert_eq!(sres.number_of_gens_in_bidegree(1, 2), 1); // h_1
+        assert_eq!(sres.number_of_gens_in_bidegree(1, 4), 1); // h_2
     }
 
     #[test]

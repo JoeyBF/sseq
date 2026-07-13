@@ -143,6 +143,31 @@ and the large `A(0)` region is irreducible. The `A(n)` below-line family is
 therefore already near-optimal; richer families (e.g. the above-line `F(n)`)
 were judged not worth the complexity for the achievable gain.
 
+## `PAlgebra` trait — unifying the ordinary and motivic engines
+
+The resolution engine is generic: `SignatureResolution<A: PAlgebra>`, where
+`PAlgebra` abstracts exactly the data Nassau's sweep needs (profiles,
+signatures, `signature_mask`, `optimal_profile`, dims/names). Two implementations:
+
+- `impl PAlgebra for CTauOpAlgebra` — the motivic case, over the opposite
+  algebra so the filtration is right-stable (`MotivicSubalgebra` profiles).
+- `impl PAlgebra for MilnorAlgebra` — the **classical** case, reusing the proven
+  `MilnorSubalgebra` machinery from `crate::nassau` (now `pub(crate)`); the
+  standard Milnor basis is already right-stable, so no opposite is needed.
+
+One engine drives both. Validated: `SignatureResolution<MilnorAlgebra>`
+reproduces the classical Adams `E_2` rank-for-rank against the generic engine
+over `MilnorAlgebra` (`classical_signature_resolution_matches_generic`), while
+`SignatureResolution<CTauOpAlgebra>` reproduces the motivic (unchanged). The
+handedness — the only real difference between the two cases — is confined to the
+trait `impl` (which algebra, direct vs. opposite), per the note
+`notes/opposite-algebra-nassau.tex`.
+
+Margolis's general `P`-algebras fit the same trait: any graded connected
+$\mathbb{F}_2$-Hopf algebra with a profile/signature structure and a
+right-stable (or opposite-right-stable) filtration is a `PAlgebra` and is
+resolvable by this engine unchanged.
+
 ## M6 — Signature-accelerated τ-lift (Algorithm 3)
 
 **Not attempted in this workspace.** M6 routes the `TauLift`'s inner `solve`

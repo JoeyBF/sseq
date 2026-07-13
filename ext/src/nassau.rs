@@ -82,8 +82,8 @@ const MAX_NEW_GENS: usize = 10;
 /// in Lemma 2.4 is just the (reverse) lexicographic ordering of the P parts. This corresponds to
 /// the ordering of $\mathcal{P}$ where $P^s_t < P^{s'}_t$ if $s < s'$).
 #[derive(Clone)]
-struct MilnorSubalgebra {
-    profile: Vec<u8>,
+pub struct MilnorSubalgebra {
+    pub(crate) profile: Vec<u8>,
 }
 
 impl MilnorSubalgebra {
@@ -96,7 +96,7 @@ impl MilnorSubalgebra {
     }
 
     /// The algebra with trivial profile, corresponding to the trivial algebra.
-    fn zero_algebra() -> Self {
+    pub(crate) fn zero_algebra() -> Self {
         Self { profile: vec![] }
     }
 
@@ -111,14 +111,14 @@ impl MilnorSubalgebra {
         true
     }
 
-    fn zero_signature(&self) -> Vec<PPartEntry> {
+    pub(crate) fn zero_signature(&self) -> Vec<PPartEntry> {
         vec![0; self.profile.len()]
     }
 
     /// Give a list of basis elements in degree `degree` that has signature `signature`.
     ///
     /// This requires passing the algebra for borrow checker reasons.
-    fn signature_mask<'a>(
+    pub(crate) fn signature_mask<'a>(
         &'a self,
         algebra: &'a MilnorAlgebra,
         module: &'a FreeModule<MilnorAlgebra>,
@@ -182,7 +182,10 @@ impl MilnorSubalgebra {
 
     /// Iterate through all signatures of this algebra that contain elements of degree at most
     /// `degree` (inclusive). This skips the initial zero signature.
-    fn iter_signatures(&self, degree: i32) -> impl Iterator<Item = Vec<PPartEntry>> + '_ {
+    pub(crate) fn iter_signatures(
+        &self,
+        degree: i32,
+    ) -> impl Iterator<Item = Vec<PPartEntry>> + '_ {
         SignatureIterator::new(self, degree)
     }
 
@@ -195,7 +198,7 @@ impl MilnorSubalgebra {
             .sum()
     }
 
-    fn optimal_for(b: Bidegree) -> Self {
+    pub(crate) fn optimal_for(b: Bidegree) -> Self {
         let b_is_in_vanishing_region = |subalgebra: &Self| {
             let coeff = (1 << subalgebra.profile.len()) - 1;
             b.t() >= coeff * (b.s() + 1) + subalgebra.top_degree()
