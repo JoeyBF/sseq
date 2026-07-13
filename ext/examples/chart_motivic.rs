@@ -57,11 +57,16 @@ fn main() -> anyhow::Result<()> {
         ws.sort_unstable();
     }
 
-    // The Page-`page` dimension of the (n, s, w) slice.
+    // The Page-`page` dimension of the (n, s, w) slice. The deformation SS is
+    // sparse — an (n, s, w) with no classes was never registered, and `page_data`
+    // panics on an unregistered degree — so an undefined slice is dimension 0.
     let dim_at = |n: i32, s: i32, w: i32| {
-        sseq.page_data(MultiDegree::from([n, s, w]))
-            .get_max(page)
-            .dimension()
+        let deg = MultiDegree::from([n, s, w]);
+        if sseq.defined(deg) {
+            sseq.page_data(deg).get_max(page).dimension()
+        } else {
+            0
+        }
     };
 
     // Flat index of the weight-`w` block within the projected (n, s) node: the
@@ -95,6 +100,14 @@ fn main() -> anyhow::Result<()> {
         let target = Deformation::profile(page, b);
         let [tn, ts, tw] = target.coords();
         if !in_box(tn, ts) {
+            continue;
+        }
+        // `target` cleared the (n, s) *range* check, but the SS is sparse: an
+        // in-range slice with no classes was never registered, and
+        // `page_data`/`differentials` panic on an unregistered degree. A d_page out
+        // of `b` can only land where classes exist, so an unregistered target
+        // carries no structlines — skip it.
+        if !sseq.defined(target) {
             continue;
         }
 
