@@ -105,6 +105,26 @@ shrink, timing, and shortcut/fallback counts. On the **n ≤ 40, s ≤ 22** box
 Both engines are runnable side by side; the signature engine is fully
 feature-gated (`sig-nassau`) and additive.
 
+### Scaling (s ≤ 22, increasing stem)
+
+| box (n) | gens | median shrink | max shrink | signature | generic | speedup |
+|--------:|-----:|--------------:|-----------:|----------:|--------:|--------:|
+| 40      | 1106 | 2.0×          | 48.2×      | 12.1 s    | 33.3 s  | 2.75×   |
+| 50      | 1730 | 2.0×          | 50.9×      | 57.9 s    | 177.4 s | 3.06×   |
+| 60      | 2449 | 5.9×          | 50.9×      | 265 s     | 763 s   | 2.88×   |
+
+Rank-for-rank correctness and `d²=0` hold at **every** box. At n=60 the
+vanishing-line `B` promotes the deepest bidegrees to `A(2)`: the largest single
+step is `(s=7, t=82)`, `B=A(2)`, dim C = 7128 → dim E₀C = 201 (**35.5×**).
+
+**Speedup is sub-linear in the shrink** (and dips slightly at n=60) by design:
+promoting a bidegree from `A(1)` to `A(2)` shrinks its `E₀` homology but runs the
+correction sweep over ~63 signatures instead of ~7, and this spike deliberately
+does **not** cache masks/partial matrices across signatures or parallelize the
+`E_R` solves (the classical engine does both). So the measured result is a
+*proof of shrink* with a ~3× end-to-end resolution-phase win; closing the gap to
+a shrink-proportional speedup is an optimization task, not a correctness one.
+
 ## M6 — Signature-accelerated τ-lift (Algorithm 3)
 
 **Not attempted in this workspace.** M6 routes the `TauLift`'s inner `solve`
