@@ -181,6 +181,10 @@ use crate::chain_complex::FiniteChainComplex;
 pub type CCC = FiniteChainComplex<SteenrodModule>;
 
 pub mod nassau;
+/// The motivic-Nassau spike: a signature-filtration resolution engine for `A_C/τ`.
+/// Feature-gated (`sig-nassau`), additive, and validated against the generic engine.
+#[cfg(feature = "sig-nassau")]
+pub mod motivic_nassau;
 pub mod secondary;
 pub mod utils;
 

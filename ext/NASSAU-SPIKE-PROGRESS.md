@@ -22,11 +22,43 @@ notes, and final numbers. Everything is built/run with
 - Baseline resolution-phase wall-clock on this box: **~1.83 s** (generic engine,
   release, single run; the whole box, not just one bidegree).
 
-## M1 — Signature combinatorics  ⏳ (in progress)
+## M1 — Signature combinatorics  ✅
 
-## M2 — B-trivial signature-graded multiplication
+- `ext/src/motivic_nassau.rs` (feature `sig-nassau`): [`MotivicSubalgebra`] —
+  a finite admissible `B ⊂ A_C/τ` as a **polynomial profile** `p_profile[i]`
+  (bound on `ξ_{i+1}`) plus an **exterior length** `q_len` (`Q_0…Q_{q_len-1} ∈
+  B`). So `A(n) = { p_profile: [n, n-1, …, 1], q_len: n+1 }`, e.g.
+  `A(0) = E(Q_0)`.
+- Signatures carry **both** parts (plan subtlety #1): `sig_q = E ∩
+  {Q_0…Q_{q_len-1}}`, `sig_p[i] = r_{i+1} mod 2^{p_profile[i]}` — the classical
+  low-bit convention on `Q(E)P(R)`.
+- Unit tests: `dim A(0)=2`, `dim A(1)=8`, `dim A(2)=64`, signature
+  well-definedness / partition, ordering strictly increasing.
 
-## M3 — MVP inductive step (B = A(0))
+## M2 — B-trivial signature-graded action  ✅
+
+- `signature_mask` / `signature_matrix` restrict the ordinary `A_C/τ` product to
+  a fixed signature over `FreeModule` (the "B-trivial" action, exactly as the
+  classical engine does — masking, not a separate matrix enumeration).
+- **Key finding (handedness).** The diagnostic `ext/examples/sig_diag.rs` sweeps
+  signature conventions against the *real* `A_C/τ` product and checks
+  acyclicity. Over `A_C/τ` no independent per-coordinate mod-`2^p` signature is
+  right-A-stable, but with the **classical low-bit** signature the **left**
+  multiplication *does* preserve `sig ≥ R` (the *right* factor is the floor) —
+  the **opposite handedness** to the classical polynomial case, and
+  degree-monotone. Result: `A(0)`, `A(1)`, `E(Q_0)`, `E(Q_0,Q_1)` are ACYCLIC
+  with signature-degree order.
+- Consequence: the engine resolves over the **opposite algebra**
+  [`CTauOpAlgebra`] (`a ·ᵒᵖ b = b·a`), so the free-module differential's source
+  operation becomes the right factor and the floor holds. The antipode gives
+  `(A_C/τ)^op ≅ A_C/τ`, so `Ext` ranks are **identical** — verified:
+  opposite-algebra generic resolution reproduces the golden total (130 on the
+  n≤20/s≤12 box).
+- Correction order: **signature degree ascending** (validated linear extension).
+- Tests: `product_raises_signature` (right-factor floor over the real product),
+  `signatures_sum_to_full_dimension`, `opposite_algebra_matches_golden_total`.
+
+## M3 — MVP inductive step (B = A(0))  ⏳ (in progress)
 
 ## M4 — General Algorithm 2 + generic fallback
 

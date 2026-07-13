@@ -59,6 +59,9 @@ concurrent = [
 odd-primes = ["fp/odd-primes", "algebra/odd-primes", "sseq/odd-primes"]
 logging = []
 nassau = []
+# The motivic-Nassau spike (signature-filtration engine for A_C/τ), additive and
+# validated against the generic engine. See NASSAU-SPIKE-PLAN.md.
+sig-nassau = []
 
 [workspace]
 members = [
