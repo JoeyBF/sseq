@@ -206,6 +206,20 @@ impl<const N: usize, P: SseqProfile<N>> Sseq<N, P> {
     ) -> bool {
         let target_b = P::profile(r, source.degree());
 
+        // A sparse spectral sequence (e.g. the trigraded deformation SS, where only
+        // degrees carrying generators are registered) may install a differential
+        // whose target — or an intermediate page's target `profile(r', source)` that
+        // `extend_differential`/`update_degree` probe — has no registered classes.
+        // Register any such gap as a 0-dimensional degree so those profile-shifted
+        // accesses don't index an absent degree. Dimension 0 is correct (no classes)
+        // and this is a no-op for a dense SS, where the targets already exist.
+        for r2 in P::MIN_R..=r {
+            let t = P::profile(r2, source.degree());
+            if !self.defined(t) {
+                self.set_dimension(t, 0);
+            }
+        }
+
         self.extend_differential(r, source.degree());
         self.extend_page_data(r + 1, source.degree());
         self.extend_page_data(r + 1, target_b);
@@ -592,6 +606,45 @@ mod tests {
 
     use super::*;
     use crate::coordinates::BidegreeElement;
+
+    /// A sparse spectral sequence may add a `d_r` (`r > MIN_R`) whose *intermediate*
+    /// page target `profile(r', source)` was never registered. `extend_differential`
+    /// and `update_degree` probe those degrees, so `add_differential` must fill the
+    /// gap (as a 0-dimensional degree) instead of indexing an absent one and
+    /// panicking. Regression for the trigraded deformation SS, which registers only
+    /// generator-bearing degrees and panicked with `no value at index [...]`.
+    #[test]
+    fn test_add_differential_fills_sparse_intermediate_targets() {
+        let p = ValidPrime::new(2);
+        let mut sseq = Sseq::<2, Adams>::new(p);
+        let source = Bidegree::x_y(1, 0);
+        let d3_target = Bidegree::x_y(0, 3); // profile(3, source) = source + (-1, 3)
+        let d2_gap = Bidegree::x_y(0, 2); // profile(2, source) — deliberately unregistered
+        sseq.set_dimension(source, 1);
+        sseq.set_dimension(d3_target, 1);
+        assert!(
+            !sseq.defined(d2_gap),
+            "precondition: the d2-intermediate target is an unregistered gap"
+        );
+
+        // Before the fix this panicked in `extend_differential` probing the gap.
+        sseq.add_differential(
+            3,
+            &BidegreeElement::new(source, FpVector::from_slice(p, &[1])),
+            FpVector::from_slice(p, &[1]).as_slice(),
+        );
+        sseq.update();
+
+        assert!(
+            sseq.defined(d2_gap),
+            "the gap was filled by add_differential"
+        );
+        assert_eq!(
+            sseq.dimension(d2_gap),
+            0,
+            "filled as a 0-dimensional degree"
+        );
+    }
 
     #[test]
     fn test_sseq_differential() {
