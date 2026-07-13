@@ -15,7 +15,11 @@ fn sig_of(e: u32, r: &[u32], qlen: usize, prof: &[u8], ext_high: bool, poly_high
         .enumerate()
         .map(|(i, &pp)| {
             let rk = r.get(i + 1).copied().unwrap_or(0);
-            if poly_high { rk >> pp } else { rk & ((1 << pp) - 1) }
+            if poly_high {
+                rk >> pp
+            } else {
+                rk & ((1 << pp) - 1)
+            }
         })
         .collect();
     (q, p)
@@ -102,7 +106,8 @@ fn test(name: &str, qlen: usize, prof: &[u8], eh: bool, ph: bool, right: bool) {
         }
     }
     println!(
-        "{name} qlen={qlen} prof={prof:?} eh={eh} ph={ph} right={right}: {} deg_monotone={deg_monotone} ({} nodes, {} edges)",
+        "{name} qlen={qlen} prof={prof:?} eh={eh} ph={ph} right={right}: {} \
+         deg_monotone={deg_monotone} ({} nodes, {} edges)",
         if ac { "ACYCLIC" } else { "CYCLE" },
         nodes.len(),
         edges.len()

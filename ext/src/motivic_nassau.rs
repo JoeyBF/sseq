@@ -607,7 +607,8 @@ mod tests {
                                 let sig = b.signature_of(*e, r);
                                 assert!(
                                     b.order_degree_key(&sig) >= key_b,
-                                    "product lowered signature: term of sig {:?} < sig(right={}) for B={b}",
+                                    "product lowered signature: term of sig {:?} < sig(right={}) \
+                                     for B={b}",
                                     sig,
                                     alg.basis_element_to_string(tb, ib),
                                 );
@@ -635,7 +636,10 @@ mod tests {
                 // The signature of every basis element is one we enumerated (its
                 // representative degree ≤ t since sig components are bounded by the
                 // element itself).
-                assert!(sigs.contains(&sig), "unenumerated signature {sig:?} at t={t}");
+                assert!(
+                    sigs.contains(&sig),
+                    "unenumerated signature {sig:?} at t={t}"
+                );
                 counted += 1;
             }
             assert_eq!(counted, alg.dimension(t));
@@ -647,7 +651,10 @@ mod tests {
         // Far below the vanishing line only F₂ (a plain step); high t admits A(n).
         assert!(MotivicSubalgebra::optimal_for(5, 3).is_trivial());
         let big = MotivicSubalgebra::optimal_for(2, 200);
-        assert!(!big.is_trivial(), "expected a nontrivial B high up, got {big}");
+        assert!(
+            !big.is_trivial(),
+            "expected a nontrivial B high up, got {big}"
+        );
     }
 
     #[test]
