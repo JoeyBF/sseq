@@ -136,6 +136,10 @@ impl MotivicResolution {
             .get_or_init(|| self.build_deformation_sseq())
     }
 
+    #[tracing::instrument(
+        skip(self),
+        fields(max = %self.max, top_page = tracing::field::Empty, num_higher_diffs = tracing::field::Empty)
+    )]
     fn build_deformation_sseq(&self) -> Sseq<3, Deformation> {
         let mut sseq = Sseq::<3, Deformation>::new(TWO);
 
@@ -215,6 +219,7 @@ impl MotivicResolution {
 
         let degrees: Vec<MultiDegree<3>> = sseq.iter_degrees().collect();
         let mut r = 2;
+        let mut num_higher_diffs = 0usize;
         loop {
             let mut to_add: Vec<(MultiDegree<3>, FpVector, FpVector)> = Vec::new();
             for &b in &degrees {
@@ -269,6 +274,7 @@ impl MotivicResolution {
                 if sseq.add_differential(r, &MultiDegreeElement::new(b, source), target.as_slice())
                 {
                     added = true;
+                    num_higher_diffs += 1;
                 }
             }
             sseq.update();
@@ -277,6 +283,9 @@ impl MotivicResolution {
             }
             r += 1;
         }
+        let span = tracing::Span::current();
+        span.record("top_page", r);
+        span.record("num_higher_diffs", num_higher_diffs);
 
         sseq
     }

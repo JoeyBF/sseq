@@ -191,6 +191,10 @@ impl MotivicResolution {
     /// The generators of `module` must be weight-homogeneous, seeded by
     /// [`Self::compute_weights`] from the s=0 cells; the trivial module needs no
     /// input (its one cell is the weight-0 unit).
+    #[tracing::instrument(
+        skip(module, save_dir),
+        fields(max = %max, compute = tracing::field::Empty, cached = tracing::field::Empty)
+    )]
     pub fn with_module(
         module: Arc<FDModule<CTauAlgebra>>,
         max: Bidegree,
@@ -223,12 +227,14 @@ impl MotivicResolution {
             .and_then(|v| v.parse().ok())
             .unwrap_or(1);
         let compute = Bidegree::n_s(max.n() + margin, max.s());
+        tracing::Span::current().record("compute", tracing::field::display(compute));
         let profile = std::env::var("MOT_PROFILE").is_ok();
         let t0 = std::time::Instant::now();
         resolution.compute_through_stem(compute);
         if profile {
-            use algebra::motivic::milnor::{PRODUCT_HITS, PRODUCT_MISSES, PRODUCT_NANOS};
             use std::sync::atomic::Ordering;
+
+            use algebra::motivic::milnor::{PRODUCT_HITS, PRODUCT_MISSES, PRODUCT_NANOS};
             eprintln!("[profile] resolution: {:?}", t0.elapsed());
             eprintln!(
                 "[profile]   products: {} miss + {} hit, {:?} in closed-form",
@@ -250,7 +256,9 @@ impl MotivicResolution {
         };
         // Load the weights + lifted differentials from disk if a matching cache
         // exists; otherwise compute them and save.
-        if this.load_lift(&save_dir) {
+        let cached = this.load_lift(&save_dir);
+        tracing::Span::current().record("cached", cached);
+        if cached {
             if profile {
                 eprintln!("[profile] lift:       loaded from disk");
             }
@@ -328,6 +336,7 @@ impl MotivicResolution {
     /// augmentation into the trivial module and `d_1`'s entries lie in the
     /// augmentation ideal. For `s ≥ 2` we start from the mod-$\tau$ support and
     /// cancel the $\tau$-divisible remainder of `d_{s-1} d_s`.
+    #[tracing::instrument(skip(self), fields(max = %self.max, num_lifted = tracing::field::Empty))]
     fn lift(&mut self) {
         // Wavefront over `s`: correcting a generator reads only its `s-1`
         // neighbors (the mod-τ targets at stem ≤ n and the δ-targets at stem
@@ -338,12 +347,14 @@ impl MotivicResolution {
             let gens: Vec<Gen> = (0..=t_max)
                 .flat_map(|t| (0..self.num_gens(s, t)).map(move |idx| Gen { s, t, idx }))
                 .collect();
+            let _span = tracing::info_span!("lift_s", s, num_gens = gens.len()).entered();
             let lifted: Vec<(Gen, BTreeSet<usize>)> = gens
                 .into_maybe_par_iter()
                 .map(|g| (g, self.lift_generator(g)))
                 .collect();
             self.lifted.extend(lifted);
         }
+        tracing::Span::current().record("num_lifted", self.lifted.len());
     }
 
     /// Lift a single generator's differential to `A_C`. Parallel-safe: it reads
@@ -478,6 +489,7 @@ impl MotivicResolution {
     /// `d(g)`. The unit generator has weight 0; higher weights propagate. Panics
     /// if any generator turns out weight-inhomogeneous (which would violate the
     /// bigraded structure and break the valuation representation).
+    #[tracing::instrument(skip(self), fields(num_weights = tracing::field::Empty))]
     fn compute_weights(&mut self) {
         // Built locally, then `Arc`-shared into `self.weights` (and the Ext DGA) — no copy.
         let mut weights: HashMap<Gen, i32> = HashMap::new();
@@ -521,6 +533,7 @@ impl MotivicResolution {
                 }
             }
         }
+        tracing::Span::current().record("num_weights", weights.len());
         self.weights = Arc::new(weights);
     }
 
@@ -723,7 +736,8 @@ trait TauLift {
         // Non-convergence within the cap: only outside the report cone (report-cone
         // cells converge). Never read by the report cohomology, so leave the partial.
         tracing::debug!(
-            "motivic lift did not converge at (s={}, t={}, idx={}); leaving partial (outside report cone)",
+            "motivic lift did not converge at (s={}, t={}, idx={}); leaving partial (outside \
+             report cone)",
             g.s,
             g.t,
             g.idx
@@ -788,9 +802,7 @@ impl TauLift for DifferentialCells<'_> {
 
 #[cfg(test)]
 mod tests {
-    use sseq::coordinates::{
-        BidegreeGenerator, degree::MultiDegree, element::MultiDegreeElement,
-    };
+    use sseq::coordinates::{BidegreeGenerator, degree::MultiDegree, element::MultiDegreeElement};
 
     use super::*;
 

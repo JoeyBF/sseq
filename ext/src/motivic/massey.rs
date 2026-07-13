@@ -44,6 +44,7 @@ impl MotivicResolution {
     /// [`ChainHomotopy`]; the τ-corrections make `dH + Hd = φ_bφ_a` hold over $A_C$,
     /// via the third [`TauLift`] instance ([`NullHomotopyCells`]). This is the datum
     /// a Massey product `⟨a, b, c⟩` is built from.
+    #[tracing::instrument(skip(self, a, b), fields(a = ?a, b = ?b))]
     pub(super) fn lift_nullhomotopy(
         &self,
         a: Gen,
@@ -244,6 +245,7 @@ impl NullHomotopyCells<'_> {
     fn shift_s(&self) -> i32 {
         self.a.s + self.b.s
     }
+
     fn shift_t(&self) -> i32 {
         self.a.t + self.b.t
     }

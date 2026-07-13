@@ -31,6 +31,7 @@ impl MotivicResolution {
     /// `s` ascending, since a cell's constant defect `φₐ(dg)` reads `φₐ` at `s-1`.
     /// This is the motivic product: reducing mod τ recovers the Cτ product, and the
     /// τ-powers are the hidden extensions (e.g. `h₀²h₂ = τ·h₁³`).
+    #[tracing::instrument(skip(self, a), fields(a = ?a))]
     pub(super) fn lift_product(&self, a: Gen, max_s: i32) -> HashMap<Gen, BTreeSet<usize>> {
         let wa = self.weights[&a];
         let a_deg = Bidegree::n_s(a.t - a.s, a.s);
