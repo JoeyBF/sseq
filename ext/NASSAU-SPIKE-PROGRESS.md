@@ -125,6 +125,24 @@ does **not** cache masks/partial matrices across signatures or parallelize the
 *proof of shrink* with a ~3× end-to-end resolution-phase win; closing the gap to
 a shrink-proportional speedup is an optimization task, not a correctness one.
 
+## Optimal `B`-selection ranges
+
+`optimal_for(s, t)` picks the applicable `B` of **largest dimension** (smallest
+`E₀ ≈ C/\dim B`, Nassau's heuristic) over the `A(n)` ladder plus the
+pure-exterior `E(Q_0..Q_k)` intermediates, each admitted by its own **sound**
+below-line bound `t > (2^{q_len}-1)(s+1) + \tau_B` (slope set by the largest
+Bockstein, Lemma 2.6 / Thm 3.1) — never below a `B`'s vanishing line, so ranks
+stay correct rather than fallback-corrected.
+
+The `B` histogram on n≤40 is `A(0)×583, A(1)×359, A(2)×33, E(Q_0..Q_1)×33`. The
+finer ladder upgrades only 33 bidegrees (A(0)→E(Q_0,Q_1)), moving aggregate
+shrink 5.1→5.2×. This is not a tuning failure but a **structural** fact:
+admissibility couples the two parts — `Q_0·ξ_1 ∋ Q_1` forces any `B ∋ ξ_1, Q_0`
+to contain `Q_1` — so no sound `B` has `A(0)`'s slope-1 line with better shrink,
+and the large `A(0)` region is irreducible. The `A(n)` below-line family is
+therefore already near-optimal; richer families (e.g. the above-line `F(n)`)
+were judged not worth the complexity for the achievable gain.
+
 ## M6 — Signature-accelerated τ-lift (Algorithm 3)
 
 **Not attempted in this workspace.** M6 routes the `TauLift`'s inner `solve`

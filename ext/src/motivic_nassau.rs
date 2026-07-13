@@ -159,7 +159,8 @@ impl Algebra for CTauOpAlgebra {
 /// is `p_profile = []`, `q_len = 1`), and `F₂` is `p_profile = []`, `q_len = 0`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MotivicSubalgebra {
-    /// `p_profile[i]` = profile exponent for `ξ_{i+1}` (B allows `r_{i+1} < 2^{p_profile[i]}`).
+    /// `p_profile[i]` = profile exponent for `ξ_{i+1}` (B allows `r_{i+1} < 2^{p_profile[i]}`;
+    /// `p_profile[i] = 0` means `ξ_{i+1} ∉ B`). Entries beyond the vector are `0`.
     p_profile: Vec<u8>,
     /// `Q_0, …, Q_{q_len-1}` are the exterior generators in B.
     q_len: usize,
@@ -468,22 +469,54 @@ impl MotivicSubalgebra {
         result
     }
 
-    /// Choose the largest subalgebra in the `A(n)` ladder that is applicable at
-    /// bidegree `(s, t)` by the below-line vanishing bound (Thm 3.1): `A(n)` is
-    /// valid when `t > ρ_n·(s+1) + τ_B`, with `ρ_n = 2^{n+1} - 1` and `τ_B =
-    /// top_degree(A(n))`. Returns [`MotivicSubalgebra::trivial`] (a plain step)
-    /// when no nontrivial `A(n)` qualifies — the generic fallback.
+    /// The largest exterior index in `B` (`Q_{q_len-1}`), or `None` if `B` has no
+    /// exterior part.
+    fn max_bockstein(&self) -> Option<usize> {
+        self.q_len.checked_sub(1)
+    }
+
+    /// Whether Algorithm 2 is provably valid at `(s, t)` for this `B`, by the
+    /// below-line bound (Nassau Thm 3.1): with `B ⊆ A(n)` where `n = q_len-1` is
+    /// the largest Bockstein, `A(n)` has slope `ρ_n = |Q_n| = 2^{n+1}-1`, and the
+    /// step is valid once `t > ρ_n·(s+1) + τ_B` with `τ_B = top_degree(B)`. The
+    /// slope is set by the largest Bockstein (Lemma 2.6), so a `B ⊊ A(n)` shares
+    /// `A(n)`'s slope but has a smaller intercept `τ_B`, hence applies slightly
+    /// sooner. This is **sound** (never applies `B` below its vanishing line), so
+    /// the resulting ranks are always correct — not merely fallback-corrected.
+    pub fn applicable(&self, s: i32, t: i32) -> bool {
+        match self.max_bockstein() {
+            None => false, // trivial B: no shortcut, handled as a plain step.
+            Some(n) => {
+                let rho = (1i64 << (n + 1)) - 1;
+                (t as i64) > rho * (s as i64 + 1) + self.top_degree() as i64
+            }
+        }
+    }
+
+    /// Choose the applicable subalgebra of **largest `F₂`-dimension** at `(s, t)`
+    /// — the one with the smallest zero-signature piece `E₀C ≈ C/\dim B`, Nassau's
+    /// practical heuristic. The candidate ladder is the `A(n)` family together with
+    /// the pure-exterior `E(Q_0, …, Q_{k-1})` subalgebras (which share `A(k-1)`'s
+    /// vanishing slope but a smaller intercept, so they can apply in a thin band
+    /// just below the next `A(n)`). Returns [`MotivicSubalgebra::trivial`] when
+    /// nothing qualifies — the plain step.
+    ///
+    /// Admissibility couples the two parts: `Q_0·ξ_1 ∋ Q_1`, so any `B` containing
+    /// `ξ_1` and `Q_0` must contain `Q_1`. Consequently no sound `B` improves on
+    /// `A(0)`'s slope-1 line, and the large `A(0)`-region is essentially
+    /// irreducible; the finer ladder only helps in the narrow inter-`A(n)` bands.
     pub fn optimal_for(s: i32, t: i32) -> Self {
         let mut best = Self::trivial();
-        for n in 0.. {
-            let cand = Self::a_n(n);
-            let rho = (1i64 << (n + 1)) - 1;
-            let bound = rho * (s as i64 + 1) + cand.top_degree() as i64;
-            if (t as i64) > bound {
+        let mut best_dim = 1u64;
+        // A(n) ladder and pure-exterior E(Q_0..Q_{k-1}) ladder. 8 levels covers any
+        // feasible box (A(8) already has top_degree in the thousands).
+        let candidates = (0..=8)
+            .map(Self::a_n)
+            .chain((1..=9).map(|k| Self::new(vec![], k)));
+        for cand in candidates {
+            if cand.applicable(s, t) && cand.dimension() > best_dim {
+                best_dim = cand.dimension();
                 best = cand;
-            } else {
-                // top_degree only grows, so once we fail we will keep failing.
-                break;
             }
         }
         best
@@ -506,8 +539,11 @@ impl std::fmt::Display for MotivicSubalgebra {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         if self.is_trivial() {
             write!(f, "F₂")
-        } else if self.p_profile == Self::a_n(self.q_len - 1).p_profile && self.q_len > 0 {
+        } else if self.q_len > 0 && self.p_profile == Self::a_n(self.q_len - 1).p_profile {
             write!(f, "A({})", self.q_len - 1)
+        } else if self.p_profile.iter().all(|&e| e == 0) {
+            // Pure exterior E(Q_0, …, Q_{q_len-1}).
+            write!(f, "E(Q_0..Q_{})", self.q_len - 1)
         } else {
             write!(f, "B(q_len={}, p={:?})", self.q_len, self.p_profile)
         }
