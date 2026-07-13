@@ -26,3 +26,6 @@ pub use tau::Tau;
 
 pub mod milnor;
 pub use milnor::MotivicMilnorAlgebra;
+
+pub mod ctau;
+pub use ctau::CTauAlgebra;
