@@ -76,7 +76,7 @@ impl From<i32> for MultiDegree<1> {
 }
 
 impl From<MultiDegree<1>> for i32 {
-    fn from(d: MultiDegree<1>) -> i32 {
+    fn from(d: MultiDegree<1>) -> Self {
         d.coords[0]
     }
 }
