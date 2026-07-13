@@ -74,6 +74,10 @@ members = [
     "crates/sseq",
 ]
 
+[[example]]
+name = "motivic_nassau_validate"
+required-features = ["sig-nassau"]
+
 [[bench]]
 name = "resolve"
 harness = false

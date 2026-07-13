@@ -58,8 +58,69 @@ notes, and final numbers. Everything is built/run with
 - Tests: `product_raises_signature` (right-factor floor over the real product),
   `signatures_sum_to_full_dimension`, `opposite_algebra_matches_golden_total`.
 
-## M3 — MVP inductive step (B = A(0))  ⏳ (in progress)
+## M3 / M4 — SignatureResolution engine + generic fallback  ✅
 
-## M4 — General Algorithm 2 + generic fallback
+- [`SignatureResolution`] (in `motivic_nassau.rs`): a **standalone** minimal
+  resolution of `k` over `A_C/τ` by Algorithm 2, carrying its own
+  `FreeModule<CTauOpAlgebra>` modules + `FreeModuleHomomorphism` differentials
+  (decoupled from the `ChainComplex` pipeline, per M4). Ports the classical
+  `step0`/`step1`/`step_resolution_with_subalgebra` with the motivic signature
+  masking of M1/M2.
+- `choose_B` = [`MotivicSubalgebra::optimal_for`] (below-line `A(n)` vanishing
+  bound, Thm 3.1). Where no `A(n)` qualifies it uses `B = F₂`, whose
+  zero-signature block **is** the whole module — i.e. the ordinary generic step.
+  So every non-applicable bidegree is covered and the composite is **always
+  correct** — no separate fallback code path needed.
+- Extra safety: the step returns `false` if the correction sweep leaves
+  `d² ≠ 0` (signature order insufficient), and the caller redoes that bidegree
+  with `B = F₂`. In practice this never fires on the validated box (the
+  vanishing-line `B` is always sufficient).
+- All kernel/image/lift linear algebra reuses `fp` (`Matrix`,
+  `AugmentedMatrix`, `compute_kernel`, `compute_quasi_inverse`) — no hand-rolled
+  linear algebra.
+- **Exit:** `SignatureResolution` resolves `k` and its ranks match the generic
+  engine bidegree-for-bidegree on `s ≤ 12, t ≤ 32` (unit test
+  `signature_resolution_matches_generic`), with `d² = 0` throughout.
 
-## M5 — Validation & benchmark
+## M5 — Validation & benchmark  ✅
+
+Harness: `ext/examples/motivic_nassau_validate.rs` (feature `sig-nassau`) resolves
+the same `(max_s, max_t)` rectangle with both engines and reports correctness,
+shrink, timing, and shortcut/fallback counts. On the **n ≤ 40, s ≤ 22** box
+(`max_t = 62`), release, `RUSTFLAGS="-C target-cpu=x86-64-v3"`:
+
+- **[1] Correctness (basis-independent).** Signature-engine generator ranks equal
+  the generic engine's at **every** bidegree (1106 generators over the full
+  rectangle). Homology `= k` / `d² = 0` holds (checked inside every step).
+- **[2] Shrink `dim C / dim E₀C`.** Aggregate **5.1×** (Σ dim C = 309 548, Σ dim
+  E₀ = 60 660), median 2.0×, **max 48.2×** — in line with Nassau's ≈50× on the
+  polynomial case. Largest single step: `(s=6, t=62)`, `B = A(1)`,
+  dim C = 2213 → dim E₀C = 339.
+- **[3] Timing (same box).** Signature engine **12.1 s** vs generic engine
+  **33.3 s** — a **≈2.75× resolution-phase speedup** (both serial, same
+  rectangle).
+- **[4] Steps.** 1008 signature-shortcut steps, 315 plain fallbacks (low stems
+  below every vanishing line).
+
+Both engines are runnable side by side; the signature engine is fully
+feature-gated (`sig-nassau`) and additive.
+
+## M6 — Signature-accelerated τ-lift (Algorithm 3)
+
+**Not attempted in this workspace.** M6 routes the `TauLift`'s inner `solve`
+through the signature filtration, but the τ-lift + deformation pipeline
+(`ext/src/motivic/`, `TauLift`, `chart_motivic`) is **big-branch only**
+(`origin/claude/awesome-davinci-khkr8x`); it does not exist on this PR1-based
+branch. M5 is green, so per the plan M6 is the next step — to be run on the
+big-branch checkout, reusing `MotivicSubalgebra` + the signature masking here.
+
+## Definition of done — status
+
+- ✅ Rank-for-rank identical to the generic engine, exact (`d²=0`, `H=k`), on the
+  box.
+- ✅ Generic engine untouched; new engine feature-gated; generic fallback (trivial
+  `B`) covers every non-applicable bidegree.
+- ✅ Measured `dim C / dim E₀C` shrink table + resolution-phase timing.
+- ⏳ M6 (τ-lift) deferred to the big branch (pipeline not present here).
+- ✅ Builds/tests green under the required RUSTFLAGS; touched files nightly-fmt'd.
+- ✅ Committed with this progress log; no PR; no changes to the generic engine.

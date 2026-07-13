@@ -515,9 +515,10 @@ impl std::fmt::Display for MotivicSubalgebra {
 }
 
 /// Iterate over the `(e_mask, r)` monomials of every `A_C/τ` basis element of a
-/// given topological degree, paired with its in-degree index. Reads the shared
+/// given topological degree. Reads the shared
 /// [`MotivicMilnorAlgebra`](algebra::motivic::MotivicMilnorAlgebra) basis under
-/// `CTauAlgebra`.
+/// `CTauAlgebra`. (Used by the signature tests.)
+#[cfg(test)]
 pub(crate) fn basis_monomials(alg: &CTauOpAlgebra, degree: i32) -> Vec<(u32, Vec<u32>)> {
     alg.compute_basis(degree);
     let engine = alg.inner().engine();
