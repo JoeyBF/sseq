@@ -972,7 +972,19 @@ impl PAlgebra for MilnorAlgebra {
     type Profile = SteenrodProfile;
 
     fn optimal_profile(&self, s: i32, t: i32) -> SteenrodProfile {
-        SteenrodProfile::optimal_for(self.prime(), s, t)
+        if self.profile().is_trivial() {
+            // Full Steenrod algebra: the A(n)/vanishing-line ladder (Thm 3.1).
+            SteenrodProfile::optimal_for(self.prime(), s, t)
+        } else {
+            // A finite ambient (e.g. A(2), for tmf): the full-algebra vanishing
+            // lines do not apply, and — with no runtime fallback — applying a
+            // sub-`B` below its (different, and here unimplemented) vanishing
+            // region would give *silently* wrong ranks. So we take plain steps
+            // (trivial `B`), which are always correct. A finite algebra is small,
+            // so the plain resolution is cheap; a sound sub-`B` shortcut for
+            // finite ambients (a change-of-rings vanishing line) is future work.
+            SteenrodProfile::trivial(self.prime())
+        }
     }
 
     fn basis_element_signature(
@@ -1613,6 +1625,89 @@ mod tests {
         assert_eq!(sres.number_of_gens_in_bidegree(1, 1), 1); // h_0
         assert_eq!(sres.number_of_gens_in_bidegree(1, 2), 1); // h_1
         assert_eq!(sres.number_of_gens_in_bidegree(1, 4), 1); // h_2
+    }
+
+    #[test]
+    fn tmf_resolution_over_a2_matches_generic() {
+        // tmf: Ext_{A(2)}(F₂, F₂) is the tmf Adams E₂. Resolve k over A(2) (a
+        // finite MilnorAlgebra ambient) with the signature engine and check it
+        // against the generic engine rank-for-rank, plus a few certain structural
+        // facts of the tmf chart — including the *absence* of h₃ (Sq⁸ ∉ A(2)),
+        // which distinguishes A(2) from the full Steenrod algebra.
+        use std::sync::Arc;
+
+        use algebra::{
+            milnor_algebra::{MilnorAlgebra, MilnorProfile},
+            module::FDModule,
+        };
+        use bivec::BiVec;
+        use fp::prime::TWO;
+        use sseq::coordinates::Bidegree;
+
+        use crate::{
+            chain_complex::{ChainComplex, FiniteChainComplex, FreeChainComplex},
+            resolution::Resolution,
+        };
+
+        // A(2): ξ_1 < 2³, ξ_2 < 2², ξ_3 < 2¹ (dim 64).
+        let a2 = || {
+            MilnorAlgebra::new_with_profile(
+                TWO,
+                MilnorProfile {
+                    q_part: !0,
+                    p_part: vec![3, 2, 1],
+                    truncated: true,
+                },
+                false,
+            )
+        };
+
+        let max_s = 14;
+        let max_t = 44;
+
+        let galg = Arc::new(a2());
+        let gmod = Arc::new(FDModule::new(
+            Arc::clone(&galg),
+            "k".to_string(),
+            BiVec::from_vec(0, vec![1]),
+        ));
+        let gcc = Arc::new(FiniteChainComplex::<FDModule<MilnorAlgebra>>::ccdz(gmod));
+        let gres = Resolution::new(gcc);
+        gres.compute_through_stem(Bidegree::s_t(max_s, max_t));
+
+        let mut sres = SignatureResolution::new(Arc::new(a2()));
+        sres.compute_through_stem(max_s, max_t);
+
+        let mut checked = 0usize;
+        for b in gres.iter_stem() {
+            if b.t() > max_t {
+                continue;
+            }
+            let want = gres.number_of_gens_in_bidegree(b);
+            let got = sres.number_of_gens_in_bidegree(b.s(), b.t());
+            assert_eq!(
+                got,
+                want,
+                "tmf rank mismatch at (s={}, n={}): signature={got} generic={want}",
+                b.s(),
+                b.n()
+            );
+            checked += 1;
+        }
+        assert!(checked > 80, "too few bidegrees checked: {checked}");
+
+        // Certain tmf E₂ facts (s = filtration, stem n = t − s):
+        let gens = |s: i32, n: i32| sres.number_of_gens_in_bidegree(s, n + s);
+        assert_eq!(gens(0, 0), 1, "unit"); //  1
+        assert_eq!(gens(1, 0), 1, "h_0"); //  h_0 ∈ Ext^{1,1}
+        assert_eq!(gens(1, 1), 1, "h_1"); //  h_1 ∈ Ext^{1,2}
+        assert_eq!(gens(1, 3), 1, "h_2"); //  h_2 ∈ Ext^{1,4}
+        assert_eq!(gens(1, 7), 0, "no h_3"); //  Sq⁸ ∉ A(2) ⇒ no h_3
+        assert_eq!(gens(1, 2), 0, "no class in (1, stem 2)");
+        // The h_0-tower in stem 0: Ext^{s,s} = 1 for every s.
+        for s in 0..=max_s {
+            assert_eq!(gens(s, 0), 1, "h_0-tower rank at s={s}");
+        }
     }
 
     #[test]

@@ -222,6 +222,28 @@ correct. The $p = 2$ classical and motivic validations are unchanged.
 One engine now spans: motivic $A_C/\tau$ ($p=2$, opposite), classical Steenrod
 ($p=2$, direct), odd-primary Steenrod ($p=3,5$, direct).
 
+### Finite ambients — tmf over `A(2)`
+
+The engine also resolves over a **finite** sub-Hopf-algebra as the ground ring.
+`Ext_{A(2)}(F_2, F_2)` is the tmf Adams `E_2`, so resolving `k` over `A(2)`
+(`MilnorAlgebra::new_with_profile`, `p_part = [3,2,1]`, dim 64) computes tmf.
+
+`optimal_profile` is **ambient-aware**: for the full algebra it uses the
+`A(n)`/vanishing-line ladder; for a finite ambient (nontrivial profile) it
+returns the trivial profile, i.e. **plain steps**. This is deliberate — the
+full-algebra vanishing lines (Thm 3.1) do not apply to a finite ambient, and
+with the fallback gone, applying a sub-`B` below its (different, unimplemented)
+vanishing region would give *silently* wrong ranks (the `d²=0` assert only
+checks the complex is a complex, not that the ranks are right). A finite algebra
+is small, so plain steps are cheap; a sound sub-`B` shortcut for finite ambients
+(a change-of-rings vanishing line) is future work.
+
+Validated (`tmf_resolution_over_a2_matches_generic`, `examples/tmf.rs`): the
+`A(2)` resolution matches the generic engine rank-for-rank on stem ≤ 30, and the
+chart shows the tmf `E_2` — the `h_0`-tower in stem 0, `h_1`/`h_2`, the `c_0`
+family, the onset of Δ-periodicity around stem 24 — and crucially **no `h_3`**
+(`Sq⁸ ∉ A(2)`), which distinguishes `A(2)` from the full Steenrod algebra.
+
 ## M6 — Signature-accelerated τ-lift (Algorithm 3)
 
 **Not attempted in this workspace.** M6 routes the `TauLift`'s inner `solve`

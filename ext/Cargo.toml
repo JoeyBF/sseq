@@ -78,6 +78,10 @@ members = [
 name = "motivic_nassau_validate"
 required-features = ["sig-nassau"]
 
+[[example]]
+name = "tmf"
+required-features = ["sig-nassau"]
+
 [[bench]]
 name = "resolve"
 harness = false
