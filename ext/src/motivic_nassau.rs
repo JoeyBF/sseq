@@ -845,7 +845,34 @@ impl SteenrodProfile {
         (t as i64) > self.rho() * (s as i64 + 1) + self.top_degree() as i64
     }
 
-    fn optimal_for(prime: ValidPrime, s: i32, t: i32) -> Self {
+    /// Whether `B ⊆` the ambient sub-Hopf-algebra given by `ambient`
+    /// ([`MilnorProfile`]). Required when resolving over a **finite** ambient
+    /// (e.g. `A(2)` for tmf): only a `B` that is actually a sub-Hopf-algebra of
+    /// the ground ring is a valid choice. For the full algebra (trivial profile,
+    /// unbounded) every `B` qualifies.
+    fn subseteq(&self, ambient: &algebra::milnor_algebra::MilnorProfile) -> bool {
+        if self.q_part & !ambient.q_part != 0 {
+            return false;
+        }
+        self.p_profile
+            .iter()
+            .enumerate()
+            .all(|(i, &e)| e as u32 <= ambient.get_p_part(i))
+    }
+
+    /// The applicable `B ⊆ ambient` of largest dimension at `(s, t)`. The
+    /// vanishing line `t > ρ(s+1) + τ_B` is intrinsic to `B` (from `Ext_B`'s
+    /// vanishing above `B`'s top-Bockstein line, Lemma 2.6), so it holds for any
+    /// ambient containing `B` — including a finite one. The only ambient-dependence
+    /// is the **cap** `B ⊆ ambient`. When the ambient itself (e.g. `A(2)`) is the
+    /// applicable `B`, that happens above its top line, where `Ext_ambient = 0` —
+    /// resolved to zero essentially for free.
+    fn optimal_for(
+        prime: ValidPrime,
+        ambient: &algebra::milnor_algebra::MilnorProfile,
+        s: i32,
+        t: i32,
+    ) -> Self {
         let mut best = Self::trivial(prime);
         let mut best_dim = 1u64;
         // A(n) ladder for every prime; at odd p also the pure-exterior
@@ -863,7 +890,7 @@ impl SteenrodProfile {
                 .collect()
         };
         for cand in a_ns.chain(exteriors) {
-            if cand.applicable(s, t) && cand.dimension() > best_dim {
+            if cand.subseteq(ambient) && cand.applicable(s, t) && cand.dimension() > best_dim {
                 best_dim = cand.dimension();
                 best = cand;
             }
@@ -972,19 +999,13 @@ impl PAlgebra for MilnorAlgebra {
     type Profile = SteenrodProfile;
 
     fn optimal_profile(&self, s: i32, t: i32) -> SteenrodProfile {
-        if self.profile().is_trivial() {
-            // Full Steenrod algebra: the A(n)/vanishing-line ladder (Thm 3.1).
-            SteenrodProfile::optimal_for(self.prime(), s, t)
-        } else {
-            // A finite ambient (e.g. A(2), for tmf): the full-algebra vanishing
-            // lines do not apply, and — with no runtime fallback — applying a
-            // sub-`B` below its (different, and here unimplemented) vanishing
-            // region would give *silently* wrong ranks. So we take plain steps
-            // (trivial `B`), which are always correct. A finite algebra is small,
-            // so the plain resolution is cheap; a sound sub-`B` shortcut for
-            // finite ambients (a change-of-rings vanishing line) is future work.
-            SteenrodProfile::trivial(self.prime())
-        }
+        // The `A(n)`/vanishing-line ladder (Thm 3.1), **capped at the ambient**
+        // `B ⊆ self.profile()`. The vanishing line is intrinsic to `B` (from
+        // `Ext_B` vanishing above `B`'s top-Bockstein line), so it holds over a
+        // finite ambient (e.g. `A(2)` for tmf) exactly as over the full algebra —
+        // the only ambient-dependence is the cap. For the full algebra the profile
+        // is trivial (unbounded) and the cap is vacuous.
+        SteenrodProfile::optimal_for(self.prime(), self.profile(), s, t)
     }
 
     fn basis_element_signature(
@@ -1708,6 +1729,12 @@ mod tests {
         for s in 0..=max_s {
             assert_eq!(gens(s, 0), 1, "h_0-tower rank at s={s}");
         }
+
+        // The signature shortcut fires over the finite ambient: the vanishing line
+        // is intrinsic to B, so B ⊆ A(2) accelerates the resolution (it is not
+        // reduced to plain steps).
+        let (sig_steps, _plain) = sres.stats();
+        assert!(sig_steps > 0, "no signature shortcut fired over A(2)");
     }
 
     #[test]

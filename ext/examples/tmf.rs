@@ -1,10 +1,10 @@
 //! tmf via the signature engine: resolve `k` over `A(2)` and print the Adams
 //! `E₂ = Ext_{A(2)}(F₂, F₂)` chart (the tmf Adams `E₂`).
 //!
-//! `A(2)` is a *finite* ambient, so the engine takes plain steps (the full-algebra
-//! vanishing-line shortcut does not apply); the point here is that the same engine
-//! resolves over a finite sub-Hopf-algebra and reproduces the famous tmf chart.
-//! Cross-checked against the generic engine over `A(2)`.
+//! `A(2)` is a *finite* ambient. The vanishing-line shortcut still applies — the
+//! line is intrinsic to each `B` — with `B` **capped at the ambient** (`B ⊆
+//! A(2)`); where `A(2)` itself is the applicable `B`, we are above its top line
+//! and `Ext_{A(2)} = 0` for free. Cross-checked against the generic engine.
 //!
 //! ```text
 //! RUSTFLAGS="-C target-cpu=x86-64-v3" cargo run --release --features sig-nassau \
@@ -79,7 +79,9 @@ fn main() -> anyhow::Result<()> {
         }
     );
     let (sig, plain) = sres.stats();
-    println!("# steps: signature-shortcut {sig}, plain {plain}  (A(2) finite ⇒ plain)\n");
+    println!(
+        "# steps: signature-shortcut {sig}, plain {plain}  (B ⊆ A(2), capped at the ambient)\n"
+    );
 
     // ASCII chart: rows = filtration s (high at top), cols = stem n. A rank r>0 is
     // printed as its digit (or `·` for 1), blank for 0.

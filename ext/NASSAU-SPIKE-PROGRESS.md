@@ -228,21 +228,24 @@ The engine also resolves over a **finite** sub-Hopf-algebra as the ground ring.
 `Ext_{A(2)}(F_2, F_2)` is the tmf Adams `E_2`, so resolving `k` over `A(2)`
 (`MilnorAlgebra::new_with_profile`, `p_part = [3,2,1]`, dim 64) computes tmf.
 
-`optimal_profile` is **ambient-aware**: for the full algebra it uses the
-`A(n)`/vanishing-line ladder; for a finite ambient (nontrivial profile) it
-returns the trivial profile, i.e. **plain steps**. This is deliberate — the
-full-algebra vanishing lines (Thm 3.1) do not apply to a finite ambient, and
-with the fallback gone, applying a sub-`B` below its (different, unimplemented)
-vanishing region would give *silently* wrong ranks (the `d²=0` assert only
-checks the complex is a complex, not that the ranks are right). A finite algebra
-is small, so plain steps are cheap; a sound sub-`B` shortcut for finite ambients
-(a change-of-rings vanishing line) is future work.
+`optimal_profile` uses the `A(n)`/vanishing-line ladder **capped at the ambient**
+(`B ⊆ self.profile()`). The vanishing line `t > ρ(s+1) + τ_B` is **intrinsic to
+`B`** — it comes from `Ext_B` vanishing above `B`'s own top-Bockstein line
+(Lemma 2.6) — so it applies over a finite ambient exactly as over the full
+algebra. The *only* ambient-dependence is the cap: a valid `B` must actually be a
+sub-Hopf-algebra of the ground ring (`A(3) ⊄ A(2)`, so it is excluded). When
+`A(2)` itself is the applicable `B` (high `t`), that is above its top line where
+`Ext_{A(2)} = 0`, so those bidegrees resolve to zero essentially for free. (An
+earlier version conservatively used plain steps for finite ambients; that was
+unnecessary — the missing piece was the cap, not the vanishing lines.)
 
 Validated (`tmf_resolution_over_a2_matches_generic`, `examples/tmf.rs`): the
-`A(2)` resolution matches the generic engine rank-for-rank on stem ≤ 30, and the
-chart shows the tmf `E_2` — the `h_0`-tower in stem 0, `h_1`/`h_2`, the `c_0`
-family, the onset of Δ-periodicity around stem 24 — and crucially **no `h_3`**
-(`Sq⁸ ∉ A(2)`), which distinguishes `A(2)` from the full Steenrod algebra.
+`A(2)` resolution matches the generic engine **rank-for-rank** — on stem ≤ 50,
+s ≤ 24 in the example — and the signature shortcut fires (**1357** shortcut vs
+368 plain steps there; `B ⊆ A(2)`). The chart shows the tmf `E_2` — the
+`h_0`-tower in stem 0, `h_1`/`h_2`, the `c_0` family, the onset of Δ-periodicity
+around stem 24 — and crucially **no `h_3`** (`Sq⁸ ∉ A(2)`), which distinguishes
+`A(2)` from the full Steenrod algebra.
 
 ## M6 — Signature-accelerated τ-lift (Algorithm 3)
 
