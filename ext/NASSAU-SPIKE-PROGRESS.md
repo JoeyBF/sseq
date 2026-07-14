@@ -129,6 +129,48 @@ does **not** cache masks/partial matrices across signatures or parallelize the
 *proof of shrink* with a ~3× end-to-end resolution-phase win; closing the gap to
 a shrink-proportional speedup is an optimization task, not a correctness one.
 
+### Performance: stem region + allocation-free signatures  ✅
+
+Two engine-level fixes (see `PERF-NOTES.md` for the full investigation), both
+landed with the `d²=0` assert and the rank cross-checks guarding correctness:
+
+1. **Stem region, not the constant-`t` diagonal.**
+   `SignatureResolution::compute_through_stem(max_s, max_t)` looped `{s ≤ max_s,
+   t ≤ max_t}`. On the `(n, s)` grid that is the slope-(−1) diagonal `n + s =
+   max_t`, fanning out to stem `max_t` at `s = 0` — the low-`s`, high-`n` corner,
+   which is the *expensive* corner because `dim A` grows with degree. Now the loop
+   gates `t − s > max_n → continue`, computing the `(n, s)` stem rectangle `{n ≤
+   max_n, s ≤ max_s}` master already computed. The top boundary reads its `(s−1)`
+   neighbour one stem higher (skipped), but that neighbour's degree-`t` generators
+   map to nonzero images so they never enter the kernel we hit — the same
+   phantom-boundary read master makes at its `distance == 1` cells. On the
+   classical sphere this cut the `2 60 30` box from **18.9 s → 1.66 s**.
+
+2. **Allocation-free coset check.** `signature_mask`'s inner loop decided coset
+   membership by allocating a whole signature (a `Vec`-carrying struct) per basis
+   element — 62M times on `2 80 40` — comparing with `==` and dropping it. Added
+   `PAlgebra::basis_element_has_signature`, a field-by-field check that allocates
+   nothing (both algebras override it). `signature_mask` 1639 ms → 579 ms.
+
+On the classical sphere the signature engine is now on par with master's
+hand-tuned `nassau.rs` (`2 80 40`: **14.8 s** vs 14.1 s) and well ahead of the
+generic engine (23.7 s).
+
+### Motivic scaling after the region fix (stem region, `s ≈ n/2`)
+
+| region (n, s) | gens | shrink (agg) | median | max | signature | generic | speedup |
+|--------------:|-----:|-------------:|-------:|----:|----------:|--------:|--------:|
+| n ≤ 60, s ≤ 30 | 2776 | 4.5× | 2.0× | 48.2× | 21.0 s  | 56.4 s   | 2.68× |
+| n ≤ 70, s ≤ 35 | 4925 | 5.0× | 2.0× | 50.9× | 104.0 s | 294.0 s  | 2.83× |
+| n ≤ 80, s ≤ 40 | 8045 | 5.4× | 2.0× | 50.9× | 479.1 s | 1369.2 s | 2.86× |
+
+Rank-for-rank correct and `d²=0` at every box. The end-to-end speedup over the
+generic engine holds at ~2.7–2.9× and creeps up with box size as the deeper
+bidegrees promote to larger `B` (the `A(2)` count grows 36 → 80 → 140). These are
+the true stem-region times: both engines now compute the `(n, s)` rectangle, so
+the low-`s` waste corner is gone from *both* — the ratio is the honest shrink win,
+not a region artifact.
+
 ## Optimal `B`-selection ranges
 
 `optimal_for(s, t)` picks the applicable `B` of **largest dimension** (smallest
