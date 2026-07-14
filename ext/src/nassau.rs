@@ -115,6 +115,19 @@ impl MilnorSubalgebra {
         vec![0; self.profile.len()]
     }
 
+    /// The signature (`B`-coset) of a basis element given by its `ppart`: the low
+    /// `profile[i]` bits of each `ppart[i]`. The value analogue of
+    /// [`Self::has_signature`], used as the coset projection `sig_B` by the
+    /// generic `motivic_nassau` engine.
+    #[cfg(feature = "sig-nassau")]
+    pub(crate) fn signature_of(&self, ppart: &[PPartEntry]) -> Vec<PPartEntry> {
+        self.profile
+            .iter()
+            .enumerate()
+            .map(|(i, &profile)| ppart.get(i).copied().unwrap_or(0) & ((1 << profile) - 1))
+            .collect()
+    }
+
     /// Give a list of basis elements in degree `degree` that has signature `signature`.
     ///
     /// This requires passing the algebra for borrow checker reasons.

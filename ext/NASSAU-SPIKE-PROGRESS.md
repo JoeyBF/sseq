@@ -145,9 +145,33 @@ were judged not worth the complexity for the achievable gain.
 
 ## `PAlgebra` trait — unifying the ordinary and motivic engines
 
-The resolution engine is generic: `SignatureResolution<A: PAlgebra>`, where
-`PAlgebra` abstracts exactly the data Nassau's sweep needs (profiles,
-signatures, `signature_mask`, `optimal_profile`, dims/names). Two implementations:
+The resolution engine is generic: `SignatureResolution<A: PAlgebra>`. The
+abstraction is split into two traits, mapping onto the mathematics of a
+Margolis P-algebra:
+
+- **`Profile`** — the coset combinatorics of one finite sub-Hopf-algebra `B`,
+  i.e. its signature space `S_B ≅ B\\A`: `zero_signature`, `iter_signatures`,
+  `dimension`, `name`. No basis, no module. (These are the methods that were
+  wrongly bundled into `PAlgebra` — they're operations on signatures, not the
+  algebra.)
+- **`PAlgebra`** — the algebra `A`: its profile family (`optimal_profile` from
+  the vanishing lines) and the *single* basis-dependent primitive, the coset
+  projection `basis_element_signature = sig_B`. `signature_mask` and
+  `signature_matrix` are now derived from it generically — one implementation,
+  not one per algebra.
+
+Correspondence to the definition: a P-algebra is a graded connected `F_2`-Hopf
+algebra free over each finite sub-Hopf-algebra `B` (Milnor–Moore); that freeness
+`A ≅ B ⊗ (B\\A)` is what makes `sig_B` well-defined and `S_B` a set of cosets.
+`Profile` packages `S_B`; `PAlgebra` provides `sig_B` and the basis. Two honest
+caveats: (1) the trait requires only `Algebra` — the Hopf/freeness axioms are a
+precondition the impl is trusted to meet (guarded by the `d²=0` fallback + rank
+check), so `PAlgebra` is the *computational shadow* of a P-algebra; (2)
+right-stability is an extra requirement beyond "P-algebra" (the filtration by
+right ideals), always arrangeable for a cocommutative P-algebra via the antipode
+— the opposite-algebra move. Odd primes are out of scope (the engine is `F_2`).
+
+Two implementations:
 
 - `impl PAlgebra for CTauOpAlgebra` — the motivic case, over the opposite
   algebra so the filtration is right-stable (`MotivicSubalgebra` profiles).

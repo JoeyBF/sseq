@@ -11,14 +11,25 @@
 //!
 //! # Unified engine over a [`PAlgebra`]
 //!
-//! The resolution engine [`SignatureResolution`] is generic over the [`PAlgebra`]
-//! trait — the data Nassau's algorithm needs from an algebra (profiles,
-//! signatures, masks, vanishing-line `B`-selection). It is instantiated over both
-//! the motivic $A_C/\tau$ (via the opposite algebra [`CTauOpAlgebra`]) **and** the
-//! classical mod-$2$ Steenrod algebra (`MilnorAlgebra`, reusing the proven
-//! [`MilnorSubalgebra`] from [`crate::nassau`]). One engine, two algebras; the
-//! handedness (which the note in `notes/opposite-algebra-nassau.tex` explains)
-//! lives entirely in the trait implementations.
+//! The resolution engine [`SignatureResolution`] is generic over two traits that
+//! together capture Margolis's notion of a P-algebra presented for Nassau's
+//! algorithm:
+//!
+//! - [`Profile`] — the coset combinatorics of a single finite sub-Hopf-algebra
+//!   `B` (its signature space `S_B ≅ B\\A`): `zero_signature`, `iter_signatures`,
+//!   `dimension`, `name`. No basis, no module — pure combinatorics.
+//! - [`PAlgebra`] — the algebra `A`: its profile family (`optimal_profile`, from
+//!   the vanishing lines) and the single basis-dependent primitive, the coset
+//!   projection [`PAlgebra::basis_element_signature`] (`sig_B`). Everything else
+//!   ([`signature_mask`], [`signature_matrix`]) is *derived* from it generically.
+//!
+//! Instantiated over both the motivic $A_C/\tau$ (via the opposite algebra
+//! [`CTauOpAlgebra`]) **and** the classical mod-$2$ Steenrod algebra
+//! (`MilnorAlgebra`, reusing the proven [`MilnorSubalgebra`] from
+//! [`crate::nassau`]). One engine, two algebras; the handedness (which the note in
+//! `notes/opposite-algebra-nassau.tex` explains) lives entirely in the trait
+//! implementations. The Hopf/freeness axioms of a P-algebra are a precondition the
+//! implementor is trusted to meet (guarded in practice by the `d²=0` fallback).
 //!
 //! # The odd-primary shape
 //!
@@ -427,35 +438,6 @@ impl MotivicSubalgebra {
 // ---------------------------------------------------------------------------
 
 impl MotivicSubalgebra {
-    /// The indices of the free-module basis in `degree` whose **operation part**
-    /// has the given `signature` — the mask defining `E_signature (module)_degree`.
-    pub(crate) fn signature_mask(
-        &self,
-        alg: &CTauOpAlgebra,
-        module: &FreeModule<CTauOpAlgebra>,
-        degree: i32,
-        signature: &Signature,
-    ) -> Vec<usize> {
-        let engine = alg.inner().engine();
-        let mut out = Vec::new();
-        for GeneratorData {
-            gen_deg,
-            start: [offset],
-            ..
-        } in module.iter_gen_offsets([degree])
-        {
-            let op_deg = degree - gen_deg;
-            alg.compute_basis(op_deg);
-            for n in 0..alg.dimension(op_deg) {
-                let (e, r) = engine.basis_element(op_deg, n);
-                if self.has_signature(*e, r, signature) {
-                    out.push(offset + n);
-                }
-            }
-        }
-        out
-    }
-
     /// The largest exterior index in `B` (`Q_{q_len-1}`), or `None` if `B` has no
     /// exterior part.
     fn max_bockstein(&self) -> Option<usize> {
@@ -551,76 +533,139 @@ pub(crate) fn basis_monomials(alg: &CTauOpAlgebra, degree: i32) -> Vec<(u32, Vec
 }
 
 // ---------------------------------------------------------------------------
-// The `PAlgebra` abstraction: the data Nassau's algorithm needs from an algebra.
+// The P-algebra abstraction, split into two traits.
+//
+//   * `Profile`   — the coset combinatorics of a single finite sub-Hopf-algebra
+//                   B: its signature space S_B (= B\\A), independent of any basis
+//                   or module. This is where the signature methods live.
+//   * `PAlgebra`  — the algebra A itself: its profile family (with the
+//                   vanishing-line B-selection) and the one basis-dependent
+//                   primitive, the coset projection `sig_B` on basis elements.
+//
+// Everything else — `signature_mask`, `signature_matrix` — is *derived*
+// generically from `PAlgebra::basis_element_signature`, so the two engines share
+// it verbatim.
 // ---------------------------------------------------------------------------
 
-/// A **P-algebra** (in Margolis's sense): a graded connected $\mathbb{F}_2$-Hopf
-/// algebra equipped with the signature-filtration structure of Nassau's algorithm
-/// — a family of finite sub-Hopf-algebras (**profiles**) whose $B$-signatures
-/// decompose each free module into a small zero-signature piece plus
-/// signature-graded corrections.
+/// The signature combinatorics of a single finite sub-Hopf-algebra `B` — its
+/// coset space `S_B ≅ B\\A` as a graded, ordered set — with **no reference to a
+/// basis, a module, or the ambient algebra**. (These are exactly the
+/// [`PAlgebra`] methods that were really about signatures, factored out.)
 ///
-/// Implementing this trait makes an algebra resolvable by the generic
-/// [`SignatureResolution`] engine, which is thereby shared between the classical
-/// mod-$2$ Steenrod algebra (`MilnorAlgebra`) and the motivic $A_C/\tau$
-/// ([`CTauOpAlgebra`]). The implementor is responsible for presenting the algebra
-/// in the **handedness** the sweep requires: the signature filtration must be by
-/// *right* ideals, so that the free-left-module differential is filtered (see the
-/// note in `notes/opposite-algebra-nassau.tex`). For $A_C/\tau$ that means
-/// implementing the trait on the *opposite* algebra [`CTauOpAlgebra`]; for the
-/// classical algebra the standard Milnor basis is already right-stable.
+/// Mathematically `Profile` packages the data Margolis's freeness `A ≅ B ⊗
+/// (B\\A)` produces: a distinguished zero coset (`E₀`) and the finite set of
+/// cosets carrying an element up to a given degree, in the order the correction
+/// sweep must process them (a linear extension of "right-multiplication raises
+/// signature").
+pub trait Profile {
+    /// A `B`-signature: a coset label in `S_B`.
+    type Signature: Clone + Eq;
+
+    /// Whether this is the trivial profile `F₂` (only the zero signature, so the
+    /// step degenerates to the ordinary generic step).
+    fn is_trivial(&self) -> bool;
+    /// A display name (for stats), e.g. `A(1)` or `E(Q_0..Q_1)`.
+    fn name(&self) -> String;
+    /// The `F₂`-dimension of `B` — the ideal shrink factor `dim C / dim E₀C`.
+    fn dimension(&self) -> u64;
+    /// The zero signature (the `E₀` coset, where the homology is computed).
+    fn zero_signature(&self) -> Self::Signature;
+    /// The **nonzero** signatures with a representative of degree `≤ degree`, in
+    /// the correction order. The zero signature is excluded.
+    fn iter_signatures(&self, degree: i32) -> Vec<Self::Signature>;
+}
+
+/// A **P-algebra** (Margolis) presented for Nassau's algorithm: a graded connected
+/// $\mathbb{F}_2$-Hopf algebra, free over each finite sub-Hopf-algebra, together
+/// with a family of [`Profile`]s and the coset projection $\mathrm{sig}_B$ on
+/// basis elements.
+///
+/// The trait is the *computational shadow* of a P-algebra: it requires only
+/// [`Algebra`] (a basis and product). The Hopf structure and freeness over `B` —
+/// which make the signatures well-defined — are a **precondition** the implementor
+/// is trusted to satisfy (in practice guarded by the engine's `d² = 0` fallback
+/// and rank validation). The implementor must also present the algebra in the
+/// **handedness** the sweep needs — the signature filtration by *right* ideals —
+/// so that the free-left-module differential is filtered (see
+/// `notes/opposite-algebra-nassau.tex`). For $A_C/\tau$ that means the *opposite*
+/// algebra [`CTauOpAlgebra`]; the classical Milnor basis is already right-stable.
+///
+/// The single basis-dependent primitive is [`Self::basis_element_signature`], the
+/// coset projection $\mathrm{sig}_B\colon A \to S_B$; [`signature_mask`] and
+/// [`signature_matrix`] are derived from it generically.
 pub trait PAlgebra: Algebra + Sized {
-    /// A finite sub-Hopf-algebra `B` (a profile).
-    type Profile: Clone;
-    /// A `B`-signature.
-    type Signature: Clone;
+    /// The profile type — a finite sub-Hopf-algebra `B` with its coset
+    /// combinatorics.
+    type Profile: Profile;
 
-    /// The profile to use at bidegree `(s, t)` — the applicable one of largest
-    /// dimension, or [`Self::trivial_profile`] for a plain step.
+    /// The profile to use at bidegree `(s, t)`: the applicable one of largest
+    /// dimension (smallest `E₀`), or [`Self::trivial_profile`] for a plain step.
     fn optimal_profile(s: i32, t: i32) -> Self::Profile;
-    /// The trivial profile `F₂` (its zero-signature block is the whole module, so
-    /// the step degenerates to the ordinary generic step).
+    /// The trivial profile `F₂`.
     fn trivial_profile() -> Self::Profile;
-    fn profile_is_trivial(profile: &Self::Profile) -> bool;
-    /// A display name for the profile (for stats).
-    fn profile_name(profile: &Self::Profile) -> String;
-    /// The `F₂`-dimension of `B` (the ideal shrink factor `dim C / dim E₀C`).
-    fn profile_dim(profile: &Self::Profile) -> u64;
 
-    /// The zero signature of `B`.
-    fn zero_signature(&self, profile: &Self::Profile) -> Self::Signature;
-    /// The nonzero signatures with a representative of degree `≤ degree`, in the
-    /// correction order (a linear extension of "left-multiplication raises
-    /// signature").
-    fn iter_signatures(&self, profile: &Self::Profile, degree: i32) -> Vec<Self::Signature>;
-    /// The free-module basis indices in `degree` whose operation part has the given
-    /// `signature` — the mask defining `E_signature(module)_degree`.
-    fn signature_mask(
+    /// The signature $\mathrm{sig}_B$ of the `idx`-th algebra basis element in
+    /// `degree` — the coset of `B` it lies in. This is the only place the
+    /// signature structure touches the algebra's basis.
+    fn basis_element_signature(
         &self,
         profile: &Self::Profile,
-        module: &FreeModule<Self>,
         degree: i32,
-        signature: &Self::Signature,
-    ) -> Vec<usize>;
+        idx: usize,
+    ) -> <Self::Profile as Profile>::Signature;
+}
+
+/// The signature of a [`PAlgebra`]'s profile — shorthand for the nested associated
+/// type.
+type Sig<A> = <<A as PAlgebra>::Profile as Profile>::Signature;
+
+/// The free-module basis indices in `degree` whose operation part has the given
+/// `signature` — the mask defining `E_signature(module)_degree`. Derived from
+/// [`PAlgebra::basis_element_signature`]: a free-module basis element `op·g` at
+/// `offset + idx` has the signature of its operation `op` (the `idx`-th algebra
+/// basis element in `degree − |g|`). Generic over any [`PAlgebra`].
+fn signature_mask<A: PAlgebra>(
+    alg: &A,
+    profile: &A::Profile,
+    module: &FreeModule<A>,
+    degree: i32,
+    signature: &Sig<A>,
+) -> Vec<usize> {
+    let mut out = Vec::new();
+    for GeneratorData {
+        gen_deg,
+        start: [offset],
+        ..
+    } in module.iter_gen_offsets([degree])
+    {
+        let op_deg = degree - gen_deg;
+        alg.compute_basis(op_deg);
+        for idx in 0..alg.dimension(op_deg) {
+            if &alg.basis_element_signature(profile, op_deg, idx) == signature {
+                out.push(offset + idx);
+            }
+        }
+    }
+    out
 }
 
 /// The matrix of a free-module homomorphism restricted to a signature-graded piece
-/// (rows = source basis of `signature`, columns = target basis of `signature`).
-/// Generic over any [`PAlgebra`]; this is `d : E_signature C → E_signature C_{s-1}`
-/// in the masked bases.
+/// (rows = source basis of `signature`, columns = target basis of `signature`):
+/// `d : E_signature C → E_signature C_{s-1}` in the masked bases. Generic over any
+/// [`PAlgebra`].
 fn signature_matrix<A: PAlgebra>(
     alg: &A,
     profile: &A::Profile,
     hom: &FreeModuleHomomorphism<FreeModule<A>>,
     degree: i32,
-    signature: &A::Signature,
+    signature: &Sig<A>,
 ) -> Matrix {
     let source = hom.source();
     let target = hom.target();
     let target_degree = degree - hom.degree_shift();
 
-    let target_mask = alg.signature_mask(profile, &target, target_degree, signature);
-    let source_mask = alg.signature_mask(profile, &source, degree, signature);
+    let target_mask = signature_mask(alg, profile, &target, target_degree, signature);
+    let source_mask = signature_mask(alg, profile, &source, degree, signature);
 
     let mut scratch = FpVector::new(TWO, target.dimension(target_degree));
     let mut result = Matrix::new(TWO, source_mask.len(), target_mask.len());
@@ -632,12 +677,36 @@ fn signature_matrix<A: PAlgebra>(
     result
 }
 
+/// [`Profile`] combinatorics for the motivic $A_C/\tau$: `S_B` of a
+/// [`MotivicSubalgebra`].
+impl Profile for MotivicSubalgebra {
+    type Signature = Signature;
+
+    fn is_trivial(&self) -> bool {
+        MotivicSubalgebra::is_trivial(self)
+    }
+
+    fn name(&self) -> String {
+        self.to_string()
+    }
+
+    fn dimension(&self) -> u64 {
+        MotivicSubalgebra::dimension(self)
+    }
+
+    fn zero_signature(&self) -> Signature {
+        MotivicSubalgebra::zero_signature(self)
+    }
+
+    fn iter_signatures(&self, degree: i32) -> Vec<Signature> {
+        MotivicSubalgebra::iter_signatures(self, degree)
+    }
+}
+
 /// [`PAlgebra`] for the motivic $A_C/\tau$, on the opposite algebra so the
-/// filtration is right-stable (see [`CTauOpAlgebra`]). Profiles are
-/// [`MotivicSubalgebra`]; signatures are [`Signature`].
+/// filtration is right-stable (see [`CTauOpAlgebra`]).
 impl PAlgebra for CTauOpAlgebra {
     type Profile = MotivicSubalgebra;
-    type Signature = Signature;
 
     fn optimal_profile(s: i32, t: i32) -> MotivicSubalgebra {
         MotivicSubalgebra::optimal_for(s, t)
@@ -647,46 +716,51 @@ impl PAlgebra for CTauOpAlgebra {
         MotivicSubalgebra::trivial()
     }
 
-    fn profile_is_trivial(profile: &MotivicSubalgebra) -> bool {
-        profile.is_trivial()
-    }
-
-    fn profile_name(profile: &MotivicSubalgebra) -> String {
-        profile.to_string()
-    }
-
-    fn profile_dim(profile: &MotivicSubalgebra) -> u64 {
-        profile.dimension()
-    }
-
-    fn zero_signature(&self, profile: &MotivicSubalgebra) -> Signature {
-        profile.zero_signature()
-    }
-
-    fn iter_signatures(&self, profile: &MotivicSubalgebra, degree: i32) -> Vec<Signature> {
-        profile.iter_signatures(degree)
-    }
-
-    fn signature_mask(
+    fn basis_element_signature(
         &self,
         profile: &MotivicSubalgebra,
-        module: &FreeModule<Self>,
         degree: i32,
-        signature: &Signature,
-    ) -> Vec<usize> {
-        profile.signature_mask(self, module, degree, signature)
+        idx: usize,
+    ) -> Signature {
+        let (e, r) = self.inner().engine().basis_element(degree, idx);
+        profile.signature_of(*e, r)
     }
 }
 
-/// [`PAlgebra`] for the **classical** mod-$2$ Steenrod algebra, reusing the proven
-/// [`MilnorSubalgebra`] signature machinery from the classical Nassau engine
-/// ([`crate::nassau`]). The standard Milnor basis is already right-stable, so the
-/// algebra is used directly (no opposite). This is the unification: the same
-/// [`SignatureResolution`] engine drives both the classical and motivic cases,
-/// differing only in this trait implementation.
+/// [`Profile`] combinatorics for the **classical** mod-$2$ Steenrod algebra,
+/// reusing the proven [`MilnorSubalgebra`] machinery from [`crate::nassau`].
+impl Profile for MilnorSubalgebra {
+    type Signature = Vec<PPartEntry>;
+
+    fn is_trivial(&self) -> bool {
+        self.profile.is_empty()
+    }
+
+    fn name(&self) -> String {
+        self.to_string()
+    }
+
+    fn dimension(&self) -> u64 {
+        // dim B = Π_i 2^{profile[i]} = 2^{Σ profile[i]}.
+        1u64 << self.profile.iter().map(|&e| e as u32).sum::<u32>()
+    }
+
+    fn zero_signature(&self) -> Vec<PPartEntry> {
+        MilnorSubalgebra::zero_signature(self)
+    }
+
+    fn iter_signatures(&self, degree: i32) -> Vec<Vec<PPartEntry>> {
+        MilnorSubalgebra::iter_signatures(self, degree).collect()
+    }
+}
+
+/// [`PAlgebra`] for the classical mod-$2$ Steenrod algebra. The standard Milnor
+/// basis is already right-stable, so the algebra is used directly (no opposite).
+/// This is the unification: the same [`SignatureResolution`] engine drives both
+/// the classical and motivic cases, differing only in this trait implementation
+/// and the coset projection.
 impl PAlgebra for MilnorAlgebra {
     type Profile = MilnorSubalgebra;
-    type Signature = Vec<PPartEntry>;
 
     fn optimal_profile(s: i32, t: i32) -> MilnorSubalgebra {
         // The trivial module `k` has top degree 0, so no `max_degree` shift.
@@ -697,37 +771,13 @@ impl PAlgebra for MilnorAlgebra {
         MilnorSubalgebra::zero_algebra()
     }
 
-    fn profile_is_trivial(profile: &MilnorSubalgebra) -> bool {
-        profile.profile.is_empty()
-    }
-
-    fn profile_name(profile: &MilnorSubalgebra) -> String {
-        profile.to_string()
-    }
-
-    fn profile_dim(profile: &MilnorSubalgebra) -> u64 {
-        // dim B = Π_i 2^{profile[i]} = 2^{Σ profile[i]}.
-        1u64 << profile.profile.iter().map(|&e| e as u32).sum::<u32>()
-    }
-
-    fn zero_signature(&self, profile: &MilnorSubalgebra) -> Vec<PPartEntry> {
-        profile.zero_signature()
-    }
-
-    fn iter_signatures(&self, profile: &MilnorSubalgebra, degree: i32) -> Vec<Vec<PPartEntry>> {
-        profile.iter_signatures(degree).collect()
-    }
-
-    fn signature_mask(
+    fn basis_element_signature(
         &self,
         profile: &MilnorSubalgebra,
-        module: &FreeModule<Self>,
         degree: i32,
-        signature: &Vec<PPartEntry>,
-    ) -> Vec<usize> {
-        profile
-            .signature_mask(self, module, degree, signature)
-            .collect()
+        idx: usize,
+    ) -> Vec<PPartEntry> {
+        profile.signature_of(&self.ppart_table(degree)[idx])
     }
 }
 
@@ -888,7 +938,7 @@ impl<A: PAlgebra> SignatureResolution<A> {
             if !self.step_general(s, t, &b) {
                 self.fallbacks.set(self.fallbacks.get() + 1);
                 self.step_general(s, t, &A::trivial_profile());
-            } else if A::profile_is_trivial(&b) {
+            } else if b.is_trivial() {
                 self.fallbacks.set(self.fallbacks.get() + 1);
             } else {
                 self.sig_steps.set(self.sig_steps.get() + 1);
@@ -984,17 +1034,17 @@ impl<A: PAlgebra> SignatureResolution<A> {
         let next = &self.modules[s as usize - 2];
         next.compute_basis(t);
 
-        let zero_sig = alg.zero_signature(b);
+        let zero_sig = b.zero_signature();
         let target_dim = target.dimension(t);
-        let target_mask = alg.signature_mask(b, target, t, &zero_sig);
-        let next_mask = alg.signature_mask(b, next, t, &zero_sig);
+        let target_mask = signature_mask(alg, b, target, t, &zero_sig);
+        let next_mask = signature_mask(alg, b, next, t, &zero_sig);
 
         // Shrink record: E₀ (zero-sig) masked dim vs full dim of C_{s-1}.
-        if !A::profile_is_trivial(b) {
+        if !b.is_trivial() {
             self.shrink.borrow_mut().push(ShrinkRecord {
                 s,
                 t,
-                b: A::profile_name(b),
+                b: b.name(),
                 dim_c: target_dim,
                 dim_e0: target_mask.len(),
             });
@@ -1032,11 +1082,11 @@ impl<A: PAlgebra> SignatureResolution<A> {
         // Signature-ordered corrections.
         let mut tmask: Vec<usize> = Vec::new();
         let mut nmask: Vec<usize> = Vec::new();
-        for signature in alg.iter_signatures(b, t) {
+        for signature in b.iter_signatures(t) {
             tmask.clear();
             nmask.clear();
-            tmask.extend(alg.signature_mask(b, target, t, &signature));
-            nmask.extend(alg.signature_mask(b, next, t, &signature));
+            tmask.extend(signature_mask(alg, b, target, t, &signature));
+            nmask.extend(signature_mask(alg, b, next, t, &signature));
 
             let full_matrix = self.differentials[s as usize - 1].get_partial_matrix(t, &tmask);
             let mut masked = AugmentedMatrix::new(TWO, tmask.len(), [nmask.len(), tmask.len()]);
