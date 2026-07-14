@@ -289,6 +289,51 @@ s ≤ 24 in the example — and the signature shortcut fires (**1357** shortcut 
 around stem 24 — and crucially **no `h_3`** (`Sq⁸ ∉ A(2)`), which distinguishes
 `A(2)` from the full Steenrod algebra.
 
+### Finite modules and chain complexes
+
+The signature machinery (`step_general`, `s ≥ 2`) is intrinsic to the free
+`A`-modules and their `A`-linear differentials — it never inspects what is being
+resolved. So the engine resolves not just `k` but any bounded module `M`, and any
+bounded **finite chain complex** `C_*`.
+
+- `SignatureResolution::from_module` / `from_chain_complex` seed from an arbitrary
+  target. The single module-specific ingredient is the **vanishing-line offset**:
+  `Ext_B(M, k)` is a subquotient of `⊕ Σ^{n_i} Ext_B(k, k)`, so it vanishes only
+  above `k`'s line shifted by `top(M)`. `optimal_profile` is called at
+  `t − target_top`; without it the engine picks `B` below its true line and the
+  sweep fails (`Cnu`, cofiber of `ν = Sq⁴`, panicked with `d² ≠ 0` at `(2,5)`
+  before the offset).
+- Chain complexes need the full Cartan–Eilenberg step. `plain_step` ports the
+  generic engine's C–E augmentation over the target complex `C_{s,·}`; the
+  previous augmented kernel is *recomputed* (`plain_kernel`) rather than stored,
+  so it composes with `step_general` across the stem boundary with no cross-step
+  state. Dispatch: a nontrivial `B` is only ever chosen when `t > target_top`,
+  where `C_{·,t} = 0` and the C–E step degenerates to exactly the pure free-module
+  step — so the shortcut region and the augmentation provably never overlap.
+
+Validated rank-for-rank against the generic engine: finite modules `C2v14, Ceta,
+Cnu, Joker, Csigma, RP4, DA1` (`examples/finite_module_validate.rs`), and the
+Yoneda **cofibers** named by the `cofiber` attribute — `C4` (3-term), `Ceta2`
+(3-term), `C2v14` (5-term) — built exactly as `utils::construct_standard` does
+(`examples/cofiber_validate.rs`). Unit tests: `finite_module_resolution_matches_generic`
+(incl. the offset-exercising `Cnu`) and `cofiber_chain_complex_matches_generic`
+(Yoneda of `h₀²`, 3-term, shortcut steps firing).
+
+**Speedup (C4 cofiber, classical `p = 2`, vs the generic engine — master's Nassau
+is `k`-only, so it cannot resolve these at all):**
+
+| box (n, s) | gens | signature | generic | speedup |
+|-----------:|-----:|----------:|--------:|--------:|
+| 50, 26     | 459  | 0.45 s    | 0.43 s  | 0.96×   |
+| 60, 30     | 647  | 1.61 s    | 1.84 s  | 1.14×   |
+| 70, 35     | 1020 | 5.54 s    | 7.32 s  | 1.32×   |
+| 80, 40     | 1453 | 18.05 s   | 31.93 s | 1.77×   |
+
+The ratio climbs with stem exactly as classical `k` does (also ~1.6–1.8× at
+n=80): the shrink converts to wall-clock as the generic engine goes cubic. So
+the signature engine gives Nassau-style acceleration for finite chain complexes —
+a capability the hand-tuned `nassau.rs` does not have.
+
 ## M6 — Signature-accelerated τ-lift (Algorithm 3)
 
 **Not attempted in this workspace.** M6 routes the `TauLift`'s inner `solve`
