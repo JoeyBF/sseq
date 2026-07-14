@@ -58,7 +58,7 @@ notes, and final numbers. Everything is built/run with
 - Tests: `product_raises_signature` (right-factor floor over the real product),
   `signatures_sum_to_full_dimension`, `opposite_algebra_matches_golden_total`.
 
-## M3 / M4 — SignatureResolution engine + generic fallback  ✅
+## M3 / M4 — SignatureResolution engine (trivial-B plain steps, no fallback)  ✅
 
 - [`SignatureResolution`] (in `motivic_nassau.rs`): a **standalone** minimal
   resolution of `k` over `A_C/τ` by Algorithm 2, carrying its own
@@ -67,14 +67,17 @@ notes, and final numbers. Everything is built/run with
   `step0`/`step1`/`step_resolution_with_subalgebra` with the motivic signature
   masking of M1/M2.
 - `choose_B` = [`MotivicSubalgebra::optimal_for`] (below-line `A(n)` vanishing
-  bound, Thm 3.1). Where no `A(n)` qualifies it uses `B = F₂`, whose
-  zero-signature block **is** the whole module — i.e. the ordinary generic step.
-  So every non-applicable bidegree is covered and the composite is **always
-  correct** — no separate fallback code path needed.
-- Extra safety: the step returns `false` if the correction sweep leaves
-  `d² ≠ 0` (signature order insufficient), and the caller redoes that bidegree
-  with `B = F₂`. In practice this never fires on the validated box (the
-  vanishing-line `B` is always sufficient).
+  bound, Thm 3.1). Where no `A(n)` qualifies it uses the trivial `B = A(-1) = k`,
+  whose zero-signature block **is** the whole module — i.e. the ordinary generic
+  step, which always works. So `optimal_profile` returns only a
+  provably-applicable `B` or the trivial one, both of which the sweep converges
+  on: there is **no runtime fallback**.
+- The `d² = 0` identity is enforced by an `assert!` at the end of each step
+  (rather than a silent retry). It held at every bidegree of every validated box
+  — motivic to n=60, classical, odd-primary p=3/5 — so a future failure would be
+  a genuine bug (bad vanishing line or signature order), surfaced rather than
+  masked. (An earlier version retried with the trivial `B` on `d² ≠ 0`;
+  instrumenting that path showed it never fired, so it was removed.)
 - All kernel/image/lift linear algebra reuses `fp` (`Matrix`,
   `AugmentedMatrix`, `compute_kernel`, `compute_quasi_inverse`) — no hand-rolled
   linear algebra.
@@ -99,8 +102,9 @@ shrink, timing, and shortcut/fallback counts. On the **n ≤ 40, s ≤ 22** box
 - **[3] Timing (same box).** Signature engine **12.1 s** vs generic engine
   **33.3 s** — a **≈2.75× resolution-phase speedup** (both serial, same
   rectangle).
-- **[4] Steps.** 1008 signature-shortcut steps, 315 plain fallbacks (low stems
-  below every vanishing line).
+- **[4] Steps.** 1008 signature-shortcut steps, 315 plain steps (trivial `B`,
+  low stems below every vanishing line — not a fallback, the correct choice
+  there).
 
 Both engines are runnable side by side; the signature engine is fully
 feature-gated (`sig-nassau`) and additive.
@@ -132,7 +136,7 @@ a shrink-proportional speedup is an optimization task, not a correctness one.
 pure-exterior `E(Q_0..Q_k)` intermediates, each admitted by its own **sound**
 below-line bound `t > (2^{q_len}-1)(s+1) + \tau_B` (slope set by the largest
 Bockstein, Lemma 2.6 / Thm 3.1) — never below a `B`'s vanishing line, so ranks
-stay correct rather than fallback-corrected.
+stay correct — provably applicable, not fallback-corrected.
 
 The `B` histogram on n≤40 is `A(0)×583, A(1)×359, A(2)×33, E(Q_0..Q_1)×33`. The
 finer ladder upgrades only 33 bidegrees (A(0)→E(Q_0,Q_1)), moving aggregate
@@ -165,7 +169,7 @@ algebra free over each finite sub-Hopf-algebra `B` (Milnor–Moore); that freene
 `A ≅ B ⊗ (B\\A)` is what makes `sig_B` well-defined and `S_B` a set of cosets.
 `Profile` packages `S_B`; `PAlgebra` provides `sig_B` and the basis. Two honest
 caveats: (1) the trait requires only `Algebra` — the Hopf/freeness axioms are a
-precondition the impl is trusted to meet (guarded by the `d²=0` fallback + rank
+precondition the impl is trusted to meet (guarded by the `d²=0` assert + rank
 check), so `PAlgebra` is the *computational shadow* of a P-algebra; (2)
 right-stability is an extra requirement beyond "P-algebra" (the filtration by
 right ideals), always arrangeable for a cocommutative P-algebra via the antipode
@@ -231,8 +235,8 @@ big-branch checkout, reusing `MotivicSubalgebra` + the signature masking here.
 
 - ✅ Rank-for-rank identical to the generic engine, exact (`d²=0`, `H=k`), on the
   box.
-- ✅ Generic engine untouched; new engine feature-gated; generic fallback (trivial
-  `B`) covers every non-applicable bidegree.
+- ✅ Generic engine untouched; new engine feature-gated; the trivial `B` (a plain
+  step) covers every non-applicable bidegree — no runtime fallback needed.
 - ✅ Measured `dim C / dim E₀C` shrink table + resolution-phase timing.
 - ⏳ M6 (τ-lift) deferred to the big branch (pipeline not present here).
 - ✅ Builds/tests green under the required RUSTFLAGS; touched files nightly-fmt'd.

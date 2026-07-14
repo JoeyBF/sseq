@@ -119,9 +119,9 @@ fn main() -> anyhow::Result<()> {
         max_t
     );
 
-    // --- 4. Shortcut vs fallback, and the B histogram ---
-    let (sig_steps, fallbacks) = sres.stats();
-    println!("[4] STEPS  signature-shortcut {sig_steps}   fallback (plain) {fallbacks}");
+    // --- 4. Signature-shortcut vs plain steps, and the B histogram ---
+    let (sig_steps, plain_steps) = sres.stats();
+    println!("[4] STEPS  signature-shortcut {sig_steps}   plain (trivial B) {plain_steps}");
     let mut hist: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
     for r in &records {
         *hist.entry(r.b.clone()).or_default() += 1;

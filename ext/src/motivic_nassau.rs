@@ -598,12 +598,13 @@ pub trait PAlgebra: Algebra + Sized {
     type Profile: Profile;
 
     /// The profile to use at bidegree `(s, t)`: the applicable one of largest
-    /// dimension (smallest `E₀`), or [`Self::trivial_profile`] for a plain step.
-    /// Takes `&self` because the choice (and, for variable-prime algebras, the
-    /// profile itself) depends on the algebra.
+    /// dimension (smallest `E₀`), or the **trivial** profile `A(-1) = k` (a plain
+    /// step) when none is applicable. Must return a profile the sweep converges on
+    /// — a provably-applicable `B` (Thm 3.1) or the trivial one; the trivial
+    /// profile always works, so there is no runtime fallback. Takes `&self` because
+    /// the choice (and, for variable-prime algebras, the profile) depends on the
+    /// algebra.
     fn optimal_profile(&self, s: i32, t: i32) -> Self::Profile;
-    /// The trivial profile (`F_p`).
-    fn trivial_profile(&self) -> Self::Profile;
 
     /// The signature $\mathrm{sig}_B$ of the `idx`-th algebra basis element in
     /// `degree` — the coset of `B` it lies in. This is the only place the
@@ -712,10 +713,6 @@ impl PAlgebra for CTauOpAlgebra {
 
     fn optimal_profile(&self, s: i32, t: i32) -> MotivicSubalgebra {
         MotivicSubalgebra::optimal_for(s, t)
-    }
-
-    fn trivial_profile(&self) -> MotivicSubalgebra {
-        MotivicSubalgebra::trivial()
     }
 
     fn basis_element_signature(
@@ -978,10 +975,6 @@ impl PAlgebra for MilnorAlgebra {
         SteenrodProfile::optimal_for(self.prime(), s, t)
     }
 
-    fn trivial_profile(&self) -> SteenrodProfile {
-        SteenrodProfile::trivial(self.prime())
-    }
-
     fn basis_element_signature(
         &self,
         profile: &SteenrodProfile,
@@ -1033,7 +1026,7 @@ pub struct SignatureResolution<A: PAlgebra> {
     chain_maps: Vec<Arc<FreeModuleHomomorphism<FDModule<A>>>>,
     max_s: i32,
     shrink: RefCell<Vec<ShrinkRecord>>,
-    fallbacks: Cell<usize>,
+    plain_steps: Cell<usize>,
     sig_steps: Cell<usize>,
 }
 
@@ -1060,7 +1053,7 @@ impl<A: PAlgebra> SignatureResolution<A> {
             chain_maps: Vec::new(),
             max_s: 0,
             shrink: RefCell::new(Vec::new()),
-            fallbacks: Cell::new(0),
+            plain_steps: Cell::new(0),
             sig_steps: Cell::new(0),
         }
     }
@@ -1110,9 +1103,10 @@ impl<A: PAlgebra> SignatureResolution<A> {
     }
 
     /// How many `(s, t)` steps used a nontrivial signature shortcut, and how many
-    /// fell back to a plain step.
+    /// were plain steps (`optimal_profile` returned the trivial `B` — below every
+    /// vanishing line). There is no runtime fallback.
     pub fn stats(&self) -> (usize, usize) {
-        (self.sig_steps.get(), self.fallbacks.get())
+        (self.sig_steps.get(), self.plain_steps.get())
     }
 
     fn add_generators(&self, s: i32, t: i32, num: usize) {
@@ -1143,17 +1137,16 @@ impl<A: PAlgebra> SignatureResolution<A> {
         } else if s == 1 {
             self.step1(t);
         } else {
+            // `optimal_profile` returns a provably-applicable B (Thm 3.1) or the
+            // trivial profile `A(-1) = k` — the plain step, which always works. So
+            // the step never needs a runtime fallback.
             let b = self.algebra.optimal_profile(s, t);
-            // Attempt the signature step; on any residual inconsistency fall back
-            // to the plain (trivial-B) step, which is the generic algorithm.
-            if !self.step_general(s, t, &b) {
-                self.fallbacks.set(self.fallbacks.get() + 1);
-                self.step_general(s, t, &self.algebra.trivial_profile());
-            } else if b.is_trivial() {
-                self.fallbacks.set(self.fallbacks.get() + 1);
+            if b.is_trivial() {
+                self.plain_steps.set(self.plain_steps.get() + 1);
             } else {
                 self.sig_steps.set(self.sig_steps.get() + 1);
             }
+            self.step_general(s, t, &b);
         }
     }
 
@@ -1240,7 +1233,7 @@ impl<A: PAlgebra> SignatureResolution<A> {
     /// The Algorithm 2 inductive step at `(s, t)` with subalgebra `b`. Returns
     /// `false` if the correction sweep left `d² ≠ 0` (signature order insufficient
     /// at this bidegree), signalling the caller to fall back to a plain step.
-    fn step_general(&self, s: i32, t: i32, b: &A::Profile) -> bool {
+    fn step_general(&self, s: i32, t: i32, b: &A::Profile) {
         let alg = &*self.algebra;
         let p = alg.prime();
         let target = &self.modules[s as usize - 1];
@@ -1332,18 +1325,21 @@ impl<A: PAlgebra> SignatureResolution<A> {
             }
         }
 
-        // d² = 0 check: every dx must have been driven to zero.
-        if dxs.iter().any(|dx| !dx.is_zero()) {
-            // Roll back the generators we added so the fallback can redo cleanly.
-            // (add_generators is append-only; a fresh trivial-B step re-adds the
-            // correct count. We detect this only when the signature order was
-            // insufficient, which the vanishing-line choice of B avoids.)
-            return false;
-        }
+        // d² = 0. This must hold: the correction sweep drives every dx to zero
+        // whenever B is applicable (which `optimal_profile` guarantees — it returns
+        // only a provably-applicable B or the trivial one, and the trivial B is the
+        // plain step that always works). So there is no runtime fallback; a failure
+        // here is a genuine bug (a bad vanishing line or signature order), surfaced
+        // rather than silently papered over.
+        assert!(
+            dxs.iter().all(|dx| dx.is_zero()),
+            "d² ≠ 0 at (s={s}, t={t}) with B={} — B applied outside its vanishing region, or the \
+             signature order is not a valid linear extension",
+            b.name(),
+        );
 
         self.differentials[s as usize].add_generators_from_rows(t, xs);
         self.chain_maps[s as usize].extend_by_zero(t);
-        true
     }
 }
 
