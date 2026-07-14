@@ -30,12 +30,20 @@ fn main() -> anyhow::Result<()> {
     let mut args = std::env::args().skip(1);
     let max_n: i32 = args.next().and_then(|s| s.parse().ok()).unwrap_or(40);
     let max_s: i32 = args.next().and_then(|s| s.parse().ok()).unwrap_or(22);
+    // A third arg "sig" skips the generic reference (and the rank cross-check):
+    // for a scaling study at large stems, where the generic engine is intractable
+    // but the shrink / B-histogram / signature-engine timing is exactly what we
+    // want. Correctness there rests on the golden fixture + unit-test validation.
+    let sig_only = args.next().is_some_and(|a| a.starts_with("sig"));
     let max_t = max_n + max_s;
 
     // The computed region is the stem rectangle {n ≤ max_n, s ≤ max_s}. Internally
     // the loop bounds the computational degree t = n + s (top corner max_t), but
     // the grid region is described by its axes n and s.
-    println!("# motivic-Nassau validation  (stem region: n ≤ {max_n}, s ≤ {max_s})");
+    println!(
+        "# motivic-Nassau validation  (stem region: n ≤ {max_n}, s ≤ {max_s}{})",
+        if sig_only { "; signature engine only" } else { "" }
+    );
 
     // --- Signature engine ---
     let mut sres = SignatureResolution::motivic();
@@ -44,44 +52,51 @@ fn main() -> anyhow::Result<()> {
     let sig_time = start.elapsed();
 
     // --- Generic engine (same stem region) ---
-    let galg = Arc::new(CTauAlgebra::new());
-    let gmod = Arc::new(FDModule::new(
-        Arc::clone(&galg),
-        "k".to_string(),
-        BiVec::from_vec(0, vec![1]),
-    ));
-    let gcc = Arc::new(FiniteChainComplex::<FDModule<CTauAlgebra>>::ccdz(gmod));
-    let gres = Resolution::new(gcc);
-    let start = Instant::now();
-    gres.compute_through_stem(Bidegree::s_t(max_s, max_t));
-    let gen_time = start.elapsed();
-
-    // --- 1. Correctness: rank-for-rank equality (over the shared stem region) ---
-    let mut mismatches = 0usize;
-    let mut total = 0usize;
-    for s in 0..=max_s {
-        for t in 0..=max_t {
-            if t - s > max_n {
-                continue;
-            }
-            let want = gres.number_of_gens_in_bidegree(Bidegree::s_t(s, t));
-            let got = sres.number_of_gens_in_bidegree(s, t);
-            if got != want {
-                if mismatches < 20 {
-                    println!("  MISMATCH (s={s}, t={t}): signature={got} generic={want}");
-                }
-                mismatches += 1;
-            }
-            total += got;
-        }
-    }
-    if mismatches == 0 {
-        println!(
-            "[1] CORRECT: signature ranks == generic ranks at every bidegree ({total} generators)"
-        );
+    let gen_time = if sig_only {
+        None
     } else {
-        println!("[1] FAILED: {mismatches} bidegree rank mismatches");
-    }
+        let galg = Arc::new(CTauAlgebra::new());
+        let gmod = Arc::new(FDModule::new(
+            Arc::clone(&galg),
+            "k".to_string(),
+            BiVec::from_vec(0, vec![1]),
+        ));
+        let gcc = Arc::new(FiniteChainComplex::<FDModule<CTauAlgebra>>::ccdz(gmod));
+        let gres = Resolution::new(gcc);
+        let start = Instant::now();
+        gres.compute_through_stem(Bidegree::s_t(max_s, max_t));
+        let gen_time = start.elapsed();
+
+        // --- 1. Correctness: rank-for-rank equality (over the shared stem region) ---
+        let mut mismatches = 0usize;
+        let mut total = 0usize;
+        for s in 0..=max_s {
+            for t in 0..=max_t {
+                if t - s > max_n {
+                    continue;
+                }
+                let want = gres.number_of_gens_in_bidegree(Bidegree::s_t(s, t));
+                let got = sres.number_of_gens_in_bidegree(s, t);
+                if got != want {
+                    if mismatches < 20 {
+                        println!("  MISMATCH (s={s}, t={t}): signature={got} generic={want}");
+                    }
+                    mismatches += 1;
+                }
+                total += got;
+            }
+        }
+        if mismatches == 0 {
+            println!(
+                "[1] CORRECT: signature ranks == generic ranks at every bidegree ({total} \
+                 generators)"
+            );
+        } else {
+            println!("[1] FAILED: {mismatches} bidegree rank mismatches");
+            std::process::exit(1);
+        }
+        Some(gen_time)
+    };
 
     // --- 2. Shrink factors ---
     let records = sres.shrink_records();
@@ -117,12 +132,18 @@ fn main() -> anyhow::Result<()> {
     }
 
     // --- 3. Timing ---
-    println!(
-        "[3] TIMING  signature engine {:.3}s   generic engine {:.3}s   (same stem region n ≤ \
-         {max_n}, s ≤ {max_s})",
-        sig_time.as_secs_f64(),
-        gen_time.as_secs_f64(),
-    );
+    match gen_time {
+        Some(g) => println!(
+            "[3] TIMING  signature engine {:.3}s   generic engine {:.3}s   ({:.2}× over generic)",
+            sig_time.as_secs_f64(),
+            g.as_secs_f64(),
+            g.as_secs_f64() / sig_time.as_secs_f64(),
+        ),
+        None => println!(
+            "[3] TIMING  signature engine {:.3}s   (generic reference skipped)",
+            sig_time.as_secs_f64(),
+        ),
+    }
 
     // --- 4. Signature-shortcut vs plain steps, and the B histogram ---
     let (sig_steps, plain_steps) = sres.stats();
@@ -134,8 +155,5 @@ fn main() -> anyhow::Result<()> {
     let parts: Vec<String> = hist.iter().map(|(b, n)| format!("{b}×{n}")).collect();
     println!("    B histogram: {}", parts.join("  "));
 
-    if mismatches > 0 {
-        std::process::exit(1);
-    }
     Ok(())
 }
