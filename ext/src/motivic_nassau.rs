@@ -1181,10 +1181,27 @@ impl<A: PAlgebra> SignatureResolution<A> {
     pub fn compute_through_stem(&mut self, max_s: i32, max_t: i32) {
         self.extend_through_degree(max_s);
         self.algebra.compute_basis(max_t);
+        // Compute the `(n, s)` stem rectangle `{n = t − s ≤ max_n, s ≤ max_s}`,
+        // not the constant-`t` diagonal `{t ≤ max_t}`. The two agree at `s = max_s`
+        // but the diagonal fans out to stem `max_t` at `s = 0`; that low-`s`,
+        // high-`n` corner is pure waste for a chart of stems `≤ max_n`, and it is
+        // the expensive corner because `dim(A)` grows with degree. This is the
+        // region master's `nassau.rs` computes (via its `distance` gate).
+        let max_n = max_t - max_s;
         for t in 0..=max_t {
             for s in 0..=max_s {
-                // (s, t) depends on (s-1, t) [done: smaller s this t] and (s, t-1)
-                // [done: previous t]. Serial nested loop respects both.
+                // Skip the corner beyond the stem cutoff. Dependencies: (s, t)
+                // needs (s, t-1) [previous t, always in region] and, at the top
+                // boundary n = max_n, reads (s-1, t) at stem n+1 — which we skip.
+                // That neighbour's degree-t generators never enter the kernel we
+                // hit here (they map to nonzero images, so they are not in
+                // ker d_{s-1}), and it lies outside the reported region, so the
+                // partial matrix over the smaller target is still correct. This
+                // is exactly the phantom-boundary read master's wavefront makes
+                // at its `distance == 1` cells.
+                if t - s > max_n {
+                    continue;
+                }
                 self.step(s, t);
             }
         }
@@ -1610,7 +1627,7 @@ mod tests {
         sres.compute_through_stem(max_s, max_t);
 
         // Compare over the bidegrees the generic engine actually computed (a stem
-        // region); the signature engine's full rectangle covers all of them.
+        // region); the signature engine now computes the same stem region.
         let mut checked = 0usize;
         for b in gres.iter_stem() {
             if b.t() > max_t {

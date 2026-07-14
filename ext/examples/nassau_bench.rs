@@ -67,7 +67,8 @@ fn main() -> anyhow::Result<()> {
     let gres = Resolution::new(gcc);
     let g1 = gpm();
     let start = Instant::now();
-    gres.compute_through_bidegree(Bidegree::s_t(max_s, max_t));
+    // Same stem region as the signature engine (fair comparison).
+    gres.compute_through_stem(Bidegree::s_t(max_s, max_t));
     let gen_time = start.elapsed();
     let gen_gpm = gpm_since(g1);
 
@@ -75,6 +76,11 @@ fn main() -> anyhow::Result<()> {
     let mut mism = 0;
     for s in 0..=max_s {
         for t in 0..=max_t {
+            // Both engines now compute the stem region {n ≤ max_n, s ≤ max_s};
+            // only compare there.
+            if t - s > max_n {
+                continue;
+            }
             if sres.number_of_gens_in_bidegree(s, t)
                 != gres.number_of_gens_in_bidegree(Bidegree::s_t(s, t))
             {
@@ -111,8 +117,8 @@ fn main() -> anyhow::Result<()> {
         let mres = ext::utils::construct_nassau("S_2", None)?;
         let g2 = gpm();
         let start = Instant::now();
-        // Same rectangle as the other two engines (fair region).
-        mres.compute_through_bidegree(Bidegree::s_t(max_s, max_t));
+        // Same stem region as the other two engines (fair region).
+        mres.compute_through_stem(Bidegree::s_t(max_s, max_t));
         (Some(start.elapsed()), Some(gpm_since(g2)))
     } else {
         (None, None)
