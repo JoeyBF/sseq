@@ -24,15 +24,34 @@
 //! is a genuine positive-degree operator and $\delta \neq 0$ — exactly what makes this a non-minimal
 //! resolution whose cohomology must be taken.
 
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+};
 
-use algebra::{Algebra, Bialgebra, module::Module};
+use algebra::{
+    Algebra, Bialgebra,
+    module::{
+        FreeModule, Module, ZeroModule,
+        homomorphism::{FreeModuleHomomorphism, ModuleHomomorphism},
+    },
+    pair_algebra::PairAlgebra,
+};
 use dashmap::DashMap;
-use fp::{matrix::Matrix, prime::ValidPrime, vector::FpVector};
-use sseq::coordinates::Bidegree;
+use fp::{
+    matrix::Matrix,
+    prime::{Prime, ValidPrime},
+    vector::FpVector,
+};
+use once::{OnceBiVec, OnceVec};
+use sseq::coordinates::{Bidegree, BidegreeElement};
 
-use super::{ExtAlgebra, ExtDifferential};
-use crate::chain_complex::FreeChainComplex;
+use super::{Cochain, ExtAlgebra, ExtDifferential};
+use crate::{
+    chain_complex::{ChainComplex, FreeChainComplex},
+    resolution::secondary::SecondaryResolution,
+    secondary::SecondaryLift,
+};
 
 /// The Hopf antipode $\chi\colon A \to A$ of a connected graded bialgebra, computed generically and
 /// memoised.
@@ -153,6 +172,74 @@ impl<A: Bialgebra> Antipode<A> {
                 .add(self.apply(degree, idx).as_slice(), coeff);
         }
         out
+    }
+}
+
+/// The full coproduct $\Delta(x) = \sum_{(x)} x_{(1)} \otimes x_{(2)}$ of a basis element, memoised.
+///
+/// At $p = 2$ every term has coefficient $1$, so a coproduct is a *set* of basis-element pairs
+/// $(|x_{(1)}|, x_{(1)}, |x_{(2)}|, x_{(2)})$. It is obtained by folding the coproducts of the
+/// [`decompose`](Bialgebra::decompose) atoms in $A \otimes A$ — the same route the [`Antipode`]
+/// uses, but keeping *all* terms (including the two boundary terms $x \otimes 1$ and $1 \otimes x$).
+pub(crate) struct FullCoproduct<A: Bialgebra> {
+    algebra: Arc<A>,
+    cache: DashMap<(i32, usize), Arc<Vec<(i32, usize, i32, usize)>>>,
+}
+
+impl<A: Bialgebra> FullCoproduct<A> {
+    pub(crate) fn new(algebra: Arc<A>) -> Self {
+        Self {
+            algebra,
+            cache: DashMap::new(),
+        }
+    }
+
+    /// $\Delta$ of the basis element `(degree, idx)`, as the list of surviving pairs
+    /// `(|a'|, a', |a''|, a'')`. Requires the algebra basis computed through `degree`.
+    pub(crate) fn terms(&self, degree: i32, idx: usize) -> Arc<Vec<(i32, usize, i32, usize)>> {
+        if degree == 0 {
+            // Δ(1) = 1 ⊗ 1 (the unit is grouplike).
+            return Arc::new(vec![(0, 0, 0, 0)]);
+        }
+        if let Some(v) = self.cache.get(&(degree, idx)) {
+            return Arc::clone(&v);
+        }
+
+        let p = self.algebra.prime();
+        // Δ as a map (l_deg, l_idx, r_deg, r_idx) → coeff, seeded with the unit 1 ⊗ 1.
+        let mut terms: HashMap<(i32, usize, i32, usize), u32> = HashMap::new();
+        terms.insert((0, 0, 0, 0), 1);
+        for (a_deg, a_idx) in self.algebra.decompose(degree, idx) {
+            let mut next: HashMap<(i32, usize, i32, usize), u32> = HashMap::new();
+            for (&(ll, li, rl, ri), &c) in &terms {
+                for (cl, cli, cr, cri) in self.algebra.coproduct(a_deg, a_idx) {
+                    // (ll ⊗ rl) · (cl ⊗ cr) = (ll · cl) ⊗ (rl · cr).
+                    let mut left = FpVector::new(p, self.algebra.dimension(ll + cl));
+                    self.algebra
+                        .multiply_basis_elements(left.as_slice_mut(), 1, ll, li, cl, cli);
+                    let mut right = FpVector::new(p, self.algebra.dimension(rl + cr));
+                    self.algebra
+                        .multiply_basis_elements(right.as_slice_mut(), 1, rl, ri, cr, cri);
+                    for (lj, lc) in left.iter_nonzero() {
+                        for (rj, rc) in right.iter_nonzero() {
+                            *next.entry((ll + cl, lj, rl + cr, rj)).or_insert(0) += c * lc * rc;
+                        }
+                    }
+                }
+            }
+            terms = next;
+        }
+        let result: Vec<(i32, usize, i32, usize)> = terms
+            .into_iter()
+            .filter(|&(_, c)| c % p.as_u32() != 0)
+            .map(|(k, _)| k)
+            .collect();
+        Arc::clone(
+            self.cache
+                .entry((degree, idx))
+                .or_insert_with(|| Arc::new(result))
+                .value(),
+        )
     }
 }
 
@@ -350,6 +437,509 @@ where
     ExtAlgebra::without_unit(resolution).with_differential(diff)
 }
 
+/// The dualised differential $\Hom_A(\partial, k)$ of *any* free chain complex `Q`, read straight
+/// off `Q`'s own differential, as an [`ExtDifferential`].
+///
+/// Its cohomology is $\Ext$ computed from `Q`: zero coboundary (so $\Ext = $ generators) for a
+/// minimal `Q`, and the genuine non-minimal coboundary for a tensored `Q` such as
+/// [`TensorResolution`]. Because the cochain basis at each bidegree is exactly `Q`'s generators, an
+/// [`ExtAlgebra`] carrying this differential shares one coordinate system with `Q`'s secondary
+/// machinery — which is what lets [`FieldResolutionSecondary`] transport the Adams $d_2$ between
+/// them by [`lift`](ExtAlgebra::lift)/[`project`](ExtAlgebra::project).
+pub struct DualizedDifferential<CC: FreeChainComplex> {
+    complex: Arc<CC>,
+}
+
+impl<CC: FreeChainComplex> DualizedDifferential<CC> {
+    pub fn new(complex: Arc<CC>) -> Self {
+        Self { complex }
+    }
+}
+
+impl<CC: FreeChainComplex> ExtDifferential for DualizedDifferential<CC> {
+    fn shift(&self) -> Bidegree {
+        // δ: Ext^{s,t} → Ext^{s+1,t}, i.e. (n, s) → (n-1, s+1) with t fixed.
+        Bidegree::n_s(-1, 1)
+    }
+
+    fn dimension(&self, b: Bidegree) -> Option<usize> {
+        if b.s() < 0 || !self.complex.has_computed_bidegree(b) {
+            return None;
+        }
+        Some(self.complex.number_of_gens_in_bidegree(b))
+    }
+
+    fn matrix(&self, b: Bidegree) -> Option<Matrix> {
+        let (s, t) = (b.s(), b.t());
+        let target = b + self.shift(); // (s + 1, t)
+        if s < 0
+            || !self.complex.has_computed_bidegree(b)
+            || !self.complex.has_computed_bidegree(target)
+        {
+            return None;
+        }
+        let p = self.complex.prime();
+        let rows = self.complex.number_of_gens_in_bidegree(b); // C^s_t
+        let cols = self.complex.number_of_gens_in_bidegree(target); // C^{s+1}_t
+        let mut matrix = Matrix::new(p, rows, cols);
+        // ∂_{s+1}: Q_{s+1} → Q_s; `hom_k(t)` is indexed [Q_s gen][Q_{s+1} gen] = [row][col], with
+        // entry = coefficient of Q_s-generator `row` in ∂ of Q_{s+1}-generator `col` — exactly the
+        // coboundary δ_{row,col} (and the augmentation part of `TensorResolution`'s free ∂).
+        let hk = self.complex.differential(s + 1).hom_k(t);
+        for (row, cols_of_row) in hk.iter().enumerate() {
+            for (col, &v) in cols_of_row.iter().enumerate() {
+                if v != 0 {
+                    matrix.row_mut(row).set_entry(col, v);
+                }
+            }
+        }
+        Some(matrix)
+    }
+}
+
+/// A materialised, **genuine** free resolution $Q_\bullet = P_\bullet \otimes M \to M$ of `M`,
+/// built by Nassau's field-resolution trick (see the [module docs](self)).
+///
+/// Unlike [`TensorResolutionDifferential`] — which only produces the *dualised* $\Hom_A(Q, k)$ and
+/// so knows just the additive $\Ext$ — this is the whole chain complex, with free modules and free
+/// differentials, and therefore is a bona fide [`FreeChainComplex`]. That unlocks everything the
+/// secondary/product machinery needs from a resolution: in particular
+/// [`SecondaryResolution`](crate::resolution::secondary::SecondaryResolution) accepts it directly,
+/// giving the Adams $d_2$ on $\Ext_A(M, k)$ for infinite/tensored `M`.
+///
+/// # The free differential, in closed form
+/// $Q_s = P_s \otimes M$ carries the diagonal $A$-action; the untwisting isomorphism
+/// $\Phi\colon P_s \otimes M^{\mathrm{triv}} \xrightarrow{\ \sim\ } P_s \otimes M$,
+/// $b\,x_i \otimes m \mapsto \sum b_{(1)} x_i \otimes b_{(2)} m$, presents it as *free* on the pairs
+/// $x_i \otimes m_\alpha$. Conjugating $\partial_P \otimes \mathrm{id}$ by $\Phi$ (its inverse is
+/// $\Psi(b\,y \otimes m) = \sum b_{(1)} y \otimes \chi(b_{(2)}) m$) gives the free differential
+/// $$ \partial_Q(x_i \otimes m_\alpha)
+///      = \sum_j \sum_{(a_{ij})} a'_{ij} \cdot \bigl(y_j \otimes \chi(a''_{ij})\, m_\alpha\bigr), $$
+/// where $\partial_P(x_i) = \sum_j a_{ij} y_j$ and $\Delta(a_{ij}) = \sum a'_{ij} \otimes a''_{ij}$
+/// is the [full coproduct](FullCoproduct). Its $\Hom_A(-, k)$ keeps only the augmentation part
+/// $a' = 1$, recovering the closed-form [`TensorResolutionDifferential`]; and it squares to zero by
+/// construction, being conjugate to $\partial_P \otimes \mathrm{id}$.
+///
+/// Generators of $Q_s$ at internal degree `t` are added in the same $(x_i, m_\alpha)$ order as
+/// [`TensorResolutionDifferential::cochain_basis`], so the two share one coordinate system.
+pub struct TensorResolution<CC, N>
+where
+    CC: FreeChainComplex,
+    CC::Algebra: Bialgebra,
+    N: Module<Algebra = CC::Algebra> + ZeroModule,
+{
+    /// $P_\bullet$: a (minimal) free resolution of `k`.
+    resolution: Arc<CC>,
+    /// The module `M` being resolved.
+    module: Arc<N>,
+    antipode: Antipode<CC::Algebra>,
+    coproduct: FullCoproduct<CC::Algebra>,
+    zero_module: Arc<FreeModule<CC::Algebra>>,
+    /// `s` → $Q_s = P_s \otimes M$.
+    modules: OnceBiVec<Arc<FreeModule<CC::Algebra>>>,
+    /// `s` → $\partial_s\colon Q_s \to Q_{s-1}$ (with $\partial_0\colon Q_0 \to 0$).
+    differentials: OnceVec<Arc<FreeModuleHomomorphism<FreeModule<CC::Algebra>>>>,
+    lock: Mutex<()>,
+}
+
+impl<CC, N> TensorResolution<CC, N>
+where
+    CC: FreeChainComplex,
+    CC::Algebra: Bialgebra,
+    N: Module<Algebra = CC::Algebra> + ZeroModule,
+{
+    pub fn new(resolution: Arc<CC>, module: Arc<N>) -> Self {
+        let algebra = resolution.algebra();
+        let antipode = Antipode::new(Arc::clone(&algebra));
+        let coproduct = FullCoproduct::new(Arc::clone(&algebra));
+        let zero_module = Arc::new(FreeModule::new(Arc::clone(&algebra), "0".to_string(), 0));
+        Self {
+            resolution,
+            module,
+            antipode,
+            coproduct,
+            zero_module,
+            modules: OnceBiVec::new(0),
+            differentials: OnceVec::new(),
+            lock: Mutex::new(()),
+        }
+    }
+
+    /// Build $Q_s$ (free modules and differentials) for all `s ≤ s_max` through internal degree
+    /// `t_max`. Idempotent and monotone: re-calling with a larger box extends in place.
+    fn extend(&self, s_max: i32, t_max: i32) {
+        if s_max < 0 || t_max < 0 {
+            return;
+        }
+        let _lock = self.lock.lock().unwrap();
+        let algebra = self.resolution.algebra();
+
+        // Grow the substrate first: P_• through (s_max, t_max); M and the algebra through t_max.
+        self.resolution
+            .compute_through_bidegree(Bidegree::s_t(s_max, t_max));
+        self.module.compute_basis(t_max);
+        algebra.compute_basis(t_max);
+        self.zero_module.compute_basis(t_max);
+
+        // Ensure a free module exists for each 0..=s_max, then grow its generators + basis to t_max.
+        for s in self.modules.len()..=s_max {
+            self.modules.push(Arc::new(FreeModule::new(
+                Arc::clone(&algebra),
+                format!("(P⊗M)_{s}"),
+                0,
+            )));
+        }
+        for s in 0..=s_max {
+            let fm = &self.modules[s];
+            fm.compute_basis(t_max);
+            let p_s = self.resolution.module(s);
+            for d in (fm.max_computed_degree() + 1)..=t_max {
+                // Generators of Q_s at degree d: the (i, α) with |x_i| + |m_α| = d.
+                let count: usize = p_s
+                    .iter_gens(d)
+                    .map(|(d_i, _)| self.module.dimension(d - d_i))
+                    .sum();
+                fm.add_generators(d, count, None);
+            }
+        }
+
+        // Ensure the differentials exist, then grow their outputs to t_max.
+        for s in self.differentials.len() as i32..=s_max {
+            let d = if s == 0 {
+                FreeModuleHomomorphism::new(
+                    Arc::clone(&self.modules[0]),
+                    Arc::clone(&self.zero_module),
+                    0,
+                )
+            } else {
+                FreeModuleHomomorphism::new(
+                    Arc::clone(&self.modules[s]),
+                    Arc::clone(&self.modules[s - 1]),
+                    0,
+                )
+            };
+            self.differentials.push(Arc::new(d));
+        }
+        for s in 0..=s_max {
+            let d = &self.differentials[s as usize];
+            if s == 0 {
+                d.extend_by_zero(t_max);
+            } else {
+                for degree in d.next_degree()..=t_max {
+                    let rows = self.differential_rows(s, degree);
+                    d.add_generators_from_rows(degree, rows);
+                }
+            }
+        }
+
+        // The secondary machinery lifts intermediates through the differentials, so each needs its
+        // quasi-inverse (image/kernel/QI). Minimal resolvers build these while resolving; here we
+        // compute them explicitly for the materialised free differentials.
+        for s in 0..=s_max {
+            self.differentials[s as usize].compute_auxiliary_data_through_degree(t_max);
+        }
+    }
+
+    /// The outputs of $\partial_s\colon Q_s \to Q_{s-1}$ on the generators of $Q_s$ at degree
+    /// `degree`, one [`FpVector`] (in $(Q_{s-1})_{\text{degree}}$) per generator, in generator order.
+    fn differential_rows(&self, s: i32, degree: i32) -> Vec<FpVector> {
+        let p = self.resolution.prime();
+        let algebra = self.resolution.algebra();
+        let fm = &self.modules[s];
+        let target = &self.modules[s - 1];
+        let p_s = self.resolution.module(s);
+        let p_prev = self.resolution.module(s - 1);
+        let d_p = self.resolution.differential(s);
+        let tgt_dim = target.dimension(degree);
+
+        let mut rows: Vec<FpVector> = Vec::with_capacity(fm.number_of_gens_in_degree(degree));
+        for (d_i, i) in p_s.iter_gens(degree) {
+            let e_alpha = degree - d_i;
+            let m_dim = self.module.dimension(e_alpha);
+            if m_dim == 0 {
+                continue;
+            }
+            // ∂_P(x_i) ∈ (P_{s-1})_{d_i}.
+            let mut dp = FpVector::new(p, p_prev.dimension(d_i));
+            d_p.apply_to_generator(&mut dp, 1, d_i, i);
+
+            for alpha in 0..m_dim {
+                let mut out = FpVector::new(p, tgt_dim);
+                if !dp.is_zero() {
+                    // For each P_{s-1}-generator (d'_j, j): extract a_{ij}, apply the Hopf formula.
+                    for (dpj, j) in p_prev.iter_gens(d_i) {
+                        let op_deg = d_i - dpj; // |a_{ij}|
+                        let width = algebra.dimension(op_deg);
+                        if width == 0 {
+                            continue;
+                        }
+                        let off = p_prev.generator_offset(d_i, dpj, j);
+                        for a_idx in 0..width {
+                            let coeff = dp.entry(off + a_idx);
+                            if coeff == 0 {
+                                continue;
+                            }
+                            // ∂_Q term: Σ_(a) a' · (y_j ⊗ χ(a'') m_α).
+                            for &(l_deg, l_idx, r_deg, r_idx) in
+                                self.coproduct.terms(op_deg, a_idx).iter()
+                            {
+                                // χ(a'') m_α ∈ M_{r_deg + e_alpha}.
+                                let chi = self.antipode.apply(r_deg, r_idx);
+                                let mbeta_deg = r_deg + e_alpha;
+                                let mut acted = FpVector::new(p, self.module.dimension(mbeta_deg));
+                                for (op_idx, op_c) in chi.iter_nonzero() {
+                                    self.module.act_on_basis(
+                                        acted.as_slice_mut(),
+                                        (op_c * coeff) % p.as_u32(),
+                                        r_deg,
+                                        op_idx,
+                                        e_alpha,
+                                        alpha,
+                                    );
+                                }
+                                if acted.is_zero() {
+                                    continue;
+                                }
+                                // Place a' · gen(j, β) for each β: block = generator (j, β) of
+                                // degree d'_j + |m_β|; within-block offset = l_idx (a' at deg l_deg).
+                                let gen_deg = dpj + mbeta_deg;
+                                for (beta, b_c) in acted.iter_nonzero() {
+                                    let gen_idx = self.local_gen_index(s - 1, gen_deg, dpj, j, beta);
+                                    let block = target.generator_offset(degree, gen_deg, gen_idx);
+                                    debug_assert_eq!(degree - gen_deg, l_deg);
+                                    out.add_basis_element(block + l_idx, b_c);
+                                }
+                            }
+                        }
+                    }
+                }
+                rows.push(out);
+            }
+        }
+        rows
+    }
+
+    /// Index of the generator $(y_j, m_\beta)$ among the generators of $Q_s$ at degree `gen_deg`,
+    /// where `y_j` is the P_s-generator `(target_pdeg, target_pidx)`. Matches the add-order in
+    /// [`Self::extend`] (iterate P_s generators, then M-basis β).
+    fn local_gen_index(
+        &self,
+        s: i32,
+        gen_deg: i32,
+        target_pdeg: i32,
+        target_pidx: usize,
+        beta: usize,
+    ) -> usize {
+        let p_s = self.resolution.module(s);
+        let mut idx = 0;
+        for (dk, k) in p_s.iter_gens(gen_deg) {
+            if dk == target_pdeg && k == target_pidx {
+                return idx + beta;
+            }
+            idx += self.module.dimension(gen_deg - dk);
+        }
+        panic!("generator ({target_pdeg}, {target_pidx}) not found in Q_{s} at degree {gen_deg}");
+    }
+}
+
+impl<CC, N> ChainComplex for TensorResolution<CC, N>
+where
+    CC: FreeChainComplex,
+    CC::Algebra: Bialgebra,
+    N: Module<Algebra = CC::Algebra> + ZeroModule,
+{
+    type Algebra = CC::Algebra;
+    type Homomorphism = FreeModuleHomomorphism<FreeModule<CC::Algebra>>;
+    type Module = FreeModule<CC::Algebra>;
+
+    fn algebra(&self) -> Arc<Self::Algebra> {
+        self.resolution.algebra()
+    }
+
+    fn min_degree(&self) -> i32 {
+        0
+    }
+
+    fn zero_module(&self) -> Arc<Self::Module> {
+        Arc::clone(&self.zero_module)
+    }
+
+    fn module(&self, s: i32) -> Arc<Self::Module> {
+        Arc::clone(&self.modules[s])
+    }
+
+    fn differential(&self, s: i32) -> Arc<Self::Homomorphism> {
+        Arc::clone(&self.differentials[s as usize])
+    }
+
+    fn has_computed_bidegree(&self, b: Bidegree) -> bool {
+        b.s() >= 0
+            && self.differentials.len() > b.s() as usize
+            && self.differential(b.s()).next_degree() > b.t()
+    }
+
+    fn compute_through_bidegree(&self, b: Bidegree) {
+        self.extend(b.s(), b.t());
+    }
+
+    fn next_homological_degree(&self) -> i32 {
+        self.modules.len()
+    }
+}
+
+/// The Adams $d_2$ on $\Ext_A(M, k)$ for a module resolved by the field-resolution trick.
+///
+/// It wraps the genuine [`TensorResolution`] $Q_\bullet = P_\bullet \otimes M$ in the standard
+/// [`SecondaryResolution`] machinery (which computes $d_2$ from any free resolution — $d_2$ is a
+/// chain-homotopy invariant), and an [`ExtAlgebra`] whose $E_2$ page is the cohomology of
+/// $\Hom_A(Q, k)$ (via [`DualizedDifferential`]). Because $Q$ is *non-minimal*, $d_2$ is only
+/// defined on cohomology classes, not on cochain generators; the transport
+/// $$ d_2 = \text{project} \circ (\text{cochain } d_2) \circ \text{lift} $$
+/// restricts to cocycles and quotients the spurious coboundary part — exactly the
+/// [`lift`](ExtAlgebra::lift)/[`project`](ExtAlgebra::project) of the cohomology-first foundation.
+///
+/// Works for finite *and* infinite `M`. Cross-checked against the direct
+/// [`SecondaryExtAlgebra`](super::SecondaryExtAlgebra) on the minimal resolution of `M`.
+pub struct FieldResolutionSecondary<CC, N>
+where
+    CC: FreeChainComplex + 'static,
+    CC::Algebra: Bialgebra + PairAlgebra,
+    N: Module<Algebra = CC::Algebra> + ZeroModule + 'static,
+{
+    resolution: Arc<TensorResolution<CC, N>>,
+    secondary: Arc<SecondaryResolution<TensorResolution<CC, N>>>,
+    /// The $E_2$ page of $\Ext_A(M, k)$, in $Q_\bullet$-generator (cochain) coordinates.
+    e2: ExtAlgebra<TensorResolution<CC, N>>,
+}
+
+impl<CC, N> FieldResolutionSecondary<CC, N>
+where
+    CC: FreeChainComplex + 'static,
+    CC::Algebra: Bialgebra + PairAlgebra,
+    N: Module<Algebra = CC::Algebra> + ZeroModule + 'static,
+{
+    /// Build the secondary layer over the field-resolution trick. `resolution` resolves the base
+    /// field `k`; `module` is `M`. Construction is cheap — call
+    /// [`compute_through_stem`](Self::compute_through_stem) to do the work.
+    pub fn new(resolution: Arc<CC>, module: Arc<N>) -> Self {
+        let q = Arc::new(TensorResolution::new(resolution, module));
+        let secondary = Arc::new(SecondaryResolution::new(Arc::clone(&q)));
+        let e2 = ExtAlgebra::without_unit(Arc::clone(&q))
+            .with_differential(Arc::new(DualizedDifferential::new(Arc::clone(&q))));
+        Self {
+            resolution: q,
+            secondary,
+            e2,
+        }
+    }
+
+    fn prime(&self) -> ValidPrime {
+        self.resolution.prime()
+    }
+
+    /// The materialised free resolution $Q_\bullet = P_\bullet \otimes M$.
+    pub fn resolution(&self) -> &Arc<TensorResolution<CC, N>> {
+        &self.resolution
+    }
+
+    /// The $E_2$ page $\Ext_A(M, k)$, with cohomology exposed via
+    /// [`lift`](ExtAlgebra::lift)/[`project`](ExtAlgebra::project).
+    pub fn ext(&self) -> &ExtAlgebra<TensorResolution<CC, N>> {
+        &self.e2
+    }
+
+    /// Compute $Q_\bullet$ and its secondary homotopies far enough to read $d_2$ on the box up to
+    /// `max`. Resolves $Q_\bullet$ with the margin the Adams $d_2$ needs (one extra stem and two
+    /// extra filtrations), then extends the secondary resolution.
+    pub fn compute_through_stem(&self, max: Bidegree) {
+        // d2 out of (n, s) reads the target (n-1, s+2), and the secondary homotopies at s need the
+        // resolution two filtrations higher; also grow one extra stem for the incoming coboundary.
+        let margin = Bidegree::n_s(max.n() + 1, max.s() + 3);
+        self.resolution.compute_through_bidegree(margin);
+        self.compute_secondary();
+    }
+
+    /// Compute the secondary homotopies on the non-minimal $Q_\bullet$.
+    ///
+    /// This mirrors [`SecondaryLift::extend_all`] but drives the final homotopy pass in an order
+    /// suited to a *non-minimal* resolution. The standard [`iter_s_t`](sseq::coordinates::iter_s_t)
+    /// driver only guarantees $h_{s-1}(t')$ for $t' < t$ before computing $h_s(t)$ — enough for a
+    /// minimal resolution, whose differential has no identity component. Our $Q_\bullet$ *does*
+    /// (that non-minimality is the whole point), so $h_s(t)$ depends on $h_{s-1}(t)$ as well; we
+    /// therefore compute `t` outer, `s` inner and strictly increasing (sequential in `s`).
+    fn compute_secondary(&self) {
+        let sec = &self.secondary;
+        sec.initialize_homotopies();
+        sec.compute_composites();
+        sec.compute_intermediates();
+
+        // Base case: the homotopies at s = shift.s() (= 2) are zero.
+        let shift = sec.shift();
+        {
+            let h = &sec.homotopies()[shift.s()];
+            h.homotopies.extend_by_zero(h.composites.max_degree());
+        }
+
+        let min_t = sec.homotopies()[shift.s()].homotopies.min_degree();
+        let s_range = sec.homotopies().range();
+        let max = sec.max().restrict(s_range.end);
+        let mut global_max_t = min_t;
+        for s in (s_range.start + 1)..max.s() {
+            global_max_t = global_max_t.max(max.t(s));
+        }
+        for t in min_t..global_max_t {
+            for s in (s_range.start + 1)..max.s() {
+                if t < max.t(s) {
+                    sec.compute_homotopy_step(Bidegree::s_t(s, t));
+                }
+            }
+        }
+    }
+
+    /// The dimension of $\Ext_A(M, k)$ (the $E_2$ page) at bidegree `b`.
+    pub fn cohomology_dimension(&self, b: Bidegree) -> Option<usize> {
+        self.e2.cohomology_dimension(b)
+    }
+
+    /// The Adams differential $d_2(x)$, a class in bidegree `(n - 1, s + 2)`.
+    ///
+    /// Returns `None` if the target bidegree is out of the computed range. A computed-but-zero
+    /// differential is `Some` of a zero class.
+    pub fn d2(&self, x: &BidegreeElement) -> Option<BidegreeElement> {
+        let b = x.degree();
+        let target = b + Bidegree::n_s(-1, 2);
+        if !(b.t() > 0 && self.resolution.has_computed_bidegree(target)) {
+            return None;
+        }
+
+        // Lift the class to a cocycle representative in Q_•-generator coordinates.
+        let cocycle = self.e2.lift(x);
+
+        // Cochain-level d2: `m[i]` is the d2 of the i-th Q_•-generator at `b`, as a vector over the
+        // Q_•-generators at `target`. This is exactly what `SecondaryResolution::e3_page` reads.
+        let m = self.secondary.homotopy(b.s() + 2).homotopies.hom_k(b.t());
+
+        let target_dim = self.resolution.number_of_gens_in_bidegree(target);
+        let mut out = FpVector::new(self.prime(), target_dim);
+        if !m.is_empty() && !m[0].is_empty() {
+            let p = self.prime().as_u32();
+            for (i, ci) in cocycle.vec().iter_nonzero() {
+                for (k, &v) in m[i].iter().enumerate() {
+                    out.add_basis_element(k, (ci * v) % p);
+                }
+            }
+        }
+
+        // Project the resulting cochain back to an Ext class (quotient by coboundaries).
+        Some(self.e2.project(&Cochain::new(target, out)))
+    }
+
+    /// Whether `x` is a $d_2$-cycle (survives to $E_3$). `None` if $d_2$ is out of range.
+    pub fn survives(&self, x: &BidegreeElement) -> Option<bool> {
+        self.d2(x).map(|d| d.vec().is_zero())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use algebra::{
@@ -404,11 +994,12 @@ mod tests {
     fn antipode_hopf_identity() {
         // Σ χ(x_(1)) x_(2) = ε(x)·1 for every basis element x through some degree.
         let (algebra, chi) = sphere_antipode(10);
+        let coproduct = FullCoproduct::new(Arc::clone(&algebra));
         for degree in 1..=10 {
             for idx in 0..algebra.dimension(degree) {
                 let mut acc = FpVector::new(TWO, algebra.dimension(degree));
                 // Use the same decompose/coproduct route as the antipode for the full coproduct.
-                for (l_deg, l_idx, r_deg, r_idx) in full_coproduct(&algebra, degree, idx) {
+                for &(l_deg, l_idx, r_deg, r_idx) in coproduct.terms(degree, idx).iter() {
                     let chi_left = chi.apply(l_deg, l_idx);
                     for (j, coeff) in chi_left.iter_nonzero() {
                         algebra.multiply_basis_elements(
@@ -427,44 +1018,6 @@ mod tests {
                 );
             }
         }
-    }
-
-    /// The full coproduct Δ(x) of a basis element, folding `decompose` atoms' coproducts in A⊗A.
-    /// Used only by the Hopf-identity test as an independent check.
-    fn full_coproduct(
-        algebra: &SteenrodAlgebra,
-        degree: i32,
-        idx: usize,
-    ) -> Vec<(i32, usize, i32, usize)> {
-        // Represent Δ as a map (l_deg, l_idx, r_deg, r_idx) → coeff.
-        let mut terms: HashMap<(i32, usize, i32, usize), u32> = HashMap::new();
-        terms.insert((0, 0, 0, 0), 1);
-        let mut left_deg = 0;
-        for (a_deg, a_idx) in algebra.decompose(degree, idx) {
-            let mut next: HashMap<(i32, usize, i32, usize), u32> = HashMap::new();
-            for (&(ll, li, rl, ri), &c) in &terms {
-                for (cl, cli, cr, cri) in algebra.coproduct(a_deg, a_idx) {
-                    // (ll⊗rl)·(cl⊗cr) = (ll·cl)⊗(rl·cr).
-                    let mut left = FpVector::new(TWO, algebra.dimension(ll + cl));
-                    algebra.multiply_basis_elements(left.as_slice_mut(), 1, ll, li, cl, cli);
-                    let mut right = FpVector::new(TWO, algebra.dimension(rl + cr));
-                    algebra.multiply_basis_elements(right.as_slice_mut(), 1, rl, ri, cr, cri);
-                    for (lj, lc) in left.iter_nonzero() {
-                        for (rj, rc) in right.iter_nonzero() {
-                            *next.entry((ll + cl, lj, rl + cr, rj)).or_insert(0) += c * lc * rc;
-                        }
-                    }
-                }
-            }
-            terms = next;
-            left_deg += a_deg;
-        }
-        let _ = left_deg;
-        terms
-            .into_iter()
-            .filter(|&(_, c)| c % 2 == 1)
-            .map(|(k, _)| k)
-            .collect()
     }
 
     /// The tensor trick reproduces the direct minimal resolution of a finite module.
@@ -626,5 +1179,197 @@ mod tests {
                 assert_eq!(diff.dimension(b), Some(expected), "dim C^{s}_{t} at {b:?}");
             }
         }
+    }
+
+    /// Build the trivial module for `name` over the sphere algebra, basis computed through `t_max`.
+    fn finite_module(
+        algebra: &Arc<SteenrodAlgebra>,
+        name: &str,
+        t_max: i32,
+    ) -> Arc<FDModule<SteenrodAlgebra>> {
+        let m = Arc::new(
+            FDModule::from_json(
+                Arc::clone(algebra),
+                &crate::utils::parse_module_name(name).unwrap(),
+            )
+            .unwrap(),
+        );
+        m.compute_basis(t_max);
+        m
+    }
+
+    #[test]
+    fn tensor_resolution_is_a_complex() {
+        // ∂ ∘ ∂ = 0 on every generator of Q_• = P_• ⊗ C2 over a box — the free differential is
+        // conjugate to ∂_P ⊗ id, so it must square to zero.
+        use algebra::module::homomorphism::ModuleHomomorphism;
+
+        let (ss, t_max) = (6, 16);
+        let k_res = Arc::new(construct_standard::<false, _, _>("S_2", None).unwrap());
+        let m = finite_module(&k_res.algebra(), "C2", t_max);
+        let q = TensorResolution::new(Arc::clone(&k_res), m);
+        q.compute_through_bidegree(Bidegree::s_t(ss, t_max));
+
+        for s in 2..=ss {
+            let d_s = q.differential(s);
+            let d_prev = q.differential(s - 1);
+            let q_s = q.module(s);
+            let q_prev2 = q.module(s - 2);
+            for t in 0..=t_max {
+                for i in 0..q_s.number_of_gens_in_degree(t) {
+                    let dx = d_s.output(t, i); // ∂(gen) ∈ Q_{s-1} at t
+                    let mut ddx = FpVector::new(TWO, q_prev2.dimension(t));
+                    d_prev.apply(ddx.as_slice_mut(), 1, t, dx.as_slice());
+                    assert!(ddx.is_zero(), "∂² ≠ 0 at s = {s}, t = {t}, gen {i}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn q_complex_computes_ext_c2() {
+        // Gate A: the genuine Q_• complex (via its dualised differential) computes the same additive
+        // Ext(C2, k) as the closed form and the direct minimal resolution — and is genuinely
+        // non-minimal (some bidegree has more cochains than cohomology).
+        let (nn, ss) = (10, 6);
+        let t_max = nn + ss;
+        let k_res = Arc::new(construct_standard::<false, _, _>("S_2", None).unwrap());
+        k_res.compute_through_bidegree(Bidegree::s_t(ss + 1, t_max));
+        k_res.algebra().compute_basis(t_max + 1);
+        let m = finite_module(&k_res.algebra(), "C2", t_max);
+
+        let q = Arc::new(TensorResolution::new(Arc::clone(&k_res), Arc::clone(&m)));
+        q.compute_through_bidegree(Bidegree::s_t(ss + 1, t_max));
+        let e2 = ExtAlgebra::without_unit(Arc::clone(&q))
+            .with_differential(Arc::new(DualizedDifferential::new(Arc::clone(&q))));
+
+        let closed = field_resolution_ext(Arc::clone(&k_res), Arc::clone(&m));
+        let direct = Arc::new(construct_standard::<false, _, _>("C2", None).unwrap());
+        direct.compute_through_stem(Bidegree::n_s(nn, ss));
+
+        let mut saw_nonminimal = false;
+        for n in 0..=nn {
+            for s in 0..=ss {
+                let b = Bidegree::n_s(n, s);
+                let d = direct.number_of_gens_in_bidegree(b);
+                assert_eq!(e2.cohomology_dimension(b), Some(d), "Q• Ext vs direct at {b:?}");
+                assert_eq!(
+                    e2.cohomology_dimension(b),
+                    closed.cohomology_dimension(b),
+                    "Q• Ext vs closed form at {b:?}"
+                );
+                saw_nonminimal |= e2.cochain_dimension(b) > d;
+            }
+        }
+        assert!(
+            saw_nonminimal,
+            "expected a non-minimal bidegree (cochains > cohomology)"
+        );
+    }
+
+    #[test]
+    fn field_d2_reproduces_sphere() {
+        // Gate B sanity: with M = k the tensor complex Q_• collapses to the minimal P_• (the trivial
+        // module makes χ(a) act as ε(a)), so the field-trick d2 must reproduce the standard Adams
+        // d2: d2(h4) = h0 h3² at (14, 3), with h0, h1, h2 permanent.
+        use sseq::coordinates::BidegreeGenerator;
+
+        let k_res = Arc::new(construct_standard::<false, _, _>("S_2", None).unwrap());
+        let m = finite_module(&k_res.algebra(), "S_2", 24);
+        let sec = FieldResolutionSecondary::new(k_res, m);
+        sec.compute_through_stem(Bidegree::n_s(16, 4));
+
+        for (n, s) in [(0, 1), (1, 1), (3, 1)] {
+            let b = Bidegree::n_s(n, s);
+            let h = sec.ext().generator(BidegreeGenerator::new(b, 0));
+            assert_eq!(
+                sec.survives(&h),
+                Some(true),
+                "h at (n = {n}, s = {s}) should survive d2"
+            );
+        }
+
+        let h4 = sec
+            .ext()
+            .generator(BidegreeGenerator::new(Bidegree::n_s(15, 1), 0));
+        let d = sec.d2(&h4).expect("d2(h4) target should be computed");
+        assert_eq!(d.degree(), Bidegree::n_s(14, 3));
+        assert_eq!(sec.cohomology_dimension(Bidegree::n_s(14, 3)), Some(1));
+        assert!(!d.vec().is_zero(), "d2(h4) = h0 h3² should be nonzero");
+        assert_eq!(sec.survives(&h4), Some(false), "h4 should not survive d2");
+    }
+
+    #[test]
+    fn field_d2_matches_direct_c2() {
+        // Gate B: on the genuinely non-minimal Q_• = P_• ⊗ C2, the field-trick d2 agrees with the
+        // direct minimal resolution's secondary d2. Ranks of the outgoing d2 (a basis-independent
+        // invariant of the Adams differential) match at every bidegree, and the E2 dimensions agree.
+        use fp::matrix::Matrix;
+        use sseq::coordinates::BidegreeGenerator;
+
+        use crate::ext_algebra::SecondaryExtAlgebra;
+
+        let (nn, ss) = (12, 6);
+
+        let k_res = Arc::new(construct_standard::<false, _, _>("S_2", None).unwrap());
+        let m = finite_module(&k_res.algebra(), "C2", nn + ss + 8);
+        let field = FieldResolutionSecondary::new(k_res, m);
+        field.compute_through_stem(Bidegree::n_s(nn, ss));
+
+        let direct_res = Arc::new(construct_standard::<false, _, _>("C2", None).unwrap());
+        direct_res.compute_through_stem(Bidegree::n_s(nn + 1, ss + 3));
+        let direct_e2 = Arc::new(ExtAlgebra::new(
+            Arc::clone(&direct_res),
+            Arc::clone(&direct_res),
+        ));
+        let direct_sec = SecondaryExtAlgebra::new(Arc::clone(&direct_e2));
+        direct_sec.extend_all();
+
+        let rank_of = |dim: usize,
+                       target_dim: usize,
+                       d2_of: &mut dyn FnMut(usize) -> FpVector|
+         -> usize {
+            if dim == 0 || target_dim == 0 {
+                return 0;
+            }
+            let rows: Vec<FpVector> = (0..dim).map(&mut *d2_of).collect();
+            Matrix::from_rows(TWO, rows, target_dim).row_reduce()
+        };
+
+        let mut compared = 0;
+        for n in 1..=nn {
+            for s in 1..=ss {
+                let b = Bidegree::n_s(n, s);
+                let target = b + Bidegree::n_s(-1, 2);
+                let (Some(fd), Some(ftd)) = (
+                    field.cohomology_dimension(b),
+                    field.cohomology_dimension(target),
+                ) else {
+                    continue;
+                };
+                assert_eq!(fd, direct_e2.dimension(b), "E2 dim mismatch at {b:?}");
+                assert_eq!(
+                    ftd,
+                    direct_e2.dimension(target),
+                    "E2 dim mismatch at target {target:?}"
+                );
+
+                let field_rank = rank_of(fd, ftd, &mut |i| {
+                    field
+                        .d2(&field.ext().generator(BidegreeGenerator::new(b, i)))
+                        .map(BidegreeElement::into_vec)
+                        .unwrap_or_else(|| FpVector::new(TWO, ftd))
+                });
+                let direct_rank = rank_of(fd, ftd, &mut |i| {
+                    direct_sec
+                        .d2(&direct_e2.generator(BidegreeGenerator::new(b, i)))
+                        .map(BidegreeElement::into_vec)
+                        .unwrap_or_else(|| FpVector::new(TWO, ftd))
+                });
+                assert_eq!(field_rank, direct_rank, "d2 rank mismatch at {b:?}");
+                compared += 1;
+            }
+        }
+        assert!(compared > 0, "no bidegrees compared");
     }
 }
