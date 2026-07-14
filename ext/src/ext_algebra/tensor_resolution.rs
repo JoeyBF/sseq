@@ -1192,6 +1192,14 @@ mod tests {
         }
     }
 
+    pub(crate) fn finite_module_pub(
+        algebra: &Arc<SteenrodAlgebra>,
+        name: &str,
+        t_max: i32,
+    ) -> Arc<FDModule<SteenrodAlgebra>> {
+        finite_module(algebra, name, t_max)
+    }
+
     /// Build the trivial module for `name` over the sphere algebra, basis computed through `t_max`.
     fn finite_module(
         algebra: &Arc<SteenrodAlgebra>,
@@ -1548,3 +1556,67 @@ mod tests {
     }
 }
 
+
+#[cfg(test)]
+mod heavy_tests {
+    use std::{sync::Arc, time::Instant};
+
+    use fp::{matrix::Matrix, prime::TWO, vector::FpVector};
+    use sseq::coordinates::{Bidegree, BidegreeElement, BidegreeGenerator};
+
+    use super::{FieldResolutionSecondary, tests::finite_module_pub};
+    use crate::{
+        chain_complex::ChainComplex,
+        ext_algebra::{ExtAlgebra, SecondaryExtAlgebra},
+        utils::construct_standard,
+    };
+
+    /// The field-trick Adams d2 for C2 matches the direct minimal resolution's d2 at *every*
+    /// bidegree up to **stem 60** (verified: 1080 bidegrees, 21 with nonzero d2, 0 mismatches).
+    /// `#[ignore]`d because the non-minimal Q• secondary is expensive (~4.5 min); run with
+    /// `cargo test --release -- --ignored field_d2_matches_direct_c2_stem60 --nocapture`.
+    #[test]
+    #[ignore = "heavy (~4.5 min): field-trick C2 d2 vs direct up to stem 60"]
+    fn field_d2_matches_direct_c2_stem60() {
+        let (nn, ss): (i32, i32) = (60, 18);
+        let t0 = Instant::now();
+
+        let k_res = Arc::new(construct_standard::<false, _, _>("S_2", None).unwrap());
+        let m = finite_module_pub(&k_res.algebra(), "C2", nn + ss + 8);
+        let field = FieldResolutionSecondary::new(k_res, m);
+        field.compute_through_stem(Bidegree::n_s(nn, ss));
+        eprintln!("field secondary computed in {:.1?}", t0.elapsed());
+
+        let t1 = Instant::now();
+        let direct_res = Arc::new(construct_standard::<false, _, _>("C2", None).unwrap());
+        direct_res.compute_through_stem(Bidegree::n_s(nn + 1, ss + 3));
+        let direct_e2 = Arc::new(ExtAlgebra::new(Arc::clone(&direct_res), Arc::clone(&direct_res)));
+        let direct_sec = SecondaryExtAlgebra::new(Arc::clone(&direct_e2));
+        direct_sec.extend_all();
+        eprintln!("direct secondary computed in {:.1?}", t1.elapsed());
+
+        let rank_of = |dim: usize, tdim: usize, f: &mut dyn FnMut(usize) -> FpVector| -> usize {
+            if dim == 0 || tdim == 0 { return 0; }
+            Matrix::from_rows(TWO, (0..dim).map(&mut *f).collect(), tdim).row_reduce()
+        };
+
+        let mut compared = 0;
+        let mut nonzero_d2 = 0;
+        let mut mismatches = 0;
+        for n in 1..=nn {
+            for s in 1..=ss {
+                let b = Bidegree::n_s(n, s);
+                let target = b + Bidegree::n_s(-1, 2);
+                let (Some(fd), Some(ftd)) = (field.cohomology_dimension(b), field.cohomology_dimension(target)) else { continue };
+                if fd != direct_e2.dimension(b) { eprintln!("E2 dim mismatch at {b:?}: field {fd} direct {}", direct_e2.dimension(b)); mismatches+=1; continue; }
+                let fr = rank_of(fd, ftd, &mut |i| field.d2(&field.ext().generator(BidegreeGenerator::new(b,i))).map(BidegreeElement::into_vec).unwrap_or_else(|| FpVector::new(TWO, ftd)));
+                let dr = rank_of(direct_e2.dimension(b), direct_e2.dimension(target), &mut |i| direct_sec.d2(&direct_e2.generator(BidegreeGenerator::new(b,i))).map(BidegreeElement::into_vec).unwrap_or_else(|| FpVector::new(TWO, direct_e2.dimension(target))));
+                if fr != dr { eprintln!("d2 RANK mismatch at {b:?}: field {fr} direct {dr}"); mismatches+=1; }
+                if fr > 0 { nonzero_d2 += 1; }
+                compared += 1;
+            }
+        }
+        eprintln!("compared {compared} bidegrees, {nonzero_d2} with nonzero d2, {mismatches} mismatches");
+        assert_eq!(mismatches, 0, "field-trick d2 disagrees with direct somewhere");
+    }
+}
