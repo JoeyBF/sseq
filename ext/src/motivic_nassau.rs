@@ -639,6 +639,23 @@ pub trait PAlgebra: Algebra + Sized {
         degree: i32,
         idx: usize,
     ) -> <Self::Profile as Profile>::Signature;
+
+    /// Whether the `idx`-th algebra basis element in `degree` lies in the coset
+    /// `signature`. Semantically `&self.basis_element_signature(profile, degree,
+    /// idx) == signature`, and that is the default — but this is
+    /// [`signature_mask`]'s innermost loop (tens of millions of calls), and the
+    /// default allocates a fresh signature (a `Vec`) per call only to compare and
+    /// drop it. Implementors are strongly encouraged to override with an
+    /// allocation-free field-by-field check.
+    fn basis_element_has_signature(
+        &self,
+        profile: &Self::Profile,
+        degree: i32,
+        idx: usize,
+        signature: &<Self::Profile as Profile>::Signature,
+    ) -> bool {
+        &self.basis_element_signature(profile, degree, idx) == signature
+    }
 }
 
 /// The signature of a [`PAlgebra`]'s profile — shorthand for the nested associated
@@ -672,7 +689,7 @@ fn signature_mask<A: PAlgebra>(
         let dim = alg.dimension(op_deg);
         prof::BASIS_SIG_CALLS.fetch_add(dim as u64, Relaxed);
         for idx in 0..dim {
-            if &alg.basis_element_signature(profile, op_deg, idx) == signature {
+            if alg.basis_element_has_signature(profile, op_deg, idx, signature) {
                 out.push(offset + idx);
             }
         }
@@ -754,6 +771,17 @@ impl PAlgebra for CTauOpAlgebra {
         let (e, r) = self.inner().engine().basis_element(degree, idx);
         profile.signature_of(*e, r)
     }
+
+    fn basis_element_has_signature(
+        &self,
+        profile: &MotivicSubalgebra,
+        degree: i32,
+        idx: usize,
+        signature: &Signature,
+    ) -> bool {
+        let (e, r) = self.inner().engine().basis_element(degree, idx);
+        profile.has_signature(*e, r, signature)
+    }
 }
 
 /// A finite admissible sub-Hopf-algebra `B` of the mod-`p` Steenrod algebra for
@@ -821,6 +849,27 @@ impl SteenrodProfile {
             .map(|(i, &e)| elt.p_part.get(i).copied().unwrap_or(0) % p.pow(e as u32))
             .collect();
         SteenrodSignature { q, p: sp }
+    }
+
+    /// Whether `elt` lies in the coset `sig` — the allocation-free equality that
+    /// [`signature_of(elt) == *sig`] would compute, without materialising the
+    /// `Vec` (this runs in [`signature_mask`]'s hot loop).
+    fn has_signature(
+        &self,
+        elt: &algebra::milnor_algebra::MilnorBasisElement,
+        sig: &SteenrodSignature,
+    ) -> bool {
+        let p = self.prime.as_u32();
+        if elt.q_part & self.q_mask() != sig.q {
+            return false;
+        }
+        for (i, &e) in self.p_profile.iter().enumerate() {
+            let ri = elt.p_part.get(i).copied().unwrap_or(0) % p.pow(e as u32);
+            if ri != sig.p.get(i).copied().unwrap_or(0) {
+                return false;
+            }
+        }
+        true
     }
 
     /// The topological degree of the `B`-element a signature represents.
@@ -1045,6 +1094,16 @@ impl PAlgebra for MilnorAlgebra {
         idx: usize,
     ) -> SteenrodSignature {
         profile.signature_of(self.basis_element_from_index(degree, idx))
+    }
+
+    fn basis_element_has_signature(
+        &self,
+        profile: &SteenrodProfile,
+        degree: i32,
+        idx: usize,
+        signature: &SteenrodSignature,
+    ) -> bool {
+        profile.has_signature(self.basis_element_from_index(degree, idx), signature)
     }
 }
 

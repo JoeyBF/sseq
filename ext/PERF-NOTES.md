@@ -76,14 +76,23 @@ shortcut is a real win over the generic path, and on par with master.
    }` order already satisfies the true minimal dependency `(s,t) ← (s,t−1),
    (s−1,t−1)`, both within the region.
 
-2. **Allocation-free signatures (~10%, real).** `signature_mask` still does tens
-   of millions of `basis_element_signature` calls (62M on `2 80 40`), each
-   allocating a `Vec` for `MilnorAlgebra`. Bucketing basis elements by signature
-   once per (module, degree) + a packed `u64/u128` signature key removes these.
-   Worth doing but it is ~10%, not the headline — this is what remains of the gap
-   to master (15.6 s vs 13.8 s on `2 80 40`).
+2. **DONE — allocation-free signature check (~5%, real).** `signature_mask`'s
+   inner loop tested membership in a coset by *allocating* a whole signature
+   (`SteenrodSignature`/`Signature`, each carrying a `Vec`) per basis element,
+   comparing with `==`, then dropping it — 62M times on `2 80 40`. Replaced with
+   `PAlgebra::basis_element_has_signature`, a field-by-field check that allocates
+   nothing (default still delegates to the old path; both `MilnorAlgebra` and
+   `CTauOpAlgebra` override it). `signature_mask` fell from 1639 ms → 579 ms, and
+   the engine from 15.6 s → 14.8 s (master 14.1 s — now within ~5%).
 
-3. GPM itself (73%) is inherent — master spends the same share there. No change.
+   (The `signature_mask` *return* `Vec<usize>` is a different, far smaller
+   allocation — ~51K/run, not 62M — and it is indexed/reused several times
+   downstream, so returning an iterator would force recomputation rather than
+   help. Left as a Vec.)
+
+3. GPM itself (~78%) is inherent — master spends the same share there. The ~5%
+   that remains is a handful more/differently-shaped partial matrices; diminishing
+   returns. No change.
 
 ## Instrumentation (TEMP — remove after)
 
