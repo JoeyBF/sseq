@@ -20,7 +20,7 @@ use std::{sync::Arc, time::Instant};
 use algebra::{module::FDModule, motivic::CTauAlgebra};
 use bivec::BiVec;
 use ext::{
-    chain_complex::{ChainComplex, FiniteChainComplex, FreeChainComplex},
+    chain_complex::{FiniteChainComplex, FreeChainComplex},
     motivic_nassau::SignatureResolution,
     resolution::Resolution,
 };
@@ -40,7 +40,7 @@ fn main() -> anyhow::Result<()> {
     sres.compute_through_stem(max_s, max_t);
     let sig_time = start.elapsed();
 
-    // --- Generic engine (same rectangle) ---
+    // --- Generic engine (same stem region) ---
     let galg = Arc::new(CTauAlgebra::new());
     let gmod = Arc::new(FDModule::new(
         Arc::clone(&galg),
@@ -50,14 +50,17 @@ fn main() -> anyhow::Result<()> {
     let gcc = Arc::new(FiniteChainComplex::<FDModule<CTauAlgebra>>::ccdz(gmod));
     let gres = Resolution::new(gcc);
     let start = Instant::now();
-    gres.compute_through_bidegree(Bidegree::s_t(max_s, max_t));
+    gres.compute_through_stem(Bidegree::s_t(max_s, max_t));
     let gen_time = start.elapsed();
 
-    // --- 1. Correctness: rank-for-rank equality ---
+    // --- 1. Correctness: rank-for-rank equality (over the shared stem region) ---
     let mut mismatches = 0usize;
     let mut total = 0usize;
     for s in 0..=max_s {
         for t in 0..=max_t {
+            if t - s > max_n {
+                continue;
+            }
             let want = gres.number_of_gens_in_bidegree(Bidegree::s_t(s, t));
             let got = sres.number_of_gens_in_bidegree(s, t);
             if got != want {
