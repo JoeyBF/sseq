@@ -32,7 +32,10 @@ fn main() -> anyhow::Result<()> {
     let max_s: i32 = args.next().and_then(|s| s.parse().ok()).unwrap_or(22);
     let max_t = max_n + max_s;
 
-    println!("# motivic-Nassau validation  (box: max_n={max_n}, max_s={max_s}, max_t={max_t})");
+    // The computed region is the stem rectangle {n ≤ max_n, s ≤ max_s}. Internally
+    // the loop bounds the computational degree t = n + s (top corner max_t), but
+    // the grid region is described by its axes n and s.
+    println!("# motivic-Nassau validation  (stem region: n ≤ {max_n}, s ≤ {max_s})");
 
     // --- Signature engine ---
     let mut sres = SignatureResolution::motivic();
@@ -115,11 +118,10 @@ fn main() -> anyhow::Result<()> {
 
     // --- 3. Timing ---
     println!(
-        "[3] TIMING  signature engine {:.3}s   generic engine {:.3}s   (same {}×{} box)",
+        "[3] TIMING  signature engine {:.3}s   generic engine {:.3}s   (same stem region n ≤ \
+         {max_n}, s ≤ {max_s})",
         sig_time.as_secs_f64(),
         gen_time.as_secs_f64(),
-        max_s,
-        max_t
     );
 
     // --- 4. Signature-shortcut vs plain steps, and the B histogram ---
