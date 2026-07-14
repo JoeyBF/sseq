@@ -830,7 +830,11 @@ where
     /// [`compute_through_stem`](Self::compute_through_stem) to do the work.
     pub fn new(resolution: Arc<CC>, module: Arc<N>) -> Self {
         let q = Arc::new(TensorResolution::new(resolution, module));
-        let secondary = Arc::new(SecondaryResolution::new(Arc::clone(&q)));
+        // Q• is non-minimal, so its composite ∂∂ genuinely hits same-degree generators.
+        let secondary = Arc::new(SecondaryResolution::new_with_hit_generator(
+            Arc::clone(&q),
+            true,
+        ));
         let e2 = ExtAlgebra::without_unit(Arc::clone(&q))
             .with_differential(Arc::new(DualizedDifferential::new(Arc::clone(&q))));
         Self {
@@ -1411,16 +1415,17 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "blocked: the pair-algebra SecondaryResolution machinery assumes minimal \
-                resolutions (composite sizing / same-degree dropping / finalize_element's \
-                `ones.is_zero()`), which the non-minimal Q• for RP^∞ violates. Q• itself is a \
-                correct resolution (∂²=0, see tensor_resolution_is_a_complex_rp_inf); unblocking \
-                infinite-module d2 needs Q• minimised first, or the secondary machinery \
-                generalised to non-minimal resolutions."]
+    #[ignore = "blocked by a MATHEMATICAL obstruction, not minimality: H*(RP^∞) admits several \
+                secondary (B-module) structures, and the secondary machinery assumes the `zero` \
+                one — which does not lift for RP^∞ (see secondary_zero_structure_fails_for_rp_inf; \
+                the DIRECT minimal resolution fails identically at (10,3)). The minimality \
+                hypothesis itself IS removed (hit_generator flag + the act empty-block fix let the \
+                secondary machinery run on the non-minimal Q•, verified for C2). Determining the \
+                geometrically correct secondary structure of RP^∞ is separate theoretical work."]
     fn field_d2_matches_direct_rp_inf() {
-        // The payoff (currently blocked, see #[ignore]): the Adams d2 on `Ext(RP^∞, k)` for the
-        // *infinite* module RP^∞, via the field trick, should agree with the direct minimal
-        // resolution's secondary d2. Ranks of the outgoing d2 match at every bidegree, E2 dims agree.
+        // The payoff (blocked, see #[ignore]): the Adams d2 on `Ext(RP^∞, k)` for the *infinite*
+        // module RP^∞, via the field trick, should agree with the direct minimal resolution's
+        // secondary d2. Ranks of the outgoing d2 match at every bidegree, E2 dims agree.
         use algebra::module::RealProjectiveSpace;
         use fp::matrix::Matrix;
         use sseq::coordinates::BidegreeGenerator;
@@ -1491,4 +1496,55 @@ mod tests {
         }
         assert!(compared > 0, "no bidegrees compared");
     }
+
+    #[test]
+    fn secondary_zero_structure_fails_for_rp_inf() {
+        // The obstruction blocking infinite-module d2 is MATHEMATICAL, not the minimality
+        // hypothesis: H*(RP^∞) admits several secondary (B-module) structures, and the machinery
+        // assumes the `zero` one — which does not lift for RP^∞. This is a property of RP^∞ itself,
+        // independent of the field trick: even the DIRECT *minimal* resolution's secondary lift
+        // fails, at (n, s) = (10, 3). (Contrast the sphere and C2, whose zero structure lifts.)
+        //
+        // We drive the secondary homotopies exactly as `compute_homotopies` does — but stop before
+        // the failing step — then compute it via the fallible path and check it reports the lift
+        // failure rather than silently producing a wrong d2. (Mirrors `secondary::cofib_h4`.)
+        use crate::secondary::SecondaryLift;
+
+        let res = Arc::new(construct_standard::<false, _, _>("RP_inf", None).unwrap());
+        res.compute_through_stem(Bidegree::n_s(12, 6));
+        let lift = crate::secondary::SecondaryResolution::new(Arc::clone(&res));
+
+        let failing = Bidegree::n_s(10, 3);
+
+        lift.initialize_homotopies();
+        lift.compute_composites();
+        lift.compute_intermediates();
+        let shift = lift.shift();
+        {
+            let h = &lift.homotopies()[shift.s()];
+            h.homotopies.extend_by_zero(h.composites.max_degree());
+        }
+        let min_t = lift.homotopies()[shift.s()].homotopies.min_degree();
+        let s_range = lift.homotopies().range();
+        let min = Bidegree::s_t(s_range.start + 1, min_t);
+        let max = lift.max().restrict(s_range.end);
+        sseq::coordinates::iter_s_t(
+            &|b| {
+                if b.s() > failing.s() || (b.s() == failing.s() && b.t() >= failing.t()) {
+                    return b.t()..b.t() + 1;
+                }
+                lift.compute_homotopy_step(b)
+            },
+            min,
+            max,
+        );
+
+        let result = lift.try_compute_homotopy_step(failing);
+        assert!(result.is_err(), "expected RP^∞'s zero secondary structure to fail to lift");
+        assert!(
+            result.unwrap_err().to_string().contains("Failed to lift"),
+            "expected a lift failure at {failing}"
+        );
+    }
 }
+
