@@ -82,6 +82,10 @@ required-features = ["sig-nassau"]
 name = "tmf"
 required-features = ["sig-nassau"]
 
+[[example]]
+name = "nassau_bench"
+required-features = ["sig-nassau"]
+
 [[bench]]
 name = "resolve"
 harness = false
