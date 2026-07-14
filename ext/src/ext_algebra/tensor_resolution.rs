@@ -684,18 +684,25 @@ where
                                 self.coproduct.terms(op_deg, a_idx).iter()
                             {
                                 // χ(a'') m_α ∈ M_{r_deg + e_alpha}.
-                                let chi = self.antipode.apply(r_deg, r_idx);
                                 let mbeta_deg = r_deg + e_alpha;
                                 let mut acted = FpVector::new(p, self.module.dimension(mbeta_deg));
-                                for (op_idx, op_c) in chi.iter_nonzero() {
-                                    self.module.act_on_basis(
-                                        acted.as_slice_mut(),
-                                        (op_c * coeff) % p.as_u32(),
-                                        r_deg,
-                                        op_idx,
-                                        e_alpha,
-                                        alpha,
-                                    );
+                                if r_deg == 0 {
+                                    // a'' = 1, so χ(a'') m_α = m_α. Do this directly: some module
+                                    // actions (e.g. `RealProjectiveSpace`) short-circuit the
+                                    // identity operation `op_degree == 0` and would drop this term.
+                                    acted.add_basis_element(alpha, coeff);
+                                } else {
+                                    let chi = self.antipode.apply(r_deg, r_idx);
+                                    for (op_idx, op_c) in chi.iter_nonzero() {
+                                        self.module.act_on_basis(
+                                            acted.as_slice_mut(),
+                                            (op_c * coeff) % p.as_u32(),
+                                            r_deg,
+                                            op_idx,
+                                            e_alpha,
+                                            alpha,
+                                        );
+                                    }
                                 }
                                 if acted.is_zero() {
                                     continue;
@@ -1317,6 +1324,118 @@ mod tests {
         field.compute_through_stem(Bidegree::n_s(nn, ss));
 
         let direct_res = Arc::new(construct_standard::<false, _, _>("C2", None).unwrap());
+        direct_res.compute_through_stem(Bidegree::n_s(nn + 1, ss + 3));
+        let direct_e2 = Arc::new(ExtAlgebra::new(
+            Arc::clone(&direct_res),
+            Arc::clone(&direct_res),
+        ));
+        let direct_sec = SecondaryExtAlgebra::new(Arc::clone(&direct_e2));
+        direct_sec.extend_all();
+
+        let rank_of = |dim: usize,
+                       target_dim: usize,
+                       d2_of: &mut dyn FnMut(usize) -> FpVector|
+         -> usize {
+            if dim == 0 || target_dim == 0 {
+                return 0;
+            }
+            let rows: Vec<FpVector> = (0..dim).map(&mut *d2_of).collect();
+            Matrix::from_rows(TWO, rows, target_dim).row_reduce()
+        };
+
+        let mut compared = 0;
+        for n in 1..=nn {
+            for s in 1..=ss {
+                let b = Bidegree::n_s(n, s);
+                let target = b + Bidegree::n_s(-1, 2);
+                let (Some(fd), Some(ftd)) = (
+                    field.cohomology_dimension(b),
+                    field.cohomology_dimension(target),
+                ) else {
+                    continue;
+                };
+                assert_eq!(fd, direct_e2.dimension(b), "E2 dim mismatch at {b:?}");
+                assert_eq!(
+                    ftd,
+                    direct_e2.dimension(target),
+                    "E2 dim mismatch at target {target:?}"
+                );
+
+                let field_rank = rank_of(fd, ftd, &mut |i| {
+                    field
+                        .d2(&field.ext().generator(BidegreeGenerator::new(b, i)))
+                        .map(BidegreeElement::into_vec)
+                        .unwrap_or_else(|| FpVector::new(TWO, ftd))
+                });
+                let direct_rank = rank_of(fd, ftd, &mut |i| {
+                    direct_sec
+                        .d2(&direct_e2.generator(BidegreeGenerator::new(b, i)))
+                        .map(BidegreeElement::into_vec)
+                        .unwrap_or_else(|| FpVector::new(TWO, ftd))
+                });
+                assert_eq!(field_rank, direct_rank, "d2 rank mismatch at {b:?}");
+                compared += 1;
+            }
+        }
+        assert!(compared > 0, "no bidegrees compared");
+    }
+
+    #[test]
+    fn tensor_resolution_is_a_complex_rp_inf() {
+        // ∂ ∘ ∂ = 0 for the *infinite* module RP^∞, whose nontrivial higher action exercises the
+        // full antipode-Hopf differential (including the identity-operation term dropped by
+        // `RealProjectiveSpace`'s `act_on_basis` unless special-cased).
+        use algebra::module::{RealProjectiveSpace, homomorphism::ModuleHomomorphism};
+
+        let (ss, t_max) = (7, 20);
+        let k_res = Arc::new(construct_standard::<false, _, _>("S_2", None).unwrap());
+        let rp = Arc::new(RealProjectiveSpace::new(k_res.algebra(), 1, None, false));
+        rp.compute_basis(t_max);
+        let q = TensorResolution::new(Arc::clone(&k_res), rp);
+        q.compute_through_bidegree(Bidegree::s_t(ss, t_max));
+
+        for s in 2..=ss {
+            let d_s = q.differential(s);
+            let d_prev = q.differential(s - 1);
+            let q_s = q.module(s);
+            let q_prev2 = q.module(s - 2);
+            for t in 0..=t_max {
+                for i in 0..q_s.number_of_gens_in_degree(t) {
+                    let dx = d_s.output(t, i);
+                    let mut ddx = FpVector::new(TWO, q_prev2.dimension(t));
+                    d_prev.apply(ddx.as_slice_mut(), 1, t, dx.as_slice());
+                    assert!(ddx.is_zero(), "∂² ≠ 0 at s = {s}, t = {t}, gen {i}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "blocked: the pair-algebra SecondaryResolution machinery assumes minimal \
+                resolutions (composite sizing / same-degree dropping / finalize_element's \
+                `ones.is_zero()`), which the non-minimal Q• for RP^∞ violates. Q• itself is a \
+                correct resolution (∂²=0, see tensor_resolution_is_a_complex_rp_inf); unblocking \
+                infinite-module d2 needs Q• minimised first, or the secondary machinery \
+                generalised to non-minimal resolutions."]
+    fn field_d2_matches_direct_rp_inf() {
+        // The payoff (currently blocked, see #[ignore]): the Adams d2 on `Ext(RP^∞, k)` for the
+        // *infinite* module RP^∞, via the field trick, should agree with the direct minimal
+        // resolution's secondary d2. Ranks of the outgoing d2 match at every bidegree, E2 dims agree.
+        use algebra::module::RealProjectiveSpace;
+        use fp::matrix::Matrix;
+        use sseq::coordinates::BidegreeGenerator;
+
+        use crate::ext_algebra::SecondaryExtAlgebra;
+
+        let (nn, ss) = (10, 5);
+
+        let k_res = Arc::new(construct_standard::<false, _, _>("S_2", None).unwrap());
+        let rp = Arc::new(RealProjectiveSpace::new(k_res.algebra(), 1, None, false));
+        rp.compute_basis(nn + ss + 8);
+        let field = FieldResolutionSecondary::new(k_res, rp);
+        field.compute_through_stem(Bidegree::n_s(nn, ss));
+
+        let direct_res = Arc::new(construct_standard::<false, _, _>("RP_inf", None).unwrap());
         direct_res.compute_through_stem(Bidegree::n_s(nn + 1, ss + 3));
         let direct_e2 = Arc::new(ExtAlgebra::new(
             Arc::clone(&direct_res),
