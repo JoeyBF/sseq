@@ -13,7 +13,7 @@
 //! ```
 //! Args: cofiber module name (default `C4`), max_n (stem), max_s.
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Instant};
 
 use algebra::{milnor_algebra::MilnorAlgebra, module::FDModule};
 use ext::{
@@ -91,12 +91,16 @@ fn main() -> anyhow::Result<()> {
     );
     println!("# stem region: n ≤ {max_n}, s ≤ {max_s}");
 
-    // --- Resolve the chain complex with both engines. ---
+    // --- Resolve the chain complex with both engines (same stem region). ---
     let gres = Resolution::new(Arc::clone(&cofiber_cc));
+    let start = Instant::now();
     gres.compute_through_stem(Bidegree::s_t(max_s, max_t));
+    let gen_time = start.elapsed();
 
     let mut sres = SignatureResolution::from_chain_complex(Arc::clone(&cofiber_cc));
+    let start = Instant::now();
     sres.compute_through_stem(max_s, max_t);
+    let sig_time = start.elapsed();
 
     let mut mism = 0usize;
     let mut total = 0usize;
@@ -137,6 +141,12 @@ fn main() -> anyhow::Result<()> {
     }
     let (sig_steps, plain) = sres.stats();
     println!("[3] STEPS signature-shortcut {sig_steps}   plain {plain}");
+    println!(
+        "[4] TIMING signature {:.3}s   generic {:.3}s   ({:.2}× over generic)",
+        sig_time.as_secs_f64(),
+        gen_time.as_secs_f64(),
+        gen_time.as_secs_f64() / sig_time.as_secs_f64(),
+    );
 
     if mism > 0 {
         std::process::exit(1);
