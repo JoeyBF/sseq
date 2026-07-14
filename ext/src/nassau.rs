@@ -82,8 +82,8 @@ const MAX_NEW_GENS: usize = 10;
 /// in Lemma 2.4 is just the (reverse) lexicographic ordering of the P parts. This corresponds to
 /// the ordering of $\mathcal{P}$ where $P^s_t < P^{s'}_t$ if $s < s'$).
 #[derive(Clone)]
-pub struct MilnorSubalgebra {
-    pub(crate) profile: Vec<u8>,
+struct MilnorSubalgebra {
+    profile: Vec<u8>,
 }
 
 impl MilnorSubalgebra {
@@ -96,7 +96,7 @@ impl MilnorSubalgebra {
     }
 
     /// The algebra with trivial profile, corresponding to the trivial algebra.
-    pub(crate) fn zero_algebra() -> Self {
+    fn zero_algebra() -> Self {
         Self { profile: vec![] }
     }
 
@@ -111,27 +111,14 @@ impl MilnorSubalgebra {
         true
     }
 
-    pub(crate) fn zero_signature(&self) -> Vec<PPartEntry> {
+    fn zero_signature(&self) -> Vec<PPartEntry> {
         vec![0; self.profile.len()]
-    }
-
-    /// The signature (`B`-coset) of a basis element given by its `ppart`: the low
-    /// `profile[i]` bits of each `ppart[i]`. The value analogue of
-    /// [`Self::has_signature`], used as the coset projection `sig_B` by the
-    /// generic `motivic_nassau` engine.
-    #[cfg(feature = "sig-nassau")]
-    pub(crate) fn signature_of(&self, ppart: &[PPartEntry]) -> Vec<PPartEntry> {
-        self.profile
-            .iter()
-            .enumerate()
-            .map(|(i, &profile)| ppart.get(i).copied().unwrap_or(0) & ((1 << profile) - 1))
-            .collect()
     }
 
     /// Give a list of basis elements in degree `degree` that has signature `signature`.
     ///
     /// This requires passing the algebra for borrow checker reasons.
-    pub(crate) fn signature_mask<'a>(
+    fn signature_mask<'a>(
         &'a self,
         algebra: &'a MilnorAlgebra,
         module: &'a FreeModule<MilnorAlgebra>,
@@ -195,10 +182,7 @@ impl MilnorSubalgebra {
 
     /// Iterate through all signatures of this algebra that contain elements of degree at most
     /// `degree` (inclusive). This skips the initial zero signature.
-    pub(crate) fn iter_signatures(
-        &self,
-        degree: i32,
-    ) -> impl Iterator<Item = Vec<PPartEntry>> + '_ {
+    fn iter_signatures(&self, degree: i32) -> impl Iterator<Item = Vec<PPartEntry>> + '_ {
         SignatureIterator::new(self, degree)
     }
 
@@ -211,7 +195,7 @@ impl MilnorSubalgebra {
             .sum()
     }
 
-    pub(crate) fn optimal_for(b: Bidegree) -> Self {
+    fn optimal_for(b: Bidegree) -> Self {
         let b_is_in_vanishing_region = |subalgebra: &Self| {
             let coeff = (1 << subalgebra.profile.len()) - 1;
             b.t() >= coeff * (b.s() + 1) + subalgebra.top_degree()

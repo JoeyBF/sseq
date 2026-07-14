@@ -188,9 +188,35 @@ trait `impl` (which algebra, direct vs. opposite), per the note
 `notes/opposite-algebra-nassau.tex`.
 
 Margolis's general `P`-algebras fit the same trait: any graded connected
-$\mathbb{F}_2$-Hopf algebra with a profile/signature structure and a
+$\mathbb{F}_p$-Hopf algebra with a profile/signature structure and a
 right-stable (or opposite-right-stable) filtration is a `PAlgebra` and is
 resolvable by this engine unchanged.
+
+### Odd-primary generalization
+
+The engine is now $\mathbb{F}_p$-generic, not $\mathbb{F}_2$-only:
+
+- All matrices/vectors are built over `algebra.prime()`, and the
+  signature-correction sweep runs through `QuasiInverse::apply` with coefficient
+  $-1 \equiv p-1$, which does the honest $\mathbb{F}_p$ arithmetic (scale each
+  preimage row by its coefficient; `x -= f`, `dx -= d(f)`). At $p = 2$ this is
+  identical to the old 0/1 logic, so the classical/motivic results are unchanged.
+- `impl PAlgebra for MilnorAlgebra` now uses [`SteenrodProfile`], a **prime-aware**
+  profile in the standard Milnor basis $Q(E)P(R)$: at $p = 2$ the exterior part is
+  vacuous and it reduces to the classical polynomial profile; at odd $p$ it
+  carries both the polynomial truncation ($\xi_{i+1} < p^{p\_profile[i]}$) and the
+  exterior $Q_i \in B$. Degrees come from `combinatorics::{xi,tau}_degrees(p)`;
+  `A(n)` and the vanishing slope $\rho$ branch on $p$.
+
+Validated: `SignatureResolution<MilnorAlgebra>` reproduces the odd-primary Adams
+`E_2` rank-for-rank against the generic engine at **$p = 3$ and $p = 5$**, and the
+signature shortcut *fires* (`sig_steps > 0`) — confirming (a) the standard odd-$p$
+Milnor basis is **right-stable** (used directly, no opposite, unlike the
+conjugate-basis motivic case), and (b) the $\mathbb{F}_p$ correction arithmetic is
+correct. The $p = 2$ classical and motivic validations are unchanged.
+
+One engine now spans: motivic $A_C/\tau$ ($p=2$, opposite), classical Steenrod
+($p=2$, direct), odd-primary Steenrod ($p=3,5$, direct).
 
 ## M6 — Signature-accelerated τ-lift (Algorithm 3)
 

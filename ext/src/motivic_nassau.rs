@@ -23,13 +23,16 @@
 //!   projection [`PAlgebra::basis_element_signature`] (`sig_B`). Everything else
 //!   ([`signature_mask`], [`signature_matrix`]) is *derived* from it generically.
 //!
-//! Instantiated over both the motivic $A_C/\tau$ (via the opposite algebra
-//! [`CTauOpAlgebra`]) **and** the classical mod-$2$ Steenrod algebra
-//! (`MilnorAlgebra`, reusing the proven [`MilnorSubalgebra`] from
-//! [`crate::nassau`]). One engine, two algebras; the handedness (which the note in
-//! `notes/opposite-algebra-nassau.tex` explains) lives entirely in the trait
-//! implementations. The Hopf/freeness axioms of a P-algebra are a precondition the
-//! implementor is trusted to meet (guarded in practice by the `d²=0` fallback).
+//! Instantiated over the motivic $A_C/\tau$ (via the opposite algebra
+//! [`CTauOpAlgebra`]) **and** the mod-$p$ Steenrod algebra `MilnorAlgebra` for
+//! every prime — classical ($p = 2$) and odd-primary ($p = 3, 5, \dots$) alike,
+//! via [`SteenrodProfile`]. One engine, three algebra families. The engine is
+//! $\mathbb{F}_p$-generic (matrices/vectors over `algebra.prime()`, corrections
+//! through `QuasiInverse::apply`); the handedness (which the note in
+//! `notes/opposite-algebra-nassau.tex` explains) and the prime live entirely in
+//! the trait implementations. The Hopf/freeness axioms of a P-algebra are a
+//! precondition the implementor is trusted to meet (guarded in practice by the
+//! `d²=0` fallback).
 //!
 //! # The odd-primary shape
 //!
@@ -60,8 +63,8 @@ use std::{
 };
 
 use algebra::{
-    Algebra,
-    milnor_algebra::{MilnorAlgebra, PPartEntry},
+    Algebra, combinatorics,
+    milnor_algebra::MilnorAlgebra,
     module::{
         FDModule, FreeModule, GeneratorData, Module,
         homomorphism::{FreeModuleHomomorphism, ModuleHomomorphism},
@@ -71,15 +74,11 @@ use algebra::{
 use bivec::BiVec;
 use fp::{
     matrix::{AugmentedMatrix, Matrix},
-    prime::{TWO, ValidPrime},
+    prime::{Prime, TWO, ValidPrime},
     vector::{FpSliceMut, FpVector},
 };
-use sseq::coordinates::Bidegree;
 
-use crate::{
-    chain_complex::{ChainComplex, FiniteChainComplex},
-    nassau::MilnorSubalgebra,
-};
+use crate::chain_complex::{ChainComplex, FiniteChainComplex};
 
 /// Cap on new generators introduced at a single `(1, t)` bidegree (mirrors the
 /// classical engine's headroom for the augmented matrix).
@@ -600,9 +599,11 @@ pub trait PAlgebra: Algebra + Sized {
 
     /// The profile to use at bidegree `(s, t)`: the applicable one of largest
     /// dimension (smallest `E₀`), or [`Self::trivial_profile`] for a plain step.
-    fn optimal_profile(s: i32, t: i32) -> Self::Profile;
-    /// The trivial profile `F₂`.
-    fn trivial_profile() -> Self::Profile;
+    /// Takes `&self` because the choice (and, for variable-prime algebras, the
+    /// profile itself) depends on the algebra.
+    fn optimal_profile(&self, s: i32, t: i32) -> Self::Profile;
+    /// The trivial profile (`F_p`).
+    fn trivial_profile(&self) -> Self::Profile;
 
     /// The signature $\mathrm{sig}_B$ of the `idx`-th algebra basis element in
     /// `degree` — the coset of `B` it lies in. This is the only place the
@@ -664,11 +665,12 @@ fn signature_matrix<A: PAlgebra>(
     let target = hom.target();
     let target_degree = degree - hom.degree_shift();
 
+    let p = alg.prime();
     let target_mask = signature_mask(alg, profile, &target, target_degree, signature);
     let source_mask = signature_mask(alg, profile, &source, degree, signature);
 
-    let mut scratch = FpVector::new(TWO, target.dimension(target_degree));
-    let mut result = Matrix::new(TWO, source_mask.len(), target_mask.len());
+    let mut scratch = FpVector::new(p, target.dimension(target_degree));
+    let mut result = Matrix::new(p, source_mask.len(), target_mask.len());
     for (mut row, &masked_index) in std::iter::zip(result.iter_mut(), &source_mask) {
         scratch.set_to_zero();
         hom.apply_to_basis_element(scratch.as_slice_mut(), 1, degree, masked_index);
@@ -708,11 +710,11 @@ impl Profile for MotivicSubalgebra {
 impl PAlgebra for CTauOpAlgebra {
     type Profile = MotivicSubalgebra;
 
-    fn optimal_profile(s: i32, t: i32) -> MotivicSubalgebra {
+    fn optimal_profile(&self, s: i32, t: i32) -> MotivicSubalgebra {
         MotivicSubalgebra::optimal_for(s, t)
     }
 
-    fn trivial_profile() -> MotivicSubalgebra {
+    fn trivial_profile(&self) -> MotivicSubalgebra {
         MotivicSubalgebra::trivial()
     }
 
@@ -727,13 +729,176 @@ impl PAlgebra for CTauOpAlgebra {
     }
 }
 
-/// [`Profile`] combinatorics for the **classical** mod-$2$ Steenrod algebra,
-/// reusing the proven [`MilnorSubalgebra`] machinery from [`crate::nassau`].
-impl Profile for MilnorSubalgebra {
-    type Signature = Vec<PPartEntry>;
+/// A finite admissible sub-Hopf-algebra `B` of the mod-`p` Steenrod algebra for
+/// **any** prime `p`, in the standard Milnor basis `Q(E)P(R)` — the profile the
+/// generic engine uses over `MilnorAlgebra`. Uniform across primes: at `p = 2`
+/// the exterior part is vacuous (`q_part = 0`, basis elements have no `Q`s) and
+/// this reduces to the classical polynomial profile; at odd `p` it carries both
+/// the polynomial truncation and the exterior `Q_i ∈ B`.
+///
+/// - `p_profile[i]` truncates `ξ_{i+1}` at exponent `p^{p_profile[i]}`;
+/// - `q_part` bit `i` set ⟺ `Q_i ∈ B`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SteenrodProfile {
+    prime: ValidPrime,
+    p_profile: Vec<u8>,
+    q_part: u32,
+}
+
+/// A signature over the mod-`p` Steenrod algebra: the exterior (`Q`) and
+/// polynomial (`ξ`) `B`-components of a `Q(E)P(R)` basis element.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SteenrodSignature {
+    q: u32,
+    p: Vec<u32>,
+}
+
+impl SteenrodProfile {
+    fn trivial(prime: ValidPrime) -> Self {
+        Self {
+            prime,
+            p_profile: vec![],
+            q_part: 0,
+        }
+    }
+
+    /// `A(n)` at prime `p`. At `p = 2`: the polynomial profile `[n+1, n, …, 1]`
+    /// (no exterior). At odd `p`: `Q_0, …, Q_n` and `[n, n-1, …, 1]`.
+    fn a_n(prime: ValidPrime, n: usize) -> Self {
+        if prime.as_u32() == 2 {
+            Self {
+                prime,
+                p_profile: (1..=n + 1).rev().map(|x| x as u8).collect(),
+                q_part: 0,
+            }
+        } else {
+            Self {
+                prime,
+                p_profile: (1..=n).rev().map(|x| x as u8).collect(),
+                q_part: (1u32 << (n + 1)) - 1,
+            }
+        }
+    }
+
+    fn q_mask(&self) -> u32 {
+        self.q_part
+    }
+
+    fn signature_of(&self, elt: &algebra::milnor_algebra::MilnorBasisElement) -> SteenrodSignature {
+        let p = self.prime.as_u32();
+        let q = elt.q_part & self.q_mask();
+        let sp = self
+            .p_profile
+            .iter()
+            .enumerate()
+            .map(|(i, &e)| elt.p_part.get(i).copied().unwrap_or(0) % p.pow(e as u32))
+            .collect();
+        SteenrodSignature { q, p: sp }
+    }
+
+    /// The topological degree of the `B`-element a signature represents.
+    fn signature_degree(&self, sig: &SteenrodSignature) -> i32 {
+        let td = combinatorics::tau_degrees(self.prime);
+        let xd = combinatorics::xi_degrees(self.prime);
+        let mut d = 0i32;
+        for i in 0..32 {
+            if (sig.q >> i) & 1 != 0 {
+                d += td[i as usize];
+            }
+        }
+        for (i, &v) in sig.p.iter().enumerate() {
+            d += v as i32 * xd[i];
+        }
+        d
+    }
+
+    fn top_degree(&self) -> i32 {
+        let p = self.prime.as_u32();
+        let td = combinatorics::tau_degrees(self.prime);
+        let xd = combinatorics::xi_degrees(self.prime);
+        let mut d = 0i32;
+        for i in 0..32 {
+            if (self.q_part >> i) & 1 != 0 {
+                d += td[i as usize];
+            }
+        }
+        for (i, &e) in self.p_profile.iter().enumerate() {
+            d += (p.pow(e as u32) - 1) as i32 * xd[i];
+        }
+        d
+    }
+
+    /// The vanishing-line slope `ρ` (Thm 3.1): `2^{profile.len()}−1` at `p = 2`
+    /// (poly-only `A(n)`), `|Q_n| = 2p^n−1` at odd `p` (largest Bockstein).
+    fn rho(&self) -> i64 {
+        if self.prime.as_u32() == 2 {
+            (1i64 << self.p_profile.len()) - 1
+        } else if self.q_part != 0 {
+            let n = 31 - self.q_part.leading_zeros();
+            combinatorics::tau_degrees(self.prime)[n as usize] as i64
+        } else {
+            0
+        }
+    }
+
+    fn applicable(&self, s: i32, t: i32) -> bool {
+        if self.is_trivial() {
+            return false;
+        }
+        (t as i64) > self.rho() * (s as i64 + 1) + self.top_degree() as i64
+    }
+
+    fn optimal_for(prime: ValidPrime, s: i32, t: i32) -> Self {
+        let mut best = Self::trivial(prime);
+        let mut best_dim = 1u64;
+        // A(n) ladder for every prime; at odd p also the pure-exterior
+        // E(Q_0..Q_{k-1}) intermediates (which share A(k-1)'s slope, smaller τ_B).
+        let a_ns = (0..=8).map(|n| Self::a_n(prime, n));
+        let exteriors: Vec<Self> = if prime.as_u32() == 2 {
+            vec![]
+        } else {
+            (1..=9)
+                .map(|k| Self {
+                    prime,
+                    p_profile: vec![],
+                    q_part: (1u32 << k) - 1,
+                })
+                .collect()
+        };
+        for cand in a_ns.chain(exteriors) {
+            if cand.applicable(s, t) && cand.dimension() > best_dim {
+                best_dim = cand.dimension();
+                best = cand;
+            }
+        }
+        best
+    }
+}
+
+impl std::fmt::Display for SteenrodProfile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.is_trivial() {
+            return write!(f, "F_{}", self.prime.as_u32());
+        }
+        // A(n) detection.
+        for n in 0..=12 {
+            if *self == Self::a_n(self.prime, n) {
+                return write!(f, "A({n})");
+            }
+        }
+        if self.p_profile.iter().all(|&e| e == 0) && self.q_part != 0 {
+            return write!(f, "E(Q_0..Q_{})", 31 - self.q_part.leading_zeros());
+        }
+        write!(f, "B(q={:#x}, p={:?})", self.q_part, self.p_profile)
+    }
+}
+
+/// [`Profile`] combinatorics for the mod-`p` Steenrod algebra.
+impl Profile for SteenrodProfile {
+    type Signature = SteenrodSignature;
 
     fn is_trivial(&self) -> bool {
-        self.profile.is_empty()
+        self.q_part == 0 && self.p_profile.iter().all(|&e| e == 0)
     }
 
     fn name(&self) -> String {
@@ -741,43 +906,89 @@ impl Profile for MilnorSubalgebra {
     }
 
     fn dimension(&self) -> u64 {
-        // dim B = Π_i 2^{profile[i]} = 2^{Σ profile[i]}.
-        1u64 << self.profile.iter().map(|&e| e as u32).sum::<u32>()
+        let p = self.prime.as_u32() as u64;
+        let poly: u64 = self.p_profile.iter().map(|&e| p.pow(e as u32)).product();
+        poly << self.q_part.count_ones()
     }
 
-    fn zero_signature(&self) -> Vec<PPartEntry> {
-        MilnorSubalgebra::zero_signature(self)
+    fn zero_signature(&self) -> SteenrodSignature {
+        SteenrodSignature {
+            q: 0,
+            p: vec![0; self.p_profile.len()],
+        }
     }
 
-    fn iter_signatures(&self, degree: i32) -> Vec<Vec<PPartEntry>> {
-        MilnorSubalgebra::iter_signatures(self, degree).collect()
+    fn iter_signatures(&self, degree: i32) -> Vec<SteenrodSignature> {
+        // Mixed-radix enumeration over the signature coordinates (Q_i radix 2,
+        // ξ_{i+1} radix p^{p_profile[i]}), keeping those of degree ≤ `degree`,
+        // ordered by signature degree ascending (a valid linear extension).
+        let p = self.prime.as_u32();
+        let mut radices: Vec<(bool, usize, u32)> = Vec::new(); // (is_ext, index, radix)
+        let n = self.p_profile.len().max(32);
+        for k in 0..n {
+            if (self.q_part >> k) & 1 != 0 {
+                radices.push((true, k, 2));
+            }
+            if let Some(&e) = self.p_profile.get(k)
+                && e > 0
+            {
+                radices.push((false, k, p.pow(e as u32)));
+            }
+        }
+        let mut out = Vec::new();
+        let mut cur = vec![0u32; radices.len()];
+        loop {
+            let mut i = 0;
+            loop {
+                if i == radices.len() {
+                    out.sort_by_key(|s| (self.signature_degree(s), s.q, s.p.clone()));
+                    return out;
+                }
+                cur[i] += 1;
+                if cur[i] < radices[i].2 {
+                    break;
+                }
+                cur[i] = 0;
+                i += 1;
+            }
+            let mut sig = self.zero_signature();
+            for (c, &v) in radices.iter().zip(&cur) {
+                match c {
+                    (true, k, _) if v != 0 => sig.q |= 1 << k,
+                    (false, k, _) => sig.p[*k] = v,
+                    _ => {}
+                }
+            }
+            if self.signature_degree(&sig) <= degree {
+                out.push(sig);
+            }
+        }
     }
 }
 
-/// [`PAlgebra`] for the classical mod-$2$ Steenrod algebra. The standard Milnor
-/// basis is already right-stable, so the algebra is used directly (no opposite).
-/// This is the unification: the same [`SignatureResolution`] engine drives both
-/// the classical and motivic cases, differing only in this trait implementation
-/// and the coset projection.
+/// [`PAlgebra`] for the mod-`p` Steenrod algebra in the standard Milnor basis,
+/// for **every** prime. The standard basis is right-stable (no opposite needed),
+/// so the same [`SignatureResolution`] engine drives the classical (`p = 2`) and
+/// odd-primary cases; only the coset projection and the profile family, here,
+/// are prime-aware.
 impl PAlgebra for MilnorAlgebra {
-    type Profile = MilnorSubalgebra;
+    type Profile = SteenrodProfile;
 
-    fn optimal_profile(s: i32, t: i32) -> MilnorSubalgebra {
-        // The trivial module `k` has top degree 0, so no `max_degree` shift.
-        MilnorSubalgebra::optimal_for(Bidegree::s_t(s, t))
+    fn optimal_profile(&self, s: i32, t: i32) -> SteenrodProfile {
+        SteenrodProfile::optimal_for(self.prime(), s, t)
     }
 
-    fn trivial_profile() -> MilnorSubalgebra {
-        MilnorSubalgebra::zero_algebra()
+    fn trivial_profile(&self) -> SteenrodProfile {
+        SteenrodProfile::trivial(self.prime())
     }
 
     fn basis_element_signature(
         &self,
-        profile: &MilnorSubalgebra,
+        profile: &SteenrodProfile,
         degree: i32,
         idx: usize,
-    ) -> Vec<PPartEntry> {
-        profile.signature_of(&self.ppart_table(degree)[idx])
+    ) -> SteenrodSignature {
+        profile.signature_of(self.basis_element_from_index(degree, idx))
     }
 }
 
@@ -932,12 +1143,12 @@ impl<A: PAlgebra> SignatureResolution<A> {
         } else if s == 1 {
             self.step1(t);
         } else {
-            let b = A::optimal_profile(s, t);
+            let b = self.algebra.optimal_profile(s, t);
             // Attempt the signature step; on any residual inconsistency fall back
             // to the plain (trivial-B) step, which is the generic algorithm.
             if !self.step_general(s, t, &b) {
                 self.fallbacks.set(self.fallbacks.get() + 1);
-                self.step_general(s, t, &A::trivial_profile());
+                self.step_general(s, t, &self.algebra.trivial_profile());
             } else if b.is_trivial() {
                 self.fallbacks.set(self.fallbacks.get() + 1);
             } else {
@@ -964,7 +1175,7 @@ impl<A: PAlgebra> SignatureResolution<A> {
             chain_map.extend_by_zero(t);
         } else {
             let mut matrix = AugmentedMatrix::<2>::new_with_capacity(
-                TWO,
+                self.algebra.prime(),
                 source_dim,
                 &[target_dim, source_dim],
                 source_dim + target_dim,
@@ -998,14 +1209,15 @@ impl<A: PAlgebra> SignatureResolution<A> {
         let source_dim = source.dimension(t);
         let target_dim = target.dimension(t);
 
-        let mut matrix = AugmentedMatrix::<2>::new(TWO, target_dim, [cc.dimension(t), target_dim]);
+        let p = self.algebra.prime();
+        let mut matrix = AugmentedMatrix::<2>::new(p, target_dim, [cc.dimension(t), target_dim]);
         self.chain_maps[0].get_matrix(matrix.segment(0, 0), t);
         matrix.segment(1, 1).add_identity();
         matrix.row_reduce();
         let desired_image = matrix.compute_kernel();
 
         let mut matrix = AugmentedMatrix::<2>::new_with_capacity(
-            TWO,
+            p,
             source_dim,
             &[target_dim, source_dim],
             source_dim + MAX_NEW_GENS,
@@ -1030,6 +1242,7 @@ impl<A: PAlgebra> SignatureResolution<A> {
     /// at this bidegree), signalling the caller to fall back to a plain step.
     fn step_general(&self, s: i32, t: i32, b: &A::Profile) -> bool {
         let alg = &*self.algebra;
+        let p = alg.prime();
         let target = &self.modules[s as usize - 1];
         let next = &self.modules[s as usize - 2];
         next.compute_basis(t);
@@ -1053,7 +1266,7 @@ impl<A: PAlgebra> SignatureResolution<A> {
         // Kernel of d_{s-1} in the zero-signature block.
         let full_matrix = self.differentials[s as usize - 1].get_partial_matrix(t, &target_mask);
         let mut masked =
-            AugmentedMatrix::new(TWO, target_mask.len(), [next_mask.len(), target_mask.len()]);
+            AugmentedMatrix::new(p, target_mask.len(), [next_mask.len(), target_mask.len()]);
         masked.segment(0, 0).add_masked(&full_matrix, &next_mask);
         masked.segment(1, 1).add_identity();
         masked.row_reduce();
@@ -1070,12 +1283,14 @@ impl<A: PAlgebra> SignatureResolution<A> {
         }
         self.add_generators(s, t, num_new_gens);
 
-        let mut xs = vec![FpVector::new(TWO, target_dim); num_new_gens];
-        let mut dxs = vec![FpVector::new(TWO, next.dimension(t)); num_new_gens];
+        let mut xs = vec![FpVector::new(p, target_dim); num_new_gens];
+        let mut dxs = vec![FpVector::new(p, next.dimension(t)); num_new_gens];
         for ((x, x_masked), dx) in xs.iter_mut().zip(n.iter().skip(next_row)).zip(&mut dxs) {
+            // x := x_masked scattered into the full C_{s-1} basis (coeff 1: this
+            // *defines* x). dx := d_{s-1}(x) = Σ_i x_masked[i]·d(target_mask[i]).
             x.as_slice_mut().add_unmasked(x_masked, 1, &target_mask);
-            for (i, _) in x_masked.iter_nonzero() {
-                dx.as_slice_mut().add(full_matrix.row(i), 1);
+            for (i, c) in x_masked.iter_nonzero() {
+                dx.as_slice_mut().add(full_matrix.row(i), c);
             }
         }
 
@@ -1089,32 +1304,30 @@ impl<A: PAlgebra> SignatureResolution<A> {
             nmask.extend(signature_mask(alg, b, next, t, &signature));
 
             let full_matrix = self.differentials[s as usize - 1].get_partial_matrix(t, &tmask);
-            let mut masked = AugmentedMatrix::new(TWO, tmask.len(), [nmask.len(), tmask.len()]);
+            let mut masked = AugmentedMatrix::new(p, tmask.len(), [nmask.len(), tmask.len()]);
             masked.segment(0, 0).add_masked(&full_matrix, &nmask);
             masked.segment(1, 1).add_identity();
             masked.row_reduce();
 
             let qi = masked.compute_quasi_inverse();
-            let pivots = qi.pivots().unwrap();
-            let preimage = qi.preimage();
 
-            let mut scratch = FpVector::new(TWO, tmask.len());
+            let mut scratch = FpVector::new(p, tmask.len());
+            let mut dx_masked = FpVector::new(p, nmask.len());
             for (x, dx) in xs.iter_mut().zip(&mut dxs) {
-                scratch.set_scratch_vector_size(tmask.len());
-                scratch.set_to_zero();
-                let mut row = 0;
+                // The E_signature (masked) component of dx over C_{s-2}.
+                dx_masked.set_to_zero();
                 for (i, &v) in nmask.iter().enumerate() {
-                    if pivots[i] < 0 {
-                        continue;
-                    }
-                    if dx.entry(v) != 0 {
-                        scratch.as_slice_mut().add(preimage.row(row), 1);
-                    }
-                    row += 1;
+                    dx_masked.set_entry(i, dx.entry(v));
                 }
-                for (i, _) in scratch.iter_nonzero() {
-                    x.add_basis_element(tmask[i], 1);
-                    dx.as_slice_mut().add(full_matrix.row(i), 1);
+                // scratch := −f where d(f) = dx on this block (quasi-inverse, scaled
+                // by −1 ≡ p−1 so the `+=` updates below realise x −= f, dx −= d(f)).
+                // `apply` does the Fₚ arithmetic (scales each preimage row by its
+                // coefficient and skips non-pivot columns).
+                scratch.set_to_zero();
+                qi.apply(scratch.as_slice_mut(), p - 1, dx_masked.as_slice());
+                for (i, c) in scratch.iter_nonzero() {
+                    x.add_basis_element(tmask[i], c);
+                    dx.as_slice_mut().add(full_matrix.row(i), c);
                 }
             }
         }
@@ -1404,6 +1617,68 @@ mod tests {
         assert_eq!(sres.number_of_gens_in_bidegree(1, 1), 1); // h_0
         assert_eq!(sres.number_of_gens_in_bidegree(1, 2), 1); // h_1
         assert_eq!(sres.number_of_gens_in_bidegree(1, 4), 1); // h_2
+    }
+
+    #[test]
+    fn odd_primary_signature_resolution_matches_generic() {
+        // The odd-primary payoff: the SAME engine, over MilnorAlgebra at p=3 and
+        // p=5, reproduces the odd-primary Adams E₂ rank-for-rank vs the generic
+        // engine — and the signature shortcut actually fires (sig_steps > 0),
+        // confirming the standard odd-p Milnor basis is right-stable (no opposite
+        // needed) and the Fₚ correction arithmetic is correct.
+        use std::sync::Arc;
+
+        use algebra::{milnor_algebra::MilnorAlgebra, module::FDModule};
+        use bivec::BiVec;
+        use fp::prime::ValidPrime;
+        use sseq::coordinates::Bidegree;
+
+        use crate::{
+            chain_complex::{ChainComplex, FiniteChainComplex, FreeChainComplex},
+            resolution::Resolution,
+        };
+
+        for p in [3u32, 5] {
+            let prime = ValidPrime::new(p);
+            let max_s = 6;
+            let max_t = if p == 3 { 60 } else { 80 };
+
+            let galg = Arc::new(MilnorAlgebra::new(prime, false));
+            let gmod = Arc::new(FDModule::new(
+                Arc::clone(&galg),
+                "k".to_string(),
+                BiVec::from_vec(0, vec![1]),
+            ));
+            let gcc = Arc::new(FiniteChainComplex::<FDModule<MilnorAlgebra>>::ccdz(gmod));
+            let gres = Resolution::new(gcc);
+            gres.compute_through_stem(Bidegree::s_t(max_s, max_t));
+
+            let mut sres = SignatureResolution::new(Arc::new(MilnorAlgebra::new(prime, false)));
+            sres.compute_through_stem(max_s, max_t);
+
+            let mut checked = 0usize;
+            for b in gres.iter_stem() {
+                if b.t() > max_t {
+                    continue;
+                }
+                let want = gres.number_of_gens_in_bidegree(b);
+                let got = sres.number_of_gens_in_bidegree(b.s(), b.t());
+                assert_eq!(
+                    got,
+                    want,
+                    "p={p} rank mismatch at (s={}, t={}): signature={got} generic={want}",
+                    b.s(),
+                    b.t()
+                );
+                checked += 1;
+            }
+            assert!(checked > 40, "p={p}: too few bidegrees checked: {checked}");
+            let (sig_steps, _fallbacks) = sres.stats();
+            assert!(
+                sig_steps > 0,
+                "p={p}: no signature shortcut fired — handedness or Fₚ arithmetic wrong"
+            );
+        }
     }
 
     #[test]
