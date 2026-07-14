@@ -30,6 +30,7 @@
 
 pub mod massey;
 pub mod secondary;
+pub mod tensor_resolution;
 
 use std::sync::Arc;
 
@@ -42,6 +43,7 @@ use fp::{
 use sseq::coordinates::{Bidegree, BidegreeElement, BidegreeGenerator};
 
 pub use self::secondary::{SecondaryExtAlgebra, SecondaryProduct};
+pub use self::tensor_resolution::{Antipode, TensorResolutionDifferential, field_resolution_ext};
 use crate::{
     chain_complex::{AugmentedChainComplex, FreeChainComplex},
     resolution_homomorphism::ResolutionHomomorphism,
@@ -101,6 +103,22 @@ pub trait ExtDifferential: Send + Sync {
     fn matrix_capped(&self, b: Bidegree, cap: i32) -> Option<Matrix> {
         let _ = cap;
         self.matrix(b)
+    }
+
+    /// The number of cochain generators at `b`, when the differential's cochain complex is *not*
+    /// the one read off the backing resolution's generators.
+    ///
+    /// The default `None` means "use the backing resolution's generator count"
+    /// ([`ExtAlgebra::dimension`]) — the right thing for the minimal/secondary case, where the
+    /// cochain generators *are* the resolution's generators. A differential whose complex lives
+    /// elsewhere overrides this: the tensor-trick coboundary
+    /// ([`tensor_resolution::TensorResolutionDifferential`]) resolves a *different* module `M` by
+    /// tensoring the backing $k$-resolution with `M`, so its cochain generators at
+    /// $(n, s)$ number $\sum_i \dim M_{t - d_i}$ (the indecomposables of $P_s \otimes M$), not the
+    /// $k$-resolution's `number_of_gens_in_bidegree`.
+    fn dimension(&self, b: Bidegree) -> Option<usize> {
+        let _ = b;
+        None
     }
 }
 
@@ -206,6 +224,7 @@ impl<CC: FreeChainComplex> ExtAlgebra<CC> {
         };
         let gens = d
             .graded_dimension(b, cap)
+            .or_else(|| d.dimension(b))
             .unwrap_or_else(|| self.dimension(b));
         let shift = d.shift();
         let source = Bidegree::n_s(b.n() - shift.n(), b.s() - shift.s());
@@ -253,10 +272,10 @@ impl<CC: FreeChainComplex> ExtAlgebra<CC> {
     /// with [`cohomology_dimension`](Self::cohomology_dimension)).
     pub fn cohomology_subquotient(&self, b: Bidegree) -> Option<Subquotient> {
         let p = self.prime();
-        let dim = self.dimension(b);
         let Some(d) = &self.differential else {
-            return Some(Subquotient::new_full(p, dim));
+            return Some(Subquotient::new_full(p, self.dimension(b)));
         };
+        let dim = d.dimension(b).unwrap_or_else(|| self.dimension(b));
 
         // Numerator: ker(δ out of b), via the standard augmented-identity kernel.
         let out = d.matrix(b)?;
