@@ -84,30 +84,6 @@ use crate::chain_complex::{ChainComplex, FiniteChainComplex};
 /// classical engine's headroom for the augmented matrix).
 const MAX_NEW_GENS: usize = 10;
 
-/// Profiling counters (temporary, for the perf investigation). `MASK_CALLS` =
-/// `signature_mask` invocations; `BASIS_SIG_CALLS` = `basis_element_signature`
-/// calls (each allocates a signature); `*_NANOS` = wall-time in each phase.
-pub mod prof {
-    use std::sync::atomic::AtomicU64;
-    pub static MASK_CALLS: AtomicU64 = AtomicU64::new(0);
-    pub static BASIS_SIG_CALLS: AtomicU64 = AtomicU64::new(0);
-    pub static MASK_NANOS: AtomicU64 = AtomicU64::new(0);
-    pub static PARTIAL_NANOS: AtomicU64 = AtomicU64::new(0);
-    pub static LINALG_NANOS: AtomicU64 = AtomicU64::new(0);
-    pub static ITERSIG_NANOS: AtomicU64 = AtomicU64::new(0);
-    pub fn snapshot() -> [u64; 6] {
-        use std::sync::atomic::Ordering::Relaxed;
-        [
-            MASK_CALLS.load(Relaxed),
-            BASIS_SIG_CALLS.load(Relaxed),
-            MASK_NANOS.load(Relaxed),
-            PARTIAL_NANOS.load(Relaxed),
-            LINALG_NANOS.load(Relaxed),
-            ITERSIG_NANOS.load(Relaxed),
-        ]
-    }
-}
-
 /// The **opposite** algebra of `A_C/τ`: the same underlying `F₂`-vector space and
 /// basis, with the product reversed (`a ·ᵒᵖ b = b · a`).
 ///
@@ -674,9 +650,6 @@ fn signature_mask<A: PAlgebra>(
     degree: i32,
     signature: &Sig<A>,
 ) -> Vec<usize> {
-    use std::sync::atomic::Ordering::Relaxed;
-    let _t = std::time::Instant::now();
-    prof::MASK_CALLS.fetch_add(1, Relaxed);
     let mut out = Vec::new();
     for GeneratorData {
         gen_deg,
@@ -687,14 +660,12 @@ fn signature_mask<A: PAlgebra>(
         let op_deg = degree - gen_deg;
         alg.compute_basis(op_deg);
         let dim = alg.dimension(op_deg);
-        prof::BASIS_SIG_CALLS.fetch_add(dim as u64, Relaxed);
         for idx in 0..dim {
             if alg.basis_element_has_signature(profile, op_deg, idx, signature) {
                 out.push(offset + idx);
             }
         }
     }
-    prof::MASK_NANOS.fetch_add(_t.elapsed().as_nanos() as u64, Relaxed);
     out
 }
 
@@ -1395,19 +1366,14 @@ impl<A: PAlgebra> SignatureResolution<A> {
             });
         }
 
-        use std::sync::atomic::Ordering::Relaxed;
         // Kernel of d_{s-1} in the zero-signature block.
-        let _pt = std::time::Instant::now();
         let full_matrix = self.differentials[s as usize - 1].get_partial_matrix(t, &target_mask);
-        prof::PARTIAL_NANOS.fetch_add(_pt.elapsed().as_nanos() as u64, Relaxed);
-        let _lt = std::time::Instant::now();
         let mut masked =
             AugmentedMatrix::new(p, target_mask.len(), [next_mask.len(), target_mask.len()]);
         masked.segment(0, 0).add_masked(&full_matrix, &next_mask);
         masked.segment(1, 1).add_identity();
         masked.row_reduce();
         let kernel = masked.compute_kernel();
-        prof::LINALG_NANOS.fetch_add(_lt.elapsed().as_nanos() as u64, Relaxed);
 
         // Image of d_s in the zero-signature block; new generators cover the rest.
         let mut n = signature_matrix(alg, b, &self.differentials[s as usize], t, &zero_sig);
@@ -1434,26 +1400,20 @@ impl<A: PAlgebra> SignatureResolution<A> {
         // Signature-ordered corrections.
         let mut tmask: Vec<usize> = Vec::new();
         let mut nmask: Vec<usize> = Vec::new();
-        let _it = std::time::Instant::now();
         let sigs = b.iter_signatures(t);
-        prof::ITERSIG_NANOS.fetch_add(_it.elapsed().as_nanos() as u64, Relaxed);
         for signature in sigs {
             tmask.clear();
             nmask.clear();
             tmask.extend(signature_mask(alg, b, target, t, &signature));
             nmask.extend(signature_mask(alg, b, next, t, &signature));
 
-            let _pt = std::time::Instant::now();
             let full_matrix = self.differentials[s as usize - 1].get_partial_matrix(t, &tmask);
-            prof::PARTIAL_NANOS.fetch_add(_pt.elapsed().as_nanos() as u64, Relaxed);
-            let _lt = std::time::Instant::now();
             let mut masked = AugmentedMatrix::new(p, tmask.len(), [nmask.len(), tmask.len()]);
             masked.segment(0, 0).add_masked(&full_matrix, &nmask);
             masked.segment(1, 1).add_identity();
             masked.row_reduce();
 
             let qi = masked.compute_quasi_inverse();
-            prof::LINALG_NANOS.fetch_add(_lt.elapsed().as_nanos() as u64, Relaxed);
 
             let mut scratch = FpVector::new(p, tmask.len());
             let mut dx_masked = FpVector::new(p, nmask.len());

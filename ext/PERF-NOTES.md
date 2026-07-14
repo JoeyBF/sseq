@@ -94,14 +94,18 @@ shortcut is a real win over the generic path, and on par with master.
    that remains is a handful more/differently-shaped partial matrices; diminishing
    returns. No change.
 
-## Instrumentation (TEMP — remove after)
+## Instrumentation (removed)
+
+The temporary counters used for this investigation have been removed now that
+both fixes have landed:
 
 - `algebra::module::homomorphism::{GPM_CALLS, GPM_INPUTS, GPM_NANOS}` on the
-  shared `get_partial_matrix` (in `crates/algebra/.../homomorphism/mod.rs`).
-- `ext::motivic_nassau::prof` (per-phase timers in `signature_mask` /
-  `step_general`).
-- The `[5]`/`[6]` blocks in `examples/nassau_bench.rs`.
+  shared `get_partial_matrix`;
+- `ext::motivic_nassau::prof` per-phase timers in `signature_mask` /
+  `step_general`;
+- the `[5]`/`[6]` blocks in `examples/nassau_bench.rs`.
 
-All add per-call `Instant::now` overhead — **remove once the region change lands**.
-The `assert!(d²=0)` + the `tmf_*`/`classical_*`/`odd_primary_*` rank cross-checks
-guard correctness through any rewrite.
+Correctness through the rewrite is guarded by `assert!(d² = 0)` in `step_general`
+and the `tmf_*` / `classical_*` / `odd_primary_*` / golden-fixture rank
+cross-checks. To re-profile, `perf`/`cargo flamegraph` on `nassau_bench` show the
+same split without touching the source.

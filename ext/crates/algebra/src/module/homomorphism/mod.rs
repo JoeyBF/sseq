@@ -8,13 +8,6 @@ use fp::{
 
 use crate::module::Module;
 
-/// TEMP perf instrumentation for [`ModuleHomomorphism::get_partial_matrix`] —
-/// shared by every resolution engine so their calls/time can be compared. Remove
-/// after the signature-engine tuning.
-pub static GPM_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-pub static GPM_INPUTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-pub static GPM_NANOS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
 mod free_module_homomorphism;
 mod full_module_homomorphism;
 mod generic_zero_homomorphism;
@@ -145,17 +138,9 @@ pub trait ModuleHomomorphism: Send + Sync {
 
     /// Get the values of the homomorphism on the specified inputs to `matrix`.
     fn get_partial_matrix(&self, degree: i32, inputs: &[usize]) -> Matrix {
-        // TEMP perf instrumentation (shared by all engines); remove after tuning.
-        let _gpm = std::time::Instant::now();
-        GPM_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        GPM_INPUTS.fetch_add(inputs.len() as u64, std::sync::atomic::Ordering::Relaxed);
         let mut matrix = Matrix::new(self.prime(), inputs.len(), self.target().dimension(degree));
 
         if matrix.columns() == 0 {
-            GPM_NANOS.fetch_add(
-                _gpm.elapsed().as_nanos() as u64,
-                std::sync::atomic::Ordering::Relaxed,
-            );
             return matrix;
         }
 
@@ -164,10 +149,6 @@ pub trait ModuleHomomorphism: Send + Sync {
             .enumerate()
             .for_each(|(i, row)| self.apply_to_basis_element(row, 1, degree, inputs[i]));
 
-        GPM_NANOS.fetch_add(
-            _gpm.elapsed().as_nanos() as u64,
-            std::sync::atomic::Ordering::Relaxed,
-        );
         matrix
     }
 
