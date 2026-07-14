@@ -506,6 +506,57 @@ mod tests {
     }
 
     #[test]
+    fn cohomology_basis_and_lift_project() {
+        use sseq::coordinates::BidegreeGenerator;
+
+        // On the field trick (non-minimal) `Ext*` exposes the cohomology: `dimension` is the
+        // cohomology dim (≤ the cochain-generator count, strictly less where the coboundary bites),
+        // and `project ∘ lift` is the identity on cohomology classes.
+        let (nn, ss) = (12, 7);
+        let t_max = nn + ss;
+        let k_res = Arc::new(construct_standard::<false, _, _>("S_2", None).unwrap());
+        k_res.compute_through_bidegree(Bidegree::s_t(ss + 1, t_max));
+        k_res.algebra().compute_basis(t_max + 1);
+        let m = Arc::new(
+            FDModule::from_json(
+                k_res.algebra(),
+                &crate::utils::parse_module_name("C2").unwrap(),
+            )
+            .unwrap(),
+        );
+        m.compute_basis(t_max);
+        let alg = field_resolution_ext(Arc::clone(&k_res), m);
+
+        let mut saw_nonminimal = false;
+        for n in 0..=nn {
+            for s in 0..=ss {
+                let b = Bidegree::n_s(n, s);
+                let dim = alg.dimension(b);
+                assert_eq!(Some(dim), alg.cohomology_dimension(b));
+                let cochain = alg.cochain_dimension(b);
+                assert!(
+                    cochain >= dim,
+                    "cochain {cochain} < cohomology {dim} at {b:?}"
+                );
+                saw_nonminimal |= cochain > dim;
+
+                for i in 0..dim {
+                    let class = alg.generator(BidegreeGenerator::new(b, i));
+                    assert_eq!(
+                        class,
+                        alg.project(&alg.lift(&class)),
+                        "project∘lift {b:?}#{i}"
+                    );
+                }
+            }
+        }
+        assert!(
+            saw_nonminimal,
+            "expected a non-minimal bidegree where cochain dim > cohomology dim"
+        );
+    }
+
+    #[test]
     fn tensor_trick_matches_direct_rp_inf() {
         // The real payoff: `RP^∞` is *infinite*, so Nassau's engine cannot resolve it — but the
         // non-nassau standard resolver works degreewise and *can*. Cross-check the whole Ext chart

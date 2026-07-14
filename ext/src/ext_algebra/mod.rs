@@ -38,7 +38,7 @@ use dashmap::DashMap;
 use fp::{
     matrix::{AugmentedMatrix, Matrix, Subquotient, Subspace},
     prime::ValidPrime,
-    vector::FpVector,
+    vector::{FpSlice, FpVector},
 };
 use sseq::coordinates::{Bidegree, BidegreeElement, BidegreeGenerator};
 
@@ -122,6 +122,37 @@ pub trait ExtDifferential: Send + Sync {
     }
 }
 
+/// A cochain of the Ext cochain complex $\Hom_A(P_\bullet, k)$ at a bidegree: a vector over the
+/// **cochain generators** (dual to the resolution's free generators).
+///
+/// This is the native "cochain" world, distinct from [`BidegreeElement`], which `Ext*` interprets
+/// as a cohomology **class**. The two coincide only when the coboundary vanishes (a minimal
+/// resolution); in general convert with [`ExtAlgebra::lift`] (class → cocycle representative) and
+/// [`ExtAlgebra::project`] (cochain → class).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Cochain {
+    degree: Bidegree,
+    vec: FpVector,
+}
+
+impl Cochain {
+    pub fn new(degree: Bidegree, vec: FpVector) -> Self {
+        Self { degree, vec }
+    }
+
+    pub fn degree(&self) -> Bidegree {
+        self.degree
+    }
+
+    pub fn vec(&self) -> FpSlice<'_> {
+        self.vec.as_slice()
+    }
+
+    pub fn into_vec(self) -> FpVector {
+        self.vec
+    }
+}
+
 /// $\Ext(M, k)$ as a bigraded module over the bigraded algebra $\Ext(k, k)$, backed by a
 /// resolution. See the [module-level documentation](self) for conventions.
 pub struct ExtAlgebra<CC: FreeChainComplex> {
@@ -135,6 +166,9 @@ pub struct ExtAlgebra<CC: FreeChainComplex> {
     /// The DGA differential, if any. `None` is the field/minimal case (zero
     /// coboundary), where the cohomology is just the generators.
     differential: Option<Arc<dyn ExtDifferential>>,
+    /// Memoised cohomology space (of the attached [`differential`](Self::differential)) at each
+    /// bidegree — the vector space whose basis `Ext*` exposes. See [`Self::cohomology`].
+    cohomology_cache: DashMap<Bidegree, Arc<Subquotient>>,
 }
 
 impl ExtAlgebra<QueryModuleResolution> {
@@ -166,6 +200,7 @@ impl<CC: FreeChainComplex> ExtAlgebra<CC> {
             unit,
             products: DashMap::new(),
             differential: None,
+            cohomology_cache: DashMap::new(),
         }
     }
 
@@ -187,6 +222,7 @@ impl<CC: FreeChainComplex> ExtAlgebra<CC> {
     #[must_use]
     pub fn with_differential(mut self, differential: Arc<dyn ExtDifferential>) -> Self {
         self.differential = Some(differential);
+        self.cohomology_cache.clear();
         self
     }
 
@@ -220,12 +256,12 @@ impl<CC: FreeChainComplex> ExtAlgebra<CC> {
     /// [`cohomology_dimension`](Self::cohomology_dimension) for every `cap`.
     pub fn cohomology_dimension_capped(&self, b: Bidegree, cap: i32) -> Option<usize> {
         let Some(d) = &self.differential else {
-            return Some(self.dimension(b));
+            return Some(self.cochain_dimension(b));
         };
         let gens = d
             .graded_dimension(b, cap)
             .or_else(|| d.dimension(b))
-            .unwrap_or_else(|| self.dimension(b));
+            .unwrap_or_else(|| self.cochain_dimension(b));
         let shift = d.shift();
         let source = Bidegree::n_s(b.n() - shift.n(), b.s() - shift.s());
         // The capped matrix must line up with the capped generator count `gens`, or
@@ -271,11 +307,32 @@ impl<CC: FreeChainComplex> ExtAlgebra<CC> {
     /// `None` if the outgoing differential at `b` is out of the computed range (as
     /// with [`cohomology_dimension`](Self::cohomology_dimension)).
     pub fn cohomology_subquotient(&self, b: Bidegree) -> Option<Subquotient> {
+        self.cohomology(b).map(|h| (*h).clone())
+    }
+
+    /// The cohomology space at `b` (of the attached [`differential`](Self::differential)) — the
+    /// vector space whose basis `Ext*` exposes as `Ext`, memoised and `Arc`-shared. This is the
+    /// canonical object behind [`dimension`](Self::dimension), [`basis`](Self::basis),
+    /// [`lift`](Self::lift) and [`project`](Self::project): its `dimension()` is the Ext dimension
+    /// and its `gens()` are cocycle representatives of the basis classes.
+    ///
+    /// `None` when the differential out of `b` is out of the computed range.
+    pub fn cohomology(&self, b: Bidegree) -> Option<Arc<Subquotient>> {
+        if let Some(h) = self.cohomology_cache.get(&b) {
+            return Some(Arc::clone(&h));
+        }
+        let h = Arc::new(self.compute_cohomology(b)?);
+        Some(Arc::clone(
+            self.cohomology_cache.entry(b).or_insert(h).value(),
+        ))
+    }
+
+    fn compute_cohomology(&self, b: Bidegree) -> Option<Subquotient> {
         let p = self.prime();
         let Some(d) = &self.differential else {
-            return Some(Subquotient::new_full(p, self.dimension(b)));
+            return Some(Subquotient::new_full(p, self.cochain_dimension(b)));
         };
-        let dim = d.dimension(b).unwrap_or_else(|| self.dimension(b));
+        let dim = self.cochain_dimension(b);
 
         // Numerator: ker(δ out of b), via the standard augmented-identity kernel.
         let out = d.matrix(b)?;
@@ -340,29 +397,89 @@ impl<CC: FreeChainComplex> ExtAlgebra<CC> {
         }
     }
 
-    /// The dimension of $\Ext^{s,t}(M, k)$ at the given bidegree.
+    /// The dimension of $\Ext^{s,t}(M, k)$ at the given bidegree — the dimension of the
+    /// **cohomology** of the attached [`differential`](Self::differential) (its Ext part). With no
+    /// differential (a minimal resolution) this is the generator count, since every cochain is a
+    /// cocycle; with one (the field/tensor trick, or a $d_2$ page) it is a genuine
+    /// kernel-mod-image. Returns `0` when out of the computed range.
     pub fn dimension(&self, b: Bidegree) -> usize {
-        self.resolution.number_of_gens_in_bidegree(b)
+        self.cohomology_dimension(b).unwrap_or(0)
     }
 
-    /// The basis generators of $\Ext(M, k)$ at the given bidegree.
+    /// The number of **cochain generators** at `b` — the ambient dimension of the cochain group
+    /// $\Hom_A(P_\bullet, k)_b$ that the cohomology is a subquotient of. This is the "generator"
+    /// world (as opposed to the cohomology-class world of [`dimension`](Self::dimension)); the two
+    /// coincide exactly when the coboundary is zero (a minimal resolution).
+    pub fn cochain_dimension(&self, b: Bidegree) -> usize {
+        self.differential
+            .as_ref()
+            .and_then(|d| d.dimension(b))
+            .unwrap_or_else(|| self.resolution.number_of_gens_in_bidegree(b))
+    }
+
+    /// The basis classes of $\Ext(M, k)$ at the given bidegree — one [`BidegreeGenerator`] per basis
+    /// element of the cohomology.
     pub fn basis(&self, b: Bidegree) -> Vec<BidegreeGenerator> {
         (0..self.dimension(b))
             .map(|i| BidegreeGenerator::new(b, i))
             .collect()
     }
 
-    /// A class in $\Ext(M, k)$ from its coordinates in the generator basis at bidegree `b`.
+    /// A class in $\Ext(M, k)$ from its coordinates in the **cohomology** basis at bidegree `b`.
     pub fn element(&self, b: Bidegree, coords: &[u32]) -> BidegreeElement {
         assert_eq!(self.dimension(b), coords.len());
         BidegreeElement::new(b, FpVector::from_slice(self.prime(), coords))
     }
 
-    /// A single generator of $\Ext(M, k)$ as a class.
+    /// A single basis class of $\Ext(M, k)$.
     pub fn generator(&self, g: BidegreeGenerator) -> BidegreeElement {
         let ambient = self.dimension(g.degree());
         assert!(ambient > g.idx());
-        g.into_element(self.prime(), self.dimension(g.degree()))
+        g.into_element(self.prime(), ambient)
+    }
+
+    /// Lift a cohomology **class** to a **cocycle representative** — a [`Cochain`] whose class is
+    /// `x`. Concretely $\sum_i x_i \cdot g_i$ over the cocycle representatives
+    /// `cohomology(b).gens()`. Inverse to [`project`](Self::project) up to a coboundary; on a
+    /// minimal resolution (zero coboundary) it is the identity.
+    pub fn lift(&self, x: &BidegreeElement) -> Cochain {
+        let b = x.degree();
+        let h = self
+            .cohomology(b)
+            .expect("lift: bidegree out of computed range");
+        let mut vec = FpVector::new(self.prime(), h.ambient_dimension());
+        for (i, c) in x.vec().iter_nonzero() {
+            vec.as_slice_mut()
+                .add(h.gens().nth(i).expect("class coordinate out of range"), c);
+        }
+        Cochain::new(b, vec)
+    }
+
+    /// Project a **cochain** to its cohomology **class** by reducing modulo coboundaries and reading
+    /// coordinates in the cohomology basis. On a minimal resolution it is the identity. (A cochain
+    /// with a non-cocycle part is reduced regardless; pass a cocycle for a meaningful class.)
+    pub fn project(&self, c: &Cochain) -> BidegreeElement {
+        let b = c.degree();
+        let h = self
+            .cohomology(b)
+            .expect("project: bidegree out of computed range");
+        let mut v = FpVector::new(self.prime(), h.ambient_dimension());
+        v.as_slice_mut().add(c.vec(), 1);
+        let coords = h.reduce(v.as_slice_mut());
+        BidegreeElement::new(b, FpVector::from_slice(self.prime(), &coords))
+    }
+
+    /// A [`Cochain`] from its coordinates in the cochain-generator basis at bidegree `b`.
+    pub fn cochain_element(&self, b: Bidegree, coords: &[u32]) -> Cochain {
+        assert_eq!(self.cochain_dimension(b), coords.len());
+        Cochain::new(b, FpVector::from_slice(self.prime(), coords))
+    }
+
+    /// A single cochain generator (a basis element of the cochain group), as a [`Cochain`].
+    pub fn cochain_generator(&self, g: BidegreeGenerator) -> Cochain {
+        let ambient = self.cochain_dimension(g.degree());
+        assert!(ambient > g.idx());
+        Cochain::new(g.degree(), g.into_element(self.prime(), ambient).into_vec())
     }
 
     /// The dimension of $\Ext(k, k)$ at the given bidegree (the multiplicand/"scalar" side).
@@ -505,7 +622,10 @@ mod tests {
         for s in 0..=8 {
             for n in 0..=8 {
                 let b = Bidegree::n_s(n, s);
-                assert_eq!(alg.cohomology_dimension(b), Some(alg.dimension(b)));
+                // No differential: cohomology = cochain generators, so the class world and the
+                // cochain world coincide.
+                assert_eq!(alg.cohomology_dimension(b), Some(alg.cochain_dimension(b)));
+                assert_eq!(alg.dimension(b), alg.cochain_dimension(b));
             }
         }
     }
@@ -554,10 +674,16 @@ mod tests {
         let alg = ExtAlgebra::new(Arc::clone(&res), Arc::clone(&res))
             .with_differential(Arc::new(MockDiff { dims }));
 
-        // Sanity: all three source bidegrees are 1-dimensional on the E-page.
-        assert_eq!(alg.dimension(Bidegree::n_s(0, 1)), 1); // h_0
-        assert_eq!(alg.dimension(Bidegree::n_s(0, 2)), 1); // h_0^2
-        assert_eq!(alg.dimension(Bidegree::n_s(1, 1)), 1); // h_1
+        // Sanity: all three source bidegrees are 1-dimensional on the E-page (the cochain level;
+        // `dimension` itself is now the cohomology, computed below).
+        assert_eq!(alg.cochain_dimension(Bidegree::n_s(0, 1)), 1); // h_0
+        assert_eq!(alg.cochain_dimension(Bidegree::n_s(0, 2)), 1); // h_0^2
+        assert_eq!(alg.cochain_dimension(Bidegree::n_s(1, 1)), 1); // h_1
+
+        // `dimension` is the cohomology: the two killed classes drop to 0, h_1 survives.
+        assert_eq!(alg.dimension(Bidegree::n_s(0, 2)), 0);
+        assert_eq!(alg.dimension(Bidegree::n_s(0, 1)), 0);
+        assert_eq!(alg.dimension(Bidegree::n_s(1, 1)), 1);
 
         assert_eq!(alg.cohomology_dimension(Bidegree::n_s(0, 2)), Some(0)); // outgoing rank 1
         assert_eq!(alg.cohomology_dimension(Bidegree::n_s(0, 1)), Some(0)); // incoming rank 1
