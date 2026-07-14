@@ -1118,6 +1118,14 @@ pub struct SignatureResolution<A: PAlgebra> {
     differentials: Vec<Arc<FreeModuleHomomorphism<FreeModule<A>>>>,
     chain_maps: Vec<Arc<FreeModuleHomomorphism<FDModule<A>>>>,
     max_s: i32,
+    /// Top degree of the resolved target complex (0 for `k`). The `Ext_B`
+    /// vanishing line for a module `M` is offset by `M`'s top cell — its
+    /// associated graded is `⊕ Σ^{n_i} k`, so `Ext_B(M, k)` is a subquotient of
+    /// `⊕ Σ^{n_i} Ext_B(k, k)` and vanishes only above `k`'s line shifted by
+    /// `max n_i = top(M)`. We select `B` conservatively by that offset (see
+    /// [`Self::step`]); without it, `optimal_profile` picks `B` below its true
+    /// vanishing line and the correction sweep fails (`d² ≠ 0`).
+    target_top: i32,
     shrink: RefCell<Vec<ShrinkRecord>>,
     plain_steps: Cell<usize>,
     sig_steps: Cell<usize>,
@@ -1131,12 +1139,37 @@ impl<A: PAlgebra> SignatureResolution<A> {
             "k".to_string(),
             BiVec::from_vec(0, vec![1]),
         ));
-        let target = Arc::new(FiniteChainComplex::<FDModule<A>>::ccdz(module));
+        Self::from_module(module)
+    }
+
+    /// A resolution of an arbitrary bounded (finite-dimensional) module `M` over
+    /// its algebra, as a chain complex concentrated in homological degree 0.
+    ///
+    /// The signature machinery ([`Self::step_general`], `s ≥ 2`) is intrinsic to
+    /// the free `A`-modules and their `A`-linear differentials — it never inspects
+    /// what is being resolved. Only the seed (`step0`/`step1`, which cover
+    /// `M = target.module(0)` and `ker(C_0 → M)`) is module-specific, and those
+    /// already read `self.target.module(0)` generically. So resolving `M ≠ k`
+    /// needs only a different target; the vanishing-line shortcut region shifts up
+    /// by `M`'s top degree (below it, plain steps, always correct).
+    pub fn from_module(module: Arc<FDModule<A>>) -> Self {
+        Self::from_chain_complex(Arc::new(FiniteChainComplex::<FDModule<A>>::ccdz(module)))
+    }
+
+    /// A resolution of a bounded finite chain complex `C_*` of `FDModule`s.
+    pub fn from_chain_complex(target: Arc<FiniteChainComplex<FDModule<A>>>) -> Self {
+        use crate::chain_complex::BoundedChainComplex;
+        let algebra = target.algebra();
         let zero_module = Arc::new(FreeModule::new(
             Arc::clone(&algebra),
             "F_{-1}".to_string(),
             0,
         ));
+        // Top cell of the whole target complex — the vanishing-line offset.
+        let target_top = (0..=target.max_s())
+            .filter_map(|s| target.module(s).max_degree())
+            .max()
+            .unwrap_or(0);
         Self {
             algebra,
             target,
@@ -1145,6 +1178,7 @@ impl<A: PAlgebra> SignatureResolution<A> {
             differentials: Vec::new(),
             chain_maps: Vec::new(),
             max_s: 0,
+            target_top,
             shrink: RefCell::new(Vec::new()),
             plain_steps: Cell::new(0),
             sig_steps: Cell::new(0),
@@ -1249,8 +1283,11 @@ impl<A: PAlgebra> SignatureResolution<A> {
         } else {
             // `optimal_profile` returns a provably-applicable B (Thm 3.1) or the
             // trivial profile `A(-1) = k` — the plain step, which always works. So
-            // the step never needs a runtime fallback.
-            let b = self.algebra.optimal_profile(s, t);
+            // the step never needs a runtime fallback. Offset `t` by the target's
+            // top cell: `Ext_B(M, k)` vanishes only above `k`'s line shifted by
+            // `top(M)`, so choosing `B` as if at `t − target_top` keeps us above
+            // the module's true vanishing line (`target_top = 0` recovers `k`).
+            let b = self.algebra.optimal_profile(s, t - self.target_top);
             if b.is_trivial() {
                 self.plain_steps.set(self.plain_steps.get() + 1);
             } else {
@@ -1724,6 +1761,77 @@ mod tests {
         assert_eq!(sres.number_of_gens_in_bidegree(1, 1), 1); // h_0
         assert_eq!(sres.number_of_gens_in_bidegree(1, 2), 1); // h_1
         assert_eq!(sres.number_of_gens_in_bidegree(1, 4), 1); // h_2
+    }
+
+    #[test]
+    fn finite_module_resolution_matches_generic() {
+        // The signature engine resolves an arbitrary bounded module M (not just k):
+        // step_general is M-agnostic; only the seed and the vanishing-line offset
+        // (`target_top`) depend on M. Validate rank-for-rank against the generic
+        // engine on two finite modules, one whose top cell (degree 4) actually
+        // exercises the offset — Cnu = cofiber of ν (`Sq⁴`) panicked with `d² ≠ 0`
+        // before the offset was applied.
+        use std::sync::Arc;
+
+        use algebra::{milnor_algebra::MilnorAlgebra, module::FDModule};
+        use fp::prime::TWO;
+        use serde_json::json;
+        use sseq::coordinates::Bidegree;
+
+        use crate::{
+            chain_complex::{ChainComplex, FiniteChainComplex, FreeChainComplex},
+            resolution::Resolution,
+        };
+
+        let modules = [
+            // Cnu: cells in degrees 0 and 4, Sq⁴ x0 = x4 (top cell forces offset 4).
+            json!({
+                "type": "finite dimensional module",
+                "p": 2,
+                "gens": { "x0": 0, "x4": 4 },
+                "actions": ["Sq4 x0 = x4"],
+            }),
+            // Cη: cells in degrees 0 and 2, Sq² x0 = x2.
+            json!({
+                "type": "finite dimensional module",
+                "p": 2,
+                "gens": { "x0": 0, "x2": 2 },
+                "actions": ["Sq2 x0 = x2"],
+            }),
+        ];
+
+        let max_s = 10;
+        let max_t = 28;
+        for spec in &modules {
+            let algebra = Arc::new(MilnorAlgebra::new(TWO, false));
+            let module = Arc::new(FDModule::from_json(Arc::clone(&algebra), spec).unwrap());
+
+            let gcc =
+                Arc::new(FiniteChainComplex::<FDModule<MilnorAlgebra>>::ccdz(Arc::clone(&module)));
+            let gres = Resolution::new(gcc);
+            gres.compute_through_stem(Bidegree::s_t(max_s, max_t));
+
+            let mut sres = SignatureResolution::from_module(Arc::clone(&module));
+            sres.compute_through_stem(max_s, max_t);
+
+            let mut checked = 0usize;
+            for b in gres.iter_stem() {
+                if b.t() > max_t {
+                    continue;
+                }
+                let want = gres.number_of_gens_in_bidegree(b);
+                let got = sres.number_of_gens_in_bidegree(b.s(), b.t());
+                assert_eq!(
+                    got,
+                    want,
+                    "rank mismatch at (s={}, t={}): signature={got} generic={want}",
+                    b.s(),
+                    b.t()
+                );
+                checked += 1;
+            }
+            assert!(checked > 40, "too few bidegrees checked: {checked}");
+        }
     }
 
     #[test]
