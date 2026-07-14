@@ -42,7 +42,11 @@ fn main() -> anyhow::Result<()> {
     // the grid region is described by its axes n and s.
     println!(
         "# motivic-Nassau validation  (stem region: n ≤ {max_n}, s ≤ {max_s}{})",
-        if sig_only { "; signature engine only" } else { "" }
+        if sig_only {
+            "; signature engine only"
+        } else {
+            ""
+        }
     );
 
     // --- Signature engine ---

@@ -90,6 +90,10 @@ required-features = ["sig-nassau"]
 name = "finite_module_validate"
 required-features = ["sig-nassau"]
 
+[[example]]
+name = "cofiber_validate"
+required-features = ["sig-nassau"]
+
 [[bench]]
 name = "resolve"
 harness = false

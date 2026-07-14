@@ -42,7 +42,9 @@ fn main() -> anyhow::Result<()> {
     println!("# stem region: n ≤ {max_n}, s ≤ {max_s}");
 
     // Generic engine.
-    let gcc = Arc::new(FiniteChainComplex::<FDModule<MilnorAlgebra>>::ccdz(Arc::clone(&module)));
+    let gcc = Arc::new(FiniteChainComplex::<FDModule<MilnorAlgebra>>::ccdz(
+        Arc::clone(&module),
+    ));
     let gres = Resolution::new(gcc);
     gres.compute_through_stem(Bidegree::s_t(max_s, max_t));
 
@@ -72,7 +74,9 @@ fn main() -> anyhow::Result<()> {
     println!(
         "[1] {}",
         if mism == 0 {
-            format!("CORRECT: signature ranks == generic ranks at every bidegree ({total} generators)")
+            format!(
+                "CORRECT: signature ranks == generic ranks at every bidegree ({total} generators)"
+            )
         } else {
             format!("FAILED: {mism} bidegree rank mismatches")
         }

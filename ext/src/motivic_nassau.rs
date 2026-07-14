@@ -1276,105 +1276,238 @@ impl<A: PAlgebra> SignatureResolution<A> {
         if s > 0 {
             self.modules[s as usize - 1].compute_basis(t);
         }
-        if s == 0 {
-            self.step0(t);
-        } else if s == 1 {
-            self.step1(t);
+        if s < 2 {
+            // The seed always needs the full Cartan–Eilenberg step (it augments
+            // over the target complex `C_{s,·}`).
+            self.plain_step(s, t);
+            return;
+        }
+        // `optimal_profile` returns a provably-applicable B (Thm 3.1) or the
+        // trivial profile `A(-1) = k` — the plain step, which always works. So
+        // the step never needs a runtime fallback. Offset `t` by the target's top
+        // cell: `Ext_B(M, k)` vanishes only above `k`'s line shifted by `top(M)`,
+        // so choosing `B` as if at `t − target_top` keeps us above the module's
+        // true vanishing line (`target_top = 0` recovers `k`).
+        let b = self.algebra.optimal_profile(s, t - self.target_top);
+        if b.is_trivial() {
+            // Below the (offset) vanishing line — a plain step. For a chain-complex
+            // target this must be the full C–E step, but a nontrivial `B` is only
+            // ever chosen when `t > target_top` (the line has positive intercept),
+            // where `C_{·,t} = 0` and the C–E step degenerates to the pure
+            // free-module step `step_general` computes.
+            self.plain_steps.set(self.plain_steps.get() + 1);
+            self.plain_step(s, t);
         } else {
-            // `optimal_profile` returns a provably-applicable B (Thm 3.1) or the
-            // trivial profile `A(-1) = k` — the plain step, which always works. So
-            // the step never needs a runtime fallback. Offset `t` by the target's
-            // top cell: `Ext_B(M, k)` vanishes only above `k`'s line shifted by
-            // `top(M)`, so choosing `B` as if at `t − target_top` keeps us above
-            // the module's true vanishing line (`target_top = 0` recovers `k`).
-            let b = self.algebra.optimal_profile(s, t - self.target_top);
-            if b.is_trivial() {
-                self.plain_steps.set(self.plain_steps.get() + 1);
-            } else {
-                self.sig_steps.set(self.sig_steps.get() + 1);
-            }
+            self.sig_steps.set(self.sig_steps.get() + 1);
             self.step_general(s, t, &b);
         }
     }
 
-    /// s = 0: cover the trivial module in degree 0 (one generator there).
-    fn step0(&self, t: i32) {
-        self.zero_module.extend_by_zero(t);
-        let source = &self.modules[0];
-        let cc = self.target.module(0);
-        let chain_map = &self.chain_maps[0];
-        let d = &self.differentials[0];
+    /// The ordinary (no-shortcut) minimal-resolution step at `(s, t)`, augmenting
+    /// over the target chain complex `C_{s,·}`. A faithful port of the generic
+    /// engine's Cartan–Eilenberg step (`resolution::Resolution::step_resolution`),
+    /// with the save-file paths dropped and the previous augmented kernel
+    /// **recomputed** rather than stored — so it composes with `step_general`
+    /// (which stores nothing) with no cross-step dependency. Used for `s < 2` and
+    /// wherever the signature shortcut does not apply.
+    fn plain_step(&self, s: i32, t: i32) {
+        use sseq::coordinates::Bidegree;
+        let p = self.algebra.prime();
+        if s == 0 {
+            self.zero_module.extend_by_zero(t);
+        }
+        self.target.compute_through_bidegree(Bidegree::s_t(s, t));
+
+        let source = &self.modules[s as usize];
+        let target_cc = self.target.module(s);
+        let current_differential = &self.differentials[s as usize];
+        let current_chain_map = &self.chain_maps[s as usize];
+        let target_res = current_differential.target();
 
         source.compute_basis(t);
-        cc.compute_basis(t);
-        let source_dim = source.dimension(t);
-        let target_dim = cc.dimension(t);
+        target_cc.compute_basis(t);
+        target_res.compute_basis(t);
+        let source_dimension = source.dimension(t);
+        let target_cc_dimension = target_cc.dimension(t);
+        let target_res_dimension = target_res.dimension(t);
 
-        if target_dim == 0 {
-            source.extend_by_zero(t);
-            chain_map.extend_by_zero(t);
-        } else {
-            let mut matrix = AugmentedMatrix::<2>::new_with_capacity(
-                self.algebra.prime(),
-                source_dim,
-                &[target_dim, source_dim],
-                source_dim + target_dim,
-                0,
-            );
-            chain_map.get_matrix(matrix.segment(0, 0), t);
-            matrix.segment(1, 1).add_identity();
-            matrix.row_reduce();
-            let num_new_gens = matrix.extend_to_surjection(0, target_dim, 0).len();
-            self.add_generators(0, t, num_new_gens);
-            chain_map.add_generators_from_matrix_rows(
-                t,
-                matrix
-                    .segment(0, 0)
-                    .row_slice(source_dim, source_dim + num_new_gens),
+        // (d, f) : X_{s,t} → X_{s-1,t} ⊕ C_{s,t}, augmented with the identity so we
+        // can read off preimages.
+        let mut matrix = AugmentedMatrix::<3>::new_with_capacity(
+            p,
+            source_dimension,
+            &[target_cc_dimension, target_res_dimension, source_dimension],
+            source_dimension + MAX_NEW_GENS,
+            MAX_NEW_GENS,
+        );
+        current_chain_map.get_matrix(matrix.segment(0, 0), t);
+        current_differential.get_matrix(matrix.segment(1, 1), t);
+        matrix.segment(2, 2).add_identity();
+        matrix.row_reduce();
+
+        // Add generators to surject onto C_{s,t}.
+        let cc_new_gens = matrix.extend_to_surjection(0, target_cc_dimension, MAX_NEW_GENS);
+        let mut res_new_gens = Vec::new();
+
+        if s > 0 {
+            if !cc_new_gens.is_empty() {
+                // Make the new generators a chain map: set d(x) = f⁻¹(dC(f(x))) so
+                // that f(dX(x)) = dC(f(x)). Uses the previous chain map's quasi-
+                // inverse, which the previous plain step stored (this branch only
+                // fires when C_{s,t} ≠ 0, i.e. t ≤ target_top, where (s-1,t) is also
+                // a plain step).
+                let prev_chain_map = &self.chain_maps[s as usize - 1];
+                let quasi_inverse = prev_chain_map.quasi_inverse(t).unwrap();
+                let complex_cur_differential = self.target.differential(s);
+                let dfx_dim = complex_cur_differential.target().dimension(t);
+                let mut dfx = FpVector::new(p, dfx_dim);
+                for (i, &column) in cc_new_gens.iter().enumerate() {
+                    complex_cur_differential.apply_to_basis_element(
+                        dfx.as_slice_mut(),
+                        1,
+                        t,
+                        column,
+                    );
+                    quasi_inverse.apply(
+                        matrix.row_segment_mut(source_dimension + i, 1, 1),
+                        1,
+                        dfx.as_slice(),
+                    );
+                    dfx.set_to_zero();
+                }
+            }
+
+            // Add generators to hit the previous augmented kernel — recomputed here
+            // (see the doc comment) as ker of (d, f) : X_{s-1,t} → X_{s-2,t} ⊕
+            // C_{s-1,t}.
+            let old_kernel = self.plain_kernel(s - 1, t);
+            res_new_gens = matrix.inner.extend_image(
+                matrix.start[1],
+                matrix.end[1],
+                &old_kernel,
+                MAX_NEW_GENS,
             );
         }
-        chain_map.compute_auxiliary_data_through_degree(t);
-        d.set_kernel(t, None);
-        d.set_image(t, None);
-        d.set_quasi_inverse(t, None);
-        d.extend_by_zero(t);
+
+        let num_new_gens = cc_new_gens.len() + res_new_gens.len();
+        self.add_generators(s, t, num_new_gens);
+        let new_rows = source_dimension + num_new_gens;
+
+        current_chain_map.add_generators_from_matrix_rows(
+            t,
+            matrix.segment(0, 0).row_slice(source_dimension, new_rows),
+        );
+        current_differential.add_generators_from_matrix_rows(
+            t,
+            matrix.segment(1, 1).row_slice(source_dimension, new_rows),
+        );
+
+        if num_new_gens > 0 {
+            // Fix up the augmentation and re-establish RREF in place (verbatim from
+            // the generic engine — pure matrix bookkeeping).
+            let columns = matrix.columns();
+            matrix.extend_column_dimension(columns + num_new_gens);
+            for i in source_dimension..new_rows {
+                matrix.inner.row_mut(i).set_entry(matrix.start[2] + i, 1);
+            }
+            for k in source_dimension..source_dimension + cc_new_gens.len() {
+                for column in matrix.start[1]..matrix.end[1] {
+                    let row = matrix.pivots()[column];
+                    if row < 0 {
+                        continue;
+                    }
+                    let row = row as usize;
+                    unsafe {
+                        matrix.row_op(k, row, column, p);
+                    }
+                }
+            }
+            let first_res_row = source_dimension + cc_new_gens.len();
+            for (source_row, &pivot_col) in res_new_gens.iter().enumerate() {
+                for target_row in 0..first_res_row {
+                    unsafe {
+                        matrix.row_op(target_row, source_row + first_res_row, pivot_col, p);
+                    }
+                }
+            }
+            let mut new_gens = cc_new_gens.into_iter().chain(res_new_gens).enumerate();
+            let (mut next_new_row, mut next_new_col) = new_gens.next().unwrap();
+            let mut next_old_row = 0;
+            for old_col in 0..matrix.columns() {
+                if old_col == next_new_col {
+                    matrix.rotate_down(next_old_row..source_dimension + next_new_row + 1, 1);
+                    matrix.pivots_mut()[old_col] = next_old_row as isize;
+                    match new_gens.next() {
+                        Some((x, y)) => {
+                            next_new_row = x;
+                            next_new_col = y;
+                        }
+                        None => {
+                            for entry in &mut matrix.pivots_mut()[old_col + 1..] {
+                                if *entry >= 0 {
+                                    *entry += next_new_row as isize + 1;
+                                }
+                            }
+                            break;
+                        }
+                    }
+                    next_old_row += 1;
+                } else if matrix.pivots()[old_col] >= 0 {
+                    matrix.pivots_mut()[old_col] += next_new_row as isize;
+                    next_old_row += 1;
+                }
+            }
+        }
+
+        let (cm_qi, res_qi) = matrix.compute_quasi_inverses();
+        current_differential.set_quasi_inverse(t, Some(res_qi));
+        current_differential.set_kernel(t, None);
+        current_differential.set_image(t, None);
+        // Always needed when the target is not concentrated in a single homological
+        // degree (chain-complex cofibers).
+        current_chain_map.set_quasi_inverse(t, Some(cm_qi));
+        current_chain_map.set_kernel(t, None);
+        current_chain_map.set_image(t, None);
     }
 
-    /// s = 1: generators map onto `ker(F_0 → k)`.
-    fn step1(&self, t: i32) {
-        let source = &self.modules[1];
-        let target = &self.modules[0];
-        let cc = self.target.module(0);
-
-        let source_dim = source.dimension(t);
-        let target_dim = target.dimension(t);
-
+    /// The augmented kernel of `(d, f) : X_{s,t} → X_{s-1,t} ⊕ C_{s,t}` — the cycles
+    /// the next filtration must hit. Recomputed on demand (the modules and maps at
+    /// `(s, t)` are already built) so `plain_step` needs no stored kernel.
+    fn plain_kernel(&self, s: i32, t: i32) -> fp::matrix::Subspace {
+        use sseq::coordinates::Bidegree;
         let p = self.algebra.prime();
-        let mut matrix = AugmentedMatrix::<2>::new(p, target_dim, [cc.dimension(t), target_dim]);
-        self.chain_maps[0].get_matrix(matrix.segment(0, 0), t);
-        matrix.segment(1, 1).add_identity();
-        matrix.row_reduce();
-        let desired_image = matrix.compute_kernel();
+        let source = &self.modules[s as usize];
+        // At a stem boundary the `(s, t)` neighbour may have been skipped, so its
+        // free modules are not yet extended to `t`. Extend the three the kernel
+        // reads from their existing generators (the missing degree-`t` generators
+        // never affect the kernel — the phantom-boundary argument).
+        source.compute_basis(t);
+        if s == 0 {
+            self.zero_module.extend_by_zero(t);
+        } else {
+            self.modules[s as usize - 1].compute_basis(t);
+        }
+        self.target.compute_through_bidegree(Bidegree::s_t(s, t));
 
-        let mut matrix = AugmentedMatrix::<2>::new_with_capacity(
+        let target_cc = self.target.module(s);
+        let current_differential = &self.differentials[s as usize];
+        let current_chain_map = &self.chain_maps[s as usize];
+        let target_res = current_differential.target();
+
+        let source_dimension = source.dimension(t);
+        let target_cc_dimension = target_cc.dimension(t);
+        let target_res_dimension = target_res.dimension(t);
+
+        let mut matrix = AugmentedMatrix::<3>::new(
             p,
-            source_dim,
-            &[target_dim, source_dim],
-            source_dim + MAX_NEW_GENS,
-            0,
+            source_dimension,
+            [target_cc_dimension, target_res_dimension, source_dimension],
         );
-        self.differentials[1].get_matrix(matrix.segment(0, 0), t);
-        matrix.segment(1, 1).add_identity();
+        current_chain_map.get_matrix(matrix.segment(0, 0), t);
+        current_differential.get_matrix(matrix.segment(1, 1), t);
+        matrix.segment(2, 2).add_identity();
         matrix.row_reduce();
-        let num_new_gens = matrix.extend_image(0, target_dim, &desired_image, 0).len();
-        self.add_generators(1, t, num_new_gens);
-        self.differentials[1].add_generators_from_matrix_rows(
-            t,
-            matrix
-                .segment(0, 0)
-                .row_slice(source_dim, source_dim + num_new_gens),
-        );
-        self.chain_maps[1].extend_by_zero(t);
+        matrix.compute_kernel()
     }
 
     /// The Algorithm 2 inductive step at `(s, t)` with subalgebra `b`. Returns
@@ -1806,8 +1939,9 @@ mod tests {
             let algebra = Arc::new(MilnorAlgebra::new(TWO, false));
             let module = Arc::new(FDModule::from_json(Arc::clone(&algebra), spec).unwrap());
 
-            let gcc =
-                Arc::new(FiniteChainComplex::<FDModule<MilnorAlgebra>>::ccdz(Arc::clone(&module)));
+            let gcc = Arc::new(FiniteChainComplex::<FDModule<MilnorAlgebra>>::ccdz(
+                Arc::clone(&module),
+            ));
             let gres = Resolution::new(gcc);
             gres.compute_through_stem(Bidegree::s_t(max_s, max_t));
 
@@ -1832,6 +1966,97 @@ mod tests {
             }
             assert!(checked > 40, "too few bidegrees checked: {checked}");
         }
+    }
+
+    #[test]
+    fn cofiber_chain_complex_matches_generic() {
+        // The signature engine resolves a genuine finite *chain complex*, not just a
+        // module: `plain_step` ports the Cartan–Eilenberg augmentation, and the
+        // signature shortcut fires where the complex is zero (above its top cell).
+        // Build the Yoneda cofiber of h₀² ∈ Ext²'²(k, k) — the "C4" 3-term complex —
+        // and check its Ext rank-for-rank against the generic engine.
+        use std::sync::Arc;
+
+        use algebra::{
+            milnor_algebra::MilnorAlgebra,
+            module::{FDModule, Module, homomorphism::FreeModuleHomomorphism},
+        };
+        use bivec::BiVec;
+        use fp::{matrix::Matrix, prime::TWO};
+        use sseq::coordinates::{Bidegree, BidegreeGenerator};
+
+        use crate::{
+            chain_complex::{
+                BoundedChainComplex, ChainComplex, ChainMap, FiniteChainComplex, FreeChainComplex,
+            },
+            resolution::Resolution,
+            yoneda::yoneda_representative,
+        };
+
+        let algebra = Arc::new(MilnorAlgebra::new(TWO, false));
+        let k = Arc::new(FDModule::new(
+            Arc::clone(&algebra),
+            "k".to_string(),
+            BiVec::from_vec(0, vec![1]),
+        ));
+
+        // Yoneda representative of the (s=2, t=2) class (h₀²).
+        let cofiber = BidegreeGenerator::s_t(2, 2, 0);
+        let base_cc = Arc::new(FiniteChainComplex::<FDModule<MilnorAlgebra>>::ccdz(
+            Arc::clone(&k),
+        ));
+        let resolution = Resolution::new(base_cc);
+        resolution.compute_through_stem(cofiber.degree() + Bidegree::n_s(0, 0));
+
+        let cmap = FreeModuleHomomorphism::new(
+            resolution.module(cofiber.s()),
+            Arc::clone(&k),
+            cofiber.t(),
+        );
+        let num_gens = resolution
+            .module(cofiber.s())
+            .number_of_gens_in_degree(cofiber.t());
+        let mut out = Matrix::new(TWO, num_gens, 1);
+        out.row_mut(cofiber.idx()).set_entry(0, 1);
+        cmap.add_generators_from_matrix_rows(cofiber.t(), out.as_slice_mut());
+        cmap.extend_by_zero(cofiber.degree().t());
+        let cm = ChainMap {
+            s_shift: cofiber.s(),
+            chain_maps: vec![cmap],
+        };
+        let yoneda = yoneda_representative(Arc::new(resolution), cm);
+        let mut cofiber_cc = FiniteChainComplex::from(yoneda);
+        cofiber_cc.pop();
+        let cofiber_cc = Arc::new(cofiber_cc);
+        assert!(cofiber_cc.max_s() >= 2, "expected a multi-term complex");
+
+        let max_s = 12;
+        let max_t = 28;
+        let gres = Resolution::new(Arc::clone(&cofiber_cc));
+        gres.compute_through_stem(Bidegree::s_t(max_s, max_t));
+
+        let mut sres = SignatureResolution::from_chain_complex(Arc::clone(&cofiber_cc));
+        sres.compute_through_stem(max_s, max_t);
+
+        let mut checked = 0usize;
+        for b in gres.iter_stem() {
+            if b.t() > max_t {
+                continue;
+            }
+            let want = gres.number_of_gens_in_bidegree(b);
+            let got = sres.number_of_gens_in_bidegree(b.s(), b.t());
+            assert_eq!(
+                got,
+                want,
+                "cofiber rank mismatch at (s={}, t={}): signature={got} generic={want}",
+                b.s(),
+                b.t()
+            );
+            checked += 1;
+        }
+        assert!(checked > 40, "too few bidegrees checked: {checked}");
+        // The shortcut must actually fire on the chain complex (not all plain steps).
+        assert!(sres.stats().0 > 0, "no signature shortcut steps fired");
     }
 
     #[test]
