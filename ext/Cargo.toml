@@ -86,3 +86,7 @@ harness = false
 [[bench]]
 name = "load_resolution"
 harness = false
+
+[[bench]]
+name = "field_products"
+harness = false
