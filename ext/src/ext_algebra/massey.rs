@@ -219,7 +219,6 @@ where
     ) -> Option<MasseyResult> {
         let p = self.prime();
         let res = self.resolution();
-        let unit = self.unit();
 
         let c_deg = c.degree();
         let tot = c_deg + shift;
@@ -245,14 +244,8 @@ where
         // v with δ_Q v = b∪c; `None` iff b·c ≠ 0 (b∪c is not a coboundary).
         let v = self.delta_preimage(v_deg, bc.as_slice())?;
 
-        // a∪v, then project to an Ext class.
-        let f_a = Arc::new(ResolutionHomomorphism::from_class(
-            String::new(),
-            Arc::clone(unit),
-            Arc::clone(unit),
-            a.degree(),
-            &a.vec().iter().collect::<Vec<_>>(),
-        ));
+        // a∪v, then project to an Ext class. `f_a` is cached (incrementally extended across a sweep).
+        let f_a = self.unit_class_map(a);
         f_a.extend_through_stem(tot);
         let av_mat = cup.cup_matrix(&f_a, v_deg.s(), v_deg.t(), a.degree());
         let mut av = FpVector::new(p, av_mat.columns());
@@ -277,13 +270,9 @@ where
         if z.len() != c {
             return None;
         }
-        let mut aug = AugmentedMatrix::<2>::new(p, r, [c, r]);
-        for i in 0..r {
-            aug.row_mut(i).slice_mut(0, c).add(d.row(i), 1);
-        }
-        aug.segment(1, 1).add_identity();
-        aug.row_reduce();
-        let qi = aug.compute_quasi_inverse();
+        // The quasi-inverse of `δ_Q` out of `v_deg` is intrinsic — shared across every bracket that
+        // lands here — so it is row-reduced once and cached.
+        let qi = self.delta_quasi_inverse(v_deg, &d, r, c);
 
         let mut v = FpVector::new(p, r);
         qi.apply(v.as_slice_mut(), 1, z);
@@ -373,7 +362,14 @@ where
         let b_hom = self.massey_b_hom(b, shift);
 
         let mut results = Vec::new();
-        for c_deg in self.resolution().iter_nonzero_stem() {
+        // The third factor ranges over bidegrees where $\Ext(M, k)$ is nonzero. On a minimal
+        // resolution those are the resolution's generators (`iter_nonzero_stem`); on the field trick
+        // the resolution is the small $P_\bullet$, so the Ext bidegrees are read off `dimension`
+        // (the cohomology of $\delta_Q$) instead — hence sweep `iter_stem` and filter.
+        for c_deg in self.resolution().iter_stem() {
+            if self.dimension(c_deg) == 0 {
+                continue;
+            }
             let Some(kernel) = self.massey_kernel(b, c_deg) else {
                 continue;
             };

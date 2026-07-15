@@ -197,8 +197,25 @@ pub struct ExtAlgebra<CC: FreeChainComplex, CCU: FreeChainComplex<Algebra = CC::
     /// possible when `CCU == CC`).
     unit: Arc<CCU>,
     is_unit: bool,
-    /// One multiplication map per generator of $\Ext(M, k)$, built and extended on demand.
+    /// One multiplication map per generator of $\Ext(M, k)$, built and extended on demand. Used by
+    /// the chain-map product path (minimal resolutions).
     products: DashMap<BidegreeGenerator, Arc<ResolutionHomomorphism<CC, CCU>>>,
+    /// One chain self-map of the unit per generator of $\Ext(k, k)$, built on demand. Used by the
+    /// **cup** product path (the closed-form field trick), where products are read off the cup
+    /// instead of chain-map lifts on a materialised $Q_\bullet$.
+    unit_maps: DashMap<BidegreeGenerator, Arc<ResolutionHomomorphism<CCU, CCU>>>,
+    /// Chain self-maps of the unit for a general $\Ext(k, k)$ *class* (not just a generator), cached
+    /// so a Massey sweep with fixed first/second factor reuses (and only incrementally extends) the
+    /// same `f_a`, `f_b` maps across every third factor.
+    unit_class_maps: DashMap<BidegreeElement, Arc<ResolutionHomomorphism<CCU, CCU>>>,
+    /// Cup matrices `{y_j ∪ -}` keyed by `(shift, b)` (the multiplier and multiplicand bidegrees).
+    /// They depend only on those two bidegrees, not on the multiplier's coordinates, so caching them
+    /// collapses the per-generator recomputation a Massey kernel would otherwise do.
+    cup_cache: DashMap<(Bidegree, Bidegree), Arc<Vec<Matrix>>>,
+    /// Quasi-inverse of the coboundary `δ_Q` out of each bidegree, memoised. The Massey
+    /// `δ`-preimage is intrinsic to `δ_Q` (not to the bracket factors), so this row-reduction is
+    /// shared across every third factor rather than repeated per bracket.
+    delta_qi_cache: DashMap<Bidegree, Arc<fp::matrix::QuasiInverse>>,
     /// Whether the product/Massey maps out of `resolution` must be extended in the sequential
     /// (`t`-outer / `s`-inner) order — required when `resolution` is non-minimal (the field trick).
     /// See [`ResolutionHomomorphism::with_sequential`](crate::resolution_homomorphism::MuResolutionHomomorphism::with_sequential).
@@ -243,6 +260,10 @@ impl<CC: FreeChainComplex> ExtAlgebra<CC, CC> {
             resolution,
             unit,
             products: DashMap::new(),
+            unit_maps: DashMap::new(),
+            unit_class_maps: DashMap::new(),
+            cup_cache: DashMap::new(),
+            delta_qi_cache: DashMap::new(),
             sequential_source: false,
             differential: None,
             cup: None,
@@ -279,6 +300,10 @@ where
             resolution,
             unit,
             products: DashMap::new(),
+            unit_maps: DashMap::new(),
+            unit_class_maps: DashMap::new(),
+            cup_cache: DashMap::new(),
+            delta_qi_cache: DashMap::new(),
             sequential_source: false,
             differential: None,
             cup: None,
@@ -507,7 +532,15 @@ where
         self.differential
             .as_ref()
             .and_then(|d| d.dimension(b))
-            .unwrap_or_else(|| self.resolution.number_of_gens_in_bidegree(b))
+            .unwrap_or_else(|| {
+                // Panic-safe: an uncomputed bidegree has no cochains (rather than indexing past the
+                // resolution). This lets callers sweep `iter_stem` without a prior range check.
+                if b.s() >= 0 && self.resolution.has_computed_bidegree(b) {
+                    self.resolution.number_of_gens_in_bidegree(b)
+                } else {
+                    0
+                }
+            })
     }
 
     /// The basis classes of $\Ext(M, k)$ at the given bidegree — one [`BidegreeGenerator`] per basis
@@ -560,6 +593,29 @@ where
         v.as_slice_mut().add(c.vec(), 1);
         let coords = h.reduce(v.as_slice_mut());
         BidegreeElement::new(b, FpVector::from_slice(self.prime(), &coords))
+    }
+
+    /// The quasi-inverse of the coboundary `δ_Q` out of `v_deg` (given its matrix `d`, `r × c`),
+    /// memoised. Used by the Massey `δ`-preimage; `δ_Q` is intrinsic, so the row reduction is done
+    /// once and reused across every bracket landing at `v_deg`.
+    pub(crate) fn delta_quasi_inverse(
+        &self,
+        v_deg: Bidegree,
+        d: &Matrix,
+        r: usize,
+        c: usize,
+    ) -> Arc<fp::matrix::QuasiInverse> {
+        if let Some(q) = self.delta_qi_cache.get(&v_deg) {
+            return Arc::clone(&q);
+        }
+        let mut aug = AugmentedMatrix::<2>::new(self.prime(), r, [c, r]);
+        for i in 0..r {
+            aug.row_mut(i).slice_mut(0, c).add(d.row(i), 1);
+        }
+        aug.segment(1, 1).add_identity();
+        aug.row_reduce();
+        let qi = Arc::new(aug.compute_quasi_inverse());
+        Arc::clone(self.delta_qi_cache.entry(v_deg).or_insert(qi).value())
     }
 
     /// A [`Cochain`] from its coordinates in the cochain-generator basis at bidegree `b`.
@@ -641,6 +697,78 @@ where
         Arc::clone(self.products.entry(g).or_insert(hom).value())
     }
 
+    /// The chain self-map $f_y\colon P_\bullet \to P_\bullet$ of the unit realising a generator `g`
+    /// of $\Ext(k, k)$, built and cached on first use. Used by the closed-form cup product path.
+    pub(crate) fn unit_self_map(
+        &self,
+        g: BidegreeGenerator,
+    ) -> Arc<ResolutionHomomorphism<CCU, CCU>> {
+        if let Some(map) = self.unit_maps.get(&g) {
+            return Arc::clone(&map);
+        }
+        let dim = self.unit.number_of_gens_in_bidegree(g.degree());
+        let mut class = vec![0u32; dim];
+        class[g.idx()] = 1;
+        let name = format!("cup_{}_{}_{}", g.n(), g.s(), g.idx());
+        let hom = Arc::new(ResolutionHomomorphism::from_class(
+            name,
+            Arc::clone(&self.unit),
+            Arc::clone(&self.unit),
+            g.degree(),
+            &class,
+        ));
+        Arc::clone(self.unit_maps.entry(g).or_insert(hom).value())
+    }
+
+    /// The cup matrices `{y_j ∪ -}` for each generator `y_j` of $\Ext(k, k)$ at `b`, mapping cochains
+    /// at `shift` to cochains at `target = b + shift`. Cached by `(shift, b)` since they are
+    /// independent of the multiplier's coordinates.
+    fn cup_matrices(
+        &self,
+        cup: &Arc<dyn CochainCup<CCU>>,
+        shift: Bidegree,
+        b: Bidegree,
+        target: Bidegree,
+        unit_dim: usize,
+    ) -> Arc<Vec<Matrix>> {
+        if let Some(m) = self.cup_cache.get(&(shift, b)) {
+            return Arc::clone(&m);
+        }
+        let mats: Vec<Matrix> = (0..unit_dim)
+            .map(|j| {
+                let f_y = self.unit_self_map(BidegreeGenerator::new(b, j));
+                f_y.extend_through_stem(target);
+                cup.cup_matrix(&f_y, shift.s(), shift.t(), b)
+            })
+            .collect();
+        Arc::clone(
+            self.cup_cache
+                .entry((shift, b))
+                .or_insert_with(|| Arc::new(mats))
+                .value(),
+        )
+    }
+
+    /// The chain self-map $f_x\colon P_\bullet \to P_\bullet$ of the unit realising a general class
+    /// `x` of $\Ext(k, k)$, cached. A Massey sweep with a fixed factor reuses (and only
+    /// incrementally extends) one map across every third factor, rather than rebuilding it each time.
+    pub(crate) fn unit_class_map(
+        &self,
+        x: &BidegreeElement,
+    ) -> Arc<ResolutionHomomorphism<CCU, CCU>> {
+        if let Some(map) = self.unit_class_maps.get(x) {
+            return Arc::clone(&map);
+        }
+        let hom = Arc::new(ResolutionHomomorphism::from_class(
+            format!("cup_{x}"),
+            Arc::clone(&self.unit),
+            Arc::clone(&self.unit),
+            x.degree(),
+            &x.vec().iter().collect::<Vec<_>>(),
+        ));
+        Arc::clone(self.unit_class_maps.entry(x.clone()).or_insert(hom).value())
+    }
+
     /// Left-multiplication by the class `x` (in $\Ext(M, k)$), applied to every basis generator of
     /// $\Ext(k, k)$ at bidegree `b`.
     ///
@@ -662,13 +790,28 @@ where
         self.cohomology(shift)?;
         self.cohomology(target)?;
 
-        // Realise `x` as a cocycle in the cochain (resolution-generator) basis, so its coordinates
-        // select the right per-generator product maps. The unit operand needs no such lift — the
-        // unit resolution is minimal, so its cochain basis already *is* the Ext basis. On a minimal
-        // resolution `lift`/`project` are identities and this whole transport is a no-op.
+        // Realise `x` as a cocycle in the cochain basis; on a minimal resolution `lift` is the
+        // identity.
         let x_cochain = self.lift(x);
-
         let unit_dim = self.unit.number_of_gens_in_bidegree(b);
+
+        // Closed-form field trick: read each product `x·y_j = project(y_j ∪ x)` off the cup, with no
+        // chain-map lift on a materialised `Q•` — cochain-sized work only. The cup matrices depend
+        // only on `(shift, b)`, so they are cached and shared across every multiplier at `shift`.
+        if let Some(cup) = &self.cup {
+            let cochain_cols = self.cochain_dimension(target);
+            let cohomology_cols = self.dimension(target);
+            let cup_mats = self.cup_matrices(cup, shift, b, target, unit_dim);
+            let mut matrix = Matrix::new(self.prime(), unit_dim, cohomology_cols);
+            for (j, cup_mat) in cup_mats.iter().enumerate() {
+                let mut out = FpVector::new(self.prime(), cochain_cols);
+                cup_mat.apply(out.as_slice_mut(), 1, x_cochain.vec());
+                let class = self.project(&Cochain::new(target, out));
+                matrix.row_mut(j).add(class.vec(), 1);
+            }
+            return Some(matrix);
+        }
+
         let cochain_cols = self.cochain_dimension(target);
         // The products in the cochain (resolution-generator) basis of `target`.
         let mut raw = Matrix::new(self.prime(), unit_dim, cochain_cols);

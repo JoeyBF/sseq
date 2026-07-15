@@ -264,6 +264,9 @@ where
     /// `(generator degree d_i, generator index i, M-basis index α)`. Cached so that `matrix(b)`'s
     /// rows and `matrix(source)`'s columns share one coordinate system.
     cochain_bases: DashMap<(i32, i32), Arc<Vec<(i32, usize, usize)>>>,
+    /// The coboundary matrix `δ_Q` out of each bidegree, memoised — it is intrinsic (the closed-form
+    /// untwisting), so a Massey sweep does not recompute it per bracket.
+    matrix_cache: DashMap<Bidegree, Arc<Matrix>>,
 }
 
 impl<CC, N> TensorResolutionDifferential<CC, N>
@@ -279,6 +282,7 @@ where
             module,
             antipode,
             cochain_bases: DashMap::new(),
+            matrix_cache: DashMap::new(),
         }
     }
 
@@ -433,6 +437,9 @@ where
     }
 
     fn matrix(&self, b: Bidegree) -> Option<Matrix> {
+        if let Some(m) = self.matrix_cache.get(&b) {
+            return Some((**m).clone());
+        }
         let (s, t) = (b.s(), b.t());
         // Need P_s (rows / a_{li}) and P_{s+1} (columns / d_P out of s+1) through degree t.
         if !self.computed(s, t) || !self.computed(s + 1, t) {
@@ -442,11 +449,19 @@ where
         let p = self.prime();
         let module_s = self.resolution.module(s);
         let d_p = self.resolution.differential(s + 1); // P_{s+1} → P_s
-        Some(self.closed_form_matrix(s, t, s + 1, t, |e_l, l| {
+        let matrix = self.closed_form_matrix(s, t, s + 1, t, |e_l, l| {
             let mut dp = FpVector::new(p, module_s.dimension(e_l));
             d_p.apply_to_generator(&mut dp, 1, e_l, l);
             dp
-        }))
+        });
+        Some(
+            (**self
+                .matrix_cache
+                .entry(b)
+                .or_insert(Arc::new(matrix))
+                .value())
+            .clone(),
+        )
     }
 }
 
@@ -498,46 +513,37 @@ where
 /// Build an [`ExtAlgebra`] whose $\Ext(M, k)$ supports **products and Massey products** by the
 /// field-resolution trick (see the [module docs](self)).
 ///
-/// Unlike [`field_resolution_ext`] — which only exposes the additive $\Ext$ via the closed-form
-/// [`TensorResolutionDifferential`] — this builds the *genuine* free resolution
-/// $Q_\bullet = P_\bullet \otimes M$ ([`TensorResolution`]) as the product-carrying `resolution`,
-/// and keeps the **minimal** $P_\bullet$ as the separate `unit`. The resulting
-/// `ExtAlgebra<TensorResolution<CC, N>, CC>` computes $\Ext(k, k)$-module products of $\Ext(M, k)$
-/// classes: product maps have $Q_\bullet$ as (non-minimal) source and the minimal $P_\bullet$ as
-/// target, so only `P_\bullet` needs to be an [`AugmentedChainComplex`]. The non-minimality is
-/// handled by the sequential extension order ([`with_sequential_source`](ExtAlgebra::with_sequential_source))
-/// and the cohomology transport in [`multiply_into`](ExtAlgebra::multiply_into).
+/// This is entirely **closed form**: the resolution is the (small, minimal) $k$-resolution
+/// $P_\bullet$ itself, and everything about `M` lives in the attached
+/// [`TensorResolutionDifferential`] — used *both* as the coboundary $\delta_Q$ (giving the additive
+/// $\Ext(M, k)$, exactly as [`field_resolution_ext`]) *and* as the cochain cup product
+/// ([`CochainCup`](super::CochainCup)). The genuine tensor complex $Q_\bullet = P_\bullet\otimes M$
+/// is **never materialised** — its free modules would have dimension `#gens ×` (Steenrod algebra
+/// dimension in the complementary degree), which blows up with the stem. Instead:
 ///
-/// `resolution` must be a (minimal) free resolution of the base field `k` over the same algebra as
-/// `module`.
+/// - products read `x·y = project(y ∪ x)` off the closed-form cup
+///   ([`multiply_into`](ExtAlgebra::multiply_into)), touching only cochain generators;
+/// - Massey products dispatch to the cochain-DGA bracket ($\langle a,b,c\rangle = [a\cup v]$,
+///   $\delta_Q v = b\cup c$), likewise cochain-sized.
 ///
-/// **Massey products** work through the same [`ExtAlgebra::massey`] as on a minimal resolution: the
-/// attached cochain cup product ([`CochainCup`](super::CochainCup)) makes `massey` dispatch to the
-/// cochain-DGA bracket, which stays correct on the non-minimal $Q_\bullet$ (the chain-map /
-/// null-homotopy bracket would degenerate there).
-pub fn field_resolution_products<CC, N>(
-    resolution: Arc<CC>,
-    module: Arc<N>,
-) -> ExtAlgebra<TensorResolution<CC, N>, CC>
+/// The only chain maps built are self-maps of the *minimal* $P_\bullet$ (the ordinary $\Ext(k,k)$
+/// product cost). `resolution` must be a (minimal) free resolution of the base field `k` over the
+/// same algebra as `module`.
+pub fn field_resolution_products<CC, N>(resolution: Arc<CC>, module: Arc<N>) -> ExtAlgebra<CC, CC>
 where
     CC: FreeChainComplex + crate::chain_complex::AugmentedChainComplex + 'static,
     CC::Algebra: Bialgebra,
-    N: Module<Algebra = CC::Algebra> + ZeroModule + 'static,
+    N: Module<Algebra = CC::Algebra> + 'static,
 {
-    let q = Arc::new(TensorResolution::new(
-        Arc::clone(&resolution),
-        Arc::clone(&module),
-    ));
-    let diff = Arc::new(DualizedDifferential::new(Arc::clone(&q)));
-    // The cup engine reads the same untwisting closed form as `diff`, in the shared cochain basis.
-    let cup = Arc::new(TensorResolutionDifferential::new(
-        Arc::clone(&resolution),
+    // One engine serves as both the coboundary δ_Q (additive Ext) and the cup product — same
+    // untwisting closed form, same cochain basis.
+    let engine = Arc::new(TensorResolutionDifferential::new(
+        resolution.clone(),
         module,
     ));
-    ExtAlgebra::new_with_unit(q, resolution)
-        .with_differential(diff)
-        .with_cup(cup)
-        .with_sequential_source(true)
+    ExtAlgebra::without_unit(resolution)
+        .with_differential(engine.clone() as Arc<dyn ExtDifferential>)
+        .with_cup(engine as Arc<dyn super::CochainCup<CC>>)
 }
 
 /// The dualised differential $\Hom_A(\partial, k)$ of *any* free chain complex `Q`, read straight

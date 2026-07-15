@@ -9,7 +9,7 @@ use std::{sync::Arc, time::Instant};
 use algebra::module::{FDModule, Module};
 use ext::{
     chain_complex::ChainComplex,
-    ext_algebra::{ExtAlgebra, field_resolution_products},
+    ext_algebra::{ExtAlgebra, field_resolution_ext, field_resolution_products},
     utils::{construct_standard, parse_module_name},
 };
 use sseq::coordinates::{Bidegree, BidegreeGenerator};
@@ -48,11 +48,25 @@ fn main() {
     let k_res = Arc::new(construct_standard::<false, _, _>("S_2", None).unwrap());
     k_res.compute_through_bidegree(Bidegree::s_t(margin.s() + 1, margin.n() + margin.s() + 2));
 
-    // ---- Field trick: Q• = P• ⊗ C2 (non-minimal). ----
-    let t = Instant::now();
     let m =
         Arc::new(FDModule::from_json(k_res.algebra(), &parse_module_name("C2").unwrap()).unwrap());
     m.compute_basis(nn + ss + 8);
+
+    // ---- Additive Ext only, closed form (no materialised Q•): the "fixed cost for every M". ----
+    let t = Instant::now();
+    let closed = field_resolution_ext(Arc::clone(&k_res), Arc::clone(&m));
+    let mut cdim = 0usize;
+    for n in 0..=nn {
+        for s in 0..=ss {
+            cdim += closed
+                .cohomology_dimension(Bidegree::n_s(n, s))
+                .unwrap_or(0);
+        }
+    }
+    let field_additive = t.elapsed();
+
+    // ---- Field trick structure: products + Massey, entirely closed form (Q• is never built). ----
+    let t = Instant::now();
     let field = field_resolution_products(Arc::clone(&k_res), m);
     field.compute_through_bidegree(margin);
     let field_setup = t.elapsed();
@@ -87,6 +101,7 @@ fn main() {
     let direct_massey = t.elapsed();
 
     println!("box  n ≤ {nn}, s ≤ {ss}");
+    println!("FIELD   additive-Ext (closed form) {field_additive:>9.2?}   (dim sum {cdim})");
     println!(
         "FIELD   setup {field_setup:>9.2?}   products {field_products:>9.2?}   massey \
          {field_massey:>9.2?}   ({fmassey} brackets, sum {fsum})"
