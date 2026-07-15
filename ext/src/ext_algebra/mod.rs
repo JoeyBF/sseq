@@ -749,6 +749,32 @@ where
         )
     }
 
+    /// The cup matrix `x ∪ -` for a general class `x` of $\Ext(k, k)$, mapping cochains at `src` to
+    /// cochains at `src + x.degree()`. Built by combining the cached per-generator cup matrices
+    /// (`x ∪ - = Σ x_j (y_j ∪ -)`), so the expensive cup-matrix builds are memoised in `cup_cache`
+    /// and shared with the product path (and, once persisted, with disk); only the linear combine is
+    /// per call. Used by the closed-form Massey sweep for both the `b ∪ c` and `a ∪ v` cochains.
+    pub(crate) fn cup_class_matrix(
+        &self,
+        cup: &Arc<dyn CochainCup<CCU>>,
+        x: &BidegreeElement,
+        src: Bidegree,
+    ) -> Matrix {
+        let x_deg = x.degree();
+        let target = src + x_deg;
+        let unit_dim = self.unit.number_of_gens_in_bidegree(x_deg);
+        let mats = self.cup_matrices(cup, src, x_deg, target, unit_dim);
+        let rows = mats.first().map_or(0, Matrix::rows);
+        let cols = mats.first().map_or(0, Matrix::columns);
+        let mut out = Matrix::new(self.prime(), rows, cols);
+        for (j, coef) in x.vec().iter_nonzero() {
+            for i in 0..rows {
+                out.row_mut(i).add(mats[j].row(i), coef);
+            }
+        }
+        out
+    }
+
     /// The chain self-map $f_x\colon P_\bullet \to P_\bullet$ of the unit realising a general class
     /// `x` of $\Ext(k, k)$, cached. A Massey sweep with a fixed factor reuses (and only
     /// incrementally extends) one map across every third factor, rather than rebuilding it each time.

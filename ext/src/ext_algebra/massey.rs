@@ -324,21 +324,34 @@ where
         c: &BidegreeElement,
         tot: Bidegree,
     ) -> Subspace {
-        let mut sub = Subspace::new(self.prime(), self.dimension(tot));
+        let mut sub = self.massey_indeterminacy_a(a, tot);
+        self.massey_indeterminacy_c(c, tot, &mut sub);
+        sub
+    }
 
+    /// The $a \cdot \Ext^{|b| + |c| - (1,0)}$ half of the Massey indeterminacy at `tot`. This depends
+    /// only on `a` and `tot`, so a family sweep over the third factor computes it once per `c_deg`.
+    fn massey_indeterminacy_a(&self, a: &BidegreeElement, tot: Bidegree) -> Subspace {
+        let mut sub = Subspace::new(self.prime(), self.dimension(tot));
         // a · Ext(M, k)^{tot - a.degree()}, computed as y · a (equal up to sign).
         for y in self.basis(tot - a.degree()) {
             if let Some(prod) = self.try_multiply(&self.generator(y), a) {
                 sub.add_vector(prod.vec());
             }
         }
+        sub
+    }
+
+    /// Add the $\Ext^{|a| + |b| - (1,0)} \cdot c$ half of the Massey indeterminacy at `tot` into an
+    /// existing subspace (typically one already carrying the `a`-half). This half depends on the
+    /// specific third factor `c`, so it is the per-row part of a family sweep.
+    fn massey_indeterminacy_c(&self, c: &BidegreeElement, tot: Bidegree, sub: &mut Subspace) {
         // Ext(k, k)^{tot - c.degree()} · c, computed as c · x (equal up to sign).
         for x in self.unit_basis(tot - c.degree()) {
             if let Some(prod) = self.try_multiply(c, &self.unit_generator(x)) {
                 sub.add_vector(prod.vec());
             }
         }
-        sub
     }
 
     /// Compute the family of Massey products $\langle a, b, -\rangle$ for fixed `a` and `b` and
@@ -359,8 +372,16 @@ where
         b: &BidegreeElement,
     ) -> Vec<(BidegreeElement, MasseyResult)> {
         let shift = Self::massey_shift(a, b);
-        let b_hom = self.massey_b_hom(b, shift);
 
+        // On the field trick the bracket is the cochain-DGA formula, whose per-`c_deg` cup matrices
+        // and δ_Q quasi-inverse are independent of the specific kernel row; hoist them out of the
+        // row loop rather than rebuilding them per bracket via `massey_bracket_of`. The cup path
+        // reads its cup matrices off `cup_class_matrix`, so the chain-map `b_hom` is never needed.
+        if let Some(cup) = self.cup() {
+            return self.massey_iter_c_cup(&Arc::clone(cup), a, b, shift);
+        }
+
+        let b_hom = self.massey_b_hom(b, shift);
         let mut results = Vec::new();
         // The third factor ranges over bidegrees where $\Ext(M, k)$ is nonzero. On a minimal
         // resolution those are the resolution's generators (`iter_nonzero_stem`); on the field trick
@@ -377,6 +398,91 @@ where
                 let c = BidegreeElement::new(c_deg, row.to_owned());
                 let Some(result) = self.massey_bracket_of(a, Arc::clone(&b_hom), shift, &c) else {
                     continue;
+                };
+                if result.contains_zero() {
+                    continue;
+                }
+                results.push((c, result));
+            }
+        }
+        results
+    }
+
+    /// The cochain-DGA specialisation of [`massey_iter_c`](Self::massey_iter_c): computes the family
+    /// $\langle a, b, -\rangle$ for a field-trick resolution carrying a [`CochainCup`]. For each
+    /// third-factor bidegree `c_deg` it builds the cup-by-`b` matrix, the cup-by-`a` matrix, the
+    /// δ_Q quasi-inverse at `v_deg`, and the `a·Ext` half of the indeterminacy **once**, then applies
+    /// them to every kernel row — the only per-row work is `lift(c)`, two matrix applications, the
+    /// δ-preimage solve (against the shared quasi-inverse), the projection, and the `Ext·c` half of
+    /// the indeterminacy. This is the hoisted equivalent of looping
+    /// [`massey_bracket_dga`](Self::massey_bracket_dga) per row.
+    fn massey_iter_c_cup(
+        &self,
+        cup: &Arc<dyn CochainCup<CCU>>,
+        a: &BidegreeElement,
+        b: &BidegreeElement,
+        shift: Bidegree,
+    ) -> Vec<(BidegreeElement, MasseyResult)> {
+        let p = self.prime();
+        let res = self.resolution();
+        let b_deg = b.degree();
+
+        let mut results = Vec::new();
+        for c_deg in res.iter_stem() {
+            if self.dimension(c_deg) == 0 {
+                continue;
+            }
+            let Some(kernel) = self.massey_kernel(b, c_deg) else {
+                continue;
+            };
+            if kernel.dimension() == 0 {
+                continue;
+            }
+
+            let tot = c_deg + shift;
+            let bc_deg = b_deg + c_deg;
+            let v_deg = bc_deg + Bidegree::n_s(1, -1);
+            // Every cochain read must lie in the computed box (mirrors `massey_bracket_dga`).
+            if [bc_deg, v_deg, tot]
+                .iter()
+                .any(|d| d.s() < 0 || d.t() < 0 || !res.has_computed_bidegree(*d))
+            {
+                continue;
+            }
+            if self.cohomology(tot).is_none() {
+                continue;
+            }
+
+            // Per-`c_deg` matrices, independent of the specific kernel row: cup-by-`b` (source
+            // `c_deg`), cup-by-`a` (source `v_deg`), and the `a·Ext` half of the indeterminacy. Both
+            // cup matrices go through `cup_class_matrix`, so their (expensive) per-generator builds
+            // are memoised in `cup_cache` and shared with the product path; the δ_Q quasi-inverse at
+            // `v_deg` is likewise memoised inside `delta_preimage`.
+            let bc_mat = self.cup_class_matrix(cup, b, c_deg);
+            let av_mat = self.cup_class_matrix(cup, a, v_deg);
+            let a_indet = self.massey_indeterminacy_a(a, tot);
+
+            for row in kernel.iter() {
+                let c = BidegreeElement::new(c_deg, row.to_owned());
+
+                // b∪c as a cochain, then its δ_Q-preimage `v` (`None` iff b·c ≠ 0).
+                let lc = self.lift(&c);
+                let mut bc = FpVector::new(p, bc_mat.columns());
+                bc_mat.apply(bc.as_slice_mut(), 1, lc.vec());
+                let Some(v) = self.delta_preimage(v_deg, bc.as_slice()) else {
+                    continue;
+                };
+
+                // a∪v, projected to an Ext class.
+                let mut av = FpVector::new(p, av_mat.columns());
+                av_mat.apply(av.as_slice_mut(), 1, v.as_slice());
+                let representative = self.project(&Cochain::new(tot, av)).into_vec();
+
+                let mut indeterminacy = a_indet.clone();
+                self.massey_indeterminacy_c(&c, tot, &mut indeterminacy);
+                let result = MasseyResult {
+                    degree: tot,
+                    coset: AffineSubspace::new(representative, indeterminacy),
                 };
                 if result.contains_zero() {
                     continue;
