@@ -523,8 +523,8 @@ where
         // shapes let us both reload a self-describing save file and size a fresh computation.
         let rows = self.cochain_basis(s, t).len();
         let cols = self.cochain_basis(s + 1, t).len();
-        let matrix = if let Some(m) = self.read_delta(b, rows, cols) {
-            m
+        let (matrix, from_disk) = if let Some(m) = self.read_delta(b, rows, cols) {
+            (m, true)
         } else {
             // δ: C^s → C^{s+1} at the same internal degree, read off the free differential d_P.
             let p = self.prime();
@@ -535,17 +535,22 @@ where
                 d_p.apply_to_generator(&mut dp, 1, e_l, l);
                 dp
             });
-            self.write_delta(b, &matrix);
-            matrix
+            (matrix, false)
         };
-        Some(
-            (**self
-                .matrix_cache
-                .entry(b)
-                .or_insert(Arc::new(matrix))
-                .value())
-            .clone(),
-        )
+
+        // Claim the cache slot before writing: whoever inserts owns the (single) disk write, so a
+        // freshly computed matrix is persisted exactly once even if two threads raced to compute it
+        // (a fresh `create_new` would otherwise panic on the loser).
+        use dashmap::mapref::entry::Entry;
+        Some(match self.matrix_cache.entry(b) {
+            Entry::Occupied(e) => (**e.get()).clone(),
+            Entry::Vacant(e) => {
+                if !from_disk {
+                    self.write_delta(b, &matrix);
+                }
+                (**e.insert(Arc::new(matrix))).clone()
+            }
+        })
     }
 }
 
