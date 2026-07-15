@@ -43,7 +43,9 @@ use fp::{
 use sseq::coordinates::{Bidegree, BidegreeElement, BidegreeGenerator};
 
 pub use self::secondary::{SecondaryExtAlgebra, SecondaryProduct};
-pub use self::tensor_resolution::{Antipode, TensorResolutionDifferential, field_resolution_ext};
+pub use self::tensor_resolution::{
+    Antipode, TensorResolutionDifferential, field_resolution_ext, field_resolution_products,
+};
 use crate::{
     chain_complex::{AugmentedChainComplex, FreeChainComplex},
     resolution_homomorphism::ResolutionHomomorphism,
@@ -155,14 +157,27 @@ impl Cochain {
 
 /// $\Ext(M, k)$ as a bigraded module over the bigraded algebra $\Ext(k, k)$, backed by a
 /// resolution. See the [module-level documentation](self) for conventions.
-pub struct ExtAlgebra<CC: FreeChainComplex> {
+///
+/// The resolution of `M` (type `CC`) and the resolution of the unit `k` (type `CCU`) may be
+/// **different** chain-complex types. The default `CCU = CC` covers the common case where both are
+/// the same kind of resolution (in particular `M == k`). The field-resolution trick uses distinct
+/// types: `CC` is the non-minimal $Q_\bullet = P_\bullet \otimes M$
+/// ([`TensorResolution`](tensor_resolution::TensorResolution)) and `CCU` is the minimal $P_\bullet$.
+/// Only the *unit* `CCU` must be an [`AugmentedChainComplex`] (products/Massey maps always target
+/// it); the resolution `CC` is only ever a *source*, so `Q_\bullet` never needs augmentation.
+pub struct ExtAlgebra<CC: FreeChainComplex, CCU: FreeChainComplex<Algebra = CC::Algebra> = CC> {
     /// Resolution of `M`; products land in its Ext.
     resolution: Arc<CC>,
-    /// Resolution of the base field `k`. `Arc`-shared with `resolution` when `M == k`.
-    unit: Arc<CC>,
+    /// Resolution of the base field `k`. `Arc`-shared with `resolution` when `M == k` (only
+    /// possible when `CCU == CC`).
+    unit: Arc<CCU>,
     is_unit: bool,
     /// One multiplication map per generator of $\Ext(M, k)$, built and extended on demand.
-    products: DashMap<BidegreeGenerator, Arc<ResolutionHomomorphism<CC, CC>>>,
+    products: DashMap<BidegreeGenerator, Arc<ResolutionHomomorphism<CC, CCU>>>,
+    /// Whether the product/Massey maps out of `resolution` must be extended in the sequential
+    /// (`t`-outer / `s`-inner) order — required when `resolution` is non-minimal (the field trick).
+    /// See [`ResolutionHomomorphism::with_sequential`](crate::resolution_homomorphism::MuResolutionHomomorphism::with_sequential).
+    sequential_source: bool,
     /// The DGA differential, if any. `None` is the field/minimal case (zero
     /// coboundary), where the cohomology is just the generators.
     differential: Option<Arc<dyn ExtDifferential>>,
@@ -190,8 +205,8 @@ impl ExtAlgebra<QueryModuleResolution> {
     }
 }
 
-impl<CC: FreeChainComplex> ExtAlgebra<CC> {
-    /// Build an [`ExtAlgebra`] from an explicit `(resolution, unit)` pair.
+impl<CC: FreeChainComplex> ExtAlgebra<CC, CC> {
+    /// Build an [`ExtAlgebra`] from an explicit `(resolution, unit)` pair of the **same** type.
     pub fn new(resolution: Arc<CC>, unit: Arc<CC>) -> Self {
         assert_eq!(resolution.prime(), unit.prime());
         Self {
@@ -199,6 +214,7 @@ impl<CC: FreeChainComplex> ExtAlgebra<CC> {
             resolution,
             unit,
             products: DashMap::new(),
+            sequential_source: false,
             differential: None,
             cohomology_cache: DashMap::new(),
         }
@@ -214,6 +230,38 @@ impl<CC: FreeChainComplex> ExtAlgebra<CC> {
     /// or [`new`](Self::new) instead.
     pub fn without_unit(resolution: Arc<CC>) -> Self {
         Self::new(Arc::clone(&resolution), resolution)
+    }
+}
+
+impl<CC, CCU> ExtAlgebra<CC, CCU>
+where
+    CC: FreeChainComplex,
+    CCU: FreeChainComplex<Algebra = CC::Algebra>,
+{
+    /// Build an [`ExtAlgebra`] from a resolution of `M` (`CC`) and a **different**-typed unit
+    /// resolution (`CCU`) of `k`. Used by the field-resolution trick, where `CC` is the non-minimal
+    /// $Q_\bullet$ and `CCU` is the minimal $P_\bullet$. `is_unit` is always `false` here (distinct
+    /// types cannot be `Arc`-shared).
+    pub fn new_with_unit(resolution: Arc<CC>, unit: Arc<CCU>) -> Self {
+        assert_eq!(resolution.prime(), unit.prime());
+        Self {
+            is_unit: false,
+            resolution,
+            unit,
+            products: DashMap::new(),
+            sequential_source: false,
+            differential: None,
+            cohomology_cache: DashMap::new(),
+        }
+    }
+
+    /// Opt into the sequential (`t`-outer / `s`-inner) extension order for the product/Massey maps
+    /// out of `resolution` — required when `resolution` is a non-minimal resolution (the field
+    /// trick's $Q_\bullet$). Defaults to `false`.
+    #[must_use]
+    pub fn with_sequential_source(mut self, sequential: bool) -> Self {
+        self.sequential_source = sequential;
+        self
     }
 
     /// Attach a DGA differential, turning this into the Ext DGA whose cohomology
@@ -377,7 +425,7 @@ impl<CC: FreeChainComplex> ExtAlgebra<CC> {
         &self.resolution
     }
 
-    pub fn unit(&self) -> &Arc<CC> {
+    pub fn unit(&self) -> &Arc<CCU> {
         &self.unit
     }
 
@@ -508,17 +556,23 @@ impl<CC: FreeChainComplex> ExtAlgebra<CC> {
     }
 }
 
-impl<CC> ExtAlgebra<CC>
+impl<CC, CCU> ExtAlgebra<CC, CCU>
 where
-    CC: FreeChainComplex + AugmentedChainComplex,
+    CC: FreeChainComplex,
+    CCU: FreeChainComplex<Algebra = CC::Algebra> + AugmentedChainComplex,
 {
     /// The multiplication map for a single generator `g` of $\Ext(M, k)$, built and cached on
     /// first use. The returned map is *not* guaranteed to be extended; [`ExtAlgebra::multiply_into`]
     /// extends it as needed.
+    ///
+    /// The map's source is the (possibly non-minimal) resolution of `M` and its target is the unit
+    /// resolution `CCU`; only the latter must be an [`AugmentedChainComplex`]. When
+    /// `resolution` is non-minimal ([`with_sequential_source`](Self::with_sequential_source)) the
+    /// map is extended in the sequential order.
     pub fn generator_product_map(
         &self,
         g: BidegreeGenerator,
-    ) -> Arc<ResolutionHomomorphism<CC, CC>> {
+    ) -> Arc<ResolutionHomomorphism<CC, CCU>> {
         if let Some(map) = self.products.get(&g) {
             return Arc::clone(&map);
         }
@@ -528,13 +582,16 @@ where
         class[g.idx()] = 1;
 
         let name = format!("prod_{}_{}_{}", g.n(), g.s(), g.idx());
-        let hom = Arc::new(ResolutionHomomorphism::from_class(
-            name,
-            Arc::clone(&self.resolution),
-            Arc::clone(&self.unit),
-            g.degree(),
-            &class,
-        ));
+        let hom = Arc::new(
+            ResolutionHomomorphism::from_class(
+                name,
+                Arc::clone(&self.resolution),
+                Arc::clone(&self.unit),
+                g.degree(),
+                &class,
+            )
+            .with_sequential(self.sequential_source),
+        );
 
         Arc::clone(self.products.entry(g).or_insert(hom).value())
     }
@@ -555,23 +612,43 @@ where
         if !self.unit.has_computed_bidegree(b) || !self.resolution.has_computed_bidegree(target) {
             return None;
         }
+        // Both ends of the transport must have a computable cohomology (they coincide with the
+        // cochain space, so are always available, on a minimal resolution).
+        self.cohomology(shift)?;
+        self.cohomology(target)?;
+
+        // Realise `x` as a cocycle in the cochain (resolution-generator) basis, so its coordinates
+        // select the right per-generator product maps. The unit operand needs no such lift — the
+        // unit resolution is minimal, so its cochain basis already *is* the Ext basis. On a minimal
+        // resolution `lift`/`project` are identities and this whole transport is a no-op.
+        let x_cochain = self.lift(x);
 
         let unit_dim = self.unit.number_of_gens_in_bidegree(b);
-        let res_dim = self.resolution.number_of_gens_in_bidegree(target);
-        let mut matrix = Matrix::new(self.prime(), unit_dim, res_dim);
+        let cochain_cols = self.cochain_dimension(target);
+        // The products in the cochain (resolution-generator) basis of `target`.
+        let mut raw = Matrix::new(self.prime(), unit_dim, cochain_cols);
 
-        for (i, c) in x.vec().iter_nonzero() {
+        for (i, c) in x_cochain.vec().iter_nonzero() {
             let map = self.generator_product_map(BidegreeGenerator::new(shift, i));
             map.extend_all();
 
             // `hom_k(b.t())[j][k]`: `j` indexes the multiplicand generator of the unit at `b`, `k`
-            // indexes the result generator of the resolution at `target`.
+            // indexes the result cochain generator of the resolution at `target`.
             let hom_k = map.get_map(target.s()).hom_k(b.t());
             for (j, row) in hom_k.iter().enumerate() {
                 for (k, &v) in row.iter().enumerate() {
-                    matrix.row_mut(j).add_basis_element(k, c * v);
+                    raw.row_mut(j).add_basis_element(k, c * v);
                 }
             }
+        }
+
+        // Project each product cochain to its cohomology class, so the returned matrix is in the
+        // Ext (cohomology) basis of `target`.
+        let cohomology_cols = self.dimension(target);
+        let mut matrix = Matrix::new(self.prime(), unit_dim, cohomology_cols);
+        for j in 0..unit_dim {
+            let class = self.project(&Cochain::new(target, raw.row(j).to_owned()));
+            matrix.row_mut(j).add(class.vec(), 1);
         }
         Some(matrix)
     }

@@ -24,7 +24,7 @@ use fp::{
 };
 use sseq::coordinates::{Bidegree, BidegreeElement, BidegreeGenerator};
 
-use super::ExtAlgebra;
+use super::{Cochain, ExtAlgebra};
 use crate::{
     chain_complex::{AugmentedChainComplex, ChainHomotopy, FreeChainComplex},
     resolution_homomorphism::ResolutionHomomorphism,
@@ -50,9 +50,10 @@ impl MasseyResult {
     }
 }
 
-impl<CC> ExtAlgebra<CC>
+impl<CC, CCU> ExtAlgebra<CC, CCU>
 where
-    CC: FreeChainComplex + AugmentedChainComplex,
+    CC: FreeChainComplex,
+    CCU: FreeChainComplex<Algebra = CC::Algebra> + AugmentedChainComplex + Sync,
 {
     /// The bidegree shift of $\langle a, b, -\rangle$: a class `c` produces a bracket in bidegree
     /// `c.degree() + a.degree() + b.degree() - (1, 0)`.
@@ -66,7 +67,7 @@ where
         &self,
         b: &BidegreeElement,
         shift: Bidegree,
-    ) -> Arc<ResolutionHomomorphism<CC, CC>> {
+    ) -> Arc<ResolutionHomomorphism<CCU, CCU>> {
         let b_coords: Vec<u32> = b.vec().iter().collect();
         let hom = Arc::new(ResolutionHomomorphism::from_class(
             String::new(),
@@ -94,8 +95,10 @@ where
         if !resolution.has_computed_bidegree(prod_deg) {
             return None;
         }
-        let num_gens = resolution.number_of_gens_in_bidegree(c_deg);
-        let product_num_gens = resolution.number_of_gens_in_bidegree(prod_deg);
+        // Work in the Ext (cohomology) basis: on the field trick the resolution is non-minimal, so
+        // its generator count is *not* the Ext dimension.
+        let num_gens = self.dimension(c_deg);
+        let product_num_gens = self.dimension(prod_deg);
 
         let mut product = AugmentedMatrix::<2>::new(p, num_gens, [product_num_gens, num_gens]);
         product.segment(1, 1).add_identity();
@@ -123,7 +126,7 @@ where
     fn massey_bracket_of(
         &self,
         a: &BidegreeElement,
-        b_hom: Arc<ResolutionHomomorphism<CC, CC>>,
+        b_hom: Arc<ResolutionHomomorphism<CCU, CCU>>,
         shift: Bidegree,
         c: &BidegreeElement,
     ) -> Option<MasseyResult> {
@@ -136,6 +139,7 @@ where
         if !resolution.has_computed_bidegree(tot) {
             return None;
         }
+        // The bracket is read in the cochain (resolution-generator) basis, then projected to Ext.
         let target_num_gens = resolution.number_of_gens_in_bidegree(tot);
 
         // When `tot` is computed but empty the bracket lands in the zero group, so it is the
@@ -150,18 +154,23 @@ where
                 unit.module(a.degree().s())
                     .generator_offset(a.degree().t(), a.degree().t(), 0);
             let a_coords: Vec<u32> = a.vec().iter().collect();
-            let c_coords: Vec<u32> = c.vec().iter().collect();
+            // Realise `c` as a cocycle in the resolution's cochain basis (identity on a minimal
+            // resolution); `f_c` needs its cochain coordinates, not the Ext ones.
+            let c_coords: Vec<u32> = self.lift(c).vec().iter().collect();
 
-            let f_c = Arc::new(ResolutionHomomorphism::from_class(
-                String::new(),
-                Arc::clone(resolution),
-                Arc::clone(unit),
-                c_deg,
-                &c_coords,
-            ));
+            let f_c = Arc::new(
+                ResolutionHomomorphism::from_class(
+                    String::new(),
+                    Arc::clone(resolution),
+                    Arc::clone(unit),
+                    c_deg,
+                    &c_coords,
+                )
+                .with_sequential(self.sequential_source),
+            );
             f_c.extend_through_stem(tot);
 
-            let homotopy = ChainHomotopy::new(f_c, b_hom);
+            let homotopy = ChainHomotopy::new(f_c, b_hom).with_sequential(self.sequential_source);
             homotopy.extend(tot);
 
             let last = homotopy.homotopy(tot.s());
@@ -177,6 +186,9 @@ where
             representative
         };
 
+        // Project the cochain representative to its Ext class, so it lives in the same basis as the
+        // indeterminacy (identity on a minimal resolution).
+        let representative = self.project(&Cochain::new(tot, representative)).into_vec();
         let indeterminacy = self.massey_indeterminacy(a, c, tot);
         Some(MasseyResult {
             degree: tot,
@@ -203,7 +215,10 @@ where
         row: FpSlice,
         tot: Bidegree,
     ) -> MasseyResult {
+        // `answers` is in the cochain basis; project the bracket representative to its Ext class so
+        // it matches the (cohomology-basis) indeterminacy. Identity on a minimal resolution.
         let representative = self.massey_representative(answers, row);
+        let representative = self.project(&Cochain::new(tot, representative)).into_vec();
         let indeterminacy = self.massey_indeterminacy(a, c, tot);
         MasseyResult {
             degree: tot,
@@ -299,15 +314,20 @@ where
         let bc_shift = b.degree() + c.degree() - Bidegree::s_t(1, 0);
 
         // `f_c` realises `c` (resolution of `M` → unit); `f_b` is multiplication by `b` (in the
-        // unit). The single null-homotopy `s_bc` of `b ∘ c` is reused for every first factor.
-        let c_coords: Vec<u32> = c.vec().iter().collect();
-        let f_c = Arc::new(ResolutionHomomorphism::from_class(
-            String::new(),
-            Arc::clone(resolution),
-            Arc::clone(unit),
-            c.degree(),
-            &c_coords,
-        ));
+        // unit). The single null-homotopy `s_bc` of `b ∘ c` is reused for every first factor. `c`'s
+        // cochain (cocycle) coordinates realise the chain map — the identity of its Ext coordinates
+        // on a minimal resolution, a genuine lift on the field trick.
+        let c_coords: Vec<u32> = self.lift(c).vec().iter().collect();
+        let f_c = Arc::new(
+            ResolutionHomomorphism::from_class(
+                String::new(),
+                Arc::clone(resolution),
+                Arc::clone(unit),
+                c.degree(),
+                &c_coords,
+            )
+            .with_sequential(self.sequential_source),
+        );
         let b_coords: Vec<u32> = b.vec().iter().collect();
         let f_b = Arc::new(ResolutionHomomorphism::from_class(
             String::new(),
@@ -316,7 +336,8 @@ where
             b.degree(),
             &b_coords,
         ));
-        let s_bc = ChainHomotopy::new(Arc::clone(&f_c), Arc::clone(&f_b));
+        let s_bc = ChainHomotopy::new(Arc::clone(&f_c), Arc::clone(&f_b))
+            .with_sequential(self.sequential_source);
 
         let mut results = Vec::new();
         for a_deg in unit.iter_nonzero_stem() {

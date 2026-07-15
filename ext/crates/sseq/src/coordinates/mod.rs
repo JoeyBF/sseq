@@ -109,6 +109,39 @@ pub fn iter_s_t<T: Sync>(
     });
 }
 
+/// Row-sequential (`s`-outer strictly-increasing, `t`-inner **parallel**) variant of [`iter_s_t`],
+/// for a **non-minimal** chain complex.
+///
+/// [`iter_s_t`] only guarantees `f(s - 1, t')` for every `t' < t` before computing `f(s, t)` — the
+/// right dependency for a *minimal* resolution, whose differential has no identity (same-degree)
+/// component. A non-minimal complex's differential *does* have such a component, so `f(s, t)` can
+/// depend on `f(s - 1, t)` at the **same** `t`. This driver walks `s` outermost and finishes an
+/// entire filtration `s - 1` before starting `s`, so `f(s - 1, t)` is always available. Within a
+/// filtration the `t`-values are mutually independent (each reads only row `s - 1`), so they run in
+/// parallel — retaining most of [`iter_s_t`]'s throughput while honouring the stronger cross-`s`
+/// dependency. The return value of `f` is ignored — the iteration order is fixed here rather than
+/// inferred from a computed-range.
+///
+/// # Arguments (matching [`iter_s_t`]):
+///  - `max.s()`: exclusive
+///  - `max.t(s)`: exclusive
+pub fn iter_s_t_sequential<T: Sync>(
+    f: &(impl Fn(Bidegree) -> std::ops::Range<i32> + Sync),
+    min: Bidegree,
+    max: BidegreeRange<T>,
+) {
+    let tracing_span = tracing::Span::current();
+    let f = &|b| {
+        let _tracing_guard = tracing_span.enter();
+        f(b)
+    };
+    for s in min.s()..max.s() {
+        (min.t()..max.t(s)).into_maybe_par_iter().for_each(|t| {
+            f(Bidegree::s_t(s, t));
+        });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use fp::{prime::ValidPrime, vector::FpVector};

@@ -32,6 +32,12 @@ pub struct ChainHomotopy<
     /// Homotopies, indexed by the filtration of the target of f - g.
     homotopies: OnceBiVec<Arc<FreeModuleHomomorphism<U::Module>>>,
     save_dir: SaveDirectory,
+    /// Drive [`extend_profile`](Self::extend_profile) with the sequential (`t`-outer / `s`-inner)
+    /// order instead of the parallel [`iter_s_t`](sseq::coordinates::iter_s_t). Required when the
+    /// **source** `S` is a non-minimal resolution, whose same-degree differential component makes
+    /// the homotopy at `(s, t)` depend on the one at `(s - 1, t)`. Defaults to `false`; set via
+    /// [`with_sequential`](Self::with_sequential).
+    sequential: bool,
 }
 
 impl<
@@ -67,7 +73,16 @@ impl<
             right,
             lock: Mutex::new(()),
             save_dir,
+            sequential: false,
         }
+    }
+
+    /// Opt into the sequential (`t`-outer / `s`-inner) extension order needed when the source is a
+    /// non-minimal resolution; see [`sequential`](Self::sequential). Returns `self` for chaining.
+    #[must_use]
+    pub fn with_sequential(mut self, sequential: bool) -> Self {
+        self.sequential = sequential;
+        self
     }
 
     pub fn prime(&self) -> ValidPrime {
@@ -149,7 +164,11 @@ impl<
             ),
         );
 
-        sseq::coordinates::iter_s_t(&|b| self.extend_step(b), min, max_source);
+        if self.sequential {
+            sseq::coordinates::iter_s_t_sequential(&|b| self.extend_step(b), min, max_source);
+        } else {
+            sseq::coordinates::iter_s_t(&|b| self.extend_step(b), min, max_source);
+        }
     }
 
     fn extend_step(&self, source: Bidegree) -> std::ops::Range<i32> {

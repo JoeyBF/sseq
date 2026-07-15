@@ -40,6 +40,12 @@ where
     maps: OnceBiVec<Arc<MuFreeModuleHomomorphism<U, CC2::Module>>>,
     pub shift: Bidegree,
     save_dir: SaveDirectory,
+    /// Drive [`extend_profile`](Self::extend_profile) with the sequential (`t`-outer / `s`-inner)
+    /// order instead of the parallel [`iter_s_t`](sseq::coordinates::iter_s_t). Required when the
+    /// **source** is non-minimal (e.g. a [`TensorResolution`](crate::ext_algebra::TensorResolution)),
+    /// whose same-degree differential component makes `f(s, t)` depend on `f(s - 1, t)`. Defaults to
+    /// `false` (the minimal-resolution fast path), set via [`with_sequential`](Self::with_sequential).
+    sequential: bool,
 }
 
 impl<const U: bool, CC1, CC2> MuResolutionHomomorphism<U, CC1, CC2>
@@ -67,7 +73,17 @@ where
             maps: OnceBiVec::new(shift.s()),
             shift,
             save_dir,
+            sequential: false,
         }
+    }
+
+    /// Opt into the sequential (`t`-outer / `s`-inner) extension order needed when the source is a
+    /// non-minimal resolution; see [`sequential`](Self::sequential). Returns `self` for chaining
+    /// (e.g. after [`from_class`](Self::from_class)).
+    #[must_use]
+    pub fn with_sequential(mut self, sequential: bool) -> Self {
+        self.sequential = sequential;
+        self
     }
 
     pub fn name(&self) -> &str {
@@ -176,14 +192,15 @@ where
     pub fn extend_profile<AUX: Sync>(&self, max: BidegreeRange<AUX>) {
         self.get_map_ensure_length(max.s() - 1);
 
-        sseq::coordinates::iter_s_t(
-            &|b| self.extend_step_raw(b, None),
-            Bidegree::s_t(
-                self.shift.s(),
-                self.get_map_ensure_length(self.shift.s()).min_degree(),
-            ),
-            max,
+        let min = Bidegree::s_t(
+            self.shift.s(),
+            self.get_map_ensure_length(self.shift.s()).min_degree(),
         );
+        if self.sequential {
+            sseq::coordinates::iter_s_t_sequential(&|b| self.extend_step_raw(b, None), min, max);
+        } else {
+            sseq::coordinates::iter_s_t(&|b| self.extend_step_raw(b, None), min, max);
+        }
 
         for s in self.shift.s()..max.s() {
             assert_eq!(
