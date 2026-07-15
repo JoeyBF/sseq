@@ -124,6 +124,31 @@ pub trait ExtDifferential: Send + Sync {
     }
 }
 
+/// A cochain-level **cup product** $x \cup -$ by a class $x \in \Ext(k, k)$, on the cochain complex
+/// $\Hom_A(Q_\bullet, k)$.
+///
+/// This is what lets [`ExtAlgebra::massey`] compute Massey products on a **non-minimal** resolution:
+/// the chain-map/null-homotopy bracket degenerates there (the lifted product map can be forced to
+/// zero), but the dual cochain-DGA formula $\langle a,b,c\rangle = [a \cup v]$, $\delta_Q v = b\cup
+/// c$, stays correct precisely because $\delta_Q \neq 0$. It is attached by the field trick
+/// ([`field_resolution_products`]); a minimal resolution attaches none and
+/// [`ExtAlgebra::massey`] falls back to the chain-map construction. Like [`ExtDifferential`], the
+/// cup is a pluggable structure supplied by whoever builds the [`ExtAlgebra`].
+pub trait CochainCup<CCU: FreeChainComplex>: Send + Sync {
+    /// The matrix of $x \cup -\colon \Hom_A(Q_s, k)_t \to \Hom_A(Q_{s + \mathrm{shift}.s}, k)_{t +
+    /// \mathrm{shift}.t}$: rows index the source cochain basis at `(src_s, src_t)`, columns the
+    /// target at `(src_s + shift.s(), src_t + shift.t())`. `f_x` is the chain self-map of the unit
+    /// realising `x` (its [`shift`](ResolutionHomomorphism) is `x`'s bidegree), extended through the
+    /// target filtration.
+    fn cup_matrix(
+        &self,
+        f_x: &ResolutionHomomorphism<CCU, CCU>,
+        src_s: i32,
+        src_t: i32,
+        shift: Bidegree,
+    ) -> Matrix;
+}
+
 /// A cochain of the Ext cochain complex $\Hom_A(P_\bullet, k)$ at a bidegree: a vector over the
 /// **cochain generators** (dual to the resolution's free generators).
 ///
@@ -181,6 +206,10 @@ pub struct ExtAlgebra<CC: FreeChainComplex, CCU: FreeChainComplex<Algebra = CC::
     /// The DGA differential, if any. `None` is the field/minimal case (zero
     /// coboundary), where the cohomology is just the generators.
     differential: Option<Arc<dyn ExtDifferential>>,
+    /// The cochain cup product $x \cup -$, if any. Attached for a **non-minimal** resolution (the
+    /// field trick) so [`massey`](Self::massey) uses the cochain-DGA bracket; `None` for a minimal
+    /// resolution, where [`massey`](Self::massey) uses the chain-map/null-homotopy bracket.
+    cup: Option<Arc<dyn CochainCup<CCU>>>,
     /// Memoised cohomology space (of the attached [`differential`](Self::differential)) at each
     /// bidegree — the vector space whose basis `Ext*` exposes. See [`Self::cohomology`].
     cohomology_cache: DashMap<Bidegree, Arc<Subquotient>>,
@@ -216,6 +245,7 @@ impl<CC: FreeChainComplex> ExtAlgebra<CC, CC> {
             products: DashMap::new(),
             sequential_source: false,
             differential: None,
+            cup: None,
             cohomology_cache: DashMap::new(),
         }
     }
@@ -251,8 +281,23 @@ where
             products: DashMap::new(),
             sequential_source: false,
             differential: None,
+            cup: None,
             cohomology_cache: DashMap::new(),
         }
+    }
+
+    /// Attach a cochain cup product, so [`massey`](Self::massey) uses the cochain-DGA bracket
+    /// (correct on a non-minimal resolution) instead of the chain-map/null-homotopy one. See
+    /// [`CochainCup`].
+    #[must_use]
+    pub fn with_cup(mut self, cup: Arc<dyn CochainCup<CCU>>) -> Self {
+        self.cup = Some(cup);
+        self
+    }
+
+    /// The cochain cup product this carries, if any.
+    pub fn cup(&self) -> Option<&Arc<dyn CochainCup<CCU>>> {
+        self.cup.as_ref()
     }
 
     /// Opt into the sequential (`t`-outer / `s`-inner) extension order for the product/Massey maps

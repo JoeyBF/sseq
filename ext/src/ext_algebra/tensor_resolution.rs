@@ -39,16 +39,16 @@ use algebra::{
 };
 use dashmap::DashMap;
 use fp::{
-    matrix::{AffineSubspace, AugmentedMatrix, Matrix},
+    matrix::Matrix,
     prime::{Prime, ValidPrime},
     vector::FpVector,
 };
 use once::{OnceBiVec, OnceVec};
 use sseq::coordinates::{Bidegree, BidegreeElement};
 
-use super::{Cochain, ExtAlgebra, ExtDifferential, massey::MasseyResult};
+use super::{Cochain, ExtAlgebra, ExtDifferential};
 use crate::{
-    chain_complex::{AugmentedChainComplex, ChainComplex, FreeChainComplex},
+    chain_complex::{ChainComplex, FreeChainComplex},
     resolution::secondary::SecondaryResolution,
     resolution_homomorphism::ResolutionHomomorphism,
     secondary::SecondaryLift,
@@ -411,31 +411,6 @@ where
         }
         matrix
     }
-
-    /// The matrix of the cup product by `x ∈ Ext(k, k)` on cochains: $\Hom_A(Q_{s+s_x}, k)_{t+t_x}
-    /// \xleftarrow{\ x \cup -\ } \Hom_A(Q_s, k)_t$ (rows = source at `(src_s, src_t)`, columns =
-    /// target at `(src_s + x_shift.s, src_t + x_shift.t)`).
-    ///
-    /// `f_x` is the chain self-map of `P` realising `x` (built by
-    /// [`from_class`](ResolutionHomomorphism::from_class) in the unit and extended through the target
-    /// filtration). The cup product reads it through the same untwisting as
-    /// [`closed_form_matrix`](Self::closed_form_matrix): the module action `a ∪ v = v ∘ (f_x ⊗ id)`
-    /// keeps only the augmentation part, giving entry `[m_β](χ(b_li) · m_γ)` with `b_li` the
-    /// component of `f_x(z_l)` on the generator `x_i`.
-    pub(crate) fn cup_matrix(
-        &self,
-        f_x: &ResolutionHomomorphism<CC, CC>,
-        src_s: i32,
-        src_t: i32,
-        x_shift: Bidegree,
-    ) -> Matrix {
-        let tgt_s = src_s + x_shift.s();
-        let tgt_t = src_t + x_shift.t();
-        let map = f_x.get_map(tgt_s);
-        self.closed_form_matrix(src_s, src_t, tgt_s, tgt_t, move |e_l, l| {
-            map.output(e_l, l).to_owned()
-        })
-    }
 }
 
 impl<CC, N> ExtDifferential for TensorResolutionDifferential<CC, N>
@@ -475,6 +450,32 @@ where
     }
 }
 
+impl<CC, N> super::CochainCup<CC> for TensorResolutionDifferential<CC, N>
+where
+    CC: FreeChainComplex,
+    CC::Algebra: Bialgebra,
+    N: Module<Algebra = CC::Algebra>,
+{
+    /// The cup product reads `f_x` through the same untwisting as
+    /// [`closed_form_matrix`](TensorResolutionDifferential::closed_form_matrix): the module action
+    /// `x ∪ v = v ∘ (f_x ⊗ id)` keeps only the augmentation part, giving entry `[m_β](χ(b_li)·m_γ)`
+    /// with `b_li` the component of `f_x(z_l)` on the generator `x_i`.
+    fn cup_matrix(
+        &self,
+        f_x: &ResolutionHomomorphism<CC, CC>,
+        src_s: i32,
+        src_t: i32,
+        shift: Bidegree,
+    ) -> Matrix {
+        let tgt_s = src_s + shift.s();
+        let tgt_t = src_t + shift.t();
+        let map = f_x.get_map(tgt_s);
+        self.closed_form_matrix(src_s, src_t, tgt_s, tgt_t, move |e_l, l| {
+            map.output(e_l, l).to_owned()
+        })
+    }
+}
+
 /// Build an [`ExtAlgebra`] over the $k$-resolution whose cohomology is $\Ext_A(M, k)$, computed by
 /// Nassau's field-resolution trick (see the [module docs](self)).
 ///
@@ -510,10 +511,10 @@ where
 /// `resolution` must be a (minimal) free resolution of the base field `k` over the same algebra as
 /// `module`.
 ///
-/// For **Massey products** on the field trick use [`FieldMassey`], *not* the generic
-/// [`ExtAlgebra::massey`] on the returned algebra: the chain-map/null-homotopy bracket the latter
-/// uses degenerates on the non-minimal $Q_\bullet$, whereas [`FieldMassey`] reads the bracket from
-/// the cochain DGA and stays correct.
+/// **Massey products** work through the same [`ExtAlgebra::massey`] as on a minimal resolution: the
+/// attached cochain cup product ([`CochainCup`](super::CochainCup)) makes `massey` dispatch to the
+/// cochain-DGA bracket, which stays correct on the non-minimal $Q_\bullet$ (the chain-map /
+/// null-homotopy bracket would degenerate there).
 pub fn field_resolution_products<CC, N>(
     resolution: Arc<CC>,
     module: Arc<N>,
@@ -523,10 +524,19 @@ where
     CC::Algebra: Bialgebra,
     N: Module<Algebra = CC::Algebra> + ZeroModule + 'static,
 {
-    let q = Arc::new(TensorResolution::new(Arc::clone(&resolution), module));
+    let q = Arc::new(TensorResolution::new(
+        Arc::clone(&resolution),
+        Arc::clone(&module),
+    ));
     let diff = Arc::new(DualizedDifferential::new(Arc::clone(&q)));
+    // The cup engine reads the same untwisting closed form as `diff`, in the shared cochain basis.
+    let cup = Arc::new(TensorResolutionDifferential::new(
+        Arc::clone(&resolution),
+        module,
+    ));
     ExtAlgebra::new_with_unit(q, resolution)
         .with_differential(diff)
+        .with_cup(cup)
         .with_sequential_source(true)
 }
 
@@ -1038,208 +1048,6 @@ where
     /// Whether `x` is a $d_2$-cycle (survives to $E_3$). `None` if $d_2$ is out of range.
     pub fn survives(&self, x: &BidegreeElement) -> Option<bool> {
         self.d2(x).map(|d| d.vec().is_zero())
-    }
-}
-
-/// Primary Massey products $\langle a, b, c\rangle$ on $\Ext_A(M, k)$ for the field trick, computed
-/// by the **cochain DGA** (cup product + $\delta$-preimage) rather than chain-map null-homotopies.
-///
-/// On a non-minimal resolution the chain-map + null-homotopy construction degenerates — the lifted
-/// product map $f_c$ can be forced to zero at higher filtration, so the composite $f_b \circ f_c$
-/// vanishes and the bracket is lost. The dual construction works *precisely* when the cochain
-/// differential $\delta \neq 0$, which is exactly the non-minimal $Q_\bullet$ the field trick
-/// produces. Because the unit $P_\bullet$ is minimal, $a \cdot b = 0$ holds at the cochain level (so
-/// the $a\cup b$ null-homotopy $u = 0$), and the bracket reduces to
-/// $$ \langle a, b, c\rangle = [\, a \cup v \,], \qquad \delta_Q\, v = b \cup c. $$
-/// Cup products are the closed-form [`cup_matrix`](TensorResolutionDifferential::cup_matrix); the
-/// $\delta$-preimage is a quasi-inverse of the cochain differential. Every operand is robust: the
-/// cup reads the chain map $f_x$'s `hom_k` (the verified product data), and $\delta_Q \neq 0$ makes
-/// `v` a genuine preimage — so the bracket is nonzero exactly where the null-homotopy read zero.
-pub struct FieldMassey<CC, N>
-where
-    CC: FreeChainComplex + AugmentedChainComplex + Sync + 'static,
-    CC::Algebra: Bialgebra,
-    N: Module<Algebra = CC::Algebra> + ZeroModule + 'static,
-{
-    /// $\Ext_A(M, k)$ with products (resolution $= Q_\bullet$, unit $= P_\bullet$).
-    ext: ExtAlgebra<TensorResolution<CC, N>, CC>,
-    /// $\Ext_A(k, k)$, for validating $a \cdot b = 0$ in the unit.
-    unit_ext: ExtAlgebra<CC, CC>,
-    /// The closed-form cochain engine: $\delta_Q$ and the cup products $x \cup -$.
-    cup: TensorResolutionDifferential<CC, N>,
-    /// $P_\bullet$, for realising a class of $\Ext(k, k)$ as a chain self-map $f_x$.
-    unit: Arc<CC>,
-    /// Cache of $f_x\colon P_\bullet \to P_\bullet$ per multiplier class of $\Ext(k, k)$.
-    f_maps: DashMap<BidegreeElement, Arc<ResolutionHomomorphism<CC, CC>>>,
-}
-
-impl<CC, N> FieldMassey<CC, N>
-where
-    CC: FreeChainComplex + AugmentedChainComplex + Sync + 'static,
-    CC::Algebra: Bialgebra,
-    N: Module<Algebra = CC::Algebra> + ZeroModule + 'static,
-{
-    /// Build the field-trick Massey engine. `resolution` resolves the base field `k`; `module` is
-    /// `M`. Construction is cheap — call [`compute_through_bidegree`](Self::compute_through_bidegree).
-    pub fn new(resolution: Arc<CC>, module: Arc<N>) -> Self {
-        let ext = field_resolution_products(Arc::clone(&resolution), Arc::clone(&module));
-        let unit_ext = ExtAlgebra::new(Arc::clone(&resolution), Arc::clone(&resolution));
-        let cup = TensorResolutionDifferential::new(Arc::clone(&resolution), module);
-        Self {
-            ext,
-            unit_ext,
-            cup,
-            unit: resolution,
-            f_maps: DashMap::new(),
-        }
-    }
-
-    /// The underlying $\Ext_A(M, k)$ (products, cohomology, `lift`/`project`).
-    pub fn ext(&self) -> &ExtAlgebra<TensorResolution<CC, N>, CC> {
-        &self.ext
-    }
-
-    fn prime(&self) -> ValidPrime {
-        self.ext.prime()
-    }
-
-    /// Compute $Q_\bullet$, $P_\bullet$ and the $\Ext(k,k)$ side far enough to read brackets landing
-    /// in the box up to `max`. Grows one extra stem and two extra filtrations for the cup products
-    /// and the $\delta$-preimage.
-    pub fn compute_through_bidegree(&self, max: Bidegree) {
-        let margin = Bidegree::n_s(max.n() + 2, max.s() + 3);
-        self.ext.compute_through_bidegree(margin);
-        self.unit_ext.compute_through_bidegree(margin);
-    }
-
-    /// The chain self-map $f_x\colon P_\bullet \to P_\bullet$ realising `x ∈ Ext(k, k)`, cached.
-    fn f_map(&self, x: &BidegreeElement) -> Arc<ResolutionHomomorphism<CC, CC>> {
-        if let Some(m) = self.f_maps.get(x) {
-            return Arc::clone(&m);
-        }
-        let hom = Arc::new(ResolutionHomomorphism::from_class(
-            format!("cup_{x}"),
-            Arc::clone(&self.unit),
-            Arc::clone(&self.unit),
-            x.degree(),
-            &x.vec().iter().collect::<Vec<_>>(),
-        ));
-        Arc::clone(self.f_maps.entry(x.clone()).or_insert(hom).value())
-    }
-
-    /// The cup product `x ∪ v` of `x ∈ Ext(k, k)` with a cochain `v ∈ Hom(Q•, k)`, landing at
-    /// `v.degree() + x.degree()`. The unit `P•` is minimal, so `f_x` needs no sequential extension.
-    fn cup(&self, x: &BidegreeElement, v: &Cochain) -> Cochain {
-        let src = v.degree();
-        let tgt = src + x.degree();
-        let f_x = self.f_map(x);
-        f_x.extend_through_stem(tgt);
-        let m = self.cup.cup_matrix(&f_x, src.s(), src.t(), x.degree());
-        let mut out = FpVector::new(self.prime(), m.columns());
-        m.apply(out.as_slice_mut(), 1, v.vec());
-        Cochain::new(tgt, out)
-    }
-
-    /// A cochain `v` with `δ_Q v = z`, or `None` if `z` is not a coboundary (so the bracket is
-    /// undefined). `δ_Q` lowers filtration for the preimage: `v` lives at `z.degree() + (n+1, s-1)`.
-    fn delta_preimage(&self, z: &Cochain) -> Option<Cochain> {
-        let p = self.prime();
-        let v_deg = z.degree() + Bidegree::n_s(1, -1);
-        // D = δ_Q out of v_deg : C^{v_deg} → C^{z.degree()}. Rows index v, columns index z.
-        let d = self.cup.matrix(v_deg)?;
-        let (r, c) = (d.rows(), d.columns());
-        if z.vec().len() != c {
-            return None;
-        }
-        // Solve v·D = z via the quasi-inverse of [D | I].
-        let mut aug = AugmentedMatrix::<2>::new(p, r, [c, r]);
-        for i in 0..r {
-            aug.row_mut(i).slice_mut(0, c).add(d.row(i), 1);
-        }
-        aug.segment(1, 1).add_identity();
-        aug.row_reduce();
-        let qi = aug.compute_quasi_inverse();
-
-        let mut v = FpVector::new(p, r);
-        qi.apply(v.as_slice_mut(), 1, z.vec());
-
-        // Verify: `qi.apply` silently drops any component of `z` outside `im δ_Q`, so re-check that
-        // δ_Q v = z (i.e. `v·D - z = 0`).
-        let mut back = FpVector::new(p, c);
-        d.apply(back.as_slice_mut(), 1, v.as_slice());
-        back.as_slice_mut().add(z.vec(), p.as_u32() - 1);
-        if !back.is_zero() {
-            return None;
-        }
-        Some(Cochain::new(v_deg, v))
-    }
-
-    /// The triple Massey product $\langle a, b, c\rangle$ with `a, b ∈ Ext(k, k)` and
-    /// `c ∈ Ext(M, k)`, via the cochain DGA. Returns `None` when `a·b ≠ 0`, `b·c ≠ 0`, or the
-    /// bracket bidegree is out of the computed range.
-    pub fn massey(
-        &self,
-        a: &BidegreeElement,
-        b: &BidegreeElement,
-        c: &BidegreeElement,
-    ) -> Option<MasseyResult> {
-        let tot = a.degree() + b.degree() + c.degree() - Bidegree::s_t(1, 0);
-        // The cup/preimage pipeline reads cochains at `b∪c` (= `b + c`), its δ-preimage `v`, and the
-        // bracket `tot`. Every one must be resolved, or the cochain reads run off the computed box.
-        // `has_computed_bidegree` is panic-safe (unlike `cohomology`/`cochain_dimension`).
-        let res = self.ext.resolution();
-        let bc_deg = b.degree() + c.degree();
-        let v_deg = bc_deg + Bidegree::n_s(1, -1);
-        for d in [bc_deg, v_deg, tot] {
-            if d.s() < 0 || d.t() < 0 || !res.has_computed_bidegree(d) {
-                return None;
-            }
-        }
-        self.ext.cohomology(tot)?;
-
-        // a·b = 0 is required for u = 0 (the a∪b null-homotopy) to be valid.
-        match self.unit_ext.try_multiply(a, b) {
-            Some(ab) if ab.vec().is_zero() => {}
-            _ => return None,
-        }
-
-        // v with δ_Q v = b∪c; `None` iff b·c ≠ 0 (b∪c not a coboundary).
-        let bc = self.cup(b, &self.ext.lift(c));
-        let v = self.delta_preimage(&bc)?;
-        let av = self.cup(a, &v);
-        let representative = self.ext.project(&av).into_vec();
-        let indeterminacy = self.ext.massey_indeterminacy(a, c, tot);
-        Some(MasseyResult {
-            degree: tot,
-            coset: AffineSubspace::new(representative, indeterminacy),
-        })
-    }
-
-    /// The family of Massey products $\langle a, b, -\rangle$ for fixed `a, b ∈ Ext(k, k)` and every
-    /// valid third factor `c ∈ Ext(M, k)` (the kernel of multiplication by `b`) across the computed
-    /// range. Brackets that contain `0` are omitted. Assumes `a·b = 0`.
-    pub fn massey_iter_c(
-        &self,
-        a: &BidegreeElement,
-        b: &BidegreeElement,
-    ) -> Vec<(BidegreeElement, MasseyResult)> {
-        let mut results = Vec::new();
-        for c_deg in self.ext.resolution().iter_nonzero_stem() {
-            let Some(kernel) = self.ext.massey_kernel(b, c_deg) else {
-                continue;
-            };
-            for row in kernel.iter() {
-                let c = BidegreeElement::new(c_deg, row.to_owned());
-                let Some(result) = self.massey(a, b, &c) else {
-                    continue;
-                };
-                if result.contains_zero() {
-                    continue;
-                }
-                results.push((c, result));
-            }
-        }
-        results
     }
 }
 
@@ -1781,16 +1589,15 @@ mod tests {
         let (nn, ss) = (8, 5);
         let s2 = Arc::new(construct_standard::<false, _, _>("S_2", None).unwrap());
         let m = finite_module(&s2.algebra(), "C2", nn + ss + 8);
-        let fm = FieldMassey::new(Arc::clone(&s2), m);
-        fm.compute_through_bidegree(Bidegree::n_s(nn, ss));
+        let field = field_resolution_products(Arc::clone(&s2), m);
+        field.compute_through_bidegree(Bidegree::n_s(nn + 2, ss + 3));
 
         let c2 = Arc::new(construct_standard::<false, _, _>("C2", None).unwrap());
         c2.compute_through_stem(Bidegree::n_s(nn + 1, ss + 3));
         let direct = ExtAlgebra::new(Arc::clone(&c2), Arc::clone(&s2));
 
-        let ext = fm.ext();
-        let h0 = ext.unit_generator(BidegreeGenerator::new(Bidegree::n_s(0, 1), 0));
-        let h1 = ext.unit_generator(BidegreeGenerator::new(Bidegree::n_s(1, 1), 0));
+        let h0 = field.unit_generator(BidegreeGenerator::new(Bidegree::n_s(0, 1), 0));
+        let h1 = field.unit_generator(BidegreeGenerator::new(Bidegree::n_s(1, 1), 0));
         let d_h0 = direct.unit_generator(BidegreeGenerator::new(Bidegree::n_s(0, 1), 0));
         let d_h1 = direct.unit_generator(BidegreeGenerator::new(Bidegree::n_s(1, 1), 0));
 
@@ -1806,7 +1613,9 @@ mod tests {
             keyed
         };
 
-        let field_fam = summarize(fm.massey_iter_c(&h0, &h1));
+        // The SAME `massey_iter_c` as on a minimal resolution — the attached cup makes it dispatch
+        // to the cochain-DGA bracket.
+        let field_fam = summarize(field.massey_iter_c(&h0, &h1));
         let direct_fam = summarize(direct.massey_iter_c(&d_h0, &d_h1));
         assert!(!field_fam.is_empty(), "expected some nonzero brackets");
         assert_eq!(
@@ -1817,30 +1626,45 @@ mod tests {
 
     #[test]
     fn field_massey_dga_cup_matches_products() {
-        // Stage 1 of the cochain-DGA Massey: the closed-form cup product `h0 ∪ v` reproduces the
-        // chain-map product on Ext(C2, k). For every class y, project(h0 ∪ lift(y)) == y · h0.
+        // The closed-form cup product `h0 ∪ v` (the DGA's module action) reproduces the chain-map
+        // product on Ext(C2, k): for every class y, project(h0 ∪ lift(y)) == y · h0. This isolates
+        // the cup engine from the δ-preimage half of the bracket.
         use sseq::coordinates::BidegreeGenerator;
+
+        use crate::resolution_homomorphism::ResolutionHomomorphism;
 
         let (nn, ss) = (8, 5);
         let s2 = Arc::new(construct_standard::<false, _, _>("S_2", None).unwrap());
         let m = finite_module(&s2.algebra(), "C2", nn + ss + 8);
-        let fm = FieldMassey::new(Arc::clone(&s2), m);
-        fm.compute_through_bidegree(Bidegree::n_s(nn, ss));
-        let ext = fm.ext();
-        let h0 = ext.unit_generator(BidegreeGenerator::new(Bidegree::n_s(0, 1), 0));
+        let field = field_resolution_products(Arc::clone(&s2), m);
+        field.compute_through_bidegree(Bidegree::n_s(nn + 2, ss + 3));
+        let h0 = field.unit_generator(BidegreeGenerator::new(Bidegree::n_s(0, 1), 0));
+
+        let cup = field.cup().expect("the field trick attaches a cup product");
+        let f_h0 = ResolutionHomomorphism::from_class(
+            String::new(),
+            Arc::clone(field.unit()),
+            Arc::clone(field.unit()),
+            h0.degree(),
+            &[1],
+        );
 
         let mut checked = 0;
         for n in 0..=nn {
             for s in 0..=ss {
                 let b = Bidegree::n_s(n, s);
                 let target = b + h0.degree();
-                if ext.cohomology(b).is_none() || ext.cohomology(target).is_none() {
+                if field.cohomology(b).is_none() || field.cohomology(target).is_none() {
                     continue;
                 }
-                for i in 0..ext.dimension(b) {
-                    let y = ext.generator(BidegreeGenerator::new(b, i));
-                    let via_cup = ext.project(&fm.cup(&h0, &ext.lift(&y)));
-                    let via_mult = ext.multiply(&y, &h0);
+                f_h0.extend_through_stem(target);
+                let m_cup = cup.cup_matrix(&f_h0, b.s(), b.t(), h0.degree());
+                for i in 0..field.dimension(b) {
+                    let y = field.generator(BidegreeGenerator::new(b, i));
+                    let mut out = FpVector::new(TWO, m_cup.columns());
+                    m_cup.apply(out.as_slice_mut(), 1, field.lift(&y).vec());
+                    let via_cup = field.project(&super::Cochain::new(target, out));
+                    let via_mult = field.multiply(&y, &h0);
                     assert_eq!(via_cup, via_mult, "h0 ∪ y != y · h0 at {b:?}#{i}");
                     checked += 1;
                 }
@@ -1851,31 +1675,30 @@ mod tests {
 
     #[test]
     fn field_massey_dga_matches_direct_c2() {
-        // The cochain-DGA field-trick Massey ⟨h0, h1, c⟩ on Ext(C2, k) agrees with the direct
-        // minimal resolution — the bracket the chain-map/null-homotopy path loses to non-minimality.
+        // The unified `massey` on the field trick agrees with the direct minimal resolution on the
+        // classic ⟨h0, h1, c⟩ — the bracket the chain-map/null-homotopy path loses to non-minimality.
         use sseq::coordinates::BidegreeGenerator;
 
         let (nn, ss) = (8, 5);
         let s2 = Arc::new(construct_standard::<false, _, _>("S_2", None).unwrap());
         let m = finite_module(&s2.algebra(), "C2", nn + ss + 8);
-        let fm = FieldMassey::new(Arc::clone(&s2), m);
-        fm.compute_through_bidegree(Bidegree::n_s(nn, ss));
+        let field = field_resolution_products(Arc::clone(&s2), m);
+        field.compute_through_bidegree(Bidegree::n_s(nn + 2, ss + 3));
 
         let c2 = Arc::new(construct_standard::<false, _, _>("C2", None).unwrap());
         c2.compute_through_stem(Bidegree::n_s(nn + 1, ss + 3));
         let direct = ExtAlgebra::new(Arc::clone(&c2), Arc::clone(&s2));
 
-        let ext = fm.ext();
-        let h0 = ext.unit_generator(BidegreeGenerator::new(Bidegree::n_s(0, 1), 0));
-        let h1 = ext.unit_generator(BidegreeGenerator::new(Bidegree::n_s(1, 1), 0));
+        let h0 = field.unit_generator(BidegreeGenerator::new(Bidegree::n_s(0, 1), 0));
+        let h1 = field.unit_generator(BidegreeGenerator::new(Bidegree::n_s(1, 1), 0));
         let d_h0 = direct.unit_generator(BidegreeGenerator::new(Bidegree::n_s(0, 1), 0));
         let d_h1 = direct.unit_generator(BidegreeGenerator::new(Bidegree::n_s(1, 1), 0));
 
         // The classic bracket ⟨h0, h1, c⟩ at c = (2, 2): the null-homotopy path read 0 here.
         let cd = Bidegree::n_s(2, 2);
-        let c_field = ext.generator(BidegreeGenerator::new(cd, 0));
+        let c_field = field.generator(BidegreeGenerator::new(cd, 0));
         let c_direct = direct.generator(BidegreeGenerator::new(cd, 0));
-        let fb = fm
+        let fb = field
             .massey(&h0, &h1, &c_field)
             .expect("field ⟨h0,h1,c⟩ defined");
         let db = direct

@@ -20,11 +20,12 @@ use std::sync::Arc;
 
 use fp::{
     matrix::{AffineSubspace, AugmentedMatrix, Matrix, Subspace},
+    prime::Prime,
     vector::{FpSlice, FpVector},
 };
 use sseq::coordinates::{Bidegree, BidegreeElement, BidegreeGenerator};
 
-use super::{Cochain, ExtAlgebra};
+use super::{Cochain, CochainCup, ExtAlgebra};
 use crate::{
     chain_complex::{AugmentedChainComplex, ChainHomotopy, FreeChainComplex},
     resolution_homomorphism::ResolutionHomomorphism,
@@ -130,6 +131,12 @@ where
         shift: Bidegree,
         c: &BidegreeElement,
     ) -> Option<MasseyResult> {
+        // On a non-minimal resolution (the field trick attaches a cup product) the chain-map bracket
+        // below degenerates; dispatch to the cochain-DGA bracket instead.
+        if let Some(cup) = self.cup() {
+            return self.massey_bracket_dga(&Arc::clone(cup), a, b_hom, shift, c);
+        }
+
         let p = self.prime();
         let resolution = self.resolution();
         let unit = self.unit();
@@ -194,6 +201,100 @@ where
             degree: tot,
             coset: AffineSubspace::new(representative, indeterminacy),
         })
+    }
+
+    /// The bracket $\langle a, b, c\rangle$ via the **cochain DGA**, for a non-minimal resolution
+    /// carrying a [`CochainCup`]. Because the unit is minimal ($a\cdot b = 0$ at the cochain level,
+    /// so the $a\cup b$ null-homotopy $u = 0$), the bracket is $[\,a \cup v\,]$ with $\delta_Q v = b
+    /// \cup c$. The cup reads the chain self-maps `b_hom` (= $f_b$) and `f_a`, and $\delta_Q$ is the
+    /// attached [`differential`](Self::differential); every operand stays non-degenerate on the
+    /// non-minimal $Q_\bullet$. Returns `None` if `b·c ≠ 0` or the range is uncomputed.
+    fn massey_bracket_dga(
+        &self,
+        cup: &Arc<dyn CochainCup<CCU>>,
+        a: &BidegreeElement,
+        b_hom: Arc<ResolutionHomomorphism<CCU, CCU>>,
+        shift: Bidegree,
+        c: &BidegreeElement,
+    ) -> Option<MasseyResult> {
+        let p = self.prime();
+        let res = self.resolution();
+        let unit = self.unit();
+
+        let c_deg = c.degree();
+        let tot = c_deg + shift;
+        let b_deg = b_hom.shift;
+        let bc_deg = b_deg + c_deg;
+        let v_deg = bc_deg + Bidegree::n_s(1, -1);
+        // Every cochain read (b∪c at `bc_deg`, its δ-preimage `v`, the bracket `tot`) must be in the
+        // computed box. `has_computed_bidegree` is panic-safe unlike `cohomology`/`cochain_dimension`.
+        for d in [bc_deg, v_deg, tot] {
+            if d.s() < 0 || d.t() < 0 || !res.has_computed_bidegree(d) {
+                return None;
+            }
+        }
+        self.cohomology(tot)?;
+
+        // b∪c as a cochain: cup by b (realised by `b_hom`) applied to the cocycle rep of c.
+        b_hom.extend_through_stem(bc_deg);
+        let bc_mat = cup.cup_matrix(&b_hom, c_deg.s(), c_deg.t(), b_deg);
+        let lc = self.lift(c);
+        let mut bc = FpVector::new(p, bc_mat.columns());
+        bc_mat.apply(bc.as_slice_mut(), 1, lc.vec());
+
+        // v with δ_Q v = b∪c; `None` iff b·c ≠ 0 (b∪c is not a coboundary).
+        let v = self.delta_preimage(v_deg, bc.as_slice())?;
+
+        // a∪v, then project to an Ext class.
+        let f_a = Arc::new(ResolutionHomomorphism::from_class(
+            String::new(),
+            Arc::clone(unit),
+            Arc::clone(unit),
+            a.degree(),
+            &a.vec().iter().collect::<Vec<_>>(),
+        ));
+        f_a.extend_through_stem(tot);
+        let av_mat = cup.cup_matrix(&f_a, v_deg.s(), v_deg.t(), a.degree());
+        let mut av = FpVector::new(p, av_mat.columns());
+        av_mat.apply(av.as_slice_mut(), 1, v.as_slice());
+
+        let representative = self.project(&Cochain::new(tot, av)).into_vec();
+        let indeterminacy = self.massey_indeterminacy(a, c, tot);
+        Some(MasseyResult {
+            degree: tot,
+            coset: AffineSubspace::new(representative, indeterminacy),
+        })
+    }
+
+    /// A cochain `v` at `v_deg` with `δ_Q v = z` (the attached differential's matrix out of `v_deg`
+    /// lands at `z`'s bidegree), or `None` if `z ∉ im δ_Q` (so the bracket is undefined). Solved by a
+    /// quasi-inverse of `[δ_Q | I]`, with a `δ_Q v = z` post-check (the quasi-inverse silently drops
+    /// any component of `z` outside the image).
+    fn delta_preimage(&self, v_deg: Bidegree, z: FpSlice) -> Option<FpVector> {
+        let p = self.prime();
+        let d = self.differential()?.matrix(v_deg)?;
+        let (r, c) = (d.rows(), d.columns());
+        if z.len() != c {
+            return None;
+        }
+        let mut aug = AugmentedMatrix::<2>::new(p, r, [c, r]);
+        for i in 0..r {
+            aug.row_mut(i).slice_mut(0, c).add(d.row(i), 1);
+        }
+        aug.segment(1, 1).add_identity();
+        aug.row_reduce();
+        let qi = aug.compute_quasi_inverse();
+
+        let mut v = FpVector::new(p, r);
+        qi.apply(v.as_slice_mut(), 1, z);
+
+        let mut back = FpVector::new(p, c);
+        d.apply(back.as_slice_mut(), 1, v.as_slice());
+        back.as_slice_mut().add(z, p.as_u32() - 1);
+        if !back.is_zero() {
+            return None;
+        }
+        Some(v)
     }
 
     /// Compute a representative of a Massey product evaluated at `row` from the per-generator
