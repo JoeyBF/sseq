@@ -51,6 +51,7 @@ use crate::{
     chain_complex::{ChainComplex, FreeChainComplex},
     resolution::secondary::SecondaryResolution,
     resolution_homomorphism::ResolutionHomomorphism,
+    save::{SaveDirectory, SaveFile, SaveKind},
     secondary::SecondaryLift,
 };
 
@@ -267,6 +268,10 @@ where
     /// The coboundary matrix `δ_Q` out of each bidegree, memoised — it is intrinsic (the closed-form
     /// untwisting), so a Massey sweep does not recompute it per bracket.
     matrix_cache: DashMap<Bidegree, Arc<Matrix>>,
+    /// Where the `δ_Q` matrices are persisted, if disk caching is enabled. Because the on-disk header
+    /// only distinguishes by algebra and bidegree (not by `M`), this directory must be dedicated to a
+    /// single module — see [`with_save_dir`](Self::with_save_dir).
+    save_dir: SaveDirectory,
 }
 
 impl<CC, N> TensorResolutionDifferential<CC, N>
@@ -283,11 +288,79 @@ where
             antipode,
             cochain_bases: DashMap::new(),
             matrix_cache: DashMap::new(),
+            save_dir: SaveDirectory::None,
         }
+    }
+
+    /// Persist (and reload) the closed-form `δ_Q` matrices under `save_dir`, using the
+    /// [`save`](crate::save) machinery. Because the on-disk header does not encode `M`, **the
+    /// directory must be dedicated to a single module** — reusing one directory for two different
+    /// modules over the same algebra would silently mix their differentials. The
+    /// [`SaveKind::TensorDifferential`] subdirectory is created eagerly so writes succeed lazily.
+    #[must_use]
+    pub fn with_save_dir(mut self, save_dir: impl Into<SaveDirectory>) -> Self {
+        let save_dir = save_dir.into();
+        if let Some(p) = save_dir.write() {
+            SaveKind::TensorDifferential
+                .create_dir(p)
+                .expect("Failed to create tensor-differential save directory");
+        }
+        self.save_dir = save_dir;
+        self
     }
 
     fn prime(&self) -> ValidPrime {
         self.resolution.prime()
+    }
+
+    /// The [`SaveFile`] for the `δ_Q` matrix out of bidegree `b`.
+    fn delta_save_file(&self, b: Bidegree) -> SaveFile<CC::Algebra> {
+        SaveFile {
+            kind: SaveKind::TensorDifferential,
+            algebra: self.resolution.algebra(),
+            b,
+            idx: None,
+        }
+    }
+
+    /// Read the `δ_Q` matrix out of `b` from disk, if present. The file is self-describing (it stores
+    /// its own row/column counts); we assert those against the cochain-basis shape as an integrity
+    /// guard, so a directory holding another module's data (a wrong-shaped matrix) fails loudly rather
+    /// than returning nonsense.
+    fn read_delta(&self, b: Bidegree, rows: usize, cols: usize) -> Option<Matrix> {
+        use byteorder::{LittleEndian, ReadBytesExt};
+
+        let dir = self.save_dir.read()?;
+        let mut f = self.delta_save_file(b).open_file(dir.clone())?;
+        let saved_rows = f.read_u64::<LittleEndian>().unwrap() as usize;
+        let saved_cols = f.read_u64::<LittleEndian>().unwrap() as usize;
+        assert_eq!(
+            (saved_rows, saved_cols),
+            (rows, cols),
+            "tensor-differential save file at {b} has shape {saved_rows}×{saved_cols}, expected \
+             {rows}×{cols} (is this directory dedicated to a single module?)"
+        );
+        Some(Matrix::from_bytes(self.prime(), rows, cols, &mut f).unwrap())
+    }
+
+    /// Persist the `δ_Q` matrix out of `b` to disk, if writing is enabled and it is not already
+    /// present. The shape (`rows`, `cols`) is written ahead of the matrix body so [`read_delta`] is
+    /// self-describing.
+    fn write_delta(&self, b: Bidegree, matrix: &Matrix) {
+        use byteorder::{LittleEndian, WriteBytesExt};
+
+        let Some(dir) = self.save_dir.write() else {
+            return;
+        };
+        let save_file = self.delta_save_file(b);
+        if save_file.exists(dir.clone()) {
+            return;
+        }
+        let mut f = save_file.create_file(dir.clone(), false);
+        f.write_u64::<LittleEndian>(matrix.rows() as u64).unwrap();
+        f.write_u64::<LittleEndian>(matrix.columns() as u64)
+            .unwrap();
+        matrix.to_bytes(&mut f).unwrap();
     }
 
     /// True once $P_s$ is resolved through internal degree `t` (so its generators up to `t` and the
@@ -445,15 +518,26 @@ where
         if !self.computed(s, t) || !self.computed(s + 1, t) {
             return None;
         }
-        // δ: C^s → C^{s+1} at the same internal degree, read off the free differential d_P.
-        let p = self.prime();
-        let module_s = self.resolution.module(s);
-        let d_p = self.resolution.differential(s + 1); // P_{s+1} → P_s
-        let matrix = self.closed_form_matrix(s, t, s + 1, t, |e_l, l| {
-            let mut dp = FpVector::new(p, module_s.dimension(e_l));
-            d_p.apply_to_generator(&mut dp, 1, e_l, l);
-            dp
-        });
+
+        // The `δ_Q` matrix maps the cochain basis at `(s, t)` to the one at `(s + 1, t)`; those
+        // shapes let us both reload a self-describing save file and size a fresh computation.
+        let rows = self.cochain_basis(s, t).len();
+        let cols = self.cochain_basis(s + 1, t).len();
+        let matrix = if let Some(m) = self.read_delta(b, rows, cols) {
+            m
+        } else {
+            // δ: C^s → C^{s+1} at the same internal degree, read off the free differential d_P.
+            let p = self.prime();
+            let module_s = self.resolution.module(s);
+            let d_p = self.resolution.differential(s + 1); // P_{s+1} → P_s
+            let matrix = self.closed_form_matrix(s, t, s + 1, t, |e_l, l| {
+                let mut dp = FpVector::new(p, module_s.dimension(e_l));
+                d_p.apply_to_generator(&mut dp, 1, e_l, l);
+                dp
+            });
+            self.write_delta(b, &matrix);
+            matrix
+        };
         Some(
             (**self
                 .matrix_cache
@@ -503,10 +587,25 @@ where
     CC::Algebra: Bialgebra,
     N: Module<Algebra = CC::Algebra> + 'static,
 {
-    let diff = Arc::new(TensorResolutionDifferential::new(
-        Arc::clone(&resolution),
-        module,
-    ));
+    field_resolution_ext_with_save_dir(resolution, module, SaveDirectory::None)
+}
+
+/// [`field_resolution_ext`] with the closed-form `δ_Q` matrices persisted under `save_dir` via the
+/// [`save`](crate::save) machinery. The directory must be dedicated to this single module `M` — see
+/// [`TensorResolutionDifferential::with_save_dir`].
+pub fn field_resolution_ext_with_save_dir<CC, N>(
+    resolution: Arc<CC>,
+    module: Arc<N>,
+    save_dir: impl Into<SaveDirectory>,
+) -> ExtAlgebra<CC>
+where
+    CC: FreeChainComplex + 'static,
+    CC::Algebra: Bialgebra,
+    N: Module<Algebra = CC::Algebra> + 'static,
+{
+    let diff = Arc::new(
+        TensorResolutionDifferential::new(Arc::clone(&resolution), module).with_save_dir(save_dir),
+    );
     ExtAlgebra::without_unit(resolution).with_differential(diff)
 }
 
@@ -535,12 +634,27 @@ where
     CC::Algebra: Bialgebra,
     N: Module<Algebra = CC::Algebra> + 'static,
 {
+    field_resolution_products_with_save_dir(resolution, module, SaveDirectory::None)
+}
+
+/// [`field_resolution_products`] with the closed-form `δ_Q` matrices persisted under `save_dir` via
+/// the [`save`](crate::save) machinery. The directory must be dedicated to this single module `M` —
+/// see [`TensorResolutionDifferential::with_save_dir`].
+pub fn field_resolution_products_with_save_dir<CC, N>(
+    resolution: Arc<CC>,
+    module: Arc<N>,
+    save_dir: impl Into<SaveDirectory>,
+) -> ExtAlgebra<CC, CC>
+where
+    CC: FreeChainComplex + crate::chain_complex::AugmentedChainComplex + 'static,
+    CC::Algebra: Bialgebra,
+    N: Module<Algebra = CC::Algebra> + 'static,
+{
     // One engine serves as both the coboundary δ_Q (additive Ext) and the cup product — same
     // untwisting closed form, same cochain basis.
-    let engine = Arc::new(TensorResolutionDifferential::new(
-        resolution.clone(),
-        module,
-    ));
+    let engine = Arc::new(
+        TensorResolutionDifferential::new(resolution.clone(), module).with_save_dir(save_dir),
+    );
     ExtAlgebra::without_unit(resolution)
         .with_differential(engine.clone() as Arc<dyn ExtDifferential>)
         .with_cup(engine as Arc<dyn super::CochainCup<CC>>)
@@ -1173,6 +1287,63 @@ mod tests {
     #[test]
     fn tensor_trick_matches_direct_c2() {
         assert_matches_direct("C2", "S_2", 10, 6);
+    }
+
+    /// The closed-form `δ_Q` matrices persist to disk via [`crate::save`] and reload byte-faithfully:
+    /// a fresh engine pointed at the populated directory (empty in-memory cache) reproduces the same
+    /// $\Ext(C2, k)$ as the direct minimal resolution, exercising the disk read path.
+    #[test]
+    fn field_delta_matrices_persist_to_disk() {
+        use crate::save::SaveDirectory;
+
+        let (nn, ss) = (10, 6);
+        let t_max = nn + ss;
+        let k_res = Arc::new(construct_standard::<false, _, _>("S_2", None).unwrap());
+        k_res.compute_through_bidegree(Bidegree::s_t(ss + 1, t_max));
+        k_res.algebra().compute_basis(t_max + 1);
+
+        let m_json = crate::utils::parse_module_name("C2").unwrap();
+        let make_module = || {
+            let m = Arc::new(FDModule::from_json(k_res.algebra(), &m_json).unwrap());
+            m.compute_basis(t_max);
+            m
+        };
+
+        // Ground truth: the direct minimal resolution of C2.
+        let direct = Arc::new(construct_standard::<false, _, _>("C2", None).unwrap());
+        direct.compute_through_stem(Bidegree::n_s(nn, ss));
+
+        let dir = tempfile::tempdir().unwrap();
+        let save_dir = SaveDirectory::from(Some(dir.path().to_owned()));
+
+        let check_against_direct = |alg: &ExtAlgebra<_>| {
+            for n in 0..=nn {
+                for s in 0..=ss {
+                    let b = Bidegree::n_s(n, s);
+                    assert_eq!(
+                        alg.cohomology_dimension(b),
+                        Some(direct.number_of_gens_in_bidegree(b)),
+                        "Ext(C2, k) mismatch at {b:?}",
+                    );
+                }
+            }
+        };
+
+        // Pass 1: writing enabled — computing the cohomology populates the δ_Q save directory.
+        let alg =
+            field_resolution_ext_with_save_dir(Arc::clone(&k_res), make_module(), save_dir.clone());
+        check_against_direct(&alg);
+
+        // δ_Q matrices were actually written to disk.
+        let subdir = dir.path().join("tensor_differentials");
+        let written = std::fs::read_dir(&subdir).map_or(0, Iterator::count);
+        assert!(written > 0, "expected persisted δ_Q matrices in {subdir:?}");
+
+        // Pass 2: a fresh engine with an empty in-memory cache reads the matrices back from disk and
+        // must reproduce the same Ext (the read path asserts each file's shape as an integrity guard).
+        let reloaded =
+            field_resolution_ext_with_save_dir(Arc::clone(&k_res), make_module(), save_dir);
+        check_against_direct(&reloaded);
     }
 
     #[test]

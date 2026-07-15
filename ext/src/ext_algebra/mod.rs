@@ -44,7 +44,9 @@ use sseq::coordinates::{Bidegree, BidegreeElement, BidegreeGenerator};
 
 pub use self::secondary::{SecondaryExtAlgebra, SecondaryProduct};
 pub use self::tensor_resolution::{
-    Antipode, TensorResolutionDifferential, field_resolution_ext, field_resolution_products,
+    Antipode, TensorResolutionDifferential, field_resolution_ext,
+    field_resolution_ext_with_save_dir, field_resolution_products,
+    field_resolution_products_with_save_dir,
 };
 use crate::{
     chain_complex::{AugmentedChainComplex, FreeChainComplex},
