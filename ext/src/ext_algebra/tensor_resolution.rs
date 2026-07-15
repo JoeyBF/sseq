@@ -1759,6 +1759,101 @@ mod tests {
     }
 
     #[test]
+    fn field_products_match_direct_c2_nassau() {
+        // The field trick over a **Nassau / Milnor** sphere `P•` (never exercised before — every other
+        // field-trick test uses the standard `SteenrodAlgebra` resolver). This is the exact `P•` a
+        // large-scale run would load from disk, so it validates the antipode/coproduct and cup path
+        // over Milnor's basis. Ext dimensions and the rank of `(·h0)` are presentation-independent, so
+        // we cross-check them against the direct minimal resolution of C2 (over `SteenrodAlgebra`).
+        use sseq::coordinates::BidegreeGenerator;
+
+        use super::field_resolution_products;
+
+        let (nn, ss) = (8, 5);
+        let t_max = nn + ss + 6;
+
+        // Field side: Milnor sphere via Nassau's algorithm, tensored with C2 over the same algebra.
+        // Nassau keeps its quasi-inverse on disk, not in memory, so the product/cup maps (which lift
+        // through the unit via `apply_quasi_inverse`) require a populated save directory — precisely
+        // the "save the sphere, then compute from the saved res" workflow.
+        let s2_dir = tempfile::tempdir().unwrap();
+        let s2 = Arc::new(
+            crate::utils::construct_nassau("S_2", Some(s2_dir.path().to_owned())).unwrap(),
+        );
+        s2.compute_through_bidegree(Bidegree::s_t(ss + 3, t_max));
+        s2.algebra().compute_basis(t_max + 1);
+        let m = Arc::new(
+            FDModule::from_json(
+                s2.algebra(),
+                &crate::utils::parse_module_name("C2").unwrap(),
+            )
+            .unwrap(),
+        );
+        m.compute_basis(t_max);
+        let field = field_resolution_products(Arc::clone(&s2), Arc::clone(&m));
+        field.compute_through_bidegree(Bidegree::s_t(ss + 3, t_max));
+
+        // Direct side: minimal resolution of C2 (over `SteenrodAlgebra`) as ground truth.
+        let c2 = Arc::new(construct_standard::<false, _, _>("C2", None).unwrap());
+        c2.compute_through_stem(Bidegree::n_s(nn + 1, ss + 3));
+        let s2_std = Arc::new(construct_standard::<false, _, _>("S_2", None).unwrap());
+        s2_std.compute_through_bidegree(Bidegree::s_t(ss + 3, t_max));
+        let direct = ExtAlgebra::new(Arc::clone(&c2), s2_std);
+
+        let h0 = BidegreeGenerator::new(Bidegree::n_s(0, 1), 0);
+        let field_h0 = field.unit_generator(h0);
+        let direct_h0 = direct.unit_generator(h0);
+
+        let rank_of =
+            |dim: usize, tdim: usize, f: &mut dyn FnMut(usize) -> Option<FpVector>| -> usize {
+                if dim == 0 || tdim == 0 {
+                    return 0;
+                }
+                let rows: Vec<FpVector> = (0..dim)
+                    .map(|i| f(i).unwrap_or_else(|| FpVector::new(TWO, tdim)))
+                    .collect();
+                Matrix::from_rows(TWO, rows, tdim).row_reduce()
+            };
+
+        let mut compared = 0;
+        let mut saw_nonzero = false;
+        for n in 0..=nn {
+            for s in 0..=ss {
+                let b = Bidegree::n_s(n, s);
+                let target = b + h0.degree();
+                let (Some(fd), Some(ftd)) = (
+                    field.cohomology_dimension(b),
+                    field.cohomology_dimension(target),
+                ) else {
+                    continue;
+                };
+                assert_eq!(fd, direct.dimension(b), "Ext dim mismatch at {b:?}");
+                assert_eq!(
+                    ftd,
+                    direct.dimension(target),
+                    "Ext dim mismatch at {target:?}"
+                );
+
+                let field_rank = rank_of(fd, ftd, &mut |i| {
+                    field
+                        .try_multiply(&field.generator(BidegreeGenerator::new(b, i)), &field_h0)
+                        .map(BidegreeElement::into_vec)
+                });
+                let direct_rank = rank_of(fd, ftd, &mut |i| {
+                    direct
+                        .try_multiply(&direct.generator(BidegreeGenerator::new(b, i)), &direct_h0)
+                        .map(BidegreeElement::into_vec)
+                });
+                assert_eq!(field_rank, direct_rank, "(·h0) rank mismatch at {b:?}");
+                saw_nonzero |= field_rank > 0;
+                compared += 1;
+            }
+        }
+        assert!(compared > 0, "no bidegrees compared");
+        assert!(saw_nonzero, "expected nonzero h0-multiplication somewhere");
+    }
+
+    #[test]
     fn field_massey_dga_family_matches_direct_c2() {
         // The cochain-DGA field-trick Massey family ⟨h0, h1, -⟩ on Ext(C2, k) agrees with the direct
         // minimal resolution across the whole computed range: same set of nonzero brackets, keyed by
