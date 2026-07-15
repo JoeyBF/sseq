@@ -87,7 +87,7 @@ where
     /// sign, so the same kernel). Returns `None` when the product bidegree `c_deg + b.degree()` is
     /// uncomputed, so callers never mistake an uncomputed product for a zero one; a computed but
     /// empty product bidegree correctly yields the full space.
-    fn massey_kernel(&self, b: &BidegreeElement, c_deg: Bidegree) -> Option<Subspace> {
+    pub(crate) fn massey_kernel(&self, b: &BidegreeElement, c_deg: Bidegree) -> Option<Subspace> {
         let p = self.prime();
         let resolution = self.resolution();
 
@@ -228,7 +228,7 @@ where
 
     /// The indeterminacy $a \cdot \Ext^{|b| + |c| - (1,0)} + \Ext^{|a| + |b| - (1,0)} \cdot c$ at
     /// the bracket bidegree `tot`, as a subspace of $\Ext(M, k)$ at `tot`.
-    fn massey_indeterminacy(
+    pub(crate) fn massey_indeterminacy(
         &self,
         a: &BidegreeElement,
         c: &BidegreeElement,
