@@ -9,9 +9,11 @@
 //! `H^*(S(n)) = H^*(L(n, n))`.
 
 pub mod cohomology;
+pub mod equivariant;
 pub mod morava_lie;
 
 pub use cohomology::{
     CohomologyStats, Options, WeightReport, chevalley_eilenberg_cohomology, cohomology_by_weight,
 };
+pub use equivariant::equivariant_total_dim;
 pub use morava_lie::{BracketConvention, MoravaLie};

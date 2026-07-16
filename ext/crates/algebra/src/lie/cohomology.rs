@@ -254,7 +254,7 @@ fn wedge_sort_sign(mask: u32, a: usize, b: usize, c: usize) -> i32 {
 /// Enumerates every subset (bitmask) of `{0..weights.len()}` whose total `weight` equals `target`,
 /// calling `emit` on each. A pruned DFS: we descend only while the running weight can still reach
 /// `target` using the remaining generators.
-fn enumerate_weight(weights: &[u32], target: u32, emit: &mut impl FnMut(u32)) {
+pub(crate) fn enumerate_weight(weights: &[u32], target: u32, emit: &mut impl FnMut(u32)) {
     let n = weights.len();
     // suffix_max[i] = sum of weights[i..]; the most weight the remaining generators can add.
     let mut suffix_max = vec![0u32; n + 1];
