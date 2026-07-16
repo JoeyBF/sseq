@@ -22,25 +22,34 @@
 //! d(e_{a_0} /\ ... /\ e_{a_{k-1}}) = sum_r (-1)^r e_{a_0} /\ ... /\ d(e_{a_r}) /\ ... /\ e_{a_{k-1}}.
 //! ```
 //!
-//! # Block decomposition
+//! # Block decomposition and scaling
 //!
 //! The `i`-weight of [`MoravaLie`] is additive under the bracket, hence preserved by `d`. So the
 //! complex splits as a direct sum over total `i`-weight `w`, and within each weight over
-//! cohomological degree `k`. We rank each `(w, k)` block independently — the blocks are small even
-//! though the full complex has dimension `2^{n^2}` (e.g. `65536` at `n = 4`).
+//! cohomological degree `k`; we rank each `(w, k)` block independently. To scale past `n = 4` (whose
+//! full complex has dimension `2^16`) we never materialize the whole complex:
+//!
+//! * **Streaming enumeration.** The monomials of a fixed weight `w` are generated on demand by a
+//!   pruned depth-first subset walk ([`enumerate_weight`]) — we hold one weight's block in memory at
+//!   a time, not all `2^{n^2}` monomials.
+//! * **Sparse rank.** Each differential column has only `O(k * bracket size)` nonzeros, so we rank
+//!   with incremental sparse row reduction over `F_p` ([`sparse_rank`]) rather than a dense matrix.
+//!   The codomain is *not* enumerated separately: a target monomial's bitmask is used directly as a
+//!   column identifier.
+//!
+//! This lets `n = 4` run in well under a second, and makes the corners and small/large weights of
+//! `n = 5` (whose middle blocks reach `~565k` — see [`cohomology_by_weight`]) reachable with a size
+//! cap. Full `n = 5` still needs either the `Z/n`-equivariant splitting or structured/black-box
+//! sparse rank; see the handoff §3.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
-use fp::{matrix::Matrix, prime::Prime};
+use fp::prime::Prime;
+use maybe_rayon::prelude::*;
 
 use crate::lie::morava_lie::MoravaLie;
 
-/// The maximum Lie-algebra dimension this (dense, bitmask-enumerating) implementation will accept.
-/// `n = 4` gives dimension `16`; `n = 5` gives `25`, whose `2^25`-dimensional complex is beyond a
-/// dense brute-force pass (see `ext/docs/chromatic-computations.md` §3, "the moonshot").
-const MAX_DIM: usize = 20;
-
-/// The result of a Chevalley–Eilenberg cohomology computation.
+/// The result of a (complete) Chevalley–Eilenberg cohomology computation.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CohomologyStats {
     /// The prime `p`.
@@ -55,82 +64,52 @@ pub struct CohomologyStats {
     pub betti: Vec<usize>,
 }
 
-/// Computes the Chevalley–Eilenberg cohomology of `lie` over `F_p`.
+/// Per-weight rank data, the streaming unit of the computation. One [`WeightReport`] summarizes the
+/// contribution of the total-`i`-weight-`w` summand of the complex.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WeightReport {
+    /// The total `i`-weight `w` of this summand.
+    pub weight: u32,
+    /// `ranks[k] = rank(d_k)` restricted to weight `w`, for `k in 0..=N`. All-zero entries are kept
+    /// so the vector can be summed across weights positionally.
+    pub ranks: Vec<usize>,
+    /// `dim C^k` restricted to weight `w` (the block sizes), for `k in 0..=N`.
+    pub block_dims: Vec<usize>,
+    /// Whether every block of this weight was ranked (`false` if some exceeded the size cap).
+    pub complete: bool,
+    /// The largest block (domain size) encountered in this weight.
+    pub max_block: usize,
+}
+
+/// Options controlling the streaming computation.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Options {
+    /// If set, skip any `(w, k)` block whose domain size exceeds this cap (recording the weight as
+    /// incomplete). `None` ranks everything, however large.
+    pub max_block: Option<usize>,
+}
+
+/// Computes the Chevalley–Eilenberg cohomology of `lie` over `F_p`, ranking every block.
 ///
-/// Panics if `lie.dim() > MAX_DIM` (the dense enumerator would exhaust memory).
+/// This is the complete computation used by the validation ladder; it is fast through `n = 4`. For
+/// `n = 5` prefer [`cohomology_by_weight`] with a `max_block` cap, since some middle blocks are too
+/// large to rank densely-in-memory here.
 pub fn chevalley_eilenberg_cohomology(lie: &MoravaLie) -> CohomologyStats {
+    let reports = cohomology_by_weight(lie, Options::default());
+    debug_assert!(reports.iter().all(|r| r.complete));
     let n_dim = lie.dim();
-    assert!(
-        n_dim <= MAX_DIM,
-        "Chevalley–Eilenberg dimension {n_dim} exceeds the dense brute-force limit {MAX_DIM}; \
-         this needs the streaming/height-shifting approach (handoff §3)."
-    );
-    let prime = lie.prime();
-    let p = prime.as_u32();
-    let cobracket = lie.cobracket();
-    let weights: Vec<u32> = (0..n_dim).map(|a| lie.weight(a)).collect();
-
-    // Bucket every basis monomial (a subset of the n_dim generators, encoded as a bitmask) by its
-    // total i-weight. Within a weight we later split by cohomological degree (popcount).
-    let total = 1usize << n_dim;
-    let mut by_weight: HashMap<u32, Vec<u32>> = HashMap::new();
-    // dim C^k = number of monomials of popcount k, accumulated for the Betti numbers.
-    let mut dim_ck = vec![0usize; n_dim + 1];
-    for mask in 0..total {
-        let mask = mask as u32;
-        let k = mask.count_ones() as usize;
-        dim_ck[k] += 1;
-        let mut w = 0u32;
-        let mut bits = mask;
-        while bits != 0 {
-            let a = bits.trailing_zeros() as usize;
-            w += weights[a];
-            bits &= bits - 1;
-        }
-        by_weight.entry(w).or_default().push(mask);
-    }
-
-    // rank(d_k) summed over all weights.
     let mut ranks = vec![0usize; n_dim + 1];
-
-    for masks in by_weight.values() {
-        // Split this weight's monomials by cohomological degree.
-        let mut by_k: HashMap<usize, Vec<u32>> = HashMap::new();
-        for &m in masks {
-            by_k.entry(m.count_ones() as usize).or_default().push(m);
-        }
-        for (&k, domain) in &by_k {
-            let Some(codomain) = by_k.get(&(k + 1)) else {
-                continue; // d_k is zero into an empty target
-            };
-            if domain.is_empty() || codomain.is_empty() {
-                continue;
-            }
-            // Column index of each codomain monomial.
-            let col_of: HashMap<u32, usize> = codomain
-                .iter()
-                .enumerate()
-                .map(|(idx, &m)| (m, idx))
-                .collect();
-            let ncols = codomain.len();
-            let mut rows: Vec<Vec<u32>> = Vec::with_capacity(domain.len());
-            for &mask in domain {
-                let mut row = vec![0u32; ncols];
-                differential(mask, &cobracket, p, |target, coeff| {
-                    let col = col_of[&target];
-                    row[col] = (row[col] + coeff) % p;
-                });
-                rows.push(row);
-            }
-            let mut matrix = Matrix::from_vec(prime, &rows);
-            ranks[k] += matrix.row_reduce();
+    for r in &reports {
+        for (k, &rk) in r.ranks.iter().enumerate() {
+            ranks[k] += rk;
         }
     }
-
+    let total: usize = 1usize << n_dim;
     let total_rank: usize = ranks.iter().sum();
     let total_dim = total - 2 * total_rank;
 
-    // betti[k] = dim C^k - rank(d_k) - rank(d_{k-1}).
+    // dim C^k = binomial(N, k).
+    let dim_ck = binomials(n_dim);
     let mut betti = vec![0usize; n_dim + 1];
     for k in 0..=n_dim {
         let prev = if k == 0 { 0 } else { ranks[k - 1] };
@@ -138,7 +117,7 @@ pub fn chevalley_eilenberg_cohomology(lie: &MoravaLie) -> CohomologyStats {
     }
 
     CohomologyStats {
-        prime: p,
+        prime: lie.prime().as_u32(),
         dim: n_dim,
         total_dim,
         ranks,
@@ -146,47 +125,109 @@ pub fn chevalley_eilenberg_cohomology(lie: &MoravaLie) -> CohomologyStats {
     }
 }
 
-/// Applies the Chevalley–Eilenberg differential to the basis monomial `mask`, calling
-/// `emit(target_mask, coeff)` for each nonzero term (`coeff` already reduced mod `p`, in `1..p`).
-fn differential(
+/// Streams the computation weight by weight, returning a [`WeightReport`] per total `i`-weight.
+///
+/// Only one weight's blocks are held in memory at a time. With `opts.max_block` set, blocks larger
+/// than the cap are skipped and their weight marked incomplete, which is how partial `n = 5` data is
+/// gathered (compute the reachable weights/corners, leave the `~565k` middle blocks out).
+pub fn cohomology_by_weight(lie: &MoravaLie, opts: Options) -> Vec<WeightReport> {
+    let n_dim = lie.dim();
+    let p = lie.prime().as_u32();
+    let cobracket = lie.cobracket();
+    let weights: Vec<u32> = (0..n_dim).map(|a| lie.weight(a)).collect();
+    let max_weight: u32 = weights.iter().sum();
+
+    // Pass 1 (sequential): enumerate each weight, record its metadata, and collect the individual
+    // `(weight, k)` blocks that are within the size cap as independent ranking tasks. Blocks over the
+    // cap are never stored. Only one weight's monomials are materialized at a time.
+    let mut reports: Vec<WeightReport> = Vec::new();
+    let mut tasks: Vec<(usize, usize, Vec<u32>)> = Vec::new(); // (report index, k, domain masks)
+    for w in 0..=max_weight {
+        let mut by_k: Vec<Vec<u32>> = vec![Vec::new(); n_dim + 1];
+        enumerate_weight(&weights, w, &mut |mask| {
+            by_k[mask.count_ones() as usize].push(mask);
+        });
+        if by_k.iter().all(|b| b.is_empty()) {
+            continue;
+        }
+        let block_dims: Vec<usize> = by_k.iter().map(|b| b.len()).collect();
+        let max_block = block_dims.iter().copied().max().unwrap_or(0);
+        let report_idx = reports.len();
+        let mut complete = true;
+
+        for k in 0..n_dim {
+            if by_k[k].is_empty() || by_k[k + 1].is_empty() {
+                continue; // d_k has rank 0
+            }
+            if opts
+                .max_block
+                .is_some_and(|cap| by_k[k].len() > cap || by_k[k + 1].len() > cap)
+            {
+                complete = false;
+                continue;
+            }
+            tasks.push((report_idx, k, std::mem::take(&mut by_k[k])));
+        }
+
+        reports.push(WeightReport {
+            weight: w,
+            ranks: vec![0usize; n_dim + 1],
+            block_dims,
+            complete,
+            max_block,
+        });
+    }
+
+    // Pass 2 (parallel): rank the independent blocks. Blocks are independent summands, so this is
+    // embarrassingly parallel; `cobracket` is shared read-only.
+    let cobracket_ref = &cobracket;
+    let ranked: Vec<(usize, usize, usize)> = tasks
+        .into_maybe_par_iter()
+        .map(|(report_idx, k, masks)| (report_idx, k, block_rank(&masks, cobracket_ref, p)))
+        .collect();
+    for (report_idx, k, rank) in ranked {
+        reports[report_idx].ranks[k] = rank;
+    }
+    reports
+}
+
+/// The Chevalley–Eilenberg differential of the basis monomial `mask`, as a list of
+/// `(target_mask, coeff)` terms with `coeff` reduced to `1..p`. Duplicate targets are merged.
+pub fn differential_terms(
     mask: u32,
     cobracket: &[Vec<(usize, usize, i32)>],
     p: u32,
-    mut emit: impl FnMut(u32, u32),
-) {
+) -> Vec<(u32, u32)> {
+    let mut acc: HashMap<u32, i32> = HashMap::new();
     let mut bits = mask;
     while bits != 0 {
         let a = bits.trailing_zeros() as usize;
         bits &= bits - 1;
-        // r = number of set bits of `mask` strictly below `a` (the Koszul position of e_a).
         let r = (mask & ((1u32 << a) - 1)).count_ones();
         let koszul = if r.is_multiple_of(2) { 1i32 } else { -1i32 };
         for &(b, c, coeff) in &cobracket[a] {
             let bit_b = 1u32 << b;
             let bit_c = 1u32 << c;
-            // A repeated generator wedges to zero. (b, c != a since the bracket raises weight.)
             if mask & bit_b != 0 || mask & bit_c != 0 {
-                continue;
+                continue; // repeated generator wedges to zero
             }
             let target = (mask & !(1u32 << a)) | bit_b | bit_c;
-            // Sign of reordering [prefix, b, c, suffix] (the wedge order) into ascending order.
             let sort_sign = wedge_sort_sign(mask, a, b, c);
-            // d(e_a) contributes with an overall -1: (-1)^r * (-1) * coeff * sort_sign.
-            let signed = -koszul * coeff * sort_sign;
-            let reduced = signed.rem_euclid(p as i32) as u32;
-            if reduced != 0 {
-                emit(target, reduced);
-            }
+            *acc.entry(target).or_insert(0) += -koszul * coeff * sort_sign;
         }
     }
+    acc.into_iter()
+        .filter_map(|(t, v)| {
+            let v = v.rem_euclid(p as i32) as u32;
+            (v != 0).then_some((t, v))
+        })
+        .collect()
 }
 
-/// The sign (`+1`/`-1`) of the permutation that sorts the wedge
-/// `e_{a_0} /\ ... /\ e_{a_{r-1}} /\ e_b /\ e_c /\ e_{a_{r+1}} /\ ... /\ e_{a_{k-1}}` into ascending
-/// index order, where `{a_0 < ... < a_{k-1}}` are the set bits of `mask` and `a = a_r` is being
-/// replaced by the pair `(b, c)` with `b < c`. Callers guarantee `b, c` are not already in `mask`.
+/// The sign (`+1`/`-1`) sorting the wedge `[a_0, ..., a_{r-1}, b, c, a_{r+1}, ...]` — the set bits of
+/// `mask` with `a = a_r` replaced by `(b, c)` (`b < c`) — into ascending order. Callers guarantee
+/// `b, c` are not already in `mask`.
 fn wedge_sort_sign(mask: u32, a: usize, b: usize, c: usize) -> i32 {
-    // Build the wedge order: ascending set bits of `mask`, with `a` replaced by `b, c`.
     let mut seq: Vec<usize> = Vec::with_capacity(mask.count_ones() as usize + 1);
     let mut bits = mask;
     while bits != 0 {
@@ -199,7 +240,6 @@ fn wedge_sort_sign(mask: u32, a: usize, b: usize, c: usize) -> i32 {
             seq.push(x);
         }
     }
-    // Count inversions (small sequence); parity gives the sign.
     let mut inversions = 0usize;
     for i in 0..seq.len() {
         for j in (i + 1)..seq.len() {
@@ -209,6 +249,201 @@ fn wedge_sort_sign(mask: u32, a: usize, b: usize, c: usize) -> i32 {
         }
     }
     if inversions.is_multiple_of(2) { 1 } else { -1 }
+}
+
+/// Enumerates every subset (bitmask) of `{0..weights.len()}` whose total `weight` equals `target`,
+/// calling `emit` on each. A pruned DFS: we descend only while the running weight can still reach
+/// `target` using the remaining generators.
+fn enumerate_weight(weights: &[u32], target: u32, emit: &mut impl FnMut(u32)) {
+    let n = weights.len();
+    // suffix_max[i] = sum of weights[i..]; the most weight the remaining generators can add.
+    let mut suffix_max = vec![0u32; n + 1];
+    for i in (0..n).rev() {
+        suffix_max[i] = suffix_max[i + 1] + weights[i];
+    }
+    fn dfs(
+        idx: usize,
+        cur_mask: u32,
+        cur_weight: u32,
+        target: u32,
+        weights: &[u32],
+        suffix_max: &[u32],
+        emit: &mut impl FnMut(u32),
+    ) {
+        if cur_weight == target {
+            // No remaining generator has weight 0, so the only completion is the empty tail.
+            emit(cur_mask);
+            return;
+        }
+        if idx == weights.len() || cur_weight > target {
+            return;
+        }
+        // Prune: even taking everything left cannot reach the target.
+        if cur_weight + suffix_max[idx] < target {
+            return;
+        }
+        // Include generator `idx`.
+        dfs(
+            idx + 1,
+            cur_mask | (1u32 << idx),
+            cur_weight + weights[idx],
+            target,
+            weights,
+            suffix_max,
+            emit,
+        );
+        // Exclude generator `idx`.
+        dfs(
+            idx + 1,
+            cur_mask,
+            cur_weight,
+            target,
+            weights,
+            suffix_max,
+            emit,
+        );
+    }
+    dfs(0, 0, 0, target, weights, &suffix_max, emit);
+}
+
+/// The rank over `F_p` of one `(weight, degree)` differential block, whose domain is the monomial
+/// list `masks` and whose rows are `differential_terms(mask, ..)`. This is the hot path, ranked by
+/// the incremental forward elimination of [`eliminate`] (target bitmasks used directly as columns).
+fn block_rank(masks: &[u32], cobracket: &[Vec<(usize, usize, i32)>], p: u32) -> usize {
+    let mut pivots: HashMap<u32, Vec<(u32, u32)>> = HashMap::new();
+    let mut rank = 0usize;
+    for &mask in masks {
+        let mut work: BTreeMap<u32, u32> = BTreeMap::new();
+        for (col, v) in differential_terms(mask, cobracket, p) {
+            *work.entry(col).or_insert(0) += v;
+        }
+        work.retain(|_, v| {
+            *v %= p;
+            *v != 0
+        });
+        eliminate(&mut work, &mut pivots, p, &mut rank);
+    }
+    rank
+}
+
+/// Reduce `work` against the current `pivots`; if it survives, install it as a new pivot.
+fn eliminate(
+    work: &mut BTreeMap<u32, u32>,
+    pivots: &mut HashMap<u32, Vec<(u32, u32)>>,
+    p: u32,
+    rank: &mut usize,
+) {
+    loop {
+        let Some((&lead, &lead_coeff)) = work.iter().next() else {
+            return;
+        };
+        let Some(pivot) = pivots.get(&lead) else {
+            let inv = mod_inverse(lead_coeff, p);
+            let normalized: Vec<(u32, u32)> =
+                work.iter().map(|(&c, &v)| (c, (v * inv) % p)).collect();
+            pivots.insert(lead, normalized);
+            *rank += 1;
+            return;
+        };
+        let factor = lead_coeff;
+        for &(c, pv) in pivot {
+            let sub = (factor * pv) % p;
+            if sub == 0 {
+                continue;
+            }
+            let entry = work.entry(c).or_insert(0);
+            *entry = (*entry + p - sub) % p;
+            if *entry == 0 {
+                work.remove(&c);
+            }
+        }
+    }
+}
+
+/// The rank over `F_p` of the matrix whose rows are the given sparse vectors. Each row is a list of
+/// `(column_id, coeff)` pairs (`coeff` in `1..p`); column identifiers are arbitrary `u32`s. Simple
+/// reference implementation used by tests; the streaming path uses [`block_rank`], which adds a
+/// fill-reducing column order.
+pub fn sparse_rank(rows: impl IntoIterator<Item = Vec<(u32, u32)>>, p: u32) -> usize {
+    // pivots[lead] = a normalized echelon row (leading coeff 1 at column `lead`, other entries at
+    // columns > lead).
+    let mut pivots: HashMap<u32, Vec<(u32, u32)>> = HashMap::new();
+    let mut rank = 0usize;
+    for row in rows {
+        // Working row as an ordered map for O(log) min-column access and merges.
+        let mut work: BTreeMap<u32, u32> = BTreeMap::new();
+        for (c, v) in row {
+            let v = v % p;
+            if v != 0 {
+                *work.entry(c).or_insert(0) += v;
+            }
+        }
+        // Normalize any accidental sums.
+        work.retain(|_, v| {
+            *v %= p;
+            *v != 0
+        });
+        loop {
+            let Some((&lead, &lead_coeff)) = work.iter().next() else {
+                break; // reduced to zero: linearly dependent
+            };
+            let Some(pivot) = pivots.get(&lead) else {
+                // New pivot. Normalize leading coefficient to 1.
+                let inv = mod_inverse(lead_coeff, p);
+                let normalized: Vec<(u32, u32)> =
+                    work.iter().map(|(&c, &v)| (c, (v * inv) % p)).collect();
+                pivots.insert(lead, normalized);
+                rank += 1;
+                break;
+            };
+            // Eliminate the leading column: work -= lead_coeff * pivot.
+            // pivot has coeff 1 at `lead`, so this clears `lead` and only touches columns >= lead.
+            let factor = lead_coeff;
+            for &(c, pv) in pivot {
+                let sub = (factor * pv) % p;
+                if sub == 0 {
+                    continue;
+                }
+                let entry = work.entry(c).or_insert(0);
+                *entry = (*entry + p - sub) % p;
+                if *entry == 0 {
+                    work.remove(&c);
+                }
+            }
+        }
+    }
+    rank
+}
+
+/// `a^{-1} mod p` for prime `p`, via Fermat's little theorem.
+fn mod_inverse(a: u32, p: u32) -> u32 {
+    debug_assert!(!a.is_multiple_of(p));
+    mod_pow(a % p, p - 2, p)
+}
+
+fn mod_pow(base: u32, mut exp: u32, p: u32) -> u32 {
+    let mut result = 1u64;
+    let mut b = base as u64 % p as u64;
+    while exp > 0 {
+        if exp & 1 == 1 {
+            result = result * b % p as u64;
+        }
+        b = b * b % p as u64;
+        exp >>= 1;
+    }
+    result as u32
+}
+
+/// `binomial(n, k)` for `k in 0..=n` (the dimensions `dim C^k = binom(N, k)`).
+fn binomials(n: usize) -> Vec<usize> {
+    let mut row = vec![0usize; n + 1];
+    row[0] = 1;
+    for i in 1..=n {
+        for k in (1..=i).rev() {
+            row[k] += row[k - 1];
+        }
+    }
+    row
 }
 
 #[cfg(test)]
@@ -222,37 +457,59 @@ mod tests {
         ValidPrime::new(v)
     }
 
-    /// Verify `d^2 = 0` block by block: for every weight and degree `k`, the composite
-    /// `C^k -> C^{k+1} -> C^{k+2}` must vanish. This is the correctness gate on the sign convention.
+    /// `d^2 = 0`, block by block, over every monomial: the correctness gate on the sign convention.
     fn check_d_squared(lie: &MoravaLie) {
         let n_dim = lie.dim();
-        let p = lie.prime().as_u32();
+        let prime = lie.prime().as_u32();
         let cobracket = lie.cobracket();
         for mask in 0u32..(1u32 << n_dim) {
-            // (target -> coeff) after one differential.
-            let mut first: HashMap<u32, u32> = HashMap::new();
-            differential(mask, &cobracket, p, |t, c| {
-                let e = first.entry(t).or_insert(0);
-                *e = (*e + c) % p;
-            });
-            // Apply d again and accumulate; everything must cancel.
+            let first = differential_terms(mask, &cobracket, prime);
             let mut second: HashMap<u32, i64> = HashMap::new();
-            for (&t, &c) in &first {
-                if c == 0 {
-                    continue;
-                }
-                differential(t, &cobracket, p, |t2, c2| {
+            for &(t, c) in &first {
+                for (t2, c2) in differential_terms(t, &cobracket, prime) {
                     *second.entry(t2).or_insert(0) += (c as i64) * (c2 as i64);
-                });
+                }
             }
             for (&t2, &v) in &second {
                 assert_eq!(
-                    v.rem_euclid(p as i64),
+                    v.rem_euclid(prime as i64),
                     0,
                     "d^2 != 0 at monomial {mask:#b} target {t2:#b}"
                 );
             }
         }
+    }
+
+    #[test]
+    fn sparse_rank_matches_known_small() {
+        // A 3x3 rank-2 matrix over F_7.
+        let rows = vec![
+            vec![(0u32, 1u32), (1, 2), (2, 3)],
+            vec![(0, 2), (1, 4), (2, 6)], // = 2 * row0, dependent
+            vec![(1, 1), (2, 5)],
+        ];
+        assert_eq!(sparse_rank(rows, 7), 2);
+        // Full-rank identity-ish.
+        let rows = vec![vec![(0u32, 3u32)], vec![(1, 5)], vec![(2, 1)]];
+        assert_eq!(sparse_rank(rows, 7), 3);
+        // Empty.
+        assert_eq!(sparse_rank(Vec::<Vec<(u32, u32)>>::new(), 5), 0);
+    }
+
+    #[test]
+    fn enumerate_weight_counts() {
+        // weights [1,2,2,3]: subsets of weight 3 are {3}, {1,2a}, {1,2b} -> 3 of them.
+        let weights = [1u32, 2, 2, 3];
+        let mut count = 0;
+        enumerate_weight(&weights, 3, &mut |_| count += 1);
+        assert_eq!(count, 3);
+        // Total over all weights must be 2^4 = 16.
+        let total_w: u32 = weights.iter().sum();
+        let mut total = 0;
+        for w in 0..=total_w {
+            enumerate_weight(&weights, w, &mut |_| total += 1);
+        }
+        assert_eq!(total, 16);
     }
 
     #[test]
@@ -271,7 +528,6 @@ mod tests {
 
     #[test]
     fn validation_ladder_n1() {
-        // H^*(L(1,1)) = E(h_{1,0}), dimension 2.
         let stats = chevalley_eilenberg_cohomology(&MoravaLie::new(p(3), 1));
         assert_eq!(stats.total_dim, 2);
         assert_eq!(stats.betti, vec![1, 1]);
@@ -279,13 +535,10 @@ mod tests {
 
     #[test]
     fn validation_ladder_n2() {
-        // dim H^*(L(2,2)) = 12 (Salch table; known for all p). The two bracket transcriptions
-        // happen to coincide at n = 2.
         for conv in [BracketConvention::GreenBook, BracketConvention::Salch] {
             let stats =
                 chevalley_eilenberg_cohomology(&MoravaLie::with_convention(p(5), 2, conv));
             assert_eq!(stats.total_dim, 12, "n=2 total dim wrong for {conv:?}");
-            // Poincaré duality of Lie-algebra cohomology: betti is symmetric.
             let mut rev = stats.betti.clone();
             rev.reverse();
             assert_eq!(stats.betti, rev, "n=2 Betti not symmetric for {conv:?}");
@@ -294,10 +547,8 @@ mod tests {
 
     #[test]
     fn validation_ladder_n3() {
-        // dim H^*(L(3,3)) = 152 (Salch table; known for p >= 5). This is the rung that
-        // disambiguates the two OCR readings of green-book Thm 6.3.3 (handoff §2): the GreenBook
-        // transcription reproduces 152, while the swapped-subscript ("Salch eq. (8)") reading
-        // gives 128 -- so GreenBook is the correct one, and it is our default.
+        // The rung that disambiguates the two OCR readings of green-book Thm 6.3.3 (handoff §2):
+        // GreenBook reproduces the known 152, the swapped reading gives 128.
         let green = chevalley_eilenberg_cohomology(&MoravaLie::with_convention(
             p(7),
             3,
@@ -313,5 +564,16 @@ mod tests {
             salch.total_dim, 152,
             "the swapped-subscript reading should NOT match; it is the wrong transcription"
         );
+    }
+
+    #[test]
+    fn validation_ladder_n4() {
+        // The near-term prize: independent confirmation of Salch's in-progress H^*(L(4,4)) = 3440.
+        let stats = chevalley_eilenberg_cohomology(&MoravaLie::new(p(7), 4));
+        assert_eq!(stats.total_dim, 3440);
+        // Poincaré self-duality of Lie-algebra cohomology.
+        let mut rev = stats.betti.clone();
+        rev.reverse();
+        assert_eq!(stats.betti, rev);
     }
 }

@@ -174,15 +174,20 @@ later; the total dimension is the honest first milestone.
   to his (he derives it via deformations/spectral sequences, not computation). Given the field's track
   record — Ravenel's own first-edition `H^*(S(2))` at `p=3` was wrong until Henn caught it — this
   independent check has real value.
-- `n = 5` (complex 2^25 ≈ 33.5M): **still open — deliberately not attempted by this pass.** The
-  current implementation enumerates all `2^N` monomials densely (bucketing by `i`-weight, then dense
-  `row_reduce` per block) and refuses `N > 20` (`MAX_DIM` in `cohomology.rs`) to avoid OOM. At `n = 5`
-  even a single mid-weight block has millions of monomials, so a dense pass is out regardless. Getting
-  `n = 5` needs (a) a *streaming* subset enumerator that generates each `(weight, degree)` block by
-  subset-sum rather than materializing all `2^{25}`, and (b) sparse rank over `F_p` (or borrowing
-  Salch's height-shifting). Partial data — specific `i`-weights, or the low/high cohomological corners
-  — is the reachable and genuinely novel next step. A confirmed total of `128512` would be a real
-  result.
+- `n = 5` (complex 2^25 ≈ 33.5M): **partial data reachable; full total still open.** The
+  implementation now *streams* — it enumerates each `i`-weight block by a pruned subset-sum walk
+  (`enumerate_weight`), holding one weight in memory at a time, and ranks each `(weight, degree)`
+  block with **sparse incremental row reduction** (`block_rank`/`sparse_rank`, target bitmasks used
+  directly as columns) instead of a dense matrix. Independent blocks are ranked in **parallel**
+  (`maybe_rayon`; build `--features concurrent`). This lets `chromatic_finite_ce -- 5 <cap>` compute
+  every `n = 5` weight whose blocks fit under `<cap>`; e.g. `cap = 100000` clears 44 of the 76
+  weights (all the low/high corners) in ~15 s on 4 cores. The barrier to the *full* total `128512` is
+  the ~30 middle weights whose largest `(weight, degree)` blocks run `106k … 565k` square — the rank
+  there needs either the **`Z/n`-equivariant (character) splitting** (`p ≡ 1 mod n`, e.g. `p = 11`,
+  splits every block into `n` pieces ~`1/n` the size with all arithmetic staying in `F_p`), a
+  **structured / black-box sparse solver** (Wiedemann/Lanczos over `F_p`), or Salch's height-shifting.
+  Partial `n = 5` data — specific `i`-weights and the cohomological corners — is genuinely novel; a
+  confirmed total of `128512` would be a real result.
 
   > **Block-grading note (what actually splits the complex).** The differential is *not* homogeneous
   > for the topological internal degree `2(p^i−1)p^j` (this is the §6 trap). It *is* homogeneous for
@@ -195,11 +200,13 @@ later; the total dimension is the honest first milestone.
 1. ✓ `crates/algebra/src/lie/morava_lie.rs`: `MoravaLie { n, p, gens, convention }`, fixed index order
    `index(i,j) = (i−1)n + j`, structure constants from the §2 bracket (`m = n`). Bracket unit-tested
    for antisymmetry + Jacobi at `n = 2, 3, 4`.
-2. ✓ `crates/algebra/src/lie/cohomology.rs`: `Λ^•(V)` as bitmasks, CE differential built as `F_p`
-   matrices (`fp::matrix::Matrix`), each `d_k` ranked via `row_reduce`; `d² = 0` is unit-tested.
+2. ✓ `crates/algebra/src/lie/cohomology.rs`: `Λ^•(V)` streamed by `i`-weight (`enumerate_weight`), CE
+   differential ranked by sparse incremental elimination (`block_rank`/`sparse_rank`) in parallel
+   (`maybe_rayon`); `d² = 0` is unit-tested.
 3. ✓ `dim H^* = 2^N − 2 Σ rank d_k`; asserts 2, 12, 152 at `n = 1, 2, 3`. **Gate passing.**
 4. ✓ `n = 4` confirmed `3440` (`examples/chromatic_finite_ce.rs`).
-5. ☐ `n = 5` — open; see the feasibility note above for the two upgrades it needs.
+5. ◐ `n = 5` — *partial* data reachable now (`chromatic_finite_ce -- 5 <cap>`); the full total needs
+   the character splitting / black-box sparse rank of the feasibility note above.
 
 ---
 

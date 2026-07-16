@@ -11,5 +11,7 @@
 pub mod cohomology;
 pub mod morava_lie;
 
-pub use cohomology::{CohomologyStats, chevalley_eilenberg_cohomology};
-pub use morava_lie::MoravaLie;
+pub use cohomology::{
+    CohomologyStats, Options, WeightReport, chevalley_eilenberg_cohomology, cohomology_by_weight,
+};
+pub use morava_lie::{BracketConvention, MoravaLie};
