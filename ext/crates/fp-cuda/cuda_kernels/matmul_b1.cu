@@ -421,9 +421,13 @@ typedef unsigned long long u64_t;
 // A: gather the natural row-major (m_orig × sa_orig) limb array into row-major
 // K-major tiles (TM rows × KL u64), ordered K-chunk-major then M-tile-major.
 // Rows/limbs past the real extent (padding M→m_padded, K→k_padded) read as zero.
+// `sa_orig` is the logical K-limb count (columns to pack); `a_stride` is the
+// source row stride in limbs, which may exceed sa_orig when A is a sub-block of
+// a wider buffer (e.g. a wide-panel multiplier matrix L stored with stride bl
+// but used with only ceil(pr/64) occupied limbs).
 extern "C" __global__ void pack_a(
     u64_t* __restrict__ out, const u64_t* __restrict__ a,
-    unsigned m_orig, unsigned sa_orig, unsigned m_tiles, unsigned total)
+    unsigned m_orig, unsigned sa_orig, unsigned a_stride, unsigned m_tiles, unsigned total)
 {
     unsigned idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= total) return;
@@ -438,7 +442,7 @@ extern "C" __global__ void pack_a(
     unsigned global_kl  = kk * KL + kl;
     u64_t val = 0;
     if (global_row < m_orig && global_kl < sa_orig)
-        val = a[(u64_t)global_row * sa_orig + global_kl];
+        val = a[(u64_t)global_row * a_stride + global_kl];
     out[idx] = val;
 }
 
