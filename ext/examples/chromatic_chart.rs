@@ -16,7 +16,11 @@ use std::collections::BTreeMap;
 
 use algebra::lie::{MoravaLie, trigraded_cohomology};
 use fp::prime::ValidPrime;
-use sseq::{Adams, Product, Sseq, charting::SvgBackend, coordinates::Bidegree};
+use sseq::{
+    Adams, Product, Sseq,
+    charting::{SeqSeeBackend, SvgBackend},
+    coordinates::Bidegree,
+};
 
 fn is_prime(p: u32) -> bool {
     p >= 2 && (2..p).take_while(|k| k * k <= p).all(|k| p % k != 0)
@@ -81,14 +85,16 @@ fn main() -> anyhow::Result<()> {
     for (&(s, t), &d) in &cells {
         sseq.set_dimension(Bidegree::s_t(s as i32, t as i32), d);
     }
+    // Render. Dispatch on the output extension: `.json` -> SeqSee descriptor, else SVG. No
+    // differentials or products at large primes (the page is already E_∞).
     let file = std::fs::File::create(&out)?;
-    sseq.write_to_graph(
-        SvgBackend::new(file),
-        2,
-        false,
-        std::iter::empty::<&(String, Product<2>)>(),
-        |_| Ok(()),
-    )?;
-    println!("wrote SVG chart to {out}");
+    let empty = std::iter::empty::<&(String, Product<2>)>();
+    if out.ends_with(".json") {
+        sseq.write_to_graph(SeqSeeBackend::new(file), 2, false, empty, |_| Ok(()))?;
+        println!("wrote SeqSee JSON descriptor to {out}");
+    } else {
+        sseq.write_to_graph(SvgBackend::new(file), 2, false, empty, |_| Ok(()))?;
+        println!("wrote SVG chart to {out}");
+    }
     Ok(())
 }
