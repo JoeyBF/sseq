@@ -5,6 +5,7 @@
 
 #![deny(clippy::use_self, unsafe_op_in_unsafe_fn)]
 
+pub mod lie;
 pub mod module;
 pub mod steenrod_evaluator;
 pub(crate) mod steenrod_parser;
