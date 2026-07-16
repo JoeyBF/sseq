@@ -5,25 +5,46 @@ self-contained investigation: whether Nassau's tensor/field trick — already im
 crate for the mod‑2 Steenrod algebra — can be pointed at the **Morava stabilizer algebra** to
 compute the algebraic input to K(n)‑local (chromatic) homotopy.
 
-> **Update (phase 1 complete): height 1 at p = 2 implemented and validated.**
+> **Update (phase 1 complete): height 1 at p = 2 implemented and validated against Ravenel 6.3.21(a).**
 >
-> `gr S(1) = u(L(1))` is now implemented as a standalone `Algebra + Bialgebra` in
-> `crates/algebra/src/algebra/morava_stabilizer.rs` (`MoravaStabilizerAlgebra`). At `p = 2` it is
-> the exterior Hopf algebra `Λ(x_1, x_2, …)` on primitive generators with `|x_i| = 2(2^i − 1)`
-> (abelian `L(1)`, trivial restriction — the associated graded kills both the restriction and every
-> cross term of the BP coproduct). No `enum_dispatch` registration was needed: the resolution engine
-> is fully generic over `CC::Algebra`, and `MuAlgebra<false>` is a blanket impl over `Algebra`.
+> `gr S(1) = u(L(1)) = E_0 S(1)^*` is implemented as a standalone `Algebra + Bialgebra` in
+> `crates/algebra/src/algebra/morava_stabilizer.rs` (`MoravaStabilizerAlgebra`). No `enum_dispatch`
+> registration was needed: the resolution engine is fully generic over `CC::Algebra`, and
+> `MuAlgebra<false>` is a blanket impl over `Algebra`.
 >
-> The example `ext/examples/chromatic_grs1.rs` resolves `F_2` and confirms, at every computed
-> bidegree, that `Ext_{gr S(1)}(F_2, F_2) = F_2[h_1, h_2, …]` with `h_i ∈ (s,t) = (1, 2(2^i−1))` —
-> the algebraic (May `E_1`) page for the height-1 stabilizer. It *also* re-derives the same chart
-> through `field_resolution_ext` (`M = F_2`), so the full field-trick stack (antipode `χ`,
-> closed-form `δ_Q`) is confirmed to accept this new `Bialgebra`. Unit tests live alongside the
-> algebra. The May differentials that cut `F_2[h_i]` down to the genuine `H^*(S_1)` remain out of
-> scope, exactly as §5 warns.
+> **Get the algebra, not just the grading, right.** `L(1)` is abelian (green book Thm 6.3.3), but its
+> restriction is *not* trivial: `ξ(x_1) = 0` and `ξ(x_i) = x_{i+1}` for `i ≥ 2`. So the restricted
+> enveloping algebra collapses to
+>
+> ```text
+> gr S(1) = Λ(x_1) ⊗ F_2[x_2],   |x_1| = 2 (exterior),   |x_2| = 6 (polynomial),
+> ```
+> — **not** the exterior algebra `Λ(x_1, x_2, …)` on all the Lie generators. Grading the `x_i` by the
+> topological degree `2(2^i−1)` and treating them all as independent primitives makes the restriction
+> and the coproduct cross terms inhomogeneous; they silently vanish and you get the degenerate
+> `F_2[h_1, h_2, …]`. That is precisely the "wrong but plausible-looking chart" §5 warns about — the
+> first implementation fell into it and had to be corrected once the reference (green book 6.3) was in
+> hand. The correct answer (Ravenel Thm 6.3.21(a); at height 1 the May SS collapses, so this is
+> already `H^*(S(1))`) is
+>
+> ```text
+> Ext_{gr S(1)}(F_2, F_2) = P(h_1) ⊗ E(ρ_1) = F_2[h_1] ⊗ Λ(ρ_1),
+>     h_1 = h_{1,0} = [t_1] ∈ (s,t) = (1, 2),   ρ_1 = h_{2,0} = [t_2] ∈ (s,t) = (1, 6).
+> ```
+>
+> The example `ext/examples/chromatic_grs1.rs` resolves `F_2` and confirms this at every computed
+> bidegree, and *also* re-derives the same chart through `field_resolution_ext` (`M = F_2`), so the
+> full field-trick stack (antipode `χ`, closed-form `δ_Q`) is confirmed to accept this new
+> `Bialgebra`. Unit tests live alongside the algebra.
+>
+> **Lesson for height ≥ 2.** Pin conventions against green book 6.3 *first*. The reader that computes
+> Ext is agnostic to the grading you hand it and will happily return a wrong chart; correctness comes
+> from (i) the restriction map (Thm 6.3.3) and (ii) a grading in which both the bracket and the
+> restriction `ξ(x) = x^{[p]}` (degree `p·|x|`) are homogeneous. For `n ≥ 2` the bracket is genuinely
+> non-abelian — the substantive §3a product work.
 >
 > Not yet done: the `HopfAlgebra` refactor of §3e (optional; the generic `Antipode` already works),
-> odd primes, and height ≥ 2 (where `L(n)` is non-abelian — the substantive §3a product work).
+> odd primes, and height ≥ 2.
 
 The one-line thesis: *the field-trick stack is generic over `Bialgebra`, and the associated graded
 of the Morava stabilizer algebra is a connected, finite-type, cocommutative `Bialgebra` over
