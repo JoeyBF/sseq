@@ -13,7 +13,8 @@ pub mod equivariant;
 pub mod morava_lie;
 
 pub use cohomology::{
-    CohomologyStats, Options, WeightReport, chevalley_eilenberg_cohomology, cohomology_by_weight,
+    CohomologyStats, Options, WeightReport, bigraded_cohomology, chevalley_eilenberg_cohomology,
+    cohomology_by_weight,
 };
 pub use equivariant::equivariant_total_dim;
 pub use morava_lie::{BracketConvention, MoravaLie};

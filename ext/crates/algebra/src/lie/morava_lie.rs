@@ -127,6 +127,33 @@ impl MoravaLie {
         self.gens[a].0
     }
 
+    /// The modulus `p^n - 1` of the internal grading (see [`Self::internal_degree`]).
+    pub fn internal_modulus(&self) -> u64 {
+        (self.prime.as_u32() as u64).pow(self.height) - 1
+    }
+
+    /// The internal (topological) degree of generator `a`, valued in `Z/(p^n - 1)`:
+    ///
+    /// ```text
+    /// t_{i,j} = p^j (p^i - 1)  ==  p^{i+j} - p^j   (mod p^n - 1).
+    /// ```
+    ///
+    /// This is the *periodic* ("chromatic") refinement of Ravenel's topological degree
+    /// `2(p^i - 1)p^j`: because `L(n, n)` identifies `j` mod `n` and `p^n ≡ 1 (mod p^n - 1)`, the
+    /// honest topological degree is only well-defined mod `p^n - 1`, and it is exactly for *this*
+    /// grading — not the naïve `Z`-valued one (the §6 trap) — that the bracket is homogeneous:
+    /// `t_{i,j} + t_{k,l} = t_{i+k, ·}` for both bracket terms. Hence the Chevalley–Eilenberg
+    /// differential preserves it and `H^*(L(n,n))` is bigraded by `(s, t)`, `t ∈ Z/(p^n - 1)`. (We
+    /// drop Ravenel's uniform factor of `2`, which only rescales `t`.)
+    pub fn internal_degree(&self, a: usize) -> u64 {
+        let (i, j) = self.gens[a];
+        let m = self.internal_modulus();
+        let p = self.prime.as_u32() as u64;
+        let pj = p.pow(j) % m;
+        let pi_minus_1 = (p.pow(i) % m + m - 1) % m;
+        pj * pi_minus_1 % m
+    }
+
     /// The index of the generator `x_{i, j}` (`1 <= i <= n`, `j` taken mod `n`), or `None` if
     /// `i` is out of range `1..=n`.
     fn index_of(&self, i: u32, j: u32) -> Option<usize> {
