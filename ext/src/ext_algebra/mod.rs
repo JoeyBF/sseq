@@ -202,14 +202,14 @@ pub struct ExtAlgebra<CC: FreeChainComplex, CCU: FreeChainComplex<Algebra = CC::
     /// One multiplication map per generator of $\Ext(M, k)$, built and extended on demand. Used by
     /// the chain-map product path (minimal resolutions).
     products: DashMap<BidegreeGenerator, Arc<ResolutionHomomorphism<CC, CCU>>>,
-    /// One chain self-map of the unit per generator of $\Ext(k, k)$, built on demand. Used by the
-    /// **cup** product path (the closed-form field trick), where products are read off the cup
-    /// instead of chain-map lifts on a materialised $Q_\bullet$.
+    /// One chain self-map of the unit per generator of $\Ext(k, k)$, built on demand. This is the
+    /// single self-map cache: the **cup** product path (the closed-form field trick) and *every*
+    /// Massey bracket read their cup matrices off these maps (via
+    /// [`cup_class_matrix`](Self::cup_class_matrix)), realising a general class as a linear
+    /// combination of the per-generator maps rather than building a separate map per class. Because
+    /// they all share one source keyed by the generator, they are also unified on disk (saved once,
+    /// under the same `prod_{n}_{s}_{idx}` name as the unit's own product maps).
     unit_maps: DashMap<BidegreeGenerator, Arc<ResolutionHomomorphism<CCU, CCU>>>,
-    /// Chain self-maps of the unit for a general $\Ext(k, k)$ *class* (not just a generator), cached
-    /// so a Massey sweep with fixed first/second factor reuses (and only incrementally extends) the
-    /// same `f_a`, `f_b` maps across every third factor.
-    unit_class_maps: DashMap<BidegreeElement, Arc<ResolutionHomomorphism<CCU, CCU>>>,
     /// Cup matrices `{y_j ∪ -}` keyed by `(shift, b)` (the multiplier and multiplicand bidegrees).
     /// They depend only on those two bidegrees, not on the multiplier's coordinates, so caching them
     /// collapses the per-generator recomputation a Massey kernel would otherwise do.
@@ -263,7 +263,6 @@ impl<CC: FreeChainComplex> ExtAlgebra<CC, CC> {
             unit,
             products: DashMap::new(),
             unit_maps: DashMap::new(),
-            unit_class_maps: DashMap::new(),
             cup_cache: DashMap::new(),
             delta_qi_cache: DashMap::new(),
             sequential_source: false,
@@ -303,7 +302,6 @@ where
             unit,
             products: DashMap::new(),
             unit_maps: DashMap::new(),
-            unit_class_maps: DashMap::new(),
             cup_cache: DashMap::new(),
             delta_qi_cache: DashMap::new(),
             sequential_source: false,
@@ -783,26 +781,6 @@ where
             }
         }
         out
-    }
-
-    /// The chain self-map $f_x\colon P_\bullet \to P_\bullet$ of the unit realising a general class
-    /// `x` of $\Ext(k, k)$, cached. A Massey sweep with a fixed factor reuses (and only
-    /// incrementally extends) one map across every third factor, rather than rebuilding it each time.
-    pub(crate) fn unit_class_map(
-        &self,
-        x: &BidegreeElement,
-    ) -> Arc<ResolutionHomomorphism<CCU, CCU>> {
-        if let Some(map) = self.unit_class_maps.get(x) {
-            return Arc::clone(&map);
-        }
-        let hom = Arc::new(ResolutionHomomorphism::from_class(
-            format!("cup_{x}"),
-            Arc::clone(&self.unit),
-            Arc::clone(&self.unit),
-            x.degree(),
-            &x.vec().iter().collect::<Vec<_>>(),
-        ));
-        Arc::clone(self.unit_class_maps.entry(x.clone()).or_insert(hom).value())
     }
 
     /// Left-multiplication by the class `x` (in $\Ext(M, k)$), applied to every basis generator of

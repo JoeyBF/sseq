@@ -127,14 +127,16 @@ where
     fn massey_bracket_of(
         &self,
         a: &BidegreeElement,
+        b: &BidegreeElement,
         b_hom: Arc<ResolutionHomomorphism<CCU, CCU>>,
         shift: Bidegree,
         c: &BidegreeElement,
     ) -> Option<MasseyResult> {
         // On a non-minimal resolution (the field trick attaches a cup product) the chain-map bracket
-        // below degenerates; dispatch to the cochain-DGA bracket instead.
+        // below degenerates; dispatch to the cochain-DGA bracket instead. The DGA path reads its cup
+        // matrices off the shared per-generator self-map cache, so it needs `b` itself, not `b_hom`.
         if let Some(cup) = self.cup() {
-            return self.massey_bracket_dga(&Arc::clone(cup), a, b_hom, shift, c);
+            return self.massey_bracket_dga(&Arc::clone(cup), a, b, shift, c);
         }
 
         let p = self.prime();
@@ -206,14 +208,16 @@ where
     /// The bracket $\langle a, b, c\rangle$ via the **cochain DGA**, for a non-minimal resolution
     /// carrying a [`CochainCup`]. Because the unit is minimal ($a\cdot b = 0$ at the cochain level,
     /// so the $a\cup b$ null-homotopy $u = 0$), the bracket is $[\,a \cup v\,]$ with $\delta_Q v = b
-    /// \cup c$. The cup reads the chain self-maps `b_hom` (= $f_b$) and `f_a`, and $\delta_Q$ is the
-    /// attached [`differential`](Self::differential); every operand stays non-degenerate on the
-    /// non-minimal $Q_\bullet$. Returns `None` if `b·c ≠ 0` or the range is uncomputed.
+    /// \cup c$. Both cups ($b\cup c$ and $a\cup v$) are read via
+    /// [`cup_class_matrix`](Self::cup_class_matrix), so they draw on the *same* per-generator unit
+    /// self-map cache as the product path and the family sweep — no bracket-specific self-map is ever
+    /// built. $\delta_Q$ is the attached [`differential`](Self::differential). Returns `None` if `b·c
+    /// ≠ 0` or the range is uncomputed.
     fn massey_bracket_dga(
         &self,
         cup: &Arc<dyn CochainCup<CCU>>,
         a: &BidegreeElement,
-        b_hom: Arc<ResolutionHomomorphism<CCU, CCU>>,
+        b: &BidegreeElement,
         shift: Bidegree,
         c: &BidegreeElement,
     ) -> Option<MasseyResult> {
@@ -222,8 +226,7 @@ where
 
         let c_deg = c.degree();
         let tot = c_deg + shift;
-        let b_deg = b_hom.shift;
-        let bc_deg = b_deg + c_deg;
+        let bc_deg = b.degree() + c_deg;
         let v_deg = bc_deg + Bidegree::n_s(1, -1);
         // Every cochain read (b∪c at `bc_deg`, its δ-preimage `v`, the bracket `tot`) must be in the
         // computed box. `has_computed_bidegree` is panic-safe unlike `cohomology`/`cochain_dimension`.
@@ -234,9 +237,8 @@ where
         }
         self.cohomology(tot)?;
 
-        // b∪c as a cochain: cup by b (realised by `b_hom`) applied to the cocycle rep of c.
-        b_hom.extend_through_stem(bc_deg);
-        let bc_mat = cup.cup_matrix(&b_hom, c_deg.s(), c_deg.t(), b_deg);
+        // b∪c as a cochain: cup by b applied to the cocycle rep of c, through the shared cup cache.
+        let bc_mat = self.cup_class_matrix(cup, b, c_deg);
         let lc = self.lift(c);
         let mut bc = FpVector::new(p, bc_mat.columns());
         bc_mat.apply(bc.as_slice_mut(), 1, lc.vec());
@@ -244,10 +246,8 @@ where
         // v with δ_Q v = b∪c; `None` iff b·c ≠ 0 (b∪c is not a coboundary).
         let v = self.delta_preimage(v_deg, bc.as_slice())?;
 
-        // a∪v, then project to an Ext class. `f_a` is cached (incrementally extended across a sweep).
-        let f_a = self.unit_class_map(a);
-        f_a.extend_through_stem(tot);
-        let av_mat = cup.cup_matrix(&f_a, v_deg.s(), v_deg.t(), a.degree());
+        // a∪v, then project to an Ext class — again through the shared cup cache.
+        let av_mat = self.cup_class_matrix(cup, a, v_deg);
         let mut av = FpVector::new(p, av_mat.columns());
         av_mat.apply(av.as_slice_mut(), 1, v.as_slice());
 
@@ -396,7 +396,8 @@ where
             };
             for row in kernel.iter() {
                 let c = BidegreeElement::new(c_deg, row.to_owned());
-                let Some(result) = self.massey_bracket_of(a, Arc::clone(&b_hom), shift, &c) else {
+                let Some(result) = self.massey_bracket_of(a, b, Arc::clone(&b_hom), shift, &c)
+                else {
                     continue;
                 };
                 if result.contains_zero() {
@@ -636,7 +637,7 @@ where
             _ => return None,
         }
 
-        self.massey_bracket_of(a, b_hom, shift, c)
+        self.massey_bracket_of(a, b, b_hom, shift, c)
     }
 }
 
