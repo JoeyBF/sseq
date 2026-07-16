@@ -73,17 +73,45 @@ fn main() -> anyhow::Result<()> {
         println!("  ({} occupied (n,s,weight) cells — see the SVG)", chart.len());
     }
 
-    // Build the E_2( = E_∞) page and render. Dimensions only (no differentials at large primes); we
-    // sum the weight grading into each (s, t) cell and pass the honest (s, t) bidegree — the plotter
-    // converts to the Adams (stem n = t − s, filtration s) display itself.
+    // Sum the weight grading into each (s, t) cell.
     let mut cells: BTreeMap<(usize, u64), usize> = BTreeMap::new();
     for (deg, &d) in &chart {
         let t = (deg.n + deg.s as i64) as u64; // t = n + s, a representative in [0, modulus)
         *cells.entry((deg.s, t)).or_insert(0) += d;
     }
+
+    // Two displays:
+    //   * Adams (pass `adams` as a 4th arg): honest (s, t), plotter draws stem n = t − s on x.
+    //   * default: plot t directly on x (no diagonal shift) and TRIM empty columns — reindex the
+    //     occupied t-values to consecutive integers. Since every t is a multiple of p − 1 (as
+    //     t_{i,j} = pʲ(pⁱ − 1) ≡ 0 mod p − 1), and most multiples are still empty, this collapses a
+    //     ~16806-wide height-5 chart down to just its populated columns.
+    let adams = std::env::args().any(|a| a == "adams");
     let mut sseq = Sseq::<2, Adams>::new(ValidPrime::new(p));
-    for (&(s, t), &d) in &cells {
-        sseq.set_dimension(Bidegree::s_t(s as i32, t as i32), d);
+    if adams {
+        for (&(s, t), &d) in &cells {
+            sseq.set_dimension(Bidegree::s_t(s as i32, t as i32), d);
+        }
+    } else {
+        // Occupied t-values, in order, mapped to consecutive columns.
+        let mut occupied_t: Vec<u64> = cells.keys().map(|&(_, t)| t).collect();
+        occupied_t.sort_unstable();
+        occupied_t.dedup();
+        let col: std::collections::HashMap<u64, i32> = occupied_t
+            .iter()
+            .enumerate()
+            .map(|(i, &t)| (t, i as i32))
+            .collect();
+        println!(
+            "  trimmed (t,s) display: {} occupied t-columns (of {} multiples of p−1 = {})",
+            occupied_t.len(),
+            modulus / (p as u64 - 1),
+            p - 1,
+        );
+        for (&(s, t), &d) in &cells {
+            // x = trimmed column, y = s.  (Bidegree::n_s puts arg0 on the x-axis directly.)
+            sseq.set_dimension(Bidegree::n_s(col[&t], s as i32), d);
+        }
     }
     // Render. Dispatch on the output extension: `.json` -> SeqSee descriptor, else SVG. No
     // differentials or products at large primes (the page is already E_∞).
