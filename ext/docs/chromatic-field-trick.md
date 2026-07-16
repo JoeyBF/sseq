@@ -80,7 +80,7 @@ The field-trick stack does **not** know anything Steenrod-specific. Concrete poi
 
 | Piece | Location | Genericity |
 |---|---|---|
-| Antipode `χ`, computed from `decompose` + `coproduct` | `src/ext_algebra/tensor_resolution.rs` (`struct Antipode<A: Bialgebra>`) | any `A: Bialgebra` |
+| Antipode `χ`, computed from `decompose` + `coproduct`, memoized | `src/ext_algebra/tensor_resolution.rs` (`struct Antipode<A: Bialgebra>`) | any `A: Bialgebra` (see §3e — promote to a `HopfAlgebra` trait) |
 | Closed-form coboundary `δ_Q` of `Q• = P• ⊗ M` | `src/ext_algebra/tensor_resolution.rs` (`TensorResolutionDifferential`) | any `CC: FreeChainComplex`, `CC::Algebra: Bialgebra` |
 | Additive Ext of a module by the trick | `field_resolution_ext[_with_save_dir]` (same file) | ditto |
 | Products + Massey (closed-form cup) | `field_resolution_products[_with_save_dir]` (same file); `src/ext_algebra/massey.rs` | ditto |
@@ -146,6 +146,54 @@ Instead, mirror their body with your algebra:
 
 Everything from stem-100 C2 (products, Massey, `prod_*` sharing, δ_Q disk cache) then applies
 verbatim.
+
+### 3e. Recommended refactor: promote the antipode to a `HopfAlgebra` trait
+
+Today the antipode lives in a standalone `Antipode<A: Bialgebra>` struct (`tensor_resolution.rs`) that
+derives `χ` generically (Milnor's recursion on the `decompose` atoms, `χ(ab)=χ(b)χ(a)`), memoized in
+its own `DashMap`. That is correct — for a *connected graded* bialgebra the antipode is uniquely
+determined by the coproduct, so `Bialgebra` already suffices and no `HopfAlgebra` trait is needed for
+correctness. But `gr S(n)` is the first algebra where the antipode is *trivial* (cocommutative,
+`χ = −1` on primitives), and the generic recursion is pointless there. That is the motivation to add:
+
+```rust
+// crates/algebra — enum_dispatched like Bialgebra
+pub trait HopfAlgebra: Bialgebra {
+    fn antipode(&self, deg: i32, idx: usize) -> FpVector;
+}
+```
+
+**Cache placement — the one design decision.** The memoization must be keyed *per algebra instance*
+(the `(deg, idx)` key is only meaningful relative to one algebra; a process-global `static` cache
+would collide across algebras — Milnor vs Adem vs a profiled subalgebra vs `gr S(n)` all have
+different basis elements at the same `(deg, idx)`, and would cross-contaminate tests in one binary).
+So the cache lives **on the algebra**, exactly like the existing multiplication/basis caches
+(`&self` interior mutability). Factor the generic recursion into a reusable component that holds only
+the cache:
+
+```rust
+pub struct AntipodeCache { cache: DashMap<(i32, usize), FpVector> }
+impl AntipodeCache {
+    // memoized generic recursion; recursive sub-calls route back through `get`, so mid-recursion
+    // memoization is preserved. Does NOT hold Arc<A> — it lives on the algebra, takes it as a param.
+    pub fn get<A: Bialgebra>(&self, alg: &A, deg: i32, idx: usize) -> FpVector { /* … */ }
+}
+
+struct MilnorAlgebra { /* … */ antipode_cache: AntipodeCache }
+impl HopfAlgebra for MilnorAlgebra {
+    fn antipode(&self, d: i32, i: usize) -> FpVector { self.antipode_cache.get(self, d, i) }
+}
+```
+
+`gr S(n)` skips `AntipodeCache` entirely and returns `−x` directly (no state, cocommutative). `ext`
+then deletes its `Antipode` struct, `TensorResolutionDifferential` calls `algebra.antipode(deg, idx)`,
+and the field-trick bounds go `CC::Algebra: Bialgebra → HopfAlgebra`.
+
+**Timing.** This is *pure prep* — it changes nothing measurable for the Steenrod computations that
+exist today (the antipode is already cached and off the hot path; a closed-form Steenrod antipode
+would **not** save time, so do not bother writing one). Land this refactor **in the same pass that
+adds `gr S(n)`**, with the new algebra as the immediate second `HopfAlgebra` impl that justifies the
+abstraction — not as speculative surgery on the shared `algebra` crate beforehand.
 
 ---
 
