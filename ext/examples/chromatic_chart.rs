@@ -12,9 +12,9 @@
 //!
 //! Usage: `cargo run --release --features concurrent --example chromatic_chart -- [n] [p] [out.svg]`
 
-use std::io::Write as _;
+use std::collections::BTreeMap;
 
-use algebra::lie::{MoravaLie, bigraded_cohomology};
+use algebra::lie::{MoravaLie, trigraded_cohomology};
 use fp::prime::ValidPrime;
 use sseq::{Adams, Product, Sseq, charting::SvgBackend, coordinates::Bidegree};
 
@@ -43,33 +43,41 @@ fn main() -> anyhow::Result<()> {
 
     let lie = MoravaLie::new(ValidPrime::new(p), n);
     let modulus = lie.internal_modulus();
-    let chart = bigraded_cohomology(&lie);
+    // Trigraded H^{n,s,w}, keyed (stem n = t−s, filtration s, i-weight w) — the sseq display order.
+    let chart = trigraded_cohomology(&lie);
     let total: usize = chart.values().sum();
 
-    println!("H^{{s,t}}(L({n},{n})) over F_{p},  t ∈ Z/{modulus},  total dim = {total}");
-    // Cohomological Betti row (Σ_t H^{s,t}) — the coarse invariant, always shown.
+    println!(
+        "H^*(L({n},{n})) over F_{p},  stem n = t−s,  t ∈ Z/{modulus},  total dim = {total}",
+    );
+    // Cohomological Betti row (Σ over n, w) — the coarse invariant, always shown.
     let mut per_s = vec![0usize; lie.dim() + 1];
-    for (&(s, _t), &d) in &chart {
-        per_s[s] += d;
+    for (deg, &d) in &chart {
+        per_s[deg.s] += d;
     }
     while per_s.last() == Some(&0) {
         per_s.pop();
     }
-    println!("  H^s dims (Σ_t): {per_s:?}");
-    // Full (s,t) table only when compact.
-    if chart.len() <= 80 {
-        println!("  {:>3}  {:>6}  {:>5}", "s", "t", "dim");
-        for (&(s, t), &d) in &chart {
-            println!("  {s:>3}  {t:>6}  {d:>5}");
+    println!("  H^s dims (Σ_{{n,w}}): {per_s:?}");
+    // Full (n, s, weight) table only when compact.
+    if chart.len() <= 100 {
+        println!("  {:>4}  {:>3}  {:>4}  {:>4}", "n", "s", "wt", "dim");
+        for (deg, &d) in &chart {
+            println!("  {:>4}  {:>3}  {:>4}  {:>4}", deg.n, deg.s, deg.weight, d);
         }
     } else {
-        println!("  ({} occupied (s,t) bidegrees — see the SVG)", chart.len());
+        println!("  ({} occupied (n,s,weight) cells — see the SVG)", chart.len());
     }
 
-    // Build the E_2( = E_∞) page and render. Dimensions only — no differentials at large primes.
+    // Build the E_2( = E_∞) page and render, in the (stem n, filtration s) display. Dimensions only
+    // (no differentials at large primes); sum the weight grading into each (n, s) cell.
+    let mut cells: BTreeMap<(i64, usize), usize> = BTreeMap::new();
+    for (deg, &d) in &chart {
+        *cells.entry((deg.n, deg.s)).or_insert(0) += d;
+    }
     let mut sseq = Sseq::<2, Adams>::new(ValidPrime::new(p));
-    for (&(s, t), &d) in &chart {
-        sseq.set_dimension(Bidegree::s_t(s as i32, t as i32), d);
+    for (&(nn, s), &d) in &cells {
+        sseq.set_dimension(Bidegree::n_s(nn as i32, s as i32), d);
     }
     let file = std::fs::File::create(&out)?;
     sseq.write_to_graph(
@@ -79,8 +87,6 @@ fn main() -> anyhow::Result<()> {
         std::iter::empty::<&(String, Product<2>)>(),
         |_| Ok(()),
     )?;
-    // Flush note.
-    std::io::stdout().flush().ok();
     println!("wrote SVG chart to {out}");
     Ok(())
 }

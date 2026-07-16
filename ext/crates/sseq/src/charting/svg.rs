@@ -83,14 +83,19 @@ impl<T: io::Write> SvgBackend<T> {
     fn get_coords(&self, g: BidegreeGenerator) -> (f32, f32, f32) {
         let n = *self.num_nodes.get(&g.degree()).unwrap();
 
+        let base_x = (g.x() * Self::GRID_WIDTH + Self::MARGIN) as f32;
+        let base_y = ((self.max - g.degree()).y() * Self::GRID_WIDTH + Self::MARGIN) as f32;
+
+        // More classes than we have dot-patterns for: the cell is drawn as a count label instead of
+        // dots (see `node`), so anchor anything referencing it (e.g. structlines) at the cell centre.
+        if n > PATTERNS.len() {
+            let (radius, _) = PATTERNS[PATTERNS.len() - 1];
+            return (radius, base_x, base_y);
+        }
+
         let (radius, patterns) = PATTERNS[n - 1];
         let offset = patterns[g.idx()];
-
-        (
-            radius,
-            (g.x() * Self::GRID_WIDTH + Self::MARGIN) as f32 + offset.0,
-            ((self.max - g.degree()).y() * Self::GRID_WIDTH + Self::MARGIN) as f32 + offset.1,
-        )
+        (radius, base_x + offset.0, base_y + offset.1)
     }
 
     pub fn new(out: T) -> Self {
@@ -161,6 +166,18 @@ impl<T: io::Write> Backend for SvgBackend<T> {
             return Ok(());
         }
         self.num_nodes.insert(b, n);
+
+        // Beyond the available dot-patterns, draw the class count as a number rather than dots (and
+        // rather than panicking). Common convention for dense charts.
+        if n > PATTERNS.len() {
+            let x = (b.x() * Self::GRID_WIDTH + Self::MARGIN) as f32;
+            let y = ((self.max - b).y() * Self::GRID_WIDTH + Self::MARGIN) as f32;
+            writeln!(
+                self.out,
+                r#"<text x="{x}" y="{y}" text-anchor="middle" dominant-baseline="middle" font-size="10">{n}</text>"#,
+            )?;
+            return Ok(());
+        }
 
         for k in 0..n {
             let (r, x, y) = self.get_coords(BidegreeGenerator::new(b, k));

@@ -191,18 +191,29 @@ pub fn cohomology_by_weight(lie: &MoravaLie, opts: Options) -> Vec<WeightReport>
     reports
 }
 
-/// The **bigraded** cohomology `dim H^{s,t}(L(n,n))`, `s` the cohomological degree and
-/// `t ∈ Z/(p^n − 1)` the internal degree of [`MoravaLie::internal_degree`]. Returns a sorted map
-/// `(s, t) -> dim`, omitting zero entries.
+/// A location in the trigraded chart of `H^*(L(n,n))`, in the order the spectral-sequence display
+/// uses: stem `n = t − s`, filtration `s`, and `i`-weight `w` (all preserved by the differential
+/// except `s`, which it raises by 1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ChartDegree {
+    /// Stem `n = t − s` (the `x`-axis of the standard `(n, s)` chart).
+    pub n: i64,
+    /// Cohomological / May-filtration degree `s` (the `y`-axis).
+    pub s: usize,
+    /// `i`-weight `w = Σ i` (the natural third grading).
+    pub weight: u32,
+}
+
+/// The **trigraded** cohomology `dim H^{n,s,w}(L(n,n))`, keyed as `(stem n = t − s, s, i-weight w)`
+/// — the order in which bigraded spectral sequences are displayed (`n` on the `x`-axis, `s` on the
+/// `y`-axis), with the `i`-weight as the third grading.
 ///
-/// The differential preserves both the `i`-weight and `t`, so the complex splits into
-/// `(i-weight, t, s)` blocks — finer than the weight-only decomposition of [`cohomology_by_weight`],
-/// hence smaller and faster. Ranks are summed over `i`-weight (the differential is block-diagonal in
-/// it) to give `rank(d_s|_t)`, and `H^{s,t} = dim C^{s,t} − rank(d_s|_t) − rank(d_{s-1}|_t)`.
-///
-/// `Σ_t H^{s,t}` equals the `s`-graded Betti number, and `Σ_{s,t} H^{s,t}` the total dimension — both
-/// asserted in tests.
-pub fn bigraded_cohomology(lie: &MoravaLie) -> BTreeMap<(usize, u64), usize> {
+/// The internal degree `t ∈ Z/(p^n − 1)` is [`MoravaLie::internal_degree`]; `n = t − s`. The
+/// differential preserves both `t` and the `i`-weight while raising `s`, so the complex splits into
+/// `(weight, t, s)` blocks and `H^{n,s,w} = dim C − rank(d_s) − rank(d_{s−1})` within each `(w, t)`
+/// column. We parallelize over `i`-weight (each weight ranks all of its small `(t, s)` blocks), which
+/// keeps memory low and avoids per-block task overhead.
+pub fn trigraded_cohomology(lie: &MoravaLie) -> BTreeMap<ChartDegree, usize> {
     let n_dim = lie.dim();
     let p = lie.prime().as_u32();
     let modulus = lie.internal_modulus();
@@ -210,53 +221,90 @@ pub fn bigraded_cohomology(lie: &MoravaLie) -> BTreeMap<(usize, u64), usize> {
     let weights: Vec<u32> = (0..n_dim).map(|a| lie.weight(a)).collect();
     let int_deg: Vec<u64> = (0..n_dim).map(|a| lie.internal_degree(a)).collect();
     let max_weight: u32 = weights.iter().sum();
-
-    // dim C^{s,t}, and the ranking tasks (one per (weight, t, s) block, keyed by (t, s) for aggregation).
-    let mut cdim: HashMap<(usize, u64), usize> = HashMap::new();
-    let mut tasks: Vec<((u64, usize), Vec<u32>)> = Vec::new();
-    for w in 0..=max_weight {
-        let mut by_ts: HashMap<(u64, usize), Vec<u32>> = HashMap::new();
-        enumerate_weight(&weights, w, &mut |mask| {
-            let s = mask.count_ones() as usize;
-            let mut t = 0u64;
-            let mut bits = mask;
-            while bits != 0 {
-                let a = bits.trailing_zeros() as usize;
-                bits &= bits - 1;
-                t = (t + int_deg[a]) % modulus;
-            }
-            by_ts.entry((t, s)).or_default().push(mask);
-        });
-        for ((t, s), masks) in by_ts {
-            *cdim.entry((s, t)).or_insert(0) += masks.len();
-            tasks.push(((t, s), masks));
-        }
-    }
-
-    // Rank each block in parallel; d preserves (weight, t) so rank(d_s|_t) sums over weights.
     let cobracket_ref = &cobracket;
-    let ranked: Vec<((u64, usize), usize)> = tasks
-        .into_maybe_par_iter()
-        .map(|((t, s), masks)| ((t, s), block_rank(&masks, cobracket_ref, p)))
-        .collect();
-    let mut ranks: HashMap<(u64, usize), usize> = HashMap::new();
-    for ((t, s), r) in ranked {
-        *ranks.entry((t, s)).or_insert(0) += r;
+    let weights_ref = &weights;
+    let int_deg_ref = &int_deg;
+
+    // Phase 1 (parallel over i-weight): enumerate each weight and split it into `(weight, t, s)`
+    // blocks. `dim C^{s,t,w}` is read off directly. Weights are independent (d is block-diagonal in
+    // weight), and this holds only one weight's monomials per task.
+    let per_weight: Vec<(Vec<((u32, u64, usize), Vec<u32>)>, Vec<((u32, u64, usize), usize)>)> =
+        (0..=max_weight)
+            .collect::<Vec<_>>()
+            .into_maybe_par_iter()
+            .map(|w| {
+                let mut by_ts: HashMap<(u64, usize), Vec<u32>> = HashMap::new();
+                enumerate_weight(weights_ref, w, &mut |mask| {
+                    let s = mask.count_ones() as usize;
+                    let mut t = 0u64;
+                    let mut bits = mask;
+                    while bits != 0 {
+                        let a = bits.trailing_zeros() as usize;
+                        bits &= bits - 1;
+                        t = (t + int_deg_ref[a]) % modulus;
+                    }
+                    by_ts.entry((t, s)).or_default().push(mask);
+                });
+                let mut blocks = Vec::with_capacity(by_ts.len());
+                let mut cdims = Vec::with_capacity(by_ts.len());
+                for ((t, s), masks) in by_ts {
+                    cdims.push(((w, t, s), masks.len()));
+                    blocks.push(((w, t, s), masks));
+                }
+                (blocks, cdims)
+            })
+            .collect();
+
+    // Flatten. `cdim` keeps dim C^{s,t,w}; `blocks` are the ranking tasks.
+    let mut cdim: HashMap<(u32, u64, usize), usize> = HashMap::new();
+    let mut blocks: Vec<((u32, u64, usize), Vec<u32>)> = Vec::new();
+    for (bs, cs) in per_weight {
+        for (key, d) in cs {
+            cdim.insert(key, d);
+        }
+        blocks.extend(bs);
     }
 
-    // H^{s,t} = dim C^{s,t} − rank(d_s|_t) − rank(d_{s-1}|_t).
+    // Phase 2 (flat parallel over all blocks): rank each — balanced regardless of weight size.
+    let ranked: Vec<((u32, u64, usize), usize)> = blocks
+        .into_maybe_par_iter()
+        .map(|(key, masks)| (key, block_rank(&masks, cobracket_ref, p)))
+        .collect();
+    let rank: HashMap<(u32, u64, usize), usize> = ranked.into_iter().collect();
+
+    // H^{s,t,w} = dim C − rank(d_s) − rank(d_{s-1}); key by (stem n = t − s, s, weight).
     let mut result = BTreeMap::new();
-    for (&(s, t), &cd) in &cdim {
-        let r_s = *ranks.get(&(t, s)).unwrap_or(&0);
+    for (&(w, t, s), &cd) in &cdim {
+        let r_s = *rank.get(&(w, t, s)).unwrap_or(&0);
         let r_prev = if s == 0 {
             0
         } else {
-            *ranks.get(&(t, s - 1)).unwrap_or(&0)
+            *rank.get(&(w, t, s - 1)).unwrap_or(&0)
         };
         let h = cd - r_s - r_prev;
         if h > 0 {
-            result.insert((s, t), h);
+            result.insert(
+                ChartDegree {
+                    n: t as i64 - s as i64,
+                    s,
+                    weight: w,
+                },
+                h,
+            );
         }
+    }
+    result
+}
+
+/// The **bigraded** cohomology `dim H^{s,t}(L(n,n))` (summed over the `i`-weight), keyed `(s, t)`.
+/// `Σ_t H^{s,t}` equals the `s`-graded Betti number, and `Σ_{s,t}` the total dimension.
+pub fn bigraded_cohomology(lie: &MoravaLie) -> BTreeMap<(usize, u64), usize> {
+    let modulus = lie.internal_modulus();
+    let mut result: BTreeMap<(usize, u64), usize> = BTreeMap::new();
+    for (deg, d) in trigraded_cohomology(lie) {
+        // t = n + s (mod p^n − 1); n was defined as t − s from a representative t ∈ [0, modulus).
+        let t = (deg.n + deg.s as i64).rem_euclid(modulus as i64) as u64;
+        *result.entry((deg.s, t)).or_insert(0) += d;
     }
     result
 }
@@ -572,19 +620,28 @@ mod tests {
     }
 
     #[test]
-    fn bigraded_refines_betti() {
-        // The (s,t) chart must sum correctly: Σ_t H^{s,t} = betti[s], and Σ_{s,t} = total dim.
+    fn graded_charts_refine_betti() {
+        // The tri/bigraded charts must sum correctly: Σ over the finer gradings = betti[s], and the
+        // grand total = dim H^*. Checks both trigraded (n,s,w) and its bigraded (s,t) collapse.
         for (n, prime, total) in [(2u32, 5u32, 12usize), (3, 7, 152), (4, 7, 3440)] {
             let lie = MoravaLie::new(p(prime), n);
-            let chart = bigraded_cohomology(&lie);
             let stats = chevalley_eilenberg_cohomology(&lie);
-            let grand: usize = chart.values().sum();
-            assert_eq!(grand, total, "bigraded total wrong at n={n}");
+
+            let tri = trigraded_cohomology(&lie);
+            assert_eq!(tri.values().sum::<usize>(), total, "trigraded total wrong at n={n}");
             let mut per_s = vec![0usize; lie.dim() + 1];
-            for (&(s, _t), &d) in &chart {
-                per_s[s] += d;
+            for (deg, &d) in &tri {
+                per_s[deg.s] += d;
             }
-            assert_eq!(per_s, stats.betti, "Σ_t H^{{s,t}} must equal betti[s] at n={n}");
+            assert_eq!(per_s, stats.betti, "Σ_{{n,w}} H must equal betti[s] at n={n}");
+
+            let bi = bigraded_cohomology(&lie);
+            assert_eq!(bi.values().sum::<usize>(), total, "bigraded total wrong at n={n}");
+            let mut per_s_bi = vec![0usize; lie.dim() + 1];
+            for (&(s, _t), &d) in &bi {
+                per_s_bi[s] += d;
+            }
+            assert_eq!(per_s_bi, stats.betti, "Σ_t H^{{s,t}} must equal betti[s] at n={n}");
         }
     }
 
