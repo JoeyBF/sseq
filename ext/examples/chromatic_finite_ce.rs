@@ -32,8 +32,17 @@
 use algebra::lie::{MoravaLie, Options, cohomology_by_weight};
 use fp::prime::ValidPrime;
 
-/// The known/conjectural total dimensions, indexed by `n` (Salch, arXiv:2312.17185).
-const EXPECTED: &[(u32, usize)] = &[(1, 2), (2, 12), (3, 152), (4, 3440), (5, 128512)];
+/// Reference total dimensions `(n, dim, known)` (Salch, arXiv:2312.17185). `known = true` are
+/// established; `known = false` are *conjectural*. NOTE: this tool computes `dim H^*(L(5,5)) = 128992`
+/// (reproduced at `p = 7` and `p = 11` with identical Betti numbers), which **disagrees** with the
+/// conjectural `128512` — see `ext/docs/chromatic-computations.md` §3.
+const EXPECTED: &[(u32, usize, bool)] = &[
+    (1, 2, true),
+    (2, 12, true),
+    (3, 152, true),
+    (4, 3440, true),
+    (5, 128512, false),
+];
 
 /// The smallest prime `> n + 1` (the large-prime regime where the collapse holds).
 fn large_prime_for(n: u32) -> u32 {
@@ -48,18 +57,21 @@ fn is_prime(p: u32) -> bool {
     p >= 2 && (2..p).take_while(|k| k * k <= p).all(|k| p % k != 0)
 }
 
-fn expected_for(n: u32) -> Option<usize> {
-    EXPECTED.iter().find(|(m, _)| *m == n).map(|(_, d)| *d)
+fn expected_for(n: u32) -> Option<(usize, bool)> {
+    EXPECTED.iter().find(|(m, _, _)| *m == n).map(|&(_, d, k)| (d, k))
 }
 
 fn main() {
     let mut args = std::env::args().skip(1);
     let max_n: u32 = args.next().and_then(|s| s.parse().ok()).unwrap_or(4);
     let max_block: Option<usize> = match args.next().and_then(|s| s.parse().ok()) {
+        Some(0) => None,       // 0 means "uncapped"
         Some(c) => Some(c),
         None if max_n >= 5 => Some(200_000),
         None => None,
     };
+    // Optional 3rd arg: override the prime for *every* n (to probe characteristic dependence).
+    let prime_override: Option<u32> = args.next().and_then(|s| s.parse().ok());
 
     println!(
         "{:>3}  {:>2}  {:>6}  {:>12}  {:>12}   {}",
@@ -68,7 +80,7 @@ fn main() {
     println!("{}", "-".repeat(78));
 
     for n in 1..=max_n {
-        let p = large_prime_for(n);
+        let p = prime_override.unwrap_or_else(|| large_prime_for(n));
         let lie = MoravaLie::new(ValidPrime::new(p), n);
         let dim = lie.dim();
         let opts = Options { max_block };
@@ -86,13 +98,17 @@ fn main() {
             let total_dim = total - 2 * total_rank;
             let expected = expected_for(n);
             let status = match expected {
-                Some(e) if e == total_dim => "OK".to_string(),
-                Some(e) => format!("MISMATCH (expected {e})"),
+                Some((e, _)) if e == total_dim => "OK".to_string(),
+                // A mismatch against a *known* value is a bug; against a *conjecture* it is a finding.
+                Some((e, true)) => format!("MISMATCH (known {e})"),
+                Some((e, false)) => format!("computed (conj. was {e})"),
                 None => "(no reference)".to_string(),
             };
             println!(
                 "{n:>3}  {p:>2}  {dim:>6}  {total_dim:>12}  {:>12}   {status}",
-                expected.map(|e| e.to_string()).unwrap_or_else(|| "?".into()),
+                expected
+                    .map(|(e, _)| e.to_string())
+                    .unwrap_or_else(|| "?".into()),
             );
             // Betti numbers (Poincaré self-dual) as a graded sanity check.
             let mut betti = vec![0usize; dim + 1];
@@ -120,7 +136,9 @@ fn main() {
             let biggest = reports.iter().map(|r| r.max_block).max().unwrap_or(0);
             // Partial lower bound on the *co*rank: 2^N - 2 * (rank so far) upper-bounds dim H^*,
             // but with blocks skipped we cannot pin the total; report the reachable structure.
-            let expected = expected_for(n).map(|e| e.to_string()).unwrap_or_else(|| "?".into());
+            let expected = expected_for(n)
+                .map(|(e, _)| e.to_string())
+                .unwrap_or_else(|| "?".into());
             println!(
                 "{n:>3}  {p:>2}  {dim:>6}  {:>12}  {expected:>12}   PARTIAL (cap {})",
                 "-",

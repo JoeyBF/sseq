@@ -42,7 +42,7 @@
 //! cap. Full `n = 5` still needs either the `Z/n`-equivariant splitting or structured/black-box
 //! sparse rank; see the handoff §3.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 
 use fp::prime::Prime;
 use maybe_rayon::prelude::*;
@@ -307,112 +307,117 @@ pub(crate) fn enumerate_weight(weights: &[u32], target: u32, emit: &mut impl FnM
 }
 
 /// The rank over `F_p` of one `(weight, degree)` differential block, whose domain is the monomial
-/// list `masks` and whose rows are `differential_terms(mask, ..)`. This is the hot path, ranked by
-/// the incremental forward elimination of [`eliminate`] (target bitmasks used directly as columns).
+/// list `masks` and whose rows are `differential_terms(mask, ..)`. This is the hot path.
 fn block_rank(masks: &[u32], cobracket: &[Vec<(usize, usize, i32)>], p: u32) -> usize {
-    let mut pivots: HashMap<u32, Vec<(u32, u32)>> = HashMap::new();
-    let mut rank = 0usize;
-    for &mask in masks {
-        let mut work: BTreeMap<u32, u32> = BTreeMap::new();
-        for (col, v) in differential_terms(mask, cobracket, p) {
-            *work.entry(col).or_insert(0) += v;
-        }
-        work.retain(|_, v| {
-            *v %= p;
-            *v != 0
-        });
-        eliminate(&mut work, &mut pivots, p, &mut rank);
-    }
-    rank
-}
-
-/// Reduce `work` against the current `pivots`; if it survives, install it as a new pivot.
-fn eliminate(
-    work: &mut BTreeMap<u32, u32>,
-    pivots: &mut HashMap<u32, Vec<(u32, u32)>>,
-    p: u32,
-    rank: &mut usize,
-) {
-    loop {
-        let Some((&lead, &lead_coeff)) = work.iter().next() else {
-            return;
-        };
-        let Some(pivot) = pivots.get(&lead) else {
-            let inv = mod_inverse(lead_coeff, p);
-            let normalized: Vec<(u32, u32)> =
-                work.iter().map(|(&c, &v)| (c, (v * inv) % p)).collect();
-            pivots.insert(lead, normalized);
-            *rank += 1;
-            return;
-        };
-        let factor = lead_coeff;
-        for &(c, pv) in pivot {
-            let sub = (factor * pv) % p;
-            if sub == 0 {
-                continue;
-            }
-            let entry = work.entry(c).or_insert(0);
-            *entry = (*entry + p - sub) % p;
-            if *entry == 0 {
-                work.remove(&c);
-            }
-        }
-    }
+    sparse_rank(
+        masks.iter().map(|&mask| differential_terms(mask, cobracket, p)),
+        p,
+    )
 }
 
 /// The rank over `F_p` of the matrix whose rows are the given sparse vectors. Each row is a list of
-/// `(column_id, coeff)` pairs (`coeff` in `1..p`); column identifiers are arbitrary `u32`s. Simple
-/// reference implementation used by tests; the streaming path uses [`block_rank`], which adds a
-/// fill-reducing column order.
+/// `(column_id, coeff)` pairs; column identifiers are arbitrary `u32`s (we use target bitmasks).
+///
+/// Incremental sparse row-echelon reduction. Rows and pivots are stored as `(column, coeff)` pairs
+/// sorted by column ascending; a pivot's leading column is its smallest and carries coefficient `1`,
+/// so eliminating it only touches columns `>=` that lead — a working row's leading column strictly
+/// increases and the reduction terminates. Each step is a linear merge ([`axpy`]) — cache-friendly
+/// and free of tree/hash-map per-node overhead, which is what keeps the raw sparse differential
+/// blocks tractable.
 pub fn sparse_rank(rows: impl IntoIterator<Item = Vec<(u32, u32)>>, p: u32) -> usize {
-    // pivots[lead] = a normalized echelon row (leading coeff 1 at column `lead`, other entries at
-    // columns > lead).
+    // pivots[lead] = a normalized echelon row (leading coeff 1 at column `lead`).
     let mut pivots: HashMap<u32, Vec<(u32, u32)>> = HashMap::new();
     let mut rank = 0usize;
+    let mut merged: Vec<(u32, u32)> = Vec::new();
     for row in rows {
-        // Working row as an ordered map for O(log) min-column access and merges.
-        let mut work: BTreeMap<u32, u32> = BTreeMap::new();
-        for (c, v) in row {
-            let v = v % p;
-            if v != 0 {
-                *work.entry(c).or_insert(0) += v;
-            }
-        }
-        // Normalize any accidental sums.
-        work.retain(|_, v| {
-            *v %= p;
-            *v != 0
-        });
+        let mut work = canonicalize_row(row, p);
         loop {
-            let Some((&lead, &lead_coeff)) = work.iter().next() else {
+            let Some(&(lead, lead_coeff)) = work.first() else {
                 break; // reduced to zero: linearly dependent
             };
-            let Some(pivot) = pivots.get(&lead) else {
-                // New pivot. Normalize leading coefficient to 1.
-                let inv = mod_inverse(lead_coeff, p);
-                let normalized: Vec<(u32, u32)> =
-                    work.iter().map(|(&c, &v)| (c, (v * inv) % p)).collect();
-                pivots.insert(lead, normalized);
-                rank += 1;
-                break;
-            };
-            // Eliminate the leading column: work -= lead_coeff * pivot.
-            // pivot has coeff 1 at `lead`, so this clears `lead` and only touches columns >= lead.
-            let factor = lead_coeff;
-            for &(c, pv) in pivot {
-                let sub = (factor * pv) % p;
-                if sub == 0 {
-                    continue;
+            match pivots.get(&lead) {
+                Some(pivot) => {
+                    // work <- work - lead_coeff * pivot (both sorted; leading column cancels).
+                    axpy(&work, pivot, lead_coeff, p, &mut merged);
+                    std::mem::swap(&mut work, &mut merged);
                 }
-                let entry = work.entry(c).or_insert(0);
-                *entry = (*entry + p - sub) % p;
-                if *entry == 0 {
-                    work.remove(&c);
+                None => {
+                    // New pivot: normalize the leading coefficient to 1.
+                    let inv = mod_inverse(lead_coeff, p);
+                    if inv != 1 {
+                        for e in work.iter_mut() {
+                            e.1 = (e.1 * inv) % p;
+                        }
+                    }
+                    pivots.insert(lead, work);
+                    rank += 1;
+                    break;
                 }
             }
         }
     }
     rank
+}
+
+/// Reduces a row mod `p`, sorts by column, merges duplicate columns, and drops zeros.
+fn canonicalize_row(mut row: Vec<(u32, u32)>, p: u32) -> Vec<(u32, u32)> {
+    for e in row.iter_mut() {
+        e.1 %= p;
+    }
+    row.sort_unstable_by_key(|&(c, _)| c);
+    let mut out: Vec<(u32, u32)> = Vec::with_capacity(row.len());
+    for (c, v) in row {
+        if v == 0 {
+            continue;
+        }
+        if let Some(last) = out.last_mut()
+            && last.0 == c
+        {
+            last.1 = (last.1 + v) % p;
+            if last.1 == 0 {
+                out.pop();
+            }
+            continue;
+        }
+        out.push((c, v));
+    }
+    out
+}
+
+/// Computes `work - factor * pivot` over `F_p` into `out` (cleared first). Both inputs are sorted by
+/// column ascending; the result is sorted, with zeros dropped. `pivot`'s leading column equals
+/// `work`'s and carries coefficient `1`, so that entry cancels.
+fn axpy(work: &[(u32, u32)], pivot: &[(u32, u32)], factor: u32, p: u32, out: &mut Vec<(u32, u32)>) {
+    out.clear();
+    let (mut i, mut j) = (0usize, 0usize);
+    while i < work.len() && j < pivot.len() {
+        let (wc, wv) = work[i];
+        let (pc, pv) = pivot[j];
+        if wc < pc {
+            out.push((wc, wv));
+            i += 1;
+        } else if wc > pc {
+            let nv = (p - factor * pv % p) % p;
+            if nv != 0 {
+                out.push((pc, nv));
+            }
+            j += 1;
+        } else {
+            let nv = (wv + p - factor * pv % p) % p;
+            if nv != 0 {
+                out.push((wc, nv));
+            }
+            i += 1;
+            j += 1;
+        }
+    }
+    out.extend_from_slice(&work[i..]);
+    for &(pc, pv) in &pivot[j..] {
+        let nv = (p - factor * pv % p) % p;
+        if nv != 0 {
+            out.push((pc, nv));
+        }
+    }
 }
 
 /// `a^{-1} mod p` for prime `p`, via Fermat's little theorem.
@@ -494,6 +499,26 @@ mod tests {
         assert_eq!(sparse_rank(rows, 7), 3);
         // Empty.
         assert_eq!(sparse_rank(Vec::<Vec<(u32, u32)>>::new(), 5), 0);
+    }
+
+    #[test]
+    fn h1_dimension_pattern() {
+        // dim H^1(L(n,n)) = N - rank(d_1) = dim of the coabelianization. Empirically this is n + 1.
+        // The n = 5 case exercises the i + k = n = 5 brackets, which n <= 4 never reach, so it is a
+        // fast independent check underpinning the full n = 5 computation (dim H^* = 128992). Ranking
+        // d_1 : C^1 -> C^2 is cheap (domain dimension N = n^2).
+        for (n, prime) in [(2u32, 5u32), (3, 7), (4, 7), (5, 11)] {
+            let lie = MoravaLie::new(p(prime), n);
+            let cobracket = lie.cobracket();
+            let n_dim = lie.dim();
+            let rows = (0..n_dim).map(|a| differential_terms(1u32 << a, &cobracket, prime));
+            let rank_d1 = sparse_rank(rows, prime);
+            assert_eq!(
+                n_dim - rank_d1,
+                (n + 1) as usize,
+                "dim H^1(L({n},{n})) should be n + 1"
+            );
+        }
     }
 
     #[test]

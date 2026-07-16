@@ -3,13 +3,17 @@
 **Status.** Two validated, self-contained deliverables:
 1. the height-1 algebra `gr S(1)` and a smoke test reproducing `H^*(S(1))` at `p = 2` (the
    *small-prime* reference; §5), and
-2. **the finite Chevalley–Eilenberg tool of §3 — now implemented and validated.** It reproduces the
-   whole known validation ladder `dim H^*(L(n,n)) = 2, 12, 152` at `n = 1, 2, 3`, and **independently
-   confirms `dim H^*(L(4,4)) = 3440`** — the near-term prize (Salch's `n = 4` case, by a method
-   orthogonal to his). See §3 for the delivered code and what it settled.
+2. **the finite Chevalley–Eilenberg tool of §3 — implemented, validated, and pushed through to
+   `n = 5`.** It reproduces the whole known validation ladder `dim H^*(L(n,n)) = 2, 12, 152` at
+   `n = 1, 2, 3`, independently confirms `dim H^*(L(4,4)) = 3440` (Salch's `n = 4` case, by a method
+   orthogonal to his), and **computes the open `n = 5` total: `dim H^*(L(5,5)) = 128992`** — which
+   **disagrees with the long-standing conjectural `128512`** (by 480). The `n = 5` value is reproduced
+   at `p = 7` and `p = 11` with identical Betti numbers (so it is characteristic-independent), is
+   Poincaré-self-dual, and passes an independent `H^1` cross-check; it nonetheless **deserves an
+   expert second opinion** before being treated as a correction. See §3.
 
-This brief lays out the mathematics and the remaining open direction (`n = 5`). Read it top to bottom
-before extending the tool; the math is subtle and there is a documented trap (see §6).
+This brief lays out the mathematics. Read it top to bottom before extending the tool; the math is
+subtle and there is a documented trap (see §6).
 
 > **Update since first handoff.** The subscript ambiguity flagged in §2 is now *resolved by the tool
 > itself*: the green-book reading reproduces the known `n = 3` answer `152`; the swapped ("Salch eq.
@@ -157,7 +161,7 @@ dim_{F_p} H^*(L(n,n)) = 2^{n^2} − 2 · Σ_k rank(d_k).
 | 2 | 12 | 16 | known, all p |
 | 3 | 152 | 512 | known `p ≥ 5` |
 | 4 | 3440 | 65536 | **✓ CONFIRMED by this tool** (`p = 7`); independent check of Salch's in-progress `n = 4`. Betti profile `[1,5,18,55,129,249,409,551,606,551,409,249,129,55,18,5,1]` |
-| 5 | 128512 (conjectured, from a generating function) | 2^25 ≈ 33.5M | **open — no one has it** |
+| 5 | **128992 (computed here)** — conjecture was 128512 | 2^25 ≈ 33.5M | **✓ COMPUTED by this tool** at `p = 7` *and* `p = 11` (identical Betti); **disagrees with the conjectural 128512 by 480** (see below) |
 | 6 | 7621888 (conjectured) | 2^36 | open |
 
 **Crucial simplification for validation:** the *total* `F_p`-dimension of `H^*(L(n,n))` is
@@ -174,20 +178,38 @@ later; the total dimension is the honest first milestone.
   to his (he derives it via deformations/spectral sequences, not computation). Given the field's track
   record — Ravenel's own first-edition `H^*(S(2))` at `p=3` was wrong until Henn caught it — this
   independent check has real value.
-- `n = 5` (complex 2^25 ≈ 33.5M): **partial data reachable; full total still open.** The
-  implementation now *streams* — it enumerates each `i`-weight block by a pruned subset-sum walk
-  (`enumerate_weight`), holding one weight in memory at a time, and ranks each `(weight, degree)`
+- `n = 5` (complex 2^25 ≈ 33.5M): **COMPUTED — `dim H^*(L(5,5)) = 128992`, not the conjectural
+  128512.** The implementation *streams* — it enumerates each `i`-weight block by a pruned subset-sum
+  walk (`enumerate_weight`), holding one weight in memory at a time, and ranks each `(weight, degree)`
   block with **sparse incremental row reduction** (`block_rank`/`sparse_rank`, target bitmasks used
   directly as columns) instead of a dense matrix. Independent blocks are ranked in **parallel**
-  (`maybe_rayon`; build `--features concurrent`). This lets `chromatic_finite_ce -- 5 <cap>` compute
-  every `n = 5` weight whose blocks fit under `<cap>`; e.g. `cap = 100000` clears 44 of the 76
-  weights (all the low/high corners) in ~15 s on 4 cores. The barrier to the *full* total `128512` is
-  the ~30 middle weights whose largest `(weight, degree)` blocks run `106k … 565k` square — the rank
-  there needs either the **`Z/n`-equivariant (character) splitting** (`p ≡ 1 mod n`, e.g. `p = 11`,
-  splits every block into `n` pieces ~`1/n` the size with all arithmetic staying in `F_p`), a
-  **structured / black-box sparse solver** (Wiedemann/Lanczos over `F_p`), or Salch's height-shifting.
-  Partial `n = 5` data — specific `i`-weights and the cohomological corners — is genuinely novel; a
-  confirmed total of `128512` would be a real result.
+  (`maybe_rayon`; build `--features concurrent`). Crucially, the *raw* differential is genuinely
+  sparse (`±1` entries) and its fill-in under elimination stays bounded, so the full complex — middle
+  blocks up to `565k` square — is rankable directly, in ~2.7 GB and **~33 min on 4 cores**, no cap
+  needed:
+
+  ```
+  cargo run --release --features concurrent --example chromatic_finite_ce -- 5 0
+  #  5   7      25        128992        128512   computed (conj. was 128512)
+  ```
+
+  > **⚠ This contradicts the conjectural `128512`** (Salch's table, "from a generating function"). The
+  > result is **`128992` at both `p = 7` and `p = 11`, with identical Betti numbers**
+  > `[1, 6, 25, 86, 251, 646, 1461, 2946, 5302, 8472, 12137, 15551, 17612, 17612, 15551, 12137, 8472,
+  > 5302, 2946, 1461, 646, 251, 86, 25, 6, 1]` — so it is characteristic-independent (not `p`-torsion),
+  > and the profile is Poincaré-self-dual as it must be. The computation is validated by reproducing
+  > the *known* totals `2, 12, 152, 3440` at `n = 1..4` (through the same code, at multiple primes),
+  > by `d² = 0`, and by an independent check that `dim H^1(L(5,5)) = 6` (which exercises the `i + k = 5`
+  > brackets that `n ≤ 4` never reach; `h1_dimension_pattern` test). **480 is a small, suspicious gap,
+  > so this warrants an independent expert check before it is trusted as a correction** — but every
+  > internal and cross-prime consistency test we can run says `128992`. If the bracket transcription
+  > (§2) or the target grading has a subtle error it would have to be invisible at `n ≤ 4` *and*
+  > preserve self-duality and the `H^1` count, which is a narrow target.
+
+  A `Z/n`-equivariant (character) split (`p ≡ 1 mod n`) is also implemented (`lie::equivariant`) and
+  independently reproduces `12, 152, 3440`; it splits each block into `n` pieces but *densifies* them,
+  so on this hardware the plain streaming rank above is the faster route to the total. `n = 6` (`2^36`)
+  remains out of brute-force reach.
 
   > **Block-grading note (what actually splits the complex).** The differential is *not* homogeneous
   > for the topological internal degree `2(p^i−1)p^j` (this is the §6 trap). It *is* homogeneous for
@@ -205,8 +227,9 @@ later; the total dimension is the honest first milestone.
    (`maybe_rayon`); `d² = 0` is unit-tested.
 3. ✓ `dim H^* = 2^N − 2 Σ rank d_k`; asserts 2, 12, 152 at `n = 1, 2, 3`. **Gate passing.**
 4. ✓ `n = 4` confirmed `3440` (`examples/chromatic_finite_ce.rs`).
-5. ◐ `n = 5` — *partial* data reachable now (`chromatic_finite_ce -- 5 <cap>`); the full total needs
-   the character splitting / black-box sparse rank of the feasibility note above.
+5. ✓ `n = 5` — **computed: `128992`** (`chromatic_finite_ce -- 5 0`, ~33 min on 4 cores), reproduced
+   at `p = 7` and `p = 11`. This *disagrees* with the conjectural `128512`; see the feasibility note
+   above for the validation and the caveat.
 
 ---
 

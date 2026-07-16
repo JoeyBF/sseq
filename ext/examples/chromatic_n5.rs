@@ -11,13 +11,15 @@ use std::time::Instant;
 use algebra::lie::{MoravaLie, equivariant_total_dim};
 use fp::prime::ValidPrime;
 
-/// `(n, prime, expected)` — a prime `≡ 1 (mod n)` and `> n + 1`; expected total (conj. at n = 5).
+/// `(n, prime, reference)` — a prime `≡ 1 (mod n)` and `> n + 1`; the reference total is the *known*
+/// value for `n <= 4` and the *conjectural* one for `n >= 5`. This tool computes `128992` at `n = 5`
+/// (at `p = 7` and `p = 11`), which disagrees with the conjectural `128512`.
 const CASES: &[(u32, u32, Option<usize>)] = &[
     (2, 5, Some(12)),
     (3, 7, Some(152)),
     (4, 13, Some(3440)),
-    (5, 11, Some(128512)),
-    (6, 13, Some(7621888)),
+    (5, 11, Some(128512)), // conjectural; computed value is 128992
+    (6, 13, Some(7621888)), // conjectural
 ];
 
 fn main() {
