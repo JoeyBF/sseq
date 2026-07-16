@@ -701,6 +701,14 @@ where
 
     /// The chain self-map $f_y\colon P_\bullet \to P_\bullet$ of the unit realising a generator `g`
     /// of $\Ext(k, k)$, built and cached on first use. Used by the closed-form cup product path.
+    ///
+    /// This is *the same map* the minimal product path builds for the unit's own generators via
+    /// [`generator_product_map`](Self::generator_product_map): both are `from_class` on the unit
+    /// realising `g`, so they must share the on-disk save name (`prod_{n}_{s}_{idx}`). That sharing is
+    /// what lets a field-trick module reuse the unit's already-computed self-maps: once the unit's
+    /// product ring has been saved to disk, every module's cup path *reloads* the lifts instead of
+    /// recomputing them (the expensive, `M`-independent part), leaving only the closed-form cup
+    /// untwist per module.
     pub(crate) fn unit_self_map(
         &self,
         g: BidegreeGenerator,
@@ -711,7 +719,7 @@ where
         let dim = self.unit.number_of_gens_in_bidegree(g.degree());
         let mut class = vec![0u32; dim];
         class[g.idx()] = 1;
-        let name = format!("cup_{}_{}_{}", g.n(), g.s(), g.idx());
+        let name = format!("prod_{}_{}_{}", g.n(), g.s(), g.idx());
         let hom = Arc::new(ResolutionHomomorphism::from_class(
             name,
             Arc::clone(&self.unit),

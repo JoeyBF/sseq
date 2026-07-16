@@ -111,16 +111,27 @@ fn main() -> anyhow::Result<()> {
     println!("   done in {phase1:.2?}  ({})\n", du(&sphere_dir));
 
     // ---- Phase 2: the sphere's own product ring (minimal path) -------------------------------
-    println!("== Phase 2: Ext(k, k) products (full ring, maps saved under S_2/products) ==");
-    let sphere_alg = ExtAlgebra::new(Arc::clone(&sphere), Arc::clone(&sphere));
-    sphere_alg.compute_through_bidegree(box_max);
-    let start = Instant::now();
-    let (computed, nonzero, checksum) = full_products(&sphere_alg, box_max);
-    let phase2 = start.elapsed();
-    println!(
-        "   {computed} products ({nonzero} nonzero, checksum {checksum}) in {phase2:.2?}  ({})\n",
-        du(&sphere_dir)
-    );
+    // Skippable: set `FIELD_SKIP_SPHERE_PRODUCTS=1` to regenerate only a module's products against a
+    // sphere whose product ring (the shared `prod_*` self-maps) is already on disk — the "the sphere
+    // is a fixed cost, each module is cheap" scenario.
+    let skip_sphere = std::env::var_os("FIELD_SKIP_SPHERE_PRODUCTS").is_some();
+    let phase2 = if skip_sphere {
+        println!("== Phase 2: SKIPPED (reusing the sphere product ring already on disk) ==\n");
+        None
+    } else {
+        println!("== Phase 2: Ext(k, k) products (full ring, maps saved under S_2/products) ==");
+        let sphere_alg = ExtAlgebra::new(Arc::clone(&sphere), Arc::clone(&sphere));
+        sphere_alg.compute_through_bidegree(box_max);
+        let start = Instant::now();
+        let (computed, nonzero, checksum) = full_products(&sphere_alg, box_max);
+        let elapsed = start.elapsed();
+        println!(
+            "   {computed} products ({nonzero} nonzero, checksum {checksum}) in {elapsed:.2?}  \
+             ({})\n",
+            du(&sphere_dir)
+        );
+        Some((elapsed, nonzero))
+    };
 
     // ---- Phase 3: Ext(M, k) products via the field trick, reusing the saved sphere ----------
     println!(
@@ -151,7 +162,12 @@ fn main() -> anyhow::Result<()> {
     // ---- Summary ----------------------------------------------------------------------------
     println!("== Summary (M = {module_name}, box n ≤ {max_n}, s ≤ {max_s}) ==");
     println!("   S_2 resolve + save:      {phase1:.2?}");
-    println!("   Ext(k, k) products:      {phase2:.2?}  ({nonzero} nonzero)");
+    match phase2 {
+        Some((elapsed, nonzero)) => {
+            println!("   Ext(k, k) products:      {elapsed:.2?}  ({nonzero} nonzero)");
+        }
+        None => println!("   Ext(k, k) products:      (skipped; reused from disk)"),
+    }
     println!("   Ext({module_name}, k) products:  {phase3:.2?}  ({m_nonzero} nonzero)");
     println!(
         "   total on disk:           {}",
