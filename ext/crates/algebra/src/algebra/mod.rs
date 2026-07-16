@@ -18,6 +18,9 @@ pub use field::Field;
 pub mod milnor_algebra;
 pub use milnor_algebra::MilnorAlgebra;
 
+pub mod morava_stabilizer;
+pub use morava_stabilizer::MoravaStabilizerAlgebra;
+
 mod steenrod_algebra;
 pub use steenrod_algebra::{AlgebraType, SteenrodAlgebra};
 

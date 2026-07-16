@@ -1,9 +1,29 @@
 # Handoff: chromatic (Morava stabilizer) computations via the field trick
 
-**Status:** exploratory brief. Nothing chromatic is implemented yet. This document hands off a
+**Status:** phase 1 (§6) done — see the update box below. This document hands off a
 self-contained investigation: whether Nassau's tensor/field trick — already implemented in this
 crate for the mod‑2 Steenrod algebra — can be pointed at the **Morava stabilizer algebra** to
 compute the algebraic input to K(n)‑local (chromatic) homotopy.
+
+> **Update (phase 1 complete): height 1 at p = 2 implemented and validated.**
+>
+> `gr S(1) = u(L(1))` is now implemented as a standalone `Algebra + Bialgebra` in
+> `crates/algebra/src/algebra/morava_stabilizer.rs` (`MoravaStabilizerAlgebra`). At `p = 2` it is
+> the exterior Hopf algebra `Λ(x_1, x_2, …)` on primitive generators with `|x_i| = 2(2^i − 1)`
+> (abelian `L(1)`, trivial restriction — the associated graded kills both the restriction and every
+> cross term of the BP coproduct). No `enum_dispatch` registration was needed: the resolution engine
+> is fully generic over `CC::Algebra`, and `MuAlgebra<false>` is a blanket impl over `Algebra`.
+>
+> The example `ext/examples/chromatic_grs1.rs` resolves `F_2` and confirms, at every computed
+> bidegree, that `Ext_{gr S(1)}(F_2, F_2) = F_2[h_1, h_2, …]` with `h_i ∈ (s,t) = (1, 2(2^i−1))` —
+> the algebraic (May `E_1`) page for the height-1 stabilizer. It *also* re-derives the same chart
+> through `field_resolution_ext` (`M = F_2`), so the full field-trick stack (antipode `χ`,
+> closed-form `δ_Q`) is confirmed to accept this new `Bialgebra`. Unit tests live alongside the
+> algebra. The May differentials that cut `F_2[h_i]` down to the genuine `H^*(S_1)` remain out of
+> scope, exactly as §5 warns.
+>
+> Not yet done: the `HopfAlgebra` refactor of §3e (optional; the generic `Antipode` already works),
+> odd primes, and height ≥ 2 (where `L(n)` is non-abelian — the substantive §3a product work).
 
 The one-line thesis: *the field-trick stack is generic over `Bialgebra`, and the associated graded
 of the Morava stabilizer algebra is a connected, finite-type, cocommutative `Bialgebra` over
