@@ -846,7 +846,12 @@ where
 
         for (i, c) in x_cochain.vec().iter_nonzero() {
             let map = self.generator_product_map(BidegreeGenerator::new(shift, i));
-            map.extend_all();
+            // Extend only as far as this product needs (`target`), not to the resolved edge. A
+            // Nassau substrate keeps its quasi-inverse one filtration *behind* the edge (the QI at
+            // filtration `s` inverts `d: s+1 → s`, which does not exist at the top), so `extend_all`
+            // would request a quasi-inverse the substrate never saved. `target` stays within the
+            // resolved-with-margin range, matching the closed-form cup path above.
+            map.extend_through_stem(target);
 
             // `hom_k(b.t())[j][k]`: `j` indexes the multiplicand generator of the unit at `b`, `k`
             // indexes the result cochain generator of the resolution at `target`.
