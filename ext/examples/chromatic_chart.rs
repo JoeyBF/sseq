@@ -69,15 +69,17 @@ fn main() -> anyhow::Result<()> {
         println!("  ({} occupied (n,s,weight) cells — see the SVG)", chart.len());
     }
 
-    // Build the E_2( = E_∞) page and render, in the (stem n, filtration s) display. Dimensions only
-    // (no differentials at large primes); sum the weight grading into each (n, s) cell.
-    let mut cells: BTreeMap<(i64, usize), usize> = BTreeMap::new();
+    // Build the E_2( = E_∞) page and render. Dimensions only (no differentials at large primes); we
+    // sum the weight grading into each (s, t) cell and pass the honest (s, t) bidegree — the plotter
+    // converts to the Adams (stem n = t − s, filtration s) display itself.
+    let mut cells: BTreeMap<(usize, u64), usize> = BTreeMap::new();
     for (deg, &d) in &chart {
-        *cells.entry((deg.n, deg.s)).or_insert(0) += d;
+        let t = (deg.n + deg.s as i64) as u64; // t = n + s, a representative in [0, modulus)
+        *cells.entry((deg.s, t)).or_insert(0) += d;
     }
     let mut sseq = Sseq::<2, Adams>::new(ValidPrime::new(p));
-    for (&(nn, s), &d) in &cells {
-        sseq.set_dimension(Bidegree::n_s(nn as i32, s as i32), d);
+    for (&(s, t), &d) in &cells {
+        sseq.set_dimension(Bidegree::s_t(s as i32, t as i32), d);
     }
     let file = std::fs::File::create(&out)?;
     sseq.write_to_graph(
