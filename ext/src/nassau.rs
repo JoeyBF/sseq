@@ -14,7 +14,6 @@
 
 use std::{
     fmt::Display,
-    io,
     sync::{Arc, LazyLock, Mutex, mpsc},
 };
 
@@ -30,7 +29,7 @@ use anyhow::anyhow;
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use fp::{
     matrix::{AugmentedMatrix, Matrix},
-    prime::{TWO, ValidPrime},
+    prime::{Prime, TWO, ValidPrime},
     vector::{FpSlice, FpSliceMut, FpVector},
 };
 use itertools::Itertools;
@@ -39,8 +38,8 @@ use sseq::coordinates::{Bidegree, BidegreeGenerator};
 
 use crate::{
     chain_complex::{AugmentedChainComplex, ChainComplex, FiniteChainComplex, FreeChainComplex},
-    save::{SaveDirectory, SaveKind},
-    utils::{LogWriter, parallel::ParallelGuard},
+    save::{NassauCommand, NassauQiWriter, SaveDirectory, SaveKind},
+    utils::parallel::ParallelGuard,
 };
 
 /// See [`resolution::SenderData`](../resolution/struct.SenderData.html). This differs by not having the `new` field.
@@ -205,81 +204,6 @@ impl MilnorSubalgebra {
             .last()
             .unwrap_or(Self::zero_algebra())
     }
-
-    fn to_bytes(&self, buffer: &mut impl io::Write) -> io::Result<()> {
-        buffer.write_u64::<LittleEndian>(self.profile.len() as u64)?;
-        buffer.write_all(&self.profile)?;
-
-        let len = self.profile.len();
-        let zeros = [0; 8];
-        let padding = len - ((len / 8) * 8);
-        buffer.write_all(&zeros[0..padding])
-    }
-
-    fn from_bytes(data: &mut impl io::Read) -> io::Result<Self> {
-        let len = data.read_u64::<LittleEndian>()? as usize;
-        let mut profile = vec![0; len];
-
-        data.read_exact(&mut profile)?;
-
-        let padding = len - ((len / 8) * 8);
-        if padding > 0 {
-            let mut buf: [u8; 8] = [0; 8];
-            data.read_exact(&mut buf[0..padding])?;
-            assert_eq!(buf, [0; 8]);
-        }
-        Ok(Self { profile })
-    }
-
-    fn signature_to_bytes(signature: &[PPartEntry], buffer: &mut impl io::Write) -> io::Result<()> {
-        if cfg!(target_endian = "little") && std::mem::size_of::<PPartEntry>() == 2 {
-            unsafe {
-                let buf: &[u8] = std::slice::from_raw_parts(
-                    signature.as_ptr() as *const u8,
-                    signature.len() * 2,
-                );
-                buffer.write_all(buf).unwrap();
-            }
-        } else {
-            for &entry in signature {
-                buffer.write_u16::<LittleEndian>(entry as u16)?;
-            }
-        }
-
-        let len = signature.len();
-        let zeros = [0; 8];
-        let padding = len - ((len / 4) * 4);
-
-        if padding > 0 {
-            buffer.write_all(&zeros[0..padding * 2])?;
-        }
-        Ok(())
-    }
-
-    fn signature_from_bytes(&self, data: &mut impl io::Read) -> io::Result<Vec<PPartEntry>> {
-        let len = self.profile.len();
-        let mut signature: Vec<PPartEntry> = vec![0; len];
-
-        if cfg!(target_endian = "little") && std::mem::size_of::<PPartEntry>() == 2 {
-            unsafe {
-                let buf: &mut [u8] =
-                    std::slice::from_raw_parts_mut(signature.as_mut_ptr() as *mut u8, len * 2);
-                data.read_exact(buf).unwrap();
-            }
-        } else {
-            for entry in &mut signature {
-                *entry = data.read_u16::<LittleEndian>()? as PPartEntry;
-            }
-        }
-
-        let padding = len - ((len / 4) * 4);
-        if padding > 0 {
-            let mut buffer: [u8; 8] = [0; 8];
-            data.read_exact(&mut buffer[0..padding * 2])?;
-            assert_eq!(buffer, [0; 8]);
-        }
-        Ok(signature)
-    }
 }
 
 impl Display for MilnorSubalgebra {
@@ -381,13 +305,6 @@ impl Iterator for SignatureIterator<'_> {
     }
 }
 
-/// Some magic constants used in the save file
-enum Magic {
-    End = -1,
-    Signature = -2,
-    Fix = -3,
-}
-
 /// Whether to persist quasi-inverses to disk during resolution. Disabled by
 /// `EXT_NASSAU_NO_SAVE_QI`, in which case only the differentials are written (the quasi-inverses are
 /// ~260-460x larger) and every downstream lift recomputes its quasi-inverse on demand.
@@ -423,6 +340,15 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
     }
 
     pub fn set_name(&mut self, name: String) {
+        // Record the label in the save store (if any) so the on-disk `zarr.json` is
+        // self-describing. Best-effort and purely informational — the module spec written by
+        // `bind_module_spec` is what actually guards loading.
+        if !name.is_empty()
+            && let Some(store) = self.save_dir.store()
+            && let Err(e) = store.set_complex_name(&name)
+        {
+            tracing::warn!("Failed to record complex name in save store: {e}");
+        }
         self.name = name;
     }
 
@@ -432,18 +358,16 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
 
     pub fn new_with_save(
         module: Arc<M>,
-        save_dir: impl Into<SaveDirectory>,
+        save_dir: impl TryInto<SaveDirectory, Error: Into<anyhow::Error>>,
     ) -> anyhow::Result<Self> {
-        let save_dir = save_dir.into();
+        let save_dir = save_dir.try_into().map_err(Into::into)?;
         let max_degree = module
             .max_degree()
             .ok_or_else(|| anyhow!("Nassau's algorithm requires bounded module"))?;
         let target = Arc::new(FiniteChainComplex::ccdz(module));
-
-        if let Some(p) = save_dir.write() {
-            for subdir in SaveKind::nassau_data() {
-                subdir.create_dir(p)?;
-            }
+        if let Some(store) = save_dir.store() {
+            let algebra = target.algebra();
+            store.bind_to_algebra(algebra.magic(), algebra.prime().as_u32(), algebra.prefix())?;
         }
 
         Ok(Self {
@@ -506,57 +430,113 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
         });
     }
 
-    #[tracing::instrument(skip_all, fields(throughput))]
+    #[tracing::instrument(skip_all)]
     fn write_qi(
-        f: &mut Option<impl io::Write>,
+        w: &mut Option<NassauQiWriter>,
         scratch: &mut FpVector,
         signature: &[PPartEntry],
         next_mask: &[usize],
         full_matrix: &Matrix,
         masked_matrix: &AugmentedMatrix<2>,
-    ) -> io::Result<()> {
-        let f = match f {
-            Some(f) => f,
+    ) -> anyhow::Result<()> {
+        let w = match w {
+            Some(w) => w,
             None => return Ok(()),
         };
-
-        let mut own_f = LogWriter::new(f);
-        let f = &mut own_f;
 
         let pivots = &masked_matrix.pivots()[0..masked_matrix.end[0]];
         if !pivots.iter().any(|&x| x >= 0) {
             return Ok(());
         }
 
-        // Write signature if non-zero.
+        // Emit a signature command if non-zero.
         if signature.iter().any(|&x| x > 0) {
-            f.write_u64::<LittleEndian>(Magic::Signature as u64)?;
-            MilnorSubalgebra::signature_to_bytes(signature, f)?;
+            let sig_u16: Vec<u16> = signature.iter().map(|&x| x as u16).collect();
+            w.write_signature(&sig_u16)?;
         }
 
-        // Write quasi-inverses
+        // Emit one pivot command per non-trivial pivot row.
         for (col, &row) in pivots.iter().enumerate() {
             if row < 0 {
                 continue;
             }
-            f.write_u64::<LittleEndian>(next_mask[col] as u64)?;
             let preimage = masked_matrix.row_segment(row as usize, 1, 1);
             scratch.set_scratch_vector_size(preimage.len());
             scratch.as_slice_mut().assign(preimage);
-            scratch.to_bytes(f)?;
+            // The lift slice we want to write is `scratch.as_slice()` here;
+            // we have to capture it before reusing `scratch` for the image.
+            let lift_vec = scratch.clone();
 
             scratch.set_scratch_vector_size(full_matrix.columns());
             for (i, _) in preimage.iter_nonzero() {
                 scratch.as_slice_mut().add(full_matrix.row(i), 1);
             }
-            scratch.to_bytes(f)?;
+            w.write_pivot(
+                next_mask[col] as u64,
+                lift_vec.as_slice(),
+                scratch.as_slice(),
+            )?;
         }
 
-        tracing::Span::current().record(
-            "throughput",
-            tracing::field::display(own_f.into_throughput()),
-        );
         Ok(())
+    }
+
+    /// Build the [`NassauCommand`] stream for one signature block of a quasi-inverse.
+    ///
+    /// Mirrors [`Self::write_qi`] but returns owned commands instead of writing them to a store;
+    /// used by the on-demand recompute path ([`RecomputeReader`]). Returns an empty vec if the
+    /// block has no pivots (nothing to emit). Never emits [`NassauCommand::Fix`] — that is only
+    /// written when the bidegree was resolved through stem, which never happens on the recompute
+    /// path (the resolution is fully computed by then).
+    fn qi_commands(
+        scratch: &mut FpVector,
+        signature: &[PPartEntry],
+        next_mask: &[usize],
+        full_matrix: &Matrix,
+        masked_matrix: &AugmentedMatrix<2>,
+    ) -> anyhow::Result<Vec<NassauCommand>> {
+        let mut cmds = Vec::new();
+
+        let pivots = &masked_matrix.pivots()[0..masked_matrix.end[0]];
+        if !pivots.iter().any(|&x| x >= 0) {
+            return Ok(cmds);
+        }
+
+        // Emit a signature command if non-zero.
+        if signature.iter().any(|&x| x > 0) {
+            let sig_u16: Vec<u16> = signature.iter().map(|&x| x as u16).collect();
+            cmds.push(NassauCommand::Signature(sig_u16));
+        }
+
+        // Emit one pivot command per non-trivial pivot row.
+        for (col, &row) in pivots.iter().enumerate() {
+            if row < 0 {
+                continue;
+            }
+            let preimage = masked_matrix.row_segment(row as usize, 1, 1);
+            scratch.set_scratch_vector_size(preimage.len());
+            scratch.as_slice_mut().assign(preimage);
+            // The lift slice we want to write is `scratch.as_slice()` here;
+            // we have to capture it before reusing `scratch` for the image.
+            let lift_vec = scratch.clone();
+
+            scratch.set_scratch_vector_size(full_matrix.columns());
+            for (i, _) in preimage.iter_nonzero() {
+                scratch.as_slice_mut().add(full_matrix.row(i), 1);
+            }
+
+            let mut lift_bytes = Vec::new();
+            lift_vec.to_bytes(&mut lift_bytes)?;
+            let mut image_bytes = Vec::new();
+            scratch.to_bytes(&mut image_bytes)?;
+            cmds.push(NassauCommand::Pivot {
+                col: next_mask[col] as u64,
+                lift_bytes,
+                image_bytes,
+            });
+        }
+
+        Ok(cmds)
     }
 
     fn write_differential(
@@ -565,16 +545,17 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
         num_new_gens: usize,
         target_dim: usize,
     ) -> anyhow::Result<()> {
-        if let Some(dir) = self.save_dir.write() {
-            let mut f = self
-                .save_file(SaveKind::NassauDifferential, b)
-                .create_file(dir.clone(), false);
-            f.write_u64::<LittleEndian>(num_new_gens as u64)?;
-            f.write_u64::<LittleEndian>(target_dim as u64)?;
+        if let Some(store) = self.save_dir.store() {
+            let mut buf = Vec::new();
+            buf.write_u64::<LittleEndian>(num_new_gens as u64)?;
+            buf.write_u64::<LittleEndian>(target_dim as u64)?;
 
             for n in 0..num_new_gens {
-                self.differential(b.s()).output(b.t(), n).to_bytes(&mut f)?;
+                self.differential(b.s())
+                    .output(b.t(), n)
+                    .to_bytes(&mut buf)?;
             }
+            store.write(SaveKind::NassauDifferential, b, &buf)?;
         }
         Ok(())
     }
@@ -610,15 +591,15 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
         next.compute_basis(b.t());
 
         // Skip writing the quasi-inverse when `EXT_NASSAU_NO_SAVE_QI` is set; `apply_quasi_inverse`
-        // recomputes it on demand from the differential (see `RecomputeReader`).
-        let mut f = if *SAVE_QI && let Some(dir) = self.save_dir().write() {
-            let mut f = self
-                .save_file(SaveKind::NassauQi, b - Bidegree::s_t(1, 0))
-                .create_file(dir.to_owned(), true);
-            f.write_u64::<LittleEndian>(next.dimension(b.t()) as u64)?;
-            f.write_u64::<LittleEndian>(target_masked_dim as u64)?;
-            subalgebra.to_bytes(&mut f)?;
-            Some(f)
+        // recomputes it on demand from the differential.
+        let mut f = if *SAVE_QI && let Some(store) = self.save_dir.store() {
+            let qi_b = b - Bidegree::s_t(1, 0);
+            Some(store.nassau_qi_writer(
+                qi_b,
+                next.dimension(b.t()) as u64,
+                target_masked_dim as u64,
+                &subalgebra.profile,
+            )?)
         } else {
             None
         };
@@ -655,7 +636,7 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
         if let Some(f) = &mut f
             && target.max_computed_degree() < b.t()
         {
-            f.write_u64::<LittleEndian>(Magic::Fix as u64)?;
+            f.write_fix()?;
         }
 
         // Compute image
@@ -749,8 +730,8 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
 
         end();
 
-        if let Some(f) = &mut f {
-            f.write_u64::<LittleEndian>(Magic::End as u64)?;
+        if let Some(w) = f {
+            w.finish()?;
         }
 
         self.write_differential(b, num_new_gens, target_dim)?;
@@ -887,13 +868,12 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
             return Ok(());
         }
 
-        if let Some(dir) = self.save_dir.read()
-            && let Some(mut f) = self
-                .save_file(SaveKind::NassauDifferential, b)
-                .open_file(dir.clone())
+        if let Some(store) = self.save_dir.store()
+            && let Some(data) = store.read(SaveKind::NassauDifferential, b)?
         {
             tracing::info!(%b, "Loading differential");
 
+            let mut f = std::io::Cursor::new(data);
             let num_new_gens = f.read_u64::<LittleEndian>()? as usize;
             // This need not be equal to `target_res_dimension`. If we saved a big resolution
             // and now only want to load up to a small stem, then `target_res_dimension` will
@@ -1070,30 +1050,70 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> ChainComplex for Resolution<M> {
         for<'a> &'a mut T: Into<FpSliceMut<'a>>,
         for<'a> &'a S: Into<FpSlice<'a>>,
     {
-        // Read the saved quasi-inverse unless recomputation is forced. Fall back to recomputation
-        // whenever no saved stream is available: no store, the qis were never persisted
-        // (`EXT_NASSAU_NO_SAVE_QI`), or the store has no qi for this bidegree. The last case
-        // legitimately happens at the top of the computed region — nassau writes qi(s, t) while
-        // computing (s + 1, t), so qi(max_s, t) is never saved even though lifting into it is
-        // well-defined. `RecomputeReader` regenerates the exact same byte stream from
-        // `differentials[b.s]`, so the loop below is unchanged.
+        self.apply_quasi_inverse_fallible(results, b, inputs)
+            .unwrap_or_else(|e| panic!("apply_quasi_inverse failed at {b}: {e:#}"))
+    }
+}
+
+impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
+    /// The fallible core of [`ChainComplex::apply_quasi_inverse`].
+    ///
+    /// The quasi-inverse commands are read from the saved zarr stream unless recomputation is
+    /// forced (`EXT_NASSAU_RECOMPUTE_QI`). When no saved stream is available — no store, the qis
+    /// were never persisted (`EXT_NASSAU_NO_SAVE_QI`), or the store simply has no qi for this
+    /// bidegree — the commands are regenerated on the fly from `differentials[b.s]` by
+    /// [`RecomputeReader`]. The missing-qi case legitimately happens at the top of the computed
+    /// region: nassau writes qi(s, t) while computing (s + 1, t), so qi(max_s, t) is never saved
+    /// even though lifting into it is well-defined.
+    ///
+    /// Both sources yield the same [`NassauCommand`] stream, so the application loop below is
+    /// identical either way. Returns `Ok(true)` once applied (the recompute fallback means we
+    /// never fail to produce a quasi-inverse), and propagates `anyhow::Error` from the reader or
+    /// `FpVector::update_from_bytes`.
+    fn apply_quasi_inverse_fallible<T, S>(
+        &self,
+        results: &mut [T],
+        b: Bidegree,
+        inputs: &[S],
+    ) -> anyhow::Result<bool>
+    where
+        for<'a> &'a mut T: Into<FpSliceMut<'a>>,
+        for<'a> &'a S: Into<FpSlice<'a>>,
+    {
+        let p = self.prime();
+
+        // Prefer the saved stream unless recomputation is forced.
         let saved = if *RECOMPUTE_QI {
             None
-        } else if let Some(dir) = self.save_dir.read() {
-            self.save_file(SaveKind::NassauQi, b).open_file(dir.clone())
+        } else if let Some(store) = self.save_dir.store() {
+            store.nassau_qi_reader(b)?
         } else {
             None
         };
-        let mut f: Box<dyn io::Read> = match saved {
-            Some(f) => f,
-            None => Box::new(RecomputeReader::new(self, b)),
+
+        type Commands<'a> = Box<dyn Iterator<Item = anyhow::Result<NassauCommand>> + 'a>;
+        let (target_dim, zero_mask_dim, subalgebra, commands): (
+            usize,
+            usize,
+            MilnorSubalgebra,
+            Commands,
+        ) = match saved {
+            Some(reader) => {
+                let target_dim = reader.target_dim() as usize;
+                let zero_mask_dim = reader.zero_mask_dim() as usize;
+                let subalgebra = MilnorSubalgebra::new(reader.subalgebra_profile().to_vec());
+                (target_dim, zero_mask_dim, subalgebra, Box::new(reader))
+            }
+            None => {
+                // Regenerate the quasi-inverse from the (fully computed) differential.
+                let recompute = RecomputeReader::new(self, b);
+                let target_dim = recompute.target_dim;
+                let zero_mask_dim = recompute.zero_mask_dim;
+                let subalgebra = recompute.subalgebra.clone();
+                (target_dim, zero_mask_dim, subalgebra, Box::new(recompute))
+            }
         };
 
-        let p = self.prime();
-
-        let target_dim = f.read_u64::<LittleEndian>().unwrap() as usize;
-        let zero_mask_dim = f.read_u64::<LittleEndian>().unwrap() as usize;
-        let subalgebra = MilnorSubalgebra::from_bytes(&mut f).unwrap();
         let source = &self.modules[b.s()];
         let target = &self.modules[b.s() - 1];
         let algebra = target.algebra();
@@ -1110,24 +1130,24 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> ChainComplex for Resolution<M> {
         let mut scratch0 = FpVector::new(p, zero_mask_dim);
         let mut scratch1 = FpVector::new(p, target_dim);
 
-        // If the quasi-inverse was computed using incomplete information, we need to figure out
-        // what the differentials in this bidegree hit and use them to lift. these variables are
-        // trivial if there is no such problem.
+        // If the quasi-inverse was computed using incomplete information, we need to figure
+        // out what the differentials in this bidegree hit and use them to lift. these
+        // variables are trivial if there is no such problem.
         //
         // target_zero_mask is the signature mask of the target under the zero signature.
         //
         // dx_matrix is an AugmentedMatrix::<3>.
         //
-        // Each row of this matrix is of the form [r; dx; x], where x is an element of the source
-        // of signature zero, expressed in the masked basis, and dx is the value of the
-        // differential on x. Then r is the entries of dx that have zero signature, which we
-        // include so that the rref of the matix is nice. In practice, we keep r empty until the
-        // very end, and then populate it manually.
+        // Each row of this matrix is of the form [r; dx; x], where x is an element of the
+        // source of signature zero, expressed in the masked basis, and dx is the value of
+        // the differential on x. Then r is the entries of dx that have zero signature,
+        // which we include so that the rref of the matix is nice. In practice, we keep r
+        // empty until the very end, and then populate it manually.
         //
-        // At the beginning the x's will be the new generators in this bidegree. As we read in the
-        // quasi-inverses for the zero signature, we keep on reducing this so that dx is zero in
-        // the pivot columns of the quasi-inverse. We can then use (the rref of) this matrix to
-        // lift remaining elements with zero signature.
+        // At the beginning the x's will be the new generators in this bidegree. As we read
+        // in the quasi-inverses for the zero signature, we keep on reducing this so that dx
+        // is zero in the pivot columns of the quasi-inverse. We can then use (the rref of)
+        // this matrix to lift remaining elements with zero signature.
         let (mut target_zero_mask, mut dx_matrix) = if zero_mask_dim != mask.len() {
             let num_new_gens = source.number_of_gens_in_degree(b.t());
             assert_eq!(mask.len(), zero_mask_dim + num_new_gens);
@@ -1157,83 +1177,90 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> ChainComplex for Resolution<M> {
             (Vec::new(), AugmentedMatrix::<3>::new(p, 0, [0, 0, 0]))
         };
 
-        loop {
-            let col = f.read_u64::<LittleEndian>().unwrap() as usize;
-            if col == Magic::End as usize {
-                break;
-            } else if col == Magic::Signature as usize {
-                let signature = subalgebra.signature_from_bytes(&mut f).unwrap();
-
-                mask.clear();
-                mask.extend(subalgebra.signature_mask(&algebra, source, b.t(), &signature));
-                scratch0.set_scratch_vector_size(mask.len());
-            } else if col == Magic::Fix as usize {
-                // We need to fix the differential problem
-                //
-                // First manually add_masked the second segment to the first, which we use for
-                // row reduction. We do this manually for borrow checker reasons.
-                for (j, &k) in target_zero_mask.iter().enumerate() {
-                    for i in 0..dx_matrix.rows() {
-                        if dx_matrix.row_segment(i, 1, 1).entry(k) != 0 {
-                            dx_matrix.row_segment_mut(i, 0, 0).add_basis_element(j, 1);
+        for cmd in commands {
+            match cmd? {
+                NassauCommand::Signature(sig_u16) => {
+                    let signature: Vec<PPartEntry> =
+                        sig_u16.iter().map(|&x| x as PPartEntry).collect();
+                    mask.clear();
+                    mask.extend(subalgebra.signature_mask(&algebra, source, b.t(), &signature));
+                    scratch0.set_scratch_vector_size(mask.len());
+                }
+                NassauCommand::Fix => {
+                    // We need to fix the differential problem
+                    //
+                    // First manually add_masked the second segment to the first, which we
+                    // use for row reduction. We do this manually for borrow checker reasons.
+                    for (j, &k) in target_zero_mask.iter().enumerate() {
+                        for i in 0..dx_matrix.rows() {
+                            if dx_matrix.row_segment(i, 1, 1).entry(k) != 0 {
+                                dx_matrix.row_segment_mut(i, 0, 0).add_basis_element(j, 1);
+                            }
                         }
                     }
+                    dx_matrix.row_reduce();
+
+                    // Now reduce by these elements
+                    for i in 0..dx_matrix.rows() {
+                        let masked_col = dx_matrix.row(i).first_nonzero().unwrap().0;
+                        assert_eq!(dx_matrix.pivots()[masked_col], i as isize);
+                        let col = target_zero_mask[masked_col];
+
+                        for (input, output) in inputs.iter_mut().zip(results.iter_mut()) {
+                            let entry = input.entry(col);
+                            if entry != 0 {
+                                output.into().add_unmasked(
+                                    dx_matrix.row_segment(i, 2, 2),
+                                    1,
+                                    &mask,
+                                );
+                                input.as_slice_mut().add(dx_matrix.row_segment(i, 1, 1), 1);
+                            }
+                        }
+                    }
+
+                    // Drop these objects to save a bit of memory
+                    target_zero_mask = Vec::new();
+                    dx_matrix = AugmentedMatrix::<3>::new(p, 0, [0, 0, 0]);
                 }
-                dx_matrix.row_reduce();
-
-                // Now reduce by these elements
-                for i in 0..dx_matrix.rows() {
-                    let masked_col = dx_matrix.row(i).first_nonzero().unwrap().0;
-                    assert_eq!(dx_matrix.pivots()[masked_col], i as isize);
-                    let col = target_zero_mask[masked_col];
-
+                NassauCommand::Pivot {
+                    col,
+                    lift_bytes,
+                    image_bytes,
+                } => {
+                    let col = col as usize;
+                    scratch0.update_from_bytes(&mut &lift_bytes[..])?;
+                    scratch1.update_from_bytes(&mut &image_bytes[..])?;
                     for (input, output) in inputs.iter_mut().zip(results.iter_mut()) {
                         let entry = input.entry(col);
                         if entry != 0 {
-                            output
-                                .into()
-                                .add_unmasked(dx_matrix.row_segment(i, 2, 2), 1, &mask);
-                            input.as_slice_mut().add(dx_matrix.row_segment(i, 1, 1), 1);
+                            output.into().add_unmasked(scratch0.as_slice(), 1, &mask);
+                            // If we resume a resolve_through_stem, input may be longer
+                            // than scratch1.
+                            input
+                                .slice_mut(0, scratch1.len())
+                                .add(scratch1.as_slice(), 1);
                         }
                     }
-                }
 
-                // Drop these objects to save a bit of memory
-                target_zero_mask = Vec::new();
-                dx_matrix = AugmentedMatrix::<3>::new(p, 0, [0, 0, 0]);
-            } else {
-                scratch0.update_from_bytes(&mut f).unwrap();
-                scratch1.update_from_bytes(&mut f).unwrap();
-                for (input, output) in inputs.iter_mut().zip(results.iter_mut()) {
-                    let entry = input.entry(col);
-                    if entry != 0 {
-                        output.into().add_unmasked(scratch0.as_slice(), 1, &mask);
-                        // If we resume a resolve_through_stem, input may be longer than scratch1.
-                        input
-                            .slice_mut(0, scratch1.len())
-                            .add(scratch1.as_slice(), 1);
-                    }
-                }
-
-                // Row reduce the differentials
-                if !target_zero_mask.is_empty() {
-                    for i in 0..dx_matrix.rows() {
-                        if dx_matrix.row_segment(i, 1, 1).entry(col) != 0 {
-                            dx_matrix
-                                .row_segment_mut(i, 2, 2)
-                                .slice_mut(0, zero_mask_dim)
-                                .add(scratch0.as_slice(), 1);
-                            dx_matrix
-                                .row_segment_mut(i, 1, 1)
-                                .slice_mut(0, target_dim)
-                                .add(scratch1.as_slice(), 1);
+                    // Row reduce the differentials
+                    if !target_zero_mask.is_empty() {
+                        for i in 0..dx_matrix.rows() {
+                            if dx_matrix.row_segment(i, 1, 1).entry(col) != 0 {
+                                dx_matrix
+                                    .row_segment_mut(i, 2, 2)
+                                    .slice_mut(0, zero_mask_dim)
+                                    .add(scratch0.as_slice(), 1);
+                                dx_matrix
+                                    .row_segment_mut(i, 1, 1)
+                                    .slice_mut(0, target_dim)
+                                    .add(scratch1.as_slice(), 1);
+                            }
                         }
                     }
                 }
             }
         }
-        // Make sure we have finished reading everything
-        drop(f);
 
         for dx in inputs {
             assert!(
@@ -1242,35 +1269,38 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> ChainComplex for Resolution<M> {
                 target.element_to_string(b.t(), dx.as_slice())
             );
         }
-        true
+        Ok(true)
     }
 }
 
-/// A streaming [`io::Read`] that regenerates the quasi-inverse of `d_{b.s}` at bidegree `b` on the
-/// fly, in exactly the byte format that [`Resolution::write_qi`] wrote to disk.
+/// A streaming iterator that regenerates the quasi-inverse of `d_{b.s}` at bidegree `b` on the
+/// fly, yielding the exact same [`NassauCommand`] stream that [`Resolution::write_qi`] wrote to the
+/// save store.
 ///
-/// This lets [`ChainComplex::apply_quasi_inverse`] read a recomputed quasi-inverse through the same
-/// code path as a saved one — the apply loop is unchanged; only the source of bytes differs. The
-/// quasi-inverse is re-derived from `differentials[b.s]` alone (plus the module bases and the
-/// deterministically-chosen subalgebra), never the rest of the resolution.
+/// This lets [`Resolution::apply_quasi_inverse_fallible`] apply a recomputed quasi-inverse through
+/// the same code path as a saved one — the apply loop is unchanged; only the source of commands
+/// differs. The quasi-inverse is re-derived from `differentials[b.s]` alone (plus the module bases
+/// and the deterministically-chosen subalgebra), never the rest of the resolution.
 ///
-/// It advances one signature at a time, holding only that signature's matrices, so its peak memory
-/// matches what resolving this bidegree originally required — never the whole quasi-inverse, which
-/// can reach hundreds of GB at record stems.
+/// It advances one signature at a time, holding only that signature's matrices (and the commands
+/// of the current signature), so its peak memory matches what resolving this bidegree originally
+/// required — never the whole quasi-inverse, which can reach hundreds of GB at record stems.
 ///
 /// Because the resolution is fully computed by the time a lift is requested, the recomputed
-/// quasi-inverse always uses complete information, so it never emits a [`Magic::Fix`].
+/// quasi-inverse always uses complete information, so it never emits a [`NassauCommand::Fix`].
 struct RecomputeReader<'a, M: ZeroModule<Algebra = MilnorAlgebra>> {
     res: &'a Resolution<M>,
     b: Bidegree,
     subalgebra: MilnorSubalgebra,
     algebra: Arc<MilnorAlgebra>,
+    /// Target dimension of the quasi-inverse (`= dim F_{s-1}` at `t`). Header field.
+    target_dim: usize,
+    /// Zero-signature masked source dimension. Header field.
+    zero_mask_dim: usize,
     signatures: std::vec::IntoIter<Vec<PPartEntry>>,
     scratch: FpVector,
-    buf: Vec<u8>,
-    pos: usize,
-    header_done: bool,
-    end_done: bool,
+    /// Commands generated for the current signature, awaiting consumption.
+    pending: std::vec::IntoIter<NassauCommand>,
 }
 
 impl<'a, M: ZeroModule<Algebra = MilnorAlgebra>> RecomputeReader<'a, M> {
@@ -1289,6 +1319,11 @@ impl<'a, M: ZeroModule<Algebra = MilnorAlgebra>> RecomputeReader<'a, M> {
         tgt.compute_basis(t);
         let algebra = tgt.algebra();
 
+        let target_dim = tgt.dimension(t);
+        let zero_mask_dim = subalgebra
+            .signature_mask(&algebra, src, t, &subalgebra.zero_signature())
+            .count();
+
         // Zero signature first, then the rest — matching the write order.
         let signatures: Vec<Vec<PPartEntry>> = std::iter::once(subalgebra.zero_signature())
             .chain(subalgebra.iter_signatures(t))
@@ -1299,36 +1334,21 @@ impl<'a, M: ZeroModule<Algebra = MilnorAlgebra>> RecomputeReader<'a, M> {
             b,
             subalgebra,
             algebra,
+            target_dim,
+            zero_mask_dim,
             signatures: signatures.into_iter(),
             scratch: FpVector::new(res.prime(), 0),
-            buf: Vec::new(),
-            pos: 0,
-            header_done: false,
-            end_done: false,
+            pending: Vec::new().into_iter(),
         }
     }
 
-    /// Write the qi header: target dimension, zero-signature masked source dimension, subalgebra.
-    fn write_header(&mut self) -> io::Result<()> {
-        let (s, t) = (self.b.s(), self.b.t());
-        let target_dim = self.res.modules[s - 1].dimension(t);
-        let zero_mask_dim = self
-            .subalgebra
-            .signature_mask(
-                &self.algebra,
-                &self.res.modules[s],
-                t,
-                &self.subalgebra.zero_signature(),
-            )
-            .count();
-        self.buf.write_u64::<LittleEndian>(target_dim as u64)?;
-        self.buf.write_u64::<LittleEndian>(zero_mask_dim as u64)?;
-        self.subalgebra.to_bytes(&mut self.buf)
-    }
-
-    /// Row-reduce `d_s` restricted to `signature` and append the resulting commands, exactly as
-    /// `write_qi` did during resolution. Writes nothing if the block has no pivots.
-    fn write_signature(&mut self, signature: &[PPartEntry]) -> io::Result<()> {
+    /// Row-reduce `d_s` restricted to `signature` and build the resulting [`NassauCommand`]s,
+    /// exactly as [`Resolution::write_qi`] did during resolution. Returns an empty vec if the
+    /// block has no pivots.
+    fn commands_for_signature(
+        &mut self,
+        signature: &[PPartEntry],
+    ) -> anyhow::Result<Vec<NassauCommand>> {
         let (s, t) = (self.b.s(), self.b.t());
         let p = self.res.prime();
 
@@ -1353,8 +1373,7 @@ impl<'a, M: ZeroModule<Algebra = MilnorAlgebra>> RecomputeReader<'a, M> {
         masked_matrix.segment(1, 1).add_identity();
         masked_matrix.row_reduce();
 
-        Resolution::<M>::write_qi(
-            &mut Some(&mut self.buf),
+        Resolution::<M>::qi_commands(
             &mut self.scratch,
             signature,
             &tgt_mask,
@@ -1364,27 +1383,20 @@ impl<'a, M: ZeroModule<Algebra = MilnorAlgebra>> RecomputeReader<'a, M> {
     }
 }
 
-impl<M: ZeroModule<Algebra = MilnorAlgebra>> io::Read for RecomputeReader<'_, M> {
-    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
-        while self.pos >= self.buf.len() {
-            self.buf.clear();
-            self.pos = 0;
-            if !self.header_done {
-                self.write_header()?;
-                self.header_done = true;
-            } else if let Some(signature) = self.signatures.next() {
-                self.write_signature(&signature)?;
-            } else if !self.end_done {
-                self.buf.write_u64::<LittleEndian>(Magic::End as u64)?;
-                self.end_done = true;
-            } else {
-                return Ok(0);
+impl<M: ZeroModule<Algebra = MilnorAlgebra>> Iterator for RecomputeReader<'_, M> {
+    type Item = anyhow::Result<NassauCommand>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if let Some(cmd) = self.pending.next() {
+                return Some(Ok(cmd));
+            }
+            let signature = self.signatures.next()?;
+            match self.commands_for_signature(&signature) {
+                Ok(cmds) => self.pending = cmds.into_iter(),
+                Err(e) => return Some(Err(e)),
             }
         }
-        let n = std::cmp::min(out.len(), self.buf.len() - self.pos);
-        out[..n].copy_from_slice(&self.buf[self.pos..self.pos + n]);
-        self.pos += n;
-        Ok(n)
     }
 }
 
