@@ -365,29 +365,41 @@ static SAVE_QI: LazyLock<bool> =
 static RECOMPUTE_QI: LazyLock<bool> =
     LazyLock::new(|| std::env::var_os("EXT_NASSAU_RECOMPUTE_QI").is_some());
 
-/// Build the partial matrix of a differential, dispatching to the GPU Milnor-multiply
-/// path when it is compiled in, opted into (`NASSAU_GPU`), applicable, and the launch is
-/// large enough to amortise the fixed per-launch GPU cost.
+/// Build the matrix of `hom` on the basis elements `inputs`, with the target truncated to its first
+/// `target_dim` basis elements. A free-function form of the restricted partial-matrix build (PR
+/// #272): it does not read the (possibly concurrently growing) full target dimension, relying on
+/// minimality so the truncated image loses nothing. This is the CPU reference and fallback.
+fn restricted_partial_matrix(
+    hom: &FreeModuleHomomorphism<FreeModule<MilnorAlgebra>>,
+    degree: i32,
+    inputs: &[usize],
+    target_dim: usize,
+) -> Matrix {
+    let mut matrix = Matrix::new(hom.prime(), inputs.len(), target_dim);
+    if target_dim > 0 {
+        matrix
+            .maybe_par_iter_mut()
+            .enumerate()
+            .for_each(|(i, row)| hom.apply_to_basis_element_restricted(row, 1, degree, inputs[i]));
+    }
+    matrix
+}
+
+/// Restricted partial-matrix build, dispatching to the GPU Milnor-multiply path when it is compiled
+/// in, opted into (`NASSAU_GPU`), applicable, and the launch is large enough to amortise the fixed
+/// per-launch GPU cost.
 ///
-/// Defaults to the CPU per-term sweep, so behaviour is unchanged unless a caller sets
-/// `NASSAU_GPU`. A resolution issues thousands of small signature-masked launches (avg
-/// ~10³ term-pairs), for which the GPU's per-launch overhead (kernel launch + readback
-/// sync, ~0.7 ms) dwarfs the multiply; only launches whose `rows × cols` exceeds
-/// `NASSAU_GPU_MIN_WORK` (default 4M) are offloaded. `NASSAU_GPU_VERIFY` builds the CPU
-/// matrix too and asserts they agree. Without the `gpu` feature this is exactly
-/// `diff.get_partial_matrix(t, mask)`.
-///
-/// NOTE: currently unused. Merging PR #272 ("relax the dependency graph") switched the Nassau step
-/// to [`Resolution::restricted_partial_matrix`], which reads only the frozen (degree-restricted)
-/// target columns — a correctness requirement for computing a bidegree concurrently with the one
-/// that adds its target's top-degree generators. That CPU helper has no GPU offload path, so the
-/// GPU reuse machinery below (`build_partial_matrix` / `reuse_full_matrix` / `select_rows`) is
-/// retained but not wired in; re-integrating GPU offload would need a *restricted* variant.
-#[allow(dead_code)]
-fn build_partial_matrix(
+/// Defaults to the CPU [`restricted_partial_matrix`], so behaviour is unchanged unless a caller sets
+/// `NASSAU_GPU`. A resolution issues thousands of small signature-masked launches (avg ~10³
+/// term-pairs), for which the GPU's per-launch overhead (kernel launch + readback sync, ~0.7 ms)
+/// dwarfs the multiply; only launches whose `rows × cols` (`inputs.len() * target_dim`) exceeds
+/// `NASSAU_GPU_MIN_WORK` (default 4M) are offloaded. `NASSAU_GPU_VERIFY` builds the CPU matrix too
+/// and asserts they agree. Without the `gpu` feature this is exactly [`restricted_partial_matrix`].
+fn restricted_partial_matrix_maybe_gpu(
     diff: &FreeModuleHomomorphism<FreeModule<MilnorAlgebra>>,
     t: i32,
-    mask: &[usize],
+    inputs: &[usize],
+    target_dim: usize,
 ) -> Matrix {
     #[cfg(feature = "gpu")]
     {
@@ -396,30 +408,31 @@ fn build_partial_matrix(
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(4_000_000);
-            let work = mask.len() as u64 * diff.target().dimension(t) as u64;
+            let work = inputs.len() as u64 * target_dim as u64;
             if work >= min_work {
                 return if std::env::var_os("NASSAU_GPU_VERIFY").is_some() {
-                    crate::nassau_gpu::get_partial_matrix_verified(diff, t, mask)
+                    crate::nassau_gpu::get_partial_matrix_restricted_verified(
+                        diff, t, inputs, target_dim,
+                    )
                 } else {
-                    crate::nassau_gpu::get_partial_matrix(diff, t, mask)
+                    crate::nassau_gpu::get_partial_matrix_restricted(diff, t, inputs, target_dim)
                 };
             }
         }
     }
-    diff.get_partial_matrix(t, mask)
+    restricted_partial_matrix(diff, t, inputs, target_dim)
 }
 
-/// Whether to compute the full differential matrix once per bidegree and reuse row slices
-/// across the signature passes, instead of relaunching the multiply once per signature.
+/// Whether to compute the full restricted differential matrix once per bidegree and reuse row
+/// slices across the signature passes, instead of relaunching the multiply once per signature.
 ///
-/// Each signature's [`build_partial_matrix`] is a *row subset* of one full matrix — the
-/// masks partition the source basis, so the per-signature builds together compute every
-/// row exactly once, the same total multiply work as one all-rows build. On the CPU that
-/// restructuring is roughly neutral, but for the GPU it turns thousands of small
-/// (often sub-threshold, CPU-fallback) launches into one big launch per bidegree that
-/// amortises all fixed per-launch overhead. So it is gated on the same opt-in as the GPU
-/// path; without it the per-signature build is unchanged.
-#[allow(dead_code)]
+/// Each signature's partial matrix is a *row subset* of one full matrix — the signature masks
+/// partition the (restricted) source basis, so the per-signature builds together compute every row
+/// exactly once, the same total multiply work as one all-rows build. On the CPU that restructuring
+/// is roughly neutral, but for the GPU it turns thousands of small (often sub-threshold,
+/// CPU-fallback) launches into one big launch per bidegree that amortises all fixed per-launch
+/// overhead. So it is gated on the same opt-in as the GPU path; without it the per-signature build
+/// is unchanged.
 fn reuse_full_matrix(_diff: &FreeModuleHomomorphism<FreeModule<MilnorAlgebra>>) -> bool {
     #[cfg(feature = "gpu")]
     {
@@ -431,10 +444,10 @@ fn reuse_full_matrix(_diff: &FreeModuleHomomorphism<FreeModule<MilnorAlgebra>>) 
     }
 }
 
-/// Extract `rows` of `full` into a fresh matrix (`out.row(i) = full.row(rows[i])`),
-/// preserving the column layout. Slices a precomputed full differential matrix into one
-/// signature's partial matrix (see [`reuse_full_matrix`]).
-#[allow(dead_code)]
+/// Extract `rows` of `full` into a fresh matrix (`out.row(i) = full.row(rows[i])`), preserving the
+/// column layout. Slices a precomputed full (restricted-column) differential matrix into one
+/// signature's partial matrix (see [`reuse_full_matrix`]). `rows` must index within `full` — the
+/// signature masks are subsets of `0..full.rows()` (the restricted source basis), so this holds.
 fn select_rows(full: &Matrix, rows: &[usize]) -> Matrix {
     let mut out = Matrix::new(full.prime(), rows.len(), full.columns());
     for (dst, &src) in rows.iter().enumerate() {
@@ -687,28 +700,6 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
         Ok(())
     }
 
-    /// Build the matrix of `hom` on the basis elements `inputs`, using a target that has been
-    /// truncated to its first `target_dim` basis elements. This is a version of
-    /// [`ModuleHomomorphism::get_partial_matrix`] that does not read the (possibly concurrently
-    /// growing) target dimension.
-    fn restricted_partial_matrix(
-        hom: &FreeModuleHomomorphism<FreeModule<MilnorAlgebra>>,
-        degree: i32,
-        inputs: &[usize],
-        target_dim: usize,
-    ) -> Matrix {
-        let mut matrix = Matrix::new(hom.prime(), inputs.len(), target_dim);
-        if target_dim > 0 {
-            matrix
-                .maybe_par_iter_mut()
-                .enumerate()
-                .for_each(|(i, row)| {
-                    hom.apply_to_basis_element_restricted(row, 1, degree, inputs[i])
-                });
-        }
-        matrix
-    }
-
     #[tracing::instrument(skip(self), fields(%b, %subalgebra, num_new_gens, density))]
     fn step_resolution_with_subalgebra(
         &self,
@@ -770,14 +761,37 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
             .collect();
         let next_masked_dim = next_mask.len();
 
-        let full_matrix = {
+        // When GPU reuse is active, build ONE full restricted matrix over every (restricted) source
+        // row at degree `b.t()` in a single launch, then slice each signature's rows out of it.
+        // `target_dim` is the restricted source dimension, so `0..target_dim` is exactly the row set
+        // the per-signature masks partition; `next_dim` is the restricted column count.
+        let full_reuse: Option<Matrix> = if reuse_full_matrix(&self.differentials[b.s() - 1]) {
+            let all_rows: Vec<usize> = (0..target_dim).collect();
             let _guard = ParallelGuard::new();
-            Self::restricted_partial_matrix(
+            Some(restricted_partial_matrix_maybe_gpu(
                 &self.differentials[b.s() - 1],
                 b.t(),
-                &target_mask,
+                &all_rows,
                 next_dim,
-            )
+            ))
+        } else {
+            None
+        };
+
+        let full_matrix = match &full_reuse {
+            Some(full) => {
+                debug_assert!(target_mask.iter().all(|&r| r < full.rows()));
+                select_rows(full, &target_mask)
+            }
+            None => {
+                let _guard = ParallelGuard::new();
+                restricted_partial_matrix_maybe_gpu(
+                    &self.differentials[b.s() - 1],
+                    b.t(),
+                    &target_mask,
+                    next_dim,
+                )
+            }
         };
         let mut masked_matrix =
             AugmentedMatrix::new(p, target_masked_dim, [next_masked_dim, target_masked_dim]);
@@ -861,14 +875,20 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                 next_bound,
             ));
 
-            let full_matrix = {
-                let _guard = ParallelGuard::new();
-                Self::restricted_partial_matrix(
-                    &self.differentials[b.s() - 1],
-                    b.t(),
-                    &target_mask,
-                    next_dim,
-                )
+            let full_matrix = match &full_reuse {
+                Some(full) => {
+                    debug_assert!(target_mask.iter().all(|&r| r < full.rows()));
+                    select_rows(full, &target_mask)
+                }
+                None => {
+                    let _guard = ParallelGuard::new();
+                    restricted_partial_matrix_maybe_gpu(
+                        &self.differentials[b.s() - 1],
+                        b.t(),
+                        &target_mask,
+                        next_dim,
+                    )
+                }
             };
 
             let mut masked_matrix =
@@ -1620,12 +1640,7 @@ impl<'a, M: ZeroModule<Algebra = MilnorAlgebra>> RecomputeReader<'a, M> {
 
         let full_matrix = {
             let _guard = ParallelGuard::new();
-            Resolution::<M>::restricted_partial_matrix(
-                &self.res.differentials[s],
-                t,
-                &src_mask,
-                self.next_dim,
-            )
+            restricted_partial_matrix(&self.res.differentials[s], t, &src_mask, self.next_dim)
         };
         let mut masked_matrix =
             AugmentedMatrix::new(p, src_mask.len(), [tgt_mask.len(), src_mask.len()]);
