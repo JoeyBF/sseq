@@ -46,6 +46,14 @@ use crate::algebra::{Algebra, MilnorAlgebra, combinatorics::xi_degrees};
 /// `mk_len = rows + cols − 1 ≤ MAX_XI_TAU + ⌈log2⌉`; 32 covers every in-range case.
 const WORKING_CAP: usize = 32;
 
+/// Maximum `(product, matrix, term)` thread-pairs per GPU launch. The batch multiply indexes
+/// threads by CubeCL's `ABSOLUTE_POS` (a `u32`), so one launch can address at most `2^32` threads;
+/// a single all-rows reuse build reaches ~4.4e9 pairs at stem ~145, past that limit. Launches whose
+/// pair count exceeds this cap are split into chunks each bounded by it. `1 << 30` (~1.07e9) leaves
+/// >3x headroom under `2^32` even after a chunk's final product pushes it over, and keeps each
+/// chunk's grid (`chunk_pairs / 256` cubes) well under CUDA's `2^31 - 1` grid-dimension limit.
+const GPU_PAIR_CHUNK: usize = 1 << 30;
+
 /// Narrow an admissible-matrix / p-part entry to the `u16` the GPU buffers use, failing loudly
 /// instead of silently wrapping. Every entry is well within `u16` for the stem ranges this path
 /// targets; a panic here means that assumption was pushed past its limit, which must not ship
@@ -732,7 +740,14 @@ pub fn multiply_batch_on_gpu(
     let mut prod_num_terms: Vec<u32> = Vec::with_capacity(products.len());
     let mut prod_row_base: Vec<u32> = Vec::with_capacity(products.len());
     let mut prod_out_offset: Vec<u32> = Vec::with_capacity(products.len());
-    let mut prod_pair_start: Vec<u32> = Vec::with_capacity(products.len() + 1);
+    // Per-product `(matrix, term)` pair count. A launch's total pair count is the sum, and can
+    // exceed `u32::MAX` at record degrees (a single all-rows reuse build reaches ~4.4e9 pairs at
+    // stem ~145). The kernel indexes threads by `ABSOLUTE_POS`, itself a `u32`, so a launch can
+    // address at most `2^32` threads; the device section below splits the products into chunks each
+    // bounded by [`GPU_PAIR_CHUNK`] so every kernel launch stays safely under that limit. Keeping the
+    // per-product counts (rather than a single prefix sum) lets each chunk build its own `u32`
+    // prefix sum locally.
+    let mut prod_pairs: Vec<usize> = Vec::with_capacity(products.len());
     let mut pair_acc: usize = 0;
     for (pi, (tp, tl)) in per_prod.iter().enumerate() {
         let prod = &products[pi];
@@ -740,16 +755,25 @@ pub fn multiply_batch_on_gpu(
         prod_term_start.push(term_lens.len() as u32);
         term_lens.extend_from_slice(tl);
         term_pparts.extend_from_slice(tp);
-        prod_pair_start.push(pair_acc as u32);
-        pair_acc += r_num_matrices[ri as usize] * prod.term_indices.len();
+        let pairs = r_num_matrices[ri as usize] * prod.term_indices.len();
+        prod_pairs.push(pairs);
+        pair_acc += pairs;
         prod_num_terms.push(prod.term_indices.len() as u32);
         prod_row_base.push((prod.row * num_limbs) as u32);
         prod_out_offset.push(prod.out_offset as u32);
     }
-    prod_pair_start.push(pair_acc as u32); // sentinel: total pair count at index num_products
 
     let total_pairs = pair_acc;
     let out_len = num_rows * num_limbs;
+    if std::env::var_os("NASSAU_GPU_DEBUG").is_some() {
+        let num_chunks = total_pairs.div_ceil(GPU_PAIR_CHUNK).max(1);
+        eprintln!(
+            "[gpu-batch] num_rows={num_rows} num_cols={num_cols} num_limbs={num_limbs} \
+             products={} total_pairs={total_pairs} out_len={out_len} \
+             chunks={num_chunks} (cap={GPU_PAIR_CHUNK})",
+            products.len(),
+        );
+    }
     if total_pairs == 0 {
         return vec![vec![0u32; num_limbs]; num_rows];
     }
@@ -783,6 +807,10 @@ pub fn multiply_batch_on_gpu(
         let mk_len_master = resident.masks.len();
         let cs_h = resident.cs_handle.clone().unwrap();
         let mk_h = resident.mk_handle.clone().unwrap();
+        // Shared across every chunk: term data, seqno/xi tables, per-`R` offsets, and the output
+        // buffer. `prod_term_start` values index the global `term_*` arrays, so each chunk reuses
+        // these handles unchanged; only the per-product record slices and the pair prefix sum are
+        // rebuilt per chunk.
         let tp_h = client.create_from_slice(u16::as_bytes(&term_pparts));
         let tl_h = client.create_from_slice(u32::as_bytes(&term_lens));
         let g_h = client.create_from_slice(u32::as_bytes(&g));
@@ -791,40 +819,71 @@ pub fn multiply_batch_on_gpu(
         let rmo_h = client.create_from_slice(u32::as_bytes(&r_mk_offset));
         let rcl_h = client.create_from_slice(u32::as_bytes(&r_cs_len));
         let rml_h = client.create_from_slice(u32::as_bytes(&r_mk_len));
-        let pri_h = client.create_from_slice(u32::as_bytes(&prod_r_index));
-        let pts_h = client.create_from_slice(u32::as_bytes(&prod_term_start));
-        let pnt_h = client.create_from_slice(u32::as_bytes(&prod_num_terms));
-        let prb_h = client.create_from_slice(u32::as_bytes(&prod_row_base));
-        let poo_h = client.create_from_slice(u32::as_bytes(&prod_out_offset));
-        let pps_h = client.create_from_slice(u32::as_bytes(&prod_pair_start));
         let zeros = vec![0u32; out_len];
         let out_h = client.create_from_slice(u32::as_bytes(&zeros));
         const THREADS: u32 = 256;
-        let cubes = (total_pairs as u32).div_ceil(THREADS).max(1);
-        unsafe {
-            multiply_batch_kernel::launch::<CudaRuntime>(
-                &client,
-                CubeCount::Static(cubes, 1, 1),
-                CubeDim::new_1d(THREADS),
-                ArrayArg::from_raw_parts(cs_h, cs_len_master),
-                ArrayArg::from_raw_parts(mk_h, mk_len_master),
-                ArrayArg::from_raw_parts(tp_h, term_pparts.len()),
-                ArrayArg::from_raw_parts(tl_h, term_lens.len()),
-                ArrayArg::from_raw_parts(g_h, g.len()),
-                ArrayArg::from_raw_parts(xi_h, xi.len()),
-                ArrayArg::from_raw_parts(out_h.clone(), out_len),
-                ArrayArg::from_raw_parts(rco_h, r_cs_offset.len()),
-                ArrayArg::from_raw_parts(rmo_h, r_mk_offset.len()),
-                ArrayArg::from_raw_parts(rcl_h, r_cs_len.len()),
-                ArrayArg::from_raw_parts(rml_h, r_mk_len.len()),
-                ArrayArg::from_raw_parts(pri_h, prod_r_index.len()),
-                ArrayArg::from_raw_parts(pts_h, prod_term_start.len()),
-                ArrayArg::from_raw_parts(pnt_h, prod_num_terms.len()),
-                ArrayArg::from_raw_parts(prb_h, prod_row_base.len()),
-                ArrayArg::from_raw_parts(poo_h, prod_out_offset.len()),
-                ArrayArg::from_raw_parts(pps_h, prod_pair_start.len()),
-                width,
-            );
+
+        // Launch the products in chunks each holding at most `GPU_PAIR_CHUNK` pairs, so every
+        // kernel's thread count (and thus `ABSOLUTE_POS`) stays under `2^32`. Each product writes
+        // its F₂ bits into `out_h` with atomic XOR keyed by its global `row`/`out_offset`, so
+        // splitting the product set across launches and accumulating into the shared buffer is
+        // exact (XOR is associative and order-independent).
+        let mut c0 = 0usize;
+        while c0 < products.len() {
+            // Grow the chunk product-by-product until the next one would exceed the cap; always take
+            // at least one product (a single product's pair count is far below the cap).
+            let mut c1 = c0;
+            let mut chunk_pairs = 0usize;
+            while c1 < products.len()
+                && (c1 == c0 || chunk_pairs + prod_pairs[c1] <= GPU_PAIR_CHUNK)
+            {
+                chunk_pairs += prod_pairs[c1];
+                c1 += 1;
+            }
+
+            // Chunk-local pair prefix sum (values < cap, fit `u32`), sentinel at the end.
+            let mut pps_chunk: Vec<u32> = Vec::with_capacity(c1 - c0 + 1);
+            let mut acc = 0u32;
+            for &pairs in &prod_pairs[c0..c1] {
+                pps_chunk.push(acc);
+                acc += pairs as u32;
+            }
+            pps_chunk.push(acc);
+
+            let pri_h = client.create_from_slice(u32::as_bytes(&prod_r_index[c0..c1]));
+            let pts_h = client.create_from_slice(u32::as_bytes(&prod_term_start[c0..c1]));
+            let pnt_h = client.create_from_slice(u32::as_bytes(&prod_num_terms[c0..c1]));
+            let prb_h = client.create_from_slice(u32::as_bytes(&prod_row_base[c0..c1]));
+            let poo_h = client.create_from_slice(u32::as_bytes(&prod_out_offset[c0..c1]));
+            let pps_h = client.create_from_slice(u32::as_bytes(&pps_chunk));
+            let cubes = (chunk_pairs as u32).div_ceil(THREADS).max(1);
+            unsafe {
+                multiply_batch_kernel::launch::<CudaRuntime>(
+                    &client,
+                    CubeCount::Static(cubes, 1, 1),
+                    CubeDim::new_1d(THREADS),
+                    ArrayArg::from_raw_parts(cs_h.clone(), cs_len_master),
+                    ArrayArg::from_raw_parts(mk_h.clone(), mk_len_master),
+                    ArrayArg::from_raw_parts(tp_h.clone(), term_pparts.len()),
+                    ArrayArg::from_raw_parts(tl_h.clone(), term_lens.len()),
+                    ArrayArg::from_raw_parts(g_h.clone(), g.len()),
+                    ArrayArg::from_raw_parts(xi_h.clone(), xi.len()),
+                    ArrayArg::from_raw_parts(out_h.clone(), out_len),
+                    ArrayArg::from_raw_parts(rco_h.clone(), r_cs_offset.len()),
+                    ArrayArg::from_raw_parts(rmo_h.clone(), r_mk_offset.len()),
+                    ArrayArg::from_raw_parts(rcl_h.clone(), r_cs_len.len()),
+                    ArrayArg::from_raw_parts(rml_h.clone(), r_mk_len.len()),
+                    ArrayArg::from_raw_parts(pri_h, c1 - c0),
+                    ArrayArg::from_raw_parts(pts_h, c1 - c0),
+                    ArrayArg::from_raw_parts(pnt_h, c1 - c0),
+                    ArrayArg::from_raw_parts(prb_h, c1 - c0),
+                    ArrayArg::from_raw_parts(poo_h, c1 - c0),
+                    ArrayArg::from_raw_parts(pps_h, pps_chunk.len()),
+                    width,
+                );
+            }
+
+            c0 = c1;
         }
 
         let bytes = client.read_one(out_h).unwrap();

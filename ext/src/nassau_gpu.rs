@@ -279,8 +279,9 @@ pub fn get_partial_matrix_restricted_verified(
         assert_eq!(
             g, c,
             "GPU/CPU restricted get_partial_matrix mismatch at degree {degree}, row {row} \
-             (input {}, target_dim {target_dim})",
+             (input {}, target_dim {target_dim}, num_rows {})",
             inputs[row],
+            inputs.len(),
         );
     }
     cpu
