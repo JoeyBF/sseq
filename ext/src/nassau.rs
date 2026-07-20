@@ -46,11 +46,13 @@ use sseq::coordinates::{Bidegree, BidegreeGenerator};
 use crate::{
     chain_complex::{AugmentedChainComplex, ChainComplex, FiniteChainComplex, FreeChainComplex},
     save::{NassauCommand, NassauQiWriter, SaveDirectory, SaveKind},
+    utils::parallel::ParallelGuard,
 };
 
 /// See [`resolution::SenderData`](../resolution/struct.SenderData.html). This differs by not having the `new` field.
 struct SenderData {
     b: Bidegree,
+    retry: bool,
     sender: mpsc::Sender<Self>,
 }
 
@@ -59,6 +61,18 @@ impl SenderData {
         sender
             .send(Self {
                 b,
+                retry: false,
+                sender: sender.clone(),
+            })
+            .unwrap()
+    }
+
+    pub(crate) fn send_retry(b: Bidegree, sender: mpsc::Sender<Self>) {
+        tracing::info!(%b, "retrying");
+        sender
+            .send(Self {
+                b,
+                retry: true,
                 sender: sender.clone(),
             })
             .unwrap()
@@ -753,6 +767,7 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
         // the per-signature masks partition; `next_dim` is the restricted column count.
         let full_reuse: Option<Matrix> = if reuse_full_matrix(&self.differentials[b.s() - 1]) {
             let all_rows: Vec<usize> = (0..target_dim).collect();
+            let _guard = ParallelGuard::new();
             Some(restricted_partial_matrix_maybe_gpu(
                 &self.differentials[b.s() - 1],
                 b.t(),
@@ -769,6 +784,7 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                 select_rows(full, &target_mask)
             }
             None => {
+                let _guard = ParallelGuard::new();
                 restricted_partial_matrix_maybe_gpu(
                     &self.differentials[b.s() - 1],
                     b.t(),
@@ -865,6 +881,7 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                     select_rows(full, &target_mask)
                 }
                 None => {
+                    let _guard = ParallelGuard::new();
                     restricted_partial_matrix_maybe_gpu(
                         &self.differentials[b.s() - 1],
                         b.t(),
@@ -956,6 +973,7 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                 0,
             );
             {
+                let _guard = ParallelGuard::new();
                 chain_map.get_matrix(matrix.segment(0, 0), t);
             }
             matrix.segment(1, 1).add_identity();
@@ -996,6 +1014,7 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
         let mut matrix =
             AugmentedMatrix::<2>::new(p, target_dim, [cc_module.dimension(t), target_dim]);
         {
+            let _guard = ParallelGuard::new();
             self.chain_maps[0].get_matrix(matrix.segment(0, 0), t);
         }
         matrix.segment(1, 1).add_identity();
@@ -1010,6 +1029,7 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
             0,
         );
         {
+            let _guard = ParallelGuard::new();
             self.differentials[1].get_matrix(matrix.segment(0, 0), t);
         }
         matrix.segment(1, 1).add_identity();
@@ -1162,6 +1182,10 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                     let tracing_span = tracing_span.clone();
                     scope.spawn(move |_| {
                         let _tracing_guard = tracing_span.enter();
+                        if crate::utils::parallel::is_in_parallel() {
+                            SenderData::send_retry(b, sender);
+                            return;
+                        }
                         self.step_resolution(b);
                         SenderData::send(b, sender);
                     });
@@ -1178,7 +1202,11 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
             }
             drop(sender);
 
-            while let Ok(SenderData { b, sender }) = receiver.recv() {
+            while let Ok(SenderData { b, retry, sender }) = receiver.recv() {
+                if retry {
+                    f(b, sender);
+                    continue;
+                }
                 assert!(progress[b.s() as usize] == b.t() - 1);
                 progress[b.s() as usize] = b.t();
 
@@ -1611,6 +1639,7 @@ impl<'a, M: ZeroModule<Algebra = MilnorAlgebra>> RecomputeReader<'a, M> {
             .collect();
 
         let full_matrix = {
+            let _guard = ParallelGuard::new();
             restricted_partial_matrix(&self.res.differentials[s], t, &src_mask, self.next_dim)
         };
         let mut masked_matrix =
