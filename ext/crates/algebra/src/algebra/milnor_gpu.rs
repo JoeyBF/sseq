@@ -23,18 +23,6 @@ use cubecl::{
     cuda::{CudaDevice, CudaRuntime},
     prelude::*,
 };
-use cubecl_common::stream_id::StreamId;
-
-/// The single CUDA stream all GPU work is pinned to (via [`StreamId::executes`]).
-///
-/// CubeCL's memory pools are per-stream, and the resolution issues launches from many
-/// rayon worker threads (each its own stream). Left alone, each stream's pool retains its
-/// freed per-launch buffers (chiefly the hundreds-of-MB `out_h`), and across ~16 streams
-/// they accumulate until the 4 GB card OOMs — `memory_cleanup` only trims the *calling*
-/// stream's pool. Pinning every launch to one stream gives one pool that each launch's
-/// `memory_cleanup` fully reclaims. Value 0 is a valid stream id (the first thread's).
-const GPU_STREAM: StreamId = StreamId { value: 0 };
-
 // Only the `#[cfg(test)]` standalone `seqno_kernel` sizes its working array by this bound; the
 // production kernels use `WORKING_CAP`.
 #[cfg(test)]
@@ -81,10 +69,7 @@ pub fn take_batch_stats() -> (u64, u64, u64, u64) {
     )
 }
 
-use std::{
-    collections::HashMap,
-    sync::{LazyLock, Mutex},
-};
+use std::{cell::RefCell, collections::HashMap};
 
 use cubecl::server::Handle;
 
@@ -100,7 +85,7 @@ struct RInfo {
     num_mats: u32,
 }
 
-/// Process-global resident store of admissible-matrix data, both host- and device-side.
+/// Per-thread resident store of admissible-matrix data, both host- and device-side.
 ///
 /// Admissible-matrix enumeration is a pure function of `R`'s p-part and the same
 /// low-degree `R`s recur in essentially every bidegree, so the host master (`col_sums` /
@@ -109,12 +94,15 @@ struct RInfo {
 /// and are re-uploaded *only when it grows* — after the `R`s saturate (early in a
 /// resolution) launches upload no admissible data at all, cutting the dominant transfer.
 ///
-/// Guarded by a `Mutex` so the device section serializes across rayon worker threads: each
-/// launch runs to its blocking readback before releasing, giving a happens-before edge and
-/// no concurrent access — which is what CubeCL's single-device-thread managed-memory model
-/// (its `unsafe impl Sync`) requires for a handle created on one thread to be reused on
-/// another. Safe as a global because in the GPU path's regime (`p = 2`, trivial profile)
-/// `admissible_matrices` depends only on the p-part, not on the algebra instance.
+/// Held in *thread-local* storage (see [`RESIDENT`]), one independent store per rayon worker.
+/// Each worker therefore creates and consumes its own `cs_handle`/`mk_handle` on the single
+/// thread — and thus the single default CUDA stream — that owns them, so no handle is ever
+/// shared across threads. That is what lets us drop the old global `Mutex`: cubecl 0.10's
+/// per-device runner thread already serializes server access (making concurrent client calls
+/// memory-safe), and keeping every worker's buffers on its own stream avoids cross-stream
+/// event synchronization while letting independent bidegrees marshal and launch concurrently.
+/// Duplicating the cache per thread is cheap and correct: in the GPU path's regime (`p = 2`,
+/// trivial profile) `admissible_matrices` depends only on the p-part, not the algebra instance.
 #[derive(Default)]
 struct Resident {
     col_sums: Vec<u16>,
@@ -148,7 +136,12 @@ impl Resident {
     }
 }
 
-static RESIDENT: LazyLock<Mutex<Resident>> = LazyLock::new(|| Mutex::new(Resident::default()));
+thread_local! {
+    /// Per-thread resident admissible-matrix store (see [`Resident`]). Thread-local instead of
+    /// a shared `Mutex<Resident>` so independent bidegrees no longer serialize on one lock: each
+    /// rayon worker keeps its own cache and GPU handles on its own default CUDA stream.
+    static RESIDENT: RefCell<Resident> = RefCell::new(Resident::default());
+}
 
 /// Elementwise F₂ addition of two bit-packed vectors: `out[i] = a[i] ^ b[i]`.
 ///
@@ -691,8 +684,8 @@ pub fn multiply_batch_on_gpu(
         prod_r_index.push(ri);
     }
 
-    // Admissible-matrix data (`col_sums`/`masks` + per-`R` offsets) is resident (built
-    // under the `RESIDENT` lock below), so nothing to enumerate or lay out here.
+    // Admissible-matrix data (`col_sums`/`masks` + per-`R` offsets) is resident (built in the
+    // thread-local `RESIDENT` store below), so nothing to enumerate or lay out here.
 
     // Parallel: each product's term p-parts (padded to `width`) and lengths.
     let per_prod: Vec<(Vec<u16>, Vec<u32>)> = (0..products.len())
@@ -713,85 +706,86 @@ pub fn multiply_batch_on_gpu(
         })
         .collect();
 
-    // Resident admissible-matrix store: enumerate each new `R` once and reuse forever;
-    // the per-`R` offsets are global (into the master `col_sums`/`masks`). Taking the lock
-    // here also serializes the device section across rayon workers (see [`Resident`]).
-    let mut resident = RESIDENT.lock().unwrap();
-    let mut r_cs_offset: Vec<u32> = Vec::with_capacity(distinct_r.len());
-    let mut r_mk_offset: Vec<u32> = Vec::with_capacity(distinct_r.len());
-    let mut r_cs_len: Vec<u32> = Vec::with_capacity(distinct_r.len());
-    let mut r_mk_len: Vec<u32> = Vec::with_capacity(distinct_r.len());
-    let mut r_num_matrices: Vec<usize> = Vec::with_capacity(distinct_r.len());
-    for &(rd, ridx) in &distinct_r {
-        let r = algebra.basis_element_from_index(rd, ridx);
-        assert!(!r.p_part.is_empty(), "each R must be non-empty");
-        let info = resident.ensure(algebra, &r.p_part);
-        r_cs_offset.push(info.cs_off);
-        r_mk_offset.push(info.mk_off);
-        r_cs_len.push(info.cs_len);
-        r_mk_len.push(info.mk_len);
-        r_num_matrices.push(info.num_mats as usize);
-    }
+    // Resident admissible-matrix store (thread-local; see [`Resident`]): enumerate each new `R`
+    // once per worker and reuse forever, with per-`R` offsets into this thread's master
+    // `col_sums`/`masks`. The whole marshal + device section runs inside this borrow, but it is
+    // uncontended — no other thread can touch this worker's store.
+    RESIDENT.with_borrow_mut(|resident| {
+        let mut r_cs_offset: Vec<u32> = Vec::with_capacity(distinct_r.len());
+        let mut r_mk_offset: Vec<u32> = Vec::with_capacity(distinct_r.len());
+        let mut r_cs_len: Vec<u32> = Vec::with_capacity(distinct_r.len());
+        let mut r_mk_len: Vec<u32> = Vec::with_capacity(distinct_r.len());
+        let mut r_num_matrices: Vec<usize> = Vec::with_capacity(distinct_r.len());
+        for &(rd, ridx) in &distinct_r {
+            let r = algebra.basis_element_from_index(rd, ridx);
+            assert!(!r.p_part.is_empty(), "each R must be non-empty");
+            let info = resident.ensure(algebra, &r.p_part);
+            r_cs_offset.push(info.cs_off);
+            r_mk_offset.push(info.mk_off);
+            r_cs_len.push(info.cs_len);
+            r_mk_len.push(info.mk_len);
+            r_num_matrices.push(info.num_mats as usize);
+        }
 
-    // Lay out per-product term data + records + the pair-count prefix sum (sequential).
-    let mut term_pparts: Vec<u16> = Vec::new();
-    let mut term_lens: Vec<u32> = Vec::new();
-    let mut prod_term_start: Vec<u32> = Vec::with_capacity(products.len());
-    let mut prod_num_terms: Vec<u32> = Vec::with_capacity(products.len());
-    let mut prod_row_base: Vec<u32> = Vec::with_capacity(products.len());
-    let mut prod_out_offset: Vec<u32> = Vec::with_capacity(products.len());
-    // Per-product `(matrix, term)` pair count. A launch's total pair count is the sum, and can
-    // exceed `u32::MAX` at record degrees (a single all-rows reuse build reaches ~4.4e9 pairs at
-    // stem ~145). The kernel indexes threads by `ABSOLUTE_POS`, itself a `u32`, so a launch can
-    // address at most `2^32` threads; the device section below splits the products into chunks each
-    // bounded by [`GPU_PAIR_CHUNK`] so every kernel launch stays safely under that limit. Keeping the
-    // per-product counts (rather than a single prefix sum) lets each chunk build its own `u32`
-    // prefix sum locally.
-    let mut prod_pairs: Vec<usize> = Vec::with_capacity(products.len());
-    let mut pair_acc: usize = 0;
-    for (pi, (tp, tl)) in per_prod.iter().enumerate() {
-        let prod = &products[pi];
-        let ri = prod_r_index[pi];
-        prod_term_start.push(term_lens.len() as u32);
-        term_lens.extend_from_slice(tl);
-        term_pparts.extend_from_slice(tp);
-        let pairs = r_num_matrices[ri as usize] * prod.term_indices.len();
-        prod_pairs.push(pairs);
-        pair_acc += pairs;
-        prod_num_terms.push(prod.term_indices.len() as u32);
-        prod_row_base.push((prod.row * num_limbs) as u32);
-        prod_out_offset.push(prod.out_offset as u32);
-    }
+        // Lay out per-product term data + records + the pair-count prefix sum (sequential).
+        let mut term_pparts: Vec<u16> = Vec::new();
+        let mut term_lens: Vec<u32> = Vec::new();
+        let mut prod_term_start: Vec<u32> = Vec::with_capacity(products.len());
+        let mut prod_num_terms: Vec<u32> = Vec::with_capacity(products.len());
+        let mut prod_row_base: Vec<u32> = Vec::with_capacity(products.len());
+        let mut prod_out_offset: Vec<u32> = Vec::with_capacity(products.len());
+        // Per-product `(matrix, term)` pair count. A launch's total pair count is the sum, and can
+        // exceed `u32::MAX` at record degrees (a single all-rows reuse build reaches ~4.4e9 pairs at
+        // stem ~145). The kernel indexes threads by `ABSOLUTE_POS`, itself a `u32`, so a launch can
+        // address at most `2^32` threads; the device section below splits the products into chunks each
+        // bounded by [`GPU_PAIR_CHUNK`] so every kernel launch stays safely under that limit. Keeping the
+        // per-product counts (rather than a single prefix sum) lets each chunk build its own `u32`
+        // prefix sum locally.
+        let mut prod_pairs: Vec<usize> = Vec::with_capacity(products.len());
+        let mut pair_acc: usize = 0;
+        for (pi, (tp, tl)) in per_prod.iter().enumerate() {
+            let prod = &products[pi];
+            let ri = prod_r_index[pi];
+            prod_term_start.push(term_lens.len() as u32);
+            term_lens.extend_from_slice(tl);
+            term_pparts.extend_from_slice(tp);
+            let pairs = r_num_matrices[ri as usize] * prod.term_indices.len();
+            prod_pairs.push(pairs);
+            pair_acc += pairs;
+            prod_num_terms.push(prod.term_indices.len() as u32);
+            prod_row_base.push((prod.row * num_limbs) as u32);
+            prod_out_offset.push(prod.out_offset as u32);
+        }
 
-    let total_pairs = pair_acc;
-    let out_len = num_rows * num_limbs;
-    if std::env::var_os("NASSAU_GPU_DEBUG").is_some() {
-        let num_chunks = total_pairs.div_ceil(GPU_PAIR_CHUNK).max(1);
-        eprintln!(
-            "[gpu-batch] num_rows={num_rows} num_cols={num_cols} num_limbs={num_limbs} \
+        let total_pairs = pair_acc;
+        let out_len = num_rows * num_limbs;
+        if std::env::var_os("NASSAU_GPU_DEBUG").is_some() {
+            let num_chunks = total_pairs.div_ceil(GPU_PAIR_CHUNK).max(1);
+            eprintln!(
+                "[gpu-batch] num_rows={num_rows} num_cols={num_cols} num_limbs={num_limbs} \
              products={} total_pairs={total_pairs} out_len={out_len} \
              chunks={num_chunks} (cap={GPU_PAIR_CHUNK})",
-            products.len(),
-        );
-    }
-    if total_pairs == 0 {
-        return vec![vec![0u32; num_limbs]; num_rows];
-    }
+                products.len(),
+            );
+        }
+        if total_pairs == 0 {
+            return vec![vec![0u32; num_limbs]; num_rows];
+        }
 
-    // The resident `col_sums`/`masks` are non-empty once any `R` is present (guaranteed
-    // here, since `total_pairs > 0`); only `term_pparts` needs the non-empty guard.
-    if term_pparts.is_empty() {
-        term_pparts.push(0);
-    }
+        // The resident `col_sums`/`masks` are non-empty once any `R` is present (guaranteed
+        // here, since `total_pairs > 0`); only `term_pparts` needs the non-empty guard.
+        if term_pparts.is_empty() {
+            term_pparts.push(0);
+        }
 
-    let marshal_ms = t_marshal.elapsed().as_secs_f64() * 1e3;
+        let marshal_ms = t_marshal.elapsed().as_secs_f64() * 1e3;
 
-    let t_device = std::time::Instant::now();
+        let t_device = std::time::Instant::now();
 
-    // Pin the whole device section to one CUDA stream (see [`GPU_STREAM`]) so a single
-    // memory pool is reclaimed by `memory_cleanup`. Held under the `resident` lock, so this
-    // stream is used by at most one thread at a time.
-    let result = GPU_STREAM.executes(|| {
+        // Device section on this worker's default CUDA stream (distinct per rayon thread, so
+        // independent bidegrees overlap on the GPU). No lock: `resident` is thread-local, so its
+        // handles are only ever touched by this thread, and cubecl's per-device runner serializes
+        // the actual server access. `memory_cleanup` below trims only this stream's own pool.
         let client = CudaRuntime::client(&CudaDevice::default());
         // Resident admissible buffers: (re-)upload the master only when it grew this
         // launch; otherwise reuse the handle from a previous launch and upload nothing.
@@ -899,24 +893,22 @@ pub fn multiply_batch_on_gpu(
         // resident admissible handles stay alive (refcount > 0) so cleanup skips them.
         client.memory_cleanup();
 
+        // Aggregate marshal/device totals across every launch (cheap, always on) so a whole
+        // resolution's GPU overhead can be split host-vs-device via [`take_batch_stats`].
+        let device_ms = t_device.elapsed().as_secs_f64() * 1e3;
+        BATCH_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        BATCH_MARSHAL_US.fetch_add(
+            (marshal_ms * 1e3) as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        BATCH_DEVICE_US.fetch_add(
+            (device_ms * 1e3) as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        BATCH_PAIRS.fetch_add(total_pairs as u64, std::sync::atomic::Ordering::Relaxed);
+
         result
-    });
-
-    // Aggregate marshal/device totals across every launch (cheap, always on) so a whole
-    // resolution's GPU overhead can be split host-vs-device via [`take_batch_stats`].
-    let device_ms = t_device.elapsed().as_secs_f64() * 1e3;
-    BATCH_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    BATCH_MARSHAL_US.fetch_add(
-        (marshal_ms * 1e3) as u64,
-        std::sync::atomic::Ordering::Relaxed,
-    );
-    BATCH_DEVICE_US.fetch_add(
-        (device_ms * 1e3) as u64,
-        std::sync::atomic::Ordering::Relaxed,
-    );
-    BATCH_PAIRS.fetch_add(total_pairs as u64, std::sync::atomic::Ordering::Relaxed);
-
-    result
+    })
 }
 
 #[cfg(test)]
