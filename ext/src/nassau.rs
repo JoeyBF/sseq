@@ -1175,7 +1175,7 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
 
             let (sender, receiver) = mpsc::channel();
 
-            let f = |b: Bidegree, sender: mpsc::Sender<SenderData>| {
+            let spawn_bidegree = |b: Bidegree, sender: mpsc::Sender<SenderData>| {
                 if self.has_computed_bidegree(b) {
                     SenderData::send(b, sender);
                 } else {
@@ -1197,32 +1197,83 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
             // diagonal predecessor `(0, min_degree)` is in region, so we let it be spawned instead.
             for s in 0..=max_s {
                 if s != 1 {
-                    f(Bidegree::s_t(s, min_degree), sender.clone());
+                    spawn_bidegree(Bidegree::s_t(s, min_degree), sender.clone());
                 }
             }
             drop(sender);
 
-            while let Ok(SenderData { b, retry, sender }) = receiver.recv() {
-                if retry {
-                    f(b, sender);
-                    continue;
-                }
-                assert!(progress[b.s() as usize] == b.t() - 1);
-                progress[b.s() as usize] = b.t();
+            // Bidegrees whose spawned job was stolen onto a worker already inside a critical section
+            // (`is_in_parallel` set on that worker) and so bounced back a retry rather than causing
+            // a priority inversion. Because the check is per-thread, a job is only ever bounced when
+            // its worker is a blocked guard holder; a job picked up by a free worker just runs. Such
+            // bounces are therefore rare, but when the pool is momentarily saturated we still must
+            // avoid re-spawning immediately in a tight loop, so we park bounced bidegrees here.
+            //
+            // The scheduler thread never holds a guard, so it cannot itself observe when a worker
+            // frees; instead, while anything is parked we wait on the channel with a short timeout
+            // and retry the parked work whenever a completion arrives (a worker likely just freed)
+            // or the timeout elapses (periodic re-check). Incoming messages are still handled the
+            // instant they arrive; the timeout only governs how promptly we retry while otherwise
+            // idle. This cannot deadlock: parked entries keep their senders, so the channel stays
+            // open, and the timeout guarantees parked work is retried until a free worker takes it.
+            let mut deferred: Vec<(Bidegree, mpsc::Sender<SenderData>)> = Vec::new();
+            // How long to wait for a message before retrying parked bidegrees. Small enough that a
+            // freed worker is used promptly, large enough that the poll is negligible; it only ticks
+            // while something is parked.
+            const RETRY_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_micros(100);
 
-                // Completing `b` can only make ready its same-row successor `(s, t + 1)` and one
-                // diagonal successor. `ready` requires *both* predecessors, so of the two
-                // completions that could spawn a given bidegree, only the later one does.
-                let same_row = b + Bidegree::s_t(0, 1);
-                let diagonal = if b.s() == 0 {
-                    Bidegree::s_t(1, b.t())
+            loop {
+                let event = if deferred.is_empty() {
+                    // Nothing parked: block until a message arrives or all senders drop.
+                    match receiver.recv() {
+                        Ok(data) => Some(data),
+                        Err(_) => break,
+                    }
                 } else {
-                    b + Bidegree::s_t(1, 1)
+                    // Something parked: wake periodically to retry it. Parked entries hold senders,
+                    // so the channel cannot be disconnected here.
+                    match receiver.recv_timeout(RETRY_POLL_INTERVAL) {
+                        Ok(data) => Some(data),
+                        Err(mpsc::RecvTimeoutError::Timeout) => None,
+                        Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                    }
                 };
 
-                for cand in [same_row, diagonal] {
-                    if ready(cand.s(), cand.t(), &progress) {
-                        f(cand, sender.clone());
+                if let Some(SenderData { b, retry, sender }) = event {
+                    if retry {
+                        // Park until a worker frees; retried below on a completion or timeout.
+                        deferred.push((b, sender));
+                        continue;
+                    }
+                    assert!(progress[b.s() as usize] == b.t() - 1);
+                    progress[b.s() as usize] = b.t();
+
+                    // Completing `b` can only make ready its same-row successor `(s, t + 1)` and one
+                    // diagonal successor. `ready` requires *both* predecessors, so of the two
+                    // completions that could spawn a given bidegree, only the later one does.
+                    let same_row = b + Bidegree::s_t(0, 1);
+                    let diagonal = if b.s() == 0 {
+                        Bidegree::s_t(1, b.t())
+                    } else {
+                        b + Bidegree::s_t(1, 1)
+                    };
+
+                    for cand in [same_row, diagonal] {
+                        if ready(cand.s(), cand.t(), &progress) {
+                            spawn_bidegree(cand, sender.clone());
+                        }
+                    }
+                }
+
+                // Retry parked bidegrees — reached after a completion (a worker likely just freed)
+                // or a timeout (periodic re-check), but not after a retry (which `continue`s above,
+                // so a bounced job waits out the timeout before being retried). Each re-spawned job
+                // re-checks its own worker's flag: those on a free worker run, those stolen onto a
+                // blocked guard holder bounce and are re-parked. This stays cheap because per-thread
+                // bounces are rare, so `deferred` is normally empty.
+                if !deferred.is_empty() {
+                    for (b, sender) in std::mem::take(&mut deferred) {
+                        spawn_bidegree(b, sender);
                     }
                 }
             }
