@@ -26,9 +26,12 @@ pub struct SeqSeeBackend<T: io::Write> {
     nodes: Map<String, Value>,
     /// The list of SeqSee edge objects.
     edges: Vec<Value>,
-    /// The set of style names referenced by edges. Each becomes an attribute alias in the header so
-    /// that the edges referencing it validate against the schema.
+    /// The set of style names referenced by edges or nodes. Each becomes an attribute alias in the
+    /// header so that the objects referencing it validate against the schema.
     styles: BTreeSet<String>,
+    /// Explicit attribute-alias definitions, `name -> attributes array`. These override the
+    /// auto-generated `[]`/differential defaults for the same name at [`Drop`] time.
+    attribute_defs: Map<String, Value>,
 }
 
 impl<T: io::Write> SeqSeeBackend<T> {
@@ -39,7 +42,55 @@ impl<T: io::Write> SeqSeeBackend<T> {
             nodes: Map::new(),
             edges: Vec::new(),
             styles: BTreeSet::new(),
+            attribute_defs: Map::new(),
         }
+    }
+
+    /// Register a named attribute alias with an explicit spec, e.g.
+    /// `define_attribute("tau3", json!([{ "color": "#d62728" }]))`.
+    ///
+    /// The `spec` is a SeqSee attributes array (each item a `{color, size, ...}` object). It appears
+    /// under `header.aliases.attributes` and takes precedence over the auto-generated default for a
+    /// name of the same key. Nodes and edges reference the alias by name via [`Self::styled_node`]
+    /// and [`Backend::structline`].
+    pub fn define_attribute(&mut self, name: &str, spec: Value) {
+        self.attribute_defs.insert(name.to_string(), spec);
+    }
+
+    /// Emit a single node at bidegree `b`, position index `position`, carrying the named attribute
+    /// aliases `attrs` (colors, sizes, ... registered via [`Self::define_attribute`]) and an
+    /// optional `label`.
+    ///
+    /// Like [`Backend::node`], out-of-bounds nodes (beyond `max`) are silently skipped, and the node
+    /// id uses the same `(x,y,idx)` format so structline endpoints stay in sync. Any referenced
+    /// attribute name that was not explicitly defined is auto-registered as an empty alias.
+    pub fn styled_node(
+        &mut self,
+        b: Bidegree,
+        position: usize,
+        attrs: &[String],
+        label: Option<String>,
+    ) -> Result<(), io::Error> {
+        if b.x() > self.max.x() || b.y() > self.max.y() {
+            return Ok(());
+        }
+
+        let id = format!("{:#}", BidegreeGenerator::new(b, position));
+        let mut node = Map::new();
+        node.insert("x".to_string(), json!(b.x()));
+        node.insert("y".to_string(), json!(b.y()));
+        node.insert("position".to_string(), json!(position));
+        if !attrs.is_empty() {
+            for a in attrs {
+                self.styles.insert(a.clone());
+            }
+            node.insert("attributes".to_string(), json!(attrs));
+        }
+        if let Some(label) = label {
+            node.insert("label".to_string(), Value::String(label));
+        }
+        self.nodes.insert(id, Value::Object(node));
+        Ok(())
     }
 }
 
@@ -137,6 +188,10 @@ impl<T: io::Write> Drop for SeqSeeBackend<T> {
             };
             attributes.insert(style.clone(), attr);
         }
+        // Explicit definitions win over the auto-generated defaults above.
+        for (name, spec) in &self.attribute_defs {
+            attributes.insert(name.clone(), spec.clone());
+        }
 
         let document = json!({
             "header": {
@@ -221,6 +276,79 @@ mod tests {
             ],
         });
         assert_eq!(produced, expected);
+    }
+
+    #[test]
+    fn test_styled_node_and_define_attribute() {
+        let mut buf: Vec<u8> = Vec::new();
+        {
+            let mut backend = SeqSeeBackend::new(&mut buf);
+            backend.init(Bidegree::x_y(2, 2)).unwrap();
+
+            // Explicit definition; overrides nothing, so appears verbatim.
+            backend.define_attribute("tau2", json!([{ "color": "#d62728" }]));
+
+            // Styled node referencing the explicit attr, plus a label.
+            backend
+                .styled_node(Bidegree::x_y(0, 0), 0, &["tau2".to_string()], Some("x".to_string()))
+                .unwrap();
+            // Styled node referencing an attr never explicitly defined: auto-registered as `[]`.
+            backend
+                .styled_node(Bidegree::x_y(1, 1), 0, &["free".to_string()], None)
+                .unwrap();
+            // Plain node, no attributes.
+            backend.styled_node(Bidegree::x_y(0, 1), 0, &[], None).unwrap();
+            // Out of bounds: dropped silently.
+            backend
+                .styled_node(Bidegree::x_y(9, 9), 0, &["free".to_string()], None)
+                .unwrap();
+        }
+
+        let produced: Value = serde_json::from_slice(&buf).unwrap();
+        let expected = json!({
+            "header": {
+                "chart": {
+                    "width": { "min": 0, "max": 2 },
+                    "height": { "min": 0, "max": 2 },
+                },
+                "aliases": {
+                    "attributes": {
+                        "tau2": [{ "color": "#d62728" }],
+                        "free": [],
+                    },
+                },
+            },
+            "nodes": {
+                "(0,0,0)": { "x": 0, "y": 0, "position": 0, "attributes": ["tau2"], "label": "x" },
+                "(1,1,0)": { "x": 1, "y": 1, "position": 0, "attributes": ["free"] },
+                "(0,1,0)": { "x": 0, "y": 1, "position": 0 },
+            },
+            "edges": [],
+        });
+        assert_eq!(produced, expected);
+    }
+
+    #[test]
+    fn test_define_attribute_overrides_default() {
+        let mut buf: Vec<u8> = Vec::new();
+        {
+            let mut backend = SeqSeeBackend::new(&mut buf);
+            backend.init(Bidegree::x_y(2, 2)).unwrap();
+            // `d2` would default to blue; an explicit definition must win.
+            backend.define_attribute("d2", json!([{ "color": "green" }]));
+            backend
+                .structline(
+                    BidegreeGenerator::new(Bidegree::x_y(1, 1), 0),
+                    BidegreeGenerator::new(Bidegree::x_y(0, 1), 0),
+                    Some("d2"),
+                )
+                .unwrap();
+        }
+        let produced: Value = serde_json::from_slice(&buf).unwrap();
+        assert_eq!(
+            produced["header"]["aliases"]["attributes"]["d2"],
+            json!([{ "color": "green" }])
+        );
     }
 
     #[test]
