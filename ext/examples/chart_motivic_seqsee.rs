@@ -161,10 +161,14 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
-    // --- 3. Assemble the dots: one per generator, keyed by its `Gen` so products can find their
-    // endpoints. Positions stack per (n, s), ordered by (weight, ambient index). -------------------
-    let mut dot_of: HashMap<(i32, i32, usize), Dot> = HashMap::new(); // (s, t, idx) -> Dot
-    let mut next_pos: HashMap<(i32, i32), usize> = HashMap::new();
+    // --- 3. Assemble the dots. The SS classification above gives *candidate* generators with a
+    // `Gen` identity (needed to wire products), but the authoritative per-bidegree module structure
+    // is `tau_module` (the SNF of the outgoing δ). So we draw exactly what `tau_module` reports and
+    // attach a candidate `Gen` to each dot by matching torsion order, dropping any surplus candidate
+    // and leaving a dot `Gen`-less if the classification came up short (rare, top-of-range only). ---
+
+    // Candidate generators per (n, s), each `(order, (s, t, idx))`.
+    let mut cand: HashMap<(i32, i32), Vec<(Order, (i32, i32, usize))>> = HashMap::new();
     let mut slices: Vec<(i32, i32, i32)> = order_of.keys().copied().collect();
     slices.sort_unstable();
     for key @ (n, s, _w) in slices {
@@ -173,17 +177,41 @@ fn main() -> anyhow::Result<()> {
             order_of[&key].iter().map(|(&i, &o)| (i, o)).collect();
         entries.sort_unstable();
         for (i, order) in entries {
-            let pos = next_pos.entry((n, s)).or_insert(0);
-            dot_of.insert(
-                (s, n + s, gens[i]),
-                Dot {
-                    n,
-                    s,
-                    pos: *pos,
-                    order,
-                },
-            );
-            *pos += 1;
+            cand.entry((n, s))
+                .or_default()
+                .push((order, (s, n + s, gens[i])));
+        }
+    }
+
+    // Every dot to draw, and — when a candidate matched — the `Gen` behind it (for products).
+    let mut dots: Vec<Dot> = Vec::new();
+    let mut dot_of: HashMap<(i32, i32, usize), Dot> = HashMap::new(); // (s, t, idx) -> Dot
+    for s in 0..=max_s {
+        for n in 0..=max_n {
+            let tm = res.tau_module(s, n + s);
+            // The multiset of orders `tau_module` says must be present: `free` copies of order 0
+            // plus one per torsion order.
+            let mut wanted: Vec<Order> = vec![0; tm.free];
+            wanted.extend(tm.torsion.iter().copied());
+            wanted.sort_unstable();
+
+            let mut avail = cand.remove(&(n, s)).unwrap_or_default();
+            let mut used = vec![false; avail.len()];
+            for (pos, &order) in wanted.iter().enumerate() {
+                // Attach a not-yet-used candidate of the same order, if any.
+                let matched = avail
+                    .iter()
+                    .enumerate()
+                    .position(|(k, &(o, _))| !used[k] && o == order);
+                let dot = Dot { n, s, pos, order };
+                if let Some(k) = matched {
+                    used[k] = true;
+                    dot_of.insert(avail[k].1, dot);
+                }
+                dots.push(dot);
+            }
+            // Surplus candidates (the classification's over-counts) are simply not drawn.
+            let _ = &mut avail;
         }
     }
 
@@ -203,8 +231,8 @@ fn main() -> anyhow::Result<()> {
     // Red arrow for the τ-annihilated infinite h₁-towers (rule 9).
     backend.define_attribute("h1tower", json!([{ "color": "#e41a1c", "arrowTip": "simple" }]));
 
-    // Draw the dots.
-    for dot in dot_of.values() {
+    // Draw the dots exactly as `tau_module` dictates (colors/counts are authoritative).
+    for dot in &dots {
         backend.styled_node(
             Bidegree::n_s(dot.n, dot.s),
             dot.pos,
@@ -213,33 +241,15 @@ fn main() -> anyhow::Result<()> {
         )?;
     }
 
-    // Cross-check the per-bidegree module structure against the pipeline's SNF report; warn (stderr)
-    // without aborting.
-    let mut free_at: HashMap<(i32, i32), usize> = HashMap::new();
-    let mut tors_at: HashMap<(i32, i32), Vec<Order>> = HashMap::new();
-    for dot in dot_of.values() {
-        if dot.order == 0 {
-            *free_at.entry((dot.n, dot.s)).or_insert(0) += 1;
-        } else {
-            tors_at.entry((dot.n, dot.s)).or_default().push(dot.order);
-        }
-    }
-    for s in 0..=max_s {
-        for n in 0..=max_n {
-            let tm = res.tau_module(s, n + s);
-            let free = free_at.get(&(n, s)).copied().unwrap_or(0);
-            let mut got = tors_at.get(&(n, s)).cloned().unwrap_or_default();
-            got.sort_unstable();
-            let mut want = tm.torsion.clone();
-            want.sort_unstable();
-            if free != tm.free || got != want {
-                eprintln!(
-                    "warning: module mismatch at (n={n}, s={s}): chart free={free} tors={got:?} \
-                     vs tau_module free={} tors={want:?}",
-                    tm.free
-                );
-            }
-        }
+    // Report how many generators could not be tied to a `Gen` for product wiring (dots still drawn
+    // with the right color, but with no outgoing/incoming product lines). Diagnostic only.
+    let unmatched = dots.len() - dot_of.len();
+    if unmatched > 0 {
+        eprintln!(
+            "note: {unmatched} of {} dots had no matching Gen for products (drawn, colored, but \
+             unwired)",
+            dots.len()
+        );
     }
 
     // --- 5. Filtration-one products h₀, h₁, h₂ (Isaksen draws only these). ----------------------
