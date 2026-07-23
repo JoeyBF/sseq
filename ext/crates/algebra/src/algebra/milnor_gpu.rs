@@ -266,6 +266,21 @@ fn resident_info(algebra: &MilnorAlgebra, p_part: &[PPartEntry]) -> RInfo {
     info
 }
 
+/// Zero a device `u32` buffer on-device: `out[i] = 0`, one thread per limb.
+///
+/// Initializes the batched multiply's XOR accumulator without allocating and uploading a host
+/// zero buffer. Profiling (stem 145) showed the per-launch `create_from_slice` of a
+/// hundreds-of-MB `out_h` zero vec — a host `memset` + non-pinned host→device `memcpy`, both on
+/// the calling rayon worker — was the dominant serial marshaling cost, stalling the wavefront.
+/// On-device zeroing is memory-bound (microseconds on an H200) and same-stream ordered before
+/// the multiply kernel, so no host allocation, upload, or extra sync is needed.
+#[cube(launch)]
+fn zero_u32(out: &mut Array<u32>) {
+    if ABSOLUTE_POS < out.len() {
+        out[ABSOLUTE_POS] = 0u32;
+    }
+}
+
 /// Elementwise F₂ addition of two bit-packed vectors: `out[i] = a[i] ^ b[i]`.
 ///
 /// One thread per `u32` limb. F₂ addition is XOR of the packed limbs, so this is
@@ -1034,9 +1049,19 @@ fn multiply_batch_block(
         let rmo_h = client.create_from_slice(u32::as_bytes(&r_mk_offset));
         let rcl_h = client.create_from_slice(u32::as_bytes(&r_cs_len));
         let rml_h = client.create_from_slice(u32::as_bytes(&r_mk_len));
-        let zeros = vec![0u32; out_len];
-        let out_h = client.create_from_slice(u32::as_bytes(&zeros));
         const THREADS: u32 = 256;
+        // Allocate the XOR accumulator uninitialized and zero it on-device (see [`zero_u32`]),
+        // instead of uploading a hundreds-of-MB host zero buffer — the former dominant serial
+        // marshaling cost. Same stream as the multiply below, so it is ordered before it.
+        let out_h = client.empty(out_len * size_of::<u32>());
+        unsafe {
+            zero_u32::launch::<CudaRuntime>(
+                &client,
+                CubeCount::Static((out_len as u32).div_ceil(THREADS).max(1), 1, 1),
+                CubeDim::new_1d(THREADS),
+                ArrayArg::from_raw_parts(out_h.clone(), out_len),
+            );
+        }
 
         let pri_h = client.create_from_slice(u32::as_bytes(&prod_r_index));
         let pts_h = client.create_from_slice(u32::as_bytes(&prod_term_start));
