@@ -94,6 +94,46 @@ impl MotivicResolution {
     /// `gₖ ↦ ε_b(φₐ(gₖ))` — the coefficient of the augmentation term `1 ⊗ b` in
     /// `φₐ(gₖ)`. Since `φₐ(gₖ)` has weight `w(gₖ) − w(a)` and `1 ⊗ b` has weight
     /// `w(b)`, that coefficient's forced τ-power is `w(a) + w(b) − w(gₖ)`.
+    /// All left products `a · b` for a fixed `a`, from a **single** lift of `φₐ`.
+    ///
+    /// This is the batched form of [`Self::motivic_product`]: it lifts the product chain map `φₐ`
+    /// once (the expensive step) and reads off `a · b` for every source generator `b` at once,
+    /// returning a map `b ↦ [(target, τ-power)]`. Prefer this when multiplying many `b` by the same
+    /// `a` (e.g. every generator by a fixed `hᵢ`), where calling [`Self::motivic_product`] in a loop
+    /// would re-lift `φₐ` on every call.
+    ///
+    /// A `b` absent from the map (or with an empty list) has `a · b = 0`.
+    pub fn motivic_products_by(&self, a: Gen) -> HashMap<Gen, Vec<(Gen, u32)>> {
+        let phi = self.lift_product(a, self.max.s());
+        let wa = self.weights[&a];
+        let mut out: HashMap<Gen, Vec<(Gen, u32)>> = HashMap::new();
+        for (&gk, support) in &phi {
+            let b_s = gk.s - a.s;
+            let b_t = gk.t - a.t;
+            if b_s < 0 || b_t < 0 {
+                continue;
+            }
+            // `φₐ(gk)` lives in `F_{bₛ}` at degree `bₜ`; a support entry that is the augmentation
+            // term `1 ⊗ b` (generator `b` at homological degree 0) contributes `gk` to `a · b`.
+            let out_mod = self.module(b_s);
+            for b_idx in 0..self.num_gens(b_s, b_t) {
+                let idx_1b = out_mod.operation_generator_to_index(0, 0, b_t, b_idx);
+                if support.contains(&idx_1b) {
+                    let b = Gen {
+                        s: b_s,
+                        t: b_t,
+                        idx: b_idx,
+                    };
+                    let wb = self.weights[&b];
+                    out.entry(b)
+                        .or_default()
+                        .push((gk, (wa + wb - self.weights[&gk]) as u32));
+                }
+            }
+        }
+        out
+    }
+
     pub fn motivic_product(&self, a: Gen, b: Gen) -> Vec<(Gen, u32)> {
         let target_s = a.s + b.s;
         let target_t = a.t + b.t;

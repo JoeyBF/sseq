@@ -807,6 +807,33 @@ mod tests {
     use super::*;
 
     #[test]
+    fn motivic_products_by_matches_motivic_product() {
+        // The batched `motivic_products_by(a)` must agree with `motivic_product(a, b)` on every b,
+        // for a fixed a — it just lifts φₐ once instead of per pair.
+        let res = MotivicResolution::new(Bidegree::n_s(12, 8));
+        let top_s = res.max().s();
+        for a in [
+            Gen { s: 1, t: 1, idx: 0 }, // h₀
+            Gen { s: 1, t: 2, idx: 0 }, // h₁
+            Gen { s: 1, t: 4, idx: 0 }, // h₂
+        ] {
+            let batched = res.motivic_products_by(a);
+            for s in 0..=top_s {
+                for t in 0..=(res.max().n() + s) {
+                    for idx in 0..res.algebraic_novikov_rank(s, t) {
+                        let b = Gen { s, t, idx };
+                        let mut want = res.motivic_product(a, b);
+                        want.sort();
+                        let mut got = batched.get(&b).cloned().unwrap_or_default();
+                        got.sort();
+                        assert_eq!(got, want, "products of {a:?} · {b:?} disagree");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn ctau_products_run_via_ext_algebra() {
         // ExtAlgebra's product machinery runs on the motivic (mod-τ) resolution:
         // the cochain ring is Ext_{A_C/τ} = the algebraic Novikov E₂ = the Adams

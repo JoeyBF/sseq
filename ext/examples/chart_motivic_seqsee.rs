@@ -237,13 +237,17 @@ fn main() -> anyhow::Result<()> {
         .collect();
 
     let mut edges: Vec<Edge> = Vec::new();
-    for (&(s, t, idx), src) in &dot_of {
-        if !in_box(src.n, src.s) {
-            continue;
-        }
-        let g = Gen { s, t, idx };
-        for &(i, hg) in &hopf {
-            for (tgt, power) in res.motivic_product(hg, g) {
+    for &(i, hg) in &hopf {
+        // Lift φ_{hᵢ} once and read off hᵢ·b for every generator b, instead of re-lifting per pair.
+        let products = res.motivic_products_by(hg);
+        for (&(s, t, idx), src) in &dot_of {
+            if !in_box(src.n, src.s) {
+                continue;
+            }
+            let Some(terms) = products.get(&Gen { s, t, idx }) else {
+                continue;
+            };
+            for &(tgt, power) in terms {
                 let Some(dst) = dot_of.get(&(tgt.s, tgt.t, tgt.idx)) else {
                     continue; // τ = 0 shadow landed on a non-generator; not a generator line
                 };
