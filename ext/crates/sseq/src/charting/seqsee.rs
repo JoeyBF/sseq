@@ -57,6 +57,32 @@ impl<T: io::Write> SeqSeeBackend<T> {
         self.attribute_defs.insert(name.to_string(), spec);
     }
 
+    /// Emit an arrow: an edge that starts at generator `source` and extends by the chart-coordinate
+    /// `offset` `(dx, dy)` to a free end (no target node), carrying the named attribute aliases
+    /// `attrs`. Used for infinite-tower arrows (e.g. the τ-annihilated $h_1$-towers), whose upper end
+    /// is not a drawn node. The source is silently skipped if out of bounds.
+    pub fn arrow(
+        &mut self,
+        source: BidegreeGenerator,
+        offset: (f64, f64),
+        attrs: &[String],
+    ) -> Result<(), io::Error> {
+        if source.x() > self.max.x() || source.y() > self.max.y() {
+            return Ok(());
+        }
+        let mut edge = Map::new();
+        edge.insert("source".to_string(), Value::String(format!("{source:#}")));
+        edge.insert("offset".to_string(), json!({ "x": offset.0, "y": offset.1 }));
+        if !attrs.is_empty() {
+            for a in attrs {
+                self.styles.insert(a.clone());
+            }
+            edge.insert("attributes".to_string(), json!(attrs));
+        }
+        self.edges.push(Value::Object(edge));
+        Ok(())
+    }
+
     /// Emit a single node at bidegree `b`, position index `position`, carrying the named attribute
     /// aliases `attrs` (colors, sizes, ... registered via [`Self::define_attribute`]) and an
     /// optional `label`.
@@ -326,6 +352,32 @@ mod tests {
             "edges": [],
         });
         assert_eq!(produced, expected);
+    }
+
+    #[test]
+    fn test_arrow_offset_edge() {
+        let mut buf: Vec<u8> = Vec::new();
+        {
+            let mut backend = SeqSeeBackend::new(&mut buf);
+            backend.init(Bidegree::x_y(4, 4)).unwrap();
+            backend.define_attribute("h1tower", json!([{ "color": "red", "arrowTip": "simple" }]));
+            backend
+                .arrow(
+                    BidegreeGenerator::new(Bidegree::x_y(3, 3), 0),
+                    (1.0, 1.0),
+                    &["h1tower".to_string()],
+                )
+                .unwrap();
+        }
+        let produced: Value = serde_json::from_slice(&buf).unwrap();
+        assert_eq!(
+            produced["edges"][0],
+            json!({ "source": "(3,3,0)", "offset": { "x": 1.0, "y": 1.0 }, "attributes": ["h1tower"] })
+        );
+        assert_eq!(
+            produced["header"]["aliases"]["attributes"]["h1tower"],
+            json!([{ "color": "red", "arrowTip": "simple" }])
+        );
     }
 
     #[test]

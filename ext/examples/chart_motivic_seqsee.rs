@@ -215,12 +215,147 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
-    // --- 4. Emit the chart. --------------------------------------------------------------------
+    // A position key `(n, s, pos)` identifies a drawn dot; look up its order.
+    let order_at: HashMap<(i32, i32, usize), Order> = dots
+        .iter()
+        .map(|d| ((d.n, d.s, d.pos), d.order))
+        .collect();
+
+    // --- 4. Filtration-one products h₀, h₁, h₂ (Isaksen draws only these), built in memory so the
+    // h₁-towers can be post-processed before emission. Each edge records which hᵢ and the hidden-
+    // extension τ-power on that term. ------------------------------------------------------------
+    struct Edge {
+        src: (i32, i32, usize),
+        tgt: (i32, i32, usize),
+        hi: usize,
+        power: u32,
+    }
+    let hopf: Vec<(usize, Gen)> = (0..3)
+        .map(|i| (i, 1i32 << i)) // hᵢ at (n, s) = (2ⁱ − 1, 1), so t = 2ⁱ
+        .filter(|&(_, t)| t - 1 <= max_n && res.algebraic_novikov_rank(1, t) > 0)
+        .map(|(i, t)| (i, Gen { s: 1, t, idx: 0 }))
+        .collect();
+
+    let mut edges: Vec<Edge> = Vec::new();
+    for (&(s, t, idx), src) in &dot_of {
+        if !in_box(src.n, src.s) {
+            continue;
+        }
+        let g = Gen { s, t, idx };
+        for &(i, hg) in &hopf {
+            for (tgt, power) in res.motivic_product(hg, g) {
+                let Some(dst) = dot_of.get(&(tgt.s, tgt.t, tgt.idx)) else {
+                    continue; // τ = 0 shadow landed on a non-generator; not a generator line
+                };
+                if !in_box(dst.n, dst.s) {
+                    continue;
+                }
+                edges.push(Edge {
+                    src: (src.n, src.s, src.pos),
+                    tgt: (dst.n, dst.s, dst.pos),
+                    hi: i,
+                    power,
+                });
+            }
+        }
+    }
+
+    // --- 5. Collapse the infinite h₁-towers into red arrows (Isaksen rule 9). --------------------
+    //
+    // Above the line s = n/2 + 3/2 every class is h₁-periodic (in an infinite, τ-annihilated
+    // h₁-tower). Starting from those, we trim along h₁-multiplications through τ-torsion classes,
+    // stopping at a class that either is a target of an h₀ or h₂ product or is not simple
+    // (M₂/τ) torsion. Each such tower is removed and replaced by a single red arrow rising from its
+    // anchor — the non-tower class just below the tower's foot.
+    let above_line = |n: i32, s: i32| (s as f64) > (n as f64) / 2.0 + 1.5;
+
+    // Classes that receive an h₀ or h₂ product (an "incoming h₀/h₂").
+    let mut incoming_h0h2: std::collections::HashSet<(i32, i32, usize)> =
+        std::collections::HashSet::new();
+    for e in &edges {
+        if e.hi == 0 || e.hi == 2 {
+            incoming_h0h2.insert(e.tgt);
+        }
+    }
+    // A class is a *tower interior* candidate iff it is simple τ-torsion and not h₀/h₂-anchored.
+    let trimmable = |k: &(i32, i32, usize)| {
+        order_at.get(k) == Some(&1) && !incoming_h0h2.contains(k)
+    };
+
+    // h₁ adjacency among trimmable classes (both directions), and the h₁-divisor lookup used to find
+    // a tower's anchor.
+    let mut h1_adj: HashMap<(i32, i32, usize), Vec<(i32, i32, usize)>> = HashMap::new();
+    let mut h1_divisors: HashMap<(i32, i32, usize), Vec<(i32, i32, usize)>> = HashMap::new();
+    for e in &edges {
+        if e.hi == 1 && e.power == 0 {
+            h1_divisors.entry(e.tgt).or_default().push(e.src);
+            if trimmable(&e.src) && trimmable(&e.tgt) {
+                h1_adj.entry(e.src).or_default().push(e.tgt);
+                h1_adj.entry(e.tgt).or_default().push(e.src);
+            }
+        }
+    }
+
+    // Connected components of the trimmable h₁-graph; a component that reaches above the line is an
+    // infinite tower to collapse.
+    let mut removed: std::collections::HashSet<(i32, i32, usize)> = std::collections::HashSet::new();
+    let mut arrow_anchors: Vec<(i32, i32, usize)> = Vec::new();
+    let mut seen: std::collections::HashSet<(i32, i32, usize)> = std::collections::HashSet::new();
+    let mut all_trimmable: Vec<(i32, i32, usize)> =
+        order_at.keys().copied().filter(trimmable).collect();
+    all_trimmable.sort_unstable();
+    for start in all_trimmable {
+        if seen.contains(&start) {
+            continue;
+        }
+        // BFS the component.
+        let mut comp: Vec<(i32, i32, usize)> = Vec::new();
+        let mut stack = vec![start];
+        seen.insert(start);
+        while let Some(k) = stack.pop() {
+            comp.push(k);
+            for &nb in h1_adj.get(&k).into_iter().flatten() {
+                if seen.insert(nb) {
+                    stack.push(nb);
+                }
+            }
+        }
+        if !comp.iter().any(|&(n, s, _)| above_line(n, s)) {
+            continue; // a finite h₁ segment below the line — keep it as ordinary red h₁ lines
+        }
+        // The foot of the tower: the lowest (min s, then min n) class.
+        let foot = *comp.iter().min_by_key(|&&(n, s, _)| (s, n)).unwrap();
+        // Its anchor: an h₁-divisor of the foot that is itself not part of the tower.
+        let anchor = h1_divisors
+            .get(&foot)
+            .into_iter()
+            .flatten()
+            .copied()
+            .find(|d| !trimmable(d));
+        match anchor {
+            Some(a) => {
+                // Remove the whole tower; the arrow rises from the anchor below it.
+                removed.extend(comp.iter().copied());
+                arrow_anchors.push(a);
+            }
+            None => {
+                // No class below: keep the foot as the arrow's base, remove the rest.
+                for &k in &comp {
+                    if k != foot {
+                        removed.insert(k);
+                    }
+                }
+                arrow_anchors.push(foot);
+            }
+        }
+    }
+
+    // --- 6. Emit. ------------------------------------------------------------------------------
     let mut backend = SeqSeeBackend::new(std::io::stdout());
     backend.init(Bidegree::n_s(max_n, max_s))?;
 
-    // Node / line colors (Isaksen's palette). Lines reuse the node-color aliases so that an
-    // ordinary product line takes its target's color (rules 6–8).
+    // Node / line colors (Isaksen's palette). Lines reuse the node-color aliases so that an ordinary
+    // product line takes its target's color (rules 6–8).
     backend.define_attribute("m2", json!([{ "color": "#8c8c8c" }])); // gray
     backend.define_attribute("m2tau", json!([{ "color": "#e41a1c" }])); // red
     backend.define_attribute("m2tau2", json!([{ "color": "#377eb8" }])); // blue
@@ -231,8 +366,11 @@ fn main() -> anyhow::Result<()> {
     // Red arrow for the τ-annihilated infinite h₁-towers (rule 9).
     backend.define_attribute("h1tower", json!([{ "color": "#e41a1c", "arrowTip": "simple" }]));
 
-    // Draw the dots exactly as `tau_module` dictates (colors/counts are authoritative).
+    // Dots (colors/counts authoritative from `tau_module`), minus the collapsed towers.
     for dot in &dots {
+        if removed.contains(&(dot.n, dot.s, dot.pos)) {
+            continue;
+        }
         backend.styled_node(
             Bidegree::n_s(dot.n, dot.s),
             dot.pos,
@@ -241,55 +379,34 @@ fn main() -> anyhow::Result<()> {
         )?;
     }
 
-    // Report how many generators could not be tied to a `Gen` for product wiring (dots still drawn
-    // with the right color, but with no outgoing/incoming product lines). Diagnostic only.
-    let unmatched = dots.len() - dot_of.len();
-    if unmatched > 0 {
-        eprintln!(
-            "note: {unmatched} of {} dots had no matching Gen for products (drawn, colored, but \
-             unwired)",
-            dots.len()
-        );
-    }
-
-    // --- 5. Filtration-one products h₀, h₁, h₂ (Isaksen draws only these). ----------------------
-    let hopf: Vec<(usize, Gen)> = (0..3)
-        .map(|i| (i, 1i32 << i)) // hᵢ at (n, s) = (2ⁱ − 1, 1), so t = 2ⁱ
-        .filter(|&(_, t)| t - 1 <= max_n && res.algebraic_novikov_rank(1, t) > 0)
-        .map(|(i, t)| (i, Gen { s: 1, t, idx: 0 }))
-        .collect();
-
-    for (&(s, t, idx), src) in &dot_of {
-        if !in_box(src.n, src.s) {
+    // Product lines, minus any touching a collapsed-tower class.
+    for e in &edges {
+        if removed.contains(&e.src) || removed.contains(&e.tgt) {
             continue;
         }
-        let g = Gen { s, t, idx };
-        for &(i, hg) in &hopf {
-            for (tgt, power) in res.motivic_product(hg, g) {
-                let Some(dst) = dot_of.get(&(tgt.s, tgt.t, tgt.idx)) else {
-                    // The product's τ = 0 shadow landed on a non-generator (an absorbed torsion
-                    // top); it is not a generator-to-generator line.
-                    continue;
-                };
-                if !in_box(dst.n, dst.s) {
-                    continue;
-                }
-                let style = if power >= 2 {
-                    "hidden_tauk" // orange (rule 11)
-                } else if power == 1 {
-                    "hidden_tau" // magenta (rule 10)
-                } else if i == 1 && dst.order >= 1 {
-                    "h1tower" // red arrow into τ-torsion (rule 9)
-                } else {
-                    color_alias(dst.order) // ordinary product, target's color (rules 6–8)
-                };
-                backend.structline(
-                    BidegreeGenerator::new(Bidegree::n_s(src.n, src.s), src.pos),
-                    BidegreeGenerator::new(Bidegree::n_s(dst.n, dst.s), dst.pos),
-                    Some(style),
-                )?;
-            }
-        }
+        let tgt_order = *order_at.get(&e.tgt).unwrap_or(&0);
+        let style = if e.power >= 2 {
+            "hidden_tauk" // orange (rule 11)
+        } else if e.power == 1 {
+            "hidden_tau" // magenta (rule 10)
+        } else {
+            color_alias(tgt_order) // ordinary product, target's color (rules 6–8)
+        };
+        let _ = e.hi;
+        backend.structline(
+            BidegreeGenerator::new(Bidegree::n_s(e.src.0, e.src.1), e.src.2),
+            BidegreeGenerator::new(Bidegree::n_s(e.tgt.0, e.tgt.1), e.tgt.2),
+            Some(style),
+        )?;
+    }
+
+    // One red h₁ arrow per collapsed tower, rising slope-1 from its anchor (rule 9).
+    for a in &arrow_anchors {
+        backend.arrow(
+            BidegreeGenerator::new(Bidegree::n_s(a.0, a.1), a.2),
+            (1.0, 1.0),
+            &["h1tower".to_string()],
+        )?;
     }
 
     Ok(())
