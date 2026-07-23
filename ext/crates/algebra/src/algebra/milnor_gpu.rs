@@ -53,8 +53,8 @@ const GPU_PAIR_CHUNK: usize = 1 << 30;
 /// splits large builds into row blocks whose output buffer stays under this budget. Rows of
 /// distinct products are independent (each product writes only its own row), so blocks simply
 /// concatenate — the same in-between as the old per-signature builds, but with blocks big enough
-/// to keep the launch amortization. Together with [`GPU_PERMITS`] this makes peak transient
-/// memory a configured constant (≈ permits × budget) instead of a function of the frontier size.
+/// to keep the launch amortization. Together with [`GPU_BUDGET`] this makes peak transient
+/// memory a configured constant (≈ the byte budget) instead of a function of the frontier size.
 fn gpu_block_bytes() -> usize {
     static BYTES: LazyLock<usize> = LazyLock::new(|| {
         std::env::var("NASSAU_GPU_BLOCK_MB")
@@ -67,10 +67,17 @@ fn gpu_block_bytes() -> usize {
     *BYTES
 }
 
-/// Counting semaphore bounding how many workers may be inside the layout + device section at
-/// once (`NASSAU_GPU_CONCURRENCY`, default 8). With per-thread streams every worker can launch
-/// concurrently, which is the throughput win — but each concurrent section holds up to
-/// [`gpu_block_bytes`] of transient host and device memory, so the count must be capped.
+/// Byte-weighted budget bounding the total *output size* of in-flight device sections
+/// (`NASSAU_GPU_MEM_BUDGET_MB`, default 4096).
+///
+/// A count-based cap (formerly `NASSAU_GPU_CONCURRENCY` = 8 sections) throttled exactly the
+/// wrong region: low-stem launches are a few MB each and were capped at 8 concurrent (measured
+/// 4x slowdown vs the uncapped code at stem 130), while the cap only exists for the
+/// multi-hundred-MB frontier blocks. Weighting admission by output bytes admits dozens of
+/// small launches concurrently and still bounds the frontier to ~budget / [`gpu_block_bytes`]
+/// in flight. A launch heavier than the whole budget is admitted alone (when nothing else is
+/// in flight), so progress is always possible. Waiters have heterogeneous weights, so release
+/// notifies all.
 ///
 /// SAFETY INVARIANT: a permit must never be held across a rayon parallel section. A par_iter's
 /// chunks execute on other threads, which do not carry the holder's thread-local
@@ -80,54 +87,70 @@ fn gpu_block_bytes() -> usize {
 /// permit only after the parallel marshal, guarding a strictly sequential section: every holder
 /// makes progress, so parked acquirers always wake (priority inversion at worst, never
 /// deadlock).
-struct GpuPermits {
-    free: Mutex<Vec<usize>>,
+struct GpuBudget {
+    budget: usize,
+    used: Mutex<usize>,
     freed: Condvar,
 }
 
-static GPU_PERMITS: LazyLock<GpuPermits> = LazyLock::new(|| {
-    let max = std::env::var("NASSAU_GPU_CONCURRENCY")
+static GPU_BUDGET: LazyLock<GpuBudget> = LazyLock::new(|| GpuBudget {
+    budget: std::env::var("NASSAU_GPU_MEM_BUDGET_MB")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
-        .filter(|&n| n > 0)
-        .unwrap_or(8);
-    GpuPermits {
-        free: Mutex::new((0..max).rev().collect()),
-        freed: Condvar::new(),
-    }
+        .filter(|&mb| mb > 0)
+        .unwrap_or(4096)
+        << 20,
+    used: Mutex::new(0),
+    freed: Condvar::new(),
 });
 
-/// RAII permit from [`GPU_PERMITS`]; blocks (parked, not spinning) until one frees.
-///
-/// A permit is also a *stream slot*: the holder runs its device section under
-/// `StreamId { value: slot }`, so the process only ever touches `NASSAU_GPU_CONCURRENCY`
-/// CUDA streams. Without the pin every worker thread gets its own default stream, and each
-/// stream's memory pool *retains* its freed slabs (`memory_cleanup` only trims the calling
-/// stream, at its next launch) — ~100 worker streams each retaining ~1 GB of out/staging
-/// buffers filled the whole 143 GB H200. Pinning bounds device retention to
-/// ≈ permits × [`gpu_block_bytes`].
+/// Fixed CUDA stream-slot count (`NASSAU_GPU_STREAMS`, default 8): device sections run under
+/// `StreamId { value: counter % slots }`, so only this many streams (and hence retained
+/// memory pools) ever exist. Without a pin every worker thread gets its own default stream,
+/// and each stream's pool *retains* its freed slabs — ~100 worker streams each retaining
+/// ~1 GB filled the whole 143 GB H200. Slots are round-robin and *shared*, not exclusive:
+/// two small launches on one slot merely serialize on that CUDA stream (memory-safe, and
+/// cheap for small kernels), so slot count does not cap concurrency the way the byte budget
+/// does. Kept at 8: a 16-slot experiment collapsed >30x (unexplained cross-stream churn).
+fn gpu_stream_slots() -> u64 {
+    static SLOTS: LazyLock<u64> = LazyLock::new(|| {
+        std::env::var("NASSAU_GPU_STREAMS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(8)
+    });
+    *SLOTS
+}
+
+/// RAII reservation of `weight` bytes from [`GPU_BUDGET`] plus a round-robin stream slot;
+/// blocks (parked, not spinning) until the budget admits it.
 struct GpuPermit {
-    slot: usize,
+    weight: usize,
+    slot: u64,
 }
 
 impl GpuPermit {
-    fn acquire() -> Self {
-        let permits = &*GPU_PERMITS;
-        let mut free = permits.free.lock().unwrap();
-        loop {
-            if let Some(slot) = free.pop() {
-                return Self { slot };
-            }
-            free = permits.freed.wait(free).unwrap();
+    fn acquire(weight: usize) -> Self {
+        static NEXT_SLOT: AtomicU64 = AtomicU64::new(0);
+        let b = &*GPU_BUDGET;
+        let mut used = b.used.lock().unwrap();
+        while !(*used == 0 || *used + weight <= b.budget) {
+            used = b.freed.wait(used).unwrap();
+        }
+        *used += weight;
+        Self {
+            weight,
+            slot: NEXT_SLOT.fetch_add(1, Ordering::Relaxed) % gpu_stream_slots(),
         }
     }
 }
 
 impl Drop for GpuPermit {
     fn drop(&mut self) {
-        let permits = &*GPU_PERMITS;
-        permits.free.lock().unwrap().push(self.slot);
-        permits.freed.notify_one();
+        let b = &*GPU_BUDGET;
+        *b.used.lock().unwrap() -= self.weight;
+        b.freed.notify_all();
     }
 }
 
@@ -800,8 +823,8 @@ pub fn multiply_batch_on_gpu(
 /// One bounded launch of [`multiply_batch_on_gpu`]: rows `row_base..row_base + num_rows` of the
 /// full build, with `products` the (contiguous, row-major) slice landing in those rows. Holds a
 /// [`GpuPermit`] for its sequential layout + device section (acquired only after the parallel
-/// marshal — see [`GpuPermits`]), so at most `NASSAU_GPU_CONCURRENCY` device sections run at
-/// once across all worker threads.
+/// marshal — see [`GpuBudget`]), so the total output size of concurrent device sections
+/// stays under `NASSAU_GPU_MEM_BUDGET_MB` across all worker threads.
 fn multiply_batch_block(
     algebra: &MilnorAlgebra,
     num_cols: usize,
@@ -875,7 +898,7 @@ fn multiply_batch_block(
     // pre-pass already enumerated every `R`), and the device section never enters rayon — so
     // every permit holder makes progress and stolen jobs waiting for a permit wake in finite
     // time (priority inversion at worst, never deadlock).
-    let permit = GpuPermit::acquire();
+    let permit = GpuPermit::acquire(num_rows * num_limbs * 4);
     // Per-`R` offsets into the shared resident master (see [`ResidentHost`]). All read-lock
     // cache hits: the caller's pair-count pre-pass already enumerated every `R` in this block.
     // `need_cs`/`need_mk` track the furthest master offset this block dereferences, so the
@@ -961,10 +984,7 @@ fn multiply_batch_block(
     // than that ever exist — see [`GpuPermit`]. Cubecl's per-device runner serializes the
     // actual server access; cross-slot/cross-thread reuse of the shared resident handles is
     // event-synced by cubecl. `memory_cleanup` below trims only this slot's own pool.
-    let result = StreamId {
-        value: permit.slot as u64,
-    }
-    .executes(|| {
+    let result = StreamId { value: permit.slot }.executes(|| {
         let client = CudaRuntime::client(&CudaDevice::default());
         // Shared resident admissible buffers (see [`ResidentDev`]): re-upload the master ONLY
         // when this block dereferences past the uploaded prefix (`need_cs` / `need_mk`). The
@@ -978,15 +998,23 @@ fn multiply_batch_block(
         // host master and every offset `< uploaded` is final.
         let (cs_h, mk_h, cs_len_master, mk_len_master) = {
             let mut dev = RESIDENT_DEV.lock().unwrap();
+            // Prefix-only upload with doubling: ship `max(need, 2 x uploaded)` entries (clamped
+            // to the master), not the whole master. At the frontier every new `t` appends new
+            // `R`s, so uploading the full master on each miss re-ships gigabytes of tail the
+            // launch never touches; doubling amortizes total upload traffic to <= ~2x the final
+            // master size while keeping the upload count logarithmic.
             if dev.cs_handle.is_none() || dev.cs_uploaded < need_cs {
                 let host = RESIDENT_HOST.read().unwrap();
-                dev.cs_handle = Some(client.create_from_slice(u16::as_bytes(&host.col_sums)));
-                dev.cs_uploaded = host.col_sums.len();
+                let len = host.col_sums.len().min(need_cs.max(2 * dev.cs_uploaded));
+                dev.cs_handle =
+                    Some(client.create_from_slice(u16::as_bytes(&host.col_sums[..len])));
+                dev.cs_uploaded = len;
             }
             if dev.mk_handle.is_none() || dev.mk_uploaded < need_mk {
                 let host = RESIDENT_HOST.read().unwrap();
-                dev.mk_handle = Some(client.create_from_slice(u16::as_bytes(&host.masks)));
-                dev.mk_uploaded = host.masks.len();
+                let len = host.masks.len().min(need_mk.max(2 * dev.mk_uploaded));
+                dev.mk_handle = Some(client.create_from_slice(u16::as_bytes(&host.masks[..len])));
+                dev.mk_uploaded = len;
             }
             (
                 dev.cs_handle.clone().unwrap(),
