@@ -181,53 +181,6 @@ impl MilnorSubalgebra {
             .unwrap_or(0)
     }
 
-    /// Get the matrix of a free module homomorphism when restricted to the subquotient given by
-    /// the signature.
-    ///
-    /// Only generators of the target of degree strictly less than `target_max_gen_degree` are used
-    /// (see [`Self::signature_mask`]).
-    fn signature_matrix(
-        &self,
-        hom: &FreeModuleHomomorphism<FreeModule<MilnorAlgebra>>,
-        degree: i32,
-        signature: &[PPartEntry],
-        target_max_gen_degree: i32,
-    ) -> Matrix {
-        let p = hom.prime();
-        let source = hom.source();
-        let target = hom.target();
-        let algebra = target.algebra();
-        let target_degree = degree - hom.degree_shift();
-
-        let target_mask: Vec<usize> = self
-            .signature_mask(
-                &algebra,
-                &target,
-                target_degree,
-                signature,
-                target_max_gen_degree,
-            )
-            .collect();
-
-        let source_mask: Vec<usize> = self
-            .signature_mask(&algebra, &source, degree, signature, i32::MAX)
-            .collect();
-
-        let mut scratch = FpVector::new(
-            p,
-            Self::restricted_dimension(&target, target_degree, target_max_gen_degree),
-        );
-        let mut result = Matrix::new(p, source_mask.len(), target_mask.len());
-
-        for (mut row, &masked_index) in std::iter::zip(result.iter_mut(), &source_mask) {
-            scratch.set_to_zero();
-            hom.apply_to_basis_element_restricted(scratch.as_slice_mut(), 1, degree, masked_index);
-
-            row.add_masked(scratch.as_slice(), 1, &target_mask);
-        }
-        result
-    }
-
     /// Iterate through all signatures of this algebra that contain elements of degree at most
     /// `degree` (inclusive). This skips the initial zero signature.
     fn iter_signatures(&self, degree: i32) -> impl Iterator<Item = Vec<PPartEntry>> + '_ {
@@ -822,9 +775,26 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
             f.write_fix()?;
         }
 
-        // Compute image
-        let mut n =
-            subalgebra.signature_matrix(&self.differentials[b.s()], b.t(), &zero_sig, target_bound);
+        // Compute image: d_s applied to the zero-signature source basis, column-masked to the
+        // zero-signature target basis. This is the same restricted multiply as `full_matrix` above
+        // (on d_s = differentials[b.s()] rather than d_{s-1}), and its target mask/dimension are
+        // exactly the `target_mask`/`target_dim` already computed for this bidegree — d_s and
+        // d_{s-1} share the target module `modules[b.s() - 1]`. So route it through the same
+        // (GPU-offloaded, work-gated) restricted-matrix path and apply the column mask on CPU,
+        // instead of `signature_matrix`'s serial per-row CPU multiply.
+        let source_mask: Vec<usize> = subalgebra
+            .signature_mask(&algebra, &self.modules[b.s()], b.t(), &zero_sig, i32::MAX)
+            .collect();
+        let img_full = restricted_partial_matrix_maybe_gpu(
+            &self.differentials[b.s()],
+            b.t(),
+            &source_mask,
+            target_dim,
+        );
+        let mut n = Matrix::new(p, source_mask.len(), target_masked_dim);
+        for (mut row, full_row) in std::iter::zip(n.iter_mut(), img_full.iter()) {
+            row.add_masked(full_row, 1, &target_mask);
+        }
         n.row_reduce();
         let next_row = n.rows();
 
