@@ -227,8 +227,9 @@ static RESIDENT_HOST: LazyLock<RwLock<ResidentHost>> =
 /// Process-shared device mirror of the host master: one upload for the whole process,
 /// re-uploaded only when the master grew. The handles are shared across worker threads and
 /// stream slots — safe under cubecl 0.10's per-device runner (which serializes all server
-/// access), with cross-stream reuse event-synced via the handle's origin-stream stamp. The
-/// mutex guards only the grew-check + upload, held briefly per launch.
+/// access), with cross-stream reuse event-synced via the handle's origin-stream stamp. Reads
+/// go through `RESIDENT_DEV.read()` (lock-free fan-out); uploads run outside that lock,
+/// serialized only by `RESIDENT_UPLOAD` (see [`resident_dev_handle`]).
 #[derive(Default)]
 struct ResidentDev {
     cs_handle: Option<Handle>,
@@ -237,8 +238,56 @@ struct ResidentDev {
     mk_uploaded: usize,
 }
 
-static RESIDENT_DEV: LazyLock<Mutex<ResidentDev>> =
-    LazyLock::new(|| Mutex::new(ResidentDev::default()));
+static RESIDENT_DEV: LazyLock<RwLock<ResidentDev>> =
+    LazyLock::new(|| RwLock::new(ResidentDev::default()));
+
+/// Serializes master device *uploads* only — never handle reads. A launch that must grow the
+/// device master takes this before uploading, so at a growth point at most one multi-GB
+/// `create_from_slice` runs (others re-check and find it already done) instead of every launch
+/// piling redundant copies. Reads go lock-free through `RESIDENT_DEV.read()`, so the upload no
+/// longer blocks other bidegrees' device sections (the old single mutex held across the copy
+/// collapsed the whole wavefront to one memcpy-ing thread).
+static RESIDENT_UPLOAD: Mutex<()> = Mutex::new(());
+
+/// Fetch a resident device-master handle, uploading the current master prefix only when this
+/// block dereferences past what is already on the device (`need`). The upload runs OUTSIDE
+/// `RESIDENT_DEV` (readers stay lock-free; only concurrent uploaders serialize, on
+/// `RESIDENT_UPLOAD`, and a re-check coalesces a burst of growth-needing launches into one
+/// upload). The master is append-only, so any handle with `uploaded >= need` is valid.
+macro_rules! resident_dev_handle {
+    ($client:expr, $need:expr, $handle:ident, $uploaded:ident, $host_vec:ident) => {{
+        let read_current = || {
+            let dev = RESIDENT_DEV.read().unwrap();
+            match (dev.$uploaded >= $need, dev.$handle.clone()) {
+                (true, Some(h)) => Some((h, dev.$uploaded)),
+                _ => None,
+            }
+        };
+        match read_current() {
+            Some(hu) => hu,
+            None => {
+                let _upload_guard = RESIDENT_UPLOAD.lock().unwrap();
+                match read_current() {
+                    Some(hu) => hu, // another uploader already covered our need
+                    None => {
+                        let (handle, len) = {
+                            let host = RESIDENT_HOST.read().unwrap();
+                            let len = host.$host_vec.len();
+                            (
+                                $client.create_from_slice(u16::as_bytes(&host.$host_vec[..len])),
+                                len,
+                            )
+                        };
+                        let mut dev = RESIDENT_DEV.write().unwrap();
+                        dev.$handle = Some(handle.clone());
+                        dev.$uploaded = len;
+                        (handle, len)
+                    }
+                }
+            }
+        }
+    }};
+}
 
 /// Global offsets/lengths of `R`'s admissible matrices in the shared host master (see
 /// [`ResidentHost`]), enumerating and appending them on first sight (the append order fixes
@@ -974,10 +1023,20 @@ fn multiply_batch_block(
     pps.push(total_pairs as u32);
     let out_len = num_rows * num_limbs;
     if std::env::var_os("NASSAU_GPU_DEBUG").is_some() {
+        let kb = |n: usize, sz: usize| n * sz / 1024;
         eprintln!(
-            "[gpu-batch] row_base={row_base} num_rows={num_rows} num_cols={num_cols} \
-             num_limbs={num_limbs} products={} total_pairs={total_pairs} out_len={out_len}",
+            "[gpu-batch] rows={num_rows} cols={num_cols} products={} total_pairs={total_pairs} \
+             out_len={out_len} | UPLOAD-KB: g={} xi={} term_pparts={} term_lens={} \
+             prod_arrays={} pps={} | resident cs={} mk={}",
             products.len(),
+            kb(g.len(), 4),
+            kb(xi.len(), 4),
+            kb(term_pparts.len(), 2),
+            kb(term_lens.len(), 4),
+            kb(products.len() * 5, 4),
+            kb(pps.len(), 4),
+            kb(need_cs, 2),
+            kb(need_mk, 2),
         );
     }
     if total_pairs == 0 {
@@ -1011,33 +1070,10 @@ fn multiply_batch_block(
         // then HOST.read, and nothing under either lock blocks on rayon or a permit. The
         // master is append-only, so the uploaded prefix is always a prefix of the current
         // host master and every offset `< uploaded` is final.
-        let (cs_h, mk_h, cs_len_master, mk_len_master) = {
-            let mut dev = RESIDENT_DEV.lock().unwrap();
-            // Prefix-only upload with doubling: ship `max(need, 2 x uploaded)` entries (clamped
-            // to the master), not the whole master. At the frontier every new `t` appends new
-            // `R`s, so uploading the full master on each miss re-ships gigabytes of tail the
-            // launch never touches; doubling amortizes total upload traffic to <= ~2x the final
-            // master size while keeping the upload count logarithmic.
-            if dev.cs_handle.is_none() || dev.cs_uploaded < need_cs {
-                let host = RESIDENT_HOST.read().unwrap();
-                let len = host.col_sums.len().min(need_cs.max(2 * dev.cs_uploaded));
-                dev.cs_handle =
-                    Some(client.create_from_slice(u16::as_bytes(&host.col_sums[..len])));
-                dev.cs_uploaded = len;
-            }
-            if dev.mk_handle.is_none() || dev.mk_uploaded < need_mk {
-                let host = RESIDENT_HOST.read().unwrap();
-                let len = host.masks.len().min(need_mk.max(2 * dev.mk_uploaded));
-                dev.mk_handle = Some(client.create_from_slice(u16::as_bytes(&host.masks[..len])));
-                dev.mk_uploaded = len;
-            }
-            (
-                dev.cs_handle.clone().unwrap(),
-                dev.mk_handle.clone().unwrap(),
-                dev.cs_uploaded,
-                dev.mk_uploaded,
-            )
-        };
+        let (cs_h, cs_len_master) =
+            resident_dev_handle!(client, need_cs, cs_handle, cs_uploaded, col_sums);
+        let (mk_h, mk_len_master) =
+            resident_dev_handle!(client, need_mk, mk_handle, mk_uploaded, masks);
         // Upload the block's data — term data, seqno/xi tables, per-`R` offsets, per-product
         // records, the pair prefix sum, and the (zeroed) output buffer — and launch once: the
         // caller has already bounded this block's pair count and output size.
