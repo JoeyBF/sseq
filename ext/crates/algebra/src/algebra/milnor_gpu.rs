@@ -35,14 +35,21 @@ use crate::algebra::{Algebra, MilnorAlgebra, combinatorics::xi_degrees};
 /// `mk_len = rows + cols − 1 ≤ MAX_XI_TAU + ⌈log2⌉`; 32 covers every in-range case.
 const WORKING_CAP: usize = 32;
 
-/// Target `(product, matrix, term)` thread-pairs per GPU launch. The batch multiply indexes
-/// threads by CubeCL's `ABSOLUTE_POS` (a `u32`), so one launch can address at most `2^32` threads;
-/// a single all-rows reuse build reaches ~4.4e9 pairs at stem ~145, past that limit. The row-block
-/// splitter in [`multiply_batch_on_gpu`] closes a block once its pair count would pass this target
-/// (alongside the [`gpu_block_bytes`] output budget). `1 << 30` (~1.07e9) leaves >3x headroom
-/// under `2^32` even when a lone over-budget row overshoots it, and keeps the grid
-/// (`total_pairs / 256` cubes) well under CUDA's `2^31 - 1` grid-dimension limit.
-const GPU_PAIR_CHUNK: usize = 1 << 30;
+/// Target `(product, matrix, term)` thread-pairs per GPU launch. The batch multiply indexes threads
+/// by CubeCL's `ABSOLUTE_POS` (a `u32`), so one launch can address at most `2^32` threads; a single
+/// all-rows reuse build reaches ~4.4e9 pairs at stem ~145, past that limit. The row-block splitter
+/// in [`multiply_batch_on_gpu`] closes a block once its pair count would pass this target (alongside
+/// the [`gpu_block_bytes`] output budget).
+///
+/// Set close to the `2^32` ceiling, not far below it: every extra split is a whole extra launch
+/// (upload + kernel + blocking readback), and at record stems this — not the byte budget — is the
+/// binding constraint, so a conservative value chops each giant multiply into several
+/// otherwise-unnecessary launches (measured: `1 << 30` pegged the giants at ~1.07e9 pairs, ~4
+/// launches each, while their output is only ~350 MB, well under `gpu_block_bytes`). `3.9e9` leaves
+/// ~0.39e9 of headroom under `2^32` for a lone over-budget row (the splitter always takes ≥1 row,
+/// and a single row past `2^32` still trips the per-block `u32::try_from` assert), and keeps the
+/// grid (`pairs / 256` cubes ≈ 1.5e7) far under CUDA's `2^31 - 1` grid-dimension limit.
+const GPU_PAIR_CHUNK: usize = 3_900_000_000;
 
 /// Per-launch output-buffer budget in bytes (`NASSAU_GPU_BLOCK_MB`, default 512 MiB).
 ///
