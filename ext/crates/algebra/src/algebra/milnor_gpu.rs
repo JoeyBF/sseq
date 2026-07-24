@@ -24,17 +24,6 @@ use cubecl::{
     prelude::*,
 };
 use cubecl_common::stream_id::StreamId;
-
-/// The single CUDA stream all GPU work is pinned to (via [`StreamId::executes`]).
-///
-/// CubeCL's memory pools are per-stream, and the resolution issues launches from many
-/// rayon worker threads (each its own stream). Left alone, each stream's pool retains its
-/// freed per-launch buffers (chiefly the hundreds-of-MB `out_h`), and across ~16 streams
-/// they accumulate until the 4 GB card OOMs — `memory_cleanup` only trims the *calling*
-/// stream's pool. Pinning every launch to one stream gives one pool that each launch's
-/// `memory_cleanup` fully reclaims. Value 0 is a valid stream id (the first thread's).
-const GPU_STREAM: StreamId = StreamId { value: 0 };
-
 // Only the `#[cfg(test)]` standalone `seqno_kernel` sizes its working array by this bound; the
 // production kernels use `WORKING_CAP`.
 #[cfg(test)]
@@ -46,13 +35,131 @@ use crate::algebra::{Algebra, MilnorAlgebra, combinatorics::xi_degrees};
 /// `mk_len = rows + cols − 1 ≤ MAX_XI_TAU + ⌈log2⌉`; 32 covers every in-range case.
 const WORKING_CAP: usize = 32;
 
-/// Maximum `(product, matrix, term)` thread-pairs per GPU launch. The batch multiply indexes
-/// threads by CubeCL's `ABSOLUTE_POS` (a `u32`), so one launch can address at most `2^32` threads;
-/// a single all-rows reuse build reaches ~4.4e9 pairs at stem ~145, past that limit. Launches whose
-/// pair count exceeds this cap are split into chunks each bounded by it. `1 << 30` (~1.07e9) leaves
-/// >3x headroom under `2^32` even after a chunk's final product pushes it over, and keeps each
-/// chunk's grid (`chunk_pairs / 256` cubes) well under CUDA's `2^31 - 1` grid-dimension limit.
-const GPU_PAIR_CHUNK: usize = 1 << 30;
+/// Target `(product, matrix, term)` thread-pairs per GPU launch. The batch multiply indexes threads
+/// by CubeCL's `ABSOLUTE_POS` (a `u32`), so one launch can address at most `2^32` threads; a single
+/// all-rows reuse build reaches ~4.4e9 pairs at stem ~145, past that limit. The row-block splitter
+/// in [`multiply_batch_on_gpu`] closes a block once its pair count would pass this target (alongside
+/// the [`gpu_block_bytes`] output budget).
+///
+/// Set close to the `2^32` ceiling, not far below it: every extra split is a whole extra launch
+/// (upload + kernel + blocking readback), and at record stems this — not the byte budget — is the
+/// binding constraint, so a conservative value chops each giant multiply into several
+/// otherwise-unnecessary launches (measured: `1 << 30` pegged the giants at ~1.07e9 pairs, ~4
+/// launches each, while their output is only ~350 MB, well under `gpu_block_bytes`). `3.9e9` leaves
+/// ~0.39e9 of headroom under `2^32` for a lone over-budget row (the splitter always takes ≥1 row,
+/// and a single row past `2^32` still trips the per-block `u32::try_from` assert), and keeps the
+/// grid (`pairs / 256` cubes ≈ 1.5e7) far under CUDA's `2^31 - 1` grid-dimension limit.
+const GPU_PAIR_CHUNK: usize = 3_900_000_000;
+
+/// Per-launch output-buffer budget in bytes (`NASSAU_GPU_BLOCK_MB`, default 512 MiB).
+///
+/// A launch's transient footprint — host marshal buffers, pinned staging, device buffers, and
+/// each stream's retained pool pages — scales with its output size, and with the device mutex
+/// gone many workers hold such transients simultaneously; at record stems an unbounded all-rows
+/// reuse build multiplies to >100 GB on both host and device. [`multiply_batch_on_gpu`] therefore
+/// splits large builds into row blocks whose output buffer stays under this budget. Rows of
+/// distinct products are independent (each product writes only its own row), so blocks simply
+/// concatenate — the same in-between as the old per-signature builds, but with blocks big enough
+/// to keep the launch amortization. Together with [`GPU_BUDGET`] this makes peak transient
+/// memory a configured constant (≈ the byte budget) instead of a function of the frontier size.
+fn gpu_block_bytes() -> usize {
+    static BYTES: LazyLock<usize> = LazyLock::new(|| {
+        std::env::var("NASSAU_GPU_BLOCK_MB")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&mb| mb > 0)
+            .unwrap_or(512)
+            << 20
+    });
+    *BYTES
+}
+
+/// Byte-weighted budget bounding the total *output size* of in-flight device sections
+/// (`NASSAU_GPU_MEM_BUDGET_MB`, default 4096).
+///
+/// A count-based cap (formerly `NASSAU_GPU_CONCURRENCY` = 8 sections) throttled exactly the
+/// wrong region: low-stem launches are a few MB each and were capped at 8 concurrent (measured
+/// 4x slowdown vs the uncapped code at stem 130), while the cap only exists for the
+/// multi-hundred-MB frontier blocks. Weighting admission by output bytes admits dozens of
+/// small launches concurrently and still bounds the frontier to ~budget / [`gpu_block_bytes`]
+/// in flight. A launch heavier than the whole budget is admitted alone (when nothing else is
+/// in flight), so progress is always possible. Waiters have heterogeneous weights, so release
+/// notifies all.
+///
+/// SAFETY INVARIANT: a permit must never be held across a rayon parallel section. A par_iter's
+/// chunks execute on other threads, which do not carry the holder's thread-local
+/// `ParallelGuard` flag and so can steal a resolution-step job mid-chunk; that job would park
+/// on [`GpuPermit::acquire`] while the holder's permit waits on the never-finishing join —
+/// a cycle (observed as a full stall on H200). [`multiply_batch_block`] therefore acquires its
+/// permit only after the parallel marshal, guarding a strictly sequential section: every holder
+/// makes progress, so parked acquirers always wake (priority inversion at worst, never
+/// deadlock).
+struct GpuBudget {
+    budget: usize,
+    used: Mutex<usize>,
+    freed: Condvar,
+}
+
+static GPU_BUDGET: LazyLock<GpuBudget> = LazyLock::new(|| GpuBudget {
+    budget: std::env::var("NASSAU_GPU_MEM_BUDGET_MB")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&mb| mb > 0)
+        .unwrap_or(4096)
+        << 20,
+    used: Mutex::new(0),
+    freed: Condvar::new(),
+});
+
+/// Fixed CUDA stream-slot count (`NASSAU_GPU_STREAMS`, default 8): device sections run under
+/// `StreamId { value: counter % slots }`, so only this many streams (and hence retained
+/// memory pools) ever exist. Without a pin every worker thread gets its own default stream,
+/// and each stream's pool *retains* its freed slabs — ~100 worker streams each retaining
+/// ~1 GB filled the whole 143 GB H200. Slots are round-robin and *shared*, not exclusive:
+/// two small launches on one slot merely serialize on that CUDA stream (memory-safe, and
+/// cheap for small kernels), so slot count does not cap concurrency the way the byte budget
+/// does. Kept at 8: a 16-slot experiment collapsed >30x (unexplained cross-stream churn).
+fn gpu_stream_slots() -> u64 {
+    static SLOTS: LazyLock<u64> = LazyLock::new(|| {
+        std::env::var("NASSAU_GPU_STREAMS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(8)
+    });
+    *SLOTS
+}
+
+/// RAII reservation of `weight` bytes from [`GPU_BUDGET`] plus a round-robin stream slot;
+/// blocks (parked, not spinning) until the budget admits it.
+struct GpuPermit {
+    weight: usize,
+    slot: u64,
+}
+
+impl GpuPermit {
+    fn acquire(weight: usize) -> Self {
+        static NEXT_SLOT: AtomicU64 = AtomicU64::new(0);
+        let b = &*GPU_BUDGET;
+        let mut used = b.used.lock().unwrap();
+        while !(*used == 0 || *used + weight <= b.budget) {
+            used = b.freed.wait(used).unwrap();
+        }
+        *used += weight;
+        Self {
+            weight,
+            slot: NEXT_SLOT.fetch_add(1, Ordering::Relaxed) % gpu_stream_slots(),
+        }
+    }
+}
+
+impl Drop for GpuPermit {
+    fn drop(&mut self) {
+        let b = &*GPU_BUDGET;
+        *b.used.lock().unwrap() -= self.weight;
+        b.freed.notify_all();
+    }
+}
 
 /// Narrow an admissible-matrix / p-part entry to the `u16` the GPU buffers use, failing loudly
 /// instead of silently wrapping. Every entry is well within `u16` for the stem ranges this path
@@ -83,7 +190,7 @@ pub fn take_batch_stats() -> (u64, u64, u64, u64) {
 
 use std::{
     collections::HashMap,
-    sync::{LazyLock, Mutex},
+    sync::{Condvar, LazyLock, Mutex, RwLock},
 };
 
 use cubecl::server::Handle;
@@ -100,55 +207,135 @@ struct RInfo {
     num_mats: u32,
 }
 
-/// Process-global resident store of admissible-matrix data, both host- and device-side.
+/// Process-shared host master of admissible-matrix data.
 ///
 /// Admissible-matrix enumeration is a pure function of `R`'s p-part and the same
 /// low-degree `R`s recur in essentially every bidegree, so the host master (`col_sums` /
 /// `masks`, append-only, keyed by p-part in `index`) is enumerated once per distinct `R`
-/// and never recomputed. The device copies (`cs_handle` / `mk_handle`) mirror the master
-/// and are re-uploaded *only when it grows* — after the `R`s saturate (early in a
-/// resolution) launches upload no admissible data at all, cutting the dominant transfer.
+/// and never recomputed.
 ///
-/// Guarded by a `Mutex` so the device section serializes across rayon worker threads: each
-/// launch runs to its blocking readback before releasing, giving a happens-before edge and
-/// no concurrent access — which is what CubeCL's single-device-thread managed-memory model
-/// (its `unsafe impl Sync`) requires for a handle created on one thread to be reused on
-/// another. Safe as a global because in the GPU path's regime (`p = 2`, trivial profile)
-/// `admissible_matrices` depends only on the p-part, not on the algebra instance.
+/// SHARED, not per-thread: the master reaches many GB at record stems (it grows with the
+/// degree), so a thread-local copy per rayon worker multiplies it by the worker count —
+/// measured at ~137 GB host / a full 143 GB H200 with 16 workers at stem 150. One copy
+/// behind an `RwLock` restores the old shared-mutex footprint: lookups (the overwhelmingly
+/// common case once the `R`s saturate) take the read lock, and only a first-sight append
+/// takes the write lock — with the enumeration itself done *outside* the lock, so readers
+/// never stall behind it.
 #[derive(Default)]
-struct Resident {
+struct ResidentHost {
     col_sums: Vec<u16>,
     masks: Vec<u16>,
     index: HashMap<Vec<PPartEntry>, RInfo>,
+}
+
+static RESIDENT_HOST: LazyLock<RwLock<ResidentHost>> =
+    LazyLock::new(|| RwLock::new(ResidentHost::default()));
+
+/// Process-shared device mirror of the host master: one upload for the whole process,
+/// re-uploaded only when the master grew. The handles are shared across worker threads and
+/// stream slots — safe under cubecl 0.10's per-device runner (which serializes all server
+/// access), with cross-stream reuse event-synced via the handle's origin-stream stamp. Reads
+/// go through `RESIDENT_DEV.read()` (lock-free fan-out); uploads run outside that lock,
+/// serialized only by `RESIDENT_UPLOAD` (see [`resident_dev_handle`]).
+#[derive(Default)]
+struct ResidentDev {
     cs_handle: Option<Handle>,
     mk_handle: Option<Handle>,
     cs_uploaded: usize,
     mk_uploaded: usize,
 }
 
-impl Resident {
-    /// Global offsets/lengths of `R`'s admissible matrices in the master, enumerating and
-    /// appending them on first sight (the append order fixes the offsets forever).
-    fn ensure(&mut self, algebra: &MilnorAlgebra, p_part: &[PPartEntry]) -> RInfo {
-        if let Some(info) = self.index.get(p_part) {
-            return *info;
-        }
-        let (cs_len, mk_len, cs, mk) = algebra.admissible_matrices(p_part);
-        let info = RInfo {
-            cs_off: self.col_sums.len() as u32,
-            mk_off: self.masks.len() as u32,
-            cs_len: cs_len as u32,
-            mk_len: mk_len as u32,
-            num_mats: (mk.len() / mk_len) as u32,
+static RESIDENT_DEV: LazyLock<RwLock<ResidentDev>> =
+    LazyLock::new(|| RwLock::new(ResidentDev::default()));
+
+/// Serializes master device *uploads* only — never handle reads. A launch that must grow the
+/// device master takes this before uploading, so at a growth point at most one multi-GB
+/// `create_from_slice` runs (others re-check and find it already done) instead of every launch
+/// piling redundant copies. Reads go lock-free through `RESIDENT_DEV.read()`, so the upload no
+/// longer blocks other bidegrees' device sections (the old single mutex held across the copy
+/// collapsed the whole wavefront to one memcpy-ing thread).
+static RESIDENT_UPLOAD: Mutex<()> = Mutex::new(());
+
+/// Fetch a resident device-master handle, uploading the current master prefix only when this
+/// block dereferences past what is already on the device (`need`). The upload runs OUTSIDE
+/// `RESIDENT_DEV` (readers stay lock-free; only concurrent uploaders serialize, on
+/// `RESIDENT_UPLOAD`, and a re-check coalesces a burst of growth-needing launches into one
+/// upload). The master is append-only, so any handle with `uploaded >= need` is valid.
+macro_rules! resident_dev_handle {
+    ($client:expr, $need:expr, $handle:ident, $uploaded:ident, $host_vec:ident) => {{
+        let read_current = || {
+            let dev = RESIDENT_DEV.read().unwrap();
+            match (dev.$uploaded >= $need, dev.$handle.clone()) {
+                (true, Some(h)) => Some((h, dev.$uploaded)),
+                _ => None,
+            }
         };
-        self.col_sums.extend(cs.iter().map(|&v| narrow_u16(v)));
-        self.masks.extend(mk.iter().map(|&v| narrow_u16(v)));
-        self.index.insert(p_part.to_vec(), info);
-        info
-    }
+        match read_current() {
+            Some(hu) => hu,
+            None => {
+                let _upload_guard = RESIDENT_UPLOAD.lock().unwrap();
+                match read_current() {
+                    Some(hu) => hu, // another uploader already covered our need
+                    None => {
+                        let (handle, len) = {
+                            let host = RESIDENT_HOST.read().unwrap();
+                            let len = host.$host_vec.len();
+                            (
+                                $client.create_from_slice(u16::as_bytes(&host.$host_vec[..len])),
+                                len,
+                            )
+                        };
+                        let mut dev = RESIDENT_DEV.write().unwrap();
+                        dev.$handle = Some(handle.clone());
+                        dev.$uploaded = len;
+                        (handle, len)
+                    }
+                }
+            }
+        }
+    }};
 }
 
-static RESIDENT: LazyLock<Mutex<Resident>> = LazyLock::new(|| Mutex::new(Resident::default()));
+/// Global offsets/lengths of `R`'s admissible matrices in the shared host master (see
+/// [`ResidentHost`]), enumerating and appending them on first sight (the append order fixes
+/// the offsets forever). The enumeration runs outside any lock; on a first-sight race the
+/// loser rechecks under the write lock and discards its duplicate.
+fn resident_info(algebra: &MilnorAlgebra, p_part: &[PPartEntry]) -> RInfo {
+    if let Some(info) = RESIDENT_HOST.read().unwrap().index.get(p_part) {
+        return *info;
+    }
+    let (cs_len, mk_len, cs, mk) = algebra.admissible_matrices(p_part);
+    let mut host = RESIDENT_HOST.write().unwrap();
+    if let Some(info) = host.index.get(p_part) {
+        return *info;
+    }
+    let info = RInfo {
+        cs_off: host.col_sums.len() as u32,
+        mk_off: host.masks.len() as u32,
+        cs_len: cs_len as u32,
+        mk_len: mk_len as u32,
+        num_mats: (mk.len() / mk_len) as u32,
+    };
+    host.col_sums.extend(cs.iter().map(|&v| narrow_u16(v)));
+    host.masks.extend(mk.iter().map(|&v| narrow_u16(v)));
+    host.index.insert(p_part.to_vec(), info);
+    info
+}
+
+/// Zero a device `u32` buffer on-device: `out[i] = 0`, one thread per limb.
+///
+/// Initializes the batched multiply's XOR accumulator without allocating and uploading a host
+/// zero buffer. Profiling (stem 145) showed the per-launch `create_from_slice` of a
+/// hundreds-of-MB `out_h` zero vec — a host `memset` + non-pinned host→device `memcpy`, both on
+/// the calling rayon worker — was the dominant serial marshaling cost, stalling the wavefront.
+/// On-device zeroing is memory-bound (microseconds on an H200) and same-stream ordered before
+/// the multiply kernel, so no host allocation, upload, or extra sync is needed.
+#[cube(launch)]
+fn zero_u32(out: &mut Array<u32>) {
+    if ABSOLUTE_POS < out.len() {
+        out[ABSOLUTE_POS] = 0u32;
+    }
+}
 
 /// Elementwise F₂ addition of two bit-packed vectors: `out[i] = a[i] ^ b[i]`.
 ///
@@ -640,10 +827,10 @@ pub struct GpuProduct {
     pub out_offset: usize,
 }
 
-/// Compute a whole batch of `Sq(R) · s` products in a single GPU launch — the
-/// The batched unit of one `get_partial_matrix` call. `R`s may differ (each contributes its
-/// own admissible matrices). Returns `num_rows` F₂ vectors, each `⌈num_cols/32⌉`
-/// bit-packed `u32` limbs.
+/// Compute a whole batch of `Sq(R) · s` products on the GPU — the batched unit of one
+/// `get_partial_matrix` call, split into row blocks of at most [`gpu_block_bytes`] of output
+/// each (see [`multiply_batch_block`]). `R`s may differ (each contributes its own admissible
+/// matrices). Returns `num_rows` F₂ vectors, each `⌈num_cols/32⌉` bit-packed `u32` limbs.
 ///
 /// `num_cols` is the *row* width — for a module row that is the module dimension (a sum
 /// over generator blocks, generally larger than any single algebra degree's dimension),
@@ -653,6 +840,66 @@ pub struct GpuProduct {
 pub fn multiply_batch_on_gpu(
     algebra: &MilnorAlgebra,
     num_cols: usize,
+    num_rows: usize,
+    products: &[GpuProduct],
+) -> Vec<Vec<u32>> {
+    let num_limbs = num_cols.div_ceil(32).max(1);
+    let max_block_rows = (gpu_block_bytes() / (num_limbs * 4)).max(1);
+    // Products arrive row-major (the extract loops emit them per input row, in order), so each
+    // block is a contiguous product slice. Rows are independent — every product writes only its
+    // own row — so concatenating block outputs reproduces the single-launch result exactly.
+    debug_assert!(products.windows(2).all(|w| w[0].row <= w[1].row));
+    // Per-product `(matrix, term)` pair counts, i.e. kernel threads. The kernel indexes threads
+    // by `ABSOLUTE_POS`, a `u32`, so a block must also stay under `2^32` pairs — output bytes
+    // alone don't bound this (pairs per row grow with the degree; an unbounded all-rows build
+    // reaches ~4.4e9 pairs by stem ~145). This pre-pass also warms the shared resident master,
+    // so every block's layout lookups below are read-lock cache hits.
+    let prod_pairs: Vec<usize> = products
+        .iter()
+        .map(|prod| {
+            let r = algebra.basis_element_from_index(prod.r_degree, prod.r_idx);
+            resident_info(algebra, &r.p_part).num_mats as usize * prod.term_indices.len()
+        })
+        .collect();
+    let mut result: Vec<Vec<u32>> = Vec::with_capacity(num_rows);
+    let (mut r0, mut p0) = (0, 0);
+    while r0 < num_rows {
+        // Grow the block row by row until the next row would break either budget — output bytes
+        // ([`gpu_block_bytes`]) or kernel threads ([`GPU_PAIR_CHUNK`]) — always taking at least
+        // one row (a lone over-budget row still fits the kernel's `u32` limit, asserted in the
+        // block).
+        let (mut r1, mut p1) = (r0, p0);
+        let mut pairs = 0usize;
+        while r1 < num_rows && r1 - r0 < max_block_rows {
+            let q = p1 + products[p1..].partition_point(|p| p.row <= r1);
+            let row_pairs: usize = prod_pairs[p1..q].iter().sum();
+            if r1 > r0 && pairs + row_pairs > GPU_PAIR_CHUNK {
+                break;
+            }
+            pairs += row_pairs;
+            (r1, p1) = (r1 + 1, q);
+        }
+        result.extend(multiply_batch_block(
+            algebra,
+            num_cols,
+            r0,
+            r1 - r0,
+            &products[p0..p1],
+        ));
+        (r0, p0) = (r1, p1);
+    }
+    result
+}
+
+/// One bounded launch of [`multiply_batch_on_gpu`]: rows `row_base..row_base + num_rows` of the
+/// full build, with `products` the (contiguous, row-major) slice landing in those rows. Holds a
+/// [`GpuPermit`] for its sequential layout + device section (acquired only after the parallel
+/// marshal — see [`GpuBudget`]), so the total output size of concurrent device sections
+/// stays under `NASSAU_GPU_MEM_BUDGET_MB` across all worker threads.
+fn multiply_batch_block(
+    algebra: &MilnorAlgebra,
+    num_cols: usize,
+    row_base: usize,
     num_rows: usize,
     products: &[GpuProduct],
 ) -> Vec<Vec<u32>> {
@@ -691,87 +938,131 @@ pub fn multiply_batch_on_gpu(
         prod_r_index.push(ri);
     }
 
-    // Admissible-matrix data (`col_sums`/`masks` + per-`R` offsets) is resident (built
-    // under the `RESIDENT` lock below), so nothing to enumerate or lay out here.
+    // Admissible-matrix data (`col_sums`/`masks` + per-`R` offsets) is resident (built in the
+    // thread-local `RESIDENT` store below), so nothing to enumerate or lay out here.
 
-    // Parallel: each product's term p-parts (padded to `width`) and lengths.
-    let per_prod: Vec<(Vec<u16>, Vec<u32>)> = (0..products.len())
-        .into_maybe_par_iter()
-        .map(|pi| {
+    // Per-product term p-parts (padded to `width`) and lengths, filled directly into two flat
+    // buffers rather than one `(Vec, Vec)` per product. At the frontier a launch has ~10^5-10^6
+    // products; the old per-product `Vec` pair (plus the later concat-copy) was ~10^6 tiny
+    // allocations per launch — a dominant chunk of the marshal cost. `term_off` is the prefix sum
+    // of term counts, so each product owns a disjoint output range and the fill stays parallel.
+    let term_off: Vec<usize> = {
+        let mut off = Vec::with_capacity(products.len() + 1);
+        let mut acc = 0usize;
+        for prod in products {
+            off.push(acc);
+            acc += prod.term_indices.len();
+        }
+        off.push(acc);
+        off
+    };
+    let total_terms = *term_off.last().unwrap();
+    let mut term_pparts: Vec<u16> = vec![0u16; total_terms * width];
+    let mut term_lens: Vec<u32> = vec![0u32; total_terms];
+    {
+        let tp_base = term_pparts.as_mut_ptr() as usize;
+        let tl_base = term_lens.as_mut_ptr() as usize;
+        (0..products.len()).into_maybe_par_iter().for_each(|pi| {
             let prod = &products[pi];
-            let nt = prod.term_indices.len();
-            let mut tp = vec![0u16; nt * width];
-            let mut tl = Vec::with_capacity(nt);
+            let (off, nt) = (term_off[pi], prod.term_indices.len());
+            // SAFETY: products write disjoint `[off, off + nt)` ranges (from the prefix sum),
+            // each within the allocated buffers, so no two tasks alias any element. The `usize`
+            // bases are re-formed into pointers here because raw pointers are not `Send`.
+            let tp = unsafe {
+                std::slice::from_raw_parts_mut((tp_base as *mut u16).add(off * width), nt * width)
+            };
+            let tl = unsafe { std::slice::from_raw_parts_mut((tl_base as *mut u32).add(off), nt) };
             for (k, &ti) in prod.term_indices.iter().enumerate() {
                 let elt = algebra.basis_element_from_index(prod.s_degree, ti);
-                tl.push(elt.p_part.len() as u32);
+                tl[k] = elt.p_part.len() as u32;
                 for (slot, &v) in tp[k * width..(k + 1) * width].iter_mut().zip(&elt.p_part) {
                     *slot = narrow_u16(v);
                 }
             }
-            (tp, tl)
-        })
-        .collect();
+        });
+    }
 
-    // Resident admissible-matrix store: enumerate each new `R` once and reuse forever;
-    // the per-`R` offsets are global (into the master `col_sums`/`masks`). Taking the lock
-    // here also serializes the device section across rayon workers (see [`Resident`]).
-    let mut resident = RESIDENT.lock().unwrap();
+    // Take the concurrency permit only now, with every rayon parallel section behind us: holding
+    // it across the `per_prod` par_iter above deadlocks, because that par_iter's chunks execute on
+    // *other* threads, which do not carry this thread's `ParallelGuard` flag and so can steal a
+    // bidegree job mid-chunk; the stolen job parks on `GpuPermit::acquire` while this thread's
+    // permit waits on the never-finishing join (observed on H200). Everything from here on is
+    // strictly sequential — the `ensure` calls below are cache hits (the caller's pair-count
+    // pre-pass already enumerated every `R`), and the device section never enters rayon — so
+    // every permit holder makes progress and stolen jobs waiting for a permit wake in finite
+    // time (priority inversion at worst, never deadlock).
+    let permit = GpuPermit::acquire(num_rows * num_limbs * 4);
+    // Per-`R` offsets into the shared resident master (see [`ResidentHost`]). All read-lock
+    // cache hits: the caller's pair-count pre-pass already enumerated every `R` in this block.
+    // `need_cs`/`need_mk` track the furthest master offset this block dereferences, so the
+    // device section can skip the (multi-GB, mutex-serialized) master re-upload whenever the
+    // already-uploaded prefix covers it.
     let mut r_cs_offset: Vec<u32> = Vec::with_capacity(distinct_r.len());
     let mut r_mk_offset: Vec<u32> = Vec::with_capacity(distinct_r.len());
     let mut r_cs_len: Vec<u32> = Vec::with_capacity(distinct_r.len());
     let mut r_mk_len: Vec<u32> = Vec::with_capacity(distinct_r.len());
     let mut r_num_matrices: Vec<usize> = Vec::with_capacity(distinct_r.len());
+    let mut need_cs: usize = 0;
+    let mut need_mk: usize = 0;
     for &(rd, ridx) in &distinct_r {
         let r = algebra.basis_element_from_index(rd, ridx);
         assert!(!r.p_part.is_empty(), "each R must be non-empty");
-        let info = resident.ensure(algebra, &r.p_part);
+        let info = resident_info(algebra, &r.p_part);
         r_cs_offset.push(info.cs_off);
         r_mk_offset.push(info.mk_off);
         r_cs_len.push(info.cs_len);
         r_mk_len.push(info.mk_len);
         r_num_matrices.push(info.num_mats as usize);
+        need_cs = need_cs.max(info.cs_off as usize + info.num_mats as usize * info.cs_len as usize);
+        need_mk = need_mk.max(info.mk_off as usize + info.num_mats as usize * info.mk_len as usize);
     }
 
-    // Lay out per-product term data + records + the pair-count prefix sum (sequential).
-    let mut term_pparts: Vec<u16> = Vec::new();
-    let mut term_lens: Vec<u32> = Vec::new();
+    // Lay out per-product records + the pair-count prefix sum (sequential). Term data is already
+    // in `term_pparts`/`term_lens` (filled in parallel above); `term_off` gives each product's
+    // start, so nothing is copied here.
     let mut prod_term_start: Vec<u32> = Vec::with_capacity(products.len());
     let mut prod_num_terms: Vec<u32> = Vec::with_capacity(products.len());
     let mut prod_row_base: Vec<u32> = Vec::with_capacity(products.len());
     let mut prod_out_offset: Vec<u32> = Vec::with_capacity(products.len());
-    // Per-product `(matrix, term)` pair count. A launch's total pair count is the sum, and can
-    // exceed `u32::MAX` at record degrees (a single all-rows reuse build reaches ~4.4e9 pairs at
-    // stem ~145). The kernel indexes threads by `ABSOLUTE_POS`, itself a `u32`, so a launch can
-    // address at most `2^32` threads; the device section below splits the products into chunks each
-    // bounded by [`GPU_PAIR_CHUNK`] so every kernel launch stays safely under that limit. Keeping the
-    // per-product counts (rather than a single prefix sum) lets each chunk build its own `u32`
-    // prefix sum locally.
-    let mut prod_pairs: Vec<usize> = Vec::with_capacity(products.len());
+    // The pair prefix sum: entry `pi` is the number of `(matrix, term)` pairs before product
+    // `pi`, with the sentinel total at the end — the kernel binary-searches it to decode its
+    // thread index. The caller splits blocks near [`GPU_PAIR_CHUNK`], so every entry fits
+    // `u32` (a lone over-budget row can exceed the target but stays far below the kernel's
+    // `2^32` `ABSOLUTE_POS` limit; asserted below before the values are used).
+    let mut pps: Vec<u32> = Vec::with_capacity(products.len() + 1);
     let mut pair_acc: usize = 0;
-    for (pi, (tp, tl)) in per_prod.iter().enumerate() {
-        let prod = &products[pi];
+    for (pi, prod) in products.iter().enumerate() {
         let ri = prod_r_index[pi];
-        prod_term_start.push(term_lens.len() as u32);
-        term_lens.extend_from_slice(tl);
-        term_pparts.extend_from_slice(tp);
-        let pairs = r_num_matrices[ri as usize] * prod.term_indices.len();
-        prod_pairs.push(pairs);
-        pair_acc += pairs;
+        prod_term_start.push(term_off[pi] as u32);
+        pps.push(pair_acc as u32);
+        pair_acc += r_num_matrices[ri as usize] * prod.term_indices.len();
         prod_num_terms.push(prod.term_indices.len() as u32);
-        prod_row_base.push((prod.row * num_limbs) as u32);
+        prod_row_base.push(((prod.row - row_base) * num_limbs) as u32);
         prod_out_offset.push(prod.out_offset as u32);
     }
 
     let total_pairs = pair_acc;
+    assert!(
+        u32::try_from(total_pairs).is_ok(),
+        "block pair count {total_pairs} exceeds the kernel's u32 thread limit"
+    );
+    pps.push(total_pairs as u32);
     let out_len = num_rows * num_limbs;
     if std::env::var_os("NASSAU_GPU_DEBUG").is_some() {
-        let num_chunks = total_pairs.div_ceil(GPU_PAIR_CHUNK).max(1);
+        let kb = |n: usize, sz: usize| n * sz / 1024;
         eprintln!(
-            "[gpu-batch] num_rows={num_rows} num_cols={num_cols} num_limbs={num_limbs} \
-             products={} total_pairs={total_pairs} out_len={out_len} \
-             chunks={num_chunks} (cap={GPU_PAIR_CHUNK})",
+            "[gpu-batch] rows={num_rows} cols={num_cols} products={} total_pairs={total_pairs} \
+             out_len={out_len} | UPLOAD-KB: g={} xi={} term_pparts={} term_lens={} \
+             prod_arrays={} pps={} | resident cs={} mk={}",
             products.len(),
+            kb(g.len(), 4),
+            kb(xi.len(), 4),
+            kb(term_pparts.len(), 2),
+            kb(term_lens.len(), 4),
+            kb(products.len() * 5, 4),
+            kb(pps.len(), 4),
+            kb(need_cs, 2),
+            kb(need_mk, 2),
         );
     }
     if total_pairs == 0 {
@@ -788,29 +1079,30 @@ pub fn multiply_batch_on_gpu(
 
     let t_device = std::time::Instant::now();
 
-    // Pin the whole device section to one CUDA stream (see [`GPU_STREAM`]) so a single
-    // memory pool is reclaimed by `memory_cleanup`. Held under the `resident` lock, so this
-    // stream is used by at most one thread at a time.
-    let result = GPU_STREAM.executes(|| {
+    // Device section pinned to this permit's stream slot: up to `NASSAU_GPU_CONCURRENCY`
+    // launches overlap on distinct streams, but no more streams (and hence retained pools)
+    // than that ever exist — see [`GpuPermit`]. Cubecl's per-device runner serializes the
+    // actual server access; cross-slot/cross-thread reuse of the shared resident handles is
+    // event-synced by cubecl. `memory_cleanup` below trims only this slot's own pool.
+    let result = StreamId { value: permit.slot }.executes(|| {
         let client = CudaRuntime::client(&CudaDevice::default());
-        // Resident admissible buffers: (re-)upload the master only when it grew this
-        // launch; otherwise reuse the handle from a previous launch and upload nothing.
-        if resident.cs_handle.is_none() || resident.cs_uploaded != resident.col_sums.len() {
-            resident.cs_handle = Some(client.create_from_slice(u16::as_bytes(&resident.col_sums)));
-            resident.cs_uploaded = resident.col_sums.len();
-        }
-        if resident.mk_handle.is_none() || resident.mk_uploaded != resident.masks.len() {
-            resident.mk_handle = Some(client.create_from_slice(u16::as_bytes(&resident.masks)));
-            resident.mk_uploaded = resident.masks.len();
-        }
-        let cs_len_master = resident.col_sums.len();
-        let mk_len_master = resident.masks.len();
-        let cs_h = resident.cs_handle.clone().unwrap();
-        let mk_h = resident.mk_handle.clone().unwrap();
-        // Shared across every chunk: term data, seqno/xi tables, per-`R` offsets, and the output
-        // buffer. `prod_term_start` values index the global `term_*` arrays, so each chunk reuses
-        // these handles unchanged; only the per-product record slices and the pair prefix sum are
-        // rebuilt per chunk.
+        // Shared resident admissible buffers (see [`ResidentDev`]): re-upload the master ONLY
+        // when this block dereferences past the uploaded prefix (`need_cs` / `need_mk`). The
+        // master grows continually at the frontier, so re-uploading on mere growth ships
+        // multi-GB uploads under this mutex on nearly every launch (measured 1.5x wall
+        // regression); most launches touch only long-uploaded low-degree `R`s and reuse the
+        // stale handle at its uploaded length. When an upload does fire it captures the full
+        // current master, amortizing all growth since the last one. Lock order is DEV.lock
+        // then HOST.read, and nothing under either lock blocks on rayon or a permit. The
+        // master is append-only, so the uploaded prefix is always a prefix of the current
+        // host master and every offset `< uploaded` is final.
+        let (cs_h, cs_len_master) =
+            resident_dev_handle!(client, need_cs, cs_handle, cs_uploaded, col_sums);
+        let (mk_h, mk_len_master) =
+            resident_dev_handle!(client, need_mk, mk_handle, mk_uploaded, masks);
+        // Upload the block's data — term data, seqno/xi tables, per-`R` offsets, per-product
+        // records, the pair prefix sum, and the (zeroed) output buffer — and launch once: the
+        // caller has already bounded this block's pair count and output size.
         let tp_h = client.create_from_slice(u16::as_bytes(&term_pparts));
         let tl_h = client.create_from_slice(u32::as_bytes(&term_lens));
         let g_h = client.create_from_slice(u32::as_bytes(&g));
@@ -819,71 +1111,51 @@ pub fn multiply_batch_on_gpu(
         let rmo_h = client.create_from_slice(u32::as_bytes(&r_mk_offset));
         let rcl_h = client.create_from_slice(u32::as_bytes(&r_cs_len));
         let rml_h = client.create_from_slice(u32::as_bytes(&r_mk_len));
-        let zeros = vec![0u32; out_len];
-        let out_h = client.create_from_slice(u32::as_bytes(&zeros));
         const THREADS: u32 = 256;
+        // Allocate the XOR accumulator uninitialized and zero it on-device (see [`zero_u32`]),
+        // instead of uploading a hundreds-of-MB host zero buffer — the former dominant serial
+        // marshaling cost. Same stream as the multiply below, so it is ordered before it.
+        let out_h = client.empty(out_len * size_of::<u32>());
+        unsafe {
+            zero_u32::launch::<CudaRuntime>(
+                &client,
+                CubeCount::Static((out_len as u32).div_ceil(THREADS).max(1), 1, 1),
+                CubeDim::new_1d(THREADS),
+                ArrayArg::from_raw_parts(out_h.clone(), out_len),
+            );
+        }
 
-        // Launch the products in chunks each holding at most `GPU_PAIR_CHUNK` pairs, so every
-        // kernel's thread count (and thus `ABSOLUTE_POS`) stays under `2^32`. Each product writes
-        // its F₂ bits into `out_h` with atomic XOR keyed by its global `row`/`out_offset`, so
-        // splitting the product set across launches and accumulating into the shared buffer is
-        // exact (XOR is associative and order-independent).
-        let mut c0 = 0usize;
-        while c0 < products.len() {
-            // Grow the chunk product-by-product until the next one would exceed the cap; always take
-            // at least one product (a single product's pair count is far below the cap).
-            let mut c1 = c0;
-            let mut chunk_pairs = 0usize;
-            while c1 < products.len()
-                && (c1 == c0 || chunk_pairs + prod_pairs[c1] <= GPU_PAIR_CHUNK)
-            {
-                chunk_pairs += prod_pairs[c1];
-                c1 += 1;
-            }
-
-            // Chunk-local pair prefix sum (values < cap, fit `u32`), sentinel at the end.
-            let mut pps_chunk: Vec<u32> = Vec::with_capacity(c1 - c0 + 1);
-            let mut acc = 0u32;
-            for &pairs in &prod_pairs[c0..c1] {
-                pps_chunk.push(acc);
-                acc += pairs as u32;
-            }
-            pps_chunk.push(acc);
-
-            let pri_h = client.create_from_slice(u32::as_bytes(&prod_r_index[c0..c1]));
-            let pts_h = client.create_from_slice(u32::as_bytes(&prod_term_start[c0..c1]));
-            let pnt_h = client.create_from_slice(u32::as_bytes(&prod_num_terms[c0..c1]));
-            let prb_h = client.create_from_slice(u32::as_bytes(&prod_row_base[c0..c1]));
-            let poo_h = client.create_from_slice(u32::as_bytes(&prod_out_offset[c0..c1]));
-            let pps_h = client.create_from_slice(u32::as_bytes(&pps_chunk));
-            let cubes = (chunk_pairs as u32).div_ceil(THREADS).max(1);
-            unsafe {
-                multiply_batch_kernel::launch::<CudaRuntime>(
-                    &client,
-                    CubeCount::Static(cubes, 1, 1),
-                    CubeDim::new_1d(THREADS),
-                    ArrayArg::from_raw_parts(cs_h.clone(), cs_len_master),
-                    ArrayArg::from_raw_parts(mk_h.clone(), mk_len_master),
-                    ArrayArg::from_raw_parts(tp_h.clone(), term_pparts.len()),
-                    ArrayArg::from_raw_parts(tl_h.clone(), term_lens.len()),
-                    ArrayArg::from_raw_parts(g_h.clone(), g.len()),
-                    ArrayArg::from_raw_parts(xi_h.clone(), xi.len()),
-                    ArrayArg::from_raw_parts(out_h.clone(), out_len),
-                    ArrayArg::from_raw_parts(rco_h.clone(), r_cs_offset.len()),
-                    ArrayArg::from_raw_parts(rmo_h.clone(), r_mk_offset.len()),
-                    ArrayArg::from_raw_parts(rcl_h.clone(), r_cs_len.len()),
-                    ArrayArg::from_raw_parts(rml_h.clone(), r_mk_len.len()),
-                    ArrayArg::from_raw_parts(pri_h, c1 - c0),
-                    ArrayArg::from_raw_parts(pts_h, c1 - c0),
-                    ArrayArg::from_raw_parts(pnt_h, c1 - c0),
-                    ArrayArg::from_raw_parts(prb_h, c1 - c0),
-                    ArrayArg::from_raw_parts(poo_h, c1 - c0),
-                    ArrayArg::from_raw_parts(pps_h, pps_chunk.len()),
-                    width,
-                );
-            }
-
-            c0 = c1;
+        let pri_h = client.create_from_slice(u32::as_bytes(&prod_r_index));
+        let pts_h = client.create_from_slice(u32::as_bytes(&prod_term_start));
+        let pnt_h = client.create_from_slice(u32::as_bytes(&prod_num_terms));
+        let prb_h = client.create_from_slice(u32::as_bytes(&prod_row_base));
+        let poo_h = client.create_from_slice(u32::as_bytes(&prod_out_offset));
+        let pps_h = client.create_from_slice(u32::as_bytes(&pps));
+        let cubes = (total_pairs as u32).div_ceil(THREADS).max(1);
+        unsafe {
+            multiply_batch_kernel::launch::<CudaRuntime>(
+                &client,
+                CubeCount::Static(cubes, 1, 1),
+                CubeDim::new_1d(THREADS),
+                ArrayArg::from_raw_parts(cs_h, cs_len_master),
+                ArrayArg::from_raw_parts(mk_h, mk_len_master),
+                ArrayArg::from_raw_parts(tp_h, term_pparts.len()),
+                ArrayArg::from_raw_parts(tl_h, term_lens.len()),
+                ArrayArg::from_raw_parts(g_h, g.len()),
+                ArrayArg::from_raw_parts(xi_h, xi.len()),
+                ArrayArg::from_raw_parts(out_h.clone(), out_len),
+                ArrayArg::from_raw_parts(rco_h, r_cs_offset.len()),
+                ArrayArg::from_raw_parts(rmo_h, r_mk_offset.len()),
+                ArrayArg::from_raw_parts(rcl_h, r_cs_len.len()),
+                ArrayArg::from_raw_parts(rml_h, r_mk_len.len()),
+                ArrayArg::from_raw_parts(pri_h, products.len()),
+                ArrayArg::from_raw_parts(pts_h, products.len()),
+                ArrayArg::from_raw_parts(pnt_h, products.len()),
+                ArrayArg::from_raw_parts(prb_h, products.len()),
+                ArrayArg::from_raw_parts(poo_h, products.len()),
+                ArrayArg::from_raw_parts(pps_h, pps.len()),
+                width,
+            );
         }
 
         let bytes = client.read_one(out_h).unwrap();

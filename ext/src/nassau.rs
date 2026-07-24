@@ -46,11 +46,13 @@ use sseq::coordinates::{Bidegree, BidegreeGenerator};
 use crate::{
     chain_complex::{AugmentedChainComplex, ChainComplex, FiniteChainComplex, FreeChainComplex},
     save::{NassauCommand, NassauQiWriter, SaveDirectory, SaveKind},
+    utils::parallel::ParallelGuard,
 };
 
 /// See [`resolution::SenderData`](../resolution/struct.SenderData.html). This differs by not having the `new` field.
 struct SenderData {
     b: Bidegree,
+    retry: bool,
     sender: mpsc::Sender<Self>,
 }
 
@@ -59,6 +61,18 @@ impl SenderData {
         sender
             .send(Self {
                 b,
+                retry: false,
+                sender: sender.clone(),
+            })
+            .unwrap()
+    }
+
+    pub(crate) fn send_retry(b: Bidegree, sender: mpsc::Sender<Self>) {
+        tracing::info!(%b, "retrying");
+        sender
+            .send(Self {
+                b,
+                retry: true,
                 sender: sender.clone(),
             })
             .unwrap()
@@ -165,53 +179,6 @@ impl MilnorSubalgebra {
             .map(|gen_data| gen_data.end[0])
             .last()
             .unwrap_or(0)
-    }
-
-    /// Get the matrix of a free module homomorphism when restricted to the subquotient given by
-    /// the signature.
-    ///
-    /// Only generators of the target of degree strictly less than `target_max_gen_degree` are used
-    /// (see [`Self::signature_mask`]).
-    fn signature_matrix(
-        &self,
-        hom: &FreeModuleHomomorphism<FreeModule<MilnorAlgebra>>,
-        degree: i32,
-        signature: &[PPartEntry],
-        target_max_gen_degree: i32,
-    ) -> Matrix {
-        let p = hom.prime();
-        let source = hom.source();
-        let target = hom.target();
-        let algebra = target.algebra();
-        let target_degree = degree - hom.degree_shift();
-
-        let target_mask: Vec<usize> = self
-            .signature_mask(
-                &algebra,
-                &target,
-                target_degree,
-                signature,
-                target_max_gen_degree,
-            )
-            .collect();
-
-        let source_mask: Vec<usize> = self
-            .signature_mask(&algebra, &source, degree, signature, i32::MAX)
-            .collect();
-
-        let mut scratch = FpVector::new(
-            p,
-            Self::restricted_dimension(&target, target_degree, target_max_gen_degree),
-        );
-        let mut result = Matrix::new(p, source_mask.len(), target_mask.len());
-
-        for (mut row, &masked_index) in std::iter::zip(result.iter_mut(), &source_mask) {
-            scratch.set_to_zero();
-            hom.apply_to_basis_element_restricted(scratch.as_slice_mut(), 1, degree, masked_index);
-
-            row.add_masked(scratch.as_slice(), 1, &target_mask);
-        }
-        result
     }
 
     /// Iterate through all signatures of this algebra that contain elements of degree at most
@@ -753,6 +720,7 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
         // the per-signature masks partition; `next_dim` is the restricted column count.
         let full_reuse: Option<Matrix> = if reuse_full_matrix(&self.differentials[b.s() - 1]) {
             let all_rows: Vec<usize> = (0..target_dim).collect();
+            let _guard = ParallelGuard::new();
             Some(restricted_partial_matrix_maybe_gpu(
                 &self.differentials[b.s() - 1],
                 b.t(),
@@ -769,6 +737,7 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                 select_rows(full, &target_mask)
             }
             None => {
+                let _guard = ParallelGuard::new();
                 restricted_partial_matrix_maybe_gpu(
                     &self.differentials[b.s() - 1],
                     b.t(),
@@ -806,9 +775,26 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
             f.write_fix()?;
         }
 
-        // Compute image
-        let mut n =
-            subalgebra.signature_matrix(&self.differentials[b.s()], b.t(), &zero_sig, target_bound);
+        // Compute image: d_s applied to the zero-signature source basis, column-masked to the
+        // zero-signature target basis. This is the same restricted multiply as `full_matrix` above
+        // (on d_s = differentials[b.s()] rather than d_{s-1}), and its target mask/dimension are
+        // exactly the `target_mask`/`target_dim` already computed for this bidegree — d_s and
+        // d_{s-1} share the target module `modules[b.s() - 1]`. So route it through the same
+        // (GPU-offloaded, work-gated) restricted-matrix path and apply the column mask on CPU,
+        // instead of `signature_matrix`'s serial per-row CPU multiply.
+        let source_mask: Vec<usize> = subalgebra
+            .signature_mask(&algebra, &self.modules[b.s()], b.t(), &zero_sig, i32::MAX)
+            .collect();
+        let img_full = restricted_partial_matrix_maybe_gpu(
+            &self.differentials[b.s()],
+            b.t(),
+            &source_mask,
+            target_dim,
+        );
+        let mut n = Matrix::new(p, source_mask.len(), target_masked_dim);
+        for (mut row, full_row) in std::iter::zip(n.iter_mut(), img_full.iter()) {
+            row.add_masked(full_row, 1, &target_mask);
+        }
         n.row_reduce();
         let next_row = n.rows();
 
@@ -865,6 +851,7 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                     select_rows(full, &target_mask)
                 }
                 None => {
+                    let _guard = ParallelGuard::new();
                     restricted_partial_matrix_maybe_gpu(
                         &self.differentials[b.s() - 1],
                         b.t(),
@@ -956,6 +943,7 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                 0,
             );
             {
+                let _guard = ParallelGuard::new();
                 chain_map.get_matrix(matrix.segment(0, 0), t);
             }
             matrix.segment(1, 1).add_identity();
@@ -996,6 +984,7 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
         let mut matrix =
             AugmentedMatrix::<2>::new(p, target_dim, [cc_module.dimension(t), target_dim]);
         {
+            let _guard = ParallelGuard::new();
             self.chain_maps[0].get_matrix(matrix.segment(0, 0), t);
         }
         matrix.segment(1, 1).add_identity();
@@ -1010,6 +999,7 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
             0,
         );
         {
+            let _guard = ParallelGuard::new();
             self.differentials[1].get_matrix(matrix.segment(0, 0), t);
         }
         matrix.segment(1, 1).add_identity();
@@ -1155,13 +1145,17 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
 
             let (sender, receiver) = mpsc::channel();
 
-            let f = |b: Bidegree, sender: mpsc::Sender<SenderData>| {
+            let spawn_bidegree = |b: Bidegree, sender: mpsc::Sender<SenderData>| {
                 if self.has_computed_bidegree(b) {
                     SenderData::send(b, sender);
                 } else {
                     let tracing_span = tracing_span.clone();
                     scope.spawn(move |_| {
                         let _tracing_guard = tracing_span.enter();
+                        if crate::utils::parallel::is_in_parallel() {
+                            SenderData::send_retry(b, sender);
+                            return;
+                        }
                         self.step_resolution(b);
                         SenderData::send(b, sender);
                     });
@@ -1173,28 +1167,83 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
             // diagonal predecessor `(0, min_degree)` is in region, so we let it be spawned instead.
             for s in 0..=max_s {
                 if s != 1 {
-                    f(Bidegree::s_t(s, min_degree), sender.clone());
+                    spawn_bidegree(Bidegree::s_t(s, min_degree), sender.clone());
                 }
             }
             drop(sender);
 
-            while let Ok(SenderData { b, sender }) = receiver.recv() {
-                assert!(progress[b.s() as usize] == b.t() - 1);
-                progress[b.s() as usize] = b.t();
+            // Bidegrees whose spawned job was stolen onto a worker already inside a critical section
+            // (`is_in_parallel` set on that worker) and so bounced back a retry rather than causing
+            // a priority inversion. Because the check is per-thread, a job is only ever bounced when
+            // its worker is a blocked guard holder; a job picked up by a free worker just runs. Such
+            // bounces are therefore rare, but when the pool is momentarily saturated we still must
+            // avoid re-spawning immediately in a tight loop, so we park bounced bidegrees here.
+            //
+            // The scheduler thread never holds a guard, so it cannot itself observe when a worker
+            // frees; instead, while anything is parked we wait on the channel with a short timeout
+            // and retry the parked work whenever a completion arrives (a worker likely just freed)
+            // or the timeout elapses (periodic re-check). Incoming messages are still handled the
+            // instant they arrive; the timeout only governs how promptly we retry while otherwise
+            // idle. This cannot deadlock: parked entries keep their senders, so the channel stays
+            // open, and the timeout guarantees parked work is retried until a free worker takes it.
+            let mut deferred: Vec<(Bidegree, mpsc::Sender<SenderData>)> = Vec::new();
+            // How long to wait for a message before retrying parked bidegrees. Small enough that a
+            // freed worker is used promptly, large enough that the poll is negligible; it only ticks
+            // while something is parked.
+            const RETRY_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_micros(100);
 
-                // Completing `b` can only make ready its same-row successor `(s, t + 1)` and one
-                // diagonal successor. `ready` requires *both* predecessors, so of the two
-                // completions that could spawn a given bidegree, only the later one does.
-                let same_row = b + Bidegree::s_t(0, 1);
-                let diagonal = if b.s() == 0 {
-                    Bidegree::s_t(1, b.t())
+            loop {
+                let event = if deferred.is_empty() {
+                    // Nothing parked: block until a message arrives or all senders drop.
+                    match receiver.recv() {
+                        Ok(data) => Some(data),
+                        Err(_) => break,
+                    }
                 } else {
-                    b + Bidegree::s_t(1, 1)
+                    // Something parked: wake periodically to retry it. Parked entries hold senders,
+                    // so the channel cannot be disconnected here.
+                    match receiver.recv_timeout(RETRY_POLL_INTERVAL) {
+                        Ok(data) => Some(data),
+                        Err(mpsc::RecvTimeoutError::Timeout) => None,
+                        Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                    }
                 };
 
-                for cand in [same_row, diagonal] {
-                    if ready(cand.s(), cand.t(), &progress) {
-                        f(cand, sender.clone());
+                if let Some(SenderData { b, retry, sender }) = event {
+                    if retry {
+                        // Park until a worker frees; retried below on a completion or timeout.
+                        deferred.push((b, sender));
+                        continue;
+                    }
+                    assert!(progress[b.s() as usize] == b.t() - 1);
+                    progress[b.s() as usize] = b.t();
+
+                    // Completing `b` can only make ready its same-row successor `(s, t + 1)` and one
+                    // diagonal successor. `ready` requires *both* predecessors, so of the two
+                    // completions that could spawn a given bidegree, only the later one does.
+                    let same_row = b + Bidegree::s_t(0, 1);
+                    let diagonal = if b.s() == 0 {
+                        Bidegree::s_t(1, b.t())
+                    } else {
+                        b + Bidegree::s_t(1, 1)
+                    };
+
+                    for cand in [same_row, diagonal] {
+                        if ready(cand.s(), cand.t(), &progress) {
+                            spawn_bidegree(cand, sender.clone());
+                        }
+                    }
+                }
+
+                // Retry parked bidegrees — reached after a completion (a worker likely just freed)
+                // or a timeout (periodic re-check), but not after a retry (which `continue`s above,
+                // so a bounced job waits out the timeout before being retried). Each re-spawned job
+                // re-checks its own worker's flag: those on a free worker run, those stolen onto a
+                // blocked guard holder bounce and are re-parked. This stays cheap because per-thread
+                // bounces are rare, so `deferred` is normally empty.
+                if !deferred.is_empty() {
+                    for (b, sender) in std::mem::take(&mut deferred) {
+                        spawn_bidegree(b, sender);
                     }
                 }
             }
@@ -1611,6 +1660,7 @@ impl<'a, M: ZeroModule<Algebra = MilnorAlgebra>> RecomputeReader<'a, M> {
             .collect();
 
         let full_matrix = {
+            let _guard = ParallelGuard::new();
             restricted_partial_matrix(&self.res.differentials[s], t, &src_mask, self.next_dim)
         };
         let mut masked_matrix =
