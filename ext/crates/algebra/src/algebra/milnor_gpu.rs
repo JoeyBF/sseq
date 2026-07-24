@@ -130,6 +130,16 @@ fn gpu_stream_slots() -> u64 {
     *SLOTS
 }
 
+/// A/B diagnostic toggle (`NASSAU_GPU_BASIS_PASSTHROUGH=1`): when set, the batched multiply
+/// marshals each term's p-part per launch and binds those buffers as the "basis" with an
+/// identity index map, reproducing the pre-resident-basis behaviour through the same kernel.
+/// Lets a single binary isolate a kernel-signature bug from a resident-basis host/upload bug.
+fn basis_passthrough() -> bool {
+    static ON: LazyLock<bool> =
+        LazyLock::new(|| std::env::var_os("NASSAU_GPU_BASIS_PASSTHROUGH").is_some());
+    *ON
+}
+
 /// RAII reservation of `weight` bytes from [`GPU_BUDGET`] plus a round-robin stream slot;
 /// blocks (parked, not spinning) until the budget admits it.
 struct GpuPermit {
@@ -320,6 +330,131 @@ fn resident_info(algebra: &MilnorAlgebra, p_part: &[PPartEntry]) -> RInfo {
     host.masks.extend(mk.iter().map(|&v| narrow_u16(v)));
     host.index.insert(p_part.to_vec(), info);
     info
+}
+
+/// Process-shared host master of the Milnor basis itself, laid out for the device.
+///
+/// Every basis element's p-part is stored zero-padded to `width` at `pparts[gei*width ..]`,
+/// where `gei` is the element's *global* index (elements concatenated in degree order:
+/// all of degree 0, then degree 1, …). `lens[gei]` is its true (trimmed) p-part length,
+/// and `global_base[d]` is the number of elements in degrees `< d`, so a term `(s_degree,
+/// ti)` maps to `gei = global_base[s_degree] + ti`.
+///
+/// This exists so a launch uploads only the small per-term *index* array (`term_gei`)
+/// rather than re-gathering and re-uploading every term's padded p-part every launch — the
+/// dominant per-launch H2D transfer. The basis is append-only and grows only when a higher
+/// degree first appears, so it is uploaded to the device once and re-uploaded only on growth
+/// (mirroring [`ResidentHost`]). `built_degree` is the highest degree fully appended.
+#[derive(Default)]
+struct ResidentBasisHost {
+    pparts: Vec<u16>,
+    lens: Vec<u32>,
+    global_base: Vec<u32>,
+    built_degree: i32,
+    width: usize,
+}
+
+static RESIDENT_BASIS_HOST: LazyLock<RwLock<ResidentBasisHost>> =
+    LazyLock::new(|| RwLock::new(ResidentBasisHost::default()));
+
+/// Device mirror of [`ResidentBasisHost`]; `uploaded` is the element count on the device.
+#[derive(Default)]
+struct ResidentBasisDev {
+    pp_handle: Option<Handle>,
+    ln_handle: Option<Handle>,
+    uploaded: usize,
+}
+
+static RESIDENT_BASIS_DEV: LazyLock<RwLock<ResidentBasisDev>> =
+    LazyLock::new(|| RwLock::new(ResidentBasisDev::default()));
+
+/// Serializes basis device *uploads* only (never handle reads); see [`RESIDENT_UPLOAD`].
+static RESIDENT_BASIS_UPLOAD: Mutex<()> = Mutex::new(());
+
+/// Ensure the resident basis is built through `max_degree` and return a snapshot of
+/// `global_base` (so callers compute `gei = global_base[s_degree] + ti` without holding the
+/// lock during the parallel marshal). `width` is the fixed p-part padding stride.
+///
+/// Append-only: only the first sight of each new degree takes the write lock, and the append
+/// order fixes every element's `gei` forever. Basis enumeration is a pure function of the
+/// algebra, so a first-sight race just recomputes identical bytes (the loser rechecks under
+/// the write lock and appends nothing already present, since we extend strictly past
+/// `built_degree`).
+fn ensure_basis(algebra: &MilnorAlgebra, width: usize, max_degree: i32) -> Vec<u32> {
+    {
+        let host = RESIDENT_BASIS_HOST.read().unwrap();
+        // `width != 0` distinguishes an initialized store from the derived-`Default` zero state
+        // (where `built_degree == 0` would spuriously claim degree 0 is already built).
+        if host.width != 0 && host.built_degree >= max_degree {
+            return host.global_base.clone();
+        }
+    }
+    let mut host = RESIDENT_BASIS_HOST.write().unwrap();
+    if host.width == 0 {
+        host.width = width;
+        host.built_degree = -1; // nothing built yet; the loop below starts at degree 0
+        host.global_base.push(0); // global_base[0] = 0 elements before degree 0
+    }
+    debug_assert_eq!(host.width, width, "basis padding width must be stable");
+    for d in (host.built_degree + 1)..=max_degree {
+        let dim = algebra.dimension(d);
+        for i in 0..dim {
+            let elt = algebra.basis_element_from_index(d, i);
+            host.lens.push(elt.p_part.len() as u32);
+            let base = host.pparts.len();
+            host.pparts.resize(base + width, 0);
+            for (slot, &v) in host.pparts[base..base + width].iter_mut().zip(&elt.p_part) {
+                *slot = narrow_u16(v);
+            }
+        }
+        // global_base[d+1] = total elements in degrees ≤ d.
+        let total = host.lens.len() as u32;
+        host.global_base.push(total);
+    }
+    host.built_degree = max_degree;
+    host.global_base.clone()
+}
+
+/// Fetch the resident basis device handles `(pparts, lens)`, uploading the current host basis
+/// only when the device copy does not yet cover `$need` elements. Upload runs outside
+/// `RESIDENT_BASIS_DEV` (readers stay lock-free), serialized by `RESIDENT_BASIS_UPLOAD` with a
+/// re-check to coalesce a burst of growth. The basis is append-only, so any handle with
+/// `uploaded >= $need` is valid. A macro (not a fn) so the cubecl client type stays inferred,
+/// exactly as [`resident_dev_handle`].
+macro_rules! basis_dev_handles {
+    ($client:expr, $need:expr) => {{
+        let read_current = || {
+            let dev = RESIDENT_BASIS_DEV.read().unwrap();
+            match (dev.uploaded >= $need, dev.pp_handle.clone(), dev.ln_handle.clone()) {
+                (true, Some(pp), Some(ln)) => Some((pp, ln)),
+                _ => None,
+            }
+        };
+        match read_current() {
+            Some(h) => h,
+            None => {
+                let _guard = RESIDENT_BASIS_UPLOAD.lock().unwrap();
+                match read_current() {
+                    Some(h) => h, // another uploader already covered our need
+                    None => {
+                        let (pp, ln, elems) = {
+                            let host = RESIDENT_BASIS_HOST.read().unwrap();
+                            (
+                                $client.create_from_slice(u16::as_bytes(&host.pparts)),
+                                $client.create_from_slice(u32::as_bytes(&host.lens)),
+                                host.lens.len(),
+                            )
+                        };
+                        let mut dev = RESIDENT_BASIS_DEV.write().unwrap();
+                        dev.pp_handle = Some(pp.clone());
+                        dev.ln_handle = Some(ln.clone());
+                        dev.uploaded = elems;
+                        (pp, ln)
+                    }
+                }
+            }
+        }
+    }};
 }
 
 /// Zero a device `u32` buffer on-device: `out[i] = 0`, one thread per limb.
@@ -645,8 +780,9 @@ fn multiply_single_r_kernel(
 fn multiply_batch_kernel(
     col_sums: &Array<u16>,
     masks: &Array<u16>,
-    term_pparts: &Array<u16>,
-    term_lens: &Array<u32>,
+    basis_pparts: &Array<u16>,
+    basis_lens: &Array<u32>,
+    term_gei: &Array<u32>,
     g: &Array<u32>,
     xi: &Array<u32>,
     out: &mut Array<Atomic<u32>>,
@@ -694,17 +830,23 @@ fn multiply_batch_kernel(
     let cs_len = usize::cast_from(r_cs_len[ri]);
     let mk_len = usize::cast_from(r_mk_len[ri]);
     let term_slot = usize::cast_from(prod_term_start[p]) + t;
+    // `term_gei[term_slot]` is the term's *global* basis-element index (across all degrees):
+    // its (width-padded) p-part lives at `basis_pparts[gei*width ..]`, length `basis_lens[gei]`.
+    // The basis is resident on the device (uploaded once, grown incrementally), so a launch
+    // uploads only these indices instead of re-gathering every term's p-part — see
+    // [`ResidentBasisHost`].
+    let gei = usize::cast_from(term_gei[term_slot]);
     multiply_pair(
         col_sums,
         masks,
-        term_pparts,
+        basis_pparts,
         g,
         xi,
         out,
         usize::cast_from(r_cs_offset[ri]) + m * cs_len,
         usize::cast_from(r_mk_offset[ri]) + m * mk_len,
-        term_slot * width,
-        usize::cast_from(term_lens[term_slot]),
+        gei * width,
+        usize::cast_from(basis_lens[gei]),
         cs_len,
         mk_len,
         usize::cast_from(prod_row_base[p]),
@@ -957,30 +1099,68 @@ fn multiply_batch_block(
         off
     };
     let total_terms = *term_off.last().unwrap();
-    let mut term_pparts: Vec<u16> = vec![0u16; total_terms * width];
-    let mut term_lens: Vec<u32> = vec![0u32; total_terms];
+
+    // Resident-basis path (the default): a term's p-part is not marshalled at all — it lives on
+    // the device (built once, grown incrementally). We upload only `term_gei[slot]`, the term's
+    // *global* basis-element index `global_base[s_degree] + ti`. Ensure the basis covers every
+    // `s_degree` in this block, then snapshot `global_base` so the parallel fill needs no lock.
+    let max_s_degree = products.iter().map(|p| p.s_degree).max().unwrap_or(0);
+    let global_base = ensure_basis(algebra, width, max_s_degree);
+    let mut term_gei: Vec<u32> = vec![0u32; total_terms];
     {
-        let tp_base = term_pparts.as_mut_ptr() as usize;
-        let tl_base = term_lens.as_mut_ptr() as usize;
+        let tg_base = term_gei.as_mut_ptr() as usize;
+        let global_base = &global_base;
         (0..products.len()).into_maybe_par_iter().for_each(|pi| {
             let prod = &products[pi];
             let (off, nt) = (term_off[pi], prod.term_indices.len());
             // SAFETY: products write disjoint `[off, off + nt)` ranges (from the prefix sum),
-            // each within the allocated buffers, so no two tasks alias any element. The `usize`
-            // bases are re-formed into pointers here because raw pointers are not `Send`.
-            let tp = unsafe {
+            // each within the allocated buffer, so no two tasks alias any element. The `usize`
+            // base is re-formed into a pointer here because raw pointers are not `Send`.
+            let tg = unsafe { std::slice::from_raw_parts_mut((tg_base as *mut u32).add(off), nt) };
+            let base = global_base[prod.s_degree as usize];
+            for (k, &ti) in prod.term_indices.iter().enumerate() {
+                tg[k] = base + ti as u32;
+            }
+        });
+    }
+    // Device need: the largest `gei` any term dereferences is `< global_base[max_s_degree + 1]`
+    // (all elements through degree `max_s_degree`), so uploading that many covers the block.
+    let need_basis_elems = global_base[max_s_degree as usize + 1] as usize;
+
+    // A/B diagnostic (`NASSAU_GPU_BASIS_PASSTHROUGH=1`): bind the *per-launch* term buffers as the
+    // "basis" and set `term_gei` to the identity, so the new kernel reproduces the old behaviour
+    // bit-for-bit. If passthrough matches the CPU but the resident path does not, the bug is in
+    // the resident host/upload logic, not the kernel signature — and vice-versa.
+    let passthrough = basis_passthrough();
+    let (mut term_pparts, mut term_lens): (Vec<u16>, Vec<u32>) = if passthrough {
+        let mut tp: Vec<u16> = vec![0u16; total_terms * width];
+        let mut tl: Vec<u32> = vec![0u32; total_terms];
+        let tp_base = tp.as_mut_ptr() as usize;
+        let tl_base = tl.as_mut_ptr() as usize;
+        (0..products.len()).into_maybe_par_iter().for_each(|pi| {
+            let prod = &products[pi];
+            let (off, nt) = (term_off[pi], prod.term_indices.len());
+            // SAFETY: disjoint per-product ranges, as above.
+            let tpp = unsafe {
                 std::slice::from_raw_parts_mut((tp_base as *mut u16).add(off * width), nt * width)
             };
-            let tl = unsafe { std::slice::from_raw_parts_mut((tl_base as *mut u32).add(off), nt) };
+            let tll = unsafe { std::slice::from_raw_parts_mut((tl_base as *mut u32).add(off), nt) };
             for (k, &ti) in prod.term_indices.iter().enumerate() {
                 let elt = algebra.basis_element_from_index(prod.s_degree, ti);
-                tl[k] = elt.p_part.len() as u32;
-                for (slot, &v) in tp[k * width..(k + 1) * width].iter_mut().zip(&elt.p_part) {
+                tll[k] = elt.p_part.len() as u32;
+                for (slot, &v) in tpp[k * width..(k + 1) * width].iter_mut().zip(&elt.p_part) {
                     *slot = narrow_u16(v);
                 }
             }
         });
-    }
+        // Identity indices, so the kernel's `gei*width` / `basis_lens[gei]` hit slot `term_slot`.
+        for (i, g) in term_gei.iter_mut().enumerate() {
+            *g = i as u32;
+        }
+        (tp, tl)
+    } else {
+        (Vec::new(), Vec::new())
+    };
 
     // Take the concurrency permit only now, with every rayon parallel section behind us: holding
     // it across the `per_prod` par_iter above deadlocks, because that par_iter's chunks execute on
@@ -1052,13 +1232,12 @@ fn multiply_batch_block(
         let kb = |n: usize, sz: usize| n * sz / 1024;
         eprintln!(
             "[gpu-batch] rows={num_rows} cols={num_cols} products={} total_pairs={total_pairs} \
-             out_len={out_len} | UPLOAD-KB: g={} xi={} term_pparts={} term_lens={} \
-             prod_arrays={} pps={} | resident cs={} mk={}",
+             out_len={out_len} | UPLOAD-KB: g={} xi={} term_gei={} \
+             prod_arrays={} pps={} | resident cs={} mk={} basis_elems={need_basis_elems}",
             products.len(),
             kb(g.len(), 4),
             kb(xi.len(), 4),
-            kb(term_pparts.len(), 2),
-            kb(term_lens.len(), 4),
+            kb(term_gei.len(), 4),
             kb(products.len() * 5, 4),
             kb(pps.len(), 4),
             kb(need_cs, 2),
@@ -1069,10 +1248,15 @@ fn multiply_batch_block(
         return vec![vec![0u32; num_limbs]; num_rows];
     }
 
-    // The resident `col_sums`/`masks` are non-empty once any `R` is present (guaranteed
-    // here, since `total_pairs > 0`); only `term_pparts` needs the non-empty guard.
-    if term_pparts.is_empty() {
+    // The resident `col_sums`/`masks` and basis are non-empty once any `R`/term is present
+    // (guaranteed here, since `total_pairs > 0`); only `term_gei` (and, in passthrough, the
+    // per-launch term buffers) needs the non-empty guard `create_from_slice` requires.
+    if term_gei.is_empty() {
+        term_gei.push(0);
+    }
+    if passthrough && term_pparts.is_empty() {
         term_pparts.push(0);
+        term_lens.push(0);
     }
 
     let marshal_ms = t_marshal.elapsed().as_secs_f64() * 1e3;
@@ -1103,8 +1287,22 @@ fn multiply_batch_block(
         // Upload the block's data — term data, seqno/xi tables, per-`R` offsets, per-product
         // records, the pair prefix sum, and the (zeroed) output buffer — and launch once: the
         // caller has already bounded this block's pair count and output size.
-        let tp_h = client.create_from_slice(u16::as_bytes(&term_pparts));
-        let tl_h = client.create_from_slice(u32::as_bytes(&term_lens));
+        // Resident basis handles (default) or per-launch passthrough buffers (A/B diagnostic).
+        // `bp_len`/`bl_len` are the logical array lengths the kernel sees; every `gei` a thread
+        // dereferences is `< need_basis_elems`, so `need_basis_elems*width` / `need_basis_elems`
+        // cover it (the resident buffer may be larger — append-only — which is fine).
+        let (bp_h, bl_h, bp_len, bl_len) = if passthrough {
+            (
+                client.create_from_slice(u16::as_bytes(&term_pparts)),
+                client.create_from_slice(u32::as_bytes(&term_lens)),
+                term_pparts.len(),
+                term_lens.len(),
+            )
+        } else {
+            let (pp, ln) = basis_dev_handles!(client, need_basis_elems);
+            (pp, ln, need_basis_elems * width, need_basis_elems)
+        };
+        let tg_h = client.create_from_slice(u32::as_bytes(&term_gei));
         let g_h = client.create_from_slice(u32::as_bytes(&g));
         let xi_h = client.create_from_slice(u32::as_bytes(&xi));
         let rco_h = client.create_from_slice(u32::as_bytes(&r_cs_offset));
@@ -1139,8 +1337,9 @@ fn multiply_batch_block(
                 CubeDim::new_1d(THREADS),
                 ArrayArg::from_raw_parts(cs_h, cs_len_master),
                 ArrayArg::from_raw_parts(mk_h, mk_len_master),
-                ArrayArg::from_raw_parts(tp_h, term_pparts.len()),
-                ArrayArg::from_raw_parts(tl_h, term_lens.len()),
+                ArrayArg::from_raw_parts(bp_h, bp_len),
+                ArrayArg::from_raw_parts(bl_h, bl_len),
+                ArrayArg::from_raw_parts(tg_h, term_gei.len()),
                 ArrayArg::from_raw_parts(g_h, g.len()),
                 ArrayArg::from_raw_parts(xi_h, xi.len()),
                 ArrayArg::from_raw_parts(out_h.clone(), out_len),
