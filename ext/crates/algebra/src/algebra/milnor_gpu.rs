@@ -934,24 +934,46 @@ fn multiply_batch_block(
     // Admissible-matrix data (`col_sums`/`masks` + per-`R` offsets) is resident (built in the
     // thread-local `RESIDENT` store below), so nothing to enumerate or lay out here.
 
-    // Parallel: each product's term p-parts (padded to `width`) and lengths.
-    let per_prod: Vec<(Vec<u16>, Vec<u32>)> = (0..products.len())
-        .into_maybe_par_iter()
-        .map(|pi| {
+    // Per-product term p-parts (padded to `width`) and lengths, filled directly into two flat
+    // buffers rather than one `(Vec, Vec)` per product. At the frontier a launch has ~10^5-10^6
+    // products; the old per-product `Vec` pair (plus the later concat-copy) was ~10^6 tiny
+    // allocations per launch — a dominant chunk of the marshal cost. `term_off` is the prefix sum
+    // of term counts, so each product owns a disjoint output range and the fill stays parallel.
+    let term_off: Vec<usize> = {
+        let mut off = Vec::with_capacity(products.len() + 1);
+        let mut acc = 0usize;
+        for prod in products {
+            off.push(acc);
+            acc += prod.term_indices.len();
+        }
+        off.push(acc);
+        off
+    };
+    let total_terms = *term_off.last().unwrap();
+    let mut term_pparts: Vec<u16> = vec![0u16; total_terms * width];
+    let mut term_lens: Vec<u32> = vec![0u32; total_terms];
+    {
+        let tp_base = term_pparts.as_mut_ptr() as usize;
+        let tl_base = term_lens.as_mut_ptr() as usize;
+        (0..products.len()).into_maybe_par_iter().for_each(|pi| {
             let prod = &products[pi];
-            let nt = prod.term_indices.len();
-            let mut tp = vec![0u16; nt * width];
-            let mut tl = Vec::with_capacity(nt);
+            let (off, nt) = (term_off[pi], prod.term_indices.len());
+            // SAFETY: products write disjoint `[off, off + nt)` ranges (from the prefix sum),
+            // each within the allocated buffers, so no two tasks alias any element. The `usize`
+            // bases are re-formed into pointers here because raw pointers are not `Send`.
+            let tp = unsafe {
+                std::slice::from_raw_parts_mut((tp_base as *mut u16).add(off * width), nt * width)
+            };
+            let tl = unsafe { std::slice::from_raw_parts_mut((tl_base as *mut u32).add(off), nt) };
             for (k, &ti) in prod.term_indices.iter().enumerate() {
                 let elt = algebra.basis_element_from_index(prod.s_degree, ti);
-                tl.push(elt.p_part.len() as u32);
+                tl[k] = elt.p_part.len() as u32;
                 for (slot, &v) in tp[k * width..(k + 1) * width].iter_mut().zip(&elt.p_part) {
                     *slot = narrow_u16(v);
                 }
             }
-            (tp, tl)
-        })
-        .collect();
+        });
+    }
 
     // Take the concurrency permit only now, with every rayon parallel section behind us: holding
     // it across the `per_prod` par_iter above deadlocks, because that par_iter's chunks execute on
@@ -988,9 +1010,9 @@ fn multiply_batch_block(
         need_mk = need_mk.max(info.mk_off as usize + info.num_mats as usize * info.mk_len as usize);
     }
 
-    // Lay out per-product term data + records + the pair-count prefix sum (sequential).
-    let mut term_pparts: Vec<u16> = Vec::new();
-    let mut term_lens: Vec<u32> = Vec::new();
+    // Lay out per-product records + the pair-count prefix sum (sequential). Term data is already
+    // in `term_pparts`/`term_lens` (filled in parallel above); `term_off` gives each product's
+    // start, so nothing is copied here.
     let mut prod_term_start: Vec<u32> = Vec::with_capacity(products.len());
     let mut prod_num_terms: Vec<u32> = Vec::with_capacity(products.len());
     let mut prod_row_base: Vec<u32> = Vec::with_capacity(products.len());
@@ -1002,12 +1024,9 @@ fn multiply_batch_block(
     // `2^32` `ABSOLUTE_POS` limit; asserted below before the values are used).
     let mut pps: Vec<u32> = Vec::with_capacity(products.len() + 1);
     let mut pair_acc: usize = 0;
-    for (pi, (tp, tl)) in per_prod.iter().enumerate() {
-        let prod = &products[pi];
+    for (pi, prod) in products.iter().enumerate() {
         let ri = prod_r_index[pi];
-        prod_term_start.push(term_lens.len() as u32);
-        term_lens.extend_from_slice(tl);
-        term_pparts.extend_from_slice(tp);
+        prod_term_start.push(term_off[pi] as u32);
         pps.push(pair_acc as u32);
         pair_acc += r_num_matrices[ri as usize] * prod.term_indices.len();
         prod_num_terms.push(prod.term_indices.len() as u32);
