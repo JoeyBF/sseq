@@ -14,25 +14,11 @@
 //!   CPU path is used. Defaults to 2048; the GPU only wins once the kernel work
 //!   dwarfs the H2D/D2H + TMA-layout marshalling, which dominates small sizes.
 
-use std::sync::{Mutex, OnceLock, RwLock};
+use std::sync::{Mutex, OnceLock};
 
 use fp_cuda::GpuContext;
 
 use crate::{matrix::Matrix, prime::TWO};
-
-/// Serializes the fp-cuda **cooperative** row-reduce (raw cudarc) against the algebra
-/// **cubecl** Milnor multiply, which share the one physical GPU from different CUDA
-/// runtimes. The row-reduce's `cuLaunchCooperativeKernel` (panel_factor_coop's grid-wide
-/// spin barrier) needs *all* its CTAs co-resident; a cubecl multiply kernel occupying SMs
-/// at that moment prevents co-residency, so the missing CTAs never reach the barrier and
-/// the resident ones spin forever (flat sm=100% — the intermittent stem-150 wedge).
-///
-/// Contract: the cooperative row-reduce takes the **write** lock (exclusive GPU) around its
-/// launch+download; every cubecl multiply takes a **read** lock held from launch through its
-/// readback (so releasing means that kernel has actually completed, not merely enqueued).
-/// Readers run concurrently with each other; a pending row-reduce drains them, runs alone,
-/// then lets them resume. See `algebra::algebra::milnor_gpu` for the read side.
-pub static GPU_EXCLUSIVE: RwLock<()> = RwLock::new(());
 
 /// Smallest `min(m, k, n)` for which we attempt the GPU matmul. Below this the
 /// host marshalling (bit-repack into TMA tiles + copies) costs more than it saves.
@@ -141,11 +127,9 @@ pub(crate) fn try_row_reduce(m: &mut Matrix) -> Option<usize> {
     let stride = cols.div_ceil(64);
     let limbs = to_limbs(m);
 
-    // Exclusive GPU for the cooperative reduce: block new cubecl multiplies and wait for
-    // in-flight ones to complete, so panel_factor_coop's grid-wide barrier can co-reside all
-    // its CTAs (see [`GPU_EXCLUSIVE`]). Held across launch + download; ordered before ctx.lock.
+    // The default row-reduce is composable (no cooperative launch), so it needs no
+    // cross-runtime exclusion against the concurrent cubecl multiply.
     let (dev_limbs, perm, r, pivot_cols) = {
-        let _exclusive = GPU_EXCLUSIVE.write().unwrap_or_else(|e| e.into_inner());
         let gpu = ctx.lock().ok()?;
         let mut dm = gpu.upload(&limbs, rows, cols).ok()?;
         let (perm, r, pivot_cols) = gpu.row_reduce_dev(&mut dm).ok()?;

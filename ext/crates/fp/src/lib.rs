@@ -12,12 +12,6 @@ pub mod vector;
 
 pub mod blas;
 
-/// Cross-runtime GPU serialization lock (cubecl multiply vs. cooperative fp-cuda row-reduce).
-/// Re-exported so `algebra`'s Milnor-multiply GPU path can take the read side. See
-/// [`blas::cuda::GPU_EXCLUSIVE`].
-#[cfg(feature = "gpu")]
-pub use blas::cuda::GPU_EXCLUSIVE;
-
 pub(crate) mod simd;
 
 // This is useful for traits that want to implement `Arbitrary`. This lets us specify that they

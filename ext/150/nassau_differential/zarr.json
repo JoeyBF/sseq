@@ -1,0 +1,63 @@
+{
+  "zarr_format": 3,
+  "node_type": "array",
+  "shape": [
+    4096,
+    1024
+  ],
+  "data_type": "bytes",
+  "chunk_grid": {
+    "name": "regular",
+    "configuration": {
+      "chunk_shape": [
+        8,
+        8
+      ]
+    }
+  },
+  "chunk_key_encoding": {
+    "name": "default",
+    "configuration": {
+      "separator": "/"
+    }
+  },
+  "fill_value": [],
+  "codecs": [
+    {
+      "name": "sharding_indexed",
+      "configuration": {
+        "chunk_shape": [
+          1,
+          1
+        ],
+        "codecs": [
+          {
+            "name": "vlen-bytes"
+          },
+          {
+            "name": "crc32c"
+          }
+        ],
+        "index_codecs": [
+          {
+            "name": "bytes",
+            "configuration": {
+              "endian": "little"
+            }
+          },
+          {
+            "name": "crc32c"
+          }
+        ],
+        "index_location": "end"
+      }
+    }
+  ],
+  "attributes": {
+    "_zarrs": {
+      "description": "This array was created with zarrs",
+      "repository": "https://github.com/zarrs/zarrs",
+      "version": "0.23.13"
+    }
+  }
+}

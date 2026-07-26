@@ -1505,13 +1505,6 @@ fn multiply_batch_block(
     }
     .executes(|| {
         let client = CudaRuntime::client(&CudaDevice::default());
-        // Hold the cross-runtime GPU read lock for this whole device section (H2D + kernels +
-        // readback), so a concurrent cooperative fp-cuda row-reduce (raw cudarc) waits for this
-        // cubecl multiply to finish before taking the GPU exclusively. Without this, the RREF's
-        // `cuLaunchCooperativeKernel` grid barrier can't co-reside its CTAs against a resident
-        // multiply kernel and spins forever (the intermittent stem-150 wedge). See
-        // [`fp::GPU_EXCLUSIVE`]. Dropped at the end of the closure, after `read_one`.
-        let _gpu_shared = fp::GPU_EXCLUSIVE.read().unwrap_or_else(|e| e.into_inner());
         // Shared resident admissible buffers (see [`ResidentDev`]): re-upload the master ONLY
         // when this block dereferences past the uploaded prefix (`need_cs` / `need_mk`). The
         // master grows continually at the frontier, so re-uploading on mere growth ships
