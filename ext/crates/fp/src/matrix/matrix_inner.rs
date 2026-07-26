@@ -688,6 +688,14 @@ impl Matrix {
         if p == 2 {
             let (rr_rows, rr_cols) = (self.rows(), self.columns());
             let rr_big = rr_rows.min(rr_cols) >= 1024;
+            // Wrap the GPU reduce in an ENTERED span (not just a completion event) so a wedge
+            // *inside* `try_row_reduce` leaves an open `gpu_row_reduce` span with no `close` in the
+            // log — distinguishing an RREF hang from a milnor-multiply hang. Inherits the active
+            // nassau step span, so it carries the bidegree/signature. Dropped on return/fallthrough.
+            let _rr_span = rr_big.then(|| {
+                tracing::info_span!(target: "fp::rr", "gpu_row_reduce", rows = rr_rows, cols = rr_cols)
+                    .entered()
+            });
             match crate::blas::cuda::try_row_reduce(self) {
                 Some(rank) => {
                     if rr_big {
