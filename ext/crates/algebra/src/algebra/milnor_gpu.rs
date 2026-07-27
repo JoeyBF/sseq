@@ -226,8 +226,11 @@ use crate::algebra::milnor_algebra::PPartEntry;
 /// Where one `R`'s admissible-matrix data lives inside the resident master buffers.
 #[derive(Clone, Copy)]
 struct RInfo {
-    cs_off: u32,
-    mk_off: u32,
+    /// Global element offsets into the shared master (`u64`: the master exceeds `u32::MAX`
+    /// u16 elements at high stems, so the offset itself must be 64-bit — `multiply_batch_kernel`
+    /// reads `col_sums`/`masks` at these offsets under 64-bit `address_type`).
+    cs_off: u64,
+    mk_off: u64,
     cs_len: u32,
     mk_len: u32,
     num_mats: u32,
@@ -289,14 +292,6 @@ static RESIDENT_DEV: LazyLock<RwLock<ResidentDev>> =
 /// the initial size carries headroom to keep them few (~a handful per run). u16 → ~512 MiB.
 const RESIDENT_INIT_CAP: usize = 1 << 28;
 
-/// Maximum resident buffer capacity (elements). cubecl's `ArrayArg` length is a `u32`, so an array
-/// of exactly `2^32` elements has its length truncated to 0 — the copy then writes nothing and the
-/// buffer reads as all zeros (the stem-150 `dx != 0`, hit when the doubling `cap` jumped 2^31 → 2^32).
-/// Capacity is clamped just below the limit. A single resident buffer therefore cannot exceed
-/// `2^32 - 1` elements; a master/basis larger than that (very high stems) must be split across
-/// buffers — the same fundamental cubecl limit the old full-`create_from_slice` path also had.
-const RESIDENT_MAX_CAP: usize = (1 << 32) - 1;
-
 /// Serializes master device *uploads* only — never handle reads. A launch that must grow the
 /// device master takes this before uploading, so at a growth point at most one multi-GB
 /// `create_from_slice` runs (others re-check and find it already done) instead of every launch
@@ -349,8 +344,10 @@ macro_rules! resident_dev_handle {
                         let (handle, cap) = if old_handle.is_none() || host_len > cap {
                             // Quiesce readers for the handle swap (see [`RESIDENT_REALLOC`]).
                             let _realloc_w = RESIDENT_REALLOC.write().unwrap();
-                            let new_cap = host_len.max(cap * 2).max(RESIDENT_INIT_CAP)
-                                .min(RESIDENT_MAX_CAP);
+                            // No `u32` cap: the kernels bind these buffers with 64-bit addressing
+                            // (`multiply_batch_kernel` reads with static `u64`; the grow copy with
+                            // dynamic), so the length/offsets are never truncated past `u32::MAX`.
+                            let new_cap = host_len.max(cap * 2).max(RESIDENT_INIT_CAP);
                             let new_handle = $client.empty(new_cap * ::core::mem::size_of::<u16>());
                             if let Some(oh) = &old_handle {
                                 if uploaded > 0 {
@@ -417,8 +414,8 @@ fn resident_info(algebra: &MilnorAlgebra, p_part: &[PPartEntry]) -> RInfo {
         return *info;
     }
     let info = RInfo {
-        cs_off: host.col_sums.len() as u32,
-        mk_off: host.masks.len() as u32,
+        cs_off: host.col_sums.len() as u64,
+        mk_off: host.masks.len() as u64,
         cs_len: cs_len as u32,
         mk_len: mk_len as u32,
         num_mats: (mk.len() / mk_len) as u32,
@@ -549,8 +546,7 @@ macro_rules! basis_dev_handles {
                         };
                         let (pp_h, pp_cap) = if old_pp.is_none() || pp_len > pp_cap {
                             let _realloc_w = RESIDENT_REALLOC.write().unwrap();
-                            let new_cap = pp_len.max(pp_cap * 2).max(RESIDENT_INIT_CAP)
-                                .min(RESIDENT_MAX_CAP);
+                            let new_cap = pp_len.max(pp_cap * 2).max(RESIDENT_INIT_CAP);
                             let nh = $client.empty(new_cap * ::core::mem::size_of::<u16>());
                             if let Some(oh) = &old_pp {
                                 if pp_up > 0 {
@@ -584,8 +580,7 @@ macro_rules! basis_dev_handles {
                         };
                         let (ln_h, ln_cap) = if old_ln.is_none() || ln_len > ln_cap {
                             let _realloc_w = RESIDENT_REALLOC.write().unwrap();
-                            let new_cap = ln_len.max(ln_cap * 2).max(RESIDENT_INIT_CAP)
-                                .min(RESIDENT_MAX_CAP);
+                            let new_cap = ln_len.max(ln_cap * 2).max(RESIDENT_INIT_CAP);
                             let nh = $client.empty(new_cap * ::core::mem::size_of::<u32>());
                             if let Some(oh) = &old_ln {
                                 if ln_up > 0 {
@@ -654,10 +649,14 @@ fn zero_u32(out: &mut Array<u32>) {
 /// stable resident buffer at its append offset, so the resident device handle never changes (no
 /// re-`create_from_slice` churn that would break cross-stream sync).
 ///
-/// Offsets are `usize`, and `count` bounds this launch so the caller can split a copy larger than the
-/// `u32` `ABSOLUTE_POS` thread limit into chunks (a resident buffer exceeds 2^32 u16 elements around
-/// stem 150 — the width-padded basis p-parts especially). See [`copy_into_chunked`].
-#[cube(launch)]
+/// Offsets are `usize` (64-bit on device under the launch's `address_type = "dynamic"`, so both the
+/// `dst_off` append offset and the buffer length are safe past `u32::MAX`), and `count` bounds this
+/// launch so the caller can split a copy larger than the `u32` grid/`ABSOLUTE_POS` thread limit into
+/// chunks (a resident buffer exceeds 2^32 u16 elements around stem 150). See [`copy_chunked`].
+// `launch_unchecked` + dynamic addressing: `dst_off`/buffer length exceed `u32` once the resident
+// master/basis passes 2^32 elements, needing 64-bit `usize`; and cubecl's checked bounds clamp emits
+// `min(u64, u64)` (ambiguous for NVRTC) under u64. The `ABSOLUTE_POS < count` guard keeps it in-bounds.
+#[cube(launch_unchecked, address_type = "dynamic")]
 fn copy_into_u16(src: &Array<u16>, dst: &mut Array<u16>, src_off: usize, dst_off: usize, count: u32) {
     if ABSOLUTE_POS < usize::cast_from(count) {
         dst[dst_off + ABSOLUTE_POS] = src[src_off + ABSOLUTE_POS];
@@ -665,7 +664,7 @@ fn copy_into_u16(src: &Array<u16>, dst: &mut Array<u16>, src_off: usize, dst_off
 }
 
 /// `u32` sibling of [`copy_into_u16`] (for the resident basis `lens`).
-#[cube(launch)]
+#[cube(launch_unchecked, address_type = "dynamic")]
 fn copy_into_u32(src: &Array<u32>, dst: &mut Array<u32>, src_off: usize, dst_off: usize, count: u32) {
     if ABSOLUTE_POS < usize::cast_from(count) {
         dst[dst_off + ABSOLUTE_POS] = src[src_off + ABSOLUTE_POS];
@@ -687,10 +686,12 @@ macro_rules! copy_chunked {
         while done < $count {
             let n = ($count - done).min(COPY_CHUNK);
             unsafe {
-                $kernel::launch::<CudaRuntime>(
+                $kernel::launch_unchecked::<CudaRuntime>(
                     &$client,
                     CubeCount::Static((n as u32).div_ceil(CT), 1, 1),
                     CubeDim::new_1d(CT),
+                    // The resident dst offset ($dst_off) and buffer length exceed u32 at high stems.
+                    AddressType::from_len(($src_len).max($dst_len).max($dst_off + $count)),
                     ArrayArg::from_raw_parts($src.clone(), $src_len),
                     ArrayArg::from_raw_parts($dst.clone(), $dst_len),
                     $src_off + done,
@@ -1006,7 +1007,15 @@ fn multiply_single_r_kernel(
 ///
 /// Output is `num_rows` F₂ vectors of `num_limbs` `u32` limbs, row `r` at
 /// `out[r*num_limbs ..]`.
-#[cube(launch)]
+// 64-bit addressing (`address_type = "u64"`): the admissible masters (`col_sums`/`masks`) and the
+// width-padded basis exceed `u32::MAX` elements at high stems, and the per-`R` offsets in
+// `r_cs_offset`/`r_mk_offset` (u64) index into them. Static u64 (not "dynamic") because dynamic
+// would pick 32-bit `usize` for small blocks and then *narrow* the u64 offset arrays on read
+// (cubecl `usize::cast_from(u64)` under a u32 address type), corrupting results — the (180,92)
+// `dx != 0`. `launch_unchecked` because cubecl's checked-mode bounds clamp emits `min(u64, u64)`,
+// which NVRTC rejects as an ambiguous overload; every access here is already in-bounds by
+// construction (the `need_*` prefix covers every offset and the per-column guards bound `j`).
+#[cube(launch_unchecked, address_type = "u64")]
 #[allow(clippy::too_many_arguments)]
 fn multiply_batch_kernel(
     col_sums: &Array<u16>,
@@ -1017,8 +1026,8 @@ fn multiply_batch_kernel(
     g: &Array<u32>,
     xi: &Array<u32>,
     out: &mut Array<Atomic<u32>>,
-    r_cs_offset: &Array<u32>,
-    r_mk_offset: &Array<u32>,
+    r_cs_offset: &Array<u64>,
+    r_mk_offset: &Array<u64>,
     r_cs_len: &Array<u32>,
     r_mk_len: &Array<u32>,
     prod_r_index: &Array<u32>,
@@ -1410,8 +1419,8 @@ fn multiply_batch_block(
     // `need_cs`/`need_mk` track the furthest master offset this block dereferences, so the
     // device section can skip the (multi-GB, mutex-serialized) master re-upload whenever the
     // already-uploaded prefix covers it.
-    let mut r_cs_offset: Vec<u32> = Vec::with_capacity(distinct_r.len());
-    let mut r_mk_offset: Vec<u32> = Vec::with_capacity(distinct_r.len());
+    let mut r_cs_offset: Vec<u64> = Vec::with_capacity(distinct_r.len());
+    let mut r_mk_offset: Vec<u64> = Vec::with_capacity(distinct_r.len());
     let mut r_cs_len: Vec<u32> = Vec::with_capacity(distinct_r.len());
     let mut r_mk_len: Vec<u32> = Vec::with_capacity(distinct_r.len());
     let mut r_num_matrices: Vec<usize> = Vec::with_capacity(distinct_r.len());
@@ -1461,6 +1470,14 @@ fn multiply_batch_block(
     );
     pps.push(total_pairs as u32);
     let out_len = num_rows * num_limbs;
+    // Output offsets (`prod_out_offset`/`prod_row_base`) are `u32` values indexing `out_h`; the
+    // row-block splitter caps `out_len` well under `u32::MAX` (its output-byte budget is far below
+    // 16 GiB), so these never truncate. Assert it loudly rather than silently corrupt if a future
+    // budget is set absurdly high. (The `out_h` *length* itself is bound with dynamic addressing.)
+    assert!(
+        u32::try_from(out_len).is_ok(),
+        "block output length {out_len} exceeds u32; lower NASSAU_GPU_BLOCK_MB / row-block budget"
+    );
     if std::env::var_os("NASSAU_GPU_DEBUG").is_some() {
         let kb = |n: usize, sz: usize| n * sz / 1024;
         eprintln!(
@@ -1538,8 +1555,8 @@ fn multiply_batch_block(
         let tg_h = client.create_from_slice(u32::as_bytes(&term_gei));
         let g_h = client.create_from_slice(u32::as_bytes(&g));
         let xi_h = client.create_from_slice(u32::as_bytes(&xi));
-        let rco_h = client.create_from_slice(u32::as_bytes(&r_cs_offset));
-        let rmo_h = client.create_from_slice(u32::as_bytes(&r_mk_offset));
+        let rco_h = client.create_from_slice(u64::as_bytes(&r_cs_offset));
+        let rmo_h = client.create_from_slice(u64::as_bytes(&r_mk_offset));
         let rcl_h = client.create_from_slice(u32::as_bytes(&r_cs_len));
         let rml_h = client.create_from_slice(u32::as_bytes(&r_mk_len));
         const THREADS: u32 = 256;
@@ -1569,8 +1586,10 @@ fn multiply_batch_block(
         let poo_h = client.create_from_slice(u32::as_bytes(&prod_out_offset));
         let pps_h = client.create_from_slice(u32::as_bytes(&pps));
         let cubes = (total_pairs as u32).div_ceil(THREADS).max(1);
+        // SAFETY: `launch_unchecked` — see the kernel's `address_type = "u64"` note. Every device
+        // read is in-bounds by construction (uploaded `need_*` prefix + per-column `j` guards).
         unsafe {
-            multiply_batch_kernel::launch::<CudaRuntime>(
+            multiply_batch_kernel::launch_unchecked::<CudaRuntime>(
                 &client,
                 CubeCount::Static(cubes, 1, 1),
                 CubeDim::new_1d(THREADS),
