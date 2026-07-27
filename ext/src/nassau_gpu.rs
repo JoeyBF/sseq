@@ -157,13 +157,31 @@ pub fn get_partial_matrix_verified(
 /// at/after `target_dim` are dropped (blocks are generator-major and contiguous, and `target_dim`
 /// falls on a generator boundary, so the whole block is outside), and the kernel is launched with
 /// `num_cols = target_dim`. Any returned bit `>= target_dim` is masked out defensively.
+/// Rows per GPU multiply batch, chosen so the dense readback (`rows × ceil(cols/32) × 4` bytes)
+/// stays under `NASSAU_GPU_MAX_READBACK_MB` (default 1024). Bounds the transient host memory of one
+/// build regardless of how many rows the bidegree has; ≥ 1. `0` MB disables batching (one call).
+fn gpu_rows_per_batch(cols: usize, num_rows: usize) -> usize {
+    static CAP_BYTES: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+        std::env::var("NASSAU_GPU_MAX_READBACK_MB")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(1024)
+            * (1 << 20)
+    });
+    if *CAP_BYTES == 0 {
+        return num_rows.max(1);
+    }
+    let bytes_per_row = cols.div_ceil(32) * 4; // one row's readback in bytes
+    (*CAP_BYTES / bytes_per_row.max(1)).clamp(1, num_rows.max(1))
+}
+
 pub fn get_partial_matrix_restricted(
     hom: &NassauDifferential,
     degree: i32,
     inputs: &[usize],
     target_dim: usize,
 ) -> Matrix {
-    let (mut matrix, products) = extract_restricted(hom, degree, inputs, target_dim);
+    let (mut matrix, mut products) = extract_restricted(hom, degree, inputs, target_dim);
     if !products.is_empty() {
         let target = hom.target();
         let algebra = target.algebra();
@@ -175,22 +193,45 @@ pub fn get_partial_matrix_restricted(
         // Passing `target_dim` there would truncate `num_limbs` and corrupt the row layout. We
         // truncate afterwards by masking bits `>= target_dim` when XORing into the matrix.
         let full_cols = target.dimension(degree);
-        let rows = multiply_batch_on_gpu(&algebra, full_cols, inputs.len(), &products);
-        for (row, limbs) in rows.iter().enumerate() {
-            let mut target_row = matrix.row_mut(row);
-            for (limb_idx, &limb) in limbs.iter().enumerate() {
-                let mut bits = limb;
-                while bits != 0 {
-                    let b = bits.trailing_zeros() as usize;
-                    let col = limb_idx * 32 + b;
-                    // Minimality should keep every bit within the restricted prefix, but mask
-                    // defensively so a stray high bit can never write out of bounds.
-                    if col < target_dim {
-                        target_row.add_basis_element(col, 1);
+        // Cap how large a single multiply we hand the GPU: the dense readback (num_rows × num_limbs
+        // u32) plus the matrix would otherwise both be held for the whole all-rows / zero-signature
+        // build (~12 GB dense regions at stem 180). Process the rows in batches of ≤ `rows_per_batch`
+        // so the readback stays bounded and is freed between batches. `products` is built in row
+        // order (`extract_restricted`), so each batch's products are a contiguous slice; we remap
+        // their `row` to batch-local (0-based) for the kernel and write back to the global rows.
+        let rows_per_batch = gpu_rows_per_batch(full_cols, inputs.len());
+        let mut p0 = 0usize;
+        let mut r0 = 0usize;
+        while r0 < inputs.len() {
+            let r1 = (r0 + rows_per_batch).min(inputs.len());
+            let mut p1 = p0;
+            while p1 < products.len() && products[p1].row < r1 {
+                p1 += 1;
+            }
+            if p1 > p0 {
+                for pr in &mut products[p0..p1] {
+                    pr.row -= r0; // batch-local row index for the kernel's output layout
+                }
+                let rows = multiply_batch_on_gpu(&algebra, full_cols, r1 - r0, &products[p0..p1]);
+                for (bi, limbs) in rows.iter().enumerate() {
+                    let mut target_row = matrix.row_mut(r0 + bi);
+                    for (limb_idx, &limb) in limbs.iter().enumerate() {
+                        let mut bits = limb;
+                        while bits != 0 {
+                            let b = bits.trailing_zeros() as usize;
+                            let col = limb_idx * 32 + b;
+                            // Minimality should keep every bit within the restricted prefix, but mask
+                            // defensively so a stray high bit can never write out of bounds.
+                            if col < target_dim {
+                                target_row.add_basis_element(col, 1);
+                            }
+                            bits &= bits - 1;
+                        }
                     }
-                    bits &= bits - 1;
                 }
             }
+            p0 = p1;
+            r0 = r1;
         }
     }
     matrix

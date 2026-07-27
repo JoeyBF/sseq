@@ -397,6 +397,38 @@ fn reuse_full_matrix(_diff: &FreeModuleHomomorphism<FreeModule<MilnorAlgebra>>) 
     }
 }
 
+/// Max `rows × cols` of the full restricted matrix for which [`reuse_full_matrix`] builds it all at
+/// once. Above this the all-rows build (and its dense GPU readback, both held across the whole
+/// signature loop) dominates host memory at high stems — the ~12 GB dense regions behind the stem-180
+/// OOM. Past the cap we fall back to per-signature builds (each a bounded row subset, like the CPU),
+/// trading a little launch amortization for a peak that scales with the largest single signature
+/// rather than the whole bidegree. `NASSAU_GPU_REUSE_MAX_WORK` overrides (0 = never reuse). Default
+/// ~1e10 (rows×cols) ≈ a ~1.2 GB restricted matrix.
+#[cfg(feature = "gpu")]
+fn gpu_reuse_max_work() -> u64 {
+    static W: std::sync::LazyLock<u64> = std::sync::LazyLock::new(|| {
+        std::env::var("NASSAU_GPU_REUSE_MAX_WORK")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(10_000_000_000)
+    });
+    *W
+}
+
+/// Whether the full restricted matrix (`rows × cols`) is small enough to build all at once (see
+/// [`gpu_reuse_max_work`]). Always true without the `gpu` feature (the reuse path is off anyway).
+fn reuse_within_cap(_rows: usize, _cols: usize) -> bool {
+    #[cfg(feature = "gpu")]
+    {
+        let w = gpu_reuse_max_work();
+        w > 0 && (_rows as u64).saturating_mul(_cols as u64) <= w
+    }
+    #[cfg(not(feature = "gpu"))]
+    {
+        true
+    }
+}
+
 /// Extract `rows` of `full` into a fresh matrix (`out.row(i) = full.row(rows[i])`), preserving the
 /// column layout. Slices a precomputed full (restricted-column) differential matrix into one
 /// signature's partial matrix (see [`reuse_full_matrix`]). `rows` must index within `full` — the
@@ -718,7 +750,9 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
         // row at degree `b.t()` in a single launch, then slice each signature's rows out of it.
         // `target_dim` is the restricted source dimension, so `0..target_dim` is exactly the row set
         // the per-signature masks partition; `next_dim` is the restricted column count.
-        let full_reuse: Option<Matrix> = if reuse_full_matrix(&self.differentials[b.s() - 1]) {
+        let full_reuse: Option<Matrix> = if reuse_full_matrix(&self.differentials[b.s() - 1])
+            && reuse_within_cap(target_dim, next_dim)
+        {
             let all_rows: Vec<usize> = (0..target_dim).collect();
             let _guard = ParallelGuard::new();
             Some(restricted_partial_matrix_maybe_gpu(
