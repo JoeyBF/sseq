@@ -1822,10 +1822,10 @@ fn multiply_batch_block(
         }
     }
 
-    // (Transient) Flatten the cold p-parts (padded to the widest) and cast the block-local scratch
-    // offsets to `u32` for the enumeration kernel. Offsets equal `r_cs_offset`/`r_mk_offset`; a block
-    // is pair-capped (`GPU_PAIR_CHUNK`) so the packed scratch stays well under `u32::MAX`.
-    let (enum_pp, enum_cs_out, enum_mk_out, enum_width) = if mode == MasterMode::Transient {
+    // (Transient) Flatten the cold p-parts (padded to the widest) for the enumeration kernel. The
+    // per-`R` scratch offsets it writes at are `r_cs_offset`/`r_mk_offset` themselves (u64), passed
+    // straight through — no u32 narrowing, so a big block's multi-GB scratch is addressed safely.
+    let (enum_pp, enum_width) = if mode == MasterMode::Transient {
         let w = enum_rows.iter().copied().max().unwrap_or(1) as usize;
         let mut pp = vec![0u32; enum_pp_rows.len() * w];
         for (i, row) in enum_pp_rows.iter().enumerate() {
@@ -1833,17 +1833,9 @@ fn multiply_batch_block(
                 *slot = v;
             }
         }
-        let to_u32 = |v: &[u64]| -> Vec<u32> {
-            v.iter()
-                .map(|&x| {
-                    assert!(x <= u32::MAX as u64, "transient scratch offset {x} exceeds u32");
-                    x as u32
-                })
-                .collect()
-        };
-        (pp, to_u32(&r_cs_offset), to_u32(&r_mk_offset), w)
+        (pp, w)
     } else {
-        (Vec::new(), Vec::new(), Vec::new(), 1usize)
+        (Vec::new(), 1usize)
     };
 
     // Lay out per-product records + the pair-count prefix sum (sequential). Term data is already
@@ -1965,10 +1957,10 @@ fn multiply_batch_block(
                 let epp_h = client.create_from_slice(u32::as_bytes(&enum_pp));
                 let er_h = client.create_from_slice(u32::as_bytes(&enum_rows));
                 let ec_h = client.create_from_slice(u32::as_bytes(&enum_cols));
-                let eco_h = client.create_from_slice(u32::as_bytes(&enum_cs_out));
-                let emo_h = client.create_from_slice(u32::as_bytes(&enum_mk_out));
+                let eco_h = client.create_from_slice(u64::as_bytes(&r_cs_offset));
+                let emo_h = client.create_from_slice(u64::as_bytes(&r_mk_offset));
                 unsafe {
-                    enumerate_admissible_kernel::launch::<CudaRuntime>(
+                    enumerate_admissible_kernel::launch_unchecked::<CudaRuntime>(
                         &client,
                         CubeCount::Static((n_cold as u32).div_ceil(ENUM_THREADS).max(1), 1, 1),
                         CubeDim::new_1d(ENUM_THREADS),
@@ -2119,14 +2111,23 @@ fn multiply_batch_block(
 /// prefix-sum without any host enumeration. Runtime-agnostic: the same kernel lowers to CUDA (the
 /// H200 path) and to the `cpu` backend (used by `admissible_enum_gpu_matches` to cross-check the
 /// device lowering against `enumerate_admissible_ref` without a GPU).
-#[cube(launch)]
+//
+// 64-bit addressing (`address_type = "u64"`, like `multiply_batch_kernel`): a big all-rows block's
+// `out_cs`/`out_mk` scratch reaches multiple GB at high stems, so the flat element index (and the
+// byte offset cubecl derives from it) overflows the default `u32` address type — the write lands at
+// a wild address → `CUDA_ERROR_LAUNCH_FAILED`. `launch_unchecked` because checked u64 mode emits a
+// `min(u64, u64)` NVRTC rejects; every access here is in-bounds by construction (the write offset is
+// `r_cs_out[ri] + mat*cs_len + j < need_cs`, the scratch length, and reads are bounded by `n_r`).
+#[cube(launch_unchecked, address_type = "u64")]
 #[allow(clippy::too_many_arguments)]
 fn enumerate_admissible_kernel(
     p_parts: &Array<u32>,
     r_rows: &Array<u32>,
     r_cols: &Array<u32>,
-    r_cs_out: &Array<u32>,
-    r_mk_out: &Array<u32>,
+    // u64: the scratch offsets index buffers that reach billions of elements in a big block, past
+    // `u32::MAX` (same reason the multiply's `r_cs_offset`/`r_mk_offset` are u64 — these ARE those).
+    r_cs_out: &Array<u64>,
+    r_mk_out: &Array<u64>,
     out_cs: &mut Array<u16>,
     out_mk: &mut Array<u16>,
     out_counts: &mut Array<u32>,
@@ -2276,10 +2277,10 @@ fn enumerate_admissible_on_runtime<R: Runtime>(
     let mut pp_flat = vec![0u32; n_r * width];
     let mut r_rows = vec![0u32; n_r];
     let mut r_cols = vec![0u32; n_r];
-    let mut r_cs_out = vec![0u32; n_r];
-    let mut r_mk_out = vec![0u32; n_r];
-    let mut cs_total = 0u32;
-    let mut mk_total = 0u32;
+    let mut r_cs_out = vec![0u64; n_r];
+    let mut r_mk_out = vec![0u64; n_r];
+    let mut cs_total = 0u64;
+    let mut mk_total = 0u64;
     for (i, pp) in p_parts.iter().enumerate() {
         let rows = pp.len();
         let cols = pp
@@ -2287,8 +2288,8 @@ fn enumerate_admissible_on_runtime<R: Runtime>(
             .map(|&x| (u32::BITS - x.leading_zeros()) as usize)
             .max()
             .unwrap();
-        let cs_len = (cols - 1) as u32;
-        let mk_len = (rows + cols - 1) as u32;
+        let cs_len = (cols - 1) as u64;
+        let mk_len = (rows + cols - 1) as u64;
         for (slot, &v) in pp_flat[i * width..i * width + rows].iter_mut().zip(pp) {
             *slot = v;
         }
@@ -2296,16 +2297,16 @@ fn enumerate_admissible_on_runtime<R: Runtime>(
         r_cols[i] = cols as u32;
         r_cs_out[i] = cs_total;
         r_mk_out[i] = mk_total;
-        cs_total += num_mats[i] * cs_len;
-        mk_total += num_mats[i] * mk_len;
+        cs_total += num_mats[i] as u64 * cs_len;
+        mk_total += num_mats[i] as u64 * mk_len;
     }
 
     let client = R::client(device);
     let pp_h = client.create_from_slice(u32::as_bytes(&pp_flat));
     let rr_h = client.create_from_slice(u32::as_bytes(&r_rows));
     let rc_h = client.create_from_slice(u32::as_bytes(&r_cols));
-    let rco_h = client.create_from_slice(u32::as_bytes(&r_cs_out));
-    let rmo_h = client.create_from_slice(u32::as_bytes(&r_mk_out));
+    let rco_h = client.create_from_slice(u64::as_bytes(&r_cs_out));
+    let rmo_h = client.create_from_slice(u64::as_bytes(&r_mk_out));
     // `empty` needs a non-zero size even when a batch happens to have no matrices.
     let cs_cap = (cs_total.max(1)) as usize;
     let mk_cap = (mk_total.max(1)) as usize;
@@ -2316,7 +2317,7 @@ fn enumerate_admissible_on_runtime<R: Runtime>(
     const THREADS: u32 = 64;
     let cubes = (n_r as u32).div_ceil(THREADS);
     unsafe {
-        enumerate_admissible_kernel::launch::<R>(
+        enumerate_admissible_kernel::launch_unchecked::<R>(
             &client,
             CubeCount::Static(cubes, 1, 1),
             CubeDim::new_1d(THREADS),
@@ -2332,8 +2333,12 @@ fn enumerate_admissible_on_runtime<R: Runtime>(
             n_r,
         );
     }
-    let cs = u16::from_bytes(&client.read_one(ocs_h).unwrap()).to_vec();
-    let mk = u16::from_bytes(&client.read_one(omk_h).unwrap()).to_vec();
+    // Truncate off the `max(1)` padding element present when a batch has zero col_sums / masks (an
+    // all-ones p_part gives `cs_len == 0`); the caller compares against the exact packed reference.
+    let mut cs = u16::from_bytes(&client.read_one(ocs_h).unwrap()).to_vec();
+    let mut mk = u16::from_bytes(&client.read_one(omk_h).unwrap()).to_vec();
+    cs.truncate(cs_total as usize);
+    mk.truncate(mk_total as usize);
     let counts = u32::from_bytes(&client.read_one(cnt_h).unwrap()).to_vec();
     (cs, mk, counts)
 }
@@ -2468,11 +2473,16 @@ fn check_enum_backend<Rt: Runtime>(device: &Rt::Device, max_degree: i32) {
     let algebra = MilnorAlgebra::new(p, false);
     algebra.compute_basis(max_degree);
 
-    let mut p_parts: Vec<Vec<u32>> = Vec::new();
-    let mut num_mats: Vec<u32> = Vec::new();
-    let mut exp_cs: Vec<u16> = Vec::new();
-    let mut exp_mk: Vec<u16> = Vec::new();
+    // Process one degree per launch. At high degree the full master is tens of GB, so batching every
+    // R together would OOM the host; per-degree keeps the expected arrays bounded AND pinpoints the
+    // exact degree if the device lowering ever diverges from the CPU reference.
+    let mut total_r = 0usize;
+    let mut total_mats = 0u64;
     for deg in 1..=max_degree {
+        let mut p_parts: Vec<Vec<u32>> = Vec::new();
+        let mut num_mats: Vec<u32> = Vec::new();
+        let mut exp_cs: Vec<u16> = Vec::new();
+        let mut exp_mk: Vec<u16> = Vec::new();
         for idx in 0..algebra.dimension(deg) {
             let pp = algebra.basis_element_from_index(deg, idx).p_part.clone();
             if pp.is_empty() {
@@ -2486,19 +2496,106 @@ fn check_enum_backend<Rt: Runtime>(device: &Rt::Device, max_degree: i32) {
             exp_mk.extend(mk.iter().map(|&v| narrow_u16(v)));
             p_parts.push(pp);
         }
+        if p_parts.is_empty() {
+            continue;
+        }
+        let (got_cs, got_mk, counts) =
+            enumerate_admissible_on_runtime::<Rt>(device, &p_parts, &num_mats);
+        assert_eq!(counts, num_mats, "per-R matrix counts diverged at degree {deg}");
+        assert_eq!(got_cs, exp_cs, "device col_sums diverged at degree {deg}");
+        assert_eq!(got_mk, exp_mk, "device masks diverged at degree {deg}");
+        total_r += p_parts.len();
+        total_mats += num_mats.iter().map(|&m| m as u64).sum::<u64>();
     }
-    assert!(!p_parts.is_empty(), "no R's exercised");
-
-    let (got_cs, got_mk, counts) =
-        enumerate_admissible_on_runtime::<Rt>(device, &p_parts, &num_mats);
-    assert_eq!(counts, num_mats, "per-R matrix counts diverged from the CPU reference");
-    assert_eq!(got_cs, exp_cs, "device col_sums diverged from the CPU reference");
-    assert_eq!(got_mk, exp_mk, "device masks diverged from the CPU reference");
+    assert!(total_r > 0, "no R's exercised");
     eprintln!(
-        "enum backend: {} R's, {} matrices bit-exact vs enumerate_admissible_ref",
-        p_parts.len(),
-        num_mats.iter().sum::<u32>()
+        "enum backend: {total_r} R's, {total_mats} matrices bit-exact vs enumerate_admissible_ref \
+         (degrees 1..={max_degree})"
     );
+}
+
+/// Time one enumeration launch on `device`, split into (marshal+upload, kernel, full readback).
+/// `kernel` reads only the tiny `counts` buffer to force a stream sync (so it captures kernel wall
+/// time without the big transfer); `readback` then pulls the full `col_sums`/`masks`. Used by
+/// `bench_admissible_cpu_vs_gpu` — production never reads the arrays back (the multiply consumes the
+/// scratch on-device), so `kernel` is the production-relevant cost and `readback` is bench-only.
+#[cfg(test)]
+fn enum_launch_timed<R: Runtime>(
+    device: &R::Device,
+    p_parts: &[Vec<u32>],
+    num_mats: &[u32],
+) -> (f64, f64, f64) {
+    use std::time::Instant;
+    let n_r = p_parts.len();
+    let width = p_parts.iter().map(Vec::len).max().unwrap();
+
+    let t_marshal = Instant::now();
+    let mut pp_flat = vec![0u32; n_r * width];
+    let mut r_rows = vec![0u32; n_r];
+    let mut r_cols = vec![0u32; n_r];
+    let mut r_cs_out = vec![0u64; n_r];
+    let mut r_mk_out = vec![0u64; n_r];
+    let (mut cs_total, mut mk_total) = (0u64, 0u64);
+    for (i, pp) in p_parts.iter().enumerate() {
+        let rows = pp.len();
+        let cols = pp
+            .iter()
+            .map(|&x| (u32::BITS - x.leading_zeros()) as usize)
+            .max()
+            .unwrap();
+        for (slot, &v) in pp_flat[i * width..i * width + rows].iter_mut().zip(pp) {
+            *slot = v;
+        }
+        r_rows[i] = rows as u32;
+        r_cols[i] = cols as u32;
+        r_cs_out[i] = cs_total;
+        r_mk_out[i] = mk_total;
+        cs_total += num_mats[i] as u64 * (cols - 1) as u64;
+        mk_total += num_mats[i] as u64 * (rows + cols - 1) as u64;
+    }
+    let client = R::client(device);
+    let pp_h = client.create_from_slice(u32::as_bytes(&pp_flat));
+    let rr_h = client.create_from_slice(u32::as_bytes(&r_rows));
+    let rc_h = client.create_from_slice(u32::as_bytes(&r_cols));
+    let rco_h = client.create_from_slice(u64::as_bytes(&r_cs_out));
+    let rmo_h = client.create_from_slice(u64::as_bytes(&r_mk_out));
+    let cs_cap = cs_total.max(1) as usize;
+    let mk_cap = mk_total.max(1) as usize;
+    let ocs_h = client.empty(cs_cap * size_of::<u16>());
+    let omk_h = client.empty(mk_cap * size_of::<u16>());
+    let cnt_h = client.empty(n_r * size_of::<u32>());
+    let marshal_s = t_marshal.elapsed().as_secs_f64();
+
+    const THREADS: u32 = 64;
+    let cubes = (n_r as u32).div_ceil(THREADS);
+    let t_kernel = Instant::now();
+    unsafe {
+        enumerate_admissible_kernel::launch_unchecked::<R>(
+            &client,
+            CubeCount::Static(cubes, 1, 1),
+            CubeDim::new_1d(THREADS),
+            ArrayArg::from_raw_parts(pp_h, pp_flat.len()),
+            ArrayArg::from_raw_parts(rr_h, n_r),
+            ArrayArg::from_raw_parts(rc_h, n_r),
+            ArrayArg::from_raw_parts(rco_h, n_r),
+            ArrayArg::from_raw_parts(rmo_h, n_r),
+            ArrayArg::from_raw_parts(ocs_h.clone(), cs_cap),
+            ArrayArg::from_raw_parts(omk_h.clone(), mk_cap),
+            ArrayArg::from_raw_parts(cnt_h.clone(), n_r),
+            width,
+            n_r,
+        );
+    }
+    // Reading the tiny counts buffer blocks until the kernel completes: kernel wall time, ~no transfer.
+    let _ = client.read_one(cnt_h).unwrap();
+    let kernel_s = t_kernel.elapsed().as_secs_f64();
+
+    let t_read = Instant::now();
+    let _ = client.read_one(ocs_h).unwrap();
+    let _ = client.read_one(omk_h).unwrap();
+    let readback_s = t_read.elapsed().as_secs_f64();
+
+    (marshal_s, kernel_s, readback_s)
 }
 
 #[cfg(test)]
@@ -2506,12 +2603,84 @@ mod tests {
     use super::*;
 
     /// The in-kernel [`enumerate_admissible_kernel`], run on the CUDA backend, must reproduce the
-    /// CPU-validated [`enumerate_admissible_ref`] bit-for-bit over every real `R` up to degree 40 —
+    /// CPU-validated [`enumerate_admissible_ref`] bit-for-bit over every real `R` up to degree 145 —
     /// validating the cubecl lowering of the flag-based enumeration (local arrays, bitops, u16
-    /// stores) on the actual H200 target. Requires a live GPU + the CUDA toolkit env.
+    /// stores) across the FULL degree range the eviction path exercises (cold R's reach ~144 at
+    /// stem 150), not just the low degrees. Requires a live GPU + the CUDA toolkit env.
     #[test]
     fn admissible_enum_gpu_matches() {
-        check_enum_backend::<CudaRuntime>(&CudaDevice::default(), 40);
+        check_enum_backend::<CudaRuntime>(&CudaDevice::default(), 145);
+    }
+
+    /// Throughput comparison, CPU `admissible_matrices` vs the in-kernel [`enumerate_admissible_kernel`],
+    /// for enumerating every `R`'s admissible matrices up to a degree. Reports GPU kernel-only time
+    /// (the production-relevant cost — the multiply consumes the scratch on-device, no readback) and
+    /// the full-readback time separately. Run with `--nocapture --ignored`; needs a live GPU.
+    #[test]
+    #[ignore = "benchmark, not a correctness check; run explicitly with --ignored --nocapture"]
+    fn bench_admissible_cpu_vs_gpu() {
+        use fp::prime::ValidPrime;
+        use std::time::Instant;
+
+        let p = ValidPrime::new(2);
+        let algebra = MilnorAlgebra::new(p, false);
+        let max_degree = 130;
+        algebra.compute_basis(max_degree);
+
+        // Gather every non-empty R, grouped by degree (per-degree GPU launches keep host arrays bounded).
+        let mut by_degree: Vec<(Vec<Vec<u32>>, Vec<u32>)> = Vec::new();
+        let mut cpu_secs = 0.0f64;
+        let mut total_r = 0usize;
+        let mut total_mats = 0u64;
+        for deg in 1..=max_degree {
+            let mut pps = Vec::new();
+            let mut nms = Vec::new();
+            for idx in 0..algebra.dimension(deg) {
+                let pp = algebra.basis_element_from_index(deg, idx).p_part.clone();
+                if pp.is_empty() {
+                    continue;
+                }
+                // Time the CPU enumeration (`admissible_matrices`, the call the CPU multiply makes).
+                let t = Instant::now();
+                let (_cs_len, mk_len, _cs, mk) = algebra.admissible_matrices(&pp);
+                cpu_secs += t.elapsed().as_secs_f64();
+                let nm = (mk.len() / mk_len) as u32;
+                nms.push(nm);
+                total_mats += nm as u64;
+                pps.push(pp);
+            }
+            total_r += pps.len();
+            if !pps.is_empty() {
+                by_degree.push((pps, nms));
+            }
+        }
+
+        let device = CudaDevice::default();
+        // Warm up the runtime/JIT so the first degree's compile doesn't skew the GPU timing.
+        {
+            let (pps, nms) = &by_degree[0];
+            let _ = enum_launch_timed::<CudaRuntime>(&device, pps, nms);
+        }
+        let (mut g_marshal, mut g_kernel, mut g_read) = (0.0f64, 0.0f64, 0.0f64);
+        for (pps, nms) in &by_degree {
+            let (m, k, r) = enum_launch_timed::<CudaRuntime>(&device, pps, nms);
+            g_marshal += m;
+            g_kernel += k;
+            g_read += r;
+        }
+
+        eprintln!(
+            "\n=== admissible enumeration: CPU vs GPU (degrees 1..={max_degree}) ===\n\
+             R's: {total_r}   matrices: {total_mats}\n\
+             CPU  admissible_matrices : {cpu_secs:.3} s\n\
+             GPU  kernel only         : {g_kernel:.3} s   ({:.1}x vs CPU)   [production path]\n\
+             GPU  marshal+upload      : {g_marshal:.3} s\n\
+             GPU  full readback       : {g_read:.3} s   (bench-only; prod keeps it on-device)\n\
+             GPU  kernel+marshal+read : {:.3} s   ({:.1}x vs CPU)   [full round-trip]",
+            cpu_secs / g_kernel,
+            g_marshal + g_kernel + g_read,
+            cpu_secs / (g_marshal + g_kernel + g_read),
+        );
     }
 
     /// The flag-based [`enumerate_admissible_ref`] must reproduce `admissible_matrices` bit-for-bit
@@ -2524,7 +2693,9 @@ mod tests {
 
         let p = ValidPrime::new(2);
         let algebra = MilnorAlgebra::new(p, false);
-        let max_degree = 60;
+        // To 150: the eviction bench faults on cold (high-degree) R's at internal degree ~144, above
+        // the degree-40/60 originally checked — extend the CPU reference to that range.
+        let max_degree = 150;
         algebra.compute_basis(max_degree);
         let mut checked = 0usize;
         for deg in 1..=max_degree {
