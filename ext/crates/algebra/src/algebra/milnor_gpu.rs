@@ -2044,9 +2044,155 @@ fn multiply_batch_block(
     result
 }
 
+/// CPU reference for the planned *in-kernel* admissible-matrix enumeration — the direction that
+/// replaces the resident/uploaded master (the stem-300 memory wall + the eviction re-upload cost)
+/// by generating each `R`'s `col_sums`/`masks` ON THE GPU into a transient scratch buffer, never
+/// storing or uploading them. This reimplements [`MilnorAlgebra::admissible_matrices`] /
+/// `AdmissibleMatrix` using ONLY flag-guarded control flow — no `break`, `continue`, or early
+/// `return` — because that is the subset the cubecl DSL compiles cleanly (cf. `multiply_pair`,
+/// which tracks `rejected` rather than breaking). The eventual `#[cube]` kernel is then a mechanical
+/// transcription of this function onto per-thread local `Array`s (state is tiny: `rows = |p_part|`,
+/// `cols ≤ 32`). Returns the same `(cs_len, mk_len, col_sums, masks)` row-major flattening as
+/// `admissible_matrices`; `admissible_enum_ref_matches` asserts bit-exact equivalence over every
+/// real `R` up to degree 60, validating the flag-based restructuring before the hard-to-debug port.
+#[cfg(test)]
+fn enumerate_admissible_ref(p_part: &[u32]) -> (usize, usize, Vec<u32>, Vec<u32>) {
+    let rows = p_part.len();
+    let cols = p_part
+        .iter()
+        .map(|&x| (u32::BITS - x.leading_zeros()) as usize)
+        .max()
+        .unwrap();
+    let cs_len = cols - 1;
+    let mk_len = rows + cols - 1;
+
+    // State mirrors `AdmissibleMatrix`: `matrix` row-major `rows*cols` (column 0 = `p_part`),
+    // `totals[rows]`, `col_sums[cs_len]`, `masks[mk_len]` (masks starts as the padded `p_part`).
+    let mut matrix = vec![0u32; rows * cols];
+    for (i, &x) in p_part.iter().enumerate() {
+        matrix[i * cols] = x;
+    }
+    let mut totals = vec![0u32; rows];
+    let mut col_sums = vec![0u32; cs_len];
+    let mut masks = vec![0u32; mk_len];
+    for (i, &x) in p_part.iter().enumerate() {
+        masks[i] = x;
+    }
+
+    let mut out_cs: Vec<u32> = Vec::new();
+    let mut out_mk: Vec<u32> = Vec::new();
+
+    // Emit the current matrix, then advance; `more` is `AdmissibleMatrix::next`'s return value.
+    let mut more = true;
+    while more {
+        out_cs.extend_from_slice(&col_sums);
+        out_mk.extend_from_slice(&masks);
+
+        // One `next()` step, flag-based: `found` = "produced a new matrix" (the original's
+        // `return true`); `handled` = "this column already updated `totals`" (the original's
+        // `continue 'mid`, which skips the trailing add). Loops are guarded by `!found` instead
+        // of breaking.
+        let mut found = false;
+        let mut row = 0;
+        while row < rows && !found {
+            let mut p_to_the_j: u32 = 1;
+            totals[row] = matrix[row * cols]; // get(row, 0)
+            let mut col = 1;
+            while col < cols && !found {
+                p_to_the_j *= 2;
+                let mut handled = false;
+                if p_to_the_j <= totals[row] {
+                    // Bitsum along the anti-diagonal to the bottom-left.
+                    let mut d = 0u32;
+                    let mut c = (row + col + 1).saturating_sub(rows);
+                    while c < col {
+                        d |= matrix[(row + col - c) * cols + c];
+                        c += 1;
+                    }
+                    let cur = matrix[row * cols + col];
+                    let new_entry = ((cur | d) + 1) & !d;
+                    let inc = new_entry - cur;
+                    let sub = inc * p_to_the_j;
+                    if totals[row] < sub {
+                        totals[row] += p_to_the_j * cur;
+                        handled = true;
+                    } else {
+                        matrix[row * cols] = totals[row] - sub; // set(row, 0, ..)
+                        masks[row] = matrix[row * cols];
+                        col_sums[col - 1] += inc;
+                        let mut j = 1;
+                        while j < col {
+                            masks[row + j] &= !matrix[row * cols + j];
+                            col_sums[j - 1] -= matrix[row * cols + j];
+                            matrix[row * cols + j] = 0;
+                            j += 1;
+                        }
+                        matrix[row * cols + col] = new_entry;
+                        let mut i = 0;
+                        while i < row {
+                            matrix[i * cols] = totals[i];
+                            masks[i] = totals[i];
+                            let mut j = 1;
+                            while j < cols {
+                                if i + j > row {
+                                    masks[i + j] &= !matrix[i * cols + j];
+                                }
+                                col_sums[j - 1] -= matrix[i * cols + j];
+                                matrix[i * cols + j] = 0;
+                                j += 1;
+                            }
+                            i += 1;
+                        }
+                        masks[row + col] = d | new_entry;
+                        found = true;
+                        handled = true;
+                    }
+                }
+                if !handled {
+                    totals[row] += p_to_the_j * matrix[row * cols + col];
+                }
+                col += 1;
+            }
+            row += 1;
+        }
+        more = found;
+    }
+
+    (cs_len, mk_len, out_cs, out_mk)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The flag-based [`enumerate_admissible_ref`] must reproduce `admissible_matrices` bit-for-bit
+    /// on every real `R` — this validates the no-break/continue/return restructuring (the tricky
+    /// part of the future cubecl in-kernel port) purely on the CPU, where it is fast to debug.
+    /// Pure CPU: no GPU needed.
+    #[test]
+    fn admissible_enum_ref_matches() {
+        use fp::prime::ValidPrime;
+
+        let p = ValidPrime::new(2);
+        let algebra = MilnorAlgebra::new(p, false);
+        let max_degree = 60;
+        algebra.compute_basis(max_degree);
+        let mut checked = 0usize;
+        for deg in 1..=max_degree {
+            for idx in 0..algebra.dimension(deg) {
+                let p_part = algebra.basis_element_from_index(deg, idx).p_part.clone();
+                if p_part.is_empty() {
+                    continue;
+                }
+                let want = algebra.admissible_matrices(&p_part);
+                let got = enumerate_admissible_ref(&p_part);
+                assert_eq!(got, want, "R degree {deg} idx {idx} p_part {p_part:?}");
+                checked += 1;
+            }
+        }
+        assert!(checked > 0, "no R's exercised");
+        eprintln!("admissible_enum_ref: {checked} R's matched admissible_matrices");
+    }
 
     /// Smoke test proving the CubeCL `cuda` runtime launches and returns correct
     /// results. Requires a live GPU + the CUDA toolkit env (run under the `gpu`
