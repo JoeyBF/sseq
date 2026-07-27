@@ -24,9 +24,8 @@ use cubecl::{
     prelude::*,
 };
 use cubecl_common::stream_id::StreamId;
-// Only the `#[cfg(test)]` standalone `seqno_kernel` sizes its working array by this bound; the
-// production kernels use `WORKING_CAP`.
-#[cfg(test)]
+// Bounds the per-thread enumeration state ([`ENUM_ROW_CAP`]) and the `#[cfg(test)]` `seqno_kernel`'s
+// working array; the multiply kernel uses `WORKING_CAP`.
 use crate::algebra::combinatorics::MAX_XI_TAU;
 use crate::algebra::{Algebra, MilnorAlgebra, combinatorics::xi_degrees};
 
@@ -39,13 +38,9 @@ const WORKING_CAP: usize = 32;
 /// Each `R` has `rows = |p_part| ≤ MAX_XI_TAU` and `cols ≤ WORKING_CAP` (max bit-length of an entry),
 /// so the enumeration's `matrix` is `rows*cols`, `col_sums` is `cols−1`, and `masks` is `rows+cols−1`.
 /// These bound the fixed-size local `Array`s the kernel allocates per thread.
-#[cfg(test)]
 const ENUM_ROW_CAP: usize = MAX_XI_TAU;
-#[cfg(test)]
 const ENUM_COL_CAP: usize = WORKING_CAP;
-#[cfg(test)]
 const ENUM_MATRIX_CAP: usize = ENUM_ROW_CAP * ENUM_COL_CAP;
-#[cfg(test)]
 const ENUM_MASK_CAP: usize = ENUM_ROW_CAP + ENUM_COL_CAP;
 
 /// Target `(product, matrix, term)` thread-pairs per GPU launch. The batch multiply indexes threads
@@ -273,7 +268,7 @@ pub fn cubecl_device_usage() -> (u64, u64) {
 
 use std::{
     collections::HashMap,
-    sync::{Arc, Condvar, LazyLock, Mutex, RwLock},
+    sync::{Condvar, LazyLock, Mutex, RwLock},
 };
 
 use cubecl::server::Handle;
@@ -375,46 +370,29 @@ static RESIDENT_UPLOAD: Mutex<()> = Mutex::new(());
 /// hot path stays lock-free; reallocs happen only a handful of times per run, so the barrier is free.
 static RESIDENT_REALLOC: RwLock<()> = RwLock::new(());
 
-/// Host-side cache of cold (degree > [`resident_degree_cap`]) `R`s' admissible matrices, narrowed to
-/// `u16` and ready to upload. Cold `R`s are deliberately kept OFF the device master (that is the whole
-/// point of eviction — it bounds the 143 GB device), but `admissible_matrices` is the *expensive* part
-/// for exactly these high-degree `R`s (big matrices) and they recur across many bidegrees. Recomputing
-/// per launch collapsed throughput (2× wall at stem 180, bench 2026-07-27). Caching the result
-/// host-side (host has ~755 GB — never the constraint) makes the recompute one-shot, like the resident
-/// path, while the *device* copy stays transient (uploaded per launch into a block-local buffer, freed
-/// after). Grows to roughly the evicted tail of the master (tens of GB), well within host RAM.
-struct ColdEntry {
-    cs_len: u32,
-    mk_len: u32,
-    num_mats: u32,
-    cs: Arc<Vec<u16>>,
-    mk: Arc<Vec<u16>>,
-}
-static COLD_HOST: LazyLock<RwLock<HashMap<Vec<PPartEntry>, ColdEntry>>> =
+/// Host-side cache of cold (degree > [`resident_degree_cap`]) `R`s' admissible-matrix *shape* only —
+/// `(cs_len, mk_len, num_mats)`, twelve bytes per `R`. With [in-kernel enumeration](enumerate_admissible_kernel)
+/// the cold `col_sums`/`masks` are generated ON the device into transient scratch, so the host never
+/// stores (nor uploads) the arrays themselves — only their sizes, needed up front to lay out the
+/// scratch offsets and the pair-count prefix sum before the launch. This is the memory win over the
+/// old array cache: the evicted tail of the master (tens of GB) lives neither on the device nor the
+/// host. The count is computed once per distinct `R` (via `admissible_matrices`, whose arrays are
+/// dropped immediately) and memoized, so the per-launch cost is an `O(1)` lookup.
+static COLD_COUNT: LazyLock<RwLock<HashMap<Vec<PPartEntry>, (u32, u32, u32)>>> =
     LazyLock::new(|| RwLock::new(HashMap::new()));
 
-/// Cold-`R` admissible data, from the [`COLD_HOST`] cache (computed + narrowed once on first use).
-/// Returns `(cs_len, mk_len, num_mats, cs, mk)`; the `Arc`s make the cache-hit path a cheap refcount
-/// bump, no copy. Layout matches [`resident_info`]'s so the kernel indexes both identically.
-fn cold_host_entry(
-    algebra: &MilnorAlgebra,
-    p_part: &[PPartEntry],
-) -> (u32, u32, u32, Arc<Vec<u16>>, Arc<Vec<u16>>) {
-    if let Some(e) = COLD_HOST.read().unwrap().get(p_part) {
-        return (e.cs_len, e.mk_len, e.num_mats, e.cs.clone(), e.mk.clone());
+/// Cold-`R` admissible-matrix shape `(cs_len, mk_len, num_mats)` from the [`COLD_COUNT`] cache. On a
+/// miss it runs `admissible_matrices` purely to *count* (the returned arrays are dropped, not kept —
+/// the device enumerates them), then memoizes the triple. Layout matches [`resident_info`]'s so the
+/// kernel indexes the on-device-enumerated scratch identically to the resident master.
+fn cold_count(algebra: &MilnorAlgebra, p_part: &[PPartEntry]) -> (u32, u32, u32) {
+    if let Some(&e) = COLD_COUNT.read().unwrap().get(p_part) {
+        return e;
     }
-    let (cs_len, mk_len, cs, mk) = algebra.admissible_matrices(p_part);
-    let num_mats = (mk.len() / mk_len) as u32;
-    let entry = ColdEntry {
-        cs_len: cs_len as u32,
-        mk_len: mk_len as u32,
-        num_mats,
-        cs: Arc::new(cs.iter().map(|&v| narrow_u16(v)).collect()),
-        mk: Arc::new(mk.iter().map(|&v| narrow_u16(v)).collect()),
-    };
-    let mut w = COLD_HOST.write().unwrap();
-    let e = w.entry(p_part.to_vec()).or_insert(entry);
-    (e.cs_len, e.mk_len, e.num_mats, e.cs.clone(), e.mk.clone())
+    let (cs_len, mk_len, _cs, mk) = algebra.admissible_matrices(p_part);
+    let e = (cs_len as u32, mk_len as u32, (mk.len() / mk_len) as u32);
+    COLD_COUNT.write().unwrap().entry(p_part.to_vec()).or_insert(e);
+    e
 }
 
 /// Fetch a resident device-master handle, uploading the current master prefix only when this
@@ -1598,14 +1576,14 @@ fn multiply_batch_grouped(
     // alone don't bound this (pairs per row grow with the degree; an unbounded all-rows build
     // reaches ~4.4e9 pairs by stem ~145). For `Resident` this pre-pass also warms the shared
     // resident master, so every block's layout lookups below are read-lock cache hits; for
-    // `Transient` it warms the host-side [`COLD_HOST`] cache the same way (no per-block recompute).
+    // `Transient` it warms the host-side [`COLD_COUNT`] shape cache the same way (no per-block recount).
     let prod_pairs: Vec<usize> = products
         .iter()
         .map(|prod| {
             let r = algebra.basis_element_from_index(prod.r_degree, prod.r_idx);
             let num_mats = match mode {
                 MasterMode::Resident => resident_info(algebra, &r.p_part).num_mats as usize,
-                MasterMode::Transient => cold_host_entry(algebra, &r.p_part).2 as usize,
+                MasterMode::Transient => cold_count(algebra, &r.p_part).2 as usize,
             };
             num_mats * prod.term_indices.len()
         })
@@ -1795,11 +1773,14 @@ fn multiply_batch_block(
     let mut r_num_matrices: Vec<usize> = Vec::with_capacity(distinct_r.len());
     let mut need_cs: usize = 0;
     let mut need_mk: usize = 0;
-    // `Transient`: this block's own `col_sums`/`masks`, packed contiguously with block-local
-    // offsets (mirrors the resident master's layout, but built fresh here and freed after the
-    // launch instead of persisting). Empty / unused under `Resident`.
-    let mut cs_local: Vec<u16> = Vec::new();
-    let mut mk_local: Vec<u16> = Vec::new();
+    // `Transient`: per-cold-`R` inputs for the on-device enumeration ([`enumerate_admissible_kernel`]).
+    // Instead of building this block's `col_sums`/`masks` on the host and uploading them (the H2D
+    // cost the eviction bench exposed), we upload only each cold `R`'s p-part + dimensions and
+    // generate the arrays into device scratch at the block-local `r_cs_offset`/`r_mk_offset`. Empty
+    // under `Resident`.
+    let mut enum_pp_rows: Vec<Vec<u32>> = Vec::new();
+    let mut enum_rows: Vec<u32> = Vec::new();
+    let mut enum_cols: Vec<u32> = Vec::new();
     for &(rd, ridx) in &distinct_r {
         let r = algebra.basis_element_from_index(rd, ridx);
         assert!(!r.p_part.is_empty(), "each R must be non-empty");
@@ -1817,19 +1798,53 @@ fn multiply_batch_block(
                     .max(info.mk_off as usize + info.num_mats as usize * info.mk_len as usize);
             }
             MasterMode::Transient => {
-                let (cs_len, mk_len, num_mats, cs, mk) = cold_host_entry(algebra, &r.p_part);
-                r_cs_offset.push(cs_local.len() as u64);
-                r_mk_offset.push(mk_local.len() as u64);
+                let (cs_len, mk_len, num_mats) = cold_count(algebra, &r.p_part);
+                r_cs_offset.push(need_cs as u64);
+                r_mk_offset.push(need_mk as u64);
                 r_cs_len.push(cs_len);
                 r_mk_len.push(mk_len);
                 r_num_matrices.push(num_mats as usize);
-                cs_local.extend_from_slice(&cs);
-                mk_local.extend_from_slice(&mk);
-                need_cs = cs_local.len();
-                need_mk = mk_local.len();
+                // `cols` = max bit-length of any entry, exactly as the enumeration kernel derives it;
+                // `cs_len == cols-1`, `mk_len == rows+cols-1` (asserted equal to `cold_count`'s below).
+                let cols = r
+                    .p_part
+                    .iter()
+                    .map(|&x| u32::BITS - x.leading_zeros())
+                    .max()
+                    .unwrap();
+                debug_assert_eq!((cs_len, mk_len), (cols - 1, r.p_part.len() as u32 + cols - 1));
+                enum_rows.push(r.p_part.len() as u32);
+                enum_cols.push(cols);
+                enum_pp_rows.push(r.p_part.clone());
+                need_cs += num_mats as usize * cs_len as usize;
+                need_mk += num_mats as usize * mk_len as usize;
             }
         }
     }
+
+    // (Transient) Flatten the cold p-parts (padded to the widest) and cast the block-local scratch
+    // offsets to `u32` for the enumeration kernel. Offsets equal `r_cs_offset`/`r_mk_offset`; a block
+    // is pair-capped (`GPU_PAIR_CHUNK`) so the packed scratch stays well under `u32::MAX`.
+    let (enum_pp, enum_cs_out, enum_mk_out, enum_width) = if mode == MasterMode::Transient {
+        let w = enum_rows.iter().copied().max().unwrap_or(1) as usize;
+        let mut pp = vec![0u32; enum_pp_rows.len() * w];
+        for (i, row) in enum_pp_rows.iter().enumerate() {
+            for (slot, &v) in pp[i * w..i * w + row.len()].iter_mut().zip(row) {
+                *slot = v;
+            }
+        }
+        let to_u32 = |v: &[u64]| -> Vec<u32> {
+            v.iter()
+                .map(|&x| {
+                    assert!(x <= u32::MAX as u64, "transient scratch offset {x} exceeds u32");
+                    x as u32
+                })
+                .collect()
+        };
+        (pp, to_u32(&r_cs_offset), to_u32(&r_mk_offset), w)
+    } else {
+        (Vec::new(), Vec::new(), Vec::new(), 1usize)
+    };
 
     // Lay out per-product records + the pair-count prefix sum (sequential). Term data is already
     // in `term_pparts`/`term_lens` (filled in parallel above); `term_off` gives each product's
@@ -1934,12 +1949,43 @@ fn multiply_batch_block(
                     resident_dev_handle!(client, need_mk, mk, mk_pending, mk_len);
                 (cs_h, cs_len_master, mk_h, mk_len_master)
             }
-            MasterMode::Transient => (
-                client.create_from_slice(u16::as_bytes(&cs_local)),
-                cs_local.len(),
-                client.create_from_slice(u16::as_bytes(&mk_local)),
-                mk_local.len(),
-            ),
+            MasterMode::Transient => {
+                // Generate this block's cold `col_sums`/`masks` ON the device into transient scratch
+                // (freed with the launch), instead of uploading host-built arrays. Only the small
+                // p-parts + dimensions are uploaded. The enumeration launch is issued before the
+                // multiply on this same stream, so the scratch is fully written when the multiply
+                // reads it (kernel launches on one stream are ordered, as with `zero_u32` below).
+                const ENUM_THREADS: u32 = 256;
+                let n_cold = enum_rows.len();
+                let cs_cap = need_cs.max(1);
+                let mk_cap = need_mk.max(1);
+                let cs_scratch = client.empty(cs_cap * size_of::<u16>());
+                let mk_scratch = client.empty(mk_cap * size_of::<u16>());
+                let cnt_scratch = client.empty(n_cold.max(1) * size_of::<u32>());
+                let epp_h = client.create_from_slice(u32::as_bytes(&enum_pp));
+                let er_h = client.create_from_slice(u32::as_bytes(&enum_rows));
+                let ec_h = client.create_from_slice(u32::as_bytes(&enum_cols));
+                let eco_h = client.create_from_slice(u32::as_bytes(&enum_cs_out));
+                let emo_h = client.create_from_slice(u32::as_bytes(&enum_mk_out));
+                unsafe {
+                    enumerate_admissible_kernel::launch::<CudaRuntime>(
+                        &client,
+                        CubeCount::Static((n_cold as u32).div_ceil(ENUM_THREADS).max(1), 1, 1),
+                        CubeDim::new_1d(ENUM_THREADS),
+                        ArrayArg::from_raw_parts(epp_h, enum_pp.len()),
+                        ArrayArg::from_raw_parts(er_h, n_cold),
+                        ArrayArg::from_raw_parts(ec_h, n_cold),
+                        ArrayArg::from_raw_parts(eco_h, n_cold),
+                        ArrayArg::from_raw_parts(emo_h, n_cold),
+                        ArrayArg::from_raw_parts(cs_scratch.clone(), cs_cap),
+                        ArrayArg::from_raw_parts(mk_scratch.clone(), mk_cap),
+                        ArrayArg::from_raw_parts(cnt_scratch, n_cold.max(1)),
+                        enum_width,
+                        n_cold,
+                    );
+                }
+                (cs_scratch, cs_cap, mk_scratch, mk_cap)
+            }
         };
         // Upload the block's data — term data, seqno/xi tables, per-`R` offsets, per-product
         // records, the pair prefix sum, and the (zeroed) output buffer — and launch once: the
@@ -2073,7 +2119,6 @@ fn multiply_batch_block(
 /// prefix-sum without any host enumeration. Runtime-agnostic: the same kernel lowers to CUDA (the
 /// H200 path) and to the `cpu` backend (used by `admissible_enum_gpu_matches` to cross-check the
 /// device lowering against `enumerate_admissible_ref` without a GPU).
-#[cfg(test)]
 #[cube(launch)]
 #[allow(clippy::too_many_arguments)]
 fn enumerate_admissible_kernel(
