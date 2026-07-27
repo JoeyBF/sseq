@@ -2095,6 +2095,96 @@ fn multiply_batch_block(
     result
 }
 
+/// Max number of fixed-size segments a segmented resident master can have. The kernel selects a
+/// segment by a static branch (cubecl cannot dynamically index an array-of-buffers), so this is a
+/// compile-time bound; `MASTER_SEG_ELEMS` sets the per-segment element count. 8 segments is the
+/// prototype size (raise once the mechanic is wired + validated). Together they cap a buffer at
+/// `MASTER_MAX_SEG * MASTER_SEG_ELEMS` u16 elements.
+#[allow(dead_code)] // used once the segmented master is wired into the multiply path
+const MASTER_MAX_SEG: usize = 8;
+
+/// Read `data[o]` from a master split into up to [`MASTER_MAX_SEG`] fixed-size segments of
+/// `seg_elems` elements each: segment `o / seg_elems`, local index `o % seg_elems`. This is the
+/// no-copy-growth replacement for a single contiguous `Array<u16>` — appending a segment never
+/// reallocates/copies the existing ones, so the device peak is `live_size + one_segment` instead of
+/// the `~2×` realloc-doubling transient that pushes cubecl into its memory-corruption regime. The
+/// per-segment `Array`s are separate kernel args because cubecl has no array-of-buffers; the branch
+/// is the price of staying inside cubecl (vs raw CUDA VMM). `seg_elems` is runtime so tests can use
+/// tiny segments; production sets it large.
+#[cube]
+#[allow(clippy::too_many_arguments)]
+fn seg_read_u16(
+    s0: &Array<u16>,
+    s1: &Array<u16>,
+    s2: &Array<u16>,
+    s3: &Array<u16>,
+    s4: &Array<u16>,
+    s5: &Array<u16>,
+    s6: &Array<u16>,
+    s7: &Array<u16>,
+    o: usize,
+    seg_elems: usize,
+) -> u16 {
+    let seg = o / seg_elems;
+    let local = o % seg_elems;
+    let mut v = 0u16;
+    if seg == 0 {
+        v = s0[local];
+    } else if seg == 1 {
+        v = s1[local];
+    } else if seg == 2 {
+        v = s2[local];
+    } else if seg == 3 {
+        v = s3[local];
+    } else if seg == 4 {
+        v = s4[local];
+    } else if seg == 5 {
+        v = s5[local];
+    } else if seg == 6 {
+        v = s6[local];
+    } else {
+        v = s7[local];
+    }
+    v
+}
+
+/// Validation kernel for [`seg_read_u16`]: `out[i] = segmented[idx[i]]`. Lets a test assert the
+/// segmented read reproduces a contiguous buffer bit-for-bit before the mechanic is wired into the
+/// multiply's hot path.
+#[cfg(test)]
+#[cube(launch)]
+#[allow(clippy::too_many_arguments)]
+fn seg_gather_kernel(
+    s0: &Array<u16>,
+    s1: &Array<u16>,
+    s2: &Array<u16>,
+    s3: &Array<u16>,
+    s4: &Array<u16>,
+    s5: &Array<u16>,
+    s6: &Array<u16>,
+    s7: &Array<u16>,
+    idx: &Array<u32>,
+    out: &mut Array<u16>,
+    seg_elems: usize,
+) {
+    let i = ABSOLUTE_POS;
+    if i >= out.len() {
+        terminate!();
+    }
+    out[i] = seg_read_u16(
+        s0,
+        s1,
+        s2,
+        s3,
+        s4,
+        s5,
+        s6,
+        s7,
+        usize::cast_from(idx[i]),
+        seg_elems,
+    );
+}
+
 /// In-kernel admissible-matrix enumeration: one thread per distinct `R`, generating that `R`'s
 /// `col_sums`/`masks` for *every* admissible matrix directly into device scratch — the on-GPU
 /// replacement for the resident/uploaded master (the stem-300 memory wall + the eviction re-upload
@@ -2460,6 +2550,59 @@ fn enumerate_admissible_ref(p_part: &[u32]) -> (usize, usize, Vec<u32>, Vec<u32>
     (cs_len, mk_len, out_cs, out_mk)
 }
 
+/// Host driver for [`seg_gather_kernel`]: splits `data` into ≤ [`MASTER_MAX_SEG`] segments of
+/// `seg_elems`, uploads each as its own device buffer (no contiguous copy — the whole point), and
+/// returns `data[idx[i]]` gathered through the segmented read. Unused segments get a 1-element dummy
+/// (never indexed). Proves the segmented master reads identically to a contiguous one.
+#[cfg(test)]
+fn seg_gather_on_gpu(data: &[u16], seg_elems: usize, indices: &[u32]) -> Vec<u16> {
+    let n = data.len();
+    let nseg = n.div_ceil(seg_elems).max(1);
+    assert!(nseg <= MASTER_MAX_SEG, "prototype caps at {MASTER_MAX_SEG} segments");
+    let client = CudaRuntime::client(&CudaDevice::default());
+
+    // One handle per segment slot; real segments hold their slice, unused slots a 1-elem dummy.
+    let dummy = [0u16];
+    let mut handles = Vec::with_capacity(MASTER_MAX_SEG);
+    let mut lens = Vec::with_capacity(MASTER_MAX_SEG);
+    for s in 0..MASTER_MAX_SEG {
+        let lo = s * seg_elems;
+        if lo < n {
+            let hi = (lo + seg_elems).min(n);
+            handles.push(client.create_from_slice(u16::as_bytes(&data[lo..hi])));
+            lens.push(hi - lo);
+        } else {
+            handles.push(client.create_from_slice(u16::as_bytes(&dummy)));
+            lens.push(1);
+        }
+    }
+    let idx_h = client.create_from_slice(u32::as_bytes(indices));
+    let out_h = client.empty(indices.len() * size_of::<u16>());
+
+    const THREADS: u32 = 256;
+    let cubes = (indices.len() as u32).div_ceil(THREADS).max(1);
+    let arg = |i: usize| unsafe { ArrayArg::from_raw_parts(handles[i].clone(), lens[i]) };
+    unsafe {
+        seg_gather_kernel::launch::<CudaRuntime>(
+            &client,
+            CubeCount::Static(cubes, 1, 1),
+            CubeDim::new_1d(THREADS),
+            arg(0),
+            arg(1),
+            arg(2),
+            arg(3),
+            arg(4),
+            arg(5),
+            arg(6),
+            arg(7),
+            ArrayArg::from_raw_parts(idx_h, indices.len()),
+            ArrayArg::from_raw_parts(out_h.clone(), indices.len()),
+            seg_elems,
+        );
+    }
+    u16::from_bytes(&client.read_one(out_h).unwrap()).to_vec()
+}
+
 /// Shared body for the per-backend enumeration tests: builds a batch of every real `R` up to
 /// `max_degree`, computes the expected packed `col_sums`/`masks` (and per-`R` `num_mats`) from the
 /// CPU-validated [`enumerate_admissible_ref`], runs [`enumerate_admissible_kernel`] on `R`'s
@@ -2610,6 +2753,23 @@ mod tests {
     #[test]
     fn admissible_enum_gpu_matches() {
         check_enum_backend::<CudaRuntime>(&CudaDevice::default(), 145);
+    }
+
+    /// The segmented master read ([`seg_read_u16`]) must reproduce a contiguous buffer bit-for-bit,
+    /// including reads that land in every one of the [`MASTER_MAX_SEG`] segments and at segment
+    /// boundaries. This validates the no-copy-growth mechanic before it is wired into the multiply's
+    /// hot path. Requires a live GPU + the CUDA toolkit env.
+    #[test]
+    fn seg_read_matches_contiguous() {
+        // 1000 elements over seg_elems=137 → 8 segments (0..137, 137..274, …, 959..1000), so every
+        // segment slot is exercised, including the ragged last one and the boundaries between them.
+        let data: Vec<u16> = (0..1000u16).collect();
+        let seg_elems = 137usize;
+        // Gather in a scrambled order so a segment-selection bug can't hide behind sequential access.
+        let indices: Vec<u32> = (0..1000u32).map(|i| (i * 613) % 1000).collect();
+        let got = seg_gather_on_gpu(&data, seg_elems, &indices);
+        let want: Vec<u16> = indices.iter().map(|&i| data[i as usize]).collect();
+        assert_eq!(got, want, "segmented read diverged from contiguous indexing");
     }
 
     /// Throughput comparison, CPU `admissible_matrices` vs the in-kernel [`enumerate_admissible_kernel`],
