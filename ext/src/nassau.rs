@@ -1271,18 +1271,31 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                                 algebra::milnor_gpu::resident_host_bytes();
                             #[cfg(not(feature = "gpu"))]
                             let (res_master, res_basis) = (0usize, 0usize);
+                            #[cfg(feature = "gpu")]
+                            let (dev_master, dev_basis) =
+                                algebra::milnor_gpu::resident_dev_bytes();
+                            #[cfg(feature = "gpu")]
+                            let (dev_pool_use, dev_pool_res) =
+                                algebra::milnor_gpu::cubecl_device_usage();
+                            #[cfg(not(feature = "gpu"))]
+                            let ((dev_master, dev_basis), (dev_pool_use, dev_pool_res)) =
+                                ((0usize, 0usize), (0u64, 0u64));
                             let gb = |x: usize| x as f64 / (1u64 << 30) as f64;
+                            let gbu = |x: u64| x as f64 / (1u64 << 30) as f64;
                             eprintln!(
-                                "[MEM] commits={commit_count} last_b=({},{}) \
-                                 differentials={:.1}GB modules={:.1}GB \
-                                 resident_master={:.1}GB resident_basis={:.1}GB accounted={:.1}GB",
+                                "[MEM] commits={commit_count} last_b=({},{}) HOST[diff={:.1} mod={:.1} \
+                                 res_master={:.1} res_basis={:.1}]GB DEV[master={:.1} basis={:.1} \
+                                 cubecl_use={:.1} cubecl_reserved={:.1}]GB",
                                 b.n(),
                                 b.s(),
                                 gb(diff_b),
                                 gb(mod_b),
                                 gb(res_master),
                                 gb(res_basis),
-                                gb(diff_b + mod_b + res_master + res_basis),
+                                gb(dev_master),
+                                gb(dev_basis),
+                                gbu(dev_pool_use),
+                                gbu(dev_pool_res),
                             );
                         }
                     }
@@ -1317,6 +1330,10 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                 }
             }
         });
+
+        // Eviction probe (`NASSAU_R_STATS`): dump the R-access distribution once the wavefront is done.
+        #[cfg(feature = "gpu")]
+        algebra::milnor_gpu::dump_r_stats();
     }
 }
 

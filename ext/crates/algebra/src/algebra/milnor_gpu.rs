@@ -235,9 +235,32 @@ pub fn resident_host_bytes() -> (usize, usize) {
     (master, basis)
 }
 
+/// Diagnostic (see `NASSAU_MEM_REPORT`): DEVICE-side bytes of the resident master (`col_sums`+`masks`,
+/// u16) and basis (`pparts` u16 + `lens` u32) — the persistent GPU buffers, from their uploaded
+/// element counts. Returns `(master_bytes, basis_bytes)`.
+pub fn resident_dev_bytes() -> (usize, usize) {
+    let d = RESIDENT_DEV.read().unwrap();
+    let master = d.cs.uploaded * 2 + d.mk.uploaded * 2;
+    let b = RESIDENT_BASIS_DEV.read().unwrap();
+    let basis = b.pp.uploaded * 2 + b.ln.uploaded * 4;
+    (master, basis)
+}
+
+/// Diagnostic (see `NASSAU_MEM_REPORT`): the cubecl CUDA memory pool's device usage on the default
+/// device, `(bytes_in_use, bytes_reserved)`. This is the batched-multiply pool; the fp-cuda RREF runs
+/// on a separate cudarc context, so `nvidia-smi total − resident_dev − reserved` estimates the RREF
+/// pool. Returns `(0, 0)` if the query fails.
+pub fn cubecl_device_usage() -> (u64, u64) {
+    let client = CudaRuntime::client(&CudaDevice::default());
+    match client.memory_usage() {
+        Ok(u) => (u.bytes_in_use, u.bytes_reserved),
+        Err(_) => (0, 0),
+    }
+}
+
 use std::{
     collections::HashMap,
-    sync::{Condvar, LazyLock, Mutex, RwLock},
+    sync::{Arc, Condvar, LazyLock, Mutex, RwLock},
 };
 
 use cubecl::server::Handle;
@@ -338,6 +361,48 @@ static RESIDENT_UPLOAD: Mutex<()> = Mutex::new(());
 /// common in-place delta write does NOT take this lock (it's stable-handle, proven race-free), so the
 /// hot path stays lock-free; reallocs happen only a handful of times per run, so the barrier is free.
 static RESIDENT_REALLOC: RwLock<()> = RwLock::new(());
+
+/// Host-side cache of cold (degree > [`resident_degree_cap`]) `R`s' admissible matrices, narrowed to
+/// `u16` and ready to upload. Cold `R`s are deliberately kept OFF the device master (that is the whole
+/// point of eviction — it bounds the 143 GB device), but `admissible_matrices` is the *expensive* part
+/// for exactly these high-degree `R`s (big matrices) and they recur across many bidegrees. Recomputing
+/// per launch collapsed throughput (2× wall at stem 180, bench 2026-07-27). Caching the result
+/// host-side (host has ~755 GB — never the constraint) makes the recompute one-shot, like the resident
+/// path, while the *device* copy stays transient (uploaded per launch into a block-local buffer, freed
+/// after). Grows to roughly the evicted tail of the master (tens of GB), well within host RAM.
+struct ColdEntry {
+    cs_len: u32,
+    mk_len: u32,
+    num_mats: u32,
+    cs: Arc<Vec<u16>>,
+    mk: Arc<Vec<u16>>,
+}
+static COLD_HOST: LazyLock<RwLock<HashMap<Vec<PPartEntry>, ColdEntry>>> =
+    LazyLock::new(|| RwLock::new(HashMap::new()));
+
+/// Cold-`R` admissible data, from the [`COLD_HOST`] cache (computed + narrowed once on first use).
+/// Returns `(cs_len, mk_len, num_mats, cs, mk)`; the `Arc`s make the cache-hit path a cheap refcount
+/// bump, no copy. Layout matches [`resident_info`]'s so the kernel indexes both identically.
+fn cold_host_entry(
+    algebra: &MilnorAlgebra,
+    p_part: &[PPartEntry],
+) -> (u32, u32, u32, Arc<Vec<u16>>, Arc<Vec<u16>>) {
+    if let Some(e) = COLD_HOST.read().unwrap().get(p_part) {
+        return (e.cs_len, e.mk_len, e.num_mats, e.cs.clone(), e.mk.clone());
+    }
+    let (cs_len, mk_len, cs, mk) = algebra.admissible_matrices(p_part);
+    let num_mats = (mk.len() / mk_len) as u32;
+    let entry = ColdEntry {
+        cs_len: cs_len as u32,
+        mk_len: mk_len as u32,
+        num_mats,
+        cs: Arc::new(cs.iter().map(|&v| narrow_u16(v)).collect()),
+        mk: Arc::new(mk.iter().map(|&v| narrow_u16(v)).collect()),
+    };
+    let mut w = COLD_HOST.write().unwrap();
+    let e = w.entry(p_part.to_vec()).or_insert(entry);
+    (e.cs_len, e.mk_len, e.num_mats, e.cs.clone(), e.mk.clone())
+}
 
 /// Fetch a resident device-master handle, uploading the current master prefix only when this
 /// block dereferences past what is already on the device (`need`). The upload runs OUTSIDE
@@ -441,7 +506,162 @@ macro_rules! resident_dev_handle {
 /// [`ResidentHost`]), enumerating and appending them on first sight (the append order fixes
 /// the offsets forever). The enumeration runs outside any lock; on a first-sight race the
 /// loser rechecks under the write lock and discards its duplicate.
+/// Per-`R` access statistics for the eviction probe (`NASSAU_R_STATS`): how often each distinct `R`
+/// is referenced (a block that uses it counts once), its degree, and the first/last reference "time"
+/// (a `BATCH_CALLS` tick). Dumped by [`dump_r_stats`] to reveal the hot/cold structure that a device
+/// working-set cache would exploit.
+#[derive(Clone)]
+struct RStat {
+    count: u64,
+    degree: i32,
+    first: u64,
+    last: u64,
+}
+
+static R_STATS: LazyLock<Option<Mutex<HashMap<Vec<PPartEntry>, RStat>>>> = LazyLock::new(|| {
+    std::env::var_os("NASSAU_R_STATS").map(|_| Mutex::new(HashMap::new()))
+});
+
+/// Internal degree of `R` from its p-part: `Σ p_part[i] · deg(ξ_{i+1})`.
+fn ppart_degree(p_part: &[PPartEntry]) -> i32 {
+    let xi = xi_degrees(fp::prime::ValidPrime::new(2));
+    p_part
+        .iter()
+        .zip(xi.iter())
+        .map(|(&e, &d)| e as i32 * d as i32)
+        .sum()
+}
+
+/// Operations `R` whose internal degree exceeds this stay OUT of the resident device master and are
+/// instead recomputed and uploaded to a throwaway per-launch buffer (see [`MasterMode`]). Default
+/// `i32::MAX` keeps every `R` resident — byte-identical to the pre-eviction path (the caller takes a
+/// fast path that never touches the transient code). The `NASSAU_R_STATS` probe found a *degree*
+/// threshold, not LRU, is the right policy: low-degree `R`s are the stable hot core (reference span
+/// 0.99 of the run), high-degree `R`s are scattered-recurring (0.81) *and* the biggest matrices, so
+/// excluding them saves more device bytes than their count fraction. On S_2 (150,75): θ≤100 keeps
+/// 17% of distinct `R`s resident and recomputes 14% of references; θ≤125 keeps 43% / recomputes 4%.
+/// The resident set saturates with degree, so this bounds the master at any stem (the stem-300 lever).
+fn resident_degree_cap() -> i32 {
+    static CAP: LazyLock<i32> = LazyLock::new(|| {
+        std::env::var("NASSAU_GPU_RESIDENT_MAX_DEGREE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(i32::MAX)
+    });
+    *CAP
+}
+
+/// Where a launch's `col_sums`/`masks` come from. A given output row's products all share one `R`
+/// (the operation of its input basis element), so rows split cleanly by `R`-degree into a resident
+/// group and a transient group with no row overlap — the two launches write disjoint rows.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MasterMode {
+    /// Persist each `R`'s admissible matrices in the shared append-only device master ([`ResidentDev`]).
+    Resident,
+    /// Recompute this block's `R`s ([`MilnorAlgebra::admissible_matrices`]) into a per-block buffer,
+    /// uploaded fresh and freed with the launch. Keeps the resident master bounded across stems.
+    Transient,
+}
+
+fn record_r_use(p_part: &[PPartEntry]) {
+    if let Some(m) = R_STATS.as_ref() {
+        let now = BATCH_CALLS.load(Ordering::Relaxed);
+        let mut map = m.lock().unwrap();
+        let e = map.entry(p_part.to_vec()).or_insert(RStat {
+            count: 0,
+            degree: ppart_degree(p_part),
+            first: now,
+            last: now,
+        });
+        e.count += 1;
+        e.last = now;
+    }
+}
+
+/// Dump the `R`-access distribution gathered under `NASSAU_R_STATS` (see [`RStat`]) — the data that
+/// decides whether/what device eviction policy helps. Prints: reference skew (top-k coverage),
+/// degree-vs-frequency correlation, and reference-lifetime spans. No-op unless the probe is enabled.
+pub fn dump_r_stats() {
+    let Some(m) = R_STATS.as_ref() else { return };
+    let map = m.lock().unwrap();
+    if map.is_empty() {
+        return;
+    }
+    let n = map.len();
+    let total_refs: u64 = map.values().map(|s| s.count).sum();
+    let now = BATCH_CALLS.load(Ordering::Relaxed).max(1);
+    let mut v: Vec<&RStat> = map.values().collect();
+    // Coverage: sort by count desc, cumulative fraction of references from the top-k Rs.
+    v.sort_by(|a, b| b.count.cmp(&a.count));
+    let cov = |frac: f64| -> f64 {
+        let k = ((n as f64 * frac).ceil() as usize).max(1).min(n);
+        let hit: u64 = v[..k].iter().map(|s| s.count).sum();
+        hit as f64 / total_refs as f64 * 100.0
+    };
+    // used-once fraction (pure cold), and how many Rs cover 90% of refs.
+    let once = v.iter().filter(|s| s.count == 1).count();
+    let mut acc = 0u64;
+    let mut k90 = 0usize;
+    for s in &v {
+        acc += s.count;
+        k90 += 1;
+        if acc as f64 >= total_refs as f64 * 0.90 {
+            break;
+        }
+    }
+    // Degree vs frequency: avg degree of the hottest decile vs the coldest decile.
+    let dec = (n / 10).max(1);
+    let avg_deg = |slice: &[&RStat]| -> f64 {
+        slice.iter().map(|s| s.degree as f64).sum::<f64>() / slice.len().max(1) as f64
+    };
+    let hot_deg = avg_deg(&v[..dec]);
+    let cold_deg = avg_deg(&v[n - dec..]);
+    // Reference lifetime: span (last-first)/now for the hot decile (are they used throughout, or windowed?).
+    let hot_span = v[..dec]
+        .iter()
+        .map(|s| (s.last - s.first) as f64 / now as f64)
+        .sum::<f64>()
+        / dec as f64;
+    let cold_span = v[n - dec..]
+        .iter()
+        .map(|s| (s.last - s.first) as f64 / now as f64)
+        .sum::<f64>()
+        / dec as f64;
+    let max_deg = v.iter().map(|s| s.degree).max().unwrap_or(0);
+    let min_deg = v.iter().map(|s| s.degree).min().unwrap_or(0);
+    // Degree-threshold sizing: for a resident cache that keeps Rs with degree <= θ, what fraction of
+    // distinct Rs it holds and what fraction of references hit it (miss rate = 100 − ref%).
+    let mut deg_table = String::new();
+    for theta in [50, 75, 100, 125] {
+        let held = v.iter().filter(|s| s.degree <= theta).count();
+        let refs: u64 = v.iter().filter(|s| s.degree <= theta).map(|s| s.count).sum();
+        deg_table += &format!(
+            " θ≤{theta}:[{:.0}%Rs,{:.0}%refs]",
+            held as f64 / n as f64 * 100.0,
+            refs as f64 / total_refs as f64 * 100.0
+        );
+    }
+    eprintln!(
+        "[R-STATS] distinct_R={n} total_refs={total_refs} used_once={once} ({:.0}%) \
+         k_for_90%_refs={k90} ({:.1}% of Rs) | coverage top1%={:.0}% top5%={:.0}% top10%={:.0}% top25%={:.0}% \
+         | degree hot_decile_avg={:.0} cold_decile_avg={:.0} range=[{min_deg},{max_deg}] \
+         | ref_span hot={:.2} cold={:.2} (of run) | degree-threshold cache sizing:{}",
+        once as f64 / n as f64 * 100.0,
+        k90 as f64 / n as f64 * 100.0,
+        cov(0.01),
+        cov(0.05),
+        cov(0.10),
+        cov(0.25),
+        hot_deg,
+        cold_deg,
+        hot_span,
+        cold_span,
+        deg_table,
+    );
+}
+
 fn resident_info(algebra: &MilnorAlgebra, p_part: &[PPartEntry]) -> RInfo {
+    record_r_use(p_part);
     if let Some(info) = RESIDENT_HOST.read().unwrap().index.get(p_part) {
         return *info;
     }
@@ -1269,6 +1489,7 @@ pub fn multiply_single_r_on_gpu(
 /// product's `seqno` output indexes the algebra basis of the output degree; `out_offset`
 /// is the start of the target-generator block that basis maps into within the row (0 when
 /// the whole row is a single algebra element, as in the single-generator tests).
+#[derive(Clone)]
 pub struct GpuProduct {
     pub r_degree: i32,
     pub r_idx: usize,
@@ -1294,22 +1515,86 @@ pub fn multiply_batch_on_gpu(
     num_rows: usize,
     products: &[GpuProduct],
 ) -> Vec<Vec<u32>> {
+    let cap = resident_degree_cap();
+    // Fast path (default, `cap == i32::MAX`, and any run whose `R`s are all under the cap): a single
+    // resident-master pass, byte-identical to the pre-eviction code. No cloning, no second launch.
+    if cap == i32::MAX || products.iter().all(|p| p.r_degree <= cap) {
+        return multiply_batch_grouped(algebra, num_cols, num_rows, products, MasterMode::Resident);
+    }
+    // Eviction active. Each output row's products all share one `R` (see [`MasterMode`]), so the
+    // hot (degree ≤ cap) and cold row sets are DISJOINT. Run each group on its own rows only,
+    // **compacted** to a dense `0..k` range so each pass reads back just its own rows — total
+    // readback stays `num_rows`, not 2× (critical in the intended high-θ regime, where the cold
+    // set is a small tail and a full-height cold readback would be almost all zeros). Results
+    // scatter back to the original row indices; a row in neither group stays zero (its content, if
+    // any, comes from the caller's CPU identity path).
+    let num_limbs = num_cols.div_ceil(32).max(1);
+    let mut result = vec![vec![0u32; num_limbs]; num_rows];
+    for mode in [MasterMode::Resident, MasterMode::Transient] {
+        let is_group = |d: i32| match mode {
+            MasterMode::Resident => d <= cap,
+            MasterMode::Transient => d > cap,
+        };
+        // Distinct rows this group touches, in order (products are row-major, so already sorted).
+        let mut rows: Vec<usize> = products
+            .iter()
+            .filter(|p| is_group(p.r_degree))
+            .map(|p| p.row)
+            .collect();
+        rows.dedup();
+        if rows.is_empty() {
+            continue;
+        }
+        let remap: HashMap<usize, usize> =
+            rows.iter().enumerate().map(|(i, &r)| (r, i)).collect();
+        let compact: Vec<GpuProduct> = products
+            .iter()
+            .filter(|p| is_group(p.r_degree))
+            .map(|p| {
+                let mut q = p.clone();
+                q.row = remap[&p.row];
+                q
+            })
+            .collect();
+        let sub = multiply_batch_grouped(algebra, num_cols, rows.len(), &compact, mode);
+        for (i, &orig) in rows.iter().enumerate() {
+            for (a, b) in result[orig].iter_mut().zip(&sub[i]) {
+                *a ^= *b;
+            }
+        }
+    }
+    result
+}
+
+fn multiply_batch_grouped(
+    algebra: &MilnorAlgebra,
+    num_cols: usize,
+    num_rows: usize,
+    products: &[GpuProduct],
+    mode: MasterMode,
+) -> Vec<Vec<u32>> {
     let num_limbs = num_cols.div_ceil(32).max(1);
     let max_block_rows = (gpu_block_bytes() / (num_limbs * 4)).max(1);
-    // Products arrive row-major (the extract loops emit them per input row, in order), so each
-    // block is a contiguous product slice. Rows are independent — every product writes only its
-    // own row — so concatenating block outputs reproduces the single-launch result exactly.
+    // Products arrive row-major (the extract loops emit them per input row, in order; the hot/cold
+    // filter above preserves that order), so each block is a contiguous product slice. Rows are
+    // independent — every product writes only its own row — so concatenating block outputs
+    // reproduces the single-launch result exactly.
     debug_assert!(products.windows(2).all(|w| w[0].row <= w[1].row));
     // Per-product `(matrix, term)` pair counts, i.e. kernel threads. The kernel indexes threads
     // by `ABSOLUTE_POS`, a `u32`, so a block must also stay under `2^32` pairs — output bytes
     // alone don't bound this (pairs per row grow with the degree; an unbounded all-rows build
-    // reaches ~4.4e9 pairs by stem ~145). This pre-pass also warms the shared resident master,
-    // so every block's layout lookups below are read-lock cache hits.
+    // reaches ~4.4e9 pairs by stem ~145). For `Resident` this pre-pass also warms the shared
+    // resident master, so every block's layout lookups below are read-lock cache hits; for
+    // `Transient` it warms the host-side [`COLD_HOST`] cache the same way (no per-block recompute).
     let prod_pairs: Vec<usize> = products
         .iter()
         .map(|prod| {
             let r = algebra.basis_element_from_index(prod.r_degree, prod.r_idx);
-            resident_info(algebra, &r.p_part).num_mats as usize * prod.term_indices.len()
+            let num_mats = match mode {
+                MasterMode::Resident => resident_info(algebra, &r.p_part).num_mats as usize,
+                MasterMode::Transient => cold_host_entry(algebra, &r.p_part).2 as usize,
+            };
+            num_mats * prod.term_indices.len()
         })
         .collect();
     let mut result: Vec<Vec<u32>> = Vec::with_capacity(num_rows);
@@ -1336,6 +1621,7 @@ pub fn multiply_batch_on_gpu(
             r0,
             r1 - r0,
             &products[p0..p1],
+            mode,
         ));
         (r0, p0) = (r1, p1);
     }
@@ -1353,6 +1639,7 @@ fn multiply_batch_block(
     row_base: usize,
     num_rows: usize,
     products: &[GpuProduct],
+    mode: MasterMode,
 ) -> Vec<Vec<u32>> {
     let (width, g) = algebra.seqno_table_u32();
     let mut xi: Vec<u32> = xi_degrees(algebra.prime())
@@ -1495,17 +1782,40 @@ fn multiply_batch_block(
     let mut r_num_matrices: Vec<usize> = Vec::with_capacity(distinct_r.len());
     let mut need_cs: usize = 0;
     let mut need_mk: usize = 0;
+    // `Transient`: this block's own `col_sums`/`masks`, packed contiguously with block-local
+    // offsets (mirrors the resident master's layout, but built fresh here and freed after the
+    // launch instead of persisting). Empty / unused under `Resident`.
+    let mut cs_local: Vec<u16> = Vec::new();
+    let mut mk_local: Vec<u16> = Vec::new();
     for &(rd, ridx) in &distinct_r {
         let r = algebra.basis_element_from_index(rd, ridx);
         assert!(!r.p_part.is_empty(), "each R must be non-empty");
-        let info = resident_info(algebra, &r.p_part);
-        r_cs_offset.push(info.cs_off);
-        r_mk_offset.push(info.mk_off);
-        r_cs_len.push(info.cs_len);
-        r_mk_len.push(info.mk_len);
-        r_num_matrices.push(info.num_mats as usize);
-        need_cs = need_cs.max(info.cs_off as usize + info.num_mats as usize * info.cs_len as usize);
-        need_mk = need_mk.max(info.mk_off as usize + info.num_mats as usize * info.mk_len as usize);
+        match mode {
+            MasterMode::Resident => {
+                let info = resident_info(algebra, &r.p_part);
+                r_cs_offset.push(info.cs_off);
+                r_mk_offset.push(info.mk_off);
+                r_cs_len.push(info.cs_len);
+                r_mk_len.push(info.mk_len);
+                r_num_matrices.push(info.num_mats as usize);
+                need_cs = need_cs
+                    .max(info.cs_off as usize + info.num_mats as usize * info.cs_len as usize);
+                need_mk = need_mk
+                    .max(info.mk_off as usize + info.num_mats as usize * info.mk_len as usize);
+            }
+            MasterMode::Transient => {
+                let (cs_len, mk_len, num_mats, cs, mk) = cold_host_entry(algebra, &r.p_part);
+                r_cs_offset.push(cs_local.len() as u64);
+                r_mk_offset.push(mk_local.len() as u64);
+                r_cs_len.push(cs_len);
+                r_mk_len.push(mk_len);
+                r_num_matrices.push(num_mats as usize);
+                cs_local.extend_from_slice(&cs);
+                mk_local.extend_from_slice(&mk);
+                need_cs = cs_local.len();
+                need_mk = mk_local.len();
+            }
+        }
     }
 
     // Lay out per-product records + the pair-count prefix sum (sequential). Term data is already
@@ -1601,8 +1911,23 @@ fn multiply_batch_block(
         // then HOST.read, and nothing under either lock blocks on rayon or a permit. The
         // master is append-only, so the uploaded prefix is always a prefix of the current
         // host master and every offset `< uploaded` is final.
-        let (cs_h, cs_len_master) = resident_dev_handle!(client, need_cs, cs, cs_pending, cs_len);
-        let (mk_h, mk_len_master) = resident_dev_handle!(client, need_mk, mk, mk_pending, mk_len);
+        // `Transient` (degree > cap `R`s): upload this block's freshly-built master and free it
+        // with the launch — no persistence, no cross-stream sharing, so no realloc guard below.
+        let (cs_h, cs_len_master, mk_h, mk_len_master) = match mode {
+            MasterMode::Resident => {
+                let (cs_h, cs_len_master) =
+                    resident_dev_handle!(client, need_cs, cs, cs_pending, cs_len);
+                let (mk_h, mk_len_master) =
+                    resident_dev_handle!(client, need_mk, mk, mk_pending, mk_len);
+                (cs_h, cs_len_master, mk_h, mk_len_master)
+            }
+            MasterMode::Transient => (
+                client.create_from_slice(u16::as_bytes(&cs_local)),
+                cs_local.len(),
+                client.create_from_slice(u16::as_bytes(&mk_local)),
+                mk_local.len(),
+            ),
+        };
         // Upload the block's data — term data, seqno/xi tables, per-`R` offsets, per-product
         // records, the pair prefix sum, and the (zeroed) output buffer — and launch once: the
         // caller has already bounded this block's pair count and output size.
@@ -1633,8 +1958,10 @@ fn multiply_batch_block(
         // through the readback that syncs it (see [`RESIDENT_REALLOC`]). All resident growth for this
         // block is already done above; a concurrent capacity realloc on another thread waits here for
         // this multiply to finish, so the resident handle can never be swapped mid-kernel. Held to
-        // the end of the device section (dropped after `read_one`).
-        let _realloc_guard = RESIDENT_REALLOC.read().unwrap();
+        // the end of the device section (dropped after `read_one`). `Transient` buffers are
+        // block-local (never reallocated by another thread), so they need no such guard.
+        let _realloc_guard =
+            (mode == MasterMode::Resident).then(|| RESIDENT_REALLOC.read().unwrap());
         // Allocate the XOR accumulator uninitialized and zero it on-device (see [`zero_u32`]),
         // instead of uploading a hundreds-of-MB host zero buffer — the former dominant serial
         // marshaling cost. Same stream as the multiply below, so it is ordered before it.
