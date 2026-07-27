@@ -2628,13 +2628,16 @@ mod tests {
         algebra.compute_basis(max_degree);
 
         // Gather every non-empty R, grouped by degree (per-degree GPU launches keep host arrays bounded).
-        let mut by_degree: Vec<(Vec<Vec<u32>>, Vec<u32>)> = Vec::new();
+        // Per degree keep the packed u16 col_sums/masks (what upload-based eviction uploads H->D),
+        // so we can time that upload directly and compare it against on-device enumeration. Both are
+        // production paths: the matrices end up on-device either way, so NEITHER counts a readback.
+        let mut by_degree: Vec<(Vec<Vec<u32>>, Vec<u32>, Vec<u16>, Vec<u16>)> = Vec::new();
         let mut cpu_secs = 0.0f64;
         let mut total_r = 0usize;
         let mut total_mats = 0u64;
         for deg in 1..=max_degree {
-            let mut pps = Vec::new();
-            let mut nms = Vec::new();
+            let (mut pps, mut nms, mut cs_all, mut mk_all) =
+                (Vec::new(), Vec::new(), Vec::new(), Vec::new());
             for idx in 0..algebra.dimension(deg) {
                 let pp = algebra.basis_element_from_index(deg, idx).p_part.clone();
                 if pp.is_empty() {
@@ -2642,44 +2645,54 @@ mod tests {
                 }
                 // Time the CPU enumeration (`admissible_matrices`, the call the CPU multiply makes).
                 let t = Instant::now();
-                let (_cs_len, mk_len, _cs, mk) = algebra.admissible_matrices(&pp);
+                let (_cs_len, mk_len, cs, mk) = algebra.admissible_matrices(&pp);
                 cpu_secs += t.elapsed().as_secs_f64();
                 let nm = (mk.len() / mk_len) as u32;
                 nms.push(nm);
                 total_mats += nm as u64;
+                cs_all.extend(cs.iter().map(|&v| narrow_u16(v)));
+                mk_all.extend(mk.iter().map(|&v| narrow_u16(v)));
                 pps.push(pp);
             }
             total_r += pps.len();
             if !pps.is_empty() {
-                by_degree.push((pps, nms));
+                by_degree.push((pps, nms, cs_all, mk_all));
             }
         }
 
         let device = CudaDevice::default();
+        let client = CudaRuntime::client(&device);
         // Warm up the runtime/JIT so the first degree's compile doesn't skew the GPU timing.
         {
-            let (pps, nms) = &by_degree[0];
+            let (pps, nms, _, _) = &by_degree[0];
             let _ = enum_launch_timed::<CudaRuntime>(&device, pps, nms);
         }
-        let (mut g_marshal, mut g_kernel, mut g_read) = (0.0f64, 0.0f64, 0.0f64);
-        for (pps, nms) in &by_degree {
-            let (m, k, r) = enum_launch_timed::<CudaRuntime>(&device, pps, nms);
-            g_marshal += m;
+        let mut g_kernel = 0.0f64;
+        let mut upload_secs = 0.0f64;
+        for (pps, nms, cs_all, mk_all) in &by_degree {
+            // (a) On-device enumeration, kernel only (no readback — the multiply consumes the scratch).
+            let (_m, k, _r) = enum_launch_timed::<CudaRuntime>(&device, pps, nms);
             g_kernel += k;
-            g_read += r;
+            // (b) What upload-based eviction does instead: upload the host-built arrays H->D. Force the
+            // (possibly async) copies to complete by syncing the stream via a tiny throwaway readback
+            // (4 bytes back, negligible) — NOT by reading the big arrays back, so this is upload-only.
+            let t = Instant::now();
+            let ch = client.create_from_slice(u16::as_bytes(cs_all));
+            let mh = client.create_from_slice(u16::as_bytes(mk_all));
+            let sync = client.empty(size_of::<u32>());
+            let _ = client.read_one(sync).unwrap();
+            upload_secs += t.elapsed().as_secs_f64();
+            drop((ch, mh));
         }
 
         eprintln!(
-            "\n=== admissible enumeration: CPU vs GPU (degrees 1..={max_degree}) ===\n\
-             R's: {total_r}   matrices: {total_mats}\n\
-             CPU  admissible_matrices : {cpu_secs:.3} s\n\
-             GPU  kernel only         : {g_kernel:.3} s   ({:.1}x vs CPU)   [production path]\n\
-             GPU  marshal+upload      : {g_marshal:.3} s\n\
-             GPU  full readback       : {g_read:.3} s   (bench-only; prod keeps it on-device)\n\
-             GPU  kernel+marshal+read : {:.3} s   ({:.1}x vs CPU)   [full round-trip]",
-            cpu_secs / g_kernel,
-            g_marshal + g_kernel + g_read,
-            cpu_secs / (g_marshal + g_kernel + g_read),
+            "\n=== admissible matrices onto the device: enumerate vs upload (degrees 1..={max_degree}) ===\n\
+             R's: {total_r}   matrices: {total_mats}   (both paths leave the arrays ON-DEVICE, no readback)\n\
+             CPU  admissible_matrices (enumerate, 1 core) : {cpu_secs:.3} s\n\
+             GPU  enumerate in-kernel                     : {g_kernel:.3} s\n\
+             H->D upload of host-built arrays             : {upload_secs:.3} s\n\
+             --> in-kernel enum is {:.2}x the cost of just uploading the same arrays",
+            g_kernel / upload_secs,
         );
     }
 
