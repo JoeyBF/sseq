@@ -24,6 +24,7 @@ use cubecl::{
     prelude::*,
 };
 use cubecl_common::stream_id::StreamId;
+
 // Bounds the per-thread enumeration state ([`ENUM_ROW_CAP`]) and the `#[cfg(test)]` `seqno_kernel`'s
 // working array; the multiply kernel uses `WORKING_CAP`.
 use crate::algebra::combinatorics::MAX_XI_TAU;
@@ -404,7 +405,11 @@ fn cold_count(algebra: &MilnorAlgebra, p_part: &[PPartEntry]) -> (u32, u32, u32)
     }
     let (cs_len, mk_len, _cs, mk) = algebra.admissible_matrices(p_part);
     let e = (cs_len as u32, mk_len as u32, (mk.len() / mk_len) as u32);
-    COLD_COUNT.write().unwrap().entry(p_part.to_vec()).or_insert(e);
+    COLD_COUNT
+        .write()
+        .unwrap()
+        .entry(p_part.to_vec())
+        .or_insert(e);
     e
 }
 
@@ -517,9 +522,8 @@ struct RStat {
     last: u64,
 }
 
-static R_STATS: LazyLock<Option<Mutex<HashMap<Vec<PPartEntry>, RStat>>>> = LazyLock::new(|| {
-    std::env::var_os("NASSAU_R_STATS").map(|_| Mutex::new(HashMap::new()))
-});
+static R_STATS: LazyLock<Option<Mutex<HashMap<Vec<PPartEntry>, RStat>>>> =
+    LazyLock::new(|| std::env::var_os("NASSAU_R_STATS").map(|_| Mutex::new(HashMap::new())));
 
 /// Internal degree of `R` from its p-part: `Σ p_part[i] · deg(ξ_{i+1})`.
 fn ppart_degree(p_part: &[PPartEntry]) -> i32 {
@@ -633,7 +637,11 @@ pub fn dump_r_stats() {
     let mut deg_table = String::new();
     for theta in [50, 75, 100, 125] {
         let held = v.iter().filter(|s| s.degree <= theta).count();
-        let refs: u64 = v.iter().filter(|s| s.degree <= theta).map(|s| s.count).sum();
+        let refs: u64 = v
+            .iter()
+            .filter(|s| s.degree <= theta)
+            .map(|s| s.count)
+            .sum();
         deg_table += &format!(
             " θ≤{theta}:[{:.0}%Rs,{:.0}%refs]",
             held as f64 / n as f64 * 100.0,
@@ -642,9 +650,10 @@ pub fn dump_r_stats() {
     }
     eprintln!(
         "[R-STATS] distinct_R={n} total_refs={total_refs} used_once={once} ({:.0}%) \
-         k_for_90%_refs={k90} ({:.1}% of Rs) | coverage top1%={:.0}% top5%={:.0}% top10%={:.0}% top25%={:.0}% \
-         | degree hot_decile_avg={:.0} cold_decile_avg={:.0} range=[{min_deg},{max_deg}] \
-         | ref_span hot={:.2} cold={:.2} (of run) | degree-threshold cache sizing:{}",
+         k_for_90%_refs={k90} ({:.1}% of Rs) | coverage top1%={:.0}% top5%={:.0}% top10%={:.0}% \
+         top25%={:.0}% | degree hot_decile_avg={:.0} cold_decile_avg={:.0} \
+         range=[{min_deg},{max_deg}] | ref_span hot={:.2} cold={:.2} (of run) | degree-threshold \
+         cache sizing:{}",
         once as f64 / n as f64 * 100.0,
         k90 as f64 / n as f64 * 100.0,
         cov(0.01),
@@ -770,7 +779,6 @@ fn ensure_basis(algebra: &MilnorAlgebra, width: usize, max_degree: i32) -> Vec<u
     host.global_base.clone()
 }
 
-
 /// Zero a device `u32` buffer on-device: `out[i] = 0`, one thread per limb.
 ///
 /// Initializes the batched multiply's XOR accumulator without allocating and uploading a host
@@ -799,7 +807,13 @@ fn zero_u32(out: &mut Array<u32>) {
 // master/basis passes 2^32 elements, needing 64-bit `usize`; and cubecl's checked bounds clamp emits
 // `min(u64, u64)` (ambiguous for NVRTC) under u64. The `ABSOLUTE_POS < count` guard keeps it in-bounds.
 #[cube(launch_unchecked, address_type = "dynamic")]
-fn copy_into_u16(src: &Array<u16>, dst: &mut Array<u16>, src_off: usize, dst_off: usize, count: u32) {
+fn copy_into_u16(
+    src: &Array<u16>,
+    dst: &mut Array<u16>,
+    src_off: usize,
+    dst_off: usize,
+    count: u32,
+) {
     if ABSOLUTE_POS < usize::cast_from(count) {
         dst[dst_off + ABSOLUTE_POS] = src[src_off + ABSOLUTE_POS];
     }
@@ -807,7 +821,13 @@ fn copy_into_u16(src: &Array<u16>, dst: &mut Array<u16>, src_off: usize, dst_off
 
 /// `u32` sibling of [`copy_into_u16`] (for the resident basis `lens`).
 #[cube(launch_unchecked, address_type = "dynamic")]
-fn copy_into_u32(src: &Array<u32>, dst: &mut Array<u32>, src_off: usize, dst_off: usize, count: u32) {
+fn copy_into_u32(
+    src: &Array<u32>,
+    dst: &mut Array<u32>,
+    src_off: usize,
+    dst_off: usize,
+    count: u32,
+) {
     if ABSOLUTE_POS < usize::cast_from(count) {
         dst[dst_off + ABSOLUTE_POS] = src[src_off + ABSOLUTE_POS];
     }
@@ -824,7 +844,6 @@ const COPY_CHUNK: usize = 1 << 30;
 /// 180 with 8 streams, the OOM driver. Staging in `STAGE_CHUNK` pieces with a sync between them
 /// caps the live pinned staging at ~one chunk. 64 Mi × u16 = 128 MiB (× u32 = 256 MiB).
 const STAGE_CHUNK: usize = 1 << 26;
-
 
 /// Copy `count` elements `src[src_off..] -> dst[dst_off..]` with `$kernel` (`copy_into_u16`/`_u32`),
 /// splitting into [`COPY_CHUNK`]-element launches so counts past the `u32` thread limit are handled.
@@ -853,50 +872,6 @@ macro_rules! copy_chunked {
             done += n;
         }
     }};
-}
-
-/// Elementwise F₂ addition of two bit-packed vectors: `out[i] = a[i] ^ b[i]`.
-///
-/// One thread per `u32` limb. F₂ addition is XOR of the packed limbs, so this is
-/// the output primitive the multiply kernels accumulate with.
-#[cfg(test)]
-#[cube(launch)]
-fn xor_f2(a: &Array<u32>, b: &Array<u32>, out: &mut Array<u32>) {
-    if ABSOLUTE_POS < out.len() {
-        out[ABSOLUTE_POS] = a[ABSOLUTE_POS] ^ b[ABSOLUTE_POS];
-    }
-}
-
-/// Compute `a ^ b` limb-wise on the default CUDA device.
-///
-/// Host-side driver for `xor_f2`: uploads both operands, launches one thread per
-/// limb, and reads the result back. Panics if the operands differ in length.
-#[cfg(test)]
-pub fn xor_f2_on_gpu(a: &[u32], b: &[u32]) -> Vec<u32> {
-    assert_eq!(a.len(), b.len(), "operands must have equal limb counts");
-    let n = a.len();
-    let client = CudaRuntime::client(&CudaDevice::default());
-
-    let a_handle = client.create_from_slice(u32::as_bytes(a));
-    let b_handle = client.create_from_slice(u32::as_bytes(b));
-    let out_handle = client.empty(std::mem::size_of_val(a));
-
-    // One 1-D block of `THREADS` units, enough blocks to cover every limb.
-    const THREADS: u32 = 256;
-    let cubes = (n as u32).div_ceil(THREADS);
-    unsafe {
-        xor_f2::launch::<CudaRuntime>(
-            &client,
-            CubeCount::Static(cubes, 1, 1),
-            CubeDim::new_1d(THREADS),
-            ArrayArg::from_raw_parts(a_handle, n),
-            ArrayArg::from_raw_parts(b_handle, n),
-            ArrayArg::from_raw_parts(out_handle.clone(), n),
-        );
-    }
-
-    let bytes = client.read_one(out_handle).unwrap();
-    u32::from_bytes(&bytes).to_vec()
 }
 
 /// Device port of [`MilnorAlgebra::seqno`]: the index of `P(working)` in the Milnor
@@ -936,72 +911,6 @@ fn seqno_core(
         }
     }
     rank
-}
-
-/// One thread per padded p_part: `out[i] = seqno(p_parts[i])`. `p_parts` is
-/// `n × width` row-major, each row a p_part zero-padded to `width` (padding entries
-/// are zero and skipped, so `wlen == width` matches the CPU's trimmed loop).
-#[cfg(test)]
-#[cube(launch)]
-fn seqno_kernel(
-    g: &Array<u32>,
-    xi: &Array<u32>,
-    p_parts: &Array<u32>,
-    out: &mut Array<u32>,
-    width: usize,
-) {
-    let idx = ABSOLUTE_POS;
-    if idx >= out.len() {
-        terminate!();
-    }
-    let base = idx * width;
-
-    let mut working = Array::<u32>::new(MAX_XI_TAU);
-    for h in 0..width {
-        working[h] = p_parts[base + h];
-    }
-    out[idx] = seqno_core(g, xi, &working, width, width);
-}
-
-/// Run `seqno_kernel` over `n` padded p_parts and return their seqno indices.
-///
-/// `g`/`xi` come from `MilnorAlgebra::seqno_table_u32` and
-/// [`crate::algebra::combinatorics::xi_degrees`]; `p_parts` is `n × width` row-major,
-/// each row a p_part zero-padded to `width`.
-#[cfg(test)]
-pub fn seqno_batch_on_gpu(
-    width: usize,
-    xi: &[u32],
-    g: &[u32],
-    p_parts: &[u32],
-    n: usize,
-) -> Vec<u32> {
-    assert_eq!(xi.len(), width, "xi must have `width` entries");
-    assert_eq!(p_parts.len(), n * width, "p_parts must be n × width");
-    let client = CudaRuntime::client(&CudaDevice::default());
-
-    let g_h = client.create_from_slice(u32::as_bytes(g));
-    let xi_h = client.create_from_slice(u32::as_bytes(xi));
-    let pp_h = client.create_from_slice(u32::as_bytes(p_parts));
-    let out_h = client.empty(n * size_of::<u32>());
-
-    const THREADS: u32 = 256;
-    let cubes = (n as u32).div_ceil(THREADS);
-    unsafe {
-        seqno_kernel::launch::<CudaRuntime>(
-            &client,
-            CubeCount::Static(cubes, 1, 1),
-            CubeDim::new_1d(THREADS),
-            ArrayArg::from_raw_parts(g_h, g.len()),
-            ArrayArg::from_raw_parts(xi_h, xi.len()),
-            ArrayArg::from_raw_parts(pp_h, p_parts.len()),
-            ArrayArg::from_raw_parts(out_h.clone(), n),
-            width,
-        );
-    }
-
-    let bytes = client.read_one(out_h).unwrap();
-    u32::from_bytes(&bytes).to_vec()
 }
 
 /// Assemble one `(admissible matrix, term)` product and XOR its F₂ output bit into
@@ -1098,51 +1007,6 @@ fn multiply_pair(
     }
 }
 
-/// Multiply `Sq(R) · s` for a single fixed operation `R` into one F₂ output vector.
-/// One thread per `(matrix, term)` pair; delegates the assembly to `multiply_pair`.
-#[cfg(test)]
-#[cube(launch)]
-#[allow(clippy::too_many_arguments)]
-fn multiply_single_r_kernel(
-    col_sums: &Array<u16>,
-    masks: &Array<u16>,
-    term_pparts: &Array<u16>,
-    term_lens: &Array<u32>,
-    g: &Array<u32>,
-    xi: &Array<u32>,
-    out: &mut Array<Atomic<u32>>,
-    num_terms: usize,
-    num_matrices: usize,
-    cs_len: usize,
-    mk_len: usize,
-    width: usize,
-) {
-    let pair = ABSOLUTE_POS;
-    if pair >= num_matrices * num_terms {
-        terminate!();
-    }
-    let m = pair / num_terms;
-    let t = pair % num_terms;
-    let term_len = usize::cast_from(term_lens[t]);
-    multiply_pair(
-        col_sums,
-        masks,
-        term_pparts,
-        g,
-        xi,
-        out,
-        m * cs_len,
-        m * mk_len,
-        t * width,
-        term_len,
-        cs_len,
-        mk_len,
-        0,
-        0,
-        width,
-    );
-}
-
 /// Batched multiply: one launch covering all `(R, s)` products of (e.g.) a
 /// `get_partial_matrix` call. One thread per `(product, matrix, term)` pair.
 ///
@@ -1176,22 +1040,70 @@ fn multiply_single_r_kernel(
 #[cube(launch_unchecked, address_type = "u64")]
 #[allow(clippy::too_many_arguments)]
 fn multiply_batch_kernel(
-    cs0: &Array<u16>, cs1: &Array<u16>, cs2: &Array<u16>, cs3: &Array<u16>,
-    cs4: &Array<u16>, cs5: &Array<u16>, cs6: &Array<u16>, cs7: &Array<u16>,
-    cs8: &Array<u16>, cs9: &Array<u16>, cs10: &Array<u16>, cs11: &Array<u16>,
-    cs12: &Array<u16>, cs13: &Array<u16>, cs14: &Array<u16>, cs15: &Array<u16>,
-    mk0: &Array<u16>, mk1: &Array<u16>, mk2: &Array<u16>, mk3: &Array<u16>,
-    mk4: &Array<u16>, mk5: &Array<u16>, mk6: &Array<u16>, mk7: &Array<u16>,
-    mk8: &Array<u16>, mk9: &Array<u16>, mk10: &Array<u16>, mk11: &Array<u16>,
-    mk12: &Array<u16>, mk13: &Array<u16>, mk14: &Array<u16>, mk15: &Array<u16>,
-    pp0: &Array<u16>, pp1: &Array<u16>, pp2: &Array<u16>, pp3: &Array<u16>,
-    pp4: &Array<u16>, pp5: &Array<u16>, pp6: &Array<u16>, pp7: &Array<u16>,
-    pp8: &Array<u16>, pp9: &Array<u16>, pp10: &Array<u16>, pp11: &Array<u16>,
-    pp12: &Array<u16>, pp13: &Array<u16>, pp14: &Array<u16>, pp15: &Array<u16>,
-    ln0: &Array<u32>, ln1: &Array<u32>, ln2: &Array<u32>, ln3: &Array<u32>,
-    ln4: &Array<u32>, ln5: &Array<u32>, ln6: &Array<u32>, ln7: &Array<u32>,
-    ln8: &Array<u32>, ln9: &Array<u32>, ln10: &Array<u32>, ln11: &Array<u32>,
-    ln12: &Array<u32>, ln13: &Array<u32>, ln14: &Array<u32>, ln15: &Array<u32>,
+    cs0: &Array<u16>,
+    cs1: &Array<u16>,
+    cs2: &Array<u16>,
+    cs3: &Array<u16>,
+    cs4: &Array<u16>,
+    cs5: &Array<u16>,
+    cs6: &Array<u16>,
+    cs7: &Array<u16>,
+    cs8: &Array<u16>,
+    cs9: &Array<u16>,
+    cs10: &Array<u16>,
+    cs11: &Array<u16>,
+    cs12: &Array<u16>,
+    cs13: &Array<u16>,
+    cs14: &Array<u16>,
+    cs15: &Array<u16>,
+    mk0: &Array<u16>,
+    mk1: &Array<u16>,
+    mk2: &Array<u16>,
+    mk3: &Array<u16>,
+    mk4: &Array<u16>,
+    mk5: &Array<u16>,
+    mk6: &Array<u16>,
+    mk7: &Array<u16>,
+    mk8: &Array<u16>,
+    mk9: &Array<u16>,
+    mk10: &Array<u16>,
+    mk11: &Array<u16>,
+    mk12: &Array<u16>,
+    mk13: &Array<u16>,
+    mk14: &Array<u16>,
+    mk15: &Array<u16>,
+    pp0: &Array<u16>,
+    pp1: &Array<u16>,
+    pp2: &Array<u16>,
+    pp3: &Array<u16>,
+    pp4: &Array<u16>,
+    pp5: &Array<u16>,
+    pp6: &Array<u16>,
+    pp7: &Array<u16>,
+    pp8: &Array<u16>,
+    pp9: &Array<u16>,
+    pp10: &Array<u16>,
+    pp11: &Array<u16>,
+    pp12: &Array<u16>,
+    pp13: &Array<u16>,
+    pp14: &Array<u16>,
+    pp15: &Array<u16>,
+    ln0: &Array<u32>,
+    ln1: &Array<u32>,
+    ln2: &Array<u32>,
+    ln3: &Array<u32>,
+    ln4: &Array<u32>,
+    ln5: &Array<u32>,
+    ln6: &Array<u32>,
+    ln7: &Array<u32>,
+    ln8: &Array<u32>,
+    ln9: &Array<u32>,
+    ln10: &Array<u32>,
+    ln11: &Array<u32>,
+    ln12: &Array<u32>,
+    ln13: &Array<u32>,
+    ln14: &Array<u32>,
+    ln15: &Array<u32>,
     term_gei: &Array<u32>,
     g: &Array<u32>,
     xi: &Array<u32>,
@@ -1252,9 +1164,8 @@ fn multiply_batch_kernel(
     let mk_off = usize::cast_from(r_mk_offset[ri]) + m * mk_len;
     let pp_off = gei * width;
     let term_len = usize::cast_from(seg_read_u32(
-        ln0, ln1, ln2, ln3, ln4, ln5, ln6, ln7,
-        ln8, ln9, ln10, ln11, ln12, ln13, ln14, ln15,
-        gei, seg_elems,
+        ln0, ln1, ln2, ln3, ln4, ln5, ln6, ln7, ln8, ln9, ln10, ln11, ln12, ln13, ln14, ln15, gei,
+        seg_elems,
     ));
 
     // Gather this thread's matrix / term out of the segmented stores into contiguous locals, then run
@@ -1268,27 +1179,72 @@ fn multiply_batch_kernel(
         let mut c = 0u16;
         if j < cs_len {
             c = seg_read_u16(
-                cs0, cs1, cs2, cs3, cs4, cs5, cs6, cs7,
-                cs8, cs9, cs10, cs11, cs12, cs13, cs14, cs15,
-                cs_off + j, seg_elems,
+                cs0,
+                cs1,
+                cs2,
+                cs3,
+                cs4,
+                cs5,
+                cs6,
+                cs7,
+                cs8,
+                cs9,
+                cs10,
+                cs11,
+                cs12,
+                cs13,
+                cs14,
+                cs15,
+                cs_off + j,
+                seg_elems,
             );
         }
         cs_local[j] = c;
         let mut mm = 0u16;
         if j < mk_len {
             mm = seg_read_u16(
-                mk0, mk1, mk2, mk3, mk4, mk5, mk6, mk7,
-                mk8, mk9, mk10, mk11, mk12, mk13, mk14, mk15,
-                mk_off + j, seg_elems,
+                mk0,
+                mk1,
+                mk2,
+                mk3,
+                mk4,
+                mk5,
+                mk6,
+                mk7,
+                mk8,
+                mk9,
+                mk10,
+                mk11,
+                mk12,
+                mk13,
+                mk14,
+                mk15,
+                mk_off + j,
+                seg_elems,
             );
         }
         mk_local[j] = mm;
         let mut b = 0u16;
         if j < term_len {
             b = seg_read_u16(
-                pp0, pp1, pp2, pp3, pp4, pp5, pp6, pp7,
-                pp8, pp9, pp10, pp11, pp12, pp13, pp14, pp15,
-                pp_off + j, seg_elems,
+                pp0,
+                pp1,
+                pp2,
+                pp3,
+                pp4,
+                pp5,
+                pp6,
+                pp7,
+                pp8,
+                pp9,
+                pp10,
+                pp11,
+                pp12,
+                pp13,
+                pp14,
+                pp15,
+                pp_off + j,
+                seg_elems,
             );
         }
         term_local[j] = b;
@@ -1311,102 +1267,6 @@ fn multiply_batch_kernel(
         usize::cast_from(prod_out_offset[p]),
         width,
     );
-}
-
-/// Compute `Sq(R) · s` on the GPU for a single operation `R = (r_degree, r_idx)`,
-/// returning the F₂ result as bit-packed `u32` limbs (bit `i` = basis index `i`).
-///
-/// `term_indices` are the nonzero indices of `s` in the degree-`s_degree` basis.
-/// `R` must be non-empty (`Sq(∅) = 1` is the trivial identity the caller handles).
-/// Requires the algebra's basis and seqno tables built through `r_degree + s_degree`.
-#[cfg(test)]
-pub fn multiply_single_r_on_gpu(
-    algebra: &MilnorAlgebra,
-    r_degree: i32,
-    r_idx: usize,
-    s_degree: i32,
-    term_indices: &[usize],
-) -> Vec<u32> {
-    let (width, g) = algebra.seqno_table_u32();
-    // Pad `xi` to `WORKING_CAP` so the kernel's `cur_d` sum (which runs to the full
-    // working capacity) never reads out of bounds; padding entries multiply zero.
-    let mut xi: Vec<u32> = xi_degrees(algebra.prime())
-        .iter()
-        .map(|&x| x as u32)
-        .collect();
-    xi.resize(WORKING_CAP, 0);
-
-    let r = algebra.basis_element_from_index(r_degree, r_idx);
-    assert!(
-        !r.p_part.is_empty(),
-        "R must be non-empty (Sq(∅) = 1 is the identity)"
-    );
-    let (cs_len, mk_len, cs32, mk32) = algebra.admissible_matrices(&r.p_part);
-    // Ship admissible-matrix / term data as u16 (see `multiply_batch_on_gpu`).
-    let mut col_sums: Vec<u16> = cs32.iter().map(|&v| narrow_u16(v)).collect();
-    let masks: Vec<u16> = mk32.iter().map(|&v| narrow_u16(v)).collect();
-    let num_matrices = masks.len() / mk_len;
-
-    // Terms of s, each p_part padded to `width`, with their true (trimmed) lengths.
-    let num_terms = term_indices.len();
-    let mut term_pparts = vec![0u16; num_terms * width];
-    let mut term_lens = vec![0u32; num_terms];
-    for (t, &ti) in term_indices.iter().enumerate() {
-        let elt = algebra.basis_element_from_index(s_degree, ti);
-        term_lens[t] = elt.p_part.len() as u32;
-        for (slot, &v) in term_pparts[t * width..(t + 1) * width]
-            .iter_mut()
-            .zip(&elt.p_part)
-        {
-            *slot = narrow_u16(v);
-        }
-    }
-
-    let out_degree = r_degree + s_degree;
-    let dim = algebra.dimension(out_degree);
-    let num_limbs = dim.div_ceil(32).max(1);
-
-    // Device buffers must be non-empty; `cs_len == 0` (R's max entry is 1) leaves
-    // `col_sums` empty. The kernel never reads past the real lengths.
-    if col_sums.is_empty() {
-        col_sums.push(0);
-    }
-
-    let client = CudaRuntime::client(&CudaDevice::default());
-    let cs_h = client.create_from_slice(u16::as_bytes(&col_sums));
-    let mk_h = client.create_from_slice(u16::as_bytes(&masks));
-    let tp_h = client.create_from_slice(u16::as_bytes(&term_pparts));
-    let tl_h = client.create_from_slice(u32::as_bytes(&term_lens));
-    let g_h = client.create_from_slice(u32::as_bytes(&g));
-    let xi_h = client.create_from_slice(u32::as_bytes(&xi));
-    let zeros = vec![0u32; num_limbs];
-    let out_h = client.create_from_slice(u32::as_bytes(&zeros));
-
-    let total_pairs = num_matrices * num_terms;
-    const THREADS: u32 = 256;
-    let cubes = (total_pairs as u32).div_ceil(THREADS).max(1);
-    unsafe {
-        multiply_single_r_kernel::launch::<CudaRuntime>(
-            &client,
-            CubeCount::Static(cubes, 1, 1),
-            CubeDim::new_1d(THREADS),
-            ArrayArg::from_raw_parts(cs_h, col_sums.len()),
-            ArrayArg::from_raw_parts(mk_h, masks.len()),
-            ArrayArg::from_raw_parts(tp_h, term_pparts.len()),
-            ArrayArg::from_raw_parts(tl_h, term_lens.len()),
-            ArrayArg::from_raw_parts(g_h, g.len()),
-            ArrayArg::from_raw_parts(xi_h, xi.len()),
-            ArrayArg::from_raw_parts(out_h.clone(), num_limbs),
-            num_terms,
-            num_matrices,
-            cs_len,
-            mk_len,
-            width,
-        );
-    }
-
-    let bytes = client.read_one(out_h).unwrap();
-    u32::from_bytes(&bytes).to_vec()
 }
 
 /// One `Sq(R) · s` product of a batched launch, written into output row `row` at bit
@@ -1474,8 +1334,7 @@ pub fn multiply_batch_on_gpu(
         if rows.is_empty() {
             continue;
         }
-        let remap: HashMap<usize, usize> =
-            rows.iter().enumerate().map(|(i, &r)| (r, i)).collect();
+        let remap: HashMap<usize, usize> = rows.iter().enumerate().map(|(i, &r)| (r, i)).collect();
         let compact: Vec<GpuProduct> = products
             .iter()
             .filter(|p| is_group(p.r_degree))
@@ -1750,7 +1609,10 @@ fn multiply_batch_block(
                     .map(|&x| u32::BITS - x.leading_zeros())
                     .max()
                     .unwrap();
-                debug_assert_eq!((cs_len, mk_len), (cols - 1, r.p_part.len() as u32 + cols - 1));
+                debug_assert_eq!(
+                    (cs_len, mk_len),
+                    (cols - 1, r.p_part.len() as u32 + cols - 1)
+                );
                 enum_rows.push(r.p_part.len() as u32);
                 enum_cols.push(cols);
                 enum_pp_rows.push(r.p_part.clone());
@@ -1819,8 +1681,8 @@ fn multiply_batch_block(
         let kb = |n: usize, sz: usize| n * sz / 1024;
         eprintln!(
             "[gpu-batch] rows={num_rows} cols={num_cols} products={} total_pairs={total_pairs} \
-             out_len={out_len} | UPLOAD-KB: g={} xi={} term_gei={} \
-             prod_arrays={} pps={} | resident cs={} mk={} basis_elems={need_basis_elems}",
+             out_len={out_len} | UPLOAD-KB: g={} xi={} term_gei={} prod_arrays={} pps={} | \
+             resident cs={} mk={} basis_elems={need_basis_elems}",
             products.len(),
             kb(g.len(), 4),
             kb(xi.len(), 4),
@@ -1870,14 +1732,20 @@ fn multiply_batch_block(
         let dummy16 = client.create_from_slice(u16::as_bytes(&[0u16]));
         let dummy32 = client.create_from_slice(u32::as_bytes(&[0u32]));
         let pad_u16 = |mut v: Vec<(Handle, usize)>| -> Vec<(Handle, usize)> {
-            assert!(v.len() <= MASTER_MAX_SEG, "segment count exceeds MASTER_MAX_SEG");
+            assert!(
+                v.len() <= MASTER_MAX_SEG,
+                "segment count exceeds MASTER_MAX_SEG"
+            );
             while v.len() < MASTER_MAX_SEG {
                 v.push((dummy16.clone(), 1));
             }
             v
         };
         let pad_u32 = |mut v: Vec<(Handle, usize)>| -> Vec<(Handle, usize)> {
-            assert!(v.len() <= MASTER_MAX_SEG, "segment count exceeds MASTER_MAX_SEG");
+            assert!(
+                v.len() <= MASTER_MAX_SEG,
+                "segment count exceeds MASTER_MAX_SEG"
+            );
             while v.len() < MASTER_MAX_SEG {
                 v.push((dummy32.clone(), 1));
             }
@@ -1892,8 +1760,14 @@ fn multiply_batch_block(
         let (cs_seg, mk_seg) = match mode {
             MasterMode::Resident => {
                 let (cs_segs, _) = seg_grow!(
-                    client, RESIDENT_DEV, cs, RESIDENT_UPLOAD, need_cs,
-                    copy_into_u16, u16::as_bytes, u16,
+                    client,
+                    RESIDENT_DEV,
+                    cs,
+                    RESIDENT_UPLOAD,
+                    need_cs,
+                    copy_into_u16,
+                    u16::as_bytes,
+                    u16,
                     |_up: usize| {
                         let mut h = RESIDENT_HOST.write().unwrap();
                         let nl = h.cs_len;
@@ -1901,8 +1775,14 @@ fn multiply_batch_block(
                     }
                 );
                 let (mk_segs, _) = seg_grow!(
-                    client, RESIDENT_DEV, mk, RESIDENT_UPLOAD, need_mk,
-                    copy_into_u16, u16::as_bytes, u16,
+                    client,
+                    RESIDENT_DEV,
+                    mk,
+                    RESIDENT_UPLOAD,
+                    need_mk,
+                    copy_into_u16,
+                    u16::as_bytes,
+                    u16,
                     |_up: usize| {
                         let mut h = RESIDENT_HOST.write().unwrap();
                         let nl = h.mk_len;
@@ -1949,7 +1829,10 @@ fn multiply_batch_block(
                         n_cold,
                     );
                 }
-                (pad_u16(vec![(cs_scratch, cs_cap)]), pad_u16(vec![(mk_scratch, mk_cap)]))
+                (
+                    pad_u16(vec![(cs_scratch, cs_cap)]),
+                    pad_u16(vec![(mk_scratch, mk_cap)]),
+                )
             }
         };
         // Resident basis segments (default) or per-launch passthrough buffers (A/B diagnostic) bound
@@ -1968,8 +1851,14 @@ fn multiply_batch_block(
             )
         } else {
             let (pp_segs, _) = seg_grow!(
-                client, RESIDENT_BASIS_DEV, pp, RESIDENT_BASIS_UPLOAD, need_basis_elems * width,
-                copy_into_u16, u16::as_bytes, u16,
+                client,
+                RESIDENT_BASIS_DEV,
+                pp,
+                RESIDENT_BASIS_UPLOAD,
+                need_basis_elems * width,
+                copy_into_u16,
+                u16::as_bytes,
+                u16,
                 |up: usize| {
                     let h = RESIDENT_BASIS_HOST.read().unwrap();
                     let nl = h.lens.len() * h.width;
@@ -1977,8 +1866,14 @@ fn multiply_batch_block(
                 }
             );
             let (ln_segs, _) = seg_grow!(
-                client, RESIDENT_BASIS_DEV, ln, RESIDENT_BASIS_UPLOAD, need_basis_elems,
-                copy_into_u32, u32::as_bytes, u32,
+                client,
+                RESIDENT_BASIS_DEV,
+                ln,
+                RESIDENT_BASIS_UPLOAD,
+                need_basis_elems,
+                copy_into_u32,
+                u32::as_bytes,
+                u32,
                 |up: usize| {
                     let h = RESIDENT_BASIS_HOST.read().unwrap();
                     let nl = h.lens.len();
@@ -2036,22 +1931,70 @@ fn multiply_batch_block(
                 &client,
                 CubeCount::Static(cubes, 1, 1),
                 CubeDim::new_1d(THREADS),
-                sa!(cs_seg, 0), sa!(cs_seg, 1), sa!(cs_seg, 2), sa!(cs_seg, 3),
-                sa!(cs_seg, 4), sa!(cs_seg, 5), sa!(cs_seg, 6), sa!(cs_seg, 7),
-                sa!(cs_seg, 8), sa!(cs_seg, 9), sa!(cs_seg, 10), sa!(cs_seg, 11),
-                sa!(cs_seg, 12), sa!(cs_seg, 13), sa!(cs_seg, 14), sa!(cs_seg, 15),
-                sa!(mk_seg, 0), sa!(mk_seg, 1), sa!(mk_seg, 2), sa!(mk_seg, 3),
-                sa!(mk_seg, 4), sa!(mk_seg, 5), sa!(mk_seg, 6), sa!(mk_seg, 7),
-                sa!(mk_seg, 8), sa!(mk_seg, 9), sa!(mk_seg, 10), sa!(mk_seg, 11),
-                sa!(mk_seg, 12), sa!(mk_seg, 13), sa!(mk_seg, 14), sa!(mk_seg, 15),
-                sa!(pp_seg, 0), sa!(pp_seg, 1), sa!(pp_seg, 2), sa!(pp_seg, 3),
-                sa!(pp_seg, 4), sa!(pp_seg, 5), sa!(pp_seg, 6), sa!(pp_seg, 7),
-                sa!(pp_seg, 8), sa!(pp_seg, 9), sa!(pp_seg, 10), sa!(pp_seg, 11),
-                sa!(pp_seg, 12), sa!(pp_seg, 13), sa!(pp_seg, 14), sa!(pp_seg, 15),
-                sa!(ln_seg, 0), sa!(ln_seg, 1), sa!(ln_seg, 2), sa!(ln_seg, 3),
-                sa!(ln_seg, 4), sa!(ln_seg, 5), sa!(ln_seg, 6), sa!(ln_seg, 7),
-                sa!(ln_seg, 8), sa!(ln_seg, 9), sa!(ln_seg, 10), sa!(ln_seg, 11),
-                sa!(ln_seg, 12), sa!(ln_seg, 13), sa!(ln_seg, 14), sa!(ln_seg, 15),
+                sa!(cs_seg, 0),
+                sa!(cs_seg, 1),
+                sa!(cs_seg, 2),
+                sa!(cs_seg, 3),
+                sa!(cs_seg, 4),
+                sa!(cs_seg, 5),
+                sa!(cs_seg, 6),
+                sa!(cs_seg, 7),
+                sa!(cs_seg, 8),
+                sa!(cs_seg, 9),
+                sa!(cs_seg, 10),
+                sa!(cs_seg, 11),
+                sa!(cs_seg, 12),
+                sa!(cs_seg, 13),
+                sa!(cs_seg, 14),
+                sa!(cs_seg, 15),
+                sa!(mk_seg, 0),
+                sa!(mk_seg, 1),
+                sa!(mk_seg, 2),
+                sa!(mk_seg, 3),
+                sa!(mk_seg, 4),
+                sa!(mk_seg, 5),
+                sa!(mk_seg, 6),
+                sa!(mk_seg, 7),
+                sa!(mk_seg, 8),
+                sa!(mk_seg, 9),
+                sa!(mk_seg, 10),
+                sa!(mk_seg, 11),
+                sa!(mk_seg, 12),
+                sa!(mk_seg, 13),
+                sa!(mk_seg, 14),
+                sa!(mk_seg, 15),
+                sa!(pp_seg, 0),
+                sa!(pp_seg, 1),
+                sa!(pp_seg, 2),
+                sa!(pp_seg, 3),
+                sa!(pp_seg, 4),
+                sa!(pp_seg, 5),
+                sa!(pp_seg, 6),
+                sa!(pp_seg, 7),
+                sa!(pp_seg, 8),
+                sa!(pp_seg, 9),
+                sa!(pp_seg, 10),
+                sa!(pp_seg, 11),
+                sa!(pp_seg, 12),
+                sa!(pp_seg, 13),
+                sa!(pp_seg, 14),
+                sa!(pp_seg, 15),
+                sa!(ln_seg, 0),
+                sa!(ln_seg, 1),
+                sa!(ln_seg, 2),
+                sa!(ln_seg, 3),
+                sa!(ln_seg, 4),
+                sa!(ln_seg, 5),
+                sa!(ln_seg, 6),
+                sa!(ln_seg, 7),
+                sa!(ln_seg, 8),
+                sa!(ln_seg, 9),
+                sa!(ln_seg, 10),
+                sa!(ln_seg, 11),
+                sa!(ln_seg, 12),
+                sa!(ln_seg, 13),
+                sa!(ln_seg, 14),
+                sa!(ln_seg, 15),
                 ArrayArg::from_raw_parts(tg_h, term_gei.len()),
                 ArrayArg::from_raw_parts(g_h, g.len()),
                 ArrayArg::from_raw_parts(xi_h, xi.len()),
@@ -2236,43 +2179,6 @@ fn seg_read_u32(
     v
 }
 
-/// Validation kernel for [`seg_read_u16`]: `out[i] = segmented[idx[i]]`. Lets a test assert the
-/// segmented read reproduces a contiguous buffer bit-for-bit (see `seg_read_matches_contiguous`).
-#[cfg(test)]
-#[cube(launch)]
-#[allow(clippy::too_many_arguments)]
-fn seg_gather_kernel(
-    s0: &Array<u16>,
-    s1: &Array<u16>,
-    s2: &Array<u16>,
-    s3: &Array<u16>,
-    s4: &Array<u16>,
-    s5: &Array<u16>,
-    s6: &Array<u16>,
-    s7: &Array<u16>,
-    s8: &Array<u16>,
-    s9: &Array<u16>,
-    s10: &Array<u16>,
-    s11: &Array<u16>,
-    s12: &Array<u16>,
-    s13: &Array<u16>,
-    s14: &Array<u16>,
-    s15: &Array<u16>,
-    idx: &Array<u32>,
-    out: &mut Array<u16>,
-    seg_elems: usize,
-) {
-    let i = ABSOLUTE_POS;
-    if i >= out.len() {
-        terminate!();
-    }
-    out[i] = seg_read_u16(
-        s0, s1, s2, s3, s4, s5, s6, s7, s8, s9, s10, s11, s12, s13, s14, s15,
-        usize::cast_from(idx[i]),
-        seg_elems,
-    );
-}
-
 /// In-kernel admissible-matrix enumeration: one thread per distinct `R`, generating that `R`'s
 /// `col_sums`/`masks` for *every* admissible matrix directly into device scratch — the on-GPU
 /// replacement for the resident/uploaded master (the stem-300 memory wall + the eviction re-upload
@@ -2437,409 +2343,706 @@ fn enumerate_admissible_kernel(
     out_counts[ri] = u32::cast_from(mat);
 }
 
-/// Backend-agnostic host driver for [`enumerate_admissible_kernel`]. Lays out each `R`'s scratch
-/// slot from the supplied per-`R` `num_mats` (a prefix-sum of `num_mats·cs_len` / `num_mats·mk_len`),
-/// uploads the compact per-`R` inputs, launches one thread per `R` on `device`, and reads back the
-/// packed `(out_cs, out_mk, counts)`. Generic over [`Runtime`] so the *same* kernel can be run on
-/// CUDA (the H200 path) and on the `cpu` backend — the cross-lowering check the caller uses to
-/// confirm the device semantics match [`enumerate_admissible_ref`] without needing a GPU.
-#[cfg(test)]
-fn enumerate_admissible_on_runtime<R: Runtime>(
-    device: &R::Device,
-    p_parts: &[Vec<u32>],
-    num_mats: &[u32],
-) -> (Vec<u16>, Vec<u16>, Vec<u32>) {
-    let n_r = p_parts.len();
-    let width = p_parts.iter().map(Vec::len).max().unwrap();
-
-    let mut pp_flat = vec![0u32; n_r * width];
-    let mut r_rows = vec![0u32; n_r];
-    let mut r_cols = vec![0u32; n_r];
-    let mut r_cs_out = vec![0u64; n_r];
-    let mut r_mk_out = vec![0u64; n_r];
-    let mut cs_total = 0u64;
-    let mut mk_total = 0u64;
-    for (i, pp) in p_parts.iter().enumerate() {
-        let rows = pp.len();
-        let cols = pp
-            .iter()
-            .map(|&x| (u32::BITS - x.leading_zeros()) as usize)
-            .max()
-            .unwrap();
-        let cs_len = (cols - 1) as u64;
-        let mk_len = (rows + cols - 1) as u64;
-        for (slot, &v) in pp_flat[i * width..i * width + rows].iter_mut().zip(pp) {
-            *slot = v;
-        }
-        r_rows[i] = rows as u32;
-        r_cols[i] = cols as u32;
-        r_cs_out[i] = cs_total;
-        r_mk_out[i] = mk_total;
-        cs_total += num_mats[i] as u64 * cs_len;
-        mk_total += num_mats[i] as u64 * mk_len;
-    }
-
-    let client = R::client(device);
-    let pp_h = client.create_from_slice(u32::as_bytes(&pp_flat));
-    let rr_h = client.create_from_slice(u32::as_bytes(&r_rows));
-    let rc_h = client.create_from_slice(u32::as_bytes(&r_cols));
-    let rco_h = client.create_from_slice(u64::as_bytes(&r_cs_out));
-    let rmo_h = client.create_from_slice(u64::as_bytes(&r_mk_out));
-    // `empty` needs a non-zero size even when a batch happens to have no matrices.
-    let cs_cap = (cs_total.max(1)) as usize;
-    let mk_cap = (mk_total.max(1)) as usize;
-    let ocs_h = client.empty(cs_cap * size_of::<u16>());
-    let omk_h = client.empty(mk_cap * size_of::<u16>());
-    let cnt_h = client.empty(n_r * size_of::<u32>());
-
-    const THREADS: u32 = 64;
-    let cubes = (n_r as u32).div_ceil(THREADS);
-    unsafe {
-        enumerate_admissible_kernel::launch_unchecked::<R>(
-            &client,
-            CubeCount::Static(cubes, 1, 1),
-            CubeDim::new_1d(THREADS),
-            ArrayArg::from_raw_parts(pp_h, pp_flat.len()),
-            ArrayArg::from_raw_parts(rr_h, n_r),
-            ArrayArg::from_raw_parts(rc_h, n_r),
-            ArrayArg::from_raw_parts(rco_h, n_r),
-            ArrayArg::from_raw_parts(rmo_h, n_r),
-            ArrayArg::from_raw_parts(ocs_h.clone(), cs_cap),
-            ArrayArg::from_raw_parts(omk_h.clone(), mk_cap),
-            ArrayArg::from_raw_parts(cnt_h.clone(), n_r),
-            width,
-            n_r,
-        );
-    }
-    // Truncate off the `max(1)` padding element present when a batch has zero col_sums / masks (an
-    // all-ones p_part gives `cs_len == 0`); the caller compares against the exact packed reference.
-    let mut cs = u16::from_bytes(&client.read_one(ocs_h).unwrap()).to_vec();
-    let mut mk = u16::from_bytes(&client.read_one(omk_h).unwrap()).to_vec();
-    cs.truncate(cs_total as usize);
-    mk.truncate(mk_total as usize);
-    let counts = u32::from_bytes(&client.read_one(cnt_h).unwrap()).to_vec();
-    (cs, mk, counts)
-}
-
-/// CPU reference for the planned *in-kernel* admissible-matrix enumeration — the direction that
-/// replaces the resident/uploaded master (the stem-300 memory wall + the eviction re-upload cost)
-/// by generating each `R`'s `col_sums`/`masks` ON THE GPU into a transient scratch buffer, never
-/// storing or uploading them. This reimplements [`MilnorAlgebra::admissible_matrices`] /
-/// `AdmissibleMatrix` using ONLY flag-guarded control flow — no `break`, `continue`, or early
-/// `return` — because that is the subset the cubecl DSL compiles cleanly (cf. `multiply_pair`,
-/// which tracks `rejected` rather than breaking). The eventual `#[cube]` kernel is then a mechanical
-/// transcription of this function onto per-thread local `Array`s (state is tiny: `rows = |p_part|`,
-/// `cols ≤ 32`). Returns the same `(cs_len, mk_len, col_sums, masks)` row-major flattening as
-/// `admissible_matrices`; `admissible_enum_ref_matches` asserts bit-exact equivalence over every
-/// real `R` up to degree 60, validating the flag-based restructuring before the hard-to-debug port.
-#[cfg(test)]
-fn enumerate_admissible_ref(p_part: &[u32]) -> (usize, usize, Vec<u32>, Vec<u32>) {
-    let rows = p_part.len();
-    let cols = p_part
-        .iter()
-        .map(|&x| (u32::BITS - x.leading_zeros()) as usize)
-        .max()
-        .unwrap();
-    let cs_len = cols - 1;
-    let mk_len = rows + cols - 1;
-
-    // State mirrors `AdmissibleMatrix`: `matrix` row-major `rows*cols` (column 0 = `p_part`),
-    // `totals[rows]`, `col_sums[cs_len]`, `masks[mk_len]` (masks starts as the padded `p_part`).
-    let mut matrix = vec![0u32; rows * cols];
-    for (i, &x) in p_part.iter().enumerate() {
-        matrix[i * cols] = x;
-    }
-    let mut totals = vec![0u32; rows];
-    let mut col_sums = vec![0u32; cs_len];
-    let mut masks = vec![0u32; mk_len];
-    for (i, &x) in p_part.iter().enumerate() {
-        masks[i] = x;
-    }
-
-    let mut out_cs: Vec<u32> = Vec::new();
-    let mut out_mk: Vec<u32> = Vec::new();
-
-    // Emit the current matrix, then advance; `more` is `AdmissibleMatrix::next`'s return value.
-    let mut more = true;
-    while more {
-        out_cs.extend_from_slice(&col_sums);
-        out_mk.extend_from_slice(&masks);
-
-        // One `next()` step, flag-based: `found` = "produced a new matrix" (the original's
-        // `return true`); `handled` = "this column already updated `totals`" (the original's
-        // `continue 'mid`, which skips the trailing add). Loops are guarded by `!found` instead
-        // of breaking.
-        let mut found = false;
-        let mut row = 0;
-        while row < rows && !found {
-            let mut p_to_the_j: u32 = 1;
-            totals[row] = matrix[row * cols]; // get(row, 0)
-            let mut col = 1;
-            while col < cols && !found {
-                p_to_the_j *= 2;
-                let mut handled = false;
-                if p_to_the_j <= totals[row] {
-                    // Bitsum along the anti-diagonal to the bottom-left.
-                    let mut d = 0u32;
-                    let mut c = (row + col + 1).saturating_sub(rows);
-                    while c < col {
-                        d |= matrix[(row + col - c) * cols + c];
-                        c += 1;
-                    }
-                    let cur = matrix[row * cols + col];
-                    let new_entry = ((cur | d) + 1) & !d;
-                    let inc = new_entry - cur;
-                    let sub = inc * p_to_the_j;
-                    if totals[row] < sub {
-                        totals[row] += p_to_the_j * cur;
-                        handled = true;
-                    } else {
-                        matrix[row * cols] = totals[row] - sub; // set(row, 0, ..)
-                        masks[row] = matrix[row * cols];
-                        col_sums[col - 1] += inc;
-                        let mut j = 1;
-                        while j < col {
-                            masks[row + j] &= !matrix[row * cols + j];
-                            col_sums[j - 1] -= matrix[row * cols + j];
-                            matrix[row * cols + j] = 0;
-                            j += 1;
-                        }
-                        matrix[row * cols + col] = new_entry;
-                        let mut i = 0;
-                        while i < row {
-                            matrix[i * cols] = totals[i];
-                            masks[i] = totals[i];
-                            let mut j = 1;
-                            while j < cols {
-                                if i + j > row {
-                                    masks[i + j] &= !matrix[i * cols + j];
-                                }
-                                col_sums[j - 1] -= matrix[i * cols + j];
-                                matrix[i * cols + j] = 0;
-                                j += 1;
-                            }
-                            i += 1;
-                        }
-                        masks[row + col] = d | new_entry;
-                        found = true;
-                        handled = true;
-                    }
-                }
-                if !handled {
-                    totals[row] += p_to_the_j * matrix[row * cols + col];
-                }
-                col += 1;
-            }
-            row += 1;
-        }
-        more = found;
-    }
-
-    (cs_len, mk_len, out_cs, out_mk)
-}
-
-/// Host driver for [`seg_gather_kernel`]: splits `data` into ≤ [`MASTER_MAX_SEG`] segments of
-/// `seg_elems`, uploads each as its own device buffer (no contiguous copy — the whole point), and
-/// returns `data[idx[i]]` gathered through the segmented read. Unused segments get a 1-element dummy
-/// (never indexed). Proves the segmented master reads identically to a contiguous one.
-#[cfg(test)]
-fn seg_gather_on_gpu(data: &[u16], seg_elems: usize, indices: &[u32]) -> Vec<u16> {
-    let n = data.len();
-    let nseg = n.div_ceil(seg_elems).max(1);
-    assert!(nseg <= MASTER_MAX_SEG, "prototype caps at {MASTER_MAX_SEG} segments");
-    let client = CudaRuntime::client(&CudaDevice::default());
-
-    // One handle per segment slot; real segments hold their slice, unused slots a 1-elem dummy.
-    let dummy = [0u16];
-    let mut handles = Vec::with_capacity(MASTER_MAX_SEG);
-    let mut lens = Vec::with_capacity(MASTER_MAX_SEG);
-    for s in 0..MASTER_MAX_SEG {
-        let lo = s * seg_elems;
-        if lo < n {
-            let hi = (lo + seg_elems).min(n);
-            handles.push(client.create_from_slice(u16::as_bytes(&data[lo..hi])));
-            lens.push(hi - lo);
-        } else {
-            handles.push(client.create_from_slice(u16::as_bytes(&dummy)));
-            lens.push(1);
-        }
-    }
-    let idx_h = client.create_from_slice(u32::as_bytes(indices));
-    let out_h = client.empty(indices.len() * size_of::<u16>());
-
-    const THREADS: u32 = 256;
-    let cubes = (indices.len() as u32).div_ceil(THREADS).max(1);
-    let arg = |i: usize| unsafe { ArrayArg::from_raw_parts(handles[i].clone(), lens[i]) };
-    unsafe {
-        seg_gather_kernel::launch::<CudaRuntime>(
-            &client,
-            CubeCount::Static(cubes, 1, 1),
-            CubeDim::new_1d(THREADS),
-            arg(0),
-            arg(1),
-            arg(2),
-            arg(3),
-            arg(4),
-            arg(5),
-            arg(6),
-            arg(7),
-            arg(8),
-            arg(9),
-            arg(10),
-            arg(11),
-            arg(12),
-            arg(13),
-            arg(14),
-            arg(15),
-            ArrayArg::from_raw_parts(idx_h, indices.len()),
-            ArrayArg::from_raw_parts(out_h.clone(), indices.len()),
-            seg_elems,
-        );
-    }
-    u16::from_bytes(&client.read_one(out_h).unwrap()).to_vec()
-}
-
-/// Shared body for the per-backend enumeration tests: builds a batch of every real `R` up to
-/// `max_degree`, computes the expected packed `col_sums`/`masks` (and per-`R` `num_mats`) from the
-/// CPU-validated [`enumerate_admissible_ref`], runs [`enumerate_admissible_kernel`] on `R`'s
-/// `device`, and asserts the device output is bit-exact — values *and* per-`R` counts. Generic so
-/// CUDA (H200) and the `cpu` backend run the identical kernel through it.
-#[cfg(test)]
-fn check_enum_backend<Rt: Runtime>(device: &Rt::Device, max_degree: i32) {
-    use fp::prime::ValidPrime;
-
-    let p = ValidPrime::new(2);
-    let algebra = MilnorAlgebra::new(p, false);
-    algebra.compute_basis(max_degree);
-
-    // Process one degree per launch. At high degree the full master is tens of GB, so batching every
-    // R together would OOM the host; per-degree keeps the expected arrays bounded AND pinpoints the
-    // exact degree if the device lowering ever diverges from the CPU reference.
-    let mut total_r = 0usize;
-    let mut total_mats = 0u64;
-    for deg in 1..=max_degree {
-        let mut p_parts: Vec<Vec<u32>> = Vec::new();
-        let mut num_mats: Vec<u32> = Vec::new();
-        let mut exp_cs: Vec<u16> = Vec::new();
-        let mut exp_mk: Vec<u16> = Vec::new();
-        for idx in 0..algebra.dimension(deg) {
-            let pp = algebra.basis_element_from_index(deg, idx).p_part.clone();
-            if pp.is_empty() {
-                continue;
-            }
-            let (_cs_len, mk_len, cs, mk) = enumerate_admissible_ref(&pp);
-            // `mk_len = rows+cols-1 ≥ 1` always, so it recovers the matrix count even when
-            // `cs_len == 0` (an all-ones p_part contributes no col_sums).
-            num_mats.push((mk.len() / mk_len) as u32);
-            exp_cs.extend(cs.iter().map(|&v| narrow_u16(v)));
-            exp_mk.extend(mk.iter().map(|&v| narrow_u16(v)));
-            p_parts.push(pp);
-        }
-        if p_parts.is_empty() {
-            continue;
-        }
-        let (got_cs, got_mk, counts) =
-            enumerate_admissible_on_runtime::<Rt>(device, &p_parts, &num_mats);
-        assert_eq!(counts, num_mats, "per-R matrix counts diverged at degree {deg}");
-        assert_eq!(got_cs, exp_cs, "device col_sums diverged at degree {deg}");
-        assert_eq!(got_mk, exp_mk, "device masks diverged at degree {deg}");
-        total_r += p_parts.len();
-        total_mats += num_mats.iter().map(|&m| m as u64).sum::<u64>();
-    }
-    assert!(total_r > 0, "no R's exercised");
-    eprintln!(
-        "enum backend: {total_r} R's, {total_mats} matrices bit-exact vs enumerate_admissible_ref \
-         (degrees 1..={max_degree})"
-    );
-}
-
-/// Time one enumeration launch on `device`, split into (marshal+upload, kernel, full readback).
-/// `kernel` reads only the tiny `counts` buffer to force a stream sync (so it captures kernel wall
-/// time without the big transfer); `readback` then pulls the full `col_sums`/`masks`. Used by
-/// `bench_admissible_cpu_vs_gpu` — production never reads the arrays back (the multiply consumes the
-/// scratch on-device), so `kernel` is the production-relevant cost and `readback` is bench-only.
-#[cfg(test)]
-fn enum_launch_timed<R: Runtime>(
-    device: &R::Device,
-    p_parts: &[Vec<u32>],
-    num_mats: &[u32],
-) -> (f64, f64, f64) {
-    use std::time::Instant;
-    let n_r = p_parts.len();
-    let width = p_parts.iter().map(Vec::len).max().unwrap();
-
-    let t_marshal = Instant::now();
-    let mut pp_flat = vec![0u32; n_r * width];
-    let mut r_rows = vec![0u32; n_r];
-    let mut r_cols = vec![0u32; n_r];
-    let mut r_cs_out = vec![0u64; n_r];
-    let mut r_mk_out = vec![0u64; n_r];
-    let (mut cs_total, mut mk_total) = (0u64, 0u64);
-    for (i, pp) in p_parts.iter().enumerate() {
-        let rows = pp.len();
-        let cols = pp
-            .iter()
-            .map(|&x| (u32::BITS - x.leading_zeros()) as usize)
-            .max()
-            .unwrap();
-        for (slot, &v) in pp_flat[i * width..i * width + rows].iter_mut().zip(pp) {
-            *slot = v;
-        }
-        r_rows[i] = rows as u32;
-        r_cols[i] = cols as u32;
-        r_cs_out[i] = cs_total;
-        r_mk_out[i] = mk_total;
-        cs_total += num_mats[i] as u64 * (cols - 1) as u64;
-        mk_total += num_mats[i] as u64 * (rows + cols - 1) as u64;
-    }
-    let client = R::client(device);
-    let pp_h = client.create_from_slice(u32::as_bytes(&pp_flat));
-    let rr_h = client.create_from_slice(u32::as_bytes(&r_rows));
-    let rc_h = client.create_from_slice(u32::as_bytes(&r_cols));
-    let rco_h = client.create_from_slice(u64::as_bytes(&r_cs_out));
-    let rmo_h = client.create_from_slice(u64::as_bytes(&r_mk_out));
-    let cs_cap = cs_total.max(1) as usize;
-    let mk_cap = mk_total.max(1) as usize;
-    let ocs_h = client.empty(cs_cap * size_of::<u16>());
-    let omk_h = client.empty(mk_cap * size_of::<u16>());
-    let cnt_h = client.empty(n_r * size_of::<u32>());
-    let marshal_s = t_marshal.elapsed().as_secs_f64();
-
-    const THREADS: u32 = 64;
-    let cubes = (n_r as u32).div_ceil(THREADS);
-    let t_kernel = Instant::now();
-    unsafe {
-        enumerate_admissible_kernel::launch_unchecked::<R>(
-            &client,
-            CubeCount::Static(cubes, 1, 1),
-            CubeDim::new_1d(THREADS),
-            ArrayArg::from_raw_parts(pp_h, pp_flat.len()),
-            ArrayArg::from_raw_parts(rr_h, n_r),
-            ArrayArg::from_raw_parts(rc_h, n_r),
-            ArrayArg::from_raw_parts(rco_h, n_r),
-            ArrayArg::from_raw_parts(rmo_h, n_r),
-            ArrayArg::from_raw_parts(ocs_h.clone(), cs_cap),
-            ArrayArg::from_raw_parts(omk_h.clone(), mk_cap),
-            ArrayArg::from_raw_parts(cnt_h.clone(), n_r),
-            width,
-            n_r,
-        );
-    }
-    // Reading the tiny counts buffer blocks until the kernel completes: kernel wall time, ~no transfer.
-    let _ = client.read_one(cnt_h).unwrap();
-    let kernel_s = t_kernel.elapsed().as_secs_f64();
-
-    let t_read = Instant::now();
-    let _ = client.read_one(ocs_h).unwrap();
-    let _ = client.read_one(omk_h).unwrap();
-    let readback_s = t_read.elapsed().as_secs_f64();
-
-    (marshal_s, kernel_s, readback_s)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Elementwise F₂ addition of two bit-packed vectors: `out[i] = a[i] ^ b[i]`.
+    ///
+    /// One thread per `u32` limb. F₂ addition is XOR of the packed limbs, so this is
+    /// the output primitive the multiply kernels accumulate with.
+    #[cube(launch)]
+    fn xor_f2(a: &Array<u32>, b: &Array<u32>, out: &mut Array<u32>) {
+        if ABSOLUTE_POS < out.len() {
+            out[ABSOLUTE_POS] = a[ABSOLUTE_POS] ^ b[ABSOLUTE_POS];
+        }
+    }
+
+    /// Compute `a ^ b` limb-wise on the default CUDA device.
+    ///
+    /// Host-side driver for `xor_f2`: uploads both operands, launches one thread per
+    /// limb, and reads the result back. Panics if the operands differ in length.
+    pub fn xor_f2_on_gpu(a: &[u32], b: &[u32]) -> Vec<u32> {
+        assert_eq!(a.len(), b.len(), "operands must have equal limb counts");
+        let n = a.len();
+        let client = CudaRuntime::client(&CudaDevice::default());
+
+        let a_handle = client.create_from_slice(u32::as_bytes(a));
+        let b_handle = client.create_from_slice(u32::as_bytes(b));
+        let out_handle = client.empty(std::mem::size_of_val(a));
+
+        // One 1-D block of `THREADS` units, enough blocks to cover every limb.
+        const THREADS: u32 = 256;
+        let cubes = (n as u32).div_ceil(THREADS);
+        unsafe {
+            xor_f2::launch::<CudaRuntime>(
+                &client,
+                CubeCount::Static(cubes, 1, 1),
+                CubeDim::new_1d(THREADS),
+                ArrayArg::from_raw_parts(a_handle, n),
+                ArrayArg::from_raw_parts(b_handle, n),
+                ArrayArg::from_raw_parts(out_handle.clone(), n),
+            );
+        }
+
+        let bytes = client.read_one(out_handle).unwrap();
+        u32::from_bytes(&bytes).to_vec()
+    }
+
+    /// One thread per padded p_part: `out[i] = seqno(p_parts[i])`. `p_parts` is
+    /// `n × width` row-major, each row a p_part zero-padded to `width` (padding entries
+    /// are zero and skipped, so `wlen == width` matches the CPU's trimmed loop).
+    #[cube(launch)]
+    fn seqno_kernel(
+        g: &Array<u32>,
+        xi: &Array<u32>,
+        p_parts: &Array<u32>,
+        out: &mut Array<u32>,
+        width: usize,
+    ) {
+        let idx = ABSOLUTE_POS;
+        if idx >= out.len() {
+            terminate!();
+        }
+        let base = idx * width;
+
+        let mut working = Array::<u32>::new(MAX_XI_TAU);
+        for h in 0..width {
+            working[h] = p_parts[base + h];
+        }
+        out[idx] = seqno_core(g, xi, &working, width, width);
+    }
+
+    /// Run `seqno_kernel` over `n` padded p_parts and return their seqno indices.
+    ///
+    /// `g`/`xi` come from `MilnorAlgebra::seqno_table_u32` and
+    /// [`crate::algebra::combinatorics::xi_degrees`]; `p_parts` is `n × width` row-major,
+    /// each row a p_part zero-padded to `width`.
+    pub fn seqno_batch_on_gpu(
+        width: usize,
+        xi: &[u32],
+        g: &[u32],
+        p_parts: &[u32],
+        n: usize,
+    ) -> Vec<u32> {
+        assert_eq!(xi.len(), width, "xi must have `width` entries");
+        assert_eq!(p_parts.len(), n * width, "p_parts must be n × width");
+        let client = CudaRuntime::client(&CudaDevice::default());
+
+        let g_h = client.create_from_slice(u32::as_bytes(g));
+        let xi_h = client.create_from_slice(u32::as_bytes(xi));
+        let pp_h = client.create_from_slice(u32::as_bytes(p_parts));
+        let out_h = client.empty(n * size_of::<u32>());
+
+        const THREADS: u32 = 256;
+        let cubes = (n as u32).div_ceil(THREADS);
+        unsafe {
+            seqno_kernel::launch::<CudaRuntime>(
+                &client,
+                CubeCount::Static(cubes, 1, 1),
+                CubeDim::new_1d(THREADS),
+                ArrayArg::from_raw_parts(g_h, g.len()),
+                ArrayArg::from_raw_parts(xi_h, xi.len()),
+                ArrayArg::from_raw_parts(pp_h, p_parts.len()),
+                ArrayArg::from_raw_parts(out_h.clone(), n),
+                width,
+            );
+        }
+
+        let bytes = client.read_one(out_h).unwrap();
+        u32::from_bytes(&bytes).to_vec()
+    }
+
+    /// Multiply `Sq(R) · s` for a single fixed operation `R` into one F₂ output vector.
+    /// One thread per `(matrix, term)` pair; delegates the assembly to `multiply_pair`.
+    #[cube(launch)]
+    #[allow(clippy::too_many_arguments)]
+    fn multiply_single_r_kernel(
+        col_sums: &Array<u16>,
+        masks: &Array<u16>,
+        term_pparts: &Array<u16>,
+        term_lens: &Array<u32>,
+        g: &Array<u32>,
+        xi: &Array<u32>,
+        out: &mut Array<Atomic<u32>>,
+        num_terms: usize,
+        num_matrices: usize,
+        cs_len: usize,
+        mk_len: usize,
+        width: usize,
+    ) {
+        let pair = ABSOLUTE_POS;
+        if pair >= num_matrices * num_terms {
+            terminate!();
+        }
+        let m = pair / num_terms;
+        let t = pair % num_terms;
+        let term_len = usize::cast_from(term_lens[t]);
+        multiply_pair(
+            col_sums,
+            masks,
+            term_pparts,
+            g,
+            xi,
+            out,
+            m * cs_len,
+            m * mk_len,
+            t * width,
+            term_len,
+            cs_len,
+            mk_len,
+            0,
+            0,
+            width,
+        );
+    }
+
+    /// Compute `Sq(R) · s` on the GPU for a single operation `R = (r_degree, r_idx)`,
+    /// returning the F₂ result as bit-packed `u32` limbs (bit `i` = basis index `i`).
+    ///
+    /// `term_indices` are the nonzero indices of `s` in the degree-`s_degree` basis.
+    /// `R` must be non-empty (`Sq(∅) = 1` is the trivial identity the caller handles).
+    /// Requires the algebra's basis and seqno tables built through `r_degree + s_degree`.
+    pub fn multiply_single_r_on_gpu(
+        algebra: &MilnorAlgebra,
+        r_degree: i32,
+        r_idx: usize,
+        s_degree: i32,
+        term_indices: &[usize],
+    ) -> Vec<u32> {
+        let (width, g) = algebra.seqno_table_u32();
+        // Pad `xi` to `WORKING_CAP` so the kernel's `cur_d` sum (which runs to the full
+        // working capacity) never reads out of bounds; padding entries multiply zero.
+        let mut xi: Vec<u32> = xi_degrees(algebra.prime())
+            .iter()
+            .map(|&x| x as u32)
+            .collect();
+        xi.resize(WORKING_CAP, 0);
+
+        let r = algebra.basis_element_from_index(r_degree, r_idx);
+        assert!(
+            !r.p_part.is_empty(),
+            "R must be non-empty (Sq(∅) = 1 is the identity)"
+        );
+        let (cs_len, mk_len, cs32, mk32) = algebra.admissible_matrices(&r.p_part);
+        // Ship admissible-matrix / term data as u16 (see `multiply_batch_on_gpu`).
+        let mut col_sums: Vec<u16> = cs32.iter().map(|&v| narrow_u16(v)).collect();
+        let masks: Vec<u16> = mk32.iter().map(|&v| narrow_u16(v)).collect();
+        let num_matrices = masks.len() / mk_len;
+
+        // Terms of s, each p_part padded to `width`, with their true (trimmed) lengths.
+        let num_terms = term_indices.len();
+        let mut term_pparts = vec![0u16; num_terms * width];
+        let mut term_lens = vec![0u32; num_terms];
+        for (t, &ti) in term_indices.iter().enumerate() {
+            let elt = algebra.basis_element_from_index(s_degree, ti);
+            term_lens[t] = elt.p_part.len() as u32;
+            for (slot, &v) in term_pparts[t * width..(t + 1) * width]
+                .iter_mut()
+                .zip(&elt.p_part)
+            {
+                *slot = narrow_u16(v);
+            }
+        }
+
+        let out_degree = r_degree + s_degree;
+        let dim = algebra.dimension(out_degree);
+        let num_limbs = dim.div_ceil(32).max(1);
+
+        // Device buffers must be non-empty; `cs_len == 0` (R's max entry is 1) leaves
+        // `col_sums` empty. The kernel never reads past the real lengths.
+        if col_sums.is_empty() {
+            col_sums.push(0);
+        }
+
+        let client = CudaRuntime::client(&CudaDevice::default());
+        let cs_h = client.create_from_slice(u16::as_bytes(&col_sums));
+        let mk_h = client.create_from_slice(u16::as_bytes(&masks));
+        let tp_h = client.create_from_slice(u16::as_bytes(&term_pparts));
+        let tl_h = client.create_from_slice(u32::as_bytes(&term_lens));
+        let g_h = client.create_from_slice(u32::as_bytes(&g));
+        let xi_h = client.create_from_slice(u32::as_bytes(&xi));
+        let zeros = vec![0u32; num_limbs];
+        let out_h = client.create_from_slice(u32::as_bytes(&zeros));
+
+        let total_pairs = num_matrices * num_terms;
+        const THREADS: u32 = 256;
+        let cubes = (total_pairs as u32).div_ceil(THREADS).max(1);
+        unsafe {
+            multiply_single_r_kernel::launch::<CudaRuntime>(
+                &client,
+                CubeCount::Static(cubes, 1, 1),
+                CubeDim::new_1d(THREADS),
+                ArrayArg::from_raw_parts(cs_h, col_sums.len()),
+                ArrayArg::from_raw_parts(mk_h, masks.len()),
+                ArrayArg::from_raw_parts(tp_h, term_pparts.len()),
+                ArrayArg::from_raw_parts(tl_h, term_lens.len()),
+                ArrayArg::from_raw_parts(g_h, g.len()),
+                ArrayArg::from_raw_parts(xi_h, xi.len()),
+                ArrayArg::from_raw_parts(out_h.clone(), num_limbs),
+                num_terms,
+                num_matrices,
+                cs_len,
+                mk_len,
+                width,
+            );
+        }
+
+        let bytes = client.read_one(out_h).unwrap();
+        u32::from_bytes(&bytes).to_vec()
+    }
+
+    /// Validation kernel for [`seg_read_u16`]: `out[i] = segmented[idx[i]]`. Lets a test assert the
+    /// segmented read reproduces a contiguous buffer bit-for-bit (see `seg_read_matches_contiguous`).
+    #[cube(launch)]
+    #[allow(clippy::too_many_arguments)]
+    fn seg_gather_kernel(
+        s0: &Array<u16>,
+        s1: &Array<u16>,
+        s2: &Array<u16>,
+        s3: &Array<u16>,
+        s4: &Array<u16>,
+        s5: &Array<u16>,
+        s6: &Array<u16>,
+        s7: &Array<u16>,
+        s8: &Array<u16>,
+        s9: &Array<u16>,
+        s10: &Array<u16>,
+        s11: &Array<u16>,
+        s12: &Array<u16>,
+        s13: &Array<u16>,
+        s14: &Array<u16>,
+        s15: &Array<u16>,
+        idx: &Array<u32>,
+        out: &mut Array<u16>,
+        seg_elems: usize,
+    ) {
+        let i = ABSOLUTE_POS;
+        if i >= out.len() {
+            terminate!();
+        }
+        out[i] = seg_read_u16(
+            s0,
+            s1,
+            s2,
+            s3,
+            s4,
+            s5,
+            s6,
+            s7,
+            s8,
+            s9,
+            s10,
+            s11,
+            s12,
+            s13,
+            s14,
+            s15,
+            usize::cast_from(idx[i]),
+            seg_elems,
+        );
+    }
+
+    /// Backend-agnostic host driver for [`enumerate_admissible_kernel`]. Lays out each `R`'s scratch
+    /// slot from the supplied per-`R` `num_mats` (a prefix-sum of `num_mats·cs_len` / `num_mats·mk_len`),
+    /// uploads the compact per-`R` inputs, launches one thread per `R` on `device`, and reads back the
+    /// packed `(out_cs, out_mk, counts)`. Generic over [`Runtime`] so the *same* kernel can be run on
+    /// CUDA (the H200 path) and on the `cpu` backend — the cross-lowering check the caller uses to
+    /// confirm the device semantics match [`enumerate_admissible_ref`] without needing a GPU.
+    fn enumerate_admissible_on_runtime<R: Runtime>(
+        device: &R::Device,
+        p_parts: &[Vec<u32>],
+        num_mats: &[u32],
+    ) -> (Vec<u16>, Vec<u16>, Vec<u32>) {
+        let n_r = p_parts.len();
+        let width = p_parts.iter().map(Vec::len).max().unwrap();
+
+        let mut pp_flat = vec![0u32; n_r * width];
+        let mut r_rows = vec![0u32; n_r];
+        let mut r_cols = vec![0u32; n_r];
+        let mut r_cs_out = vec![0u64; n_r];
+        let mut r_mk_out = vec![0u64; n_r];
+        let mut cs_total = 0u64;
+        let mut mk_total = 0u64;
+        for (i, pp) in p_parts.iter().enumerate() {
+            let rows = pp.len();
+            let cols = pp
+                .iter()
+                .map(|&x| (u32::BITS - x.leading_zeros()) as usize)
+                .max()
+                .unwrap();
+            let cs_len = (cols - 1) as u64;
+            let mk_len = (rows + cols - 1) as u64;
+            for (slot, &v) in pp_flat[i * width..i * width + rows].iter_mut().zip(pp) {
+                *slot = v;
+            }
+            r_rows[i] = rows as u32;
+            r_cols[i] = cols as u32;
+            r_cs_out[i] = cs_total;
+            r_mk_out[i] = mk_total;
+            cs_total += num_mats[i] as u64 * cs_len;
+            mk_total += num_mats[i] as u64 * mk_len;
+        }
+
+        let client = R::client(device);
+        let pp_h = client.create_from_slice(u32::as_bytes(&pp_flat));
+        let rr_h = client.create_from_slice(u32::as_bytes(&r_rows));
+        let rc_h = client.create_from_slice(u32::as_bytes(&r_cols));
+        let rco_h = client.create_from_slice(u64::as_bytes(&r_cs_out));
+        let rmo_h = client.create_from_slice(u64::as_bytes(&r_mk_out));
+        // `empty` needs a non-zero size even when a batch happens to have no matrices.
+        let cs_cap = (cs_total.max(1)) as usize;
+        let mk_cap = (mk_total.max(1)) as usize;
+        let ocs_h = client.empty(cs_cap * size_of::<u16>());
+        let omk_h = client.empty(mk_cap * size_of::<u16>());
+        let cnt_h = client.empty(n_r * size_of::<u32>());
+
+        const THREADS: u32 = 64;
+        let cubes = (n_r as u32).div_ceil(THREADS);
+        unsafe {
+            enumerate_admissible_kernel::launch_unchecked::<R>(
+                &client,
+                CubeCount::Static(cubes, 1, 1),
+                CubeDim::new_1d(THREADS),
+                ArrayArg::from_raw_parts(pp_h, pp_flat.len()),
+                ArrayArg::from_raw_parts(rr_h, n_r),
+                ArrayArg::from_raw_parts(rc_h, n_r),
+                ArrayArg::from_raw_parts(rco_h, n_r),
+                ArrayArg::from_raw_parts(rmo_h, n_r),
+                ArrayArg::from_raw_parts(ocs_h.clone(), cs_cap),
+                ArrayArg::from_raw_parts(omk_h.clone(), mk_cap),
+                ArrayArg::from_raw_parts(cnt_h.clone(), n_r),
+                width,
+                n_r,
+            );
+        }
+        // Truncate off the `max(1)` padding element present when a batch has zero col_sums / masks (an
+        // all-ones p_part gives `cs_len == 0`); the caller compares against the exact packed reference.
+        let mut cs = u16::from_bytes(&client.read_one(ocs_h).unwrap()).to_vec();
+        let mut mk = u16::from_bytes(&client.read_one(omk_h).unwrap()).to_vec();
+        cs.truncate(cs_total as usize);
+        mk.truncate(mk_total as usize);
+        let counts = u32::from_bytes(&client.read_one(cnt_h).unwrap()).to_vec();
+        (cs, mk, counts)
+    }
+
+    /// CPU reference for the planned *in-kernel* admissible-matrix enumeration — the direction that
+    /// replaces the resident/uploaded master (the stem-300 memory wall + the eviction re-upload cost)
+    /// by generating each `R`'s `col_sums`/`masks` ON THE GPU into a transient scratch buffer, never
+    /// storing or uploading them. This reimplements [`MilnorAlgebra::admissible_matrices`] /
+    /// `AdmissibleMatrix` using ONLY flag-guarded control flow — no `break`, `continue`, or early
+    /// `return` — because that is the subset the cubecl DSL compiles cleanly (cf. `multiply_pair`,
+    /// which tracks `rejected` rather than breaking). The eventual `#[cube]` kernel is then a mechanical
+    /// transcription of this function onto per-thread local `Array`s (state is tiny: `rows = |p_part|`,
+    /// `cols ≤ 32`). Returns the same `(cs_len, mk_len, col_sums, masks)` row-major flattening as
+    /// `admissible_matrices`; `admissible_enum_ref_matches` asserts bit-exact equivalence over every
+    /// real `R` up to degree 60, validating the flag-based restructuring before the hard-to-debug port.
+    fn enumerate_admissible_ref(p_part: &[u32]) -> (usize, usize, Vec<u32>, Vec<u32>) {
+        let rows = p_part.len();
+        let cols = p_part
+            .iter()
+            .map(|&x| (u32::BITS - x.leading_zeros()) as usize)
+            .max()
+            .unwrap();
+        let cs_len = cols - 1;
+        let mk_len = rows + cols - 1;
+
+        // State mirrors `AdmissibleMatrix`: `matrix` row-major `rows*cols` (column 0 = `p_part`),
+        // `totals[rows]`, `col_sums[cs_len]`, `masks[mk_len]` (masks starts as the padded `p_part`).
+        let mut matrix = vec![0u32; rows * cols];
+        for (i, &x) in p_part.iter().enumerate() {
+            matrix[i * cols] = x;
+        }
+        let mut totals = vec![0u32; rows];
+        let mut col_sums = vec![0u32; cs_len];
+        let mut masks = vec![0u32; mk_len];
+        for (i, &x) in p_part.iter().enumerate() {
+            masks[i] = x;
+        }
+
+        let mut out_cs: Vec<u32> = Vec::new();
+        let mut out_mk: Vec<u32> = Vec::new();
+
+        // Emit the current matrix, then advance; `more` is `AdmissibleMatrix::next`'s return value.
+        let mut more = true;
+        while more {
+            out_cs.extend_from_slice(&col_sums);
+            out_mk.extend_from_slice(&masks);
+
+            // One `next()` step, flag-based: `found` = "produced a new matrix" (the original's
+            // `return true`); `handled` = "this column already updated `totals`" (the original's
+            // `continue 'mid`, which skips the trailing add). Loops are guarded by `!found` instead
+            // of breaking.
+            let mut found = false;
+            let mut row = 0;
+            while row < rows && !found {
+                let mut p_to_the_j: u32 = 1;
+                totals[row] = matrix[row * cols]; // get(row, 0)
+                let mut col = 1;
+                while col < cols && !found {
+                    p_to_the_j *= 2;
+                    let mut handled = false;
+                    if p_to_the_j <= totals[row] {
+                        // Bitsum along the anti-diagonal to the bottom-left.
+                        let mut d = 0u32;
+                        let mut c = (row + col + 1).saturating_sub(rows);
+                        while c < col {
+                            d |= matrix[(row + col - c) * cols + c];
+                            c += 1;
+                        }
+                        let cur = matrix[row * cols + col];
+                        let new_entry = ((cur | d) + 1) & !d;
+                        let inc = new_entry - cur;
+                        let sub = inc * p_to_the_j;
+                        if totals[row] < sub {
+                            totals[row] += p_to_the_j * cur;
+                            handled = true;
+                        } else {
+                            matrix[row * cols] = totals[row] - sub; // set(row, 0, ..)
+                            masks[row] = matrix[row * cols];
+                            col_sums[col - 1] += inc;
+                            let mut j = 1;
+                            while j < col {
+                                masks[row + j] &= !matrix[row * cols + j];
+                                col_sums[j - 1] -= matrix[row * cols + j];
+                                matrix[row * cols + j] = 0;
+                                j += 1;
+                            }
+                            matrix[row * cols + col] = new_entry;
+                            let mut i = 0;
+                            while i < row {
+                                matrix[i * cols] = totals[i];
+                                masks[i] = totals[i];
+                                let mut j = 1;
+                                while j < cols {
+                                    if i + j > row {
+                                        masks[i + j] &= !matrix[i * cols + j];
+                                    }
+                                    col_sums[j - 1] -= matrix[i * cols + j];
+                                    matrix[i * cols + j] = 0;
+                                    j += 1;
+                                }
+                                i += 1;
+                            }
+                            masks[row + col] = d | new_entry;
+                            found = true;
+                            handled = true;
+                        }
+                    }
+                    if !handled {
+                        totals[row] += p_to_the_j * matrix[row * cols + col];
+                    }
+                    col += 1;
+                }
+                row += 1;
+            }
+            more = found;
+        }
+
+        (cs_len, mk_len, out_cs, out_mk)
+    }
+
+    /// Host driver for [`seg_gather_kernel`]: splits `data` into ≤ [`MASTER_MAX_SEG`] segments of
+    /// `seg_elems`, uploads each as its own device buffer (no contiguous copy — the whole point), and
+    /// returns `data[idx[i]]` gathered through the segmented read. Unused segments get a 1-element dummy
+    /// (never indexed). Proves the segmented master reads identically to a contiguous one.
+    fn seg_gather_on_gpu(data: &[u16], seg_elems: usize, indices: &[u32]) -> Vec<u16> {
+        let n = data.len();
+        let nseg = n.div_ceil(seg_elems).max(1);
+        assert!(
+            nseg <= MASTER_MAX_SEG,
+            "prototype caps at {MASTER_MAX_SEG} segments"
+        );
+        let client = CudaRuntime::client(&CudaDevice::default());
+
+        // One handle per segment slot; real segments hold their slice, unused slots a 1-elem dummy.
+        let dummy = [0u16];
+        let mut handles = Vec::with_capacity(MASTER_MAX_SEG);
+        let mut lens = Vec::with_capacity(MASTER_MAX_SEG);
+        for s in 0..MASTER_MAX_SEG {
+            let lo = s * seg_elems;
+            if lo < n {
+                let hi = (lo + seg_elems).min(n);
+                handles.push(client.create_from_slice(u16::as_bytes(&data[lo..hi])));
+                lens.push(hi - lo);
+            } else {
+                handles.push(client.create_from_slice(u16::as_bytes(&dummy)));
+                lens.push(1);
+            }
+        }
+        let idx_h = client.create_from_slice(u32::as_bytes(indices));
+        let out_h = client.empty(indices.len() * size_of::<u16>());
+
+        const THREADS: u32 = 256;
+        let cubes = (indices.len() as u32).div_ceil(THREADS).max(1);
+        let arg = |i: usize| unsafe { ArrayArg::from_raw_parts(handles[i].clone(), lens[i]) };
+        unsafe {
+            seg_gather_kernel::launch::<CudaRuntime>(
+                &client,
+                CubeCount::Static(cubes, 1, 1),
+                CubeDim::new_1d(THREADS),
+                arg(0),
+                arg(1),
+                arg(2),
+                arg(3),
+                arg(4),
+                arg(5),
+                arg(6),
+                arg(7),
+                arg(8),
+                arg(9),
+                arg(10),
+                arg(11),
+                arg(12),
+                arg(13),
+                arg(14),
+                arg(15),
+                ArrayArg::from_raw_parts(idx_h, indices.len()),
+                ArrayArg::from_raw_parts(out_h.clone(), indices.len()),
+                seg_elems,
+            );
+        }
+        u16::from_bytes(&client.read_one(out_h).unwrap()).to_vec()
+    }
+
+    /// Shared body for the per-backend enumeration tests: builds a batch of every real `R` up to
+    /// `max_degree`, computes the expected packed `col_sums`/`masks` (and per-`R` `num_mats`) from the
+    /// CPU-validated [`enumerate_admissible_ref`], runs [`enumerate_admissible_kernel`] on `R`'s
+    /// `device`, and asserts the device output is bit-exact — values *and* per-`R` counts. Generic so
+    /// CUDA (H200) and the `cpu` backend run the identical kernel through it.
+    fn check_enum_backend<Rt: Runtime>(device: &Rt::Device, max_degree: i32) {
+        use fp::prime::ValidPrime;
+
+        let p = ValidPrime::new(2);
+        let algebra = MilnorAlgebra::new(p, false);
+        algebra.compute_basis(max_degree);
+
+        // Process one degree per launch. At high degree the full master is tens of GB, so batching every
+        // R together would OOM the host; per-degree keeps the expected arrays bounded AND pinpoints the
+        // exact degree if the device lowering ever diverges from the CPU reference.
+        let mut total_r = 0usize;
+        let mut total_mats = 0u64;
+        for deg in 1..=max_degree {
+            let mut p_parts: Vec<Vec<u32>> = Vec::new();
+            let mut num_mats: Vec<u32> = Vec::new();
+            let mut exp_cs: Vec<u16> = Vec::new();
+            let mut exp_mk: Vec<u16> = Vec::new();
+            for idx in 0..algebra.dimension(deg) {
+                let pp = algebra.basis_element_from_index(deg, idx).p_part.clone();
+                if pp.is_empty() {
+                    continue;
+                }
+                let (_cs_len, mk_len, cs, mk) = enumerate_admissible_ref(&pp);
+                // `mk_len = rows+cols-1 ≥ 1` always, so it recovers the matrix count even when
+                // `cs_len == 0` (an all-ones p_part contributes no col_sums).
+                num_mats.push((mk.len() / mk_len) as u32);
+                exp_cs.extend(cs.iter().map(|&v| narrow_u16(v)));
+                exp_mk.extend(mk.iter().map(|&v| narrow_u16(v)));
+                p_parts.push(pp);
+            }
+            if p_parts.is_empty() {
+                continue;
+            }
+            let (got_cs, got_mk, counts) =
+                enumerate_admissible_on_runtime::<Rt>(device, &p_parts, &num_mats);
+            assert_eq!(
+                counts, num_mats,
+                "per-R matrix counts diverged at degree {deg}"
+            );
+            assert_eq!(got_cs, exp_cs, "device col_sums diverged at degree {deg}");
+            assert_eq!(got_mk, exp_mk, "device masks diverged at degree {deg}");
+            total_r += p_parts.len();
+            total_mats += num_mats.iter().map(|&m| m as u64).sum::<u64>();
+        }
+        assert!(total_r > 0, "no R's exercised");
+        eprintln!(
+            "enum backend: {total_r} R's, {total_mats} matrices bit-exact vs \
+             enumerate_admissible_ref (degrees 1..={max_degree})"
+        );
+    }
+
+    /// Time one enumeration launch on `device`, split into (marshal+upload, kernel, full readback).
+    /// `kernel` reads only the tiny `counts` buffer to force a stream sync (so it captures kernel wall
+    /// time without the big transfer); `readback` then pulls the full `col_sums`/`masks`. Used by
+    /// `bench_admissible_cpu_vs_gpu` — production never reads the arrays back (the multiply consumes the
+    /// scratch on-device), so `kernel` is the production-relevant cost and `readback` is bench-only.
+    fn enum_launch_timed<R: Runtime>(
+        device: &R::Device,
+        p_parts: &[Vec<u32>],
+        num_mats: &[u32],
+    ) -> (f64, f64, f64) {
+        use std::time::Instant;
+        let n_r = p_parts.len();
+        let width = p_parts.iter().map(Vec::len).max().unwrap();
+
+        let t_marshal = Instant::now();
+        let mut pp_flat = vec![0u32; n_r * width];
+        let mut r_rows = vec![0u32; n_r];
+        let mut r_cols = vec![0u32; n_r];
+        let mut r_cs_out = vec![0u64; n_r];
+        let mut r_mk_out = vec![0u64; n_r];
+        let (mut cs_total, mut mk_total) = (0u64, 0u64);
+        for (i, pp) in p_parts.iter().enumerate() {
+            let rows = pp.len();
+            let cols = pp
+                .iter()
+                .map(|&x| (u32::BITS - x.leading_zeros()) as usize)
+                .max()
+                .unwrap();
+            for (slot, &v) in pp_flat[i * width..i * width + rows].iter_mut().zip(pp) {
+                *slot = v;
+            }
+            r_rows[i] = rows as u32;
+            r_cols[i] = cols as u32;
+            r_cs_out[i] = cs_total;
+            r_mk_out[i] = mk_total;
+            cs_total += num_mats[i] as u64 * (cols - 1) as u64;
+            mk_total += num_mats[i] as u64 * (rows + cols - 1) as u64;
+        }
+        let client = R::client(device);
+        let pp_h = client.create_from_slice(u32::as_bytes(&pp_flat));
+        let rr_h = client.create_from_slice(u32::as_bytes(&r_rows));
+        let rc_h = client.create_from_slice(u32::as_bytes(&r_cols));
+        let rco_h = client.create_from_slice(u64::as_bytes(&r_cs_out));
+        let rmo_h = client.create_from_slice(u64::as_bytes(&r_mk_out));
+        let cs_cap = cs_total.max(1) as usize;
+        let mk_cap = mk_total.max(1) as usize;
+        let ocs_h = client.empty(cs_cap * size_of::<u16>());
+        let omk_h = client.empty(mk_cap * size_of::<u16>());
+        let cnt_h = client.empty(n_r * size_of::<u32>());
+        let marshal_s = t_marshal.elapsed().as_secs_f64();
+
+        const THREADS: u32 = 64;
+        let cubes = (n_r as u32).div_ceil(THREADS);
+        let t_kernel = Instant::now();
+        unsafe {
+            enumerate_admissible_kernel::launch_unchecked::<R>(
+                &client,
+                CubeCount::Static(cubes, 1, 1),
+                CubeDim::new_1d(THREADS),
+                ArrayArg::from_raw_parts(pp_h, pp_flat.len()),
+                ArrayArg::from_raw_parts(rr_h, n_r),
+                ArrayArg::from_raw_parts(rc_h, n_r),
+                ArrayArg::from_raw_parts(rco_h, n_r),
+                ArrayArg::from_raw_parts(rmo_h, n_r),
+                ArrayArg::from_raw_parts(ocs_h.clone(), cs_cap),
+                ArrayArg::from_raw_parts(omk_h.clone(), mk_cap),
+                ArrayArg::from_raw_parts(cnt_h.clone(), n_r),
+                width,
+                n_r,
+            );
+        }
+        // Reading the tiny counts buffer blocks until the kernel completes: kernel wall time, ~no transfer.
+        let _ = client.read_one(cnt_h).unwrap();
+        let kernel_s = t_kernel.elapsed().as_secs_f64();
+
+        let t_read = Instant::now();
+        let _ = client.read_one(ocs_h).unwrap();
+        let _ = client.read_one(omk_h).unwrap();
+        let readback_s = t_read.elapsed().as_secs_f64();
+
+        (marshal_s, kernel_s, readback_s)
+    }
 
     /// The in-kernel [`enumerate_admissible_kernel`], run on the CUDA backend, must reproduce the
     /// CPU-validated [`enumerate_admissible_ref`] bit-for-bit over every real `R` up to degree 145 —
@@ -2865,7 +3068,10 @@ mod tests {
         let indices: Vec<u32> = (0..1000u32).map(|i| (i * 613) % 1000).collect();
         let got = seg_gather_on_gpu(&data, seg_elems, &indices);
         let want: Vec<u16> = indices.iter().map(|&i| data[i as usize]).collect();
-        assert_eq!(got, want, "segmented read diverged from contiguous indexing");
+        assert_eq!(
+            got, want,
+            "segmented read diverged from contiguous indexing"
+        );
     }
 
     /// Throughput comparison, CPU `admissible_matrices` vs the in-kernel [`enumerate_admissible_kernel`],
@@ -2875,8 +3081,9 @@ mod tests {
     #[test]
     #[ignore = "benchmark, not a correctness check; run explicitly with --ignored --nocapture"]
     fn bench_admissible_cpu_vs_gpu() {
-        use fp::prime::ValidPrime;
         use std::time::Instant;
+
+        use fp::prime::ValidPrime;
 
         let p = ValidPrime::new(2);
         let algebra = MilnorAlgebra::new(p, false);
@@ -2942,12 +3149,12 @@ mod tests {
         }
 
         eprintln!(
-            "\n=== admissible matrices onto the device: enumerate vs upload (degrees 1..={max_degree}) ===\n\
-             R's: {total_r}   matrices: {total_mats}   (both paths leave the arrays ON-DEVICE, no readback)\n\
-             CPU  admissible_matrices (enumerate, 1 core) : {cpu_secs:.3} s\n\
-             GPU  enumerate in-kernel                     : {g_kernel:.3} s\n\
-             H->D upload of host-built arrays             : {upload_secs:.3} s\n\
-             --> in-kernel enum is {:.2}x the cost of just uploading the same arrays",
+            "\n=== admissible matrices onto the device: enumerate vs upload (degrees \
+             1..={max_degree}) ===\nR's: {total_r}   matrices: {total_mats}   (both paths leave \
+             the arrays ON-DEVICE, no readback)\nCPU  admissible_matrices (enumerate, 1 core) : \
+             {cpu_secs:.3} s\nGPU  enumerate in-kernel                     : {g_kernel:.3} \
+             s\nH->D upload of host-built arrays             : {upload_secs:.3} s\n--> in-kernel \
+             enum is {:.2}x the cost of just uploading the same arrays",
             g_kernel / upload_secs,
         );
     }
@@ -3279,7 +3486,8 @@ mod tests {
             let got = multiply_batch_on_gpu(&algebra, out_dim, num_rows, &products);
             assert_eq!(
                 got, golden,
-                "incremental-growth GPU multiply diverged from reference at out_degree={out_degree}"
+                "incremental-growth GPU multiply diverged from reference at \
+                 out_degree={out_degree}"
             );
         };
 
