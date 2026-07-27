@@ -307,7 +307,7 @@ struct RInfo {
 /// device it is dropped host-side — it is provably never read again (offsets come from `index`;
 /// growth uploads only the pending tail; a capacity realloc copies the old *device* buffer, not the
 /// host). This removes the multi-GB host↔device duplicate that dominated the resolver's anon RSS
-/// (~27 GB at stem 130, growing). Invariant maintained by [`resident_dev_handle`]:
+/// (~27 GB at stem 130, growing). Invariant maintained by [`seg_grow`]:
 /// `RESIDENT_DEV.$buf.uploaded == $len - $pending.len()`, i.e. `$pending == master[uploaded..$len]`.
 #[derive(Default)]
 struct ResidentHost {
@@ -321,54 +321,67 @@ struct ResidentHost {
 static RESIDENT_HOST: LazyLock<RwLock<ResidentHost>> =
     LazyLock::new(|| RwLock::new(ResidentHost::default()));
 
-/// A resident device buffer that GROWS IN PLACE: a single stable handle, allocated once
-/// (persistent, so per-launch cleanup never reindexes it) with headroom and written to at its
-/// append offset as the host master grows — never re-`create_from_slice`d. The handle changes only
-/// on a rare capacity doubling. `uploaded` is how many elements have been written; `cap` is the
-/// allocated element capacity.
+/// Compile-time cap on the number of fixed-size segments a resident device buffer may hold. It
+/// bounds both the multiply kernel's per-buffer argument count and the [`seg_read_u16`] /
+/// [`seg_read_u32`] branch depth, so it must be a constant. With `master_seg_elems()` at its default
+/// `2^31`, this holds `16 × 4 GiB = 64 GiB` of u16 master per buffer — well past what fits resident
+/// on one H200. Raise it (and extend the two `seg_read_*` / the kernel binding) for larger buffers.
+const MASTER_MAX_SEG: usize = 16;
+
+/// Element count per resident segment (see [`SegBuf`]); env `NASSAU_GPU_MASTER_SEG_ELEMS`. Default
+/// `2^31` — 4 GiB per u16 segment, 8 GiB per u32 — and deliberately `< u32::MAX`, so a single
+/// segment's length never overflows cubecl's 32-bit array-length metadata (the truncation class of
+/// bug the u64 offset addressing already guards against). Tests set it tiny to exercise many-segment
+/// gathers at low degree; production leaves it large so a run needs only a handful of segments.
+fn master_seg_elems() -> usize {
+    static N: LazyLock<usize> = LazyLock::new(|| {
+        std::env::var("NASSAU_GPU_MASTER_SEG_ELEMS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(1usize << 31)
+    });
+    *N
+}
+
+/// A resident device buffer grown by APPENDING fixed-size segments — the existing segments are never
+/// reallocated or copied, so the device peak is `live + one_segment`, not the `~2×` realloc-doubling
+/// transient that pushed cubecl into its silent memory-corruption regime (the stem-140+ `dx != 0`).
+/// Each segment holds exactly `master_seg_elems()` elements (allocated full; the last is only
+/// partially written); the multiply kernel selects the segment for a global offset `o` by a static
+/// branch (`o / seg_elems`), so at most [`MASTER_MAX_SEG`] segments exist. Append-only and stable —
+/// a segment handle, once allocated and written, never changes identity and is never freed — which
+/// is the ordinary shared-global (model-weights) pattern cubecl syncs correctly across streams; the
+/// churny "swap the whole buffer on every growth" it replaced broke that sync. `uploaded` is how
+/// many elements are physically resident across all segments.
 #[derive(Default)]
-struct GrowBuf {
-    handle: Option<Handle>,
-    cap: usize,
+struct SegBuf {
+    segs: Vec<Handle>,
     uploaded: usize,
 }
 
-/// Process-shared device mirror of the host master. Each buffer is a STABLE handle grown in place
-/// (see [`GrowBuf`], [`resident_dev_handle`]). This is what makes the master safe to share across
-/// streams: the churny "re-upload a new handle on every growth" it replaced broke cubecl's
-/// per-handle cross-stream sync (crash rate tracked re-upload frequency); a fixed handle written in
+/// Process-shared device mirror of the host master. Each buffer is a segmented, append-only
+/// no-copy-growth store (see [`SegBuf`], [`seg_grow`]). This is what makes the master safe to share
+/// across streams: the churny "re-upload a new handle on every growth" it replaced broke cubecl's
+/// per-handle cross-stream sync (crash rate tracked re-upload frequency); a stable segment written in
 /// place is the ordinary shared-global (model-weights) pattern. Reads go through `RESIDENT_DEV.read()`
 /// (lock-free fan-out); growth runs outside that lock, serialized only by `RESIDENT_UPLOAD`.
 #[derive(Default)]
 struct ResidentDev {
-    cs: GrowBuf,
-    mk: GrowBuf,
+    cs: SegBuf,
+    mk: SegBuf,
 }
 
 static RESIDENT_DEV: LazyLock<RwLock<ResidentDev>> =
     LazyLock::new(|| RwLock::new(ResidentDev::default()));
 
-/// Initial element capacity of a resident buffer. Doubling to grow past it is barrier-protected
-/// (see [`RESIDENT_REALLOC`]) so it is correct, but each doubling briefly quiesces the device, so
-/// the initial size carries headroom to keep them few (~a handful per run). u16 → ~512 MiB.
-const RESIDENT_INIT_CAP: usize = 1 << 28;
-
-/// Serializes master device *uploads* only — never handle reads. A launch that must grow the
-/// device master takes this before uploading, so at a growth point at most one multi-GB
-/// `create_from_slice` runs (others re-check and find it already done) instead of every launch
-/// piling redundant copies. Reads go lock-free through `RESIDENT_DEV.read()`, so the upload no
-/// longer blocks other bidegrees' device sections (the old single mutex held across the copy
-/// collapsed the whole wavefront to one memcpy-ing thread).
+/// Serializes master device *uploads* only — never segment reads. A launch that must grow the
+/// device master takes this before uploading, so at a growth point at most one grower runs (others
+/// re-check and find it already done) instead of every launch piling redundant copies. Reads go
+/// lock-free through `RESIDENT_DEV.read()`, so the upload no longer blocks other bidegrees' device
+/// sections (the old single mutex held across the copy collapsed the whole wavefront to one
+/// memcpy-ing thread).
 static RESIDENT_UPLOAD: Mutex<()> = Mutex::new(());
-
-/// Guards the rare capacity-doubling REALLOC (the only time a resident handle changes) against
-/// concurrent readers. A device section holds the read lock while its multiply kernel is reading the
-/// resident buffers; a realloc takes the write lock, so it waits for every in-flight reader to drain
-/// and blocks new ones — the swap + old-buffer free then happens with the device quiesced, which the
-/// churny path could not guarantee (residual ~1/10 crash at the readback / a stale multiply). The
-/// common in-place delta write does NOT take this lock (it's stable-handle, proven race-free), so the
-/// hot path stays lock-free; reallocs happen only a handful of times per run, so the barrier is free.
-static RESIDENT_REALLOC: RwLock<()> = RwLock::new(());
 
 /// Host-side cache of cold (degree > [`resident_degree_cap`]) `R`s' admissible-matrix *shape* only —
 /// `(cs_len, mk_len, num_mats)`, twelve bytes per `R`. With [in-kernel enumeration](enumerate_admissible_kernel)
@@ -395,97 +408,92 @@ fn cold_count(algebra: &MilnorAlgebra, p_part: &[PPartEntry]) -> (u32, u32, u32)
     e
 }
 
-/// Fetch a resident device-master handle, uploading the current master prefix only when this
-/// block dereferences past what is already on the device (`need`). The upload runs OUTSIDE
-/// `RESIDENT_DEV` (readers stay lock-free; only concurrent uploaders serialize, on
-/// `RESIDENT_UPLOAD`, and a re-check coalesces a burst of growth-needing launches into one
-/// upload). The master is append-only, so any handle with `uploaded >= need` is valid.
-macro_rules! resident_dev_handle {
-    ($client:expr, $need:expr, $buf:ident, $pending:ident, $len:ident) => {{
-        // Lock-free fast path: the stable handle already covers `$need`.
+/// Grow a segmented resident device buffer ([`SegBuf`]) so it covers `$need` elements, and return
+/// `(segments, uploaded)` — the per-segment handles (each `master_seg_elems()` elements) and the
+/// logical resident length. NO-COPY growth: existing segments are never reallocated or copied; a
+/// growth only allocates the new segment(s) it needs and stage-writes the not-yet-uploaded tail into
+/// them. This replaces the `~2×` realloc-doubling transient (old+new buffer both live) that pushed
+/// cubecl into memory corruption — the stem-140+ `dx != 0` — with a `live + one_segment` peak.
+///
+/// Concurrency mirrors the old in-place path: a lock-free fast path returns the current segments when
+/// they already cover `$need`; otherwise `$upload` (a `Mutex`) serializes growers, with a re-check
+/// coalescing a burst. The long stage-write runs on a CLONE of the segment vector (segment handles
+/// are refcounted, so cloning shares the buffers) and is published under a brief `$dev` write lock,
+/// so readers taking `$dev.read()` always see a consistent `(segs, uploaded)` pair. Segments are
+/// append-only and never freed, so a reader's cloned handle stays valid for its whole kernel with no
+/// realloc barrier. `$tail` is `|uploaded| -> (Vec<$elem>, new_len)`: the owned tail
+/// `master[uploaded..new_len]` (the master frees it host-side via `mem::take`; the basis copies it
+/// out of its retained store) plus the new logical length.
+macro_rules! seg_grow {
+    ($client:expr, $dev:expr, $field:ident, $upload:expr, $need:expr,
+     $copy:ident, $as_bytes:path, $elem:ty, $tail:expr) => {{
+        let seg_elems = master_seg_elems();
+        // Lock-free fast path: current segments already cover `$need`.
         let read_current = || {
-            let dev = RESIDENT_DEV.read().unwrap();
-            match (dev.$buf.uploaded >= $need, dev.$buf.handle.clone()) {
-                (true, Some(h)) => Some((h, dev.$buf.uploaded)),
-                _ => None,
+            let dev = $dev.read().unwrap();
+            if dev.$field.uploaded >= $need {
+                Some((dev.$field.segs.clone(), dev.$field.uploaded))
+            } else {
+                None
             }
         };
         match read_current() {
-            Some(hu) => hu,
+            Some(su) => su,
             None => {
-                let _upload_guard = RESIDENT_UPLOAD.lock().unwrap();
+                let _upload_guard = $upload.lock().unwrap();
                 match read_current() {
-                    Some(hu) => hu, // another grower already covered our need
+                    Some(su) => su, // another grower already covered our need
                     None => {
-                        let (old_handle, cap, uploaded) = {
-                            let dev = RESIDENT_DEV.read().unwrap();
-                            (dev.$buf.handle.clone(), dev.$buf.cap, dev.$buf.uploaded)
+                        // Snapshot the current segments + logical length. We extend a CLONE and
+                        // publish it atomically, so a concurrent reader sees either the whole old
+                        // state or the whole new one — never a half-grown vector.
+                        let (mut segs, uploaded): (Vec<Handle>, usize) = {
+                            let dev = $dev.read().unwrap();
+                            (dev.$field.segs.clone(), dev.$field.uploaded)
                         };
-                        // Take the not-yet-uploaded tail and the logical length together. By the
-                        // invariant (see [`ResidentHost`]) the tail is exactly `master[uploaded..len]`,
-                        // so `uploaded + batch.len() == host_len`. `mem::take` FREES it host-side —
-                        // once on the device it is never read again. Appends after this point land in
-                        // a fresh `$pending` and upload on the next growth. `RESIDENT_UPLOAD` (held)
-                        // makes this the sole grower, so `uploaded` is stable here.
-                        let (batch, host_len) = {
-                            let mut host = RESIDENT_HOST.write().unwrap();
-                            (std::mem::take(&mut host.$pending), host.$len)
-                        };
-                        debug_assert_eq!(uploaded + batch.len(), host_len);
-
-                        // (Re)allocate a stable persistent buffer on first use or capacity overflow
-                        // (rare: `RESIDENT_INIT_CAP` has headroom and the master saturates early),
-                        // copying existing device data on-device. Only THIS handle-swap needs a sync,
-                        // so a fresh-handle cross-stream read never sees an incomplete copy.
-                        let (handle, cap) = if old_handle.is_none() || host_len > cap {
-                            // Quiesce readers for the handle swap (see [`RESIDENT_REALLOC`]).
-                            let _realloc_w = RESIDENT_REALLOC.write().unwrap();
-                            // No `u32` cap: the kernels bind these buffers with 64-bit addressing
-                            // (`multiply_batch_kernel` reads with static `u64`; the grow copy with
-                            // dynamic), so the length/offsets are never truncated past `u32::MAX`.
-                            let new_cap = host_len.max(cap * 2).max(RESIDENT_INIT_CAP);
-                            let new_handle = $client.empty(new_cap * ::core::mem::size_of::<u16>());
-                            if let Some(oh) = &old_handle {
-                                if uploaded > 0 {
-                                    copy_chunked!(
-                                        $client, copy_into_u16, oh, uploaded, 0usize,
-                                        new_handle, new_cap, 0usize, uploaded
-                                    );
-                                }
-                            }
-                            let _ = cubecl_common::reader::read_sync($client.sync());
-                            (new_handle, new_cap)
-                        } else {
-                            (old_handle.unwrap(), cap)
-                        };
-
-                        // Write the tail `batch` (== master[uploaded..host_len]) into the STABLE
-                        // buffer at its append offset through a BOUNDED pinned staging (see
-                        // [`STAGE_CHUNK`]), syncing each chunk. The sync also serves the cross-stream
-                        // ordering the resident buffers need: cubecl does not order a *kernel write* to
-                        // a shared buffer against reads on another stream the way it does
-                        // `create_from_slice`, so blocking here makes the new prefix physically
-                        // resident before any reader observes the bumped `uploaded`.
+                        let (tail, new_len): (Vec<$elem>, usize) = ($tail)(uploaded);
+                        debug_assert_eq!(uploaded + tail.len(), new_len);
+                        assert!(
+                            new_len.div_ceil(seg_elems.max(1)) <= MASTER_MAX_SEG,
+                            "resident buffer needs {} segments (> MASTER_MAX_SEG={}); raise \
+                             MASTER_MAX_SEG or NASSAU_GPU_MASTER_SEG_ELEMS",
+                            new_len.div_ceil(seg_elems.max(1)),
+                            MASTER_MAX_SEG
+                        );
+                        // Allocate (no copy) full-size segments until they cover `new_len`. The last
+                        // one is allocated full even if only partially written; reads only touch
+                        // written locals (`< uploaded`), so its uninitialized tail is never read.
+                        while segs.len() * seg_elems < new_len {
+                            segs.push($client.empty(seg_elems * ::core::mem::size_of::<$elem>()));
+                        }
+                        // Stage-write the tail `master[uploaded..new_len]` into its segments, split at
+                        // segment boundaries and [`STAGE_CHUNK`], syncing each chunk. Existing
+                        // segments (including the partially-filled last one) are appended into, never
+                        // copied. The sync makes each chunk physically resident before the bumped
+                        // `uploaded` is published, so a cross-stream reader never observes a gap
+                        // (cubecl does not order a kernel write to a shared buffer against another
+                        // stream's read the way `create_from_slice` does).
+                        let mut pos = uploaded;
                         let mut done = 0usize;
-                        while done < batch.len() {
-                            let m = (batch.len() - done).min(STAGE_CHUNK);
-                            let lo = uploaded + done;
+                        while pos < new_len {
+                            let seg = pos / seg_elems;
+                            let local = pos % seg_elems;
+                            let m = (new_len - pos).min(seg_elems - local).min(STAGE_CHUNK);
                             let scratch =
-                                $client.create_from_slice(u16::as_bytes(&batch[done..done + m]));
+                                $client.create_from_slice($as_bytes(&tail[done..done + m]));
                             copy_chunked!(
-                                $client, copy_into_u16, scratch, m, 0usize, handle, cap, lo, m
+                                $client, $copy, scratch, m, 0usize, segs[seg], seg_elems, local, m
                             );
                             let _ = cubecl_common::reader::read_sync($client.sync());
+                            pos += m;
                             done += m;
                         }
-
                         {
-                            let mut dev = RESIDENT_DEV.write().unwrap();
-                            dev.$buf.handle = Some(handle.clone());
-                            dev.$buf.cap = cap;
-                            dev.$buf.uploaded = host_len;
+                            let mut dev = $dev.write().unwrap();
+                            dev.$field.segs = segs.clone();
+                            dev.$field.uploaded = new_len;
                         }
-                        (handle, host_len)
+                        (segs, new_len)
                     }
                 }
             }
@@ -703,13 +711,13 @@ struct ResidentBasisHost {
 static RESIDENT_BASIS_HOST: LazyLock<RwLock<ResidentBasisHost>> =
     LazyLock::new(|| RwLock::new(ResidentBasisHost::default()));
 
-/// Device mirror of [`ResidentBasisHost`], both buffers grown IN PLACE (see [`GrowBuf`],
-/// [`resident_dev_handle`]). `pp` holds the width-padded p-parts (`elems * width` u16), `ln` the
+/// Device mirror of [`ResidentBasisHost`], both buffers segmented no-copy-growth stores (see
+/// [`SegBuf`], [`seg_grow`]). `pp` holds the width-padded p-parts (`elems * width` u16), `ln` the
 /// lengths (`elems` u32); the basis element count is `ln.uploaded`.
 #[derive(Default)]
 struct ResidentBasisDev {
-    pp: GrowBuf,
-    ln: GrowBuf,
+    pp: SegBuf,
+    ln: SegBuf,
 }
 
 static RESIDENT_BASIS_DEV: LazyLock<RwLock<ResidentBasisDev>> =
@@ -762,118 +770,6 @@ fn ensure_basis(algebra: &MilnorAlgebra, width: usize, max_degree: i32) -> Vec<u
     host.global_base.clone()
 }
 
-/// Fetch the resident basis device handles `(pparts, lens)`, uploading the current host basis
-/// only when the device copy does not yet cover `$need` elements. Upload runs outside
-/// `RESIDENT_BASIS_DEV` (readers stay lock-free), serialized by `RESIDENT_BASIS_UPLOAD` with a
-/// re-check to coalesce a burst of growth. The basis is append-only, so any handle with
-/// `uploaded >= $need` is valid. A macro (not a fn) so the cubecl client type stays inferred,
-/// exactly as [`resident_dev_handle`].
-macro_rules! basis_dev_handles {
-    ($client:expr, $need:expr) => {{
-        // Lock-free fast path: the stable buffers already cover `$need` basis elements
-        // (`ln.uploaded` is the element count).
-        let read_current = || {
-            let dev = RESIDENT_BASIS_DEV.read().unwrap();
-            match (dev.ln.uploaded >= $need, dev.pp.handle.clone(), dev.ln.handle.clone()) {
-                (true, Some(pp), Some(ln)) => Some((pp, ln)),
-                _ => None,
-            }
-        };
-        match read_current() {
-            Some(h) => h,
-            None => {
-                let _guard = RESIDENT_BASIS_UPLOAD.lock().unwrap();
-                match read_current() {
-                    Some(h) => h, // another grower already covered our need
-                    None => {
-                        let width = RESIDENT_BASIS_HOST.read().unwrap().width;
-                        let elems = RESIDENT_BASIS_HOST.read().unwrap().lens.len();
-                        let pp_len = elems * width; // u16 count
-                        let ln_len = elems; // u32 count
-
-                        // Grow the width-padded p-parts buffer (u16) in place.
-                        let (old_pp, pp_cap, pp_up) = {
-                            let d = RESIDENT_BASIS_DEV.read().unwrap();
-                            (d.pp.handle.clone(), d.pp.cap, d.pp.uploaded)
-                        };
-                        let (pp_h, pp_cap) = if old_pp.is_none() || pp_len > pp_cap {
-                            let _realloc_w = RESIDENT_REALLOC.write().unwrap();
-                            let new_cap = pp_len.max(pp_cap * 2).max(RESIDENT_INIT_CAP);
-                            let nh = $client.empty(new_cap * ::core::mem::size_of::<u16>());
-                            if let Some(oh) = &old_pp {
-                                if pp_up > 0 {
-                                    copy_chunked!(
-                                        $client, copy_into_u16, oh, pp_up, 0usize,
-                                        nh, new_cap, 0usize, pp_up
-                                    );
-                                }
-                            }
-                            let _ = cubecl_common::reader::read_sync($client.sync());
-                            (nh, new_cap)
-                        } else {
-                            (old_pp.unwrap(), pp_cap)
-                        };
-                        if pp_len > pp_up {
-                            let n = pp_len - pp_up;
-                            stage_upload!(
-                                $client, copy_into_u16, u16::as_bytes,
-                                RESIDENT_BASIS_HOST.read().unwrap(), pparts,
-                                pp_h, pp_cap, pp_up, n
-                            );
-                        }
-
-                        // Grow the lengths buffer (u32) in place.
-                        let (old_ln, ln_cap, ln_up) = {
-                            let d = RESIDENT_BASIS_DEV.read().unwrap();
-                            (d.ln.handle.clone(), d.ln.cap, d.ln.uploaded)
-                        };
-                        let (ln_h, ln_cap) = if old_ln.is_none() || ln_len > ln_cap {
-                            let _realloc_w = RESIDENT_REALLOC.write().unwrap();
-                            let new_cap = ln_len.max(ln_cap * 2).max(RESIDENT_INIT_CAP);
-                            let nh = $client.empty(new_cap * ::core::mem::size_of::<u32>());
-                            if let Some(oh) = &old_ln {
-                                if ln_up > 0 {
-                                    copy_chunked!(
-                                        $client, copy_into_u32, oh, ln_up, 0usize,
-                                        nh, new_cap, 0usize, ln_up
-                                    );
-                                }
-                            }
-                            let _ = cubecl_common::reader::read_sync($client.sync());
-                            (nh, new_cap)
-                        } else {
-                            (old_ln.unwrap(), ln_cap)
-                        };
-                        if ln_len > ln_up {
-                            let n = ln_len - ln_up;
-                            stage_upload!(
-                                $client, copy_into_u32, u32::as_bytes,
-                                RESIDENT_BASIS_HOST.read().unwrap(), lens,
-                                ln_h, ln_cap, ln_up, n
-                            );
-                        }
-
-                        // `stage_upload!` already synced each chunk, so both grown buffers are
-                        // physically resident before publishing (see [`resident_dev_handle`]):
-                        // a reader on another worker's stream must never observe the bumped element
-                        // count before the copy is done.
-
-                        {
-                            let mut dev = RESIDENT_BASIS_DEV.write().unwrap();
-                            dev.pp.handle = Some(pp_h.clone());
-                            dev.pp.cap = pp_cap;
-                            dev.pp.uploaded = pp_len;
-                            dev.ln.handle = Some(ln_h.clone());
-                            dev.ln.cap = ln_cap;
-                            dev.ln.uploaded = ln_len;
-                        }
-                        (pp_h, ln_h)
-                    }
-                }
-            }
-        }
-    }};
-}
 
 /// Zero a device `u32` buffer on-device: `out[i] = 0`, one thread per limb.
 ///
@@ -921,7 +817,7 @@ fn copy_into_u32(src: &Array<u32>, dst: &mut Array<u32>, src_off: usize, dst_off
 /// of multi-billion-element resident buffers are split into this many at a time.
 const COPY_CHUNK: usize = 1 << 30;
 
-/// Elements per pinned host-staging chunk when uploading resident growth (see [`stage_upload`]).
+/// Elements per pinned host-staging chunk when uploading resident growth (see [`seg_grow`]).
 /// Bounds the page-locked host buffer cubecl reserves per `create_from_slice`: those pinned pages
 /// are pooled PER CUDA STREAM and never trimmed, so a single full-master `create_from_slice` (the
 /// tail can be many GB) would pin that whole size on every stream — measured ~240 GB shmem at stem
@@ -929,31 +825,6 @@ const COPY_CHUNK: usize = 1 << 30;
 /// caps the live pinned staging at ~one chunk. 64 Mi × u16 = 128 MiB (× u32 = 256 MiB).
 const STAGE_CHUNK: usize = 1 << 26;
 
-/// Upload `host_slice[0..n]` into resident device `dst[dst_off..dst_off+n]` through a BOUNDED pinned
-/// staging buffer, re-locking `$host_lock` to reslice each chunk. `$host_lock` is an expression
-/// evaluating to a read guard whose `$field` is the source `Vec` (re-evaluated per chunk so the
-/// guard is not held across the sync). Syncs after each chunk so the pinned pool reuses one page
-/// instead of accumulating the whole tail (see [`STAGE_CHUNK`]). `$copy` is `copy_into_u16`/`_u32`,
-/// `$as_bytes` the matching `u16`/`u32` `as_bytes`.
-macro_rules! stage_upload {
-    ($client:expr, $copy:ident, $as_bytes:path, $host_lock:expr, $field:ident,
-     $dst:expr, $dst_cap:expr, $dst_off:expr, $n:expr) => {{
-        let mut done = 0usize;
-        while done < $n {
-            let m = ($n - done).min(STAGE_CHUNK);
-            let lo = $dst_off + done;
-            let scratch = {
-                let host = $host_lock;
-                $client.create_from_slice($as_bytes(&host.$field[lo..lo + m]))
-            };
-            copy_chunked!($client, $copy, scratch, m, 0usize, $dst, $dst_cap, lo, m);
-            // Drain the H2D copy so this chunk's pinned staging is freed (and its pool page reused)
-            // before the next `create_from_slice`, keeping live pinned memory at ~one chunk.
-            let _ = cubecl_common::reader::read_sync($client.sync());
-            done += m;
-        }
-    }};
-}
 
 /// Copy `count` elements `src[src_off..] -> dst[dst_off..]` with `$kernel` (`copy_into_u16`/`_u32`),
 /// splitting into [`COPY_CHUNK`]-element launches so counts past the `u32` thread limit are handled.
@@ -1287,21 +1158,40 @@ fn multiply_single_r_kernel(
 ///
 /// Output is `num_rows` F₂ vectors of `num_limbs` `u32` limbs, row `r` at
 /// `out[r*num_limbs ..]`.
-// 64-bit addressing (`address_type = "u64"`): the admissible masters (`col_sums`/`masks`) and the
-// width-padded basis exceed `u32::MAX` elements at high stems, and the per-`R` offsets in
-// `r_cs_offset`/`r_mk_offset` (u64) index into them. Static u64 (not "dynamic") because dynamic
-// would pick 32-bit `usize` for small blocks and then *narrow* the u64 offset arrays on read
-// (cubecl `usize::cast_from(u64)` under a u32 address type), corrupting results — the (180,92)
-// `dx != 0`. `launch_unchecked` because cubecl's checked-mode bounds clamp emits `min(u64, u64)`,
-// which NVRTC rejects as an ambiguous overload; every access here is already in-bounds by
-// construction (the `need_*` prefix covers every offset and the per-column guards bound `j`).
+// 64-bit addressing (`address_type = "u64"`): the admissible master and width-padded basis exceed
+// `u32::MAX` elements at high stems, and the per-`R` offsets in `r_cs_offset`/`r_mk_offset` (u64)
+// index the global (across-segment) master offsets. Static u64 (not "dynamic") because dynamic would
+// pick 32-bit `usize` for small blocks and then *narrow* the u64 offset arrays on read (cubecl
+// `usize::cast_from(u64)` under a u32 address type), corrupting results — the (180,92) `dx != 0`.
+// `launch_unchecked` because cubecl's checked-mode bounds clamp emits `min(u64, u64)`, which NVRTC
+// rejects as an ambiguous overload; every access here is in-bounds by construction (the `need_*`
+// prefix covers every offset, `seg_read_*` selects the owning segment, and the per-column `j` guards).
+//
+// The master (`cs*`/`mk*`) and basis (`pp*`/`ln*`) are each a segmented, no-copy-growth store bound as
+// [`MASTER_MAX_SEG`] separate segment `Array`s (cubecl has no array-of-buffers). A thread GATHERS its
+// one matrix's `col_sums`/`masks` and its term's p-part out of the segments into small local arrays
+// via `seg_read_*` (correct for any offset, straddle or not — no layout padding needed), then hands
+// those contiguous locals to `multiply_pair`, which stays a pure segmentation-agnostic arithmetic
+// core. `seg_elems` is the segment element count (`o / seg_elems` picks the segment).
 #[cube(launch_unchecked, address_type = "u64")]
 #[allow(clippy::too_many_arguments)]
 fn multiply_batch_kernel(
-    col_sums: &Array<u16>,
-    masks: &Array<u16>,
-    basis_pparts: &Array<u16>,
-    basis_lens: &Array<u32>,
+    cs0: &Array<u16>, cs1: &Array<u16>, cs2: &Array<u16>, cs3: &Array<u16>,
+    cs4: &Array<u16>, cs5: &Array<u16>, cs6: &Array<u16>, cs7: &Array<u16>,
+    cs8: &Array<u16>, cs9: &Array<u16>, cs10: &Array<u16>, cs11: &Array<u16>,
+    cs12: &Array<u16>, cs13: &Array<u16>, cs14: &Array<u16>, cs15: &Array<u16>,
+    mk0: &Array<u16>, mk1: &Array<u16>, mk2: &Array<u16>, mk3: &Array<u16>,
+    mk4: &Array<u16>, mk5: &Array<u16>, mk6: &Array<u16>, mk7: &Array<u16>,
+    mk8: &Array<u16>, mk9: &Array<u16>, mk10: &Array<u16>, mk11: &Array<u16>,
+    mk12: &Array<u16>, mk13: &Array<u16>, mk14: &Array<u16>, mk15: &Array<u16>,
+    pp0: &Array<u16>, pp1: &Array<u16>, pp2: &Array<u16>, pp3: &Array<u16>,
+    pp4: &Array<u16>, pp5: &Array<u16>, pp6: &Array<u16>, pp7: &Array<u16>,
+    pp8: &Array<u16>, pp9: &Array<u16>, pp10: &Array<u16>, pp11: &Array<u16>,
+    pp12: &Array<u16>, pp13: &Array<u16>, pp14: &Array<u16>, pp15: &Array<u16>,
+    ln0: &Array<u32>, ln1: &Array<u32>, ln2: &Array<u32>, ln3: &Array<u32>,
+    ln4: &Array<u32>, ln5: &Array<u32>, ln6: &Array<u32>, ln7: &Array<u32>,
+    ln8: &Array<u32>, ln9: &Array<u32>, ln10: &Array<u32>, ln11: &Array<u32>,
+    ln12: &Array<u32>, ln13: &Array<u32>, ln14: &Array<u32>, ln15: &Array<u32>,
     term_gei: &Array<u32>,
     g: &Array<u32>,
     xi: &Array<u32>,
@@ -1317,6 +1207,7 @@ fn multiply_batch_kernel(
     prod_out_offset: &Array<u32>,
     prod_pair_start: &Array<u32>,
     width: usize,
+    seg_elems: usize,
 ) {
     let k = ABSOLUTE_POS;
     let num_products = prod_pair_start.len() - 1;
@@ -1350,23 +1241,70 @@ fn multiply_batch_kernel(
     let cs_len = usize::cast_from(r_cs_len[ri]);
     let mk_len = usize::cast_from(r_mk_len[ri]);
     let term_slot = usize::cast_from(prod_term_start[p]) + t;
-    // `term_gei[term_slot]` is the term's *global* basis-element index (across all degrees):
-    // its (width-padded) p-part lives at `basis_pparts[gei*width ..]`, length `basis_lens[gei]`.
-    // The basis is resident on the device (uploaded once, grown incrementally), so a launch
-    // uploads only these indices instead of re-gathering every term's p-part — see
-    // [`ResidentBasisHost`].
+    // `term_gei[term_slot]` is the term's *global* basis-element index (across all degrees): its
+    // (width-padded) p-part lives at global offset `gei*width` in the segmented basis `pp*`, length
+    // `ln*[gei]`. The basis is resident on the device (uploaded once, grown incrementally), so a
+    // launch uploads only these indices instead of re-gathering every term's p-part.
     let gei = usize::cast_from(term_gei[term_slot]);
+
+    // Global (across-segment) offsets of this matrix's data and this term's p-part.
+    let cs_off = usize::cast_from(r_cs_offset[ri]) + m * cs_len;
+    let mk_off = usize::cast_from(r_mk_offset[ri]) + m * mk_len;
+    let pp_off = gei * width;
+    let term_len = usize::cast_from(seg_read_u32(
+        ln0, ln1, ln2, ln3, ln4, ln5, ln6, ln7,
+        ln8, ln9, ln10, ln11, ln12, ln13, ln14, ln15,
+        gei, seg_elems,
+    ));
+
+    // Gather this thread's matrix / term out of the segmented stores into contiguous locals, then run
+    // the pure arithmetic core on them (base 0). Entries past each length are zero, matching
+    // `multiply_pair`'s own out-of-range convention. The loop bounds at `WORKING_CAP`, exactly as the
+    // core does, so any `mk_len > WORKING_CAP` tail (never read by the core) is likewise not gathered.
+    let mut cs_local = Array::<u16>::new(WORKING_CAP);
+    let mut mk_local = Array::<u16>::new(WORKING_CAP);
+    let mut term_local = Array::<u16>::new(WORKING_CAP);
+    for j in 0..WORKING_CAP {
+        let mut c = 0u16;
+        if j < cs_len {
+            c = seg_read_u16(
+                cs0, cs1, cs2, cs3, cs4, cs5, cs6, cs7,
+                cs8, cs9, cs10, cs11, cs12, cs13, cs14, cs15,
+                cs_off + j, seg_elems,
+            );
+        }
+        cs_local[j] = c;
+        let mut mm = 0u16;
+        if j < mk_len {
+            mm = seg_read_u16(
+                mk0, mk1, mk2, mk3, mk4, mk5, mk6, mk7,
+                mk8, mk9, mk10, mk11, mk12, mk13, mk14, mk15,
+                mk_off + j, seg_elems,
+            );
+        }
+        mk_local[j] = mm;
+        let mut b = 0u16;
+        if j < term_len {
+            b = seg_read_u16(
+                pp0, pp1, pp2, pp3, pp4, pp5, pp6, pp7,
+                pp8, pp9, pp10, pp11, pp12, pp13, pp14, pp15,
+                pp_off + j, seg_elems,
+            );
+        }
+        term_local[j] = b;
+    }
+
     multiply_pair(
-        col_sums,
-        masks,
-        basis_pparts,
+        &cs_local,
+        &mk_local,
+        &term_local,
         g,
         xi,
         out,
-        usize::cast_from(r_cs_offset[ri]) + m * cs_len,
-        usize::cast_from(r_mk_offset[ri]) + m * mk_len,
-        gei * width,
-        usize::cast_from(basis_lens[gei]),
+        0,
+        0,
+        0,
+        term_len,
         cs_len,
         mk_len,
         usize::cast_from(prod_row_base[p]),
@@ -1921,36 +1859,71 @@ fn multiply_batch_block(
     }
     .executes(|| {
         let client = CudaRuntime::client(&CudaDevice::default());
-        // Shared resident admissible buffers (see [`ResidentDev`]): re-upload the master ONLY
-        // when this block dereferences past the uploaded prefix (`need_cs` / `need_mk`). The
-        // master grows continually at the frontier, so re-uploading on mere growth ships
-        // multi-GB uploads under this mutex on nearly every launch (measured 1.5x wall
-        // regression); most launches touch only long-uploaded low-degree `R`s and reuse the
-        // stale handle at its uploaded length. When an upload does fire it captures the full
-        // current master, amortizing all growth since the last one. Lock order is DEV.lock
-        // then HOST.read, and nothing under either lock blocks on rayon or a permit. The
-        // master is append-only, so the uploaded prefix is always a prefix of the current
-        // host master and every offset `< uploaded` is final.
-        // `Transient` (degree > cap `R`s): upload this block's freshly-built master and free it
-        // with the launch — no persistence, no cross-stream sharing, so no realloc guard below.
-        let (cs_h, cs_len_master, mk_h, mk_len_master) = match mode {
+        // Bind the segmented resident master/basis (see [`SegBuf`], [`seg_grow`]). Each store is
+        // `MASTER_MAX_SEG` segment handles padded with a never-indexed 1-element dummy; a
+        // single-buffer store (transient enum scratch or the passthrough diagnostic) is bound as
+        // segment 0, which the kernel resolves correctly because `seg_elems` exceeds its length so
+        // every offset lands in segment 0. `seg_grow!` re-uploads only the tail past the resident
+        // prefix (`need_*`), never copying existing segments — the no-`~2×`-spike growth that keeps
+        // cubecl out of its memory-corruption regime.
+        let seg_elems = master_seg_elems();
+        let dummy16 = client.create_from_slice(u16::as_bytes(&[0u16]));
+        let dummy32 = client.create_from_slice(u32::as_bytes(&[0u32]));
+        let pad_u16 = |mut v: Vec<(Handle, usize)>| -> Vec<(Handle, usize)> {
+            assert!(v.len() <= MASTER_MAX_SEG, "segment count exceeds MASTER_MAX_SEG");
+            while v.len() < MASTER_MAX_SEG {
+                v.push((dummy16.clone(), 1));
+            }
+            v
+        };
+        let pad_u32 = |mut v: Vec<(Handle, usize)>| -> Vec<(Handle, usize)> {
+            assert!(v.len() <= MASTER_MAX_SEG, "segment count exceeds MASTER_MAX_SEG");
+            while v.len() < MASTER_MAX_SEG {
+                v.push((dummy32.clone(), 1));
+            }
+            v
+        };
+        let full = |segs: Vec<Handle>| -> Vec<(Handle, usize)> {
+            segs.into_iter().map(|h| (h, seg_elems)).collect()
+        };
+
+        // `Transient` (degree > cap `R`s): enumerate this block's cold master ON the device into
+        // scratch, freed with the launch. `Resident` (default): grow + reuse the shared master.
+        let (cs_seg, mk_seg) = match mode {
             MasterMode::Resident => {
-                let (cs_h, cs_len_master) =
-                    resident_dev_handle!(client, need_cs, cs, cs_pending, cs_len);
-                let (mk_h, mk_len_master) =
-                    resident_dev_handle!(client, need_mk, mk, mk_pending, mk_len);
-                (cs_h, cs_len_master, mk_h, mk_len_master)
+                let (cs_segs, _) = seg_grow!(
+                    client, RESIDENT_DEV, cs, RESIDENT_UPLOAD, need_cs,
+                    copy_into_u16, u16::as_bytes, u16,
+                    |_up: usize| {
+                        let mut h = RESIDENT_HOST.write().unwrap();
+                        let nl = h.cs_len;
+                        (std::mem::take(&mut h.cs_pending), nl)
+                    }
+                );
+                let (mk_segs, _) = seg_grow!(
+                    client, RESIDENT_DEV, mk, RESIDENT_UPLOAD, need_mk,
+                    copy_into_u16, u16::as_bytes, u16,
+                    |_up: usize| {
+                        let mut h = RESIDENT_HOST.write().unwrap();
+                        let nl = h.mk_len;
+                        (std::mem::take(&mut h.mk_pending), nl)
+                    }
+                );
+                (pad_u16(full(cs_segs)), pad_u16(full(mk_segs)))
             }
             MasterMode::Transient => {
-                // Generate this block's cold `col_sums`/`masks` ON the device into transient scratch
-                // (freed with the launch), instead of uploading host-built arrays. Only the small
-                // p-parts + dimensions are uploaded. The enumeration launch is issued before the
-                // multiply on this same stream, so the scratch is fully written when the multiply
-                // reads it (kernel launches on one stream are ordered, as with `zero_u32` below).
+                // The enumeration launch is issued before the multiply on this same stream, so the
+                // scratch is fully written when the multiply reads it (one-stream launches are
+                // ordered, as with `zero_u32` below).
                 const ENUM_THREADS: u32 = 256;
                 let n_cold = enum_rows.len();
                 let cs_cap = need_cs.max(1);
                 let mk_cap = need_mk.max(1);
+                assert!(
+                    cs_cap <= seg_elems && mk_cap <= seg_elems,
+                    "transient scratch ({cs_cap}/{mk_cap} u16) exceeds one segment ({seg_elems}); \
+                     raise NASSAU_GPU_MASTER_SEG_ELEMS"
+                );
                 let cs_scratch = client.empty(cs_cap * size_of::<u16>());
                 let mk_scratch = client.empty(mk_cap * size_of::<u16>());
                 let cnt_scratch = client.empty(n_cold.max(1) * size_of::<u32>());
@@ -1976,27 +1949,47 @@ fn multiply_batch_block(
                         n_cold,
                     );
                 }
-                (cs_scratch, cs_cap, mk_scratch, mk_cap)
+                (pad_u16(vec![(cs_scratch, cs_cap)]), pad_u16(vec![(mk_scratch, mk_cap)]))
             }
+        };
+        // Resident basis segments (default) or per-launch passthrough buffers (A/B diagnostic) bound
+        // as segment 0. Every `gei` a thread dereferences is `< need_basis_elems`, so growing the
+        // basis to `need_basis_elems` (pp: `× width`) covers it.
+        let (pp_seg, ln_seg) = if passthrough {
+            assert!(
+                term_pparts.len() <= seg_elems && term_lens.len() <= seg_elems,
+                "passthrough basis exceeds one segment; raise NASSAU_GPU_MASTER_SEG_ELEMS"
+            );
+            let bp = client.create_from_slice(u16::as_bytes(&term_pparts));
+            let bl = client.create_from_slice(u32::as_bytes(&term_lens));
+            (
+                pad_u16(vec![(bp, term_pparts.len())]),
+                pad_u32(vec![(bl, term_lens.len())]),
+            )
+        } else {
+            let (pp_segs, _) = seg_grow!(
+                client, RESIDENT_BASIS_DEV, pp, RESIDENT_BASIS_UPLOAD, need_basis_elems * width,
+                copy_into_u16, u16::as_bytes, u16,
+                |up: usize| {
+                    let h = RESIDENT_BASIS_HOST.read().unwrap();
+                    let nl = h.lens.len() * h.width;
+                    (h.pparts[up..nl].to_vec(), nl)
+                }
+            );
+            let (ln_segs, _) = seg_grow!(
+                client, RESIDENT_BASIS_DEV, ln, RESIDENT_BASIS_UPLOAD, need_basis_elems,
+                copy_into_u32, u32::as_bytes, u32,
+                |up: usize| {
+                    let h = RESIDENT_BASIS_HOST.read().unwrap();
+                    let nl = h.lens.len();
+                    (h.lens[up..nl].to_vec(), nl)
+                }
+            );
+            (pad_u16(full(pp_segs)), pad_u32(full(ln_segs)))
         };
         // Upload the block's data — term data, seqno/xi tables, per-`R` offsets, per-product
         // records, the pair prefix sum, and the (zeroed) output buffer — and launch once: the
         // caller has already bounded this block's pair count and output size.
-        // Resident basis handles (default) or per-launch passthrough buffers (A/B diagnostic).
-        // `bp_len`/`bl_len` are the logical array lengths the kernel sees; every `gei` a thread
-        // dereferences is `< need_basis_elems`, so `need_basis_elems*width` / `need_basis_elems`
-        // cover it (the resident buffer may be larger — append-only — which is fine).
-        let (bp_h, bl_h, bp_len, bl_len) = if passthrough {
-            (
-                client.create_from_slice(u16::as_bytes(&term_pparts)),
-                client.create_from_slice(u32::as_bytes(&term_lens)),
-                term_pparts.len(),
-                term_lens.len(),
-            )
-        } else {
-            let (pp, ln) = basis_dev_handles!(client, need_basis_elems);
-            (pp, ln, need_basis_elems * width, need_basis_elems)
-        };
         let tg_h = client.create_from_slice(u32::as_bytes(&term_gei));
         let g_h = client.create_from_slice(u32::as_bytes(&g));
         let xi_h = client.create_from_slice(u32::as_bytes(&xi));
@@ -2005,14 +1998,11 @@ fn multiply_batch_block(
         let rcl_h = client.create_from_slice(u32::as_bytes(&r_cs_len));
         let rml_h = client.create_from_slice(u32::as_bytes(&r_mk_len));
         const THREADS: u32 = 256;
-        // Hold the resident READ lock across the multiply that dereferences the resident buffers,
-        // through the readback that syncs it (see [`RESIDENT_REALLOC`]). All resident growth for this
-        // block is already done above; a concurrent capacity realloc on another thread waits here for
-        // this multiply to finish, so the resident handle can never be swapped mid-kernel. Held to
-        // the end of the device section (dropped after `read_one`). `Transient` buffers are
-        // block-local (never reallocated by another thread), so they need no such guard.
-        let _realloc_guard =
-            (mode == MasterMode::Resident).then(|| RESIDENT_REALLOC.read().unwrap());
+        // No realloc barrier needed: the resident master/basis are append-only segmented stores whose
+        // segments, once allocated and written, never change identity and are never freed (see
+        // [`seg_grow`]). This block cloned their segment handles above, so each stays alive (refcount
+        // > 0) for the whole kernel even if another thread grows the store concurrently by appending
+        // a new segment — the churny whole-buffer swap that needed quiescing is gone.
         // Allocate the XOR accumulator uninitialized and zero it on-device (see [`zero_u32`]),
         // instead of uploading a hundreds-of-MB host zero buffer — the former dominant serial
         // marshaling cost. Same stream as the multiply below, so it is ordered before it.
@@ -2033,17 +2023,35 @@ fn multiply_batch_block(
         let poo_h = client.create_from_slice(u32::as_bytes(&prod_out_offset));
         let pps_h = client.create_from_slice(u32::as_bytes(&pps));
         let cubes = (total_pairs as u32).div_ceil(THREADS).max(1);
+        // Bind one `ArrayArg` per `(segment vector, index)` — the `.0` handle, `.1` element length.
+        macro_rules! sa {
+            ($v:expr, $i:expr) => {
+                ArrayArg::from_raw_parts($v[$i].0.clone(), $v[$i].1)
+            };
+        }
         // SAFETY: `launch_unchecked` — see the kernel's `address_type = "u64"` note. Every device
-        // read is in-bounds by construction (uploaded `need_*` prefix + per-column `j` guards).
+        // read is in-bounds by construction (uploaded `need_*` prefix, per-segment select, `j` guards).
         unsafe {
             multiply_batch_kernel::launch_unchecked::<CudaRuntime>(
                 &client,
                 CubeCount::Static(cubes, 1, 1),
                 CubeDim::new_1d(THREADS),
-                ArrayArg::from_raw_parts(cs_h, cs_len_master),
-                ArrayArg::from_raw_parts(mk_h, mk_len_master),
-                ArrayArg::from_raw_parts(bp_h, bp_len),
-                ArrayArg::from_raw_parts(bl_h, bl_len),
+                sa!(cs_seg, 0), sa!(cs_seg, 1), sa!(cs_seg, 2), sa!(cs_seg, 3),
+                sa!(cs_seg, 4), sa!(cs_seg, 5), sa!(cs_seg, 6), sa!(cs_seg, 7),
+                sa!(cs_seg, 8), sa!(cs_seg, 9), sa!(cs_seg, 10), sa!(cs_seg, 11),
+                sa!(cs_seg, 12), sa!(cs_seg, 13), sa!(cs_seg, 14), sa!(cs_seg, 15),
+                sa!(mk_seg, 0), sa!(mk_seg, 1), sa!(mk_seg, 2), sa!(mk_seg, 3),
+                sa!(mk_seg, 4), sa!(mk_seg, 5), sa!(mk_seg, 6), sa!(mk_seg, 7),
+                sa!(mk_seg, 8), sa!(mk_seg, 9), sa!(mk_seg, 10), sa!(mk_seg, 11),
+                sa!(mk_seg, 12), sa!(mk_seg, 13), sa!(mk_seg, 14), sa!(mk_seg, 15),
+                sa!(pp_seg, 0), sa!(pp_seg, 1), sa!(pp_seg, 2), sa!(pp_seg, 3),
+                sa!(pp_seg, 4), sa!(pp_seg, 5), sa!(pp_seg, 6), sa!(pp_seg, 7),
+                sa!(pp_seg, 8), sa!(pp_seg, 9), sa!(pp_seg, 10), sa!(pp_seg, 11),
+                sa!(pp_seg, 12), sa!(pp_seg, 13), sa!(pp_seg, 14), sa!(pp_seg, 15),
+                sa!(ln_seg, 0), sa!(ln_seg, 1), sa!(ln_seg, 2), sa!(ln_seg, 3),
+                sa!(ln_seg, 4), sa!(ln_seg, 5), sa!(ln_seg, 6), sa!(ln_seg, 7),
+                sa!(ln_seg, 8), sa!(ln_seg, 9), sa!(ln_seg, 10), sa!(ln_seg, 11),
+                sa!(ln_seg, 12), sa!(ln_seg, 13), sa!(ln_seg, 14), sa!(ln_seg, 15),
                 ArrayArg::from_raw_parts(tg_h, term_gei.len()),
                 ArrayArg::from_raw_parts(g_h, g.len()),
                 ArrayArg::from_raw_parts(xi_h, xi.len()),
@@ -2059,6 +2067,7 @@ fn multiply_batch_block(
                 ArrayArg::from_raw_parts(poo_h, products.len()),
                 ArrayArg::from_raw_parts(pps_h, pps.len()),
                 width,
+                seg_elems,
             );
         }
 
@@ -2095,14 +2104,6 @@ fn multiply_batch_block(
     result
 }
 
-/// Max number of fixed-size segments a segmented resident master can have. The kernel selects a
-/// segment by a static branch (cubecl cannot dynamically index an array-of-buffers), so this is a
-/// compile-time bound; `MASTER_SEG_ELEMS` sets the per-segment element count. 8 segments is the
-/// prototype size (raise once the mechanic is wired + validated). Together they cap a buffer at
-/// `MASTER_MAX_SEG * MASTER_SEG_ELEMS` u16 elements.
-#[allow(dead_code)] // used once the segmented master is wired into the multiply path
-const MASTER_MAX_SEG: usize = 8;
-
 /// Read `data[o]` from a master split into up to [`MASTER_MAX_SEG`] fixed-size segments of
 /// `seg_elems` elements each: segment `o / seg_elems`, local index `o % seg_elems`. This is the
 /// no-copy-growth replacement for a single contiguous `Array<u16>` — appending a segment never
@@ -2110,7 +2111,7 @@ const MASTER_MAX_SEG: usize = 8;
 /// the `~2×` realloc-doubling transient that pushes cubecl into its memory-corruption regime. The
 /// per-segment `Array`s are separate kernel args because cubecl has no array-of-buffers; the branch
 /// is the price of staying inside cubecl (vs raw CUDA VMM). `seg_elems` is runtime so tests can use
-/// tiny segments; production sets it large.
+/// tiny segments; production sets it large. Keep the branch chain length equal to [`MASTER_MAX_SEG`].
 #[cube]
 #[allow(clippy::too_many_arguments)]
 fn seg_read_u16(
@@ -2122,6 +2123,14 @@ fn seg_read_u16(
     s5: &Array<u16>,
     s6: &Array<u16>,
     s7: &Array<u16>,
+    s8: &Array<u16>,
+    s9: &Array<u16>,
+    s10: &Array<u16>,
+    s11: &Array<u16>,
+    s12: &Array<u16>,
+    s13: &Array<u16>,
+    s14: &Array<u16>,
+    s15: &Array<u16>,
     o: usize,
     seg_elems: usize,
 ) -> u16 {
@@ -2142,15 +2151,93 @@ fn seg_read_u16(
         v = s5[local];
     } else if seg == 6 {
         v = s6[local];
-    } else {
+    } else if seg == 7 {
         v = s7[local];
+    } else if seg == 8 {
+        v = s8[local];
+    } else if seg == 9 {
+        v = s9[local];
+    } else if seg == 10 {
+        v = s10[local];
+    } else if seg == 11 {
+        v = s11[local];
+    } else if seg == 12 {
+        v = s12[local];
+    } else if seg == 13 {
+        v = s13[local];
+    } else if seg == 14 {
+        v = s14[local];
+    } else {
+        v = s15[local];
+    }
+    v
+}
+
+/// `u32` sibling of [`seg_read_u16`] (the resident basis `lens` are u32). Same static-branch segment
+/// select; see [`seg_read_u16`] for the layout and rationale.
+#[cube]
+#[allow(clippy::too_many_arguments)]
+fn seg_read_u32(
+    s0: &Array<u32>,
+    s1: &Array<u32>,
+    s2: &Array<u32>,
+    s3: &Array<u32>,
+    s4: &Array<u32>,
+    s5: &Array<u32>,
+    s6: &Array<u32>,
+    s7: &Array<u32>,
+    s8: &Array<u32>,
+    s9: &Array<u32>,
+    s10: &Array<u32>,
+    s11: &Array<u32>,
+    s12: &Array<u32>,
+    s13: &Array<u32>,
+    s14: &Array<u32>,
+    s15: &Array<u32>,
+    o: usize,
+    seg_elems: usize,
+) -> u32 {
+    let seg = o / seg_elems;
+    let local = o % seg_elems;
+    let mut v = 0u32;
+    if seg == 0 {
+        v = s0[local];
+    } else if seg == 1 {
+        v = s1[local];
+    } else if seg == 2 {
+        v = s2[local];
+    } else if seg == 3 {
+        v = s3[local];
+    } else if seg == 4 {
+        v = s4[local];
+    } else if seg == 5 {
+        v = s5[local];
+    } else if seg == 6 {
+        v = s6[local];
+    } else if seg == 7 {
+        v = s7[local];
+    } else if seg == 8 {
+        v = s8[local];
+    } else if seg == 9 {
+        v = s9[local];
+    } else if seg == 10 {
+        v = s10[local];
+    } else if seg == 11 {
+        v = s11[local];
+    } else if seg == 12 {
+        v = s12[local];
+    } else if seg == 13 {
+        v = s13[local];
+    } else if seg == 14 {
+        v = s14[local];
+    } else {
+        v = s15[local];
     }
     v
 }
 
 /// Validation kernel for [`seg_read_u16`]: `out[i] = segmented[idx[i]]`. Lets a test assert the
-/// segmented read reproduces a contiguous buffer bit-for-bit before the mechanic is wired into the
-/// multiply's hot path.
+/// segmented read reproduces a contiguous buffer bit-for-bit (see `seg_read_matches_contiguous`).
 #[cfg(test)]
 #[cube(launch)]
 #[allow(clippy::too_many_arguments)]
@@ -2163,6 +2250,14 @@ fn seg_gather_kernel(
     s5: &Array<u16>,
     s6: &Array<u16>,
     s7: &Array<u16>,
+    s8: &Array<u16>,
+    s9: &Array<u16>,
+    s10: &Array<u16>,
+    s11: &Array<u16>,
+    s12: &Array<u16>,
+    s13: &Array<u16>,
+    s14: &Array<u16>,
+    s15: &Array<u16>,
     idx: &Array<u32>,
     out: &mut Array<u16>,
     seg_elems: usize,
@@ -2172,14 +2267,7 @@ fn seg_gather_kernel(
         terminate!();
     }
     out[i] = seg_read_u16(
-        s0,
-        s1,
-        s2,
-        s3,
-        s4,
-        s5,
-        s6,
-        s7,
+        s0, s1, s2, s3, s4, s5, s6, s7, s8, s9, s10, s11, s12, s13, s14, s15,
         usize::cast_from(idx[i]),
         seg_elems,
     );
@@ -2595,6 +2683,14 @@ fn seg_gather_on_gpu(data: &[u16], seg_elems: usize, indices: &[u32]) -> Vec<u16
             arg(5),
             arg(6),
             arg(7),
+            arg(8),
+            arg(9),
+            arg(10),
+            arg(11),
+            arg(12),
+            arg(13),
+            arg(14),
+            arg(15),
             ArrayArg::from_raw_parts(idx_h, indices.len()),
             ArrayArg::from_raw_parts(out_h.clone(), indices.len()),
             seg_elems,
@@ -3100,6 +3196,101 @@ mod tests {
         eprintln!(
             "multiply_batch: {} products across {num_rows} rows matched reference",
             products.len()
+        );
+    }
+
+    /// Drive several batched multiplies at INCREASING output degree so the shared segmented resident
+    /// master (see [`SegBuf`], [`seg_grow`]) grows ACROSS launches — each later call appends into the
+    /// partially-filled last segment and, at a small `NASSAU_GPU_MASTER_SEG_ELEMS`, allocates fresh
+    /// segments. Run with e.g. `NASSAU_GPU_MASTER_SEG_ELEMS=64` to force many segments and exercise
+    /// the cross-launch append (the one growth sub-path the single-shot test above does not reach);
+    /// with the default large segment it still checks correctness on the single-segment path.
+    #[test]
+    fn multiply_batch_incremental_growth() {
+        use fp::{prime::ValidPrime, vector::FpVector};
+
+        let p = ValidPrime::new(2);
+        let algebra = MilnorAlgebra::new(p, false);
+        let max_degree = 48;
+        algebra.compute_basis(max_degree);
+        algebra.compute_seqno_tables(max_degree);
+        let num_rows = 8;
+
+        // One batched multiply at `out_degree`, checked against the CPU reference. Reused across a
+        // sequence of growing degrees; the resident master persists (process-global) and grows
+        // monotonically between calls.
+        let check = |out_degree: i32| {
+            let out_dim = algebra.dimension(out_degree);
+            let mut products = Vec::new();
+            for r_degree in 1..out_degree {
+                let s_degree = out_degree - r_degree;
+                let s_dim = algebra.dimension(s_degree);
+                if s_dim == 0 {
+                    continue;
+                }
+                for r_idx in 0..algebra.dimension(r_degree) {
+                    if algebra
+                        .basis_element_from_index(r_degree, r_idx)
+                        .p_part
+                        .is_empty()
+                    {
+                        continue;
+                    }
+                    let row = products.len() % num_rows;
+                    products.push(GpuProduct {
+                        r_degree,
+                        r_idx,
+                        s_degree,
+                        term_indices: (0..s_dim).collect(),
+                        row,
+                        out_offset: 0,
+                    });
+                }
+            }
+            let mut cpu_rows: Vec<FpVector> =
+                (0..num_rows).map(|_| FpVector::new(p, out_dim)).collect();
+            for prod in &products {
+                let mut s = FpVector::new(p, algebra.dimension(prod.s_degree));
+                for &ti in &prod.term_indices {
+                    s.set_entry(ti, 1);
+                }
+                let mut tmp = FpVector::new(p, out_dim);
+                algebra.multiply_basis_element_by_element_2(
+                    tmp.as_slice_mut(),
+                    1,
+                    prod.r_degree,
+                    prod.r_idx,
+                    prod.s_degree,
+                    s.as_slice(),
+                );
+                cpu_rows[prod.row].add(&tmp, 1);
+            }
+            let num_limbs = out_dim.div_ceil(32).max(1);
+            let golden: Vec<Vec<u32>> = cpu_rows
+                .iter()
+                .map(|row| {
+                    let mut packed = vec![0u32; num_limbs];
+                    for (i, _) in row.iter_nonzero() {
+                        packed[i / 32] ^= 1u32 << (i % 32);
+                    }
+                    packed
+                })
+                .collect();
+            let got = multiply_batch_on_gpu(&algebra, out_dim, num_rows, &products);
+            assert_eq!(
+                got, golden,
+                "incremental-growth GPU multiply diverged from reference at out_degree={out_degree}"
+            );
+        };
+
+        // Strictly increasing so every call grows the resident master past the previous one.
+        for out_degree in [14, 20, 26, 32, 38] {
+            check(out_degree);
+        }
+        eprintln!(
+            "multiply_batch_incremental_growth: 5 growing launches matched reference \
+             (seg_elems={})",
+            master_seg_elems()
         );
     }
 }
