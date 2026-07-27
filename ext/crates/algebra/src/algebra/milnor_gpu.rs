@@ -35,6 +35,19 @@ use crate::algebra::{Algebra, MilnorAlgebra, combinatorics::xi_degrees};
 /// `mk_len = rows + cols − 1 ≤ MAX_XI_TAU + ⌈log2⌉`; 32 covers every in-range case.
 const WORKING_CAP: usize = 32;
 
+/// Per-thread local caps for the in-kernel admissible enumeration ([`enumerate_admissible_kernel`]).
+/// Each `R` has `rows = |p_part| ≤ MAX_XI_TAU` and `cols ≤ WORKING_CAP` (max bit-length of an entry),
+/// so the enumeration's `matrix` is `rows*cols`, `col_sums` is `cols−1`, and `masks` is `rows+cols−1`.
+/// These bound the fixed-size local `Array`s the kernel allocates per thread.
+#[cfg(test)]
+const ENUM_ROW_CAP: usize = MAX_XI_TAU;
+#[cfg(test)]
+const ENUM_COL_CAP: usize = WORKING_CAP;
+#[cfg(test)]
+const ENUM_MATRIX_CAP: usize = ENUM_ROW_CAP * ENUM_COL_CAP;
+#[cfg(test)]
+const ENUM_MASK_CAP: usize = ENUM_ROW_CAP + ENUM_COL_CAP;
+
 /// Target `(product, matrix, term)` thread-pairs per GPU launch. The batch multiply indexes threads
 /// by CubeCL's `ABSOLUTE_POS` (a `u32`), so one launch can address at most `2^32` threads; a single
 /// all-rows reuse build reaches ~4.4e9 pairs at stem ~145, past that limit. The row-block splitter
@@ -2044,6 +2057,242 @@ fn multiply_batch_block(
     result
 }
 
+/// In-kernel admissible-matrix enumeration: one thread per distinct `R`, generating that `R`'s
+/// `col_sums`/`masks` for *every* admissible matrix directly into device scratch — the on-GPU
+/// replacement for the resident/uploaded master (the stem-300 memory wall + the eviction re-upload
+/// cost). This is the cubecl transcription of [`enumerate_admissible_ref`] (validated bit-exact on
+/// the CPU), using only flag-guarded control flow — `while … && !found` in place of the odometer's
+/// `break`/early `return`, `handled` in place of its `continue`. All per-thread state lives in
+/// fixed-size local `Array`s ([`ENUM_MATRIX_CAP`] etc.); the values are small (≤ `u16`), stored as
+/// `u16` exactly like the uploaded master so the multiply kernel reads them unchanged.
+///
+/// Inputs are per-`R`: `p_parts` (`n_r × width`, zero-padded), `r_rows`/`r_cols` (its dimensions),
+/// and `r_cs_out`/`r_mk_out` (its base offset, in `u16` units, into the shared `out_cs`/`out_mk`
+/// scratch — a host prefix-sum of `num_mats × cs_len` / `num_mats × mk_len`). `out_counts[ri]`
+/// receives the number of matrices the thread emitted, so a count-only pre-pass can drive the
+/// prefix-sum without any host enumeration. Runtime-agnostic: the same kernel lowers to CUDA (the
+/// H200 path) and to the `cpu` backend (used by `admissible_enum_gpu_matches` to cross-check the
+/// device lowering against `enumerate_admissible_ref` without a GPU).
+#[cfg(test)]
+#[cube(launch)]
+#[allow(clippy::too_many_arguments)]
+fn enumerate_admissible_kernel(
+    p_parts: &Array<u32>,
+    r_rows: &Array<u32>,
+    r_cols: &Array<u32>,
+    r_cs_out: &Array<u32>,
+    r_mk_out: &Array<u32>,
+    out_cs: &mut Array<u16>,
+    out_mk: &mut Array<u16>,
+    out_counts: &mut Array<u32>,
+    width: usize,
+    n_r: usize,
+) {
+    let ri = ABSOLUTE_POS;
+    if ri >= n_r {
+        terminate!();
+    }
+    let rows = usize::cast_from(r_rows[ri]);
+    let cols = usize::cast_from(r_cols[ri]);
+    let cs_len = cols - 1;
+    let mk_len = rows + cols - 1;
+    let pbase = ri * width;
+    let cs_base = usize::cast_from(r_cs_out[ri]);
+    let mk_base = usize::cast_from(r_mk_out[ri]);
+
+    // Per-thread local state, mirroring `AdmissibleMatrix` / `enumerate_admissible_ref`. CUDA local
+    // arrays are uninitialized, so every slot up to the comptime cap is explicitly zeroed first.
+    let mut matrix = Array::<u32>::new(ENUM_MATRIX_CAP);
+    let mut totals = Array::<u32>::new(ENUM_ROW_CAP);
+    let mut col_sums = Array::<u32>::new(ENUM_COL_CAP);
+    let mut masks = Array::<u32>::new(ENUM_MASK_CAP);
+    for i in 0..ENUM_MATRIX_CAP {
+        matrix[i] = 0u32;
+    }
+    for i in 0..ENUM_ROW_CAP {
+        totals[i] = 0u32;
+    }
+    for i in 0..ENUM_COL_CAP {
+        col_sums[i] = 0u32;
+    }
+    for i in 0..ENUM_MASK_CAP {
+        masks[i] = 0u32;
+    }
+    // Column 0 of the matrix (and the initial masks) is the padded p_part.
+    for i in 0..rows {
+        let x = p_parts[pbase + i];
+        matrix[i * cols] = x;
+        masks[i] = x;
+    }
+
+    let mut mat = 0usize;
+    let mut more = true;
+    while more {
+        // Emit the current matrix's col_sums/masks into this R's scratch slot.
+        let co = cs_base + mat * cs_len;
+        for j in 0..cs_len {
+            out_cs[co + j] = u16::cast_from(col_sums[j]);
+        }
+        let mo = mk_base + mat * mk_len;
+        for j in 0..mk_len {
+            out_mk[mo + j] = u16::cast_from(masks[j]);
+        }
+        mat += 1;
+
+        // One `next()` step: `found` = produced a new matrix (the ref's `return true`); `handled`
+        // = this column already updated `totals` (the ref's `continue`). Loops guard on `!found`.
+        let mut found = false;
+        let mut row = 0usize;
+        while row < rows && !found {
+            let mut p_to_the_j = 1u32;
+            totals[row] = matrix[row * cols];
+            let mut col = 1usize;
+            while col < cols && !found {
+                p_to_the_j *= 2u32;
+                let mut handled = false;
+                if p_to_the_j <= totals[row] {
+                    // Bitsum along the anti-diagonal to the bottom-left (saturating start index).
+                    let mut d = 0u32;
+                    let mut c = 0usize;
+                    if row + col + 1 > rows {
+                        c = row + col + 1 - rows;
+                    }
+                    while c < col {
+                        d |= matrix[(row + col - c) * cols + c];
+                        c += 1;
+                    }
+                    let cur = matrix[row * cols + col];
+                    let new_entry = ((cur | d) + 1u32) & !d;
+                    let inc = new_entry - cur;
+                    let sub = inc * p_to_the_j;
+                    if totals[row] < sub {
+                        totals[row] += p_to_the_j * cur;
+                        handled = true;
+                    } else {
+                        matrix[row * cols] = totals[row] - sub;
+                        masks[row] = matrix[row * cols];
+                        col_sums[col - 1] += inc;
+                        let mut j = 1usize;
+                        while j < col {
+                            masks[row + j] &= !matrix[row * cols + j];
+                            col_sums[j - 1] -= matrix[row * cols + j];
+                            matrix[row * cols + j] = 0u32;
+                            j += 1;
+                        }
+                        matrix[row * cols + col] = new_entry;
+                        let mut i = 0usize;
+                        while i < row {
+                            matrix[i * cols] = totals[i];
+                            masks[i] = totals[i];
+                            let mut j2 = 1usize;
+                            while j2 < cols {
+                                if i + j2 > row {
+                                    masks[i + j2] &= !matrix[i * cols + j2];
+                                }
+                                col_sums[j2 - 1] -= matrix[i * cols + j2];
+                                matrix[i * cols + j2] = 0u32;
+                                j2 += 1;
+                            }
+                            i += 1;
+                        }
+                        masks[row + col] = d | new_entry;
+                        found = true;
+                        handled = true;
+                    }
+                }
+                if !handled {
+                    totals[row] += p_to_the_j * matrix[row * cols + col];
+                }
+                col += 1;
+            }
+            row += 1;
+        }
+        more = found;
+    }
+
+    out_counts[ri] = u32::cast_from(mat);
+}
+
+/// Backend-agnostic host driver for [`enumerate_admissible_kernel`]. Lays out each `R`'s scratch
+/// slot from the supplied per-`R` `num_mats` (a prefix-sum of `num_mats·cs_len` / `num_mats·mk_len`),
+/// uploads the compact per-`R` inputs, launches one thread per `R` on `device`, and reads back the
+/// packed `(out_cs, out_mk, counts)`. Generic over [`Runtime`] so the *same* kernel can be run on
+/// CUDA (the H200 path) and on the `cpu` backend — the cross-lowering check the caller uses to
+/// confirm the device semantics match [`enumerate_admissible_ref`] without needing a GPU.
+#[cfg(test)]
+fn enumerate_admissible_on_runtime<R: Runtime>(
+    device: &R::Device,
+    p_parts: &[Vec<u32>],
+    num_mats: &[u32],
+) -> (Vec<u16>, Vec<u16>, Vec<u32>) {
+    let n_r = p_parts.len();
+    let width = p_parts.iter().map(Vec::len).max().unwrap();
+
+    let mut pp_flat = vec![0u32; n_r * width];
+    let mut r_rows = vec![0u32; n_r];
+    let mut r_cols = vec![0u32; n_r];
+    let mut r_cs_out = vec![0u32; n_r];
+    let mut r_mk_out = vec![0u32; n_r];
+    let mut cs_total = 0u32;
+    let mut mk_total = 0u32;
+    for (i, pp) in p_parts.iter().enumerate() {
+        let rows = pp.len();
+        let cols = pp
+            .iter()
+            .map(|&x| (u32::BITS - x.leading_zeros()) as usize)
+            .max()
+            .unwrap();
+        let cs_len = (cols - 1) as u32;
+        let mk_len = (rows + cols - 1) as u32;
+        for (slot, &v) in pp_flat[i * width..i * width + rows].iter_mut().zip(pp) {
+            *slot = v;
+        }
+        r_rows[i] = rows as u32;
+        r_cols[i] = cols as u32;
+        r_cs_out[i] = cs_total;
+        r_mk_out[i] = mk_total;
+        cs_total += num_mats[i] * cs_len;
+        mk_total += num_mats[i] * mk_len;
+    }
+
+    let client = R::client(device);
+    let pp_h = client.create_from_slice(u32::as_bytes(&pp_flat));
+    let rr_h = client.create_from_slice(u32::as_bytes(&r_rows));
+    let rc_h = client.create_from_slice(u32::as_bytes(&r_cols));
+    let rco_h = client.create_from_slice(u32::as_bytes(&r_cs_out));
+    let rmo_h = client.create_from_slice(u32::as_bytes(&r_mk_out));
+    // `empty` needs a non-zero size even when a batch happens to have no matrices.
+    let cs_cap = (cs_total.max(1)) as usize;
+    let mk_cap = (mk_total.max(1)) as usize;
+    let ocs_h = client.empty(cs_cap * size_of::<u16>());
+    let omk_h = client.empty(mk_cap * size_of::<u16>());
+    let cnt_h = client.empty(n_r * size_of::<u32>());
+
+    const THREADS: u32 = 64;
+    let cubes = (n_r as u32).div_ceil(THREADS);
+    unsafe {
+        enumerate_admissible_kernel::launch::<R>(
+            &client,
+            CubeCount::Static(cubes, 1, 1),
+            CubeDim::new_1d(THREADS),
+            ArrayArg::from_raw_parts(pp_h, pp_flat.len()),
+            ArrayArg::from_raw_parts(rr_h, n_r),
+            ArrayArg::from_raw_parts(rc_h, n_r),
+            ArrayArg::from_raw_parts(rco_h, n_r),
+            ArrayArg::from_raw_parts(rmo_h, n_r),
+            ArrayArg::from_raw_parts(ocs_h.clone(), cs_cap),
+            ArrayArg::from_raw_parts(omk_h.clone(), mk_cap),
+            ArrayArg::from_raw_parts(cnt_h.clone(), n_r),
+            width,
+            n_r,
+        );
+    }
+    let cs = u16::from_bytes(&client.read_one(ocs_h).unwrap()).to_vec();
+    let mk = u16::from_bytes(&client.read_one(omk_h).unwrap()).to_vec();
+    let counts = u32::from_bytes(&client.read_one(cnt_h).unwrap()).to_vec();
+    (cs, mk, counts)
+}
+
 /// CPU reference for the planned *in-kernel* admissible-matrix enumeration — the direction that
 /// replaces the resident/uploaded master (the stem-300 memory wall + the eviction re-upload cost)
 /// by generating each `R`'s `col_sums`/`masks` ON THE GPU into a transient scratch buffer, never
@@ -2161,9 +2410,64 @@ fn enumerate_admissible_ref(p_part: &[u32]) -> (usize, usize, Vec<u32>, Vec<u32>
     (cs_len, mk_len, out_cs, out_mk)
 }
 
+/// Shared body for the per-backend enumeration tests: builds a batch of every real `R` up to
+/// `max_degree`, computes the expected packed `col_sums`/`masks` (and per-`R` `num_mats`) from the
+/// CPU-validated [`enumerate_admissible_ref`], runs [`enumerate_admissible_kernel`] on `R`'s
+/// `device`, and asserts the device output is bit-exact — values *and* per-`R` counts. Generic so
+/// CUDA (H200) and the `cpu` backend run the identical kernel through it.
+#[cfg(test)]
+fn check_enum_backend<Rt: Runtime>(device: &Rt::Device, max_degree: i32) {
+    use fp::prime::ValidPrime;
+
+    let p = ValidPrime::new(2);
+    let algebra = MilnorAlgebra::new(p, false);
+    algebra.compute_basis(max_degree);
+
+    let mut p_parts: Vec<Vec<u32>> = Vec::new();
+    let mut num_mats: Vec<u32> = Vec::new();
+    let mut exp_cs: Vec<u16> = Vec::new();
+    let mut exp_mk: Vec<u16> = Vec::new();
+    for deg in 1..=max_degree {
+        for idx in 0..algebra.dimension(deg) {
+            let pp = algebra.basis_element_from_index(deg, idx).p_part.clone();
+            if pp.is_empty() {
+                continue;
+            }
+            let (_cs_len, mk_len, cs, mk) = enumerate_admissible_ref(&pp);
+            // `mk_len = rows+cols-1 ≥ 1` always, so it recovers the matrix count even when
+            // `cs_len == 0` (an all-ones p_part contributes no col_sums).
+            num_mats.push((mk.len() / mk_len) as u32);
+            exp_cs.extend(cs.iter().map(|&v| narrow_u16(v)));
+            exp_mk.extend(mk.iter().map(|&v| narrow_u16(v)));
+            p_parts.push(pp);
+        }
+    }
+    assert!(!p_parts.is_empty(), "no R's exercised");
+
+    let (got_cs, got_mk, counts) =
+        enumerate_admissible_on_runtime::<Rt>(device, &p_parts, &num_mats);
+    assert_eq!(counts, num_mats, "per-R matrix counts diverged from the CPU reference");
+    assert_eq!(got_cs, exp_cs, "device col_sums diverged from the CPU reference");
+    assert_eq!(got_mk, exp_mk, "device masks diverged from the CPU reference");
+    eprintln!(
+        "enum backend: {} R's, {} matrices bit-exact vs enumerate_admissible_ref",
+        p_parts.len(),
+        num_mats.iter().sum::<u32>()
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The in-kernel [`enumerate_admissible_kernel`], run on the CUDA backend, must reproduce the
+    /// CPU-validated [`enumerate_admissible_ref`] bit-for-bit over every real `R` up to degree 40 —
+    /// validating the cubecl lowering of the flag-based enumeration (local arrays, bitops, u16
+    /// stores) on the actual H200 target. Requires a live GPU + the CUDA toolkit env.
+    #[test]
+    fn admissible_enum_gpu_matches() {
+        check_enum_backend::<CudaRuntime>(&CudaDevice::default(), 40);
+    }
 
     /// The flag-based [`enumerate_admissible_ref`] must reproduce `admissible_matrices` bit-for-bit
     /// on every real `R` — this validates the no-break/continue/return restructuring (the tricky
