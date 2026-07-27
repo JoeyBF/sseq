@@ -1187,6 +1187,10 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
             // idle. This cannot deadlock: parked entries keep their senders, so the channel stays
             // open, and the timeout guarantees parked work is retried until a free worker takes it.
             let mut deferred: Vec<(Bidegree, mpsc::Sender<SenderData>)> = Vec::new();
+            // Diagnostic (`NASSAU_MEM_REPORT`): count committed bidegrees so we can periodically
+            // report the retained-data heap split (differentials' `outputs` vs modules' tables).
+            let mem_report = std::env::var_os("NASSAU_MEM_REPORT").is_some();
+            let mut commit_count = 0usize;
             // How long to wait for a message before retrying parked bidegrees. Small enough that a
             // freed worker is used promptly, large enough that the poll is negligible; it only ticks
             // while something is parked.
@@ -1217,6 +1221,37 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                     }
                     assert!(progress[b.s() as usize] == b.t() - 1);
                     progress[b.s() as usize] = b.t();
+
+                    if mem_report {
+                        commit_count += 1;
+                        if commit_count % 400 == 0 {
+                            let diff_b: usize = self
+                                .differentials
+                                .iter()
+                                .map(|(_, d)| d.output_heap_bytes())
+                                .sum();
+                            let mod_b: usize =
+                                self.modules.iter().map(|(_, m)| m.table_heap_bytes()).sum();
+                            #[cfg(feature = "gpu")]
+                            let (res_master, res_basis) =
+                                algebra::milnor_gpu::resident_host_bytes();
+                            #[cfg(not(feature = "gpu"))]
+                            let (res_master, res_basis) = (0usize, 0usize);
+                            let gb = |x: usize| x as f64 / (1u64 << 30) as f64;
+                            eprintln!(
+                                "[MEM] commits={commit_count} last_b=({},{}) \
+                                 differentials={:.1}GB modules={:.1}GB \
+                                 resident_master={:.1}GB resident_basis={:.1}GB accounted={:.1}GB",
+                                b.n(),
+                                b.s(),
+                                gb(diff_b),
+                                gb(mod_b),
+                                gb(res_master),
+                                gb(res_basis),
+                                gb(diff_b + mod_b + res_master + res_basis),
+                            );
+                        }
+                    }
 
                     // Completing `b` can only make ready its same-row successor `(s, t + 1)` and one
                     // diagonal successor. `ready` requires *both* predecessors, so of the two

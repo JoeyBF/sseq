@@ -111,22 +111,26 @@ static GPU_BUDGET: LazyLock<GpuBudget> = LazyLock::new(|| GpuBudget {
     freed: Condvar::new(),
 });
 
-/// Number of distinct CUDA streams to spread device work over (`NASSAU_GPU_STREAMS`, default 8).
+/// Number of distinct CUDA streams to spread device work over (`NASSAU_GPU_STREAMS`, default 1).
 /// Each worker thread gets a stable per-thread stream id (see [`thread_stream_id`]), and this caps
 /// how many distinct streams — hence retained memory pools — exist; `1` forces the single-stream
 /// mode (all threads → stream 0).
 ///
-/// Multi-stream is SAFE because the shared resident master/basis are grown IN PLACE in stable
-/// device buffers ([`ResidentDev`]) — the read-only "global weights" pattern cubecl supports across
-/// streams. (The earlier churny design — re-`create_from_slice` a new handle on every growth — broke
-/// cubecl's per-handle cross-stream sync and had to run single-stream; that is fixed.)
+/// **Default 1 (single stream) because multi-stream is a MEMORY disaster for little gain.** cubecl
+/// gives each CUDA stream its own device AND page-locked host (pinned) memory pool, and those pools
+/// are never trimmed (`memory_cleanup` frees only the GPU pool). Measured at stem 180: single-stream
+/// holds pinned host memory at ~4 GB, but ≥2 streams balloons it to 140–240 GB (each stream retains
+/// its own varying-size readback/staging pages) — the dominant term in the ~500 GB cgroup OOM. And
+/// the payoff is ~nil: cubecl's server is single-threaded (one runner behind a channel), so extra
+/// streams buy no CPU-side concurrency, only GPU kernel overlap that the big saturating multiplies
+/// barely benefit from. Raise it only on a dedicated large-RAM node that wants that overlap.
 fn gpu_stream_slots() -> u64 {
     static SLOTS: LazyLock<u64> = LazyLock::new(|| {
         std::env::var("NASSAU_GPU_STREAMS")
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
             .filter(|&n| n > 0)
-            .unwrap_or(8)
+            .unwrap_or(1)
     });
     *SLOTS
 }
@@ -214,6 +218,23 @@ pub fn take_batch_stats() -> (u64, u64, u64, u64) {
     )
 }
 
+/// Diagnostic (see `NASSAU_MEM_REPORT`): resident-master HOST-side heap bytes — the not-yet-uploaded
+/// `col_sums`/`masks` tails, the width-padded basis `pparts`/`lens`, and the per-`R` `index` map
+/// (its `Vec<PPartEntry>` keys). The bulk `col_sums`/`masks` are no longer retained (freed after
+/// upload — see [`ResidentHost`]); only the pending tail + the `index` persist. Returns `(master, basis)`.
+pub fn resident_host_bytes() -> (usize, usize) {
+    let h = RESIDENT_HOST.read().unwrap();
+    let master = h.cs_pending.capacity() * 2
+        + h.mk_pending.capacity() * 2
+        + h.index.capacity()
+            * (std::mem::size_of::<RInfo>()
+                + std::mem::size_of::<Vec<PPartEntry>>()
+                + 4 * std::mem::size_of::<PPartEntry>());
+    let b = RESIDENT_BASIS_HOST.read().unwrap();
+    let basis = b.pparts.capacity() * 2 + b.lens.capacity() * 4 + b.global_base.capacity() * 4;
+    (master, basis)
+}
+
 use std::{
     collections::HashMap,
     sync::{Condvar, LazyLock, Mutex, RwLock},
@@ -250,10 +271,19 @@ struct RInfo {
 /// common case once the `R`s saturate) take the read lock, and only a first-sight append
 /// takes the write lock — with the enumeration itself done *outside* the lock, so readers
 /// never stall behind it.
+/// The host master keeps ONLY the not-yet-uploaded tail (`*_pending`) plus a logical length
+/// (`*_len`), never the full `col_sums`/`masks`. Once an `R`'s admissible data is copied to the
+/// device it is dropped host-side — it is provably never read again (offsets come from `index`;
+/// growth uploads only the pending tail; a capacity realloc copies the old *device* buffer, not the
+/// host). This removes the multi-GB host↔device duplicate that dominated the resolver's anon RSS
+/// (~27 GB at stem 130, growing). Invariant maintained by [`resident_dev_handle`]:
+/// `RESIDENT_DEV.$buf.uploaded == $len - $pending.len()`, i.e. `$pending == master[uploaded..$len]`.
 #[derive(Default)]
 struct ResidentHost {
-    col_sums: Vec<u16>,
-    masks: Vec<u16>,
+    cs_pending: Vec<u16>,
+    mk_pending: Vec<u16>,
+    cs_len: usize,
+    mk_len: usize,
     index: HashMap<Vec<PPartEntry>, RInfo>,
 }
 
@@ -315,7 +345,7 @@ static RESIDENT_REALLOC: RwLock<()> = RwLock::new(());
 /// `RESIDENT_UPLOAD`, and a re-check coalesces a burst of growth-needing launches into one
 /// upload). The master is append-only, so any handle with `uploaded >= need` is valid.
 macro_rules! resident_dev_handle {
-    ($client:expr, $need:expr, $buf:ident, $host_vec:ident) => {{
+    ($client:expr, $need:expr, $buf:ident, $pending:ident, $len:ident) => {{
         // Lock-free fast path: the stable handle already covers `$need`.
         let read_current = || {
             let dev = RESIDENT_DEV.read().unwrap();
@@ -335,7 +365,17 @@ macro_rules! resident_dev_handle {
                             let dev = RESIDENT_DEV.read().unwrap();
                             (dev.$buf.handle.clone(), dev.$buf.cap, dev.$buf.uploaded)
                         };
-                        let host_len = RESIDENT_HOST.read().unwrap().$host_vec.len();
+                        // Take the not-yet-uploaded tail and the logical length together. By the
+                        // invariant (see [`ResidentHost`]) the tail is exactly `master[uploaded..len]`,
+                        // so `uploaded + batch.len() == host_len`. `mem::take` FREES it host-side —
+                        // once on the device it is never read again. Appends after this point land in
+                        // a fresh `$pending` and upload on the next growth. `RESIDENT_UPLOAD` (held)
+                        // makes this the sole grower, so `uploaded` is stable here.
+                        let (batch, host_len) = {
+                            let mut host = RESIDENT_HOST.write().unwrap();
+                            (std::mem::take(&mut host.$pending), host.$len)
+                        };
+                        debug_assert_eq!(uploaded + batch.len(), host_len);
 
                         // (Re)allocate a stable persistent buffer on first use or capacity overflow
                         // (rare: `RESIDENT_INIT_CAP` has headroom and the master saturates early),
@@ -363,27 +403,24 @@ macro_rules! resident_dev_handle {
                             (old_handle.unwrap(), cap)
                         };
 
-                        // Write the new tail host[uploaded..host_len] into the STABLE buffer at its
-                        // append offset via a scratch upload + copy kernel, then SYNC before
-                        // publishing: cubecl does not cross-stream-order a *kernel write* to a shared
-                        // buffer against reads the way it does `create_from_slice`, so a reader on
-                        // another worker's stream could otherwise see the tail mid-copy (harmless at
-                        // small sizes, corrupting once the copy is GB-scale — the stem-150 `dx != 0`).
-                        // Blocking here makes the new prefix physically resident before any reader can
-                        // observe the bumped `uploaded`.
-                        if host_len > uploaded {
-                            let n = host_len - uploaded;
-                            let scratch = {
-                                let host = RESIDENT_HOST.read().unwrap();
-                                $client.create_from_slice(u16::as_bytes(
-                                    &host.$host_vec[uploaded..host_len],
-                                ))
-                            };
+                        // Write the tail `batch` (== master[uploaded..host_len]) into the STABLE
+                        // buffer at its append offset through a BOUNDED pinned staging (see
+                        // [`STAGE_CHUNK`]), syncing each chunk. The sync also serves the cross-stream
+                        // ordering the resident buffers need: cubecl does not order a *kernel write* to
+                        // a shared buffer against reads on another stream the way it does
+                        // `create_from_slice`, so blocking here makes the new prefix physically
+                        // resident before any reader observes the bumped `uploaded`.
+                        let mut done = 0usize;
+                        while done < batch.len() {
+                            let m = (batch.len() - done).min(STAGE_CHUNK);
+                            let lo = uploaded + done;
+                            let scratch =
+                                $client.create_from_slice(u16::as_bytes(&batch[done..done + m]));
                             copy_chunked!(
-                                $client, copy_into_u16, scratch, n, 0usize,
-                                handle, cap, uploaded, n
+                                $client, copy_into_u16, scratch, m, 0usize, handle, cap, lo, m
                             );
                             let _ = cubecl_common::reader::read_sync($client.sync());
+                            done += m;
                         }
 
                         {
@@ -413,15 +450,19 @@ fn resident_info(algebra: &MilnorAlgebra, p_part: &[PPartEntry]) -> RInfo {
     if let Some(info) = host.index.get(p_part) {
         return *info;
     }
+    // Offsets are the running LOGICAL lengths (`*_len`), not the pending-buffer lengths — the
+    // uploaded prefix has been freed but the logical numbering is permanent (see [`ResidentHost`]).
     let info = RInfo {
-        cs_off: host.col_sums.len() as u64,
-        mk_off: host.masks.len() as u64,
+        cs_off: host.cs_len as u64,
+        mk_off: host.mk_len as u64,
         cs_len: cs_len as u32,
         mk_len: mk_len as u32,
         num_mats: (mk.len() / mk_len) as u32,
     };
-    host.col_sums.extend(cs.iter().map(|&v| narrow_u16(v)));
-    host.masks.extend(mk.iter().map(|&v| narrow_u16(v)));
+    host.cs_pending.extend(cs.iter().map(|&v| narrow_u16(v)));
+    host.mk_pending.extend(mk.iter().map(|&v| narrow_u16(v)));
+    host.cs_len += cs.len();
+    host.mk_len += mk.len();
     host.index.insert(p_part.to_vec(), info);
     info
 }
@@ -563,12 +604,9 @@ macro_rules! basis_dev_handles {
                         };
                         if pp_len > pp_up {
                             let n = pp_len - pp_up;
-                            let scratch = {
-                                let host = RESIDENT_BASIS_HOST.read().unwrap();
-                                $client.create_from_slice(u16::as_bytes(&host.pparts[pp_up..pp_len]))
-                            };
-                            copy_chunked!(
-                                $client, copy_into_u16, scratch, n, 0usize,
+                            stage_upload!(
+                                $client, copy_into_u16, u16::as_bytes,
+                                RESIDENT_BASIS_HOST.read().unwrap(), pparts,
                                 pp_h, pp_cap, pp_up, n
                             );
                         }
@@ -597,20 +635,17 @@ macro_rules! basis_dev_handles {
                         };
                         if ln_len > ln_up {
                             let n = ln_len - ln_up;
-                            let scratch = {
-                                let host = RESIDENT_BASIS_HOST.read().unwrap();
-                                $client.create_from_slice(u32::as_bytes(&host.lens[ln_up..ln_len]))
-                            };
-                            copy_chunked!(
-                                $client, copy_into_u32, scratch, n, 0usize,
+                            stage_upload!(
+                                $client, copy_into_u32, u32::as_bytes,
+                                RESIDENT_BASIS_HOST.read().unwrap(), lens,
                                 ln_h, ln_cap, ln_up, n
                             );
                         }
 
-                        // Sync both in-place copies before publishing (see [`resident_dev_handle`]):
-                        // a kernel write to the shared basis buffers must be physically done before a
-                        // reader on another worker's stream can observe the bumped element count.
-                        let _ = cubecl_common::reader::read_sync($client.sync());
+                        // `stage_upload!` already synced each chunk, so both grown buffers are
+                        // physically resident before publishing (see [`resident_dev_handle`]):
+                        // a reader on another worker's stream must never observe the bumped element
+                        // count before the copy is done.
 
                         {
                             let mut dev = RESIDENT_BASIS_DEV.write().unwrap();
@@ -674,6 +709,40 @@ fn copy_into_u32(src: &Array<u32>, dst: &mut Array<u32>, src_off: usize, dst_off
 /// Elements per copy-kernel launch: below the kernel's `u32` `ABSOLUTE_POS` thread limit, so copies
 /// of multi-billion-element resident buffers are split into this many at a time.
 const COPY_CHUNK: usize = 1 << 30;
+
+/// Elements per pinned host-staging chunk when uploading resident growth (see [`stage_upload`]).
+/// Bounds the page-locked host buffer cubecl reserves per `create_from_slice`: those pinned pages
+/// are pooled PER CUDA STREAM and never trimmed, so a single full-master `create_from_slice` (the
+/// tail can be many GB) would pin that whole size on every stream — measured ~240 GB shmem at stem
+/// 180 with 8 streams, the OOM driver. Staging in `STAGE_CHUNK` pieces with a sync between them
+/// caps the live pinned staging at ~one chunk. 64 Mi × u16 = 128 MiB (× u32 = 256 MiB).
+const STAGE_CHUNK: usize = 1 << 26;
+
+/// Upload `host_slice[0..n]` into resident device `dst[dst_off..dst_off+n]` through a BOUNDED pinned
+/// staging buffer, re-locking `$host_lock` to reslice each chunk. `$host_lock` is an expression
+/// evaluating to a read guard whose `$field` is the source `Vec` (re-evaluated per chunk so the
+/// guard is not held across the sync). Syncs after each chunk so the pinned pool reuses one page
+/// instead of accumulating the whole tail (see [`STAGE_CHUNK`]). `$copy` is `copy_into_u16`/`_u32`,
+/// `$as_bytes` the matching `u16`/`u32` `as_bytes`.
+macro_rules! stage_upload {
+    ($client:expr, $copy:ident, $as_bytes:path, $host_lock:expr, $field:ident,
+     $dst:expr, $dst_cap:expr, $dst_off:expr, $n:expr) => {{
+        let mut done = 0usize;
+        while done < $n {
+            let m = ($n - done).min(STAGE_CHUNK);
+            let lo = $dst_off + done;
+            let scratch = {
+                let host = $host_lock;
+                $client.create_from_slice($as_bytes(&host.$field[lo..lo + m]))
+            };
+            copy_chunked!($client, $copy, scratch, m, 0usize, $dst, $dst_cap, lo, m);
+            // Drain the H2D copy so this chunk's pinned staging is freed (and its pool page reused)
+            // before the next `create_from_slice`, keeping live pinned memory at ~one chunk.
+            let _ = cubecl_common::reader::read_sync($client.sync());
+            done += m;
+        }
+    }};
+}
 
 /// Copy `count` elements `src[src_off..] -> dst[dst_off..]` with `$kernel` (`copy_into_u16`/`_u32`),
 /// splitting into [`COPY_CHUNK`]-element launches so counts past the `u32` thread limit are handled.
@@ -1532,8 +1601,8 @@ fn multiply_batch_block(
         // then HOST.read, and nothing under either lock blocks on rayon or a permit. The
         // master is append-only, so the uploaded prefix is always a prefix of the current
         // host master and every offset `< uploaded` is final.
-        let (cs_h, cs_len_master) = resident_dev_handle!(client, need_cs, cs, col_sums);
-        let (mk_h, mk_len_master) = resident_dev_handle!(client, need_mk, mk, masks);
+        let (cs_h, cs_len_master) = resident_dev_handle!(client, need_cs, cs, cs_pending, cs_len);
+        let (mk_h, mk_len_master) = resident_dev_handle!(client, need_mk, mk, mk_pending, mk_len);
         // Upload the block's data — term data, seqno/xi tables, per-`R` offsets, per-product
         // records, the pair prefix sum, and the (zeroed) output buffer — and launch once: the
         // caller has already bounded this block's pair count and output size.

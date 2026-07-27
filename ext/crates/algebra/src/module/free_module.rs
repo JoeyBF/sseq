@@ -237,6 +237,21 @@ impl<const U: bool, A: MuAlgebra<U>> ZeroModule for MuFreeModule<U, A> {
 }
 
 impl<const U: bool, A: MuAlgebra<U>> MuFreeModule<U, A> {
+    /// Diagnostic (see `NASSAU_MEM_REPORT`): total heap bytes held by this module's internal
+    /// tables — one `OperationGeneratorPair` per basis element per degree (`basis_element_to_opgen`)
+    /// plus the `generator_to_index` inverse. These scale with Σ dim(t), the same order as a
+    /// differential's `outputs`, so they are the other half of the resolution's retained RAM.
+    pub fn table_heap_bytes(&self) -> usize {
+        let mut bytes = 0usize;
+        for (_, row) in self.basis_element_to_opgen.iter() {
+            bytes += row.len() * std::mem::size_of::<OperationGeneratorPair>();
+        }
+        for (_, row) in self.generator_to_index.iter() {
+            bytes += row.len() * std::mem::size_of::<usize>();
+        }
+        bytes
+    }
+
     pub fn gen_names(&self) -> &OnceBiVec<Vec<String>> {
         &self.gen_names
     }
