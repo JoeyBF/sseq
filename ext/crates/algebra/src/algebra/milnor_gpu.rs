@@ -208,6 +208,7 @@ fn narrow_u16(v: u32) -> u16 {
     u16::try_from(v).expect("admissible/term entry exceeds u16")
 }
 
+use std::cell::RefCell;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Aggregate [`multiply_batch_on_gpu`] counters across all launches (call count, host
@@ -383,6 +384,70 @@ static RESIDENT_DEV: LazyLock<RwLock<ResidentDev>> =
 /// sections (the old single mutex held across the copy collapsed the whole wavefront to one
 /// memcpy-ing thread).
 static RESIDENT_UPLOAD: Mutex<()> = Mutex::new(());
+
+/// Shared resident device copies of the read-only seqno table `g` and the (constant) `xi` degrees.
+/// These are identical across every launch at a given built degree, so re-uploading them per launch
+/// (a `create_from_slice` each) was pure churn — one of the per-launch allocation/copy streams that
+/// pushed cubecl's allocator into its `CUDA_ERROR_LAUNCH_FAILED` (719) failure at scale. Uploaded
+/// once and re-uploaded only when `g` grows to a new max degree. Keyed by `g.len()`: `g` is a
+/// deterministic function of the built degree, so equal length ⇒ identical bytes. Read-only and
+/// shared cross-stream exactly like the resident master.
+struct SeqnoDev {
+    g_len: usize,
+    g: Handle,
+    xi: Handle,
+}
+static RESIDENT_SEQNO: LazyLock<RwLock<Option<SeqnoDev>>> = LazyLock::new(|| RwLock::new(None));
+/// Serializes seqno-table uploads only (never reads); see [`RESIDENT_UPLOAD`].
+static RESIDENT_SEQNO_UPLOAD: Mutex<()> = Mutex::new(());
+
+/// Fetch the shared resident `(g, xi)` device handles, uploading only when the cached table's length
+/// differs from `$g` (i.e. the built degree changed). Lock-free fast path; a burst of first-sight
+/// launches coalesces behind `RESIDENT_SEQNO_UPLOAD`. The upload is synced before publishing so a
+/// cross-stream reader never observes the handles before their H2D copy completes.
+macro_rules! resident_seqno {
+    ($client:expr, $g:expr, $xi:expr) => {{
+        let read_current = || {
+            let s = RESIDENT_SEQNO.read().unwrap();
+            match &*s {
+                Some(d) if d.g_len == $g.len() => Some((d.g.clone(), d.xi.clone())),
+                _ => None,
+            }
+        };
+        match read_current() {
+            Some(h) => h,
+            None => {
+                let _upload_guard = RESIDENT_SEQNO_UPLOAD.lock().unwrap();
+                match read_current() {
+                    Some(h) => h,
+                    None => {
+                        let gh = $client.create_from_slice(u32::as_bytes(&$g));
+                        let xh = $client.create_from_slice(u32::as_bytes(&$xi));
+                        // Make the copies physically resident before publishing (cross-stream reads).
+                        let _ = cubecl_common::reader::read_sync($client.sync());
+                        *RESIDENT_SEQNO.write().unwrap() = Some(SeqnoDev {
+                            g_len: $g.len(),
+                            g: gh.clone(),
+                            xi: xh.clone(),
+                        });
+                        (gh, xh)
+                    }
+                }
+            }
+        }
+    }};
+}
+
+thread_local! {
+    /// Per-worker (= per-stream, see [`thread_stream_id`]) persistent XOR-accumulator buffer, grown
+    /// to the largest `out_len` this thread has needed and reused every launch — replacing the
+    /// per-launch `empty()` + free-via-`memory_cleanup` of the block output, the single biggest
+    /// allocation churned each launch. Per-thread (not shared) because each stream's multiply XORs
+    /// into its own output rows; a shared buffer would corrupt concurrent blocks. Holds
+    /// `(capacity_in_u32_elements, handle)`; the handle stays live (refcount > 0) so `memory_cleanup`
+    /// skips it.
+    static OUT_ACCUM: RefCell<Option<(usize, Handle)>> = const { RefCell::new(None) };
+}
 
 /// Host-side cache of cold (degree > [`resident_degree_cap`]) `R`s' admissible-matrix *shape* only —
 /// `(cs_len, mk_len, num_mats)`, twelve bytes per `R`. With [in-kernel enumeration](enumerate_admissible_kernel)
@@ -1886,8 +1951,9 @@ fn multiply_batch_block(
         // records, the pair prefix sum, and the (zeroed) output buffer — and launch once: the
         // caller has already bounded this block's pair count and output size.
         let tg_h = client.create_from_slice(u32::as_bytes(&term_gei));
-        let g_h = client.create_from_slice(u32::as_bytes(&g));
-        let xi_h = client.create_from_slice(u32::as_bytes(&xi));
+        // `g`/`xi` are identical every launch at this degree: fetch the shared resident copies
+        // (uploaded once, re-uploaded only on a degree bump) instead of re-uploading them here.
+        let (g_h, xi_h) = resident_seqno!(client, g, xi);
         let rco_h = client.create_from_slice(u64::as_bytes(&r_cs_offset));
         let rmo_h = client.create_from_slice(u64::as_bytes(&r_mk_offset));
         let rcl_h = client.create_from_slice(u32::as_bytes(&r_cs_len));
@@ -1898,10 +1964,20 @@ fn multiply_batch_block(
         // [`seg_grow`]). This block cloned their segment handles above, so each stays alive (refcount
         // > 0) for the whole kernel even if another thread grows the store concurrently by appending
         // a new segment — the churny whole-buffer swap that needed quiescing is gone.
-        // Allocate the XOR accumulator uninitialized and zero it on-device (see [`zero_u32`]),
-        // instead of uploading a hundreds-of-MB host zero buffer — the former dominant serial
-        // marshaling cost. Same stream as the multiply below, so it is ordered before it.
-        let out_h = client.empty(out_len * size_of::<u32>());
+        // XOR accumulator: reuse this worker's persistent per-stream buffer (see [`OUT_ACCUM`]),
+        // growing it only when a larger `out_len` appears, instead of `empty()`-ing a fresh one every
+        // launch. `zero_u32` clears the used `[0, out_len)` prefix on-device (the multiply XORs into
+        // that range; any stale tail past `out_len` is never bound or read). Same stream as the
+        // multiply below, so the zero is ordered before it.
+        let (out_h, out_cap) = OUT_ACCUM.with(|cell| {
+            let mut slot = cell.borrow_mut();
+            let cur_cap = slot.as_ref().map(|(c, _)| *c).unwrap_or(0);
+            if cur_cap < out_len {
+                *slot = Some((out_len, client.empty(out_len * size_of::<u32>())));
+            }
+            let (cap, h) = slot.as_ref().unwrap();
+            (h.clone(), *cap)
+        });
         unsafe {
             zero_u32::launch::<CudaRuntime>(
                 &client,
@@ -2014,17 +2090,20 @@ fn multiply_batch_block(
             );
         }
 
-        let bytes = client.read_one(out_h).unwrap();
+        // Read back only the used `[0, out_len)` prefix — the persistent buffer may be larger than
+        // this launch needs (`out_cap >= out_len`), so trim the unused tail off the read.
+        let read_h = out_h.offset_end(((out_cap - out_len) * size_of::<u32>()) as u64);
+        let bytes = client.read_one(read_h).unwrap();
         let flat = u32::from_bytes(&bytes);
         let result: Vec<Vec<u32>> = (0..num_rows)
             .map(|r| flat[r * num_limbs..(r + 1) * num_limbs].to_vec())
             .collect();
 
-        // `out_h` alone is `num_rows × num_limbs` u32 — hundreds of MB at record degrees.
-        // It (and the small per-launch buffers, now dropped) varies in size launch to
-        // launch, so CubeCL's pool cannot reuse the slab and would accumulate them until
-        // the 4 GB card OOMs. Return the freed memory to the driver each launch; the
-        // resident admissible handles stay alive (refcount > 0) so cleanup skips them.
+        // Trim the pool: the remaining per-launch uploads (the small per-`R`/per-product metadata
+        // arrays) still vary in size and would otherwise accumulate in the pool. The persistent
+        // buffers — the resident master/basis, the seqno `g`/`xi`, and this stream's `OUT_ACCUM`
+        // accumulator — stay alive (refcount > 0), so cleanup skips them and only the transient
+        // metadata is reclaimed. (Phase 2 will make the metadata persistent too and drop this.)
         client.memory_cleanup();
 
         result
