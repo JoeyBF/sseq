@@ -208,7 +208,6 @@ fn narrow_u16(v: u32) -> u16 {
     u16::try_from(v).expect("admissible/term entry exceeds u16")
 }
 
-use std::cell::RefCell;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Aggregate [`multiply_batch_on_gpu`] counters across all launches (call count, host
@@ -438,16 +437,6 @@ macro_rules! resident_seqno {
     }};
 }
 
-thread_local! {
-    /// Per-worker (= per-stream, see [`thread_stream_id`]) persistent XOR-accumulator buffer, grown
-    /// to the largest `out_len` this thread has needed and reused every launch — replacing the
-    /// per-launch `empty()` + free-via-`memory_cleanup` of the block output, the single biggest
-    /// allocation churned each launch. Per-thread (not shared) because each stream's multiply XORs
-    /// into its own output rows; a shared buffer would corrupt concurrent blocks. Holds
-    /// `(capacity_in_u32_elements, handle)`; the handle stays live (refcount > 0) so `memory_cleanup`
-    /// skips it.
-    static OUT_ACCUM: RefCell<Option<(usize, Handle)>> = const { RefCell::new(None) };
-}
 
 /// Host-side cache of cold (degree > [`resident_degree_cap`]) `R`s' admissible-matrix *shape* only —
 /// `(cs_len, mk_len, num_mats)`, twelve bytes per `R`. With [in-kernel enumeration](enumerate_admissible_kernel)
@@ -1964,20 +1953,12 @@ fn multiply_batch_block(
         // [`seg_grow`]). This block cloned their segment handles above, so each stays alive (refcount
         // > 0) for the whole kernel even if another thread grows the store concurrently by appending
         // a new segment — the churny whole-buffer swap that needed quiescing is gone.
-        // XOR accumulator: reuse this worker's persistent per-stream buffer (see [`OUT_ACCUM`]),
-        // growing it only when a larger `out_len` appears, instead of `empty()`-ing a fresh one every
-        // launch. `zero_u32` clears the used `[0, out_len)` prefix on-device (the multiply XORs into
-        // that range; any stale tail past `out_len` is never bound or read). Same stream as the
-        // multiply below, so the zero is ordered before it.
-        let (out_h, out_cap) = OUT_ACCUM.with(|cell| {
-            let mut slot = cell.borrow_mut();
-            let cur_cap = slot.as_ref().map(|(c, _)| *c).unwrap_or(0);
-            if cur_cap < out_len {
-                *slot = Some((out_len, client.empty(out_len * size_of::<u32>())));
-            }
-            let (cap, h) = slot.as_ref().unwrap();
-            (h.clone(), *cap)
-        });
+        // Allocate the XOR accumulator uninitialized and zero it on-device (see [`zero_u32`]),
+        // instead of uploading a hundreds-of-MB host zero buffer — the former dominant serial
+        // marshaling cost. Bounded by the caller's row-batching (see `get_partial_matrix`), so it
+        // stays small and is returned to the pool by `memory_cleanup` below. Same stream as the
+        // multiply, so the zero is ordered before it.
+        let out_h = client.empty(out_len * size_of::<u32>());
         unsafe {
             zero_u32::launch::<CudaRuntime>(
                 &client,
@@ -2090,20 +2071,16 @@ fn multiply_batch_block(
             );
         }
 
-        // Read back only the used `[0, out_len)` prefix — the persistent buffer may be larger than
-        // this launch needs (`out_cap >= out_len`), so trim the unused tail off the read.
-        let read_h = out_h.offset_end(((out_cap - out_len) * size_of::<u32>()) as u64);
-        let bytes = client.read_one(read_h).unwrap();
+        let bytes = client.read_one(out_h).unwrap();
         let flat = u32::from_bytes(&bytes);
         let result: Vec<Vec<u32>> = (0..num_rows)
             .map(|r| flat[r * num_limbs..(r + 1) * num_limbs].to_vec())
             .collect();
 
-        // Trim the pool: the remaining per-launch uploads (the small per-`R`/per-product metadata
-        // arrays) still vary in size and would otherwise accumulate in the pool. The persistent
-        // buffers — the resident master/basis, the seqno `g`/`xi`, and this stream's `OUT_ACCUM`
-        // accumulator — stay alive (refcount > 0), so cleanup skips them and only the transient
-        // metadata is reclaimed. (Phase 2 will make the metadata persistent too and drop this.)
+        // Trim the pool: the per-launch uploads (`out_h` and the per-`R`/per-product metadata arrays)
+        // vary in size and would otherwise accumulate. The persistent buffers — the resident
+        // master/basis and the seqno `g`/`xi` — stay alive (refcount > 0), so cleanup skips them and
+        // only the transient per-launch memory is reclaimed.
         client.memory_cleanup();
 
         result
