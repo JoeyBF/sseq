@@ -33,13 +33,13 @@ enum_dispatch = "0.3.13"
 # `cuda` targets the local NVIDIA card via NVRTC (needs the CUDA toolkit — wired into
 # the ext dev shell in flake.nix). Kernels are runtime-agnostic, so `wgpu` (Vulkan)
 # remains a drop-in portable fallback.
-cubecl = { version = "0.10.0", optional = true, default-features = false, features = [
+cubecl = { git = "https://github.com/JoeyBF/cubecl", branch = "claude/pool-slot-map-v0.10.0", optional = true, default-features = false, features = [
     "cuda",
 ] }
 # For pinning all GPU work to one CUDA stream (`StreamId`), so a single memory pool is
 # reclaimed by `memory_cleanup` — CubeCL's pools are per-stream, and rayon spreads launches
 # across threads/streams, which otherwise accumulates buffers until the card OOMs.
-cubecl-common = { version = "0.10.0", optional = true }
+cubecl-common = { git = "https://github.com/JoeyBF/cubecl", branch = "claude/pool-slot-map-v0.10.0", optional = true }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
@@ -68,6 +68,12 @@ harness = false
 
 [[bench]]
 name = "nassau_milnor"
+harness = false
+
+# GPU batched-multiply throughput / cubecl-regression bench (see benches/nassau_milnor_gpu.rs).
+# Requires `--features gpu`; without it the target compiles to a no-op main.
+[[bench]]
+name = "nassau_milnor_gpu"
 harness = false
 
 [[bench]]

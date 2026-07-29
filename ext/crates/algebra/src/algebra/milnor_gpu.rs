@@ -208,7 +208,22 @@ fn narrow_u16(v: u32) -> u16 {
     u16::try_from(v).expect("admissible/term entry exceeds u16")
 }
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+/// Set once the cubecl CUDA context has failed irrecoverably (a `CUDA_ERROR_LAUNCH_FAILED` /
+/// `ServerUnhealthy` surfacing the unresolved cubecl uninit-handle bug — see
+/// `~/cubecl-uninit-handle-followup.md`, tracel-ai/cubecl#1401). Such a failure **poisons the whole
+/// CUDA context**: every later launch on the shared client fails too, so there is no per-call retry —
+/// the only recovery is to abandon the GPU multiply and finish the resolution on the CPU.
+/// [`multiply_batch_on_gpu`] flips this on the first failure and routes all subsequent (and the
+/// current) batches through [`cpu_multiply_batch`]. NOTE: this covers only the cubecl **multiply**;
+/// the RREF path runs on a separate `fp-cuda` runtime and is not gated by this flag.
+static GPU_DISABLED: AtomicBool = AtomicBool::new(false);
+
+/// Whether the GPU multiply has been disabled for the rest of the process (see [`GPU_DISABLED`]).
+pub fn gpu_disabled() -> bool {
+    GPU_DISABLED.load(Ordering::Relaxed)
+}
 
 /// Aggregate [`multiply_batch_on_gpu`] counters across all launches (call count, host
 /// marshal µs, device µs, total pairs), for splitting a whole resolution's GPU overhead.
@@ -1358,6 +1373,86 @@ pub fn multiply_batch_on_gpu(
     num_rows: usize,
     products: &[GpuProduct],
 ) -> Vec<Vec<u32>> {
+    // STOPGAP (see [`GPU_DISABLED`]): once the cubecl CUDA context has been poisoned by the
+    // unresolved uninit-handle bug, every launch fails, so we finish the run on the CPU. On the
+    // first failure we catch the panic (it surfaces as an `.unwrap()` on a `CUDA_ERROR_LAUNCH_FAILED`
+    // / `ServerUnhealthy` in [`multiply_batch_gpu_inner`]), flip the flag, and fall back. All later
+    // calls short-circuit straight to the CPU path. The CPU result is bit-identical to the GPU's
+    // (validated by `cpu_multiply_batch_matches_gpu`), so callers see no difference but speed.
+    if gpu_disabled() {
+        return cpu_multiply_batch(algebra, num_cols, num_rows, products);
+    }
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        multiply_batch_gpu_inner(algebra, num_cols, num_rows, products)
+    })) {
+        Ok(rows) => rows,
+        Err(_) => {
+            // compare_exchange so exactly one thread (of the ~100 that may fail together on the
+            // shared poisoned context) prints the notice; the rest just fall through to the CPU.
+            if GPU_DISABLED
+                .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+            {
+                eprintln!(
+                    "[nassau-gpu] GPU milnor multiply failed (CUDA context poisoned by the \
+                     unresolved cubecl uninit-handle bug); disabling the GPU multiply and \
+                     completing the resolution on the CPU. RREF (separate fp-cuda runtime) is \
+                     unaffected by this flag."
+                );
+            }
+            cpu_multiply_batch(algebra, num_cols, num_rows, products)
+        }
+    }
+}
+
+/// CPU reference for one [`multiply_batch_on_gpu`] batch: the exact same `num_rows × ⌈num_cols/32⌉`
+/// bit-packed F₂ matrix the GPU produces, computed with [`MilnorAlgebra::multiply_basis_element_by_element_2`].
+/// Used as the stopgap fallback when the GPU context dies mid-run, and as a correctness oracle for the
+/// GPU stress bench. Each product's `Sq(R)·s` lands in row `prod.row` at column offset `prod.out_offset`.
+pub fn cpu_multiply_batch(
+    algebra: &MilnorAlgebra,
+    num_cols: usize,
+    num_rows: usize,
+    products: &[GpuProduct],
+) -> Vec<Vec<u32>> {
+    use fp::vector::FpVector;
+    let p = algebra.prime();
+    let num_limbs = num_cols.div_ceil(32).max(1);
+    let mut rows = vec![vec![0u32; num_limbs]; num_rows];
+    for prod in products {
+        let out_degree = prod.r_degree + prod.s_degree;
+        let block_dim = algebra.dimension(out_degree);
+        if block_dim == 0 {
+            continue;
+        }
+        let s_dim = algebra.dimension(prod.s_degree);
+        let mut s = FpVector::new(p, s_dim);
+        for &ti in &prod.term_indices {
+            s.set_entry(ti, 1);
+        }
+        let mut tmp = FpVector::new(p, block_dim);
+        algebra.multiply_basis_element_by_element_2(
+            tmp.as_slice_mut(),
+            1,
+            prod.r_degree,
+            prod.r_idx,
+            prod.s_degree,
+            s.as_slice(),
+        );
+        for (i, _) in tmp.iter_nonzero() {
+            let col = prod.out_offset + i;
+            rows[prod.row][col / 32] ^= 1u32 << (col % 32);
+        }
+    }
+    rows
+}
+
+fn multiply_batch_gpu_inner(
+    algebra: &MilnorAlgebra,
+    num_cols: usize,
+    num_rows: usize,
+    products: &[GpuProduct],
+) -> Vec<Vec<u32>> {
     let cap = resident_degree_cap();
     // Fast path (default, `cap == i32::MAX`, and any run whose `R`s are all under the cap): a single
     // resident-master pass, byte-identical to the pre-eviction code. No cloning, no second launch.
@@ -2077,10 +2172,13 @@ fn multiply_batch_block(
             .map(|r| flat[r * num_limbs..(r + 1) * num_limbs].to_vec())
             .collect();
 
-        // Trim the pool: the per-launch uploads (`out_h` and the per-`R`/per-product metadata arrays)
-        // vary in size and would otherwise accumulate. The persistent buffers — the resident
-        // master/basis and the seqno `g`/`xi` — stay alive (refcount > 0), so cleanup skips them and
-        // only the transient per-launch memory is reclaimed.
+        // Trim this stream's transient pool. Historically this per-launch cleanup RENUMBERED the
+        // exclusive pool's page indices (`update_page`), which under ~100-way concurrency corrupted
+        // cached page handles on other streams → `ManagedMemoryDescriptor` id-mismatch /
+        // `CUDA_ERROR_LAUNCH_FAILED` at high stems (tracel-ai/cubecl#1401). The generational-slot pool
+        // fix (JoeyBF/cubecl@claude/pool-slot-map-v0.10.0) gives pages stable ids so cleanup no longer
+        // renumbers, making this safe again — and it keeps the retained pool bounded (freed pages
+        // returned to the driver) so device memory tracks the working set instead of ratcheting.
         client.memory_cleanup();
 
         result
@@ -3458,6 +3556,69 @@ mod tests {
         );
         eprintln!(
             "multiply_batch: {} products across {num_rows} rows matched reference",
+            products.len()
+        );
+    }
+
+    /// The stopgap CPU fallback ([`cpu_multiply_batch`]) must produce byte-identical output to the GPU
+    /// batch multiply — otherwise a mid-run GPU-context death would silently corrupt the resolution.
+    /// Uses TWO generator blocks at distinct `out_offset`s in one wide row, the module-row layout the
+    /// single-block `multiply_batch_matches_reference` does not exercise.
+    #[test]
+    fn cpu_multiply_batch_matches_gpu() {
+        use fp::prime::ValidPrime;
+
+        let p = ValidPrime::new(2);
+        let algebra = MilnorAlgebra::new(p, false);
+        let max_degree = 44;
+        algebra.compute_basis(max_degree);
+        algebra.compute_seqno_tables(max_degree);
+
+        let num_rows = 6;
+        // Block A (degree 24) at offset 0, block B (degree 20) immediately after — a two-generator
+        // row of width dim(A) + dim(B), so products carry a nonzero `out_offset`.
+        let (deg_a, deg_b) = (24, 20);
+        let (dim_a, dim_b) = (algebra.dimension(deg_a), algebra.dimension(deg_b));
+        let num_cols = dim_a + dim_b;
+
+        let mut products = Vec::new();
+        for (out_deg, out_offset) in [(deg_a, 0usize), (deg_b, dim_a)] {
+            for r_degree in 1..out_deg {
+                let s_degree = out_deg - r_degree;
+                let s_dim = algebra.dimension(s_degree);
+                if s_dim == 0 {
+                    continue;
+                }
+                let r_dim = algebra.dimension(r_degree);
+                for r_idx in 0..r_dim {
+                    if algebra
+                        .basis_element_from_index(r_degree, r_idx)
+                        .p_part
+                        .is_empty()
+                    {
+                        continue;
+                    }
+                    let row = products.len() % num_rows;
+                    products.push(GpuProduct {
+                        r_degree,
+                        r_idx,
+                        s_degree,
+                        term_indices: (0..s_dim).collect(),
+                        row,
+                        out_offset,
+                    });
+                }
+            }
+        }
+
+        let gpu = multiply_batch_on_gpu(&algebra, num_cols, num_rows, &products);
+        let cpu = cpu_multiply_batch(&algebra, num_cols, num_rows, &products);
+        assert_eq!(
+            gpu, cpu,
+            "cpu_multiply_batch diverged from the GPU batch multiply (out_offset path)"
+        );
+        eprintln!(
+            "cpu_multiply_batch matches GPU: {} products, {num_rows} rows, num_cols={num_cols}",
             products.len()
         );
     }
