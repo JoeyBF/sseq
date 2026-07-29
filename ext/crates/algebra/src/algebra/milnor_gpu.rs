@@ -225,6 +225,27 @@ pub fn gpu_disabled() -> bool {
     GPU_DISABLED.load(Ordering::Relaxed)
 }
 
+/// Global launch counter for throttling per-launch [`memory_cleanup`] (see [`cleanup_every`]).
+static CLEANUP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// How often to call `client.memory_cleanup()` after a multiply launch, via
+/// `NASSAU_GPU_CLEANUP_EVERY` (default `1` = every launch). `N` cleans every Nth launch; `0` never
+/// cleans. DIAGNOSTIC: the residual `CUDA_ERROR_LAUNCH_FAILED` at high stems is consistent with a
+/// cross-stream pool reclaim (one stream's cleanup reclaiming a resident-master page still in flight
+/// on another stream — tracel-ai/cubecl#1401). Throttling this drastically cuts that reclaim rate; if
+/// the crash disappears or moves much later, cleanup is confirmed as the trigger. The tradeoff is
+/// device-memory growth, since freed pages linger — watch `nvidia-smi`.
+fn cleanup_every() -> u64 {
+    use std::sync::OnceLock;
+    static EVERY: OnceLock<u64> = OnceLock::new();
+    *EVERY.get_or_init(|| {
+        std::env::var("NASSAU_GPU_CLEANUP_EVERY")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1)
+    })
+}
+
 /// Aggregate [`multiply_batch_on_gpu`] counters across all launches (call count, host
 /// marshal µs, device µs, total pairs), for splitting a whole resolution's GPU overhead.
 static BATCH_CALLS: AtomicU64 = AtomicU64::new(0);
@@ -2179,7 +2200,12 @@ fn multiply_batch_block(
         // fix (JoeyBF/cubecl@claude/pool-slot-map-v0.10.0) gives pages stable ids so cleanup no longer
         // renumbers, making this safe again — and it keeps the retained pool bounded (freed pages
         // returned to the driver) so device memory tracks the working set instead of ratcheting.
-        client.memory_cleanup();
+        // Throttled by `NASSAU_GPU_CLEANUP_EVERY` (see [`cleanup_every`]) to probe whether the residual
+        // high-stem `LAUNCH_FAILED` is a cross-stream cleanup-reclaim race.
+        let every = cleanup_every();
+        if every != 0 && CLEANUP_COUNTER.fetch_add(1, Ordering::Relaxed) % every == 0 {
+            client.memory_cleanup();
+        }
 
         result
     });
