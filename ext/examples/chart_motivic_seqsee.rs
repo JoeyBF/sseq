@@ -254,6 +254,14 @@ fn main() -> anyhow::Result<()> {
                 if !in_box(dst.n, dst.s) {
                     continue;
                 }
+                // Drop spurious products: if the target is τ-torsion of order `ord`
+                // (a copy of M₂/τ^ord), then a term with τ-power ≥ ord is
+                // τ^power·(order-ord class) = 0 and no line should be drawn. Free
+                // targets (order 0) are never annihilated. Filtering here — before the
+                // edge exists — also keeps these zeros out of the h₁-tower analysis.
+                if dst.order != 0 && power >= dst.order {
+                    continue;
+                }
                 edges.push(Edge {
                     src: (src.n, src.s, src.pos),
                     tgt: (dst.n, dst.s, dst.pos),
