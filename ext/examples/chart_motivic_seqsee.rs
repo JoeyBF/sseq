@@ -247,9 +247,6 @@ fn main() -> anyhow::Result<()> {
             let Some(terms) = products.get(&Gen { s, t, idx }) else {
                 continue;
             };
-            // Collect the nonzero components of this product that land on a drawn dot
-            // in-box.
-            let mut comps: Vec<((i32, i32, usize), u32)> = Vec::new();
             for &(tgt, power) in terms {
                 let Some(dst) = dot_of.get(&(tgt.s, tgt.t, tgt.idx)) else {
                     continue; // τ = 0 shadow landed on a non-generator; not a generator line
@@ -258,28 +255,16 @@ fn main() -> anyhow::Result<()> {
                     continue;
                 }
                 // Drop spurious products: if the target is τ-torsion of order `ord`
-                // (a copy of M₂/τ^ord), a term with τ-power ≥ ord is
-                // τ^power·(order-ord class) = 0 and is not a component at all.
+                // (a copy of M₂/τ^ord), then a term with τ-power ≥ ord is
+                // τ^power·(order-ord class) = 0 and no line should be drawn. Free
+                // targets (order 0) are never annihilated. Filtering here — before the
+                // edge exists — also keeps these zeros out of the h₁-tower analysis.
                 if dst.order != 0 && power >= dst.order {
                     continue;
                 }
-                comps.push(((dst.n, dst.s, dst.pos), power));
-            }
-            // The product's τ-divisibility is the *minimum* τ-power among its
-            // components. A change of basis (add a τ-multiple of one generator to
-            // another) absorbs every higher-power tail into that minimal component, so
-            // only the min-power lines are basis-invariant; a "hidden extension" color
-            // on the higher tail of an otherwise-ordinary product is a basis artifact.
-            // Draw the min-power component(s) — colored by the true τ-divisibility
-            // (rules 6–8/10/11) — and drop the tails. This also keeps the tails out of
-            // the h₁-tower analysis.
-            let Some(min_p) = comps.iter().map(|&(_, p)| p).min() else {
-                continue;
-            };
-            for &(tgtkey, power) in comps.iter().filter(|&&(_, p)| p == min_p) {
                 edges.push(Edge {
                     src: (src.n, src.s, src.pos),
-                    tgt: tgtkey,
+                    tgt: (dst.n, dst.s, dst.pos),
                     hi: i,
                     power,
                 });
