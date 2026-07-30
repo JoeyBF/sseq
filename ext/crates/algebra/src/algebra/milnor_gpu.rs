@@ -3744,4 +3744,191 @@ mod tests {
             master_seg_elems()
         );
     }
+
+    /// Concurrency + growth soak on the GPU Milnor multiply: many worker threads hammer
+    /// [`multiply_batch_on_gpu`] against ONE shared resident master while it grows, across many
+    /// streams with per-launch `memory_cleanup` on — the same access pattern that trips the cubecl
+    /// cross-stream pool-reclaim race (tracel-ai/cubecl#1401) in the stem-200 resolution (one
+    /// stream's cleanup reclaiming a pool page another stream's in-flight launch still reads).
+    ///
+    /// It is BOTH a fast correctness guard and a fast #1401 reproducer:
+    /// - **Correctness:** every GPU result is compared against the bit-identical
+    ///   [`cpu_multiply_batch`] oracle (up to `verify_max`), catching cross-stream renumber/identity
+    ///   races; any mid-soak context death also flips `GPU_DISABLED` and fails the final assert.
+    /// - **#1401 (measured):** clean at `max_degree ≤ 128`, but at `max_degree=160` with
+    ///   `NASSAU_GPU_STREAMS=48` the cross-stream pool-reclaim race fires within a ~45 s soak — the
+    ///   `never initialized` / `ServerUnhealthy` cascade, `gpu_disabled` flips — at only ~28 GB host
+    ///   / ~22 GB GPU, so it is NOT a device OOM but the genuine timing race. That makes this a
+    ///   ~1–2 min, low-memory stand-in for the 40-min stem-200 crash (the race window scales with
+    ///   buffer size; degree 64 was just below threshold). The single-submission-thread redesign
+    ///   must turn this exact config GREEN.
+    ///
+    /// Ignored by default (needs a CUDA device + `NASSAU_GPU_STREAMS>1`). Reproduce #1401 with:
+    /// ```text
+    /// NASSAU_GPU_STREAMS=48 NASSAU_GPU_CLEANUP_EVERY=1 NASSAU_SOAK_MAX_DEGREE=160 \
+    ///   cargo test -p algebra --release --features gpu -- --ignored --nocapture concurrent_growth_soak
+    /// ```
+    /// Tunables (env): `NASSAU_SOAK_THREADS` (64), `NASSAU_SOAK_SECS` (60), `NASSAU_SOAK_MAX_DEGREE`
+    /// (60), `NASSAU_SOAK_VERIFY_MAX` (44, the degree ceiling for the CPU-oracle correctness check).
+    #[test]
+    #[ignore = "GPU cross-stream soak: needs a CUDA device and NASSAU_GPU_STREAMS>1; run explicitly"]
+    fn concurrent_growth_soak() {
+        use std::{
+            sync::{
+                Arc,
+                atomic::{AtomicU64, Ordering},
+            },
+            time::{Duration, Instant},
+        };
+
+        let env_num = |key: &str, default: u64| -> u64 {
+            std::env::var(key)
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(default)
+        };
+        let threads = env_num("NASSAU_SOAK_THREADS", 64) as usize;
+        let secs = env_num("NASSAU_SOAK_SECS", 60);
+        let max_degree = env_num("NASSAU_SOAK_MAX_DEGREE", 60) as i32;
+        // Correctness is checked only up to this degree — the CPU-oracle precompute
+        // ([`cpu_multiply_batch`]) explodes past ~degree 48, so keep it modest while letting
+        // `max_degree` run far higher to widen the resident master (the race window scales with
+        // buffer size). Degrees above the cap still launch on the GPU for the stability/#1401 axis;
+        // their output just isn't compared.
+        let verify_max = env_num("NASSAU_SOAK_VERIFY_MAX", 44) as i32;
+        let num_rows = 32usize;
+
+        if gpu_stream_slots() == 1 {
+            eprintln!(
+                "[soak] WARNING: NASSAU_GPU_STREAMS=1 (single stream) — the cross-stream reclaim \
+                 race CANNOT reproduce. Set NASSAU_GPU_STREAMS >= {threads} to exercise it."
+            );
+        }
+
+        let p = fp::prime::ValidPrime::new(2);
+        let algebra = MilnorAlgebra::new(p, false);
+        algebra.compute_basis(max_degree);
+        algebra.compute_seqno_tables(max_degree);
+
+        // One `get_partial_matrix`-shaped batch per output degree: every non-empty R of degree
+        // 1..out_degree times a dense complementary element, round-robin across rows, single block.
+        // Mirrors `multiply_batch_incremental_growth` / the throughput bench, so it hits the exact
+        // kernel + resident-master path Nassau drives.
+        let build_batch = |out_degree: i32| -> (usize, Vec<GpuProduct>) {
+            let num_cols = algebra.dimension(out_degree);
+            let mut products = Vec::new();
+            for r_degree in 1..out_degree {
+                let s_degree = out_degree - r_degree;
+                let s_dim = algebra.dimension(s_degree);
+                if s_dim == 0 {
+                    continue;
+                }
+                for r_idx in 0..algebra.dimension(r_degree) {
+                    if algebra
+                        .basis_element_from_index(r_degree, r_idx)
+                        .p_part
+                        .is_empty()
+                    {
+                        continue;
+                    }
+                    let row = products.len() % num_rows;
+                    products.push(GpuProduct {
+                        r_degree,
+                        r_idx,
+                        s_degree,
+                        term_indices: (0..s_dim).collect(),
+                        row,
+                        out_offset: 0,
+                    });
+                }
+            }
+            (num_cols, products)
+        };
+
+        // Ascending degrees so the sweep drives resident-master growth; precompute each batch and
+        // its CPU golden once (shared, read-only) so worker threads only launch + compare.
+        struct Job {
+            num_cols: usize,
+            products: Vec<GpuProduct>,
+            golden: Option<Vec<Vec<u32>>>,
+        }
+        let jobs: Arc<Vec<Job>> = Arc::new(
+            (12..=max_degree)
+                .step_by(2)
+                .filter_map(|d| {
+                    let (num_cols, products) = build_batch(d);
+                    if products.is_empty() {
+                        return None;
+                    }
+                    let golden = (d <= verify_max)
+                        .then(|| cpu_multiply_batch(&algebra, num_cols, num_rows, &products));
+                    Some(Job {
+                        num_cols,
+                        products,
+                        golden,
+                    })
+                })
+                .collect(),
+        );
+        assert!(
+            !jobs.is_empty(),
+            "no non-empty batches built up to degree {max_degree}"
+        );
+
+        let launches = AtomicU64::new(0);
+        let mismatches = AtomicU64::new(0);
+        let started = Instant::now();
+        let deadline = started + Duration::from_secs(secs);
+
+        std::thread::scope(|scope| {
+            for t in 0..threads {
+                let jobs = Arc::clone(&jobs);
+                let algebra = &algebra;
+                let launches = &launches;
+                let mismatches = &mismatches;
+                scope.spawn(move || {
+                    // Desynchronize threads across the degree sweep so some GROW the master (first
+                    // touch of a high degree) while others READ lower resident pages + cleanup.
+                    let mut i = t % jobs.len();
+                    while Instant::now() < deadline && !gpu_disabled() {
+                        let job = &jobs[i];
+                        let got =
+                            multiply_batch_on_gpu(algebra, job.num_cols, num_rows, &job.products);
+                        launches.fetch_add(1, Ordering::Relaxed);
+                        // A mismatch while the GPU is still enabled is a real concurrency bug (a
+                        // cross-stream renumber/identity race). Once disabled, results come from the
+                        // bit-identical CPU oracle, so they still match — no false alarm. Degrees
+                        // above `verify_max` have no golden and only exercise stability.
+                        if let Some(golden) = &job.golden {
+                            if got != *golden && !gpu_disabled() {
+                                mismatches.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                        i = (i + 1) % jobs.len();
+                    }
+                });
+            }
+        });
+
+        let elapsed = started.elapsed();
+        let n = launches.load(Ordering::Relaxed);
+        let mm = mismatches.load(Ordering::Relaxed);
+        eprintln!(
+            "[soak] {threads} threads × {secs}s, {} streams: {n} launches ({:.0}/s over {} degrees, \
+             verified ≤{verify_max}), {mm} correctness mismatches, gpu_disabled={}",
+            gpu_stream_slots(),
+            n as f64 / elapsed.as_secs_f64().max(1e-3),
+            jobs.len(),
+            gpu_disabled(),
+        );
+        assert_eq!(
+            mm, 0,
+            "GPU multiply diverged from the CPU oracle under concurrency (renumber/identity race)"
+        );
+        assert!(
+            !gpu_disabled(),
+            "cubecl GPU multiply was disabled mid-soak — the cross-stream pool-reclaim race \
+             (tracel-ai/cubecl#1401) fired. This is the crash the submission-thread redesign closes."
+        );
+    }
 }
