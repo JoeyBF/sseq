@@ -1402,6 +1402,44 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "slow: resolves 42 stems; run with `--release -- --ignored`"]
+    fn deformation_sseq_exact_at_higher_differentials() {
+        // Regression for the length-`>1` differential fix. Near g² at (40, 8) the
+        // τ-Bockstein zig-zag missed a length-2 differential (41, 9) → (42, 8): its
+        // source degree was *isolated* at the d₁ level (its `page_data` never
+        // extended past E₁), so the old `page.len() <= r` guard skipped it, leaving
+        // both endpoints as spurious E_∞ survivors (extra free classes near g²). The
+        // fix reads E_r via `get_max(r)` — the last page for an isolated degree. Here
+        // the SS E_∞ must equal the exact τ-inverted δ rank at every interior
+        // bidegree, and g² must be a single free class.
+        let max = Bidegree::n_s(42, 12);
+        let res = MotivicResolution::new(max);
+        let sseq = res.deformation_sseq();
+
+        let mut einf: HashMap<(i32, i32), usize> = HashMap::new();
+        for deg in sseq.iter_degrees() {
+            let [n, s, _] = deg.coords();
+            let page = sseq.page_data(deg);
+            *einf.entry((n, s)).or_default() += page[page.len() - 1].dimension();
+        }
+        for s in 0..res.max_s() {
+            for n in 0..=max.n() {
+                let got = einf.get(&(n, s)).copied().unwrap_or(0);
+                let want = res
+                    .ext()
+                    .cohomology_dimension(Bidegree::n_s(n, s))
+                    .unwrap_or(0);
+                assert_eq!(got, want, "SS E_∞ vs exact δ rank at (n={n}, s={s})");
+            }
+        }
+        // g² is a single free (τ-tower) class; the recovered length-2 differential
+        // makes (41, 9) pure τ²-torsion and (42, 8) one free + one τ²-torsion.
+        assert_eq!(res.tau_module(8, 48).free, 1, "g² free rank");
+        assert!(res.tau_module(8, 48).torsion.is_empty(), "g² torsion");
+        assert_eq!(res.tau_module(9, 50).torsion, vec![2], "(41,9) is τ²-torsion");
+    }
+
+    #[test]
     fn lift_is_a_complex_and_reduces_correctly() {
         // Build once (expensive: the padded resolution plus the lift), then check
         // everything: every generator in the report box has a weight; reducing

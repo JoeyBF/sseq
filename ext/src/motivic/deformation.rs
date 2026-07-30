@@ -231,12 +231,16 @@ impl MotivicResolution {
                 if s < 1 || n > self.max.n() {
                     continue;
                 }
-                let page = sseq.page_data(b);
-                if page.len() <= r {
-                    continue;
-                }
                 let t = n + s;
-                for rep in page[r].gens() {
+                // The E_r page of this degree. `get_max(r)` is `page[r]` when the
+                // Sseq has extended this degree's `page_data` that far, and the last
+                // computed page otherwise — which is exactly E_r for an *isolated*
+                // degree (one no differential ever touched, so nothing quotiented it
+                // past E_1). The former guard `page.len() <= r { continue }` skipped
+                // those degrees entirely, dropping every d_r out of a class that had
+                // no lower differential — e.g. the length-2 differential (41,9)→(42,8)
+                // that left spurious survivors near g² at (40,8).
+                for rep in sseq.page_data(b).get_max(r).gens() {
                     // x̃ = the E_r representative, lifted to a raw cochain over (s, t).
                     let mut xtilde = FpVector::new(TWO, self.num_gens(s, t));
                     if let Some(g) = groups.get(&[n, s, w]) {
