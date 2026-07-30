@@ -293,21 +293,20 @@ impl MotivicResolution {
     /// The classical Adams $E_2$ rank at `(s, t)` — invert $\tau$: the free rank of
     /// the motivic $E_2$.
     ///
-    /// Read off the deformation SS: the $E_\infty$ survivors at `(n, s)` summed over
-    /// weight. Inverting $\tau$ ($w \to \infty$) is exactly the classical Adams
-    /// $E_2$; the τ-torsion classes die on finite pages and drop out.
+    /// The exact $\tau$-inverted rank of $H(\delta)$, read off the Ext DGA at
+    /// `cap = ∞` ([`ExtAlgebra::cohomology_dimension`]) — the classical Adams $E_2$
+    /// (regressed against `Ext_A`).
+    ///
+    /// The deformation SS $E_\infty$ is an equivalent count *only* where every
+    /// algebraic-Novikov differential has length 1. A higher (length $> 1$)
+    /// differential the τ-Bockstein zig-zag can miss ([`Self::build_deformation_sseq`])
+    /// leaves both of its endpoints alive as spurious survivors — e.g. the extra
+    /// classes near $g^2$ at $(40, 8)$. The δ rank captures every differential length
+    /// (they are the higher-$\tau$ entries of δ, seen by its Smith normal form), so we
+    /// take it as authoritative instead of summing the SS $E_\infty$.
     pub fn classical_ext_rank(&self, s: i32, t: i32) -> usize {
-        let n = t - s;
-        let sseq = self.deformation_sseq();
-        sseq.iter_degrees()
-            .filter(|d| {
-                let c = d.coords();
-                c[0] == n && c[1] == s
-            })
-            .map(|d| {
-                let page = sseq.page_data(d);
-                page[page.len() - 1].dimension() // E_∞ at (n, s, w)
-            })
-            .sum()
+        self.ext()
+            .cohomology_dimension(Bidegree::n_s(t - s, s))
+            .unwrap_or(0)
     }
 }
