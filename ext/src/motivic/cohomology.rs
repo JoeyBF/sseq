@@ -238,18 +238,11 @@ impl MotivicResolution {
     /// pivot count (rank over $\mathbb{F}_2(\tau)$). Being local, this is exact up to
     /// the resolved range — including at the report-box edge, where the deformation
     /// SS over-counts for lack of the incoming differentials.
-    pub(super) fn free_rank(&self, s: i32, t: i32) -> usize {
+    pub fn free_rank(&self, s: i32, t: i32) -> usize {
         let gens = self.num_gens(s, t);
         let rank_out = f2tau::smith(self.delta_matrix(s, t)).0;
         let rank_in = f2tau::smith(self.delta_matrix(s + 1, t)).0;
         gens.saturating_sub(rank_out).saturating_sub(rank_in)
-    }
-
-    /// Whether `(s, t)` carries a $\tau$-torsion class in the motivic $E_2$ — a class
-    /// that dies when $\tau$ is inverted, invisible to the classical Adams $E_2$.
-    /// The boolean shadow of [`Self::tau_module`].
-    pub fn has_tau_torsion(&self, s: i32, t: i32) -> bool {
-        !self.tau_torsion_orders(s, t).is_empty()
     }
 
     /// The orders $k_i$ of the $\tau$-torsion summands $\mathbb{F}_2[\tau]/\tau^{k_i}$

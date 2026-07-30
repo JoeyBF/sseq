@@ -1,8 +1,8 @@
 //! The deformation (algebraic Novikov / τ-Bockstein) spectral sequence: assemble
 //! the trigraded [`Sseq`] whose $E_1 = \mathrm{Ext}_{A_C/\tau}$ and whose $d_r$ are
 //! the τ-Bockstein differentials read off the lifted δ. Inverting τ gives the
-//! classical Adams $E_2$ ([`MotivicResolution::classical_ext_rank`]); the
-//! finite-page deaths are the motivic τ-torsion.
+//! classical Adams $E_2$ ([`MotivicResolution::free_rank`]); the finite-page deaths
+//! are the motivic τ-torsion.
 
 use std::collections::HashMap;
 
@@ -292,17 +292,5 @@ impl MotivicResolution {
         span.record("num_higher_diffs", num_higher_diffs);
 
         sseq
-    }
-
-    /// The classical Adams $E_2$ rank at `(s, t)` — invert $\tau$: the free rank of
-    /// the motivic $E_2$. An alias for [`Self::free_rank`], the single δ-SNF source of
-    /// truth (`#gens − rank(δ_out) − rank(δ_in)`), regressed against `Ext_A`.
-    ///
-    /// (Summing the deformation SS $E_\infty$ is an equivalent count *only* where
-    /// every algebraic-Novikov differential has length 1; the δ SNF sees every
-    /// length — a $\tau^r$ invariant factor is a $d_r$ — so it is authoritative, and
-    /// exact at the report edge where the SS over-counts.)
-    pub fn classical_ext_rank(&self, s: i32, t: i32) -> usize {
-        self.free_rank(s, t)
     }
 }

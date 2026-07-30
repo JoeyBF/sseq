@@ -32,14 +32,6 @@ impl Poly {
         Poly([0; LIMBS])
     }
 
-    /// The monomial $\tau^{\mathrm{exp}}$.
-    #[allow(dead_code)] // constructor used by tests; matrices are built via `toggle`
-    pub fn tau_pow(exp: u32) -> Self {
-        let mut p = Poly::zero();
-        p.toggle(exp);
-        p
-    }
-
     /// Whether this is the zero polynomial.
     pub fn is_zero(&self) -> bool {
         self.0.iter().all(|&w| w == 0)

@@ -46,7 +46,7 @@
 //! fall out:
 //!
 //! - **invert $\tau$** — the free rank (all generators): the classical Adams $E_2$
-//!   ([`MotivicResolution::classical_ext_rank`], regressed against `Ext_A`).
+//!   ([`MotivicResolution::free_rank`], regressed against `Ext_A`).
 //! - **$\tau = 0$** — the generator counts: the algebraic Novikov $E_2$ (Phase 1).
 //! - **keep $\tau$** — free plus $\tau$-torsion: the motivic $E_2$ as a full
 //!   $\mathbb{F}_2[\tau]$-module ([`MotivicResolution::tau_module`], structure
@@ -1157,11 +1157,11 @@ mod tests {
         let moore = MotivicResolution::with_module(module, Bidegree::n_s(8, 6), None);
 
         // The bottom class survives on both.
-        assert_eq!(moore.classical_ext_rank(0, 0), 1, "S/2 bottom cell");
+        assert_eq!(moore.free_rank(0, 0), 1, "S/2 bottom cell");
         // The h₀-tower (stem 0, filtration ≥ 1): present on the sphere, gone on S/2.
         for s in 1..=4 {
-            assert_eq!(sphere.classical_ext_rank(s, s), 1, "sphere h₀^{s}");
-            assert_eq!(moore.classical_ext_rank(s, s), 0, "S/2 kills h₀^{s}");
+            assert_eq!(sphere.free_rank(s, s), 1, "sphere h₀^{s}");
+            assert_eq!(moore.free_rank(s, s), 0, "S/2 kills h₀^{s}");
         }
     }
 
@@ -1310,28 +1310,31 @@ mod tests {
     #[test]
     fn f2tau_reduce_mod_detects_membership() {
         use super::f2tau::{Poly, reduce_mod};
+        // The monomial τ^e (matrices are built via `toggle`; this is a test shorthand).
+        let tau = |e: u32| {
+            let mut p = Poly::zero();
+            p.toggle(e);
+            p
+        };
         // Over F₂[τ], reduce vectors modulo the submodule spanned by rows.
         // Rows: (1, τ) and (0, τ²). Column 0 pivot is the unit 1.
-        let rows = vec![
-            vec![Poly::tau_pow(0), Poly::tau_pow(1)],
-            vec![Poly::zero(), Poly::tau_pow(2)],
-        ];
+        let rows = vec![vec![tau(0), tau(1)], vec![Poly::zero(), tau(2)]];
         // (1, τ) is in the span → reduces to 0.
         assert!(
-            reduce_mod(rows.clone(), vec![Poly::tau_pow(0), Poly::tau_pow(1)])
+            reduce_mod(rows.clone(), vec![tau(0), tau(1)])
                 .iter()
                 .all(Poly::is_zero)
         );
         // (1, 0): col-0 pivot kills entry 0, leaving (0, τ) from the first row; then
         // (0, τ) mod (0, τ²) stays τ (τ has lower degree than τ²) → not in submodule.
         assert!(
-            reduce_mod(rows.clone(), vec![Poly::tau_pow(0), Poly::zero()])
+            reduce_mod(rows.clone(), vec![tau(0), Poly::zero()])
                 .iter()
                 .any(|x| !x.is_zero())
         );
         // (0, τ³) = τ·(0, τ²) is in the span → reduces to 0.
         assert!(
-            reduce_mod(rows, vec![Poly::zero(), Poly::tau_pow(3)])
+            reduce_mod(rows, vec![Poly::zero(), tau(3)])
                 .iter()
                 .all(Poly::is_zero)
         );
@@ -1499,14 +1502,14 @@ mod tests {
         let classical = construct_standard::<false, _, _>("S_2", None).unwrap();
         classical.compute_through_stem(max);
 
-        // classical_ext_rank(s, t) needs the lift at s+1, so s ≤ max_s − 1.
+        // free_rank(s, t) needs the lift at s+1, so s ≤ max_s − 1.
         for s in 0..res.max_s() {
             for t in s..=(max.n() + s) {
                 let n = t - s;
                 if n > max.n() {
                     continue;
                 }
-                let got = res.classical_ext_rank(s, t);
+                let got = res.free_rank(s, t);
                 let want = classical.number_of_gens_in_bidegree(Bidegree::n_s(n, s));
                 assert_eq!(
                     got, want,
@@ -1533,7 +1536,7 @@ mod tests {
             vec![1],
             "h₁⁴ at (s=4, t=8) should be a single F₂[τ]/τ torsion summand"
         );
-        assert!(res.has_tau_torsion(4, 8));
+        assert!(!res.tau_module(4, 8).torsion.is_empty());
 
         // Sanity: h₁³ (s=3, t=6) is already nonzero classically, so it is free —
         // not flagged as (extra) torsion beyond its classical class.
