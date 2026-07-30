@@ -413,10 +413,12 @@ fn main() -> anyhow::Result<()> {
     }
 
     // One red h₁ arrow per collapsed tower, rising slope-1 from its anchor (rule 9).
+    // Length 0.7 (not a full unit) so the arrowhead sits in the gap and isn't hidden
+    // behind the dot at the next lattice point.
     for a in &arrow_anchors {
         backend.arrow(
             BidegreeGenerator::new(Bidegree::n_s(a.0, a.1), a.2),
-            (1.0, 1.0),
+            (0.7, 0.7),
             &["h1tower".to_string()],
         )?;
     }
