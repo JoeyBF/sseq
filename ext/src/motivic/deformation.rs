@@ -295,22 +295,14 @@ impl MotivicResolution {
     }
 
     /// The classical Adams $E_2$ rank at `(s, t)` — invert $\tau$: the free rank of
-    /// the motivic $E_2$.
+    /// the motivic $E_2$. An alias for [`Self::free_rank`], the single δ-SNF source of
+    /// truth (`#gens − rank(δ_out) − rank(δ_in)`), regressed against `Ext_A`.
     ///
-    /// The exact $\tau$-inverted rank of $H(\delta)$, read off the Ext DGA at
-    /// `cap = ∞` ([`ExtAlgebra::cohomology_dimension`]) — the classical Adams $E_2$
-    /// (regressed against `Ext_A`).
-    ///
-    /// The deformation SS $E_\infty$ is an equivalent count *only* where every
-    /// algebraic-Novikov differential has length 1. A higher (length $> 1$)
-    /// differential the τ-Bockstein zig-zag can miss ([`Self::build_deformation_sseq`])
-    /// leaves both of its endpoints alive as spurious survivors — e.g. the extra
-    /// classes near $g^2$ at $(40, 8)$. The δ rank captures every differential length
-    /// (they are the higher-$\tau$ entries of δ, seen by its Smith normal form), so we
-    /// take it as authoritative instead of summing the SS $E_\infty$.
+    /// (Summing the deformation SS $E_\infty$ is an equivalent count *only* where
+    /// every algebraic-Novikov differential has length 1; the δ SNF sees every
+    /// length — a $\tau^r$ invariant factor is a $d_r$ — so it is authoritative, and
+    /// exact at the report edge where the SS over-counts.)
     pub fn classical_ext_rank(&self, s: i32, t: i32) -> usize {
-        self.ext()
-            .cohomology_dimension(Bidegree::n_s(t - s, s))
-            .unwrap_or(0)
+        self.free_rank(s, t)
     }
 }

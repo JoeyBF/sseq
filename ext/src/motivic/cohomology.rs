@@ -194,11 +194,55 @@ impl MotivicResolution {
     /// data the deformation SS carries as its $d_r$ differentials *supported* at
     /// `(n, s)` (order $= r$), computed locally here so it is exact up to the resolved
     /// range rather than the SS's report box.
+    /// Both halves are read off the **one** Smith normal form of δ over
+    /// $\mathbb{F}_2[\tau]$ ([`super::f2tau::smith`]): the torsion is its non-unit
+    /// invariant factors, and the free rank is `#gens − rank(δ_out) − rank(δ_in)`
+    /// with the ranks over $\mathbb{F}_2(\tau)$ (invert $\tau$) — the SNF pivot count.
+    /// This is the single source of truth for the graded δ; the deformation SS
+    /// carries the *same* invariant factors as its $d_r$ (a $\tau^r$ factor is a
+    /// $d_r$) but exists to carry the ring structure, not to recompute this.
     pub fn tau_module(&self, s: i32, t: i32) -> TauModule {
         TauModule {
-            free: self.classical_ext_rank(s, t),
+            free: self.free_rank(s, t),
             torsion: self.tau_torsion_orders(s, t),
         }
+    }
+
+    /// The δ matrix $\delta\colon \mathrm{gens}(s, t) \to \mathrm{gens}(s{-}1, t)$
+    /// over $\mathbb{F}_2[\tau]$: entry `(i, j)` is $\sum \tau^{\mathrm{power}}$ over
+    /// the terms of $\delta(g_i)$ hitting the `j`-th target generator (each power is
+    /// forced by the weights, so every entry is a single monomial). Empty for
+    /// $s < 1$ (the unit has no outgoing δ).
+    fn delta_matrix(&self, s: i32, t: i32) -> Vec<Vec<f2tau::Poly>> {
+        if s < 1 {
+            return Vec::new();
+        }
+        let (rows, cols) = (self.num_gens(s, t), self.num_gens(s - 1, t));
+        let mut m = vec![vec![f2tau::Poly::zero(); cols]; rows];
+        for (ri, row) in m.iter_mut().enumerate() {
+            for (gj, power) in self.delta(Gen { s, t, idx: ri }) {
+                if gj.s == s - 1 && gj.idx < cols {
+                    row[gj.idx].toggle(power);
+                }
+            }
+        }
+        m
+    }
+
+    /// The classical Adams $E_2$ (free) rank at `(s, t)` — the $\tau$-inverted rank
+    /// of $H(\delta)$ — read off the **same** SNF of δ as the torsion:
+    /// $$\dim_{\mathbb{F}_2(\tau)} H(\delta) = \#\mathrm{gens}(s,t)
+    ///   - \operatorname{rank}(\delta_{\mathrm{out}}) - \operatorname{rank}(\delta_{\mathrm{in}}),$$
+    /// where $\delta_{\mathrm{out}}\colon (s,t) \to (s{-}1,t)$ and
+    /// $\delta_{\mathrm{in}}\colon (s{+}1,t) \to (s,t)$, and each rank is the SNF
+    /// pivot count (rank over $\mathbb{F}_2(\tau)$). Being local, this is exact up to
+    /// the resolved range — including at the report-box edge, where the deformation
+    /// SS over-counts for lack of the incoming differentials.
+    pub(super) fn free_rank(&self, s: i32, t: i32) -> usize {
+        let gens = self.num_gens(s, t);
+        let rank_out = f2tau::smith(self.delta_matrix(s, t)).0;
+        let rank_in = f2tau::smith(self.delta_matrix(s + 1, t)).0;
+        gens.saturating_sub(rank_out).saturating_sub(rank_in)
     }
 
     /// Whether `(s, t)` carries a $\tau$-torsion class in the motivic $E_2$ — a class
@@ -215,26 +259,9 @@ impl MotivicResolution {
     /// $\mathbb{F}_2[\tau]$. (Outgoing, not incoming: `Ext = H(δ)` is cohomology, so
     /// the torsion sits on the class whose own δ is $\tau$-divisible.)
     fn tau_torsion_orders(&self, s: i32, t: i32) -> Vec<u32> {
-        if s < 1 {
-            return Vec::new(); // the s = 0 unit is free; no outgoing δ.
-        }
-        let rows = self.num_gens(s, t);
-        let cols = self.num_gens(s - 1, t);
-        if rows == 0 || cols == 0 {
-            return Vec::new();
-        }
-        // The δ matrix over F₂[τ]: entry (i, j) is the sum of τ^power over the terms
-        // of δ(gᵢ) hitting the j-th generator at (s-1, t). Packed as a bitmask of
-        // τ-exponents (F₂ coefficients).
-        let mut m = vec![vec![f2tau::Poly::zero(); cols]; rows];
-        for (ri, row) in m.iter_mut().enumerate() {
-            for (gj, power) in self.delta(Gen { s, t, idx: ri }) {
-                if gj.s == s - 1 && gj.idx < cols {
-                    row[gj.idx].toggle(power);
-                }
-            }
-        }
-        let mut orders: Vec<u32> = f2tau::invariant_factors(m)
+        // The non-unit invariant factors of the outgoing δ (empty for s < 1).
+        let mut orders: Vec<u32> = f2tau::smith(self.delta_matrix(s, t))
+            .1
             .into_iter()
             .map(|f| f2tau::deg(&f) as u32)
             .collect();

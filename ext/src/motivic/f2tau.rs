@@ -4,7 +4,7 @@
 //!
 //! Used to read the motivic Adams $E_2$ as an $\mathbb{F}_2[\tau]$-module: the
 //! $\tau$-torsion orders are the non-unit invariant factors of $\delta$
-//! ([`invariant_factors`], Smith normal form), and Massey-product coset membership
+//! ([`smith`], Smith normal form), and Massey-product coset membership
 //! is decided by reducing modulo a submodule ([`reduce_mod`]).
 //!
 //! The representation was `u128` (exponents capped at 127); it is now a fixed
@@ -33,6 +33,7 @@ impl Poly {
     }
 
     /// The monomial $\tau^{\mathrm{exp}}$.
+    #[allow(dead_code)] // constructor used by tests; matrices are built via `toggle`
     pub fn tau_pow(exp: u32) -> Self {
         let mut p = Poly::zero();
         p.toggle(exp);
@@ -189,17 +190,25 @@ pub fn reduce_mod(mut rows: Vec<Vec<Poly>>, mut target: Vec<Poly>) -> Vec<Poly> 
     target
 }
 
-/// The non-unit invariant factors (degree $\ge 1$) of `m` over
-/// $\mathbb{F}_2[\tau]$, by Smith normal form. `m` is consumed.
+/// The Smith normal form of `m` over $\mathbb{F}_2[\tau]$: its `rank` (number of
+/// nonzero invariant factors = the rank over the fraction field $\mathbb{F}_2(\tau)$,
+/// i.e. inverting $\tau$) and the non-unit invariant `factors` (degree $\ge 1$, the
+/// $\tau$-torsion orders). `m` is consumed.
+///
+/// One source of truth for the graded δ: over the PID $\mathbb{F}_2[\tau]$ an
+/// invariant factor $\tau^r$ is exactly a length-$r$ differential $d_r$ of the
+/// τ-Bockstein SS, and `rank` (invert $\tau$) is what the $E_\infty$ free part
+/// counts. So [`crate::motivic::MotivicResolution::tau_module`] reads both its free
+/// rank and its torsion off this one call.
 ///
 /// Standard Euclidean SNF: pivot on the minimum-degree nonzero entry, clear its
 /// row and column by division, and pull any lower-degree residual back into the
 /// pivot until the pivot divides the remaining block; then recurse on the
-/// complementary submatrix.
+/// complementary submatrix. The number of pivots is `rank`.
 // The row/column clears index two rows (or columns) at once — `m[i][j]` against
 // `m[r0][j]` — so index loops are clearer than split-borrow iterator gymnastics.
 #[allow(clippy::needless_range_loop)]
-pub fn invariant_factors(mut m: Vec<Vec<Poly>>) -> Vec<Poly> {
+pub fn smith(mut m: Vec<Vec<Poly>>) -> (usize, Vec<Poly>) {
     let rows = m.len();
     let cols = m.first().map_or(0, Vec::len);
     let mut factors = Vec::new();
@@ -283,5 +292,5 @@ pub fn invariant_factors(mut m: Vec<Vec<Poly>>) -> Vec<Poly> {
         r0 += 1;
         c0 += 1;
     }
-    factors
+    (r0, factors) // r0 = number of pivots = rank over F₂(τ)
 }
