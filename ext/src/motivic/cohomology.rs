@@ -226,17 +226,17 @@ impl MotivicResolution {
         // The δ matrix over F₂[τ]: entry (i, j) is the sum of τ^power over the terms
         // of δ(gᵢ) hitting the j-th generator at (s-1, t). Packed as a bitmask of
         // τ-exponents (F₂ coefficients).
-        let mut m = vec![vec![0u128; cols]; rows];
+        let mut m = vec![vec![f2tau::Poly::zero(); cols]; rows];
         for (ri, row) in m.iter_mut().enumerate() {
             for (gj, power) in self.delta(Gen { s, t, idx: ri }) {
                 if gj.s == s - 1 && gj.idx < cols {
-                    row[gj.idx] ^= 1u128 << power;
+                    row[gj.idx].toggle(power);
                 }
             }
         }
         let mut orders: Vec<u32> = f2tau::invariant_factors(m)
             .into_iter()
-            .map(|f| f2tau::deg(f) as u32)
+            .map(|f| f2tau::deg(&f) as u32)
             .collect();
         orders.sort_unstable();
         orders

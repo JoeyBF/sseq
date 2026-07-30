@@ -1309,25 +1309,32 @@ mod tests {
 
     #[test]
     fn f2tau_reduce_mod_detects_membership() {
-        use super::f2tau::reduce_mod;
+        use super::f2tau::{Poly, reduce_mod};
         // Over F₂[τ], reduce vectors modulo the submodule spanned by rows.
         // Rows: (1, τ) and (0, τ²). Column 0 pivot is the unit 1.
-        let rows = vec![vec![0b1u128, 0b10], vec![0, 0b100]];
+        let rows = vec![
+            vec![Poly::tau_pow(0), Poly::tau_pow(1)],
+            vec![Poly::zero(), Poly::tau_pow(2)],
+        ];
         // (1, τ) is in the span → reduces to 0.
         assert!(
-            reduce_mod(rows.clone(), vec![0b1, 0b10])
+            reduce_mod(rows.clone(), vec![Poly::tau_pow(0), Poly::tau_pow(1)])
                 .iter()
-                .all(|&x| x == 0)
+                .all(Poly::is_zero)
         );
         // (1, 0): col-0 pivot kills entry 0, leaving (0, τ) from the first row; then
         // (0, τ) mod (0, τ²) stays τ (τ has lower degree than τ²) → not in submodule.
         assert!(
-            reduce_mod(rows.clone(), vec![0b1, 0])
+            reduce_mod(rows.clone(), vec![Poly::tau_pow(0), Poly::zero()])
                 .iter()
-                .any(|&x| x != 0)
+                .any(|x| !x.is_zero())
         );
         // (0, τ³) = τ·(0, τ²) is in the span → reduces to 0.
-        assert!(reduce_mod(rows, vec![0, 0b1000]).iter().all(|&x| x == 0));
+        assert!(
+            reduce_mod(rows, vec![Poly::zero(), Poly::tau_pow(3)])
+                .iter()
+                .all(Poly::is_zero)
+        );
     }
 
     #[test]

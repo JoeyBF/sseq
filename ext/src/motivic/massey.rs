@@ -202,16 +202,16 @@ impl MotivicResolution {
 
         // Reduce the representative modulo the indeterminacy over F₂[τ]: pack each
         // term list into a coefficient vector (τ-powers as F₂[τ] monomials).
-        let to_vec = |terms: &[(Gen, u32)]| -> Vec<u128> {
-            let mut v = vec![0u128; ncols];
+        let to_vec = |terms: &[(Gen, u32)]| -> Vec<f2tau::Poly> {
+            let mut v = vec![f2tau::Poly::zero(); ncols];
             for &(g, p) in terms {
-                v[g.idx] ^= 1u128 << p;
+                v[g.idx].toggle(p);
             }
             v
         };
-        let rows: Vec<Vec<u128>> = indeterminacy.iter().map(|t| to_vec(t)).collect();
+        let rows: Vec<Vec<f2tau::Poly>> = indeterminacy.iter().map(|t| to_vec(t)).collect();
         let remainder = f2tau::reduce_mod(rows, to_vec(&representative));
-        let is_zero = remainder.iter().all(|&x| x == 0);
+        let is_zero = remainder.iter().all(f2tau::Poly::is_zero);
 
         MotivicMassey {
             degree: Bidegree::n_s(tot_t - tot_s, tot_s),
