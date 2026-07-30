@@ -370,7 +370,10 @@ mod tests {
                         let mut result = FpVector::new(TWO, alg.dimension(t));
                         alg.multiply_basis_elements(result.as_slice_mut(), 1, t1, idx1, t2, idx2);
                         let got: BTreeSet<usize> = result.iter_nonzero().map(|(i, _)| i).collect();
-                        assert_eq!(got, expected, "mod-τ product ≠ τ^0 part at ({t1},{idx1})·({t2},{idx2})");
+                        assert_eq!(
+                            got, expected,
+                            "mod-τ product ≠ τ^0 part at ({t1},{idx1})·({t2},{idx2})"
+                        );
                     }
                 }
             }
@@ -388,7 +391,9 @@ mod tests {
         alg.compute_basis(16);
 
         let name_of = |deg: i32, gens: &[usize]| -> Vec<String> {
-            gens.iter().map(|&i| alg.basis_element_to_string(deg, i)).collect()
+            gens.iter()
+                .map(|&i| alg.basis_element_to_string(deg, i))
+                .collect()
         };
         assert_eq!(name_of(1, &alg.generators(1)), vec!["Q_0"]);
         assert_eq!(name_of(2, &alg.generators(2)), vec!["P(0, 1)"]);
@@ -429,7 +434,8 @@ mod tests {
                 for (coef, (d1, i1), (d2, i2)) in decomp {
                     assert!(
                         d1 > 0 && d1 < degree && d2 > 0 && d2 < degree,
-                        "factor of ({degree}, {idx}) is not strictly smaller: ({d1},{i1})·({d2},{i2})"
+                        "factor of ({degree}, {idx}) is not strictly smaller: \
+                         ({d1},{i1})·({d2},{i2})"
                     );
                     alg.multiply_basis_elements(sum.as_slice_mut(), coef, d1, i1, d2, i2);
                 }
@@ -484,7 +490,10 @@ mod tests {
                 alg.multiply_basis_elements(result.as_slice_mut(), 1, 0, 0, t, idx);
                 let mut expected = FpVector::new(TWO, alg.dimension(t));
                 expected.add_basis_element(idx, 1);
-                assert_eq!(result, expected, "unit did not act as identity on ({t}, {idx})");
+                assert_eq!(
+                    result, expected,
+                    "unit did not act as identity on ({t}, {idx})"
+                );
             }
         }
     }

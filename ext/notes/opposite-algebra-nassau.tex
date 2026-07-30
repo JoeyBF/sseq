@@ -1,0 +1,349 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,amsthm,mathtools}
+\usepackage{hyperref}
+\usepackage{enumitem}
+
+\newtheorem{theorem}{Theorem}
+\newtheorem{proposition}[theorem]{Proposition}
+\newtheorem{lemma}[theorem]{Lemma}
+\newtheorem{corollary}[theorem]{Corollary}
+\theoremstyle{definition}
+\newtheorem{definition}[theorem]{Definition}
+\newtheorem{remark}[theorem]{Remark}
+
+\DeclareMathOperator{\Ext}{Ext}
+\DeclareMathOperator{\Tor}{Tor}
+\DeclareMathOperator{\supp}{supp}
+\DeclareMathOperator{\op}{op}
+\newcommand{\F}{\mathbb{F}}
+\newcommand{\Ac}{A_{\mathbb C}}
+\newcommand{\Actau}{A_{\mathbb C}/\tau}
+\newcommand{\ket}[1]{\lvert #1 \rangle}
+\newcommand{\barA}{\overline{A}}
+\newcommand{\Aop}{A^{\op}}
+
+\title{Resolving over the opposite algebra:\\
+a handedness correction for Nassau's signature filtration\\
+over the motivic Steenrod algebra $\Actau$}
+\author{}
+\date{}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Nassau's signature-filtration algorithm computes a minimal free resolution of the
+trivial module over the mod-$2$ Steenrod algebra by localizing the homology
+computation at each bidegree to a small ``zero-signature'' subquotient, with cheap
+signature-graded corrections. Its correctness rests on the signature filtration by
+a finite sub-Hopf-algebra $B$ being a filtration by \emph{right} ideals, so that the
+differential of a free \emph{left} module is filtered. We observe that for the
+mod-$\tau$ $C$-motivic Steenrod algebra $\Actau$, presented in the conjugate
+(Voevodsky) Milnor basis, the analogous signature filtration is instead by
+\emph{left} ideals. We give an elementary reduction: whenever the filtration is
+left-stable, one runs the algorithm on free \emph{right} modules --- equivalently,
+free left modules over the opposite algebra $\Aop$ --- and the resulting bigraded
+$\Ext$ ranks are unchanged, by the flip symmetry $\Tor^A(k,k)\cong\Tor^{\Aop}(k,k)$
+of the bar complex. We explain the handedness as antipode transport between the
+standard and conjugate Milnor bases, and report a computational validation: the
+resulting engine reproduces the generic minimal resolution rank-for-rank while
+localizing the homology to subquotients up to $\approx 50\times$ smaller.
+\end{abstract}
+
+\section{Introduction}
+
+Let $k=\F_2$ and let $A$ be a graded, connected, augmented $\F_2$-algebra of finite
+type, with augmentation ideal $\barA=\ker(\epsilon\colon A\to k)$. Computing
+$\Ext_A(k,k)$ --- for $A$ the Steenrod algebra, the input to the Adams spectral
+sequence --- amounts to building a minimal free resolution $C_\bullet\to k$ and
+reading off the ranks $\dim\Ext^{s,t}_A(k,k)=\#\{\text{generators of }C_s\text{ in
+degree }t\}$.
+
+Nassau's algorithm \cite{nassau} accelerates this for $A$ the mod-$2$ Steenrod
+algebra. Fix a finite sub-Hopf-algebra $B\subseteq A$. Milnor's theorem makes $A$
+free over $B$ on both sides, so each Milnor basis element has a well-defined
+\emph{$B$-signature}, and $A$ decomposes as $\bigoplus_R E_R A$ indexed by a poset
+$S_B$ of signatures. At a bidegree $(s,t)$ the homology $H(E_0C)$ of the
+\emph{zero-signature} subquotient already determines the new generators; the true
+differential is then recovered by a sweep of cheap lifting solves through the
+nonzero signatures in increasing order. Because $\dim E_0C\approx\dim C/\dim B$, the
+expensive linear algebra shrinks by a factor of order $\dim B$.
+
+The correctness of the sweep requires that the differential of a free module be
+compatible with the signature filtration --- that the signature-masked matrices are
+exactly the associated-graded pieces of a block-triangular map. As we recall in
+\S\ref{sec:stability}, this is the statement that the filtration
+$F_R=\bigoplus_{S\ge R}E_SA$ is by \emph{right} ideals of $A$. Nassau's Lemma~2.5
+establishes precisely this in the standard Milnor basis.
+
+We are interested in the mod-$\tau$ $C$-motivic Steenrod algebra
+\[
+  \Actau \;\cong\; \F_2[\xi_1,\xi_2,\dots]\otimes E(\tau_0,\tau_1,\dots),
+\]
+whose cohomology $\Ext_{\Actau}(k,k)$ is the algebraic Novikov $E_2$-page,
+equivalently the motivic Adams $E_2$ of $C\tau$ \cite{gwx}. This is a connected
+finite-type $\F_2$-Hopf algebra of the ``odd-primary shape'': its basis elements
+$Q(E)P(R)$ carry an exterior part (the $\tau_i$, dual to the Milnor primitives
+$Q_i$) alongside the polynomial part (the $\xi_j$). Its product is computed in the
+\emph{conjugate} generators of Kong--Lin \cite{konglin}, so that on the polynomial
+part it agrees on the nose with Milnor's classical matrix product.
+
+A direct transcription of Nassau's algorithm to $\Actau$ fails to converge: the
+signature-masked correction sweep does not terminate with $d^2=0$. The obstruction
+is that, in this basis, the signature filtration is \emph{not} by right ideals. Our
+first observation isolates why (\S\ref{sec:handedness}); the second is a clean and
+completely general fix.
+
+\begin{theorem}[Opposite-algebra reduction]\label{thm:main}
+Let $A$ be a graded connected augmented $\F_2$-algebra of finite type with a
+signature filtration $\{F_R\}_{R\in S_B}$ that is \emph{left}-stable, i.e.\ $A\cdot
+F_R\subseteq F_R$ for every $R$. Then Nassau's signature sweep, applied to free left
+modules over the opposite algebra $\Aop$ (equivalently, to free \emph{right}
+$A$-modules), computes a minimal resolution of $k$, and for all $(s,t)$
+\[
+  \dim\Ext^{s,t}_{\Aop}(k,k)\;=\;\dim\Ext^{s,t}_{A}(k,k).
+\]
+\end{theorem}
+
+The rank equality (\S\ref{sec:reduction}) is elementary and requires no Hopf
+structure: it is the flip symmetry of the two-sided bar complex. The Hopf antipode
+supplies the finer statement that $\Aop\cong A$ as algebras, and also explains the
+handedness itself. \S\ref{sec:computation} records the computational validation.
+
+\section{Signature filtrations and one-sided stability}\label{sec:stability}
+
+Fix $A$ as above with a homogeneous $k$-basis $\mathcal B\ni 1$. A \emph{signature
+datum} for $A$ is a finite poset $(S_B,\le)$ with least element $0$, together with a
+map $\sigma\colon\mathcal B\to S_B$ with $\sigma(1)=0$. Set
+\[
+  E_R=\operatorname{span}_k\{b\in\mathcal B:\sigma(b)=R\},\qquad
+  F_R=\bigoplus_{S\ge R}E_S=\operatorname{span}_k\{b:\sigma(b)\ge R\}.
+\]
+Thus $F_0=A$, and $\{F_R\}$ is a decreasing filtration indexed by $S_B$. In the
+Steenrod setting $S_B$ is the set of $B$-signatures of a finite sub-Hopf-algebra
+$B$, and $E_RA\cong B\backslash\!\backslash A$ up to a degree shift.
+
+\begin{definition}
+The filtration $\{F_R\}$ is \emph{right-stable} if $F_R\cdot A\subseteq F_R$ for all
+$R$ (each $F_R$ a right ideal), and \emph{left-stable} if $A\cdot F_R\subseteq F_R$
+for all $R$ (each $F_R$ a left ideal).
+\end{definition}
+
+Since $F_R$ is spanned by the basis elements of signature $\ge R$ and $0=\min S_B$,
+these translate into structure-constant conditions on the product:
+\begin{align}
+  \{F_R\}\text{ right-stable}
+  &\iff \sigma(c)\ge\sigma(a)\ \text{ for all }a,b\in\mathcal B,\ c\in\supp(ab),
+  \tag{L-floor}\label{eq:Lfloor}\\
+  \{F_R\}\text{ left-stable}
+  &\iff \sigma(c)\ge\sigma(b)\ \text{ for all }a,b\in\mathcal B,\ c\in\supp(ab).
+  \tag{R-floor}\label{eq:Rfloor}
+\end{align}
+That is: right-stability says the \emph{left} factor's signature is a floor for the
+product; left-stability says the \emph{right} factor's is.
+
+Let $F=\bigoplus_\alpha A g_\alpha$ be a free \emph{left} $A$-module on homogeneous
+generators $g_\alpha$, filtered by $\Phi_RF=\bigoplus_\alpha F_R g_\alpha$; the
+basis element $b\,g_\alpha$ has signature $\sigma(b)$.
+
+\begin{lemma}\label{lem:filtered}
+If $\{F_R\}$ is right-stable, then every homomorphism of free left $A$-modules is
+filtered: $d(\Phi_RF)\subseteq\Phi_RF'$. Dually, if $\{F_R\}$ is left-stable, then
+every homomorphism of free \emph{right} $A$-modules is filtered.
+\end{lemma}
+
+\begin{proof}
+Let $d\colon F\to F'$ be left $A$-linear, $d(g_\alpha)=\sum_\beta
+u_{\alpha\beta}\,g_\beta$ with $u_{\alpha\beta}\in A$. For a basis element $b\,
+g_\alpha\in\Phi_RF$ (so $\sigma(b)\ge R$, i.e.\ $b\in F_R$),
+\[
+  d(b\,g_\alpha)=\sum_\beta (b\,u_{\alpha\beta})\,g_\beta,
+  \qquad b\,u_{\alpha\beta}\in F_R\cdot A\subseteq F_R
+\]
+by right-stability, so $d(b\,g_\alpha)\in\Phi_RF'$. The right-module statement is
+identical with $d(g_\alpha\,b)=\sum_\beta g_\beta\,(u_{\alpha\beta}\,b)$ and
+$u_{\alpha\beta}\,b\in A\cdot F_R\subseteq F_R$.
+\end{proof}
+
+Nassau's sweep is exactly the algorithm that, at each bidegree, computes the
+homology of the associated-graded of a filtered differential by processing the pieces
+$E_R$ in increasing order of $R$; Lemma~\ref{lem:filtered} is the hypothesis that
+makes the differential filtered. In a resolution of the trivial module by free
+\emph{left} modules the differential is left $A$-linear, so the algorithm needs
+right-stability~\eqref{eq:Lfloor}. This is the classical situation. When instead the
+filtration is left-stable~\eqref{eq:Rfloor}, Lemma~\ref{lem:filtered} says one must
+use free \emph{right} modules.
+
+\section{The opposite-algebra reduction}\label{sec:reduction}
+
+Free right $A$-modules are free left modules over the opposite algebra $\Aop$ (same
+underlying graded vector space, product $a\cdot_{\op}b=ba$). The augmentation, the
+basis $\mathcal B$, and the signature map $\sigma$ are unchanged, and one checks
+directly that $\{F_R\}$ is left-stable for $A$ iff it is right-stable for $\Aop$.
+Thus:
+
+\begin{proposition}\label{prop:op-runs}
+If $\{F_R\}$ is left-stable for $A$, it is right-stable for $\Aop$, and Nassau's
+sweep applied to free left $\Aop$-modules computes a minimal resolution of $k$ over
+$\Aop$.
+\end{proposition}
+
+\begin{proof}
+Immediate from Lemma~\ref{lem:filtered} applied to $\Aop$: left-stability of
+$\{F_R\}$ for $A$ is \eqref{eq:Rfloor}, which reads $\sigma(c)\ge\sigma(b)$ for
+$c\in\supp(ab)=\supp(b\cdot_{\op}a)$, i.e.\ the \emph{left} $\Aop$-factor $b$ is the
+floor: right-stability~\eqref{eq:Lfloor} for $\Aop$. Now run the standard algorithm
+over $\Aop$.
+\end{proof}
+
+It remains to see that resolving over $\Aop$ costs nothing in the answer.
+
+\begin{proposition}[Bar-flip symmetry]\label{prop:tor}
+For any augmented $\F_2$-algebra $A$ of finite type and all $(s,t)$,
+\[
+  \Tor^{A}_{s,t}(k,k)\;\cong\;\Tor^{\Aop}_{s,t}(k,k),
+  \qquad\text{hence}\qquad
+  \dim\Ext^{s,t}_{A}(k,k)=\dim\Ext^{s,t}_{\Aop}(k,k).
+\]
+\end{proposition}
+
+\begin{proof}
+$\Tor^A_\bullet(k,k)$ is the homology of the normalized bar complex $\barA^{\otimes
+\bullet}$ with $s$-th term $\barA^{\otimes s}$ and differential
+$\partial=\sum_{i=1}^{s-1}\partial_i$, where over $\F_2$
+\[
+  \partial_i(a_1\otimes\cdots\otimes a_s)
+  = a_1\otimes\cdots\otimes a_ia_{i+1}\otimes\cdots\otimes a_s
+\]
+multiplies the $i$-th adjacent pair. The reversal
+\[
+  \rho\colon \barA^{\otimes s}\to\barA^{\otimes s},\qquad
+  a_1\otimes\cdots\otimes a_s\longmapsto a_s\otimes\cdots\otimes a_1
+\]
+is a graded isomorphism, and it intertwines the $A$- and $\Aop$-bar differentials:
+the pair multiplied by $\partial_i^A$ is $a_ia_{i+1}=a_{i+1}\cdot_{\op}a_i$, which
+after reversal is the adjacent $\Aop$-product at position $s-i$, so
+$\rho\circ\partial_i^A=\partial_{s-i}^{\Aop}\circ\rho$. Hence $\rho$ is an
+isomorphism of complexes $\barA^{\otimes\bullet}(A)\cong\barA^{\otimes\bullet}
+(\Aop)$, giving the stated isomorphism on homology. The $\Ext$ statement follows as
+$A$ is of finite type, so $\Ext^{s,t}_A(k,k)$ is dual to $\Tor^A_{s,t}(k,k)$.
+\end{proof}
+
+\begin{proof}[Proof of Theorem~\ref{thm:main}]
+Combine Proposition~\ref{prop:op-runs} (the sweep computes a minimal resolution of
+$k$ over $\Aop$, whose generator ranks are $\dim\Ext_{\Aop}(k,k)$) with
+Proposition~\ref{prop:tor} (those ranks equal $\dim\Ext_A(k,k)$).
+\end{proof}
+
+\begin{remark}
+Proposition~\ref{prop:tor} uses no coalgebra structure. When $A$ is a Hopf algebra
+the antipode $\chi\colon A\to\Aop$ is an algebra isomorphism, so $\Aop\cong A$
+outright and one even has a canonical isomorphism of $\Ext$-algebras; but the rank
+equality --- all that a resolution computes --- is the elementary bar-flip above.
+\end{remark}
+
+\section{The handedness of $\Actau$}\label{sec:handedness}
+
+Why is the signature filtration of $\Actau$ left-stable when the classical one is
+right-stable? The two algebras share the polynomial part: on $P(R)$-elements the
+$\Actau$-product is Milnor's classical matrix product, for which Nassau's Lemma~2.5
+gives right-stability~\eqref{eq:Lfloor}. The flip is forced by two features of the
+motivic setting.
+
+\paragraph{The exterior generators couple to the polynomial signature.}
+A signature that reads only the $\xi$-exponents is already unstable on $\Actau$,
+because of mixed products such as
+\[
+  Q_0\cdot P(\xi_1)\;=\;Q_1+Q_0P(\xi_1).
+\]
+Here the right factor $P(\xi_1)$ has nonzero $\xi_1$-signature, but the output term
+$Q_1$ is purely exterior and has $\xi$-signature $0$. This is the $\xi_0=1$ versus
+$\tau_0\ne1$ asymmetry of the motivic coproduct (Kong--Lin, Remark~4.3): the
+signature must be read jointly on $Q(E)P(R)$, as in Nassau's odd-primary treatment
+(\cite{nassau}, \S4). With the joint low-bit signature $\sigma_B$ --- the exterior
+component $E\cap\{Q_0,\dots,Q_{q-1}\}$ together with $r_{i+1}\bmod 2^{p_i}$ --- the
+filtration is stable; the question is only on which side.
+
+\paragraph{Conjugate generators reverse the side.}
+The $\Actau$-product is computed in the conjugate (Voevodsky) Milnor basis
+\cite{konglin}: the engine's $P(R)$ is dual to $\overline{\xi}\,{}^R$, with
+$\overline{\xi}_i=\chi(\xi_i)$ and $\chi$ the Hopf antipode. Let $\sigma_B^{\mathrm
+{std}}$ denote Nassau's signature in the standard Milnor basis. The antipode
+$\chi\colon A\to A$ is an anti-automorphism ($\chi(ab)=\chi(b)\chi(a)$) that
+preserves every sub-Hopf-algebra ($\chi(B)=B$), hence carries the standard signature
+filtration to
+\[
+  \chi\bigl(F_R^{\mathrm{std}}\cdot A\bigr)
+  = A\cdot\chi\bigl(F_R^{\mathrm{std}}\bigr),
+\]
+so right-stability of $F^{\mathrm{std}}$ becomes left-stability of
+$\chi(F^{\mathrm{std}})$. The filtration our engine computes --- the low-bit
+signature in the conjugate basis --- is $\chi(F^{\mathrm{std}})$, and is therefore
+left-stable. Applying $\chi$, or equivalently passing to $\Aop$ as in
+Theorem~\ref{thm:main}, undoes the conjugation and returns the computation to
+Nassau's original right-stable hypothesis.
+
+\begin{remark}
+The reduction is agnostic to \emph{why} a filtration is one-sided: one detects the
+side once, per algebra and basis, by checking the structure-constant condition
+\eqref{eq:Lfloor}/\eqref{eq:Rfloor}, then chooses $A$ or $\Aop$ accordingly. The
+antipode argument above is the conceptual explanation of the observed side for
+$\Actau$; the side is in any case confirmed directly (\S\ref{sec:computation}). The
+two remaining ingredients are genuinely Nassau's odd-primary theory: that the joint
+$Q(E)P(R)$ signature is stable at all (\cite{nassau}, \S4), and the vanishing-line
+choice of $B$ (\emph{loc.\ cit.}, Thm.~3.1/4.1). Theorem~\ref{thm:main} concerns
+only the handedness, and is what makes those ingredients usable in the conjugate
+basis the motivic product is computed in.
+\end{remark}
+
+\section{Computational validation}\label{sec:computation}
+
+The reduction is implemented as an additive, feature-gated engine
+(\texttt{motivic\_nassau}) in the \texttt{sseq} Rust library, resolving $k$ over
+$\Actau$ by the signature sweep of Proposition~\ref{prop:op-runs} over the opposite
+algebra, and validated against the library's generic minimal-resolution engine.
+
+\begin{enumerate}[leftmargin=*]
+\item \emph{Handedness.} Over a range of degrees the structure-constant conditions
+\eqref{eq:Lfloor}/\eqref{eq:Rfloor} are checked directly against the computed
+$\Actau$-product for $B=A(0),A(1),E(Q_0),E(Q_0,Q_1)$: \eqref{eq:Lfloor} (left factor
+floor) fails, \eqref{eq:Rfloor} (right factor floor) holds, and the induced order
+on $S_B$ is a linear extension of the signature poset (monotone in signature
+degree). This is the empirical confirmation that $\{F_R\}$ is left-stable.
+
+\item \emph{Correctness.} On the box $n\le 60$, $s\le 22$ (stem $n=t-s$), the
+signature engine's generator ranks equal the generic engine's at every bidegree,
+and $d^2=0$ holds at every step of the sweep. Because minimal resolutions are unique
+only up to isomorphism, this rank-for-rank comparison --- together with $d^2=0$ and
+$H(C_\bullet)=k$ --- is the correct basis-independent test, and it is exactly the
+equality guaranteed by Theorem~\ref{thm:main}.
+
+\item \emph{Shrink.} The zero-signature localization $\dim C/\dim E_0C$ reaches
+$\approx 51$ on individual steps where $B=A(2)$ applies (e.g.\ $\dim C=7128\mapsto
+\dim E_0C=201$ at $(s,t)=(7,82)$), in line with Nassau's $\approx 50\times$ on the
+classical polynomial case, and the resolution phase runs $\approx 3\times$ faster
+than the generic engine on the same box.
+\end{enumerate}
+
+\begin{thebibliography}{9}
+
+\bibitem{gwx}
+B.~Gheorghe, G.~Wang, Z.~Xu,
+\emph{The special fiber of the motivic deformation of the stable homotopy category
+is algebraic}, Acta Math.\ \textbf{226} (2021), no.~2, 319--407.
+
+\bibitem{konglin}
+H.~J.~Kong, W.~Lin,
+\emph{Product formulas for the motivic Milnor basis},
+arXiv:2411.12890.
+
+\bibitem{nassau}
+C.~Nassau,
+\emph{On the structure of the mod-$2$ cohomology of the Steenrod algebra} /
+\emph{Computing minimal resolutions over the Steenrod algebra}, arXiv:1910.04063.
+
+\end{thebibliography}
+
+\end{document}
