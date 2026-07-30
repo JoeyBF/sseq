@@ -4,7 +4,7 @@
 //! classical Adams $E_2$ ([`MotivicResolution::free_rank`]); the finite-page deaths
 //! are the motivic τ-torsion.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use fp::{matrix::Matrix, prime::TWO, vector::FpVector};
 use once::MultiIndexed;
@@ -117,18 +117,16 @@ impl MotivicResolution {
     }
 
     /// The deformation spectral sequence as an [`Sseq`], trigraded by $(n, s, w)$
-    /// ([`Deformation`]). $E_1 = \Ext_{A_C/\tau}$ — the mod-τ generators, grouped
-    /// by weight — with $d_1$ the **weight-1 part of δ** (the induced differential
-    /// on the associated graded, read directly off [`delta`](Self::delta)).
-    /// [`Sseq::update`] then computes $E_2 = H(d_1)$, whose [`page_data`] are the
-    /// `Subquotient`s.
-    ///
-    /// The higher $d_r$ are then computed by the **τ-Bockstein zig-zag** on the full
-    /// $\mathbb{F}_2[\tau]$-linear δ (`slice`/`inject`/`apply_delta` below), pushing
-    /// $\delta(\tilde x)$ up in weight one order at a time — each correction solved by
-    /// $d_1$'s stored quasi-inverse — and reading the weight-$(w+r)$ part, until a
-    /// page adds nothing ($E_\infty$). The products (via [`Sseq::multiply`]) build on
-    /// this.
+    /// ([`Deformation`]). $E_1 = \Ext_{A_C/\tau}$ — the mod-τ generators, grouped by
+    /// weight — and **every** $d_r$ is read straight off the graded Smith normal form
+    /// of the outgoing δ ([`MotivicResolution::motivic_differentials`]): a pivot
+    /// $\tau^r$ at $(s, t)$ is a length-$r$ differential whose source and target are
+    /// the weight-pure ($\tau^0$) parts of the homogeneous SNF combinations. This is
+    /// the **same** set of invariant factors [`tau_module`](Self::tau_module) reads as
+    /// the τ-torsion, so the module structure and the SS share one source of truth —
+    /// there is no separate τ-Bockstein zig-zag. [`Sseq::update`] then quotients each
+    /// page into its `Subquotient`s, and the products (via [`Sseq::multiply`]) build
+    /// on the result.
     ///
     /// [`page_data`]: Sseq::page_data
     pub fn deformation_sseq(&self) -> &Sseq<3, Deformation> {
@@ -150,145 +148,78 @@ impl MotivicResolution {
             sseq.set_dimension(MultiDegree::from(key), list.len());
         }
 
-        // d₁ = the weight-1 part of δ; a generator with δ = ∅ is a permanent cycle.
+        // Permanent cycles: the s = 0 unit, and every generator with δ = ∅. A
+        // δ-empty generator is never a differential source (δ SNF has no pivot on it),
+        // so it survives to E_∞.
         for (&g, &(deg, p)) in &pos {
-            let mut source = FpVector::new(TWO, sseq.dimension(deg));
-            source.set_entry(p, 1);
-            // s = 0 is the unit: no differential (δ is only defined for s ≥ 1).
-            if g.s == 0 {
+            if g.s == 0 || self.delta(g).is_empty() {
+                let mut source = FpVector::new(TWO, sseq.dimension(deg));
+                source.set_entry(p, 1);
                 sseq.add_permanent_class(&MultiDegreeElement::new(deg, source));
-                continue;
             }
-            let d = self.delta(g);
-            if d.is_empty() {
-                sseq.add_permanent_class(&MultiDegreeElement::new(deg, source));
-                continue;
-            }
-            // d₁ = the weight-1 part of δ. A δ with no weight-1 term makes g a
-            // d₁-cycle (its leading δ term is higher order); it is left to the
-            // τ-Bockstein zig-zag below. Checking this before sizing `target` also
-            // avoids `sseq.dimension(profile(1, deg))` on an empty d₁-target degree:
-            // that degree need not carry any generators (e.g. at the top-stem edge of
-            // the box), and `Sseq::dimension` panics on a degree that was never
-            // `set_dimension`'d. A weight-1 term, by contrast, points to a generator
-            // *at* that degree, so its presence guarantees the degree is populated.
-            if !d.iter().any(|&(_, power)| power == 1) {
-                continue;
-            }
-            let target_deg = Deformation::profile(1, deg);
-            let mut target = FpVector::new(TWO, sseq.dimension(target_deg));
-            for (gj, power) in d {
-                if power == 1 {
-                    target.set_entry(pos[&gj].1, 1);
-                }
-            }
-            sseq.add_differential(1, &MultiDegreeElement::new(deg, source), target.as_slice());
         }
-        sseq.update();
 
-        // Higher d_r by the τ-Bockstein zig-zag on the full δ. `apply_delta`
-        // evaluates δ on a raw cochain over the generators at (s, t); `slice`
-        // extracts a fixed-weight part into (n,s,w)-group coordinates; `inject` adds
-        // a group-coordinate vector back into a raw cochain.
-        let apply_delta = |xtilde: &FpVector, s: i32, t: i32| -> FpVector {
-            let mut dvec = FpVector::new(TWO, self.num_gens(s - 1, t));
-            for (gi, _) in xtilde.iter_nonzero() {
-                for (gj, _power) in self.delta(Gen { s, t, idx: gi }) {
-                    dvec.add_basis_element(gj.idx, 1);
-                }
+        // Every d_r, read straight off the graded δ SNF ([`Self::motivic_differentials`])
+        // — the SAME invariant factors `tau_module` reads as torsion, now carrying
+        // their source/target vectors. No τ-Bockstein zig-zag: a pivot τ^r at (s, t)
+        // is a length-r differential from a weight-pure source at (n, s, w) to a
+        // weight-pure target at (n+1, s-1, w+r) (the τ⁰ parts of the homogeneous SNF
+        // combinations). Only report-box sources (stem n ≤ max.n()) are added — their
+        // δ-targets (stem n+1 ≤ compute.n()) are resolved, and every differential
+        // touching a report degree has a report-box source, so the report E_∞ is
+        // exact; margin sources would reach the unresolved stem max.n+2.
+        //
+        // Differentials are grouped by length and applied in ascending r with an
+        // `update` between pages, so each d_r sees the correct E_r subquotient. A
+        // source already killed on an earlier page reduces to zero and is dropped by
+        // `add_differential` (which returns `false`); by δ² = 0 a genuine d_r source
+        // (a non-cycle of δ_s) is never such a boundary, so nothing real is lost.
+        let group_vec = |key: [i32; 3], gens: &[usize]| -> FpVector {
+            let list = groups.get(&key).map(Vec::as_slice).unwrap_or(&[]);
+            let mut v = FpVector::new(TWO, list.len());
+            for &gi in gens {
+                let p = list
+                    .iter()
+                    .position(|&x| x == gi)
+                    .expect("differential generator lies in its own weight group");
+                v.set_entry(p, 1);
             }
-            dvec
+            v
         };
-        let slice = |dvec: &FpVector, key: [i32; 3]| -> FpVector {
-            let g = groups.get(&key).map(Vec::as_slice).unwrap_or(&[]);
-            let mut y = FpVector::new(TWO, g.len());
-            for (p, &gi) in g.iter().enumerate() {
-                if dvec.entry(gi) != 0 {
-                    y.set_entry(p, 1);
-                }
-            }
-            y
-        };
-        let inject = |xtilde: &mut FpVector, key: [i32; 3], gv: &FpVector| {
-            if let Some(g) = groups.get(&key) {
-                for (p, _) in gv.iter_nonzero() {
-                    xtilde.add_basis_element(g[p], 1);
-                }
-            }
-        };
-
-        let degrees: Vec<MultiDegree<3>> = sseq.iter_degrees().collect();
-        let mut r = 2;
-        let mut num_higher_diffs = 0usize;
-        loop {
-            let mut to_add: Vec<(MultiDegree<3>, FpVector, FpVector)> = Vec::new();
-            for &b in &degrees {
-                let [n, s, w] = b.coords();
-                // Only report-box sources: their δ-targets (stem n+1 ≤ compute.n())
-                // are resolved, and every differential touching a report degree has
-                // a report-box source, so the report E_∞ is unaffected. Margin
-                // sources would reach stem max.n+2 (unresolved).
-                if s < 1 || n > self.max.n() {
+        let mut by_order: BTreeMap<i32, Vec<(MultiDegree<3>, FpVector, FpVector)>> = BTreeMap::new();
+        for s in 1..=self.max_s() {
+            for t in 0..=(self.max.n() + s) {
+                let n = t - s;
+                if n < 0 || n > self.max.n() {
                     continue;
                 }
-                let t = n + s;
-                // The E_r page of this degree. `get_max(r)` is `page[r]` when the
-                // Sseq has extended this degree's `page_data` that far, and the last
-                // computed page otherwise — which is exactly E_r for an *isolated*
-                // degree (one no differential ever touched, so nothing quotiented it
-                // past E_1). The former guard `page.len() <= r { continue }` skipped
-                // those degrees entirely, dropping every d_r out of a class that had
-                // no lower differential — e.g. the length-2 differential (41,9)→(42,8)
-                // that left spurious survivors near g² at (40,8).
-                for rep in sseq.page_data(b).get_max(r).gens() {
-                    // x̃ = the E_r representative, lifted to a raw cochain over (s, t).
-                    let mut xtilde = FpVector::new(TWO, self.num_gens(s, t));
-                    if let Some(g) = groups.get(&[n, s, w]) {
-                        for (p, _) in rep.iter_nonzero() {
-                            xtilde.add_basis_element(g[p], 1);
-                        }
-                    }
-                    // Push δ(x̃) up in weight, correcting each intermediate order.
-                    let mut ok = true;
-                    for k in 1..r {
-                        let y = slice(&apply_delta(&xtilde, s, t), [n + 1, s - 1, w + k]);
-                        if y.is_zero() {
-                            continue;
-                        }
-                        let src = MultiDegree::from([n, s, w + k - 1]);
-                        if !sseq.defined(src) || sseq.differentials(src).len() <= 1 {
-                            ok = false; // no d₁ to invert (should not happen for a genuine cycle)
-                            break;
-                        }
-                        let mut c = FpVector::new(TWO, sseq.dimension(src));
-                        sseq.differentials(src)[1].quasi_inverse(c.as_slice_mut(), y.as_slice());
-                        inject(&mut xtilde, [n, s, w + k - 1], &c);
-                    }
-                    if !ok {
-                        continue;
-                    }
-                    let target = slice(&apply_delta(&xtilde, s, t), [n + 1, s - 1, w + r]);
-                    if !target.is_zero() {
-                        to_add.push((b, rep.to_owned(), target));
-                    }
+                for (r, w, source_gens, target_gens) in self.motivic_differentials(s, t) {
+                    let src_deg = MultiDegree::from([n, s, w]);
+                    let source = group_vec([n, s, w], &source_gens);
+                    let target = group_vec([n + 1, s - 1, w + r], &target_gens);
+                    by_order.entry(r).or_default().push((src_deg, source, target));
                 }
             }
-            let mut added = false;
-            for (b, source, target) in to_add {
-                if sseq.add_differential(r, &MultiDegreeElement::new(b, source), target.as_slice())
-                {
-                    added = true;
+        }
+
+        let mut top_page = 1;
+        let mut num_higher_diffs = 0usize;
+        for (r, list) in by_order {
+            for (src_deg, source, target) in list {
+                let added = sseq.add_differential(
+                    r,
+                    &MultiDegreeElement::new(src_deg, source),
+                    target.as_slice(),
+                );
+                if added && r >= 2 {
                     num_higher_diffs += 1;
                 }
             }
             sseq.update();
-            if !added {
-                break;
-            }
-            r += 1;
+            top_page = top_page.max(r + 1);
         }
         let span = tracing::Span::current();
-        span.record("top_page", r);
+        span.record("top_page", top_page);
         span.record("num_higher_diffs", num_higher_diffs);
 
         sseq

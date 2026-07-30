@@ -245,6 +245,66 @@ impl MotivicResolution {
         gens.saturating_sub(rank_out).saturating_sub(rank_in)
     }
 
+    /// The τ-Bockstein $d_r$ differentials **out of** filtration `s` at internal
+    /// degree `t`, read off the graded SNF of the outgoing δ ([`f2tau::smith_with_sources`])
+    /// — the single source of truth the deformation SS is fed from. Each entry is
+    /// `(r, w, source_gens, target_gens)`: a length-`r` differential from the weight-`w`
+    /// classes `source_gens ⊆ gens(s,t)` to the weight-`(w+r)` classes
+    /// `target_gens ⊆ gens(s-1,t)`, in raw generator-index coordinates.
+    ///
+    /// Each SNF pivot $\tau^r$ is a weight-homogeneous source/target combination
+    /// (δ is graded: entry $(i,j)$ is the monomial $\tau^{w_j - w_i}$). The **$\tau^0$
+    /// part** of the source is its lowest-weight term — the weight-pure $E_1$
+    /// representative — and likewise the $\tau^0$ part of the target sits at weight
+    /// $w + r$. So the differential vectors fall straight out of the same invariant
+    /// factors that [`Self::tau_torsion_orders`] reads as the torsion, with no separate
+    /// τ-Bockstein zig-zag. Empty for $s < 1$.
+    pub(super) fn motivic_differentials(
+        &self,
+        s: i32,
+        t: i32,
+    ) -> Vec<(i32, i32, Vec<usize>, Vec<usize>)> {
+        if s < 1 {
+            return Vec::new();
+        }
+        let m = self.delta_matrix(s, t);
+        if m.is_empty() || m[0].is_empty() {
+            return Vec::new();
+        }
+        f2tau::smith_with_sources(m)
+            .into_iter()
+            .map(|d| {
+                let r = d.order as i32;
+                // The τ⁰ (weight-pure) parts: the lowest-weight generators of each
+                // homogeneous combination.
+                let source_gens: Vec<usize> =
+                    (0..d.source.len()).filter(|&i| d.source[i].coeff(0)).collect();
+                let target_gens: Vec<usize> =
+                    (0..d.target.len()).filter(|&j| d.target[j].coeff(0)).collect();
+                let w = self.generator_weight(Gen {
+                    s,
+                    t,
+                    idx: source_gens[0],
+                });
+                debug_assert!(
+                    source_gens
+                        .iter()
+                        .all(|&i| self.generator_weight(Gen { s, t, idx: i }) == w),
+                    "source not weight-pure at (s={s}, t={t})"
+                );
+                debug_assert!(
+                    target_gens.iter().all(|&j| self.generator_weight(Gen {
+                        s: s - 1,
+                        t,
+                        idx: j
+                    }) == w + r),
+                    "target not at weight w+r at (s={s}, t={t})"
+                );
+                (r, w, source_gens, target_gens)
+            })
+            .collect()
+    }
+
     /// The orders $k_i$ of the $\tau$-torsion summands $\mathbb{F}_2[\tau]/\tau^{k_i}$
     /// of the motivic $E_2$ at `(s, t)`, ascending: the non-unit invariant factors
     /// (as powers of $\tau$) of the outgoing coboundary
