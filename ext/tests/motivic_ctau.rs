@@ -249,8 +249,12 @@ fn motivic_grow_the_box_reuses_cache() {
     let dir = std::env::temp_dir().join(format!("motivic-grow-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
-    let small = Bidegree::n_s(6, 4);
-    let big = Bidegree::n_s(10, 5);
+    // Big enough that the small box has high-filtration cells (small stem, large
+    // internal degree t) near its top — the ones whose lift only *partially*
+    // converges and must NOT be cached. A too-small box has none, which is why an
+    // earlier version of this test missed a bug that cached those partials.
+    let small = Bidegree::n_s(12, 8);
+    let big = Bidegree::n_s(18, 11);
 
     // Populate the store at the small box.
     let _ = MotivicResolution::with_module(MotivicResolution::trivial_module(), small, Some(dir.clone()));
@@ -265,7 +269,9 @@ fn motivic_grow_the_box_reuses_cache() {
         "growing the box must reuse the smaller box's cached lifts, but reused {reused}"
     );
 
-    // A cold build of the big box (fresh store) must be observationally identical.
+    // A cold build of the big box (fresh store) must be identical — τ-module *and*
+    // products (products read specific lifted support entries, so they catch a
+    // wrongly-cached partial that the rank-based τ-module can miss).
     let cold_dir = std::env::temp_dir().join(format!("motivic-grow-cold-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&cold_dir);
     std::fs::create_dir_all(&cold_dir).unwrap();
@@ -277,7 +283,33 @@ fn motivic_grow_the_box_reuses_cache() {
     assert_eq!(
         observables(&grown),
         observables(&cold),
-        "the grown box matches a from-scratch build of the same box"
+        "the grown box's τ-module matches a from-scratch build"
+    );
+    // Report-box products only: a source generator b in the +1 stem margin has a
+    // box-dependent (partial) product, intentionally not comparable across boxes.
+    #[allow(clippy::type_complexity)]
+    let report_products =
+        |res: &MotivicResolution| -> BTreeSet<(i32, i32, i32, usize, i32, i32, usize, u32)> {
+            let mut out = BTreeSet::new();
+            for t in [1, 2, 4] {
+                if t - 1 > big.n() {
+                    continue;
+                }
+                for (b, terms) in res.motivic_products_by(Gen { s: 1, t, idx: 0 }) {
+                    if b.t - b.s > big.n() {
+                        continue;
+                    }
+                    for (g, p) in terms {
+                        out.insert((t, b.s, b.t, b.idx, g.s, g.t, g.idx, p));
+                    }
+                }
+            }
+            out
+        };
+    assert_eq!(
+        report_products(&grown),
+        report_products(&cold),
+        "the grown box's hᵢ products match a from-scratch build"
     );
     let _ = std::fs::remove_dir_all(&dir);
     let _ = std::fs::remove_dir_all(&cold_dir);

@@ -128,7 +128,7 @@ impl MotivicResolution {
     /// `lift_is_box_independent`). Margin cells `(max.n(), cone]` are partial lifts a
     /// larger box would replace, so they are never persisted.
     pub(super) fn product_lift_is_box_independent(&self, a: Gen, g: Gen) -> bool {
-        g.s - a.s < 1 || (g.t - g.s) <= self.max.n()
+        g.s - a.s < 1 || g.t <= self.cache_t_bound()
     }
 
     /// The motivic product `a · b` of two resolution generators, over

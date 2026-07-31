@@ -73,20 +73,28 @@ impl MotivicResolution {
     /// Whether generator `g`'s lifted differential is safe to persist and reuse at
     /// any larger box — i.e. box-independent because it fully **converged**. Two
     /// cases: low filtration (`s < 2`), whose lifted value is always the mod-τ seed,
-    /// and inside the **report box** (`stem ≤ max.n()`), whose lift converges — its
-    /// correction solves the quasi-inverse of `d_{s-1}` at bidegree `(s-1, t)`,
-    /// stem `+1`, which is computed exactly when `stem ≤ max.n()` (the compute box
-    /// is `max.n() + 1`); and by minimality that cell's own differential support
-    /// lies at stem `≤ stem(g)`, so a converged cell reads only converged cells.
-    ///
-    /// Note this is the report box, NOT the wider correction cone
-    /// `max.n() + max.s()`: a cell in the margin between them is lifted but only
-    /// *partially* (its quasi-inverse is out of the computed box, so the correction
-    /// stops early). The report never reads those partials, but a larger box would
-    /// converge them, so caching a partial and reusing it corrupts the larger box's
-    /// lift (`d² ≠ 0`). Persist only what has converged.
+    /// and internal degree `t ≤ max.n()` (see [`Self::cache_t_bound`]).
     fn lift_is_box_independent(&self, g: Gen) -> bool {
-        g.s < 2 || (g.t - g.s) <= self.max.n()
+        g.s < 2 || g.t <= self.cache_t_bound()
+    }
+
+    /// Internal-degree bound below which a lifted cell has fully converged and is
+    /// therefore box-independent (safe to cache and reuse at any larger box).
+    ///
+    /// The τ-adic correction of a cell at `(s, t)` runs entirely at internal degree
+    /// `t`: every round solves a quasi-inverse at degree `t`, and the lower cells it
+    /// reads all lie at degree `≤ t`. So convergence needs the whole
+    /// internal-degree-`t` column of the resolution to be fully resolved. That
+    /// column's lowest-filtration cell sits at stem `≈ t`, which is interior only
+    /// when `t ≤ max.n()` — the report box. The `+1` compute margin (stem
+    /// `max.n() + 1`) is kernel-only, so a cell with `t > max.n()` is lifted but only
+    /// *partially*; the report never reads it, but a larger box converges it, so
+    /// caching that partial and reusing it corrupts the larger box (a wrong τ-module
+    /// and missing products, or — one stem lower — a `d² ≠ 0` panic). The bound is on
+    /// `t`, NOT stem: a high-filtration cell at a modest stem still has large `t` and
+    /// reaches the edge. Verified against cold builds (grow A→B == cold B) up to n=70.
+    pub(super) fn cache_t_bound(&self) -> i32 {
+        self.max.n()
     }
 
     // --- Chain-map lift caches (Phase 3): products φ_a and null-homotopies H ----

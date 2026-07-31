@@ -146,12 +146,13 @@ impl MotivicResolution {
             }
 
             if let Some(ref st) = store {
+                let t_bound = self.cache_t_bound();
                 self.save_lifted_map(st, SaveKind::ChainHomotopy, &h_phi, |g| {
-                    // A cell is a plain mod-τ seed when out_s < 1 (g.s < shift_s),
-                    // and otherwise converges only inside the report box (stem ≤
-                    // max.n()) — the same convergence bound as the differential lift.
-                    // Margin cells are partial and must never be cached.
-                    g.s + 1 - shift_s < 1 || (g.t - g.s) <= self.max.n()
+                    // A cell is a plain mod-τ seed when out_s < 1 (g.s < shift_s), and
+                    // otherwise converges only within the internal-degree bound (the
+                    // same as the differential lift). Margin cells are partial and
+                    // must never be cached.
+                    g.s + 1 - shift_s < 1 || g.t <= t_bound
                 });
             }
         }
