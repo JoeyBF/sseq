@@ -153,3 +153,117 @@ fn motivic_chart_matches_golden() {
         "motivic chart drifted from the golden fixture (examples/benchmarks/motivic-S_2)"
     );
 }
+
+// --- Save store (PR #260 ZarrV3) round-trip and crash-recovery ------------------
+//
+// The motivic weights + lifted A_C differentials are cached under a `motivic`
+// subgroup of the resolution's own save store (see `src/motivic/persist.rs`). The
+// cache is a pure memoization of a deterministic function of `(module, box)`, so
+// these tests pin two contracts through the *public* API: (1) a reload reproduces
+// every observable exactly, and (2) a damaged cache recomputes rather than serving
+// garbage. `LIFT_CACHE_LOADS` (public) distinguishes a genuine disk load from a
+// byte-identical recompute, which the observables alone cannot.
+
+use std::sync::atomic::Ordering;
+
+use ext::motivic::{Gen, LIFT_CACHE_LOADS, MotivicResolution};
+
+/// Serializes the two tests below: each asserts an exact delta of the global
+/// [`LIFT_CACHE_LOADS`] counter, so their store builds must not overlap. They are
+/// the only motivic tests that build with a save store.
+static CACHE_LOAD_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Every public observable of the motivic $E_2$ over the reported box: the
+/// τ-module — free rank and τ-torsion orders — at each `(s, t)`. These derive
+/// entirely from the weights and the lifted differentials (the two cached
+/// quantities), so equality here is equality of the whole cached computation.
+/// `s` runs to `max.s()` exclusive because `tau_module`/`free_rank` read the lift
+/// one homological degree higher.
+fn observables(res: &MotivicResolution) -> Vec<(i32, i32, usize, Vec<u32>)> {
+    let max = res.max();
+    let mut out = Vec::new();
+    for s in 0..max.s() {
+        for n in 0..=max.n() {
+            let t = n + s;
+            let tm = res.tau_module(s, t);
+            out.push((s, t, res.free_rank(s, t), tm.torsion));
+        }
+    }
+    out
+}
+
+#[test]
+fn motivic_save_load_round_trips() {
+    let _guard = CACHE_LOAD_TEST_LOCK.lock().unwrap();
+    // Resolve with a save store, then reload: the reload comes off disk (not a
+    // recompute) and reproduces every observable, module structure and products alike.
+    let dir = std::env::temp_dir().join(format!("motivic-save-rt-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let max = Bidegree::n_s(8, 5);
+
+    let before = LIFT_CACHE_LOADS.load(Ordering::Relaxed);
+    let fresh =
+        MotivicResolution::with_module(MotivicResolution::trivial_module(), max, Some(dir.clone()));
+    assert_eq!(
+        LIFT_CACHE_LOADS.load(Ordering::Relaxed),
+        before,
+        "a cold build has no cache to load"
+    );
+
+    let loaded =
+        MotivicResolution::with_module(MotivicResolution::trivial_module(), max, Some(dir.clone()));
+    assert_eq!(
+        LIFT_CACHE_LOADS.load(Ordering::Relaxed),
+        before + 1,
+        "the second build must load the lift from the store, not recompute it"
+    );
+
+    assert_eq!(
+        observables(&fresh),
+        observables(&loaded),
+        "τ-module (free rank + torsion) is identical after save/load"
+    );
+    // The ring path survives too, including a hidden-τ extension: h₀·h₂ = τ·h₁³.
+    let h0 = Gen { s: 1, t: 1, idx: 0 };
+    let h2 = Gen { s: 1, t: 4, idx: 0 };
+    assert_eq!(
+        fresh.motivic_product(h0, h2),
+        loaded.motivic_product(h0, h2),
+        "h₀·h₂ product survives save/load"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn motivic_partial_cache_recomputes_not_garbage() {
+    let _guard = CACHE_LOAD_TEST_LOCK.lock().unwrap();
+    // A partial/damaged cache must read as a miss and recompute from scratch, never
+    // load a half-written lift. Simulate a crash that left the motivic subgroup
+    // incomplete by deleting it after a full build (the resolution's own cache is
+    // left intact — exactly a crash between the resolution save and the lift save).
+    let dir = std::env::temp_dir().join(format!("motivic-partial-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let max = Bidegree::n_s(8, 5);
+
+    let fresh =
+        MotivicResolution::with_module(MotivicResolution::trivial_module(), max, Some(dir.clone()));
+    std::fs::remove_dir_all(dir.join("motivic")).unwrap();
+
+    let before = LIFT_CACHE_LOADS.load(Ordering::Relaxed);
+    let rebuilt =
+        MotivicResolution::with_module(MotivicResolution::trivial_module(), max, Some(dir.clone()));
+    assert_eq!(
+        LIFT_CACHE_LOADS.load(Ordering::Relaxed),
+        before,
+        "a damaged cache must recompute, not report a load"
+    );
+    // A miss costs time, never correctness: the recompute matches the original exactly.
+    assert_eq!(
+        observables(&fresh),
+        observables(&rebuilt),
+        "recompute after a damaged cache is identical to the original"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

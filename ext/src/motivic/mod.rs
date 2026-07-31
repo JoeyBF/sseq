@@ -197,8 +197,9 @@ impl MotivicResolution {
     ///
     /// If `save_dir` is set, the mod-τ resolution is saved/loaded there (via
     /// [`Resolution::new_with_save`]) and the weights + lifted differentials are
-    /// cached alongside it (`motivic-lift.bin`), so re-running the same box reloads
-    /// the whole computation instead of recomputing the resolution and the lift.
+    /// cached in a `motivic` subgroup of the same ZarrV3 store (see the `persist`
+    /// module), so re-running the same box reloads the whole computation instead
+    /// of recomputing the resolution and the lift.
     ///
     /// The generators of `module` must be weight-homogeneous, seeded by
     /// [`Self::compute_weights`] from the s=0 cells; the trivial module needs no
@@ -243,6 +244,17 @@ impl MotivicResolution {
         let profile = std::env::var("MOT_PROFILE").is_ok();
         let t0 = std::time::Instant::now();
         resolution.compute_through_stem(compute);
+        // Force the free-module bases the lift reads. `lift`/`compute_weights` read
+        // `module(s - 2)` at internal degree up to `compute.n() + s`, deeper than the
+        // resolution itself computes. A *fresh* resolve fills those bases as a side
+        // effect of resolving the higher `s`; a resolution *loaded* from the save
+        // store does not (its differentials come off disk without recomputing the
+        // lower bases that far). Computing them explicitly makes the lift correct on
+        // either path — the from-scratch build and the grow-the-box reload alike.
+        let t_max = compute.n() + max.s();
+        for s in 0..=max.s() {
+            resolution.module(s).compute_basis(t_max);
+        }
         if profile {
             use std::sync::atomic::Ordering;
 
@@ -268,7 +280,7 @@ impl MotivicResolution {
         };
         // Load the weights + lifted differentials from disk if a matching cache
         // exists; otherwise compute them and save.
-        let cached = this.load_lift(&save_dir);
+        let cached = this.load_lift();
         tracing::Span::current().record("cached", cached);
         if cached {
             if profile {
@@ -285,7 +297,7 @@ impl MotivicResolution {
             if profile {
                 eprintln!("[profile] lift:       {:?}", t2.elapsed());
             }
-            this.save_lift(&save_dir);
+            this.save_lift();
         }
         this
     }
@@ -669,6 +681,14 @@ impl MotivicResolution {
 /// `pub` so profiling harnesses can snapshot it around a lift, mirroring
 /// [`algebra::motivic::milnor::PRODUCT_HITS`].
 pub static TAULIFT_ITERS: AtomicU64 = AtomicU64::new(0);
+
+/// Count of complete lift caches loaded from the save store (see the `persist`
+/// module), incremented once per successful [`MotivicResolution::load_lift`]. Lets
+/// a run — or a test — confirm the lift came off disk rather than being recomputed
+/// byte-identically (which is otherwise indistinguishable in the results). This is
+/// also the seed of the Phase 2 loaded-vs-computed reuse accounting. `Relaxed`:
+/// only ever read as an aggregate delta.
+pub static LIFT_CACHE_LOADS: AtomicU64 = AtomicU64::new(0);
 
 /// The shared τ-adic lifting problem, in the style of [`crate::secondary::SecondaryLift`].
 ///
@@ -1270,44 +1290,10 @@ mod tests {
         );
     }
 
-    #[test]
-    fn save_load_round_trips() {
-        // Resolving with a save directory, then reloading, reproduces the weights and
-        // lifted differentials exactly (and hence every downstream invariant).
-        let dir = std::env::temp_dir().join(format!("motivic-save-test-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let max = Bidegree::n_s(8, 5);
-
-        let fresh = MotivicResolution::with_module(
-            MotivicResolution::trivial_module(),
-            max,
-            Some(dir.clone()),
-        );
-        // A second construction with the same save dir must load, not recompute.
-        let loaded = MotivicResolution::with_module(
-            MotivicResolution::trivial_module(),
-            max,
-            Some(dir.clone()),
-        );
-
-        assert_eq!(*fresh.weights, *loaded.weights, "weights survive save/load");
-        assert_eq!(
-            fresh.lifted, loaded.lifted,
-            "lifted differentials survive save/load"
-        );
-        // And a spot-check that downstream data agrees.
-        for s in 0..max.s() {
-            for n in 0..=8 {
-                assert_eq!(
-                    fresh.tau_module(s, n + s).torsion,
-                    loaded.tau_module(s, n + s).torsion,
-                    "τ-module at (n={n}, s={s})"
-                );
-            }
-        }
-        let _ = std::fs::remove_dir_all(&dir);
-    }
+    // The save-store round-trip and crash-recovery tests live with the other
+    // motivic integration tests in `tests/motivic_ctau.rs`: they exercise the
+    // save/reload *workflow* through the public API (τ-module + products +
+    // `LIFT_CACHE_LOADS`), not private state.
 
     #[test]
     fn motivic_massey_products_with_tau() {
