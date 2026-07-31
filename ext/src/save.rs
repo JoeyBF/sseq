@@ -290,16 +290,17 @@ pub struct ZarrSaveStore {
     /// call — and its methods take `&self`, so a cached `Arc<Array>` is safe to share across
     /// threads for concurrent reads and (shard-serialized) writes.
     arrays: DashMap<SaveKind, Arc<ShardArray>>,
-    /// Per-shard write lock.
+    /// Per-shard access lock, held by both writes and reads.
     ///
     /// Since zarrs 0.14, `Array::store_array_subset` is documented as requiring caller-side
     /// synchronization for "regions sharing any chunks" — the sharding codec does a
     /// read-modify-write on the entire shard internally, so concurrent calls touching different
-    /// inner chunks of the *same shard* race and lose writes. Writes to *different* shards touch
-    /// disjoint chunk files and are independent, so we key the lock by `(kind, shard coords)`
-    /// rather than by kind alone. This preserves the cross-shard write parallelism a parallel
-    /// resolution relies on while still honouring the zarrs contract.
-    write_locks: DashMap<(SaveKind, [u64; 3]), Arc<Mutex<()>>>,
+    /// inner chunks of the *same shard* race and lose writes. A *read* of that shard, running
+    /// mid-write, likewise sees a torn shard file (the partial bytes fail to decode). Writes and
+    /// reads to *different* shards touch disjoint chunk files and are independent, so we key the
+    /// lock by `(kind, shard coords)` rather than by kind alone. This preserves the cross-shard
+    /// parallelism a parallel resolution relies on while still honouring the zarrs contract.
+    shard_locks: DashMap<(SaveKind, [u64; 3]), Arc<Mutex<()>>>,
 }
 
 /// Alias for the concrete opened-array type shared across the store and its streaming readers.
@@ -335,7 +336,7 @@ impl ZarrSaveStore {
             group: String::new(),
             created: DashSet::new(),
             arrays: DashMap::new(),
-            write_locks: DashMap::new(),
+            shard_locks: DashMap::new(),
         })
     }
 
@@ -492,7 +493,7 @@ impl ZarrSaveStore {
             group,
             created: DashSet::new(),
             arrays: DashMap::new(),
-            write_locks: DashMap::new(),
+            shard_locks: DashMap::new(),
         })
     }
 
@@ -565,13 +566,15 @@ impl ZarrSaveStore {
         out
     }
 
-    /// Get-or-create the write lock guarding the shard that holds `zarr_coords` for `kind`.
+    /// Get-or-create the lock guarding the shard that holds `zarr_coords` for `kind`.
     ///
-    /// See the comment on the `write_locks` field for why this exists.
-    fn write_lock(&self, kind: SaveKind, zarr_coords: &[u64]) -> Arc<Mutex<()>> {
+    /// Held by both `write` and `read`: the sharding codec read-modify-writes the
+    /// whole shard, so a read concurrent with a write to the *same shard* would
+    /// observe a torn shard file. See the comment on the `shard_locks` field.
+    fn shard_lock(&self, kind: SaveKind, zarr_coords: &[u64]) -> Arc<Mutex<()>> {
         let key = (kind, Self::shard_coords(zarr_coords));
         Arc::clone(
-            self.write_locks
+            self.shard_locks
                 .entry(key)
                 .or_insert_with(|| Arc::new(Mutex::new(())))
                 .value(),
@@ -681,7 +684,7 @@ impl ZarrSaveStore {
             .shard_array(kind, true)?
             .expect("shard_array(create=true) never returns None");
         let zarr_coords = Self::shard_zarr_coords(location.save_coords());
-        let lock = self.write_lock(kind, &zarr_coords);
+        let lock = self.shard_lock(kind, &zarr_coords);
         let _guard = lock.lock().unwrap();
         let subset = ArraySubset::new_with_start_shape(zarr_coords, vec![1; N])?;
         // Force sequential codec execution. Holding our std::sync::Mutex across
@@ -717,8 +720,19 @@ impl ZarrSaveStore {
             None => return Ok(None),
         };
         let zarr_coords = Self::shard_zarr_coords(location.save_coords());
+        // Serialize against concurrent writes to the same shard. The sharding codec
+        // read-modify-writes the *entire* shard file, so a read that runs while
+        // another thread is mid-write observes a torn shard — the partial file
+        // decodes to a garbage vlen header ("Expected header with 1 elements, got
+        // N"). Take the same per-shard lock `write()` holds. `concurrent_target(1)`
+        // forces sequential codec execution because holding a `std::sync::Mutex`
+        // across a rayon-parallel codec call can deadlock (see `write`).
+        let lock = self.shard_lock(kind, &zarr_coords);
+        let _guard = lock.lock().unwrap();
         let subset = ArraySubset::new_with_start_shape(zarr_coords, vec![1; N])?;
-        let data: Vec<Vec<u8>> = arr.retrieve_array_subset(&subset).map_err(zarr_err)?;
+        let data: Vec<Vec<u8>> = arr
+            .retrieve_array_subset_opt(&subset, &CodecOptions::default().with_concurrent_target(1))
+            .map_err(zarr_err)?;
         match data.into_iter().next() {
             Some(element) if !element.is_empty() => Ok(Some(element)),
             _ => Ok(None),
@@ -753,7 +767,7 @@ impl ZarrSaveStore {
             None => return Ok(()),
         };
         let zarr_coords = Self::shard_zarr_coords(location.save_coords());
-        let lock = self.write_lock(kind, &zarr_coords);
+        let lock = self.shard_lock(kind, &zarr_coords);
         let _guard = lock.lock().unwrap();
         let subset = ArraySubset::new_with_start_shape(zarr_coords, vec![1; N])?;
         arr.store_array_subset_opt(
