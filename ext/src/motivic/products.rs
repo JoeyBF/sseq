@@ -6,7 +6,7 @@
 
 use std::{
     collections::{BTreeSet, HashMap},
-    sync::Arc,
+    sync::{Arc, atomic::Ordering},
 };
 
 use algebra::{
@@ -31,8 +31,9 @@ impl MotivicResolution {
     /// `s` ascending, since a cell's constant defect `φₐ(dg)` reads `φₐ` at `s-1`.
     /// This is the motivic product: reducing mod τ recovers the Cτ product, and the
     /// τ-powers are the hidden extensions (e.g. `h₀²h₂ = τ·h₁³`).
-    #[tracing::instrument(skip(self, a), fields(a = ?a))]
+    #[tracing::instrument(skip(self, a), fields(a = %a, num_corrections = tracing::field::Empty))]
     pub(super) fn lift_product(&self, a: Gen, max_s: i32) -> HashMap<Gen, BTreeSet<usize>> {
+        let iters_before = super::TAULIFT_ITERS.load(Ordering::Relaxed);
         let wa = self.weights[&a];
         let a_deg = Bidegree::n_s(a.t - a.s, a.s);
         let hom = self
@@ -81,6 +82,10 @@ impl MotivicResolution {
                 .collect();
             phi.extend(lifted);
         }
+        tracing::Span::current().record(
+            "num_corrections",
+            super::TAULIFT_ITERS.load(Ordering::Relaxed) - iters_before,
+        );
         phi
     }
 
@@ -103,7 +108,7 @@ impl MotivicResolution {
     /// would re-lift `φₐ` on every call.
     ///
     /// A `b` absent from the map (or with an empty list) has `a · b = 0`.
-    #[tracing::instrument(skip(self, a), fields(a = ?a, num_products = tracing::field::Empty))]
+    #[tracing::instrument(skip(self, a), fields(a = %a, num_products = tracing::field::Empty))]
     pub fn motivic_products_by(&self, a: Gen) -> HashMap<Gen, Vec<(Gen, u32)>> {
         let phi = self.lift_product(a, self.max.s());
         let wa = self.weights[&a];

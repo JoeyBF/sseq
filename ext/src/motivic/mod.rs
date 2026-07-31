@@ -56,7 +56,10 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     path::PathBuf,
-    sync::{Arc, OnceLock},
+    sync::{
+        Arc, OnceLock,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 use algebra::{
@@ -97,6 +100,15 @@ pub struct Gen {
     pub s: i32,
     pub t: i32,
     pub idx: usize,
+}
+
+impl std::fmt::Display for Gen {
+    /// Chart coordinates `(n, s)#idx`: stem `n = t − s`, Adams filtration `s`, and
+    /// the index within that bidegree — matching [`Bidegree`]'s `(n, s)` printing (so
+    /// a `Gen` in a tracing field reads like the chart, not the raw struct).
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "({}, {})#{}", self.t - self.s, self.s, self.idx)
+    }
 }
 
 /// The C-motivic resolution: the mod-$\tau$ model plus the weight assignment and
@@ -336,8 +348,9 @@ impl MotivicResolution {
     /// augmentation into the trivial module and `d_1`'s entries lie in the
     /// augmentation ideal. For `s ≥ 2` we start from the mod-$\tau$ support and
     /// cancel the $\tau$-divisible remainder of `d_{s-1} d_s`.
-    #[tracing::instrument(skip(self), fields(max = %self.max, num_lifted = tracing::field::Empty))]
+    #[tracing::instrument(skip(self), fields(max = %self.max, num_lifted = tracing::field::Empty, num_corrections = tracing::field::Empty))]
     fn lift(&mut self) {
+        let iters_before = TAULIFT_ITERS.load(Ordering::Relaxed);
         // Wavefront over `s`: correcting a generator reads only its `s-1`
         // neighbors (the mod-τ targets at stem ≤ n and the δ-targets at stem
         // n+1), and runs its own weight-loop locally. So `s` is a sequential
@@ -347,14 +360,30 @@ impl MotivicResolution {
             let gens: Vec<Gen> = (0..=t_max)
                 .flat_map(|t| (0..self.num_gens(s, t)).map(move |idx| Gen { s, t, idx }))
                 .collect();
-            let _span = tracing::info_span!("lift_s", s, num_gens = gens.len()).entered();
+            let iters_s = TAULIFT_ITERS.load(Ordering::Relaxed);
+            let lift_span = tracing::info_span!(
+                "lift_s",
+                s,
+                num_gens = gens.len(),
+                num_corrections = tracing::field::Empty
+            )
+            .entered();
             let lifted: Vec<(Gen, BTreeSet<usize>)> = gens
                 .into_maybe_par_iter()
                 .map(|g| (g, self.lift_generator(g)))
                 .collect();
+            lift_span.record(
+                "num_corrections",
+                TAULIFT_ITERS.load(Ordering::Relaxed) - iters_s,
+            );
             self.lifted.extend(lifted);
         }
-        tracing::Span::current().record("num_lifted", self.lifted.len());
+        let span = tracing::Span::current();
+        span.record("num_lifted", self.lifted.len());
+        span.record(
+            "num_corrections",
+            TAULIFT_ITERS.load(Ordering::Relaxed) - iters_before,
+        );
     }
 
     /// Lift a single generator's differential to `A_C`. Parallel-safe: it reads
@@ -631,6 +660,14 @@ impl MotivicResolution {
     }
 }
 
+/// Total τ-adic correction iterations run by [`TauLift::lift_cell`] across every lift
+/// (differential, product, null-homotopy). A cheap global work counter — each
+/// order-by-order correction round bumps it by one — that the `lift` / `lift_product`
+/// spans snapshot as a delta to report how much correction a phase actually did
+/// (the per-`s` generator counts don't reveal how deep each cell's τ-tower ran).
+/// `Relaxed`: only ever read as an aggregate difference, never for synchronization.
+pub(crate) static TAULIFT_ITERS: AtomicU64 = AtomicU64::new(0);
+
 /// The shared τ-adic lifting problem, in the style of [`crate::secondary::SecondaryLift`].
 ///
 /// Every "make it motivic" step in this module has the same shape: a map given over
@@ -701,6 +738,7 @@ trait TauLift {
             else {
                 return support; // defect fully cancelled
             };
+            TAULIFT_ITERS.fetch_add(1, Ordering::Relaxed); // one order-by-order round
             assert!(
                 min_power >= 1,
                 "mod-τ defect ≠ 0 at (s={}, t={}, idx={}) — the model is not a complex",
