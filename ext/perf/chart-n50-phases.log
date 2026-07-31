@@ -1,0 +1,11 @@
+with_module{max=(50, 27) compute=(51, 27) cached=false}:compute_weights{num_weights=1656}: ext::motivic: close time.busy=3.62ms
+with_module{max=(50, 27) compute=(51, 27) cached=false}:lift{max=(50, 27) num_lifted=1655 num_corrections=20895}: ext::motivic: close time.busy=1.40s
+build_deformation_sseq{max=(50, 27)}:snf_differentials{num_diffs=608}: ext::motivic::deformation: close time.busy=4.69ms
+build_deformation_sseq{max=(50, 27)}:apply_pages: ext::motivic::deformation: close time.busy=5.72ms
+chart_assembly:chart_products:motivic_products_by{a=(0, 1)#0}:lift_product{max_s=27 a=(0, 1)#0}:build_ext{num_deltas=679}: ext::motivic::cohomology: close time.busy=2.27ms
+chart_assembly:chart_products:motivic_products_by{a=(0, 1)#0}:lift_product{max_s=27 a=(0, 1)#0 num_corrections=42295}: ext::motivic::products: close time.busy=2.06s
+chart_assembly:chart_products:motivic_products_by{a=(0, 1)#0 num_products=565}: ext::motivic::products: close time.busy=2.07s
+chart_assembly:chart_products:motivic_products_by{a=(1, 1)#0}:lift_product{max_s=27 a=(1, 1)#0 num_corrections=40088}: ext::motivic::products: close time.busy=1.74s
+chart_assembly:chart_products:motivic_products_by{a=(1, 1)#0 num_products=1305}: ext::motivic::products: close time.busy=1.74s
+chart_assembly:chart_products:motivic_products_by{a=(3, 1)#0}:lift_product{max_s=27 a=(3, 1)#0 num_corrections=39722}: ext::motivic::products: close time.busy=1.56s
+chart_assembly:chart_products:motivic_products_by{a=(3, 1)#0 num_products=406}: ext::motivic::products: close time.busy=1.56s

@@ -666,7 +666,9 @@ impl MotivicResolution {
 /// spans snapshot as a delta to report how much correction a phase actually did
 /// (the per-`s` generator counts don't reveal how deep each cell's τ-tower ran).
 /// `Relaxed`: only ever read as an aggregate difference, never for synchronization.
-pub(crate) static TAULIFT_ITERS: AtomicU64 = AtomicU64::new(0);
+/// `pub` so profiling harnesses can snapshot it around a lift, mirroring
+/// [`algebra::motivic::milnor::PRODUCT_HITS`].
+pub static TAULIFT_ITERS: AtomicU64 = AtomicU64::new(0);
 
 /// The shared τ-adic lifting problem, in the style of [`crate::secondary::SecondaryLift`].
 ///
