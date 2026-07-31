@@ -166,7 +166,7 @@ fn motivic_chart_matches_golden() {
 
 use std::sync::atomic::Ordering;
 
-use ext::motivic::{Gen, LIFT_CACHE_LOADS, MotivicResolution};
+use ext::motivic::{Gen, LIFT_CACHE_LOADS, LIFT_CELLS_REUSED, MotivicResolution};
 
 /// Serializes the two tests below: each asserts an exact delta of the global
 /// [`LIFT_CACHE_LOADS`] counter, so their store builds must not overlap. They are
@@ -233,6 +233,50 @@ fn motivic_save_load_round_trips() {
         "h₀·h₂ product survives save/load"
     );
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn motivic_grow_the_box_reuses_cache() {
+    let _guard = CACHE_LOAD_TEST_LOCK.lock().unwrap();
+    // Lazy box growth: a cell converged in a small box is byte-identical in a larger
+    // one (it depends only on the resolution up to its own degree, not the box), so
+    // growing reuses the small box's cached in-cone lifts and recomputes only the
+    // frontier — yet lands on exactly the cold-build result.
+    let dir = std::env::temp_dir().join(format!("motivic-grow-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let small = Bidegree::n_s(6, 4);
+    let big = Bidegree::n_s(10, 5);
+
+    // Populate the store at the small box.
+    let _ = MotivicResolution::with_module(MotivicResolution::trivial_module(), small, Some(dir.clone()));
+
+    // Grow to the big box on the same store: it must reuse the small box's cells.
+    let reused_before = LIFT_CELLS_REUSED.load(Ordering::Relaxed);
+    let grown =
+        MotivicResolution::with_module(MotivicResolution::trivial_module(), big, Some(dir.clone()));
+    let reused = LIFT_CELLS_REUSED.load(Ordering::Relaxed) - reused_before;
+    assert!(
+        reused > 0,
+        "growing the box must reuse the smaller box's cached lifts, but reused {reused}"
+    );
+
+    // A cold build of the big box (fresh store) must be observationally identical.
+    let cold_dir = std::env::temp_dir().join(format!("motivic-grow-cold-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&cold_dir);
+    std::fs::create_dir_all(&cold_dir).unwrap();
+    let cold = MotivicResolution::with_module(
+        MotivicResolution::trivial_module(),
+        big,
+        Some(cold_dir.clone()),
+    );
+    assert_eq!(
+        observables(&grown),
+        observables(&cold),
+        "the grown box matches a from-scratch build of the same box"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&cold_dir);
 }
 
 #[test]

@@ -114,9 +114,17 @@ converged cells back.
   Differential kind + bitcode. Delete the byteorder/`motivic-lift.bin` format. First
   check: confirm `Resolution::save_dir()` is reachable from `motivic` (may need
   `pub(crate)`).
-- **Phase 2 — incremental.** `lift()`/`compute_weights()` skip loaded cells, compute
-  frontier, write back. Add a loaded-vs-computed counter (à la `TAULIFT_ITERS`) so a
-  run reports reuse.
+- **Phase 2 — incremental. DONE.** `load_lift` is now partial (populates whatever
+  cells exist, no all-or-nothing gate); `compute_weights`/`lift` skip cells already
+  loaded and compute only the frontier; `save_lift` persists the lifted support only
+  for **box-independent** cells (`s < 2` seed, or in-cone converged — never an
+  out-of-cone seed placeholder, via `lift_is_box_independent`). `with_module` always
+  load→compute→lift→save. Counters: `LIFT_CACHE_LOADS` (coarse: a load found ≥1
+  cell) + new `LIFT_CELLS_REUSED` (cells skipped by reuse). Free-module bases forced
+  after `compute_through_stem` (Phase-1 fix) is what makes the grow-the-box lift
+  correct on a reloaded resolution. Tests: `motivic_grow_the_box_reuses_cache`
+  (small→big on one store reuses cells and equals a cold big build) in
+  `tests/motivic_ctau.rs`.
 - **Phase 3 — product lifts + null-homotopies.** Persist `φ_a`/`H_{a,b}` under the
   product/homotopy subgroups; `lift_product`/`lift_nullhomotopy` check the store and
   lift only the frontier. This is the biggest payoff (42 min of products).

@@ -206,7 +206,7 @@ impl MotivicResolution {
     /// input (its one cell is the weight-0 unit).
     #[tracing::instrument(
         skip(module, save_dir),
-        fields(max = %max, compute = tracing::field::Empty, cached = tracing::field::Empty)
+        fields(max = %max, compute = tracing::field::Empty, cells_reused = tracing::field::Empty)
     )]
     pub fn with_module(
         module: Arc<FDModule<CTauAlgebra>>,
@@ -278,27 +278,28 @@ impl MotivicResolution {
             max,
             compute,
         };
-        // Load the weights + lifted differentials from disk if a matching cache
-        // exists; otherwise compute them and save.
-        let cached = this.load_lift();
-        tracing::Span::current().record("cached", cached);
-        if cached {
-            if profile {
-                eprintln!("[profile] lift:       loaded from disk");
-            }
-        } else {
-            let t1 = std::time::Instant::now();
-            this.compute_weights();
-            if profile {
-                eprintln!("[profile] weights:    {:?}", t1.elapsed());
-            }
-            let t2 = std::time::Instant::now();
-            this.lift();
-            if profile {
-                eprintln!("[profile] lift:       {:?}", t2.elapsed());
-            }
-            this.save_lift();
+        // Restore whatever the save store holds (incremental — Phase 2), then fill
+        // only the gaps: `compute_weights`/`lift` skip cells `load_lift` already
+        // populated, so a warm or grown box reuses the cached in-cone lifts and
+        // recomputes just its frontier. Finally write the (updated) cells back.
+        let reused_before = LIFT_CELLS_REUSED.load(Ordering::Relaxed);
+        this.load_lift();
+        let t1 = std::time::Instant::now();
+        this.compute_weights();
+        if profile {
+            eprintln!("[profile] weights:    {:?}", t1.elapsed());
         }
+        let t2 = std::time::Instant::now();
+        this.lift();
+        let reused = LIFT_CELLS_REUSED.load(Ordering::Relaxed) - reused_before;
+        tracing::Span::current().record("cells_reused", reused);
+        if profile {
+            eprintln!(
+                "[profile] lift:       {:?} ({reused} cells reused from store)",
+                t2.elapsed()
+            );
+        }
+        this.save_lift();
         this
     }
 
@@ -369,14 +370,26 @@ impl MotivicResolution {
         // barrier, but at each `s` every generator is independent — fan them out.
         for s in 1..=self.max_s() {
             let t_max = self.compute.n() + s;
-            let gens: Vec<Gen> = (0..=t_max)
-                .flat_map(|t| (0..self.num_gens(s, t)).map(move |idx| Gen { s, t, idx }))
-                .collect();
+            // Incremental: skip generators already populated by `load_lift` from the
+            // save store. A loaded cell is either the box-independent mod-τ seed
+            // (s < 2) or a converged in-cone lift — identical to what recomputing
+            // would produce — so reusing it is exact, and it spares the τ-correction
+            // that dominates the run. Only the frontier (cells absent from disk) is
+            // computed here.
+            let all_at_s = (0..=t_max)
+                .flat_map(|t| (0..self.num_gens(s, t)).map(move |idx| Gen { s, t, idx }));
+            let gens: Vec<Gen> = all_at_s.filter(|g| !self.lifted.contains_key(g)).collect();
+            let reused = (0..=t_max)
+                .map(|t| self.num_gens(s, t))
+                .sum::<usize>()
+                - gens.len();
+            LIFT_CELLS_REUSED.fetch_add(reused as u64, Ordering::Relaxed);
             let iters_s = TAULIFT_ITERS.load(Ordering::Relaxed);
             let lift_span = tracing::info_span!(
                 "lift_s",
                 s,
                 num_gens = gens.len(),
+                num_reused = reused,
                 num_corrections = tracing::field::Empty
             )
             .entered();
@@ -532,10 +545,13 @@ impl MotivicResolution {
     /// bigraded structure and break the valuation representation).
     #[tracing::instrument(skip(self), fields(num_weights = tracing::field::Empty))]
     fn compute_weights(&mut self) {
-        // Built locally, then `Arc`-shared into `self.weights` (and the Ext DGA) — no copy.
-        let mut weights: HashMap<Gen, i32> = HashMap::new();
+        // Seed from whatever `load_lift` restored from the save store, then fill only
+        // the gaps: a weight is a box-independent function of the generator's
+        // differential, so a loaded weight is exactly what recomputing would yield.
+        // Built locally, then `Arc`-shared into `self.weights` — no copy.
+        let mut weights: HashMap<Gen, i32> = (*self.weights).clone();
         // s = 0: the single generator is the unit, weight 0.
-        weights.insert(Gen { s: 0, t: 0, idx: 0 }, 0);
+        weights.entry(Gen { s: 0, t: 0, idx: 0 }).or_insert(0);
 
         for s in 1..=self.max_s() {
             let d = self.resolution.differential(s);
@@ -543,6 +559,11 @@ impl MotivicResolution {
             let t_max = self.compute.n() + s;
             for t in 0..=t_max {
                 for idx in 0..self.num_gens(s, t) {
+                    // Reuse a loaded weight; the target weights it would read are
+                    // already present (loaded, or computed at the lower `s`).
+                    if weights.contains_key(&Gen { s, t, idx }) {
+                        continue;
+                    }
                     let out = d.output(t, idx);
                     let mut weight: Option<i32> = None;
                     for (bidx, v) in out.iter_nonzero() {
@@ -682,13 +703,20 @@ impl MotivicResolution {
 /// [`algebra::motivic::milnor::PRODUCT_HITS`].
 pub static TAULIFT_ITERS: AtomicU64 = AtomicU64::new(0);
 
-/// Count of complete lift caches loaded from the save store (see the `persist`
-/// module), incremented once per successful [`MotivicResolution::load_lift`]. Lets
-/// a run — or a test — confirm the lift came off disk rather than being recomputed
-/// byte-identically (which is otherwise indistinguishable in the results). This is
-/// also the seed of the Phase 2 loaded-vs-computed reuse accounting. `Relaxed`:
-/// only ever read as an aggregate delta.
+/// Count of lift loads from the save store (see the `persist` module) that found
+/// at least one cached cell — incremented once per [`MotivicResolution::load_lift`]
+/// that populated any lifted cell. Lets a run — or a test — confirm the lift came
+/// (at least partly) off disk rather than being recomputed byte-identically (which
+/// is otherwise indistinguishable in the results). `Relaxed`: only ever read as an
+/// aggregate delta.
 pub static LIFT_CACHE_LOADS: AtomicU64 = AtomicU64::new(0);
+
+/// Count of lifted cells reused from the store instead of recomputed — the cells
+/// [`MotivicResolution::lift`] skipped because [`MotivicResolution::load_lift`] had
+/// already populated them. On a warm or grown box this is the incremental win: the
+/// expensive in-cone τ-corrections are read off disk, and only the frontier is
+/// computed. `Relaxed`: only ever read as an aggregate delta.
+pub static LIFT_CELLS_REUSED: AtomicU64 = AtomicU64::new(0);
 
 /// The shared τ-adic lifting problem, in the style of [`crate::secondary::SecondaryLift`].
 ///
