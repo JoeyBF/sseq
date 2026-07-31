@@ -86,15 +86,22 @@ impl MotivicResolution {
     /// reads all lie at degree `≤ t`. So convergence needs the whole
     /// internal-degree-`t` column of the resolution to be fully resolved. That
     /// column's lowest-filtration cell sits at stem `≈ t`, which is interior only
-    /// when `t ≤ max.n()` — the report box. The `+1` compute margin (stem
-    /// `max.n() + 1`) is kernel-only, so a cell with `t > max.n()` is lifted but only
-    /// *partially*; the report never reads it, but a larger box converges it, so
-    /// caching that partial and reusing it corrupts the larger box (a wrong τ-module
-    /// and missing products, or — one stem lower — a `d² ≠ 0` panic). The bound is on
-    /// `t`, NOT stem: a high-filtration cell at a modest stem still has large `t` and
-    /// reaches the edge. Verified against cold builds (grow A→B == cold B) up to n=70.
+    /// when it is strictly inside the computed box — i.e. `t ≤ compute.n() - 1`,
+    /// since the compute edge (stem `compute.n()`) is kernel-only. A cell with a
+    /// larger `t` is lifted but only *partially* (it reads edge data); the report
+    /// never reads it, but a larger box converges it to a different value, so caching
+    /// that partial and reusing it corrupts the larger box (missing products, or —
+    /// one stem lower — a `d² ≠ 0` panic). The bound is on `t`, NOT stem: a
+    /// high-filtration cell at a modest stem still has large `t` and reaches the edge.
+    ///
+    /// Note this is `compute.n()`, not the report box `max.n()`: with the default
+    /// `+1` margin they coincide (`compute.n() = max.n() + 1`), but a larger
+    /// `MOT_MARGIN` resolves deeper, so more products become final AND cacheable —
+    /// the one real lever for extending reuse (there is no resumable partial lift;
+    /// an unconverged cell is a complete computation on incomplete inputs, not a
+    /// half-finished one). Verified against cold builds (grow A→B == cold B) to n=70.
     pub(super) fn cache_t_bound(&self) -> i32 {
-        self.max.n()
+        self.compute.n() - 1
     }
 
     // --- Chain-map lift caches (Phase 3): products φ_a and null-homotopies H ----

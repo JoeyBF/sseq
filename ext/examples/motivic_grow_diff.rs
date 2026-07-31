@@ -47,6 +47,38 @@ fn main() {
     let grown = build(b, Some(dir.clone()));
     let cold = build(b, None);
 
+    // Is the small box's REPORT region (stem ≤ a, all filtrations) box-stable? I.e.
+    // does a cold box A agree with a cold box B on their overlap? If yes, the cells
+    // with a < t ≤ ... are already box-independent and could be cached at box A. If
+    // no, the region above t = a genuinely changes with the box (edge effect) and
+    // there is nothing extra to reuse.
+    let cold_a = build(a, None);
+    // τ-module (ranks) cold-A vs cold-B over stem ≤ a: does the +1 margin already
+    // stabilize ranks even where products are not yet stable?
+    let mut cc_tau_diffs = 0;
+    let mut first_diff_t = i32::MAX;
+    for s in 0..cold_a.max().s() {
+        for n in 0..=a {
+            let (ta, tb) = (cold_a.tau_module(s, n + s), cold.tau_module(s, n + s));
+            if ta.free != tb.free || ta.torsion != tb.torsion {
+                cc_tau_diffs += 1;
+                first_diff_t = first_diff_t.min(n + s);
+            }
+        }
+    }
+    println!(
+        "cold-{a} vs cold-{b} τ-module on stem≤{a}: diffs={cc_tau_diffs}{}",
+        if cc_tau_diffs > 0 { format!(" (lowest at t={first_diff_t}, max.n={a})") } else { String::new() }
+    );
+    let (pa, pb_on_a) = (products(&cold_a, a), products(&cold, a));
+    println!(
+        "cold-{a} vs cold-{b} on stem≤{a}: cold_a={} cold_b={} (differ: only_in_A={}, only_in_B={})",
+        pa.len(),
+        pb_on_a.len(),
+        pa.difference(&pb_on_a).count(),
+        pb_on_a.difference(&pa).count()
+    );
+
     // τ-module over the report box.
     let mut tau_diffs = 0;
     for s in 0..grown.max().s() {
