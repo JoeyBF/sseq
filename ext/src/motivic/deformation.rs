@@ -144,18 +144,20 @@ impl MotivicResolution {
         // Group generators by (n, s, w) — a generator's position within its group
         // is its coordinate in that multidegree.
         let (groups, pos) = self.sseq_grouping();
-        for (&key, list) in &groups {
-            sseq.set_dimension(MultiDegree::from(key), list.len());
-        }
-
-        // Permanent cycles: the s = 0 unit, and every generator with δ = ∅. A
-        // δ-empty generator is never a differential source (δ SNF has no pivot on it),
-        // so it survives to E_∞.
-        for (&g, &(deg, p)) in &pos {
-            if g.s == 0 || self.delta(g).is_empty() {
-                let mut source = FpVector::new(TWO, sseq.dimension(deg));
-                source.set_entry(p, 1);
-                sseq.add_permanent_class(&MultiDegreeElement::new(deg, source));
+        {
+            // E₁ setup: set every degree's dimension and mark the permanent cycles
+            // (the s = 0 unit, and every generator with δ = ∅ — never a differential
+            // source, so a survivor).
+            let _span = tracing::info_span!("sseq_setup", num_groups = groups.len()).entered();
+            for (&key, list) in &groups {
+                sseq.set_dimension(MultiDegree::from(key), list.len());
+            }
+            for (&g, &(deg, p)) in &pos {
+                if g.s == 0 || self.delta(g).is_empty() {
+                    let mut source = FpVector::new(TWO, sseq.dimension(deg));
+                    source.set_entry(p, 1);
+                    sseq.add_permanent_class(&MultiDegreeElement::new(deg, source));
+                }
             }
         }
 
@@ -187,36 +189,49 @@ impl MotivicResolution {
             v
         };
         let mut by_order: BTreeMap<i32, Vec<(MultiDegree<3>, FpVector, FpVector)>> = BTreeMap::new();
-        for s in 1..=self.max_s() {
-            for t in 0..=(self.max.n() + s) {
-                let n = t - s;
-                if n < 0 || n > self.max.n() {
-                    continue;
-                }
-                for (r, w, source_gens, target_gens) in self.motivic_differentials(s, t) {
-                    let src_deg = MultiDegree::from([n, s, w]);
-                    let source = group_vec([n, s, w], &source_gens);
-                    let target = group_vec([n + 1, s - 1, w + r], &target_gens);
-                    by_order.entry(r).or_default().push((src_deg, source, target));
+        {
+            // The Smith-normal-form work: one graded SNF of the outgoing δ per (s, t)
+            // over the report box, emitting the d_r source/target vectors.
+            let _span =
+                tracing::info_span!("snf_differentials", num_diffs = tracing::field::Empty).entered();
+            for s in 1..=self.max_s() {
+                for t in 0..=(self.max.n() + s) {
+                    let n = t - s;
+                    if n < 0 || n > self.max.n() {
+                        continue;
+                    }
+                    for (r, w, source_gens, target_gens) in self.motivic_differentials(s, t) {
+                        let src_deg = MultiDegree::from([n, s, w]);
+                        let source = group_vec([n, s, w], &source_gens);
+                        let target = group_vec([n + 1, s - 1, w + r], &target_gens);
+                        by_order.entry(r).or_default().push((src_deg, source, target));
+                    }
                 }
             }
+            let num_diffs: usize = by_order.values().map(Vec::len).sum();
+            tracing::Span::current().record("num_diffs", num_diffs);
         }
 
         let mut top_page = 1;
         let mut num_higher_diffs = 0usize;
-        for (r, list) in by_order {
-            for (src_deg, source, target) in list {
-                let added = sseq.add_differential(
-                    r,
-                    &MultiDegreeElement::new(src_deg, source),
-                    target.as_slice(),
-                );
-                if added && r >= 2 {
-                    num_higher_diffs += 1;
+        {
+            // Sseq bookkeeping: apply the differentials page by page (ascending r,
+            // `update` between) so each d_r sees the right E_r subquotient.
+            let _span = tracing::info_span!("apply_pages").entered();
+            for (r, list) in by_order {
+                for (src_deg, source, target) in list {
+                    let added = sseq.add_differential(
+                        r,
+                        &MultiDegreeElement::new(src_deg, source),
+                        target.as_slice(),
+                    );
+                    if added && r >= 2 {
+                        num_higher_diffs += 1;
+                    }
                 }
+                sseq.update();
+                top_page = top_page.max(r + 1);
             }
-            sseq.update();
-            top_page = top_page.max(r + 1);
         }
         let span = tracing::Span::current();
         span.record("top_page", top_page);

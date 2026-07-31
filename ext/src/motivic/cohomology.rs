@@ -136,6 +136,7 @@ impl MotivicResolution {
     /// [`ExtAlgebra`] over the mod-τ resolution. This is where the $\Hom$ functor
     /// is applied and its result stored on the Ext side; the resolution keeps only
     /// the raw differential.
+    #[tracing::instrument(skip(self), fields(num_deltas = tracing::field::Empty))]
     fn build_ext(&self) -> ExtAlgebra<CTauResolution> {
         let mut deltas: HashMap<Gen, Vec<(Gen, u32)>> = HashMap::new();
         for s in 1..=self.max_s() {
@@ -152,6 +153,7 @@ impl MotivicResolution {
                 }
             }
         }
+        tracing::Span::current().record("num_deltas", deltas.len());
         let coboundary = Arc::new(MotivicCoboundary {
             resolution: Arc::clone(&self.resolution),
             deltas,

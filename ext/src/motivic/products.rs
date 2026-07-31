@@ -103,6 +103,7 @@ impl MotivicResolution {
     /// would re-lift `φₐ` on every call.
     ///
     /// A `b` absent from the map (or with an empty list) has `a · b = 0`.
+    #[tracing::instrument(skip(self, a), fields(a = ?a, num_products = tracing::field::Empty))]
     pub fn motivic_products_by(&self, a: Gen) -> HashMap<Gen, Vec<(Gen, u32)>> {
         let phi = self.lift_product(a, self.max.s());
         let wa = self.weights[&a];
@@ -131,6 +132,7 @@ impl MotivicResolution {
                 }
             }
         }
+        tracing::Span::current().record("num_products", out.len());
         out
     }
 

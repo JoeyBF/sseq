@@ -90,6 +90,9 @@ fn main() -> anyhow::Result<()> {
         _ => MotivicResolution::new(max),
     };
     let sseq = res.deformation_sseq();
+    // Everything below is chart assembly (the resolution + SS build above are spanned
+    // separately). `chart_dots`/`chart_products` break out the two heavy phases.
+    let _assembly = tracing::info_span!("chart_assembly").entered();
 
     // Reported box (mirrors chart_motivic): the top filtration needs the lift one degree higher, so
     // it is not reported.
@@ -161,6 +164,7 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
+    let dots_span = tracing::info_span!("chart_dots").entered();
     // --- 3. Assemble the dots. The SS classification above gives *candidate* generators with a
     // `Gen` identity (needed to wire products), but the authoritative per-bidegree module structure
     // is `tau_module` (the SNF of the outgoing δ). So we draw exactly what `tau_module` reports and
@@ -221,6 +225,8 @@ fn main() -> anyhow::Result<()> {
         .map(|d| ((d.n, d.s, d.pos), d.order))
         .collect();
 
+    drop(dots_span);
+    let products_span = tracing::info_span!("chart_products").entered();
     // --- 4. Filtration-one products h₀, h₁, h₂ (Isaksen draws only these), built in memory so the
     // h₁-towers can be post-processed before emission. Each edge records which hᵢ and the hidden-
     // extension τ-power on that term. ------------------------------------------------------------
@@ -272,6 +278,7 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
+    drop(products_span);
     // --- 5. Collapse the infinite h₁-towers into red arrows (Isaksen rule 9). --------------------
     //
     // Above the line s = n/2 + 3/2 every class is h₁-periodic (in an infinite, τ-annihilated
