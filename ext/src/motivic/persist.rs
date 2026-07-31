@@ -43,6 +43,22 @@ struct BidegreeRecord {
     gens: Vec<GenRecord>,
 }
 
+/// One source generator's lifted support in a *chain-map* cache (a product `φ_a`
+/// or a Massey null-homotopy `H`), stored per source bidegree. Unlike the
+/// differential cache there is no weight here — weights live in the differential
+/// cache and are loaded once for the whole resolution.
+#[derive(Serialize, Deserialize)]
+struct LiftedGenRecord {
+    idx: u64,
+    support: Vec<u64>,
+}
+
+/// All source generators of a chain-map lift at one bidegree — one shard element.
+#[derive(Serialize, Deserialize)]
+struct LiftedBidegreeRecord {
+    gens: Vec<LiftedGenRecord>,
+}
+
 impl MotivicResolution {
     /// The `motivic` subgroup of the resolution's save store, if one is open. The
     /// subgroup shares the resolution's store, so it inherits #260's algebra and
@@ -63,6 +79,104 @@ impl MotivicResolution {
     /// hazard the plan calls out). All generators at a bidegree share this predicate.
     fn lift_is_box_independent(&self, g: Gen) -> bool {
         g.s < 2 || (g.t - g.s) <= self.max.n() + self.max.s()
+    }
+
+    // --- Chain-map lift caches (Phase 3): products φ_a and null-homotopies H ----
+    //
+    // Each `a` (or pair `a, b`) gets its own subgroup, whose `ChainMap` /
+    // `ChainHomotopy` shard arrays are private to it (a subgroup owns its arrays),
+    // so reusing those kinds across many products is collision-free. The cell value
+    // is box-independent under the same reasoning as the differential lift — a
+    // converged in-cone cell, or a low-filtration mod-τ seed, is a function of the
+    // resolution alone — with the seed boundary shifted by `a` (resp. `a, b`).
+
+    /// The `motivic/products/{a}` subgroup for the product-lift cache of `φ_a`.
+    pub(super) fn product_store(&self, a: Gen) -> Option<ZarrSaveStore> {
+        self.motivic_store()?
+            .subgroup(&format!("products/{}_{}_{}", a.s, a.t, a.idx))
+            .ok()
+    }
+
+    /// The `motivic/homotopies/{a}__{b}` subgroup for the null-homotopy cache of the
+    /// nullhomotopy of `φ_b ∘ φ_a`.
+    pub(super) fn homotopy_store(&self, a: Gen, b: Gen) -> Option<ZarrSaveStore> {
+        self.motivic_store()?
+            .subgroup(&format!(
+                "homotopies/{}_{}_{}__{}_{}_{}",
+                a.s, a.t, a.idx, b.s, b.t, b.idx
+            ))
+            .ok()
+    }
+
+    /// Load a cached chain-map lift (`φ_a` or `H`) from `store`: every source
+    /// generator whose bidegree has a record, keyed by generator. Source degrees
+    /// run `s ∈ [s_lo, s_hi]`, `t ∈ [t_lo, compute.n() + s]` — the range the lift
+    /// itself walks. Absent or corrupt records are skipped (that bidegree becomes
+    /// frontier). Bumps [`super::PRODUCT_CELLS_REUSED`] by the number of cells read.
+    pub(super) fn load_lifted_map(
+        &self,
+        store: &ZarrSaveStore,
+        kind: SaveKind,
+        s_lo: i32,
+        s_hi: i32,
+        t_lo: i32,
+    ) -> HashMap<Gen, BTreeSet<usize>> {
+        let mut map: HashMap<Gen, BTreeSet<usize>> = HashMap::new();
+        let mut reused = 0u64;
+        for s in s_lo..=s_hi {
+            for t in t_lo..=(self.compute.n() + s) {
+                if self.num_gens(s, t) == 0 {
+                    continue;
+                }
+                let b = Bidegree::n_s(t - s, s);
+                let Ok(Some(bytes)) = store.read(kind, b) else {
+                    continue;
+                };
+                let Ok(rec) = bitcode::deserialize::<LiftedBidegreeRecord>(&bytes) else {
+                    continue;
+                };
+                for gr in rec.gens {
+                    let g = Gen {
+                        s,
+                        t,
+                        idx: gr.idx as usize,
+                    };
+                    map.insert(g, gr.support.into_iter().map(|x| x as usize).collect());
+                    reused += 1;
+                }
+            }
+        }
+        super::PRODUCT_CELLS_REUSED.fetch_add(reused, std::sync::atomic::Ordering::Relaxed);
+        map
+    }
+
+    /// Save a chain-map lift (`φ_a` or `H`) to `store`, one shard element per source
+    /// bidegree. Only box-independent cells — those for which `keep(g)` holds — are
+    /// written; the out-of-cone seed placeholders (which a larger box would replace)
+    /// are dropped, mirroring the differential cache. Writes are idempotent.
+    pub(super) fn save_lifted_map(
+        &self,
+        store: &ZarrSaveStore,
+        kind: SaveKind,
+        map: &HashMap<Gen, BTreeSet<usize>>,
+        keep: impl Fn(Gen) -> bool,
+    ) {
+        let mut by_bidegree: HashMap<(i32, i32), Vec<LiftedGenRecord>> = HashMap::new();
+        for (g, support) in map {
+            if !keep(*g) {
+                continue;
+            }
+            by_bidegree.entry((g.s, g.t)).or_default().push(LiftedGenRecord {
+                idx: g.idx as u64,
+                support: support.iter().map(|&x| x as u64).collect(),
+            });
+        }
+        for ((s, t), mut gens) in by_bidegree {
+            gens.sort_by_key(|r| r.idx);
+            let b = Bidegree::n_s(t - s, s);
+            let bytes = bitcode::serialize(&LiftedBidegreeRecord { gens }).unwrap();
+            let _ = store.write(kind, b, &bytes);
+        }
     }
 
     /// Save the weights and lifted differentials to the `motivic` subgroup, one

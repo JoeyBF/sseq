@@ -18,7 +18,10 @@ use maybe_rayon::prelude::*;
 use sseq::coordinates::{Bidegree, BidegreeGenerator};
 
 use super::{Gen, MotivicResolution, TauLift, f2tau};
-use crate::chain_complex::{ChainComplex, ChainHomotopy};
+use crate::{
+    chain_complex::{ChainComplex, ChainHomotopy},
+    save::SaveKind,
+};
 
 /// A motivic Massey product `⟨a, b, c⟩` as a coset in the motivic Ext: a
 /// representative together with the $\mathbb{F}_2[\tau]$-submodule of indeterminacy
@@ -44,7 +47,7 @@ impl MotivicResolution {
     /// [`ChainHomotopy`]; the τ-corrections make `dH + Hd = φ_bφ_a` hold over $A_C$,
     /// via the third [`TauLift`] instance ([`NullHomotopyCells`]). This is the datum
     /// a Massey product `⟨a, b, c⟩` is built from.
-    #[tracing::instrument(skip(self, a, b), fields(a = %a, b = %b))]
+    #[tracing::instrument(skip(self, a, b), fields(a = %a, b = %b, cells_reused = tracing::field::Empty))]
     pub(super) fn lift_nullhomotopy(
         &self,
         a: Gen,
@@ -55,67 +58,101 @@ impl MotivicResolution {
         let phi_a = self.lift_product(a, max_s);
         let phi_b = self.lift_product(b, max_s);
 
-        let hom_a = self
-            .ext()
-            .generator_product_map(BidegreeGenerator::new(Bidegree::n_s(a.t - a.s, a.s), a.idx));
-        let hom_b = self
-            .ext()
-            .generator_product_map(BidegreeGenerator::new(Bidegree::n_s(b.t - b.s, b.s), b.idx));
-        // Extend only to the box we lift over (stem ≤ compute.n(), s ≤ max_s); the
-        // resolution is stem-computed, so extend_all would over-reach into unresolved
-        // bidegrees.
-        let box_max = Bidegree::n_s(self.compute.n(), max_s);
-        hom_a.extend_through_stem(box_max);
-        hom_b.extend_through_stem(box_max);
-        let ch = ChainHomotopy::new(hom_a, hom_b); // null-homotopy of φ_b ∘ φ_a
-        ch.extend(box_max);
-
         let shift_s = a.s + b.s;
         let shift_t = a.t + b.t;
+        let s_lo = (shift_s - 1).max(0);
 
-        // Mod-τ seeds: H(g) mod τ ∈ F_{s+1−shiftₛ} at degree t−shiftₜ.
-        let mut seeds: HashMap<Gen, BTreeSet<usize>> = HashMap::new();
-        for s in (shift_s - 1).max(0)..=max_s {
-            let map = ch.homotopy(s);
-            for t in shift_t..=(self.compute.n() + s) {
-                for idx in 0..self.num_gens(s, t) {
-                    let support: BTreeSet<usize> = map
-                        .output(t, idx)
-                        .iter_nonzero()
-                        .filter(|(_, v)| *v != 0)
-                        .map(|(i, _)| i)
-                        .collect();
-                    if !support.is_empty() {
-                        seeds.insert(Gen { s, t, idx }, support);
+        // Restore cached box-independent H cells (Phase 3). Source degrees run
+        // s ∈ [s_lo, max_s], t ∈ [shift_t, compute.n() + s].
+        let reused_before = super::PRODUCT_CELLS_REUSED.load(std::sync::atomic::Ordering::Relaxed);
+        let store = self.homotopy_store(a, b);
+        let mut h_phi: HashMap<Gen, BTreeSet<usize>> = store
+            .as_ref()
+            .map(|st| self.load_lifted_map(st, SaveKind::ChainHomotopy, s_lo, max_s, shift_t))
+            .unwrap_or_default();
+        let reused =
+            super::PRODUCT_CELLS_REUSED.load(std::sync::atomic::Ordering::Relaxed) - reused_before;
+        tracing::Span::current().record("cells_reused", reused);
+
+        // The frontier: source generators not already loaded. If empty, the cached
+        // H is complete — skip the ExtAlgebra chain homotopy and the τ-correction.
+        let missing: Vec<Gen> = (s_lo..=max_s)
+            .flat_map(|s| {
+                (shift_t..=(self.compute.n() + s))
+                    .flat_map(move |t| (0..self.num_gens(s, t)).map(move |idx| Gen { s, t, idx }))
+            })
+            .filter(|g| !h_phi.contains_key(g))
+            .collect();
+
+        if !missing.is_empty() {
+            let hom_a = self
+                .ext()
+                .generator_product_map(BidegreeGenerator::new(Bidegree::n_s(a.t - a.s, a.s), a.idx));
+            let hom_b = self
+                .ext()
+                .generator_product_map(BidegreeGenerator::new(Bidegree::n_s(b.t - b.s, b.s), b.idx));
+            // Extend only to the box we lift over (stem ≤ compute.n(), s ≤ max_s); the
+            // resolution is stem-computed, so extend_all would over-reach into
+            // unresolved bidegrees.
+            let box_max = Bidegree::n_s(self.compute.n(), max_s);
+            hom_a.extend_through_stem(box_max);
+            hom_b.extend_through_stem(box_max);
+            let ch = ChainHomotopy::new(hom_a, hom_b); // null-homotopy of φ_b ∘ φ_a
+            ch.extend(box_max);
+
+            // Mod-τ seeds: H(g) mod τ ∈ F_{s+1−shiftₛ} at degree t−shiftₜ.
+            let mut seeds: HashMap<Gen, BTreeSet<usize>> = HashMap::new();
+            for s in s_lo..=max_s {
+                let map = ch.homotopy(s);
+                for t in shift_t..=(self.compute.n() + s) {
+                    for idx in 0..self.num_gens(s, t) {
+                        let support: BTreeSet<usize> = map
+                            .output(t, idx)
+                            .iter_nonzero()
+                            .filter(|(_, v)| *v != 0)
+                            .map(|(i, _)| i)
+                            .collect();
+                        if !support.is_empty() {
+                            seeds.insert(Gen { s, t, idx }, support);
+                        }
                     }
                 }
             }
-        }
 
-        // Lift, s ascending (the constant defect Hd reads H at s−1).
-        let mut h_phi: HashMap<Gen, BTreeSet<usize>> = HashMap::new();
-        for s in (shift_s - 1).max(0)..=max_s {
-            let gens: Vec<Gen> = (shift_t..=(self.compute.n() + s))
-                .flat_map(|t| (0..self.num_gens(s, t)).map(move |idx| Gen { s, t, idx }))
-                .collect();
-            let lifted: Vec<(Gen, BTreeSet<usize>)> = gens
-                .into_maybe_par_iter()
-                .map(|g| {
-                    let cells = NullHomotopyCells {
-                        res: self,
-                        a,
-                        b,
-                        wa,
-                        wb,
-                        seeds: &seeds,
-                        phi_a: &phi_a,
-                        phi_b: &phi_b,
-                        h_phi: &h_phi,
-                    };
-                    (g, cells.lift_or_seed(g))
-                })
-                .collect();
-            h_phi.extend(lifted);
+            // Lift the frontier, s ascending (the constant defect Hd reads H at s−1).
+            for s in s_lo..=max_s {
+                let gens: Vec<Gen> = (shift_t..=(self.compute.n() + s))
+                    .flat_map(|t| (0..self.num_gens(s, t)).map(move |idx| Gen { s, t, idx }))
+                    .filter(|g| !h_phi.contains_key(g))
+                    .collect();
+                let lifted: Vec<(Gen, BTreeSet<usize>)> = gens
+                    .into_maybe_par_iter()
+                    .map(|g| {
+                        let cells = NullHomotopyCells {
+                            res: self,
+                            a,
+                            b,
+                            wa,
+                            wb,
+                            seeds: &seeds,
+                            phi_a: &phi_a,
+                            phi_b: &phi_b,
+                            h_phi: &h_phi,
+                        };
+                        (g, cells.lift_or_seed(g))
+                    })
+                    .collect();
+                h_phi.extend(lifted);
+            }
+
+            if let Some(ref st) = store {
+                self.save_lifted_map(st, SaveKind::ChainHomotopy, &h_phi, |g| {
+                    // A cell is a plain mod-τ seed when out_s < 1 (g.s < shift_s),
+                    // and otherwise converges exactly in the report cone. Mirrors
+                    // `NullHomotopyCells::lift_or_seed`.
+                    g.s + 1 - shift_s < 1 || (g.t - g.s) <= self.max.n() + self.max.s()
+                });
+            }
         }
         h_phi
     }

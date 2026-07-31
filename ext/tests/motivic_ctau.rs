@@ -166,7 +166,11 @@ fn motivic_chart_matches_golden() {
 
 use std::sync::atomic::Ordering;
 
-use ext::motivic::{Gen, LIFT_CACHE_LOADS, LIFT_CELLS_REUSED, MotivicResolution};
+use std::collections::{BTreeMap, BTreeSet};
+
+use ext::motivic::{
+    Gen, LIFT_CACHE_LOADS, LIFT_CELLS_REUSED, MotivicResolution, PRODUCT_CELLS_REUSED,
+};
 
 /// Serializes the two tests below: each asserts an exact delta of the global
 /// [`LIFT_CACHE_LOADS`] counter, so their store builds must not overlap. They are
@@ -277,6 +281,93 @@ fn motivic_grow_the_box_reuses_cache() {
     );
     let _ = std::fs::remove_dir_all(&dir);
     let _ = std::fs::remove_dir_all(&cold_dir);
+}
+
+/// Products compared as sets — `motivic_products_by` returns `Vec` values whose
+/// order follows nondeterministic `HashMap` iteration, so normalize before `assert_eq`.
+fn norm_products(m: &HashMap<Gen, Vec<(Gen, u32)>>) -> BTreeMap<Gen, BTreeSet<(Gen, u32)>> {
+    m.iter().map(|(b, v)| (*b, v.iter().copied().collect())).collect()
+}
+
+#[test]
+fn motivic_product_cache_reuses_and_matches() {
+    let _guard = CACHE_LOAD_TEST_LOCK.lock().unwrap();
+    // The product lift φ_a is the biggest phase of a large chart. Cache it: the
+    // first computation writes it, a second reads it back and skips the whole
+    // τ-correction — landing on the same products as a from-scratch (store-less) run.
+    let dir = std::env::temp_dir().join(format!("motivic-prod-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let max = Bidegree::n_s(8, 5);
+    let res =
+        MotivicResolution::with_module(MotivicResolution::trivial_module(), max, Some(dir.clone()));
+    let h1 = Gen { s: 1, t: 2, idx: 0 };
+
+    // First call computes φ_{h1} and writes it (no reuse yet).
+    let mid_before = PRODUCT_CELLS_REUSED.load(Ordering::Relaxed);
+    let first = res.motivic_products_by(h1);
+    let mid = PRODUCT_CELLS_REUSED.load(Ordering::Relaxed);
+    assert_eq!(mid, mid_before, "the first product computation has nothing to reuse");
+
+    // Second call must reuse the cached φ cells rather than recompute.
+    let second = res.motivic_products_by(h1);
+    let after = PRODUCT_CELLS_REUSED.load(Ordering::Relaxed);
+    assert!(
+        after > mid,
+        "the second product computation must reuse cached φ cells, reused {}",
+        after - mid
+    );
+    assert_eq!(
+        norm_products(&first),
+        norm_products(&second),
+        "product results agree across a fresh compute and a cache reuse"
+    );
+
+    // And both agree with a from-scratch, store-less computation (the ground truth).
+    let plain = MotivicResolution::new(max);
+    assert_eq!(
+        norm_products(&plain.motivic_products_by(h1)),
+        norm_products(&first),
+        "cached products match a store-less computation"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn motivic_massey_cache_matches() {
+    let _guard = CACHE_LOAD_TEST_LOCK.lock().unwrap();
+    // The null-homotopy lift H is cached like the products (a different seed
+    // boundary, same box-independence rule). A store-backed Massey bracket must
+    // reuse H on a repeat and agree with a store-less computation.
+    let dir = std::env::temp_dir().join(format!("motivic-massey-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let max = Bidegree::n_s(10, 7);
+    let res =
+        MotivicResolution::with_module(MotivicResolution::trivial_module(), max, Some(dir.clone()));
+    let h0 = Gen { s: 1, t: 1, idx: 0 };
+    let h1 = Gen { s: 1, t: 2, idx: 0 };
+
+    let as_set = |v: Vec<(Gen, u32)>| -> BTreeSet<(Gen, u32)> { v.into_iter().collect() };
+
+    // ⟨h₀, h₁, h₀⟩ = τ·h₁²: compute twice; the repeat must reuse cached H cells.
+    let before = PRODUCT_CELLS_REUSED.load(Ordering::Relaxed);
+    let first = res.motivic_massey(h0, h1, h0);
+    let second = res.motivic_massey(h0, h1, h0);
+    assert!(
+        PRODUCT_CELLS_REUSED.load(Ordering::Relaxed) > before,
+        "a repeated Massey bracket must reuse cached H (and φ) cells"
+    );
+    assert_eq!(as_set(first.clone()), as_set(second), "cached H gives the same bracket");
+
+    // Ground truth: a store-less computation of the same bracket.
+    let plain = MotivicResolution::new(max);
+    assert_eq!(
+        as_set(first),
+        as_set(plain.motivic_massey(h0, h1, h0)),
+        "cached Massey bracket matches a store-less computation"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]

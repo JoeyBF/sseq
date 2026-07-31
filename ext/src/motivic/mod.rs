@@ -718,6 +718,14 @@ pub static LIFT_CACHE_LOADS: AtomicU64 = AtomicU64::new(0);
 /// computed. `Relaxed`: only ever read as an aggregate delta.
 pub static LIFT_CELLS_REUSED: AtomicU64 = AtomicU64::new(0);
 
+/// Count of product-/null-homotopy-lift cells reused from the store instead of
+/// recomputed — the `φ_a` (and Massey `H`) cells that `lift_product` /
+/// `lift_nullhomotopy` read off disk rather than re-running the τ-correction. The
+/// product lifts are the largest single phase of a big chart (≈ half the run at
+/// n=100), so this is Phase 3's payoff. `Relaxed`: only ever read as an aggregate
+/// delta.
+pub static PRODUCT_CELLS_REUSED: AtomicU64 = AtomicU64::new(0);
+
 /// The shared τ-adic lifting problem, in the style of [`crate::secondary::SecondaryLift`].
 ///
 /// Every "make it motivic" step in this module has the same shape: a map given over

@@ -125,9 +125,19 @@ converged cells back.
   correct on a reloaded resolution. Tests: `motivic_grow_the_box_reuses_cache`
   (small→big on one store reuses cells and equals a cold big build) in
   `tests/motivic_ctau.rs`.
-- **Phase 3 — product lifts + null-homotopies.** Persist `φ_a`/`H_{a,b}` under the
-  product/homotopy subgroups; `lift_product`/`lift_nullhomotopy` check the store and
-  lift only the frontier. This is the biggest payoff (42 min of products).
+- **Phase 3 — product lifts + null-homotopies. DONE.** `lift_product` caches `φ_a`
+  under `subgroup("motivic/products/{s}_{t}_{idx}")` via `SaveKind::ChainMap`;
+  `lift_nullhomotopy` caches `H` under `subgroup("motivic/homotopies/{a}__{b}")` via
+  `SaveKind::ChainHomotopy`. Both load box-independent cells first (per source
+  bidegree, payload `LiftedBidegreeRecord{gens:[{idx,support}]}`, shared
+  `load_lifted_map`/`save_lifted_map` helpers in persist.rs), compute only the
+  frontier, and — crucially — when the frontier is empty **skip building the
+  ExtAlgebra product map / chain homotopy entirely** (the whole τ-correction is
+  cached). Box-independence for `φ_a`: `g.s ≤ a.s` (seed) or in-cone; for `H`:
+  `g.s < a.s+b.s` (seed) or in-cone — same out-of-cone-placeholder exclusion as the
+  differential. New counter `PRODUCT_CELLS_REUSED`. Tests in `tests/motivic_ctau.rs`:
+  `motivic_product_cache_reuses_and_matches` (compute twice → reuse + equals a
+  store-less run) and `motivic_massey_cache_matches`.
 - **Phase 4 — free win (already there):** the CTauResolution's diffs+QIs are persisted
   by #260 (`res_qi` stream tier); `differential(s).quasi_inverse(t)` comes off disk on
   a warm store with no motivic work.

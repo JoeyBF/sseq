@@ -18,7 +18,7 @@ use maybe_rayon::prelude::*;
 use sseq::coordinates::{Bidegree, BidegreeGenerator};
 
 use super::{Gen, MotivicResolution, TauLift};
-use crate::chain_complex::ChainComplex;
+use crate::{chain_complex::ChainComplex, save::SaveKind};
 
 impl MotivicResolution {
     /// Lift the product chain map $\varphi_a$ (left-multiplication by the generator
@@ -31,62 +31,103 @@ impl MotivicResolution {
     /// `s` ascending, since a cell's constant defect `φₐ(dg)` reads `φₐ` at `s-1`.
     /// This is the motivic product: reducing mod τ recovers the Cτ product, and the
     /// τ-powers are the hidden extensions (e.g. `h₀²h₂ = τ·h₁³`).
-    #[tracing::instrument(skip(self, a), fields(a = %a, num_corrections = tracing::field::Empty))]
+    #[tracing::instrument(skip(self, a), fields(a = %a, num_corrections = tracing::field::Empty, cells_reused = tracing::field::Empty))]
     pub(super) fn lift_product(&self, a: Gen, max_s: i32) -> HashMap<Gen, BTreeSet<usize>> {
         let iters_before = super::TAULIFT_ITERS.load(Ordering::Relaxed);
+        let reused_before = super::PRODUCT_CELLS_REUSED.load(Ordering::Relaxed);
         let wa = self.weights[&a];
-        let a_deg = Bidegree::n_s(a.t - a.s, a.s);
-        let hom = self
-            .ext()
-            .generator_product_map(BidegreeGenerator::new(a_deg, a.idx));
-        hom.extend_all();
 
-        // Mod-τ seeds: φₐ(g) mod τ = the ExtAlgebra chain map on each generator.
-        // φₐ shifts degree by aₜ, so it is zero on source generators below degree aₜ.
-        let mut seeds: HashMap<Gen, BTreeSet<usize>> = HashMap::new();
-        for s in a.s..=max_s {
-            let map = hom.get_map(s);
-            for t in a.t..=(self.compute.n() + s) {
-                for idx in 0..self.num_gens(s, t) {
-                    let support: BTreeSet<usize> = map
-                        .output(t, idx)
-                        .iter_nonzero()
-                        .filter(|(_, v)| *v != 0)
-                        .map(|(i, _)| i)
-                        .collect();
-                    if !support.is_empty() {
-                        seeds.insert(Gen { s, t, idx }, support);
+        // Restore cached box-independent φₐ cells (Phase 3). Cells run over source
+        // degrees s ∈ [a.s, max_s], t ∈ [a.t, compute.n() + s].
+        let store = self.product_store(a);
+        let mut phi: HashMap<Gen, BTreeSet<usize>> = store
+            .as_ref()
+            .map(|st| self.load_lifted_map(st, SaveKind::ChainMap, a.s, max_s, a.t))
+            .unwrap_or_default();
+        let reused = super::PRODUCT_CELLS_REUSED.load(Ordering::Relaxed) - reused_before;
+        tracing::Span::current().record("cells_reused", reused);
+
+        // The frontier: source generators not already loaded. If empty, the cached
+        // φₐ is complete for this box — skip the ExtAlgebra product map and the whole
+        // τ-correction (the expensive part).
+        let missing: Vec<Gen> = (a.s..=max_s)
+            .flat_map(|s| {
+                (a.t..=(self.compute.n() + s))
+                    .flat_map(move |t| (0..self.num_gens(s, t)).map(move |idx| Gen { s, t, idx }))
+            })
+            .filter(|g| !phi.contains_key(g))
+            .collect();
+
+        if !missing.is_empty() {
+            // Mod-τ seeds: φₐ(g) mod τ = the ExtAlgebra chain map on each generator.
+            // φₐ shifts degree by aₜ, so it is zero on source generators below aₜ.
+            let a_deg = Bidegree::n_s(a.t - a.s, a.s);
+            let hom = self
+                .ext()
+                .generator_product_map(BidegreeGenerator::new(a_deg, a.idx));
+            hom.extend_all();
+            let mut seeds: HashMap<Gen, BTreeSet<usize>> = HashMap::new();
+            for s in a.s..=max_s {
+                let map = hom.get_map(s);
+                for t in a.t..=(self.compute.n() + s) {
+                    for idx in 0..self.num_gens(s, t) {
+                        let support: BTreeSet<usize> = map
+                            .output(t, idx)
+                            .iter_nonzero()
+                            .filter(|(_, v)| *v != 0)
+                            .map(|(i, _)| i)
+                            .collect();
+                        if !support.is_empty() {
+                            seeds.insert(Gen { s, t, idx }, support);
+                        }
                     }
                 }
             }
-        }
 
-        // Lift, s ascending.
-        let mut phi: HashMap<Gen, BTreeSet<usize>> = HashMap::new();
-        for s in a.s..=max_s {
-            let gens: Vec<Gen> = (a.t..=(self.compute.n() + s))
-                .flat_map(|t| (0..self.num_gens(s, t)).map(move |idx| Gen { s, t, idx }))
-                .collect();
-            let lifted: Vec<(Gen, BTreeSet<usize>)> = gens
-                .into_maybe_par_iter()
-                .map(|g| {
-                    let cells = ProductCells {
-                        res: self,
-                        a,
-                        wa,
-                        seeds: &seeds,
-                        phi: &phi,
-                    };
-                    (g, cells.lift_or_seed(g))
-                })
-                .collect();
-            phi.extend(lifted);
+            // Lift the frontier, s ascending (a cell's constant defect reads φₐ at
+            // s-1, already present — loaded or computed at the lower s).
+            for s in a.s..=max_s {
+                let gens: Vec<Gen> = (a.t..=(self.compute.n() + s))
+                    .flat_map(|t| (0..self.num_gens(s, t)).map(move |idx| Gen { s, t, idx }))
+                    .filter(|g| !phi.contains_key(g))
+                    .collect();
+                let lifted: Vec<(Gen, BTreeSet<usize>)> = gens
+                    .into_maybe_par_iter()
+                    .map(|g| {
+                        let cells = ProductCells {
+                            res: self,
+                            a,
+                            wa,
+                            seeds: &seeds,
+                            phi: &phi,
+                        };
+                        (g, cells.lift_or_seed(g))
+                    })
+                    .collect();
+                phi.extend(lifted);
+            }
+
+            // Persist the box-independent cells for reuse at this or a larger box.
+            if let Some(ref st) = store {
+                self.save_lifted_map(st, SaveKind::ChainMap, &phi, |g| {
+                    self.product_lift_is_box_independent(a, g)
+                });
+            }
         }
         tracing::Span::current().record(
             "num_corrections",
             super::TAULIFT_ITERS.load(Ordering::Relaxed) - iters_before,
         );
         phi
+    }
+
+    /// Whether `φₐ(g)` is box-independent — safe to cache and reuse at any larger
+    /// box. Mirrors [`ProductCells::lift_or_seed`]: a cell is a plain mod-τ seed
+    /// when `g.s ≤ a.s` (out_s < 1), and otherwise a converged lift exactly when it
+    /// is in the report cone. The out-of-cone `g.s > a.s` cells are seed
+    /// placeholders a larger box would replace, so they are never persisted.
+    pub(super) fn product_lift_is_box_independent(&self, a: Gen, g: Gen) -> bool {
+        g.s - a.s < 1 || (g.t - g.s) <= self.max.n() + self.max.s()
     }
 
     /// The motivic product `a · b` of two resolution generators, over
