@@ -148,9 +148,10 @@ impl MotivicResolution {
             if let Some(ref st) = store {
                 self.save_lifted_map(st, SaveKind::ChainHomotopy, &h_phi, |g| {
                     // A cell is a plain mod-τ seed when out_s < 1 (g.s < shift_s),
-                    // and otherwise converges exactly in the report cone. Mirrors
-                    // `NullHomotopyCells::lift_or_seed`.
-                    g.s + 1 - shift_s < 1 || (g.t - g.s) <= self.max.n() + self.max.s()
+                    // and otherwise converges only inside the report box (stem ≤
+                    // max.n()) — the same convergence bound as the differential lift.
+                    // Margin cells are partial and must never be cached.
+                    g.s + 1 - shift_s < 1 || (g.t - g.s) <= self.max.n()
                 });
             }
         }

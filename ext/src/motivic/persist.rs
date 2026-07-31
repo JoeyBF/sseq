@@ -71,14 +71,22 @@ impl MotivicResolution {
     }
 
     /// Whether generator `g`'s lifted differential is safe to persist and reuse at
-    /// any larger box — i.e. box-independent. Two cases are: low filtration
-    /// (`s < 2`), whose lifted value is always the mod-τ seed, and inside the report
-    /// cone (`stem ≤ max.n() + max.s()`), whose lift converges. An out-of-cone
-    /// `s ≥ 2` cell holds only a mod-τ seed *placeholder* that a larger box would
-    /// replace with a real lift, so it must never be cached (the one persistence
-    /// hazard the plan calls out). All generators at a bidegree share this predicate.
+    /// any larger box — i.e. box-independent because it fully **converged**. Two
+    /// cases: low filtration (`s < 2`), whose lifted value is always the mod-τ seed,
+    /// and inside the **report box** (`stem ≤ max.n()`), whose lift converges — its
+    /// correction solves the quasi-inverse of `d_{s-1}` at bidegree `(s-1, t)`,
+    /// stem `+1`, which is computed exactly when `stem ≤ max.n()` (the compute box
+    /// is `max.n() + 1`); and by minimality that cell's own differential support
+    /// lies at stem `≤ stem(g)`, so a converged cell reads only converged cells.
+    ///
+    /// Note this is the report box, NOT the wider correction cone
+    /// `max.n() + max.s()`: a cell in the margin between them is lifted but only
+    /// *partially* (its quasi-inverse is out of the computed box, so the correction
+    /// stops early). The report never reads those partials, but a larger box would
+    /// converge them, so caching a partial and reusing it corrupts the larger box's
+    /// lift (`d² ≠ 0`). Persist only what has converged.
     fn lift_is_box_independent(&self, g: Gen) -> bool {
-        g.s < 2 || (g.t - g.s) <= self.max.n() + self.max.s()
+        g.s < 2 || (g.t - g.s) <= self.max.n()
     }
 
     // --- Chain-map lift caches (Phase 3): products φ_a and null-homotopies H ----

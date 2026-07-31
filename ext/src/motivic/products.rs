@@ -122,12 +122,13 @@ impl MotivicResolution {
     }
 
     /// Whether `φₐ(g)` is box-independent — safe to cache and reuse at any larger
-    /// box. Mirrors [`ProductCells::lift_or_seed`]: a cell is a plain mod-τ seed
-    /// when `g.s ≤ a.s` (out_s < 1), and otherwise a converged lift exactly when it
-    /// is in the report cone. The out-of-cone `g.s > a.s` cells are seed
-    /// placeholders a larger box would replace, so they are never persisted.
+    /// box because it fully converged. A cell is a plain mod-τ seed when `g.s ≤ a.s`
+    /// (out_s < 1), otherwise a lift that converges only inside the **report box**
+    /// (`stem ≤ max.n()`) — the same convergence bound as the differential lift (see
+    /// `lift_is_box_independent`). Margin cells `(max.n(), cone]` are partial lifts a
+    /// larger box would replace, so they are never persisted.
     pub(super) fn product_lift_is_box_independent(&self, a: Gen, g: Gen) -> bool {
-        g.s - a.s < 1 || (g.t - g.s) <= self.max.n() + self.max.s()
+        g.s - a.s < 1 || (g.t - g.s) <= self.max.n()
     }
 
     /// The motivic product `a · b` of two resolution generators, over
