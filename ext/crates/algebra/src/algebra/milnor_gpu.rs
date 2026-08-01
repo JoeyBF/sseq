@@ -1038,6 +1038,7 @@ fn multiply_pair(
     row_base: usize,
     out_offset: usize,
     width: usize,
+    num_limbs: usize,
 ) {
     let mut low = cs_len;
     if term_len < cs_len {
@@ -1091,9 +1092,17 @@ fn multiply_pair(
         // output). Both are bit offsets, added before splitting into (limb, bit).
         let idx = seqno_core(g, xi, working.as_slice(), WORKING_CAP, width);
         let global_bit = out_offset + usize::cast_from(idx);
-        let word = row_base + global_bit / 32;
-        let bit = u32::cast_from(global_bit % 32);
-        out[word].fetch_xor(1u32 << bit);
+        let limb = global_bit / 32;
+        // Device-side mirror of the host's defensive mask: `nassau_gpu::get_partial_matrix_restricted`
+        // launches at the full output width but masks bits `>= target_dim` on readback because a kept
+        // block's `out_offset + seqno` can span past it. Skip writes past this row's `num_limbs` — they
+        // would otherwise overrun into the next row (silent corruption) or past the buffer (an OOB
+        // atomic; compute-sanitizer confirmed `Invalid __global__ atomic ... out of bounds`).
+        if limb < num_limbs {
+            let word = row_base + limb;
+            let bit = u32::cast_from(global_bit % 32);
+            out[word].fetch_xor(1u32 << bit);
+        }
     }
 }
 
@@ -1210,6 +1219,7 @@ fn multiply_batch_kernel(
     prod_pair_start: &[u32],
     width: usize,
     seg_elems: usize,
+    num_limbs: usize,
 ) {
     let k = ABSOLUTE_POS;
     let num_products = prod_pair_start.len() - 1;
@@ -1356,6 +1366,7 @@ fn multiply_batch_kernel(
         usize::cast_from(prod_row_base[p]),
         usize::cast_from(prod_out_offset[p]),
         width,
+        num_limbs,
     );
 }
 
@@ -2184,6 +2195,7 @@ fn multiply_batch_block(
                 BufferArg::from_raw_parts(pps_h, pps.len()),
                 width,
                 seg_elems,
+                num_limbs,
             );
         }
 
@@ -2650,6 +2662,7 @@ mod tests {
         cs_len: usize,
         mk_len: usize,
         width: usize,
+        num_limbs: usize,
     ) {
         let pair = ABSOLUTE_POS;
         if pair >= num_matrices * num_terms {
@@ -2674,6 +2687,7 @@ mod tests {
             0,
             0,
             width,
+            num_limbs,
         );
     }
 
@@ -2765,6 +2779,7 @@ mod tests {
                 cs_len,
                 mk_len,
                 width,
+                num_limbs,
             );
         }
 
