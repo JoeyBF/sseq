@@ -1,0 +1,7 @@
+{
+    "type": "finite dimensional module",
+    "name": "Csigma",
+    "doc": "Cofiber of sigma = h_3. Two cells joined by Sq^8 = P(xi_1^4) = P(0, 4) (bidegree (8,4)).",
+    "gens": { "x0": 0, "x8": 8 },
+    "actions": ["P(0, 4) x0 = x8"]
+}

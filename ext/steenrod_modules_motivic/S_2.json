@@ -1,0 +1,7 @@
+{
+    "type": "finite dimensional module",
+    "name": "sphere",
+    "doc": "The sphere: the trivial module F_2 over A_C/tau, one cell in degree 0.",
+    "gens": { "x0": 0 },
+    "actions": []
+}

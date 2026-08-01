@@ -79,6 +79,7 @@ use crate::{
 };
 
 mod cohomology;
+mod construct;
 mod deformation;
 mod f2tau;
 mod massey;
@@ -86,6 +87,7 @@ mod persist;
 mod products;
 
 pub use cohomology::TauModule;
+pub use construct::{load_motivic_module_json, motivic_module_by_name, query_motivic_module};
 pub use deformation::Deformation;
 pub use massey::MotivicMassey;
 
@@ -711,6 +713,13 @@ pub static TAULIFT_ITERS: AtomicU64 = AtomicU64::new(0);
 /// aggregate delta.
 pub static LIFT_CACHE_LOADS: AtomicU64 = AtomicU64::new(0);
 
+/// EXPERIMENTAL cap on the τ-order the lift corrects to (see [`TauLift::lift_cell`]).
+/// `i32::MAX` (default) = full convergence. Lowering it truncates every τ-tower at
+/// this order — used to measure whether a depth-`k` product needs only order-`k`
+/// corrections (a bounded, local reach) or full convergence (internal degree `t`).
+pub static TAU_ORDER_CAP: std::sync::atomic::AtomicI32 =
+    std::sync::atomic::AtomicI32::new(i32::MAX);
+
 /// Count of lifted cells reused from the store instead of recomputed — the cells
 /// [`MotivicResolution::lift`] skipped because [`MotivicResolution::load_lift`] had
 /// already populated them. On a warm or grown box this is the incremental win: the
@@ -796,6 +805,11 @@ trait TauLift {
             else {
                 return support; // defect fully cancelled
             };
+            // EXPERIMENTAL (MOT_TAU_ORDER_CAP): stop correcting past a fixed τ-order,
+            // to test whether a depth-k product needs only order-k corrections.
+            if min_power > TAU_ORDER_CAP.load(Ordering::Relaxed) {
+                return support;
+            }
             TAULIFT_ITERS.fetch_add(1, Ordering::Relaxed); // one order-by-order round
             assert!(
                 min_power >= 1,

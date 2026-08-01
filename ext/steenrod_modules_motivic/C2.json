@@ -1,0 +1,7 @@
+{
+    "type": "finite dimensional module",
+    "name": "C2",
+    "doc": "Motivic Moore space S/2 = cofiber of 2 = h_0. Two cells joined by Q_0 = Sq^1 (bidegree (1,0)).",
+    "gens": { "x0": 0, "x1": 1 },
+    "actions": ["Q_0 x0 = x1"]
+}

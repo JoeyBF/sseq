@@ -14,25 +14,26 @@
 //!   — e.g. $h_1^4$ at $(4, 4)$.)
 //!
 //! Output is `n,s,alg_nov,classical,tau_torsion`, one line per nonzero bidegree.
-//! Run with e.g. `cargo run --release --example resolve_motivic` (reads `Max n` /
-//! `Max s`, defaulting to 12 / 8).
+//! Run with e.g. `cargo run --release --example resolve_motivic` — it prompts for a
+//! `Module` (default `S_2`, the sphere; also `C2`, `Ceta`, `Cnu`, `Csigma`, or a
+//! path to a `.json` descriptor), an optional save directory (a ZarrV3 store that
+//! caches the resolution + lift and reloads it on a later run of the same box), and
+//! `Max n` / `Max s` (defaulting to 12 / 8).
 
-use ext::motivic::MotivicResolution;
+use ext::motivic::{MotivicResolution, query_motivic_module};
 use maybe_rayon::prelude::*;
 use sseq::coordinates::Bidegree;
 
 fn main() -> anyhow::Result<()> {
     ext::utils::init_logging()?;
 
+    let (module, save_dir) = query_motivic_module("Module", "S_2")?;
     let max = Bidegree::n_s(
         query::with_default("Max n", "12", str::parse),
         query::with_default("Max s", "8", str::parse),
     );
 
-    // Set MOT_SAVE=<dir> to cache the resolution + lift to disk (and reload it on a
-    // later run of the same box).
-    let save_dir = std::env::var_os("MOT_SAVE").map(std::path::PathBuf::from);
-    let res = MotivicResolution::with_module(MotivicResolution::trivial_module(), max, save_dir);
+    let res = MotivicResolution::with_module(module, max, save_dir);
 
     let profile = std::env::var("MOT_PROFILE").is_ok();
     let t_coh = std::time::Instant::now();

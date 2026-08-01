@@ -1,0 +1,7 @@
+{
+    "type": "finite dimensional module",
+    "name": "Ceta",
+    "doc": "Cofiber of eta = h_1. Two cells joined by Sq^2 = P(xi_1) = P(0, 1) (bidegree (2,1)). Collapses the infinite h_1-towers of the sphere.",
+    "gens": { "x0": 0, "x2": 2 },
+    "actions": ["P(0, 1) x0 = x2"]
+}

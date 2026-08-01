@@ -14,11 +14,13 @@
 //! $E_2$; the finite-page deaths are the motivic τ-torsion. Ask for a larger page
 //! to watch the SS converge.
 //!
-//! Prompts for `Max n`, `Max s`, and the `Page` to draw (defaulting to 30 / 17 / 1).
+//! Prompts for a `Module` (default `S_2`; also `C2`, `Ceta`, `Cnu`, `Csigma`, or a
+//! `.json` path), an optional save directory, then `Max n`, `Max s`, and the `Page`
+//! to draw (defaulting to 30 / 17 / 1).
 
 use std::collections::BTreeMap;
 
-use ext::motivic::{Deformation, MotivicResolution};
+use ext::motivic::{Deformation, MotivicResolution, query_motivic_module};
 use sseq::{
     SseqProfile,
     charting::{Backend, SvgBackend},
@@ -28,13 +30,14 @@ use sseq::{
 fn main() -> anyhow::Result<()> {
     ext::utils::init_logging()?;
 
+    let (module, save_dir) = query_motivic_module("Module", "S_2")?;
     let max = Bidegree::n_s(
         query::with_default("Max n", "30", str::parse),
         query::with_default("Max s", "17", str::parse),
     );
     let page: i32 = query::with_default("Page", "1", str::parse);
 
-    let res = MotivicResolution::new(max);
+    let res = MotivicResolution::with_module(module, max, save_dir);
     let sseq = res.deformation_sseq();
 
     // The reported box: stems `0..=max.n()`, filtrations `0..=max.s()-1` (the top
