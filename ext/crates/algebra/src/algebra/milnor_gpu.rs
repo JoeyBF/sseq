@@ -1098,10 +1098,16 @@ fn multiply_pair(
         // block's `out_offset + seqno` can span past it. Skip writes past this row's `num_limbs` — they
         // would otherwise overrun into the next row (silent corruption) or past the buffer (an OOB
         // atomic; compute-sanitizer confirmed `Invalid __global__ atomic ... out of bounds`).
+        // Two independent bounds, both required: `limb < num_limbs` keeps the write inside this row
+        // (out_offset + seqno can span past it), and `word < out.len()` guards the row itself — a
+        // `row_base` that overruns the buffer (compute-sanitizer caught this as a second OOB atomic at
+        // higher degree, distinct from the intra-row overflow) would otherwise write past the end.
         if limb < num_limbs {
             let word = row_base + limb;
-            let bit = u32::cast_from(global_bit % 32);
-            out[word].fetch_xor(1u32 << bit);
+            if word < out.len() {
+                let bit = u32::cast_from(global_bit % 32);
+                out[word].fetch_xor(1u32 << bit);
+            }
         }
     }
 }
