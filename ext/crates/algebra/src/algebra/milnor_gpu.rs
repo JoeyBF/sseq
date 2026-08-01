@@ -878,7 +878,7 @@ fn ensure_basis(algebra: &MilnorAlgebra, width: usize, max_degree: i32) -> Vec<u
 /// On-device zeroing is memory-bound (microseconds on an H200) and same-stream ordered before
 /// the multiply kernel, so no host allocation, upload, or extra sync is needed.
 #[cube(launch)]
-fn zero_u32(out: &mut Array<u32>) {
+fn zero_u32(out: &mut [u32]) {
     if ABSOLUTE_POS < out.len() {
         out[ABSOLUTE_POS] = 0u32;
     }
@@ -898,8 +898,8 @@ fn zero_u32(out: &mut Array<u32>) {
 // `min(u64, u64)` (ambiguous for NVRTC) under u64. The `ABSOLUTE_POS < count` guard keeps it in-bounds.
 #[cube(launch_unchecked, address_type = "dynamic")]
 fn copy_into_u16(
-    src: &Array<u16>,
-    dst: &mut Array<u16>,
+    src: &[u16],
+    dst: &mut [u16],
     src_off: usize,
     dst_off: usize,
     count: u32,
@@ -912,8 +912,8 @@ fn copy_into_u16(
 /// `u32` sibling of [`copy_into_u16`] (for the resident basis `lens`).
 #[cube(launch_unchecked, address_type = "dynamic")]
 fn copy_into_u32(
-    src: &Array<u32>,
-    dst: &mut Array<u32>,
+    src: &[u32],
+    dst: &mut [u32],
     src_off: usize,
     dst_off: usize,
     count: u32,
@@ -952,8 +952,8 @@ macro_rules! copy_chunked {
                     CubeDim::new_1d(CT),
                     // The resident dst offset ($dst_off) and buffer length exceed u32 at high stems.
                     AddressType::from_len(($src_len).max($dst_len).max($dst_off + $count)),
-                    ArrayArg::from_raw_parts($src.clone(), $src_len),
-                    ArrayArg::from_raw_parts($dst.clone(), $dst_len),
+                    BufferArg::from_raw_parts($src.clone(), $src_len),
+                    BufferArg::from_raw_parts($dst.clone(), $dst_len),
                     $src_off + done,
                     $dst_off + done,
                     n as u32,
@@ -975,9 +975,9 @@ macro_rules! copy_chunked {
 /// `multiply_single_r_kernel` so both index outputs identically.
 #[cube]
 fn seqno_core(
-    g: &Array<u32>,
-    xi: &Array<u32>,
-    working: &Array<u32>,
+    g: &[u32],
+    xi: &[u32],
+    working: &[u32],
     wlen: usize,
     width: usize,
 ) -> u32 {
@@ -1023,12 +1023,12 @@ fn seqno_core(
 #[cube]
 #[allow(clippy::too_many_arguments)]
 fn multiply_pair(
-    col_sums: &Array<u16>,
-    masks: &Array<u16>,
-    term_pparts: &Array<u16>,
-    g: &Array<u32>,
-    xi: &Array<u32>,
-    out: &mut Array<Atomic<u32>>,
+    col_sums: &[u16],
+    masks: &[u16],
+    term_pparts: &[u16],
+    g: &[u32],
+    xi: &[u32],
+    out: &mut [Atomic<u32>],
     cs_base: usize,
     mk_base: usize,
     b_base: usize,
@@ -1089,7 +1089,7 @@ fn multiply_pair(
         // `seqno` indexes the algebra basis of the output degree; `out_offset` shifts it
         // to this product's target-generator block within the row (0 for a single-block
         // output). Both are bit offsets, added before splitting into (limb, bit).
-        let idx = seqno_core(g, xi, &working, WORKING_CAP, width);
+        let idx = seqno_core(g, xi, working.as_slice(), WORKING_CAP, width);
         let global_bit = out_offset + usize::cast_from(idx);
         let word = row_base + global_bit / 32;
         let bit = u32::cast_from(global_bit % 32);
@@ -1130,84 +1130,84 @@ fn multiply_pair(
 #[cube(launch_unchecked, address_type = "u64")]
 #[allow(clippy::too_many_arguments)]
 fn multiply_batch_kernel(
-    cs0: &Array<u16>,
-    cs1: &Array<u16>,
-    cs2: &Array<u16>,
-    cs3: &Array<u16>,
-    cs4: &Array<u16>,
-    cs5: &Array<u16>,
-    cs6: &Array<u16>,
-    cs7: &Array<u16>,
-    cs8: &Array<u16>,
-    cs9: &Array<u16>,
-    cs10: &Array<u16>,
-    cs11: &Array<u16>,
-    cs12: &Array<u16>,
-    cs13: &Array<u16>,
-    cs14: &Array<u16>,
-    cs15: &Array<u16>,
-    mk0: &Array<u16>,
-    mk1: &Array<u16>,
-    mk2: &Array<u16>,
-    mk3: &Array<u16>,
-    mk4: &Array<u16>,
-    mk5: &Array<u16>,
-    mk6: &Array<u16>,
-    mk7: &Array<u16>,
-    mk8: &Array<u16>,
-    mk9: &Array<u16>,
-    mk10: &Array<u16>,
-    mk11: &Array<u16>,
-    mk12: &Array<u16>,
-    mk13: &Array<u16>,
-    mk14: &Array<u16>,
-    mk15: &Array<u16>,
-    pp0: &Array<u16>,
-    pp1: &Array<u16>,
-    pp2: &Array<u16>,
-    pp3: &Array<u16>,
-    pp4: &Array<u16>,
-    pp5: &Array<u16>,
-    pp6: &Array<u16>,
-    pp7: &Array<u16>,
-    pp8: &Array<u16>,
-    pp9: &Array<u16>,
-    pp10: &Array<u16>,
-    pp11: &Array<u16>,
-    pp12: &Array<u16>,
-    pp13: &Array<u16>,
-    pp14: &Array<u16>,
-    pp15: &Array<u16>,
-    ln0: &Array<u32>,
-    ln1: &Array<u32>,
-    ln2: &Array<u32>,
-    ln3: &Array<u32>,
-    ln4: &Array<u32>,
-    ln5: &Array<u32>,
-    ln6: &Array<u32>,
-    ln7: &Array<u32>,
-    ln8: &Array<u32>,
-    ln9: &Array<u32>,
-    ln10: &Array<u32>,
-    ln11: &Array<u32>,
-    ln12: &Array<u32>,
-    ln13: &Array<u32>,
-    ln14: &Array<u32>,
-    ln15: &Array<u32>,
-    term_gei: &Array<u32>,
-    g: &Array<u32>,
-    xi: &Array<u32>,
-    out: &mut Array<Atomic<u32>>,
-    r_cs_offset: &Array<u64>,
-    r_mk_offset: &Array<u64>,
-    r_cs_len: &Array<u32>,
-    r_mk_len: &Array<u32>,
-    prod_r_index: &Array<u32>,
-    prod_term_start: &Array<u32>,
-    prod_num_terms: &Array<u32>,
-    prod_row_base: &Array<u32>,
-    prod_out_offset: &Array<u32>,
-    prod_pair_start: &Array<u32>,
+    cs0: &[u16],
+    cs1: &[u16],
+    cs2: &[u16],
+    cs3: &[u16],
+    cs4: &[u16],
+    cs5: &[u16],
+    cs6: &[u16],
+    cs7: &[u16],
+    cs8: &[u16],
+    cs9: &[u16],
+    cs10: &[u16],
+    cs11: &[u16],
+    cs12: &[u16],
+    cs13: &[u16],
+    cs14: &[u16],
+    cs15: &[u16],
+    mk0: &[u16],
+    mk1: &[u16],
+    mk2: &[u16],
+    mk3: &[u16],
+    mk4: &[u16],
+    mk5: &[u16],
+    mk6: &[u16],
+    mk7: &[u16],
+    mk8: &[u16],
+    mk9: &[u16],
+    mk10: &[u16],
+    mk11: &[u16],
+    mk12: &[u16],
+    mk13: &[u16],
+    mk14: &[u16],
+    mk15: &[u16],
+    pp0: &[u16],
+    pp1: &[u16],
+    pp2: &[u16],
+    pp3: &[u16],
+    pp4: &[u16],
+    pp5: &[u16],
+    pp6: &[u16],
+    pp7: &[u16],
+    pp8: &[u16],
+    pp9: &[u16],
+    pp10: &[u16],
+    pp11: &[u16],
+    pp12: &[u16],
+    pp13: &[u16],
+    pp14: &[u16],
+    pp15: &[u16],
+    ln0: &[u32],
+    ln1: &[u32],
+    ln2: &[u32],
+    ln3: &[u32],
+    ln4: &[u32],
+    ln5: &[u32],
+    ln6: &[u32],
+    ln7: &[u32],
+    ln8: &[u32],
+    ln9: &[u32],
+    ln10: &[u32],
+    ln11: &[u32],
+    ln12: &[u32],
+    ln13: &[u32],
+    ln14: &[u32],
+    ln15: &[u32],
+    term_gei: &[u32],
+    g: &[u32],
+    xi: &[u32],
+    out: &mut [Atomic<u32>],
+    r_cs_offset: &[u64],
+    r_mk_offset: &[u64],
+    r_cs_len: &[u32],
+    r_mk_len: &[u32],
+    prod_r_index: &[u32],
+    prod_term_start: &[u32],
+    prod_num_terms: &[u32],
+    prod_row_base: &[u32],
+    prod_out_offset: &[u32],
+    prod_pair_start: &[u32],
     width: usize,
     seg_elems: usize,
 ) {
@@ -1341,9 +1341,9 @@ fn multiply_batch_kernel(
     }
 
     multiply_pair(
-        &cs_local,
-        &mk_local,
-        &term_local,
+        cs_local.as_slice(),
+        mk_local.as_slice(),
+        term_local.as_slice(),
         g,
         xi,
         out,
@@ -1987,14 +1987,14 @@ fn multiply_batch_block(
                         &client,
                         CubeCount::Static((n_cold as u32).div_ceil(ENUM_THREADS).max(1), 1, 1),
                         CubeDim::new_1d(ENUM_THREADS),
-                        ArrayArg::from_raw_parts(epp_h, enum_pp.len()),
-                        ArrayArg::from_raw_parts(er_h, n_cold),
-                        ArrayArg::from_raw_parts(ec_h, n_cold),
-                        ArrayArg::from_raw_parts(eco_h, n_cold),
-                        ArrayArg::from_raw_parts(emo_h, n_cold),
-                        ArrayArg::from_raw_parts(cs_scratch.clone(), cs_cap),
-                        ArrayArg::from_raw_parts(mk_scratch.clone(), mk_cap),
-                        ArrayArg::from_raw_parts(cnt_scratch, n_cold.max(1)),
+                        BufferArg::from_raw_parts(epp_h, enum_pp.len()),
+                        BufferArg::from_raw_parts(er_h, n_cold),
+                        BufferArg::from_raw_parts(ec_h, n_cold),
+                        BufferArg::from_raw_parts(eco_h, n_cold),
+                        BufferArg::from_raw_parts(emo_h, n_cold),
+                        BufferArg::from_raw_parts(cs_scratch.clone(), cs_cap),
+                        BufferArg::from_raw_parts(mk_scratch.clone(), mk_cap),
+                        BufferArg::from_raw_parts(cnt_scratch, n_cold.max(1)),
                         enum_width,
                         n_cold,
                     );
@@ -2080,7 +2080,7 @@ fn multiply_batch_block(
                 &client,
                 CubeCount::Static((out_len as u32).div_ceil(THREADS).max(1), 1, 1),
                 CubeDim::new_1d(THREADS),
-                ArrayArg::from_raw_parts(out_h.clone(), out_len),
+                BufferArg::from_raw_parts(out_h.clone(), out_len),
             );
         }
 
@@ -2091,10 +2091,10 @@ fn multiply_batch_block(
         let poo_h = client.create_from_slice(u32::as_bytes(&prod_out_offset));
         let pps_h = client.create_from_slice(u32::as_bytes(&pps));
         let cubes = (total_pairs as u32).div_ceil(THREADS).max(1);
-        // Bind one `ArrayArg` per `(segment vector, index)` — the `.0` handle, `.1` element length.
+        // Bind one `BufferArg` per `(segment vector, index)` — the `.0` handle, `.1` element length.
         macro_rules! sa {
             ($v:expr, $i:expr) => {
-                ArrayArg::from_raw_parts($v[$i].0.clone(), $v[$i].1)
+                BufferArg::from_raw_parts($v[$i].0.clone(), $v[$i].1)
             };
         }
         // SAFETY: `launch_unchecked` — see the kernel's `address_type = "u64"` note. Every device
@@ -2168,20 +2168,20 @@ fn multiply_batch_block(
                 sa!(ln_seg, 13),
                 sa!(ln_seg, 14),
                 sa!(ln_seg, 15),
-                ArrayArg::from_raw_parts(tg_h, term_gei.len()),
-                ArrayArg::from_raw_parts(g_h, g.len()),
-                ArrayArg::from_raw_parts(xi_h, xi.len()),
-                ArrayArg::from_raw_parts(out_h.clone(), out_len),
-                ArrayArg::from_raw_parts(rco_h, r_cs_offset.len()),
-                ArrayArg::from_raw_parts(rmo_h, r_mk_offset.len()),
-                ArrayArg::from_raw_parts(rcl_h, r_cs_len.len()),
-                ArrayArg::from_raw_parts(rml_h, r_mk_len.len()),
-                ArrayArg::from_raw_parts(pri_h, products.len()),
-                ArrayArg::from_raw_parts(pts_h, products.len()),
-                ArrayArg::from_raw_parts(pnt_h, products.len()),
-                ArrayArg::from_raw_parts(prb_h, products.len()),
-                ArrayArg::from_raw_parts(poo_h, products.len()),
-                ArrayArg::from_raw_parts(pps_h, pps.len()),
+                BufferArg::from_raw_parts(tg_h, term_gei.len()),
+                BufferArg::from_raw_parts(g_h, g.len()),
+                BufferArg::from_raw_parts(xi_h, xi.len()),
+                BufferArg::from_raw_parts(out_h.clone(), out_len),
+                BufferArg::from_raw_parts(rco_h, r_cs_offset.len()),
+                BufferArg::from_raw_parts(rmo_h, r_mk_offset.len()),
+                BufferArg::from_raw_parts(rcl_h, r_cs_len.len()),
+                BufferArg::from_raw_parts(rml_h, r_mk_len.len()),
+                BufferArg::from_raw_parts(pri_h, products.len()),
+                BufferArg::from_raw_parts(pts_h, products.len()),
+                BufferArg::from_raw_parts(pnt_h, products.len()),
+                BufferArg::from_raw_parts(prb_h, products.len()),
+                BufferArg::from_raw_parts(poo_h, products.len()),
+                BufferArg::from_raw_parts(pps_h, pps.len()),
                 width,
                 seg_elems,
             );
@@ -2238,22 +2238,22 @@ fn multiply_batch_block(
 #[cube]
 #[allow(clippy::too_many_arguments)]
 fn seg_read_u16(
-    s0: &Array<u16>,
-    s1: &Array<u16>,
-    s2: &Array<u16>,
-    s3: &Array<u16>,
-    s4: &Array<u16>,
-    s5: &Array<u16>,
-    s6: &Array<u16>,
-    s7: &Array<u16>,
-    s8: &Array<u16>,
-    s9: &Array<u16>,
-    s10: &Array<u16>,
-    s11: &Array<u16>,
-    s12: &Array<u16>,
-    s13: &Array<u16>,
-    s14: &Array<u16>,
-    s15: &Array<u16>,
+    s0: &[u16],
+    s1: &[u16],
+    s2: &[u16],
+    s3: &[u16],
+    s4: &[u16],
+    s5: &[u16],
+    s6: &[u16],
+    s7: &[u16],
+    s8: &[u16],
+    s9: &[u16],
+    s10: &[u16],
+    s11: &[u16],
+    s12: &[u16],
+    s13: &[u16],
+    s14: &[u16],
+    s15: &[u16],
     o: usize,
     seg_elems: usize,
 ) -> u16 {
@@ -2301,22 +2301,22 @@ fn seg_read_u16(
 #[cube]
 #[allow(clippy::too_many_arguments)]
 fn seg_read_u32(
-    s0: &Array<u32>,
-    s1: &Array<u32>,
-    s2: &Array<u32>,
-    s3: &Array<u32>,
-    s4: &Array<u32>,
-    s5: &Array<u32>,
-    s6: &Array<u32>,
-    s7: &Array<u32>,
-    s8: &Array<u32>,
-    s9: &Array<u32>,
-    s10: &Array<u32>,
-    s11: &Array<u32>,
-    s12: &Array<u32>,
-    s13: &Array<u32>,
-    s14: &Array<u32>,
-    s15: &Array<u32>,
+    s0: &[u32],
+    s1: &[u32],
+    s2: &[u32],
+    s3: &[u32],
+    s4: &[u32],
+    s5: &[u32],
+    s6: &[u32],
+    s7: &[u32],
+    s8: &[u32],
+    s9: &[u32],
+    s10: &[u32],
+    s11: &[u32],
+    s12: &[u32],
+    s13: &[u32],
+    s14: &[u32],
+    s15: &[u32],
     o: usize,
     seg_elems: usize,
 ) -> u32 {
@@ -2385,16 +2385,16 @@ fn seg_read_u32(
 #[cube(launch_unchecked, address_type = "u64")]
 #[allow(clippy::too_many_arguments)]
 fn enumerate_admissible_kernel(
-    p_parts: &Array<u32>,
-    r_rows: &Array<u32>,
-    r_cols: &Array<u32>,
+    p_parts: &[u32],
+    r_rows: &[u32],
+    r_cols: &[u32],
     // u64: the scratch offsets index buffers that reach billions of elements in a big block, past
     // `u32::MAX` (same reason the multiply's `r_cs_offset`/`r_mk_offset` are u64 — these ARE those).
-    r_cs_out: &Array<u64>,
-    r_mk_out: &Array<u64>,
-    out_cs: &mut Array<u16>,
-    out_mk: &mut Array<u16>,
-    out_counts: &mut Array<u32>,
+    r_cs_out: &[u64],
+    r_mk_out: &[u64],
+    out_cs: &mut [u16],
+    out_mk: &mut [u16],
+    out_counts: &mut [u32],
     width: usize,
     n_r: usize,
 ) {
@@ -2532,7 +2532,7 @@ mod tests {
     /// One thread per `u32` limb. F₂ addition is XOR of the packed limbs, so this is
     /// the output primitive the multiply kernels accumulate with.
     #[cube(launch)]
-    fn xor_f2(a: &Array<u32>, b: &Array<u32>, out: &mut Array<u32>) {
+    fn xor_f2(a: &[u32], b: &[u32], out: &mut [u32]) {
         if ABSOLUTE_POS < out.len() {
             out[ABSOLUTE_POS] = a[ABSOLUTE_POS] ^ b[ABSOLUTE_POS];
         }
@@ -2559,9 +2559,9 @@ mod tests {
                 &client,
                 CubeCount::Static(cubes, 1, 1),
                 CubeDim::new_1d(THREADS),
-                ArrayArg::from_raw_parts(a_handle, n),
-                ArrayArg::from_raw_parts(b_handle, n),
-                ArrayArg::from_raw_parts(out_handle.clone(), n),
+                BufferArg::from_raw_parts(a_handle, n),
+                BufferArg::from_raw_parts(b_handle, n),
+                BufferArg::from_raw_parts(out_handle.clone(), n),
             );
         }
 
@@ -2574,10 +2574,10 @@ mod tests {
     /// are zero and skipped, so `wlen == width` matches the CPU's trimmed loop).
     #[cube(launch)]
     fn seqno_kernel(
-        g: &Array<u32>,
-        xi: &Array<u32>,
-        p_parts: &Array<u32>,
-        out: &mut Array<u32>,
+        g: &[u32],
+        xi: &[u32],
+        p_parts: &[u32],
+        out: &mut [u32],
         width: usize,
     ) {
         let idx = ABSOLUTE_POS;
@@ -2590,7 +2590,7 @@ mod tests {
         for h in 0..width {
             working[h] = p_parts[base + h];
         }
-        out[idx] = seqno_core(g, xi, &working, width, width);
+        out[idx] = seqno_core(g, xi, working.as_slice(), width, width);
     }
 
     /// Run `seqno_kernel` over `n` padded p_parts and return their seqno indices.
@@ -2621,10 +2621,10 @@ mod tests {
                 &client,
                 CubeCount::Static(cubes, 1, 1),
                 CubeDim::new_1d(THREADS),
-                ArrayArg::from_raw_parts(g_h, g.len()),
-                ArrayArg::from_raw_parts(xi_h, xi.len()),
-                ArrayArg::from_raw_parts(pp_h, p_parts.len()),
-                ArrayArg::from_raw_parts(out_h.clone(), n),
+                BufferArg::from_raw_parts(g_h, g.len()),
+                BufferArg::from_raw_parts(xi_h, xi.len()),
+                BufferArg::from_raw_parts(pp_h, p_parts.len()),
+                BufferArg::from_raw_parts(out_h.clone(), n),
                 width,
             );
         }
@@ -2638,13 +2638,13 @@ mod tests {
     #[cube(launch)]
     #[allow(clippy::too_many_arguments)]
     fn multiply_single_r_kernel(
-        col_sums: &Array<u16>,
-        masks: &Array<u16>,
-        term_pparts: &Array<u16>,
-        term_lens: &Array<u32>,
-        g: &Array<u32>,
-        xi: &Array<u32>,
-        out: &mut Array<Atomic<u32>>,
+        col_sums: &[u16],
+        masks: &[u16],
+        term_pparts: &[u16],
+        term_lens: &[u32],
+        g: &[u32],
+        xi: &[u32],
+        out: &mut [Atomic<u32>],
         num_terms: usize,
         num_matrices: usize,
         cs_len: usize,
@@ -2753,13 +2753,13 @@ mod tests {
                 &client,
                 CubeCount::Static(cubes, 1, 1),
                 CubeDim::new_1d(THREADS),
-                ArrayArg::from_raw_parts(cs_h, col_sums.len()),
-                ArrayArg::from_raw_parts(mk_h, masks.len()),
-                ArrayArg::from_raw_parts(tp_h, term_pparts.len()),
-                ArrayArg::from_raw_parts(tl_h, term_lens.len()),
-                ArrayArg::from_raw_parts(g_h, g.len()),
-                ArrayArg::from_raw_parts(xi_h, xi.len()),
-                ArrayArg::from_raw_parts(out_h.clone(), num_limbs),
+                BufferArg::from_raw_parts(cs_h, col_sums.len()),
+                BufferArg::from_raw_parts(mk_h, masks.len()),
+                BufferArg::from_raw_parts(tp_h, term_pparts.len()),
+                BufferArg::from_raw_parts(tl_h, term_lens.len()),
+                BufferArg::from_raw_parts(g_h, g.len()),
+                BufferArg::from_raw_parts(xi_h, xi.len()),
+                BufferArg::from_raw_parts(out_h.clone(), num_limbs),
                 num_terms,
                 num_matrices,
                 cs_len,
@@ -2777,24 +2777,24 @@ mod tests {
     #[cube(launch)]
     #[allow(clippy::too_many_arguments)]
     fn seg_gather_kernel(
-        s0: &Array<u16>,
-        s1: &Array<u16>,
-        s2: &Array<u16>,
-        s3: &Array<u16>,
-        s4: &Array<u16>,
-        s5: &Array<u16>,
-        s6: &Array<u16>,
-        s7: &Array<u16>,
-        s8: &Array<u16>,
-        s9: &Array<u16>,
-        s10: &Array<u16>,
-        s11: &Array<u16>,
-        s12: &Array<u16>,
-        s13: &Array<u16>,
-        s14: &Array<u16>,
-        s15: &Array<u16>,
-        idx: &Array<u32>,
-        out: &mut Array<u16>,
+        s0: &[u16],
+        s1: &[u16],
+        s2: &[u16],
+        s3: &[u16],
+        s4: &[u16],
+        s5: &[u16],
+        s6: &[u16],
+        s7: &[u16],
+        s8: &[u16],
+        s9: &[u16],
+        s10: &[u16],
+        s11: &[u16],
+        s12: &[u16],
+        s13: &[u16],
+        s14: &[u16],
+        s15: &[u16],
+        idx: &[u32],
+        out: &mut [u16],
         seg_elems: usize,
     ) {
         let i = ABSOLUTE_POS;
@@ -2884,14 +2884,14 @@ mod tests {
                 &client,
                 CubeCount::Static(cubes, 1, 1),
                 CubeDim::new_1d(THREADS),
-                ArrayArg::from_raw_parts(pp_h, pp_flat.len()),
-                ArrayArg::from_raw_parts(rr_h, n_r),
-                ArrayArg::from_raw_parts(rc_h, n_r),
-                ArrayArg::from_raw_parts(rco_h, n_r),
-                ArrayArg::from_raw_parts(rmo_h, n_r),
-                ArrayArg::from_raw_parts(ocs_h.clone(), cs_cap),
-                ArrayArg::from_raw_parts(omk_h.clone(), mk_cap),
-                ArrayArg::from_raw_parts(cnt_h.clone(), n_r),
+                BufferArg::from_raw_parts(pp_h, pp_flat.len()),
+                BufferArg::from_raw_parts(rr_h, n_r),
+                BufferArg::from_raw_parts(rc_h, n_r),
+                BufferArg::from_raw_parts(rco_h, n_r),
+                BufferArg::from_raw_parts(rmo_h, n_r),
+                BufferArg::from_raw_parts(ocs_h.clone(), cs_cap),
+                BufferArg::from_raw_parts(omk_h.clone(), mk_cap),
+                BufferArg::from_raw_parts(cnt_h.clone(), n_r),
                 width,
                 n_r,
             );
@@ -3055,7 +3055,7 @@ mod tests {
 
         const THREADS: u32 = 256;
         let cubes = (indices.len() as u32).div_ceil(THREADS).max(1);
-        let arg = |i: usize| unsafe { ArrayArg::from_raw_parts(handles[i].clone(), lens[i]) };
+        let arg = |i: usize| unsafe { BufferArg::from_raw_parts(handles[i].clone(), lens[i]) };
         unsafe {
             seg_gather_kernel::launch::<CudaRuntime>(
                 &client,
@@ -3077,8 +3077,8 @@ mod tests {
                 arg(13),
                 arg(14),
                 arg(15),
-                ArrayArg::from_raw_parts(idx_h, indices.len()),
-                ArrayArg::from_raw_parts(out_h.clone(), indices.len()),
+                BufferArg::from_raw_parts(idx_h, indices.len()),
+                BufferArg::from_raw_parts(out_h.clone(), indices.len()),
                 seg_elems,
             );
         }
@@ -3200,14 +3200,14 @@ mod tests {
                 &client,
                 CubeCount::Static(cubes, 1, 1),
                 CubeDim::new_1d(THREADS),
-                ArrayArg::from_raw_parts(pp_h, pp_flat.len()),
-                ArrayArg::from_raw_parts(rr_h, n_r),
-                ArrayArg::from_raw_parts(rc_h, n_r),
-                ArrayArg::from_raw_parts(rco_h, n_r),
-                ArrayArg::from_raw_parts(rmo_h, n_r),
-                ArrayArg::from_raw_parts(ocs_h.clone(), cs_cap),
-                ArrayArg::from_raw_parts(omk_h.clone(), mk_cap),
-                ArrayArg::from_raw_parts(cnt_h.clone(), n_r),
+                BufferArg::from_raw_parts(pp_h, pp_flat.len()),
+                BufferArg::from_raw_parts(rr_h, n_r),
+                BufferArg::from_raw_parts(rc_h, n_r),
+                BufferArg::from_raw_parts(rco_h, n_r),
+                BufferArg::from_raw_parts(rmo_h, n_r),
+                BufferArg::from_raw_parts(ocs_h.clone(), cs_cap),
+                BufferArg::from_raw_parts(omk_h.clone(), mk_cap),
+                BufferArg::from_raw_parts(cnt_h.clone(), n_r),
                 width,
                 n_r,
             );
