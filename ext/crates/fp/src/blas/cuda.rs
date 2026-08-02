@@ -14,7 +14,7 @@
 //!   CPU path is used. Defaults to 2048; the GPU only wins once the kernel work
 //!   dwarfs the H2D/D2H + TMA-layout marshalling, which dominates small sizes.
 
-use std::sync::{Mutex, OnceLock};
+use std::sync::OnceLock;
 
 use fp_cuda::GpuContext;
 
@@ -52,20 +52,41 @@ fn rr_threshold() -> usize {
 
 /// The process-wide GPU context, created lazily on first use. `None` if no
 /// usable device is present (no driver, no Hopper GPU, or the kernel PTX is the
-/// nvcc-absent build stub). Wrapped in a `Mutex` because a single CUDA context
-/// serialises submission anyway and `GpuContext` is not shared concurrently.
-fn context() -> Option<&'static Mutex<GpuContext>> {
-    static GPU: OnceLock<Option<Mutex<GpuContext>>> = OnceLock::new();
+/// nvcc-absent build stub). Shared as `&'static` — no lock: `GpuContext` is
+/// `Send + Sync` (its cudarc handles are), and every submission goes through a
+/// per-thread stream ([`GpuContext::stream`]), so concurrent rayon workers run
+/// on independent streams (overlapping transfers + kernels) instead of
+/// serializing on one mutex. Buffers are per-call and thread-local, so there is
+/// no shared mutable device state to guard.
+fn context() -> Option<&'static GpuContext> {
+    static GPU: OnceLock<Option<GpuContext>> = OnceLock::new();
     GPU.get_or_init(|| {
         if std::env::var_os("FP_CUDA_DISABLE").is_some() {
             return None;
         }
-        match GpuContext::new(0) {
-            Ok(ctx) => Some(Mutex::new(ctx)),
-            Err(_) => None,
-        }
+        // `FP_CUDA_DEVICE` puts the row reduction on its own GPU. On a single device the two CUDA
+        // consumers contend: the reduction's thousands of tiny sequential relaunches queue behind
+        // the multiply's saturating kernels (1.8-9.7 ms standalone vs 8.6-96.8 s co-running), which
+        // is why [`crate::gpu_lock`] exists at all — and that arbitration then costs ~47% of
+        // multiply time. Separate devices remove the contention by construction, so the lock
+        // becomes a no-op (see [`crate::gpu_lock::set_devices_shared`]).
+        let device = std::env::var("FP_CUDA_DEVICE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        crate::gpu_lock::set_devices_shared(device == multiply_device());
+        GpuContext::new(device).ok()
     })
     .as_ref()
+}
+
+/// Which GPU the cubecl Milnor multiply runs on (`NASSAU_GPU_DEVICE`, default 0). Read here only to
+/// decide whether the two runtimes share a device; `algebra` owns the actual client construction.
+fn multiply_device() -> usize {
+    std::env::var("NASSAU_GPU_DEVICE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0)
 }
 
 /// Row-major, K-major `u64` limbs — the exact layout `fp_cuda::matmul_b1_raw`
@@ -100,10 +121,9 @@ pub(super) fn try_mul(a: &Matrix, b: &Matrix) -> Option<Matrix> {
     let a_limbs = to_limbs(a);
     let b_limbs = to_limbs(b);
 
-    let c = {
-        let guard = ctx.lock().ok()?;
-        fp_cuda::matmul_b1_raw(&guard, &a_limbs, m, k, &b_limbs, n).ok()?
-    };
+    // Lock-free: `matmul_b1_raw` submits on the calling thread's own stream with per-call device
+    // buffers, so concurrent callers do not interfere (see [`context`]).
+    let c = fp_cuda::matmul_b1_raw(ctx, &a_limbs, m, k, &b_limbs, n).ok()?;
     Some(Matrix::from_data(TWO, m, n, c))
 }
 
@@ -127,12 +147,23 @@ pub(crate) fn try_row_reduce(m: &mut Matrix) -> Option<usize> {
     let stride = cols.div_ceil(64);
     let limbs = to_limbs(m);
 
+    // Lock-free, per-thread stream (see [`context`]): the default row-reduce is composable (no
+    // cooperative launch) and allocates its device buffers per call, so concurrent rayon workers
+    // reduce different matrices on independent streams — overlapping instead of serializing.
+    //
+    // The claim that this "needs no cross-runtime exclusion against the cubecl multiply" is exactly
+    // backwards. Composability (no cooperative launch) means this path *can* overlap other GPU work
+    // without deadlocking — not that it should. This reduction is a chain of thousands of tiny
+    // sequential per-column relaunches, so overlapping it with the multiply's saturating kernels
+    // makes every launch queue: 1.8–9.7 ms standalone becomes 8.6–96.8 s co-running. Take the
+    // device exclusively for the duration; see [`fp::gpu_lock`] for the measurements and the cost
+    // (~5 s of multiply pause across a whole stem-200 resolution).
+    let _exclusive = crate::gpu_lock::exclusive();
     let (dev_limbs, perm, r, pivot_cols) = {
-        let gpu = ctx.lock().ok()?;
-        let mut dm = gpu.upload(&limbs, rows, cols).ok()?;
-        let (perm, r, pivot_cols) = gpu.row_reduce_dev(&mut dm).ok()?;
-        let dev_limbs = gpu.download(&dm).ok()?;
-        let perm = gpu.download_u32(&perm).ok()?;
+        let mut dm = ctx.upload(&limbs, rows, cols).ok()?;
+        let (perm, r, pivot_cols) = ctx.row_reduce_dev(&mut dm).ok()?;
+        let dev_limbs = ctx.download(&dm).ok()?;
+        let perm = ctx.download_u32(&perm).ok()?;
         (dev_limbs, perm, r, pivot_cols)
     };
 
