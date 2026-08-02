@@ -350,6 +350,22 @@ pub fn take_batch_stats() -> (u64, u64, u64, u64) {
     )
 }
 
+/// Where multiply time goes, as microsecond totals: host prep, then the GPU-thread split of
+/// queue wait versus device execution, then queue depth (summed, max). See [`gpu_thread`].
+///
+/// Separate from [`take_batch_stats`] because the queue/exec split is the measurement that
+/// distinguishes "waiting behind other workers" from "computing" — collapsing them into one
+/// `device` figure is what made multi-minute submission stalls read as kernel time.
+pub fn take_gpu_timing() -> (u64, u64, u64, u64, u64) {
+    (
+        BATCH_PREP_US.swap(0, Ordering::Relaxed),
+        BATCH_QUEUE_US.swap(0, Ordering::Relaxed),
+        BATCH_EXEC_US.swap(0, Ordering::Relaxed),
+        BATCH_DEPTH_SUM.swap(0, Ordering::Relaxed),
+        BATCH_DEPTH_MAX.swap(0, Ordering::Relaxed),
+    )
+}
+
 /// Diagnostic (see `NASSAU_MEM_REPORT`): resident-master HOST-side heap bytes — the not-yet-uploaded
 /// `col_sums`/`masks` tails, the width-padded basis `pparts`/`lens`, and the per-`R` `index` map
 /// (its `Vec<PPartEntry>` keys). The bulk `col_sums`/`masks` are no longer retained (freed after
@@ -4110,5 +4126,242 @@ mod tests {
              (tracel-ai/cubecl#1401) fired. This is the crash the submission-thread redesign \
              closes."
         );
+    }
+
+    /// Benchmark of the **hard stem-200 regime**: the GPU submission path under the contention
+    /// shape a record-stem Nassau resolution actually produces.
+    ///
+    /// # Why this exists
+    ///
+    /// Every change to the GPU path was previously validated by a ~3 h stem-200 resolution, so the
+    /// iteration loop was measured in hours and each answer arrived with run-to-run variance mixed
+    /// in. This reproduces the regime in minutes.
+    ///
+    /// # Calibration
+    ///
+    /// The shape below is not invented; it is the measured distribution of `gpu_submit` spans from
+    /// a complete stem-200 run, restricted to the hard tail (stems ≥ 190, n = 11 287 launches):
+    ///
+    /// ```text
+    ///            p10        p50        p90         max
+    /// rows       122        158        260      83 702
+    /// pairs   190 962  1 963 056 14 770 242 632 386 884
+    /// out_u32 326 106    379 516    665 860  42 269 510
+    /// ```
+    ///
+    /// Two properties matter as much as the sizes:
+    /// - **Worker count ≈ 7**, the real wavefront (time-weighted mean 6.6, and 87 % of the run sits
+    ///   at 6–7 bidegrees in flight). The soak's 64 threads are deliberately *wrong* here: queue
+    ///   contention is the thing under test, so the number of contenders must match the resolution.
+    /// - **Steady state, not growth.** The timed phase runs after a warm-up sweep has grown the
+    ///   resident master, because at stem 200 the master is long since built; timing the growth
+    ///   transient would measure a phase the hard regime is not in.
+    ///
+    /// `num_cols` is chosen by searching for the output degree whose dimension is closest to
+    /// `NASSAU_BENCH_COLS`, rather than hard-coding a degree — the degree that yields a given
+    /// matrix width is an artifact of the algebra, and pinning the *width* is what keeps this
+    /// comparable to the measured run.
+    ///
+    /// Reports launches/s, pairs/s and the prep / queue / exec split with queue depth, plus the
+    /// achieved workload distribution so drift from the calibration above is visible rather than
+    /// silent.
+    ///
+    /// Ignored by default (needs a CUDA device). Run with:
+    /// ```text
+    /// cargo test -p algebra --release --features gpu -- --ignored --nocapture stem200_regime_bench
+    /// ```
+    /// Tunables (env): `NASSAU_BENCH_WORKERS` (7), `NASSAU_BENCH_ROWS` (158),
+    /// `NASSAU_BENCH_COLS` (77 000), `NASSAU_BENCH_SECS` (60), `NASSAU_BENCH_SPREAD` (4).
+    #[test]
+    #[ignore = "GPU perf bench: needs a CUDA device; run explicitly"]
+    fn stem200_regime_bench() {
+        use std::{
+            sync::{
+                Arc, Mutex,
+                atomic::{AtomicU64, Ordering},
+            },
+            time::{Duration, Instant},
+        };
+
+        let env_num = |key: &str, default: u64| -> u64 {
+            std::env::var(key)
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(default)
+        };
+        let workers = env_num("NASSAU_BENCH_WORKERS", 7) as usize;
+        let num_rows = env_num("NASSAU_BENCH_ROWS", 158) as usize;
+        let target_cols = env_num("NASSAU_BENCH_COLS", 77_000) as usize;
+        let secs = env_num("NASSAU_BENCH_SECS", 60);
+        // How many neighbouring degrees to sweep. A single degree would let every launch reuse one
+        // resident-master prefix; the real run interleaves several bidegrees at once.
+        let spread = env_num("NASSAU_BENCH_SPREAD", 4) as i32;
+
+        let p = fp::prime::ValidPrime::new(2);
+        let algebra = MilnorAlgebra::new(p, false);
+
+        // Grow the basis until it brackets `target_cols`, then take the closest degree. Doubling
+        // the probe keeps this from computing a far larger basis than the bench needs.
+        let mut probe = 32;
+        loop {
+            algebra.compute_basis(probe);
+            if algebra.dimension(probe) >= target_cols || probe > 512 {
+                break;
+            }
+            probe *= 2;
+        }
+        let out_degree = (1..=probe)
+            .min_by_key(|&d| algebra.dimension(d).abs_diff(target_cols))
+            .expect("non-empty degree range");
+        let max_degree = out_degree;
+        algebra.compute_basis(max_degree);
+        algebra.compute_seqno_tables(max_degree);
+        eprintln!(
+            "[bench] target_cols={target_cols} -> out_degree={out_degree} (num_cols={}), \
+             workers={workers} rows={num_rows} spread={spread} secs={secs}",
+            algebra.dimension(out_degree),
+        );
+
+        // Same `get_partial_matrix`-shaped batch the soak builds, so this drives the identical
+        // kernel + resident-master path Nassau does.
+        let build_batch = |out_degree: i32| -> (usize, Vec<GpuProduct>) {
+            let num_cols = algebra.dimension(out_degree);
+            let mut products = Vec::new();
+            for r_degree in 1..out_degree {
+                let s_degree = out_degree - r_degree;
+                let s_dim = algebra.dimension(s_degree);
+                if s_dim == 0 {
+                    continue;
+                }
+                for r_idx in 0..algebra.dimension(r_degree) {
+                    if algebra
+                        .basis_element_from_index(r_degree, r_idx)
+                        .p_part
+                        .is_empty()
+                    {
+                        continue;
+                    }
+                    let row = products.len() % num_rows;
+                    products.push(GpuProduct {
+                        r_degree,
+                        r_idx,
+                        s_degree,
+                        term_indices: (0..s_dim).collect(),
+                        row,
+                        out_offset: 0,
+                    });
+                }
+            }
+            (num_cols, products)
+        };
+
+        struct Job {
+            num_cols: usize,
+            products: Vec<GpuProduct>,
+        }
+        let jobs: Arc<Vec<Job>> = Arc::new(
+            (out_degree - spread + 1..=out_degree)
+                .filter(|&d| d > 1)
+                .filter_map(|d| {
+                    let (num_cols, products) = build_batch(d);
+                    (!products.is_empty()).then_some(Job { num_cols, products })
+                })
+                .collect(),
+        );
+        assert!(
+            !jobs.is_empty(),
+            "no non-empty batches at degree {out_degree}"
+        );
+
+        // Warm-up: one pass per job grows the resident master to its steady-state extent, so the
+        // timed phase below measures the regime rather than the growth transient.
+        let warm = Instant::now();
+        for job in jobs.iter() {
+            let _ = multiply_batch_on_gpu(&algebra, job.num_cols, num_rows, &job.products);
+        }
+        eprintln!(
+            "[bench] warm-up: {} jobs in {:.1}s",
+            jobs.len(),
+            warm.elapsed().as_secs_f64()
+        );
+        assert!(!gpu_disabled(), "GPU died during warm-up");
+
+        // Discard warm-up from the counters; the timed phase starts from zero.
+        let _ = take_batch_stats();
+        let _ = take_gpu_timing();
+
+        let launches = AtomicU64::new(0);
+        // Per-launch wall time: the tail is the starvation signal the aggregate mean hides.
+        let waits: Mutex<Vec<f64>> = Mutex::new(Vec::new());
+        let started = Instant::now();
+        let deadline = started + Duration::from_secs(secs);
+
+        std::thread::scope(|scope| {
+            for t in 0..workers {
+                let jobs = Arc::clone(&jobs);
+                let algebra = &algebra;
+                let launches = &launches;
+                let waits = &waits;
+                scope.spawn(move || {
+                    let mut local = Vec::new();
+                    let mut i = t % jobs.len();
+                    while Instant::now() < deadline && !gpu_disabled() {
+                        let job = &jobs[i];
+                        let t0 = Instant::now();
+                        let _ =
+                            multiply_batch_on_gpu(algebra, job.num_cols, num_rows, &job.products);
+                        local.push(t0.elapsed().as_secs_f64());
+                        launches.fetch_add(1, Ordering::Relaxed);
+                        i = (i + 1) % jobs.len();
+                    }
+                    waits.lock().unwrap().extend(local);
+                });
+            }
+        });
+
+        let elapsed = started.elapsed().as_secs_f64().max(1e-3);
+        let n = launches.load(Ordering::Relaxed);
+        let (calls, _marshal_us, device_us, pairs) = take_batch_stats();
+        let (prep_us, queue_us, exec_us, depth_sum, depth_max) = take_gpu_timing();
+        let us = |v: u64| v as f64 / 1e6;
+        let total = (us(prep_us) + us(device_us)).max(1e-9);
+
+        let mut w = waits.into_inner().unwrap();
+        w.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let q = |pc: usize| w[(w.len() * pc / 100).min(w.len().saturating_sub(1))];
+
+        eprintln!(
+            "[bench] {n} calls ({calls} blocks) in {elapsed:.1}s: {:.1} calls/s, {:.2e} pairs/s",
+            n as f64 / elapsed,
+            pairs as f64 / elapsed,
+        );
+        eprintln!(
+            "[bench] prep={:.1}s queue={:.1}s exec={:.1}s | prep={:.0}% queue={:.0}% exec={:.0}% \
+             | depth mean={:.1} max={depth_max}",
+            us(prep_us),
+            us(queue_us),
+            us(exec_us),
+            100.0 * us(prep_us) / total,
+            100.0 * us(queue_us) / total,
+            100.0 * us(exec_us) / total,
+            depth_sum as f64 / calls.max(1) as f64,
+        );
+        eprintln!(
+            "[bench] per-call wall: p50={:.3}s p90={:.3}s p99={:.3}s max={:.3}s (ratio \
+             max/p50={:.0}x)",
+            q(50),
+            q(90),
+            q(99),
+            w[w.len() - 1],
+            w[w.len() - 1] / q(50).max(1e-9),
+        );
+        eprintln!(
+            "[bench] gpu-thread duty cycle: {:.0}% ({:.1}s exec of {elapsed:.1}s wall)",
+            100.0 * us(exec_us) / elapsed,
+            us(exec_us),
+        );
+
+        assert!(!gpu_disabled(), "GPU context died during the bench");
+        assert!(n > 0, "no launches completed");
     }
 }
