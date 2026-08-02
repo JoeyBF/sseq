@@ -1132,16 +1132,17 @@ fn multiply_pair(
     out_offset: usize,
     width: usize,
     num_limbs: usize,
+    #[comptime] work_cap: usize,
 ) {
     let mut low = cs_len;
     if term_len < cs_len {
         low = term_len;
     }
 
-    let mut working = Array::<u32>::new(WORKING_CAP);
+    let mut working = Array::<u32>::new(work_cap);
     let mut rejected = false;
 
-    for j in 0..WORKING_CAP {
+    for j in 0..work_cap {
         let mut b = 0u32;
         if j < term_len {
             b = u32::cast_from(term_pparts[b_base + j]);
@@ -1183,7 +1184,7 @@ fn multiply_pair(
         // `seqno` indexes the algebra basis of the output degree; `out_offset` shifts it
         // to this product's target-generator block within the row (0 for a single-block
         // output). Both are bit offsets, added before splitting into (limb, bit).
-        let idx = seqno_core(g, xi, working.as_slice(), WORKING_CAP, width);
+        let idx = seqno_core(g, xi, working.as_slice(), work_cap, width);
         let global_bit = out_offset + usize::cast_from(idx);
         let limb = global_bit / 32;
         // Device-side mirror of the host's defensive mask: `nassau_gpu::get_partial_matrix_restricted`
@@ -1327,6 +1328,20 @@ fn multiply_batch_kernel(
     // Comptime is right here: at most `MASTER_MAX_SEG` distinct values, so the select chain folds
     // to the segments that exist without a recompile storm.
     #[comptime] num_segs: usize,
+    // Per-thread working-array size, specialised per launch to what THIS block actually needs
+    // (`max(mk_len, term_len)`, rounded up), not the global worst case.
+    //
+    // This is the kernel's dominant cost. Every thread holds four arrays of this length
+    // (`working` u32 plus `cs_local`/`mk_local`/`term_local` u16), so the constant sets register
+    // pressure and hence occupancy: measured 36% compute warps in flight with 64% of warp slots
+    // unallocated at the old fixed 32. Shrinking it to what the data needs measured +28%
+    // (5.97 -> 7.64 e9 pairs/s).
+    //
+    // It must NOT be hardcoded. `mk_len = rows + cols - 1` grows with internal degree: 16 suffices
+    // to t~510, but a 9th xi appears at t>=511 and it becomes 17, then 18 past 1023. A fixed 16
+    // would silently truncate at stem 300 — wrong answers, no error. Deriving it per launch keeps
+    // the occupancy win at every degree, and the host asserts it fits [`WORKING_CAP`].
+    #[comptime] work_cap: usize,
 ) {
     let k = ABSOLUTE_POS;
     let num_products = prod_pair_start.len() - 1;
@@ -1384,10 +1399,10 @@ fn multiply_batch_kernel(
     // the pure arithmetic core on them (base 0). Entries past each length are zero, matching
     // `multiply_pair`'s own out-of-range convention. The loop bounds at `WORKING_CAP`, exactly as the
     // core does, so any `mk_len > WORKING_CAP` tail (never read by the core) is likewise not gathered.
-    let mut cs_local = Array::<u16>::new(WORKING_CAP);
-    let mut mk_local = Array::<u16>::new(WORKING_CAP);
-    let mut term_local = Array::<u16>::new(WORKING_CAP);
-    for j in 0..WORKING_CAP {
+    let mut cs_local = Array::<u16>::new(work_cap);
+    let mut mk_local = Array::<u16>::new(work_cap);
+    let mut term_local = Array::<u16>::new(work_cap);
+    for j in 0..work_cap {
         let mut c = 0u16;
         if j < cs_len {
             c = seg_read_u16(
@@ -1482,6 +1497,7 @@ fn multiply_batch_kernel(
         usize::cast_from(prod_out_offset[p]),
         width,
         num_limbs,
+        work_cap,
     );
 }
 
@@ -2394,6 +2410,24 @@ fn multiply_batch_block(
                 .max(need_basis_elems * width)
                 .div_ceil(seg_elems)
                 .max(1);
+            // Per-thread working size this block actually needs. `mk_len` bounds the assembled
+            // p-part, and a term's own p-part is at most `MAX_XI_TAU` long. Rounded to a multiple
+            // of 4 so the number of distinct comptime values (hence NVRTC recompiles) stays small
+            // while still tracking the degree — a hardcoded 16 would be right to t~510 and
+            // silently truncate past stem ~300.
+            let work_cap = (r_mk_len
+                .iter()
+                .copied()
+                .max()
+                .unwrap_or(0)
+                .max(MAX_XI_TAU as u32) as usize)
+                .div_ceil(4)
+                * 4;
+            assert!(
+                work_cap <= WORKING_CAP,
+                "block needs a working array of {work_cap} > WORKING_CAP {WORKING_CAP}; raise the \
+                 cap (it also bounds the host-side `xi` padding)"
+            );
             // Bind one `BufferArg` per `(segment vector, index)` — the `.0` handle, `.1` element length.
             macro_rules! sa {
                 ($v:expr, $i:expr) => {
@@ -2490,6 +2524,7 @@ fn multiply_batch_block(
                     num_limbs,
                     search_iters,
                     num_segs,
+                    work_cap,
                 );
             }
 
@@ -3069,6 +3104,7 @@ mod tests {
             0,
             width,
             num_limbs,
+            WORKING_CAP,
         );
     }
 
