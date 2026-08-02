@@ -754,7 +754,6 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
             && reuse_within_cap(target_dim, next_dim)
         {
             let all_rows: Vec<usize> = (0..target_dim).collect();
-            let _guard = ParallelGuard::new();
             Some(restricted_partial_matrix_maybe_gpu(
                 &self.differentials[b.s() - 1],
                 b.t(),
@@ -770,15 +769,12 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                 debug_assert!(target_mask.iter().all(|&r| r < full.rows()));
                 select_rows(full, &target_mask)
             }
-            None => {
-                let _guard = ParallelGuard::new();
-                restricted_partial_matrix_maybe_gpu(
-                    &self.differentials[b.s() - 1],
-                    b.t(),
-                    &target_mask,
-                    next_dim,
-                )
-            }
+            None => restricted_partial_matrix_maybe_gpu(
+                &self.differentials[b.s() - 1],
+                b.t(),
+                &target_mask,
+                next_dim,
+            ),
         };
         let mut masked_matrix =
             AugmentedMatrix::new(p, target_masked_dim, [next_masked_dim, target_masked_dim]);
@@ -897,15 +893,12 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                     debug_assert!(target_mask.iter().all(|&r| r < full.rows()));
                     select_rows(full, &target_mask)
                 }
-                None => {
-                    let _guard = ParallelGuard::new();
-                    restricted_partial_matrix_maybe_gpu(
-                        &self.differentials[b.s() - 1],
-                        b.t(),
-                        &target_mask,
-                        next_dim,
-                    )
-                }
+                None => restricted_partial_matrix_maybe_gpu(
+                    &self.differentials[b.s() - 1],
+                    b.t(),
+                    &target_mask,
+                    next_dim,
+                ),
             };
 
             let mut masked_matrix =
@@ -1007,10 +1000,7 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                 source_dim + target_dim,
                 0,
             );
-            {
-                let _guard = ParallelGuard::new();
-                chain_map.get_matrix(matrix.segment(0, 0), t);
-            }
+            chain_map.get_matrix(matrix.segment(0, 0), t);
             matrix.segment(1, 1).add_identity();
 
             matrix.row_reduce();
@@ -1048,10 +1038,7 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
 
         let mut matrix =
             AugmentedMatrix::<2>::new(p, target_dim, [cc_module.dimension(t), target_dim]);
-        {
-            let _guard = ParallelGuard::new();
-            self.chain_maps[0].get_matrix(matrix.segment(0, 0), t);
-        }
+        self.chain_maps[0].get_matrix(matrix.segment(0, 0), t);
         matrix.segment(1, 1).add_identity();
         matrix.row_reduce();
         let desired_image = matrix.compute_kernel();
@@ -1063,10 +1050,7 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
             source_dim + MAX_NEW_GENS,
             0,
         );
-        {
-            let _guard = ParallelGuard::new();
-            self.differentials[1].get_matrix(matrix.segment(0, 0), t);
-        }
+        self.differentials[1].get_matrix(matrix.segment(0, 0), t);
         matrix.segment(1, 1).add_identity();
         matrix.row_reduce();
 
@@ -1798,6 +1782,10 @@ impl<'a, M: ZeroModule<Algebra = MilnorAlgebra>> RecomputeReader<'a, M> {
             .collect();
 
         let full_matrix = {
+            // Kept while the per-section guards elsewhere were removed: this path is NOT under the
+            // whole-bidegree guard in `step_resolution`. `commands_for_signature` runs from
+            // `RecomputeReader::next`, driven by `apply_quasi_inverse_fallible` — an accessor that
+            // consumers call outside any bidegree, so nothing upstream has raised the depth.
             let _guard = ParallelGuard::new();
             restricted_partial_matrix(&self.res.differentials[s], t, &src_mask, self.next_dim)
         };

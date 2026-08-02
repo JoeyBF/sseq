@@ -52,8 +52,8 @@ pub fn get_partial_matrix(hom: &NassauDifferential, degree: i32, inputs: &[usize
         // Idempotent + cheap (O(degree · width)); returns immediately once built.
         algebra.compute_seqno_tables(degree);
         let num_cols = target.dimension(degree);
-        let rows = multiply_batch_on_gpu(&algebra, num_cols, inputs.len(), &products);
-        for (row, limbs) in rows.iter().enumerate() {
+        let out = multiply_batch_on_gpu(&algebra, num_cols, inputs.len(), &products);
+        for (row, limbs) in out.iter_rows().enumerate() {
             let mut target_row = matrix.row_mut(row);
             for (limb_idx, &limb) in limbs.iter().enumerate() {
                 let mut bits = limb;
@@ -217,8 +217,8 @@ pub fn get_partial_matrix_restricted(
                 for pr in &mut products[p0..p1] {
                     pr.row -= r0; // batch-local row index for the kernel's output layout
                 }
-                let rows = multiply_batch_on_gpu(&algebra, full_cols, r1 - r0, &products[p0..p1]);
-                for (bi, limbs) in rows.iter().enumerate() {
+                let out = multiply_batch_on_gpu(&algebra, full_cols, r1 - r0, &products[p0..p1]);
+                for (bi, limbs) in out.iter_rows().enumerate() {
                     let mut target_row = matrix.row_mut(r0 + bi);
                     for (limb_idx, &limb) in limbs.iter().enumerate() {
                         let mut bits = limb;

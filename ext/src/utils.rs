@@ -663,39 +663,27 @@ pub(crate) mod parallel {
     }
 
     /// RAII guard that increments this thread's [`PARALLEL_DEPTH`] on creation and decrements it on
-    /// drop. Used to mark regions where `par_iter_mut` work is active, so that a `step_resolution`
-    /// job stolen onto a blocked guard holder can detect the priority inversion and retry.
+    /// drop. Used to mark regions where a stolen `step_resolution` job would cause a priority
+    /// inversion, so it can be bounced back instead (see `nassau::step_resolution`).
+    ///
+    /// Carries no tracing span: one is taken per bidegree (and per recompute), not per inner
+    /// parallel section, so the span added log volume proportional to the signature count — over a
+    /// thousand span pairs per bidegree — for no diagnostic value the enclosing `step` span does
+    /// not already provide.
     pub(crate) struct ParallelGuard {
-        #[allow(dead_code)]
-        span: tracing::span::EnteredSpan,
+        _private: (),
     }
 
     impl ParallelGuard {
         pub(crate) fn new() -> Self {
-            let counter_start = PARALLEL_DEPTH.with(|d| {
-                let v = d.get();
-                d.set(v + 1);
-                v
-            });
-            Self {
-                span: tracing::info_span!(
-                    "parallel_guard",
-                    counter_start,
-                    counter_end = tracing::field::Empty
-                )
-                .entered(),
-            }
+            PARALLEL_DEPTH.with(|d| d.set(d.get() + 1));
+            Self { _private: () }
         }
     }
 
     impl Drop for ParallelGuard {
         fn drop(&mut self) {
-            let counter_end = PARALLEL_DEPTH.with(|d| {
-                let v = d.get() - 1;
-                d.set(v);
-                v
-            });
-            self.span.record("counter_end", counter_end);
+            PARALLEL_DEPTH.with(|d| d.set(d.get() - 1));
         }
     }
 

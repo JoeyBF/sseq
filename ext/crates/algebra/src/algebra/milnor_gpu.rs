@@ -23,6 +23,7 @@ use cubecl::{
     cuda::{CudaDevice, CudaRuntime},
     prelude::*,
 };
+use cubecl_common::bytes::Bytes;
 
 // Bounds the per-thread enumeration state ([`ENUM_ROW_CAP`]) and the `#[cfg(test)]` `seqno_kernel`'s
 // working array; the multiply kernel uses `WORKING_CAP`.
@@ -1318,6 +1319,14 @@ fn multiply_batch_kernel(
     width: usize,
     seg_elems: usize,
     num_limbs: usize,
+    // Runtime scalar, deliberately NOT `#[comptime]`: it is `ceil(log2(num_products))`, which
+    // differs block to block, so specialising on it forces an NVRTC recompile per distinct value
+    // (measured: bench spread widened from 0.7% to 5.6%). The win here is executing ~15 iterations
+    // instead of a fixed 32, which needs no unrolling.
+    search_iters: usize,
+    // Comptime is right here: at most `MASTER_MAX_SEG` distinct values, so the select chain folds
+    // to the segments that exist without a recompile storm.
+    #[comptime] num_segs: usize,
 ) {
     let k = ABSOLUTE_POS;
     let num_products = prod_pair_start.len() - 1;
@@ -1326,11 +1335,16 @@ fn multiply_batch_kernel(
     }
 
     // Largest product `p` with `prod_pair_start[p] <= k` (every product owns ≥ 1 pair,
-    // so `prod_pair_start` is strictly increasing and `p` is unique). 32 iterations
-    // cover any realistic product count; once `hi = lo + 1` the update is idempotent.
+    // so `prod_pair_start` is strictly increasing and `p` is unique).
+    //
+    // `search_iters` is `ceil(log2(num_products))`, computed on the host and passed as a bare
+    // scalar, which cubecl bakes in as a compile-time constant — so the loop unrolls to exactly
+    // the steps the search needs. It was a fixed 32, and each step is a DEPENDENT global load of
+    // `prod_pair_start[mid]`, so the surplus iterations were a pure latency chain on every thread.
+    // At the measured p50 of ~24k products this is 15 steps rather than 32.
     let mut lo = 0usize;
     let mut hi = num_products;
-    for _ in 0..32 {
+    for _ in 0..search_iters {
         if hi - lo > 1 {
             let mid = (lo + hi) / 2;
             if usize::cast_from(prod_pair_start[mid]) <= k {
@@ -1363,7 +1377,7 @@ fn multiply_batch_kernel(
     let pp_off = gei * width;
     let term_len = usize::cast_from(seg_read_u32(
         ln0, ln1, ln2, ln3, ln4, ln5, ln6, ln7, ln8, ln9, ln10, ln11, ln12, ln13, ln14, ln15, gei,
-        seg_elems,
+        seg_elems, num_segs,
     ));
 
     // Gather this thread's matrix / term out of the segmented stores into contiguous locals, then run
@@ -1395,6 +1409,7 @@ fn multiply_batch_kernel(
                 cs15,
                 cs_off + j,
                 seg_elems,
+                num_segs,
             );
         }
         cs_local[j] = c;
@@ -1419,6 +1434,7 @@ fn multiply_batch_kernel(
                 mk15,
                 mk_off + j,
                 seg_elems,
+                num_segs,
             );
         }
         mk_local[j] = mm;
@@ -1443,6 +1459,7 @@ fn multiply_batch_kernel(
                 pp15,
                 pp_off + j,
                 seg_elems,
+                num_segs,
             );
         }
         term_local[j] = b;
@@ -1497,12 +1514,87 @@ pub struct GpuProduct {
 /// with each product's `out_offset` selecting its block. Every product's
 /// `out_offset + index` must be `< num_cols`. Every `R` must be non-empty; the algebra's
 /// basis and seqno tables must reach each product's output degree (`r_degree + s_degree`).
+/// One batch multiply's result, held as the D2H landing buffers themselves.
+///
+/// The device write has to land somewhere; everything after that is waste. The original form
+/// allocated a fresh `Vec` per row and copied the whole output into freshly-mapped pages right
+/// after the device had written it — ~32 M allocations over a stem-200 resolution. The measured
+/// best-case launch cost scaled linearly with output bytes at only 2.1-5.0 GB/s (256 MiB in
+/// 130 ms), far under PCIe 5.0 x16, with the GPU idle throughout.
+///
+/// So this keeps cubecl's [`Bytes`] (which may already be pinned — see `AllocationProperty`) and
+/// hands out row slices as views. One block per bounded launch, in row order; the owned
+/// constructor covers the eviction merge and the CPU oracle, which must accumulate.
+pub struct BatchOutput {
+    /// One landing buffer per row-block, in row order.
+    blocks: Vec<Bytes>,
+    num_limbs: usize,
+}
+
+impl BatchOutput {
+    /// Wrap the per-block landing buffers (zero copy).
+    fn from_blocks(blocks: Vec<Bytes>, num_limbs: usize) -> Self {
+        Self { blocks, num_limbs }
+    }
+
+    /// Wrap owned row-major limbs (eviction merge, CPU oracle).
+    pub fn from_limbs(limbs: Vec<u32>, num_limbs: usize) -> Self {
+        Self {
+            blocks: vec![Bytes::from_elems(limbs)],
+            num_limbs,
+        }
+    }
+
+    /// Build from per-row limb vectors (test/reference helper).
+    pub fn from_rows(rows: &[Vec<u32>], num_limbs: usize) -> Self {
+        Self::from_limbs(rows.concat(), num_limbs)
+    }
+
+    /// Limbs per row.
+    pub fn num_limbs(&self) -> usize {
+        self.num_limbs
+    }
+
+    /// Number of rows across all blocks.
+    pub fn rows(&self) -> usize {
+        if self.num_limbs == 0 {
+            return 0;
+        }
+        self.blocks.iter().map(|b| b.len() / 4).sum::<usize>() / self.num_limbs
+    }
+
+    /// Row limb-slices in row order, as views into the landing buffers.
+    pub fn iter_rows(&self) -> impl Iterator<Item = &[u32]> {
+        let n = self.num_limbs;
+        self.blocks
+            .iter()
+            .flat_map(move |b| u32::from_bytes(b).chunks_exact(n))
+    }
+}
+
+impl PartialEq for BatchOutput {
+    fn eq(&self, other: &Self) -> bool {
+        self.num_limbs == other.num_limbs && self.iter_rows().eq(other.iter_rows())
+    }
+}
+
+impl Eq for BatchOutput {}
+
+impl std::fmt::Debug for BatchOutput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BatchOutput")
+            .field("rows", &self.rows())
+            .field("num_limbs", &self.num_limbs)
+            .finish()
+    }
+}
+
 pub fn multiply_batch_on_gpu(
     algebra: &MilnorAlgebra,
     num_cols: usize,
     num_rows: usize,
     products: &[GpuProduct],
-) -> Vec<Vec<u32>> {
+) -> BatchOutput {
     // The CPU fallback that used to live here (catch the launch failure, latch [`GPU_DISABLED`],
     // finish the run on the CPU) was removed deliberately: it turned a hard GPU fault into a silent
     // ~100x slowdown, so a crashing run still reported "completed" and every A/B measurement had to
@@ -1512,7 +1604,7 @@ pub fn multiply_batch_on_gpu(
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         multiply_batch_gpu_inner(algebra, num_cols, num_rows, products)
     })) {
-        Ok(rows) => rows,
+        Ok(out) => out,
         Err(payload) => {
             // compare_exchange so exactly one thread (of the ~100 that may fail together on the
             // shared poisoned context) prints the notice; the rest just resume unwinding.
@@ -1540,11 +1632,12 @@ pub fn cpu_multiply_batch(
     num_cols: usize,
     num_rows: usize,
     products: &[GpuProduct],
-) -> Vec<Vec<u32>> {
+) -> BatchOutput {
     use fp::vector::FpVector;
     let p = algebra.prime();
     let num_limbs = num_cols.div_ceil(32).max(1);
     let mut rows = vec![vec![0u32; num_limbs]; num_rows];
+    // (built per row, then flattened to the shared BatchOutput layout below)
     for prod in products {
         let out_degree = prod.r_degree + prod.s_degree;
         let block_dim = algebra.dimension(out_degree);
@@ -1570,7 +1663,7 @@ pub fn cpu_multiply_batch(
             rows[prod.row][col / 32] ^= 1u32 << (col % 32);
         }
     }
-    rows
+    BatchOutput::from_limbs(rows.concat(), num_limbs)
 }
 
 fn multiply_batch_gpu_inner(
@@ -1578,12 +1671,16 @@ fn multiply_batch_gpu_inner(
     num_cols: usize,
     num_rows: usize,
     products: &[GpuProduct],
-) -> Vec<Vec<u32>> {
+) -> BatchOutput {
     let cap = resident_degree_cap();
     // Fast path (default, `cap == i32::MAX`, and any run whose `R`s are all under the cap): a single
     // resident-master pass, byte-identical to the pre-eviction code. No cloning, no second launch.
+    let num_limbs_all = num_cols.div_ceil(32).max(1);
     if cap == i32::MAX || products.iter().all(|p| p.r_degree <= cap) {
-        return multiply_batch_grouped(algebra, num_cols, num_rows, products, MasterMode::Resident);
+        return BatchOutput::from_blocks(
+            multiply_batch_grouped(algebra, num_cols, num_rows, products, MasterMode::Resident),
+            num_limbs_all,
+        );
     }
     // Eviction active. Each output row's products all share one `R` (see [`MasterMode`]), so the
     // hot (degree ≤ cap) and cold row sets are DISJOINT. Run each group on its own rows only,
@@ -1593,7 +1690,7 @@ fn multiply_batch_gpu_inner(
     // scatter back to the original row indices; a row in neither group stays zero (its content, if
     // any, comes from the caller's CPU identity path).
     let num_limbs = num_cols.div_ceil(32).max(1);
-    let mut result = vec![vec![0u32; num_limbs]; num_rows];
+    let mut result = vec![0u32; num_rows * num_limbs];
     for mode in [MasterMode::Resident, MasterMode::Transient] {
         let is_group = |d: i32| match mode {
             MasterMode::Resident => d <= cap,
@@ -1619,14 +1716,19 @@ fn multiply_batch_gpu_inner(
                 q
             })
             .collect();
-        let sub = multiply_batch_grouped(algebra, num_cols, rows.len(), &compact, mode);
+        let sub_blocks = multiply_batch_grouped(algebra, num_cols, rows.len(), &compact, mode);
+        let sub: Vec<u32> = sub_blocks
+            .iter()
+            .flat_map(|b| u32::from_bytes(b).iter().copied())
+            .collect();
         for (i, &orig) in rows.iter().enumerate() {
-            for (a, b) in result[orig].iter_mut().zip(&sub[i]) {
-                *a ^= *b;
+            let (dst, src) = (orig * num_limbs, i * num_limbs);
+            for k in 0..num_limbs {
+                result[dst + k] ^= sub[src + k];
             }
         }
     }
-    result
+    BatchOutput::from_limbs(result, num_limbs)
 }
 
 fn multiply_batch_grouped(
@@ -1635,7 +1737,7 @@ fn multiply_batch_grouped(
     num_rows: usize,
     products: &[GpuProduct],
     mode: MasterMode,
-) -> Vec<Vec<u32>> {
+) -> Vec<Bytes> {
     let num_limbs = num_cols.div_ceil(32).max(1);
     let max_block_rows = (gpu_block_bytes() / (num_limbs * 4)).max(1);
     // Products arrive row-major (the extract loops emit them per input row, in order; the hot/cold
@@ -1678,7 +1780,7 @@ fn multiply_batch_grouped(
         RESIDENT_MISSES.load(std::sync::atomic::Ordering::Relaxed) - misses_before,
     );
     drop(prepass);
-    let mut result: Vec<Vec<u32>> = Vec::with_capacity(num_rows);
+    let mut result: Vec<Bytes> = Vec::new();
     let (mut r0, mut p0) = (0, 0);
     while r0 < num_rows {
         // Grow the block row by row until the next row would break either budget — output bytes
@@ -1696,7 +1798,7 @@ fn multiply_batch_grouped(
             pairs += row_pairs;
             (r1, p1) = (r1 + 1, q);
         }
-        result.extend(multiply_batch_block(
+        result.push(multiply_batch_block(
             algebra,
             num_cols,
             r0,
@@ -1721,7 +1823,7 @@ fn multiply_batch_block(
     num_rows: usize,
     products: &[GpuProduct],
     mode: MasterMode,
-) -> Vec<Vec<u32>> {
+) -> Bytes {
     let (width, g) = algebra.seqno_table_u32();
     let mut xi: Vec<u32> = xi_degrees(algebra.prime())
         .iter()
@@ -2033,7 +2135,7 @@ fn multiply_batch_block(
         );
     }
     if total_pairs == 0 {
-        return vec![vec![0u32; num_limbs]; num_rows];
+        return Bytes::from_elems(vec![0u32; num_rows * num_limbs]);
     }
 
     // The resident `col_sums`/`masks` and basis are non-empty once any `R`/term is present
@@ -2047,6 +2149,8 @@ fn multiply_batch_block(
         term_lens.push(0);
     }
 
+    let term_gei_len = term_gei.len();
+    let pps_len = pps.len();
     let marshal_ms = t_marshal.elapsed().as_secs_f64() * 1e3;
 
     let t_device = std::time::Instant::now();
@@ -2237,7 +2341,13 @@ fn multiply_batch_block(
             // Upload the block's data — term data, seqno/xi tables, per-`R` offsets, per-product
             // records, the pair prefix sum, and the (zeroed) output buffer — and launch once: the
             // caller has already bounded this block's pair count and output size.
-            let tg_h = client.create_from_slice(u32::as_bytes(&term_gei));
+            // Hand the marshalled buffers over (`create`) rather than have cubecl copy out of a
+            // borrowed slice (`create_from_slice`): the marshal already built exactly the bytes the
+            // upload wants, so the extra staging copy is pure waste. Mirrors what [`BatchOutput`]
+            // does on the way back. NOT using `client.staging()` to pin these: it consumes the
+            // `Bytes` by value (so a buffer cannot be pinned once and reused across launches) and
+            // its own docs note it blocks the compute queue.
+            let tg_h = client.create(Bytes::from_elems(term_gei));
             // `g`/`xi` are identical every launch at this degree: fetch the shared resident copies
             // (uploaded once, re-uploaded only on a degree bump) instead of re-uploading them here.
             let (g_h, xi_h) = resident_seqno!(client, g, xi);
@@ -2266,13 +2376,24 @@ fn multiply_batch_block(
                 );
             }
 
-            let pri_h = client.create_from_slice(u32::as_bytes(&prod_r_index));
-            let pts_h = client.create_from_slice(u32::as_bytes(&prod_term_start));
-            let pnt_h = client.create_from_slice(u32::as_bytes(&prod_num_terms));
-            let prb_h = client.create_from_slice(u32::as_bytes(&prod_row_base));
-            let poo_h = client.create_from_slice(u32::as_bytes(&prod_out_offset));
-            let pps_h = client.create_from_slice(u32::as_bytes(&pps));
+            let pri_h = client.create(Bytes::from_elems(prod_r_index));
+            let pts_h = client.create(Bytes::from_elems(prod_term_start));
+            let pnt_h = client.create(Bytes::from_elems(prod_num_terms));
+            let prb_h = client.create(Bytes::from_elems(prod_row_base));
+            let poo_h = client.create(Bytes::from_elems(prod_out_offset));
+            let pps_h = client.create(Bytes::from_elems(pps));
             let cubes = (total_pairs as u32).div_ceil(THREADS).max(1);
+            // Exactly the binary-search depth this block needs (see the kernel): passed bare so cubecl
+            // specialises the trip count instead of always running 32 dependent loads.
+            let search_iters = usize::BITS as usize - num_products.max(1).leading_zeros() as usize;
+            // Segments actually populated across the four segmented stores; the rest are the
+            // never-indexed 1-element dummies. Passed bare so the kernel's select chain specialises to
+            // this many arms instead of all `MASTER_MAX_SEG`.
+            let num_segs = need_cs
+                .max(need_mk)
+                .max(need_basis_elems * width)
+                .div_ceil(seg_elems)
+                .max(1);
             // Bind one `BufferArg` per `(segment vector, index)` — the `.0` handle, `.1` element length.
             macro_rules! sa {
                 ($v:expr, $i:expr) => {
@@ -2350,7 +2471,7 @@ fn multiply_batch_block(
                     sa!(ln_seg, 13),
                     sa!(ln_seg, 14),
                     sa!(ln_seg, 15),
-                    BufferArg::from_raw_parts(tg_h, term_gei.len()),
+                    BufferArg::from_raw_parts(tg_h, term_gei_len),
                     BufferArg::from_raw_parts(g_h, g.len()),
                     BufferArg::from_raw_parts(xi_h, xi.len()),
                     BufferArg::from_raw_parts(out_h.clone(), out_len),
@@ -2363,18 +2484,17 @@ fn multiply_batch_block(
                     BufferArg::from_raw_parts(pnt_h, num_products),
                     BufferArg::from_raw_parts(prb_h, num_products),
                     BufferArg::from_raw_parts(poo_h, num_products),
-                    BufferArg::from_raw_parts(pps_h, pps.len()),
+                    BufferArg::from_raw_parts(pps_h, pps_len),
                     width,
                     seg_elems,
                     num_limbs,
+                    search_iters,
+                    num_segs,
                 );
             }
 
-            let bytes = client.read_one(out_h).unwrap();
-            let flat = u32::from_bytes(&bytes);
-            let result: Vec<Vec<u32>> = (0..num_rows)
-                .map(|r| flat[r * num_limbs..(r + 1) * num_limbs].to_vec())
-                .collect();
+            // Hand back the landing buffer itself — no copy, no allocation (see [`BatchOutput`]).
+            let result = client.read_one(out_h).unwrap();
 
             // Trim this stream's transient pool. Historically this per-launch cleanup RENUMBERED the
             // exclusive pool's page indices (`update_page`), which under ~100-way concurrency corrupted
@@ -2511,42 +2631,54 @@ fn seg_read_u16(
     s15: &[u16],
     o: usize,
     seg_elems: usize,
+    #[comptime] num_segs: usize,
 ) -> u16 {
-    let seg = o / seg_elems;
-    let local = o % seg_elems;
+    // `num_segs` is passed bare, so cubecl bakes it in as a compile-time constant and every
+    // `num_segs > k` below folds away — the chain specialises to the segments that actually exist
+    // instead of always testing all [`MASTER_MAX_SEG`] of them. This is the hot path: the gather
+    // loop calls a `seg_read` 3 x WORKING_CAP = 96 times per thread, so a 16-way compare/select
+    // chain per call dominated the instruction stream. Measured on an H200 with the kernel
+    // resident: SM Active 100%, SM Issue 68%, DRAM read 1.1% of peak — pure instruction cost, not
+    // bandwidth. The single-segment case skips the division too.
     let mut v = 0u16;
-    if seg == 0 {
-        v = s0[local];
-    } else if seg == 1 {
-        v = s1[local];
-    } else if seg == 2 {
-        v = s2[local];
-    } else if seg == 3 {
-        v = s3[local];
-    } else if seg == 4 {
-        v = s4[local];
-    } else if seg == 5 {
-        v = s5[local];
-    } else if seg == 6 {
-        v = s6[local];
-    } else if seg == 7 {
-        v = s7[local];
-    } else if seg == 8 {
-        v = s8[local];
-    } else if seg == 9 {
-        v = s9[local];
-    } else if seg == 10 {
-        v = s10[local];
-    } else if seg == 11 {
-        v = s11[local];
-    } else if seg == 12 {
-        v = s12[local];
-    } else if seg == 13 {
-        v = s13[local];
-    } else if seg == 14 {
-        v = s14[local];
+    if num_segs == 1 {
+        v = s0[o];
     } else {
-        v = s15[local];
+        let seg = o / seg_elems;
+        let local = o % seg_elems;
+        if seg == 0 {
+            v = s0[local];
+        } else if num_segs > 1 && seg == 1 {
+            v = s1[local];
+        } else if num_segs > 2 && seg == 2 {
+            v = s2[local];
+        } else if num_segs > 3 && seg == 3 {
+            v = s3[local];
+        } else if num_segs > 4 && seg == 4 {
+            v = s4[local];
+        } else if num_segs > 5 && seg == 5 {
+            v = s5[local];
+        } else if num_segs > 6 && seg == 6 {
+            v = s6[local];
+        } else if num_segs > 7 && seg == 7 {
+            v = s7[local];
+        } else if num_segs > 8 && seg == 8 {
+            v = s8[local];
+        } else if num_segs > 9 && seg == 9 {
+            v = s9[local];
+        } else if num_segs > 10 && seg == 10 {
+            v = s10[local];
+        } else if num_segs > 11 && seg == 11 {
+            v = s11[local];
+        } else if num_segs > 12 && seg == 12 {
+            v = s12[local];
+        } else if num_segs > 13 && seg == 13 {
+            v = s13[local];
+        } else if num_segs > 14 && seg == 14 {
+            v = s14[local];
+        } else {
+            v = s15[local];
+        }
     }
     v
 }
@@ -2574,42 +2706,54 @@ fn seg_read_u32(
     s15: &[u32],
     o: usize,
     seg_elems: usize,
+    #[comptime] num_segs: usize,
 ) -> u32 {
-    let seg = o / seg_elems;
-    let local = o % seg_elems;
+    // `num_segs` is passed bare, so cubecl bakes it in as a compile-time constant and every
+    // `num_segs > k` below folds away — the chain specialises to the segments that actually exist
+    // instead of always testing all [`MASTER_MAX_SEG`] of them. This is the hot path: the gather
+    // loop calls a `seg_read` 3 x WORKING_CAP = 96 times per thread, so a 16-way compare/select
+    // chain per call dominated the instruction stream. Measured on an H200 with the kernel
+    // resident: SM Active 100%, SM Issue 68%, DRAM read 1.1% of peak — pure instruction cost, not
+    // bandwidth. The single-segment case skips the division too.
     let mut v = 0u32;
-    if seg == 0 {
-        v = s0[local];
-    } else if seg == 1 {
-        v = s1[local];
-    } else if seg == 2 {
-        v = s2[local];
-    } else if seg == 3 {
-        v = s3[local];
-    } else if seg == 4 {
-        v = s4[local];
-    } else if seg == 5 {
-        v = s5[local];
-    } else if seg == 6 {
-        v = s6[local];
-    } else if seg == 7 {
-        v = s7[local];
-    } else if seg == 8 {
-        v = s8[local];
-    } else if seg == 9 {
-        v = s9[local];
-    } else if seg == 10 {
-        v = s10[local];
-    } else if seg == 11 {
-        v = s11[local];
-    } else if seg == 12 {
-        v = s12[local];
-    } else if seg == 13 {
-        v = s13[local];
-    } else if seg == 14 {
-        v = s14[local];
+    if num_segs == 1 {
+        v = s0[o];
     } else {
-        v = s15[local];
+        let seg = o / seg_elems;
+        let local = o % seg_elems;
+        if seg == 0 {
+            v = s0[local];
+        } else if num_segs > 1 && seg == 1 {
+            v = s1[local];
+        } else if num_segs > 2 && seg == 2 {
+            v = s2[local];
+        } else if num_segs > 3 && seg == 3 {
+            v = s3[local];
+        } else if num_segs > 4 && seg == 4 {
+            v = s4[local];
+        } else if num_segs > 5 && seg == 5 {
+            v = s5[local];
+        } else if num_segs > 6 && seg == 6 {
+            v = s6[local];
+        } else if num_segs > 7 && seg == 7 {
+            v = s7[local];
+        } else if num_segs > 8 && seg == 8 {
+            v = s8[local];
+        } else if num_segs > 9 && seg == 9 {
+            v = s9[local];
+        } else if num_segs > 10 && seg == 10 {
+            v = s10[local];
+        } else if num_segs > 11 && seg == 11 {
+            v = s11[local];
+        } else if num_segs > 12 && seg == 12 {
+            v = s12[local];
+        } else if num_segs > 13 && seg == 13 {
+            v = s13[local];
+        } else if num_segs > 14 && seg == 14 {
+            v = s14[local];
+        } else {
+            v = s15[local];
+        }
     }
     v
 }
@@ -3048,6 +3192,7 @@ mod tests {
         idx: &[u32],
         out: &mut [u16],
         seg_elems: usize,
+        #[comptime] num_segs: usize,
     ) {
         let i = ABSOLUTE_POS;
         if i >= out.len() {
@@ -3072,6 +3217,7 @@ mod tests {
             s15,
             usize::cast_from(idx[i]),
             seg_elems,
+            num_segs,
         );
     }
 
@@ -3332,6 +3478,7 @@ mod tests {
                 BufferArg::from_raw_parts(idx_h, indices.len()),
                 BufferArg::from_raw_parts(out_h.clone(), indices.len()),
                 seg_elems,
+                nseg,
             );
         }
         u16::from_bytes(&client.read_one(out_h).unwrap()).to_vec()
@@ -3826,6 +3973,7 @@ mod tests {
                 packed
             })
             .collect();
+        let golden = BatchOutput::from_rows(&golden, num_limbs);
 
         let got = multiply_batch_on_gpu(&algebra, out_dim, num_rows, &products);
         assert_eq!(
@@ -3978,6 +4126,7 @@ mod tests {
                     packed
                 })
                 .collect();
+            let golden = BatchOutput::from_rows(&golden, num_limbs);
             let got = multiply_batch_on_gpu(&algebra, out_dim, num_rows, &products);
             assert_eq!(
                 got, golden,
@@ -4095,7 +4244,7 @@ mod tests {
         struct Job {
             num_cols: usize,
             products: Vec<GpuProduct>,
-            golden: Option<Vec<Vec<u32>>>,
+            golden: Option<BatchOutput>,
         }
         let jobs: Arc<Vec<Job>> = Arc::new(
             (12..=max_degree)
@@ -4271,15 +4420,30 @@ mod tests {
             algebra.dimension(out_degree),
         );
 
-        // Same `get_partial_matrix`-shaped batch the soak builds, so this drives the identical
-        // kernel + resident-master path Nassau does.
+        // Same `get_partial_matrix`-shaped batch the soak builds, but with the product count
+        // BOUNDED.
+        //
+        // Taking every `(R, s)` pair the way the soak does is fine to degree ~160 and impossible
+        // above it: the batch holds `sum_r dim(r) * dim(out_degree - r)` term indices, which at the
+        // degree that yields stem-200-scale matrices is astronomically large — the first version of
+        // this bench died in setup there, never reaching a launch. Real batches are bounded too
+        // (measured p50 ~24k products, max ~479k), so sampling `R`s on a stride reproduces the
+        // regime while the exhaustive build merely runs out of memory.
+        let max_products = env_num("NASSAU_BENCH_PRODUCTS", 24_000) as usize;
+        // Terms per product. Real products carry the nonzeros of a sparse vector, not a whole
+        // basis: run I measured `products=478972 terms=2300621`, i.e. ~4.8 terms each. Using the
+        // full s-degree basis (as the low-degree soak does) makes every product hundreds of
+        // thousands of terms here, which blows past the kernel's u32 pair limit before it can run.
+        let terms_per_product = env_num("NASSAU_BENCH_TERMS", 5) as usize;
         let build_batch = |out_degree: i32| -> (usize, Vec<GpuProduct>) {
             let num_cols = algebra.dimension(out_degree);
-            let mut products = Vec::new();
+            // Count the candidate `R`s first so the stride spreads the sample over the whole
+            // degree range instead of truncating at low `r_degree` (which would bias every launch
+            // toward small, cheap operations).
+            let mut candidates: Vec<(i32, usize, i32)> = Vec::new();
             for r_degree in 1..out_degree {
                 let s_degree = out_degree - r_degree;
-                let s_dim = algebra.dimension(s_degree);
-                if s_dim == 0 {
+                if algebra.dimension(s_degree) == 0 {
                     continue;
                 }
                 for r_idx in 0..algebra.dimension(r_degree) {
@@ -4290,16 +4454,24 @@ mod tests {
                     {
                         continue;
                     }
-                    let row = products.len() % num_rows;
-                    products.push(GpuProduct {
-                        r_degree,
-                        r_idx,
-                        s_degree,
-                        term_indices: (0..s_dim).collect(),
-                        row,
-                        out_offset: 0,
-                    });
+                    candidates.push((r_degree, r_idx, s_degree));
                 }
+            }
+            let stride = candidates.len().div_ceil(max_products.max(1)).max(1);
+            let mut products = Vec::new();
+            for (r_degree, r_idx, s_degree) in candidates.into_iter().step_by(stride) {
+                let s_dim = algebra.dimension(s_degree);
+                let nt = terms_per_product.min(s_dim);
+                let t_stride = s_dim.div_ceil(nt.max(1)).max(1);
+                let row = products.len() % num_rows;
+                products.push(GpuProduct {
+                    r_degree,
+                    r_idx,
+                    s_degree,
+                    term_indices: (0..s_dim).step_by(t_stride).take(nt).collect(),
+                    row,
+                    out_offset: 0,
+                });
             }
             (num_cols, products)
         };
