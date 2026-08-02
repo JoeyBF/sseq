@@ -40,6 +40,9 @@ cubecl = { git = "https://github.com/tracel-ai/cubecl", tag = "v0.11.0-pre.1", o
 # reclaimed by `memory_cleanup` — CubeCL's pools are per-stream, and rayon spreads launches
 # across threads/streams, which otherwise accumulates buffers until the card OOMs.
 cubecl-common = { git = "https://github.com/tracel-ai/cubecl", tag = "v0.11.0-pre.1", optional = true }
+# Spans around the GPU submission (see `gpu_thread`), so a worker blocked waiting for the device
+# is visible in the log instead of silent — the stalls it diagnoses emitted nothing at all.
+tracing = { version = "0.1.41", optional = true }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
@@ -51,7 +54,7 @@ rstest = "0.25.0"
 default = ["odd-primes"]
 cache-multiplication = []
 concurrent = ["fp/concurrent", "maybe-rayon/concurrent"]
-gpu = ["dep:cubecl", "dep:cubecl-common"]
+gpu = ["dep:cubecl", "dep:cubecl-common", "dep:tracing"]
 odd-primes = ["fp/odd-primes"]
 
 [[bench]]
