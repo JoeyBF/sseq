@@ -213,10 +213,11 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 /// Set once the cubecl CUDA context has failed irrecoverably (a `CUDA_ERROR_LAUNCH_FAILED` /
 /// `ServerUnhealthy` surfacing the unresolved cubecl uninit-handle bug — see
 /// `~/cubecl-uninit-handle-followup.md`, tracel-ai/cubecl#1401). Such a failure **poisons the whole
-/// CUDA context**: every later launch on the shared client fails too, so there is no per-call retry —
-/// the only recovery is to abandon the GPU multiply and finish the resolution on the CPU.
-/// [`multiply_batch_on_gpu`] flips this on the first failure and routes all subsequent (and the
-/// current) batches through [`cpu_multiply_batch`]. NOTE: this covers only the cubecl **multiply**;
+/// CUDA context**: every later launch on the shared client fails too, so there is no per-call retry.
+/// [`multiply_batch_on_gpu`] latches this on the first failure and then *propagates the panic* — the
+/// run dies at the fault rather than silently finishing on the CPU, so a crash cannot masquerade as a
+/// slow success. The flag exists purely so in-process observers (the soak test) can distinguish a
+/// context death from an ordinary assertion failure. NOTE: this covers only the cubecl **multiply**;
 /// the RREF path runs on a separate `fp-cuda` runtime and is not gated by this flag.
 static GPU_DISABLED: AtomicBool = AtomicBool::new(false);
 
@@ -252,6 +253,14 @@ static BATCH_CALLS: AtomicU64 = AtomicU64::new(0);
 static BATCH_MARSHAL_US: AtomicU64 = AtomicU64::new(0);
 static BATCH_DEVICE_US: AtomicU64 = AtomicU64::new(0);
 static BATCH_PAIRS: AtomicU64 = AtomicU64::new(0);
+/// `BATCH_MARSHAL_US` split: host CPU work before any blocking, and time parked on the
+/// [`GpuPermit`] / [`fp::gpu_lock`] acquisition. Conflating them hid which one dominates.
+static BATCH_PREP_US: AtomicU64 = AtomicU64::new(0);
+static BATCH_WAIT_US: AtomicU64 = AtomicU64::new(0);
+/// `BATCH_WAIT_US` split again: the pre-existing [`GpuPermit`] (bounds in-flight output bytes)
+/// versus the cross-runtime [`fp::gpu_lock`] arbitration. They have different owners and fixes.
+static BATCH_PERMIT_US: AtomicU64 = AtomicU64::new(0);
+static BATCH_LOCK_US: AtomicU64 = AtomicU64::new(0);
 
 /// Read and reset the aggregate batch counters: `(calls, marshal_us, device_us, pairs)`.
 pub fn take_batch_stats() -> (u64, u64, u64, u64) {
@@ -472,7 +481,6 @@ macro_rules! resident_seqno {
         }
     }};
 }
-
 
 /// Host-side cache of cold (degree > [`resident_degree_cap`]) `R`s' admissible-matrix *shape* only —
 /// `(cs_len, mk_len, num_mats)`, twelve bytes per `R`. With [in-kernel enumeration](enumerate_admissible_kernel)
@@ -897,13 +905,7 @@ fn zero_u32(out: &mut [u32]) {
 // master/basis passes 2^32 elements, needing 64-bit `usize`; and cubecl's checked bounds clamp emits
 // `min(u64, u64)` (ambiguous for NVRTC) under u64. The `ABSOLUTE_POS < count` guard keeps it in-bounds.
 #[cube(launch_unchecked, address_type = "dynamic")]
-fn copy_into_u16(
-    src: &[u16],
-    dst: &mut [u16],
-    src_off: usize,
-    dst_off: usize,
-    count: u32,
-) {
+fn copy_into_u16(src: &[u16], dst: &mut [u16], src_off: usize, dst_off: usize, count: u32) {
     if ABSOLUTE_POS < usize::cast_from(count) {
         dst[dst_off + ABSOLUTE_POS] = src[src_off + ABSOLUTE_POS];
     }
@@ -911,13 +913,7 @@ fn copy_into_u16(
 
 /// `u32` sibling of [`copy_into_u16`] (for the resident basis `lens`).
 #[cube(launch_unchecked, address_type = "dynamic")]
-fn copy_into_u32(
-    src: &[u32],
-    dst: &mut [u32],
-    src_off: usize,
-    dst_off: usize,
-    count: u32,
-) {
+fn copy_into_u32(src: &[u32], dst: &mut [u32], src_off: usize, dst_off: usize, count: u32) {
     if ABSOLUTE_POS < usize::cast_from(count) {
         dst[dst_off + ABSOLUTE_POS] = src[src_off + ABSOLUTE_POS];
     }
@@ -974,13 +970,7 @@ macro_rules! copy_chunked {
 /// `usize` at the index sites. Shared by `seqno_kernel` and
 /// `multiply_single_r_kernel` so both index outputs identically.
 #[cube]
-fn seqno_core(
-    g: &[u32],
-    xi: &[u32],
-    working: &[u32],
-    wlen: usize,
-    width: usize,
-) -> u32 {
+fn seqno_core(g: &[u32], xi: &[u32], working: &[u32], wlen: usize, width: usize) -> u32 {
     // cur_d = Σ working[h] · xi[h].
     let mut cur_d = 0u32;
     for h in 0..wlen {
@@ -1411,34 +1401,30 @@ pub fn multiply_batch_on_gpu(
     num_rows: usize,
     products: &[GpuProduct],
 ) -> Vec<Vec<u32>> {
-    // STOPGAP (see [`GPU_DISABLED`]): once the cubecl CUDA context has been poisoned by the
-    // unresolved uninit-handle bug, every launch fails, so we finish the run on the CPU. On the
-    // first failure we catch the panic (it surfaces as an `.unwrap()` on a `CUDA_ERROR_LAUNCH_FAILED`
-    // / `ServerUnhealthy` in [`multiply_batch_gpu_inner`]), flip the flag, and fall back. All later
-    // calls short-circuit straight to the CPU path. The CPU result is bit-identical to the GPU's
-    // (validated by `cpu_multiply_batch_matches_gpu`), so callers see no difference but speed.
-    if gpu_disabled() {
-        return cpu_multiply_batch(algebra, num_cols, num_rows, products);
-    }
+    // The CPU fallback that used to live here (catch the launch failure, latch [`GPU_DISABLED`],
+    // finish the run on the CPU) was removed deliberately: it turned a hard GPU fault into a silent
+    // ~100x slowdown, so a crashing run still reported "completed" and every A/B measurement had to
+    // be reconstructed by grepping stderr. A context death is now loud — the panic propagates and
+    // the run dies at the fault. [`GPU_DISABLED`] is still latched first so in-process observers
+    // (the soak test) can tell a context death from an ordinary assertion failure.
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         multiply_batch_gpu_inner(algebra, num_cols, num_rows, products)
     })) {
         Ok(rows) => rows,
-        Err(_) => {
+        Err(payload) => {
             // compare_exchange so exactly one thread (of the ~100 that may fail together on the
-            // shared poisoned context) prints the notice; the rest just fall through to the CPU.
+            // shared poisoned context) prints the notice; the rest just resume unwinding.
             if GPU_DISABLED
                 .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
                 .is_ok()
             {
                 eprintln!(
-                    "[nassau-gpu] GPU milnor multiply failed (CUDA context poisoned by the \
-                     unresolved cubecl uninit-handle bug); disabling the GPU multiply and \
-                     completing the resolution on the CPU. RREF (separate fp-cuda runtime) is \
+                    "[nassau-gpu] GPU milnor multiply failed (CUDA context poisoned); failing the \
+                     run instead of falling back to the CPU. RREF (separate fp-cuda runtime) is \
                      unaffected by this flag."
                 );
             }
-            cpu_multiply_batch(algebra, num_cols, num_rows, products)
+            std::panic::resume_unwind(payload)
         }
     }
 }
@@ -1744,7 +1730,26 @@ fn multiply_batch_block(
     // time (priority inversion at worst, never deadlock).
     // Held for the device section (RAII): bounds total in-flight output bytes across workers. The
     // stream is now chosen per-thread (see [`thread_stream_id`]), not from the permit.
+    // Split the "marshal" figure at the point where this thread stops doing CPU work and starts
+    // waiting. `t_marshal` spans both, so the 80/20 marshal-vs-device headline it produced cannot
+    // distinguish host marshalling from time parked on our own permit / arbitration lock — and the
+    // two call for opposite fixes.
+    let prep_ms = t_marshal.elapsed().as_secs_f64() * 1e3;
+    let t_wait = std::time::Instant::now();
     let _permit = GpuPermit::acquire(num_rows * num_limbs * 4);
+    let permit_ms = t_wait.elapsed().as_secs_f64() * 1e3;
+    let t_lock = std::time::Instant::now();
+    // Shared side of the cross-runtime GPU arbitration, taken here for the same reason as the
+    // permit above and never earlier: multiplies overlap each other freely but yield while an
+    // `fp-cuda` row reduction holds the device, so the reduction's thousands of tiny sequential
+    // relaunches are not stuck behind these saturating kernels (~10 000× when they are — see
+    // [`fp::gpu_lock`]). Taking it at function entry deadlocks exactly as described above: the
+    // marshalling `par_iter` runs chunks on other workers, which steal another bidegree's
+    // multiply, block acquiring the shared side behind a waiting reduction, and never let this
+    // thread's join finish (observed on H200).
+    let _shared = fp::gpu_lock::shared();
+    let lock_ms = t_lock.elapsed().as_secs_f64() * 1e3;
+    let wait_ms = t_wait.elapsed().as_secs_f64() * 1e3;
     // Per-`R` offsets into the shared resident master (see [`ResidentHost`]). All read-lock
     // cache hits: the caller's pair-count pre-pass already enumerated every `R` in this block.
     // `need_cs`/`need_mk` track the furthest master offset this block dereferences, so the
@@ -2231,7 +2236,11 @@ fn multiply_batch_block(
     // Aggregate marshal/device totals across every launch (cheap, always on) so a whole
     // resolution's GPU overhead can be split host-vs-device via [`take_batch_stats`].
     let device_ms = t_device.elapsed().as_secs_f64() * 1e3;
-    BATCH_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // Keep the value this call was assigned: with ~100 workers incrementing, a separate `load`
+    // races past exact multiples, so a `% every == 0` test on it can fire never (observed: zero
+    // reports over 12 minutes). `fetch_add` returns a unique ticket per call, so exactly one
+    // caller sees each multiple.
+    let call_no = BATCH_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
     BATCH_MARSHAL_US.fetch_add(
         (marshal_ms * 1e3) as u64,
         std::sync::atomic::Ordering::Relaxed,
@@ -2241,8 +2250,56 @@ fn multiply_batch_block(
         std::sync::atomic::Ordering::Relaxed,
     );
     BATCH_PAIRS.fetch_add(total_pairs as u64, std::sync::atomic::Ordering::Relaxed);
+    BATCH_PREP_US.fetch_add((prep_ms * 1e3) as u64, std::sync::atomic::Ordering::Relaxed);
+    BATCH_WAIT_US.fetch_add((wait_ms * 1e3) as u64, std::sync::atomic::Ordering::Relaxed);
+    BATCH_PERMIT_US.fetch_add(
+        (permit_ms * 1e3) as u64,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    BATCH_LOCK_US.fetch_add((lock_ms * 1e3) as u64, std::sync::atomic::Ordering::Relaxed);
+
+    // Periodic split of where multiply time actually goes. The counters above were being collected
+    // and never read ([`take_batch_stats`] had no callers), which left the dominant cost of a
+    // resolution unattributed: profiling a stem-200 run showed ~96% of the slow bidegrees' time
+    // inside the per-signature parallel section (row reduction was ~2%), but nothing said whether
+    // that is host marshalling or device execution. Non-resetting reads so the totals stay
+    // cumulative; `NASSAU_BATCH_REPORT_EVERY=0` disables.
+    let every = batch_report_every();
+    if every != 0 && call_no % every == 0 {
+        let calls = call_no;
+        let marshal_s = BATCH_MARSHAL_US.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6;
+        let device_s = BATCH_DEVICE_US.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6;
+        let pairs = BATCH_PAIRS.load(std::sync::atomic::Ordering::Relaxed);
+        let prep_s = BATCH_PREP_US.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6;
+        let wait_s = BATCH_WAIT_US.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6;
+        let permit_s = BATCH_PERMIT_US.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6;
+        let lock_s = BATCH_LOCK_US.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6;
+        let total = (prep_s + wait_s + device_s).max(1e-9);
+        eprintln!(
+            "[batch-stats] calls={calls} prep={prep_s:.1}s permit={permit_s:.1}s \
+             lock={lock_s:.1}s device={device_s:.1}s | prep={:.0}% permit={:.0}% lock={:.0}% \
+             device={:.0}% pairs={pairs} (marshal={marshal_s:.1}s wait={wait_s:.1}s)",
+            100.0 * prep_s / total,
+            100.0 * permit_s / total,
+            100.0 * lock_s / total,
+            100.0 * device_s / total,
+        );
+    }
 
     result
+}
+
+/// How often [`multiply_batch_block`] prints the cumulative marshal/device split, in launches.
+/// `NASSAU_BATCH_REPORT_EVERY` (default 2000; `0` disables).
+fn batch_report_every() -> u64 {
+    use std::sync::OnceLock;
+    static EVERY: OnceLock<u64> = OnceLock::new();
+    *EVERY.get_or_init(|| {
+        std::env::var("NASSAU_BATCH_REPORT_EVERY")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(2000)
+    })
 }
 
 /// Read `data[o]` from a master split into up to [`MASTER_MAX_SEG`] fixed-size segments of
@@ -2591,13 +2648,7 @@ mod tests {
     /// `n × width` row-major, each row a p_part zero-padded to `width` (padding entries
     /// are zero and skipped, so `wlen == width` matches the CPU's trimmed loop).
     #[cube(launch)]
-    fn seqno_kernel(
-        g: &[u32],
-        xi: &[u32],
-        p_parts: &[u32],
-        out: &mut [u32],
-        width: usize,
-    ) {
+    fn seqno_kernel(g: &[u32], xi: &[u32], p_parts: &[u32], out: &mut [u32], width: usize) {
         let idx = ABSOLUTE_POS;
         if idx >= out.len() {
             terminate!();
@@ -3935,8 +3986,8 @@ mod tests {
         let n = launches.load(Ordering::Relaxed);
         let mm = mismatches.load(Ordering::Relaxed);
         eprintln!(
-            "[soak] {threads} threads × {secs}s, {} streams: {n} launches ({:.0}/s over {} degrees, \
-             verified ≤{verify_max}), {mm} correctness mismatches, gpu_disabled={}",
+            "[soak] {threads} threads × {secs}s, {} streams: {n} launches ({:.0}/s over {} \
+             degrees, verified ≤{verify_max}), {mm} correctness mismatches, gpu_disabled={}",
             gpu_stream_slots(),
             n as f64 / elapsed.as_secs_f64().max(1e-3),
             jobs.len(),
@@ -3949,7 +4000,8 @@ mod tests {
         assert!(
             !gpu_disabled(),
             "cubecl GPU multiply was disabled mid-soak — the cross-stream pool-reclaim race \
-             (tracel-ai/cubecl#1401) fired. This is the crash the submission-thread redesign closes."
+             (tracel-ai/cubecl#1401) fired. This is the crash the submission-thread redesign \
+             closes."
         );
     }
 }
