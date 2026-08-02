@@ -181,7 +181,12 @@ pub fn get_partial_matrix_restricted(
     inputs: &[usize],
     target_dim: usize,
 ) -> Matrix {
-    let (mut matrix, mut products) = extract_restricted(hom, degree, inputs, target_dim);
+    // Spanned because the 279 s stalls land somewhere in this function *before* the multiply
+    // (which itself measured 40 ms), and neither this build nor the pair pre-pass inside
+    // `multiply_batch_on_gpu` was previously visible to the log.
+    let (mut matrix, mut products) =
+        tracing::info_span!("extract_restricted", inputs = inputs.len(), target_dim)
+            .in_scope(|| extract_restricted(hom, degree, inputs, target_dim));
     if !products.is_empty() {
         let target = hom.target();
         let algebra = target.algebra();

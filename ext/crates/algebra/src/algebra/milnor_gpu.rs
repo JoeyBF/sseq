@@ -319,6 +319,9 @@ fn cleanup_every() -> u64 {
 /// Aggregate [`multiply_batch_on_gpu`] counters across all launches (call count, host
 /// marshal µs, device µs, total pairs), for splitting a whole resolution's GPU overhead.
 static BATCH_CALLS: AtomicU64 = AtomicU64::new(0);
+/// First-sight `R`s that forced an `admissible_matrices` enumeration + a `RESIDENT_HOST` write
+/// lock (see [`resident_info`]). Diffed around the pair pre-pass to attribute its cost.
+static RESIDENT_MISSES: AtomicU64 = AtomicU64::new(0);
 static BATCH_MARSHAL_US: AtomicU64 = AtomicU64::new(0);
 static BATCH_DEVICE_US: AtomicU64 = AtomicU64::new(0);
 static BATCH_PAIRS: AtomicU64 = AtomicU64::new(0);
@@ -865,6 +868,11 @@ fn resident_info(algebra: &MilnorAlgebra, p_part: &[PPartEntry]) -> RInfo {
     if let Some(info) = RESIDENT_HOST.read().unwrap().index.get(p_part) {
         return *info;
     }
+    // Miss: enumerate the admissible matrices (expensive, CPU) and then append under the WRITE
+    // lock. Counted so [`multiply_batch_grouped`]'s pre-pass can report how many misses it paid
+    // for — the pre-pass cost is entirely a function of first-sight `R`s, which makes it depend on
+    // what *other* bidegrees warmed earlier, i.e. on run order rather than on this step's work.
+    RESIDENT_MISSES.fetch_add(1, Ordering::Relaxed);
     let (cs_len, mk_len, cs, mk) = algebra.admissible_matrices(p_part);
     let mut host = RESIDENT_HOST.write().unwrap();
     if let Some(info) = host.index.get(p_part) {
@@ -1641,17 +1649,35 @@ fn multiply_batch_grouped(
     // reaches ~4.4e9 pairs by stem ~145). For `Resident` this pre-pass also warms the shared
     // resident master, so every block's layout lookups below are read-lock cache hits; for
     // `Transient` it warms the host-side [`COLD_COUNT`] shape cache the same way (no per-block recount).
-    let prod_pairs: Vec<usize> = products
-        .iter()
-        .map(|prod| {
-            let r = algebra.basis_element_from_index(prod.r_degree, prod.r_idx);
-            let num_mats = match mode {
-                MasterMode::Resident => resident_info(algebra, &r.p_part).num_mats as usize,
-                MasterMode::Transient => cold_count(algebra, &r.p_part).2 as usize,
-            };
-            num_mats * prod.term_indices.len()
-        })
-        .collect();
+    // This pre-pass is where multi-minute stalls hide: it is strictly sequential, it calls
+    // `admissible_matrices` for every first-sight `R`, and it serialises on the `RESIDENT_HOST`
+    // write lock while appending multi-GB pending buffers — all of it previously outside every
+    // span and every timer, so a worker parked here logged nothing at all. `new_r` distinguishes
+    // "paid to warm the master" from "waited for someone else's warm-up".
+    let prepass = tracing::info_span!(
+        "pair_prepass",
+        products = products.len(),
+        new_r = tracing::field::Empty,
+    );
+    let misses_before = RESIDENT_MISSES.load(std::sync::atomic::Ordering::Relaxed);
+    let prod_pairs: Vec<usize> = prepass.in_scope(|| {
+        products
+            .iter()
+            .map(|prod| {
+                let r = algebra.basis_element_from_index(prod.r_degree, prod.r_idx);
+                let num_mats = match mode {
+                    MasterMode::Resident => resident_info(algebra, &r.p_part).num_mats as usize,
+                    MasterMode::Transient => cold_count(algebra, &r.p_part).2 as usize,
+                };
+                num_mats * prod.term_indices.len()
+            })
+            .collect()
+    });
+    prepass.record(
+        "new_r",
+        RESIDENT_MISSES.load(std::sync::atomic::Ordering::Relaxed) - misses_before,
+    );
+    drop(prepass);
     let mut result: Vec<Vec<u32>> = Vec::with_capacity(num_rows);
     let (mut r0, mut p0) = (0, 0);
     while r0 < num_rows {
@@ -1756,23 +1782,46 @@ fn multiply_batch_block(
     // *global* basis-element index `global_base[s_degree] + ti`. Ensure the basis covers every
     // `s_degree` in this block, then snapshot `global_base` so the parallel fill needs no lock.
     let max_s_degree = products.iter().map(|p| p.s_degree).max().unwrap_or(0);
-    let global_base = ensure_basis(algebra, width, max_s_degree);
+    // `ensure_basis` takes the basis WRITE lock on a first-sight degree; spanned separately from
+    // the fill below so a wait on that lock is not misread as marshalling work.
+    let global_base = tracing::info_span!("ensure_basis", max_s_degree)
+        .in_scope(|| ensure_basis(algebra, width, max_s_degree));
     let mut term_gei: Vec<u32> = vec![0u32; total_terms];
+    // The ONLY rayon construct inside the guarded region, hence the only place a worker can block
+    // at a join and enter the steal loop. The multi-minute stalls sit somewhere in this guarded
+    // region and every other part of it is now spanned and bounded (`extract_restricted` ≤4.8 s,
+    // `pair_prepass` ≤5.1 s, `gpu_submit` 40 ms), so this is what remains. `prep` was only ever
+    // reported as a sum, which cannot separate a few 100 s outliers from many small costs.
     {
-        let tg_base = term_gei.as_mut_ptr() as usize;
-        let global_base = &global_base;
-        (0..products.len()).into_maybe_par_iter().for_each(|pi| {
-            let prod = &products[pi];
+        // Scoped to the fill alone: entering at function level would leave the span open across
+        // the permit wait and the GPU submission and attribute their time here.
+        let _marshal_span = tracing::info_span!(
+            "marshal_terms",
+            products = products.len(),
+            terms = total_terms
+        )
+        .entered();
+        // SEQUENTIAL, deliberately. The body is one add and one store per term, so at the largest
+        // observed size (478 972 products / 2 300 621 terms) the whole fill is a few milliseconds
+        // of memory-bandwidth-bound work — rayon cannot speed that up past its own split/join
+        // overhead.
+        //
+        // What parallelising it DID buy was a join, and therefore rayon's steal loop, and therefore
+        // exposure to starvation: instrumenting this span measured a single fill at **146 s** (p99
+        // 0.09 s — 99 % are fast, only the tail explodes), roughly 30 000x the work involved. That
+        // was the multi-hundred-second "signature step" stall, which had been misattributed in turn
+        // to GPU submission ordering, to the resident-master pre-pass, and to the kernel itself.
+        //
+        // With this sequential there is no join anywhere inside a bidegree's guarded region, so a
+        // worker cannot be parked here at all.
+        let tg_all = &mut term_gei[..];
+        for (pi, prod) in products.iter().enumerate() {
             let (off, nt) = (term_off[pi], prod.term_indices.len());
-            // SAFETY: products write disjoint `[off, off + nt)` ranges (from the prefix sum),
-            // each within the allocated buffer, so no two tasks alias any element. The `usize`
-            // base is re-formed into a pointer here because raw pointers are not `Send`.
-            let tg = unsafe { std::slice::from_raw_parts_mut((tg_base as *mut u32).add(off), nt) };
             let base = global_base[prod.s_degree as usize];
-            for (k, &ti) in prod.term_indices.iter().enumerate() {
-                tg[k] = base + ti as u32;
+            for (slot, &ti) in tg_all[off..off + nt].iter_mut().zip(&prod.term_indices) {
+                *slot = base + ti as u32;
             }
-        });
+        }
     }
     // Device need: the largest `gei` any term dereferences is `< global_base[max_s_degree + 1]`
     // (all elements through degree `max_s_degree`), so uploading that many covers the block.

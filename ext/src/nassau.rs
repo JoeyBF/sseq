@@ -1154,6 +1154,24 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
     }
 
     fn step_resolution(&self, b: Bidegree) {
+        // One guard for the whole bidegree, rather than one per inner parallel section.
+        //
+        // This is correct by construction rather than by audit. A `step_resolution` job can only be
+        // stolen onto a thread that is in rayon's steal loop, i.e. blocked at a join — and running
+        // it there is exactly the priority inversion. So a bounce never discards useful work: it
+        // declines precisely the runs that would invert. Holding the guard for the whole bidegree
+        // therefore costs nothing and removes the need to know which callee happens to enter rayon
+        // today, which the narrow per-section guards did depend on.
+        //
+        // Nesting is free: [`ParallelGuard`] counts depth, so the inner guards become depth 1+ and
+        // keep their spans.
+        //
+        // Measurement note, for whoever revisits this: a single stem-200 A/B showed the worst step
+        // improving (224 s -> 87 s) but the count of steps >=20 s rising (41 -> 67) and retries
+        // rising (1363 -> 1613). That comparison is NOT conclusive — two runs differing in nothing
+        // relevant to guarding moved 31 -> 41 and 1271 s -> 1969 s, so the noise floor is the same
+        // size as the effect. Do not "fix" this on one run's numbers.
+        let _guard = ParallelGuard::new();
         self.step_resolution_with_result(b)
             .unwrap_or_else(|e| panic!("Error computing bidegree {b}: {e}"));
     }
