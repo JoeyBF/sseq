@@ -318,9 +318,10 @@ pub fn get_partial_matrix_restricted_verified(
         let g: Vec<usize> = gpu.row(row).iter_nonzero().map(|(i, _)| i).collect();
         let c: Vec<usize> = cpu.row(row).iter_nonzero().map(|(i, _)| i).collect();
         assert_eq!(
-            g, c,
-            "GPU/CPU restricted get_partial_matrix mismatch at degree {degree}, row {row} \
-             (input {}, target_dim {target_dim}, num_rows {})",
+            g,
+            c,
+            "GPU/CPU restricted get_partial_matrix mismatch at degree {degree}, row {row} (input \
+             {}, target_dim {target_dim}, num_rows {})",
             inputs[row],
             inputs.len(),
         );
