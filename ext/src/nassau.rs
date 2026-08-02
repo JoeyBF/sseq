@@ -860,6 +860,19 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
 
         drop(guard);
 
+        // Probe (`NASSAU_PROBE_SIG_INDEP=1`): are the signature steps independent?
+        //
+        // Each step reads `dx.entry(v)` for `v` in its own `next_mask`, then writes `dx` with rows
+        // of the *unmasked* `full_matrix`, whose support can extend outside that mask. If those
+        // writes never land on a column another step later reads, the steps are solving against an
+        // unchanging `dx` and the loop is parallelisable (solve independently, combine). If they do,
+        // the loop is a forward substitution and must stay ordered. Comparing each read against a
+        // pre-loop snapshot answers exactly that, without altering what the loop computes.
+        let dx_snapshot: Option<Vec<FpVector>> =
+            std::env::var_os("NASSAU_PROBE_SIG_INDEP").map(|_| dxs.clone());
+        let mut probe_reads = 0usize;
+        let mut probe_perturbed = 0usize;
+
         for signature in subalgebra.iter_signatures(b.t()) {
             let _guard = tracing::info_span!("step", ?signature).entered();
             target_mask.clear();
@@ -907,6 +920,17 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
             let pivots = qi.pivots().unwrap();
             let preimage = qi.preimage();
 
+            if let Some(snap) = &dx_snapshot {
+                for (dx, dx0) in dxs.iter().zip(snap) {
+                    for &v in &next_mask {
+                        probe_reads += 1;
+                        if dx.entry(v) != dx0.entry(v) {
+                            probe_perturbed += 1;
+                        }
+                    }
+                }
+            }
+
             for (x, dx) in xs.iter_mut().zip(&mut dxs) {
                 scratch.set_scratch_vector_size(target_mask.len());
                 let mut row = 0;
@@ -933,6 +957,13 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                 &masked_matrix,
             )?;
         }
+        if dx_snapshot.is_some() {
+            eprintln!(
+                "[sig-probe] b={b} signatures_read_positions={probe_reads} \
+                 perturbed_by_earlier_signature={probe_perturbed}"
+            );
+        }
+
         for dx in &dxs {
             assert!(dx.is_zero(), "dx non-zero at {b}");
         }
@@ -1272,8 +1303,7 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                             #[cfg(not(feature = "gpu"))]
                             let (res_master, res_basis) = (0usize, 0usize);
                             #[cfg(feature = "gpu")]
-                            let (dev_master, dev_basis) =
-                                algebra::milnor_gpu::resident_dev_bytes();
+                            let (dev_master, dev_basis) = algebra::milnor_gpu::resident_dev_bytes();
                             #[cfg(feature = "gpu")]
                             let (dev_pool_use, dev_pool_res) =
                                 algebra::milnor_gpu::cubecl_device_usage();
@@ -1283,9 +1313,9 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                             let gb = |x: usize| x as f64 / (1u64 << 30) as f64;
                             let gbu = |x: u64| x as f64 / (1u64 << 30) as f64;
                             eprintln!(
-                                "[MEM] commits={commit_count} last_b=({},{}) HOST[diff={:.1} mod={:.1} \
-                                 res_master={:.1} res_basis={:.1}]GB DEV[master={:.1} basis={:.1} \
-                                 cubecl_use={:.1} cubecl_reserved={:.1}]GB",
+                                "[MEM] commits={commit_count} last_b=({},{}) HOST[diff={:.1} \
+                                 mod={:.1} res_master={:.1} res_basis={:.1}]GB DEV[master={:.1} \
+                                 basis={:.1} cubecl_use={:.1} cubecl_reserved={:.1}]GB",
                                 b.n(),
                                 b.s(),
                                 gb(diff_b),
@@ -1543,9 +1573,13 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                     mask.clear();
                     // At apply time the resolution is fully computed, so we read the full mask
                     // (no concurrently-growing generators to exclude).
-                    mask.extend(
-                        subalgebra.signature_mask(&algebra, source, b.t(), &signature, i32::MAX),
-                    );
+                    mask.extend(subalgebra.signature_mask(
+                        &algebra,
+                        source,
+                        b.t(),
+                        &signature,
+                        i32::MAX,
+                    ));
                     scratch0.set_scratch_vector_size(mask.len());
                 }
                 NassauCommand::Fix => {
