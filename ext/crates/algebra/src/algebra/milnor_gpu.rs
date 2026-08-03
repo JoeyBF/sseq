@@ -1143,6 +1143,27 @@ fn seqno_core_packed(
 /// skips zero entries and `working` beyond the assembled length is zero, so the full
 /// `WORKING_CAP` length is equivalent to the CPU's trimmed p_part (`xi` is host-padded
 /// to `WORKING_CAP` so the `cur_d` sum stays in bounds; the extra terms are `0 · xi`).
+/// How many columns one `(matrix, term)` pair actually has to visit: past the longest of the three
+/// inputs, `b`, `cs` and `mk` are all zero, so [`pair_col`] returns 0 — no rejection and nothing
+/// added to `working`. Stopping there is exact, not a truncation.
+///
+/// This is per THREAD. The loop used to run to the launch's comptime `work_cap`, which is the max
+/// `mk_len` over every `R` in the block, so one long `R` made every thread in the launch pay for
+/// columns its own data does not have: measured `work_cap = 16` against a mean `mk_len` of 9.9.
+/// Ablation put ~59% of kernel time in this loop (shortening it 16 -> 4 was +80%), so the waste was
+/// the single largest item in the kernel.
+#[cube]
+fn pair_cols(term_len: usize, cs_len: usize, mk_len: usize) -> usize {
+    let mut cols = cs_len;
+    if term_len > cols {
+        cols = term_len;
+    }
+    if mk_len > cols {
+        cols = mk_len;
+    }
+    cols
+}
+
 /// Bit [`pair_col`] sets to report that a column rejects the whole product, above the 16 bits the
 /// value itself occupies (`diff | mk` and `b | mk` are all widened from `u16`).
 ///
@@ -1245,7 +1266,6 @@ fn multiply_pair(
     out_offset: usize,
     width: usize,
     num_limbs: usize,
-    #[comptime] work_cap: usize,
     #[comptime] sq_len: usize,
     pp_shift: &[u32],
     pp_mask: &[u32],
@@ -1267,7 +1287,7 @@ fn multiply_pair(
     let mut working = 0u64;
     let mut rejected = 0u32;
 
-    for j in 0..work_cap {
+    for j in 0..pair_cols(term_len, cs_len, mk_len) {
         let mut b = 0u32;
         if j < term_len {
             b = u32::cast_from(term_pparts[b_base + j]);
@@ -1455,7 +1475,6 @@ fn multiply_batch_kernel(
     // to t~510, but a 9th xi appears at t>=511 and it becomes 17, then 18 past 1023. A fixed 16
     // would silently truncate at stem 300 — wrong answers, no error. Deriving it per launch keeps
     // the occupancy win at every degree, and the host asserts it fits [`WORKING_CAP`].
-    #[comptime] work_cap: usize,
 ) {
     let k = ABSOLUTE_POS;
     let num_products = prod_pair_start.len() - 1;
@@ -1528,7 +1547,7 @@ fn multiply_batch_kernel(
     let mut working = 0u64;
     let mut rejected = 0u32;
 
-    for j in 0..work_cap {
+    for j in 0..pair_cols(term_len, cs_len, mk_len) {
         let mut cs = 0u32;
         if j < cs_len {
             cs = u32::cast_from(seg_read_u16(
@@ -2672,7 +2691,6 @@ fn multiply_batch_block(
                     BufferArg::from_raw_parts(psh_h, pp_shift_len),
                     BufferArg::from_raw_parts(pms_h, pp_shift_len),
                     work_cap.min(PPART_MAX_LEN),
-                    work_cap,
                 );
             }
 
@@ -3288,7 +3306,6 @@ mod tests {
             0,
             width,
             num_limbs,
-            WORKING_CAP,
             PPART_MAX_LEN,
             pp_shift,
             pp_mask,
