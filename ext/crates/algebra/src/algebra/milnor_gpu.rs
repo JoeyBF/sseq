@@ -1444,9 +1444,9 @@ fn multiply_batch_kernel(
     r_mk_offset: &[u64],
     r_cs_len: &[u32],
     r_mk_len: &[u32],
+    r_num_mats: &[u32],
     prod_r_index: &[u32],
     prod_term_start: &[u32],
-    prod_num_terms: &[u32],
     prod_row_base: &[u32],
     prod_out_offset: &[u32],
     prod_pair_start: &[u32],
@@ -1519,7 +1519,6 @@ fn multiply_batch_kernel(
     let p = lo;
 
     let ri = usize::cast_from(prod_r_index[p]);
-    let nt = usize::cast_from(prod_num_terms[p]);
     let p_start = usize::cast_from(prod_pair_start[p]);
     let local = k - p_start;
     // MATRIX varies fastest, term slowest. The obvious decode (`m = local / nt`, `t = local % nt`)
@@ -1536,9 +1535,12 @@ fn multiply_batch_kernel(
     //
     // This is a permutation of the same `(m, t)` set: every thread still owns exactly one pair, and
     // the output is XOR-accumulated, so the result is unchanged.
-    let num_mats = (usize::cast_from(prod_pair_start[p + 1]) - p_start) / nt;
-    let m = local % num_mats;
+    // `num_mats` by lookup, not `(pair_span) / nt`: one load instead of an emulated integer
+    // division (I2F/MUFU.RCP/F2I plus fixups). Only ONE division remains in the decode -- `t` and
+    // `m` share it, since ptxas emits a single divide plus an IMAD for the remainder.
+    let num_mats = usize::cast_from(r_num_mats[ri]);
     let t = local / num_mats;
+    let m = local - t * num_mats;
 
     let cs_len = usize::cast_from(r_cs_len[ri]);
     let mk_len = usize::cast_from(r_mk_len[ri]);
@@ -2276,7 +2278,6 @@ fn multiply_batch_block(
     // in `term_pparts`/`term_lens` (filled in parallel above); `term_off` gives each product's
     // start, so nothing is copied here.
     let mut prod_term_start: Vec<u32> = Vec::with_capacity(products.len());
-    let mut prod_num_terms: Vec<u32> = Vec::with_capacity(products.len());
     let mut prod_row_base: Vec<u32> = Vec::with_capacity(products.len());
     let mut prod_out_offset: Vec<u32> = Vec::with_capacity(products.len());
     // The pair prefix sum: entry `pi` is the number of `(matrix, term)` pairs before product
@@ -2291,7 +2292,6 @@ fn multiply_batch_block(
         prod_term_start.push(term_off[pi] as u32);
         pps.push(pair_acc as u32);
         pair_acc += r_num_matrices[ri as usize] * prod.term_indices.len();
-        prod_num_terms.push(prod.term_indices.len() as u32);
         prod_row_base.push(((prod.row - row_base) * num_limbs) as u32);
         prod_out_offset.push(prod.out_offset as u32);
     }
@@ -2575,6 +2575,11 @@ fn multiply_batch_block(
             let rmo_h = client.create_from_slice(u64::as_bytes(&r_mk_offset));
             let rcl_h = client.create_from_slice(u32::as_bytes(&r_cs_len));
             let rml_h = client.create_from_slice(u32::as_bytes(&r_mk_len));
+            // Per-`R` matrix count, so the kernel reads it instead of dividing for it. Integer
+            // division by a runtime value is emulated on the GPU (I2F/MUFU.RCP/F2I plus fixups,
+            // ~20 instructions), and this kernel is issue-limited on integer work.
+            let r_num_mats_u32: Vec<u32> = r_num_matrices.iter().map(|&n| n as u32).collect();
+            let rnm_h = client.create_from_slice(u32::as_bytes(&r_num_mats_u32));
             const THREADS: u32 = 256;
             // No realloc barrier needed: the resident master/basis are append-only segmented stores whose
             // segments, once allocated and written, never change identity and are never freed (see
@@ -2598,7 +2603,6 @@ fn multiply_batch_block(
 
             let pri_h = client.create(Bytes::from_elems(prod_r_index));
             let pts_h = client.create(Bytes::from_elems(prod_term_start));
-            let pnt_h = client.create(Bytes::from_elems(prod_num_terms));
             let prb_h = client.create(Bytes::from_elems(prod_row_base));
             let poo_h = client.create(Bytes::from_elems(prod_out_offset));
             let pps_h = client.create(Bytes::from_elems(pps));
@@ -2738,9 +2742,9 @@ fn multiply_batch_block(
                     BufferArg::from_raw_parts(rmo_h, r_mk_offset.len()),
                     BufferArg::from_raw_parts(rcl_h, r_cs_len.len()),
                     BufferArg::from_raw_parts(rml_h, r_mk_len.len()),
+                    BufferArg::from_raw_parts(rnm_h, r_num_mats_u32.len()),
                     BufferArg::from_raw_parts(pri_h, num_products),
                     BufferArg::from_raw_parts(pts_h, num_products),
-                    BufferArg::from_raw_parts(pnt_h, num_products),
                     BufferArg::from_raw_parts(prb_h, num_products),
                     BufferArg::from_raw_parts(poo_h, num_products),
                     BufferArg::from_raw_parts(pps_h, pps_len),
