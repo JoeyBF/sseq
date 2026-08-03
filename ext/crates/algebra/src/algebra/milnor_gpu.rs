@@ -89,7 +89,24 @@ const COARSE_LOG: usize = 20;
 /// Terms one multiply thread handles against a single matrix. `col_sums`/`masks` depend only on the
 /// matrix, so a group amortises those reads (and their address arithmetic) across `TERM_GROUP`
 /// terms: loads per pair fall from 3 per column to `2/TERM_GROUP + 1`.
-const TERM_GROUP: usize = 4;
+///
+/// Tuned, and the optimum is NOT monotonic — bigger groups amortise more but waste more lanes on
+/// the ragged tail, since a product's `nt` terms need `ceil(nt / TERM_GROUP)` groups and the last
+/// one is usually partial. Two interleaved rounds at the measured `nt ~ 5`:
+///
+/// | TERM_GROUP | pairs/s        | idle lanes at nt=5 |
+/// |------------|----------------|--------------------|
+/// | 2          | 1.09 / 1.06e10 | 1 of 6  (17%)      |
+/// | **3**      | **1.31 / 1.28e10** | 1 of 6  (17%)  |
+/// | 4          | 1.20 / 1.18e10 | 3 of 8  (37%)      |
+/// | 6          | 1.27 / 1.25e10 | 1 of 6  (17%)      |
+/// | 8          | 1.06 / 1.07e10 | 3 of 8  (37%)      |
+///
+/// Every 17%-waste value beats every 37%-waste value, so tail waste dominates the choice; among
+/// those, 3 amortises more than 2 and holds more registers than 6 does not need. Retune if the
+/// terms-per-product regime moves: this is fitted to `nt ~ 5`, and a workload with a different
+/// average would want a different divisor.
+const TERM_GROUP: usize = 3;
 
 /// Per-launch output-buffer budget in bytes (`NASSAU_GPU_BLOCK_MB`, default 512 MiB).
 ///
