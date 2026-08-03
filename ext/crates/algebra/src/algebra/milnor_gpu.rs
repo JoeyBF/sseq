@@ -1283,6 +1283,17 @@ fn multiply_pair(
 // via `seg_read_*` (correct for any offset, straddle or not — no layout padding needed), then hands
 // those contiguous locals to `multiply_pair`, which stays a pure segmentation-agnostic arithmetic
 // core. `seg_elems` is the segment element count (`o / seg_elems` picks the segment).
+// OCCUPANCY (pending an upstream cubecl change): this kernel is register-bound, and ptxas without
+// a `minBlocksPerSM` target settles at 78 registers = 3 blocks/SM = 37.5% occupancy (matching a
+// sampled 36.8% "Compute Warps in Flight", with 63% of warp slots idle). Asking for 4 blocks/SM
+// measured +6.2% (7.61e9 -> 8.08e9 pairs/s) for 130 bytes of spill stores; 5 and 6 tie within
+// noise, 7-8 lose 12% as spilling overtakes the gain.
+//
+// It is not enabled here because cubecl emits only `__launch_bounds__(<threads>)` -- there is no
+// way to request the second argument. The change is prepared as
+// `~/cubecl-min-blocks-per-sm.patch` (adds `KernelOptions::min_blocks_per_sm` and a
+// `min_blocks_per_sm = N` argument to `#[cube(..)]`, mirroring `cluster_dim`); once it lands
+// upstream, add `min_blocks_per_sm = 4` below and re-measure.
 #[cube(launch_unchecked, address_type = "u64")]
 #[allow(clippy::too_many_arguments)]
 fn multiply_batch_kernel(
