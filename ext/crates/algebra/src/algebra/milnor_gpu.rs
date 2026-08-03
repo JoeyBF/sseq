@@ -1520,9 +1520,25 @@ fn multiply_batch_kernel(
 
     let ri = usize::cast_from(prod_r_index[p]);
     let nt = usize::cast_from(prod_num_terms[p]);
-    let local = k - usize::cast_from(prod_pair_start[p]);
-    let m = local / nt;
-    let t = local % nt;
+    let p_start = usize::cast_from(prod_pair_start[p]);
+    let local = k - p_start;
+    // MATRIX varies fastest, term slowest. The obvious decode (`m = local / nt`, `t = local % nt`)
+    // has the opposite order, and it is the kernel's dominant cost: consecutive threads then share a
+    // matrix but each takes a DIFFERENT term, whose p-part sits at `gei * width` for an arbitrary
+    // basis index -- a 32-way scatter across a multi-GB resident basis, 2 useful bytes per 32-byte
+    // sector fetched. Ablation measured the whole kernel at +79% with the scatter removed (every
+    // thread reading offset 0) and +0.3% with the entire seqno rank loop deleted, so locality is
+    // essentially all of the remaining time.
+    //
+    // With `m` fastest, a warp shares one term -- its p-part read becomes a broadcast -- and the
+    // `col_sums`/`masks` reads become `m * cs_len` apart, i.e. one contiguous fully-used run per
+    // warp instead of one wasted sector per lane.
+    //
+    // This is a permutation of the same `(m, t)` set: every thread still owns exactly one pair, and
+    // the output is XOR-accumulated, so the result is unchanged.
+    let num_mats = (usize::cast_from(prod_pair_start[p + 1]) - p_start) / nt;
+    let m = local % num_mats;
+    let t = local / num_mats;
 
     let cs_len = usize::cast_from(r_cs_len[ri]);
     let mk_len = usize::cast_from(r_mk_len[ri]);
