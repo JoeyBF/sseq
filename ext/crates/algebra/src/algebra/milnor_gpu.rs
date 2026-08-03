@@ -2561,6 +2561,18 @@ fn multiply_batch_block(
                 "block needs a working array of {work_cap} > WORKING_CAP {WORKING_CAP}; raise the \
                  cap (it also bounds the host-side `xi` padding)"
             );
+            if launch_log_enabled() {
+                let mk_max = r_mk_len.iter().copied().max().unwrap_or(0);
+                let mk_sum: u64 = r_mk_len.iter().map(|&x| x as u64).sum();
+                eprintln!(
+                    "[launch] work_cap={work_cap} mk_max={mk_max} mk_mean={:.1} n_r={} \
+                     products={} pairs={} cubes={cubes}",
+                    mk_sum as f64 / r_mk_len.len().max(1) as f64,
+                    r_mk_len.len(),
+                    num_products,
+                    total_pairs,
+                );
+            }
             // Bind one `BufferArg` per `(segment vector, index)` — the `.0` handle, `.1` element length.
             macro_rules! sa {
                 ($v:expr, $i:expr) => {
@@ -2762,6 +2774,22 @@ fn multiply_batch_block(
 
 /// How often [`multiply_batch_block`] prints the cumulative marshal/device split, in launches.
 /// `NASSAU_BATCH_REPORT_EVERY` (default 2000; `0` disables).
+/// `NASSAU_GPU_LAUNCH_LOG=1` dumps each multiply launch's shape (`work_cap`, the `mk_len` spread,
+/// product count, pair count, grid size) to stderr.
+///
+/// This exists because launch shape is otherwise invisible, and inferring it from aggregates is how
+/// several wrong conclusions got made here. It settled one directly: two bench processes each report
+/// ~7x the solo `pairs/s`, which looked like enormous headroom, and the log showed both were issuing
+/// *identical* launches (same `work_cap`, same ~2.5e9 pairs, same ~9.6e6 blocks). Same launch, same
+/// device, "7x faster" — so the throughput figure, not the kernel, was the thing that changed. The
+/// bench's fixed-work warm-up (4 jobs, ~190 s regardless of co-tenancy) confirmed real throughput is
+/// flat. Read `pairs/s` from a contended run as meaningless, not as headroom.
+fn launch_log_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("NASSAU_GPU_LAUNCH_LOG").is_some())
+}
+
 fn batch_report_every() -> u64 {
     use std::sync::OnceLock;
     static EVERY: OnceLock<u64> = OnceLock::new();
