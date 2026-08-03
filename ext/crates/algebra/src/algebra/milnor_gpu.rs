@@ -86,6 +86,11 @@ const GPU_PAIR_CHUNK: usize = 3_900_000_000;
 /// every product into a scan bounded by how many products one chunk spans.
 const COARSE_LOG: usize = 20;
 
+/// Terms one multiply thread handles against a single matrix. `col_sums`/`masks` depend only on the
+/// matrix, so a group amortises those reads (and their address arithmetic) across `TERM_GROUP`
+/// terms: loads per pair fall from 3 per column to `2/TERM_GROUP + 1`.
+const TERM_GROUP: usize = 4;
+
 /// Per-launch output-buffer budget in bytes (`NASSAU_GPU_BLOCK_MB`, default 512 MiB).
 ///
 /// A launch's transient footprint — host marshal buffers, pinned staging, device buffers, and
@@ -1447,6 +1452,7 @@ fn multiply_batch_kernel(
     r_num_mats: &[u32],
     prod_r_index: &[u32],
     prod_term_start: &[u32],
+    prod_num_terms: &[u32],
     prod_row_base: &[u32],
     prod_out_offset: &[u32],
     prod_pair_start: &[u32],
@@ -1539,47 +1545,68 @@ fn multiply_batch_kernel(
     // division (I2F/MUFU.RCP/F2I plus fixups). Only ONE division remains in the decode -- `t` and
     // `m` share it, since ptxas emits a single divide plus an IMAD for the remainder.
     let num_mats = usize::cast_from(r_num_mats[ri]);
-    let t = local / num_mats;
-    let m = local - t * num_mats;
+    let tgrp = local / num_mats;
+    let m = local - tgrp * num_mats;
+    let t_base = tgrp * TERM_GROUP;
+    let nt = usize::cast_from(prod_num_terms[p]);
 
     let cs_len = usize::cast_from(r_cs_len[ri]);
     let mk_len = usize::cast_from(r_mk_len[ri]);
-    let term_slot = usize::cast_from(prod_term_start[p]) + t;
-    // `term_gei[term_slot]` is the term's *global* basis-element index (across all degrees): its
-    // (width-padded) p-part lives at global offset `gei*width` in the segmented basis `pp*`, length
-    // `ln*[gei]`. The basis is resident on the device (uploaded once, grown incrementally), so a
-    // launch uploads only these indices instead of re-gathering every term's p-part.
-    let gei = usize::cast_from(term_gei[term_slot]);
-
-    // Global (across-segment) offsets of this matrix's data and this term's p-part.
+    // Global (across-segment) offset of this matrix's data.
     let cs_off = usize::cast_from(r_cs_offset[ri]) + m * cs_len;
     let mk_off = usize::cast_from(r_mk_offset[ri]) + m * mk_len;
-    let pp_off = gei * width;
-    let term_len = usize::cast_from(seg_read_u32(
-        ln0, ln1, ln2, ln3, ln4, ln5, ln6, ln7, ln8, ln9, ln10, ln11, ln12, ln13, ln14, ln15, gei,
-        seg_elems, num_segs,
-    ));
+    let ts_base = usize::cast_from(prod_term_start[p]) + t_base;
 
-    // The arithmetic of `multiply_pair`, with this thread's matrix / term read straight out of the
-    // segmented stores column by column. It used to gather into three `Array::<u16>::new(work_cap)`
-    // locals and call `multiply_pair` on them, but each entry is consumed exactly once, at the same
-    // `j`, by that function's own `0..work_cap` loop — so the arrays only ferried values between two
-    // loops with identical bounds. Fusing them deletes `work_cap x 3 x u16` of per-thread state,
-    // which is what caps occupancy (see the kernel's `work_cap` note). The per-column rule and the
-    // output tail stay shared with the single-`R` path via `pair_col` / `pair_emit`, so the two
-    // callers cannot drift.
+    // One thread now covers `TERM_GROUP` terms against ONE matrix, because `col_sums` and `masks`
+    // depend only on the matrix. One thread per pair re-read those ~2 x cols values for every term,
+    // i.e. two thirds of all loads (and their address arithmetic) were redundant by a factor of
+    // `nt`. Reading them once per column and applying the whole term group against them cuts loads
+    // per pair from 3 to `2/TERM_GROUP + 1`.
     //
-    // Entries past each length read as zero, matching `multiply_pair`'s out-of-range convention;
-    // the loop bounds at `work_cap` exactly as the core does, so any `mk_len > work_cap` tail is
-    // neither read nor needed.
-    let mut low = cs_len;
-    if term_len < cs_len {
-        low = term_len;
+    // This is the lever that is left: ncu measures the kernel issue-limited on integer work (74.8%
+    // SM vs 0.99% DRAM, IPC 3.36/4, ALU 68.4%, 93% L1 hit), and the SASS is 26% IMAD / 14% ISETP --
+    // address and predicate arithmetic. Peephole work had run dry at ~1% a change; this removes
+    // whole loads rather than shaving instructions off them.
+    //
+    // `term_gei[term_slot]` is the term's *global* basis-element index (across all degrees): its
+    // (width-padded) p-part lives at global offset `gei*width` in the segmented basis `pp*`, length
+    // `ln*[gei]`. The group's tail is ragged whenever `TERM_GROUP` does not divide `nt`; those lanes
+    // carry `term_len = 0` and are excluded from the output below (they cannot simply fall out of
+    // the arithmetic -- an all-zero term against an all-zero column does NOT reject).
+    let mut pp_off = Array::<u64>::new(TERM_GROUP);
+    let mut term_len = Array::<u32>::new(TERM_GROUP);
+    let mut cols = cs_len;
+    if mk_len > cols {
+        cols = mk_len;
     }
-    let mut working = 0u64;
-    let mut rejected = 0u32;
+    #[unroll]
+    for tt in 0..TERM_GROUP {
+        let mut po = 0u64;
+        let mut tl = 0u32;
+        if t_base + tt < nt {
+            let gei = usize::cast_from(term_gei[ts_base + tt]);
+            po = u64::cast_from(gei * width);
+            tl = seg_read_u32(
+                ln0, ln1, ln2, ln3, ln4, ln5, ln6, ln7, ln8, ln9, ln10, ln11, ln12, ln13, ln14,
+                ln15, gei, seg_elems, num_segs,
+            );
+        }
+        pp_off[tt] = po;
+        term_len[tt] = tl;
+        if usize::cast_from(tl) > cols {
+            cols = usize::cast_from(tl);
+        }
+    }
 
-    for j in 0..pair_cols(term_len, cs_len, mk_len) {
+    let mut working = Array::<u64>::new(TERM_GROUP);
+    let mut rejected = Array::<u32>::new(TERM_GROUP);
+    #[unroll]
+    for tt in 0..TERM_GROUP {
+        working[tt] = 0u64;
+        rejected[tt] = 0u32;
+    }
+
+    for j in 0..cols {
         let mut cs = 0u32;
         if j < cs_len {
             cs = u32::cast_from(seg_read_u16(
@@ -1628,52 +1655,64 @@ fn multiply_batch_kernel(
                 num_segs,
             ));
         }
-        let mut b = 0u32;
-        if j < term_len {
-            b = u32::cast_from(seg_read_u16(
-                pp0,
-                pp1,
-                pp2,
-                pp3,
-                pp4,
-                pp5,
-                pp6,
-                pp7,
-                pp8,
-                pp9,
-                pp10,
-                pp11,
-                pp12,
-                pp13,
-                pp14,
-                pp15,
-                pp_off + j,
-                seg_elems,
-                num_segs,
-            ));
-        }
-
-        let val = pair_col(j, low, b, cs, mk);
-        rejected |= val & PAIR_COL_REJECT;
-        if j < PPART_MAX_LEN {
-            working |= u64::cast_from(val & 0xffffu32) << u64::cast_from(pp_shift[j]);
+        #[unroll]
+        for tt in 0..TERM_GROUP {
+            let tl = usize::cast_from(term_len[tt]);
+            let mut b = 0u32;
+            if j < tl {
+                b = u32::cast_from(seg_read_u16(
+                    pp0,
+                    pp1,
+                    pp2,
+                    pp3,
+                    pp4,
+                    pp5,
+                    pp6,
+                    pp7,
+                    pp8,
+                    pp9,
+                    pp10,
+                    pp11,
+                    pp12,
+                    pp13,
+                    pp14,
+                    pp15,
+                    usize::cast_from(pp_off[tt]) + j,
+                    seg_elems,
+                    num_segs,
+                ));
+            }
+            let mut low = cs_len;
+            if tl < cs_len {
+                low = tl;
+            }
+            let val = pair_col(j, low, b, cs, mk);
+            rejected[tt] |= val & PAIR_COL_REJECT;
+            if j < PPART_MAX_LEN {
+                working[tt] |= u64::cast_from(val & 0xffffu32) << u64::cast_from(pp_shift[j]);
+            }
         }
     }
 
-    if rejected == 0u32 {
-        pair_emit(
-            g,
-            xi,
-            out,
-            working,
-            usize::cast_from(prod_row_base[p]),
-            usize::cast_from(prod_out_offset[p]),
-            width,
-            num_limbs,
-            sq_len,
-            pp_shift,
-            pp_mask,
-        );
+    #[unroll]
+    for tt in 0..TERM_GROUP {
+        if t_base + tt < nt {
+            if rejected[tt] == 0u32 {
+                pair_emit(
+                    g,
+                    xi,
+                    out,
+                    working[tt],
+                    usize::cast_from(prod_row_base[p]),
+                    usize::cast_from(prod_out_offset[p]),
+                    width,
+                    num_limbs,
+                    sq_len,
+                    pp_shift,
+                    pp_mask,
+                );
+            }
+        }
     }
 }
 
@@ -1963,7 +2002,8 @@ fn multiply_batch_grouped(
                     MasterMode::Resident => resident_info(algebra, r.p_part).num_mats as usize,
                     MasterMode::Transient => cold_count(algebra, r.p_part).2 as usize,
                 };
-                num_mats * prod.term_indices.len()
+                // Threads, not pairs: one per (matrix, TERM_GROUP-sized term group).
+                num_mats * prod.term_indices.len().div_ceil(TERM_GROUP)
             })
             .collect()
     });
@@ -2278,6 +2318,7 @@ fn multiply_batch_block(
     // in `term_pparts`/`term_lens` (filled in parallel above); `term_off` gives each product's
     // start, so nothing is copied here.
     let mut prod_term_start: Vec<u32> = Vec::with_capacity(products.len());
+    let mut prod_num_terms: Vec<u32> = Vec::with_capacity(products.len());
     let mut prod_row_base: Vec<u32> = Vec::with_capacity(products.len());
     let mut prod_out_offset: Vec<u32> = Vec::with_capacity(products.len());
     // The pair prefix sum: entry `pi` is the number of `(matrix, term)` pairs before product
@@ -2287,11 +2328,17 @@ fn multiply_batch_block(
     // `2^32` `ABSOLUTE_POS` limit; asserted below before the values are used).
     let mut pps: Vec<u32> = Vec::with_capacity(products.len() + 1);
     let mut pair_acc: usize = 0;
+    let mut real_pairs: usize = 0;
     for (pi, prod) in products.iter().enumerate() {
         let ri = prod_r_index[pi];
         prod_term_start.push(term_off[pi] as u32);
         pps.push(pair_acc as u32);
-        pair_acc += r_num_matrices[ri as usize] * prod.term_indices.len();
+        // One thread per (matrix, TERM_GROUP-sized term group), not per (matrix, term). `pair_acc`
+        // sizes the grid, so it counts THREADS; `real_pairs` stays the count of `(matrix, term)`
+        // products actually evaluated, which is what the throughput stat must report.
+        prod_num_terms.push(prod.term_indices.len() as u32);
+        pair_acc += r_num_matrices[ri as usize] * prod.term_indices.len().div_ceil(TERM_GROUP);
+        real_pairs += r_num_matrices[ri as usize] * prod.term_indices.len();
         prod_row_base.push(((prod.row - row_base) * num_limbs) as u32);
         prod_out_offset.push(prod.out_offset as u32);
     }
@@ -2603,6 +2650,7 @@ fn multiply_batch_block(
 
             let pri_h = client.create(Bytes::from_elems(prod_r_index));
             let pts_h = client.create(Bytes::from_elems(prod_term_start));
+            let pnt_h = client.create(Bytes::from_elems(prod_num_terms));
             let prb_h = client.create(Bytes::from_elems(prod_row_base));
             let poo_h = client.create(Bytes::from_elems(prod_out_offset));
             let pps_h = client.create(Bytes::from_elems(pps));
@@ -2745,6 +2793,7 @@ fn multiply_batch_block(
                     BufferArg::from_raw_parts(rnm_h, r_num_mats_u32.len()),
                     BufferArg::from_raw_parts(pri_h, num_products),
                     BufferArg::from_raw_parts(pts_h, num_products),
+                    BufferArg::from_raw_parts(pnt_h, num_products),
                     BufferArg::from_raw_parts(prb_h, num_products),
                     BufferArg::from_raw_parts(poo_h, num_products),
                     BufferArg::from_raw_parts(pps_h, pps_len),
@@ -2797,7 +2846,7 @@ fn multiply_batch_block(
         (device_ms * 1e3) as u64,
         std::sync::atomic::Ordering::Relaxed,
     );
-    BATCH_PAIRS.fetch_add(total_pairs as u64, std::sync::atomic::Ordering::Relaxed);
+    BATCH_PAIRS.fetch_add(real_pairs as u64, std::sync::atomic::Ordering::Relaxed);
     BATCH_PREP_US.fetch_add((prep_ms * 1e3) as u64, std::sync::atomic::Ordering::Relaxed);
     BATCH_WAIT_US.fetch_add((wait_ms * 1e3) as u64, std::sync::atomic::Ordering::Relaxed);
     BATCH_PERMIT_US.fetch_add(
