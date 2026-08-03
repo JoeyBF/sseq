@@ -35,6 +35,26 @@ use crate::algebra::{Algebra, MilnorAlgebra, combinatorics::xi_degrees, milnor_a
 /// `mk_len = rows + cols − 1 ≤ MAX_XI_TAU + ⌈log2⌉`; 32 covers every in-range case.
 const WORKING_CAP: usize = 32;
 
+/// `PPart::MAX_LEN` — the number of entries the packed exponent sequence can hold.
+///
+/// Positions beyond it are unreachable, not merely unused: entry `r_n` multiplies
+/// `deg(xi_n) = 2^n - 1`, so length 11 requires degree >= 2047 while `PPart::MAX_DEGREE` is 2045.
+/// The multiply kernel's `working` accumulator therefore packs into one `u64` with no loss.
+const PPART_MAX_LEN: usize = 10;
+
+/// Bit offset and value mask of each packed p-part field, uploaded per launch (80 bytes) so the
+/// kernel can unpack `working` without a per-thread array. Mirrors `PPart`'s private tables.
+fn ppart_shift_mask() -> (Vec<u32>, Vec<u32>) {
+    let shift: Vec<u32> = (0..PPART_MAX_LEN).map(|i| PPart::shift(i)).collect();
+    let mask: Vec<u32> = (0..PPART_MAX_LEN)
+        .map(|i| {
+            let w = PPart::shift(i + 1) - PPart::shift(i);
+            ((1u64 << w) - 1) as u32
+        })
+        .collect();
+    (shift, mask)
+}
+
 /// Per-thread local caps for the in-kernel admissible enumeration ([`enumerate_admissible_kernel`]).
 /// Each `R` has `rows = |p_part| ≤ MAX_XI_TAU` and `cols ≤ WORKING_CAP` (max bit-length of an entry),
 /// so the enumeration's `matrix` is `rows*cols`, `col_sums` is `cols−1`, and `masks` is `rows+cols−1`.
@@ -1072,18 +1092,29 @@ macro_rules! copy_chunked {
 /// `usize` at the index sites. Shared by `seqno_kernel` and
 /// `multiply_single_r_kernel` so both index outputs identically.
 #[cube]
-fn seqno_core(g: &[u32], xi: &[u32], working: &[u32], wlen: usize, width: usize) -> u32 {
-    // cur_d = Σ working[h] · xi[h].
+fn seqno_core_packed(
+    g: &[u32],
+    xi: &[u32],
+    pp_shift: &[u32],
+    pp_mask: &[u32],
+    working: u64,
+    wlen: usize,
+    width: usize,
+) -> u32 {
+    // cur_d = Σ working[h] · xi[h], reading entries out of the packed word.
     let mut cur_d = 0u32;
     for h in 0..wlen {
-        cur_d += working[h] * xi[h];
+        let e =
+            u32::cast_from((working >> u64::cast_from(pp_shift[h])) & u64::cast_from(pp_mask[h]));
+        cur_d += e * xi[h];
     }
 
     // Rank by consuming positions from high to low; position 0 contributes nothing.
     let mut rank = 0u32;
     for hh in 1..wlen {
         let h = wlen - hh; // wlen-1 down to 1
-        let r = working[h];
+        let r =
+            u32::cast_from((working >> u64::cast_from(pp_shift[h])) & u64::cast_from(pp_mask[h]));
         if r != 0 {
             let below = cur_d - r * xi[h];
             let cur_row = usize::cast_from(cur_d) * width + h;
@@ -1132,13 +1163,25 @@ fn multiply_pair(
     width: usize,
     num_limbs: usize,
     #[comptime] work_cap: usize,
+    #[comptime] sq_len: usize,
+    pp_shift: &[u32],
+    pp_mask: &[u32],
 ) {
     let mut low = cs_len;
     if term_len < cs_len {
         low = term_len;
     }
 
-    let mut working = Array::<u32>::new(work_cap);
+    // Packed accumulator instead of `Array::<u32>::new(work_cap)`: the single largest slice of
+    // per-thread state (work_cap x u32 ~= 16 registers of the measured 78, and registers are what
+    // caps occupancy at 3 blocks/SM = 37.5%).
+    //
+    // Entries at index >= PPART_MAX_LEN cannot exist, so stopping there is exact rather than a
+    // truncation, and it holds by the degree bound rather than by observation: at p = 2 the entry
+    // r_n multiplies deg(xi_n) = 2^n - 1, so a p-part of length 11 needs degree >= 2^11 - 1 = 2047,
+    // while `PPart::MAX_DEGREE` is 2045. `MAX_LEN = 10` is therefore forced by that bound, not a
+    // cap something could exceed — which is also why `PPart::set` can assert `i < MAX_LEN`.
+    let mut working = 0u64;
     let mut rejected = false;
 
     for j in 0..work_cap {
@@ -1176,14 +1219,19 @@ fn multiply_pair(
             }
             val = b | mk;
         }
-        working[j] = val;
+        if j < PPART_MAX_LEN {
+            working |= u64::cast_from(val) << u64::cast_from(pp_shift[j]);
+        }
     }
 
     if !rejected {
         // `seqno` indexes the algebra basis of the output degree; `out_offset` shifts it
         // to this product's target-generator block within the row (0 for a single-block
         // output). Both are bit offsets, added before splitting into (limb, bit).
-        let idx = seqno_core(g, xi, working.as_slice(), work_cap, width);
+        // Only the first `PPART_MAX_LEN` positions can be non-zero (see the accumulator above),
+        // so the rank loop stops at `sq_len = min(work_cap, PPART_MAX_LEN)`, computed on the host
+        // (comptime arithmetic does not lower inside a `#[cube]` fn).
+        let idx = seqno_core_packed(g, xi, pp_shift, pp_mask, working, sq_len, width);
         let global_bit = out_offset + usize::cast_from(idx);
         let limb = global_bit / 32;
         // Device-side mirror of the host's defensive mask: `nassau_gpu::get_partial_matrix_restricted`
@@ -1327,6 +1375,10 @@ fn multiply_batch_kernel(
     // Comptime is right here: at most `MASTER_MAX_SEG` distinct values, so the select chain folds
     // to the segments that exist without a recompile storm.
     #[comptime] num_segs: usize,
+    pp_shift: &[u32],
+    pp_mask: &[u32],
+    // `min(work_cap, PPART_MAX_LEN)`: how far the packed rank loop runs.
+    #[comptime] sq_len: usize,
     // Per-thread working-array size, specialised per launch to what THIS block actually needs
     // (`max(mk_len, term_len)`, rounded up), not the global worst case.
     //
@@ -1497,6 +1549,9 @@ fn multiply_batch_kernel(
         width,
         num_limbs,
         work_cap,
+        sq_len,
+        pp_shift,
+        pp_mask,
     );
 }
 
@@ -2404,6 +2459,11 @@ fn multiply_batch_block(
             // Exactly the binary-search depth this block needs (see the kernel): passed bare so cubecl
             // specialises the trip count instead of always running 32 dependent loads.
             let search_iters = usize::BITS as usize - num_products.max(1).leading_zeros() as usize;
+            // 80 bytes per launch; lets the kernel unpack `working` without a per-thread array.
+            let (pp_shift_h, pp_mask_h) = ppart_shift_mask();
+            let pp_shift_len = pp_shift_h.len();
+            let psh_h = client.create(Bytes::from_elems(pp_shift_h));
+            let pms_h = client.create(Bytes::from_elems(pp_mask_h));
             // Segments actually populated across the four segmented stores; the rest are the
             // never-indexed 1-element dummies. Passed bare so the kernel's select chain specialises to
             // this many arms instead of all `MASTER_MAX_SEG`.
@@ -2526,6 +2586,9 @@ fn multiply_batch_block(
                     num_limbs,
                     search_iters,
                     num_segs,
+                    BufferArg::from_raw_parts(psh_h, pp_shift_len),
+                    BufferArg::from_raw_parts(pms_h, pp_shift_len),
+                    work_cap.min(PPART_MAX_LEN),
                     work_cap,
                 );
             }
@@ -3009,18 +3072,29 @@ mod tests {
     /// `n × width` row-major, each row a p_part zero-padded to `width` (padding entries
     /// are zero and skipped, so `wlen == width` matches the CPU's trimmed loop).
     #[cube(launch)]
-    fn seqno_kernel(g: &[u32], xi: &[u32], p_parts: &[u32], out: &mut [u32], width: usize) {
+    fn seqno_kernel(
+        g: &[u32],
+        xi: &[u32],
+        p_parts: &[u32],
+        out: &mut [u32],
+        width: usize,
+        pp_shift: &[u32],
+        pp_mask: &[u32],
+        #[comptime] sq_len: usize,
+    ) {
         let idx = ABSOLUTE_POS;
         if idx >= out.len() {
             terminate!();
         }
         let base = idx * width;
 
-        let mut working = Array::<u32>::new(MAX_XI_TAU);
-        for h in 0..width {
-            working[h] = p_parts[base + h];
+        let mut working = 0u64;
+        for h in 0..PPART_MAX_LEN {
+            if h < width {
+                working |= u64::cast_from(p_parts[base + h]) << u64::cast_from(pp_shift[h]);
+            }
         }
-        out[idx] = seqno_core(g, xi, working.as_slice(), width, width);
+        out[idx] = seqno_core_packed(g, xi, pp_shift, pp_mask, working, sq_len, width);
     }
 
     /// Run `seqno_kernel` over `n` padded p_parts and return their seqno indices.
@@ -3044,6 +3118,10 @@ mod tests {
         let pp_h = client.create_from_slice(u32::as_bytes(p_parts));
         let out_h = client.empty(n * size_of::<u32>());
 
+        let (psh, pms) = ppart_shift_mask();
+        let pp_len = psh.len();
+        let psh_h = client.create(Bytes::from_elems(psh));
+        let pms_h = client.create(Bytes::from_elems(pms));
         const THREADS: u32 = 256;
         let cubes = (n as u32).div_ceil(THREADS);
         unsafe {
@@ -3056,6 +3134,9 @@ mod tests {
                 BufferArg::from_raw_parts(pp_h, p_parts.len()),
                 BufferArg::from_raw_parts(out_h.clone(), n),
                 width,
+                BufferArg::from_raw_parts(psh_h, pp_len),
+                BufferArg::from_raw_parts(pms_h, pp_len),
+                width.min(PPART_MAX_LEN),
             );
         }
 
@@ -3081,6 +3162,8 @@ mod tests {
         mk_len: usize,
         width: usize,
         num_limbs: usize,
+        pp_shift: &[u32],
+        pp_mask: &[u32],
     ) {
         let pair = ABSOLUTE_POS;
         if pair >= num_matrices * num_terms {
@@ -3107,6 +3190,9 @@ mod tests {
             width,
             num_limbs,
             WORKING_CAP,
+            PPART_MAX_LEN,
+            pp_shift,
+            pp_mask,
         );
     }
 
@@ -3178,6 +3264,10 @@ mod tests {
         let zeros = vec![0u32; num_limbs];
         let out_h = client.create_from_slice(u32::as_bytes(&zeros));
 
+        let (psh, pms) = ppart_shift_mask();
+        let pp_len = psh.len();
+        let psh_h = client.create(Bytes::from_elems(psh));
+        let pms_h = client.create(Bytes::from_elems(pms));
         let total_pairs = num_matrices * num_terms;
         const THREADS: u32 = 256;
         let cubes = (total_pairs as u32).div_ceil(THREADS).max(1);
@@ -3199,6 +3289,8 @@ mod tests {
                 mk_len,
                 width,
                 num_limbs,
+                BufferArg::from_raw_parts(psh_h, pp_len),
+                BufferArg::from_raw_parts(pms_h, pp_len),
             );
         }
 
