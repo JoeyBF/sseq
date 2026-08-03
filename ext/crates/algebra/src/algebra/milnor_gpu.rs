@@ -1143,6 +1143,89 @@ fn seqno_core_packed(
 /// skips zero entries and `working` beyond the assembled length is zero, so the full
 /// `WORKING_CAP` length is equivalent to the CPU's trimmed p_part (`xi` is host-padded
 /// to `WORKING_CAP` so the `cur_d` sum stays in bounds; the extra terms are `0 · xi`).
+/// Bit [`pair_col`] sets to report that a column rejects the whole product, above the 16 bits the
+/// value itself occupies (`diff | mk` and `b | mk` are all widened from `u16`).
+///
+/// Packing the flag into the return value rather than signalling it out of band keeps the caller
+/// branchless: it ORs the flag into an accumulator and shifts the low half into `working`
+/// unconditionally, exactly as the pre-refactor code did. Guarding the accumulate on a rejection
+/// test instead costs ~11% — twelve divergent branches per thread, one per column.
+const PAIR_COL_REJECT: u32 = 1 << 16;
+
+/// The per-column rule of [`multiply_pair`], factored out so a caller that reads `b`/`cs`/`mk`
+/// from somewhere other than three contiguous slices can reuse it verbatim. Returns the assembled
+/// `working[j]` in the low 16 bits, with [`PAIR_COL_REJECT`] set if this column kills the product
+/// (in which case the value half is meaningless — the caller discards the whole product).
+#[cube]
+fn pair_col(j: usize, low: usize, b: u32, cs: u32, mk: u32) -> u32 {
+    let mut val = 0u32;
+    if j < low {
+        if cs > b {
+            val = PAIR_COL_REJECT;
+        } else {
+            let diff = b - cs;
+            if (diff & mk) != 0u32 {
+                val = PAIR_COL_REJECT;
+            } else {
+                val = diff | mk;
+            }
+        }
+    } else {
+        if cs > 0u32 {
+            val = PAIR_COL_REJECT;
+        } else if (b & mk) != 0u32 {
+            val = PAIR_COL_REJECT;
+        } else {
+            val = b | mk;
+        }
+    }
+    val
+}
+
+/// Tail of [`multiply_pair`] for an accepted product: index the assembled p-part and XOR its
+/// F₂ bit into `out`. Split out alongside [`pair_col`] so both callers share it.
+#[cube]
+#[allow(clippy::too_many_arguments)]
+fn pair_emit(
+    g: &[u32],
+    xi: &[u32],
+    out: &mut [Atomic<u32>],
+    working: u64,
+    row_base: usize,
+    out_offset: usize,
+    width: usize,
+    num_limbs: usize,
+    #[comptime] sq_len: usize,
+    pp_shift: &[u32],
+    pp_mask: &[u32],
+) {
+    // `seqno` indexes the algebra basis of the output degree; `out_offset` shifts it
+    // to this product's target-generator block within the row (0 for a single-block
+    // output). Both are bit offsets, added before splitting into (limb, bit).
+    // Only the first `PPART_MAX_LEN` positions can be non-zero (see `multiply_pair`'s
+    // accumulator), so the rank loop stops at `sq_len = min(work_cap, PPART_MAX_LEN)`, computed on
+    // the host (comptime arithmetic does not lower inside a `#[cube]` fn).
+    let idx = seqno_core_packed(g, xi, pp_shift, pp_mask, working, sq_len, width);
+    let global_bit = out_offset + usize::cast_from(idx);
+    let limb = global_bit / 32;
+    // Device-side mirror of the host's defensive mask: `nassau_gpu::get_partial_matrix_restricted`
+    // launches at the full output width but masks bits `>= target_dim` on readback because a kept
+    // block's `out_offset + seqno` can span past it. Skip writes past this row's `num_limbs` — they
+    // would otherwise overrun into the next row (silent corruption) or past the buffer (an OOB
+    // atomic; compute-sanitizer confirmed `Invalid __global__ atomic ... out of bounds`).
+    // Two independent bounds, both required: `limb < num_limbs` keeps the write inside this row
+    // (out_offset + seqno can span past it), and `word < out.len()` guards the row itself — a
+    // `row_base` that overruns the buffer (compute-sanitizer caught this as a second OOB atomic at
+    // higher degree, distinct from the intra-row overflow) would otherwise write past the end.
+    if limb < num_limbs {
+        let word = row_base + limb;
+        if word < out.len() {
+            let bit = u32::cast_from(global_bit % 32);
+            out[word].fetch_xor(1u32 << bit);
+        }
+    }
+}
+
 #[cube]
 #[allow(clippy::too_many_arguments)]
 fn multiply_pair(
@@ -1182,7 +1265,7 @@ fn multiply_pair(
     // while `PPart::MAX_DEGREE` is 2045. `MAX_LEN = 10` is therefore forced by that bound, not a
     // cap something could exceed — which is also why `PPart::set` can assert `i < MAX_LEN`.
     let mut working = 0u64;
-    let mut rejected = false;
+    let mut rejected = 0u32;
 
     for j in 0..work_cap {
         let mut b = 0u32;
@@ -1198,58 +1281,17 @@ fn multiply_pair(
             mk = u32::cast_from(masks[mk_base + j]);
         }
 
-        let mut val = 0u32;
-        if j < low {
-            if cs > b {
-                rejected = true;
-            } else {
-                let diff = b - cs;
-                if (diff & mk) != 0u32 {
-                    rejected = true;
-                } else {
-                    val = diff | mk;
-                }
-            }
-        } else {
-            if cs > 0u32 {
-                rejected = true;
-            }
-            if (b & mk) != 0u32 {
-                rejected = true;
-            }
-            val = b | mk;
-        }
+        let val = pair_col(j, low, b, cs, mk);
+        rejected |= val & PAIR_COL_REJECT;
         if j < PPART_MAX_LEN {
-            working |= u64::cast_from(val) << u64::cast_from(pp_shift[j]);
+            working |= u64::cast_from(val & 0xffffu32) << u64::cast_from(pp_shift[j]);
         }
     }
 
-    if !rejected {
-        // `seqno` indexes the algebra basis of the output degree; `out_offset` shifts it
-        // to this product's target-generator block within the row (0 for a single-block
-        // output). Both are bit offsets, added before splitting into (limb, bit).
-        // Only the first `PPART_MAX_LEN` positions can be non-zero (see the accumulator above),
-        // so the rank loop stops at `sq_len = min(work_cap, PPART_MAX_LEN)`, computed on the host
-        // (comptime arithmetic does not lower inside a `#[cube]` fn).
-        let idx = seqno_core_packed(g, xi, pp_shift, pp_mask, working, sq_len, width);
-        let global_bit = out_offset + usize::cast_from(idx);
-        let limb = global_bit / 32;
-        // Device-side mirror of the host's defensive mask: `nassau_gpu::get_partial_matrix_restricted`
-        // launches at the full output width but masks bits `>= target_dim` on readback because a kept
-        // block's `out_offset + seqno` can span past it. Skip writes past this row's `num_limbs` — they
-        // would otherwise overrun into the next row (silent corruption) or past the buffer (an OOB
-        // atomic; compute-sanitizer confirmed `Invalid __global__ atomic ... out of bounds`).
-        // Two independent bounds, both required: `limb < num_limbs` keeps the write inside this row
-        // (out_offset + seqno can span past it), and `word < out.len()` guards the row itself — a
-        // `row_base` that overruns the buffer (compute-sanitizer caught this as a second OOB atomic at
-        // higher degree, distinct from the intra-row overflow) would otherwise write past the end.
-        if limb < num_limbs {
-            let word = row_base + limb;
-            if word < out.len() {
-                let bit = u32::cast_from(global_bit % 32);
-                out[word].fetch_xor(1u32 << bit);
-            }
-        }
+    if rejected == 0u32 {
+        pair_emit(
+            g, xi, out, working, row_base, out_offset, width, num_limbs, sq_len, pp_shift, pp_mask,
+        );
     }
 }
 
@@ -1278,22 +1320,29 @@ fn multiply_pair(
 // prefix covers every offset, `seg_read_*` selects the owning segment, and the per-column `j` guards).
 //
 // The master (`cs*`/`mk*`) and basis (`pp*`/`ln*`) are each a segmented, no-copy-growth store bound as
-// [`MASTER_MAX_SEG`] separate segment `Array`s (cubecl has no array-of-buffers). A thread GATHERS its
-// one matrix's `col_sums`/`masks` and its term's p-part out of the segments into small local arrays
-// via `seg_read_*` (correct for any offset, straddle or not — no layout padding needed), then hands
-// those contiguous locals to `multiply_pair`, which stays a pure segmentation-agnostic arithmetic
-// core. `seg_elems` is the segment element count (`o / seg_elems` picks the segment).
-// OCCUPANCY (pending an upstream cubecl change): this kernel is register-bound, and ptxas without
-// a `minBlocksPerSM` target settles at 78 registers = 3 blocks/SM = 37.5% occupancy (matching a
-// sampled 36.8% "Compute Warps in Flight", with 63% of warp slots idle). Asking for 4 blocks/SM
-// measured +6.2% (7.61e9 -> 8.08e9 pairs/s) for 130 bytes of spill stores; 5 and 6 tie within
-// noise, 7-8 lose 12% as spilling overtakes the gain.
+// [`MASTER_MAX_SEG`] separate segment `Array`s (cubecl has no array-of-buffers). A thread reads its
+// one matrix's `col_sums`/`masks` and its term's p-part out of the segments via `seg_read_*` (correct
+// for any offset, straddle or not — no layout padding needed), one column at a time, straight into
+// the arithmetic. `seg_elems` is the segment element count (`o / seg_elems` picks the segment).
 //
-// It is not enabled here because cubecl emits only `__launch_bounds__(<threads>)` -- there is no
-// way to request the second argument. The change is prepared as
-// `~/cubecl-min-blocks-per-sm.patch` (adds `KernelOptions::min_blocks_per_sm` and a
-// `min_blocks_per_sm = N` argument to `#[cube(..)]`, mirroring `cluster_dim`); once it lands
-// upstream, add `min_blocks_per_sm = 4` below and re-measure.
+// OCCUPANCY: this kernel was register-bound, and the register count is essentially a function of how
+// much per-thread state it holds. Two successive removals took it from 78 registers (3 blocks/SM,
+// 37.5% — matching a sampled 36.8% "Compute Warps in Flight") to 48 (packing `working` into a `u64`)
+// to 40 (fusing the `cs_local`/`mk_local`/`term_local` gather into the column loop), i.e. 6
+// blocks/SM = 75%, with zero spill at every tier. Nothing of `work_cap` length lives in a thread any
+// more, so occupancy no longer scales with the internal degree either. Measured +5.6% on the
+// stem-200 bench (6.43 -> 6.79 e9 pairs/s, four paired rounds, arms non-overlapping).
+//
+// That retired a planned upstream cubecl change: cubecl emits only `__launch_bounds__(<threads>)`,
+// and forcing the second argument (`~/cubecl-min-blocks-per-sm.patch`, mirroring `cluster_dim`) was
+// worth +6.2% back when ptxas settled at 78 registers. It is moot now — ptxas picks 6 blocks/SM on
+// its own, past the 4 the patch would have asked for, so the floor it sets would never bind.
+//
+// Occupancy is no longer the constraint, and pushing it further is not obviously the next move: an
+// intermediate variant reached 35 registers (7 blocks/SM) by branching on the rejection test instead
+// of accumulating it, and measured ~11% SLOWER — twelve divergent branches per thread cost more than
+// the extra resident warp bought. Unrolling the column loop (`#[unroll]`) was throughput-neutral and
+// quadrupled the code, so it is deliberately not used.
 #[cube(launch_unchecked, address_type = "u64")]
 #[allow(clippy::too_many_arguments)]
 fn multiply_batch_kernel(
@@ -1390,14 +1439,17 @@ fn multiply_batch_kernel(
     pp_mask: &[u32],
     // `min(work_cap, PPART_MAX_LEN)`: how far the packed rank loop runs.
     #[comptime] sq_len: usize,
-    // Per-thread working-array size, specialised per launch to what THIS block actually needs
+    // Per-thread column count, specialised per launch to what THIS block actually needs
     // (`max(mk_len, term_len)`, rounded up), not the global worst case.
     //
-    // This is the kernel's dominant cost. Every thread holds four arrays of this length
-    // (`working` u32 plus `cs_local`/`mk_local`/`term_local` u16), so the constant sets register
-    // pressure and hence occupancy: measured 36% compute warps in flight with 64% of warp slots
+    // This used to be the kernel's dominant cost: every thread held four arrays of this length
+    // (`working` u32 plus `cs_local`/`mk_local`/`term_local` u16), so the constant set register
+    // pressure and hence occupancy — measured 36% compute warps in flight with 64% of warp slots
     // unallocated at the old fixed 32. Shrinking it to what the data needs measured +28%
-    // (5.97 -> 7.64 e9 pairs/s).
+    // (5.97 -> 7.64 e9 pairs/s). All four arrays are gone now (`working` packs into a `u64`, the
+    // other three were fused away into the loop below), so what is left is the trip count of a
+    // loop over scalars; keeping it tight still shortens that loop, but it no longer gates
+    // occupancy. It stays comptime so the trip count is a literal rather than a loaded scalar.
     //
     // It must NOT be hardcoded. `mk_len = rows + cols - 1` grows with internal degree: 16 suffices
     // to t~510, but a 9th xi appears at t>=511 and it becomes 17, then 18 past 1023. A fixed 16
@@ -1457,17 +1509,29 @@ fn multiply_batch_kernel(
         seg_elems, num_segs,
     ));
 
-    // Gather this thread's matrix / term out of the segmented stores into contiguous locals, then run
-    // the pure arithmetic core on them (base 0). Entries past each length are zero, matching
-    // `multiply_pair`'s own out-of-range convention. The loop bounds at `WORKING_CAP`, exactly as the
-    // core does, so any `mk_len > WORKING_CAP` tail (never read by the core) is likewise not gathered.
-    let mut cs_local = Array::<u16>::new(work_cap);
-    let mut mk_local = Array::<u16>::new(work_cap);
-    let mut term_local = Array::<u16>::new(work_cap);
+    // The arithmetic of `multiply_pair`, with this thread's matrix / term read straight out of the
+    // segmented stores column by column. It used to gather into three `Array::<u16>::new(work_cap)`
+    // locals and call `multiply_pair` on them, but each entry is consumed exactly once, at the same
+    // `j`, by that function's own `0..work_cap` loop — so the arrays only ferried values between two
+    // loops with identical bounds. Fusing them deletes `work_cap x 3 x u16` of per-thread state,
+    // which is what caps occupancy (see the kernel's `work_cap` note). The per-column rule and the
+    // output tail stay shared with the single-`R` path via `pair_col` / `pair_emit`, so the two
+    // callers cannot drift.
+    //
+    // Entries past each length read as zero, matching `multiply_pair`'s out-of-range convention;
+    // the loop bounds at `work_cap` exactly as the core does, so any `mk_len > work_cap` tail is
+    // neither read nor needed.
+    let mut low = cs_len;
+    if term_len < cs_len {
+        low = term_len;
+    }
+    let mut working = 0u64;
+    let mut rejected = 0u32;
+
     for j in 0..work_cap {
-        let mut c = 0u16;
+        let mut cs = 0u32;
         if j < cs_len {
-            c = seg_read_u16(
+            cs = u32::cast_from(seg_read_u16(
                 cs0,
                 cs1,
                 cs2,
@@ -1487,12 +1551,11 @@ fn multiply_batch_kernel(
                 cs_off + j,
                 seg_elems,
                 num_segs,
-            );
+            ));
         }
-        cs_local[j] = c;
-        let mut mm = 0u16;
+        let mut mk = 0u32;
         if j < mk_len {
-            mm = seg_read_u16(
+            mk = u32::cast_from(seg_read_u16(
                 mk0,
                 mk1,
                 mk2,
@@ -1512,12 +1575,11 @@ fn multiply_batch_kernel(
                 mk_off + j,
                 seg_elems,
                 num_segs,
-            );
+            ));
         }
-        mk_local[j] = mm;
-        let mut b = 0u16;
+        let mut b = 0u32;
         if j < term_len {
-            b = seg_read_u16(
+            b = u32::cast_from(seg_read_u16(
                 pp0,
                 pp1,
                 pp2,
@@ -1537,33 +1599,31 @@ fn multiply_batch_kernel(
                 pp_off + j,
                 seg_elems,
                 num_segs,
-            );
+            ));
         }
-        term_local[j] = b;
+
+        let val = pair_col(j, low, b, cs, mk);
+        rejected |= val & PAIR_COL_REJECT;
+        if j < PPART_MAX_LEN {
+            working |= u64::cast_from(val & 0xffffu32) << u64::cast_from(pp_shift[j]);
+        }
     }
 
-    multiply_pair(
-        cs_local.as_slice(),
-        mk_local.as_slice(),
-        term_local.as_slice(),
-        g,
-        xi,
-        out,
-        0,
-        0,
-        0,
-        term_len,
-        cs_len,
-        mk_len,
-        usize::cast_from(prod_row_base[p]),
-        usize::cast_from(prod_out_offset[p]),
-        width,
-        num_limbs,
-        work_cap,
-        sq_len,
-        pp_shift,
-        pp_mask,
-    );
+    if rejected == 0u32 {
+        pair_emit(
+            g,
+            xi,
+            out,
+            working,
+            usize::cast_from(prod_row_base[p]),
+            usize::cast_from(prod_out_offset[p]),
+            width,
+            num_limbs,
+            sq_len,
+            pp_shift,
+            pp_mask,
+        );
+    }
 }
 
 /// One `Sq(R) · s` product of a batched launch, written into output row `row` at bit
