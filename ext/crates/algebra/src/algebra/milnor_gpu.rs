@@ -80,6 +80,12 @@ const ENUM_MASK_CAP: usize = ENUM_ROW_CAP + ENUM_COL_CAP;
 /// grid (`pairs / 256` cubes ≈ 1.5e7) far under CUDA's `2^31 - 1` grid-dimension limit.
 const GPU_PAIR_CHUNK: usize = 3_900_000_000;
 
+/// Chunk size (log2) of the multiply kernel's coarse product index. One entry per `2^COARSE_LOG`
+/// pairs, so a launch of billions of pairs needs a table of a few thousand `u32` — negligible to
+/// build and upload, and it turns the per-thread product lookup from a full binary search over
+/// every product into a scan bounded by how many products one chunk spans.
+const COARSE_LOG: usize = 20;
+
 /// Per-launch output-buffer budget in bytes (`NASSAU_GPU_BLOCK_MB`, default 512 MiB).
 ///
 /// A launch's transient footprint — host marshal buffers, pinned staging, device buffers, and
@@ -1444,13 +1450,14 @@ fn multiply_batch_kernel(
     prod_row_base: &[u32],
     prod_out_offset: &[u32],
     prod_pair_start: &[u32],
+    prod_coarse: &[u32],
     width: usize,
     seg_elems: usize,
     num_limbs: usize,
-    // Runtime scalar, deliberately NOT `#[comptime]`: it is `ceil(log2(num_products))`, which
-    // differs block to block, so specialising on it forces an NVRTC recompile per distinct value
-    // (measured: bench spread widened from 0.7% to 5.6%). The win here is executing ~15 iterations
-    // instead of a fixed 32, which needs no unrolling.
+    // Runtime scalar, deliberately NOT `#[comptime]`: it differs block to block, so specialising on
+    // it forces an NVRTC recompile per distinct value (measured: bench spread widened from 0.7% to
+    // 5.6%). With the coarse index below it is `ceil(log2(chunk span))`, typically a couple of
+    // steps rather than the ~15 a full search over every product needed.
     search_iters: usize,
     // Comptime is right here: at most `MASTER_MAX_SEG` distinct values, so the select chain folds
     // to the segments that exist without a recompile storm.
@@ -1485,13 +1492,20 @@ fn multiply_batch_kernel(
     // Largest product `p` with `prod_pair_start[p] <= k` (every product owns ≥ 1 pair,
     // so `prod_pair_start` is strictly increasing and `p` is unique).
     //
-    // `search_iters` is `ceil(log2(num_products))`, computed on the host and passed as a bare
-    // scalar, which cubecl bakes in as a compile-time constant — so the loop unrolls to exactly
-    // the steps the search needs. It was a fixed 32, and each step is a DEPENDENT global load of
-    // `prod_pair_start[mid]`, so the surplus iterations were a pure latency chain on every thread.
-    // At the measured p50 of ~24k products this is 15 steps rather than 32.
-    let mut lo = 0usize;
-    let mut hi = num_products;
+    // `prod_coarse` brackets the answer before the search starts: entry `ci` is the product owning
+    // pair `ci << COARSE_LOG`, so `p` is in `prod_coarse[ci] ..= prod_coarse[ci + 1]`. Products are
+    // ordered and every product owns >= 1 pair, so the bracket is valid; the sentinel entry keeps
+    // `ci + 1` readable for the final chunk.
+    //
+    // Each search step is a DEPENDENT global load of `prod_pair_start[mid]` — a full latency stall
+    // before a thread can touch its own data — and ablation put the unbracketed search at ~12% of
+    // kernel time. Two cheap loads replace ~15 dependent ones.
+    let ci = k >> COARSE_LOG;
+    let mut lo = usize::cast_from(prod_coarse[ci]);
+    let mut hi = usize::cast_from(prod_coarse[ci + 1]) + 1;
+    if hi > num_products {
+        hi = num_products;
+    }
     for _ in 0..search_iters {
         if hi - lo > 1 {
             let mid = (lo + hi) / 2;
@@ -2272,6 +2286,33 @@ fn multiply_batch_block(
         "block pair count {total_pairs} exceeds the kernel's u32 thread limit"
     );
     pps.push(total_pairs as u32);
+
+    // Coarse index over the pair space: `coarse[i]` is the product owning pair `i << COARSE_LOG`,
+    // so the product for a thread at pair `k` lies in `coarse[ci] ..= coarse[ci + 1]` for
+    // `ci = k >> COARSE_LOG`. Ablation put the unaided binary search at ~12% of kernel time, and it
+    // is the worst kind of work: `ceil(log2(num_products))` *dependent* global loads, each a full
+    // latency stall, before a thread can touch any of its own data.
+    let mut coarse: Vec<u32> = Vec::with_capacity((total_pairs >> COARSE_LOG) + 2);
+    {
+        let mut pi = 0usize;
+        let mut k = 0usize;
+        while k <= total_pairs {
+            while pi + 1 < products.len() && (pps[pi + 1] as usize) <= k {
+                pi += 1;
+            }
+            coarse.push(pi as u32);
+            k += 1 << COARSE_LOG;
+        }
+        // Sentinel: `ci + 1` must be readable for threads in the final chunk.
+        coarse.push(products.len().saturating_sub(1) as u32);
+    }
+    // Widest product span any chunk covers, so the in-kernel scan has a static iteration bound.
+    let coarse_span = coarse
+        .windows(2)
+        .map(|w| (w[1] - w[0]) as usize)
+        .max()
+        .unwrap_or(0);
+
     let out_len = num_rows * num_limbs;
     // Output offsets (`prod_out_offset`/`prod_row_base`) are `u32` values indexing `out_h`; the
     // row-block splitter caps `out_len` well under `u32::MAX` (its output-byte budget is far below
@@ -2545,10 +2586,14 @@ fn multiply_batch_block(
             let prb_h = client.create(Bytes::from_elems(prod_row_base));
             let poo_h = client.create(Bytes::from_elems(prod_out_offset));
             let pps_h = client.create(Bytes::from_elems(pps));
+            let coarse_len = coarse.len();
+            let coarse_h = client.create(Bytes::from_elems(coarse));
             let cubes = (total_pairs as u32).div_ceil(THREADS).max(1);
-            // Exactly the binary-search depth this block needs (see the kernel): passed bare so cubecl
-            // specialises the trip count instead of always running 32 dependent loads.
-            let search_iters = usize::BITS as usize - num_products.max(1).leading_zeros() as usize;
+            // Search depth over a single coarse chunk's product span, not over every product: the
+            // coarse index brackets the answer first, so this is `ceil(log2(span))` rather than
+            // `ceil(log2(num_products))`.
+            let search_iters =
+                usize::BITS as usize - (coarse_span + 1).max(1).leading_zeros() as usize;
             // 80 bytes per launch; lets the kernel unpack `working` without a per-thread array.
             let (pp_shift_h, pp_mask_h) = ppart_shift_mask();
             let pp_shift_len = pp_shift_h.len();
@@ -2683,6 +2728,7 @@ fn multiply_batch_block(
                     BufferArg::from_raw_parts(prb_h, num_products),
                     BufferArg::from_raw_parts(poo_h, num_products),
                     BufferArg::from_raw_parts(pps_h, pps_len),
+                    BufferArg::from_raw_parts(coarse_h, coarse_len),
                     width,
                     seg_elems,
                     num_limbs,
