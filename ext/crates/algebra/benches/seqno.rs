@@ -51,7 +51,7 @@ fn seqno(c: &mut Criterion) {
         g.bench_function(format!("basis_to_index/deg{degree}"), |b| {
             b.iter(|| {
                 for elt in &basis {
-                    black_box(algebra.seqno(&elt.p_part));
+                    black_box(algebra.seqno(elt.p_part));
                 }
             });
         });

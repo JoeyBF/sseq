@@ -28,7 +28,7 @@ use cubecl_common::bytes::Bytes;
 // Bounds the per-thread enumeration state ([`ENUM_ROW_CAP`]) and the `#[cfg(test)]` `seqno_kernel`'s
 // working array; the multiply kernel uses `WORKING_CAP`.
 use crate::algebra::combinatorics::MAX_XI_TAU;
-use crate::algebra::{Algebra, MilnorAlgebra, combinatorics::xi_degrees};
+use crate::algebra::{Algebra, MilnorAlgebra, combinatorics::xi_degrees, milnor_algebra::PPart};
 
 /// Comptime capacity for the per-thread `working` p_part in the multiply kernel.
 /// The assembled p_part has length `max(term_len, mk_len)` before trimming, where
@@ -459,7 +459,7 @@ struct ResidentHost {
     mk_pending: Vec<u16>,
     cs_len: usize,
     mk_len: usize,
-    index: HashMap<Vec<PPartEntry>, RInfo>,
+    index: HashMap<PPart, RInfo>,
 }
 
 static RESIDENT_HOST: LazyLock<RwLock<ResidentHost>> =
@@ -588,24 +588,20 @@ macro_rules! resident_seqno {
 /// old array cache: the evicted tail of the master (tens of GB) lives neither on the device nor the
 /// host. The count is computed once per distinct `R` (via `admissible_matrices`, whose arrays are
 /// dropped immediately) and memoized, so the per-launch cost is an `O(1)` lookup.
-static COLD_COUNT: LazyLock<RwLock<HashMap<Vec<PPartEntry>, (u32, u32, u32)>>> =
+static COLD_COUNT: LazyLock<RwLock<HashMap<PPart, (u32, u32, u32)>>> =
     LazyLock::new(|| RwLock::new(HashMap::new()));
 
 /// Cold-`R` admissible-matrix shape `(cs_len, mk_len, num_mats)` from the [`COLD_COUNT`] cache. On a
 /// miss it runs `admissible_matrices` purely to *count* (the returned arrays are dropped, not kept —
 /// the device enumerates them), then memoizes the triple. Layout matches [`resident_info`]'s so the
 /// kernel indexes the on-device-enumerated scratch identically to the resident master.
-fn cold_count(algebra: &MilnorAlgebra, p_part: &[PPartEntry]) -> (u32, u32, u32) {
-    if let Some(&e) = COLD_COUNT.read().unwrap().get(p_part) {
+fn cold_count(algebra: &MilnorAlgebra, p_part: PPart) -> (u32, u32, u32) {
+    if let Some(&e) = COLD_COUNT.read().unwrap().get(&p_part) {
         return e;
     }
     let (cs_len, mk_len, _cs, mk) = algebra.admissible_matrices(p_part);
     let e = (cs_len as u32, mk_len as u32, (mk.len() / mk_len) as u32);
-    COLD_COUNT
-        .write()
-        .unwrap()
-        .entry(p_part.to_vec())
-        .or_insert(e);
+    COLD_COUNT.write().unwrap().entry(p_part).or_insert(e);
     e
 }
 
@@ -718,16 +714,16 @@ struct RStat {
     last: u64,
 }
 
-static R_STATS: LazyLock<Option<Mutex<HashMap<Vec<PPartEntry>, RStat>>>> =
+static R_STATS: LazyLock<Option<Mutex<HashMap<PPart, RStat>>>> =
     LazyLock::new(|| std::env::var_os("NASSAU_R_STATS").map(|_| Mutex::new(HashMap::new())));
 
 /// Internal degree of `R` from its p-part: `Σ p_part[i] · deg(ξ_{i+1})`.
-fn ppart_degree(p_part: &[PPartEntry]) -> i32 {
+fn ppart_degree(p_part: PPart) -> i32 {
     let xi = xi_degrees(fp::prime::ValidPrime::new(2));
     p_part
         .iter()
         .zip(xi.iter())
-        .map(|(&e, &d)| e as i32 * d as i32)
+        .map(|(e, &d)| e as i32 * d as i32)
         .sum()
 }
 
@@ -762,11 +758,11 @@ enum MasterMode {
     Transient,
 }
 
-fn record_r_use(p_part: &[PPartEntry]) {
+fn record_r_use(p_part: PPart) {
     if let Some(m) = R_STATS.as_ref() {
         let now = BATCH_CALLS.load(Ordering::Relaxed);
         let mut map = m.lock().unwrap();
-        let e = map.entry(p_part.to_vec()).or_insert(RStat {
+        let e = map.entry(p_part).or_insert(RStat {
             count: 0,
             degree: ppart_degree(p_part),
             first: now,
@@ -864,9 +860,9 @@ pub fn dump_r_stats() {
     );
 }
 
-fn resident_info(algebra: &MilnorAlgebra, p_part: &[PPartEntry]) -> RInfo {
+fn resident_info(algebra: &MilnorAlgebra, p_part: PPart) -> RInfo {
     record_r_use(p_part);
-    if let Some(info) = RESIDENT_HOST.read().unwrap().index.get(p_part) {
+    if let Some(info) = RESIDENT_HOST.read().unwrap().index.get(&p_part) {
         return *info;
     }
     // Miss: enumerate the admissible matrices (expensive, CPU) and then append under the WRITE
@@ -876,7 +872,7 @@ fn resident_info(algebra: &MilnorAlgebra, p_part: &[PPartEntry]) -> RInfo {
     RESIDENT_MISSES.fetch_add(1, Ordering::Relaxed);
     let (cs_len, mk_len, cs, mk) = algebra.admissible_matrices(p_part);
     let mut host = RESIDENT_HOST.write().unwrap();
-    if let Some(info) = host.index.get(p_part) {
+    if let Some(info) = host.index.get(&p_part) {
         return *info;
     }
     // Offsets are the running LOGICAL lengths (`*_len`), not the pending-buffer lengths — the
@@ -892,7 +888,7 @@ fn resident_info(algebra: &MilnorAlgebra, p_part: &[PPartEntry]) -> RInfo {
     host.mk_pending.extend(mk.iter().map(|&v| narrow_u16(v)));
     host.cs_len += cs.len();
     host.mk_len += mk.len();
-    host.index.insert(p_part.to_vec(), info);
+    host.index.insert(p_part, info);
     info
 }
 
@@ -968,7 +964,10 @@ fn ensure_basis(algebra: &MilnorAlgebra, width: usize, max_degree: i32) -> Vec<u
             host.lens.push(elt.p_part.len() as u32);
             let base = host.pparts.len();
             host.pparts.resize(base + width, 0);
-            for (slot, &v) in host.pparts[base..base + width].iter_mut().zip(&elt.p_part) {
+            for (slot, v) in host.pparts[base..base + width]
+                .iter_mut()
+                .zip(elt.p_part.iter())
+            {
                 *slot = narrow_u16(v);
             }
         }
@@ -1784,8 +1783,8 @@ fn multiply_batch_grouped(
             .map(|prod| {
                 let r = algebra.basis_element_from_index(prod.r_degree, prod.r_idx);
                 let num_mats = match mode {
-                    MasterMode::Resident => resident_info(algebra, &r.p_part).num_mats as usize,
-                    MasterMode::Transient => cold_count(algebra, &r.p_part).2 as usize,
+                    MasterMode::Resident => resident_info(algebra, r.p_part).num_mats as usize,
+                    MasterMode::Transient => cold_count(algebra, r.p_part).2 as usize,
                 };
                 num_mats * prod.term_indices.len()
             })
@@ -1966,7 +1965,10 @@ fn multiply_batch_block(
             for (k, &ti) in prod.term_indices.iter().enumerate() {
                 let elt = algebra.basis_element_from_index(prod.s_degree, ti);
                 tll[k] = elt.p_part.len() as u32;
-                for (slot, &v) in tpp[k * width..(k + 1) * width].iter_mut().zip(&elt.p_part) {
+                for (slot, v) in tpp[k * width..(k + 1) * width]
+                    .iter_mut()
+                    .zip(elt.p_part.iter())
+                {
                     *slot = narrow_u16(v);
                 }
             }
@@ -2040,7 +2042,7 @@ fn multiply_batch_block(
         assert!(!r.p_part.is_empty(), "each R must be non-empty");
         match mode {
             MasterMode::Resident => {
-                let info = resident_info(algebra, &r.p_part);
+                let info = resident_info(algebra, r.p_part);
                 r_cs_offset.push(info.cs_off);
                 r_mk_offset.push(info.mk_off);
                 r_cs_len.push(info.cs_len);
@@ -2052,7 +2054,7 @@ fn multiply_batch_block(
                     .max(info.mk_off as usize + info.num_mats as usize * info.mk_len as usize);
             }
             MasterMode::Transient => {
-                let (cs_len, mk_len, num_mats) = cold_count(algebra, &r.p_part);
+                let (cs_len, mk_len, num_mats) = cold_count(algebra, r.p_part);
                 r_cs_offset.push(need_cs as u64);
                 r_mk_offset.push(need_mk as u64);
                 r_cs_len.push(cs_len);
@@ -2063,7 +2065,7 @@ fn multiply_batch_block(
                 let cols = r
                     .p_part
                     .iter()
-                    .map(|&x| u32::BITS - x.leading_zeros())
+                    .map(|x| u32::BITS - x.leading_zeros())
                     .max()
                     .unwrap();
                 debug_assert_eq!(
@@ -2072,7 +2074,7 @@ fn multiply_batch_block(
                 );
                 enum_rows.push(r.p_part.len() as u32);
                 enum_cols.push(cols);
-                enum_pp_rows.push(r.p_part.clone());
+                enum_pp_rows.push(r.p_part.iter().collect::<Vec<_>>());
                 need_cs += num_mats as usize * cs_len as usize;
                 need_mk += num_mats as usize * mk_len as usize;
             }
@@ -3135,7 +3137,7 @@ mod tests {
             !r.p_part.is_empty(),
             "R must be non-empty (Sq(∅) = 1 is the identity)"
         );
-        let (cs_len, mk_len, cs32, mk32) = algebra.admissible_matrices(&r.p_part);
+        let (cs_len, mk_len, cs32, mk32) = algebra.admissible_matrices(r.p_part);
         // Ship admissible-matrix / term data as u16 (see `multiply_batch_on_gpu`).
         let mut col_sums: Vec<u16> = cs32.iter().map(|&v| narrow_u16(v)).collect();
         let masks: Vec<u16> = mk32.iter().map(|&v| narrow_u16(v)).collect();
@@ -3148,9 +3150,9 @@ mod tests {
         for (t, &ti) in term_indices.iter().enumerate() {
             let elt = algebra.basis_element_from_index(s_degree, ti);
             term_lens[t] = elt.p_part.len() as u32;
-            for (slot, &v) in term_pparts[t * width..(t + 1) * width]
+            for (slot, v) in term_pparts[t * width..(t + 1) * width]
                 .iter_mut()
-                .zip(&elt.p_part)
+                .zip(elt.p_part.iter())
             {
                 *slot = narrow_u16(v);
             }
@@ -3543,7 +3545,11 @@ mod tests {
             let mut exp_cs: Vec<u16> = Vec::new();
             let mut exp_mk: Vec<u16> = Vec::new();
             for idx in 0..algebra.dimension(deg) {
-                let pp = algebra.basis_element_from_index(deg, idx).p_part.clone();
+                let pp: Vec<u32> = algebra
+                    .basis_element_from_index(deg, idx)
+                    .p_part
+                    .iter()
+                    .collect();
                 if pp.is_empty() {
                     continue;
                 }
@@ -3717,13 +3723,18 @@ mod tests {
             let (mut pps, mut nms, mut cs_all, mut mk_all) =
                 (Vec::new(), Vec::new(), Vec::new(), Vec::new());
             for idx in 0..algebra.dimension(deg) {
-                let pp = algebra.basis_element_from_index(deg, idx).p_part.clone();
+                let pp: Vec<u32> = algebra
+                    .basis_element_from_index(deg, idx)
+                    .p_part
+                    .iter()
+                    .collect();
                 if pp.is_empty() {
                     continue;
                 }
                 // Time the CPU enumeration (`admissible_matrices`, the call the CPU multiply makes).
                 let t = Instant::now();
-                let (_cs_len, mk_len, cs, mk) = algebra.admissible_matrices(&pp);
+                let (_cs_len, mk_len, cs, mk) =
+                    algebra.admissible_matrices(PPart::try_from_slice(&pp).unwrap());
                 cpu_secs += t.elapsed().as_secs_f64();
                 let nm = (mk.len() / mk_len) as u32;
                 nms.push(nm);
@@ -3791,11 +3802,15 @@ mod tests {
         let mut checked = 0usize;
         for deg in 1..=max_degree {
             for idx in 0..algebra.dimension(deg) {
-                let p_part = algebra.basis_element_from_index(deg, idx).p_part.clone();
+                let p_part: Vec<u32> = algebra
+                    .basis_element_from_index(deg, idx)
+                    .p_part
+                    .iter()
+                    .collect();
                 if p_part.is_empty() {
                     continue;
                 }
-                let want = algebra.admissible_matrices(&p_part);
+                let want = algebra.admissible_matrices(PPart::try_from_slice(&p_part).unwrap());
                 let got = enumerate_admissible_ref(&p_part);
                 assert_eq!(got, want, "R degree {deg} idx {idx} p_part {p_part:?}");
                 checked += 1;
@@ -3843,7 +3858,7 @@ mod tests {
             for i in 0..dim {
                 let elt = algebra.basis_element_from_index(d, i);
                 let mut row = vec![0u32; width];
-                for (slot, &v) in row.iter_mut().zip(&elt.p_part) {
+                for (slot, v) in row.iter_mut().zip(elt.p_part.iter()) {
                     *slot = v;
                 }
                 p_parts.extend_from_slice(&row);
