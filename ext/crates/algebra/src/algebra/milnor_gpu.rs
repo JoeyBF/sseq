@@ -209,14 +209,15 @@ mod gpu_thread {
         sync::{
             OnceLock,
             atomic::{AtomicU64, Ordering},
-            mpsc::{self, Sender},
+            mpsc,
         },
         time::Instant,
     };
 
+    use crossbeam_channel::{Sender, unbounded};
     use cubecl_common::stream_id::StreamId;
 
-    /// Jobs enqueued but not yet started, i.e. how deep the FIFO is when a worker joins it.
+    /// Jobs enqueued but not yet started: the shared queue's depth when a worker joins it.
     static DEPTH: AtomicU64 = AtomicU64::new(0);
 
     type Task = Box<dyn FnOnce() + Send + 'static>;
@@ -231,27 +232,46 @@ mod gpu_thread {
         pub depth: u64,
     }
 
-    fn sender() -> &'static Sender<Task> {
-        static QUEUE: OnceLock<Sender<Task>> = OnceLock::new();
-        QUEUE.get_or_init(|| {
-            let (tx, rx) = mpsc::channel::<Task>();
-            std::thread::Builder::new()
-                .name("nassau-gpu".into())
-                .spawn(move || {
-                    // Bind the stream once for the whole loop: one stream, one driver thread.
-                    StreamId { value: 0 }.executes(|| {
-                        while let Ok(task) = rx.recv() {
-                            task();
-                        }
-                    });
-                })
-                .expect("failed to spawn the nassau-gpu thread");
-            tx
+    /// One queue PER DEVICE. A shared pull-queue would balance better — a worker takes the next job
+    /// the instant it frees up, with no need to predict job size — but the sharded master makes work
+    /// device-AFFINE: an `R`'s rows live on exactly one device, so its products can only run there.
+    /// Balance therefore comes from spreading `R`s evenly (round-robin at first sight), not from
+    /// letting idle workers steal.
+    ///
+    /// Each worker owns its device, its stream, and (via the thread-local set here) its own replica
+    /// of the resident master/basis, so a device handle can never reach another device's client.
+    ///
+    /// `crossbeam-channel` because this is genuinely multi-consumer: std's `mpsc` has a single
+    /// receiver, so one shared queue there would mean wrapping it in a `Mutex` and serialising every
+    /// pop behind a lock held across a blocking `recv`.
+    fn senders() -> &'static Vec<Sender<Task>> {
+        static QUEUES: OnceLock<Vec<Sender<Task>>> = OnceLock::new();
+        QUEUES.get_or_init(|| {
+            let mut txs = Vec::with_capacity(super::gpu_count());
+            for dev in 0..super::gpu_count() {
+                let (tx, rx) = unbounded::<Task>();
+                txs.push(tx);
+                std::thread::Builder::new()
+                    .name(format!("nassau-gpu{dev}"))
+                    .spawn(move || {
+                        super::CUR_DEVICE.with(|c| c.set(dev));
+                        // Bind the stream once for the whole loop: one stream per driver thread, a
+                        // distinct id per device so the runtime keeps them independent.
+                        StreamId { value: dev as u64 }.executes(|| {
+                            while let Ok(task) = rx.recv() {
+                                task();
+                            }
+                        });
+                    })
+                    .expect("failed to spawn a nassau-gpu thread");
+            }
+            txs
         })
     }
 
     /// Run `f` on the GPU thread, blocking until it returns. Panics propagate to the caller.
-    pub(super) fn run<T, F>(f: F) -> (T, Timing)
+    /// Run `f` on `dev`'s worker. The device is chosen by the caller from where the data lives.
+    pub(super) fn run_on<T, F>(dev: usize, f: F) -> (T, Timing)
     where
         F: FnOnce() -> T + Send + 'static,
         T: Send + 'static,
@@ -259,7 +279,7 @@ mod gpu_thread {
         let (tx, rx) = mpsc::sync_channel::<(std::thread::Result<T>, f64, f64)>(1);
         let depth = DEPTH.fetch_add(1, Ordering::Relaxed) + 1;
         let enqueued = Instant::now();
-        sender()
+        senders()[dev]
             .send(Box::new(move || {
                 let queue_ms = enqueued.elapsed().as_secs_f64() * 1e3;
                 DEPTH.fetch_sub(1, Ordering::Relaxed);
@@ -430,8 +450,8 @@ pub fn take_gpu_timing() -> (u64, u64, u64, u64, u64) {
 /// upload — see [`ResidentHost`]); only the pending tail + the `index` persist. Returns `(master, basis)`.
 pub fn resident_host_bytes() -> (usize, usize) {
     let h = RESIDENT_HOST.read().unwrap();
-    let master = h.cs_pending.capacity() * 2
-        + h.mk_pending.capacity() * 2
+    let master = h.cs_pending.iter().map(|p| p.capacity()).sum::<usize>() * 2
+        + h.mk_pending.iter().map(|p| p.capacity()).sum::<usize>() * 2
         + h.index.capacity()
             * (std::mem::size_of::<RInfo>()
                 + std::mem::size_of::<Vec<PPartEntry>>()
@@ -445,10 +465,21 @@ pub fn resident_host_bytes() -> (usize, usize) {
 /// u16) and basis (`pparts` u16 + `lens` u32) — the persistent GPU buffers, from their uploaded
 /// element counts. Returns `(master_bytes, basis_bytes)`.
 pub fn resident_dev_bytes() -> (usize, usize) {
-    let d = RESIDENT_DEV.read().unwrap();
-    let master = d.cs.uploaded * 2 + d.mk.uploaded * 2;
-    let b = RESIDENT_BASIS_DEV.read().unwrap();
-    let basis = b.pp.uploaded * 2 + b.ln.uploaded * 4;
+    // Summed over every device: each holds its own replica of the resident master and basis.
+    let master: usize = RESIDENT_DEV
+        .iter()
+        .map(|d| {
+            let d = d.read().unwrap();
+            d.cs.uploaded * 2 + d.mk.uploaded * 2
+        })
+        .sum();
+    let basis: usize = RESIDENT_BASIS_DEV
+        .iter()
+        .map(|b| {
+            let b = b.read().unwrap();
+            b.pp.uploaded * 2 + b.ln.uploaded * 4
+        })
+        .sum();
     (master, basis)
 }
 
@@ -457,7 +488,7 @@ pub fn resident_dev_bytes() -> (usize, usize) {
 /// on a separate cudarc context, so `nvidia-smi total − resident_dev − reserved` estimates the RREF
 /// pool. Returns `(0, 0)` if the query fails.
 pub fn cubecl_device_usage() -> (u64, u64) {
-    let client = CudaRuntime::client(&CudaDevice::default());
+    let client = gpu_client();
     match client.memory_usage() {
         Ok(u) => (u.bytes_in_use, u.bytes_reserved),
         Err(_) => (0, 0),
@@ -484,6 +515,13 @@ struct RInfo {
     cs_len: u32,
     mk_len: u32,
     num_mats: u32,
+    /// Which device holds this `R`'s rows. The master is SHARDED, not replicated: each `R` lives on
+    /// exactly one device, so total device memory is one master spread over `gpu_count()` cards
+    /// rather than a full copy on each. That is what lifts the memory ceiling (aggregate VRAM
+    /// instead of per-card VRAM) and keeps the upload cost at 1x rather than Nx.
+    ///
+    /// The offsets above are therefore into THIS DEVICE's master, not a global one.
+    dev: u8,
 }
 
 /// Process-shared host master of admissible-matrix data.
@@ -507,17 +545,74 @@ struct RInfo {
 /// host). This removes the multi-GB host↔device duplicate that dominated the resolver's anon RSS
 /// (~27 GB at stem 130, growing). Invariant maintained by [`seg_grow`]:
 /// `RESIDENT_DEV.$buf.uploaded == $len - $pending.len()`, i.e. `$pending == master[uploaded..$len]`.
-#[derive(Default)]
+/// `*_pending` is per DEVICE. The uploaded prefix is dropped host-side, so what remains is only the
+/// tail each device has yet to consume; with several devices each needs its own copy of that tail,
+/// because a device replicates the master rather than sharing it. This multiplies the TAIL, not the
+/// master: the multi-GB host-side duplicate this design exists to avoid stays gone.
 struct ResidentHost {
-    cs_pending: Vec<u16>,
-    mk_pending: Vec<u16>,
-    cs_len: usize,
-    mk_len: usize,
+    cs_pending: Vec<Vec<u16>>,
+    mk_pending: Vec<Vec<u16>>,
+    /// Per-device logical master lengths; an `R` extends only its own device's.
+    cs_len: Vec<usize>,
+    mk_len: Vec<usize>,
+    /// Round-robin cursor for assigning the next first-sight `R` to a device.
+    next_dev: usize,
     index: HashMap<PPart, RInfo>,
 }
 
-static RESIDENT_HOST: LazyLock<RwLock<ResidentHost>> =
-    LazyLock::new(|| RwLock::new(ResidentHost::default()));
+static RESIDENT_HOST: LazyLock<RwLock<ResidentHost>> = LazyLock::new(|| {
+    RwLock::new(ResidentHost {
+        cs_pending: (0..gpu_count()).map(|_| Vec::new()).collect(),
+        mk_pending: (0..gpu_count()).map(|_| Vec::new()).collect(),
+        cs_len: vec![0; gpu_count()],
+        mk_len: vec![0; gpu_count()],
+        next_dev: 0,
+        index: HashMap::new(),
+    })
+});
+
+/// Hard cap on devices, so the per-device tables below are a fixed, cheap allocation.
+const MAX_GPUS: usize = 8;
+
+/// How many CUDA devices the multiply path spreads work over. `NASSAU_GPU_DEVICES` overrides;
+/// otherwise every device the driver exposes is used.
+///
+/// Multi-GPU is worth it here because the single-device run is GPU-bound, not host-bound: whole-run
+/// accounting on stem 200 measured 3302 s of device execution against 3931 s wall (84% duty), so
+/// eliminating *all* host work would cap out at 1.19x while `629 + 3302/N` predicts 1.72x at N = 2
+/// and 2.70x at N = 4.
+fn gpu_count() -> usize {
+    static N: LazyLock<usize> = LazyLock::new(|| {
+        let detected = std::fs::read_dir("/proc/driver/nvidia/gpus")
+            .map(|d| d.filter_map(|e| e.ok()).count())
+            .unwrap_or(0)
+            .max(1);
+        std::env::var("NASSAU_GPU_DEVICES")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(detected)
+            .clamp(1, MAX_GPUS)
+    });
+    *N
+}
+
+thread_local! {
+    /// Which device the current thread's GPU work belongs to. Set once per GPU worker thread; every
+    /// other thread sees 0 and never touches device state directly.
+    static CUR_DEVICE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// The device this thread's GPU work runs on. Device handles are NOT interchangeable across
+/// devices, so every resident-state accessor and every client is keyed by this.
+fn cur_device() -> usize {
+    CUR_DEVICE.with(|c| c.get())
+}
+
+/// The cubecl client for this thread's device.
+fn gpu_client() -> cubecl::prelude::ComputeClient<CudaRuntime> {
+    CudaRuntime::client(&CudaDevice::new(cur_device()))
+}
 
 /// Compile-time cap on the number of fixed-size segments a resident device buffer may hold. It
 /// bounds both the multiply kernel's per-buffer argument count and the [`seg_read_u16`] /
@@ -570,8 +665,18 @@ struct ResidentDev {
     mk: SegBuf,
 }
 
-static RESIDENT_DEV: LazyLock<RwLock<ResidentDev>> =
-    LazyLock::new(|| RwLock::new(ResidentDev::default()));
+/// One per device: a `Handle` allocated on device `i` is meaningless on device `j`, so the resident
+/// master is replicated rather than shared. The HOST master ([`RESIDENT_HOST`]) stays single-copy,
+/// which is what keeps the multi-GB host-side duplicate from multiplying by `gpu_count()`.
+static RESIDENT_DEV: LazyLock<Vec<RwLock<ResidentDev>>> = LazyLock::new(|| {
+    (0..gpu_count())
+        .map(|_| RwLock::new(ResidentDev::default()))
+        .collect()
+});
+
+fn resident_dev() -> &'static RwLock<ResidentDev> {
+    &RESIDENT_DEV[cur_device()]
+}
 
 /// Serializes master device *uploads* only — never segment reads. A launch that must grow the
 /// device master takes this before uploading, so at a growth point at most one grower runs (others
@@ -579,7 +684,12 @@ static RESIDENT_DEV: LazyLock<RwLock<ResidentDev>> =
 /// lock-free through `RESIDENT_DEV.read()`, so the upload no longer blocks other bidegrees' device
 /// sections (the old single mutex held across the copy collapsed the whole wavefront to one
 /// memcpy-ing thread).
-static RESIDENT_UPLOAD: Mutex<()> = Mutex::new(());
+static RESIDENT_UPLOAD: LazyLock<Vec<Mutex<()>>> =
+    LazyLock::new(|| (0..gpu_count()).map(|_| Mutex::new(())).collect());
+
+fn resident_upload() -> &'static Mutex<()> {
+    &RESIDENT_UPLOAD[cur_device()]
+}
 
 /// Shared resident device copies of the read-only seqno table `g` and the (constant) `xi` degrees.
 /// These are identical across every launch at a given built degree, so re-uploading them per launch
@@ -593,9 +703,19 @@ struct SeqnoDev {
     g: Handle,
     xi: Handle,
 }
-static RESIDENT_SEQNO: LazyLock<RwLock<Option<SeqnoDev>>> = LazyLock::new(|| RwLock::new(None));
+static RESIDENT_SEQNO: LazyLock<Vec<RwLock<Option<SeqnoDev>>>> =
+    LazyLock::new(|| (0..gpu_count()).map(|_| RwLock::new(None)).collect());
+
+fn resident_seqno() -> &'static RwLock<Option<SeqnoDev>> {
+    &RESIDENT_SEQNO[cur_device()]
+}
 /// Serializes seqno-table uploads only (never reads); see [`RESIDENT_UPLOAD`].
-static RESIDENT_SEQNO_UPLOAD: Mutex<()> = Mutex::new(());
+static RESIDENT_SEQNO_UPLOAD: LazyLock<Vec<Mutex<()>>> =
+    LazyLock::new(|| (0..gpu_count()).map(|_| Mutex::new(())).collect());
+
+fn resident_seqno_upload() -> &'static Mutex<()> {
+    &RESIDENT_SEQNO_UPLOAD[cur_device()]
+}
 
 /// Fetch the shared resident `(g, xi)` device handles, uploading only when the cached table's length
 /// differs from `$g` (i.e. the built degree changed). Lock-free fast path; a burst of first-sight
@@ -604,7 +724,7 @@ static RESIDENT_SEQNO_UPLOAD: Mutex<()> = Mutex::new(());
 macro_rules! resident_seqno {
     ($client:expr, $g:expr, $xi:expr) => {{
         let read_current = || {
-            let s = RESIDENT_SEQNO.read().unwrap();
+            let s = resident_seqno().read().unwrap();
             match &*s {
                 Some(d) if d.g_len == $g.len() => Some((d.g.clone(), d.xi.clone())),
                 _ => None,
@@ -613,7 +733,7 @@ macro_rules! resident_seqno {
         match read_current() {
             Some(h) => h,
             None => {
-                let _upload_guard = RESIDENT_SEQNO_UPLOAD.lock().unwrap();
+                let _upload_guard = resident_seqno_upload().lock().unwrap();
                 match read_current() {
                     Some(h) => h,
                     None => {
@@ -621,7 +741,7 @@ macro_rules! resident_seqno {
                         let xh = $client.create_from_slice(u32::as_bytes(&$xi));
                         // Make the copies physically resident before publishing (cross-stream reads).
                         let _ = cubecl_common::reader::read_sync($client.sync());
-                        *RESIDENT_SEQNO.write().unwrap() = Some(SeqnoDev {
+                        *resident_seqno().write().unwrap() = Some(SeqnoDev {
                             g_len: $g.len(),
                             g: gh.clone(),
                             xi: xh.clone(),
@@ -931,17 +1051,22 @@ fn resident_info(algebra: &MilnorAlgebra, p_part: PPart) -> RInfo {
     }
     // Offsets are the running LOGICAL lengths (`*_len`), not the pending-buffer lengths — the
     // uploaded prefix has been freed but the logical numbering is permanent (see [`ResidentHost`]).
+    // Assign this `R` to a device, round-robin over first-sight order. Its rows go to that device
+    // and nowhere else, so a launch must route products to the device owning their `R`.
+    let dev = host.next_dev % gpu_count();
+    host.next_dev = host.next_dev.wrapping_add(1);
     let info = RInfo {
-        cs_off: host.cs_len as u64,
-        mk_off: host.mk_len as u64,
+        cs_off: host.cs_len[dev] as u64,
+        mk_off: host.mk_len[dev] as u64,
         cs_len: cs_len as u32,
         mk_len: mk_len as u32,
         num_mats: (mk.len() / mk_len) as u32,
+        dev: dev as u8,
     };
-    host.cs_pending.extend(cs.iter().map(|&v| narrow_u16(v)));
-    host.mk_pending.extend(mk.iter().map(|&v| narrow_u16(v)));
-    host.cs_len += cs.len();
-    host.mk_len += mk.len();
+    host.cs_pending[dev].extend(cs.iter().map(|&v| narrow_u16(v)));
+    host.mk_pending[dev].extend(mk.iter().map(|&v| narrow_u16(v)));
+    host.cs_len[dev] += cs.len();
+    host.mk_len[dev] += mk.len();
     host.index.insert(p_part, info);
     info
 }
@@ -980,11 +1105,23 @@ struct ResidentBasisDev {
     ln: SegBuf,
 }
 
-static RESIDENT_BASIS_DEV: LazyLock<RwLock<ResidentBasisDev>> =
-    LazyLock::new(|| RwLock::new(ResidentBasisDev::default()));
+static RESIDENT_BASIS_DEV: LazyLock<Vec<RwLock<ResidentBasisDev>>> = LazyLock::new(|| {
+    (0..gpu_count())
+        .map(|_| RwLock::new(ResidentBasisDev::default()))
+        .collect()
+});
+
+fn resident_basis_dev() -> &'static RwLock<ResidentBasisDev> {
+    &RESIDENT_BASIS_DEV[cur_device()]
+}
 
 /// Serializes basis device *uploads* only (never handle reads); see [`RESIDENT_UPLOAD`].
-static RESIDENT_BASIS_UPLOAD: Mutex<()> = Mutex::new(());
+static RESIDENT_BASIS_UPLOAD: LazyLock<Vec<Mutex<()>>> =
+    LazyLock::new(|| (0..gpu_count()).map(|_| Mutex::new(())).collect());
+
+fn resident_basis_upload() -> &'static Mutex<()> {
+    &RESIDENT_BASIS_UPLOAD[cur_device()]
+}
 
 /// Ensure the resident basis is built through `max_degree` and return a snapshot of
 /// `global_base` (so callers compute `gei = global_base[s_degree] + ti` without holding the
@@ -2075,14 +2212,54 @@ fn multiply_batch_grouped(
             pairs += row_pairs;
             (r1, p1) = (r1 + 1, q);
         }
-        result.push(multiply_batch_block(
-            algebra,
-            num_cols,
-            r0,
-            r1 - r0,
-            &products[p0..p1],
-            mode,
-        ));
+        // Fan the row-block out across devices. The master is sharded, so a product can only run
+        // where its `R` lives; each device evaluates its own subset over the SAME rows and the
+        // partial outputs are XORed. That is exact, not an approximation: every product contributes
+        // by `fetch_xor` into the output limbs, so the contributions commute and split freely.
+        let block = &products[p0..p1];
+        let mut by_dev: Vec<Vec<GpuProduct>> = vec![Vec::new(); gpu_count()];
+        for (pi, prod) in block.iter().enumerate() {
+            let d = match mode {
+                // Transient blocks enumerate their own master into per-launch scratch, so they are
+                // device-agnostic; spread them round-robin instead of piling onto device 0.
+                MasterMode::Transient => pi % gpu_count(),
+                MasterMode::Resident => {
+                    let r = algebra.basis_element_from_index(prod.r_degree, prod.r_idx);
+                    resident_info(algebra, r.p_part).dev as usize
+                }
+            };
+            by_dev[d].push(prod.clone());
+        }
+        // Scoped threads, not a sequential loop: `gpu_thread::run_on` BLOCKS until its device
+        // finishes, so submitting one after another would serialise the very devices this is
+        // splitting work across.
+        let partials: Vec<Bytes> = std::thread::scope(|scope| {
+            let handles: Vec<_> = by_dev
+                .iter()
+                .enumerate()
+                .filter(|(_, ps)| !ps.is_empty())
+                .map(|(d, ps)| {
+                    scope.spawn(move || {
+                        multiply_batch_block(algebra, num_cols, r0, r1 - r0, ps, mode, d)
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().expect("a sharded sub-launch panicked"))
+                .collect()
+        });
+        let mut it = partials.into_iter();
+        let mut acc = it
+            .next()
+            .expect("a non-empty row block has at least one device's products");
+        for part in it {
+            // Byte-wise XOR is identical to limb-wise here and needs no typed view.
+            for (x, y) in acc.iter_mut().zip(part.iter()) {
+                *x ^= *y;
+            }
+        }
+        result.push(acc);
         (r0, p0) = (r1, p1);
     }
     result
@@ -2100,6 +2277,7 @@ fn multiply_batch_block(
     num_rows: usize,
     products: &[GpuProduct],
     mode: MasterMode,
+    dev: usize,
 ) -> Bytes {
     let (width, g) = algebra.seqno_table_u32();
     let mut xi: Vec<u32> = xi_degrees(algebra.prime())
@@ -2485,11 +2663,11 @@ fn multiply_batch_block(
         out = out_len
     );
     let (result, timing) = submit_span.in_scope(|| {
-        gpu_thread::run(move || {
+        gpu_thread::run_on(dev, move || {
             // Arbitrate against the `fp-cuda` row reduction from the one thread that submits (see the
             // note where the permit is taken). Dropped at the end of this task.
             let _shared = fp::gpu_lock::shared();
-            let client = CudaRuntime::client(&CudaDevice::default());
+            let client = gpu_client();
             // Bind the segmented resident master/basis (see [`SegBuf`], [`seg_grow`]). Each store is
             // `MASTER_MAX_SEG` segment handles padded with a never-indexed 1-element dummy; a
             // single-buffer store (transient enum scratch or the passthrough diagnostic) is bound as
@@ -2530,32 +2708,34 @@ fn multiply_batch_block(
                 MasterMode::Resident => {
                     let (cs_segs, _) = seg_grow!(
                         client,
-                        RESIDENT_DEV,
+                        resident_dev(),
                         cs,
-                        RESIDENT_UPLOAD,
+                        resident_upload(),
                         need_cs,
                         copy_into_u16,
                         u16::as_bytes,
                         u16,
                         |_up: usize| {
                             let mut h = RESIDENT_HOST.write().unwrap();
-                            let nl = h.cs_len;
-                            (std::mem::take(&mut h.cs_pending), nl)
+                            let dev = cur_device();
+                            let nl = h.cs_len[dev];
+                            (std::mem::take(&mut h.cs_pending[dev]), nl)
                         }
                     );
                     let (mk_segs, _) = seg_grow!(
                         client,
-                        RESIDENT_DEV,
+                        resident_dev(),
                         mk,
-                        RESIDENT_UPLOAD,
+                        resident_upload(),
                         need_mk,
                         copy_into_u16,
                         u16::as_bytes,
                         u16,
                         |_up: usize| {
                             let mut h = RESIDENT_HOST.write().unwrap();
-                            let nl = h.mk_len;
-                            (std::mem::take(&mut h.mk_pending), nl)
+                            let dev = cur_device();
+                            let nl = h.mk_len[dev];
+                            (std::mem::take(&mut h.mk_pending[dev]), nl)
                         }
                     );
                     (pad_u16(full(cs_segs)), pad_u16(full(mk_segs)))
@@ -2621,9 +2801,9 @@ fn multiply_batch_block(
             } else {
                 let (pp_segs, _) = seg_grow!(
                     client,
-                    RESIDENT_BASIS_DEV,
+                    resident_basis_dev(),
                     pp,
-                    RESIDENT_BASIS_UPLOAD,
+                    resident_basis_upload(),
                     need_basis_elems * width,
                     copy_into_u16,
                     u16::as_bytes,
@@ -2636,9 +2816,9 @@ fn multiply_batch_block(
                 );
                 let (ln_segs, _) = seg_grow!(
                     client,
-                    RESIDENT_BASIS_DEV,
+                    resident_basis_dev(),
                     ln,
-                    RESIDENT_BASIS_UPLOAD,
+                    resident_basis_upload(),
                     need_basis_elems,
                     copy_into_u32,
                     u32::as_bytes,
@@ -3322,7 +3502,7 @@ mod tests {
     pub fn xor_f2_on_gpu(a: &[u32], b: &[u32]) -> Vec<u32> {
         assert_eq!(a.len(), b.len(), "operands must have equal limb counts");
         let n = a.len();
-        let client = CudaRuntime::client(&CudaDevice::default());
+        let client = gpu_client();
 
         let a_handle = client.create_from_slice(u32::as_bytes(a));
         let b_handle = client.create_from_slice(u32::as_bytes(b));
@@ -3389,7 +3569,7 @@ mod tests {
     ) -> Vec<u32> {
         assert_eq!(xi.len(), width, "xi must have `width` entries");
         assert_eq!(p_parts.len(), n * width, "p_parts must be n × width");
-        let client = CudaRuntime::client(&CudaDevice::default());
+        let client = gpu_client();
 
         let g_h = client.create_from_slice(u32::as_bytes(g));
         let xi_h = client.create_from_slice(u32::as_bytes(xi));
@@ -3531,7 +3711,7 @@ mod tests {
             col_sums.push(0);
         }
 
-        let client = CudaRuntime::client(&CudaDevice::default());
+        let client = gpu_client();
         let cs_h = client.create_from_slice(u16::as_bytes(&col_sums));
         let mk_h = client.create_from_slice(u16::as_bytes(&masks));
         let tp_h = client.create_from_slice(u16::as_bytes(&term_pparts));
@@ -3838,7 +4018,7 @@ mod tests {
             nseg <= MASTER_MAX_SEG,
             "prototype caps at {MASTER_MAX_SEG} segments"
         );
-        let client = CudaRuntime::client(&CudaDevice::default());
+        let client = gpu_client();
 
         // One handle per segment slot; real segments hold their slice, unused slots a 1-elem dummy.
         let dummy = [0u16];

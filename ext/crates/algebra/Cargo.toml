@@ -43,6 +43,10 @@ cubecl-common = { git = "https://github.com/tracel-ai/cubecl", tag = "v0.11.0-pr
 # Spans around the GPU submission (see `gpu_thread`), so a worker blocked waiting for the device
 # is visible in the log instead of silent — the stalls it diagnoses emitted nothing at all.
 tracing = { version = "0.1.41", optional = true }
+# Multi-consumer job queue for the per-device GPU workers (see `gpu_thread`). std's mpsc is
+# single-consumer, so sharing one queue across devices there means a `Mutex<Receiver>`; this is an
+# actual MPMC queue, which is what the dispatch wants.
+crossbeam-channel = { version = "0.5", optional = true }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
@@ -58,7 +62,7 @@ cache-multiplication = []
 # `algebra::milnor_rank`.
 milnor-rank = []
 concurrent = ["fp/concurrent", "maybe-rayon/concurrent"]
-gpu = ["dep:cubecl", "dep:cubecl-common", "dep:tracing"]
+gpu = ["dep:cubecl", "dep:cubecl-common", "dep:tracing", "dep:crossbeam-channel"]
 odd-primes = ["fp/odd-primes"]
 
 [[bench]]
