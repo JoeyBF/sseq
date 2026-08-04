@@ -666,7 +666,16 @@ fn fanout_pool() -> &'static maybe_rayon::MaybeThreadPool {
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
             .filter(|&n| n > 0)
-            .unwrap_or_else(|| (gpu_count() * 16).clamp(16, 128));
+            .unwrap_or_else(|| {
+                // `callers x gpu_count`, NOT a multiple of `gpu_count` alone. `install` holds a
+                // worker for a whole block (marshal AND device wait), and a block needs one slot per
+                // shard, so the pool caps blocks in flight at `threads / gpu_count`. Sizing it below
+                // `resolution workers x gpu_count` throttles submission and starves the devices:
+                // at 64 threads with 32 rayon workers only 16 blocks could be live, queue depth fell
+                // 3.8 -> 2.2, device duty 60% -> 40%, and a full stem-200 took 3743 s against 2551 s.
+                // Marshal got 3x FASTER and queueing dropped; none of that mattered against idle GPUs.
+                (maybe_rayon::max_num_threads() * gpu_count()).clamp(16, 1024)
+            });
         maybe_rayon::MaybeThreadPool::new(n, "nassau-fanout")
     });
     &POOL

@@ -111,3 +111,9 @@ impl MaybeThreadPool {
         self.0.install(f)
     }
 }
+
+/// Width of the global pool — the number of callers that can be submitting work at once. Sizing a
+/// private pool that those callers block on requires knowing this.
+pub fn max_num_threads() -> usize {
+    rayon::current_num_threads()
+}

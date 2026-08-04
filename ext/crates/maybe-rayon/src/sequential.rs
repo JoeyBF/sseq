@@ -144,3 +144,8 @@ impl MaybeThreadPool {
         f()
     }
 }
+
+/// Sequential proxy: one caller.
+pub fn max_num_threads() -> usize {
+    1
+}
