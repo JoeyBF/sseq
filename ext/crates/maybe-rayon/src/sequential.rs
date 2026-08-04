@@ -129,3 +129,18 @@ impl<T: Send> Iterator for Empty<T> {
 pub fn empty<T: Send>() -> Empty<T> {
     Empty(std::marker::PhantomData)
 }
+
+/// Sequential proxy for the concurrent module's `MaybeThreadPool`: holds no threads and runs
+/// `install` inline, so a build without `concurrent` keeps the same call sites and stays
+/// single-threaded for debugging.
+pub struct MaybeThreadPool;
+
+impl MaybeThreadPool {
+    pub fn new(_num_threads: usize, _name_prefix: &'static str) -> Self {
+        Self
+    }
+
+    pub fn install<R: Send, F: FnOnce() -> R + Send>(&self, f: F) -> R {
+        f()
+    }
+}

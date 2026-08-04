@@ -640,6 +640,24 @@ fn cur_device() -> usize {
 }
 
 /// The cubecl client for this thread's device.
+/// Private thread pool for the multi-GPU fan-out: `gpu_count()` persistent workers, created once.
+///
+/// Private on purpose, for two independent reasons.
+///   - Isolation: a fan-out worker blocked on a device can only ever steal ANOTHER SHARD of the
+///     same block — never a giant `step_resolution` job off the global pool. That is the priority
+///     inversion this codebase has already paid for once (the 146 s signature stalls), and a
+///     private pool rules it out structurally rather than relying on a guard.
+///   - Cost: it replaces `std::thread::scope`, which spawned up to `gpu_count()` OS threads PER ROW
+///     BLOCK — on the order of a million over a stem-200 run.
+///
+/// Via `maybe-rayon`, so a build without `concurrent` gets the sequential proxy and the shards run
+/// one after another. That stays correct because the partials are XORed and so order-independent.
+fn fanout_pool() -> &'static maybe_rayon::MaybeThreadPool {
+    static POOL: LazyLock<maybe_rayon::MaybeThreadPool> =
+        LazyLock::new(|| maybe_rayon::MaybeThreadPool::new(gpu_count(), "nassau-fanout"));
+    &POOL
+}
+
 fn gpu_client() -> cubecl::prelude::ComputeClient<CudaRuntime> {
     CudaRuntime::client(&CudaDevice::new(cur_device()))
 }
@@ -2279,37 +2297,28 @@ fn multiply_batch_grouped(
         // execution and all shards are in flight together. The first cut used `std::thread::scope`
         // here, which spawned an OS thread per device per block — hundreds a second, and thread ids
         // into the hundreds of thousands in the logs.
-        // Scoped threads, deliberately, after measuring the alternatives. Each device's share is
-        // marshalled AND awaited on its own thread, so both the host marshalling and the four device
-        // sections overlap.
+        // Fan the shards out on a PRIVATE pool (see `fanout_pool`): persistent workers, and no
+        // possibility of a blocked fan-out worker stealing a `step_resolution` job.
         //
-        // Two tidier-looking designs were tried on a full stem-200 and both lost:
-        //   - marshal sequentially, then submit all and wait (no threads at all): the marshal is
-        //     ~4.7 ks of host work over a run, and serialising it across devices ran ~18% behind at
-        //     matched elapsed time.
-        //   - marshal + submit under `into_maybe_par_iter`, waiting outside the parallel section:
-        //     still ~10 points of `max_t` behind at matched elapsed. Stall burden was NOT the cause
-        //     (steps >= 20 s totalled 3.7 ks either way, the same as the single-GPU run) -- a
-        //     `par_iter` join per row block simply costs more here than a thread does.
-        //
-        // The cost is real and was worth checking: this spawns up to `gpu_count()` OS threads per
-        // row block, which shows up as thread ids in the hundreds of thousands in a long run. It is
-        // still the fastest of the three, so it stays until something beats it on a measured run.
-        let partials: Vec<Bytes> = std::thread::scope(|scope| {
-            let handles: Vec<_> = by_dev
-                .iter()
+        // Each task marshals AND waits for its own device, so host marshalling (~4.7 ks per run) and
+        // the four device sections all overlap. Two tidier shapes were measured on full stem-200
+        // runs and both lost: marshalling sequentially then submitting all ran ~18% behind, and
+        // marshal+submit on the GLOBAL pool with the wait outside ran ~10 `max_t` behind.
+        let partials: Vec<Bytes> = fanout_pool().install(move || {
+            let mut out: Vec<(usize, Bytes)> = by_dev
+                .into_maybe_par_iter()
                 .enumerate()
                 .filter(|(_, ps)| !ps.is_empty())
                 .map(|(d, ps)| {
-                    scope.spawn(move || {
-                        multiply_batch_block(algebra, num_cols, r0, r1 - r0, ps, mode, d)()
-                    })
+                    (
+                        d,
+                        multiply_batch_block(algebra, num_cols, r0, r1 - r0, &ps, mode, d)(),
+                    )
                 })
                 .collect();
-            handles
-                .into_iter()
-                .map(|h| h.join().expect("a sharded sub-launch panicked"))
-                .collect()
+            // Order-independent (the partials are XORed), but sorted so the combine is deterministic.
+            out.sort_by_key(|(d, _)| *d);
+            out.into_iter().map(|(_, b)| b).collect()
         });
         let mut it = partials.into_iter();
         let mut acc = it

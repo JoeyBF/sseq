@@ -86,3 +86,28 @@ where
 pub fn empty<T: Send>() -> rayon::iter::Empty<T> {
     rayon::iter::empty()
 }
+
+/// A private thread pool, so a caller can run work on threads that are NOT the global pool's.
+///
+/// The motivating case: a task that blocks (e.g. waiting on a GPU) must not be able to steal an
+/// unrelated large job while it waits, which is how priority inversion happens. A private pool
+/// bounds what its workers can pick up to the tasks submitted to it.
+pub struct MaybeThreadPool(rayon::ThreadPool);
+
+impl MaybeThreadPool {
+    /// Build a pool with `num_threads` workers named `<name_prefix><i>`.
+    pub fn new(num_threads: usize, name_prefix: &'static str) -> Self {
+        Self(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(num_threads)
+                .thread_name(move |i| format!("{name_prefix}{i}"))
+                .build()
+                .expect("failed to build a MaybeThreadPool"),
+        )
+    }
+
+    /// Run `f` inside the pool; parallel iterators created within it use only this pool's workers.
+    pub fn install<R: Send, F: FnOnce() -> R + Send>(&self, f: F) -> R {
+        self.0.install(f)
+    }
+}
