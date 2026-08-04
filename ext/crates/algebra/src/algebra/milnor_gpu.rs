@@ -652,9 +652,23 @@ fn cur_device() -> usize {
 ///
 /// Via `maybe-rayon`, so a build without `concurrent` gets the sequential proxy and the shards run
 /// one after another. That stays correct because the partials are XORed and so order-independent.
+/// Sized for CONCURRENT CALLERS x devices, not devices. Sizing it at `gpu_count()` looks natural
+/// and is badly wrong: every resolution worker fans a row block out into `gpu_count()` shards, so
+/// with ~32 workers there are ~32 fan-outs live at once. A 4-worker pool caps in-flight submissions
+/// at 4 and starves the per-device queues (measured depth 8-24 when healthy), leaving devices idle
+/// between jobs — a full stem-200 ran ~250 s behind before this was raised.
+///
+/// These workers spend nearly all their time BLOCKED waiting on a device, so oversubscribing costs
+/// almost nothing. `NASSAU_GPU_FANOUT_THREADS` overrides.
 fn fanout_pool() -> &'static maybe_rayon::MaybeThreadPool {
-    static POOL: LazyLock<maybe_rayon::MaybeThreadPool> =
-        LazyLock::new(|| maybe_rayon::MaybeThreadPool::new(gpu_count(), "nassau-fanout"));
+    static POOL: LazyLock<maybe_rayon::MaybeThreadPool> = LazyLock::new(|| {
+        let n = std::env::var("NASSAU_GPU_FANOUT_THREADS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or_else(|| (gpu_count() * 16).clamp(16, 128));
+        maybe_rayon::MaybeThreadPool::new(n, "nassau-fanout")
+    });
     &POOL
 }
 
