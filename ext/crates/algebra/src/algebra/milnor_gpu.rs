@@ -108,6 +108,12 @@ const COARSE_LOG: usize = 20;
 /// average would want a different divisor.
 const TERM_GROUP: usize = 3;
 
+/// Matrices one multiply thread handles, the second axis of the tile alongside [`TERM_GROUP`].
+/// `col_sums`/`masks` are per-matrix, so an `M x T` tile costs `2M + T` loads per column for `M*T`
+/// pairs. Unlike terms there is no meaningful ragged tail here -- `num_mats` runs to ~20 000, so a
+/// partial tile idles a couple of lanes out of thousands.
+const MATRIX_GROUP: usize = 2;
+
 /// Per-launch output-buffer budget in bytes (`NASSAU_GPU_BLOCK_MB`, default 512 MiB).
 ///
 /// A launch's transient footprint — host marshal buffers, pinned staging, device buffers, and
@@ -1562,34 +1568,34 @@ fn multiply_batch_kernel(
     // division (I2F/MUFU.RCP/F2I plus fixups). Only ONE division remains in the decode -- `t` and
     // `m` share it, since ptxas emits a single divide plus an IMAD for the remainder.
     let num_mats = usize::cast_from(r_num_mats[ri]);
-    let tgrp = local / num_mats;
-    let m = local - tgrp * num_mats;
-    let t_base = tgrp * TERM_GROUP;
     let nt = usize::cast_from(prod_num_terms[p]);
+
+    // A thread covers a TILE of `MATRIX_GROUP` matrices x `TERM_GROUP` terms.
+    //
+    // `col_sums`/`masks` depend only on the matrix and a term's p-part only on the term, so a
+    // MxT tile reads `2M + T` values per column to evaluate `M*T` pairs -- 1.17 loads per pair at
+    // 2x3, against 1.67 at 1x3 and 3 at 1x1. The kernel is issue-limited on integer work (ncu:
+    // 75% SM vs 1.9% DRAM, ALU top pipeline), so fewer loads and fewer addresses is the lever.
+    //
+    // The two axes are NOT symmetric. Terms are few (`nt ~ 5`), so the ragged tail dominates the
+    // choice of `TERM_GROUP` -- see its doc comment, where 4 loses to 3 purely on wasted lanes.
+    // Matrices are many (`num_mats ~ 20 000`), so a partial matrix tile costs a few idle lanes out
+    // of thousands and `MATRIX_GROUP` is free to follow the load arithmetic instead.
+    let mg_count = num_mats.div_ceil(MATRIX_GROUP);
+    let mg = local % mg_count;
+    let tg = local / mg_count;
+    let m_base = mg * MATRIX_GROUP;
+    let t_base = tg * TERM_GROUP;
 
     let cs_len = usize::cast_from(r_cs_len[ri]);
     let mk_len = usize::cast_from(r_mk_len[ri]);
-    // Global (across-segment) offset of this matrix's data.
-    let cs_off = usize::cast_from(r_cs_offset[ri]) + m * cs_len;
-    let mk_off = usize::cast_from(r_mk_offset[ri]) + m * mk_len;
+    let cs_base = usize::cast_from(r_cs_offset[ri]);
+    let mk_base = usize::cast_from(r_mk_offset[ri]);
     let ts_base = usize::cast_from(prod_term_start[p]) + t_base;
 
-    // One thread now covers `TERM_GROUP` terms against ONE matrix, because `col_sums` and `masks`
-    // depend only on the matrix. One thread per pair re-read those ~2 x cols values for every term,
-    // i.e. two thirds of all loads (and their address arithmetic) were redundant by a factor of
-    // `nt`. Reading them once per column and applying the whole term group against them cuts loads
-    // per pair from 3 to `2/TERM_GROUP + 1`.
-    //
-    // This is the lever that is left: ncu measures the kernel issue-limited on integer work (74.8%
-    // SM vs 0.99% DRAM, IPC 3.36/4, ALU 68.4%, 93% L1 hit), and the SASS is 26% IMAD / 14% ISETP --
-    // address and predicate arithmetic. Peephole work had run dry at ~1% a change; this removes
-    // whole loads rather than shaving instructions off them.
-    //
-    // `term_gei[term_slot]` is the term's *global* basis-element index (across all degrees): its
-    // (width-padded) p-part lives at global offset `gei*width` in the segmented basis `pp*`, length
-    // `ln*[gei]`. The group's tail is ragged whenever `TERM_GROUP` does not divide `nt`; those lanes
-    // carry `term_len = 0` and are excluded from the output below (they cannot simply fall out of
-    // the arithmetic -- an all-zero term against an all-zero column does NOT reject).
+    // Per-term p-part offsets and lengths. Lanes past `nt` carry `term_len = 0` and are excluded
+    // from the output below: an all-zero term against an all-zero column does NOT reject, so they
+    // would otherwise emit a spurious `seqno(0)` bit.
     let mut pp_off = Array::<u64>::new(TERM_GROUP);
     let mut term_len = Array::<u32>::new(TERM_GROUP);
     let mut cols = cs_len;
@@ -1615,63 +1621,75 @@ fn multiply_batch_kernel(
         }
     }
 
-    let mut working = Array::<u64>::new(TERM_GROUP);
-    let mut rejected = Array::<u32>::new(TERM_GROUP);
+    let mut working = Array::<u64>::new(MATRIX_GROUP * TERM_GROUP);
+    let mut rejected = Array::<u32>::new(MATRIX_GROUP * TERM_GROUP);
     #[unroll]
-    for tt in 0..TERM_GROUP {
-        working[tt] = 0u64;
-        rejected[tt] = 0u32;
+    for i in 0..MATRIX_GROUP * TERM_GROUP {
+        working[i] = 0u64;
+        rejected[i] = 0u32;
     }
 
     for j in 0..cols {
-        let mut cs = 0u32;
-        if j < cs_len {
-            cs = u32::cast_from(seg_read_u16(
-                cs0,
-                cs1,
-                cs2,
-                cs3,
-                cs4,
-                cs5,
-                cs6,
-                cs7,
-                cs8,
-                cs9,
-                cs10,
-                cs11,
-                cs12,
-                cs13,
-                cs14,
-                cs15,
-                cs_off + j,
-                seg_elems,
-                num_segs,
-            ));
+        // One `col_sums`/`masks` pair per matrix in the tile, shared by every term.
+        let mut cs = Array::<u32>::new(MATRIX_GROUP);
+        let mut mk = Array::<u32>::new(MATRIX_GROUP);
+        #[unroll]
+        for mm in 0..MATRIX_GROUP {
+            let mut c = 0u32;
+            let mut k = 0u32;
+            if m_base + mm < num_mats {
+                if j < cs_len {
+                    c = u32::cast_from(seg_read_u16(
+                        cs0,
+                        cs1,
+                        cs2,
+                        cs3,
+                        cs4,
+                        cs5,
+                        cs6,
+                        cs7,
+                        cs8,
+                        cs9,
+                        cs10,
+                        cs11,
+                        cs12,
+                        cs13,
+                        cs14,
+                        cs15,
+                        cs_base + (m_base + mm) * cs_len + j,
+                        seg_elems,
+                        num_segs,
+                    ));
+                }
+                if j < mk_len {
+                    k = u32::cast_from(seg_read_u16(
+                        mk0,
+                        mk1,
+                        mk2,
+                        mk3,
+                        mk4,
+                        mk5,
+                        mk6,
+                        mk7,
+                        mk8,
+                        mk9,
+                        mk10,
+                        mk11,
+                        mk12,
+                        mk13,
+                        mk14,
+                        mk15,
+                        mk_base + (m_base + mm) * mk_len + j,
+                        seg_elems,
+                        num_segs,
+                    ));
+                }
+            }
+            cs[mm] = c;
+            mk[mm] = k;
         }
-        let mut mk = 0u32;
-        if j < mk_len {
-            mk = u32::cast_from(seg_read_u16(
-                mk0,
-                mk1,
-                mk2,
-                mk3,
-                mk4,
-                mk5,
-                mk6,
-                mk7,
-                mk8,
-                mk9,
-                mk10,
-                mk11,
-                mk12,
-                mk13,
-                mk14,
-                mk15,
-                mk_off + j,
-                seg_elems,
-                num_segs,
-            ));
-        }
+
+        // One p-part read per term in the tile, shared by every matrix.
         #[unroll]
         for tt in 0..TERM_GROUP {
             let tl = usize::cast_from(term_len[tt]);
@@ -1703,31 +1721,41 @@ fn multiply_batch_kernel(
             if tl < cs_len {
                 low = tl;
             }
-            let val = pair_col(j, low, b, cs, mk);
-            rejected[tt] |= val & PAIR_COL_REJECT;
-            if j < PPART_MAX_LEN {
-                working[tt] |= u64::cast_from(val & 0xffffu32) << u64::cast_from(pp_shift[j]);
+            #[unroll]
+            for mm in 0..MATRIX_GROUP {
+                let val = pair_col(j, low, b, cs[mm], mk[mm]);
+                let i = mm * TERM_GROUP + tt;
+                rejected[i] |= val & PAIR_COL_REJECT;
+                if j < PPART_MAX_LEN {
+                    working[i] |= u64::cast_from(val & 0xffffu32) << u64::cast_from(pp_shift[j]);
+                }
             }
         }
     }
 
     #[unroll]
-    for tt in 0..TERM_GROUP {
-        if t_base + tt < nt {
-            if rejected[tt] == 0u32 {
-                pair_emit(
-                    g,
-                    xi,
-                    out,
-                    working[tt],
-                    usize::cast_from(prod_row_base[p]),
-                    usize::cast_from(prod_out_offset[p]),
-                    width,
-                    num_limbs,
-                    sq_len,
-                    pp_shift,
-                    pp_mask,
-                );
+    for mm in 0..MATRIX_GROUP {
+        #[unroll]
+        for tt in 0..TERM_GROUP {
+            let i = mm * TERM_GROUP + tt;
+            if m_base + mm < num_mats {
+                if t_base + tt < nt {
+                    if rejected[i] == 0u32 {
+                        pair_emit(
+                            g,
+                            xi,
+                            out,
+                            working[i],
+                            usize::cast_from(prod_row_base[p]),
+                            usize::cast_from(prod_out_offset[p]),
+                            width,
+                            num_limbs,
+                            sq_len,
+                            pp_shift,
+                            pp_mask,
+                        );
+                    }
+                }
             }
         }
     }
@@ -2019,8 +2047,8 @@ fn multiply_batch_grouped(
                     MasterMode::Resident => resident_info(algebra, r.p_part).num_mats as usize,
                     MasterMode::Transient => cold_count(algebra, r.p_part).2 as usize,
                 };
-                // Threads, not pairs: one per (matrix, TERM_GROUP-sized term group).
-                num_mats * prod.term_indices.len().div_ceil(TERM_GROUP)
+                // Threads, not pairs: one per (MATRIX_GROUP x TERM_GROUP tile).
+                num_mats.div_ceil(MATRIX_GROUP) * prod.term_indices.len().div_ceil(TERM_GROUP)
             })
             .collect()
     });
@@ -2354,7 +2382,8 @@ fn multiply_batch_block(
         // sizes the grid, so it counts THREADS; `real_pairs` stays the count of `(matrix, term)`
         // products actually evaluated, which is what the throughput stat must report.
         prod_num_terms.push(prod.term_indices.len() as u32);
-        pair_acc += r_num_matrices[ri as usize] * prod.term_indices.len().div_ceil(TERM_GROUP);
+        pair_acc += r_num_matrices[ri as usize].div_ceil(MATRIX_GROUP)
+            * prod.term_indices.len().div_ceil(TERM_GROUP);
         real_pairs += r_num_matrices[ri as usize] * prod.term_indices.len();
         prod_row_base.push(((prod.row - row_base) * num_limbs) as u32);
         prod_out_offset.push(prod.out_offset as u32);
