@@ -555,8 +555,12 @@ struct ResidentHost {
     /// Per-device logical master lengths; an `R` extends only its own device's.
     cs_len: Vec<usize>,
     mk_len: Vec<usize>,
-    /// Round-robin cursor for assigning the next first-sight `R` to a device.
-    next_dev: usize,
+    /// Accumulated `num_mats` per device — the work proxy the shard assignment balances.
+    ///
+    /// A launch's work on a device is the sum over its products of `num_mats(R) * ceil(nt/T)`, so
+    /// with `R`s used at broadly similar rates the device's share is set by the `num_mats` it owns.
+    /// Master bytes are `num_mats * (cs_len + mk_len)`, so balancing this also tracks memory.
+    dev_load: Vec<u64>,
     index: HashMap<PPart, RInfo>,
 }
 
@@ -566,7 +570,7 @@ static RESIDENT_HOST: LazyLock<RwLock<ResidentHost>> = LazyLock::new(|| {
         mk_pending: (0..gpu_count()).map(|_| Vec::new()).collect(),
         cs_len: vec![0; gpu_count()],
         mk_len: vec![0; gpu_count()],
-        next_dev: 0,
+        dev_load: vec![0; gpu_count()],
         index: HashMap::new(),
     })
 });
@@ -1051,16 +1055,28 @@ fn resident_info(algebra: &MilnorAlgebra, p_part: PPart) -> RInfo {
     }
     // Offsets are the running LOGICAL lengths (`*_len`), not the pending-buffer lengths — the
     // uploaded prefix has been freed but the logical numbering is permanent (see [`ResidentHost`]).
-    // Assign this `R` to a device, round-robin over first-sight order. Its rows go to that device
-    // and nowhere else, so a launch must route products to the device owning their `R`.
-    let dev = host.next_dev % gpu_count();
-    host.next_dev = host.next_dev.wrapping_add(1);
+    // Assign this `R` to the least-loaded device. Its rows go there and nowhere else, so a launch
+    // must route products to the device owning their `R`.
+    //
+    // Round-robin over first-sight order was the first cut and balances COUNT, not work — `num_mats`
+    // varies by orders of magnitude between `R`s, so equal counts left the devices badly uneven
+    // (batch-stats: queue 67% / exec 32%, mean depth 8.4, i.e. devices waiting while others ran).
+    // Greedy least-loaded is the standard fix and needs no lookahead.
+    let num_mats = (mk.len() / mk_len) as u64;
+    let dev = host
+        .dev_load
+        .iter()
+        .enumerate()
+        .min_by_key(|&(i, &load)| (load, i))
+        .map(|(i, _)| i)
+        .expect("at least one device");
+    host.dev_load[dev] += num_mats;
     let info = RInfo {
         cs_off: host.cs_len[dev] as u64,
         mk_off: host.mk_len[dev] as u64,
         cs_len: cs_len as u32,
         mk_len: mk_len as u32,
-        num_mats: (mk.len() / mk_len) as u32,
+        num_mats: num_mats as u32,
         dev: dev as u8,
     };
     host.cs_pending[dev].extend(cs.iter().map(|&v| narrow_u16(v)));
