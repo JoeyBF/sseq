@@ -270,8 +270,36 @@ mod gpu_thread {
     }
 
     /// Run `f` on the GPU thread, blocking until it returns. Panics propagate to the caller.
-    /// Run `f` on `dev`'s worker. The device is chosen by the caller from where the data lives.
-    pub(super) fn run_on<T, F>(dev: usize, f: F) -> (T, Timing)
+    /// A submitted job that has not been waited on yet.
+    pub(super) struct Pending<T> {
+        rx: mpsc::Receiver<(std::thread::Result<T>, f64, f64)>,
+        depth: u64,
+    }
+
+    impl<T> Pending<T> {
+        /// Block for the result. Panics in the job propagate to the caller.
+        pub(super) fn wait(self) -> (T, Timing) {
+            let (out, queue_ms, exec_ms) =
+                self.rx.recv().expect("the nassau-gpu thread died mid-task");
+            match out {
+                Ok(v) => (
+                    v,
+                    Timing {
+                        queue_ms,
+                        exec_ms,
+                        depth: self.depth,
+                    },
+                ),
+                Err(payload) => std::panic::resume_unwind(payload),
+            }
+        }
+    }
+
+    /// Submit `f` to `dev`'s worker WITHOUT blocking. The sharded fan-out needs every device in
+    /// flight at once; blocking per device would serialise exactly what the shard split parallelises,
+    /// and spawning a thread per device per block (the first cut) churned hundreds of OS threads a
+    /// second — visible as `ThreadId(867540)` in the logs.
+    pub(super) fn submit_on<T, F>(dev: usize, f: F) -> Pending<T>
     where
         F: FnOnce() -> T + Send + 'static,
         T: Send + 'static,
@@ -292,18 +320,16 @@ mod gpu_thread {
                 let _ = tx.send((out, queue_ms, exec_ms));
             }))
             .expect("the nassau-gpu thread died");
-        let (out, queue_ms, exec_ms) = rx.recv().expect("the nassau-gpu thread died mid-task");
-        match out {
-            Ok(v) => (
-                v,
-                Timing {
-                    queue_ms,
-                    exec_ms,
-                    depth,
-                },
-            ),
-            Err(payload) => std::panic::resume_unwind(payload),
-        }
+        Pending { rx, depth }
+    }
+
+    /// Submit to `dev` and block for the result.
+    pub(super) fn run_on<T, F>(dev: usize, f: F) -> (T, Timing)
+    where
+        F: FnOnce() -> T + Send + 'static,
+        T: Send + 'static,
+    {
+        submit_on(dev, f).wait()
     }
 }
 
@@ -2246,25 +2272,18 @@ fn multiply_batch_grouped(
             };
             by_dev[d].push(prod.clone());
         }
-        // Scoped threads, not a sequential loop: `gpu_thread::run_on` BLOCKS until its device
-        // finishes, so submitting one after another would serialise the very devices this is
-        // splitting work across.
-        let partials: Vec<Bytes> = std::thread::scope(|scope| {
-            let handles: Vec<_> = by_dev
-                .iter()
-                .enumerate()
-                .filter(|(_, ps)| !ps.is_empty())
-                .map(|(d, ps)| {
-                    scope.spawn(move || {
-                        multiply_batch_block(algebra, num_cols, r0, r1 - r0, ps, mode, d)
-                    })
-                })
-                .collect();
-            handles
-                .into_iter()
-                .map(|h| h.join().expect("a sharded sub-launch panicked"))
-                .collect()
-        });
+        // Marshal + submit every device's share first, THEN wait. `multiply_batch_block` returns
+        // the wait rather than performing it, so device `d + 1`'s marshalling overlaps device `d`'s
+        // execution and all shards are in flight together. The first cut used `std::thread::scope`
+        // here, which spawned an OS thread per device per block — hundreds a second, and thread ids
+        // into the hundreds of thousands in the logs.
+        let waits: Vec<_> = by_dev
+            .iter()
+            .enumerate()
+            .filter(|(_, ps)| !ps.is_empty())
+            .map(|(d, ps)| multiply_batch_block(algebra, num_cols, r0, r1 - r0, ps, mode, d))
+            .collect();
+        let partials: Vec<Bytes> = waits.into_iter().map(|w| w()).collect();
         let mut it = partials.into_iter();
         let mut acc = it
             .next()
@@ -2294,7 +2313,7 @@ fn multiply_batch_block(
     products: &[GpuProduct],
     mode: MasterMode,
     dev: usize,
-) -> Bytes {
+) -> Box<dyn FnOnce() -> Bytes> {
     let (width, g) = algebra.seqno_table_u32();
     let mut xi: Vec<u32> = xi_degrees(algebra.prime())
         .iter()
@@ -2642,7 +2661,10 @@ fn multiply_batch_block(
         );
     }
     if total_pairs == 0 {
-        return Bytes::from_elems(vec![0u32; num_rows * num_limbs]);
+        // Nothing to launch: hand back a wait that yields the zero block, so the caller's
+        // submit-then-wait shape is uniform.
+        let empty = Bytes::from_elems(vec![0u32; num_rows * num_limbs]);
+        return Box::new(move || empty) as Box<dyn FnOnce() -> Bytes>;
     }
 
     // The resident `col_sums`/`masks` and basis are non-empty once any `R`/term is present
@@ -2678,8 +2700,10 @@ fn multiply_batch_block(
         pairs = total_pairs,
         out = out_len
     );
-    let (result, timing) = submit_span.in_scope(|| {
-        gpu_thread::run_on(dev, move || {
+    // Submit and return the wait: the caller launches every device's share before blocking on any
+    // of them, so the shards actually overlap.
+    let pending = submit_span.in_scope(|| {
+        gpu_thread::submit_on(dev, move || {
             // Arbitrate against the `fp-cuda` row reduction from the one thread that submits (see the
             // note where the permit is taken). Dropped at the end of this task.
             let _shared = fp::gpu_lock::shared();
@@ -3072,79 +3096,84 @@ fn multiply_batch_block(
         })
     });
 
-    // Aggregate marshal/device totals across every launch (cheap, always on) so a whole
-    // resolution's GPU overhead can be split host-vs-device via [`take_batch_stats`].
-    let device_ms = t_device.elapsed().as_secs_f64() * 1e3;
-    // Keep the value this call was assigned: with ~100 workers incrementing, a separate `load`
-    // races past exact multiples, so a `% every == 0` test on it can fire never (observed: zero
-    // reports over 12 minutes). `fetch_add` returns a unique ticket per call, so exactly one
-    // caller sees each multiple.
-    let call_no = BATCH_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-    BATCH_MARSHAL_US.fetch_add(
-        (marshal_ms * 1e3) as u64,
-        std::sync::atomic::Ordering::Relaxed,
-    );
-    BATCH_DEVICE_US.fetch_add(
-        (device_ms * 1e3) as u64,
-        std::sync::atomic::Ordering::Relaxed,
-    );
-    BATCH_PAIRS.fetch_add(real_pairs as u64, std::sync::atomic::Ordering::Relaxed);
-    BATCH_PREP_US.fetch_add((prep_ms * 1e3) as u64, std::sync::atomic::Ordering::Relaxed);
-    BATCH_WAIT_US.fetch_add((wait_ms * 1e3) as u64, std::sync::atomic::Ordering::Relaxed);
-    BATCH_PERMIT_US.fetch_add(
-        (permit_ms * 1e3) as u64,
-        std::sync::atomic::Ordering::Relaxed,
-    );
-    BATCH_LOCK_US.fetch_add((lock_ms * 1e3) as u64, std::sync::atomic::Ordering::Relaxed);
-    BATCH_QUEUE_US.fetch_add(
-        (timing.queue_ms * 1e3) as u64,
-        std::sync::atomic::Ordering::Relaxed,
-    );
-    BATCH_EXEC_US.fetch_add(
-        (timing.exec_ms * 1e3) as u64,
-        std::sync::atomic::Ordering::Relaxed,
-    );
-    BATCH_DEPTH_SUM.fetch_add(timing.depth, std::sync::atomic::Ordering::Relaxed);
-    BATCH_DEPTH_MAX.fetch_max(timing.depth, std::sync::atomic::Ordering::Relaxed);
+    Box::new(move || {
+        let (result, timing) = pending.wait();
 
-    // Periodic split of where multiply time actually goes. The counters above were being collected
-    // and never read ([`take_batch_stats`] had no callers), which left the dominant cost of a
-    // resolution unattributed: profiling a stem-200 run showed ~96% of the slow bidegrees' time
-    // inside the per-signature parallel section (row reduction was ~2%), but nothing said whether
-    // that is host marshalling or device execution. Non-resetting reads so the totals stay
-    // cumulative; `NASSAU_BATCH_REPORT_EVERY=0` disables.
-    let every = batch_report_every();
-    if every != 0 && call_no % every == 0 {
-        let calls = call_no;
-        let marshal_s = BATCH_MARSHAL_US.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6;
-        let device_s = BATCH_DEVICE_US.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6;
-        let pairs = BATCH_PAIRS.load(std::sync::atomic::Ordering::Relaxed);
-        let prep_s = BATCH_PREP_US.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6;
-        let wait_s = BATCH_WAIT_US.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6;
-        let permit_s = BATCH_PERMIT_US.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6;
-        let lock_s = BATCH_LOCK_US.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6;
-        let queue_s = BATCH_QUEUE_US.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6;
-        let exec_s = BATCH_EXEC_US.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6;
-        let depth_sum = BATCH_DEPTH_SUM.load(std::sync::atomic::Ordering::Relaxed);
-        let depth_max = BATCH_DEPTH_MAX.load(std::sync::atomic::Ordering::Relaxed);
-        let total = (prep_s + wait_s + device_s).max(1e-9);
-        eprintln!(
-            "[batch-stats] calls={calls} prep={prep_s:.1}s permit={permit_s:.1}s \
-             lock={lock_s:.1}s device={device_s:.1}s | prep={:.0}% permit={:.0}% lock={:.0}% \
-             device={:.0}% pairs={pairs} (marshal={marshal_s:.1}s wait={wait_s:.1}s) \
-             queue={queue_s:.1}s exec={exec_s:.1}s | queue={:.0}% exec={:.0}% depth mean={:.1} \
-             max={depth_max}",
-            100.0 * prep_s / total,
-            100.0 * permit_s / total,
-            100.0 * lock_s / total,
-            100.0 * device_s / total,
-            100.0 * queue_s / total,
-            100.0 * exec_s / total,
-            depth_sum as f64 / calls as f64,
+        // Aggregate marshal/device totals across every launch (cheap, always on) so a whole
+        // resolution's GPU overhead can be split host-vs-device via [`take_batch_stats`].
+        let device_ms = t_device.elapsed().as_secs_f64() * 1e3;
+        // Keep the value this call was assigned: with ~100 workers incrementing, a separate `load`
+        // races past exact multiples, so a `% every == 0` test on it can fire never (observed: zero
+        // reports over 12 minutes). `fetch_add` returns a unique ticket per call, so exactly one
+        // caller sees each multiple.
+        let call_no = BATCH_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        BATCH_MARSHAL_US.fetch_add(
+            (marshal_ms * 1e3) as u64,
+            std::sync::atomic::Ordering::Relaxed,
         );
-    }
+        BATCH_DEVICE_US.fetch_add(
+            (device_ms * 1e3) as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        BATCH_PAIRS.fetch_add(real_pairs as u64, std::sync::atomic::Ordering::Relaxed);
+        BATCH_PREP_US.fetch_add((prep_ms * 1e3) as u64, std::sync::atomic::Ordering::Relaxed);
+        BATCH_WAIT_US.fetch_add((wait_ms * 1e3) as u64, std::sync::atomic::Ordering::Relaxed);
+        BATCH_PERMIT_US.fetch_add(
+            (permit_ms * 1e3) as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        BATCH_LOCK_US.fetch_add((lock_ms * 1e3) as u64, std::sync::atomic::Ordering::Relaxed);
+        BATCH_QUEUE_US.fetch_add(
+            (timing.queue_ms * 1e3) as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        BATCH_EXEC_US.fetch_add(
+            (timing.exec_ms * 1e3) as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        BATCH_DEPTH_SUM.fetch_add(timing.depth, std::sync::atomic::Ordering::Relaxed);
+        BATCH_DEPTH_MAX.fetch_max(timing.depth, std::sync::atomic::Ordering::Relaxed);
 
-    result
+        // Periodic split of where multiply time actually goes. The counters above were being collected
+        // and never read ([`take_batch_stats`] had no callers), which left the dominant cost of a
+        // resolution unattributed: profiling a stem-200 run showed ~96% of the slow bidegrees' time
+        // inside the per-signature parallel section (row reduction was ~2%), but nothing said whether
+        // that is host marshalling or device execution. Non-resetting reads so the totals stay
+        // cumulative; `NASSAU_BATCH_REPORT_EVERY=0` disables.
+        let every = batch_report_every();
+        if every != 0 && call_no % every == 0 {
+            let calls = call_no;
+            let marshal_s =
+                BATCH_MARSHAL_US.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6;
+            let device_s = BATCH_DEVICE_US.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6;
+            let pairs = BATCH_PAIRS.load(std::sync::atomic::Ordering::Relaxed);
+            let prep_s = BATCH_PREP_US.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6;
+            let wait_s = BATCH_WAIT_US.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6;
+            let permit_s = BATCH_PERMIT_US.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6;
+            let lock_s = BATCH_LOCK_US.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6;
+            let queue_s = BATCH_QUEUE_US.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6;
+            let exec_s = BATCH_EXEC_US.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6;
+            let depth_sum = BATCH_DEPTH_SUM.load(std::sync::atomic::Ordering::Relaxed);
+            let depth_max = BATCH_DEPTH_MAX.load(std::sync::atomic::Ordering::Relaxed);
+            let total = (prep_s + wait_s + device_s).max(1e-9);
+            eprintln!(
+                "[batch-stats] calls={calls} prep={prep_s:.1}s permit={permit_s:.1}s \
+                 lock={lock_s:.1}s device={device_s:.1}s | prep={:.0}% permit={:.0}% lock={:.0}% \
+                 device={:.0}% pairs={pairs} (marshal={marshal_s:.1}s wait={wait_s:.1}s) \
+                 queue={queue_s:.1}s exec={exec_s:.1}s | queue={:.0}% exec={:.0}% depth \
+                 mean={:.1} max={depth_max}",
+                100.0 * prep_s / total,
+                100.0 * permit_s / total,
+                100.0 * lock_s / total,
+                100.0 * device_s / total,
+                100.0 * queue_s / total,
+                100.0 * exec_s / total,
+                depth_sum as f64 / calls as f64,
+            );
+        }
+
+        result
+    })
 }
 
 /// How often [`multiply_batch_block`] prints the cumulative marshal/device split, in launches.

@@ -619,6 +619,11 @@ mod logging {
             .with_max_level(tracing::Level::INFO)
             .with_span_events(FmtSpan::NEW | FmtSpan::CLOSE)
             .with_thread_ids(true)
+            // Names too, not just ids. The GPU workers are named `nassau-gpu<device>`, so without
+            // this a line from the device path reads `ThreadId(37)` and there is no way to tell
+            // WHICH device it came from — exactly what you need when checking shard balance.
+            // Rayon's pool threads are unnamed and simply print an empty name.
+            .with_thread_names(true)
             .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_default())
             .finish()
     }
