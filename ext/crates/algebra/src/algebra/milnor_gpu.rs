@@ -652,35 +652,6 @@ fn cur_device() -> usize {
 ///
 /// Via `maybe-rayon`, so a build without `concurrent` gets the sequential proxy and the shards run
 /// one after another. That stays correct because the partials are XORed and so order-independent.
-/// Sized for CONCURRENT CALLERS x devices, not devices. Sizing it at `gpu_count()` looks natural
-/// and is badly wrong: every resolution worker fans a row block out into `gpu_count()` shards, so
-/// with ~32 workers there are ~32 fan-outs live at once. A 4-worker pool caps in-flight submissions
-/// at 4 and starves the per-device queues (measured depth 8-24 when healthy), leaving devices idle
-/// between jobs — a full stem-200 ran ~250 s behind before this was raised.
-///
-/// These workers spend nearly all their time BLOCKED waiting on a device, so oversubscribing costs
-/// almost nothing. `NASSAU_GPU_FANOUT_THREADS` overrides.
-fn fanout_pool() -> &'static maybe_rayon::MaybeThreadPool {
-    static POOL: LazyLock<maybe_rayon::MaybeThreadPool> = LazyLock::new(|| {
-        let n = std::env::var("NASSAU_GPU_FANOUT_THREADS")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .filter(|&n| n > 0)
-            .unwrap_or_else(|| {
-                // `callers x gpu_count`, NOT a multiple of `gpu_count` alone. `install` holds a
-                // worker for a whole block (marshal AND device wait), and a block needs one slot per
-                // shard, so the pool caps blocks in flight at `threads / gpu_count`. Sizing it below
-                // `resolution workers x gpu_count` throttles submission and starves the devices:
-                // at 64 threads with 32 rayon workers only 16 blocks could be live, queue depth fell
-                // 3.8 -> 2.2, device duty 60% -> 40%, and a full stem-200 took 3743 s against 2551 s.
-                // Marshal got 3x FASTER and queueing dropped; none of that mattered against idle GPUs.
-                (maybe_rayon::max_num_threads() * gpu_count()).clamp(16, 1024)
-            });
-        maybe_rayon::MaybeThreadPool::new(n, "nassau-fanout")
-    });
-    &POOL
-}
-
 fn gpu_client() -> cubecl::prelude::ComputeClient<CudaRuntime> {
     CudaRuntime::client(&CudaDevice::new(cur_device()))
 }
@@ -2234,8 +2205,6 @@ fn multiply_batch_grouped(
     products: &[GpuProduct],
     mode: MasterMode,
 ) -> Vec<Bytes> {
-    use maybe_rayon::prelude::*;
-
     let num_limbs = num_cols.div_ceil(32).max(1);
     let max_block_rows = (gpu_block_bytes() / (num_limbs * 4)).max(1);
     // Products arrive row-major (the extract loops emit them per input row, in order; the hot/cold
@@ -2320,29 +2289,22 @@ fn multiply_batch_grouped(
         // execution and all shards are in flight together. The first cut used `std::thread::scope`
         // here, which spawned an OS thread per device per block — hundreds a second, and thread ids
         // into the hundreds of thousands in the logs.
-        // Fan the shards out on a PRIVATE pool (see `fanout_pool`): persistent workers, and no
-        // possibility of a blocked fan-out worker stealing a `step_resolution` job.
+        // One thread, asynchronous submissions to every device. No fan-out threads and no pool:
+        // `submit_on` does not block, so this marshals a shard, hands it to its device, and moves to
+        // the next while that device is already running. Only the final wait blocks.
         //
-        // Each task marshals AND waits for its own device, so host marshalling (~4.7 ks per run) and
-        // the four device sections all overlap. Two tidier shapes were measured on full stem-200
-        // runs and both lost: marshalling sequentially then submitting all ran ~18% behind, and
-        // marshal+submit on the GLOBAL pool with the wait outside ran ~10 `max_t` behind.
-        let partials: Vec<Bytes> = fanout_pool().install(move || {
-            let mut out: Vec<(usize, Bytes)> = by_dev
-                .into_maybe_par_iter()
-                .enumerate()
-                .filter(|(_, ps)| !ps.is_empty())
-                .map(|(d, ps)| {
-                    (
-                        d,
-                        multiply_batch_block(algebra, num_cols, r0, r1 - r0, &ps, mode, d)(),
-                    )
-                })
-                .collect();
-            // Order-independent (the partials are XORed), but sorted so the combine is deterministic.
-            out.sort_by_key(|(d, _)| *d);
-            out.into_iter().map(|(_, b)| b).collect()
-        });
+        // Sharding SPLITS the products, so marshalling the shards one after another is the same
+        // total host work as marshalling one unsharded block — there is nothing to parallelise here.
+        // And with ~32 resolution workers each submitting `gpu_count()` jobs, ~128 launches are in
+        // flight, which is the queue depth the devices need; a fan-out pool could only cap that
+        // (sized at 64 it halved depth 3.8 -> 2.2 and cost 47% end to end).
+        let waits: Vec<Box<dyn FnOnce() -> Bytes + Send>> = by_dev
+            .iter()
+            .enumerate()
+            .filter(|(_, ps)| !ps.is_empty())
+            .map(|(d, ps)| multiply_batch_block(algebra, num_cols, r0, r1 - r0, ps, mode, d))
+            .collect();
+        let partials: Vec<Bytes> = waits.into_iter().map(|w| w()).collect();
         let mut it = partials.into_iter();
         let mut acc = it
             .next()
