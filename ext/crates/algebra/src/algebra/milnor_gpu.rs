@@ -2193,6 +2193,8 @@ fn multiply_batch_grouped(
     products: &[GpuProduct],
     mode: MasterMode,
 ) -> Vec<Bytes> {
+    use maybe_rayon::prelude::*;
+
     let num_limbs = num_cols.div_ceil(32).max(1);
     let max_block_rows = (gpu_block_bytes() / (num_limbs * 4)).max(1);
     // Products arrive row-major (the extract loops emit them per input row, in order; the hot/cold
@@ -2277,13 +2279,28 @@ fn multiply_batch_grouped(
         // execution and all shards are in flight together. The first cut used `std::thread::scope`
         // here, which spawned an OS thread per device per block — hundreds a second, and thread ids
         // into the hundreds of thousands in the logs.
-        let waits: Vec<_> = by_dev
-            .iter()
+        // Marshal + submit every device's share IN PARALLEL, then wait. Two things matter here and
+        // they pull in opposite directions:
+        //   - the marshal is real host work (~4.7 ks over a stem-200 run), so doing the devices'
+        //     shares one after another on the calling thread serialises it — measured ~18% behind
+        //     at matched elapsed time when this was sequential;
+        //   - the WAIT must stay outside the parallel section. `par_iter` bodies that block on the
+        //     GPU are the join + steal-loop pattern behind the 146 s signature stalls.
+        // Submitting is non-blocking, so marshalling in parallel and blocking afterwards gets the
+        // overlap without ever parking a rayon worker on the device.
+        let mut waits: Vec<(usize, Box<dyn FnOnce() -> Bytes + Send>)> = by_dev
+            .into_maybe_par_iter()
             .enumerate()
             .filter(|(_, ps)| !ps.is_empty())
-            .map(|(d, ps)| multiply_batch_block(algebra, num_cols, r0, r1 - r0, ps, mode, d))
+            .map(|(d, ps)| {
+                (
+                    d,
+                    multiply_batch_block(algebra, num_cols, r0, r1 - r0, &ps, mode, d),
+                )
+            })
             .collect();
-        let partials: Vec<Bytes> = waits.into_iter().map(|w| w()).collect();
+        waits.sort_by_key(|(d, _)| *d);
+        let partials: Vec<Bytes> = waits.into_iter().map(|(_, w)| w()).collect();
         let mut it = partials.into_iter();
         let mut acc = it
             .next()
@@ -2313,7 +2330,7 @@ fn multiply_batch_block(
     products: &[GpuProduct],
     mode: MasterMode,
     dev: usize,
-) -> Box<dyn FnOnce() -> Bytes> {
+) -> Box<dyn FnOnce() -> Bytes + Send> {
     let (width, g) = algebra.seqno_table_u32();
     let mut xi: Vec<u32> = xi_degrees(algebra.prime())
         .iter()
@@ -2664,7 +2681,7 @@ fn multiply_batch_block(
         // Nothing to launch: hand back a wait that yields the zero block, so the caller's
         // submit-then-wait shape is uniform.
         let empty = Bytes::from_elems(vec![0u32; num_rows * num_limbs]);
-        return Box::new(move || empty) as Box<dyn FnOnce() -> Bytes>;
+        return Box::new(move || empty) as Box<dyn FnOnce() -> Bytes + Send>;
     }
 
     // The resident `col_sums`/`masks` and basis are non-empty once any `R`/term is present
@@ -2694,8 +2711,12 @@ fn multiply_batch_block(
     //
     // The `gpu_submit` span makes that wait *visible*: a worker stuck here previously logged
     // nothing at all for the whole stall, which is why the multi-minute steps looked like compute.
+    // `dev` is the point of this field: the span is entered on the SUBMITTING (rayon) thread, not
+    // inside the `nassau-gpu<dev>` worker, so neither the thread id nor its name says which device a
+    // job went to. Without it there is no way to check shard balance from a log.
     let submit_span = tracing::info_span!(
         "gpu_submit",
+        dev = dev,
         rows = num_rows,
         pairs = total_pairs,
         out = out_len
