@@ -2237,7 +2237,7 @@ fn multiply_batch_grouped(
     // write lock while appending multi-GB pending buffers — all of it previously outside every
     // span and every timer, so a worker parked here logged nothing at all. `new_r` distinguishes
     // "paid to warm the master" from "waited for someone else's warm-up".
-    let prepass = tracing::info_span!(
+    let prepass = tracing::debug_span!(
         "pair_prepass",
         products = products.len(),
         new_r = tracing::field::Empty,
@@ -2460,7 +2460,7 @@ fn multiply_batch_block<'a>(
     let max_s_degree = products.iter().map(|p| p.s_degree).max().unwrap_or(0);
     // `ensure_basis` takes the basis WRITE lock on a first-sight degree; spanned separately from
     // the fill below so a wait on that lock is not misread as marshalling work.
-    let global_base = tracing::info_span!("ensure_basis", max_s_degree)
+    let global_base = tracing::debug_span!("ensure_basis", max_s_degree)
         .in_scope(|| ensure_basis(algebra, width, max_s_degree));
     // Everything from the intern to here: `term_off` prefix sums, the `max_s_degree` scan, and
     // `ensure_basis` (which may upload). Separated from the fill because the two have different
@@ -2476,7 +2476,7 @@ fn multiply_batch_block<'a>(
     {
         // Scoped to the fill alone: entering at function level would leave the span open across
         // the permit wait and the GPU submission and attribute their time here.
-        let _marshal_span = tracing::info_span!(
+        let _marshal_span = tracing::debug_span!(
             "marshal_terms",
             products = products.len(),
             terms = total_terms
@@ -2801,7 +2801,7 @@ fn multiply_batch_block<'a>(
         // `dev` is the point of this field: the span is entered on the SUBMITTING (rayon) thread, not
         // inside the `nassau-gpu<dev>` worker, so neither the thread id nor its name says which device a
         // job went to. Without it there is no way to check shard balance from a log.
-        let submit_span = tracing::info_span!(
+        let submit_span = tracing::debug_span!(
             "gpu_submit",
             dev = dev,
             rows = num_rows,

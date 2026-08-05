@@ -812,7 +812,7 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                 next_dim,
             ),
         };
-        let mut masked_matrix = tracing::info_span!(
+        let mut masked_matrix = tracing::trace_span!(
             "zs_assemble",
             rows = target_masked_dim,
             cols = next_masked_dim
@@ -825,13 +825,13 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
             m
         });
 
-        tracing::info_span!(
+        tracing::trace_span!(
             "zs_row_reduce",
             rows = target_masked_dim,
             cols = next_masked_dim
         )
         .in_scope(|| masked_matrix.row_reduce());
-        let kernel = tracing::info_span!("zs_kernel").in_scope(|| masked_matrix.compute_kernel());
+        let kernel = tracing::trace_span!("zs_kernel").in_scope(|| masked_matrix.compute_kernel());
 
         Self::write_qi(
             &mut f,
@@ -868,17 +868,18 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
             &source_mask,
             target_dim,
         );
-        let mut n = tracing::info_span!("img_assemble", rows = source_mask.len()).in_scope(|| {
+        let mut n = tracing::trace_span!("img_assemble", rows = source_mask.len()).in_scope(|| {
             let mut n = Matrix::new(p, source_mask.len(), target_masked_dim);
             for (mut row, full_row) in std::iter::zip(n.iter_mut(), img_full.iter()) {
                 row.add_masked(full_row, 1, &target_mask);
             }
             n
         });
-        tracing::info_span!("img_row_reduce", rows = source_mask.len()).in_scope(|| n.row_reduce());
+        tracing::trace_span!("img_row_reduce", rows = source_mask.len())
+            .in_scope(|| n.row_reduce());
         let next_row = n.rows();
 
-        let num_new_gens = tracing::info_span!("extend_image")
+        let num_new_gens = tracing::trace_span!("extend_image")
             .in_scope(|| n.extend_image(0, n.columns(), &kernel, 0).len());
 
         if b.t() < b.s() {
@@ -926,7 +927,7 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
             // ~26% of worker time inside `step` but outside any named region, which is exactly the
             // shape that produced several wrong diagnoses earlier. One span per signature is cheap
             // (the bodies are substantial); do NOT push spans inside these loops.
-            let _sm = tracing::info_span!("sig_masks").entered();
+            let _sm = tracing::trace_span!("sig_masks").entered();
             target_mask.clear();
             next_mask.clear();
             target_mask.extend(subalgebra.signature_mask(
@@ -945,23 +946,21 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
             ));
             drop(_sm);
 
-            let full_matrix =
-                tracing::info_span!("sig_select", rows = target_mask.len()).in_scope(|| {
-                    match &full_reuse {
-                        Some(full) => {
-                            debug_assert!(target_mask.iter().all(|&r| r < full.rows()));
-                            select_rows(full, &target_mask)
-                        }
-                        None => restricted_partial_matrix_maybe_gpu(
-                            &self.differentials[b.s() - 1],
-                            b.t(),
-                            &target_mask,
-                            next_dim,
-                        ),
+            let full_matrix = tracing::trace_span!("sig_select", rows = target_mask.len())
+                .in_scope(|| match &full_reuse {
+                    Some(full) => {
+                        debug_assert!(target_mask.iter().all(|&r| r < full.rows()));
+                        select_rows(full, &target_mask)
                     }
+                    None => restricted_partial_matrix_maybe_gpu(
+                        &self.differentials[b.s() - 1],
+                        b.t(),
+                        &target_mask,
+                        next_dim,
+                    ),
                 });
 
-            let mut masked_matrix = tracing::info_span!(
+            let mut masked_matrix = tracing::trace_span!(
                 "sig_assemble",
                 rows = target_mask.len(),
                 cols = next_mask.len()
@@ -979,14 +978,14 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
 
             // The CPU row reduction, once per signature. `gpu_row_reduce` only takes over at
             // >= 8192^2, so every one of these is host work.
-            tracing::info_span!(
+            tracing::trace_span!(
                 "sig_row_reduce",
                 rows = target_mask.len(),
                 cols = next_mask.len()
             )
             .in_scope(|| masked_matrix.row_reduce());
 
-            let qi = tracing::info_span!("sig_quasi_inverse")
+            let qi = tracing::trace_span!("sig_quasi_inverse")
                 .in_scope(|| masked_matrix.compute_quasi_inverse());
             let pivots = qi.pivots().unwrap();
             let preimage = qi.preimage();
@@ -1002,7 +1001,7 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                 }
             }
 
-            let _lift = tracing::info_span!("sig_lift", gens = xs.len()).entered();
+            let _lift = tracing::trace_span!("sig_lift", gens = xs.len()).entered();
             for (x, dx) in xs.iter_mut().zip(&mut dxs) {
                 scratch.set_scratch_vector_size(target_mask.len());
                 let mut row = 0;
@@ -1021,7 +1020,7 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                 }
             }
             drop(_lift);
-            tracing::info_span!("sig_write_qi").in_scope(|| {
+            tracing::trace_span!("sig_write_qi").in_scope(|| {
                 Self::write_qi(
                     &mut f,
                     &mut scratch,
