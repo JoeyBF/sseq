@@ -450,6 +450,12 @@ static BATCH_DEPTH_MAX: AtomicU64 = AtomicU64::new(0);
 /// separate from `queue`/`exec`, which measure the same run from the worker's side.
 static BATCH_LAUNCH_US: AtomicU64 = AtomicU64::new(0);
 static BATCH_FENCE_US: AtomicU64 = AtomicU64::new(0);
+/// `prep` split three ways, to decide whether marshalling is worth a representation change: the
+/// per-launch `R` intern, the `term_off`/`ensure_basis` middle, and the `term_gei` fill. Each has a
+/// different fix, and the single `prep` number could not distinguish them.
+static BATCH_INTERN_US: AtomicU64 = AtomicU64::new(0);
+static BATCH_BASIS_US: AtomicU64 = AtomicU64::new(0);
+static BATCH_TGEI_US: AtomicU64 = AtomicU64::new(0);
 
 /// Read and reset the aggregate batch counters: `(calls, marshal_us, device_us, pairs)`.
 pub fn take_batch_stats() -> (u64, u64, u64, u64) {
@@ -2418,6 +2424,14 @@ fn multiply_batch_block<'a>(
             });
         prod_r_index.push(ri);
     }
+    // Breakdown of the `prep` figure, which was only ever a single number and so could not say
+    // whether marshalling is worth restructuring or merely worth accepting. `intern` is the
+    // per-launch `HashMap<(i32, usize), u32>` above — pure representation tax, since every `R`
+    // already has a resident device identity ([`RInfo`]) the caller could have carried instead of
+    // an algebra-local `(degree, index)` pair. If it dominates, deleting it needs no new data
+    // structure, only a different id in `GpuProduct`.
+    let intern_ms = t_marshal.elapsed().as_secs_f64() * 1e3;
+    let t_basis = std::time::Instant::now();
 
     // Admissible-matrix data (`col_sums`/`masks` + per-`R` offsets) is resident (built in the
     // thread-local `RESIDENT` store below), so nothing to enumerate or lay out here.
@@ -2448,6 +2462,11 @@ fn multiply_batch_block<'a>(
     // the fill below so a wait on that lock is not misread as marshalling work.
     let global_base = tracing::info_span!("ensure_basis", max_s_degree)
         .in_scope(|| ensure_basis(algebra, width, max_s_degree));
+    // Everything from the intern to here: `term_off` prefix sums, the `max_s_degree` scan, and
+    // `ensure_basis` (which may upload). Separated from the fill because the two have different
+    // fixes — this shrinks by keeping the basis warm, the fill by not rebuilding indices.
+    let basis_ms = t_basis.elapsed().as_secs_f64() * 1e3;
+    let t_tgei = std::time::Instant::now();
     let mut term_gei: Vec<u32> = vec![0u32; total_terms];
     // The ONLY rayon construct inside the guarded region, hence the only place a worker can block
     // at a join and enter the steal loop. The multi-minute stalls sit somewhere in this guarded
@@ -2485,6 +2504,10 @@ fn multiply_batch_block<'a>(
             }
         }
     }
+    // The `term_gei` fill: one add and one store per term. This is the part that becomes a SLICE
+    // rather than a build if products are held struct-of-arrays with global basis indices, so its
+    // share is the ceiling on what that refactor can return.
+    let tgei_ms = t_tgei.elapsed().as_secs_f64() * 1e3;
     // Device need: the largest `gei` any term dereferences is `< global_base[max_s_degree + 1]`
     // (all elements through degree `max_s_degree`), so uploading that many covers the block.
     let need_basis_elems = global_base[max_s_degree as usize + 1] as usize;
@@ -3236,6 +3259,15 @@ fn multiply_batch_block<'a>(
                 (fence_ms * 1e3) as u64,
                 std::sync::atomic::Ordering::Relaxed,
             );
+            BATCH_INTERN_US.fetch_add(
+                (intern_ms * 1e3) as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            BATCH_BASIS_US.fetch_add(
+                (basis_ms * 1e3) as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            BATCH_TGEI_US.fetch_add((tgei_ms * 1e3) as u64, std::sync::atomic::Ordering::Relaxed);
 
             // Aggregate marshal/device totals across every launch (cheap, always on) so a whole
             // resolution's GPU overhead can be split host-vs-device via [`take_batch_stats`].
@@ -3307,7 +3339,7 @@ fn multiply_batch_block<'a>(
                      lock={:.0}% device={:.0}% pairs={pairs} (marshal={marshal_s:.1}s \
                      wait={wait_s:.1}s) queue={queue_s:.1}s exec={exec_s:.1}s | queue={:.0}% \
                      exec={:.0}% depth mean={:.1} max={depth_max} | launch={launch_s:.1}s \
-                     fence={fence_s:.1}s pipeline={:.0}%",
+                     fence={fence_s:.1}s pipeline={:.0}% | intern={:.1}s basis={:.1}s tgei={:.1}s",
                     100.0 * prep_s / total,
                     100.0 * permit_s / total,
                     100.0 * lock_s / total,
@@ -3319,6 +3351,9 @@ fn multiply_batch_block<'a>(
                     // launches. ~100% is a full pipeline; the pre-change one-kernel-deep behaviour
                     // drives this toward 0 as callers pile up.
                     100.0 * fence_s / (launch_s + fence_s).max(1e-9),
+                    BATCH_INTERN_US.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6,
+                    BATCH_BASIS_US.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6,
+                    BATCH_TGEI_US.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6,
                 );
             }
 
