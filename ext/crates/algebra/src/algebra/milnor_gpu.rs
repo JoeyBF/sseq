@@ -2325,46 +2325,55 @@ fn multiply_batch_grouped(
         //     worker, so the devices stay busy with later blocks while this thread sits on fences.
         //
         // In-flight work is therefore bounded by `NASSAU_GPU_MEM_BUDGET_MB` — memory, not threads.
-        // Phase 1 marshals the shards concurrently on DEDICATED threads, not on the rayon pool.
+        // Each shard runs its WHOLE pipeline — marshal, permit, submit, wait — on its own thread.
         //
-        // That distinction is the whole measurement. Verified complete stem-200 runs: scoped threads
-        // 2439 s against 3138 s for serial marshal, with `marshal` 1134 s vs 3283 s and mean queue
-        // depth 4.1 vs 1.9 — the devices are simply fed better. But routing the same work through
-        // rayon (`into_maybe_par_iter`, ef16f934ef) measured 3373 s, i.e. WORSE than serial. So it is
-        // not parallelism as such that pays; it is parallelism that does not contend with the ~128
-        // resolution workers already occupying the global pool.
+        // Concurrent SUBMISSION is the lever, and it took three measured runs to isolate. Verified
+        // complete stem-200s:
+        //
+        //   scoped, whole pipeline per thread   2439 s   marshal 1134 s   depth 4.1
+        //   scoped marshal, serial submit       3358 s   marshal 2439 s   depth 1.8
+        //   serial marshal, serial submit       3138 s   marshal 3283 s   depth 1.9
+        //   rayon marshal, serial submit        3373 s
+        //
+        // Read the middle row carefully: it CUT marshal by 840 s and got 220 s SLOWER. Marshal time
+        // does not predict wall time; queue depth does. Parallelising the marshal alone leaves every
+        // shard's submission behind the previous one, so the devices still see ~2 blocks queued and
+        // idle between them. Only submitting concurrently gets depth to 4.1 and the GPUs fed.
         //
         // Cost: `gpu_count()` spawns per row block, ~1M over a run. Live threads peak at
         // callers x devices ~512 against a per-UID `RLIMIT_NPROC` of 4096 shared machine-wide, and
-        // PIDs recycle on join, so the churn is ~1% of runtime rather than an accumulation. Do NOT
-        // "tidy" this into a shared pool without re-measuring — that is exactly what ef16f934ef did.
-        //
-        // Permits are still taken in phase 2, never here. The original scoped fan-out took each
-        // shard's permit while its siblings were still marshalling, which was harmless only because
-        // the permit was the broken pre-`a4aed87c64` one that bounded nothing (`permit=0.0s` in that
-        // run's stats). With the budget actually enforcing, that shape is the deadlock [`GpuBudget`]
-        // documents; keeping acquisition in the rayon-free phase gets the throughput without it.
+        // PIDs recycle on join, so this is ~1% churn, not accumulation. Do NOT convert this to a
+        // shared pool or a rayon `par_iter` without re-measuring END TO END: both were tried
+        // (3743 s and 3373 s) and both lost, because they queue behind the ~128 resolution workers
+        // instead of running beside them.
         let shards: Vec<(usize, &Vec<GpuProduct>)> = by_dev
             .iter()
             .enumerate()
             .filter(|(_, ps)| !ps.is_empty())
             .collect();
-        let submits: Vec<BlockSubmit<'_>> = std::thread::scope(|scope| {
-            let handles: Vec<_> = shards
-                .into_iter()
-                .map(|(d, ps)| {
-                    scope.spawn(move || {
-                        multiply_batch_block(algebra, num_cols, r0, r1 - r0, ps, mode, d)
-                    })
-                })
-                .collect();
-            handles
-                .into_iter()
-                .map(|h| h.join().expect("a shard's marshal panicked"))
-                .collect()
-        });
-        let waits: Vec<BlockWait> = submits.into_iter().map(|s| s()).collect();
-        let partials: Vec<Bytes> = waits.into_iter().map(|w| w()).collect();
+        let run_shard = |d: usize, ps: &Vec<GpuProduct>| -> Bytes {
+            multiply_batch_block(algebra, num_cols, r0, r1 - r0, ps, mode, d)()()
+        };
+        // Threads hold their permit while siblings marshal. That is safe HERE and only here because
+        // the marshal contains no rayon — the `term_gei` fill is deliberately sequential (a par_iter
+        // over it once measured a 146 s stall), so there is no join for a permit-blocked steal to
+        // wedge, and every holder is either on the GPU or making progress. The one exception is the
+        // `NASSAU_GPU_BASIS_PASSTHROUGH` diagnostic, whose per-product fill IS a par_iter; that
+        // combination is exactly [`GpuBudget`]'s documented deadlock, so it runs serially instead.
+        let partials: Vec<Bytes> = if basis_passthrough() {
+            shards.into_iter().map(|(d, ps)| run_shard(d, ps)).collect()
+        } else {
+            std::thread::scope(|scope| {
+                let handles: Vec<_> = shards
+                    .into_iter()
+                    .map(|(d, ps)| scope.spawn(move || run_shard(d, ps)))
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|h| h.join().expect("a shard panicked"))
+                    .collect()
+            })
+        };
         let mut it = partials.into_iter();
         let mut acc = it
             .next()
