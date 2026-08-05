@@ -2852,6 +2852,12 @@ fn multiply_batch_block<'a>(
 
                 // `Transient` (degree > cap `R`s): enumerate this block's cold master ON the device into
                 // scratch, freed with the launch. `Resident` (default): grow + reuse the shared master.
+                // The `Transient` enumeration launch's own inputs need the same lifetime extension as
+                // the multiply's: they are consumed by `from_raw_parts` and would otherwise die with
+                // the match arm, while the enum kernel is still running on this stream.
+                // (`cs_scratch`/`mk_scratch` survive into `cs_seg`/`mk_seg`, so they are already
+                // covered by the main keepalive below.)
+                let mut enum_keep: Vec<Handle> = Vec::new();
                 let (cs_seg, mk_seg) = match mode {
                     MasterMode::Resident => {
                         let (cs_segs, _) = seg_grow!(
@@ -2909,6 +2915,14 @@ fn multiply_batch_block<'a>(
                         let ec_h = client.create_from_slice(u32::as_bytes(&enum_cols));
                         let eco_h = client.create_from_slice(u64::as_bytes(&r_cs_offset));
                         let emo_h = client.create_from_slice(u64::as_bytes(&r_mk_offset));
+                        enum_keep.extend([
+                            cnt_scratch.clone(),
+                            epp_h.clone(),
+                            er_h.clone(),
+                            ec_h.clone(),
+                            eco_h.clone(),
+                            emo_h.clone(),
+                        ]);
                         unsafe {
                             enumerate_admissible_kernel::launch_unchecked::<CudaRuntime>(
                                 &client,
@@ -3089,6 +3103,46 @@ fn multiply_batch_block<'a>(
                         BufferArg::from_raw_parts($v[$i].0.clone(), $v[$i].1)
                     };
                 }
+                // Keep every buffer this launch reads alive until the READBACK completes, not merely
+                // until this closure returns. With the blocking `read_one` those two coincided; with
+                // `read_async` this closure returns while the kernel may still be running, and a
+                // dropped handle lets cubecl hand its pages to a later allocation that the running
+                // kernel is still reading — observed as `CUDA_ERROR_LAUNCH_FAILED` at `max_t=304`.
+                //
+                // `BufferArg::from_raw_parts` consuming the handles below does NOT keep them alive:
+                // it takes them by value and the argument dies with the launch call. Nor do the `sa!`
+                // segment clones — those are temporaries too. So clone every handle here, before the
+                // launch consumes the originals, and hand the vec back with the future.
+                let keepalive: Vec<Handle> = [
+                    tg_h.clone(),
+                    g_h.clone(),
+                    xi_h.clone(),
+                    out_h.clone(),
+                    rco_h.clone(),
+                    rmo_h.clone(),
+                    rcl_h.clone(),
+                    rml_h.clone(),
+                    rnm_h.clone(),
+                    pri_h.clone(),
+                    pts_h.clone(),
+                    pnt_h.clone(),
+                    prb_h.clone(),
+                    poo_h.clone(),
+                    pps_h.clone(),
+                    coarse_h.clone(),
+                    psh_h.clone(),
+                    pms_h.clone(),
+                ]
+                .into_iter()
+                // The resident segment stores, including the padding dummies. Their segments are
+                // never freed while a handle lives, which is exactly the guarantee being extended.
+                .chain(
+                    [&cs_seg, &mk_seg, &pp_seg, &ln_seg]
+                        .into_iter()
+                        .flat_map(|v| v.iter().map(|(h, _)| h.clone())),
+                )
+                .chain(enum_keep)
+                .collect();
                 // SAFETY: `launch_unchecked` — see the kernel's `address_type = "u64"` note. Every device
                 // read is in-bounds by construction (uploaded `need_*` prefix, per-segment select, `j` guards).
                 unsafe {
@@ -3187,21 +3241,7 @@ fn multiply_batch_block<'a>(
                     );
                 }
 
-                // KNOWN BUG, NOT YET FIXED — a full stem-200 crashes with
-            // `CUDA_ERROR_LAUNCH_FAILED, "unspecified launch failure"` (observed at `max_t=304`
-            // after 2673 s; NOT the cleanup race, `NASSAU_GPU_CLEANUP_EVERY=0` was set).
-            //
-            // Because this closure no longer blocks, it RETURNS AND DROPS ITS INPUT HANDLES while
-            // the kernel may still be running, so cubecl can hand those pages to a later allocation
-            // that the running kernel is still reading. `read_one` blocked, which kept them alive
-            // until the kernel retired. `BufferArg::from_raw_parts` consuming the handles does NOT
-            // save this: `cs_seg`/`mk_seg` are `Vec<(Handle, usize)>` CLONES with their own
-            // lifetimes, as are the dummies and the `r*_h` group.
-            //
-            // Fix: return `(DynFut, Vec<Handle>)` and drop the vec after `block_on`, exactly as the
-            // permit now does — clone each handle into it immediately before `launch_unchecked`.
-            //
-            // Issue the readback but DO NOT wait for it. `read_async` enqueues the device→host copy
+                // Issue the readback but DO NOT wait for it. `read_async` enqueues the device→host copy
                 // into pinned memory and records a CUDA event, then hands back a future whose entire body
                 // is that event's wait (`cubecl-cuda` `command.rs`, `Fence::wait_sync`). Returning it
                 // un-awaited is what makes the pipeline deeper than one kernel: this worker goes straight
@@ -3237,7 +3277,9 @@ fn multiply_batch_block<'a>(
                     client.memory_cleanup();
                 }
 
-                result
+                // The keepalive rides back with the future so the caller's wait, not this closure's
+                // return, is what finally releases the launch's buffers.
+                (result, keepalive)
             })
         });
 
@@ -3251,7 +3293,7 @@ fn multiply_batch_block<'a>(
             // — the two are indistinguishable, which is how the one-kernel-deep pipeline stayed hidden
             // through three separate fan-out rewrites.
             let t_launch = std::time::Instant::now();
-            let (fut, timing) = pending.wait();
+            let ((fut, keepalive), timing) = pending.wait();
             let launch_ms = t_launch.elapsed().as_secs_f64() * 1e3;
 
             let t_fence = std::time::Instant::now();
@@ -3263,6 +3305,11 @@ fn multiply_batch_block<'a>(
             // Only now is the output buffer free — device page and pinned host landing both — so this is
             // where the byte budget must be released. Explicit rather than implicit: the whole point of
             // moving it here is that dropping it earlier silently unbounds memory (see its acquisition).
+            // Only now can the launch's input buffers be reclaimed: the fence above is the first
+            // moment the kernel is known to be done reading them. Dropping these when the device
+            // closure returned — as the first cut of this pipelining did — let cubecl reuse pages
+            // under a running kernel, which crashed a stem-200 at `max_t=304`.
+            drop(keepalive);
             drop(permit);
 
             BATCH_LAUNCH_US.fetch_add(
