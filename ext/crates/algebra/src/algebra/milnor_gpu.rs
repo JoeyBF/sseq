@@ -2325,12 +2325,44 @@ fn multiply_batch_grouped(
         //     worker, so the devices stay busy with later blocks while this thread sits on fences.
         //
         // In-flight work is therefore bounded by `NASSAU_GPU_MEM_BUDGET_MB` — memory, not threads.
-        let submits: Vec<BlockSubmit<'_>> = by_dev
+        // Phase 1 marshals the shards concurrently on DEDICATED threads, not on the rayon pool.
+        //
+        // That distinction is the whole measurement. Verified complete stem-200 runs: scoped threads
+        // 2439 s against 3138 s for serial marshal, with `marshal` 1134 s vs 3283 s and mean queue
+        // depth 4.1 vs 1.9 — the devices are simply fed better. But routing the same work through
+        // rayon (`into_maybe_par_iter`, ef16f934ef) measured 3373 s, i.e. WORSE than serial. So it is
+        // not parallelism as such that pays; it is parallelism that does not contend with the ~128
+        // resolution workers already occupying the global pool.
+        //
+        // Cost: `gpu_count()` spawns per row block, ~1M over a run. Live threads peak at
+        // callers x devices ~512 against a per-UID `RLIMIT_NPROC` of 4096 shared machine-wide, and
+        // PIDs recycle on join, so the churn is ~1% of runtime rather than an accumulation. Do NOT
+        // "tidy" this into a shared pool without re-measuring — that is exactly what ef16f934ef did.
+        //
+        // Permits are still taken in phase 2, never here. The original scoped fan-out took each
+        // shard's permit while its siblings were still marshalling, which was harmless only because
+        // the permit was the broken pre-`a4aed87c64` one that bounded nothing (`permit=0.0s` in that
+        // run's stats). With the budget actually enforcing, that shape is the deadlock [`GpuBudget`]
+        // documents; keeping acquisition in the rayon-free phase gets the throughput without it.
+        let shards: Vec<(usize, &Vec<GpuProduct>)> = by_dev
             .iter()
             .enumerate()
             .filter(|(_, ps)| !ps.is_empty())
-            .map(|(d, ps)| multiply_batch_block(algebra, num_cols, r0, r1 - r0, ps, mode, d))
             .collect();
+        let submits: Vec<BlockSubmit<'_>> = std::thread::scope(|scope| {
+            let handles: Vec<_> = shards
+                .into_iter()
+                .map(|(d, ps)| {
+                    scope.spawn(move || {
+                        multiply_batch_block(algebra, num_cols, r0, r1 - r0, ps, mode, d)
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().expect("a shard's marshal panicked"))
+                .collect()
+        });
         let waits: Vec<BlockWait> = submits.into_iter().map(|s| s()).collect();
         let partials: Vec<Bytes> = waits.into_iter().map(|w| w()).collect();
         let mut it = partials.into_iter();
@@ -2361,7 +2393,7 @@ type BlockWait = Box<dyn FnOnce() -> Bytes + Send>;
 /// held device `d`'s permit while marshalling device `d + 1`, so a par_iter chunk could steal a
 /// resolution-step job that parked on `acquire` while this thread waited on a join those very
 /// workers had to finish — the H200 stall the invariant exists to prevent.
-type BlockSubmit<'a> = Box<dyn FnOnce() -> BlockWait + 'a>;
+type BlockSubmit<'a> = Box<dyn FnOnce() -> BlockWait + Send + 'a>;
 
 /// One bounded launch of [`multiply_batch_on_gpu`]: rows `row_base..row_base + num_rows` of the
 /// full build, with `products` the (contiguous, row-major) slice landing in those rows. Marshals
