@@ -684,7 +684,14 @@ static RESIDENT_HOST: LazyLock<RwLock<ResidentHost>> = LazyLock::new(|| {
 const MAX_GPUS: usize = 8;
 
 /// How many CUDA devices the multiply path spreads work over. `NASSAU_GPU_DEVICES` overrides;
-/// otherwise every device the driver exposes is used.
+/// otherwise every device *visible to this process* is used.
+///
+/// `/proc/driver/nvidia/gpus` counts the devices physically in the node, which is NOT the same thing:
+/// CUDA renumbers the visible subset to `0..n`, so under `CUDA_VISIBLE_DEVICES=1,2,3` the driver
+/// exposes ordinals 0..2 while the node still has four entries in `/proc`. Taking the physical count
+/// there made the fourth shard open device 3 and panic with `CUDA_ERROR_INVALID_DEVICE` ("invalid
+/// device ordinal"), taking the GPU worker threads down with it — so the standard way of partitioning
+/// GPUs on a shared node silently broke the run. Honour the mask when it is set.
 ///
 /// Multi-GPU is worth it here because the single-device run is GPU-bound, not host-bound: whole-run
 /// accounting on stem 200 measured 3302 s of device execution against 3931 s wall (84% duty), so
@@ -692,10 +699,22 @@ const MAX_GPUS: usize = 8;
 /// and 2.70x at N = 4.
 fn gpu_count() -> usize {
     static N: LazyLock<usize> = LazyLock::new(|| {
-        let detected = std::fs::read_dir("/proc/driver/nvidia/gpus")
+        let physical = std::fs::read_dir("/proc/driver/nvidia/gpus")
             .map(|d| d.filter_map(|e| e.ok()).count())
             .unwrap_or(0)
             .max(1);
+        // An empty mask means "no GPUs visible"; a mask listing unparseable or out-of-range entries
+        // truncates at the first bad one, exactly as CUDA itself does.
+        let visible = std::env::var("CUDA_VISIBLE_DEVICES").ok().map(|v| {
+            v.split(',')
+                .take_while(|e| {
+                    e.trim()
+                        .parse::<usize>()
+                        .is_ok_and(|ord| ord < physical.max(MAX_GPUS))
+                })
+                .count()
+        });
+        let detected = visible.unwrap_or(physical).max(1);
         std::env::var("NASSAU_GPU_DEVICES")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
@@ -1017,8 +1036,9 @@ static R_STATS: LazyLock<Option<Mutex<HashMap<PPart, RStat>>>> =
 ///
 /// The mixing is load-bearing, not decoration. [`PPart`] packs entry `i` into a field at a fixed
 /// bit offset, so the low bits are `r_1` — which correlates strongly with internal degree, and
-/// degree correlates with work (the `NASSAU_R_STATS` hot decile averages degree 70 against the cold
-/// decile's 14). Taking `bits() % gpu_count()` would therefore partition by `r_1 mod 4` and could
+/// degree correlates with reference rate (the `NASSAU_R_STATS` hot decile averages degree 70, the
+/// cold decile 149 — low-degree `R`s are the hot core). Taking `bits() % gpu_count()` would
+/// therefore partition by `r_1 mod 4` and could
 /// reproduce the very skew this replaces. The splitmix64 finalizer below spreads every input bit
 /// across the output, so the shard is independent of the packing's structure.
 ///
@@ -1181,6 +1201,32 @@ pub fn dump_r_stats() {
         cold_span,
         deg_table,
     );
+
+    // The full concentration curve, not just four points: "the hottest x% of `R`s carry y% of all
+    // references", sampled densely near the head where it bends. Four percentiles were enough to
+    // see that the distribution is skewed, but not to size a policy against it — a shard assignment
+    // or an eviction cache behaves very differently if the head is a cliff rather than a slope.
+    // `v` is already sorted by count descending.
+    let mut curve = String::new();
+    let mut acc = 0u64;
+    let mut next = 0usize;
+    // Denser sampling below 10%: that is where essentially all of the curvature lives.
+    let marks: Vec<f64> = (1..=40)
+        .map(|i| i as f64 * 0.0025)
+        .chain((1..=18).map(|i| 0.10 + i as f64 * 0.05))
+        .collect();
+    for (i, s) in v.iter().enumerate() {
+        acc += s.count;
+        while next < marks.len() && (i + 1) as f64 / n as f64 >= marks[next] {
+            curve.push_str(&format!(
+                "{:.3}:{:.4} ",
+                marks[next],
+                acc as f64 / total_refs as f64
+            ));
+            next += 1;
+        }
+    }
+    eprintln!("[R-LORENZ] n={n} total_refs={total_refs} points(x_frac:y_frac) {curve}");
 }
 
 fn resident_info(algebra: &MilnorAlgebra, p_part: PPart) -> RInfo {
@@ -2184,7 +2230,7 @@ pub fn multiply_batch_on_gpu(
     // the run dies at the fault. [`GPU_DISABLED`] is still latched first so in-process observers
     // (the soak test) can tell a context death from an ordinary assertion failure.
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        multiply_batch_gpu_inner(algebra, num_cols, num_rows, products)
+        multiply_batch_gpu_inner(algebra, num_cols, num_rows, products, resident_degree_cap())
     })) {
         Ok(out) => out,
         Err(payload) => {
@@ -2253,8 +2299,11 @@ fn multiply_batch_gpu_inner(
     num_cols: usize,
     num_rows: usize,
     products: &[GpuProduct],
+    // Passed in rather than read from [`resident_degree_cap`]: that is a process-wide `LazyLock` over
+    // an env var, so a test could only ever exercise ONE cap per process — and the eviction split has
+    // three distinct regimes (all-resident, all-transient, mixed) that must each be checked.
+    cap: i32,
 ) -> BatchOutput {
-    let cap = resident_degree_cap();
     // Fast path (default, `cap == i32::MAX`, and any run whose `R`s are all under the cap): a single
     // resident-master pass, byte-identical to the pre-eviction code. No cloning, no second launch.
     let num_limbs_all = num_cols.div_ceil(32).max(1);
@@ -4657,6 +4706,11 @@ mod tests {
     /// validating the cubecl lowering of the flag-based enumeration (local arrays, bitops, u16
     /// stores) across the FULL degree range the eviction path exercises (cold R's reach ~144 at
     /// stem 150), not just the low degrees. Requires a live GPU + the CUDA toolkit env.
+    ///
+    /// 145 is a runtime compromise, not a known ceiling: the degree-240 sweep (1,593,460 `R`s,
+    /// 16,949,543,206 matrices) also passes bit-exact, but takes 942 s against a few seconds here,
+    /// and the cost is in the CPU reference, so it grows steeply. Raise the bound to re-check after
+    /// touching the kernel — a `LAUNCH_FAILED` at high stem is NOT evidence against this kernel.
     #[test]
     fn admissible_enum_gpu_matches() {
         check_enum_backend::<CudaRuntime>(&CudaDevice::default(), 145);
@@ -5108,6 +5162,124 @@ mod tests {
             "multiply_batch: {} products across {num_rows} rows matched reference",
             products.len()
         );
+    }
+
+    /// The same batch, run through every regime of the eviction split ([`MasterMode`]) — all-resident,
+    /// all-transient, and the mixed two-launch path — must give the identical matrix.
+    ///
+    /// This is the coverage `multiply_batch_matches_reference` does not provide: it only ever runs the
+    /// default `cap == i32::MAX` fast path, so *nothing* exercised on-device enumeration feeding the
+    /// multiply until now. `admissible_enum_gpu_matches` validates the enumeration kernel in isolation
+    /// through a test-only harness, which is a different launch path — it says nothing about whether
+    /// the scratch it writes is laid out the way `multiply_batch_kernel` indexes it.
+    ///
+    /// The caps are chosen against the batch's actual `R` degrees (1..`out_degree`): `MAX` keeps every
+    /// `R` resident, `0` pushes every `R` transient, and the interior ones straddle the split so both
+    /// launches run and their disjoint row sets have to reassemble correctly.
+    #[test]
+    fn multiply_batch_matches_reference_under_eviction() {
+        // Low degree pins the *logic* of the split; the high-degree pass is where a cap actually bites
+        // in production (the stem-210 θ=125 run faulted only once the frontier reached t≈185, with
+        // every low-degree block before it clean), so a small-batch-only test would prove nothing
+        // about the regime the knob exists for.
+        check_eviction_regimes(24);
+        check_eviction_regimes(72);
+    }
+
+    fn check_eviction_regimes(out_degree: i32) {
+        use fp::{prime::ValidPrime, vector::FpVector};
+
+        let p = ValidPrime::new(2);
+        let algebra = Arc::new(MilnorAlgebra::new(p, false));
+        let max_degree = out_degree + 16;
+        algebra.compute_basis(max_degree);
+        algebra.compute_seqno_tables(max_degree);
+
+        let out_dim = algebra.dimension(out_degree);
+        let num_rows = 8;
+
+        let mut products = Vec::new();
+        for r_degree in 1..out_degree {
+            let s_degree = out_degree - r_degree;
+            let s_dim = algebra.dimension(s_degree);
+            if s_dim == 0 {
+                continue;
+            }
+            let r_dim = algebra.dimension(r_degree);
+            for r_idx in 0..r_dim {
+                if algebra
+                    .basis_element_from_index(r_degree, r_idx)
+                    .p_part
+                    .is_empty()
+                {
+                    continue;
+                }
+                let row = products.len() % num_rows;
+                products.push(GpuProduct {
+                    r_degree,
+                    r_idx,
+                    s_degree,
+                    term_indices: (0..s_dim).collect(),
+                    row,
+                    out_offset: 0,
+                });
+            }
+        }
+
+        let mut cpu_rows: Vec<FpVector> =
+            (0..num_rows).map(|_| FpVector::new(p, out_dim)).collect();
+        for prod in &products {
+            let s_dim = algebra.dimension(prod.s_degree);
+            let mut s = FpVector::new(p, s_dim);
+            for &ti in &prod.term_indices {
+                s.set_entry(ti, 1);
+            }
+            let mut tmp = FpVector::new(p, out_dim);
+            algebra.multiply_basis_element_by_element_2(
+                tmp.as_slice_mut(),
+                1,
+                prod.r_degree,
+                prod.r_idx,
+                prod.s_degree,
+                s.as_slice(),
+            );
+            cpu_rows[prod.row].add(&tmp, 1);
+        }
+        let num_limbs = out_dim.div_ceil(32).max(1);
+        let golden: Vec<Vec<u32>> = cpu_rows
+            .iter()
+            .map(|row| {
+                let mut packed = vec![0u32; num_limbs];
+                for (i, _) in row.iter_nonzero() {
+                    packed[i / 32] ^= 1u32 << (i % 32);
+                }
+                packed
+            })
+            .collect();
+        let golden = BatchOutput::from_rows(&golden, num_limbs);
+
+        for cap in [
+            i32::MAX,
+            0,
+            1,
+            out_degree / 3,
+            out_degree / 2,
+            out_degree - 1,
+        ] {
+            let got = multiply_batch_gpu_inner(&algebra, out_dim, num_rows, &products, cap);
+            let transient = products.iter().filter(|p| p.r_degree > cap).count();
+            assert_eq!(
+                got,
+                golden,
+                "batched GPU multiply diverged from reference at cap {cap} ({transient}/{} \
+                 products transient)",
+                products.len()
+            );
+            eprintln!(
+                "multiply_batch cap={cap}: {transient}/{} products transient, matched reference",
+                products.len()
+            );
+        }
     }
 
     /// The stopgap CPU fallback ([`cpu_multiply_batch`]) must produce byte-identical output to the GPU
