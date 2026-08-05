@@ -74,7 +74,8 @@ mod gpu {
 
     pub fn nassau_milnor_gpu(c: &mut Criterion) {
         // Exactly the algebra Nassau uses: the full Milnor algebra at p=2, stable (not unstable).
-        let algebra = MilnorAlgebra::new(TWO, false);
+        use std::sync::Arc;
+        let algebra = Arc::new(MilnorAlgebra::new(TWO, false));
         let mut g = c.benchmark_group("nassau_milnor_gpu");
 
         for &out_degree in OUT_DEGREES {

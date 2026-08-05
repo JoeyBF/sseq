@@ -333,6 +333,69 @@ mod gpu_thread {
     }
 }
 
+/// Persistent per-caller helper threads for the shard fan-out.
+///
+/// # Why per-caller, and not one shared pool
+///
+/// The fan-out's whole value is that each shard's pipeline — marshal, permit, submit, wait — runs
+/// concurrently, so all `gpu_count()` devices receive work at once instead of each submission
+/// queueing behind the previous shard's marshal. Verified stem-200s: 2412 s with concurrent
+/// submission, 3138 s without, and 3358 s when only the *marshal* was parallelised (which cut
+/// marshal by 840 s and still lost 220 s — marshal time does not predict wall time).
+///
+/// A *shared* pool re-serialises exactly that: with every caller feeding one queue, a shard waits
+/// behind other callers' shards. Measured ~3743 s for a 512-thread shared rayon pool, and 3373 s
+/// routing the same work through the global rayon pool — both slower than doing nothing. So each
+/// caller owns its helpers privately: no shared queue, no stealing, no cross-caller interference.
+///
+/// # Sizing
+///
+/// `gpu_count() - 1` threads per calling thread, created lazily on that thread's first fan-out and
+/// reused forever after; the caller runs the remaining shard itself. Aggregate is therefore
+/// `rayon_threads x (gpu_count - 1)` and falls out of the rayon pool size rather than being a
+/// separate knob that can drift from it — shrink the rayon pool and this shrinks in proportion.
+///
+/// Replaces `std::thread::scope`, which spawned `gpu_count()` OS threads per row block (~900 k per
+/// stem-200 run). That churn cost ~0.01% of wall time, so this is a robustness change, not a
+/// throughput one: it keeps the live thread count off `RLIMIT_NPROC` (4096 per-UID, shared
+/// machine-wide, against a ~644-thread baseline) and stops the PID churn.
+mod shard_pool {
+    use std::{cell::RefCell, sync::mpsc};
+
+    type Job = Box<dyn FnOnce() + Send + 'static>;
+
+    thread_local! {
+        /// This caller's helpers. `RefCell` and not `OnceCell` only because the vector is built
+        /// lazily; it is never borrowed across a dispatch.
+        static HELPERS: RefCell<Vec<mpsc::Sender<Job>>> = const { RefCell::new(Vec::new()) };
+    }
+
+    /// Hand `job` to this thread's helper `i`, spawning the helpers on first use.
+    ///
+    /// Panics in a job are contained by the helper (its result channel drops, which the caller sees
+    /// as a receive error) so one bad shard cannot poison a thread other callers depend on — there
+    /// are none, but it also keeps this caller's later blocks working.
+    pub(super) fn dispatch(i: usize, job: Job) {
+        HELPERS.with(|h| {
+            let mut h = h.borrow_mut();
+            while h.len() <= i {
+                let (tx, rx) = mpsc::channel::<Job>();
+                let idx = h.len();
+                std::thread::Builder::new()
+                    .name(format!("nassau-shard{idx}"))
+                    .spawn(move || {
+                        while let Ok(job) = rx.recv() {
+                            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job));
+                        }
+                    })
+                    .expect("failed to spawn a shard helper thread");
+                h.push(tx);
+            }
+            h[i].send(job).expect("a shard helper thread died");
+        });
+    }
+}
+
 /// A/B diagnostic toggle (`NASSAU_GPU_BASIS_PASSTHROUGH=1`): when set, the batched multiply
 /// marshals each term's p-part per launch and binds those buffers as the "basis" with an
 /// identity index map, reproducing the pre-resident-basis behaviour through the same kernel.
@@ -378,7 +441,10 @@ fn narrow_u16(v: u32) -> u16 {
     u16::try_from(v).expect("admissible/term entry exceeds u16")
 }
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, AtomicU64, Ordering},
+};
 
 /// Set once the cubecl CUDA context has failed irrecoverably (a `CUDA_ERROR_LAUNCH_FAILED` /
 /// `ServerUnhealthy` surfacing the unresolved cubecl uninit-handle bug — see
@@ -2071,7 +2137,7 @@ impl std::fmt::Debug for BatchOutput {
 }
 
 pub fn multiply_batch_on_gpu(
-    algebra: &MilnorAlgebra,
+    algebra: &Arc<MilnorAlgebra>,
     num_cols: usize,
     num_rows: usize,
     products: &[GpuProduct],
@@ -2148,7 +2214,7 @@ pub fn cpu_multiply_batch(
 }
 
 fn multiply_batch_gpu_inner(
-    algebra: &MilnorAlgebra,
+    algebra: &Arc<MilnorAlgebra>,
     num_cols: usize,
     num_rows: usize,
     products: &[GpuProduct],
@@ -2213,7 +2279,7 @@ fn multiply_batch_gpu_inner(
 }
 
 fn multiply_batch_grouped(
-    algebra: &MilnorAlgebra,
+    algebra: &Arc<MilnorAlgebra>,
     num_cols: usize,
     num_rows: usize,
     products: &[GpuProduct],
@@ -2325,54 +2391,71 @@ fn multiply_batch_grouped(
         //     worker, so the devices stay busy with later blocks while this thread sits on fences.
         //
         // In-flight work is therefore bounded by `NASSAU_GPU_MEM_BUDGET_MB` — memory, not threads.
-        // Each shard runs its WHOLE pipeline — marshal, permit, submit, wait — on its own thread.
+        // Each shard runs its WHOLE pipeline — marshal, permit, submit, wait — concurrently, so
+        // all `gpu_count()` devices receive work at once. Verified stem-200s:
         //
-        // Concurrent SUBMISSION is the lever, and it took three measured runs to isolate. Verified
-        // complete stem-200s:
-        //
-        //   scoped, whole pipeline per thread   2439 s   marshal 1134 s   depth 4.1
+        //   concurrent submission (this)        2412 s   marshal 1108 s   depth 2.4
         //   scoped marshal, serial submit       3358 s   marshal 2439 s   depth 1.8
         //   serial marshal, serial submit       3138 s   marshal 3283 s   depth 1.9
         //   rayon marshal, serial submit        3373 s
         //
-        // Read the middle row carefully: it CUT marshal by 840 s and got 220 s SLOWER. Marshal time
-        // does not predict wall time; queue depth does. Parallelising the marshal alone leaves every
-        // shard's submission behind the previous one, so the devices still see ~2 blocks queued and
-        // idle between them. Only submitting concurrently gets depth to 4.1 and the GPUs fed.
+        // Row 2 pins the mechanism: it cut marshal by 840 s and came out 220 s SLOWER. Marshal time
+        // does not predict wall time — leaving each submit behind the previous shard's marshal
+        // starves the devices however fast the marshal itself is.
         //
-        // Cost: `gpu_count()` spawns per row block, ~1M over a run. Live threads peak at
-        // callers x devices ~512 against a per-UID `RLIMIT_NPROC` of 4096 shared machine-wide, and
-        // PIDs recycle on join, so this is ~1% churn, not accumulation. Do NOT convert this to a
-        // shared pool or a rayon `par_iter` without re-measuring END TO END: both were tried
-        // (3743 s and 3373 s) and both lost, because they queue behind the ~128 resolution workers
-        // instead of running beside them.
-        let shards: Vec<(usize, &Vec<GpuProduct>)> = by_dev
-            .iter()
+        // Helpers are persistent and PRIVATE to this thread (see [`shard_pool`]); the caller takes
+        // the last shard itself, so `gpu_count() - 1` are dispatched. Do not consolidate them into a
+        // shared pool or a rayon `par_iter` without an end-to-end re-measure: both were tried
+        // (~3743 s and 3373 s) and both lost, because a shared queue puts a shard behind other
+        // callers' shards — precisely the serialisation this exists to remove.
+        //
+        // Permits are acquired from several threads at once. Safe in the default configuration
+        // because the marshal contains no rayon — the `term_gei` fill is deliberately sequential
+        // (a par_iter over it once measured a 146 s stall) — so there is no join for a
+        // permit-blocked steal to wedge, and every holder is on the GPU or progressing. Under the
+        // `NASSAU_GPU_BASIS_PASSTHROUGH` diagnostic that fill IS a par_iter, which is exactly
+        // [`GpuBudget`]'s documented deadlock, so that path runs the shards serially.
+        let mut shards: Vec<(usize, Vec<GpuProduct>)> = by_dev
+            .into_iter()
             .enumerate()
             .filter(|(_, ps)| !ps.is_empty())
             .collect();
-        let run_shard = |d: usize, ps: &Vec<GpuProduct>| -> Bytes {
-            multiply_batch_block(algebra, num_cols, r0, r1 - r0, ps, mode, d)()()
-        };
-        // Threads hold their permit while siblings marshal. That is safe HERE and only here because
-        // the marshal contains no rayon — the `term_gei` fill is deliberately sequential (a par_iter
-        // over it once measured a 146 s stall), so there is no join for a permit-blocked steal to
-        // wedge, and every holder is either on the GPU or making progress. The one exception is the
-        // `NASSAU_GPU_BASIS_PASSTHROUGH` diagnostic, whose per-product fill IS a par_iter; that
-        // combination is exactly [`GpuBudget`]'s documented deadlock, so it runs serially instead.
-        let partials: Vec<Bytes> = if basis_passthrough() {
-            shards.into_iter().map(|(d, ps)| run_shard(d, ps)).collect()
+        let block_rows = r1 - r0;
+        let run_shard =
+            move |algebra: Arc<MilnorAlgebra>, d: usize, ps: Vec<GpuProduct>| -> Bytes {
+                multiply_batch_block(&algebra, num_cols, r0, block_rows, &ps, mode, d)()()
+            };
+        let partials: Vec<Bytes> = if basis_passthrough() || shards.len() == 1 {
+            shards
+                .into_iter()
+                .map(|(d, ps)| run_shard(algebra.clone(), d, ps))
+                .collect()
         } else {
-            std::thread::scope(|scope| {
-                let handles: Vec<_> = shards
-                    .into_iter()
-                    .map(|(d, ps)| scope.spawn(move || run_shard(d, ps)))
-                    .collect();
-                handles
-                    .into_iter()
-                    .map(|h| h.join().expect("a shard panicked"))
-                    .collect()
-            })
+            // Dispatch all but one, run that one here, then collect. Every helper is joined through
+            // its result channel before this returns, so a shard cannot outlive the block.
+            let mine = shards.pop().expect("shards is non-empty");
+            let rxs: Vec<_> = shards
+                .into_iter()
+                .enumerate()
+                .map(|(i, (d, ps))| {
+                    let (tx, rx) = std::sync::mpsc::sync_channel::<Bytes>(1);
+                    let alg = algebra.clone();
+                    shard_pool::dispatch(
+                        i,
+                        Box::new(move || {
+                            let _ = tx.send(run_shard(alg, d, ps));
+                        }),
+                    );
+                    rx
+                })
+                .collect();
+            let here = run_shard(algebra.clone(), mine.0, mine.1);
+            let mut out: Vec<Bytes> = rxs
+                .into_iter()
+                .map(|rx| rx.recv().expect("a shard helper panicked"))
+                .collect();
+            out.push(here);
+            out
         };
         let mut it = partials.into_iter();
         let mut acc = it
@@ -4400,7 +4483,7 @@ mod tests {
         use fp::prime::ValidPrime;
 
         let p = ValidPrime::new(2);
-        let algebra = MilnorAlgebra::new(p, false);
+        let algebra = Arc::new(MilnorAlgebra::new(p, false));
         algebra.compute_basis(max_degree);
 
         // Process one degree per launch. At high degree the full master is tens of GB, so batching every
@@ -4576,7 +4659,7 @@ mod tests {
         use fp::prime::ValidPrime;
 
         let p = ValidPrime::new(2);
-        let algebra = MilnorAlgebra::new(p, false);
+        let algebra = Arc::new(MilnorAlgebra::new(p, false));
         let max_degree = 130;
         algebra.compute_basis(max_degree);
 
@@ -4663,7 +4746,7 @@ mod tests {
         use fp::prime::ValidPrime;
 
         let p = ValidPrime::new(2);
-        let algebra = MilnorAlgebra::new(p, false);
+        let algebra = Arc::new(MilnorAlgebra::new(p, false));
         // To 150: the eviction bench faults on cold (high-degree) R's at internal degree ~144, above
         // the degree-40/60 originally checked — extend the CPU reference to that range.
         let max_degree = 150;
@@ -4709,7 +4792,7 @@ mod tests {
         use fp::prime::ValidPrime;
 
         let p = ValidPrime::new(2);
-        let algebra = MilnorAlgebra::new(p, false);
+        let algebra = Arc::new(MilnorAlgebra::new(p, false));
         let max_degree = 60;
         algebra.compute_basis(max_degree);
         algebra.compute_seqno_tables(max_degree);
@@ -4750,7 +4833,7 @@ mod tests {
         use fp::{prime::ValidPrime, vector::FpVector};
 
         let p = ValidPrime::new(2);
-        let algebra = MilnorAlgebra::new(p, false);
+        let algebra = Arc::new(MilnorAlgebra::new(p, false));
         let max_degree = 40;
         algebra.compute_basis(max_degree);
         algebra.compute_seqno_tables(max_degree);
@@ -4823,7 +4906,7 @@ mod tests {
         use fp::{prime::ValidPrime, vector::FpVector};
 
         let p = ValidPrime::new(2);
-        let algebra = MilnorAlgebra::new(p, false);
+        let algebra = Arc::new(MilnorAlgebra::new(p, false));
         let max_degree = 40;
         algebra.compute_basis(max_degree);
         algebra.compute_seqno_tables(max_degree);
@@ -4915,7 +4998,7 @@ mod tests {
         use fp::prime::ValidPrime;
 
         let p = ValidPrime::new(2);
-        let algebra = MilnorAlgebra::new(p, false);
+        let algebra = Arc::new(MilnorAlgebra::new(p, false));
         let max_degree = 44;
         algebra.compute_basis(max_degree);
         algebra.compute_seqno_tables(max_degree);
@@ -4980,7 +5063,7 @@ mod tests {
         use fp::{prime::ValidPrime, vector::FpVector};
 
         let p = ValidPrime::new(2);
-        let algebra = MilnorAlgebra::new(p, false);
+        let algebra = Arc::new(MilnorAlgebra::new(p, false));
         let max_degree = 48;
         algebra.compute_basis(max_degree);
         algebra.compute_seqno_tables(max_degree);
@@ -5120,7 +5203,7 @@ mod tests {
         let num_rows = 32usize;
 
         let p = fp::prime::ValidPrime::new(2);
-        let algebra = MilnorAlgebra::new(p, false);
+        let algebra = Arc::new(MilnorAlgebra::new(p, false));
         algebra.compute_basis(max_degree);
         algebra.compute_seqno_tables(max_degree);
 
@@ -5316,7 +5399,7 @@ mod tests {
         let spread = env_num("NASSAU_BENCH_SPREAD", 4) as i32;
 
         let p = fp::prime::ValidPrime::new(2);
-        let algebra = MilnorAlgebra::new(p, false);
+        let algebra = Arc::new(MilnorAlgebra::new(p, false));
 
         // Grow the basis until it brackets `target_cols`, then take the closest degree. Doubling
         // the probe keeps this from computing a far larger basis than the bench needs.
