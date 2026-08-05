@@ -56,11 +56,19 @@ fn ppart_shift_mask() -> (Vec<u32>, Vec<u32>) {
 }
 
 /// Per-thread local caps for the in-kernel admissible enumeration ([`enumerate_admissible_kernel`]).
-/// Each `R` has `rows = |p_part| ≤ MAX_XI_TAU` and `cols ≤ WORKING_CAP` (max bit-length of an entry),
+/// Each `R` has `rows = |p_part| ≤ MAX_XI_TAU` and `cols ≤ ENUM_COL_CAP` (max bit-length of an entry),
 /// so the enumeration's `matrix` is `rows*cols`, `col_sums` is `cols−1`, and `masks` is `rows+cols−1`.
 /// These bound the fixed-size local `Array`s the kernel allocates per thread.
+///
+/// `cols` is the widest bit-length of any p-part entry, so its true bound is `PPart::width(0)` — the
+/// field holding `r_1`, the widest — and NOT `WORKING_CAP`, which sizes an unrelated array (the
+/// multiply kernel's assembled p-part) and is nearly 3x larger. That conflation made `matrix`, the
+/// hottest per-thread array, 320 u32 instead of 110. It is CUDA *local* memory: dynamically indexed,
+/// so it cannot be register-allocated and every access is a real off-chip load. Deriving the cap from
+/// the width table keeps it correct if `PPart`'s layout ever changes; `enum_col_cap_bounds_real_rs`
+/// checks it against every actual `R`.
 const ENUM_ROW_CAP: usize = MAX_XI_TAU;
-const ENUM_COL_CAP: usize = WORKING_CAP;
+const ENUM_COL_CAP: usize = PPart::width(0) as usize;
 const ENUM_MATRIX_CAP: usize = ENUM_ROW_CAP * ENUM_COL_CAP;
 const ENUM_MASK_CAP: usize = ENUM_ROW_CAP + ENUM_COL_CAP;
 
@@ -2854,20 +2862,52 @@ fn multiply_batch_block<'a>(
             }
         }
 
-        // (Transient) Flatten the cold p-parts (padded to the widest) for the enumeration kernel. The
-        // per-`R` scratch offsets it writes at are `r_cs_offset`/`r_mk_offset` themselves (u64), passed
-        // straight through — no u32 narrowing, so a big block's multi-GB scratch is addressed safely.
-        let (enum_pp, enum_width) = if mode == MasterMode::Transient {
+        // (Transient) Flatten the cold p-parts (padded to the widest) for the enumeration kernel, in
+        // MATRIX-COUNT ORDER rather than basis order.
+        //
+        // The enumeration is an odometer, so a thread's cost is proportional to its `R`'s matrix
+        // count, and a warp retires only when its slowest lane does — a warp costs `32 x max`, not
+        // `sum`. Matrix counts are heavily skewed (the `NASSAU_R_STATS` Lorenz curve: the hottest 1%
+        // of `R`s carry 31% of all references), so in basis order one huge `R` idles the other 31
+        // lanes for its entire run. Measured by `enum_warp_utilisation` to degree 130: 30.9% of lane
+        // slots do useful work in basis order against 66.8% sorted, a 2.16x headroom.
+        //
+        // Only the ENUMERATION's own inputs are permuted. The kernel writes each `R` to the absolute
+        // scratch offset it is handed, so reordering its inputs consistently reproduces byte-identical
+        // scratch — the multiply's `r_cs_offset`/`r_mk_offset`/`prod_r_index` keep basis order and are
+        // untouched. (`out_counts` follows the permutation, but production discards it.)
+        let (enum_pp, enum_width, enum_rows, enum_cols, enum_cs_out, enum_mk_out) = if mode
+            == MasterMode::Transient
+        {
             let w = enum_rows.iter().copied().max().unwrap_or(1) as usize;
+            let mut order: Vec<usize> = (0..enum_pp_rows.len()).collect();
+            order.sort_unstable_by_key(|&i| r_num_matrices[i]);
             let mut pp = vec![0u32; enum_pp_rows.len() * w];
-            for (i, row) in enum_pp_rows.iter().enumerate() {
-                for (slot, &v) in pp[i * w..i * w + row.len()].iter_mut().zip(row) {
-                    *slot = v;
+            for (slot, &i) in order.iter().enumerate() {
+                let row = &enum_pp_rows[i];
+                for (dst, &v) in pp[slot * w..slot * w + row.len()].iter_mut().zip(row) {
+                    *dst = v;
                 }
             }
-            (pp, w)
+            let pick_u32 = |src: &[u32]| -> Vec<u32> { order.iter().map(|&i| src[i]).collect() };
+            let pick_u64 = |src: &[u64]| -> Vec<u64> { order.iter().map(|&i| src[i]).collect() };
+            (
+                pp,
+                w,
+                pick_u32(&enum_rows),
+                pick_u32(&enum_cols),
+                pick_u64(&r_cs_offset),
+                pick_u64(&r_mk_offset),
+            )
         } else {
-            (Vec::new(), 1usize)
+            (
+                Vec::new(),
+                1usize,
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            )
         };
 
         // Lay out per-product records + the pair-count prefix sum (sequential). Term data is already
@@ -3108,8 +3148,10 @@ fn multiply_batch_block<'a>(
                         let epp_h = client.create_from_slice(u32::as_bytes(&enum_pp));
                         let er_h = client.create_from_slice(u32::as_bytes(&enum_rows));
                         let ec_h = client.create_from_slice(u32::as_bytes(&enum_cols));
-                        let eco_h = client.create_from_slice(u64::as_bytes(&r_cs_offset));
-                        let emo_h = client.create_from_slice(u64::as_bytes(&r_mk_offset));
+                        // The permuted offsets, matching `enum_pp`/`enum_rows`/`enum_cols` — NOT the
+                        // multiply's basis-order `r_cs_offset`/`r_mk_offset`.
+                        let eco_h = client.create_from_slice(u64::as_bytes(&enum_cs_out));
+                        let emo_h = client.create_from_slice(u64::as_bytes(&enum_mk_out));
                         enum_keep.extend([
                             cnt_scratch.clone(),
                             epp_h.clone(),
@@ -3860,16 +3902,22 @@ fn enumerate_admissible_kernel(
     let mut totals = Array::<u32>::new(ENUM_ROW_CAP);
     let mut col_sums = Array::<u32>::new(ENUM_COL_CAP);
     let mut masks = Array::<u32>::new(ENUM_MASK_CAP);
-    for i in 0..ENUM_MATRIX_CAP {
+    // Zero only the region this `R` can actually reach, not the whole comptime cap. Every index the
+    // enumeration below forms is bounded by these: `matrix` by `row*cols+col < rows*cols`, `totals`
+    // by `rows`, `col_sums` by `cols-1 == cs_len`, and `masks` by `(rows-1)+(cols-1) < mk_len`. A
+    // typical `R` is far smaller than the cap (rows ~4-8 against 10, cols ~6-9 against the cap), so
+    // clearing the full arrays spent most of these stores on slots no read ever touches — and they
+    // are local-memory stores, not register writes.
+    for i in 0..rows * cols {
         matrix[i] = 0u32;
     }
-    for i in 0..ENUM_ROW_CAP {
+    for i in 0..rows {
         totals[i] = 0u32;
     }
-    for i in 0..ENUM_COL_CAP {
+    for i in 0..cs_len {
         col_sums[i] = 0u32;
     }
-    for i in 0..ENUM_MASK_CAP {
+    for i in 0..mk_len {
         masks[i] = 0u32;
     }
     // Column 0 of the matrix (and the initial masks) is the padded p_part.
@@ -4701,6 +4749,122 @@ mod tests {
         (marshal_s, kernel_s, readback_s)
     }
 
+    /// How much of the enumeration kernel's throughput the one-thread-per-`R` mapping actually gets.
+    ///
+    /// The kernel walks an odometer, so a thread's cost is proportional to its `R`'s matrix count, and
+    /// a warp cannot retire until its slowest lane does — warp cost is `32 x max`, not `sum`. The
+    /// `NASSAU_R_STATS` Lorenz curve says matrix counts are extremely skewed (the hottest 1% of `R`s
+    /// carry 31% of all references), so if `R`s land in warps in basis order, a single huge `R` can
+    /// idle 31 lanes for its whole run.
+    ///
+    /// Reports achieved utilisation against the same work sorted by matrix count, which is the win
+    /// available from a host-side reorder before launch. CPU-only.
+    ///
+    /// TREAT THE RATIO AS AN UPPER BOUND, NOT A FORECAST: it models a warp in isolation, but an SM
+    /// keeps many warps resident and runs others while a lane-heavy warp grinds, so most of the
+    /// modelled stall is hidden. The 2.16x this reports at degree 130 cashed out as 1.08x measured
+    /// end-to-end (`bench_admissible_cpu_vs_gpu`). Sorting is still worth it — a host-side sort of a
+    /// few thousand keys per block is free next to the launch — but do not size a decision on the
+    /// model without measuring.
+    #[test]
+    #[ignore = "diagnostic, not a correctness check; run explicitly with --ignored --nocapture"]
+    fn enum_warp_utilisation() {
+        use fp::prime::ValidPrime;
+
+        let algebra = MilnorAlgebra::new(ValidPrime::new(2), false);
+        let max_degree = 130;
+        algebra.compute_basis(max_degree);
+
+        // Warp cost model: lanes run in lockstep, so a warp costs 32 x its largest lane.
+        let warp_cost =
+            |mats: &[u64]| -> u64 { mats.chunks(32).map(|w| 32 * w.iter().max().unwrap()).sum() };
+
+        let (mut tot_work, mut tot_natural, mut tot_sorted) = (0u64, 0u64, 0u64);
+        for deg in 1..=max_degree {
+            let mut mats: Vec<u64> = Vec::new();
+            for idx in 0..algebra.dimension(deg) {
+                let pp: Vec<u32> = algebra
+                    .basis_element_from_index(deg, idx)
+                    .p_part
+                    .iter()
+                    .collect();
+                if pp.is_empty() {
+                    continue;
+                }
+                let (_cs_len, mk_len, _cs, mk) = enumerate_admissible_ref(&pp);
+                mats.push((mk.len() / mk_len) as u64);
+            }
+            if mats.is_empty() {
+                continue;
+            }
+            tot_work += mats.iter().sum::<u64>();
+            tot_natural += warp_cost(&mats);
+            let mut sorted = mats.clone();
+            sorted.sort_unstable();
+            tot_sorted += warp_cost(&sorted);
+        }
+
+        let pct = |c: u64| 100.0 * tot_work as f64 / c as f64;
+        eprintln!(
+            "enum warp utilisation to degree {max_degree}: work {tot_work} matrices\n  basis \
+             order : {tot_natural} lane-slots ({:.1}% utilised)\n  sorted      : {tot_sorted} \
+             lane-slots ({:.1}% utilised)  ->  {:.2}x headroom",
+            pct(tot_natural),
+            pct(tot_sorted),
+            tot_natural as f64 / tot_sorted as f64,
+        );
+    }
+
+    /// [`ENUM_COL_CAP`] / [`ENUM_ROW_CAP`] bound fixed-size local arrays the enumeration kernel
+    /// indexes with runtime values, so an `R` exceeding either would write out of bounds — a silent
+    /// `CUDA_ERROR_LAUNCH_FAILED` at some high stem, not a clean failure. The caps are derived from
+    /// `PPart`'s layout rather than measured, so this checks the derivation against reality: no real
+    /// `R` may exceed them.
+    ///
+    /// The caps stay deliberately loose: at degree 400 the real maxima are 8 rows and 9 cols, but
+    /// `cols` is bounded by the `r_1` field width (11) and only approaches it near `PPart::MAX_DEGREE`.
+    /// Tightening to the observed 9 would trade a further 18% of `matrix` for a cap that silently
+    /// breaks at a degree nobody is watching, so the structural bound is the one worth encoding.
+    ///
+    /// CPU-only, so it costs nothing to run in CI alongside the GPU tests.
+    #[test]
+    fn enum_col_cap_bounds_real_rs() {
+        use fp::prime::ValidPrime;
+
+        let algebra = MilnorAlgebra::new(ValidPrime::new(2), false);
+        let max_degree = 400;
+        algebra.compute_basis(max_degree);
+
+        let (mut max_rows, mut max_cols) = (0usize, 0usize);
+        for deg in 1..=max_degree {
+            for idx in 0..algebra.dimension(deg) {
+                let pp = algebra.basis_element_from_index(deg, idx).p_part;
+                if pp.is_empty() {
+                    continue;
+                }
+                max_rows = max_rows.max(pp.len());
+                max_cols = max_cols.max(
+                    pp.iter()
+                        .map(|x| (u32::BITS - x.leading_zeros()) as usize)
+                        .max()
+                        .unwrap(),
+                );
+            }
+        }
+        assert!(
+            max_rows <= ENUM_ROW_CAP,
+            "an R has {max_rows} rows > ENUM_ROW_CAP {ENUM_ROW_CAP}"
+        );
+        assert!(
+            max_cols <= ENUM_COL_CAP,
+            "an R has {max_cols} cols > ENUM_COL_CAP {ENUM_COL_CAP}"
+        );
+        eprintln!(
+            "enum caps to degree {max_degree}: max rows {max_rows}/{ENUM_ROW_CAP}, max cols \
+             {max_cols}/{ENUM_COL_CAP} (matrix {ENUM_MATRIX_CAP} u32/thread)"
+        );
+    }
+
     /// The in-kernel [`enumerate_admissible_kernel`], run on the CUDA backend, must reproduce the
     /// CPU-validated [`enumerate_admissible_ref`] bit-for-bit over every real `R` up to degree 145 —
     /// validating the cubecl lowering of the flag-based enumeration (local arrays, bitops, u16
@@ -4798,11 +4962,20 @@ mod tests {
             let _ = enum_launch_timed::<CudaRuntime>(&device, pps, nms);
         }
         let mut g_kernel = 0.0f64;
+        let mut g_kernel_sorted = 0.0f64;
         let mut upload_secs = 0.0f64;
         for (pps, nms, cs_all, mk_all) in &by_degree {
-            // (a) On-device enumeration, kernel only (no readback — the multiply consumes the scratch).
+            // (a) On-device enumeration, kernel only (no readback — the multiply consumes the scratch),
+            // in basis order and in matrix-count order. Production sorts (see the `enum_pp` marshal);
+            // the unsorted timing is kept as the baseline that motivates it.
             let (_m, k, _r) = enum_launch_timed::<CudaRuntime>(&device, pps, nms);
             g_kernel += k;
+            let mut order: Vec<usize> = (0..pps.len()).collect();
+            order.sort_unstable_by_key(|&i| nms[i]);
+            let pps_s: Vec<Vec<u32>> = order.iter().map(|&i| pps[i].clone()).collect();
+            let nms_s: Vec<u32> = order.iter().map(|&i| nms[i]).collect();
+            let (_m, ks, _r) = enum_launch_timed::<CudaRuntime>(&device, &pps_s, &nms_s);
+            g_kernel_sorted += ks;
             // (b) What upload-based eviction does instead: upload the host-built arrays H->D. Force the
             // (possibly async) copies to complete by syncing the stream via a tiny throwaway readback
             // (4 bytes back, negligible) — NOT by reading the big arrays back, so this is upload-only.
@@ -4819,10 +4992,12 @@ mod tests {
             "\n=== admissible matrices onto the device: enumerate vs upload (degrees \
              1..={max_degree}) ===\nR's: {total_r}   matrices: {total_mats}   (both paths leave \
              the arrays ON-DEVICE, no readback)\nCPU  admissible_matrices (enumerate, 1 core) : \
-             {cpu_secs:.3} s\nGPU  enumerate in-kernel                     : {g_kernel:.3} \
-             s\nH->D upload of host-built arrays             : {upload_secs:.3} s\n--> in-kernel \
-             enum is {:.2}x the cost of just uploading the same arrays",
-            g_kernel / upload_secs,
+             {cpu_secs:.3} s\nGPU  enumerate in-kernel (basis order)       : {g_kernel:.3} s\nGPU  \
+             enumerate in-kernel (matrix-count order): {g_kernel_sorted:.3} s  ({:.2}x)\nH->D \
+             upload of host-built arrays             : {upload_secs:.3} s\n--> in-kernel enum is \
+             {:.2}x the cost of just uploading the same arrays",
+            g_kernel / g_kernel_sorted,
+            g_kernel_sorted / upload_secs,
         );
     }
 
