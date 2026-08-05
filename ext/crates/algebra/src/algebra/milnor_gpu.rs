@@ -1013,6 +1013,33 @@ struct RStat {
 static R_STATS: LazyLock<Option<Mutex<HashMap<PPart, RStat>>>> =
     LazyLock::new(|| std::env::var_os("NASSAU_R_STATS").map(|_| Mutex::new(HashMap::new())));
 
+/// Which device owns `R`'s admissible matrices, from a mixed hash of its packed representation.
+///
+/// The mixing is load-bearing, not decoration. [`PPart`] packs entry `i` into a field at a fixed
+/// bit offset, so the low bits are `r_1` — which correlates strongly with internal degree, and
+/// degree correlates with work (the `NASSAU_R_STATS` hot decile averages degree 70 against the cold
+/// decile's 14). Taking `bits() % gpu_count()` would therefore partition by `r_1 mod 4` and could
+/// reproduce the very skew this replaces. The splitmix64 finalizer below spreads every input bit
+/// across the output, so the shard is independent of the packing's structure.
+///
+/// Deterministic across runs and processes — the same `R` always lands on the same device, which
+/// the sharded resident master requires and which keeps a run reproducible.
+fn shard_of(p_part: PPart) -> usize {
+    (shard_hash(p_part) % gpu_count() as u64) as usize
+}
+
+/// The splitmix64 finalizer applied to `R`'s packed bits. Split out from [`shard_of`] so the
+/// uniformity test can bucket a fixed device count rather than whatever the host happens to have.
+fn shard_hash(p_part: PPart) -> u64 {
+    let mut h = p_part.bits();
+    h ^= h >> 30;
+    h = h.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    h ^= h >> 27;
+    h = h.wrapping_mul(0x94d0_49bb_1331_11eb);
+    h ^= h >> 31;
+    h
+}
+
 /// Internal degree of `R` from its p-part: `Σ p_part[i] · deg(ξ_{i+1})`.
 fn ppart_degree(p_part: PPart) -> i32 {
     let xi = xi_degrees(fp::prime::ValidPrime::new(2));
@@ -1176,18 +1203,26 @@ fn resident_info(algebra: &MilnorAlgebra, p_part: PPart) -> RInfo {
     // Assign this `R` to the least-loaded device. Its rows go there and nowhere else, so a launch
     // must route products to the device owning their `R`.
     //
-    // Round-robin over first-sight order was the first cut and balances COUNT, not work — `num_mats`
-    // varies by orders of magnitude between `R`s, so equal counts left the devices badly uneven
-    // (batch-stats: queue 67% / exec 32%, mean depth 8.4, i.e. devices waiting while others ran).
-    // Greedy least-loaded is the standard fix and needs no lookahead.
+    // Assignment is a MIXED HASH of `R`, not a load heuristic. See [`shard_of`].
+    //
+    // Two earlier policies both balanced the wrong quantity. Round-robin over first-sight order
+    // balances the COUNT of `R`s, and `num_mats` varies by orders of magnitude between them.
+    // Greedy least-loaded by accumulated `num_mats` replaced it and balances master BYTES — which
+    // its own doc justified by assuming `R`s are "used at broadly similar rates". The
+    // `NASSAU_R_STATS` probe at (150,110) says otherwise: of 173 930 distinct `R`s, the top 1%
+    // carry 31% of references and the top 10% carry 78%. Owning equal `num_mats` therefore says
+    // little about owning equal work, and the error compounds because assignment is permanent —
+    // measured mean SM at the frontier was 50.5% on device 0 against ~15% on the other three at
+    // stem 210, a 3.3x spread (1.18x at stem 200, so it worsens with scale).
+    //
+    // Hashing balances neither count nor bytes deliberately; it draws each device an INDEPENDENT
+    // SAMPLE of the joint (size, reference-rate) distribution. With ~174k `R`s over 4 devices and
+    // no single `R` above a fraction of a percent of references, both quantities concentrate. It is
+    // also stateless: no accumulator under the write lock, no dependence on first-sight order, and
+    // no tie-break bias (`min_by_key` resolved ties to device 0, which is where the hot early
+    // low-degree `R`s landed).
     let num_mats = (mk.len() / mk_len) as u64;
-    let dev = host
-        .dev_load
-        .iter()
-        .enumerate()
-        .min_by_key(|&(i, &load)| (load, i))
-        .map(|(i, _)| i)
-        .expect("at least one device");
+    let dev = shard_of(p_part);
     host.dev_load[dev] += num_mats;
     let info = RInfo {
         cs_off: host.cs_len[dev] as u64,
@@ -4734,6 +4769,92 @@ mod tests {
              s\nH->D upload of host-built arrays             : {upload_secs:.3} s\n--> in-kernel \
              enum is {:.2}x the cost of just uploading the same arrays",
             g_kernel / upload_secs,
+        );
+    }
+
+    /// [`shard_of`] must split the real `R`s evenly across devices, and must stay even when they are
+    /// grouped by degree — because assignment is permanent and the frontier walks degree upward, a
+    /// hash that is uniform overall but skewed within a degree band would still starve devices for
+    /// long stretches, which is the failure this replaced.
+    ///
+    /// Also asserts the unmixed key is NOT usable, so nobody "simplifies" `shard_of` back to a bare
+    /// modulo: [`PPart`] packs `r_1` in the low bits and `r_1` tracks degree, so `bits() % 4`
+    /// partitions by degree — precisely the correlation that produced a 3.3x device imbalance.
+    /// Pure CPU: no GPU needed.
+    #[test]
+    fn shard_of_is_uniform_over_real_rs() {
+        use fp::prime::ValidPrime;
+
+        let algebra = MilnorAlgebra::new(ValidPrime::new(2), false);
+        let max_degree = 150;
+        algebra.compute_basis(max_degree);
+
+        let n_dev = gpu_count().max(4);
+        let mut overall = vec![0usize; n_dev];
+        let mut by_band: Vec<Vec<usize>> = Vec::new();
+        let mut raw = vec![0usize; n_dev];
+        let mut total = 0usize;
+
+        for band in 0..5 {
+            let (lo, hi) = (1 + band * 30, (band + 1) * 30);
+            let mut counts = vec![0usize; n_dev];
+            for deg in lo..=hi.min(max_degree) {
+                for idx in 0..algebra.dimension(deg as i32) {
+                    let pp = algebra.basis_element_from_index(deg as i32, idx).p_part;
+                    let d = (shard_hash(pp) % n_dev as u64) as usize;
+                    counts[d] += 1;
+                    overall[d] += 1;
+                    raw[(pp.bits() % n_dev as u64) as usize] += 1;
+                    total += 1;
+                }
+            }
+            by_band.push(counts);
+        }
+
+        assert!(total > 10_000, "need a meaningful sample, got {total}");
+        let ideal = total as f64 / n_dev as f64;
+        for (d, &c) in overall.iter().enumerate() {
+            let dev = (c as f64 - ideal).abs() / ideal;
+            assert!(
+                dev < 0.05,
+                "device {d} off by {:.1}% overall ({c} vs {ideal:.0})",
+                dev * 100.0
+            );
+        }
+        for (b, counts) in by_band.iter().enumerate() {
+            let n: usize = counts.iter().sum();
+            if n < 500 {
+                continue;
+            }
+            let ideal = n as f64 / n_dev as f64;
+            for (d, &c) in counts.iter().enumerate() {
+                let dev = (c as f64 - ideal).abs() / ideal;
+                assert!(
+                    dev < 0.15,
+                    "degree band {b}, device {d} off by {:.1}%",
+                    dev * 100.0
+                );
+            }
+        }
+        // The unmixed key must be visibly worse, else the mixing is not earning its place.
+        let raw_worst = raw
+            .iter()
+            .map(|&c| ((c as f64 - ideal).abs() / ideal))
+            .fold(0.0_f64, f64::max);
+        let mixed_worst = overall
+            .iter()
+            .map(|&c| ((c as f64 - ideal).abs() / ideal))
+            .fold(0.0_f64, f64::max);
+        eprintln!(
+            "shard_of over {total} real R's, {n_dev} devices: worst deviation {:.2}% mixed vs \
+             {:.2}% for a bare bits() % n",
+            mixed_worst * 100.0,
+            raw_worst * 100.0
+        );
+        assert!(
+            raw_worst > mixed_worst,
+            "unmixed bits() % n was as balanced as the hash ({raw_worst:.3} vs {mixed_worst:.3}); \
+             if the packing changed so this no longer holds, revisit shard_of's rationale"
         );
     }
 

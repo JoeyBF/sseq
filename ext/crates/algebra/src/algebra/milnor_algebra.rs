@@ -196,6 +196,11 @@ impl PPart {
     /// The raw packed value. Two exponent sequences are equal exactly when their bits are, so this
     /// is a complete hash key, and it can be compared against a packed mask in one operation (see
     /// `MilnorSubalgebra::packed_signature` in `ext`).
+    ///
+    /// The layout is not uniform, so this is a complete key but not a balanced one: entry `i` sits
+    /// at [`Self::SHIFTS`]`[i]`, putting `r_1` in the low bits, and `r_1` correlates strongly with
+    /// internal degree. Taking this value modulo a small number partitions by `r_1` rather than
+    /// evenly — mix the bits first (see `milnor_gpu::shard_of`).
     pub const fn bits(self) -> u64 {
         self.0
     }
