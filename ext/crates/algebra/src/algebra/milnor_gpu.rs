@@ -3187,7 +3187,21 @@ fn multiply_batch_block<'a>(
                     );
                 }
 
-                // Issue the readback but DO NOT wait for it. `read_async` enqueues the device→host copy
+                // KNOWN BUG, NOT YET FIXED — a full stem-200 crashes with
+            // `CUDA_ERROR_LAUNCH_FAILED, "unspecified launch failure"` (observed at `max_t=304`
+            // after 2673 s; NOT the cleanup race, `NASSAU_GPU_CLEANUP_EVERY=0` was set).
+            //
+            // Because this closure no longer blocks, it RETURNS AND DROPS ITS INPUT HANDLES while
+            // the kernel may still be running, so cubecl can hand those pages to a later allocation
+            // that the running kernel is still reading. `read_one` blocked, which kept them alive
+            // until the kernel retired. `BufferArg::from_raw_parts` consuming the handles does NOT
+            // save this: `cs_seg`/`mk_seg` are `Vec<(Handle, usize)>` CLONES with their own
+            // lifetimes, as are the dummies and the `r*_h` group.
+            //
+            // Fix: return `(DynFut, Vec<Handle>)` and drop the vec after `block_on`, exactly as the
+            // permit now does — clone each handle into it immediately before `launch_unchecked`.
+            //
+            // Issue the readback but DO NOT wait for it. `read_async` enqueues the device→host copy
                 // into pinned memory and records a CUDA event, then hands back a future whose entire body
                 // is that event's wait (`cubecl-cuda` `command.rs`, `Fence::wait_sync`). Returning it
                 // un-awaited is what makes the pipeline deeper than one kernel: this worker goes straight
