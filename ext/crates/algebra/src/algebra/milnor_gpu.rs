@@ -2325,23 +2325,10 @@ fn multiply_batch_grouped(
         //     worker, so the devices stay busy with later blocks while this thread sits on fences.
         //
         // In-flight work is therefore bounded by `NASSAU_GPU_MEM_BUDGET_MB` — memory, not threads.
-        // Phase 1 runs the shards' marshalling CONCURRENTLY, which is safe here precisely because
-        // no permit is taken until phase 2 — the split is what makes this legal, and it is also
-        // where the time is. Sharding divides the products, so marshalling shards one after another
-        // costs the same TOTAL host work as one unsharded block, and an earlier comment concluded
-        // from that there was nothing to parallelise. That is true of total work and false of the
-        // critical path: a row block is not done until its slowest shard is, so serial marshalling
-        // makes each block's latency the SUM over devices rather than the max. Measured end to end
-        // at stem 200: parallel marshal 2551 s, serial marshal 3136 s and 3140 s across two
-        // independent runs, with `marshal` itself totalling 3444 s.
-        use maybe_rayon::prelude::*;
-        let nonempty: Vec<(usize, &Vec<GpuProduct>)> = by_dev
+        let submits: Vec<BlockSubmit<'_>> = by_dev
             .iter()
             .enumerate()
             .filter(|(_, ps)| !ps.is_empty())
-            .collect();
-        let submits: Vec<BlockSubmit<'_>> = nonempty
-            .into_maybe_par_iter()
             .map(|(d, ps)| multiply_batch_block(algebra, num_cols, r0, r1 - r0, ps, mode, d))
             .collect();
         let waits: Vec<BlockWait> = submits.into_iter().map(|s| s()).collect();
@@ -2374,7 +2361,7 @@ type BlockWait = Box<dyn FnOnce() -> Bytes + Send>;
 /// held device `d`'s permit while marshalling device `d + 1`, so a par_iter chunk could steal a
 /// resolution-step job that parked on `acquire` while this thread waited on a join those very
 /// workers had to finish — the H200 stall the invariant exists to prevent.
-type BlockSubmit<'a> = Box<dyn FnOnce() -> BlockWait + Send + 'a>;
+type BlockSubmit<'a> = Box<dyn FnOnce() -> BlockWait + 'a>;
 
 /// One bounded launch of [`multiply_batch_on_gpu`]: rows `row_base..row_base + num_rows` of the
 /// full build, with `products` the (contiguous, row-major) slice landing in those rows. Marshals
