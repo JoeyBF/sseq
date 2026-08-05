@@ -360,14 +360,16 @@ mod gpu_thread {
 /// throughput one: it keeps the live thread count off `RLIMIT_NPROC` (4096 per-UID, shared
 /// machine-wide, against a ~644-thread baseline) and stops the PID churn.
 mod shard_pool {
-    use std::{cell::RefCell, sync::mpsc};
+    use std::cell::RefCell;
+
+    use crossbeam_channel::{Sender, unbounded};
 
     type Job = Box<dyn FnOnce() + Send + 'static>;
 
     thread_local! {
         /// This caller's helpers. `RefCell` and not `OnceCell` only because the vector is built
         /// lazily; it is never borrowed across a dispatch.
-        static HELPERS: RefCell<Vec<mpsc::Sender<Job>>> = const { RefCell::new(Vec::new()) };
+        static HELPERS: RefCell<Vec<Sender<Job>>> = const { RefCell::new(Vec::new()) };
     }
 
     /// Hand `job` to this thread's helper `i`, spawning the helpers on first use.
@@ -379,7 +381,7 @@ mod shard_pool {
         HELPERS.with(|h| {
             let mut h = h.borrow_mut();
             while h.len() <= i {
-                let (tx, rx) = mpsc::channel::<Job>();
+                let (tx, rx) = unbounded::<Job>();
                 let idx = h.len();
                 std::thread::Builder::new()
                     .name(format!("nassau-shard{idx}"))
@@ -2438,7 +2440,7 @@ fn multiply_batch_grouped(
                 .into_iter()
                 .enumerate()
                 .map(|(i, (d, ps))| {
-                    let (tx, rx) = std::sync::mpsc::sync_channel::<Bytes>(1);
+                    let (tx, rx) = crossbeam_channel::bounded::<Bytes>(1);
                     let alg = algebra.clone();
                     shard_pool::dispatch(
                         i,
