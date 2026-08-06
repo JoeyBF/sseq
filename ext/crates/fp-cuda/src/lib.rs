@@ -451,10 +451,20 @@ fn run_gemm_kernel(
     // Set `FP_CUDA_GEMM_DEVICE_FRAC=1` to take the whole machine when this process owns the GPU (a
     // dedicated linear-algebra device), which restores full throughput.
     //
-    // UNRESOLVED: why an oversubscribed grid *fails* rather than queueing. Ordinary launches
-    // schedule in waves; something here (thread-block clusters, the dynamic shared-memory request,
-    // or both) makes the placement a hard launch-time requirement. Until that is understood, no
-    // choice of share can be called correct — only likelier to fit.
+    // This whole knob is a STOPGAP. The co-scheduling requirement came in with Phase 9
+    // (`264b4111d4`, thread-block clusters + TMA multicast of B): `__cluster_dims__` makes a
+    // cluster's CTAs co-resident by construction, B is multicast with an all-ranks mask, and the
+    // empty barrier is cluster-wide via `mapa`. That is a hard placement constraint, and it is why
+    // an oversubscribed grid fails rather than queueing the way an ordinary launch would.
+    //
+    // Phase 8 (`60b05cddc4`) is NOT implicated: its persistent loop strides (`tile += gridDim.x`)
+    // and was already work-capped (`sms.min(total_tiles)`), so it composes at any grid size.
+    //
+    // The fix is a cluster-free GEMM variant — the same move that made the row reduction composable
+    // (see `rr_coop`). The cost is Phase 9's 2x cut in B's HBM traffic, on top of the 8x that Phase
+    // 8's GROUP_M rasterization already delivers, against the ~8x throughput this share sacrifices
+    // (1062 TOPS at 1/16 vs 8674 at full grid). On a bandwidth-bound kernel that trade needs
+    // measuring, but it starts from a much better place than shrinking the grid.
     let frac = std::env::var("FP_CUDA_GEMM_DEVICE_FRAC")
         .ok()
         .and_then(|v| v.parse::<u32>().ok())
