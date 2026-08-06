@@ -2836,8 +2836,10 @@ fn multiply_batch_block<'a>(
                 }
                 MasterMode::Transient => {
                     let (cs_len, mk_len, num_mats) = cold_count(algebra, r.p_part);
-                    r_cs_offset.push(need_cs as u64);
-                    r_mk_offset.push(need_mk as u64);
+                    // Offsets are assigned after this loop: they depend on the matrix-count sort AND
+                    // on segment packing, neither of which is known per-`R` in basis order.
+                    r_cs_offset.push(0);
+                    r_mk_offset.push(0);
                     r_cs_len.push(cs_len);
                     r_mk_len.push(mk_len);
                     r_num_matrices.push(num_mats as usize);
@@ -2856,8 +2858,6 @@ fn multiply_batch_block<'a>(
                     enum_rows.push(r.p_part.len() as u32);
                     enum_cols.push(cols);
                     enum_pp_rows.push(r.p_part.iter().collect::<Vec<_>>());
-                    need_cs += num_mats as usize * cs_len as usize;
-                    need_mk += num_mats as usize * mk_len as usize;
                 }
             }
         }
@@ -2876,12 +2876,65 @@ fn multiply_batch_block<'a>(
         // scratch offset it is handed, so reordering its inputs consistently reproduces byte-identical
         // scratch — the multiply's `r_cs_offset`/`r_mk_offset`/`prod_r_index` keep basis order and are
         // untouched. (`out_counts` follows the permutation, but production discards it.)
+        //
+        // The same pass lays the scratch out across as many SEGMENTS as it needs, instead of cramming
+        // it into one. A segment is `master_seg_elems()` (2^31 u16 = 4 GiB, deliberately under
+        // `u32::MAX` so a segment length cannot overflow cubecl's 32-bit array-length metadata —
+        // raising THAT is what reopens the truncation bug class). Binding transient scratch as
+        // segment 0 alone therefore capped a whole block at 4 GiB, and a stem-200 block wants 2.17e9
+        // u16 of `masks`: over the line, hard assert, run dead. The resident path already spans
+        // `MASTER_MAX_SEG` segments through the same `seg_read`, so the ceiling here is 16x higher for
+        // free.
+        //
+        // Each `R` is placed WHOLLY inside one segment, with its `col_sums` and `masks` in the
+        // same-numbered segment, by advancing both cursors to the next boundary together whenever
+        // either run would straddle. That is what lets the enumeration run as one launch per segment
+        // against the existing single-buffer kernel signature, rather than needing a segmented-write
+        // kernel. The padding costs address space in an allocation already rounded to segments.
+        let seg_elems_layout = master_seg_elems();
+        let mut enum_seg_ranges: Vec<(usize, usize)> = Vec::new();
         let (enum_pp, enum_width, enum_rows, enum_cols, enum_cs_out, enum_mk_out) = if mode
             == MasterMode::Transient
         {
             let w = enum_rows.iter().copied().max().unwrap_or(1) as usize;
             let mut order: Vec<usize> = (0..enum_pp_rows.len()).collect();
             order.sort_unstable_by_key(|&i| r_num_matrices[i]);
+
+            let (mut cs_out, mut mk_out) = (vec![0u64; order.len()], vec![0u64; order.len()]);
+            let (mut seg, mut seg_start) = (0usize, 0usize);
+            for (slot, &i) in order.iter().enumerate() {
+                let cs_span = r_num_matrices[i] * r_cs_len[i] as usize;
+                let mk_span = r_num_matrices[i] * r_mk_len[i] as usize;
+                assert!(
+                    cs_span <= seg_elems_layout && mk_span <= seg_elems_layout,
+                    "one R's transient scratch ({cs_span}/{mk_span} u16) exceeds a whole segment \
+                     ({seg_elems_layout}); raise NASSAU_GPU_MASTER_SEG_ELEMS"
+                );
+                let base = seg * seg_elems_layout;
+                if need_cs - base + cs_span > seg_elems_layout
+                    || need_mk - base + mk_span > seg_elems_layout
+                {
+                    enum_seg_ranges.push((seg_start, slot));
+                    seg += 1;
+                    seg_start = slot;
+                    need_cs = seg * seg_elems_layout;
+                    need_mk = seg * seg_elems_layout;
+                }
+                cs_out[slot] = need_cs as u64;
+                mk_out[slot] = need_mk as u64;
+                r_cs_offset[i] = need_cs as u64;
+                r_mk_offset[i] = need_mk as u64;
+                need_cs += cs_span;
+                need_mk += mk_span;
+            }
+            enum_seg_ranges.push((seg_start, order.len()));
+            assert!(
+                seg < MASTER_MAX_SEG,
+                "transient scratch needs {} segments (> MASTER_MAX_SEG={MASTER_MAX_SEG}); raise \
+                 MASTER_MAX_SEG or NASSAU_GPU_MASTER_SEG_ELEMS",
+                seg + 1
+            );
+
             let mut pp = vec![0u32; enum_pp_rows.len() * w];
             for (slot, &i) in order.iter().enumerate() {
                 let row = &enum_pp_rows[i];
@@ -2890,14 +2943,13 @@ fn multiply_batch_block<'a>(
                 }
             }
             let pick_u32 = |src: &[u32]| -> Vec<u32> { order.iter().map(|&i| src[i]).collect() };
-            let pick_u64 = |src: &[u64]| -> Vec<u64> { order.iter().map(|&i| src[i]).collect() };
             (
                 pp,
                 w,
                 pick_u32(&enum_rows),
                 pick_u32(&enum_cols),
-                pick_u64(&r_cs_offset),
-                pick_u64(&r_mk_offset),
+                cs_out,
+                mk_out,
             )
         } else {
             (
@@ -3134,57 +3186,71 @@ fn multiply_batch_block<'a>(
                         // scratch is fully written when the multiply reads it (one-stream launches are
                         // ordered, as with `zero_u32` below).
                         const ENUM_THREADS: u32 = 256;
-                        let n_cold = enum_rows.len();
-                        let cs_cap = need_cs.max(1);
-                        let mk_cap = need_mk.max(1);
-                        assert!(
-                            cs_cap <= seg_elems && mk_cap <= seg_elems,
-                            "transient scratch ({cs_cap}/{mk_cap} u16) exceeds one segment \
-                             ({seg_elems}); raise NASSAU_GPU_MASTER_SEG_ELEMS"
-                        );
-                        let cs_scratch = client.empty(cs_cap * size_of::<u16>());
-                        let mk_scratch = client.empty(mk_cap * size_of::<u16>());
-                        let cnt_scratch = client.empty(n_cold.max(1) * size_of::<u32>());
-                        let epp_h = client.create_from_slice(u32::as_bytes(&enum_pp));
-                        let er_h = client.create_from_slice(u32::as_bytes(&enum_rows));
-                        let ec_h = client.create_from_slice(u32::as_bytes(&enum_cols));
-                        // The permuted offsets, matching `enum_pp`/`enum_rows`/`enum_cols` — NOT the
-                        // multiply's basis-order `r_cs_offset`/`r_mk_offset`.
-                        let eco_h = client.create_from_slice(u64::as_bytes(&enum_cs_out));
-                        let emo_h = client.create_from_slice(u64::as_bytes(&enum_mk_out));
-                        enum_keep.extend([
-                            cnt_scratch.clone(),
-                            epp_h.clone(),
-                            er_h.clone(),
-                            ec_h.clone(),
-                            eco_h.clone(),
-                            emo_h.clone(),
-                        ]);
-                        unsafe {
-                            enumerate_admissible_kernel::launch_unchecked::<CudaRuntime>(
-                                &client,
-                                CubeCount::Static(
-                                    (n_cold as u32).div_ceil(ENUM_THREADS).max(1),
-                                    1,
-                                    1,
-                                ),
-                                CubeDim::new_1d(ENUM_THREADS),
-                                BufferArg::from_raw_parts(epp_h, enum_pp.len()),
-                                BufferArg::from_raw_parts(er_h, n_cold),
-                                BufferArg::from_raw_parts(ec_h, n_cold),
-                                BufferArg::from_raw_parts(eco_h, n_cold),
-                                BufferArg::from_raw_parts(emo_h, n_cold),
-                                BufferArg::from_raw_parts(cs_scratch.clone(), cs_cap),
-                                BufferArg::from_raw_parts(mk_scratch.clone(), mk_cap),
-                                BufferArg::from_raw_parts(cnt_scratch, n_cold.max(1)),
-                                enum_width,
-                                n_cold,
-                            );
+                        // One allocation per segment, and one enumeration launch per segment over the
+                        // `R`s the layout pass placed there. Every `R` sits wholly inside its segment
+                        // with `col_sums` and `masks` in the same-numbered one, so each launch keeps
+                        // the kernel's plain single-buffer signature and just works in segment-local
+                        // offsets. The last segment is allocated to what it actually holds; the rest
+                        // are full.
+                        let nseg = enum_seg_ranges.len();
+                        let mut cs_segs: Vec<(Handle, usize)> = Vec::with_capacity(nseg);
+                        let mut mk_segs: Vec<(Handle, usize)> = Vec::with_capacity(nseg);
+                        for s in 0..nseg {
+                            let base = s * seg_elems;
+                            let cs_len_s = (need_cs - base).min(seg_elems).max(1);
+                            let mk_len_s = (need_mk - base).min(seg_elems).max(1);
+                            cs_segs.push((client.empty(cs_len_s * size_of::<u16>()), cs_len_s));
+                            mk_segs.push((client.empty(mk_len_s * size_of::<u16>()), mk_len_s));
                         }
-                        (
-                            pad_u16(vec![(cs_scratch, cs_cap)]),
-                            pad_u16(vec![(mk_scratch, mk_cap)]),
-                        )
+                        for (s, &(lo, hi)) in enum_seg_ranges.iter().enumerate() {
+                            let n_s = hi - lo;
+                            if n_s == 0 {
+                                continue;
+                            }
+                            let base = (s * seg_elems) as u64;
+                            // Segment-local offsets: the kernel indexes this segment's buffer alone.
+                            let cs_loc: Vec<u64> =
+                                enum_cs_out[lo..hi].iter().map(|&o| o - base).collect();
+                            let mk_loc: Vec<u64> =
+                                enum_mk_out[lo..hi].iter().map(|&o| o - base).collect();
+                            let pp_s = &enum_pp[lo * enum_width..hi * enum_width];
+                            let cnt_scratch = client.empty(n_s * size_of::<u32>());
+                            let epp_h = client.create_from_slice(u32::as_bytes(pp_s));
+                            let er_h = client.create_from_slice(u32::as_bytes(&enum_rows[lo..hi]));
+                            let ec_h = client.create_from_slice(u32::as_bytes(&enum_cols[lo..hi]));
+                            let eco_h = client.create_from_slice(u64::as_bytes(&cs_loc));
+                            let emo_h = client.create_from_slice(u64::as_bytes(&mk_loc));
+                            enum_keep.extend([
+                                cnt_scratch.clone(),
+                                epp_h.clone(),
+                                er_h.clone(),
+                                ec_h.clone(),
+                                eco_h.clone(),
+                                emo_h.clone(),
+                            ]);
+                            unsafe {
+                                enumerate_admissible_kernel::launch_unchecked::<CudaRuntime>(
+                                    &client,
+                                    CubeCount::Static(
+                                        (n_s as u32).div_ceil(ENUM_THREADS).max(1),
+                                        1,
+                                        1,
+                                    ),
+                                    CubeDim::new_1d(ENUM_THREADS),
+                                    BufferArg::from_raw_parts(epp_h, pp_s.len()),
+                                    BufferArg::from_raw_parts(er_h, n_s),
+                                    BufferArg::from_raw_parts(ec_h, n_s),
+                                    BufferArg::from_raw_parts(eco_h, n_s),
+                                    BufferArg::from_raw_parts(emo_h, n_s),
+                                    BufferArg::from_raw_parts(cs_segs[s].0.clone(), cs_segs[s].1),
+                                    BufferArg::from_raw_parts(mk_segs[s].0.clone(), mk_segs[s].1),
+                                    BufferArg::from_raw_parts(cnt_scratch, n_s),
+                                    enum_width,
+                                    n_s,
+                                );
+                            }
+                        }
+                        (pad_u16(cs_segs), pad_u16(mk_segs))
                     }
                 };
                 // Resident basis segments (default) or per-launch passthrough buffers (A/B diagnostic) bound
