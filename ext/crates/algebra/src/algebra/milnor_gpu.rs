@@ -4931,6 +4931,196 @@ mod tests {
         );
     }
 
+    /// Diagnostic: is the anti-diagonal bitsum `d` already available in `masks`?
+    ///
+    /// Both odometers (`AdmissibleMatrix::next` and [`enumerate_admissible_kernel`]) recompute
+    ///
+    /// ```text
+    /// for c in (row+col+1).saturating_sub(rows)..col { d |= matrix[(row+col-c)*cols + c] }
+    /// ```
+    ///
+    /// on every visited `(row, col)`, inside the hottest triple-nested loop. But the accept path
+    /// stores `masks[row+col] = d | new_entry` and the clears do `masks[i+j] &= !matrix[i*cols+j]`,
+    /// so `masks` is itself an accumulator over the anti-diagonal `row+col`. If it coincided with
+    /// `d` at read time, an O(cols) scan would collapse to one load in BOTH implementations.
+    ///
+    /// VERDICT (measured, degree <= 120, 46,995,344 anti-diagonal computations): the shortcut is
+    /// NOT worth taking, and the reason is not the one the conjecture is about.
+    ///
+    /// * `d == masks` only 28.3% of the time — `masks[row+col]` folds in the cell AT column `col`
+    ///   (`masks[row+col] = d | new_entry`) while `d` stops short of it, so they differ whenever
+    ///   that cell is set.
+    /// * `d` SUBSET-OF `masks` in 100.000% of cases (0 violations, assert armed below). So
+    ///   `masks[row+col] == 0` soundly implies `d == 0` and the scan can be skipped outright.
+    /// * But that skip fires on 5.8% of checks and avoids 6.9% of scan iterations, and the scan
+    ///   averages **1.19 iterations per check** (55,846,521 over 46,995,344) — the range
+    ///   `(row+col+1).saturating_sub(rows)..col` is nearly always empty or one step for real R's.
+    ///
+    /// So the "O(cols) bitsum in the hottest loop" is not O(cols) in practice and not hot. Do not
+    /// re-propose caching, precomputing, or incrementally maintaining `d`; the arithmetic is not
+    /// where enumeration spends its time. Together with the earlier null result from shrinking the
+    /// per-thread local state 3x (1.884s -> 1.872s, noise), that leaves the kernel's ~20 scattered
+    /// 2-byte output stores per matrix as the remaining candidate.
+    ///
+    /// This does not assert the conjecture — it measures it, reporting the containment direction so
+    /// a mismatch says what `masks` is missing rather than merely that it differs. Ignored by
+    /// default: it is an investigation tool, not a regression gate.
+    #[test]
+    #[ignore = "diagnostic: run explicitly to measure the d-vs-masks relationship"]
+    fn masks_anti_diagonal_carries_d() {
+        use fp::prime::ValidPrime;
+
+        let algebra = MilnorAlgebra::new(ValidPrime::new(2), false);
+        let max_degree = 120;
+        algebra.compute_basis(max_degree);
+
+        let (mut checks, mut equal, mut d_subset, mut masks_subset) = (0u64, 0u64, 0u64, 0u64);
+        let (mut scan_iters, mut saved_iters, mut masks_zero) = (0u64, 0u64, 0u64);
+        let mut sample: Vec<String> = Vec::new();
+
+        for deg in 1..=max_degree {
+            for idx in 0..algebra.dimension(deg) {
+                let pp = &algebra.basis_element_from_index(deg, idx).p_part;
+                if pp.is_empty() {
+                    continue;
+                }
+                let p_part: Vec<u32> = pp.iter().map(|x| x as u32).collect();
+                let rows = p_part.len();
+                let cols = p_part
+                    .iter()
+                    .map(|&x| (u32::BITS - x.leading_zeros()) as usize)
+                    .max()
+                    .unwrap();
+                if cols < 2 {
+                    continue;
+                }
+
+                let mut matrix = vec![0u32; rows * cols];
+                let mut masks = vec![0u32; rows + cols - 1];
+                for (i, &x) in p_part.iter().enumerate() {
+                    matrix[i * cols] = x;
+                    masks[i] = x;
+                }
+                let mut totals = vec![0u32; rows];
+                let mut col_sums = vec![0u32; cols - 1];
+
+                let mut more = true;
+                while more {
+                    let mut found = false;
+                    let mut row = 0;
+                    while row < rows && !found {
+                        let mut p_to_the_j: u32 = 1;
+                        totals[row] = matrix[row * cols];
+                        let mut col = 1;
+                        while col < cols && !found {
+                            p_to_the_j *= 2;
+                            let mut handled = false;
+                            if p_to_the_j <= totals[row] {
+                                let mut d = 0u32;
+                                let mut c = (row + col + 1).saturating_sub(rows);
+                                while c < col {
+                                    d |= matrix[(row + col - c) * cols + c];
+                                    c += 1;
+                                }
+
+                                // The measurement: compare against the maintained accumulator.
+                                let m = masks[row + col];
+                                checks += 1;
+                                scan_iters += (col - (row + col + 1).saturating_sub(rows)) as u64;
+                                if m == 0 {
+                                    masks_zero += 1;
+                                    saved_iters +=
+                                        (col - (row + col + 1).saturating_sub(rows)) as u64;
+                                    assert_eq!(d, 0, "masks==0 but d!=0 — containment violated");
+                                }
+                                if d == m {
+                                    equal += 1;
+                                }
+                                if d | m == m {
+                                    d_subset += 1;
+                                }
+                                if d | m == d {
+                                    masks_subset += 1;
+                                }
+                                if d != m && sample.len() < 8 {
+                                    sample.push(format!(
+                                        "R={p_part:?} rows={rows} cols={cols} (row={row},col={col}) \
+                                         d={d:#x} masks[{}]={m:#x}",
+                                        row + col
+                                    ));
+                                }
+
+                                let cur = matrix[row * cols + col];
+                                let new_entry = ((cur | d) + 1) & !d;
+                                let inc = new_entry - cur;
+                                let sub = inc * p_to_the_j;
+                                if totals[row] < sub {
+                                    totals[row] += p_to_the_j * cur;
+                                    handled = true;
+                                } else {
+                                    matrix[row * cols] = totals[row] - sub;
+                                    masks[row] = matrix[row * cols];
+                                    col_sums[col - 1] += inc;
+                                    let mut j = 1;
+                                    while j < col {
+                                        masks[row + j] &= !matrix[row * cols + j];
+                                        col_sums[j - 1] -= matrix[row * cols + j];
+                                        matrix[row * cols + j] = 0;
+                                        j += 1;
+                                    }
+                                    matrix[row * cols + col] = new_entry;
+                                    let mut i = 0;
+                                    while i < row {
+                                        matrix[i * cols] = totals[i];
+                                        masks[i] = totals[i];
+                                        let mut j = 1;
+                                        while j < cols {
+                                            if i + j > row {
+                                                masks[i + j] &= !matrix[i * cols + j];
+                                            }
+                                            col_sums[j - 1] -= matrix[i * cols + j];
+                                            matrix[i * cols + j] = 0;
+                                            j += 1;
+                                        }
+                                        i += 1;
+                                    }
+                                    masks[row + col] = d | new_entry;
+                                    found = true;
+                                    handled = true;
+                                }
+                            }
+                            if !handled {
+                                totals[row] += p_to_the_j * matrix[row * cols + col];
+                            }
+                            col += 1;
+                        }
+                        row += 1;
+                    }
+                    more = found;
+                }
+            }
+        }
+
+        let pct = |n: u64| 100.0 * n as f64 / checks.max(1) as f64;
+        eprintln!(
+            "d-vs-masks over {checks} anti-diagonal computations (degree <= {max_degree}):\n  \
+             d == masks : {equal} ({:.3}%)\n  d subset-of masks : {d_subset} ({:.3}%)\n  \
+             masks subset-of d : {masks_subset} ({:.3}%)",
+            pct(equal),
+            pct(d_subset),
+            pct(masks_subset)
+        );
+        eprintln!(
+            "  masks==0 (sound skip): {masks_zero} ({:.3}%)\n  d-scan iterations: {scan_iters}, \
+             avoidable by the skip: {saved_iters} ({:.3}%)",
+            pct(masks_zero),
+            100.0 * saved_iters as f64 / scan_iters.max(1) as f64
+        );
+        for s in &sample {
+            eprintln!("  mismatch: {s}");
+        }
+    }
+
     /// The in-kernel [`enumerate_admissible_kernel`], run on the CUDA backend, must reproduce the
     /// CPU-validated [`enumerate_admissible_ref`] bit-for-bit over every real `R` up to degree 145 —
     /// validating the cubecl lowering of the flag-based enumeration (local arrays, bitops, u16
