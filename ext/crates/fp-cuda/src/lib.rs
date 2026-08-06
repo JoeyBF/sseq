@@ -423,7 +423,44 @@ fn run_gemm_kernel(
         .kernel
         .occupancy_max_active_blocks_per_multiprocessor(THREADS, smem_bytes as usize, None)?
         .max(1);
-    let mut num_ctas = (occ * sms / CLUSTER as u32).max(1) * CLUSTER as u32;
+    // Take a SHARE of the machine, not all of it. A grid sized to full occupancy is only placeable
+    // on a GPU this process owns outright; when anything else holds SMs — the cubecl Milnor multiply
+    // in `algebra`, or simply another tenant — the launch is not queued, it fails, as a bare
+    // `CUDA_ERROR_LAUNCH_FAILED` that compute-sanitizer cannot attribute (0 invalid accesses across
+    // a whole run: it was never a memory bug).
+    //
+    // Fixing that by arbitrating with the other runtime would make `fp-cuda` and `algebra` depend on
+    // each other's scheduling, which is exactly the coupling worth avoiding — and it would not help
+    // a co-tenant outside this process at all. Asking only for a share needs no such knowledge: the
+    // persistent loop already handles any multiple of `CLUSTER` (fewer CTAs simply do more
+    // tile-iterations each), so grid size was never a correctness parameter, only a throughput one.
+    //
+    // The default is empirical and deliberately conservative, because the safe grid size is NOT a
+    // sharp threshold. On the theta=125 stem-200 workload (the multiply resident nearly
+    // continuously, full grid ~264 CTAs): 1/16 ran a clean 240 s, while 1/8 failed 74 times — and a
+    // 32-CTA cap, essentially the same grid as 1/8, had passed cleanly in an earlier run. Where the
+    // launch stops being placeable depends on what the other tenant is doing at that moment, so a
+    // share reduces the collision probability sharply but does not prove it to zero. Treat any
+    // value here as a risk setting, not a guarantee.
+    //
+    // The cost is real: the idle-device sweep (`bench_kernel_only`, 16384^3) puts 16 CTAs at 1062
+    // binary TOPS and 32 at 2107, against 8674 at full grid. That is the price of composing on a
+    // shared GPU — but it is measured against a full grid that *fails* on such a GPU, not one that
+    // succeeds.
+    //
+    // Set `FP_CUDA_GEMM_DEVICE_FRAC=1` to take the whole machine when this process owns the GPU (a
+    // dedicated linear-algebra device), which restores full throughput.
+    //
+    // UNRESOLVED: why an oversubscribed grid *fails* rather than queueing. Ordinary launches
+    // schedule in waves; something here (thread-block clusters, the dynamic shared-memory request,
+    // or both) makes the placement a hard launch-time requirement. Until that is understood, no
+    // choice of share can be called correct — only likelier to fit.
+    let frac = std::env::var("FP_CUDA_GEMM_DEVICE_FRAC")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .filter(|&f| f > 0)
+        .unwrap_or(16);
+    let mut num_ctas = ((occ * sms / frac) / CLUSTER as u32).max(1) * CLUSTER as u32;
     // Diagnostic: cap the persistent grid to probe how much of a small GEMM's
     // time is the persistent-grid startup (cluster sync + mbar init + pipeline
     // fill across occ×SMs CTAs). The persistent loop handles any multiple of
