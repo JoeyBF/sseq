@@ -107,6 +107,15 @@ __device__ __forceinline__ void arrive_cluster(uint64_t* b, uint32_t cta_id) {
         "}\n" :: "r"(local), "r"(cta_id) : "memory");
 }
 
+// Single-CTA counterpart of `arrive_cluster`: arrive (count 1) on a *local*
+// mbarrier. Used by the cluster-free variant, where the only CTA that ever
+// releases a stage is the one that consumed it, so no `mapa` translation is
+// needed and no cross-CTA co-residency is implied.
+__device__ __forceinline__ void arrive_local(uint64_t* b) {
+    asm volatile("mbarrier.arrive.shared::cta.b64 _, [%0], 1;\n"
+        :: "r"((uint32_t)__cvta_generic_to_shared(b)) : "memory");
+}
+
 // TMA load with cluster multicast: one HBM read of the source tile is fanned
 // out into the SMEM of every CTA whose bit is set in `mask` (same `dst` SMEM
 // offset and `b` mbarrier offset in each), and counts complete_tx bytes against
@@ -243,10 +252,23 @@ constexpr uint32_t DESC_SWIZ = 1;
 // The output block (TM rows × NG limbs) is packed row-major into sC and written
 // back with a single TMA bulk store (S2G). C is padded to whole NG-limb column
 // groups on the host so every stored tile is complete.
-extern "C" __global__ void __cluster_dims__(CLUSTER, 1, 1) matmul_b1_kernel(
-    const __grid_constant__ CUtensorMap tma_a,
-    const __grid_constant__ CUtensorMap tma_b,
-    const __grid_constant__ CUtensorMap tma_c,
+// The body is templated on the cluster width so one source produces both
+// variants (see the two `extern "C"` entry points below). `CLU == 1` is not a
+// degenerate special case bolted on: every cluster-dependent construct here has
+// an exact single-CTA counterpart, and the compiler discards the other branch.
+//   rank -> 0            (no %cluster_ctarank read)
+//   cluster_sync         -> nothing (the preceding __syncthreads already orders it)
+//   arrive_cluster       -> arrive_local (no mapa into a cluster-mate's SMEM)
+//   tma_2d_multicast     -> tma_2d      (each CTA reads its own B tile)
+//   mbar_empty count     -> 1 instead of CLUSTER
+// What remains is identical arithmetic on an identical tile schedule, so the
+// two kernels are bit-for-bit equivalent; they differ only in HBM traffic for B
+// and in whether the launch demands co-resident CTAs.
+template <int CLU>
+__device__ __forceinline__ void matmul_b1_body(
+    const CUtensorMap& tma_a,
+    const CUtensorMap& tma_b,
+    const CUtensorMap& tma_c,
     uint32_t m_tiles,
     uint32_t n_groups,
     uint32_t M, uint32_t K)
@@ -272,12 +294,14 @@ extern "C" __global__ void __cluster_dims__(CLUSTER, 1, 1) matmul_b1_kernel(
     // Cluster geometry: CLUSTER CTAs along M share one B-panel via multicast,
     // so the schedule walks "M-super-rows" of CLUSTER M-tiles. The host pads
     // m_tiles to a multiple of CLUSTER, so m_super divides exactly.
-    const uint32_t rank         = cluster_ctarank();      // 0..CLUSTER-1 (= M offset)
-    const uint32_t cluster_id   = blockIdx.x / CLUSTER;
-    const uint32_t num_clusters = gridDim.x / CLUSTER;
-    const uint32_t m_super      = m_tiles / CLUSTER;
+    uint32_t rank = 0;                                    // 0..CLU-1 (= M offset)
+    if constexpr (CLU > 1) rank = cluster_ctarank();
+    const uint32_t cluster_id   = blockIdx.x / CLU;
+    const uint32_t num_clusters = gridDim.x / CLU;
+    const uint32_t m_super      = m_tiles / CLU;
     const uint32_t total_cl     = m_super * n_groups;
-    const uint16_t bmask        = (uint16_t)((1u << CLUSTER) - 1u); // all ranks
+    const uint16_t bmask        = (uint16_t)((1u << CLU) - 1u); // all ranks
+    (void)bmask;                                          // unused at CLU == 1
 
     // Register reallocation is a one-time per-warpgroup action.
     if (wg == 0) SET_MAXNREG_DEC(PRODUCER_REGS);
@@ -291,17 +315,22 @@ extern "C" __global__ void __cluster_dims__(CLUSTER, 1, 1) matmul_b1_kernel(
         #pragma unroll
         for (int s = 0; s < STAGES; ++s) {
             mbar_init(&mbar_full[s], 1);
-            mbar_init(&mbar_empty[s], CLUSTER);
+            mbar_init(&mbar_empty[s], CLU);
         }
     }
     __syncthreads();
-    cluster_sync();   // all CTAs' barriers initialized before any cross-CTA arrive
+    // All CTAs' barriers initialized before any cross-CTA arrive. Only needed
+    // when arrivals actually cross CTAs; at CLU == 1 __syncthreads is sufficient.
+    if constexpr (CLU > 1) cluster_sync();
 
-    // Pre-arrive every empty barrier cluster-wide so the producer's first
-    // STAGES `mbar_wait(empty, 0)` succeed immediately (stages logically free).
-    if (wg == 1 && t_wg < CLUSTER) {
+    // Pre-arrive every empty barrier so the producer's first STAGES
+    // `mbar_wait(empty, 0)` succeed immediately (stages logically free).
+    if (wg == 1 && t_wg < CLU) {
         #pragma unroll
-        for (int s = 0; s < STAGES; ++s) arrive_cluster(&mbar_empty[s], t_wg);
+        for (int s = 0; s < STAGES; ++s) {
+            if constexpr (CLU > 1) arrive_cluster(&mbar_empty[s], t_wg);
+            else                   arrive_local(&mbar_empty[s]);
+        }
     }
 
     // ===================== PERSISTENT CLUSTER LOOP =====================
@@ -321,7 +350,7 @@ extern "C" __global__ void __cluster_dims__(CLUSTER, 1, 1) matmul_b1_kernel(
         const uint32_t local  = ct - gid * GROUP_M * n_groups;
         const uint32_t sbi    = firstm + local % curm;
         const int bj = (int)(local / curm);
-        const int bi = (int)(sbi * CLUSTER + rank);  // this CTA's M-tile
+        const int bi = (int)(sbi * CLU + rank);  // this CTA's M-tile
         const int row0 = bi * TM, col0 = bj * NG;
         uint64_t* sCb = sC + (titer & 1) * SC_STRIDE;   // this tile's sC buffer
 
@@ -353,10 +382,18 @@ extern "C" __global__ void __cluster_dims__(CLUSTER, 1, 1) matmul_b1_kernel(
                     // B: one HBM read, multicast into every cluster member's sB
                     // and counted against every member's full barrier. Issued by
                     // rank 0 only (its mask bit is set, so it fills itself too).
-                    if (rank == 0) {
-                        tma_2d_multicast(&sB[s * TILE_B], &tma_b, 0,
-                                         (kk * n_groups + bj) * NB, &mbar_full[s],
-                                         bmask);
+                    // Without a cluster there is nobody to share with, so each
+                    // CTA simply loads its own copy — the extra HBM traffic is
+                    // exactly what the cluster variant buys back.
+                    if constexpr (CLU > 1) {
+                        if (rank == 0) {
+                            tma_2d_multicast(&sB[s * TILE_B], &tma_b, 0,
+                                             (kk * n_groups + bj) * NB, &mbar_full[s],
+                                             bmask);
+                        }
+                    } else {
+                        tma_2d(&sB[s * TILE_B], &tma_b, 0,
+                               (kk * n_groups + bj) * NB, &mbar_full[s]);
                     }
                 }
                 if (++qidx == STAGES) { qidx = 0; p ^= 1; }
@@ -402,8 +439,13 @@ extern "C" __global__ void __cluster_dims__(CLUSTER, 1, 1) matmul_b1_kernel(
                 wgmma_wait();
 
                 // Release this stage cluster-wide: arrive on every CTA's empty
-                // barrier (so rank 0 may overwrite their multicast sB).
-                if (t_wg < CLUSTER) arrive_cluster(&mbar_empty[s], t_wg);
+                // barrier (so rank 0 may overwrite their multicast sB). Without
+                // a cluster the stage is this CTA's alone, so a local arrive is
+                // the whole of the release.
+                if (t_wg < CLU) {
+                    if constexpr (CLU > 1) arrive_cluster(&mbar_empty[s], t_wg);
+                    else                   arrive_local(&mbar_empty[s]);
+                }
                 if (++qidx == STAGES) { qidx = 0; p ^= 1; }
             }
 
@@ -460,6 +502,44 @@ extern "C" __global__ void __cluster_dims__(CLUSTER, 1, 1) matmul_b1_kernel(
     }
     // Drain the last outstanding output store before the CTA exits.
     if (t == 0) tma_store_wait();
+}
+
+// ── Entry points ────────────────────────────────────────────────────────────
+//
+// Two kernels, same body, differing only in cluster width:
+//
+//   matmul_b1_kernel     CLUSTER-wide clusters + TMA multicast of B. Max
+//                        throughput (8674 binary TOPS at 16384^3 on an idle
+//                        H200), but `__cluster_dims__` makes the cluster's CTAs
+//                        co-resident BY CONSTRUCTION, so the launch demands a
+//                        placement rather than queueing for one. On a GPU shared
+//                        with another tenant that surfaces as a bare
+//                        CUDA_ERROR_LAUNCH_FAILED. Use when this process owns
+//                        the device.
+//
+//   matmul_b1_kernel_nc  No clusters, no multicast: an ordinary grid whose CTAs
+//                        are independent, so the launch queues like any other
+//                        and composes with a co-tenant at any grid size. Pays
+//                        for B once per CTA instead of once per cluster.
+//
+// The host picks between them (`run_gemm_kernel`); the choice is a throughput /
+// composability trade, never a correctness one.
+extern "C" __global__ void __cluster_dims__(CLUSTER, 1, 1) matmul_b1_kernel(
+    const __grid_constant__ CUtensorMap tma_a,
+    const __grid_constant__ CUtensorMap tma_b,
+    const __grid_constant__ CUtensorMap tma_c,
+    uint32_t m_tiles, uint32_t n_groups, uint32_t M, uint32_t K)
+{
+    matmul_b1_body<CLUSTER>(tma_a, tma_b, tma_c, m_tiles, n_groups, M, K);
+}
+
+extern "C" __global__ void matmul_b1_kernel_nc(
+    const __grid_constant__ CUtensorMap tma_a,
+    const __grid_constant__ CUtensorMap tma_b,
+    const __grid_constant__ CUtensorMap tma_c,
+    uint32_t m_tiles, uint32_t n_groups, uint32_t M, uint32_t K)
+{
+    matmul_b1_body<1>(tma_a, tma_b, tma_c, m_tiles, n_groups, M, K);
 }
 
 // ── Device-resident packing kernels (BLAS3 GPU row-reduction port) ───────────

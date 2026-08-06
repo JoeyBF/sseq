@@ -69,6 +69,28 @@ fn rr_coop() -> bool {
         .unwrap_or(false)
 }
 
+/// Whether the GEMM uses its **cluster** kernel, `matmul_b1_kernel`
+/// (`__cluster_dims__(CLUSTER,1,1)` plus TMA multicast of the B panel).
+///
+/// This is the same trade as [`rr_coop`], one layer down. A thread-block cluster is
+/// co-resident *by construction*: the hardware will not place one CTA of a cluster
+/// without placing them all, because rank 0 multicasts B directly into its mates'
+/// shared memory and every consumer arrives on their empty barriers through `mapa`.
+/// So when another runtime holds SMs, the launch does not queue for a slot the way an
+/// ordinary grid does — it fails outright with `CUDA_ERROR_LAUNCH_FAILED`.
+///
+/// **Off by default**, so the GEMM composes with concurrent GPU work at any grid size.
+/// The default `matmul_b1_kernel_nc` runs the identical tile schedule and arithmetic
+/// with independent CTAs, paying for B once per CTA instead of once per cluster — at
+/// most 2× B's HBM traffic, on top of the ~8× that GROUP_M rasterization already saves.
+/// Set `FP_CUDA_GEMM_COOP=1` to opt into the cluster kernel on a dedicated GPU, where
+/// it is the faster of the two.
+fn gemm_coop() -> bool {
+    std::env::var("FP_CUDA_GEMM_COOP")
+        .map(|v| v != "0" && !v.is_empty())
+        .unwrap_or(false)
+}
+
 /// Lets us pass a `CUtensorMap` by value as a (grid-constant) kernel argument
 /// through cudarc's typed launch builder. `repr(transparent)` so the pointer
 /// cudarc pushes is the address of the 128-byte descriptor itself.
@@ -101,6 +123,8 @@ pub struct GpuContext {
     #[allow(dead_code)]
     module: Arc<CudaModule>,
     kernel: CudaFunction,
+    /// Cluster-free GEMM (`matmul_b1_kernel_nc`): same arithmetic, ordinary grid.
+    kernel_nc: CudaFunction,
     // Device-resident packing/epilogue kernels for the row-reduction port.
     pack_a: CudaFunction,
     pack_b: CudaFunction,
@@ -134,6 +158,7 @@ impl GpuContext {
         let ptx = Ptx::from_src(String::from_utf8(PTX_IMAGE.to_vec())?);
         let module = ctx.load_module(ptx)?;
         let kernel = module.load_function("matmul_b1_kernel")?;
+        let kernel_nc = module.load_function("matmul_b1_kernel_nc")?;
         let pack_a = module.load_function("pack_a")?;
         let pack_b = module.load_function("pack_b")?;
         let xor_into = module.load_function("xor_into")?;
@@ -157,6 +182,7 @@ impl GpuContext {
             ctx,
             module,
             kernel,
+            kernel_nc,
             pack_a,
             pack_b,
             xor_into,
@@ -394,8 +420,17 @@ fn run_gemm_kernel(
     let smem_u64 = STAGES * tile_a + STAGES * tile_b + 2 * NG as usize * TILE_M + 2 * STAGES;
     let smem_bytes = (smem_u64 * std::mem::size_of::<u64>()) as u32;
 
+    // Which GEMM variant runs. The cluster kernel is faster but its
+    // `__cluster_dims__` requires CLUSTER co-resident CTAs, which a launch onto a
+    // GPU somebody else is using cannot get -- see [`gemm_coop`]. Default is the
+    // composable one.
+    let coop = gemm_coop();
+    let kf = if coop { &gpu.kernel } else { &gpu.kernel_nc };
+    // CTA granule the grid must be a multiple of: a whole cluster, or nothing.
+    let gran = if coop { CLUSTER as u32 } else { 1 };
+
     // Opt in to >48 KB shared memory (Hopper static default cap).
-    gpu.kernel.set_attribute(
+    kf.set_attribute(
         sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
         smem_bytes as i32,
     )?;
@@ -419,58 +454,31 @@ fn run_gemm_kernel(
         .ctx
         .attribute(sys::CUdevice_attribute_enum::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)?
         as u32;
-    let occ = gpu
-        .kernel
+    let occ = kf
         .occupancy_max_active_blocks_per_multiprocessor(THREADS, smem_bytes as usize, None)?
         .max(1);
-    // Take a SHARE of the machine, not all of it. A grid sized to full occupancy is only placeable
-    // on a GPU this process owns outright; when anything else holds SMs — the cubecl Milnor multiply
-    // in `algebra`, or simply another tenant — the launch is not queued, it fails, as a bare
-    // `CUDA_ERROR_LAUNCH_FAILED` that compute-sanitizer cannot attribute (0 invalid accesses across
-    // a whole run: it was never a memory bug).
+    // How much of the machine to ask for. Under the cluster kernel a grid sized to full occupancy
+    // is only placeable on a GPU this process owns outright: when anything else holds SMs — the
+    // cubecl Milnor multiply in `algebra`, or simply another tenant — the launch is not queued, it
+    // fails, as a bare `CUDA_ERROR_LAUNCH_FAILED` that compute-sanitizer cannot attribute (0 invalid
+    // accesses across a whole run: it was never a memory bug). Shrinking the grid reduces the
+    // collision probability but never proves it to zero — the safe size is not a sharp threshold
+    // (on the theta=125 stem-200 workload 1/16 ran clean while 1/8 failed 74 times), and it costs
+    // most of the throughput (`bench_kernel_only`, 16384^3, idle H200: 1062 binary TOPS at 16 CTAs
+    // and 2107 at 32, against 8674 at full grid).
     //
-    // Fixing that by arbitrating with the other runtime would make `fp-cuda` and `algebra` depend on
-    // each other's scheduling, which is exactly the coupling worth avoiding — and it would not help
-    // a co-tenant outside this process at all. Asking only for a share needs no such knowledge: the
-    // persistent loop already handles any multiple of `CLUSTER` (fewer CTAs simply do more
-    // tile-iterations each), so grid size was never a correctness parameter, only a throughput one.
+    // The cluster-free kernel has no such constraint — its CTAs are independent, so the launch
+    // queues like any other — and therefore takes the whole machine by default. That is the point of
+    // it: composability without paying the share.
     //
-    // The default is empirical and deliberately conservative, because the safe grid size is NOT a
-    // sharp threshold. On the theta=125 stem-200 workload (the multiply resident nearly
-    // continuously, full grid ~264 CTAs): 1/16 ran a clean 240 s, while 1/8 failed 74 times — and a
-    // 32-CTA cap, essentially the same grid as 1/8, had passed cleanly in an earlier run. Where the
-    // launch stops being placeable depends on what the other tenant is doing at that moment, so a
-    // share reduces the collision probability sharply but does not prove it to zero. Treat any
-    // value here as a risk setting, not a guarantee.
-    //
-    // The cost is real: the idle-device sweep (`bench_kernel_only`, 16384^3) puts 16 CTAs at 1062
-    // binary TOPS and 32 at 2107, against 8674 at full grid. That is the price of composing on a
-    // shared GPU — but it is measured against a full grid that *fails* on such a GPU, not one that
-    // succeeds.
-    //
-    // Set `FP_CUDA_GEMM_DEVICE_FRAC=1` to take the whole machine when this process owns the GPU (a
-    // dedicated linear-algebra device), which restores full throughput.
-    //
-    // This whole knob is a STOPGAP. The co-scheduling requirement came in with Phase 9
-    // (`264b4111d4`, thread-block clusters + TMA multicast of B): `__cluster_dims__` makes a
-    // cluster's CTAs co-resident by construction, B is multicast with an all-ranks mask, and the
-    // empty barrier is cluster-wide via `mapa`. That is a hard placement constraint, and it is why
-    // an oversubscribed grid fails rather than queueing the way an ordinary launch would.
-    //
-    // Phase 8 (`60b05cddc4`) is NOT implicated: its persistent loop strides (`tile += gridDim.x`)
-    // and was already work-capped (`sms.min(total_tiles)`), so it composes at any grid size.
-    //
-    // The fix is a cluster-free GEMM variant — the same move that made the row reduction composable
-    // (see `rr_coop`). The cost is Phase 9's 2x cut in B's HBM traffic, on top of the 8x that Phase
-    // 8's GROUP_M rasterization already delivers, against the ~8x throughput this share sacrifices
-    // (1062 TOPS at 1/16 vs 8674 at full grid). On a bandwidth-bound kernel that trade needs
-    // measuring, but it starts from a much better place than shrinking the grid.
+    // `FP_CUDA_GEMM_DEVICE_FRAC` overrides either default (1 = whole machine). Under the cluster
+    // kernel treat any value as a risk setting, not a guarantee.
     let frac = std::env::var("FP_CUDA_GEMM_DEVICE_FRAC")
         .ok()
         .and_then(|v| v.parse::<u32>().ok())
         .filter(|&f| f > 0)
-        .unwrap_or(16);
-    let mut num_ctas = ((occ * sms / frac) / CLUSTER as u32).max(1) * CLUSTER as u32;
+        .unwrap_or(if coop { 16 } else { 1 });
+    let mut num_ctas = ((occ * sms / frac) / gran).max(1) * gran;
     // Diagnostic: cap the persistent grid to probe how much of a small GEMM's
     // time is the persistent-grid startup (cluster sync + mbar init + pipeline
     // fill across occ×SMs CTAs). The persistent loop handles any multiple of
@@ -479,7 +487,7 @@ fn run_gemm_kernel(
         .ok()
         .and_then(|v| v.parse::<u32>().ok())
     {
-        num_ctas = (cap / CLUSTER as u32).max(1) * CLUSTER as u32;
+        num_ctas = (cap / gran).max(1) * gran;
     }
 
     let ta = TmaArg(tma_a);
@@ -496,7 +504,7 @@ fn run_gemm_kernel(
             block_dim: (THREADS, 1, 1),
             shared_mem_bytes: smem_bytes,
         };
-        let mut lb = stream.launch_builder(&gpu.kernel);
+        let mut lb = stream.launch_builder(kf);
         lb.arg(&ta)
             .arg(&tb)
             .arg(&tc)
