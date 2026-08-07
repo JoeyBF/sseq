@@ -4159,6 +4159,31 @@ fn seg_read_u32(
 /// the constraint. The fixes that would matter are structural: batch far more `R`s per launch so the
 /// grid fills the device, or drop thread-per-`R` for lane cooperation with dynamically pulled work.
 ///
+/// MEASURED (S_2 stem 150, max_s 60, theta=125), and it narrows the choice further:
+///
+/// | ENUM_THREADS | blocks/launch | waves/SM | wall  |
+/// |--------------|---------------|----------|-------|
+/// | 256          | 6             | 0.002    | 561 s |
+/// | 64           | 21            | 0.007    | 569 s |
+/// | 32           | 41            | 0.013    | 542 s |
+///
+/// 6.5x more blocks buys 3.4% — noise. Spreading a launch over more SMs cannot help, because a
+/// launch's duration is set by its LONGEST SINGLE `R` (one thread, sequential odometer), not by how
+/// many blocks it occupies; the extra SMs just idle beside the one thread still grinding. `Rs/launch`
+/// averages 1293 and peaks at 34157, so that spread is enormous.
+///
+/// 10260 launches over a ~550 s run is ~50 ms each, and [`gpu_thread`] runs every device section on
+/// ONE thread and ONE stream — so they are strictly serial. That is what makes batching worth a
+/// factor of hundreds rather than a few percent: merging launches turns a SUM into a MAX. Ten
+/// serialised 50 ms launches cost 500 ms; the same `R`s in one launch cost ~50 ms, because the short
+/// `R`s run beside the long one instead of queueing behind it.
+///
+/// So the two candidates are (a) stream concurrency — the launches are already independent, and
+/// [`gpu_thread`]'s FIFO order could dispatch round-robin across N streams and stay fair — or
+/// (b) aggregating `R`s across calls, which needs enumeration decoupled from the multiply that
+/// consumes it. (a) is far cheaper, but streams were pinned to 1 to fix a host-memory blowup from
+/// per-stream pinned pools, so that constraint has to be re-examined, not ignored.
+///
 /// In-kernel admissible-matrix enumeration: one thread per distinct `R`, generating that `R`'s
 /// `col_sums`/`masks` for *every* admissible matrix directly into device scratch — the on-GPU
 /// replacement for the resident/uploaded master (the stem-300 memory wall + the eviction re-upload
