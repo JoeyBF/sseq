@@ -1755,6 +1755,17 @@ impl MilnorAlgebra {
 /// by [`MilnorAlgebra::multiply_basis_element_by_element_2`]. See that method (and the original
 /// `FreeModule::custom_milnor_act`) for the algorithm. Rows are indexed by the entries of `R`; the
 /// stored `matrix` is row-major with `cols` columns.
+///
+/// These stay `Vec`s deliberately. Replacing them with fixed-size arrays sized to [`PPart`]'s own
+/// structural caps (`MAX_LEN` = 10 rows, `width(0)` = 11 cols, so 110/10/10/20 entries) removes four
+/// allocations per `R`, and was measured on `benches/nassau_milnor` to be a NET LOSS: 6.7% slower at
+/// `op24xel32`, 2.2% at `op40xel1`, and 0.3-0.6% slower across most of the rest, against ~0.1-0.3%
+/// gains on three shapes. The allocations are not the cost -- the zeroing is. A typical `R` is far
+/// smaller than the cap (~4 rows x ~6 cols = 24 entries against 110), so `vec![0; rows * cols]`
+/// clears a third of what `[0; 110]` would, and the saved `malloc`s do not pay for the extra stores.
+///
+/// This is the same effect that made shrinking the GPU kernel's `ENUM_COL_CAP` 32 -> 11 worthwhile,
+/// seen from the other side: over-sized fixed state costs more than the allocation it avoids.
 struct AdmissibleMatrix {
     cols: usize,
     rows: usize,
