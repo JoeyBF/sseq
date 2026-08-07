@@ -4085,6 +4085,36 @@ fn seg_read_u32(
     v
 }
 
+/// PROFILE (ncu, idle H200, degree <= 130: 89392 `R`s / 76M matrices). This kernel is ~99% of GPU
+/// kernel time whenever the transient path is live (nsys; `multiply_batch_kernel` is 1.1%), and it is
+/// LATENCY-bound, not bandwidth- or compute-bound:
+///
+/// ```text
+/// Compute (SM) Throughput   5.16 %      Avg. Active Threads Per Warp   5.88 / 32
+/// Memory Throughput        13.92 %      Active Warps Per Scheduler     2.09
+/// DRAM Throughput           0.65 %      No Eligible                   76.57 %
+/// L2 Hit Rate              98.83 %      Warp Cycles Per Issued Instr   8.90
+/// ```
+///
+/// Nothing is saturated; the scheduler simply has nothing to issue 3 cycles in 4. Two causes, in
+/// order of size:
+///
+/// 1. DIVERGENCE — 5.88 of 32 lanes active. One thread per `R`, and `R`s have wildly different
+///    matrix counts, so a warp runs at its longest member and ~82% of lanes idle. Sorting by
+///    `num_mats` (dbe1b49e85) won 8% and left this untouched. Unaddressed; the biggest number here.
+/// 2. LOCAL MEMORY — the state below is indexed by runtime values, so it cannot be registers and
+///    lands in local memory; ncu attributes 45.6% of the 8.9 stall cycles to waiting on it.
+///
+/// Moving the state to `Shared<[u32]>` (stride `elem * BLOCK + tid`, bank-conflict-free) WAS tried
+/// and is bit-exact, but is a net LOSS: it cuts warp cycles per issued instruction 8.90 -> 5.92
+/// (-33%, so the mechanism is real) while forcing the block from 256 to 64 threads (152 u32/thread
+/// = 38.9 KB/block, at the 48 KB static shared limit), which drops active warps per scheduler
+/// 2.09 -> 1.61. Net 109.63 ms -> 112.72 ms. The 33% is only reachable if the shared footprint
+/// shrinks enough to keep occupancy — e.g. `matrix` as u16 (values are <= 2^11).
+///
+/// Do not read ncu's "Est. Local Speedup: 76.57%" as a forecast: it is the prize if the stall
+/// vanishes at zero cost, and here the cost was occupancy.
+///
 /// In-kernel admissible-matrix enumeration: one thread per distinct `R`, generating that `R`'s
 /// `col_sums`/`masks` for *every* admissible matrix directly into device scratch — the on-GPU
 /// replacement for the resident/uploaded master (the stem-300 memory wall + the eviction re-upload
