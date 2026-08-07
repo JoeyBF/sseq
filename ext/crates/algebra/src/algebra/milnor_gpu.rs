@@ -3247,7 +3247,8 @@ fn multiply_batch_block<'a>(
                                     BufferArg::from_raw_parts(cnt_scratch, n_s),
                                     enum_width,
                                     n_s,
-                                    true,
+                                    0u32,
+                                    1,
                                 );
                             }
                         }
@@ -3953,7 +3954,10 @@ fn enumerate_admissible_kernel(
     // Comptime: `false` compiles the emit stores OUT entirely (not merely branches around them),
     // isolating the odometer's cost from the cost of writing its results. Production passes `true`;
     // only the `enum_emit_store_cost` diagnostic passes `false`.
-    #[comptime] emit: bool,
+    // Wrap mask for `emit == 2` only (power-of-two - 1), keeping the probe's rewritten indices in
+    // bounds; ignored by every other mode.
+    wrap: u32,
+    #[comptime] emit: u32,
 ) {
     let ri = ABSOLUTE_POS;
     if ri >= n_r {
@@ -4002,7 +4006,11 @@ fn enumerate_admissible_kernel(
     let mut more = true;
     while more {
         // Emit the current matrix's col_sums/masks into this R's scratch slot.
-        if emit {
+        // 0 = no stores at all (isolates the odometer). 1 = production: this R's slot, contiguous
+        // per thread but scattered across the warp. 2 = lane-adjacent indices, which coalesces the
+        // warp but writes garbage layout -- a TIMING PROBE ONLY, never correct output. 3 = every
+        // other entry, halving both store count and bytes.
+        if emit == 1 {
             let co = cs_base + mat * cs_len;
             for j in 0..cs_len {
                 out_cs[co + j] = u16::cast_from(col_sums[j]);
@@ -4010,6 +4018,27 @@ fn enumerate_admissible_kernel(
             let mo = mk_base + mat * mk_len;
             for j in 0..mk_len {
                 out_mk[mo + j] = u16::cast_from(masks[j]);
+            }
+        } else if emit == 2 {
+            let w = usize::cast_from(wrap);
+            for j in 0..cs_len {
+                out_cs[(ri + n_r * (mat * cs_len + j)) & w] = u16::cast_from(col_sums[j]);
+            }
+            for j in 0..mk_len {
+                out_mk[(ri + n_r * (mat * mk_len + j)) & w] = u16::cast_from(masks[j]);
+            }
+        } else if emit == 3 {
+            let co = cs_base + mat * cs_len;
+            let mut j = 0usize;
+            while j < cs_len {
+                out_cs[co + j] = u16::cast_from(col_sums[j]);
+                j += 2;
+            }
+            let mo = mk_base + mat * mk_len;
+            let mut j2 = 0usize;
+            while j2 < mk_len {
+                out_mk[mo + j2] = u16::cast_from(masks[j2]);
+                j2 += 2;
             }
         }
         mat += 1;
@@ -4487,7 +4516,8 @@ mod tests {
                 BufferArg::from_raw_parts(cnt_h.clone(), n_r),
                 width,
                 n_r,
-                true,
+                0u32,
+                1,
             );
         }
         // Truncate off the `max(1)` padding element present when a batch has zero col_sums / masks (an
@@ -4553,11 +4583,19 @@ mod tests {
             .collect();
         let total_mats: u64 = num_mats.iter().map(|&m| m as u64).sum();
 
-        let (cs, mk, t_emit) =
-            time_enum::<CudaRuntime>(&Default::default(), &p_parts, &num_mats, true);
-        let (_, _, t_noemit) =
-            time_enum::<CudaRuntime>(&Default::default(), &p_parts, &num_mats, false);
+        let d = Default::default();
+        let (cs, mk, t_emit) = time_enum::<CudaRuntime>(&d, &p_parts, &num_mats, 1);
+        let (_, _, t_noemit) = time_enum::<CudaRuntime>(&d, &p_parts, &num_mats, 0);
+        let (_, _, t_coal) = time_enum::<CudaRuntime>(&d, &p_parts, &num_mats, 2);
+        let (_, _, t_half) = time_enum::<CudaRuntime>(&d, &p_parts, &num_mats, 3);
         let stores = cs as u64 + mk as u64;
+        let share = |t: f64| 100.0 * (t - t_noemit) / (t_emit - t_noemit);
+        eprintln!(
+            "  emit=2 coalesced (lane-adjacent, garbage layout) {t_coal:.4}s -> {:.1}% of the emit \
+             cost remains\n  emit=3 half the stores {t_half:.4}s -> {:.1}% remains",
+            share(t_coal),
+            share(t_half)
+        );
         eprintln!(
             "enum emit cost (degree <= {max_degree}, {} R's, {total_mats} matrices, {stores} u16 \
              stores = {:.2} GB):\n  emit=true  {:.4}s\n  emit=false {:.4}s\n  stores are {:.1}% \
@@ -4578,7 +4616,7 @@ mod tests {
         device: &R::Device,
         p_parts: &[Vec<u32>],
         num_mats: &[u32],
-        emit: bool,
+        emit: u32,
     ) -> (u64, u64, f64) {
         use std::time::Instant;
 
@@ -4620,6 +4658,12 @@ mod tests {
         let omk_h = client.empty(mk_cap * size_of::<u16>());
         let cnt_h = client.empty(n_r * size_of::<u32>());
 
+        // Largest power of two that keeps `emit == 2`'s rewritten indices inside both buffers.
+        let wrap = {
+            let lim = cs_cap.min(mk_cap) as u64;
+            (1u64 << (63 - lim.leading_zeros().min(62))).min(lim) as u32 - 1
+        };
+
         const THREADS: u32 = 64;
         let cubes = (n_r as u32).div_ceil(THREADS);
         let mut times: Vec<f64> = Vec::new();
@@ -4640,6 +4684,7 @@ mod tests {
                     BufferArg::from_raw_parts(cnt_h.clone(), n_r),
                     width,
                     n_r,
+                    wrap,
                     emit,
                 );
             }
@@ -4959,7 +5004,8 @@ mod tests {
                 BufferArg::from_raw_parts(cnt_h.clone(), n_r),
                 width,
                 n_r,
-                true,
+                0u32,
+                1,
             );
         }
         // Reading the tiny counts buffer blocks until the kernel completes: kernel wall time, ~no transfer.
