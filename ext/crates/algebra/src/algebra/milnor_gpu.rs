@@ -1251,6 +1251,28 @@ pub fn dump_r_stats() {
     // Ranking a cache on references alone is ranking on the wrong quantity: a small hot `R` and a
     // big cold one can cost the same to rebuild, and if that trade is even, the cost distribution
     // is FLAT and no partial cache has a head to exploit (only theta, the memory dial, remains).
+    // Optional per-`R` dump, for offline cache simulation: replaying an admission policy needs the
+    // individual records, not the summary curves. `first`/`last` are BATCH_CALLS ticks, so a
+    // simulator can place an `R`'s references across the run rather than only count them.
+    if let Some(path) = std::env::var_os("NASSAU_R_STATS_CSV") {
+        use std::io::Write;
+        match std::fs::File::create(&path) {
+            Ok(f) => {
+                let mut w = std::io::BufWriter::new(f);
+                let _ = writeln!(w, "count,degree,first,last,num_mats");
+                for s in map.values() {
+                    let _ = writeln!(
+                        w,
+                        "{},{},{},{},{}",
+                        s.count, s.degree, s.first, s.last, s.num_mats
+                    );
+                }
+                eprintln!("[R-STATS] wrote {} rows to {:?}", map.len(), path);
+            }
+            Err(e) => eprintln!("[R-STATS] could not write {path:?}: {e}"),
+        }
+    }
+
     let cost = |s: &RStat| s.count * s.num_mats;
     let mut c: Vec<&RStat> = map.values().collect();
     c.sort_by_key(|b| std::cmp::Reverse(cost(b)));
