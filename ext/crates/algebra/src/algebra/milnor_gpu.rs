@@ -981,13 +981,25 @@ macro_rules! seg_grow {
                         };
                         let (tail, new_len): (Vec<$elem>, usize) = ($tail)(uploaded);
                         debug_assert_eq!(uploaded + tail.len(), new_len);
-                        assert!(
-                            new_len.div_ceil(seg_elems.max(1)) <= MASTER_MAX_SEG,
-                            "resident buffer needs {} segments (> MASTER_MAX_SEG={}); raise \
-                             MASTER_MAX_SEG or NASSAU_GPU_MASTER_SEG_ELEMS",
-                            new_len.div_ceil(seg_elems.max(1)),
-                            MASTER_MAX_SEG
-                        );
+                        // ABORT, do not panic. This runs on a shard's dedicated per-launch thread,
+                        // and a panic there kills only that launch: the next one spawns a fresh
+                        // thread and the resolution carries on having silently dropped the failed
+                        // block's products. Observed on an uncapped stem-300 run -- four launches
+                        // died here and the run continued for another ~900k batches, which produces
+                        // a wrong answer rather than a stopped one. There is no recovery from
+                        // exhausting the segment table mid-master, so take the whole process down
+                        // where it cannot be mistaken for a slow run.
+                        if new_len.div_ceil(seg_elems.max(1)) > MASTER_MAX_SEG {
+                            eprintln!(
+                                "FATAL: resident buffer needs {} segments (> MASTER_MAX_SEG={}); \
+                                 lower NASSAU_GPU_RESIDENT_MAX_DEGREE (see `dump_master_by_degree` \
+                                 for which theta fits), or raise MASTER_MAX_SEG / \
+                                 NASSAU_GPU_MASTER_SEG_ELEMS",
+                                new_len.div_ceil(seg_elems.max(1)),
+                                MASTER_MAX_SEG
+                            );
+                            ::std::process::abort();
+                        }
                         // Allocate (no copy) full-size segments until they cover `new_len`. The last
                         // one is allocated full even if only partially written; reads only touch
                         // written locals (`< uploaded`), so its uninitialized tail is never read.
