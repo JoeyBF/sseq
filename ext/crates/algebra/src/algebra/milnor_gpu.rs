@@ -4115,6 +4115,30 @@ fn seg_read_u32(
 /// Do not read ncu's "Est. Local Speedup: 76.57%" as a forecast: it is the prize if the stall
 /// vanishes at zero cost, and here the cost was occupancy.
 ///
+/// ROOT CAUSE (ncu Occupancy/LaunchStats, same run): the kernel is STARVED OF WORK, and everything
+/// above is a symptom of it.
+///
+/// ```text
+/// Registers Per Thread   40      Block Limit Registers   24 blocks
+/// Theoretical Occupancy  75 %    Waves Per SM            0.44
+/// Achieved Occupancy    8.16 %   Grid Size               1397 blocks x 64 threads
+/// ```
+///
+/// Registers are NOT a limiter (40/thread allows 24 blocks/SM, 75% theoretical) — do not spend
+/// effort shrinking them. The binding fact is `Waves Per SM = 0.44`: an H200 has 132 SMs x 24 block
+/// slots = 3168, and the grid supplies 1397. One thread per `R` over 89392 `R`s is ~89k threads
+/// against the device's ~270k capacity, so the kernel cannot fill half the machine however well it
+/// runs — and achieved occupancy is then 8.16% of that 75% ceiling because those few blocks drain
+/// raggedly (the same divergence as the 5.88/32 lanes).
+///
+/// Production is likely worse: this measurement enumerates every `R` to degree 130 at once, while a
+/// production launch covers only one block's transient `R`s, so those grids are smaller still.
+///
+/// So the granularity is the bug: one thread per `R` gives too FEW threads and wildly UNEQUAL ones.
+/// That is why every local tweak measured between -3% and +8% — they adjust resources that are not
+/// the constraint. The fixes that would matter are structural: batch far more `R`s per launch so the
+/// grid fills the device, or drop thread-per-`R` for lane cooperation with dynamically pulled work.
+///
 /// In-kernel admissible-matrix enumeration: one thread per distinct `R`, generating that `R`'s
 /// `col_sums`/`masks` for *every* admissible matrix directly into device scratch — the on-GPU
 /// replacement for the resident/uploaded master (the stem-300 memory wall + the eviction re-upload
