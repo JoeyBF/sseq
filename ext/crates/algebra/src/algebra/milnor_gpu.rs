@@ -246,8 +246,10 @@ mod gpu_thread {
     /// Balance therefore comes from spreading `R`s evenly (round-robin at first sight), not from
     /// letting idle workers steal.
     ///
-    /// Each worker owns its device, its stream, and (via the thread-local set here) its own replica
-    /// of the resident master/basis, so a device handle can never reach another device's client.
+    /// Each worker owns its device and its stream, and the thread-local set here is what keeps a
+    /// device handle from ever reaching another device's client. The resident master/basis is NOT
+    /// per worker — [`RESIDENT_DEV`] is indexed by device — so the [`gpu_streams`] workers sharing
+    /// one device's queue also share its segments rather than replicating them.
     ///
     /// `crossbeam-channel` because this is genuinely multi-consumer: std's `mpsc` has a single
     /// receiver, so one shared queue there would mean wrapping it in a `Mutex` and serialising every
@@ -255,23 +257,35 @@ mod gpu_thread {
     fn senders() -> &'static Vec<Sender<Task>> {
         static QUEUES: OnceLock<Vec<Sender<Task>>> = std::sync::OnceLock::new();
         QUEUES.get_or_init(|| {
+            let nstream = super::gpu_streams();
             let mut txs = Vec::with_capacity(super::gpu_count());
             for dev in 0..super::gpu_count() {
                 let (tx, rx) = unbounded::<Task>();
                 txs.push(tx);
-                std::thread::Builder::new()
-                    .name(format!("nassau-gpu{dev}"))
-                    .spawn(move || {
-                        super::CUR_DEVICE.with(|c| c.set(dev));
-                        // Bind the stream once for the whole loop: one stream per driver thread, a
-                        // distinct id per device so the runtime keeps them independent.
-                        StreamId { value: dev as u64 }.executes(|| {
-                            while let Ok(task) = rx.recv() {
-                                task();
+                // `gpu_streams()` workers share this device's queue, so whichever frees up first
+                // takes the next section — the pull-queue balance the per-device split allows, now
+                // that there is more than one puller. Each gets its OWN `StreamId` (ids are global,
+                // hence `dev * nstream + w`), which is what actually lets their launches overlap on
+                // the device; sharing one id would re-serialise them.
+                for w in 0..nstream {
+                    let rx = rx.clone();
+                    std::thread::Builder::new()
+                        .name(format!("nassau-gpu{dev}s{w}"))
+                        .spawn(move || {
+                            super::CUR_DEVICE.with(|c| c.set(dev));
+                            // Bind the stream once for the whole loop: one stream per driver
+                            // thread, a distinct id so the runtime keeps them independent.
+                            StreamId {
+                                value: (dev * nstream + w) as u64,
                             }
-                        });
-                    })
-                    .expect("failed to spawn a nassau-gpu thread");
+                            .executes(|| {
+                                while let Ok(task) = rx.recv() {
+                                    task();
+                                }
+                            });
+                        })
+                        .expect("failed to spawn a nassau-gpu thread");
+                }
             }
             txs
         })
@@ -747,6 +761,63 @@ fn gpu_count() -> usize {
             .filter(|&n| n > 0)
             .unwrap_or(detected)
             .clamp(1, MAX_GPUS)
+    });
+    *N
+}
+
+/// Worker threads — and therefore CUDA streams — per device (`NASSAU_GPU_STREAMS`, default 1).
+///
+/// Each device's submission queue is drained by this many workers, so this many device sections run
+/// CONCURRENTLY on one device instead of strictly one after another. It exists because
+/// [`enumerate_admissible_kernel`] is ~99% of GPU kernel time and runs the device at
+/// `Waves Per SM = 0.002`: a production launch is ~6 blocks of the 3168 an H200 can hold, and its
+/// duration is set by its longest single `R` (one thread, sequential odometer), not by how many
+/// blocks it occupies. Widening the grid therefore cannot help (measured: 6.5x more blocks bought
+/// 3.4%) — but running independent sections *beside* each other can, because it converts a SUM of
+/// serialised launches into a MAX of concurrent ones.
+///
+/// Default 1 because streams were pinned to 1 for a reason: the CUDA runtime keeps a pinned staging
+/// pool PER STREAM, and per-stream pools were half of the ~500 GB host-memory blowup (see the
+/// resident-master notes). N streams multiply that pool count by N, so raising this trades host RSS
+/// for device concurrency and must be measured, not assumed.
+///
+/// MEASURED (S_2 stem 150, max_s 60, theta=125) — and it does NOT pay:
+///
+/// | streams | wall  | peak host RSS | peak GPU |
+/// |---------|-------|---------------|----------|
+/// | 1       | 528 s | 39.1 GB       | 31.5 GB  |
+/// | 2       | 527 s | 53.3 GB       | 43.9 GB  |
+/// | 4       | 598 s | 75.9 GB       | 68.8 GB  |
+///
+/// Wall is flat at 2 and 13% WORSE at 4, while both memories roughly double. The growth is the
+/// important part: it is proof the sections really did overlap (several sets of transient buffers in
+/// flight at once), so this is not "the streams did not engage" — concurrency happened and bought
+/// nothing, then started costing (4 streams push the allocator and the pinned pools hard enough to
+/// lose 13%).
+///
+/// The conclusion is therefore about the workload, not about streams: at this configuration the
+/// resolution is NOT GPU-throughput-bound. `enumerate_admissible_kernel` is 99% of GPU *kernel* time,
+/// but kernel time is not on the critical path, so the "batching turns a SUM into a MAX" argument
+/// above — correct as arithmetic about the launches — optimises something that is not the limiter.
+/// Measured at the same time: the process ran at ~918% CPU on a 128-core node (~7% of the machine)
+/// with a wavefront only ~5 bidegrees wide, i.e. the limiter is a SERIAL DEPENDENCY CHAIN on the
+/// host. Look there before spending anything more on the enum kernel.
+///
+/// Kept (rather than reverted) because it is a few lines, defaults to the old behaviour exactly, and
+/// is the control that makes the "not GPU-bound" claim falsifiable on a different workload.
+///
+/// Safe with the shared resident master: [`RESIDENT_DEV`] is indexed per DEVICE, not per thread, so
+/// extra workers on one device reuse the same segments rather than replicating them, and the
+/// segmented append-only store is already the cross-stream-safe shape (a stable segment written in
+/// place) that replaced the churny re-upload cubecl could not synchronise.
+fn gpu_streams() -> usize {
+    static N: LazyLock<usize> = LazyLock::new(|| {
+        std::env::var("NASSAU_GPU_STREAMS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(1)
+            .clamp(1, 16)
     });
     *N
 }
@@ -1357,8 +1428,8 @@ pub fn dump_r_stats() {
     };
     eprintln!(
         "[R-COST] total_matrices_enumerated={total_cost} | cost coverage (all Rs) top1%={:.0}% \
-         top5%={:.0}% top10%={:.0}% top25%={:.0}% top50%={:.0}% | transient(deg>{theta}): \
-         {t_rs} Rs ({:.0}%) {t_refs} refs ({:.0}%) cost {:.0}% of total | within transient, cost \
+         top5%={:.0}% top10%={:.0}% top25%={:.0}% top50%={:.0}% | transient(deg>{theta}): {t_rs} \
+         Rs ({:.0}%) {t_refs} refs ({:.0}%) cost {:.0}% of total | within transient, cost \
          coverage top1%={:.0}% top5%={:.0}% top10%={:.0}% top25%={:.0}%",
         ccov(0.01),
         ccov(0.05),
@@ -3890,8 +3961,8 @@ fn multiply_batch_block<'a>(
                      lock={:.0}% device={:.0}% pairs={pairs} (marshal={marshal_s:.1}s \
                      wait={wait_s:.1}s) queue={queue_s:.1}s exec={exec_s:.1}s | queue={:.0}% \
                      exec={:.0}% depth mean={:.1} max={depth_max} | launch={launch_s:.1}s \
-                     fence={fence_s:.1}s pipeline={:.0}% | intern={:.1}s basis={:.1}s tgei={:.1}s | \
-                     enum launches={el} Rs/launch mean={:.0} max={erm} blocks/launch mean={:.0} \
+                     fence={fence_s:.1}s pipeline={:.0}% | intern={:.1}s basis={:.1}s tgei={:.1}s \
+                     | enum launches={el} Rs/launch mean={:.0} max={erm} blocks/launch mean={:.0} \
                      waves/SM={:.3}",
                     100.0 * prep_s / total,
                     100.0 * permit_s / total,
@@ -4862,8 +4933,8 @@ mod tests {
         let stores = cs as u64 + mk as u64;
         let share = |t: f64| 100.0 * (t - t_noemit) / (t_emit - t_noemit);
         eprintln!(
-            "  emit=2 coalesced (lane-adjacent, garbage layout) {t_coal:.4}s -> {:.1}% of the emit \
-             cost remains\n  emit=3 half the stores {t_half:.4}s -> {:.1}% remains",
+            "  emit=2 coalesced (lane-adjacent, garbage layout) {t_coal:.4}s -> {:.1}% of the \
+             emit cost remains\n  emit=3 half the stores {t_half:.4}s -> {:.1}% remains",
             share(t_coal),
             share(t_half)
         );
@@ -5520,8 +5591,8 @@ mod tests {
                                 }
                                 if d != m && sample.len() < 8 {
                                     sample.push(format!(
-                                        "R={p_part:?} rows={rows} cols={cols} (row={row},col={col}) \
-                                         d={d:#x} masks[{}]={m:#x}",
+                                        "R={p_part:?} rows={rows} cols={cols} \
+                                         (row={row},col={col}) d={d:#x} masks[{}]={m:#x}",
                                         row + col
                                     ));
                                 }
@@ -5579,9 +5650,9 @@ mod tests {
 
         let pct = |n: u64| 100.0 * n as f64 / checks.max(1) as f64;
         eprintln!(
-            "d-vs-masks over {checks} anti-diagonal computations (degree <= {max_degree}):\n  \
-             d == masks : {equal} ({:.3}%)\n  d subset-of masks : {d_subset} ({:.3}%)\n  \
-             masks subset-of d : {masks_subset} ({:.3}%)",
+            "d-vs-masks over {checks} anti-diagonal computations (degree <= {max_degree}):\n  d \
+             == masks : {equal} ({:.3}%)\n  d subset-of masks : {d_subset} ({:.3}%)\n  masks \
+             subset-of d : {masks_subset} ({:.3}%)",
             pct(equal),
             pct(d_subset),
             pct(masks_subset)
