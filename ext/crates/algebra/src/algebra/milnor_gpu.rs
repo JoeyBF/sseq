@@ -668,6 +668,13 @@ struct ResidentHost {
     /// Per-device logical master lengths; an `R` extends only its own device's.
     cs_len: Vec<usize>,
     mk_len: Vec<usize>,
+    /// Master bytes admitted at each `R` degree, indexed by degree. A cumulative sum over this is
+    /// exactly "how large the master would be at [`resident_degree_cap`] = θ", so a run can report
+    /// which θ WOULD have fit in a given device budget without ever having to OOM to find out. Kept
+    /// unconditionally: it is one add per first-sight `R`, and guessing θ is otherwise a blind
+    /// extrapolation (bytes are dominated by the top degrees, so a lower-stem run cannot predict a
+    /// higher θ -- the degrees carrying the mass are simply absent from it).
+    deg_bytes: Vec<u64>,
     /// Accumulated `num_mats` per device — the work proxy the shard assignment balances.
     ///
     /// A launch's work on a device is the sum over its products of `num_mats(R) * ceil(nt/T)`, so
@@ -684,6 +691,7 @@ static RESIDENT_HOST: LazyLock<RwLock<ResidentHost>> = LazyLock::new(|| {
         cs_len: vec![0; gpu_count()],
         mk_len: vec![0; gpu_count()],
         dev_load: vec![0; gpu_count()],
+        deg_bytes: Vec::new(),
         index: HashMap::new(),
     })
 });
@@ -1345,6 +1353,41 @@ pub fn dump_r_stats() {
     );
 }
 
+/// Report the master's size as a function of [`resident_degree_cap`]: for each θ, the bytes the
+/// resident master would occupy if the cap were set there. Answers "what θ fits in my device
+/// budget" from a single run, in place of guessing and discovering the answer as an OOM hours in.
+///
+/// Bytes are sharded across [`gpu_count`] devices, so the per-GPU column is what a budget is
+/// actually compared against. Note the master is typically a small share of peak device memory
+/// (2.6 GB/GPU at stem 150 against a ~50 GB peak at stem 200) -- θ caps the master, not the dense
+/// output matrices, so a θ that fits the master is necessary but not sufficient.
+pub fn dump_master_by_degree() {
+    let host = RESIDENT_HOST.read().unwrap();
+    if host.deg_bytes.is_empty() {
+        return;
+    }
+    let devs = gpu_count().max(1) as f64;
+    let total: u64 = host.deg_bytes.iter().sum();
+    let mut acc = 0u64;
+    let mut out = String::new();
+    for (d, &b) in host.deg_bytes.iter().enumerate() {
+        acc += b;
+        if b != 0 && (d % 25 == 0 || d + 1 == host.deg_bytes.len()) {
+            out += &format!(
+                " θ≤{d}:{:.1}GB({:.1}/GPU)",
+                acc as f64 / 1e9,
+                acc as f64 / devs / 1e9
+            );
+        }
+    }
+    eprintln!(
+        "[MASTER-BY-DEGREE] full={:.1}GB ({:.1}GB/GPU over {} devices) | cumulative:{out}",
+        total as f64 / 1e9,
+        total as f64 / devs / 1e9,
+        gpu_count().max(1),
+    );
+}
+
 fn resident_info(algebra: &MilnorAlgebra, p_part: PPart) -> RInfo {
     record_r_use(algebra, p_part);
     if let Some(info) = RESIDENT_HOST.read().unwrap().index.get(&p_part) {
@@ -1394,6 +1437,11 @@ fn resident_info(algebra: &MilnorAlgebra, p_part: PPart) -> RInfo {
         num_mats: num_mats as u32,
         dev: dev as u8,
     };
+    let deg = ppart_degree(p_part).max(0) as usize;
+    if host.deg_bytes.len() <= deg {
+        host.deg_bytes.resize(deg + 1, 0);
+    }
+    host.deg_bytes[deg] += num_mats * (cs_len + mk_len) as u64 * size_of::<u16>() as u64;
     host.cs_pending[dev].extend(cs.iter().map(|&v| narrow_u16(v)));
     host.mk_pending[dev].extend(mk.iter().map(|&v| narrow_u16(v)));
     host.cs_len[dev] += cs.len();
@@ -3807,6 +3855,10 @@ fn multiply_batch_block<'a>(
                 let fence_s =
                     BATCH_FENCE_US.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6;
                 let total = (prep_s + wait_s + device_s).max(1e-9);
+                // Emit the theta->bytes curve alongside the periodic stats, not only at the end: a
+                // run that dies on an allocation must still leave behind the answer to "which theta
+                // would have fit", which is the whole point of collecting it.
+                dump_master_by_degree();
                 eprintln!(
                     "[batch-stats] calls={calls} prep={prep_s:.1}s permit={permit_s:.1}s \
                      lock={lock_s:.1}s device={device_s:.1}s | prep={:.0}% permit={:.0}% \

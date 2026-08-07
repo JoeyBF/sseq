@@ -1447,6 +1447,7 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
         // Eviction probe (`NASSAU_R_STATS`): dump the R-access distribution once the wavefront is done.
         #[cfg(feature = "gpu")]
         algebra::milnor_gpu::dump_r_stats();
+        algebra::milnor_gpu::dump_master_by_degree();
     }
 }
 
