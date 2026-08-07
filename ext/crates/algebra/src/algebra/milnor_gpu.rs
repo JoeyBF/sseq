@@ -705,6 +705,13 @@ struct ResidentHost {
     /// with `R`s used at broadly similar rates the device's share is set by the `num_mats` it owns.
     /// Master bytes are `num_mats * (cs_len + mk_len)`, so balancing this also tracks memory.
     dev_load: Vec<u64>,
+    /// std's `HashMap` (SipHash), deliberately. `resident_info` is 7.7% of user cycles in a `perf`
+    /// profile of an uncapped stem-150 run with a further 2.2% in `DefaultHasher`/`RandomState`, so
+    /// swapping to `rustc_hash::FxHashMap` looks like free money for a non-adversarial integer key.
+    /// It is not: measured over three replicates per arm, Fx was ~8% SLOWER
+    /// (219.0 s mean vs 202.7 s; runs 234/210/213 against 205/208/195). Fx is a weak
+    /// multiply-rotate and evidently clusters on packed `PPart` keys where SipHash spreads them.
+    /// Do not re-try this without replicates -- the run-to-run noise floor here is ~3%.
     index: HashMap<PPart, RInfo>,
 }
 
