@@ -1092,6 +1092,28 @@ fn ppart_degree(p_part: PPart) -> i32 {
 /// excluding them saves more device bytes than their count fraction. On S_2 (150,75): θ≤100 keeps
 /// 17% of distinct `R`s resident and recomputes 14% of references; θ≤125 keeps 43% / recomputes 4%.
 /// The resident set saturates with degree, so this bounds the master at any stem (the stem-300 lever).
+///
+/// SET IT AS HIGH AS DEVICE MEMORY ALLOWS. The reference-miss rate above is a byte metric and badly
+/// understates the time cost: a miss re-enumerates on the GPU in EVERY block that touches the `R`
+/// (~442 times over a run at (150,75)), and `enumerate_admissible_kernel` is ~99% of GPU kernel time
+/// whenever the transient path is live (nsys; `multiply_batch_kernel` is 1.1%). Measured on stem 200
+/// to max_t=310, all complete with 0 crashes:
+///
+/// | θ    | wall    | peak GPU mem |
+/// |------|---------|--------------|
+/// | ∞    |  2412 s | —            |
+/// | 200  |  2865 s | 50.2 GB      |
+/// | 125  | 18566 s | 44.9 GB      |
+///
+/// θ=125 trades 6.5x in wall time for 5.3 GB. The knee is sharp and sits above 125: the memory curve
+/// is far flatter than the time curve, so the cap is a fallback for running out of device memory,
+/// not a parameter to tune down. `exec` fell 16x and `fence` 32x from 125 to 200 on identical work
+/// (pairs 5.88e13 both), which is the enumeration simply not happening.
+///
+/// A smarter eviction policy is not the answer and was measured: replaying a pinned count-ranked
+/// cache against the reference stream saves bytes-cached LINEARLY (1% budget -> 2.4%, 25% -> 43.8%),
+/// within 0.3pp of a full-hindsight oracle. cost/byte is exactly `count`, so once normalised by the
+/// memory it occupies the distribution is flat and no admission rule has anything to exploit.
 fn resident_degree_cap() -> i32 {
     static CAP: LazyLock<i32> = LazyLock::new(|| {
         std::env::var("NASSAU_GPU_RESIDENT_MAX_DEGREE")
