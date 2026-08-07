@@ -497,6 +497,16 @@ static BATCH_CALLS: AtomicU64 = AtomicU64::new(0);
 /// First-sight `R`s that forced an `admissible_matrices` enumeration + a `RESIDENT_HOST` write
 /// lock (see [`resident_info`]). Diffed around the pair pre-pass to attribute its cost.
 static RESIDENT_MISSES: AtomicU64 = AtomicU64::new(0);
+/// Enum-launch geometry, for sizing the grid against the device. `enumerate_admissible_kernel` is
+/// ~99% of GPU kernel time and its benchmark measured `Waves Per SM = 0.44` — i.e. it cannot fill
+/// half the machine — but that benchmark enumerates every `R` to degree 130 in ONE launch, while a
+/// production launch covers only one block-segment's transient `R`s. These say what production
+/// actually submits, which decides whether batching `R`s across launches is worth the scratch memory
+/// it would cost.
+static ENUM_LAUNCHES: AtomicU64 = AtomicU64::new(0);
+static ENUM_RS: AtomicU64 = AtomicU64::new(0);
+static ENUM_RS_MAX: AtomicU64 = AtomicU64::new(0);
+static ENUM_BLOCKS: AtomicU64 = AtomicU64::new(0);
 static BATCH_MARSHAL_US: AtomicU64 = AtomicU64::new(0);
 static BATCH_DEVICE_US: AtomicU64 = AtomicU64::new(0);
 static BATCH_PAIRS: AtomicU64 = AtomicU64::new(0);
@@ -3396,14 +3406,15 @@ fn multiply_batch_block<'a>(
                                 eco_h.clone(),
                                 emo_h.clone(),
                             ]);
+                            let enum_blocks = (n_s as u32).div_ceil(ENUM_THREADS).max(1);
+                            ENUM_LAUNCHES.fetch_add(1, Ordering::Relaxed);
+                            ENUM_RS.fetch_add(n_s as u64, Ordering::Relaxed);
+                            ENUM_RS_MAX.fetch_max(n_s as u64, Ordering::Relaxed);
+                            ENUM_BLOCKS.fetch_add(enum_blocks as u64, Ordering::Relaxed);
                             unsafe {
                                 enumerate_admissible_kernel::launch_unchecked::<CudaRuntime>(
                                     &client,
-                                    CubeCount::Static(
-                                        (n_s as u32).div_ceil(ENUM_THREADS).max(1),
-                                        1,
-                                        1,
-                                    ),
+                                    CubeCount::Static(enum_blocks, 1, 1),
                                     CubeDim::new_1d(ENUM_THREADS),
                                     BufferArg::from_raw_parts(epp_h, pp_s.len()),
                                     BufferArg::from_raw_parts(er_h, n_s),
@@ -3866,6 +3877,8 @@ fn multiply_batch_block<'a>(
                     BATCH_LAUNCH_US.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6;
                 let fence_s =
                     BATCH_FENCE_US.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6;
+                let el = ENUM_LAUNCHES.load(Ordering::Relaxed);
+                let erm = ENUM_RS_MAX.load(Ordering::Relaxed);
                 let total = (prep_s + wait_s + device_s).max(1e-9);
                 // Emit the theta->bytes curve alongside the periodic stats, not only at the end: a
                 // run that dies on an allocation must still leave behind the answer to "which theta
@@ -3877,7 +3890,9 @@ fn multiply_batch_block<'a>(
                      lock={:.0}% device={:.0}% pairs={pairs} (marshal={marshal_s:.1}s \
                      wait={wait_s:.1}s) queue={queue_s:.1}s exec={exec_s:.1}s | queue={:.0}% \
                      exec={:.0}% depth mean={:.1} max={depth_max} | launch={launch_s:.1}s \
-                     fence={fence_s:.1}s pipeline={:.0}% | intern={:.1}s basis={:.1}s tgei={:.1}s",
+                     fence={fence_s:.1}s pipeline={:.0}% | intern={:.1}s basis={:.1}s tgei={:.1}s | \
+                     enum launches={el} Rs/launch mean={:.0} max={erm} blocks/launch mean={:.0} \
+                     waves/SM={:.3}",
                     100.0 * prep_s / total,
                     100.0 * permit_s / total,
                     100.0 * lock_s / total,
@@ -3892,6 +3907,11 @@ fn multiply_batch_block<'a>(
                     BATCH_INTERN_US.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6,
                     BATCH_BASIS_US.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6,
                     BATCH_TGEI_US.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6,
+                    ENUM_RS.load(Ordering::Relaxed) as f64 / el.max(1) as f64,
+                    ENUM_BLOCKS.load(Ordering::Relaxed) as f64 / el.max(1) as f64,
+                    // 132 SMs x 24 resident blocks (the measured Block Limit Registers at 40
+                    // regs/thread) = 3168 block slots on an H200.
+                    ENUM_BLOCKS.load(Ordering::Relaxed) as f64 / el.max(1) as f64 / 3168.0,
                 );
             }
 
