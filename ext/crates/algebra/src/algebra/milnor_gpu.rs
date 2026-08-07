@@ -1035,6 +1035,11 @@ struct RStat {
     degree: i32,
     first: u64,
     last: u64,
+    /// Admissible matrices this `R` enumerates. Enumeration cost is proportional to it, so the
+    /// quantity that actually matters is `count * num_mats` — total matrices enumerated for this
+    /// `R` over the run — not `count`. A cache policy ranked on references alone is ranking on the
+    /// wrong axis: a small hot `R` and a big cold one can cost exactly the same to rebuild.
+    num_mats: u64,
 }
 
 static R_STATS: LazyLock<Option<Mutex<HashMap<PPart, RStat>>>> =
@@ -1109,8 +1114,12 @@ enum MasterMode {
     Transient,
 }
 
-fn record_r_use(p_part: PPart) {
+fn record_r_use(algebra: &MilnorAlgebra, p_part: PPart) {
     if let Some(m) = R_STATS.as_ref() {
+        // Inside the probe guard: `cold_count` memoizes, but its first call per `R` enumerates.
+        // That double-enumerates once per `R` on a probe run and costs nothing when the probe is
+        // off, which is the right trade for a diagnostic.
+        let num_mats = cold_count(algebra, p_part).2 as u64;
         let now = BATCH_CALLS.load(Ordering::Relaxed);
         let mut map = m.lock().unwrap();
         let e = map.entry(p_part).or_insert(RStat {
@@ -1118,6 +1127,7 @@ fn record_r_use(p_part: PPart) {
             degree: ppart_degree(p_part),
             first: now,
             last: now,
+            num_mats,
         });
         e.count += 1;
         e.last = now;
@@ -1235,10 +1245,64 @@ pub fn dump_r_stats() {
         }
     }
     eprintln!("[R-LORENZ] n={n} total_refs={total_refs} points(x_frac:y_frac) {curve}");
+
+    // The axis that actually matters. Enumeration cost is proportional to `num_mats`, so an `R`'s
+    // total rebuild cost over the run is `count * num_mats` — matrices enumerated, not references.
+    // Ranking a cache on references alone is ranking on the wrong quantity: a small hot `R` and a
+    // big cold one can cost the same to rebuild, and if that trade is even, the cost distribution
+    // is FLAT and no partial cache has a head to exploit (only theta, the memory dial, remains).
+    let cost = |s: &RStat| s.count * s.num_mats;
+    let mut c: Vec<&RStat> = map.values().collect();
+    c.sort_by_key(|b| std::cmp::Reverse(cost(b)));
+    let total_cost: u128 = c.iter().map(|s| cost(s) as u128).sum();
+    let ccov = |frac: f64| -> f64 {
+        let k = ((n as f64 * frac).ceil() as usize).max(1).min(n);
+        let hit: u128 = c[..k].iter().map(|s| cost(s) as u128).sum();
+        hit as f64 / total_cost.max(1) as f64 * 100.0
+    };
+    let theta = 125;
+    let (mut t_rs, mut t_refs, mut t_cost) = (0usize, 0u64, 0u128);
+    for s in &c {
+        if s.degree > theta {
+            t_rs += 1;
+            t_refs += s.count;
+            t_cost += cost(s) as u128;
+        }
+    }
+    // Within the transient set alone: is its cost concentrated, or spread evenly?
+    let tv: Vec<&RStat> = c.iter().copied().filter(|s| s.degree > theta).collect();
+    let tcov = |frac: f64| -> f64 {
+        if tv.is_empty() {
+            return 0.0;
+        }
+        let k = ((tv.len() as f64 * frac).ceil() as usize)
+            .max(1)
+            .min(tv.len());
+        let hit: u128 = tv[..k].iter().map(|s| cost(s) as u128).sum();
+        hit as f64 / t_cost.max(1) as f64 * 100.0
+    };
+    eprintln!(
+        "[R-COST] total_matrices_enumerated={total_cost} | cost coverage (all Rs) top1%={:.0}% \
+         top5%={:.0}% top10%={:.0}% top25%={:.0}% top50%={:.0}% | transient(deg>{theta}): \
+         {t_rs} Rs ({:.0}%) {t_refs} refs ({:.0}%) cost {:.0}% of total | within transient, cost \
+         coverage top1%={:.0}% top5%={:.0}% top10%={:.0}% top25%={:.0}%",
+        ccov(0.01),
+        ccov(0.05),
+        ccov(0.10),
+        ccov(0.25),
+        ccov(0.50),
+        t_rs as f64 / n as f64 * 100.0,
+        t_refs as f64 / total_refs as f64 * 100.0,
+        t_cost as f64 / total_cost.max(1) as f64 * 100.0,
+        tcov(0.01),
+        tcov(0.05),
+        tcov(0.10),
+        tcov(0.25),
+    );
 }
 
 fn resident_info(algebra: &MilnorAlgebra, p_part: PPart) -> RInfo {
-    record_r_use(p_part);
+    record_r_use(algebra, p_part);
     if let Some(info) = RESIDENT_HOST.read().unwrap().index.get(&p_part) {
         return *info;
     }
