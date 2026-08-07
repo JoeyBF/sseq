@@ -3247,6 +3247,7 @@ fn multiply_batch_block<'a>(
                                     BufferArg::from_raw_parts(cnt_scratch, n_s),
                                     enum_width,
                                     n_s,
+                                    true,
                                 );
                             }
                         }
@@ -3949,6 +3950,10 @@ fn enumerate_admissible_kernel(
     out_counts: &mut [u32],
     width: usize,
     n_r: usize,
+    // Comptime: `false` compiles the emit stores OUT entirely (not merely branches around them),
+    // isolating the odometer's cost from the cost of writing its results. Production passes `true`;
+    // only the `enum_emit_store_cost` diagnostic passes `false`.
+    #[comptime] emit: bool,
 ) {
     let ri = ABSOLUTE_POS;
     if ri >= n_r {
@@ -3997,13 +4002,15 @@ fn enumerate_admissible_kernel(
     let mut more = true;
     while more {
         // Emit the current matrix's col_sums/masks into this R's scratch slot.
-        let co = cs_base + mat * cs_len;
-        for j in 0..cs_len {
-            out_cs[co + j] = u16::cast_from(col_sums[j]);
-        }
-        let mo = mk_base + mat * mk_len;
-        for j in 0..mk_len {
-            out_mk[mo + j] = u16::cast_from(masks[j]);
+        if emit {
+            let co = cs_base + mat * cs_len;
+            for j in 0..cs_len {
+                out_cs[co + j] = u16::cast_from(col_sums[j]);
+            }
+            let mo = mk_base + mat * mk_len;
+            for j in 0..mk_len {
+                out_mk[mo + j] = u16::cast_from(masks[j]);
+            }
         }
         mat += 1;
 
@@ -4480,6 +4487,7 @@ mod tests {
                 BufferArg::from_raw_parts(cnt_h.clone(), n_r),
                 width,
                 n_r,
+                true,
             );
         }
         // Truncate off the `max(1)` padding element present when a batch has zero col_sums / masks (an
@@ -4490,6 +4498,156 @@ mod tests {
         mk.truncate(mk_total as usize);
         let counts = u32::from_bytes(&client.read_one(cnt_h).unwrap()).to_vec();
         (cs, mk, counts)
+    }
+
+    /// Diagnostic: how much of [`enumerate_admissible_kernel`]'s time is the EMIT, not the odometer?
+    ///
+    /// Two prior null results cleared the enumeration arithmetic — shrinking the per-thread local
+    /// state 3x was noise (1.884s -> 1.872s), and the anti-diagonal bitsum averages 1.19 iterations
+    /// per check (see [`masks_anti_diagonal_carries_d`]). What remains proportional to the work is
+    /// the emit: `cs_len + mk_len` (~20) scattered 2-byte global stores per matrix, at ~1.7e10
+    /// matrices for a high-degree block. Adjacent lanes write to unrelated `r_cs_out[ri]` offsets,
+    /// so essentially every store is its own transaction moving 16 bits.
+    ///
+    /// Runs the identical odometer with the stores compiled out (`emit = false` is comptime, so this
+    /// is not a predicted branch — the stores are absent from the generated code) against the real
+    /// kernel. `mat` still increments, so the enumeration and its trip count are unchanged; only the
+    /// writes differ. The gap IS the store cost.
+    #[test]
+    #[ignore = "diagnostic: needs a CUDA device; run explicitly"]
+    fn enum_emit_store_cost() {
+        use std::time::Instant;
+
+        use fp::prime::ValidPrime;
+
+        let algebra = MilnorAlgebra::new(ValidPrime::new(2), false);
+        let max_degree = 130;
+        algebra.compute_basis(max_degree);
+
+        let mut p_parts: Vec<Vec<u32>> = Vec::new();
+        for deg in 1..=max_degree {
+            for idx in 0..algebra.dimension(deg) {
+                let pp: Vec<u32> = algebra
+                    .basis_element_from_index(deg, idx)
+                    .p_part
+                    .iter()
+                    .map(|x| x as u32)
+                    .collect();
+                if !pp.is_empty() {
+                    p_parts.push(pp);
+                }
+            }
+        }
+        let num_mats: Vec<u32> = p_parts
+            .iter()
+            .map(|pp| {
+                let (_cs_len, _mk_len, _cs, mk) = enumerate_admissible_ref(pp);
+                let mk_len = pp.len()
+                    + pp.iter()
+                        .map(|&x| (u32::BITS - x.leading_zeros()) as usize)
+                        .max()
+                        .unwrap()
+                    - 1;
+                (mk.len() / mk_len) as u32
+            })
+            .collect();
+        let total_mats: u64 = num_mats.iter().map(|&m| m as u64).sum();
+
+        let (cs, mk, t_emit) =
+            time_enum::<CudaRuntime>(&Default::default(), &p_parts, &num_mats, true);
+        let (_, _, t_noemit) =
+            time_enum::<CudaRuntime>(&Default::default(), &p_parts, &num_mats, false);
+        let stores = cs as u64 + mk as u64;
+        eprintln!(
+            "enum emit cost (degree <= {max_degree}, {} R's, {total_mats} matrices, {stores} u16 \
+             stores = {:.2} GB):\n  emit=true  {:.4}s\n  emit=false {:.4}s\n  stores are {:.1}% \
+             of kernel time ({:.2}x speedup if free)",
+            p_parts.len(),
+            stores as f64 * 2.0 / 1e9,
+            t_emit,
+            t_noemit,
+            100.0 * (t_emit - t_noemit) / t_emit,
+            t_emit / t_noemit,
+        );
+    }
+
+    /// Launch [`enumerate_admissible_kernel`] with `emit` on or off and return
+    /// `(cs_total, mk_total, seconds)` — the median of several timed launches, sync'd by a small
+    /// readback so the measurement covers the kernel rather than the submission.
+    fn time_enum<R: Runtime>(
+        device: &R::Device,
+        p_parts: &[Vec<u32>],
+        num_mats: &[u32],
+        emit: bool,
+    ) -> (u64, u64, f64) {
+        use std::time::Instant;
+
+        let n_r = p_parts.len();
+        let width = p_parts.iter().map(Vec::len).max().unwrap();
+        let mut pp_flat = vec![0u32; n_r * width];
+        let mut r_rows = vec![0u32; n_r];
+        let mut r_cols = vec![0u32; n_r];
+        let mut r_cs_out = vec![0u64; n_r];
+        let mut r_mk_out = vec![0u64; n_r];
+        let (mut cs_total, mut mk_total) = (0u64, 0u64);
+        for (i, pp) in p_parts.iter().enumerate() {
+            let rows = pp.len();
+            let cols = pp
+                .iter()
+                .map(|&x| (u32::BITS - x.leading_zeros()) as usize)
+                .max()
+                .unwrap();
+            for (slot, &v) in pp_flat[i * width..i * width + rows].iter_mut().zip(pp) {
+                *slot = v;
+            }
+            r_rows[i] = rows as u32;
+            r_cols[i] = cols as u32;
+            r_cs_out[i] = cs_total;
+            r_mk_out[i] = mk_total;
+            cs_total += num_mats[i] as u64 * (cols - 1) as u64;
+            mk_total += num_mats[i] as u64 * (rows + cols - 1) as u64;
+        }
+
+        let client = R::client(device);
+        let pp_h = client.create_from_slice(u32::as_bytes(&pp_flat));
+        let rr_h = client.create_from_slice(u32::as_bytes(&r_rows));
+        let rc_h = client.create_from_slice(u32::as_bytes(&r_cols));
+        let rco_h = client.create_from_slice(u64::as_bytes(&r_cs_out));
+        let rmo_h = client.create_from_slice(u64::as_bytes(&r_mk_out));
+        let cs_cap = cs_total.max(1) as usize;
+        let mk_cap = mk_total.max(1) as usize;
+        let ocs_h = client.empty(cs_cap * size_of::<u16>());
+        let omk_h = client.empty(mk_cap * size_of::<u16>());
+        let cnt_h = client.empty(n_r * size_of::<u32>());
+
+        const THREADS: u32 = 64;
+        let cubes = (n_r as u32).div_ceil(THREADS);
+        let mut times: Vec<f64> = Vec::new();
+        for _ in 0..5 {
+            let t0 = Instant::now();
+            unsafe {
+                enumerate_admissible_kernel::launch_unchecked::<R>(
+                    &client,
+                    CubeCount::Static(cubes, 1, 1),
+                    CubeDim::new_1d(THREADS),
+                    BufferArg::from_raw_parts(pp_h.clone(), pp_flat.len()),
+                    BufferArg::from_raw_parts(rr_h.clone(), n_r),
+                    BufferArg::from_raw_parts(rc_h.clone(), n_r),
+                    BufferArg::from_raw_parts(rco_h.clone(), n_r),
+                    BufferArg::from_raw_parts(rmo_h.clone(), n_r),
+                    BufferArg::from_raw_parts(ocs_h.clone(), cs_cap),
+                    BufferArg::from_raw_parts(omk_h.clone(), mk_cap),
+                    BufferArg::from_raw_parts(cnt_h.clone(), n_r),
+                    width,
+                    n_r,
+                    emit,
+                );
+            }
+            let _ = client.read_one(cnt_h.clone()).unwrap();
+            times.push(t0.elapsed().as_secs_f64());
+        }
+        times.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        (cs_total, mk_total, times[times.len() / 2])
     }
 
     /// CPU reference for the planned *in-kernel* admissible-matrix enumeration — the direction that
@@ -4801,6 +4959,7 @@ mod tests {
                 BufferArg::from_raw_parts(cnt_h.clone(), n_r),
                 width,
                 n_r,
+                true,
             );
         }
         // Reading the tiny counts buffer blocks until the kernel completes: kernel wall time, ~no transfer.
