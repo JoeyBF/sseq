@@ -28,7 +28,7 @@ use algebra::{
 use anyhow::anyhow;
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use fp::{
-    matrix::{AugmentedMatrix, Matrix},
+    matrix::{AugmentedMatrix, Matrix, Subspace},
     prime::{Prime, TWO, ValidPrime},
     vector::{FpSlice, FpSliceMut, FpVector},
 };
@@ -1117,12 +1117,31 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
         let source_dim = source_module.dimension(t);
         let target_dim = target_module.dimension(t);
 
-        let mut matrix =
-            AugmentedMatrix::<2>::new(p, target_dim, [cc_module.dimension(t), target_dim]);
-        self.chain_maps[0].get_matrix(matrix.segment(0, 0), t);
-        matrix.segment(1, 1).add_identity();
-        matrix.row_reduce();
-        let desired_image = matrix.compute_kernel();
+        // The desired image is the kernel of the augmentation `target_module -> cc_module` in this
+        // degree. Whenever the target complex is empty in degree `t` that map has a zero-dimensional
+        // codomain, so its kernel is the whole space and no computation can discover otherwise.
+        // Taking it directly skips building and row-reducing a `target_dim x target_dim` augmented
+        // identity, where `target_dim` is `dim(A_t)` -- large enough at high `t` to reach the GPU
+        // RREF path.
+        //
+        // The guard is on the codomain being empty, not on which module is being resolved, so it is
+        // not a sphere special case: every finite target module is concentrated in finitely many
+        // degrees, so past its top cell this holds for all `t`, which is almost the whole
+        // resolution. The sphere is only the extreme of it, firing from `t = 1`.
+        //
+        // When the codomain is NON-empty the reduction is still needed, but note it is wasteful
+        // there too: the kernel has codimension at most `cc_module.dimension(t)`, typically a
+        // handful, yet we materialise a full `(target_dim - c) x target_dim` basis for it.
+        let desired_image = if cc_module.dimension(t) == 0 {
+            Subspace::entire_space(p, target_dim)
+        } else {
+            let mut matrix =
+                AugmentedMatrix::<2>::new(p, target_dim, [cc_module.dimension(t), target_dim]);
+            self.chain_maps[0].get_matrix(matrix.segment(0, 0), t);
+            matrix.segment(1, 1).add_identity();
+            matrix.row_reduce();
+            matrix.compute_kernel()
+        };
 
         let mut matrix = AugmentedMatrix::<2>::new_with_capacity(
             p,
@@ -1446,8 +1465,11 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
 
         // Eviction probe (`NASSAU_R_STATS`): dump the R-access distribution once the wavefront is done.
         #[cfg(feature = "gpu")]
-        algebra::milnor_gpu::dump_r_stats();
-        algebra::milnor_gpu::dump_master_by_degree();
+        {
+            algebra::milnor_gpu::dump_r_stats();
+            // Which theta would have fit: see `resident_degree_cap`.
+            algebra::milnor_gpu::dump_master_by_degree();
+        }
     }
 }
 
