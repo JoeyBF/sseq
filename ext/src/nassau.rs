@@ -916,6 +916,28 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
         // unchanging `dx` and the loop is parallelisable (solve independently, combine). If they do,
         // the loop is a forward substitution and must stay ordered. Comparing each read against a
         // pre-loop snapshot answers exactly that, without altering what the loop computes.
+        //
+        // MEASURED (S_2 stem 60, max_s 30, 2233 bidegrees): 27 028 of 140 614 reads — 19.2% — see a
+        // value an earlier signature wrote. So the steps are NOT independent and the loop must stay
+        // ordered: it is a forward substitution, and "solve every signature separately, then
+        // combine" would be wrong, not merely racy.
+        //
+        // That is a negative result about the LIFT only, and the lift is the cheap end. Everything
+        // above it — `sig_masks`, `sig_select` (where ~91% of `gpu_submit` lives), `sig_assemble`,
+        // `sig_row_reduce`, `sig_quasi_inverse` — reads only `full_reuse`/the differentials and
+        // never touches `dxs` or `xs`, so it CAN legally run several signatures at a time.
+        //
+        // DO NOT BOTHER: that was built (a windowed prepare stage feeding an ordered lift) and it is
+        // worthless, because the work is not spread across the signatures. Per-bidegree `step` span
+        // times over a stem-150 run, 10 738 bidegrees with >= 2 signatures:
+        //
+        //     sum of per-bidegree TOTAL signature time  4064.7 s
+        //     sum of per-bidegree MAX   signature time  3895.7 s   -> ceiling = 1.04x
+        //
+        // One signature is ~96% of its bidegree, so the ideal speedup from parallelising the loop is
+        // 4%. Measured end to end it was worse than that: a window of 4 ran 537 s against a 528 s
+        // baseline while raising mean CPU 918% -> 1306%, i.e. it burned 42% more CPU to lose 1.7%.
+        // The parallelism this resolution is missing is NOT inside a bidegree.
         let dx_snapshot: Option<Vec<FpVector>> =
             std::env::var_os("NASSAU_PROBE_SIG_INDEP").map(|_| dxs.clone());
         let mut probe_reads = 0usize;
