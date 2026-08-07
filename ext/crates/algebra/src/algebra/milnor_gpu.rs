@@ -806,6 +806,24 @@ fn gpu_count() -> usize {
 /// Kept (rather than reverted) because it is a few lines, defaults to the old behaviour exactly, and
 /// is the control that makes the "not GPU-bound" claim falsifiable on a different workload.
 ///
+/// READ THE CAVEAT BEFORE REUSING THESE NUMBERS. Every row above was measured at
+/// `NASSAU_GPU_RESIDENT_MAX_DEGREE=125`, which at stem 150 is an ARTIFICIAL WORST CASE: the same
+/// run's `[MASTER-BY-DEGREE]` reports the full master as 1.5 GB (0.4 GB/GPU), so the cap forces the
+/// transient re-enumeration path for a master that fits resident several times over. Same binary,
+/// same session, stem 150:
+///
+/// | theta | wall  | enum launches | mean CPU |
+/// |-------|-------|---------------|----------|
+/// | 125   | 575 s | 10260         | 1110%    |
+/// | none  | 202 s | 0             | 1618%    |
+///
+/// 2.85x, with the enum kernel not running at all. So roughly two thirds of the wall time in the
+/// stream sweep was enum work a sensibly-configured run at this stem never does, and any conclusion
+/// drawn from a theta-capped benchmark about where time goes is a conclusion about the cap.
+///
+/// Set theta from `[MASTER-BY-DEGREE]`, which reports exactly how many GB each cap would cost: cap
+/// only when the master genuinely does not fit, and at high stems cap as high as it does fit.
+///
 /// Safe with the shared resident master: [`RESIDENT_DEV`] is indexed per DEVICE, not per thread, so
 /// extra workers on one device reuse the same segments rather than replicating them, and the
 /// segmented append-only store is already the cross-stream-safe shape (a stable segment written in
