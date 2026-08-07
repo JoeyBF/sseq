@@ -364,6 +364,10 @@ fn restricted_partial_matrix(
     inputs: &[usize],
     target_dim: usize,
 ) -> Matrix {
+    // Spanned because this is the fallback every build below `NASSAU_GPU_MIN_WORK` takes, and it
+    // was invisible: the trace attributed 902.8 s to `extract_restricted` over 4915 GPU builds, but
+    // a stem-150 run issues ~21 500 builds, so most of them landed here and were never counted.
+    let _s = tracing::trace_span!("cpu_restricted", rows = inputs.len(), target_dim).entered();
     let mut matrix = Matrix::new(hom.prime(), inputs.len(), target_dim);
     if target_dim > 0 {
         matrix
@@ -777,9 +781,11 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
         };
 
         let guard = tracing::info_span!("step", signature = ?zero_sig).entered();
-        let next_mask: Vec<usize> = subalgebra
-            .signature_mask(&algebra, next, b.t(), &zero_sig, next_bound)
-            .collect();
+        let next_mask: Vec<usize> = tracing::trace_span!("zs_masks").in_scope(|| {
+            subalgebra
+                .signature_mask(&algebra, next, b.t(), &zero_sig, next_bound)
+                .collect()
+        });
         let next_masked_dim = next_mask.len();
 
         // When GPU reuse is active, build ONE full restricted matrix over every (restricted) source
@@ -800,18 +806,21 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
             None
         };
 
-        let full_matrix = match &full_reuse {
-            Some(full) => {
-                debug_assert!(target_mask.iter().all(|&r| r < full.rows()));
-                select_rows(full, &target_mask)
-            }
-            None => restricted_partial_matrix_maybe_gpu(
-                &self.differentials[b.s() - 1],
-                b.t(),
-                &target_mask,
-                next_dim,
-            ),
-        };
+        let full_matrix =
+            tracing::trace_span!("zs_select", rows = target_mask.len()).in_scope(|| {
+                match &full_reuse {
+                    Some(full) => {
+                        debug_assert!(target_mask.iter().all(|&r| r < full.rows()));
+                        select_rows(full, &target_mask)
+                    }
+                    None => restricted_partial_matrix_maybe_gpu(
+                        &self.differentials[b.s() - 1],
+                        b.t(),
+                        &target_mask,
+                        next_dim,
+                    ),
+                }
+            });
         let mut masked_matrix = tracing::trace_span!(
             "zs_assemble",
             rows = target_masked_dim,
@@ -859,9 +868,11 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
         // d_{s-1} share the target module `modules[b.s() - 1]`. So route it through the same
         // (GPU-offloaded, work-gated) restricted-matrix path and apply the column mask on CPU,
         // instead of `signature_matrix`'s serial per-row CPU multiply.
-        let source_mask: Vec<usize> = subalgebra
-            .signature_mask(&algebra, &self.modules[b.s()], b.t(), &zero_sig, i32::MAX)
-            .collect();
+        let source_mask: Vec<usize> = tracing::trace_span!("zs_source_mask").in_scope(|| {
+            subalgebra
+                .signature_mask(&algebra, &self.modules[b.s()], b.t(), &zero_sig, i32::MAX)
+                .collect()
+        });
         let img_full = restricted_partial_matrix_maybe_gpu(
             &self.differentials[b.s()],
             b.t(),
@@ -891,14 +902,17 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
         let mut xs = vec![FpVector::new(p, target_dim); num_new_gens];
         let mut dxs = vec![FpVector::new(p, next_dim); num_new_gens];
 
-        for ((x, x_masked), dx) in xs
-            .iter_mut()
-            .zip_eq(n.iter().skip(next_row))
-            .zip_eq(&mut dxs)
         {
-            x.as_slice_mut().add_unmasked(x_masked, 1, &target_mask);
-            for (i, _) in x_masked.iter_nonzero() {
-                dx.as_slice_mut().add(full_matrix.row(i), 1);
+            let _s = tracing::trace_span!("zs_dx_init", gens = xs.len()).entered();
+            for ((x, x_masked), dx) in xs
+                .iter_mut()
+                .zip_eq(n.iter().skip(next_row))
+                .zip_eq(&mut dxs)
+            {
+                x.as_slice_mut().add_unmasked(x_masked, 1, &target_mask);
+                for (i, _) in x_masked.iter_nonzero() {
+                    dx.as_slice_mut().add(full_matrix.row(i), 1);
+                }
             }
         }
 
