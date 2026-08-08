@@ -2409,7 +2409,15 @@ pub struct GpuProduct {
     pub r_degree: i32,
     pub r_idx: usize,
     pub s_degree: i32,
-    pub term_indices: Vec<usize>,
+    /// `Arc<[usize]>`, not `Vec<usize>`, purely so cloning a `GpuProduct` is a refcount bump.
+    ///
+    /// The terms are written once at construction and only ever read afterwards, but products get
+    /// cloned twice on the way to the device — once to compact rows into a dense range per
+    /// hot/cold group, once to fan out into per-device buckets — and with a `Vec` each of those
+    /// duplicated every term list. A call-graph profile of an uncapped stem-150 run put 5.45% of
+    /// all user cycles in `_int_free` under the drop of these vectors alone (16.1% total in the
+    /// allocator). Sharing makes the clones free and the drops O(1).
+    pub term_indices: std::sync::Arc<[usize]>,
     pub row: usize,
     pub out_offset: usize,
 }
@@ -2556,7 +2564,7 @@ pub fn cpu_multiply_batch(
         }
         let s_dim = algebra.dimension(prod.s_degree);
         let mut s = FpVector::new(p, s_dim);
-        for &ti in &prod.term_indices {
+        for &ti in prod.term_indices.iter() {
             s.set_entry(ti, 1);
         }
         let mut tmp = FpVector::new(p, block_dim);
@@ -2976,7 +2984,10 @@ fn multiply_batch_block<'a>(
         for (pi, prod) in products.iter().enumerate() {
             let (off, nt) = (term_off[pi], prod.term_indices.len());
             let base = global_base[prod.s_degree as usize];
-            for (slot, &ti) in tg_all[off..off + nt].iter_mut().zip(&prod.term_indices) {
+            for (slot, &ti) in tg_all[off..off + nt]
+                .iter_mut()
+                .zip(prod.term_indices.iter())
+            {
                 *slot = base + ti as u32;
             }
         }
