@@ -30,6 +30,44 @@ use fp::{matrix::Matrix, vector::FpVector};
 
 type NassauDifferential = FreeModuleHomomorphism<FreeModule<MilnorAlgebra>>;
 
+/// Reinterpret a GPU output row's `u32` limbs as their little-endian bytes.
+///
+/// The kernel's `u32` limbs and `fp`'s `u64` limbs are the same bit-vector in the same byte order,
+/// so this is a view, not a conversion. `fp`'s own `limb::from_bytes`/`to_bytes` take exactly this
+/// shortcut under the same `cfg`; the fallback keeps a big-endian target correct rather than
+/// silently wrong.
+///
+/// One bulk `memcpy` per row. The first cut wrote `w.to_le_bytes()` into `buf` one `u32` at a time,
+/// which a call-graph profile of an uncapped stem-150 run showed as 12.15% of ALL user cycles under
+/// `copy_from_slice` — a bounds-checked 4-byte copy per limb, thousands per row, for a region that
+/// is already byte-identical.
+fn fill_limb_bytes(buf: &mut [u8], limbs: &[u32]) {
+    #[cfg(target_endian = "little")]
+    {
+        // SAFETY: `u32` has no padding or invalid bit patterns, `u8` has alignment 1 (so a `u32`
+        // pointer is suitably aligned), and the length is the same region measured in bytes. The
+        // view borrows `limbs` and does not outlive it.
+        let src: &[u8] = unsafe {
+            std::slice::from_raw_parts(limbs.as_ptr().cast::<u8>(), std::mem::size_of_val(limbs))
+        };
+        let n = src.len().min(buf.len());
+        buf[..n].copy_from_slice(&src[..n]);
+        buf[n..].fill(0);
+    }
+    #[cfg(not(target_endian = "little"))]
+    {
+        buf.fill(0);
+        for (k, &w) in limbs.iter().enumerate() {
+            let o = k * size_of::<u32>();
+            if o >= buf.len() {
+                break;
+            }
+            let n = size_of::<u32>().min(buf.len() - o);
+            buf[o..o + n].copy_from_slice(&w.to_le_bytes()[..n]);
+        }
+    }
+}
+
 /// Whether the GPU `get_partial_matrix` path applies to this differential — the
 /// seqno-table regime (`p = 2`, trivial profile, stable), i.e. Nassau `S_2`. The
 /// (cheap, idempotent) seqno tables are built on demand in [`get_partial_matrix`].
@@ -67,17 +105,7 @@ pub fn get_partial_matrix(hom: &NassauDifferential, degree: i32, inputs: &[usize
             r => (1u64 << r) - 1,
         };
         for (row, limbs) in out.iter_rows().enumerate() {
-            let copy = (limbs.len() * size_of::<u32>()).min(nbytes);
-            for (k, &w) in limbs
-                .iter()
-                .take(copy.div_ceil(size_of::<u32>()))
-                .enumerate()
-            {
-                let o = k * size_of::<u32>();
-                let n = size_of::<u32>().min(nbytes - o);
-                buf[o..o + n].copy_from_slice(&w.to_le_bytes()[..n]);
-            }
-            buf[copy..].fill(0);
+            fill_limb_bytes(&mut buf, limbs);
             let last = nbytes - size_of::<u64>();
             let masked = u64::from_le_bytes(buf[last..].try_into().unwrap()) & tail_mask;
             buf[last..].copy_from_slice(&masked.to_le_bytes());
@@ -269,17 +297,7 @@ pub fn get_partial_matrix_restricted(
                     // Reinterpret this row's `u32` limbs as the vector's little-endian limb bytes,
                     // truncated at `target_dim` (both directions: partial final limb, and whole
                     // limbs past the restricted prefix).
-                    let copy = (limbs.len() * size_of::<u32>()).min(nbytes);
-                    for (k, &w) in limbs
-                        .iter()
-                        .take(copy.div_ceil(size_of::<u32>()))
-                        .enumerate()
-                    {
-                        let o = k * size_of::<u32>();
-                        let n = size_of::<u32>().min(nbytes - o);
-                        buf[o..o + n].copy_from_slice(&w.to_le_bytes()[..n]);
-                    }
-                    buf[copy..].fill(0);
+                    fill_limb_bytes(&mut buf, limbs);
                     let last = nbytes - size_of::<u64>();
                     let masked = u64::from_le_bytes(buf[last..].try_into().unwrap()) & tail_mask;
                     buf[last..].copy_from_slice(&masked.to_le_bytes());
