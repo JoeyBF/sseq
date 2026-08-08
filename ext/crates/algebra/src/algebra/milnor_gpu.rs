@@ -2684,13 +2684,33 @@ fn multiply_batch_grouped(
     );
     let misses_before = RESIDENT_MISSES.load(std::sync::atomic::Ordering::Relaxed);
     let prod_pairs: Vec<usize> = prepass.in_scope(|| {
+        // One-entry memo on `(r_degree, r_idx)`. `extract_restricted` emits one product per target
+        // generator block of an input row, and `R` is a property of the ROW, so consecutive products
+        // repeat the same `R` — a single slot catches all of it without a hash or an allocation.
+        //
+        // Worth doing because the lookup is not cheap: `resident_info` takes a read lock on the
+        // process-wide `RESIDENT_HOST` and SipHashes a `PPart`, and a call-graph profile of an
+        // uncapped stem-150 run put `resident_info` at 12.93% of user cycles (4.44% of it inside
+        // `RwLock::read`, plus 1.26% in `read_contended` and 3.37% in `DefaultHasher`/`RandomState`).
+        // Per DISTINCT `R` that cost is unavoidable; per PRODUCT it is pure repetition.
+        let mut memo: Option<((i32, usize), usize)> = None;
         products
             .iter()
             .map(|prod| {
-                let r = algebra.basis_element_from_index(prod.r_degree, prod.r_idx);
-                let num_mats = match mode {
-                    MasterMode::Resident => resident_info(algebra, r.p_part).num_mats as usize,
-                    MasterMode::Transient => cold_count(algebra, r.p_part).2 as usize,
+                let key = (prod.r_degree, prod.r_idx);
+                let num_mats = match memo {
+                    Some((k, v)) if k == key => v,
+                    _ => {
+                        let r = algebra.basis_element_from_index(prod.r_degree, prod.r_idx);
+                        let v = match mode {
+                            MasterMode::Resident => {
+                                resident_info(algebra, r.p_part).num_mats as usize
+                            }
+                            MasterMode::Transient => cold_count(algebra, r.p_part).2 as usize,
+                        };
+                        memo = Some((key, v));
+                        v
+                    }
                 };
                 // Threads, not pairs: one per (MATRIX_GROUP x TERM_GROUP tile).
                 num_mats.div_ceil(MATRIX_GROUP) * prod.term_indices.len().div_ceil(TERM_GROUP)
@@ -2726,14 +2746,26 @@ fn multiply_batch_grouped(
         // by `fetch_xor` into the output limbs, so the contributions commute and split freely.
         let block = &products[p0..p1];
         let mut by_dev: Vec<Vec<GpuProduct>> = vec![Vec::new(); gpu_count()];
+        // Same one-entry memo as the pre-pass, for the same reason: `R` is a property of the row,
+        // so consecutive products repeat it and each repeat would otherwise cost a global read lock
+        // and a `PPart` hash.
+        let mut dev_memo: Option<((i32, usize), usize)> = None;
         for (pi, prod) in block.iter().enumerate() {
             let d = match mode {
                 // Transient blocks enumerate their own master into per-launch scratch, so they are
                 // device-agnostic; spread them round-robin instead of piling onto device 0.
                 MasterMode::Transient => pi % gpu_count(),
                 MasterMode::Resident => {
-                    let r = algebra.basis_element_from_index(prod.r_degree, prod.r_idx);
-                    resident_info(algebra, r.p_part).dev as usize
+                    let key = (prod.r_degree, prod.r_idx);
+                    match dev_memo {
+                        Some((k, v)) if k == key => v,
+                        _ => {
+                            let r = algebra.basis_element_from_index(prod.r_degree, prod.r_idx);
+                            let v = resident_info(algebra, r.p_part).dev as usize;
+                            dev_memo = Some((key, v));
+                            v
+                        }
+                    }
                 }
             };
             by_dev[d].push(prod.clone());
