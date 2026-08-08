@@ -2638,16 +2638,26 @@ fn multiply_batch_gpu_inner(
             })
             .collect();
         let sub_blocks = multiply_batch_grouped(algebra, num_cols, rows.len(), &compact, mode);
-        let sub: Vec<u32> = sub_blocks
-            .iter()
-            .flat_map(|b| u32::from_bytes(b).iter().copied())
-            .collect();
-        for (i, &orig) in rows.iter().enumerate() {
-            let (dst, src) = (orig * num_limbs, i * num_limbs);
-            for k in 0..num_limbs {
-                result[dst + k] ^= sub[src + k];
+        // Scatter straight out of the device blocks. The first cut flattened them into one
+        // `Vec<u32>` first, which allocated and copied the ENTIRE group output — hundreds of MB at
+        // the stems that actually need eviction — only to read it once and drop it. Blocks are
+        // whole rows of `num_limbs` each, in compacted row order, so walking them in `num_limbs`
+        // chunks visits exactly the rows `rows` names, in the same order.
+        let mut i = 0usize;
+        for b in &sub_blocks {
+            for chunk in u32::from_bytes(b).chunks(num_limbs) {
+                let dst = rows[i] * num_limbs;
+                for (k, &v) in chunk.iter().enumerate() {
+                    result[dst + k] ^= v;
+                }
+                i += 1;
             }
         }
+        debug_assert_eq!(
+            i,
+            rows.len(),
+            "block rows must cover the compacted row set exactly"
+        );
     }
     BatchOutput::from_limbs(result, num_limbs)
 }
