@@ -1207,6 +1207,38 @@ static R_STATS: LazyLock<Option<Mutex<HashMap<PPart, RStat>>>> =
 ///
 /// Deterministic across runs and processes — the same `R` always lands on the same device, which
 /// the sharded resident master requires and which keeps a run reproducible.
+/// Pin any `R` with at least this many admissible matrices into the RESIDENT master, whatever its
+/// degree (`NASSAU_GPU_PIN_MIN_MATS`, default 0 = disabled, i.e. degree is the only criterion).
+///
+/// The point is an asymmetry between what costs memory and what costs time. Master BYTES are a SUM
+/// over `R`s, but a transient enum launch's DURATION is the MAX over the `R`s in it — ncu at
+/// production geometry shows launches of 3-104 blocks taking 7-100 ms at 1.56% occupancy, their
+/// length set by the single longest odometer chain. So the long-pole `R`s dominate time while
+/// contributing almost nothing to size. Measured over the 75 379 `R`s of a stem-150 run:
+///
+/// | threshold | `R`s pinned | extra master |
+/// |-----------|-------------|--------------|
+/// | 20000     | 126         | ~0.12 GB     |
+/// | 10000     | 717         | ~0.42 GB     |
+/// | 5000      | 2297        | ~0.83 GB     |
+/// | 2000      | 6739        | ~1.34 GB     |
+///
+/// Against a 143 GB card and a master that reaches 24 GB/GPU at stem 200, that is free. This is the
+/// one lever consistent with the max model: de-duplicating enum work across devices removed 36% of
+/// all enumerations and bought nothing, because it shortened no chain.
+///
+/// Costs one host enumeration per newly-pinned `R` (via `resident_info`), amortised over every later
+/// launch that would have re-enumerated it on the device.
+fn pin_min_mats() -> u64 {
+    static T: LazyLock<u64> = LazyLock::new(|| {
+        std::env::var("NASSAU_GPU_PIN_MIN_MATS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(0)
+    });
+    *T
+}
+
 fn shard_of(p_part: PPart) -> usize {
     (shard_hash(p_part) % gpu_count() as u64) as usize
 }
@@ -2636,15 +2668,26 @@ fn multiply_batch_gpu_inner(
     // any, comes from the caller's CPU identity path).
     let num_limbs = num_cols.div_ceil(32).max(1);
     let mut result = vec![0u32; num_rows * num_limbs];
+    // Above-cap `R`s that are long enough to be pinned resident anyway (see [`pin_min_mats`]).
+    // Resolved once per call rather than per product: `cold_count` memoizes, but the lookup still
+    // costs a lock and a hash, and the same `R` recurs across most products.
+    let pin = pin_min_mats();
+    let pinned = |d: i32, r_idx: usize| -> bool {
+        if pin == 0 || d <= cap {
+            return false;
+        }
+        let r = algebra.basis_element_from_index(d, r_idx);
+        cold_count(algebra, r.p_part).2 as u64 >= pin
+    };
     for mode in [MasterMode::Resident, MasterMode::Transient] {
-        let is_group = |d: i32| match mode {
-            MasterMode::Resident => d <= cap,
-            MasterMode::Transient => d > cap,
+        let is_group = |d: i32, r_idx: usize| match mode {
+            MasterMode::Resident => d <= cap || pinned(d, r_idx),
+            MasterMode::Transient => d > cap && !pinned(d, r_idx),
         };
         // Distinct rows this group touches, in order (products are row-major, so already sorted).
         let mut rows: Vec<usize> = products
             .iter()
-            .filter(|p| is_group(p.r_degree))
+            .filter(|p| is_group(p.r_degree, p.r_idx))
             .map(|p| p.row)
             .collect();
         rows.dedup();
@@ -2654,7 +2697,7 @@ fn multiply_batch_gpu_inner(
         let remap: HashMap<usize, usize> = rows.iter().enumerate().map(|(i, &r)| (r, i)).collect();
         let compact: Vec<GpuProduct> = products
             .iter()
-            .filter(|p| is_group(p.r_degree))
+            .filter(|p| is_group(p.r_degree, p.r_idx))
             .map(|p| {
                 let mut q = p.clone();
                 q.row = remap[&p.row];
