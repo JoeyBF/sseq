@@ -72,6 +72,30 @@ const ENUM_COL_CAP: usize = PPart::width(0) as usize;
 const ENUM_MATRIX_CAP: usize = ENUM_ROW_CAP * ENUM_COL_CAP;
 const ENUM_MASK_CAP: usize = ENUM_ROW_CAP + ENUM_COL_CAP;
 
+/// Threads per block for [`enumerate_admissible_kernel`], and the stride of its shared-memory state.
+///
+/// 32, not the 256 this used to launch, because the per-thread enumeration state now lives in shared
+/// memory: 152 `u32` per thread (`matrix` 110 + `totals` 10 + `col_sums` 11 + `masks` 21) is 608 B,
+/// so 32 threads is 19.5 KB of the 48 KB static budget while 256 would need 155 KB.
+///
+/// Trading occupancy for shared memory is normally a bad deal, and when this was first tried on the
+/// all-`R` benchmark it WAS: it cut warp cycles per issued instruction 8.90 -> 5.92 (-33%) but
+/// dropped active warps per scheduler 2.09 -> 1.61 and lost overall. That benchmark enumerates every
+/// `R` to degree 130 in ONE launch (1397 blocks), where occupancy is the binding constraint.
+/// PRODUCTION IS NOT THAT: a real launch is ~6 blocks against the H200's 3168 slots
+/// (`Waves Per SM = 0.002`), so there is no occupancy to lose — the SMs are empty either way. The
+/// block-size sweep measured 256/64/32 threads at 561/569/542 s, i.e. flat, which is the same fact
+/// from the other side: grid width does not set this kernel's time.
+const ENUM_BLOCK: u32 = 32;
+
+/// Offsets of each per-thread array within the shared state, in units of "one element per thread".
+/// Layout is `elem * ENUM_BLOCK + UNIT_POS`, so the lanes of a warp touch consecutive words — one
+/// word per bank, conflict-free, and the reason the stride is the block size rather than 1.
+const ENUM_ST_TOTALS: usize = ENUM_MATRIX_CAP;
+const ENUM_ST_COLSUMS: usize = ENUM_ST_TOTALS + ENUM_ROW_CAP;
+const ENUM_ST_MASKS: usize = ENUM_ST_COLSUMS + ENUM_COL_CAP;
+const ENUM_STATE: usize = ENUM_ST_MASKS + ENUM_MASK_CAP;
+
 /// Target `(product, matrix, term)` thread-pairs per GPU launch. The batch multiply indexes threads
 /// by CubeCL's `ABSOLUTE_POS` (a `u32`), so one launch can address at most `2^32` threads; a single
 /// all-rows reuse build reaches ~4.4e9 pairs at stem ~145, past that limit. The row-block splitter
@@ -3512,7 +3536,8 @@ fn multiply_batch_block<'a>(
                         // The enumeration launch is issued before the multiply on this same stream, so the
                         // scratch is fully written when the multiply reads it (one-stream launches are
                         // ordered, as with `zero_u32` below).
-                        const ENUM_THREADS: u32 = 256;
+                        // Must match the kernel's shared-memory stride exactly.
+                        const ENUM_THREADS: u32 = ENUM_BLOCK;
                         // One allocation per segment, and one enumeration launch per segment over the
                         // `R`s the layout pass placed there. Every `R` sits wholly inside its segment
                         // with `col_sums` and `masks` in the same-numbered one, so each launch keeps
@@ -4393,10 +4418,13 @@ fn enumerate_admissible_kernel(
 
     // Per-thread local state, mirroring `AdmissibleMatrix` / `enumerate_admissible_ref`. CUDA local
     // arrays are uninitialized, so every slot up to the comptime cap is explicitly zeroed first.
-    let mut matrix = Array::<u32>::new(ENUM_MATRIX_CAP);
-    let mut totals = Array::<u32>::new(ENUM_ROW_CAP);
-    let mut col_sums = Array::<u32>::new(ENUM_COL_CAP);
-    let mut masks = Array::<u32>::new(ENUM_MASK_CAP);
+    // Shared memory, not `Array` — `Array` is CUDA *local* memory, and because every index here is
+    // a runtime value none of it can be register-allocated. ncu attributed 45.6% of this kernel's
+    // 8.9 stall cycles to waiting on those local accesses. See [`ENUM_BLOCK`] for why the occupancy
+    // this costs is free in production even though it was not on the benchmark.
+    let tid = usize::cast_from(UNIT_POS);
+    let bs = ENUM_BLOCK as usize;
+    let mut st = Shared::<[u32]>::new_slice(ENUM_STATE * ENUM_BLOCK as usize);
     // Zero only the region this `R` can actually reach, not the whole comptime cap. Every index the
     // enumeration below forms is bounded by these: `matrix` by `row*cols+col < rows*cols`, `totals`
     // by `rows`, `col_sums` by `cols-1 == cs_len`, and `masks` by `(rows-1)+(cols-1) < mk_len`. A
@@ -4404,22 +4432,22 @@ fn enumerate_admissible_kernel(
     // clearing the full arrays spent most of these stores on slots no read ever touches — and they
     // are local-memory stores, not register writes.
     for i in 0..rows * cols {
-        matrix[i] = 0u32;
+        st[(i) * bs + tid] = 0u32;
     }
     for i in 0..rows {
-        totals[i] = 0u32;
+        st[(ENUM_ST_TOTALS + i) * bs + tid] = 0u32;
     }
     for i in 0..cs_len {
-        col_sums[i] = 0u32;
+        st[(ENUM_ST_COLSUMS + i) * bs + tid] = 0u32;
     }
     for i in 0..mk_len {
-        masks[i] = 0u32;
+        st[(ENUM_ST_MASKS + i) * bs + tid] = 0u32;
     }
     // Column 0 of the matrix (and the initial masks) is the padded p_part.
     for i in 0..rows {
         let x = p_parts[pbase + i];
-        matrix[i * cols] = x;
-        masks[i] = x;
+        st[(i * cols) * bs + tid] = x;
+        st[(ENUM_ST_MASKS + i) * bs + tid] = x;
     }
 
     let mut mat = 0usize;
@@ -4433,31 +4461,33 @@ fn enumerate_admissible_kernel(
         if emit == 1 {
             let co = cs_base + mat * cs_len;
             for j in 0..cs_len {
-                out_cs[co + j] = u16::cast_from(col_sums[j]);
+                out_cs[co + j] = u16::cast_from(st[(ENUM_ST_COLSUMS + j) * bs + tid]);
             }
             let mo = mk_base + mat * mk_len;
             for j in 0..mk_len {
-                out_mk[mo + j] = u16::cast_from(masks[j]);
+                out_mk[mo + j] = u16::cast_from(st[(ENUM_ST_MASKS + j) * bs + tid]);
             }
         } else if emit == 2 {
             let w = usize::cast_from(wrap);
             for j in 0..cs_len {
-                out_cs[(ri + n_r * (mat * cs_len + j)) & w] = u16::cast_from(col_sums[j]);
+                out_cs[(ri + n_r * (mat * cs_len + j)) & w] =
+                    u16::cast_from(st[(ENUM_ST_COLSUMS + j) * bs + tid]);
             }
             for j in 0..mk_len {
-                out_mk[(ri + n_r * (mat * mk_len + j)) & w] = u16::cast_from(masks[j]);
+                out_mk[(ri + n_r * (mat * mk_len + j)) & w] =
+                    u16::cast_from(st[(ENUM_ST_MASKS + j) * bs + tid]);
             }
         } else if emit == 3 {
             let co = cs_base + mat * cs_len;
             let mut j = 0usize;
             while j < cs_len {
-                out_cs[co + j] = u16::cast_from(col_sums[j]);
+                out_cs[co + j] = u16::cast_from(st[(ENUM_ST_COLSUMS + j) * bs + tid]);
                 j += 2;
             }
             let mo = mk_base + mat * mk_len;
             let mut j2 = 0usize;
             while j2 < mk_len {
-                out_mk[mo + j2] = u16::cast_from(masks[j2]);
+                out_mk[mo + j2] = u16::cast_from(st[(ENUM_ST_MASKS + j2) * bs + tid]);
                 j2 += 2;
             }
         }
@@ -4469,12 +4499,12 @@ fn enumerate_admissible_kernel(
         let mut row = 0usize;
         while row < rows && !found {
             let mut p_to_the_j = 1u32;
-            totals[row] = matrix[row * cols];
+            st[(ENUM_ST_TOTALS + row) * bs + tid] = st[(row * cols) * bs + tid];
             let mut col = 1usize;
             while col < cols && !found {
                 p_to_the_j *= 2u32;
                 let mut handled = false;
-                if p_to_the_j <= totals[row] {
+                if p_to_the_j <= st[(ENUM_ST_TOTALS + row) * bs + tid] {
                     // Bitsum along the anti-diagonal to the bottom-left (saturating start index).
                     let mut d = 0u32;
                     let mut c = 0usize;
@@ -4482,50 +4512,62 @@ fn enumerate_admissible_kernel(
                         c = row + col + 1 - rows;
                     }
                     while c < col {
-                        d |= matrix[(row + col - c) * cols + c];
+                        d |= st[((row + col - c) * cols + c) * bs + tid];
                         c += 1;
                     }
-                    let cur = matrix[row * cols + col];
+                    let cur = st[(row * cols + col) * bs + tid];
                     let new_entry = ((cur | d) + 1u32) & !d;
                     let inc = new_entry - cur;
                     let sub = inc * p_to_the_j;
-                    if totals[row] < sub {
-                        totals[row] += p_to_the_j * cur;
+                    if st[(ENUM_ST_TOTALS + row) * bs + tid] < sub {
+                        st[(ENUM_ST_TOTALS + row) * bs + tid] =
+                            st[(ENUM_ST_TOTALS + row) * bs + tid] + p_to_the_j * cur;
                         handled = true;
                     } else {
-                        matrix[row * cols] = totals[row] - sub;
-                        masks[row] = matrix[row * cols];
-                        col_sums[col - 1] += inc;
+                        st[(row * cols) * bs + tid] = st[(ENUM_ST_TOTALS + row) * bs + tid] - sub;
+                        st[(ENUM_ST_MASKS + row) * bs + tid] = st[(row * cols) * bs + tid];
+                        st[(ENUM_ST_COLSUMS + col - 1) * bs + tid] =
+                            st[(ENUM_ST_COLSUMS + col - 1) * bs + tid] + inc;
                         let mut j = 1usize;
                         while j < col {
-                            masks[row + j] &= !matrix[row * cols + j];
-                            col_sums[j - 1] -= matrix[row * cols + j];
-                            matrix[row * cols + j] = 0u32;
+                            st[(ENUM_ST_MASKS + row + j) * bs + tid] = st
+                                [(ENUM_ST_MASKS + row + j) * bs + tid]
+                                & !st[(row * cols + j) * bs + tid];
+                            st[(ENUM_ST_COLSUMS + j - 1) * bs + tid] = st
+                                [(ENUM_ST_COLSUMS + j - 1) * bs + tid]
+                                - st[(row * cols + j) * bs + tid];
+                            st[(row * cols + j) * bs + tid] = 0u32;
                             j += 1;
                         }
-                        matrix[row * cols + col] = new_entry;
+                        st[(row * cols + col) * bs + tid] = new_entry;
                         let mut i = 0usize;
                         while i < row {
-                            matrix[i * cols] = totals[i];
-                            masks[i] = totals[i];
+                            st[(i * cols) * bs + tid] = st[(ENUM_ST_TOTALS + i) * bs + tid];
+                            st[(ENUM_ST_MASKS + i) * bs + tid] =
+                                st[(ENUM_ST_TOTALS + i) * bs + tid];
                             let mut j2 = 1usize;
                             while j2 < cols {
                                 if i + j2 > row {
-                                    masks[i + j2] &= !matrix[i * cols + j2];
+                                    st[(ENUM_ST_MASKS + i + j2) * bs + tid] = st
+                                        [(ENUM_ST_MASKS + i + j2) * bs + tid]
+                                        & !st[(i * cols + j2) * bs + tid];
                                 }
-                                col_sums[j2 - 1] -= matrix[i * cols + j2];
-                                matrix[i * cols + j2] = 0u32;
+                                st[(ENUM_ST_COLSUMS + j2 - 1) * bs + tid] = st
+                                    [(ENUM_ST_COLSUMS + j2 - 1) * bs + tid]
+                                    - st[(i * cols + j2) * bs + tid];
+                                st[(i * cols + j2) * bs + tid] = 0u32;
                                 j2 += 1;
                             }
                             i += 1;
                         }
-                        masks[row + col] = d | new_entry;
+                        st[(ENUM_ST_MASKS + row + col) * bs + tid] = d | new_entry;
                         found = true;
                         handled = true;
                     }
                 }
                 if !handled {
-                    totals[row] += p_to_the_j * matrix[row * cols + col];
+                    st[(ENUM_ST_TOTALS + row) * bs + tid] = st[(ENUM_ST_TOTALS + row) * bs + tid]
+                        + p_to_the_j * st[(row * cols + col) * bs + tid];
                 }
                 col += 1;
             }
@@ -4919,7 +4961,7 @@ mod tests {
         let omk_h = client.empty(mk_cap * size_of::<u16>());
         let cnt_h = client.empty(n_r * size_of::<u32>());
 
-        const THREADS: u32 = 64;
+        const THREADS: u32 = ENUM_BLOCK; // must match the kernel's shared stride
         let cubes = (n_r as u32).div_ceil(THREADS);
         unsafe {
             enumerate_admissible_kernel::launch_unchecked::<R>(
@@ -5084,7 +5126,7 @@ mod tests {
             (1u64 << (63 - lim.leading_zeros().min(62))).min(lim) as u32 - 1
         };
 
-        const THREADS: u32 = 64;
+        const THREADS: u32 = ENUM_BLOCK; // must match the kernel's shared stride
         let cubes = (n_r as u32).div_ceil(THREADS);
         let mut times: Vec<f64> = Vec::new();
         for _ in 0..5 {
@@ -5406,7 +5448,7 @@ mod tests {
         let cnt_h = client.empty(n_r * size_of::<u32>());
         let marshal_s = t_marshal.elapsed().as_secs_f64();
 
-        const THREADS: u32 = 64;
+        const THREADS: u32 = ENUM_BLOCK; // must match the kernel's shared stride
         let cubes = (n_r as u32).div_ceil(THREADS);
         let t_kernel = Instant::now();
         unsafe {
@@ -6182,7 +6224,7 @@ mod tests {
         for prod in &products {
             let s_dim = algebra.dimension(prod.s_degree);
             let mut s = FpVector::new(p, s_dim);
-            for &ti in &prod.term_indices {
+            for &ti in prod.term_indices.iter() {
                 s.set_entry(ti, 1);
             }
             let mut tmp = FpVector::new(p, out_dim);
@@ -6287,7 +6329,7 @@ mod tests {
         for prod in &products {
             let s_dim = algebra.dimension(prod.s_degree);
             let mut s = FpVector::new(p, s_dim);
-            for &ti in &prod.term_indices {
+            for &ti in prod.term_indices.iter() {
                 s.set_entry(ti, 1);
             }
             let mut tmp = FpVector::new(p, out_dim);
@@ -6453,7 +6495,7 @@ mod tests {
                 (0..num_rows).map(|_| FpVector::new(p, out_dim)).collect();
             for prod in &products {
                 let mut s = FpVector::new(p, algebra.dimension(prod.s_degree));
-                for &ti in &prod.term_indices {
+                for &ti in prod.term_indices.iter() {
                     s.set_entry(ti, 1);
                 }
                 let mut tmp = FpVector::new(p, out_dim);
