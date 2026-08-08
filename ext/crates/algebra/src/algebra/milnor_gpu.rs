@@ -1229,6 +1229,24 @@ static R_STATS: LazyLock<Option<Mutex<HashMap<PPart, RStat>>>> =
 ///
 /// Costs one host enumeration per newly-pinned `R` (via `resident_info`), amortised over every later
 /// launch that would have re-enumerated it on the device.
+///
+/// NOT SHOWN TO CARRY ABOVE STEM 200. Stem 250 cannot be A/B'd to completion: `t` advanced ~1 degree
+/// per 10 min at `t ~ 305` and was still slowing, so a full-height run is days per arm — and
+/// `max_s = 40` is the SAME run, because everything above `s = 40` is negligible. Compared instead
+/// by fixed 15-minute windows, two rounds with arms alternating:
+///
+/// | metric (mean) | PIN=0   | PIN=2000        |
+/// |---------------|---------|-----------------|
+/// | pairs         | 1.54e13 | 2.84e13 (1.84x) |
+/// | calls         | 552 000 | 892 000         |
+/// | bidegrees     | 7968    | 8142 (+2.2%)    |
+/// | max t         | 231     | 222             |
+///
+/// It nearly doubles GPU work throughput while completing ~2% more bidegrees and reaching LOWER `t`.
+/// Those contradict, so `pairs` is not a progress measure here — more work is not progress if it is
+/// different work. The 13.6% seen at stem 150 is NOT reproduced at stem 250. The honest state is
+/// "unproven above stem 200", neither works nor does not; settling it needs a completed stem-250 run
+/// per arm, i.e. days of machine time.
 fn pin_min_mats() -> u64 {
     static T: LazyLock<u64> = LazyLock::new(|| {
         std::env::var("NASSAU_GPU_PIN_MIN_MATS")
