@@ -2788,6 +2788,22 @@ fn multiply_batch_grouped(
             let d = match mode {
                 // Transient blocks enumerate their own master into per-launch scratch, so they are
                 // device-agnostic; spread them round-robin instead of piling onto device 0.
+                //
+                // TRIED AND REVERTED: hashing `R` to a device here (`shard_of`, as `Resident` does)
+                // so each distinct `R` enumerates exactly ONCE per block instead of being scattered
+                // across up to `gpu_count()` devices that each enumerate it. The mechanism works —
+                // `Rs/launch` fell 1293 -> 832, i.e. 36% of all `R`-enumerations removed (13.3M ->
+                // 8.5M) — and it bought NOTHING: 372.0 s against 373.0 s over three interleaved
+                // rounds, and only 2.6% off peak GPU memory (129.4 -> 126.0 GB).
+                //
+                // That is the max-versus-sum lesson, and it generalises: an ncu profile at
+                // PRODUCTION geometry shows a launch is 3-104 blocks of 32 threads taking 7-100 ms
+                // at 1.56% achieved occupancy, i.e. its duration is set by its LONGEST single `R`
+                // chain, not by how many `R`s it enumerates. Deduplicating work off the non-critical
+                // chains cannot move a maximum. Only shortening the longest chain can — by
+                // splitting it (needs an unrank to jump to the k-th admissible matrix, since the
+                // odometer derives each from the previous) or by keeping the longest `R`s resident
+                // so they are never re-enumerated at all.
                 MasterMode::Transient => pi % gpu_count(),
                 MasterMode::Resident => {
                     let key = (prod.r_degree, prod.r_idx);
