@@ -1257,6 +1257,133 @@ fn pin_min_mats() -> u64 {
     *T
 }
 
+/// Highest `R` degree any launch has asked for so far — the enumeration frontier, which the
+/// prefetcher runs ahead of.
+static PREFETCH_FRONTIER: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+/// How many internal degrees ahead of the frontier to pre-enumerate (`NASSAU_GPU_PREFETCH_AHEAD`,
+/// default 0 = disabled). Requires [`pin_min_mats`] > 0, which selects WHICH `R`s are worth it.
+fn prefetch_ahead() -> i32 {
+    static A: LazyLock<i32> = LazyLock::new(|| {
+        std::env::var("NASSAU_GPU_PREFETCH_AHEAD")
+            .ok()
+            .and_then(|v| v.parse::<i32>().ok())
+            .unwrap_or(0)
+            .max(0)
+    });
+    *A
+}
+
+/// Host-memory ceiling for the prefetcher (`NASSAU_GPU_PREFETCH_MAX_GB`, default 8). It stops
+/// enumerating ahead once the host master passes this; the wavefront keeps working either way.
+fn prefetch_max_bytes() -> usize {
+    static B: LazyLock<usize> = LazyLock::new(|| {
+        std::env::var("NASSAU_GPU_PREFETCH_MAX_GB")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(8)
+            << 30
+    });
+    *B
+}
+
+/// Enumerate expensive `R`s BEFORE anything waits on them.
+///
+/// The `R`s a bidegree needs are `Sq(R)` with `deg R = t - deg(gen)`, i.e. Milnor basis elements of
+/// degree `< t`. That set is a function of DEGREE ALONE — it does not depend on the resolution's
+/// content — so it is not a prefetch heuristic but a schedule that can be computed exactly, as far
+/// ahead as memory allows.
+///
+/// Why it should beat pinning on demand ([`pin_min_mats`]): the pin still pays the FIRST TOUCH
+/// synchronously, because `resident_info` runs `admissible_matrices` on the host inside
+/// `pair_prepass`, on the critical path. It therefore only wins where an `R` recurs often enough to
+/// amortise that — which is why it measured -13.6% at stem 150 and nothing at stem 250, where there
+/// are more distinct `R`s and less recurrence each. Doing the same work on a spare thread ahead of
+/// demand removes the first touch instead of amortising it.
+///
+/// Cost-ranked, not degree-ranked: enumeration time and master bytes both scale with `num_mats`, but
+/// the COUNT of expensive `R`s is tiny — at stem 150, `num_mats >= 20000` is 126 `R`s (~0.12 GB) and
+/// `>= 2000` is 6739 (~1.34 GB). The long poles are individually huge and collectively cheap; the
+/// mass of medium `R`s is what fills the master, and those are left to the transient path.
+///
+/// Deliberately reuses the resident master rather than adding a store: a prefetched `R` is just an
+/// `R` that arrived early, so `resident_info` serves it unchanged and `pinned()` already routes it.
+/// That keeps this a scheduling change, which is what makes it cheap to abandon if it does not pay.
+///
+/// MEASURED AND NEUTRAL SO FAR — and the reason matters, because it says what to test next.
+/// Interleaved, 3 rounds, theta=125 / stem 150, BOTH arms at `PIN_MIN_MATS=2000`:
+///
+///     ahead=0    354, 367, 325   mean 348.7 s
+///     ahead=25   354, 331, 340   mean 341.7 s   (2%, inside noise; rounds split)
+///
+/// The prefetcher demonstrably ran (47-51k `R`s stored, reaching degree 163-165, i.e. 25 ahead).
+/// It bought nothing because the experiment could not: with the pin on, those `R`s were routed
+/// Resident in BOTH arms, so the GPU enum work was identical and only the HOST enumeration moved.
+/// The host has 128 cores at ~7% utilisation, so moving work earlier on it is free either way — the
+/// first-touch cost was never the bottleneck.
+///
+/// The test that WOULD show prefetch's value is a lower pin threshold: prefetching is what makes
+/// aggressive pinning affordable, so compare `PIN=2000` against `PIN=200 + prefetch` under a fixed
+/// memory budget. The win, if any, comes from MORE `R`s being resident (less GPU enumeration), not
+/// from when the host enumerated them.
+fn start_prefetch(algebra: &Arc<MilnorAlgebra>) {
+    if prefetch_ahead() == 0 || pin_min_mats() == 0 {
+        return;
+    }
+    static ONCE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    ONCE.get_or_init(|| {
+        let alg = Arc::clone(algebra);
+        std::thread::Builder::new()
+            .name("nassau-prefetch".to_string())
+            .spawn(move || {
+                let mut done_to = 0i32;
+                loop {
+                    let frontier = PREFETCH_FRONTIER.load(Ordering::Relaxed);
+                    let target = frontier + prefetch_ahead();
+                    if frontier == 0 || done_to >= target {
+                        std::thread::sleep(std::time::Duration::from_millis(200));
+                        continue;
+                    }
+                    if resident_host_bytes().0 >= prefetch_max_bytes() {
+                        std::thread::sleep(std::time::Duration::from_secs(2));
+                        continue;
+                    }
+                    let d = done_to.max(frontier) + 1;
+                    alg.compute_basis(d);
+                    let n = alg.dimension(d);
+                    for i in 0..n {
+                        let r = alg.basis_element_from_index(d, i);
+                        if r.p_part.is_empty() {
+                            continue;
+                        }
+                        // `cold_count` memoizes the shape without keeping the arrays, so this is the
+                        // cheap way to ask "is this one of the expensive ones?" before committing to
+                        // storing it.
+                        if cold_count(&alg, r.p_part).2 as u64 >= pin_min_mats() {
+                            resident_info(&alg, r.p_part);
+                            PREFETCHED.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                    done_to = d;
+                    PREFETCH_DEGREE.store(d, Ordering::Relaxed);
+                }
+            })
+            .expect("failed to spawn the prefetch thread");
+    });
+}
+
+/// Diagnostics: how many `R`s the prefetcher stored, and how far ahead it has reached.
+static PREFETCHED: AtomicU64 = AtomicU64::new(0);
+static PREFETCH_DEGREE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+/// `(R`s prefetched, degree reached)` for the `[batch-stats]` line.
+pub fn prefetch_stats() -> (u64, i32) {
+    (
+        PREFETCHED.load(Ordering::Relaxed),
+        PREFETCH_DEGREE.load(Ordering::Relaxed),
+    )
+}
+
 fn shard_of(p_part: PPart) -> usize {
     (shard_hash(p_part) % gpu_count() as u64) as usize
 }
@@ -2587,6 +2714,12 @@ pub fn multiply_batch_on_gpu(
     num_rows: usize,
     products: &[GpuProduct],
 ) -> BatchOutput {
+    // Start the prefetcher on first use (no-op unless enabled) and tell it how far the wavefront has
+    // got. `r_degree` is the `R` degree this launch needs, so its max IS the enumeration frontier.
+    start_prefetch(algebra);
+    if let Some(m) = products.iter().map(|p| p.r_degree).max() {
+        PREFETCH_FRONTIER.fetch_max(m, Ordering::Relaxed);
+    }
     // The CPU fallback that used to live here (catch the launch failure, latch [`GPU_DISABLED`],
     // finish the run on the CPU) was removed deliberately: it turned a hard GPU fault into a silent
     // ~100x slowdown, so a crashing run still reported "completed" and every A/B measurement had to
@@ -4130,12 +4263,14 @@ fn multiply_batch_block<'a>(
                     BATCH_FENCE_US.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6;
                 let el = ENUM_LAUNCHES.load(Ordering::Relaxed);
                 let erm = ENUM_RS_MAX.load(Ordering::Relaxed);
+                let (pf_n, pf_d) = prefetch_stats();
                 let total = (prep_s + wait_s + device_s).max(1e-9);
                 // Emit the theta->bytes curve alongside the periodic stats, not only at the end: a
                 // run that dies on an allocation must still leave behind the answer to "which theta
                 // would have fit", which is the whole point of collecting it.
                 dump_master_by_degree();
                 eprintln!(
+                    // Prefetcher progress: 0/0 means it is off (the default).
                     "[batch-stats] calls={calls} prep={prep_s:.1}s permit={permit_s:.1}s \
                      lock={lock_s:.1}s device={device_s:.1}s | prep={:.0}% permit={:.0}% \
                      lock={:.0}% device={:.0}% pairs={pairs} (marshal={marshal_s:.1}s \
@@ -4143,7 +4278,7 @@ fn multiply_batch_block<'a>(
                      exec={:.0}% depth mean={:.1} max={depth_max} | launch={launch_s:.1}s \
                      fence={fence_s:.1}s pipeline={:.0}% | intern={:.1}s basis={:.1}s tgei={:.1}s \
                      | enum launches={el} Rs/launch mean={:.0} max={erm} blocks/launch mean={:.0} \
-                     waves/SM={:.3}",
+                     waves/SM={:.3} | prefetched={pf_n} to_degree={pf_d}",
                     100.0 * prep_s / total,
                     100.0 * permit_s / total,
                     100.0 * lock_s / total,
