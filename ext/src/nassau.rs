@@ -796,12 +796,46 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
             && reuse_within_cap(target_dim, next_dim)
         {
             let all_rows: Vec<usize> = (0..target_dim).collect();
-            Some(restricted_partial_matrix_maybe_gpu(
+            let full = restricted_partial_matrix_maybe_gpu(
                 &self.differentials[b.s() - 1],
                 b.t(),
                 &all_rows,
                 next_dim,
-            ))
+            );
+            // `NASSAU_SPLIT_VERIFY`: check the ROW-BLOCK DECOMPOSITION empirically.
+            //
+            // The speculative plan for capped-theta high stems rests on one claim: the rows of this
+            // matrix coming from generators that already exist can be computed AHEAD of the bidegree
+            // and concatenated with the rest, because rows are generator-major and the module's
+            // basis tables are append-only (`OnceVec`), so an early row block stays valid verbatim.
+            // That is an argument from data-structure semantics; this checks it against real data
+            // before anything is built on it. A row-range build must equal the corresponding rows of
+            // the all-rows build, bit for bit.
+            if std::env::var_os("NASSAU_SPLIT_VERIFY").is_some() && target_dim > 1 {
+                let mid = target_dim / 2;
+                let lo = restricted_partial_matrix_maybe_gpu(
+                    &self.differentials[b.s() - 1],
+                    b.t(),
+                    &all_rows[..mid],
+                    next_dim,
+                );
+                let hi = restricted_partial_matrix_maybe_gpu(
+                    &self.differentials[b.s() - 1],
+                    b.t(),
+                    &all_rows[mid..],
+                    next_dim,
+                );
+                for r in 0..target_dim {
+                    let split = if r < mid { lo.row(r) } else { hi.row(r - mid) };
+                    assert_eq!(
+                        full.row(r).iter_nonzero().collect::<Vec<_>>(),
+                        split.iter_nonzero().collect::<Vec<_>>(),
+                        "row-block decomposition mismatch at {b}, row {r} (mid {mid}, target_dim \
+                         {target_dim}, next_dim {next_dim})"
+                    );
+                }
+            }
+            Some(full)
         } else {
             None
         };
