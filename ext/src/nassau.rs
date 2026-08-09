@@ -481,6 +481,219 @@ fn select_rows(full: &Matrix, rows: &[usize]) -> Matrix {
     out
 }
 
+/// Speculative full-matrix precomputation: build a bidegree's full restricted differential matrix
+/// *before* the bidegree runs, on background threads, and hand it over when the bidegree starts.
+///
+/// # Why this is sound
+///
+/// `step_resolution_with_subalgebra` deliberately treats `C_{s-1}` as having no generators of degree
+/// `>= t` and `C_{s-2}` as having none of degree `>= t - 1`, so the full matrix it builds reads only
+/// data frozen once `(s - 1, t - 1)` is committed — see the comment there. That is *strictly weaker*
+/// than the condition for running `(s, t)`, which additionally needs `(s, t - 1)`. The gap between
+/// the two is the speculation window: whenever row `s` lags row `s - 1`, every bidegree in between
+/// already has a fully determined matrix and nothing but scheduling stops us from building it.
+///
+/// The window is widest exactly where it pays. The bottleneck in practice is the low-`s` rows, and
+/// for those the rows below are long since finished — row 2's matrices are all computable the moment
+/// row 1 completes. So the lookahead available to the critical path is bounded by `NASSAU_SPECULATE`
+/// depth, not by the wavefront.
+///
+/// The row-block claim underneath (a matrix built over a row subset equals those rows of the all-rows
+/// build) is checked empirically by `NASSAU_SPLIT_VERIFY`; this cache goes further and builds the
+/// whole matrix early, which `NASSAU_SPECULATE_VERIFY` checks by rebuilding at consumption time and
+/// asserting equality.
+///
+/// # Why it should win at capped theta
+///
+/// At high stems the resident master must be capped, so most `R`'s are enumerated on the GPU on the
+/// critical path, and an enumeration launch costs the length of its longest odometer chain. Building
+/// matrices ahead moves that latency off the critical path entirely: the speculative threads issue
+/// their launches while the wavefront is busy elsewhere, and a bidegree that finds its matrix in the
+/// cache skips the multiply *and* the enumeration behind it.
+///
+/// # Configuration
+///
+/// * `NASSAU_SPECULATE` — number of background builder threads (default 0, off).
+/// * `NASSAU_SPECULATE_AHEAD` — how many degrees past a row's own frontier to speculate (default 64).
+/// * `NASSAU_SPECULATE_MAX_GB` — cap on retained speculative matrices (default 64 GB).
+/// * `NASSAU_SPECULATE_VERIFY` — rebuild at consumption and assert the cached matrix is identical.
+mod speculate {
+    use std::{
+        cmp::Reverse,
+        collections::{BinaryHeap, HashMap},
+        sync::{
+            Condvar, LazyLock, Mutex,
+            atomic::{AtomicUsize, Ordering},
+        },
+    };
+
+    use fp::matrix::Matrix;
+    use sseq::coordinates::Bidegree;
+
+    /// Number of background builder threads; 0 disables speculation entirely.
+    pub fn threads() -> usize {
+        static N: LazyLock<usize> = LazyLock::new(|| {
+            std::env::var("NASSAU_SPECULATE")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0)
+        });
+        *N
+    }
+
+    /// How far past a row's own committed frontier to speculate. Bounds the queue (and hence the
+    /// retained memory) when a row lags very far behind the one below it.
+    pub fn ahead() -> i32 {
+        static A: LazyLock<i32> = LazyLock::new(|| {
+            std::env::var("NASSAU_SPECULATE_AHEAD")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(64)
+        });
+        *A
+    }
+
+    /// Cap on the bytes held by cached matrices. Speculation is skipped while over it.
+    fn max_bytes() -> usize {
+        static B: LazyLock<usize> = LazyLock::new(|| {
+            std::env::var("NASSAU_SPECULATE_MAX_GB")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(64)
+                << 30
+        });
+        *B
+    }
+
+    pub fn verify() -> bool {
+        static V: LazyLock<bool> =
+            LazyLock::new(|| std::env::var_os("NASSAU_SPECULATE_VERIFY").is_some());
+        *V
+    }
+
+    /// Cached matrices, keyed by bidegree. A process resolves one `Resolution`, so the bidegree
+    /// alone identifies the matrix; the cache is only ever populated when `NASSAU_SPECULATE` is set.
+    static CACHE: LazyLock<Mutex<HashMap<(i32, i32), Matrix>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
+    static BYTES: AtomicUsize = AtomicUsize::new(0);
+    static HITS: AtomicUsize = AtomicUsize::new(0);
+    static MISSES: AtomicUsize = AtomicUsize::new(0);
+    static BUILT: AtomicUsize = AtomicUsize::new(0);
+
+    fn size_of(m: &Matrix) -> usize {
+        m.rows() * m.columns().div_ceil(64) * 8
+    }
+
+    /// Whether there is room to build another matrix. Checked before building, not after: a
+    /// speculative build we cannot afford to keep is wasted work, not just wasted space.
+    pub fn has_room() -> bool {
+        BYTES.load(Ordering::Relaxed) < max_bytes()
+    }
+
+    pub fn insert(b: Bidegree, m: Matrix) {
+        BYTES.fetch_add(size_of(&m), Ordering::Relaxed);
+        BUILT.fetch_add(1, Ordering::Relaxed);
+        if let Some(old) = CACHE.lock().unwrap().insert((b.s(), b.t()), m) {
+            BYTES.fetch_sub(size_of(&old), Ordering::Relaxed);
+        }
+    }
+
+    /// Take the matrix for `b` if one was built ahead. Counted as a hit or a miss so the payoff is
+    /// legible in the log without a profiler.
+    pub fn take(b: Bidegree) -> Option<Matrix> {
+        if threads() == 0 {
+            return None;
+        }
+        let taken = CACHE.lock().unwrap().remove(&(b.s(), b.t()));
+        match &taken {
+            Some(m) => {
+                BYTES.fetch_sub(size_of(m), Ordering::Relaxed);
+                HITS.fetch_add(1, Ordering::Relaxed);
+            }
+            None => {
+                MISSES.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        taken
+    }
+
+    /// `(built, hits, misses, retained bytes)`, for periodic reporting.
+    pub fn stats() -> (usize, usize, usize, usize) {
+        (
+            BUILT.load(Ordering::Relaxed),
+            HITS.load(Ordering::Relaxed),
+            MISSES.load(Ordering::Relaxed),
+            BYTES.load(Ordering::Relaxed),
+        )
+    }
+
+    /// Drop everything. Called when the wavefront finishes so a second `compute_through_stem` in the
+    /// same process cannot see stale entries.
+    pub fn clear() {
+        CACHE.lock().unwrap().clear();
+        BYTES.store(0, Ordering::Relaxed);
+    }
+
+    struct Queue {
+        heap: BinaryHeap<Reverse<(i32, i32)>>,
+        closed: bool,
+    }
+
+    /// Pending speculative builds, ordered by `(t, s)` ascending.
+    ///
+    /// The order matters more than it looks. The queue can run far longer than the builders can
+    /// drain it, and a matrix that lands after its bidegree has already started is pure waste — so
+    /// builders must always take the bidegree the wavefront will reach soonest, which is the
+    /// smallest `t`. A FIFO would instead spend the builders on the deepest speculation first.
+    static QUEUE: LazyLock<(Mutex<Queue>, Condvar)> = LazyLock::new(|| {
+        (
+            Mutex::new(Queue {
+                heap: BinaryHeap::new(),
+                closed: false,
+            }),
+            Condvar::new(),
+        )
+    });
+
+    pub fn open() {
+        let (m, _) = &*QUEUE;
+        let mut q = m.lock().unwrap();
+        q.heap.clear();
+        q.closed = false;
+    }
+
+    pub fn push(b: Bidegree) {
+        let (m, cv) = &*QUEUE;
+        m.lock().unwrap().heap.push(Reverse((b.t(), b.s())));
+        cv.notify_one();
+    }
+
+    /// Block for the next bidegree to build, or `None` once the queue is closed and drained.
+    pub fn pop() -> Option<Bidegree> {
+        let (m, cv) = &*QUEUE;
+        let mut q = m.lock().unwrap();
+        loop {
+            if let Some(Reverse((t, s))) = q.heap.pop() {
+                return Some(Bidegree::s_t(s, t));
+            }
+            if q.closed {
+                return None;
+            }
+            q = cv.wait(q).unwrap();
+        }
+    }
+
+    /// Stop the builders once the wavefront is done. Anything still queued is dropped: its bidegree
+    /// has either run already or is out of region.
+    pub fn close() {
+        let (m, cv) = &*QUEUE;
+        let mut q = m.lock().unwrap();
+        q.closed = true;
+        q.heap.clear();
+        cv.notify_all();
+    }
+}
+
 /// A resolution of `S_2` using Nassau's algorithm.
 ///
 /// This aims to have an API similar to that of
@@ -725,6 +938,62 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
         Ok(())
     }
 
+    /// Dimensions of the full restricted matrix at `b`: the restricted source dimension (its row
+    /// count) and the restricted target dimension (its column count), exactly as
+    /// [`Self::step_resolution_with_subalgebra`] computes them.
+    ///
+    /// Note there is no [`MilnorSubalgebra`] argument. The restriction bounds are `b.t()` and
+    /// `b.t() - 1` — properties of the bidegree, not of the signature — which is precisely why this
+    /// matrix can be built before the bidegree's subalgebra is chosen, and hence before the bidegree
+    /// runs at all. See [`speculate`].
+    fn restricted_dims(&self, b: Bidegree) -> (usize, usize) {
+        let target = &*self.modules[b.s() - 1];
+        target.compute_basis(b.t());
+        let target_dim = MilnorSubalgebra::restricted_dimension(target, b.t(), b.t());
+        let next = &self.modules[b.s() - 2];
+        next.compute_basis(b.t());
+        let next_dim = MilnorSubalgebra::restricted_dimension(next, b.t(), b.t() - 1);
+        (target_dim, next_dim)
+    }
+
+    /// The full restricted differential matrix at `b`, over every restricted source row.
+    fn build_full_restricted(&self, b: Bidegree, target_dim: usize, next_dim: usize) -> Matrix {
+        let all_rows: Vec<usize> = (0..target_dim).collect();
+        restricted_partial_matrix_maybe_gpu(
+            &self.differentials[b.s() - 1],
+            b.t(),
+            &all_rows,
+            next_dim,
+        )
+    }
+
+    /// Build `b`'s full matrix ahead of time and park it in the [`speculate`] cache.
+    ///
+    /// Only called for `b.s() >= 2` and only once `(b.s() - 1, b.t() - 1)` is committed, which is
+    /// what makes every input frozen. Bails out whenever the result would not be used: when the
+    /// bidegree is already computed or on disk, when the reuse path is off or the matrix exceeds its
+    /// cap (in which case the consumer builds per-signature instead), or when the cache is full.
+    #[tracing::instrument(skip(self), fields(%b))]
+    fn speculate_build(&self, b: Bidegree) {
+        if self.has_computed_bidegree(b) || !speculate::has_room() {
+            return;
+        }
+        if let Some(store) = self.save_dir.store()
+            && store.exists(SaveKind::NassauDifferential, b)
+        {
+            return;
+        }
+        if !reuse_full_matrix(&self.differentials[b.s() - 1]) {
+            return;
+        }
+        let (target_dim, next_dim) = self.restricted_dims(b);
+        if !reuse_within_cap(target_dim, next_dim) {
+            return;
+        }
+        let m = self.build_full_restricted(b, target_dim, next_dim);
+        speculate::insert(b, m);
+    }
+
     #[tracing::instrument(skip(self), fields(%b, %subalgebra, num_new_gens, density))]
     fn step_resolution_with_subalgebra(
         &self,
@@ -796,12 +1065,37 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
             && reuse_within_cap(target_dim, next_dim)
         {
             let all_rows: Vec<usize> = (0..target_dim).collect();
-            let full = restricted_partial_matrix_maybe_gpu(
-                &self.differentials[b.s() - 1],
-                b.t(),
-                &all_rows,
-                next_dim,
-            );
+            // A background builder may already have this matrix. Its inputs are frozen once
+            // `(b.s() - 1, b.t() - 1)` is committed, strictly earlier than `(b.s(), b.t())` can run,
+            // so a cached matrix is the same matrix — see [`speculate`]. A shape mismatch would mean
+            // that reasoning is wrong somewhere, so say so loudly and rebuild rather than trusting
+            // it; `NASSAU_SPECULATE_VERIFY` checks the contents too.
+            let full = match speculate::take(b) {
+                Some(m) if m.rows() == target_dim && m.columns() == next_dim => {
+                    if speculate::verify() {
+                        let fresh = self.build_full_restricted(b, target_dim, next_dim);
+                        for r in 0..target_dim {
+                            assert_eq!(
+                                m.row(r).iter_nonzero().collect::<Vec<_>>(),
+                                fresh.row(r).iter_nonzero().collect::<Vec<_>>(),
+                                "speculative matrix mismatch at {b}, row {r}"
+                            );
+                        }
+                    }
+                    m
+                }
+                stale => {
+                    if let Some(m) = stale {
+                        tracing::warn!(
+                            %b,
+                            "discarding speculative matrix: got {}x{}, want {target_dim}x{next_dim}",
+                            m.rows(),
+                            m.columns(),
+                        );
+                    }
+                    self.build_full_restricted(b, target_dim, next_dim)
+                }
+            };
             // `NASSAU_SPLIT_VERIFY`: check the ROW-BLOCK DECOMPOSITION empirically.
             //
             // The speculative plan for capped-theta high stems rests on one claim: the rows of this
@@ -1375,163 +1669,230 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
         };
 
         let tracing_span = tracing::Span::current();
-        maybe_rayon::in_place_scope(|scope| {
-            let _tracing_guard = tracing_span.enter();
+        let spec_threads = speculate::threads();
+        speculate::open();
 
-            let mut progress: Vec<i32> = vec![min_degree - 1; max_s as usize + 1];
-
-            let (sender, receiver) = mpsc::channel();
-
-            let spawn_bidegree = |b: Bidegree, sender: mpsc::Sender<SenderData>| {
-                if self.has_computed_bidegree(b) {
-                    SenderData::send(b, sender);
-                } else {
-                    let tracing_span = tracing_span.clone();
-                    scope.spawn(move |_| {
-                        let _tracing_guard = tracing_span.enter();
-                        if crate::utils::parallel::is_in_parallel() {
-                            SenderData::send_retry(b, sender);
-                            return;
-                        }
-                        self.step_resolution(b);
-                        SenderData::send(b, sender);
-                    });
-                }
-            };
-
-            // Seed the base of every row. A bidegree `(s, min_degree)` has no in-region
-            // predecessors, so it is not spawned by the wavefront — except `(1, min_degree)`, whose
-            // diagonal predecessor `(0, min_degree)` is in region, so we let it be spawned instead.
-            for s in 0..=max_s {
-                if s != 1 {
-                    spawn_bidegree(Bidegree::s_t(s, min_degree), sender.clone());
-                }
-            }
-            drop(sender);
-
-            // Bidegrees whose spawned job was stolen onto a worker already inside a critical section
-            // (`is_in_parallel` set on that worker) and so bounced back a retry rather than causing
-            // a priority inversion. Because the check is per-thread, a job is only ever bounced when
-            // its worker is a blocked guard holder; a job picked up by a free worker just runs. Such
-            // bounces are therefore rare, but when the pool is momentarily saturated we still must
-            // avoid re-spawning immediately in a tight loop, so we park bounced bidegrees here.
-            //
-            // The scheduler thread never holds a guard, so it cannot itself observe when a worker
-            // frees; instead, while anything is parked we wait on the channel with a short timeout
-            // and retry the parked work whenever a completion arrives (a worker likely just freed)
-            // or the timeout elapses (periodic re-check). Incoming messages are still handled the
-            // instant they arrive; the timeout only governs how promptly we retry while otherwise
-            // idle. This cannot deadlock: parked entries keep their senders, so the channel stays
-            // open, and the timeout guarantees parked work is retried until a free worker takes it.
-            let mut deferred: Vec<(Bidegree, mpsc::Sender<SenderData>)> = Vec::new();
-            // Diagnostic (`NASSAU_MEM_REPORT`): count committed bidegrees so we can periodically
-            // report the retained-data heap split (differentials' `outputs` vs modules' tables).
-            let mem_report = std::env::var_os("NASSAU_MEM_REPORT").is_some();
-            let mut commit_count = 0usize;
-            // How long to wait for a message before retrying parked bidegrees. Small enough that a
-            // freed worker is used promptly, large enough that the poll is negligible; it only ticks
-            // while something is parked.
-            const RETRY_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_micros(100);
-
-            loop {
-                let event = if deferred.is_empty() {
-                    // Nothing parked: block until a message arrives or all senders drop.
-                    match receiver.recv() {
-                        Ok(data) => Some(data),
-                        Err(_) => break,
+        // Speculative builders run *outside* the rayon pool on purpose. They are a background task
+        // whose whole point is to use time the wavefront is not using; putting them in the pool
+        // would let them take worker slots from the critical path, which is the opposite of the
+        // intent. `std::thread::scope` keeps them borrowing `self` without any `Arc` plumbing.
+        std::thread::scope(|spec_scope| {
+            for _ in 0..spec_threads {
+                let tracing_span = tracing_span.clone();
+                spec_scope.spawn(move || {
+                    let _tracing_guard = tracing_span.enter();
+                    while let Some(b) = speculate::pop() {
+                        self.speculate_build(b);
                     }
-                } else {
-                    // Something parked: wake periodically to retry it. Parked entries hold senders,
-                    // so the channel cannot be disconnected here.
-                    match receiver.recv_timeout(RETRY_POLL_INTERVAL) {
-                        Ok(data) => Some(data),
-                        Err(mpsc::RecvTimeoutError::Timeout) => None,
-                        Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                });
+            }
+
+            maybe_rayon::in_place_scope(|scope| {
+                let _tracing_guard = tracing_span.enter();
+
+                let mut progress: Vec<i32> = vec![min_degree - 1; max_s as usize + 1];
+
+                let (sender, receiver) = mpsc::channel();
+
+                let spawn_bidegree = |b: Bidegree, sender: mpsc::Sender<SenderData>| {
+                    if self.has_computed_bidegree(b) {
+                        SenderData::send(b, sender);
+                    } else {
+                        let tracing_span = tracing_span.clone();
+                        scope.spawn(move |_| {
+                            let _tracing_guard = tracing_span.enter();
+                            if crate::utils::parallel::is_in_parallel() {
+                                SenderData::send_retry(b, sender);
+                                return;
+                            }
+                            self.step_resolution(b);
+                            SenderData::send(b, sender);
+                        });
                     }
                 };
 
-                if let Some(SenderData { b, retry, sender }) = event {
-                    if retry {
-                        // Park until a worker frees; retried below on a completion or timeout.
-                        deferred.push((b, sender));
-                        continue;
+                // Seed the base of every row. A bidegree `(s, min_degree)` has no in-region
+                // predecessors, so it is not spawned by the wavefront — except `(1, min_degree)`, whose
+                // diagonal predecessor `(0, min_degree)` is in region, so we let it be spawned instead.
+                for s in 0..=max_s {
+                    if s != 1 {
+                        spawn_bidegree(Bidegree::s_t(s, min_degree), sender.clone());
                     }
-                    assert!(progress[b.s() as usize] == b.t() - 1);
-                    progress[b.s() as usize] = b.t();
+                }
+                drop(sender);
 
-                    if mem_report {
-                        commit_count += 1;
-                        if commit_count % 400 == 0 {
-                            let diff_b: usize = self
-                                .differentials
-                                .iter()
-                                .map(|(_, d)| d.output_heap_bytes())
-                                .sum();
-                            let mod_b: usize =
-                                self.modules.iter().map(|(_, m)| m.table_heap_bytes()).sum();
-                            #[cfg(feature = "gpu")]
-                            let (res_master, res_basis) =
-                                algebra::milnor_gpu::resident_host_bytes();
-                            #[cfg(not(feature = "gpu"))]
-                            let (res_master, res_basis) = (0usize, 0usize);
-                            #[cfg(feature = "gpu")]
-                            let (dev_master, dev_basis) = algebra::milnor_gpu::resident_dev_bytes();
-                            #[cfg(feature = "gpu")]
-                            let (dev_pool_use, dev_pool_res) =
-                                algebra::milnor_gpu::cubecl_device_usage();
-                            #[cfg(not(feature = "gpu"))]
-                            let ((dev_master, dev_basis), (dev_pool_use, dev_pool_res)) =
-                                ((0usize, 0usize), (0u64, 0u64));
-                            let gb = |x: usize| x as f64 / (1u64 << 30) as f64;
-                            let gbu = |x: u64| x as f64 / (1u64 << 30) as f64;
-                            eprintln!(
-                                "[MEM] commits={commit_count} last_b=({},{}) HOST[diff={:.1} \
-                                 mod={:.1} res_master={:.1} res_basis={:.1}]GB DEV[master={:.1} \
-                                 basis={:.1} cubecl_use={:.1} cubecl_reserved={:.1}]GB",
-                                b.n(),
-                                b.s(),
-                                gb(diff_b),
-                                gb(mod_b),
-                                gb(res_master),
-                                gb(res_basis),
-                                gb(dev_master),
-                                gb(dev_basis),
-                                gbu(dev_pool_use),
-                                gbu(dev_pool_res),
-                            );
+                // Bidegrees whose spawned job was stolen onto a worker already inside a critical section
+                // (`is_in_parallel` set on that worker) and so bounced back a retry rather than causing
+                // a priority inversion. Because the check is per-thread, a job is only ever bounced when
+                // its worker is a blocked guard holder; a job picked up by a free worker just runs. Such
+                // bounces are therefore rare, but when the pool is momentarily saturated we still must
+                // avoid re-spawning immediately in a tight loop, so we park bounced bidegrees here.
+                //
+                // The scheduler thread never holds a guard, so it cannot itself observe when a worker
+                // frees; instead, while anything is parked we wait on the channel with a short timeout
+                // and retry the parked work whenever a completion arrives (a worker likely just freed)
+                // or the timeout elapses (periodic re-check). Incoming messages are still handled the
+                // instant they arrive; the timeout only governs how promptly we retry while otherwise
+                // idle. This cannot deadlock: parked entries keep their senders, so the channel stays
+                // open, and the timeout guarantees parked work is retried until a free worker takes it.
+                let mut deferred: Vec<(Bidegree, mpsc::Sender<SenderData>)> = Vec::new();
+                // Diagnostic (`NASSAU_MEM_REPORT`): count committed bidegrees so we can periodically
+                // report the retained-data heap split (differentials' `outputs` vs modules' tables).
+                let mem_report = std::env::var_os("NASSAU_MEM_REPORT").is_some();
+                let mut commit_count = 0usize;
+                // How long to wait for a message before retrying parked bidegrees. Small enough that a
+                // freed worker is used promptly, large enough that the poll is negligible; it only ticks
+                // while something is parked.
+                const RETRY_POLL_INTERVAL: std::time::Duration =
+                    std::time::Duration::from_micros(100);
+
+                // Largest `t` already queued for speculation in each row, so a commit only enqueues the
+                // window it newly opened.
+                let mut spec_issued: Vec<i32> = vec![min_degree - 1; max_s as usize + 1];
+                // Enqueue every bidegree whose matrix is now determined but which cannot run yet.
+                //
+                // `(r, t)`'s matrix needs only `(r - 1, t - 1)` — i.e. `t <= progress[r - 1] + 1` —
+                // while running `(r, t)` additionally needs `(r, t - 1)`. Everything strictly between
+                // those two bounds is a bidegree we can build for but not yet run: exactly the
+                // speculation window. We start at `progress[r] + 2` because `progress[r] + 1` is the
+                // bidegree the scheduler is spawning right now, whose matrix a builder would only race.
+                let enqueue_spec = |progress: &[i32], spec_issued: &mut Vec<i32>| {
+                    if spec_threads == 0 {
+                        return;
+                    }
+                    for r in 2..=max_s {
+                        let ri = r as usize;
+                        let hi = std::cmp::min(
+                            progress[ri - 1] + 1,
+                            progress[ri] + 1 + speculate::ahead(),
+                        );
+                        let lo = std::cmp::max(spec_issued[ri] + 1, progress[ri] + 2);
+                        for t in lo..=hi {
+                            if in_region(r, t) {
+                                speculate::push(Bidegree::s_t(r, t));
+                            }
                         }
+                        spec_issued[ri] = std::cmp::max(spec_issued[ri], hi);
                     }
+                };
 
-                    // Completing `b` can only make ready its same-row successor `(s, t + 1)` and one
-                    // diagonal successor. `ready` requires *both* predecessors, so of the two
-                    // completions that could spawn a given bidegree, only the later one does.
-                    let same_row = b + Bidegree::s_t(0, 1);
-                    let diagonal = if b.s() == 0 {
-                        Bidegree::s_t(1, b.t())
+                loop {
+                    let event = if deferred.is_empty() {
+                        // Nothing parked: block until a message arrives or all senders drop.
+                        match receiver.recv() {
+                            Ok(data) => Some(data),
+                            Err(_) => break,
+                        }
                     } else {
-                        b + Bidegree::s_t(1, 1)
+                        // Something parked: wake periodically to retry it. Parked entries hold senders,
+                        // so the channel cannot be disconnected here.
+                        match receiver.recv_timeout(RETRY_POLL_INTERVAL) {
+                            Ok(data) => Some(data),
+                            Err(mpsc::RecvTimeoutError::Timeout) => None,
+                            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                        }
                     };
 
-                    for cand in [same_row, diagonal] {
-                        if ready(cand.s(), cand.t(), &progress) {
-                            spawn_bidegree(cand, sender.clone());
+                    if let Some(SenderData { b, retry, sender }) = event {
+                        if retry {
+                            // Park until a worker frees; retried below on a completion or timeout.
+                            deferred.push((b, sender));
+                            continue;
+                        }
+                        assert!(progress[b.s() as usize] == b.t() - 1);
+                        progress[b.s() as usize] = b.t();
+                        enqueue_spec(&progress, &mut spec_issued);
+
+                        if mem_report {
+                            commit_count += 1;
+                            if commit_count % 400 == 0 {
+                                let diff_b: usize = self
+                                    .differentials
+                                    .iter()
+                                    .map(|(_, d)| d.output_heap_bytes())
+                                    .sum();
+                                let mod_b: usize =
+                                    self.modules.iter().map(|(_, m)| m.table_heap_bytes()).sum();
+                                #[cfg(feature = "gpu")]
+                                let (res_master, res_basis) =
+                                    algebra::milnor_gpu::resident_host_bytes();
+                                #[cfg(not(feature = "gpu"))]
+                                let (res_master, res_basis) = (0usize, 0usize);
+                                #[cfg(feature = "gpu")]
+                                let (dev_master, dev_basis) =
+                                    algebra::milnor_gpu::resident_dev_bytes();
+                                #[cfg(feature = "gpu")]
+                                let (dev_pool_use, dev_pool_res) =
+                                    algebra::milnor_gpu::cubecl_device_usage();
+                                #[cfg(not(feature = "gpu"))]
+                                let ((dev_master, dev_basis), (dev_pool_use, dev_pool_res)) =
+                                    ((0usize, 0usize), (0u64, 0u64));
+                                let gb = |x: usize| x as f64 / (1u64 << 30) as f64;
+                                let gbu = |x: u64| x as f64 / (1u64 << 30) as f64;
+                                eprintln!(
+                                    "[MEM] commits={commit_count} last_b=({},{}) HOST[diff={:.1} \
+                                     mod={:.1} res_master={:.1} res_basis={:.1}]GB \
+                                     DEV[master={:.1} basis={:.1} cubecl_use={:.1} \
+                                     cubecl_reserved={:.1}]GB",
+                                    b.n(),
+                                    b.s(),
+                                    gb(diff_b),
+                                    gb(mod_b),
+                                    gb(res_master),
+                                    gb(res_basis),
+                                    gb(dev_master),
+                                    gb(dev_basis),
+                                    gbu(dev_pool_use),
+                                    gbu(dev_pool_res),
+                                );
+                            }
+                        }
+
+                        // Completing `b` can only make ready its same-row successor `(s, t + 1)` and one
+                        // diagonal successor. `ready` requires *both* predecessors, so of the two
+                        // completions that could spawn a given bidegree, only the later one does.
+                        let same_row = b + Bidegree::s_t(0, 1);
+                        let diagonal = if b.s() == 0 {
+                            Bidegree::s_t(1, b.t())
+                        } else {
+                            b + Bidegree::s_t(1, 1)
+                        };
+
+                        for cand in [same_row, diagonal] {
+                            if ready(cand.s(), cand.t(), &progress) {
+                                spawn_bidegree(cand, sender.clone());
+                            }
+                        }
+                    }
+
+                    // Retry parked bidegrees — reached after a completion (a worker likely just freed)
+                    // or a timeout (periodic re-check), but not after a retry (which `continue`s above,
+                    // so a bounced job waits out the timeout before being retried). Each re-spawned job
+                    // re-checks its own worker's flag: those on a free worker run, those stolen onto a
+                    // blocked guard holder bounce and are re-parked. This stays cheap because per-thread
+                    // bounces are rare, so `deferred` is normally empty.
+                    if !deferred.is_empty() {
+                        for (b, sender) in std::mem::take(&mut deferred) {
+                            spawn_bidegree(b, sender);
                         }
                     }
                 }
+            });
 
-                // Retry parked bidegrees — reached after a completion (a worker likely just freed)
-                // or a timeout (periodic re-check), but not after a retry (which `continue`s above,
-                // so a bounced job waits out the timeout before being retried). Each re-spawned job
-                // re-checks its own worker's flag: those on a free worker run, those stolen onto a
-                // blocked guard holder bounce and are re-parked. This stays cheap because per-thread
-                // bounces are rare, so `deferred` is normally empty.
-                if !deferred.is_empty() {
-                    for (b, sender) in std::mem::take(&mut deferred) {
-                        spawn_bidegree(b, sender);
-                    }
-                }
-            }
+            // The wavefront is done, so no further matrix can be wanted: release the builders.
+            speculate::close();
         });
+
+        if spec_threads > 0 {
+            let (built, hits, misses, bytes) = speculate::stats();
+            eprintln!(
+                "[speculate] threads={spec_threads} built={built} hits={hits} misses={misses} \
+                 hit_rate={:.1}% unused={:.1}GB",
+                100.0 * hits as f64 / (hits + misses).max(1) as f64,
+                bytes as f64 / (1u64 << 30) as f64,
+            );
+        }
+        speculate::clear();
 
         // Eviction probe (`NASSAU_R_STATS`): dump the R-access distribution once the wavefront is done.
         #[cfg(feature = "gpu")]
