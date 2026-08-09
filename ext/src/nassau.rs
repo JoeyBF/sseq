@@ -586,6 +586,13 @@ mod speculate {
         *W
     }
 
+    /// Whether speculative builds take the CPU path (`NASSAU_SPECULATE_CPU`). Off by default.
+    pub fn on_cpu() -> bool {
+        static C: LazyLock<bool> =
+            LazyLock::new(|| std::env::var_os("NASSAU_SPECULATE_CPU").is_some());
+        *C
+    }
+
     pub fn verify() -> bool {
         static V: LazyLock<bool> =
             LazyLock::new(|| std::env::var_os("NASSAU_SPECULATE_VERIFY").is_some());
@@ -1086,14 +1093,26 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
     }
 
     /// The full restricted differential matrix at `b`, over every restricted source row.
-    fn build_full_restricted(&self, b: Bidegree, target_dim: usize, next_dim: usize) -> Matrix {
+    ///
+    /// `on_cpu` forces the CPU path regardless of the GPU settings. Speculative builders use it
+    /// (`NASSAU_SPECULATE_CPU`) because the two paths compete for different resources: sampling a
+    /// stem-200 run shows GPU 0 bursting to 100% while ~120 of the 128 cores idle, so a speculative
+    /// build sent to the GPU merely queues behind the critical path, while one sent to the CPU is
+    /// nearly free AND removes a launch from the queue the critical path is waiting on.
+    fn build_full_restricted(
+        &self,
+        b: Bidegree,
+        target_dim: usize,
+        next_dim: usize,
+        on_cpu: bool,
+    ) -> Matrix {
         let all_rows: Vec<usize> = (0..target_dim).collect();
-        restricted_partial_matrix_maybe_gpu(
-            &self.differentials[b.s() - 1],
-            b.t(),
-            &all_rows,
-            next_dim,
-        )
+        let diff = &self.differentials[b.s() - 1];
+        if on_cpu {
+            restricted_partial_matrix(diff, b.t(), &all_rows, next_dim)
+        } else {
+            restricted_partial_matrix_maybe_gpu(diff, b.t(), &all_rows, next_dim)
+        }
     }
 
     /// Build `b`'s full matrix ahead of time and park it in the [`speculate`] cache.
@@ -1125,7 +1144,7 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
             return;
         }
         let guard = speculate::ClaimGuard::new(b);
-        let m = self.build_full_restricted(b, target_dim, next_dim);
+        let m = self.build_full_restricted(b, target_dim, next_dim, speculate::on_cpu());
         speculate::publish(b, m);
         guard.done();
     }
@@ -1209,7 +1228,7 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
             let full = match speculate::take_or_claim(b) {
                 Some(m) if m.rows() == target_dim && m.columns() == next_dim => {
                     if speculate::verify() {
-                        let fresh = self.build_full_restricted(b, target_dim, next_dim);
+                        let fresh = self.build_full_restricted(b, target_dim, next_dim, false);
                         for r in 0..target_dim {
                             assert_eq!(
                                 m.row(r).iter_nonzero().collect::<Vec<_>>(),
@@ -1229,7 +1248,7 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                             m.columns(),
                         );
                     }
-                    self.build_full_restricted(b, target_dim, next_dim)
+                    self.build_full_restricted(b, target_dim, next_dim, false)
                 }
             };
             // `NASSAU_SPLIT_VERIFY`: check the ROW-BLOCK DECOMPOSITION empirically.
