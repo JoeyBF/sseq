@@ -586,6 +586,30 @@ mod speculate {
         *W
     }
 
+    /// Dedicated pool for speculative CPU builds.
+    ///
+    /// `restricted_partial_matrix` is itself rayon-parallel, so a speculative build issued from a
+    /// builder thread injects a large parallel job into the GLOBAL pool -- the one serving the
+    /// wavefront. The cores it uses are not free in that case: wavefront tasks queue behind
+    /// speculative chunks, and work-stealing spreads the damage. Measured at stem 150 / theta=125,
+    /// pin 20: 16 CPU builders took 649 s against a 310 s baseline, a 2.1x regression, while the
+    /// cache itself worked fine (53% hit rate, zero duplication).
+    ///
+    /// Installing the build into a separate pool keeps every nested `par_iter` inside that pool, so
+    /// speculation can only consume cores the wavefront is not asking for.
+    /// `NASSAU_SPECULATE_POOL` sizes it (default: a quarter of the machine).
+    pub fn pool() -> &'static maybe_rayon::MaybeThreadPool {
+        static P: LazyLock<maybe_rayon::MaybeThreadPool> = LazyLock::new(|| {
+            let n = std::env::var("NASSAU_SPECULATE_POOL")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .filter(|&v| v > 0)
+                .unwrap_or_else(|| (maybe_rayon::max_num_threads() / 4).max(1));
+            maybe_rayon::MaybeThreadPool::new(n, "nassau-spec")
+        });
+        &P
+    }
+
     /// Whether speculative builds take the CPU path (`NASSAU_SPECULATE_CPU`). Off by default.
     pub fn on_cpu() -> bool {
         static C: LazyLock<bool> =
@@ -1144,7 +1168,11 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
             return;
         }
         let guard = speculate::ClaimGuard::new(b);
-        let m = self.build_full_restricted(b, target_dim, next_dim, speculate::on_cpu());
+        // Inside the speculative pool, so the build's own `par_iter`s cannot take workers from the
+        // wavefront's pool -- see [`speculate::pool`].
+        let on_cpu = speculate::on_cpu();
+        let m = speculate::pool()
+            .install(|| self.build_full_restricted(b, target_dim, next_dim, on_cpu));
         speculate::publish(b, m);
         guard.done();
     }

@@ -1438,9 +1438,10 @@ fn start_prefetch(algebra: &Arc<MilnorAlgebra>) {
                     // Plain `std::thread`, not rayon: this must never inject into the pool the
                     // wavefront is using (see the deadlock the speculative builders hit).
                     if prefetch_on_gpu() {
-                        prefetch_degree_gpu(&alg, d, n);
-                        done_to = d;
-                        PREFETCH_DEGREE.store(d, Ordering::Relaxed);
+                        // Sweep every degree still inside the lookahead window into ONE batch.
+                        prefetch_degrees_gpu(&alg, d, target.max(d));
+                        done_to = target.max(d);
+                        PREFETCH_DEGREE.store(done_to, Ordering::Relaxed);
                         continue;
                     }
                     let nthreads = prefetch_threads().min(n.max(1));
@@ -1724,16 +1725,25 @@ fn enum_batch_bytes() -> u64 {
 /// The count pass is what makes the threshold test cheap: `num_mats` arrives from the device, so an
 /// `R` below `pin_min_mats` is rejected without ever being enumerated on the host. Counts are
 /// memoised into `COLD_COUNT` for every `R` seen, kept or not, so the multiply path inherits them.
-fn prefetch_degree_gpu(alg: &Arc<MilnorAlgebra>, d: i32, n: usize) {
+fn prefetch_degrees_gpu(alg: &Arc<MilnorAlgebra>, lo: i32, hi: i32) {
     // Group by owning device: an `R`'s rows live on one device's master, and enumerating it there
-    // keeps the whole degree's work spread the same way the master is.
+    // keeps the work spread the same way the master is.
+    //
+    // Across a RANGE of degrees, not one. One degree yields only a few thousand `R`s, and split four
+    // ways that is ~740 per shard -- about 23 blocks of the 3168 an H200 holds, which is the same
+    // starvation the multiply-driven launches suffer and the reason the first batched attempt
+    // measured nothing (`Rs/launch max` came out identical to the un-batched arm). Sweeping the
+    // whole lookahead window into one launch is what makes the grid big enough to matter.
     let mut by_dev: Vec<Vec<PPart>> = vec![Vec::new(); gpu_count()];
-    for i in 0..n {
-        let pp = alg.basis_element_from_index(d, i).p_part;
-        if pp.is_empty() || resident_contains(pp) {
-            continue;
+    for d in lo..=hi {
+        alg.compute_basis(d);
+        for i in 0..alg.dimension(d) {
+            let pp = alg.basis_element_from_index(d, i).p_part;
+            if pp.is_empty() || resident_contains(pp) {
+                continue;
+            }
+            by_dev[shard_of(pp)].push(pp);
         }
-        by_dev[shard_of(pp)].push(pp);
     }
     std::thread::scope(|sc| {
         for (dev, pps) in by_dev.iter().enumerate() {
@@ -1774,8 +1784,8 @@ fn prefetch_degree_gpu(alg: &Arc<MilnorAlgebra>, d: i32, n: usize) {
                         assert_eq!(
                             (rcl, rml, &rcs, &rmk),
                             (cs_len, mk_len, &cs, &mk),
-                            "batched device enumeration disagrees with admissible_matrices at \
-                             degree {d}"
+                            "batched device enumeration disagrees with admissible_matrices in \
+                             degrees {lo}..={hi}"
                         );
                     }
                     resident_append(keep[i], cs_len, mk_len, &cs, &mk);
@@ -4774,7 +4784,8 @@ fn multiply_batch_block<'a>(
                      exec={:.0}% depth mean={:.1} max={depth_max} | launch={launch_s:.1}s \
                      fence={fence_s:.1}s pipeline={:.0}% | intern={:.1}s basis={:.1}s tgei={:.1}s \
                      | enum launches={el} Rs/launch mean={:.0} max={erm} blocks/launch mean={:.0} \
-                     waves/SM={:.3} | prefetched={pf_n} to_degree={pf_d}",
+                     waves/SM={:.3} | prefetched={pf_n} to_degree={pf_d} batches={pfb_n} \
+                     Rs/batch={pfb_mean} max_batch={pfb_max}",
                     100.0 * prep_s / total,
                     100.0 * permit_s / total,
                     100.0 * lock_s / total,
