@@ -1290,18 +1290,30 @@ static PREFETCH_FRONTIER: std::sync::atomic::AtomicI32 = std::sync::atomic::Atom
 
 /// How many internal degrees ahead of the frontier to pre-enumerate (`NASSAU_GPU_PREFETCH_AHEAD`,
 /// default 0 = disabled). Requires [`pin_min_mats`] > 0, which selects WHICH `R`s are worth it.
-/// Threads the prefetcher uses to warm one degree (`NASSAU_GPU_PREFETCH_THREADS`, default 16).
+/// Threads the prefetcher uses to warm one degree (`NASSAU_GPU_PREFETCH_THREADS`, default 1).
 ///
-/// The elements of a degree are independent, and a stem-200 run leaves ~120 of 128 cores idle, so
-/// the warmer has no reason to be serial. It stays well under the core count because the wavefront
-/// still owns the machine and warming is by definition not on the critical path.
+/// The elements of a degree are independent and a stem-200 run leaves ~120 of 128 cores idle, so
+/// parallelising this looks free. It is not, and the reason is worth keeping: the warmer is limited
+/// by [`prefetch_ahead`], not by its own speed. It fills the window and sleeps, so extra threads
+/// cannot warm anything further ahead — they only contend with the wavefront.
+///
+/// MEASURED (S_2 stem 150, max_s 60, theta=125, PIN=200, AHEAD=25, interleaved, counterbalanced):
+///
+/// | threads | wall            | frontier reached | Rs/launch |
+/// |---------|-----------------|------------------|-----------|
+/// | 1       | 345 s, 336 s    | degree 176       | 531       |
+/// | 16      | 396 s, 382 s    | degree 176       | 531       |
+///
+/// Identical frontier, identical enumeration load, 14% slower. Only raise this together with
+/// `NASSAU_GPU_PREFETCH_AHEAD`, and only if the warmer is measurably falling behind the frontier —
+/// `to_degree` in the `[batch-stats]` line is how you tell.
 fn prefetch_threads() -> usize {
     static T: LazyLock<usize> = LazyLock::new(|| {
         std::env::var("NASSAU_GPU_PREFETCH_THREADS")
             .ok()
             .and_then(|v| v.parse().ok())
             .filter(|&v| v > 0)
-            .unwrap_or(16)
+            .unwrap_or(1)
     });
     *T
 }
