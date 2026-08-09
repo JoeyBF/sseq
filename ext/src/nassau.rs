@@ -565,20 +565,62 @@ mod speculate {
         *B
     }
 
+    /// How long a consumer will wait for an in-flight speculative build before giving up and
+    /// building the matrix itself (`NASSAU_SPECULATE_WAIT_MS`, default 5000).
+    ///
+    /// The wait MUST be bounded. Builders run `restricted_partial_matrix`, which is rayon-parallel,
+    /// from outside the pool: rayon injects the work and blocks the builder until a pool worker
+    /// picks it up. A consumer is a pool worker, and a worker parked in a condvar cannot steal — so
+    /// an unbounded wait closes a cycle (consumer waits on builder, builder waits on the workers one
+    /// of which is the consumer) and the run hangs. It did, immediately, at stem 40. A timeout turns
+    /// that cycle into at worst one duplicated build.
+    fn wait_limit() -> std::time::Duration {
+        static W: LazyLock<std::time::Duration> = LazyLock::new(|| {
+            std::time::Duration::from_millis(
+                std::env::var("NASSAU_SPECULATE_WAIT_MS")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(5000),
+            )
+        });
+        *W
+    }
+
     pub fn verify() -> bool {
         static V: LazyLock<bool> =
             LazyLock::new(|| std::env::var_os("NASSAU_SPECULATE_VERIFY").is_some());
         *V
     }
 
-    /// Cached matrices, keyed by bidegree. A process resolves one `Resolution`, so the bidegree
-    /// alone identifies the matrix; the cache is only ever populated when `NASSAU_SPECULATE` is set.
-    static CACHE: LazyLock<Mutex<HashMap<(i32, i32), Matrix>>> =
-        LazyLock::new(|| Mutex::new(HashMap::new()));
+    /// What the cache knows about a bidegree's matrix.
+    ///
+    /// The state matters as much as the matrix. A first cut cached only finished matrices, so a
+    /// builder and the bidegree itself could build the same matrix concurrently — and since a full
+    /// build is most of a bidegree's cost, that duplication was the whole cost of speculation (at
+    /// stem 150/θ=125: 442 built, 99 consumed, +18% wall). Every bidegree therefore passes through
+    /// this map exactly once, and the entry is what stops the second builder from starting.
+    enum Slot {
+        /// A builder is building this right now. A consumer that arrives waits rather than
+        /// duplicating: waiting costs at most what building costs, and usually much less, because
+        /// the builder has a head start by construction.
+        InFlight,
+        Ready(Matrix),
+        /// Consumed, or claimed by the consumer on a miss. Builders skip it.
+        Taken,
+    }
+
+    /// Slots keyed by bidegree, with a condvar for consumers waiting on [`Slot::InFlight`]. A
+    /// process resolves one `Resolution`, so the bidegree alone identifies the matrix; the map is
+    /// only ever populated when `NASSAU_SPECULATE` is set.
+    static CACHE: LazyLock<(Mutex<HashMap<(i32, i32), Slot>>, Condvar)> =
+        LazyLock::new(|| (Mutex::new(HashMap::new()), Condvar::new()));
     static BYTES: AtomicUsize = AtomicUsize::new(0);
     static HITS: AtomicUsize = AtomicUsize::new(0);
     static MISSES: AtomicUsize = AtomicUsize::new(0);
     static BUILT: AtomicUsize = AtomicUsize::new(0);
+    static WAITED: AtomicUsize = AtomicUsize::new(0);
+    static TIMEOUTS: AtomicUsize = AtomicUsize::new(0);
+    static DROPPED: AtomicUsize = AtomicUsize::new(0);
 
     fn size_of(m: &Matrix) -> usize {
         m.rows() * m.columns().div_ceil(64) * 8
@@ -590,39 +632,124 @@ mod speculate {
         BYTES.load(Ordering::Relaxed) < max_bytes()
     }
 
-    pub fn insert(b: Bidegree, m: Matrix) {
-        BYTES.fetch_add(size_of(&m), Ordering::Relaxed);
-        BUILT.fetch_add(1, Ordering::Relaxed);
-        if let Some(old) = CACHE.lock().unwrap().insert((b.s(), b.t()), m) {
-            BYTES.fetch_sub(size_of(&old), Ordering::Relaxed);
+    /// Take ownership of building `b`, or report that someone else already owns it.
+    ///
+    /// A `false` means another builder is on it or the consumer has claimed it — either way there is
+    /// nothing to gain by proceeding, only a duplicate build. A `true` obliges the caller to call
+    /// [`publish`]: a consumer may now be waiting on this slot.
+    pub fn claim(b: Bidegree) -> bool {
+        let (m, _) = &*CACHE;
+        let mut g = m.lock().unwrap();
+        if g.contains_key(&(b.s(), b.t())) {
+            return false;
+        }
+        g.insert((b.s(), b.t()), Slot::InFlight);
+        true
+    }
+
+    /// Releases a claim that never produced a matrix, so a consumer waiting on the slot falls
+    /// through and builds it itself instead of hanging forever. The only way that happens is a panic
+    /// in the builder, which would otherwise turn a crash into a deadlock.
+    pub struct ClaimGuard(Option<Bidegree>);
+
+    impl ClaimGuard {
+        pub fn new(b: Bidegree) -> Self {
+            Self(Some(b))
+        }
+
+        /// The matrix was published; nothing to release.
+        pub fn done(mut self) {
+            self.0 = None;
         }
     }
 
-    /// Take the matrix for `b` if one was built ahead. Counted as a hit or a miss so the payoff is
-    /// legible in the log without a profiler.
-    pub fn take(b: Bidegree) -> Option<Matrix> {
+    impl Drop for ClaimGuard {
+        fn drop(&mut self) {
+            if let Some(b) = self.0 {
+                let (m, cv) = &*CACHE;
+                m.lock().unwrap().remove(&(b.s(), b.t()));
+                cv.notify_all();
+            }
+        }
+    }
+
+    /// Hand over a finished speculative matrix, waking anyone waiting on it.
+    pub fn publish(b: Bidegree, matrix: Matrix) {
+        let (m, cv) = &*CACHE;
+        let mut g = m.lock().unwrap();
+        // If the consumer timed out and built its own, the slot is already `Taken`. Drop this copy
+        // rather than parking a matrix nobody will ever collect.
+        if !matches!(g.get(&(b.s(), b.t())), Some(Slot::InFlight)) {
+            DROPPED.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        BYTES.fetch_add(size_of(&matrix), Ordering::Relaxed);
+        BUILT.fetch_add(1, Ordering::Relaxed);
+        g.insert((b.s(), b.t()), Slot::Ready(matrix));
+        cv.notify_all();
+    }
+
+    /// The consumer side: the matrix for `b` if it was built ahead, else `None`.
+    ///
+    /// Never races a builder. If a build is in flight this blocks until it lands; if nothing is
+    /// known, it claims the slot so no builder starts the work the caller is about to do itself.
+    pub fn take_or_claim(b: Bidegree) -> Option<Matrix> {
         if threads() == 0 {
             return None;
         }
-        let taken = CACHE.lock().unwrap().remove(&(b.s(), b.t()));
-        match &taken {
-            Some(m) => {
-                BYTES.fetch_sub(size_of(m), Ordering::Relaxed);
-                HITS.fetch_add(1, Ordering::Relaxed);
-            }
-            None => {
-                MISSES.fetch_add(1, Ordering::Relaxed);
+        let (m, cv) = &*CACHE;
+        let mut g = m.lock().unwrap();
+        let mut waited = false;
+        loop {
+            match g.get(&(b.s(), b.t())) {
+                Some(Slot::Ready(_)) => {
+                    let Some(Slot::Ready(matrix)) = g.insert((b.s(), b.t()), Slot::Taken) else {
+                        unreachable!("just matched Ready under the same lock")
+                    };
+                    BYTES.fetch_sub(size_of(&matrix), Ordering::Relaxed);
+                    HITS.fetch_add(1, Ordering::Relaxed);
+                    return Some(matrix);
+                }
+                Some(Slot::InFlight) => {
+                    if !waited {
+                        waited = true;
+                        WAITED.fetch_add(1, Ordering::Relaxed);
+                    }
+                    let (guard, res) = cv.wait_timeout(g, wait_limit()).unwrap();
+                    g = guard;
+                    if res.timed_out() {
+                        // Stop waiting on the builder and take the slot: it will find `Taken` and
+                        // drop its result. One duplicated build beats a stalled worker.
+                        g.insert((b.s(), b.t()), Slot::Taken);
+                        TIMEOUTS.fetch_add(1, Ordering::Relaxed);
+                        MISSES.fetch_add(1, Ordering::Relaxed);
+                        return None;
+                    }
+                }
+                Some(Slot::Taken) => {
+                    MISSES.fetch_add(1, Ordering::Relaxed);
+                    return None;
+                }
+                None => {
+                    g.insert((b.s(), b.t()), Slot::Taken);
+                    MISSES.fetch_add(1, Ordering::Relaxed);
+                    return None;
+                }
             }
         }
-        taken
     }
 
-    /// `(built, hits, misses, retained bytes)`, for periodic reporting.
-    pub fn stats() -> (usize, usize, usize, usize) {
+    /// `(built, hits, misses, waits, timeouts, dropped, retained bytes)`, for reporting.
+    /// `built - hits` plus `dropped` is the wasted work this design exists to keep near zero;
+    /// `timeouts` says how often a consumer gave up on a builder.
+    pub fn stats() -> (usize, usize, usize, usize, usize, usize, usize) {
         (
             BUILT.load(Ordering::Relaxed),
             HITS.load(Ordering::Relaxed),
             MISSES.load(Ordering::Relaxed),
+            WAITED.load(Ordering::Relaxed),
+            TIMEOUTS.load(Ordering::Relaxed),
+            DROPPED.load(Ordering::Relaxed),
             BYTES.load(Ordering::Relaxed),
         )
     }
@@ -630,8 +757,10 @@ mod speculate {
     /// Drop everything. Called when the wavefront finishes so a second `compute_through_stem` in the
     /// same process cannot see stale entries.
     pub fn clear() {
-        CACHE.lock().unwrap().clear();
+        let (m, cv) = &*CACHE;
+        m.lock().unwrap().clear();
         BYTES.store(0, Ordering::Relaxed);
+        cv.notify_all();
     }
 
     struct Queue {
@@ -990,8 +1119,15 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
         if !reuse_within_cap(target_dim, next_dim) {
             return;
         }
+        // Claim last, once every bail-out is behind us: a claim obliges us to publish, because a
+        // consumer reaching this bidegree will wait on the slot rather than build it itself.
+        if !speculate::claim(b) {
+            return;
+        }
+        let guard = speculate::ClaimGuard::new(b);
         let m = self.build_full_restricted(b, target_dim, next_dim);
-        speculate::insert(b, m);
+        speculate::publish(b, m);
+        guard.done();
     }
 
     #[tracing::instrument(skip(self), fields(%b, %subalgebra, num_new_gens, density))]
@@ -1070,7 +1206,7 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
             // so a cached matrix is the same matrix — see [`speculate`]. A shape mismatch would mean
             // that reasoning is wrong somewhere, so say so loudly and rebuild rather than trusting
             // it; `NASSAU_SPECULATE_VERIFY` checks the contents too.
-            let full = match speculate::take(b) {
+            let full = match speculate::take_or_claim(b) {
                 Some(m) if m.rows() == target_dim && m.columns() == next_dim => {
                     if speculate::verify() {
                         let fresh = self.build_full_restricted(b, target_dim, next_dim);
@@ -1884,11 +2020,13 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
         });
 
         if spec_threads > 0 {
-            let (built, hits, misses, bytes) = speculate::stats();
+            let (built, hits, misses, waited, timeouts, dropped, bytes) = speculate::stats();
             eprintln!(
                 "[speculate] threads={spec_threads} built={built} hits={hits} misses={misses} \
-                 hit_rate={:.1}% unused={:.1}GB",
+                 waited={waited} timeouts={timeouts} dropped={dropped} hit_rate={:.1}% wasted={} \
+                 unused={:.1}GB",
                 100.0 * hits as f64 / (hits + misses).max(1) as f64,
+                built.saturating_sub(hits) + dropped,
                 bytes as f64 / (1u64 << 30) as f64,
             );
         }
