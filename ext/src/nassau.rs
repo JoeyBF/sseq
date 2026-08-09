@@ -553,8 +553,9 @@ mod speculate {
         *A
     }
 
-    /// Cap on the bytes held by cached matrices. Speculation is skipped while over it.
-    fn max_bytes() -> usize {
+    /// Cap on the bytes held by cached matrices. Speculation is skipped while over it. Shared with
+    /// [`super::blocks`], which is an alternative granularity for the same cache, never a second one.
+    pub fn max_bytes() -> usize {
         static B: LazyLock<usize> = LazyLock::new(|| {
             std::env::var("NASSAU_SPECULATE_MAX_GB")
                 .ok()
@@ -854,6 +855,292 @@ mod speculate {
     }
 }
 
+/// Block-granular speculation: precompute *row blocks* of a bidegree's full restricted matrix.
+///
+/// [`speculate`] caches one whole matrix per bidegree, which bounds how early the work can start.
+/// The matrix at `(s, t)` is only fully determined once `(s - 1, t - 1)` is committed, so a builder
+/// gets at most the gap between "matrix determined" and "bidegree runs" — one degree of slack per
+/// row, and the measured hit rate is ~30%.
+///
+/// A *block* is the set of rows coming from generators of `modules[s - 1]` in a single degree
+/// `gen_deg` — the rows `Sq(R) · x` with `deg x = gen_deg` and `deg Sq(R) = t - gen_deg`, which is
+/// exactly the `(bidegree, input_deg, output_deg)` decomposition. A block is determined *far*
+/// earlier than the matrix it belongs to:
+///
+/// * **Its rows.** Basis elements of a [`FreeModule`] at degree `t` are laid out generator-major and
+///   the table is append-only (`add_generators` appends to every already-computed degree, so
+///   existing indices never move). The row range of block `gen_deg` is therefore
+///   `sum over h < gen_deg of num_gens[h] * dim(t - h)`, frozen once the generator counts below
+///   `gen_deg` are — i.e. once `(s - 1, gen_deg)` is committed. Not `t - 1`. This is the same
+///   row-block claim `NASSAU_SPLIT_VERIFY` checks against real data.
+/// * **Its columns.** `d(x)` for a generator `x` of degree `gen_deg` lands in the radical (that is
+///   minimality, and it is already what licenses the existing truncation in
+///   [`FreeModuleHomomorphism::apply_to_basis_element_restricted`]), so it is supported on
+///   generators of `modules[s - 2]` of degree *strictly* below `gen_deg`. Acting by `Sq(R)` does not
+///   change the generator, so the whole block is supported in the first
+///   `restricted_dimension(modules[s - 2], t, gen_deg)` columns. The block is built that narrow and
+///   zero-extended at assembly, so it needs only `(s - 2, gen_deg - 1)`, not `(s - 2, t - 2)`.
+///
+/// So block `gen_deg` of `(s, t)` is buildable as soon as `min(progress[s-1], progress[s-2])`
+/// reaches `gen_deg`, for *every* `t > gen_deg` still in region. That is what deepens the queue: a
+/// single commit opens blocks across a whole column of future bidegrees instead of one matrix.
+///
+/// # Consuming
+///
+/// The consumer takes whatever blocks are ready, copies them into the full matrix, and collects the
+/// rows it did not get into ONE coalesced build. A miss therefore costs nothing beyond the rows it
+/// covers — unlike [`speculate`], where a miss means rebuilding everything — so there is no waiting
+/// on in-flight work here, and hence none of that module's deadlock hazard: a block that has not
+/// landed is simply folded into the launch the consumer was making anyway.
+///
+/// # Configuration
+///
+/// * `NASSAU_SPECULATE_BLOCKS` — use block granularity instead of whole matrices.
+/// * `NASSAU_SPECULATE_BLOCK_AHEAD` — degrees past a row's frontier to speculate (default 24).
+/// * `NASSAU_SPECULATE_BLOCK_QUEUE` — cap on queued blocks (default 1M), a flood guard.
+mod blocks {
+    use std::{
+        cmp::Reverse,
+        collections::{BinaryHeap, HashMap},
+        sync::{
+            Condvar, LazyLock, Mutex,
+            atomic::{AtomicUsize, Ordering},
+        },
+    };
+
+    use fp::matrix::Matrix;
+    use sseq::coordinates::Bidegree;
+
+    pub fn enabled() -> bool {
+        static E: LazyLock<bool> =
+            LazyLock::new(|| std::env::var_os("NASSAU_SPECULATE_BLOCKS").is_some());
+        *E
+    }
+
+    /// How far past a row's own committed frontier to speculate blocks. Smaller than
+    /// [`super::speculate::ahead`] by default because each degree contributes many items, not one.
+    pub fn ahead() -> i32 {
+        static A: LazyLock<i32> = LazyLock::new(|| {
+            std::env::var("NASSAU_SPECULATE_BLOCK_AHEAD")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(24)
+        });
+        *A
+    }
+
+    fn queue_cap() -> usize {
+        static Q: LazyLock<usize> = LazyLock::new(|| {
+            std::env::var("NASSAU_SPECULATE_BLOCK_QUEUE")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(1 << 20)
+        });
+        *Q
+    }
+
+    /// A finished block carries the row offset it was BUILT against, not just its contents.
+    ///
+    /// That offset is the fix for a real bug. The consumer used to re-derive each block's row range
+    /// from the module's generator counts at consumption time and got a different answer than the
+    /// builder had (`start=23` for a block whose rows actually sat at 22), silently misplacing every
+    /// row. A free module's basis at a fixed degree is append-only and generator-major, so the
+    /// offset a block was built against stays valid forever — recomputing it later is what is
+    /// fragile. So the block owns its position, and the consumer never re-derives it.
+    enum Slot {
+        InFlight,
+        Ready(usize, Matrix),
+    }
+
+    /// Every block known for one bidegree.
+    ///
+    /// `done` is set the moment the consumer collects, and is what stops a builder from starting (or
+    /// publishing) work whose bidegree has already assembled its matrix. The entry outlives the
+    /// collection precisely so that a straggling `publish` finds `done` and drops its result instead
+    /// of resurrecting the bidegree.
+    #[derive(Default)]
+    struct BidegreeBlocks {
+        done: bool,
+        slots: HashMap<i32, Slot>,
+    }
+
+    static CACHE: LazyLock<Mutex<HashMap<(i32, i32), BidegreeBlocks>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
+    static BYTES: AtomicUsize = AtomicUsize::new(0);
+    static BUILT: AtomicUsize = AtomicUsize::new(0);
+    static HITS: AtomicUsize = AtomicUsize::new(0);
+    static MISSES: AtomicUsize = AtomicUsize::new(0);
+    static DROPPED: AtomicUsize = AtomicUsize::new(0);
+    static ROWS_HIT: AtomicUsize = AtomicUsize::new(0);
+    static ROWS_MISSED: AtomicUsize = AtomicUsize::new(0);
+    static FLOODED: AtomicUsize = AtomicUsize::new(0);
+
+    fn size_of(m: &Matrix) -> usize {
+        m.rows() * m.columns().div_ceil(64) * 8
+    }
+
+    pub fn has_room() -> bool {
+        BYTES.load(Ordering::Relaxed) < super::speculate::max_bytes()
+    }
+
+    /// Take ownership of building one block, or report that it is already spoken for.
+    pub fn claim(b: Bidegree, gen_deg: i32) -> bool {
+        let mut g = CACHE.lock().unwrap();
+        let e = g.entry((b.s(), b.t())).or_default();
+        if e.done || e.slots.contains_key(&gen_deg) {
+            return false;
+        }
+        e.slots.insert(gen_deg, Slot::InFlight);
+        true
+    }
+
+    /// Releases a claim that produced nothing, so a later builder may retry it. Only reachable if
+    /// the builder panicked.
+    pub struct ClaimGuard(Option<(Bidegree, i32)>);
+
+    impl ClaimGuard {
+        pub fn new(b: Bidegree, gen_deg: i32) -> Self {
+            Self(Some((b, gen_deg)))
+        }
+
+        pub fn done(mut self) {
+            self.0 = None;
+        }
+    }
+
+    impl Drop for ClaimGuard {
+        fn drop(&mut self) {
+            if let Some((b, gen_deg)) = self.0
+                && let Some(e) = CACHE.lock().unwrap().get_mut(&(b.s(), b.t()))
+                && matches!(e.slots.get(&gen_deg), Some(Slot::InFlight))
+            {
+                e.slots.remove(&gen_deg);
+            }
+        }
+    }
+
+    pub fn publish(b: Bidegree, gen_deg: i32, start: usize, matrix: Matrix) {
+        let mut g = CACHE.lock().unwrap();
+        let Some(e) = g.get_mut(&(b.s(), b.t())) else {
+            DROPPED.fetch_add(1, Ordering::Relaxed);
+            return;
+        };
+        if e.done || !matches!(e.slots.get(&gen_deg), Some(Slot::InFlight)) {
+            DROPPED.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        BYTES.fetch_add(size_of(&matrix), Ordering::Relaxed);
+        BUILT.fetch_add(1, Ordering::Relaxed);
+        e.slots.insert(gen_deg, Slot::Ready(start, matrix));
+    }
+
+    /// Collect every ready block for `b` and close the bidegree to further speculation.
+    /// Collect every ready block for `b` as `(start, matrix)` sorted by row offset, and close the
+    /// bidegree to further speculation.
+    pub fn take_all(b: Bidegree) -> Vec<(usize, Matrix)> {
+        let mut g = CACHE.lock().unwrap();
+        let e = g.entry((b.s(), b.t())).or_default();
+        e.done = true;
+        let mut out = Vec::new();
+        for (_, slot) in std::mem::take(&mut e.slots) {
+            if let Slot::Ready(start, m) = slot {
+                BYTES.fetch_sub(size_of(&m), Ordering::Relaxed);
+                out.push((start, m));
+            }
+        }
+        out.sort_by_key(|(start, _)| *start);
+        out
+    }
+
+    /// Book-keeping from one assembly: blocks reused, blocks absent, and the row counts behind them
+    /// (the rows are what actually matter — a hit on a one-row block saves nothing).
+    pub fn record(hits: usize, misses: usize, rows_hit: usize, rows_missed: usize) {
+        HITS.fetch_add(hits, Ordering::Relaxed);
+        MISSES.fetch_add(misses, Ordering::Relaxed);
+        ROWS_HIT.fetch_add(rows_hit, Ordering::Relaxed);
+        ROWS_MISSED.fetch_add(rows_missed, Ordering::Relaxed);
+    }
+
+    pub fn stats() -> (usize, usize, usize, usize, usize, usize, usize, usize) {
+        (
+            BUILT.load(Ordering::Relaxed),
+            HITS.load(Ordering::Relaxed),
+            MISSES.load(Ordering::Relaxed),
+            ROWS_HIT.load(Ordering::Relaxed),
+            ROWS_MISSED.load(Ordering::Relaxed),
+            DROPPED.load(Ordering::Relaxed),
+            FLOODED.load(Ordering::Relaxed),
+            BYTES.load(Ordering::Relaxed),
+        )
+    }
+
+    pub fn clear() {
+        CACHE.lock().unwrap().clear();
+        BYTES.store(0, Ordering::Relaxed);
+    }
+
+    struct Queue {
+        heap: BinaryHeap<Reverse<(i32, i32, i32)>>,
+        closed: bool,
+    }
+
+    /// Pending blocks, ordered by `(t, s, gen_deg)` ascending — nearest bidegree first, and within a
+    /// bidegree the earliest generator degree first (those blocks have been available longest, so a
+    /// builder taking them is least likely to be racing the wavefront).
+    static QUEUE: LazyLock<(Mutex<Queue>, Condvar)> = LazyLock::new(|| {
+        (
+            Mutex::new(Queue {
+                heap: BinaryHeap::new(),
+                closed: false,
+            }),
+            Condvar::new(),
+        )
+    });
+
+    pub fn open() {
+        let (m, _) = &*QUEUE;
+        let mut q = m.lock().unwrap();
+        q.heap.clear();
+        q.closed = false;
+    }
+
+    pub fn push(b: Bidegree, gen_deg: i32) {
+        let (m, cv) = &*QUEUE;
+        let mut q = m.lock().unwrap();
+        // The block window is two-dimensional, so a lagging row can enqueue a quadratic number of
+        // items. Dropping the excess is safe: an unbuilt block is a miss, and a miss costs only the
+        // rows it covers.
+        if q.heap.len() >= queue_cap() {
+            FLOODED.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        q.heap.push(Reverse((b.t(), b.s(), gen_deg)));
+        cv.notify_one();
+    }
+
+    pub fn pop() -> Option<(Bidegree, i32)> {
+        let (m, cv) = &*QUEUE;
+        let mut q = m.lock().unwrap();
+        loop {
+            if let Some(Reverse((t, s, gen_deg))) = q.heap.pop() {
+                return Some((Bidegree::s_t(s, t), gen_deg));
+            }
+            if q.closed {
+                return None;
+            }
+            q = cv.wait(q).unwrap();
+        }
+    }
+
+    pub fn close() {
+        let (m, cv) = &*QUEUE;
+        let mut q = m.lock().unwrap();
+        q.closed = true;
+        q.heap.clear();
+        cv.notify_all();
+    }
+}
+
 /// A resolution of `S_2` using Nassau's algorithm.
 ///
 /// This aims to have an API similar to that of
@@ -1139,6 +1426,138 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
         }
     }
 
+    /// The row blocks of `b`'s full restricted matrix, as `(gen_deg, start, end)` with `start..end`
+    /// the rows coming from generators of `modules[b.s() - 1]` in degree `gen_deg`.
+    ///
+    /// The blocks tile `0..target_dim` exactly and in order, because a free module's basis is
+    /// generator-major. Only reads generator counts strictly below `b.t()`, the same frozen prefix
+    /// [`MilnorSubalgebra::restricted_dimension`] reads, so it is safe to call while generators of
+    /// degree `b.t()` are being added concurrently.
+    fn block_ranges(&self, b: Bidegree) -> Vec<(i32, usize, usize)> {
+        let target = &*self.modules[b.s() - 1];
+        target.compute_basis(b.t());
+        target
+            .iter_gen_offsets([b.t()])
+            .take_while(|g| g.gen_deg < b.t())
+            .filter(|g| g.end[0] > g.start[0])
+            .map(|g| (g.gen_deg, g.start[0], g.end[0]))
+            .collect()
+    }
+
+    /// Column count for the block at `gen_deg`: the restricted dimension of `modules[b.s() - 2]`
+    /// counting only generators of degree *strictly* below `gen_deg`.
+    ///
+    /// That bound is minimality. `d(x)` for a generator `x` of degree `gen_deg` lands in the radical,
+    /// so it is a combination of `op · y` with `deg op > 0` and hence `deg y < gen_deg`; acting by
+    /// `Sq(R)` keeps the generator, so the block cannot touch a column beyond this. Building the
+    /// block this narrow is what lets it be built before `modules[b.s() - 2]` has grown to `b.t()`.
+    fn block_cols(&self, b: Bidegree, gen_deg: i32) -> usize {
+        let next = &self.modules[b.s() - 2];
+        next.compute_basis(b.t());
+        MilnorSubalgebra::restricted_dimension(next, b.t(), gen_deg.min(b.t() - 1))
+    }
+
+    /// Build one row block of `b`'s matrix ahead of time and park it in the [`blocks`] cache.
+    #[tracing::instrument(skip(self), fields(%b, gen_deg, rows, cols))]
+    fn speculate_block(&self, b: Bidegree, gen_deg: i32) {
+        if self.has_computed_bidegree(b) || !blocks::has_room() {
+            return;
+        }
+        if let Some(store) = self.save_dir.store()
+            && store.exists(SaveKind::NassauDifferential, b)
+        {
+            return;
+        }
+        if !reuse_full_matrix(&self.differentials[b.s() - 1]) {
+            return;
+        }
+        let Some(&(_, start, end)) = self
+            .block_ranges(b)
+            .iter()
+            .find(|&&(g, _, _)| g == gen_deg)
+        else {
+            // The generators of `gen_deg` were not there after all, or the block is empty.
+            return;
+        };
+        let cols = self.block_cols(b, gen_deg);
+        tracing::Span::current().record("rows", end - start);
+        tracing::Span::current().record("cols", cols);
+        if cols == 0 {
+            return;
+        }
+        // Claim last, once every bail-out is behind us.
+        if !blocks::claim(b, gen_deg) {
+            return;
+        }
+        let guard = blocks::ClaimGuard::new(b, gen_deg);
+        let rows: Vec<usize> = (start..end).collect();
+        let diff = &self.differentials[b.s() - 1];
+        let m = speculate::pool().install(|| {
+            if speculate::on_cpu() {
+                restricted_partial_matrix(diff, b.t(), &rows, cols)
+            } else {
+                restricted_partial_matrix_maybe_gpu(diff, b.t(), &rows, cols)
+            }
+        });
+        blocks::publish(b, gen_deg, start, m);
+        guard.done();
+    }
+
+    /// Assemble `b`'s full restricted matrix from whatever row blocks were precomputed, building
+    /// everything else in a single coalesced launch.
+    ///
+    /// A missing block is cheap here — its rows simply join the build the consumer was making
+    /// anyway — which is why nothing waits on an in-flight block. The one big launch per bidegree
+    /// that [`reuse_full_matrix`] exists to create therefore survives: at worst it is the original
+    /// launch, at best it shrinks to the rows speculation did not cover.
+    fn assemble_full_restricted(&self, b: Bidegree, target_dim: usize, next_dim: usize) -> Matrix {
+        let mut full = Matrix::new(self.prime(), target_dim, next_dim);
+        let ready = blocks::take_all(b);
+        // Walk the row axis once, alternating between "a cached block covers these rows" and "these
+        // rows are mine to build". Blocks arrive sorted by offset and cannot overlap (one block per
+        // generator degree, each claimed once), but a stale one is dropped rather than trusted: a
+        // block that runs past `target_dim` or backwards over a row already covered would corrupt
+        // the matrix silently, and re-deriving those rows costs only their own multiply.
+        let mut missing: Vec<usize> = Vec::new();
+        let (mut hits, mut misses, mut rows_hit) = (0usize, 0usize, 0usize);
+        let mut cursor = 0usize;
+        for (start, m) in &ready {
+            let (start, end) = (*start, start + m.rows());
+            if start < cursor || end > target_dim || m.columns() > next_dim {
+                tracing::warn!(
+                    %b,
+                    "discarding speculative block: rows {start}..{end} x {} against {target_dim} x \
+                     {next_dim} (cursor {cursor})",
+                    m.columns(),
+                );
+                misses += 1;
+                continue;
+            }
+            missing.extend(cursor..start);
+            for (i, r) in (start..end).enumerate() {
+                full.row_mut(r).slice_mut(0, m.columns()).assign(m.row(i));
+            }
+            hits += 1;
+            rows_hit += m.rows();
+            cursor = end;
+        }
+        missing.extend(cursor..target_dim);
+        blocks::record(hits, misses, rows_hit, missing.len());
+        if !missing.is_empty() {
+            let part = restricted_partial_matrix_maybe_gpu(
+                &self.differentials[b.s() - 1],
+                b.t(),
+                &missing,
+                next_dim,
+            );
+            for (i, &r) in missing.iter().enumerate() {
+                full.row_mut(r).assign(part.row(i));
+            }
+        }
+        full
+    }
+
+
     /// Build `b`'s full matrix ahead of time and park it in the [`speculate`] cache.
     ///
     /// Only called for `b.s() >= 2` and only once `(b.s() - 1, b.t() - 1)` is committed, which is
@@ -1253,7 +1672,21 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
             // so a cached matrix is the same matrix — see [`speculate`]. A shape mismatch would mean
             // that reasoning is wrong somewhere, so say so loudly and rebuild rather than trusting
             // it; `NASSAU_SPECULATE_VERIFY` checks the contents too.
-            let full = match speculate::take_or_claim(b) {
+            let full = if blocks::enabled() {
+                let m = self.assemble_full_restricted(b, target_dim, next_dim);
+                if speculate::verify() {
+                    let fresh = self.build_full_restricted(b, target_dim, next_dim, false);
+                    for r in 0..target_dim {
+                        assert_eq!(
+                            m.row(r).iter_nonzero().collect::<Vec<_>>(),
+                            fresh.row(r).iter_nonzero().collect::<Vec<_>>(),
+                            "assembled block matrix mismatch at {b}, row {r}"
+                        );
+                    }
+                }
+                m
+            } else {
+                match speculate::take_or_claim(b) {
                 Some(m) if m.rows() == target_dim && m.columns() == next_dim => {
                     if speculate::verify() {
                         let fresh = self.build_full_restricted(b, target_dim, next_dim, false);
@@ -1277,6 +1710,7 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                         );
                     }
                     self.build_full_restricted(b, target_dim, next_dim, false)
+                }
                 }
             };
             // `NASSAU_SPLIT_VERIFY`: check the ROW-BLOCK DECOMPOSITION empirically.
@@ -1854,6 +2288,7 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
         let tracing_span = tracing::Span::current();
         let spec_threads = speculate::threads();
         speculate::open();
+        blocks::open();
 
         // Speculative builders run *outside* the rayon pool on purpose. They are a background task
         // whose whole point is to use time the wavefront is not using; putting them in the pool
@@ -1864,8 +2299,14 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                 let tracing_span = tracing_span.clone();
                 spec_scope.spawn(move || {
                     let _tracing_guard = tracing_span.enter();
-                    while let Some(b) = speculate::pop() {
-                        self.speculate_build(b);
+                    if blocks::enabled() {
+                        while let Some((b, gen_deg)) = blocks::pop() {
+                            self.speculate_block(b, gen_deg);
+                        }
+                    } else {
+                        while let Some(b) = speculate::pop() {
+                            self.speculate_build(b);
+                        }
                     }
                 });
             }
@@ -1932,6 +2373,12 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                 // Largest `t` already queued for speculation in each row, so a commit only enqueues the
                 // window it newly opened.
                 let mut spec_issued: Vec<i32> = vec![min_degree - 1; max_s as usize + 1];
+                // Block mode issues over a RECTANGLE per row -- internal degrees `t` crossed with
+                // generator degrees `gen_deg` -- so it needs the high-water mark of both axes to
+                // enqueue only what a commit newly opened. Both grow monotonically, so the new work
+                // is always two strips: the `t`s just opened (at every available `gen_deg`), and the
+                // `gen_deg`s just opened (at every `t` already in the window).
+                let mut spec_issued_g: Vec<i32> = vec![min_degree - 1; max_s as usize + 1];
                 // Enqueue every bidegree whose matrix is now determined but which cannot run yet.
                 //
                 // `(r, t)`'s matrix needs only `(r - 1, t - 1)` — i.e. `t <= progress[r - 1] + 1` —
@@ -1939,8 +2386,48 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                 // those two bounds is a bidegree we can build for but not yet run: exactly the
                 // speculation window. We start at `progress[r] + 2` because `progress[r] + 1` is the
                 // bidegree the scheduler is spawning right now, whose matrix a builder would only race.
-                let enqueue_spec = |progress: &[i32], spec_issued: &mut Vec<i32>| {
+                //
+                // In BLOCK mode the first bound disappears: block `gen_deg` of `(r, t)` needs only
+                // `gen_deg <= min(progress[r - 1], progress[r - 2])`, for every `t > gen_deg` still
+                // in region. So the `t` window is capped only by how far ahead we are willing to
+                // speculate, and one commit opens blocks across a whole column of future bidegrees
+                // rather than a single matrix — which is the point, since the queue depth is what
+                // the GPU is starved of.
+                let enqueue_spec = |progress: &[i32],
+                                    spec_issued: &mut Vec<i32>,
+                                    spec_issued_g: &mut Vec<i32>| {
                     if spec_threads == 0 {
+                        return;
+                    }
+                    if blocks::enabled() {
+                        for r in 2..=max_s {
+                            let ri = r as usize;
+                            // Generator degrees whose rows AND columns are both frozen.
+                            let gf = std::cmp::min(progress[ri - 1], progress[ri - 2]);
+                            let hi_t = progress[ri] + 1 + blocks::ahead();
+                            let lo_t = progress[ri] + 2;
+                            let emit = |t: i32, lo_g: i32, hi_g: i32| {
+                                if !in_region(r, t) {
+                                    return;
+                                }
+                                // `gen_deg < t`: a generator of degree `t` contributes no rows to
+                                // the restricted matrix at `t`.
+                                for g in lo_g..=std::cmp::min(hi_g, t - 1) {
+                                    blocks::push(Bidegree::s_t(r, t), g);
+                                }
+                            };
+                            // Strip A: internal degrees newly in the window, at every `gen_deg`.
+                            for t in std::cmp::max(lo_t, spec_issued[ri] + 1)..=hi_t {
+                                emit(t, min_degree, gf);
+                            }
+                            // Strip B: generator degrees newly frozen, at internal degrees already
+                            // issued.
+                            for t in lo_t..=std::cmp::min(spec_issued[ri], hi_t) {
+                                emit(t, spec_issued_g[ri] + 1, gf);
+                            }
+                            spec_issued[ri] = std::cmp::max(spec_issued[ri], hi_t);
+                            spec_issued_g[ri] = std::cmp::max(spec_issued_g[ri], gf);
+                        }
                         return;
                     }
                     for r in 2..=max_s {
@@ -1984,7 +2471,7 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                         }
                         assert!(progress[b.s() as usize] == b.t() - 1);
                         progress[b.s() as usize] = b.t();
-                        enqueue_spec(&progress, &mut spec_issued);
+                        enqueue_spec(&progress, &mut spec_issued, &mut spec_issued_g);
 
                         if mem_report {
                             commit_count += 1;
@@ -2064,9 +2551,23 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
 
             // The wavefront is done, so no further matrix can be wanted: release the builders.
             speculate::close();
+            blocks::close();
         });
 
-        if spec_threads > 0 {
+        if spec_threads > 0 && blocks::enabled() {
+            let (built, hits, misses, rows_hit, rows_missed, dropped, flooded, bytes) =
+                blocks::stats();
+            // `row_rate` is the figure of merit, not `hit_rate`: a hit on a one-row block removes
+            // almost nothing from the consumer's launch.
+            eprintln!(
+                "[blocks] threads={spec_threads} built={built} hits={hits} misses={misses} \
+                 hit_rate={:.1}% rows_hit={rows_hit} rows_missed={rows_missed} row_rate={:.1}% \
+                 dropped={dropped} flooded={flooded} unused={:.1}GB",
+                100.0 * hits as f64 / (hits + misses).max(1) as f64,
+                100.0 * rows_hit as f64 / (rows_hit + rows_missed).max(1) as f64,
+                bytes as f64 / (1u64 << 30) as f64,
+            );
+        } else if spec_threads > 0 {
             let (built, hits, misses, waited, timeouts, dropped, bytes) = speculate::stats();
             eprintln!(
                 "[speculate] threads={spec_threads} built={built} hits={hits} misses={misses} \
@@ -2078,6 +2579,7 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
             );
         }
         speculate::clear();
+        blocks::clear();
 
         // Eviction probe (`NASSAU_R_STATS`): dump the R-access distribution once the wavefront is done.
         #[cfg(feature = "gpu")]
