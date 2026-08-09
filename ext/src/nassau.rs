@@ -974,6 +974,7 @@ mod blocks {
     static ROWS_HIT: AtomicUsize = AtomicUsize::new(0);
     static ROWS_MISSED: AtomicUsize = AtomicUsize::new(0);
     static FLOODED: AtomicUsize = AtomicUsize::new(0);
+    static RELEASED: AtomicUsize = AtomicUsize::new(0);
 
     fn size_of(m: &Matrix) -> usize {
         m.rows() * m.columns().div_ceil(64) * 8
@@ -1052,6 +1053,12 @@ mod blocks {
         out
     }
 
+    /// Drop every block for a bidegree that will never assemble one, and close it to further
+    /// speculation. Counted separately so the waste is visible rather than inferred.
+    pub fn release(b: Bidegree) {
+        RELEASED.fetch_add(take_all(b).len(), Ordering::Relaxed);
+    }
+
     /// Book-keeping from one assembly: blocks reused, blocks absent, and the row counts behind them
     /// (the rows are what actually matter — a hit on a one-row block saves nothing).
     pub fn record(hits: usize, misses: usize, rows_hit: usize, rows_missed: usize) {
@@ -1069,7 +1076,7 @@ mod blocks {
             ROWS_HIT.load(Ordering::Relaxed),
             ROWS_MISSED.load(Ordering::Relaxed),
             DROPPED.load(Ordering::Relaxed),
-            FLOODED.load(Ordering::Relaxed),
+            RELEASED.load(Ordering::Relaxed),
             BYTES.load(Ordering::Relaxed),
         )
     }
@@ -1435,6 +1442,8 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
     /// degree `b.t()` are being added concurrently.
     fn block_ranges(&self, b: Bidegree) -> Vec<(i32, usize, usize)> {
         let target = &*self.modules[b.s() - 1];
+        // Per-bidegree, NOT hoisted over the whole range: a module whose basis is computed through
+        // `max.t()` up front can no longer have generators added back into it.
         target.compute_basis(b.t());
         target
             .iter_gen_offsets([b.t()])
@@ -1471,14 +1480,29 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
         if !reuse_full_matrix(&self.differentials[b.s() - 1]) {
             return;
         }
-        let Some(&(_, start, end)) = self
-            .block_ranges(b)
-            .iter()
-            .find(|&&(g, _, _)| g == gen_deg)
-        else {
+        // Don't precompute for a bidegree that will never collect. The consumer only assembles when
+        // the matrix is within `reuse_within_cap`; above it, it builds per signature and never calls
+        // `take_all`, so every block built here would be wasted work AND would sit in the cache
+        // until the run ended — which is where `unused=150.3GB` at stem 200 came from.
+        //
+        // The dims are read early, before the bidegree's frontier is frozen, so they are a LOWER
+        // bound on the final ones. That makes this sound in one direction only: already over the cap
+        // now means over it for good. The consumer releases whatever slips through.
+        let ranges = self.block_ranges(b);
+        let Some(&(_, start, end)) = ranges.iter().find(|&&(g, _, _)| g == gen_deg) else {
             // The generators of `gen_deg` were not there after all, or the block is empty.
             return;
         };
+        // The cap check reuses what `block_ranges` already computed rather than calling
+        // `restricted_dims`, which would repeat the same `compute_basis` work per block: doing that
+        // slowed the builders enough to cut row coverage from 93% to 55% at stem 30. The blocks tile
+        // the restricted source basis, so the last range's end IS the row count, and the column
+        // count is the widest block's.
+        let target_dim = ranges.last().map_or(0, |&(_, _, e)| e);
+        let next_dim = self.block_cols(b, b.t() - 1);
+        if !reuse_within_cap(target_dim, next_dim) {
+            return;
+        }
         let cols = self.block_cols(b, gen_deg);
         tracing::Span::current().record("rows", end - start);
         tracing::Span::current().record("cols", cols);
@@ -1748,6 +1772,13 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
             }
             Some(full)
         } else {
+            // This bidegree is building per signature, so nothing will ever collect its blocks.
+            // Release them here rather than leaving them pinned until the end of the run: they hold
+            // memory against `has_room()`, which would starve speculation for the bidegrees that
+            // DO collect.
+            if blocks::enabled() {
+                blocks::release(b);
+            }
             None
         };
 
@@ -2555,14 +2586,14 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
         });
 
         if spec_threads > 0 && blocks::enabled() {
-            let (built, hits, misses, rows_hit, rows_missed, dropped, flooded, bytes) =
+            let (built, hits, misses, rows_hit, rows_missed, dropped, released, bytes) =
                 blocks::stats();
             // `row_rate` is the figure of merit, not `hit_rate`: a hit on a one-row block removes
             // almost nothing from the consumer's launch.
             eprintln!(
                 "[blocks] threads={spec_threads} built={built} hits={hits} misses={misses} \
                  hit_rate={:.1}% rows_hit={rows_hit} rows_missed={rows_missed} row_rate={:.1}% \
-                 dropped={dropped} flooded={flooded} unused={:.1}GB",
+                 dropped={dropped} released={released} unused={:.1}GB",
                 100.0 * hits as f64 / (hits + misses).max(1) as f64,
                 100.0 * rows_hit as f64 / (rows_hit + rows_missed).max(1) as f64,
                 bytes as f64 / (1u64 << 30) as f64,
