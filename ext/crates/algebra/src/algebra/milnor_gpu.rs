@@ -1405,6 +1405,12 @@ fn start_prefetch(algebra: &Arc<MilnorAlgebra>) {
                     //
                     // Plain `std::thread`, not rayon: this must never inject into the pool the
                     // wavefront is using (see the deadlock the speculative builders hit).
+                    if prefetch_on_gpu() {
+                        prefetch_degree_gpu(&alg, d, n);
+                        done_to = d;
+                        PREFETCH_DEGREE.store(d, Ordering::Relaxed);
+                        continue;
+                    }
                     let nthreads = prefetch_threads().min(n.max(1));
                     std::thread::scope(|sc| {
                         for tid in 0..nthreads {
@@ -1443,6 +1449,317 @@ fn start_prefetch(algebra: &Arc<MilnorAlgebra>) {
             })
             .expect("failed to spawn the prefetch thread");
     });
+}
+
+/// Enumerate a whole BATCH of `R`s in one device launch, returning `(cs_len, mk_len, cs, mk)` per
+/// `R` in the order given.
+///
+/// # Why this exists
+///
+/// The enum kernel is starved, and not because of launch geometry. A production launch carries the
+/// `R`s of the ONE multiply that needs them (`Rs/launch mean=1293`, `waves/SM=0.013`), and the GPU
+/// submission queue is only ~1.5 deep, so there is essentially never a peer launch to merge with.
+/// That is why widening the grid 6.5x bought 3.4% and two streams bought nothing: there is no second
+/// launch to overlap. The warmer has no such constraint -- nothing downstream is waiting on it, so
+/// it can hand the kernel an entire degree at once and finally fill the device.
+///
+/// # Two passes, and no host enumeration at all
+///
+/// `emit = 0` compiles the emit stores out entirely and fills only `out_counts`, which is exactly
+/// what the offset prefix-sum needs. So the counts that decide which `R`s are worth storing come
+/// from the GPU, not from `admissible_matrices` -- previously the threshold test alone cost a full
+/// CPU enumeration of every `R` in the degree, whether or not it was kept. `emit = 1` then writes
+/// the arrays for the keepers.
+///
+/// The emit pass is chunked to bound device scratch (`NASSAU_GPU_ENUM_BATCH_MB`, default 2048): a
+/// degree's full output reaches many GB at high stems, while the count pass is `4 · n` bytes and
+/// never needs chunking.
+fn enum_batch_layout(pps: &[PPart]) -> (usize, Vec<u32>, Vec<u32>, Vec<u32>) {
+    let n_r = pps.len();
+    let width = pps.iter().map(|pp| pp.len()).max().unwrap().max(1);
+    let mut pp_flat = vec![0u32; n_r * width];
+    let mut r_rows = vec![0u32; n_r];
+    let mut r_cols = vec![0u32; n_r];
+    for (i, pp) in pps.iter().enumerate() {
+        let rows = pp.len();
+        let cols = pp
+            .iter()
+            .map(|x| (u32::BITS - x.leading_zeros()) as usize)
+            .max()
+            .unwrap_or(1);
+        for (slot, v) in pp_flat[i * width..i * width + rows]
+            .iter_mut()
+            .zip(pp.iter())
+        {
+            *slot = v;
+        }
+        r_rows[i] = rows as u32;
+        r_cols[i] = cols as u32;
+    }
+    (width, pp_flat, r_rows, r_cols)
+}
+
+/// Pass 1 of [`enumerate_batch_gpu`]: how many admissible matrices each `R` has, from the device.
+///
+/// `emit = 0` compiles the stores out, so this is the odometer alone -- and it means the counts that
+/// decide which `R`s are worth keeping no longer cost a CPU enumeration each. Never needs chunking:
+/// the output is 4 bytes per `R`.
+fn enumerate_counts_gpu(pps: &[PPart], dev: usize) -> Vec<u32> {
+    if pps.is_empty() {
+        return Vec::new();
+    }
+    let n_r = pps.len();
+    let (width, pp_flat, r_rows, r_cols) = enum_batch_layout(pps);
+    {
+        gpu_thread::run_on(dev, move || {
+            let client = gpu_client();
+            let zeros = vec![0u64; n_r];
+            let pp_h = client.create_from_slice(u32::as_bytes(&pp_flat));
+            let rr_h = client.create_from_slice(u32::as_bytes(&r_rows));
+            let rc_h = client.create_from_slice(u32::as_bytes(&r_cols));
+            let rco_h = client.create_from_slice(u64::as_bytes(&zeros));
+            let rmo_h = client.create_from_slice(u64::as_bytes(&zeros));
+            // `emit = 0` writes nothing here, but the buffers must still bind.
+            let ocs_h = client.empty(size_of::<u16>());
+            let omk_h = client.empty(size_of::<u16>());
+            let cnt_h = client.empty(n_r * size_of::<u32>());
+            ENUM_LAUNCHES.fetch_add(1, Ordering::Relaxed);
+            ENUM_RS.fetch_add(n_r as u64, Ordering::Relaxed);
+            ENUM_RS_MAX.fetch_max(n_r as u64, Ordering::Relaxed);
+            unsafe {
+                enumerate_admissible_kernel::launch_unchecked::<CudaRuntime>(
+                    client,
+                    CubeCount::Static((n_r as u32).div_ceil(ENUM_BLOCK), 1, 1),
+                    CubeDim::new_1d(ENUM_BLOCK),
+                    BufferArg::from_raw_parts(pp_h, pp_flat.len()),
+                    BufferArg::from_raw_parts(rr_h, n_r),
+                    BufferArg::from_raw_parts(rc_h, n_r),
+                    BufferArg::from_raw_parts(rco_h, n_r),
+                    BufferArg::from_raw_parts(rmo_h, n_r),
+                    BufferArg::from_raw_parts(ocs_h, 1),
+                    BufferArg::from_raw_parts(omk_h, 1),
+                    BufferArg::from_raw_parts(cnt_h.clone(), n_r),
+                    width,
+                    n_r,
+                    0u32,
+                    0,
+                );
+            }
+            u32::from_bytes(&client.read_one(cnt_h).unwrap()).to_vec()
+        })
+        .0
+    }
+}
+
+/// Pass 2 of [`enumerate_batch_gpu`]: emit the arrays for `pps`, given their `counts` from
+/// [`enumerate_counts_gpu`]. Chunked so one launch's device scratch stays within
+/// [`enum_batch_bytes`] -- a degree's full output reaches many GB at high stems.
+fn enumerate_batch_gpu(
+    pps: &[PPart],
+    counts: &[u32],
+    dev: usize,
+) -> Vec<(usize, usize, Vec<u32>, Vec<u32>)> {
+    if pps.is_empty() {
+        return Vec::new();
+    }
+    let n_r = pps.len();
+    let (width, pp_flat, r_rows, r_cols) = enum_batch_layout(pps);
+    let cs_len_of = |i: usize| (r_cols[i] as usize).saturating_sub(1);
+    let mk_len_of = |i: usize| (r_rows[i] + r_cols[i]) as usize - 1;
+
+    let mut out: Vec<(usize, usize, Vec<u32>, Vec<u32>)> = (0..n_r)
+        .map(|i| (cs_len_of(i), mk_len_of(i), Vec::new(), Vec::new()))
+        .collect();
+
+    // Pass 2: emit, chunked so one launch's scratch stays within budget.
+    let budget = enum_batch_bytes();
+    let mut lo = 0usize;
+    while lo < n_r {
+        let mut hi = lo;
+        let mut bytes = 0u64;
+        while hi < n_r {
+            let b = counts[hi] as u64 * (cs_len_of(hi) + mk_len_of(hi)) as u64 * 2;
+            if hi > lo && bytes + b > budget {
+                break;
+            }
+            bytes += b;
+            hi += 1;
+        }
+        let m = hi - lo;
+        let mut cs_off = vec![0u64; m];
+        let mut mk_off = vec![0u64; m];
+        let (mut cs_tot, mut mk_tot) = (0u64, 0u64);
+        for k in 0..m {
+            cs_off[k] = cs_tot;
+            mk_off[k] = mk_tot;
+            cs_tot += counts[lo + k] as u64 * cs_len_of(lo + k) as u64;
+            mk_tot += counts[lo + k] as u64 * mk_len_of(lo + k) as u64;
+        }
+        // The launch closure takes ownership; the split loop below still needs the offsets.
+        let cs_off_c = cs_off.clone();
+        let mk_off_c = mk_off.clone();
+        let pp_s = pp_flat[lo * width..hi * width].to_vec();
+        let rr_s = r_rows[lo..hi].to_vec();
+        let rc_s = r_cols[lo..hi].to_vec();
+        let (cs_all, mk_all) = gpu_thread::run_on(dev, move || {
+            let client = gpu_client();
+            let cs_cap = cs_tot.max(1) as usize;
+            let mk_cap = mk_tot.max(1) as usize;
+            let pp_h = client.create_from_slice(u32::as_bytes(&pp_s));
+            let rr_h = client.create_from_slice(u32::as_bytes(&rr_s));
+            let rc_h = client.create_from_slice(u32::as_bytes(&rc_s));
+            let rco_h = client.create_from_slice(u64::as_bytes(&cs_off_c));
+            let rmo_h = client.create_from_slice(u64::as_bytes(&mk_off_c));
+            let ocs_h = client.empty(cs_cap * size_of::<u16>());
+            let omk_h = client.empty(mk_cap * size_of::<u16>());
+            let cnt_h = client.empty(m * size_of::<u32>());
+            ENUM_LAUNCHES.fetch_add(1, Ordering::Relaxed);
+            ENUM_RS.fetch_add(m as u64, Ordering::Relaxed);
+            ENUM_RS_MAX.fetch_max(m as u64, Ordering::Relaxed);
+            ENUM_BLOCKS.fetch_add((m as u32).div_ceil(ENUM_BLOCK) as u64, Ordering::Relaxed);
+            unsafe {
+                enumerate_admissible_kernel::launch_unchecked::<CudaRuntime>(
+                    client,
+                    CubeCount::Static((m as u32).div_ceil(ENUM_BLOCK), 1, 1),
+                    CubeDim::new_1d(ENUM_BLOCK),
+                    BufferArg::from_raw_parts(pp_h, pp_s.len()),
+                    BufferArg::from_raw_parts(rr_h, m),
+                    BufferArg::from_raw_parts(rc_h, m),
+                    BufferArg::from_raw_parts(rco_h, m),
+                    BufferArg::from_raw_parts(rmo_h, m),
+                    BufferArg::from_raw_parts(ocs_h.clone(), cs_cap),
+                    BufferArg::from_raw_parts(omk_h.clone(), mk_cap),
+                    BufferArg::from_raw_parts(cnt_h, m),
+                    width,
+                    m,
+                    0u32,
+                    1,
+                );
+            }
+            (
+                u16::from_bytes(&client.read_one(ocs_h).unwrap()).to_vec(),
+                u16::from_bytes(&client.read_one(omk_h).unwrap()).to_vec(),
+            )
+        })
+        .0;
+        // Widen to `u32` for [`resident_append`], which narrows again on the way in. The round trip
+        // is one pass over data that took a device launch to produce, and it keeps a single append
+        // path shared with the CPU enumerations.
+        for k in 0..m {
+            let i = lo + k;
+            let (cl, ml) = (cs_len_of(i), mk_len_of(i));
+            let c0 = cs_off[k] as usize;
+            let m0 = mk_off[k] as usize;
+            let cn = counts[i] as usize * cl;
+            let mn = counts[i] as usize * ml;
+            out[i].2 = cs_all[c0..c0 + cn].iter().map(|&v| v as u32).collect();
+            out[i].3 = mk_all[m0..m0 + mn].iter().map(|&v| v as u32).collect();
+        }
+        lo = hi;
+    }
+    out
+}
+
+/// Device scratch budget for one emit pass of [`enumerate_batch_gpu`]
+/// (`NASSAU_GPU_ENUM_BATCH_MB`, default 2048).
+fn enum_batch_bytes() -> u64 {
+    static B: LazyLock<u64> = LazyLock::new(|| {
+        std::env::var("NASSAU_GPU_ENUM_BATCH_MB")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(2048)
+            << 20
+    });
+    *B
+}
+
+/// Warm one whole degree using batched device enumeration, sharded across every GPU.
+///
+/// This is the saturating path. Instead of `n` separate CPU enumerations (or `n` tiny device
+/// launches), each device gets the `R`s it owns in one count pass and a handful of emit passes, so a
+/// launch carries thousands of `R`s instead of the ~1293 a multiply-driven launch can supply. The
+/// shards run concurrently, which also puts the three idle GPUs to work -- sampling shows GPU 0 near
+/// 100% and GPUs 1-3 near zero.
+///
+/// The count pass is what makes the threshold test cheap: `num_mats` arrives from the device, so an
+/// `R` below `pin_min_mats` is rejected without ever being enumerated on the host. Counts are
+/// memoised into `COLD_COUNT` for every `R` seen, kept or not, so the multiply path inherits them.
+fn prefetch_degree_gpu(alg: &Arc<MilnorAlgebra>, d: i32, n: usize) {
+    // Group by owning device: an `R`'s rows live on one device's master, and enumerating it there
+    // keeps the whole degree's work spread the same way the master is.
+    let mut by_dev: Vec<Vec<PPart>> = vec![Vec::new(); gpu_count()];
+    for i in 0..n {
+        let pp = alg.basis_element_from_index(d, i).p_part;
+        if pp.is_empty() || resident_contains(pp) {
+            continue;
+        }
+        by_dev[shard_of(pp)].push(pp);
+    }
+    std::thread::scope(|sc| {
+        for (dev, pps) in by_dev.iter().enumerate() {
+            if pps.is_empty() {
+                continue;
+            }
+            let alg = alg;
+            sc.spawn(move || {
+                let counts = enumerate_counts_gpu(pps, dev);
+                let mut keep: Vec<PPart> = Vec::new();
+                let mut keep_counts: Vec<u32> = Vec::new();
+                {
+                    let mut cc = COLD_COUNT.write().unwrap();
+                    for (i, &pp) in pps.iter().enumerate() {
+                        let rows = pp.len() as u32;
+                        let cols = pp
+                            .iter()
+                            .map(|x| u32::BITS - x.leading_zeros())
+                            .max()
+                            .unwrap_or(1);
+                        cc.entry(pp).or_insert((
+                            cols.saturating_sub(1),
+                            rows + cols - 1,
+                            counts[i],
+                        ));
+                        if counts[i] as u64 >= pin_min_mats() {
+                            keep.push(pp);
+                            keep_counts.push(counts[i]);
+                        }
+                    }
+                }
+                for (i, (cs_len, mk_len, cs, mk)) in enumerate_batch_gpu(&keep, &keep_counts, dev)
+                    .into_iter()
+                    .enumerate()
+                {
+                    if enum_batch_verify() {
+                        let (rcl, rml, rcs, rmk) = alg.admissible_matrices(keep[i]);
+                        assert_eq!(
+                            (rcl, rml, &rcs, &rmk),
+                            (cs_len, mk_len, &cs, &mk),
+                            "batched device enumeration disagrees with admissible_matrices at \
+                             degree {d}"
+                        );
+                    }
+                    resident_append(keep[i], cs_len, mk_len, &cs, &mk);
+                    PREFETCHED.fetch_add(1, Ordering::Relaxed);
+                }
+            });
+        }
+    });
+}
+
+/// Whether the prefetcher enumerates on the device in batches (`NASSAU_GPU_PREFETCH_GPU`).
+fn prefetch_on_gpu() -> bool {
+    static G: LazyLock<bool> =
+        LazyLock::new(|| std::env::var_os("NASSAU_GPU_PREFETCH_GPU").is_some());
+    *G
+}
+
+/// Check every batched device enumeration against `admissible_matrices`
+/// (`NASSAU_GPU_ENUM_BATCH_VERIFY`). Expensive -- it re-runs on the host exactly the work the batch
+/// exists to avoid -- so it is for validation runs only.
+fn enum_batch_verify() -> bool {
+    static V: LazyLock<bool> =
+        LazyLock::new(|| std::env::var_os("NASSAU_GPU_ENUM_BATCH_VERIFY").is_some());
+    *V
 }
 
 /// Diagnostics: how many `R`s the prefetcher stored, and how far ahead it has reached.
