@@ -1558,6 +1558,7 @@ fn enumerate_counts_gpu(pps: &[PPart], dev: usize) -> Vec<u32> {
             ENUM_LAUNCHES.fetch_add(1, Ordering::Relaxed);
             ENUM_RS.fetch_add(n_r as u64, Ordering::Relaxed);
             ENUM_RS_MAX.fetch_max(n_r as u64, Ordering::Relaxed);
+            record_batch(n_r);
             unsafe {
                 enumerate_admissible_kernel::launch_unchecked::<CudaRuntime>(
                     client,
@@ -1648,6 +1649,7 @@ fn enumerate_batch_gpu(
             ENUM_LAUNCHES.fetch_add(1, Ordering::Relaxed);
             ENUM_RS.fetch_add(m as u64, Ordering::Relaxed);
             ENUM_RS_MAX.fetch_max(m as u64, Ordering::Relaxed);
+            record_batch(m);
             ENUM_BLOCKS.fetch_add((m as u32).div_ceil(ENUM_BLOCK) as u64, Ordering::Relaxed);
             unsafe {
                 enumerate_admissible_kernel::launch_unchecked::<CudaRuntime>(
@@ -1693,13 +1695,19 @@ fn enumerate_batch_gpu(
 }
 
 /// Device scratch budget for one emit pass of [`enumerate_batch_gpu`]
-/// (`NASSAU_GPU_ENUM_BATCH_MB`, default 2048).
+/// (`NASSAU_GPU_ENUM_BATCH_MB`, default 16384).
+///
+/// It was 2048, which silently defeated the entire point. A pinned `R` (`num_mats >= 200`) is often
+/// megabytes of `col_sums`/`masks`, so a 2 GB budget fits only a few hundred of them: the batched
+/// path ran at ~947 `R`s per launch, BELOW the 531-mean multiply-driven launches it was meant to
+/// dwarf, and `Rs/launch max` came out identical (13650) to the un-batched arm — proof that no batch
+/// ever got large. Anything measured under that budget says nothing about batching.
 fn enum_batch_bytes() -> u64 {
     static B: LazyLock<u64> = LazyLock::new(|| {
         std::env::var("NASSAU_GPU_ENUM_BATCH_MB")
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(2048)
+            .unwrap_or(16384)
             << 20
     });
     *B
@@ -1792,6 +1800,29 @@ fn enum_batch_verify() -> bool {
     static V: LazyLock<bool> =
         LazyLock::new(|| std::env::var_os("NASSAU_GPU_ENUM_BATCH_VERIFY").is_some());
     *V
+}
+
+/// Diagnostics: batched-enumeration launch sizes, so saturation is observed rather than assumed.
+/// `Rs/launch` in the `[batch-stats]` line is dominated by the multiply-driven launches, which hid
+/// the fact that the batches were small.
+static PF_BATCH_N: AtomicU64 = AtomicU64::new(0);
+static PF_BATCH_RS: AtomicU64 = AtomicU64::new(0);
+static PF_BATCH_MAX: AtomicU64 = AtomicU64::new(0);
+
+fn record_batch(n: usize) {
+    PF_BATCH_N.fetch_add(1, Ordering::Relaxed);
+    PF_BATCH_RS.fetch_add(n as u64, Ordering::Relaxed);
+    PF_BATCH_MAX.fetch_max(n as u64, Ordering::Relaxed);
+}
+
+/// `(batch launches, mean R's per batch, largest batch)`.
+pub fn prefetch_batch_stats() -> (u64, u64, u64) {
+    let n = PF_BATCH_N.load(Ordering::Relaxed);
+    (
+        n,
+        PF_BATCH_RS.load(Ordering::Relaxed) / n.max(1),
+        PF_BATCH_MAX.load(Ordering::Relaxed),
+    )
 }
 
 /// Diagnostics: how many `R`s the prefetcher stored, and how far ahead it has reached.
@@ -4728,6 +4759,7 @@ fn multiply_batch_block<'a>(
                 let el = ENUM_LAUNCHES.load(Ordering::Relaxed);
                 let erm = ENUM_RS_MAX.load(Ordering::Relaxed);
                 let (pf_n, pf_d) = prefetch_stats();
+                let (pfb_n, pfb_mean, pfb_max) = prefetch_batch_stats();
                 let total = (prep_s + wait_s + device_s).max(1e-9);
                 // Emit the theta->bytes curve alongside the periodic stats, not only at the end: a
                 // run that dies on an allocation must still leave behind the answer to "which theta
