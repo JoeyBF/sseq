@@ -1274,6 +1274,26 @@ static R_STATS: LazyLock<Option<Mutex<HashMap<PPart, RStat>>>> =
 /// different work. The 13.6% seen at stem 150 is NOT reproduced at stem 250. The honest state is
 /// "unproven above stem 200", neither works nor does not; settling it needs a completed stem-250 run
 /// per arm, i.e. days of machine time.
+/// MEASURED — this threshold, not the enum kernel's geometry, is what bounds critical-path
+/// enumeration (S_2 stem 150, max_s 60, theta=125, AHEAD=25, interleaved and counterbalanced):
+///
+/// | pin_min_mats | wall           | Rs/launch | enum launches |
+/// |--------------|----------------|-----------|---------------|
+/// | 200          | 418 s, 367 s   | 531       | 10210         |
+/// | 20           | 294 s, 317 s   | 117       | 10103         |
+/// | 2            | 304 s, 350 s   | 4         | 6581          |
+///
+/// 20 is 22% faster than 200 and 20% faster than running with no warmer at all (~384 s). The reason
+/// the earlier, far more conservative thresholds looked fine is that `Rs/launch` sat at exactly 531
+/// across every *warmer* configuration tried — deeper lookahead, more warmer threads, batched device
+/// enumeration, all 531 — because the leftover `R`s were the ones this threshold deliberately skips,
+/// not ones the warmer failed to reach. Warming further ahead never moved it; warming further DOWN
+/// the cost distribution moved it by 4.5x.
+///
+/// Below ~20 it turns over: 2 drives enumeration to nothing (Rs/launch 4, a third fewer launches)
+/// and still loses to 20, because warming every trivial `R` costs more than enumerating it. Measured
+/// at capped theta only, which is the regime that matters at stems 250+ — with theta uncapped
+/// everything is resident already and this knob does nothing.
 fn pin_min_mats() -> u64 {
     static T: LazyLock<u64> = LazyLock::new(|| {
         std::env::var("NASSAU_GPU_PIN_MIN_MATS")
