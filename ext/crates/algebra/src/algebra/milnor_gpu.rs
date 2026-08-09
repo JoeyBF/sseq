@@ -1290,6 +1290,22 @@ static PREFETCH_FRONTIER: std::sync::atomic::AtomicI32 = std::sync::atomic::Atom
 
 /// How many internal degrees ahead of the frontier to pre-enumerate (`NASSAU_GPU_PREFETCH_AHEAD`,
 /// default 0 = disabled). Requires [`pin_min_mats`] > 0, which selects WHICH `R`s are worth it.
+/// Threads the prefetcher uses to warm one degree (`NASSAU_GPU_PREFETCH_THREADS`, default 16).
+///
+/// The elements of a degree are independent, and a stem-200 run leaves ~120 of 128 cores idle, so
+/// the warmer has no reason to be serial. It stays well under the core count because the wavefront
+/// still owns the machine and warming is by definition not on the critical path.
+fn prefetch_threads() -> usize {
+    static T: LazyLock<usize> = LazyLock::new(|| {
+        std::env::var("NASSAU_GPU_PREFETCH_THREADS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(16)
+    });
+    *T
+}
+
 fn prefetch_ahead() -> i32 {
     static A: LazyLock<i32> = LazyLock::new(|| {
         std::env::var("NASSAU_GPU_PREFETCH_AHEAD")
@@ -1378,19 +1394,49 @@ fn start_prefetch(algebra: &Arc<MilnorAlgebra>) {
                     let d = done_to.max(frontier) + 1;
                     alg.compute_basis(d);
                     let n = alg.dimension(d);
-                    for i in 0..n {
-                        let r = alg.basis_element_from_index(d, i);
-                        if r.p_part.is_empty() {
-                            continue;
+                    // Spread the degree across threads. Warming an `R` is a pure function of its
+                    // p-part, so the elements of one degree are completely independent; the only
+                    // shared state is the master's write lock, taken once per STORED `R`.
+                    //
+                    // This is the cheapest way to use the idle machine: sampling a stem-200 run
+                    // shows ~120 of 128 cores doing nothing while the GPU is the constraint. A
+                    // single-threaded warmer cannot keep ahead of the frontier at high stems, which
+                    // is exactly where theta must be capped and warming is the point.
+                    //
+                    // Plain `std::thread`, not rayon: this must never inject into the pool the
+                    // wavefront is using (see the deadlock the speculative builders hit).
+                    let nthreads = prefetch_threads().min(n.max(1));
+                    std::thread::scope(|sc| {
+                        for tid in 0..nthreads {
+                            let alg = &alg;
+                            sc.spawn(move || {
+                                for i in (tid..n).step_by(nthreads) {
+                                    let r = alg.basis_element_from_index(d, i);
+                                    if r.p_part.is_empty() || resident_contains(r.p_part) {
+                                        continue;
+                                    }
+                                    // ONE enumeration, not two. `cold_count` used to run
+                                    // `admissible_matrices` purely to count, throw the arrays away,
+                                    // and then `resident_info` ran it AGAIN for every `R` that
+                                    // passed the threshold — so each pinned `R` was enumerated
+                                    // twice. Enumerate once, memoise the count, and append the
+                                    // arrays already in hand.
+                                    let (cs_len, mk_len, cs, mk) =
+                                        alg.admissible_matrices(r.p_part);
+                                    let num_mats = (mk.len() / mk_len) as u32;
+                                    COLD_COUNT.write().unwrap().entry(r.p_part).or_insert((
+                                        cs_len as u32,
+                                        mk_len as u32,
+                                        num_mats,
+                                    ));
+                                    if num_mats as u64 >= pin_min_mats() {
+                                        resident_append(r.p_part, cs_len, mk_len, &cs, &mk);
+                                        PREFETCHED.fetch_add(1, Ordering::Relaxed);
+                                    }
+                                }
+                            });
                         }
-                        // `cold_count` memoizes the shape without keeping the arrays, so this is the
-                        // cheap way to ask "is this one of the expensive ones?" before committing to
-                        // storing it.
-                        if cold_count(&alg, r.p_part).2 as u64 >= pin_min_mats() {
-                            resident_info(&alg, r.p_part);
-                            PREFETCHED.fetch_add(1, Ordering::Relaxed);
-                        }
-                    }
+                    });
                     done_to = d;
                     PREFETCH_DEGREE.store(d, Ordering::Relaxed);
                 }
@@ -1762,6 +1808,18 @@ fn resident_info(algebra: &MilnorAlgebra, p_part: PPart) -> RInfo {
     // what *other* bidegrees warmed earlier, i.e. on run order rather than on this step's work.
     RESIDENT_MISSES.fetch_add(1, Ordering::Relaxed);
     let (cs_len, mk_len, cs, mk) = algebra.admissible_matrices(p_part);
+    resident_append(p_part, cs_len, mk_len, &cs, &mk)
+}
+
+/// Append an already-enumerated `R` to the resident master and return its [`RInfo`].
+///
+/// Split out of [`resident_info`] so an enumeration produced somewhere OTHER than that function's
+/// serial CPU call can be stored — the parallel prefetcher enumerates many `R`s on many cores at
+/// once, and a batched GPU pass enumerates thousands in one launch. Everything lands here, so there
+/// stays exactly one place that assigns offsets, picks the shard and mutates the master.
+///
+/// Takes the write lock and re-checks the index: two producers may reach the same `R` at once.
+fn resident_append(p_part: PPart, cs_len: usize, mk_len: usize, cs: &[u32], mk: &[u32]) -> RInfo {
     let mut host = RESIDENT_HOST.write().unwrap();
     if let Some(info) = host.index.get(&p_part) {
         return *info;
