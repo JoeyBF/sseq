@@ -1207,8 +1207,14 @@ static R_STATS: LazyLock<Option<Mutex<HashMap<PPart, RStat>>>> =
 ///
 /// Deterministic across runs and processes — the same `R` always lands on the same device, which
 /// the sharded resident master requires and which keeps a run reproducible.
-/// Pin any `R` with at least this many admissible matrices into the RESIDENT master, whatever its
-/// degree (`NASSAU_GPU_PIN_MIN_MATS`, default 0 = disabled, i.e. degree is the only criterion).
+/// Which above-cap `R`s the PREFETCHER is willing to store: those with at least this many admissible
+/// matrices (`NASSAU_GPU_PIN_MIN_MATS`, default 0 = disabled, i.e. degree is the only criterion).
+///
+/// This is a prefetch-policy knob ONLY. It no longer decides routing — see [`resident_contains`]:
+/// an above-cap `R` runs Resident iff it is already resident, never "iff it is expensive". Letting
+/// a cost threshold drive routing forced a synchronous `admissible_matrices` on the critical path
+/// for every expensive `R` the prefetcher had not yet reached, which is precisely the latency
+/// prefetching is meant to hide.
 ///
 /// The point is an asymmetry between what costs memory and what costs time. Master BYTES are a SUM
 /// over `R`s, but a transient enum launch's DURATION is the MAX over the `R`s in it — ncu at
@@ -1705,6 +1711,23 @@ pub fn dump_master_by_degree() {
         total as f64 / devs / 1e9,
         gpu_count().max(1),
     );
+}
+
+/// Is this `R` ALREADY in the resident master? A read-lock lookup that never enumerates and never
+/// inserts — the routing predicate, as distinct from [`resident_info`], which materialises on miss.
+///
+/// Routing must ask about residency, not about cost. Deciding it from `num_mats >= pin_min_mats()`
+/// (the first cut) routes an `R` to the Resident path whenever it is *expensive enough*, including
+/// when the prefetcher has not reached it yet — and `resident_info` then enumerates it
+/// SYNCHRONOUSLY on the critical path. That reintroduces exactly the latency prefetching exists to
+/// hide, and it makes the cost threshold do two unrelated jobs at once.
+///
+/// With this predicate the two are separate: the prefetcher alone decides what is resident (cost
+/// ranked, memory bounded), and anything it has not reached yet simply goes Transient and is
+/// enumerated on the device. Never blocking, always correct. It is also cheaper on the hot path — no
+/// `cold_count` lock and `PPart` hash per product.
+fn resident_contains(p_part: PPart) -> bool {
+    RESIDENT_HOST.read().unwrap().index.contains_key(&p_part)
 }
 
 fn resident_info(algebra: &MilnorAlgebra, p_part: PPart) -> RInfo {
@@ -2822,24 +2845,36 @@ fn multiply_batch_gpu_inner(
     // Above-cap `R`s that are long enough to be pinned resident anyway (see [`pin_min_mats`]).
     // Resolved once per call rather than per product: `cold_count` memoizes, but the lookup still
     // costs a lock and a hash, and the same `R` recurs across most products.
-    let pin = pin_min_mats();
-    let pinned = |d: i32, r_idx: usize| -> bool {
-        if pin == 0 || d <= cap {
-            return false;
-        }
-        let r = algebra.basis_element_from_index(d, r_idx);
-        cold_count(algebra, r.p_part).2 as u64 >= pin
-    };
+    // An above-cap `R` runs Resident iff it is ALREADY resident — i.e. the prefetcher got to it.
+    // Never "iff it is expensive", which would force a synchronous enumeration for the ones it has
+    // not reached. See [`resident_contains`].
+    //
+    // SNAPSHOT IT, once, for every product. `resident_contains` reads state the PREFETCHER MUTATES
+    // concurrently, and the classification is consumed twice per mode — once to collect `rows`, once
+    // to build `compact`. Re-evaluating it let an `R` be Transient in the first pass and Resident in
+    // the second, so its row was missing from `remap`: `panicked ... no entry found for key`,
+    // observed once in ~9 runs. A snapshot makes each product's group fixed for the whole call, and
+    // a prefetch that lands mid-call simply takes effect on the next one.
+    let is_res: Vec<bool> = products
+        .iter()
+        .map(|p| {
+            p.r_degree <= cap || {
+                let r = algebra.basis_element_from_index(p.r_degree, p.r_idx);
+                resident_contains(r.p_part)
+            }
+        })
+        .collect();
     for mode in [MasterMode::Resident, MasterMode::Transient] {
-        let is_group = |d: i32, r_idx: usize| match mode {
-            MasterMode::Resident => d <= cap || pinned(d, r_idx),
-            MasterMode::Transient => d > cap && !pinned(d, r_idx),
+        let is_group = |i: usize| match mode {
+            MasterMode::Resident => is_res[i],
+            MasterMode::Transient => !is_res[i],
         };
         // Distinct rows this group touches, in order (products are row-major, so already sorted).
         let mut rows: Vec<usize> = products
             .iter()
-            .filter(|p| is_group(p.r_degree, p.r_idx))
-            .map(|p| p.row)
+            .enumerate()
+            .filter(|(i, _)| is_group(*i))
+            .map(|(_, p)| p.row)
             .collect();
         rows.dedup();
         if rows.is_empty() {
@@ -2848,8 +2883,9 @@ fn multiply_batch_gpu_inner(
         let remap: HashMap<usize, usize> = rows.iter().enumerate().map(|(i, &r)| (r, i)).collect();
         let compact: Vec<GpuProduct> = products
             .iter()
-            .filter(|p| is_group(p.r_degree, p.r_idx))
-            .map(|p| {
+            .enumerate()
+            .filter(|(i, _)| is_group(*i))
+            .map(|(_, p)| {
                 let mut q = p.clone();
                 q.row = remap[&p.row];
                 q
