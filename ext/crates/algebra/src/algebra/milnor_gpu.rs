@@ -796,6 +796,27 @@ fn gpu_count() -> usize {
     *N
 }
 
+/// PROFILE OF THE SHIPPING CONFIGURATION (theta uncapped, stem 150, 2026-08-09, after the readback,
+/// `Arc` term-list and `R`-memo fixes). Every other profile in this file is either theta-handicapped
+/// or predates those, so prefer this one when deciding what to work on next:
+///
+/// ```text
+/// multiply_batch_grouped (+closure) 17.4%    allocator                 9.7%
+/// memcpy + memset                   13.8%    add_masked                7.1%
+/// Matrix::row_reduce                11.3%    crossbeam_epoch (rayon)   5.8%
+/// get_partial_matrix_restricted      9.3%    resident_info             2.6%
+/// ```
+///
+/// The binary is 64.5% of cycles and `libcuda` does not reach the top 16 — at correct theta this
+/// workload is CPU-bound and barely touches the GPU. The 1.56%-occupancy and 52% spin-wait figures
+/// elsewhere in this file describe the theta=125 TESTBED, not production. `resident_info` fell
+/// 12.93% -> 2.56%, which is the lookup memo working.
+///
+/// `crossbeam_epoch` is rayon's work-stealing reclamation, not our channel, and shrinking the pool
+/// to match the ~9 cores of real work makes things WORSE, not better (interleaved, 3 rounds:
+/// 128 threads 130.7 s, 32 threads 142.3 s, 16 threads 142.7 s). The overhead rides on idle workers
+/// and costs no wall time; the wide pool is buying parallelism elsewhere. Do not "fix" it.
+///
 /// Worker threads — and therefore CUDA streams — per device (`NASSAU_GPU_STREAMS`, default 1).
 ///
 /// Each device's submission queue is drained by this many workers, so this many device sections run
