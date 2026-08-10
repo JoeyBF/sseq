@@ -17,7 +17,7 @@ use fp::{
     vector::{FpSlice, FpSliceMut, FpVector},
 };
 use itertools::Itertools;
-use once::{OnceBiVec, OnceVec};
+use once::{FrontierGrid, OnceBiVec, OnceVec};
 use sseq::coordinates::{Bidegree, BidegreeGenerator};
 
 use crate::{
@@ -745,14 +745,12 @@ where
         maybe_rayon::in_place_scope(|scope| {
             let _tracing_guard = tracing_span.enter();
 
-            // Things that we have finished computing.
-            let mut progress: Vec<i32> = vec![min_degree - 1; max.s() as usize + 1];
-            // We will kickstart the process by pretending we have computed (0, min_degree - 1). So
-            // we must pretend we have only computed up to (0, min_degree - 2);
-            progress[0] = min_degree - 2;
+            // How far each filtration has got. Rows here advance strictly in order, so no row
+            // ever holds a pending degree; the grid is used for the bookkeeping and the naming,
+            // not for its out-of-order support.
+            let mut progress = FrontierGrid::new(max.s() as usize + 1, min_degree);
 
             let (sender, receiver) = mpsc::channel();
-            SenderData::send(Bidegree::s_t(0, min_degree - 1), false, sender);
 
             let f = |b, sender| {
                 if self.has_computed_bidegree(b) {
@@ -771,6 +769,9 @@ where
                 }
             };
 
+            // Seed the bottom of filtration 0; everything else is reached through the wavefront.
+            f(Bidegree::s_t(0, min_degree), sender);
+
             while let Ok(SenderData {
                 b,
                 new,
@@ -782,14 +783,14 @@ where
                     f(b, sender);
                     continue;
                 }
-                assert!(progress[b.s() as usize] == b.t() - 1);
-                progress[b.s() as usize] = b.t();
+                assert_eq!(progress.next(b.s()), b.t());
+                let _ = progress.complete(b.s(), b.t());
 
-                if b.t() < max.t() && (b.s() == 0 || progress[b.s() as usize - 1] > b.t()) {
+                if b.t() < max.t() && (b.s() == 0 || progress.has_completed(b.s() - 1, b.t() + 1)) {
                     // We are computing a normal step
                     f(b + Bidegree::s_t(0, 1), sender.clone());
                 }
-                if b.s() < max.s() && progress[b.s() as usize + 1] == b.t() - 1 {
+                if b.s() < max.s() && progress.next(b.s() + 1) == b.t() {
                     f(b + Bidegree::s_t(1, 0), sender);
                 }
                 if new {
@@ -817,14 +818,12 @@ where
         maybe_rayon::in_place_scope(|scope| {
             let _tracing_guard = tracing_span.enter();
 
-            // Things that we have finished computing.
-            let mut progress: Vec<i32> = vec![min_degree - 1; max.s() as usize + 1];
-            // We will kickstart the process by pretending we have computed (0, min_degree - 1). So
-            // we must pretend we have only computed up to (0, min_degree - 2);
-            progress[0] = min_degree - 2;
+            // How far each filtration has got. Rows here advance strictly in order, so no row
+            // ever holds a pending degree; the grid is used for the bookkeeping and the naming,
+            // not for its out-of-order support.
+            let mut progress = FrontierGrid::new(max.s() as usize + 1, min_degree);
 
             let (sender, receiver) = mpsc::channel();
-            SenderData::send(Bidegree::s_t(0, min_degree - 1), false, sender);
 
             let f = |b, sender| {
                 if self.has_computed_bidegree(b) {
@@ -843,6 +842,9 @@ where
                 }
             };
 
+            // Seed the bottom of filtration 0; everything else is reached through the wavefront.
+            f(Bidegree::s_t(0, min_degree), sender);
+
             while let Ok(SenderData {
                 b,
                 new,
@@ -854,17 +856,17 @@ where
                     f(b, sender);
                     continue;
                 }
-                assert!(progress[b.s() as usize] == b.t() - 1);
-                progress[b.s() as usize] = b.t();
+                assert_eq!(progress.next(b.s()), b.t());
+                let _ = progress.complete(b.s(), b.t());
 
                 // How far we are from the last one for this s.
                 let distance = max.n() - b.n() + 1;
 
-                if b.s() < max.s() && progress[b.s() as usize + 1] == b.t() - 1 {
+                if b.s() < max.s() && progress.next(b.s() + 1) == b.t() {
                     f(b + Bidegree::s_t(1, 0), sender.clone());
                 }
 
-                if distance > 1 && (b.s() == 0 || progress[b.s() as usize - 1] > b.t()) {
+                if distance > 1 && (b.s() == 0 || progress.has_completed(b.s() - 1, b.t() + 1)) {
                     // We are computing a normal step
                     f(b + Bidegree::s_t(0, 1), sender);
                 } else if distance == 1 && b.s() < max.s() {

@@ -173,6 +173,79 @@ impl Frontier {
     }
 }
 
+/// A [`Frontier`] per row of a two-dimensional grid, addressed in signed degrees.
+///
+/// Sweeps over a bidegree plane track "how far has filtration `s` got" for every `s` at once, and
+/// decide what to run next by comparing those numbers. Keeping them in one place makes the
+/// comparisons read as questions about progress rather than as arithmetic on a bare `Vec<i32>`,
+/// and gets the off-by-ones right in a single spot.
+///
+/// Rows are indexed by `s`, degrees start at `min_degree`. A row whose degrees arrive strictly in
+/// order simply never has anything pending, so a driver that fills rows sequentially pays nothing
+/// for the generality.
+///
+/// # Example
+///
+/// ```
+/// # use once::FrontierGrid;
+/// // Two filtrations, degrees starting at -3.
+/// let mut grid = FrontierGrid::new(2, -3);
+/// assert_eq!(grid.next(0), -3);
+/// assert!(!grid.has_completed(0, -3));
+///
+/// let _ = grid.complete(0, -3);
+/// assert_eq!(grid.next(0), -2);
+/// assert!(grid.has_completed(0, -3));
+/// ```
+#[derive(Clone, Debug)]
+pub struct FrontierGrid {
+    min_degree: i32,
+    rows: Vec<Frontier>,
+}
+
+impl FrontierGrid {
+    /// A grid of `rows` filtrations, each empty and starting at `min_degree`.
+    pub fn new(rows: usize, min_degree: i32) -> Self {
+        Self {
+            min_degree,
+            rows: vec![Frontier::new(); rows],
+        }
+    }
+
+    pub const fn min_degree(&self) -> i32 {
+        self.min_degree
+    }
+
+    pub fn rows(&self) -> usize {
+        self.rows.len()
+    }
+
+    /// The lowest degree in row `s` that is not yet part of its gap-free prefix — that is, the next
+    /// degree the row is waiting on.
+    pub fn next(&self, s: i32) -> i32 {
+        self.rows[s as usize].get() as i32 + self.min_degree
+    }
+
+    /// Whether row `s`'s gap-free prefix has reached degree `t`.
+    pub fn has_completed(&self, s: i32, t: i32) -> bool {
+        self.next(s) > t
+    }
+
+    /// Record `(s, t)` as complete, returning the degrees of row `s` this caller thereby became
+    /// responsible for. See [`Claim`].
+    pub fn complete(&mut self, s: i32, t: i32) -> Claim<i32> {
+        let min_degree = self.min_degree;
+        self.rows[s as usize]
+            .complete((t - min_degree) as usize)
+            .map(|i| i as i32 + min_degree)
+    }
+
+    /// Whether every row is settled, i.e. no degree is waiting on a gap below it.
+    pub fn is_settled(&self) -> bool {
+        self.rows.iter().all(Frontier::is_settled)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -263,5 +336,47 @@ mod tests {
         let c: Claim<usize> = Claim::Advanced(2..5);
         assert_eq!(c.map(|i| i as i32 - 3), Claim::Advanced(-1..2));
         assert_eq!(Claim::<usize>::Nothing.map(|i| i as i32), Claim::Nothing);
+    }
+
+    #[test]
+    fn grid_rows_are_independent_and_degree_addressed() {
+        let mut grid = FrontierGrid::new(3, -2);
+        for s in 0..3 {
+            assert_eq!(grid.next(s), -2);
+        }
+
+        assert_eq!(grid.complete(1, -2), Claim::Advanced(-2..-1));
+        assert_eq!(grid.next(1), -1);
+        // Other rows are untouched.
+        assert_eq!(grid.next(0), -2);
+        assert_eq!(grid.next(2), -2);
+    }
+
+    #[test]
+    fn grid_has_completed_answers_the_predecessor_question() {
+        let mut grid = FrontierGrid::new(1, 0);
+        assert!(!grid.has_completed(0, 0));
+        let _ = grid.complete(0, 0);
+        assert!(grid.has_completed(0, 0));
+        assert!(!grid.has_completed(0, 1));
+
+        // A degree completed above a gap does not count until the gap closes.
+        let _ = grid.complete(0, 2);
+        assert!(!grid.has_completed(0, 2));
+        assert!(!grid.is_settled());
+        let _ = grid.complete(0, 1);
+        assert!(grid.has_completed(0, 2));
+        assert!(grid.is_settled());
+    }
+
+    #[test]
+    fn grid_sequential_rows_never_go_pending() {
+        // The degenerate case a strictly-sequential driver sees: always settled.
+        let mut grid = FrontierGrid::new(2, 5);
+        for t in 5..10 {
+            assert_eq!(grid.complete(0, t), Claim::Advanced(t..t + 1));
+            assert!(grid.is_settled());
+        }
+        assert_eq!(grid.next(0), 10);
     }
 }

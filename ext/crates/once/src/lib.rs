@@ -41,7 +41,7 @@ pub mod write_once;
 
 mod std_or_loom;
 
-pub use frontier::{Claim, Frontier};
+pub use frontier::{Claim, Frontier, FrontierGrid};
 pub use grove::{Grove, TwoEndedGrove};
 pub use multiindexed::MultiIndexed;
 pub use once::{OnceBiVec, OnceBiVecIter, OnceVec, OnceVecIter};
