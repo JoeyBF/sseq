@@ -1004,6 +1004,32 @@ mod blocks {
     static ROWS_MISSED: AtomicUsize = AtomicUsize::new(0);
     static FLOODED: AtomicUsize = AtomicUsize::new(0);
     static RELEASED: AtomicUsize = AtomicUsize::new(0);
+    /// Why builders declined work, so a coverage plateau can be attributed instead of guessed at.
+    /// Stem 200 sits at 33% row coverage while total CPU is ~13 of 128 cores -- the builders are
+    /// IDLE, not contended -- so the question is which bail-out they are taking.
+    static BAIL_ROOM: AtomicUsize = AtomicUsize::new(0);
+    static BAIL_DONE: AtomicUsize = AtomicUsize::new(0);
+    static BAIL_CLAIMED: AtomicUsize = AtomicUsize::new(0);
+    static BAIL_OTHER: AtomicUsize = AtomicUsize::new(0);
+
+    pub fn bail(kind: u8) {
+        match kind {
+            0 => &BAIL_ROOM,
+            1 => &BAIL_DONE,
+            2 => &BAIL_CLAIMED,
+            _ => &BAIL_OTHER,
+        }
+        .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn bails() -> (usize, usize, usize, usize) {
+        (
+            BAIL_ROOM.load(Ordering::Relaxed),
+            BAIL_DONE.load(Ordering::Relaxed),
+            BAIL_CLAIMED.load(Ordering::Relaxed),
+            BAIL_OTHER.load(Ordering::Relaxed),
+        )
+    }
 
     fn size_of(m: &Matrix) -> usize {
         m.rows() * m.columns().div_ceil(64) * 8
@@ -1269,6 +1295,20 @@ mod blocks {
 /// Multiply work (`rows x cols`) split by whether the bidegree could use the full-matrix reuse
 /// path at all. Speculation can only ever touch the REUSE side, so this bounds the whole direction:
 /// if most of the work is on the no-reuse side, no amount of block tuning can reach it.
+/// Bidegrees actually executing right now, and its running statistics.
+///
+/// Speculation shortens each bidegree; it does not widen the WAVEFRONT, because admission is
+/// unchanged -- `(s,t)` is eligible only once `(s,t-1)` and `(s-1,t-1)` are committed, so the
+/// frontier stays a slope-1 staircase over `s`. If neither CPU nor GPU is saturated (stem 200
+/// measured ~13 of 128 cores and 11-47% GPU), the machine is waiting, and the question is whether
+/// too few bidegrees are ELIGIBLE or whether eligible ones are not being run. This counts the
+/// latter; a low mean with idle hardware means the dependency graph is the constraint and no amount
+/// of speculation or granularity tuning can matter.
+static INFLIGHT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static INFLIGHT_MAX: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static INFLIGHT_SUM: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static INFLIGHT_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 static REUSE_WORK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static REUSE_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 static NOREUSE_WORK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -1707,7 +1747,12 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
     /// Build one row block of `b`'s matrix ahead of time and park it in the [`blocks`] cache.
     #[tracing::instrument(skip(self), fields(%b, gen_deg, rows, cols))]
     fn speculate_block(&self, b: Bidegree, gen_deg: i32) {
-        if self.has_computed_bidegree(b) || !blocks::has_room() {
+        if !blocks::has_room() {
+            blocks::bail(0);
+            return;
+        }
+        if self.has_computed_bidegree(b) {
+            blocks::bail(1);
             return;
         }
         if let Some(store) = self.save_dir.store()
@@ -1716,6 +1761,7 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
             return;
         }
         if !reuse_full_matrix(&self.differentials[b.s() - 1]) {
+            blocks::bail(3);
             return;
         }
         // Don't precompute for a bidegree that will never collect. The consumer only assembles when
@@ -1744,6 +1790,7 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
         }
         // Claim last, once every bail-out is behind us.
         if !blocks::claim(b, gen_deg) {
+            blocks::bail(2);
             return;
         }
         let guard = blocks::ClaimGuard::new(b, gen_deg);
@@ -2772,7 +2819,10 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                                 SenderData::send_retry(b, sender);
                                 return;
                             }
+                            let n = INFLIGHT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                            INFLIGHT_MAX.fetch_max(n, std::sync::atomic::Ordering::Relaxed);
                             self.step_resolution(b);
+                            INFLIGHT.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                             SenderData::send(b, sender);
                         });
                     }
@@ -2913,6 +2963,11 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                             continue;
                         }
                         assert!(progress[b.s() as usize] == b.t() - 1);
+                        INFLIGHT_SUM.fetch_add(
+                            INFLIGHT.load(std::sync::atomic::Ordering::Relaxed) as u64,
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
+                        INFLIGHT_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         progress[b.s() as usize] = b.t();
                         enqueue_spec(&progress, &mut spec_issued, &mut spec_issued_g);
 
@@ -3005,10 +3060,15 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
             eprintln!(
                 "[blocks] threads={spec_threads} built={built} hits={hits} misses={misses} \
                  hit_rate={:.1}% rows_hit={rows_hit} rows_missed={rows_missed} row_rate={:.1}% \
-                 dropped={dropped} released={released} unused={:.1}GB",
+                 dropped={dropped} released={released} unused={:.1}GB bails(room/done/claimed/\
+                 other)={}/{}/{}/{}",
                 100.0 * hits as f64 / (hits + misses).max(1) as f64,
                 100.0 * rows_hit as f64 / (rows_hit + rows_missed).max(1) as f64,
                 bytes as f64 / (1u64 << 30) as f64,
+                blocks::bails().0,
+                blocks::bails().1,
+                blocks::bails().2,
+                blocks::bails().3,
             );
         } else if spec_threads > 0 {
             let (built, hits, misses, waited, timeouts, dropped, bytes) = speculate::stats();
@@ -3020,6 +3080,17 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                 built.saturating_sub(hits) + dropped,
                 bytes as f64 / (1u64 << 30) as f64,
             );
+        }
+        {
+            let n = INFLIGHT_N.load(std::sync::atomic::Ordering::Relaxed);
+            if n > 0 {
+                eprintln!(
+                    "[wavefront] in-flight bidegrees: mean={:.1} max={} (samples={n}, cores={})",
+                    INFLIGHT_SUM.load(std::sync::atomic::Ordering::Relaxed) as f64 / n as f64,
+                    INFLIGHT_MAX.load(std::sync::atomic::Ordering::Relaxed),
+                    maybe_rayon::max_num_threads(),
+                );
+            }
         }
         {
             let (rw, rc) = (
