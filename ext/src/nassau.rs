@@ -1154,6 +1154,14 @@ mod blocks {
 static REUSE_WORK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static REUSE_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 static NOREUSE_WORK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// The same work measured in the NARROW block representation: sum over generator degrees of
+/// `rows(g) x cols(g)`, where `cols(g)` stops below generator degree `g` by minimality.
+///
+/// The full matrix pads every row to `next_dim`; the block set is triangular. The ratio says whether
+/// serving a signature's rows directly from blocks -- never materialising the full matrix -- would
+/// fit under a memory ceiling the full matrix does not. Near 0.5 that is worth building; near 1.0
+/// the triangle is too shallow and relaxing `reuse_within_cap` is the only lever left.
+static NARROW_WORK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static NOREUSE_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// A resolution of `S_2` using Nassau's algorithm.
@@ -1474,6 +1482,16 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
         MilnorSubalgebra::restricted_dimension(next, b.t(), gen_deg.min(b.t() - 1))
     }
 
+    /// Total size of `b`'s matrix in the narrow block representation, in `rows x cols` units.
+    fn narrow_work(&self, b: Bidegree) -> u64 {
+        self.block_ranges(b)
+            .into_iter()
+            .map(|(gen_deg, start, end)| {
+                ((end - start) as u64).saturating_mul(self.block_cols(b, gen_deg) as u64)
+            })
+            .sum()
+    }
+
     /// Build one row block of `b`'s matrix ahead of time and park it in the [`blocks`] cache.
     #[tracing::instrument(skip(self), fields(%b, gen_deg, rows, cols))]
     fn speculate_block(&self, b: Bidegree, gen_deg: i32) {
@@ -1698,6 +1716,7 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
         let full_reuse: Option<Matrix> = if reuse_full_matrix(&self.differentials[b.s() - 1])
             && reuse_within_cap(target_dim, next_dim)
         {
+            NARROW_WORK.fetch_add(self.narrow_work(b), std::sync::atomic::Ordering::Relaxed);
             REUSE_WORK.fetch_add(
                 (target_dim as u64).saturating_mul(next_dim as u64),
                 std::sync::atomic::Ordering::Relaxed,
@@ -1792,6 +1811,7 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
             // `row_rate` is consistent with speculation being irrelevant to most of the work. This
             // splits the total multiply work (`rows x cols`) both ways to say which.
             if reuse_full_matrix(&self.differentials[b.s() - 1]) {
+                NARROW_WORK.fetch_add(self.narrow_work(b), std::sync::atomic::Ordering::Relaxed);
                 NOREUSE_WORK.fetch_add(
                     (target_dim as u64).saturating_mul(next_dim as u64),
                     std::sync::atomic::Ordering::Relaxed,
@@ -2647,11 +2667,14 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
             if rw + nw > 0 {
                 eprintln!(
                     "[reuse-split] reusable={rc} bidegrees {:.1}Gwork ({:.1}%) | over-cap={nc} \
-                     bidegrees {:.1}Gwork ({:.1}%)",
+                     bidegrees {:.1}Gwork ({:.1}%) | narrow={:.1}Gwork (ratio {:.3})",
                     rw as f64 / 1e9,
                     100.0 * rw as f64 / (rw + nw) as f64,
                     nw as f64 / 1e9,
                     100.0 * nw as f64 / (rw + nw) as f64,
+                    NARROW_WORK.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e9,
+                    NARROW_WORK.load(std::sync::atomic::Ordering::Relaxed) as f64
+                        / (rw + nw).max(1) as f64,
                 );
             }
         }
