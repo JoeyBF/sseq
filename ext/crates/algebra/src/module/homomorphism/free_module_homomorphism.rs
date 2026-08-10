@@ -228,17 +228,21 @@ where
         self.outputs.push_checked(rows, degree);
     }
 
-    /// Add the image of a bidegree out of order. See
-    /// [`OnceVec::push_ooo`](once::OnceVec::push_ooo) for details on return value.
+    /// Add the image of a bidegree ahead of the gap-free prefix, for sweeps that fill degrees in
+    /// dependency order rather than sequentially.
+    ///
+    /// Returns the degrees this caller is responsible for following up on; see
+    /// [`Claim`](once::Claim).
     pub fn add_generators_from_rows_ooo(
         &self,
         degree: i32,
         rows: Vec<FpVector>,
-    ) -> std::ops::Range<i32> {
+    ) -> once::Claim<i32> {
         self.outputs.push_ooo(rows, degree)
     }
 
-    /// List of outputs that have been added out of order
+    /// Degrees written ahead of the gap-free prefix, whose gaps are not yet closed. Empty unless a
+    /// sweep is in progress.
     pub fn ooo_outputs(&self) -> Vec<i32> {
         self.outputs.ooo_elements()
     }

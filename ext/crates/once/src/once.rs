@@ -1,29 +1,19 @@
 use core::ops::{Index, IndexMut};
 use std::{
     cmp::{Eq, PartialEq},
-    collections::BTreeSet,
     fmt,
 };
 
 use maybe_rayon::prelude::*;
 
 use crate::{
+    frontier::{Claim, Frontier},
     grove::Grove,
     std_or_loom::sync::{
         Mutex, MutexGuard,
         atomic::{AtomicUsize, Ordering},
     },
 };
-
-/// A wrapper around a `BTreeSet` that tracks out-of-order element insertions.
-///
-/// This is an internal implementation detail of [`OnceVec`] that keeps track of
-/// indices where elements have been inserted out of order. It's also used as the
-/// target of the mutex lock to prevent concurrent modifications.
-///
-/// See [`OnceVec`] documentation for more details on how out-of-order insertions work.
-#[derive(Clone, Default)]
-pub struct OooTracker(BTreeSet<usize>);
 
 /// A push-only vector which is thread-safe. To ensure thread-safety, we need to ensure three things
 ///
@@ -87,13 +77,13 @@ pub struct OooTracker(BTreeSet<usize>);
 /// let vec = OnceVec::<i32>::new();
 ///
 /// // Insert at position 0
-/// vec.push_ooo(10, 0);
+/// let _ = vec.push_ooo(10, 0);
 ///
 /// // Insert at position 2 (leaving position 1 empty for now)
-/// vec.push_ooo(30, 2);
+/// let _ = vec.push_ooo(30, 2);
 ///
 /// // Fill in position 1
-/// vec.push_ooo(20, 1);
+/// let _ = vec.push_ooo(20, 1);
 ///
 /// assert_eq!(vec[0usize], 10);
 /// assert_eq!(vec[1usize], 20);
@@ -102,12 +92,13 @@ pub struct OooTracker(BTreeSet<usize>);
 
 #[derive(Default)]
 pub struct OnceVec<T> {
+    /// Lock-free mirror of `frontier`'s value, so that readers never take the lock. Written under
+    /// the lock with `Release` immediately after the data it covers, and read with `Acquire`
+    /// before any access — this is what makes reading `0..len` safe without synchronisation.
     len: AtomicUsize,
-    /// [`BTreeSet`] of elements that have been added out of order. We also use this mutex to
-    /// prevent conflicting concurrent pushes. We use a newtype to wrap the [`BTreeSet`] because
-    /// we want [`OnceVec::lock`] to be public, but we don't want to let people mess with the
-    /// internals of the tracker.
-    ooo: Mutex<OooTracker>,
+    /// Source of truth for how far the gap-free prefix reaches, and which indices above it are
+    /// filled. Doubles as the write lock: every mutating method holds it.
+    frontier: Mutex<Frontier>,
     data: Grove<T>,
 }
 
@@ -167,7 +158,7 @@ impl<T> OnceVec<T> {
         let len = data.len();
         Self {
             len: AtomicUsize::new(len),
-            ooo: Mutex::new(OooTracker::default()),
+            frontier: Mutex::new(Frontier::settled_through(len)),
             data,
         }
     }
@@ -175,14 +166,17 @@ impl<T> OnceVec<T> {
     pub fn new() -> Self {
         Self {
             len: AtomicUsize::new(0),
-            ooo: Mutex::new(OooTracker::default()),
+            frontier: Mutex::new(Frontier::new()),
             data: Grove::new(),
         }
     }
 
-    /// Returns a list of out-of-order elements remaining.
+    /// Indices filled out of order that the gap-free prefix has not yet reached.
+    ///
+    /// Only ever non-empty partway through a [`push_ooo`](Self::push_ooo) sweep. A sweep that has
+    /// finished should leave this empty; see [`Frontier`] for why.
     pub fn ooo_elements(&self) -> Vec<usize> {
-        self.ooo.lock().unwrap().0.iter().copied().collect()
+        self.lock().pending().collect()
     }
 
     /// All data up to length self.len() are guaranteed to be fully written *after* reading
@@ -228,8 +222,8 @@ impl<T> OnceVec<T> {
 
     /// Takes a lock on the `OnceVec`. The `OnceVec` cannot be updated while the lock is held.
     /// This is useful when used in conjuction with [`OnceVec::extend`];
-    pub fn lock(&self) -> MutexGuard<'_, OooTracker> {
-        self.ooo.lock().unwrap()
+    pub fn lock(&self) -> MutexGuard<'_, Frontier> {
+        self.frontier.lock().unwrap()
     }
 
     /// Push an element into the vector and check that it was inserted into the `index` position.
@@ -259,42 +253,52 @@ impl<T> OnceVec<T> {
     /// assert_eq!(*x, 2);
     /// ```
     pub fn push(&self, value: T) -> usize {
-        let ooo = self.lock();
+        let mut frontier = self.lock();
         assert!(
-            ooo.0.is_empty(),
+            frontier.is_settled(),
             "Cannot push while there are out-of-order elements"
         );
-        let old_len = self.len.load(Ordering::Acquire);
+        let old_len = frontier.get();
 
         self.data.insert(old_len, value);
 
-        self.len.store(old_len + 1, Ordering::Release);
+        let _ = frontier.complete(old_len);
+        self.len.store(frontier.get(), Ordering::Release);
         old_len
     }
 
-    /// Append an element to an arbitrary position in the OnceVec.
+    /// Write an element at an arbitrary index, ahead of the gap-free prefix if necessary.
     ///
-    /// Whenever an element is pushed out of order, the we revisit the whole `OnceVec` and update
-    /// the `len` to be the largest contiguous initial block that has been written to. The return
-    /// value indicates the newly valid range. Elements in this range will no longer be consider to
-    /// have been pushed out of order.
+    /// This exists for computations that fill the vector in an order set by a dependency relation
+    /// rather than left to right, so that independent indices can be filled concurrently. Holes
+    /// are transient: a sweep is expected to close every gap it opens, leaving the vector as
+    /// contiguous as an ordinary sequence of [`push`](Self::push)es would.
     ///
-    /// It is invalid to use the ordinary push function when there are still elements pushed out of
-    /// order.
+    /// Readers are unaffected by holes. [`len`](Self::len) only counts the gap-free prefix, so an
+    /// element written above a gap stays invisible to [`get`](Self::get) until the gap closes.
+    ///
+    /// The returned [`Claim`] names the indices *this caller* is responsible for following up on —
+    /// see [`Claim`] for why that is a range and why it must not be discarded. If you only want to
+    /// store a value and have no follow-up work to schedule, ignore it explicitly.
+    ///
+    /// Mixing this with [`push`](Self::push) while a gap is open will panic; `push` has no way to
+    /// know where the end of the vector is meant to be.
     ///
     /// # Example
     /// ```
-    /// # use once::OnceVec;
+    /// # use once::{Claim, OnceVec};
     /// let v = OnceVec::<u32>::new();
-    /// assert_eq!(v.push_ooo(1, 0), 0..1);
+    /// assert_eq!(v.push_ooo(1, 0), Claim::Advanced(0..1));
     /// assert_eq!(v.len(), 1);
     ///
     /// v.push_checked(2, 1);
     ///
-    /// assert_eq!(v.push_ooo(3, 3), 2..2);
+    /// // 3 lands above a gap at index 2, so it claims nothing and stays invisible.
+    /// assert_eq!(v.push_ooo(3, 3), Claim::Nothing);
     /// assert_eq!(v.len(), 2);
     ///
-    /// assert_eq!(v.push_ooo(5, 2), 2..4);
+    /// // Filling index 2 closes the gap, claiming index 3 along with it.
+    /// assert_eq!(v.push_ooo(5, 2), Claim::Advanced(2..4));
     /// assert_eq!(v.len(), 4);
     ///
     /// v.push(4);
@@ -303,27 +307,19 @@ impl<T> OnceVec<T> {
     /// assert_eq!(v[3usize], 3);
     /// assert_eq!(v[4usize], 4);
     /// ```
-    pub fn push_ooo(&self, value: T, index: usize) -> std::ops::Range<usize> {
-        let mut ooo = self.lock();
-        if ooo.0.contains(&index) {
-            panic!("Cannot push element out of order at the same index {index} twice");
-        }
-
-        let old_len = self.len.load(Ordering::Acquire);
+    ///
+    /// # Panics
+    ///
+    /// Panics if `index` has already been written, whether it is below the frontier or still
+    /// pending.
+    pub fn push_ooo(&self, value: T, index: usize) -> Claim {
+        let mut frontier = self.lock();
 
         self.data.insert(index, value);
 
-        if index != old_len {
-            ooo.0.insert(index);
-            return old_len..old_len;
-        }
-        let mut end = old_len + 1;
-        while ooo.0.remove(&end) {
-            end += 1;
-        }
-
-        self.len.store(end, Ordering::Release);
-        old_len..end
+        let claim = frontier.complete(index);
+        self.len.store(frontier.get(), Ordering::Release);
+        claim
     }
 
     /// Extend the `OnceVec` to up to index `new_max`, filling in the entries with the values of
@@ -352,9 +348,9 @@ impl<T> OnceVec<T> {
     /// }
     /// ```
     pub fn extend(&self, new_max: usize, mut f: impl FnMut(usize) -> T) {
-        let ooo = self.lock();
-        assert!(ooo.0.is_empty());
-        let old_len = self.len.load(Ordering::Acquire);
+        let mut frontier = self.lock();
+        assert!(frontier.is_settled());
+        let old_len = frontier.get();
         if new_max < old_len {
             return;
         }
@@ -363,6 +359,7 @@ impl<T> OnceVec<T> {
             self.data.insert(i, f(i));
 
             // Do it inside the loop because f may use self
+            frontier.advance_to(i + 1);
             self.len.store(i + 1, Ordering::Release)
         }
     }
@@ -450,10 +447,10 @@ impl<T: Send + Sync> OnceVec<T> {
     /// }
     /// ```
     pub fn maybe_par_extend(&self, new_max: usize, f: impl Fn(usize) -> T + Send + Sync) {
-        let ooo = self.lock();
-        assert!(ooo.0.is_empty());
+        let mut frontier = self.lock();
+        assert!(frontier.is_settled());
 
-        let old_len = self.len.load(Ordering::Acquire);
+        let old_len = frontier.get();
         if new_max < old_len {
             return;
         }
@@ -462,6 +459,7 @@ impl<T: Send + Sync> OnceVec<T> {
             self.data.insert(i, f(i));
         });
 
+        frontier.advance_to(new_max + 1);
         self.len.store(new_max + 1, Ordering::Release)
     }
 }
@@ -542,11 +540,11 @@ impl<T> FromIterator<T> for OnceVec<T> {
 /// let vec = OnceBiVec::<i32>::new(-3);
 ///
 /// // Insert elements at various positions
-/// vec.push_ooo(10, -3); // At minimum degree
-/// vec.push_ooo(30, -1);
-/// vec.push_ooo(20, -2);
-/// vec.push_ooo(50, 1);
-/// vec.push_ooo(40, 0);
+/// let _ = vec.push_ooo(10, -3); // At minimum degree
+/// let _ = vec.push_ooo(30, -1);
+/// let _ = vec.push_ooo(20, -2);
+/// let _ = vec.push_ooo(50, 1);
+/// let _ = vec.push_ooo(40, 0);
 ///
 /// // Access elements using their indices
 /// assert_eq!(vec[-3], 10);
@@ -684,13 +682,12 @@ impl<T> OnceBiVec<T> {
         self.data.push(value) as i32 + self.min_degree
     }
 
-    /// See [`OnceVec::push_ooo`].
-    pub fn push_ooo(&self, value: T, index: i32) -> std::ops::Range<i32> {
-        let result = self
-            .data
-            .push_ooo(value, (index - self.min_degree) as usize);
-
-        (result.start as i32 + self.min_degree)..(result.end as i32 + self.min_degree)
+    /// See [`OnceVec::push_ooo`]. The returned [`Claim`] is in degrees, not storage indices.
+    pub fn push_ooo(&self, value: T, index: i32) -> Claim<i32> {
+        let min_degree = self.min_degree;
+        self.data
+            .push_ooo(value, (index - min_degree) as usize)
+            .map(|i| i as i32 + min_degree)
     }
 
     pub fn ooo_elements(&self) -> Vec<i32> {
@@ -754,7 +751,7 @@ impl<T> OnceBiVec<T> {
 
     /// Takes a lock on the `OnceBiVec`. The `OnceBiVec` cannot be updated while the lock is held.
     /// This is useful when used in conjuction with [`OnceBiVec::extend`];
-    pub fn lock(&self) -> MutexGuard<'_, OooTracker> {
+    pub fn lock(&self) -> MutexGuard<'_, Frontier> {
         self.data.lock()
     }
 
@@ -906,7 +903,7 @@ mod tests {
         let v: OnceVec<u32> = OnceVec::new();
         v.push(4);
         v.push(3);
-        v.push_ooo(6, 7);
+        let _ = v.push_ooo(6, 7);
         drop(v);
     }
 
@@ -958,29 +955,29 @@ mod tests {
         let v = OnceVec::<usize>::new();
 
         // Push out of order
-        v.push_ooo(100, 10);
+        let _ = v.push_ooo(100, 10);
         assert_eq!(v.len(), 0); // Length is still 0 because there's a gap
         assert_eq!(v.ooo_elements(), vec![10]);
 
         // Fill the gap partially
-        v.push_ooo(0, 0);
+        let _ = v.push_ooo(0, 0);
         assert_eq!(v.len(), 1); // Length is now 1
         assert_eq!(v.ooo_elements(), vec![10]);
 
         // Fill more of the gap
-        v.push_ooo(10, 1);
-        v.push_ooo(20, 2);
-        v.push_ooo(30, 3);
+        let _ = v.push_ooo(10, 1);
+        let _ = v.push_ooo(20, 2);
+        let _ = v.push_ooo(30, 3);
         assert_eq!(v.len(), 4); // Length is now 4
         assert_eq!(v.ooo_elements(), vec![10]);
 
         // Fill the rest of the gap
-        v.push_ooo(40, 4);
-        v.push_ooo(50, 5);
-        v.push_ooo(60, 6);
-        v.push_ooo(70, 7);
-        v.push_ooo(80, 8);
-        v.push_ooo(90, 9);
+        let _ = v.push_ooo(40, 4);
+        let _ = v.push_ooo(50, 5);
+        let _ = v.push_ooo(60, 6);
+        let _ = v.push_ooo(70, 7);
+        let _ = v.push_ooo(80, 8);
+        let _ = v.push_ooo(90, 9);
         assert_eq!(v.len(), 11); // Length is now 11 (0-10)
         assert_eq!(v.ooo_elements().len(), 0);
 
@@ -1099,10 +1096,10 @@ mod tests {
                                 // Skip invalid indices that would panic
                                 continue;
                             } else if idx == reference.len() {
-                                vec.push_ooo(value, idx);
+                                let _ = vec.push_ooo(value, idx);
                                 reference.push(value);
                             } else {
-                                vec.push_ooo(value, idx);
+                                let _ = vec.push_ooo(value, idx);
                                 while reference.len() <= idx {
                                     reference.push(0); // Placeholder values
                                 }
@@ -1182,13 +1179,13 @@ mod tests {
         let v = OnceBiVec::<i32>::new(-3);
 
         // Push out of order
-        v.push_ooo(100, 0);
+        let _ = v.push_ooo(100, 0);
         assert_eq!(v.len(), -3); // Length is still -3 because there's a gap
 
         // Fill the gap
-        v.push_ooo(10, -3);
-        v.push_ooo(20, -2);
-        v.push_ooo(30, -1);
+        let _ = v.push_ooo(10, -3);
+        let _ = v.push_ooo(20, -2);
+        let _ = v.push_ooo(30, -1);
 
         // Check state
         assert_eq!(v.len(), 1); // All gaps filled, so len is 1
@@ -1340,6 +1337,39 @@ mod tests {
     mod loom_tests {
         use super::*;
         use crate::std_or_loom::{sync::Arc, thread};
+
+        /// Two threads fill adjacent indices in either order. However they interleave, the vector
+        /// must end up contiguous and the claims they receive must cover each index exactly once
+        /// — if a claim were duplicated or dropped, a sweep built on this would double-schedule or
+        /// strand the corresponding work.
+        #[test]
+        fn loom_concurrent_push_ooo_claims_partition() {
+            loom::model(|| {
+                let vec = Arc::new(OnceVec::<usize>::new());
+
+                let vec0 = Arc::clone(&vec);
+                let t0 = thread::spawn(move || vec0.push_ooo(10, 0).advanced());
+
+                let vec1 = Arc::clone(&vec);
+                let t1 = thread::spawn(move || vec1.push_ooo(11, 1).advanced());
+
+                let claim0 = t0.join().unwrap();
+                let claim1 = t1.join().unwrap();
+
+                assert_eq!(vec.len(), 2);
+                assert_eq!(vec[0usize], 10);
+                assert_eq!(vec[1usize], 11);
+                assert!(vec.ooo_elements().is_empty());
+
+                let mut claimed = [0u8; 2];
+                for range in [claim0, claim1].into_iter().flatten() {
+                    for i in range {
+                        claimed[i] += 1;
+                    }
+                }
+                assert_eq!(claimed, [1, 1], "each index must be claimed exactly once");
+            });
+        }
 
         #[test]
         fn loom_concurrent_push() {

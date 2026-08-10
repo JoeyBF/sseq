@@ -225,11 +225,11 @@ where
         let fx_dimension = f_cur.target().dimension(output.t());
 
         if num_gens == 0 || fx_dimension == 0 {
-            let range = f_cur.add_generators_from_rows_ooo(
+            let claim = f_cur.add_generators_from_rows_ooo(
                 input.t(),
                 vec![FpVector::new(p, fx_dimension); num_gens],
             );
-            return sseq::coordinates::ComputeOutcome::Computed(range);
+            return sseq::coordinates::ComputeOutcome::Computed(claim);
         }
 
         if let Some(dir) = self.save_dir.read() {
@@ -244,8 +244,8 @@ where
                 for _ in 0..num_gens {
                     outputs.push(FpVector::from_bytes(p, fx_dimension, &mut f).unwrap());
                 }
-                let range = f_cur.add_generators_from_rows_ooo(input.t(), outputs);
-                return sseq::coordinates::ComputeOutcome::Computed(range);
+                let claim = f_cur.add_generators_from_rows_ooo(input.t(), outputs);
+                return sseq::coordinates::ComputeOutcome::Computed(claim);
             }
         }
 
@@ -264,8 +264,8 @@ where
                 }
             }
 
-            let range = f_cur.add_generators_from_rows_ooo(input.t(), outputs);
-            return sseq::coordinates::ComputeOutcome::Computed(range);
+            let claim = f_cur.add_generators_from_rows_ooo(input.t(), outputs);
+            return sseq::coordinates::ComputeOutcome::Computed(claim);
         }
         let mut outputs = vec![FpVector::new(p, fx_dimension); num_gens];
         let d_source = self.source.differential(input.s());
@@ -340,8 +340,8 @@ where
                 row.to_bytes(&mut f).unwrap();
             }
         }
-        let range = f_cur.add_generators_from_rows_ooo(input.t(), outputs);
-        sseq::coordinates::ComputeOutcome::Computed(range)
+        let claim = f_cur.add_generators_from_rows_ooo(input.t(), outputs);
+        sseq::coordinates::ComputeOutcome::Computed(claim)
     }
 }
 

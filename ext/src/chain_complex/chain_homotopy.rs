@@ -175,8 +175,8 @@ impl<
         // these values.
         if target.s() == 0 || target_dim == 0 || num_gens == 0 {
             let outputs = vec![FpVector::new(p, target_dim); num_gens];
-            let range = self.homotopies[source.s()].add_generators_from_rows_ooo(source.t(), outputs);
-            return sseq::coordinates::ComputeOutcome::Computed(range);
+            let claim = self.homotopies[source.s()].add_generators_from_rows_ooo(source.t(), outputs);
+            return sseq::coordinates::ComputeOutcome::Computed(claim);
         }
 
         if let Some(dir) = self.save_dir.read()
@@ -190,8 +190,8 @@ impl<
             for _ in 0..num_gens {
                 outputs.push(FpVector::from_bytes(p, target_dim, &mut f).unwrap());
             }
-            let range = self.homotopies[source.s()].add_generators_from_rows_ooo(source.t(), outputs);
-            return sseq::coordinates::ComputeOutcome::Computed(range);
+            let claim = self.homotopies[source.s()].add_generators_from_rows_ooo(source.t(), outputs);
+            return sseq::coordinates::ComputeOutcome::Computed(claim);
         }
 
         let mut outputs = vec![FpVector::new(p, target_dim); num_gens];
@@ -275,8 +275,8 @@ impl<
                 row.to_bytes(&mut f).unwrap();
             }
         }
-        let range = self.homotopies[source.s()].add_generators_from_rows_ooo(source.t(), outputs);
-        sseq::coordinates::ComputeOutcome::Computed(range)
+        let claim = self.homotopies[source.s()].add_generators_from_rows_ooo(source.t(), outputs);
+        sseq::coordinates::ComputeOutcome::Computed(claim)
     }
 
     pub fn homotopy(&self, source_s: i32) -> Arc<FreeModuleHomomorphism<U::Module>> {

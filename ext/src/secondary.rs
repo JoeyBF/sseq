@@ -563,10 +563,10 @@ pub trait SecondaryLift: Sync + Sized {
                 for _ in 0..num_gens {
                     results.push(FpVector::from_bytes(p, target_dim, &mut f).unwrap());
                 }
-                let range = self.homotopies()[b.s()]
+                let claim = self.homotopies()[b.s()]
                     .homotopies
                     .add_generators_from_rows_ooo(b.t(), results);
-                return Ok(sseq::coordinates::ComputeOutcome::Computed(range));
+                return Ok(sseq::coordinates::ComputeOutcome::Computed(claim));
             }
         }
 
@@ -638,10 +638,10 @@ pub trait SecondaryLift: Sync + Sized {
             }
         }
 
-        let range = homotopy
+        let claim = homotopy
             .homotopies
             .add_generators_from_rows_ooo(b.t(), results);
-        Ok(sseq::coordinates::ComputeOutcome::Computed(range))
+        Ok(sseq::coordinates::ComputeOutcome::Computed(claim))
     }
 
     #[tracing::instrument(skip(self))]

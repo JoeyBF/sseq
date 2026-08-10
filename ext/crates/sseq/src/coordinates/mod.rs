@@ -2,6 +2,7 @@ pub use degree::MultiDegree;
 pub use element::MultiDegreeElement;
 pub use generator::MultiDegreeGenerator;
 use maybe_rayon::prelude::*;
+pub use once::Claim;
 use ordered::OrderedMultiDegree;
 pub use range::BidegreeRange;
 
@@ -11,24 +12,22 @@ pub mod generator;
 pub mod ordered;
 pub mod range;
 
-/// Outcome of a single computation step in a bidegree iteration.
+/// What one step of an [`iter_s_t`] sweep did, and therefore what should run next.
 ///
-/// This makes the intent of the computation explicit, replacing the previous approach of
-/// encoding control flow in return ranges.
-///
-/// # Variants
-///
-/// - `Computed(range)`: Successfully computed data. The range indicates which `t` values
-///   in `s+1` are now contiguous and should be processed next.
-/// - `AlreadyProcessed`: The step had nothing to do; it was already computed.
-/// - `Skipped`: Deliberately skipped this step (e.g., error condition met, unreachable case).
+/// A step is responsible for telling the sweep which `t` in the row above it have become
+/// reachable. Getting that wrong does not corrupt data — it silently strands whole regions of the
+/// grid — so each case is spelled out rather than encoded in a range.
 #[derive(Debug, Clone)]
 pub enum ComputeOutcome {
-    /// Successfully computed. The range indicates newly-contiguous t-values for the next s.
-    Computed(std::ops::Range<i32>),
-    /// The step was already processed; no new computation was done.
+    /// The step wrote its bidegree. The [`Claim`] says which degrees it thereby became responsible
+    /// for; [`Claim::Nothing`] means it landed above a gap and another step will pick these up.
+    Computed(Claim<i32>),
+    /// A previous sweep already wrote this bidegree, so there was nothing to do — but this step
+    /// still owns propagating it, or every dependent above would be stranded. Load-bearing on
+    /// resumed computations, where a row can start out filled well past the row above it.
     AlreadyProcessed,
-    /// Deliberately skipped this step (e.g., error condition met, unreachable).
+    /// Abandon this branch: write nothing, propagate nothing. Schedules identically to
+    /// `Computed(Claim::Nothing)`; the distinction is that this step chose not to do the work.
     Skipped,
 }
 
@@ -99,15 +98,14 @@ pub fn iter_s_t<T: Sync>(
             max: BidegreeRange<'a, S>,
             current: Bidegree,
         ) {
-            let outcome = f(current);
-            let mut ret = match outcome {
-                ComputeOutcome::Computed(range) => range,
-                ComputeOutcome::AlreadyProcessed => {
-                    current.t()..current.t() + 1
-                }
-                ComputeOutcome::Skipped => {
-                    current.t()..current.t()
-                }
+            let claim = match f(current) {
+                ComputeOutcome::Computed(claim) => claim,
+                // Synthesise the claim this bidegree would have earned, so dependents still run.
+                ComputeOutcome::AlreadyProcessed => Claim::Advanced(current.t()..current.t() + 1),
+                ComputeOutcome::Skipped => Claim::Nothing,
+            };
+            let Some(mut ret) = claim.advanced() else {
+                return;
             };
 
             if current.s() + 1 < max.s() {

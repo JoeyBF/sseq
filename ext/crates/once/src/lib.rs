@@ -33,6 +33,7 @@
 #![allow(unexpected_cfgs)]
 #![deny(clippy::use_self, unsafe_op_in_unsafe_fn)]
 
+pub mod frontier;
 pub mod grove;
 pub mod multiindexed;
 pub mod once;
@@ -40,6 +41,7 @@ pub mod write_once;
 
 mod std_or_loom;
 
+pub use frontier::{Claim, Frontier};
 pub use grove::{Grove, TwoEndedGrove};
 pub use multiindexed::MultiIndexed;
 pub use once::{OnceBiVec, OnceBiVecIter, OnceVec, OnceVecIter};
