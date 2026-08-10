@@ -598,14 +598,28 @@ mod speculate {
     ///
     /// Installing the build into a separate pool keeps every nested `par_iter` inside that pool, so
     /// speculation can only consume cores the wavefront is not asking for.
-    /// `NASSAU_SPECULATE_POOL` sizes it (default: a quarter of the machine).
+    ///
+    /// SIZE IT GENEROUSLY. This defaulted to a quarter of the machine, which throttled speculation
+    /// by construction: measured CPU was ~20 of 128 cores, and block coverage plateaued near 52%
+    /// however the pieces were reshaped. Stem 150, θ=125, control repeated last:
+    ///
+    /// | builders / pool | wall        | row coverage |
+    /// |-----------------|-------------|--------------|
+    /// | 16 / 32         | 170 s 168 s | 52.2% 50.6%  |
+    /// | 24 / 64         | 134 s       | 63.6%        |
+    /// | 32 / 96         | 119 s       | 70.8%        |
+    /// | 48 / 120        | 134 s       | 77.0%        |
+    ///
+    /// So the contention this pool exists to prevent is real, but only past ~3/4 of the machine: at
+    /// 120 threads coverage still climbs while wall time regresses. Default is 3/4.
+    /// `NASSAU_SPECULATE_POOL` overrides.
     pub fn pool() -> &'static maybe_rayon::MaybeThreadPool {
         static P: LazyLock<maybe_rayon::MaybeThreadPool> = LazyLock::new(|| {
             let n = std::env::var("NASSAU_SPECULATE_POOL")
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .filter(|&v| v > 0)
-                .unwrap_or_else(|| (maybe_rayon::max_num_threads() / 4).max(1));
+                .unwrap_or_else(|| (maybe_rayon::max_num_threads() * 3 / 4).max(1));
             maybe_rayon::MaybeThreadPool::new(n, "nassau-spec")
         });
         &P
