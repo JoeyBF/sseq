@@ -11,6 +11,27 @@ pub mod generator;
 pub mod ordered;
 pub mod range;
 
+/// Outcome of a single computation step in a bidegree iteration.
+///
+/// This makes the intent of the computation explicit, replacing the previous approach of
+/// encoding control flow in return ranges.
+///
+/// # Variants
+///
+/// - `Computed(range)`: Successfully computed data. The range indicates which `t` values
+///   in `s+1` are now contiguous and should be processed next.
+/// - `AlreadyProcessed`: The step had nothing to do; it was already computed.
+/// - `Skipped`: Deliberately skipped this step (e.g., error condition met, unreachable case).
+#[derive(Debug, Clone)]
+pub enum ComputeOutcome {
+    /// Successfully computed. The range indicates newly-contiguous t-values for the next s.
+    Computed(std::ops::Range<i32>),
+    /// The step was already processed; no new computation was done.
+    AlreadyProcessed,
+    /// Deliberately skipped this step (e.g., error condition met, unreachable).
+    Skipped,
+}
+
 pub type Bidegree = MultiDegree<2>;
 pub type BidegreeElement = MultiDegreeElement<2>;
 pub type BidegreeGenerator = MultiDegreeGenerator<2>;
@@ -46,12 +67,11 @@ impl BidegreeGenerator {
 /// `[min_t, max_t(s)]`.  Further, we only compute `f(s, t)` when `f(s - 1, t')` has been computed
 /// for all `t' < t`.
 ///
-/// The function `f` should return a range starting from t and ending at the largest `T` such that
-/// `f(s, t')` has already been computed for every `t' < T`.
-///
-/// While `iter_s_t` could have had kept track of that data, it is usually the case that `f` would
-/// compute something and write it to a `OnceBiVec`, and
-/// [`OnceBiVec::push_ooo`](once::OnceBiVec::push_ooo) would return this range for us.
+/// The function `f` should return a [`ComputeOutcome`] indicating what happened:
+/// - `ComputeOutcome::Computed(range)`: The computation succeeded and produced data. The range
+///   indicates which `t` values in `s+1` should be processed next.
+/// - `ComputeOutcome::Skipped`: The step was skipped (e.g., already computed, error condition).
+///   No further steps will be spawned for this branch.
 ///
 /// This uses [`maybe_rayon`] under the hood, and `f` should feel free to use further parallelism.
 ///
@@ -59,7 +79,7 @@ impl BidegreeGenerator {
 ///  - `max_s`: This is exclusive
 ///  - `max_t`: This is exclusive
 pub fn iter_s_t<T: Sync>(
-    f: &(impl Fn(Bidegree) -> std::ops::Range<i32> + Sync),
+    f: &(impl Fn(Bidegree) -> ComputeOutcome + Sync),
     min: Bidegree,
     max: BidegreeRange<T>,
 ) {
@@ -75,11 +95,21 @@ pub fn iter_s_t<T: Sync>(
         // arguments.
         fn run<'a, S: Sync>(
             scope: &maybe_rayon::Scope<'a>,
-            f: &'a (impl Fn(Bidegree) -> std::ops::Range<i32> + Sync + 'a),
+            f: &'a (impl Fn(Bidegree) -> ComputeOutcome + Sync + 'a),
             max: BidegreeRange<'a, S>,
             current: Bidegree,
         ) {
-            let mut ret = f(current);
+            let outcome = f(current);
+            let mut ret = match outcome {
+                ComputeOutcome::Computed(range) => range,
+                ComputeOutcome::AlreadyProcessed => {
+                    current.t()..current.t() + 1
+                }
+                ComputeOutcome::Skipped => {
+                    current.t()..current.t()
+                }
+            };
+
             if current.s() + 1 < max.s() {
                 ret.start += 1;
                 ret.end = std::cmp::min(ret.end + 1, max.t(current.s() + 1));

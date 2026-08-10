@@ -1,6 +1,6 @@
 //! This module defines [`MuResolutionHomomorphism`], which is a chain map from a
 //! [`FreeChainComplex`].
-use std::{ops::Range, sync::Arc};
+use std::sync::Arc;
 
 use algebra::{
     MuAlgebra,
@@ -206,7 +206,7 @@ where
         &self,
         input: Bidegree,
         extra_images: Option<Vec<FpVector>>,
-    ) -> Range<i32> {
+    ) -> sseq::coordinates::ComputeOutcome {
         let output = input - self.shift;
         assert!(self.target.has_computed_bidegree(output));
         assert!(self.source.has_computed_bidegree(input));
@@ -215,8 +215,8 @@ where
         let f_cur = self.get_map_ensure_length(input.s());
         if input.t() < f_cur.next_degree() {
             assert!(extra_images.is_none());
-            // We need to signal to compute the dependents of this
-            return input.t()..input.t() + 1;
+            // Already processed
+            return sseq::coordinates::ComputeOutcome::AlreadyProcessed;
         }
 
         let p = self.source.prime();
@@ -225,10 +225,11 @@ where
         let fx_dimension = f_cur.target().dimension(output.t());
 
         if num_gens == 0 || fx_dimension == 0 {
-            return f_cur.add_generators_from_rows_ooo(
+            let range = f_cur.add_generators_from_rows_ooo(
                 input.t(),
                 vec![FpVector::new(p, fx_dimension); num_gens],
             );
+            return sseq::coordinates::ComputeOutcome::Computed(range);
         }
 
         if let Some(dir) = self.save_dir.read() {
@@ -243,7 +244,8 @@ where
                 for _ in 0..num_gens {
                     outputs.push(FpVector::from_bytes(p, fx_dimension, &mut f).unwrap());
                 }
-                return f_cur.add_generators_from_rows_ooo(input.t(), outputs);
+                let range = f_cur.add_generators_from_rows_ooo(input.t(), outputs);
+                return sseq::coordinates::ComputeOutcome::Computed(range);
             }
         }
 
@@ -262,7 +264,8 @@ where
                 }
             }
 
-            return f_cur.add_generators_from_rows_ooo(input.t(), outputs);
+            let range = f_cur.add_generators_from_rows_ooo(input.t(), outputs);
+            return sseq::coordinates::ComputeOutcome::Computed(range);
         }
         let mut outputs = vec![FpVector::new(p, fx_dimension); num_gens];
         let d_source = self.source.differential(input.s());
@@ -337,7 +340,8 @@ where
                 row.to_bytes(&mut f).unwrap();
             }
         }
-        f_cur.add_generators_from_rows_ooo(input.t(), outputs)
+        let range = f_cur.add_generators_from_rows_ooo(input.t(), outputs);
+        sseq::coordinates::ComputeOutcome::Computed(range)
     }
 }
 
@@ -379,7 +383,7 @@ where
     /// The user should call this function explicitly to manually define the chain map where the
     /// chain complex is not exact, and then call [`MuResolutionHomomorphism::extend_all`] to extend
     /// the rest by exactness.
-    pub fn extend_step(&self, input: Bidegree, extra_images: Option<&Matrix>) -> Range<i32> {
+    pub fn extend_step(&self, input: Bidegree, extra_images: Option<&Matrix>) -> sseq::coordinates::ComputeOutcome {
         self.extend_step_raw(
             input,
             extra_images.map(|m| {

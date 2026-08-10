@@ -525,7 +525,7 @@ pub trait SecondaryLift: Sync + Sized {
             })
     }
 
-    fn compute_homotopy_step(&self, b: Bidegree) -> std::ops::Range<i32> {
+    fn compute_homotopy_step(&self, b: Bidegree) -> sseq::coordinates::ComputeOutcome {
         self.try_compute_homotopy_step(b).unwrap()
     }
 
@@ -535,10 +535,10 @@ pub trait SecondaryLift: Sync + Sized {
     /// is invalid. [`compute_homotopy_step`](Self::compute_homotopy_step) is simply
     /// `self.try_compute_homotopy_step(b).unwrap()`.
     #[tracing::instrument(skip(self), fields(%b))]
-    fn try_compute_homotopy_step(&self, b: Bidegree) -> anyhow::Result<std::ops::Range<i32>> {
+    fn try_compute_homotopy_step(&self, b: Bidegree) -> anyhow::Result<sseq::coordinates::ComputeOutcome> {
         let homotopy = &self.homotopies()[b.s()];
         if homotopy.homotopies.next_degree() > b.t() {
-            return Ok(b.t()..b.t() + 1);
+            return Ok(sseq::coordinates::ComputeOutcome::AlreadyProcessed);
         }
         let p = self.prime();
         let shift = self.shift();
@@ -563,9 +563,10 @@ pub trait SecondaryLift: Sync + Sized {
                 for _ in 0..num_gens {
                     results.push(FpVector::from_bytes(p, target_dim, &mut f).unwrap());
                 }
-                return Ok(self.homotopies()[b.s()]
+                let range = self.homotopies()[b.s()]
                     .homotopies
-                    .add_generators_from_rows_ooo(b.t(), results));
+                    .add_generators_from_rows_ooo(b.t(), results);
+                return Ok(sseq::coordinates::ComputeOutcome::Computed(range));
             }
         }
 
@@ -637,9 +638,10 @@ pub trait SecondaryLift: Sync + Sized {
             }
         }
 
-        Ok(homotopy
+        let range = homotopy
             .homotopies
-            .add_generators_from_rows_ooo(b.t(), results))
+            .add_generators_from_rows_ooo(b.t(), results);
+        Ok(sseq::coordinates::ComputeOutcome::Computed(range))
     }
 
     #[tracing::instrument(skip(self))]
@@ -735,7 +737,7 @@ mod tests {
             &|b| {
                 if b.s() > failing.s() || (b.s() == failing.s() && b.t() >= failing.t()) {
                     // Skip the failing step and everything after it.
-                    return b.t()..b.t() + 1;
+                    return sseq::coordinates::ComputeOutcome::Skipped;
                 }
                 lift.compute_homotopy_step(b)
             },
