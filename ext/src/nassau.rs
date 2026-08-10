@@ -1879,6 +1879,18 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
         next_dim: usize,
     ) -> Matrix {
         let ready = blocks::take_sig(b, sig_idx);
+        // Nothing precomputed: build straight into the result. Going through the assembly path
+        // anyway would allocate this matrix, build a SECOND one for the missing rows, and copy row
+        // by row -- pure overhead, and it cost 7% at stem 200 on bidegrees where no piece landed.
+        if ready.is_empty() {
+            blocks::record(0, 0, 0, target_mask.len());
+            return restricted_partial_matrix_maybe_gpu(
+                &self.differentials[b.s() - 1],
+                b.t(),
+                target_mask,
+                next_dim,
+            );
+        }
         let mut full = Matrix::new(self.prime(), target_mask.len(), next_dim);
         let mut missing: Vec<usize> = Vec::new();
         let (mut hits, mut misses, mut rows_hit) = (0usize, 0usize, 0usize);
