@@ -1148,6 +1148,14 @@ mod blocks {
     }
 }
 
+/// Multiply work (`rows x cols`) split by whether the bidegree could use the full-matrix reuse
+/// path at all. Speculation can only ever touch the REUSE side, so this bounds the whole direction:
+/// if most of the work is on the no-reuse side, no amount of block tuning can reach it.
+static REUSE_WORK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static REUSE_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static NOREUSE_WORK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static NOREUSE_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 /// A resolution of `S_2` using Nassau's algorithm.
 ///
 /// This aims to have an API similar to that of
@@ -1690,6 +1698,11 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
         let full_reuse: Option<Matrix> = if reuse_full_matrix(&self.differentials[b.s() - 1])
             && reuse_within_cap(target_dim, next_dim)
         {
+            REUSE_WORK.fetch_add(
+                (target_dim as u64).saturating_mul(next_dim as u64),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            REUSE_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let all_rows: Vec<usize> = (0..target_dim).collect();
             // A background builder may already have this matrix. Its inputs are frozen once
             // `(b.s() - 1, b.t() - 1)` is committed, strictly earlier than `(b.s(), b.t())` can run,
@@ -1772,6 +1785,19 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
             }
             Some(full)
         } else {
+            // How much of the run is out of reach of blocks entirely?
+            //
+            // `row_rate` only measures bidegrees that take the reuse path; a bidegree over
+            // `reuse_within_cap` builds per signature and contributes nothing to it, so a high
+            // `row_rate` is consistent with speculation being irrelevant to most of the work. This
+            // splits the total multiply work (`rows x cols`) both ways to say which.
+            if reuse_full_matrix(&self.differentials[b.s() - 1]) {
+                NOREUSE_WORK.fetch_add(
+                    (target_dim as u64).saturating_mul(next_dim as u64),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                NOREUSE_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
             // This bidegree is building per signature, so nothing will ever collect its blocks.
             // Release them here rather than leaving them pinned until the end of the run: they hold
             // memory against `has_room()`, which would starve speculation for the bidegrees that
@@ -2608,6 +2634,26 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                 built.saturating_sub(hits) + dropped,
                 bytes as f64 / (1u64 << 30) as f64,
             );
+        }
+        {
+            let (rw, rc) = (
+                REUSE_WORK.load(std::sync::atomic::Ordering::Relaxed),
+                REUSE_COUNT.load(std::sync::atomic::Ordering::Relaxed),
+            );
+            let (nw, nc) = (
+                NOREUSE_WORK.load(std::sync::atomic::Ordering::Relaxed),
+                NOREUSE_COUNT.load(std::sync::atomic::Ordering::Relaxed),
+            );
+            if rw + nw > 0 {
+                eprintln!(
+                    "[reuse-split] reusable={rc} bidegrees {:.1}Gwork ({:.1}%) | over-cap={nc} \
+                     bidegrees {:.1}Gwork ({:.1}%)",
+                    rw as f64 / 1e9,
+                    100.0 * rw as f64 / (rw + nw) as f64,
+                    nw as f64 / 1e9,
+                    100.0 * nw as f64 / (rw + nw) as f64,
+                );
+            }
         }
         speculate::clear();
         blocks::clear();
