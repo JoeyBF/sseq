@@ -1701,17 +1701,42 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
         };
 
         if reuse_within_cap(target_dim, next_dim) {
-            // Within the cap the consumer assembles ONE full matrix, so deliver contiguous row
-            // ranges: one piece per generator of this degree, published as each lands.
-            speculate::pool().install(|| {
-                for &(_, start, end) in ranges.iter().filter(|&&(g, _, _)| g == gen_deg) {
-                    if blocks::is_done(b) {
-                        break;
-                    }
-                    let rows: Vec<usize> = (start..end).collect();
-                    blocks::publish(b, gen_deg, start, build(&rows));
-                }
-            });
+            // Within the cap the consumer assembles ONE full matrix, so deliver one contiguous
+            // range covering EVERY generator of this degree. Generators of a degree are adjacent,
+            // so the merged range is still contiguous.
+            //
+            // Publishing them as separate pieces instead covers the same rows but costs 17% of wall
+            // time at stem 150 (203/201 s against 172/173 s) and covers slightly LESS: ~36% more
+            // pieces means more work per queue item, so builders reach fewer degrees before the
+            // wavefront arrives. Granularity here is not free.
+            // One piece per degree covering only its FIRST generator, by default.
+            //
+            // That sounds like it leaves work on the table, and it does — but not measurably, and
+            // covering more costs. Stem 150, θ=125, one binary, interleaved:
+            //
+            //     first generator only   173 s   coverage 53.4%
+            //     merged over the degree 194 s   coverage 53.3%
+            //     one piece per generator 202 s  coverage 51.4%
+            //
+            // Coverage is flat because a degree almost always carries a single generator here, so
+            // the extra generators are nearly empty; what changes is piece size and builder load,
+            // and both bigger pieces and more pieces lose. Speculation is already at its useful
+            // limit — past it the builders just compete with the wavefront. `NASSAU_BLOCK_MERGE=1`
+            // covers every generator of the degree, for regimes where generators are denser.
+            let merge = std::env::var("NASSAU_BLOCK_MERGE").as_deref() == Ok("1");
+            let mut it = ranges.iter().filter(|&&(g, _, _)| g == gen_deg);
+            let first = *it.next().unwrap();
+            let (start, end) = if merge {
+                (
+                    first.1,
+                    it.fold(first.2, |acc, &(_, _, e)| std::cmp::max(acc, e)),
+                )
+            } else {
+                (first.1, first.2)
+            };
+            let rows: Vec<usize> = (start..end).collect();
+            let m = speculate::pool().install(|| build(&rows));
+            blocks::publish(b, gen_deg, start, m);
             guard.done();
             return;
         }
