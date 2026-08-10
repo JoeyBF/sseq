@@ -1584,28 +1584,46 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
             .collect()
     }
 
-    /// The rows of `b`'s signature-`signature` matrix contributed by generators of degree
-    /// `gen_deg`, and the offset of that run within the signature matrix.
+    /// EVERY signature piece for one generator degree, in a single pass.
     ///
-    /// This is `signature_mask` restricted to one generator degree, which is the whole point: the
-    /// op indices it selects come only from `ppart_table(t - gen_deg)` and the packed signature —
-    /// never the module's degree-`t` basis — so a piece is determined exactly when the generators of
-    /// degree `gen_deg` are, the same early window plain blocks get. The run is contiguous within
-    /// the signature matrix because `signature_mask` walks generators in layout order, so the rows
-    /// from lower degrees all precede it; counting them gives the offset.
-    fn signature_piece(
+    /// Returns `(sig_idx, offset within that signature's matrix, rows)`.
+    ///
+    /// Doing one signature at a time cost O(generators x ppart_table x signatures) per degree,
+    /// because it rescanned every generator and its whole operation table for each signature in
+    /// turn. At stem 200 that produced 2 988 096 tiny pieces and ran 5077 s against 3799 s for plain
+    /// blocks. Every operation has exactly ONE signature, and all signatures of a subalgebra share
+    /// the same packed MASK (it depends only on the profile), so a single pass bucketing ops by
+    /// `op.bits() & mask` does the whole degree for what one signature used to cost.
+    ///
+    /// Frontier-free for the same reason `signature_mask` is: the op indices come from
+    /// `ppart_table(t - gen_deg)` and the packed signature alone, never the module's degree-`t`
+    /// basis. The offsets count matching rows from lower generator degrees, which is what makes each
+    /// piece a contiguous run of its signature's matrix.
+    fn signature_pieces(
         &self,
         b: Bidegree,
         subalgebra: &MilnorSubalgebra,
-        signature: &[PPartEntry],
+        signatures: &[Vec<PPartEntry>],
         gen_deg: i32,
-    ) -> Option<(usize, Vec<usize>)> {
+    ) -> Vec<(usize, usize, Vec<usize>)> {
         let target = &*self.modules[b.s() - 1];
         target.compute_basis(b.t());
         let algebra = target.algebra();
-        let (mask, value) = subalgebra.packed_signature(signature)?;
-        let mut start = 0usize;
-        let mut rows = Vec::new();
+
+        let mut mask = 0u64;
+        let mut index: std::collections::HashMap<u64, usize> = std::collections::HashMap::new();
+        for (i, sig) in signatures.iter().enumerate() {
+            if let Some((m, v)) = subalgebra.packed_signature(sig) {
+                mask = m;
+                index.insert(v, i);
+            }
+        }
+        if index.is_empty() {
+            return Vec::new();
+        }
+
+        let mut starts: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+        let mut rows: std::collections::HashMap<usize, Vec<usize>> = std::collections::HashMap::new();
         for gd in target
             .iter_gen_offsets([b.t()])
             .take_while(|g| g.gen_deg < b.t())
@@ -1615,14 +1633,22 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
             }
             let table = algebra.ppart_table(b.t() - gd.gen_deg);
             if gd.gen_deg < gen_deg {
-                start += table.iter().filter(|op| op.bits() & mask == value).count();
+                for op in table {
+                    if let Some(&i) = index.get(&(op.bits() & mask)) {
+                        *starts.entry(i).or_insert(0) += 1;
+                    }
+                }
             } else {
-                rows.extend(table.iter().enumerate().filter_map(|(n, op)| {
-                    (op.bits() & mask == value).then_some(gd.start[0] + n)
-                }));
+                for (n, op) in table.iter().enumerate() {
+                    if let Some(&i) = index.get(&(op.bits() & mask)) {
+                        rows.entry(i).or_default().push(gd.start[0] + n);
+                    }
+                }
             }
         }
-        Some((start, rows))
+        rows.into_iter()
+            .map(|(i, r)| (i, starts.get(&i).copied().unwrap_or(0), r))
+            .collect()
     }
 
     /// Column count for the block at `gen_deg`: the restricted dimension of `modules[b.s() - 2]`
@@ -1646,6 +1672,22 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                 ((end - start) as u64).saturating_mul(self.block_cols(b, gen_deg) as u64)
             })
             .sum()
+    }
+
+    /// Smallest piece worth precomputing, in rows (`NASSAU_SIG_MIN_ROWS`).
+    ///
+    /// Signature pieces are naturally tiny — stem 200 averaged 32 rows each — and below some size a
+    /// piece cannot repay its allocation, lock and bookkeeping. Signature mass is also very uneven
+    /// (one signature is often ~96% of its bidegree), so a threshold discards a great many pieces
+    /// while keeping nearly all the rows.
+    fn sig_min_rows() -> usize {
+        static M: LazyLock<usize> = LazyLock::new(|| {
+            std::env::var("NASSAU_SIG_MIN_ROWS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(512)
+        });
+        *M
     }
 
     /// Build one row block of `b`'s matrix ahead of time and park it in the [`blocks`] cache.
@@ -1749,19 +1791,15 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
         // it costs no extra multiplies -- signatures partition the operations, so this is a strict
         // refinement of the same rows.
         let subalgebra = MilnorSubalgebra::optimal_for(b);
+        let signatures: Vec<Vec<PPartEntry>> = subalgebra.iter_signatures(b.t()).collect();
+        let pieces = self.signature_pieces(b, &subalgebra, &signatures, gen_deg);
+        let min_rows = Self::sig_min_rows();
         speculate::pool().install(|| {
-            for (sig_idx, signature) in subalgebra.iter_signatures(b.t()).enumerate() {
+            for (sig_idx, start, rows) in pieces {
                 if blocks::is_done(b) || !blocks::has_room() {
                     break;
                 }
-                if !blocks::claim_sig(b, gen_deg, sig_idx) {
-                    continue;
-                }
-                let Some((start, rows)) = self.signature_piece(b, &subalgebra, &signature, gen_deg)
-                else {
-                    continue;
-                };
-                if rows.is_empty() {
+                if rows.len() < min_rows || !blocks::claim_sig(b, gen_deg, sig_idx) {
                     continue;
                 }
                 blocks::publish_sig(b, sig_idx, start, build(&rows));
