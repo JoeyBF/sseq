@@ -939,7 +939,20 @@ mod blocks {
         *Q
     }
 
-    /// A finished block carries the row offset it was BUILT against, not just its contents.
+    /// One generator degree's claim, holding whatever pieces have been finished for it so far.
+    ///
+    /// A degree is claimed as a unit (one queue item) but DELIVERED per generator, incrementally.
+    /// `iter_gen_offsets` yields one entry per generator, so a degree with several generators is
+    /// several independent row ranges; building them as one range made blocks coarse and
+    /// all-or-nothing, and coverage fell (86.3% -> 68.1% at stem 30) because fewer finished before
+    /// their bidegree ran. Publishing each generator as it lands keeps the granularity fine while
+    /// still covering every generator, instead of only the first one in each degree.
+    #[derive(Default)]
+    struct DegreeSlot {
+        pieces: Vec<(usize, Matrix)>,
+    }
+
+    /// A finished piece carries the row offset it was BUILT against, not just its contents.
     ///
     /// That offset is the fix for a real bug. The consumer used to re-derive each block's row range
     /// from the module's generator counts at consumption time and got a different answer than the
@@ -947,10 +960,6 @@ mod blocks {
     /// row. A free module's basis at a fixed degree is append-only and generator-major, so the
     /// offset a block was built against stays valid forever — recomputing it later is what is
     /// fragile. So the block owns its position, and the consumer never re-derives it.
-    enum Slot {
-        InFlight,
-        Ready(usize, Matrix),
-    }
 
     /// Every block known for one bidegree.
     ///
@@ -961,7 +970,13 @@ mod blocks {
     #[derive(Default)]
     struct BidegreeBlocks {
         done: bool,
-        slots: HashMap<i32, Slot>,
+        slots: HashMap<i32, DegreeSlot>,
+        /// Signatures already consumed. A bidegree above `reuse_within_cap` never assembles a full
+        /// matrix, so `done` never fires for it; delivery is per signature instead and this is what
+        /// stops a straggling piece from being stored for a signature already row-reduced.
+        sig_done: std::collections::HashSet<usize>,
+        /// `sig_idx -> pieces`, each `(offset within the signature matrix, rows)`.
+        sig: HashMap<usize, Vec<(usize, Matrix)>>,
     }
 
     static CACHE: LazyLock<Mutex<HashMap<(i32, i32), BidegreeBlocks>>> =
@@ -991,7 +1006,7 @@ mod blocks {
         if e.done || e.slots.contains_key(&gen_deg) {
             return false;
         }
-        e.slots.insert(gen_deg, Slot::InFlight);
+        e.slots.insert(gen_deg, DegreeSlot::default());
         true
     }
 
@@ -1013,26 +1028,89 @@ mod blocks {
         fn drop(&mut self) {
             if let Some((b, gen_deg)) = self.0
                 && let Some(e) = CACHE.lock().unwrap().get_mut(&(b.s(), b.t()))
-                && matches!(e.slots.get(&gen_deg), Some(Slot::InFlight))
+                && e.slots.get(&gen_deg).is_some_and(|d| d.pieces.is_empty())
             {
                 e.slots.remove(&gen_deg);
             }
         }
     }
 
+    /// Hand over one finished piece. Called once per generator, as each lands.
     pub fn publish(b: Bidegree, gen_deg: i32, start: usize, matrix: Matrix) {
         let mut g = CACHE.lock().unwrap();
         let Some(e) = g.get_mut(&(b.s(), b.t())) else {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             return;
         };
-        if e.done || !matches!(e.slots.get(&gen_deg), Some(Slot::InFlight)) {
+        let done = e.done;
+        let Some(slot) = e.slots.get_mut(&gen_deg).filter(|_| !done) else {
+            DROPPED.fetch_add(1, Ordering::Relaxed);
+            return;
+        };
+        BYTES.fetch_add(size_of(&matrix), Ordering::Relaxed);
+        BUILT.fetch_add(1, Ordering::Relaxed);
+        slot.pieces.push((start, matrix));
+    }
+
+    /// Take ownership of building one signature's pieces for a generator degree.
+    pub fn claim_sig(b: Bidegree, gen_deg: i32, sig_idx: usize) -> bool {
+        let mut g = CACHE.lock().unwrap();
+        let e = g.entry((b.s(), b.t())).or_default();
+        if e.done || e.sig_done.contains(&sig_idx) {
+            return false;
+        }
+        // One claim per (signature, generator degree): the degree's queue item already serialises
+        // builders, this only guards against a re-queued degree redoing finished work.
+        e.sig.entry(sig_idx).or_default();
+        let _ = gen_deg;
+        true
+    }
+
+    pub fn publish_sig(b: Bidegree, sig_idx: usize, start: usize, matrix: Matrix) {
+        let mut g = CACHE.lock().unwrap();
+        let Some(e) = g.get_mut(&(b.s(), b.t())) else {
+            DROPPED.fetch_add(1, Ordering::Relaxed);
+            return;
+        };
+        if e.done || e.sig_done.contains(&sig_idx) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             return;
         }
         BYTES.fetch_add(size_of(&matrix), Ordering::Relaxed);
         BUILT.fetch_add(1, Ordering::Relaxed);
-        e.slots.insert(gen_deg, Slot::Ready(start, matrix));
+        e.sig.entry(sig_idx).or_default().push((start, matrix));
+    }
+
+    /// Collect one signature's pieces and close that signature. Sorted by offset.
+    pub fn take_sig(b: Bidegree, sig_idx: usize) -> Vec<(usize, Matrix)> {
+        let mut g = CACHE.lock().unwrap();
+        let e = g.entry((b.s(), b.t())).or_default();
+        e.sig_done.insert(sig_idx);
+        let mut out = e.sig.remove(&sig_idx).unwrap_or_default();
+        for (_, m) in &out {
+            BYTES.fetch_sub(size_of(m), Ordering::Relaxed);
+        }
+        out.sort_by_key(|(start, _)| *start);
+        out
+    }
+
+    /// Whether the bidegree has already assembled, so a builder should stop mid-degree.
+    pub fn is_done(b: Bidegree) -> bool {
+        CACHE
+            .lock()
+            .unwrap()
+            .get(&(b.s(), b.t()))
+            .is_some_and(|e| e.done)
+    }
+
+    /// Whether any signature speculation exists for `b` — lets the consumer skip the assembly path
+    /// entirely (and its mask bookkeeping) when nothing was precomputed.
+    pub fn has_sig(b: Bidegree) -> bool {
+        CACHE
+            .lock()
+            .unwrap()
+            .get(&(b.s(), b.t()))
+            .is_some_and(|e| !e.sig.is_empty())
     }
 
     /// Collect every ready block for `b` and close the bidegree to further speculation.
@@ -1044,7 +1122,7 @@ mod blocks {
         e.done = true;
         let mut out = Vec::new();
         for (_, slot) in std::mem::take(&mut e.slots) {
-            if let Slot::Ready(start, m) = slot {
+            for (start, m) in slot.pieces {
                 BYTES.fetch_sub(size_of(&m), Ordering::Relaxed);
                 out.push((start, m));
             }
@@ -1055,8 +1133,34 @@ mod blocks {
 
     /// Drop every block for a bidegree that will never assemble one, and close it to further
     /// speculation. Counted separately so the waste is visible rather than inferred.
+    /// Drop the contiguous block pieces for a bidegree that is building per signature.
+    ///
+    /// Deliberately does NOT set `done`: above the cap the bidegree still takes delivery along the
+    /// signature axis, and `done` would silence exactly that.
     pub fn release(b: Bidegree) {
-        RELEASED.fetch_add(take_all(b).len(), Ordering::Relaxed);
+        let mut g = CACHE.lock().unwrap();
+        let Some(e) = g.get_mut(&(b.s(), b.t())) else {
+            return;
+        };
+        for (_, slot) in std::mem::take(&mut e.slots) {
+            RELEASED.fetch_add(slot.pieces.len(), Ordering::Relaxed);
+            for (_, m) in &slot.pieces {
+                BYTES.fetch_sub(size_of(m), Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// Drop every signature piece for a bidegree that has finished its signature loop.
+    pub fn release_sig(b: Bidegree) {
+        let mut g = CACHE.lock().unwrap();
+        if let Some(e) = g.get_mut(&(b.s(), b.t())) {
+            for (_, pieces) in std::mem::take(&mut e.sig) {
+                RELEASED.fetch_add(pieces.len(), Ordering::Relaxed);
+                for (_, m) in &pieces {
+                    BYTES.fetch_sub(size_of(m), Ordering::Relaxed);
+                }
+            }
+        }
     }
 
     /// Book-keeping from one assembly: blocks reused, blocks absent, and the row counts behind them
@@ -1461,12 +1565,64 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
         // Per-bidegree, NOT hoisted over the whole range: a module whose basis is computed through
         // `max.t()` up front can no longer have generators added back into it.
         target.compute_basis(b.t());
+        // `iter_gen_offsets` yields one entry per GENERATOR, not per generator degree — `iter_gens`
+        // flat-maps over `0..num_gens[t]`, so a degree with several generators appears several
+        // times and `start`/`end` bound one generator each. Keying blocks by degree while reading
+        // these entries one-for-one meant only the FIRST generator of each degree was ever built;
+        // every other generator silently fell through to the consumer's rebuild, which is why row
+        // coverage sat at 60-84% instead of near 100%.
+        //
+        // So the entries are kept per generator and a degree simply yields several pieces, each
+        // published as it lands. Merging them into one range per degree also covers every generator
+        // but makes the unit coarse and all-or-nothing, and coverage fell (86.3% -> 68.1% at stem
+        // 30) because fewer finished before their bidegree ran.
         target
             .iter_gen_offsets([b.t()])
             .take_while(|g| g.gen_deg < b.t())
             .filter(|g| g.end[0] > g.start[0])
             .map(|g| (g.gen_deg, g.start[0], g.end[0]))
             .collect()
+    }
+
+    /// The rows of `b`'s signature-`signature` matrix contributed by generators of degree
+    /// `gen_deg`, and the offset of that run within the signature matrix.
+    ///
+    /// This is `signature_mask` restricted to one generator degree, which is the whole point: the
+    /// op indices it selects come only from `ppart_table(t - gen_deg)` and the packed signature —
+    /// never the module's degree-`t` basis — so a piece is determined exactly when the generators of
+    /// degree `gen_deg` are, the same early window plain blocks get. The run is contiguous within
+    /// the signature matrix because `signature_mask` walks generators in layout order, so the rows
+    /// from lower degrees all precede it; counting them gives the offset.
+    fn signature_piece(
+        &self,
+        b: Bidegree,
+        subalgebra: &MilnorSubalgebra,
+        signature: &[PPartEntry],
+        gen_deg: i32,
+    ) -> Option<(usize, Vec<usize>)> {
+        let target = &*self.modules[b.s() - 1];
+        target.compute_basis(b.t());
+        let algebra = target.algebra();
+        let (mask, value) = subalgebra.packed_signature(signature)?;
+        let mut start = 0usize;
+        let mut rows = Vec::new();
+        for gd in target
+            .iter_gen_offsets([b.t()])
+            .take_while(|g| g.gen_deg < b.t())
+        {
+            if gd.gen_deg > gen_deg {
+                break;
+            }
+            let table = algebra.ppart_table(b.t() - gd.gen_deg);
+            if gd.gen_deg < gen_deg {
+                start += table.iter().filter(|op| op.bits() & mask == value).count();
+            } else {
+                rows.extend(table.iter().enumerate().filter_map(|(n, op)| {
+                    (op.bits() & mask == value).then_some(gd.start[0] + n)
+                }));
+            }
+        }
+        Some((start, rows))
     }
 
     /// Column count for the block at `gen_deg`: the restricted dimension of `modules[b.s() - 2]`
@@ -1515,10 +1671,10 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
         // bound on the final ones. That makes this sound in one direction only: already over the cap
         // now means over it for good. The consumer releases whatever slips through.
         let ranges = self.block_ranges(b);
-        let Some(&(_, start, end)) = ranges.iter().find(|&&(g, _, _)| g == gen_deg) else {
-            // The generators of `gen_deg` were not there after all, or the block is empty.
+        if !ranges.iter().any(|&(g, _, _)| g == gen_deg) {
+            // The generators of `gen_deg` were not there after all, or contribute no rows.
             return;
-        };
+        }
         // The cap check reuses what `block_ranges` already computed rather than calling
         // `restricted_dims`, which would repeat the same `compute_basis` work per block: doing that
         // slowed the builders enough to cut row coverage from 93% to 55% at stem 30. The blocks tile
@@ -1526,12 +1682,7 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
         // count is the widest block's.
         let target_dim = ranges.last().map_or(0, |&(_, _, e)| e);
         let next_dim = self.block_cols(b, b.t() - 1);
-        if !reuse_within_cap(target_dim, next_dim) {
-            return;
-        }
         let cols = self.block_cols(b, gen_deg);
-        tracing::Span::current().record("rows", end - start);
-        tracing::Span::current().record("cols", cols);
         if cols == 0 {
             return;
         }
@@ -1540,16 +1691,57 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
             return;
         }
         let guard = blocks::ClaimGuard::new(b, gen_deg);
-        let rows: Vec<usize> = (start..end).collect();
         let diff = &self.differentials[b.s() - 1];
-        let m = speculate::pool().install(|| {
+        let build = |rows: &[usize]| {
             if speculate::on_cpu() {
-                restricted_partial_matrix(diff, b.t(), &rows, cols)
+                restricted_partial_matrix(diff, b.t(), rows, cols)
             } else {
-                restricted_partial_matrix_maybe_gpu(diff, b.t(), &rows, cols)
+                restricted_partial_matrix_maybe_gpu(diff, b.t(), rows, cols)
+            }
+        };
+
+        if reuse_within_cap(target_dim, next_dim) {
+            // Within the cap the consumer assembles ONE full matrix, so deliver contiguous row
+            // ranges: one piece per generator of this degree, published as each lands.
+            speculate::pool().install(|| {
+                for &(_, start, end) in ranges.iter().filter(|&&(g, _, _)| g == gen_deg) {
+                    if blocks::is_done(b) {
+                        break;
+                    }
+                    let rows: Vec<usize> = (start..end).collect();
+                    blocks::publish(b, gen_deg, start, build(&rows));
+                }
+            });
+            guard.done();
+            return;
+        }
+
+        // Above the cap the consumer never assembles a full matrix -- it builds one signature at a
+        // time and discards it, which is exactly the memory bound the cap exists to hold. So deliver
+        // along the SIGNATURE axis instead: one piece per (signature, generator degree), each a
+        // contiguous run of the signature's matrix. Peak stays at one signature however large the
+        // bidegree is, so this reaches the work plain blocks cannot (86.9% of it at stem 200), and
+        // it costs no extra multiplies -- signatures partition the operations, so this is a strict
+        // refinement of the same rows.
+        let subalgebra = MilnorSubalgebra::optimal_for(b);
+        speculate::pool().install(|| {
+            for (sig_idx, signature) in subalgebra.iter_signatures(b.t()).enumerate() {
+                if blocks::is_done(b) || !blocks::has_room() {
+                    break;
+                }
+                if !blocks::claim_sig(b, gen_deg, sig_idx) {
+                    continue;
+                }
+                let Some((start, rows)) = self.signature_piece(b, &subalgebra, &signature, gen_deg)
+                else {
+                    continue;
+                };
+                if rows.is_empty() {
+                    continue;
+                }
+                blocks::publish_sig(b, sig_idx, start, build(&rows));
             }
         });
-        blocks::publish(b, gen_deg, start, m);
         guard.done();
     }
 
@@ -1607,6 +1799,80 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
         full
     }
 
+
+    /// Assemble one signature's matrix from precomputed pieces, building the rest in a single
+    /// coalesced call.
+    ///
+    /// `target_mask` lists the signature's rows in layout order, so a piece covering generator
+    /// degree `g` occupies a contiguous run of it — the same walk-and-fill as
+    /// [`Self::assemble_full_restricted`], one axis over. Pieces are narrow (minimality) and the
+    /// destination is allocated at `next_dim` up front, so every write is a row copy into an
+    /// existing row: matrices are row-major, and widening one afterwards would restride every row.
+    fn assemble_signature(
+        &self,
+        b: Bidegree,
+        sig_idx: usize,
+        target_mask: &[usize],
+        next_dim: usize,
+    ) -> Matrix {
+        let ready = blocks::take_sig(b, sig_idx);
+        let mut full = Matrix::new(self.prime(), target_mask.len(), next_dim);
+        let mut missing: Vec<usize> = Vec::new();
+        let (mut hits, mut misses, mut rows_hit) = (0usize, 0usize, 0usize);
+        let mut cursor = 0usize;
+        for (start, m) in &ready {
+            let (start, end) = (*start, start + m.rows());
+            if start < cursor || end > target_mask.len() || m.columns() > next_dim {
+                tracing::warn!(
+                    %b, sig_idx,
+                    "discarding speculative signature piece: rows {start}..{end} x {} against {} x \
+                     {next_dim} (cursor {cursor})",
+                    m.columns(),
+                    target_mask.len(),
+                );
+                misses += 1;
+                continue;
+            }
+            missing.extend(cursor..start);
+            for (i, pos) in (start..end).enumerate() {
+                full.row_mut(pos).slice_mut(0, m.columns()).assign(m.row(i));
+            }
+            hits += 1;
+            rows_hit += m.rows();
+            cursor = end;
+        }
+        missing.extend(cursor..target_mask.len());
+        blocks::record(hits, misses, rows_hit, missing.len());
+        let verify = speculate::verify() && !ready.is_empty();
+        if !missing.is_empty() {
+            let rows: Vec<usize> = missing.iter().map(|&pos| target_mask[pos]).collect();
+            let part = restricted_partial_matrix_maybe_gpu(
+                &self.differentials[b.s() - 1],
+                b.t(),
+                &rows,
+                next_dim,
+            );
+            for (i, &pos) in missing.iter().enumerate() {
+                full.row_mut(pos).assign(part.row(i));
+            }
+        }
+        if verify {
+            let fresh = restricted_partial_matrix(
+                &self.differentials[b.s() - 1],
+                b.t(),
+                target_mask,
+                next_dim,
+            );
+            for r in 0..target_mask.len() {
+                assert_eq!(
+                    full.row(r).iter_nonzero().collect::<Vec<_>>(),
+                    fresh.row(r).iter_nonzero().collect::<Vec<_>>(),
+                    "assembled signature matrix mismatch at {b}, signature {sig_idx}, row {r}"
+                );
+            }
+        }
+        full
+    }
 
     /// Build `b`'s full matrix ahead of time and park it in the [`speculate`] cache.
     ///
@@ -1979,7 +2245,7 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
         let mut probe_reads = 0usize;
         let mut probe_perturbed = 0usize;
 
-        for signature in subalgebra.iter_signatures(b.t()) {
+        for (sig_idx, signature) in subalgebra.iter_signatures(b.t()).enumerate() {
             let _guard = tracing::info_span!("step", ?signature).entered();
             // Spans below split what used to be one opaque `step`: the run's own accounting put
             // ~26% of worker time inside `step` but outside any named region, which is exactly the
@@ -2009,6 +2275,11 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                     Some(full) => {
                         debug_assert!(target_mask.iter().all(|&r| r < full.rows()));
                         select_rows(full, &target_mask)
+                    }
+                    // Above `reuse_within_cap` there is no full matrix to slice, so this is where
+                    // signature-axis speculation is collected.
+                    None if blocks::enabled() => {
+                        self.assemble_signature(b, sig_idx, &target_mask, next_dim)
                     }
                     None => restricted_partial_matrix_maybe_gpu(
                         &self.differentials[b.s() - 1],
@@ -2105,6 +2376,12 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
 
         if let Some(w) = f {
             w.finish()?;
+        }
+
+        // Anything the signature loop did not collect (an unrepresentable signature, a piece that
+        // landed late) would otherwise stay pinned for the rest of the run.
+        if blocks::enabled() {
+            blocks::release_sig(b);
         }
 
         self.write_differential(b, num_new_gens, target_dim)?;
