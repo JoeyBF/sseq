@@ -3200,12 +3200,78 @@ impl std::fmt::Debug for BatchOutput {
     }
 }
 
+/// Census (`NASSAU_CENSUS`): how much of the batch is duplicated WORK rather than distinct work.
+///
+/// [`GpuProduct`] separates what is computed — `(r_degree, r_idx, s_degree, term_indices)` — from
+/// where it lands — `(row, out_offset)`. Two rows carrying the same operation over different
+/// same-degree generators whose differentials share a coefficient produce byte-identical work with
+/// different destinations, and today each is enumerated and multiplied independently. This counts
+/// the redundancy so the payoff of deduplicating within a launch can be sized before building it.
+///
+/// Weighted by `term_indices.len()`, not by product count. That is exact for the ratio because
+/// duplicates share `(r_degree, r_idx)` and therefore share the per-`R` matrix count; joining
+/// against `dump_r_stats` offline recovers the fully matrix-weighted figure.
+pub static CENSUS_PAIRS_TOTAL: AtomicU64 = AtomicU64::new(0);
+pub static CENSUS_PAIRS_DISTINCT: AtomicU64 = AtomicU64::new(0);
+pub static CENSUS_PRODUCTS_TOTAL: AtomicU64 = AtomicU64::new(0);
+pub static CENSUS_PRODUCTS_DISTINCT: AtomicU64 = AtomicU64::new(0);
+
+static CENSUS_ON: LazyLock<bool> = LazyLock::new(|| std::env::var_os("NASSAU_CENSUS").is_some());
+
+fn census_batch(products: &[GpuProduct]) {
+    if !*CENSUS_ON {
+        return;
+    }
+    // Per-launch map folded into globals at the end: a shared global map would serialise the
+    // marshal path, which is exactly where a past priority inversion came from.
+    let mut seen: std::collections::HashSet<(i32, usize, i32, &[usize])> =
+        std::collections::HashSet::with_capacity(products.len());
+    let (mut tot_pairs, mut dis_pairs, mut dis_prod) = (0u64, 0u64, 0u64);
+    for p in products {
+        let nt = p.term_indices.len() as u64;
+        tot_pairs += nt;
+        if seen.insert((p.r_degree, p.r_idx, p.s_degree, &p.term_indices)) {
+            dis_pairs += nt;
+            dis_prod += 1;
+        }
+    }
+    CENSUS_PAIRS_TOTAL.fetch_add(tot_pairs, Ordering::Relaxed);
+    CENSUS_PAIRS_DISTINCT.fetch_add(dis_pairs, Ordering::Relaxed);
+    CENSUS_PRODUCTS_TOTAL.fetch_add(products.len() as u64, Ordering::Relaxed);
+    CENSUS_PRODUCTS_DISTINCT.fetch_add(dis_prod, Ordering::Relaxed);
+}
+
+/// Print the batch-redundancy census. Called alongside the other end-of-run dumps.
+pub fn dump_census() {
+    if !*CENSUS_ON {
+        return;
+    }
+    let (tp, dp) = (
+        CENSUS_PAIRS_TOTAL.load(Ordering::Relaxed),
+        CENSUS_PAIRS_DISTINCT.load(Ordering::Relaxed),
+    );
+    let (tprod, dprod) = (
+        CENSUS_PRODUCTS_TOTAL.load(Ordering::Relaxed),
+        CENSUS_PRODUCTS_DISTINCT.load(Ordering::Relaxed),
+    );
+    if tp == 0 {
+        return;
+    }
+    eprintln!(
+        "[census-gpu] products: total={tprod} distinct={dprod} (dedup factor {:.3}x) | \
+         term-pairs: total={tp} distinct={dp} (dedup factor {:.3}x)",
+        tprod as f64 / dprod.max(1) as f64,
+        tp as f64 / dp.max(1) as f64,
+    );
+}
+
 pub fn multiply_batch_on_gpu(
     algebra: &Arc<MilnorAlgebra>,
     num_cols: usize,
     num_rows: usize,
     products: &[GpuProduct],
 ) -> BatchOutput {
+    census_batch(products);
     // Start the prefetcher on first use (no-op unless enabled) and tell it how far the wavefront has
     // got. `r_degree` is the `R` degree this launch needs, so its max IS the enumeration frontier.
     start_prefetch(algebra);

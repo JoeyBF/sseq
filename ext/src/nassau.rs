@@ -474,6 +474,10 @@ fn reuse_within_cap(_rows: usize, _cols: usize) -> bool {
 /// signature's partial matrix (see [`reuse_full_matrix`]). `rows` must index within `full` — the
 /// signature masks are subsets of `0..full.rows()` (the restricted source basis), so this holds.
 fn select_rows(full: &Matrix, rows: &[usize]) -> Matrix {
+    crate::census::add_bytes(
+        &crate::census::SELECT_ROWS_BYTES,
+        rows.len() as u64 * (full.columns() as u64).div_ceil(64) * 8,
+    );
     let mut out = Matrix::new(full.prime(), rows.len(), full.columns());
     for (dst, &src) in rows.iter().enumerate() {
         out.row_mut(dst).assign(full.row(src));
@@ -2275,6 +2279,11 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
         let p = self.prime();
         let mut scratch = FpVector::new(p, 0);
 
+        // Census records counts, never durations, so a census run may be arbitrarily slower than
+        // production without invalidating a number. See [`crate::census`].
+        let mut census = crate::census::enabled()
+            .then(|| crate::census::BidegreeCensus::new(b.s(), b.t()));
+
         let target = &*self.modules[b.s() - 1];
         let algebra = target.algebra();
 
@@ -2298,6 +2307,18 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
         let next = &self.modules[b.s() - 2];
         next.compute_basis(b.t());
         let next_dim = MilnorSubalgebra::restricted_dimension(next, b.t(), next_bound);
+
+        if let Some(c) = census.as_mut() {
+            // `target_masked_dim` is the zero-signature row count: the rows that signature-shift
+            // reuse would still have to multiply. `target_dim` is what we multiply today.
+            let dim_b: usize = subalgebra
+                .profile
+                .iter()
+                .map(|&e| 1usize << e)
+                .product::<usize>()
+                .max(1);
+            c.dims(target_dim, target_masked_dim, next_dim, dim_b);
+        }
 
         // Skip writing the quasi-inverse when `EXT_NASSAU_NO_SAVE_QI` is set; `apply_quasi_inverse`
         // recomputes it on demand from the differential.
@@ -2531,6 +2552,10 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
             assert_eq!(num_new_gens, 0, "Adding generators at {b}");
         }
 
+        if let Some(c) = census.as_mut() {
+            c.set_new_gens(num_new_gens);
+        }
+
         self.add_generators(b, num_new_gens);
 
         let mut xs = vec![FpVector::new(p, target_dim); num_new_gens];
@@ -2544,8 +2569,13 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                 .zip_eq(&mut dxs)
             {
                 x.as_slice_mut().add_unmasked(x_masked, 1, &target_mask);
+                let mut consumed = 0usize;
                 for (i, _) in x_masked.iter_nonzero() {
                     dx.as_slice_mut().add(full_matrix.row(i), 1);
+                    consumed += 1;
+                }
+                if let Some(c) = census.as_mut() {
+                    c.add_rows_consumed(consumed);
                 }
             }
         }
@@ -2593,6 +2623,14 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
 
         for (sig_idx, signature) in subalgebra.iter_signatures(b.t()).enumerate() {
             let _guard = tracing::info_span!("step", ?signature).entered();
+            // Corrections only ever raise signature, so once every `dx` is zero the whole remaining
+            // tail is a provable no-op (its only side effect is `write_qi`, which is off under
+            // `EXT_NASSAU_NO_SAVE_QI`). Record where that happens rather than acting on it — the
+            // census must not change what the run computes.
+            if let Some(c) = census.as_mut() {
+                c.set_signatures(sig_idx + 1);
+                c.sig_live(sig_idx, dxs.iter().any(|dx| !dx.is_zero()));
+            }
             // Spans below split what used to be one opaque `step`: the run's own accounting put
             // ~26% of worker time inside `step` but outside any named region, which is exactly the
             // shape that produced several wrong diagnoses earlier. One span per signature is cheap
@@ -2689,9 +2727,14 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                     }
                     row += 1;
                 }
+                let mut consumed = 0usize;
                 for (i, _) in scratch.iter_nonzero() {
                     x.add_basis_element(target_mask[i], 1);
                     dx.as_slice_mut().add(full_matrix.row(i), 1);
+                    consumed += 1;
+                }
+                if let Some(c) = census.as_mut() {
+                    c.add_rows_consumed(consumed);
                 }
             }
             drop(_lift);
@@ -2719,6 +2762,10 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
         self.differential(b.s()).add_generators_from_rows(b.t(), xs);
 
         end();
+
+        if let Some(c) = census {
+            c.finish();
+        }
 
         if let Some(w) = f {
             w.finish()?;
@@ -3362,12 +3409,14 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
             }
         }
         blocks::dump_opdeg();
+        crate::census::report();
         speculate::clear();
         blocks::clear();
 
         // Eviction probe (`NASSAU_R_STATS`): dump the R-access distribution once the wavefront is done.
         #[cfg(feature = "gpu")]
         {
+            algebra::milnor_gpu::dump_census();
             algebra::milnor_gpu::dump_r_stats();
             // Which theta would have fit: see `resident_degree_cap`.
             algebra::milnor_gpu::dump_master_by_degree();
