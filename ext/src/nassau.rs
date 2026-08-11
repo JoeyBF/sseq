@@ -1011,6 +1011,32 @@ mod blocks {
     static BAIL_DONE: AtomicUsize = AtomicUsize::new(0);
     static BAIL_CLAIMED: AtomicUsize = AtomicUsize::new(0);
     static BAIL_OTHER: AtomicUsize = AtomicUsize::new(0);
+    /// Queue depth at each successful pop, and the time builders spend parked because the queue is
+    /// EMPTY. Only 36% of popped items got built before their bidegree ran, while builders were not
+    /// saturated (1310% CPU of 128 cores) -- so they were neither too slow nor too busy. Either the
+    /// queue is mostly empty (the producer's eligibility gate admits far less than the nominal
+    /// 24-degree window) or builders are blocked on something that does not show as CPU. Depth near
+    /// zero with large idle time means the former.
+    static QDEPTH_SUM: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    static QDEPTH_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    static QDEPTH_MAX: AtomicUsize = AtomicUsize::new(0);
+    static IDLE_NANOS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    static BUILD_NANOS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    pub fn record_build_nanos(n: u64) {
+        BUILD_NANOS.fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// `(mean depth, max depth, builder idle seconds, builder build seconds)`.
+    pub fn queue_stats() -> (f64, usize, f64, f64) {
+        let n = QDEPTH_N.load(Ordering::Relaxed).max(1);
+        (
+            QDEPTH_SUM.load(Ordering::Relaxed) as f64 / n as f64,
+            QDEPTH_MAX.load(Ordering::Relaxed),
+            IDLE_NANOS.load(Ordering::Relaxed) as f64 / 1e9,
+            BUILD_NANOS.load(Ordering::Relaxed) as f64 / 1e9,
+        )
+    }
 
     pub fn bail(kind: u8) {
         match kind {
@@ -1272,14 +1298,23 @@ mod blocks {
     pub fn pop() -> Option<(Bidegree, i32)> {
         let (m, cv) = &*QUEUE;
         let mut q = m.lock().unwrap();
+        let mut idle = std::time::Duration::ZERO;
         loop {
+            let depth = q.heap.len();
             if let Some(Reverse((t, s, gen_deg))) = q.heap.pop() {
+                QDEPTH_SUM.fetch_add(depth as u64, Ordering::Relaxed);
+                QDEPTH_N.fetch_add(1, Ordering::Relaxed);
+                QDEPTH_MAX.fetch_max(depth, Ordering::Relaxed);
+                IDLE_NANOS.fetch_add(idle.as_nanos() as u64, Ordering::Relaxed);
                 return Some((Bidegree::s_t(s, t), gen_deg));
             }
             if q.closed {
+                IDLE_NANOS.fetch_add(idle.as_nanos() as u64, Ordering::Relaxed);
                 return None;
             }
+            let t0 = std::time::Instant::now();
             q = cv.wait(q).unwrap();
+            idle += t0.elapsed();
         }
     }
 
@@ -1838,7 +1873,9 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                 (first.1, first.2)
             };
             let rows: Vec<usize> = (start..end).collect();
+            let t0 = std::time::Instant::now();
             let m = speculate::pool().install(|| build(&rows));
+            blocks::record_build_nanos(t0.elapsed().as_nanos() as u64);
             blocks::publish(b, gen_deg, start, m);
             guard.done();
             return;
@@ -3082,6 +3119,13 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
             );
         }
         {
+            let (qd, qmax, idle_s, build_s) = blocks::queue_stats();
+            if blocks::enabled() {
+                eprintln!(
+                    "[specqueue] depth mean={qd:.1} max={qmax} builder_idle={idle_s:.0}s \
+                     builder_build={build_s:.0}s threads={spec_threads}"
+                );
+            }
             let n = INFLIGHT_N.load(std::sync::atomic::Ordering::Relaxed);
             if n > 0 {
                 eprintln!(
