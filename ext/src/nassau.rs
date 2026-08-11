@@ -1022,6 +1022,11 @@ mod blocks {
     static QDEPTH_MAX: AtomicUsize = AtomicUsize::new(0);
     static IDLE_NANOS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     static BUILD_NANOS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    static SKIPPED_SMALL: AtomicUsize = AtomicUsize::new(0);
+
+    pub fn skipped_small() -> usize {
+        SKIPPED_SMALL.load(Ordering::Relaxed)
+    }
 
     pub fn record_build_nanos(n: u64) {
         BUILD_NANOS.fetch_add(n, Ordering::Relaxed);
@@ -1257,13 +1262,23 @@ mod blocks {
     }
 
     struct Queue {
-        heap: BinaryHeap<Reverse<(i32, i32, i32)>>,
+        /// `(Reverse(t), rows, s, gen_deg)` in a MAX-heap: smallest `t` first, then most rows.
+        heap: BinaryHeap<(Reverse<i32>, usize, i32, i32)>,
         closed: bool,
     }
 
-    /// Pending blocks, ordered by `(t, s, gen_deg)` ascending — nearest bidegree first, and within a
-    /// bidegree the earliest generator degree first (those blocks have been available longest, so a
-    /// builder taking them is least likely to be racing the wavefront).
+    /// Pending blocks, ordered by internal degree ascending, then ROW COUNT descending.
+    ///
+    /// Blocks have DEADLINES: one is worthless the moment its bidegree runs, and equally useful any
+    /// time before. Since the queue never fully drains (36% of items built at stem 200), near blocks
+    /// expire while far ones stay valid, so imminence-first is earliest-deadline-first — the optimal
+    /// policy for meeting deadlines. Ordering by size INSTEAD threw that away and let builders spend
+    /// time on far-future blocks while imminent ones expired: row coverage fell from ~84% to 46.8%
+    /// at stem 30.
+    ///
+    /// Size belongs one level down. Within a deadline the choice is free, and there the stem-200
+    /// numbers apply: 36% of items built produced 33% of rows, i.e. selection was size-neutral, so
+    /// taking the biggest first converts the same builder time into more coverage.
     static QUEUE: LazyLock<(Mutex<Queue>, Condvar)> = LazyLock::new(|| {
         (
             Mutex::new(Queue {
@@ -1281,7 +1296,28 @@ mod blocks {
         q.closed = false;
     }
 
-    pub fn push(b: Bidegree, gen_deg: i32) {
+    /// Smallest block worth queueing, in rows (`NASSAU_BLOCK_MIN_ROWS`).
+    ///
+    /// A block that is NOT precomputed costs the consumer nothing extra: its rows simply join the
+    /// single coalesced build it was already making. So a small block has almost no value
+    /// precomputed while still costing a queue slot, a claim, a lock, an allocation and a publish.
+    /// At stem 200 the queue carried 718 171 items; the tail is most of the bookkeeping and almost
+    /// none of the benefit.
+    pub fn min_rows() -> usize {
+        static M: LazyLock<usize> = LazyLock::new(|| {
+            std::env::var("NASSAU_BLOCK_MIN_ROWS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(1024)
+        });
+        *M
+    }
+
+    pub fn push(b: Bidegree, gen_deg: i32, rows: usize) {
+        if rows < min_rows() {
+            SKIPPED_SMALL.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
         let (m, cv) = &*QUEUE;
         let mut q = m.lock().unwrap();
         // The block window is two-dimensional, so a lagging row can enqueue a quadratic number of
@@ -1291,7 +1327,7 @@ mod blocks {
             FLOODED.fetch_add(1, Ordering::Relaxed);
             return;
         }
-        q.heap.push(Reverse((b.t(), b.s(), gen_deg)));
+        q.heap.push((Reverse(b.t()), rows, b.s(), gen_deg));
         cv.notify_one();
     }
 
@@ -1301,7 +1337,7 @@ mod blocks {
         let mut idle = std::time::Duration::ZERO;
         loop {
             let depth = q.heap.len();
-            if let Some(Reverse((t, s, gen_deg))) = q.heap.pop() {
+            if let Some((Reverse(t), _, s, gen_deg)) = q.heap.pop() {
                 QDEPTH_SUM.fetch_add(depth as u64, Ordering::Relaxed);
                 QDEPTH_N.fetch_add(1, Ordering::Relaxed);
                 QDEPTH_MAX.fetch_max(depth, Ordering::Relaxed);
@@ -2930,6 +2966,7 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                         return;
                     }
                     if blocks::enabled() {
+                        let algebra = self.algebra();
                         for r in 2..=max_s {
                             let ri = r as usize;
                             // Generator degrees whose rows AND columns are both frozen.
@@ -2942,8 +2979,14 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                                 }
                                 // `gen_deg < t`: a generator of degree `t` contributes no rows to
                                 // the restricted matrix at `t`.
+                                // Row count is `num_gens[g] x dim(A_{t-g})`: both O(1) lookups, so
+                                // sizing every candidate costs nothing and lets the queue order by
+                                // it.
+                                let source = &self.modules[r - 1];
                                 for g in lo_g..=std::cmp::min(hi_g, t - 1) {
-                                    blocks::push(Bidegree::s_t(r, t), g);
+                                    let rows = source.number_of_gens_in_degree(g)
+                                        * algebra.ppart_table(t - g).len();
+                                    blocks::push(Bidegree::s_t(r, t), g, rows);
                                 }
                             };
                             // Strip A: internal degrees newly in the window, at every `gen_deg`.
