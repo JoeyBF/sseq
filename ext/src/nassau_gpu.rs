@@ -11,7 +11,8 @@
 //! `operation_degree == 0`) are plain copies with no admissible-matrix work, so they
 //! are left to the CPU `apply_to_basis_element` per row. The output F₂ bits the kernel
 //! returns are XORed into the matrix rows (bit `i` → `add_basis_element(i, 1)`), the
-//! same layout the CPU path produces.
+//! same layout the CPU path produces — as a limb-wise XOR, since the kernel's little-endian `u32`
+//! limbs are byte-identical to `fp`'s `u64` limbs.
 //!
 //! Gated behind the `gpu` feature. Callers must ensure
 //! [`MilnorAlgebra::gpu_multiply_applicable`] (`p = 2`, trivial profile, stable) — the
@@ -25,9 +26,47 @@ use algebra::{
         homomorphism::{FreeModuleHomomorphism, ModuleHomomorphism},
     },
 };
-use fp::matrix::Matrix;
+use fp::{matrix::Matrix, vector::FpVector};
 
 type NassauDifferential = FreeModuleHomomorphism<FreeModule<MilnorAlgebra>>;
+
+/// Reinterpret a GPU output row's `u32` limbs as their little-endian bytes.
+///
+/// The kernel's `u32` limbs and `fp`'s `u64` limbs are the same bit-vector in the same byte order,
+/// so this is a view, not a conversion. `fp`'s own `limb::from_bytes`/`to_bytes` take exactly this
+/// shortcut under the same `cfg`; the fallback keeps a big-endian target correct rather than
+/// silently wrong.
+///
+/// One bulk `memcpy` per row. The first cut wrote `w.to_le_bytes()` into `buf` one `u32` at a time,
+/// which a call-graph profile of an uncapped stem-150 run showed as 12.15% of ALL user cycles under
+/// `copy_from_slice` — a bounds-checked 4-byte copy per limb, thousands per row, for a region that
+/// is already byte-identical.
+fn fill_limb_bytes(buf: &mut [u8], limbs: &[u32]) {
+    #[cfg(target_endian = "little")]
+    {
+        // SAFETY: `u32` has no padding or invalid bit patterns, `u8` has alignment 1 (so a `u32`
+        // pointer is suitably aligned), and the length is the same region measured in bytes. The
+        // view borrows `limbs` and does not outlive it.
+        let src: &[u8] = unsafe {
+            std::slice::from_raw_parts(limbs.as_ptr().cast::<u8>(), std::mem::size_of_val(limbs))
+        };
+        let n = src.len().min(buf.len());
+        buf[..n].copy_from_slice(&src[..n]);
+        buf[n..].fill(0);
+    }
+    #[cfg(not(target_endian = "little"))]
+    {
+        buf.fill(0);
+        for (k, &w) in limbs.iter().enumerate() {
+            let o = k * size_of::<u32>();
+            if o >= buf.len() {
+                break;
+            }
+            let n = size_of::<u32>().min(buf.len() - o);
+            buf[o..o + n].copy_from_slice(&w.to_le_bytes()[..n]);
+        }
+    }
+}
 
 /// Whether the GPU `get_partial_matrix` path applies to this differential — the
 /// seqno-table regime (`p = 2`, trivial profile, stable), i.e. Nassau `S_2`. The
@@ -47,22 +86,33 @@ pub fn applicable(hom: &NassauDifferential) -> bool {
 pub fn get_partial_matrix(hom: &NassauDifferential, degree: i32, inputs: &[usize]) -> Matrix {
     let (mut matrix, products) = extract(hom, degree, inputs);
     if !products.is_empty() {
+        let p = hom.prime();
         let target = hom.target();
         let algebra = target.algebra();
         // Idempotent + cheap (O(degree · width)); returns immediately once built.
         algebra.compute_seqno_tables(degree);
         let num_cols = target.dimension(degree);
-        let rows = multiply_batch_on_gpu(&algebra, num_cols, inputs.len(), &products);
-        for (row, limbs) in rows.iter().enumerate() {
-            let mut target_row = matrix.row_mut(row);
-            for (limb_idx, &limb) in limbs.iter().enumerate() {
-                let mut bits = limb;
-                while bits != 0 {
-                    let b = bits.trailing_zeros() as usize;
-                    target_row.add_basis_element(limb_idx * 32 + b, 1);
-                    bits &= bits - 1;
-                }
-            }
+        let out = multiply_batch_on_gpu(&algebra, num_cols, inputs.len(), &products);
+        // Limb-wise readback; see the equivalent (truncating) loop in
+        // [`get_partial_matrix_restricted`] for why the byte copy is valid. Here the widths already
+        // agree, so only the partial final limb needs masking.
+        let num_limbs = FpVector::num_limbs(p, num_cols);
+        let nbytes = num_limbs * size_of::<u64>();
+        let mut scratch = FpVector::new(p, num_cols);
+        let mut buf: Vec<u8> = vec![0; nbytes];
+        let tail_mask: u64 = match num_cols % 64 {
+            0 => u64::MAX,
+            r => (1u64 << r) - 1,
+        };
+        for (row, limbs) in out.iter_rows().enumerate() {
+            fill_limb_bytes(&mut buf, limbs);
+            let last = nbytes - size_of::<u64>();
+            let masked = u64::from_le_bytes(buf[last..].try_into().unwrap()) & tail_mask;
+            buf[last..].copy_from_slice(&masked.to_le_bytes());
+            scratch
+                .update_from_bytes(&mut &buf[..])
+                .expect("readback scratch is exactly num_limbs * 8 bytes");
+            matrix.row_mut(row).add(scratch.as_slice(), 1);
         }
     }
     matrix
@@ -157,14 +207,38 @@ pub fn get_partial_matrix_verified(
 /// at/after `target_dim` are dropped (blocks are generator-major and contiguous, and `target_dim`
 /// falls on a generator boundary, so the whole block is outside), and the kernel is launched with
 /// `num_cols = target_dim`. Any returned bit `>= target_dim` is masked out defensively.
+/// Rows per GPU multiply batch, chosen so the dense readback (`rows × ceil(cols/32) × 4` bytes)
+/// stays under `NASSAU_GPU_MAX_READBACK_MB` (default 1024). Bounds the transient host memory of one
+/// build regardless of how many rows the bidegree has; ≥ 1. `0` MB disables batching (one call).
+fn gpu_rows_per_batch(cols: usize, num_rows: usize) -> usize {
+    static CAP_BYTES: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+        std::env::var("NASSAU_GPU_MAX_READBACK_MB")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(1024)
+            * (1 << 20)
+    });
+    if *CAP_BYTES == 0 {
+        return num_rows.max(1);
+    }
+    let bytes_per_row = cols.div_ceil(32) * 4; // one row's readback in bytes
+    (*CAP_BYTES / bytes_per_row.max(1)).clamp(1, num_rows.max(1))
+}
+
 pub fn get_partial_matrix_restricted(
     hom: &NassauDifferential,
     degree: i32,
     inputs: &[usize],
     target_dim: usize,
 ) -> Matrix {
-    let (mut matrix, products) = extract_restricted(hom, degree, inputs, target_dim);
+    // Spanned because the 279 s stalls land somewhere in this function *before* the multiply
+    // (which itself measured 40 ms), and neither this build nor the pair pre-pass inside
+    // `multiply_batch_on_gpu` was previously visible to the log.
+    let (mut matrix, mut products) =
+        tracing::info_span!("extract_restricted", inputs = inputs.len(), target_dim)
+            .in_scope(|| extract_restricted(hom, degree, inputs, target_dim));
     if !products.is_empty() {
+        let p = hom.prime();
         let target = hom.target();
         let algebra = target.algebra();
         // Idempotent + cheap (O(degree · width)); returns immediately once built.
@@ -175,22 +249,66 @@ pub fn get_partial_matrix_restricted(
         // Passing `target_dim` there would truncate `num_limbs` and corrupt the row layout. We
         // truncate afterwards by masking bits `>= target_dim` when XORing into the matrix.
         let full_cols = target.dimension(degree);
-        let rows = multiply_batch_on_gpu(&algebra, full_cols, inputs.len(), &products);
-        for (row, limbs) in rows.iter().enumerate() {
-            let mut target_row = matrix.row_mut(row);
-            for (limb_idx, &limb) in limbs.iter().enumerate() {
-                let mut bits = limb;
-                while bits != 0 {
-                    let b = bits.trailing_zeros() as usize;
-                    let col = limb_idx * 32 + b;
-                    // Minimality should keep every bit within the restricted prefix, but mask
-                    // defensively so a stray high bit can never write out of bounds.
-                    if col < target_dim {
-                        target_row.add_basis_element(col, 1);
-                    }
-                    bits &= bits - 1;
+        // Cap how large a single multiply we hand the GPU: the dense readback (num_rows × num_limbs
+        // u32) plus the matrix would otherwise both be held for the whole all-rows / zero-signature
+        // build (~12 GB dense regions at stem 180). Process the rows in batches of ≤ `rows_per_batch`
+        // so the readback stays bounded and is freed between batches. `products` is built in row
+        // order (`extract_restricted`), so each batch's products are a contiguous slice; we remap
+        // their `row` to batch-local (0-based) for the kernel and write back to the global rows.
+        let rows_per_batch = gpu_rows_per_batch(full_cols, inputs.len());
+        // Readback scratch, allocated once for the whole call (`target_dim` is fixed): the GPU's
+        // per-row output is XORed into the matrix through a limb-wise `add` rather than bit by bit.
+        //
+        // Both sides are little-endian packed F_2 bitvectors with bit `i` = column `i`, so four of
+        // the kernel's `u32` limbs ARE one of `fp`'s `u64` limbs, byte for byte — no transposition,
+        // just a truncating copy. `update_from_bytes` fills the existing limbs in place (no
+        // allocation, no resize), and `read_exact` demands exactly `num_limbs * 8` bytes, which is
+        // why `buf` is sized once and refilled rather than sliced per row.
+        //
+        // The bit-at-a-time loop this replaces called `add_basis_element` once per set bit: at the
+        // logged ~26% density that is ~0.26 * cols read-modify-writes per row against cols/64 limb
+        // XORs here, and each one was a bounds-checked entry write rather than a word XOR.
+        let num_limbs = FpVector::num_limbs(p, target_dim);
+        let nbytes = num_limbs * size_of::<u64>();
+        let mut scratch = FpVector::new(p, target_dim);
+        let mut buf: Vec<u8> = vec![0; nbytes];
+        // Bits at or past `target_dim` inside the final limb must not survive into the vector —
+        // `FpVector` requires them zero, and dropping them is exactly what the old `col < target_dim`
+        // guard did. Whole limbs past the end are dropped by `buf` being only `nbytes` long.
+        let tail_mask: u64 = match target_dim % 64 {
+            0 => u64::MAX,
+            r => (1u64 << r) - 1,
+        };
+        let mut p0 = 0usize;
+        let mut r0 = 0usize;
+        while r0 < inputs.len() {
+            let r1 = (r0 + rows_per_batch).min(inputs.len());
+            let mut p1 = p0;
+            while p1 < products.len() && products[p1].row < r1 {
+                p1 += 1;
+            }
+            if p1 > p0 {
+                for pr in &mut products[p0..p1] {
+                    pr.row -= r0; // batch-local row index for the kernel's output layout
+                }
+                let out = multiply_batch_on_gpu(&algebra, full_cols, r1 - r0, &products[p0..p1]);
+                let _scatter = tracing::info_span!("gpu_readback", rows = r1 - r0).entered();
+                for (bi, limbs) in out.iter_rows().enumerate() {
+                    // Reinterpret this row's `u32` limbs as the vector's little-endian limb bytes,
+                    // truncated at `target_dim` (both directions: partial final limb, and whole
+                    // limbs past the restricted prefix).
+                    fill_limb_bytes(&mut buf, limbs);
+                    let last = nbytes - size_of::<u64>();
+                    let masked = u64::from_le_bytes(buf[last..].try_into().unwrap()) & tail_mask;
+                    buf[last..].copy_from_slice(&masked.to_le_bytes());
+                    scratch
+                        .update_from_bytes(&mut &buf[..])
+                        .expect("readback scratch is exactly num_limbs * 8 bytes");
+                    matrix.row_mut(r0 + bi).add(scratch.as_slice(), 1);
                 }
             }
+            p0 = p1;
+            r0 = r1;
         }
     }
     matrix
@@ -277,9 +395,10 @@ pub fn get_partial_matrix_restricted_verified(
         let g: Vec<usize> = gpu.row(row).iter_nonzero().map(|(i, _)| i).collect();
         let c: Vec<usize> = cpu.row(row).iter_nonzero().map(|(i, _)| i).collect();
         assert_eq!(
-            g, c,
-            "GPU/CPU restricted get_partial_matrix mismatch at degree {degree}, row {row} \
-             (input {}, target_dim {target_dim}, num_rows {})",
+            g,
+            c,
+            "GPU/CPU restricted get_partial_matrix mismatch at degree {degree}, row {row} (input \
+             {}, target_dim {target_dim}, num_rows {})",
             inputs[row],
             inputs.len(),
         );

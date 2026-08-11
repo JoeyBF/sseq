@@ -92,6 +92,29 @@ impl<const U: bool, M: Module> MuFreeModuleHomomorphism<U, M>
 where
     M::Algebra: MuAlgebra<U>,
 {
+    /// Diagnostic (see `NASSAU_MEM_REPORT`): total heap bytes held by the stored `outputs`
+    /// matrices — for every degree, every generator's image `FpVector`'s limb storage. This is
+    /// the differential's own retained footprint. `images`/`kernels`/`quasi_inverses` are also
+    /// summed (they are `None` in Nassau, so contribute ~0) to prove they are not the consumer.
+    pub fn output_heap_bytes(&self) -> usize {
+        let mut bytes = 0usize;
+        for (_, row) in self.outputs.iter() {
+            bytes += row.capacity() * std::mem::size_of::<FpVector>();
+            for v in row {
+                // p=2: one 64-bit limb per 64 entries.
+                bytes += v.len().div_ceil(64) * 8;
+            }
+        }
+        // Option<Subspace> slot overhead only (these are `None` in Nassau).
+        let opt = |n: i32| n.max(0) as usize * std::mem::size_of::<usize>();
+        bytes + opt(self.images.len()) + opt(self.kernels.len()) + opt(self.quasi_inverses.len())
+    }
+}
+
+impl<const U: bool, M: Module> MuFreeModuleHomomorphism<U, M>
+where
+    M::Algebra: MuAlgebra<U>,
+{
     pub fn new(
         source: Arc<MuFreeModule<U, M::Algebra>>,
         target: Arc<M>,

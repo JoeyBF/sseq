@@ -19,7 +19,7 @@ use std::{
 
 use algebra::{
     Algebra, combinatorics,
-    milnor_algebra::{MilnorAlgebra, PPartEntry},
+    milnor_algebra::{MilnorAlgebra, PPart, PPartEntry},
     module::{
         FreeModule, GeneratorData, Module, ZeroModule,
         homomorphism::{FreeModuleHomomorphism, FullModuleHomomorphism, ModuleHomomorphism},
@@ -28,7 +28,7 @@ use algebra::{
 use anyhow::anyhow;
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use fp::{
-    matrix::{AugmentedMatrix, Matrix},
+    matrix::{AugmentedMatrix, Matrix, Subspace},
     prime::{Prime, TWO, ValidPrime},
     vector::{FpSlice, FpSliceMut, FpVector},
 };
@@ -106,15 +106,40 @@ impl MilnorSubalgebra {
         Self { profile: vec![] }
     }
 
-    /// Computes the signature of an element
-    fn has_signature(&self, ppart: &[PPartEntry], signature: &[PPartEntry]) -> bool {
-        for (i, (&profile, &signature)) in self.profile.iter().zip(signature).enumerate() {
-            let ppart = ppart.get(i).copied().unwrap_or(0);
-            if ppart & ((1 << profile) - 1) != signature {
-                return false;
+    /// The test "does this element have this signature" compiled into a `(mask, value)` pair to
+    /// match against the packed p-part.
+    ///
+    /// The per-entry test is `ppart[i] & ((1 << profile[i]) - 1) == signature[i]`. Because each
+    /// entry occupies a fixed field of the packed word, the low `profile[i]` bits of entry `i` are
+    /// a fixed bit range of that word, so the whole conjunction is a single `&` and `==`. Entries
+    /// past the end of the p-part read as zero, which the packing already gives us for free.
+    /// Returns `None` if no element can have this signature, which the caller turns into an empty
+    /// result. A profile is not bounded by [`PPart::MAX_LEN`] -- `SubalgebraIterator` grows one
+    /// without limit and `from_bytes` reads whatever length a file gives -- so both ways a
+    /// signature can fail to be representable have to be handled here rather than assumed away.
+    fn packed_signature(&self, signature: &[PPartEntry]) -> Option<(u64, u64)> {
+        let mut mask = 0;
+        let mut value = 0;
+        for (i, (&profile, &entry)) in self.profile.iter().zip(signature).enumerate() {
+            if i >= PPart::MAX_LEN {
+                // No p-part of a representable degree has an entry this far out, so it reads as
+                // zero: a non-zero constraint is unsatisfiable and a zero one is vacuous.
+                if entry != 0 {
+                    return None;
+                }
+                continue;
             }
+            // A profile wider than the field constrains the whole field.
+            let width = std::cmp::min(profile as u32, PPart::width(i));
+            // The masked entry has only `width` bits, so a signature wanting more matches nothing.
+            // Packing it anyway would spill into the neighbouring field.
+            if (entry as u64) >> width != 0 {
+                return None;
+            }
+            mask |= ((1u64 << width) - 1) << PPart::shift(i);
+            value |= (entry as u64) << PPart::shift(i);
         }
-        true
+        Some((mask, value))
     }
 
     fn zero_signature(&self) -> Vec<PPartEntry> {
@@ -138,28 +163,39 @@ impl MilnorSubalgebra {
         signature: &'a [PPartEntry],
         max_gen_degree: i32,
     ) -> impl Iterator<Item = usize> + 'a {
-        module
-            .iter_gen_offsets([degree])
-            .take_while(move |gen_data| gen_data.gen_deg < max_gen_degree)
-            .flat_map(
-                move |GeneratorData {
-                          gen_deg,
-                          start: [offset],
-                          end: _,
-                      }| {
-                    algebra
-                        .ppart_table(degree - gen_deg)
-                        .iter()
-                        .enumerate()
-                        .filter_map(move |(n, op)| {
-                            if self.has_signature(op, signature) {
-                                Some(offset + n)
-                            } else {
-                                None
-                            }
-                        })
-                },
-            )
+        // The mask depends only on the signature, so compute it once for the whole sweep (PR #280).
+        // An unrepresentable signature yields no elements at all.
+        //
+        // `take_while` is retained from this branch and is NOT optional: `max_gen_degree` exists so
+        // a reader can ignore the generators of the current internal degree, which another thread
+        // may be adding concurrently. Generators are laid out in increasing degree, so this is
+        // exactly a prefix.
+        self.packed_signature(signature)
+            .into_iter()
+            .flat_map(move |(mask, value)| {
+                module
+                    .iter_gen_offsets([degree])
+                    .take_while(move |gen_data| gen_data.gen_deg < max_gen_degree)
+                    .flat_map(
+                        move |GeneratorData {
+                                  gen_deg,
+                                  start: [offset],
+                                  end: _,
+                              }| {
+                            algebra
+                                .ppart_table(degree - gen_deg)
+                                .iter()
+                                .enumerate()
+                                .filter_map(move |(n, op)| {
+                                    if op.bits() & mask == value {
+                                        Some(offset + n)
+                                    } else {
+                                        None
+                                    }
+                                })
+                        },
+                    )
+            })
     }
 
     /// The number of basis elements in `degree` coming from generators of `module` of degree
@@ -328,6 +364,10 @@ fn restricted_partial_matrix(
     inputs: &[usize],
     target_dim: usize,
 ) -> Matrix {
+    // Spanned because this is the fallback every build below `NASSAU_GPU_MIN_WORK` takes, and it
+    // was invisible: the trace attributed 902.8 s to `extract_restricted` over 4915 GPU builds, but
+    // a stem-150 run issues ~21 500 builds, so most of them landed here and were never counted.
+    let _s = tracing::trace_span!("cpu_restricted", rows = inputs.len(), target_dim).entered();
     let mut matrix = Matrix::new(hom.prime(), inputs.len(), target_dim);
     if target_dim > 0 {
         matrix
@@ -397,6 +437,38 @@ fn reuse_full_matrix(_diff: &FreeModuleHomomorphism<FreeModule<MilnorAlgebra>>) 
     }
 }
 
+/// Max `rows × cols` of the full restricted matrix for which [`reuse_full_matrix`] builds it all at
+/// once. Above this the all-rows build (and its dense GPU readback, both held across the whole
+/// signature loop) dominates host memory at high stems — the ~12 GB dense regions behind the stem-180
+/// OOM. Past the cap we fall back to per-signature builds (each a bounded row subset, like the CPU),
+/// trading a little launch amortization for a peak that scales with the largest single signature
+/// rather than the whole bidegree. `NASSAU_GPU_REUSE_MAX_WORK` overrides (0 = never reuse). Default
+/// ~1e10 (rows×cols) ≈ a ~1.2 GB restricted matrix.
+#[cfg(feature = "gpu")]
+fn gpu_reuse_max_work() -> u64 {
+    static W: std::sync::LazyLock<u64> = std::sync::LazyLock::new(|| {
+        std::env::var("NASSAU_GPU_REUSE_MAX_WORK")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(10_000_000_000)
+    });
+    *W
+}
+
+/// Whether the full restricted matrix (`rows × cols`) is small enough to build all at once (see
+/// [`gpu_reuse_max_work`]). Always true without the `gpu` feature (the reuse path is off anyway).
+fn reuse_within_cap(_rows: usize, _cols: usize) -> bool {
+    #[cfg(feature = "gpu")]
+    {
+        let w = gpu_reuse_max_work();
+        w > 0 && (_rows as u64).saturating_mul(_cols as u64) <= w
+    }
+    #[cfg(not(feature = "gpu"))]
+    {
+        true
+    }
+}
+
 /// Extract `rows` of `full` into a fresh matrix (`out.row(i) = full.row(rows[i])`), preserving the
 /// column layout. Slices a precomputed full (restricted-column) differential matrix into one
 /// signature's partial matrix (see [`reuse_full_matrix`]). `rows` must index within `full` — the
@@ -408,6 +480,1042 @@ fn select_rows(full: &Matrix, rows: &[usize]) -> Matrix {
     }
     out
 }
+
+/// Speculative full-matrix precomputation: build a bidegree's full restricted differential matrix
+/// *before* the bidegree runs, on background threads, and hand it over when the bidegree starts.
+///
+/// # Why this is sound
+///
+/// `step_resolution_with_subalgebra` deliberately treats `C_{s-1}` as having no generators of degree
+/// `>= t` and `C_{s-2}` as having none of degree `>= t - 1`, so the full matrix it builds reads only
+/// data frozen once `(s - 1, t - 1)` is committed — see the comment there. That is *strictly weaker*
+/// than the condition for running `(s, t)`, which additionally needs `(s, t - 1)`. The gap between
+/// the two is the speculation window: whenever row `s` lags row `s - 1`, every bidegree in between
+/// already has a fully determined matrix and nothing but scheduling stops us from building it.
+///
+/// The window is widest exactly where it pays. The bottleneck in practice is the low-`s` rows, and
+/// for those the rows below are long since finished — row 2's matrices are all computable the moment
+/// row 1 completes. So the lookahead available to the critical path is bounded by `NASSAU_SPECULATE`
+/// depth, not by the wavefront.
+///
+/// The row-block claim underneath (a matrix built over a row subset equals those rows of the all-rows
+/// build) is checked empirically by `NASSAU_SPLIT_VERIFY`; this cache goes further and builds the
+/// whole matrix early, which `NASSAU_SPECULATE_VERIFY` checks by rebuilding at consumption time and
+/// asserting equality.
+///
+/// # Why it should win at capped theta
+///
+/// At high stems the resident master must be capped, so most `R`'s are enumerated on the GPU on the
+/// critical path, and an enumeration launch costs the length of its longest odometer chain. Building
+/// matrices ahead moves that latency off the critical path entirely: the speculative threads issue
+/// their launches while the wavefront is busy elsewhere, and a bidegree that finds its matrix in the
+/// cache skips the multiply *and* the enumeration behind it.
+///
+/// # Configuration
+///
+/// * `NASSAU_SPECULATE` — number of background builder threads (default 0, off).
+/// * `NASSAU_SPECULATE_AHEAD` — how many degrees past a row's own frontier to speculate (default 64).
+/// * `NASSAU_SPECULATE_MAX_GB` — cap on retained speculative matrices (default 64 GB).
+/// * `NASSAU_SPECULATE_VERIFY` — rebuild at consumption and assert the cached matrix is identical.
+mod speculate {
+    use std::{
+        cmp::Reverse,
+        collections::{BinaryHeap, HashMap},
+        sync::{
+            Condvar, LazyLock, Mutex,
+            atomic::{AtomicUsize, Ordering},
+        },
+    };
+
+    use fp::matrix::Matrix;
+    use sseq::coordinates::Bidegree;
+
+    /// Number of background builder threads; 0 disables speculation entirely.
+    pub fn threads() -> usize {
+        static N: LazyLock<usize> = LazyLock::new(|| {
+            std::env::var("NASSAU_SPECULATE")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0)
+        });
+        *N
+    }
+
+    /// How far past a row's own committed frontier to speculate. Bounds the queue (and hence the
+    /// retained memory) when a row lags very far behind the one below it.
+    pub fn ahead() -> i32 {
+        static A: LazyLock<i32> = LazyLock::new(|| {
+            std::env::var("NASSAU_SPECULATE_AHEAD")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(64)
+        });
+        *A
+    }
+
+    /// Cap on the bytes held by cached matrices. Speculation is skipped while over it. Shared with
+    /// [`super::blocks`], which is an alternative granularity for the same cache, never a second one.
+    pub fn max_bytes() -> usize {
+        static B: LazyLock<usize> = LazyLock::new(|| {
+            std::env::var("NASSAU_SPECULATE_MAX_GB")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(64)
+                << 30
+        });
+        *B
+    }
+
+    /// How long a consumer will wait for an in-flight speculative build before giving up and
+    /// building the matrix itself (`NASSAU_SPECULATE_WAIT_MS`, default 5000).
+    ///
+    /// The wait MUST be bounded. Builders run `restricted_partial_matrix`, which is rayon-parallel,
+    /// from outside the pool: rayon injects the work and blocks the builder until a pool worker
+    /// picks it up. A consumer is a pool worker, and a worker parked in a condvar cannot steal — so
+    /// an unbounded wait closes a cycle (consumer waits on builder, builder waits on the workers one
+    /// of which is the consumer) and the run hangs. It did, immediately, at stem 40. A timeout turns
+    /// that cycle into at worst one duplicated build.
+    fn wait_limit() -> std::time::Duration {
+        static W: LazyLock<std::time::Duration> = LazyLock::new(|| {
+            std::time::Duration::from_millis(
+                std::env::var("NASSAU_SPECULATE_WAIT_MS")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(5000),
+            )
+        });
+        *W
+    }
+
+    /// Dedicated pool for speculative CPU builds.
+    ///
+    /// `restricted_partial_matrix` is itself rayon-parallel, so a speculative build issued from a
+    /// builder thread injects a large parallel job into the GLOBAL pool -- the one serving the
+    /// wavefront. The cores it uses are not free in that case: wavefront tasks queue behind
+    /// speculative chunks, and work-stealing spreads the damage. Measured at stem 150 / theta=125,
+    /// pin 20: 16 CPU builders took 649 s against a 310 s baseline, a 2.1x regression, while the
+    /// cache itself worked fine (53% hit rate, zero duplication).
+    ///
+    /// Installing the build into a separate pool keeps every nested `par_iter` inside that pool, so
+    /// speculation can only consume cores the wavefront is not asking for.
+    ///
+    /// SIZE IT GENEROUSLY. This defaulted to a quarter of the machine, which throttled speculation
+    /// by construction: measured CPU was ~20 of 128 cores, and block coverage plateaued near 52%
+    /// however the pieces were reshaped. Stem 150, θ=125, control repeated last:
+    ///
+    /// | builders / pool | wall        | row coverage |
+    /// |-----------------|-------------|--------------|
+    /// | 16 / 32         | 170 s 168 s | 52.2% 50.6%  |
+    /// | 24 / 64         | 134 s       | 63.6%        |
+    /// | 32 / 96         | 119 s       | 70.8%        |
+    /// | 48 / 120        | 134 s       | 77.0%        |
+    ///
+    /// So the contention this pool exists to prevent is real, but only past ~3/4 of the machine: at
+    /// 120 threads coverage still climbs while wall time regresses. Default is 3/4.
+    /// `NASSAU_SPECULATE_POOL` overrides.
+    pub fn pool() -> &'static maybe_rayon::MaybeThreadPool {
+        static P: LazyLock<maybe_rayon::MaybeThreadPool> = LazyLock::new(|| {
+            let n = std::env::var("NASSAU_SPECULATE_POOL")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .filter(|&v| v > 0)
+                .unwrap_or_else(|| (maybe_rayon::max_num_threads() * 3 / 4).max(1));
+            maybe_rayon::MaybeThreadPool::new(n, "nassau-spec")
+        });
+        &P
+    }
+
+    /// Whether speculative builds take the CPU path (`NASSAU_SPECULATE_CPU`). Off by default.
+    pub fn on_cpu() -> bool {
+        static C: LazyLock<bool> =
+            LazyLock::new(|| std::env::var_os("NASSAU_SPECULATE_CPU").is_some());
+        *C
+    }
+
+    pub fn verify() -> bool {
+        static V: LazyLock<bool> =
+            LazyLock::new(|| std::env::var_os("NASSAU_SPECULATE_VERIFY").is_some());
+        *V
+    }
+
+    /// What the cache knows about a bidegree's matrix.
+    ///
+    /// The state matters as much as the matrix. A first cut cached only finished matrices, so a
+    /// builder and the bidegree itself could build the same matrix concurrently — and since a full
+    /// build is most of a bidegree's cost, that duplication was the whole cost of speculation (at
+    /// stem 150/θ=125: 442 built, 99 consumed, +18% wall). Every bidegree therefore passes through
+    /// this map exactly once, and the entry is what stops the second builder from starting.
+    enum Slot {
+        /// A builder is building this right now. A consumer that arrives waits rather than
+        /// duplicating: waiting costs at most what building costs, and usually much less, because
+        /// the builder has a head start by construction.
+        InFlight,
+        Ready(Matrix),
+        /// Consumed, or claimed by the consumer on a miss. Builders skip it.
+        Taken,
+    }
+
+    /// Slots keyed by bidegree, with a condvar for consumers waiting on [`Slot::InFlight`]. A
+    /// process resolves one `Resolution`, so the bidegree alone identifies the matrix; the map is
+    /// only ever populated when `NASSAU_SPECULATE` is set.
+    static CACHE: LazyLock<(Mutex<HashMap<(i32, i32), Slot>>, Condvar)> =
+        LazyLock::new(|| (Mutex::new(HashMap::new()), Condvar::new()));
+    static BYTES: AtomicUsize = AtomicUsize::new(0);
+    static HITS: AtomicUsize = AtomicUsize::new(0);
+    static MISSES: AtomicUsize = AtomicUsize::new(0);
+    static BUILT: AtomicUsize = AtomicUsize::new(0);
+    static WAITED: AtomicUsize = AtomicUsize::new(0);
+    static TIMEOUTS: AtomicUsize = AtomicUsize::new(0);
+    static DROPPED: AtomicUsize = AtomicUsize::new(0);
+
+    fn size_of(m: &Matrix) -> usize {
+        m.rows() * m.columns().div_ceil(64) * 8
+    }
+
+    /// Whether there is room to build another matrix. Checked before building, not after: a
+    /// speculative build we cannot afford to keep is wasted work, not just wasted space.
+    pub fn has_room() -> bool {
+        BYTES.load(Ordering::Relaxed) < max_bytes()
+    }
+
+    /// Take ownership of building `b`, or report that someone else already owns it.
+    ///
+    /// A `false` means another builder is on it or the consumer has claimed it — either way there is
+    /// nothing to gain by proceeding, only a duplicate build. A `true` obliges the caller to call
+    /// [`publish`]: a consumer may now be waiting on this slot.
+    pub fn claim(b: Bidegree) -> bool {
+        let (m, _) = &*CACHE;
+        let mut g = m.lock().unwrap();
+        if g.contains_key(&(b.s(), b.t())) {
+            return false;
+        }
+        g.insert((b.s(), b.t()), Slot::InFlight);
+        true
+    }
+
+    /// Releases a claim that never produced a matrix, so a consumer waiting on the slot falls
+    /// through and builds it itself instead of hanging forever. The only way that happens is a panic
+    /// in the builder, which would otherwise turn a crash into a deadlock.
+    pub struct ClaimGuard(Option<Bidegree>);
+
+    impl ClaimGuard {
+        pub fn new(b: Bidegree) -> Self {
+            Self(Some(b))
+        }
+
+        /// The matrix was published; nothing to release.
+        pub fn done(mut self) {
+            self.0 = None;
+        }
+    }
+
+    impl Drop for ClaimGuard {
+        fn drop(&mut self) {
+            if let Some(b) = self.0 {
+                let (m, cv) = &*CACHE;
+                m.lock().unwrap().remove(&(b.s(), b.t()));
+                cv.notify_all();
+            }
+        }
+    }
+
+    /// Hand over a finished speculative matrix, waking anyone waiting on it.
+    pub fn publish(b: Bidegree, matrix: Matrix) {
+        let (m, cv) = &*CACHE;
+        let mut g = m.lock().unwrap();
+        // If the consumer timed out and built its own, the slot is already `Taken`. Drop this copy
+        // rather than parking a matrix nobody will ever collect.
+        if !matches!(g.get(&(b.s(), b.t())), Some(Slot::InFlight)) {
+            DROPPED.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        BYTES.fetch_add(size_of(&matrix), Ordering::Relaxed);
+        BUILT.fetch_add(1, Ordering::Relaxed);
+        g.insert((b.s(), b.t()), Slot::Ready(matrix));
+        cv.notify_all();
+    }
+
+    /// The consumer side: the matrix for `b` if it was built ahead, else `None`.
+    ///
+    /// Never races a builder. If a build is in flight this blocks until it lands; if nothing is
+    /// known, it claims the slot so no builder starts the work the caller is about to do itself.
+    pub fn take_or_claim(b: Bidegree) -> Option<Matrix> {
+        if threads() == 0 {
+            return None;
+        }
+        let (m, cv) = &*CACHE;
+        let mut g = m.lock().unwrap();
+        let mut waited = false;
+        loop {
+            match g.get(&(b.s(), b.t())) {
+                Some(Slot::Ready(_)) => {
+                    let Some(Slot::Ready(matrix)) = g.insert((b.s(), b.t()), Slot::Taken) else {
+                        unreachable!("just matched Ready under the same lock")
+                    };
+                    BYTES.fetch_sub(size_of(&matrix), Ordering::Relaxed);
+                    HITS.fetch_add(1, Ordering::Relaxed);
+                    return Some(matrix);
+                }
+                Some(Slot::InFlight) => {
+                    if !waited {
+                        waited = true;
+                        WAITED.fetch_add(1, Ordering::Relaxed);
+                    }
+                    let (guard, res) = cv.wait_timeout(g, wait_limit()).unwrap();
+                    g = guard;
+                    if res.timed_out() {
+                        // Stop waiting on the builder and take the slot: it will find `Taken` and
+                        // drop its result. One duplicated build beats a stalled worker.
+                        g.insert((b.s(), b.t()), Slot::Taken);
+                        TIMEOUTS.fetch_add(1, Ordering::Relaxed);
+                        MISSES.fetch_add(1, Ordering::Relaxed);
+                        return None;
+                    }
+                }
+                Some(Slot::Taken) => {
+                    MISSES.fetch_add(1, Ordering::Relaxed);
+                    return None;
+                }
+                None => {
+                    g.insert((b.s(), b.t()), Slot::Taken);
+                    MISSES.fetch_add(1, Ordering::Relaxed);
+                    return None;
+                }
+            }
+        }
+    }
+
+    /// `(built, hits, misses, waits, timeouts, dropped, retained bytes)`, for reporting.
+    /// `built - hits` plus `dropped` is the wasted work this design exists to keep near zero;
+    /// `timeouts` says how often a consumer gave up on a builder.
+    pub fn stats() -> (usize, usize, usize, usize, usize, usize, usize) {
+        (
+            BUILT.load(Ordering::Relaxed),
+            HITS.load(Ordering::Relaxed),
+            MISSES.load(Ordering::Relaxed),
+            WAITED.load(Ordering::Relaxed),
+            TIMEOUTS.load(Ordering::Relaxed),
+            DROPPED.load(Ordering::Relaxed),
+            BYTES.load(Ordering::Relaxed),
+        )
+    }
+
+    /// Drop everything. Called when the wavefront finishes so a second `compute_through_stem` in the
+    /// same process cannot see stale entries.
+    pub fn clear() {
+        let (m, cv) = &*CACHE;
+        m.lock().unwrap().clear();
+        BYTES.store(0, Ordering::Relaxed);
+        cv.notify_all();
+    }
+
+    struct Queue {
+        heap: BinaryHeap<Reverse<(i32, i32)>>,
+        closed: bool,
+    }
+
+    /// Pending speculative builds, ordered by `(t, s)` ascending.
+    ///
+    /// The order matters more than it looks. The queue can run far longer than the builders can
+    /// drain it, and a matrix that lands after its bidegree has already started is pure waste — so
+    /// builders must always take the bidegree the wavefront will reach soonest, which is the
+    /// smallest `t`. A FIFO would instead spend the builders on the deepest speculation first.
+    static QUEUE: LazyLock<(Mutex<Queue>, Condvar)> = LazyLock::new(|| {
+        (
+            Mutex::new(Queue {
+                heap: BinaryHeap::new(),
+                closed: false,
+            }),
+            Condvar::new(),
+        )
+    });
+
+    pub fn open() {
+        let (m, _) = &*QUEUE;
+        let mut q = m.lock().unwrap();
+        q.heap.clear();
+        q.closed = false;
+    }
+
+    pub fn push(b: Bidegree) {
+        let (m, cv) = &*QUEUE;
+        m.lock().unwrap().heap.push(Reverse((b.t(), b.s())));
+        cv.notify_one();
+    }
+
+    /// Block for the next bidegree to build, or `None` once the queue is closed and drained.
+    pub fn pop() -> Option<Bidegree> {
+        let (m, cv) = &*QUEUE;
+        let mut q = m.lock().unwrap();
+        loop {
+            if let Some(Reverse((t, s))) = q.heap.pop() {
+                return Some(Bidegree::s_t(s, t));
+            }
+            if q.closed {
+                return None;
+            }
+            q = cv.wait(q).unwrap();
+        }
+    }
+
+    /// Stop the builders once the wavefront is done. Anything still queued is dropped: its bidegree
+    /// has either run already or is out of region.
+    pub fn closed() -> bool {
+        let (m, _) = &*QUEUE;
+        m.lock().unwrap().closed
+    }
+
+    pub fn close() {
+        let (m, cv) = &*QUEUE;
+        let mut q = m.lock().unwrap();
+        q.closed = true;
+        q.heap.clear();
+        cv.notify_all();
+    }
+}
+
+/// Block-granular speculation: precompute *row blocks* of a bidegree's full restricted matrix.
+///
+/// [`speculate`] caches one whole matrix per bidegree, which bounds how early the work can start.
+/// The matrix at `(s, t)` is only fully determined once `(s - 1, t - 1)` is committed, so a builder
+/// gets at most the gap between "matrix determined" and "bidegree runs" — one degree of slack per
+/// row, and the measured hit rate is ~30%.
+///
+/// A *block* is the set of rows coming from generators of `modules[s - 1]` in a single degree
+/// `gen_deg` — the rows `Sq(R) · x` with `deg x = gen_deg` and `deg Sq(R) = t - gen_deg`, which is
+/// exactly the `(bidegree, input_deg, output_deg)` decomposition. A block is determined *far*
+/// earlier than the matrix it belongs to:
+///
+/// * **Its rows.** Basis elements of a [`FreeModule`] at degree `t` are laid out generator-major and
+///   the table is append-only (`add_generators` appends to every already-computed degree, so
+///   existing indices never move). The row range of block `gen_deg` is therefore
+///   `sum over h < gen_deg of num_gens[h] * dim(t - h)`, frozen once the generator counts below
+///   `gen_deg` are — i.e. once `(s - 1, gen_deg)` is committed. Not `t - 1`. This is the same
+///   row-block claim `NASSAU_SPLIT_VERIFY` checks against real data.
+/// * **Its columns.** `d(x)` for a generator `x` of degree `gen_deg` lands in the radical (that is
+///   minimality, and it is already what licenses the existing truncation in
+///   [`FreeModuleHomomorphism::apply_to_basis_element_restricted`]), so it is supported on
+///   generators of `modules[s - 2]` of degree *strictly* below `gen_deg`. Acting by `Sq(R)` does not
+///   change the generator, so the whole block is supported in the first
+///   `restricted_dimension(modules[s - 2], t, gen_deg)` columns. The block is built that narrow and
+///   zero-extended at assembly, so it needs only `(s - 2, gen_deg - 1)`, not `(s - 2, t - 2)`.
+///
+/// So block `gen_deg` of `(s, t)` is buildable as soon as `min(progress[s-1], progress[s-2])`
+/// reaches `gen_deg`, for *every* `t > gen_deg` still in region. That is what deepens the queue: a
+/// single commit opens blocks across a whole column of future bidegrees instead of one matrix.
+///
+/// # Consuming
+///
+/// The consumer takes whatever blocks are ready, copies them into the full matrix, and collects the
+/// rows it did not get into ONE coalesced build. A miss therefore costs nothing beyond the rows it
+/// covers — unlike [`speculate`], where a miss means rebuilding everything — so there is no waiting
+/// on in-flight work here, and hence none of that module's deadlock hazard: a block that has not
+/// landed is simply folded into the launch the consumer was making anyway.
+///
+/// # Configuration
+///
+/// * `NASSAU_SPECULATE_BLOCKS` — use block granularity instead of whole matrices.
+/// * `NASSAU_SPECULATE_BLOCK_AHEAD` — degrees past a row's frontier to speculate (default 24).
+/// * `NASSAU_SPECULATE_BLOCK_QUEUE` — cap on queued blocks (default 1M), a flood guard.
+mod blocks {
+    use std::{
+        cmp::Reverse,
+        collections::{BinaryHeap, HashMap},
+        sync::{
+            Condvar, LazyLock, Mutex,
+            atomic::{AtomicUsize, Ordering},
+        },
+    };
+
+    use fp::matrix::Matrix;
+    use sseq::coordinates::Bidegree;
+
+    pub fn enabled() -> bool {
+        static E: LazyLock<bool> =
+            LazyLock::new(|| std::env::var_os("NASSAU_SPECULATE_BLOCKS").is_some());
+        *E
+    }
+
+    /// How far past a row's own committed frontier to speculate blocks. Smaller than
+    /// [`super::speculate::ahead`] by default because each degree contributes many items, not one.
+    pub fn ahead() -> i32 {
+        static A: LazyLock<i32> = LazyLock::new(|| {
+            std::env::var("NASSAU_SPECULATE_BLOCK_AHEAD")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(24)
+        });
+        *A
+    }
+
+    fn queue_cap() -> usize {
+        static Q: LazyLock<usize> = LazyLock::new(|| {
+            std::env::var("NASSAU_SPECULATE_BLOCK_QUEUE")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(1 << 20)
+        });
+        *Q
+    }
+
+    /// One generator degree's claim, holding whatever pieces have been finished for it so far.
+    ///
+    /// A degree is claimed as a unit (one queue item) but DELIVERED per generator, incrementally.
+    /// `iter_gen_offsets` yields one entry per generator, so a degree with several generators is
+    /// several independent row ranges; building them as one range made blocks coarse and
+    /// all-or-nothing, and coverage fell (86.3% -> 68.1% at stem 30) because fewer finished before
+    /// their bidegree ran. Publishing each generator as it lands keeps the granularity fine while
+    /// still covering every generator, instead of only the first one in each degree.
+    #[derive(Default)]
+    struct DegreeSlot {
+        pieces: Vec<(usize, Matrix)>,
+    }
+
+    /// A finished piece carries the row offset it was BUILT against, not just its contents.
+    ///
+    /// That offset is the fix for a real bug. The consumer used to re-derive each block's row range
+    /// from the module's generator counts at consumption time and got a different answer than the
+    /// builder had (`start=23` for a block whose rows actually sat at 22), silently misplacing every
+    /// row. A free module's basis at a fixed degree is append-only and generator-major, so the
+    /// offset a block was built against stays valid forever — recomputing it later is what is
+    /// fragile. So the block owns its position, and the consumer never re-derives it.
+
+    /// Every block known for one bidegree.
+    ///
+    /// `done` is set the moment the consumer collects, and is what stops a builder from starting (or
+    /// publishing) work whose bidegree has already assembled its matrix. The entry outlives the
+    /// collection precisely so that a straggling `publish` finds `done` and drops its result instead
+    /// of resurrecting the bidegree.
+    #[derive(Default)]
+    struct BidegreeBlocks {
+        done: bool,
+        slots: HashMap<i32, DegreeSlot>,
+        /// Signatures already consumed. A bidegree above `reuse_within_cap` never assembles a full
+        /// matrix, so `done` never fires for it; delivery is per signature instead and this is what
+        /// stops a straggling piece from being stored for a signature already row-reduced.
+        sig_done: std::collections::HashSet<usize>,
+        /// `sig_idx -> pieces`, each `(offset within the signature matrix, rows)`.
+        sig: HashMap<usize, Vec<(usize, Matrix)>>,
+    }
+
+    static CACHE: LazyLock<Mutex<HashMap<(i32, i32), BidegreeBlocks>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
+    static BYTES: AtomicUsize = AtomicUsize::new(0);
+    static BUILT: AtomicUsize = AtomicUsize::new(0);
+    static HITS: AtomicUsize = AtomicUsize::new(0);
+    static MISSES: AtomicUsize = AtomicUsize::new(0);
+    static DROPPED: AtomicUsize = AtomicUsize::new(0);
+    static ROWS_HIT: AtomicUsize = AtomicUsize::new(0);
+    static ROWS_MISSED: AtomicUsize = AtomicUsize::new(0);
+    static FLOODED: AtomicUsize = AtomicUsize::new(0);
+    static RELEASED: AtomicUsize = AtomicUsize::new(0);
+    /// Why builders declined work, so a coverage plateau can be attributed instead of guessed at.
+    /// Stem 200 sits at 33% row coverage while total CPU is ~13 of 128 cores -- the builders are
+    /// IDLE, not contended -- so the question is which bail-out they are taking.
+    static BAIL_ROOM: AtomicUsize = AtomicUsize::new(0);
+    static BAIL_DONE: AtomicUsize = AtomicUsize::new(0);
+    static BAIL_CLAIMED: AtomicUsize = AtomicUsize::new(0);
+    static BAIL_OTHER: AtomicUsize = AtomicUsize::new(0);
+    /// Queue depth at each successful pop, and the time builders spend parked because the queue is
+    /// EMPTY. Only 36% of popped items got built before their bidegree ran, while builders were not
+    /// saturated (1310% CPU of 128 cores) -- so they were neither too slow nor too busy. Either the
+    /// queue is mostly empty (the producer's eligibility gate admits far less than the nominal
+    /// 24-degree window) or builders are blocked on something that does not show as CPU. Depth near
+    /// zero with large idle time means the former.
+    static QDEPTH_SUM: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    static QDEPTH_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    static QDEPTH_MAX: AtomicUsize = AtomicUsize::new(0);
+    static IDLE_NANOS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    static BUILD_NANOS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    static SKIPPED_SMALL: AtomicUsize = AtomicUsize::new(0);
+    static TW_SUM: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    static TW_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    static TW_EMPTY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    static ACTIVE_BUILDERS: AtomicUsize = AtomicUsize::new(0);
+    /// Rows served vs rebuilt, bucketed by OPERATION degree (`t - gen_deg`) in steps of 25.
+    ///
+    /// A block's lookahead is ~`t - gen_deg`: it becomes eligible when `progress[s-1]` reaches
+    /// `gen_deg`, and its bidegree runs when `progress[s-1]` reaches `t-1`. So blocks with `gen_deg`
+    /// near `t` have almost no warning. The claim to test is that the ~33% coverage ceiling at stem
+    /// 200 is this and not a tunable: if so, misses concentrate in the LOW operation-degree buckets
+    /// and hits in the high ones, and the row mass shifts low between stem 150 and stem 200.
+    static HIT_BY_OPDEG: [std::sync::atomic::AtomicU64; 16] =
+        [const { std::sync::atomic::AtomicU64::new(0) }; 16];
+    static MISS_BY_OPDEG: [std::sync::atomic::AtomicU64; 16] =
+        [const { std::sync::atomic::AtomicU64::new(0) }; 16];
+
+    pub fn opdeg_hist() -> bool {
+        static H: LazyLock<bool> =
+            LazyLock::new(|| std::env::var_os("NASSAU_OPDEG_HIST").is_some());
+        *H
+    }
+
+    pub fn record_opdeg(op_deg: i32, rows: u64, hit: bool) {
+        let b = ((op_deg.max(0) / 25) as usize).min(15);
+        if hit {
+            HIT_BY_OPDEG[b].fetch_add(rows, Ordering::Relaxed);
+        } else {
+            MISS_BY_OPDEG[b].fetch_add(rows, Ordering::Relaxed);
+        }
+    }
+
+    pub fn dump_opdeg() {
+        if !opdeg_hist() {
+            return;
+        }
+        for b in 0..16 {
+            let (h, m) = (
+                HIT_BY_OPDEG[b].load(Ordering::Relaxed),
+                MISS_BY_OPDEG[b].load(Ordering::Relaxed),
+            );
+            if h + m > 0 {
+                eprintln!(
+                    "[opdeg] op_deg {:>3}-{:<3} rows_hit={h} rows_missed={m} coverage={:.1}%",
+                    b * 25,
+                    b * 25 + 24,
+                    100.0 * h as f64 / (h + m) as f64,
+                );
+            }
+        }
+    }
+    /// Depth and queued rows maintained on push/pop, so the sampler never takes the queue lock.
+    ///
+    /// Reading them under the mutex does not work: with ~343k items and 32 builders contending, a
+    /// 100 ms sampler simply never wins the lock, and iterating the heap under it would block every
+    /// builder. The first version did both and emitted nothing at stem 200 while working fine on a
+    /// small queue.
+    static Q_DEPTH: AtomicUsize = AtomicUsize::new(0);
+    static Q_ROWS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    pub fn skipped_small() -> usize {
+        SKIPPED_SMALL.load(Ordering::Relaxed)
+    }
+
+    pub fn record_build_nanos(n: u64) {
+        BUILD_NANOS.fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// Time-weighted queue depth, sampled by a timer rather than at pops.
+    ///
+    /// Sampling at pops is biased by construction: a pop only happens when there is work, so the
+    /// statistic can only ever report "deep". It measured mean=133 589 while `builder_idle` showed
+    /// builders parked 91% of their thread-time — both true, describing different moments. The
+    /// producer emits a whole strip per commit, floods the queue, and builders drain it over
+    /// minutes; between bursts the queue is empty and nothing observes it.
+    pub fn sample_depth() {
+        let d = Q_DEPTH.load(Ordering::Relaxed);
+        TW_SUM.fetch_add(d as u64, Ordering::Relaxed);
+        TW_N.fetch_add(1, Ordering::Relaxed);
+        if d == 0 {
+            TW_EMPTY.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// One line of the queue-depth TIME SERIES, with a breakdown of what is queued.
+    ///
+    /// A mean hides the shape, and the shape is the question: enqueues are triggered by COMMITS,
+    /// and commits get sparser as bidegrees get larger, so the queue is expected to be front-loaded
+    /// and to starve later — exactly when the expensive bidegrees need it. `tmin`/`tmax` show
+    /// whether what is queued is near or far work, `rows` whether it is worth anything, and
+    /// `building` how many builders are actually occupied at that instant.
+    pub fn trace_depth(elapsed_s: f64) {
+        eprintln!(
+            "[qtrace] t={elapsed_s:.0}s depth={} rows={} building={} built={}",
+            Q_DEPTH.load(Ordering::Relaxed),
+            Q_ROWS.load(Ordering::Relaxed),
+            ACTIVE_BUILDERS.load(Ordering::Relaxed),
+            BUILT.load(Ordering::Relaxed),
+        );
+    }
+
+    pub fn builder_enter() {
+        ACTIVE_BUILDERS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn builder_exit() {
+        ACTIVE_BUILDERS.fetch_sub(1, Ordering::Relaxed);
+    }
+
+    /// `(time-weighted mean depth, fraction of samples with an EMPTY queue)`.
+    pub fn timed_depth() -> (f64, f64) {
+        let n = TW_N.load(Ordering::Relaxed).max(1);
+        (
+            TW_SUM.load(Ordering::Relaxed) as f64 / n as f64,
+            TW_EMPTY.load(Ordering::Relaxed) as f64 / n as f64,
+        )
+    }
+
+    /// `(mean depth, max depth, builder idle seconds, builder build seconds)`.
+    pub fn queue_stats() -> (f64, usize, f64, f64) {
+        let n = QDEPTH_N.load(Ordering::Relaxed).max(1);
+        (
+            QDEPTH_SUM.load(Ordering::Relaxed) as f64 / n as f64,
+            QDEPTH_MAX.load(Ordering::Relaxed),
+            IDLE_NANOS.load(Ordering::Relaxed) as f64 / 1e9,
+            BUILD_NANOS.load(Ordering::Relaxed) as f64 / 1e9,
+        )
+    }
+
+    pub fn bail(kind: u8) {
+        match kind {
+            0 => &BAIL_ROOM,
+            1 => &BAIL_DONE,
+            2 => &BAIL_CLAIMED,
+            _ => &BAIL_OTHER,
+        }
+        .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn bails() -> (usize, usize, usize, usize) {
+        (
+            BAIL_ROOM.load(Ordering::Relaxed),
+            BAIL_DONE.load(Ordering::Relaxed),
+            BAIL_CLAIMED.load(Ordering::Relaxed),
+            BAIL_OTHER.load(Ordering::Relaxed),
+        )
+    }
+
+    fn size_of(m: &Matrix) -> usize {
+        m.rows() * m.columns().div_ceil(64) * 8
+    }
+
+    pub fn has_room() -> bool {
+        BYTES.load(Ordering::Relaxed) < super::speculate::max_bytes()
+    }
+
+    /// Take ownership of building one block, or report that it is already spoken for.
+    pub fn claim(b: Bidegree, gen_deg: i32) -> bool {
+        let mut g = CACHE.lock().unwrap();
+        let e = g.entry((b.s(), b.t())).or_default();
+        if e.done || e.slots.contains_key(&gen_deg) {
+            return false;
+        }
+        e.slots.insert(gen_deg, DegreeSlot::default());
+        true
+    }
+
+    /// Releases a claim that produced nothing, so a later builder may retry it. Only reachable if
+    /// the builder panicked.
+    pub struct ClaimGuard(Option<(Bidegree, i32)>);
+
+    impl ClaimGuard {
+        pub fn new(b: Bidegree, gen_deg: i32) -> Self {
+            Self(Some((b, gen_deg)))
+        }
+
+        pub fn done(mut self) {
+            self.0 = None;
+        }
+    }
+
+    impl Drop for ClaimGuard {
+        fn drop(&mut self) {
+            if let Some((b, gen_deg)) = self.0
+                && let Some(e) = CACHE.lock().unwrap().get_mut(&(b.s(), b.t()))
+                && e.slots.get(&gen_deg).is_some_and(|d| d.pieces.is_empty())
+            {
+                e.slots.remove(&gen_deg);
+            }
+        }
+    }
+
+    /// Hand over one finished piece. Called once per generator, as each lands.
+    pub fn publish(b: Bidegree, gen_deg: i32, start: usize, matrix: Matrix) {
+        let mut g = CACHE.lock().unwrap();
+        let Some(e) = g.get_mut(&(b.s(), b.t())) else {
+            DROPPED.fetch_add(1, Ordering::Relaxed);
+            return;
+        };
+        let done = e.done;
+        let Some(slot) = e.slots.get_mut(&gen_deg).filter(|_| !done) else {
+            DROPPED.fetch_add(1, Ordering::Relaxed);
+            return;
+        };
+        BYTES.fetch_add(size_of(&matrix), Ordering::Relaxed);
+        BUILT.fetch_add(1, Ordering::Relaxed);
+        slot.pieces.push((start, matrix));
+    }
+
+    /// Take ownership of building one signature's pieces for a generator degree.
+    pub fn claim_sig(b: Bidegree, gen_deg: i32, sig_idx: usize) -> bool {
+        let mut g = CACHE.lock().unwrap();
+        let e = g.entry((b.s(), b.t())).or_default();
+        if e.done || e.sig_done.contains(&sig_idx) {
+            return false;
+        }
+        // One claim per (signature, generator degree): the degree's queue item already serialises
+        // builders, this only guards against a re-queued degree redoing finished work.
+        e.sig.entry(sig_idx).or_default();
+        let _ = gen_deg;
+        true
+    }
+
+    pub fn publish_sig(b: Bidegree, sig_idx: usize, start: usize, matrix: Matrix) {
+        let mut g = CACHE.lock().unwrap();
+        let Some(e) = g.get_mut(&(b.s(), b.t())) else {
+            DROPPED.fetch_add(1, Ordering::Relaxed);
+            return;
+        };
+        if e.done || e.sig_done.contains(&sig_idx) {
+            DROPPED.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        BYTES.fetch_add(size_of(&matrix), Ordering::Relaxed);
+        BUILT.fetch_add(1, Ordering::Relaxed);
+        e.sig.entry(sig_idx).or_default().push((start, matrix));
+    }
+
+    /// Collect one signature's pieces and close that signature. Sorted by offset.
+    pub fn take_sig(b: Bidegree, sig_idx: usize) -> Vec<(usize, Matrix)> {
+        let mut g = CACHE.lock().unwrap();
+        let e = g.entry((b.s(), b.t())).or_default();
+        e.sig_done.insert(sig_idx);
+        let mut out = e.sig.remove(&sig_idx).unwrap_or_default();
+        for (_, m) in &out {
+            BYTES.fetch_sub(size_of(m), Ordering::Relaxed);
+        }
+        out.sort_by_key(|(start, _)| *start);
+        out
+    }
+
+    /// Whether the bidegree has already assembled, so a builder should stop mid-degree.
+    pub fn is_done(b: Bidegree) -> bool {
+        CACHE
+            .lock()
+            .unwrap()
+            .get(&(b.s(), b.t()))
+            .is_some_and(|e| e.done)
+    }
+
+    /// Whether any signature speculation exists for `b` — lets the consumer skip the assembly path
+    /// entirely (and its mask bookkeeping) when nothing was precomputed.
+    pub fn has_sig(b: Bidegree) -> bool {
+        CACHE
+            .lock()
+            .unwrap()
+            .get(&(b.s(), b.t()))
+            .is_some_and(|e| !e.sig.is_empty())
+    }
+
+    /// Collect every ready block for `b` and close the bidegree to further speculation.
+    /// Collect every ready block for `b` as `(start, matrix)` sorted by row offset, and close the
+    /// bidegree to further speculation.
+    pub fn take_all(b: Bidegree) -> Vec<(usize, Matrix)> {
+        let mut g = CACHE.lock().unwrap();
+        let e = g.entry((b.s(), b.t())).or_default();
+        e.done = true;
+        let mut out = Vec::new();
+        for (_, slot) in std::mem::take(&mut e.slots) {
+            for (start, m) in slot.pieces {
+                BYTES.fetch_sub(size_of(&m), Ordering::Relaxed);
+                out.push((start, m));
+            }
+        }
+        out.sort_by_key(|(start, _)| *start);
+        out
+    }
+
+    /// Drop every block for a bidegree that will never assemble one, and close it to further
+    /// speculation. Counted separately so the waste is visible rather than inferred.
+    /// Drop the contiguous block pieces for a bidegree that is building per signature.
+    ///
+    /// Deliberately does NOT set `done`: above the cap the bidegree still takes delivery along the
+    /// signature axis, and `done` would silence exactly that.
+    pub fn release(b: Bidegree) {
+        let mut g = CACHE.lock().unwrap();
+        let Some(e) = g.get_mut(&(b.s(), b.t())) else {
+            return;
+        };
+        for (_, slot) in std::mem::take(&mut e.slots) {
+            RELEASED.fetch_add(slot.pieces.len(), Ordering::Relaxed);
+            for (_, m) in &slot.pieces {
+                BYTES.fetch_sub(size_of(m), Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// Drop every signature piece for a bidegree that has finished its signature loop.
+    pub fn release_sig(b: Bidegree) {
+        let mut g = CACHE.lock().unwrap();
+        if let Some(e) = g.get_mut(&(b.s(), b.t())) {
+            for (_, pieces) in std::mem::take(&mut e.sig) {
+                RELEASED.fetch_add(pieces.len(), Ordering::Relaxed);
+                for (_, m) in &pieces {
+                    BYTES.fetch_sub(size_of(m), Ordering::Relaxed);
+                }
+            }
+        }
+    }
+
+    /// Book-keeping from one assembly: blocks reused, blocks absent, and the row counts behind them
+    /// (the rows are what actually matter — a hit on a one-row block saves nothing).
+    pub fn record(hits: usize, misses: usize, rows_hit: usize, rows_missed: usize) {
+        HITS.fetch_add(hits, Ordering::Relaxed);
+        MISSES.fetch_add(misses, Ordering::Relaxed);
+        ROWS_HIT.fetch_add(rows_hit, Ordering::Relaxed);
+        ROWS_MISSED.fetch_add(rows_missed, Ordering::Relaxed);
+    }
+
+    pub fn stats() -> (usize, usize, usize, usize, usize, usize, usize, usize) {
+        (
+            BUILT.load(Ordering::Relaxed),
+            HITS.load(Ordering::Relaxed),
+            MISSES.load(Ordering::Relaxed),
+            ROWS_HIT.load(Ordering::Relaxed),
+            ROWS_MISSED.load(Ordering::Relaxed),
+            DROPPED.load(Ordering::Relaxed),
+            RELEASED.load(Ordering::Relaxed),
+            BYTES.load(Ordering::Relaxed),
+        )
+    }
+
+    pub fn clear() {
+        CACHE.lock().unwrap().clear();
+        BYTES.store(0, Ordering::Relaxed);
+    }
+
+    struct Queue {
+        /// `(Reverse(t), rows, s, gen_deg)` in a MAX-heap: smallest `t` first, then most rows.
+        heap: BinaryHeap<(Reverse<i32>, usize, i32, i32)>,
+        closed: bool,
+    }
+
+    /// Pending blocks, ordered by internal degree ascending, then ROW COUNT descending.
+    ///
+    /// Blocks have DEADLINES: one is worthless the moment its bidegree runs, and equally useful any
+    /// time before. Since the queue never fully drains (36% of items built at stem 200), near blocks
+    /// expire while far ones stay valid, so imminence-first is earliest-deadline-first — the optimal
+    /// policy for meeting deadlines. Ordering by size INSTEAD threw that away and let builders spend
+    /// time on far-future blocks while imminent ones expired: row coverage fell from ~84% to 46.8%
+    /// at stem 30.
+    ///
+    /// Size belongs one level down. Within a deadline the choice is free, and there the stem-200
+    /// numbers apply: 36% of items built produced 33% of rows, i.e. selection was size-neutral, so
+    /// taking the biggest first converts the same builder time into more coverage.
+    static QUEUE: LazyLock<(Mutex<Queue>, Condvar)> = LazyLock::new(|| {
+        (
+            Mutex::new(Queue {
+                heap: BinaryHeap::new(),
+                closed: false,
+            }),
+            Condvar::new(),
+        )
+    });
+
+    pub fn open() {
+        let (m, _) = &*QUEUE;
+        let mut q = m.lock().unwrap();
+        q.heap.clear();
+        q.closed = false;
+    }
+
+    /// Smallest block worth queueing, in rows (`NASSAU_BLOCK_MIN_ROWS`).
+    ///
+    /// A block that is NOT precomputed costs the consumer nothing extra: its rows simply join the
+    /// single coalesced build it was already making. So a small block has almost no value
+    /// precomputed while still costing a queue slot, a claim, a lock, an allocation and a publish.
+    /// At stem 200 the queue carried 718 171 items; the tail is most of the bookkeeping and almost
+    /// none of the benefit.
+    pub fn min_rows() -> usize {
+        static M: LazyLock<usize> = LazyLock::new(|| {
+            std::env::var("NASSAU_BLOCK_MIN_ROWS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(1024)
+        });
+        *M
+    }
+
+    pub fn push(b: Bidegree, gen_deg: i32, rows: usize) {
+        if rows < min_rows() {
+            SKIPPED_SMALL.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        let (m, cv) = &*QUEUE;
+        let mut q = m.lock().unwrap();
+        // The block window is two-dimensional, so a lagging row can enqueue a quadratic number of
+        // items. Dropping the excess is safe: an unbuilt block is a miss, and a miss costs only the
+        // rows it covers.
+        if q.heap.len() >= queue_cap() {
+            FLOODED.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        q.heap.push((Reverse(b.t()), rows, b.s(), gen_deg));
+        Q_DEPTH.fetch_add(1, Ordering::Relaxed);
+        Q_ROWS.fetch_add(rows as u64, Ordering::Relaxed);
+        cv.notify_one();
+    }
+
+    pub fn pop() -> Option<(Bidegree, i32)> {
+        let (m, cv) = &*QUEUE;
+        let mut q = m.lock().unwrap();
+        let mut idle = std::time::Duration::ZERO;
+        loop {
+            let depth = q.heap.len();
+            if let Some((Reverse(t), popped_rows, s, gen_deg)) = q.heap.pop() {
+                Q_DEPTH.fetch_sub(1, Ordering::Relaxed);
+                Q_ROWS.fetch_sub(popped_rows as u64, Ordering::Relaxed);
+                QDEPTH_SUM.fetch_add(depth as u64, Ordering::Relaxed);
+                QDEPTH_N.fetch_add(1, Ordering::Relaxed);
+                QDEPTH_MAX.fetch_max(depth, Ordering::Relaxed);
+                IDLE_NANOS.fetch_add(idle.as_nanos() as u64, Ordering::Relaxed);
+                return Some((Bidegree::s_t(s, t), gen_deg));
+            }
+            if q.closed {
+                IDLE_NANOS.fetch_add(idle.as_nanos() as u64, Ordering::Relaxed);
+                return None;
+            }
+            let t0 = std::time::Instant::now();
+            q = cv.wait(q).unwrap();
+            idle += t0.elapsed();
+        }
+    }
+
+    pub fn closed() -> bool {
+        let (m, _) = &*QUEUE;
+        m.lock().unwrap().closed
+    }
+
+    pub fn close() {
+        let (m, cv) = &*QUEUE;
+        let mut q = m.lock().unwrap();
+        q.closed = true;
+        Q_DEPTH.store(0, Ordering::Relaxed);
+        Q_ROWS.store(0, Ordering::Relaxed);
+        q.heap.clear();
+        cv.notify_all();
+    }
+}
+
+/// Multiply work (`rows x cols`) split by whether the bidegree could use the full-matrix reuse
+/// path at all. Speculation can only ever touch the REUSE side, so this bounds the whole direction:
+/// if most of the work is on the no-reuse side, no amount of block tuning can reach it.
+/// Bidegrees actually executing right now, and its running statistics.
+///
+/// Speculation shortens each bidegree; it does not widen the WAVEFRONT, because admission is
+/// unchanged -- `(s,t)` is eligible only once `(s,t-1)` and `(s-1,t-1)` are committed, so the
+/// frontier stays a slope-1 staircase over `s`. If neither CPU nor GPU is saturated (stem 200
+/// measured ~13 of 128 cores and 11-47% GPU), the machine is waiting, and the question is whether
+/// too few bidegrees are ELIGIBLE or whether eligible ones are not being run. This counts the
+/// latter; a low mean with idle hardware means the dependency graph is the constraint and no amount
+/// of speculation or granularity tuning can matter.
+static INFLIGHT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static INFLIGHT_MAX: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static INFLIGHT_SUM: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static INFLIGHT_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+static REUSE_WORK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static REUSE_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static NOREUSE_WORK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// The same work measured in the NARROW block representation: sum over generator degrees of
+/// `rows(g) x cols(g)`, where `cols(g)` stops below generator degree `g` by minimality.
+///
+/// The full matrix pads every row to `next_dim`; the block set is triangular. The ratio says whether
+/// serving a signature's rows directly from blocks -- never materialising the full matrix -- would
+/// fit under a memory ceiling the full matrix does not. Near 0.5 that is worth building; near 1.0
+/// the triangle is too shallow and relaxing `reuse_within_cap` is the only lever left.
+static NARROW_WORK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static NOREUSE_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// A resolution of `S_2` using Nassau's algorithm.
 ///
@@ -653,6 +1761,503 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
         Ok(())
     }
 
+    /// Dimensions of the full restricted matrix at `b`: the restricted source dimension (its row
+    /// count) and the restricted target dimension (its column count), exactly as
+    /// [`Self::step_resolution_with_subalgebra`] computes them.
+    ///
+    /// Note there is no [`MilnorSubalgebra`] argument. The restriction bounds are `b.t()` and
+    /// `b.t() - 1` — properties of the bidegree, not of the signature — which is precisely why this
+    /// matrix can be built before the bidegree's subalgebra is chosen, and hence before the bidegree
+    /// runs at all. See [`speculate`].
+    fn restricted_dims(&self, b: Bidegree) -> (usize, usize) {
+        let target = &*self.modules[b.s() - 1];
+        target.compute_basis(b.t());
+        let target_dim = MilnorSubalgebra::restricted_dimension(target, b.t(), b.t());
+        let next = &self.modules[b.s() - 2];
+        next.compute_basis(b.t());
+        let next_dim = MilnorSubalgebra::restricted_dimension(next, b.t(), b.t() - 1);
+        (target_dim, next_dim)
+    }
+
+    /// The full restricted differential matrix at `b`, over every restricted source row.
+    ///
+    /// `on_cpu` forces the CPU path regardless of the GPU settings. Speculative builders use it
+    /// (`NASSAU_SPECULATE_CPU`) because the two paths compete for different resources: sampling a
+    /// stem-200 run shows GPU 0 bursting to 100% while ~120 of the 128 cores idle, so a speculative
+    /// build sent to the GPU merely queues behind the critical path, while one sent to the CPU is
+    /// nearly free AND removes a launch from the queue the critical path is waiting on.
+    fn build_full_restricted(
+        &self,
+        b: Bidegree,
+        target_dim: usize,
+        next_dim: usize,
+        on_cpu: bool,
+    ) -> Matrix {
+        let all_rows: Vec<usize> = (0..target_dim).collect();
+        let diff = &self.differentials[b.s() - 1];
+        if on_cpu {
+            restricted_partial_matrix(diff, b.t(), &all_rows, next_dim)
+        } else {
+            restricted_partial_matrix_maybe_gpu(diff, b.t(), &all_rows, next_dim)
+        }
+    }
+
+    /// The row blocks of `b`'s full restricted matrix, as `(gen_deg, start, end)` with `start..end`
+    /// the rows coming from generators of `modules[b.s() - 1]` in degree `gen_deg`.
+    ///
+    /// The blocks tile `0..target_dim` exactly and in order, because a free module's basis is
+    /// generator-major. Only reads generator counts strictly below `b.t()`, the same frozen prefix
+    /// [`MilnorSubalgebra::restricted_dimension`] reads, so it is safe to call while generators of
+    /// degree `b.t()` are being added concurrently.
+    fn block_ranges(&self, b: Bidegree) -> Vec<(i32, usize, usize)> {
+        let target = &*self.modules[b.s() - 1];
+        // Per-bidegree, NOT hoisted over the whole range: a module whose basis is computed through
+        // `max.t()` up front can no longer have generators added back into it.
+        target.compute_basis(b.t());
+        // `iter_gen_offsets` yields one entry per GENERATOR, not per generator degree — `iter_gens`
+        // flat-maps over `0..num_gens[t]`, so a degree with several generators appears several
+        // times and `start`/`end` bound one generator each. Keying blocks by degree while reading
+        // these entries one-for-one meant only the FIRST generator of each degree was ever built;
+        // every other generator silently fell through to the consumer's rebuild, which is why row
+        // coverage sat at 60-84% instead of near 100%.
+        //
+        // So the entries are kept per generator and a degree simply yields several pieces, each
+        // published as it lands. Merging them into one range per degree also covers every generator
+        // but makes the unit coarse and all-or-nothing, and coverage fell (86.3% -> 68.1% at stem
+        // 30) because fewer finished before their bidegree ran.
+        target
+            .iter_gen_offsets([b.t()])
+            .take_while(|g| g.gen_deg < b.t())
+            .filter(|g| g.end[0] > g.start[0])
+            .map(|g| (g.gen_deg, g.start[0], g.end[0]))
+            .collect()
+    }
+
+    /// EVERY signature piece for one generator degree, in a single pass.
+    ///
+    /// Returns `(sig_idx, offset within that signature's matrix, rows)`.
+    ///
+    /// Doing one signature at a time cost O(generators x ppart_table x signatures) per degree,
+    /// because it rescanned every generator and its whole operation table for each signature in
+    /// turn. At stem 200 that produced 2 988 096 tiny pieces and ran 5077 s against 3799 s for plain
+    /// blocks. Every operation has exactly ONE signature, and all signatures of a subalgebra share
+    /// the same packed MASK (it depends only on the profile), so a single pass bucketing ops by
+    /// `op.bits() & mask` does the whole degree for what one signature used to cost.
+    ///
+    /// Frontier-free for the same reason `signature_mask` is: the op indices come from
+    /// `ppart_table(t - gen_deg)` and the packed signature alone, never the module's degree-`t`
+    /// basis. The offsets count matching rows from lower generator degrees, which is what makes each
+    /// piece a contiguous run of its signature's matrix.
+    fn signature_pieces(
+        &self,
+        b: Bidegree,
+        subalgebra: &MilnorSubalgebra,
+        signatures: &[Vec<PPartEntry>],
+        gen_deg: i32,
+    ) -> Vec<(usize, usize, Vec<usize>)> {
+        let target = &*self.modules[b.s() - 1];
+        target.compute_basis(b.t());
+        let algebra = target.algebra();
+
+        let mut mask = 0u64;
+        let mut index: std::collections::HashMap<u64, usize> = std::collections::HashMap::new();
+        for (i, sig) in signatures.iter().enumerate() {
+            if let Some((m, v)) = subalgebra.packed_signature(sig) {
+                mask = m;
+                index.insert(v, i);
+            }
+        }
+        if index.is_empty() {
+            return Vec::new();
+        }
+
+        let mut starts: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+        let mut rows: std::collections::HashMap<usize, Vec<usize>> = std::collections::HashMap::new();
+        for gd in target
+            .iter_gen_offsets([b.t()])
+            .take_while(|g| g.gen_deg < b.t())
+        {
+            if gd.gen_deg > gen_deg {
+                break;
+            }
+            let table = algebra.ppart_table(b.t() - gd.gen_deg);
+            if gd.gen_deg < gen_deg {
+                for op in table {
+                    if let Some(&i) = index.get(&(op.bits() & mask)) {
+                        *starts.entry(i).or_insert(0) += 1;
+                    }
+                }
+            } else {
+                for (n, op) in table.iter().enumerate() {
+                    if let Some(&i) = index.get(&(op.bits() & mask)) {
+                        rows.entry(i).or_default().push(gd.start[0] + n);
+                    }
+                }
+            }
+        }
+        rows.into_iter()
+            .map(|(i, r)| (i, starts.get(&i).copied().unwrap_or(0), r))
+            .collect()
+    }
+
+    /// Column count for the block at `gen_deg`: the restricted dimension of `modules[b.s() - 2]`
+    /// counting only generators of degree *strictly* below `gen_deg`.
+    ///
+    /// That bound is minimality. `d(x)` for a generator `x` of degree `gen_deg` lands in the radical,
+    /// so it is a combination of `op · y` with `deg op > 0` and hence `deg y < gen_deg`; acting by
+    /// `Sq(R)` keeps the generator, so the block cannot touch a column beyond this. Building the
+    /// block this narrow is what lets it be built before `modules[b.s() - 2]` has grown to `b.t()`.
+    fn block_cols(&self, b: Bidegree, gen_deg: i32) -> usize {
+        let next = &self.modules[b.s() - 2];
+        next.compute_basis(b.t());
+        MilnorSubalgebra::restricted_dimension(next, b.t(), gen_deg.min(b.t() - 1))
+    }
+
+    /// Total size of `b`'s matrix in the narrow block representation, in `rows x cols` units.
+    fn narrow_work(&self, b: Bidegree) -> u64 {
+        self.block_ranges(b)
+            .into_iter()
+            .map(|(gen_deg, start, end)| {
+                ((end - start) as u64).saturating_mul(self.block_cols(b, gen_deg) as u64)
+            })
+            .sum()
+    }
+
+    /// Smallest piece worth precomputing, in rows (`NASSAU_SIG_MIN_ROWS`).
+    ///
+    /// Signature pieces are naturally tiny — stem 200 averaged 32 rows each — and below some size a
+    /// piece cannot repay its allocation, lock and bookkeeping. Signature mass is also very uneven
+    /// (one signature is often ~96% of its bidegree), so a threshold discards a great many pieces
+    /// while keeping nearly all the rows.
+    fn sig_min_rows() -> usize {
+        static M: LazyLock<usize> = LazyLock::new(|| {
+            std::env::var("NASSAU_SIG_MIN_ROWS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(512)
+        });
+        *M
+    }
+
+    /// Build one row block of `b`'s matrix ahead of time and park it in the [`blocks`] cache.
+    #[tracing::instrument(skip(self), fields(%b, gen_deg, rows, cols))]
+    fn speculate_block(&self, b: Bidegree, gen_deg: i32) {
+        if !blocks::has_room() {
+            blocks::bail(0);
+            return;
+        }
+        if self.has_computed_bidegree(b) {
+            blocks::bail(1);
+            return;
+        }
+        if let Some(store) = self.save_dir.store()
+            && store.exists(SaveKind::NassauDifferential, b)
+        {
+            return;
+        }
+        if !reuse_full_matrix(&self.differentials[b.s() - 1]) {
+            blocks::bail(3);
+            return;
+        }
+        // Don't precompute for a bidegree that will never collect. The consumer only assembles when
+        // the matrix is within `reuse_within_cap`; above it, it builds per signature and never calls
+        // `take_all`, so every block built here would be wasted work AND would sit in the cache
+        // until the run ended — which is where `unused=150.3GB` at stem 200 came from.
+        //
+        // The dims are read early, before the bidegree's frontier is frozen, so they are a LOWER
+        // bound on the final ones. That makes this sound in one direction only: already over the cap
+        // now means over it for good. The consumer releases whatever slips through.
+        let ranges = self.block_ranges(b);
+        if !ranges.iter().any(|&(g, _, _)| g == gen_deg) {
+            // The generators of `gen_deg` were not there after all, or contribute no rows.
+            return;
+        }
+        // The cap check reuses what `block_ranges` already computed rather than calling
+        // `restricted_dims`, which would repeat the same `compute_basis` work per block: doing that
+        // slowed the builders enough to cut row coverage from 93% to 55% at stem 30. The blocks tile
+        // the restricted source basis, so the last range's end IS the row count, and the column
+        // count is the widest block's.
+        let target_dim = ranges.last().map_or(0, |&(_, _, e)| e);
+        let next_dim = self.block_cols(b, b.t() - 1);
+        let cols = self.block_cols(b, gen_deg);
+        if cols == 0 {
+            return;
+        }
+        // Claim last, once every bail-out is behind us.
+        if !blocks::claim(b, gen_deg) {
+            blocks::bail(2);
+            return;
+        }
+        let guard = blocks::ClaimGuard::new(b, gen_deg);
+        let diff = &self.differentials[b.s() - 1];
+        let build = |rows: &[usize]| {
+            if speculate::on_cpu() {
+                restricted_partial_matrix(diff, b.t(), rows, cols)
+            } else {
+                restricted_partial_matrix_maybe_gpu(diff, b.t(), rows, cols)
+            }
+        };
+
+        if reuse_within_cap(target_dim, next_dim) {
+            // Within the cap the consumer assembles ONE full matrix, so deliver one contiguous
+            // range covering EVERY generator of this degree. Generators of a degree are adjacent,
+            // so the merged range is still contiguous.
+            //
+            // Publishing them as separate pieces instead covers the same rows but costs 17% of wall
+            // time at stem 150 (203/201 s against 172/173 s) and covers slightly LESS: ~36% more
+            // pieces means more work per queue item, so builders reach fewer degrees before the
+            // wavefront arrives. Granularity here is not free.
+            // One piece per degree covering only its FIRST generator, by default.
+            //
+            // That sounds like it leaves work on the table, and it does — but not measurably, and
+            // covering more costs. Stem 150, θ=125, one binary, interleaved:
+            //
+            //     first generator only   173 s   coverage 53.4%
+            //     merged over the degree 194 s   coverage 53.3%
+            //     one piece per generator 202 s  coverage 51.4%
+            //
+            // Coverage is flat because a degree almost always carries a single generator here, so
+            // the extra generators are nearly empty; what changes is piece size and builder load,
+            // and both bigger pieces and more pieces lose. Speculation is already at its useful
+            // limit — past it the builders just compete with the wavefront. `NASSAU_BLOCK_MERGE=1`
+            // covers every generator of the degree, for regimes where generators are denser.
+            let merge = std::env::var("NASSAU_BLOCK_MERGE").as_deref() == Ok("1");
+            let mut it = ranges.iter().filter(|&&(g, _, _)| g == gen_deg);
+            let first = *it.next().unwrap();
+            let (start, end) = if merge {
+                (
+                    first.1,
+                    it.fold(first.2, |acc, &(_, _, e)| std::cmp::max(acc, e)),
+                )
+            } else {
+                (first.1, first.2)
+            };
+            let rows: Vec<usize> = (start..end).collect();
+            let t0 = std::time::Instant::now();
+            blocks::builder_enter();
+            let m = speculate::pool().install(|| build(&rows));
+            blocks::builder_exit();
+            blocks::record_build_nanos(t0.elapsed().as_nanos() as u64);
+            blocks::publish(b, gen_deg, start, m);
+            guard.done();
+            return;
+        }
+
+        // Above the cap the consumer never assembles a full matrix -- it builds one signature at a
+        // time and discards it, which is exactly the memory bound the cap exists to hold. So deliver
+        // along the SIGNATURE axis instead: one piece per (signature, generator degree), each a
+        // contiguous run of the signature's matrix. Peak stays at one signature however large the
+        // bidegree is, so this reaches the work plain blocks cannot (86.9% of it at stem 200), and
+        // it costs no extra multiplies -- signatures partition the operations, so this is a strict
+        // refinement of the same rows.
+        let subalgebra = MilnorSubalgebra::optimal_for(b);
+        let signatures: Vec<Vec<PPartEntry>> = subalgebra.iter_signatures(b.t()).collect();
+        let pieces = self.signature_pieces(b, &subalgebra, &signatures, gen_deg);
+        let min_rows = Self::sig_min_rows();
+        speculate::pool().install(|| {
+            for (sig_idx, start, rows) in pieces {
+                if blocks::is_done(b) || !blocks::has_room() {
+                    break;
+                }
+                if rows.len() < min_rows || !blocks::claim_sig(b, gen_deg, sig_idx) {
+                    continue;
+                }
+                blocks::publish_sig(b, sig_idx, start, build(&rows));
+            }
+        });
+        guard.done();
+    }
+
+    /// Assemble `b`'s full restricted matrix from whatever row blocks were precomputed, building
+    /// everything else in a single coalesced launch.
+    ///
+    /// A missing block is cheap here — its rows simply join the build the consumer was making
+    /// anyway — which is why nothing waits on an in-flight block. The one big launch per bidegree
+    /// that [`reuse_full_matrix`] exists to create therefore survives: at worst it is the original
+    /// launch, at best it shrinks to the rows speculation did not cover.
+    fn assemble_full_restricted(&self, b: Bidegree, target_dim: usize, next_dim: usize) -> Matrix {
+        let mut full = Matrix::new(self.prime(), target_dim, next_dim);
+        let ready = blocks::take_all(b);
+        // Walk the row axis once, alternating between "a cached block covers these rows" and "these
+        // rows are mine to build". Blocks arrive sorted by offset and cannot overlap (one block per
+        // generator degree, each claimed once), but a stale one is dropped rather than trusted: a
+        // block that runs past `target_dim` or backwards over a row already covered would corrupt
+        // the matrix silently, and re-deriving those rows costs only their own multiply.
+        let mut missing: Vec<usize> = Vec::new();
+        let (mut hits, mut misses, mut rows_hit) = (0usize, 0usize, 0usize);
+        let mut cursor = 0usize;
+        for (start, m) in &ready {
+            let (start, end) = (*start, start + m.rows());
+            if start < cursor || end > target_dim || m.columns() > next_dim {
+                tracing::warn!(
+                    %b,
+                    "discarding speculative block: rows {start}..{end} x {} against {target_dim} x \
+                     {next_dim} (cursor {cursor})",
+                    m.columns(),
+                );
+                misses += 1;
+                continue;
+            }
+            missing.extend(cursor..start);
+            for (i, r) in (start..end).enumerate() {
+                full.row_mut(r).slice_mut(0, m.columns()).assign(m.row(i));
+            }
+            hits += 1;
+            rows_hit += m.rows();
+            cursor = end;
+        }
+        missing.extend(cursor..target_dim);
+        blocks::record(hits, misses, rows_hit, missing.len());
+        if blocks::opdeg_hist() {
+            let covered: std::collections::HashSet<usize> =
+                ready.iter().map(|(start, _)| *start).collect();
+            for (gen_deg, start, end) in self.block_ranges(b) {
+                blocks::record_opdeg(
+                    b.t() - gen_deg,
+                    (end - start) as u64,
+                    covered.contains(&start),
+                );
+            }
+        }
+        if !missing.is_empty() {
+            let part = restricted_partial_matrix_maybe_gpu(
+                &self.differentials[b.s() - 1],
+                b.t(),
+                &missing,
+                next_dim,
+            );
+            for (i, &r) in missing.iter().enumerate() {
+                full.row_mut(r).assign(part.row(i));
+            }
+        }
+        full
+    }
+
+
+    /// Assemble one signature's matrix from precomputed pieces, building the rest in a single
+    /// coalesced call.
+    ///
+    /// `target_mask` lists the signature's rows in layout order, so a piece covering generator
+    /// degree `g` occupies a contiguous run of it — the same walk-and-fill as
+    /// [`Self::assemble_full_restricted`], one axis over. Pieces are narrow (minimality) and the
+    /// destination is allocated at `next_dim` up front, so every write is a row copy into an
+    /// existing row: matrices are row-major, and widening one afterwards would restride every row.
+    fn assemble_signature(
+        &self,
+        b: Bidegree,
+        sig_idx: usize,
+        target_mask: &[usize],
+        next_dim: usize,
+    ) -> Matrix {
+        let ready = blocks::take_sig(b, sig_idx);
+        // Nothing precomputed: build straight into the result. Going through the assembly path
+        // anyway would allocate this matrix, build a SECOND one for the missing rows, and copy row
+        // by row -- pure overhead, and it cost 7% at stem 200 on bidegrees where no piece landed.
+        if ready.is_empty() {
+            blocks::record(0, 0, 0, target_mask.len());
+            return restricted_partial_matrix_maybe_gpu(
+                &self.differentials[b.s() - 1],
+                b.t(),
+                target_mask,
+                next_dim,
+            );
+        }
+        let mut full = Matrix::new(self.prime(), target_mask.len(), next_dim);
+        let mut missing: Vec<usize> = Vec::new();
+        let (mut hits, mut misses, mut rows_hit) = (0usize, 0usize, 0usize);
+        let mut cursor = 0usize;
+        for (start, m) in &ready {
+            let (start, end) = (*start, start + m.rows());
+            if start < cursor || end > target_mask.len() || m.columns() > next_dim {
+                tracing::warn!(
+                    %b, sig_idx,
+                    "discarding speculative signature piece: rows {start}..{end} x {} against {} x \
+                     {next_dim} (cursor {cursor})",
+                    m.columns(),
+                    target_mask.len(),
+                );
+                misses += 1;
+                continue;
+            }
+            missing.extend(cursor..start);
+            for (i, pos) in (start..end).enumerate() {
+                full.row_mut(pos).slice_mut(0, m.columns()).assign(m.row(i));
+            }
+            hits += 1;
+            rows_hit += m.rows();
+            cursor = end;
+        }
+        missing.extend(cursor..target_mask.len());
+        blocks::record(hits, misses, rows_hit, missing.len());
+        let verify = speculate::verify() && !ready.is_empty();
+        if !missing.is_empty() {
+            let rows: Vec<usize> = missing.iter().map(|&pos| target_mask[pos]).collect();
+            let part = restricted_partial_matrix_maybe_gpu(
+                &self.differentials[b.s() - 1],
+                b.t(),
+                &rows,
+                next_dim,
+            );
+            for (i, &pos) in missing.iter().enumerate() {
+                full.row_mut(pos).assign(part.row(i));
+            }
+        }
+        if verify {
+            let fresh = restricted_partial_matrix(
+                &self.differentials[b.s() - 1],
+                b.t(),
+                target_mask,
+                next_dim,
+            );
+            for r in 0..target_mask.len() {
+                assert_eq!(
+                    full.row(r).iter_nonzero().collect::<Vec<_>>(),
+                    fresh.row(r).iter_nonzero().collect::<Vec<_>>(),
+                    "assembled signature matrix mismatch at {b}, signature {sig_idx}, row {r}"
+                );
+            }
+        }
+        full
+    }
+
+    /// Build `b`'s full matrix ahead of time and park it in the [`speculate`] cache.
+    ///
+    /// Only called for `b.s() >= 2` and only once `(b.s() - 1, b.t() - 1)` is committed, which is
+    /// what makes every input frozen. Bails out whenever the result would not be used: when the
+    /// bidegree is already computed or on disk, when the reuse path is off or the matrix exceeds its
+    /// cap (in which case the consumer builds per-signature instead), or when the cache is full.
+    #[tracing::instrument(skip(self), fields(%b))]
+    fn speculate_build(&self, b: Bidegree) {
+        if self.has_computed_bidegree(b) || !speculate::has_room() {
+            return;
+        }
+        if let Some(store) = self.save_dir.store()
+            && store.exists(SaveKind::NassauDifferential, b)
+        {
+            return;
+        }
+        if !reuse_full_matrix(&self.differentials[b.s() - 1]) {
+            return;
+        }
+        let (target_dim, next_dim) = self.restricted_dims(b);
+        if !reuse_within_cap(target_dim, next_dim) {
+            return;
+        }
+        // Claim last, once every bail-out is behind us: a claim obliges us to publish, because a
+        // consumer reaching this bidegree will wait on the slot rather than build it itself.
+        if !speculate::claim(b) {
+            return;
+        }
+        let guard = speculate::ClaimGuard::new(b);
+        // Inside the speculative pool, so the build's own `par_iter`s cannot take workers from the
+        // wavefront's pool -- see [`speculate::pool`].
+        let on_cpu = speculate::on_cpu();
+        let m = speculate::pool()
+            .install(|| self.build_full_restricted(b, target_dim, next_dim, on_cpu));
+        speculate::publish(b, m);
+        guard.done();
+    }
+
     #[tracing::instrument(skip(self), fields(%b, %subalgebra, num_new_gens, density))]
     fn step_resolution_with_subalgebra(
         &self,
@@ -709,52 +2314,167 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
         };
 
         let guard = tracing::info_span!("step", signature = ?zero_sig).entered();
-        let next_mask: Vec<usize> = subalgebra
-            .signature_mask(&algebra, next, b.t(), &zero_sig, next_bound)
-            .collect();
+        let next_mask: Vec<usize> = tracing::trace_span!("zs_masks").in_scope(|| {
+            subalgebra
+                .signature_mask(&algebra, next, b.t(), &zero_sig, next_bound)
+                .collect()
+        });
         let next_masked_dim = next_mask.len();
 
         // When GPU reuse is active, build ONE full restricted matrix over every (restricted) source
         // row at degree `b.t()` in a single launch, then slice each signature's rows out of it.
         // `target_dim` is the restricted source dimension, so `0..target_dim` is exactly the row set
         // the per-signature masks partition; `next_dim` is the restricted column count.
-        let full_reuse: Option<Matrix> = if reuse_full_matrix(&self.differentials[b.s() - 1]) {
+        let full_reuse: Option<Matrix> = if reuse_full_matrix(&self.differentials[b.s() - 1])
+            && reuse_within_cap(target_dim, next_dim)
+        {
+            NARROW_WORK.fetch_add(self.narrow_work(b), std::sync::atomic::Ordering::Relaxed);
+            REUSE_WORK.fetch_add(
+                (target_dim as u64).saturating_mul(next_dim as u64),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            REUSE_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let all_rows: Vec<usize> = (0..target_dim).collect();
-            let _guard = ParallelGuard::new();
-            Some(restricted_partial_matrix_maybe_gpu(
-                &self.differentials[b.s() - 1],
-                b.t(),
-                &all_rows,
-                next_dim,
-            ))
+            // A background builder may already have this matrix. Its inputs are frozen once
+            // `(b.s() - 1, b.t() - 1)` is committed, strictly earlier than `(b.s(), b.t())` can run,
+            // so a cached matrix is the same matrix — see [`speculate`]. A shape mismatch would mean
+            // that reasoning is wrong somewhere, so say so loudly and rebuild rather than trusting
+            // it; `NASSAU_SPECULATE_VERIFY` checks the contents too.
+            let full = if blocks::enabled() {
+                let m = self.assemble_full_restricted(b, target_dim, next_dim);
+                if speculate::verify() {
+                    let fresh = self.build_full_restricted(b, target_dim, next_dim, false);
+                    for r in 0..target_dim {
+                        assert_eq!(
+                            m.row(r).iter_nonzero().collect::<Vec<_>>(),
+                            fresh.row(r).iter_nonzero().collect::<Vec<_>>(),
+                            "assembled block matrix mismatch at {b}, row {r}"
+                        );
+                    }
+                }
+                m
+            } else {
+                match speculate::take_or_claim(b) {
+                Some(m) if m.rows() == target_dim && m.columns() == next_dim => {
+                    if speculate::verify() {
+                        let fresh = self.build_full_restricted(b, target_dim, next_dim, false);
+                        for r in 0..target_dim {
+                            assert_eq!(
+                                m.row(r).iter_nonzero().collect::<Vec<_>>(),
+                                fresh.row(r).iter_nonzero().collect::<Vec<_>>(),
+                                "speculative matrix mismatch at {b}, row {r}"
+                            );
+                        }
+                    }
+                    m
+                }
+                stale => {
+                    if let Some(m) = stale {
+                        tracing::warn!(
+                            %b,
+                            "discarding speculative matrix: got {}x{}, want {target_dim}x{next_dim}",
+                            m.rows(),
+                            m.columns(),
+                        );
+                    }
+                    self.build_full_restricted(b, target_dim, next_dim, false)
+                }
+                }
+            };
+            // `NASSAU_SPLIT_VERIFY`: check the ROW-BLOCK DECOMPOSITION empirically.
+            //
+            // The speculative plan for capped-theta high stems rests on one claim: the rows of this
+            // matrix coming from generators that already exist can be computed AHEAD of the bidegree
+            // and concatenated with the rest, because rows are generator-major and the module's
+            // basis tables are append-only (`OnceVec`), so an early row block stays valid verbatim.
+            // That is an argument from data-structure semantics; this checks it against real data
+            // before anything is built on it. A row-range build must equal the corresponding rows of
+            // the all-rows build, bit for bit.
+            if std::env::var_os("NASSAU_SPLIT_VERIFY").is_some() && target_dim > 1 {
+                let mid = target_dim / 2;
+                let lo = restricted_partial_matrix_maybe_gpu(
+                    &self.differentials[b.s() - 1],
+                    b.t(),
+                    &all_rows[..mid],
+                    next_dim,
+                );
+                let hi = restricted_partial_matrix_maybe_gpu(
+                    &self.differentials[b.s() - 1],
+                    b.t(),
+                    &all_rows[mid..],
+                    next_dim,
+                );
+                for r in 0..target_dim {
+                    let split = if r < mid { lo.row(r) } else { hi.row(r - mid) };
+                    assert_eq!(
+                        full.row(r).iter_nonzero().collect::<Vec<_>>(),
+                        split.iter_nonzero().collect::<Vec<_>>(),
+                        "row-block decomposition mismatch at {b}, row {r} (mid {mid}, target_dim \
+                         {target_dim}, next_dim {next_dim})"
+                    );
+                }
+            }
+            Some(full)
         } else {
+            // How much of the run is out of reach of blocks entirely?
+            //
+            // `row_rate` only measures bidegrees that take the reuse path; a bidegree over
+            // `reuse_within_cap` builds per signature and contributes nothing to it, so a high
+            // `row_rate` is consistent with speculation being irrelevant to most of the work. This
+            // splits the total multiply work (`rows x cols`) both ways to say which.
+            if reuse_full_matrix(&self.differentials[b.s() - 1]) {
+                NARROW_WORK.fetch_add(self.narrow_work(b), std::sync::atomic::Ordering::Relaxed);
+                NOREUSE_WORK.fetch_add(
+                    (target_dim as u64).saturating_mul(next_dim as u64),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                NOREUSE_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            // This bidegree is building per signature, so nothing will ever collect its blocks.
+            // Release them here rather than leaving them pinned until the end of the run: they hold
+            // memory against `has_room()`, which would starve speculation for the bidegrees that
+            // DO collect.
+            if blocks::enabled() {
+                blocks::release(b);
+            }
             None
         };
 
-        let full_matrix = match &full_reuse {
-            Some(full) => {
-                debug_assert!(target_mask.iter().all(|&r| r < full.rows()));
-                select_rows(full, &target_mask)
-            }
-            None => {
-                let _guard = ParallelGuard::new();
-                restricted_partial_matrix_maybe_gpu(
-                    &self.differentials[b.s() - 1],
-                    b.t(),
-                    &target_mask,
-                    next_dim,
-                )
-            }
-        };
-        let mut masked_matrix =
-            AugmentedMatrix::new(p, target_masked_dim, [next_masked_dim, target_masked_dim]);
+        let full_matrix =
+            tracing::trace_span!("zs_select", rows = target_mask.len()).in_scope(|| {
+                match &full_reuse {
+                    Some(full) => {
+                        debug_assert!(target_mask.iter().all(|&r| r < full.rows()));
+                        select_rows(full, &target_mask)
+                    }
+                    None => restricted_partial_matrix_maybe_gpu(
+                        &self.differentials[b.s() - 1],
+                        b.t(),
+                        &target_mask,
+                        next_dim,
+                    ),
+                }
+            });
+        let mut masked_matrix = tracing::trace_span!(
+            "zs_assemble",
+            rows = target_masked_dim,
+            cols = next_masked_dim
+        )
+        .in_scope(|| {
+            let mut m =
+                AugmentedMatrix::new(p, target_masked_dim, [next_masked_dim, target_masked_dim]);
+            m.segment(0, 0).add_masked(&full_matrix, &next_mask);
+            m.segment(1, 1).add_identity();
+            m
+        });
 
-        masked_matrix
-            .segment(0, 0)
-            .add_masked(&full_matrix, &next_mask);
-        masked_matrix.segment(1, 1).add_identity();
-        masked_matrix.row_reduce();
-        let kernel = masked_matrix.compute_kernel();
+        tracing::trace_span!(
+            "zs_row_reduce",
+            rows = target_masked_dim,
+            cols = next_masked_dim
+        )
+        .in_scope(|| masked_matrix.row_reduce());
+        let kernel = tracing::trace_span!("zs_kernel").in_scope(|| masked_matrix.compute_kernel());
 
         Self::write_qi(
             &mut f,
@@ -782,23 +2502,30 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
         // d_{s-1} share the target module `modules[b.s() - 1]`. So route it through the same
         // (GPU-offloaded, work-gated) restricted-matrix path and apply the column mask on CPU,
         // instead of `signature_matrix`'s serial per-row CPU multiply.
-        let source_mask: Vec<usize> = subalgebra
-            .signature_mask(&algebra, &self.modules[b.s()], b.t(), &zero_sig, i32::MAX)
-            .collect();
+        let source_mask: Vec<usize> = tracing::trace_span!("zs_source_mask").in_scope(|| {
+            subalgebra
+                .signature_mask(&algebra, &self.modules[b.s()], b.t(), &zero_sig, i32::MAX)
+                .collect()
+        });
         let img_full = restricted_partial_matrix_maybe_gpu(
             &self.differentials[b.s()],
             b.t(),
             &source_mask,
             target_dim,
         );
-        let mut n = Matrix::new(p, source_mask.len(), target_masked_dim);
-        for (mut row, full_row) in std::iter::zip(n.iter_mut(), img_full.iter()) {
-            row.add_masked(full_row, 1, &target_mask);
-        }
-        n.row_reduce();
+        let mut n = tracing::trace_span!("img_assemble", rows = source_mask.len()).in_scope(|| {
+            let mut n = Matrix::new(p, source_mask.len(), target_masked_dim);
+            for (mut row, full_row) in std::iter::zip(n.iter_mut(), img_full.iter()) {
+                row.add_masked(full_row, 1, &target_mask);
+            }
+            n
+        });
+        tracing::trace_span!("img_row_reduce", rows = source_mask.len())
+            .in_scope(|| n.row_reduce());
         let next_row = n.rows();
 
-        let num_new_gens = n.extend_image(0, n.columns(), &kernel, 0).len();
+        let num_new_gens = tracing::trace_span!("extend_image")
+            .in_scope(|| n.extend_image(0, n.columns(), &kernel, 0).len());
 
         if b.t() < b.s() {
             assert_eq!(num_new_gens, 0, "Adding generators at {b}");
@@ -809,14 +2536,17 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
         let mut xs = vec![FpVector::new(p, target_dim); num_new_gens];
         let mut dxs = vec![FpVector::new(p, next_dim); num_new_gens];
 
-        for ((x, x_masked), dx) in xs
-            .iter_mut()
-            .zip_eq(n.iter().skip(next_row))
-            .zip_eq(&mut dxs)
         {
-            x.as_slice_mut().add_unmasked(x_masked, 1, &target_mask);
-            for (i, _) in x_masked.iter_nonzero() {
-                dx.as_slice_mut().add(full_matrix.row(i), 1);
+            let _s = tracing::trace_span!("zs_dx_init", gens = xs.len()).entered();
+            for ((x, x_masked), dx) in xs
+                .iter_mut()
+                .zip_eq(n.iter().skip(next_row))
+                .zip_eq(&mut dxs)
+            {
+                x.as_slice_mut().add_unmasked(x_masked, 1, &target_mask);
+                for (i, _) in x_masked.iter_nonzero() {
+                    dx.as_slice_mut().add(full_matrix.row(i), 1);
+                }
             }
         }
 
@@ -826,8 +2556,48 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
 
         drop(guard);
 
-        for signature in subalgebra.iter_signatures(b.t()) {
+        // Probe (`NASSAU_PROBE_SIG_INDEP=1`): are the signature steps independent?
+        //
+        // Each step reads `dx.entry(v)` for `v` in its own `next_mask`, then writes `dx` with rows
+        // of the *unmasked* `full_matrix`, whose support can extend outside that mask. If those
+        // writes never land on a column another step later reads, the steps are solving against an
+        // unchanging `dx` and the loop is parallelisable (solve independently, combine). If they do,
+        // the loop is a forward substitution and must stay ordered. Comparing each read against a
+        // pre-loop snapshot answers exactly that, without altering what the loop computes.
+        //
+        // MEASURED (S_2 stem 60, max_s 30, 2233 bidegrees): 27 028 of 140 614 reads — 19.2% — see a
+        // value an earlier signature wrote. So the steps are NOT independent and the loop must stay
+        // ordered: it is a forward substitution, and "solve every signature separately, then
+        // combine" would be wrong, not merely racy.
+        //
+        // That is a negative result about the LIFT only, and the lift is the cheap end. Everything
+        // above it — `sig_masks`, `sig_select` (where ~91% of `gpu_submit` lives), `sig_assemble`,
+        // `sig_row_reduce`, `sig_quasi_inverse` — reads only `full_reuse`/the differentials and
+        // never touches `dxs` or `xs`, so it CAN legally run several signatures at a time.
+        //
+        // DO NOT BOTHER: that was built (a windowed prepare stage feeding an ordered lift) and it is
+        // worthless, because the work is not spread across the signatures. Per-bidegree `step` span
+        // times over a stem-150 run, 10 738 bidegrees with >= 2 signatures:
+        //
+        //     sum of per-bidegree TOTAL signature time  4064.7 s
+        //     sum of per-bidegree MAX   signature time  3895.7 s   -> ceiling = 1.04x
+        //
+        // One signature is ~96% of its bidegree, so the ideal speedup from parallelising the loop is
+        // 4%. Measured end to end it was worse than that: a window of 4 ran 537 s against a 528 s
+        // baseline while raising mean CPU 918% -> 1306%, i.e. it burned 42% more CPU to lose 1.7%.
+        // The parallelism this resolution is missing is NOT inside a bidegree.
+        let dx_snapshot: Option<Vec<FpVector>> =
+            std::env::var_os("NASSAU_PROBE_SIG_INDEP").map(|_| dxs.clone());
+        let mut probe_reads = 0usize;
+        let mut probe_perturbed = 0usize;
+
+        for (sig_idx, signature) in subalgebra.iter_signatures(b.t()).enumerate() {
             let _guard = tracing::info_span!("step", ?signature).entered();
+            // Spans below split what used to be one opaque `step`: the run's own accounting put
+            // ~26% of worker time inside `step` but outside any named region, which is exactly the
+            // shape that produced several wrong diagnoses earlier. One span per signature is cheap
+            // (the bodies are substantial); do NOT push spans inside these loops.
+            let _sm = tracing::trace_span!("sig_masks").entered();
             target_mask.clear();
             next_mask.clear();
             target_mask.extend(subalgebra.signature_mask(
@@ -844,35 +2614,69 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                 &signature,
                 next_bound,
             ));
+            drop(_sm);
 
-            let full_matrix = match &full_reuse {
-                Some(full) => {
-                    debug_assert!(target_mask.iter().all(|&r| r < full.rows()));
-                    select_rows(full, &target_mask)
-                }
-                None => {
-                    let _guard = ParallelGuard::new();
-                    restricted_partial_matrix_maybe_gpu(
+            let full_matrix = tracing::trace_span!("sig_select", rows = target_mask.len())
+                .in_scope(|| match &full_reuse {
+                    Some(full) => {
+                        debug_assert!(target_mask.iter().all(|&r| r < full.rows()));
+                        select_rows(full, &target_mask)
+                    }
+                    // Above `reuse_within_cap` there is no full matrix to slice, so this is where
+                    // signature-axis speculation is collected.
+                    None if blocks::enabled() => {
+                        self.assemble_signature(b, sig_idx, &target_mask, next_dim)
+                    }
+                    None => restricted_partial_matrix_maybe_gpu(
                         &self.differentials[b.s() - 1],
                         b.t(),
                         &target_mask,
                         next_dim,
-                    )
-                }
-            };
+                    ),
+                });
 
-            let mut masked_matrix =
-                AugmentedMatrix::new(p, target_mask.len(), [next_mask.len(), target_mask.len()]);
-            masked_matrix
-                .segment(0, 0)
-                .add_masked(&full_matrix, &next_mask);
-            masked_matrix.segment(1, 1).add_identity();
-            masked_matrix.row_reduce();
+            let mut masked_matrix = tracing::trace_span!(
+                "sig_assemble",
+                rows = target_mask.len(),
+                cols = next_mask.len()
+            )
+            .in_scope(|| {
+                let mut m = AugmentedMatrix::new(
+                    p,
+                    target_mask.len(),
+                    [next_mask.len(), target_mask.len()],
+                );
+                m.segment(0, 0).add_masked(&full_matrix, &next_mask);
+                m.segment(1, 1).add_identity();
+                m
+            });
 
-            let qi = masked_matrix.compute_quasi_inverse();
+            // The CPU row reduction, once per signature. `gpu_row_reduce` only takes over at
+            // >= 8192^2, so every one of these is host work.
+            tracing::trace_span!(
+                "sig_row_reduce",
+                rows = target_mask.len(),
+                cols = next_mask.len()
+            )
+            .in_scope(|| masked_matrix.row_reduce());
+
+            let qi = tracing::trace_span!("sig_quasi_inverse")
+                .in_scope(|| masked_matrix.compute_quasi_inverse());
             let pivots = qi.pivots().unwrap();
             let preimage = qi.preimage();
 
+            if let Some(snap) = &dx_snapshot {
+                for (dx, dx0) in dxs.iter().zip(snap) {
+                    for &v in &next_mask {
+                        probe_reads += 1;
+                        if dx.entry(v) != dx0.entry(v) {
+                            probe_perturbed += 1;
+                        }
+                    }
+                }
+            }
+
+            let _lift = tracing::trace_span!("sig_lift", gens = xs.len()).entered();
             for (x, dx) in xs.iter_mut().zip(&mut dxs) {
                 scratch.set_scratch_vector_size(target_mask.len());
                 let mut row = 0;
@@ -890,15 +2694,25 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                     dx.as_slice_mut().add(full_matrix.row(i), 1);
                 }
             }
-            Self::write_qi(
-                &mut f,
-                &mut scratch,
-                &signature,
-                &next_mask,
-                &full_matrix,
-                &masked_matrix,
-            )?;
+            drop(_lift);
+            tracing::trace_span!("sig_write_qi").in_scope(|| {
+                Self::write_qi(
+                    &mut f,
+                    &mut scratch,
+                    &signature,
+                    &next_mask,
+                    &full_matrix,
+                    &masked_matrix,
+                )
+            })?;
         }
+        if dx_snapshot.is_some() {
+            eprintln!(
+                "[sig-probe] b={b} signatures_read_positions={probe_reads} \
+                 perturbed_by_earlier_signature={probe_perturbed}"
+            );
+        }
+
         for dx in &dxs {
             assert!(dx.is_zero(), "dx non-zero at {b}");
         }
@@ -908,6 +2722,12 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
 
         if let Some(w) = f {
             w.finish()?;
+        }
+
+        // Anything the signature loop did not collect (an unrepresentable signature, a piece that
+        // landed late) would otherwise stay pinned for the rest of the run.
+        if blocks::enabled() {
+            blocks::release_sig(b);
         }
 
         self.write_differential(b, num_new_gens, target_dim)?;
@@ -942,10 +2762,7 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                 source_dim + target_dim,
                 0,
             );
-            {
-                let _guard = ParallelGuard::new();
-                chain_map.get_matrix(matrix.segment(0, 0), t);
-            }
+            chain_map.get_matrix(matrix.segment(0, 0), t);
             matrix.segment(1, 1).add_identity();
 
             matrix.row_reduce();
@@ -981,15 +2798,31 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
         let source_dim = source_module.dimension(t);
         let target_dim = target_module.dimension(t);
 
-        let mut matrix =
-            AugmentedMatrix::<2>::new(p, target_dim, [cc_module.dimension(t), target_dim]);
-        {
-            let _guard = ParallelGuard::new();
+        // The desired image is the kernel of the augmentation `target_module -> cc_module` in this
+        // degree. Whenever the target complex is empty in degree `t` that map has a zero-dimensional
+        // codomain, so its kernel is the whole space and no computation can discover otherwise.
+        // Taking it directly skips building and row-reducing a `target_dim x target_dim` augmented
+        // identity, where `target_dim` is `dim(A_t)` -- large enough at high `t` to reach the GPU
+        // RREF path.
+        //
+        // The guard is on the codomain being empty, not on which module is being resolved, so it is
+        // not a sphere special case: every finite target module is concentrated in finitely many
+        // degrees, so past its top cell this holds for all `t`, which is almost the whole
+        // resolution. The sphere is only the extreme of it, firing from `t = 1`.
+        //
+        // When the codomain is NON-empty the reduction is still needed, but note it is wasteful
+        // there too: the kernel has codimension at most `cc_module.dimension(t)`, typically a
+        // handful, yet we materialise a full `(target_dim - c) x target_dim` basis for it.
+        let desired_image = if cc_module.dimension(t) == 0 {
+            Subspace::entire_space(p, target_dim)
+        } else {
+            let mut matrix =
+                AugmentedMatrix::<2>::new(p, target_dim, [cc_module.dimension(t), target_dim]);
             self.chain_maps[0].get_matrix(matrix.segment(0, 0), t);
-        }
-        matrix.segment(1, 1).add_identity();
-        matrix.row_reduce();
-        let desired_image = matrix.compute_kernel();
+            matrix.segment(1, 1).add_identity();
+            matrix.row_reduce();
+            matrix.compute_kernel()
+        };
 
         let mut matrix = AugmentedMatrix::<2>::new_with_capacity(
             p,
@@ -998,10 +2831,7 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
             source_dim + MAX_NEW_GENS,
             0,
         );
-        {
-            let _guard = ParallelGuard::new();
-            self.differentials[1].get_matrix(matrix.segment(0, 0), t);
-        }
+        self.differentials[1].get_matrix(matrix.segment(0, 0), t);
         matrix.segment(1, 1).add_identity();
         matrix.row_reduce();
 
@@ -1089,6 +2919,24 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
     }
 
     fn step_resolution(&self, b: Bidegree) {
+        // One guard for the whole bidegree, rather than one per inner parallel section.
+        //
+        // This is correct by construction rather than by audit. A `step_resolution` job can only be
+        // stolen onto a thread that is in rayon's steal loop, i.e. blocked at a join — and running
+        // it there is exactly the priority inversion. So a bounce never discards useful work: it
+        // declines precisely the runs that would invert. Holding the guard for the whole bidegree
+        // therefore costs nothing and removes the need to know which callee happens to enter rayon
+        // today, which the narrow per-section guards did depend on.
+        //
+        // Nesting is free: [`ParallelGuard`] counts depth, so the inner guards become depth 1+ and
+        // keep their spans.
+        //
+        // Measurement note, for whoever revisits this: a single stem-200 A/B showed the worst step
+        // improving (224 s -> 87 s) but the count of steps >=20 s rising (41 -> 67) and retries
+        // rising (1363 -> 1613). That comparison is NOT conclusive — two runs differing in nothing
+        // relevant to guarding moved 31 -> 41 and 1271 s -> 1969 s, so the noise floor is the same
+        // size as the effect. Do not "fix" this on one run's numbers.
+        let _guard = ParallelGuard::new();
         self.step_resolution_with_result(b)
             .unwrap_or_else(|e| panic!("Error computing bidegree {b}: {e}"));
     }
@@ -1138,116 +2986,392 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
         };
 
         let tracing_span = tracing::Span::current();
-        maybe_rayon::in_place_scope(|scope| {
-            let _tracing_guard = tracing_span.enter();
+        let spec_threads = speculate::threads();
+        speculate::open();
+        blocks::open();
 
-            let mut progress: Vec<i32> = vec![min_degree - 1; max_s as usize + 1];
-
-            let (sender, receiver) = mpsc::channel();
-
-            let spawn_bidegree = |b: Bidegree, sender: mpsc::Sender<SenderData>| {
-                if self.has_computed_bidegree(b) {
-                    SenderData::send(b, sender);
-                } else {
-                    let tracing_span = tracing_span.clone();
-                    scope.spawn(move |_| {
-                        let _tracing_guard = tracing_span.enter();
-                        if crate::utils::parallel::is_in_parallel() {
-                            SenderData::send_retry(b, sender);
-                            return;
+        // Speculative builders run *outside* the rayon pool on purpose. They are a background task
+        // whose whole point is to use time the wavefront is not using; putting them in the pool
+        // would let them take worker slots from the critical path, which is the opposite of the
+        // intent. `std::thread::scope` keeps them borrowing `self` without any `Arc` plumbing.
+        std::thread::scope(|spec_scope| {
+            if spec_threads > 0 && blocks::enabled() {
+                // Samples on a timer, so the depth statistic is time-weighted rather than
+                // conditioned on there being work to pop.
+                spec_scope.spawn(|| {
+                    let t0 = std::time::Instant::now();
+                    let mut ticks = 0u64;
+                    while !blocks::closed() {
+                        blocks::sample_depth();
+                        ticks += 1;
+                        // 60 Hz. The sampler reads two atomics, so this is free -- the earlier
+                        // 10 Hz limit existed only because it took the queue lock. Resolution
+                        // matters: the burst that showed speculation dying lasted under 2 s.
+                        if ticks % 30 == 0 {
+                            blocks::trace_depth(t0.elapsed().as_secs_f64());
                         }
-                        self.step_resolution(b);
-                        SenderData::send(b, sender);
-                    });
-                }
-            };
-
-            // Seed the base of every row. A bidegree `(s, min_degree)` has no in-region
-            // predecessors, so it is not spawned by the wavefront — except `(1, min_degree)`, whose
-            // diagonal predecessor `(0, min_degree)` is in region, so we let it be spawned instead.
-            for s in 0..=max_s {
-                if s != 1 {
-                    spawn_bidegree(Bidegree::s_t(s, min_degree), sender.clone());
-                }
-            }
-            drop(sender);
-
-            // Bidegrees whose spawned job was stolen onto a worker already inside a critical section
-            // (`is_in_parallel` set on that worker) and so bounced back a retry rather than causing
-            // a priority inversion. Because the check is per-thread, a job is only ever bounced when
-            // its worker is a blocked guard holder; a job picked up by a free worker just runs. Such
-            // bounces are therefore rare, but when the pool is momentarily saturated we still must
-            // avoid re-spawning immediately in a tight loop, so we park bounced bidegrees here.
-            //
-            // The scheduler thread never holds a guard, so it cannot itself observe when a worker
-            // frees; instead, while anything is parked we wait on the channel with a short timeout
-            // and retry the parked work whenever a completion arrives (a worker likely just freed)
-            // or the timeout elapses (periodic re-check). Incoming messages are still handled the
-            // instant they arrive; the timeout only governs how promptly we retry while otherwise
-            // idle. This cannot deadlock: parked entries keep their senders, so the channel stays
-            // open, and the timeout guarantees parked work is retried until a free worker takes it.
-            let mut deferred: Vec<(Bidegree, mpsc::Sender<SenderData>)> = Vec::new();
-            // How long to wait for a message before retrying parked bidegrees. Small enough that a
-            // freed worker is used promptly, large enough that the poll is negligible; it only ticks
-            // while something is parked.
-            const RETRY_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_micros(100);
-
-            loop {
-                let event = if deferred.is_empty() {
-                    // Nothing parked: block until a message arrives or all senders drop.
-                    match receiver.recv() {
-                        Ok(data) => Some(data),
-                        Err(_) => break,
+                        std::thread::sleep(std::time::Duration::from_micros(16667));
                     }
-                } else {
-                    // Something parked: wake periodically to retry it. Parked entries hold senders,
-                    // so the channel cannot be disconnected here.
-                    match receiver.recv_timeout(RETRY_POLL_INTERVAL) {
-                        Ok(data) => Some(data),
-                        Err(mpsc::RecvTimeoutError::Timeout) => None,
-                        Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                });
+            }
+            for _ in 0..spec_threads {
+                let tracing_span = tracing_span.clone();
+                spec_scope.spawn(move || {
+                    let _tracing_guard = tracing_span.enter();
+                    if blocks::enabled() {
+                        while let Some((b, gen_deg)) = blocks::pop() {
+                            self.speculate_block(b, gen_deg);
+                        }
+                    } else {
+                        while let Some(b) = speculate::pop() {
+                            self.speculate_build(b);
+                        }
+                    }
+                });
+            }
+
+            maybe_rayon::in_place_scope(|scope| {
+                let _tracing_guard = tracing_span.enter();
+
+                let mut progress: Vec<i32> = vec![min_degree - 1; max_s as usize + 1];
+
+                let (sender, receiver) = mpsc::channel();
+
+                let spawn_bidegree = |b: Bidegree, sender: mpsc::Sender<SenderData>| {
+                    if self.has_computed_bidegree(b) {
+                        SenderData::send(b, sender);
+                    } else {
+                        let tracing_span = tracing_span.clone();
+                        scope.spawn(move |_| {
+                            let _tracing_guard = tracing_span.enter();
+                            if crate::utils::parallel::is_in_parallel() {
+                                SenderData::send_retry(b, sender);
+                                return;
+                            }
+                            let n = INFLIGHT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                            INFLIGHT_MAX.fetch_max(n, std::sync::atomic::Ordering::Relaxed);
+                            self.step_resolution(b);
+                            INFLIGHT.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                            SenderData::send(b, sender);
+                        });
                     }
                 };
 
-                if let Some(SenderData { b, retry, sender }) = event {
-                    if retry {
-                        // Park until a worker frees; retried below on a completion or timeout.
-                        deferred.push((b, sender));
-                        continue;
+                // Seed the base of every row. A bidegree `(s, min_degree)` has no in-region
+                // predecessors, so it is not spawned by the wavefront — except `(1, min_degree)`, whose
+                // diagonal predecessor `(0, min_degree)` is in region, so we let it be spawned instead.
+                for s in 0..=max_s {
+                    if s != 1 {
+                        spawn_bidegree(Bidegree::s_t(s, min_degree), sender.clone());
                     }
-                    assert!(progress[b.s() as usize] == b.t() - 1);
-                    progress[b.s() as usize] = b.t();
+                }
+                drop(sender);
 
-                    // Completing `b` can only make ready its same-row successor `(s, t + 1)` and one
-                    // diagonal successor. `ready` requires *both* predecessors, so of the two
-                    // completions that could spawn a given bidegree, only the later one does.
-                    let same_row = b + Bidegree::s_t(0, 1);
-                    let diagonal = if b.s() == 0 {
-                        Bidegree::s_t(1, b.t())
+                // Bidegrees whose spawned job was stolen onto a worker already inside a critical section
+                // (`is_in_parallel` set on that worker) and so bounced back a retry rather than causing
+                // a priority inversion. Because the check is per-thread, a job is only ever bounced when
+                // its worker is a blocked guard holder; a job picked up by a free worker just runs. Such
+                // bounces are therefore rare, but when the pool is momentarily saturated we still must
+                // avoid re-spawning immediately in a tight loop, so we park bounced bidegrees here.
+                //
+                // The scheduler thread never holds a guard, so it cannot itself observe when a worker
+                // frees; instead, while anything is parked we wait on the channel with a short timeout
+                // and retry the parked work whenever a completion arrives (a worker likely just freed)
+                // or the timeout elapses (periodic re-check). Incoming messages are still handled the
+                // instant they arrive; the timeout only governs how promptly we retry while otherwise
+                // idle. This cannot deadlock: parked entries keep their senders, so the channel stays
+                // open, and the timeout guarantees parked work is retried until a free worker takes it.
+                let mut deferred: Vec<(Bidegree, mpsc::Sender<SenderData>)> = Vec::new();
+                // Diagnostic (`NASSAU_MEM_REPORT`): count committed bidegrees so we can periodically
+                // report the retained-data heap split (differentials' `outputs` vs modules' tables).
+                let mem_report = std::env::var_os("NASSAU_MEM_REPORT").is_some();
+                let mut commit_count = 0usize;
+                // How long to wait for a message before retrying parked bidegrees. Small enough that a
+                // freed worker is used promptly, large enough that the poll is negligible; it only ticks
+                // while something is parked.
+                const RETRY_POLL_INTERVAL: std::time::Duration =
+                    std::time::Duration::from_micros(100);
+
+                // Largest `t` already queued for speculation in each row, so a commit only enqueues the
+                // window it newly opened.
+                let mut spec_issued: Vec<i32> = vec![min_degree - 1; max_s as usize + 1];
+                // Block mode issues over a RECTANGLE per row -- internal degrees `t` crossed with
+                // generator degrees `gen_deg` -- so it needs the high-water mark of both axes to
+                // enqueue only what a commit newly opened. Both grow monotonically, so the new work
+                // is always two strips: the `t`s just opened (at every available `gen_deg`), and the
+                // `gen_deg`s just opened (at every `t` already in the window).
+                let mut spec_issued_g: Vec<i32> = vec![min_degree - 1; max_s as usize + 1];
+                // Enqueue every bidegree whose matrix is now determined but which cannot run yet.
+                //
+                // `(r, t)`'s matrix needs only `(r - 1, t - 1)` — i.e. `t <= progress[r - 1] + 1` —
+                // while running `(r, t)` additionally needs `(r, t - 1)`. Everything strictly between
+                // those two bounds is a bidegree we can build for but not yet run: exactly the
+                // speculation window. We start at `progress[r] + 2` because `progress[r] + 1` is the
+                // bidegree the scheduler is spawning right now, whose matrix a builder would only race.
+                //
+                // In BLOCK mode the first bound disappears: block `gen_deg` of `(r, t)` needs only
+                // `gen_deg <= min(progress[r - 1], progress[r - 2])`, for every `t > gen_deg` still
+                // in region. So the `t` window is capped only by how far ahead we are willing to
+                // speculate, and one commit opens blocks across a whole column of future bidegrees
+                // rather than a single matrix — which is the point, since the queue depth is what
+                // the GPU is starved of.
+                let enqueue_spec = |progress: &[i32],
+                                    spec_issued: &mut Vec<i32>,
+                                    spec_issued_g: &mut Vec<i32>| {
+                    if spec_threads == 0 {
+                        return;
+                    }
+                    if blocks::enabled() {
+                        let algebra = self.algebra();
+                        for r in 2..=max_s {
+                            let ri = r as usize;
+                            // Generator degrees whose rows AND columns are both frozen.
+                            let gf = std::cmp::min(progress[ri - 1], progress[ri - 2]);
+                            let hi_t = progress[ri] + 1 + blocks::ahead();
+                            let lo_t = progress[ri] + 2;
+                            let emit = |t: i32, lo_g: i32, hi_g: i32| {
+                                if !in_region(r, t) {
+                                    return;
+                                }
+                                // `gen_deg < t`: a generator of degree `t` contributes no rows to
+                                // the restricted matrix at `t`.
+                                // Row count is `num_gens[g] x dim(A_{t-g})`: both O(1) lookups, so
+                                // sizing every candidate costs nothing and lets the queue order by
+                                // it.
+                                let source = &self.modules[r - 1];
+                                for g in lo_g..=std::cmp::min(hi_g, t - 1) {
+                                    let rows = source.number_of_gens_in_degree(g)
+                                        * algebra.ppart_table(t - g).len();
+                                    blocks::push(Bidegree::s_t(r, t), g, rows);
+                                }
+                            };
+                            // Strip A: internal degrees newly in the window, at every `gen_deg`.
+                            for t in std::cmp::max(lo_t, spec_issued[ri] + 1)..=hi_t {
+                                emit(t, min_degree, gf);
+                            }
+                            // Strip B: generator degrees newly frozen, at internal degrees already
+                            // issued.
+                            for t in lo_t..=std::cmp::min(spec_issued[ri], hi_t) {
+                                emit(t, spec_issued_g[ri] + 1, gf);
+                            }
+                            spec_issued[ri] = std::cmp::max(spec_issued[ri], hi_t);
+                            spec_issued_g[ri] = std::cmp::max(spec_issued_g[ri], gf);
+                        }
+                        return;
+                    }
+                    for r in 2..=max_s {
+                        let ri = r as usize;
+                        let hi = std::cmp::min(
+                            progress[ri - 1] + 1,
+                            progress[ri] + 1 + speculate::ahead(),
+                        );
+                        let lo = std::cmp::max(spec_issued[ri] + 1, progress[ri] + 2);
+                        for t in lo..=hi {
+                            if in_region(r, t) {
+                                speculate::push(Bidegree::s_t(r, t));
+                            }
+                        }
+                        spec_issued[ri] = std::cmp::max(spec_issued[ri], hi);
+                    }
+                };
+
+                loop {
+                    let event = if deferred.is_empty() {
+                        // Nothing parked: block until a message arrives or all senders drop.
+                        match receiver.recv() {
+                            Ok(data) => Some(data),
+                            Err(_) => break,
+                        }
                     } else {
-                        b + Bidegree::s_t(1, 1)
+                        // Something parked: wake periodically to retry it. Parked entries hold senders,
+                        // so the channel cannot be disconnected here.
+                        match receiver.recv_timeout(RETRY_POLL_INTERVAL) {
+                            Ok(data) => Some(data),
+                            Err(mpsc::RecvTimeoutError::Timeout) => None,
+                            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                        }
                     };
 
-                    for cand in [same_row, diagonal] {
-                        if ready(cand.s(), cand.t(), &progress) {
-                            spawn_bidegree(cand, sender.clone());
+                    if let Some(SenderData { b, retry, sender }) = event {
+                        if retry {
+                            // Park until a worker frees; retried below on a completion or timeout.
+                            deferred.push((b, sender));
+                            continue;
+                        }
+                        assert!(progress[b.s() as usize] == b.t() - 1);
+                        INFLIGHT_SUM.fetch_add(
+                            INFLIGHT.load(std::sync::atomic::Ordering::Relaxed) as u64,
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
+                        INFLIGHT_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        progress[b.s() as usize] = b.t();
+                        enqueue_spec(&progress, &mut spec_issued, &mut spec_issued_g);
+
+                        if mem_report {
+                            commit_count += 1;
+                            if commit_count % 400 == 0 {
+                                let diff_b: usize = self
+                                    .differentials
+                                    .iter()
+                                    .map(|(_, d)| d.output_heap_bytes())
+                                    .sum();
+                                let mod_b: usize =
+                                    self.modules.iter().map(|(_, m)| m.table_heap_bytes()).sum();
+                                #[cfg(feature = "gpu")]
+                                let (res_master, res_basis) =
+                                    algebra::milnor_gpu::resident_host_bytes();
+                                #[cfg(not(feature = "gpu"))]
+                                let (res_master, res_basis) = (0usize, 0usize);
+                                #[cfg(feature = "gpu")]
+                                let (dev_master, dev_basis) =
+                                    algebra::milnor_gpu::resident_dev_bytes();
+                                #[cfg(feature = "gpu")]
+                                let (dev_pool_use, dev_pool_res) =
+                                    algebra::milnor_gpu::cubecl_device_usage();
+                                #[cfg(not(feature = "gpu"))]
+                                let ((dev_master, dev_basis), (dev_pool_use, dev_pool_res)) =
+                                    ((0usize, 0usize), (0u64, 0u64));
+                                let gb = |x: usize| x as f64 / (1u64 << 30) as f64;
+                                let gbu = |x: u64| x as f64 / (1u64 << 30) as f64;
+                                eprintln!(
+                                    "[MEM] commits={commit_count} last_b=({},{}) HOST[diff={:.1} \
+                                     mod={:.1} res_master={:.1} res_basis={:.1}]GB \
+                                     DEV[master={:.1} basis={:.1} cubecl_use={:.1} \
+                                     cubecl_reserved={:.1}]GB",
+                                    b.n(),
+                                    b.s(),
+                                    gb(diff_b),
+                                    gb(mod_b),
+                                    gb(res_master),
+                                    gb(res_basis),
+                                    gb(dev_master),
+                                    gb(dev_basis),
+                                    gbu(dev_pool_use),
+                                    gbu(dev_pool_res),
+                                );
+                            }
+                        }
+
+                        // Completing `b` can only make ready its same-row successor `(s, t + 1)` and one
+                        // diagonal successor. `ready` requires *both* predecessors, so of the two
+                        // completions that could spawn a given bidegree, only the later one does.
+                        let same_row = b + Bidegree::s_t(0, 1);
+                        let diagonal = if b.s() == 0 {
+                            Bidegree::s_t(1, b.t())
+                        } else {
+                            b + Bidegree::s_t(1, 1)
+                        };
+
+                        for cand in [same_row, diagonal] {
+                            if ready(cand.s(), cand.t(), &progress) {
+                                spawn_bidegree(cand, sender.clone());
+                            }
+                        }
+                    }
+
+                    // Retry parked bidegrees — reached after a completion (a worker likely just freed)
+                    // or a timeout (periodic re-check), but not after a retry (which `continue`s above,
+                    // so a bounced job waits out the timeout before being retried). Each re-spawned job
+                    // re-checks its own worker's flag: those on a free worker run, those stolen onto a
+                    // blocked guard holder bounce and are re-parked. This stays cheap because per-thread
+                    // bounces are rare, so `deferred` is normally empty.
+                    if !deferred.is_empty() {
+                        for (b, sender) in std::mem::take(&mut deferred) {
+                            spawn_bidegree(b, sender);
                         }
                     }
                 }
+            });
 
-                // Retry parked bidegrees — reached after a completion (a worker likely just freed)
-                // or a timeout (periodic re-check), but not after a retry (which `continue`s above,
-                // so a bounced job waits out the timeout before being retried). Each re-spawned job
-                // re-checks its own worker's flag: those on a free worker run, those stolen onto a
-                // blocked guard holder bounce and are re-parked. This stays cheap because per-thread
-                // bounces are rare, so `deferred` is normally empty.
-                if !deferred.is_empty() {
-                    for (b, sender) in std::mem::take(&mut deferred) {
-                        spawn_bidegree(b, sender);
-                    }
-                }
-            }
+            // The wavefront is done, so no further matrix can be wanted: release the builders.
+            speculate::close();
+            blocks::close();
         });
+
+        if spec_threads > 0 && blocks::enabled() {
+            let (built, hits, misses, rows_hit, rows_missed, dropped, released, bytes) =
+                blocks::stats();
+            // `row_rate` is the figure of merit, not `hit_rate`: a hit on a one-row block removes
+            // almost nothing from the consumer's launch.
+            eprintln!(
+                "[blocks] threads={spec_threads} built={built} hits={hits} misses={misses} \
+                 hit_rate={:.1}% rows_hit={rows_hit} rows_missed={rows_missed} row_rate={:.1}% \
+                 dropped={dropped} released={released} unused={:.1}GB bails(room/done/claimed/\
+                 other)={}/{}/{}/{}",
+                100.0 * hits as f64 / (hits + misses).max(1) as f64,
+                100.0 * rows_hit as f64 / (rows_hit + rows_missed).max(1) as f64,
+                bytes as f64 / (1u64 << 30) as f64,
+                blocks::bails().0,
+                blocks::bails().1,
+                blocks::bails().2,
+                blocks::bails().3,
+            );
+        } else if spec_threads > 0 {
+            let (built, hits, misses, waited, timeouts, dropped, bytes) = speculate::stats();
+            eprintln!(
+                "[speculate] threads={spec_threads} built={built} hits={hits} misses={misses} \
+                 waited={waited} timeouts={timeouts} dropped={dropped} hit_rate={:.1}% wasted={} \
+                 unused={:.1}GB",
+                100.0 * hits as f64 / (hits + misses).max(1) as f64,
+                built.saturating_sub(hits) + dropped,
+                bytes as f64 / (1u64 << 30) as f64,
+            );
+        }
+        {
+            let (qd, qmax, idle_s, build_s) = blocks::queue_stats();
+            let (twd, twe_frac) = blocks::timed_depth();
+            let twe = twe_frac * 100.0;
+            if blocks::enabled() {
+                eprintln!(
+                    "[specqueue] depth at-pop mean={qd:.1} max={qmax} | TIME-WEIGHTED mean={twd:.1} \
+                     empty={twe:.1}% | builder_idle={idle_s:.0}s builder_build={build_s:.0}s \
+                     threads={spec_threads}"
+                );
+            }
+            let n = INFLIGHT_N.load(std::sync::atomic::Ordering::Relaxed);
+            if n > 0 {
+                eprintln!(
+                    "[wavefront] in-flight bidegrees: mean={:.1} max={} (samples={n}, cores={})",
+                    INFLIGHT_SUM.load(std::sync::atomic::Ordering::Relaxed) as f64 / n as f64,
+                    INFLIGHT_MAX.load(std::sync::atomic::Ordering::Relaxed),
+                    maybe_rayon::max_num_threads(),
+                );
+            }
+        }
+        {
+            let (rw, rc) = (
+                REUSE_WORK.load(std::sync::atomic::Ordering::Relaxed),
+                REUSE_COUNT.load(std::sync::atomic::Ordering::Relaxed),
+            );
+            let (nw, nc) = (
+                NOREUSE_WORK.load(std::sync::atomic::Ordering::Relaxed),
+                NOREUSE_COUNT.load(std::sync::atomic::Ordering::Relaxed),
+            );
+            if rw + nw > 0 {
+                eprintln!(
+                    "[reuse-split] reusable={rc} bidegrees {:.1}Gwork ({:.1}%) | over-cap={nc} \
+                     bidegrees {:.1}Gwork ({:.1}%) | narrow={:.1}Gwork (ratio {:.3})",
+                    rw as f64 / 1e9,
+                    100.0 * rw as f64 / (rw + nw) as f64,
+                    nw as f64 / 1e9,
+                    100.0 * nw as f64 / (rw + nw) as f64,
+                    NARROW_WORK.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e9,
+                    NARROW_WORK.load(std::sync::atomic::Ordering::Relaxed) as f64
+                        / (rw + nw).max(1) as f64,
+                );
+            }
+        }
+        blocks::dump_opdeg();
+        speculate::clear();
+        blocks::clear();
+
+        // Eviction probe (`NASSAU_R_STATS`): dump the R-access distribution once the wavefront is done.
+        #[cfg(feature = "gpu")]
+        {
+            algebra::milnor_gpu::dump_r_stats();
+            // Which theta would have fit: see `resident_degree_cap`.
+            algebra::milnor_gpu::dump_master_by_degree();
+        }
     }
 }
 
@@ -1457,9 +3581,13 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                     mask.clear();
                     // At apply time the resolution is fully computed, so we read the full mask
                     // (no concurrently-growing generators to exclude).
-                    mask.extend(
-                        subalgebra.signature_mask(&algebra, source, b.t(), &signature, i32::MAX),
-                    );
+                    mask.extend(subalgebra.signature_mask(
+                        &algebra,
+                        source,
+                        b.t(),
+                        &signature,
+                        i32::MAX,
+                    ));
                     scratch0.set_scratch_vector_size(mask.len());
                 }
                 NassauCommand::Fix => {
@@ -1660,6 +3788,10 @@ impl<'a, M: ZeroModule<Algebra = MilnorAlgebra>> RecomputeReader<'a, M> {
             .collect();
 
         let full_matrix = {
+            // Kept while the per-section guards elsewhere were removed: this path is NOT under the
+            // whole-bidegree guard in `step_resolution`. `commands_for_signature` runs from
+            // `RecomputeReader::next`, driven by `apply_quasi_inverse_fallible` — an accessor that
+            // consumers call outside any bidegree, so nothing upstream has raised the depth.
             let _guard = ParallelGuard::new();
             restricted_partial_matrix(&self.res.differentials[s], t, &src_mask, self.next_dim)
         };
@@ -1867,5 +3999,56 @@ mod tests {
             subalgebra.iter_signatures(7).collect::<Vec<_>>(),
             vec![vec![0, 1, 0, 0], vec![0, 2, 0, 0], vec![0, 0, 1, 0],]
         );
+    }
+
+    /// The packed signature test must agree with the per-entry comparison it replaced, including
+    /// on signatures that no element can have. Packing those naively would spill bits into the
+    /// neighbouring field and select unrelated elements.
+    #[test]
+    fn packed_signature_matches_per_entry_test() {
+        // The comparison the packed mask replaced, kept here as the reference.
+        fn has_signature(profile: &[u8], ppart: PPart, signature: &[PPartEntry]) -> bool {
+            for (i, (&profile, &signature)) in profile.iter().zip(signature).enumerate() {
+                if ppart.get(i) & ((1u64 << profile) - 1) as PPartEntry != signature {
+                    return false;
+                }
+            }
+            true
+        }
+
+        let algebra = MilnorAlgebra::new(TWO, false);
+        algebra.compute_basis(60);
+
+        for profile in [
+            vec![1u8, 1, 1],
+            vec![4, 3, 2, 1],
+            vec![2, 0, 3],
+            // Wider than the fields they constrain.
+            vec![9, 9, 9, 9],
+            // Longer than a p-part can be, so the tail entries can never be non-zero.
+            vec![1; PPart::MAX_LEN + 3],
+        ] {
+            let subalgebra = MilnorSubalgebra::new(profile.clone());
+            for signature in [
+                vec![0; profile.len()],
+                (0..profile.len()).map(|i| (i % 3) as PPartEntry).collect(),
+                // An entry too wide for its field, which must match nothing.
+                (0..profile.len())
+                    .map(|i| if i == profile.len() - 1 { 255 } else { 0 })
+                    .collect(),
+            ] {
+                let packed = subalgebra.packed_signature(&signature);
+                for t in 0..=60 {
+                    for &op in algebra.ppart_table(t) {
+                        let expected = has_signature(&profile, op, &signature);
+                        let actual = packed.is_some_and(|(mask, value)| op.bits() & mask == value);
+                        assert_eq!(
+                            actual, expected,
+                            "profile {profile:?}, signature {signature:?}, element {op:?}"
+                        );
+                    }
+                }
+            }
+        }
     }
 }
