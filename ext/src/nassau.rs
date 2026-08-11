@@ -860,6 +860,11 @@ mod speculate {
 
     /// Stop the builders once the wavefront is done. Anything still queued is dropped: its bidegree
     /// has either run already or is out of region.
+    pub fn closed() -> bool {
+        let (m, _) = &*QUEUE;
+        m.lock().unwrap().closed
+    }
+
     pub fn close() {
         let (m, cv) = &*QUEUE;
         let mut q = m.lock().unwrap();
@@ -1023,6 +1028,9 @@ mod blocks {
     static IDLE_NANOS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     static BUILD_NANOS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     static SKIPPED_SMALL: AtomicUsize = AtomicUsize::new(0);
+    static TW_SUM: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    static TW_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    static TW_EMPTY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
     pub fn skipped_small() -> usize {
         SKIPPED_SMALL.load(Ordering::Relaxed)
@@ -1030,6 +1038,32 @@ mod blocks {
 
     pub fn record_build_nanos(n: u64) {
         BUILD_NANOS.fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// Time-weighted queue depth, sampled by a timer rather than at pops.
+    ///
+    /// Sampling at pops is biased by construction: a pop only happens when there is work, so the
+    /// statistic can only ever report "deep". It measured mean=133 589 while `builder_idle` showed
+    /// builders parked 91% of their thread-time — both true, describing different moments. The
+    /// producer emits a whole strip per commit, floods the queue, and builders drain it over
+    /// minutes; between bursts the queue is empty and nothing observes it.
+    pub fn sample_depth() {
+        let (m, _) = &*QUEUE;
+        let d = m.lock().unwrap().heap.len();
+        TW_SUM.fetch_add(d as u64, Ordering::Relaxed);
+        TW_N.fetch_add(1, Ordering::Relaxed);
+        if d == 0 {
+            TW_EMPTY.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// `(time-weighted mean depth, fraction of samples with an EMPTY queue)`.
+    pub fn timed_depth() -> (f64, f64) {
+        let n = TW_N.load(Ordering::Relaxed).max(1);
+        (
+            TW_SUM.load(Ordering::Relaxed) as f64 / n as f64,
+            TW_EMPTY.load(Ordering::Relaxed) as f64 / n as f64,
+        )
     }
 
     /// `(mean depth, max depth, builder idle seconds, builder build seconds)`.
@@ -1352,6 +1386,11 @@ mod blocks {
             q = cv.wait(q).unwrap();
             idle += t0.elapsed();
         }
+    }
+
+    pub fn closed() -> bool {
+        let (m, _) = &*QUEUE;
+        m.lock().unwrap().closed
     }
 
     pub fn close() {
@@ -2858,6 +2897,16 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
         // would let them take worker slots from the critical path, which is the opposite of the
         // intent. `std::thread::scope` keeps them borrowing `self` without any `Arc` plumbing.
         std::thread::scope(|spec_scope| {
+            if spec_threads > 0 && blocks::enabled() {
+                // Samples on a timer, so the depth statistic is time-weighted rather than
+                // conditioned on there being work to pop.
+                spec_scope.spawn(|| {
+                    while !blocks::closed() {
+                        blocks::sample_depth();
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                    }
+                });
+            }
             for _ in 0..spec_threads {
                 let tracing_span = tracing_span.clone();
                 spec_scope.spawn(move || {
@@ -3163,10 +3212,13 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
         }
         {
             let (qd, qmax, idle_s, build_s) = blocks::queue_stats();
+            let (twd, twe_frac) = blocks::timed_depth();
+            let twe = twe_frac * 100.0;
             if blocks::enabled() {
                 eprintln!(
-                    "[specqueue] depth mean={qd:.1} max={qmax} builder_idle={idle_s:.0}s \
-                     builder_build={build_s:.0}s threads={spec_threads}"
+                    "[specqueue] depth at-pop mean={qd:.1} max={qmax} | TIME-WEIGHTED mean={twd:.1} \
+                     empty={twe:.1}% | builder_idle={idle_s:.0}s builder_build={build_s:.0}s \
+                     threads={spec_threads}"
                 );
             }
             let n = INFLIGHT_N.load(std::sync::atomic::Ordering::Relaxed);
