@@ -1031,6 +1031,7 @@ mod blocks {
     static TW_SUM: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     static TW_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     static TW_EMPTY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    static ACTIVE_BUILDERS: AtomicUsize = AtomicUsize::new(0);
 
     pub fn skipped_small() -> usize {
         SKIPPED_SMALL.load(Ordering::Relaxed)
@@ -1055,6 +1056,42 @@ mod blocks {
         if d == 0 {
             TW_EMPTY.fetch_add(1, Ordering::Relaxed);
         }
+    }
+
+    /// One line of the queue-depth TIME SERIES, with a breakdown of what is queued.
+    ///
+    /// A mean hides the shape, and the shape is the question: enqueues are triggered by COMMITS,
+    /// and commits get sparser as bidegrees get larger, so the queue is expected to be front-loaded
+    /// and to starve later — exactly when the expensive bidegrees need it. `tmin`/`tmax` show
+    /// whether what is queued is near or far work, `rows` whether it is worth anything, and
+    /// `building` how many builders are actually occupied at that instant.
+    pub fn trace_depth(elapsed_s: f64) {
+        let (m, _) = &*QUEUE;
+        let q = m.lock().unwrap();
+        let depth = q.heap.len();
+        let mut rows = 0u64;
+        let mut tmin = i32::MAX;
+        let mut tmax = i32::MIN;
+        for &(Reverse(t), r, _, _) in q.heap.iter() {
+            rows += r as u64;
+            tmin = tmin.min(t);
+            tmax = tmax.max(t);
+        }
+        drop(q);
+        eprintln!(
+            "[qtrace] t={elapsed_s:.0}s depth={depth} rows={rows} tmin={} tmax={} building={}",
+            if depth == 0 { 0 } else { tmin },
+            if depth == 0 { 0 } else { tmax },
+            ACTIVE_BUILDERS.load(Ordering::Relaxed),
+        );
+    }
+
+    pub fn builder_enter() {
+        ACTIVE_BUILDERS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn builder_exit() {
+        ACTIVE_BUILDERS.fetch_sub(1, Ordering::Relaxed);
     }
 
     /// `(time-weighted mean depth, fraction of samples with an EMPTY queue)`.
@@ -1949,7 +1986,9 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
             };
             let rows: Vec<usize> = (start..end).collect();
             let t0 = std::time::Instant::now();
+            blocks::builder_enter();
             let m = speculate::pool().install(|| build(&rows));
+            blocks::builder_exit();
             blocks::record_build_nanos(t0.elapsed().as_nanos() as u64);
             blocks::publish(b, gen_deg, start, m);
             guard.done();
@@ -2901,8 +2940,15 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                 // Samples on a timer, so the depth statistic is time-weighted rather than
                 // conditioned on there being work to pop.
                 spec_scope.spawn(|| {
+                    let t0 = std::time::Instant::now();
+                    let mut ticks = 0u64;
                     while !blocks::closed() {
                         blocks::sample_depth();
+                        ticks += 1;
+                        // Every 2 s, emit a time-series line as well as the aggregate sample.
+                        if ticks % 20 == 0 {
+                            blocks::trace_depth(t0.elapsed().as_secs_f64());
+                        }
                         std::thread::sleep(std::time::Duration::from_millis(100));
                     }
                 });
