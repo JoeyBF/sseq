@@ -1032,6 +1032,14 @@ mod blocks {
     static TW_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     static TW_EMPTY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     static ACTIVE_BUILDERS: AtomicUsize = AtomicUsize::new(0);
+    /// Depth and queued rows maintained on push/pop, so the sampler never takes the queue lock.
+    ///
+    /// Reading them under the mutex does not work: with ~343k items and 32 builders contending, a
+    /// 100 ms sampler simply never wins the lock, and iterating the heap under it would block every
+    /// builder. The first version did both and emitted nothing at stem 200 while working fine on a
+    /// small queue.
+    static Q_DEPTH: AtomicUsize = AtomicUsize::new(0);
+    static Q_ROWS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
     pub fn skipped_small() -> usize {
         SKIPPED_SMALL.load(Ordering::Relaxed)
@@ -1049,8 +1057,7 @@ mod blocks {
     /// producer emits a whole strip per commit, floods the queue, and builders drain it over
     /// minutes; between bursts the queue is empty and nothing observes it.
     pub fn sample_depth() {
-        let (m, _) = &*QUEUE;
-        let d = m.lock().unwrap().heap.len();
+        let d = Q_DEPTH.load(Ordering::Relaxed);
         TW_SUM.fetch_add(d as u64, Ordering::Relaxed);
         TW_N.fetch_add(1, Ordering::Relaxed);
         if d == 0 {
@@ -1066,23 +1073,12 @@ mod blocks {
     /// whether what is queued is near or far work, `rows` whether it is worth anything, and
     /// `building` how many builders are actually occupied at that instant.
     pub fn trace_depth(elapsed_s: f64) {
-        let (m, _) = &*QUEUE;
-        let q = m.lock().unwrap();
-        let depth = q.heap.len();
-        let mut rows = 0u64;
-        let mut tmin = i32::MAX;
-        let mut tmax = i32::MIN;
-        for &(Reverse(t), r, _, _) in q.heap.iter() {
-            rows += r as u64;
-            tmin = tmin.min(t);
-            tmax = tmax.max(t);
-        }
-        drop(q);
         eprintln!(
-            "[qtrace] t={elapsed_s:.0}s depth={depth} rows={rows} tmin={} tmax={} building={}",
-            if depth == 0 { 0 } else { tmin },
-            if depth == 0 { 0 } else { tmax },
+            "[qtrace] t={elapsed_s:.0}s depth={} rows={} building={} built={}",
+            Q_DEPTH.load(Ordering::Relaxed),
+            Q_ROWS.load(Ordering::Relaxed),
             ACTIVE_BUILDERS.load(Ordering::Relaxed),
+            BUILT.load(Ordering::Relaxed),
         );
     }
 
@@ -1399,6 +1395,8 @@ mod blocks {
             return;
         }
         q.heap.push((Reverse(b.t()), rows, b.s(), gen_deg));
+        Q_DEPTH.fetch_add(1, Ordering::Relaxed);
+        Q_ROWS.fetch_add(rows as u64, Ordering::Relaxed);
         cv.notify_one();
     }
 
@@ -1408,7 +1406,9 @@ mod blocks {
         let mut idle = std::time::Duration::ZERO;
         loop {
             let depth = q.heap.len();
-            if let Some((Reverse(t), _, s, gen_deg)) = q.heap.pop() {
+            if let Some((Reverse(t), popped_rows, s, gen_deg)) = q.heap.pop() {
+                Q_DEPTH.fetch_sub(1, Ordering::Relaxed);
+                Q_ROWS.fetch_sub(popped_rows as u64, Ordering::Relaxed);
                 QDEPTH_SUM.fetch_add(depth as u64, Ordering::Relaxed);
                 QDEPTH_N.fetch_add(1, Ordering::Relaxed);
                 QDEPTH_MAX.fetch_max(depth, Ordering::Relaxed);
@@ -1434,6 +1434,8 @@ mod blocks {
         let (m, cv) = &*QUEUE;
         let mut q = m.lock().unwrap();
         q.closed = true;
+        Q_DEPTH.store(0, Ordering::Relaxed);
+        Q_ROWS.store(0, Ordering::Relaxed);
         q.heap.clear();
         cv.notify_all();
     }
@@ -2945,11 +2947,13 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                     while !blocks::closed() {
                         blocks::sample_depth();
                         ticks += 1;
-                        // Every 2 s, emit a time-series line as well as the aggregate sample.
-                        if ticks % 20 == 0 {
+                        // 60 Hz. The sampler reads two atomics, so this is free -- the earlier
+                        // 10 Hz limit existed only because it took the queue lock. Resolution
+                        // matters: the burst that showed speculation dying lasted under 2 s.
+                        if ticks % 30 == 0 {
                             blocks::trace_depth(t0.elapsed().as_secs_f64());
                         }
-                        std::thread::sleep(std::time::Duration::from_millis(100));
+                        std::thread::sleep(std::time::Duration::from_micros(16667));
                     }
                 });
             }
