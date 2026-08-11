@@ -1032,6 +1032,52 @@ mod blocks {
     static TW_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     static TW_EMPTY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     static ACTIVE_BUILDERS: AtomicUsize = AtomicUsize::new(0);
+    /// Rows served vs rebuilt, bucketed by OPERATION degree (`t - gen_deg`) in steps of 25.
+    ///
+    /// A block's lookahead is ~`t - gen_deg`: it becomes eligible when `progress[s-1]` reaches
+    /// `gen_deg`, and its bidegree runs when `progress[s-1]` reaches `t-1`. So blocks with `gen_deg`
+    /// near `t` have almost no warning. The claim to test is that the ~33% coverage ceiling at stem
+    /// 200 is this and not a tunable: if so, misses concentrate in the LOW operation-degree buckets
+    /// and hits in the high ones, and the row mass shifts low between stem 150 and stem 200.
+    static HIT_BY_OPDEG: [std::sync::atomic::AtomicU64; 16] =
+        [const { std::sync::atomic::AtomicU64::new(0) }; 16];
+    static MISS_BY_OPDEG: [std::sync::atomic::AtomicU64; 16] =
+        [const { std::sync::atomic::AtomicU64::new(0) }; 16];
+
+    pub fn opdeg_hist() -> bool {
+        static H: LazyLock<bool> =
+            LazyLock::new(|| std::env::var_os("NASSAU_OPDEG_HIST").is_some());
+        *H
+    }
+
+    pub fn record_opdeg(op_deg: i32, rows: u64, hit: bool) {
+        let b = ((op_deg.max(0) / 25) as usize).min(15);
+        if hit {
+            HIT_BY_OPDEG[b].fetch_add(rows, Ordering::Relaxed);
+        } else {
+            MISS_BY_OPDEG[b].fetch_add(rows, Ordering::Relaxed);
+        }
+    }
+
+    pub fn dump_opdeg() {
+        if !opdeg_hist() {
+            return;
+        }
+        for b in 0..16 {
+            let (h, m) = (
+                HIT_BY_OPDEG[b].load(Ordering::Relaxed),
+                MISS_BY_OPDEG[b].load(Ordering::Relaxed),
+            );
+            if h + m > 0 {
+                eprintln!(
+                    "[opdeg] op_deg {:>3}-{:<3} rows_hit={h} rows_missed={m} coverage={:.1}%",
+                    b * 25,
+                    b * 25 + 24,
+                    100.0 * h as f64 / (h + m) as f64,
+                );
+            }
+        }
+    }
     /// Depth and queued rows maintained on push/pop, so the sampler never takes the queue lock.
     ///
     /// Reading them under the mutex does not work: with ~343k items and 32 builders contending, a
@@ -2062,6 +2108,17 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
         }
         missing.extend(cursor..target_dim);
         blocks::record(hits, misses, rows_hit, missing.len());
+        if blocks::opdeg_hist() {
+            let covered: std::collections::HashSet<usize> =
+                ready.iter().map(|(start, _)| *start).collect();
+            for (gen_deg, start, end) in self.block_ranges(b) {
+                blocks::record_opdeg(
+                    b.t() - gen_deg,
+                    (end - start) as u64,
+                    covered.contains(&start),
+                );
+            }
+        }
         if !missing.is_empty() {
             let part = restricted_partial_matrix_maybe_gpu(
                 &self.differentials[b.s() - 1],
@@ -3304,6 +3361,7 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                 );
             }
         }
+        blocks::dump_opdeg();
         speculate::clear();
         blocks::clear();
 
