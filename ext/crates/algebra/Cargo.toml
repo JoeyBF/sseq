@@ -33,13 +33,20 @@ enum_dispatch = "0.3.13"
 # `cuda` targets the local NVIDIA card via NVRTC (needs the CUDA toolkit — wired into
 # the ext dev shell in flake.nix). Kernels are runtime-agnostic, so `wgpu` (Vulkan)
 # remains a drop-in portable fallback.
-cubecl = { version = "0.10.0", optional = true, default-features = false, features = [
+cubecl = { git = "https://github.com/tracel-ai/cubecl", tag = "v0.11.0-pre.1", optional = true, default-features = false, features = [
     "cuda",
 ] }
 # For pinning all GPU work to one CUDA stream (`StreamId`), so a single memory pool is
 # reclaimed by `memory_cleanup` — CubeCL's pools are per-stream, and rayon spreads launches
 # across threads/streams, which otherwise accumulates buffers until the card OOMs.
-cubecl-common = { version = "0.10.0", optional = true }
+cubecl-common = { git = "https://github.com/tracel-ai/cubecl", tag = "v0.11.0-pre.1", optional = true }
+# Spans around the GPU submission (see `gpu_thread`), so a worker blocked waiting for the device
+# is visible in the log instead of silent — the stalls it diagnoses emitted nothing at all.
+tracing = { version = "0.1.41", optional = true }
+# Multi-consumer job queue for the per-device GPU workers (see `gpu_thread`). std's mpsc is
+# single-consumer, so sharing one queue across devices there means a `Mutex<Receiver>`; this is an
+# actual MPMC queue, which is what the dispatch wants.
+crossbeam-channel = { version = "0.5", optional = true }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
@@ -50,8 +57,12 @@ rstest = "0.25.0"
 [features]
 default = ["odd-primes"]
 cache-multiplication = []
+# An arithmetic replacement for the Milnor basis index map. Off by default and not wired in:
+# adopting it would renumber the basis and invalidate saved resolutions. See
+# `algebra::milnor_rank`.
+milnor-rank = []
 concurrent = ["fp/concurrent", "maybe-rayon/concurrent"]
-gpu = ["dep:cubecl", "dep:cubecl-common"]
+gpu = ["dep:cubecl", "dep:cubecl-common", "dep:tracing", "dep:crossbeam-channel"]
 odd-primes = ["fp/odd-primes"]
 
 [[bench]]
@@ -70,6 +81,17 @@ harness = false
 name = "nassau_milnor"
 harness = false
 
+# GPU batched-multiply throughput / cubecl-regression bench (see benches/nassau_milnor_gpu.rs).
+# Requires `--features gpu`; without it the target compiles to a no-op main.
+[[bench]]
+name = "nassau_milnor_gpu"
+harness = false
+
 [[bench]]
 name = "seqno"
 harness = false
+
+[[bench]]
+name = "milnor_rank"
+harness = false
+required-features = ["milnor-rank"]

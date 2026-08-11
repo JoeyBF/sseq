@@ -619,6 +619,11 @@ mod logging {
             .with_max_level(tracing::Level::INFO)
             .with_span_events(FmtSpan::NEW | FmtSpan::CLOSE)
             .with_thread_ids(true)
+            // Names too, not just ids. The GPU workers are named `nassau-gpu<device>`, so without
+            // this a line from the device path reads `ThreadId(37)` and there is no way to tell
+            // WHICH device it came from — exactly what you need when checking shard balance.
+            // Rayon's pool threads are unnamed and simply print an empty name.
+            .with_thread_names(true)
             .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_default())
             .finish()
     }
@@ -637,6 +642,100 @@ mod logging {
 }
 
 pub use logging::{LogWriter, ext_tracing_subscriber, init_logging};
+
+pub(crate) mod parallel {
+
+    use std::cell::Cell;
+
+    thread_local! {
+        /// Depth of `par_iter_mut` critical sections currently entered *on this thread*.
+        ///
+        /// The priority inversion we guard against is narrow: a `step_resolution` job initiates a
+        /// `par_iter` on some rayon worker, which then blocks in the join and work-steals to stay
+        /// busy. If that blocked worker steals another (heavy, itself nested-parallel) resolution
+        /// step, that step runs on it and stalls the critical section it is blocked on. A stolen
+        /// job runs on the *same* OS thread as the worker that stole it, so a per-thread depth is
+        /// exactly the right signal: [`is_in_parallel`] reports whether *this* worker is a blocked
+        /// guard holder. A job picked up by any other worker — idle, or busy on non-critical work —
+        /// reads zero and is free to run, which is what lets independent bidegrees resolve
+        /// concurrently.
+        ///
+        /// Deliberately per-thread rather than a global count of active critical sections: a global
+        /// flag blocks *all* new work whenever *any* thread is in a critical section, which under
+        /// the relaxed wavefront (many bidegrees in flight) is nearly always, producing a retry
+        /// storm that pegs every core doing no useful work.
+        static PARALLEL_DEPTH: Cell<usize> = const { Cell::new(0) };
+    }
+
+    /// RAII guard that increments this thread's [`PARALLEL_DEPTH`] on creation and decrements it on
+    /// drop. Used to mark regions where a stolen `step_resolution` job would cause a priority
+    /// inversion, so it can be bounced back instead (see `nassau::step_resolution`).
+    ///
+    /// Carries no tracing span: one is taken per bidegree (and per recompute), not per inner
+    /// parallel section, so the span added log volume proportional to the signature count — over a
+    /// thousand span pairs per bidegree — for no diagnostic value the enclosing `step` span does
+    /// not already provide.
+    pub(crate) struct ParallelGuard {
+        _private: (),
+    }
+
+    impl ParallelGuard {
+        pub(crate) fn new() -> Self {
+            PARALLEL_DEPTH.with(|d| d.set(d.get() + 1));
+            Self { _private: () }
+        }
+    }
+
+    impl Drop for ParallelGuard {
+        fn drop(&mut self) {
+            PARALLEL_DEPTH.with(|d| d.set(d.get() - 1));
+        }
+    }
+
+    /// Whether the *current* thread is inside a `par_iter_mut` critical section, i.e. whether it is
+    /// a blocked guard holder onto which stealing a resolution step would cause a priority
+    /// inversion. See [`PARALLEL_DEPTH`].
+    pub(crate) fn is_in_parallel() -> bool {
+        PARALLEL_DEPTH.with(|d| d.get() > 0)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use std::sync::mpsc;
+
+        use super::{ParallelGuard, is_in_parallel};
+
+        /// A [`ParallelGuard`] held on one thread must not be visible on another: the whole point of
+        /// making `PARALLEL_DEPTH` thread-local is that a resolution step stolen onto a free worker
+        /// reads zero. Guards against a regression to a shared counter.
+        #[test]
+        fn parallel_guard_is_thread_local() {
+            assert!(!is_in_parallel());
+
+            let (held_tx, held_rx) = mpsc::channel();
+            let (release_tx, release_rx) = mpsc::channel();
+
+            let handle = std::thread::spawn(move || {
+                let guard = ParallelGuard::new();
+                // Visible on the thread that holds it.
+                assert!(is_in_parallel());
+                held_tx.send(()).unwrap();
+                // Keep the guard alive until the main thread has checked.
+                release_rx.recv().unwrap();
+                drop(guard);
+                // Cleared once dropped.
+                assert!(!is_in_parallel());
+            });
+
+            // Once the other thread holds the guard, it must be invisible here.
+            held_rx.recv().unwrap();
+            assert!(!is_in_parallel());
+            release_tx.send(()).unwrap();
+
+            handle.join().unwrap();
+        }
+    }
+}
 
 /// The value of the SECONDARY_JOB environment variable.
 ///

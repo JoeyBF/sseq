@@ -40,6 +40,57 @@ fn adaptive_bl(stride: usize) -> usize {
     (stride / div).clamp(1, 16)
 }
 
+/// Whether the row reduction uses its **cooperative** kernels — `panel_factor_coop`,
+/// `promote_coop`, `block_reduce_coop` — launched with `cuLaunchCooperativeKernel`
+/// and synchronized by a hand-rolled grid-wide spin barrier.
+///
+/// The cooperative launch requires **all** the grid's CTAs to be co-resident at once
+/// (the barrier spins waiting for every CTA to arrive). That holds only when this
+/// process owns the whole GPU: a kernel from another CUDA runtime sharing the device
+/// — e.g. `cubecl`'s Milnor multiply in the `algebra` crate — can occupy SMs and
+/// prevent co-residency, so the missing CTAs never reach the barrier and the resident
+/// ones spin forever (the intermittent stem-150 wedge, flat sm=100%).
+///
+/// **Off by default**, so the reduction composes safely with concurrent GPU work.
+/// The default path keeps the cooperative kernels' all-SM parallelism but replaces
+/// their in-grid `grid_sync` with kernel-boundary (stream-ordered) synchronization:
+/// the forward pass runs `pf_find_swap` then a fused `pf_step` per column (each a
+/// grid-wide reduction finalized by the last CTA to arrive — no barrier, no co-
+/// residency), promotion uses the grid-strided `promote_pivots`, and back-
+/// substitution the streamed `br_cond`/`br_xor` pair (single-CTA `block_reduce_rref`
+/// below stride 1024). None launch cooperatively, so none can deadlock. The residual
+/// cost is the forward pass's per-column relaunch vs the persistent cooperative grid:
+/// ~2× at n≈2¹⁷, shrinking with size (~1.4× total at 2¹⁸, converging as the O(cols)
+/// launch term is dwarfed by the O(cols²) work). Set `FP_CUDA_RR_COOP=1` to opt into
+/// the cooperative path on a dedicated GPU.
+fn rr_coop() -> bool {
+    std::env::var("FP_CUDA_RR_COOP")
+        .map(|v| v != "0" && !v.is_empty())
+        .unwrap_or(false)
+}
+
+/// Whether the GEMM uses its **cluster** kernel, `matmul_b1_kernel`
+/// (`__cluster_dims__(CLUSTER,1,1)` plus TMA multicast of the B panel).
+///
+/// This is the same trade as [`rr_coop`], one layer down. A thread-block cluster is
+/// co-resident *by construction*: the hardware will not place one CTA of a cluster
+/// without placing them all, because rank 0 multicasts B directly into its mates'
+/// shared memory and every consumer arrives on their empty barriers through `mapa`.
+/// So when another runtime holds SMs, the launch does not queue for a slot the way an
+/// ordinary grid does — it fails outright with `CUDA_ERROR_LAUNCH_FAILED`.
+///
+/// **Off by default**, so the GEMM composes with concurrent GPU work at any grid size.
+/// The default `matmul_b1_kernel_nc` runs the identical tile schedule and arithmetic
+/// with independent CTAs, paying for B once per CTA instead of once per cluster — at
+/// most 2× B's HBM traffic, on top of the ~8× that GROUP_M rasterization already saves.
+/// Set `FP_CUDA_GEMM_COOP=1` to opt into the cluster kernel on a dedicated GPU, where
+/// it is the faster of the two.
+fn gemm_coop() -> bool {
+    std::env::var("FP_CUDA_GEMM_COOP")
+        .map(|v| v != "0" && !v.is_empty())
+        .unwrap_or(false)
+}
+
 /// Lets us pass a `CUtensorMap` by value as a (grid-constant) kernel argument
 /// through cudarc's typed launch builder. `repr(transparent)` so the pointer
 /// cudarc pushes is the address of the 128-byte descriptor itself.
@@ -72,12 +123,17 @@ pub struct GpuContext {
     #[allow(dead_code)]
     module: Arc<CudaModule>,
     kernel: CudaFunction,
+    /// Cluster-free GEMM (`matmul_b1_kernel_nc`): same arithmetic, ordinary grid.
+    kernel_nc: CudaFunction,
     // Device-resident packing/epilogue kernels for the row-reduction port.
     pack_a: CudaFunction,
     pack_b: CudaFunction,
     xor_into: CudaFunction,
     panel_factor: CudaFunction,
     panel_factor_coop: CudaFunction,
+    pf_find_swap: CudaFunction,
+    pf_step: CudaFunction,
+    pf_xor: CudaFunction,
     mark_live: CudaFunction,
     promote_pivots: CudaFunction,
     promote_coop: CudaFunction,
@@ -85,21 +141,32 @@ pub struct GpuContext {
     gather_rows: CudaFunction,
     block_reduce_rref: CudaFunction,
     block_reduce_coop: CudaFunction,
+    br_cond: CudaFunction,
+    br_xor: CudaFunction,
     gather_cols: CudaFunction,
     xor_into_perm: CudaFunction,
 }
 
 impl GpuContext {
     pub fn new(device_id: usize) -> Result<Self, Box<dyn std::error::Error>> {
+        // NOTE: this retains the device *primary* context, which the cubecl Milnor-multiply runtime
+        // also retains (`cubecl-cuda/src/runtime.rs`, `primary_ctx::retain`), so both CUDA consumers
+        // share one context. Giving the row reduction its own non-primary context was tried as a fix
+        // for the cross-runtime `CUDA_ERROR_LAUNCH_FAILED` and did NOT help (3/3 runs still died):
+        // the fault is device contention, not shared context state. See [`fp::gpu_lock`].
         let ctx = CudaContext::new(device_id)?;
         let ptx = Ptx::from_src(String::from_utf8(PTX_IMAGE.to_vec())?);
         let module = ctx.load_module(ptx)?;
         let kernel = module.load_function("matmul_b1_kernel")?;
+        let kernel_nc = module.load_function("matmul_b1_kernel_nc")?;
         let pack_a = module.load_function("pack_a")?;
         let pack_b = module.load_function("pack_b")?;
         let xor_into = module.load_function("xor_into")?;
         let panel_factor = module.load_function("panel_factor")?;
         let panel_factor_coop = module.load_function("panel_factor_coop")?;
+        let pf_find_swap = module.load_function("pf_find_swap")?;
+        let pf_step = module.load_function("pf_step")?;
+        let pf_xor = module.load_function("pf_xor")?;
         let mark_live = module.load_function("mark_live")?;
         let promote_pivots = module.load_function("promote_pivots")?;
         let promote_coop = module.load_function("promote_coop")?;
@@ -107,17 +174,23 @@ impl GpuContext {
         let gather_rows = module.load_function("gather_rows")?;
         let block_reduce_rref = module.load_function("block_reduce_rref")?;
         let block_reduce_coop = module.load_function("block_reduce_coop")?;
+        let br_cond = module.load_function("br_cond")?;
+        let br_xor = module.load_function("br_xor")?;
         let gather_cols = module.load_function("gather_cols")?;
         let xor_into_perm = module.load_function("xor_into_perm")?;
         Ok(Self {
             ctx,
             module,
             kernel,
+            kernel_nc,
             pack_a,
             pack_b,
             xor_into,
             panel_factor,
             panel_factor_coop,
+            pf_find_swap,
+            pf_step,
+            pf_xor,
             mark_live,
             promote_pivots,
             promote_coop,
@@ -125,6 +198,8 @@ impl GpuContext {
             gather_rows,
             block_reduce_rref,
             block_reduce_coop,
+            br_cond,
+            br_xor,
             gather_cols,
             xor_into_perm,
         })
@@ -142,6 +217,36 @@ impl GpuContext {
 
     pub fn default_stream(&self) -> Arc<CudaStream> {
         self.ctx.default_stream()
+    }
+
+    /// A CUDA stream **private to the calling OS thread**, created lazily on first use and reused
+    /// thereafter. Every row-reduction method submits through this instead of the context's single
+    /// `default_stream()`, so work from different rayon workers runs on distinct streams —
+    /// overlapping transfers and kernels concurrently instead of serializing — while every
+    /// sub-launch of one reduce shares one stream (correct ordering within a thread). This is what
+    /// lets `try_row_reduce` run lock-free from many threads at once.
+    ///
+    /// Assumes a single process-wide `GpuContext` (the `OnceLock` in `fp::blas::cuda`): the
+    /// thread-local caches the stream by thread, not by context, so the first context to call this
+    /// on a given thread owns that thread's stream. With one context that is always correct.
+    pub fn stream(&self) -> Arc<CudaStream> {
+        use std::cell::RefCell;
+        thread_local! {
+            static TLS: RefCell<Option<Arc<CudaStream>>> = const { RefCell::new(None) };
+        }
+        TLS.with(|cell| {
+            let mut slot = cell.borrow_mut();
+            // If stream creation fails (e.g. the context is already poisoned by another runtime's
+            // launch failure), fall back to the context default stream rather than panicking: the
+            // subsequent op then fails as a normal `Err`, which `try_row_reduce` turns into a CPU
+            // fallback instead of crashing the process.
+            slot.get_or_insert_with(|| {
+                self.ctx
+                    .new_stream()
+                    .unwrap_or_else(|_| self.ctx.default_stream())
+            })
+            .clone()
+        })
     }
 
     pub fn kernel(&self) -> &CudaFunction {
@@ -218,7 +323,7 @@ fn matmul_b1_inner(
     let n_groups = n_lim.div_ceil(NG as usize);
     let n_padded_lim = n_groups * NG as usize;
 
-    let stream = gpu.ctx.default_stream();
+    let stream = gpu.stream();
 
     let a_padded = pad_2d(a, m, k.div_ceil(64), m_padded, k_padded / 64);
     let b_padded = pad_2d(b, k, n_lim, k_padded, n_lim);
@@ -315,8 +420,17 @@ fn run_gemm_kernel(
     let smem_u64 = STAGES * tile_a + STAGES * tile_b + 2 * NG as usize * TILE_M + 2 * STAGES;
     let smem_bytes = (smem_u64 * std::mem::size_of::<u64>()) as u32;
 
+    // Which GEMM variant runs. The cluster kernel is faster but its
+    // `__cluster_dims__` requires CLUSTER co-resident CTAs, which a launch onto a
+    // GPU somebody else is using cannot get -- see [`gemm_coop`]. Default is the
+    // composable one.
+    let coop = gemm_coop();
+    let kf = if coop { &gpu.kernel } else { &gpu.kernel_nc };
+    // CTA granule the grid must be a multiple of: a whole cluster, or nothing.
+    let gran = if coop { CLUSTER as u32 } else { 1 };
+
     // Opt in to >48 KB shared memory (Hopper static default cap).
-    gpu.kernel.set_attribute(
+    kf.set_attribute(
         sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
         smem_bytes as i32,
     )?;
@@ -340,11 +454,31 @@ fn run_gemm_kernel(
         .ctx
         .attribute(sys::CUdevice_attribute_enum::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)?
         as u32;
-    let occ = gpu
-        .kernel
+    let occ = kf
         .occupancy_max_active_blocks_per_multiprocessor(THREADS, smem_bytes as usize, None)?
         .max(1);
-    let mut num_ctas = (occ * sms / CLUSTER as u32).max(1) * CLUSTER as u32;
+    // How much of the machine to ask for. Under the cluster kernel a grid sized to full occupancy
+    // is only placeable on a GPU this process owns outright: when anything else holds SMs — the
+    // cubecl Milnor multiply in `algebra`, or simply another tenant — the launch is not queued, it
+    // fails, as a bare `CUDA_ERROR_LAUNCH_FAILED` that compute-sanitizer cannot attribute (0 invalid
+    // accesses across a whole run: it was never a memory bug). Shrinking the grid reduces the
+    // collision probability but never proves it to zero — the safe size is not a sharp threshold
+    // (on the theta=125 stem-200 workload 1/16 ran clean while 1/8 failed 74 times), and it costs
+    // most of the throughput (`bench_kernel_only`, 16384^3, idle H200: 1062 binary TOPS at 16 CTAs
+    // and 2107 at 32, against 8674 at full grid).
+    //
+    // The cluster-free kernel has no such constraint — its CTAs are independent, so the launch
+    // queues like any other — and therefore takes the whole machine by default. That is the point of
+    // it: composability without paying the share.
+    //
+    // `FP_CUDA_GEMM_DEVICE_FRAC` overrides either default (1 = whole machine). Under the cluster
+    // kernel treat any value as a risk setting, not a guarantee.
+    let frac = std::env::var("FP_CUDA_GEMM_DEVICE_FRAC")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .filter(|&f| f > 0)
+        .unwrap_or(if coop { 16 } else { 1 });
+    let mut num_ctas = ((occ * sms / frac) / gran).max(1) * gran;
     // Diagnostic: cap the persistent grid to probe how much of a small GEMM's
     // time is the persistent-grid startup (cluster sync + mbar init + pipeline
     // fill across occ×SMs CTAs). The persistent loop handles any multiple of
@@ -353,7 +487,7 @@ fn run_gemm_kernel(
         .ok()
         .and_then(|v| v.parse::<u32>().ok())
     {
-        num_ctas = (cap / CLUSTER as u32).max(1) * CLUSTER as u32;
+        num_ctas = (cap / gran).max(1) * gran;
     }
 
     let ta = TmaArg(tma_a);
@@ -370,7 +504,7 @@ fn run_gemm_kernel(
             block_dim: (THREADS, 1, 1),
             shared_mem_bytes: smem_bytes,
         };
-        let mut lb = stream.launch_builder(&gpu.kernel);
+        let mut lb = stream.launch_builder(kf);
         lb.arg(&ta)
             .arg(&tb)
             .arg(&tc)
@@ -463,7 +597,7 @@ impl GpuContext {
         let n_groups = n_lim.div_ceil(NG as usize);
         let n_padded_lim = n_groups * NG as usize;
 
-        let stream = self.ctx.default_stream();
+        let stream = self.stream();
 
         // Pack A → interleaved row-major K-major tiles (m_padded × k_padded/64).
         // pack_a/pack_b/the GEMM fully overwrite these buffers (padding written as
@@ -578,7 +712,7 @@ impl GpuContext {
         n: usize,
     ) -> Result<Vec<u64>, Box<dyn std::error::Error>> {
         let n_lim = n.div_ceil(64);
-        let stream = self.ctx.default_stream();
+        let stream = self.stream();
         let a_dev = stream.clone_htod(a)?;
         let b_dev = stream.clone_htod(b)?;
         let (c_dev, n_padded_lim) = self.matmul_b1_dev(&a_dev, m, k, &b_dev, n)?;
@@ -600,7 +734,7 @@ impl GpuContext {
     ) -> Result<DeviceMatrix, Box<dyn std::error::Error>> {
         let stride = cols.div_ceil(64);
         assert_eq!(data.len(), rows * stride, "limb count mismatch");
-        let buf = self.ctx.default_stream().clone_htod(data)?;
+        let buf = self.stream().clone_htod(data)?;
         Ok(DeviceMatrix {
             buf,
             rows,
@@ -611,12 +745,12 @@ impl GpuContext {
 
     /// Download a [`DeviceMatrix`] back to host limbs (natural layout). One D2H.
     pub fn download(&self, dm: &DeviceMatrix) -> Result<Vec<u64>, Box<dyn std::error::Error>> {
-        Ok(self.ctx.default_stream().clone_dtoh(&dm.buf)?)
+        Ok(self.stream().clone_dtoh(&dm.buf)?)
     }
 
     /// Download a device `u32` buffer (e.g. a `perm` vector) to host.
     pub fn download_u32(&self, s: &CudaSlice<u32>) -> Result<Vec<u32>, Box<dyn std::error::Error>> {
-        Ok(self.ctx.default_stream().clone_dtoh(s)?)
+        Ok(self.stream().clone_dtoh(s)?)
     }
 
     /// The fused trailing-update / back-substitution epilogue over persistent
@@ -653,7 +787,7 @@ impl GpuContext {
         }
         let (c_dev, _n_padded_lim) = self.matmul_b1_dev(&l.buf, m, k, &u.buf, t)?;
         let width = t.div_ceil(64); // == dst.stride - col_off/64
-        let stream = self.ctx.default_stream();
+        let stream = self.stream();
         self.xor_into_region(
             &stream,
             &mut dst.buf,
@@ -673,7 +807,7 @@ impl GpuContext {
     /// are `perm` swaps, so the matrix bytes never move.
     pub fn identity_perm(&self, m: usize) -> Result<CudaSlice<u32>, Box<dyn std::error::Error>> {
         let host: Vec<u32> = (0..m as u32).collect();
-        Ok(self.ctx.default_stream().clone_htod(&host)?)
+        Ok(self.stream().clone_htod(&host)?)
     }
 
     /// Factor one 64-bit column panel (limb `plimb`) in place over the
@@ -698,7 +832,7 @@ impl GpuContext {
     ) -> Result<(usize, Vec<u32>), Box<dyn std::error::Error>> {
         assert_eq!(perm.len(), m.rows, "perm length must equal rows");
         assert_eq!(l.rows, m.rows, "L rows must equal M rows");
-        let stream = self.ctx.default_stream();
+        let stream = self.stream();
 
         const THREADS: u32 = 256;
         let pivcols = stream.alloc_zeros::<u32>(64)?;
@@ -758,7 +892,7 @@ impl GpuContext {
         assert_eq!(l.rows, m.rows, "L rows must equal M rows");
         assert!(l.stride >= bl, "L stride must be at least bl");
         assert!(m_active <= m.rows && m_active >= r, "m_active out of range");
-        let stream = self.ctx.default_stream();
+        let stream = self.stream();
 
         const THREADS: u32 = 256;
         let smem = THREADS * std::mem::size_of::<i32>() as u32;
@@ -830,6 +964,169 @@ impl GpuContext {
         Ok((pr, cols[..pr].to_vec()))
     }
 
+    /// **Streamed** (kernel-boundary) equivalent of
+    /// [`panel_factor_coop`](Self::panel_factor_coop): identical math and the same
+    /// all-SM parallelism, but each of the ≤ `bl·64` sequential bit-steps is three
+    /// ordinary grid-wide launches (`pf_find` → `pf_swap` → `pf_xor`) whose stream
+    /// ordering replaces the cooperative kernel's in-grid `grid_sync`. No
+    /// `cuLaunchCooperativeKernel`, so no all-CTAs-co-resident requirement — it
+    /// composes with a concurrent kernel from another CUDA runtime instead of
+    /// deadlocking the grid barrier. All per-step state (`g_pr`, `g_min`,
+    /// `g_pivpos`, `g_pivword`) lives on the device, so the host issues every launch
+    /// without a readback and their latency hides behind the GPU work; only the
+    /// final `(pr, pivcols)` is copied back. Bit-for-bit equal to the coop kernel.
+    #[allow(clippy::too_many_arguments)]
+    pub fn panel_factor_streamed(
+        &self,
+        m: &mut DeviceMatrix,
+        perm: &mut CudaSlice<u32>,
+        l: &mut DeviceMatrix,
+        ppanel: usize,
+        bl: usize,
+        r: usize,
+        m_active: usize,
+    ) -> Result<(usize, Vec<u32>), Box<dyn std::error::Error>> {
+        assert_eq!(perm.len(), m.rows, "perm length must equal rows");
+        assert_eq!(l.rows, m.rows, "L rows must equal M rows");
+        assert!(l.stride >= bl, "L stride must be at least bl");
+        assert!(m_active <= m.rows && m_active >= r, "m_active out of range");
+        let stream = self.stream();
+
+        const THREADS: u32 = 256;
+        const INF: i32 = 0x7fff_ffff;
+        let smem = THREADS * std::mem::size_of::<i32>() as u32;
+
+        // Device-resident per-step state: pivot count, find-first result (INF =
+        // none), this step's pivot position (pf_xor's guard), the pivot row's bl
+        // panel limbs, and the last-CTA-finalize arrival counter. g_min starts INF;
+        // g_pr and arrival start 0 (arrival self-resets to 0 each step).
+        let pivcols = stream.alloc_zeros::<u32>(bl * 64)?;
+        let mut g_pr = stream.alloc_zeros::<u32>(1)?;
+        let mut g_min = stream.clone_htod(&[INF])?;
+        let g_pivpos = stream.alloc_zeros::<i32>(1)?;
+        let mut g_pivword = stream.alloc_zeros::<u64>(bl)?;
+        let mut arrival = stream.alloc_zeros::<u32>(1)?;
+
+        // Regular launches wave-schedule, so the grid can be sized purely to cover
+        // the active rows once; cap at occ×SMs for launch efficiency.
+        let sms = self
+            .ctx
+            .attribute(sys::CUdevice_attribute_enum::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)?
+            as u32;
+        let occ = self
+            .pf_xor
+            .occupancy_max_active_blocks_per_multiprocessor(THREADS, 0, None)?
+            .max(1);
+        let rows_worth = (m_active as u32).div_ceil(THREADS).max(1);
+        let num_ctas = (occ * sms).min(rows_worth).max(1);
+        // Each step's grid-wide min-reduce + last-CTA finalize contends on g_min /
+        // arrival across all CTAs, so — like the cooperative kernel's FP_CUDA_PF_CTAS
+        // — a smaller grid makes every step cheaper once it still covers the rows.
+        // Cap at 128 (H200 sweet spot); overridable.
+        let num_ctas = std::env::var("FP_CUDA_PF_CTAS")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(128)
+            .clamp(1, num_ctas);
+
+        let (r_u, m_u, n_u, stride_u, l_stride_u, ppanel_u, bl_u) = (
+            r as u32,
+            m_active as u32,
+            m.cols as u32,
+            m.stride as u32,
+            l.stride as u32,
+            ppanel as u32,
+            bl as u32,
+        );
+        let find_cfg = LaunchConfig {
+            grid_dim: (num_ctas, 1, 1),
+            block_dim: (THREADS, 1, 1),
+            shared_mem_bytes: smem,
+        };
+        let grid_cfg = LaunchConfig {
+            grid_dim: (num_ctas, 1, 1),
+            block_dim: (THREADS, 1, 1),
+            shared_mem_bytes: 0,
+        };
+
+        // Valid columns in this panel (the last panel may be short).
+        let ncols = (bl * 64).min(m.cols - ppanel * 64);
+
+        // (0) find+swap the first column's pivot (no trailing XOR yet).
+        {
+            let (plimb_u, j_u, cc_u) = (ppanel_u, 0u32, 0u32);
+            let mut lb = stream.launch_builder(&self.pf_find_swap);
+            lb.arg(&mut m.buf)
+                .arg(&mut *perm)
+                .arg(&pivcols)
+                .arg(&mut g_pivword)
+                .arg(&mut g_min)
+                .arg(&mut g_pr)
+                .arg(&g_pivpos)
+                .arg(&mut arrival)
+                .arg(&ppanel_u)
+                .arg(&bl_u)
+                .arg(&j_u)
+                .arg(&plimb_u)
+                .arg(&cc_u)
+                .arg(&r_u)
+                .arg(&m_u)
+                .arg(&stride_u)
+                .arg(&n_u);
+            unsafe { lb.launch(find_cfg) }?;
+        }
+
+        // (1) fused lookahead: each step clears column cc-1 and finds+swaps column
+        // cc — one launch per column instead of two, with the row read once.
+        for cc in 1..ncols {
+            let cc_u = cc as u32;
+            let mut lb = stream.launch_builder(&self.pf_step);
+            lb.arg(&mut m.buf)
+                .arg(&mut *perm)
+                .arg(&mut l.buf)
+                .arg(&pivcols)
+                .arg(&mut g_pivword)
+                .arg(&mut g_min)
+                .arg(&mut g_pr)
+                .arg(&g_pivpos)
+                .arg(&mut arrival)
+                .arg(&ppanel_u)
+                .arg(&bl_u)
+                .arg(&cc_u)
+                .arg(&r_u)
+                .arg(&m_u)
+                .arg(&stride_u)
+                .arg(&l_stride_u)
+                .arg(&n_u);
+            unsafe { lb.launch(find_cfg) }?;
+        }
+
+        // (2) clear the final column's pivot from the rows below.
+        {
+            let (cc_u, j_u) = ((ncols - 1) as u32, ((ncols - 1) & 63) as u32);
+            let mut lb = stream.launch_builder(&self.pf_xor);
+            lb.arg(&mut m.buf)
+                .arg(&*perm)
+                .arg(&mut l.buf)
+                .arg(&g_pivword)
+                .arg(&g_pivpos)
+                .arg(&g_pr)
+                .arg(&ppanel_u)
+                .arg(&bl_u)
+                .arg(&cc_u)
+                .arg(&j_u)
+                .arg(&r_u)
+                .arg(&m_u)
+                .arg(&stride_u)
+                .arg(&l_stride_u);
+            unsafe { lb.launch(grid_cfg) }?;
+        }
+
+        let pr = stream.clone_dtoh(&g_pr)?[0] as usize;
+        let cols = stream.clone_dtoh(&pivcols)?;
+        Ok((pr, cols[..pr].to_vec()))
+    }
+
     /// Active-row compaction (design §8.2): mark the below rows [r, m_active)
     /// that are entirely zero across the remaining columns [start_limb·64, n) —
     /// permanently dead (they can never pivot and carry no multiplier) — and
@@ -849,7 +1146,7 @@ impl GpuContext {
         if m_active <= r {
             return Ok(m_active);
         }
-        let stream = self.ctx.default_stream();
+        let stream = self.stream();
         let n_scan = m_active - r;
         let live = unsafe { stream.alloc::<u32>(n_scan) }?;
         {
@@ -911,7 +1208,7 @@ impl GpuContext {
         if pr == 0 || trailing_limbs == 0 {
             return Ok(());
         }
-        let stream = self.ctx.default_stream();
+        let stream = self.stream();
         stream.memset_zeros(pc_barrier)?;
         let (r_u, pr_u, fl, tl, st, ls, llo, tc) = (
             r_piv as u32,
@@ -968,7 +1265,7 @@ impl GpuContext {
         pc_cond: &CudaSlice<u32>,
         pc_ctas: u32,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let stream = self.ctx.default_stream();
+        let stream = self.stream();
         let (rows, stride, n) = (m.rows, m.stride, m.cols);
         let trailing_limbs = end_limb - first_limb;
         if pr == 0 || trailing_limbs == 0 {
@@ -1071,15 +1368,23 @@ impl GpuContext {
         &self,
         m: &mut DeviceMatrix,
     ) -> Result<(CudaSlice<u32>, usize, Vec<usize>), Box<dyn std::error::Error>> {
-        let stream = self.ctx.default_stream();
+        let stream = self.stream();
         let (rows, stride) = (m.rows, m.stride);
         let mut perm = self.identity_perm(rows)?;
         let mut r = 0usize;
         let mut pivot_cols = Vec::new();
+        // Cooperative vs. composable kernels (see [`rr_coop`]). The non-cooperative
+        // path never launches a cooperative grid, so it composes with concurrent GPU
+        // work at the cost of the single-CTA panel factor; the cooperative path is the
+        // faster exclusive-GPU mode.
+        let coop = rr_coop();
+
         // Panel width in limbs (b = 64·bl columns). Wider panels raise the
         // trailing GEMM's contraction dimension pr toward b, reclaiming the ~16×
         // K-padding waste. Override with FP_CUDA_BL; otherwise adaptive_bl picks
-        // the measured optimum (flat at bl≈12–16).
+        // the measured optimum (flat at bl≈12–16). Both the cooperative and the
+        // streamed (non-cooperative) panel factor handle wide panels, so bl is
+        // chosen the same way in either mode.
         let bl = if let Some(v) = std::env::var("FP_CUDA_BL")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
@@ -1098,7 +1403,7 @@ impl GpuContext {
         // Cooperative multi-CTA promotion (right-looking) replaces the single-CTA
         // triangular replay when the matrix is wide enough to amortize the grid
         // barriers; otherwise the grid-strided promote_pivots kernel is used.
-        let use_promote_coop = stride >= 1024;
+        let use_promote_coop = coop && stride >= 1024;
         let (pc_ctas, mut pc_barrier, pc_cond) = if use_promote_coop {
             let sms = self
                 .ctx
@@ -1147,8 +1452,13 @@ impl GpuContext {
                 cols: bl_eff * 64,
                 stride: bl_eff,
             };
-            let (pr, pivcols) =
-                self.panel_factor_coop(m, &mut perm, &mut l, ppanel, bl_eff, r, m_active)?;
+            let (pr, pivcols) = if coop {
+                self.panel_factor_coop(m, &mut perm, &mut l, ppanel, bl_eff, r, m_active)?
+            } else {
+                // Multi-SM factor via kernel-boundary sync — same math and grid
+                // parallelism as the coop kernel, no cooperative launch.
+                self.panel_factor_streamed(m, &mut perm, &mut l, ppanel, bl_eff, r, m_active)?
+            };
             if pr > 0 {
                 for &q in &pivcols {
                     pivot_cols.push(q as usize);
@@ -1202,7 +1512,7 @@ impl GpuContext {
         if above_count == 0 || block_e <= block_s {
             return Ok(());
         }
-        let stream = self.ctx.default_stream();
+        let stream = self.stream();
         let (stride, n) = (m.stride, m.cols);
         let bp_eff = block_e - block_s;
         let start_limb = pivot_cols[block_s] / 64;
@@ -1296,6 +1606,7 @@ impl GpuContext {
         s: usize,
         e: usize,
         use_coop: bool,
+        streamed: bool,
         br_barrier: &mut CudaSlice<u32>,
         br_cond: &CudaSlice<u32>,
         br_ctas: u32,
@@ -1303,7 +1614,7 @@ impl GpuContext {
         if e <= s {
             return Ok(());
         }
-        let stream = self.ctx.default_stream();
+        let stream = self.stream();
         let stride = m.stride;
         {
             if use_coop {
@@ -1325,6 +1636,44 @@ impl GpuContext {
                     .arg(br_cond)
                     .arg(&tc);
                 unsafe { lb.launch_cooperative(cfg) }?;
+            } else if streamed {
+                // Kernel-boundary equivalent of block_reduce_coop: per pivot k
+                // (high-to-low), br_cond gathers the clear-conditions, then br_xor
+                // clears row k from the flagged block rows across the grid. Stream
+                // order replaces the cooperative grid barrier.
+                let st = stride as u32;
+                let xor_cfg = LaunchConfig {
+                    grid_dim: (br_ctas, 1, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                let mut k = e;
+                while k > s {
+                    k -= 1;
+                    let (s_u, k_u) = (s as u32, k as u32);
+                    let nj = (k - s) as u32;
+                    {
+                        let mut lb = stream.launch_builder(&self.br_cond);
+                        lb.arg(&m.buf)
+                            .arg(perm)
+                            .arg(piv_dev)
+                            .arg(&s_u)
+                            .arg(&k_u)
+                            .arg(&st)
+                            .arg(br_cond);
+                        unsafe { lb.launch(cfg_1d((nj.max(1)) as usize)) }?;
+                    }
+                    {
+                        let mut lb = stream.launch_builder(&self.br_xor);
+                        lb.arg(&mut m.buf)
+                            .arg(perm)
+                            .arg(&s_u)
+                            .arg(&k_u)
+                            .arg(&st)
+                            .arg(br_cond);
+                        unsafe { lb.launch(xor_cfg) }?;
+                    }
+                }
             } else {
                 let (s_u, e_u, st) = (s as u32, e as u32, stride as u32);
                 let cfg = LaunchConfig {
@@ -1368,24 +1717,27 @@ impl GpuContext {
         e: usize,
         base_bp: usize,
         use_coop: bool,
+        streamed: bool,
         br_barrier: &mut CudaSlice<u32>,
         br_cond: &CudaSlice<u32>,
         br_ctas: u32,
     ) -> Result<(), Box<dyn std::error::Error>> {
         if e - s <= base_bp {
             return self.block_reduce_elem(
-                m, perm, piv_dev, s, e, use_coop, br_barrier, br_cond, br_ctas,
+                m, perm, piv_dev, s, e, use_coop, streamed, br_barrier, br_cond, br_ctas,
             );
         }
         let mid = s + (e - s) / 2;
         // Right half to RREF, then clear its pivots from the left half (K = e-mid).
         self.block_reduce_rec(
-            m, perm, piv_dev, pivot_cols, mid, e, base_bp, use_coop, br_barrier, br_cond, br_ctas,
+            m, perm, piv_dev, pivot_cols, mid, e, base_bp, use_coop, streamed, br_barrier, br_cond,
+            br_ctas,
         )?;
         self.bs_clear_above(m, perm, piv_dev, pivot_cols, mid, e, s, mid - s)?;
         // Left half to RREF (its rows now carry no right-half pivot bits).
         self.block_reduce_rec(
-            m, perm, piv_dev, pivot_cols, s, mid, base_bp, use_coop, br_barrier, br_cond, br_ctas,
+            m, perm, piv_dev, pivot_cols, s, mid, base_bp, use_coop, streamed, br_barrier, br_cond,
+            br_ctas,
         )?;
         Ok(())
     }
@@ -1407,25 +1759,32 @@ impl GpuContext {
         if r == 0 {
             return Ok(());
         }
-        let stream = self.ctx.default_stream();
+        let stream = self.stream();
         let stride = m.stride;
         let piv_dev =
             stream.clone_htod(&pivot_cols.iter().map(|&q| q as u32).collect::<Vec<_>>())?;
 
-        // Cooperative multi-CTA block reduction: spreads each block's per-pivot
-        // clear across the whole grid. The per-block cooperative launch + grid
-        // barriers only pay once the block work (≈ bp·stride) is large, so gate on
-        // a wide matrix; below that the single-CTA kernel wins. Measured (H200):
-        // neutral at n=2¹⁵ (stride 512), +6% at 2¹⁶, +18% at 2¹⁷.
-        let use_coop = stride >= 1024;
+        // Multi-CTA block reduction spreads each block's per-pivot clear across the
+        // whole grid. It only pays once the block work (≈ bp·stride) is large, so
+        // gate on a wide matrix; below that the single-CTA kernel wins. Measured
+        // (H200): neutral at n=2¹⁵ (stride 512), +6% at 2¹⁶, +18% at 2¹⁷.
+        //
+        // Two grid-parallel variants (see [`rr_coop`]): `use_coop` = the cooperative
+        // block_reduce_coop (dedicated GPU); `streamed` = the kernel-boundary
+        // br_cond/br_xor pair, which composes with concurrent GPU work and is the
+        // default. Below the width gate both fall back to the single-CTA
+        // block_reduce_rref.
+        let wide = stride >= 1024;
+        let use_coop = rr_coop() && wide;
+        let streamed = !rr_coop() && wide;
 
         // Pivots per back-substitution block. Wider blocks raise the X·U GEMM's
         // contraction dimension bp toward TILE_K, cutting its K-padding waste
-        // (K=64 pads 16×). block_reduce_coop's cost is ~bp-independent (its
-        // compute and barrier counts both scale with r, not bp), so on the coop
-        // path we widen bp for free; the single-CTA fallback keeps bp=64 (its
-        // shared cond[] is sized 64). Override with FP_CUDA_BP.
-        let bp = if use_coop {
+        // (K=64 pads 16×). The grid-parallel base reduces are ~bp-independent (their
+        // compute and barrier counts scale with r, not bp), so when either fires we
+        // widen bp for free; the single-CTA fallback keeps bp=64 (its shared cond[]
+        // is sized 64). Override with FP_CUDA_BP.
+        let bp = if use_coop || streamed {
             // K=1024 makes the X·U GEMM's contraction an exact TILE_K multiple —
             // zero K-padding — and block_reduce_coop is bp-independent.
             std::env::var("FP_CUDA_BP")
@@ -1446,9 +1805,10 @@ impl GpuContext {
             .block_reduce_coop
             .occupancy_max_active_blocks_per_multiprocessor(BR_THREADS, 0, None)?
             .max(1);
-        // Blocked-TRSM within-block reduce (coop path): recurse each block to
-        // narrow base blocks + X·U GEMMs.
-        let use_trsm = use_coop;
+        // Blocked-TRSM within-block reduce: recurse each block to narrow base blocks
+        // + X·U GEMMs. The GEMM path composes regardless, so use it whenever a
+        // grid-parallel base reduce is in play (coop or streamed).
+        let use_trsm = use_coop || streamed;
         // Base ≤ 64: the single-CTA block_reduce_rref's shared cond[] is sized 64.
         let base_bp: usize = std::env::var("FP_CUDA_BS_BASE")
             .ok()
@@ -1488,6 +1848,7 @@ impl GpuContext {
                     e,
                     base_bp,
                     use_coop,
+                    streamed,
                     &mut br_barrier,
                     &br_cond,
                     br_ctas,
@@ -1500,6 +1861,7 @@ impl GpuContext {
                     s,
                     e,
                     use_coop,
+                    streamed,
                     &mut br_barrier,
                     &br_cond,
                     br_ctas,
@@ -1525,6 +1887,19 @@ impl GpuContext {
         &self,
         m: &mut DeviceMatrix,
     ) -> Result<(CudaSlice<u32>, usize, Vec<usize>), Box<dyn std::error::Error>> {
+        if std::env::var_os("FP_CUDA_RR_TIMING").is_some() {
+            let t0 = std::time::Instant::now();
+            let (perm, r, pivot_cols) = self.forward_reduce(m)?;
+            let t1 = std::time::Instant::now();
+            self.back_substitute(m, &perm, r, &pivot_cols)?;
+            let t2 = std::time::Instant::now();
+            eprintln!(
+                "[rr_timing] forward={:.3}s back={:.3}s (r={r})",
+                (t1 - t0).as_secs_f64(),
+                (t2 - t1).as_secs_f64(),
+            );
+            return Ok((perm, r, pivot_cols));
+        }
         let (perm, r, pivot_cols) = self.forward_reduce(m)?;
         self.back_substitute(m, &perm, r, &pivot_cols)?;
         Ok((perm, r, pivot_cols))

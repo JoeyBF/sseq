@@ -1,0 +1,18 @@
+{
+  "zarr_format": 3,
+  "node_type": "group",
+  "attributes": {
+    "algebra_magic": 163840,
+    "prime": 2,
+    "algebra_prefix": "milnor",
+    "module_spec": {
+      "p": 2,
+      "type": "finite dimensional module",
+      "gens": {
+        "x0": 0
+      },
+      "actions": []
+    },
+    "complex_name": "S_2"
+  }
+}

@@ -107,6 +107,15 @@ __device__ __forceinline__ void arrive_cluster(uint64_t* b, uint32_t cta_id) {
         "}\n" :: "r"(local), "r"(cta_id) : "memory");
 }
 
+// Single-CTA counterpart of `arrive_cluster`: arrive (count 1) on a *local*
+// mbarrier. Used by the cluster-free variant, where the only CTA that ever
+// releases a stage is the one that consumed it, so no `mapa` translation is
+// needed and no cross-CTA co-residency is implied.
+__device__ __forceinline__ void arrive_local(uint64_t* b) {
+    asm volatile("mbarrier.arrive.shared::cta.b64 _, [%0], 1;\n"
+        :: "r"((uint32_t)__cvta_generic_to_shared(b)) : "memory");
+}
+
 // TMA load with cluster multicast: one HBM read of the source tile is fanned
 // out into the SMEM of every CTA whose bit is set in `mask` (same `dst` SMEM
 // offset and `b` mbarrier offset in each), and counts complete_tx bytes against
@@ -243,10 +252,23 @@ constexpr uint32_t DESC_SWIZ = 1;
 // The output block (TM rows × NG limbs) is packed row-major into sC and written
 // back with a single TMA bulk store (S2G). C is padded to whole NG-limb column
 // groups on the host so every stored tile is complete.
-extern "C" __global__ void __cluster_dims__(CLUSTER, 1, 1) matmul_b1_kernel(
-    const __grid_constant__ CUtensorMap tma_a,
-    const __grid_constant__ CUtensorMap tma_b,
-    const __grid_constant__ CUtensorMap tma_c,
+// The body is templated on the cluster width so one source produces both
+// variants (see the two `extern "C"` entry points below). `CLU == 1` is not a
+// degenerate special case bolted on: every cluster-dependent construct here has
+// an exact single-CTA counterpart, and the compiler discards the other branch.
+//   rank -> 0            (no %cluster_ctarank read)
+//   cluster_sync         -> nothing (the preceding __syncthreads already orders it)
+//   arrive_cluster       -> arrive_local (no mapa into a cluster-mate's SMEM)
+//   tma_2d_multicast     -> tma_2d      (each CTA reads its own B tile)
+//   mbar_empty count     -> 1 instead of CLUSTER
+// What remains is identical arithmetic on an identical tile schedule, so the
+// two kernels are bit-for-bit equivalent; they differ only in HBM traffic for B
+// and in whether the launch demands co-resident CTAs.
+template <int CLU>
+__device__ __forceinline__ void matmul_b1_body(
+    const CUtensorMap& tma_a,
+    const CUtensorMap& tma_b,
+    const CUtensorMap& tma_c,
     uint32_t m_tiles,
     uint32_t n_groups,
     uint32_t M, uint32_t K)
@@ -272,12 +294,14 @@ extern "C" __global__ void __cluster_dims__(CLUSTER, 1, 1) matmul_b1_kernel(
     // Cluster geometry: CLUSTER CTAs along M share one B-panel via multicast,
     // so the schedule walks "M-super-rows" of CLUSTER M-tiles. The host pads
     // m_tiles to a multiple of CLUSTER, so m_super divides exactly.
-    const uint32_t rank         = cluster_ctarank();      // 0..CLUSTER-1 (= M offset)
-    const uint32_t cluster_id   = blockIdx.x / CLUSTER;
-    const uint32_t num_clusters = gridDim.x / CLUSTER;
-    const uint32_t m_super      = m_tiles / CLUSTER;
+    uint32_t rank = 0;                                    // 0..CLU-1 (= M offset)
+    if constexpr (CLU > 1) rank = cluster_ctarank();
+    const uint32_t cluster_id   = blockIdx.x / CLU;
+    const uint32_t num_clusters = gridDim.x / CLU;
+    const uint32_t m_super      = m_tiles / CLU;
     const uint32_t total_cl     = m_super * n_groups;
-    const uint16_t bmask        = (uint16_t)((1u << CLUSTER) - 1u); // all ranks
+    const uint16_t bmask        = (uint16_t)((1u << CLU) - 1u); // all ranks
+    (void)bmask;                                          // unused at CLU == 1
 
     // Register reallocation is a one-time per-warpgroup action.
     if (wg == 0) SET_MAXNREG_DEC(PRODUCER_REGS);
@@ -291,17 +315,22 @@ extern "C" __global__ void __cluster_dims__(CLUSTER, 1, 1) matmul_b1_kernel(
         #pragma unroll
         for (int s = 0; s < STAGES; ++s) {
             mbar_init(&mbar_full[s], 1);
-            mbar_init(&mbar_empty[s], CLUSTER);
+            mbar_init(&mbar_empty[s], CLU);
         }
     }
     __syncthreads();
-    cluster_sync();   // all CTAs' barriers initialized before any cross-CTA arrive
+    // All CTAs' barriers initialized before any cross-CTA arrive. Only needed
+    // when arrivals actually cross CTAs; at CLU == 1 __syncthreads is sufficient.
+    if constexpr (CLU > 1) cluster_sync();
 
-    // Pre-arrive every empty barrier cluster-wide so the producer's first
-    // STAGES `mbar_wait(empty, 0)` succeed immediately (stages logically free).
-    if (wg == 1 && t_wg < CLUSTER) {
+    // Pre-arrive every empty barrier so the producer's first STAGES
+    // `mbar_wait(empty, 0)` succeed immediately (stages logically free).
+    if (wg == 1 && t_wg < CLU) {
         #pragma unroll
-        for (int s = 0; s < STAGES; ++s) arrive_cluster(&mbar_empty[s], t_wg);
+        for (int s = 0; s < STAGES; ++s) {
+            if constexpr (CLU > 1) arrive_cluster(&mbar_empty[s], t_wg);
+            else                   arrive_local(&mbar_empty[s]);
+        }
     }
 
     // ===================== PERSISTENT CLUSTER LOOP =====================
@@ -321,7 +350,7 @@ extern "C" __global__ void __cluster_dims__(CLUSTER, 1, 1) matmul_b1_kernel(
         const uint32_t local  = ct - gid * GROUP_M * n_groups;
         const uint32_t sbi    = firstm + local % curm;
         const int bj = (int)(local / curm);
-        const int bi = (int)(sbi * CLUSTER + rank);  // this CTA's M-tile
+        const int bi = (int)(sbi * CLU + rank);  // this CTA's M-tile
         const int row0 = bi * TM, col0 = bj * NG;
         uint64_t* sCb = sC + (titer & 1) * SC_STRIDE;   // this tile's sC buffer
 
@@ -353,10 +382,18 @@ extern "C" __global__ void __cluster_dims__(CLUSTER, 1, 1) matmul_b1_kernel(
                     // B: one HBM read, multicast into every cluster member's sB
                     // and counted against every member's full barrier. Issued by
                     // rank 0 only (its mask bit is set, so it fills itself too).
-                    if (rank == 0) {
-                        tma_2d_multicast(&sB[s * TILE_B], &tma_b, 0,
-                                         (kk * n_groups + bj) * NB, &mbar_full[s],
-                                         bmask);
+                    // Without a cluster there is nobody to share with, so each
+                    // CTA simply loads its own copy — the extra HBM traffic is
+                    // exactly what the cluster variant buys back.
+                    if constexpr (CLU > 1) {
+                        if (rank == 0) {
+                            tma_2d_multicast(&sB[s * TILE_B], &tma_b, 0,
+                                             (kk * n_groups + bj) * NB, &mbar_full[s],
+                                             bmask);
+                        }
+                    } else {
+                        tma_2d(&sB[s * TILE_B], &tma_b, 0,
+                               (kk * n_groups + bj) * NB, &mbar_full[s]);
                     }
                 }
                 if (++qidx == STAGES) { qidx = 0; p ^= 1; }
@@ -402,8 +439,13 @@ extern "C" __global__ void __cluster_dims__(CLUSTER, 1, 1) matmul_b1_kernel(
                 wgmma_wait();
 
                 // Release this stage cluster-wide: arrive on every CTA's empty
-                // barrier (so rank 0 may overwrite their multicast sB).
-                if (t_wg < CLUSTER) arrive_cluster(&mbar_empty[s], t_wg);
+                // barrier (so rank 0 may overwrite their multicast sB). Without
+                // a cluster the stage is this CTA's alone, so a local arrive is
+                // the whole of the release.
+                if (t_wg < CLU) {
+                    if constexpr (CLU > 1) arrive_cluster(&mbar_empty[s], t_wg);
+                    else                   arrive_local(&mbar_empty[s]);
+                }
                 if (++qidx == STAGES) { qidx = 0; p ^= 1; }
             }
 
@@ -460,6 +502,44 @@ extern "C" __global__ void __cluster_dims__(CLUSTER, 1, 1) matmul_b1_kernel(
     }
     // Drain the last outstanding output store before the CTA exits.
     if (t == 0) tma_store_wait();
+}
+
+// ── Entry points ────────────────────────────────────────────────────────────
+//
+// Two kernels, same body, differing only in cluster width:
+//
+//   matmul_b1_kernel     CLUSTER-wide clusters + TMA multicast of B. Max
+//                        throughput (8674 binary TOPS at 16384^3 on an idle
+//                        H200), but `__cluster_dims__` makes the cluster's CTAs
+//                        co-resident BY CONSTRUCTION, so the launch demands a
+//                        placement rather than queueing for one. On a GPU shared
+//                        with another tenant that surfaces as a bare
+//                        CUDA_ERROR_LAUNCH_FAILED. Use when this process owns
+//                        the device.
+//
+//   matmul_b1_kernel_nc  No clusters, no multicast: an ordinary grid whose CTAs
+//                        are independent, so the launch queues like any other
+//                        and composes with a co-tenant at any grid size. Pays
+//                        for B once per CTA instead of once per cluster.
+//
+// The host picks between them (`run_gemm_kernel`); the choice is a throughput /
+// composability trade, never a correctness one.
+extern "C" __global__ void __cluster_dims__(CLUSTER, 1, 1) matmul_b1_kernel(
+    const __grid_constant__ CUtensorMap tma_a,
+    const __grid_constant__ CUtensorMap tma_b,
+    const __grid_constant__ CUtensorMap tma_c,
+    uint32_t m_tiles, uint32_t n_groups, uint32_t M, uint32_t K)
+{
+    matmul_b1_body<CLUSTER>(tma_a, tma_b, tma_c, m_tiles, n_groups, M, K);
+}
+
+extern "C" __global__ void matmul_b1_kernel_nc(
+    const __grid_constant__ CUtensorMap tma_a,
+    const __grid_constant__ CUtensorMap tma_b,
+    const __grid_constant__ CUtensorMap tma_c,
+    uint32_t m_tiles, uint32_t n_groups, uint32_t M, uint32_t K)
+{
+    matmul_b1_body<1>(tma_a, tma_b, tma_c, m_tiles, n_groups, M, K);
 }
 
 // ── Device-resident packing kernels (BLAS3 GPU row-reduction port) ───────────
@@ -757,6 +837,208 @@ extern "C" __global__ void panel_factor_coop(
     if (gtid == 0) *pr_out = *g_pr;
 }
 
+// ── Streamed (kernel-boundary) panel factorization ───────────────────────────
+//
+// Same all-SM parallelism as panel_factor_coop, but WITHOUT a cooperative launch:
+// each of the ≤ bl·64 sequential bit-steps is three ordinary grid-wide kernels
+// (pf_find → pf_swap → pf_xor), and the *kernel boundary* — stream ordering —
+// replaces the in-grid `grid_sync`. This is how cuSOLVER/cuBLAS build grid-wide
+// multi-step algorithms: no all-CTAs-co-resident requirement, so it composes with
+// a concurrent kernel from another CUDA runtime (cubecl's Milnor multiply) instead
+// of deadlocking its grid barrier (the intermittent stem-150 wedge).
+//
+// All state stays on the device — g_pr (pivots so far), g_min (find-first result),
+// g_pivpos (this step's pivot position, for pf_xor's guard), g_pivword (the pivot
+// row's bl panel limbs). The host never reads back inside the loop, so it races
+// ahead queuing launches and their latency hides behind the GPU work. Bit-for-bit
+// identical to panel_factor_coop; g_min must be INF and g_pr 0 at entry.
+
+// find-first + swap, fused into one launch. Every CTA reduces its row slice and
+// atomicMin's into g_min; then a threadfence "last-CTA finalize" (the CTA whose
+// leader increments the arrival counter last) reads the grid-wide minimum and does
+// the swap. This is a grid-wide *reduction*, not a barrier — the last CTA to run
+// finalizes, so it needs NO co-residency (unlike a spin barrier) and cannot
+// deadlock against concurrent GPU work; `arrival` self-resets to 0 via atomicInc's
+// wrap at gridDim-1. On a pivot: read its bl panel limbs into g_pivword, swap it up
+// to r+g_pr (perm swap), record the column, bump g_pr, reset g_min for the next
+// step. Publishes the pivot position (or INF) to g_pivpos so pf_xor knows whether
+// to run. `arrival` and g_min must be 0 / INF at the first step. q ≥ n ⇒ no-op
+// (lets a fixed-length step sequence cover a short final panel).
+extern "C" __global__ void pf_find_swap(
+    u64_t* __restrict__ m_buf,
+    unsigned* __restrict__ perm,
+    unsigned* __restrict__ pivcols,
+    u64_t* __restrict__ g_pivword,
+    int* __restrict__ g_min,
+    unsigned* __restrict__ g_pr,
+    int* __restrict__ g_pivpos,
+    unsigned* __restrict__ arrival,
+    unsigned ppanel, unsigned bl, unsigned j, unsigned plimb, unsigned cc,
+    unsigned r, unsigned m, unsigned stride, unsigned n)
+{
+    extern __shared__ int s_red[];
+    const int tid = threadIdx.x;
+    const int nt = blockDim.x;
+    const unsigned gtid = blockIdx.x * blockDim.x + threadIdx.x;
+    const unsigned gnt = gridDim.x * blockDim.x;
+    const unsigned q = ppanel * 64 + cc;
+    const unsigned pr = *g_pr;
+
+    int local_min = 0x7fffffff;
+    if (q < n) {
+        for (unsigned p = r + pr + gtid; p < m; p += gnt) {
+            unsigned row = perm[p];
+            if ((m_buf[(u64_t)row * stride + plimb] >> j) & 1ULL)
+                local_min = min(local_min, (int)p);
+        }
+    }
+    s_red[tid] = local_min;
+    __syncthreads();
+    for (int off = nt / 2; off > 0; off >>= 1) {
+        if (tid < off) s_red[tid] = min(s_red[tid], s_red[tid + off]);
+        __syncthreads();
+    }
+    if (tid == 0) atomicMin(g_min, s_red[0]);
+    __threadfence();
+
+    __shared__ bool am_last;
+    if (tid == 0) am_last = (atomicInc(arrival, gridDim.x - 1) == gridDim.x - 1);
+    __syncthreads();
+    if (!am_last || tid != 0) return;
+
+    int pivpos = *g_min;
+    *g_pivpos = pivpos;
+    if (pivpos == 0x7fffffff) return; // free column: g_min stays INF for next step
+    unsigned pivrow = perm[pivpos];
+    for (unsigned t = 0; t < bl; ++t)
+        g_pivword[t] = m_buf[(u64_t)pivrow * stride + ppanel + t];
+    unsigned a = r + pr;
+    perm[pivpos] = perm[a];
+    perm[a] = pivrow;
+    pivcols[pr] = q;
+    *g_min = 0x7fffffff; // reset for the next column
+    *g_pr = pr + 1;
+}
+
+// Fused lookahead step: clear the PREVIOUS column (cc-1) from the below rows AND
+// find+swap the pivot of the CURRENT column (cc), in one launch. Because the
+// forward sweep alternates xor(col j) then find(col j+1) over the *same* below-row
+// range, fusing them halves the panel factor's launches and — since each thread
+// owns the same rows in both phases (grid-stride) — lets it read each row once and
+// see its own XOR before scanning, cutting memory traffic. Correctness rests on:
+// (A) the previous pivot sits above the shared below-row range, (B) g_pivword /
+// g_pivpos / g_pr are read by every CTA in phase A before the last-CTA finalize
+// overwrites them (the arrival counter orders all phase-A reads before the single
+// finalize write). g_min INF, arrival 0 on entry; q ≥ n ⇒ find is skipped.
+extern "C" __global__ void pf_step(
+    u64_t* __restrict__ m_buf,
+    unsigned* __restrict__ perm,
+    u64_t* __restrict__ l_buf,
+    unsigned* __restrict__ pivcols,
+    u64_t* __restrict__ g_pivword,
+    int* __restrict__ g_min,
+    unsigned* __restrict__ g_pr,
+    int* __restrict__ g_pivpos,
+    unsigned* __restrict__ arrival,
+    unsigned ppanel, unsigned bl, unsigned cc,
+    unsigned r, unsigned m, unsigned stride, unsigned l_stride, unsigned n)
+{
+    extern __shared__ int s_red[];
+    const int tid = threadIdx.x;
+    const int nt = blockDim.x;
+    const unsigned gtid = blockIdx.x * blockDim.x + threadIdx.x;
+    const unsigned gnt = gridDim.x * blockDim.x;
+
+    const unsigned pr_now = *g_pr;      // pivots found through column cc-1
+    const int prev_pivpos = *g_pivpos;  // pivot position of column cc-1 (INF = free)
+
+    // ── Phase A: clear column cc-1 from the below rows [r+pr_now, m) ──
+    // (skipped if cc-1 was a free column). The previous pivot is at r+pr_now-1,
+    // above this range, so it is untouched.
+    if (prev_pivpos != 0x7fffffff) {
+        const unsigned prev_cc = cc - 1;
+        const unsigned pj = prev_cc & 63;
+        const unsigned prev_pr = pr_now - 1; // L index of the previous pivot
+        for (unsigned p = r + pr_now + gtid; p < m; p += gnt) {
+            unsigned row = perm[p];
+            u64_t* base = &m_buf[(u64_t)row * stride + ppanel];
+            if ((base[prev_cc / 64] >> pj) & 1ULL) {
+                l_buf[(u64_t)row * l_stride + (prev_pr >> 6)] |= (1ULL << (prev_pr & 63));
+                for (unsigned t = 0; t < bl; ++t)
+                    base[t] ^= g_pivword[t];
+            }
+        }
+    }
+
+    // ── Phase B: find-first for column cc over the same below rows ──
+    // Same thread owns the same rows as phase A, so its XORs are visible here.
+    const unsigned q = ppanel * 64 + cc;
+    const unsigned plimb = ppanel + cc / 64;
+    const unsigned j = cc & 63;
+    int local_min = 0x7fffffff;
+    if (q < n) {
+        for (unsigned p = r + pr_now + gtid; p < m; p += gnt) {
+            unsigned row = perm[p];
+            if ((m_buf[(u64_t)row * stride + plimb] >> j) & 1ULL)
+                local_min = min(local_min, (int)p);
+        }
+    }
+    s_red[tid] = local_min;
+    __syncthreads();
+    for (int off = nt / 2; off > 0; off >>= 1) {
+        if (tid < off) s_red[tid] = min(s_red[tid], s_red[tid + off]);
+        __syncthreads();
+    }
+    if (tid == 0) atomicMin(g_min, s_red[0]);
+    __threadfence();
+
+    __shared__ bool am_last;
+    if (tid == 0) am_last = (atomicInc(arrival, gridDim.x - 1) == gridDim.x - 1);
+    __syncthreads();
+    if (!am_last || tid != 0) return;
+
+    int pivpos = *g_min;
+    *g_pivpos = pivpos;
+    if (pivpos == 0x7fffffff) return; // free column
+    unsigned pivrow = perm[pivpos];
+    for (unsigned t = 0; t < bl; ++t)
+        g_pivword[t] = m_buf[(u64_t)pivrow * stride + ppanel + t];
+    unsigned a = r + pr_now;
+    perm[pivpos] = perm[a];
+    perm[a] = pivrow;
+    pivcols[pr_now] = q;
+    *g_min = 0x7fffffff;
+    *g_pr = pr_now + 1;
+}
+
+// masked XOR of the pivot row into the rows *below* it, across all bl panel limbs,
+// recording the multiplier bit into L. No-op on a free column (g_pivpos == INF).
+// g_pr has already been bumped by pf_swap, so this pivot's index is *g_pr - 1.
+extern "C" __global__ void pf_xor(
+    u64_t* __restrict__ m_buf,
+    const unsigned* __restrict__ perm,
+    u64_t* __restrict__ l_buf,
+    const u64_t* __restrict__ g_pivword,
+    const int* __restrict__ g_pivpos,
+    const unsigned* __restrict__ g_pr,
+    unsigned ppanel, unsigned bl, unsigned cc, unsigned j,
+    unsigned r, unsigned m, unsigned stride, unsigned l_stride)
+{
+    if (*g_pivpos == 0x7fffffff) return; // free column: nothing to clear
+    const unsigned pr = *g_pr - 1;       // index of the pivot just placed
+    const unsigned gtid = blockIdx.x * blockDim.x + threadIdx.x;
+    const unsigned gnt = gridDim.x * blockDim.x;
+    for (unsigned p = r + pr + 1 + gtid; p < m; p += gnt) {
+        unsigned row = perm[p];
+        u64_t* base = &m_buf[(u64_t)row * stride + ppanel];
+        if ((base[cc / 64] >> j) & 1ULL) {
+            l_buf[(u64_t)row * l_stride + (pr >> 6)] |= (1ULL << (pr & 63));
+            for (unsigned t = 0; t < bl; ++t)
+                base[t] ^= g_pivword[t];
+        }
+    }
+}
+
 // ── Active-row compaction (design §8.2) ──────────────────────────────────────
 //
 // A below row that is entirely zero across the remaining columns [start_limb,
@@ -973,6 +1255,50 @@ extern "C" __global__ void block_reduce_coop(
             m_buf[(u64_t)perm[s + j] * stride + c] ^= m_buf[(u64_t)rowk * stride + c];
         }
         goal += total_ctas; grid_sync(barrier, goal); // [B] finish k before next reads
+    }
+}
+
+// ── Streamed (kernel-boundary) block reduction ───────────────────────────────
+//
+// Non-cooperative equivalent of block_reduce_coop: the same grid-wide per-pivot
+// clear, but each of block_reduce_coop's two grid_syncs becomes a kernel boundary
+// (br_cond → br_xor per pivot k, high-to-low). No cooperative launch, so it
+// composes with concurrent GPU work. `cond` holds ≥ (e-s) unsigned; both are
+// launched per pivot with the same block-relative index k. Bit-identical to
+// block_reduce_coop / block_reduce_rref.
+
+// Gather the pivot-k bit of every earlier block row j ∈ [s, k) into cond[j-s],
+// *before* any XOR clears it. Grid-strided over the ≤64 earlier rows.
+extern "C" __global__ void br_cond(
+    const u64_t* __restrict__ m_buf, const unsigned* __restrict__ perm,
+    const unsigned* __restrict__ pivcols,
+    unsigned s, unsigned k, unsigned stride, unsigned* __restrict__ cond)
+{
+    unsigned qk = pivcols[k];
+    unsigned qlimb = qk >> 6, qbit = qk & 63;
+    unsigned nj = k - s;
+    const unsigned gtid = blockIdx.x * blockDim.x + threadIdx.x;
+    const unsigned gnt = gridDim.x * blockDim.x;
+    for (unsigned j = gtid; j < nj; j += gnt)
+        cond[j] = (unsigned)((m_buf[(u64_t)perm[s + j] * stride + qlimb] >> qbit) & 1ULL);
+}
+
+// XOR row k into every flagged earlier block row across all limbs, flattened over
+// (j, limb) across the grid.
+extern "C" __global__ void br_xor(
+    u64_t* __restrict__ m_buf, const unsigned* __restrict__ perm,
+    unsigned s, unsigned k, unsigned stride, const unsigned* __restrict__ cond)
+{
+    unsigned rowk = perm[k];
+    unsigned nj = k - s;
+    unsigned total = nj * stride;
+    const unsigned gtid = blockIdx.x * blockDim.x + threadIdx.x;
+    const unsigned gnt = gridDim.x * blockDim.x;
+    for (unsigned idx = gtid; idx < total; idx += gnt) {
+        unsigned j = idx / stride;
+        if (!cond[j]) continue;
+        unsigned c = idx - j * stride;
+        m_buf[(u64_t)perm[s + j] * stride + c] ^= m_buf[(u64_t)rowk * stride + c];
     }
 }
 

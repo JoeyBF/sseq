@@ -40,3 +40,6 @@ chart/python/*.egg-info
 # Claude
 .claude
 
+# GPU run logs. These are multi-hundred-MB analysis artifacts written next to the crate;
+# one was committed by accident and blocked a push (GitHub rejects files over 100 MB).
+ext/*.log
