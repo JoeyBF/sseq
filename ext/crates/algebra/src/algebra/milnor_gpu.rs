@@ -545,6 +545,9 @@ static ENUM_LAUNCHES: AtomicU64 = AtomicU64::new(0);
 static ENUM_RS: AtomicU64 = AtomicU64::new(0);
 static ENUM_RS_MAX: AtomicU64 = AtomicU64::new(0);
 static ENUM_BLOCKS: AtomicU64 = AtomicU64::new(0);
+/// Threads issued across all enumeration launches. Equals `ENUM_RS` when the odometer split is off,
+/// and exceeds it by the split's expansion factor when it is on.
+static ENUM_THREADS_TOTAL: AtomicU64 = AtomicU64::new(0);
 static BATCH_MARSHAL_US: AtomicU64 = AtomicU64::new(0);
 static BATCH_DEVICE_US: AtomicU64 = AtomicU64::new(0);
 static BATCH_PAIRS: AtomicU64 = AtomicU64::new(0);
@@ -1099,6 +1102,297 @@ static COLD_COUNT: LazyLock<RwLock<HashMap<PPart, (u32, u32, u32)>>> =
 /// consumes them) so no thread walks the suffix at all.
 const ENUM_SPLIT_TARGET: usize = 64;
 
+/// Fresh odometer state for `p_part`: `(matrix, totals, col_sums, masks, rows, cols)`.
+#[allow(clippy::type_complexity)]
+fn odometer_init(p_part: &[u32]) -> (Vec<u32>, Vec<u32>, Vec<u32>, Vec<u32>, usize, usize) {
+    let rows = p_part.len();
+    let cols = p_part
+        .iter()
+        .map(|&x| (u32::BITS - x.leading_zeros()) as usize)
+        .max()
+        .unwrap();
+    let mut matrix = vec![0u32; rows * cols];
+    let mut masks = vec![0u32; rows + cols - 1];
+    for (i, &x) in p_part.iter().enumerate() {
+        matrix[i * cols] = x;
+        masks[i] = x;
+    }
+    (
+        matrix,
+        vec![0u32; rows],
+        vec![0u32; cols - 1],
+        masks,
+        rows,
+        cols,
+    )
+}
+
+/// One `next()` step of the admissible-matrix odometer, restricted to digits `lo_pos..hi_pos`.
+///
+/// Flag-based: `found` = "produced a new matrix" (the original's `return true`); `handled` = "this
+/// column already updated `totals`" (the original's `continue 'mid`, which skips the trailing add).
+/// Loops are guarded by `!found` instead of breaking, because that is the subset the cubecl DSL
+/// compiles cleanly — [`enumerate_admissible_kernel`] is a transcription of exactly this.
+///
+/// # Why the digit range is a parameter
+///
+/// The walk is a mixed-radix odometer over digits `(row, col)` with row 0 varying FASTEST. The
+/// admissibility constraint on row `row` is the anti-diagonal bitsum `d`, which reads
+/// `matrix[row + col - c][c]` for `c < col` — and `row + col - c > row` there, so **`d` only ever
+/// reads rows with a LARGER index**, i.e. only the slower-varying digits, which are frozen while
+/// row `row` varies.
+///
+/// Hence for any fixed state of the suffix digits `[sp, total)`, the sub-odometer over `[0, sp)` is
+/// independent of how that suffix state was reached, and the full walk factors exactly as
+///
+/// ```text
+/// for each suffix state (steps with lo = sp, hi = total)
+///     for each sub state (steps with lo = 0, hi = sp)
+/// ```
+///
+/// contiguously, and in the SAME ORDER as the unsplit walk. That is what licenses giving each
+/// suffix state its own thread: a launch's duration is set by its longest single `R` chain (one
+/// thread, sequential odometer), so splitting that chain is the only thing that can move the
+/// maximum — and doing it this way keeps the emitted master bit-identical, so it is checkable
+/// against the unsplit walk rather than taken on faith.
+///
+/// Splitting mid-ROW is legitimate for the same reason: with `rows == 2` (which every long-pole `R`
+/// at degree 150 has), `d` at `(0, col)` reads only `matrix[1][col - 1]`, a frozen row, so row 0's
+/// own columns do not constrain each other. Row granularity is too coarse to balance — it offers a
+/// single non-degenerate choice there.
+///
+/// Columns below `lo_pos` in the starting row are still scanned, because `totals[row]` accumulates
+/// `p^col * matrix[row][col]` across the whole row and column 0 is the remainder; they are simply
+/// not offered as increment sites. Digits outside `lo_pos..hi_pos` are left untouched otherwise:
+/// the reset that follows a successful increment clears rows `lo_row..row`, not `0..row`.
+fn odometer_step_ref(
+    matrix: &mut [u32],
+    totals: &mut [u32],
+    col_sums: &mut [u32],
+    masks: &mut [u32],
+    rows: usize,
+    cols: usize,
+    lo_pos: usize,
+    hi_pos: usize,
+) -> bool {
+    // `cols == 1` (every `p_part` entry is 1) has no digits at all: the column loop below never runs
+    // and the walk is a single matrix. `max(1)` only keeps the index arithmetic total; `hi_pos` is 0
+    // there, so the row loop is empty and this correctly reports "no successor".
+    let per_row = (cols - 1).max(1);
+    let lo_row = lo_pos / per_row;
+    let hi_row = hi_pos.div_ceil(per_row).min(rows);
+    let mut found = false;
+    let mut row = lo_row;
+    while row < hi_row && !found {
+        let mut p_to_the_j: u32 = 1;
+        totals[row] = matrix[row * cols]; // get(row, 0)
+        let mut col = 1;
+        while col < cols && !found {
+            p_to_the_j *= 2;
+            let mut handled = false;
+            let pos = row * per_row + (col - 1);
+            if pos >= lo_pos && pos < hi_pos && p_to_the_j <= totals[row] {
+                // Bitsum along the anti-diagonal to the bottom-left. Reads only rows `> row`.
+                let mut d = 0u32;
+                let mut c = (row + col + 1).saturating_sub(rows);
+                while c < col {
+                    d |= matrix[(row + col - c) * cols + c];
+                    c += 1;
+                }
+                let cur = matrix[row * cols + col];
+                let new_entry = ((cur | d) + 1) & !d;
+                let inc = new_entry - cur;
+                let sub = inc * p_to_the_j;
+                if totals[row] < sub {
+                    totals[row] += p_to_the_j * cur;
+                    handled = true;
+                } else {
+                    matrix[row * cols] = totals[row] - sub; // set(row, 0, ..)
+                    masks[row] = matrix[row * cols];
+                    col_sums[col - 1] += inc;
+                    let mut j = 1;
+                    while j < col {
+                        masks[row + j] &= !matrix[row * cols + j];
+                        col_sums[j - 1] -= matrix[row * cols + j];
+                        matrix[row * cols + j] = 0;
+                        j += 1;
+                    }
+                    matrix[row * cols + col] = new_entry;
+                    // Reset the faster digits. `lo_row`, not 0: rows below the split belong to a
+                    // different (already seeded) sub-walk and must not be disturbed. Columns 1..col
+                    // of `row` are cleared by the loop above; when the split falls mid-row those
+                    // include sub-walk columns, which is correct — they are zero in this state and
+                    // zero is exactly what the sub-walk seeds from.
+                    let mut i = lo_row;
+                    while i < row {
+                        matrix[i * cols] = totals[i];
+                        masks[i] = totals[i];
+                        let mut j = 1;
+                        while j < cols {
+                            if i + j > row {
+                                masks[i + j] &= !matrix[i * cols + j];
+                            }
+                            col_sums[j - 1] -= matrix[i * cols + j];
+                            matrix[i * cols + j] = 0;
+                            j += 1;
+                        }
+                        i += 1;
+                    }
+                    masks[row + col] = d | new_entry;
+                    found = true;
+                    handled = true;
+                }
+            }
+            if !handled {
+                totals[row] += p_to_the_j * matrix[row * cols + col];
+            }
+            col += 1;
+        }
+        row += 1;
+    }
+    found
+}
+
+/// How many suffix states a split at `sp` yields. Costs exactly that many odometer steps.
+fn count_suffix_states(p_part: &[u32], sp: usize) -> usize {
+    let (mut matrix, mut totals, mut col_sums, mut masks, rows, cols) = odometer_init(p_part);
+    let total_digits = rows * (cols - 1);
+    let mut n = 1usize;
+    while odometer_step_ref(
+        &mut matrix,
+        &mut totals,
+        &mut col_sums,
+        &mut masks,
+        rows,
+        cols,
+        sp,
+        total_digits,
+    ) {
+        n += 1;
+    }
+    n
+}
+
+/// The largest split position (fewest seeds) that still yields at least `target` threads.
+///
+/// Seeds increase as `sp` decreases, so this walks `sp` down from the unsplit end and stops at the
+/// first position that clears the target. Cost is the sum of the state counts it tried, which is
+/// dominated by the last one — about `2 * target` steps, INDEPENDENT of the chain length. That is
+/// what makes it usable on a marshal path.
+fn heuristic_split_pos(p_part: &[u32], target: usize) -> usize {
+    let rows = p_part.len();
+    let cols = p_part
+        .iter()
+        .map(|&x| (u32::BITS - x.leading_zeros()) as usize)
+        .max()
+        .unwrap();
+    let total = rows * (cols - 1);
+    let mut sp = total;
+    while sp > 0 {
+        if count_suffix_states(p_part, sp) >= target {
+            return sp;
+        }
+        sp -= 1;
+    }
+    0
+}
+
+/// Where each seed's sub-chain starts, in matrices, for a split of `p_part` at digit `sp`.
+///
+/// `len()` is the thread count for this `R` and consecutive differences are the sub-chain lengths,
+/// so `starts[k] * cs_len` is exactly the offset thread `k` must write at for the concatenation to
+/// reproduce the unsplit stream.
+fn seed_starts(p_part: &[u32], sp: usize) -> Vec<u32> {
+    let (mut matrix, mut totals, mut col_sums, mut masks, rows, cols) = odometer_init(p_part);
+    let total_digits = rows * (cols - 1);
+    let mut starts = Vec::new();
+    let mut acc = 0u32;
+    let mut more_suffix = true;
+    while more_suffix {
+        starts.push(acc);
+        let (mut m, mut t, mut cs, mut mk) = (
+            matrix.clone(),
+            totals.clone(),
+            col_sums.clone(),
+            masks.clone(),
+        );
+        let mut n = 1u32;
+        while odometer_step_ref(&mut m, &mut t, &mut cs, &mut mk, rows, cols, 0, sp) {
+            n += 1;
+        }
+        acc += n;
+        more_suffix = odometer_step_ref(
+            &mut matrix,
+            &mut totals,
+            &mut col_sums,
+            &mut masks,
+            rows,
+            cols,
+            sp,
+            total_digits,
+        );
+    }
+    starts
+}
+
+/// Below this many matrices an `R` is left unsplit: one thread, exactly as before.
+///
+/// The split only pays on the chains that set a launch's duration, and every seed costs a
+/// `seed_starts` entry to memoise plus a thread to marshal. `Rs/launch` averages 1293 and the
+/// matrix counts are heavily skewed (the hottest 1% of `R`s carry 31% of all references), so
+/// confining the split to the long tail keeps both costs proportional to the work they remove.
+/// Overridable by `NASSAU_GPU_ENUM_SPLIT_MIN` — set it to 1 to force EVERY `R` down the split path,
+/// which is what makes a small end-to-end run an actual test of the split rather than a vacuous one.
+fn enum_split_min_mats() -> u32 {
+    static M: LazyLock<u32> = LazyLock::new(|| {
+        std::env::var("NASSAU_GPU_ENUM_SPLIT_MIN")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(2048)
+    });
+    *M
+}
+
+/// Memoised split plan per cold `R`: `(split digit, seed starts)`.
+///
+/// Keyed like [`COLD_COUNT`], and populated from the same one-full-walk-per-distinct-`R` budget the
+/// cold path already pays. `Arc<[u32]>` because the plan is written once and read by every launch
+/// that touches this `R` — clones are refcount bumps, not copies.
+static SPLIT_PLAN: LazyLock<RwLock<HashMap<PPart, (u32, Arc<[u32]>)>>> =
+    LazyLock::new(|| RwLock::new(HashMap::new()));
+
+/// The split plan for a cold `R`, or `None` when it is too small to be worth splitting.
+///
+/// `num_mats` is passed in rather than recomputed because [`cold_count`] has it already.
+fn split_plan(p_part: PPart, num_mats: u32) -> Option<(u32, Arc<[u32]>)> {
+    if num_mats < enum_split_min_mats() || !enum_split_enabled() {
+        return None;
+    }
+    if let Some(e) = SPLIT_PLAN.read().unwrap().get(&p_part) {
+        return Some(e.clone());
+    }
+    let pp: Vec<u32> = p_part.iter().collect();
+    let sp = heuristic_split_pos(&pp, ENUM_SPLIT_TARGET);
+    let starts: Arc<[u32]> = seed_starts(&pp, sp).into();
+    let e = (sp as u32, starts);
+    SPLIT_PLAN
+        .write()
+        .unwrap()
+        .entry(p_part)
+        .or_insert_with(|| e.clone());
+    Some(e)
+}
+
+/// Whether to split the enumeration odometer across threads (`NASSAU_GPU_ENUM_SPLIT`, default on).
+///
+/// An escape hatch, not a tuning knob: setting it to `0` restores the one-thread-per-`R` mapping
+/// exactly, which is the arm every prior enum measurement was taken against.
+fn enum_split_enabled() -> bool {
+    static E: LazyLock<bool> =
+        LazyLock::new(|| std::env::var("NASSAU_GPU_ENUM_SPLIT").map(|v| v != "0") != Ok(false));
+    *E
+}
+
 /// A 1-element buffer standing in for the split inputs of an UNSPLIT enumeration launch.
 ///
 /// `split == false` is comptime, so every read of `t_slot`/`t_seed`/`r_split` is compiled out and
@@ -1421,8 +1715,10 @@ fn prefetch_max_bytes() -> usize {
 /// MEASURED AND NEUTRAL SO FAR — and the reason matters, because it says what to test next.
 /// Interleaved, 3 rounds, theta=125 / stem 150, BOTH arms at `PIN_MIN_MATS=2000`:
 ///
-///     ahead=0    354, 367, 325   mean 348.7 s
-///     ahead=25   354, 331, 340   mean 341.7 s   (2%, inside noise; rounds split)
+/// ```text
+/// ahead=0    354, 367, 325   mean 348.7 s
+/// ahead=25   354, 331, 340   mean 341.7 s   (2%, inside noise; rounds split)
+/// ```
 ///
 /// The prefetcher demonstrably ran (47-51k `R`s stored, reaching degree 163-165, i.e. 25 ahead).
 /// It bought nothing because the experiment could not: with the pin on, those `R`s were routed
@@ -3993,6 +4289,9 @@ fn multiply_batch_block<'a>(
         let mut enum_pp_rows: Vec<Vec<u32>> = Vec::new();
         let mut enum_rows: Vec<u32> = Vec::new();
         let mut enum_cols: Vec<u32> = Vec::new();
+        // Per-`R` odometer split plan (`None` = leave this `R` on one thread). Memoised globally, so
+        // this loop only ever pays a lookup after the first launch that touches each `R`.
+        let mut enum_plan: Vec<Option<(u32, Arc<[u32]>)>> = Vec::new();
         for &(rd, ridx) in &distinct_r {
             let r = algebra.basis_element_from_index(rd, ridx);
             assert!(!r.p_part.is_empty(), "each R must be non-empty");
@@ -4033,6 +4332,7 @@ fn multiply_batch_block<'a>(
                     enum_rows.push(r.p_part.len() as u32);
                     enum_cols.push(cols);
                     enum_pp_rows.push(r.p_part.iter().collect::<Vec<_>>());
+                    enum_plan.push(split_plan(r.p_part, num_mats));
                 }
             }
         }
@@ -4068,9 +4368,20 @@ fn multiply_batch_block<'a>(
         // kernel. The padding costs address space in an allocation already rounded to segments.
         let seg_elems_layout = master_seg_elems();
         let mut enum_seg_ranges: Vec<(usize, usize)> = Vec::new();
-        let (enum_pp, enum_width, enum_rows, enum_cols, enum_cs_out, enum_mk_out) = if mode
-            == MasterMode::Transient
-        {
+        let (
+            enum_pp,
+            enum_width,
+            enum_rows,
+            enum_cols,
+            enum_cs_out,
+            enum_mk_out,
+            enum_split,
+            enum_t_slot,
+            enum_t_seed,
+            enum_t_cs,
+            enum_t_mk,
+            enum_t_start,
+        ) = if mode == MasterMode::Transient {
             let w = enum_rows.iter().copied().max().unwrap_or(1) as usize;
             let mut order: Vec<usize> = (0..enum_pp_rows.len()).collect();
             order.sort_unstable_by_key(|&i| r_num_matrices[i]);
@@ -4117,6 +4428,40 @@ fn multiply_batch_block<'a>(
                     *dst = v;
                 }
             }
+            // Expand slots into THREADS: one per `(R, seed)` for split `R`s, one per `R` otherwise.
+            // Threads are emitted in slot order, so a segment's slot range `[lo, hi)` maps to the
+            // thread range `[t_start[lo], t_start[hi])` and each `R`'s threads stay wholly inside
+            // its own segment, exactly as its scratch does.
+            let mut r_split = vec![0u32; order.len()];
+            let (mut t_slot, mut t_seed) = (Vec::new(), Vec::new());
+            let (mut t_cs, mut t_mk) = (Vec::new(), Vec::new());
+            let mut t_start = Vec::with_capacity(order.len() + 1);
+            for (slot, &i) in order.iter().enumerate() {
+                t_start.push(t_slot.len());
+                let (cs_len, mk_len) = (r_cs_len[i] as u64, r_mk_len[i] as u64);
+                match &enum_plan[i] {
+                    Some((sp, starts)) => {
+                        r_split[slot] = *sp;
+                        for (k, &s) in starts.iter().enumerate() {
+                            t_slot.push(slot as u32);
+                            t_seed.push(k as u32);
+                            t_cs.push(cs_out[slot] + s as u64 * cs_len);
+                            t_mk.push(mk_out[slot] + s as u64 * mk_len);
+                        }
+                    }
+                    None => {
+                        // Unsplit: the whole digit range is the sub-walk, and seed 0 is the start.
+                        r_split[slot] = enum_rows[i] * (enum_cols[i] - 1);
+                        t_slot.push(slot as u32);
+                        t_seed.push(0);
+                        t_cs.push(cs_out[slot]);
+                        t_mk.push(mk_out[slot]);
+                    }
+                }
+            }
+            t_start.push(t_slot.len());
+            ENUM_THREADS_TOTAL.fetch_add(t_slot.len() as u64, Ordering::Relaxed);
+
             let pick_u32 = |src: &[u32]| -> Vec<u32> { order.iter().map(|&i| src[i]).collect() };
             (
                 pp,
@@ -4125,11 +4470,23 @@ fn multiply_batch_block<'a>(
                 pick_u32(&enum_cols),
                 cs_out,
                 mk_out,
+                r_split,
+                t_slot,
+                t_seed,
+                t_cs,
+                t_mk,
+                t_start,
             )
         } else {
             (
                 Vec::new(),
                 1usize,
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
                 Vec::new(),
                 Vec::new(),
                 Vec::new(),
@@ -4384,18 +4741,31 @@ fn multiply_batch_block<'a>(
                                 continue;
                             }
                             let base = (s * seg_elems) as u64;
-                            // Segment-local offsets: the kernel indexes this segment's buffer alone.
+                            // Threads for slots `[lo, hi)`. Both the slot index and the output
+                            // offsets are rebased to this segment, because the kernel indexes this
+                            // segment's buffers alone.
+                            let (tlo, thi) = (enum_t_start[lo], enum_t_start[hi]);
+                            let n_t = thi - tlo;
                             let cs_loc: Vec<u64> =
-                                enum_cs_out[lo..hi].iter().map(|&o| o - base).collect();
+                                enum_t_cs[tlo..thi].iter().map(|&o| o - base).collect();
                             let mk_loc: Vec<u64> =
-                                enum_mk_out[lo..hi].iter().map(|&o| o - base).collect();
+                                enum_t_mk[tlo..thi].iter().map(|&o| o - base).collect();
+                            let ts_loc: Vec<u32> = enum_t_slot[tlo..thi]
+                                .iter()
+                                .map(|&v| v - lo as u32)
+                                .collect();
                             let pp_s = &enum_pp[lo * enum_width..hi * enum_width];
-                            let cnt_scratch = client.empty(n_s * size_of::<u32>());
+                            let cnt_scratch = client.empty(n_t * size_of::<u32>());
                             let epp_h = client.create_from_slice(u32::as_bytes(pp_s));
                             let er_h = client.create_from_slice(u32::as_bytes(&enum_rows[lo..hi]));
                             let ec_h = client.create_from_slice(u32::as_bytes(&enum_cols[lo..hi]));
                             let eco_h = client.create_from_slice(u64::as_bytes(&cs_loc));
                             let emo_h = client.create_from_slice(u64::as_bytes(&mk_loc));
+                            let ets_h = client.create_from_slice(u32::as_bytes(&ts_loc));
+                            let etk_h =
+                                client.create_from_slice(u32::as_bytes(&enum_t_seed[tlo..thi]));
+                            let esp_h =
+                                client.create_from_slice(u32::as_bytes(&enum_split[lo..hi]));
                             enum_keep.extend([
                                 cnt_scratch.clone(),
                                 epp_h.clone(),
@@ -4403,9 +4773,11 @@ fn multiply_batch_block<'a>(
                                 ec_h.clone(),
                                 eco_h.clone(),
                                 emo_h.clone(),
+                                ets_h.clone(),
+                                etk_h.clone(),
+                                esp_h.clone(),
                             ]);
-                            let dmy_h = enum_split_dummy(&client);
-                            let enum_blocks = (n_s as u32).div_ceil(ENUM_THREADS).max(1);
+                            let enum_blocks = (n_t as u32).div_ceil(ENUM_THREADS).max(1);
                             ENUM_LAUNCHES.fetch_add(1, Ordering::Relaxed);
                             ENUM_RS.fetch_add(n_s as u64, Ordering::Relaxed);
                             ENUM_RS_MAX.fetch_max(n_s as u64, Ordering::Relaxed);
@@ -4422,15 +4794,15 @@ fn multiply_batch_block<'a>(
                                     BufferArg::from_raw_parts(emo_h, n_s),
                                     BufferArg::from_raw_parts(cs_segs[s].0.clone(), cs_segs[s].1),
                                     BufferArg::from_raw_parts(mk_segs[s].0.clone(), mk_segs[s].1),
-                                    BufferArg::from_raw_parts(cnt_scratch, n_s),
+                                    BufferArg::from_raw_parts(cnt_scratch, n_t),
                                     enum_width,
-                                    n_s,
+                                    n_t,
                                     0u32,
-                                    BufferArg::from_raw_parts(dmy_h.clone(), 1),
-                                    BufferArg::from_raw_parts(dmy_h.clone(), 1),
-                                    BufferArg::from_raw_parts(dmy_h, 1),
+                                    BufferArg::from_raw_parts(ets_h, n_t),
+                                    BufferArg::from_raw_parts(etk_h, n_t),
+                                    BufferArg::from_raw_parts(esp_h, n_s),
                                     1,
-                                    false,
+                                    true,
                                 );
                             }
                         }
@@ -4919,6 +5291,14 @@ fn multiply_batch_block<'a>(
                     // 132 SMs x 24 resident blocks (the measured Block Limit Registers at 40
                     // regs/thread) = 3168 block slots on an H200.
                     ENUM_BLOCKS.load(Ordering::Relaxed) as f64 / el.max(1) as f64 / 3168.0,
+                );
+                // Odometer-split expansion: threads issued per `R`. 1.0 means the split never fired
+                // (every `R` below `NASSAU_GPU_ENUM_SPLIT_MIN`, or the split switched off).
+                eprintln!(
+                    "  enum split: {:.0} threads/launch, {:.2}x expansion over R's",
+                    ENUM_THREADS_TOTAL.load(Ordering::Relaxed) as f64 / el.max(1) as f64,
+                    ENUM_THREADS_TOTAL.load(Ordering::Relaxed) as f64
+                        / ENUM_RS.load(Ordering::Relaxed).max(1) as f64,
                 );
             }
 
@@ -5807,95 +6187,6 @@ mod tests {
         );
     }
 
-    /// Backend-agnostic host driver for [`enumerate_admissible_kernel`]. Lays out each `R`'s scratch
-    /// slot from the supplied per-`R` `num_mats` (a prefix-sum of `num_mats·cs_len` / `num_mats·mk_len`),
-    /// uploads the compact per-`R` inputs, launches one thread per `R` on `device`, and reads back the
-    /// packed `(out_cs, out_mk, counts)`. Generic over [`Runtime`] so the *same* kernel can be run on
-    /// CUDA (the H200 path) and on the `cpu` backend — the cross-lowering check the caller uses to
-    /// confirm the device semantics match [`enumerate_admissible_ref`] without needing a GPU.
-    /// Where each seed's sub-chain starts, in matrices, for a split of `p_part` at digit `sp`.
-    ///
-    /// `len()` is the thread count for this `R` and consecutive differences are the sub-chain
-    /// lengths, so `starts[k] * cs_len` is exactly the offset thread `k` must write at for the
-    /// concatenation to reproduce the unsplit stream.
-    fn seed_starts(p_part: &[u32], sp: usize) -> Vec<u32> {
-        let (mut matrix, mut totals, mut col_sums, mut masks, rows, cols) = odometer_init(p_part);
-        let total_digits = rows * (cols - 1);
-        let mut starts = Vec::new();
-        let mut acc = 0u32;
-        let mut more_suffix = true;
-        while more_suffix {
-            starts.push(acc);
-            let (mut m, mut t, mut cs, mut mk) = (
-                matrix.clone(),
-                totals.clone(),
-                col_sums.clone(),
-                masks.clone(),
-            );
-            let mut n = 1u32;
-            while odometer_step_ref(&mut m, &mut t, &mut cs, &mut mk, rows, cols, 0, sp) {
-                n += 1;
-            }
-            acc += n;
-            more_suffix = odometer_step_ref(
-                &mut matrix,
-                &mut totals,
-                &mut col_sums,
-                &mut masks,
-                rows,
-                cols,
-                sp,
-                total_digits,
-            );
-        }
-        starts
-    }
-
-    /// How many suffix states a split at `sp` yields. Costs exactly that many odometer steps.
-    fn count_suffix_states(p_part: &[u32], sp: usize) -> usize {
-        let (mut matrix, mut totals, mut col_sums, mut masks, rows, cols) = odometer_init(p_part);
-        let total_digits = rows * (cols - 1);
-        let mut n = 1usize;
-        while odometer_step_ref(
-            &mut matrix,
-            &mut totals,
-            &mut col_sums,
-            &mut masks,
-            rows,
-            cols,
-            sp,
-            total_digits,
-        ) {
-            n += 1;
-        }
-        n
-    }
-
-    /// The largest split position (fewest seeds) that still yields at least `target` threads.
-    ///
-    /// Seeds increase as `sp` decreases, so this walks `sp` down from the unsplit end and stops at
-    /// the first position that clears the target. Cost is the sum of the state counts it tried,
-    /// which is dominated by the last one — about `2 * target` steps, independent of the chain
-    /// length. That is what makes it usable on the marshal path, unlike [`best_split_pos`], which
-    /// is exhaustive and costs a full walk per candidate position.
-    fn heuristic_split_pos(p_part: &[u32], target: usize) -> usize {
-        let rows = p_part.len();
-        let cols = p_part
-            .iter()
-            .map(|&x| (u32::BITS - x.leading_zeros()) as usize)
-            .max()
-            .unwrap();
-        let total = rows * (cols - 1);
-        let mut sp = total;
-        while sp > 0 {
-            if count_suffix_states(p_part, sp) >= target {
-                return sp;
-            }
-            sp -= 1;
-        }
-        0
-    }
-
     /// Split position for `p_part`, chosen to minimise `states + longest` — the two-phase critical
     /// path of "enumerate seeds, then run the longest sub-chain". Exhaustive over digit positions,
     /// which is fine here; production wants a cheaper rule.
@@ -5917,7 +6208,15 @@ mod tests {
         best.1
     }
 
-    /// Optionally maps threads to `(R, seed)` pairs instead of to `R`s.
+    /// Backend-agnostic host driver for [`enumerate_admissible_kernel`]. Lays out each `R`'s scratch
+    /// slot from the supplied per-`R` `num_mats` (a prefix-sum of `num_mats·cs_len` / `num_mats·mk_len`),
+    /// uploads the compact per-`R` inputs, launches the threads on `device`, and reads back the
+    /// packed `(out_cs, out_mk, counts)`. Generic over [`Runtime`] so the *same* kernel can be run on
+    /// CUDA (the H200 path) and on the `cpu` backend — the cross-lowering check the caller uses to
+    /// confirm the device semantics match [`enumerate_admissible_ref`] without needing a GPU.
+    ///
+    /// With `split`, threads map to `(R, seed)` pairs rather than to `R`s; `counts` is then per
+    /// THREAD, and the emitted stream must still be bit-identical to the unsplit one.
     ///
     /// The split output must be BIT-IDENTICAL to the unsplit output, not merely a permutation —
     /// that is the whole claim being tested, and it is what lets the production master stay
@@ -6252,138 +6551,6 @@ mod tests {
         }
 
         (cs_len, mk_len, out_cs, out_mk)
-    }
-
-    /// One `next()` step of the admissible-matrix odometer, restricted to digits `lo_pos..hi_pos`.
-    ///
-    /// Flag-based: `found` = "produced a new matrix" (the original's `return true`); `handled` =
-    /// "this column already updated `totals`" (the original's `continue 'mid`, which skips the
-    /// trailing add). Loops are guarded by `!found` instead of breaking, because that is the subset
-    /// the cubecl DSL compiles cleanly.
-    ///
-    /// # Why the row range is a parameter
-    ///
-    /// The walk is a mixed-radix odometer over rows with row 0 varying FASTEST. The admissibility
-    /// constraint on row `row` is the anti-diagonal bitsum `d`, which reads `matrix[row + col - c][c]`
-    /// for `c < col` — and `row + col - c > row` there, so **`d` only ever reads rows with a LARGER
-    /// index**, i.e. only the slower-varying digits, which are frozen while row `row` varies.
-    ///
-    /// Hence for any fixed state of the suffix rows `j..rows`, the sub-odometer over rows `0..j` is
-    /// independent of how that suffix state was reached, and the full walk factors exactly as
-    ///
-    /// ```text
-    /// for each suffix state (steps with lo = j, hi = rows)
-    ///     for each sub state (steps with lo = 0, hi = j)
-    /// ```
-    ///
-    /// contiguously, and in the SAME ORDER as the unsplit walk. That is what licenses giving each
-    /// suffix state its own thread: a launch's duration is set by its longest single `R` chain
-    /// (one thread, sequential odometer), so splitting that chain is the only thing that can move
-    /// the maximum — and doing it this way keeps the emitted master bit-identical, so it is
-    /// checkable against the unsplit walk rather than taken on faith.
-    /// `admissible_enum_split_matches` asserts that equivalence for every `j` over real `R`s.
-    ///
-    /// # Digit granularity
-    ///
-    /// The split point is a DIGIT position, not a row. Digits are `(row, col)` for `col in 1..cols`,
-    /// numbered `pos = row * (cols - 1) + (col - 1)`, fastest first — the order the odometer scans.
-    /// Row granularity is too coarse to balance: the long-pole `R`s at degree 150 all have
-    /// `rows == 2`, so a row split offers exactly one non-degenerate choice and lands 36x8432 when
-    /// what is wanted is ~332x332. Splitting between columns of the same row is legitimate for the
-    /// same reason splitting between rows is — with `rows == 2`, `d` at `(0, col)` reads only
-    /// `matrix[1][col - 1]`, a frozen row, so row 0's own columns do not constrain each other.
-    ///
-    /// Columns below `lo_pos` in the starting row are still scanned, because `totals[row]`
-    /// accumulates `p^col * matrix[row][col]` across the whole row and column 0 is the remainder;
-    /// they are simply not offered as increment sites. Digits outside `lo_pos..hi_pos` are left
-    /// untouched otherwise: the reset that follows a successful increment clears rows
-    /// `lo_row..row`, not `0..row`.
-    fn odometer_step_ref(
-        matrix: &mut [u32],
-        totals: &mut [u32],
-        col_sums: &mut [u32],
-        masks: &mut [u32],
-        rows: usize,
-        cols: usize,
-        lo_pos: usize,
-        hi_pos: usize,
-    ) -> bool {
-        // `cols == 1` (every `p_part` entry is 1) has no digits at all: the column loop below never
-        // runs and the walk is a single matrix. `max(1)` only keeps the index arithmetic total;
-        // `hi_pos` is 0 there, so the row loop is empty and this correctly reports "no successor".
-        let per_row = (cols - 1).max(1);
-        let lo_row = lo_pos / per_row;
-        let hi_row = hi_pos.div_ceil(per_row).min(rows);
-        let mut found = false;
-        let mut row = lo_row;
-        while row < hi_row && !found {
-            let mut p_to_the_j: u32 = 1;
-            totals[row] = matrix[row * cols]; // get(row, 0)
-            let mut col = 1;
-            while col < cols && !found {
-                p_to_the_j *= 2;
-                let mut handled = false;
-                let pos = row * per_row + (col - 1);
-                if pos >= lo_pos && pos < hi_pos && p_to_the_j <= totals[row] {
-                    // Bitsum along the anti-diagonal to the bottom-left. Reads only rows `> row`.
-                    let mut d = 0u32;
-                    let mut c = (row + col + 1).saturating_sub(rows);
-                    while c < col {
-                        d |= matrix[(row + col - c) * cols + c];
-                        c += 1;
-                    }
-                    let cur = matrix[row * cols + col];
-                    let new_entry = ((cur | d) + 1) & !d;
-                    let inc = new_entry - cur;
-                    let sub = inc * p_to_the_j;
-                    if totals[row] < sub {
-                        totals[row] += p_to_the_j * cur;
-                        handled = true;
-                    } else {
-                        matrix[row * cols] = totals[row] - sub; // set(row, 0, ..)
-                        masks[row] = matrix[row * cols];
-                        col_sums[col - 1] += inc;
-                        let mut j = 1;
-                        while j < col {
-                            masks[row + j] &= !matrix[row * cols + j];
-                            col_sums[j - 1] -= matrix[row * cols + j];
-                            matrix[row * cols + j] = 0;
-                            j += 1;
-                        }
-                        matrix[row * cols + col] = new_entry;
-                        // Reset the faster digits. `lo_row`, not 0: rows below the split belong to a
-                        // different (already seeded) sub-walk and must not be disturbed. Columns
-                        // 1..col of `row` are cleared by the loop above; when the split falls mid-row
-                        // those include sub-walk columns, which is correct — they are zero in this
-                        // state and zero is exactly what the sub-walk seeds from.
-                        let mut i = lo_row;
-                        while i < row {
-                            matrix[i * cols] = totals[i];
-                            masks[i] = totals[i];
-                            let mut j = 1;
-                            while j < cols {
-                                if i + j > row {
-                                    masks[i + j] &= !matrix[i * cols + j];
-                                }
-                                col_sums[j - 1] -= matrix[i * cols + j];
-                                matrix[i * cols + j] = 0;
-                                j += 1;
-                            }
-                            i += 1;
-                        }
-                        masks[row + col] = d | new_entry;
-                        found = true;
-                        handled = true;
-                    }
-                }
-                if !handled {
-                    totals[row] += p_to_the_j * matrix[row * cols + col];
-                }
-                col += 1;
-            }
-            row += 1;
-        }
-        found
     }
 
     /// The same enumeration as [`enumerate_admissible_ref`], but performed as the split walk:
@@ -7437,31 +7604,6 @@ mod tests {
         }
         assert!(checked > 0, "no R's exercised");
         eprintln!("admissible_enum_ref: {checked} R's matched admissible_matrices");
-    }
-
-    /// Fresh odometer state for `p_part`: `(matrix, totals, col_sums, masks, rows, cols)`.
-    #[allow(clippy::type_complexity)]
-    fn odometer_init(p_part: &[u32]) -> (Vec<u32>, Vec<u32>, Vec<u32>, Vec<u32>, usize, usize) {
-        let rows = p_part.len();
-        let cols = p_part
-            .iter()
-            .map(|&x| (u32::BITS - x.leading_zeros()) as usize)
-            .max()
-            .unwrap();
-        let mut matrix = vec![0u32; rows * cols];
-        let mut masks = vec![0u32; rows + cols - 1];
-        for (i, &x) in p_part.iter().enumerate() {
-            matrix[i * cols] = x;
-            masks[i] = x;
-        }
-        (
-            matrix,
-            vec![0u32; rows],
-            vec![0u32; cols - 1],
-            masks,
-            rows,
-            cols,
-        )
     }
 
     /// `(suffix states, longest sub-walk)` for splitting `p_part`'s odometer at `j`.
