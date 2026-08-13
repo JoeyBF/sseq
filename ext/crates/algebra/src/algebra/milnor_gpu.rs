@@ -1077,6 +1077,17 @@ static COLD_COUNT: LazyLock<RwLock<HashMap<PPart, (u32, u32, u32)>>> =
 /// miss it runs `admissible_matrices` purely to *count* (the returned arrays are dropped, not kept —
 /// the device enumerates them), then memoizes the triple. Layout matches [`resident_info`]'s so the
 /// kernel indexes the on-device-enumerated scratch identically to the resident master.
+/// A 1-element buffer standing in for the split inputs of an UNSPLIT enumeration launch.
+///
+/// `split == false` is comptime, so every read of `t_slot`/`t_seed`/`r_split` is compiled out and
+/// the contents are never observed — but cubecl still requires a bound buffer, and a zero-length one
+/// is not permitted.
+fn enum_split_dummy<Rt: cubecl::prelude::Runtime>(
+    client: &cubecl::prelude::ComputeClient<Rt>,
+) -> cubecl::server::Handle {
+    client.create_from_slice(u32::as_bytes(&[0u32]))
+}
+
 fn cold_count(algebra: &MilnorAlgebra, p_part: PPart) -> (u32, u32, u32) {
     if let Some(&e) = COLD_COUNT.read().unwrap().get(&p_part) {
         return e;
@@ -1560,6 +1571,7 @@ fn enumerate_counts_gpu(pps: &[PPart], dev: usize) -> Vec<u32> {
             ENUM_RS.fetch_add(n_r as u64, Ordering::Relaxed);
             ENUM_RS_MAX.fetch_max(n_r as u64, Ordering::Relaxed);
             record_batch(n_r);
+            let dmy_h = enum_split_dummy(client);
             unsafe {
                 enumerate_admissible_kernel::launch_unchecked::<CudaRuntime>(
                     client,
@@ -1576,7 +1588,11 @@ fn enumerate_counts_gpu(pps: &[PPart], dev: usize) -> Vec<u32> {
                     width,
                     n_r,
                     0u32,
+                    BufferArg::from_raw_parts(dmy_h.clone(), 1),
+                    BufferArg::from_raw_parts(dmy_h.clone(), 1),
+                    BufferArg::from_raw_parts(dmy_h, 1),
                     0,
+                    false,
                 );
             }
             u32::from_bytes(&client.read_one(cnt_h).unwrap()).to_vec()
@@ -1652,6 +1668,7 @@ fn enumerate_batch_gpu(
             ENUM_RS_MAX.fetch_max(m as u64, Ordering::Relaxed);
             record_batch(m);
             ENUM_BLOCKS.fetch_add((m as u32).div_ceil(ENUM_BLOCK) as u64, Ordering::Relaxed);
+            let dmy_h = enum_split_dummy(client);
             unsafe {
                 enumerate_admissible_kernel::launch_unchecked::<CudaRuntime>(
                     client,
@@ -1668,7 +1685,11 @@ fn enumerate_batch_gpu(
                     width,
                     m,
                     0u32,
+                    BufferArg::from_raw_parts(dmy_h.clone(), 1),
+                    BufferArg::from_raw_parts(dmy_h.clone(), 1),
+                    BufferArg::from_raw_parts(dmy_h, 1),
                     1,
+                    false,
                 );
             }
             (
@@ -4361,6 +4382,7 @@ fn multiply_batch_block<'a>(
                                 eco_h.clone(),
                                 emo_h.clone(),
                             ]);
+                            let dmy_h = enum_split_dummy(&client);
                             let enum_blocks = (n_s as u32).div_ceil(ENUM_THREADS).max(1);
                             ENUM_LAUNCHES.fetch_add(1, Ordering::Relaxed);
                             ENUM_RS.fetch_add(n_s as u64, Ordering::Relaxed);
@@ -4382,7 +4404,11 @@ fn multiply_batch_block<'a>(
                                     enum_width,
                                     n_s,
                                     0u32,
+                                    BufferArg::from_raw_parts(dmy_h.clone(), 1),
+                                    BufferArg::from_raw_parts(dmy_h.clone(), 1),
+                                    BufferArg::from_raw_parts(dmy_h, 1),
                                     1,
+                                    false,
                                 );
                             }
                         }
@@ -5187,19 +5213,49 @@ fn enumerate_admissible_kernel(
     // Wrap mask for `emit == 2` only (power-of-two - 1), keeping the probe's rewritten indices in
     // bounds; ignored by every other mode.
     wrap: u32,
+    // Split inputs. `split == false` compiles them out entirely and the thread mapping collapses to
+    // "thread = R", which is what every unsplit call site relies on; the buffers are then bound as
+    // 1-element dummies and never indexed. See the module note on `odometer_step_ref` for why the
+    // split is legitimate and why the emitted master stays bit-identical.
+    t_slot: &[u32],
+    t_seed: &[u32],
+    r_split: &[u32],
     #[comptime] emit: u32,
+    #[comptime] split: bool,
 ) {
-    let ri = ABSOLUTE_POS;
-    if ri >= n_r {
+    let ti = ABSOLUTE_POS;
+    if ti >= n_r {
         terminate!();
     }
-    let rows = usize::cast_from(r_rows[ri]);
-    let cols = usize::cast_from(r_cols[ri]);
+    // Which `R` this thread serves, and which seed of that `R`'s suffix walk it starts from.
+    let mut slot = ti;
+    let mut seed = 0usize;
+    if split {
+        slot = usize::cast_from(t_slot[ti]);
+        seed = usize::cast_from(t_seed[ti]);
+    }
+    let rows = usize::cast_from(r_rows[slot]);
+    let cols = usize::cast_from(r_cols[slot]);
     let cs_len = cols - 1;
     let mk_len = rows + cols - 1;
-    let pbase = ri * width;
-    let cs_base = usize::cast_from(r_cs_out[ri]);
-    let mk_base = usize::cast_from(r_mk_out[ri]);
+    let pbase = slot * width;
+    // Per-THREAD when split (the host has already folded in this seed's matrix offset within the
+    // `R`'s block), per-`R` otherwise — which is the same thing, since `ti == slot` there.
+    let cs_base = usize::cast_from(r_cs_out[ti]);
+    let mk_base = usize::cast_from(r_mk_out[ti]);
+
+    // Digit positions: `(row, col)` numbered `row * (cols - 1) + (col - 1)`, fastest first. The
+    // thread walks the SUFFIX digits `[sp, total)` `seed` times to reach its seed state, then walks
+    // the SUB digits `[0, sp)` from there, emitting. `sp == total` is the unsplit walk.
+    let mut per_row = cols - 1;
+    if per_row < 1 {
+        per_row = 1;
+    }
+    let total_digits = rows * (cols - 1);
+    let mut sp = total_digits;
+    if split {
+        sp = usize::cast_from(r_split[slot]);
+    }
 
     // Per-thread local state, mirroring `AdmissibleMatrix` / `enumerate_admissible_ref`. CUDA local
     // arrays are uninitialized, so every slot up to the comptime cap is explicitly zeroed first.
@@ -5235,6 +5291,19 @@ fn enumerate_admissible_kernel(
         st[(ENUM_ST_MASKS + i) * bs + tid] = x;
     }
 
+    // Phase 1 seeks with `(lo, hi) = (sp, total)`; phase 2 emits with `(0, sp)`. `left` counts the
+    // suffix steps still owed before this thread reaches its seed. A thread whose seed index is past
+    // the end of the suffix walk simply finds nothing and reports zero matrices, so the grid may be
+    // over-provisioned safely.
+    let mut lo = sp;
+    let mut hi = total_digits;
+    let mut emitting = seed == 0;
+    if emitting {
+        lo = 0;
+        hi = sp;
+    }
+    let mut left = seed;
+
     let mut mat = 0usize;
     let mut more = true;
     while more {
@@ -5243,53 +5312,64 @@ fn enumerate_admissible_kernel(
         // per thread but scattered across the warp. 2 = lane-adjacent indices, which coalesces the
         // warp but writes garbage layout -- a TIMING PROBE ONLY, never correct output. 3 = every
         // other entry, halving both store count and bytes.
-        if emit == 1 {
-            let co = cs_base + mat * cs_len;
-            for j in 0..cs_len {
-                out_cs[co + j] = u16::cast_from(st[(ENUM_ST_COLSUMS + j) * bs + tid]);
+        if emitting {
+            if emit == 1 {
+                let co = cs_base + mat * cs_len;
+                for j in 0..cs_len {
+                    out_cs[co + j] = u16::cast_from(st[(ENUM_ST_COLSUMS + j) * bs + tid]);
+                }
+                let mo = mk_base + mat * mk_len;
+                for j in 0..mk_len {
+                    out_mk[mo + j] = u16::cast_from(st[(ENUM_ST_MASKS + j) * bs + tid]);
+                }
+            } else if emit == 2 {
+                let w = usize::cast_from(wrap);
+                for j in 0..cs_len {
+                    out_cs[(ti + n_r * (mat * cs_len + j)) & w] =
+                        u16::cast_from(st[(ENUM_ST_COLSUMS + j) * bs + tid]);
+                }
+                for j in 0..mk_len {
+                    out_mk[(ti + n_r * (mat * mk_len + j)) & w] =
+                        u16::cast_from(st[(ENUM_ST_MASKS + j) * bs + tid]);
+                }
+            } else if emit == 3 {
+                let co = cs_base + mat * cs_len;
+                let mut j = 0usize;
+                while j < cs_len {
+                    out_cs[co + j] = u16::cast_from(st[(ENUM_ST_COLSUMS + j) * bs + tid]);
+                    j += 2;
+                }
+                let mo = mk_base + mat * mk_len;
+                let mut j2 = 0usize;
+                while j2 < mk_len {
+                    out_mk[mo + j2] = u16::cast_from(st[(ENUM_ST_MASKS + j2) * bs + tid]);
+                    j2 += 2;
+                }
             }
-            let mo = mk_base + mat * mk_len;
-            for j in 0..mk_len {
-                out_mk[mo + j] = u16::cast_from(st[(ENUM_ST_MASKS + j) * bs + tid]);
-            }
-        } else if emit == 2 {
-            let w = usize::cast_from(wrap);
-            for j in 0..cs_len {
-                out_cs[(ri + n_r * (mat * cs_len + j)) & w] =
-                    u16::cast_from(st[(ENUM_ST_COLSUMS + j) * bs + tid]);
-            }
-            for j in 0..mk_len {
-                out_mk[(ri + n_r * (mat * mk_len + j)) & w] =
-                    u16::cast_from(st[(ENUM_ST_MASKS + j) * bs + tid]);
-            }
-        } else if emit == 3 {
-            let co = cs_base + mat * cs_len;
-            let mut j = 0usize;
-            while j < cs_len {
-                out_cs[co + j] = u16::cast_from(st[(ENUM_ST_COLSUMS + j) * bs + tid]);
-                j += 2;
-            }
-            let mo = mk_base + mat * mk_len;
-            let mut j2 = 0usize;
-            while j2 < mk_len {
-                out_mk[mo + j2] = u16::cast_from(st[(ENUM_ST_MASKS + j2) * bs + tid]);
-                j2 += 2;
-            }
+            mat += 1;
         }
-        mat += 1;
 
-        // One `next()` step: `found` = produced a new matrix (the ref's `return true`); `handled`
-        // = this column already updated `totals` (the ref's `continue`). Loops guard on `!found`.
+        // One `next()` step over digits `[lo, hi)`: `found` = produced a new matrix (the ref's
+        // `return true`); `handled` = this column already updated `totals` (the ref's `continue`).
+        // Loops guard on `!found`. Columns below `lo` in the starting row are still scanned, because
+        // `totals[row]` accumulates across the whole row and column 0 is the remainder; they are just
+        // not offered as increment sites.
+        let lo_row = lo / per_row;
+        let mut hi_row = hi.div_ceil(per_row);
+        if hi_row > rows {
+            hi_row = rows;
+        }
         let mut found = false;
-        let mut row = 0usize;
-        while row < rows && !found {
+        let mut row = lo_row;
+        while row < hi_row && !found {
             let mut p_to_the_j = 1u32;
             st[(ENUM_ST_TOTALS + row) * bs + tid] = st[(row * cols) * bs + tid];
             let mut col = 1usize;
             while col < cols && !found {
                 p_to_the_j *= 2u32;
                 let mut handled = false;
-                if p_to_the_j <= st[(ENUM_ST_TOTALS + row) * bs + tid] {
+                let pos = row * per_row + (col - 1);
+                if pos >= lo && pos < hi && p_to_the_j <= st[(ENUM_ST_TOTALS + row) * bs + tid] {
                     // Bitsum along the anti-diagonal to the bottom-left (saturating start index).
                     let mut d = 0u32;
                     let mut c = 0usize;
@@ -5325,7 +5405,9 @@ fn enumerate_admissible_kernel(
                             j += 1;
                         }
                         st[(row * cols + col) * bs + tid] = new_entry;
-                        let mut i = 0usize;
+                        // `lo_row`, not 0: rows below the split belong to a different thread's
+                        // sub-walk and must not be disturbed.
+                        let mut i = lo_row;
                         while i < row {
                             st[(i * cols) * bs + tid] = st[(ENUM_ST_TOTALS + i) * bs + tid];
                             st[(ENUM_ST_MASKS + i) * bs + tid] =
@@ -5359,9 +5441,20 @@ fn enumerate_admissible_kernel(
             row += 1;
         }
         more = found;
+        // Still seeking: charge the suffix step, and switch to the sub-walk on arrival. If the
+        // suffix walk ran out first (`!found`) this thread's seed does not exist and it exits
+        // having emitted nothing, which is what makes an over-provisioned grid safe.
+        if !emitting {
+            left -= 1;
+            if left == 0 && found {
+                emitting = true;
+                lo = 0;
+                hi = sp;
+            }
+        }
     }
 
-    out_counts[ri] = u32::cast_from(mat);
+    out_counts[ti] = u32::cast_from(mat);
 }
 
 #[cfg(test)]
@@ -5698,10 +5791,75 @@ mod tests {
     /// packed `(out_cs, out_mk, counts)`. Generic over [`Runtime`] so the *same* kernel can be run on
     /// CUDA (the H200 path) and on the `cpu` backend — the cross-lowering check the caller uses to
     /// confirm the device semantics match [`enumerate_admissible_ref`] without needing a GPU.
-    fn enumerate_admissible_on_runtime<R: Runtime>(
+    /// Where each seed's sub-chain starts, in matrices, for a split of `p_part` at digit `sp`.
+    ///
+    /// `len()` is the thread count for this `R` and consecutive differences are the sub-chain
+    /// lengths, so `starts[k] * cs_len` is exactly the offset thread `k` must write at for the
+    /// concatenation to reproduce the unsplit stream.
+    fn seed_starts(p_part: &[u32], sp: usize) -> Vec<u32> {
+        let (mut matrix, mut totals, mut col_sums, mut masks, rows, cols) = odometer_init(p_part);
+        let total_digits = rows * (cols - 1);
+        let mut starts = Vec::new();
+        let mut acc = 0u32;
+        let mut more_suffix = true;
+        while more_suffix {
+            starts.push(acc);
+            let (mut m, mut t, mut cs, mut mk) = (
+                matrix.clone(),
+                totals.clone(),
+                col_sums.clone(),
+                masks.clone(),
+            );
+            let mut n = 1u32;
+            while odometer_step_ref(&mut m, &mut t, &mut cs, &mut mk, rows, cols, 0, sp) {
+                n += 1;
+            }
+            acc += n;
+            more_suffix = odometer_step_ref(
+                &mut matrix,
+                &mut totals,
+                &mut col_sums,
+                &mut masks,
+                rows,
+                cols,
+                sp,
+                total_digits,
+            );
+        }
+        starts
+    }
+
+    /// Split position for `p_part`, chosen to minimise `states + longest` — the two-phase critical
+    /// path of "enumerate seeds, then run the longest sub-chain". Exhaustive over digit positions,
+    /// which is fine here; production wants a cheaper rule.
+    fn best_split_pos(p_part: &[u32]) -> usize {
+        let rows = p_part.len();
+        let cols = p_part
+            .iter()
+            .map(|&x| (u32::BITS - x.leading_zeros()) as usize)
+            .max()
+            .unwrap();
+        let total = rows * (cols - 1);
+        let mut best = (usize::MAX, total);
+        for sp in 0..=total {
+            let (states, longest) = split_profile(p_part, sp);
+            if states + longest < best.0 {
+                best = (states + longest, sp);
+            }
+        }
+        best.1
+    }
+
+    /// Optionally maps threads to `(R, seed)` pairs instead of to `R`s.
+    ///
+    /// The split output must be BIT-IDENTICAL to the unsplit output, not merely a permutation —
+    /// that is the whole claim being tested, and it is what lets the production master stay
+    /// byte-compatible with everything that indexes into it.
+    fn enumerate_admissible_on_runtime_split<R: Runtime>(
         device: &R::Device,
         p_parts: &[Vec<u32>],
         num_mats: &[u32],
+        split: bool,
     ) -> (Vec<u16>, Vec<u16>, Vec<u32>) {
         let n_r = p_parts.len();
         let width = p_parts.iter().map(Vec::len).max().unwrap();
@@ -5709,8 +5867,12 @@ mod tests {
         let mut pp_flat = vec![0u32; n_r * width];
         let mut r_rows = vec![0u32; n_r];
         let mut r_cols = vec![0u32; n_r];
-        let mut r_cs_out = vec![0u64; n_r];
-        let mut r_mk_out = vec![0u64; n_r];
+        let mut r_split = vec![0u32; n_r];
+        // Per-THREAD output bases; with `split == false` there is exactly one thread per `R`.
+        let mut t_cs_out: Vec<u64> = Vec::new();
+        let mut t_mk_out: Vec<u64> = Vec::new();
+        let mut t_slot: Vec<u32> = Vec::new();
+        let mut t_seed: Vec<u32> = Vec::new();
         let mut cs_total = 0u64;
         let mut mk_total = 0u64;
         for (i, pp) in p_parts.iter().enumerate() {
@@ -5727,27 +5889,46 @@ mod tests {
             }
             r_rows[i] = rows as u32;
             r_cols[i] = cols as u32;
-            r_cs_out[i] = cs_total;
-            r_mk_out[i] = mk_total;
+            let sp = if split {
+                best_split_pos(pp)
+            } else {
+                rows * (cols - 1)
+            };
+            r_split[i] = sp as u32;
+            let starts = if split {
+                seed_starts(pp, sp)
+            } else {
+                vec![0u32]
+            };
+            for (k, &s) in starts.iter().enumerate() {
+                t_slot.push(i as u32);
+                t_seed.push(k as u32);
+                t_cs_out.push(cs_total + s as u64 * cs_len);
+                t_mk_out.push(mk_total + s as u64 * mk_len);
+            }
             cs_total += num_mats[i] as u64 * cs_len;
             mk_total += num_mats[i] as u64 * mk_len;
         }
+        let n_t = t_slot.len();
 
         let client = R::client(device);
         let pp_h = client.create_from_slice(u32::as_bytes(&pp_flat));
         let rr_h = client.create_from_slice(u32::as_bytes(&r_rows));
         let rc_h = client.create_from_slice(u32::as_bytes(&r_cols));
-        let rco_h = client.create_from_slice(u64::as_bytes(&r_cs_out));
-        let rmo_h = client.create_from_slice(u64::as_bytes(&r_mk_out));
+        let rco_h = client.create_from_slice(u64::as_bytes(&t_cs_out));
+        let rmo_h = client.create_from_slice(u64::as_bytes(&t_mk_out));
+        let ts_h = client.create_from_slice(u32::as_bytes(&t_slot));
+        let tk_h = client.create_from_slice(u32::as_bytes(&t_seed));
+        let rsp_h = client.create_from_slice(u32::as_bytes(&r_split));
         // `empty` needs a non-zero size even when a batch happens to have no matrices.
         let cs_cap = (cs_total.max(1)) as usize;
         let mk_cap = (mk_total.max(1)) as usize;
         let ocs_h = client.empty(cs_cap * size_of::<u16>());
         let omk_h = client.empty(mk_cap * size_of::<u16>());
-        let cnt_h = client.empty(n_r * size_of::<u32>());
+        let cnt_h = client.empty(n_t * size_of::<u32>());
 
         const THREADS: u32 = ENUM_BLOCK; // must match the kernel's shared stride
-        let cubes = (n_r as u32).div_ceil(THREADS);
+        let cubes = (n_t as u32).div_ceil(THREADS);
         unsafe {
             enumerate_admissible_kernel::launch_unchecked::<R>(
                 &client,
@@ -5756,15 +5937,19 @@ mod tests {
                 BufferArg::from_raw_parts(pp_h, pp_flat.len()),
                 BufferArg::from_raw_parts(rr_h, n_r),
                 BufferArg::from_raw_parts(rc_h, n_r),
-                BufferArg::from_raw_parts(rco_h, n_r),
-                BufferArg::from_raw_parts(rmo_h, n_r),
+                BufferArg::from_raw_parts(rco_h, n_t),
+                BufferArg::from_raw_parts(rmo_h, n_t),
                 BufferArg::from_raw_parts(ocs_h.clone(), cs_cap),
                 BufferArg::from_raw_parts(omk_h.clone(), mk_cap),
-                BufferArg::from_raw_parts(cnt_h.clone(), n_r),
+                BufferArg::from_raw_parts(cnt_h.clone(), n_t),
                 width,
-                n_r,
+                n_t,
                 0u32,
+                BufferArg::from_raw_parts(ts_h, n_t),
+                BufferArg::from_raw_parts(tk_h, n_t),
+                BufferArg::from_raw_parts(rsp_h, n_r),
                 1,
+                split,
             );
         }
         // Truncate off the `max(1)` padding element present when a batch has zero col_sums / masks (an
@@ -5793,8 +5978,6 @@ mod tests {
     #[test]
     #[ignore = "diagnostic: needs a CUDA device; run explicitly"]
     fn enum_emit_store_cost() {
-        use std::time::Instant;
-
         use fp::prime::ValidPrime;
 
         let algebra = MilnorAlgebra::new(ValidPrime::new(2), false);
@@ -5914,6 +6097,7 @@ mod tests {
         const THREADS: u32 = ENUM_BLOCK; // must match the kernel's shared stride
         let cubes = (n_r as u32).div_ceil(THREADS);
         let mut times: Vec<f64> = Vec::new();
+        let dmy_h = enum_split_dummy(&client);
         for _ in 0..5 {
             let t0 = Instant::now();
             unsafe {
@@ -5932,7 +6116,11 @@ mod tests {
                     width,
                     n_r,
                     wrap,
+                    BufferArg::from_raw_parts(dmy_h.clone(), 1),
+                    BufferArg::from_raw_parts(dmy_h.clone(), 1),
+                    BufferArg::from_raw_parts(dmy_h.clone(), 1),
                     emit,
+                    false,
                 );
             }
             let _ = client.read_one(cnt_h.clone()).unwrap();
@@ -6267,6 +6455,10 @@ mod tests {
     /// `device`, and asserts the device output is bit-exact — values *and* per-`R` counts. Generic so
     /// CUDA (H200) and the `cpu` backend run the identical kernel through it.
     fn check_enum_backend<Rt: Runtime>(device: &Rt::Device, max_degree: i32) {
+        check_enum_backend_split::<Rt>(device, max_degree, false)
+    }
+
+    fn check_enum_backend_split<Rt: Runtime>(device: &Rt::Device, max_degree: i32, split: bool) {
         use fp::prime::ValidPrime;
 
         let p = ValidPrime::new(2);
@@ -6277,6 +6469,7 @@ mod tests {
         // R together would OOM the host; per-degree keeps the expected arrays bounded AND pinpoints the
         // exact degree if the device lowering ever diverges from the CPU reference.
         let mut total_r = 0usize;
+        let mut total_threads = 0usize;
         let mut total_mats = 0u64;
         for deg in 1..=max_degree {
             let mut p_parts: Vec<Vec<u32>> = Vec::new();
@@ -6304,20 +6497,33 @@ mod tests {
                 continue;
             }
             let (got_cs, got_mk, counts) =
-                enumerate_admissible_on_runtime::<Rt>(device, &p_parts, &num_mats);
-            assert_eq!(
-                counts, num_mats,
-                "per-R matrix counts diverged at degree {deg}"
-            );
+                enumerate_admissible_on_runtime_split::<Rt>(device, &p_parts, &num_mats, split);
+            if split {
+                // Counts are per THREAD now, so the per-`R` identity becomes a total. The real
+                // assertion is the bit-exact stream below: a split that mis-sized any sub-chain
+                // would misplace every matrix after it.
+                assert_eq!(
+                    counts.iter().map(|&c| c as u64).sum::<u64>(),
+                    num_mats.iter().map(|&m| m as u64).sum::<u64>(),
+                    "total matrix count diverged at degree {deg}"
+                );
+            } else {
+                assert_eq!(
+                    counts, num_mats,
+                    "per-R matrix counts diverged at degree {deg}"
+                );
+            }
             assert_eq!(got_cs, exp_cs, "device col_sums diverged at degree {deg}");
             assert_eq!(got_mk, exp_mk, "device masks diverged at degree {deg}");
             total_r += p_parts.len();
+            total_threads += counts.len();
             total_mats += num_mats.iter().map(|&m| m as u64).sum::<u64>();
         }
         assert!(total_r > 0, "no R's exercised");
         eprintln!(
-            "enum backend: {total_r} R's, {total_mats} matrices bit-exact vs \
-             enumerate_admissible_ref (degrees 1..={max_degree})"
+            "enum backend{}: {total_r} R's, {total_threads} threads, {total_mats} matrices \
+             bit-exact vs enumerate_admissible_ref (degrees 1..={max_degree})",
+            if split { " (SPLIT)" } else { "" }
         );
     }
 
@@ -6375,6 +6581,7 @@ mod tests {
         const THREADS: u32 = ENUM_BLOCK; // must match the kernel's shared stride
         let cubes = (n_r as u32).div_ceil(THREADS);
         let t_kernel = Instant::now();
+        let dmy_h = enum_split_dummy(&client);
         unsafe {
             enumerate_admissible_kernel::launch_unchecked::<R>(
                 &client,
@@ -6391,7 +6598,11 @@ mod tests {
                 width,
                 n_r,
                 0u32,
+                BufferArg::from_raw_parts(dmy_h.clone(), 1),
+                BufferArg::from_raw_parts(dmy_h.clone(), 1),
+                BufferArg::from_raw_parts(dmy_h, 1),
                 1,
+                false,
             );
         }
         // Reading the tiny counts buffer blocks until the kernel completes: kernel wall time, ~no transfer.
@@ -6725,6 +6936,19 @@ mod tests {
     #[test]
     fn admissible_enum_gpu_matches() {
         check_enum_backend::<CudaRuntime>(&CudaDevice::default(), 145);
+    }
+
+    /// The SPLIT thread mapping — one thread per `(R, seed)` rather than per `R` — must reproduce
+    /// the same master bit-for-bit on the device.
+    ///
+    /// This is the property that makes the split adoptable: everything downstream indexes the
+    /// master by `(R, matrix)`, so the split is only free if the concatenated per-seed sub-chains
+    /// land in exactly the order the single-threaded odometer produced them. Degree 90 rather than
+    /// the unsplit test's 145 because the exhaustive `best_split_pos` search is quadratic in the
+    /// chain length; the mapping under test does not depend on degree.
+    #[test]
+    fn admissible_enum_gpu_split_matches() {
+        check_enum_backend_split::<CudaRuntime>(&CudaDevice::default(), 90, true);
     }
 
     /// The segmented master read ([`seg_read_u16`]) must reproduce a contiguous buffer bit-for-bit,
