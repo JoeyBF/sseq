@@ -880,6 +880,31 @@ mod speculate {
 
 /// Block-granular speculation: precompute *row blocks* of a bidegree's full restricted matrix.
 ///
+/// # What this is actually competing against (measured Aug 2026)
+///
+/// At stem 110 / theta=0, with the GPU work already fixed (`NASSAU_GPU_CLEANUP_EVERY=0`, enum split
+/// on), the run uses **2705% of a possible 12800% — 21% of 128 cores**. It is neither CPU-bound nor
+/// GPU-bound: the GPU workers are 31% busy and the devices less. It is STARVED, because the
+/// dependency structure only exposes `[wavefront] in-flight bidegrees: mean=6.6 max=19` at a time,
+/// each using ~4 cores.
+///
+/// Turning this on spends some of the idle 79%. Interleaved, 2 rounds, output identical:
+///
+/// ```text
+/// off              26.0, 25.7 s   cpu 2705%, 2723%
+/// blocks, 32 bld   22.9, 22.6 s   cpu 3157%, 3200%
+/// blocks, 96 bld   23.0, 22.1 s   cpu 3140%, 3291%
+/// ```
+///
+/// 1.14x, and CPU only 21% -> 25%. Tripling the builders buys nothing (96 ~ 32), so what bounds it
+/// is the amount of work ELIGIBLE to speculate, not builder capacity — consistent with the ~33%
+/// row-coverage ceiling and the idle-builder counters below.
+///
+/// So the remaining lever is not this module's tuning, it is the WAVEFRONT WIDTH itself: `progress`
+/// only advances when a bidegree fully finishes, while the generators that unblock downstream work
+/// are known early (`add_generators`) — before the signature loop that is ~96% of a bidegree's cost.
+/// Publishing that early is what would raise `mean=6.6`, and every knob here is downstream of it.
+///
 /// [`speculate`] caches one whole matrix per bidegree, which bounds how early the work can start.
 /// The matrix at `(s, t)` is only fully determined once `(s - 1, t - 1)` is committed, so a builder
 /// gets at most the gap between "matrix determined" and "bidegree runs" — one degree of slack per
