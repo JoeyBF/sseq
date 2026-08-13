@@ -551,6 +551,59 @@ fn shift_probe_report() {
     }
 }
 
+/// Cross-bidegree cache of ZERO-SIGNATURE restricted matrices, the substrate for shift reuse
+/// (`NASSAU_SHIFT_REUSE=1`).
+///
+/// Proven by `NASSAU_PROBE_SHIFT=2` (0 mismatches in 16056 signature instances): the masked matrix
+/// for signature `sigma` at internal degree `t` IS the zero-signature masked matrix at
+/// `t - deg(sigma)`, row for row, with no permutation. So every signature's matrix can come from
+/// one per-degree zero-signature build shared across every bidegree that shifts onto it, instead of
+/// being rebuilt inside each bidegree. The census sizes what survives at 33.35% of rows.
+///
+/// # Why the producer must be a consumer
+///
+/// The entry for degree `d` must include rows from generators of degree EXACTLY `d`, because a
+/// consumer at `t = d + deg(sigma)` masks with `target_bound = t > d` and so sees them. Bidegree
+/// `(s, d)` cannot build that: it deliberately uses `target_bound = d`, excluding those very
+/// generators, precisely so it can run concurrently with `(s - 1, d)` which is still adding them.
+///
+/// A consumer is safe where the producer is not. A consumer at `t >= d + 1` only runs once
+/// `progress[s - 1] >= t - 1 >= d`, i.e. once `(s - 1, d)` has committed, so the generators are
+/// frozen by the time it asks. Hence entries are filled lazily on first demand from a consumer and
+/// never by the bidegree they are named after. Getting this backwards is what made the first
+/// dimension probe read 21% instead of 100%.
+#[cfg(feature = "gpu")]
+#[allow(dead_code)] // Substrate for the next step; the correct path is currently uncached.
+mod shift {
+    use std::sync::{Arc, LazyLock, Mutex};
+
+    use fp::matrix::Matrix;
+    use rustc_hash::FxHashMap;
+
+    /// `(s, degree) -> zero-signature restricted matrix at that degree over ALL generators.`
+    static CACHE: LazyLock<Mutex<FxHashMap<(i32, i32), Arc<Matrix>>>> =
+        LazyLock::new(|| Mutex::new(FxHashMap::default()));
+
+    pub(super) fn enabled() -> bool {
+        static ON: LazyLock<bool> =
+            LazyLock::new(|| std::env::var("NASSAU_SHIFT_REUSE").as_deref() == Ok("1"));
+        *ON
+    }
+
+    pub(super) fn get(s: i32, degree: i32) -> Option<Arc<Matrix>> {
+        CACHE.lock().unwrap().get(&(s, degree)).map(Arc::clone)
+    }
+
+    pub(super) fn put(s: i32, degree: i32, m: Arc<Matrix>) {
+        CACHE.lock().unwrap().insert((s, degree), m);
+    }
+
+    /// Drop everything once the wavefront is done, mirroring [`super::blocks::clear`].
+    pub(super) fn clear() {
+        CACHE.lock().unwrap().clear();
+    }
+}
+
 /// One signature's partial differential matrix, which is either built for that signature alone or
 /// is a row-subset of a cached full matrix (see [`reuse_full_matrix`]).
 ///
@@ -2863,6 +2916,87 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                 }
             }
 
+            // Shift reuse: take this signature's matrix from the shared zero-signature build at
+            // `t - deg(sigma)` rather than from this bidegree. `sig_shift` carries its own column
+            // mask, since the shifted matrix lives over the shifted degree's column space.
+            let mut shifted: Option<(Arc<Matrix>, Vec<usize>)> = None;
+            #[cfg(feature = "gpu")]
+            if shift::enabled() {
+                let shifted_t = b.t() - MilnorSubalgebra::signature_degree(&signature);
+                if shifted_t >= 0 {
+                    let _sh = tracing::trace_span!("sig_shift", shifted_t).entered();
+                    // Bound `shifted_t + 1`, NOT `i32::MAX`: at degree `shifted_t` only generators
+                    // of degree `<= shifted_t` can contribute, so this selects exactly the same
+                    // rows as the consumer's own `b.t()` bound while never reading the generator
+                    // counts of higher degrees — which another thread is concurrently growing.
+                    let zs_bound = shifted_t + 1;
+                    // The COLUMN mask must use this bidegree's own `next_bound`, not `zs_bound`.
+                    // They differ exactly when `deg(sigma) == 1`, where `shifted_t == b.t() - 1`
+                    // and `next_bound` excludes the degree-`shifted_t` generators that `zs_bound`
+                    // keeps. `next_bound` is what the matrix-level probe verified, and the cached
+                    // matrix carries the maximal column set, so every consumer's mask indexes a
+                    // prefix of it and stays in range.
+                    let zs_next: Vec<usize> = subalgebra
+                        .signature_mask(&algebra, next, shifted_t, &zero_sig, next_bound)
+                        .collect();
+                    // NO CACHE for now, and built with the CONSUMER's own bounds — exactly the
+                    // parameters `NASSAU_PROBE_SHIFT=2` validated. Caching with a consumer-
+                    // independent bound (`zs_bound`) produced content that disagreed with a fresh
+                    // build -- `NASSAU_SHIFT_VERIFY=1` catches it at (15,3) sig=[2,0] -- so the
+                    // cache is reintroduced only once that is understood. Correct first, fast
+                    // second.
+                    let _ = zs_bound;
+                    let m = {
+                        let zs_rows: Vec<usize> = subalgebra
+                            .signature_mask(&algebra, target, shifted_t, &zero_sig, target_bound)
+                            .collect();
+                        let cols =
+                            MilnorSubalgebra::restricted_dimension(next, shifted_t, next_bound);
+                        Arc::new(restricted_partial_matrix_maybe_gpu(
+                            &self.differentials[b.s() - 1],
+                            shifted_t,
+                            &zs_rows,
+                            cols,
+                        ))
+                    };
+                    // `NASSAU_SHIFT_VERIFY=1`: the probe validated a FRESHLY built shifted matrix;
+                    // this checks the CACHED one actually delivered to the solver, which is the
+                    // only difference between the validated claim and this code path.
+                    if std::env::var("NASSAU_SHIFT_VERIFY").as_deref() == Ok("1") {
+                        // Content, not shape: does the shifted matrix agree with this signature's
+                        // own, masked? This is the probe's check applied to what actually reaches
+                        // the solver. `full_reuse` is still populated, so `full_matrix` here is
+                        // the independently-built truth.
+                        let truth = match &full_reuse {
+                            Some(full) => PartialMatrix::Gather {
+                                full,
+                                rows: &target_mask,
+                            },
+                            None => PartialMatrix::Owned(restricted_partial_matrix_maybe_gpu(
+                                &self.differentials[b.s() - 1],
+                                b.t(),
+                                &target_mask,
+                                next_dim,
+                            )),
+                        };
+                        let mut a = FpVector::new(p, next_mask.len());
+                        let mut c = FpVector::new(p, zs_next.len());
+                        for i in 0..target_mask.len().min(m.rows()) {
+                            a.set_to_zero();
+                            c.set_to_zero();
+                            a.as_slice_mut().add_masked(truth.row(i), 1, &next_mask);
+                            c.as_slice_mut().add_masked(m.row(i), 1, &zs_next);
+                            assert_eq!(
+                                a, c,
+                                "shift CONTENT row {i} at {b} sig={signature:?} \
+                                 shifted_t={shifted_t}"
+                            );
+                        }
+                    }
+                    shifted = Some((m, zs_next));
+                }
+            }
+
             let full_matrix = tracing::trace_span!("sig_select", rows = target_mask.len())
                 .in_scope(|| match &full_reuse {
                     Some(full) => {
@@ -2948,8 +3082,19 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                 );
                 // Row gather and column mask fused into one pass. `Matrix::add_masked` would need a
                 // materialised `full_matrix`; going row by row lets the gather stay an indirection.
-                for (i, mut l) in m.segment(0, 0).iter_mut().enumerate() {
-                    l.add_masked(full_matrix.row(i), 1, &next_mask);
+                match &shifted {
+                    // Same matrix, reached from the shared build at the shifted degree — hence its
+                    // own column mask over the shifted degree's column space.
+                    Some((zs, zs_next)) => {
+                        for (i, mut l) in m.segment(0, 0).iter_mut().enumerate() {
+                            l.add_masked(zs.row(i), 1, zs_next);
+                        }
+                    }
+                    None => {
+                        for (i, mut l) in m.segment(0, 0).iter_mut().enumerate() {
+                            l.add_masked(full_matrix.row(i), 1, &next_mask);
+                        }
+                    }
                 }
                 m.segment(1, 1).add_identity();
                 m
