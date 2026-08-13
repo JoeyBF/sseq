@@ -512,12 +512,42 @@ pub fn gpu_disabled() -> bool {
 static CLEANUP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// How often to call `client.memory_cleanup()` after a multiply launch, via
-/// `NASSAU_GPU_CLEANUP_EVERY` (default `1` = every launch). `N` cleans every Nth launch; `0` never
-/// cleans. DIAGNOSTIC: the residual `CUDA_ERROR_LAUNCH_FAILED` at high stems is consistent with a
+/// `NASSAU_GPU_CLEANUP_EVERY` (default `0` = NEVER). `N` cleans every Nth launch.
+///
+/// DIAGNOSTIC ORIGIN: the residual `CUDA_ERROR_LAUNCH_FAILED` at high stems is consistent with a
 /// cross-stream pool reclaim (one stream's cleanup reclaiming a resident-master page still in flight
-/// on another stream — tracel-ai/cubecl#1401). Throttling this drastically cuts that reclaim rate; if
-/// the crash disappears or moves much later, cleanup is confirmed as the trigger. The tradeoff is
-/// device-memory growth, since freed pages linger — watch `nvidia-smi`.
+/// on another stream — tracel-ai/cubecl#1401). Throttling it drastically cuts that reclaim rate; `0`
+/// is what gave the first clean GPU stem-200. The tradeoff is device-memory growth, since freed
+/// pages linger — watch `nvidia-smi`.
+///
+/// # The default stays 1, but EVERY REAL RUN MUST SET 0
+///
+/// `0` is 3.4x faster and is what production wants, but it cannot be the in-code default: with
+/// cleanup off, the ~80 GPU tests sharing one device never reclaim and the suite goes flaky (four
+/// multiply tests fail under parallel load and pass in isolation).
+///
+/// ACTION REQUIRED, not yet done: `ext/gpu_prep` is untracked, so this commit cannot carry the fix.
+/// It does NOT currently export `NASSAU_GPU_CLEANUP_EVERY=0`, which means anything sourcing it has
+/// been running 3.4x slow. Add the export there.
+///
+/// Worse than the slowdown, it silently invalidated measurement. Cleaning per launch does
+/// not merely cost its own time: it forces allocator work UNDER `read_async`, which turns that call
+/// from "record an event and hand back its wait" into a 33 ms block on kernel completion. Measured
+/// at stem 110 / theta=0, differentials identical:
+///
+/// ```text
+///                       every=1    every=0
+///   wall                  ~90 s      26 s
+///   queue                   82%       28%
+///   pipeline (fence share)   1%       49%
+///   worker read           117 s     18.2 s
+///   fence                  17 s     93.7 s
+/// ```
+///
+/// So with cleanup off the design works as documented: the readback stops blocking the worker, the
+/// wait lands on the caller's fence where it belongs, and the pipeline runs half deep instead of one
+/// kernel deep. The "worker is the bottleneck, queue is 82%" reading — and the conclusion that the
+/// blocking readback was load-bearing backpressure — were both artifacts of this default.
 fn cleanup_every() -> u64 {
     use std::sync::OnceLock;
     static EVERY: OnceLock<u64> = std::sync::OnceLock::new();
@@ -1468,39 +1498,33 @@ fn split_plan(p_part: PPart, num_mats: u32) -> Option<(u32, Arc<[u32]>)> {
     Some(e)
 }
 
-/// Whether to split the enumeration odometer across threads (`NASSAU_GPU_ENUM_SPLIT`, default OFF).
+/// Whether to split the enumeration odometer across threads (`NASSAU_GPU_ENUM_SPLIT`, default ON).
 ///
-/// # Why this is off despite working
-///
-/// The split does exactly what it was built to do, and it does not pay. In isolation it is an
-/// 8.7-10.2x cut in enum kernel time (see [`ENUM_SPLIT_TARGET`]) and it lifts `waves/SM` from 0.013
-/// to 0.118, a ~10x occupancy gain. End to end it is worth NOTHING. Five interleaved rounds of
-/// `differentials S_2 "" 110 55` at theta=0 -- which forces every `R` through the enumeration path,
-/// i.e. the split's BEST case:
+/// Worth 1.28x end to end. Three interleaved rounds of `differentials S_2 "" 110 55` at theta=0 --
+/// which forces every `R` through the enumeration path -- differentials identical:
 ///
 /// ```text
-/// split on   89.2, 86.7, 86.4, 95.3, 77.1   mean 86.9 s   median 86.7 s
-/// split off  88.5, 88.1, 87.5, 83.0, 85.2   mean 86.5 s   median 87.5 s
+/// split on   20.46, 19.67, 19.46 s   median 19.67 s
+/// split off  25.23, 25.46, 24.73 s   median 25.23 s
 /// ```
 ///
-/// 0.5% slower by mean, 0.9% faster by median, against a ~3% noise floor. An earlier TWO-round
-/// comparison of the same arms read 57 s vs 87 s — pure noise, and a reminder that this measurement
-/// needs replicates rather than a pair.
+/// In isolation the kernel itself is 8.7-10.2x faster (see [`ENUM_SPLIT_TARGET`]) with `waves/SM`
+/// up from 0.013 to 0.118.
 ///
-/// The batch stats say why. Device time is 99% of the multiply's cost, but WITHIN it `queue=82%`
-/// against `exec=17%`: launches spend their time waiting behind other launches, and the enum kernel
-/// is a small part of the execution slice in a pipeline dominated by the multiply
-/// (`pairs=2.3e10`). A 10x cut to a minor term under a 17% ceiling is not observable, and that is
-/// the whole result.
+/// # This was first measured as a NULL result, and the reason is worth keeping
 ///
-/// So this joins the other max-versus-sum findings rather than contradicting them: shortening the
-/// longest chain WAS the right lever on the enum kernel, and the enum kernel simply is not what a
-/// theta=0 run at this stem waits on. Left in, and off, because the enum share is expected to grow
-/// with stem (master growth forces the enum path above stem 200) and it is then already built and
-/// validated — but turn it on against a measurement, never on the strength of the kernel number.
+/// The same comparison previously read 86.9 s against 86.5 s -- nothing -- and was very nearly
+/// abandoned on that basis. The runs were made with [`cleanup_every`] at its old default of 1,
+/// which makes the whole run 3.4x slower by forcing allocator work under every `read_async`. In
+/// that regime `queue` is 82% of device time and the enum kernel is a small term under a 17%
+/// ceiling, so a 10x cut to it genuinely is not observable. At the production setting `queue` is
+/// 28%, the pipeline runs 49% deep, and the same 10x kernel win surfaces as 1.28x wall.
+///
+/// The lesson is not about this flag: an optimisation measured against a mis-set default can read
+/// as exactly zero. Check what regime a null result was taken in before believing it.
 fn enum_split_enabled() -> bool {
     static E: LazyLock<bool> =
-        LazyLock::new(|| std::env::var("NASSAU_GPU_ENUM_SPLIT").is_ok_and(|v| v != "0"));
+        LazyLock::new(|| std::env::var("NASSAU_GPU_ENUM_SPLIT").as_deref() != Ok("0"));
     *E
 }
 
