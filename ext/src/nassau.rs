@@ -498,9 +498,20 @@ fn reuse_within_cap(_rows: usize, _cols: usize) -> bool {
 static SHIFT_MATCH: AtomicUsize = AtomicUsize::new(0);
 static SHIFT_MISMATCH: AtomicUsize = AtomicUsize::new(0);
 static SHIFT_ABSENT: AtomicUsize = AtomicUsize::new(0);
+static SHIFT_MAT_MATCH: AtomicUsize = AtomicUsize::new(0);
+static SHIFT_MAT_MISMATCH: AtomicUsize = AtomicUsize::new(0);
 
 fn shift_probe_enabled() -> bool {
     static ON: LazyLock<bool> = LazyLock::new(|| std::env::var_os("NASSAU_PROBE_SHIFT").is_some());
+    *ON
+}
+
+/// `NASSAU_PROBE_SHIFT=2`: also rebuild the zero-signature matrix at the shifted degree and diff
+/// it against this signature's. This is the SUFFICIENT check that dimension equality is not —
+/// and it is expensive (an extra restricted multiply per signature), so run it at small stem.
+fn shift_probe_matrices() -> bool {
+    static ON: LazyLock<bool> =
+        LazyLock::new(|| std::env::var("NASSAU_PROBE_SHIFT").as_deref() == Ok("2"));
     *ON
 }
 
@@ -523,6 +534,21 @@ fn shift_probe_report() {
             100.0 * m as f64 / total as f64
         }
     );
+    if shift_probe_matrices() {
+        let (mm, mx) = (
+            SHIFT_MAT_MATCH.load(Ordering::Relaxed),
+            SHIFT_MAT_MISMATCH.load(Ordering::Relaxed),
+        );
+        let mt = mm + mx;
+        eprintln!(
+            "[shift-probe] MATRICES: match={mm} MISMATCH={mx} ({:.2}% match)",
+            if mt == 0 {
+                0.0
+            } else {
+                100.0 * mm as f64 / mt as f64
+            }
+        );
+    }
 }
 
 /// One signature's partial differential matrix, which is either built for that signature alone or
@@ -2861,6 +2887,53 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                         next_dim,
                     )),
                 });
+
+            // The sufficient check: is this signature's masked matrix literally the zero-signature
+            // masked matrix at the shifted degree? The two live over DIFFERENT column spaces
+            // (degree `b.t()` vs `shifted_t`), so they are only comparable after masking — which
+            // is exactly the claim, since both mask down to `next_mask.len()` columns.
+            if shift_probe_matrices() {
+                let shifted_t = b.t() - MilnorSubalgebra::signature_degree(&signature);
+                if shifted_t >= 0 {
+                    let zs_target: Vec<usize> = subalgebra
+                        .signature_mask(&algebra, target, shifted_t, &zero_sig, target_bound)
+                        .collect();
+                    let zs_next: Vec<usize> = subalgebra
+                        .signature_mask(&algebra, next, shifted_t, &zero_sig, next_bound)
+                        .collect();
+                    let zs_next_dim =
+                        MilnorSubalgebra::restricted_dimension(next, shifted_t, next_bound);
+                    let zs_full = restricted_partial_matrix_maybe_gpu(
+                        &self.differentials[b.s() - 1],
+                        shifted_t,
+                        &zs_target,
+                        zs_next_dim,
+                    );
+                    let mut ours = FpVector::new(p, next_mask.len());
+                    let mut theirs = FpVector::new(p, zs_next.len());
+                    let mut same = zs_target.len() == target_mask.len();
+                    if same {
+                        for i in 0..target_mask.len() {
+                            ours.set_to_zero();
+                            theirs.set_to_zero();
+                            ours.as_slice_mut()
+                                .add_masked(full_matrix.row(i), 1, &next_mask);
+                            theirs
+                                .as_slice_mut()
+                                .add_masked(zs_full.row(i), 1, &zs_next);
+                            if ours != theirs {
+                                same = false;
+                                break;
+                            }
+                        }
+                    }
+                    if same {
+                        SHIFT_MAT_MATCH.fetch_add(1, Ordering::Relaxed);
+                    } else {
+                        SHIFT_MAT_MISMATCH.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }
 
             let mut masked_matrix = tracing::trace_span!(
                 "sig_assemble",
