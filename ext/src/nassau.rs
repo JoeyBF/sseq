@@ -595,9 +595,10 @@ mod shift {
     static CACHE: LazyLock<Mutex<FxHashMap<Key, Arc<Matrix>>>> =
         LazyLock::new(|| Mutex::new(FxHashMap::default()));
 
+    /// Default ON; `NASSAU_SHIFT_REUSE=0` disables.
     pub(super) fn enabled() -> bool {
         static ON: LazyLock<bool> =
-            LazyLock::new(|| std::env::var("NASSAU_SHIFT_REUSE").as_deref() == Ok("1"));
+            LazyLock::new(|| std::env::var("NASSAU_SHIFT_REUSE").as_deref() != Ok("0"));
         *ON
     }
 
@@ -2568,7 +2569,18 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
         // row at degree `b.t()` in a single launch, then slice each signature's rows out of it.
         // `target_dim` is the restricted source dimension, so `0..target_dim` is exactly the row set
         // the per-signature masks partition; `next_dim` is the restricted column count.
-        let full_reuse: Option<Matrix> = if reuse_full_matrix(&self.differentials[b.s() - 1])
+        // With shift reuse on, every nonzero signature's matrix comes from the shift cache, so
+        // this bidegree's full matrix is needed only for the ZERO-signature step and for the rows
+        // the lift actually consumes. Stop building all `target_dim` rows and serve those two on
+        // demand -- the census's 11.88% + 21.47% = 33.35%. Gated on `f.is_none()` because
+        // `write_qi` reads the full matrix directly.
+        #[cfg(feature = "gpu")]
+        let shift_skip_full = shift::enabled() && f.is_none();
+        #[cfg(not(feature = "gpu"))]
+        let shift_skip_full = false;
+
+        let full_reuse: Option<Matrix> = if !shift_skip_full
+            && reuse_full_matrix(&self.differentials[b.s() - 1])
             && reuse_within_cap(target_dim, next_dim)
         {
             NARROW_WORK.fetch_add(self.narrow_work(b), std::sync::atomic::Ordering::Relaxed);
@@ -2939,7 +2951,7 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
             // mask, since the shifted matrix lives over the shifted degree's column space.
             let mut shifted: Option<(Arc<Matrix>, Vec<usize>)> = None;
             #[cfg(feature = "gpu")]
-            if shift::enabled() {
+            if shift_skip_full {
                 let shifted_t = b.t() - MilnorSubalgebra::signature_degree(&signature);
                 if shifted_t >= 0 {
                     let _sh = tracing::trace_span!("sig_shift", shifted_t).entered();
@@ -3043,28 +3055,36 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
             }
 
             let full_matrix = tracing::trace_span!("sig_select", rows = target_mask.len())
-                .in_scope(|| match &full_reuse {
-                    Some(full) => {
-                        debug_assert!(target_mask.iter().all(|&r| r < full.rows()));
-                        PartialMatrix::Gather {
-                            full,
-                            rows: &target_mask,
-                        }
+                .in_scope(|| {
+                    // Under shift reuse the solver comes from the cache and the lift builds its
+                    // rows on demand, so nothing wants this matrix -- do not spend a multiply on
+                    // it. An empty placeholder keeps the binding's type without allocating.
+                    if shift_skip_full && shifted.is_some() {
+                        return PartialMatrix::Owned(Matrix::new(p, 0, 0));
                     }
-                    // Above `reuse_within_cap` there is no full matrix to slice, so this is where
-                    // signature-axis speculation is collected.
-                    None if blocks::enabled() => PartialMatrix::Owned(self.assemble_signature(
-                        b,
-                        sig_idx,
-                        &target_mask,
-                        next_dim,
-                    )),
-                    None => PartialMatrix::Owned(restricted_partial_matrix_maybe_gpu(
-                        &self.differentials[b.s() - 1],
-                        b.t(),
-                        &target_mask,
-                        next_dim,
-                    )),
+                    match &full_reuse {
+                        Some(full) => {
+                            debug_assert!(target_mask.iter().all(|&r| r < full.rows()));
+                            PartialMatrix::Gather {
+                                full,
+                                rows: &target_mask,
+                            }
+                        }
+                        // Above `reuse_within_cap` there is no full matrix to slice, so this is where
+                        // signature-axis speculation is collected.
+                        None if blocks::enabled() => PartialMatrix::Owned(self.assemble_signature(
+                            b,
+                            sig_idx,
+                            &target_mask,
+                            next_dim,
+                        )),
+                        None => PartialMatrix::Owned(restricted_partial_matrix_maybe_gpu(
+                            &self.differentials[b.s() - 1],
+                            b.t(),
+                            &target_mask,
+                            next_dim,
+                        )),
+                    }
                 });
 
             // The sufficient check: is this signature's masked matrix literally the zero-signature
@@ -3171,26 +3191,81 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
             }
 
             let _lift = tracing::trace_span!("sig_lift", gens = xs.len()).entered();
-            for (x, dx) in xs.iter_mut().zip(&mut dxs) {
-                scratch.set_scratch_vector_size(target_mask.len());
-                let mut row = 0;
-                for (i, &v) in next_mask.iter().enumerate() {
-                    if pivots[i] < 0 {
-                        continue;
+            if shift_skip_full && shifted.is_some() {
+                // Two passes, because there is no full matrix to read rows from any more.
+                //
+                // Sound because generators are INDEPENDENT within a signature: each owns its `x`
+                // and `dx`, and the only shared state (`pivots`, `preimage`) is read-only. Per
+                // generator the original is read-then-write on its own `dx`, so hoisting every
+                // read ahead of every write changes nothing. (The signature LOOP is a forward
+                // substitution and must stay ordered -- that is a different axis, see above.)
+                let mut supports: Vec<Vec<usize>> = Vec::with_capacity(xs.len());
+                for (x, dx) in xs.iter_mut().zip(dxs.iter()) {
+                    scratch.set_scratch_vector_size(target_mask.len());
+                    let mut row = 0;
+                    for (i, &v) in next_mask.iter().enumerate() {
+                        if pivots[i] < 0 {
+                            continue;
+                        }
+                        if dx.entry(v) != 0 {
+                            scratch.as_slice_mut().add(preimage.row(row), 1);
+                        }
+                        row += 1;
                     }
-                    if dx.entry(v) != 0 {
-                        scratch.as_slice_mut().add(preimage.row(row), 1);
+                    let mut sup = Vec::new();
+                    for (i, _) in scratch.iter_nonzero() {
+                        x.add_basis_element(target_mask[i], 1);
+                        sup.push(i);
                     }
-                    row += 1;
+                    supports.push(sup);
                 }
-                let mut consumed = 0usize;
-                for (i, _) in scratch.iter_nonzero() {
-                    x.add_basis_element(target_mask[i], 1);
-                    dx.as_slice_mut().add(full_matrix.row(i), 1);
-                    consumed += 1;
-                }
+                let mut needed: Vec<usize> = supports.iter().flatten().copied().collect();
+                needed.sort_unstable();
+                needed.dedup();
                 if let Some(c) = census.as_mut() {
-                    c.add_rows_consumed(consumed);
+                    c.add_rows_consumed(supports.iter().map(Vec::len).sum());
+                }
+                if !needed.is_empty() {
+                    // One multiply for the whole signature's demand, not one per generator.
+                    let basis: Vec<usize> = needed.iter().map(|&i| target_mask[i]).collect();
+                    let got =
+                        tracing::trace_span!("sig_ondemand", rows = basis.len()).in_scope(|| {
+                            restricted_partial_matrix_maybe_gpu(
+                                &self.differentials[b.s() - 1],
+                                b.t(),
+                                &basis,
+                                next_dim,
+                            )
+                        });
+                    for (sup, dx) in supports.iter().zip(dxs.iter_mut()) {
+                        for &i in sup {
+                            let k = needed.binary_search(&i).unwrap();
+                            dx.as_slice_mut().add(got.row(k), 1);
+                        }
+                    }
+                }
+            } else {
+                for (x, dx) in xs.iter_mut().zip(&mut dxs) {
+                    scratch.set_scratch_vector_size(target_mask.len());
+                    let mut row = 0;
+                    for (i, &v) in next_mask.iter().enumerate() {
+                        if pivots[i] < 0 {
+                            continue;
+                        }
+                        if dx.entry(v) != 0 {
+                            scratch.as_slice_mut().add(preimage.row(row), 1);
+                        }
+                        row += 1;
+                    }
+                    let mut consumed = 0usize;
+                    for (i, _) in scratch.iter_nonzero() {
+                        x.add_basis_element(target_mask[i], 1);
+                        dx.as_slice_mut().add(full_matrix.row(i), 1);
+                        consumed += 1;
+                    }
+                    if let Some(c) = census.as_mut() {
+                        c.add_rows_consumed(consumed);
+                    }
                 }
             }
             drop(_lift);
