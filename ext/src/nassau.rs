@@ -411,10 +411,23 @@ fn restricted_partial_matrix_maybe_gpu(
     #[cfg(feature = "gpu")]
     {
         if std::env::var_os("NASSAU_GPU").is_some() && crate::nassau_gpu::applicable(diff) {
+            // Below this `rows x cols`, the CPU beats a GPU launch. Raised 4e6 -> 2.56e8 once
+            // signature-shift reuse landed: it removes ~2/3 of the multiply work, and what is
+            // left is small and fragmented (stem 130: 7308 shift builds averaging 361 rows,
+            // `waves/SM` 0.017, readback 80% of worker time). Sending that to the GPU costs more
+            // in per-launch readback than it saves in compute.
+            //
+            // MEASURED (theta=0, interleaved, differentials identical at every setting):
+            //     stem 110   4e6 13.7/13.3s   2.56e8 6.09/6.22s   4e9 6.46/6.22s
+            //     stem 130   4e6 53.0/52.1s   2.56e8 27.1/26.7s   4e9 26.4/26.4s
+            // Flat from 2.56e8 up, and CPU-only (1e12) is within noise of the best at stem 130 --
+            // the GPU is barely contributing at these sizes now. 2.56e8 is chosen over "never"
+            // so genuinely large work still goes to the device; expect this to matter again at
+            // high stem, where the per-bidegree matrices grow.
             let min_work: u64 = std::env::var("NASSAU_GPU_MIN_WORK")
                 .ok()
                 .and_then(|v| v.parse().ok())
-                .unwrap_or(4_000_000);
+                .unwrap_or(256_000_000);
             let work = inputs.len() as u64 * target_dim as u64;
             if work >= min_work {
                 return if std::env::var_os("NASSAU_GPU_VERIFY").is_some() {
@@ -498,6 +511,34 @@ fn reuse_within_cap(_rows: usize, _cols: usize) -> bool {
 static SHIFT_MATCH: AtomicUsize = AtomicUsize::new(0);
 static SHIFT_MISMATCH: AtomicUsize = AtomicUsize::new(0);
 static SHIFT_ABSENT: AtomicUsize = AtomicUsize::new(0);
+/// Launch-site counters (`NASSAU_SHIFT_STATS=1`). After shift reuse the run issues 4.3x MORE
+/// launches at 13x smaller size (stem 130: 39000 calls, 331 Rs each, `waves/SM` 0.017), and
+/// readback is 80% of worker time. Batching is the fix, but only after knowing WHICH site emits
+/// them: the shifted builds are deterministic and hoistable, the on-demand lift rows are
+/// data-dependent and are not.
+static N_SHIFT_BUILD: AtomicUsize = AtomicUsize::new(0);
+static N_SHIFT_HIT: AtomicUsize = AtomicUsize::new(0);
+static N_ONDEMAND: AtomicUsize = AtomicUsize::new(0);
+static N_ZS: AtomicUsize = AtomicUsize::new(0);
+static ROWS_SHIFT_BUILD: AtomicUsize = AtomicUsize::new(0);
+static ROWS_ONDEMAND: AtomicUsize = AtomicUsize::new(0);
+
+fn shift_stats_report() {
+    if std::env::var("NASSAU_SHIFT_STATS").as_deref() != Ok("1") {
+        return;
+    }
+    eprintln!(
+        "[shift-stats] launches: zs_select={} shift_build={} (rows {}) ondemand={} (rows {}) | \
+         cache hits={}",
+        N_ZS.load(Ordering::Relaxed),
+        N_SHIFT_BUILD.load(Ordering::Relaxed),
+        ROWS_SHIFT_BUILD.load(Ordering::Relaxed),
+        N_ONDEMAND.load(Ordering::Relaxed),
+        ROWS_ONDEMAND.load(Ordering::Relaxed),
+        N_SHIFT_HIT.load(Ordering::Relaxed),
+    );
+}
+
 static SHIFT_MAT_MATCH: AtomicUsize = AtomicUsize::new(0);
 static SHIFT_MAT_MISMATCH: AtomicUsize = AtomicUsize::new(0);
 
@@ -2705,12 +2746,15 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                             rows: &target_mask,
                         }
                     }
-                    None => PartialMatrix::Owned(restricted_partial_matrix_maybe_gpu(
-                        &self.differentials[b.s() - 1],
-                        b.t(),
-                        &target_mask,
-                        next_dim,
-                    )),
+                    None => {
+                        N_ZS.fetch_add(1, Ordering::Relaxed);
+                        PartialMatrix::Owned(restricted_partial_matrix_maybe_gpu(
+                            &self.differentials[b.s() - 1],
+                            b.t(),
+                            &target_mask,
+                            next_dim,
+                        ))
+                    }
                 }
             });
         let mut masked_matrix = tracing::trace_span!(
@@ -2985,7 +3029,10 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                     // its own bound and does not publish.
                     let may_publish = MilnorSubalgebra::signature_degree(&signature) >= 2;
                     let m = match shift::get(b.s() as i32, shifted_t, &subalgebra.profile) {
-                        Some(m) => m,
+                        Some(m) => {
+                            N_SHIFT_HIT.fetch_add(1, Ordering::Relaxed);
+                            m
+                        }
                         None => {
                             let bound = if may_publish { zs_bound } else { next_bound };
                             let zs_rows: Vec<usize> = subalgebra
@@ -2999,6 +3046,8 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                                 .collect();
                             let cols =
                                 MilnorSubalgebra::restricted_dimension(next, shifted_t, bound);
+                            N_SHIFT_BUILD.fetch_add(1, Ordering::Relaxed);
+                            ROWS_SHIFT_BUILD.fetch_add(zs_rows.len(), Ordering::Relaxed);
                             let m = Arc::new(restricted_partial_matrix_maybe_gpu(
                                 &self.differentials[b.s() - 1],
                                 shifted_t,
@@ -3906,6 +3955,7 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                 );
             }
             shift_probe_report();
+            shift_stats_report();
             let n = INFLIGHT_N.load(std::sync::atomic::Ordering::Relaxed);
             if n > 0 {
                 eprintln!(
