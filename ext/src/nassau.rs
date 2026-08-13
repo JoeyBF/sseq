@@ -560,6 +560,16 @@ fn shift_probe_report() {
 /// one per-degree zero-signature build shared across every bidegree that shifts onto it, instead of
 /// being rebuilt inside each bidegree. The census sizes what survives at 33.35% of rows.
 ///
+/// # The key must include the SUBALGEBRA
+///
+/// `MilnorSubalgebra::optimal_for` picks a profile per bidegree, so two consumers landing on the
+/// same `(s, shifted_t)` need not share a subalgebra — and a different profile means a different
+/// zero signature, hence a different mask at the same degree. Keying on `(s, degree)` alone hands
+/// an entry built under one profile to a consumer using another. That is not a subtle aliasing
+/// bug: at `(15,3) sig=[2,0] shifted_t=16` it produced a 14-row matrix where the consumer's mask
+/// had 9 rows. It looked like a monotonicity violation (a larger generator bound yielding FEWER
+/// rows, which is impossible) precisely because the two counts came from unrelated subalgebras.
+///
 /// # Why the producer must be a consumer
 ///
 /// The entry for degree `d` must include rows from generators of degree EXACTLY `d`, because a
@@ -573,15 +583,16 @@ fn shift_probe_report() {
 /// never by the bidegree they are named after. Getting this backwards is what made the first
 /// dimension probe read 21% instead of 100%.
 #[cfg(feature = "gpu")]
-#[allow(dead_code)] // Substrate for the next step; the correct path is currently uncached.
 mod shift {
     use std::sync::{Arc, LazyLock, Mutex};
 
     use fp::matrix::Matrix;
     use rustc_hash::FxHashMap;
 
-    /// `(s, degree) -> zero-signature restricted matrix at that degree over ALL generators.`
-    static CACHE: LazyLock<Mutex<FxHashMap<(i32, i32), Arc<Matrix>>>> =
+    /// `(s, degree, subalgebra profile) -> zero-signature restricted matrix at that degree.`
+    type Key = (i32, i32, Vec<u8>);
+
+    static CACHE: LazyLock<Mutex<FxHashMap<Key, Arc<Matrix>>>> =
         LazyLock::new(|| Mutex::new(FxHashMap::default()));
 
     pub(super) fn enabled() -> bool {
@@ -590,12 +601,19 @@ mod shift {
         *ON
     }
 
-    pub(super) fn get(s: i32, degree: i32) -> Option<Arc<Matrix>> {
-        CACHE.lock().unwrap().get(&(s, degree)).map(Arc::clone)
+    pub(super) fn get(s: i32, degree: i32, profile: &[u8]) -> Option<Arc<Matrix>> {
+        CACHE
+            .lock()
+            .unwrap()
+            .get(&(s, degree, profile.to_vec()))
+            .map(Arc::clone)
     }
 
-    pub(super) fn put(s: i32, degree: i32, m: Arc<Matrix>) {
-        CACHE.lock().unwrap().insert((s, degree), m);
+    pub(super) fn put(s: i32, degree: i32, profile: &[u8], m: Arc<Matrix>) {
+        CACHE
+            .lock()
+            .unwrap()
+            .insert((s, degree, profile.to_vec()), m);
     }
 
     /// Drop everything once the wavefront is done, mirroring [`super::blocks::clear`].
@@ -2939,25 +2957,52 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                     let zs_next: Vec<usize> = subalgebra
                         .signature_mask(&algebra, next, shifted_t, &zero_sig, next_bound)
                         .collect();
-                    // NO CACHE for now, and built with the CONSUMER's own bounds — exactly the
-                    // parameters `NASSAU_PROBE_SHIFT=2` validated. Caching with a consumer-
-                    // independent bound (`zs_bound`) produced content that disagreed with a fresh
-                    // build -- `NASSAU_SHIFT_VERIFY=1` catches it at (15,3) sig=[2,0] -- so the
-                    // cache is reintroduced only once that is understood. Correct first, fast
-                    // second.
-                    let _ = zs_bound;
-                    let m = {
-                        let zs_rows: Vec<usize> = subalgebra
-                            .signature_mask(&algebra, target, shifted_t, &zero_sig, target_bound)
-                            .collect();
-                        let cols =
-                            MilnorSubalgebra::restricted_dimension(next, shifted_t, next_bound);
-                        Arc::new(restricted_partial_matrix_maybe_gpu(
-                            &self.differentials[b.s() - 1],
-                            shifted_t,
-                            &zs_rows,
-                            cols,
-                        ))
+                    // Who may BUILD the shared entry is a correctness question, not a policy
+                    // one. `zs_bound` columns reach `modules[b.s() - 2]` generators of degree up
+                    // to `shifted_t`. A consumer is only permitted to see degree `< next_bound`
+                    // (= `b.t() - 1`) there -- that bound is exactly what lets this bidegree run
+                    // concurrently with the one still ADDING those generators. For
+                    // `deg(sigma) == 1`, `shifted_t == b.t() - 1`, so building at `zs_bound` would
+                    // read generators being written right now: a race, and the reason this cache
+                    // still diverged at stem 90 after the profile was added to the key.
+                    //
+                    // So only `deg(sigma) >= 2` may build (there `next_bound >= shifted_t + 1`,
+                    // making `zs_bound` within its permitted view). A `deg(sigma) == 1` consumer
+                    // may still USE an entry someone else built -- it only ever reads the prefix
+                    // its own narrower mask names -- but when there is none it builds privately at
+                    // its own bound and does not publish.
+                    let may_publish = MilnorSubalgebra::signature_degree(&signature) >= 2;
+                    let m = match shift::get(b.s() as i32, shifted_t, &subalgebra.profile) {
+                        Some(m) => m,
+                        None => {
+                            let bound = if may_publish { zs_bound } else { next_bound };
+                            let zs_rows: Vec<usize> = subalgebra
+                                .signature_mask(
+                                    &algebra,
+                                    target,
+                                    shifted_t,
+                                    &zero_sig,
+                                    target_bound,
+                                )
+                                .collect();
+                            let cols =
+                                MilnorSubalgebra::restricted_dimension(next, shifted_t, bound);
+                            let m = Arc::new(restricted_partial_matrix_maybe_gpu(
+                                &self.differentials[b.s() - 1],
+                                shifted_t,
+                                &zs_rows,
+                                cols,
+                            ));
+                            if may_publish {
+                                shift::put(
+                                    b.s() as i32,
+                                    shifted_t,
+                                    &subalgebra.profile,
+                                    Arc::clone(&m),
+                                );
+                            }
+                            m
+                        }
                     };
                     // `NASSAU_SHIFT_VERIFY=1`: the probe validated a FRESHLY built shifted matrix;
                     // this checks the CACHED one actually delivered to the solver, which is the
@@ -3823,6 +3868,8 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
         crate::census::report();
         speculate::clear();
         blocks::clear();
+        #[cfg(feature = "gpu")]
+        shift::clear();
 
         // Eviction probe (`NASSAU_R_STATS`): dump the R-access distribution once the wavefront is done.
         #[cfg(feature = "gpu")]
