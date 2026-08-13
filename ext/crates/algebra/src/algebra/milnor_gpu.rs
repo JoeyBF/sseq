@@ -5984,75 +5984,214 @@ mod tests {
         while more {
             out_cs.extend_from_slice(&col_sums);
             out_mk.extend_from_slice(&masks);
+            more = odometer_step_ref(
+                &mut matrix,
+                &mut totals,
+                &mut col_sums,
+                &mut masks,
+                rows,
+                cols,
+                0,
+                rows * (cols - 1),
+            );
+        }
 
-            // One `next()` step, flag-based: `found` = "produced a new matrix" (the original's
-            // `return true`); `handled` = "this column already updated `totals`" (the original's
-            // `continue 'mid`, which skips the trailing add). Loops are guarded by `!found` instead
-            // of breaking.
-            let mut found = false;
-            let mut row = 0;
-            while row < rows && !found {
-                let mut p_to_the_j: u32 = 1;
-                totals[row] = matrix[row * cols]; // get(row, 0)
-                let mut col = 1;
-                while col < cols && !found {
-                    p_to_the_j *= 2;
-                    let mut handled = false;
-                    if p_to_the_j <= totals[row] {
-                        // Bitsum along the anti-diagonal to the bottom-left.
-                        let mut d = 0u32;
-                        let mut c = (row + col + 1).saturating_sub(rows);
-                        while c < col {
-                            d |= matrix[(row + col - c) * cols + c];
-                            c += 1;
+        (cs_len, mk_len, out_cs, out_mk)
+    }
+
+    /// One `next()` step of the admissible-matrix odometer, restricted to digits `lo_pos..hi_pos`.
+    ///
+    /// Flag-based: `found` = "produced a new matrix" (the original's `return true`); `handled` =
+    /// "this column already updated `totals`" (the original's `continue 'mid`, which skips the
+    /// trailing add). Loops are guarded by `!found` instead of breaking, because that is the subset
+    /// the cubecl DSL compiles cleanly.
+    ///
+    /// # Why the row range is a parameter
+    ///
+    /// The walk is a mixed-radix odometer over rows with row 0 varying FASTEST. The admissibility
+    /// constraint on row `row` is the anti-diagonal bitsum `d`, which reads `matrix[row + col - c][c]`
+    /// for `c < col` — and `row + col - c > row` there, so **`d` only ever reads rows with a LARGER
+    /// index**, i.e. only the slower-varying digits, which are frozen while row `row` varies.
+    ///
+    /// Hence for any fixed state of the suffix rows `j..rows`, the sub-odometer over rows `0..j` is
+    /// independent of how that suffix state was reached, and the full walk factors exactly as
+    ///
+    /// ```text
+    /// for each suffix state (steps with lo = j, hi = rows)
+    ///     for each sub state (steps with lo = 0, hi = j)
+    /// ```
+    ///
+    /// contiguously, and in the SAME ORDER as the unsplit walk. That is what licenses giving each
+    /// suffix state its own thread: a launch's duration is set by its longest single `R` chain
+    /// (one thread, sequential odometer), so splitting that chain is the only thing that can move
+    /// the maximum — and doing it this way keeps the emitted master bit-identical, so it is
+    /// checkable against the unsplit walk rather than taken on faith.
+    /// `admissible_enum_split_matches` asserts that equivalence for every `j` over real `R`s.
+    ///
+    /// # Digit granularity
+    ///
+    /// The split point is a DIGIT position, not a row. Digits are `(row, col)` for `col in 1..cols`,
+    /// numbered `pos = row * (cols - 1) + (col - 1)`, fastest first — the order the odometer scans.
+    /// Row granularity is too coarse to balance: the long-pole `R`s at degree 150 all have
+    /// `rows == 2`, so a row split offers exactly one non-degenerate choice and lands 36x8432 when
+    /// what is wanted is ~332x332. Splitting between columns of the same row is legitimate for the
+    /// same reason splitting between rows is — with `rows == 2`, `d` at `(0, col)` reads only
+    /// `matrix[1][col - 1]`, a frozen row, so row 0's own columns do not constrain each other.
+    ///
+    /// Columns below `lo_pos` in the starting row are still scanned, because `totals[row]`
+    /// accumulates `p^col * matrix[row][col]` across the whole row and column 0 is the remainder;
+    /// they are simply not offered as increment sites. Digits outside `lo_pos..hi_pos` are left
+    /// untouched otherwise: the reset that follows a successful increment clears rows
+    /// `lo_row..row`, not `0..row`.
+    fn odometer_step_ref(
+        matrix: &mut [u32],
+        totals: &mut [u32],
+        col_sums: &mut [u32],
+        masks: &mut [u32],
+        rows: usize,
+        cols: usize,
+        lo_pos: usize,
+        hi_pos: usize,
+    ) -> bool {
+        // `cols == 1` (every `p_part` entry is 1) has no digits at all: the column loop below never
+        // runs and the walk is a single matrix. `max(1)` only keeps the index arithmetic total;
+        // `hi_pos` is 0 there, so the row loop is empty and this correctly reports "no successor".
+        let per_row = (cols - 1).max(1);
+        let lo_row = lo_pos / per_row;
+        let hi_row = hi_pos.div_ceil(per_row).min(rows);
+        let mut found = false;
+        let mut row = lo_row;
+        while row < hi_row && !found {
+            let mut p_to_the_j: u32 = 1;
+            totals[row] = matrix[row * cols]; // get(row, 0)
+            let mut col = 1;
+            while col < cols && !found {
+                p_to_the_j *= 2;
+                let mut handled = false;
+                let pos = row * per_row + (col - 1);
+                if pos >= lo_pos && pos < hi_pos && p_to_the_j <= totals[row] {
+                    // Bitsum along the anti-diagonal to the bottom-left. Reads only rows `> row`.
+                    let mut d = 0u32;
+                    let mut c = (row + col + 1).saturating_sub(rows);
+                    while c < col {
+                        d |= matrix[(row + col - c) * cols + c];
+                        c += 1;
+                    }
+                    let cur = matrix[row * cols + col];
+                    let new_entry = ((cur | d) + 1) & !d;
+                    let inc = new_entry - cur;
+                    let sub = inc * p_to_the_j;
+                    if totals[row] < sub {
+                        totals[row] += p_to_the_j * cur;
+                        handled = true;
+                    } else {
+                        matrix[row * cols] = totals[row] - sub; // set(row, 0, ..)
+                        masks[row] = matrix[row * cols];
+                        col_sums[col - 1] += inc;
+                        let mut j = 1;
+                        while j < col {
+                            masks[row + j] &= !matrix[row * cols + j];
+                            col_sums[j - 1] -= matrix[row * cols + j];
+                            matrix[row * cols + j] = 0;
+                            j += 1;
                         }
-                        let cur = matrix[row * cols + col];
-                        let new_entry = ((cur | d) + 1) & !d;
-                        let inc = new_entry - cur;
-                        let sub = inc * p_to_the_j;
-                        if totals[row] < sub {
-                            totals[row] += p_to_the_j * cur;
-                            handled = true;
-                        } else {
-                            matrix[row * cols] = totals[row] - sub; // set(row, 0, ..)
-                            masks[row] = matrix[row * cols];
-                            col_sums[col - 1] += inc;
+                        matrix[row * cols + col] = new_entry;
+                        // Reset the faster digits. `lo_row`, not 0: rows below the split belong to a
+                        // different (already seeded) sub-walk and must not be disturbed. Columns
+                        // 1..col of `row` are cleared by the loop above; when the split falls mid-row
+                        // those include sub-walk columns, which is correct — they are zero in this
+                        // state and zero is exactly what the sub-walk seeds from.
+                        let mut i = lo_row;
+                        while i < row {
+                            matrix[i * cols] = totals[i];
+                            masks[i] = totals[i];
                             let mut j = 1;
-                            while j < col {
-                                masks[row + j] &= !matrix[row * cols + j];
-                                col_sums[j - 1] -= matrix[row * cols + j];
-                                matrix[row * cols + j] = 0;
+                            while j < cols {
+                                if i + j > row {
+                                    masks[i + j] &= !matrix[i * cols + j];
+                                }
+                                col_sums[j - 1] -= matrix[i * cols + j];
+                                matrix[i * cols + j] = 0;
                                 j += 1;
                             }
-                            matrix[row * cols + col] = new_entry;
-                            let mut i = 0;
-                            while i < row {
-                                matrix[i * cols] = totals[i];
-                                masks[i] = totals[i];
-                                let mut j = 1;
-                                while j < cols {
-                                    if i + j > row {
-                                        masks[i + j] &= !matrix[i * cols + j];
-                                    }
-                                    col_sums[j - 1] -= matrix[i * cols + j];
-                                    matrix[i * cols + j] = 0;
-                                    j += 1;
-                                }
-                                i += 1;
-                            }
-                            masks[row + col] = d | new_entry;
-                            found = true;
-                            handled = true;
+                            i += 1;
                         }
+                        masks[row + col] = d | new_entry;
+                        found = true;
+                        handled = true;
                     }
-                    if !handled {
-                        totals[row] += p_to_the_j * matrix[row * cols + col];
-                    }
-                    col += 1;
                 }
-                row += 1;
+                if !handled {
+                    totals[row] += p_to_the_j * matrix[row * cols + col];
+                }
+                col += 1;
             }
-            more = found;
+            row += 1;
+        }
+        found
+    }
+
+    /// The same enumeration as [`enumerate_admissible_ref`], but performed as the split walk:
+    /// enumerate the suffix states of rows `j..rows`, and run the sub-odometer over rows `0..j`
+    /// from each. This is the CPU model of the intended kernel change (thread ↦ `(R, suffix state)`
+    /// rather than thread ↦ `R`), and it must agree with the unsplit walk element for element.
+    ///
+    /// `j == 0` and `j == rows` are the degenerate ends: at `j == rows` the suffix walk IS the full
+    /// walk and each sub-walk emits one matrix; at `j == 0` the suffix walk emits a single state and
+    /// the sub-walk does everything. Both must still reproduce the reference exactly.
+    fn enumerate_admissible_split_ref(
+        p_part: &[u32],
+        j: usize,
+    ) -> (usize, usize, Vec<u32>, Vec<u32>) {
+        let rows = p_part.len();
+        let cols = p_part
+            .iter()
+            .map(|&x| (u32::BITS - x.leading_zeros()) as usize)
+            .max()
+            .unwrap();
+        let cs_len = cols - 1;
+        let mk_len = rows + cols - 1;
+
+        let mut matrix = vec![0u32; rows * cols];
+        for (i, &x) in p_part.iter().enumerate() {
+            matrix[i * cols] = x;
+        }
+        let mut totals = vec![0u32; rows];
+        let mut col_sums = vec![0u32; cs_len];
+        let mut masks = vec![0u32; mk_len];
+        for (i, &x) in p_part.iter().enumerate() {
+            masks[i] = x;
+        }
+
+        let mut out_cs: Vec<u32> = Vec::new();
+        let mut out_mk: Vec<u32> = Vec::new();
+
+        // The suffix state is the seed; rows `0..j` of it stay at their initial state (all mass in
+        // column 0) throughout, which is exactly what each sub-walk expects to start from.
+        let mut more_suffix = true;
+        while more_suffix {
+            let (mut m, mut t, mut cs, mut mk) = (
+                matrix.clone(),
+                totals.clone(),
+                col_sums.clone(),
+                masks.clone(),
+            );
+            let mut more = true;
+            while more {
+                out_cs.extend_from_slice(&cs);
+                out_mk.extend_from_slice(&mk);
+                more = odometer_step_ref(&mut m, &mut t, &mut cs, &mut mk, rows, cols, 0, j);
+            }
+            more_suffix = odometer_step_ref(
+                &mut matrix,
+                &mut totals,
+                &mut col_sums,
+                &mut masks,
+                rows,
+                cols,
+                j,
+                rows * (cols - 1),
+            );
         }
 
         (cs_len, mk_len, out_cs, out_mk)
@@ -6828,6 +6967,211 @@ mod tests {
         }
         assert!(checked > 0, "no R's exercised");
         eprintln!("admissible_enum_ref: {checked} R's matched admissible_matrices");
+    }
+
+    /// Fresh odometer state for `p_part`: `(matrix, totals, col_sums, masks, rows, cols)`.
+    #[allow(clippy::type_complexity)]
+    fn odometer_init(p_part: &[u32]) -> (Vec<u32>, Vec<u32>, Vec<u32>, Vec<u32>, usize, usize) {
+        let rows = p_part.len();
+        let cols = p_part
+            .iter()
+            .map(|&x| (u32::BITS - x.leading_zeros()) as usize)
+            .max()
+            .unwrap();
+        let mut matrix = vec![0u32; rows * cols];
+        let mut masks = vec![0u32; rows + cols - 1];
+        for (i, &x) in p_part.iter().enumerate() {
+            matrix[i * cols] = x;
+            masks[i] = x;
+        }
+        (
+            matrix,
+            vec![0u32; rows],
+            vec![0u32; cols - 1],
+            masks,
+            rows,
+            cols,
+        )
+    }
+
+    /// `(suffix states, longest sub-walk)` for splitting `p_part`'s odometer at `j`.
+    ///
+    /// The suffix states are the threads and the longest sub-walk is what each launch then waits
+    /// on, so `total / longest` is the speedup a split at `j` could deliver on this `R`. Counts
+    /// only — nothing is emitted.
+    fn split_profile(p_part: &[u32], j: usize) -> (usize, usize) {
+        let (mut matrix, mut totals, mut col_sums, mut masks, rows, cols) = odometer_init(p_part);
+        let (mut states, mut longest) = (0usize, 0usize);
+        let mut more_suffix = true;
+        while more_suffix {
+            let (mut m, mut t, mut cs, mut mk) = (
+                matrix.clone(),
+                totals.clone(),
+                col_sums.clone(),
+                masks.clone(),
+            );
+            let mut n = 1usize;
+            while odometer_step_ref(&mut m, &mut t, &mut cs, &mut mk, rows, cols, 0, j) {
+                n += 1;
+            }
+            states += 1;
+            longest = longest.max(n);
+            more_suffix = odometer_step_ref(
+                &mut matrix,
+                &mut totals,
+                &mut col_sums,
+                &mut masks,
+                rows,
+                cols,
+                j,
+                rows * (cols - 1),
+            );
+        }
+        (states, longest)
+    }
+
+    /// How much parallelism the split can actually extract from the `R`s that set launch duration.
+    ///
+    /// An enum launch's cost is the MAX over its `R` chains, so the figure that matters is not the
+    /// total work but the longest chain, and the question this answers is whether splitting at some
+    /// `j` shortens it by a useful factor on the `R`s that are long in the first place. Reported for
+    /// the worst `R`s by matrix count, since those are the ones a launch waits on.
+    #[test]
+    #[ignore = "diagnostic: sizes the win, does not assert"]
+    fn admissible_enum_split_profile() {
+        use fp::prime::ValidPrime;
+
+        let p = ValidPrime::new(2);
+        let algebra = Arc::new(MilnorAlgebra::new(p, false));
+        let max_degree = 150;
+        algebra.compute_basis(max_degree);
+
+        let mut all: Vec<(usize, i32, usize, Vec<u32>)> = Vec::new();
+        for deg in 1..=max_degree {
+            for idx in 0..algebra.dimension(deg) {
+                let p_part: Vec<u32> = algebra
+                    .basis_element_from_index(deg, idx)
+                    .p_part
+                    .iter()
+                    .collect();
+                if p_part.is_empty() {
+                    continue;
+                }
+                let (n, _) = split_profile(&p_part, 0); // j = 0: one suffix state = whole walk
+                all.push((n, deg, idx, p_part));
+            }
+        }
+        all.sort_by_key(|e| std::cmp::Reverse(e.0));
+        eprintln!(
+            "{} R's up to degree {max_degree}; longest chain {} matrices",
+            all.len(),
+            all[0].0
+        );
+        // `j == rows` is the unsplit walk and `j == 0` splits maximally, but the maximal split is
+        // not free: the suffix states ARE the thread seeds, and enumerating them is itself a serial
+        // odometer. So the figure of merit is the two-phase critical path `states + longest`
+        // (enumerate seeds, then run the longest sub-chain), which is minimised near
+        // `states ~ longest ~ sqrt(total)`, not at `j = 0`.
+        eprintln!("  chain  deg rows cols | best digit split: threads x longest = cp, speedup");
+        let mut worst_cp = 0usize;
+        for (n, deg, _, p_part) in all.iter().take(20) {
+            let rows = p_part.len();
+            let cols = p_part
+                .iter()
+                .map(|&x| (u32::BITS - x.leading_zeros()) as usize)
+                .max()
+                .unwrap();
+            let mut best = (usize::MAX, 0usize, 0usize, 0usize);
+            for j in 0..=rows * (cols - 1) {
+                let (states, longest) = split_profile(p_part, j);
+                if states + longest < best.0 {
+                    best = (states + longest, states, longest, j);
+                }
+            }
+            worst_cp = worst_cp.max(best.0);
+            eprintln!(
+                "  {:6} {:4} {:4} {:4} | pos {:2}: {:6} x {:6} = {:6}, {:6.0}x",
+                n,
+                deg,
+                rows,
+                cols,
+                best.3,
+                best.1,
+                best.2,
+                best.0,
+                *n as f64 / best.0 as f64
+            );
+        }
+        eprintln!(
+            "worst critical path over the top 20: {worst_cp} (was {})",
+            all[0].0
+        );
+    }
+
+    /// The split walk reproduces the unsplit walk exactly, for every split point.
+    ///
+    /// This is the correctness precondition for splitting a single `R`'s odometer across threads.
+    /// A launch's duration is the MAX over its `R` chains, not the sum, so the only lever on enum
+    /// time is shortening the longest chain — and [`odometer_step_ref`] argues the chain factors
+    /// into (suffix states) x (sub states) because the anti-diagonal bitsum reads only slower rows.
+    /// If that argument is right the concatenated output is bit-identical, not merely a permutation,
+    /// so this asserts equality of the flattened `(col_sums, masks)` streams rather than of a set.
+    ///
+    /// Every `j` in `0..=rows` is checked, including both degenerate ends, so the property is not
+    /// accidentally true only for the split points a heuristic happens to pick.
+    #[test]
+    fn admissible_enum_split_matches() {
+        use fp::prime::ValidPrime;
+
+        let p = ValidPrime::new(2);
+        let algebra = Arc::new(MilnorAlgebra::new(p, false));
+        let max_degree = 60;
+        algebra.compute_basis(max_degree);
+        let mut checked = 0usize;
+        // How much a split could shorten the longest chain, which is what predicts the win.
+        let mut worst_chain = 0usize;
+        let mut worst_split = 0usize;
+        for deg in 1..=max_degree {
+            for idx in 0..algebra.dimension(deg) {
+                let p_part: Vec<u32> = algebra
+                    .basis_element_from_index(deg, idx)
+                    .p_part
+                    .iter()
+                    .collect();
+                if p_part.is_empty() {
+                    continue;
+                }
+                let want = enumerate_admissible_ref(&p_part);
+                let rows = p_part.len();
+                let cols = p_part
+                    .iter()
+                    .map(|&x| (u32::BITS - x.leading_zeros()) as usize)
+                    .max()
+                    .unwrap();
+                for j in 0..=rows * (cols - 1) {
+                    let got = enumerate_admissible_split_ref(&p_part, j);
+                    assert_eq!(
+                        got, want,
+                        "R degree {deg} idx {idx} p_part {p_part:?} split at digit {j}"
+                    );
+                }
+                // Chain length after the best split: suffix states run in parallel, so the longest
+                // remaining chain is the largest sub-walk. Approximated by total / suffix count at
+                // the split that maximises the suffix count, which is `j = 0` (whole walk as
+                // suffix); the useful figure is the total, reported so the sweep below can size it.
+                let total = want.2.len() / want.0.max(1);
+                if total > worst_chain {
+                    worst_chain = total;
+                    worst_split = rows;
+                }
+                checked += 1;
+            }
+        }
+        assert!(checked > 0, "no R's exercised");
+        eprintln!(
+            "admissible_enum_split: {checked} R's matched for every split point (longest chain \
+             seen {worst_chain} matrices over {worst_split} rows)"
+        );
     }
 
     /// Smoke test proving the CubeCL `cuda` runtime launches and returns correct

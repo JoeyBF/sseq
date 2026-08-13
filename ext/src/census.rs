@@ -157,8 +157,8 @@ pub fn report() {
         return;
     }
     let records = RECORDS.lock().unwrap();
-    let path = std::env::var("NASSAU_CENSUS_CSV")
-        .unwrap_or_else(|_| "nassau_census.csv".to_string());
+    let path =
+        std::env::var("NASSAU_CENSUS_CSV").unwrap_or_else(|_| "nassau_census.csv".to_string());
     let mut csv = String::from(
         "s,t,target_dim,target_masked_dim,next_dim,signatures,subalgebra_dim,num_new_gens,\
          last_live_sig,rows_consumed,matrix_bytes,wall_us\n",
@@ -206,16 +206,21 @@ pub fn report() {
     let rows_zero_sig: u128 = records.iter().map(|r| r.target_masked_dim as u128).sum();
     let rows_consumed: u128 = records.iter().map(|r| r.rows_consumed as u128).sum();
     let peak_matrix = records.iter().map(|r| r.matrix_bytes).max().unwrap_or(0);
-    let pct = |a: u128, b: u128| if b == 0 { 0.0 } else { 100.0 * a as f64 / b as f64 };
+    let pct = |a: u128, b: u128| {
+        if b == 0 {
+            0.0
+        } else {
+            100.0 * a as f64 / b as f64
+        }
+    };
 
     eprintln!(
-        "[census] bidegrees={} csv={path}\n\
-         [census] work-weighted: zero_gen_bidegrees={:.1}% dead_signature_tail={:.1}%\n\
-         [census] rows: computed={rows_all} zero_sig={rows_zero_sig} ({:.2}% of computed) \
-         consumed_on_demand={rows_consumed} ({:.3}% of computed)\n\
-         [census] shift-reuse rows needed = zero_sig + on_demand = {} ({:.2}% of computed)\n\
-         [census] copy bytes: select_rows={:.1}GB add_masked={:.1}GB augmented_alloc={:.1}GB\n\
-         [census] peak single dense matrix={:.2}GB  VmHWM={:.1}GB",
+        "[census] bidegrees={} csv={path}\n[census] work-weighted: zero_gen_bidegrees={:.1}% \
+         dead_signature_tail={:.1}%\n[census] rows: computed={rows_all} zero_sig={rows_zero_sig} \
+         ({:.2}% of computed) consumed_on_demand={rows_consumed} ({:.3}% of computed)\n[census] \
+         shift-reuse rows needed = zero_sig + on_demand = {} ({:.2}% of computed)\n[census] copy \
+         bytes: select_rows={:.1}GB add_masked={:.1}GB augmented_alloc={:.1}GB\n[census] peak \
+         single dense matrix={:.2}GB  VmHWM={:.1}GB",
         records.len(),
         pct(zero_gen_w, total_w),
         pct(dead_sig_w, total_w),

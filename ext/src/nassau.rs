@@ -1876,7 +1876,8 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
         }
 
         let mut starts: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
-        let mut rows: std::collections::HashMap<usize, Vec<usize>> = std::collections::HashMap::new();
+        let mut rows: std::collections::HashMap<usize, Vec<usize>> =
+            std::collections::HashMap::new();
         for gd in target
             .iter_gen_offsets([b.t()])
             .take_while(|g| g.gen_deg < b.t())
@@ -2137,7 +2138,6 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
         full
     }
 
-
     /// Assemble one signature's matrix from precomputed pieces, building the rest in a single
     /// coalesced call.
     ///
@@ -2281,8 +2281,8 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
 
         // Census records counts, never durations, so a census run may be arbitrarily slower than
         // production without invalidating a number. See [`crate::census`].
-        let mut census = crate::census::enabled()
-            .then(|| crate::census::BidegreeCensus::new(b.s(), b.t()));
+        let mut census =
+            crate::census::enabled().then(|| crate::census::BidegreeCensus::new(b.s(), b.t()));
 
         let target = &*self.modules[b.s() - 1];
         let algebra = target.algebra();
@@ -2376,30 +2376,30 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                 m
             } else {
                 match speculate::take_or_claim(b) {
-                Some(m) if m.rows() == target_dim && m.columns() == next_dim => {
-                    if speculate::verify() {
-                        let fresh = self.build_full_restricted(b, target_dim, next_dim, false);
-                        for r in 0..target_dim {
-                            assert_eq!(
-                                m.row(r).iter_nonzero().collect::<Vec<_>>(),
-                                fresh.row(r).iter_nonzero().collect::<Vec<_>>(),
-                                "speculative matrix mismatch at {b}, row {r}"
+                    Some(m) if m.rows() == target_dim && m.columns() == next_dim => {
+                        if speculate::verify() {
+                            let fresh = self.build_full_restricted(b, target_dim, next_dim, false);
+                            for r in 0..target_dim {
+                                assert_eq!(
+                                    m.row(r).iter_nonzero().collect::<Vec<_>>(),
+                                    fresh.row(r).iter_nonzero().collect::<Vec<_>>(),
+                                    "speculative matrix mismatch at {b}, row {r}"
+                                );
+                            }
+                        }
+                        m
+                    }
+                    stale => {
+                        if let Some(m) = stale {
+                            tracing::warn!(
+                                %b,
+                                "discarding speculative matrix: got {}x{}, want {target_dim}x{next_dim}",
+                                m.rows(),
+                                m.columns(),
                             );
                         }
+                        self.build_full_restricted(b, target_dim, next_dim, false)
                     }
-                    m
-                }
-                stale => {
-                    if let Some(m) = stale {
-                        tracing::warn!(
-                            %b,
-                            "discarding speculative matrix: got {}x{}, want {target_dim}x{next_dim}",
-                            m.rows(),
-                            m.columns(),
-                        );
-                    }
-                    self.build_full_restricted(b, target_dim, next_dim, false)
-                }
                 }
             };
             // `NASSAU_SPLIT_VERIFY`: check the ROW-BLOCK DECOMPOSITION empirically.
@@ -3162,65 +3162,64 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                 // speculate, and one commit opens blocks across a whole column of future bidegrees
                 // rather than a single matrix — which is the point, since the queue depth is what
                 // the GPU is starved of.
-                let enqueue_spec = |progress: &[i32],
-                                    spec_issued: &mut Vec<i32>,
-                                    spec_issued_g: &mut Vec<i32>| {
-                    if spec_threads == 0 {
-                        return;
-                    }
-                    if blocks::enabled() {
-                        let algebra = self.algebra();
+                let enqueue_spec =
+                    |progress: &[i32], spec_issued: &mut Vec<i32>, spec_issued_g: &mut Vec<i32>| {
+                        if spec_threads == 0 {
+                            return;
+                        }
+                        if blocks::enabled() {
+                            let algebra = self.algebra();
+                            for r in 2..=max_s {
+                                let ri = r as usize;
+                                // Generator degrees whose rows AND columns are both frozen.
+                                let gf = std::cmp::min(progress[ri - 1], progress[ri - 2]);
+                                let hi_t = progress[ri] + 1 + blocks::ahead();
+                                let lo_t = progress[ri] + 2;
+                                let emit = |t: i32, lo_g: i32, hi_g: i32| {
+                                    if !in_region(r, t) {
+                                        return;
+                                    }
+                                    // `gen_deg < t`: a generator of degree `t` contributes no rows to
+                                    // the restricted matrix at `t`.
+                                    // Row count is `num_gens[g] x dim(A_{t-g})`: both O(1) lookups, so
+                                    // sizing every candidate costs nothing and lets the queue order by
+                                    // it.
+                                    let source = &self.modules[r - 1];
+                                    for g in lo_g..=std::cmp::min(hi_g, t - 1) {
+                                        let rows = source.number_of_gens_in_degree(g)
+                                            * algebra.ppart_table(t - g).len();
+                                        blocks::push(Bidegree::s_t(r, t), g, rows);
+                                    }
+                                };
+                                // Strip A: internal degrees newly in the window, at every `gen_deg`.
+                                for t in std::cmp::max(lo_t, spec_issued[ri] + 1)..=hi_t {
+                                    emit(t, min_degree, gf);
+                                }
+                                // Strip B: generator degrees newly frozen, at internal degrees already
+                                // issued.
+                                for t in lo_t..=std::cmp::min(spec_issued[ri], hi_t) {
+                                    emit(t, spec_issued_g[ri] + 1, gf);
+                                }
+                                spec_issued[ri] = std::cmp::max(spec_issued[ri], hi_t);
+                                spec_issued_g[ri] = std::cmp::max(spec_issued_g[ri], gf);
+                            }
+                            return;
+                        }
                         for r in 2..=max_s {
                             let ri = r as usize;
-                            // Generator degrees whose rows AND columns are both frozen.
-                            let gf = std::cmp::min(progress[ri - 1], progress[ri - 2]);
-                            let hi_t = progress[ri] + 1 + blocks::ahead();
-                            let lo_t = progress[ri] + 2;
-                            let emit = |t: i32, lo_g: i32, hi_g: i32| {
-                                if !in_region(r, t) {
-                                    return;
+                            let hi = std::cmp::min(
+                                progress[ri - 1] + 1,
+                                progress[ri] + 1 + speculate::ahead(),
+                            );
+                            let lo = std::cmp::max(spec_issued[ri] + 1, progress[ri] + 2);
+                            for t in lo..=hi {
+                                if in_region(r, t) {
+                                    speculate::push(Bidegree::s_t(r, t));
                                 }
-                                // `gen_deg < t`: a generator of degree `t` contributes no rows to
-                                // the restricted matrix at `t`.
-                                // Row count is `num_gens[g] x dim(A_{t-g})`: both O(1) lookups, so
-                                // sizing every candidate costs nothing and lets the queue order by
-                                // it.
-                                let source = &self.modules[r - 1];
-                                for g in lo_g..=std::cmp::min(hi_g, t - 1) {
-                                    let rows = source.number_of_gens_in_degree(g)
-                                        * algebra.ppart_table(t - g).len();
-                                    blocks::push(Bidegree::s_t(r, t), g, rows);
-                                }
-                            };
-                            // Strip A: internal degrees newly in the window, at every `gen_deg`.
-                            for t in std::cmp::max(lo_t, spec_issued[ri] + 1)..=hi_t {
-                                emit(t, min_degree, gf);
                             }
-                            // Strip B: generator degrees newly frozen, at internal degrees already
-                            // issued.
-                            for t in lo_t..=std::cmp::min(spec_issued[ri], hi_t) {
-                                emit(t, spec_issued_g[ri] + 1, gf);
-                            }
-                            spec_issued[ri] = std::cmp::max(spec_issued[ri], hi_t);
-                            spec_issued_g[ri] = std::cmp::max(spec_issued_g[ri], gf);
+                            spec_issued[ri] = std::cmp::max(spec_issued[ri], hi);
                         }
-                        return;
-                    }
-                    for r in 2..=max_s {
-                        let ri = r as usize;
-                        let hi = std::cmp::min(
-                            progress[ri - 1] + 1,
-                            progress[ri] + 1 + speculate::ahead(),
-                        );
-                        let lo = std::cmp::max(spec_issued[ri] + 1, progress[ri] + 2);
-                        for t in lo..=hi {
-                            if in_region(r, t) {
-                                speculate::push(Bidegree::s_t(r, t));
-                            }
-                        }
-                        spec_issued[ri] = std::cmp::max(spec_issued[ri], hi);
-                    }
-                };
+                    };
 
                 loop {
                     let event = if deferred.is_empty() {
@@ -3343,8 +3342,8 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
             eprintln!(
                 "[blocks] threads={spec_threads} built={built} hits={hits} misses={misses} \
                  hit_rate={:.1}% rows_hit={rows_hit} rows_missed={rows_missed} row_rate={:.1}% \
-                 dropped={dropped} released={released} unused={:.1}GB bails(room/done/claimed/\
-                 other)={}/{}/{}/{}",
+                 dropped={dropped} released={released} unused={:.1}GB \
+                 bails(room/done/claimed/other)={}/{}/{}/{}",
                 100.0 * hits as f64 / (hits + misses).max(1) as f64,
                 100.0 * rows_hit as f64 / (rows_hit + rows_missed).max(1) as f64,
                 bytes as f64 / (1u64 << 30) as f64,
@@ -3370,9 +3369,9 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
             let twe = twe_frac * 100.0;
             if blocks::enabled() {
                 eprintln!(
-                    "[specqueue] depth at-pop mean={qd:.1} max={qmax} | TIME-WEIGHTED mean={twd:.1} \
-                     empty={twe:.1}% | builder_idle={idle_s:.0}s builder_build={build_s:.0}s \
-                     threads={spec_threads}"
+                    "[specqueue] depth at-pop mean={qd:.1} max={qmax} | TIME-WEIGHTED \
+                     mean={twd:.1} empty={twe:.1}% | builder_idle={idle_s:.0}s \
+                     builder_build={build_s:.0}s threads={spec_threads}"
                 );
             }
             let n = INFLIGHT_N.load(std::sync::atomic::Ordering::Relaxed);
