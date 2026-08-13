@@ -548,6 +548,20 @@ static ENUM_BLOCKS: AtomicU64 = AtomicU64::new(0);
 /// Threads issued across all enumeration launches. Equals `ENUM_RS` when the odometer split is off,
 /// and exceeds it by the split's expansion factor when it is on.
 static ENUM_THREADS_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// Inside-the-worker breakdown of `exec`, so "the worker is the bottleneck" can be turned into
+/// "the worker is doing THIS".
+///
+/// The existing `launch`/`fence` split says which side of the submission boundary time goes
+/// (measured 1% fence: worker-bound, device idle), but `exec` was a single number, so it could not
+/// say whether the worker's time is arbitration, resident growth, host->device upload, or issuing
+/// the launch. Only the last two are I/O; the rest is work that could move to the submitting
+/// bidegree job.
+static W_LOCK_US: AtomicU64 = AtomicU64::new(0);
+static W_BIND_US: AtomicU64 = AtomicU64::new(0);
+static W_UPLOAD_US: AtomicU64 = AtomicU64::new(0);
+static W_ISSUE_US: AtomicU64 = AtomicU64::new(0);
+static W_READ_US: AtomicU64 = AtomicU64::new(0);
+static W_CLEAN_US: AtomicU64 = AtomicU64::new(0);
 static BATCH_MARSHAL_US: AtomicU64 = AtomicU64::new(0);
 static BATCH_DEVICE_US: AtomicU64 = AtomicU64::new(0);
 static BATCH_PAIRS: AtomicU64 = AtomicU64::new(0);
@@ -4659,7 +4673,10 @@ fn multiply_batch_block<'a>(
             gpu_thread::submit_on(dev, move || {
                 // Arbitrate against the `fp-cuda` row reduction from the one thread that submits (see the
                 // note where the permit is taken). Dropped at the end of this task.
+                let t_w_lock = std::time::Instant::now();
                 let _shared = fp::gpu_lock::shared();
+                W_LOCK_US.fetch_add(t_w_lock.elapsed().as_micros() as u64, Ordering::Relaxed);
+                let t_w_bind = std::time::Instant::now();
                 let client = gpu_client();
                 // Bind the segmented resident master/basis (see [`SegBuf`], [`seg_grow`]). Each store is
                 // `MASTER_MAX_SEG` segment handles padded with a never-indexed 1-element dummy; a
@@ -4896,6 +4913,8 @@ fn multiply_batch_block<'a>(
                 // does on the way back. NOT using `client.staging()` to pin these: it consumes the
                 // `Bytes` by value (so a buffer cannot be pinned once and reused across launches) and
                 // its own docs note it blocks the compute queue.
+                W_BIND_US.fetch_add(t_w_bind.elapsed().as_micros() as u64, Ordering::Relaxed);
+                let t_w_upload = std::time::Instant::now();
                 let tg_h = client.create(Bytes::from_elems(term_gei));
                 // `g`/`xi` are identical every launch at this degree: fetch the shared resident copies
                 // (uploaded once, re-uploaded only on a degree bump) instead of re-uploading them here.
@@ -5033,6 +5052,8 @@ fn multiply_batch_block<'a>(
                 )
                 .chain(enum_keep)
                 .collect();
+                W_UPLOAD_US.fetch_add(t_w_upload.elapsed().as_micros() as u64, Ordering::Relaxed);
+                let t_w_issue = std::time::Instant::now();
                 // SAFETY: `launch_unchecked` — see the kernel's `address_type = "u64"` note. Every device
                 // read is in-bounds by construction (uploaded `need_*` prefix, per-segment select, `j` guards).
                 unsafe {
@@ -5145,7 +5166,11 @@ fn multiply_batch_block<'a>(
                 // executor is involved: the future never yields `Pending` (it wraps a blocking
                 // `cuEventSynchronize`), so `block_on` polls it exactly once. The buffer itself is still
                 // handed back with no copy (see [`BatchOutput`]); `out_h` stays alive inside the future.
+                W_ISSUE_US.fetch_add(t_w_issue.elapsed().as_micros() as u64, Ordering::Relaxed);
+                let t_w_read = std::time::Instant::now();
                 let result = client.read_async(vec![out_h]);
+                W_READ_US.fetch_add(t_w_read.elapsed().as_micros() as u64, Ordering::Relaxed);
+                let t_w_clean = std::time::Instant::now();
 
                 // Trim this stream's transient pool. Historically this per-launch cleanup RENUMBERED the
                 // exclusive pool's page indices (`update_page`), which under ~100-way concurrency corrupted
@@ -5169,6 +5194,7 @@ fn multiply_batch_block<'a>(
 
                 // The keepalive rides back with the future so the caller's wait, not this closure's
                 // return, is what finally releases the launch's buffers.
+                W_CLEAN_US.fetch_add(t_w_clean.elapsed().as_micros() as u64, Ordering::Relaxed);
                 (result, keepalive)
             })
         });
@@ -5330,6 +5356,31 @@ fn multiply_batch_block<'a>(
                     ENUM_THREADS_TOTAL.load(Ordering::Relaxed) as f64 / el.max(1) as f64,
                     ENUM_THREADS_TOTAL.load(Ordering::Relaxed) as f64
                         / ENUM_RS.load(Ordering::Relaxed).max(1) as f64,
+                );
+                // What the worker thread itself spends `exec` on. `upload`+`issue` are the only I/O;
+                // `lock` is arbitration and `bind` is resident growth + transient enumeration setup,
+                // both of which are candidates to move onto the submitting bidegree job.
+                let us = |c: &AtomicU64| c.load(Ordering::Relaxed) as f64 / 1e6;
+                let (wl, wb, wu, wi, wr, wc) = (
+                    us(&W_LOCK_US),
+                    us(&W_BIND_US),
+                    us(&W_UPLOAD_US),
+                    us(&W_ISSUE_US),
+                    us(&W_READ_US),
+                    us(&W_CLEAN_US),
+                );
+                let wt = (wl + wb + wu + wi + wr + wc).max(1e-9);
+                let pc = |x: f64| 100.0 * x / wt;
+                eprintln!(
+                    "  worker exec: lock={wl:.1}s ({:.0}%) bind={wb:.1}s ({:.0}%) upload={wu:.1}s \
+                     ({:.0}%) launch={wi:.1}s ({:.0}%) read={wr:.1}s ({:.0}%) clean={wc:.1}s \
+                     ({:.0}%)",
+                    pc(wl),
+                    pc(wb),
+                    pc(wu),
+                    pc(wi),
+                    pc(wr),
+                    pc(wc),
                 );
             }
 
