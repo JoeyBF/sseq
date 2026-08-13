@@ -2649,9 +2649,29 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
         for (sig_idx, signature) in subalgebra.iter_signatures(b.t()).enumerate() {
             let _guard = tracing::info_span!("step", ?signature).entered();
             // Corrections only ever raise signature, so once every `dx` is zero the whole remaining
-            // tail is a provable no-op (its only side effect is `write_qi`, which is off under
-            // `EXT_NASSAU_NO_SAVE_QI`). Record where that happens rather than acting on it — the
-            // census must not change what the run computes.
+            // tail is a provable no-op: the lift below is guarded by `dx.entry(v) != 0`, so it adds
+            // nothing to `xs`, and the only other side effect is `write_qi`.
+            // So skip it. With no quasi-inverse writer there is no side effect left at all, and
+            // everything above the lift (`sig_masks`, `sig_select`, `sig_assemble`,
+            // `sig_row_reduce`, `sig_quasi_inverse`) is pure waste.
+            //
+            // MEASURED (census, S_2 stem 110/max_s 55, 7533 bidegrees): the dead tail is 27.4% of
+            // work-weighted signature time — and it coincides exactly with `zero_gen_bidegrees`,
+            // which is the whole story. A bidegree with `num_new_gens == 0` has an EMPTY `dxs`, so
+            // it is vacuously converged before the first iteration and its entire signature loop
+            // was always dead. Bidegrees that do add generators have a negligible tail; this is not
+            // an early-convergence optimisation, it is 27.4% of the run computing quasi-inverses
+            // nobody asked for.
+            //
+            // Gated on `f.is_none()` because writing the quasi-inverse is a real side effect: with
+            // `EXT_NASSAU_NO_SAVE_QI` unset the loop must still run to completion.
+            if f.is_none() && dxs.iter().all(|dx| dx.is_zero()) {
+                break;
+            }
+            // Recorded AFTER the skip, so `signatures` counts iterations actually executed and
+            // `dead_signature_tail` keeps meaning "waste still present in the run" — it reads ~0
+            // once the skip is on. Counting the one aborted iteration as dead would peg a skipped
+            // bidegree at 100% dead forever and hide whether the skip fired at all.
             if let Some(c) = census.as_mut() {
                 c.set_signatures(sig_idx + 1);
                 c.sig_live(sig_idx, dxs.iter().any(|dx| !dx.is_zero()));
