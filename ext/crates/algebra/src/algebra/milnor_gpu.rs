@@ -562,6 +562,15 @@ static W_UPLOAD_US: AtomicU64 = AtomicU64::new(0);
 static W_ISSUE_US: AtomicU64 = AtomicU64::new(0);
 static W_READ_US: AtomicU64 = AtomicU64::new(0);
 static W_CLEAN_US: AtomicU64 = AtomicU64::new(0);
+static W_SYNC_US: AtomicU64 = AtomicU64::new(0);
+
+/// Diagnostic only: insert an explicit device sync before the readback, to attribute the readback's
+/// cost to kernel completion versus the pinned staging allocation. See its use site.
+fn sync_before_read() -> bool {
+    static S: LazyLock<bool> =
+        LazyLock::new(|| std::env::var_os("NASSAU_GPU_SYNC_BEFORE_READ").is_some());
+    *S
+}
 static BATCH_MARSHAL_US: AtomicU64 = AtomicU64::new(0);
 static BATCH_DEVICE_US: AtomicU64 = AtomicU64::new(0);
 static BATCH_PAIRS: AtomicU64 = AtomicU64::new(0);
@@ -930,13 +939,75 @@ fn cur_device() -> usize {
 /// which is exactly the one-kernel-deep pipeline this indirection removes. Constructing each
 /// device's client once also drops a `CudaRuntime::client` lookup from every launch.
 fn gpu_client() -> &'static cubecl::prelude::ComputeClient<CudaRuntime> {
+    gpu_client_for(cur_device())
+}
+
+/// The client for an EXPLICIT device, for code running off that device's worker thread.
+///
+/// [`cur_device`] is a thread-local that only the GPU workers set, so a rayon thread calling
+/// [`gpu_client`] would silently get device 0's client. Deferring the readback to the submitting
+/// thread (see [`read_on_caller`]) is exactly that situation, and device handles are not
+/// interchangeable across devices, so the device has to be carried explicitly.
+fn gpu_client_for(dev: usize) -> &'static cubecl::prelude::ComputeClient<CudaRuntime> {
     static CLIENTS: std::sync::OnceLock<Vec<cubecl::prelude::ComputeClient<CudaRuntime>>> =
         std::sync::OnceLock::new();
     &CLIENTS.get_or_init(|| {
         (0..gpu_count())
             .map(|d| CudaRuntime::client(&CudaDevice::new(d)))
             .collect()
-    })[cur_device()]
+    })[dev]
+}
+
+/// Issue the readback on the SUBMITTING thread rather than the GPU worker
+/// (`NASSAU_GPU_READ_ON_CALLER`, default OFF — it is 5x SLOWER; see the measurement below).
+///
+/// `read_async` is documented as enqueuing the device->host copy without waiting. It does wait:
+/// measured at stem 110 / theta=0 it is 85% of the worker's `exec`, ~33 ms a call, and inserting an
+/// explicit `client.sync()` in front of it moves 106 s of that 117 s into the sync — i.e. it is
+/// predominantly blocking on KERNEL COMPLETION, with the remainder in the staging copy.
+///
+/// That is what keeps the pipeline one kernel deep. The worker cannot enqueue the next launch until
+/// the current kernel has finished, so a device runs one kernel at a time with the `bind` + `upload`
+/// gap idle between them, and callers pile up behind the four workers (`queue=82%`). Returning the
+/// output HANDLE and letting the caller call `read_async` moves both the completion wait and the
+/// staging copy onto the submitting bidegree job, which is one of many rayon threads, leaving the
+/// worker with the launch alone (`launch=0.4 s` across 4600 launches).
+///
+/// It also explains why adding workers per device made things worse rather than better (81.9 s at
+/// `streams=1` against 299 s at `streams=8`): more threads blocked inside the same synchronous call
+/// is contention, not throughput.
+///
+/// # And it is 5x slower, because that block is LOAD-BEARING
+///
+/// Measured, interleaved, 3 rounds at stem 110 / theta=0, output identical:
+///
+/// ```text
+/// read on caller  383.3, 408.3, 405.5 s
+/// read on worker   71.2,  87.5,  65.1 s
+/// ```
+///
+/// The wait does not go away, it MOVES — into `bind` on the next launch:
+///
+/// ```text
+/// on caller  bind=1046.3s (85%)  read=0.0s     clean=147.4s (12%)
+/// on worker  bind=  15.1s (12%)  read=100.2s (82%)  clean=0.0s
+/// ```
+///
+/// The blocking readback is what bounds in-flight device memory. Without it the worker enqueues
+/// launches nothing ever drains, so the next launch's allocations (`seg_grow`, `client.empty`,
+/// `create_from_slice`) stall waiting for memory and `memory_cleanup` starts thrashing —
+/// `device` time goes 1.2e3 s -> 1.0e4 s and queue depth 11 -> 18. The one-kernel-deep pipeline is
+/// not an oversight; it is the memory bound, enforced accidentally.
+///
+/// So the real shape of a fix is a BOUNDED pipeline — N launches in flight rather than 1 or
+/// unlimited. The byte-budget permit already in this function is the natural place for it, and it
+/// currently measures `permit=0.0s`, i.e. its budget is too large to bind. Tightening that until it
+/// is the binding constraint, THEN deferring the readback, is the experiment worth running; either
+/// half alone is not.
+fn read_on_caller() -> bool {
+    static R: LazyLock<bool> =
+        LazyLock::new(|| std::env::var("NASSAU_GPU_READ_ON_CALLER").as_deref() == Ok("1"));
+    *R
 }
 
 /// Compile-time cap on the number of fixed-size segments a resident device buffer may hold. It
@@ -5167,8 +5238,29 @@ fn multiply_batch_block<'a>(
                 // `cuEventSynchronize`), so `block_on` polls it exactly once. The buffer itself is still
                 // handed back with no copy (see [`BatchOutput`]); `out_h` stays alive inside the future.
                 W_ISSUE_US.fetch_add(t_w_issue.elapsed().as_micros() as u64, Ordering::Relaxed);
+                // DIAGNOSTIC (`NASSAU_GPU_SYNC_BEFORE_READ=1`): the readback below takes 85% of this
+                // worker's time despite being documented as non-blocking, and the two candidate causes
+                // want opposite fixes. An explicit sync here separates them: if it absorbs the time,
+                // the readback is waiting on KERNEL COMPLETION (fix = move the readback to the caller,
+                // leaving the worker with the launch alone); if it does not, the cost is the PINNED
+                // HOST ALLOCATION for `out_len` (fix = a reused per-device staging buffer).
+                let t_w_sync = std::time::Instant::now();
+                if sync_before_read() {
+                    let _ = cubecl_common::reader::read_sync(client.sync());
+                }
+                W_SYNC_US.fetch_add(t_w_sync.elapsed().as_micros() as u64, Ordering::Relaxed);
+                // MEASURED: the claim above is wrong. `read_async` does not merely record an event and
+                // hand back its wait — it blocks here for ~33 ms a call, 85% of this worker's `exec`,
+                // and an explicit `client.sync()` in front of it absorbs 106 s of that 117 s. So it is
+                // predominantly waiting for the kernel to RETIRE, which leaves the pipeline exactly as
+                // deep as the `read_one` it replaced. Deferring the CALL (not just the await) to the
+                // caller is what actually removes that; see [`read_on_caller`].
                 let t_w_read = std::time::Instant::now();
-                let result = client.read_async(vec![out_h]);
+                let (result, deferred_out) = if read_on_caller() {
+                    (None, Some(out_h))
+                } else {
+                    (Some(client.read_async(vec![out_h])), None)
+                };
                 W_READ_US.fetch_add(t_w_read.elapsed().as_micros() as u64, Ordering::Relaxed);
                 let t_w_clean = std::time::Instant::now();
 
@@ -5195,7 +5287,7 @@ fn multiply_batch_block<'a>(
                 // The keepalive rides back with the future so the caller's wait, not this closure's
                 // return, is what finally releases the launch's buffers.
                 W_CLEAN_US.fetch_add(t_w_clean.elapsed().as_micros() as u64, Ordering::Relaxed);
-                (result, keepalive)
+                (result, deferred_out, keepalive)
             })
         });
 
@@ -5209,10 +5301,19 @@ fn multiply_batch_block<'a>(
             // — the two are indistinguishable, which is how the one-kernel-deep pipeline stayed hidden
             // through three separate fan-out rewrites.
             let t_launch = std::time::Instant::now();
-            let ((fut, keepalive), timing) = pending.wait();
+            let ((fut, deferred_out, keepalive), timing) = pending.wait();
             let launch_ms = t_launch.elapsed().as_secs_f64() * 1e3;
 
             let t_fence = std::time::Instant::now();
+            // With `read_on_caller` the worker handed back the output HANDLE rather than a future, so
+            // the `read_async` call itself — the part that blocks on kernel completion — happens here,
+            // on this bidegree job's thread, leaving the worker free to launch the next block. The
+            // device must be named explicitly: `gpu_client` reads a thread-local only the workers set.
+            let fut = match (fut, deferred_out) {
+                (Some(f), _) => f,
+                (None, Some(h)) => gpu_client_for(dev).read_async(vec![h]),
+                (None, None) => unreachable!("one of the two readback paths must be taken"),
+            };
             let result = cubecl_common::future::block_on(fut)
                 .expect("GPU readback failed")
                 .remove(0);
@@ -5369,16 +5470,18 @@ fn multiply_batch_block<'a>(
                     us(&W_READ_US),
                     us(&W_CLEAN_US),
                 );
-                let wt = (wl + wb + wu + wi + wr + wc).max(1e-9);
+                let ws = us(&W_SYNC_US);
+                let wt = (wl + wb + wu + wi + wr + wc + ws).max(1e-9);
                 let pc = |x: f64| 100.0 * x / wt;
                 eprintln!(
                     "  worker exec: lock={wl:.1}s ({:.0}%) bind={wb:.1}s ({:.0}%) upload={wu:.1}s \
-                     ({:.0}%) launch={wi:.1}s ({:.0}%) read={wr:.1}s ({:.0}%) clean={wc:.1}s \
-                     ({:.0}%)",
+                     ({:.0}%) launch={wi:.1}s ({:.0}%) sync={ws:.1}s ({:.0}%) read={wr:.1}s \
+                     ({:.0}%) clean={wc:.1}s ({:.0}%)",
                     pc(wl),
                     pc(wb),
                     pc(wu),
                     pc(wi),
+                    pc(ws),
                     pc(wr),
                     pc(wc),
                 );
