@@ -469,20 +469,53 @@ fn reuse_within_cap(_rows: usize, _cols: usize) -> bool {
     }
 }
 
-/// Extract `rows` of `full` into a fresh matrix (`out.row(i) = full.row(rows[i])`), preserving the
-/// column layout. Slices a precomputed full (restricted-column) differential matrix into one
-/// signature's partial matrix (see [`reuse_full_matrix`]). `rows` must index within `full` — the
-/// signature masks are subsets of `0..full.rows()` (the restricted source basis), so this holds.
-fn select_rows(full: &Matrix, rows: &[usize]) -> Matrix {
-    crate::census::add_bytes(
-        &crate::census::SELECT_ROWS_BYTES,
-        rows.len() as u64 * (full.columns() as u64).div_ceil(64) * 8,
-    );
-    let mut out = Matrix::new(full.prime(), rows.len(), full.columns());
-    for (dst, &src) in rows.iter().enumerate() {
-        out.row_mut(dst).assign(full.row(src));
+/// One signature's partial differential matrix, which is either built for that signature alone or
+/// is a row-subset of a cached full matrix (see [`reuse_full_matrix`]).
+///
+/// The subset case used to be materialised by a `select_rows` helper: allocate `rows.len()`
+/// rows and `assign` each one out of `full`. That copy was pure overhead — a row gather is just an
+/// index indirection, and every consumer (`add_masked` into the augmented matrix, the lift, and
+/// [`Resolution::write_qi`]) reads rows one at a time and never needs them contiguous. The census
+/// measured it at **7.2 GB copied at stem 110 alone**.
+///
+/// It buys no wall time — measured below noise at stem 110 (19.44 s vs 19.42 s) and at stem 140
+/// uncapped (72.2 s vs 74.3 s, ~3% noise floor). That is expected rather than disappointing: the
+/// run sits at 21-30% CPU and is release-limited, so CPU work removed off the critical path does
+/// not shorten it. Keep the change anyway — strictly less allocation and memory traffic for
+/// byte-identical output — but do not expect copy elimination alone to move this workload.
+///
+/// Do NOT read the census's other two copy counters as saying the remaining copies are cheap:
+/// `ADD_MASKED_BYTES` and `AUGMENTED_ALLOC_BYTES` are declared and printed but have no
+/// incrementing call site, so their `0.0GB` means "never instrumented", not "never copied". The
+/// `add_masked` into the augmented matrix and the per-signature `AugmentedMatrix::new` are both
+/// still real copies — just unavoidable ones, since row reduction needs a mutable working matrix.
+/// Wire those counters before drawing any conclusion about them.
+///
+/// `rows` must index within `full`; the signature masks are subsets of `0..full.rows()` (the
+/// restricted source basis), so this holds.
+enum PartialMatrix<'a> {
+    Owned(Matrix),
+    /// `row(i) == full.row(rows[i])`, without materialising the gather.
+    Gather {
+        full: &'a Matrix,
+        rows: &'a [usize],
+    },
+}
+
+impl PartialMatrix<'_> {
+    fn columns(&self) -> usize {
+        match self {
+            Self::Owned(m) => m.columns(),
+            Self::Gather { full, .. } => full.columns(),
+        }
     }
-    out
+
+    fn row(&self, i: usize) -> FpSlice<'_> {
+        match self {
+            Self::Owned(m) => m.row(i),
+            Self::Gather { full, rows } => full.row(rows[i]),
+        }
+    }
 }
 
 /// Speculative full-matrix precomputation: build a bidegree's full restricted differential matrix
@@ -1677,7 +1710,7 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
         scratch: &mut FpVector,
         signature: &[PPartEntry],
         next_mask: &[usize],
-        full_matrix: &Matrix,
+        full_matrix: &PartialMatrix<'_>,
         masked_matrix: &AugmentedMatrix<2>,
     ) -> anyhow::Result<()> {
         let w = match w {
@@ -2502,14 +2535,17 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                 match &full_reuse {
                     Some(full) => {
                         debug_assert!(target_mask.iter().all(|&r| r < full.rows()));
-                        select_rows(full, &target_mask)
+                        PartialMatrix::Gather {
+                            full,
+                            rows: &target_mask,
+                        }
                     }
-                    None => restricted_partial_matrix_maybe_gpu(
+                    None => PartialMatrix::Owned(restricted_partial_matrix_maybe_gpu(
                         &self.differentials[b.s() - 1],
                         b.t(),
                         &target_mask,
                         next_dim,
-                    ),
+                    )),
                 }
             });
         let mut masked_matrix = tracing::trace_span!(
@@ -2520,7 +2556,11 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
         .in_scope(|| {
             let mut m =
                 AugmentedMatrix::new(p, target_masked_dim, [next_masked_dim, target_masked_dim]);
-            m.segment(0, 0).add_masked(&full_matrix, &next_mask);
+            // Row gather and column mask fused into one pass. `Matrix::add_masked` would need a
+            // materialised `full_matrix`; going row by row lets the gather stay an indirection.
+            for (i, mut l) in m.segment(0, 0).iter_mut().enumerate() {
+                l.add_masked(full_matrix.row(i), 1, &next_mask);
+            }
             m.segment(1, 1).add_identity();
             m
         });
@@ -2714,19 +2754,25 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                 .in_scope(|| match &full_reuse {
                     Some(full) => {
                         debug_assert!(target_mask.iter().all(|&r| r < full.rows()));
-                        select_rows(full, &target_mask)
+                        PartialMatrix::Gather {
+                            full,
+                            rows: &target_mask,
+                        }
                     }
                     // Above `reuse_within_cap` there is no full matrix to slice, so this is where
                     // signature-axis speculation is collected.
-                    None if blocks::enabled() => {
-                        self.assemble_signature(b, sig_idx, &target_mask, next_dim)
-                    }
-                    None => restricted_partial_matrix_maybe_gpu(
+                    None if blocks::enabled() => PartialMatrix::Owned(self.assemble_signature(
+                        b,
+                        sig_idx,
+                        &target_mask,
+                        next_dim,
+                    )),
+                    None => PartialMatrix::Owned(restricted_partial_matrix_maybe_gpu(
                         &self.differentials[b.s() - 1],
                         b.t(),
                         &target_mask,
                         next_dim,
-                    ),
+                    )),
                 });
 
             let mut masked_matrix = tracing::trace_span!(
@@ -2740,7 +2786,11 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                     target_mask.len(),
                     [next_mask.len(), target_mask.len()],
                 );
-                m.segment(0, 0).add_masked(&full_matrix, &next_mask);
+                // Row gather and column mask fused into one pass. `Matrix::add_masked` would need a
+                // materialised `full_matrix`; going row by row lets the gather stay an indirection.
+                for (i, mut l) in m.segment(0, 0).iter_mut().enumerate() {
+                    l.add_masked(full_matrix.row(i), 1, &next_mask);
+                }
                 m.segment(1, 1).add_identity();
                 m
             });
