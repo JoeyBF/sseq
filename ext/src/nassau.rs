@@ -14,7 +14,11 @@
 
 use std::{
     fmt::Display,
-    sync::{Arc, LazyLock, Mutex, mpsc},
+    sync::{
+        Arc, LazyLock, Mutex,
+        atomic::{AtomicUsize, Ordering},
+        mpsc,
+    },
 };
 
 use algebra::{
@@ -221,6 +225,16 @@ impl MilnorSubalgebra {
     /// `degree` (inclusive). This skips the initial zero signature.
     fn iter_signatures(&self, degree: i32) -> impl Iterator<Item = Vec<PPartEntry>> + '_ {
         SignatureIterator::new(self, degree)
+    }
+
+    /// Internal degree of a signature. `xi_i` has degree `2^i - 1`, so entry `idx` (which is
+    /// `xi_{idx+1}`) carries weight `2^(idx+1) - 1` — the same weighting [`Self::top_degree`] uses.
+    fn signature_degree(signature: &[PPartEntry]) -> i32 {
+        signature
+            .iter()
+            .enumerate()
+            .map(|(idx, &r)| ((1i32 << (idx + 1)) - 1) * r as i32)
+            .sum()
     }
 
     fn top_degree(&self) -> i32 {
@@ -467,6 +481,48 @@ fn reuse_within_cap(_rows: usize, _cols: usize) -> bool {
     {
         true
     }
+}
+
+/// Probe (`NASSAU_PROBE_SHIFT=1`) for signature-shift reuse, the next candidate lever: the census
+/// says only 33.35% of the rows we multiply are needed if a signature-`sigma` problem at internal
+/// degree `t` is the ZERO-signature problem at `t - deg(sigma)`.
+///
+/// That is the design the reference implementation uses (`solve_signature_lifts` /
+/// `signature_to_zero_translation`): it never rebuilds the matrix for a nonzero signature, it
+/// looks up the zero-signature solver at the shifted degree and relabels the basis around it.
+///
+/// This records each bidegree's zero-signature `(target_masked_dim, next_masked_dim)` and then,
+/// for every nonzero signature, checks those dims against the shifted bidegree's. Dimension
+/// equality is only a NECESSARY condition — it does not prove the linear maps agree — but it is
+/// cheap and it is decisive in the negative: a single mismatch kills the lever outright.
+static SHIFT_MATCH: AtomicUsize = AtomicUsize::new(0);
+static SHIFT_MISMATCH: AtomicUsize = AtomicUsize::new(0);
+static SHIFT_ABSENT: AtomicUsize = AtomicUsize::new(0);
+
+fn shift_probe_enabled() -> bool {
+    static ON: LazyLock<bool> = LazyLock::new(|| std::env::var_os("NASSAU_PROBE_SHIFT").is_some());
+    *ON
+}
+
+fn shift_probe_report() {
+    if !shift_probe_enabled() {
+        return;
+    }
+    let (m, x, a) = (
+        SHIFT_MATCH.load(Ordering::Relaxed),
+        SHIFT_MISMATCH.load(Ordering::Relaxed),
+        SHIFT_ABSENT.load(Ordering::Relaxed),
+    );
+    let total = m + x;
+    eprintln!(
+        "[shift-probe] signature instances: dims_match={m} dims_MISMATCH={x} ({:.2}% match) \
+         shifted_bidegree_absent={a}",
+        if total == 0 {
+            0.0
+        } else {
+            100.0 * m as f64 / total as f64
+        }
+    );
 }
 
 /// One signature's partial differential matrix, which is either built for that signature alone or
@@ -2750,6 +2806,37 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
             ));
             drop(_sm);
 
+            // Does this signature's problem look like the zero-signature problem at the shifted
+            // degree? Necessary condition only, but a mismatch would refute shift reuse outright.
+            if shift_probe_enabled() {
+                let shifted_t = b.t() - MilnorSubalgebra::signature_degree(&signature);
+                if shifted_t < 0 {
+                    SHIFT_ABSENT.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    // Compute the ZERO-signature masks at the shifted degree, but with THIS
+                    // bidegree's generator bounds. Reading them off the shifted bidegree instead
+                    // compares different generator sets (its bound is `shifted_t`, not `b.t()`),
+                    // which is what made the first cut of this probe read 21% for no real reason.
+                    let zs_target = subalgebra
+                        .signature_mask(&algebra, target, shifted_t, &zero_sig, target_bound)
+                        .count();
+                    let zs_next = subalgebra
+                        .signature_mask(&algebra, next, shifted_t, &zero_sig, next_bound)
+                        .count();
+                    if zs_target == target_mask.len() && zs_next == next_mask.len() {
+                        SHIFT_MATCH.fetch_add(1, Ordering::Relaxed);
+                    } else {
+                        SHIFT_MISMATCH.fetch_add(1, Ordering::Relaxed);
+                        tracing::debug!(
+                            "[shift-probe] {b} sig={signature:?} shifted_t={shifted_t} target {} \
+                             vs zs {zs_target}, next {} vs zs {zs_next}",
+                            target_mask.len(),
+                            next_mask.len()
+                        );
+                    }
+                }
+            }
+
             let full_matrix = tracing::trace_span!("sig_select", rows = target_mask.len())
                 .in_scope(|| match &full_reuse {
                     Some(full) => {
@@ -3480,6 +3567,7 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                      builder_build={build_s:.0}s threads={spec_threads}"
                 );
             }
+            shift_probe_report();
             let n = INFLIGHT_N.load(std::sync::atomic::Ordering::Relaxed);
             if n > 0 {
                 eprintln!(
