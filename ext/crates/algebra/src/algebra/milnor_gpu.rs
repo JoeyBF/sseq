@@ -1077,6 +1077,28 @@ static COLD_COUNT: LazyLock<RwLock<HashMap<PPart, (u32, u32, u32)>>> =
 /// miss it runs `admissible_matrices` purely to *count* (the returned arrays are dropped, not kept —
 /// the device enumerates them), then memoizes the triple. Layout matches [`resident_info`]'s so the
 /// kernel indexes the on-device-enumerated scratch identically to the resident master.
+/// Seeds per `R` the split aims for, when splitting [`enumerate_admissible_kernel`]'s odometer.
+///
+/// STRONGLY non-monotonic, and 64 is the measured peak. Self-seeding makes thread `k` re-walk `k`
+/// suffix steps to reach its seed, so total work carries an `S^2/2` term on top of the real `N`:
+/// too few seeds leaves the long chains long, too many drowns the kernel in seeking. Measured
+/// kernel-only, unsplit vs split, medians of 3 interleaved rounds (`bench_enum_split_speedup`):
+///
+/// | seeds/R |  deg 100 |  deg 110 |  deg 120 |  deg 130 |
+/// |---------|----------|----------|----------|----------|
+/// |       8 |    4.3x  |    4.5x  |    3.7x  |    3.8x  |
+/// |      16 |    5.1x  |    6.1x  |    6.4x  |    6.9x  |
+/// |      32 |    7.6x  |    8.3x  |    8.5x  |    9.1x  |
+/// |      64 |    8.7x  |   10.2x  |   10.2x  |    9.8x  |
+/// |     128 |    8.3x  |    7.2x  |    8.2x  |    9.3x  |
+/// |     256 |    5.4x  |    5.8x  |    6.0x  |    5.3x  |
+///
+/// At degree 130 that is 76.4 ms -> 7.8 ms on a launch whose longest chain is 51408 matrices.
+/// The `S^2/2` seek term is what keeps this at ~10x rather than the ~30-40x the critical-path model
+/// allows; removing it needs a seed PRE-PASS kernel (one launch writes the seed states, the next
+/// consumes them) so no thread walks the suffix at all.
+const ENUM_SPLIT_TARGET: usize = 64;
+
 /// A 1-element buffer standing in for the split inputs of an UNSPLIT enumeration launch.
 ///
 /// `split == false` is comptime, so every read of `t_slot`/`t_seed`/`r_split` is compiled out and
@@ -5829,6 +5851,51 @@ mod tests {
         starts
     }
 
+    /// How many suffix states a split at `sp` yields. Costs exactly that many odometer steps.
+    fn count_suffix_states(p_part: &[u32], sp: usize) -> usize {
+        let (mut matrix, mut totals, mut col_sums, mut masks, rows, cols) = odometer_init(p_part);
+        let total_digits = rows * (cols - 1);
+        let mut n = 1usize;
+        while odometer_step_ref(
+            &mut matrix,
+            &mut totals,
+            &mut col_sums,
+            &mut masks,
+            rows,
+            cols,
+            sp,
+            total_digits,
+        ) {
+            n += 1;
+        }
+        n
+    }
+
+    /// The largest split position (fewest seeds) that still yields at least `target` threads.
+    ///
+    /// Seeds increase as `sp` decreases, so this walks `sp` down from the unsplit end and stops at
+    /// the first position that clears the target. Cost is the sum of the state counts it tried,
+    /// which is dominated by the last one — about `2 * target` steps, independent of the chain
+    /// length. That is what makes it usable on the marshal path, unlike [`best_split_pos`], which
+    /// is exhaustive and costs a full walk per candidate position.
+    fn heuristic_split_pos(p_part: &[u32], target: usize) -> usize {
+        let rows = p_part.len();
+        let cols = p_part
+            .iter()
+            .map(|&x| (u32::BITS - x.leading_zeros()) as usize)
+            .max()
+            .unwrap();
+        let total = rows * (cols - 1);
+        let mut sp = total;
+        while sp > 0 {
+            if count_suffix_states(p_part, sp) >= target {
+                return sp;
+            }
+            sp -= 1;
+        }
+        0
+    }
+
     /// Split position for `p_part`, chosen to minimise `states + longest` — the two-phase critical
     /// path of "enumerate seeds, then run the longest sub-chain". Exhaustive over digit positions,
     /// which is fine here; production wants a cheaper rule.
@@ -6936,6 +7003,185 @@ mod tests {
     #[test]
     fn admissible_enum_gpu_matches() {
         check_enum_backend::<CudaRuntime>(&CudaDevice::default(), 145);
+    }
+
+    /// Kernel-only time for one enumeration launch, unsplit vs split, on real `R` sets.
+    ///
+    /// The claim under test is that a launch's duration is the MAX over its `R` chains, so cutting
+    /// the longest chain cuts the launch. Everything is marshalled and uploaded before timing;
+    /// reading the tiny counts buffer is what blocks until the kernel completes, so the measured
+    /// interval is kernel wall time with ~no transfer (the same idiom `enum_launch_breakdown` uses).
+    /// Each arm is run several times and the MEDIAN reported, and the arms are interleaved rather
+    /// than run in blocks, because block-sequential arms have inverted the sign of a result here
+    /// before.
+    #[test]
+    #[ignore = "benchmark, not a correctness check; run explicitly with --ignored --nocapture"]
+    fn bench_enum_split_speedup() {
+        use std::time::Instant;
+
+        use fp::prime::ValidPrime;
+
+        let p = ValidPrime::new(2);
+        let algebra = Arc::new(MilnorAlgebra::new(p, false));
+        let max_degree = 130;
+        algebra.compute_basis(max_degree);
+        let device = CudaDevice::default();
+        let client = CudaRuntime::client(&device);
+        let target: usize = std::env::var("ENUM_SPLIT_TARGET")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(ENUM_SPLIT_TARGET);
+
+        eprintln!("target seeds/R = {target}");
+        eprintln!("  deg    R's   threads   unsplit_ms   split_ms   speedup   longest chain");
+        for deg in [100, 110, 120, 130] {
+            let mut p_parts: Vec<Vec<u32>> = Vec::new();
+            let mut num_mats: Vec<u32> = Vec::new();
+            for idx in 0..algebra.dimension(deg) {
+                let pp: Vec<u32> = algebra
+                    .basis_element_from_index(deg, idx)
+                    .p_part
+                    .iter()
+                    .collect();
+                if pp.is_empty() {
+                    continue;
+                }
+                let (_cs_len, mk_len, _cs, mk) = enumerate_admissible_ref(&pp);
+                num_mats.push((mk.len() / mk_len) as u32);
+                p_parts.push(pp);
+            }
+            if p_parts.is_empty() {
+                continue;
+            }
+            let longest = *num_mats.iter().max().unwrap();
+
+            // Marshal both arms up front; only the launch is timed.
+            let build = |split: bool| {
+                let n_r = p_parts.len();
+                let width = p_parts.iter().map(Vec::len).max().unwrap();
+                let mut pp_flat = vec![0u32; n_r * width];
+                let (mut r_rows, mut r_cols, mut r_split) =
+                    (vec![0u32; n_r], vec![0u32; n_r], vec![0u32; n_r]);
+                let (mut t_cs, mut t_mk) = (Vec::new(), Vec::new());
+                let (mut t_slot, mut t_seed) = (Vec::new(), Vec::new());
+                let (mut cs_total, mut mk_total) = (0u64, 0u64);
+                for (i, pp) in p_parts.iter().enumerate() {
+                    let rows = pp.len();
+                    let cols = pp
+                        .iter()
+                        .map(|&x| (u32::BITS - x.leading_zeros()) as usize)
+                        .max()
+                        .unwrap();
+                    let (cs_len, mk_len) = ((cols - 1) as u64, (rows + cols - 1) as u64);
+                    for (s, &v) in pp_flat[i * width..i * width + rows].iter_mut().zip(pp) {
+                        *s = v;
+                    }
+                    r_rows[i] = rows as u32;
+                    r_cols[i] = cols as u32;
+                    let sp = if split {
+                        heuristic_split_pos(pp, target)
+                    } else {
+                        rows * (cols - 1)
+                    };
+                    r_split[i] = sp as u32;
+                    let starts = if split {
+                        seed_starts(pp, sp)
+                    } else {
+                        vec![0u32]
+                    };
+                    for (k, &s) in starts.iter().enumerate() {
+                        t_slot.push(i as u32);
+                        t_seed.push(k as u32);
+                        t_cs.push(cs_total + s as u64 * cs_len);
+                        t_mk.push(mk_total + s as u64 * mk_len);
+                    }
+                    cs_total += num_mats[i] as u64 * cs_len;
+                    mk_total += num_mats[i] as u64 * mk_len;
+                }
+                (
+                    pp_flat, width, r_rows, r_cols, r_split, t_cs, t_mk, t_slot, t_seed, cs_total,
+                    mk_total,
+                )
+            };
+            let arms = [build(false), build(true)];
+
+            let mut med = [0.0f64; 2];
+            let mut times: [Vec<f64>; 2] = [Vec::new(), Vec::new()];
+            // Interleave the arms; three rounds each.
+            for _ in 0..3 {
+                for (a, arm) in arms.iter().enumerate() {
+                    let (
+                        pp_flat,
+                        width,
+                        r_rows,
+                        r_cols,
+                        r_split,
+                        t_cs,
+                        t_mk,
+                        t_slot,
+                        t_seed,
+                        cs_total,
+                        mk_total,
+                    ) = arm;
+                    let n_r = r_rows.len();
+                    let n_t = t_slot.len();
+                    let pp_h = client.create_from_slice(u32::as_bytes(pp_flat));
+                    let rr_h = client.create_from_slice(u32::as_bytes(r_rows));
+                    let rc_h = client.create_from_slice(u32::as_bytes(r_cols));
+                    let rco_h = client.create_from_slice(u64::as_bytes(t_cs));
+                    let rmo_h = client.create_from_slice(u64::as_bytes(t_mk));
+                    let ts_h = client.create_from_slice(u32::as_bytes(t_slot));
+                    let tk_h = client.create_from_slice(u32::as_bytes(t_seed));
+                    let rsp_h = client.create_from_slice(u32::as_bytes(r_split));
+                    let cs_cap = (*cs_total).max(1) as usize;
+                    let mk_cap = (*mk_total).max(1) as usize;
+                    let ocs_h = client.empty(cs_cap * size_of::<u16>());
+                    let omk_h = client.empty(mk_cap * size_of::<u16>());
+                    let cnt_h = client.empty(n_t * size_of::<u32>());
+                    let cubes = (n_t as u32).div_ceil(ENUM_BLOCK);
+                    let t0 = Instant::now();
+                    unsafe {
+                        enumerate_admissible_kernel::launch_unchecked::<CudaRuntime>(
+                            &client,
+                            CubeCount::Static(cubes, 1, 1),
+                            CubeDim::new_1d(ENUM_BLOCK),
+                            BufferArg::from_raw_parts(pp_h, pp_flat.len()),
+                            BufferArg::from_raw_parts(rr_h, n_r),
+                            BufferArg::from_raw_parts(rc_h, n_r),
+                            BufferArg::from_raw_parts(rco_h, n_t),
+                            BufferArg::from_raw_parts(rmo_h, n_t),
+                            BufferArg::from_raw_parts(ocs_h, cs_cap),
+                            BufferArg::from_raw_parts(omk_h, mk_cap),
+                            BufferArg::from_raw_parts(cnt_h.clone(), n_t),
+                            *width,
+                            n_t,
+                            0u32,
+                            BufferArg::from_raw_parts(ts_h, n_t),
+                            BufferArg::from_raw_parts(tk_h, n_t),
+                            BufferArg::from_raw_parts(rsp_h, n_r),
+                            1,
+                            a == 1,
+                        );
+                    }
+                    let _ = client.read_one(cnt_h).unwrap();
+                    times[a].push(t0.elapsed().as_secs_f64() * 1e3);
+                }
+            }
+            for a in 0..2 {
+                times[a].sort_by(|x, y| x.partial_cmp(y).unwrap());
+                med[a] = times[a][times[a].len() / 2];
+            }
+            eprintln!(
+                "  {:4} {:6} {:9} {:12.2} {:10.2} {:8.1}x {:14}",
+                deg,
+                p_parts.len(),
+                arms[1].7.len(),
+                med[0],
+                med[1],
+                med[0] / med[1],
+                longest
+            );
+        }
     }
 
     /// The SPLIT thread mapping — one thread per `(R, seed)` rather than per `R` — must reproduce
