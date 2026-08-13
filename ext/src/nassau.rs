@@ -900,10 +900,21 @@ mod speculate {
 /// is the amount of work ELIGIBLE to speculate, not builder capacity — consistent with the ~33%
 /// row-coverage ceiling and the idle-builder counters below.
 ///
-/// So the remaining lever is not this module's tuning, it is the WAVEFRONT WIDTH itself: `progress`
-/// only advances when a bidegree fully finishes, while the generators that unblock downstream work
-/// are known early (`add_generators`) — before the signature loop that is ~96% of a bidegree's cost.
-/// Publishing that early is what would raise `mean=6.6`, and every knob here is downstream of it.
+/// It is also worth LESS than it looks, and the reason generalises. Little's law: in-flight
+/// `L = λ·W`. Speculation cut per-bidegree latency `W = L × wall` by 1.40x (366 -> 262) but the
+/// wavefront narrowed 1.23x (14.15 -> 11.5) in near-exact compensation, and 1.40/1.23 = 1.14x, the
+/// measured wall win. Arrivals are gated by the DAG, not by free capacity, so the system is
+/// RELEASE-limited: making bidegrees faster does not create more of them, it just drains the queue.
+/// Any change that only shifts work off the critical path pays this tax. Uniform work REMOVAL does
+/// not — see the dead-signature-tail skip in [`Resolution::step_resolution_with_subalgebra`], which
+/// took 1.33x with the wavefront holding at 13-14, and which SUBSUMES this module: stacked, the two
+/// measure 19.9/19.2 s against 19.0-20.3 s for the skip alone.
+///
+/// The obvious next lever — publish generators early so `progress` advances before a bidegree
+/// finishes — is a DEAD END, and specifically not for the reason an earlier version of this comment
+/// gave. `add_generators` already runs before the signature loop, so the generator COUNT is already
+/// published early. What a successor blocks on is the differential VALUES, and the signature loop
+/// mutates `xs` in place until it converges. There is no artificial barrier here to remove.
 ///
 /// [`speculate`] caches one whole matrix per bidegree, which bounds how early the work can start.
 /// The matrix at `(s, t)` is only fully determined once `(s - 1, t - 1)` is committed, so a builder
