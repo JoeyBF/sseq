@@ -1242,6 +1242,59 @@ fn odometer_init(p_part: &[u32]) -> (Vec<u32>, Vec<u32>, Vec<u32>, Vec<u32>, usi
     )
 }
 
+/// Predicted number of admissible matrices for `p_part`, WITHOUT enumerating.
+///
+/// Enum launch duration is a MAX over the `R` odometer chains in the launch, so a launch that mixes
+/// one 20000-matrix `R` with hundreds of 400-matrix ones costs the long pole and wastes the rest.
+/// Grouping `R`s by cost would fix that, but only if cost is knowable BEFORE enumerating --
+/// [`count_suffix_states`] walks the odometer, so it is O(count) and useless as a predictor.
+///
+/// # The bound
+///
+/// Drop the anti-diagonal disjointness constraint and the rows DECOUPLE: row `i` then contributes
+/// independently the number of ways to write any value `<= r_i` as `sum_{j>=1} 2^j x_ij`, and the
+/// prediction is the product over rows. Dropping a constraint can only admit more matrices, so this
+/// is an UPPER BOUND on the true count.
+///
+/// That per-row count is the binary-partition function restricted to parts `>= 2`, which satisfies
+/// `h(j, s) = h(j+1, s) + h(j, s - 2^j)` -- O(1) per state. So one table over all degrees, built
+/// once, reduces the predictor to a product of `rows` lookups.
+///
+/// Exact counting in polynomial time is NOT available this way: the row-sum constraint couples
+/// along rows while disjointness couples along anti-diagonals, so an exact DP would need both a
+/// per-row remaining total and a per-anti-diagonal mask in its state.
+///
+/// Grouping needs only a monotone RANKING, not exact values, which is why a bound can still be
+/// useful -- see `predict_ranks_actual` for whether it actually ranks.
+fn predicted_matrices(p_part: &[u32]) -> u64 {
+    /// `CUM[r]` = number of tuples `(x_1, x_2, ...)` with `sum_j 2^j x_j <= r`.
+    static CUM: LazyLock<Vec<u64>> = LazyLock::new(|| {
+        const MAX_R: usize = 4096;
+        // `exact[s]` = partitions of `s` into parts 2, 4, 8, ... (parts >= 2, powers of two).
+        let mut exact = vec![0u64; MAX_R + 1];
+        exact[0] = 1;
+        let mut part = 2usize;
+        while part <= MAX_R {
+            for s in part..=MAX_R {
+                exact[s] = exact[s].saturating_add(exact[s - part]);
+            }
+            part *= 2;
+        }
+        let mut cum = vec![0u64; MAX_R + 1];
+        let mut acc = 0u64;
+        for s in 0..=MAX_R {
+            acc = acc.saturating_add(exact[s]);
+            cum[s] = acc;
+        }
+        cum
+    });
+    let cum = &*CUM;
+    p_part
+        .iter()
+        .map(|&r| cum[(r as usize).min(cum.len() - 1)])
+        .fold(1u64, |a, b| a.saturating_mul(b))
+}
+
 /// One `next()` step of the admissible-matrix odometer, restricted to digits `lo_pos..hi_pos`.
 ///
 /// Flag-based: `found` = "produced a new matrix" (the original's `return true`); `handled` = "this
@@ -6070,6 +6123,106 @@ fn enumerate_admissible_kernel(
 
 #[cfg(test)]
 mod tests {
+
+    /// Does [`predicted_matrices`] RANK `R`s the way the true enumeration does? Grouping only needs
+    /// a monotone key, so rank agreement is the property that matters, not accuracy.
+    ///
+    /// Run: `cargo test -p algebra --release predict_ranks_actual -- --ignored --nocapture`
+    #[test]
+    #[ignore = "diagnostic: enumerates every R of several degrees"]
+    fn predict_ranks_actual() {
+        let algebra = MilnorAlgebra::new(fp::prime::TWO, false);
+        for degree in [40i32, 60, 80] {
+            algebra.compute_basis(degree);
+            let mut pairs: Vec<(u64, usize, Vec<u32>)> = Vec::new();
+            for pp in algebra.ppart_table(degree) {
+                let pp: Vec<u32> = pp.iter().collect();
+                if pp.is_empty() {
+                    continue;
+                }
+                let actual = super::count_suffix_states(&pp, 0);
+                pairs.push((super::predicted_matrices(&pp), actual, pp));
+            }
+            if pairs.len() < 3 {
+                continue;
+            }
+            // Spearman: rank both, correlate.
+            let n = pairs.len();
+            let rank_of = |key: &dyn Fn(&(u64, usize, Vec<u32>)) -> f64| -> Vec<f64> {
+                let mut idx: Vec<usize> = (0..n).collect();
+                idx.sort_by(|&a, &b| key(&pairs[a]).partial_cmp(&key(&pairs[b])).unwrap());
+                let mut r = vec![0.0; n];
+                for (rank, &i) in idx.iter().enumerate() {
+                    r[i] = rank as f64;
+                }
+                r
+            };
+            let rp = rank_of(&|t| t.0 as f64);
+            let ra = rank_of(&|t| t.1 as f64);
+            let mean = (n as f64 - 1.0) / 2.0;
+            let (mut num, mut dp, mut da) = (0.0, 0.0, 0.0);
+            for i in 0..n {
+                let (x, y) = (rp[i] - mean, ra[i] - mean);
+                num += x * y;
+                dp += x * x;
+                da += y * y;
+            }
+            let rho = num / (dp.sqrt() * da.sqrt());
+            let worst = pairs
+                .iter()
+                .filter(|t| t.1 > 0)
+                .map(|t| t.0 as f64 / t.1 as f64)
+                .fold(0.0f64, f64::max);
+            let maxa = pairs.iter().map(|t| t.1).max().unwrap();
+            let mina = pairs.iter().map(|t| t.1).min().unwrap();
+            // Whole-distribution correlation is the wrong test for grouping: only the LONG POLES
+            // set a launch's duration. What matters is whether the predictor's top-K contains the
+            // true top-K, so the expensive `R`s can be split off into their own launches.
+            let mut by_pred: Vec<usize> = (0..n).collect();
+            by_pred.sort_by_key(|&i| std::cmp::Reverse(pairs[i].0));
+            let mut by_act: Vec<usize> = (0..n).collect();
+            by_act.sort_by_key(|&i| std::cmp::Reverse(pairs[i].1));
+            let recall_at = |frac: f64| -> f64 {
+                let k = ((n as f64 * frac).ceil() as usize).max(1);
+                let want: std::collections::HashSet<usize> = by_act[..k].iter().copied().collect();
+                let hit = by_pred[..k].iter().filter(|i| want.contains(i)).count();
+                hit as f64 / k as f64
+            };
+            // Simulate the payoff BEFORE building anything. Launch cost is a MAX over its `R`s,
+            // so total enum cost ~ sum over launches of the largest chain in each. Compare today's
+            // arbitrary grouping against grouping in PREDICTED order (which is all a real
+            // implementation could do, since the true count is unknown until enumeration).
+            let sim = |order: &[usize], per: usize| -> u64 {
+                order
+                    .chunks(per)
+                    .map(|c| c.iter().map(|&i| pairs[i].1 as u64).max().unwrap_or(0))
+                    .sum()
+            };
+            let arbitrary: Vec<usize> = (0..n).collect(); // basis order = today's grouping
+            let mut by_pred_asc: Vec<usize> = (0..n).collect();
+            by_pred_asc.sort_by_key(|&i| pairs[i].0);
+            let mut by_act_asc: Vec<usize> = (0..n).collect();
+            by_act_asc.sort_by_key(|&i| pairs[i].1);
+            for per in [16usize, 64] {
+                let base = sim(&arbitrary, per) as f64;
+                let pred = sim(&by_pred_asc, per) as f64;
+                let ideal = sim(&by_act_asc, per) as f64;
+                println!(
+                    "  degree {degree} Rs/launch={per}: arbitrary={base:.0} \
+                     predicted-order={pred:.0} ({:.2}x) perfect-oracle={ideal:.0} ({:.2}x)",
+                    base / pred,
+                    base / ideal
+                );
+            }
+            println!(
+                "degree {degree}: Rs={n} spearman={rho:.4} worst_overestimate={worst:.1}x \
+                 actual_range={mina}..{maxa} recall@1%={:.2} @5%={:.2} @10%={:.2}",
+                recall_at(0.01),
+                recall_at(0.05),
+                recall_at(0.10)
+            );
+        }
+    }
     use super::*;
 
     /// Elementwise F₂ addition of two bit-packed vectors: `out[i] = a[i] ^ b[i]`.
