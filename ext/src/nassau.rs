@@ -632,7 +632,10 @@ fn shift_probe_report() {
 /// dimension probe read 21% instead of 100%.
 #[cfg(feature = "gpu")]
 mod shift {
-    use std::sync::{Arc, LazyLock, Mutex};
+    use std::sync::{
+        Arc, LazyLock, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    };
 
     use fp::matrix::Matrix;
     use rustc_hash::FxHashMap;
@@ -642,6 +645,47 @@ mod shift {
 
     static CACHE: LazyLock<Mutex<FxHashMap<Key, Arc<Matrix>>>> =
         LazyLock::new(|| Mutex::new(FxHashMap::default()));
+    static BYTES: AtomicUsize = AtomicUsize::new(0);
+
+    /// Byte ceiling for this cache (`NASSAU_SHIFT_CACHE_GB`, default 0 = unlimited).
+    ///
+    /// DEFAULT IS UNLIMITED so no run gets slower by default; this is a TIME-FOR-MEMORY DIAL to
+    /// reach for when a run is near the memory wall, not a free win. Measured at stem 170:
+    ///
+    /// | cap      | wall   | host RSS | cache |
+    /// |----------|--------|----------|-------|
+    /// | unlimited| 496.5s | 50.9 GB  | 26.8  |
+    /// | 8 GB     | 636.3s | 38.1 GB  |  8.0  |
+    /// | 4 GB     | 740.5s | 34.0 GB  |  4.0  |
+    ///
+    /// Non-cache memory is ~24 GB, so ~30 GB is the floor: at most ~1.7x memory for ~1.5x time.
+    /// Since memory grows ~2.6x per 20 stems and time ~3.5x, 1.7x of memory is worth roughly 8
+    /// stems of reach against a time cost worth about 6 -- marginally positive only when memory,
+    /// not time, is what stops the run.
+    ///
+    /// Unbounded, this was the run's LARGEST memory consumer and the fastest-growing one:
+    /// 7.15 GB of 16.2 GB RSS at stem 150 (44%), 26.8 GB of 50.3 GB at stem 170 (53%), growing
+    /// 3.75x per 20 stems against RSS's 3.1x. Since memory -- not time -- is what bounds reachable
+    /// stems, capping it buys REACH.
+    ///
+    /// Eviction is by LOWEST DEGREE first, which is exact rather than heuristic: an entry for
+    /// degree `d` serves consumers at `t = d + deg(sigma)`, and the wavefront never returns to a
+    /// degree it has passed, so the smallest degrees are always the deadest. A miss merely rebuilds
+    /// the entry, so eviction can never change results.
+    fn cache_bytes_cap() -> usize {
+        static N: LazyLock<usize> = LazyLock::new(|| {
+            let gb: f64 = std::env::var("NASSAU_SHIFT_CACHE_GB")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0.0);
+            if gb <= 0.0 {
+                usize::MAX
+            } else {
+                (gb * 1e9) as usize
+            }
+        });
+        *N
+    }
 
     /// Default ON; `NASSAU_SHIFT_REUSE=0` disables.
     pub(super) fn enabled() -> bool {
@@ -659,15 +703,44 @@ mod shift {
     }
 
     pub(super) fn put(s: i32, degree: i32, profile: &[u8], m: Arc<Matrix>) {
-        CACHE
-            .lock()
-            .unwrap()
-            .insert((s, degree, profile.to_vec()), m);
+        let size = (m.rows()) * (m.columns()).div_ceil(8);
+        let mut c = CACHE.lock().unwrap();
+        if c.insert((s, degree, profile.to_vec()), m).is_none() {
+            BYTES.fetch_add(size, Ordering::Relaxed);
+        }
+        let cap = cache_bytes_cap();
+        if cap != usize::MAX && BYTES.load(Ordering::Relaxed) > cap {
+            // Lowest degree first: the wavefront never comes back for those.
+            let mut keys: Vec<Key> = c.keys().cloned().collect();
+            keys.sort_by_key(|k| k.1);
+            for k in keys {
+                if BYTES.load(Ordering::Relaxed) <= cap {
+                    break;
+                }
+                if let Some(old) = c.remove(&k) {
+                    let freed = old.rows() * old.columns().div_ceil(8);
+                    BYTES.fetch_sub(freed.min(BYTES.load(Ordering::Relaxed)), Ordering::Relaxed);
+                }
+            }
+        }
     }
 
     /// Drop everything once the wavefront is done, mirroring [`super::blocks::clear`].
     pub(super) fn clear() {
         CACHE.lock().unwrap().clear();
+        BYTES.store(0, Ordering::Relaxed);
+    }
+
+    /// Entries and approximate bytes held. This cache NEVER EVICTS during a run, so it is a prime
+    /// suspect for the steady RSS climb (stem 170: 0 -> 49 GB monotone, peak single dense matrix
+    /// only 4 GB of a 51.4 GB high-water mark -- i.e. retained state, not transient matrices).
+    pub(super) fn stats() -> (usize, u64) {
+        let c = CACHE.lock().unwrap();
+        let bytes: u64 = c
+            .values()
+            .map(|m| (m.rows() as u64) * (m.columns() as u64).div_ceil(8))
+            .sum();
+        (c.len(), bytes)
     }
 }
 
@@ -4001,7 +4074,14 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
         speculate::clear();
         blocks::clear();
         #[cfg(feature = "gpu")]
-        shift::clear();
+        {
+            let (n, bytes) = shift::stats();
+            eprintln!(
+                "[shift-cache] entries={n} approx={:.2}GB (never evicted during the run)",
+                bytes as f64 / 1e9
+            );
+            shift::clear();
+        }
 
         // Eviction probe (`NASSAU_R_STATS`): dump the R-access distribution once the wavefront is done.
         #[cfg(feature = "gpu")]
