@@ -411,23 +411,30 @@ fn restricted_partial_matrix_maybe_gpu(
     #[cfg(feature = "gpu")]
     {
         if std::env::var_os("NASSAU_GPU").is_some() && crate::nassau_gpu::applicable(diff) {
-            // Below this `rows x cols`, the CPU beats a GPU launch. Raised 4e6 -> 2.56e8 once
-            // signature-shift reuse landed: it removes ~2/3 of the multiply work, and what is
-            // left is small and fragmented (stem 130: 7308 shift builds averaging 361 rows,
-            // `waves/SM` 0.017, readback 80% of worker time). Sending that to the GPU costs more
-            // in per-launch readback than it saves in compute.
+            // Below this `rows x cols`, the CPU beats a GPU launch.
             //
-            // MEASURED (theta=0, interleaved, differentials identical at every setting):
-            //     stem 110   4e6 13.7/13.3s   2.56e8 6.09/6.22s   4e9 6.46/6.22s
-            //     stem 130   4e6 53.0/52.1s   2.56e8 27.1/26.7s   4e9 26.4/26.4s
-            // Flat from 2.56e8 up, and CPU-only (1e12) is within noise of the best at stem 130 --
-            // the GPU is barely contributing at these sizes now. 2.56e8 is chosen over "never"
-            // so genuinely large work still goes to the device; expect this to matter again at
-            // high stem, where the per-bidegree matrices grow.
+            // REGIME-DEPENDENT, and the crossover sits between stem 130 and 150. Measured at
+            // theta=0, interleaved, timing runs to /dev/null (the differentials dump is 400-600MB
+            // at stem 150 and writing it to panfs swamps the measurement):
+            //
+            //     stem 110    4e6  13.7/13.3s      2.56e8   6.09/6.22s     CPU-only  ~6.3s
+            //     stem 130    4e6  53.0/52.1s      2.56e8  27.1/26.7s      CPU-only ~27.8s
+            //     stem 150    4e6 168.2/169.9s     2.56e8 523.8/512.4s     CPU-only 505/521s
+            //     stem 170    4e6 496.5s           2.56e8 1452.6s
+            //
+            // It INVERTS: 2.2x better at stem 110-130, 3.1x WORSE at 150 and 2.9x worse at 170.
+            // The deciding factor is not matrix size (which is what this knob measures) but
+            // submission concurrency -- `depth mean` is 1.6 at stem 130 and 7.5 at stem 150, so at
+            // high stem the pipeline is deep enough to amortise per-launch overhead that dominates
+            // at low stem. A fixed size threshold cannot express that.
+            //
+            // Kept at 4e6 because the target regime is high stem: stems 110-130 run in seconds
+            // either way, and stem 150+ is where a 3x matters. Set `NASSAU_GPU_MIN_WORK=256000000`
+            // for small-stem work. Making this adaptive on queue depth is the real fix.
             let min_work: u64 = std::env::var("NASSAU_GPU_MIN_WORK")
                 .ok()
                 .and_then(|v| v.parse().ok())
-                .unwrap_or(256_000_000);
+                .unwrap_or(4_000_000);
             let work = inputs.len() as u64 * target_dim as u64;
             if work >= min_work {
                 return if std::env::var_os("NASSAU_GPU_VERIFY").is_some() {
