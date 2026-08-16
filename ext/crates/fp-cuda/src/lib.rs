@@ -127,7 +127,12 @@ impl GpuContext {
 /// inter-row padding):
 ///
 /// - `a`: the `m`×`k` left operand, `m * k.div_ceil(64)` limbs.
-/// - `b`: the `k`×`n` right operand, `k * n.div_ceil(64)` limbs.
+/// - `bt`: the **transpose** of the `k`×`n` right operand — `n` rows of `k.div_ceil(64)` limbs.
+///
+/// B arrives transposed because the kernel wants it K-major: with `bt` in hand the tiling
+/// [`tile_bt`] performs is a gather of contiguous limb runs, whereas transposing here would cost a
+/// bit-level rearrangement of the whole operand on the host. `fp::Matrix::transpose` has a blocked
+/// `p = 2` path for exactly this.
 ///
 /// Returns C = A·B as `m * n.div_ceil(64)` limbs in the same layout, ready to hand to
 /// `fp::Matrix::from_data`.
@@ -136,10 +141,10 @@ pub fn matmul_b1_raw(
     a: &[u64],
     m: usize,
     k: usize,
-    b: &[u64],
+    bt: &[u64],
     n: usize,
 ) -> anyhow::Result<Vec<u64>> {
-    Ok(matmul_b1_inner(gpu, a, m, k, b, n, 1)?.0)
+    Ok(matmul_b1_inner(gpu, a, m, k, bt, n, 1)?.0)
 }
 
 /// Like [`matmul_b1_raw`], but also returns the average **kernel-only** wall time in seconds.
@@ -155,11 +160,11 @@ pub fn matmul_b1_raw_timed(
     a: &[u64],
     m: usize,
     k: usize,
-    b: &[u64],
+    bt: &[u64],
     n: usize,
     time_iters: usize,
 ) -> anyhow::Result<(Vec<u64>, f64)> {
-    matmul_b1_inner(gpu, a, m, k, b, n, time_iters.max(1))
+    matmul_b1_inner(gpu, a, m, k, bt, n, time_iters.max(1))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -168,13 +173,14 @@ fn matmul_b1_inner(
     a: &[u64],
     m: usize,
     k: usize,
-    b: &[u64],
+    bt: &[u64],
     n: usize,
     time_iters: usize,
 ) -> anyhow::Result<(Vec<u64>, f64)> {
     let n_lim = n.div_ceil(64);
-    assert_eq!(a.len(), m * k.div_ceil(64), "A limb count mismatch");
-    assert_eq!(b.len(), k * n_lim, "B limb count mismatch");
+    let k_lim = k.div_ceil(64);
+    assert_eq!(a.len(), m * k_lim, "A limb count mismatch");
+    assert_eq!(bt.len(), n * k_lim, "Bt limb count mismatch");
 
     let k_padded = k.next_multiple_of(TILE_K);
     // Pad M to a whole number of M-tiles; the extra padded rows produce zeros
@@ -189,14 +195,14 @@ fn matmul_b1_inner(
 
     let stream = gpu.stream();
 
-    let a_padded = pad_2d(a, m, k.div_ceil(64), m_padded, k_padded / 64);
-    let b_padded = pad_2d(b, k, n_lim, k_padded, n_lim);
+    let a_padded = pad_2d(a, m, k_lim, m_padded, k_padded / 64);
+    let bt_padded = pad_2d(bt, n, k_lim, n, k_padded / 64);
 
     let a_interleaved = interleave_a(&a_padded, m_padded, k_padded);
-    let bt = transpose_b(&b_padded, k_padded, n_lim);
+    let tiles = tile_bt(&bt_padded, n, k_padded / 64, n_groups);
 
     let a_dev = stream.clone_htod(&a_interleaved)?;
-    let bt_dev = stream.clone_htod(&bt)?;
+    let bt_dev = stream.clone_htod(&tiles)?;
     let c_dev = stream.alloc_zeros::<u64>(m_padded * n_padded_lim)?;
 
     // Raw device addresses for the TMA descriptors. The returned guards keep the
@@ -379,45 +385,32 @@ fn interleave_a(a: &[u64], m: usize, k: usize) -> Vec<u64> {
     out
 }
 
-/// Pre-transpose B into plain row-major K-major tiles for TMA 128B swizzle.
+/// Slice Bᵀ into the plain row-major K-major tiles the TMA 128B swizzle expects.
 ///
 /// Each (k_chunk, column group) tile is NB = NG*64 rows (= the NG*64 output columns of the group) ×
-/// KL u64s (= TILE_K K bits); the consumer feeds it to MSTRIPS m64n128 wgmmas that share it.
-/// Operand row `lg*64 + jj` is output column `cg*NG*64 + lg*64 + jj`; element `[..][kl] bit` is bit
-/// `jj` of `B[k_chunk*TILE_K + kl*64 + bit][cg*NG + lg]`.
+/// KL u64s (= TILE_K K bits); the consumer feeds it to MSTRIPS m64n128 wgmmas that share it. Tile
+/// row `j` is output column `cg*NB + j`, whose K bits are that row of `bt` — so row `j` is exactly
+/// limbs `[k_chunk*KL, (k_chunk+1)*KL)` of `bt` row `cg*NB + j`, and the whole rearrangement is a
+/// gather of contiguous runs.
 ///
-/// Groups whose limb runs past `n_lim` are left zero-padded. Output is row-major; the TMA applies
-/// the swizzle on load.
-fn transpose_b(b: &[u64], k: usize, n_lim: usize) -> Vec<u64> {
-    let k_chunks = k / TILE_K;
-    let ng = NG as usize;
-    let n_groups = n_lim.div_ceil(ng);
-    let tile = ng * 64 * KL; // NB rows × KL u64
+/// Rows past `n` are left zero-padded. Output is row-major; the TMA applies the swizzle on load.
+fn tile_bt(bt: &[u64], n: usize, k_lim: usize, n_groups: usize) -> Vec<u64> {
+    let nb = NG as usize * 64;
+    let k_chunks = k_lim / KL;
+    let tile = nb * KL; // NB rows × KL u64
     let mut out = vec![0u64; k_chunks * n_groups * tile];
-    let mut buf = [0u64; TILE_K];
 
     for kk in 0..k_chunks {
         for cg in 0..n_groups {
             let base = (kk * n_groups + cg) * tile;
-            for lg in 0..ng {
-                let limb = cg * ng + lg;
-                if limb >= n_lim {
-                    continue; // padded column group → leave zeros
+            for j in 0..nb {
+                let row = cg * nb + j;
+                if row >= n {
+                    break; // padded column group → leave zeros
                 }
-                for (i, slot) in buf.iter_mut().enumerate() {
-                    let br = kk * TILE_K + i;
-                    *slot = if br < k { b[br * n_lim + limb] } else { 0 };
-                }
-                for jj in 0..64usize {
-                    let j = lg * 64 + jj; // operand row within the NB-col tile
-                    for kl in 0..KL {
-                        let mut val: u64 = 0;
-                        for bit in 0..64usize {
-                            val |= ((buf[kl * 64 + bit] >> jj) & 1) << bit;
-                        }
-                        out[base + j * KL + kl] = val;
-                    }
-                }
+                let src = row * k_lim + kk * KL;
+                let dst = base + j * KL;
+                out[dst..dst + KL].copy_from_slice(&bt[src..src + KL]);
             }
         }
     }
@@ -486,5 +479,98 @@ mod tests {
             Arc::ptr_eq(&sb, &b.stream()),
             "a context must reuse its own cached stream"
         );
+    }
+
+    /// The pre-transpose this crate used before it took Bᵀ: read B column-major, one bit at a time.
+    ///
+    /// Kept as the oracle for [`tile_bt`], which must produce byte-identical tiles from the
+    /// transposed operand.
+    fn transpose_b_reference(b: &[u64], k: usize, n_lim: usize) -> Vec<u64> {
+        let k_chunks = k / TILE_K;
+        let ng = NG as usize;
+        let n_groups = n_lim.div_ceil(ng);
+        let tile = ng * 64 * KL;
+        let mut out = vec![0u64; k_chunks * n_groups * tile];
+        let mut buf = [0u64; TILE_K];
+
+        for kk in 0..k_chunks {
+            for cg in 0..n_groups {
+                let base = (kk * n_groups + cg) * tile;
+                for lg in 0..ng {
+                    let limb = cg * ng + lg;
+                    if limb >= n_lim {
+                        continue;
+                    }
+                    for (i, slot) in buf.iter_mut().enumerate() {
+                        let br = kk * TILE_K + i;
+                        *slot = if br < k { b[br * n_lim + limb] } else { 0 };
+                    }
+                    for jj in 0..64usize {
+                        let j = lg * 64 + jj;
+                        for kl in 0..KL {
+                            let mut val: u64 = 0;
+                            for bit in 0..64usize {
+                                val |= ((buf[kl * 64 + bit] >> jj) & 1) << bit;
+                            }
+                            out[base + j * KL + kl] = val;
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Transpose a `k`×`n` bit matrix of limbs into the `n`×`k` layout `tile_bt` consumes.
+    fn transpose_bits(b: &[u64], k: usize, n: usize) -> Vec<u64> {
+        let n_lim = n.div_ceil(64);
+        let k_lim = k.div_ceil(64);
+        let mut bt = vec![0u64; n * k_lim];
+        for (row, chunk) in b.chunks_exact(n_lim).enumerate().take(k) {
+            for col in 0..n {
+                if (chunk[col / 64] >> (col % 64)) & 1 == 1 {
+                    bt[col * k_lim + row / 64] |= 1 << (row % 64);
+                }
+            }
+        }
+        bt
+    }
+
+    /// `tile_bt` applied to Bᵀ must reproduce the old column-major bit gather exactly.
+    #[test]
+    fn tile_bt_matches_the_old_transpose() {
+        let mut state: u64 = 0x853c_49e6_748f_ea9b;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+
+        // n values that land inside, on, and past a column-group boundary, so the zero-padded
+        // groups are covered too.
+        for &n in &[64usize, 100, 128, 129, 256] {
+            for &k in &[TILE_K, 2 * TILE_K] {
+                let n_lim = n.div_ceil(64);
+                let k_lim = k.div_ceil(64);
+                let n_groups = n_lim.div_ceil(NG as usize);
+
+                let mut b: Vec<u64> = (0..k * n_lim).map(|_| next()).collect();
+                // Clear the bits past column n; they are not part of the operand.
+                if n % 64 != 0 {
+                    let mask = (1u64 << (n % 64)) - 1;
+                    for row in 0..k {
+                        b[row * n_lim + n_lim - 1] &= mask;
+                    }
+                }
+
+                let expected = transpose_b_reference(&b, k, n_lim);
+                let bt = transpose_bits(&b, k, n);
+                let got = tile_bt(&bt, n, k_lim, n_groups);
+
+                assert_eq!(got.len(), expected.len(), "tile count at n={n}, k={k}");
+                assert_eq!(got, expected, "tile contents at n={n}, k={k}");
+            }
+        }
     }
 }

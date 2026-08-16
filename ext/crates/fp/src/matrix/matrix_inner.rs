@@ -516,6 +516,75 @@ impl fmt::Debug for Matrix {
 }
 
 impl Matrix {
+    /// The transpose of this matrix.
+    ///
+    /// At `p = 2` this transposes whole [`BITS_PER_LIMB`]-square bit blocks at a time; at odd
+    /// primes it falls back to copying one entry at a time.
+    ///
+    /// ```
+    /// # use fp::matrix::Matrix;
+    /// # use fp::prime::TWO;
+    /// let m = Matrix::from_vec(TWO, &[vec![0, 1, 0], vec![1, 1, 0]]);
+    /// assert_eq!(
+    ///     m.transpose(),
+    ///     Matrix::from_vec(TWO, &[vec![0, 1], vec![1, 1], vec![0, 0]])
+    /// );
+    /// ```
+    pub fn transpose(&self) -> Self {
+        let mut m = Self::new(self.prime(), self.columns, self.rows());
+        if self.prime() == prime::TWO {
+            self.transpose_two_into(&mut m);
+        } else {
+            for i in 0..self.rows() {
+                for j in 0..self.columns() {
+                    let entry = self.row(i).entry(j);
+                    m.row_mut(j).set_entry(i, entry);
+                }
+            }
+        }
+        m
+    }
+
+    /// Write the transpose into `out`, one [`BITS_PER_LIMB`]-square bit block at a time.
+    ///
+    /// Entry `(i, j)` of a `p = 2` matrix is bit `j % BITS_PER_LIMB` of limb `j / BITS_PER_LIMB` of
+    /// row `i`, so the block of entries `[r, r + BITS_PER_LIMB) x [c, c + BITS_PER_LIMB)` is
+    /// exactly one limb from each of `BITS_PER_LIMB` consecutive rows. Gathering that column of
+    /// limbs, transposing it, and scattering it back into `out` moves the whole block with
+    /// [`transpose_square_block`](crate::limb::transpose_square_block) instead of one bit at a
+    /// time. Blocks that run off the bottom or right edge are gathered as zeros, which transpose
+    /// into positions `out` never reads back.
+    fn transpose_two_into(&self, out: &mut Self) {
+        let bits = crate::limb::BITS_PER_LIMB;
+        let mut block = [0 as Limb; crate::limb::BITS_PER_LIMB];
+
+        for row_block in (0..self.rows()).step_by(bits) {
+            let rows_here = bits.min(self.rows() - row_block);
+            for limb_idx in 0..self.stride {
+                let col_block = limb_idx * bits;
+                if col_block >= self.columns() {
+                    break;
+                }
+
+                block[..rows_here]
+                    .iter_mut()
+                    .enumerate()
+                    .for_each(|(i, b)| {
+                        *b = self.data[(row_block + i) * self.stride + limb_idx];
+                    });
+                block[rows_here..].fill(0);
+
+                crate::limb::transpose_square_block(&mut block);
+
+                let cols_here = bits.min(self.columns() - col_block);
+                let out_limb = row_block / bits;
+                for (j, &b) in block[..cols_here].iter().enumerate() {
+                    out.data[(col_block + j) * out.stride + out_limb] = b;
+                }
+            }
+        }
+    }
+
     /// A no-nonsense, safe, row operation. Adds `c * self[source]` to `self[target]`.
     pub fn safe_row_op(&mut self, target: usize, source: usize, c: u32) {
         assert_ne!(target, source);
@@ -1620,6 +1689,53 @@ mod tests {
         }
     }
 
+    use crate::prime::TWO;
+
+    /// The entry-at-a-time transpose, as an oracle for the `p = 2` blocked path.
+    fn naive_transpose(m: &Matrix) -> Matrix {
+        let mut out = Matrix::new(m.prime(), m.columns(), m.rows());
+        for i in 0..m.rows() {
+            for (j, entry) in m.row(i).iter().enumerate() {
+                out.row_mut(j).set_entry(i, entry);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn transpose_two_spans_block_boundaries() {
+        // Around a multiple of BITS_PER_LIMB in each dimension independently, so a ragged block on
+        // one axis is exercised against a full block on the other.
+        let mut state: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for &rows in &[1, 63, 64, 65, 127, 128, 129, 200] {
+            for &columns in &[1, 63, 64, 65, 127, 128, 129, 200] {
+                let mut m = Matrix::new(TWO, rows, columns);
+                for i in 0..rows {
+                    for j in 0..columns {
+                        m.row_mut(i).set_entry(j, (next() & 1) as u32);
+                    }
+                }
+                assert_eq!(
+                    m.transpose(),
+                    naive_transpose(&m),
+                    "mismatch at {rows}x{columns}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn transpose_is_an_involution() {
+        let m = Matrix::from_vec(TWO, &[vec![0, 1, 0, 1], vec![1, 1, 0, 0], vec![0, 0, 1, 1]]);
+        assert_eq!(m.transpose().transpose(), m);
+    }
+
     proptest! {
         // Test that `arbitrary_rref` generates matrices in rref.
         #[test]
@@ -1627,6 +1743,18 @@ mod tests {
             let mut m_red = m.clone();
             m_red.row_reduce();
             prop_assert_eq!(m, m_red);
+        }
+
+        /// The blocked `p = 2` transpose must agree with the entry-at-a-time one, at every shape.
+        #[test]
+        fn test_transpose_matches_naive(m: Matrix) {
+            prop_assert_eq!(m.transpose(), naive_transpose(&m));
+        }
+
+        /// Transposing twice is the identity, at every prime.
+        #[test]
+        fn test_transpose_involution(m: Matrix) {
+            prop_assert_eq!(m.transpose().transpose(), m);
         }
     }
 }
