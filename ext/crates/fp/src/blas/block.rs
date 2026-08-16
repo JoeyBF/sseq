@@ -22,12 +22,6 @@ impl MatrixBlock {
         Self([0; 64])
     }
 
-    /// Row `i` of the block.
-    #[inline]
-    pub fn row(&self, i: usize) -> Limb {
-        self.0[i]
-    }
-
     #[inline]
     pub fn iter(&self) -> impl Iterator<Item = &Limb> {
         self.0.iter()
@@ -37,17 +31,6 @@ impl MatrixBlock {
     #[inline]
     pub fn iter_mut(&mut self) -> impl Iterator<Item = &mut Limb> {
         self.0.iter_mut()
-    }
-
-    /// Transpose this block in place, so bit `j` of row `i` becomes bit `i` of row `j`.
-    ///
-    /// A single-lane [`transpose_lanes`]; the round trip through the lane array is register-level
-    /// for one block. Transposing many blocks should call that directly, so the delta swap runs on
-    /// every lane at once.
-    pub fn transpose(&mut self) {
-        let mut lanes = self.0.map(|limb| [limb]);
-        transpose_lanes(&mut lanes);
-        self.0 = lanes.map(|[limb]| limb);
     }
 
     #[cfg_attr(not(target_feature = "avx512f"), allow(dead_code))]
@@ -295,15 +278,15 @@ pub fn transpose_lanes<const LANES: usize>(block: &mut [[Limb; LANES]; 64]) {
 mod tests {
     use super::*;
 
-    /// The entry-at-a-time transpose, as an oracle for [`MatrixBlock::transpose`].
-    fn naive_transpose(block: &MatrixBlock) -> MatrixBlock {
-        let mut out = [0; 64];
-        for (i, &row) in block.iter().enumerate() {
-            for (j, slot) in out.iter_mut().enumerate() {
+    /// The entry-at-a-time transpose, as an oracle for [`transpose_lanes`].
+    fn naive_transpose(block: &[[Limb; 1]; 64]) -> [[Limb; 1]; 64] {
+        let mut out = [[0]; 64];
+        for (i, &[row]) in block.iter().enumerate() {
+            for (j, [slot]) in out.iter_mut().enumerate() {
                 *slot |= ((row >> j) & 1) << i;
             }
         }
-        MatrixBlock::new(out)
+        out
     }
 
     /// A xorshift keeps these deterministic without pulling `rand` into a unit test.
@@ -322,9 +305,9 @@ mod tests {
             for entry in &mut limbs {
                 *entry = xorshift(&mut state);
             }
-            let mut block = MatrixBlock::new(limbs);
+            let mut block = limbs.map(|limb| [limb]);
             let expected = naive_transpose(&block);
-            block.transpose();
+            transpose_lanes(&mut block);
             assert_eq!(block, expected);
         }
     }
@@ -336,10 +319,10 @@ mod tests {
         for entry in &mut limbs {
             *entry = xorshift(&mut state);
         }
-        let mut block = MatrixBlock::new(limbs);
+        let mut block = limbs.map(|limb| [limb]);
         let original = block;
-        block.transpose();
-        block.transpose();
+        transpose_lanes(&mut block);
+        transpose_lanes(&mut block);
         assert_eq!(block, original);
     }
 
@@ -349,11 +332,11 @@ mod tests {
             for j in [0, 5, 31, 63] {
                 let mut limbs = [0; 64];
                 limbs[i] = 1 << j;
-                let mut block = MatrixBlock::new(limbs);
-                block.transpose();
-                let mut expected = [0; 64];
-                expected[j] = 1 << i;
-                assert_eq!(block, MatrixBlock::new(expected), "bit ({i}, {j})");
+                let mut block = limbs.map(|limb| [limb]);
+                transpose_lanes(&mut block);
+                let mut expected = [[0]; 64];
+                expected[j] = [1 << i];
+                assert_eq!(block, expected, "bit ({i}, {j})");
             }
         }
     }

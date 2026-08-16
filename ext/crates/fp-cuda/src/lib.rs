@@ -144,13 +144,11 @@ enum RightOperand<'a> {
 ///
 /// B is uploaded as it stands and rearranged by a device kernel, so the host does no bit-level work
 /// on it. Callers that already hold Bᵀ — or that can produce it cheaply, as `fp` can with
-/// [`Matrix::transpose`]'s blocked `p = 2` path — should prefer
-/// [`matmul_b1_raw_pretransposed`], which skips the extra device pass.
+/// `Matrix::transpose`'s blocked `p = 2` path — should prefer [`matmul_b1_raw_pretransposed`],
+/// which skips the extra device pass.
 ///
 /// Returns C = A·B as `m * n.div_ceil(64)` limbs in the same layout, ready to hand to
 /// `fp::Matrix::from_data`.
-///
-/// [`Matrix::transpose`]: https://docs.rs/fp
 pub fn matmul_b1_raw(
     gpu: &GpuContext,
     a: &[u64],
@@ -177,7 +175,8 @@ pub fn matmul_b1_raw_pretransposed(
     Ok(matmul_b1_inner(gpu, a, m, k, RightOperand::Transposed(bt), n, 1)?.0)
 }
 
-/// Like [`matmul_b1_raw`], but also returns the average **kernel-only** wall time in seconds.
+/// Like [`matmul_b1_raw_pretransposed`] — `bt` is B **transposed**, `n` rows of `k.div_ceil(64)`
+/// limbs — but also returns the average **kernel-only** wall time in seconds.
 ///
 /// The time is averaged over `time_iters` back-to-back launches, and excludes host
 /// (de)serialization, the TMA-layout pre-arrangement, and the H2D/D2H copies.

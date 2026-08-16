@@ -415,9 +415,7 @@ extern "C" __global__ void matmul_b1_kernel(
 // `jj` gathers bit `jj` out of all 64 rows. The gather reads one shared slot at a time across the
 // whole block, so every read is a broadcast rather than a bank conflict.
 //
-// Both the loads (a column of B, stride n_lim) and the stores (stride KL) are strided, so this is
-// far from peak bandwidth — but it replaces a host-side pass that ran at a couple of GB/s, and it
-// keeps B off the host critical path entirely.
+// Both the loads (a column of B, stride n_lim) and the stores (stride KL) are strided.
 extern "C" __global__ void transpose_tile_b1_kernel(
     const unsigned long long* __restrict__ b, // k_padded x n_lim, row-major
     unsigned long long* __restrict__ out,     // k_chunks x n_groups x (NB*KL)
