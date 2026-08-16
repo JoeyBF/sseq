@@ -33,6 +33,31 @@ impl MatrixBlock {
         self.0.iter_mut()
     }
 
+    /// Transpose this block in place, so bit `j` of row `i` becomes bit `i` of row `j`.
+    ///
+    /// The recursive delta swap of Hacker's Delight 7-3: each round exchanges the off-diagonal
+    /// quadrants of every sub-block at the current scale, so a full 64-square transpose costs six
+    /// masked passes over the block rather than the 4096 single-bit extractions an
+    /// entry-at-a-time transpose performs.
+    pub fn transpose(&mut self) {
+        let mut s = 32;
+        // Selects the columns whose index has bit `s` clear: the left half of each 2s-wide group.
+        let mut m: Limb = !0 >> 32;
+        while s != 0 {
+            let mut k = 0;
+            while k < 64 {
+                // `k` never has bit `s` set, so `k` and `k | s` are the upper and lower row halves
+                // of one 2s-square block; this exchanges its upper-right and lower-left quadrants.
+                let t = ((self.0[k] >> s) ^ self.0[k | s]) & m;
+                self.0[k | s] ^= t;
+                self.0[k] ^= t << s;
+                k = (k + s + 1) & !s;
+            }
+            s >>= 1;
+            m ^= m << s;
+        }
+    }
+
     #[cfg_attr(not(target_feature = "avx512f"), allow(dead_code))]
     pub(crate) fn limbs_ptr(&self) -> *const Limb {
         self.0.as_ptr()
@@ -233,6 +258,74 @@ mod arbitrary {
             proptest::array::uniform(any::<Limb>())
                 .prop_map(Self)
                 .boxed()
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The entry-at-a-time transpose, as an oracle for [`MatrixBlock::transpose`].
+    fn naive_transpose(block: &MatrixBlock) -> MatrixBlock {
+        let mut out = [0; 64];
+        for (i, &row) in block.iter().enumerate() {
+            for (j, slot) in out.iter_mut().enumerate() {
+                *slot |= ((row >> j) & 1) << i;
+            }
+        }
+        MatrixBlock::new(out)
+    }
+
+    /// A xorshift keeps these deterministic without pulling `rand` into a unit test.
+    fn xorshift(state: &mut u64) -> u64 {
+        *state ^= *state << 13;
+        *state ^= *state >> 7;
+        *state ^= *state << 17;
+        *state
+    }
+
+    #[test]
+    fn transpose_matches_naive() {
+        let mut state: u64 = 0x243f_6a88_85a3_08d3;
+        for _ in 0..64 {
+            let mut limbs = [0; 64];
+            for entry in &mut limbs {
+                *entry = xorshift(&mut state);
+            }
+            let mut block = MatrixBlock::new(limbs);
+            let expected = naive_transpose(&block);
+            block.transpose();
+            assert_eq!(block, expected);
+        }
+    }
+
+    #[test]
+    fn transpose_is_an_involution() {
+        let mut state: u64 = 0x1319_8a2e_0370_7344;
+        let mut limbs = [0; 64];
+        for entry in &mut limbs {
+            *entry = xorshift(&mut state);
+        }
+        let mut block = MatrixBlock::new(limbs);
+        let original = block;
+        block.transpose();
+        block.transpose();
+        assert_eq!(block, original);
+    }
+
+    #[test]
+    fn transpose_sends_single_bit_to_its_mirror() {
+        for i in [0, 1, 17, 62, 63] {
+            for j in [0, 5, 31, 63] {
+                let mut limbs = [0; 64];
+                limbs[i] = 1 << j;
+                let mut block = MatrixBlock::new(limbs);
+                block.transpose();
+                let mut expected = [0; 64];
+                expected[j] = 1 << i;
+                assert_eq!(block, MatrixBlock::new(expected), "bit ({i}, {j})");
+            }
         }
     }
 }

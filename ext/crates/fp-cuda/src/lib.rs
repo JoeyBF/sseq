@@ -57,6 +57,7 @@ pub struct GpuContext {
     #[allow(dead_code)]
     module: Arc<CudaModule>,
     kernel: CudaFunction,
+    transpose_kernel: CudaFunction,
 }
 
 impl GpuContext {
@@ -69,11 +70,13 @@ impl GpuContext {
         let ptx = Ptx::from_src(String::from_utf8(PTX_IMAGE.to_vec())?);
         let module = ctx.load_module(ptx)?;
         let kernel = module.load_function("matmul_b1_kernel")?;
+        let transpose_kernel = module.load_function("transpose_tile_b1_kernel")?;
         Ok(Self {
             ctx,
             streams: Mutex::new(HashMap::new()),
             module,
             kernel,
+            transpose_kernel,
         })
     }
 
@@ -120,23 +123,50 @@ impl GpuContext {
     }
 }
 
-/// Multiply two bit-packed F₂ matrices on the GPU.
+/// How the right operand reaches the kernel, which always wants B K-major.
+enum RightOperand<'a> {
+    /// B transposed: `n` rows of `k.div_ceil(64)` limbs. Tiled on the host by [`tile_bt`], which is
+    /// a gather of contiguous limb runs.
+    Transposed(&'a [u64]),
+    /// B as it stands: `k` rows of `n.div_ceil(64)` limbs. Uploaded unchanged and tiled on the
+    /// device by `transpose_tile_b1_kernel`, keeping the rearrangement off the host entirely.
+    RowMajor(&'a [u64]),
+}
+
+/// Multiply two bit-packed F₂ matrices on the GPU, transposing B on the device.
 ///
 /// Operands are plain **row-major, K-major** limb arrays — the exact layout `fp::Matrix::to_bytes`
 /// produces (little-endian `u64` limbs, one bit per entry, `columns.div_ceil(64)` limbs per row, no
 /// inter-row padding):
 ///
 /// - `a`: the `m`×`k` left operand, `m * k.div_ceil(64)` limbs.
-/// - `bt`: the **transpose** of the `k`×`n` right operand — `n` rows of `k.div_ceil(64)` limbs.
+/// - `b`: the `k`×`n` right operand, `k * n.div_ceil(64)` limbs.
 ///
-/// B arrives transposed because the kernel wants it K-major: with `bt` in hand the tiling
-/// [`tile_bt`] performs is a gather of contiguous limb runs, whereas transposing here would cost a
-/// bit-level rearrangement of the whole operand on the host. `fp::Matrix::transpose` has a blocked
-/// `p = 2` path for exactly this.
+/// B is uploaded as it stands and rearranged by a device kernel, so the host does no bit-level work
+/// on it. Callers that already hold Bᵀ — or that can produce it cheaply, as `fp` can with
+/// [`Matrix::transpose`]'s blocked `p = 2` path — should prefer
+/// [`matmul_b1_raw_pretransposed`], which skips the extra device pass.
 ///
 /// Returns C = A·B as `m * n.div_ceil(64)` limbs in the same layout, ready to hand to
 /// `fp::Matrix::from_data`.
+///
+/// [`Matrix::transpose`]: https://docs.rs/fp
 pub fn matmul_b1_raw(
+    gpu: &GpuContext,
+    a: &[u64],
+    m: usize,
+    k: usize,
+    b: &[u64],
+    n: usize,
+) -> anyhow::Result<Vec<u64>> {
+    Ok(matmul_b1_inner(gpu, a, m, k, RightOperand::RowMajor(b), n, 1)?.0)
+}
+
+/// Like [`matmul_b1_raw`], but taking B already transposed.
+///
+/// `bt` is `n` rows of `k.div_ceil(64)` limbs. This is the cheaper entry point when the caller can
+/// transpose faster than an extra device pass and an extra device buffer cost.
+pub fn matmul_b1_raw_pretransposed(
     gpu: &GpuContext,
     a: &[u64],
     m: usize,
@@ -144,7 +174,7 @@ pub fn matmul_b1_raw(
     bt: &[u64],
     n: usize,
 ) -> anyhow::Result<Vec<u64>> {
-    Ok(matmul_b1_inner(gpu, a, m, k, bt, n, 1)?.0)
+    Ok(matmul_b1_inner(gpu, a, m, k, RightOperand::Transposed(bt), n, 1)?.0)
 }
 
 /// Like [`matmul_b1_raw`], but also returns the average **kernel-only** wall time in seconds.
@@ -164,7 +194,15 @@ pub fn matmul_b1_raw_timed(
     n: usize,
     time_iters: usize,
 ) -> anyhow::Result<(Vec<u64>, f64)> {
-    matmul_b1_inner(gpu, a, m, k, bt, n, time_iters.max(1))
+    matmul_b1_inner(
+        gpu,
+        a,
+        m,
+        k,
+        RightOperand::Transposed(bt),
+        n,
+        time_iters.max(1),
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -173,14 +211,17 @@ fn matmul_b1_inner(
     a: &[u64],
     m: usize,
     k: usize,
-    bt: &[u64],
+    b: RightOperand<'_>,
     n: usize,
     time_iters: usize,
 ) -> anyhow::Result<(Vec<u64>, f64)> {
     let n_lim = n.div_ceil(64);
     let k_lim = k.div_ceil(64);
     assert_eq!(a.len(), m * k_lim, "A limb count mismatch");
-    assert_eq!(bt.len(), n * k_lim, "Bt limb count mismatch");
+    match b {
+        RightOperand::Transposed(bt) => assert_eq!(bt.len(), n * k_lim, "Bt limb count mismatch"),
+        RightOperand::RowMajor(b) => assert_eq!(b.len(), k * n_lim, "B limb count mismatch"),
+    }
 
     let k_padded = k.next_multiple_of(TILE_K);
     // Pad M to a whole number of M-tiles; the extra padded rows produce zeros
@@ -196,13 +237,40 @@ fn matmul_b1_inner(
     let stream = gpu.stream();
 
     let a_padded = pad_2d(a, m, k_lim, m_padded, k_padded / 64);
-    let bt_padded = pad_2d(bt, n, k_lim, n, k_padded / 64);
-
     let a_interleaved = interleave_a(&a_padded, m_padded, k_padded);
-    let tiles = tile_bt(&bt_padded, n, k_padded / 64, n_groups);
-
     let a_dev = stream.clone_htod(&a_interleaved)?;
-    let bt_dev = stream.clone_htod(&tiles)?;
+
+    let tile_limbs = k_chunks * n_groups * (NG as usize * 64) * KL;
+    let bt_dev = match b {
+        RightOperand::Transposed(bt) => {
+            let bt_padded = pad_2d(bt, n, k_lim, n, k_padded / 64);
+            stream.clone_htod(&tile_bt(&bt_padded, n, k_padded / 64, n_groups))?
+        }
+        RightOperand::RowMajor(b) => {
+            // B goes up unpadded; the kernel reads rows past `k` as zeros.
+            let b_dev = stream.clone_htod(b)?;
+            let tiles = stream.alloc_zeros::<u64>(tile_limbs)?;
+            let cfg = LaunchConfig {
+                grid_dim: ((KL * NG as usize) as u32, n_groups as u32, k_chunks as u32),
+                block_dim: (64, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            let mut lb = stream.launch_builder(&gpu.transpose_kernel);
+            let (n_lim_i, k_i, n_groups_i) = (n_lim as i32, k as i32, n_groups as i32);
+            lb.arg(&b_dev)
+                .arg(&tiles)
+                .arg(&n_lim_i)
+                .arg(&k_i)
+                .arg(&n_groups_i);
+            // SAFETY: the five pushed arguments match `transpose_tile_b1_kernel`'s parameter list
+            // in order and type; `b_dev` holds `k * n_lim` limbs and the kernel indexes it only
+            // where `row < k` and `limb < n_lim`; `tiles` is exactly the `tile_limbs` the grid
+            // covers; both buffers outlive the launch (their guards are held until the final
+            // synchronize below).
+            unsafe { lb.launch(cfg) }?;
+            tiles
+        }
+    };
     let c_dev = stream.alloc_zeros::<u64>(m_padded * n_padded_lim)?;
 
     // Raw device addresses for the TMA descriptors. The returned guards keep the

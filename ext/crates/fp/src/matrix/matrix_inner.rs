@@ -8,6 +8,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 
 use super::{QuasiInverse, Subspace};
 use crate::{
+    blas::block::MatrixBlock,
     field::{Field, Fp, field_internal::FieldInternal},
     limb::Limb,
     matrix::m4ri::M4riTable,
@@ -545,40 +546,37 @@ impl Matrix {
         m
     }
 
-    /// Write the transpose into `out`, one [`BITS_PER_LIMB`]-square bit block at a time.
+    /// Write the transpose into `out`, one 64-square bit block at a time.
     ///
-    /// Entry `(i, j)` of a `p = 2` matrix is bit `j % BITS_PER_LIMB` of limb `j / BITS_PER_LIMB` of
-    /// row `i`, so the block of entries `[r, r + BITS_PER_LIMB) x [c, c + BITS_PER_LIMB)` is
-    /// exactly one limb from each of `BITS_PER_LIMB` consecutive rows. Gathering that column of
-    /// limbs, transposing it, and scattering it back into `out` moves the whole block with
-    /// [`transpose_square_block`](crate::limb::transpose_square_block) instead of one bit at a
-    /// time. Blocks that run off the bottom or right edge are gathered as zeros, which transpose
-    /// into positions `out` never reads back.
+    /// Entry `(i, j)` of a `p = 2` matrix is bit `j % 64` of limb `j / 64` of row `i`, so the block
+    /// of entries `[r, r + 64) x [c, c + 64)` is exactly one limb from each of 64 consecutive rows.
+    /// Gathering that column of limbs into a [`MatrixBlock`], transposing it, and scattering it
+    /// back moves the whole block at once. Blocks that run off the bottom or right edge are
+    /// gathered as zeros, which transpose into positions `out` never reads back.
     fn transpose_two_into(&self, out: &mut Self) {
-        let bits = crate::limb::BITS_PER_LIMB;
-        let mut block = [0 as Limb; crate::limb::BITS_PER_LIMB];
+        let mut block = MatrixBlock::zero();
 
-        for row_block in (0..self.rows()).step_by(bits) {
-            let rows_here = bits.min(self.rows() - row_block);
+        for row_block in (0..self.rows()).step_by(64) {
+            let rows_here = 64.min(self.rows() - row_block);
             for limb_idx in 0..self.stride {
-                let col_block = limb_idx * bits;
+                let col_block = limb_idx * 64;
                 if col_block >= self.columns() {
                     break;
                 }
 
-                block[..rows_here]
-                    .iter_mut()
-                    .enumerate()
-                    .for_each(|(i, b)| {
-                        *b = self.data[(row_block + i) * self.stride + limb_idx];
-                    });
-                block[rows_here..].fill(0);
+                for (i, slot) in block.iter_mut().enumerate() {
+                    *slot = if i < rows_here {
+                        self.data[(row_block + i) * self.stride + limb_idx]
+                    } else {
+                        0
+                    };
+                }
 
-                crate::limb::transpose_square_block(&mut block);
+                block.transpose();
 
-                let cols_here = bits.min(self.columns() - col_block);
-                let out_limb = row_block / bits;
-                for (j, &b) in block[..cols_here].iter().enumerate() {
+                let cols_here = 64.min(self.columns() - col_block);
+                let out_limb = row_block / 64;
+                for (j, &b) in block.iter().take(cols_here).enumerate() {
                     out.data[(col_block + j) * out.stride + out_limb] = b;
                 }
             }

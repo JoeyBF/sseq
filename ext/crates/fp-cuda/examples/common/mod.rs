@@ -29,7 +29,14 @@ pub fn matmul_b1(gpu: &GpuContext, a: &Matrix, b: &Matrix) -> anyhow::Result<Mat
     assert_eq!(b.prime(), TWO);
     assert_eq!(a.columns(), b.rows());
     let (m, k, n) = (a.rows(), a.columns(), b.columns());
-    let c = fp_cuda::matmul_b1_raw(gpu, &to_limbs(a), m, k, &to_limbs(&b.transpose()), n)?;
+    let c = fp_cuda::matmul_b1_raw_pretransposed(
+        gpu,
+        &to_limbs(a),
+        m,
+        k,
+        &to_limbs(&b.transpose()),
+        n,
+    )?;
     Ok(Matrix::from_data(TWO, m, n, c))
 }
 
