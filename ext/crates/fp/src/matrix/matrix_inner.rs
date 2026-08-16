@@ -8,7 +8,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 
 use super::{QuasiInverse, Subspace};
 use crate::{
-    blas::block::MatrixBlock,
+    blas::block::transpose_lanes,
     field::{Field, Fp, field_internal::FieldInternal},
     limb::Limb,
     matrix::m4ri::M4riTable,
@@ -554,40 +554,53 @@ impl Matrix {
     /// back moves the whole block at once. Blocks that run off the bottom or right edge are
     /// gathered as zeros, which transpose into positions `out` never reads back.
     fn transpose_two_into(&self, out: &mut Self) {
-        // Each source block contributes one limb to each of 64 destination rows. Taking PANEL
-        // vertically-adjacent source blocks at once makes those contributions PANEL *consecutive*
-        // limbs of each destination row, so the scatter fills whole cache lines instead of
-        // touching one line per 8 bytes written.
-        const PANEL: usize = 8; // 8 limbs = 64 bytes = one cache line
-        let mut blocks = [MatrixBlock::zero(); PANEL];
+        // Work an LANES x LANES tile of 64-square blocks at a time, held in a scratch buffer small
+        // enough to stay in L1. Both trips to main memory are then contiguous: a row of the tile is
+        // LANES consecutive limbs of one source row, and a destination row receives LANES
+        // consecutive limbs. All the transposing happens inside the scratch.
+        //
+        // Within the scratch, lane `p` holds block `p` of the row, so the delta swap runs on all
+        // LANES blocks at once with no cross-lane movement — the operation vectorizes as written.
+        const LANES: usize = 8; // 8 limbs = 64 bytes = one cache line, and one AVX-512 register
+        let mut tile = vec![[[0 as Limb; LANES]; 64]; LANES];
 
-        for panel0 in (0..self.rows()).step_by(64 * PANEL) {
-            let panel_len = PANEL.min((self.rows() - panel0).div_ceil(64));
+        let row_blocks = self.rows().div_ceil(64);
+        let col_blocks = self.columns().div_ceil(64);
 
-            for limb_idx in 0..self.stride {
-                let col_block = limb_idx * 64;
-                if col_block >= self.columns() {
-                    break;
-                }
-                let cols_here = 64.min(self.columns() - col_block);
+        for rb0 in (0..row_blocks).step_by(LANES) {
+            let rbs = LANES.min(row_blocks - rb0);
+            for cb0 in (0..col_blocks).step_by(LANES) {
+                let cbs = LANES.min(col_blocks - cb0);
 
-                for (p, block) in blocks[..panel_len].iter_mut().enumerate() {
-                    let row_block = panel0 + p * 64;
-                    let rows_here = 64.min(self.rows() - row_block);
-                    for (i, slot) in block.iter_mut().enumerate() {
-                        *slot = if i < rows_here {
-                            self.data[(row_block + i) * self.stride + limb_idx]
-                        } else {
-                            0
-                        };
+                for (rb, block_rows) in tile[..rbs].iter_mut().enumerate() {
+                    for (i, lanes) in block_rows.iter_mut().enumerate() {
+                        let row = (rb0 + rb) * 64 + i;
+                        if row >= self.rows() {
+                            lanes.fill(0);
+                            continue;
+                        }
+                        let src = row * self.stride + cb0;
+                        for (p, slot) in lanes.iter_mut().enumerate() {
+                            *slot = if cb0 + p < self.stride {
+                                self.data[src + p]
+                            } else {
+                                0
+                            };
+                        }
                     }
-                    block.transpose();
+                    transpose_lanes(block_rows);
                 }
 
-                for j in 0..cols_here {
-                    let dst = (col_block + j) * out.stride + panel0 / 64;
-                    for (p, block) in blocks[..panel_len].iter().enumerate() {
-                        out.data[dst + p] = block.row(j);
+                for p in 0..cbs {
+                    for j in 0..64 {
+                        let row = (cb0 + p) * 64 + j;
+                        if row >= out.rows() {
+                            break;
+                        }
+                        let dst = row * out.stride + rb0;
+                        for (rb, block_rows) in tile[..rbs].iter().enumerate() {
+                            out.data[dst + rb] = block_rows[j][p];
+                        }
                     }
                 }
             }

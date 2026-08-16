@@ -41,27 +41,13 @@ impl MatrixBlock {
 
     /// Transpose this block in place, so bit `j` of row `i` becomes bit `i` of row `j`.
     ///
-    /// The recursive delta swap of Hacker's Delight 7-3: each round exchanges the off-diagonal
-    /// quadrants of every sub-block at the current scale, so a full 64-square transpose costs six
-    /// masked passes over the block rather than the 4096 single-bit extractions an
-    /// entry-at-a-time transpose performs.
+    /// A single-lane [`transpose_lanes`]; the round trip through the lane array is register-level
+    /// for one block. Transposing many blocks should call that directly, so the delta swap runs on
+    /// every lane at once.
     pub fn transpose(&mut self) {
-        let mut s = 32;
-        // Selects the columns whose index has bit `s` clear: the left half of each 2s-wide group.
-        let mut m: Limb = !0 >> 32;
-        while s != 0 {
-            let mut k = 0;
-            while k < 64 {
-                // `k` never has bit `s` set, so `k` and `k | s` are the upper and lower row halves
-                // of one 2s-square block; this exchanges its upper-right and lower-left quadrants.
-                let t = ((self.0[k] >> s) ^ self.0[k | s]) & m;
-                self.0[k | s] ^= t;
-                self.0[k] ^= t << s;
-                k = (k + s + 1) & !s;
-            }
-            s >>= 1;
-            m ^= m << s;
-        }
+        let mut lanes = self.0.map(|limb| [limb]);
+        transpose_lanes(&mut lanes);
+        self.0 = lanes.map(|[limb]| limb);
     }
 
     #[cfg_attr(not(target_feature = "avx512f"), allow(dead_code))]
@@ -265,6 +251,43 @@ mod arbitrary {
                 .prop_map(Self)
                 .boxed()
         }
+    }
+}
+
+/// Transpose the 64-square bit block held in each lane, all lanes at once.
+///
+/// `block[i][p]` is row `i` of lane `p`'s block; on return row `j` of lane `p` holds what was bit
+/// `j` of each of that lane's rows.
+///
+/// The recursive delta swap of Hacker's Delight 7-3: each round exchanges the off-diagonal
+/// quadrants of every sub-block at the current scale, so a full 64-square transpose costs six
+/// masked passes rather than the 4096 single-bit extractions an entry-at-a-time transpose performs.
+/// Every lane runs the same swap on the same row indices, so nothing moves between lanes and the
+/// inner loop is a straight elementwise operation over `LANES` limbs — the shape a vector unit
+/// wants, and the reason to transpose a panel of blocks together rather than one at a time.
+#[inline]
+pub fn transpose_lanes<const LANES: usize>(block: &mut [[Limb; LANES]; 64]) {
+    let mut s = 32;
+    // Selects the columns whose index has bit `s` clear: the left half of each 2s-wide group.
+    let mut m: Limb = !0 >> 32;
+    while s != 0 {
+        let mut k = 0;
+        while k < 64 {
+            // `k` never has bit `s` set, so `k` and `k | s` are the upper and lower row halves of
+            // one 2s-square block; this exchanges its upper-right and lower-left quadrants.
+            let (upper, lower) = {
+                let (a, b) = block.split_at_mut(k | s);
+                (&mut a[k], &mut b[0])
+            };
+            for p in 0..LANES {
+                let t = ((upper[p] >> s) ^ lower[p]) & m;
+                lower[p] ^= t;
+                upper[p] ^= t << s;
+            }
+            k = (k + s + 1) & !s;
+        }
+        s >>= 1;
+        m ^= m << s;
     }
 }
 
