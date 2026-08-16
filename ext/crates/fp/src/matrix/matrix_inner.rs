@@ -554,30 +554,41 @@ impl Matrix {
     /// back moves the whole block at once. Blocks that run off the bottom or right edge are
     /// gathered as zeros, which transpose into positions `out` never reads back.
     fn transpose_two_into(&self, out: &mut Self) {
-        let mut block = MatrixBlock::zero();
+        // Each source block contributes one limb to each of 64 destination rows. Taking PANEL
+        // vertically-adjacent source blocks at once makes those contributions PANEL *consecutive*
+        // limbs of each destination row, so the scatter fills whole cache lines instead of
+        // touching one line per 8 bytes written.
+        const PANEL: usize = 8; // 8 limbs = 64 bytes = one cache line
+        let mut blocks = [MatrixBlock::zero(); PANEL];
 
-        for row_block in (0..self.rows()).step_by(64) {
-            let rows_here = 64.min(self.rows() - row_block);
+        for panel0 in (0..self.rows()).step_by(64 * PANEL) {
+            let panel_len = PANEL.min((self.rows() - panel0).div_ceil(64));
+
             for limb_idx in 0..self.stride {
                 let col_block = limb_idx * 64;
                 if col_block >= self.columns() {
                     break;
                 }
+                let cols_here = 64.min(self.columns() - col_block);
 
-                for (i, slot) in block.iter_mut().enumerate() {
-                    *slot = if i < rows_here {
-                        self.data[(row_block + i) * self.stride + limb_idx]
-                    } else {
-                        0
-                    };
+                for (p, block) in blocks[..panel_len].iter_mut().enumerate() {
+                    let row_block = panel0 + p * 64;
+                    let rows_here = 64.min(self.rows() - row_block);
+                    for (i, slot) in block.iter_mut().enumerate() {
+                        *slot = if i < rows_here {
+                            self.data[(row_block + i) * self.stride + limb_idx]
+                        } else {
+                            0
+                        };
+                    }
+                    block.transpose();
                 }
 
-                block.transpose();
-
-                let cols_here = 64.min(self.columns() - col_block);
-                let out_limb = row_block / 64;
-                for (j, &b) in block.iter().take(cols_here).enumerate() {
-                    out.data[(col_block + j) * out.stride + out_limb] = b;
+                for j in 0..cols_here {
+                    let dst = (col_block + j) * out.stride + panel0 / 64;
+                    for (p, block) in blocks[..panel_len].iter().enumerate() {
+                        out.data[dst + p] = block.row(j);
+                    }
                 }
             }
         }

@@ -22,6 +22,12 @@ impl MatrixBlock {
         Self([0; 64])
     }
 
+    /// Row `i` of the block.
+    #[inline]
+    pub fn row(&self, i: usize) -> Limb {
+        self.0[i]
+    }
+
     #[inline]
     pub fn iter(&self) -> impl Iterator<Item = &Limb> {
         self.0.iter()
