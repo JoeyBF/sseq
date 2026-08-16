@@ -71,13 +71,11 @@ pub(super) fn try_mul(a: &Matrix, b: &Matrix) -> Option<Matrix> {
 
     let ctx = context()?;
     let a_limbs = to_limbs(a);
-    // The kernel wants B K-major. `fp_cuda::matmul_b1_raw` would do that rearrangement on the
-    // device, but `Matrix::transpose`'s blocked `p = 2` path is right here and saves the extra
-    // device pass and buffer; `fp-cuda` cannot reach it itself, since the dependency runs this way.
-    let bt_limbs = to_limbs(&b.transpose());
+    // B goes up as it stands; the kernel wants it K-major and rearranges it on the device.
+    let b_limbs = to_limbs(b);
 
     // Lock-free: `matmul_b1_raw` submits on the calling thread's own stream with per-call device
     // buffers, so concurrent callers do not interfere (see [`context`]).
-    let c = fp_cuda::matmul_b1_raw_pretransposed(ctx, &a_limbs, m, k, &bt_limbs, n).ok()?;
+    let c = fp_cuda::matmul_b1_raw(ctx, &a_limbs, m, k, &b_limbs, n).ok()?;
     Some(Matrix::from_data(TWO, m, n, c))
 }
