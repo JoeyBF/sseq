@@ -108,7 +108,13 @@ mod platform {
 
     /// Open the on-disk zarr store rooted at `path`.
     pub fn open_store(path: &Path) -> anyhow::Result<ReadableWritableListableStorage> {
-        Ok(Arc::new(FilesystemStore::new(path)?))
+        // Wrapped so every write is write-to-temp-then-rename: the raw FilesystemStore writes in
+        // place, which leaves a torn shard (up to 64 bidegrees, guarded by one CRC32C) if the
+        // process dies mid-write, and makes copying a live save directory unsafe. See
+        // [`crate::save_atomic`].
+        Ok(Arc::new(crate::save_atomic::AtomicWriteStore::new(
+            Arc::new(FilesystemStore::new(path)?),
+        )?))
     }
 
     /// Whether the root group's `zarr.json` still needs to be written — i.e. it doesn't already

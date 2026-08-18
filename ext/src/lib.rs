@@ -173,6 +173,7 @@ pub mod ext_algebra;
 pub mod resolution;
 pub mod resolution_homomorphism;
 pub mod save;
+pub mod save_atomic;
 
 pub mod yoneda;
 
