@@ -13,6 +13,7 @@ license = "(MIT OR Apache-2.0)"
 resolver = "2"
 
 [dependencies]
+tikv-jemallocator = { version = "0.6", features = ["profiling"], optional = true }
 algebra = { path = "crates/algebra", default-features = false }
 bivec = { path = "crates/bivec" }
 fp = { path = "crates/fp", default-features = false }
@@ -62,6 +63,7 @@ tempfile = "3.20.0"
 [lib]
 crate-type = ["cdylib", "rlib"]
 
+
 [features]
 default = ["odd-primes"]
 cache-multiplication = ["algebra/cache-multiplication"]
@@ -75,6 +77,8 @@ concurrent = [
 odd-primes = ["fp/odd-primes", "algebra/odd-primes", "sseq/odd-primes"]
 logging = []
 nassau = []
+# Heap profiling: swaps in jemalloc with prof support. Diagnostic only.
+heapprof = ["dep:tikv-jemallocator"]
 # Enables both GPU backends: the algebra Milnor-multiply backend (with the
 # `milnor_gpu_ab` A/B microbenchmark) and dispatch of large p=2 matrix products
 # to the Hopper GPU backend via `fp`.

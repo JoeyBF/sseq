@@ -172,6 +172,12 @@ pub mod chain_complex;
 pub mod ext_algebra;
 pub mod resolution;
 pub mod resolution_homomorphism;
+/// Heap profiling allocator (`--features heapprof`). Only present under that
+/// feature, so ordinary builds keep the system allocator.
+#[cfg(feature = "heapprof")]
+#[global_allocator]
+static HEAPPROF_ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 pub mod save;
 pub mod save_atomic;
 
