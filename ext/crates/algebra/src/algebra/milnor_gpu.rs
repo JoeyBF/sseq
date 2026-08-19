@@ -2374,6 +2374,14 @@ pub fn prefetch_stats() -> (u64, i32) {
     )
 }
 
+/// Whether transient (non-resident `R`) products are routed by [`shard_of`] rather than round-robin
+/// over the product index. `NASSAU_GPU_TRANSIENT_SHARD=0` restores the old round-robin for A/B.
+fn transient_shard_hash() -> bool {
+    static T: LazyLock<bool> =
+        LazyLock::new(|| std::env::var("NASSAU_GPU_TRANSIENT_SHARD").as_deref() != Ok("0"));
+    *T
+}
+
 fn shard_of(p_part: PPart) -> usize {
     (shard_hash(p_part) % gpu_count() as u64) as usize
 }
@@ -4096,7 +4104,32 @@ fn multiply_batch_grouped(
                 // splitting it (needs an unrank to jump to the k-th admissible matrix, since the
                 // odometer derives each from the previous) or by keeping the longest `R`s resident
                 // so they are never re-enumerated at all.
-                MasterMode::Transient => pi % gpu_count(),
+                MasterMode::Transient => {
+                    if transient_shard_hash() {
+                        // Route by `R`, exactly as the resident path does. Round-robin over `pi`
+                        // has two faults here, both stemming from products arriving GROUPED by `R`
+                        // (see `dev_memo` below): it splits each run of same-`R` products across
+                        // devices, so every device enumerates that `R` into its own scratch and
+                        // every device pays its longest chain -- and a launch's duration IS its
+                        // longest chain -- and it balances the COUNT of products when the top 1%
+                        // of `R`s carry 31% of references. Hashing keeps an `R` whole on one
+                        // device and draws each device an independent sample of the cost
+                        // distribution.
+                        let key = (prod.r_degree, prod.r_idx);
+                        match dev_memo {
+                            Some((k, v)) if k == key => v,
+                            _ => {
+                                let r =
+                                    algebra.basis_element_from_index(prod.r_degree, prod.r_idx);
+                                let v = shard_of(r.p_part);
+                                dev_memo = Some((key, v));
+                                v
+                            }
+                        }
+                    } else {
+                        pi % gpu_count()
+                    }
+                }
                 MasterMode::Resident => {
                     let key = (prod.r_degree, prod.r_idx);
                     match dev_memo {
