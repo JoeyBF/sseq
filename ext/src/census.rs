@@ -29,6 +29,16 @@ pub fn enabled() -> bool {
 
 /// Bytes copied, by site. Counted rather than timed: bytes divided by achievable bandwidth gives a
 /// defensible floor for the copy cost without needing a clean-timing run.
+///
+/// `SELECT_ROWS_BYTES` is EXPECTED to stay 0, and that zero is meaningful: the row gather it
+/// counted no longer exists. `PartialMatrix::Gather` keeps the selection as an indirection into
+/// `full_matrix` instead of materialising it, so there is no `select_rows` function left in the
+/// tree to instrument. Read it as "this copy was eliminated", not as "not measured".
+///
+/// The other two ARE wired (`nassau.rs`, the `zs_assemble` and `sig_assemble` blocks), one
+/// increment per assembled matrix. They were previously declared and printed but never
+/// incremented, so their `0.0GB` read as "no copies" for what profiling suggested was the largest
+/// single CPU cost.
 pub static SELECT_ROWS_BYTES: AtomicU64 = AtomicU64::new(0);
 pub static ADD_MASKED_BYTES: AtomicU64 = AtomicU64::new(0);
 pub static AUGMENTED_ALLOC_BYTES: AtomicU64 = AtomicU64::new(0);
@@ -38,6 +48,16 @@ pub fn add_bytes(counter: &AtomicU64, bytes: u64) {
     if enabled() {
         counter.fetch_add(bytes, Relaxed);
     }
+}
+
+/// Bit-packed size of a `rows x cols` F2 matrix, rows padded to whole 64-bit limbs — `fp`'s
+/// layout. Call sites pass whole-matrix dimensions so each copy costs ONE atomic, never one per
+/// row: the assembly loops these count run up to `target_dim` (700k+ at the frontier) times, and a
+/// contended per-row increment across 96 workers is the difference between a free counter and a
+/// regression.
+#[inline]
+pub fn matrix_bytes(rows: usize, cols: usize) -> u64 {
+    rows as u64 * (cols as u64).div_ceil(64) * 8
 }
 
 /// One row per bidegree. This is the extrapolation substrate: with the dimensions and the byte
@@ -72,8 +92,58 @@ pub struct Bidegree {
 static RECORDS: LazyLock<Mutex<Vec<Bidegree>>> = LazyLock::new(|| Mutex::new(Vec::new()));
 
 pub fn record(b: Bidegree) {
-    if enabled() {
-        RECORDS.lock().unwrap().push(b);
+    if !enabled() {
+        return;
+    }
+    let mut records = RECORDS.lock().unwrap();
+    records.push(b);
+    // Flush periodically, NOT only from `report()` at end of run. A long resolution's expected
+    // failure mode is an OOM kill, which is SIGKILL: no unwinding, no atexit, no `report()`. The
+    // whole per-bidegree series -- the extrapolation substrate this module exists for -- would die
+    // with the process, exactly as the jemalloc heap data did when `prof_final` was the only dump.
+    // Rewriting a few thousand CSV rows every `CSV_FLUSH_EVERY` bidegrees costs nothing next to a
+    // bidegree's compute, and the file is always at most that many records stale.
+    if records.len() % CSV_FLUSH_EVERY == 0 {
+        write_csv(&records);
+    }
+}
+
+/// How many bidegrees between CSV flushes. Small: at high stem a long run commits on the order of
+/// a hundred bidegrees per 6 hours, so this is a rewrite every few hours, and losing 25 records to
+/// a kill is negligible against losing all of them.
+const CSV_FLUSH_EVERY: usize = 25;
+
+fn csv_path() -> String {
+    std::env::var("NASSAU_CENSUS_CSV").unwrap_or_else(|_| "nassau_census.csv".to_string())
+}
+
+/// Serialize the per-bidegree records to the CSV path. Shared by the periodic flush in [`record`]
+/// and the end-of-run [`report`], so the two can never drift into different column orders.
+fn write_csv(records: &[Bidegree]) {
+    let mut csv = String::from(
+        "s,t,target_dim,target_masked_dim,next_dim,signatures,subalgebra_dim,num_new_gens,\
+         last_live_sig,rows_consumed,matrix_bytes,wall_us\n",
+    );
+    for r in records.iter() {
+        csv.push_str(&format!(
+            "{},{},{},{},{},{},{},{},{},{},{},{}\n",
+            r.s,
+            r.t,
+            r.target_dim,
+            r.target_masked_dim,
+            r.next_dim,
+            r.signatures,
+            r.subalgebra_dim,
+            r.num_new_gens,
+            r.last_live_sig,
+            r.rows_consumed,
+            r.matrix_bytes,
+            r.wall_us,
+        ));
+    }
+    let path = csv_path();
+    if let Err(e) = std::fs::write(&path, csv) {
+        eprintln!("[census] failed to write {path}: {e}");
     }
 }
 
@@ -157,32 +227,9 @@ pub fn report() {
         return;
     }
     let records = RECORDS.lock().unwrap();
-    let path =
-        std::env::var("NASSAU_CENSUS_CSV").unwrap_or_else(|_| "nassau_census.csv".to_string());
-    let mut csv = String::from(
-        "s,t,target_dim,target_masked_dim,next_dim,signatures,subalgebra_dim,num_new_gens,\
-         last_live_sig,rows_consumed,matrix_bytes,wall_us\n",
-    );
-    for r in records.iter() {
-        csv.push_str(&format!(
-            "{},{},{},{},{},{},{},{},{},{},{},{}\n",
-            r.s,
-            r.t,
-            r.target_dim,
-            r.target_masked_dim,
-            r.next_dim,
-            r.signatures,
-            r.subalgebra_dim,
-            r.num_new_gens,
-            r.last_live_sig,
-            r.rows_consumed,
-            r.matrix_bytes,
-            r.wall_us,
-        ));
-    }
-    if let Err(e) = std::fs::write(&path, csv) {
-        eprintln!("[census] failed to write {path}: {e}");
-    }
+    write_csv(&records);
+    // Still needed below: the aggregate block names the file it just wrote.
+    let path = csv_path();
 
     // Work-weighted aggregates. Every fraction below is weighted by that bidegree's multiply work
     // (`target_dim * next_dim`), never by bidegree count — an event-weighted fraction would repeat

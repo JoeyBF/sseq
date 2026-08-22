@@ -759,12 +759,13 @@ mod shift {
 /// not shorten it. Keep the change anyway — strictly less allocation and memory traffic for
 /// byte-identical output — but do not expect copy elimination alone to move this workload.
 ///
-/// Do NOT read the census's other two copy counters as saying the remaining copies are cheap:
-/// `ADD_MASKED_BYTES` and `AUGMENTED_ALLOC_BYTES` are declared and printed but have no
-/// incrementing call site, so their `0.0GB` means "never instrumented", not "never copied". The
-/// `add_masked` into the augmented matrix and the per-signature `AugmentedMatrix::new` are both
-/// still real copies — just unavoidable ones, since row reduction needs a mutable working matrix.
-/// Wire those counters before drawing any conclusion about them.
+/// `ADD_MASKED_BYTES` and `AUGMENTED_ALLOC_BYTES` are now wired, at the `zs_assemble` and
+/// `sig_assemble` blocks below — one increment per assembled matrix, never per row, since those
+/// loops run up to `target_dim` times. They previously printed `0.0GB` with no incrementing call
+/// site, which read as "never copied" rather than "never instrumented". The `add_masked` into the
+/// augmented matrix and the per-signature `AugmentedMatrix::new` are real copies — just
+/// unavoidable ones, since row reduction needs a mutable working matrix — and the per-signature
+/// one runs ~1000 times per frontier bidegree, so it is the term that matters.
 ///
 /// `rows` must index within `full`; the signature masks are subsets of `0..full.rows()` (the
 /// restricted source basis), so this holds.
@@ -2850,6 +2851,17 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
             for (i, mut l) in m.segment(0, 0).iter_mut().enumerate() {
                 l.add_masked(full_matrix.row(i), 1, &next_mask);
             }
+            // Counted per ASSEMBLY, not per row: the loop above runs up to `target_dim` times
+            // (700k+ at the frontier), so an increment inside it would be a contended atomic per
+            // row across 96 workers. One increment per assembled matrix carries the same total.
+            crate::census::add_bytes(
+                &crate::census::ADD_MASKED_BYTES,
+                crate::census::matrix_bytes(target_masked_dim, next_masked_dim),
+            );
+            crate::census::add_bytes(
+                &crate::census::AUGMENTED_ALLOC_BYTES,
+                crate::census::matrix_bytes(target_masked_dim, next_masked_dim + target_masked_dim),
+            );
             m.segment(1, 1).add_identity();
             m
         });
@@ -3290,6 +3302,21 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                         }
                     }
                 }
+                // Per assembly, not per row -- see the note at the zs_assemble site. This one runs
+                // once per SIGNATURE, and a bidegree at the frontier has ~1000 of them, so the
+                // total here is what sizes the per-signature copy cost the census was meant to
+                // report and has been printing as a misleading 0.0GB.
+                crate::census::add_bytes(
+                    &crate::census::ADD_MASKED_BYTES,
+                    crate::census::matrix_bytes(target_mask.len(), next_mask.len()),
+                );
+                crate::census::add_bytes(
+                    &crate::census::AUGMENTED_ALLOC_BYTES,
+                    crate::census::matrix_bytes(
+                        target_mask.len(),
+                        next_mask.len() + target_mask.len(),
+                    ),
+                );
                 m.segment(1, 1).add_identity();
                 m
             });
@@ -3791,6 +3818,18 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                 let mut deferred: Vec<(Bidegree, mpsc::Sender<SenderData>)> = Vec::new();
                 // Diagnostic (`NASSAU_MEM_REPORT`): count committed bidegrees so we can periodically
                 // report the retained-data heap split (differentials' `outputs` vs modules' tables).
+                //
+                // The value is the report INTERVAL in commits (bare `=1`, or any non-numeric value,
+                // keeps the historical 400). Commit rate falls steeply with stem -- at stem 250 a
+                // long run commits ~180 bidegrees per 6h, so a fixed 400 puts ~13 hours between
+                // heap attributions, which is far too coarse to watch memory grow. The report walks
+                // every differential and module to sum heap bytes, so it is O(bidegrees) per
+                // emission and wants to stay well above once-per-commit.
+                let mem_report_every = std::env::var("NASSAU_MEM_REPORT")
+                    .ok()
+                    .and_then(|v| v.parse::<usize>().ok())
+                    .filter(|&n| n > 1)
+                    .unwrap_or(400);
                 let mem_report = std::env::var_os("NASSAU_MEM_REPORT").is_some();
                 let mut commit_count = 0usize;
                 // How long to wait for a message before retrying parked bidegrees. Small enough that a
@@ -3915,7 +3954,7 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
 
                         if mem_report {
                             commit_count += 1;
-                            if commit_count % 400 == 0 {
+                            if commit_count % mem_report_every == 0 {
                                 let diff_b: usize = self
                                     .differentials
                                     .iter()
@@ -3939,11 +3978,21 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                                     ((0usize, 0usize), (0u64, 0u64));
                                 let gb = |x: usize| x as f64 / (1u64 << 30) as f64;
                                 let gbu = |x: u64| x as f64 / (1u64 << 30) as f64;
+                                // Cumulative copy volume, carried on the [MEM] line rather than
+                                // left to the end-of-run [census] block. Anything printed only at
+                                // clean exit is lost to an OOM SIGKILL -- the failure mode this
+                                // run is instrumented for -- which is the same reason the census
+                                // CSV now flushes periodically.
+                                let copy_masked = crate::census::ADD_MASKED_BYTES
+                                    .load(std::sync::atomic::Ordering::Relaxed);
+                                let copy_aug = crate::census::AUGMENTED_ALLOC_BYTES
+                                    .load(std::sync::atomic::Ordering::Relaxed);
                                 eprintln!(
                                     "[MEM] commits={commit_count} last_b=({},{}) HOST[diff={:.1} \
                                      mod={:.1} res_master={:.1} res_basis={:.1}]GB \
                                      DEV[master={:.1} basis={:.1} cubecl_use={:.1} \
-                                     cubecl_reserved={:.1}]GB",
+                                     cubecl_reserved={:.1}]GB COPIED[add_masked={:.1} \
+                                     augmented={:.1}]GB",
                                     b.n(),
                                     b.s(),
                                     gb(diff_b),
@@ -3954,6 +4003,8 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                                     gb(dev_basis),
                                     gbu(dev_pool_use),
                                     gbu(dev_pool_res),
+                                    gbu(copy_masked),
+                                    gbu(copy_aug),
                                 );
                             }
                         }
