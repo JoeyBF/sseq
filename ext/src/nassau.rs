@@ -16,7 +16,7 @@ use std::{
     fmt::Display,
     sync::{
         Arc, LazyLock, Mutex,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
         mpsc,
     },
 };
@@ -529,20 +529,75 @@ static N_ONDEMAND: AtomicUsize = AtomicUsize::new(0);
 static N_ZS: AtomicUsize = AtomicUsize::new(0);
 static ROWS_SHIFT_BUILD: AtomicUsize = AtomicUsize::new(0);
 static ROWS_ONDEMAND: AtomicUsize = AtomicUsize::new(0);
+/// Of the shift builds, the ones that may NOT publish (`signature_degree == 1`): they build at
+/// their own narrower bound and are dropped unshared, so each is a private per-signature matrix
+/// held live for the duration of the signature. The heap dump attributes ~164GB to two
+/// `restricted_partial_matrix_maybe_gpu` stacks and this is the candidate; these counters decide
+/// it. Bytes, not just rows, because the question is memory -- see [`crate::census::matrix_bytes`].
+static N_SHIFT_PRIVATE: AtomicUsize = AtomicUsize::new(0);
+static ROWS_SHIFT_PRIVATE: AtomicUsize = AtomicUsize::new(0);
+static BYTES_SHIFT_PRIVATE: AtomicU64 = AtomicU64::new(0);
+static BYTES_SHIFT_PUBLISHED: AtomicU64 = AtomicU64::new(0);
+static BYTES_ONDEMAND: AtomicU64 = AtomicU64::new(0);
+/// Live bytes in private shift builds right now, and the high-water mark of that -- the number
+/// that has to come down. Incremented at build, decremented when the `Arc` is dropped.
+static LIVE_PRIVATE: AtomicU64 = AtomicU64::new(0);
+static LIVE_PRIVATE_MAX: AtomicU64 = AtomicU64::new(0);
+
+/// Charges a private (unpublishable) shift build against [`LIVE_PRIVATE`] for exactly as long as
+/// the matrix is held, so the high-water mark reflects real concurrent residency rather than a
+/// running total. Bound as a sibling of `shifted`, so it drops when that matrix does.
+struct PrivateLive(u64);
+
+impl PrivateLive {
+    fn new(bytes: u64) -> Self {
+        let now = LIVE_PRIVATE.fetch_add(bytes, Ordering::Relaxed) + bytes;
+        LIVE_PRIVATE_MAX.fetch_max(now, Ordering::Relaxed);
+        Self(bytes)
+    }
+}
+
+impl Drop for PrivateLive {
+    fn drop(&mut self) {
+        LIVE_PRIVATE.fetch_sub(self.0, Ordering::Relaxed);
+    }
+}
 
 fn shift_stats_report() {
     if std::env::var("NASSAU_SHIFT_STATS").as_deref() != Ok("1") {
         return;
     }
-    eprintln!(
-        "[shift-stats] launches: zs_select={} shift_build={} (rows {}) ondemand={} (rows {}) | \
-         cache hits={}",
-        N_ZS.load(Ordering::Relaxed),
+    const GB: f64 = (1u64 << 30) as f64;
+    let (build, private) = (
         N_SHIFT_BUILD.load(Ordering::Relaxed),
+        N_SHIFT_PRIVATE.load(Ordering::Relaxed),
+    );
+    eprintln!(
+        "[shift-stats] launches: zs_select={} shift_build={build} (rows {}) ondemand={} (rows {}) \
+         | cache hits={}",
+        N_ZS.load(Ordering::Relaxed),
         ROWS_SHIFT_BUILD.load(Ordering::Relaxed),
         N_ONDEMAND.load(Ordering::Relaxed),
         ROWS_ONDEMAND.load(Ordering::Relaxed),
         N_SHIFT_HIT.load(Ordering::Relaxed),
+    );
+    // The memory question: of the shift builds, how many could not be published (`deg(sigma) ==
+    // 1`) and so were held privately per signature?
+    eprintln!(
+        "[shift-stats] private (deg-sig 1, unshared): {private}/{build} builds ({:.1}%) rows={} \
+         | bytes built: private={:.3}GB published={:.3}GB ondemand={:.3}GB \
+         | live private: now={:.3}GB peak={:.3}GB",
+        if build > 0 {
+            100.0 * private as f64 / build as f64
+        } else {
+            0.0
+        },
+        ROWS_SHIFT_PRIVATE.load(Ordering::Relaxed),
+        BYTES_SHIFT_PRIVATE.load(Ordering::Relaxed) as f64 / GB,
+        BYTES_SHIFT_PUBLISHED.load(Ordering::Relaxed) as f64 / GB,
+        BYTES_ONDEMAND.load(Ordering::Relaxed) as f64 / GB,
+        LIVE_PRIVATE.load(Ordering::Relaxed) as f64 / GB,
+        LIVE_PRIVATE_MAX.load(Ordering::Relaxed) as f64 / GB,
     );
 }
 
@@ -3086,6 +3141,9 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
             // `t - deg(sigma)` rather than from this bidegree. `sig_shift` carries its own column
             // mask, since the shifted matrix lives over the shifted degree's column space.
             let mut shifted: Option<(Arc<Matrix>, Vec<usize>)> = None;
+            // Sibling of `shifted` so its scope is exactly the private matrix's lifetime.
+            #[cfg_attr(not(feature = "gpu"), allow(unused_mut))]
+            let mut _private_live: Option<PrivateLive> = None;
             #[cfg(feature = "gpu")]
             if shift_skip_full {
                 let shifted_t = b.t() - MilnorSubalgebra::signature_degree(&signature);
@@ -3140,6 +3198,15 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                                 MilnorSubalgebra::restricted_dimension(next, shifted_t, bound);
                             N_SHIFT_BUILD.fetch_add(1, Ordering::Relaxed);
                             ROWS_SHIFT_BUILD.fetch_add(zs_rows.len(), Ordering::Relaxed);
+                            let built_bytes = crate::census::matrix_bytes(zs_rows.len(), cols);
+                            if may_publish {
+                                BYTES_SHIFT_PUBLISHED.fetch_add(built_bytes, Ordering::Relaxed);
+                            } else {
+                                N_SHIFT_PRIVATE.fetch_add(1, Ordering::Relaxed);
+                                ROWS_SHIFT_PRIVATE.fetch_add(zs_rows.len(), Ordering::Relaxed);
+                                BYTES_SHIFT_PRIVATE.fetch_add(built_bytes, Ordering::Relaxed);
+                                _private_live = Some(PrivateLive::new(built_bytes));
+                            }
                             let m = Arc::new(restricted_partial_matrix_maybe_gpu(
                                 &self.differentials[b.s() - 1],
                                 shifted_t,
@@ -3384,6 +3451,12 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                 if !needed.is_empty() {
                     // One multiply for the whole signature's demand, not one per generator.
                     let basis: Vec<usize> = needed.iter().map(|&i| target_mask[i]).collect();
+                    N_ONDEMAND.fetch_add(1, Ordering::Relaxed);
+                    ROWS_ONDEMAND.fetch_add(basis.len(), Ordering::Relaxed);
+                    BYTES_ONDEMAND.fetch_add(
+                        crate::census::matrix_bytes(basis.len(), next_dim),
+                        Ordering::Relaxed,
+                    );
                     let got =
                         tracing::trace_span!("sig_ondemand", rows = basis.len()).in_scope(|| {
                             restricted_partial_matrix_maybe_gpu(
@@ -4006,6 +4079,9 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                                     gbu(copy_masked),
                                     gbu(copy_aug),
                                 );
+                                // Emit here too, not only at stage end: an OOM kill means no
+                                // clean exit, and this is the run that most needs the numbers.
+                                shift_stats_report();
                             }
                         }
 
