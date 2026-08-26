@@ -3304,7 +3304,9 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
             // Shift reuse: take this signature's matrix from the shared zero-signature build at
             // `t - deg(sigma)` rather than from this bidegree. `sig_shift` carries its own column
             // mask, since the shifted matrix lives over the shifted degree's column space.
-            let mut shifted: Option<(Arc<Matrix>, Vec<usize>)> = None;
+            // The `bool` is whether the cached matrix is already in masked column coordinates, in
+            // which case the mask is only consulted for its LENGTH (the consumer reads a prefix).
+            let mut shifted: Option<(Arc<Matrix>, Vec<usize>, bool)> = None;
             // Sibling of `shifted` so its scope is exactly the private matrix's lifetime.
             #[cfg_attr(not(feature = "gpu"), allow(unused_mut))]
             let mut _private_live: Option<PrivateLive> = None;
@@ -3360,9 +3362,33 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                                 .collect();
                             let cols =
                                 MilnorSubalgebra::restricted_dimension(next, shifted_t, bound);
+                            // Store in MASKED column coordinates. The mask is taken at the BUILD
+                            // bound, which makes it the maximal zero-signature column set for this
+                            // cache key: `signature_mask` with a larger bound extends the set at
+                            // the end, so every consumer's own mask is a PREFIX of this one and
+                            // reads columns `0..its_len`. That is what keeps one entry shared
+                            // across the consumers that differ only in `next_bound`.
+                            //
+                            // Unlike the transient zero-signature site, this cache is resident by
+                            // construction, so the ~50x narrowing converts to peak RSS rather than
+                            // to churn.
+                            let build_mask: Option<Vec<usize>> = masked_cols_enabled().then(|| {
+                                subalgebra
+                                    .signature_mask(&algebra, next, shifted_t, &zero_sig, bound)
+                                    .collect()
+                            });
+                            let stored_cols = build_mask.as_ref().map_or(cols, Vec::len);
                             N_SHIFT_BUILD.fetch_add(1, Ordering::Relaxed);
                             ROWS_SHIFT_BUILD.fetch_add(zs_rows.len(), Ordering::Relaxed);
-                            let built_bytes = crate::census::matrix_bytes(zs_rows.len(), cols);
+                            let built_bytes =
+                                crate::census::matrix_bytes(zs_rows.len(), stored_cols);
+                            if build_mask.is_some() {
+                                crate::census::add_bytes(
+                                    &crate::census::MASKED_SAVED_BYTES,
+                                    crate::census::matrix_bytes(zs_rows.len(), cols)
+                                        .saturating_sub(built_bytes),
+                                );
+                            }
                             if may_publish {
                                 BYTES_SHIFT_PUBLISHED.fetch_add(built_bytes, Ordering::Relaxed);
                             } else {
@@ -3371,12 +3397,21 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                                 BYTES_SHIFT_PRIVATE.fetch_add(built_bytes, Ordering::Relaxed);
                                 _private_live = Some(PrivateLive::new(built_bytes));
                             }
-                            let m = Arc::new(restricted_partial_matrix_maybe_gpu(
-                                &self.differentials[b.s() - 1],
-                                shifted_t,
-                                &zs_rows,
-                                cols,
-                            ));
+                            let m = Arc::new(match &build_mask {
+                                Some(mask) => restricted_partial_matrix_masked_maybe_gpu(
+                                    &self.differentials[b.s() - 1],
+                                    shifted_t,
+                                    &zs_rows,
+                                    cols,
+                                    mask,
+                                ),
+                                None => restricted_partial_matrix_maybe_gpu(
+                                    &self.differentials[b.s() - 1],
+                                    shifted_t,
+                                    &zs_rows,
+                                    cols,
+                                ),
+                            });
                             if may_publish {
                                 shift::put(
                                     b.s() as i32,
@@ -3414,7 +3449,11 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                             a.set_to_zero();
                             c.set_to_zero();
                             a.as_slice_mut().add_masked(truth.row(i), 1, &next_mask);
-                            c.as_slice_mut().add_masked(m.row(i), 1, &zs_next);
+                            if masked_cols_enabled() {
+                                c.as_slice_mut().add(m.row(i).restrict(0, zs_next.len()), 1);
+                            } else {
+                                c.as_slice_mut().add_masked(m.row(i), 1, &zs_next);
+                            }
                             assert_eq!(
                                 a, c,
                                 "shift CONTENT row {i} at {b} sig={signature:?} \
@@ -3422,7 +3461,17 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                             );
                         }
                     }
-                    shifted = Some((m, zs_next));
+                    // A consumer whose `next_bound` is narrower than the builder's reads a prefix,
+                    // never past the end. Assert it rather than trusting the prefix argument.
+                    debug_assert!(
+                        !masked_cols_enabled() || zs_next.len() <= m.columns(),
+                        "shift mask {} exceeds cached masked width {} at {b} sig={signature:?} \
+                         shifted_t={shifted_t}",
+                        zs_next.len(),
+                        m.columns()
+                    );
+                    let pre_masked = masked_cols_enabled();
+                    shifted = Some((m, zs_next, pre_masked));
                 }
             }
 
@@ -3522,9 +3571,15 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                 match &shifted {
                     // Same matrix, reached from the shared build at the shifted degree — hence its
                     // own column mask over the shifted degree's column space.
-                    Some((zs, zs_next)) => {
+                    Some((zs, zs_next, pre_masked)) => {
                         for (i, mut l) in m.segment(0, 0).iter_mut().enumerate() {
-                            l.add_masked(zs.row(i), 1, zs_next);
+                            if *pre_masked {
+                                // Already in masked coordinates; this consumer's mask names a
+                                // prefix of the cached one, so take that many columns.
+                                l.add(zs.row(i).restrict(0, zs_next.len()), 1);
+                            } else {
+                                l.add_masked(zs.row(i), 1, zs_next);
+                            }
                         }
                     }
                     None => {
