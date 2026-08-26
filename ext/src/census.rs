@@ -42,6 +42,10 @@ pub fn enabled() -> bool {
 pub static SELECT_ROWS_BYTES: AtomicU64 = AtomicU64::new(0);
 pub static ADD_MASKED_BYTES: AtomicU64 = AtomicU64::new(0);
 pub static AUGMENTED_ALLOC_BYTES: AtomicU64 = AtomicU64::new(0);
+/// Bytes NOT allocated because a restricted partial matrix was built directly in masked column
+/// coordinates: `matrix_bytes(rows, next_dim) - matrix_bytes(rows, next_mask.len())`. This is the
+/// realised saving, not the projected one.
+pub static MASKED_SAVED_BYTES: AtomicU64 = AtomicU64::new(0);
 
 #[inline]
 pub fn add_bytes(counter: &AtomicU64, bytes: u64) {

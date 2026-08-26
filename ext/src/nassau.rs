@@ -392,6 +392,88 @@ fn restricted_partial_matrix(
     matrix
 }
 
+/// CPU restricted build with the column mask applied as it goes: `out[i][j]` is the restricted
+/// apply of `inputs[i]` read at column `col_mask[j]`.
+///
+/// The scratch is one full-width ROW per worker (via `map_init`), never a full-width matrix, so the
+/// wide object the mask exists to avoid is never allocated.
+fn restricted_partial_matrix_masked(
+    hom: &FreeModuleHomomorphism<FreeModule<MilnorAlgebra>>,
+    degree: i32,
+    inputs: &[usize],
+    target_dim: usize,
+    col_mask: &[usize],
+) -> Matrix {
+    let _s = tracing::trace_span!(
+        "cpu_restricted_masked",
+        rows = inputs.len(),
+        target_dim,
+        cols = col_mask.len()
+    )
+    .entered();
+    let p = hom.prime();
+    let mut matrix = Matrix::new(p, inputs.len(), col_mask.len());
+    if target_dim == 0 || col_mask.is_empty() {
+        return matrix;
+    }
+    for (i, mut row) in matrix.iter_mut().enumerate() {
+        let mut scratch = FpVector::new(p, target_dim);
+        hom.apply_to_basis_element_restricted(scratch.as_slice_mut(), 1, degree, inputs[i]);
+        row.add_masked(scratch.as_slice(), 1, col_mask);
+    }
+    matrix
+}
+
+/// Restricted partial-matrix build with the destination narrowed to `col_mask`.
+///
+/// Every consumer of a restricted partial matrix immediately masks its columns; the mask keeps
+/// ~2% of them at the frontier, so building the full width first is pure waste. Measured on the
+/// running instrumented job at stem 285: 37703 x 1914035 is 9.0 GB, against 183 MB masked, and the
+/// frontier's bidegrees build 143 GB to use 7.5 GB. That 143 GB matches the 142.9 GB a heap dump
+/// independently attributes to in-flight matrices.
+///
+/// `NASSAU_MASKED_COLS=0` restores the full-width build for A/B and bisection.
+fn restricted_partial_matrix_masked_maybe_gpu(
+    diff: &FreeModuleHomomorphism<FreeModule<MilnorAlgebra>>,
+    t: i32,
+    inputs: &[usize],
+    target_dim: usize,
+    col_mask: &[usize],
+) -> Matrix {
+    #[cfg(feature = "gpu")]
+    {
+        if std::env::var_os("NASSAU_GPU").is_some() && crate::nassau_gpu::applicable(diff) {
+            let min_work: u64 = std::env::var("NASSAU_GPU_MIN_WORK")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(4_000_000);
+            // Gate on the work the MULTIPLY does, which is still full width -- masking narrows the
+            // destination, not the launch.
+            let work = inputs.len() as u64 * target_dim as u64;
+            if work >= min_work {
+                return if std::env::var_os("NASSAU_GPU_VERIFY").is_some() {
+                    crate::nassau_gpu::get_partial_matrix_restricted_masked_verified(
+                        diff, t, inputs, target_dim, col_mask,
+                    )
+                } else {
+                    crate::nassau_gpu::get_partial_matrix_restricted_masked(
+                        diff, t, inputs, target_dim, col_mask,
+                    )
+                };
+            }
+        }
+    }
+    restricted_partial_matrix_masked(diff, t, inputs, target_dim, col_mask)
+}
+
+/// Whether to build restricted partial matrices directly in masked column coordinates. Default ON;
+/// `NASSAU_MASKED_COLS=0` disables.
+fn masked_cols_enabled() -> bool {
+    static ON: LazyLock<bool> =
+        LazyLock::new(|| std::env::var("NASSAU_MASKED_COLS").as_deref() != Ok("0"));
+    *ON
+}
+
 /// Restricted partial-matrix build, dispatching to the GPU Milnor-multiply path when it is compiled
 /// in, opted into (`NASSAU_GPU`), applicable, and the launch is large enough to amortise the fixed
 /// per-launch GPU cost.
@@ -584,9 +666,9 @@ fn shift_stats_report() {
     // The memory question: of the shift builds, how many could not be published (`deg(sigma) ==
     // 1`) and so were held privately per signature?
     eprintln!(
-        "[shift-stats] private (deg-sig 1, unshared): {private}/{build} builds ({:.1}%) rows={} \
-         | bytes built: private={:.3}GB published={:.3}GB ondemand={:.3}GB \
-         | live private: now={:.3}GB peak={:.3}GB",
+        "[shift-stats] private (deg-sig 1, unshared): {private}/{build} builds ({:.1}%) rows={} | \
+         bytes built: private={:.3}GB published={:.3}GB ondemand={:.3}GB | live private: \
+         now={:.3}GB peak={:.3}GB",
         if build > 0 {
             100.0 * private as f64 / build as f64
         } else {
@@ -826,6 +908,9 @@ mod shift {
 /// restricted source basis), so this holds.
 enum PartialMatrix<'a> {
     Owned(Matrix),
+    /// Already built in masked column coordinates: `row(i)` has one entry per mask index, so the
+    /// consumer must NOT mask it again. See [`restricted_partial_matrix_masked_maybe_gpu`].
+    PreMasked(Matrix),
     /// `row(i) == full.row(rows[i])`, without materialising the gather.
     Gather {
         full: &'a Matrix,
@@ -836,15 +921,31 @@ enum PartialMatrix<'a> {
 impl PartialMatrix<'_> {
     fn columns(&self) -> usize {
         match self {
-            Self::Owned(m) => m.columns(),
+            Self::Owned(m) | Self::PreMasked(m) => m.columns(),
             Self::Gather { full, .. } => full.columns(),
         }
     }
 
     fn row(&self, i: usize) -> FpSlice<'_> {
         match self {
-            Self::Owned(m) => m.row(i),
+            Self::Owned(m) | Self::PreMasked(m) => m.row(i),
             Self::Gather { full, rows } => full.row(rows[i]),
+        }
+    }
+
+    /// Whether `row(i)` is already in masked coordinates.
+    fn is_pre_masked(&self) -> bool {
+        matches!(self, Self::PreMasked(_))
+    }
+
+    /// `dst += self.row(i)`, masked by `mask` unless the matrix was already built that way.
+    /// Centralised so a caller cannot forget which coordinates it is holding.
+    fn add_row_masked(&self, dst: FpSliceMut<'_>, i: usize, mask: &[usize]) {
+        let mut dst = dst;
+        if self.is_pre_masked() {
+            dst.add(self.row(i), 1);
+        } else {
+            dst.add_masked(self.row(i), 1, mask);
         }
     }
 }
@@ -2884,12 +2985,34 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                     }
                     None => {
                         N_ZS.fetch_add(1, Ordering::Relaxed);
-                        PartialMatrix::Owned(restricted_partial_matrix_maybe_gpu(
-                            &self.differentials[b.s() - 1],
-                            b.t(),
-                            &target_mask,
-                            next_dim,
-                        ))
+                        // Build straight into masked columns when nothing downstream needs the
+                        // full width. `write_qi` does (it reads `full_matrix.row(i)` against the
+                        // full output basis), and so does the `NASSAU_PROBE_SHIFT=2` matrix probe,
+                        // so both gate this off -- the same condition `shift_skip_full` uses.
+                        if masked_cols_enabled() && f.is_none() && !shift_probe_matrices() {
+                            crate::census::add_bytes(
+                                &crate::census::MASKED_SAVED_BYTES,
+                                crate::census::matrix_bytes(target_mask.len(), next_dim)
+                                    .saturating_sub(crate::census::matrix_bytes(
+                                        target_mask.len(),
+                                        next_mask.len(),
+                                    )),
+                            );
+                            PartialMatrix::PreMasked(restricted_partial_matrix_masked_maybe_gpu(
+                                &self.differentials[b.s() - 1],
+                                b.t(),
+                                &target_mask,
+                                next_dim,
+                                &next_mask,
+                            ))
+                        } else {
+                            PartialMatrix::Owned(restricted_partial_matrix_maybe_gpu(
+                                &self.differentials[b.s() - 1],
+                                b.t(),
+                                &target_mask,
+                                next_dim,
+                            ))
+                        }
                     }
                 }
             });
@@ -2903,8 +3026,8 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                 AugmentedMatrix::new(p, target_masked_dim, [next_masked_dim, target_masked_dim]);
             // Row gather and column mask fused into one pass. `Matrix::add_masked` would need a
             // materialised `full_matrix`; going row by row lets the gather stay an indirection.
-            for (i, mut l) in m.segment(0, 0).iter_mut().enumerate() {
-                l.add_masked(full_matrix.row(i), 1, &next_mask);
+            for (i, l) in m.segment(0, 0).iter_mut().enumerate() {
+                full_matrix.add_row_masked(l, i, &next_mask);
             }
             // Counted per ASSEMBLY, not per row: the loop above runs up to `target_dim` times
             // (700k+ at the frontier), so an increment inside it would be a contended atomic per
@@ -2995,6 +3118,39 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
 
         {
             let _s = tracing::trace_span!("zs_dx_init", gens = xs.len()).entered();
+            // `dx` is FULL width and must stay that way: the signature loop below reads it at
+            // `next_mask` positions that DIFFER per signature, so the columns outside this
+            // signature's mask are live information, not slack. When `full_matrix` was built in
+            // masked coordinates it cannot serve this, so fetch exactly the rows the new
+            // generators actually touch at full width -- the same on-demand shape the shift path
+            // uses, and only `|support|` rows rather than all of `target_mask`.
+            let dx_rows: Option<(Vec<usize>, Matrix)> = if full_matrix.is_pre_masked() {
+                let mut needed: Vec<usize> = n
+                    .iter()
+                    .skip(next_row)
+                    .take(xs.len())
+                    .flat_map(|x_masked| x_masked.iter_nonzero().map(|(i, _)| i))
+                    .collect();
+                needed.sort_unstable();
+                needed.dedup();
+                if needed.is_empty() {
+                    None
+                } else {
+                    let basis: Vec<usize> = needed.iter().map(|&i| target_mask[i]).collect();
+                    let got =
+                        tracing::trace_span!("zs_dx_ondemand", rows = basis.len()).in_scope(|| {
+                            restricted_partial_matrix_maybe_gpu(
+                                &self.differentials[b.s() - 1],
+                                b.t(),
+                                &basis,
+                                next_dim,
+                            )
+                        });
+                    Some((needed, got))
+                }
+            } else {
+                None
+            };
             for ((x, x_masked), dx) in xs
                 .iter_mut()
                 .zip_eq(n.iter().skip(next_row))
@@ -3003,7 +3159,15 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                 x.as_slice_mut().add_unmasked(x_masked, 1, &target_mask);
                 let mut consumed = 0usize;
                 for (i, _) in x_masked.iter_nonzero() {
-                    dx.as_slice_mut().add(full_matrix.row(i), 1);
+                    match &dx_rows {
+                        Some((needed, got)) => {
+                            let k = needed
+                                .binary_search(&i)
+                                .expect("dx support row was collected above");
+                            dx.as_slice_mut().add(got.row(k), 1);
+                        }
+                        None => dx.as_slice_mut().add(full_matrix.row(i), 1),
+                    }
                     consumed += 1;
                 }
                 if let Some(c) = census.as_mut() {
@@ -4065,7 +4229,7 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                                      mod={:.1} res_master={:.1} res_basis={:.1}]GB \
                                      DEV[master={:.1} basis={:.1} cubecl_use={:.1} \
                                      cubecl_reserved={:.1}]GB COPIED[add_masked={:.1} \
-                                     augmented={:.1}]GB",
+                                     augmented={:.1}]GB MASKED_SAVED={:.1}GB",
                                     b.n(),
                                     b.s(),
                                     gb(diff_b),
@@ -4078,6 +4242,8 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                                     gbu(dev_pool_res),
                                     gbu(copy_masked),
                                     gbu(copy_aug),
+                                    gbu(crate::census::MASKED_SAVED_BYTES
+                                        .load(std::sync::atomic::Ordering::Relaxed)),
                                 );
                                 // Emit here too, not only at stage end: an OOM kill means no
                                 // clean exit, and this is the run that most needs the numbers.

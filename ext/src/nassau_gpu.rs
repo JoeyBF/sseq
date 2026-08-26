@@ -231,12 +231,29 @@ pub fn get_partial_matrix_restricted(
     inputs: &[usize],
     target_dim: usize,
 ) -> Matrix {
+    build_restricted(hom, degree, inputs, target_dim, None)
+}
+
+/// Shared body of the full-width and column-masked restricted builds.
+///
+/// `col_mask == None` reproduces the historical behaviour exactly. With `Some(mask)` the returned
+/// matrix has `mask.len()` columns and no full-width matrix is ever allocated -- the gather happens
+/// per row, against the readback scratch that already existed. The multiply itself is unchanged:
+/// it still runs at the full output width because a product's `out_offset + seqno` indexes the full
+/// output-degree basis.
+fn build_restricted(
+    hom: &NassauDifferential,
+    degree: i32,
+    inputs: &[usize],
+    target_dim: usize,
+    col_mask: Option<&[usize]>,
+) -> Matrix {
     // Spanned because the 279 s stalls land somewhere in this function *before* the multiply
     // (which itself measured 40 ms), and neither this build nor the pair pre-pass inside
     // `multiply_batch_on_gpu` was previously visible to the log.
     let (mut matrix, mut products) =
         tracing::info_span!("extract_restricted", inputs = inputs.len(), target_dim)
-            .in_scope(|| extract_restricted(hom, degree, inputs, target_dim));
+            .in_scope(|| extract_restricted(hom, degree, inputs, target_dim, col_mask));
     if !products.is_empty() {
         let p = hom.prime();
         let target = hom.target();
@@ -304,7 +321,16 @@ pub fn get_partial_matrix_restricted(
                     scratch
                         .update_from_bytes(&mut &buf[..])
                         .expect("readback scratch is exactly num_limbs * 8 bytes");
-                    matrix.row_mut(r0 + bi).add(scratch.as_slice(), 1);
+                    // The scratch is full width either way -- it is one ROW, not one matrix. Only
+                    // the destination narrows, which is where the ~49x allocation saving is.
+                    match col_mask {
+                        Some(mask) => {
+                            matrix
+                                .row_mut(r0 + bi)
+                                .add_masked(scratch.as_slice(), 1, mask)
+                        }
+                        None => matrix.row_mut(r0 + bi).add(scratch.as_slice(), 1),
+                    }
                 }
             }
             p0 = p1;
@@ -321,13 +347,19 @@ fn extract_restricted(
     degree: i32,
     inputs: &[usize],
     target_dim: usize,
+    col_mask: Option<&[usize]>,
 ) -> (Matrix, Vec<GpuProduct>) {
     let p = hom.prime();
     let source = hom.source();
     let target = hom.target();
     let shift = hom.degree_shift();
-    let mut matrix = Matrix::new(p, inputs.len(), target_dim);
+    let out_cols = col_mask.map_or(target_dim, <[usize]>::len);
+    let mut matrix = Matrix::new(p, inputs.len(), out_cols);
     let mut products: Vec<GpuProduct> = Vec::new();
+    // The `operation_degree == 0` rows below are written by the CPU apply, which produces a
+    // full-width row. Under a mask they need a scratch to land in first; allocated once here
+    // rather than per row, and only when masking is actually on.
+    let mut cpu_scratch = col_mask.map(|_| FpVector::new(p, target_dim));
 
     if target_dim == 0 {
         return (matrix, products);
@@ -340,7 +372,26 @@ fn extract_restricted(
         }
         if ogp.operation_degree == 0 {
             // Sq(∅) · s = s: let the CPU copy it directly into this (restricted-width) row.
-            hom.apply_to_basis_element_restricted(matrix.row_mut(row), 1, degree, input_index);
+            match (&mut cpu_scratch, col_mask) {
+                (Some(scratch), Some(mask)) => {
+                    scratch.set_to_zero();
+                    hom.apply_to_basis_element_restricted(
+                        scratch.as_slice_mut(),
+                        1,
+                        degree,
+                        input_index,
+                    );
+                    matrix.row_mut(row).add_masked(scratch.as_slice(), 1, mask);
+                }
+                _ => {
+                    hom.apply_to_basis_element_restricted(
+                        matrix.row_mut(row),
+                        1,
+                        degree,
+                        input_index,
+                    );
+                }
+            }
             continue;
         }
         let out_on_gen = hom.output(ogp.generator_degree, ogp.generator_index);
@@ -378,6 +429,79 @@ fn extract_restricted(
 /// Build the restricted matrix both ways and assert they agree; returns the CPU matrix. For the
 /// `NASSAU_GPU_VERIFY` gate. The CPU reference mirrors `Resolution::restricted_partial_matrix`
 /// (each row is the restricted apply of the corresponding input).
+/// As [`get_partial_matrix_restricted`], but the returned matrix has one column per entry of
+/// `col_mask` instead of `target_dim` columns: `out[i][j] == full[i][col_mask[j]]`.
+///
+/// # Why this exists
+///
+/// The consumer of a restricted partial matrix immediately masks its columns
+/// (`add_masked(row, 1, &next_mask)`), and the mask keeps ~2% of them. Materialising the full
+/// width first is the single largest live allocation in the run: measured at the stem-285 frontier,
+/// 37703 x 1914035 is **9.0 GB** against 183 MB for the masked form, and 143 GB across the
+/// frontier's bidegrees against 7.5 GB used -- which matches, to 0.3%, the 142.9 GB a heap dump
+/// attributes to in-flight matrices.
+///
+/// Only the *destination* narrows here. The multiply still runs at the full output width, because
+/// a product's `out_offset + seqno` indexes the full output-degree basis and `num_cols` sets the
+/// kernel's limb layout (see [`get_partial_matrix_restricted`]); pushing the mask into the kernel's
+/// output indexing is a further, larger change. What this removes is the wide *host* matrix and the
+/// separate `add_masked` pass over it.
+///
+/// The per-row readback scratch stays full width (one row, not one matrix) and the gather replaces
+/// the limb-wise copy with `add_masked`. That trades `target_dim/64` limb XORs per row for
+/// `col_mask.len()` masked reads -- at the frontier, 29907 against 38867, i.e. comparable, while
+/// the allocation drops ~49x.
+pub fn get_partial_matrix_restricted_masked(
+    hom: &NassauDifferential,
+    degree: i32,
+    inputs: &[usize],
+    target_dim: usize,
+    col_mask: &[usize],
+) -> Matrix {
+    build_restricted(hom, degree, inputs, target_dim, Some(col_mask))
+}
+
+/// `NASSAU_GPU_VERIFY` gate for the masked build.
+///
+/// Checks the property the caller actually depends on: the masked matrix equals the full matrix
+/// with `col_mask` applied. That catches a wrong gather as well as a wrong multiply, which
+/// comparing two masked builds against each other would not.
+pub fn get_partial_matrix_restricted_masked_verified(
+    hom: &NassauDifferential,
+    degree: i32,
+    inputs: &[usize],
+    target_dim: usize,
+    col_mask: &[usize],
+) -> Matrix {
+    let masked = build_restricted(hom, degree, inputs, target_dim, Some(col_mask));
+    // Reference: the CPU restricted apply at FULL width, then the mask. No GPU, no batching.
+    let p = hom.prime();
+    let mut full = Matrix::new(p, inputs.len(), target_dim);
+    if target_dim > 0 {
+        for (i, &input) in inputs.iter().enumerate() {
+            hom.apply_to_basis_element_restricted(full.row_mut(i), 1, degree, input);
+        }
+    }
+    let mut want = Matrix::new(p, inputs.len(), col_mask.len());
+    for i in 0..inputs.len() {
+        want.row_mut(i).add_masked(full.row(i), 1, col_mask);
+    }
+    for row in 0..inputs.len() {
+        let g: Vec<usize> = masked.row(row).iter_nonzero().map(|(i, _)| i).collect();
+        let c: Vec<usize> = want.row(row).iter_nonzero().map(|(i, _)| i).collect();
+        assert_eq!(
+            g,
+            c,
+            "masked restricted get_partial_matrix mismatch at degree {degree}, row {row} (input \
+             {}, target_dim {target_dim}, mask_len {}, num_rows {})",
+            inputs[row],
+            col_mask.len(),
+            inputs.len(),
+        );
+    }
+    masked
+}
+
 pub fn get_partial_matrix_restricted_verified(
     hom: &NassauDifferential,
     degree: i32,
