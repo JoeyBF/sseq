@@ -466,6 +466,25 @@ fn restricted_partial_matrix_masked_maybe_gpu(
     restricted_partial_matrix_masked(diff, t, inputs, target_dim, col_mask)
 }
 
+/// How many rows of the on-demand differential matrix to materialise at once, from a byte budget
+/// (`NASSAU_ONDEMAND_CHUNK_MB`, default 64). Returns at least one row, so a single row wider than
+/// the budget still makes progress rather than looping forever.
+///
+/// The budget is on the CHUNK, which is what bounds peak residency; total work is unaffected.
+fn ondemand_chunk_rows(next_dim: usize) -> usize {
+    static MB: LazyLock<usize> = LazyLock::new(|| {
+        std::env::var("NASSAU_ONDEMAND_CHUNK_MB")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(64)
+    });
+    if next_dim == 0 {
+        return usize::MAX;
+    }
+    // `next_dim` is a bit count; 8 bits per byte.
+    (*MB * 1_000_000 * 8 / next_dim).max(1)
+}
+
 /// Whether to build restricted partial matrices directly in masked column coordinates. Default ON;
 /// `NASSAU_MASKED_COLS=0` disables.
 fn masked_cols_enabled() -> bool {
@@ -3083,19 +3102,29 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                 .signature_mask(&algebra, &self.modules[b.s()], b.t(), &zero_sig, i32::MAX)
                 .collect()
         });
-        let img_full = restricted_partial_matrix_maybe_gpu(
-            &self.differentials[b.s()],
-            b.t(),
-            &source_mask,
-            target_dim,
-        );
+        // Built DIRECTLY in masked columns. This used to build `source_mask.len() x target_dim`
+        // and immediately gather it down to `target_masked_dim` -- and, because the full matrix
+        // was bound with `let`, it then stayed alive for the rest of the bidegree.
+        //
+        // Heap profiling (jemalloc, sampled) put this one site at **67.19GB across 18 live
+        // objects, 3.73GB each, 58% of all live Rust bytes** -- one per in-flight bidegree. It is
+        // the largest consumer in a frontier run by a wide margin, and it is the same
+        // build-full-then-mask shape already removed from the signature path; it survived only
+        // because it sits in the zero-signature preamble rather than the signature loop.
+        //
+        // Guessing had blamed the on-demand path, on the strength of a cumulative byte counter
+        // (2.78TB allocated). Chunking that path measured ZERO change in peak RSS. Cumulative
+        // counters measure churn; only a live-heap profile answers residency.
         let mut n = tracing::trace_span!("img_assemble", rows = source_mask.len()).in_scope(|| {
-            let mut n = Matrix::new(p, source_mask.len(), target_masked_dim);
-            for (mut row, full_row) in std::iter::zip(n.iter_mut(), img_full.iter()) {
-                row.add_masked(full_row, 1, &target_mask);
-            }
-            n
+            restricted_partial_matrix_masked_maybe_gpu(
+                &self.differentials[b.s()],
+                b.t(),
+                &source_mask,
+                target_dim,
+                &target_mask,
+            )
         });
+        debug_assert_eq!(n.columns(), target_masked_dim);
         tracing::trace_span!("img_row_reduce", rows = source_mask.len())
             .in_scope(|| n.row_reduce());
         let next_row = n.rows();
@@ -3668,7 +3697,24 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                     c.add_rows_consumed(supports.iter().map(Vec::len).sum());
                 }
                 if !needed.is_empty() {
-                    // One multiply for the whole signature's demand, not one per generator.
+                    // One multiply for the whole signature's demand, but built in ROW CHUNKS.
+                    //
+                    // This matrix is the single largest live allocation in a frontier run: it is
+                    // `needed.len()` rows at FULL `next_dim` width, averaging 694MB, and a live
+                    // heap has ~28 of them at once (92GB of a measured 168GB in blocks >100MB).
+                    // Yet every row is consumed exactly once, into a sum: `dx += sum of the rows
+                    // in this generator's support`. Nothing needs the rows to coexist.
+                    //
+                    // So build a chunk, fold it into the `dx`s that want its rows, drop it. Peak
+                    // becomes `chunk x next_dim` instead of `needed.len() x next_dim`, at
+                    // identical arithmetic -- addition is commutative, so regrouping the sum by
+                    // chunk cannot change a result.
+                    //
+                    // This is the shape the rival ext crate uses (`apply_full_differentials_to_
+                    // vectors` chunked by `full_differential_output_batch_len`), and it is why it
+                    // never holds a multi-GB product matrix. More, smaller launches are not a
+                    // concern: launch count anti-correlates with speed here; total WORK is what
+                    // matters, and that is unchanged.
                     let basis: Vec<usize> = needed.iter().map(|&i| target_mask[i]).collect();
                     N_ONDEMAND.fetch_add(1, Ordering::Relaxed);
                     ROWS_ONDEMAND.fetch_add(basis.len(), Ordering::Relaxed);
@@ -3676,20 +3722,37 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                         crate::census::matrix_bytes(basis.len(), next_dim),
                         Ordering::Relaxed,
                     );
-                    let got =
-                        tracing::trace_span!("sig_ondemand", rows = basis.len()).in_scope(|| {
-                            restricted_partial_matrix_maybe_gpu(
-                                &self.differentials[b.s() - 1],
-                                b.t(),
-                                &basis,
-                                next_dim,
-                            )
-                        });
-                    for (sup, dx) in supports.iter().zip(dxs.iter_mut()) {
-                        for &i in sup {
-                            let k = needed.binary_search(&i).unwrap();
-                            dx.as_slice_mut().add(got.row(k), 1);
+                    // Resolve each support entry to its row index ONCE, rather than binary
+                    // searching per chunk.
+                    let supports_k: Vec<Vec<usize>> = supports
+                        .iter()
+                        .map(|sup| {
+                            sup.iter()
+                                .map(|i| needed.binary_search(i).unwrap())
+                                .collect()
+                        })
+                        .collect();
+                    let chunk = ondemand_chunk_rows(next_dim);
+                    let mut start = 0;
+                    while start < basis.len() {
+                        let end = (start + chunk).min(basis.len());
+                        let got = tracing::trace_span!("sig_ondemand", rows = end - start)
+                            .in_scope(|| {
+                                restricted_partial_matrix_maybe_gpu(
+                                    &self.differentials[b.s() - 1],
+                                    b.t(),
+                                    &basis[start..end],
+                                    next_dim,
+                                )
+                            });
+                        for (sup_k, dx) in supports_k.iter().zip(dxs.iter_mut()) {
+                            for &k in sup_k {
+                                if k >= start && k < end {
+                                    dx.as_slice_mut().add(got.row(k - start), 1);
+                                }
+                            }
                         }
+                        start = end;
                     }
                 }
             } else {
