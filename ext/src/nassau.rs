@@ -466,6 +466,56 @@ fn restricted_partial_matrix_masked_maybe_gpu(
     restricted_partial_matrix_masked(diff, t, inputs, target_dim, col_mask)
 }
 
+/// Process RSS in bytes, from `/proc/self/status`. Returns 0 where that is unavailable.
+fn proc_rss_bytes() -> u64 {
+    std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|s| {
+            s.lines()
+                .find(|l| l.starts_with("VmRSS:"))
+                .and_then(|l| l.split_whitespace().nth(1)?.parse::<u64>().ok())
+        })
+        .map_or(0, |kb| kb * 1024)
+}
+
+/// EXACT jemalloc totals -- not sampled -- and the process RSS they sit inside.
+///
+/// This exists to size two things that a heap *profile* cannot separate:
+///
+/// * **Sampling bias.** `lg_prof_sample:23` samples one allocation per 8MB, so a long tail of
+///   small allocations is under-represented in the profile. `allocated` counts every byte, so
+///   `allocated - (summed profile stacks)` is the tail the profiler misses.
+/// * **Memory outside the Rust heap.** The CUDA driver and cubecl allocate host memory with their
+///   own mmap, never through the global allocator, so heap profiling cannot see them *by
+///   construction* -- not because of a sampling threshold. `RSS - resident` sizes that.
+///
+/// Reading these without advancing the epoch returns stale cached values, which would look like a
+/// workload that allocates nothing.
+#[cfg(feature = "heapprof")]
+fn heap_stats_report() {
+    use tikv_jemalloc_ctl::{epoch, stats};
+    let _ = epoch::advance();
+    let gb = |b: usize| b as f64 / 1e9;
+    let allocated = stats::allocated::read().unwrap_or(0);
+    let active = stats::active::read().unwrap_or(0);
+    let resident = stats::resident::read().unwrap_or(0);
+    let mapped = stats::mapped::read().unwrap_or(0);
+    let rss = proc_rss_bytes();
+    eprintln!(
+        "[HEAP] jemalloc allocated={:.1} active={:.1} resident={:.1} mapped={:.1}GB | \
+         RSS={:.1}GB | outside-jemalloc={:.1}GB",
+        gb(allocated),
+        gb(active),
+        gb(resident),
+        gb(mapped),
+        rss as f64 / 1e9,
+        (rss as f64 - resident as f64) / 1e9,
+    );
+}
+
+#[cfg(not(feature = "heapprof"))]
+fn heap_stats_report() {}
+
 /// How many rows of the on-demand differential matrix to materialise at once, from a byte budget
 /// (`NASSAU_ONDEMAND_CHUNK_MB`, default 64). Returns at least one row, so a single row wider than
 /// the budget still makes progress rather than looping forever.
@@ -4366,6 +4416,7 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                                 // Emit here too, not only at stage end: an OOM kill means no
                                 // clean exit, and this is the run that most needs the numbers.
                                 shift_stats_report();
+                                heap_stats_report();
                             }
                         }
 
