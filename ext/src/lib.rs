@@ -172,11 +172,28 @@ pub mod chain_complex;
 pub mod ext_algebra;
 pub mod resolution;
 pub mod resolution_homomorphism;
-/// Heap profiling allocator (`--features heapprof`). Only present under that
-/// feature, so ordinary builds keep the system allocator.
-#[cfg(feature = "heapprof")]
+/// jemalloc as the global allocator (`--features jemalloc`; `heapprof` implies it and adds
+/// profiling support). Ordinary builds keep the system allocator.
+///
+/// This is NOT a memory win, and was measured rather than assumed. A frontier A/B -- same code,
+/// seed, knobs and node, only the allocator differing -- gave:
+///
+/// | allocator | peak RSS at commits=52450 |
+/// |-----------|---------------------------|
+/// | glibc     | 305.0 GB                  |
+/// | jemalloc  | 295.8 GB                  |
+///
+/// 3%, which at one run per arm is noise. An earlier apparent ~80-95GB advantage for jemalloc was
+/// an artifact of comparing a glibc peak at commits=52450 against a jemalloc peak at commits=52150
+/// -- 300 commits of extra work read as an allocator effect. Peaks may only be compared at matched
+/// `commits`; this workload's RSS climbs steeply through that range (207.8 -> 295.8 GB over 300
+/// commits on the jemalloc arm alone).
+///
+/// The feature is kept because `heapprof` needs jemalloc underneath it, not because swapping the
+/// allocator buys anything.
+#[cfg(feature = "jemalloc")]
 #[global_allocator]
-static HEAPPROF_ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+static JEMALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 pub mod save;
 pub mod save_atomic;
