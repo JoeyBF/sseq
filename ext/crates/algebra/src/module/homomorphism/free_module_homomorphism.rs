@@ -204,7 +204,7 @@ where
             generator_degree,
             operation_index,
             generator_index,
-        } = *self.source.index_to_op_gen(input_degree, input_index);
+        } = self.source.index_to_op_gen(input_degree, input_index);
 
         if generator_degree >= self.min_degree() {
             let output_on_generator = self.output(generator_degree, generator_index);
