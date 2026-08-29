@@ -22,6 +22,45 @@ fn verify_opgen() -> bool {
     *ON
 }
 
+/// Unique per-instance id, so the lookup memo below can identify a module exactly. A raw pointer
+/// would not do: an address can be reused after a module is dropped, and a stale hit would then
+/// answer from the wrong module's layout.
+static NEXT_MODULE_ID: AtomicUsize = AtomicUsize::new(1);
+
+/// One-entry, per-thread memo for [`MuFreeModule::index_to_op_gen`].
+///
+/// Callers walk `inputs` in ASCENDING index order (`extract_restricted` does this per row of every
+/// restricted-matrix build), so consecutive lookups land in the same generator block nearly every
+/// time. Remembering the last block turns the common case into a range check.
+///
+/// Soundness: `generator_to_index` is append-only and existing offsets are never mutated, so a
+/// cached block `[start, end)` stays valid for the life of the module. For the LAST block, `end` is
+/// the dimension at cache time; if generators are added later the dimension grows, and indices past
+/// the cached `end` simply miss and take the slow path. A hit therefore always describes the block
+/// it claims.
+#[derive(Clone, Copy)]
+struct OpGenMemo {
+    module: usize,
+    degree: i32,
+    start: usize,
+    end: usize,
+    generator_degree: i32,
+    generator_index: usize,
+}
+
+thread_local! {
+    static OPGEN_MEMO: std::cell::Cell<OpGenMemo> = const {
+        std::cell::Cell::new(OpGenMemo {
+            module: 0,
+            degree: 0,
+            start: 0,
+            end: 0,
+            generator_degree: 0,
+            generator_index: 0,
+        })
+    };
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct OperationGeneratorPair {
     pub operation_degree: i32,
@@ -41,6 +80,8 @@ pub struct MuFreeModule<const U: bool, A: MuAlgebra<U>> {
     algebra: Arc<A>,
     name: String,
     min_degree: i32,
+    /// Identity for the lookup memo; see [`OpGenMemo`].
+    id: usize,
     gen_names: OnceBiVec<Vec<String>>,
     /// degree -> internal index of first generator in degree
     gen_deg_idx_to_internal_idx: OnceBiVec<usize>,
@@ -73,6 +114,7 @@ impl<const U: bool, A: MuAlgebra<U>> MuFreeModule<U, A> {
             algebra,
             name,
             min_degree,
+            id: NEXT_MODULE_ID.fetch_add(1, Ordering::Relaxed),
             gen_names: OnceBiVec::new(min_degree),
             gen_deg_idx_to_internal_idx,
             num_gens: OnceBiVec::new(min_degree),
@@ -399,6 +441,29 @@ impl<const U: bool, A: MuAlgebra<U>> MuFreeModule<U, A> {
             index < self.dimensions[degree].load(Ordering::Relaxed),
             "index {index} out of range in degree {degree}"
         );
+        // Fast path: the block from the previous lookup on this thread. Verified below under
+        // EXT_OPGEN_VERIFY like any other result.
+        let memo = OPGEN_MEMO.with(std::cell::Cell::get);
+        if memo.module == self.id
+            && memo.degree == degree
+            && index >= memo.start
+            && index < memo.end
+        {
+            let out = OperationGeneratorPair {
+                generator_degree: memo.generator_degree,
+                generator_index: memo.generator_index,
+                operation_degree: degree - memo.generator_degree,
+                operation_index: index - memo.start,
+            };
+            if verify_opgen() {
+                assert_eq!(
+                    out, self.verify_opgen[degree][index],
+                    "memoised opgen disagrees with the stored table at degree {degree} index {index}"
+                );
+            }
+            return out;
+        }
+
         let offsets = &self.generator_to_index[degree];
 
         // 1. Last generator ordinal whose block starts at or before `index`.
@@ -425,11 +490,31 @@ impl<const U: bool, A: MuAlgebra<U>> MuFreeModule<U, A> {
         }
         let generator_degree = dlo;
 
+        let generator_index = ordinal - self.gen_deg_idx_to_internal_idx[generator_degree];
+        let start = offsets[ordinal];
+        // The search took the LAST offset <= index, so the next offset is strictly greater and the
+        // block is non-empty. Past the final block the bound is the current dimension.
+        let end = if ordinal + 1 < offsets.len() {
+            offsets[ordinal + 1]
+        } else {
+            self.dimensions[degree].load(Ordering::Relaxed)
+        };
+        OPGEN_MEMO.with(|m| {
+            m.set(OpGenMemo {
+                module: self.id,
+                degree,
+                start,
+                end,
+                generator_degree,
+                generator_index,
+            })
+        });
+
         let out = OperationGeneratorPair {
             generator_degree,
-            generator_index: ordinal - self.gen_deg_idx_to_internal_idx[generator_degree],
+            generator_index,
             operation_degree: degree - generator_degree,
-            operation_index: index - offsets[ordinal],
+            operation_index: index - start,
         };
         if verify_opgen() {
             assert_eq!(
