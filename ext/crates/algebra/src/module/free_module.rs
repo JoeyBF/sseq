@@ -1,4 +1,7 @@
-use std::sync::Arc;
+use std::sync::{
+    Arc, LazyLock,
+    atomic::{AtomicUsize, Ordering},
+};
 
 use fp::vector::{FpSlice, FpSliceMut};
 use once::{OnceBiVec, OnceVec};
@@ -8,7 +11,55 @@ use crate::{
     module::{Module, ZeroModule},
 };
 
-#[derive(Clone, Debug)]
+/// `EXT_OPGEN_VERIFY=1`: also materialise the old per-basis-element table and assert every derived
+/// lookup against it. Off by default: turning it on restores the whole table the derivation
+/// exists to remove, so it is for validation runs at small stems only.
+fn verify_opgen() -> bool {
+    static ON: LazyLock<bool> =
+        LazyLock::new(|| std::env::var("EXT_OPGEN_VERIFY").as_deref() == Ok("1"));
+    *ON
+}
+
+/// Unique per-instance id, so the lookup memo below can identify a module exactly. A raw pointer
+/// would not do: an address can be reused after a module is dropped, and a stale hit would then
+/// answer from the wrong module's layout.
+static NEXT_MODULE_ID: AtomicUsize = AtomicUsize::new(1);
+
+/// One-entry, per-thread memo for [`MuFreeModule::index_to_op_gen`].
+///
+/// Callers walk `inputs` in ASCENDING index order (`extract_restricted` does this per row of every
+/// restricted-matrix build), so consecutive lookups land in the same generator block nearly every
+/// time. Remembering the last block turns the common case into a range check.
+///
+/// Soundness: `generator_to_index` is append-only and existing offsets are never mutated, so a
+/// cached block `[start, end)` stays valid for the life of the module. For the LAST block, `end` is
+/// the dimension at cache time; if generators are added later the dimension grows, and indices past
+/// the cached `end` simply miss and take the slow path. A hit therefore always describes the block
+/// it claims.
+#[derive(Clone, Copy)]
+struct OpGenMemo {
+    module: usize,
+    degree: i32,
+    start: usize,
+    end: usize,
+    generator_degree: i32,
+    generator_index: usize,
+}
+
+thread_local! {
+    static OPGEN_MEMO: std::cell::Cell<OpGenMemo> = const {
+        std::cell::Cell::new(OpGenMemo {
+            module: 0,
+            degree: 0,
+            start: 0,
+            end: 0,
+            generator_degree: 0,
+            generator_index: 0,
+        })
+    };
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct OperationGeneratorPair {
     pub operation_degree: i32,
     pub operation_index: usize,
@@ -27,11 +78,22 @@ pub struct MuFreeModule<const U: bool, A: MuAlgebra<U>> {
     algebra: Arc<A>,
     name: String,
     min_degree: i32,
+    /// Identity for the lookup memo; see [`OpGenMemo`].
+    id: usize,
     gen_names: OnceBiVec<Vec<String>>,
     /// degree -> internal index of first generator in degree
     gen_deg_idx_to_internal_idx: OnceBiVec<usize>,
     num_gens: OnceBiVec<usize>,
-    basis_element_to_opgen: OnceBiVec<OnceVec<OperationGeneratorPair>>,
+    /// degree -> number of basis elements. This REPLACES a materialised
+    /// `OnceBiVec<OnceVec<OperationGeneratorPair>>`, which stored one 32-byte record per basis
+    /// element per degree, and at high stems accounted for roughly three quarters of the
+    /// resolution's live heap -- for data derivable from `generator_to_index` and
+    /// `gen_deg_idx_to_internal_idx`, both indexed per GENERATOR and so smaller by a factor of
+    /// the algebra's dimension. See [`Self::index_to_op_gen`].
+    dimensions: OnceBiVec<AtomicUsize>,
+    /// Only populated under `EXT_OPGEN_VERIFY=1`, to check the derivation against the table it
+    /// replaced. Empty in normal builds.
+    verify_opgen: OnceBiVec<OnceVec<OperationGeneratorPair>>,
     /// degree -> internal_gen_idx -> the offset of the generator in degree
     generator_to_index: OnceBiVec<OnceVec<usize>>,
 }
@@ -50,10 +112,12 @@ impl<const U: bool, A: MuAlgebra<U>> MuFreeModule<U, A> {
             algebra,
             name,
             min_degree,
+            id: NEXT_MODULE_ID.fetch_add(1, Ordering::Relaxed),
             gen_names: OnceBiVec::new(min_degree),
             gen_deg_idx_to_internal_idx,
             num_gens: OnceBiVec::new(min_degree),
-            basis_element_to_opgen: OnceBiVec::new(min_degree),
+            dimensions: OnceBiVec::new(min_degree),
+            verify_opgen: OnceBiVec::new(min_degree),
             generator_to_index: OnceBiVec::new(min_degree),
         }
     }
@@ -85,9 +149,13 @@ impl<const U: bool, A: MuAlgebra<U>> Module for MuFreeModule<U, A> {
 
     fn compute_basis(&self, max_degree: i32) {
         let algebra = self.algebra();
-        self.basis_element_to_opgen.extend(max_degree, |degree| {
-            let new_row = OnceVec::new();
+        // Only the OFFSETS are stored (one per generator); the per-basis-element records are
+        // derived on demand in `index_to_op_gen`.
+        self.dimensions.extend(max_degree, |degree| {
             self.generator_to_index.push_checked(OnceVec::new(), degree);
+            if verify_opgen() {
+                self.verify_opgen.push_checked(OnceVec::new(), degree);
+            }
 
             let mut offset = 0;
             for (gen_deg, &num_gens) in &self.num_gens {
@@ -96,17 +164,19 @@ impl<const U: bool, A: MuAlgebra<U>> Module for MuFreeModule<U, A> {
                 for gen_idx in 0..num_gens {
                     self.generator_to_index[degree].push(offset);
                     offset += num_ops;
-                    for op_idx in 0..num_ops {
-                        new_row.push(OperationGeneratorPair {
-                            generator_degree: gen_deg,
-                            generator_index: gen_idx,
-                            operation_degree: op_deg,
-                            operation_index: op_idx,
-                        });
+                    if verify_opgen() {
+                        for op_idx in 0..num_ops {
+                            self.verify_opgen[degree].push(OperationGeneratorPair {
+                                generator_degree: gen_deg,
+                                generator_index: gen_idx,
+                                operation_degree: op_deg,
+                                operation_index: op_idx,
+                            });
+                        }
                     }
                 }
             }
-            new_row
+            AtomicUsize::new(offset)
         });
     }
 
@@ -115,10 +185,10 @@ impl<const U: bool, A: MuAlgebra<U>> Module for MuFreeModule<U, A> {
             return 0;
         }
         assert!(
-            degree < self.basis_element_to_opgen.len(),
+            degree < self.dimensions.len(),
             "Free Module {self} not computed through degree {degree}"
         );
-        self.basis_element_to_opgen[degree].len()
+        self.dimensions[degree].load(Ordering::Relaxed)
     }
 
     fn basis_element_to_string(&self, degree: i32, idx: usize) -> String {
@@ -151,7 +221,7 @@ impl<const U: bool, A: MuAlgebra<U>> Module for MuFreeModule<U, A> {
             operation_index: module_operation_index,
             generator_degree,
             generator_index,
-        } = *self.index_to_op_gen(mod_degree, mod_index);
+        } = self.index_to_op_gen(mod_degree, mod_index);
 
         // Now all of the output elements are going to be of the form s * x. Find where such things go in the output vector.
         let num_ops = self
@@ -246,7 +316,7 @@ impl<const U: bool, A: MuAlgebra<U>> MuFreeModule<U, A> {
     pub fn add_generators(&self, degree: i32, num_gens: usize, names: Option<Vec<String>>) {
         // We need to acquire the lock because changing num_gens modifies the behaviour of
         // extend_table_entries, and the two cannot happen concurrently.
-        let _lock = self.basis_element_to_opgen.lock();
+        let _lock = self.dimensions.lock();
         assert!(degree >= self.min_degree);
 
         // println!("add_gens == degree : {}, num_gens : {}", degree, num_gens);
@@ -268,22 +338,27 @@ impl<const U: bool, A: MuAlgebra<U>> MuFreeModule<U, A> {
 
         let algebra = self.algebra();
         let gen_deg = degree;
-        for total_degree in degree..self.basis_element_to_opgen.len() {
+        for total_degree in degree..self.dimensions.len() {
             let op_deg = total_degree - gen_deg;
-            let mut offset = self.basis_element_to_opgen[total_degree].len();
+            let mut offset = self.dimensions[total_degree].load(Ordering::Relaxed);
             let num_ops = algebra.dimension_unstable(op_deg, gen_deg);
             for gen_idx in 0..num_gens {
                 self.generator_to_index[total_degree].push(offset);
                 offset += num_ops;
-                for op_idx in 0..num_ops {
-                    self.basis_element_to_opgen[total_degree].push(OperationGeneratorPair {
-                        generator_degree: gen_deg,
-                        generator_index: gen_idx,
-                        operation_degree: op_deg,
-                        operation_index: op_idx,
-                    });
+                if verify_opgen() {
+                    for op_idx in 0..num_ops {
+                        self.verify_opgen[total_degree].push(OperationGeneratorPair {
+                            generator_degree: gen_deg,
+                            generator_index: gen_idx,
+                            operation_degree: op_deg,
+                            operation_index: op_idx,
+                        });
+                    }
                 }
             }
+            // Held under `_lock`, so the read-modify-write above cannot race another
+            // `add_generators`.
+            self.dimensions[total_degree].store(offset, Ordering::Relaxed);
         }
     }
 
@@ -338,9 +413,117 @@ impl<const U: bool, A: MuAlgebra<U>> MuFreeModule<U, A> {
         self.generator_to_index[op_deg + gen_deg][internal_gen_idx] + op_idx
     }
 
-    pub fn index_to_op_gen(&self, degree: i32, index: usize) -> &OperationGeneratorPair {
+    /// The `(operation, generator)` pair for basis element `index` of `degree`, DERIVED rather
+    /// than stored.
+    ///
+    /// The basis of degree `t` is laid out as consecutive blocks, one per generator, in order of
+    /// `(gen_deg, gen_idx)`; `generator_to_index[t]` holds each block's start offset. So the whole
+    /// per-basis-element table is recoverable by two binary searches:
+    ///
+    /// 1. over `generator_to_index[t]` -> which generator's block contains `index`;
+    /// 2. over `gen_deg_idx_to_internal_idx` -> which degree that generator ordinal sits in.
+    ///
+    /// `operation_index` is then the offset into the block, and `operation_degree` is
+    /// `degree - generator_degree`.
+    ///
+    /// Storing it instead cost one 32-byte record per basis element per degree, which at high
+    /// stems was about three quarters of the resolution's live heap. Deriving it cut peak
+    /// memory roughly in half at equal computational work, with throughput unchanged. The two
+    /// arrays consulted here are indexed per GENERATOR, of which there are fewer by a factor of
+    /// the algebra's dimension.
+    ///
+    /// Blocks may be EMPTY -- a generator with `num_ops == 0` shares its offset with the next --
+    /// so the search must take the LAST block whose offset is `<= index`. Taking the first would
+    /// return a zero-width block.
+    pub fn index_to_op_gen(&self, degree: i32, index: usize) -> OperationGeneratorPair {
         assert!(degree >= self.min_degree);
-        &self.basis_element_to_opgen[degree][index]
+        debug_assert!(
+            index < self.dimensions[degree].load(Ordering::Relaxed),
+            "index {index} out of range in degree {degree}"
+        );
+        // Fast path: the block from the previous lookup on this thread. Verified below under
+        // EXT_OPGEN_VERIFY like any other result.
+        let memo = OPGEN_MEMO.with(std::cell::Cell::get);
+        if memo.module == self.id
+            && memo.degree == degree
+            && index >= memo.start
+            && index < memo.end
+        {
+            let out = OperationGeneratorPair {
+                generator_degree: memo.generator_degree,
+                generator_index: memo.generator_index,
+                operation_degree: degree - memo.generator_degree,
+                operation_index: index - memo.start,
+            };
+            if verify_opgen() {
+                assert_eq!(
+                    out, self.verify_opgen[degree][index],
+                    "memoised opgen disagrees with the stored table at degree {degree} index \
+                     {index}"
+                );
+            }
+            return out;
+        }
+
+        let offsets = &self.generator_to_index[degree];
+
+        // 1. Last generator ordinal whose block starts at or before `index`.
+        let (mut lo, mut hi) = (0usize, offsets.len());
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            if offsets[mid] <= index {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        let ordinal = lo - 1;
+
+        // 2. The generator degree that ordinal belongs to.
+        let (mut dlo, mut dhi) = (self.min_degree, self.gen_deg_idx_to_internal_idx.len() - 1);
+        while dlo < dhi {
+            let mid = dlo + (dhi - dlo + 1) / 2;
+            if self.gen_deg_idx_to_internal_idx[mid] <= ordinal {
+                dlo = mid;
+            } else {
+                dhi = mid - 1;
+            }
+        }
+        let generator_degree = dlo;
+
+        let generator_index = ordinal - self.gen_deg_idx_to_internal_idx[generator_degree];
+        let start = offsets[ordinal];
+        // The search took the LAST offset <= index, so the next offset is strictly greater and the
+        // block is non-empty. Past the final block the bound is the current dimension.
+        let end = if ordinal + 1 < offsets.len() {
+            offsets[ordinal + 1]
+        } else {
+            self.dimensions[degree].load(Ordering::Relaxed)
+        };
+        OPGEN_MEMO.with(|m| {
+            m.set(OpGenMemo {
+                module: self.id,
+                degree,
+                start,
+                end,
+                generator_degree,
+                generator_index,
+            })
+        });
+
+        let out = OperationGeneratorPair {
+            generator_degree,
+            generator_index,
+            operation_degree: degree - generator_degree,
+            operation_index: index - start,
+        };
+        if verify_opgen() {
+            assert_eq!(
+                out, self.verify_opgen[degree][index],
+                "derived opgen disagrees with the stored table at degree {degree} index {index}"
+            );
+        }
+        out
     }
 
     pub fn extend_by_zero(&self, degree: i32) {
