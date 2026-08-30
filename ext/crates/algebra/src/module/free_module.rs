@@ -34,10 +34,9 @@ static NEXT_MODULE_ID: AtomicUsize = AtomicUsize::new(1);
 /// time. Remembering the last block turns the common case into a range check.
 ///
 /// Soundness: `generator_to_index` is append-only and existing offsets are never mutated, so a
-/// cached block `[start, end)` stays valid for the life of the module. For the LAST block, `end` is
-/// the dimension at cache time; if generators are added later the dimension grows, and indices past
-/// the cached `end` simply miss and take the slow path. A hit therefore always describes the block
-/// it claims.
+/// cached `[start, end)` taken from two consecutive offsets stays valid for the life of the module.
+/// The final block of a degree has no following offset to bound it and is deliberately not cached,
+/// since concurrent `add_generators` calls extend that degree.
 #[derive(Clone, Copy)]
 struct OpGenMemo {
     module: usize,
@@ -190,7 +189,7 @@ impl<const U: bool, A: MuAlgebra<U>> Module for MuFreeModule<U, A> {
             degree < self.dimensions.len(),
             "Free Module {self} not computed through degree {degree}"
         );
-        self.dimensions[degree].load(Ordering::Relaxed)
+        self.dimensions[degree].load(Ordering::Acquire)
     }
 
     fn basis_element_to_string(&self, degree: i32, idx: usize) -> String {
@@ -363,7 +362,7 @@ impl<const U: bool, A: MuAlgebra<U>> MuFreeModule<U, A> {
         let gen_deg = degree;
         for total_degree in degree..self.dimensions.len() {
             let op_deg = total_degree - gen_deg;
-            let mut offset = self.dimensions[total_degree].load(Ordering::Relaxed);
+            let mut offset = self.dimensions[total_degree].load(Ordering::Acquire);
             let num_ops = algebra.dimension_unstable(op_deg, gen_deg);
             for gen_idx in 0..num_gens {
                 self.generator_to_index[total_degree].push(offset);
@@ -381,7 +380,7 @@ impl<const U: bool, A: MuAlgebra<U>> MuFreeModule<U, A> {
             }
             // Held under `_lock`, so the read-modify-write above cannot race another
             // `add_generators`.
-            self.dimensions[total_degree].store(offset, Ordering::Relaxed);
+            self.dimensions[total_degree].store(offset, Ordering::Release);
         }
     }
 
@@ -459,7 +458,7 @@ impl<const U: bool, A: MuAlgebra<U>> MuFreeModule<U, A> {
     pub fn index_to_op_gen(&self, degree: i32, index: usize) -> OperationGeneratorPair {
         assert!(degree >= self.min_degree);
         debug_assert!(
-            index < self.dimensions[degree].load(Ordering::Relaxed),
+            index < self.dimensions[degree].load(Ordering::Acquire),
             "index {index} out of range in degree {degree}"
         );
         // Fast path: the block from the previous lookup on this thread. Verified below under
@@ -513,23 +512,22 @@ impl<const U: bool, A: MuAlgebra<U>> MuFreeModule<U, A> {
 
         let generator_index = ordinal - self.gen_deg_idx_to_internal_idx[generator_degree];
         let start = offsets[ordinal];
-        // The search took the LAST offset <= index, so the next offset is strictly greater and the
-        // block is non-empty. Past the final block the bound is the current dimension.
-        let end = if ordinal + 1 < offsets.len() {
-            offsets[ordinal + 1]
-        } else {
-            self.dimensions[degree].load(Ordering::Relaxed)
-        };
-        OPGEN_MEMO.with(|m| {
-            m.set(OpGenMemo {
-                module: self.id,
-                degree,
-                start,
-                end,
-                generator_degree,
-                generator_index,
-            })
-        });
+        // Only the FINAL block lacks a following offset to bound it, and its extent is whatever the
+        // dimension currently says -- which another thread may grow. Caching that would let a later
+        // index belonging to a newly pushed block hit this entry and be attributed to the wrong
+        // generator, so the final block is simply not memoised.
+        if let Some(end) = (ordinal + 1 < offsets.len()).then(|| offsets[ordinal + 1]) {
+            OPGEN_MEMO.with(|m| {
+                m.set(OpGenMemo {
+                    module: self.id,
+                    degree,
+                    start,
+                    end,
+                    generator_degree,
+                    generator_index,
+                })
+            });
+        }
 
         let out = OperationGeneratorPair {
             generator_degree,
