@@ -4206,7 +4206,15 @@ fn multiply_batch_grouped(
             move |algebra: Arc<MilnorAlgebra>, d: usize, ps: Vec<GpuProduct>| -> Bytes {
                 multiply_batch_block(&algebra, num_cols, r0, block_rows, &ps, mode, d)()()
             };
-        let partials: Vec<Bytes> = if basis_passthrough() || shards.len() == 1 {
+        let partials: Vec<Bytes> = if shards.is_empty() {
+            // Every device's product list was empty, so the block's rows are all zero. This is the
+            // same case `multiply_batch_block` handles for `total_pairs == 0`; reaching it here
+            // used to `pop()` an empty vec and panic, killing the worker thread.
+            vec![Bytes::from_elems(vec![
+                0u32;
+                block_rows * num_cols.div_ceil(32).max(1)
+            ])]
+        } else if basis_passthrough() || shards.len() == 1 {
             shards
                 .into_iter()
                 .map(|(d, ps)| run_shard(algebra.clone(), d, ps))
