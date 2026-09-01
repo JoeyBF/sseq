@@ -165,15 +165,75 @@ fn multiply_devices() -> usize {
 /// so the next job's H2D upload could overlap the current job's kernels without touching
 /// co-residency. That requires splitting each job into upload / compute / download stages on
 /// separate streams and pipelining them here; the correctness property above does not depend on it.
+/// # Widening the pool: `FP_CUDA_DRIVER_THREADS`
+///
+/// The single-owner argument above rests on whole-device persistent grids that cannot be
+/// co-resident. That hazard belongs to the launch paths that are opt-in and off by default:
+/// [`fp_cuda::rr_coop`] is false, so reduction kernels synchronise at kernel boundaries rather than
+/// launching cooperatively, and the GEMM's cluster path is likewise off. A probe of 192 concurrent
+/// `row_reduce_dev` calls across K = 1/2/4/8 on an idle H200 produced zero launch failures and zero
+/// wrong ranks.
+///
+/// Whether concurrency WINS is regime-dependent and unsettled. On an idle device K=4 measured 1.50x
+/// over K=1, because a reduction is a chain of ~33k tiny dependent launches and the device drains
+/// between them, so concurrent reductions fill each other's gaps. In a full resolution the Milnor
+/// multiply shares the device and may already fill those gaps: an end-to-end A/B at `max_n=300`
+/// found progress flat and reduce throughput ~10% worse at K=4. Re-measure in the target regime
+/// before changing the default.
+///
+/// Defaults to 1, exactly the historical single-owner behaviour, so this is inert unless asked for.
+/// All threads share the one [`GpuContext`], which is `Send + Sync` and hands each thread its own
+/// stream. Sharding across DEVICES is a separate change needing one context per device.
 mod driver {
-    use std::sync::{Mutex, OnceLock, mpsc};
+    use std::sync::{Arc, Mutex, OnceLock, mpsc};
 
     type Job = Box<dyn FnOnce() + Send + 'static>;
+
+    /// How many jobs may be in flight on the reduction device at once; 1 is the historical
+    /// single-owner behaviour.
+    fn threads() -> usize {
+        static N: OnceLock<usize> = OnceLock::new();
+        *N.get_or_init(|| {
+            std::env::var("FP_CUDA_DRIVER_THREADS")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .filter(|&n| n > 0)
+                .unwrap_or(1)
+                .clamp(1, 32)
+        })
+    }
 
     fn sender() -> &'static Mutex<mpsc::Sender<Job>> {
         static TX: OnceLock<Mutex<mpsc::Sender<Job>>> = OnceLock::new();
         TX.get_or_init(|| {
             let (tx, rx) = mpsc::channel::<Job>();
+            let n = threads();
+            if n > 1 {
+                // One shared receiver, so a long job never blocks a short one behind it the way
+                // per-worker queues would. The mutex is held only across `recv`, never across
+                // `job()` -- holding it while running would serialize the pool back down to one.
+                let rx = Arc::new(Mutex::new(rx));
+                for i in 0..n {
+                    let rx = Arc::clone(&rx);
+                    std::thread::Builder::new()
+                        .name(format!("fp-cuda-driver-{i}"))
+                        .spawn(move || {
+                            loop {
+                                let job = {
+                                    let guard = rx.lock().unwrap_or_else(|e| e.into_inner());
+                                    guard.recv()
+                                };
+                                match job {
+                                    Ok(job) => job(),
+                                    Err(_) => break, // all senders dropped; shutting down
+                                }
+                            }
+                        })
+                        .expect("failed to spawn an fp-cuda driver thread");
+                }
+                eprintln!("[fp-cuda] driver pool: {n} threads (concurrent reductions enabled)");
+                return Mutex::new(tx);
+            }
             std::thread::Builder::new()
                 .name("fp-cuda-driver".into())
                 .spawn(move || {
