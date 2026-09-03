@@ -20,7 +20,7 @@
 
 use algebra::{
     MilnorAlgebra,
-    milnor_gpu::{GpuProduct, multiply_batch_on_gpu},
+    milnor_gpu::{COL_MAP_DROP, GpuProduct, multiply_batch_on_gpu, multiply_batch_on_gpu_masked},
     module::{
         FreeModule, Module,
         homomorphism::{FreeModuleHomomorphism, ModuleHomomorphism},
@@ -266,13 +266,40 @@ fn build_restricted(
         // Passing `target_dim` there would truncate `num_limbs` and corrupt the row layout. We
         // truncate afterwards by masking bits `>= target_dim` when XORing into the matrix.
         let full_cols = target.dimension(degree);
+        // COLUMN RESTRICTION. Under a mask the kernel writes masked positions directly, so `out` is
+        // `mask.len()` wide instead of `full_cols` -- ~24k against ~1.15M at a stem-290 A(2)
+        // bidegree. That shrinks the device buffer and the readback by the same ratio, and because
+        // `gpu_rows_per_batch` sizes its cap off this width, it also stops a build being chopped
+        // into batches it never needed (~7.5k rows per batch at the full width, vs the whole build
+        // in one at the masked width).
+        //
+        // The map is indexed by FULL column because that is what `out_offset + seqno` produces
+        // inside the kernel; entries outside the mask hold `COL_MAP_DROP`.
+        //
+        // The unmasked path is deliberately left exactly as it was, launching at `full_cols` and
+        // truncating on readback: the kernel's row layout is keyed to the width it is given, and
+        // narrowing that is a separate change from restricting the columns.
+        let col_map: Option<std::sync::Arc<[u32]>> = col_mask.map(|mask| {
+            let mut m = vec![COL_MAP_DROP; full_cols];
+            for (j, &c) in mask.iter().enumerate() {
+                if c < full_cols {
+                    m[c] = j as u32;
+                }
+            }
+            m.into()
+        });
+        // Width the kernel writes at, and therefore the width of every readback row.
+        let kernel_cols = col_mask.map_or(full_cols, <[usize]>::len);
+        // Width the host-side scratch row carries. Masked: the row is already the matrix's width.
+        // Unmasked: the restricted prefix, as before.
+        let row_cols = col_mask.map_or(target_dim, <[usize]>::len);
         // Cap how large a single multiply we hand the GPU: the dense readback (num_rows × num_limbs
         // u32) plus the matrix would otherwise both be held for the whole all-rows / zero-signature
         // build (~12 GB dense regions at stem 180). Process the rows in batches of ≤ `rows_per_batch`
         // so the readback stays bounded and is freed between batches. `products` is built in row
         // order (`extract_restricted`), so each batch's products are a contiguous slice; we remap
         // their `row` to batch-local (0-based) for the kernel and write back to the global rows.
-        let rows_per_batch = gpu_rows_per_batch(full_cols, inputs.len());
+        let rows_per_batch = gpu_rows_per_batch(kernel_cols, inputs.len());
         // Readback scratch, allocated once for the whole call (`target_dim` is fixed): the GPU's
         // per-row output is XORed into the matrix through a limb-wise `add` rather than bit by bit.
         //
@@ -285,14 +312,14 @@ fn build_restricted(
         // The bit-at-a-time loop this replaces called `add_basis_element` once per set bit: at the
         // logged ~26% density that is ~0.26 * cols read-modify-writes per row against cols/64 limb
         // XORs here, and each one was a bounds-checked entry write rather than a word XOR.
-        let num_limbs = FpVector::num_limbs(p, target_dim);
+        let num_limbs = FpVector::num_limbs(p, row_cols);
         let nbytes = num_limbs * size_of::<u64>();
-        let mut scratch = FpVector::new(p, target_dim);
+        let mut scratch = FpVector::new(p, row_cols);
         let mut buf: Vec<u8> = vec![0; nbytes];
         // Bits at or past `target_dim` inside the final limb must not survive into the vector —
         // `FpVector` requires them zero, and dropping them is exactly what the old `col < target_dim`
         // guard did. Whole limbs past the end are dropped by `buf` being only `nbytes` long.
-        let tail_mask: u64 = match target_dim % 64 {
+        let tail_mask: u64 = match row_cols % 64 {
             0 => u64::MAX,
             r => (1u64 << r) - 1,
         };
@@ -308,7 +335,13 @@ fn build_restricted(
                 for pr in &mut products[p0..p1] {
                     pr.row -= r0; // batch-local row index for the kernel's output layout
                 }
-                let out = multiply_batch_on_gpu(&algebra, full_cols, r1 - r0, &products[p0..p1]);
+                let out = multiply_batch_on_gpu_masked(
+                    &algebra,
+                    kernel_cols,
+                    col_map.clone(),
+                    r1 - r0,
+                    &products[p0..p1],
+                );
                 let _scatter = tracing::info_span!("gpu_readback", rows = r1 - r0).entered();
                 for (bi, limbs) in out.iter_rows().enumerate() {
                     // Reinterpret this row's `u32` limbs as the vector's little-endian limb bytes,
@@ -323,14 +356,9 @@ fn build_restricted(
                         .expect("readback scratch is exactly num_limbs * 8 bytes");
                     // The scratch is full width either way -- it is one ROW, not one matrix. Only
                     // the destination narrows, which is where the ~49x allocation saving is.
-                    match col_mask {
-                        Some(mask) => {
-                            matrix
-                                .row_mut(r0 + bi)
-                                .add_masked(scratch.as_slice(), 1, mask)
-                        }
-                        None => matrix.row_mut(r0 + bi).add(scratch.as_slice(), 1),
-                    }
+                    // The gather that `add_masked` used to do now happens on the device, so the
+                    // row arrives already in masked coordinates and goes straight in.
+                    matrix.row_mut(r0 + bi).add(scratch.as_slice(), 1);
                 }
             }
             p0 = p1;

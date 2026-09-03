@@ -3099,6 +3099,11 @@ fn pair_col(j: usize, low: usize, b: u32, cs: u32, mk: u32) -> u32 {
     val
 }
 
+/// Marks a full output column that the signature mask discards, in the `col_map` handed to
+/// [`pair_emit`]. `u32::MAX` is safe as a sentinel because a real masked position is bounded by the
+/// mask length, which is orders of magnitude smaller than the full width it indexes into.
+pub const COL_MAP_DROP: u32 = u32::MAX;
+
 /// Tail of [`multiply_pair`] for an accepted product: index the assembled p-part and XOR its
 /// F₂ bit into `out`. Split out alongside [`pair_col`] so both callers share it.
 #[cube]
@@ -3107,6 +3112,8 @@ fn pair_emit(
     g: &[u32],
     xi: &[u32],
     out: &mut [Atomic<u32>],
+    col_map: &[u32],
+    use_col_map: u32,
     working: u64,
     row_base: usize,
     out_offset: usize,
@@ -3124,7 +3131,6 @@ fn pair_emit(
     // the host (comptime arithmetic does not lower inside a `#[cube]` fn).
     let idx = seqno_core_packed(g, xi, pp_shift, pp_mask, working, sq_len, width);
     let global_bit = out_offset + usize::cast_from(idx);
-    let limb = global_bit / 32;
     // Device-side mirror of the host's defensive mask: `nassau_gpu::get_partial_matrix_restricted`
     // launches at the full output width but masks bits `>= target_dim` on readback because a kept
     // block's `out_offset + seqno` can span past it. Skip writes past this row's `num_limbs` — they
@@ -3134,11 +3140,33 @@ fn pair_emit(
     // (out_offset + seqno can span past it), and `word < out.len()` guards the row itself — a
     // `row_base` that overruns the buffer (compute-sanitizer caught this as a second OOB atomic at
     // higher degree, distinct from the intra-row overflow) would otherwise write past the end.
-    if limb < num_limbs {
-        let word = row_base + limb;
-        if word < out.len() {
-            let bit = u32::cast_from(global_bit % 32);
-            out[word].fetch_xor(1u32 << bit);
+    // Column restriction (`use_col_map != 0`): `col_map` sends a FULL output column to its position
+    // in the masked output, or to `COL_MAP_DROP` for the ~98% of columns the signature mask
+    // discards. Applying it here rather than on readback is what lets `out` be allocated at the
+    // masked width instead of the full one -- see `pair_emit`'s caller and `gpu_rows_per_batch`.
+    // The branch is uniform across the launch, so it costs a predicted compare per term.
+    let mut bit_pos = global_bit;
+    let mut keep = true;
+    if use_col_map != 0u32 {
+        keep = false;
+        // `global_bit` can exceed the full width: a kept block's `out_offset + seqno` may span past
+        // it, which is exactly what the unmasked path drops via `limb < num_limbs`.
+        if global_bit < col_map.len() {
+            let m = col_map[global_bit];
+            if m != COL_MAP_DROP {
+                bit_pos = usize::cast_from(m);
+                keep = true;
+            }
+        }
+    }
+    if keep {
+        let limb = bit_pos / 32;
+        if limb < num_limbs {
+            let word = row_base + limb;
+            if word < out.len() {
+                let bit = u32::cast_from(bit_pos % 32);
+                out[word].fetch_xor(1u32 << bit);
+            }
         }
     }
 }
@@ -3152,6 +3180,8 @@ fn multiply_pair(
     g: &[u32],
     xi: &[u32],
     out: &mut [Atomic<u32>],
+    col_map: &[u32],
+    use_col_map: u32,
     cs_base: usize,
     mk_base: usize,
     b_base: usize,
@@ -3206,7 +3236,8 @@ fn multiply_pair(
 
     if rejected == 0u32 {
         pair_emit(
-            g, xi, out, working, row_base, out_offset, width, num_limbs, sq_len, pp_shift, pp_mask,
+            g, xi, out, col_map, use_col_map, working, row_base, out_offset, width, num_limbs,
+            sq_len, pp_shift, pp_mask,
         );
     }
 }
@@ -3330,6 +3361,10 @@ fn multiply_batch_kernel(
     g: &[u32],
     xi: &[u32],
     out: &mut [Atomic<u32>],
+    // Full output column -> masked position, or `COL_MAP_DROP`. Only read when `use_col_map != 0`;
+    // a one-element dummy is bound otherwise, since the argument is not optional.
+    col_map: &[u32],
+    use_col_map: u32,
     r_cs_offset: &[u64],
     r_mk_offset: &[u64],
     r_cs_len: &[u32],
@@ -3607,6 +3642,8 @@ fn multiply_batch_kernel(
                             g,
                             xi,
                             out,
+                            col_map,
+                            use_col_map,
                             working[i],
                             usize::cast_from(prod_row_base[p]),
                             usize::cast_from(prod_out_offset[p]),
@@ -3806,6 +3843,26 @@ pub fn multiply_batch_on_gpu(
     num_rows: usize,
     products: &[GpuProduct],
 ) -> BatchOutput {
+    multiply_batch_on_gpu_masked(algebra, num_cols, None, num_rows, products)
+}
+
+/// [`multiply_batch_on_gpu`] with the output columns restricted to a signature mask.
+///
+/// `col_map`, when given, is indexed by FULL output column and yields either that column's position
+/// in the masked output or [`COL_MAP_DROP`]; `out_cols` is the number of columns that survive. The
+/// kernel then writes masked positions directly, so the output buffer is `out_cols` wide instead of
+/// the full width. At a stem-290 A(2) bidegree the full width is ~1.15M columns against ~24k that
+/// survive, so this is a ~48x reduction -- in device memory, in the device->host readback, and, via
+/// `gpu_rows_per_batch`, in how finely a build has to be split into batches.
+///
+/// `None` reproduces the full-width build exactly.
+pub fn multiply_batch_on_gpu_masked(
+    algebra: &Arc<MilnorAlgebra>,
+    out_cols: usize,
+    col_map: Option<Arc<[u32]>>,
+    num_rows: usize,
+    products: &[GpuProduct],
+) -> BatchOutput {
     census_batch(products);
     // Start the prefetcher on first use (no-op unless enabled) and tell it how far the wavefront has
     // got. `r_degree` is the `R` degree this launch needs, so its max IS the enumeration frontier.
@@ -3820,7 +3877,14 @@ pub fn multiply_batch_on_gpu(
     // the run dies at the fault. [`GPU_DISABLED`] is still latched first so in-process observers
     // (the soak test) can tell a context death from an ordinary assertion failure.
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        multiply_batch_gpu_inner(algebra, num_cols, num_rows, products, resident_degree_cap())
+        multiply_batch_gpu_inner(
+            algebra,
+            out_cols,
+            col_map,
+            num_rows,
+            products,
+            resident_degree_cap(),
+        )
     })) {
         Ok(out) => out,
         Err(payload) => {
@@ -3886,7 +3950,8 @@ pub fn cpu_multiply_batch(
 
 fn multiply_batch_gpu_inner(
     algebra: &Arc<MilnorAlgebra>,
-    num_cols: usize,
+    out_cols: usize,
+    col_map: Option<Arc<[u32]>>,
     num_rows: usize,
     products: &[GpuProduct],
     // Passed in rather than read from [`resident_degree_cap`]: that is a process-wide `LazyLock` over
@@ -3896,10 +3961,17 @@ fn multiply_batch_gpu_inner(
 ) -> BatchOutput {
     // Fast path (default, `cap == i32::MAX`, and any run whose `R`s are all under the cap): a single
     // resident-master pass, byte-identical to the pre-eviction code. No cloning, no second launch.
-    let num_limbs_all = num_cols.div_ceil(32).max(1);
+    let num_limbs_all = out_cols.div_ceil(32).max(1);
     if cap == i32::MAX || products.iter().all(|p| p.r_degree <= cap) {
         return BatchOutput::from_blocks(
-            multiply_batch_grouped(algebra, num_cols, num_rows, products, MasterMode::Resident),
+            multiply_batch_grouped(
+                algebra,
+                out_cols,
+                col_map.clone(),
+                num_rows,
+                products,
+                MasterMode::Resident,
+            ),
             num_limbs_all,
         );
     }
@@ -3910,7 +3982,7 @@ fn multiply_batch_gpu_inner(
     // set is a small tail and a full-height cold readback would be almost all zeros). Results
     // scatter back to the original row indices; a row in neither group stays zero (its content, if
     // any, comes from the caller's CPU identity path).
-    let num_limbs = num_cols.div_ceil(32).max(1);
+    let num_limbs = out_cols.div_ceil(32).max(1);
     let mut result = vec![0u32; num_rows * num_limbs];
     // Above-cap `R`s that are long enough to be pinned resident anyway (see [`pin_min_mats`]).
     // Resolved once per call rather than per product: `cold_count` memoizes, but the lookup still
@@ -3961,7 +4033,8 @@ fn multiply_batch_gpu_inner(
                 q
             })
             .collect();
-        let sub_blocks = multiply_batch_grouped(algebra, num_cols, rows.len(), &compact, mode);
+        let sub_blocks =
+            multiply_batch_grouped(algebra, out_cols, col_map.clone(), rows.len(), &compact, mode);
         // Scatter straight out of the device blocks. The first cut flattened them into one
         // `Vec<u32>` first, which allocated and copied the ENTIRE group output — hundreds of MB at
         // the stems that actually need eviction — only to read it once and drop it. Blocks are
@@ -3988,12 +4061,13 @@ fn multiply_batch_gpu_inner(
 
 fn multiply_batch_grouped(
     algebra: &Arc<MilnorAlgebra>,
-    num_cols: usize,
+    out_cols: usize,
+    col_map: Option<Arc<[u32]>>,
     num_rows: usize,
     products: &[GpuProduct],
     mode: MasterMode,
 ) -> Vec<Bytes> {
-    let num_limbs = num_cols.div_ceil(32).max(1);
+    let num_limbs = out_cols.div_ceil(32).max(1);
     let max_block_rows = (gpu_block_bytes() / (num_limbs * 4)).max(1);
     // Products arrive row-major (the extract loops emit them per input row, in order; the hot/cold
     // filter above preserves that order), so each block is a contiguous product slice. Rows are
@@ -4202,22 +4276,25 @@ fn multiply_batch_grouped(
             .filter(|(_, ps)| !ps.is_empty())
             .collect();
         let block_rows = r1 - r0;
-        let run_shard =
-            move |algebra: Arc<MilnorAlgebra>, d: usize, ps: Vec<GpuProduct>| -> Bytes {
-                multiply_batch_block(&algebra, num_cols, r0, block_rows, &ps, mode, d)()()
-            };
+        let run_shard = move |algebra: Arc<MilnorAlgebra>,
+                              d: usize,
+                              ps: Vec<GpuProduct>,
+                              cm: Option<Arc<[u32]>>|
+              -> Bytes {
+            multiply_batch_block(&algebra, out_cols, cm, r0, block_rows, &ps, mode, d)()()
+        };
         let partials: Vec<Bytes> = if shards.is_empty() {
             // Every device's product list was empty, so the block's rows are all zero. This is the
             // same case `multiply_batch_block` handles for `total_pairs == 0`; reaching it here
             // used to `pop()` an empty vec and panic, killing the worker thread.
             vec![Bytes::from_elems(vec![
                 0u32;
-                block_rows * num_cols.div_ceil(32).max(1)
+                block_rows * out_cols.div_ceil(32).max(1)
             ])]
         } else if basis_passthrough() || shards.len() == 1 {
             shards
                 .into_iter()
-                .map(|(d, ps)| run_shard(algebra.clone(), d, ps))
+                .map(|(d, ps)| run_shard(algebra.clone(), d, ps, col_map.clone()))
                 .collect()
         } else {
             // Dispatch all but one, run that one here, then collect. Every helper is joined through
@@ -4229,16 +4306,17 @@ fn multiply_batch_grouped(
                 .map(|(i, (d, ps))| {
                     let (tx, rx) = std::sync::mpsc::sync_channel::<Bytes>(1);
                     let alg = algebra.clone();
+                    let cm = col_map.clone();
                     shard_pool::dispatch(
                         i,
                         Box::new(move || {
-                            let _ = tx.send(run_shard(alg, d, ps));
+                            let _ = tx.send(run_shard(alg, d, ps, cm));
                         }),
                     );
                     rx
                 })
                 .collect();
-            let here = run_shard(algebra.clone(), mine.0, mine.1);
+            let here = run_shard(algebra.clone(), mine.0, mine.1, col_map.clone());
             let mut out: Vec<Bytes> = rxs
                 .into_iter()
                 .map(|rx| rx.recv().expect("a shard helper panicked"))
@@ -4283,7 +4361,8 @@ type BlockSubmit<'a> = Box<dyn FnOnce() -> BlockWait + Send + 'a>;
 /// stays under `NASSAU_GPU_MEM_BUDGET_MB` across all worker threads.
 fn multiply_batch_block<'a>(
     algebra: &'a MilnorAlgebra,
-    num_cols: usize,
+    out_cols: usize,
+    col_map: Option<Arc<[u32]>>,
     row_base: usize,
     num_rows: usize,
     products: &'a [GpuProduct],
@@ -4297,7 +4376,7 @@ fn multiply_batch_block<'a>(
         .collect();
     xi.resize(WORKING_CAP, 0);
 
-    let num_limbs = num_cols.div_ceil(32).max(1);
+    let num_limbs = out_cols.div_ceil(32).max(1);
 
     let t_marshal = std::time::Instant::now();
 
@@ -4799,7 +4878,7 @@ fn multiply_batch_block<'a>(
         if std::env::var_os("NASSAU_GPU_DEBUG").is_some() {
             let kb = |n: usize, sz: usize| n * sz / 1024;
             eprintln!(
-                "[gpu-batch] rows={num_rows} cols={num_cols} products={} \
+                "[gpu-batch] rows={num_rows} cols={out_cols} products={} \
                  total_pairs={total_pairs} out_len={out_len} | UPLOAD-KB: g={} xi={} term_gei={} \
                  prod_arrays={} pps={} | resident cs={} mk={} basis_elems={need_basis_elems}",
                 products.len(),
@@ -5129,6 +5208,15 @@ fn multiply_batch_block<'a>(
                 // stays small and is returned to the pool by `memory_cleanup` below. Same stream as the
                 // multiply, so the zero is ordered before it.
                 let out_h = client.empty(out_len * size_of::<u32>());
+                // Column restriction. The map is `full_cols` u32s -- a few MB, uploaded once per
+                // block -- against an output buffer that it shrinks by the mask ratio (~48x at a
+                // stem-290 A(2) bidegree), so it pays for itself many times over per launch.
+                // Unrestricted builds bind a one-element dummy: the argument is not optional, and
+                // the kernel never reads it with the flag at 0.
+                let (colmap_h, colmap_len, use_col_map) = match col_map.as_deref() {
+                    Some(m) => (client.create_from_slice(u32::as_bytes(m)), m.len(), 1u32),
+                    None => (client.create_from_slice(u32::as_bytes(&[0u32])), 1usize, 0u32),
+                };
                 unsafe {
                     zero_u32::launch::<CudaRuntime>(
                         &client,
@@ -5318,6 +5406,8 @@ fn multiply_batch_block<'a>(
                         BufferArg::from_raw_parts(g_h, g.len()),
                         BufferArg::from_raw_parts(xi_h, xi.len()),
                         BufferArg::from_raw_parts(out_h.clone(), out_len),
+                        BufferArg::from_raw_parts(colmap_h, colmap_len),
+                        use_col_map,
                         BufferArg::from_raw_parts(rco_h, r_cs_offset.len()),
                         BufferArg::from_raw_parts(rmo_h, r_mk_offset.len()),
                         BufferArg::from_raw_parts(rcl_h, r_cs_len.len()),
@@ -6419,6 +6509,10 @@ mod tests {
             g,
             xi,
             out,
+            // This reference kernel writes at the full width, so column restriction is off. The
+            // buffer is still a required argument; `g` stands in and is never read with the flag 0.
+            g,
+            0u32,
             m * cs_len,
             m * mk_len,
             t * width,
