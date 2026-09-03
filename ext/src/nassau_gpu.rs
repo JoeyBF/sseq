@@ -241,6 +241,14 @@ pub fn get_partial_matrix_restricted(
 /// per row, against the readback scratch that already existed. The multiply itself is unchanged:
 /// it still runs at the full output width because a product's `out_offset + seqno` indexes the full
 /// output-degree basis.
+/// Whether the GPU multiply writes restricted columns directly (`NASSAU_GPU_COL_RESTRICT`,
+/// default on). `0` restores the full-width launch with the gather on readback.
+fn col_restrict_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var("NASSAU_GPU_COL_RESTRICT").as_deref() != Ok("0"));
+    *ON
+}
+
 fn build_restricted(
     hom: &NassauDifferential,
     degree: i32,
@@ -286,7 +294,11 @@ fn build_restricted(
         // The unmasked path is deliberately left exactly as it was, launching at `full_cols` and
         // truncating on readback: the kernel's row layout is keyed to the width it is given, and
         // narrowing that is a separate change from restricting the columns.
-        let col_map: Option<std::sync::Arc<[u32]>> = col_mask.map(|mask| {
+        // `NASSAU_GPU_COL_RESTRICT=0` falls back to the full-width launch plus host-side gather.
+        // Both arms of an A/B then run the same binary, and production keeps a switch it can flip
+        // without a rebuild if the restricted path ever misbehaves at a width we did not verify.
+        let restrict = col_mask.filter(|_| col_restrict_enabled());
+        let col_map: Option<std::sync::Arc<[u32]>> = restrict.map(|mask| {
             let mut m = vec![COL_MAP_DROP; full_cols];
             for (j, &c) in mask.iter().enumerate() {
                 if c < full_cols {
@@ -296,10 +308,10 @@ fn build_restricted(
             m.into()
         });
         // Width the kernel writes at, and therefore the width of every readback row.
-        let kernel_cols = col_mask.map_or(full_cols, <[usize]>::len);
+        let kernel_cols = restrict.map_or(full_cols, <[usize]>::len);
         // Width the host-side scratch row carries. Masked: the row is already the matrix's width.
         // Unmasked: the restricted prefix, as before.
-        let row_cols = col_mask.map_or(target_dim, <[usize]>::len);
+        let row_cols = restrict.map_or(target_dim, <[usize]>::len);
         // Cap how large a single multiply we hand the GPU: the dense readback (num_rows × num_limbs
         // u32) plus the matrix would otherwise both be held for the whole all-rows / zero-signature
         // build (~12 GB dense regions at stem 180). Process the rows in batches of ≤ `rows_per_batch`
@@ -363,9 +375,16 @@ fn build_restricted(
                         .expect("readback scratch is exactly num_limbs * 8 bytes");
                     // The scratch is full width either way -- it is one ROW, not one matrix. Only
                     // the destination narrows, which is where the ~49x allocation saving is.
-                    // The gather that `add_masked` used to do now happens on the device, so the
-                    // row arrives already in masked coordinates and goes straight in.
-                    matrix.row_mut(r0 + bi).add(scratch.as_slice(), 1);
+                    // Under restriction the gather happened on the device, so the row is already
+                    // in masked coordinates. Without it, gather here as before.
+                    match (restrict, col_mask) {
+                        (Some(_), _) | (None, None) => {
+                            matrix.row_mut(r0 + bi).add(scratch.as_slice(), 1)
+                        }
+                        (None, Some(mask)) => {
+                            matrix.row_mut(r0 + bi).add_masked(scratch.as_slice(), 1, mask)
+                        }
+                    }
                 }
             }
             p0 = p1;
