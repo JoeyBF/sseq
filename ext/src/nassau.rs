@@ -416,11 +416,18 @@ fn restricted_partial_matrix_masked(
     if target_dim == 0 || col_mask.is_empty() {
         return matrix;
     }
-    for (i, mut row) in matrix.iter_mut().enumerate() {
-        let mut scratch = FpVector::new(p, target_dim);
-        hom.apply_to_basis_element_restricted(scratch.as_slice_mut(), 1, degree, inputs[i]);
-        row.add_masked(scratch.as_slice(), 1, col_mask);
-    }
+    // Rows are independent and land in distinct matrix rows, so this parallelises exactly as the
+    // unmasked `restricted_partial_matrix` above already does. It was left serial while it only
+    // served builds below `NASSAU_GPU_MIN_WORK`; if the multiply moves to the CPU it becomes the
+    // hot path, on a machine where the DAG leaves ~118 cores idle.
+    matrix
+        .maybe_par_iter_mut()
+        .enumerate()
+        .for_each(|(i, mut row)| {
+            let mut scratch = FpVector::new(p, target_dim);
+            hom.apply_to_basis_element_restricted(scratch.as_slice_mut(), 1, degree, inputs[i]);
+            row.add_masked(scratch.as_slice(), 1, col_mask);
+        });
     matrix
 }
 
