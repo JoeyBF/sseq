@@ -85,7 +85,14 @@ pub fn applicable(hom: &NassauDifferential) -> bool {
 /// [`FreeModuleHomomorphism::apply_to_basis_element`] performs.
 pub fn get_partial_matrix(hom: &NassauDifferential, degree: i32, inputs: &[usize]) -> Matrix {
     let (mut matrix, products) = extract(hom, degree, inputs);
-    if !products.is_empty() {
+    // An empty signature mask means a zero-column matrix: `extract_restricted` has already returned
+    // one of the right shape, and there is nothing to multiply into it. Guarding here also keeps
+    // `nbytes` below non-zero -- it is `num_limbs(row_cols) * 8`, and the readback's
+    // `nbytes - size_of::<u64>()` underflows when the mask is empty. Reachable in practice: the
+    // verification run panicked here within seconds. The unmasked path cannot hit it, because
+    // `extract_restricted` already returns early on `target_dim == 0`.
+    let row_cols_nonzero = col_mask.map_or(target_dim > 0, |m| !m.is_empty());
+    if !products.is_empty() && row_cols_nonzero {
         let p = hom.prime();
         let target = hom.target();
         let algebra = target.algebra();
