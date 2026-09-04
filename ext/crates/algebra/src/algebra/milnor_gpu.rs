@@ -303,7 +303,22 @@ mod gpu_thread {
                                 value: (dev * nstream + w) as u64,
                             }
                             .executes(|| {
-                                while let Ok(task) = rx.recv() {
+                                loop {
+                                    // `try_recv` first: Empty means this device's queue is drained,
+                                    // which is both an exact idle signal and the safest moment to
+                                    // hand memory back (see `reclaim_on_idle`). Then block as
+                                    // before, so an idle worker still parks instead of spinning.
+                                    let task = match rx.try_recv() {
+                                        Ok(task) => task,
+                                        Err(crossbeam_channel::TryRecvError::Empty) => {
+                                            super::reclaim_on_idle(dev);
+                                            match rx.recv() {
+                                                Ok(task) => task,
+                                                Err(_) => break,
+                                            }
+                                        }
+                                        Err(crossbeam_channel::TryRecvError::Disconnected) => break,
+                                    };
                                     task();
                                 }
                             });
@@ -510,6 +525,71 @@ pub fn gpu_disabled() -> bool {
 
 /// Global launch counter for throttling per-launch [`memory_cleanup`] (see [`cleanup_every`]).
 static CLEANUP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Last idle reclaim per device, as whole seconds since [`RECLAIM_EPOCH`]; `0` = never.
+static LAST_RECLAIM: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+static RECLAIM_EPOCH: LazyLock<std::time::Instant> = LazyLock::new(std::time::Instant::now);
+
+/// Return device memory when a worker finds its job queue EMPTY
+/// (`NASSAU_GPU_IDLE_CLEANUP_SECS` = minimum seconds between reclaims, default 5; `0` disables).
+///
+/// A drained queue is a precise idle signal and the worker is already sitting on it -- no polling
+/// thread, and no inferring idleness from a launch counter.
+///
+/// WHY THIS IS NEEDED AT ALL. cubecl's automatic reclaim is unreachable on CUDA: `cleanup(false)`
+/// occurs exactly once in cubecl-cuda, at `server.rs:650` inside `flush_errors`, guarded by
+/// `if !errors.is_empty()`. Metal drives it from `regulate()` and wgpu from its flush path -- on
+/// every submission -- but on CUDA nothing reclaims unless an error has already happened. So the
+/// `dealloc_period` / `alloc_nr` machinery that the `ExclusivePages` preset configures can never
+/// fire here, and explicit `memory_cleanup()` is the only path that does anything. With
+/// `NASSAU_GPU_CLEANUP_EVERY=0` we had disabled that too, so the pool could only grow:
+/// `cubecl_reserved=133.2GB` against `cubecl_use=20.0GB`, then a failed 9.38GB allocation that
+/// corrupted differentials.
+///
+/// A DRAINED QUEUE IS ALSO THE SAFEST MOMENT. The historical high-stem `LAUNCH_FAILED` was a
+/// cleanup reclaiming a page still in flight on another stream (tracel-ai/cubecl#1401); here the
+/// worker holds no job at all. Buffers still referenced by a deferred readback stay pinned by their
+/// `Handle` clones, so they are simply not eligible and a later drain collects them.
+///
+/// Rate-limited: several stream workers share one queue and would otherwise all reclaim on the same
+/// drain, and per-launch cleanup measured ~6% throughput.
+fn reclaim_on_idle(dev: usize) {
+    static SECS: LazyLock<u64> = LazyLock::new(|| {
+        std::env::var("NASSAU_GPU_IDLE_CLEANUP_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(5)
+    });
+    if *SECS == 0 || dev >= LAST_RECLAIM.len() {
+        return;
+    }
+    let now = RECLAIM_EPOCH.elapsed().as_secs();
+    let last = LAST_RECLAIM[dev].load(Ordering::Relaxed);
+    if now < last.saturating_add(*SECS) {
+        return;
+    }
+    // One worker per interval: whoever wins the swap reclaims, the rest return immediately.
+    if LAST_RECLAIM[dev]
+        .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+        .is_err()
+    {
+        return;
+    }
+    let client = gpu_client_for(dev);
+    let before = client.memory_usage().map(|u| u.bytes_reserved).unwrap_or(0);
+    client.memory_cleanup();
+    let after = client.memory_usage().map(|u| u.bytes_reserved).unwrap_or(0);
+    if before > after {
+        const GB: f64 = (1u64 << 30) as f64;
+        tracing::info!(
+            target: "nassau::gpu",
+            device = dev,
+            reclaimed_gb = (before - after) as f64 / GB,
+            reserved_gb = after as f64 / GB,
+            "idle reclaim on drained queue"
+        );
+    }
+}
 
 /// How often to call `client.memory_cleanup()` after a multiply launch, via
 /// `NASSAU_GPU_CLEANUP_EVERY` (default `0` = NEVER). `N` cleans every Nth launch.
