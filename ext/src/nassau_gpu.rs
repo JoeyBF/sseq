@@ -354,13 +354,34 @@ fn build_restricted(
                 for pr in &mut products[p0..p1] {
                     pr.row -= r0; // batch-local row index for the kernel's output layout
                 }
-                let out = multiply_batch_on_gpu_masked(
-                    &algebra,
-                    kernel_cols,
-                    col_map.clone(),
-                    r1 - r0,
-                    &products[p0..p1],
-                );
+                // THE MULTIPLY IS THE RUN. Span-gap analysis of the dedicated-device arm put
+                // 74.1% of signature-step wall time in the two gaps around this call -- 28.1%
+                // between `extract_restricted` and the first `gpu_readback`, and 46.0% between one
+                // readback and the next batch's multiply. They are not two different costs: both
+                // are this function, which had no span, so the largest component of the run was
+                // invisible in the span tree and showed up only as absence.
+                //
+                // Note the marshal loop is NOT in here -- it is already covered by `gpu_readback`
+                // below, which is why that span's own time is small (~250 ms mean) while the gap
+                // after it is large.
+                //
+                // `products` is the pair count for this batch: the kernel's work is per product,
+                // not per row, so a rows-only label would not explain a slow batch.
+                let out = tracing::info_span!(
+                    "milnor_multiply",
+                    rows = r1 - r0,
+                    cols = kernel_cols,
+                    products = p1 - p0
+                )
+                .in_scope(|| {
+                    multiply_batch_on_gpu_masked(
+                        &algebra,
+                        kernel_cols,
+                        col_map.clone(),
+                        r1 - r0,
+                        &products[p0..p1],
+                    )
+                });
                 let _scatter = tracing::info_span!("gpu_readback", rows = r1 - r0).entered();
                 for (bi, limbs) in out.iter_rows().enumerate() {
                     // Reinterpret this row's `u32` limbs as the vector's little-endian limb bytes,
