@@ -43,7 +43,7 @@ fn threshold() -> usize {
         .unwrap_or(DEFAULT_THRESHOLD)
 }
 
-fn rr_threshold() -> usize {
+pub(crate) fn rr_threshold() -> usize {
     std::env::var("FP_CUDA_RR_THRESHOLD")
         .ok()
         .and_then(|v| v.parse().ok())

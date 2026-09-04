@@ -713,6 +713,27 @@ impl Matrix {
                 }
                 None => {
                     if rr_big {
+                        // `try_row_reduce` declines for two very different reasons and used to
+                        // log both as `path="cpu"`. Below the threshold the CPU path is the
+                        // intended one on a small matrix and costs nothing. ABOVE it, the decline
+                        // means the device upload FAILED -- in practice out of memory on a card
+                        // whose free space has been eaten by the resident master -- and the
+                        // fallback is a single-threaded M4RI reduction of a matrix big enough to
+                        // stall the run for hours. Production spent days that way at 300% CPU with
+                        // both GPUs idle, and nothing in the log distinguished it from the benign
+                        // case. Warn loudly on the second one.
+                        if rr_rows.min(rr_cols) >= crate::blas::cuda::rr_threshold() {
+                            tracing::warn!(
+                                target: "fp::rr",
+                                rows = rr_rows,
+                                cols = rr_cols,
+                                gib = (rr_rows as f64 * rr_cols as f64 / 8.0)
+                                    / (1u64 << 30) as f64,
+                                "row reduce ABOVE the GPU threshold fell back to \
+                                 single-threaded CPU M4RI: the device upload failed, most likely \
+                                 out of memory. Orders of magnitude slower than the GPU path."
+                            );
+                        }
                         tracing::info!(
                             target: "fp::rr",
                             rows = rr_rows,
