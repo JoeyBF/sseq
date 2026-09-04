@@ -983,9 +983,51 @@ fn gpu_client_for(dev: usize) -> &'static cubecl::prelude::ComputeClient<CudaRun
         std::sync::OnceLock::new();
     &CLIENTS.get_or_init(|| {
         (0..gpu_count())
-            .map(|d| CudaRuntime::client(&CudaDevice::new(d)))
+            .map(|d| {
+                let client = CudaRuntime::client(&CudaDevice::new(d));
+                configure_pools(d, &client);
+                client
+            })
             .collect()
     })[dev]
+}
+
+/// One device page per allocation instead of sub-sliced pages
+/// (`NASSAU_GPU_EXCLUSIVE_PAGES`, default ON; `0` restores cubecl's default).
+///
+/// cubecl defaults to `SubSlices`: a ladder of size-bucketed pools that sub-allocate out of large
+/// pages. Those pages are never handed back -- and cannot be, because
+/// `NASSAU_GPU_CLEANUP_EVERY=0` is mandatory (per-launch `memory_cleanup` races cross-stream and
+/// was the old LAUNCH_FAILED cause, besides making `read_async` block for ~3.4x). The result killed
+/// two production restarts on 2026-09-04: `[MEM]` showed `cubecl_use=20.0 cubecl_reserved=133.2`GB
+/// -- 20GB in use, 133GB reserved -- and then
+///
+///     cubecl-cuda server.rs:124  can't allocate buffer of size: 9381875712
+///     cubecl-cuda server.rs:729  couldn't find resource for that handle:
+///                                Memory location was never initialized
+///     nassau.rs:3807             dx non-zero at (297, 146)
+///
+/// i.e. the failed allocation left dangling handles and an uninitialised buffer became a WRONG
+/// differential. `ExclusivePages` gives each allocation its own page in exponentially spaced
+/// buckets, so a large request is not hostage to how a shared page happens to be carved up.
+///
+/// NOTE the obvious alternative does NOT work: cubecl's `exclusive-memory-only` feature, which sets
+/// the `exclusive_memory_only` cfg, is forwarded by the facade crate as
+/// `exclusive-memory-only = ["cubecl-wgpu?/exclusive-memory-only"]` -- wgpu ONLY. Enabling it on a
+/// CUDA build compiles and does nothing. The cfg is set by cubecl-runtime's own build.rs, so it
+/// would need a direct cubecl-runtime dependency; this call is the targeted equivalent, and it is
+/// reversible at runtime.
+fn configure_pools(dev: usize, client: &cubecl::prelude::ComputeClient<CudaRuntime>) {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var("NASSAU_GPU_EXCLUSIVE_PAGES").as_deref() != Ok("0")
+    });
+    if !*ON {
+        return;
+    }
+    use cubecl::config::memory::{MemoryPoolsConfig, MemoryPoolsPreset};
+    let applied =
+        client.configure_memory_pools(&MemoryPoolsConfig::Preset(MemoryPoolsPreset::ExclusivePages));
+    eprintln!("[nassau-gpu] device {dev}: ExclusivePages memory pools applied={applied}");
 }
 
 /// Issue the readback on the SUBMITTING thread rather than the GPU worker
