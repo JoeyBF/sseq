@@ -106,7 +106,31 @@ pub trait ModuleHomomorphism: Send + Sync {
         self.get_matrix(matrix.segment(0, 0), degree);
         matrix.segment(1, 1).add_identity();
 
-        matrix.row_reduce();
+        // A ZERO TARGET NEEDS NO REDUCTION. Past the target module's top cell -- which for a finite
+        // module is almost the whole resolution, and for the sphere is every degree above 0 --
+        // `target_dimension` is 0, so the augmented matrix is `[ | I]`: no target columns at all and
+        // the source identity beside them. That is ALREADY in reduced row echelon form, with pivot
+        // i in column i, so `row_reduce` can only rediscover the identity.
+        //
+        // It is not cheap to rediscover. `step0` calls this for every `t` through
+        // `compute_auxiliary_data_through_degree`, and the resulting matrix is square in the SOURCE
+        // dimension: the stem-400 logs show `gpu_row_reduce{rows=269175 cols=269175}` and up,
+        // 8.4-9.3 GiB apiece, under `step0{t=382}` spans of 57-145 seconds each -- one per degree.
+        // Skipping the reduction also skips the whole GPU round trip beneath it (upload, reduce,
+        // download and the host marshalling around them).
+        //
+        // `step1` already relies on exactly this fact for the same map, taking
+        // `Subspace::entire_space` when `cc_module.dimension(t) == 0` rather than computing a
+        // kernel; this makes `step0` stop paying for what `step1` knows for free.
+        if target_dimension == 0 {
+            matrix.initialize_pivots();
+            let piv = matrix.pivots_mut();
+            for (i, e) in piv.iter_mut().enumerate().take(source_dimension) {
+                *e = i as isize;
+            }
+        } else {
+            matrix.row_reduce();
+        }
 
         (
             matrix.compute_image(),
