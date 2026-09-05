@@ -3918,15 +3918,33 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
             matrix.compute_kernel()
         };
 
-        let mut matrix = AugmentedMatrix::<2>::new_with_capacity(
+        // NO AUGMENTED IDENTITY. This used to be an `AugmentedMatrix::<2>` with a
+        // `source_dim x source_dim` identity in segment 1, and that segment is never read: after
+        // `row_reduce`, `extend_image` works from `pivots()` and `desired_image` and writes its new
+        // rows into `[0, target_dim)`, `add_generators_from_matrix_rows` reads those same rows, and
+        // `write_differential` reads the stored outputs. Unlike the general step, nothing here sets
+        // a kernel, image or quasi-inverse. The identity was materialised, row-reduced, and dropped.
+        //
+        // It dominated the matrix. At t=325 the shape was 722416 x 848944, of which the identity is
+        // 722416 x 722416 = 60.7GiB of 71.4GiB -- 85% of it, square in the SOURCE dimension while
+        // the rank is bounded by target_dim = 126528, a sixth of that. That one reduction exceeded
+        // what a GPU could accept, fell back to single-threaded CPU M4RI (`fp::rr` logged the
+        // upload failure), and coincided with the largest host-RSS excursion of the run.
+        //
+        // Dropping the augmentation also drops the reduction from 71.4GiB to 10.6GiB, which fits on
+        // a device comfortably.
+        // NB `columns_capacity` means different things in the two constructors, which is a trap:
+        // for `AugmentedMatrix` it is EXTRA capacity beyond the listed segments, so the old code
+        // passed 0; for `Matrix` it sets the row STRIDE outright, and 0 gives every row zero limbs
+        // (`row_reduce` then panics in `first_nonzero` on an empty limb slice).
+        let mut matrix = Matrix::new_with_capacity(
             p,
             source_dim,
-            &[target_dim, source_dim],
+            target_dim,
             source_dim + MAX_NEW_GENS,
-            0,
+            target_dim,
         );
-        self.differentials[1].get_matrix(matrix.segment(0, 0), t);
-        matrix.segment(1, 1).add_identity();
+        self.differentials[1].get_matrix(matrix.as_slice_mut(), t);
         matrix.row_reduce();
 
         let num_new_gens = matrix.extend_image(0, target_dim, &desired_image, 0).len();
@@ -3936,7 +3954,7 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
         self.differentials[1].add_generators_from_matrix_rows(
             t,
             matrix
-                .segment(0, 0)
+                .as_slice_mut()
                 .row_slice(source_dim, source_dim + num_new_gens),
         );
 
