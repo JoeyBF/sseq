@@ -2086,6 +2086,129 @@ static NOREUSE_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::Atomic
 /// [`resolution::Resolution`](crate::resolution::Resolution). From an API point of view, the main
 /// difference between the two is that this is a chain complex over [`MilnorAlgebra`] over
 /// [`SteenrodAlgebra`](algebra::SteenrodAlgebra).
+/// Why a bidegree failed, in enough detail for the scheduler to decide what to do about it.
+///
+/// Three quite different things used to arrive as one indistinguishable `panic!`: mathematics that
+/// came out wrong because a GPU product was corrupted, a device allocation that failed because the
+/// card was momentarily full, and a CUDA context that will never work again. The scheduler could
+/// only retry blindly or die. This enum is what lets it have a policy instead.
+#[derive(Debug)]
+pub enum StepFailure {
+    /// `d(dx) != 0`: the computed lift is not a cycle, so some product came back wrong.
+    ///
+    /// Not necessarily a bug. A failed device allocation leaves dangling handles, the next kernel
+    /// reads an uninitialised buffer, and that garbage becomes a differential -- and this assert is
+    /// the only thing that catches it. Observed to be TRANSIENT: (395, 2) failed in job 40155630
+    /// and recomputed cleanly from the same seed with the same binary.
+    NotACycle {
+        b: Bidegree,
+        /// How many of the new generators had a non-zero `dx`. All of them failing looks more like
+        /// a logic error than like corruption, which usually hits one.
+        nonzero: usize,
+        gens: usize,
+    },
+    /// A device allocation failed. The card is full NOW; it need not be in a moment, once in-flight
+    /// work retires and the idle reclaim runs.
+    DeviceExhausted { b: Bidegree, detail: String },
+    /// The CUDA context is poisoned. Nothing will work again in this process.
+    ContextLost { b: Bidegree, detail: String },
+    /// Anything else -- an I/O error on the save, a genuine bug. Not retryable: repeating a
+    /// deterministic failure just burns the frontier.
+    Other { b: Bidegree, detail: String },
+}
+
+impl StepFailure {
+    pub fn bidegree(&self) -> Bidegree {
+        match self {
+            Self::NotACycle { b, .. }
+            | Self::DeviceExhausted { b, .. }
+            | Self::ContextLost { b, .. }
+            | Self::Other { b, .. } => *b,
+        }
+    }
+
+    /// Is running this bidegree again worth doing?
+    ///
+    /// `NotACycle` and `DeviceExhausted` are transient by nature. `ContextLost` and `Other` are
+    /// not: the first because the process is finished either way, the second because a
+    /// deterministic failure will reproduce and the run should die at it rather than grind.
+    pub fn is_retryable(&self) -> bool {
+        matches!(self, Self::NotACycle { .. } | Self::DeviceExhausted { .. })
+    }
+
+    /// Should the worker wait before trying again, and roughly how long?
+    ///
+    /// Only the memory case: a card that is full right now needs in-flight work to retire and the
+    /// idle reclaim to run before a retry can do any better. Corruption has no such dependency.
+    pub fn backoff(&self) -> Option<std::time::Duration> {
+        match self {
+            Self::DeviceExhausted { .. } => Some(std::time::Duration::from_secs(10)),
+            _ => None,
+        }
+    }
+
+    /// Classify an `anyhow` error coming out of [`Resolution::step_resolution_with_result`].
+    fn from_anyhow(b: Bidegree, e: anyhow::Error) -> Self {
+        if let Some(f) = e.downcast_ref::<StepFailure>() {
+            // Already classified at the point of failure; keep it rather than re-deriving from text.
+            return match f {
+                Self::NotACycle { b, nonzero, gens } => Self::NotACycle { b: *b, nonzero: *nonzero, gens: *gens },
+                Self::DeviceExhausted { b, detail } => Self::DeviceExhausted { b: *b, detail: detail.clone() },
+                Self::ContextLost { b, detail } => Self::ContextLost { b: *b, detail: detail.clone() },
+                Self::Other { b, detail } => Self::Other { b: *b, detail: detail.clone() },
+            };
+        }
+        Self::Other { b, detail: format!("{e:#}") }
+    }
+
+    /// Classify a PANIC payload.
+    ///
+    /// Deliberately stringly-typed, and it has to be: the allocation failures originate in
+    /// `cubecl-cuda`'s own `Result::unwrap()`, so the only thing that crosses the unwind boundary
+    /// is the message it formatted. The two signatures matched here are the ones the documented
+    /// corruption chain produces:
+    ///   `can't allocate buffer of size: <n>`
+    ///   `couldn't find resource for that handle: Memory location was never initialized`
+    /// Anything unrecognised is `Other`, i.e. fatal -- guessing "transient" for an unknown panic
+    /// would turn a real bug into an infinite retry.
+    fn from_panic(b: Bidegree, payload: &(dyn std::any::Any + Send)) -> Self {
+        let msg = payload
+            .downcast_ref::<&'static str>()
+            .map(|s| (*s).to_owned())
+            .or_else(|| payload.downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "<non-string panic payload>".to_owned());
+        let low = msg.to_ascii_lowercase();
+        if low.contains("dx non-zero") {
+            Self::NotACycle { b, nonzero: 0, gens: 0 }
+        } else if low.contains("can't allocate buffer") || low.contains("out of memory") {
+            Self::DeviceExhausted { b, detail: msg }
+        } else if low.contains("couldn't find resource for that handle")
+            || low.contains("context")&& low.contains("poison")
+            || low.contains("launch_failed")
+            || low.contains("cuda_error")
+        {
+            Self::ContextLost { b, detail: msg }
+        } else {
+            Self::Other { b, detail: msg }
+        }
+    }
+}
+
+impl std::fmt::Display for StepFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotACycle { b, nonzero, gens } => {
+                write!(f, "{b}: computed lift is not a cycle ({nonzero} of {gens} generators had dx != 0)")
+            }
+            Self::DeviceExhausted { b, detail } => write!(f, "{b}: device out of memory: {detail}"),
+            Self::ContextLost { b, detail } => write!(f, "{b}: CUDA context lost: {detail}"),
+            Self::Other { b, detail } => write!(f, "{b}: {detail}"),
+        }
+    }
+}
+
+impl std::error::Error for StepFailure {}
+
 pub struct Resolution<M: ZeroModule<Algebra = MilnorAlgebra>> {
     lock: Mutex<()>,
     name: String,
@@ -3843,7 +3966,11 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                 && b.s() == s
                 && !FIRED.swap(true, std::sync::atomic::Ordering::Relaxed)
             {
-                panic!("injected transient failure at {b}");
+                // Returns the TYPED failure rather than panicking, so the test exercises the real
+                // path: classification -> `is_retryable` -> retry. A bare `panic!` would be
+                // classified `Other` by `StepFailure::from_panic` -- correctly, since an
+                // unrecognised panic must not be retried -- and would kill the run instead.
+                return Err(StepFailure::NotACycle { b, nonzero: 1, gens: dxs.len() }.into());
             }
         }
 
@@ -3851,8 +3978,12 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
         // product came back wrong; it is the only thing standing between a corrupt differential and
         // the save file. Nothing above has mutated shared state, so a panic here loses only this
         // bidegree's work and `spawn_bidegree` can run it again.
-        for dx in &dxs {
-            assert!(dx.is_zero(), "dx non-zero at {b}");
+        let nonzero = dxs.iter().filter(|dx| !dx.is_zero()).count();
+        if nonzero > 0 {
+            // Was `assert!`. A panic carried no information across the unwind boundary, so the
+            // scheduler could not tell corrupted mathematics from a dead context and had to treat
+            // every failure the same way.
+            return Err(StepFailure::NotACycle { b, nonzero, gens: dxs.len() }.into());
         }
 
         // Past the gate: register the generators and their differential together.
@@ -4115,7 +4246,68 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
         Ok(())
     }
 
-    fn step_resolution(&self, b: Bidegree) {
+    /// Run `b`, retrying failures that are worth retrying, and report the one that should end the
+    /// run if any.
+    ///
+    /// Shared by the wavefront scheduler and the serial [`Self::compute_through_bidegree`] so the
+    /// two cannot drift apart on something as consequential as when to give up.
+    fn run_bidegree(&self, b: Bidegree) -> Option<StepFailure> {
+        // Bounded, because a genuine bug must not spin forever. What is
+        // retried, and whether it waits first, now comes from [`StepFailure`]
+        // rather than being the same blind redo for every kind of failure:
+        //
+        //   NotACycle       -- a product came back wrong. Transient; retry at
+        //                      once, there is nothing to wait for.
+        //   DeviceExhausted -- the card is full NOW. Retry, but only after
+        //                      giving in-flight work time to retire and the
+        //                      idle reclaim time to run.
+        //   ContextLost     -- the process is finished. Do not retry.
+        //   Other           -- deterministic. It will reproduce; die at it.
+        //
+        // A panic is still caught, because third-party code (cubecl's own
+        // `unwrap`) panics rather than returning, and classified from its
+        // payload -- see `StepFailure::from_panic`.
+        const MAX_ATTEMPTS: usize = 3;
+        let mut attempt = 0usize;
+        loop {
+            attempt += 1;
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                || self.step_resolution(b),
+            ));
+            let failure = match r {
+                Ok(Ok(())) => break None,
+                Ok(Err(f)) => f,
+                Err(payload) => StepFailure::from_panic(b, payload.as_ref()),
+            };
+            if !failure.is_retryable() {
+                eprintln!(
+                    "[nassau] {failure} -- not retryable, failing the run"
+                );
+                break Some(failure);
+            }
+            if attempt >= MAX_ATTEMPTS {
+                eprintln!(
+                    "[nassau] {failure} -- still failing after \
+                     {MAX_ATTEMPTS} attempts, failing the run"
+                );
+                break Some(failure);
+            }
+            if let Some(d) = failure.backoff() {
+                eprintln!(
+                    "[nassau] {failure} -- attempt {attempt}/{MAX_ATTEMPTS}, \
+                     waiting {d:?} for the card to drain"
+                );
+                std::thread::sleep(d);
+            } else {
+                eprintln!(
+                    "[nassau] {failure} -- attempt {attempt}/{MAX_ATTEMPTS}, \
+                     retrying"
+                );
+            }
+        }
+    }
+
+    fn step_resolution(&self, b: Bidegree) -> Result<(), StepFailure> {
         // One guard for the whole bidegree, rather than one per inner parallel section.
         //
         // This is correct by construction rather than by audit. A `step_resolution` job can only be
@@ -4134,8 +4326,11 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
         // relevant to guarding moved 31 -> 41 and 1271 s -> 1969 s, so the noise floor is the same
         // size as the effect. Do not "fix" this on one run's numbers.
         let _guard = ParallelGuard::new();
+        // Was `unwrap_or_else(|e| panic!(...))`. Turning every error into a panic threw away the
+        // one thing the caller needed: WHICH failure this was. Now the classification survives,
+        // and `spawn_bidegree` decides retry / wait / die from it.
         self.step_resolution_with_result(b)
-            .unwrap_or_else(|e| panic!("Error computing bidegree {b}: {e}"));
+            .map_err(|e| StepFailure::from_anyhow(b, e))
     }
 
     /// This function resolves up till a fixed stem instead of a fixed t.
@@ -4261,39 +4456,11 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                             // shared state before its `dx` check, running it again is safe and
                             // usually succeeds.
                             //
-                            // Bounded, because a genuine bug must not spin forever: after
-                            // `MAX_ATTEMPTS` the panic is resumed and the run dies loudly at the
-                            // fault, which is what a poisoned CUDA context deserves.
-                            const MAX_ATTEMPTS: usize = 3;
-                            let mut attempt = 0usize;
-                            loop {
-                                attempt += 1;
-                                let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
-                                    || self.step_resolution(b),
-                                ));
-                                match r {
-                                    Ok(()) => break,
-                                    Err(payload) => {
-                                        if attempt >= MAX_ATTEMPTS {
-                                            eprintln!(
-                                                "[nassau] bidegree {b} failed {MAX_ATTEMPTS} times; \
-                                                 failing the run"
-                                            );
-                                            INFLIGHT.fetch_sub(
-                                                1,
-                                                std::sync::atomic::Ordering::Relaxed,
-                                            );
-                                            std::panic::resume_unwind(payload);
-                                        }
-                                        eprintln!(
-                                            "[nassau] bidegree {b} panicked on attempt \
-                                             {attempt}/{MAX_ATTEMPTS}; retrying"
-                                        );
-                                    }
-                                }
-                            }
-
+                            let outcome = self.run_bidegree(b);
                             INFLIGHT.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                            if let Some(f) = outcome {
+                                panic!("{f}");
+                            }
                             SenderData::send(b, sender);
                         });
                     }
@@ -4716,7 +4883,9 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> ChainComplex for Resolution<M> {
                 if self.has_computed_bidegree(b) {
                     continue;
                 }
-                self.step_resolution(b);
+                if let Some(f) = self.run_bidegree(b) {
+                    panic!("{f}");
+                }
             }
         }
     }
