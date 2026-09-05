@@ -3194,7 +3194,15 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
             c.set_new_gens(num_new_gens);
         }
 
-        self.add_generators(b, num_new_gens);
+        // NOT `add_generators` here. Registering the generators before the differential is known
+        // makes the bidegree unrepeatable: the `dx` check below can fail -- a transient wrong
+        // answer out of the GPU multiply, seen in production at (395, 2) and twice more in job
+        // 40108364 -- and a retry would then add the generators a SECOND time and corrupt the
+        // module. Between this point and that check the only state read is
+        // `differentials[b.s() - 1]`, never `modules[b.s()]` or `differentials[b.s()]`, so nothing
+        // in the signature loop needs them registered yet. Deferring makes the whole bidegree
+        // side-effect-free until it is known to be correct, which is what lets `spawn_bidegree`
+        // retry it. It also means no other thread can observe generators that have no differential.
 
         let mut xs = vec![FpVector::new(p, target_dim); num_new_gens];
         let mut dxs = vec![FpVector::new(p, next_dim); num_new_gens];
@@ -3818,9 +3826,37 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
             );
         }
 
+        // Fault injection, so the retry path above can be exercised deliberately instead of waited
+        // for. `NASSAU_TEST_PANIC_AT="n,s"` panics ONCE at that bidegree, here -- the same point
+        // and the same state as a real `dx non-zero`. Unset, which is every production run, this
+        // is one `LazyLock` deref of a `None`.
+        {
+            static INJECT: LazyLock<Option<(i32, i32)>> = LazyLock::new(|| {
+                let v = std::env::var("NASSAU_TEST_PANIC_AT").ok()?;
+                let (n, s) = v.split_once(',')?;
+                Some((n.trim().parse().ok()?, s.trim().parse().ok()?))
+            });
+            static FIRED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if let Some((n, s)) = *INJECT
+                && b.t() - b.s() == n
+                && b.s() == s
+                && !FIRED.swap(true, std::sync::atomic::Ordering::Relaxed)
+            {
+                panic!("injected transient failure at {b}");
+            }
+        }
+
+        // The correctness gate. `dx != 0` means the computed lift is not a cycle, i.e. some
+        // product came back wrong; it is the only thing standing between a corrupt differential and
+        // the save file. Nothing above has mutated shared state, so a panic here loses only this
+        // bidegree's work and `spawn_bidegree` can run it again.
         for dx in &dxs {
             assert!(dx.is_zero(), "dx non-zero at {b}");
         }
+
+        // Past the gate: register the generators and their differential together.
+        self.add_generators(b, num_new_gens);
         self.differential(b.s()).add_generators_from_rows(b.t(), xs);
 
         end();
@@ -4211,7 +4247,52 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                             }
                             let n = INFLIGHT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
                             INFLIGHT_MAX.fetch_max(n, std::sync::atomic::Ordering::Relaxed);
-                            self.step_resolution(b);
+
+                            // A panicking bidegree used to take the run down with it in the worst
+                            // possible way: the thread died, `SenderData::send` never ran, so the
+                            // scheduler waited forever for a completion that could not arrive and
+                            // the wavefront stalled. Production job 40155630 did exactly this --
+                            // one `dx non-zero at (395, 2)` at 20:45, then hours of a 96-core node
+                            // making no progress on anything downstream, with nothing in the exit
+                            // status to say why.
+                            //
+                            // The failure is transient: (395, 2) recomputed cleanly from the same
+                            // seed with the same binary. Since the bidegree no longer mutates
+                            // shared state before its `dx` check, running it again is safe and
+                            // usually succeeds.
+                            //
+                            // Bounded, because a genuine bug must not spin forever: after
+                            // `MAX_ATTEMPTS` the panic is resumed and the run dies loudly at the
+                            // fault, which is what a poisoned CUDA context deserves.
+                            const MAX_ATTEMPTS: usize = 3;
+                            let mut attempt = 0usize;
+                            loop {
+                                attempt += 1;
+                                let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                                    || self.step_resolution(b),
+                                ));
+                                match r {
+                                    Ok(()) => break,
+                                    Err(payload) => {
+                                        if attempt >= MAX_ATTEMPTS {
+                                            eprintln!(
+                                                "[nassau] bidegree {b} failed {MAX_ATTEMPTS} times; \
+                                                 failing the run"
+                                            );
+                                            INFLIGHT.fetch_sub(
+                                                1,
+                                                std::sync::atomic::Ordering::Relaxed,
+                                            );
+                                            std::panic::resume_unwind(payload);
+                                        }
+                                        eprintln!(
+                                            "[nassau] bidegree {b} panicked on attempt \
+                                             {attempt}/{MAX_ATTEMPTS}; retrying"
+                                        );
+                                    }
+                                }
+                            }
+
                             INFLIGHT.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                             SenderData::send(b, sender);
                         });
