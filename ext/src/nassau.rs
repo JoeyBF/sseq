@@ -4347,14 +4347,25 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                                     .load(std::sync::atomic::Ordering::Relaxed);
                                 let copy_aug = crate::census::AUGMENTED_ALLOC_BYTES
                                     .load(std::sync::atomic::Ordering::Relaxed);
+                                // PROCESS RSS, not just our own accounting. Job 40131303 was
+                                // killed OUT_OF_MEMORY at 509GB of a 500G limit while the HOST[]
+                                // fields below summed to 5.8GB -- about 1% of the process. The rest
+                                // is GPU-runtime host memory (per-stream pinned pools, the resident
+                                // host-master duplicate) that nothing here measures, so the run that
+                                // died of it produced a postmortem instead of a trajectory.
+                                // `proc_rss_bytes` already existed and was dead code; the build had
+                                // been warning `never used` the whole time.
+                                let rss = proc_rss_bytes();
                                 eprintln!(
-                                    "[MEM] commits={commit_count} last_b=({},{}) HOST[diff={:.1} \
+                                    "[MEM] commits={commit_count} last_b=({},{}) RSS={:.1}GB \
+                                     HOST[diff={:.1} \
                                      mod={:.1} res_master={:.1} res_basis={:.1}]GB \
                                      DEV[master={:.1} basis={:.1} cubecl_use={:.1} \
                                      cubecl_reserved={:.1}]GB COPIED[add_masked={:.1} \
                                      augmented={:.1}]GB MASKED_SAVED={:.1}GB",
                                     b.n(),
                                     b.s(),
+                                    gbu(rss),
                                     gb(diff_b),
                                     gb(mod_b),
                                     gb(res_master),
