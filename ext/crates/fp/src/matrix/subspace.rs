@@ -42,12 +42,33 @@ impl Subspace {
         // one more vector, which will then be reduced to zero by the row reduction.
         let mut matrix = Matrix::new(p, dim + 1, dim);
         matrix.initialize_pivots();
-        Self::from_matrix(matrix)
+        // A zero matrix with every pivot -1 is already in reduced row echelon form, so reducing it
+        // only rediscovers that at O(rows x cols). See `from_rref`.
+        Self::from_rref(matrix)
     }
 
     /// Create a new subspace from a matrix. The matrix does not have to be in row echelon form.
     pub fn from_matrix(mut matrix: Matrix) -> Self {
         matrix.row_reduce();
+        Self { matrix }
+    }
+
+    /// Wrap a matrix that is ALREADY in reduced row echelon form, with its pivots set.
+    ///
+    /// [`Self::from_matrix`] reduces unconditionally, which is O(rows x cols) even when there is
+    /// nothing to do -- and these matrices are not small. `Subspace::new` builds a `(dim+1) x dim`
+    /// ZERO matrix, and `entire_space` builds the identity on top of it; at the stem-400 frontier
+    /// `dim` is over 120000, so each is multiple GiB and the reduction rediscovers a form the
+    /// caller already knows. `step1` takes `entire_space` on exactly this path for its
+    /// `desired_image` whenever the target module has vanished, i.e. almost always.
+    ///
+    /// Private on purpose: the caller is asserting the rref invariant, and nothing outside this
+    /// module can be trusted to have established it.
+    fn from_rref(matrix: Matrix) -> Self {
+        debug_assert!(
+            matrix.pivots().iter().filter(|&&p| p >= 0).count() <= matrix.rows(),
+            "from_rref: pivot count exceeds row count, matrix is not in rref"
+        );
         Self { matrix }
     }
 
@@ -77,6 +98,9 @@ impl Subspace {
         Matrix::write_pivot(self.pivots(), buffer)
     }
 
+    /// The whole ambient space. Builds the identity and its pivots directly -- `Self::new` no longer
+    /// reduces, so this costs one allocation and `dim` entry writes rather than a full reduction of
+    /// a multi-GiB matrix.
     pub fn entire_space(p: ValidPrime, dim: usize) -> Self {
         let mut result = Self::new(p, dim);
         for i in 0..dim {
