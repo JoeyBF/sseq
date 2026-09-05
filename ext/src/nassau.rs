@@ -2324,6 +2324,21 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
         Ok(())
     }
 
+    /// `C_s`, with `C_{-1}` the zero module.
+    ///
+    /// `modules` is indexed from 0, but the general step reads `modules[b.s() - 2]`, which at
+    /// `b.s() == 1` is `C_{-1}`. That object already exists — `zero_module`, the `FreeModule`
+    /// named `F_{-1}` that is the target of `differentials[0]` and is extended by zero in
+    /// [`Self::step0`] — it is simply not a member of the vector. Reading it through here is what
+    /// lets `s = 1` use [`Self::step_resolution_with_subalgebra`] like every other `s`.
+    fn module_or_zero(&self, s: i32) -> &FreeModule<MilnorAlgebra> {
+        if s < 0 {
+            &self.zero_module
+        } else {
+            &self.modules[s]
+        }
+    }
+
     /// Dimensions of the full restricted matrix at `b`: the restricted source dimension (its row
     /// count) and the restricted target dimension (its column count), exactly as
     /// [`Self::step_resolution_with_subalgebra`] computes them.
@@ -2336,7 +2351,7 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
         let target = &*self.modules[b.s() - 1];
         target.compute_basis(b.t());
         let target_dim = MilnorSubalgebra::restricted_dimension(target, b.t(), b.t());
-        let next = &self.modules[b.s() - 2];
+        let next = self.module_or_zero(b.s() - 2);
         next.compute_basis(b.t());
         let next_dim = MilnorSubalgebra::restricted_dimension(next, b.t(), b.t() - 1);
         (target_dim, next_dim)
@@ -2472,7 +2487,7 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
     /// `Sq(R)` keeps the generator, so the block cannot touch a column beyond this. Building the
     /// block this narrow is what lets it be built before `modules[b.s() - 2]` has grown to `b.t()`.
     fn block_cols(&self, b: Bidegree, gen_deg: i32) -> usize {
-        let next = &self.modules[b.s() - 2];
+        let next = self.module_or_zero(b.s() - 2);
         next.compute_basis(b.t());
         MilnorSubalgebra::restricted_dimension(next, b.t(), gen_deg.min(b.t() - 1))
     }
@@ -2863,7 +2878,7 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
             .collect();
         let target_masked_dim = target_mask.len();
 
-        let next = &self.modules[b.s() - 2];
+        let next = self.module_or_zero(b.s() - 2);
         next.compute_basis(b.t());
         let next_dim = MilnorSubalgebra::restricted_dimension(next, b.t(), next_bound);
 
@@ -4030,7 +4045,19 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
             return Ok(());
         }
 
-        if b.s() == 1 {
+        // `s = 1` goes through the general step whenever the augmentation vanishes in this
+        // degree, which past the target module's top cell is every `t` -- for the sphere, every
+        // `t >= 1`. There the desired image is `ker(d_0: C_0 -> C_{-1} = 0)`, all of `C_0`, which
+        // is exactly what `step1` arrives at the long way: by row-reducing a single
+        // `source_dim x target_dim` matrix of `d_1`. That matrix outgrows a GPU. At `t = 396` it
+        // is 1907640 x 319725 = 71 GiB, the upload fails, and it falls back to single-threaded
+        // CPU M4RI (~3e15 word operations -- weeks). The signature filtration never builds it,
+        // and `s = 1` is not special to it: `C_{-1}` is the zero module, so every element of the
+        // target is a cycle and each signature block simply extends the image.
+        //
+        // When the augmentation is NON-zero the desired image is a proper subspace that only the
+        // chain map knows, so `step1` still owns those degrees.
+        if b.s() == 1 && self.target.module(0).dimension(b.t()) != 0 {
             self.step1(b.t())?;
             set_data();
             return Ok(());
@@ -4040,7 +4067,13 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
             b,
             MilnorSubalgebra::optimal_for(b - Bidegree::s_t(0, self.max_degree)),
         )?;
-        self.chain_maps[b.s()].extend_by_zero(b.t());
+        // Deliberately still skipped for `s == 1`. This line is the only writer of `chain_maps`
+        // above index 0 and it never ran for `s == 1`, so `chain_maps[1]` has never been extended
+        // by any path; extending it for the first time at a large `t` mid-run would be a second,
+        // unrelated behaviour change riding along with this one.
+        if b.s() >= 2 {
+            self.chain_maps[b.s()].extend_by_zero(b.t());
+        }
 
         set_data();
         Ok(())
