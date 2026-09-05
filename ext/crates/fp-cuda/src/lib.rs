@@ -748,6 +748,29 @@ impl GpuContext {
         Ok(self.stream().clone_dtoh(&dm.buf)?)
     }
 
+    /// Download into an EXISTING host buffer, allocating nothing.
+    ///
+    /// [`Self::download`] allocates a fresh `Vec<u64>` per call, which at frontier matrix sizes is
+    /// a multi-GiB allocation on every reduction. A heap profile of a stem-320 run put the host-side
+    /// marshalling around this GPU call at 201-222GiB live across ~190 objects -- the largest single
+    /// consumer in the process, larger than any mathematical structure. This lets the caller reuse
+    /// one buffer instead.
+    pub fn download_into(
+        &self,
+        dm: &DeviceMatrix,
+        out: &mut [u64],
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        assert_eq!(
+            out.len(),
+            dm.rows * dm.stride,
+            "download_into: buffer is {} limbs, matrix needs {}",
+            out.len(),
+            dm.rows * dm.stride
+        );
+        self.stream().memcpy_dtoh(&dm.buf, out)?;
+        Ok(())
+    }
+
     /// Download a device `u32` buffer (e.g. a `perm` vector) to host.
     pub fn download_u32(&self, s: &CudaSlice<u32>) -> Result<Vec<u32>, Box<dyn std::error::Error>> {
         Ok(self.stream().clone_dtoh(s)?)

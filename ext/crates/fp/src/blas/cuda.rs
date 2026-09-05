@@ -191,7 +191,7 @@ mod driver {
 
     /// How many jobs may be in flight on the reduction device at once; 1 is the historical
     /// single-owner behaviour.
-    fn threads() -> usize {
+    pub(super) fn threads() -> usize {
         static N: OnceLock<usize> = OnceLock::new();
         *N.get_or_init(|| {
             std::env::var("FP_CUDA_DRIVER_THREADS")
@@ -271,6 +271,121 @@ mod driver {
 /// Row-major, K-major `u64` limbs — the exact layout `fp_cuda::matmul_b1_raw`
 /// expects (`rows × columns.div_ceil(64)` limbs, no inter-row padding). Uses
 /// `Matrix::to_bytes`, which already strips the physical row stride.
+/// A bounded pool of reusable host buffers for the row-reduce marshalling.
+///
+/// A heap profile of a stem-320 run found the host-side plumbing around the GPU reduction to be the
+/// single largest consumer in the process: 201-222 GiB live across ~190 objects, in
+/// `Matrix::from_data` under `try_row_reduce`. Two things caused it. Each reduction allocated four
+/// full-size host copies (`to_bytes` -> `Vec<u8>`, collect -> `Vec<u64>`, `download` -> `Vec<u64>`,
+/// and `out` -> `Matrix::from_data`), and the FIRST of those was made on the calling thread BEFORE
+/// `driver::run` queued the job -- so every thread waiting behind the serialized driver was holding
+/// a complete copy of its matrix. Live memory scaled with queue depth, not with concurrency on the
+/// device.
+///
+/// The copy cannot simply move inside the closure: `driver::run` requires `'static`, so it cannot
+/// borrow the matrix. Instead the buffers are OWNED, taken from this fixed-size pool, moved into the
+/// closure, and handed back out again. At most `capacity()` of them exist regardless of how many
+/// threads are queued.
+///
+/// `acquire` falls back to allocating after a timeout rather than blocking forever. A panic inside
+/// the driver closure would drop a buffer without returning it, and permanently losing a permit
+/// would deadlock every later reduction -- degrading to an extra allocation is much the lesser
+/// failure.
+mod marshal {
+    use std::{
+        sync::{Condvar, LazyLock, Mutex},
+        time::Duration,
+    };
+
+    struct Pool {
+        free: Vec<Vec<u64>>,
+        checked_out: usize,
+    }
+
+    static POOL: LazyLock<(Mutex<Pool>, Condvar)> = LazyLock::new(|| {
+        (
+            Mutex::new(Pool {
+                free: Vec::new(),
+                checked_out: 0,
+            }),
+            Condvar::new(),
+        )
+    });
+
+    /// How many marshalling buffers may exist at once (`FP_CUDA_MARSHAL_BUFFERS`).
+    ///
+    /// Two per driver thread by default: one being filled while another is in flight, which keeps
+    /// the device fed without letting the queue multiply memory.
+    fn capacity() -> usize {
+        static CAP: LazyLock<usize> = LazyLock::new(|| {
+            std::env::var("FP_CUDA_MARSHAL_BUFFERS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or_else(|| (2 * super::driver::threads()).max(2))
+        });
+        *CAP
+    }
+
+    pub(super) fn acquire() -> Vec<u64> {
+        let (lock, cv) = &*POOL;
+        let mut g = lock.lock().unwrap_or_else(|e| e.into_inner());
+        let deadline = Duration::from_secs(30);
+        loop {
+            if let Some(b) = g.free.pop() {
+                g.checked_out += 1;
+                return b;
+            }
+            if g.checked_out < capacity() {
+                g.checked_out += 1;
+                return Vec::new();
+            }
+            let (ng, timeout) = cv
+                .wait_timeout(g, deadline)
+                .unwrap_or_else(|e| e.into_inner());
+            g = ng;
+            if timeout.timed_out() {
+                // A permit was lost (a panicked closure never returned its buffer). Allocate rather
+                // than hang; the pool self-heals as live buffers come back.
+                g.checked_out += 1;
+                return Vec::new();
+            }
+        }
+    }
+
+    pub(super) fn release(mut b: Vec<u64>) {
+        let (lock, cv) = &*POOL;
+        let mut g = lock.lock().unwrap_or_else(|e| e.into_inner());
+        g.checked_out = g.checked_out.saturating_sub(1);
+        if g.free.len() < capacity() {
+            b.clear();
+            g.free.push(b);
+        }
+        cv.notify_one();
+    }
+}
+
+/// Pack `m`'s rows into `buf` in the tight row-major layout `upload` expects.
+///
+/// Replaces a `u64 -> little-endian bytes -> u64` round trip, which was two full-size copies to
+/// perform the identity on a little-endian machine. When the matrix's own stride already matches
+/// the packed one -- the common case, since `Matrix::new` sets `columns_capacity == columns` -- this
+/// is a single `extend_from_slice` of the whole buffer.
+fn fill_limbs(m: &Matrix, buf: &mut Vec<u64>) {
+    let packed = m.columns().div_ceil(64);
+    let ms = m.stride();
+    let rows = m.rows();
+    buf.clear();
+    buf.reserve(rows * packed);
+    let data = m.data();
+    if ms == packed {
+        buf.extend_from_slice(&data[..rows * packed]);
+    } else {
+        for i in 0..rows {
+            buf.extend_from_slice(&data[i * ms..i * ms + packed]);
+        }
+    }
+}
+
 fn to_limbs(m: &Matrix) -> Vec<u64> {
     let stride = m.columns().div_ceil(64);
     let mut bytes = Vec::with_capacity(m.rows() * stride * 8);
@@ -327,7 +442,6 @@ pub(crate) fn try_row_reduce(m: &mut Matrix) -> Option<usize> {
     let ctx = context()?;
 
     let stride = cols.div_ceil(64);
-    let limbs = to_limbs(m);
 
     // Lock-free, per-thread stream (see [`context`]): the default row-reduce is composable (no
     // cooperative launch) and allocates its device buffers per call, so concurrent rayon workers
@@ -343,22 +457,46 @@ pub(crate) fn try_row_reduce(m: &mut Matrix) -> Option<usize> {
     // The exclusive guard now lives on the driver thread, which holds it for the whole job — see
     // [`driver`]. Taking it here as well would deadlock: the driver would wait on a guard this
     // thread holds while this thread waits on the driver.
-    let (dev_limbs, perm, r, pivot_cols) = driver::run(move || {
-        let mut dm = ctx.upload(&limbs, rows, cols).ok()?;
-        let (perm, r, pivot_cols) = ctx.row_reduce_dev(&mut dm).ok()?;
-        let dev_limbs = ctx.download(&dm).ok()?;
-        let perm = ctx.download_u32(&perm).ok()?;
-        Some((dev_limbs, perm, r, pivot_cols))
-    })?;
+    // Both buffers come from the bounded pool and are handed back by the closure whether or not the
+    // reduction succeeded -- dropping one inside would lose a permit permanently (see `marshal`).
+    let mut in_buf = marshal::acquire();
+    fill_limbs(m, &mut in_buf);
+    let mut out_buf = marshal::acquire();
+    out_buf.clear();
+    out_buf.resize(rows * stride, 0);
 
-    // Materialize the canonical RREF: pivot k (column pivot_cols[k], ascending)
-    // at row k, taken from device row perm[k]; rows [r, rows) zero.
-    let mut out = vec![0u64; rows * stride];
-    for k in 0..r {
-        let src = perm[k] as usize * stride;
-        out[k * stride..k * stride + stride].copy_from_slice(&dev_limbs[src..src + stride]);
+    let (in_buf, mut out_buf, res) = driver::run(move || {
+        let mut outcome = None;
+        if let Ok(mut dm) = ctx.upload(&in_buf, rows, cols)
+            && let Ok((perm_dev, r, pivot_cols)) = ctx.row_reduce_dev(&mut dm)
+            && ctx.download_into(&dm, &mut out_buf).is_ok()
+            && let Ok(perm) = ctx.download_u32(&perm_dev)
+        {
+            outcome = Some((perm, r, pivot_cols));
+        }
+        (in_buf, out_buf, outcome)
+    });
+    marshal::release(in_buf);
+    let Some((perm, r, pivot_cols)) = res else {
+        marshal::release(out_buf);
+        return None;
+    };
+
+    // Materialize the canonical RREF IN PLACE: pivot k (column pivot_cols[k], ascending) at row k,
+    // taken from device row perm[k]; rows [r, rows) zero. Writing into `m`'s existing storage avoids
+    // a fourth full-size allocation, and it also preserves `m`'s row/column CAPACITY, which
+    // `Matrix::from_data` silently discarded -- callers such as `extend_image` then `add_row` into
+    // it.
+    let ms = m.stride();
+    {
+        let data = m.data_mut();
+        data.fill(0);
+        for k in 0..r {
+            let src = perm[k] as usize * stride;
+            data[k * ms..k * ms + stride].copy_from_slice(&out_buf[src..src + stride]);
+        }
     }
-    *m = Matrix::from_data(TWO, rows, cols, out);
+    marshal::release(out_buf);
     m.initialize_pivots();
     let piv = m.pivots_mut();
     for (k, &q) in pivot_cols.iter().enumerate() {
