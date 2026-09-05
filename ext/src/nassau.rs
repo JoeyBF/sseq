@@ -3872,7 +3872,23 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                     .row_slice(source_dim, source_dim + num_new_gens),
             );
         }
-        chain_map.compute_auxiliary_data_through_degree(t);
+        // NOT computing the chain map's auxiliary data here. It is never read: the only consumer
+        // of a chain map's kernel/image/quasi-inverse in this crate is `resolution.rs`, which
+        // belongs to the other `Resolution` type, and `ResolutionHomomorphism` calls
+        // `compute_auxiliary_data_through_degree` itself before using it
+        // (resolution_homomorphism.rs:619). Nassau's own flow only ever calls `get_matrix`,
+        // `add_generators_from_matrix_rows` and `extend_by_zero` on chain maps.
+        //
+        // It was not cheap. `auxiliary_data` builds `[A | I]`, and past the target module's top cell
+        // -- every degree above 0 for the sphere -- there is no `A`, so `compute_kernel` produces a
+        // source_dim x source_dim matrix and `Subspace::from_matrix` row-reduces it, even though it
+        // is the identity. In the stem-400 run that was `gpu_row_reduce{rows=198084 cols=198084}`
+        // and larger, ~5 GiB apiece: 622 `step0` spans totalling 76,501 seconds of span time in
+        // fifteen minutes, on a resolution that never looks at the answer.
+        //
+        // Skipping it only defers work for the consumers that do want it; `kernels`/`images`/
+        // `quasi_inverses` are memoised `OnceBiVec`s, so a later
+        // `compute_auxiliary_data_through_degree` fills them on demand exactly as before.
 
         d.set_kernel(t, None);
         d.set_image(t, None);
