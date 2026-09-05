@@ -577,18 +577,55 @@ fn reclaim_on_idle(dev: usize) {
     }
     let client = gpu_client_for(dev);
     let before = client.memory_usage().map(|u| u.bytes_reserved).unwrap_or(0);
+    let rss_before = proc_rss_bytes();
     client.memory_cleanup();
+    // HOST side, at the same moment and for the same reason. Job 40131303 was killed
+    // OUT_OF_MEMORY at 509GB while its LIVE storage was 5.5GB; on the next run, measured over 25
+    // samples, RSS grew 63.5 -> 85.5GB while live stayed flat at ~5.5GB and CUMULATIVE transient
+    // allocation grew 48.5GB -- dRSS/dAlloc = 0.45, with RSS occasionally DECREASING. That is
+    // glibc arena retention of large short-lived buffers (we build without the heapprof jemalloc
+    // feature), not a leak and not device memory. `malloc_trim` hands those back.
+    //
+    // Here rather than on a timer for the same reason as the device reclaim: the queue is drained,
+    // so no worker is mid-allocation and the arenas are as quiet as they ever get.
+    #[cfg(target_os = "linux")]
+    unsafe {
+        malloc_trim(0);
+    }
     let after = client.memory_usage().map(|u| u.bytes_reserved).unwrap_or(0);
-    if before > after {
+    let rss_after = proc_rss_bytes();
+    if before > after || rss_before > rss_after {
         const GB: f64 = (1u64 << 30) as f64;
         tracing::info!(
             target: "nassau::gpu",
             device = dev,
-            reclaimed_gb = (before - after) as f64 / GB,
+            reclaimed_gb = before.saturating_sub(after) as f64 / GB,
             reserved_gb = after as f64 / GB,
+            rss_freed_gb = rss_before.saturating_sub(rss_after) as f64 / GB,
+            rss_gb = rss_after as f64 / GB,
             "idle reclaim on drained queue"
         );
     }
+}
+
+/// Resident set size, for the host half of [`reclaim_on_idle`]. Duplicated rather than shared with
+/// `ext`: `algebra` does not depend on it, and it is four lines.
+fn proc_rss_bytes() -> u64 {
+    std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|s| {
+            s.lines()
+                .find(|l| l.starts_with("VmRSS:"))
+                .and_then(|l| l.split_whitespace().nth(1)?.parse::<u64>().ok())
+        })
+        .map_or(0, |kb| kb * 1024)
+}
+
+/// glibc's "return free heap to the OS". Declared directly rather than pulling in `libc` for one
+/// symbol; it is a no-op returning 0 if there is nothing to release.
+#[cfg(target_os = "linux")]
+unsafe extern "C" {
+    fn malloc_trim(pad: usize) -> core::ffi::c_int;
 }
 
 /// How often to call `client.memory_cleanup()` after a multiply launch, via
