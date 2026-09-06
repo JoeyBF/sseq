@@ -531,9 +531,28 @@ thread_local! {
     static FORCE_CPU: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+/// `NASSAU_FORCE_CPU=1`: force EVERY multiply onto the CPU path, for every thread and the whole
+/// run.
+///
+/// The thread-local guard below only ever fires on a last retry, so `cpu_multiply_batch_masked`
+/// had never executed in production until (364, 3) reached its third attempt -- at which point it
+/// panicked `p-part index 10 out of range` within 113 ms, on its first multiply. That leaves two
+/// readings: the CPU path is itself broken (it is near-untested: one unit test, 336 products,
+/// 43 -> 29 columns), or the input is genuinely corrupt and only the CPU bounds-checks it while
+/// the kernel writes garbage.
+///
+/// Those are separable only by running the CPU path on inputs known to be good, which needs a
+/// switch that does not depend on a failure to turn on. If a small resolution panics the same way
+/// with this set, the CPU path is the bug and the (364, 3) "verdict" is void.
+fn cpu_forced_globally() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var("NASSAU_FORCE_CPU").as_deref() == Ok("1"));
+    *ON
+}
+
 /// Whether this thread's multiplies are currently forced onto the CPU.
 pub fn cpu_forced() -> bool {
-    FORCE_CPU.with(std::cell::Cell::get)
+    cpu_forced_globally() || FORCE_CPU.with(std::cell::Cell::get)
 }
 
 /// Forces [`cpu_forced`] on for this thread until dropped, restoring whatever it was before.

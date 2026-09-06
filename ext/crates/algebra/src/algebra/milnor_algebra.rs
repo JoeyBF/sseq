@@ -1585,6 +1585,29 @@ impl MilnorAlgebra {
         terms.push(self.basis_element_from_index(s_degree, i1));
         terms.extend(nonzero.map(|(i, _)| self.basis_element_from_index(s_degree, i)));
 
+        // Write entry `n`, skipping zeros.
+        //
+        // The loops below assemble the output positionally, incrementing `n` past every column of
+        // the admissible matrix and every entry of the term -- so `n` reaches roughly
+        // `len(r.p_part) + len(basis)`, which can exceed `PPart::MAX_LEN` even though the entries
+        // up there are ZERO. `working.p_part` was just zeroed and the packed form does not
+        // represent trailing zeros, so writing one is semantically a no-op; but `set` asserts on
+        // the INDEX before it looks at the value, so that no-op panicked
+        // "p-part index 10 out of range".
+        //
+        // That is the (364, 3) failure. On the CPU it aborts; the GPU kernel performs the same
+        // positional write with no bounds check, so it corrupts memory past the entry array and
+        // yields a differential that is not a cycle -- one cause, both symptoms.
+        //
+        // A NON-zero entry past MAX_LEN is a genuine capacity overflow (it needs degree >=
+        // 2^(MAX_LEN+1) - 1 > MAX_DEGREE) and must still assert, so only zeros are skipped.
+        #[inline]
+        fn put(p: &mut PPart, n: usize, v: PPartEntry) {
+            if v != 0 {
+                p.set(n, v);
+            }
+        }
+
         let out_degree = r_degree + s_degree;
         let mut matrix = AdmissibleMatrix::new(r.p_part);
         let mut working = MilnorBasisElement {
@@ -1612,9 +1635,11 @@ impl MilnorAlgebra {
                     }
                     // We should add the diagonal sum, but that equals the mask, and there are no
                     // bit conflicts, so a bitwise-or is the same thing.
-                    working
-                        .p_part
-                        .set(n, (b - matrix.col_sums[j]) | matrix.masks[j]);
+                    put(
+                        &mut working.p_part,
+                        n,
+                        (b - matrix.col_sums[j]) | matrix.masks[j],
+                    );
                     n += 1;
                 }
 
@@ -1625,7 +1650,7 @@ impl MilnorAlgebra {
                         }
                     }
                     for &mask in &matrix.masks[basis.len()..] {
-                        working.p_part.set(n, mask);
+                        put(&mut working.p_part, n, mask);
                         n += 1;
                     }
                 } else {
@@ -1634,17 +1659,17 @@ impl MilnorAlgebra {
                         if b & matrix.masks[j] != 0 {
                             continue 'outer;
                         }
-                        working.p_part.set(n, b | matrix.masks[j]);
+                        put(&mut working.p_part, n, b | matrix.masks[j]);
                         n += 1;
                     }
                     if basis.len() < matrix.masks.len() {
                         for &mask in &matrix.masks[basis.len()..] {
-                            working.p_part.set(n, mask);
+                            put(&mut working.p_part, n, mask);
                             n += 1;
                         }
                     } else {
                         for j in matrix.masks.len()..basis.len() {
-                            working.p_part.set(n, basis.get(j));
+                            put(&mut working.p_part, n, basis.get(j));
                             n += 1;
                         }
                     }
