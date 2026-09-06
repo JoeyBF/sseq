@@ -239,12 +239,31 @@ impl PPart {
 
     /// Set entry `i` to `v`.
     ///
+    /// Writing a ZERO at `i >= MAX_LEN` is a no-op rather than a panic: the packed form does not
+    /// represent trailing zeros, so there is nothing to store and nothing to check.
+    ///
+    /// This matters because callers assemble p-parts POSITIONALLY. In
+    /// [`MilnorAlgebra::multiply_basis_element_by_element_2`] the index runs once per column of the
+    /// admissible matrix and once per entry of the term, reaching ~`len(r.p_part) + len(basis)`,
+    /// which passes `MAX_LEN` while the entries up there are zero; `PPartMultiplier` assembles the
+    /// same way. Asserting on the INDEX before looking at the VALUE turned those no-ops into an
+    /// abort -- `p-part index 10 out of range` -- which is what killed (364, 3)'s CPU retry 113 ms
+    /// in, on the first bidegree whose two factors' lengths sum past 10.
+    ///
+    /// The invariant this enforces is unchanged: a NON-ZERO entry at `i >= MAX_LEN` is a genuine
+    /// capacity overflow (it needs degree `>= 2^(MAX_LEN+1) - 1 = 2047 > MAX_DEGREE`) and still
+    /// panics. Only the vacuous write is admitted, and it is admitted here rather than at each
+    /// call site so every positional assembler is covered.
+    ///
     /// # Panics
     ///
-    /// If `i >= MAX_LEN`, or `v` does not fit in entry `i`. Both are unreachable for elements of
-    /// degree at most [`Self::MAX_DEGREE`].
+    /// If `i >= MAX_LEN` with `v != 0`, or `v` does not fit in entry `i`. Both are unreachable for
+    /// elements of degree at most [`Self::MAX_DEGREE`].
     #[inline]
     pub fn set(&mut self, i: usize, v: PPartEntry) {
+        if i >= Self::MAX_LEN && v == 0 {
+            return;
+        }
         assert!(i < Self::MAX_LEN, "p-part index {i} out of range");
         assert!(
             v <= Self::max_entry(i),
@@ -1585,29 +1604,6 @@ impl MilnorAlgebra {
         terms.push(self.basis_element_from_index(s_degree, i1));
         terms.extend(nonzero.map(|(i, _)| self.basis_element_from_index(s_degree, i)));
 
-        // Write entry `n`, skipping zeros.
-        //
-        // The loops below assemble the output positionally, incrementing `n` past every column of
-        // the admissible matrix and every entry of the term -- so `n` reaches roughly
-        // `len(r.p_part) + len(basis)`, which can exceed `PPart::MAX_LEN` even though the entries
-        // up there are ZERO. `working.p_part` was just zeroed and the packed form does not
-        // represent trailing zeros, so writing one is semantically a no-op; but `set` asserts on
-        // the INDEX before it looks at the value, so that no-op panicked
-        // "p-part index 10 out of range".
-        //
-        // That is the (364, 3) failure. On the CPU it aborts; the GPU kernel performs the same
-        // positional write with no bounds check, so it corrupts memory past the entry array and
-        // yields a differential that is not a cycle -- one cause, both symptoms.
-        //
-        // A NON-zero entry past MAX_LEN is a genuine capacity overflow (it needs degree >=
-        // 2^(MAX_LEN+1) - 1 > MAX_DEGREE) and must still assert, so only zeros are skipped.
-        #[inline]
-        fn put(p: &mut PPart, n: usize, v: PPartEntry) {
-            if v != 0 {
-                p.set(n, v);
-            }
-        }
-
         let out_degree = r_degree + s_degree;
         let mut matrix = AdmissibleMatrix::new(r.p_part);
         let mut working = MilnorBasisElement {
@@ -1635,11 +1631,9 @@ impl MilnorAlgebra {
                     }
                     // We should add the diagonal sum, but that equals the mask, and there are no
                     // bit conflicts, so a bitwise-or is the same thing.
-                    put(
-                        &mut working.p_part,
-                        n,
-                        (b - matrix.col_sums[j]) | matrix.masks[j],
-                    );
+                    working
+                        .p_part
+                        .set(n, (b - matrix.col_sums[j]) | matrix.masks[j]);
                     n += 1;
                 }
 
@@ -1650,7 +1644,7 @@ impl MilnorAlgebra {
                         }
                     }
                     for &mask in &matrix.masks[basis.len()..] {
-                        put(&mut working.p_part, n, mask);
+                        working.p_part.set(n, mask);
                         n += 1;
                     }
                 } else {
@@ -1659,17 +1653,17 @@ impl MilnorAlgebra {
                         if b & matrix.masks[j] != 0 {
                             continue 'outer;
                         }
-                        put(&mut working.p_part, n, b | matrix.masks[j]);
+                        working.p_part.set(n, b | matrix.masks[j]);
                         n += 1;
                     }
                     if basis.len() < matrix.masks.len() {
                         for &mask in &matrix.masks[basis.len()..] {
-                            put(&mut working.p_part, n, mask);
+                            working.p_part.set(n, mask);
                             n += 1;
                         }
                     } else {
                         for j in matrix.masks.len()..basis.len() {
-                            put(&mut working.p_part, n, basis.get(j));
+                            working.p_part.set(n, basis.get(j));
                             n += 1;
                         }
                     }
