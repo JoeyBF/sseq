@@ -872,6 +872,104 @@ pub fn resident_dev_bytes() -> (usize, usize) {
     (master, basis)
 }
 
+/// Device bytes one launch is likely to need, as a gate input for [`admit`].
+///
+/// The term we can actually compute is the dense output/readback: `num_rows` rows of
+/// `ceil(out_cols/32)` u32 words. Masters, segments and per-launch temporaries are not included --
+/// they depend on which `R`s the products touch and on what is already resident -- so the figure is
+/// scaled by `NASSAU_GPU_ADMIT_FACTOR` (default 3). This is a MITIGATION, not an accounting: it
+/// bounds how many large launches pile up concurrently, it does not predict the peak.
+fn estimated_launch_bytes(out_cols: usize, num_rows: usize) -> u64 {
+    static FACTOR: LazyLock<u64> = LazyLock::new(|| {
+        std::env::var("NASSAU_GPU_ADMIT_FACTOR")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(3)
+    });
+    (num_rows as u64) * (out_cols.div_ceil(32) as u64) * 4 * *FACTOR
+}
+
+/// Bytes of in-flight launches allowed at once, and a condvar to park on.
+static GPU_ADMIT: LazyLock<(Mutex<u64>, Condvar)> =
+    LazyLock::new(|| (Mutex::new(0), Condvar::new()));
+
+/// Total in-flight budget. `NASSAU_GPU_ADMIT_GB=0` disables the gate entirely.
+fn admit_budget() -> u64 {
+    static B: LazyLock<u64> = LazyLock::new(|| {
+        std::env::var("NASSAU_GPU_ADMIT_GB")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(24)
+            << 30
+    });
+    *B
+}
+
+/// Held for the duration of a launch; releases its bytes and wakes a parked launch on drop.
+pub struct AdmitGuard(u64);
+
+impl Drop for AdmitGuard {
+    fn drop(&mut self) {
+        if self.0 == 0 {
+            return;
+        }
+        let (lock, cv) = &*GPU_ADMIT;
+        let mut in_flight = lock.lock().unwrap();
+        *in_flight = in_flight.saturating_sub(self.0);
+        cv.notify_all();
+    }
+}
+
+/// Wait until this launch's estimated bytes fit the in-flight budget.
+///
+/// WHY. A 1.5 GB allocation failed on job 40157623; cubecl `unwrap()`s that error, which kills its
+/// worker thread, after which every later multiply returns uninitialised memory and the run writes
+/// garbage differentials (one bidegree reported 6385 of 6385 generators with `dx != 0`). The
+/// allocation sizes involved were up to 4 GiB and came from the huge bidegrees near the (300, 200)
+/// corner. Nothing bounded how many of those ran at once: `gpu_rows_per_batch` caps the HOST
+/// readback of a single batch and says nothing about how many batches are in flight on the device.
+///
+/// So park instead of racing. This cannot make an allocation succeed that would fail on an empty
+/// device, and it does not track real driver free memory (cubecl's `bytes_reserved` over-reports,
+/// since reserved-but-unsynced memory is reusable across streams). What it does is stop N threads
+/// from each asking for gigabytes simultaneously, which is the situation that actually arose.
+///
+/// A request larger than the whole budget proceeds when nothing else is in flight -- otherwise it
+/// would park forever, and a launch that big is exactly the one that must not be starved.
+fn admit(bytes: u64) -> AdmitGuard {
+    let budget = admit_budget();
+    if budget == 0 || bytes == 0 {
+        return AdmitGuard(0);
+    }
+    let (lock, cv) = &*GPU_ADMIT;
+    let mut in_flight = lock.lock().unwrap();
+    let start = std::time::Instant::now();
+    let mut parked = false;
+    while *in_flight > 0 && *in_flight + bytes > budget {
+        parked = true;
+        let (g, timeout) = cv
+            .wait_timeout(in_flight, std::time::Duration::from_millis(250))
+            .unwrap();
+        in_flight = g;
+        // Never block forever on a misjudged estimate: after 60 s, go anyway and say so. A stalled
+        // resolution is a worse failure than an allocation that might not have fitted.
+        if timeout.timed_out() && start.elapsed() > std::time::Duration::from_secs(60) {
+            tracing::warn!(
+                bytes,
+                in_flight = *in_flight,
+                budget,
+                "gpu admission waited 60s; proceeding anyway"
+            );
+            break;
+        }
+    }
+    if parked {
+        tracing::debug!(bytes, waited_ms = start.elapsed().as_millis() as u64, "gpu admission");
+    }
+    *in_flight += bytes;
+    AdmitGuard(bytes)
+}
+
 /// Diagnostic (see `NASSAU_MEM_REPORT`): the cubecl CUDA memory pool's device usage on the default
 /// device, `(bytes_in_use, bytes_reserved)`. This is the batched-multiply pool; the fp-cuda RREF runs
 /// on a separate cudarc context, so `nvidia-smi total − resident_dev − reserved` estimates the RREF
@@ -4083,6 +4181,9 @@ pub fn multiply_batch_on_gpu_masked(
     if cpu_forced() {
         return cpu_multiply_batch_masked(algebra, out_cols, col_map, num_rows, products);
     }
+    // PARK rather than race other launches into an allocation the device cannot serve. Held for
+    // the whole launch; released on the way out, including on unwind. See [`admit`].
+    let _admit = admit(estimated_launch_bytes(out_cols, num_rows));
     // Start the prefetcher on first use (no-op unless enabled) and tell it how far the wavefront has
     // got. `r_degree` is the `R` degree this launch needs, so its max IS the enumeration frontier.
     start_prefetch(algebra);
