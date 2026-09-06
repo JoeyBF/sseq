@@ -246,13 +246,47 @@ impl MilnorSubalgebra {
             .sum()
     }
 
+    /// `NASSAU_MAX_SUBALGEBRA=k`: never choose a subalgebra larger than `A(k)`.
+    ///
+    /// Correctness-safe by construction. [`Self::optimal_for`] takes the LAST subalgebra passing
+    /// `b_is_in_vanishing_region`, and `take_while` means the predicate held for every smaller one
+    /// in the sequence too -- so any earlier element is equally applicable, just a coarser
+    /// filtration. Capping changes cost, never validity.
+    ///
+    /// Worth having because `optimal_for` maximises SIZE, not speed: it is a correctness bound with
+    /// no cost term. Going A(3) -> A(4) multiplies the signature count ~32x
+    /// (dim A(k) = 2^((k+1)(k+2)/2): 1024 -> 32768), and the finer filtration is supposed to pay
+    /// for that by shrinking each signature's column set. On the `sig_ondemand` path it does not --
+    /// that build launches at the FULL output width -- and since signatures partition the ROWS,
+    /// `sum(rows * cols)` is invariant under the filtration. So the split buys nothing on multiply
+    /// work while multiplying launch count and per-launch host work in `extract_restricted`.
+    /// Measured at b=(364,3): 129 893 multiplies averaging 26 rows against 1.3M columns.
+    ///
+    /// The trade runs the other way on memory: coarser means ~32x more rows per block (~1.7 MB ->
+    /// ~53 MB at b=(349,3)), and a larger row count can push reductions over the 8192^2 GPU
+    /// threshold onto a different path. Any A/B here must record peak RSS, not just wall time.
+    fn max_subalgebra_len() -> usize {
+        static CAP: LazyLock<usize> = LazyLock::new(|| {
+            std::env::var("NASSAU_MAX_SUBALGEBRA")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                // `A(k)` has `profile.len() == k + 1`.
+                .map_or(usize::MAX, |k| k + 1)
+        });
+        *CAP
+    }
+
     fn optimal_for(b: Bidegree) -> Self {
         let b_is_in_vanishing_region = |subalgebra: &Self| {
             let coeff = (1 << subalgebra.profile.len()) - 1;
             b.t() >= coeff * (b.s() + 1) + subalgebra.top_degree()
         };
+        let cap = Self::max_subalgebra_len();
         SubalgebraIterator::new()
             .take_while(b_is_in_vanishing_region)
+            // `profile.len()` is non-decreasing along the iterator (it only ever grows by `push`,
+            // once the previous length is saturated), so this is a prefix, not a filter.
+            .take_while(|subalgebra| subalgebra.profile.len() <= cap)
             .last()
             .unwrap_or(Self::zero_algebra())
     }
