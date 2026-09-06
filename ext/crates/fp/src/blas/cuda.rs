@@ -287,10 +287,14 @@ mod driver {
 /// closure, and handed back out again. At most `capacity()` of them exist regardless of how many
 /// threads are queued.
 ///
-/// `acquire` falls back to allocating after a timeout rather than blocking forever. A panic inside
-/// the driver closure would drop a buffer without returning it, and permanently losing a permit
-/// would deadlock every later reduction -- degrading to an extra allocation is much the lesser
-/// failure.
+/// `acquire` falls back to allocating after a SHORT timeout rather than blocking. A panic inside the
+/// driver closure would drop a buffer without returning it, and permanently losing a permit would
+/// deadlock every later reduction -- degrading to an extra allocation is much the lesser failure.
+///
+/// The timeout is short because it is hit constantly, not rarely: see [`ACQUIRE_WAIT`]. A larger
+/// `capacity()` would let the pool actually serve concurrent marshalling, but the right bound there
+/// is BYTES rather than a buffer count -- at frontier sizes a single buffer is many GiB, so raising
+/// the count is how the host ran out of memory in the first place. Left as it is deliberately.
 mod marshal {
     use std::{
         sync::{Condvar, LazyLock, Mutex},
@@ -326,10 +330,28 @@ mod marshal {
         *CAP
     }
 
+    /// How long to wait for a buffer before giving up and allocating one.
+    ///
+    /// This was 30 s, and that was backwards: the fallback is a single allocation costing
+    /// milliseconds, so waiting thirty seconds to avoid it can only ever lose. It bounded nothing
+    /// either -- on timeout the buffer is allocated regardless; the wait just came first.
+    ///
+    /// MEASURED, from the span log of a from-scratch 0->250 run: 211 signature steps stalled with
+    /// their time in no child span, clustering at ~32 s (76 of them) and ~62 s (121) -- one and two
+    /// units of this deadline, because `try_row_reduce` acquires TWICE (`in_buf` and `out_buf`).
+    /// Together that is ~2.6 h of a run whose entire makespan was 3.34 h. Those stalls were 10x to
+    /// 21000x their sibling signatures while doing 0.04 s of actual multiply.
+    ///
+    /// Contention is not an edge case here: `capacity()` is `2 * driver threads`, which is 2 by
+    /// default, while marshalling is deliberately concurrent across every worker -- 16 threads were
+    /// active during the worst stall. One reduction in flight consumes the whole pool, so every
+    /// other worker takes this path.
+    const ACQUIRE_WAIT: Duration = Duration::from_millis(200);
+
     pub(super) fn acquire() -> Vec<u64> {
         let (lock, cv) = &*POOL;
         let mut g = lock.lock().unwrap_or_else(|e| e.into_inner());
-        let deadline = Duration::from_secs(30);
+        let deadline = ACQUIRE_WAIT;
         loop {
             if let Some(b) = g.free.pop() {
                 g.checked_out += 1;
@@ -344,8 +366,10 @@ mod marshal {
                 .unwrap_or_else(|e| e.into_inner());
             g = ng;
             if timeout.timed_out() {
-                // A permit was lost (a panicked closure never returned its buffer). Allocate rather
-                // than hang; the pool self-heals as live buffers come back.
+                // Either the pool is simply busy -- the common case, since capacity is small and
+                // marshalling is concurrent -- or a permit was lost when a panicking closure failed
+                // to return its buffer. Both are handled the same way: allocate, and let the pool
+                // self-heal as live buffers come back. What matters is not spending real time here.
                 g.checked_out += 1;
                 return Vec::new();
             }
