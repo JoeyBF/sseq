@@ -297,8 +297,11 @@ mod driver {
 /// the count is how the host ran out of memory in the first place. Left as it is deliberately.
 mod marshal {
     use std::{
-        sync::{Condvar, LazyLock, Mutex},
-        time::Duration,
+        sync::{
+            Condvar, LazyLock, Mutex,
+            atomic::{AtomicU64, Ordering},
+        },
+        time::{Duration, Instant},
     };
 
     struct Pool {
@@ -348,24 +351,59 @@ mod marshal {
     /// other worker takes this path.
     const ACQUIRE_WAIT: Duration = Duration::from_millis(200);
 
+    /// Cumulative contention, so a run can be asked how much time it lost here rather than having
+    /// it reconstructed from duration histograms afterwards.
+    ///
+    /// This is the instrumentation whose ABSENCE hid the 30 s bug: every span in the signature step
+    /// covers WORK, none covered WAITING, so a stalled step showed 100% of its time attributed to no
+    /// child at all and the cause had to be inferred from the fact that stalls clustered at one and
+    /// two units of 30 s. A counter here would have named it immediately.
+    pub(super) static WAITS: AtomicU64 = AtomicU64::new(0);
+    pub(super) static WAIT_NANOS: AtomicU64 = AtomicU64::new(0);
+    pub(super) static FALLBACKS: AtomicU64 = AtomicU64::new(0);
+
+    /// A single wait longer than this gets a log line. Chosen well above the common case so the log
+    /// stays quiet unless something is actually wrong.
+    const NOTABLE_WAIT: Duration = Duration::from_millis(500);
+
     pub(super) fn acquire() -> Vec<u64> {
         let (lock, cv) = &*POOL;
         let mut g = lock.lock().unwrap_or_else(|e| e.into_inner());
         let deadline = ACQUIRE_WAIT;
+        let mut waited = Duration::ZERO;
+        let finish = |waited: Duration| {
+            if waited > Duration::ZERO {
+                WAITS.fetch_add(1, Ordering::Relaxed);
+                WAIT_NANOS.fetch_add(waited.as_nanos() as u64, Ordering::Relaxed);
+                if waited >= NOTABLE_WAIT {
+                    tracing::info!(
+                        waited_ms = waited.as_millis() as u64,
+                        capacity = capacity(),
+                        "marshal buffer wait"
+                    );
+                }
+            }
+        };
         loop {
             if let Some(b) = g.free.pop() {
                 g.checked_out += 1;
+                finish(waited);
                 return b;
             }
             if g.checked_out < capacity() {
                 g.checked_out += 1;
+                finish(waited);
                 return Vec::new();
             }
+            let before = Instant::now();
             let (ng, timeout) = cv
                 .wait_timeout(g, deadline)
                 .unwrap_or_else(|e| e.into_inner());
+            waited += before.elapsed();
             g = ng;
             if timeout.timed_out() {
+                FALLBACKS.fetch_add(1, Ordering::Relaxed);
+                finish(waited);
                 // Either the pool is simply busy -- the common case, since capacity is small and
                 // marshalling is concurrent -- or a permit was lost when a panicking closure failed
                 // to return its buffer. Both are handled the same way: allocate, and let the pool
