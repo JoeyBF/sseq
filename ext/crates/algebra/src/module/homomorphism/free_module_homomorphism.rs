@@ -150,12 +150,8 @@ where
     /// than the whole thing.
     ///
     /// The caller must guarantee that the image of the basis element is supported within that
-    /// prefix; otherwise `act` will panic on an out-of-bounds write. This is used by [Nassau's
-    /// algorithm](crate::module::homomorphism), which stores each differential truncated to the same
-    /// prefix (valid by minimality, since a generator's differential lands in the radical), so `act`
-    /// stops before writing past `result`. This lets a bidegree be computed while treating the
-    /// target module as if the generators added concurrently in the current internal degree do not
-    /// yet exist.
+    /// prefix; otherwise `act` will panic on an out-of-bounds write. The Nassau resolution in the
+    /// `ext` crate relies on this.
     pub fn apply_to_basis_element_restricted(
         &self,
         result: FpSliceMut,
@@ -163,7 +159,10 @@ where
         input_degree: i32,
         input_index: usize,
     ) {
-        assert!(result.as_slice().len() <= self.target.dimension(input_degree - self.degree_shift));
+        assert!(
+            result.as_slice().len() <= self.target.dimension(input_degree - self.degree_shift),
+            "restricted result longer than target dimension"
+        );
         self.apply_to_basis_element_inner(result, coeff, input_degree, input_index);
     }
 
@@ -191,9 +190,7 @@ where
         matrix
     }
 
-    /// The shared body of [`Self::apply_to_basis_element_restricted`] and
-    /// [`ModuleHomomorphism::apply_to_basis_element`], with no check on the length of `result` (the
-    /// two callers check it differently).
+    /// The body of the two `apply_to_basis_element` variants, with no length check on `result`.
     fn apply_to_basis_element_inner(
         &self,
         result: FpSliceMut,
