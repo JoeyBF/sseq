@@ -532,6 +532,56 @@ fn masked_cols_enabled() -> bool {
     *ON
 }
 
+/// `NASSAU_ONDEMAND_PROBE=1`: measure, without changing behaviour, whether the `sig_ondemand`
+/// build's contribution to `dx` is confined to this signature's `next_mask`. See [`OD_PROBE_IN`].
+fn ondemand_probe() -> bool {
+    static ON: LazyLock<bool> =
+        LazyLock::new(|| std::env::var("NASSAU_ONDEMAND_PROBE").as_deref() == Ok("1"));
+    *ON
+}
+
+/// `NASSAU_ONDEMAND_MASK=1`: build the on-demand rows in masked column coordinates and scatter them
+/// back with `add_unmasked`, instead of launching the multiply at the full output width.
+///
+/// MEASURED UNSOUND, and kept only so the attempt is not silently repeated. `NASSAU_ONDEMAND_PROBE`
+/// on S_2 -> (120, 60) over 2 888 509 consumed rows:
+///
+///     nonzeros 608 889 521   inside_mask 73 420 037 (12.1%)   OUTSIDE_mask 535 469 484 (87.9%)
+///
+/// So 87.9% of what this build contributes to `dx` lands outside the CURRENT signature's mask, and
+/// `zs_dx_init` is right that those columns are live for later signatures -- restricting to
+/// `next_mask` would discard most of the differential. This is not a near miss to be tuned; the
+/// mask is simply the wrong column set for this build.
+///
+/// Enabling it therefore REQUIRES `NASSAU_ONDEMAND_VERIFY=1`, which aborts on the first dropped
+/// column. Without that pairing a wrong `dx` is invisible until the `dx non-zero` gate fires many
+/// bidegrees later, by which point a wrong differential is already in the save.
+fn ondemand_mask_enabled() -> bool {
+    static ON: LazyLock<bool> = LazyLock::new(|| {
+        let on = std::env::var("NASSAU_ONDEMAND_MASK").as_deref() == Ok("1");
+        assert!(
+            !on || ondemand_verify(),
+            "NASSAU_ONDEMAND_MASK=1 requires NASSAU_ONDEMAND_VERIFY=1: masking sig_ondemand with \
+             next_mask measured 87.9% of consumed nonzeros OUTSIDE the mask, so it drops live \
+             columns and writes wrong differentials. Run NASSAU_ONDEMAND_PROBE=1 to re-measure."
+        );
+        on
+    });
+    *ON
+}
+
+/// `NASSAU_ONDEMAND_VERIFY=1`: with [`ondemand_mask_enabled`] on, ALSO build the row set at full
+/// width and check the masked build loses nothing -- every consumed nonzero lies inside
+/// `next_mask`, and the masked row equals the full row gathered through it.
+///
+/// Doubles the on-demand work, so it is a validation-run switch, not a production one. It is the
+/// only thing standing between a wrong mask and a differential that is quietly missing columns.
+fn ondemand_verify() -> bool {
+    static ON: LazyLock<bool> =
+        LazyLock::new(|| std::env::var("NASSAU_ONDEMAND_VERIFY").as_deref() == Ok("1"));
+    *ON
+}
+
 /// Restricted partial-matrix build, dispatching to the GPU Milnor-multiply path when it is compiled
 /// in, opted into (`NASSAU_GPU`), applicable, and the launch is large enough to amortise the fixed
 /// per-launch GPU cost.
@@ -669,6 +719,17 @@ static N_ONDEMAND: AtomicUsize = AtomicUsize::new(0);
 static N_ZS: AtomicUsize = AtomicUsize::new(0);
 static ROWS_SHIFT_BUILD: AtomicUsize = AtomicUsize::new(0);
 static ROWS_ONDEMAND: AtomicUsize = AtomicUsize::new(0);
+/// `NASSAU_ONDEMAND_PROBE=1`: of the nonzero entries the on-demand build actually contributes to
+/// `dx`, how many land INSIDE this signature's `next_mask` and how many outside it.
+///
+/// This decides whether `sig_ondemand` -- 96.2% of all `milnor_multiply` bytes, and the last
+/// unmasked build path -- can be column-restricted like the zero-signature and shift-cache builds.
+/// `zs_dx_init` claims it cannot ("the columns outside this signature's mask are live information,
+/// not slack"), but two neighbouring comments about masking were already stale, so measure it.
+/// A nonzero OUTSIDE count means restricting to `next_mask` would silently drop live data.
+static OD_PROBE_IN: AtomicU64 = AtomicU64::new(0);
+static OD_PROBE_OUT: AtomicU64 = AtomicU64::new(0);
+static OD_PROBE_ROWS: AtomicU64 = AtomicU64::new(0);
 /// Of the shift builds, the ones that may NOT publish (`signature_degree == 1`): they build at
 /// their own narrower bound and are dropped unshared, so each is a private per-signature matrix
 /// held live for the duration of the signature. The heap dump attributes ~164GB to two
@@ -703,7 +764,37 @@ impl Drop for PrivateLive {
     }
 }
 
+/// Report the [`ondemand_probe`] result. Printed unconditionally when the probe ran, because a run
+/// whose whole purpose is this measurement must not be able to finish silently -- the counters that
+/// only emitted at clean exit are how an earlier instrumented run produced nothing at all.
+fn ondemand_probe_report() {
+    if !ondemand_probe() {
+        return;
+    }
+    let (inside, outside, rows) = (
+        OD_PROBE_IN.load(Ordering::Relaxed),
+        OD_PROBE_OUT.load(Ordering::Relaxed),
+        OD_PROBE_ROWS.load(Ordering::Relaxed),
+    );
+    let total = inside + outside;
+    eprintln!(
+        "[ondemand-probe] consumed rows={rows} nonzeros={total} inside_mask={inside} \
+         OUTSIDE_mask={outside} ({:.4}%) -> masking sig_ondemand is {}",
+        if total == 0 {
+            0.0
+        } else {
+            100.0 * outside as f64 / total as f64
+        },
+        if outside == 0 {
+            "SOUND on this workload"
+        } else {
+            "UNSOUND: it would drop live columns"
+        }
+    );
+}
+
 fn shift_stats_report() {
+    ondemand_probe_report();
     if std::env::var("NASSAU_SHIFT_STATS").as_deref() != Ok("1") {
         return;
     }
@@ -3927,19 +4018,116 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                         crate::census::matrix_bytes(basis.len(), next_dim),
                         Ordering::Relaxed,
                     );
-                    let got =
-                        tracing::trace_span!("sig_ondemand", rows = basis.len()).in_scope(|| {
+                    // `sig_ondemand` is the last unmasked build path and 96.2% of all
+                    // `milnor_multiply` bytes (232 606 multiplies / 2 847.7 GB at the FULL output
+                    // width, against 18.8 GB for the already-masked `sig_shift`). Restricting it
+                    // to `next_mask` would be worth ~37x mid-stem and ~340x at the frontier, where
+                    // the full width grows with `t` and the mask does not.
+                    //
+                    // It is only legal if this build contributes nothing outside `next_mask`.
+                    // `zs_dx_init` asserts the opposite -- that those columns are live for LATER
+                    // signatures -- so the masked arm is opt-in, guarded, and aborts rather than
+                    // drop a column. `NASSAU_ONDEMAND_PROBE=1` measures the same condition with no
+                    // behaviour change.
+                    let masked = ondemand_mask_enabled();
+                    let got = tracing::trace_span!(
+                        "sig_ondemand",
+                        rows = basis.len(),
+                        cols = if masked { next_mask.len() } else { next_dim }
+                    )
+                    .in_scope(|| {
+                        if masked {
+                            restricted_partial_matrix_masked_maybe_gpu(
+                                &self.differentials[b.s() - 1],
+                                b.t(),
+                                &basis,
+                                next_dim,
+                                &next_mask,
+                            )
+                        } else {
                             restricted_partial_matrix_maybe_gpu(
                                 &self.differentials[b.s() - 1],
                                 b.t(),
                                 &basis,
                                 next_dim,
                             )
-                        });
+                        }
+                    });
+                    if masked && ondemand_verify() {
+                        // The masked build has already discarded whatever fell outside the mask,
+                        // so the only way to check what was lost is to build it again at full
+                        // width and look. Abort rather than continue: a `dx` missing columns is
+                        // not detected until the `dx non-zero` gate fires in a LATER bidegree, by
+                        // which point the run has written a wrong differential to the save.
+                        let truth = restricted_partial_matrix_maybe_gpu(
+                            &self.differentials[b.s() - 1],
+                            b.t(),
+                            &basis,
+                            next_dim,
+                        );
+                        let mut a = FpVector::new(p, next_mask.len());
+                        for sup in &supports {
+                            for &i in sup {
+                                let k = needed.binary_search(&i).unwrap();
+                                let dropped = truth
+                                    .row(k)
+                                    .iter_nonzero()
+                                    .filter(|(c, _)| next_mask.binary_search(c).is_err())
+                                    .count();
+                                assert_eq!(
+                                    dropped, 0,
+                                    "sig_ondemand masking would DROP {dropped} live column(s) at \
+                                     b={b} sig_idx={sig_idx} row={k}: those columns are read by \
+                                     later signatures, so the masked build is unsound here"
+                                );
+                                a.set_to_zero();
+                                a.as_slice_mut().add_masked(truth.row(k), 1, &next_mask);
+                                // `FpSlice` has no `PartialEq`; at p=2 the nonzero support
+                                // determines the vector, so compare that.
+                                let gathered: Vec<usize> =
+                                    a.iter_nonzero().map(|(i, _)| i).collect();
+                                let built: Vec<usize> =
+                                    got.row(k).iter_nonzero().map(|(i, _)| i).collect();
+                                assert_eq!(
+                                    gathered, built,
+                                    "sig_ondemand masked row disagrees with the gathered full row \
+                                     at b={b} sig_idx={sig_idx} row={k}"
+                                );
+                            }
+                        }
+                    }
+                    if !masked && ondemand_probe() {
+                        // Count only the entries that are actually CONSUMED -- a nonzero in a row
+                        // no generator supports changes nothing, so counting the whole matrix
+                        // would overstate the obstruction.
+                        let (mut inside, mut outside) = (0u64, 0u64);
+                        for sup in &supports {
+                            for &i in sup {
+                                let k = needed.binary_search(&i).unwrap();
+                                for (c, _) in got.row(k).iter_nonzero() {
+                                    if next_mask.binary_search(&c).is_ok() {
+                                        inside += 1;
+                                    } else {
+                                        outside += 1;
+                                    }
+                                }
+                                OD_PROBE_ROWS.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                        OD_PROBE_IN.fetch_add(inside, Ordering::Relaxed);
+                        OD_PROBE_OUT.fetch_add(outside, Ordering::Relaxed);
+                    }
                     for (sup, dx) in supports.iter().zip(dxs.iter_mut()) {
                         for &i in sup {
                             let k = needed.binary_search(&i).unwrap();
-                            dx.as_slice_mut().add(got.row(k), 1);
+                            if masked {
+                                // `add_unmasked` scatters entry `i` of the row to column
+                                // `next_mask[i]`, the inverse of the `add_masked` gather used on
+                                // the pre-masked full matrix. `dx` stays full width throughout.
+                                dx.as_slice_mut().add_unmasked(got.row(k), 1, &next_mask);
+                            } else {
+                                dx.as_slice_mut().add(got.row(k), 1);
+                            }
                         }
                     }
                 }
