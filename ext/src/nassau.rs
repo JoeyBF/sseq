@@ -4328,6 +4328,30 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
     ///
     /// Shared by the wavefront scheduler and the serial [`Self::compute_through_bidegree`] so the
     /// two cannot drift apart on something as consequential as when to give up.
+    /// Kill the process on an unrecoverable failure, without relying on unwinding.
+    ///
+    /// Both callers of [`Self::run_bidegree`] already `panic!` on a fatal failure, and that is not
+    /// enough: the panic unwinds into a shard helper whose `catch_unwind` discards it, so the run
+    /// prints "failing the run" and then keeps going. Observed on job 40157623 -- a GPU allocation
+    /// of 1.5 GB failed, cubecl `unwrap()`ed it and killed its worker thread, and the resolution
+    /// carried on for 2.5 HOURS writing differentials built from uninitialised buffers (one
+    /// bidegree reported 6385 of 6385 generators with `dx != 0`).
+    ///
+    /// That is how a save gets poisoned: not by the allocation failure, which is survivable, but by
+    /// continuing afterwards. A corrupt save is far more expensive than a dead job -- the last one
+    /// went unnoticed through six restarts and cost days, and was only caught by comparing stored
+    /// generator counts against a from-scratch control.
+    ///
+    /// So exit the PROCESS. `exit` rather than `abort`: no core dump is wanted, and the periodic
+    /// snapshot in the run scripts has already preserved everything up to the last flush. Exit code
+    /// 70 is `EX_SOFTWARE`, distinguishable from SLURM's own kills in the job record.
+    fn die(failure: &StepFailure, why: &str) -> ! {
+        use std::io::Write;
+        eprintln!("[nassau] {failure} -- {why}. KILLING THE RUN so it cannot write more.");
+        let _ = std::io::stderr().flush();
+        std::process::exit(70);
+    }
+
     fn run_bidegree(&self, b: Bidegree) -> Option<StepFailure> {
         // Bounded, because a genuine bug must not spin forever. What is
         // retried, and whether it waits first, now comes from [`StepFailure`]
@@ -4378,18 +4402,14 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                 Err(payload) => StepFailure::from_panic(b, payload.as_ref()),
             };
             if !failure.is_retryable() {
-                eprintln!(
-                    "[nassau] {failure} -- not retryable, failing the run"
-                );
-                break Some(failure);
+                Self::die(&failure, "not retryable");
             }
             if attempt >= MAX_ATTEMPTS {
-                eprintln!(
-                    "[nassau] {failure} -- still failing after {MAX_ATTEMPTS} attempts, the last \
-                     of them with the multiply on the CPU. This is not GPU corruption. Failing \
-                     the run."
+                Self::die(
+                    &failure,
+                    "still failing after every attempt, the last with the multiply on the CPU, so \
+                     this is not GPU corruption",
                 );
-                break Some(failure);
             }
             if let Some(d) = failure.backoff() {
                 eprintln!(
