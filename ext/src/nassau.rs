@@ -2086,6 +2086,40 @@ static NOREUSE_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::Atomic
 /// [`resolution::Resolution`](crate::resolution::Resolution). From an API point of view, the main
 /// difference between the two is that this is a chain complex over [`MilnorAlgebra`] over
 /// [`SteenrodAlgebra`](algebra::SteenrodAlgebra).
+/// The authoritative-CPU-attempt switch, in both build configurations.
+///
+/// `milnor_gpu` only exists under the `gpu` feature, so a CPU-only build -- which is what the
+/// correctness tests use, precisely because they must not contend with production for a device --
+/// gets no-ops. `cpu_forced` returns `false` there rather than `true`: without the feature there is
+/// no GPU path to divert, and `false` leaves the existing `on_cpu` decisions exactly as they were.
+#[cfg(feature = "gpu")]
+use algebra::milnor_gpu::{ForceCpuGuard, cpu_forced};
+
+#[cfg(not(feature = "gpu"))]
+fn cpu_forced() -> bool {
+    false
+}
+
+#[cfg(not(feature = "gpu"))]
+struct ForceCpuGuard;
+
+#[cfg(not(feature = "gpu"))]
+impl ForceCpuGuard {
+    fn new() -> Self {
+        Self
+    }
+}
+
+/// Opt out of the authoritative CPU attempt (`NASSAU_NO_CPU_VERIFY=1`).
+///
+/// Default OFF, i.e. verification is on: knowing whether a repeated failure is the GPU or the
+/// algorithm is worth hours on a path that only runs after two failures.
+fn no_cpu_verify() -> bool {
+    static V: LazyLock<bool> =
+        LazyLock::new(|| std::env::var_os("NASSAU_NO_CPU_VERIFY").is_some());
+    *V
+}
+
 /// Why a bidegree failed, in enough detail for the scheduler to decide what to do about it.
 ///
 /// Three quite different things used to arrive as one indistinguishable `panic!`: mathematics that
@@ -2693,7 +2727,7 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
         let guard = blocks::ClaimGuard::new(b, gen_deg);
         let diff = &self.differentials[b.s() - 1];
         let build = |rows: &[usize]| {
-            if speculate::on_cpu() {
+            if speculate::on_cpu() || cpu_forced() {
                 restricted_partial_matrix(diff, b.t(), rows, cols)
             } else {
                 restricted_partial_matrix_maybe_gpu(diff, b.t(), rows, cols)
@@ -2952,7 +2986,10 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
         let guard = speculate::ClaimGuard::new(b);
         // Inside the speculative pool, so the build's own `par_iter`s cannot take workers from the
         // wavefront's pool -- see [`speculate::pool`].
-        let on_cpu = speculate::on_cpu();
+        // `|| cpu_forced()`: this bidegree may be on its authoritative CPU attempt. The read must
+        // happen on THIS thread -- the `install` below hands the closure to a pool worker, which
+        // does not inherit thread-locals.
+        let on_cpu = speculate::on_cpu() || cpu_forced();
         let m = speculate::pool()
             .install(|| self.build_full_restricted(b, target_dim, next_dim, on_cpu));
         speculate::publish(b, m);
@@ -3954,17 +3991,23 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
         // and the same state as a real `dx non-zero`. Unset, which is every production run, this
         // is one `LazyLock` deref of a `None`.
         {
-            static INJECT: LazyLock<Option<(i32, i32)>> = LazyLock::new(|| {
+            // `NASSAU_TEST_PANIC_AT="n,s[,count]"`; count defaults to 1. A count of 2 makes both
+            // GPU attempts fail so the third -- the authoritative CPU one -- actually runs, which
+            // is the only way to exercise that rung deliberately.
+            static INJECT: LazyLock<Option<(i32, i32, usize)>> = LazyLock::new(|| {
                 let v = std::env::var("NASSAU_TEST_PANIC_AT").ok()?;
-                let (n, s) = v.split_once(',')?;
-                Some((n.trim().parse().ok()?, s.trim().parse().ok()?))
+                let mut it = v.split(',');
+                let n = it.next()?.trim().parse().ok()?;
+                let s = it.next()?.trim().parse().ok()?;
+                let c = it.next().and_then(|c| c.trim().parse().ok()).unwrap_or(1);
+                Some((n, s, c))
             });
-            static FIRED: std::sync::atomic::AtomicBool =
-                std::sync::atomic::AtomicBool::new(false);
-            if let Some((n, s)) = *INJECT
+            static FIRED: std::sync::atomic::AtomicUsize =
+                std::sync::atomic::AtomicUsize::new(0);
+            if let Some((n, s, count)) = *INJECT
                 && b.t() - b.s() == n
                 && b.s() == s
-                && !FIRED.swap(true, std::sync::atomic::Ordering::Relaxed)
+                && FIRED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < count
             {
                 // Returns the TYPED failure rather than panicking, so the test exercises the real
                 // path: classification -> `is_retryable` -> retry. A bare `panic!` would be
@@ -4271,9 +4314,30 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
         let mut attempt = 0usize;
         loop {
             attempt += 1;
-            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
-                || self.step_resolution(b),
-            ));
+            // The LAST attempt runs the multiply on the CPU. Two GPU attempts are two rolls of
+            // the same dice and a third would settle nothing; a CPU attempt turns an ambiguous
+            // failure into an answer. It is slow -- a frontier bidegree can take hours -- but it
+            // only runs for a bidegree that has already failed twice, and `cpu_multiply_batch` is
+            // pinned to the GPU result by `cpu_multiply_batch_matches_gpu`.
+            //
+            // `NASSAU_NO_CPU_VERIFY=1` opts out, for when finishing matters more than knowing why.
+            let last = attempt == MAX_ATTEMPTS && !no_cpu_verify();
+            if last {
+                eprintln!(
+                    "[nassau] {b}: final attempt with the multiply on the CPU -- if this succeeds, \
+                     the earlier failures were GPU corruption"
+                );
+            }
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _cpu = last.then(ForceCpuGuard::new);
+                self.step_resolution(b)
+            }));
+            if last && matches!(r, Ok(Ok(()))) {
+                eprintln!(
+                    "[nassau] {b}: succeeded with the multiply on the CPU. The earlier failures \
+                     were GPU corruption, not a bug in the algorithm."
+                );
+            }
             let failure = match r {
                 Ok(Ok(())) => break None,
                 Ok(Err(f)) => f,
@@ -4287,8 +4351,9 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
             }
             if attempt >= MAX_ATTEMPTS {
                 eprintln!(
-                    "[nassau] {failure} -- still failing after \
-                     {MAX_ATTEMPTS} attempts, failing the run"
+                    "[nassau] {failure} -- still failing after {MAX_ATTEMPTS} attempts, the last \
+                     of them with the multiply on the CPU. This is not GPU corruption. Failing \
+                     the run."
                 );
                 break Some(failure);
             }

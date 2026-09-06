@@ -516,6 +516,42 @@ use std::sync::{
 /// slow success. The flag exists purely so in-process observers (the soak test) can distinguish a
 /// context death from an ordinary assertion failure. NOTE: this covers only the cubecl **multiply**;
 /// the RREF path runs on a separate `fp-cuda` runtime and is not gated by this flag.
+thread_local! {
+    /// Force this thread's batch multiplies onto the CPU.
+    ///
+    /// Set for the LAST attempt at a bidegree that has already failed twice (see
+    /// `Resolution::run_bidegree`). The point is not speed, it is authority: a third GPU attempt is
+    /// a third roll of the same dice and tells you nothing, whereas a CPU attempt answers the
+    /// question. If it succeeds, the earlier failures were GPU corruption and we now hold a correct
+    /// result; if it fails the same way, the GPU was never the problem and the run should die
+    /// saying so.
+    ///
+    /// Thread-local rather than global so one bidegree's slow verification does not drag every
+    /// other worker onto the CPU with it.
+    static FORCE_CPU: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether this thread's multiplies are currently forced onto the CPU.
+pub fn cpu_forced() -> bool {
+    FORCE_CPU.with(std::cell::Cell::get)
+}
+
+/// Forces [`cpu_forced`] on for this thread until dropped, restoring whatever it was before.
+pub struct ForceCpuGuard(bool);
+
+impl ForceCpuGuard {
+    pub fn new() -> Self {
+        Self(FORCE_CPU.with(|c| c.replace(true)))
+    }
+}
+
+impl Drop for ForceCpuGuard {
+    fn drop(&mut self) {
+        let prev = self.0;
+        FORCE_CPU.with(|c| c.set(prev));
+    }
+}
+
 static GPU_DISABLED: AtomicBool = AtomicBool::new(false);
 
 /// Whether the GPU multiply has been disabled for the rest of the process (see [`GPU_DISABLED`]).
@@ -4023,6 +4059,11 @@ pub fn multiply_batch_on_gpu_masked(
     products: &[GpuProduct],
 ) -> BatchOutput {
     census_batch(products);
+    // Before anything touches the device: this thread may be running a bidegree's authoritative
+    // CPU attempt, in which case the whole point is that no GPU is involved.
+    if cpu_forced() {
+        return cpu_multiply_batch_masked(algebra, out_cols, col_map, num_rows, products);
+    }
     // Start the prefetcher on first use (no-op unless enabled) and tell it how far the wavefront has
     // got. `r_degree` is the `R` degree this launch needs, so its max IS the enumeration frontier.
     start_prefetch(algebra);
@@ -4105,6 +4146,53 @@ pub fn cpu_multiply_batch(
         }
     }
     BatchOutput::from_limbs(rows.concat(), num_limbs)
+}
+
+/// [`cpu_multiply_batch`], but honouring `col_map` so it can stand in for the masked GPU path.
+///
+/// `cpu_multiply_batch` writes at FULL column indices (`prod.out_offset + i`), while the masked
+/// launch writes at restricted ones. The full width is recoverable at the call site -- it is
+/// `col_map.len()` -- so compute wide and then gather, which is exactly the "full-width launch plus
+/// host-side gather" that `NASSAU_GPU_COL_RESTRICT=0` already performs. That makes this a
+/// transformation the codebase already relies on rather than a new one.
+///
+/// The gather walks SET BITS, not columns: at frontier widths (`full` in the hundreds of
+/// thousands, rows in the millions) a per-column scan would be quadratic enough to matter even on
+/// a path this rare.
+fn cpu_multiply_batch_masked(
+    algebra: &MilnorAlgebra,
+    out_cols: usize,
+    col_map: Option<Arc<[u32]>>,
+    num_rows: usize,
+    products: &[GpuProduct],
+) -> BatchOutput {
+    let Some(map) = col_map else {
+        return cpu_multiply_batch(algebra, out_cols, num_rows, products);
+    };
+    let full = map.len();
+    let wide = cpu_multiply_batch(algebra, full, num_rows, products);
+    let out_limbs = out_cols.div_ceil(32).max(1);
+    let mut rows = vec![0u32; num_rows * out_limbs];
+    for (ri, limbs) in wide.iter_rows().enumerate() {
+        let base = ri * out_limbs;
+        for (li, &word) in limbs.iter().enumerate() {
+            let mut w = word;
+            while w != 0 {
+                let bit = w.trailing_zeros() as usize;
+                w &= w - 1;
+                let c = li * 32 + bit;
+                if c >= full {
+                    break;
+                }
+                let j = map[c];
+                if j != COL_MAP_DROP {
+                    let j = j as usize;
+                    rows[base + j / 32] |= 1u32 << (j % 32);
+                }
+            }
+        }
+    }
+    BatchOutput::from_limbs(rows, out_limbs)
 }
 
 fn multiply_batch_gpu_inner(
@@ -8761,7 +8849,7 @@ mod tests {
             out_degree / 2,
             out_degree - 1,
         ] {
-            let got = multiply_batch_gpu_inner(&algebra, out_dim, num_rows, &products, cap);
+            let got = multiply_batch_gpu_inner(&algebra, out_dim, None, num_rows, &products, cap);
             let transient = products.iter().filter(|p| p.r_degree > cap).count();
             assert_eq!(
                 got,
@@ -8836,6 +8924,97 @@ mod tests {
         );
         eprintln!(
             "cpu_multiply_batch matches GPU: {} products, {num_rows} rows, num_cols={num_cols}",
+            products.len()
+        );
+    }
+
+    /// The MASKED CPU path must match the masked GPU path.
+    ///
+    /// This is the one that matters for the authoritative retry: when a bidegree has failed twice
+    /// and is rerun with the multiply forced onto the CPU, `cpu_multiply_batch_masked` is what
+    /// produces the differential that gets committed. Production runs with
+    /// `NASSAU_GPU_COL_RESTRICT=1`, so the masked path -- not the plain one already covered above --
+    /// is what actually executes, and a bug here would write wrong mathematics on the very path
+    /// meant to rescue wrong mathematics.
+    ///
+    /// The mask keeps a non-contiguous subset so the gather is genuinely exercised: dropped columns
+    /// interleaved with kept ones, and kept indices that do not equal their source indices.
+    #[test]
+    fn cpu_multiply_batch_masked_matches_gpu() {
+        use fp::prime::ValidPrime;
+
+        let p = ValidPrime::new(2);
+        let algebra = Arc::new(MilnorAlgebra::new(p, false));
+        let max_degree = 44;
+        algebra.compute_basis(max_degree);
+        algebra.compute_seqno_tables(max_degree);
+
+        let num_rows = 6;
+        let (deg_a, deg_b) = (24, 20);
+        let (dim_a, dim_b) = (algebra.dimension(deg_a), algebra.dimension(deg_b));
+        let full_cols = dim_a + dim_b;
+
+        let mut products = Vec::new();
+        for (out_deg, out_offset) in [(deg_a, 0usize), (deg_b, dim_a)] {
+            for r_degree in 1..out_deg {
+                let s_degree = out_deg - r_degree;
+                let s_dim = algebra.dimension(s_degree);
+                if s_dim == 0 {
+                    continue;
+                }
+                let r_dim = algebra.dimension(r_degree);
+                for r_idx in 0..r_dim {
+                    if algebra
+                        .basis_element_from_index(r_degree, r_idx)
+                        .p_part
+                        .is_empty()
+                    {
+                        continue;
+                    }
+                    let row = products.len() % num_rows;
+                    products.push(GpuProduct {
+                        r_degree,
+                        r_idx,
+                        s_degree,
+                        term_indices: (0..s_dim).collect(),
+                        row,
+                        out_offset,
+                    });
+                }
+            }
+        }
+
+        // Keep roughly two thirds of the columns, skipping every third, so kept indices are
+        // shifted relative to their sources and drops appear throughout.
+        let kept: Vec<usize> = (0..full_cols).filter(|c| c % 3 != 1).collect();
+        let out_cols = kept.len();
+        let mut map = vec![COL_MAP_DROP; full_cols];
+        for (j, &c) in kept.iter().enumerate() {
+            map[c] = j as u32;
+        }
+        let col_map: Arc<[u32]> = map.into();
+
+        let gpu = multiply_batch_on_gpu_masked(
+            &algebra,
+            out_cols,
+            Some(Arc::clone(&col_map)),
+            num_rows,
+            &products,
+        );
+        let cpu = cpu_multiply_batch_masked(
+            &algebra,
+            out_cols,
+            Some(Arc::clone(&col_map)),
+            num_rows,
+            &products,
+        );
+        assert_eq!(
+            gpu, cpu,
+            "cpu_multiply_batch_masked diverged from the masked GPU multiply"
+        );
+        eprintln!(
+            "cpu_multiply_batch_masked matches GPU: {} products, {num_rows} rows, \
+             full_cols={full_cols} -> out_cols={out_cols}",
             products.len()
         );
     }
