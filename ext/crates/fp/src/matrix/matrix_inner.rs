@@ -687,7 +687,9 @@ impl Matrix {
         #[cfg(feature = "gpu")]
         if p == 2 {
             let (rr_rows, rr_cols) = (self.rows(), self.columns());
-            let rr_big = rr_rows.min(rr_cols) >= 1024;
+            // Log whatever the gate would admit, so the `path=` field covers exactly
+            // the decisions this threshold makes.
+            let rr_big = crate::blas::cuda::rr_worth_gpu(rr_rows, rr_cols);
             // Wrap the GPU reduce in an ENTERED span (not just a completion event) so a wedge
             // *inside* `try_row_reduce` leaves an open `gpu_row_reduce` span with no `close` in the
             // log — distinguishing an RREF hang from a milnor-multiply hang. Inherits the active
@@ -722,7 +724,7 @@ impl Matrix {
                         // stall the run for hours. Production spent days that way at 300% CPU with
                         // both GPUs idle, and nothing in the log distinguished it from the benign
                         // case. Warn loudly on the second one.
-                        if rr_rows.min(rr_cols) >= crate::blas::cuda::rr_threshold() {
+                        if crate::blas::cuda::rr_worth_gpu(rr_rows, rr_cols) {
                             tracing::warn!(
                                 target: "fp::rr",
                                 rows = rr_rows,

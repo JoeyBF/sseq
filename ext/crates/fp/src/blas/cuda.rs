@@ -24,17 +24,51 @@ use crate::{matrix::Matrix, prime::TWO};
 /// host marshalling (bit-repack into TMA tiles + copies) costs more than it saves.
 const DEFAULT_THRESHOLD: usize = 2048;
 
-/// Smallest `min(rows, cols)` for which we attempt the GPU row reduction. Higher
-/// than the matmul threshold: a full reduction is many dependent panel steps, not
-/// one GEMM, so its CPU crossover is later. Re-validated on an H200 post-
-/// optimization (half-rank square, device incl. upload/reduce vs M4RI
-/// `row_reduce`): GPU is 0.57× at n=4096 (a loss) and 1.57× at n=8192 (a win),
-/// so the crossover sits just below 8192. The small-n crossover is bound by fixed
-/// launch/transfer overhead, not the trailing GEMM, so the recent throughput wins
-/// (which scale with n²) did not move it. Measured against single-thread M4RI;
-/// the concurrent CPU path is faster, which only pushes the crossover up — so
-/// 8192 is the safe floor. Override with `FP_CUDA_RR_THRESHOLD`.
-const DEFAULT_RR_THRESHOLD: usize = 8192;
+/// Smallest reduction, in BITS (`rows * cols`), for which we attempt the GPU row
+/// reduction. Override with `FP_CUDA_RR_MIN_BITS`.
+///
+/// This gate used to be `min(rows, cols) >= 8192`, calibrated on half-rank SQUARE
+/// matrices where the short side tracks problem size. It does not here. In the
+/// 0→300 census the wall-weighted aspect ratio `cols / rows-per-block` is 86× at
+/// the median and 3623× at p90, so gating on the short side rejected reductions
+/// carrying far MORE work than the case the gate was tuned to accept: the median
+/// rejected reduce was 1131 × 611_461 (12.2 Gword-ops) and the worst was
+/// 3055 × 1_770_153 (645 MB, 258 Gword-ops), against the 8.6 Gword-ops of the
+/// 8192² square the device won 1.57×. Those went to single-threaded M4RI.
+///
+/// Re-measured on an H200 at real shapes (`fp-cuda`'s `reduce_shapes`, half-rank,
+/// device incl. upload+reduce, against 24-thread `row_reduce_blas3` — a
+/// conservative baseline, since the fallback this gate actually selects is
+/// single-threaded M4RI):
+///
+/// | shape | speedup |
+/// |---|---|
+/// | 16 × 1_600_000 | 7.98× |
+/// | 512 × 1_600_000 | 10.30× |
+/// | 1676 × 1_686_395 | 12.46× |
+/// | 3055 × 1_770_153 | 14.73× |
+///
+/// The device wins at every width tested down to 16 rows. The old square
+/// calibration also failed to reproduce: 4096² measured 3.30× (recorded: 0.57×
+/// loss), so the claim that throughput wins "did not move" the crossover was
+/// wrong — squares now turn over between 1024² (0.85×) and 2048² (1.77×).
+///
+/// By problem size the crossover sits near 0.125–0.5 MB: 0.03 MB loses (0.36×),
+/// 0.125 MB breaks even (0.85×), 0.5 MB wins (1.77×). 2²² bits = 0.5 MB is the
+/// first size that wins outright, and is the default.
+///
+/// Caveat this gate does NOT capture: the device reduction takes the GPU
+/// exclusively, so admitting far more work concentrates it on whichever device
+/// `FP_CUDA_DEVICE` names. With the multiply on separate devices that is the
+/// intent; on a shared device it would serialize (see the co-running note in
+/// [`try_row_reduce`]).
+const DEFAULT_RR_MIN_BITS: u64 = 1 << 22;
+
+/// Legacy minimum on the short side, `FP_CUDA_RR_THRESHOLD`. Defaults to 0, i.e.
+/// inert: the size gate above decides. Kept so scripts that set it keep working,
+/// and so the old behaviour can be restored exactly with
+/// `FP_CUDA_RR_THRESHOLD=8192`.
+const DEFAULT_RR_THRESHOLD: usize = 0;
 
 fn threshold() -> usize {
     std::env::var("FP_CUDA_THRESHOLD")
@@ -48,6 +82,23 @@ pub(crate) fn rr_threshold() -> usize {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(DEFAULT_RR_THRESHOLD)
+}
+
+fn rr_min_bits() -> u64 {
+    std::env::var("FP_CUDA_RR_MIN_BITS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_RR_MIN_BITS)
+}
+
+/// Is this reduction worth the device? Size first, because that is what the
+/// measurements track; the legacy short-side floor applies only if explicitly set.
+pub(crate) fn rr_worth_gpu(rows: usize, cols: usize) -> bool {
+    let t = rr_threshold();
+    if rows < t || cols < t {
+        return false;
+    }
+    (rows as u64).saturating_mul(cols as u64) >= rr_min_bits()
 }
 
 /// The process-wide GPU context, created lazily on first use. `None` if no
@@ -497,8 +548,7 @@ pub(super) fn try_mul(a: &Matrix, b: &Matrix) -> Option<Matrix> {
 pub(crate) fn try_row_reduce(m: &mut Matrix) -> Option<usize> {
     debug_assert_eq!(m.prime(), TWO);
     let (rows, cols) = (m.rows(), m.columns());
-    let t = rr_threshold();
-    if rows < t || cols < t {
+    if !rr_worth_gpu(rows, cols) {
         return None;
     }
     let ctx = context()?;
