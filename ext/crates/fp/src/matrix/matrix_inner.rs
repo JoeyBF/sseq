@@ -756,13 +756,22 @@ impl Matrix {
         // they stood in for were untimed, which made the share of wall time spent reducing
         // unanswerable from the logs.
         //
-        // The criterion here is `min(rows, cols) >= 1024` and is deliberately INDEPENDENT of
-        // `rr_worth_gpu`: instrumentation that moved with the gate would instrument the two arms of
-        // a threshold A/B differently and make them incomparable.
+        // The criterion is `rows * cols >= 2^20` (0.125 MB), and both properties are deliberate.
+        //
+        // BITS, not `min(rows, cols)`: this used to gate on the short side, and that is the same
+        // mistake the row-reduce threshold itself made. It hid exactly the reductions worth seeing.
+        // A measurement run at the s=4 frontier logged ZERO reductions across 165,380 signature
+        // spans, which read as "the frontier performs no reductions"; in fact a 50 x 1_300_000
+        // reduction is 8 MB and its short side is 50, so the span never fired.
+        //
+        // FIXED, and below the gate's 2^22 default, so the span sees reductions on BOTH sides of the
+        // gate. A criterion that moved with `rr_worth_gpu` would instrument the two arms of a
+        // threshold A/B differently and make them incomparable.
         #[cfg(feature = "gpu")]
         let _cpu_rr_span = {
             let (r, c) = (self.rows(), self.columns());
-            (p == 2 && r.min(c) >= 1024).then(|| {
+            let bits = (r as u64).saturating_mul(c as u64);
+            (p == 2 && bits >= (1 << 20)).then(|| {
                 tracing::info_span!(target: "fp::rr", "cpu_row_reduce", rows = r, cols = c).entered()
             })
         };
