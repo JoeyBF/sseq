@@ -749,6 +749,24 @@ impl Matrix {
             }
         }
 
+        // Everything from here down is the CPU M4RI reduction, and until now it was the one path
+        // with no timing at all: `gpu_row_reduce` above wraps `try_row_reduce`, which returns early
+        // when the gate declines, so a DECLINED reduction recorded only the cost of declining. On a
+        // live stem-400 run those 23,221 spans summed to 2.3 seconds while the actual reductions
+        // they stood in for were untimed, which made the share of wall time spent reducing
+        // unanswerable from the logs.
+        //
+        // The criterion here is `min(rows, cols) >= 1024` and is deliberately INDEPENDENT of
+        // `rr_worth_gpu`: instrumentation that moved with the gate would instrument the two arms of
+        // a threshold A/B differently and make them incomparable.
+        #[cfg(feature = "gpu")]
+        let _cpu_rr_span = {
+            let (r, c) = (self.rows(), self.columns());
+            (p == 2 && r.min(c) >= 1024).then(|| {
+                tracing::info_span!(target: "fp::rr", "cpu_row_reduce", rows = r, cols = c).entered()
+            })
+        };
+
         self.initialize_pivots();
 
         let mut empty_rows = Vec::with_capacity(self.rows());
