@@ -27,41 +27,55 @@ const DEFAULT_THRESHOLD: usize = 2048;
 /// Smallest reduction, in BITS (`rows * cols`), for which we attempt the GPU row
 /// reduction. Override with `FP_CUDA_RR_MIN_BITS`.
 ///
-/// This gate used to be `min(rows, cols) >= 8192`, calibrated on half-rank SQUARE
-/// matrices where the short side tracks problem size. It does not here. In the
-/// 0→300 census the wall-weighted aspect ratio `cols / rows-per-block` is 86× at
-/// the median and 3623× at p90, so gating on the short side rejected reductions
-/// carrying far MORE work than the case the gate was tuned to accept: the median
-/// rejected reduce was 1131 × 611_461 (12.2 Gword-ops) and the worst was
-/// 3055 × 1_770_153 (645 MB, 258 Gword-ops), against the 8.6 Gword-ops of the
-/// 8192² square the device won 1.57×. Those went to single-threaded M4RI.
+/// This gate used to be `min(rows, cols) >= 8192`, calibrated on half-rank squares
+/// against single-threaded M4RI: 0.57x at n=4096 (loss), 1.57x at n=8192 (win).
 ///
-/// Re-measured on an H200 at real shapes (`fp-cuda`'s `reduce_shapes`, half-rank,
-/// device incl. upload+reduce, against 24-thread `row_reduce_blas3` — a
-/// conservative baseline, since the fallback this gate actually selects is
-/// single-threaded M4RI):
+/// Two things were wrong with it.
 ///
-/// | shape | speedup |
-/// |---|---|
-/// | 16 × 1_600_000 | 7.98× |
-/// | 512 × 1_600_000 | 10.30× |
-/// | 1676 × 1_686_395 | 12.46× |
-/// | 3055 × 1_770_153 | 14.73× |
+/// **It was stale.** Re-measuring those same square points on an H200
+/// (`fp-cuda`'s `reduce_shapes`, device incl. upload+reduce, against 24-thread
+/// `row_reduce_blas3` -- a conservative baseline, since the fallback this gate
+/// selects is single-threaded M4RI):
 ///
-/// The device wins at every width tested down to 16 rows. The old square
-/// calibration also failed to reproduce: 4096² measured 3.30× (recorded: 0.57×
-/// loss), so the claim that throughput wins "did not move" the crossover was
-/// wrong — squares now turn over between 1024² (0.85×) and 2048² (1.77×).
+/// | n     | speedup |
+/// |-------|---------|
+/// | 1024² | 0.85x (loss) |
+/// | 2048² | 1.77x |
+/// | 4096² | 3.30x |
+/// | 8192² | 5.71x |
 ///
-/// By problem size the crossover sits near 0.125–0.5 MB: 0.03 MB loses (0.36×),
-/// 0.125 MB breaks even (0.85×), 0.5 MB wins (1.77×). 2²² bits = 0.5 MB is the
-/// first size that wins outright, and is the default.
+/// So the crossover is between 1024² and 2048², not "just below 8192" -- the
+/// throughput work moved it by a factor of four to eight, contrary to the old
+/// comment's claim that it had not.
+///
+/// **It tested the wrong quantity.** `min(rows, cols)` is a proxy for problem size
+/// only when the matrix is square. Measured over 78,786 logged reductions from a
+/// stem-400 frontier run, the reductions are mildly rectangular and small:
+///
+/// | | p10 | p50 | p90 | max |
+/// |---|---|---|---|---|
+/// | aspect `cols/rows` | 1.77x | 1.80x | 1.95x | 2.03x |
+/// | `min(rows, cols)` | 1198 | 2789 | 4799 | 8540 |
+/// | size | 0.31 MB | 1.69 MB | 5.05 MB | 16.97 MB |
+///
+/// Against that distribution the old gate admitted **24 of 78,786 reductions
+/// (0.03%)**, sending everything else to single-threaded M4RI, while a size gate
+/// admits 75.8% -- 96.4% of the total reduction volume in bits. The typical
+/// admitted reduction is ~1.7 MB near-square, where the table above says the
+/// device is worth roughly 2-3x. Not more: the large speedups in `reduce_shapes`'
+/// wide rows (8-15x at aspect 500-3000) describe shapes this workload does not
+/// produce at the reduce step, because each signature's reduction is
+/// column-restricted by that signature's mask.
+///
+/// 2²² bits = 0.5 MB is the default: it is the first size that wins outright
+/// (2048² measures 1.77x, 1024² at 0.125 MB still loses), and it sits at about
+/// p20 of the observed size distribution.
 ///
 /// Caveat this gate does NOT capture: the device reduction takes the GPU
 /// exclusively, so admitting far more work concentrates it on whichever device
-/// `FP_CUDA_DEVICE` names. With the multiply on separate devices that is the
-/// intent; on a shared device it would serialize (see the co-running note in
-/// [`try_row_reduce`]).
+/// `FP_CUDA_DEVICE` names, and reductions queue against each other. With the
+/// multiply on separate devices that is the intent; on a shared device it would
+/// serialize (see the co-running note in [`try_row_reduce`]).
 const DEFAULT_RR_MIN_BITS: u64 = 1 << 22;
 
 /// Legacy minimum on the short side, `FP_CUDA_RR_THRESHOLD`. Defaults to 0, i.e.
