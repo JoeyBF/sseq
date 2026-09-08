@@ -1893,6 +1893,33 @@ fn enum_split_enabled() -> bool {
     *E
 }
 
+/// `NASSAU_GPU_CS_TRANSPOSED=1`: store `col_sums`/`masks` column-major over MATRICES.
+///
+/// The multiply reads these two arrays at `base + m * len + j`, so consecutive lanes -- which take
+/// consecutive matrices (`m_base = (local % mg_count) * MATRIX_GROUP`) -- are `len` u16 apart. At a
+/// fixed `j` a warp therefore touches 32 different rows and pulls 32 sectors to use 2 bytes of each.
+/// ncu on a stem-400 frontier launch: the four `LDG.E.U16.CONSTANT` loads (two matrices x
+/// {col_sums, masks}) waste 12-16x and carry 82-86% of ALL excessive sectors in the kernel, with an
+/// estimated 38-65% speedup available. The 16x is exactly diagnostic -- a 32-byte sector holds
+/// sixteen u16.
+///
+/// Transposed to `base + j * num_mats + m`, consecutive lanes are adjacent, so a warp's 64 matrices
+/// (MATRIX_GROUP = 2) read 128 contiguous bytes = 4 sectors instead of 64.
+///
+/// The write side costs nothing: `enumerate_admissible_kernel`'s stores are ALREADY uncoalesced at
+/// 2.0 of 32 bytes per sector (ncu Est. Speedup 1.988%), so reordering them cannot make it worse.
+/// That kernel's real problem is elsewhere -- 838 ms at 1.52% compute, 0.72% memory pipes and 2.45%
+/// occupancy, i.e. latency-bound and 99% idle.
+///
+/// Off by default until the A/B lands. Both writers (this host path and the device enumeration) and
+/// the reader must agree, so the flag is read once and threaded through as a comptime kernel
+/// parameter rather than branched per access.
+fn cs_transposed() -> bool {
+    static T: LazyLock<bool> =
+        LazyLock::new(|| std::env::var("NASSAU_GPU_CS_TRANSPOSED").as_deref() == Ok("1"));
+    *T
+}
+
 /// A 1-element buffer standing in for the split inputs of an UNSPLIT enumeration launch.
 ///
 /// `split == false` is comptime, so every read of `t_slot`/`t_seed`/`r_split` is compiled out and
@@ -3100,8 +3127,28 @@ fn resident_append(p_part: PPart, cs_len: usize, mk_len: usize, cs: &[u32], mk: 
         host.deg_bytes.resize(deg + 1, 0);
     }
     host.deg_bytes[deg] += num_mats * (cs_len + mk_len) as u64 * size_of::<u16>() as u64;
-    host.cs_pending[dev].extend(cs.iter().map(|&v| narrow_u16(v)));
-    host.mk_pending[dev].extend(mk.iter().map(|&v| narrow_u16(v)));
+    // Layout: matrix-major by default (`m * len + j`), column-major over matrices under
+    // [`cs_transposed`] (`j * num_mats + m`) so the multiply's lanes read adjacent u16.
+    if cs_transposed() {
+        let nm = num_mats as usize;
+        let csp = &mut host.cs_pending[dev];
+        csp.reserve(cs.len());
+        for j in 0..cs_len {
+            for m in 0..nm {
+                csp.push(narrow_u16(cs[m * cs_len + j]));
+            }
+        }
+        let mkp = &mut host.mk_pending[dev];
+        mkp.reserve(mk.len());
+        for j in 0..mk_len {
+            for m in 0..nm {
+                mkp.push(narrow_u16(mk[m * mk_len + j]));
+            }
+        }
+    } else {
+        host.cs_pending[dev].extend(cs.iter().map(|&v| narrow_u16(v)));
+        host.mk_pending[dev].extend(mk.iter().map(|&v| narrow_u16(v)));
+    }
     host.cs_len[dev] += cs.len();
     host.mk_len[dev] += mk.len();
     host.index.insert(p_part, info);
@@ -3720,6 +3767,10 @@ fn multiply_batch_kernel(
     // to t~510, but a 9th xi appears at t>=511 and it becomes 17, then 18 past 1023. A fixed 16
     // would silently truncate at stem 300 — wrong answers, no error. Deriving it per launch keeps
     // the occupancy win at every degree, and the host asserts it fits [`WORKING_CAP`].
+    //
+    // Comptime so the two index forms below compile to one address chain each, with no runtime
+    // branch in the innermost loop. See [`cs_transposed`] for why the transposed form exists.
+    #[comptime] cs_transposed: bool,
 ) {
     let k = ABSOLUTE_POS;
     let num_products = prod_pair_start.len() - 1;
@@ -3865,7 +3916,11 @@ fn multiply_batch_kernel(
                         cs13,
                         cs14,
                         cs15,
-                        cs_base + (m_base + mm) * cs_len + j,
+                        if cs_transposed {
+                            cs_base + j * num_mats + m_base + mm
+                        } else {
+                            cs_base + (m_base + mm) * cs_len + j
+                        },
                         seg_elems,
                         num_segs,
                     ));
@@ -3888,7 +3943,11 @@ fn multiply_batch_kernel(
                         mk13,
                         mk14,
                         mk15,
-                        mk_base + (m_base + mm) * mk_len + j,
+                        if cs_transposed {
+                            mk_base + j * num_mats + m_base + mm
+                        } else {
+                            mk_base + (m_base + mm) * mk_len + j
+                        },
                         seg_elems,
                         num_segs,
                     ));
@@ -5795,6 +5854,9 @@ fn multiply_batch_block<'a>(
                         BufferArg::from_raw_parts(psh_h, pp_shift_len),
                         BufferArg::from_raw_parts(pms_h, pp_shift_len),
                         work_cap.min(PPART_MAX_LEN),
+                        // Resident only: the transient master is written by the enumeration
+                        // kernel, whose split mode scatters one R across threads.
+                        cs_transposed() && mode == MasterMode::Resident,
                     );
                 }
 
