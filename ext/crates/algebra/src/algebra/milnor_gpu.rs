@@ -1920,6 +1920,25 @@ fn cs_transposed() -> bool {
     *T
 }
 
+/// `NASSAU_GPU_SEG_HOIST=1`: split the segment once per array per thread instead of per access.
+///
+/// [`seg_read_u16`] recomputes `o / seg_elems` and `o % seg_elems` on every call from a `usize`
+/// offset, and the multiply's gather loop calls it 3 x WORKING_CAP times per thread. The segment is
+/// loop-INVARIANT, though: an `R`'s `col_sums`/`masks` block never straddles a segment (the
+/// transient layout asserts `cs_span <= seg_elems_layout` and starts a new segment rather than split
+/// an `R`), so every read a thread makes lands in the same one.
+///
+/// Hoisting it also lets the per-`j` offset arithmetic run in `u32`: within a segment offsets are
+/// below `seg_elems = 2^31`. That matters because the SASS carries the 64-bit form everywhere --
+/// `ISETP...EX` pairs for bound tests, `IMAD.WIDE` for indices, `LEA`+`LEA.HI.X` for addresses --
+/// about ten instructions of addressing per two bytes loaded, against an opcode mix where only
+/// 13.1% of instructions are the actual algebra.
+fn seg_hoist() -> bool {
+    static H: LazyLock<bool> =
+        LazyLock::new(|| std::env::var("NASSAU_GPU_SEG_HOIST").as_deref() == Ok("1"));
+    *H
+}
+
 /// A 1-element buffer standing in for the split inputs of an UNSPLIT enumeration launch.
 ///
 /// `split == false` is comptime, so every read of `t_slot`/`t_seed`/`r_split` is compiled out and
@@ -3779,6 +3798,9 @@ fn multiply_batch_kernel(
     // Comptime so the two index forms below compile to one address chain each, with no runtime
     // branch in the innermost loop. See [`cs_transposed`] for why the transposed form exists.
     #[comptime] cs_transposed: bool,
+    // Comptime: resolve the segment once per array per thread rather than per access, with the
+    // offset arithmetic narrowed to u32. See [`seg_hoist`].
+    #[comptime] seg_hoist: bool,
 ) {
     let k = ABSOLUTE_POS;
     let num_products = prod_pair_start.len() - 1;
@@ -3889,6 +3911,17 @@ fn multiply_batch_kernel(
         }
     }
 
+    // Segment split, hoisted. An `R`'s col_sums/masks never straddle a segment, so this is
+    // constant for every read this thread makes; and within a segment offsets fit u32.
+    let cs_seg = u32::cast_from(cs_base / seg_elems);
+    let mk_seg = u32::cast_from(mk_base / seg_elems);
+    let cs_loc0 = u32::cast_from(cs_base % seg_elems);
+    let mk_loc0 = u32::cast_from(mk_base % seg_elems);
+    let num_mats_u = u32::cast_from(num_mats);
+    let m_base_u = u32::cast_from(m_base);
+    let cs_len_u = u32::cast_from(cs_len);
+    let mk_len_u = u32::cast_from(mk_len);
+
     let mut working = Array::<u64>::new(MATRIX_GROUP * TERM_GROUP);
     let mut rejected = Array::<u32>::new(MATRIX_GROUP * TERM_GROUP);
     #[unroll]
@@ -3898,6 +3931,9 @@ fn multiply_batch_kernel(
     }
 
     for j in 0..cols {
+        // u32 view of the loop counter: the hoisted path does its offset arithmetic in 32 bits,
+        // which is what removes the IMAD.WIDE / LEA.HI.X pairs around every load.
+        let ju = u32::cast_from(j);
         // One `col_sums`/`masks` pair per matrix in the tile, shared by every term.
         let mut cs = Array::<u32>::new(MATRIX_GROUP);
         let mut mk = Array::<u32>::new(MATRIX_GROUP);
@@ -3907,58 +3943,56 @@ fn multiply_batch_kernel(
             let mut k = 0u32;
             if m_base + mm < num_mats {
                 if j < cs_len {
-                    c = u32::cast_from(seg_read_u16(
-                        cs0,
-                        cs1,
-                        cs2,
-                        cs3,
-                        cs4,
-                        cs5,
-                        cs6,
-                        cs7,
-                        cs8,
-                        cs9,
-                        cs10,
-                        cs11,
-                        cs12,
-                        cs13,
-                        cs14,
-                        cs15,
-                        if cs_transposed {
-                            cs_base + j * num_mats + m_base + mm
+                    let mmu = u32::cast_from(mm);
+                    if seg_hoist {
+                        let off = if cs_transposed {
+                            cs_loc0 + ju * num_mats_u + m_base_u + mmu
                         } else {
-                            cs_base + (m_base + mm) * cs_len + j
-                        },
-                        seg_elems,
-                        num_segs,
-                    ));
+                            cs_loc0 + (m_base_u + mmu) * cs_len_u + ju
+                        };
+                        c = u32::cast_from(seg_read_u16_at(
+                            cs0, cs1, cs2, cs3, cs4, cs5, cs6, cs7, cs8, cs9, cs10, cs11, cs12,
+                            cs13, cs14, cs15, cs_seg, off, num_segs,
+                        ));
+                    } else {
+                        c = u32::cast_from(seg_read_u16(
+                            cs0, cs1, cs2, cs3, cs4, cs5, cs6, cs7, cs8, cs9, cs10, cs11, cs12,
+                            cs13, cs14, cs15,
+                            if cs_transposed {
+                                cs_base + j * num_mats + m_base + mm
+                            } else {
+                                cs_base + (m_base + mm) * cs_len + j
+                            },
+                            seg_elems,
+                            num_segs,
+                        ));
+                    }
                 }
                 if j < mk_len {
-                    k = u32::cast_from(seg_read_u16(
-                        mk0,
-                        mk1,
-                        mk2,
-                        mk3,
-                        mk4,
-                        mk5,
-                        mk6,
-                        mk7,
-                        mk8,
-                        mk9,
-                        mk10,
-                        mk11,
-                        mk12,
-                        mk13,
-                        mk14,
-                        mk15,
-                        if cs_transposed {
-                            mk_base + j * num_mats + m_base + mm
+                    let mmu2 = u32::cast_from(mm);
+                    if seg_hoist {
+                        let off = if cs_transposed {
+                            mk_loc0 + ju * num_mats_u + m_base_u + mmu2
                         } else {
-                            mk_base + (m_base + mm) * mk_len + j
-                        },
-                        seg_elems,
-                        num_segs,
-                    ));
+                            mk_loc0 + (m_base_u + mmu2) * mk_len_u + ju
+                        };
+                        k = u32::cast_from(seg_read_u16_at(
+                            mk0, mk1, mk2, mk3, mk4, mk5, mk6, mk7, mk8, mk9, mk10, mk11, mk12,
+                            mk13, mk14, mk15, mk_seg, off, num_segs,
+                        ));
+                    } else {
+                        k = u32::cast_from(seg_read_u16(
+                            mk0, mk1, mk2, mk3, mk4, mk5, mk6, mk7, mk8, mk9, mk10, mk11, mk12,
+                            mk13, mk14, mk15,
+                            if cs_transposed {
+                                mk_base + j * num_mats + m_base + mm
+                            } else {
+                                mk_base + (m_base + mm) * mk_len + j
+                            },
+                            seg_elems,
+                            num_segs,
+                        ));
+                    }
                 }
             }
             cs[mm] = c;
@@ -5890,6 +5924,7 @@ fn multiply_batch_block<'a>(
                         // Both masters now: `resident_append` transposes the resident one and
                         // `enumerate_admissible_kernel` the transient one.
                         cs_transposed(),
+                        seg_hoist(),
                     );
                 }
 
@@ -6268,6 +6303,73 @@ fn seg_read_u16(
         } else {
             v = s15[local];
         }
+    }
+    v
+}
+
+#[cube]
+#[allow(clippy::too_many_arguments)]
+/// [`seg_read_u16`] with the segment already resolved: `local` is an offset WITHIN `seg`, in u32.
+///
+/// Same static-branch chain, minus the division and the 64-bit offset arithmetic. Callers hoist the
+/// split out of their loop; see [`seg_hoist`] for why that is sound.
+fn seg_read_u16_at(
+    s0: &[u16],
+    s1: &[u16],
+    s2: &[u16],
+    s3: &[u16],
+    s4: &[u16],
+    s5: &[u16],
+    s6: &[u16],
+    s7: &[u16],
+    s8: &[u16],
+    s9: &[u16],
+    s10: &[u16],
+    s11: &[u16],
+    s12: &[u16],
+    s13: &[u16],
+    s14: &[u16],
+    s15: &[u16],
+    seg: u32,
+    local: u32,
+    #[comptime] num_segs: usize,
+) -> u16 {
+    let i = usize::cast_from(local);
+    let mut v = 0u16;
+    if num_segs == 1 {
+        v = s0[i];
+    } else if seg == 0 {
+        v = s0[i];
+    } else if num_segs > 1 && seg == 1 {
+        v = s1[i];
+    } else if num_segs > 2 && seg == 2 {
+        v = s2[i];
+    } else if num_segs > 3 && seg == 3 {
+        v = s3[i];
+    } else if num_segs > 4 && seg == 4 {
+        v = s4[i];
+    } else if num_segs > 5 && seg == 5 {
+        v = s5[i];
+    } else if num_segs > 6 && seg == 6 {
+        v = s6[i];
+    } else if num_segs > 7 && seg == 7 {
+        v = s7[i];
+    } else if num_segs > 8 && seg == 8 {
+        v = s8[i];
+    } else if num_segs > 9 && seg == 9 {
+        v = s9[i];
+    } else if num_segs > 10 && seg == 10 {
+        v = s10[i];
+    } else if num_segs > 11 && seg == 11 {
+        v = s11[i];
+    } else if num_segs > 12 && seg == 12 {
+        v = s12[i];
+    } else if num_segs > 13 && seg == 13 {
+        v = s13[i];
+    } else if num_segs > 14 && seg == 14 {
+        v = s14[i];
+    } else {
+        v = s15[i];
     }
     v
 }
