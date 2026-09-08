@@ -1548,6 +1548,41 @@ static COLD_COUNT: LazyLock<RwLock<HashMap<PPart, (u32, u32, u32)>>> =
 /// consumes them) so no thread walks the suffix at all.
 const ENUM_SPLIT_TARGET: usize = 64;
 
+/// [`ENUM_SPLIT_TARGET`], overridable by `NASSAU_GPU_ENUM_SPLIT_TARGET` (minimum 2).
+///
+/// CORRECTION to the `S^2/2` story above. That term is total work ACROSS threads, and this kernel's
+/// duration is a MAX, not a sum -- the longest thread walks only `S` suffix steps (thread `k` walks
+/// `k`), then `N/S` chain steps. So the critical path is `S + N/S`, minimised at `S = sqrt(N)`, and
+/// with `N ~ 4000` that is ~63. THAT is why 64 is the peak, not the quadratic total work: on a
+/// device at `Waves Per SM = 0.002`, extra work on otherwise-idle threads is free.
+///
+/// The distinction matters because it kills the "seed pre-pass" fix the table above proposes. A
+/// pre-pass (one launch snapshots each seed's state, a second consumes it) does not REMOVE the
+/// suffix walk, it RELOCATES it: `S` steps in launch one plus `N/S` in launch two is the same
+/// critical path, plus an extra launch that cannot overlap on a single stream. Built and measured
+/// (stem-120 harness, `enum_dev`, prepass engaged -- launches doubled 4089 -> 8210 as designed):
+///
+/// | prepass | seeds/R | enum_dev |
+/// |---------|---------|----------|
+/// | off     | 64      |  5.6 s   |
+/// | on      | 64      | 10.5 s   |
+/// | on      | 256     | 24.8 s   |
+/// | on      | 1024    | 61.6 s   |
+///
+/// Monotonically worse, exactly as `S + N/S` predicts once `S` exceeds `sqrt(N)`. Reverted; do not
+/// rebuild it. Beating `sqrt(N)` needs UNRANKING -- computing the odometer state at index `k`
+/// directly, without stepping to it -- which is a combinatorics problem, not a scheduling one.
+fn enum_split_target() -> usize {
+    static T: LazyLock<usize> = LazyLock::new(|| {
+        std::env::var("NASSAU_GPU_ENUM_SPLIT_TARGET")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|&v| v >= 2)
+            .unwrap_or(ENUM_SPLIT_TARGET)
+    });
+    *T
+}
+
 /// Fresh odometer state for `p_part`: `(matrix, totals, col_sums, masks, rows, cols)`.
 #[allow(clippy::type_complexity)]
 fn odometer_init(p_part: &[u32]) -> (Vec<u32>, Vec<u32>, Vec<u32>, Vec<u32>, usize, usize) {
@@ -1901,7 +1936,7 @@ fn split_plan(p_part: PPart, num_mats: u32) -> Option<(u32, Arc<[u32]>)> {
         return Some(e.clone());
     }
     let pp: Vec<u32> = p_part.iter().collect();
-    let sp = heuristic_split_pos(&pp, ENUM_SPLIT_TARGET);
+    let sp = heuristic_split_pos(&pp, enum_split_target());
     let starts: Arc<[u32]> = seed_starts(&pp, sp).into();
     let e = (sp as u32, starts);
     SPLIT_PLAN
