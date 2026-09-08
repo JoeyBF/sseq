@@ -1842,12 +1842,42 @@ fn seed_starts(p_part: &[u32], sp: usize) -> Vec<u32> {
 /// confining the split to the long tail keeps both costs proportional to the work they remove.
 /// Overridable by `NASSAU_GPU_ENUM_SPLIT_MIN` — set it to 1 to force EVERY `R` down the split path,
 /// which is what makes a small end-to-end run an actual test of the split rather than a vacuous one.
+///
+/// TUNED 2048 -> 128. The old value was far too conservative: `enumerate_admissible_kernel` is ~96%
+/// of GPU kernel time (ncu, and confirmed host-side by `enum_dev`), a launch's duration is its
+/// LONGEST single `R` chain, and at 2048 nearly every `R` in a launch was left unsplit — including,
+/// routinely, the long pole that sets the duration. Measured on `enum_dev`, theta=0, 2 reps:
+///
+/// | split_min | enum_dev @120 | enum_dev @150 | blocks/launch @150 | waves/SM @150 |
+/// |-----------|---------------|---------------|--------------------|---------------|
+/// | 2048      | 16.2 s        | 194.4 196.2 s | 113                | 0.036         |
+/// | 512       |  8.2 s        | —             | —                  | —             |
+/// | **128**   | **5.75 s**    | **75.3 76.1 s**| 740               | 0.234         |
+/// | 32        |  5.65 s       | 75.5 75.8 s   | 993                | 0.313         |
+/// | 1         |  5.8 s        | —             | —                  | —             |
+///
+/// 2.8x at stem 120 and 2.58x at stem 150 — it does NOT decay with stem the way the `MIN_WORK`
+/// retune did (2.2x at 110-130, 3x SLOWER at 150-170), which is why this one is safe to default.
+/// Returns flatten below 128 and 1 is marginally worse than 32, as seed memoisation and marshal
+/// cost start to bite.
+///
+/// End-to-end, stem 150 / theta=0, measurement sync OFF, interleaved, 3 rounds:
+///
+/// | split_min | wall              | mean    | fence mean |
+/// |-----------|-------------------|---------|------------|
+/// | 2048      | 325, 325, 334 s   | 328.0 s | 377.7 s    |
+/// | 128       | 308, 284, 286 s   | 292.7 s |  99.5 s    |
+///
+/// -10.8% wall with no overlap between the arms (worst 128 beats best 2048). Wall gains far less
+/// than `fence` does (3.8x) because the run is near its DAG minimum at this stem — removing GPU
+/// work partly buys idle. The frontier is documented as genuinely GPU-bound, so it should convert
+/// better there, but that is untested.
 fn enum_split_min_mats() -> u32 {
     static M: LazyLock<u32> = LazyLock::new(|| {
         std::env::var("NASSAU_GPU_ENUM_SPLIT_MIN")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(2048)
+            .unwrap_or(128)
     });
     *M
 }
@@ -7462,8 +7492,13 @@ mod tests {
                 BufferArg::from_raw_parts(ts_h, n_t),
                 BufferArg::from_raw_parts(tk_h, n_t),
                 BufferArg::from_raw_parts(rsp_h, n_r),
+                // Transposed-layout inputs. `transposed` is comptime false here, so these are
+                // never indexed and a 1-element dummy satisfies the signature.
+                BufferArg::from_raw_parts(enum_split_dummy(&client), 1),
+                BufferArg::from_raw_parts(enum_split_dummy(&client), 1),
                 1,
                 split,
+                false,
             );
         }
         // Truncate off the `max(1)` padding element present when a batch has zero col_sums / masks (an
@@ -7633,7 +7668,10 @@ mod tests {
                     BufferArg::from_raw_parts(dmy_h.clone(), 1),
                     BufferArg::from_raw_parts(dmy_h.clone(), 1),
                     BufferArg::from_raw_parts(dmy_h.clone(), 1),
+                    BufferArg::from_raw_parts(dmy_h.clone(), 1),
+                    BufferArg::from_raw_parts(dmy_h.clone(), 1),
                     emit,
+                    false,
                     false,
                 );
             }
@@ -7982,8 +8020,11 @@ mod tests {
                 0u32,
                 BufferArg::from_raw_parts(dmy_h.clone(), 1),
                 BufferArg::from_raw_parts(dmy_h.clone(), 1),
+                BufferArg::from_raw_parts(dmy_h.clone(), 1),
+                BufferArg::from_raw_parts(dmy_h.clone(), 1),
                 BufferArg::from_raw_parts(dmy_h, 1),
                 1,
+                false,
                 false,
             );
         }
@@ -8474,8 +8515,11 @@ mod tests {
                             BufferArg::from_raw_parts(ts_h, n_t),
                             BufferArg::from_raw_parts(tk_h, n_t),
                             BufferArg::from_raw_parts(rsp_h, n_r),
+                            BufferArg::from_raw_parts(enum_split_dummy(&client), 1),
+                            BufferArg::from_raw_parts(enum_split_dummy(&client), 1),
                             1,
                             a == 1,
+                            false,
                         );
                     }
                     let _ = client.read_one(cnt_h).unwrap();
