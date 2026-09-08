@@ -750,6 +750,25 @@ static ENUM_BLOCKS: AtomicU64 = AtomicU64::new(0);
 /// Threads issued across all enumeration launches. Equals `ENUM_RS` when the odometer split is off,
 /// and exceeds it by the split's expansion factor when it is on.
 static ENUM_THREADS_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// Time attributable to ENUMERATION rather than to the multiply, so `[batch-stats]` can tell them
+/// apart.
+///
+/// It could not before, and that is a trap rather than a gap: `enumerate_admissible_kernel` is
+/// launched INSIDE [`multiply_batch_block`], so `device`/`launch`/`fence` -- and the
+/// `milnor_multiply` span -- all bill enum time to the multiply. Reading any of those as a
+/// multiply-kernel cost overstates it by more than an order of magnitude; measured per-kernel with
+/// ncu, enum is ~96% of GPU kernel time and the multiply ~4%, which matches this module's own
+/// "~99% of GPU kernel time" note above.
+///
+/// `ENUM_LAUNCH_US` is host time inside the transient enumeration region: buffer allocation plus
+/// submission, but NOT device execution, since launches are async. Subtract it from `launch` to get
+/// the multiply's own submission cost.
+static ENUM_LAUNCH_US: AtomicU64 = AtomicU64::new(0);
+/// Device time for the enumeration launches, collected only when [`enum_timing`] is on: the
+/// enumeration region then syncs before returning, so this is real kernel time and the `fence` that
+/// follows is left measuring the MULTIPLY alone. Off by default because the sync serialises the
+/// pipeline it is measuring.
+static ENUM_DEVICE_US: AtomicU64 = AtomicU64::new(0);
 /// Inside-the-worker breakdown of `exec`, so "the worker is the bottleneck" can be turned into
 /// "the worker is doing THIS".
 ///
@@ -1936,6 +1955,18 @@ fn cs_transposed() -> bool {
 fn seg_hoist() -> bool {
     static H: LazyLock<bool> =
         LazyLock::new(|| std::env::var("NASSAU_GPU_SEG_HOIST").as_deref() == Ok("1"));
+    *H
+}
+
+/// `NASSAU_GPU_ENUM_TIMING=1`: sync at the end of the transient enumeration region so its device
+/// time lands in `ENUM_DEVICE_US` instead of in the multiply's `fence`.
+///
+/// A measurement mode, not a tuning knob. The sync serialises enumeration against the multiply that
+/// follows, which is exactly the overlap the pipeline exists to create, so it makes the run slower
+/// while it makes the split visible. Leave it off in production; turn it on to attribute GPU time.
+fn enum_timing() -> bool {
+    static H: LazyLock<bool> =
+        LazyLock::new(|| std::env::var("NASSAU_GPU_ENUM_TIMING").as_deref() == Ok("1"));
     *H
 }
 
@@ -5507,6 +5538,11 @@ fn multiply_batch_block<'a>(
                         (pad_u16(full(cs_segs)), pad_u16(full(mk_segs)))
                     }
                     MasterMode::Transient => {
+                        // Everything in this arm is ENUMERATION, and it is billed separately from
+                        // here on: it sits inside the multiply's `launch`/`fence`, which is why
+                        // those numbers -- and the `milnor_multiply` span -- have always read as
+                        // "multiply" while being ~96% enum. See [`ENUM_LAUNCH_US`].
+                        let t_enum = std::time::Instant::now();
                         // The enumeration launch is issued before the multiply on this same stream, so the
                         // scratch is fully written when the multiply reads it (one-stream launches are
                         // ordered, as with `zero_u32` below).
@@ -5615,6 +5651,19 @@ fn multiply_batch_block<'a>(
                                 );
                             }
                         }
+                        // Optional: make the enum kernel's DEVICE time observable. Without this the
+                        // launches are async and only their submission cost is billed here, leaving
+                        // execution to surface later in the multiply's `fence`.
+                        if enum_timing() {
+                            let t_sync = std::time::Instant::now();
+                            let _ = cubecl_common::reader::read_sync(client.sync());
+                            ENUM_DEVICE_US.fetch_add(
+                                t_sync.elapsed().as_micros() as u64,
+                                Ordering::Relaxed,
+                            );
+                        }
+                        ENUM_LAUNCH_US
+                            .fetch_add(t_enum.elapsed().as_micros() as u64, Ordering::Relaxed);
                         (pad_u16(cs_segs), pad_u16(mk_segs))
                     }
                 };
@@ -6115,6 +6164,12 @@ fn multiply_batch_block<'a>(
                     BATCH_LAUNCH_US.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6;
                 let fence_s =
                     BATCH_FENCE_US.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6;
+                // Enum vs multiply. `enum_launch` is host submission time for the enumeration
+                // region; `enum_dev` is its device time and is 0 unless NASSAU_GPU_ENUM_TIMING=1
+                // (and then it is INCLUDED in enum_launch, which wraps it). With timing on,
+                // `fence` is left measuring the multiply alone -- that pair is the whole point.
+                let enum_launch_s = ENUM_LAUNCH_US.load(Ordering::Relaxed) as f64 / 1e6;
+                let enum_dev_s = ENUM_DEVICE_US.load(Ordering::Relaxed) as f64 / 1e6;
                 let el = ENUM_LAUNCHES.load(Ordering::Relaxed);
                 let erm = ENUM_RS_MAX.load(Ordering::Relaxed);
                 let (pf_n, pf_d) = prefetch_stats();
@@ -6131,7 +6186,8 @@ fn multiply_batch_block<'a>(
                      lock={:.0}% device={:.0}% pairs={pairs} (marshal={marshal_s:.1}s \
                      wait={wait_s:.1}s) queue={queue_s:.1}s exec={exec_s:.1}s | queue={:.0}% \
                      exec={:.0}% depth mean={:.1} max={depth_max} | launch={launch_s:.1}s \
-                     fence={fence_s:.1}s pipeline={:.0}% | intern={:.1}s basis={:.1}s tgei={:.1}s \
+                     fence={fence_s:.1}s pipeline={:.0}% | enum_launch={enum_launch_s:.1}s \
+                     enum_dev={enum_dev_s:.1}s enum={:.0}% of launch | intern={:.1}s basis={:.1}s tgei={:.1}s \
                      | enum launches={el} Rs/launch mean={:.0} max={erm} blocks/launch mean={:.0} \
                      waves/SM={:.3} | prefetched={pf_n} to_degree={pf_d} batches={pfb_n} \
                      Rs/batch={pfb_mean} max_batch={pfb_max}",
@@ -6146,6 +6202,10 @@ fn multiply_batch_block<'a>(
                     // launches. ~100% is a full pipeline; the pre-change one-kernel-deep behaviour
                     // drives this toward 0 as callers pile up.
                     100.0 * fence_s / (launch_s + fence_s).max(1e-9),
+                    // How much of submission is enumeration. The multiply's own submission cost is
+                    // `launch - enum_launch`; anything read off `launch` without this subtraction is
+                    // mostly enum.
+                    100.0 * enum_launch_s / launch_s.max(1e-9),
                     BATCH_INTERN_US.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6,
                     BATCH_BASIS_US.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6,
                     BATCH_TGEI_US.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6,
