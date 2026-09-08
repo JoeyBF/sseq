@@ -2435,8 +2435,11 @@ fn enumerate_counts_gpu(pps: &[PPart], dev: usize) -> Vec<u32> {
                     0u32,
                     BufferArg::from_raw_parts(dmy_h.clone(), 1),
                     BufferArg::from_raw_parts(dmy_h.clone(), 1),
+                    BufferArg::from_raw_parts(dmy_h.clone(), 1),
+                    BufferArg::from_raw_parts(dmy_h.clone(), 1),
                     BufferArg::from_raw_parts(dmy_h, 1),
                     0,
+                    false,
                     false,
                 );
             }
@@ -2532,8 +2535,13 @@ fn enumerate_batch_gpu(
                     0u32,
                     BufferArg::from_raw_parts(dmy_h.clone(), 1),
                     BufferArg::from_raw_parts(dmy_h.clone(), 1),
+                    BufferArg::from_raw_parts(dmy_h.clone(), 1),
+                    BufferArg::from_raw_parts(dmy_h.clone(), 1),
                     BufferArg::from_raw_parts(dmy_h, 1),
                     1,
+                    false,
+                    // Matrix-major: this pass reads back to the host and goes through
+                    // `resident_append`, which applies the transpose there instead.
                     false,
                 );
             }
@@ -5115,10 +5123,15 @@ fn multiply_batch_block<'a>(
             enum_t_cs,
             enum_t_mk,
             enum_t_start,
+            enum_num_mats,
+            enum_t_mat_off,
         ) = if mode == MasterMode::Transient {
             let w = enum_rows.iter().copied().max().unwrap_or(1) as usize;
             let mut order: Vec<usize> = (0..enum_pp_rows.len()).collect();
             order.sort_unstable_by_key(|&i| r_num_matrices[i]);
+            // `pick_u32` reorders by `order`, so the per-slot matrix counts need a u32 view first.
+            let r_num_matrices_u32: Vec<u32> =
+                r_num_matrices.iter().map(|&v| v as u32).collect();
 
             let (mut cs_out, mut mk_out) = (vec![0u64; order.len()], vec![0u64; order.len()]);
             let (mut seg, mut seg_start) = (0usize, 0usize);
@@ -5169,6 +5182,9 @@ fn multiply_batch_block<'a>(
             let mut r_split = vec![0u32; order.len()];
             let (mut t_slot, mut t_seed) = (Vec::new(), Vec::new());
             let (mut t_cs, mut t_mk) = (Vec::new(), Vec::new());
+            // This thread's matrix offset within its `R` — the same `s` that offsets `t_cs`, kept
+            // separately so the transposed layout can stride by the `R`'s total `num_mats`.
+            let mut t_mat_off: Vec<u32> = Vec::new();
             let mut t_start = Vec::with_capacity(order.len() + 1);
             for (slot, &i) in order.iter().enumerate() {
                 t_start.push(t_slot.len());
@@ -5181,6 +5197,7 @@ fn multiply_batch_block<'a>(
                             t_seed.push(k as u32);
                             t_cs.push(cs_out[slot] + s as u64 * cs_len);
                             t_mk.push(mk_out[slot] + s as u64 * mk_len);
+                            t_mat_off.push(s);
                         }
                     }
                     None => {
@@ -5190,6 +5207,7 @@ fn multiply_batch_block<'a>(
                         t_seed.push(0);
                         t_cs.push(cs_out[slot]);
                         t_mk.push(mk_out[slot]);
+                        t_mat_off.push(0);
                     }
                 }
             }
@@ -5210,11 +5228,15 @@ fn multiply_batch_block<'a>(
                 t_cs,
                 t_mk,
                 t_start,
+                pick_u32(&r_num_matrices_u32),
+                t_mat_off,
             )
         } else {
             (
                 Vec::new(),
                 1usize,
+                Vec::new(),
+                Vec::new(),
                 Vec::new(),
                 Vec::new(),
                 Vec::new(),
@@ -5503,6 +5525,12 @@ fn multiply_batch_block<'a>(
                                 client.create_from_slice(u32::as_bytes(&enum_t_seed[tlo..thi]));
                             let esp_h =
                                 client.create_from_slice(u32::as_bytes(&enum_split[lo..hi]));
+                            // Transposed-layout inputs: per-slot matrix counts and per-thread
+                            // matrix offsets, sliced to this segment exactly like the others.
+                            let enm_h =
+                                client.create_from_slice(u32::as_bytes(&enum_num_mats[lo..hi]));
+                            let emf_h = client
+                                .create_from_slice(u32::as_bytes(&enum_t_mat_off[tlo..thi]));
                             enum_keep.extend([
                                 cnt_scratch.clone(),
                                 epp_h.clone(),
@@ -5512,6 +5540,8 @@ fn multiply_batch_block<'a>(
                                 emo_h.clone(),
                                 ets_h.clone(),
                                 etk_h.clone(),
+                                enm_h.clone(),
+                                emf_h.clone(),
                                 esp_h.clone(),
                             ]);
                             let enum_blocks = (n_t as u32).div_ceil(ENUM_THREADS).max(1);
@@ -5538,6 +5568,8 @@ fn multiply_batch_block<'a>(
                                     BufferArg::from_raw_parts(ets_h, n_t),
                                     BufferArg::from_raw_parts(etk_h, n_t),
                                     BufferArg::from_raw_parts(esp_h, n_s),
+                                    BufferArg::from_raw_parts(enm_h, n_s),
+                                    BufferArg::from_raw_parts(emf_h, n_t),
                                     1,
                                     // Comptime: with the split off this compiles the `(R, seed)`
                                     // mapping out entirely and the kernel is the original
@@ -5545,6 +5577,7 @@ fn multiply_batch_block<'a>(
                                     // the split one. `n_t == n_s` then, and the bound arrays are
                                     // simply never read.
                                     enum_split_enabled(),
+                                    cs_transposed(),
                                 );
                             }
                         }
@@ -5854,9 +5887,9 @@ fn multiply_batch_block<'a>(
                         BufferArg::from_raw_parts(psh_h, pp_shift_len),
                         BufferArg::from_raw_parts(pms_h, pp_shift_len),
                         work_cap.min(PPART_MAX_LEN),
-                        // Resident only: the transient master is written by the enumeration
-                        // kernel, whose split mode scatters one R across threads.
-                        cs_transposed() && mode == MasterMode::Resident,
+                        // Both masters now: `resident_append` transposes the resident one and
+                        // `enumerate_admissible_kernel` the transient one.
+                        cs_transposed(),
                     );
                 }
 
@@ -6444,8 +6477,17 @@ fn enumerate_admissible_kernel(
     t_slot: &[u32],
     t_seed: &[u32],
     r_split: &[u32],
+    // Transposed-layout inputs, read only when `transposed` (comptime), so they compile out
+    // otherwise and may be bound as 1-element dummies. `r_num_mats` is per SLOT (an `R`),
+    // `t_mat_off` per THREAD: in split mode several threads emit different seeds of one `R`, and
+    // `t_mat_off` is where this thread's matrices start within it.
+    r_num_mats: &[u32],
+    t_mat_off: &[u32],
     #[comptime] emit: u32,
     #[comptime] split: bool,
+    // Column-major over matrices, matching [`cs_transposed`] on the read side. Comptime so each
+    // layout compiles to one address chain.
+    #[comptime] transposed: bool,
 ) {
     let ti = ABSOLUTE_POS;
     if ti >= n_r {
@@ -6538,13 +6580,31 @@ fn enumerate_admissible_kernel(
         // other entry, halving both store count and bytes.
         if emitting {
             if emit == 1 {
-                let co = cs_base + mat * cs_len;
-                for j in 0..cs_len {
-                    out_cs[co + j] = u16::cast_from(st[(ENUM_ST_COLSUMS + j) * bs + tid]);
-                }
-                let mo = mk_base + mat * mk_len;
-                for j in 0..mk_len {
-                    out_mk[mo + j] = u16::cast_from(st[(ENUM_ST_MASKS + j) * bs + tid]);
+                if transposed {
+                    // Column-major over matrices. `cs_base` already includes this thread's
+                    // `moff * cs_len`, so subtracting it recovers the `R`'s base without another
+                    // buffer; the matrix index is then `moff + mat` across the whole `R`.
+                    let moff = usize::cast_from(t_mat_off[ti]);
+                    let nm = usize::cast_from(r_num_mats[slot]);
+                    let cs_r = cs_base - moff * cs_len;
+                    for j in 0..cs_len {
+                        out_cs[cs_r + j * nm + moff + mat] =
+                            u16::cast_from(st[(ENUM_ST_COLSUMS + j) * bs + tid]);
+                    }
+                    let mk_r = mk_base - moff * mk_len;
+                    for j in 0..mk_len {
+                        out_mk[mk_r + j * nm + moff + mat] =
+                            u16::cast_from(st[(ENUM_ST_MASKS + j) * bs + tid]);
+                    }
+                } else {
+                    let co = cs_base + mat * cs_len;
+                    for j in 0..cs_len {
+                        out_cs[co + j] = u16::cast_from(st[(ENUM_ST_COLSUMS + j) * bs + tid]);
+                    }
+                    let mo = mk_base + mat * mk_len;
+                    for j in 0..mk_len {
+                        out_mk[mo + j] = u16::cast_from(st[(ENUM_ST_MASKS + j) * bs + tid]);
+                    }
                 }
             } else if emit == 2 {
                 let w = usize::cast_from(wrap);
