@@ -1572,15 +1572,30 @@ const ENUM_SPLIT_TARGET: usize = 64;
 /// Monotonically worse, exactly as `S + N/S` predicts once `S` exceeds `sqrt(N)`. Reverted; do not
 /// rebuild it. Beating `sqrt(N)` needs UNRANKING -- computing the odometer state at index `k`
 /// directly, without stepping to it -- which is a combinatorics problem, not a scheduling one.
-fn enum_split_target() -> usize {
-    static T: LazyLock<usize> = LazyLock::new(|| {
+fn enum_split_target() -> Option<usize> {
+    static T: LazyLock<Option<usize>> = LazyLock::new(|| {
         std::env::var("NASSAU_GPU_ENUM_SPLIT_TARGET")
             .ok()
             .and_then(|v| v.parse().ok())
-            .filter(|&v| v >= 2)
-            .unwrap_or(ENUM_SPLIT_TARGET)
+            .filter(|&v: &usize| v >= 2)
     });
     *T
+}
+
+/// Seeds for an `R` of `num_mats` matrices: `sqrt(num_mats)`, which is where `S + N/S` is minimised.
+///
+/// A CONSTANT seed count is only optimal for one `R` size. [`ENUM_SPLIT_TARGET`]'s 64 was fitted
+/// when the split was confined to `num_mats >= 2048` (`sqrt(2048) ~ 45`); with the threshold now at
+/// 128 it over-splits everything at the small end, where the seek dominates the chain it bought.
+///
+/// Clamped below at 2 (fewer is not a split) and above at [`ENUM_SPLIT_TARGET`], which keeps the
+/// large end exactly where it was measured rather than extrapolating past it -- `sqrt` grows without
+/// bound and the module's own sweep shows 128 and 256 seeds losing.
+fn enum_split_target_for(num_mats: u32) -> usize {
+    if let Some(fixed) = enum_split_target() {
+        return fixed;
+    }
+    ((num_mats as f64).sqrt().round() as usize).clamp(2, ENUM_SPLIT_TARGET)
 }
 
 /// Fresh odometer state for `p_part`: `(matrix, totals, col_sums, masks, rows, cols)`.
@@ -1936,7 +1951,17 @@ fn split_plan(p_part: PPart, num_mats: u32) -> Option<(u32, Arc<[u32]>)> {
         return Some(e.clone());
     }
     let pp: Vec<u32> = p_part.iter().collect();
-    let sp = heuristic_split_pos(&pp, enum_split_target());
+    // Seeds for THIS `R`, from its own size. The critical path is `S + N/S` (see
+    // [`enum_split_target`]), minimised at `S = sqrt(N)` -- so the right seed count depends on
+    // `num_mats`, and a constant is only right for one `R` size.
+    //
+    // 64 was tuned when the split was confined to `num_mats >= 2048` (`sqrt(2048) ~ 45`), but the
+    // threshold is now 128, and `sqrt(128) ~ 11`. Giving a 128-matrix `R` 64 seeds costs
+    // `64 + 2 = 66` steps against `11 + 12 = 23` at its own optimum -- ~2.9x worse, on exactly the
+    // `R`s the lower threshold newly admitted.
+    //
+    // `NASSAU_GPU_ENUM_SPLIT_TARGET` still forces a fixed count, for A/B against this.
+    let sp = heuristic_split_pos(&pp, enum_split_target_for(num_mats));
     let starts: Arc<[u32]> = seed_starts(&pp, sp).into();
     let e = (sp as u32, starts);
     SPLIT_PLAN
