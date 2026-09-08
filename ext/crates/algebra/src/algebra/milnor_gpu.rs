@@ -6874,13 +6874,16 @@ fn enumerate_admissible_kernel(
         let mut row = lo_row;
         while row < hi_row && !found {
             let mut p_to_the_j = 1u32;
-            st[(ENUM_ST_TOTALS + row) * bs + tid] = st[(row * cols) * bs + tid];
+            // `totals[row]` is thread-private and touched ~7x per column iteration. The step is a
+            // dependent chain, so those shared round trips ARE the latency; keep it in a register
+            // for the row scan and write it back once below.
+            let mut tot = st[(row * cols) * bs + tid];
             let mut col = 1usize;
             while col < cols && !found {
                 p_to_the_j *= 2u32;
                 let mut handled = false;
                 let pos = row * per_row + (col - 1);
-                if pos >= lo && pos < hi && p_to_the_j <= st[(ENUM_ST_TOTALS + row) * bs + tid] {
+                if pos >= lo && pos < hi && p_to_the_j <= tot {
                     // Bitsum along the anti-diagonal to the bottom-left (saturating start index).
                     let mut d = 0u32;
                     let mut c = 0usize;
@@ -6895,12 +6898,11 @@ fn enumerate_admissible_kernel(
                     let new_entry = ((cur | d) + 1u32) & !d;
                     let inc = new_entry - cur;
                     let sub = inc * p_to_the_j;
-                    if st[(ENUM_ST_TOTALS + row) * bs + tid] < sub {
-                        st[(ENUM_ST_TOTALS + row) * bs + tid] =
-                            st[(ENUM_ST_TOTALS + row) * bs + tid] + p_to_the_j * cur;
+                    if tot < sub {
+                        tot += p_to_the_j * cur;
                         handled = true;
                     } else {
-                        st[(row * cols) * bs + tid] = st[(ENUM_ST_TOTALS + row) * bs + tid] - sub;
+                        st[(row * cols) * bs + tid] = tot - sub;
                         st[(ENUM_ST_MASKS + row) * bs + tid] = st[(row * cols) * bs + tid];
                         st[(ENUM_ST_COLSUMS + col - 1) * bs + tid] =
                             st[(ENUM_ST_COLSUMS + col - 1) * bs + tid] + inc;
@@ -6944,11 +6946,13 @@ fn enumerate_admissible_kernel(
                     }
                 }
                 if !handled {
-                    st[(ENUM_ST_TOTALS + row) * bs + tid] = st[(ENUM_ST_TOTALS + row) * bs + tid]
-                        + p_to_the_j * st[(row * cols + col) * bs + tid];
+                    tot += p_to_the_j * st[(row * cols + col) * bs + tid];
                 }
                 col += 1;
             }
+            // Write back once per row scan. Rows below this one are read by the carry-propagation
+            // block above, and they were written back by their own iterations.
+            st[(ENUM_ST_TOTALS + row) * bs + tid] = tot;
             row += 1;
         }
         more = found;
