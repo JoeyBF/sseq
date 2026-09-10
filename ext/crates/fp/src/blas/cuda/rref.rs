@@ -1,15 +1,7 @@
-//! GPU dispatch for F₂ matrix multiplication (Hopper `wgmma.b1`).
+//! The F₂ row reduction to reduced row echelon form, on the device.
 
-use std::sync::OnceLock;
-
-use fp_cuda::GpuContext;
-
+use super::{context, driver, fill_limbs};
 use crate::{matrix::Matrix, prime::TWO};
-
-/// Smallest `min(m, k, n)` for which we attempt the GPU.
-///
-/// Below this the host marshalling (bit-repack into TMA tiles + copies) costs more than it saves.
-const DEFAULT_THRESHOLD: usize = 2048;
 
 /// Smallest problem size, in bits, for which we attempt the GPU row reduction.
 ///
@@ -24,14 +16,6 @@ const DEFAULT_RR_MIN_BITS: u64 = 1 << 22;
 /// Inert at its default of 0: [`DEFAULT_RR_MIN_BITS`] decides. Kept so that scripts setting it keep
 /// working, and so `FP_CUDA_RR_THRESHOLD=8192` restores the old behaviour exactly.
 const DEFAULT_RR_THRESHOLD: usize = 0;
-
-/// The matmul threshold in use, overridable via the `FP_CUDA_THRESHOLD` environment variable.
-fn threshold() -> usize {
-    std::env::var("FP_CUDA_THRESHOLD")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(DEFAULT_THRESHOLD)
-}
 
 /// The legacy short-side floor in use, overridable via `FP_CUDA_RR_THRESHOLD`.
 fn rr_threshold() -> usize {
@@ -58,82 +42,6 @@ pub(crate) fn rr_worth_gpu(rows: usize, cols: usize) -> bool {
         return false;
     }
     (rows as u64).saturating_mul(cols as u64) >= rr_min_bits()
-}
-
-/// The process-wide GPU context, created lazily on first use.
-///
-/// `None` if no usable device is present (no driver, no Hopper GPU, or the kernel PTX is the
-/// nvcc-absent build stub), or if `FP_CUDA_DISABLE` is set.
-///
-/// Shared as `&'static` with no lock: `GpuContext` is `Send + Sync`, every submission goes through
-/// a per-thread stream ([`GpuContext::stream`]) so concurrent callers overlap instead of
-/// serializing, and device buffers are per-call, so there is no shared state to guard.
-fn context() -> Option<&'static GpuContext> {
-    static GPU: OnceLock<Option<GpuContext>> = OnceLock::new();
-    GPU.get_or_init(|| {
-        if std::env::var_os("FP_CUDA_DISABLE").is_some() {
-            return None;
-        }
-        // `FP_CUDA_DEVICE` selects the GPU the row reduction runs on.
-        let device = std::env::var("FP_CUDA_DEVICE")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(0);
-        GpuContext::new(device).ok()
-    })
-    .as_ref()
-}
-
-/// The single thread every `fp-cuda` submission goes through.
-///
-/// This is what gives the process exactly one owner of the reduction GPU.
-///
-/// Both entry points — the row reduction's trailing GEMM and the standalone [`try_mul`] — launch
-/// grids sized to fill the machine. Co-scheduled they do not fail, they *queue*, and the reduction
-/// is a chain of thousands of dependent relaunches, so that queueing lands on a serial critical
-/// path. A lock would cover only the call sites that remember to take it; one thread makes single
-/// ownership structural.
-///
-/// Jobs run here to *completion*, not just submission: kernels outlive the call that launched them,
-/// and both jobs end in a synchronizing device-to-host download.
-mod driver {
-    use std::sync::{Mutex, OnceLock, mpsc};
-
-    type Job = Box<dyn FnOnce() + Send + 'static>;
-
-    /// The driver thread's job channel, spawning the thread on first use.
-    fn sender() -> &'static Mutex<mpsc::Sender<Job>> {
-        static TX: OnceLock<Mutex<mpsc::Sender<Job>>> = OnceLock::new();
-        TX.get_or_init(|| {
-            let (tx, rx) = mpsc::channel::<Job>();
-            std::thread::Builder::new()
-                .name("fp-cuda-driver".into())
-                .spawn(move || {
-                    for job in rx {
-                        job();
-                    }
-                })
-                .expect("failed to spawn the fp-cuda driver thread");
-            Mutex::new(tx)
-        })
-    }
-
-    /// Run `f` on the driver thread and block for its result.
-    ///
-    /// `f` owns everything it touches (both call sites have already marshalled to owned limb
-    /// buffers), so nothing borrows across threads.
-    pub(super) fn run<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
-        let (tx, rx) = mpsc::channel();
-        sender()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .send(Box::new(move || {
-                // A send failure means the caller gave up; the job still ran, so just drop it.
-                let _ = tx.send(f());
-            }))
-            .expect("the fp-cuda driver thread died");
-        rx.recv().expect("the fp-cuda driver thread dropped a job")
-    }
 }
 
 /// A small pool of reusable host buffers for marshalling matrices to and from the device.
@@ -227,72 +135,6 @@ mod marshal {
         }
         cv.notify_one();
     }
-}
-
-/// Pack `m`'s rows into `buf` in the tight row-major layout `GpuContext::upload` expects.
-///
-/// Replaces a `u64` → little-endian bytes → `u64` round trip, which was two full-size copies to
-/// perform the identity on a little-endian machine. When the matrix's own stride already matches
-/// the packed one — the common case, since `Matrix::new` sets `columns_capacity == columns` — this
-/// is a single `extend_from_slice` of the whole buffer.
-fn fill_limbs(m: &Matrix, buf: &mut Vec<u64>) {
-    let packed = m.columns().div_ceil(64);
-    let ms = m.stride();
-    let rows = m.rows();
-    buf.clear();
-    buf.reserve(rows * packed);
-    let data = m.data();
-    if ms == packed {
-        buf.extend_from_slice(&data[..rows * packed]);
-    } else {
-        for i in 0..rows {
-            buf.extend_from_slice(&data[i * ms..i * ms + packed]);
-        }
-    }
-}
-
-/// Row-major, K-major `u64` limbs — the exact layout `fp_cuda::matmul_b1_raw` expects.
-///
-/// That is `rows × columns.div_ceil(64)` limbs with no inter-row padding. Uses `Matrix::to_bytes`,
-/// which already strips the physical row stride.
-fn to_limbs(m: &Matrix) -> Vec<u64> {
-    let stride = m.columns().div_ceil(64);
-    let mut bytes = Vec::with_capacity(m.rows() * stride * 8);
-    m.to_bytes(&mut bytes).expect("Vec writes never fail");
-    let (chunks, _) = bytes.as_chunks::<8>();
-    chunks.iter().map(|&c| u64::from_le_bytes(c)).collect()
-}
-
-/// Try to compute `a · b` on the GPU.
-///
-/// This is consulted by `<&Matrix as Mul>::mul` before the CPU BLAS path: for large enough
-/// `p = 2` products it converts the operands to the raw row-major limb layout `fp-cuda` expects,
-/// runs the kernel, and rebuilds a [`Matrix`]. Anything that makes the GPU path unavailable or
-/// unsuitable — no device, a launch error, or a below-threshold size — returns `None`.
-///
-/// Assumes `a.prime() == b.prime() == 2` and `a.columns() == b.rows()`.
-pub(super) fn try_mul(a: &Matrix, b: &Matrix) -> Option<Matrix> {
-    debug_assert_eq!(a.prime(), TWO);
-    debug_assert_eq!(b.prime(), TWO);
-    debug_assert_eq!(a.columns(), b.rows());
-
-    let (m, k, n) = (a.rows(), a.columns(), b.columns());
-    let t = threshold();
-    if m < t || k < t || n < t {
-        return None;
-    }
-
-    let ctx = context()?;
-    let a_limbs = to_limbs(a);
-    let b_limbs = to_limbs(b);
-
-    // Through the driver: this is a persistent whole-device grid, so "concurrent callers do not
-    // interfere" was wrong — two at once cannot both be placed (see [`driver`]).
-    // `.ok()` inside the closure: the error is a `Box<dyn Error>`, which is not `Send`, so it
-    // cannot cross back from the driver thread. The caller only distinguishes success from
-    // fall-back-to-CPU anyway.
-    let c = driver::run(move || fp_cuda::matmul_b1_raw(ctx, &a_limbs, m, k, &b_limbs, n).ok())?;
-    Some(Matrix::from_data(TWO, m, n, c))
 }
 
 /// Try to row-reduce `m` to RREF on the GPU, in place.
