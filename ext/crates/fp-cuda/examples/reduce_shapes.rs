@@ -1,0 +1,139 @@
+//! Device vs CPU reduction across shapes, from near-square to very wide.
+//!
+//! `reduce_timing` measures half-rank squares only, and a square cannot separate the two candidate
+//! quantities for the dispatch gate: its short side and its total size move together. This example
+//! varies them independently, which is what [`fp::blas`]'s size-based gate was chosen against. The
+//! numbers it produced, and the shapes the resolution actually reduces, are in
+//! `crates/fp-cuda/EXPERIMENTS.md`.
+//!
+//! The CPU baseline is `row_reduce_blas3`, which is conservative on purpose: the fallback the gate
+//! actually selects is single-threaded M4RI, which is slower still. A device win measured here is
+//! therefore a lower bound on the win over what production really does.
+//!
+//! ```sh
+//! cargo run --release -p fp-cuda --example reduce_shapes            # census shapes + controls
+//! cargo run --release -p fp-cuda --example reduce_shapes -- 2877x1622037
+//! ```
+
+use std::time::Instant;
+
+use fp::{matrix::Matrix, prime::TWO};
+use fp_cuda::GpuContext;
+use rand::Rng;
+
+mod common;
+use common::upload_matrix;
+
+/// The dispatch gate this example exists to justify, mirrored from `fp`'s `DEFAULT_RR_MIN_BITS`.
+///
+/// `fp` is a dev-dependency here and the predicate is crate-private, so the value cannot be read
+/// from it. Keep the two in step.
+const GATE_BITS: u64 = 1 << 22;
+
+/// Random `rows × cols` built straight into limbs.
+///
+/// Going through `Vec<Vec<u32>>` costs one `u32` per BIT, which at these widths is tens of GB for
+/// an operand whose packed form is a few hundred MB.
+fn random_matrix(rows: usize, cols: usize) -> Matrix {
+    let stride = cols.div_ceil(64);
+    let mut rng = rand::rng();
+    let mut limbs = vec![0u64; rows * stride];
+    for l in limbs.iter_mut() {
+        *l = rng.random();
+    }
+    // Bits past `cols` in the final limb of each row must be zero or the matrix is malformed.
+    let tail = cols % 64;
+    if tail != 0 {
+        let mask = (1u64 << tail) - 1;
+        for r in 0..rows {
+            limbs[r * stride + stride - 1] &= mask;
+        }
+    }
+    Matrix::from_data(TWO, rows, cols, limbs)
+}
+
+/// Half-rank `rows × cols`, matching the construction the square measurements use.
+fn half_rank(rows: usize, cols: usize) -> Matrix {
+    let rank = (rows / 2).max(1);
+    &random_matrix(rows, rank) * &random_matrix(rank, cols)
+}
+
+/// Time each shape on the device and on the CPU, and print the ratio.
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let shapes: Vec<(usize, usize, &'static str)> = if args.is_empty() {
+        vec![
+            // Square controls, the shape earlier measurements used.
+            (4096, 4096, "square control"),
+            (8192, 8192, "square control"),
+            // Wide shapes taken from the census, cheapest first.
+            (587, 1_524_934, "b=(287,5)"),
+            (657, 1_692_321, "b=(293,5)"),
+            (1131, 611_461, "b=(255,9)"),
+            (1676, 1_686_395, "b=(266,7)"),
+            (2877, 1_622_037, "b=(253,10)"),
+            (3055, 1_770_153, "b=(262,8)"),
+        ]
+    } else {
+        args.iter()
+            .filter_map(|a| {
+                let (r, c) = a.split_once('x')?;
+                Some((r.parse().ok()?, c.parse().ok()?, "user"))
+            })
+            .collect()
+    };
+
+    let gpu = GpuContext::new(0)?;
+    println!("=== device vs CPU blas3 reduction, half-rank ===");
+    println!(
+        "  The CPU baseline is blas3, so a device win here is a LOWER bound on the win over\n  \
+         production's single-threaded M4RI fallback.\n"
+    );
+    println!(
+        "  {:>6} {:>10} {:>8} {:>8} {:>10} {:>10} {:>9} {:>7}  shape",
+        "rows", "cols", "aspect", "MB", "device", "cpu-blas3", "speedup", "gated?"
+    );
+
+    for (rows, cols, label) in shapes {
+        let mm = half_rank(rows, cols);
+        let mb = rows as f64 * cols as f64 / 8.0 / (1 << 20) as f64;
+        let aspect = cols as f64 / rows as f64;
+        let gated = if (rows as u64) * (cols as u64) >= GATE_BITS {
+            "GPU"
+        } else {
+            "CPU"
+        };
+
+        // Device: upload + full reduce + sync, excluding download (matches reduce_timing).
+        let t0 = Instant::now();
+        let mut dm = upload_matrix(&gpu, &mm)?;
+        let (_perm, r, _piv) = gpu.row_reduce_dev(&mut dm)?;
+        let dev = t0.elapsed().as_secs_f64();
+
+        let mut cpu = mm.clone();
+        let t1 = Instant::now();
+        let cpu_rank = cpu.row_reduce_blas3();
+        let cpu_s = t1.elapsed().as_secs_f64();
+
+        // Rank agreement is the cheap invariant. Materialising the full device RREF for a 645 MB
+        // matrix would cost more than the measurement; `reduce_timing` does the full compare on
+        // squares, and a rank mismatch is what a broken reduce actually produces.
+        let ok = r == cpu_rank;
+
+        println!(
+            "  {rows:>6} {cols:>10} {aspect:>7.0}x {mb:>8.1} {dev:>9.3}s {cpu_s:>9.3}s {:>8.2}x \
+             {gated:>7}  {label}{}",
+            cpu_s / dev,
+            if ok { "" } else { "   *** RANK MISMATCH ***" }
+        );
+        if !ok {
+            eprintln!("rank mismatch: device {r} vs cpu {cpu_rank} at {rows}x{cols}");
+            std::process::exit(1);
+        }
+    }
+    println!(
+        "\n  Read the `gated?` column against `speedup`: any row marked CPU with a speedup \
+         above\n  1.00x is work the current threshold sends to the slower path."
+    );
+    Ok(())
+}

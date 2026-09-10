@@ -11,12 +11,19 @@ use crate::{matrix::Matrix, prime::TWO};
 /// Below this the host marshalling (bit-repack into TMA tiles + copies) costs more than it saves.
 const DEFAULT_THRESHOLD: usize = 2048;
 
-/// Smallest `min(rows, cols)` for which we attempt the GPU row reduction.
+/// Smallest problem size, in bits, for which we attempt the GPU row reduction.
 ///
-/// Higher than [`DEFAULT_THRESHOLD`]: a full reduction is many dependent panel steps, not one GEMM,
-/// so its CPU crossover is later. This is a floor rather than a fitted optimum — see
-/// `crates/fp-cuda/EXPERIMENTS.md`. Override with `FP_CUDA_RR_THRESHOLD`.
-const DEFAULT_RR_THRESHOLD: usize = 8192;
+/// Size rather than a short side, because that is what the crossover tracks: the device needs
+/// enough total work, not a fat short side. This is the first size that wins outright. See
+/// `crates/fp-cuda/EXPERIMENTS.md` for the shapes it was measured on, and for the short-side
+/// floor it replaced. Override with `FP_CUDA_RR_MIN_BITS`.
+const DEFAULT_RR_MIN_BITS: u64 = 1 << 22;
+
+/// Legacy minimum on the short side, `FP_CUDA_RR_THRESHOLD`.
+///
+/// Inert at its default of 0: [`DEFAULT_RR_MIN_BITS`] decides. Kept so that scripts setting it keep
+/// working, and so `FP_CUDA_RR_THRESHOLD=8192` restores the old behaviour exactly.
+const DEFAULT_RR_THRESHOLD: usize = 0;
 
 /// The matmul threshold in use, overridable via the `FP_CUDA_THRESHOLD` environment variable.
 fn threshold() -> usize {
@@ -26,12 +33,31 @@ fn threshold() -> usize {
         .unwrap_or(DEFAULT_THRESHOLD)
 }
 
-/// The row-reduction threshold in use, overridable via `FP_CUDA_RR_THRESHOLD`.
+/// The legacy short-side floor in use, overridable via `FP_CUDA_RR_THRESHOLD`.
 fn rr_threshold() -> usize {
     std::env::var("FP_CUDA_RR_THRESHOLD")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(DEFAULT_RR_THRESHOLD)
+}
+
+/// The row-reduction size floor in use, overridable via `FP_CUDA_RR_MIN_BITS`.
+fn rr_min_bits() -> u64 {
+    std::env::var("FP_CUDA_RR_MIN_BITS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_RR_MIN_BITS)
+}
+
+/// Is this reduction worth the device?
+///
+/// Size decides; the legacy short-side floor applies only when explicitly set.
+pub(crate) fn rr_worth_gpu(rows: usize, cols: usize) -> bool {
+    let t = rr_threshold();
+    if rows < t || cols < t {
+        return false;
+    }
+    (rows as u64).saturating_mul(cols as u64) >= rr_min_bits()
 }
 
 /// The process-wide GPU context, created lazily on first use.
@@ -278,8 +304,7 @@ pub(super) fn try_mul(a: &Matrix, b: &Matrix) -> Option<Matrix> {
 pub(crate) fn try_row_reduce(m: &mut Matrix) -> Option<usize> {
     debug_assert_eq!(m.prime(), TWO);
     let (rows, cols) = (m.rows(), m.columns());
-    let t = rr_threshold();
-    if rows < t || cols < t {
+    if !rr_worth_gpu(rows, cols) {
         return None;
     }
     let ctx = context()?;
