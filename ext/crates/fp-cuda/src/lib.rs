@@ -716,6 +716,23 @@ impl GpuContext {
         Ok(self.stream().clone_dtoh(&dm.buf)?)
     }
 
+    /// Download into an existing host buffer, allocating nothing.
+    ///
+    /// [`Self::download`] allocates a fresh `Vec<u64>` per call, which at frontier matrix sizes
+    /// is a multi-GiB allocation on every reduction. Callers that reduce in a loop should hold one
+    /// buffer and reuse it through this.
+    pub fn download_into(&self, dm: &DeviceMatrix, out: &mut [u64]) -> anyhow::Result<()> {
+        assert_eq!(
+            out.len(),
+            dm.rows * dm.stride,
+            "download_into: buffer is {} limbs, matrix needs {}",
+            out.len(),
+            dm.rows * dm.stride
+        );
+        self.stream().memcpy_dtoh(&dm.buf, out)?;
+        Ok(())
+    }
+
     /// Download a device `u32` buffer (e.g. a `perm` vector) to host.
     pub fn download_u32(&self, s: &CudaSlice<u32>) -> anyhow::Result<Vec<u32>> {
         Ok(self.stream().clone_dtoh(s)?)
