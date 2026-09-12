@@ -4532,6 +4532,160 @@ pub fn dump_reuse_census() {
     );
 }
 
+/// Capture/replay (`NASSAU_CAPTURE_PRODUCTS`): dump one REAL batch to disk so a bench can replay it.
+///
+/// A synthetic bench cannot stand in for the frontier here. The in-tree one samples `R`s on a stride
+/// and gives every product the same term count, and measured against real frontier work it ranks tile
+/// 4x2 at 0.706x where the truth is 1.16x -- the WRONG SIGN, with a 0.4% noise floor, so its
+/// confidence is the dangerous part. Scaling its dimensions does not obviously fix that, because the
+/// thing it flattens is the DISTRIBUTION: real work has a steeply skewed spread over both `num_mats`
+/// per `R` (top 1% of `R`s carry 31% of references) and terms per product, and the tile's ragged-tail
+/// cost is a function of exactly that spread.
+///
+/// So capture the real thing instead of approximating it. The batch is self-contained -- products name
+/// algebra basis elements by `(degree, index)`, so a replay only needs the basis computed to the same
+/// degree -- and replaying it costs nothing but the multiply itself: no resolution, no save, no
+/// signature walk.
+///
+/// `NASSAU_CAPTURE_NTH` (default 200) picks WHICH call to keep. The first calls of a run are small
+/// warm-up batches from low bidegrees; the interesting one is a steady-state frontier batch.
+static CAPTURE_PATH: LazyLock<Option<String>> =
+    LazyLock::new(|| std::env::var("NASSAU_CAPTURE_PRODUCTS").ok());
+static CAPTURE_NTH: LazyLock<u64> = LazyLock::new(|| {
+    std::env::var("NASSAU_CAPTURE_NTH")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(200)
+});
+static CAPTURE_SEEN: AtomicU64 = AtomicU64::new(0);
+
+/// `NASPROD1` + u64 fields, little-endian throughout. Deliberately a flat dump rather than a serde
+/// format: the term lists dominate the file (a frontier batch is ~540k products x ~165 terms), so the
+/// layout that matters is that they are one contiguous run of u32.
+const CAPTURE_MAGIC: &[u8; 8] = b"NASPROD1";
+
+fn capture_batch(out_cols: usize, col_map: Option<&[u32]>, num_rows: usize, products: &[GpuProduct]) {
+    let Some(path) = CAPTURE_PATH.as_deref() else {
+        return;
+    };
+    // `fetch_add` returns a unique ticket per caller, so exactly one call sees the target. Comparing a
+    // separate `load` against `== n` can fire never under ~100 concurrent callers.
+    let n = CAPTURE_SEEN.fetch_add(1, Ordering::Relaxed) + 1;
+    if n != *CAPTURE_NTH {
+        return;
+    }
+    use std::io::Write as _;
+    let write = || -> std::io::Result<()> {
+        let f = std::fs::File::create(path)?;
+        let mut w = std::io::BufWriter::with_capacity(1 << 22, f);
+        let u = |v: usize| (v as u64).to_le_bytes();
+        w.write_all(CAPTURE_MAGIC)?;
+        w.write_all(&u(num_rows))?;
+        w.write_all(&u(out_cols))?;
+        match col_map {
+            Some(m) => {
+                w.write_all(&u(1))?;
+                w.write_all(&u(m.len()))?;
+                for &c in m {
+                    w.write_all(&c.to_le_bytes())?;
+                }
+            }
+            None => {
+                w.write_all(&u(0))?;
+                w.write_all(&u(0))?;
+            }
+        }
+        w.write_all(&u(products.len()))?;
+        for p in products {
+            w.write_all(&(p.r_degree as i64).to_le_bytes())?;
+            w.write_all(&(p.s_degree as i64).to_le_bytes())?;
+            w.write_all(&u(p.r_idx))?;
+            w.write_all(&u(p.row))?;
+            w.write_all(&u(p.out_offset))?;
+            w.write_all(&u(p.term_indices.len()))?;
+            for &t in p.term_indices.iter() {
+                w.write_all(&(t as u32).to_le_bytes())?;
+            }
+        }
+        w.flush()
+    };
+    let terms: usize = products.iter().map(|p| p.term_indices.len()).sum();
+    let maxr = products.iter().map(|p| p.r_degree).max().unwrap_or(0);
+    let maxs = products.iter().map(|p| p.s_degree).max().unwrap_or(0);
+    match write() {
+        Ok(()) => eprintln!(
+            "[capture] call #{n} -> {path}: products={} terms={terms} (mean {:.1}) rows={num_rows} \
+             out_cols={out_cols} col_map={} max_r_degree={maxr} max_s_degree={maxs}",
+            products.len(),
+            terms as f64 / products.len().max(1) as f64,
+            col_map.map_or(0, <[u32]>::len),
+        ),
+        Err(e) => eprintln!("[capture] FAILED to write {path}: {e}"),
+    }
+}
+
+/// Read back what [`capture_batch`] wrote. Returns `(num_rows, out_cols, col_map, products)`.
+pub fn load_captured_batch(
+    path: &str,
+) -> std::io::Result<(usize, usize, Option<Arc<[u32]>>, Vec<GpuProduct>)> {
+    use std::io::Read as _;
+    let f = std::fs::File::open(path)?;
+    let mut r = std::io::BufReader::with_capacity(1 << 22, f);
+    let mut m = [0u8; 8];
+    r.read_exact(&mut m)?;
+    if &m != CAPTURE_MAGIC {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "not a captured product batch",
+        ));
+    }
+    let mut u64b = [0u8; 8];
+    let mut rd = |r: &mut std::io::BufReader<std::fs::File>| -> std::io::Result<u64> {
+        r.read_exact(&mut u64b)?;
+        Ok(u64::from_le_bytes(u64b))
+    };
+    let num_rows = rd(&mut r)? as usize;
+    let out_cols = rd(&mut r)? as usize;
+    let has_map = rd(&mut r)? == 1;
+    let map_len = rd(&mut r)? as usize;
+    let col_map = if has_map {
+        let mut v = vec![0u32; map_len];
+        let mut buf = [0u8; 4];
+        for slot in v.iter_mut() {
+            r.read_exact(&mut buf)?;
+            *slot = u32::from_le_bytes(buf);
+        }
+        Some(Arc::from(v))
+    } else {
+        None
+    };
+    let np = rd(&mut r)? as usize;
+    let mut products = Vec::with_capacity(np);
+    let mut buf4 = [0u8; 4];
+    for _ in 0..np {
+        let r_degree = rd(&mut r)? as i64 as i32;
+        let s_degree = rd(&mut r)? as i64 as i32;
+        let r_idx = rd(&mut r)? as usize;
+        let row = rd(&mut r)? as usize;
+        let out_offset = rd(&mut r)? as usize;
+        let nt = rd(&mut r)? as usize;
+        let mut terms = Vec::with_capacity(nt);
+        for _ in 0..nt {
+            r.read_exact(&mut buf4)?;
+            terms.push(u32::from_le_bytes(buf4) as usize);
+        }
+        products.push(GpuProduct {
+            r_degree,
+            s_degree,
+            r_idx,
+            term_indices: Arc::from(terms),
+            row,
+            out_offset,
+        });
+    }
+    Ok((num_rows, out_cols, col_map, products))
+}
+
 fn census_batch(products: &[GpuProduct]) {
     if !*CENSUS_ON {
         return;
@@ -4607,6 +4761,7 @@ pub fn multiply_batch_on_gpu_masked(
 ) -> BatchOutput {
     census_batch(products);
     reuse_census_batch(products);
+    capture_batch(out_cols, col_map.as_deref(), num_rows, products);
     // Before anything touches the device: this thread may be running a bidegree's authoritative
     // CPU attempt, in which case the whole point is that no GPU is involved.
     if cpu_forced() {
@@ -10094,6 +10249,138 @@ mod tests {
     /// ```
     /// Tunables (env): `NASSAU_BENCH_WORKERS` (7), `NASSAU_BENCH_ROWS` (158),
     /// `NASSAU_BENCH_COLS` (77 000), `NASSAU_BENCH_SECS` (60), `NASSAU_BENCH_SPREAD` (4).
+    /// Replay a CAPTURED frontier batch. This is the bench to optimise the multiply kernel against.
+    ///
+    /// [`stem200_regime_bench`] builds a SYNTHETIC batch, and measured against real frontier work it
+    /// ranks tile 4x2 at 0.706x where the truth is 1.16x -- the wrong sign, at a 0.4% noise floor. Its
+    /// geometry is also a toy: 158 rows / 77 000 cols / 24 000 products / 5 terms against a frontier
+    /// mean of 4 047 / 3 065 138 / 540 661 / 165, measured over 1 625 real calls. And the axis it
+    /// flattens hardest is the DISTRIBUTION -- uniform term counts and strided `R`s, where real work is
+    /// steeply skewed on both -- which is exactly what the tile's ragged-tail cost depends on.
+    ///
+    /// So this replays the real thing. `NASSAU_CAPTURE_PRODUCTS=<file>` on any run dumps one batch (see
+    /// [`capture_batch`]); this loads it and launches it in a loop. No resolution, no save, no signature
+    /// walk -- realism without the overhead.
+    ///
+    /// ```text
+    /// NASSAU_REPLAY_PRODUCTS=/tmp/frontier.bin \
+    ///   cargo test -p algebra --release --features gpu -- --ignored --nocapture replay_bench
+    /// ```
+    /// Tunables: `NASSAU_REPLAY_PRODUCTS` (required), `NASSAU_BENCH_SECS` (30),
+    /// `NASSAU_BENCH_WORKERS` (3).
+    ///
+    /// Reports products/s and the exec share. For kernel work the metric is products per second of
+    /// EXEC: with host marshal in the denominator a 16% kernel change reads as ~1%, which is how a
+    /// bench with a 0.4% noise floor can still fail to see a real effect.
+    #[test]
+    #[ignore = "GPU perf bench: needs a CUDA device and a captured batch; run explicitly"]
+    fn replay_bench() {
+        use std::{
+            sync::{
+                Arc,
+                atomic::{AtomicU64, Ordering},
+            },
+            time::{Duration, Instant},
+        };
+
+        let Ok(path) = std::env::var("NASSAU_REPLAY_PRODUCTS") else {
+            eprintln!("[replay] NASSAU_REPLAY_PRODUCTS is unset; nothing to replay");
+            return;
+        };
+        let env_num = |key: &str, default: u64| -> u64 {
+            std::env::var(key)
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(default)
+        };
+        let secs = env_num("NASSAU_BENCH_SECS", 30);
+        let workers = env_num("NASSAU_BENCH_WORKERS", 3) as usize;
+
+        let (num_rows, out_cols, col_map, products) =
+            super::load_captured_batch(&path).expect("failed to load the captured batch");
+        let terms: usize = products.iter().map(|p| p.term_indices.len()).sum();
+        // The products name basis elements by `(degree, index)`, so the only state a replay needs is
+        // the basis out to the highest degree any of them touches -- `r_degree + s_degree`, since the
+        // output lives there.
+        let max_degree = products
+            .iter()
+            .map(|p| p.r_degree + p.s_degree)
+            .max()
+            .unwrap_or(0)
+            .max(1) as i32;
+        let p2 = fp::prime::ValidPrime::new(2);
+        let algebra = Arc::new(MilnorAlgebra::new(p2, false));
+        let t_basis = Instant::now();
+        algebra.compute_basis(max_degree);
+        algebra.compute_seqno_tables(max_degree);
+        eprintln!(
+            "[replay] {path}: products={} terms={terms} (mean {:.1}) rows={num_rows} \
+             out_cols={out_cols} col_map={} max_degree={max_degree} basis={:.1}s",
+            products.len(),
+            terms as f64 / products.len().max(1) as f64,
+            col_map.as_ref().map_or(0, |m| m.len()),
+            t_basis.elapsed().as_secs_f64(),
+        );
+
+        let products = Arc::new(products);
+        let launches = AtomicU64::new(0);
+        // Warm up OUTSIDE the timed window: the first launch pays enumeration into the resident master
+        // and cubecl's pool growth, which is startup, not steady state.
+        let _ = super::multiply_batch_on_gpu_masked(
+            &algebra,
+            out_cols,
+            col_map.clone(),
+            num_rows,
+            &products,
+        );
+        let _ = super::take_batch_stats();
+        let _ = super::take_gpu_timing();
+
+        let started = Instant::now();
+        let deadline = started + Duration::from_secs(secs);
+        std::thread::scope(|scope| {
+            for _ in 0..workers {
+                let algebra = Arc::clone(&algebra);
+                let products = Arc::clone(&products);
+                let col_map = col_map.clone();
+                let launches = &launches;
+                scope.spawn(move || {
+                    while Instant::now() < deadline {
+                        let _ = super::multiply_batch_on_gpu_masked(
+                            &algebra,
+                            out_cols,
+                            col_map.clone(),
+                            num_rows,
+                            &products,
+                        );
+                        launches.fetch_add(1, Ordering::Relaxed);
+                    }
+                });
+            }
+        });
+
+        let elapsed = started.elapsed().as_secs_f64().max(1e-3);
+        let n = launches.load(Ordering::Relaxed);
+        let (calls, _marshal_us, device_us, pairs) = super::take_batch_stats();
+        let (prep_us, queue_us, exec_us, _depth_sum, _depth_max) = super::take_gpu_timing();
+        let us = |v: u64| v as f64 / 1e6;
+        let total = (us(prep_us) + us(device_us)).max(1e-9);
+        eprintln!(
+            "[replay] {n} launches ({calls} blocks) in {elapsed:.1}s: {:.2e} pairs/s, \
+             {:.2e} pairs/exec-s",
+            pairs as f64 / elapsed,
+            pairs as f64 / us(exec_us).max(1e-9),
+        );
+        eprintln!(
+            "[replay] prep={:.1}s queue={:.1}s exec={:.1}s | exec={:.0}% of device+prep",
+            us(prep_us),
+            us(queue_us),
+            us(exec_us),
+            100.0 * us(exec_us) / total,
+        );
+        assert!(n > 0, "no launches completed");
+    }
+
     #[test]
     #[ignore = "GPU perf bench: needs a CUDA device; run explicitly"]
     fn stem200_regime_bench() {
