@@ -112,6 +112,43 @@ const ENUM_STATE: usize = ENUM_ST_MASKS + ENUM_MASK_CAP;
 /// grid (`pairs / 256` cubes ≈ 1.5e7) far under CUDA's `2^31 - 1` grid-dimension limit.
 const GPU_PAIR_CHUNK: usize = 3_900_000_000;
 
+/// Threads per multiply LAUNCH. [`GPU_PAIR_CHUNK`] bounds a row BLOCK, but the splitter always takes
+/// at least one row, so a single row past `2^32` pairs used to trip a hard assert and kill the run.
+/// The launch now walks the block's pair space in pieces of this size, passing a `pair_offset` the
+/// kernel adds to `ABSOLUTE_POS` — the same shape `copy_chunked!` uses for multi-billion-element
+/// copies.
+///
+/// **Must be a multiple of the launch's `THREADS` (256).** Each launch sizes its grid as
+/// `ceil(n / THREADS)`, so if a full chunk were not a whole number of cubes the trailing threads
+/// would run past the chunk and re-evaluate pairs belonging to the next one. The output is
+/// XOR-accumulated, so a duplicated pair CANCELS rather than double-counting — a silent wrong
+/// answer, not a crash. Only the final (partial) chunk over-runs, and those threads have
+/// `k >= total_pairs` and are caught by the kernel's existing bounds guard.
+///
+/// `2^31` keeps one launch per block in the common case (blocks are capped at 3.9e9 pairs, so at
+/// most two chunks) while staying well under the `2^32` `ABSOLUTE_POS` limit.
+///
+/// Overridable by `NASSAU_GPU_PAIR_LAUNCH_CHUNK`, rounded up to a multiple of 256. That exists to
+/// TEST this path: at the default, a normal block takes exactly one launch, so the chunking would
+/// otherwise only ever execute on the rare giant row it was written for — i.e. ship untested and
+/// first run in production. Setting it small forces many chunks at any stem, where the result must
+/// stay byte-identical.
+const PAIR_LAUNCH_CHUNK_DEFAULT: usize = 1 << 31;
+
+fn pair_launch_chunk() -> usize {
+    static C: LazyLock<usize> = LazyLock::new(|| {
+        let v = std::env::var("NASSAU_GPU_PAIR_LAUNCH_CHUNK")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(PAIR_LAUNCH_CHUNK_DEFAULT);
+        // Must be a whole number of 256-thread cubes, or a full chunk's trailing threads spill into
+        // the next chunk's pairs and XOR them a second time -- which CANCELS them. Round up rather
+        // than assert: this is a test/escape knob and a silently wrong answer is the failure mode.
+        v.max(256).div_ceil(256) * 256
+    });
+    *C
+}
+
 /// Chunk size (log2) of the multiply kernel's coarse product index. One entry per `2^COARSE_LOG`
 /// pairs, so a launch of billions of pairs needs a table of a few thousand `u32` — negligible to
 /// build and upload, and it turns the per-thread product lookup from a full binary search over
@@ -3882,8 +3919,14 @@ fn multiply_batch_kernel(
     prod_num_terms: &[u32],
     prod_row_base: &[u32],
     prod_out_offset: &[u32],
-    prod_pair_start: &[u32],
+    // `u64`: the block's pair space can exceed `2^32` when a single unsplittable row is huge, and
+    // these are absolute indices into it. See [`pair_launch_chunk`].
+    prod_pair_start: &[u64],
     prod_coarse: &[u32],
+    // First pair index this launch covers. The block's pair space is walked in
+    // [`pair_launch_chunk`] pieces so a single unsplittable oversized row cannot exceed the `u32`
+    // `ABSOLUTE_POS` limit; this is 0 for every launch of a normally-sized block.
+    pair_offset: u64,
     width: usize,
     seg_elems: usize,
     num_limbs: usize,
@@ -3923,8 +3966,12 @@ fn multiply_batch_kernel(
     // offset arithmetic narrowed to u32. See [`seg_hoist`].
     #[comptime] seg_hoist: bool,
 ) {
-    let k = ABSOLUTE_POS;
+    // `ABSOLUTE_POS` is a `u32`, so it addresses at most this launch's slice; `pair_offset` lifts it
+    // to the block's absolute pair index, which may exceed `2^32`. Widen BEFORE adding — summing in
+    // `u32` and casting afterwards would wrap.
+    let k = usize::cast_from(pair_offset) + usize::cast_from(ABSOLUTE_POS);
     let num_products = prod_pair_start.len() - 1;
+    // Also retires the trailing threads of the FINAL chunk, whose grid is rounded up to whole cubes.
     if k >= usize::cast_from(prod_pair_start[num_products]) {
         terminate!();
     }
@@ -5414,16 +5461,21 @@ fn multiply_batch_block<'a>(
         let mut prod_out_offset: Vec<u32> = Vec::with_capacity(products.len());
         // The pair prefix sum: entry `pi` is the number of `(matrix, term)` pairs before product
         // `pi`, with the sentinel total at the end — the kernel binary-searches it to decode its
-        // thread index. The caller splits blocks near [`GPU_PAIR_CHUNK`], so every entry fits
-        // `u32` (a lone over-budget row can exceed the target but stays far below the kernel's
-        // `2^32` `ABSOLUTE_POS` limit; asserted below before the values are used).
-        let mut pps: Vec<u32> = Vec::with_capacity(products.len() + 1);
+        // thread index.
+        //
+        // `u64`, not `u32`. The row-block splitter caps a block at [`GPU_PAIR_CHUNK`], but it always
+        // takes at least one row, so a SINGLE row past `2^32` pairs cannot be split and used to trip
+        // a hard assert that killed the run ("not retryable"). The kernel now covers the pair space
+        // in [`pair_launch_chunk`]-sized launches with a `pair_offset`, exactly as `copy_chunked!`
+        // does for multi-billion-element copies, so the total is no longer bounded by the `u32`
+        // `ABSOLUTE_POS` — but the prefix-sum VALUES must then be 64-bit too, or they wrap instead.
+        let mut pps: Vec<u64> = Vec::with_capacity(products.len() + 1);
         let mut pair_acc: usize = 0;
         let mut real_pairs: usize = 0;
         for (pi, prod) in products.iter().enumerate() {
             let ri = prod_r_index[pi];
             prod_term_start.push(term_off[pi] as u32);
-            pps.push(pair_acc as u32);
+            pps.push(pair_acc as u64);
             // One thread per (matrix, TERM_GROUP-sized term group), not per (matrix, term). `pair_acc`
             // sizes the grid, so it counts THREADS; `real_pairs` stays the count of `(matrix, term)`
             // products actually evaluated, which is what the throughput stat must report.
@@ -5436,11 +5488,15 @@ fn multiply_batch_block<'a>(
         }
 
         let total_pairs = pair_acc;
-        assert!(
-            u32::try_from(total_pairs).is_ok(),
-            "block pair count {total_pairs} exceeds the kernel's u32 thread limit"
-        );
-        pps.push(total_pairs as u32);
+        // No `u32` ceiling here any more. This assert used to kill the run ("not retryable") when a
+        // single row's pair count passed `2^32`, which the splitter cannot prevent because it always
+        // takes at least one row. The launch below now walks the pair space in
+        // [`pair_launch_chunk`] pieces, so only the PER-LAUNCH thread count has to fit `u32`, and
+        // that is bounded by construction.
+        //
+        // The grid dimension still has to fit: `cubes` per launch is at most
+        // `PAIR_LAUNCH_CHUNK / THREADS`, far under CUDA's `2^31 - 1`.
+        pps.push(total_pairs as u64);
 
         // Coarse index over the pair space: `coarse[i]` is the product owning pair `i << COARSE_LOG`,
         // so the product for a thread at pair `k` lies in `coarse[ci] ..= coarse[ci + 1]` for
@@ -5866,7 +5922,14 @@ fn multiply_batch_block<'a>(
                 let pps_h = client.create(Bytes::from_elems(pps));
                 let coarse_len = coarse.len();
                 let coarse_h = client.create(Bytes::from_elems(coarse));
-                let cubes = (total_pairs as u32).div_ceil(THREADS).max(1);
+                // Launches needed to cover this block's pair space. One for anything normal; more
+                // only for a single unsplittable row past [`pair_launch_chunk`], which previously
+                // aborted the run outright.
+                let pair_chunk = pair_launch_chunk();
+                let n_launches = total_pairs.div_ceil(pair_chunk).max(1);
+                let cubes = (total_pairs.min(pair_chunk) as u32)
+                    .div_ceil(THREADS)
+                    .max(1);
                 // Search depth over a single coarse chunk's product span, not over every product: the
                 // coarse index brackets the answer first, so this is `ceil(log2(span))` rather than
                 // `ceil(log2(num_products))`.
@@ -5906,9 +5969,13 @@ fn multiply_batch_block<'a>(
                 if launch_log_enabled() {
                     let mk_max = r_mk_len.iter().copied().max().unwrap_or(0);
                     let mk_sum: u64 = r_mk_len.iter().map(|&x| x as u64).sum();
+                    // `n_launches` is here so the pair-space chunking is OBSERVABLE. Without it the
+                    // chunked path is untestable from outside: the arms agree whether or not it
+                    // engaged, so a pass proves nothing. It is 1 for every normally-sized block.
                     eprintln!(
                         "[launch] work_cap={work_cap} mk_max={mk_max} mk_mean={:.1} n_r={} \
-                         products={} pairs={} cubes={cubes}",
+                         products={} pairs={} cubes={cubes} n_launches={n_launches} \
+                         pair_chunk={pair_chunk}",
                         mk_sum as f64 / r_mk_len.len().max(1) as f64,
                         r_mk_len.len(),
                         num_products,
@@ -5965,106 +6032,119 @@ fn multiply_batch_block<'a>(
                 let t_w_issue = std::time::Instant::now();
                 // SAFETY: `launch_unchecked` — see the kernel's `address_type = "u64"` note. Every device
                 // read is in-bounds by construction (uploaded `need_*` prefix, per-segment select, `j` guards).
-                unsafe {
-                    multiply_batch_kernel::launch_unchecked::<CudaRuntime>(
-                        &client,
-                        CubeCount::Static(cubes, 1, 1),
-                        CubeDim::new_1d(THREADS),
-                        sa!(cs_seg, 0),
-                        sa!(cs_seg, 1),
-                        sa!(cs_seg, 2),
-                        sa!(cs_seg, 3),
-                        sa!(cs_seg, 4),
-                        sa!(cs_seg, 5),
-                        sa!(cs_seg, 6),
-                        sa!(cs_seg, 7),
-                        sa!(cs_seg, 8),
-                        sa!(cs_seg, 9),
-                        sa!(cs_seg, 10),
-                        sa!(cs_seg, 11),
-                        sa!(cs_seg, 12),
-                        sa!(cs_seg, 13),
-                        sa!(cs_seg, 14),
-                        sa!(cs_seg, 15),
-                        sa!(mk_seg, 0),
-                        sa!(mk_seg, 1),
-                        sa!(mk_seg, 2),
-                        sa!(mk_seg, 3),
-                        sa!(mk_seg, 4),
-                        sa!(mk_seg, 5),
-                        sa!(mk_seg, 6),
-                        sa!(mk_seg, 7),
-                        sa!(mk_seg, 8),
-                        sa!(mk_seg, 9),
-                        sa!(mk_seg, 10),
-                        sa!(mk_seg, 11),
-                        sa!(mk_seg, 12),
-                        sa!(mk_seg, 13),
-                        sa!(mk_seg, 14),
-                        sa!(mk_seg, 15),
-                        sa!(pp_seg, 0),
-                        sa!(pp_seg, 1),
-                        sa!(pp_seg, 2),
-                        sa!(pp_seg, 3),
-                        sa!(pp_seg, 4),
-                        sa!(pp_seg, 5),
-                        sa!(pp_seg, 6),
-                        sa!(pp_seg, 7),
-                        sa!(pp_seg, 8),
-                        sa!(pp_seg, 9),
-                        sa!(pp_seg, 10),
-                        sa!(pp_seg, 11),
-                        sa!(pp_seg, 12),
-                        sa!(pp_seg, 13),
-                        sa!(pp_seg, 14),
-                        sa!(pp_seg, 15),
-                        sa!(ln_seg, 0),
-                        sa!(ln_seg, 1),
-                        sa!(ln_seg, 2),
-                        sa!(ln_seg, 3),
-                        sa!(ln_seg, 4),
-                        sa!(ln_seg, 5),
-                        sa!(ln_seg, 6),
-                        sa!(ln_seg, 7),
-                        sa!(ln_seg, 8),
-                        sa!(ln_seg, 9),
-                        sa!(ln_seg, 10),
-                        sa!(ln_seg, 11),
-                        sa!(ln_seg, 12),
-                        sa!(ln_seg, 13),
-                        sa!(ln_seg, 14),
-                        sa!(ln_seg, 15),
-                        BufferArg::from_raw_parts(tg_h, term_gei_len),
-                        BufferArg::from_raw_parts(g_h, g.len()),
-                        BufferArg::from_raw_parts(xi_h, xi.len()),
-                        BufferArg::from_raw_parts(out_h.clone(), out_len),
-                        BufferArg::from_raw_parts(colmap_h, colmap_len),
-                        use_col_map,
-                        BufferArg::from_raw_parts(rco_h, r_cs_offset.len()),
-                        BufferArg::from_raw_parts(rmo_h, r_mk_offset.len()),
-                        BufferArg::from_raw_parts(rcl_h, r_cs_len.len()),
-                        BufferArg::from_raw_parts(rml_h, r_mk_len.len()),
-                        BufferArg::from_raw_parts(rnm_h, r_num_mats_u32.len()),
-                        BufferArg::from_raw_parts(pri_h, num_products),
-                        BufferArg::from_raw_parts(pts_h, num_products),
-                        BufferArg::from_raw_parts(pnt_h, num_products),
-                        BufferArg::from_raw_parts(prb_h, num_products),
-                        BufferArg::from_raw_parts(poo_h, num_products),
-                        BufferArg::from_raw_parts(pps_h, pps_len),
-                        BufferArg::from_raw_parts(coarse_h, coarse_len),
-                        width,
-                        seg_elems,
-                        num_limbs,
-                        search_iters,
-                        num_segs,
-                        BufferArg::from_raw_parts(psh_h, pp_shift_len),
-                        BufferArg::from_raw_parts(pms_h, pp_shift_len),
-                        work_cap.min(PPART_MAX_LEN),
-                        // Both masters now: `resident_append` transposes the resident one and
-                        // `enumerate_admissible_kernel` the transient one.
-                        cs_transposed(),
-                        seg_hoist(),
-                    );
+                //
+                // One iteration for a normal block. Multiple only when a single row's pair count
+                // passes [`pair_launch_chunk`] — the case that used to abort the run. The launches
+                // are issued on one stream and so run in order; they touch DISJOINT pair ranges, and
+                // `out` is XOR-accumulated, so the result does not depend on that order.
+                for li in 0..n_launches {
+                    let pair_offset = li * pair_chunk;
+                    let this_pairs = (total_pairs - pair_offset).min(pair_chunk);
+                    let this_cubes = (this_pairs as u32).div_ceil(THREADS).max(1);
+                    unsafe {
+                        multiply_batch_kernel::launch_unchecked::<CudaRuntime>(
+                            &client,
+                            CubeCount::Static(this_cubes, 1, 1),
+                            CubeDim::new_1d(THREADS),
+                            sa!(cs_seg, 0),
+                            sa!(cs_seg, 1),
+                            sa!(cs_seg, 2),
+                            sa!(cs_seg, 3),
+                            sa!(cs_seg, 4),
+                            sa!(cs_seg, 5),
+                            sa!(cs_seg, 6),
+                            sa!(cs_seg, 7),
+                            sa!(cs_seg, 8),
+                            sa!(cs_seg, 9),
+                            sa!(cs_seg, 10),
+                            sa!(cs_seg, 11),
+                            sa!(cs_seg, 12),
+                            sa!(cs_seg, 13),
+                            sa!(cs_seg, 14),
+                            sa!(cs_seg, 15),
+                            sa!(mk_seg, 0),
+                            sa!(mk_seg, 1),
+                            sa!(mk_seg, 2),
+                            sa!(mk_seg, 3),
+                            sa!(mk_seg, 4),
+                            sa!(mk_seg, 5),
+                            sa!(mk_seg, 6),
+                            sa!(mk_seg, 7),
+                            sa!(mk_seg, 8),
+                            sa!(mk_seg, 9),
+                            sa!(mk_seg, 10),
+                            sa!(mk_seg, 11),
+                            sa!(mk_seg, 12),
+                            sa!(mk_seg, 13),
+                            sa!(mk_seg, 14),
+                            sa!(mk_seg, 15),
+                            sa!(pp_seg, 0),
+                            sa!(pp_seg, 1),
+                            sa!(pp_seg, 2),
+                            sa!(pp_seg, 3),
+                            sa!(pp_seg, 4),
+                            sa!(pp_seg, 5),
+                            sa!(pp_seg, 6),
+                            sa!(pp_seg, 7),
+                            sa!(pp_seg, 8),
+                            sa!(pp_seg, 9),
+                            sa!(pp_seg, 10),
+                            sa!(pp_seg, 11),
+                            sa!(pp_seg, 12),
+                            sa!(pp_seg, 13),
+                            sa!(pp_seg, 14),
+                            sa!(pp_seg, 15),
+                            sa!(ln_seg, 0),
+                            sa!(ln_seg, 1),
+                            sa!(ln_seg, 2),
+                            sa!(ln_seg, 3),
+                            sa!(ln_seg, 4),
+                            sa!(ln_seg, 5),
+                            sa!(ln_seg, 6),
+                            sa!(ln_seg, 7),
+                            sa!(ln_seg, 8),
+                            sa!(ln_seg, 9),
+                            sa!(ln_seg, 10),
+                            sa!(ln_seg, 11),
+                            sa!(ln_seg, 12),
+                            sa!(ln_seg, 13),
+                            sa!(ln_seg, 14),
+                            sa!(ln_seg, 15),
+                            // `.clone()` on every handle: the loop may issue more than one launch and
+                            // `BufferArg::from_raw_parts` takes them by value.
+                            BufferArg::from_raw_parts(tg_h.clone(), term_gei_len),
+                            BufferArg::from_raw_parts(g_h.clone(), g.len()),
+                            BufferArg::from_raw_parts(xi_h.clone(), xi.len()),
+                            BufferArg::from_raw_parts(out_h.clone(), out_len),
+                            BufferArg::from_raw_parts(colmap_h.clone(), colmap_len),
+                            use_col_map,
+                            BufferArg::from_raw_parts(rco_h.clone(), r_cs_offset.len()),
+                            BufferArg::from_raw_parts(rmo_h.clone(), r_mk_offset.len()),
+                            BufferArg::from_raw_parts(rcl_h.clone(), r_cs_len.len()),
+                            BufferArg::from_raw_parts(rml_h.clone(), r_mk_len.len()),
+                            BufferArg::from_raw_parts(rnm_h.clone(), r_num_mats_u32.len()),
+                            BufferArg::from_raw_parts(pri_h.clone(), num_products),
+                            BufferArg::from_raw_parts(pts_h.clone(), num_products),
+                            BufferArg::from_raw_parts(pnt_h.clone(), num_products),
+                            BufferArg::from_raw_parts(prb_h.clone(), num_products),
+                            BufferArg::from_raw_parts(poo_h.clone(), num_products),
+                            BufferArg::from_raw_parts(pps_h.clone(), pps_len),
+                            BufferArg::from_raw_parts(coarse_h.clone(), coarse_len),
+                            pair_offset as u64,
+                            width,
+                            seg_elems,
+                            num_limbs,
+                            search_iters,
+                            num_segs,
+                            BufferArg::from_raw_parts(psh_h.clone(), pp_shift_len),
+                            BufferArg::from_raw_parts(pms_h.clone(), pp_shift_len),
+                            work_cap.min(PPART_MAX_LEN),
+                            // Both masters now: `resident_append` transposes the resident one and
+                            // `enumerate_admissible_kernel` the transient one.
+                            cs_transposed(),
+                            seg_hoist(),
+                        );
+                    }
                 }
 
                 // Issue the readback but DO NOT wait for it. `read_async` enqueues the device→host copy
