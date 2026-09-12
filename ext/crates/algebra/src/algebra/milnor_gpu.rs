@@ -4371,6 +4371,167 @@ pub static CENSUS_PRODUCTS_DISTINCT: AtomicU64 = AtomicU64::new(0);
 
 static CENSUS_ON: LazyLock<bool> = LazyLock::new(|| std::env::var_os("NASSAU_CENSUS").is_some());
 
+/// Reuse census (`NASSAU_REUSE_CENSUS`): how much work repeats ACROSS launches, not within one.
+///
+/// [`census_batch`] answers a different question -- duplication inside a single product list -- and
+/// resets its `seen` set every launch. The question a cross-bidegree product cache turns on is
+/// whether the SAME `(r_degree, r_idx, s_degree, term_indices)` recurs in a LATER launch, because
+/// that is what a cache would hit and a per-launch dedup cannot.
+///
+/// Why it is worth measuring rather than assuming: the rival implementation (`wulx02/ext`, the
+/// t<=350 Grid paper) is pure CPU with no GPU at all, and its per-task times are competitive with
+/// ours. Its central structure is a product cache keyed by the OPERANDS alone --
+/// `HashMap<(CoeffKey, CoeffKey), ProductList>` plus per-profile banks and an explicit negative
+/// cache for empty products -- shared across every task in a fixed-internal-degree layer. Our own
+/// reuse cache is keyed `(s, degree, profile)`, so it shares across `t` at fixed `s` (what the
+/// wavefront produces) and never across `s`. Our `R`-reference distribution is steeply skewed (top
+/// 1% of `R`s carry 31% of references), so there may be a great deal to hit.
+///
+/// Counting only. It does NOT show that caching would pay: a hit must also be cheaper to store and
+/// look up on the host than to recompute on an otherwise-busy device, which is the opposite of the
+/// trade a CPU implementation faces. A low number kills the idea; a high number only licenses the
+/// next experiment.
+static REUSE_ON: LazyLock<bool> =
+    LazyLock::new(|| std::env::var_os("NASSAU_REUSE_CENSUS").is_some());
+
+/// Cap on distinct keys held, so a measurement build cannot OOM a frontier run. On saturation the
+/// map stops growing and [`REUSE_SATURATED`] latches, which makes the reported ratio a LOWER bound
+/// rather than silently wrong.
+/// Overridable with `NASSAU_REUSE_MAX_KEYS`. Two readings are worth having and they differ:
+/// a SMALL cap measures the hit rate a cache of that size would actually achieve (filled
+/// first-come, so a real eviction policy would do better), while a cap larger than the distinct-key
+/// count measures the unbounded ceiling. At 40M the frontier saturates in ~25 min and the reported
+/// share keeps climbing, so the capped figure alone cannot say whether the ceiling is 20% or 60%.
+fn reuse_max_keys() -> usize {
+    static N: LazyLock<usize> = LazyLock::new(|| {
+        std::env::var("NASSAU_REUSE_MAX_KEYS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(REUSE_MAX_KEYS)
+    });
+    *N
+}
+
+const REUSE_MAX_KEYS: usize = 40_000_000;
+
+static REUSE_MAP: LazyLock<Mutex<rustc_hash::FxHashMap<u64, u32>>> =
+    LazyLock::new(|| Mutex::new(rustc_hash::FxHashMap::default()));
+static REUSE_OCCURRENCES: AtomicU64 = AtomicU64::new(0);
+static REUSE_REPEAT_OCCURRENCES: AtomicU64 = AtomicU64::new(0);
+static REUSE_PAIRS_TOTAL: AtomicU64 = AtomicU64::new(0);
+static REUSE_PAIRS_REPEAT: AtomicU64 = AtomicU64::new(0);
+static REUSE_SATURATED: AtomicU64 = AtomicU64::new(0);
+
+fn reuse_key(p: &GpuProduct) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = rustc_hash::FxHasher::default();
+    p.r_degree.hash(&mut h);
+    p.r_idx.hash(&mut h);
+    p.s_degree.hash(&mut h);
+    p.term_indices.hash(&mut h);
+    h.finish()
+}
+
+fn reuse_census_batch(products: &[GpuProduct]) {
+    if !*REUSE_ON {
+        return;
+    }
+    // Fold per-launch, then take the global lock ONCE. A lock per product would serialise the
+    // marshal path, which is where a past priority inversion came from.
+    let mut local: rustc_hash::FxHashMap<u64, (u32, u32)> =
+        rustc_hash::FxHashMap::with_capacity_and_hasher(products.len(), Default::default());
+    for p in products {
+        let e = local.entry(reuse_key(p)).or_insert((0, 0));
+        e.0 += 1;
+        e.1 = p.term_indices.len() as u32;
+    }
+    let mut map = REUSE_MAP.lock().unwrap();
+    let saturated = map.len() >= reuse_max_keys();
+    let (mut occ, mut rep, mut pairs, mut rpairs) = (0u64, 0u64, 0u64, 0u64);
+    for (k, (n, nt)) in local {
+        occ += n as u64;
+        pairs += n as u64 * nt as u64;
+        match map.get_mut(&k) {
+            Some(prev) => {
+                // Every occurrence in THIS launch is a repeat: the key was already seen earlier.
+                rep += n as u64;
+                rpairs += n as u64 * nt as u64;
+                *prev = prev.saturating_add(n);
+            }
+            None => {
+                // First sighting: the launch's own duplicates beyond the first are within-launch
+                // redundancy, which `census_batch` already reports, so they are not counted here.
+                if !saturated {
+                    map.insert(k, n);
+                }
+            }
+        }
+    }
+    drop(map);
+    if saturated {
+        REUSE_SATURATED.store(1, Ordering::Relaxed);
+    }
+    REUSE_OCCURRENCES.fetch_add(occ, Ordering::Relaxed);
+    REUSE_REPEAT_OCCURRENCES.fetch_add(rep, Ordering::Relaxed);
+    REUSE_PAIRS_TOTAL.fetch_add(pairs, Ordering::Relaxed);
+    REUSE_PAIRS_REPEAT.fetch_add(rpairs, Ordering::Relaxed);
+
+    // Report periodically, not only at the end. `dump_reuse_census` runs when the wavefront
+    // finishes, and a frontier measurement run is always killed long before that -- an end-of-run
+    // dump would have produced nothing at all. `fetch_add` returns a unique ticket, so exactly one
+    // caller sees each multiple; testing a separate `load` against `% n == 0` can fire never under
+    // ~100 concurrent callers, which has happened here before.
+    let n = REUSE_LAUNCHES.fetch_add(1, Ordering::Relaxed) + 1;
+    if n % reuse_report_every() == 0 {
+        dump_reuse_census();
+    }
+}
+
+static REUSE_LAUNCHES: AtomicU64 = AtomicU64::new(0);
+
+/// How many BATCH calls between reports (`NASSAU_REUSE_EVERY`, default 100).
+///
+/// Counted in calls to this function -- one per `multiply_batch_on_gpu_masked`, i.e. one per
+/// `milnor_multiply` -- NOT in the `calls` of `[batch-stats]`, which counts row BLOCKS. Measured at
+/// the frontier the ratio is about 37 blocks per call, so an interval that looks small against
+/// `[batch-stats]` is large here: a first attempt at 2000 would have needed roughly three times the
+/// measurement run's length to emit anything at all, and produced a silent empty log.
+fn reuse_report_every() -> u64 {
+    static N: LazyLock<u64> = LazyLock::new(|| {
+        std::env::var("NASSAU_REUSE_EVERY")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(100)
+    });
+    *N
+}
+
+/// Print the cross-launch reuse census.
+pub fn dump_reuse_census() {
+    if !*REUSE_ON {
+        return;
+    }
+    let occ = REUSE_OCCURRENCES.load(Ordering::Relaxed);
+    let rep = REUSE_REPEAT_OCCURRENCES.load(Ordering::Relaxed);
+    let pairs = REUSE_PAIRS_TOTAL.load(Ordering::Relaxed);
+    let rpairs = REUSE_PAIRS_REPEAT.load(Ordering::Relaxed);
+    let distinct = REUSE_MAP.lock().unwrap().len();
+    let pct = |a: u64, b: u64| if b == 0 { 0.0 } else { 100.0 * a as f64 / b as f64 };
+    eprintln!(
+        "[reuse] products={occ} distinct={distinct} repeat={rep} ({:.1}%) | \
+         pairs={pairs} repeat_pairs={rpairs} ({:.1}%){}",
+        pct(rep, occ),
+        pct(rpairs, pairs),
+        if REUSE_SATURATED.load(Ordering::Relaxed) == 1 {
+            " SATURATED (lower bound)"
+        } else {
+            ""
+        },
+    );
+}
+
 fn census_batch(products: &[GpuProduct]) {
     if !*CENSUS_ON {
         return;
@@ -4445,6 +4606,7 @@ pub fn multiply_batch_on_gpu_masked(
     products: &[GpuProduct],
 ) -> BatchOutput {
     census_batch(products);
+    reuse_census_batch(products);
     // Before anything touches the device: this thread may be running a bidegree's authoritative
     // CPU attempt, in which case the whole point is that no GPU is involved.
     if cpu_forced() {

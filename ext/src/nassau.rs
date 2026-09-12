@@ -4949,6 +4949,10 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
         #[cfg(feature = "gpu")]
         {
             algebra::milnor_gpu::dump_census();
+            // Cross-launch product reuse (`NASSAU_REUSE_CENSUS`): would a cache keyed by the
+            // OPERANDS, shared across bidegrees, hit? `dump_census` measures within-launch
+            // duplication only, which a per-launch dedup already covers.
+            algebra::milnor_gpu::dump_reuse_census();
             algebra::milnor_gpu::dump_r_stats();
             // Which theta would have fit: see `resident_degree_cap`.
             algebra::milnor_gpu::dump_master_by_degree();
