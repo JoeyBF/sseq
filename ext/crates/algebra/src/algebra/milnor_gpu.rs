@@ -10324,17 +10324,29 @@ mod tests {
 
         let products = Arc::new(products);
         let launches = AtomicU64::new(0);
-        // Warm up OUTSIDE the timed window: the first launch pays enumeration into the resident master
-        // and cubecl's pool growth, which is startup, not steady state.
-        let _ = super::multiply_batch_on_gpu_masked(
-            &algebra,
-            out_cols,
-            col_map.clone(),
-            num_rows,
-            &products,
-        );
+        // Warm up for a fixed TIME, not a fixed count. ONE warm-up launch was not remotely enough: at
+        // 30s windows the same binary measured 1.21, 1.35 and 1.91e11 products/exec-s on three
+        // identical runs -- a 58% monotone climb, with the other tile climbing too, i.e. a shared ramp
+        // rather than noise. The transient outlasts many launches (resident-master growth, cubecl pool
+        // growth, device clocks off idle), so the window has to start after it, and the measured window
+        // has to be long enough that what remains is small.
+        let warmup = env_num("NASSAU_BENCH_WARMUP_SECS", 30);
+        let w_end = Instant::now() + Duration::from_secs(warmup);
+        let mut w_n = 0u64;
+        while Instant::now() < w_end {
+            let _ = super::multiply_batch_on_gpu_masked(
+                &algebra,
+                out_cols,
+                col_map.clone(),
+                num_rows,
+                &products,
+            );
+            w_n += 1;
+        }
+        // Discard everything the warm-up accumulated.
         let _ = super::take_batch_stats();
         let _ = super::take_gpu_timing();
+        eprintln!("[replay] warmup {warmup}s, {w_n} launches discarded");
 
         let started = Instant::now();
         let deadline = started + Duration::from_secs(secs);
