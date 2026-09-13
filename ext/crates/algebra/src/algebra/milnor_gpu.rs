@@ -42,6 +42,15 @@ const WORKING_CAP: usize = 32;
 /// The multiply kernel's `working` accumulator therefore packs into one `u64` with no loss.
 const PPART_MAX_LEN: usize = 10;
 
+/// How many leading p-part digits fit wholly below bit 32 of the packed `working` accumulator.
+///
+/// `PPart::SHIFTS` is `[0, 11, 21, 30, 38, 45, 51, 56, 60, 63]`, so digits 0, 1 and 2 occupy bits
+/// 0..30 and digit 3 straddles the word boundary at 30..38. The multiply kernel splits its column
+/// loop here so the first three columns accumulate in 32 bits: a `u64` shift-and-or is
+/// `SHF.L.U32` + `SHF.L.U64.HI` + two `LOP3` per lane, and below the boundary the upper half of
+/// each is dead. `ppart_split_is_sound` pins the value to the table rather than to this comment.
+const COL_SPLIT_32: usize = 3;
+
 /// Bit offset and value mask of each packed p-part field, uploaded per launch (80 bytes) so the
 /// kernel can unpack `working` without a per-thread array. Mirrors `PPart`'s private tables.
 fn ppart_shift_mask() -> (Vec<u32>, Vec<u32>) {
@@ -1020,7 +1029,11 @@ fn admit(bytes: u64) -> AdmitGuard {
         }
     }
     if parked {
-        tracing::debug!(bytes, waited_ms = start.elapsed().as_millis() as u64, "gpu admission");
+        tracing::debug!(
+            bytes,
+            waited_ms = start.elapsed().as_millis() as u64,
+            "gpu admission"
+        );
     }
     *in_flight += bytes;
     AdmitGuard(bytes)
@@ -1351,8 +1364,9 @@ fn configure_pools(dev: usize, client: &cubecl::prelude::ComputeClient<CudaRunti
         return;
     }
     use cubecl::config::memory::{MemoryPoolsConfig, MemoryPoolsPreset};
-    let applied =
-        client.configure_memory_pools(&MemoryPoolsConfig::Preset(MemoryPoolsPreset::ExclusivePages));
+    let applied = client.configure_memory_pools(&MemoryPoolsConfig::Preset(
+        MemoryPoolsPreset::ExclusivePages,
+    ));
     eprintln!("[nassau-gpu] device {dev}: ExclusivePages memory pools applied={applied}");
 }
 
@@ -3841,8 +3855,19 @@ fn multiply_pair(
 
     if rejected == 0u32 {
         pair_emit(
-            g, xi, out, col_map, use_col_map, working, row_base, out_offset, width, num_limbs,
-            sq_len, pp_shift, pp_mask,
+            g,
+            xi,
+            out,
+            col_map,
+            use_col_map,
+            working,
+            row_base,
+            out_offset,
+            width,
+            num_limbs,
+            sq_len,
+            pp_shift,
+            pp_mask,
         );
     }
 }
@@ -4154,10 +4179,14 @@ fn multiply_batch_kernel(
     let mk_len_u = u32::cast_from(mk_len);
 
     let mut working = Array::<u64>::new(MATRIX_GROUP * TERM_GROUP);
+    // 32-bit accumulator for the columns below [`COL_SPLIT_32`]; folded into `working` and dead
+    // before the 64-bit segment starts, so it is not live alongside it.
+    let mut lo = Array::<u32>::new(MATRIX_GROUP * TERM_GROUP);
     let mut rejected = Array::<u32>::new(MATRIX_GROUP * TERM_GROUP);
     #[unroll]
     for i in 0..MATRIX_GROUP * TERM_GROUP {
         working[i] = 0u64;
+        lo[i] = 0u32;
         rejected[i] = 0u32;
     }
 
@@ -4210,8 +4239,39 @@ fn multiply_batch_kernel(
             mk_b[mm] = mk_loc0 + mi * mk_len_u;
         }
     }
+    // THE COLUMN LOOP, IN THREE COMPTIME SEGMENTS.
+    //
+    // One loop over `0..cols` had to ask, per column, both "is this digit inside the packed
+    // accumulator?" (`ju < PPART_MAX_LEN`) and nothing about where the digit LANDS, so every lane's
+    // accumulate was a full 64-bit shift-and-or predicated on that test: per column, six
+    // `SHF.L.U32` + six `SHF.L.U64.HI` + twelve `SEL` (the predicate, materialised as a select of
+    // the shifted value against zero) + twelve `LOP3` = 36 of the loop's 121 SASS instructions,
+    // paid on EVERY column including the ones past the accumulator that contribute nothing.
+    //
+    // Both questions are answered by the column INDEX, so splitting the iteration space answers
+    // them at compile time instead:
+    //  - `0..COL_SPLIT_32`: [`PPart::SHIFTS`] puts these digits wholly below bit 32, so the
+    //    accumulate is 32-bit -- half the shifts and half the ORs.
+    //  - `COL_SPLIT_32..PPART_MAX_LEN`: the digits that straddle or exceed bit 32; 64-bit, but with
+    //    no `acc` test, so the twelve `SEL` are gone here too.
+    //  - `PPART_MAX_LEN..cols`: no accumulate at all, just the rejection test.
+    //
+    // The price is the read half of the body written three times. `mk_len` runs to 12 against
+    // `PPART_MAX_LEN = 10` on a frontier launch (mean 9.1), so the third segment is one or two
+    // columns of nine -- it is there for correctness at any shape, not for its own sake.
     let cols_u = u32::cast_from(cols);
-    for ju in 0..cols_u {
+    let split32 = u32::cast_from(COL_SPLIT_32);
+    let packed = u32::cast_from(PPART_MAX_LEN);
+    let mut end_lo = cols_u;
+    if end_lo > split32 {
+        end_lo = split32;
+    }
+    let mut end_hi = cols_u;
+    if end_hi > packed {
+        end_hi = packed;
+    }
+
+    for ju in 0..end_lo {
         // One `col_sums`/`masks` pair per matrix in the tile, shared by every term.
         let mut cs = Array::<u32>::new(MATRIX_GROUP);
         let mut mk = Array::<u32>::new(MATRIX_GROUP);
@@ -4221,14 +4281,48 @@ fn multiply_batch_kernel(
             let mut k = 0u32;
             if ju < cs_len_u {
                 c = u32::cast_from(seg_read_u16_at(
-                    cs0, cs1, cs2, cs3, cs4, cs5, cs6, cs7, cs8, cs9, cs10, cs11, cs12, cs13, cs14,
-                    cs15, cs_seg, cs_b[mm] + ju * cs_stride, num_segs,
+                    cs0,
+                    cs1,
+                    cs2,
+                    cs3,
+                    cs4,
+                    cs5,
+                    cs6,
+                    cs7,
+                    cs8,
+                    cs9,
+                    cs10,
+                    cs11,
+                    cs12,
+                    cs13,
+                    cs14,
+                    cs15,
+                    cs_seg,
+                    cs_b[mm] + ju * cs_stride,
+                    num_segs,
                 ));
             }
             if ju < mk_len_u {
                 k = u32::cast_from(seg_read_u16_at(
-                    mk0, mk1, mk2, mk3, mk4, mk5, mk6, mk7, mk8, mk9, mk10, mk11, mk12, mk13, mk14,
-                    mk15, mk_seg, mk_b[mm] + ju * mk_stride, num_segs,
+                    mk0,
+                    mk1,
+                    mk2,
+                    mk3,
+                    mk4,
+                    mk5,
+                    mk6,
+                    mk7,
+                    mk8,
+                    mk9,
+                    mk10,
+                    mk11,
+                    mk12,
+                    mk13,
+                    mk14,
+                    mk15,
+                    mk_seg,
+                    mk_b[mm] + ju * mk_stride,
+                    num_segs,
                 ));
             }
             cs[mm] = c;
@@ -4249,45 +4343,59 @@ fn multiply_batch_kernel(
             if ju < term_len[tt] {
                 if num_segs == 1 {
                     v = u32::cast_from(seg_read_u16_at(
-                        pp0, pp1, pp2, pp3, pp4, pp5, pp6, pp7, pp8, pp9, pp10, pp11, pp12, pp13,
-                        pp14, pp15, 0u32, pp_off_u[tt] + ju, num_segs,
+                        pp0,
+                        pp1,
+                        pp2,
+                        pp3,
+                        pp4,
+                        pp5,
+                        pp6,
+                        pp7,
+                        pp8,
+                        pp9,
+                        pp10,
+                        pp11,
+                        pp12,
+                        pp13,
+                        pp14,
+                        pp15,
+                        0u32,
+                        pp_off_u[tt] + ju,
+                        num_segs,
                     ));
                 } else {
-                v = u32::cast_from(seg_read_u16(
-                    pp0,
-                    pp1,
-                    pp2,
-                    pp3,
-                    pp4,
-                    pp5,
-                    pp6,
-                    pp7,
-                    pp8,
-                    pp9,
-                    pp10,
-                    pp11,
-                    pp12,
-                    pp13,
-                    pp14,
-                    pp15,
-                    usize::cast_from(pp_off[tt]) + usize::cast_from(ju),
-                    seg_elems,
-                    num_segs,
-                ));
+                    v = u32::cast_from(seg_read_u16(
+                        pp0,
+                        pp1,
+                        pp2,
+                        pp3,
+                        pp4,
+                        pp5,
+                        pp6,
+                        pp7,
+                        pp8,
+                        pp9,
+                        pp10,
+                        pp11,
+                        pp12,
+                        pp13,
+                        pp14,
+                        pp15,
+                        usize::cast_from(pp_off[tt]) + usize::cast_from(ju),
+                        seg_elems,
+                        num_segs,
+                    ));
                 }
             }
             b[tt] = v;
         }
 
-        // `pp_shift[j]` is one load per column, shared by all `MATRIX_GROUP * TERM_GROUP` lanes;
-        // reading it once here rather than inside the lane loop keeps it that way regardless of
-        // whether the compiler chooses to CSE it. Only positions below [`PPART_MAX_LEN`] can be
-        // non-zero in the packed accumulator, so beyond that the shift is not even loaded.
-        let mut sh = 0u32;
-        let acc = ju < u32::cast_from(PPART_MAX_LEN);
-        if acc {
-            sh = pp_shift[usize::cast_from(ju)];
-        }
+        // Digits below [`COL_SPLIT_32`] sit wholly inside the low 32 bits, so this accumulate is a
+        // 32-bit `SHF.L.U32` and one `LOP3` per lane instead of the `SHF.L.U32` + `SHF.L.U64.HI` +
+        // two `LOP3` a `u64` shift-and-or costs. The stray [`PAIR_COL_REJECT`] bit may now fall off
+        // the top rather than land at bit `16 + sh`; either way the lane that set it is discarded
+        // unread, exactly as in the `u64` form.
+        let sh = pp_shift[usize::cast_from(ju)];
         #[unroll]
         for tt in 0..TERM_GROUP {
             #[unroll]
@@ -4295,13 +4403,283 @@ fn multiply_batch_kernel(
                 let val = pair_col_u32(b[tt], cs[mm], mk[mm]);
                 let i = mm * TERM_GROUP + tt;
                 rejected[i] |= val & PAIR_COL_REJECT;
-                if acc {
-                    // No `& 0xffff` before the shift. The only bit it masked off is
-                    // [`PAIR_COL_REJECT`], and a column that sets that bit has also just set
-                    // `rejected[i]`, so this lane's `working` is discarded unread. Letting the
-                    // stray bit land saves a `LOP3` per lane per column.
-                    working[i] |= u64::cast_from(val) << u64::cast_from(sh);
+                lo[i] |= val << sh;
+            }
+        }
+    }
+
+    // `lo` dies here, so the two accumulators are never live at once and the split costs no
+    // registers over the single `u64` array.
+    #[unroll]
+    for i in 0..MATRIX_GROUP * TERM_GROUP {
+        working[i] = u64::cast_from(lo[i]);
+    }
+    for ju in end_lo..end_hi {
+        // One `col_sums`/`masks` pair per matrix in the tile, shared by every term.
+        let mut cs = Array::<u32>::new(MATRIX_GROUP);
+        let mut mk = Array::<u32>::new(MATRIX_GROUP);
+        #[unroll]
+        for mm in 0..MATRIX_GROUP {
+            let mut c = 0u32;
+            let mut k = 0u32;
+            if ju < cs_len_u {
+                c = u32::cast_from(seg_read_u16_at(
+                    cs0,
+                    cs1,
+                    cs2,
+                    cs3,
+                    cs4,
+                    cs5,
+                    cs6,
+                    cs7,
+                    cs8,
+                    cs9,
+                    cs10,
+                    cs11,
+                    cs12,
+                    cs13,
+                    cs14,
+                    cs15,
+                    cs_seg,
+                    cs_b[mm] + ju * cs_stride,
+                    num_segs,
+                ));
+            }
+            if ju < mk_len_u {
+                k = u32::cast_from(seg_read_u16_at(
+                    mk0,
+                    mk1,
+                    mk2,
+                    mk3,
+                    mk4,
+                    mk5,
+                    mk6,
+                    mk7,
+                    mk8,
+                    mk9,
+                    mk10,
+                    mk11,
+                    mk12,
+                    mk13,
+                    mk14,
+                    mk15,
+                    mk_seg,
+                    mk_b[mm] + ju * mk_stride,
+                    num_segs,
+                ));
+            }
+            cs[mm] = c;
+            mk[mm] = k;
+        }
+
+        // One p-part read per term in the tile, shared by every matrix.
+        //
+        // A basis row sits at `gei * width` in the resident BASIS store, which is appended with no
+        // boundary padding, so a row there MAY straddle a segment and the split cannot be hoisted
+        // out of the loop the way `col_sums`/`masks` can. With a single segment there is nothing to
+        // straddle and every offset is below `seg_elems ≤ 2^31`, so the same u32 form applies; that
+        // case is comptime (`num_segs`), so only one of these two is ever compiled.
+        let mut b = Array::<u32>::new(TERM_GROUP);
+        #[unroll]
+        for tt in 0..TERM_GROUP {
+            let mut v = 0u32;
+            if ju < term_len[tt] {
+                if num_segs == 1 {
+                    v = u32::cast_from(seg_read_u16_at(
+                        pp0,
+                        pp1,
+                        pp2,
+                        pp3,
+                        pp4,
+                        pp5,
+                        pp6,
+                        pp7,
+                        pp8,
+                        pp9,
+                        pp10,
+                        pp11,
+                        pp12,
+                        pp13,
+                        pp14,
+                        pp15,
+                        0u32,
+                        pp_off_u[tt] + ju,
+                        num_segs,
+                    ));
+                } else {
+                    v = u32::cast_from(seg_read_u16(
+                        pp0,
+                        pp1,
+                        pp2,
+                        pp3,
+                        pp4,
+                        pp5,
+                        pp6,
+                        pp7,
+                        pp8,
+                        pp9,
+                        pp10,
+                        pp11,
+                        pp12,
+                        pp13,
+                        pp14,
+                        pp15,
+                        usize::cast_from(pp_off[tt]) + usize::cast_from(ju),
+                        seg_elems,
+                        num_segs,
+                    ));
                 }
+            }
+            b[tt] = v;
+        }
+
+        // `pp_shift[j]` is one load per column, shared by all `MATRIX_GROUP * TERM_GROUP` lanes;
+        // reading it once here rather than inside the lane loop keeps it that way regardless of
+        // whether the compiler chooses to CSE it.
+        let sh = pp_shift[usize::cast_from(ju)];
+        #[unroll]
+        for tt in 0..TERM_GROUP {
+            #[unroll]
+            for mm in 0..MATRIX_GROUP {
+                let val = pair_col_u32(b[tt], cs[mm], mk[mm]);
+                let i = mm * TERM_GROUP + tt;
+                rejected[i] |= val & PAIR_COL_REJECT;
+                // No `& 0xffff` before the shift. The only bit it masked off is
+                // [`PAIR_COL_REJECT`], and a column that sets that bit has also just set
+                // `rejected[i]`, so this lane's `working` is discarded unread. Letting the
+                // stray bit land saves a `LOP3` per lane per column.
+                working[i] |= u64::cast_from(val) << u64::cast_from(sh);
+            }
+        }
+    }
+    for ju in end_hi..cols_u {
+        // One `col_sums`/`masks` pair per matrix in the tile, shared by every term.
+        let mut cs = Array::<u32>::new(MATRIX_GROUP);
+        let mut mk = Array::<u32>::new(MATRIX_GROUP);
+        #[unroll]
+        for mm in 0..MATRIX_GROUP {
+            let mut c = 0u32;
+            let mut k = 0u32;
+            if ju < cs_len_u {
+                c = u32::cast_from(seg_read_u16_at(
+                    cs0,
+                    cs1,
+                    cs2,
+                    cs3,
+                    cs4,
+                    cs5,
+                    cs6,
+                    cs7,
+                    cs8,
+                    cs9,
+                    cs10,
+                    cs11,
+                    cs12,
+                    cs13,
+                    cs14,
+                    cs15,
+                    cs_seg,
+                    cs_b[mm] + ju * cs_stride,
+                    num_segs,
+                ));
+            }
+            if ju < mk_len_u {
+                k = u32::cast_from(seg_read_u16_at(
+                    mk0,
+                    mk1,
+                    mk2,
+                    mk3,
+                    mk4,
+                    mk5,
+                    mk6,
+                    mk7,
+                    mk8,
+                    mk9,
+                    mk10,
+                    mk11,
+                    mk12,
+                    mk13,
+                    mk14,
+                    mk15,
+                    mk_seg,
+                    mk_b[mm] + ju * mk_stride,
+                    num_segs,
+                ));
+            }
+            cs[mm] = c;
+            mk[mm] = k;
+        }
+
+        // One p-part read per term in the tile, shared by every matrix.
+        //
+        // A basis row sits at `gei * width` in the resident BASIS store, which is appended with no
+        // boundary padding, so a row there MAY straddle a segment and the split cannot be hoisted
+        // out of the loop the way `col_sums`/`masks` can. With a single segment there is nothing to
+        // straddle and every offset is below `seg_elems ≤ 2^31`, so the same u32 form applies; that
+        // case is comptime (`num_segs`), so only one of these two is ever compiled.
+        let mut b = Array::<u32>::new(TERM_GROUP);
+        #[unroll]
+        for tt in 0..TERM_GROUP {
+            let mut v = 0u32;
+            if ju < term_len[tt] {
+                if num_segs == 1 {
+                    v = u32::cast_from(seg_read_u16_at(
+                        pp0,
+                        pp1,
+                        pp2,
+                        pp3,
+                        pp4,
+                        pp5,
+                        pp6,
+                        pp7,
+                        pp8,
+                        pp9,
+                        pp10,
+                        pp11,
+                        pp12,
+                        pp13,
+                        pp14,
+                        pp15,
+                        0u32,
+                        pp_off_u[tt] + ju,
+                        num_segs,
+                    ));
+                } else {
+                    v = u32::cast_from(seg_read_u16(
+                        pp0,
+                        pp1,
+                        pp2,
+                        pp3,
+                        pp4,
+                        pp5,
+                        pp6,
+                        pp7,
+                        pp8,
+                        pp9,
+                        pp10,
+                        pp11,
+                        pp12,
+                        pp13,
+                        pp14,
+                        pp15,
+                        usize::cast_from(pp_off[tt]) + usize::cast_from(ju),
+                        seg_elems,
+                        num_segs,
+                    ));
+                }
+            }
+            b[tt] = v;
+        }
+
+        // Past [`PPART_MAX_LEN`] nothing can be accumulated, so this copy carries no shift, no
+        // `pp_shift` load and no accumulate -- only the rejection test, which still applies.
+        #[unroll]
+        for tt in 0..TERM_GROUP {
+            #[unroll]
+            for mm in 0..MATRIX_GROUP {
+                let val = pair_col_u32(b[tt], cs[mm], mk[mm]);
+                let i = mm * TERM_GROUP + tt;
+                rejected[i] |= val & PAIR_COL_REJECT;
             }
         }
     }
@@ -4613,10 +4991,16 @@ pub fn dump_reuse_census() {
     let pairs = REUSE_PAIRS_TOTAL.load(Ordering::Relaxed);
     let rpairs = REUSE_PAIRS_REPEAT.load(Ordering::Relaxed);
     let distinct = REUSE_MAP.lock().unwrap().len();
-    let pct = |a: u64, b: u64| if b == 0 { 0.0 } else { 100.0 * a as f64 / b as f64 };
+    let pct = |a: u64, b: u64| {
+        if b == 0 {
+            0.0
+        } else {
+            100.0 * a as f64 / b as f64
+        }
+    };
     eprintln!(
-        "[reuse] products={occ} distinct={distinct} repeat={rep} ({:.1}%) | \
-         pairs={pairs} repeat_pairs={rpairs} ({:.1}%){}",
+        "[reuse] products={occ} distinct={distinct} repeat={rep} ({:.1}%) | pairs={pairs} \
+         repeat_pairs={rpairs} ({:.1}%){}",
         pct(rep, occ),
         pct(rpairs, pairs),
         if REUSE_SATURATED.load(Ordering::Relaxed) == 1 {
@@ -4682,7 +5066,12 @@ static CAPTURE_BYTES: AtomicU64 = AtomicU64::new(0);
 /// layout that matters is that they are one contiguous run of u32.
 const CAPTURE_MAGIC: &[u8; 8] = b"NASPROD1";
 
-fn capture_batch(out_cols: usize, col_map: Option<&[u32]>, num_rows: usize, products: &[GpuProduct]) {
+fn capture_batch(
+    out_cols: usize,
+    col_map: Option<&[u32]>,
+    num_rows: usize,
+    products: &[GpuProduct],
+) {
     let Some(path) = CAPTURE_PATH.as_deref() else {
         return;
     };
@@ -4744,8 +5133,9 @@ fn capture_batch(out_cols: usize, col_map: Option<&[u32]>, num_rows: usize, prod
     let maxs = products.iter().map(|p| p.s_degree).max().unwrap_or(0);
     match write() {
         Ok(()) => eprintln!(
-            "[capture] call #{n} -> {path}: products={} terms={terms} (mean {:.1}) rows={num_rows} \
-             out_cols={out_cols} col_map={} max_r_degree={maxr} max_s_degree={maxs}",
+            "[capture] call #{n} -> {path}: products={} terms={terms} (mean {:.1}) \
+             rows={num_rows} out_cols={out_cols} col_map={} max_r_degree={maxr} \
+             max_s_degree={maxs}",
             products.len(),
             terms as f64 / products.len().max(1) as f64,
             col_map.map_or(0, <[u32]>::len),
@@ -5119,8 +5509,14 @@ fn multiply_batch_gpu_inner(
                 q
             })
             .collect();
-        let sub_blocks =
-            multiply_batch_grouped(algebra, out_cols, col_map.clone(), rows.len(), &compact, mode);
+        let sub_blocks = multiply_batch_grouped(
+            algebra,
+            out_cols,
+            col_map.clone(),
+            rows.len(),
+            &compact,
+            mode,
+        );
         // Scatter straight out of the device blocks. The first cut flattened them into one
         // `Vec<u32>` first, which allocated and copied the ENTIRE group output — hundreds of MB at
         // the stems that actually need eviction — only to read it once and drop it. Blocks are
@@ -5279,8 +5675,7 @@ fn multiply_batch_grouped(
                         match dev_memo {
                             Some((k, v)) if k == key => v,
                             _ => {
-                                let r =
-                                    algebra.basis_element_from_index(prod.r_degree, prod.r_idx);
+                                let r = algebra.basis_element_from_index(prod.r_degree, prod.r_idx);
                                 let v = shard_of(r.p_part);
                                 dev_memo = Some((key, v));
                                 v
@@ -5375,7 +5770,8 @@ fn multiply_batch_grouped(
             // used to `pop()` an empty vec and panic, killing the worker thread.
             vec![Bytes::from_elems(vec![
                 0u32;
-                block_rows * out_cols.div_ceil(32).max(1)
+                block_rows
+                    * out_cols.div_ceil(32).max(1)
             ])]
         } else if basis_passthrough() || shards.len() == 1 {
             shards
@@ -5782,8 +6178,7 @@ fn multiply_batch_block<'a>(
             let mut order: Vec<usize> = (0..enum_pp_rows.len()).collect();
             order.sort_unstable_by_key(|&i| r_num_matrices[i]);
             // `pick_u32` reorders by `order`, so the per-slot matrix counts need a u32 view first.
-            let r_num_matrices_u32: Vec<u32> =
-                r_num_matrices.iter().map(|&v| v as u32).collect();
+            let r_num_matrices_u32: Vec<u32> = r_num_matrices.iter().map(|&v| v as u32).collect();
 
             let (mut cs_out, mut mk_out) = (vec![0u64; order.len()], vec![0u64; order.len()]);
             let (mut seg, mut seg_start) = (0usize, 0usize);
@@ -6195,8 +6590,8 @@ fn multiply_batch_block<'a>(
                             // matrix offsets, sliced to this segment exactly like the others.
                             let enm_h =
                                 client.create_from_slice(u32::as_bytes(&enum_num_mats[lo..hi]));
-                            let emf_h = client
-                                .create_from_slice(u32::as_bytes(&enum_t_mat_off[tlo..thi]));
+                            let emf_h =
+                                client.create_from_slice(u32::as_bytes(&enum_t_mat_off[tlo..thi]));
                             enum_keep.extend([
                                 cnt_scratch.clone(),
                                 epp_h.clone(),
@@ -6253,10 +6648,8 @@ fn multiply_batch_block<'a>(
                         if enum_timing() {
                             let t_sync = std::time::Instant::now();
                             let _ = cubecl_common::reader::read_sync(client.sync());
-                            ENUM_DEVICE_US.fetch_add(
-                                t_sync.elapsed().as_micros() as u64,
-                                Ordering::Relaxed,
-                            );
+                            ENUM_DEVICE_US
+                                .fetch_add(t_sync.elapsed().as_micros() as u64, Ordering::Relaxed);
                         }
                         ENUM_LAUNCH_US
                             .fetch_add(t_enum.elapsed().as_micros() as u64, Ordering::Relaxed);
@@ -6353,7 +6746,11 @@ fn multiply_batch_block<'a>(
                 // the kernel never reads it with the flag at 0.
                 let (colmap_h, colmap_len, use_col_map) = match col_map.as_deref() {
                     Some(m) => (client.create_from_slice(u32::as_bytes(m)), m.len(), 1u32),
-                    None => (client.create_from_slice(u32::as_bytes(&[0u32])), 1usize, 0u32),
+                    None => (
+                        client.create_from_slice(u32::as_bytes(&[0u32])),
+                        1usize,
+                        0u32,
+                    ),
                 };
                 unsafe {
                     zero_u32::launch::<CudaRuntime>(
@@ -6806,10 +7203,10 @@ fn multiply_batch_block<'a>(
                      wait={wait_s:.1}s) queue={queue_s:.1}s exec={exec_s:.1}s | queue={:.0}% \
                      exec={:.0}% depth mean={:.1} max={depth_max} | launch={launch_s:.1}s \
                      fence={fence_s:.1}s pipeline={:.0}% | enum_launch={enum_launch_s:.1}s \
-                     enum_dev={enum_dev_s:.1}s enum={:.0}% of launch | intern={:.1}s basis={:.1}s tgei={:.1}s \
-                     | enum launches={el} Rs/launch mean={:.0} max={erm} blocks/launch mean={:.0} \
-                     waves/SM={:.3} | prefetched={pf_n} to_degree={pf_d} batches={pfb_n} \
-                     Rs/batch={pfb_mean} max_batch={pfb_max}",
+                     enum_dev={enum_dev_s:.1}s enum={:.0}% of launch | intern={:.1}s basis={:.1}s \
+                     tgei={:.1}s | enum launches={el} Rs/launch mean={:.0} max={erm} \
+                     blocks/launch mean={:.0} waves/SM={:.3} | prefetched={pf_n} to_degree={pf_d} \
+                     batches={pfb_n} Rs/batch={pfb_mean} max_batch={pfb_max}",
                     100.0 * prep_s / total,
                     100.0 * permit_s / total,
                     100.0 * lock_s / total,
@@ -7528,6 +7925,27 @@ fn enumerate_admissible_kernel(
 
 #[cfg(test)]
 mod tests {
+
+    /// [`COL_SPLIT_32`] must be exactly where `PPart`'s packing crosses bit 32.
+    ///
+    /// The multiply kernel accumulates columns below it in `u32`, which is sound only if every
+    /// digit there ends below bit 32, and worth doing only if the next digit does not. Both halves
+    /// are read off `PPart::shift` rather than trusted to the comment, so a change to the packing
+    /// fails here instead of silently truncating a p-part on the device.
+    #[test]
+    fn ppart_split_is_sound() {
+        use super::{COL_SPLIT_32, PPART_MAX_LEN, PPart};
+        const { assert!(COL_SPLIT_32 < PPART_MAX_LEN) };
+        assert!(
+            PPart::shift(COL_SPLIT_32) <= 32,
+            "digit {COL_SPLIT_32} starts at bit {} -- the 32-bit segment would drop real bits",
+            PPart::shift(COL_SPLIT_32),
+        );
+        assert!(
+            PPart::shift(COL_SPLIT_32 + 1) > 32,
+            "the split is short: digit {COL_SPLIT_32} also fits below bit 32",
+        );
+    }
 
     /// Does [`predicted_matrices`] RANK `R`s the way the true enumeration does? Grouping only needs
     /// a monotone key, so rank agreement is the property that matters, not accuracy.
@@ -10477,7 +10895,8 @@ mod tests {
         let mut ones: u64 = 0;
         let mut rows_total: u64 = 0;
         for (bi, (rows, cols, cm, prods)) in batches.iter().enumerate() {
-            let out = super::multiply_batch_on_gpu_masked(&algebra, *cols, cm.clone(), *rows, prods);
+            let out =
+                super::multiply_batch_on_gpu_masked(&algebra, *cols, cm.clone(), *rows, prods);
             mix(bi as u64);
             for (ri, row) in out.iter_rows().enumerate() {
                 mix(ri as u64);
@@ -10552,8 +10971,8 @@ mod tests {
             .sum();
         let nprod: usize = batches.iter().map(|b| b.3.len()).sum();
         eprintln!(
-            "[replay] {} batches from {path} in {:.1}s: products={nprod} terms={terms} \
-             (mean {:.1}/product)",
+            "[replay] {} batches from {path} in {:.1}s: products={nprod} terms={terms} (mean \
+             {:.1}/product)",
             batches.len(),
             t_load.elapsed().as_secs_f64(),
             terms as f64 / nprod.max(1) as f64,
@@ -10640,8 +11059,8 @@ mod tests {
         let us = |v: u64| v as f64 / 1e6;
         let total = (us(prep_us) + us(device_us)).max(1e-9);
         eprintln!(
-            "[replay] {n} launches ({calls} blocks) in {elapsed:.1}s: {:.2e} pairs/s, \
-             {:.2e} pairs/exec-s",
+            "[replay] {n} launches ({calls} blocks) in {elapsed:.1}s: {:.2e} pairs/s, {:.2e} \
+             pairs/exec-s",
             pairs as f64 / elapsed,
             pairs as f64 / us(exec_us).max(1e-9),
         );
