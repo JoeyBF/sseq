@@ -1364,10 +1364,12 @@ fn gpu_client_for(dev: usize) -> &'static cubecl::prelude::ComputeClient<CudaRun
 /// two production restarts on 2026-09-04: `[MEM]` showed `cubecl_use=20.0 cubecl_reserved=133.2`GB
 /// -- 20GB in use, 133GB reserved -- and then
 ///
-///     cubecl-cuda server.rs:124  can't allocate buffer of size: 9381875712
-///     cubecl-cuda server.rs:729  couldn't find resource for that handle:
-///                                Memory location was never initialized
-///     nassau.rs:3807             dx non-zero at (297, 146)
+/// ```text
+/// cubecl-cuda server.rs:124  can't allocate buffer of size: 9381875712
+/// cubecl-cuda server.rs:729  couldn't find resource for that handle:
+///                            Memory location was never initialized
+/// nassau.rs:3807             dx non-zero at (297, 146)
+/// ```
 ///
 /// i.e. the failed allocation left dangling handles and an uninitialised buffer became a WRONG
 /// differential. `ExclusivePages` gives each allocation its own page in exponentially spaced
