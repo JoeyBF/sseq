@@ -4557,7 +4557,30 @@ static CAPTURE_NTH: LazyLock<u64> = LazyLock::new(|| {
         .and_then(|v| v.parse().ok())
         .unwrap_or(200)
 });
+/// How many CONSECUTIVE batches to keep, starting at [`CAPTURE_NTH`]. With more than one, the path is
+/// treated as a DIRECTORY and files are written as `batch_00000.bin`, ...
+///
+/// One batch is the wrong unit. Replaying a single batch in a loop gets both halves wrong: the batch
+/// is a sample from a wide distribution (the one first captured carried 48.9 terms per product against
+/// a 165 population mean, and the tile comparison is a direct function of that number), and looping it
+/// holds the resident master and shift cache at an artificially warm steady state that a real run
+/// never sees. A consecutive RUN of batches carries the true mix of shapes and the natural growth.
+static CAPTURE_COUNT: LazyLock<u64> = LazyLock::new(|| {
+    std::env::var("NASSAU_CAPTURE_COUNT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1)
+});
+/// Stop capturing once this many bytes have been written, so a long capture cannot fill the disk.
+static CAPTURE_MAX_GB: LazyLock<f64> = LazyLock::new(|| {
+    std::env::var("NASSAU_CAPTURE_MAX_GB")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(40.0)
+});
 static CAPTURE_SEEN: AtomicU64 = AtomicU64::new(0);
+static CAPTURE_WRITTEN: AtomicU64 = AtomicU64::new(0);
+static CAPTURE_BYTES: AtomicU64 = AtomicU64::new(0);
 
 /// `NASPROD1` + u64 fields, little-endian throughout. Deliberately a flat dump rather than a serde
 /// format: the term lists dominate the file (a frontier batch is ~540k products x ~165 terms), so the
@@ -4571,9 +4594,21 @@ fn capture_batch(out_cols: usize, col_map: Option<&[u32]>, num_rows: usize, prod
     // `fetch_add` returns a unique ticket per caller, so exactly one call sees the target. Comparing a
     // separate `load` against `== n` can fire never under ~100 concurrent callers.
     let n = CAPTURE_SEEN.fetch_add(1, Ordering::Relaxed) + 1;
-    if n != *CAPTURE_NTH {
+    if n < *CAPTURE_NTH || n >= *CAPTURE_NTH + *CAPTURE_COUNT {
         return;
     }
+    if (CAPTURE_BYTES.load(Ordering::Relaxed) as f64) > *CAPTURE_MAX_GB * 1e9 {
+        return;
+    }
+    let seq = CAPTURE_WRITTEN.fetch_add(1, Ordering::Relaxed);
+    // One batch keeps the old single-file behaviour; a range writes into a directory.
+    let target = if *CAPTURE_COUNT > 1 {
+        let _ = std::fs::create_dir_all(path);
+        format!("{path}/batch_{seq:05}.bin")
+    } else {
+        path.to_owned()
+    };
+    let path = target.as_str();
     use std::io::Write as _;
     let write = || -> std::io::Result<()> {
         let f = std::fs::File::create(path)?;
@@ -4621,6 +4656,9 @@ fn capture_batch(out_cols: usize, col_map: Option<&[u32]>, num_rows: usize, prod
             col_map.map_or(0, <[u32]>::len),
         ),
         Err(e) => eprintln!("[capture] FAILED to write {path}: {e}"),
+    }
+    if let Ok(md) = std::fs::metadata(path) {
+        CAPTURE_BYTES.fetch_add(md.len(), Ordering::Relaxed);
     }
 }
 
@@ -10283,6 +10321,9 @@ mod tests {
             time::{Duration, Instant},
         };
 
+        // A DIRECTORY of consecutive batches, or a single file. The directory form is the one that
+        // matters: replaying one batch in a loop measures a steady state the real run never reaches,
+        // and one batch is a sample from a wide distribution of shapes.
         let Ok(path) = std::env::var("NASSAU_REPLAY_PRODUCTS") else {
             eprintln!("[replay] NASSAU_REPLAY_PRODUCTS is unset; nothing to replay");
             return;
@@ -10296,14 +10337,48 @@ mod tests {
         let secs = env_num("NASSAU_BENCH_SECS", 30);
         let workers = env_num("NASSAU_BENCH_WORKERS", 3) as usize;
 
-        let (num_rows, out_cols, col_map, products) =
-            super::load_captured_batch(&path).expect("failed to load the captured batch");
-        let terms: usize = products.iter().map(|p| p.term_indices.len()).sum();
+        let mut files: Vec<String> = if std::path::Path::new(&path).is_dir() {
+            let mut v: Vec<String> = std::fs::read_dir(&path)
+                .expect("cannot read the replay directory")
+                .filter_map(|e| e.ok())
+                .map(|e| e.path().to_string_lossy().into_owned())
+                .filter(|p| p.ends_with(".bin"))
+                .collect();
+            v.sort();
+            v
+        } else {
+            vec![path.clone()]
+        };
+        if let Ok(lim) = std::env::var("NASSAU_REPLAY_MAX_BATCHES") {
+            if let Ok(k) = lim.parse::<usize>() {
+                files.truncate(k);
+            }
+        }
+        assert!(!files.is_empty(), "no .bin batches found at {path}");
+        let t_load = Instant::now();
+        let batches: Vec<(usize, usize, Option<Arc<[u32]>>, Vec<GpuProduct>)> = files
+            .iter()
+            .map(|f| super::load_captured_batch(f).expect("failed to load a captured batch"))
+            .collect();
+        let terms: usize = batches
+            .iter()
+            .map(|b| b.3.iter().map(|p| p.term_indices.len()).sum::<usize>())
+            .sum();
+        let nprod: usize = batches.iter().map(|b| b.3.len()).sum();
+        eprintln!(
+            "[replay] {} batches from {path} in {:.1}s: products={nprod} terms={terms} \
+             (mean {:.1}/product)",
+            batches.len(),
+            t_load.elapsed().as_secs_f64(),
+            terms as f64 / nprod.max(1) as f64,
+        );
+        // Kept for the single-batch reporting below.
         // The products name basis elements by `(degree, index)`, so the only state a replay needs is
         // the basis out to the highest degree any of them touches -- `r_degree + s_degree`, since the
         // output lives there.
-        let max_degree = products
+        let max_degree = batches
             .iter()
+            .flat_map(|b| b.3.iter())
             .map(|p| p.r_degree + p.s_degree)
             .max()
             .unwrap_or(0)
@@ -10314,15 +10389,11 @@ mod tests {
         algebra.compute_basis(max_degree);
         algebra.compute_seqno_tables(max_degree);
         eprintln!(
-            "[replay] {path}: products={} terms={terms} (mean {:.1}) rows={num_rows} \
-             out_cols={out_cols} col_map={} max_degree={max_degree} basis={:.1}s",
-            products.len(),
-            terms as f64 / products.len().max(1) as f64,
-            col_map.as_ref().map_or(0, |m| m.len()),
+            "[replay] max_degree={max_degree} basis={:.1}s",
             t_basis.elapsed().as_secs_f64(),
         );
 
-        let products = Arc::new(products);
+        let batches = Arc::new(batches);
         let launches = AtomicU64::new(0);
         // Warm up for a fixed TIME, not a fixed count. ONE warm-up launch was not remotely enough: at
         // 30s windows the same binary measured 1.21, 1.35 and 1.91e11 products/exec-s on three
@@ -10333,15 +10404,15 @@ mod tests {
         let warmup = env_num("NASSAU_BENCH_WARMUP_SECS", 30);
         let w_end = Instant::now() + Duration::from_secs(warmup);
         let mut w_n = 0u64;
-        while Instant::now() < w_end {
-            let _ = super::multiply_batch_on_gpu_masked(
-                &algebra,
-                out_cols,
-                col_map.clone(),
-                num_rows,
-                &products,
-            );
-            w_n += 1;
+        'warm: loop {
+            for (rows, cols, cm, prods) in batches.iter() {
+                if Instant::now() >= w_end {
+                    break 'warm;
+                }
+                let _ =
+                    super::multiply_batch_on_gpu_masked(&algebra, *cols, cm.clone(), *rows, prods);
+                w_n += 1;
+            }
         }
         // Discard everything the warm-up accumulated.
         let _ = super::take_batch_stats();
@@ -10351,21 +10422,26 @@ mod tests {
         let started = Instant::now();
         let deadline = started + Duration::from_secs(secs);
         std::thread::scope(|scope| {
-            for _ in 0..workers {
+            for w in 0..workers {
                 let algebra = Arc::clone(&algebra);
-                let products = Arc::clone(&products);
-                let col_map = col_map.clone();
+                let batches = Arc::clone(&batches);
                 let launches = &launches;
                 scope.spawn(move || {
+                    // Each worker starts at a different offset. Starting them all at batch 0 makes
+                    // every worker launch the SAME shape at the same instant, a contention pattern the
+                    // real run does not have.
+                    let mut i = w % batches.len();
                     while Instant::now() < deadline {
+                        let (rows, cols, cm, prods) = &batches[i];
                         let _ = super::multiply_batch_on_gpu_masked(
                             &algebra,
-                            out_cols,
-                            col_map.clone(),
-                            num_rows,
-                            &products,
+                            *cols,
+                            cm.clone(),
+                            *rows,
+                            prods,
                         );
                         launches.fetch_add(1, Ordering::Relaxed);
+                        i = (i + 1) % batches.len();
                     }
                 });
             }
