@@ -4282,6 +4282,25 @@ fn multiply_batch_kernel(
     // The price is the read half of the body written three times. `mk_len` runs to 12 against
     // `PPART_MAX_LEN = 10` on a frontier launch (mean 9.1), so the third segment is one or two
     // columns of nine -- it is there for correctness at any shape, not for its own sake.
+    //
+    // WHAT THIS BOUGHT, AND WHY THE NEXT ONE OF THESE PROBABLY WILL NOT.
+    //
+    // Kernel-level the split is worth 1.133x: ncu over one whole replayed frontier batch, clocks
+    // locked, 2.2453e9 -> 1.9821e9 elapsed cycles and 8.524e11 -> 7.744e11 instructions, with the
+    // measurement reproducing to 0.005% on a repeat. End-to-end on a real frontier resolution,
+    // matched to the same cumulative product count, it is worth 1.012x -- 190.3s -> 188.1s over
+    // three interleaved reps, inside the 2% spread. Worker-thread device time in that same window
+    // did fall by 16%, exactly as the kernel number predicts; the wall did not follow it.
+    //
+    // That is not a broken harness. The same harness, the same seed and the same window put the
+    // commit BEFORE this one's parent at 290.1/290.2s against 215.0/215.2s for this one -- 1.349x,
+    // with 0.05% spread. So the frontier crossed a knee somewhere between: it was multiply-bound at
+    // 290s and is bound by something else at 190s, with roughly 12 launches queued per device and
+    // 60% of each worker's device time spent waiting behind other work rather than in its own
+    // kernel. Further multiply-kernel work is still worth doing for its own sake -- it is 87% of
+    // GPU kernel time, and the margin returns as soon as whatever now binds is removed -- but do
+    // not expect it to show up in a run, and do not size the next optimisation by a kernel ratio.
+    // Find the new constraint first.
     let cols_u = u32::cast_from(cols);
     let split32 = u32::cast_from(COL_SPLIT_32);
     let packed = u32::cast_from(PPART_MAX_LEN);
