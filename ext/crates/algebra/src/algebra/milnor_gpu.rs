@@ -2066,25 +2066,6 @@ fn cs_transposed() -> bool {
     *T
 }
 
-/// `NASSAU_GPU_SEG_HOIST=1`: split the segment once per array per thread instead of per access.
-///
-/// [`seg_read_u16`] recomputes `o / seg_elems` and `o % seg_elems` on every call from a `usize`
-/// offset, and the multiply's gather loop calls it 3 x WORKING_CAP times per thread. The segment is
-/// loop-INVARIANT, though: an `R`'s `col_sums`/`masks` block never straddles a segment (the
-/// transient layout asserts `cs_span <= seg_elems_layout` and starts a new segment rather than split
-/// an `R`), so every read a thread makes lands in the same one.
-///
-/// Hoisting it also lets the per-`j` offset arithmetic run in `u32`: within a segment offsets are
-/// below `seg_elems = 2^31`. That matters because the SASS carries the 64-bit form everywhere --
-/// `ISETP...EX` pairs for bound tests, `IMAD.WIDE` for indices, `LEA`+`LEA.HI.X` for addresses --
-/// about ten instructions of addressing per two bytes loaded, against an opcode mix where only
-/// 13.1% of instructions are the actual algebra.
-fn seg_hoist() -> bool {
-    static H: LazyLock<bool> =
-        LazyLock::new(|| std::env::var("NASSAU_GPU_SEG_HOIST").as_deref() == Ok("1"));
-    *H
-}
-
 /// `NASSAU_GPU_ENUM_TIMING=1`: sync at the end of the transient enumeration region so its device
 /// time lands in `ENUM_DEVICE_US` instead of in the multiply's `fence`.
 ///
@@ -3299,6 +3280,47 @@ fn resident_append(p_part: PPart, cs_len: usize, mk_len: usize, cs: &[u32], mk: 
     let num_mats = (mk.len() / mk_len) as u64;
     let dev = shard_of(p_part);
     host.dev_load[dev] += num_mats;
+    // No `R` may STRADDLE a segment boundary.
+    //
+    // `multiply_batch_kernel` resolves the segment once per array per thread and then indexes
+    // within it in 32 bits — which is what keeps the 64-bit address arithmetic (`IMAD.WIDE`,
+    // `LEA.HI.X`, the `.EX` half of every compare) out of its column loop. That hoist is sound only
+    // if every read a thread makes lands in the same segment, and a thread reads the whole of one
+    // `R`'s `col_sums`/`masks` block.
+    //
+    // The TRANSIENT layout already guarantees it: it starts a new segment rather than split an `R`
+    // (see the `cs_span <= seg_elems_layout` assertion in the layout pass). The resident master
+    // appended blindly, so it did not — and a straddle here would have been silent, since the
+    // kernel would simply read the wrong segment's bytes and XOR a wrong answer that no assertion
+    // catches. Pad up to the boundary instead. A segment is 2^31 elements (4 GiB of `u16`) by
+    // default and a block is a few hundred KB, so the padding is immaterial: at most one block's
+    // worth per 4 GiB.
+    let seg_elems = master_seg_elems();
+    assert!(
+        cs.len() <= seg_elems && mk.len() <= seg_elems,
+        "one R's admissible block ({} cs / {} mk) exceeds a master segment ({seg_elems}); raise \
+         NASSAU_GPU_MASTER_SEG_ELEMS",
+        cs.len(),
+        mk.len(),
+    );
+    let pad_to_segment = |len: usize, span: usize| -> usize {
+        let base = len % seg_elems;
+        if span > 0 && base + span > seg_elems {
+            seg_elems - base
+        } else {
+            0
+        }
+    };
+    let cs_pad = pad_to_segment(host.cs_len[dev], cs.len());
+    if cs_pad > 0 {
+        host.cs_pending[dev].extend(std::iter::repeat_n(0u16, cs_pad));
+        host.cs_len[dev] += cs_pad;
+    }
+    let mk_pad = pad_to_segment(host.mk_len[dev], mk.len());
+    if mk_pad > 0 {
+        host.mk_pending[dev].extend(std::iter::repeat_n(0u16, mk_pad));
+        host.mk_len[dev] += mk_pad;
+    }
     let info = RInfo {
         cs_off: host.cs_len[dev] as u64,
         mk_off: host.mk_len[dev] as u64,
@@ -3643,6 +3665,45 @@ fn pair_col(j: usize, low: usize, b: u32, cs: u32, mk: u32) -> u32 {
     val
 }
 
+/// [`pair_col`] WITHOUT the `low` split — which is redundant, not an optimisation trade.
+///
+/// [`pair_col`]'s two arms are:
+/// - `j < low`: reject if `cs > b` or `(b − cs) & mk`; else `(b − cs) | mk`.
+/// - `j ≥ low`: reject if `cs > 0` or `b & mk`; else `b | mk`.
+///
+/// with `low = min(term_len, cs_len)`. Its own doc records the fact that makes the split
+/// unnecessary: past `low` AT MOST ONE of `b`, `cs` is in range, so at least one of them is zero.
+/// Take the two cases.
+/// - `cs = 0`: the first arm gives `diff = b`, rejects on `b & mk`, else `b | mk`; the second gives
+///   `cs > 0` false, rejects on `b & mk`, else `b | mk`. Identical.
+/// - `b = 0`: the first arm rejects exactly when `cs > 0`, and otherwise (`cs = 0` too) gives
+///   `diff = 0`, no `0 & mk`, value `mk`; the second rejects exactly when `cs > 0` and otherwise
+///   gives `0 | mk = mk`. Identical.
+///
+/// So the first arm computes the second's answer wherever the second applies, and one unconditional
+/// rule covers every column. The split cost a compare, a branch and its `BSSY`/`BSYNC` reconvergence
+/// pair per LANE per column — `MATRIX_GROUP * TERM_GROUP` of them per iteration — which is why it
+/// shows up in the profile as divergence bookkeeping on a loop that does not actually diverge. What
+/// is left is branchless: a compare, a subtract, two `LOP3`s and a select.
+///
+/// The `usize`, `low`-taking [`pair_col`] stays for [`multiply_pair`], whose single-`R` caller is
+/// addressed in `usize` throughout and is not on this hot path.
+#[cube]
+fn pair_col_u32(b: u32, cs: u32, mk: u32) -> u32 {
+    let mut val = 0u32;
+    if cs > b {
+        val = PAIR_COL_REJECT;
+    } else {
+        let diff = b - cs;
+        if (diff & mk) != 0u32 {
+            val = PAIR_COL_REJECT;
+        } else {
+            val = diff | mk;
+        }
+    }
+    val
+}
+
 /// Marks a full output column that the signature mask discards, in the `col_map` handed to
 /// [`pair_emit`]. `u32::MAX` is safe as a sentinel because a real masked position is bounded by the
 /// mask length, which is orders of magnitude smaller than the full width it indexes into.
@@ -3962,9 +4023,6 @@ fn multiply_batch_kernel(
     // Comptime so the two index forms below compile to one address chain each, with no runtime
     // branch in the innermost loop. See [`cs_transposed`] for why the transposed form exists.
     #[comptime] cs_transposed: bool,
-    // Comptime: resolve the segment once per array per thread rather than per access, with the
-    // offset arithmetic narrowed to u32. See [`seg_hoist`].
-    #[comptime] seg_hoist: bool,
 ) {
     // `ABSOLUTE_POS` is a `u32`, so it addresses at most this launch's slice; `pair_offset` lifts it
     // to the block's absolute pair index, which may exceed `2^32`. Widen BEFORE adding — summing in
@@ -4055,6 +4113,9 @@ fn multiply_batch_kernel(
     // from the output below: an all-zero term against an all-zero column does NOT reject, so they
     // would otherwise emit a spurious `seqno(0)` bit.
     let mut pp_off = Array::<u64>::new(TERM_GROUP);
+    // u32 mirror of the same offset, for the single-segment form of the p-part read in the column
+    // loop. Narrowing is exact there: with one segment every offset is below `seg_elems ≤ 2^31`.
+    let mut pp_off_u = Array::<u32>::new(TERM_GROUP);
     let mut term_len = Array::<u32>::new(TERM_GROUP);
     let mut cols = cs_len;
     if mk_len > cols {
@@ -4073,14 +4134,16 @@ fn multiply_batch_kernel(
             );
         }
         pp_off[tt] = po;
+        pp_off_u[tt] = u32::cast_from(po);
         term_len[tt] = tl;
         if usize::cast_from(tl) > cols {
             cols = usize::cast_from(tl);
         }
     }
 
-    // Segment split, hoisted. An `R`'s col_sums/masks never straddle a segment, so this is
-    // constant for every read this thread makes; and within a segment offsets fit u32.
+    // Segment split, hoisted. An `R`'s `col_sums`/`masks` never straddle a segment — the transient
+    // layout starts a new one rather than split an `R`, and [`resident_append`] pads to the boundary
+    // — so this is constant for every read this thread makes, and offsets within a segment fit u32.
     let cs_seg = u32::cast_from(cs_base / seg_elems);
     let mk_seg = u32::cast_from(mk_base / seg_elems);
     let cs_loc0 = u32::cast_from(cs_base % seg_elems);
@@ -4098,10 +4161,57 @@ fn multiply_batch_kernel(
         rejected[i] = 0u32;
     }
 
-    for j in 0..cols {
-        // u32 view of the loop counter: the hoisted path does its offset arithmetic in 32 bits,
-        // which is what removes the IMAD.WIDE / LEA.HI.X pairs around every load.
-        let ju = u32::cast_from(j);
+    // THE COLUMN LOOP, IN 32 BITS.
+    //
+    // `address_type = "u64"` makes every `usize` in this kernel a 64-bit value, and cubecl lowers
+    // faithfully what the source says: the loop below used to write its bound tests, its loop
+    // counter and its offsets in `usize`, so ptxas emitted the upper half of each as its own
+    // instruction. On the SASS for a frontier launch the loop body was 259 instructions of which 48
+    // were the F₂ algebra, and 45 of the rest were nothing but those upper halves — 13
+    // `ISETP...EX`, 13 `LEA.HI.X`, 9 `IMAD.X`, plus 10 `LDC.64` reloads of a buffer pointer that
+    // register pressure had spilled back to the constant bank. None of it is inherent: a column
+    // index is bounded by [`WORKING_CAP`], a matrix index by `num_mats`, and an offset WITHIN a
+    // segment by `seg_elems ≤ 2^31`. The whole loop fits `u32`.
+    //
+    // Three hoists are what let it, none of them a change to the arithmetic:
+    //  - the segment is resolved ONCE per array per thread (above), leaving a u32 offset inside it.
+    //    Sound because no `R`'s block straddles a segment — the transient layout starts a new
+    //    segment rather than split one, and [`resident_append`] pads to the boundary.
+    //  - `min(term_len, cs_len)` is loop-INVARIANT and was recomputed per column per term.
+    //  - the matrix lane's in-range test is loop-invariant too, and rather than branch on it per
+    //    column the lane index is CLAMPED into range. A trailing lane of a partial tile then reads
+    //    a real (duplicate) matrix instead of nothing, and the emit tail below already drops it on
+    //    the same condition — so nothing it computes is ever observed, while the branch, its
+    //    `BSSY`/`BSYNC` pair and both halves of its compare leave the loop entirely.
+    //
+    // `num_mats ≥ 1` for every live `R` (`mg_count` above divides by it), so the clamp always names
+    // a real matrix.
+    // Column stride within a matrix's run: 1 when the master is matrix-major, `num_mats` when it is
+    // transposed. `cs_transposed` is comptime, so only one of these survives compilation.
+    let mut cs_stride = 1u32;
+    let mut mk_stride = 1u32;
+    if cs_transposed {
+        cs_stride = num_mats_u;
+        mk_stride = num_mats_u;
+    }
+    let mut cs_b = Array::<u32>::new(MATRIX_GROUP);
+    let mut mk_b = Array::<u32>::new(MATRIX_GROUP);
+    #[unroll]
+    for mm in 0..MATRIX_GROUP {
+        let mut mi = m_base_u + u32::cast_from(mm);
+        if mi >= num_mats_u {
+            mi = num_mats_u - 1u32;
+        }
+        if cs_transposed {
+            cs_b[mm] = cs_loc0 + mi;
+            mk_b[mm] = mk_loc0 + mi;
+        } else {
+            cs_b[mm] = cs_loc0 + mi * cs_len_u;
+            mk_b[mm] = mk_loc0 + mi * mk_len_u;
+        }
+    }
+    let cols_u = u32::cast_from(cols);
+    for ju in 0..cols_u {
         // One `col_sums`/`masks` pair per matrix in the tile, shared by every term.
         let mut cs = Array::<u32>::new(MATRIX_GROUP);
         let mut mk = Array::<u32>::new(MATRIX_GROUP);
@@ -4109,71 +4219,41 @@ fn multiply_batch_kernel(
         for mm in 0..MATRIX_GROUP {
             let mut c = 0u32;
             let mut k = 0u32;
-            if m_base + mm < num_mats {
-                if j < cs_len {
-                    let mmu = u32::cast_from(mm);
-                    if seg_hoist {
-                        let off = if cs_transposed {
-                            cs_loc0 + ju * num_mats_u + m_base_u + mmu
-                        } else {
-                            cs_loc0 + (m_base_u + mmu) * cs_len_u + ju
-                        };
-                        c = u32::cast_from(seg_read_u16_at(
-                            cs0, cs1, cs2, cs3, cs4, cs5, cs6, cs7, cs8, cs9, cs10, cs11, cs12,
-                            cs13, cs14, cs15, cs_seg, off, num_segs,
-                        ));
-                    } else {
-                        c = u32::cast_from(seg_read_u16(
-                            cs0, cs1, cs2, cs3, cs4, cs5, cs6, cs7, cs8, cs9, cs10, cs11, cs12,
-                            cs13, cs14, cs15,
-                            if cs_transposed {
-                                cs_base + j * num_mats + m_base + mm
-                            } else {
-                                cs_base + (m_base + mm) * cs_len + j
-                            },
-                            seg_elems,
-                            num_segs,
-                        ));
-                    }
-                }
-                if j < mk_len {
-                    let mmu2 = u32::cast_from(mm);
-                    if seg_hoist {
-                        let off = if cs_transposed {
-                            mk_loc0 + ju * num_mats_u + m_base_u + mmu2
-                        } else {
-                            mk_loc0 + (m_base_u + mmu2) * mk_len_u + ju
-                        };
-                        k = u32::cast_from(seg_read_u16_at(
-                            mk0, mk1, mk2, mk3, mk4, mk5, mk6, mk7, mk8, mk9, mk10, mk11, mk12,
-                            mk13, mk14, mk15, mk_seg, off, num_segs,
-                        ));
-                    } else {
-                        k = u32::cast_from(seg_read_u16(
-                            mk0, mk1, mk2, mk3, mk4, mk5, mk6, mk7, mk8, mk9, mk10, mk11, mk12,
-                            mk13, mk14, mk15,
-                            if cs_transposed {
-                                mk_base + j * num_mats + m_base + mm
-                            } else {
-                                mk_base + (m_base + mm) * mk_len + j
-                            },
-                            seg_elems,
-                            num_segs,
-                        ));
-                    }
-                }
+            if ju < cs_len_u {
+                c = u32::cast_from(seg_read_u16_at(
+                    cs0, cs1, cs2, cs3, cs4, cs5, cs6, cs7, cs8, cs9, cs10, cs11, cs12, cs13, cs14,
+                    cs15, cs_seg, cs_b[mm] + ju * cs_stride, num_segs,
+                ));
+            }
+            if ju < mk_len_u {
+                k = u32::cast_from(seg_read_u16_at(
+                    mk0, mk1, mk2, mk3, mk4, mk5, mk6, mk7, mk8, mk9, mk10, mk11, mk12, mk13, mk14,
+                    mk15, mk_seg, mk_b[mm] + ju * mk_stride, num_segs,
+                ));
             }
             cs[mm] = c;
             mk[mm] = k;
         }
 
         // One p-part read per term in the tile, shared by every matrix.
+        //
+        // A basis row sits at `gei * width` in the resident BASIS store, which is appended with no
+        // boundary padding, so a row there MAY straddle a segment and the split cannot be hoisted
+        // out of the loop the way `col_sums`/`masks` can. With a single segment there is nothing to
+        // straddle and every offset is below `seg_elems ≤ 2^31`, so the same u32 form applies; that
+        // case is comptime (`num_segs`), so only one of these two is ever compiled.
+        let mut b = Array::<u32>::new(TERM_GROUP);
         #[unroll]
         for tt in 0..TERM_GROUP {
-            let tl = usize::cast_from(term_len[tt]);
-            let mut b = 0u32;
-            if j < tl {
-                b = u32::cast_from(seg_read_u16(
+            let mut v = 0u32;
+            if ju < term_len[tt] {
+                if num_segs == 1 {
+                    v = u32::cast_from(seg_read_u16_at(
+                        pp0, pp1, pp2, pp3, pp4, pp5, pp6, pp7, pp8, pp9, pp10, pp11, pp12, pp13,
+                        pp14, pp15, 0u32, pp_off_u[tt] + ju, num_segs,
+                    ));
+                } else {
+                v = u32::cast_from(seg_read_u16(
                     pp0,
                     pp1,
                     pp2,
@@ -4190,22 +4270,37 @@ fn multiply_batch_kernel(
                     pp13,
                     pp14,
                     pp15,
-                    usize::cast_from(pp_off[tt]) + j,
+                    usize::cast_from(pp_off[tt]) + usize::cast_from(ju),
                     seg_elems,
                     num_segs,
                 ));
+                }
             }
-            let mut low = cs_len;
-            if tl < cs_len {
-                low = tl;
-            }
+            b[tt] = v;
+        }
+
+        // `pp_shift[j]` is one load per column, shared by all `MATRIX_GROUP * TERM_GROUP` lanes;
+        // reading it once here rather than inside the lane loop keeps it that way regardless of
+        // whether the compiler chooses to CSE it. Only positions below [`PPART_MAX_LEN`] can be
+        // non-zero in the packed accumulator, so beyond that the shift is not even loaded.
+        let mut sh = 0u32;
+        let acc = ju < u32::cast_from(PPART_MAX_LEN);
+        if acc {
+            sh = pp_shift[usize::cast_from(ju)];
+        }
+        #[unroll]
+        for tt in 0..TERM_GROUP {
             #[unroll]
             for mm in 0..MATRIX_GROUP {
-                let val = pair_col(j, low, b, cs[mm], mk[mm]);
+                let val = pair_col_u32(b[tt], cs[mm], mk[mm]);
                 let i = mm * TERM_GROUP + tt;
                 rejected[i] |= val & PAIR_COL_REJECT;
-                if j < PPART_MAX_LEN {
-                    working[i] |= u64::cast_from(val & 0xffffu32) << u64::cast_from(pp_shift[j]);
+                if acc {
+                    // No `& 0xffff` before the shift. The only bit it masked off is
+                    // [`PAIR_COL_REJECT`], and a column that sets that bit has also just set
+                    // `rejected[i]`, so this lane's `working` is discarded unread. Letting the
+                    // stray bit land saves a `LOP3` per lane per column.
+                    working[i] |= u64::cast_from(val) << u64::cast_from(sh);
                 }
             }
         }
@@ -6497,7 +6592,6 @@ fn multiply_batch_block<'a>(
                             // Both masters now: `resident_append` transposes the resident one and
                             // `enumerate_admissible_kernel` the transient one.
                             cs_transposed(),
-                            seg_hoist(),
                         );
                     }
                 }
@@ -6897,7 +6991,7 @@ fn seg_read_u16(
 /// [`seg_read_u16`] with the segment already resolved: `local` is an offset WITHIN `seg`, in u32.
 ///
 /// Same static-branch chain, minus the division and the 64-bit offset arithmetic. Callers hoist the
-/// split out of their loop; see [`seg_hoist`] for why that is sound.
+/// split out of their loop; the batch kernel's column loop documents why that is sound.
 fn seg_read_u16_at(
     s0: &[u16],
     s1: &[u16],
@@ -10310,6 +10404,98 @@ mod tests {
     /// Reports products/s and the exec share. For kernel work the metric is products per second of
     /// EXEC: with host marshal in the denominator a 16% kernel change reads as ~1%, which is how a
     /// bench with a 0.4% noise floor can still fail to see a real effect.
+    /// The CORRECTNESS gate for kernel work, and the reason a timing claim is allowed to be made at
+    /// all: it prints a digest of the multiply's output over real captured batches.
+    ///
+    /// `multiply_batch_kernel` XOR-accumulates, so a pair evaluated twice CANCELS and a pair dropped
+    /// simply never appears — both are silent. There is no crash, no assertion, and a save built on
+    /// the result looks structurally fine. The in-file CPU-oracle tests
+    /// (`cpu_multiply_batch_masked_matches_gpu` and friends) cover the algebra on small synthetic
+    /// shapes, but they do not reach the frontier's shapes: thousands of admissible matrices per
+    /// `R`, ragged term counts, a column restriction that drops ~98% of the width, and the tile's
+    /// partial last group. Those are exactly what an indexing change perturbs.
+    ///
+    /// A CPU oracle is not an option at this size (one frontier batch is hours of scalar work), so
+    /// the gate is a BEFORE/AFTER digest on the identical input: run it on the baseline commit,
+    /// record the line, run it again after the change, and require the digests to be equal. That
+    /// makes the check byte-exact over every output limb of every row of every batch.
+    ///
+    /// ```text
+    /// NASSAU_REPLAY_PRODUCTS=/tmp/frontier_seq NASSAU_REPLAY_MAX_BATCHES=8 \
+    ///   cargo test -p algebra --release --features gpu -- --ignored --nocapture replay_digest
+    /// ```
+    #[test]
+    #[ignore = "GPU correctness gate: needs a CUDA device and captured batches; run explicitly"]
+    fn replay_digest() {
+        use std::sync::Arc;
+
+        let Ok(path) = std::env::var("NASSAU_REPLAY_PRODUCTS") else {
+            eprintln!("[digest] NASSAU_REPLAY_PRODUCTS is unset; nothing to replay");
+            return;
+        };
+        let mut files: Vec<String> = if std::path::Path::new(&path).is_dir() {
+            let mut v: Vec<String> = std::fs::read_dir(&path)
+                .expect("cannot read the replay directory")
+                .filter_map(|e| e.ok())
+                .map(|e| e.path().to_string_lossy().into_owned())
+                .filter(|p| p.ends_with(".bin"))
+                .collect();
+            v.sort();
+            v
+        } else {
+            vec![path.clone()]
+        };
+        if let Ok(lim) = std::env::var("NASSAU_REPLAY_MAX_BATCHES") {
+            if let Ok(k) = lim.parse::<usize>() {
+                files.truncate(k);
+            }
+        }
+        assert!(!files.is_empty(), "no .bin batches found at {path}");
+        let batches: Vec<(usize, usize, Option<Arc<[u32]>>, Vec<GpuProduct>)> = files
+            .iter()
+            .map(|f| super::load_captured_batch(f).expect("failed to load a captured batch"))
+            .collect();
+        let max_degree = batches
+            .iter()
+            .flat_map(|b| b.3.iter())
+            .map(|p| p.r_degree + p.s_degree)
+            .max()
+            .unwrap_or(0)
+            .max(1);
+        let p2 = fp::prime::ValidPrime::new(2);
+        let algebra = Arc::new(MilnorAlgebra::new(p2, false));
+        algebra.compute_basis(max_degree);
+        algebra.compute_seqno_tables(max_degree);
+
+        // FNV-1a over every limb of every row, in row order, mixed with the row index so a
+        // permutation of identical rows is not a collision.
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        let mut mix = |v: u64| {
+            h ^= v;
+            h = h.wrapping_mul(0x0100_0000_01b3);
+        };
+        let mut ones: u64 = 0;
+        let mut rows_total: u64 = 0;
+        for (bi, (rows, cols, cm, prods)) in batches.iter().enumerate() {
+            let out = super::multiply_batch_on_gpu_masked(&algebra, *cols, cm.clone(), *rows, prods);
+            mix(bi as u64);
+            for (ri, row) in out.iter_rows().enumerate() {
+                mix(ri as u64);
+                for &limb in row {
+                    mix(limb as u64);
+                    ones += limb.count_ones() as u64;
+                }
+                rows_total += 1;
+            }
+        }
+        // `ones` is a second, independent summary: a digest mismatch says only "different", while a
+        // changed population count says the change ADDED or LOST terms rather than moved them.
+        eprintln!(
+            "[digest] batches={} rows={rows_total} ones={ones} digest={h:016x}",
+            batches.len()
+        );
+    }
+
     #[test]
     #[ignore = "GPU perf bench: needs a CUDA device and a captured batch; run explicitly"]
     fn replay_bench() {
