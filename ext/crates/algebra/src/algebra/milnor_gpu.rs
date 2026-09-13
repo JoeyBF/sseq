@@ -190,6 +190,29 @@ const TERM_GROUP: usize = 3;
 /// `col_sums`/`masks` are per-matrix, so an `M x T` tile costs `2M + T` loads per column for `M*T`
 /// pairs. Unlike terms there is no meaningful ragged tail here -- `num_mats` runs to ~20 000, so a
 /// partial tile idles a couple of lanes out of thousands.
+///
+/// That load-amortisation argument says a WIDER tile should win, and on instruction count it does.
+/// It does not win on time. ncu over one whole replayed frontier batch (the same 463 089 captured
+/// products through every arm, clocks locked, and the 2x3 arm repeated to 0.005%, so these gaps are
+/// far outside the noise):
+///
+/// | tile    | registers | instructions | elapsed cycles | vs 2x3      |
+/// |---------|-----------|--------------|----------------|-------------|
+/// | 2x2     | 56        | 9.310e11     | 2.2904e9       | 15.6% slower|
+/// | **2x3** | **63**    | **7.744e11** | **1.9821e9**   | **--**      |
+/// | 3x3     | 76        | 6.844e11     | 2.0331e9       | 2.6% slower |
+/// | 4x2     | 64        | 7.090e11     | 2.0643e9       | 4.1% slower |
+/// | 4x3     | 80        | 6.071e11     | 2.0894e9       | 5.4% slower |
+///
+/// Above 2x3, instructions and time move in OPPOSITE directions: 4x3 issues 21.6% fewer
+/// instructions than 2x3 and takes 5.4% longer. The discriminator is the register column. 63 and 64
+/// registers both fit four 256-thread blocks per SM (65 536 / (64 x 256) = 4); 76 and 80 allow only
+/// three. A quarter less latency hiding costs more than a fifth fewer instructions buys, because
+/// what the wider tile removes is address arithmetic that was already overlapping with the loads.
+/// 2x2 loses the other way, on amortisation, with registers to spare.
+///
+/// So 2x3 sits on a real ridge, not on a modelling assumption, and a tile sweep is not worth
+/// repeating unless the register budget changes.
 const MATRIX_GROUP: usize = 2;
 
 /// Per-launch output-buffer budget in bytes (`NASSAU_GPU_BLOCK_MB`, default 512 MiB).
