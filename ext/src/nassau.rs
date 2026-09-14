@@ -2144,6 +2144,74 @@ impl ForceCpuGuard {
     }
 }
 
+/// EXPERIMENT: truncate a bidegree's view of its own dependencies by `k` internal degrees, WITHOUT
+/// refining, to establish what a refinement would owe.
+///
+/// The critical-path simulation over the n=300 census says relaxing BOTH DAG edges by `k` is worth
+/// 1.88x at k=1 and 4.60x at k=4 -- but only if the truncated answer can then be repaired. These knobs
+/// produce the unrepaired approximation so the damage is measurable: which bidegrees stop being cycles,
+/// and how far the generator counts move.
+///
+/// * `NASSAU_TRUNC_CROSS` -- pretend `C_{s-1}` has no generators of degree `>= t - k` (the `(s-1,t-1)`
+///   edge). Late generators only ADD rows to the matrix, so `num_new_gens` can only RISE on repair.
+/// * `NASSAU_TRUNC_SAME` -- pretend `C_s` has no generators of degree `>= t - k` when computing the
+///   image (the `(s,t-1)` edge). Late generators add rows to the IMAGE, so `num_new_gens` can only
+///   FALL on repair. That RETRACTS generators, which is the harder half.
+/// * `NASSAU_TRUNC_TOLERATE` -- downgrade the `dx != 0` gate to a counter so a truncated run finishes
+///   and can be compared. The resolution it produces is WRONG BY CONSTRUCTION; never save it anywhere
+///   that matters.
+fn trunc_cross() -> i32 {
+    static K: LazyLock<i32> = LazyLock::new(|| {
+        std::env::var("NASSAU_TRUNC_CROSS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0)
+    });
+    *K
+}
+
+fn trunc_same() -> i32 {
+    static K: LazyLock<i32> = LazyLock::new(|| {
+        std::env::var("NASSAU_TRUNC_SAME")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0)
+    });
+    *K
+}
+
+fn trunc_tolerate() -> bool {
+    static T: LazyLock<bool> =
+        LazyLock::new(|| std::env::var("NASSAU_TRUNC_TOLERATE").as_deref() == Ok("1"));
+    *T
+}
+
+/// Smallest POSITIVE degree carrying the zero signature, for this subalgebra.
+///
+/// The image is built at the zero signature, so truncating the same-row source by less than this
+/// removes no basis element at all and cannot change the answer. An operation has the zero signature
+/// when every p-part entry is congruent to 0 modulo its field width, so the smallest non-trivial one is
+/// `min_i 2^{w_i} * (2^i - 1)`. Measured: A(0)=2, A(1)=4, A(2)=8, A(3)=16, A(4)=32.
+///
+/// This is PER BIDEGREE. A global constant is wrong and explodes: at stem 40 a blanket k=4 broke every
+/// A(0) and A(1) bidegree, producing 39 126 generators at (30,11) against a real maximum of ~24.
+fn zero_sig_floor(subalgebra: &MilnorSubalgebra) -> i32 {
+    subalgebra
+        .profile
+        .iter()
+        .enumerate()
+        .map(|(i, &p)| {
+            let w = std::cmp::min(p as u32, PPart::width(i));
+            ((1i64 << w) * ((1i64 << (i + 1)) - 1)) as i32
+        })
+        .min()
+        .unwrap_or(1)
+}
+
+/// Bidegrees whose `dx` was non-zero under truncation: exactly those a refinement would repair.
+static TRUNC_NOT_CYCLE: AtomicUsize = AtomicUsize::new(0);
+static TRUNC_TOTAL: AtomicUsize = AtomicUsize::new(0);
+
 /// Opt out of the authoritative CPU attempt (`NASSAU_NO_CPU_VERIFY=1`).
 ///
 /// Default OFF, i.e. verification is on: knowing whether a repeated failure is the GPU or the
@@ -3062,7 +3130,7 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
         // only on data that is frozen once `(b.s() - 1, b.t() - 1)` and `(b.s(), b.t() - 1)` have
         // been committed. This is what lets [`Self::compute_through_stem`] compute `(b.s(), b.t())`
         // concurrently with `(b.s() - 1, b.t())`, which is adding those degree-`b.t()` generators.
-        let target_bound = b.t();
+        let target_bound = b.t() - trunc_cross();
         let next_bound = b.t() - 1;
 
         let zero_sig = subalgebra.zero_signature();
@@ -3347,7 +3415,18 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
         // instead of `signature_matrix`'s serial per-row CPU multiply.
         let source_mask: Vec<usize> = tracing::trace_span!("zs_source_mask").in_scope(|| {
             subalgebra
-                .signature_mask(&algebra, &self.modules[b.s()], b.t(), &zero_sig, i32::MAX)
+                .signature_mask(
+                    &algebra,
+                    &self.modules[b.s()],
+                    b.t(),
+                    &zero_sig,
+                    match trunc_same() {
+                        0 => i32::MAX,
+                        // Negative: take the largest depth that is provably free for THIS bidegree.
+                        k if k < 0 => b.t() - (zero_sig_floor(&subalgebra) - 1),
+                        k => b.t() - k,
+                    },
+                )
                 .collect()
         });
         // Built DIRECTLY in masked columns. This used to build `source_mask.len() x target_dim`
@@ -4056,7 +4135,16 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
         // the save file. Nothing above has mutated shared state, so a panic here loses only this
         // bidegree's work and `spawn_bidegree` can run it again.
         let nonzero = dxs.iter().filter(|dx| !dx.is_zero()).count();
-        if nonzero > 0 {
+        TRUNC_TOTAL.fetch_add(1, Ordering::Relaxed);
+        if nonzero > 0 && trunc_tolerate() {
+            // Truncation experiment only: record that this bidegree would need repair and carry on
+            // with a knowingly wrong answer, so the run reaches a comparable end state.
+            TRUNC_NOT_CYCLE.fetch_add(1, Ordering::Relaxed);
+            eprintln!(
+                "[trunc] b={b} NOT a cycle: nonzero={nonzero}/{} gens",
+                dxs.len()
+            );
+        } else if nonzero > 0 {
             // Was `assert!`. A panic carried no information across the unwind boundary, so the
             // scheduler could not tell corrupted mathematics from a dead context and had to treat
             // every failure the same way.
