@@ -2186,80 +2186,6 @@ fn trunc_tolerate() -> bool {
     *T
 }
 
-/// How many internal degrees a row may run ahead of its own committed frontier
-/// (`NASSAU_ROW_AHEAD`, default 0 = today's strictly-sequential rows).
-///
-/// Capped hard: every bidegree running ahead occupies a worker while it waits to register, so a large
-/// value can starve the low-t bidegree that everyone else is waiting for.
-fn row_ahead() -> i32 {
-    static K: LazyLock<i32> = LazyLock::new(|| {
-        std::env::var("NASSAU_ROW_AHEAD")
-            .ok()
-            .and_then(|v| v.parse::<i32>().ok())
-            .unwrap_or(0)
-            .clamp(0, 8)
-    });
-    *K
-}
-
-/// In-order registration for rows that compute out of order.
-///
-/// `FreeModule` generators are append-only in increasing degree, so however concurrently bidegrees are
-/// COMPUTED, `add_generators` must still run in t order within a row.
-mod rowgate {
-    use std::sync::{Condvar, LazyLock, Mutex};
-
-    /// `committed[s]` = largest internal degree fully registered in row `s`.
-    static GATE: LazyLock<(Mutex<Vec<i32>>, Condvar)> =
-        LazyLock::new(|| (Mutex::new(Vec::new()), Condvar::new()));
-
-    fn ensure(v: &mut Vec<i32>, s: usize, min_degree: i32) {
-        if v.len() <= s {
-            v.resize(s + 1, min_degree - 1);
-        }
-    }
-
-    /// Block until row `s` has registered everything below `t`.
-    ///
-    /// Diagnosing a deadlock here by reasoning about call paths failed repeatedly, so the wait reports
-    /// itself: a waiter still blocked after a few seconds prints what it wants and what the row has
-    /// actually committed. That names the stuck row and degree directly instead of by elimination.
-    pub fn wait_for_predecessor(s: usize, t: i32, min_degree: i32) {
-        let (m, cv) = &*GATE;
-        let mut g = m.lock().unwrap();
-        ensure(&mut g, s, min_degree);
-        let mut waited = 0u32;
-        while g[s] < t - 1 {
-            let (ng, res) = cv
-                .wait_timeout(g, std::time::Duration::from_secs(5))
-                .unwrap();
-            g = ng;
-            if res.timed_out() {
-                waited += 5;
-                eprintln!(
-                    "[rowgate] WAITING {waited}s: (s={s}, t={t}) needs committed[{s}] >= {}, has {}",
-                    t - 1,
-                    g[s]
-                );
-            }
-        }
-    }
-
-    /// Record that `(s, t)` is registered, releasing its successor.
-    pub fn commit(s: usize, t: i32, min_degree: i32) {
-        if std::env::var_os("NASSAU_ROWGATE_TRACE").is_some() {
-            eprintln!("[rowgate] COMMIT ({s},{t})");
-        }
-        let (m, cv) = &*GATE;
-        let mut g = m.lock().unwrap();
-        ensure(&mut g, s, min_degree);
-        if t > g[s] {
-            g[s] = t;
-        }
-        cv.notify_all();
-    }
-}
-
 /// Smallest POSITIVE degree carrying the zero signature, for this subalgebra.
 ///
 /// The image is built at the zero signature, so truncating the same-row source by less than this
@@ -3495,10 +3421,8 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                     b.t(),
                     &zero_sig,
                     match trunc_same() {
-                        // Running ahead means same-row generators below `t` may not be registered yet,
-                        // so the read MUST be bounded by the floor -- which is a no-op for the answer.
-                        0 if row_ahead() > 0 => b.t() - (zero_sig_floor(&subalgebra) - 1),
                         0 => i32::MAX,
+                        // Negative: take the largest depth that is provably free for THIS bidegree.
                         k if k < 0 => b.t() - (zero_sig_floor(&subalgebra) - 1),
                         k => b.t() - k,
                     },
@@ -4228,13 +4152,6 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
         }
 
         // Past the gate: register the generators and their differential together.
-        //
-        // With `NASSAU_ROW_AHEAD` this bidegree may have been computed before its row predecessor
-        // finished, so registration -- and only registration -- is serialised here. Everything above is
-        // already done; the wait costs nothing but the worker slot.
-        if row_ahead() > 0 {
-            rowgate::wait_for_predecessor(b.s() as usize, b.t(), self.min_degree());
-        }
         self.add_generators(b, num_new_gens);
         self.differential(b.s()).add_generators_from_rows(b.t(), xs);
 
@@ -4422,18 +4339,6 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
             c.set_image(b.t(), None);
             c.set_quasi_inverse(b.t(), None);
         };
-        // Rows 0 and 1 register their generators inside `step0`/`step1`, not in
-        // `step_resolution_with_subalgebra`, so they never reach the `rowgate` there. Gate the whole
-        // step for them -- both are cheap, so serialising them outright costs nothing.
-        //
-        // The gate is taken BEFORE `compute_basis` on this row's own module: `compute_basis` derives
-        // and CACHES each degree's dimension by summing `num_gens` below it, so computing it before the
-        // row predecessor has registered would cache a dimension that is permanently too small.
-        if row_ahead() > 0 && b.s() <= 1 {
-            // Rows 0 and 1 register inside `step0`/`step1` and never reach the late wait below, so
-            // they are serialised outright. Both are cheap, so this costs nothing.
-            rowgate::wait_for_predecessor(b.s() as usize, b.t(), self.min_degree());
-        }
         self.modules[b.s()].compute_basis(b.t());
         if b.s() > 0 {
             self.modules[b.s() - 1].compute_basis(b.t());
@@ -4441,9 +4346,6 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
 
         if b.s() == 0 {
             self.step0(b.t());
-            if row_ahead() > 0 {
-                rowgate::commit(0, b.t(), self.min_degree());
-            }
             return Ok(());
         }
 
@@ -4490,9 +4392,6 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
         if b.s() == 1 && self.target.module(0).dimension(b.t()) != 0 {
             self.step1(b.t())?;
             set_data();
-            if row_ahead() > 0 {
-                rowgate::commit(1, b.t(), self.min_degree());
-            }
             return Ok(());
         }
 
@@ -4509,15 +4408,6 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
         }
 
         set_data();
-        // Release only HERE: `set_data` appends to `images`/`quasi_inverses` per degree, so a release
-        // inside the subalgebra step let the successor append its own subspaces first. The gate must
-        // span every per-degree append the bidegree makes, which is all of them up to this point.
-        //
-        // A bidegree that FAILS never reaches here and never releases -- correct, since its successor
-        // would otherwise build on a missing predecessor; the retry path re-runs it and releases then.
-        if row_ahead() > 0 {
-            rowgate::commit(b.s() as usize, b.t(), self.min_degree());
-        }
         Ok(())
     }
 
@@ -4682,22 +4572,9 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
         // predecessor are committed. For `s >= 2` the diagonal predecessor is `(s - 1, t - 1)` (the
         // relaxed graph); for `s == 1` it is `(0, t)`; `s == 0` has none. `progress[s]` is the
         // largest committed `t` in row `s`, so it doubles as a "predecessor committed" test.
-        // How far row `s` may run ahead of its own committed frontier at `t`. Bounded by the
-        // bidegree's zero-signature floor, since beyond that the truncated read would change the
-        // answer, and by `NASSAU_ROW_AHEAD`, since each bidegree running ahead holds a worker while it
-        // waits to register.
-        let row_lookahead = |s: i32, t: i32| -> i32 {
-            let k = row_ahead();
-            if k == 0 {
-                return 0;
-            }
-            let floor = zero_sig_floor(&MilnorSubalgebra::optimal_for(Bidegree::s_t(s, t)));
-            std::cmp::min(k, floor - 1).max(0)
-        };
-
         let ready = |s: i32, t: i32, progress: &[i32]| -> bool {
             in_region(s, t)
-                && progress[s as usize] >= t - 1 - row_lookahead(s, t)
+                && progress[s as usize] >= t - 1
                 && match s {
                     0 => true,
                     // Row 1's diagonal predecessor is (0, t). At the stem edge (t = max_n + 1) that
@@ -4761,12 +4638,6 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
 
                 let spawn_bidegree = |b: Bidegree, sender: mpsc::Sender<SenderData>| {
                     if self.has_computed_bidegree(b) {
-                        if row_ahead() > 0 {
-                            if std::env::var_os("NASSAU_ROWGATE_TRACE").is_some() {
-                                eprintln!("[rowgate] PRECOMPUTED ({},{})", b.s(), b.t());
-                            }
-                            rowgate::commit(b.s() as usize, b.t(), self.min_degree());
-                        }
                         SenderData::send(b, sender);
                     } else {
                         let tracing_span = tracing_span.clone();
@@ -4827,13 +4698,6 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                 // idle. This cannot deadlock: parked entries keep their senders, so the channel stays
                 // open, and the timeout guarantees parked work is retried until a free worker takes it.
                 let mut deferred: Vec<(Bidegree, mpsc::Sender<SenderData>)> = Vec::new();
-
-                // Largest internal degree already SPAWNED in each row, used only by the row-ahead
-                // path. Seeded to `min_degree` for the rows spawned above, and to `min_degree - 1` for
-                // row 1, which is spawned by its diagonal instead.
-                let mut spawned_through: Vec<i32> = (0..=max_s)
-                    .map(|s| if s == 1 { min_degree - 1 } else { min_degree })
-                    .collect();
                 // Diagnostic (`NASSAU_MEM_REPORT`): count committed bidegrees so we can periodically
                 // report the retained-data heap split (differentials' `outputs` vs modules' tables).
                 //
@@ -4961,18 +4825,13 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                             deferred.push((b, sender));
                             continue;
                         }
-                        // With row-ahead, completions within a row can arrive out of order even
-                        // though REGISTRATION is serialised by `rowgate`, so `progress` advances to
-                        // the high-water mark rather than stepping by exactly one.
-                        if row_ahead() == 0 {
-                            assert!(progress[b.s() as usize] == b.t() - 1);
-                        }
+                        assert!(progress[b.s() as usize] == b.t() - 1);
                         INFLIGHT_SUM.fetch_add(
                             INFLIGHT.load(std::sync::atomic::Ordering::Relaxed) as u64,
                             std::sync::atomic::Ordering::Relaxed,
                         );
                         INFLIGHT_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        progress[b.s() as usize] = std::cmp::max(progress[b.s() as usize], b.t());
+                        progress[b.s() as usize] = b.t();
                         enqueue_spec(&progress, &mut spec_issued, &mut spec_issued_g);
 
                         if mem_report {
@@ -5052,24 +4911,6 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                         // Completing `b` can only make ready its same-row successor `(s, t + 1)` and one
                         // diagonal successor. `ready` requires *both* predecessors, so of the two
                         // completions that could spawn a given bidegree, only the later one does.
-                        if row_ahead() > 0 {
-                            // Exactly-once is tracked EXPLICITLY here: with a relaxed same-row
-                            // condition the "only the later completion spawns it" invariant no longer
-                            // holds, and a double spawn would register the same generators twice.
-                            for r in 0..=max_s {
-                                let ri = r as usize;
-                                let mut t = spawned_through[ri] + 1;
-                                while ready(r, t, &progress) {
-                                    if std::env::var_os("NASSAU_ROWGATE_TRACE").is_some() {
-                                        eprintln!("[rowgate] SPAWN ({r},{t})");
-                                    }
-                                    spawn_bidegree(Bidegree::s_t(r, t), sender.clone());
-                                    spawned_through[ri] = t;
-                                    t += 1;
-                                }
-                            }
-                        } else {
-
                         let same_row = b + Bidegree::s_t(0, 1);
                         let diagonal = if b.s() == 0 {
                             Bidegree::s_t(1, b.t())
@@ -5081,7 +4922,6 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                             if ready(cand.s(), cand.t(), &progress) {
                                 spawn_bidegree(cand, sender.clone());
                             }
-                        }
                         }
                     }
 
