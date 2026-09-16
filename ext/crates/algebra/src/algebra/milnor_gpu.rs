@@ -1557,6 +1557,12 @@ thread_local! {
         std::cell::RefCell::new(ScratchArena::default());
 }
 
+/// Written into each freshly allocated scratch segment to force its (lazy) allocation to complete
+/// while the allocating code can still see the failure. One small write is enough: the location is
+/// per handle, not per byte, and the segment's real contents are written by every launch's
+/// enumeration before anything reads them.
+const SEED: [u16; 256] = [0u16; 256];
+
 /// Shared resident device copies of the read-only seqno table `g` and the (constant) `xi` degrees.
 /// These are identical across every launch at a given built degree, so re-uploading them per launch
 /// (a `create_from_slice` each) was pure churn — one of the per-launch allocation/copy streams that
@@ -6634,11 +6640,37 @@ fn multiply_batch_block<'a>(
                         // dereferences was written by this launch's enumeration.
                         let (cs_segs, mk_segs) = SCRATCH.with(|s| {
                             let mut arena = s.borrow_mut();
+                            // Materialise before retaining. `client.empty()` hands back a handle
+                            // whose allocation happens later on the driver thread, so a failure
+                            // arrives after the fact and leaves the handle without a location;
+                            // retaining THAT is what turned a transient allocation failure into a
+                            // permanently poisoned segment. Seeding forces the allocation to
+                            // complete here -- and gives the location -- so a segment that cannot be
+                            // allocated fails before the `push`, not on every launch after it.
+                            let mut seed_segment = |dst: &Handle| {
+                                let seed = client.create_from_slice(u16::as_bytes(&SEED));
+                                copy_chunked!(
+                                    client,
+                                    copy_into_u16,
+                                    seed,
+                                    SEED.len(),
+                                    0usize,
+                                    dst,
+                                    seg_elems,
+                                    0usize,
+                                    SEED.len()
+                                );
+                                let _ = cubecl_common::reader::read_sync(client.sync());
+                            };
                             while arena.cs.len() < nseg {
-                                arena.cs.push(client.empty(seg_elems * size_of::<u16>()));
+                                let h = client.empty(seg_elems * size_of::<u16>());
+                                seed_segment(&h);
+                                arena.cs.push(h);
                             }
                             while arena.mk.len() < nseg {
-                                arena.mk.push(client.empty(seg_elems * size_of::<u16>()));
+                                let h = client.empty(seg_elems * size_of::<u16>());
+                                seed_segment(&h);
+                                arena.mk.push(h);
                             }
                             let mut cs: Vec<(Handle, usize)> = Vec::with_capacity(nseg);
                             let mut mk: Vec<(Handle, usize)> = Vec::with_capacity(nseg);
