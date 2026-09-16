@@ -1524,81 +1524,37 @@ fn resident_upload() -> &'static Mutex<()> {
     &RESIDENT_UPLOAD[cur_device()]
 }
 
-/// Retained device scratch for one `Transient` launch: `cs`/`mk` segments of `master_seg_elems()`
-/// elements each.
+/// Retained device scratch for the `Transient` master, owned by one worker thread.
 ///
-/// The `Transient` path used to `client.empty()` these per launch and drop them with it. That is
-/// what fails once cubecl's pool has churned: the SAME size that allocates against an empty card is
-/// refused later. Measured on an L40S (46068 MiB), one device, frontier work — 1.5/2/4 GiB segments
-/// each failed with hundreds of `can't allocate buffer of size: …` while ≤1.25 GiB allocated
-/// cleanly, and time-to-failure grew with request size (4 GiB 1055 s, 2 GiB 174 s), which is
-/// fragmentation rather than a capacity ceiling. Retaining the segments moves every allocation into
-/// the first launches, while the card is still empty, and no later launch allocates at all.
+/// The `Transient` path used to `client.empty()` its `cs`/`mk` segments per launch and free them
+/// with the launch. That is what fails once cubecl's pool has churned: on an L40S (46068 MiB) the
+/// same 2 GiB segments that allocate against an empty card were refused 307 times later in the run,
+/// though the segment COUNT at that size (~10) is well inside [`MASTER_MAX_SEG`]. Time-to-failure
+/// grew with request size, which is fragmentation rather than a capacity ceiling. Retaining the
+/// segments moves every allocation into the first launches, while the card is still empty.
 ///
-/// Grow-only and never freed, exactly as [`SegBuf`] is, and for the same reason: a stable handle is
-/// the shared-global pattern cubecl syncs correctly across streams, while allocation churn is what
-/// pushed it into its corruption regimes. Peak residency is unchanged in kind — a launch held this
-/// much scratch before too — it is simply no longer returned and re-requested.
+/// THREAD-LOCAL, not shared. The `gpu_streams()` workers on a device each hold their own
+/// `StreamId`, and cubecl's pools are per stream, so a segment allocated on one worker's stream does
+/// not resolve on another's — it fails as `Memory location was never initialized`. Owning the arena
+/// per worker also bounds it: there are exactly `gpu_count() * gpu_streams()` of them.
+///
+/// No lease or pool is needed to keep a launch from reading scratch another launch is overwriting.
+/// A worker issues every launch on its own stream and a stream is ordered, so the next task's
+/// enumeration cannot start writing until the previous multiply has finished reading.
+///
+/// Grow-only and never freed, as [`SegBuf`] is, and for the same reason: a stable handle is the
+/// shared-global pattern cubecl syncs correctly, while churn is what drove it into its corruption
+/// regimes.
 #[derive(Default)]
 struct ScratchArena {
     cs: Vec<Handle>,
     mk: Vec<Handle>,
 }
 
-/// Free arenas per device. Multiplies overlap each other freely (only `fp-cuda` reductions take the
-/// exclusive side of the arbitration), so scratch CANNOT be a single shared buffer — two launches
-/// would write the same segments. Each launch leases an arena and returns it when its readback is
-/// done; the pool grows to whatever concurrency the `GpuPermit` budget actually admits.
-static SCRATCH_POOL: LazyLock<Vec<Mutex<Vec<ScratchArena>>>> =
-    LazyLock::new(|| (0..gpu_count()).map(|_| Mutex::new(Vec::new())).collect());
-
-/// An arena borrowed for one launch, returned to its device's pool on drop.
-///
-/// Dropping this RELEASES the segments for reuse by another launch, so it must not happen until the
-/// readback has completed — the kernel may still be reading them. It therefore travels inside
-/// [`Keepalive`] rather than dying with the submit closure, which is the same hazard the keepalive
-/// itself exists to prevent (a dropped handle handed to a later allocation showed up as
-/// `CUDA_ERROR_LAUNCH_FAILED` at `max_t=304`).
-struct ScratchLease {
-    arena: Option<ScratchArena>,
-    device: usize,
-}
-
-impl ScratchLease {
-    /// Take a free arena for `cur_device()`, or start an empty one if the pool is dry.
-    fn acquire() -> Self {
-        let device = cur_device();
-        let arena = SCRATCH_POOL[device]
-            .lock()
-            .unwrap()
-            .pop()
-            .unwrap_or_default();
-        Self {
-            arena: Some(arena),
-            device,
-        }
-    }
-
-    fn arena_mut(&mut self) -> &mut ScratchArena {
-        self.arena.as_mut().expect("arena taken before drop")
-    }
-}
-
-impl Drop for ScratchLease {
-    fn drop(&mut self) {
-        if let Some(arena) = self.arena.take() {
-            SCRATCH_POOL[self.device].lock().unwrap().push(arena);
-        }
-    }
-}
-
-/// Everything one launch must keep alive until its readback completes.
-///
-/// Was a bare `Vec<Handle>`; it also has to carry the scratch lease now, because returning the
-/// arena to the pool is exactly as unsafe as dropping a handle while the kernel still reads it.
-struct Keepalive {
-    handles: Vec<Handle>,
-    scratch: Option<ScratchLease>,
+thread_local! {
+    /// This worker's scratch. Empty on any thread that never runs a device section.
+    static SCRATCH: std::cell::RefCell<ScratchArena> =
+        std::cell::RefCell::new(ScratchArena::default());
 }
 
 /// Shared resident device copies of the read-only seqno table `g` and the (constant) `xi` degrees.
@@ -6613,10 +6569,6 @@ fn multiply_batch_block<'a>(
                 // (`cs_scratch`/`mk_scratch` survive into `cs_seg`/`mk_seg`, so they are already
                 // covered by the main keepalive below.)
                 let mut enum_keep: Vec<Handle> = Vec::new();
-                // Leased inside the `Transient` arm and handed to the keepalive, because
-                // returning the arena is exactly as unsafe as dropping a handle the kernel
-                // is still reading.
-                let mut scratch_lease: Option<ScratchLease> = None;
                 let (cs_seg, mk_seg) = match mode {
                     MasterMode::Resident => {
                         let (cs_segs, _) = seg_grow!(
@@ -6671,36 +6623,38 @@ fn multiply_batch_block<'a>(
                         // offsets. The last segment is allocated to what it actually holds; the rest
                         // are full.
                         let nseg = enum_seg_ranges.len();
-                        // Lease retained scratch rather than allocating per launch (see
-                        // [`ScratchArena`]): the allocations that fail late against a churned pool
-                        // succeed in the first launches and are then never repeated.
+                        // Reuse this worker's retained scratch instead of allocating per launch
+                        // (see [`ScratchArena`]): the allocations that fail late against a churned
+                        // pool happen in the first launches instead, and never again.
                         //
-                        // Segments are allocated FULL SIZE so any later launch can reuse them
-                        // whatever its `need_*`; this launch binds only the prefix it actually
+                        // Segments are allocated FULL SIZE so any later launch on this worker can
+                        // reuse them whatever its `need_*`; each launch binds only the prefix it
                         // writes, which is what `cs_len_s`/`mk_len_s` carry into the `BufferArg`.
-                        // Stale bytes beyond that prefix are never read: every offset the multiply
+                        // Bytes beyond that prefix are never read: every offset the multiply
                         // dereferences was written by this launch's enumeration.
-                        let mut lease = ScratchLease::acquire();
-                        {
-                            let arena = lease.arena_mut();
+                        let (cs_segs, mk_segs) = SCRATCH.with(|s| {
+                            let mut arena = s.borrow_mut();
                             while arena.cs.len() < nseg {
                                 arena.cs.push(client.empty(seg_elems * size_of::<u16>()));
                             }
                             while arena.mk.len() < nseg {
                                 arena.mk.push(client.empty(seg_elems * size_of::<u16>()));
                             }
-                        }
-                        let mut cs_segs: Vec<(Handle, usize)> = Vec::with_capacity(nseg);
-                        let mut mk_segs: Vec<(Handle, usize)> = Vec::with_capacity(nseg);
-                        for s in 0..nseg {
-                            let base = s * seg_elems;
-                            let cs_len_s = (need_cs - base).min(seg_elems).max(1);
-                            let mk_len_s = (need_mk - base).min(seg_elems).max(1);
-                            let arena = lease.arena_mut();
-                            cs_segs.push((arena.cs[s].clone(), cs_len_s));
-                            mk_segs.push((arena.mk[s].clone(), mk_len_s));
-                        }
-                        scratch_lease = Some(lease);
+                            let mut cs: Vec<(Handle, usize)> = Vec::with_capacity(nseg);
+                            let mut mk: Vec<(Handle, usize)> = Vec::with_capacity(nseg);
+                            for i in 0..nseg {
+                                let base = i * seg_elems;
+                                cs.push((
+                                    arena.cs[i].clone(),
+                                    (need_cs - base).min(seg_elems).max(1),
+                                ));
+                                mk.push((
+                                    arena.mk[i].clone(),
+                                    (need_mk - base).min(seg_elems).max(1),
+                                ));
+                            }
+                            (cs, mk)
+                        });
                         for (s, &(lo, hi)) in enum_seg_ranges.iter().enumerate() {
                             let n_s = hi - lo;
                             if n_s == 0 {
@@ -6991,41 +6945,36 @@ fn multiply_batch_block<'a>(
                 // it takes them by value and the argument dies with the launch call. Nor do the `sa!`
                 // segment clones — those are temporaries too. So clone every handle here, before the
                 // launch consumes the originals, and hand the vec back with the future.
-                let keepalive = Keepalive {
-                    handles: [
-                        tg_h.clone(),
-                        g_h.clone(),
-                        xi_h.clone(),
-                        out_h.clone(),
-                        rco_h.clone(),
-                        rmo_h.clone(),
-                        rcl_h.clone(),
-                        rml_h.clone(),
-                        rnm_h.clone(),
-                        pri_h.clone(),
-                        pts_h.clone(),
-                        pnt_h.clone(),
-                        prb_h.clone(),
-                        poo_h.clone(),
-                        pps_h.clone(),
-                        coarse_h.clone(),
-                        psh_h.clone(),
-                        pms_h.clone(),
-                    ]
-                    .into_iter()
-                    // The resident segment stores, including the padding dummies. Their segments are
-                    // never freed while a handle lives, which is exactly the guarantee being extended.
-                    .chain(
-                        [&cs_seg, &mk_seg, &pp_seg, &ln_seg]
-                            .into_iter()
-                            .flat_map(|v| v.iter().map(|(h, _)| h.clone())),
-                    )
-                    .chain(enum_keep)
-                    .collect(),
-                    // Returning the arena frees it for another launch, so it waits for the readback
-                    // exactly as the handles do.
-                    scratch: scratch_lease,
-                };
+                let keepalive: Vec<Handle> = [
+                    tg_h.clone(),
+                    g_h.clone(),
+                    xi_h.clone(),
+                    out_h.clone(),
+                    rco_h.clone(),
+                    rmo_h.clone(),
+                    rcl_h.clone(),
+                    rml_h.clone(),
+                    rnm_h.clone(),
+                    pri_h.clone(),
+                    pts_h.clone(),
+                    pnt_h.clone(),
+                    prb_h.clone(),
+                    poo_h.clone(),
+                    pps_h.clone(),
+                    coarse_h.clone(),
+                    psh_h.clone(),
+                    pms_h.clone(),
+                ]
+                .into_iter()
+                // The resident segment stores, including the padding dummies. Their segments are
+                // never freed while a handle lives, which is exactly the guarantee being extended.
+                .chain(
+                    [&cs_seg, &mk_seg, &pp_seg, &ln_seg]
+                        .into_iter()
+                        .flat_map(|v| v.iter().map(|(h, _)| h.clone())),
+                )
+                .chain(enum_keep)
+                .collect();
                 W_UPLOAD_US.fetch_add(t_w_upload.elapsed().as_micros() as u64, Ordering::Relaxed);
                 let t_w_issue = std::time::Instant::now();
                 // SAFETY: `launch_unchecked` — see the kernel's `address_type = "u64"` note. Every device
