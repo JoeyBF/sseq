@@ -806,8 +806,8 @@ static BATCH_CALLS: AtomicU64 = AtomicU64::new(0);
 /// First-sight `R`s that forced an `admissible_matrices` enumeration + a `RESIDENT_HOST` write
 /// lock (see [`resident_info`]). Diffed around the pair pre-pass to attribute its cost.
 static RESIDENT_MISSES: AtomicU64 = AtomicU64::new(0);
-/// Enum-launch geometry, for sizing the grid against the device. `enumerate_admissible_kernel` is
-/// ~99% of GPU kernel time and its benchmark measured `Waves Per SM = 0.44` — i.e. it cannot fill
+/// Enum-launch geometry, for sizing the grid against the device. The benchmark for
+/// [`enumerate_admissible_kernel`] measured `Waves Per SM = 0.44` — i.e. it cannot fill
 /// half the machine — but that benchmark enumerates every `R` to degree 130 in ONE launch, while a
 /// production launch covers only one block-segment's transient `R`s. These say what production
 /// actually submits, which decides whether batching `R`s across launches is worth the scratch memory
@@ -825,9 +825,9 @@ static ENUM_THREADS_TOTAL: AtomicU64 = AtomicU64::new(0);
 /// It could not before, and that is a trap rather than a gap: `enumerate_admissible_kernel` is
 /// launched INSIDE [`multiply_batch_block`], so `device`/`launch`/`fence` -- and the
 /// `milnor_multiply` span -- all bill enum time to the multiply. Reading any of those as a
-/// multiply-kernel cost overstates it by more than an order of magnitude; measured per-kernel with
-/// ncu, enum is ~96% of GPU kernel time and the multiply ~4%, which matches this module's own
-/// "~99% of GPU kernel time" note above.
+/// multiply-kernel cost overstates it by however much enumeration there is, which ranges from
+/// nearly all of the device time at low stems to a fifth-to-half at the frontier; see
+/// [`enumerate_admissible_kernel`] for the measured split.
 ///
 /// `ENUM_LAUNCH_US` is host time inside the transient enumeration region: buffer allocation plus
 /// submission, but NOT device execution, since launches are async. Subtract it from `launch` to get
@@ -1239,8 +1239,8 @@ fn gpu_count() -> usize {
 ///
 /// Each device's submission queue is drained by this many workers, so this many device sections run
 /// CONCURRENTLY on one device instead of strictly one after another. It exists because
-/// [`enumerate_admissible_kernel`] is ~99% of GPU kernel time and runs the device at
-/// `Waves Per SM = 0.002`: a production launch is ~6 blocks of the 3168 an H200 can hold, and its
+/// [`enumerate_admissible_kernel`] runs the device at `Waves Per SM = 0.002`: a production launch
+/// is ~6 blocks of the 3168 an H200 can hold, and its
 /// duration is set by its longest single `R` (one thread, sequential odometer), not by how many
 /// blocks it occupies. Widening the grid therefore cannot help (measured: 6.5x more blocks bought
 /// 3.4%) — but running independent sections *beside* each other can, because it converts a SUM of
@@ -1266,7 +1266,7 @@ fn gpu_count() -> usize {
 /// lose 13%).
 ///
 /// The conclusion is therefore about the workload, not about streams: at this configuration the
-/// resolution is NOT GPU-throughput-bound. `enumerate_admissible_kernel` is 99% of GPU *kernel* time,
+/// resolution is NOT GPU-throughput-bound. The enumeration kernel dominated GPU *kernel* time here,
 /// but kernel time is not on the critical path, so the "batching turns a SUM into a MAX" argument
 /// above — correct as arithmetic about the launches — optimises something that is not the limiter.
 /// Measured at the same time: the process ran at ~918% CPU on a 128-core node (~7% of the machine)
@@ -1969,8 +1969,9 @@ fn seed_starts(p_part: &[u32], sp: usize) -> Vec<u32> {
 /// Overridable by `NASSAU_GPU_ENUM_SPLIT_MIN` — set it to 1 to force EVERY `R` down the split path,
 /// which is what makes a small end-to-end run an actual test of the split rather than a vacuous one.
 ///
-/// TUNED 2048 -> 128. The old value was far too conservative: `enumerate_admissible_kernel` is ~96%
-/// of GPU kernel time (ncu, and confirmed host-side by `enum_dev`), a launch's duration is its
+/// TUNED 2048 -> 128. The old value was far too conservative in the regime it was tuned in
+/// (theta=0, stems 120 and 150, where enumeration dominated GPU kernel time): a launch's
+/// duration is its
 /// LONGEST single `R` chain, and at 2048 nearly every `R` in a launch was left unsplit — including,
 /// routinely, the long pole that sets the duration. Measured on `enum_dev`, theta=0, 2 reps:
 ///
@@ -2964,9 +2965,10 @@ fn ppart_degree(p_part: PPart) -> i32 {
 ///
 /// SET IT AS HIGH AS DEVICE MEMORY ALLOWS. The reference-miss rate above is a byte metric and badly
 /// understates the time cost: a miss re-enumerates on the GPU in EVERY block that touches the `R`
-/// (~442 times over a run at (150,75)), and `enumerate_admissible_kernel` is ~99% of GPU kernel time
-/// whenever the transient path is live (nsys; `multiply_batch_kernel` is 1.1%). Measured on stem 200
-/// to max_t=310, all complete with 0 crashes:
+/// (~442 times over a run at (150,75)), and at low stems enumeration is most of GPU kernel time
+/// once the transient path is live (the share falls with stem; see
+/// [`enumerate_admissible_kernel`]). Measured on stem 200 to max_t=310, all complete with 0
+/// crashes:
 ///
 /// | θ    | wall    | peak GPU mem |
 /// |------|---------|--------------|
@@ -4299,8 +4301,9 @@ fn multiply_batch_kernel(
     // with 0.05% spread. So the frontier crossed a knee somewhere between: it was multiply-bound at
     // 290s and is bound by something else at 190s, with roughly 12 launches queued per device and
     // 60% of each worker's device time spent waiting behind other work rather than in its own
-    // kernel. Further multiply-kernel work is still worth doing for its own sake -- it is 87% of
-    // GPU kernel time, and the margin returns as soon as whatever now binds is removed -- but do
+    // kernel. Further multiply-kernel work is still worth doing for its own sake -- it is a large
+    // share of GPU kernel time at the frontier (see `enumerate_admissible_kernel`), and the margin
+    // returns as soon as whatever now binds is removed -- but do
     // not expect it to show up in a run, and do not size the next optimisation by a kernel ratio.
     // Find the new constraint first.
     let cols_u = u32::cast_from(cols);
@@ -6576,7 +6579,7 @@ fn multiply_batch_block<'a>(
                         // Everything in this arm is ENUMERATION, and it is billed separately from
                         // here on: it sits inside the multiply's `launch`/`fence`, which is why
                         // those numbers -- and the `milnor_multiply` span -- have always read as
-                        // "multiply" while being ~96% enum. See [`ENUM_LAUNCH_US`].
+                        // "multiply" while including enumeration. See [`ENUM_LAUNCH_US`].
                         let t_enum = std::time::Instant::now();
                         // The enumeration launch is issued before the multiply on this same stream, so the
                         // scratch is fully written when the multiply reads it (one-stream launches are
@@ -7569,9 +7572,24 @@ fn seg_read_u32(
     v
 }
 
-/// PROFILE (ncu, idle H200, degree <= 130: 89392 `R`s / 76M matrices). This kernel is ~99% of GPU
-/// kernel time whenever the transient path is live (nsys; `multiply_batch_kernel` is 1.1%), and it is
-/// LATENCY-bound, not bandwidth- or compute-bound:
+/// SHARE OF GPU KERNEL TIME moves with stem, device count and code version, so never quote it
+/// without all three. At degree <= 130 this kernel is nearly all of it (nsys; the multiply was
+/// 1.1%). At the frontier it is a fifth to a half. nsys on a stem ~300-360 save, theta=200, one
+/// stream per device, shares of this kernel plus [`multiply_batch_kernel`]:
+///
+/// ```text
+/// code          devices   this kernel   multiply
+/// 67db36385a    1         12%           88%
+/// 67db36385a    3         19%           81%
+/// 0354d4f146    1         38%           62%
+/// 0354d4f146    3         52%           48%
+/// ```
+///
+/// The share rises whenever work spreads over more, smaller launches: the multiply's cost divides
+/// across them, but a launch of this kernel lasts as long as its longest `R` chain.
+///
+/// PROFILE (ncu, idle H200, degree <= 130: 89392 `R`s / 76M matrices). At these degrees the kernel
+/// is LATENCY-bound, not bandwidth- or compute-bound:
 ///
 /// ```text
 /// Compute (SM) Throughput   5.16 %      Avg. Active Threads Per Warp   5.88 / 32
