@@ -256,6 +256,22 @@ impl MilnorSubalgebra {
         SignatureIterator::new(self, degree)
     }
 
+    /// How many signatures [`Self::iter_signatures`] would yield at `degree`, without allocating a
+    /// `Vec` per signature (it walks the same odometer via [`SignatureIterator::advance`]).
+    ///
+    /// The signature loop cannot supply this: a bidegree that is already converged breaks out
+    /// before its first iteration, so the census recorded `0` for it and could not tell that case
+    /// apart from a trivial subalgebra, which genuinely has no signatures. Called once per
+    /// bidegree, and only when the census is enabled.
+    fn count_signatures(&self, degree: i32) -> usize {
+        let mut iter = SignatureIterator::new(self, degree);
+        let mut n = 0;
+        while iter.advance() {
+            n += 1;
+        }
+        n
+    }
+
     /// Internal degree of a signature. `xi_i` has degree `2^i - 1`, so entry `idx` (which is
     /// `xi_{idx+1}`) carries weight `2^(idx+1) - 1` — the same weighting [`Self::top_degree`] uses.
     fn signature_degree(signature: &[PPartEntry]) -> i32 {
@@ -394,10 +410,11 @@ impl<'a> SignatureIterator<'a> {
     }
 }
 
-impl Iterator for SignatureIterator<'_> {
-    type Item = Vec<PPartEntry>;
-
-    fn next(&mut self) -> Option<Self::Item> {
+impl SignatureIterator<'_> {
+    /// Step the odometer. Returns whether another signature exists; if so `self.current` is it.
+    /// Split out of [`Iterator::next`] so [`MilnorSubalgebra::count_signatures`] can walk the same
+    /// sequence without cloning a `Vec` per step.
+    fn advance(&mut self) -> bool {
         let xi_degrees = combinatorics::xi_degrees(TWO);
         let len = self.current.len();
         for (i, current) in self.current.iter_mut().enumerate() {
@@ -408,15 +425,23 @@ impl Iterator for SignatureIterator<'_> {
                 self.signature_degree -= xi_degrees[i] * *current as i32;
                 *current = 0;
                 if i + 1 == len {
-                    return None;
+                    return false;
                 }
             } else {
-                return Some(self.current.clone());
+                return true;
             }
         }
         // This only happens when the profile is trivial
         assert!(self.current.is_empty());
-        None
+        false
+    }
+}
+
+impl Iterator for SignatureIterator<'_> {
+    type Item = Vec<PPartEntry>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.advance().then(|| self.current.clone())
     }
 }
 
@@ -3609,6 +3634,11 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
         let mut probe_reads = 0usize;
         let mut probe_perturbed = 0usize;
 
+        // Before the loop: a bidegree that is already converged breaks out below without ever
+        // recording, so this is the only place the subalgebra's signature count can be captured.
+        if let Some(c) = census.as_mut() {
+            c.set_signatures_total(subalgebra.count_signatures(b.t()));
+        }
         for (sig_idx, signature) in subalgebra.iter_signatures(b.t()).enumerate() {
             let _guard = tracing::info_span!("step", ?signature).entered();
             // Corrections only ever raise signature, so once every `dx` is zero the whole remaining
@@ -3631,12 +3661,14 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
             if f.is_none() && dxs.iter().all(|dx| dx.is_zero()) {
                 break;
             }
-            // Recorded AFTER the skip, so `signatures` counts iterations actually executed and
-            // `dead_signature_tail` keeps meaning "waste still present in the run" — it reads ~0
-            // once the skip is on. Counting the one aborted iteration as dead would peg a skipped
-            // bidegree at 100% dead forever and hide whether the skip fired at all.
+            // Recorded AFTER the skip, so `signatures_executed` counts iterations actually
+            // executed and `dead_signature_tail` keeps meaning "waste still present in the run" —
+            // it reads ~0 once the skip is on. Counting the one aborted iteration as dead would peg
+            // a skipped bidegree at 100% dead forever and hide whether the skip fired at all. The
+            // subalgebra's own signature count is `signatures_total`, set before the loop, because
+            // a bidegree that breaks here never reaches this line at all.
             if let Some(c) = census.as_mut() {
-                c.set_signatures(sig_idx + 1);
+                c.set_signatures_executed(sig_idx + 1);
                 c.sig_live(sig_idx, dxs.iter().any(|dx| !dx.is_zero()));
             }
             // Spans below split what used to be one opaque `step`: the run's own accounting put

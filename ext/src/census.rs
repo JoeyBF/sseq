@@ -77,8 +77,19 @@ pub struct Bidegree {
     pub target_masked_dim: u64,
     /// Restricted target dimension (all signatures) — the column count of `full_matrix`.
     pub next_dim: u64,
-    /// Number of signatures of the chosen subalgebra at this bidegree.
-    pub signatures: u64,
+    /// Number of signatures the chosen subalgebra has at this bidegree's internal degree, from
+    /// [`crate::nassau::MilnorSubalgebra::count_signatures`]. A property of the subalgebra and the
+    /// degree, independent of how much of the signature loop ran; measured equal to
+    /// `subalgebra_dim - 1` wherever the degree bound is not binding. `0` exactly when the
+    /// subalgebra is trivial (`subalgebra_dim == 1`), because `iter_signatures` skips the zero
+    /// signature and a trivial profile yields no others.
+    pub signatures_total: u64,
+    /// Signature-loop iterations actually executed. `0` means the dead-signature-tail skip fired
+    /// before the first iteration, i.e. every `dx` was already zero and the whole loop was a
+    /// provable no-op. It does NOT mean the bidegree was skipped or left incomplete -- such
+    /// bidegrees are verified correct against published data. Compare against `signatures_total`
+    /// to see how much of the loop was elided.
+    pub signatures_executed: u64,
     /// Signature-space dimension of the subalgebra (`dim B`), for the 1/dim-B row-share check.
     pub subalgebra_dim: u64,
     pub num_new_gens: u64,
@@ -125,18 +136,19 @@ fn csv_path() -> String {
 /// and the end-of-run [`report`], so the two can never drift into different column orders.
 fn write_csv(records: &[Bidegree]) {
     let mut csv = String::from(
-        "s,t,target_dim,target_masked_dim,next_dim,signatures,subalgebra_dim,num_new_gens,\
-         last_live_sig,rows_consumed,matrix_bytes,wall_us\n",
+        "s,t,target_dim,target_masked_dim,next_dim,signatures_total,signatures_executed,\
+         subalgebra_dim,num_new_gens,last_live_sig,rows_consumed,matrix_bytes,wall_us\n",
     );
     for r in records.iter() {
         csv.push_str(&format!(
-            "{},{},{},{},{},{},{},{},{},{},{},{}\n",
+            "{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
             r.s,
             r.t,
             r.target_dim,
             r.target_masked_dim,
             r.next_dim,
-            r.signatures,
+            r.signatures_total,
+            r.signatures_executed,
             r.subalgebra_dim,
             r.num_new_gens,
             r.last_live_sig,
@@ -190,10 +202,19 @@ impl BidegreeCensus {
         self.rec.num_new_gens = n as u64;
     }
 
-    /// Total signature count for the bidegree. Counted during the loop rather than by re-running
-    /// `iter_signatures`, so the census does not change the enumeration work.
-    pub fn set_signatures(&mut self, n: usize) {
-        self.rec.signatures = n as u64;
+    /// Total signature count for the bidegree. Set once before the signature loop, because the
+    /// loop cannot report it: a bidegree whose `dx`s are all zero breaks out before its first
+    /// iteration, which is exactly the case that used to record a meaningless `0`. The count walks
+    /// the signature odometer without allocating, and only when the census is enabled.
+    pub fn set_signatures_total(&mut self, n: usize) {
+        self.rec.signatures_total = n as u64;
+    }
+
+    /// Signature-loop iterations executed so far. Called from inside the loop, after the
+    /// dead-signature-tail skip, so it counts iterations that actually ran rather than the
+    /// subalgebra's signature count.
+    pub fn set_signatures_executed(&mut self, n: usize) {
+        self.rec.signatures_executed = n as u64;
     }
 
     /// Called once per signature index, before that signature's work, with whether any `dx` is
@@ -245,11 +266,11 @@ pub fn report() {
         .iter()
         .map(|r| {
             // Signature iterations after the last live `dx`, as a share of this bidegree's work.
-            let dead = (r.signatures as i64 - 1 - r.last_live_sig).max(0) as u128;
-            if r.signatures == 0 {
+            let dead = (r.signatures_executed as i64 - 1 - r.last_live_sig).max(0) as u128;
+            if r.signatures_executed == 0 {
                 0
             } else {
-                w(r) * dead / r.signatures as u128
+                w(r) * dead / r.signatures_executed as u128
             }
         })
         .sum();
