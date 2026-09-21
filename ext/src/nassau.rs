@@ -916,6 +916,11 @@ mod sig_solver {
     static BYTES: AtomicUsize = AtomicUsize::new(0);
     static HIT: AtomicUsize = AtomicUsize::new(0);
     static MISS: AtomicUsize = AtomicUsize::new(0);
+    static PRE_BYTES: AtomicUsize = AtomicUsize::new(0);
+    static PIV_BYTES: AtomicUsize = AtomicUsize::new(0);
+    static ROWS: AtomicUsize = AtomicUsize::new(0);
+    static COLS: AtomicUsize = AtomicUsize::new(0);
+    static RANK: AtomicUsize = AtomicUsize::new(0);
 
     /// Default ON; `NASSAU_SIG_SOLVER_CACHE=0` disables.
     pub(super) fn enabled() -> bool {
@@ -969,9 +974,20 @@ mod sig_solver {
             return;
         }
         let size = size_of(&q);
+        let pre = q.preimage();
+        let pre_b = pre.rows() * pre.columns().div_ceil(8);
+        let piv_b = q
+            .pivots()
+            .map_or(0, |p| p.len() * std::mem::size_of::<isize>());
+        let (rows, cols, rank) = (key.3, key.4, pre.rows());
         let mut c = CACHE.lock().unwrap();
         if c.insert(key, q).is_none() {
             BYTES.fetch_add(size, Ordering::Relaxed);
+            PRE_BYTES.fetch_add(pre_b, Ordering::Relaxed);
+            PIV_BYTES.fetch_add(piv_b, Ordering::Relaxed);
+            ROWS.fetch_add(rows, Ordering::Relaxed);
+            COLS.fetch_add(cols, Ordering::Relaxed);
+            RANK.fetch_add(rank, Ordering::Relaxed);
         }
         let cap = cache_bytes_cap();
         if cap != usize::MAX && BYTES.load(Ordering::Relaxed) > cap {
@@ -994,11 +1010,20 @@ mod sig_solver {
         if h + m == 0 {
             return;
         }
+        let n = CACHE.lock().unwrap().len().max(1);
         eprintln!(
-            "[sig-solver] entries={} approx={:.2}GB hits={h} misses={m} hit_rate={:.1}%",
+            "[sig-solver] entries={} approx={:.3}GB hits={h} misses={m} hit_rate={:.1}% | \
+             preimage={:.3}GB pivots={:.3}GB pivot_share={:.1}% | mean rows={} cols={} rank={}",
             CACHE.lock().unwrap().len(),
             BYTES.load(Ordering::Relaxed) as f64 / 1e9,
             100.0 * h as f64 / (h + m) as f64,
+            PRE_BYTES.load(Ordering::Relaxed) as f64 / 1e9,
+            PIV_BYTES.load(Ordering::Relaxed) as f64 / 1e9,
+            100.0 * PIV_BYTES.load(Ordering::Relaxed) as f64
+                / BYTES.load(Ordering::Relaxed).max(1) as f64,
+            ROWS.load(Ordering::Relaxed) / n,
+            COLS.load(Ordering::Relaxed) / n,
+            RANK.load(Ordering::Relaxed) / n,
         );
     }
 }
