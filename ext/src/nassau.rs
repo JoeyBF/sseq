@@ -34,7 +34,7 @@ use std::collections::HashMap;
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use fp::{
-    matrix::{AugmentedMatrix, Matrix, Subspace},
+    matrix::{AugmentedMatrix, Matrix, QuasiInverse, Subspace},
     prime::{Prime, TWO, ValidPrime},
     vector::{FpSlice, FpSliceMut, FpVector},
 };
@@ -878,6 +878,127 @@ fn shift_probe_report() {
             } else {
                 100.0 * mm as f64 / mt as f64
             }
+        );
+    }
+}
+
+/// Cache of REDUCED zero-signature solvers: what [`shift`]'s matrix reduces to.
+///
+/// [`shift`] removes the MULTIPLY for a nonzero signature but leaves `row_reduce` +
+/// `compute_quasi_inverse` running once per signature, which the census trace puts at 41.5% of
+/// `step` busy (`gpu_row_reduce` 353.2 s of 850.2 s). The reference implementation caches the
+/// SOLVER instead -- its `solve_signature_lifts` looks up an already-reduced zero-signature basis
+/// at `t - deg(sigma)` and permutes into it -- so it reduces once per shifted degree rather than
+/// once per signature.
+///
+/// Sound because the reduced result is a pure function of the key. On the shift path the assembled
+/// matrix is `[rows 0..rows, cols 0..cols of the cached zero-signature matrix | I]`, that matrix is
+/// itself determined by `(s, degree, profile)`, and row reduction is deterministic -- so two
+/// consumers sharing a key reduce the very same matrix.
+///
+/// Only the `pre_masked` path is cached. Unmasked, the assemble reads
+/// `add_masked(zs.row(i), 1, zs_next)`, which depends on the mask CONTENTS and not merely its
+/// length, so a length-keyed entry would be wrong there.
+mod sig_solver {
+    use std::sync::{
+        Arc, LazyLock, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    use fp::matrix::QuasiInverse;
+    use rustc_hash::FxHashMap;
+
+    /// [`super::shift`]'s key plus the consumer's shape: `(s, shifted degree, profile, rows, cols)`.
+    pub(super) type Key = (i32, i32, Vec<u8>, usize, usize);
+
+    static CACHE: LazyLock<Mutex<FxHashMap<Key, Arc<QuasiInverse>>>> =
+        LazyLock::new(|| Mutex::new(FxHashMap::default()));
+    static BYTES: AtomicUsize = AtomicUsize::new(0);
+    static HIT: AtomicUsize = AtomicUsize::new(0);
+    static MISS: AtomicUsize = AtomicUsize::new(0);
+
+    /// Default ON; `NASSAU_SIG_SOLVER_CACHE=0` disables.
+    pub(super) fn enabled() -> bool {
+        static ON: LazyLock<bool> =
+            LazyLock::new(|| std::env::var("NASSAU_SIG_SOLVER_CACHE").as_deref() != Ok("0"));
+        *ON
+    }
+
+    /// Byte ceiling (`NASSAU_SIG_SOLVER_GB`, default 0 = unlimited). Eviction is lowest-degree
+    /// first for the same reason as [`super::shift`]: the wavefront never returns to a degree it
+    /// has passed, and a miss merely re-reduces, so eviction cannot change results.
+    fn cache_bytes_cap() -> usize {
+        static N: LazyLock<usize> = LazyLock::new(|| {
+            let gb: f64 = std::env::var("NASSAU_SIG_SOLVER_GB")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0.0);
+            if gb <= 0.0 {
+                usize::MAX
+            } else {
+                (gb * 1e9) as usize
+            }
+        });
+        *N
+    }
+
+    /// Bit-packed preimage plus the pivot vector. Counted the same way [`super::shift`] counts a
+    /// matrix, so the two figures are comparable -- note that estimator is a known undercount.
+    fn size_of(q: &QuasiInverse) -> usize {
+        let pre = q.preimage();
+        pre.rows() * pre.columns().div_ceil(8)
+            + q.pivots()
+                .map_or(0, |p| p.len() * std::mem::size_of::<isize>())
+    }
+
+    pub(super) fn get(key: &Key) -> Option<Arc<QuasiInverse>> {
+        if !enabled() {
+            return None;
+        }
+        let hit = CACHE.lock().unwrap().get(key).map(Arc::clone);
+        if hit.is_some() {
+            HIT.fetch_add(1, Ordering::Relaxed);
+        } else {
+            MISS.fetch_add(1, Ordering::Relaxed);
+        }
+        hit
+    }
+
+    pub(super) fn put(key: Key, q: Arc<QuasiInverse>) {
+        if !enabled() {
+            return;
+        }
+        let size = size_of(&q);
+        let mut c = CACHE.lock().unwrap();
+        if c.insert(key, q).is_none() {
+            BYTES.fetch_add(size, Ordering::Relaxed);
+        }
+        let cap = cache_bytes_cap();
+        if cap != usize::MAX && BYTES.load(Ordering::Relaxed) > cap {
+            let mut keys: Vec<Key> = c.keys().cloned().collect();
+            keys.sort_by_key(|k| k.1);
+            for k in keys {
+                if BYTES.load(Ordering::Relaxed) <= cap {
+                    break;
+                }
+                if let Some(old) = c.remove(&k) {
+                    let freed = size_of(&old);
+                    BYTES.fetch_sub(freed.min(BYTES.load(Ordering::Relaxed)), Ordering::Relaxed);
+                }
+            }
+        }
+    }
+
+    pub(super) fn report() {
+        let (h, m) = (HIT.load(Ordering::Relaxed), MISS.load(Ordering::Relaxed));
+        if h + m == 0 {
+            return;
+        }
+        eprintln!(
+            "[sig-solver] entries={} approx={:.2}GB hits={h} misses={m} hit_rate={:.1}%",
+            CACHE.lock().unwrap().len(),
+            BYTES.load(Ordering::Relaxed) as f64 / 1e9,
+            100.0 * h as f64 / (h + m) as f64,
         );
     }
 }
@@ -3730,7 +3851,7 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
             // mask, since the shifted matrix lives over the shifted degree's column space.
             // The `bool` is whether the cached matrix is already in masked column coordinates, in
             // which case the mask is only consulted for its LENGTH (the consumer reads a prefix).
-            let mut shifted: Option<(Arc<Matrix>, Vec<usize>, bool)> = None;
+            let mut shifted: Option<(Arc<Matrix>, Vec<usize>, bool, i32)> = None;
             // Sibling of `shifted` so its scope is exactly the private matrix's lifetime.
             #[cfg_attr(not(feature = "gpu"), allow(unused_mut))]
             let mut _private_live: Option<PrivateLive> = None;
@@ -3895,7 +4016,7 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                         m.columns()
                     );
                     let pre_masked = masked_cols_enabled();
-                    shifted = Some((m, zs_next, pre_masked));
+                    shifted = Some((m, zs_next, pre_masked, shifted_t));
                 }
             }
 
@@ -3979,69 +4100,98 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                 }
             }
 
-            let mut masked_matrix = tracing::trace_span!(
-                "sig_assemble",
-                rows = target_mask.len(),
-                cols = next_mask.len()
-            )
-            .in_scope(|| {
-                let mut m = AugmentedMatrix::new(
-                    p,
+            // On the shift path the reduced result is a pure function of this key, so the
+            // reduction is shared across every signature and every bidegree that lands on the
+            // same shifted degree instead of running once per signature -- see [`sig_solver`].
+            // Gated on `shift_skip_full`, which means `f` is `None`, so `write_qi` -- the only
+            // other consumer of the assembled matrix -- returns immediately without reading it.
+            let solver_key: Option<sig_solver::Key> = match (&shifted, shift_skip_full) {
+                (Some((_, _, true, shifted_t)), true) => Some((
+                    b.s(),
+                    *shifted_t,
+                    subalgebra.profile.to_vec(),
                     target_mask.len(),
-                    [next_mask.len(), target_mask.len()],
-                );
-                // Row gather and column mask fused into one pass. `Matrix::add_masked` would need a
-                // materialised `full_matrix`; going row by row lets the gather stay an indirection.
-                match &shifted {
-                    // Same matrix, reached from the shared build at the shifted degree — hence its
-                    // own column mask over the shifted degree's column space.
-                    Some((zs, zs_next, pre_masked)) => {
-                        for (i, mut l) in m.segment(0, 0).iter_mut().enumerate() {
-                            if *pre_masked {
-                                // Already in masked coordinates; this consumer's mask names a
-                                // prefix of the cached one, so take that many columns.
-                                l.add(zs.row(i).restrict(0, zs_next.len()), 1);
-                            } else {
-                                l.add_masked(zs.row(i), 1, zs_next);
+                    next_mask.len(),
+                )),
+                _ => None,
+            };
+            // `None` exactly when the solver came from the cache; nothing below reads it then.
+            let mut masked_matrix: Option<AugmentedMatrix<2>> = None;
+            let qi: Arc<QuasiInverse> = match solver_key.as_ref().and_then(sig_solver::get) {
+                Some(cached) => cached,
+                None => {
+                    let mut assembled = tracing::trace_span!(
+                        "sig_assemble",
+                        rows = target_mask.len(),
+                        cols = next_mask.len()
+                    )
+                    .in_scope(|| {
+                        let mut m = AugmentedMatrix::new(
+                            p,
+                            target_mask.len(),
+                            [next_mask.len(), target_mask.len()],
+                        );
+                        // Row gather and column mask fused into one pass. `Matrix::add_masked` would need a
+                        // materialised `full_matrix`; going row by row lets the gather stay an indirection.
+                        match &shifted {
+                            // Same matrix, reached from the shared build at the shifted degree — hence its
+                            // own column mask over the shifted degree's column space.
+                            Some((zs, zs_next, pre_masked, _)) => {
+                                for (i, mut l) in m.segment(0, 0).iter_mut().enumerate() {
+                                    if *pre_masked {
+                                        // Already in masked coordinates; this consumer's mask names a
+                                        // prefix of the cached one, so take that many columns.
+                                        l.add(zs.row(i).restrict(0, zs_next.len()), 1);
+                                    } else {
+                                        l.add_masked(zs.row(i), 1, zs_next);
+                                    }
+                                }
+                            }
+                            None => {
+                                for (i, mut l) in m.segment(0, 0).iter_mut().enumerate() {
+                                    l.add_masked(full_matrix.row(i), 1, &next_mask);
+                                }
                             }
                         }
+                        // Per assembly, not per row -- see the note at the zs_assemble site. This one runs
+                        // once per SIGNATURE, and a bidegree at the frontier has ~1000 of them, so the
+                        // total here is what sizes the per-signature copy cost the census was meant to
+                        // report and has been printing as a misleading 0.0GB.
+                        crate::census::add_bytes(
+                            &crate::census::ADD_MASKED_BYTES,
+                            crate::census::matrix_bytes(target_mask.len(), next_mask.len()),
+                        );
+                        crate::census::add_bytes(
+                            &crate::census::AUGMENTED_ALLOC_BYTES,
+                            crate::census::matrix_bytes(
+                                target_mask.len(),
+                                next_mask.len() + target_mask.len(),
+                            ),
+                        );
+                        m.segment(1, 1).add_identity();
+                        m
+                    });
+
+                    // The CPU row reduction, once per signature. `gpu_row_reduce` only takes over at
+                    // >= 8192^2, so every one of these is host work.
+                    tracing::trace_span!(
+                        "sig_row_reduce",
+                        rows = target_mask.len(),
+                        cols = next_mask.len()
+                    )
+                    .in_scope(|| assembled.row_reduce());
+
+                    let q = Arc::new(
+                        tracing::trace_span!("sig_quasi_inverse")
+                            .in_scope(|| assembled.compute_quasi_inverse()),
+                    );
+                    if let Some(key) = solver_key.clone() {
+                        sig_solver::put(key, Arc::clone(&q));
                     }
-                    None => {
-                        for (i, mut l) in m.segment(0, 0).iter_mut().enumerate() {
-                            l.add_masked(full_matrix.row(i), 1, &next_mask);
-                        }
-                    }
+                    masked_matrix = Some(assembled);
+                    q
                 }
-                // Per assembly, not per row -- see the note at the zs_assemble site. This one runs
-                // once per SIGNATURE, and a bidegree at the frontier has ~1000 of them, so the
-                // total here is what sizes the per-signature copy cost the census was meant to
-                // report and has been printing as a misleading 0.0GB.
-                crate::census::add_bytes(
-                    &crate::census::ADD_MASKED_BYTES,
-                    crate::census::matrix_bytes(target_mask.len(), next_mask.len()),
-                );
-                crate::census::add_bytes(
-                    &crate::census::AUGMENTED_ALLOC_BYTES,
-                    crate::census::matrix_bytes(
-                        target_mask.len(),
-                        next_mask.len() + target_mask.len(),
-                    ),
-                );
-                m.segment(1, 1).add_identity();
-                m
-            });
-
-            // The CPU row reduction, once per signature. `gpu_row_reduce` only takes over at
-            // >= 8192^2, so every one of these is host work.
-            tracing::trace_span!(
-                "sig_row_reduce",
-                rows = target_mask.len(),
-                cols = next_mask.len()
-            )
-            .in_scope(|| masked_matrix.row_reduce());
-
-            let qi = tracing::trace_span!("sig_quasi_inverse")
-                .in_scope(|| masked_matrix.compute_quasi_inverse());
+            };
             let pivots = qi.pivots().unwrap();
             let preimage = qi.preimage();
 
@@ -4141,15 +4291,18 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                 }
             }
             drop(_lift);
-            tracing::trace_span!("sig_write_qi").in_scope(|| {
-                Self::write_qi(
+            tracing::trace_span!("sig_write_qi").in_scope(|| match &masked_matrix {
+                Some(assembled) => Self::write_qi(
                     &mut f,
                     &mut scratch,
                     &signature,
                     &next_mask,
                     &full_matrix,
-                    &masked_matrix,
-                )
+                    assembled,
+                ),
+                // Only `None` when the solver came from the cache, which requires
+                // `shift_skip_full` and hence `f.is_none()` -- `write_qi` returns immediately.
+                None => Ok(()),
             })?;
         }
         if dx_snapshot.is_some() {
@@ -5179,6 +5332,7 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
             }
             shift_probe_report();
             shift_stats_report();
+            sig_solver::report();
             let n = INFLIGHT_N.load(std::sync::atomic::Ordering::Relaxed);
             if n > 0 {
                 eprintln!(
