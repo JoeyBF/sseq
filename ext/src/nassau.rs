@@ -999,7 +999,10 @@ mod sig_level {
 /// ~1.4s each) is uniform, where the level schedule and the single-max bound diverge completely.
 /// Both ratios are reported so the two regimes can be told apart in one run.
 mod sig_sched {
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::{
+        collections::BTreeMap,
+        sync::{Mutex, atomic::{AtomicU64, Ordering}},
+    };
 
     pub static SERIAL_NS: AtomicU64 = AtomicU64::new(0);
     pub static LEVEL_NS: AtomicU64 = AtomicU64::new(0);
@@ -1039,7 +1042,22 @@ mod sig_sched {
         }
     }
 
-    pub fn record(samples: &[(u32, f64)]) {
+    /// Per-subalgebra totals, keyed by `subalgebra_dim = 2^sum(profile)`. The aggregate ceiling
+    /// mixes regimes that differ by an order of magnitude in DAG width -- A(2) `[3,2,1]` is 44% of
+    /// frontier wall at width 10, A(3) `[4,3,2,1]` is 29% at width 110 -- so the aggregate alone
+    /// cannot say whether a narrow subalgebra is the binding constraint.
+    pub static BY_SUB: Mutex<BTreeMap<u64, (f64, f64, f64, u64)>> = Mutex::new(BTreeMap::new());
+
+    pub fn record_sub(sub_dim: u64, serial: f64, level: f64, maxsig: f64) {
+        let mut g = BY_SUB.lock().unwrap();
+        let e = g.entry(sub_dim).or_insert((0.0, 0.0, 0.0, 0));
+        e.0 += serial;
+        e.1 += level;
+        e.2 += maxsig;
+        e.3 += 1;
+    }
+
+    pub fn record(samples: &[(u32, f64)], sub_dim: u64) {
         if samples.is_empty() {
             return;
         }
@@ -1065,6 +1083,7 @@ mod sig_sched {
             Ordering::Relaxed,
         );
         WIDEST.fetch_max(widest, Ordering::Relaxed);
+        record_sub(sub_dim, serial, level_cost, maxsig);
         let n = BIDEGREES.fetch_add(1, Ordering::Relaxed) + 1;
         if n % REPORT_EVERY == 0 {
             report(n);
@@ -1085,6 +1104,17 @@ mod sig_sched {
             if level > 0.0 { serial / level } else { 0.0 },
             if maxsig > 0.0 { serial / maxsig } else { 0.0 },
         );
+        let g = BY_SUB.lock().unwrap();
+        let grand: f64 = g.values().map(|e| e.0).sum();
+        for (dim, (ser, lvl, mx, cnt)) in g.iter() {
+            eprintln!(
+                "[sig-sched-sub] subalgebra_dim={dim} bidegrees={cnt} serial={ser:.1}s \
+                 ({:.1}% of wall) level_schedule={lvl:.1}s ceiling={:.2}x single_max_bound={:.2}x",
+                if grand > 0.0 { 100.0 * ser / grand } else { 0.0 },
+                if *lvl > 0.0 { ser / lvl } else { 0.0 },
+                if *mx > 0.0 { ser / mx } else { 0.0 },
+            );
+        }
     }
 }
 
@@ -4698,7 +4728,16 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
             })?;
         }
         if sched_cost.is_some() {
-            sig_sched::record(&sched_samples.borrow());
+            // `subalgebra_dim = 2^sum(profile)`, the same key the census column uses, and it names
+            // the profile uniquely along the `SubalgebraIterator` staircase.
+            let sub_dim = 1u64
+                << subalgebra
+                    .profile
+                    .iter()
+                    .map(|&p| p as u32)
+                    .sum::<u32>()
+                    .min(63);
+            sig_sched::record(&sched_samples.borrow(), sub_dim);
         }
         if dx_snapshot.is_some() {
             eprintln!(
