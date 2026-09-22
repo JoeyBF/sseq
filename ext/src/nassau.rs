@@ -1255,6 +1255,30 @@ mod sig_sched {
     pub static CORRECT_NS: AtomicU64 = AtomicU64::new(0);
     pub static CORRECT_ROWS: AtomicU64 = AtomicU64::new(0);
 
+    /// Time inside `sig_lift`. Everything ABOVE it -- `sig_masks`, `sig_select`, `sig_assemble`,
+    /// `sig_row_reduce`, `sig_quasi_inverse` -- reads only the differentials and never touches
+    /// `dxs`/`xs`, so it is independent ACROSS signatures with no appeal to the DAG at all. The
+    /// lift is the part that needs the DAG to run concurrently.
+    ///
+    /// The split decides which of two very different changes is worth making: a parallel prepare
+    /// (contained, no ordering risk) captures `prepare_share` of the 2.2x ceiling, and only the
+    /// remainder needs a level-parallel lift.
+    pub static LIFT_NS: AtomicU64 = AtomicU64::new(0);
+
+    pub struct LiftTimer(std::time::Instant);
+
+    impl LiftTimer {
+        pub fn new() -> Self {
+            Self(std::time::Instant::now())
+        }
+    }
+
+    impl Drop for LiftTimer {
+        fn drop(&mut self) {
+            LIFT_NS.fetch_add(self.0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        }
+    }
+
     pub fn record_reach(reach: u64, full: u64) {
         REACH_COLS.fetch_add(reach, Ordering::Relaxed);
         FULL_COLS.fetch_add(full, Ordering::Relaxed);
@@ -1353,6 +1377,22 @@ mod sig_sched {
             if level > 0.0 { serial / level } else { 0.0 },
             if maxsig > 0.0 { serial / maxsig } else { 0.0 },
         );
+        let lift = LIFT_NS.load(Ordering::Relaxed) as f64 / 1e9;
+        if lift > 0.0 {
+            let prep_share = 1.0 - lift / serial.max(1e-9);
+            // A parallel PREPARE alone is Amdahl-bounded by the serial lift: even at infinite
+            // width it cannot beat 1/(1 - prepare_share). Worth stating next to the 2.2x, which
+            // assumes the whole step parallelises.
+            eprintln!(
+                "[sig-split] lift={lift:.1}s ({:.1}% of walk) prepare={:.1}s ({:.1}%) | \
+                 parallel-prepare ceiling={:.2}x  (whole-step ceiling was {:.2}x)",
+                100.0 * lift / serial.max(1e-9),
+                serial - lift,
+                100.0 * prep_share,
+                serial / (serial - (serial - lift)).max(1e-9),
+                if level > 0.0 { serial / level } else { 0.0 },
+            );
+        }
         let rsteps = REACH_STEPS.load(Ordering::Relaxed);
         if rsteps > 0 {
             let rc = REACH_COLS.load(Ordering::Relaxed) as f64;
@@ -4923,6 +4963,7 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                 }
             }
             let _lift = tracing::trace_span!("sig_lift", gens = xs.len()).entered();
+            let _lift_t = sched_cost.as_ref().map(|_| sig_sched::LiftTimer::new());
             if shift_skip_full && shifted.is_some() {
                 // Two passes, because there is no full matrix to read rows from any more.
                 //
