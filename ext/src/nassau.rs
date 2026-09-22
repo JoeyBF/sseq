@@ -175,6 +175,16 @@ impl MilnorSubalgebra {
         Some((mask, value))
     }
 
+    /// Per-field decode of a packed p-part into signature entries (probe support).
+    fn signature_fields(&self, bits: u64) -> Vec<u32> {
+        (0..self.profile.len().min(PPart::MAX_LEN))
+            .map(|i| {
+                let w = std::cmp::min(self.profile[i] as u32, PPart::width(i));
+                ((bits >> PPart::shift(i)) & ((1u64 << w) - 1)) as u32
+            })
+            .collect()
+    }
+
     fn zero_signature(&self) -> Vec<PPartEntry> {
         vec![0; self.profile.len()]
     }
@@ -899,6 +909,185 @@ fn shift_probe_report() {
 /// Only the `pre_masked` path is cached. Unmasked, the assemble reads
 /// `add_masked(zs.row(i), 1, zs_next)`, which depends on the mask CONTENTS and not merely its
 /// length, so a length-keyed entry would be wrong there.
+/// Level schedule for the signature walk, derived from the Milnor coproduct.
+///
+/// The signature dependency relation -- which signature's corrections can land on which other
+/// signature's columns -- is a strict partial order, and its longest-path level is an explicit
+/// closed form. Write generator `(i, j)` for `xi_{i+1}^{2^j}`, which lies in the subalgebra iff
+/// `j < profile[i]`. Then
+///
+/// ```text
+/// level(sigma) = sum over set bits (i, j) of sigma  of  c(i, j)   -   1
+/// ```
+///
+/// where `c` comes from the coproduct `psi(xi_n) = sum_{a+b=n} xi_a^{2^b} (x) xi_b`: raised to the
+/// `2^j`, it sends `(i, j)` with `n = i+1` to the pair `(a-1, j+b)` and `(b-1, j)`. A decomposition
+/// is USABLE only when BOTH halves lie in the subalgebra -- which is what makes the truncation
+/// bite, and why a generator whose decompositions all fall outside costs 1 rather than chaining.
+///
+/// ```text
+/// c(i, j) = 1                                            if no usable decomposition
+///         = 1 + max over usable (a, b) of max(c(a-1, j+b), c(b-1, j))
+/// ```
+///
+/// VERIFIED against the measured dependency DAG (stem-165 dump, 16 519 bidegrees): `c` and the
+/// resulting level match on every node of all 9 profiles that occur, and every dependency edge
+/// strictly increases the level, with zero violations. That last point is the correctness claim --
+/// grouping signatures by level is safe precisely because no edge stays within a level.
+///
+/// Note the weight is per COORDINATE, not per bit position: on `[4,3,2,1]` the table is
+/// `[[1,1,1,1],[2,2,2],[3,3],[4]]`. The natural-looking "bit `j` costs `j+1`" has the right total
+/// (it reproduces the depth `sum_i p_i(p_i+1)/2`) but is NOT the level function -- it puts
+/// signature `(2,0,0)` at level 1 where the truth is 0.
+mod sig_level {
+    use super::PPartEntry;
+
+    /// `c[i][j]`, indexed by generator `xi_{i+1}^{2^j}`.
+    ///
+    /// `c(i, j)` depends only on entries with first index `< i` (since `a + b = i + 1` with
+    /// `a, b >= 1` forces `a - 1 <= i - 1` and `b - 1 <= i - 1`), so increasing `i` is a valid
+    /// evaluation order and no memoisation is needed.
+    pub fn cost_table(profile: &[u8]) -> Vec<Vec<u32>> {
+        let l = profile.len();
+        let mut c: Vec<Vec<u32>> = profile.iter().map(|&p| vec![0u32; p as usize]).collect();
+        for i in 0..l {
+            for j in 0..profile[i] as usize {
+                let n = i + 1;
+                let mut best: Option<u32> = None;
+                for a in 1..n {
+                    let b = n - a;
+                    let (ui, uj) = (a - 1, j + b);
+                    let (vi, vj) = (b - 1, j);
+                    if uj < profile[ui] as usize && vj < profile[vi] as usize {
+                        let cand = std::cmp::max(c[ui][uj], c[vi][vj]);
+                        best = Some(best.map_or(cand, |x| std::cmp::max(x, cand)));
+                    }
+                }
+                c[i][j] = 1 + best.unwrap_or(0);
+            }
+        }
+        c
+    }
+
+    /// Longest-path level of a signature. Signature 0 is never a source, so the `-1` never wraps
+    /// for any signature the walk actually visits; `saturating_sub` keeps it total anyway.
+    pub fn level(c: &[Vec<u32>], signature: &[PPartEntry]) -> u32 {
+        let mut total = 0u32;
+        for (i, &v) in signature.iter().enumerate() {
+            if i >= c.len() {
+                break;
+            }
+            for j in 0..c[i].len() {
+                if (v >> j) & 1 == 1 {
+                    total += c[i][j];
+                }
+            }
+        }
+        total.saturating_sub(1)
+    }
+}
+
+/// `NASSAU_PROBE_SIG_SCHED=1`: what a level schedule would actually buy, per bidegree.
+///
+/// The serial walk costs `sum_sigma t_sigma`. A level schedule runs each level's signatures
+/// concurrently, so it costs `sum_levels max_{sigma in level} t_sigma`. Their ratio is the ceiling,
+/// and it is the ONLY number that decides whether to build this.
+///
+/// This replaces the stem-150 "ceiling = 1.04x" recorded at the signature loop, which compared
+/// total against the single largest signature. That comparison is right only when one signature
+/// dominates, which is the stem-150 regime; the frontier datapoint (stem 364: 4876 signatures at
+/// ~1.4s each) is uniform, where the level schedule and the single-max bound diverge completely.
+/// Both ratios are reported so the two regimes can be told apart in one run.
+mod sig_sched {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    pub static SERIAL_NS: AtomicU64 = AtomicU64::new(0);
+    pub static LEVEL_NS: AtomicU64 = AtomicU64::new(0);
+    pub static MAXSIG_NS: AtomicU64 = AtomicU64::new(0);
+    pub static BIDEGREES: AtomicU64 = AtomicU64::new(0);
+    pub static SIGS: AtomicU64 = AtomicU64::new(0);
+    pub static LEVELS: AtomicU64 = AtomicU64::new(0);
+    pub static WIDEST: AtomicU64 = AtomicU64::new(0);
+
+    /// Report every `REPORT_EVERY` bidegrees rather than at exit: an OOM or a walltime kill means
+    /// no atexit runs, and the one run that needs these numbers is the long one.
+    const REPORT_EVERY: u64 = 256;
+
+    /// Records on DROP, so an iteration that leaves by `continue`, `break` or `?` is still timed.
+    /// The signature walk is single-threaded, which is what lets the sink be a plain `RefCell`.
+    pub struct Timer<'a> {
+        start: std::time::Instant,
+        level: u32,
+        sink: &'a std::cell::RefCell<Vec<(u32, f64)>>,
+    }
+
+    impl<'a> Timer<'a> {
+        pub fn new(level: u32, sink: &'a std::cell::RefCell<Vec<(u32, f64)>>) -> Self {
+            Self {
+                start: std::time::Instant::now(),
+                level,
+                sink,
+            }
+        }
+    }
+
+    impl Drop for Timer<'_> {
+        fn drop(&mut self) {
+            self.sink
+                .borrow_mut()
+                .push((self.level, self.start.elapsed().as_secs_f64()));
+        }
+    }
+
+    pub fn record(samples: &[(u32, f64)]) {
+        if samples.is_empty() {
+            return;
+        }
+        let serial: f64 = samples.iter().map(|&(_, t)| t).sum();
+        let maxsig = samples.iter().map(|&(_, t)| t).fold(0.0f64, f64::max);
+        let top = samples.iter().map(|&(l, _)| l).max().unwrap_or(0) as usize;
+        let mut per_level = vec![0.0f64; top + 1];
+        let mut pop = vec![0u64; top + 1];
+        for &(l, t) in samples {
+            let l = l as usize;
+            per_level[l] = per_level[l].max(t);
+            pop[l] += 1;
+        }
+        let level_cost: f64 = per_level.iter().sum();
+        let widest = pop.iter().copied().max().unwrap_or(0);
+
+        SERIAL_NS.fetch_add((serial * 1e9) as u64, Ordering::Relaxed);
+        LEVEL_NS.fetch_add((level_cost * 1e9) as u64, Ordering::Relaxed);
+        MAXSIG_NS.fetch_add((maxsig * 1e9) as u64, Ordering::Relaxed);
+        SIGS.fetch_add(samples.len() as u64, Ordering::Relaxed);
+        LEVELS.fetch_add(
+            pop.iter().filter(|&&c| c > 0).count() as u64,
+            Ordering::Relaxed,
+        );
+        WIDEST.fetch_max(widest, Ordering::Relaxed);
+        let n = BIDEGREES.fetch_add(1, Ordering::Relaxed) + 1;
+        if n % REPORT_EVERY == 0 {
+            report(n);
+        }
+    }
+
+    pub fn report(n: u64) {
+        let serial = SERIAL_NS.load(Ordering::Relaxed) as f64 / 1e9;
+        let level = LEVEL_NS.load(Ordering::Relaxed) as f64 / 1e9;
+        let maxsig = MAXSIG_NS.load(Ordering::Relaxed) as f64 / 1e9;
+        let sigs = SIGS.load(Ordering::Relaxed);
+        let levels = LEVELS.load(Ordering::Relaxed);
+        eprintln!(
+            "[sig-sched] bidegrees={n} sigs={sigs} nonempty_levels={levels} widest={} \
+             serial={serial:.1}s level_schedule={level:.1}s ceiling={:.2}x \
+             single_max_bound={:.2}x",
+            WIDEST.load(Ordering::Relaxed),
+            if level > 0.0 { serial / level } else { 0.0 },
+            if maxsig > 0.0 { serial / maxsig } else { 0.0 },
+        );
+    }
+}
+
 mod sig_solver {
     use std::sync::{
         Arc, LazyLock, Mutex,
@@ -916,6 +1105,8 @@ mod sig_solver {
     static BYTES: AtomicUsize = AtomicUsize::new(0);
     static HIT: AtomicUsize = AtomicUsize::new(0);
     static MISS: AtomicUsize = AtomicUsize::new(0);
+    /// Entries between periodic `[sig-solver]` lines.
+    const REPORT_EVERY: usize = 512;
     static PRE_BYTES: AtomicUsize = AtomicUsize::new(0);
     static PIV_BYTES: AtomicUsize = AtomicUsize::new(0);
     static ROWS: AtomicUsize = AtomicUsize::new(0);
@@ -988,6 +1179,14 @@ mod sig_solver {
             ROWS.fetch_add(rows, Ordering::Relaxed);
             COLS.fetch_add(cols, Ordering::Relaxed);
             RANK.fetch_add(rank, Ordering::Relaxed);
+            // Report periodically, not only from `report()`: a timed bench is killed, so a
+            // once-at-exit line is exactly the one that never arrives. Same reasoning as the
+            // census CSV's periodic flush.
+            if c.len() % REPORT_EVERY == 0 {
+                drop(c);
+                report();
+                return;
+            }
         }
         let cap = cache_bytes_cap();
         if cap != usize::MAX && BYTES.load(Ordering::Relaxed) > cap {
@@ -3777,6 +3976,70 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
         // The parallelism this resolution is missing is NOT inside a bidegree.
         let dx_snapshot: Option<Vec<FpVector>> =
             std::env::var_os("NASSAU_PROBE_SIG_INDEP").map(|_| dxs.clone());
+        // `NASSAU_PROBE_SIG_GEN`: generation tag per `dx` entry. The initial error is generation 0;
+        // a signature step whose live entries top out at generation `g` writes corrections tagged
+        // `g + 1`. The maximum over the bidegree is `k`, the nilpotency degree of the correction
+        // operator -- the number of sweeps a Jacobi scheme would need in place of this serial walk.
+        let mut gen_tags: Option<Vec<Vec<u32>>> = std::env::var_os("NASSAU_PROBE_SIG_GEN")
+            .map(|_| vec![vec![0u32; next_dim]; dxs.len()]);
+        let mut max_generation = 0u32;
+        // Jacobi work: a block is re-solved once per GENERATION present among its live entries,
+        // against once total for the serial walk. `k` bounds depth; this ratio is the cost.
+        let mut serial_solves = 0u64;
+        let mut jacobi_solves = 0u64;
+        // `NASSAU_PROBE_SIG_DOMINATE`: signature bits of every column of `next`, so a correction's
+        // target signature can be recovered and compared against its source.
+        let col_sig: Option<Vec<u64>> = std::env::var_os("NASSAU_PROBE_SIG_DOMINATE").map(|_| {
+            let mut full_mask = 0u64;
+            for i in 0..subalgebra.profile.len().min(PPart::MAX_LEN) {
+                let w = std::cmp::min(subalgebra.profile[i] as u32, PPart::width(i));
+                full_mask |= ((1u64 << w) - 1) << PPart::shift(i);
+            }
+            let mut v = vec![0u64; next_dim];
+            for gd in next.iter_gen_offsets([b.t()]) {
+                if gd.gen_deg >= next_bound {
+                    break;
+                }
+                let offset = gd.start[0];
+                for (n, op) in algebra.ppart_table(b.t() - gd.gen_deg).iter().enumerate() {
+                    if offset + n < v.len() {
+                        v[offset + n] = op.bits() & full_mask;
+                    }
+                }
+            }
+            v
+        });
+        let (mut viol_comp, mut viol_deg, mut viol_lex, mut checks) = (0u64, 0u64, 0u64, 0u64);
+        // Population of each longest-path level. Same-level blocks cannot depend on one another,
+        // so this is exactly what a level schedule could batch into a single launch.
+        let mut level_pop: Vec<u32> = Vec::new();
+        // DAG collection. `col_idx[p]` is the odometer index of column `p`'s signature (0 = zero
+        // signature, u32::MAX = not representable in this subalgebra).
+        let dag_path = std::env::var_os("NASSAU_DAG_DUMP");
+        let dag_state: Option<(Vec<u32>, rustc_hash::FxHashMap<Vec<PPartEntry>, u32>)> =
+            dag_path.as_ref().map(|_| {
+                let mut idx: rustc_hash::FxHashMap<Vec<PPartEntry>, u32> =
+                    rustc_hash::FxHashMap::default();
+                idx.insert(subalgebra.zero_signature(), 0);
+                for (i, s) in subalgebra.iter_signatures(b.t()).enumerate() {
+                    idx.insert(s, i as u32 + 1);
+                }
+                let mut col_idx = vec![u32::MAX; next_dim];
+                if let Some(cs) = &col_sig {
+                    for (p, &bits) in cs.iter().enumerate() {
+                        let fields: Vec<PPartEntry> = subalgebra
+                            .signature_fields(bits)
+                            .into_iter()
+                            .map(|x| x as PPartEntry)
+                            .collect();
+                        if let Some(&i) = idx.get(&fields) {
+                            col_idx[p] = i;
+                        }
+                    }
+                }
+                (col_idx, idx)
+            });
+        let mut dag_edges: Vec<(u32, u32)> = Vec::new();
         let mut probe_reads = 0usize;
         let mut probe_perturbed = 0usize;
 
@@ -3785,6 +4048,14 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
         if let Some(c) = census.as_mut() {
             c.set_signatures_total(subalgebra.count_signatures(b.t()));
         }
+        // `NASSAU_PROBE_SIG_SCHED`: time each signature and tag it with its schedule level, so the
+        // level-schedule ceiling can be computed per bidegree. Costs one `Instant::now()` per
+        // signature when enabled and nothing at all when not.
+        let sched_cost: Option<Vec<Vec<u32>>> = std::env::var_os("NASSAU_PROBE_SIG_SCHED")
+            .map(|_| sig_level::cost_table(&subalgebra.profile));
+        let sched_samples: std::cell::RefCell<Vec<(u32, f64)>> =
+            std::cell::RefCell::new(Vec::new());
+
         for (sig_idx, signature) in subalgebra.iter_signatures(b.t()).enumerate() {
             let _guard = tracing::info_span!("step", ?signature).entered();
             // Corrections only ever raise signature, so once every `dx` is zero the whole remaining
@@ -3807,6 +4078,11 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
             if f.is_none() && dxs.iter().all(|dx| dx.is_zero()) {
                 break;
             }
+            // Created AFTER the dead-tail skip: a skipped iteration does no work, and timing it
+            // would pad the sample set with zeros that shift nothing but the signature count.
+            let _sched_timer = sched_cost
+                .as_ref()
+                .map(|c| sig_sched::Timer::new(sig_level::level(c, &signature), &sched_samples));
             // Recorded AFTER the skip, so `signatures_executed` counts iterations actually
             // executed and `dead_signature_tail` keeps meaning "waste still present in the run" —
             // it reads ~0 once the skip is on. Counting the one aborted iteration as dead would peg
@@ -4231,6 +4507,17 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                 }
             }
 
+            let mut dag_before: rustc_hash::FxHashMap<u32, u64> =
+                rustc_hash::FxHashMap::default();
+            if let Some((col_idx, _)) = &dag_state {
+                for dx in dxs.iter() {
+                    for (p, _) in dx.iter_nonzero() {
+                        if p < col_idx.len() && col_idx[p] != u32::MAX {
+                            *dag_before.entry(col_idx[p]).or_insert(0) ^= (p as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+                        }
+                    }
+                }
+            }
             let _lift = tracing::trace_span!("sig_lift", gens = xs.len()).entered();
             if shift_skip_full && shifted.is_some() {
                 // Two passes, because there is no full matrix to read rows from any more.
@@ -4292,26 +4579,106 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                     }
                 }
             } else {
-                for (x, dx) in xs.iter_mut().zip(&mut dxs) {
+                for (gi, (x, dx)) in xs.iter_mut().zip(&mut dxs).enumerate() {
                     scratch.set_scratch_vector_size(target_mask.len());
                     let mut row = 0;
+                    let mut in_gen = 0u32;
+                    // One bit per generation present among this block's live entries; `k` is small
+                    // (<= 57 even for A(4)) so a u64 mask is enough, and saturating at 63 only ever
+                    // UNDER-counts, which is the safe direction for a cost estimate.
+                    let mut gen_mask = 0u64;
                     for (i, &v) in next_mask.iter().enumerate() {
                         if pivots[i] < 0 {
                             continue;
                         }
                         if dx.entry(v) != 0 {
                             scratch.as_slice_mut().add(preimage.row(row), 1);
+                            if let Some(t) = &gen_tags {
+                                let g = t[gi][v];
+                                in_gen = in_gen.max(g);
+                                gen_mask |= 1u64 << g.min(63);
+                            }
                         }
                         row += 1;
+                    }
+                    if gen_tags.is_some() && gen_mask != 0 {
+                        serial_solves += 1;
+                        jacobi_solves += u64::from(gen_mask.count_ones());
+                        let lvl = in_gen as usize;
+                        if level_pop.len() <= lvl {
+                            level_pop.resize(lvl + 1, 0);
+                        }
+                        level_pop[lvl] += 1;
                     }
                     let mut consumed = 0usize;
                     for (i, _) in scratch.iter_nonzero() {
                         x.add_basis_element(target_mask[i], 1);
                         dx.as_slice_mut().add(full_matrix.row(i), 1);
+                        if let Some(t) = &mut gen_tags {
+                            for (p, _) in full_matrix.row(i).iter_nonzero() {
+                                let e = &mut t[gi][p];
+                                *e = (*e).max(in_gen + 1);
+                            }
+                            max_generation = max_generation.max(in_gen + 1);
+                        }
+
                         consumed += 1;
                     }
                     if let Some(c) = census.as_mut() {
                         c.add_rows_consumed(consumed);
+                    }
+                }
+            }
+            // DAG: bucket-checksum AFTER the corrections; compare against the snapshot taken
+            // before them. A moved bucket is a net change, i.e. a real edge.
+            if let Some((col_idx, idx)) = &dag_state {
+                let mut after: rustc_hash::FxHashMap<u32, u64> = rustc_hash::FxHashMap::default();
+                for dx in dxs.iter() {
+                    for (p, _) in dx.iter_nonzero() {
+                        if p < col_idx.len() && col_idx[p] != u32::MAX {
+                            *after.entry(col_idx[p]).or_insert(0) ^= (p as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+                        }
+                    }
+                }
+                let me = idx.get(&signature).copied().unwrap_or(u32::MAX);
+                for (&t, &v) in after.iter() {
+                    if dag_before.get(&t).copied().unwrap_or(0) != v {
+                        dag_edges.push((me, t));
+                    }
+                }
+                for (&t, &v) in dag_before.iter() {
+                    if v != 0 && !after.contains_key(&t) {
+                        dag_edges.push((me, t));
+                    }
+                }
+            }
+            // RESIDUAL INVARIANT: with sigma processed, nothing at sigma or earlier may still
+            // be live. `lex` is the order the walk actually uses (so a violation there would be a
+            // correctness bug in the existing algorithm); `comp` is the stronger componentwise
+            // order a rank-ordered restructure would need.
+            if let Some(cs) = &col_sig {
+                let sf: Vec<u32> = signature.iter().map(|&e| u32::from(e as u16)).collect();
+                for dx in dxs.iter() {
+                    for (p, _) in dx.iter_nonzero() {
+                        if p >= cs.len() {
+                            continue;
+                        }
+                        let tf = subalgebra.signature_fields(cs[p]);
+                        checks += 1;
+                        // lex, index 0 least significant: scan from the top down
+                        let mut later = false;
+                        for j in (0..tf.len().min(sf.len())).rev() {
+                            if tf[j] != sf[j] {
+                                later = tf[j] > sf[j];
+                                break;
+                            }
+                        }
+                        if !later {
+                            viol_lex += 1;
+                        }
+                        if !tf.iter().zip(&sf).all(|(a, b2)| a >= b2) || tf == sf {
+                            viol_comp += 1;
+                        }
                     }
                 }
             }
@@ -4330,11 +4697,52 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                 None => Ok(()),
             })?;
         }
+        if sched_cost.is_some() {
+            sig_sched::record(&sched_samples.borrow());
+        }
         if dx_snapshot.is_some() {
             eprintln!(
                 "[sig-probe] b={b} signatures_read_positions={probe_reads} \
                  perturbed_by_earlier_signature={probe_perturbed}"
             );
+        }
+        if gen_tags.is_some() {
+            eprintln!(
+                "[sig-gen] b={b} k={max_generation} signatures={} profile={:?} \
+                 serial_solves={serial_solves} jacobi_solves={jacobi_solves} \
+                 checks={checks} viol_comp={viol_comp} viol_deg={viol_deg} viol_lex={viol_lex} \
+                 levels={} width={} level_pop={:?}",
+                subalgebra.count_signatures(b.t()),
+                subalgebra.profile,
+                level_pop.len(),
+                level_pop.iter().copied().max().unwrap_or(0),
+                level_pop,
+            );
+        }
+
+        if let Some(path) = &dag_path {
+            use std::io::Write;
+            dag_edges.sort_unstable();
+            dag_edges.dedup();
+            let mut line = format!(
+                "{} {} {:?} m={} edges={} |",
+                b.n(),
+                b.s(),
+                subalgebra.profile,
+                subalgebra.count_signatures(b.t()),
+                dag_edges.len(),
+            );
+            for (a, c) in &dag_edges {
+                line.push_str(&format!(" {a}>{c}"));
+            }
+            line.push('\n');
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+            {
+                let _ = f.write_all(line.as_bytes());
+            }
         }
 
         // Fault injection, so the retry path above can be exercised deliberately instead of waited
