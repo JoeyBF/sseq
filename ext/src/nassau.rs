@@ -4633,7 +4633,33 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
         let sched_samples: std::cell::RefCell<Vec<(u32, f64)>> =
             std::cell::RefCell::new(Vec::new());
 
-        for (sig_idx, signature) in subalgebra.iter_signatures(b.t()).enumerate() {
+        // `NASSAU_SIG_LEVEL_ORDER=1`: walk the signatures in SCHEDULE-LEVEL order rather than the
+        // odometer's index order.
+        //
+        // This is step one of the level-parallel lift, and it is deliberately still SERIAL. It
+        // changes nothing but the order, so if the Ext chart is unchanged then the DAG-derived
+        // level really is a valid schedule on live data -- which is the entire premise of running a
+        // level concurrently, validated before any concurrency exists to debug.
+        //
+        // Safe by the same property the parallel version will rely on: every dependency edge
+        // strictly INCREASES the level (verified, zero violations on all 9 measured profiles), so
+        // a level-ordered walk still visits every signature after everything it depends on. Ties
+        // keep odometer order, so the schedule is deterministic.
+        //
+        // The dead-tail skip below stays valid too, and is in fact cleaner here: corrections only
+        // ever move to strictly higher levels, so once every `dx` is zero the remaining levels are
+        // a provable no-op.
+        let sig_walk: Vec<(usize, Vec<PPartEntry>)> = {
+            let mut v: Vec<(usize, Vec<PPartEntry>)> =
+                subalgebra.iter_signatures(b.t()).enumerate().collect();
+            if std::env::var_os("NASSAU_SIG_LEVEL_ORDER").is_some() {
+                let c = sig_level::cost_table(&subalgebra.profile);
+                v.sort_by_key(|(idx, sig)| (sig_level::level(&c, sig), *idx));
+            }
+            v
+        };
+
+        for (sig_idx, signature) in sig_walk {
             let _guard = tracing::info_span!("step", ?signature).entered();
             // Corrections only ever raise signature, so once every `dx` is zero the whole remaining
             // tail is a provable no-op: the lift below is guarded by `dx.entry(v) != 0`, so it adds
