@@ -1273,6 +1273,11 @@ mod sig_sched {
     /// XOR-ing corrections -- has somewhere to go, onto the ~118 cores the walk leaves idle.
     pub static ONDEMAND_NS: AtomicU64 = AtomicU64::new(0);
 
+    /// Time in the prepare stage's shift-BUILD multiply, i.e. prepare's GPU half. The rest of
+    /// prepare (assemble, row_reduce, quasi-inverse) is host work and is what a parallel prepare
+    /// could actually move onto the idle cores.
+    pub static PREPARE_GPU_NS: AtomicU64 = AtomicU64::new(0);
+
     pub struct LiftTimer(std::time::Instant);
 
     impl LiftTimer {
@@ -1384,6 +1389,23 @@ mod sig_sched {
             100.0 * (lift - od) / serial.max(1e-9),
             serial - lift,
             100.0 * (serial - lift) / serial.max(1e-9),
+        );
+        // The movable share: prepare's CPU half plus the lift's CPU remainder. The two GPU pieces
+        // (shift build, on-demand multiply) run on a device that a single launch already fills, so
+        // issuing them concurrently redistributes rather than adds.
+        let pgpu = PREPARE_GPU_NS.load(Ordering::Relaxed) as f64 / 1e9;
+        let movable = (serial - lift - pgpu).max(0.0) + (lift - od).max(0.0);
+        eprintln!(
+            "[sig-movable] prepare_gpu={pgpu:.1}s ({:.1}% of walk) prepare_cpu={:.1}s ({:.1}%) \
+             | MOVABLE (cpu total)={movable:.1}s ({:.1}% of walk) -> parallel ceiling={:.2}x",
+            100.0 * pgpu / serial.max(1e-9),
+            serial - lift - pgpu,
+            100.0 * (serial - lift - pgpu) / serial.max(1e-9),
+            100.0 * movable / serial.max(1e-9),
+            // Clamp: with shift reuse off the lift is ~0 and movable approaches the whole walk, so
+            // the naive ratio divides by ~0 and prints 4e12x. A ceiling above the worker count is
+            // meaningless anyway.
+            (serial / (serial - movable).max(serial * 0.001)).min(1024.0),
         );
         super::shift_stats_report();
     }
@@ -4773,6 +4795,12 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                                 BYTES_SHIFT_PRIVATE.fetch_add(built_bytes, Ordering::Relaxed);
                                 _private_live = Some(PrivateLive::new(built_bytes));
                             }
+                            // Prepare is 35% of the frontier walk, but only its CPU part (assemble,
+                            // row_reduce, quasi-inverse) can move onto the idle cores -- this
+                            // multiply is GPU, on a device already at ~1500 waves/SM per launch.
+                            // Time it so the parallel-prepare ceiling is computed from the movable
+                            // share rather than the whole stage.
+                            let build_t0 = std::time::Instant::now();
                             let m = Arc::new(match &build_mask {
                                 Some(mask) => restricted_partial_matrix_masked_maybe_gpu(
                                     &self.differentials[b.s() - 1],
@@ -4788,6 +4816,8 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                                     cols,
                                 ),
                             });
+                            sig_sched::PREPARE_GPU_NS
+                                .fetch_add(build_t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
                             if may_publish {
                                 shift::put(
                                     b.s() as i32,
