@@ -1250,6 +1250,10 @@ mod sig_sched {
     pub static REACH_COLS: AtomicU64 = AtomicU64::new(0);
     pub static FULL_COLS: AtomicU64 = AtomicU64::new(0);
     pub static REACH_STEPS: AtomicU64 = AtomicU64::new(0);
+    /// Time in the full-width correction adds, and the rows consumed by them. This is the work the
+    /// successor-set narrowing would cut by ~4.8x, so its share of wall is the end-to-end prize.
+    pub static CORRECT_NS: AtomicU64 = AtomicU64::new(0);
+    pub static CORRECT_ROWS: AtomicU64 = AtomicU64::new(0);
 
     pub fn record_reach(reach: u64, full: u64) {
         REACH_COLS.fetch_add(reach, Ordering::Relaxed);
@@ -1358,6 +1362,16 @@ mod sig_sched {
                  frac={:.4} narrowing={:.2}x",
                 rc / fc.max(1.0),
                 fc / rc.max(1.0),
+            );
+            let cns = CORRECT_NS.load(Ordering::Relaxed) as f64 / 1e9;
+            let crows = CORRECT_ROWS.load(Ordering::Relaxed);
+            let serial = SERIAL_NS.load(Ordering::Relaxed) as f64 / 1e9;
+            eprintln!(
+                "[sig-correct] correction_adds={cns:.1}s rows={crows} \
+                 ({:.1}% of signature-walk time) narrowed_saving={:.1}s ({:.2}x on the walk)",
+                100.0 * cns / serial.max(1e-9),
+                cns * (1.0 - rc / fc.max(1.0)),
+                serial / (serial - cns * (1.0 - rc / fc.max(1.0))).max(1e-9),
             );
         }
         let g = BY_SUB.lock().unwrap();
@@ -4284,8 +4298,17 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
         //
         // Counting signatures alone says 7.6x at A(3), but that assumes columns spread evenly over
         // signatures. They do not have to, so count the COLUMNS.
-        let reach_probe: Option<(&'static sig_dag::Dag, Vec<u32>, Vec<u64>)> =
-            std::env::var_os("NASSAU_PROBE_SIG_REACH").map(|_| {
+        // `NASSAU_SIG_REACH_MASK=1` ACTS on the same table: the signature's matrix is built masked
+        // to the reachable columns, so the multiply kernel writes a narrow output rather than a
+        // full-width one that is immediately discarded (`NASSAU_GPU_COL_RESTRICT` already routes a
+        // mask into the kernel; what was missing was a mask tight enough to be worth passing).
+        //
+        // Requires `f.is_none()`: `write_qi` reads `full_matrix.row(i)` at FULL width, so a
+        // narrowed matrix cannot serve it. That is the same condition `shift_skip_full` carries.
+        let reach_active = f.is_none() && std::env::var_os("NASSAU_SIG_REACH_MASK").is_some();
+        let reach_probe: Option<(&'static sig_dag::Dag, Vec<u32>, Vec<u64>)> = (reach_active
+            || std::env::var_os("NASSAU_PROBE_SIG_REACH").is_some())
+        .then(|| {
                 let dag = sig_dag::get(&subalgebra.profile);
                 // Column -> signature INDEX (the packed probe below keeps raw bits instead, which
                 // cannot be used to index the DAG).
@@ -4467,6 +4490,53 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                 next_bound,
             ));
             drop(_sm);
+
+            // Columns this signature's correction may legally touch: its own, plus everything the
+            // DAG says it reaches. The row is provably zero elsewhere, so building those columns is
+            // waste -- measured at 20.9% of full width, a 4.8x narrowing.
+            //
+            // `next_mask` is a subset (sigma's own columns), so it is re-expressed as positions
+            // WITHIN the reachable mask; the masked build is indexed by the narrow matrix, not by
+            // the full column space.
+            //
+            // Only the plain build is narrowed. The other arms below -- the `full_reuse` gather,
+            // the speculation assemble, and the `shift_skip_full` placeholder -- all hand back
+            // FULL-width rows, and the consumers index by whichever width the build produced, so
+            // mixing them would silently mis-index rather than fail.
+            let (reach_mask, next_in_reach): (Option<Vec<usize>>, Option<Vec<usize>>) =
+                if reach_active
+                    && full_reuse.is_none()
+                    && !blocks::enabled()
+                    && !shift_skip_full
+                {
+                    let (dag, idx_of, _) = reach_probe.as_ref().expect("built when reach_active");
+                    let a = sig_dag::index(&subalgebra.profile, &signature);
+                    let row = dag.row(a);
+                    let mask: Vec<usize> = (0..next_dim)
+                        .filter(|&c| {
+                            let t = idx_of[c] as usize;
+                            t == a || (row[t >> 6] >> (t & 63)) & 1 == 1
+                        })
+                        .collect();
+                    // Both are ascending, so one merge pass locates each `next_mask` column.
+                    let mut pos = Vec::with_capacity(next_mask.len());
+                    let mut j = 0usize;
+                    for &c in &next_mask {
+                        while j < mask.len() && mask[j] < c {
+                            j += 1;
+                        }
+                        debug_assert!(
+                            j < mask.len() && mask[j] == c,
+                            "next_mask column {c} missing from the reachable set at {b} \
+                             sig={signature:?} -- the DAG under-predicted, which would silently \
+                             drop a correction"
+                        );
+                        pos.push(j);
+                    }
+                    (Some(mask), Some(pos))
+                } else {
+                    (None, None)
+                };
 
             // Does this signature's problem look like the zero-signature problem at the shifted
             // degree? Necessary condition only, but a mismatch would refute shift reuse outright.
@@ -4697,6 +4767,19 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                             &target_mask,
                             next_dim,
                         )),
+                        // Narrowed to the reachable columns: the kernel writes `mask.len()` wide
+                        // instead of `next_dim`, which shrinks the device buffer and the readback
+                        // by the same ratio. Readback is ~50% of worker exec, so this is where the
+                        // narrowing actually lands.
+                        None if reach_mask.is_some() => {
+                            PartialMatrix::Owned(restricted_partial_matrix_masked_maybe_gpu(
+                                &self.differentials[b.s() - 1],
+                                b.t(),
+                                &target_mask,
+                                next_dim,
+                                reach_mask.as_ref().unwrap(),
+                            ))
+                        }
                         None => PartialMatrix::Owned(restricted_partial_matrix_maybe_gpu(
                             &self.differentials[b.s() - 1],
                             b.t(),
@@ -4801,8 +4884,11 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                                 }
                             }
                             None => {
+                                // Under the reachable mask the matrix is already narrow, so the
+                                // gather is by position WITHIN it, not by full column index.
+                                let gather = next_in_reach.as_ref().unwrap_or(&next_mask);
                                 for (i, mut l) in m.segment(0, 0).iter_mut().enumerate() {
-                                    l.add_masked(full_matrix.row(i), 1, &next_mask);
+                                    l.add_masked(full_matrix.row(i), 1, gather);
                                 }
                             }
                         }
@@ -4963,9 +5049,22 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                         level_pop[lvl] += 1;
                     }
                     let mut consumed = 0usize;
+                    // Timed under the reach probe: the narrowing is worth 4.8x on THESE adds, so
+                    // their share of wall is what converts that ratio into an end-to-end number.
+                    // Each add is O(next_dim) while the row is provably zero outside `reach(sigma)`.
+                    let corr_t0 = reach_probe.as_ref().map(|_| std::time::Instant::now());
                     for (i, _) in scratch.iter_nonzero() {
                         x.add_basis_element(target_mask[i], 1);
-                        dx.as_slice_mut().add(full_matrix.row(i), 1);
+                        // `dx` stays FULL width -- later signatures read it at masks that differ
+                        // from this one's -- so a narrowed row is scattered back through the mask
+                        // it was built under. Outside that mask the row is zero by the DAG, so the
+                        // scatter and the old full-width add agree exactly.
+                        match reach_mask.as_ref() {
+                            Some(mask) => {
+                                dx.as_slice_mut().add_unmasked(full_matrix.row(i), 1, mask)
+                            }
+                            None => dx.as_slice_mut().add(full_matrix.row(i), 1),
+                        }
                         if let Some(t) = &mut gen_tags {
                             for (p, _) in full_matrix.row(i).iter_nonzero() {
                                 let e = &mut t[gi][p];
@@ -4975,6 +5074,12 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                         }
 
                         consumed += 1;
+                    }
+                    if let Some(t0) = corr_t0 {
+                        sig_sched::CORRECT_NS
+                            .fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                        sig_sched::CORRECT_ROWS
+                            .fetch_add(consumed as u64, Ordering::Relaxed);
                     }
                     if let Some(c) = census.as_mut() {
                         c.add_rows_consumed(consumed);
