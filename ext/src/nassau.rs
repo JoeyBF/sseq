@@ -939,6 +939,240 @@ fn shift_probe_report() {
 /// `[[1,1,1,1],[2,2,2],[3,3],[4]]`. The natural-looking "bit `j` costs `j+1`" has the right total
 /// (it reproduces the depth `sum_i p_i(p_i+1)/2`) but is NOT the level function -- it puts
 /// signature `(2,0,0)` at level 1 where the truth is 0.
+/// The signature dependency DAG itself, as reachability bitsets, derived from the profile alone.
+///
+/// [`sig_level`] gives the schedule's grading in closed form, but the grading is NOT enough to say
+/// which columns a correction can touch: restricting to "level strictly greater" is a valid but
+/// loose superset, worth only **1.9x** narrowing and flat across every profile -- exactly the
+/// figure already on record as the last remaining `narrow` lever. The true successor set is worth
+/// **7.6x** at A(3) and grows with the profile, so the DAG has to be built, not approximated.
+///
+/// Construction is the confirmed characterisation: the relation is the transitive closure of right
+/// multiplication by the algebra generators `Sq(2^k)`. Verified exact against the measured DAG
+/// (stem-165 dump) on all 9 profiles that occur -- 938 edges at A(2), 137 081 at A(3).
+///
+/// Cost is paid once per profile and cached. The R sweep needs entries over `[0, 2*2^p_i)`; a bound
+/// of `1*2^p_i` under-predicts, and under-prediction is the unsafe direction here because a missing
+/// edge means a correction silently dropped.
+mod sig_dag {
+    use std::{
+        collections::HashMap,
+        sync::{Mutex, OnceLock},
+    };
+
+    /// Milnor exponent tuple, long enough for `m + 1` where `m` is the profile length.
+    const MAXLEN: usize = 12;
+    type Tuple = [u32; MAXLEN];
+
+    /// Support of `Sq(R) * Sq(s1)` (single-entry right factor), as the exponent tuples with ODD
+    /// coefficient. The right factor has one component, so the admissible matrix has a single free
+    /// column `x_{i,1}`, constrained by `2 x_{i,1} <= r_i` and `sum_i x_{i,1} <= s1`.
+    ///
+    /// `beta(X)` is 1 exactly when the entries on each antidiagonal have pairwise disjoint binary
+    /// supports, which is why the accumulator tests `acc & v` before OR-ing.
+    fn support_single(r: &[u32], s1: u32) -> Vec<Tuple> {
+        let m = r.len();
+        let mut counts: HashMap<Tuple, u32> = HashMap::new();
+        let mut x = vec![0u32; m];
+        fn rec(
+            i: usize,
+            r: &[u32],
+            s1: u32,
+            used: u32,
+            x: &mut [u32],
+            counts: &mut HashMap<Tuple, u32>,
+        ) {
+            let m = r.len();
+            if i == m {
+                // x_{i,0} = r_i - 2 x_{i,1} sits on antidiagonal i; x_{i,1} on i+1; x_{0,1} on 1.
+                let mut anti = [0u32; MAXLEN + 2];
+                let mut seen = [0u32; MAXLEN + 2];
+                let mut ok = true;
+                let mut push = |k: usize, v: u32, anti: &mut [u32], seen: &mut [u32]| -> bool {
+                    if v == 0 {
+                        return true;
+                    }
+                    if seen[k] & v != 0 {
+                        return false;
+                    }
+                    seen[k] |= v;
+                    anti[k] |= v;
+                    true
+                };
+                ok &= push(1, s1 - used, &mut anti, &mut seen);
+                for i2 in 0..m {
+                    if !ok {
+                        break;
+                    }
+                    ok &= push(i2 + 1, r[i2] - 2 * x[i2], &mut anti, &mut seen);
+                    ok &= push(i2 + 2, x[i2], &mut anti, &mut seen);
+                }
+                if ok {
+                    let mut t: Tuple = [0; MAXLEN];
+                    for k in 1..=(m + 1).min(MAXLEN) {
+                        t[k - 1] = anti[k];
+                    }
+                    *counts.entry(t).or_insert(0) += 1;
+                }
+                return;
+            }
+            let mut v = 0u32;
+            while 2 * v <= r[i] && used + v <= s1 {
+                x[i] = v;
+                rec(i + 1, r, s1, used + v, x, counts);
+                v += 1;
+            }
+            x[i] = 0;
+        }
+        rec(0, r, s1, 0, &mut x, &mut counts);
+        counts
+            .into_iter()
+            .filter(|(_, c)| c % 2 == 1)
+            .map(|(t, _)| t)
+            .collect()
+    }
+
+    /// Index of a signature in the odometer's mixed-radix order.
+    ///
+    /// Must be computed from the signature VALUE, not taken from the loop's enumeration counter:
+    /// `iter_signatures` prunes by degree, so the two agree only when the bound is not binding.
+    pub fn index(profile: &[u8], signature: &[u32]) -> usize {
+        sig_index(signature, profile)
+    }
+
+    fn sig_index(t: &[u32], profile: &[u8]) -> usize {
+        let mut k = 0usize;
+        let mut mul = 1usize;
+        for (i, &p) in profile.iter().enumerate() {
+            let radix = 1usize << p;
+            let v = t.get(i).copied().unwrap_or(0) as usize;
+            k += (v % radix) * mul;
+            mul *= radix;
+        }
+        k
+    }
+
+    /// `succ[sigma]` as a bitset over signature indices, transitively closed.
+    pub struct Dag {
+        pub n: usize,
+        words: usize,
+        bits: Vec<u64>,
+    }
+
+    impl Dag {
+        pub fn reaches(&self, sigma: usize, tau: usize) -> bool {
+            self.bits[sigma * self.words + (tau >> 6)] >> (tau & 63) & 1 == 1
+        }
+
+        pub fn row(&self, sigma: usize) -> &[u64] {
+            &self.bits[sigma * self.words..(sigma + 1) * self.words]
+        }
+
+        pub fn edges(&self) -> u64 {
+            self.bits.iter().map(|w| w.count_ones() as u64).sum()
+        }
+    }
+
+    fn build(profile: &[u8]) -> Dag {
+        let radices: Vec<usize> = profile.iter().map(|&p| 1usize << p).collect();
+        let n: usize = radices.iter().product();
+        let words = n.div_ceil(64);
+        let mut bits = vec![0u64; n * words];
+
+        // Right factors: the algebra generators Sq(2^k), up to the largest that can move a
+        // signature within this profile's bound.
+        let cap = 2 * radices.first().copied().unwrap_or(1);
+        let ss: Vec<u32> = (0..)
+            .map(|k| 1u32 << k)
+            .take_while(|&v| (v as usize) < cap * 2)
+            .collect();
+
+        let bounds: Vec<u32> = radices.iter().map(|&r| 2 * r as u32).collect();
+        let total: u64 = bounds.iter().map(|&b| b as u64).product();
+        let mut r = vec![0u32; profile.len()];
+        for idx in 0..total {
+            let mut q = idx;
+            for (i, &b) in bounds.iter().enumerate() {
+                r[i] = (q % b as u64) as u32;
+                q /= b as u64;
+            }
+            let a = sig_index(&r, profile);
+            if a == 0 {
+                continue; // the zero signature is never a source
+            }
+            for &s1 in &ss {
+                for t in support_single(&r, s1) {
+                    let b = sig_index(&t, profile);
+                    if b != a && b != 0 {
+                        bits[a * words + (b >> 6)] |= 1u64 << (b & 63);
+                    }
+                }
+            }
+        }
+
+        // Transitive closure. Every edge strictly increases the level, so processing sources in
+        // DECREASING level order settles each row before anything that points at it is read.
+        let c = super::sig_level::cost_table(profile);
+        let mut order: Vec<usize> = (1..n).collect();
+        let level_of = |k: usize| -> u32 {
+            let mut kk = k;
+            let mut sig = vec![0u32; profile.len()];
+            for (i, &radix) in radices.iter().enumerate() {
+                sig[i] = (kk % radix) as u32;
+                kk /= radix;
+            }
+            super::sig_level::level(&c, &sig)
+        };
+        let levels: Vec<u32> = (0..n).map(level_of).collect();
+        order.sort_unstable_by_key(|&k| std::cmp::Reverse(levels[k]));
+
+        for &a in &order {
+            let mut acc = vec![0u64; words];
+            acc.copy_from_slice(&bits[a * words..(a + 1) * words]);
+            for w in 0..words {
+                let mut word = bits[a * words + w];
+                while word != 0 {
+                    let b = w * 64 + word.trailing_zeros() as usize;
+                    word &= word - 1;
+                    for (k, acc_k) in acc.iter_mut().enumerate() {
+                        *acc_k |= bits[b * words + k];
+                    }
+                }
+            }
+            bits[a * words..(a + 1) * words].copy_from_slice(&acc);
+        }
+
+        Dag { n, words, bits }
+    }
+
+    #[allow(clippy::type_complexity)]
+    static CACHE: OnceLock<Mutex<HashMap<Vec<u8>, &'static Dag>>> = OnceLock::new();
+
+    /// Cached per profile. Leaked deliberately: there are a handful of profiles in a run, each a
+    /// few hundred KB at A(3), and they live until the process exits anyway.
+    pub fn get(profile: &[u8]) -> &'static Dag {
+        let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+        let mut g = cache.lock().unwrap();
+        if let Some(d) = g.get(profile) {
+            return d;
+        }
+        let t0 = std::time::Instant::now();
+        let d: &'static Dag = Box::leak(Box::new(build(profile)));
+        // Printed once per profile. The edge count is the check against the measured DAG: 938 at
+        // A(2) [3,2,1], 137 081 at A(3) [4,3,2,1]. A mismatch means the sweep bound or the product
+        // is wrong, and a MISSING edge silently drops corrections, so this is not optional noise.
+        eprintln!(
+            "[sig-dag] profile={profile:?} signatures={} edges={} build={:.2}s mean|succ|={:.1}",
+            d.n,
+            d.edges(),
+            t0.elapsed().as_secs_f64(),
+            d.edges() as f64 / (d.n.max(2) - 1) as f64,
+        );
+        g.insert(profile.to_vec(), d);
+        d
+    }
+}
+
 mod sig_level {
     use super::PPartEntry;
 
@@ -1011,6 +1245,17 @@ mod sig_sched {
     pub static SIGS: AtomicU64 = AtomicU64::new(0);
     pub static LEVELS: AtomicU64 = AtomicU64::new(0);
     pub static WIDEST: AtomicU64 = AtomicU64::new(0);
+    /// `NASSAU_PROBE_SIG_REACH` totals: columns a correction may legally touch, against the full
+    /// width it is applied at today.
+    pub static REACH_COLS: AtomicU64 = AtomicU64::new(0);
+    pub static FULL_COLS: AtomicU64 = AtomicU64::new(0);
+    pub static REACH_STEPS: AtomicU64 = AtomicU64::new(0);
+
+    pub fn record_reach(reach: u64, full: u64) {
+        REACH_COLS.fetch_add(reach, Ordering::Relaxed);
+        FULL_COLS.fetch_add(full, Ordering::Relaxed);
+        REACH_STEPS.fetch_add(1, Ordering::Relaxed);
+    }
 
     /// Report every `REPORT_EVERY` bidegrees rather than at exit: an OOM or a walltime kill means
     /// no atexit runs, and the one run that needs these numbers is the long one.
@@ -1104,6 +1349,17 @@ mod sig_sched {
             if level > 0.0 { serial / level } else { 0.0 },
             if maxsig > 0.0 { serial / maxsig } else { 0.0 },
         );
+        let rsteps = REACH_STEPS.load(Ordering::Relaxed);
+        if rsteps > 0 {
+            let rc = REACH_COLS.load(Ordering::Relaxed) as f64;
+            let fc = FULL_COLS.load(Ordering::Relaxed) as f64;
+            eprintln!(
+                "[sig-reach] steps={rsteps} reachable_cols={rc:.0} full_cols={fc:.0} \
+                 frac={:.4} narrowing={:.2}x",
+                rc / fc.max(1.0),
+                fc / rc.max(1.0),
+            );
+        }
         let g = BY_SUB.lock().unwrap();
         let grand: f64 = g.values().map(|e| e.0).sum();
         for (dim, (ser, lvl, mx, cnt)) in g.iter() {
@@ -4019,6 +4275,55 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
         let mut jacobi_solves = 0u64;
         // `NASSAU_PROBE_SIG_DOMINATE`: signature bits of every column of `next`, so a correction's
         // target signature can be recovered and compared against its source.
+        // `NASSAU_PROBE_SIG_REACH`: how narrow a correction could legally be.
+        //
+        // The correction at `sigma` is applied at FULL width today, justified by the fact that the
+        // columns outside this signature's own mask are live for LATER signatures. The DAG makes
+        // that precise: only columns whose signature lies in `succ(sigma)` can ever be touched, so
+        // everything else is provably zero and need not be built, stored, or added.
+        //
+        // Counting signatures alone says 7.6x at A(3), but that assumes columns spread evenly over
+        // signatures. They do not have to, so count the COLUMNS.
+        let reach_probe: Option<(&'static sig_dag::Dag, Vec<u32>, Vec<u64>)> =
+            std::env::var_os("NASSAU_PROBE_SIG_REACH").map(|_| {
+                let dag = sig_dag::get(&subalgebra.profile);
+                // Column -> signature INDEX (the packed probe below keeps raw bits instead, which
+                // cannot be used to index the DAG).
+                let mut idx_of = vec![0u32; next_dim];
+                let mut count = vec![0u64; dag.n];
+                for gd in next.iter_gen_offsets([b.t()]) {
+                    if gd.gen_deg >= next_bound {
+                        break;
+                    }
+                    let offset = gd.start[0];
+                    for (n, op) in algebra.ppart_table(b.t() - gd.gen_deg).iter().enumerate() {
+                        if offset + n >= idx_of.len() {
+                            continue;
+                        }
+                        let bits = op.bits();
+                        let mut k = 0usize;
+                        let mut mul = 1usize;
+                        for i in 0..subalgebra.profile.len() {
+                            let radix = 1usize << subalgebra.profile[i];
+                            let comp = if i < PPart::MAX_LEN {
+                                let w = std::cmp::min(
+                                    subalgebra.profile[i] as u32,
+                                    PPart::width(i),
+                                );
+                                ((bits >> PPart::shift(i)) & ((1u64 << w) - 1)) as usize
+                            } else {
+                                0
+                            };
+                            k += (comp % radix) * mul;
+                            mul *= radix;
+                        }
+                        idx_of[offset + n] = k as u32;
+                        count[k] += 1;
+                    }
+                }
+                (dag, idx_of, count)
+            });
+
         let col_sig: Option<Vec<u64>> = std::env::var_os("NASSAU_PROBE_SIG_DOMINATE").map(|_| {
             let mut full_mask = 0u64;
             for i in 0..subalgebra.profile.len().min(PPart::MAX_LEN) {
@@ -4113,6 +4418,23 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
             let _sched_timer = sched_cost
                 .as_ref()
                 .map(|c| sig_sched::Timer::new(sig_level::level(c, &signature), &sched_samples));
+            if let Some((dag, _, count)) = reach_probe.as_ref() {
+                let a = sig_dag::index(&subalgebra.profile, &signature);
+                if a < dag.n {
+                    // sigma's own columns are reachable too: the correction lands on them and
+                    // cancels there, so they must stay in any narrowed set.
+                    let mut reach = count[a];
+                    for (w, &word) in dag.row(a).iter().enumerate() {
+                        let mut word = word;
+                        while word != 0 {
+                            let tau = w * 64 + word.trailing_zeros() as usize;
+                            word &= word - 1;
+                            reach += count[tau];
+                        }
+                    }
+                    sig_sched::record_reach(reach, next_dim as u64);
+                }
+            }
             // Recorded AFTER the skip, so `signatures_executed` counts iterations actually
             // executed and `dead_signature_tail` keeps meaning "waste still present in the run" —
             // it reads ~0 once the skip is on. Counting the one aborted iteration as dead would peg

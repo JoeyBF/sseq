@@ -812,6 +812,28 @@ static RESIDENT_MISSES: AtomicU64 = AtomicU64::new(0);
 /// production launch covers only one block-segment's transient `R`s. These say what production
 /// actually submits, which decides whether batching `R`s across launches is worth the scratch memory
 /// it would cost.
+/// Occupancy of the MULTIPLY kernel, which until now had none -- `waves/SM` was only ever computed
+/// for the enum kernel, and enum does not fire at the frontier at all (`enum launches=0`), so the
+/// path carrying all the work was uninstrumented.
+///
+/// The mean is misleading here and must not be quoted on its own: total pairs are dominated by a
+/// few very large zero-signature launches (~1e8 pairs, ~100 waves/SM), while the COUNT of launches
+/// is dominated by the narrow per-signature multiplies, whose column masks cut width by ~1400x.
+/// So the histogram, not the average, is what says whether merging a level's signatures into one
+/// launch would raise occupancy.
+///
+/// `waves/SM = blocks / 3168` (132 SMs x 24 resident blocks), so a launch under 3168 blocks cannot
+/// fill the device even once.
+static MUL_LAUNCHES: AtomicU64 = AtomicU64::new(0);
+static MUL_BLOCKS: AtomicU64 = AtomicU64::new(0);
+/// Launches below one full wave (`< 3168` blocks) -- the ones a merge could coalesce.
+static MUL_SUBWAVE: AtomicU64 = AtomicU64::new(0);
+/// Blocks belonging to sub-wave launches, so their share of total work is visible too: a large
+/// COUNT of tiny launches that carry no work is not worth merging.
+static MUL_SUBWAVE_BLOCKS: AtomicU64 = AtomicU64::new(0);
+/// `MUL_HIST[k]` counts launches with `blocks` in `[2^k, 2^{k+1})`, capped at the last bucket.
+static MUL_HIST: [AtomicU64; 24] = [const { AtomicU64::new(0) }; 24];
+
 static ENUM_LAUNCHES: AtomicU64 = AtomicU64::new(0);
 static ENUM_RS: AtomicU64 = AtomicU64::new(0);
 static ENUM_RS_MAX: AtomicU64 = AtomicU64::new(0);
@@ -6932,6 +6954,15 @@ fn multiply_batch_block<'a>(
                     let pair_offset = li * pair_chunk;
                     let this_pairs = (total_pairs - pair_offset).min(pair_chunk);
                     let this_cubes = (this_pairs as u32).div_ceil(THREADS).max(1);
+                    // Occupancy accounting for the multiply path (see `MUL_LAUNCHES`).
+                    MUL_LAUNCHES.fetch_add(1, Ordering::Relaxed);
+                    MUL_BLOCKS.fetch_add(this_cubes as u64, Ordering::Relaxed);
+                    if this_cubes < 3168 {
+                        MUL_SUBWAVE.fetch_add(1, Ordering::Relaxed);
+                        MUL_SUBWAVE_BLOCKS.fetch_add(this_cubes as u64, Ordering::Relaxed);
+                    }
+                    MUL_HIST[(32 - this_cubes.leading_zeros()).min(23) as usize]
+                        .fetch_add(1, Ordering::Relaxed);
                     unsafe {
                         multiply_batch_kernel::launch_unchecked::<CudaRuntime>(
                             &client,
@@ -7239,6 +7270,33 @@ fn multiply_batch_block<'a>(
                 // run that dies on an allocation must still leave behind the answer to "which theta
                 // would have fit", which is the whole point of collecting it.
                 dump_master_by_degree();
+                {
+                    // Multiply-path occupancy. Reported separately from `[batch-stats]` because the
+                    // question it answers is different: `[batch-stats]` says where a call's time
+                    // goes, this says whether the launches are big enough to fill the device.
+                    let ml = MUL_LAUNCHES.load(Ordering::Relaxed).max(1);
+                    let mb = MUL_BLOCKS.load(Ordering::Relaxed);
+                    let sw = MUL_SUBWAVE.load(Ordering::Relaxed);
+                    let swb = MUL_SUBWAVE_BLOCKS.load(Ordering::Relaxed);
+                    let hist: Vec<String> = MUL_HIST
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(k, c)| {
+                            let v = c.load(Ordering::Relaxed);
+                            (v > 0).then(|| format!("2^{k}:{v}"))
+                        })
+                        .collect();
+                    eprintln!(
+                        "[mul-occupancy] launches={ml} blocks/launch mean={:.0} \
+                         waves/SM mean={:.2} | sub-wave launches={sw} ({:.1}% of launches, \
+                         {:.2}% of blocks) | hist {}",
+                        mb as f64 / ml as f64,
+                        mb as f64 / ml as f64 / 3168.0,
+                        100.0 * sw as f64 / ml as f64,
+                        100.0 * swb as f64 / mb.max(1) as f64,
+                        hist.join(" "),
+                    );
+                }
                 eprintln!(
                     // Prefetcher progress: 0/0 means it is off (the default).
                     "[batch-stats] calls={calls} prep={prep_s:.1}s permit={permit_s:.1}s \
