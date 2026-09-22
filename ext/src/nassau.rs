@@ -1295,7 +1295,20 @@ mod sig_sched {
 
     /// Report every `REPORT_EVERY` bidegrees rather than at exit: an OOM or a walltime kill means
     /// no atexit runs, and the one run that needs these numbers is the long one.
-    const REPORT_EVERY: u64 = 256;
+    ///
+    /// `NASSAU_PROBE_SIG_SCHED_EVERY` overrides it, and at the frontier it MUST be small: a single
+    /// stem-330 bidegree runs for hours (the census has one at 23.8h), so a 256-bidegree cadence
+    /// would emit nothing at all in a day. The default suits the small-stem testbeds only.
+    fn report_every() -> u64 {
+        static N: std::sync::LazyLock<u64> = std::sync::LazyLock::new(|| {
+            std::env::var("NASSAU_PROBE_SIG_SCHED_EVERY")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .filter(|&n| n > 0)
+                .unwrap_or(256)
+        });
+        *N
+    }
 
     /// Records on DROP, so an iteration that leaves by `continue`, `break` or `?` is still timed.
     /// The signature walk is single-threaded, which is what lets the sink be a plain `RefCell`.
@@ -1317,10 +1330,62 @@ mod sig_sched {
 
     impl Drop for Timer<'_> {
         fn drop(&mut self) {
-            self.sink
-                .borrow_mut()
-                .push((self.level, self.start.elapsed().as_secs_f64()));
+            let dt = self.start.elapsed().as_secs_f64();
+            self.sink.borrow_mut().push((self.level, dt));
+            // Also accumulate GLOBALLY and consider reporting on a timer. At the frontier a single
+            // bidegree can run for hours (census p90 = 6.8h, max 75h), so anything gated on a
+            // completed bidegree emits nothing for most of a day. Signatures finish constantly,
+            // so they are the right heartbeat; only the level-schedule ceiling genuinely needs
+            // per-bidegree grouping and stays where it is.
+            SERIAL_NS.fetch_add((dt * 1e9) as u64, Ordering::Relaxed);
+            SIGS.fetch_add(1, Ordering::Relaxed);
+            maybe_report_live();
         }
+    }
+
+    /// Seconds between live reports; 0 disables. Default off so small-stem runs are unaffected.
+    fn live_every() -> u64 {
+        static N: std::sync::LazyLock<u64> = std::sync::LazyLock::new(|| {
+            std::env::var("NASSAU_PROBE_LIVE_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0)
+        });
+        *N
+    }
+
+    static LAST_LIVE: AtomicU64 = AtomicU64::new(0);
+
+    fn maybe_report_live() {
+        let every = live_every();
+        if every == 0 {
+            return;
+        }
+        let now = std::time::UNIX_EPOCH.elapsed().map_or(0, |d| d.as_secs());
+        let prev = LAST_LIVE.load(Ordering::Relaxed);
+        if now < prev + every
+            || LAST_LIVE
+                .compare_exchange(prev, now, Ordering::Relaxed, Ordering::Relaxed)
+                .is_err()
+        {
+            return;
+        }
+        let serial = SERIAL_NS.load(Ordering::Relaxed) as f64 / 1e9;
+        let lift = LIFT_NS.load(Ordering::Relaxed) as f64 / 1e9;
+        let od = ONDEMAND_NS.load(Ordering::Relaxed) as f64 / 1e9;
+        eprintln!(
+            "[sig-live] sigs={} walk={serial:.1}s | lift={lift:.1}s ({:.1}%) \
+             ondemand_multiply={od:.1}s ({:.1}% of walk) cpu_remainder={:.1}s ({:.1}% of walk) \
+             prepare={:.1}s ({:.1}%)",
+            SIGS.load(Ordering::Relaxed),
+            100.0 * lift / serial.max(1e-9),
+            100.0 * od / serial.max(1e-9),
+            lift - od,
+            100.0 * (lift - od) / serial.max(1e-9),
+            serial - lift,
+            100.0 * (serial - lift) / serial.max(1e-9),
+        );
+        super::shift_stats_report();
     }
 
     /// Per-subalgebra totals, keyed by `subalgebra_dim = 2^sum(profile)`. The aggregate ceiling
@@ -1355,10 +1420,10 @@ mod sig_sched {
         let level_cost: f64 = per_level.iter().sum();
         let widest = pop.iter().copied().max().unwrap_or(0);
 
-        SERIAL_NS.fetch_add((serial * 1e9) as u64, Ordering::Relaxed);
+        // SERIAL_NS and SIGS are accumulated in `Timer::drop` so the live report does not have to
+        // wait for a bidegree; adding them again here would double count.
         LEVEL_NS.fetch_add((level_cost * 1e9) as u64, Ordering::Relaxed);
         MAXSIG_NS.fetch_add((maxsig * 1e9) as u64, Ordering::Relaxed);
-        SIGS.fetch_add(samples.len() as u64, Ordering::Relaxed);
         LEVELS.fetch_add(
             pop.iter().filter(|&&c| c > 0).count() as u64,
             Ordering::Relaxed,
@@ -1366,7 +1431,7 @@ mod sig_sched {
         WIDEST.fetch_max(widest, Ordering::Relaxed);
         record_sub(sub_dim, serial, level_cost, maxsig);
         let n = BIDEGREES.fetch_add(1, Ordering::Relaxed) + 1;
-        if n % REPORT_EVERY == 0 {
+        if n % report_every() == 0 {
             report(n);
         }
     }
