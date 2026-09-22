@@ -1748,12 +1748,32 @@ mod shift {
     /// degree `d` serves consumers at `t = d + deg(sigma)`, and the wavefront never returns to a
     /// degree it has passed, so the smallest degrees are always the deadest. A miss merely rebuilds
     /// the entry, so eviction can never change results.
+    /// Default is BOUNDED, not unlimited.
+    ///
+    /// Unlimited is what produced the monotone RSS climb this cache was fingered for (stem 170:
+    /// 0 -> 49 GB, of a 51.4 GB high-water mark whose largest transient matrix was only 4 GB), and
+    /// unbounded residency also drifts all run, which confounds every A/B run against it.
+    ///
+    /// A small cap costs remarkably little, because eviction is lowest-degree-first and the
+    /// wavefront never returns. Measured at the frontier, matched at equal signature counts:
+    ///
+    /// ```text
+    /// sigs    64GB     4GB      OFF    4GB/64   OFF/64
+    ///   40    2151    2310     2653      1.07     1.23
+    ///   70    3694    4114     4946      1.11     1.34
+    /// ```
+    ///
+    /// So 4 GB recovers ~74% of the cache's benefit for ~6% of its memory (hit rate 29.3% against
+    /// 52.6%), while DELETING the cache costs 1.34x. Explicitly setting `0` still means unlimited,
+    /// for anyone who wants the old behaviour.
+    const DEFAULT_CACHE_GB: f64 = 4.0;
+
     fn cache_bytes_cap() -> usize {
         static N: LazyLock<usize> = LazyLock::new(|| {
             let gb: f64 = std::env::var("NASSAU_SHIFT_CACHE_GB")
                 .ok()
                 .and_then(|v| v.parse().ok())
-                .unwrap_or(0.0);
+                .unwrap_or(DEFAULT_CACHE_GB);
             if gb <= 0.0 {
                 usize::MAX
             } else {
