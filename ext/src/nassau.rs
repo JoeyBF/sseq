@@ -1748,6 +1748,19 @@ mod shift {
     /// degree `d` serves consumers at `t = d + deg(sigma)`, and the wavefront never returns to a
     /// degree it has passed, so the smallest degrees are always the deadest. A miss merely rebuilds
     /// the entry, so eviction can never change results.
+    ///
+    /// VERIFIED, not merely argued. That guarantee holds only while the cache KEY is complete --
+    /// the sibling solver cache documents exactly the hazard, where keying by mask LENGTH rather
+    /// than CONTENTS would return something a rebuild would not. Under a hit pattern that varies
+    /// run to run, an incomplete key gives INTERMITTENTLY wrong mathematics, which is the worst
+    /// failure mode available and one a chart comparison would only catch by luck.
+    ///
+    /// So it is checked by experiment (`determinism.sh`): S_2 to stem 150, max_s 75, four runs --
+    /// 64GB twice, 4GB, and `NASSAU_SHIFT_REUSE=0`. All four Ext charts are BYTE IDENTICAL
+    /// (sha b3bd25fe75bdc8be), including the two at a fixed setting whose hit patterns differed
+    /// because bidegree scheduling does. The cache is timing-nondeterministic and
+    /// result-deterministic, and only the first of those is true of the measurements taken against
+    /// it -- which is why measurement runs disable it.
     /// Default is BOUNDED, not unlimited.
     ///
     /// Unlimited is what produced the monotone RSS climb this cache was fingered for (stem 170:
