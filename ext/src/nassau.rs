@@ -1265,6 +1265,14 @@ mod sig_sched {
     /// remainder needs a level-parallel lift.
     pub static LIFT_NS: AtomicU64 = AtomicU64::new(0);
 
+    /// Time inside the lift's `sig_ondemand` multiply, i.e. the GPU-bound part of the lift.
+    ///
+    /// This decides whether a level-parallel lift can pay at all. The device already runs at 94%
+    /// with the multiply at 17.5 waves/SM, so issuing those multiplies concurrently adds callers
+    /// to a saturated device and buys nothing. Only the CPU remainder -- applying the preimage and
+    /// XOR-ing corrections -- has somewhere to go, onto the ~118 cores the walk leaves idle.
+    pub static ONDEMAND_NS: AtomicU64 = AtomicU64::new(0);
+
     pub struct LiftTimer(std::time::Instant);
 
     impl LiftTimer {
@@ -1391,6 +1399,19 @@ mod sig_sched {
                 100.0 * prep_share,
                 serial / (serial - (serial - lift)).max(1e-9),
                 if level > 0.0 { serial / level } else { 0.0 },
+            );
+            let od = ONDEMAND_NS.load(Ordering::Relaxed) as f64 / 1e9;
+            // The lift's GPU half cannot be parallelised into a win -- the device is already fed --
+            // so the CPU remainder is the only part a level schedule can actually move.
+            eprintln!(
+                "[sig-lift-split] ondemand_multiply={od:.1}s ({:.1}% of lift, {:.1}% of walk) \
+                 cpu_remainder={:.1}s ({:.1}% of walk) | lift-parallel ceiling if GPU is \
+                 saturated={:.2}x",
+                100.0 * od / lift.max(1e-9),
+                100.0 * od / serial.max(1e-9),
+                lift - od,
+                100.0 * (lift - od) / serial.max(1e-9),
+                serial / (serial - (lift - od)).max(1e-9),
             );
         }
         let rsteps = REACH_STEPS.load(Ordering::Relaxed);
@@ -5016,6 +5037,7 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                     // from this one's, so a narrowed row is scattered back through the mask it was
                     // built under. Outside that mask the row is zero, so the scatter and the old
                     // full-width add agree exactly.
+                    let ondemand_t0 = sched_cost.as_ref().map(|_| std::time::Instant::now());
                     let got =
                         tracing::trace_span!("sig_ondemand", rows = basis.len()).in_scope(|| {
                             match reach_mask.as_ref() {
@@ -5034,6 +5056,10 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                                 ),
                             }
                         });
+                    if let Some(t0) = ondemand_t0 {
+                        sig_sched::ONDEMAND_NS
+                            .fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                    }
                     for (sup, dx) in supports.iter().zip(dxs.iter_mut()) {
                         for &i in sup {
                             let k = needed.binary_search(&i).unwrap();
