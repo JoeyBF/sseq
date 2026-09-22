@@ -4499,16 +4499,13 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
             // WITHIN the reachable mask; the masked build is indexed by the narrow matrix, not by
             // the full column space.
             //
-            // Only the plain build is narrowed. The other arms below -- the `full_reuse` gather,
-            // the speculation assemble, and the `shift_skip_full` placeholder -- all hand back
-            // FULL-width rows, and the consumers index by whichever width the build produced, so
-            // mixing them would silently mis-index rather than fail.
-            let (reach_mask, next_in_reach): (Option<Vec<usize>>, Option<Vec<usize>>) =
-                if reach_active
-                    && full_reuse.is_none()
-                    && !blocks::enabled()
-                    && !shift_skip_full
-                {
+            // Applied at `sig_ondemand` ONLY. The first cut narrowed the `sig_select` build
+            // instead, which was wasted: under shift reuse that build is skipped outright (it
+            // returns an empty placeholder), so the arm never fired and both sides of the A/B
+            // issued byte-identical launches -- same launch count, same block count, same pair
+            // count. `sig_ondemand` is where the shift path actually builds correction rows, and
+            // it builds them at FULL width.
+            let reach_mask: Option<Vec<usize>> = if reach_active {
                     let (dag, idx_of, _) = reach_probe.as_ref().expect("built when reach_active");
                     let a = sig_dag::index(&subalgebra.profile, &signature);
                     let row = dag.row(a);
@@ -4518,24 +4515,9 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                             t == a || (row[t >> 6] >> (t & 63)) & 1 == 1
                         })
                         .collect();
-                    // Both are ascending, so one merge pass locates each `next_mask` column.
-                    let mut pos = Vec::with_capacity(next_mask.len());
-                    let mut j = 0usize;
-                    for &c in &next_mask {
-                        while j < mask.len() && mask[j] < c {
-                            j += 1;
-                        }
-                        debug_assert!(
-                            j < mask.len() && mask[j] == c,
-                            "next_mask column {c} missing from the reachable set at {b} \
-                             sig={signature:?} -- the DAG under-predicted, which would silently \
-                             drop a correction"
-                        );
-                        pos.push(j);
-                    }
-                    (Some(mask), Some(pos))
+                    Some(mask)
                 } else {
-                    (None, None)
+                    None
                 };
 
             // Does this signature's problem look like the zero-signature problem at the shifted
@@ -4767,19 +4749,6 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                             &target_mask,
                             next_dim,
                         )),
-                        // Narrowed to the reachable columns: the kernel writes `mask.len()` wide
-                        // instead of `next_dim`, which shrinks the device buffer and the readback
-                        // by the same ratio. Readback is ~50% of worker exec, so this is where the
-                        // narrowing actually lands.
-                        None if reach_mask.is_some() => {
-                            PartialMatrix::Owned(restricted_partial_matrix_masked_maybe_gpu(
-                                &self.differentials[b.s() - 1],
-                                b.t(),
-                                &target_mask,
-                                next_dim,
-                                reach_mask.as_ref().unwrap(),
-                            ))
-                        }
                         None => PartialMatrix::Owned(restricted_partial_matrix_maybe_gpu(
                             &self.differentials[b.s() - 1],
                             b.t(),
@@ -4884,11 +4853,8 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                                 }
                             }
                             None => {
-                                // Under the reachable mask the matrix is already narrow, so the
-                                // gather is by position WITHIN it, not by full column index.
-                                let gather = next_in_reach.as_ref().unwrap_or(&next_mask);
                                 for (i, mut l) in m.segment(0, 0).iter_mut().enumerate() {
-                                    l.add_masked(full_matrix.row(i), 1, gather);
+                                    l.add_masked(full_matrix.row(i), 1, &next_mask);
                                 }
                             }
                         }
@@ -5000,19 +4966,42 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                         crate::census::matrix_bytes(basis.len(), next_dim),
                         Ordering::Relaxed,
                     );
+                    // THE narrowing site. These are the correction rows on the shift-reuse path,
+                    // and they are built at FULL width although the row is provably zero outside
+                    // `reach(sigma)` -- measured at 20.9% of `next_dim`, a 4.8x cut to both the
+                    // kernel's output width and the readback (readback is ~55% of worker exec).
+                    //
+                    // `dx` stays full width, since later signatures read it at masks that differ
+                    // from this one's, so a narrowed row is scattered back through the mask it was
+                    // built under. Outside that mask the row is zero, so the scatter and the old
+                    // full-width add agree exactly.
                     let got =
                         tracing::trace_span!("sig_ondemand", rows = basis.len()).in_scope(|| {
-                            restricted_partial_matrix_maybe_gpu(
-                                &self.differentials[b.s() - 1],
-                                b.t(),
-                                &basis,
-                                next_dim,
-                            )
+                            match reach_mask.as_ref() {
+                                Some(mask) => restricted_partial_matrix_masked_maybe_gpu(
+                                    &self.differentials[b.s() - 1],
+                                    b.t(),
+                                    &basis,
+                                    next_dim,
+                                    mask,
+                                ),
+                                None => restricted_partial_matrix_maybe_gpu(
+                                    &self.differentials[b.s() - 1],
+                                    b.t(),
+                                    &basis,
+                                    next_dim,
+                                ),
+                            }
                         });
                     for (sup, dx) in supports.iter().zip(dxs.iter_mut()) {
                         for &i in sup {
                             let k = needed.binary_search(&i).unwrap();
-                            dx.as_slice_mut().add(got.row(k), 1);
+                            match reach_mask.as_ref() {
+                                Some(mask) => {
+                                    dx.as_slice_mut().add_unmasked(got.row(k), 1, mask)
+                                }
+                                None => dx.as_slice_mut().add(got.row(k), 1),
+                            }
                         }
                     }
                 }
@@ -5055,16 +5044,7 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                     let corr_t0 = reach_probe.as_ref().map(|_| std::time::Instant::now());
                     for (i, _) in scratch.iter_nonzero() {
                         x.add_basis_element(target_mask[i], 1);
-                        // `dx` stays FULL width -- later signatures read it at masks that differ
-                        // from this one's -- so a narrowed row is scattered back through the mask
-                        // it was built under. Outside that mask the row is zero by the DAG, so the
-                        // scatter and the old full-width add agree exactly.
-                        match reach_mask.as_ref() {
-                            Some(mask) => {
-                                dx.as_slice_mut().add_unmasked(full_matrix.row(i), 1, mask)
-                            }
-                            None => dx.as_slice_mut().add(full_matrix.row(i), 1),
-                        }
+                        dx.as_slice_mut().add(full_matrix.row(i), 1);
                         if let Some(t) = &mut gen_tags {
                             for (p, _) in full_matrix.row(i).iter_nonzero() {
                                 let e = &mut t[gi][p];
