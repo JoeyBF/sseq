@@ -7311,9 +7311,9 @@ fn multiply_batch_block<'a>(
                         })
                         .collect();
                     eprintln!(
-                        "[mul-occupancy] launches={ml} blocks/launch mean={:.0} \
-                         waves/SM mean={:.2} | sub-wave launches={sw} ({:.1}% of launches, \
-                         {:.2}% of blocks) | hist {}",
+                        "[mul-occupancy] launches={ml} blocks/launch mean={:.0} waves/SM \
+                         mean={:.2} | sub-wave launches={sw} ({:.1}% of launches, {:.2}% of \
+                         blocks) | hist {}",
                         mb as f64 / ml as f64,
                         mb as f64 / ml as f64 / 3168.0,
                         100.0 * sw as f64 / ml as f64,

@@ -13,6 +13,7 @@
 //! we find that this the easiest way to make all scripts support both types of resolutions.
 
 use std::{
+    collections::HashMap,
     fmt::Display,
     sync::{
         Arc, LazyLock, Mutex,
@@ -30,8 +31,6 @@ use algebra::{
     },
 };
 use anyhow::anyhow;
-use std::collections::HashMap;
-
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use fp::{
     matrix::{AugmentedMatrix, Matrix, QuasiInverse, Subspace},
@@ -607,8 +606,8 @@ fn heap_stats_report() {
     let mapped = stats::mapped::read().unwrap_or(0);
     let rss = proc_rss_bytes();
     eprintln!(
-        "[HEAP] jemalloc allocated={:.1} active={:.1} resident={:.1} mapped={:.1}GB | \
-         RSS={:.1}GB | outside-jemalloc={:.1}GB",
+        "[HEAP] jemalloc allocated={:.1} active={:.1} resident={:.1} mapped={:.1}GB | RSS={:.1}GB \
+         | outside-jemalloc={:.1}GB",
         gb(allocated),
         gb(active),
         gb(resident),
@@ -620,7 +619,6 @@ fn heap_stats_report() {
 
 #[cfg(not(feature = "heapprof"))]
 fn heap_stats_report() {}
-
 
 /// Whether to build restricted partial matrices directly in masked column coordinates. Default ON;
 /// `NASSAU_MASKED_COLS=0` disables.
@@ -1235,7 +1233,10 @@ mod sig_level {
 mod sig_sched {
     use std::{
         collections::BTreeMap,
-        sync::{Mutex, atomic::{AtomicU64, Ordering}},
+        sync::{
+            Mutex,
+            atomic::{AtomicU64, Ordering},
+        },
     };
 
     pub static SERIAL_NS: AtomicU64 = AtomicU64::new(0);
@@ -1410,8 +1411,8 @@ mod sig_sched {
         let pgpu = PREPARE_GPU_NS.load(Ordering::Relaxed) as f64 / 1e9;
         let movable = (serial - lift - pgpu).max(0.0) + (lift - od).max(0.0);
         eprintln!(
-            "[sig-movable] prepare_gpu={pgpu:.1}s ({:.1}% of walk) prepare_cpu={:.1}s ({:.1}%) \
-             | MOVABLE (cpu total)={movable:.1}s ({:.1}% of walk) -> parallel ceiling={:.2}x",
+            "[sig-movable] prepare_gpu={pgpu:.1}s ({:.1}% of walk) prepare_cpu={:.1}s ({:.1}%) | \
+             MOVABLE (cpu total)={movable:.1}s ({:.1}% of walk) -> parallel ceiling={:.2}x",
             100.0 * pgpu / serial.max(1e-9),
             serial - lift - pgpu,
             100.0 * (serial - lift - pgpu) / serial.max(1e-9),
@@ -1495,8 +1496,7 @@ mod sig_sched {
         let levels = LEVELS.load(Ordering::Relaxed);
         eprintln!(
             "[sig-sched] bidegrees={n} sigs={sigs} nonempty_levels={levels} widest={} \
-             serial={serial:.1}s level_schedule={level:.1}s ceiling={:.2}x \
-             single_max_bound={:.2}x",
+             serial={serial:.1}s level_schedule={level:.1}s ceiling={:.2}x single_max_bound={:.2}x",
             WIDEST.load(Ordering::Relaxed),
             if level > 0.0 { serial / level } else { 0.0 },
             if maxsig > 0.0 { serial / maxsig } else { 0.0 },
@@ -1535,8 +1535,8 @@ mod sig_sched {
             let rc = REACH_COLS.load(Ordering::Relaxed) as f64;
             let fc = FULL_COLS.load(Ordering::Relaxed) as f64;
             eprintln!(
-                "[sig-reach] steps={rsteps} reachable_cols={rc:.0} full_cols={fc:.0} \
-                 frac={:.4} narrowing={:.2}x",
+                "[sig-reach] steps={rsteps} reachable_cols={rc:.0} full_cols={fc:.0} frac={:.4} \
+                 narrowing={:.2}x",
                 rc / fc.max(1.0),
                 fc / rc.max(1.0),
             );
@@ -1544,8 +1544,8 @@ mod sig_sched {
             let crows = CORRECT_ROWS.load(Ordering::Relaxed);
             let serial = SERIAL_NS.load(Ordering::Relaxed) as f64 / 1e9;
             eprintln!(
-                "[sig-correct] correction_adds={cns:.1}s rows={crows} \
-                 ({:.1}% of signature-walk time) narrowed_saving={:.1}s ({:.2}x on the walk)",
+                "[sig-correct] correction_adds={cns:.1}s rows={crows} ({:.1}% of signature-walk \
+                 time) narrowed_saving={:.1}s ({:.2}x on the walk)",
                 100.0 * cns / serial.max(1e-9),
                 cns * (1.0 - rc / fc.max(1.0)),
                 serial / (serial - cns * (1.0 - rc / fc.max(1.0))).max(1e-9),
@@ -1555,9 +1555,13 @@ mod sig_sched {
         let grand: f64 = g.values().map(|e| e.0).sum();
         for (dim, (ser, lvl, mx, cnt)) in g.iter() {
             eprintln!(
-                "[sig-sched-sub] subalgebra_dim={dim} bidegrees={cnt} serial={ser:.1}s \
-                 ({:.1}% of wall) level_schedule={lvl:.1}s ceiling={:.2}x single_max_bound={:.2}x",
-                if grand > 0.0 { 100.0 * ser / grand } else { 0.0 },
+                "[sig-sched-sub] subalgebra_dim={dim} bidegrees={cnt} serial={ser:.1}s ({:.1}% of \
+                 wall) level_schedule={lvl:.1}s ceiling={:.2}x single_max_bound={:.2}x",
+                if grand > 0.0 {
+                    100.0 * ser / grand
+                } else {
+                    0.0
+                },
                 if *lvl > 0.0 { ser / lvl } else { 0.0 },
                 if *mx > 0.0 { ser / mx } else { 0.0 },
             );
@@ -1921,7 +1925,10 @@ enum PartialMatrix<'a> {
     /// `row(i)` has one entry per entry of `reach`, and scattering it back to full width goes
     /// through `reach`. Outside that set the row is provably zero, so the scatter and a full-width
     /// add agree exactly.
-    Reached { m: Matrix, reach: Vec<usize> },
+    Reached {
+        m: Matrix,
+        reach: Vec<usize>,
+    },
 }
 
 impl PartialMatrix<'_> {
@@ -3164,8 +3171,7 @@ static TRUNC_TOTAL: AtomicUsize = AtomicUsize::new(0);
 /// Default OFF, i.e. verification is on: knowing whether a repeated failure is the GPU or the
 /// algorithm is worth hours on a path that only runs after two failures.
 fn no_cpu_verify() -> bool {
-    static V: LazyLock<bool> =
-        LazyLock::new(|| std::env::var_os("NASSAU_NO_CPU_VERIFY").is_some());
+    static V: LazyLock<bool> = LazyLock::new(|| std::env::var_os("NASSAU_NO_CPU_VERIFY").is_some());
     *V
 }
 
@@ -3235,13 +3241,29 @@ impl StepFailure {
         if let Some(f) = e.downcast_ref::<StepFailure>() {
             // Already classified at the point of failure; keep it rather than re-deriving from text.
             return match f {
-                Self::NotACycle { b, nonzero, gens } => Self::NotACycle { b: *b, nonzero: *nonzero, gens: *gens },
-                Self::DeviceExhausted { b, detail } => Self::DeviceExhausted { b: *b, detail: detail.clone() },
-                Self::ContextLost { b, detail } => Self::ContextLost { b: *b, detail: detail.clone() },
-                Self::Other { b, detail } => Self::Other { b: *b, detail: detail.clone() },
+                Self::NotACycle { b, nonzero, gens } => Self::NotACycle {
+                    b: *b,
+                    nonzero: *nonzero,
+                    gens: *gens,
+                },
+                Self::DeviceExhausted { b, detail } => Self::DeviceExhausted {
+                    b: *b,
+                    detail: detail.clone(),
+                },
+                Self::ContextLost { b, detail } => Self::ContextLost {
+                    b: *b,
+                    detail: detail.clone(),
+                },
+                Self::Other { b, detail } => Self::Other {
+                    b: *b,
+                    detail: detail.clone(),
+                },
             };
         }
-        Self::Other { b, detail: format!("{e:#}") }
+        Self::Other {
+            b,
+            detail: format!("{e:#}"),
+        }
     }
 
     /// Classify a PANIC payload.
@@ -3262,11 +3284,15 @@ impl StepFailure {
             .unwrap_or_else(|| "<non-string panic payload>".to_owned());
         let low = msg.to_ascii_lowercase();
         if low.contains("dx non-zero") {
-            Self::NotACycle { b, nonzero: 0, gens: 0 }
+            Self::NotACycle {
+                b,
+                nonzero: 0,
+                gens: 0,
+            }
         } else if low.contains("can't allocate buffer") || low.contains("out of memory") {
             Self::DeviceExhausted { b, detail: msg }
         } else if low.contains("couldn't find resource for that handle")
-            || low.contains("context")&& low.contains("poison")
+            || low.contains("context") && low.contains("poison")
             || low.contains("launch_failed")
             || low.contains("cuda_error")
         {
@@ -3281,7 +3307,11 @@ impl std::fmt::Display for StepFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::NotACycle { b, nonzero, gens } => {
-                write!(f, "{b}: computed lift is not a cycle ({nonzero} of {gens} generators had dx != 0)")
+                write!(
+                    f,
+                    "{b}: computed lift is not a cycle ({nonzero} of {gens} generators had dx != \
+                     0)"
+                )
             }
             Self::DeviceExhausted { b, detail } => write!(f, "{b}: device out of memory: {detail}"),
             Self::ContextLost { b, detail } => write!(f, "{b}: CUDA context lost: {detail}"),
@@ -4528,8 +4558,8 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
         // a signature step whose live entries top out at generation `g` writes corrections tagged
         // `g + 1`. The maximum over the bidegree is `k`, the nilpotency degree of the correction
         // operator -- the number of sweeps a Jacobi scheme would need in place of this serial walk.
-        let mut gen_tags: Option<Vec<Vec<u32>>> = std::env::var_os("NASSAU_PROBE_SIG_GEN")
-            .map(|_| vec![vec![0u32; next_dim]; dxs.len()]);
+        let mut gen_tags: Option<Vec<Vec<u32>>> =
+            std::env::var_os("NASSAU_PROBE_SIG_GEN").map(|_| vec![vec![0u32; next_dim]; dxs.len()]);
         let mut max_generation = 0u32;
         // Jacobi work: a block is re-solved once per GENERATION present among its live entries,
         // against once total for the serial walk. `k` bounds depth; this ratio is the cost.
@@ -4557,43 +4587,40 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
         let reach_probe: Option<(&'static sig_dag::Dag, Vec<u32>, Vec<u64>)> = (reach_active
             || std::env::var_os("NASSAU_PROBE_SIG_REACH").is_some())
         .then(|| {
-                let dag = sig_dag::get(&subalgebra.profile);
-                // Column -> signature INDEX (the packed probe below keeps raw bits instead, which
-                // cannot be used to index the DAG).
-                let mut idx_of = vec![0u32; next_dim];
-                let mut count = vec![0u64; dag.n];
-                for gd in next.iter_gen_offsets([b.t()]) {
-                    if gd.gen_deg >= next_bound {
-                        break;
-                    }
-                    let offset = gd.start[0];
-                    for (n, op) in algebra.ppart_table(b.t() - gd.gen_deg).iter().enumerate() {
-                        if offset + n >= idx_of.len() {
-                            continue;
-                        }
-                        let bits = op.bits();
-                        let mut k = 0usize;
-                        let mut mul = 1usize;
-                        for i in 0..subalgebra.profile.len() {
-                            let radix = 1usize << subalgebra.profile[i];
-                            let comp = if i < PPart::MAX_LEN {
-                                let w = std::cmp::min(
-                                    subalgebra.profile[i] as u32,
-                                    PPart::width(i),
-                                );
-                                ((bits >> PPart::shift(i)) & ((1u64 << w) - 1)) as usize
-                            } else {
-                                0
-                            };
-                            k += (comp % radix) * mul;
-                            mul *= radix;
-                        }
-                        idx_of[offset + n] = k as u32;
-                        count[k] += 1;
-                    }
+            let dag = sig_dag::get(&subalgebra.profile);
+            // Column -> signature INDEX (the packed probe below keeps raw bits instead, which
+            // cannot be used to index the DAG).
+            let mut idx_of = vec![0u32; next_dim];
+            let mut count = vec![0u64; dag.n];
+            for gd in next.iter_gen_offsets([b.t()]) {
+                if gd.gen_deg >= next_bound {
+                    break;
                 }
-                (dag, idx_of, count)
-            });
+                let offset = gd.start[0];
+                for (n, op) in algebra.ppart_table(b.t() - gd.gen_deg).iter().enumerate() {
+                    if offset + n >= idx_of.len() {
+                        continue;
+                    }
+                    let bits = op.bits();
+                    let mut k = 0usize;
+                    let mut mul = 1usize;
+                    for i in 0..subalgebra.profile.len() {
+                        let radix = 1usize << subalgebra.profile[i];
+                        let comp = if i < PPart::MAX_LEN {
+                            let w = std::cmp::min(subalgebra.profile[i] as u32, PPart::width(i));
+                            ((bits >> PPart::shift(i)) & ((1u64 << w) - 1)) as usize
+                        } else {
+                            0
+                        };
+                        k += (comp % radix) * mul;
+                        mul *= radix;
+                    }
+                    idx_of[offset + n] = k as u32;
+                    count[k] += 1;
+                }
+            }
+            (dag, idx_of, count)
+        });
 
         let col_sig: Option<Vec<u64>> = std::env::var_os("NASSAU_PROBE_SIG_DOMINATE").map(|_| {
             let mut full_mask = 0u64;
@@ -4713,98 +4740,98 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
             if f.is_none() && dxs.iter().all(|dx| dx.is_zero()) {
                 break 'levels;
             }
-        for (sig_idx, signature) in level {
-            let _guard = tracing::info_span!("step", ?signature).entered();
-            // Corrections only ever raise signature, so once every `dx` is zero the whole remaining
-            // tail is a provable no-op: the lift below is guarded by `dx.entry(v) != 0`, so it adds
-            // nothing to `xs`, and the only other side effect is `write_qi`.
-            // So skip it. With no quasi-inverse writer there is no side effect left at all, and
-            // everything above the lift (`sig_masks`, `sig_select`, `sig_assemble`,
-            // `sig_row_reduce`, `sig_quasi_inverse`) is pure waste.
-            //
-            // MEASURED (census, S_2 stem 110/max_s 55, 7533 bidegrees): the dead tail is 27.4% of
-            // work-weighted signature time — and it coincides exactly with `zero_gen_bidegrees`,
-            // which is the whole story. A bidegree with `num_new_gens == 0` has an EMPTY `dxs`, so
-            // it is vacuously converged before the first iteration and its entire signature loop
-            // was always dead. Bidegrees that do add generators have a negligible tail; this is not
-            // an early-convergence optimisation, it is 27.4% of the run computing quasi-inverses
-            // nobody asked for.
-            //
-            // Gated on `f.is_none()` because writing the quasi-inverse is a real side effect: with
-            // `EXT_NASSAU_NO_SAVE_QI` unset the loop must still run to completion.
-            if f.is_none() && dxs.iter().all(|dx| dx.is_zero()) {
-                break;
-            }
-            // Created AFTER the dead-tail skip: a skipped iteration does no work, and timing it
-            // would pad the sample set with zeros that shift nothing but the signature count.
-            let _sched_timer = sched_cost
-                .as_ref()
-                .map(|c| sig_sched::Timer::new(sig_level::level(c, &signature), &sched_samples));
-            if let Some((dag, _, count)) = reach_probe.as_ref() {
-                let a = sig_dag::index(&subalgebra.profile, &signature);
-                if a < dag.n {
-                    // sigma's own columns are reachable too: the correction lands on them and
-                    // cancels there, so they must stay in any narrowed set.
-                    let mut reach = count[a];
-                    for (w, &word) in dag.row(a).iter().enumerate() {
-                        let mut word = word;
-                        while word != 0 {
-                            let tau = w * 64 + word.trailing_zeros() as usize;
-                            word &= word - 1;
-                            reach += count[tau];
-                        }
-                    }
-                    sig_sched::record_reach(reach, next_dim as u64);
+            for (sig_idx, signature) in level {
+                let _guard = tracing::info_span!("step", ?signature).entered();
+                // Corrections only ever raise signature, so once every `dx` is zero the whole remaining
+                // tail is a provable no-op: the lift below is guarded by `dx.entry(v) != 0`, so it adds
+                // nothing to `xs`, and the only other side effect is `write_qi`.
+                // So skip it. With no quasi-inverse writer there is no side effect left at all, and
+                // everything above the lift (`sig_masks`, `sig_select`, `sig_assemble`,
+                // `sig_row_reduce`, `sig_quasi_inverse`) is pure waste.
+                //
+                // MEASURED (census, S_2 stem 110/max_s 55, 7533 bidegrees): the dead tail is 27.4% of
+                // work-weighted signature time — and it coincides exactly with `zero_gen_bidegrees`,
+                // which is the whole story. A bidegree with `num_new_gens == 0` has an EMPTY `dxs`, so
+                // it is vacuously converged before the first iteration and its entire signature loop
+                // was always dead. Bidegrees that do add generators have a negligible tail; this is not
+                // an early-convergence optimisation, it is 27.4% of the run computing quasi-inverses
+                // nobody asked for.
+                //
+                // Gated on `f.is_none()` because writing the quasi-inverse is a real side effect: with
+                // `EXT_NASSAU_NO_SAVE_QI` unset the loop must still run to completion.
+                if f.is_none() && dxs.iter().all(|dx| dx.is_zero()) {
+                    break;
                 }
-            }
-            // Recorded AFTER the skip, so `signatures_executed` counts iterations actually
-            // executed and `dead_signature_tail` keeps meaning "waste still present in the run" —
-            // it reads ~0 once the skip is on. Counting the one aborted iteration as dead would peg
-            // a skipped bidegree at 100% dead forever and hide whether the skip fired at all. The
-            // subalgebra's own signature count is `signatures_total`, set before the loop, because
-            // a bidegree that breaks here never reaches this line at all.
-            if let Some(c) = census.as_mut() {
-                c.set_signatures_executed(sig_idx + 1);
-                c.sig_live(sig_idx, dxs.iter().any(|dx| !dx.is_zero()));
-            }
-            // Spans below split what used to be one opaque `step`: the run's own accounting put
-            // ~26% of worker time inside `step` but outside any named region, which is exactly the
-            // shape that produced several wrong diagnoses earlier. One span per signature is cheap
-            // (the bodies are substantial); do NOT push spans inside these loops.
-            let _sm = tracing::trace_span!("sig_masks").entered();
-            target_mask.clear();
-            next_mask.clear();
-            target_mask.extend(subalgebra.signature_mask(
-                &algebra,
-                target,
-                b.t(),
-                &signature,
-                target_bound,
-            ));
-            next_mask.extend(subalgebra.signature_mask(
-                &algebra,
-                next,
-                b.t(),
-                &signature,
-                next_bound,
-            ));
-            drop(_sm);
+                // Created AFTER the dead-tail skip: a skipped iteration does no work, and timing it
+                // would pad the sample set with zeros that shift nothing but the signature count.
+                let _sched_timer = sched_cost.as_ref().map(|c| {
+                    sig_sched::Timer::new(sig_level::level(c, &signature), &sched_samples)
+                });
+                if let Some((dag, _, count)) = reach_probe.as_ref() {
+                    let a = sig_dag::index(&subalgebra.profile, &signature);
+                    if a < dag.n {
+                        // sigma's own columns are reachable too: the correction lands on them and
+                        // cancels there, so they must stay in any narrowed set.
+                        let mut reach = count[a];
+                        for (w, &word) in dag.row(a).iter().enumerate() {
+                            let mut word = word;
+                            while word != 0 {
+                                let tau = w * 64 + word.trailing_zeros() as usize;
+                                word &= word - 1;
+                                reach += count[tau];
+                            }
+                        }
+                        sig_sched::record_reach(reach, next_dim as u64);
+                    }
+                }
+                // Recorded AFTER the skip, so `signatures_executed` counts iterations actually
+                // executed and `dead_signature_tail` keeps meaning "waste still present in the run" —
+                // it reads ~0 once the skip is on. Counting the one aborted iteration as dead would peg
+                // a skipped bidegree at 100% dead forever and hide whether the skip fired at all. The
+                // subalgebra's own signature count is `signatures_total`, set before the loop, because
+                // a bidegree that breaks here never reaches this line at all.
+                if let Some(c) = census.as_mut() {
+                    c.set_signatures_executed(sig_idx + 1);
+                    c.sig_live(sig_idx, dxs.iter().any(|dx| !dx.is_zero()));
+                }
+                // Spans below split what used to be one opaque `step`: the run's own accounting put
+                // ~26% of worker time inside `step` but outside any named region, which is exactly the
+                // shape that produced several wrong diagnoses earlier. One span per signature is cheap
+                // (the bodies are substantial); do NOT push spans inside these loops.
+                let _sm = tracing::trace_span!("sig_masks").entered();
+                target_mask.clear();
+                next_mask.clear();
+                target_mask.extend(subalgebra.signature_mask(
+                    &algebra,
+                    target,
+                    b.t(),
+                    &signature,
+                    target_bound,
+                ));
+                next_mask.extend(subalgebra.signature_mask(
+                    &algebra,
+                    next,
+                    b.t(),
+                    &signature,
+                    next_bound,
+                ));
+                drop(_sm);
 
-            // Columns this signature's correction may legally touch: its own, plus everything the
-            // DAG says it reaches. The row is provably zero elsewhere, so building those columns is
-            // waste -- measured at 20.9% of full width, a 4.8x narrowing.
-            //
-            // `next_mask` is a subset (sigma's own columns), so it is re-expressed as positions
-            // WITHIN the reachable mask; the masked build is indexed by the narrow matrix, not by
-            // the full column space.
-            //
-            // Applied at `sig_ondemand` ONLY. The first cut narrowed the `sig_select` build
-            // instead, which was wasted: under shift reuse that build is skipped outright (it
-            // returns an empty placeholder), so the arm never fired and both sides of the A/B
-            // issued byte-identical launches -- same launch count, same block count, same pair
-            // count. `sig_ondemand` is where the shift path actually builds correction rows, and
-            // it builds them at FULL width.
-            let reach_mask: Option<Vec<usize>> = if reach_active {
+                // Columns this signature's correction may legally touch: its own, plus everything the
+                // DAG says it reaches. The row is provably zero elsewhere, so building those columns is
+                // waste -- measured at 20.9% of full width, a 4.8x narrowing.
+                //
+                // `next_mask` is a subset (sigma's own columns), so it is re-expressed as positions
+                // WITHIN the reachable mask; the masked build is indexed by the narrow matrix, not by
+                // the full column space.
+                //
+                // Applied at `sig_ondemand` ONLY. The first cut narrowed the `sig_select` build
+                // instead, which was wasted: under shift reuse that build is skipped outright (it
+                // returns an empty placeholder), so the arm never fired and both sides of the A/B
+                // issued byte-identical launches -- same launch count, same block count, same pair
+                // count. `sig_ondemand` is where the shift path actually builds correction rows, and
+                // it builds them at FULL width.
+                let reach_mask: Option<Vec<usize>> = if reach_active {
                     let (dag, idx_of, _) = reach_probe.as_ref().expect("built when reach_active");
                     let a = sig_dag::index(&subalgebra.profile, &signature);
                     let row = dag.row(a);
@@ -4819,670 +4846,674 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                     None
                 };
 
-            // The `sig_select` build may only be narrowed when it is the arm that actually runs.
-            // The `full_reuse` gather, the speculation assemble and the `shift_skip_full`
-            // placeholder all hand back FULL-width rows, and the consumers index by whatever width
-            // the build produced, so mixing them would mis-index silently rather than fail.
-            let select_reach: Option<&Vec<usize>> = reach_mask.as_ref().filter(|_| {
-                full_reuse.is_none() && !blocks::enabled() && !shift_skip_full
-            });
-            // `next_mask` is a subset of the reachable set (sigma's own columns), so on the
-            // narrowed build it is re-expressed as positions WITHIN that set. Both are ascending,
-            // so one merge pass suffices.
-            let next_in_reach: Option<Vec<usize>> = select_reach.map(|mask| {
-                let mut pos = Vec::with_capacity(next_mask.len());
-                let mut j = 0usize;
-                for &c in &next_mask {
-                    while j < mask.len() && mask[j] < c {
-                        j += 1;
-                    }
-                    debug_assert!(
-                        j < mask.len() && mask[j] == c,
-                        "next_mask column {c} missing from the reachable set at {b} \
-                         sig={signature:?} -- the DAG under-predicted, which would silently drop \
-                         a correction"
-                    );
-                    pos.push(j);
-                }
-                pos
-            });
-
-            // Does this signature's problem look like the zero-signature problem at the shifted
-            // degree? Necessary condition only, but a mismatch would refute shift reuse outright.
-            if shift_probe_enabled() {
-                let shifted_t = b.t() - MilnorSubalgebra::signature_degree(&signature);
-                if shifted_t < 0 {
-                    SHIFT_ABSENT.fetch_add(1, Ordering::Relaxed);
-                } else {
-                    // Compute the ZERO-signature masks at the shifted degree, but with THIS
-                    // bidegree's generator bounds. Reading them off the shifted bidegree instead
-                    // compares different generator sets (its bound is `shifted_t`, not `b.t()`),
-                    // which is what made the first cut of this probe read 21% for no real reason.
-                    let zs_target = subalgebra
-                        .signature_mask(&algebra, target, shifted_t, &zero_sig, target_bound)
-                        .count();
-                    let zs_next = subalgebra
-                        .signature_mask(&algebra, next, shifted_t, &zero_sig, next_bound)
-                        .count();
-                    if zs_target == target_mask.len() && zs_next == next_mask.len() {
-                        SHIFT_MATCH.fetch_add(1, Ordering::Relaxed);
-                    } else {
-                        SHIFT_MISMATCH.fetch_add(1, Ordering::Relaxed);
-                        tracing::debug!(
-                            "[shift-probe] {b} sig={signature:?} shifted_t={shifted_t} target {} \
-                             vs zs {zs_target}, next {} vs zs {zs_next}",
-                            target_mask.len(),
-                            next_mask.len()
+                // The `sig_select` build may only be narrowed when it is the arm that actually runs.
+                // The `full_reuse` gather, the speculation assemble and the `shift_skip_full`
+                // placeholder all hand back FULL-width rows, and the consumers index by whatever width
+                // the build produced, so mixing them would mis-index silently rather than fail.
+                let select_reach: Option<&Vec<usize>> = reach_mask
+                    .as_ref()
+                    .filter(|_| full_reuse.is_none() && !blocks::enabled() && !shift_skip_full);
+                // `next_mask` is a subset of the reachable set (sigma's own columns), so on the
+                // narrowed build it is re-expressed as positions WITHIN that set. Both are ascending,
+                // so one merge pass suffices.
+                let next_in_reach: Option<Vec<usize>> = select_reach.map(|mask| {
+                    let mut pos = Vec::with_capacity(next_mask.len());
+                    let mut j = 0usize;
+                    for &c in &next_mask {
+                        while j < mask.len() && mask[j] < c {
+                            j += 1;
+                        }
+                        debug_assert!(
+                            j < mask.len() && mask[j] == c,
+                            "next_mask column {c} missing from the reachable set at {b} \
+                             sig={signature:?} -- the DAG under-predicted, which would silently \
+                             drop a correction"
                         );
+                        pos.push(j);
+                    }
+                    pos
+                });
+
+                // Does this signature's problem look like the zero-signature problem at the shifted
+                // degree? Necessary condition only, but a mismatch would refute shift reuse outright.
+                if shift_probe_enabled() {
+                    let shifted_t = b.t() - MilnorSubalgebra::signature_degree(&signature);
+                    if shifted_t < 0 {
+                        SHIFT_ABSENT.fetch_add(1, Ordering::Relaxed);
+                    } else {
+                        // Compute the ZERO-signature masks at the shifted degree, but with THIS
+                        // bidegree's generator bounds. Reading them off the shifted bidegree instead
+                        // compares different generator sets (its bound is `shifted_t`, not `b.t()`),
+                        // which is what made the first cut of this probe read 21% for no real reason.
+                        let zs_target = subalgebra
+                            .signature_mask(&algebra, target, shifted_t, &zero_sig, target_bound)
+                            .count();
+                        let zs_next = subalgebra
+                            .signature_mask(&algebra, next, shifted_t, &zero_sig, next_bound)
+                            .count();
+                        if zs_target == target_mask.len() && zs_next == next_mask.len() {
+                            SHIFT_MATCH.fetch_add(1, Ordering::Relaxed);
+                        } else {
+                            SHIFT_MISMATCH.fetch_add(1, Ordering::Relaxed);
+                            tracing::debug!(
+                                "[shift-probe] {b} sig={signature:?} shifted_t={shifted_t} target \
+                                 {} vs zs {zs_target}, next {} vs zs {zs_next}",
+                                target_mask.len(),
+                                next_mask.len()
+                            );
+                        }
                     }
                 }
-            }
 
-            // Shift reuse: take this signature's matrix from the shared zero-signature build at
-            // `t - deg(sigma)` rather than from this bidegree. `sig_shift` carries its own column
-            // mask, since the shifted matrix lives over the shifted degree's column space.
-            // The `bool` is whether the cached matrix is already in masked column coordinates, in
-            // which case the mask is only consulted for its LENGTH (the consumer reads a prefix).
-            let mut shifted: Option<(Arc<Matrix>, Vec<usize>, bool, i32)> = None;
-            // Sibling of `shifted` so its scope is exactly the private matrix's lifetime.
-            #[cfg_attr(not(feature = "gpu"), allow(unused_mut))]
-            let mut _private_live: Option<PrivateLive> = None;
-            #[cfg(feature = "gpu")]
-            if shift_skip_full {
-                let shifted_t = b.t() - MilnorSubalgebra::signature_degree(&signature);
-                if shifted_t >= 0 {
-                    let _sh = tracing::trace_span!("sig_shift", shifted_t).entered();
-                    // Bound `shifted_t + 1`, NOT `i32::MAX`: at degree `shifted_t` only generators
-                    // of degree `<= shifted_t` can contribute, so this selects exactly the same
-                    // rows as the consumer's own `b.t()` bound while never reading the generator
-                    // counts of higher degrees — which another thread is concurrently growing.
-                    let zs_bound = shifted_t + 1;
-                    // The COLUMN mask must use this bidegree's own `next_bound`, not `zs_bound`.
-                    // They differ exactly when `deg(sigma) == 1`, where `shifted_t == b.t() - 1`
-                    // and `next_bound` excludes the degree-`shifted_t` generators that `zs_bound`
-                    // keeps. `next_bound` is what the matrix-level probe verified, and the cached
-                    // matrix carries the maximal column set, so every consumer's mask indexes a
-                    // prefix of it and stays in range.
-                    let zs_next: Vec<usize> = subalgebra
-                        .signature_mask(&algebra, next, shifted_t, &zero_sig, next_bound)
-                        .collect();
-                    // Who may BUILD the shared entry is a correctness question, not a policy
-                    // one. `zs_bound` columns reach `modules[b.s() - 2]` generators of degree up
-                    // to `shifted_t`. A consumer is only permitted to see degree `< next_bound`
-                    // (= `b.t() - 1`) there -- that bound is exactly what lets this bidegree run
-                    // concurrently with the one still ADDING those generators. For
-                    // `deg(sigma) == 1`, `shifted_t == b.t() - 1`, so building at `zs_bound` would
-                    // read generators being written right now: a race, and the reason this cache
-                    // still diverged at stem 90 after the profile was added to the key.
-                    //
-                    // So only `deg(sigma) >= 2` may build (there `next_bound >= shifted_t + 1`,
-                    // making `zs_bound` within its permitted view). A `deg(sigma) == 1` consumer
-                    // may still USE an entry someone else built -- it only ever reads the prefix
-                    // its own narrower mask names -- but when there is none it builds privately at
-                    // its own bound and does not publish.
-                    let may_publish = MilnorSubalgebra::signature_degree(&signature) >= 2;
-                    let m = match shift::get(b.s() as i32, shifted_t, &subalgebra.profile) {
-                        Some(m) => {
-                            N_SHIFT_HIT.fetch_add(1, Ordering::Relaxed);
-                            m
-                        }
-                        None => {
-                            let bound = if may_publish { zs_bound } else { next_bound };
-                            let zs_rows: Vec<usize> = subalgebra
-                                .signature_mask(
-                                    &algebra,
-                                    target,
-                                    shifted_t,
-                                    &zero_sig,
-                                    target_bound,
-                                )
-                                .collect();
-                            let cols =
-                                MilnorSubalgebra::restricted_dimension(next, shifted_t, bound);
-                            // Store in MASKED column coordinates. The mask is taken at the BUILD
-                            // bound, which makes it the maximal zero-signature column set for this
-                            // cache key: `signature_mask` with a larger bound extends the set at
-                            // the end, so every consumer's own mask is a PREFIX of this one and
-                            // reads columns `0..its_len`. That is what keeps one entry shared
-                            // across the consumers that differ only in `next_bound`.
-                            //
-                            // Unlike the transient zero-signature site, this cache is resident by
-                            // construction, so the ~50x narrowing converts to peak RSS rather than
-                            // to churn.
-                            let build_mask: Option<Vec<usize>> = masked_cols_enabled().then(|| {
-                                subalgebra
-                                    .signature_mask(&algebra, next, shifted_t, &zero_sig, bound)
-                                    .collect()
-                            });
-                            let stored_cols = build_mask.as_ref().map_or(cols, Vec::len);
-                            N_SHIFT_BUILD.fetch_add(1, Ordering::Relaxed);
-                            ROWS_SHIFT_BUILD.fetch_add(zs_rows.len(), Ordering::Relaxed);
-                            let built_bytes =
-                                crate::census::matrix_bytes(zs_rows.len(), stored_cols);
-                            if build_mask.is_some() {
-                                crate::census::add_bytes(
-                                    &crate::census::MASKED_SAVED_BYTES,
-                                    crate::census::matrix_bytes(zs_rows.len(), cols)
-                                        .saturating_sub(built_bytes),
+                // Shift reuse: take this signature's matrix from the shared zero-signature build at
+                // `t - deg(sigma)` rather than from this bidegree. `sig_shift` carries its own column
+                // mask, since the shifted matrix lives over the shifted degree's column space.
+                // The `bool` is whether the cached matrix is already in masked column coordinates, in
+                // which case the mask is only consulted for its LENGTH (the consumer reads a prefix).
+                let mut shifted: Option<(Arc<Matrix>, Vec<usize>, bool, i32)> = None;
+                // Sibling of `shifted` so its scope is exactly the private matrix's lifetime.
+                #[cfg_attr(not(feature = "gpu"), allow(unused_mut))]
+                let mut _private_live: Option<PrivateLive> = None;
+                #[cfg(feature = "gpu")]
+                if shift_skip_full {
+                    let shifted_t = b.t() - MilnorSubalgebra::signature_degree(&signature);
+                    if shifted_t >= 0 {
+                        let _sh = tracing::trace_span!("sig_shift", shifted_t).entered();
+                        // Bound `shifted_t + 1`, NOT `i32::MAX`: at degree `shifted_t` only generators
+                        // of degree `<= shifted_t` can contribute, so this selects exactly the same
+                        // rows as the consumer's own `b.t()` bound while never reading the generator
+                        // counts of higher degrees — which another thread is concurrently growing.
+                        let zs_bound = shifted_t + 1;
+                        // The COLUMN mask must use this bidegree's own `next_bound`, not `zs_bound`.
+                        // They differ exactly when `deg(sigma) == 1`, where `shifted_t == b.t() - 1`
+                        // and `next_bound` excludes the degree-`shifted_t` generators that `zs_bound`
+                        // keeps. `next_bound` is what the matrix-level probe verified, and the cached
+                        // matrix carries the maximal column set, so every consumer's mask indexes a
+                        // prefix of it and stays in range.
+                        let zs_next: Vec<usize> = subalgebra
+                            .signature_mask(&algebra, next, shifted_t, &zero_sig, next_bound)
+                            .collect();
+                        // Who may BUILD the shared entry is a correctness question, not a policy
+                        // one. `zs_bound` columns reach `modules[b.s() - 2]` generators of degree up
+                        // to `shifted_t`. A consumer is only permitted to see degree `< next_bound`
+                        // (= `b.t() - 1`) there -- that bound is exactly what lets this bidegree run
+                        // concurrently with the one still ADDING those generators. For
+                        // `deg(sigma) == 1`, `shifted_t == b.t() - 1`, so building at `zs_bound` would
+                        // read generators being written right now: a race, and the reason this cache
+                        // still diverged at stem 90 after the profile was added to the key.
+                        //
+                        // So only `deg(sigma) >= 2` may build (there `next_bound >= shifted_t + 1`,
+                        // making `zs_bound` within its permitted view). A `deg(sigma) == 1` consumer
+                        // may still USE an entry someone else built -- it only ever reads the prefix
+                        // its own narrower mask names -- but when there is none it builds privately at
+                        // its own bound and does not publish.
+                        let may_publish = MilnorSubalgebra::signature_degree(&signature) >= 2;
+                        let m = match shift::get(b.s() as i32, shifted_t, &subalgebra.profile) {
+                            Some(m) => {
+                                N_SHIFT_HIT.fetch_add(1, Ordering::Relaxed);
+                                m
+                            }
+                            None => {
+                                let bound = if may_publish { zs_bound } else { next_bound };
+                                let zs_rows: Vec<usize> = subalgebra
+                                    .signature_mask(
+                                        &algebra,
+                                        target,
+                                        shifted_t,
+                                        &zero_sig,
+                                        target_bound,
+                                    )
+                                    .collect();
+                                let cols =
+                                    MilnorSubalgebra::restricted_dimension(next, shifted_t, bound);
+                                // Store in MASKED column coordinates. The mask is taken at the BUILD
+                                // bound, which makes it the maximal zero-signature column set for this
+                                // cache key: `signature_mask` with a larger bound extends the set at
+                                // the end, so every consumer's own mask is a PREFIX of this one and
+                                // reads columns `0..its_len`. That is what keeps one entry shared
+                                // across the consumers that differ only in `next_bound`.
+                                //
+                                // Unlike the transient zero-signature site, this cache is resident by
+                                // construction, so the ~50x narrowing converts to peak RSS rather than
+                                // to churn.
+                                let build_mask: Option<Vec<usize>> =
+                                    masked_cols_enabled().then(|| {
+                                        subalgebra
+                                            .signature_mask(
+                                                &algebra, next, shifted_t, &zero_sig, bound,
+                                            )
+                                            .collect()
+                                    });
+                                let stored_cols = build_mask.as_ref().map_or(cols, Vec::len);
+                                N_SHIFT_BUILD.fetch_add(1, Ordering::Relaxed);
+                                ROWS_SHIFT_BUILD.fetch_add(zs_rows.len(), Ordering::Relaxed);
+                                let built_bytes =
+                                    crate::census::matrix_bytes(zs_rows.len(), stored_cols);
+                                if build_mask.is_some() {
+                                    crate::census::add_bytes(
+                                        &crate::census::MASKED_SAVED_BYTES,
+                                        crate::census::matrix_bytes(zs_rows.len(), cols)
+                                            .saturating_sub(built_bytes),
+                                    );
+                                }
+                                if may_publish {
+                                    BYTES_SHIFT_PUBLISHED.fetch_add(built_bytes, Ordering::Relaxed);
+                                } else {
+                                    N_SHIFT_PRIVATE.fetch_add(1, Ordering::Relaxed);
+                                    ROWS_SHIFT_PRIVATE.fetch_add(zs_rows.len(), Ordering::Relaxed);
+                                    BYTES_SHIFT_PRIVATE.fetch_add(built_bytes, Ordering::Relaxed);
+                                    _private_live = Some(PrivateLive::new(built_bytes));
+                                }
+                                // Prepare is 35% of the frontier walk, but only its CPU part (assemble,
+                                // row_reduce, quasi-inverse) can move onto the idle cores -- this
+                                // multiply is GPU, on a device already at ~1500 waves/SM per launch.
+                                // Time it so the parallel-prepare ceiling is computed from the movable
+                                // share rather than the whole stage.
+                                let build_t0 = std::time::Instant::now();
+                                let m = Arc::new(match &build_mask {
+                                    Some(mask) => restricted_partial_matrix_masked_maybe_gpu(
+                                        &self.differentials[b.s() - 1],
+                                        shifted_t,
+                                        &zs_rows,
+                                        cols,
+                                        mask,
+                                    ),
+                                    None => restricted_partial_matrix_maybe_gpu(
+                                        &self.differentials[b.s() - 1],
+                                        shifted_t,
+                                        &zs_rows,
+                                        cols,
+                                    ),
+                                });
+                                sig_sched::PREPARE_GPU_NS.fetch_add(
+                                    build_t0.elapsed().as_nanos() as u64,
+                                    Ordering::Relaxed,
+                                );
+                                if may_publish {
+                                    shift::put(
+                                        b.s() as i32,
+                                        shifted_t,
+                                        &subalgebra.profile,
+                                        Arc::clone(&m),
+                                    );
+                                }
+                                m
+                            }
+                        };
+                        // `NASSAU_SHIFT_VERIFY=1`: the probe validated a FRESHLY built shifted matrix;
+                        // this checks the CACHED one actually delivered to the solver, which is the
+                        // only difference between the validated claim and this code path.
+                        if std::env::var("NASSAU_SHIFT_VERIFY").as_deref() == Ok("1") {
+                            // Content, not shape: does the shifted matrix agree with this signature's
+                            // own, masked? This is the probe's check applied to what actually reaches
+                            // the solver. `full_reuse` is still populated, so `full_matrix` here is
+                            // the independently-built truth.
+                            let truth = match &full_reuse {
+                                Some(full) => PartialMatrix::Gather {
+                                    full,
+                                    rows: &target_mask,
+                                },
+                                None => PartialMatrix::Owned(restricted_partial_matrix_maybe_gpu(
+                                    &self.differentials[b.s() - 1],
+                                    b.t(),
+                                    &target_mask,
+                                    next_dim,
+                                )),
+                            };
+                            let mut a = FpVector::new(p, next_mask.len());
+                            let mut c = FpVector::new(p, zs_next.len());
+                            for i in 0..target_mask.len().min(m.rows()) {
+                                a.set_to_zero();
+                                c.set_to_zero();
+                                a.as_slice_mut().add_masked(truth.row(i), 1, &next_mask);
+                                if masked_cols_enabled() {
+                                    c.as_slice_mut().add(m.row(i).restrict(0, zs_next.len()), 1);
+                                } else {
+                                    c.as_slice_mut().add_masked(m.row(i), 1, &zs_next);
+                                }
+                                assert_eq!(
+                                    a, c,
+                                    "shift CONTENT row {i} at {b} sig={signature:?} \
+                                     shifted_t={shifted_t}"
                                 );
                             }
-                            if may_publish {
-                                BYTES_SHIFT_PUBLISHED.fetch_add(built_bytes, Ordering::Relaxed);
-                            } else {
-                                N_SHIFT_PRIVATE.fetch_add(1, Ordering::Relaxed);
-                                ROWS_SHIFT_PRIVATE.fetch_add(zs_rows.len(), Ordering::Relaxed);
-                                BYTES_SHIFT_PRIVATE.fetch_add(built_bytes, Ordering::Relaxed);
-                                _private_live = Some(PrivateLive::new(built_bytes));
-                            }
-                            // Prepare is 35% of the frontier walk, but only its CPU part (assemble,
-                            // row_reduce, quasi-inverse) can move onto the idle cores -- this
-                            // multiply is GPU, on a device already at ~1500 waves/SM per launch.
-                            // Time it so the parallel-prepare ceiling is computed from the movable
-                            // share rather than the whole stage.
-                            let build_t0 = std::time::Instant::now();
-                            let m = Arc::new(match &build_mask {
-                                Some(mask) => restricted_partial_matrix_masked_maybe_gpu(
-                                    &self.differentials[b.s() - 1],
-                                    shifted_t,
-                                    &zs_rows,
-                                    cols,
-                                    mask,
-                                ),
-                                None => restricted_partial_matrix_maybe_gpu(
-                                    &self.differentials[b.s() - 1],
-                                    shifted_t,
-                                    &zs_rows,
-                                    cols,
-                                ),
-                            });
-                            sig_sched::PREPARE_GPU_NS
-                                .fetch_add(build_t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
-                            if may_publish {
-                                shift::put(
-                                    b.s() as i32,
-                                    shifted_t,
-                                    &subalgebra.profile,
-                                    Arc::clone(&m),
-                                );
-                            }
-                            m
                         }
-                    };
-                    // `NASSAU_SHIFT_VERIFY=1`: the probe validated a FRESHLY built shifted matrix;
-                    // this checks the CACHED one actually delivered to the solver, which is the
-                    // only difference between the validated claim and this code path.
-                    if std::env::var("NASSAU_SHIFT_VERIFY").as_deref() == Ok("1") {
-                        // Content, not shape: does the shifted matrix agree with this signature's
-                        // own, masked? This is the probe's check applied to what actually reaches
-                        // the solver. `full_reuse` is still populated, so `full_matrix` here is
-                        // the independently-built truth.
-                        let truth = match &full_reuse {
-                            Some(full) => PartialMatrix::Gather {
-                                full,
-                                rows: &target_mask,
-                            },
-                            None => PartialMatrix::Owned(restricted_partial_matrix_maybe_gpu(
+                        // A consumer whose `next_bound` is narrower than the builder's reads a prefix,
+                        // never past the end. Assert it rather than trusting the prefix argument.
+                        debug_assert!(
+                            !masked_cols_enabled() || zs_next.len() <= m.columns(),
+                            "shift mask {} exceeds cached masked width {} at {b} \
+                             sig={signature:?} shifted_t={shifted_t}",
+                            zs_next.len(),
+                            m.columns()
+                        );
+                        let pre_masked = masked_cols_enabled();
+                        shifted = Some((m, zs_next, pre_masked, shifted_t));
+                    }
+                }
+
+                let full_matrix = tracing::trace_span!("sig_select", rows = target_mask.len())
+                    .in_scope(|| {
+                        // Under shift reuse the solver comes from the cache and the lift builds its
+                        // rows on demand, so nothing wants this matrix -- do not spend a multiply on
+                        // it. An empty placeholder keeps the binding's type without allocating.
+                        if shift_skip_full && shifted.is_some() {
+                            return PartialMatrix::Owned(Matrix::new(p, 0, 0));
+                        }
+                        match &full_reuse {
+                            Some(full) => {
+                                debug_assert!(target_mask.iter().all(|&r| r < full.rows()));
+                                PartialMatrix::Gather {
+                                    full,
+                                    rows: &target_mask,
+                                }
+                            }
+                            // Above `reuse_within_cap` there is no full matrix to slice, so this is where
+                            // signature-axis speculation is collected.
+                            None if blocks::enabled() => PartialMatrix::Owned(
+                                self.assemble_signature(b, sig_idx, &target_mask, next_dim),
+                            ),
+                            // Narrowing applied through the shared constructor, so this site and the
+                            // on-demand one cannot diverge. Live exactly when shift reuse is off.
+                            None => PartialMatrix::build_rows(
                                 &self.differentials[b.s() - 1],
                                 b.t(),
                                 &target_mask,
                                 next_dim,
-                            )),
-                        };
-                        let mut a = FpVector::new(p, next_mask.len());
-                        let mut c = FpVector::new(p, zs_next.len());
-                        for i in 0..target_mask.len().min(m.rows()) {
-                            a.set_to_zero();
-                            c.set_to_zero();
-                            a.as_slice_mut().add_masked(truth.row(i), 1, &next_mask);
-                            if masked_cols_enabled() {
-                                c.as_slice_mut().add(m.row(i).restrict(0, zs_next.len()), 1);
-                            } else {
-                                c.as_slice_mut().add_masked(m.row(i), 1, &zs_next);
-                            }
-                            assert_eq!(
-                                a, c,
-                                "shift CONTENT row {i} at {b} sig={signature:?} \
-                                 shifted_t={shifted_t}"
-                            );
+                                select_reach.map(Vec::as_slice),
+                            ),
                         }
-                    }
-                    // A consumer whose `next_bound` is narrower than the builder's reads a prefix,
-                    // never past the end. Assert it rather than trusting the prefix argument.
-                    debug_assert!(
-                        !masked_cols_enabled() || zs_next.len() <= m.columns(),
-                        "shift mask {} exceeds cached masked width {} at {b} sig={signature:?} \
-                         shifted_t={shifted_t}",
-                        zs_next.len(),
-                        m.columns()
-                    );
-                    let pre_masked = masked_cols_enabled();
-                    shifted = Some((m, zs_next, pre_masked, shifted_t));
-                }
-            }
+                    });
 
-            let full_matrix = tracing::trace_span!("sig_select", rows = target_mask.len())
-                .in_scope(|| {
-                    // Under shift reuse the solver comes from the cache and the lift builds its
-                    // rows on demand, so nothing wants this matrix -- do not spend a multiply on
-                    // it. An empty placeholder keeps the binding's type without allocating.
-                    if shift_skip_full && shifted.is_some() {
-                        return PartialMatrix::Owned(Matrix::new(p, 0, 0));
-                    }
-                    match &full_reuse {
-                        Some(full) => {
-                            debug_assert!(target_mask.iter().all(|&r| r < full.rows()));
-                            PartialMatrix::Gather {
-                                full,
-                                rows: &target_mask,
-                            }
-                        }
-                        // Above `reuse_within_cap` there is no full matrix to slice, so this is where
-                        // signature-axis speculation is collected.
-                        None if blocks::enabled() => PartialMatrix::Owned(self.assemble_signature(
-                            b,
-                            sig_idx,
-                            &target_mask,
-                            next_dim,
-                        )),
-                        // Narrowing applied through the shared constructor, so this site and the
-                        // on-demand one cannot diverge. Live exactly when shift reuse is off.
-                        None => PartialMatrix::build_rows(
+                // The sufficient check: is this signature's masked matrix literally the zero-signature
+                // masked matrix at the shifted degree? The two live over DIFFERENT column spaces
+                // (degree `b.t()` vs `shifted_t`), so they are only comparable after masking — which
+                // is exactly the claim, since both mask down to `next_mask.len()` columns.
+                if shift_probe_matrices() {
+                    let shifted_t = b.t() - MilnorSubalgebra::signature_degree(&signature);
+                    if shifted_t >= 0 {
+                        let zs_target: Vec<usize> = subalgebra
+                            .signature_mask(&algebra, target, shifted_t, &zero_sig, target_bound)
+                            .collect();
+                        let zs_next: Vec<usize> = subalgebra
+                            .signature_mask(&algebra, next, shifted_t, &zero_sig, next_bound)
+                            .collect();
+                        let zs_next_dim =
+                            MilnorSubalgebra::restricted_dimension(next, shifted_t, next_bound);
+                        let zs_full = restricted_partial_matrix_maybe_gpu(
                             &self.differentials[b.s() - 1],
-                            b.t(),
-                            &target_mask,
-                            next_dim,
-                            select_reach.map(Vec::as_slice),
-                        ),
-                    }
-                });
-
-            // The sufficient check: is this signature's masked matrix literally the zero-signature
-            // masked matrix at the shifted degree? The two live over DIFFERENT column spaces
-            // (degree `b.t()` vs `shifted_t`), so they are only comparable after masking — which
-            // is exactly the claim, since both mask down to `next_mask.len()` columns.
-            if shift_probe_matrices() {
-                let shifted_t = b.t() - MilnorSubalgebra::signature_degree(&signature);
-                if shifted_t >= 0 {
-                    let zs_target: Vec<usize> = subalgebra
-                        .signature_mask(&algebra, target, shifted_t, &zero_sig, target_bound)
-                        .collect();
-                    let zs_next: Vec<usize> = subalgebra
-                        .signature_mask(&algebra, next, shifted_t, &zero_sig, next_bound)
-                        .collect();
-                    let zs_next_dim =
-                        MilnorSubalgebra::restricted_dimension(next, shifted_t, next_bound);
-                    let zs_full = restricted_partial_matrix_maybe_gpu(
-                        &self.differentials[b.s() - 1],
-                        shifted_t,
-                        &zs_target,
-                        zs_next_dim,
-                    );
-                    let mut ours = FpVector::new(p, next_mask.len());
-                    let mut theirs = FpVector::new(p, zs_next.len());
-                    let mut same = zs_target.len() == target_mask.len();
-                    if same {
-                        for i in 0..target_mask.len() {
-                            ours.set_to_zero();
-                            theirs.set_to_zero();
-                            ours.as_slice_mut()
-                                .add_masked(full_matrix.row(i), 1, &next_mask);
-                            theirs
-                                .as_slice_mut()
-                                .add_masked(zs_full.row(i), 1, &zs_next);
-                            if ours != theirs {
-                                same = false;
-                                break;
+                            shifted_t,
+                            &zs_target,
+                            zs_next_dim,
+                        );
+                        let mut ours = FpVector::new(p, next_mask.len());
+                        let mut theirs = FpVector::new(p, zs_next.len());
+                        let mut same = zs_target.len() == target_mask.len();
+                        if same {
+                            for i in 0..target_mask.len() {
+                                ours.set_to_zero();
+                                theirs.set_to_zero();
+                                ours.as_slice_mut()
+                                    .add_masked(full_matrix.row(i), 1, &next_mask);
+                                theirs
+                                    .as_slice_mut()
+                                    .add_masked(zs_full.row(i), 1, &zs_next);
+                                if ours != theirs {
+                                    same = false;
+                                    break;
+                                }
                             }
                         }
-                    }
-                    if same {
-                        SHIFT_MAT_MATCH.fetch_add(1, Ordering::Relaxed);
-                    } else {
-                        SHIFT_MAT_MISMATCH.fetch_add(1, Ordering::Relaxed);
+                        if same {
+                            SHIFT_MAT_MATCH.fetch_add(1, Ordering::Relaxed);
+                        } else {
+                            SHIFT_MAT_MISMATCH.fetch_add(1, Ordering::Relaxed);
+                        }
                     }
                 }
-            }
 
-            // On the shift path the reduced result is a pure function of this key, so the
-            // reduction is shared across every signature and every bidegree that lands on the
-            // same shifted degree instead of running once per signature -- see [`sig_solver`].
-            // Gated on `shift_skip_full`, which means `f` is `None`, so `write_qi` -- the only
-            // other consumer of the assembled matrix -- returns immediately without reading it.
-            let solver_key: Option<sig_solver::Key> = match (&shifted, shift_skip_full) {
-                (Some((_, _, true, shifted_t)), true) => Some((
-                    b.s(),
-                    *shifted_t,
-                    subalgebra.profile.to_vec(),
-                    target_mask.len(),
-                    next_mask.len(),
-                )),
-                _ => None,
-            };
-            // `None` exactly when the solver came from the cache; nothing below reads it then.
-            let mut masked_matrix: Option<AugmentedMatrix<2>> = None;
-            let qi: Arc<QuasiInverse> = match solver_key.as_ref().and_then(sig_solver::get) {
-                Some(cached) => cached,
-                None => {
-                    let mut assembled = tracing::trace_span!(
-                        "sig_assemble",
-                        rows = target_mask.len(),
-                        cols = next_mask.len()
-                    )
-                    .in_scope(|| {
-                        let mut m = AugmentedMatrix::new(
-                            p,
-                            target_mask.len(),
-                            [next_mask.len(), target_mask.len()],
-                        );
-                        // Row gather and column mask fused into one pass. `Matrix::add_masked` would need a
-                        // materialised `full_matrix`; going row by row lets the gather stay an indirection.
-                        match &shifted {
-                            // Same matrix, reached from the shared build at the shifted degree — hence its
-                            // own column mask over the shifted degree's column space.
-                            Some((zs, zs_next, pre_masked, _)) => {
-                                for (i, mut l) in m.segment(0, 0).iter_mut().enumerate() {
-                                    if *pre_masked {
-                                        // Already in masked coordinates; this consumer's mask names a
-                                        // prefix of the cached one, so take that many columns.
-                                        l.add(zs.row(i).restrict(0, zs_next.len()), 1);
-                                    } else {
-                                        l.add_masked(zs.row(i), 1, zs_next);
+                // On the shift path the reduced result is a pure function of this key, so the
+                // reduction is shared across every signature and every bidegree that lands on the
+                // same shifted degree instead of running once per signature -- see [`sig_solver`].
+                // Gated on `shift_skip_full`, which means `f` is `None`, so `write_qi` -- the only
+                // other consumer of the assembled matrix -- returns immediately without reading it.
+                let solver_key: Option<sig_solver::Key> = match (&shifted, shift_skip_full) {
+                    (Some((_, _, true, shifted_t)), true) => Some((
+                        b.s(),
+                        *shifted_t,
+                        subalgebra.profile.to_vec(),
+                        target_mask.len(),
+                        next_mask.len(),
+                    )),
+                    _ => None,
+                };
+                // `None` exactly when the solver came from the cache; nothing below reads it then.
+                let mut masked_matrix: Option<AugmentedMatrix<2>> = None;
+                let qi: Arc<QuasiInverse> = match solver_key.as_ref().and_then(sig_solver::get) {
+                    Some(cached) => cached,
+                    None => {
+                        let mut assembled = tracing::trace_span!(
+                            "sig_assemble",
+                            rows = target_mask.len(),
+                            cols = next_mask.len()
+                        )
+                        .in_scope(|| {
+                            let mut m = AugmentedMatrix::new(
+                                p,
+                                target_mask.len(),
+                                [next_mask.len(), target_mask.len()],
+                            );
+                            // Row gather and column mask fused into one pass. `Matrix::add_masked` would need a
+                            // materialised `full_matrix`; going row by row lets the gather stay an indirection.
+                            match &shifted {
+                                // Same matrix, reached from the shared build at the shifted degree — hence its
+                                // own column mask over the shifted degree's column space.
+                                Some((zs, zs_next, pre_masked, _)) => {
+                                    for (i, mut l) in m.segment(0, 0).iter_mut().enumerate() {
+                                        if *pre_masked {
+                                            // Already in masked coordinates; this consumer's mask names a
+                                            // prefix of the cached one, so take that many columns.
+                                            l.add(zs.row(i).restrict(0, zs_next.len()), 1);
+                                        } else {
+                                            l.add_masked(zs.row(i), 1, zs_next);
+                                        }
+                                    }
+                                }
+                                None => {
+                                    // On the narrowed build the matrix is already restricted, so the
+                                    // gather is by position WITHIN it, not by full column index.
+                                    let gather = next_in_reach.as_ref().unwrap_or(&next_mask);
+                                    for (i, mut l) in m.segment(0, 0).iter_mut().enumerate() {
+                                        l.add_masked(full_matrix.row(i), 1, gather);
                                     }
                                 }
                             }
-                            None => {
-                                // On the narrowed build the matrix is already restricted, so the
-                                // gather is by position WITHIN it, not by full column index.
-                                let gather = next_in_reach.as_ref().unwrap_or(&next_mask);
-                                for (i, mut l) in m.segment(0, 0).iter_mut().enumerate() {
-                                    l.add_masked(full_matrix.row(i), 1, gather);
+                            // Per assembly, not per row -- see the note at the zs_assemble site. This one runs
+                            // once per SIGNATURE, and a bidegree at the frontier has ~1000 of them, so the
+                            // total here is what sizes the per-signature copy cost the census was meant to
+                            // report and has been printing as a misleading 0.0GB.
+                            crate::census::add_bytes(
+                                &crate::census::ADD_MASKED_BYTES,
+                                crate::census::matrix_bytes(target_mask.len(), next_mask.len()),
+                            );
+                            crate::census::add_bytes(
+                                &crate::census::AUGMENTED_ALLOC_BYTES,
+                                crate::census::matrix_bytes(
+                                    target_mask.len(),
+                                    next_mask.len() + target_mask.len(),
+                                ),
+                            );
+                            m.segment(1, 1).add_identity();
+                            m
+                        });
+
+                        // The CPU row reduction, once per signature. `gpu_row_reduce` only takes over at
+                        // >= 8192^2, so every one of these is host work.
+                        tracing::trace_span!(
+                            "sig_row_reduce",
+                            rows = target_mask.len(),
+                            cols = next_mask.len()
+                        )
+                        .in_scope(|| assembled.row_reduce());
+
+                        let q = Arc::new(
+                            tracing::trace_span!("sig_quasi_inverse")
+                                .in_scope(|| assembled.compute_quasi_inverse()),
+                        );
+                        if let Some(key) = solver_key.clone() {
+                            sig_solver::put(key, Arc::clone(&q));
+                        }
+                        masked_matrix = Some(assembled);
+                        q
+                    }
+                };
+                let pivots = qi.pivots().unwrap();
+                let preimage = qi.preimage();
+
+                if let Some(snap) = &dx_snapshot {
+                    for (dx, dx0) in dxs.iter().zip(snap) {
+                        for &v in &next_mask {
+                            probe_reads += 1;
+                            if dx.entry(v) != dx0.entry(v) {
+                                probe_perturbed += 1;
+                            }
+                        }
+                    }
+                }
+
+                let mut dag_before: rustc_hash::FxHashMap<u32, u64> =
+                    rustc_hash::FxHashMap::default();
+                if let Some((col_idx, _)) = &dag_state {
+                    for dx in dxs.iter() {
+                        for (p, _) in dx.iter_nonzero() {
+                            if p < col_idx.len() && col_idx[p] != u32::MAX {
+                                *dag_before.entry(col_idx[p]).or_insert(0) ^=
+                                    (p as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+                            }
+                        }
+                    }
+                }
+                let _lift = tracing::trace_span!("sig_lift", gens = xs.len()).entered();
+                let _lift_t = sched_cost.as_ref().map(|_| sig_sched::LiftTimer::new());
+                if shift_skip_full && shifted.is_some() {
+                    // Two passes, because there is no full matrix to read rows from any more.
+                    //
+                    // Sound because generators are INDEPENDENT within a signature: each owns its `x`
+                    // and `dx`, and the only shared state (`pivots`, `preimage`) is read-only. Per
+                    // generator the original is read-then-write on its own `dx`, so hoisting every
+                    // read ahead of every write changes nothing. (The signature LOOP is a forward
+                    // substitution and must stay ordered -- that is a different axis, see above.)
+                    let mut supports: Vec<Vec<usize>> = Vec::with_capacity(xs.len());
+                    for (x, dx) in xs.iter_mut().zip(dxs.iter()) {
+                        scratch.set_scratch_vector_size(target_mask.len());
+                        let mut row = 0;
+                        for (i, &v) in next_mask.iter().enumerate() {
+                            if pivots[i] < 0 {
+                                continue;
+                            }
+                            if dx.entry(v) != 0 {
+                                scratch.as_slice_mut().add(preimage.row(row), 1);
+                            }
+                            row += 1;
+                        }
+                        let mut sup = Vec::new();
+                        for (i, _) in scratch.iter_nonzero() {
+                            x.add_basis_element(target_mask[i], 1);
+                            sup.push(i);
+                        }
+                        supports.push(sup);
+                    }
+                    let mut needed: Vec<usize> = supports.iter().flatten().copied().collect();
+                    needed.sort_unstable();
+                    needed.dedup();
+                    if let Some(c) = census.as_mut() {
+                        c.add_rows_consumed(supports.iter().map(Vec::len).sum());
+                    }
+                    if !needed.is_empty() {
+                        // One multiply for the whole signature's demand, not one per generator.
+                        let basis: Vec<usize> = needed.iter().map(|&i| target_mask[i]).collect();
+                        N_ONDEMAND.fetch_add(1, Ordering::Relaxed);
+                        ROWS_ONDEMAND.fetch_add(basis.len(), Ordering::Relaxed);
+                        BYTES_ONDEMAND.fetch_add(
+                            crate::census::matrix_bytes(basis.len(), next_dim),
+                            Ordering::Relaxed,
+                        );
+                        // THE narrowing site. These are the correction rows on the shift-reuse path,
+                        // and they are built at FULL width although the row is provably zero outside
+                        // `reach(sigma)` -- measured at 20.9% of `next_dim`, a 4.8x cut to both the
+                        // kernel's output width and the readback (readback is ~55% of worker exec).
+                        //
+                        // `dx` stays full width, since later signatures read it at masks that differ
+                        // from this one's, so a narrowed row is scattered back through the mask it was
+                        // built under. Outside that mask the row is zero, so the scatter and the old
+                        // full-width add agree exactly.
+                        let ondemand_t0 = sched_cost.as_ref().map(|_| std::time::Instant::now());
+                        let got = tracing::trace_span!("sig_ondemand", rows = basis.len())
+                            .in_scope(|| {
+                                PartialMatrix::build_rows(
+                                    &self.differentials[b.s() - 1],
+                                    b.t(),
+                                    &basis,
+                                    next_dim,
+                                    reach_mask.as_ref().map(Vec::as_slice),
+                                )
+                            });
+                        // Density sample for the distributed design: is the matrix an edge worker
+                        // returns sparse enough that shipping indices would beat the bit-packed form?
+                        // Sampled every 64th build, since counting nonzeros is O(entries).
+                        if ondemand_t0.is_some()
+                            && sig_sched::OD_SAMPLES.fetch_add(1, Ordering::Relaxed) % 64 == 0
+                        {
+                            let rows = basis.len();
+                            let cols = got.columns();
+                            let ones: u64 = (0..rows)
+                                .map(|r| got.row(r).iter_nonzero().count() as u64)
+                                .sum();
+                            let entries = (rows as u64) * (cols as u64);
+                            sig_sched::OD_BITS.fetch_add(entries, Ordering::Relaxed);
+                            sig_sched::OD_ONES.fetch_add(ones, Ordering::Relaxed);
+                        }
+                        if let Some(t0) = ondemand_t0 {
+                            sig_sched::ONDEMAND_NS
+                                .fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                        }
+                        for (sup, dx) in supports.iter().zip(dxs.iter_mut()) {
+                            for &i in sup {
+                                let k = needed.binary_search(&i).unwrap();
+                                got.add_row_full(dx.as_slice_mut(), k);
+                            }
+                        }
+                    }
+                } else {
+                    for (gi, (x, dx)) in xs.iter_mut().zip(&mut dxs).enumerate() {
+                        scratch.set_scratch_vector_size(target_mask.len());
+                        let mut row = 0;
+                        let mut in_gen = 0u32;
+                        // One bit per generation present among this block's live entries; `k` is small
+                        // (<= 57 even for A(4)) so a u64 mask is enough, and saturating at 63 only ever
+                        // UNDER-counts, which is the safe direction for a cost estimate.
+                        let mut gen_mask = 0u64;
+                        for (i, &v) in next_mask.iter().enumerate() {
+                            if pivots[i] < 0 {
+                                continue;
+                            }
+                            if dx.entry(v) != 0 {
+                                scratch.as_slice_mut().add(preimage.row(row), 1);
+                                if let Some(t) = &gen_tags {
+                                    let g = t[gi][v];
+                                    in_gen = in_gen.max(g);
+                                    gen_mask |= 1u64 << g.min(63);
                                 }
                             }
+                            row += 1;
                         }
-                        // Per assembly, not per row -- see the note at the zs_assemble site. This one runs
-                        // once per SIGNATURE, and a bidegree at the frontier has ~1000 of them, so the
-                        // total here is what sizes the per-signature copy cost the census was meant to
-                        // report and has been printing as a misleading 0.0GB.
-                        crate::census::add_bytes(
-                            &crate::census::ADD_MASKED_BYTES,
-                            crate::census::matrix_bytes(target_mask.len(), next_mask.len()),
-                        );
-                        crate::census::add_bytes(
-                            &crate::census::AUGMENTED_ALLOC_BYTES,
-                            crate::census::matrix_bytes(
-                                target_mask.len(),
-                                next_mask.len() + target_mask.len(),
-                            ),
-                        );
-                        m.segment(1, 1).add_identity();
-                        m
-                    });
+                        if gen_tags.is_some() && gen_mask != 0 {
+                            serial_solves += 1;
+                            jacobi_solves += u64::from(gen_mask.count_ones());
+                            let lvl = in_gen as usize;
+                            if level_pop.len() <= lvl {
+                                level_pop.resize(lvl + 1, 0);
+                            }
+                            level_pop[lvl] += 1;
+                        }
+                        let mut consumed = 0usize;
+                        // Timed under the reach probe: the narrowing is worth 4.8x on THESE adds, so
+                        // their share of wall is what converts that ratio into an end-to-end number.
+                        // Each add is O(next_dim) while the row is provably zero outside `reach(sigma)`.
+                        let corr_t0 = reach_probe.as_ref().map(|_| std::time::Instant::now());
+                        for (i, _) in scratch.iter_nonzero() {
+                            x.add_basis_element(target_mask[i], 1);
+                            full_matrix.add_row_full(dx.as_slice_mut(), i);
+                            if let Some(t) = &mut gen_tags {
+                                for (p, _) in full_matrix.row(i).iter_nonzero() {
+                                    let e = &mut t[gi][p];
+                                    *e = (*e).max(in_gen + 1);
+                                }
+                                max_generation = max_generation.max(in_gen + 1);
+                            }
 
-                    // The CPU row reduction, once per signature. `gpu_row_reduce` only takes over at
-                    // >= 8192^2, so every one of these is host work.
-                    tracing::trace_span!(
-                        "sig_row_reduce",
-                        rows = target_mask.len(),
-                        cols = next_mask.len()
-                    )
-                    .in_scope(|| assembled.row_reduce());
-
-                    let q = Arc::new(
-                        tracing::trace_span!("sig_quasi_inverse")
-                            .in_scope(|| assembled.compute_quasi_inverse()),
-                    );
-                    if let Some(key) = solver_key.clone() {
-                        sig_solver::put(key, Arc::clone(&q));
-                    }
-                    masked_matrix = Some(assembled);
-                    q
-                }
-            };
-            let pivots = qi.pivots().unwrap();
-            let preimage = qi.preimage();
-
-            if let Some(snap) = &dx_snapshot {
-                for (dx, dx0) in dxs.iter().zip(snap) {
-                    for &v in &next_mask {
-                        probe_reads += 1;
-                        if dx.entry(v) != dx0.entry(v) {
-                            probe_perturbed += 1;
+                            consumed += 1;
+                        }
+                        if let Some(t0) = corr_t0 {
+                            sig_sched::CORRECT_NS
+                                .fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                            sig_sched::CORRECT_ROWS.fetch_add(consumed as u64, Ordering::Relaxed);
+                        }
+                        if let Some(c) = census.as_mut() {
+                            c.add_rows_consumed(consumed);
                         }
                     }
                 }
-            }
-
-            let mut dag_before: rustc_hash::FxHashMap<u32, u64> =
-                rustc_hash::FxHashMap::default();
-            if let Some((col_idx, _)) = &dag_state {
-                for dx in dxs.iter() {
-                    for (p, _) in dx.iter_nonzero() {
-                        if p < col_idx.len() && col_idx[p] != u32::MAX {
-                            *dag_before.entry(col_idx[p]).or_insert(0) ^= (p as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-                        }
-                    }
-                }
-            }
-            let _lift = tracing::trace_span!("sig_lift", gens = xs.len()).entered();
-            let _lift_t = sched_cost.as_ref().map(|_| sig_sched::LiftTimer::new());
-            if shift_skip_full && shifted.is_some() {
-                // Two passes, because there is no full matrix to read rows from any more.
-                //
-                // Sound because generators are INDEPENDENT within a signature: each owns its `x`
-                // and `dx`, and the only shared state (`pivots`, `preimage`) is read-only. Per
-                // generator the original is read-then-write on its own `dx`, so hoisting every
-                // read ahead of every write changes nothing. (The signature LOOP is a forward
-                // substitution and must stay ordered -- that is a different axis, see above.)
-                let mut supports: Vec<Vec<usize>> = Vec::with_capacity(xs.len());
-                for (x, dx) in xs.iter_mut().zip(dxs.iter()) {
-                    scratch.set_scratch_vector_size(target_mask.len());
-                    let mut row = 0;
-                    for (i, &v) in next_mask.iter().enumerate() {
-                        if pivots[i] < 0 {
-                            continue;
-                        }
-                        if dx.entry(v) != 0 {
-                            scratch.as_slice_mut().add(preimage.row(row), 1);
-                        }
-                        row += 1;
-                    }
-                    let mut sup = Vec::new();
-                    for (i, _) in scratch.iter_nonzero() {
-                        x.add_basis_element(target_mask[i], 1);
-                        sup.push(i);
-                    }
-                    supports.push(sup);
-                }
-                let mut needed: Vec<usize> = supports.iter().flatten().copied().collect();
-                needed.sort_unstable();
-                needed.dedup();
-                if let Some(c) = census.as_mut() {
-                    c.add_rows_consumed(supports.iter().map(Vec::len).sum());
-                }
-                if !needed.is_empty() {
-                    // One multiply for the whole signature's demand, not one per generator.
-                    let basis: Vec<usize> = needed.iter().map(|&i| target_mask[i]).collect();
-                    N_ONDEMAND.fetch_add(1, Ordering::Relaxed);
-                    ROWS_ONDEMAND.fetch_add(basis.len(), Ordering::Relaxed);
-                    BYTES_ONDEMAND.fetch_add(
-                        crate::census::matrix_bytes(basis.len(), next_dim),
-                        Ordering::Relaxed,
-                    );
-                    // THE narrowing site. These are the correction rows on the shift-reuse path,
-                    // and they are built at FULL width although the row is provably zero outside
-                    // `reach(sigma)` -- measured at 20.9% of `next_dim`, a 4.8x cut to both the
-                    // kernel's output width and the readback (readback is ~55% of worker exec).
-                    //
-                    // `dx` stays full width, since later signatures read it at masks that differ
-                    // from this one's, so a narrowed row is scattered back through the mask it was
-                    // built under. Outside that mask the row is zero, so the scatter and the old
-                    // full-width add agree exactly.
-                    let ondemand_t0 = sched_cost.as_ref().map(|_| std::time::Instant::now());
-                    let got =
-                        tracing::trace_span!("sig_ondemand", rows = basis.len()).in_scope(|| {
-                            PartialMatrix::build_rows(
-                                &self.differentials[b.s() - 1],
-                                b.t(),
-                                &basis,
-                                next_dim,
-                                reach_mask.as_ref().map(Vec::as_slice),
-                            )
-                        });
-                    // Density sample for the distributed design: is the matrix an edge worker
-                    // returns sparse enough that shipping indices would beat the bit-packed form?
-                    // Sampled every 64th build, since counting nonzeros is O(entries).
-                    if ondemand_t0.is_some()
-                        && sig_sched::OD_SAMPLES.fetch_add(1, Ordering::Relaxed) % 64 == 0
-                    {
-                        let rows = basis.len();
-                        let cols = got.columns();
-                        let ones: u64 = (0..rows)
-                            .map(|r| got.row(r).iter_nonzero().count() as u64)
-                            .sum();
-                        let entries = (rows as u64) * (cols as u64);
-                        sig_sched::OD_BITS.fetch_add(entries, Ordering::Relaxed);
-                        sig_sched::OD_ONES.fetch_add(ones, Ordering::Relaxed);
-                    }
-                    if let Some(t0) = ondemand_t0 {
-                        sig_sched::ONDEMAND_NS
-                            .fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
-                    }
-                    for (sup, dx) in supports.iter().zip(dxs.iter_mut()) {
-                        for &i in sup {
-                            let k = needed.binary_search(&i).unwrap();
-                            got.add_row_full(dx.as_slice_mut(), k);
-                        }
-                    }
-                }
-            } else {
-                for (gi, (x, dx)) in xs.iter_mut().zip(&mut dxs).enumerate() {
-                    scratch.set_scratch_vector_size(target_mask.len());
-                    let mut row = 0;
-                    let mut in_gen = 0u32;
-                    // One bit per generation present among this block's live entries; `k` is small
-                    // (<= 57 even for A(4)) so a u64 mask is enough, and saturating at 63 only ever
-                    // UNDER-counts, which is the safe direction for a cost estimate.
-                    let mut gen_mask = 0u64;
-                    for (i, &v) in next_mask.iter().enumerate() {
-                        if pivots[i] < 0 {
-                            continue;
-                        }
-                        if dx.entry(v) != 0 {
-                            scratch.as_slice_mut().add(preimage.row(row), 1);
-                            if let Some(t) = &gen_tags {
-                                let g = t[gi][v];
-                                in_gen = in_gen.max(g);
-                                gen_mask |= 1u64 << g.min(63);
+                // DAG: bucket-checksum AFTER the corrections; compare against the snapshot taken
+                // before them. A moved bucket is a net change, i.e. a real edge.
+                if let Some((col_idx, idx)) = &dag_state {
+                    let mut after: rustc_hash::FxHashMap<u32, u64> =
+                        rustc_hash::FxHashMap::default();
+                    for dx in dxs.iter() {
+                        for (p, _) in dx.iter_nonzero() {
+                            if p < col_idx.len() && col_idx[p] != u32::MAX {
+                                *after.entry(col_idx[p]).or_insert(0) ^=
+                                    (p as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
                             }
                         }
-                        row += 1;
                     }
-                    if gen_tags.is_some() && gen_mask != 0 {
-                        serial_solves += 1;
-                        jacobi_solves += u64::from(gen_mask.count_ones());
-                        let lvl = in_gen as usize;
-                        if level_pop.len() <= lvl {
-                            level_pop.resize(lvl + 1, 0);
+                    let me = idx.get(&signature).copied().unwrap_or(u32::MAX);
+                    for (&t, &v) in after.iter() {
+                        if dag_before.get(&t).copied().unwrap_or(0) != v {
+                            dag_edges.push((me, t));
                         }
-                        level_pop[lvl] += 1;
                     }
-                    let mut consumed = 0usize;
-                    // Timed under the reach probe: the narrowing is worth 4.8x on THESE adds, so
-                    // their share of wall is what converts that ratio into an end-to-end number.
-                    // Each add is O(next_dim) while the row is provably zero outside `reach(sigma)`.
-                    let corr_t0 = reach_probe.as_ref().map(|_| std::time::Instant::now());
-                    for (i, _) in scratch.iter_nonzero() {
-                        x.add_basis_element(target_mask[i], 1);
-                        full_matrix.add_row_full(dx.as_slice_mut(), i);
-                        if let Some(t) = &mut gen_tags {
-                            for (p, _) in full_matrix.row(i).iter_nonzero() {
-                                let e = &mut t[gi][p];
-                                *e = (*e).max(in_gen + 1);
+                    for (&t, &v) in dag_before.iter() {
+                        if v != 0 && !after.contains_key(&t) {
+                            dag_edges.push((me, t));
+                        }
+                    }
+                }
+                // RESIDUAL INVARIANT: with sigma processed, nothing at sigma or earlier may still
+                // be live. `lex` is the order the walk actually uses (so a violation there would be a
+                // correctness bug in the existing algorithm); `comp` is the stronger componentwise
+                // order a rank-ordered restructure would need.
+                if let Some(cs) = &col_sig {
+                    let sf: Vec<u32> = signature.iter().map(|&e| u32::from(e as u16)).collect();
+                    for dx in dxs.iter() {
+                        for (p, _) in dx.iter_nonzero() {
+                            if p >= cs.len() {
+                                continue;
                             }
-                            max_generation = max_generation.max(in_gen + 1);
-                        }
-
-                        consumed += 1;
-                    }
-                    if let Some(t0) = corr_t0 {
-                        sig_sched::CORRECT_NS
-                            .fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
-                        sig_sched::CORRECT_ROWS
-                            .fetch_add(consumed as u64, Ordering::Relaxed);
-                    }
-                    if let Some(c) = census.as_mut() {
-                        c.add_rows_consumed(consumed);
-                    }
-                }
-            }
-            // DAG: bucket-checksum AFTER the corrections; compare against the snapshot taken
-            // before them. A moved bucket is a net change, i.e. a real edge.
-            if let Some((col_idx, idx)) = &dag_state {
-                let mut after: rustc_hash::FxHashMap<u32, u64> = rustc_hash::FxHashMap::default();
-                for dx in dxs.iter() {
-                    for (p, _) in dx.iter_nonzero() {
-                        if p < col_idx.len() && col_idx[p] != u32::MAX {
-                            *after.entry(col_idx[p]).or_insert(0) ^= (p as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-                        }
-                    }
-                }
-                let me = idx.get(&signature).copied().unwrap_or(u32::MAX);
-                for (&t, &v) in after.iter() {
-                    if dag_before.get(&t).copied().unwrap_or(0) != v {
-                        dag_edges.push((me, t));
-                    }
-                }
-                for (&t, &v) in dag_before.iter() {
-                    if v != 0 && !after.contains_key(&t) {
-                        dag_edges.push((me, t));
-                    }
-                }
-            }
-            // RESIDUAL INVARIANT: with sigma processed, nothing at sigma or earlier may still
-            // be live. `lex` is the order the walk actually uses (so a violation there would be a
-            // correctness bug in the existing algorithm); `comp` is the stronger componentwise
-            // order a rank-ordered restructure would need.
-            if let Some(cs) = &col_sig {
-                let sf: Vec<u32> = signature.iter().map(|&e| u32::from(e as u16)).collect();
-                for dx in dxs.iter() {
-                    for (p, _) in dx.iter_nonzero() {
-                        if p >= cs.len() {
-                            continue;
-                        }
-                        let tf = subalgebra.signature_fields(cs[p]);
-                        checks += 1;
-                        // lex, index 0 least significant: scan from the top down
-                        let mut later = false;
-                        for j in (0..tf.len().min(sf.len())).rev() {
-                            if tf[j] != sf[j] {
-                                later = tf[j] > sf[j];
-                                break;
+                            let tf = subalgebra.signature_fields(cs[p]);
+                            checks += 1;
+                            // lex, index 0 least significant: scan from the top down
+                            let mut later = false;
+                            for j in (0..tf.len().min(sf.len())).rev() {
+                                if tf[j] != sf[j] {
+                                    later = tf[j] > sf[j];
+                                    break;
+                                }
+                            }
+                            if !later {
+                                viol_lex += 1;
+                            }
+                            if !tf.iter().zip(&sf).all(|(a, b2)| a >= b2) || tf == sf {
+                                viol_comp += 1;
                             }
                         }
-                        if !later {
-                            viol_lex += 1;
-                        }
-                        if !tf.iter().zip(&sf).all(|(a, b2)| a >= b2) || tf == sf {
-                            viol_comp += 1;
-                        }
                     }
                 }
+                drop(_lift);
+                tracing::trace_span!("sig_write_qi").in_scope(|| match &masked_matrix {
+                    Some(assembled) => Self::write_qi(
+                        &mut f,
+                        &mut scratch,
+                        &signature,
+                        &next_mask,
+                        &full_matrix,
+                        assembled,
+                    ),
+                    // Only `None` when the solver came from the cache, which requires
+                    // `shift_skip_full` and hence `f.is_none()` -- `write_qi` returns immediately.
+                    None => Ok(()),
+                })?;
             }
-            drop(_lift);
-            tracing::trace_span!("sig_write_qi").in_scope(|| match &masked_matrix {
-                Some(assembled) => Self::write_qi(
-                    &mut f,
-                    &mut scratch,
-                    &signature,
-                    &next_mask,
-                    &full_matrix,
-                    assembled,
-                ),
-                // Only `None` when the solver came from the cache, which requires
-                // `shift_skip_full` and hence `f.is_none()` -- `write_qi` returns immediately.
-                None => Ok(()),
-            })?;
-        }
         }
         if sched_cost.is_some() {
             // `subalgebra_dim = 2^sum(profile)`, the same key the census column uses, and it names
@@ -5505,9 +5536,9 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
         if gen_tags.is_some() {
             eprintln!(
                 "[sig-gen] b={b} k={max_generation} signatures={} profile={:?} \
-                 serial_solves={serial_solves} jacobi_solves={jacobi_solves} \
-                 checks={checks} viol_comp={viol_comp} viol_deg={viol_deg} viol_lex={viol_lex} \
-                 levels={} width={} level_pop={:?}",
+                 serial_solves={serial_solves} jacobi_solves={jacobi_solves} checks={checks} \
+                 viol_comp={viol_comp} viol_deg={viol_deg} viol_lex={viol_lex} levels={} width={} \
+                 level_pop={:?}",
                 subalgebra.count_signatures(b.t()),
                 subalgebra.profile,
                 level_pop.len(),
@@ -5557,8 +5588,7 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                 let c = it.next().and_then(|c| c.trim().parse().ok()).unwrap_or(1);
                 Some((n, s, c))
             });
-            static FIRED: std::sync::atomic::AtomicUsize =
-                std::sync::atomic::AtomicUsize::new(0);
+            static FIRED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
             if let Some((n, s, count)) = *INJECT
                 && b.t() - b.s() == n
                 && b.s() == s
@@ -5568,7 +5598,12 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                 // path: classification -> `is_retryable` -> retry. A bare `panic!` would be
                 // classified `Other` by `StepFailure::from_panic` -- correctly, since an
                 // unrecognised panic must not be retried -- and would kill the run instead.
-                return Err(StepFailure::NotACycle { b, nonzero: 1, gens: dxs.len() }.into());
+                return Err(StepFailure::NotACycle {
+                    b,
+                    nonzero: 1,
+                    gens: dxs.len(),
+                }
+                .into());
             }
         }
 
@@ -5590,7 +5625,12 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
             // Was `assert!`. A panic carried no information across the unwind boundary, so the
             // scheduler could not tell corrupted mathematics from a dead context and had to treat
             // every failure the same way.
-            return Err(StepFailure::NotACycle { b, nonzero, gens: dxs.len() }.into());
+            return Err(StepFailure::NotACycle {
+                b,
+                nonzero,
+                gens: dxs.len(),
+            }
+            .into());
         }
 
         // NOT registered here. `add_generators` appends to `modules[b.s()]` in increasing degree,
@@ -5640,7 +5680,8 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
         } = pending;
 
         self.add_generators(b, num_new_gens);
-        self.differential(b.s()).add_generators_from_rows(b.t(), rows);
+        self.differential(b.s())
+            .add_generators_from_rows(b.t(), rows);
 
         if write_save {
             self.write_differential(b, num_new_gens, target_dim)?;
@@ -5969,8 +6010,8 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
             let last = attempt == MAX_ATTEMPTS && !no_cpu_verify();
             if last {
                 eprintln!(
-                    "[nassau] {b}: final attempt with the multiply on the CPU -- if this succeeds, \
-                     the earlier failures were GPU corruption"
+                    "[nassau] {b}: final attempt with the multiply on the CPU -- if this \
+                     succeeds, the earlier failures were GPU corruption"
                 );
             }
             let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -6000,23 +6041,17 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
             }
             if let Some(d) = failure.backoff() {
                 eprintln!(
-                    "[nassau] {failure} -- attempt {attempt}/{MAX_ATTEMPTS}, \
-                     waiting {d:?} for the card to drain"
+                    "[nassau] {failure} -- attempt {attempt}/{MAX_ATTEMPTS}, waiting {d:?} for \
+                     the card to drain"
                 );
                 std::thread::sleep(d);
             } else {
-                eprintln!(
-                    "[nassau] {failure} -- attempt {attempt}/{MAX_ATTEMPTS}, \
-                     retrying"
-                );
+                eprintln!("[nassau] {failure} -- attempt {attempt}/{MAX_ATTEMPTS}, retrying");
             }
         }
     }
 
-    fn step_resolution(
-        &self,
-        b: Bidegree,
-    ) -> Result<Option<PendingRegistration>, StepFailure> {
+    fn step_resolution(&self, b: Bidegree) -> Result<Option<PendingRegistration>, StepFailure> {
         // One guard for the whole bidegree, rather than one per inner parallel section.
         //
         // This is correct by construction rather than by audit. A `step_resolution` job can only be
@@ -6372,7 +6407,13 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                         }
                     };
 
-                    if let Some(SenderData { b, retry, pending, sender }) = event {
+                    if let Some(SenderData {
+                        b,
+                        retry,
+                        pending,
+                        sender,
+                    }) = event
+                    {
                         if retry {
                             // Park until a worker frees; retried below on a completion or timeout.
                             deferred.push((b, sender));
@@ -6433,11 +6474,11 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                                 let rss = proc_rss_bytes();
                                 eprintln!(
                                     "[MEM] commits={commit_count} last_b=({},{}) RSS={:.1}GB \
-                                     HOST[diff={:.1} \
-                                     mod={:.1} res_master={:.1} res_basis={:.1}]GB \
-                                     DEV[master={:.1} basis={:.1} cubecl_use={:.1} \
-                                     cubecl_reserved={:.1}]GB COPIED[add_masked={:.1} \
-                                     augmented={:.1}]GB MASKED_SAVED={:.1}GB",
+                                     HOST[diff={:.1} mod={:.1} res_master={:.1} \
+                                     res_basis={:.1}]GB DEV[master={:.1} basis={:.1} \
+                                     cubecl_use={:.1} cubecl_reserved={:.1}]GB \
+                                     COPIED[add_masked={:.1} augmented={:.1}]GB \
+                                     MASKED_SAVED={:.1}GB",
                                     b.n(),
                                     b.s(),
                                     gbu(rss),
@@ -6661,11 +6702,19 @@ mod depgraph {
 
     impl Node {
         pub fn compute(b: Bidegree) -> Self {
-            Self { phase: Phase::Compute, s: b.s(), t: b.t() }
+            Self {
+                phase: Phase::Compute,
+                s: b.s(),
+                t: b.t(),
+            }
         }
 
         pub fn register(b: Bidegree) -> Self {
-            Self { phase: Phase::Register, s: b.s(), t: b.t() }
+            Self {
+                phase: Phase::Register,
+                s: b.s(),
+                t: b.t(),
+            }
         }
 
         pub fn bidegree(&self) -> Bidegree {

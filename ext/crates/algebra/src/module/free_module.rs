@@ -1,12 +1,10 @@
-use std::sync::Arc;
+use std::sync::{
+    Arc, LazyLock,
+    atomic::{AtomicUsize, Ordering},
+};
 
 use fp::vector::{FpSlice, FpSliceMut};
 use once::{OnceBiVec, OnceVec};
-
-use std::sync::{
-    LazyLock,
-    atomic::{AtomicUsize, Ordering},
-};
 
 use crate::{
     algebra::MuAlgebra,
@@ -478,7 +476,8 @@ impl<const U: bool, A: MuAlgebra<U>> MuFreeModule<U, A> {
             if verify_opgen() {
                 assert_eq!(
                     out, self.verify_opgen[degree][index],
-                    "memoised opgen disagrees with the stored table at degree {degree} index {index}"
+                    "memoised opgen disagrees with the stored table at degree {degree} index \
+                     {index}"
                 );
             }
             return out;

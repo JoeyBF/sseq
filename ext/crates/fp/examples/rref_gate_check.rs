@@ -47,13 +47,13 @@ fn main() {
     let shapes: &[(usize, usize, bool)] = &[
         (16, 1_600_000, true),
         (64, 1_600_000, true),
-        (587, 1_524_934, true),   // b=(287,5)
-        (1131, 611_461, true),    // the median rejected reduce
-        (1676, 1_686_395, true),  // b=(266,7)
-        (2877, 1_622_037, true),  // b=(253,10)
-        (2048, 2048, true),       // square, just above the new gate
-        (512, 512, false),        // 0.03 MB: below the gate, stays on CPU
-        (1024, 1024, false),      // 0.125 MB: below 2^22, stays on CPU
+        (587, 1_524_934, true),  // b=(287,5)
+        (1131, 611_461, true),   // the median rejected reduce
+        (1676, 1_686_395, true), // b=(266,7)
+        (2877, 1_622_037, true), // b=(253,10)
+        (2048, 2048, true),      // square, just above the new gate
+        (512, 512, false),       // 0.03 MB: below the gate, stays on CPU
+        (1024, 1024, false),     // 0.125 MB: below 2^22, stays on CPU
     ];
 
     let mut failures = 0;

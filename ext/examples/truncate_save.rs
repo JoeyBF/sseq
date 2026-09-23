@@ -111,7 +111,10 @@ fn main() -> anyhow::Result<()> {
     let mut qi_dirs: BTreeSet<PathBuf> = BTreeSet::new();
     for &b in &doomed {
         for (_, leaf) in QI_GROUPS {
-            let p = dir.join("qi").join(format!("n{}_s{}", b.n(), b.s())).join(leaf);
+            let p = dir
+                .join("qi")
+                .join(format!("n{}_s{}", b.n(), b.s()))
+                .join(leaf);
             if p.is_dir() {
                 qi_dirs.insert(p);
             }

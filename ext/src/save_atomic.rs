@@ -37,8 +37,8 @@ use std::sync::{
 
 use zarrs::storage::{
     AtomicRenameStorageTraits, Bytes, ListableStorageTraits, MaybeBytesIterator,
-    OffsetBytesIterator, ReadableStorageTraits, ReadableWritableListableStorageTraits, StorageError,
-    StoreKey, StoreKeys, StoreKeysPrefixes, StorePrefix, WritableStorageTraits,
+    OffsetBytesIterator, ReadableStorageTraits, ReadableWritableListableStorageTraits,
+    StorageError, StoreKey, StoreKeys, StoreKeysPrefixes, StorePrefix, WritableStorageTraits,
     byte_range::ByteRangeIterator, store_set_partial_many,
 };
 

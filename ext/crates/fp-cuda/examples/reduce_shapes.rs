@@ -70,7 +70,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             (1131, 611_461, "median REJECTED reduce  12.2 Gword-ops"),
             (1676, 1_686_395, "b=(266,7)  0.63 core-h  aspect 1006x"),
             (2877, 1_622_037, "b=(253,10) 0.66 core-h  556 MB"),
-            (3055, 1_770_153, "b=(262,8)  0.69 core-h  645 MB, 258 Gword-ops"),
+            (
+                3055,
+                1_770_153,
+                "b=(262,8)  0.69 core-h  645 MB, 258 Gword-ops",
+            ),
         ]
     } else {
         args.iter()
@@ -84,8 +88,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let gpu = GpuContext::new(0)?;
     println!("=== device vs CPU blas3 reduction, half-rank, REAL shapes ===");
     println!(
-        "  gate today is min(rows,cols) >= 8192; CPU baseline is blas3, so a device win here is a\n  \
-         LOWER bound on the win over production's single-threaded M4RI fallback.\n"
+        "  gate today is min(rows,cols) >= 8192; CPU baseline is blas3, so a device win here is \
+         a\n  LOWER bound on the win over production's single-threaded M4RI fallback.\n"
     );
     println!(
         "  {:>6} {:>10} {:>8} {:>8} {:>10} {:>10} {:>9} {:>7}  {}",
@@ -115,8 +119,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let ok = r == cpu_rank;
 
         println!(
-            "  {rows:>6} {cols:>10} {aspect:>7.0}x {mb:>8.1} {dev:>9.3}s {cpu_s:>9.3}s \
-             {:>8.2}x {gated:>7}  {label}{}",
+            "  {rows:>6} {cols:>10} {aspect:>7.0}x {mb:>8.1} {dev:>9.3}s {cpu_s:>9.3}s {:>8.2}x \
+             {gated:>7}  {label}{}",
             cpu_s / dev,
             if ok { "" } else { "   *** RANK MISMATCH ***" }
         );
@@ -126,8 +130,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     println!(
-        "\n  Read the `gated?` column against `speedup`: any row marked CPU with a speedup above\n  \
-         1.00x is work the current threshold sends to the slower path."
+        "\n  Read the `gated?` column against `speedup`: any row marked CPU with a speedup \
+         above\n  1.00x is work the current threshold sends to the slower path."
     );
     Ok(())
 }

@@ -403,7 +403,9 @@ fn build_restricted(
                             matrix.row_mut(r0 + bi).add(scratch.as_slice(), 1)
                         }
                         (None, Some(mask)) => {
-                            matrix.row_mut(r0 + bi).add_masked(scratch.as_slice(), 1, mask)
+                            matrix
+                                .row_mut(r0 + bi)
+                                .add_masked(scratch.as_slice(), 1, mask)
                         }
                     }
                 }

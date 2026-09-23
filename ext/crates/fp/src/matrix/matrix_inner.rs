@@ -772,7 +772,8 @@ impl Matrix {
             let (r, c) = (self.rows(), self.columns());
             let bits = (r as u64).saturating_mul(c as u64);
             (p == 2 && bits >= (1 << 20)).then(|| {
-                tracing::info_span!(target: "fp::rr", "cpu_row_reduce", rows = r, cols = c).entered()
+                tracing::info_span!(target: "fp::rr", "cpu_row_reduce", rows = r, cols = c)
+                    .entered()
             })
         };
 

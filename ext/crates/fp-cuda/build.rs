@@ -58,13 +58,13 @@ fn main() {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => panic!(
             "nvcc not found ('{nvcc}': {e}).\nfp-cuda cannot be built without the CUDA Toolkit \
              (12.x+). On the cluster this means the build ran without `module load cuda/12.4`; \
-             `nvcc` lives at /wsu/el7/cuda/12.4/bin/nvcc. Set NVCC to point at it, put it on PATH, \
-             or build without the feature that enables this crate.\nThis used to emit a stub PTX \
-             and continue, which silently disabled GPU row reduction at runtime."
+             `nvcc` lives at /wsu/el7/cuda/12.4/bin/nvcc. Set NVCC to point at it, put it on \
+             PATH, or build without the feature that enables this crate.\nThis used to emit a \
+             stub PTX and continue, which silently disabled GPU row reduction at runtime."
         ),
         // nvcc is present but couldn't be executed (permissions, a broken exec, etc.).
-        Err(e) => panic!(
-            "failed to run nvcc ('{nvcc}': {e}). Set the NVCC env var to a working nvcc."
-        ),
+        Err(e) => {
+            panic!("failed to run nvcc ('{nvcc}': {e}). Set the NVCC env var to a working nvcc.")
+        }
     }
 }
