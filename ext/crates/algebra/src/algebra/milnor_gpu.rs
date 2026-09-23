@@ -11041,6 +11041,131 @@ mod tests {
         );
     }
 
+    /// Phase profile: what a LONG-LIVED worker amortises versus what it pays per work unit.
+    ///
+    /// The distributed design turns on this split. A worker spawned per work unit pays every phase
+    /// below every time; a worker that stays resident pays setup once and only `warm` thereafter.
+    /// This exists because two numbers for "one frontier multiply" disagreed by ~60s -- the replay
+    /// measured 91s wall while live instrumentation reported 30.7s -- and the gap decides whether
+    /// an edge worker is a process per unit or a daemon.
+    ///
+    /// Reps are digested and required to agree: a "warm" run that is fast because it is WRONG is
+    /// the obvious way for this measurement to lie, since `multiply_batch_kernel` XOR-accumulates
+    /// and a dropped pair is silent.
+    ///
+    /// ```text
+    /// NASSAU_REPLAY_PRODUCTS=/path/to/batch NASSAU_REPLAY_REPS=3 \
+    ///   cargo test -p algebra --release --features gpu -- --ignored --nocapture \
+    ///   replay_startup_profile
+    /// ```
+    #[test]
+    #[ignore = "GPU perf profile: needs a CUDA device and a captured batch; run explicitly"]
+    fn replay_startup_profile() {
+        use std::{sync::Arc, time::Instant};
+
+        let Ok(path) = std::env::var("NASSAU_REPLAY_PRODUCTS") else {
+            eprintln!("[startup] NASSAU_REPLAY_PRODUCTS is unset; nothing to replay");
+            return;
+        };
+        let reps: usize = std::env::var("NASSAU_REPLAY_REPS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(3);
+        let t_process = Instant::now();
+
+        // -- phase 1: pull one unit off disk ------------------------------------------------
+        let t0 = Instant::now();
+        let mut files: Vec<String> = if std::path::Path::new(&path).is_dir() {
+            let mut v: Vec<String> = std::fs::read_dir(&path)
+                .expect("cannot read the replay directory")
+                .filter_map(|e| e.ok())
+                .map(|e| e.path().to_string_lossy().into_owned())
+                .filter(|p| p.ends_with(".bin"))
+                .collect();
+            v.sort();
+            v
+        } else {
+            vec![path.clone()]
+        };
+        // Exactly one batch: this profiles PER-UNIT cost, not throughput.
+        files.truncate(1);
+        let bytes: u64 = files
+            .iter()
+            .filter_map(|f| std::fs::metadata(f).ok())
+            .map(|m| m.len())
+            .sum();
+        let batches: Vec<(usize, usize, Option<Arc<[u32]>>, Vec<GpuProduct>)> = files
+            .iter()
+            .map(|f| super::load_captured_batch(f).expect("failed to load a captured batch"))
+            .collect();
+        let load_s = t0.elapsed().as_secs_f64();
+
+        // -- phase 2: Milnor basis and seqno tables -----------------------------------------
+        let t0 = Instant::now();
+        let max_degree = batches
+            .iter()
+            .flat_map(|b| b.3.iter())
+            .map(|p| p.r_degree + p.s_degree)
+            .max()
+            .unwrap_or(0)
+            .max(1);
+        let p2 = fp::prime::ValidPrime::new(2);
+        let algebra = Arc::new(MilnorAlgebra::new(p2, false));
+        algebra.compute_basis(max_degree);
+        algebra.compute_seqno_tables(max_degree);
+        let algebra_s = t0.elapsed().as_secs_f64();
+
+        // -- phase 3: the multiply, cold then warm ------------------------------------------
+        // The FIRST call carries CUDA context creation and cubecl kernel compilation; later calls
+        // do not. The digest is taken OUTSIDE the timer so it cannot inflate the measurement.
+        let (rows, cols, cm, prods) = &batches[0];
+        let mut times: Vec<f64> = Vec::new();
+        let mut digests: Vec<u64> = Vec::new();
+        for _ in 0..reps.max(2) {
+            let t0 = Instant::now();
+            let out =
+                super::multiply_batch_on_gpu_masked(&algebra, *cols, cm.clone(), *rows, prods);
+            let dt = t0.elapsed().as_secs_f64();
+            let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+            for row in out.iter_rows() {
+                for &limb in row {
+                    h ^= limb as u64;
+                    h = h.wrapping_mul(0x0100_0000_01b3);
+                }
+            }
+            times.push(dt);
+            digests.push(h);
+        }
+        assert!(
+            digests.iter().all(|d| *d == digests[0]),
+            "reps disagree, so the warm timings are measuring a DIFFERENT computation: {digests:?}"
+        );
+
+        let cold = times[0];
+        let warm: f64 = times[1..].iter().sum::<f64>() / (times.len() - 1) as f64;
+        let jit = (cold - warm).max(0.0);
+        let per_unit_spawned = load_s + algebra_s + cold;
+        let gb = bytes as f64 / 1e9;
+        eprintln!(
+            "[startup] batch {gb:.2} GB, {} reps, digest={:016x}",
+            times.len(),
+            digests[0]
+        );
+        eprintln!("[startup] load={load_s:.2}s algebra={algebra_s:.2}s");
+        eprintln!("[startup] multiply cold={cold:.2}s warm={warm:.2}s -> context+JIT={jit:.2}s");
+        eprintln!("[startup] per unit, process-per-unit worker = {per_unit_spawned:.2}s");
+        eprintln!("[startup] per unit, resident worker         = {warm:.2}s (+ network receive)");
+        eprintln!(
+            "[startup] staying resident is worth {:.2}x; amortisable setup = {:.2}s",
+            per_unit_spawned / warm.max(1e-9),
+            algebra_s + jit
+        );
+        eprintln!(
+            "[startup] whole process {:.2}s",
+            t_process.elapsed().as_secs_f64()
+        );
+    }
+
     #[test]
     #[ignore = "GPU perf bench: needs a CUDA device and a captured batch; run explicitly"]
     fn replay_bench() {
