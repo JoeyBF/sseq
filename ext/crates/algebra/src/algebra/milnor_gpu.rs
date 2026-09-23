@@ -5124,6 +5124,11 @@ static CAPTURE_MAX_GB: LazyLock<f64> = LazyLock::new(|| {
         .unwrap_or(40.0)
 });
 static CAPTURE_SEEN: AtomicU64 = AtomicU64::new(0);
+static CAPTURE_CALLS: AtomicU64 = AtomicU64::new(0);
+/// Report capture-path entry counts on stderr. Opt-in, because the case it exists for is a
+/// capture that silently produces nothing, where every other signal is absent by construction.
+static CAPTURE_PROBE: LazyLock<bool> =
+    LazyLock::new(|| std::env::var("NASSAU_CAPTURE_PROBE").is_ok_and(|v| v != "0"));
 static CAPTURE_WRITTEN: AtomicU64 = AtomicU64::new(0);
 static CAPTURE_BYTES: AtomicU64 = AtomicU64::new(0);
 
@@ -5138,12 +5143,31 @@ fn capture_batch(
     num_rows: usize,
     products: &[GpuProduct],
 ) {
+    // Count before the path guard, so "never called" and "called but unconfigured" stay
+    // distinguishable. An earlier probe sat after this early return and so printed nothing in
+    // either case, which is what let five wrong explanations survive as long as they did.
+    //
+    // Note for anyone capturing at the frontier: this function is entered roughly ONCE EVERY FEW
+    // MINUTES there, because a single entry fans out into thousands of kernel launches. The
+    // default `NASSAU_CAPTURE_NTH` is calibrated on small stems, where entries are a steady
+    // stream, and is simply unreachable in a frontier run of any practical length. Use 1..3.
+    let calls = CAPTURE_CALLS.fetch_add(1, Ordering::Relaxed) + 1;
+    if *CAPTURE_PROBE && (calls == 1 || calls % 100 == 0) {
+        let set = CAPTURE_PATH.is_some();
+        eprintln!("[capture] entered={calls} path_set={set} rows={num_rows} cols={out_cols}");
+    }
     let Some(path) = CAPTURE_PATH.as_deref() else {
         return;
     };
     // `fetch_add` returns a unique ticket per caller, so exactly one call sees the target. Comparing a
     // separate `load` against `== n` can fire never under ~100 concurrent callers.
     let n = CAPTURE_SEEN.fetch_add(1, Ordering::Relaxed) + 1;
+    if n % 100 == 0 || n == *CAPTURE_NTH {
+        let masked = col_map.is_some();
+        let np = products.len();
+        let nth = *CAPTURE_NTH;
+        eprintln!("[capture] seen={n}/{nth} rows={num_rows} cols={out_cols} mask={masked} p={np}");
+    }
     if n < *CAPTURE_NTH || n >= *CAPTURE_NTH + *CAPTURE_COUNT {
         return;
     }

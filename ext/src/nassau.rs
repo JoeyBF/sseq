@@ -1278,6 +1278,17 @@ mod sig_sched {
     /// could actually move onto the idle cores.
     pub static PREPARE_GPU_NS: AtomicU64 = AtomicU64::new(0);
 
+    /// Density of the matrices an edge worker would have to ship back, sampled.
+    ///
+    /// At the frontier one on-demand multiply returns ~5.66 GB, so the distributed design lives or
+    /// dies on whether that can be shrunk. Bit-packed costs 1 bit per entry; a sparse encoding
+    /// costs about `log2(cols)` ~ 22 bits per NONZERO at these widths. Sparse therefore only wins
+    /// below ~4.5% density -- denser than that and the packed form is already near-optimal, and
+    /// only an entropy coder could do better.
+    pub static OD_BITS: AtomicU64 = AtomicU64::new(0);
+    pub static OD_ONES: AtomicU64 = AtomicU64::new(0);
+    pub static OD_SAMPLES: AtomicU64 = AtomicU64::new(0);
+
     pub struct LiftTimer(std::time::Instant);
 
     impl LiftTimer {
@@ -1410,6 +1421,21 @@ mod sig_sched {
             // meaningless anyway.
             (serial / (serial - movable).max(serial * 0.001)).min(1024.0),
         );
+        let bits = OD_BITS.load(Ordering::Relaxed);
+        if bits > 0 {
+            let ones = OD_ONES.load(Ordering::Relaxed);
+            let density = ones as f64 / bits as f64;
+            // Sparse costs ~ceil(log2(cols)) bits per nonzero against 1 bit per entry packed.
+            let sparse = density * 22.0;
+            let verdict = if sparse < 1.0 {
+                "sparse WINS -- ship indices"
+            } else {
+                "packed wins -- already near-optimal, only entropy coding could help"
+            };
+            let pct = 100.0 * density;
+            eprintln!("[od-density] bits={bits} ones={ones} density={pct:.4}%");
+            eprintln!("[od-density] sparse-vs-packed={sparse:.2}x | {verdict}");
+        }
         super::shift_stats_report();
     }
 
@@ -5302,6 +5328,21 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                                 reach_mask.as_ref().map(Vec::as_slice),
                             )
                         });
+                    // Density sample for the distributed design: is the matrix an edge worker
+                    // returns sparse enough that shipping indices would beat the bit-packed form?
+                    // Sampled every 64th build, since counting nonzeros is O(entries).
+                    if ondemand_t0.is_some()
+                        && sig_sched::OD_SAMPLES.fetch_add(1, Ordering::Relaxed) % 64 == 0
+                    {
+                        let rows = basis.len();
+                        let cols = got.columns();
+                        let ones: u64 = (0..rows)
+                            .map(|r| got.row(r).iter_nonzero().count() as u64)
+                            .sum();
+                        let entries = (rows as u64) * (cols as u64);
+                        sig_sched::OD_BITS.fetch_add(entries, Ordering::Relaxed);
+                        sig_sched::OD_ONES.fetch_add(ones, Ordering::Relaxed);
+                    }
                     if let Some(t0) = ondemand_t0 {
                         sig_sched::ONDEMAND_NS
                             .fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
