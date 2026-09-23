@@ -1316,15 +1316,18 @@ mod sig_sched {
     }
 
     /// Records on DROP, so an iteration that leaves by `continue`, `break` or `?` is still timed.
-    /// The signature walk is single-threaded, which is what lets the sink be a plain `RefCell`.
+    ///
+    /// The sink is a `Mutex`, not a `RefCell`: once a level's signatures are prepared concurrently
+    /// this is written from several threads at once. It is probe-only, so the lock costs nothing
+    /// that matters.
     pub struct Timer<'a> {
         start: std::time::Instant,
         level: u32,
-        sink: &'a std::cell::RefCell<Vec<(u32, f64)>>,
+        sink: &'a Mutex<Vec<(u32, f64)>>,
     }
 
     impl<'a> Timer<'a> {
-        pub fn new(level: u32, sink: &'a std::cell::RefCell<Vec<(u32, f64)>>) -> Self {
+        pub fn new(level: u32, sink: &'a Mutex<Vec<(u32, f64)>>) -> Self {
             Self {
                 start: std::time::Instant::now(),
                 level,
@@ -1336,7 +1339,7 @@ mod sig_sched {
     impl Drop for Timer<'_> {
         fn drop(&mut self) {
             let dt = self.start.elapsed().as_secs_f64();
-            self.sink.borrow_mut().push((self.level, dt));
+            self.sink.lock().unwrap().push((self.level, dt));
             // Also accumulate GLOBALLY and consider reporting on a timer. At the frontier a single
             // bidegree can run for hours (census p90 = 6.8h, max 75h), so anything gated on a
             // completed bidegree emits nothing for most of a day. Signatures finish constantly,
@@ -4630,8 +4633,7 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
         // signature when enabled and nothing at all when not.
         let sched_cost: Option<Vec<Vec<u32>>> = std::env::var_os("NASSAU_PROBE_SIG_SCHED")
             .map(|_| sig_level::cost_table(&subalgebra.profile));
-        let sched_samples: std::cell::RefCell<Vec<(u32, f64)>> =
-            std::cell::RefCell::new(Vec::new());
+        let sched_samples: Mutex<Vec<(u32, f64)>> = Mutex::new(Vec::new());
 
         // `NASSAU_SIG_LEVEL_ORDER=1`: walk the signatures in SCHEDULE-LEVEL order rather than the
         // odometer's index order.
@@ -4649,17 +4651,43 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
         // The dead-tail skip below stays valid too, and is in fact cleaner here: corrections only
         // ever move to strictly higher levels, so once every `dx` is zero the remaining levels are
         // a provable no-op.
-        let sig_walk: Vec<(usize, Vec<PPartEntry>)> = {
+        // Grouped into LEVELS. With the flag off there is exactly one group holding the whole
+        // odometer walk, so the iteration is bit-for-bit what it always was; with it on, each group
+        // is one schedule level and the groups run in order. Signatures WITHIN a group are provably
+        // independent (no dependency edge stays inside a level), which is what makes a group the
+        // unit a parallel lift can consume.
+        let sig_levels: Vec<Vec<(usize, Vec<PPartEntry>)>> = {
             let mut v: Vec<(usize, Vec<PPartEntry>)> =
                 subalgebra.iter_signatures(b.t()).enumerate().collect();
             if std::env::var_os("NASSAU_SIG_LEVEL_ORDER").is_some() {
                 let c = sig_level::cost_table(&subalgebra.profile);
                 v.sort_by_key(|(idx, sig)| (sig_level::level(&c, sig), *idx));
+                let mut out: Vec<Vec<(usize, Vec<PPartEntry>)>> = Vec::new();
+                let mut cur_level = u32::MAX;
+                for (idx, sig) in v {
+                    let l = sig_level::level(&c, &sig);
+                    if l != cur_level {
+                        out.push(Vec::new());
+                        cur_level = l;
+                    }
+                    out.last_mut().expect("pushed above").push((idx, sig));
+                }
+                out
+            } else {
+                vec![v]
             }
-            v
         };
 
-        for (sig_idx, signature) in sig_walk {
+        'levels: for level in sig_levels {
+            // Convergence is tested BETWEEN levels as well as per signature. Batching a whole level
+            // would otherwise blunt the dead-tail skip (worth 1.33x): once every `dx` is zero the
+            // remaining levels are a provable no-op, because corrections only ever move to strictly
+            // higher levels. Checking here bounds the waste to at most the level in flight, and the
+            // late levels are the small ones.
+            if f.is_none() && dxs.iter().all(|dx| dx.is_zero()) {
+                break 'levels;
+            }
+        for (sig_idx, signature) in level {
             let _guard = tracing::info_span!("step", ?signature).entered();
             // Corrections only ever raise signature, so once every `dx` is zero the whole remaining
             // tail is a provable no-op: the lift below is guarded by `dx.entry(v) != 0`, so it adds
@@ -5414,6 +5442,7 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                 None => Ok(()),
             })?;
         }
+        }
         if sched_cost.is_some() {
             // `subalgebra_dim = 2^sum(profile)`, the same key the census column uses, and it names
             // the profile uniquely along the `SubalgebraIterator` staircase.
@@ -5424,7 +5453,7 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                     .map(|&p| p as u32)
                     .sum::<u32>()
                     .min(63);
-            sig_sched::record(&sched_samples.borrow(), sub_dim);
+            sig_sched::record(&sched_samples.lock().unwrap(), sub_dim);
         }
         if dx_snapshot.is_some() {
             eprintln!(
