@@ -1411,10 +1411,67 @@ fn configure_pools(dev: usize, client: &cubecl::prelude::ComputeClient<CudaRunti
         return;
     }
     use cubecl::config::memory::{MemoryPoolsConfig, MemoryPoolsPreset};
-    let applied = client.configure_memory_pools(&MemoryPoolsConfig::Preset(
-        MemoryPoolsPreset::ExclusivePages,
-    ));
-    eprintln!("[nassau-gpu] device {dev}: ExclusivePages memory pools applied={applied}");
+
+    // `NASSAU_GPU_MAX_ALLOC_MB`: replace the preset with an explicit pool ladder whose largest
+    // pool accepts allocations up to this size.
+    //
+    // The `ExclusivePages` PRESET builds "exponentially spaced size buckets" sized from TOTAL
+    // DEVICE MEMORY, so on a small card the largest bucket is small -- measured between 762 MB and
+    // 915 MB on an 11 GB RTX 2080 Ti. An allocation above it fails with `IoError::BufferTooBig`
+    // ("no pool accepts this size"), which is NOT a driver refusal: plain `cudaMalloc` on that same
+    // card served 1/2/4/8 GiB happily and held 10,496 MiB at once.
+    //
+    // That failure is silent and catastrophic. cubecl swallows it, the dead handle is used anyway
+    // ("Memory location was never initialized"), the output buffer is never written, and the
+    // multiply returns ALL ZEROS at exit 0 -- and fast, because no work happened. The all-zero
+    // digest is computable (FNV-1a over u32 limbs), which is how it was identified.
+    //
+    // Raising the cap makes the segment constraint ONE-sided. Otherwise `MASTER_SEG_ELEMS` is
+    // squeezed from both ends -- too large exceeds the pool cap, too small needs more than
+    // `MASTER_MAX_SEG` segments -- and at full frontier batch size on an 11 GB card that window is
+    // EMPTY (measured: 610/686/762 MB per segment need 23/21/18 segments against a limit of 16,
+    // while 915 MB is refused outright).
+    match max_alloc_bytes() {
+        Some(cap) => {
+            use cubecl::config::{memory::MemoryPoolConfig, size::MemorySize};
+            // A ladder, since the first pool accepting a size serves it: small allocations should
+            // not be handed a huge page. Only the top entry differs from the preset's intent.
+            let ladder = [1u64 << 20, 16 << 20, 256 << 20, cap];
+            let pools: Vec<MemoryPoolConfig> = ladder
+                .iter()
+                .map(|&sz| MemoryPoolConfig::Exclusive {
+                    max_alloc_size: MemorySize(sz.max(1 << 20)),
+                    dealloc_period: None,
+                })
+                .collect();
+            let ok = client.configure_memory_pools(&MemoryPoolsConfig::Explicit(pools));
+            eprintln!(
+                "[nassau-gpu] device {dev}: explicit pools, max_alloc={} MiB, applied={ok}",
+                cap >> 20
+            );
+        }
+        None => {
+            let ok = client.configure_memory_pools(&MemoryPoolsConfig::Preset(
+                MemoryPoolsPreset::ExclusivePages,
+            ));
+            eprintln!("[nassau-gpu] device {dev}: ExclusivePages memory pools applied={ok}");
+        }
+    }
+}
+
+/// Largest allocation the device pools must accept (`NASSAU_GPU_MAX_ALLOC_MB`), in bytes.
+///
+/// Unset keeps cubecl's preset, so H200/L40S behaviour is untouched. Set it on a card whose preset
+/// cap is below our largest buffer -- see [`configure_pools`].
+fn max_alloc_bytes() -> Option<u64> {
+    static V: LazyLock<Option<u64>> = LazyLock::new(|| {
+        std::env::var("NASSAU_GPU_MAX_ALLOC_MB")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|&mb| mb > 0)
+            .map(|mb| mb << 20)
+    });
+    *V
 }
 
 /// Issue the readback on the SUBMITTING thread rather than the GPU worker
