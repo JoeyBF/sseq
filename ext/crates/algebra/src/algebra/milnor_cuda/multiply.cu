@@ -161,6 +161,8 @@ __device__ __forceinline__ void emit_bit(const u32 *__restrict__ g, const u32 *_
 // XOR-accumulated, so a pair evaluated twice CANCELS and a pair dropped silently changes the
 // answer -- which is why the decode order is free to be any permutation of the same (m, t) set,
 // and why the atomics need no ordering between them.
+// `__launch_bounds__` with ONE argument on purpose. The second (minimum blocks per SM) was tried
+// and is a dead end in both directions -- see `THREADS` in params.rs for the sweep.
 extern "C" __global__ __launch_bounds__(THREADS) void multiply_batch(
     // Admissible-matrix master, per distinct R. ONE pointer, not sixteen segments: the cubecl
     // kernel took 48 buffer arguments purely because cubecl could not grow an allocation in place,

@@ -357,7 +357,7 @@ pub fn cuda_multiply_batch(
     products: &[GpuProduct],
     col_map: Option<&[u32]>,
 ) -> Result<BatchOutput> {
-    cuda_multiply_batch_timed(rt, algebra, num_cols, num_rows, products, col_map).map(|(o, _)| o)
+    run(rt, algebra, num_cols, num_rows, products, col_map, false).map(|(o, _)| o)
 }
 
 /// [`cuda_multiply_batch`], also reporting where the time went.
@@ -371,6 +371,27 @@ pub fn cuda_multiply_batch_timed(
     num_rows: usize,
     products: &[GpuProduct],
     col_map: Option<&[u32]>,
+) -> Result<(BatchOutput, LaunchTiming)> {
+    run(rt, algebra, num_cols, num_rows, products, col_map, true)
+}
+
+/// The launch, with phase attribution optional.
+///
+/// `timed` controls the intermediate stream synchronises. They exist ONLY so the phases add up:
+/// everything here runs on one stream and is therefore already ordered, so the sole synchronise
+/// production needs is the one before the readback buffer is handed to the caller. Leaving the
+/// others in would make every production launch pay for instrumentation, and would serialise
+/// upload against the previous block's kernel in a multi-block launch -- the exact overlap row
+/// batching creates the opportunity for.
+#[allow(clippy::too_many_arguments)]
+fn run(
+    rt: &Arc<MilnorCuda>,
+    algebra: &MilnorAlgebra,
+    num_cols: usize,
+    num_rows: usize,
+    products: &[GpuProduct],
+    col_map: Option<&[u32]>,
+    timed: bool,
 ) -> Result<(BatchOutput, LaunchTiming)> {
     use std::time::Instant;
     let mut timing = LaunchTiming::default();
@@ -427,6 +448,23 @@ pub fn cuda_multiply_batch_timed(
     let f = module
         .load_function("multiply_batch")
         .map_err(|e| CudaError::Compile(format!("load multiply_batch: {e:?}")))?;
+    // `NASSAU_CUDA_KERNEL_INFO=1`: registers, local memory and the block ceiling ptxas settled on.
+    //
+    // Worth having rather than inferring. The block-size sweep showed a CLIFF between 128 and 160
+    // threads -- flat at ~64.5e9 pairs/s to 128, ~61 above -- which is the shape of an occupancy
+    // boundary, and the register count is what decides where that boundary sits. Guessing at it is
+    // how effort gets spent shrinking state that was never the limit.
+    if std::env::var_os("NASSAU_CUDA_KERNEL_INFO").is_some() {
+        use cudarc::driver::sys::CUfunction_attribute_enum as A;
+        let get = |a| f.get_attribute(a).unwrap_or(-1);
+        eprintln!(
+            "[kernel] multiply_batch: regs/thread={} local={}B shared={}B max_threads/block={}",
+            get(A::CU_FUNC_ATTRIBUTE_NUM_REGS),
+            get(A::CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES),
+            get(A::CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES),
+            get(A::CU_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK),
+        );
+    }
     let stream = rt.context().default_stream();
 
     macro_rules! up {
@@ -501,10 +539,12 @@ pub fn cuda_multiply_batch_timed(
         let mut d_out = stream
             .alloc_zeros::<u32>(blk_len)
             .map_err(|e| CudaError::Compile(format!("alloc out: {e:?}")))?;
-        stream
-            .synchronize()
-            .map_err(|e| CudaError::Compile(format!("sync after upload: {e:?}")))?;
-        timing.upload += t_upload.elapsed().as_secs_f64();
+        if timed {
+            stream
+                .synchronize()
+                .map_err(|e| CudaError::Compile(format!("sync after upload: {e:?}")))?;
+            timing.upload += t_upload.elapsed().as_secs_f64();
+        }
 
         let t_kernel = Instant::now();
         let num_products = arrays.num_products() as u32;
@@ -552,10 +592,12 @@ pub fn cuda_multiply_batch_timed(
                 .map_err(|e| CudaError::Compile(format!("launch multiply_batch: {e:?}")))?;
             done += n;
         }
-        stream
-            .synchronize()
-            .map_err(|e| CudaError::Compile(format!("sync after kernel: {e:?}")))?;
-        timing.kernel += t_kernel.elapsed().as_secs_f64();
+        if timed {
+            stream
+                .synchronize()
+                .map_err(|e| CudaError::Compile(format!("sync after kernel: {e:?}")))?;
+            timing.kernel += t_kernel.elapsed().as_secs_f64();
+        }
 
         // Land the readback in CACHED page-locked memory and hand that buffer straight to the
         // caller. A device-to-host copy into pageable memory is staged by the driver through its
@@ -570,6 +612,7 @@ pub fn cuda_multiply_batch_timed(
         stream
             .memcpy_dtoh(&d_out, pinned.as_mut_slice())
             .map_err(|e| CudaError::Compile(format!("readback: {e:?}")))?;
+        // ALWAYS: the caller is about to read this buffer.
         stream
             .synchronize()
             .map_err(|e| CudaError::Compile(format!("sync after readback: {e:?}")))?;

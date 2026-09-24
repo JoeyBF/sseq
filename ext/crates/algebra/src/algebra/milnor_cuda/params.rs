@@ -66,6 +66,27 @@ pub const WORKING_CAP: usize = 32;
 /// This is NOT cubecl's 256. That value was tuned for a kernel that loaded a term's digit from
 /// global memory every column; this one holds the whole p-part in a register, so it spends
 /// different resources and lands somewhere else. Retune rather than inherit.
+///
+/// # Occupancy is NOT the lever here, and this is the evidence
+///
+/// The kernel settles at 64 registers per thread with ZERO local memory -- nothing spills. At 128
+/// threads that is 8 blocks/SM, about 50% occupancy. Forcing ptxas to fit more blocks, via the
+/// second `__launch_bounds__` argument, makes it spill, and throughput falls monotonically:
+///
+/// ```text
+///   blocks/SM:   8       9       10      12      16
+///   registers:   64      56      48      40      32
+///   local:       0B      32B     64B     112B    144B
+///   pairs/s:     81.08   80.86   80.06   79.04   65.87  (e9)
+/// ```
+///
+/// And the annotation is not free even when it changes nothing: `__launch_bounds__(128, 8)` leaves
+/// the register count at 64 with no spill and still measures 81.08 against 84.07 for the
+/// single-argument form -- a 3.6% loss purely to different scheduling. So the second argument is
+/// not used at all.
+///
+/// Do not spend effort shrinking per-thread state to buy occupancy. It is available and it costs
+/// more than it returns.
 pub const THREADS: usize = 128;
 
 /// Bit position of each packed p-part digit, from `PPart`'s own layout.
