@@ -51,7 +51,22 @@ pub const COL_SPLIT_32: usize = 3;
 pub const WORKING_CAP: usize = 32;
 
 /// Threads per block.
-pub const THREADS: usize = 256;
+///
+/// MEASURED, on a real stem-170 batch, kernel time only (e9 pairs/s):
+///
+/// ```text
+///   64: 64.72    96: 64.40   128: 64.60   160: 61.21   192: 60.99   256: 61.08   512: 57.75
+/// ```
+///
+/// Flat to 128 and then a cliff -- the shape of a register/occupancy boundary, not a gradual
+/// trade: at or below 128 threads the SM fits another block of this kernel, above it does not.
+/// 64 measured 0.2% higher than 128, which is inside the run-to-run spread, so the larger block is
+/// taken for the smaller grids it produces.
+///
+/// This is NOT cubecl's 256. That value was tuned for a kernel that loaded a term's digit from
+/// global memory every column; this one holds the whole p-part in a register, so it spends
+/// different resources and lands somewhere else. Retune rather than inherit.
+pub const THREADS: usize = 128;
 
 /// Bit position of each packed p-part digit, from `PPart`'s own layout.
 ///
