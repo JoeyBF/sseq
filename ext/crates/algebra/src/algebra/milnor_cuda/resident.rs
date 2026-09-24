@@ -577,10 +577,9 @@ static RESIDENTS: OnceLock<ResidentMap> = OnceLock::new();
 
 /// The process-wide resident state for `rt`'s device, created on first use.
 ///
-/// One mutex per device, held across a whole launch. That is coarse, and deliberately so for now:
-/// correctness first. The cubecl path's finer scheme -- a read lock on the handles, a separate
-/// upload mutex, segment handles cloned per launch so growth never invalidates a live kernel's
-/// view -- is a later commit, made against a digest that is already pinned.
+/// One mutex per device, held only while a launch MUTATES the store and snapshots its pointers --
+/// not across the launch itself. The store is append-only, so pointers taken under the lock stay
+/// valid after it is released; see `run_on_device` in `multiply.rs`.
 pub fn resident(rt: &Arc<MilnorCuda>) -> Result<&'static Mutex<Resident>> {
     let map = RESIDENTS.get_or_init(|| Mutex::new(HashMap::new()));
     let mut guard = map.lock().unwrap();

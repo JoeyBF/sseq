@@ -209,7 +209,17 @@ pub(super) fn marshal(
         a.term_gei
             .extend(prod.term_indices.iter().map(|&ti| base + ti as u32));
         a.prod_r_index.push(ri);
-        a.prod_row_base.push(((prod.row - row0) * num_limbs) as u32);
+        // CHECKED. A product outside its block used to make this subtraction wrap in release, which
+        // wrote its bits into some other row and produced a plausible wrong answer. It is a bug in
+        // the block plan if it ever happens, and it should say so.
+        let local_row = prod.row.checked_sub(row0).ok_or_else(|| {
+            CudaError::Compile(format!(
+                "product for row {} was assigned to a block starting at row {row0}; \
+                 the row-block plan is not a partition",
+                prod.row
+            ))
+        })?;
+        a.prod_row_base.push((local_row * num_limbs) as u32);
         a.prod_out_offset.push(prod.out_offset as u32);
         // TILES, not pairs: a thread covers MATRIX_GROUP x TERM_GROUP of them, so this prefix sum
         // -- and therefore the coarse index built from it -- is over threads. The ragged edge of a
@@ -307,6 +317,9 @@ fn block_bytes() -> usize {
 }
 
 /// Split `products` into contiguous row blocks whose outputs each fit `block_bytes`.
+///
+/// REQUIRES `products` sorted by row -- `run` guarantees it. Unsorted input does not fail here; it
+/// yields blocks that are not a partition, which `marshal` then rejects.
 ///
 /// Returns `(row0, row1, p0, p1)` per block. Rows are INDEPENDENT -- every product writes only its
 /// own row -- so concatenating the blocks' outputs in row order reproduces the single-launch result
@@ -666,6 +679,28 @@ fn run(
         .unwrap_or(0)
         .max(1);
     let max_s_degree = products.iter().map(|p| p.s_degree).max().unwrap_or(0);
+
+    // ROW ORDER IS A PRECONDITION OF THE SPLIT, SO ESTABLISH IT HERE.
+    //
+    // `row_blocks` hands each device a contiguous range of rows plus the contiguous slice of
+    // products belonging to them, which is only a partition if the products are sorted by row.
+    // The resolution does emit them in row order, so this is normally a single O(n) check -- but
+    // it was an unchecked assumption, and it broke the moment multi-device made every launch split:
+    // unsorted products landed in blocks that did not own their row, `prod.row - row0` wrapped, and
+    // the result was WRONG rather than a crash. One device never split, so it never noticed.
+    //
+    // Sorting is sound because the output is XOR-accumulated per row: the order of products
+    // WITHIN a row never mattered, only which row each lands in, which sorting preserves. It must
+    // happen before `plan_rs`, whose `r_index` is positional over this slice.
+    let sorted_storage;
+    let products: &[GpuProduct] = if products.windows(2).all(|w| w[0].row <= w[1].row) {
+        products
+    } else {
+        let mut v = products.to_vec();
+        v.sort_by_key(|p| p.row);
+        sorted_storage = v;
+        &sorted_storage
+    };
 
     // OUTSIDE ANY LOCK, and device-independent: one pass over the products decides both which `R`s
     // to make resident and what the kernel's launch-local `R` index is for each product.

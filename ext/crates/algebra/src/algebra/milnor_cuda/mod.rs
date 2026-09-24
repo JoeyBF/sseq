@@ -453,11 +453,19 @@ impl PinnedPool {
     /// Take a buffer of at least `len` elements, reusing one if it fits.
     pub fn take(self: &Arc<Self>, ctx: &Arc<CudaContext>, len: usize) -> Result<PinnedBuf> {
         let want = len.max(1);
-        if let Some(pos) = {
-            let free = self.free.lock().unwrap();
-            free.iter().position(|&(cap, _)| cap >= want)
-        } {
-            let (cap, ptr) = self.free.lock().unwrap().remove(pos);
+        // FIND AND REMOVE UNDER ONE LOCK. This used to find the position under one acquisition,
+        // release it, and `remove(pos)` under a second -- so another thread could take that same
+        // buffer in between. The first stem-200 resolution on this backend died of exactly that
+        // after 146 s: `removal index (is 0) should be < len (is 0)`, which poisoned the mutex and
+        // took every other device thread down with it. Replays never had enough threads
+        // contending one device's pool to open the window; a real resolution does at once.
+        let reused = {
+            let mut free = self.free.lock().unwrap();
+            free.iter()
+                .position(|&(cap, _)| cap >= want)
+                .map(|pos| free.remove(pos))
+        };
+        if let Some((cap, ptr)) = reused {
             return Ok(PinnedBuf {
                 ptr,
                 len,
@@ -664,17 +672,59 @@ static RUNTIMES: OnceLock<Mutex<HashMap<i32, Arc<MilnorCuda>>>> = OnceLock::new(
 /// The runtime for `device`, opening it on first use.
 pub fn runtime(device: i32) -> Result<Arc<MilnorCuda>> {
     let map = RUNTIMES.get_or_init(|| Mutex::new(HashMap::new()));
-    if let Some(rt) = map.lock().unwrap().get(&device) {
+    // ONE guard across the check and the insert. With two acquisitions, threads opening the same
+    // device at once each built a `MilnorCuda` and the later insert silently replaced the earlier
+    // -- the same check-then-act shape that crashed the pinned pool. Opening a device happens
+    // once per process, so holding the lock through it costs nothing.
+    let mut map = map.lock().unwrap();
+    if let Some(rt) = map.get(&device) {
         return Ok(rt.clone());
     }
     let rt = Arc::new(MilnorCuda::new(device)?);
-    map.lock().unwrap().insert(device, rt.clone());
+    map.insert(device, rt.clone());
     Ok(rt)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Many threads taking and returning buffers from ONE device's pinned pool.
+    ///
+    /// `take` once found a buffer under one lock acquisition and removed it under a second, so two
+    /// threads could claim the same free slot; the loser panicked on an empty vector and poisoned
+    /// the mutex for everyone. Replaying captured batches never had enough threads contending one
+    /// pool to open that window -- the first real stem-200 resolution hit it in 146 s. This test
+    /// opens it on purpose: 16 threads, mixed sizes, a pool bounded at its default of 4.
+    #[test]
+    #[ignore = "needs a CUDA device; run explicitly with --ignored"]
+    fn pinned_pool_survives_contention() {
+        let rt = runtime(0).expect("open device 0");
+        let pool = pinned_pool(rt.device());
+        std::thread::scope(|scope| {
+            for t in 0..16usize {
+                let (pool, rt) = (&pool, &rt);
+                scope.spawn(move || {
+                    for i in 0..500usize {
+                        let len = 1024 * (1 + (t * 7 + i) % 5);
+                        let mut buf = pool.take(rt.context(), len).expect("take");
+                        // Touch both ends, so a buffer handed to two owners at once shows up as a
+                        // mismatch rather than passing silently.
+                        let tag = (t * 1_000_000 + i) as u32;
+                        buf.as_mut_slice()[0] = tag;
+                        buf.as_mut_slice()[len - 1] = tag;
+                        std::thread::yield_now();
+                        assert_eq!(buf.as_mut_slice()[0], tag, "buffer shared between owners");
+                        assert_eq!(
+                            buf.as_mut_slice()[len - 1],
+                            tag,
+                            "buffer shared between owners"
+                        );
+                    }
+                });
+            }
+        });
+    }
 
     /// NVRTC compiles and the module loads and launches. Proves the runtime-compilation path
     /// end-to-end, including that `-D` defines reach the kernel — which is how the cubecl
