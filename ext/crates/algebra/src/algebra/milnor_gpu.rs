@@ -4851,80 +4851,27 @@ pub use crate::algebra::milnor_batch::GpuProduct;
 /// with each product's `out_offset` selecting its block. Every product's
 /// `out_offset + index` must be `< num_cols`. Every `R` must be non-empty; the algebra's
 /// basis and seqno tables must reach each product's output degree (`r_degree + s_degree`).
-/// One batch multiply's result, held as the D2H landing buffers themselves.
+/// A cubecl landing buffer, handed to [`BatchOutput`] without a copy.
 ///
 /// The device write has to land somewhere; everything after that is waste. The original form
 /// allocated a fresh `Vec` per row and copied the whole output into freshly-mapped pages right
-/// after the device had written it — ~32 M allocations over a stem-200 resolution. The measured
+/// after the device had written it -- ~32 M allocations over a stem-200 resolution. The measured
 /// best-case launch cost scaled linearly with output bytes at only 2.1-5.0 GB/s (256 MiB in
 /// 130 ms), far under PCIe 5.0 x16, with the GPU idle throughout.
 ///
-/// So this keeps cubecl's [`Bytes`] (which may already be pinned — see `AllocationProperty`) and
-/// hands out row slices as views. One block per bounded launch, in row order; the owned
-/// constructor covers the eviction merge and the CPU oracle, which must accumulate.
-pub struct BatchOutput {
-    /// One landing buffer per row-block, in row order.
-    blocks: Vec<Bytes>,
-    num_limbs: usize,
-}
-
-impl BatchOutput {
-    /// Wrap the per-block landing buffers (zero copy).
-    fn from_blocks(blocks: Vec<Bytes>, num_limbs: usize) -> Self {
-        Self { blocks, num_limbs }
-    }
-
-    /// Wrap owned row-major limbs (eviction merge, CPU oracle).
-    pub fn from_limbs(limbs: Vec<u32>, num_limbs: usize) -> Self {
-        Self {
-            blocks: vec![Bytes::from_elems(limbs)],
-            num_limbs,
-        }
-    }
-
-    /// Build from per-row limb vectors (test/reference helper).
-    pub fn from_rows(rows: &[Vec<u32>], num_limbs: usize) -> Self {
-        Self::from_limbs(rows.concat(), num_limbs)
-    }
-
-    /// Limbs per row.
-    pub fn num_limbs(&self) -> usize {
-        self.num_limbs
-    }
-
-    /// Number of rows across all blocks.
-    pub fn rows(&self) -> usize {
-        if self.num_limbs == 0 {
-            return 0;
-        }
-        self.blocks.iter().map(|b| b.len() / 4).sum::<usize>() / self.num_limbs
-    }
-
-    /// Row limb-slices in row order, as views into the landing buffers.
-    pub fn iter_rows(&self) -> impl Iterator<Item = &[u32]> {
-        let n = self.num_limbs;
-        self.blocks
-            .iter()
-            .flat_map(move |b| u32::from_bytes(b).chunks_exact(n))
+/// So the buffer is kept as cubecl's [`Bytes`] -- which may already be pinned, see
+/// `AllocationProperty` -- and rows are handed out as views into it. The [`LimbBlock`] trait is
+/// what lets `BatchOutput` live in the framework-independent `milnor_batch` and still own this
+/// buffer: the zero-copy property survives while that module stays ignorant of cubecl.
+impl LimbBlock for Bytes {
+    fn limbs(&self) -> &[u32] {
+        u32::from_bytes(self)
     }
 }
 
-impl PartialEq for BatchOutput {
-    fn eq(&self, other: &Self) -> bool {
-        self.num_limbs == other.num_limbs && self.iter_rows().eq(other.iter_rows())
-    }
-}
-
-impl Eq for BatchOutput {}
-
-impl std::fmt::Debug for BatchOutput {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("BatchOutput")
-            .field("rows", &self.rows())
-            .field("num_limbs", &self.num_limbs)
-            .finish()
-    }
-}
+// ONE output type across both backends and the CPU reference, so a digest computed from one is
+// comparable with a digest computed from another by construction rather than by review.
+pub use crate::algebra::milnor_batch::{BatchOutput, LimbBlock};
 
 /// Census (`NASSAU_CENSUS`): how much of the batch is duplicated WORK rather than distinct work.
 ///
@@ -5346,17 +5293,21 @@ fn multiply_batch_gpu_inner(
     // resident-master pass, byte-identical to the pre-eviction code. No cloning, no second launch.
     let num_limbs_all = out_cols.div_ceil(32).max(1);
     if cap == i32::MAX || products.iter().all(|p| p.r_degree <= cap) {
-        return BatchOutput::from_blocks(
-            multiply_batch_grouped(
-                algebra,
-                out_cols,
-                col_map.clone(),
-                num_rows,
-                products,
-                MasterMode::Resident,
-            ),
-            num_limbs_all,
-        );
+        // `Box<dyn LimbBlock>` rather than a concrete `Bytes`: it is what lets `BatchOutput` be
+        // shared with a backend that has its own pinned host memory, at the cost of one vtable
+        // pointer per ROW BLOCK (not per row) -- and each block is up to `gpu_block_bytes`.
+        let blocks: Vec<Box<dyn LimbBlock>> = multiply_batch_grouped(
+            algebra,
+            out_cols,
+            col_map.clone(),
+            num_rows,
+            products,
+            MasterMode::Resident,
+        )
+        .into_iter()
+        .map(|b| Box::new(b) as Box<dyn LimbBlock>)
+        .collect();
+        return BatchOutput::from_blocks(blocks, num_limbs_all);
     }
     // Eviction active. Each output row's products all share one `R` (see [`MasterMode`]), so the
     // hot (degree ≤ cap) and cold row sets are DISJOINT. Run each group on its own rows only,
@@ -10828,8 +10779,12 @@ mod tests {
         algebra.compute_basis(max_degree);
         algebra.compute_seqno_tables(max_degree);
 
-        // FNV-1a over every limb of every row, in row order, mixed with the row index so a
-        // permutation of identical rows is not a collision.
+        // FNV-1a over every limb of every row, in row order, mixed with the batch and row indices
+        // so a permutation of identical rows is not a collision across a multi-batch replay.
+        //
+        // That index mixing makes this a DIFFERENT hash from `BatchOutput::digest`, which
+        // `cpu_reference_digest` and `replay_startup_profile` use. Digests from here are comparable
+        // only with other runs of this test -- do not check one against a CPU-reference number.
         let mut h: u64 = 0xcbf2_9ce4_8422_2325;
         let mut mix = |v: u64| {
             h ^= v;
@@ -10924,17 +10879,12 @@ mod tests {
         let out = super::cpu_multiply_batch_masked(&algebra, cols, cm, rows, &prods);
         let compute = t1.elapsed().as_secs_f64();
 
-        // Byte-identical to the digest in `replay_digest` / `replay_startup_profile`, so the
-        // numbers are directly comparable.
-        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-        let mut ones: u64 = 0;
-        for row in out.iter_rows() {
-            for &limb in row {
-                h ^= limb as u64;
-                h = h.wrapping_mul(0x0100_0000_01b3);
-                ones += limb.count_ones() as u64;
-            }
-        }
+        // `BatchOutput::digest`, shared with every other backend, so the numbers are comparable
+        // by construction. NOT comparable with `replay_digest`, which mixes the batch and row
+        // INDICES into the hash to keep a permutation of identical rows from colliding across a
+        // multi-batch replay; that is a different function and therefore a different number.
+        // `replay_startup_profile` uses this one.
+        let (h, ones) = out.digest();
         eprintln!(
             "[cpu-ref] products={} rows={rows} out_cols={cols} setup={setup:.2}s \
              compute={compute:.2}s ones={ones} digest={h:016x}",
@@ -11010,13 +10960,11 @@ mod tests {
             let out =
                 super::multiply_batch_on_gpu_masked(&algebra, *cols, cm.clone(), *rows, prods);
             let dt = t0.elapsed().as_secs_f64();
-            let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-            for row in out.iter_rows() {
-                for &limb in row {
-                    h ^= limb as u64;
-                    h = h.wrapping_mul(0x0100_0000_01b3);
-                }
-            }
+            let (h, ones) = out.digest();
+            assert!(
+                ones > 0,
+                "an all-zero output digests fine; this rep computed NOTHING"
+            );
             times.push(dt);
             digests.push(h);
         }

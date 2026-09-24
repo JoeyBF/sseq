@@ -480,7 +480,13 @@ extern "C" __global__ void axpy(float *out, const float *x, int n) {
         let stream = rt.context().default_stream();
 
         // Reserve 1 GiB of ADDRESS SPACE (free), commit 4 MiB.
-        let mut buf = GrowBuf::reserve(rt.device(), 1 << 30).expect("reserve");
+        //
+        // `reserve_on`, not `reserve`: this test drives the VMM and the copies through raw `sys::`
+        // entry points, and those do NOT bind a CUDA context by themselves. Run alone the test
+        // happened to inherit a context another call had left current on the thread; run alongside
+        // its siblings in one process it got `CUDA_ERROR_INVALID_CONTEXT` on the first copy. That
+        // is the same trap that once made `probe_max_alloc` report 0 GiB on a healthy card.
+        let mut buf = GrowBuf::reserve_on(&rt, 1 << 30).expect("reserve");
         buf.grow_to(4 << 20).expect("first commit");
         let ptr0 = buf.ptr();
 

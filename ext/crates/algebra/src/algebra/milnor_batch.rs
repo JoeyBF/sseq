@@ -112,6 +112,34 @@ impl BatchOutput {
             .iter()
             .flat_map(move |b| b.limbs().chunks_exact(n))
     }
+
+    /// FNV-1a over the row-major `u32` limbs, with the population count alongside.
+    ///
+    /// THE INVARIANT OF THE WHOLE PORT. A batch's digest is a property of the mathematics, not of
+    /// the machine: the same products give the same digest on an H200, on an RTX 2080 Ti, and on
+    /// the CPU with no device at all. So it is what every backend and every re-introduced kernel
+    /// optimisation is checked against, and it outlives whichever framework produced it.
+    ///
+    /// `ones` is carried because the digest alone cannot tell "correct" from "catastrophically
+    /// wrong": an all-zero output has a perfectly good digest. This codebase has already lost weeks
+    /// to exactly that -- a swallowed allocation failure returned a zeroed buffer at exit 0, and
+    /// `fabbe795a01dcf8d` turned out to be the FNV-1a of an all-zero 15901x16960 output. A
+    /// `ones = 0` line in a log is that failure, visible.
+    ///
+    /// Defined here rather than in each caller so the numbers recorded in different tests, backends
+    /// and runs stay comparable by construction; it used to be copied into three separate tests.
+    pub fn digest(&self) -> (u64, u64) {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        let mut ones: u64 = 0;
+        for row in self.iter_rows() {
+            for &limb in row {
+                h ^= limb as u64;
+                h = h.wrapping_mul(0x0100_0000_01b3);
+                ones += limb.count_ones() as u64;
+            }
+        }
+        (h, ones)
+    }
 }
 
 impl PartialEq for BatchOutput {
