@@ -48,7 +48,7 @@ tracing = { version = "0.1.41", optional = true }
 # actual MPMC queue, which is what the dispatch wants.
 crossbeam-channel = { version = "0.5", optional = true }
 
-# Direct CUDA driver access for the `cudart` backend (see src/algebra/cuda_rt.rs), which is
+# Direct CUDA driver access for the `cuda` backend (see src/algebra/milnor_cuda.rs), which is
 # replacing cubecl. Two things cubecl cannot give us:
 #   * CUDA VMM (`cuMemAddressReserve`/`cuMemCreate`/`cuMemMap`) -- one reserved address range grown
 #     by mapping physical chunks. That deletes the segmented master outright: MASTER_MAX_SEG, the
@@ -82,9 +82,12 @@ cache-multiplication = []
 milnor-rank = []
 concurrent = ["fp/concurrent", "maybe-rayon/concurrent"]
 gpu = ["dep:cubecl", "dep:cubecl-common", "dep:tracing", "dep:crossbeam-channel"]
-# The cudarc/NVRTC/VMM backend. Independent of `gpu` on purpose: both can be built at once so the
-# two paths can be digest-compared on the same input.
-cudart = ["dep:cudarc", "dep:tracing"]
+# The cudarc/NVRTC/VMM backend for the Milnor multiply. Independent of `gpu` on purpose: both
+# can be built at once so the two paths can be digest-compared on the same input.
+#
+# NOT called `cudart`: that conventionally means the CUDA RUNTIME API (libcudart.so), whereas
+# cudarc binds the DRIVER API.
+cuda = ["dep:cudarc", "dep:tracing"]
 odd-primes = ["fp/odd-primes"]
 
 [[bench]]

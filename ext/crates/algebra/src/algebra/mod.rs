@@ -18,8 +18,8 @@ pub use field::Field;
 pub mod milnor_algebra;
 pub use milnor_algebra::MilnorAlgebra;
 
-#[cfg(feature = "cudart")]
-pub mod cuda_rt;
+#[cfg(feature = "cuda")]
+pub mod milnor_cuda;
 #[cfg(feature = "gpu")]
 pub mod milnor_gpu;
 // Opt-in: an arithmetic alternative to the Milnor basis index map. Not wired in; see the module

@@ -1,7 +1,11 @@
-//! Direct CUDA runtime: cudarc + NVRTC + virtual memory management.
+//! The CUDA backend for the Milnor multiply: cudarc driver API + NVRTC + virtual memory.
+//!
+//! Named for what it is rather than `cuda_rt`/`cuda`, which conventionally means the CUDA
+//! RUNTIME API (`libcudart.so`). cudarc binds the DRIVER API, so that name said the opposite
+//! of what this does.
 //!
 //! This is the foundation for moving the Milnor GPU path off cubecl. It is deliberately
-//! self-contained and separately feature-gated (`cudart`), so both backends can be built at once
+//! self-contained and separately feature-gated (`cuda`), so both backends can be built at once
 //! and digest-compared on identical input before anything is switched over.
 //!
 //! # Why leave cubecl
@@ -109,11 +113,11 @@ unsafe impl Send for GrowBuf {}
 unsafe impl Sync for GrowBuf {}
 
 impl GrowBuf {
-    /// Reserve address space on the device a [`CudaRt`] already has bound.
+    /// Reserve address space on the device a [`MilnorCuda`] already has bound.
     ///
     /// Prefer this over [`GrowBuf::reserve`] off the runtime's thread: the raw VMM entry points are
     /// `sys::` calls, which do not bind a context by themselves.
-    pub fn reserve_on(rt: &CudaRt, reserve_bytes: usize) -> Result<Self> {
+    pub fn reserve_on(rt: &MilnorCuda, reserve_bytes: usize) -> Result<Self> {
         rt.context().bind_to_thread().map_err(|_| {
             CudaError::Driver("bind_to_thread", sys::CUresult::CUDA_ERROR_INVALID_CONTEXT)
         })?;
@@ -247,11 +251,39 @@ impl Drop for GrowBuf {
     }
 }
 
+/// The NVRTC `--gpu-architecture` string for a compute capability.
+///
+/// A table rather than a formatted `String`, because `CompileOptions::arch` is
+/// `Option<&'static str>`. fp-cuda gets away with a single `const ARCH` since its wgmma kernel is
+/// sm_90a-only; the Milnor kernels must run on both Ada and Hopper, so the arch is chosen per
+/// device and still has to be `'static`.
+fn arch_str(major: u32, minor: u32) -> Option<&'static str> {
+    Some(match (major, minor) {
+        (7, 0) => "compute_70",
+        (7, 5) => "compute_75",
+        (8, 0) => "compute_80",
+        (8, 6) => "compute_86",
+        (8, 9) => "compute_89",
+        (9, 0) => "compute_90",
+        (10, 0) => "compute_100",
+        (12, 0) => "compute_120",
+        // Unknown capability: let NVRTC pick its default rather than guess a wrong one.
+        _ => return None,
+    })
+}
+
 /// Compile CUDA C to PTX at runtime for this device's architecture.
 ///
-/// `defines` become `-D name=value`, which is how `#[comptime]` specialisation carries over: the
-/// cubecl kernels fold constants at macro-expansion time, and NVRTC folds them at compile time from
-/// these.
+/// Follows the convention PR 298 established for fp-cuda:
+/// * probe `is_culib_present` FIRST -- it has to precede any other nvrtc call -- and say plainly
+///   that the toolkit is missing. Without it an absent `libnvrtc` surfaces as an opaque failure
+///   deep inside compilation.
+/// * tuning constants live in Rust and reach the kernel as `-D` options, so there is ONE source of
+///   truth. The kernel should define none itself and `#error` on a missing one, which turns a
+///   forgotten define into a compile error instead of a silently wrong default.
+///
+/// That `-D` mechanism is also how cubecl's `#[comptime]` folding carries over: cubecl folds at
+/// macro-expansion time, NVRTC folds at compile time from these.
 pub fn compile_ptx(
     src: &str,
     name: &str,
@@ -260,10 +292,16 @@ pub fn compile_ptx(
 ) -> Result<String> {
     use cudarc::nvrtc::safe::{CompileOptions, compile_ptx_with_opts};
 
+    // Must come before any other nvrtc call.
+    if !unsafe { cudarc::nvrtc::sys::is_culib_present() } {
+        return Err(CudaError::Compile(format!(
+            "{name}: libnvrtc was not found, so the CUDA kernel cannot be compiled. Install the \
+             CUDA toolkit (module load cuda/12.4) or put libnvrtc on the library path."
+        )));
+    }
+
     let opts = CompileOptions {
-        arch: Some(Box::leak(
-            format!("compute_{}{}", arch.0, arch.1).into_boxed_str(),
-        )),
+        arch: arch_str(arch.0, arch.1),
         options: defines
             .iter()
             .map(|(k, v)| format!("-D{k}={v}"))
@@ -276,14 +314,14 @@ pub fn compile_ptx(
 }
 
 /// Per-device context plus a cache of compiled modules.
-pub struct CudaRt {
+pub struct MilnorCuda {
     ctx: Arc<CudaContext>,
     device: i32,
     arch: (u32, u32),
     modules: Mutex<HashMap<String, Arc<CudaModule>>>,
 }
 
-impl CudaRt {
+impl MilnorCuda {
     /// Open a device.
     ///
     /// `CudaContext::new` PANICS rather than returning `Err` when no driver is present, so probing
@@ -371,15 +409,15 @@ impl CudaRt {
 }
 
 /// Process-wide contexts, one per device.
-static RUNTIMES: OnceLock<Mutex<HashMap<i32, Arc<CudaRt>>>> = OnceLock::new();
+static RUNTIMES: OnceLock<Mutex<HashMap<i32, Arc<MilnorCuda>>>> = OnceLock::new();
 
 /// The runtime for `device`, opening it on first use.
-pub fn runtime(device: i32) -> Result<Arc<CudaRt>> {
+pub fn runtime(device: i32) -> Result<Arc<MilnorCuda>> {
     let map = RUNTIMES.get_or_init(|| Mutex::new(HashMap::new()));
     if let Some(rt) = map.lock().unwrap().get(&device) {
         return Ok(rt.clone());
     }
-    let rt = Arc::new(CudaRt::new(device)?);
+    let rt = Arc::new(MilnorCuda::new(device)?);
     map.lock().unwrap().insert(device, rt.clone());
     Ok(rt)
 }
@@ -518,7 +556,7 @@ extern "C" __global__ void axpy(float *out, const float *x, int n) {
         let max = rt.probe_max_alloc();
         let (maj, min) = rt.arch();
         eprintln!(
-            "[cuda_rt] device {} sm_{maj}{min}: largest single cuMemAlloc = {:.2} GiB",
+            "[milnor-cuda] device {} sm_{maj}{min}: largest single cuMemAlloc = {:.2} GiB",
             rt.device(),
             max as f64 / (1u64 << 30) as f64
         );
