@@ -4837,32 +4837,9 @@ fn multiply_batch_kernel(
     }
 }
 
-/// One `Sq(R) · s` product of a batched launch, written into output row `row` at bit
-/// offset `out_offset`.
-///
-/// `term_indices` are the nonzero indices of `s` in the degree-`s_degree` basis.
-/// Multiple products may target the same `row` (their F₂ contributions XOR together),
-/// mirroring how `get_partial_matrix` accumulates a row over generator blocks. The
-/// product's `seqno` output indexes the algebra basis of the output degree; `out_offset`
-/// is the start of the target-generator block that basis maps into within the row (0 when
-/// the whole row is a single algebra element, as in the single-generator tests).
-#[derive(Clone)]
-pub struct GpuProduct {
-    pub r_degree: i32,
-    pub r_idx: usize,
-    pub s_degree: i32,
-    /// `Arc<[usize]>`, not `Vec<usize>`, purely so cloning a `GpuProduct` is a refcount bump.
-    ///
-    /// The terms are written once at construction and only ever read afterwards, but products get
-    /// cloned twice on the way to the device — once to compact rows into a dense range per
-    /// hot/cold group, once to fan out into per-device buckets — and with a `Vec` each of those
-    /// duplicated every term list. A call-graph profile of an uncapped stem-150 run put 5.45% of
-    /// all user cycles in `_int_free` under the drop of these vectors alone (16.1% total in the
-    /// allocator). Sharing makes the clones free and the drops O(1).
-    pub term_indices: std::sync::Arc<[usize]>,
-    pub row: usize,
-    pub out_offset: usize,
-}
+// The product descriptor now lives in the framework-independent `milnor_batch`, so this
+// backend and any other share ONE type and the CPU reference can check both.
+pub use crate::algebra::milnor_batch::GpuProduct;
 
 /// Compute a whole batch of `Sq(R) · s` products on the GPU — the batched unit of one
 /// `get_partial_matrix` call, split into row blocks of at most [`gpu_block_bytes`] of output

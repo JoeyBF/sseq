@@ -18,6 +18,10 @@ pub use field::Field;
 pub mod milnor_algebra;
 pub use milnor_algebra::MilnorAlgebra;
 
+// Framework-independent core of the batched Milnor multiply: the product descriptor, the
+// output layout and the CPU reference. UNGATED on purpose -- it must not live behind any
+// one backend's feature, or a second backend cannot use it without dragging the first along.
+pub mod milnor_batch;
 #[cfg(feature = "cuda")]
 pub mod milnor_cuda;
 #[cfg(feature = "gpu")]
