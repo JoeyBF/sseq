@@ -48,28 +48,32 @@ typedef unsigned long long u64;
 // branchless -- it ORs the flag into an accumulator and stores the low half unconditionally.
 #define PAIR_COL_REJECT (1u << 16)
 
-// The per-column rule of the Milnor product test, for column `j` with `b`/`cs`/`mk` the term /
-// col_sums / masks entries (zero outside their lengths) and `low = min(term_len, cs_len)`:
-//   j <  low: reject if cs > b or (b-cs) & mk; else (b-cs) | mk
-//   j >= low: reject if cs > 0 or b & mk;      else b | mk
+// The per-column rule of the Milnor product test: with `b`/`cs`/`mk` the term / col_sums / masks
+// entries (zero outside their lengths), reject if `cs > b` or `(b - cs) & mk`, else `(b - cs) | mk`.
 //
 // This is the whole per-term test and output assembly of
 // `MilnorAlgebra::multiply_basis_element_by_element_2`, with its three tail branches collapsed into
 // one uniform per-position rule.
 //
-// Past `low` at most one of `b`, `cs` is in range, so the two arms in fact coincide there and a
-// single unconditional rule would do -- but proving that away is an optimisation, and this file is
-// the unoptimised reference.
-__device__ __forceinline__ u32 pair_col(u32 j, u32 low, u32 b, u32 cs, u32 mk) {
-    if (j < low) {
-        if (cs > b) return PAIR_COL_REJECT;
-        u32 diff = b - cs;
-        if (diff & mk) return PAIR_COL_REJECT;
-        return diff | mk;
-    }
-    if (cs > 0u) return PAIR_COL_REJECT;
-    if (b & mk) return PAIR_COL_REJECT;
-    return b | mk;
+// NO `low` SPLIT, because it is redundant rather than a trade. The two-armed form is
+//   j <  low: reject if cs > b or (b-cs) & mk; else (b-cs) | mk
+//   j >= low: reject if cs > 0 or b & mk;      else b | mk
+// with `low = min(term_len, cs_len)`. Past `low` at most one of `b`, `cs` is in range, so at least
+// one is zero, and the two cases are:
+//   * cs = 0: the first arm gives diff = b, rejects on `b & mk`, else `b | mk`; the second has
+//     `cs > 0` false, rejects on `b & mk`, else `b | mk`. Identical.
+//   * b = 0: the first rejects exactly when `cs > 0`, and otherwise (cs = 0 too) gives diff = 0,
+//     no `0 & mk`, value `mk`; the second rejects exactly when `cs > 0` and otherwise gives
+//     `0 | mk = mk`. Identical.
+// So the first arm computes the second's answer wherever the second applies, and one unconditional
+// rule covers every column. The split cost a compare, a branch and its reconvergence pair per LANE
+// per column -- MATRIX_GROUP * TERM_GROUP of them per iteration -- on a loop that does not actually
+// diverge. What is left is branchless: a compare, a subtract, two LOP3s and a select.
+__device__ __forceinline__ u32 pair_col(u32 b, u32 cs, u32 mk) {
+    if (cs > b) return PAIR_COL_REJECT;
+    u32 diff = b - cs;
+    if (diff & mk) return PAIR_COL_REJECT;
+    return diff | mk;
 }
 
 // Where each p-part digit sits inside the packed accumulator, straight from `PPart`'s own layout.
@@ -275,7 +279,6 @@ extern "C" __global__ __launch_bounds__(THREADS) void multiply_batch(
     // The trimmed LENGTH is no longer kept per lane: with the digits coming out of the packed word
     // it is read only to form `low[tt]` and to widen `cols`, both done here.
     u64 b_bits[TERM_GROUP];
-    u32 low[TERM_GROUP];
     u32 cols = (cs_len > mk_len) ? cs_len : mk_len;
 #pragma unroll
     for (u32 tt = 0; tt < TERM_GROUP; ++tt) {
@@ -287,7 +290,6 @@ extern "C" __global__ __launch_bounds__(THREADS) void multiply_batch(
             bb = pp[gei];
         }
         b_bits[tt] = bb;
-        low[tt] = (tl < cs_len) ? tl : cs_len;
         if (tl > cols) cols = tl;
     }
 
@@ -368,7 +370,7 @@ extern "C" __global__ __launch_bounds__(THREADS) void multiply_batch(
 #pragma unroll
             for (u32 tt = 0; tt < TERM_GROUP; ++tt) {
                 u32 i = mm * TERM_GROUP + tt;
-                u32 val = pair_col(j, low[tt], bv[tt], cv[mm], mv[mm]);
+                u32 val = pair_col(bv[tt], cv[mm], mv[mm]);
                 rejected[i] |= val & PAIR_COL_REJECT;
                 acc32[i] |= (val & fm) << sh;
             }
@@ -384,7 +386,7 @@ extern "C" __global__ __launch_bounds__(THREADS) void multiply_batch(
 #pragma unroll
             for (u32 tt = 0; tt < TERM_GROUP; ++tt) {
                 u32 i = mm * TERM_GROUP + tt;
-                u32 val = pair_col(j, low[tt], bv[tt], cv[mm], mv[mm]);
+                u32 val = pair_col(bv[tt], cv[mm], mv[mm]);
                 rejected[i] |= val & PAIR_COL_REJECT;
                 working[i] |= (u64)(val & fm) << sh;
             }

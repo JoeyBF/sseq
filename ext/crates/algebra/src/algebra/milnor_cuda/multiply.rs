@@ -764,7 +764,10 @@ mod tests {
                     } else {
                         0
                     };
-                    // The same uniform per-position rule as `pair_col` in multiply.cu.
+                    // The TWO-ARMED reference rule, deliberately not the collapsed one the
+                    // kernel uses. The kernel drops the `j < low` split on the argument that the
+                    // arms coincide past `low`; keeping the original form here means the digest
+                    // comparison is a check OF that argument rather than a restatement of it.
                     let val = if j < low {
                         if c > b || ((b - c) & msk) != 0 {
                             None
