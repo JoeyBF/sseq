@@ -376,6 +376,26 @@ extern "C" __global__ __launch_bounds__(THREADS) void multiply_batch(
             }
         }
     }
+    // EARLY EXIT when the whole tile is already dead.
+    //
+    // Roughly 99.5% of pairs reject (9.2M bits set from 1.74e9 pairs on the profile batch), and a
+    // rejection is permanent -- `rejected` only ever accumulates. So if every lane of the tile has
+    // rejected by the end of the first segment, the rest of the column loop and the emit cannot
+    // produce anything.
+    //
+    // ONE branch per thread, not one per column. Branching per column was measured ~11% SLOWER on
+    // the cubecl kernel: twelve divergent branches per thread cost more than the work they skip,
+    // on a loop that does not otherwise diverge. This asks once, at a point where the answer is
+    // usually yes.
+    //
+    // A SECOND check after the very first column was tried and rejected: 84.08 -> 84.78 e9 pairs/s,
+    // +0.8%, for a peeled iteration carrying a third copy of the tile accumulate. Real but not
+    // worth the drift risk of another copy. Do not re-try it expecting more.
+    u32 all_rejected = rejected[0];
+#pragma unroll
+    for (u32 i = 1; i < MATRIX_GROUP * TERM_GROUP; ++i) all_rejected &= rejected[i];
+    if (all_rejected) return;
+
 #pragma unroll
     for (u32 i = 0; i < MATRIX_GROUP * TERM_GROUP; ++i) working[i] = (u64)acc32[i];
 
