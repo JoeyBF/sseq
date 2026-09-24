@@ -706,7 +706,10 @@ mod tests {
                 // The whole p-part in one word, exactly as the kernel holds it.
                 let b_bits = s.pp[gei];
 
-                let cols = cs_len.max(mk_len).max(term_len);
+                // Capped at PPART_MAX_LEN: past it both `b` and `cs` are zero, so the column can
+                // neither reject nor accumulate. See the kernel for the bound that makes this
+                // exact rather than a truncation.
+                let cols = cs_len.max(mk_len).max(term_len).min(params::PPART_MAX_LEN);
                 let low = term_len.min(cs_len);
                 // Packed exactly as the kernel packs it, so the walk keeps testing what the kernel
                 // does rather than an equivalent-but-different assembly.

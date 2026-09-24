@@ -287,6 +287,22 @@ extern "C" __global__ __launch_bounds__(THREADS) void multiply_batch(
         if (tl > cols) cols = tl;
     }
 
+    // COLUMNS AT OR PAST PPART_MAX_LEN DO NOTHING, so do not visit them.
+    //
+    // Both of the inputs that can reject are bounded by PPART_MAX_LEN: a term's p-part has at most
+    // `PPart::MAX_LEN` = 10 entries, and cs_len = cols - 1 where cols is the widest bit-length of a
+    // p-part entry, bounded by PPart::width(0) = 11. So for j >= 10 both b and cs are zero, and
+    // `pair_col`'s second arm reduces to "cs > 0" (false) and "b & mk" (zero) -- it CANNOT reject.
+    // The accumulate is already guarded by j < PPART_MAX_LEN. The column therefore contributes
+    // nothing at all.
+    //
+    // mk_len is rows + cols - 1 and runs well past 10 (to 18 in principle, ~9.1 mean at the
+    // frontier), so this is real work: the cubecl kernel keeps a whole third comptime loop segment
+    // for `PPART_MAX_LEN..cols`, describing it as there "for correctness at any shape". The bound
+    // above says there is no such shape. `enum_caps_bound_real_rs` checks the cs_len half of that
+    // argument against every real R, and the digest checks the conclusion.
+    if (cols > PPART_MAX_LEN) cols = PPART_MAX_LEN;
+
     // Matrix lane bases, CLAMPED rather than branched. A trailing lane of a partial tile then reads
     // a real (duplicate) matrix instead of nothing, and the emit tail drops it on the same
     // condition -- so nothing it computes is ever observed, while the branch and its reconvergence
