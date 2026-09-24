@@ -384,34 +384,51 @@ pub fn cuda_multiply_batch_timed(
 /// upload against the previous block's kernel in a multi-block launch -- the exact overlap row
 /// batching creates the opportunity for.
 #[allow(clippy::too_many_arguments)]
-fn run(
-    rt: &Arc<MilnorCuda>,
+/// Devices the multiply spreads work over.
+///
+/// `NASSAU_CUDA_DEVICES` overrides; otherwise every device the driver makes visible. The driver
+/// already applies `CUDA_VISIBLE_DEVICES` and renumbers the survivors to `0..n`, so honouring that
+/// mask needs no code here -- unlike the cubecl path, which counted `/proc/driver/nvidia/gpus`,
+/// got the PHYSICAL count, and opened an ordinal the mask had hidden.
+pub fn device_count() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        let visible = cudarc::driver::CudaContext::device_count()
+            .unwrap_or(1)
+            .max(1) as usize;
+        std::env::var("NASSAU_CUDA_DEVICES")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(visible)
+            .min(visible)
+    })
+}
+
+/// One device's share of a launch: make the store resident, then run the blocks assigned to it.
+///
+/// Each device keeps its OWN resident master. The offsets differ per device, so `r_infos` -- and
+/// therefore the marshalled `r_*` arrays -- are per device too, which is why the marshal happens
+/// inside here rather than once for the whole batch.
+#[allow(clippy::too_many_arguments)]
+fn run_on_device(
+    device: i32,
     algebra: &MilnorAlgebra,
-    num_cols: usize,
-    num_rows: usize,
     products: &[GpuProduct],
+    r_index: &[u32],
+    needed: &[RKey],
+    blocks: &[(usize, (usize, usize, usize, usize))],
+    num_limbs: usize,
     col_map: Option<&[u32]>,
+    max_out_degree: i32,
+    max_s_degree: i32,
     timed: bool,
-) -> Result<(BatchOutput, LaunchTiming)> {
+) -> Result<(Vec<(usize, Box<dyn LimbBlock>)>, LaunchTiming)> {
     use std::time::Instant;
     let mut timing = LaunchTiming::default();
+    let rt = super::runtime(device)?;
+
     let t_resident = Instant::now();
-    let num_limbs = num_cols.div_ceil(32).max(1);
-    let out_len = num_rows * num_limbs;
-
-    let max_out_degree = products
-        .iter()
-        .map(|p| p.r_degree + p.s_degree)
-        .max()
-        .unwrap_or(0)
-        .max(1);
-    let max_s_degree = products.iter().map(|p| p.s_degree).max().unwrap_or(0);
-
-    // OUTSIDE THE LOCK. One pass over the products decides both which `R`s to make resident and
-    // what the kernel's launch-local `R` index is for each product -- and it needs nothing from
-    // the store, so there is no reason for other threads to wait through it.
-    let (needed, r_index) = plan_rs(algebra, products);
-
     // THE CRITICAL SECTION IS ONLY WHAT MUTATES THE STORE, plus the snapshot taken out of it.
     //
     // Everything after this -- marshalling, the launches, the readback -- runs on locals. That is
@@ -420,15 +437,16 @@ fn run(
     // has already resolved.
     //
     // Holding the lock across the whole launch instead measured a 0.95x "speedup" for four
-    // concurrent threads: full serialisation, plus the cost of contending for it. That matters
-    // more than any single launch's cost, because a frontier run has ~18 threads inside GPU calls
-    // at once.
+    // concurrent threads: full serialisation, plus the cost of contending for it.
     let (r_infos, bases, p_cs, p_mk, p_pp, p_ln, p_g, p_xi, width) = {
-        let store = resident(rt)?;
+        let store = resident(&rt)?;
         let t_lock = Instant::now();
         let mut store = store.lock().unwrap();
         if std::env::var_os("NASSAU_CUDA_LOCK_INFO").is_some() {
-            eprintln!("[lock] waited {:.4}s", t_lock.elapsed().as_secs_f64());
+            eprintln!(
+                "[lock] dev {device} waited {:.4}s",
+                t_lock.elapsed().as_secs_f64()
+            );
         }
         // `ensure_seqno` FIRST: it establishes `width`, the stride `ensure_basis` pads to.
         store.ensure_seqno(algebra, max_out_degree)?;
@@ -442,9 +460,8 @@ fn run(
                 .map(|&k| store.ensure_r(algebra, k))
                 .collect::<Result<Vec<_>>>()?
         } else {
-            store.ensure_rs(rt, algebra, &needed)?
+            store.ensure_rs(&rt, algebra, needed)?
         };
-        // The basis is fully built above, so snapshotting each degree's base here is exact.
         let bases: Vec<u32> = (0..=max_s_degree.max(0))
             .map(|d| store.basis().gei(d, 0))
             .collect();
@@ -460,24 +477,14 @@ fn run(
             store.width() as u32,
         )
     };
-
     timing.resident = t_resident.elapsed().as_secs_f64();
-    let t_marshal = Instant::now();
 
-    // Shared by every block: the compiled module, the snapshotted resident pointers and the column
-    // map. Only the per-product arrays and the output buffer are per block.
     let gei_of = move |d: i32, ti: usize| bases[d as usize] + ti as u32;
 
     let module = rt.module(&module_key(), SRC, &params::defines())?;
     let f = module
         .load_function("multiply_batch")
         .map_err(|e| CudaError::Compile(format!("load multiply_batch: {e:?}")))?;
-    // `NASSAU_CUDA_KERNEL_INFO=1`: registers, local memory and the block ceiling ptxas settled on.
-    //
-    // Worth having rather than inferring. The block-size sweep showed a CLIFF between 128 and 160
-    // threads -- flat at ~64.5e9 pairs/s to 128, ~61 above -- which is the shape of an occupancy
-    // boundary, and the register count is what decides where that boundary sits. Guessing at it is
-    // how effort gets spent shrinking state that was never the limit.
     if std::env::var_os("NASSAU_CUDA_KERNEL_INFO").is_some() {
         use cudarc::driver::sys::CUfunction_attribute_enum as A;
         let get = |a| f.get_attribute(a).unwrap_or(-1);
@@ -512,10 +519,9 @@ fn run(
     // cannot overflow the grid.
     let chunk = (u32::MAX as u64 / threads as u64) * threads as u64;
 
-    let plan = row_blocks(products, num_rows, num_limbs, block_bytes());
-    let mut out_blocks: Vec<Box<dyn LimbBlock>> = Vec::with_capacity(plan.len());
+    let mut out_blocks: Vec<(usize, Box<dyn LimbBlock>)> = Vec::with_capacity(blocks.len());
 
-    for &(row0, row1, p0, p1) in &plan {
+    for &(block_index, (row0, row1, p0, p1)) in blocks {
         let t_marshal = Instant::now();
         let arrays = marshal(
             algebra,
@@ -531,7 +537,7 @@ fn run(
         let blk_len = (row1 - row0) * num_limbs;
         if arrays.total_pairs() == 0 {
             // The rows still exist and still have to appear in the output, they are just empty.
-            out_blocks.push(Box::new(vec![0u32; blk_len]));
+            out_blocks.push((block_index, Box::new(vec![0u32; blk_len])));
             continue;
         }
 
@@ -621,7 +627,7 @@ fn run(
         // From the POOL: page-locking is charged per allocation and dominated this phase outright
         // (69.4 ms of 76.8 ms for 338 MB), while the transfer it enables runs at 45.7 GB/s.
         let t_readback = Instant::now();
-        let mut pinned = super::pinned_pool(rt.device()).take(rt.context(), blk_len)?;
+        let mut pinned = super::pinned_pool(device).take(rt.context(), blk_len)?;
         stream
             .memcpy_dtoh(&d_out, pinned.as_mut_slice())
             .map_err(|e| CudaError::Compile(format!("readback: {e:?}")))?;
@@ -630,9 +636,128 @@ fn run(
             .synchronize()
             .map_err(|e| CudaError::Compile(format!("sync after readback: {e:?}")))?;
         timing.readback += t_readback.elapsed().as_secs_f64();
-        out_blocks.push(Box::new(pinned));
+        out_blocks.push((block_index, Box::new(pinned)));
+    }
+    Ok((out_blocks, timing))
+}
+
+/// The launch, across every visible device, with phase attribution optional.
+///
+/// `timed` controls the intermediate stream synchronises. They exist ONLY so the phases add up:
+/// everything on a device runs on one stream and is therefore already ordered, so the sole
+/// synchronise production needs is the one before a readback buffer is handed to the caller.
+#[allow(clippy::too_many_arguments)]
+fn run(
+    rt: &Arc<MilnorCuda>,
+    algebra: &MilnorAlgebra,
+    num_cols: usize,
+    num_rows: usize,
+    products: &[GpuProduct],
+    col_map: Option<&[u32]>,
+    timed: bool,
+) -> Result<(BatchOutput, LaunchTiming)> {
+    let num_limbs = num_cols.div_ceil(32).max(1);
+    let out_len = num_rows * num_limbs;
+
+    let max_out_degree = products
+        .iter()
+        .map(|p| p.r_degree + p.s_degree)
+        .max()
+        .unwrap_or(0)
+        .max(1);
+    let max_s_degree = products.iter().map(|p| p.s_degree).max().unwrap_or(0);
+
+    // OUTSIDE ANY LOCK, and device-independent: one pass over the products decides both which `R`s
+    // to make resident and what the kernel's launch-local `R` index is for each product.
+    let (needed, r_index) = plan_rs(algebra, products);
+
+    // SPLIT FOR THE DEVICES, not just for the memory bound.
+    //
+    // Rows are independent, so the row blocks that bound a launch's output are also the unit of
+    // work a device can take. Capping a block at `num_rows / devices` gives every device something
+    // to do; the byte budget still applies on top, so a batch large enough to need more blocks
+    // than there are devices simply gets more.
+    let n_dev = device_count().max(1);
+    let row_bytes = num_limbs * size_of::<u32>();
+    let per_device_bytes = num_rows.div_ceil(n_dev).max(1) * row_bytes;
+    let budget = block_bytes().min(per_device_bytes.max(row_bytes));
+    let plan = row_blocks(products, num_rows, num_limbs, budget);
+
+    // Round-robin, so a plan with more blocks than devices still spreads evenly.
+    let mut per_device: Vec<Vec<(usize, (usize, usize, usize, usize))>> = vec![Vec::new(); n_dev];
+    for (i, &blk) in plan.iter().enumerate() {
+        per_device[i % n_dev].push((i, blk));
     }
 
+    // Single device: stay on this thread. Spawning to run one closure would only add a join.
+    let results: Vec<Result<(Vec<(usize, Box<dyn LimbBlock>)>, LaunchTiming)>> = if n_dev == 1 {
+        vec![run_on_device(
+            rt.device(),
+            algebra,
+            products,
+            &r_index,
+            &needed,
+            &per_device[0],
+            num_limbs,
+            col_map,
+            max_out_degree,
+            max_s_degree,
+            timed,
+        )]
+    } else {
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = per_device
+                .iter()
+                .enumerate()
+                .filter(|(_, blocks)| !blocks.is_empty())
+                .map(|(d, blocks)| {
+                    let (needed, r_index) = (&needed, &r_index);
+                    scope.spawn(move || {
+                        run_on_device(
+                            d as i32,
+                            algebra,
+                            products,
+                            r_index,
+                            needed,
+                            blocks,
+                            num_limbs,
+                            col_map,
+                            max_out_degree,
+                            max_s_degree,
+                            timed,
+                        )
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        })
+    };
+
+    // Reassemble IN ROW ORDER. The devices finish in whatever order they finish; the output is a
+    // concatenation of row blocks and cares only about their index.
+    let mut timing = LaunchTiming::default();
+    let mut slots: Vec<Option<Box<dyn LimbBlock>>> = (0..plan.len()).map(|_| None).collect();
+    for result in results {
+        let (blocks, t) = result?;
+        timing.resident += t.resident;
+        timing.marshal += t.marshal;
+        timing.upload += t.upload;
+        timing.kernel += t.kernel;
+        timing.readback += t.readback;
+        for (i, buf) in blocks {
+            slots[i] = Some(buf);
+        }
+    }
+    if plan.is_empty() {
+        return Ok((
+            BatchOutput::from_limbs(vec![0u32; out_len], num_limbs),
+            timing,
+        ));
+    }
+    let out_blocks: Vec<Box<dyn LimbBlock>> = slots
+        .into_iter()
+        .map(|b| b.expect("every block was assigned to a device"))
+        .collect();
     Ok((BatchOutput::from_blocks(out_blocks, num_limbs), timing))
 }
 
