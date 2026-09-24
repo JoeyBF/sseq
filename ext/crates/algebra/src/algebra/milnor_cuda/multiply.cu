@@ -163,8 +163,13 @@ extern "C" __global__ __launch_bounds__(THREADS) void multiply_batch(
     // ceiling that made small-memory cards fail -- has nothing left to solve.
     const u16 *__restrict__ cs,
     const u16 *__restrict__ mk,
-    // Width-padded Milnor basis: element `gei`'s p-part at pp[gei*width ..], true length ln[gei].
-    const u16 *__restrict__ pp,
+    // The Milnor basis, ONE PACKED u64 PER ELEMENT: pp[gei] is the whole p-part, with entry i at
+    // bit PP_SHIFT[i]. `PPart` is already exactly this u64, so nothing is converted on either side
+    // -- and a term's contribution to a column becomes a register shift instead of a global load,
+    // which removes the T of the tile's 2M + T loads per column outright.
+    const u64 *__restrict__ pp,
+    // Trimmed p-part length. Still needed even though the packed word gives the entries: the
+    // column loop bounds itself by it and `low` is min(term_len, cs_len).
     const u32 *__restrict__ ln,
     // Term global basis index, indexed by prod_term_start[p] + t.
     const u32 *__restrict__ term_gei,
@@ -262,7 +267,9 @@ extern "C" __global__ __launch_bounds__(THREADS) void multiply_batch(
     // the emit below: an all-zero term against an all-zero column does NOT reject, so they would
     // otherwise emit a spurious seqno(0) bit.
     u32 term_len[TERM_GROUP];
-    u64 b_base[TERM_GROUP];
+    // The term's whole p-part, held in a REGISTER for the length of the column loop. One load per
+    // term for the entire tile, against one per term per column before.
+    u64 b_bits[TERM_GROUP];
     u32 low[TERM_GROUP];
     u32 cols = (cs_len > mk_len) ? cs_len : mk_len;
 #pragma unroll
@@ -272,10 +279,10 @@ extern "C" __global__ __launch_bounds__(THREADS) void multiply_batch(
         if (t_base + tt < nt) {
             u32 gei = term_gei[prod_term_start[p] + t_base + tt];
             tl = ln[gei];
-            bb = (u64)gei * width;
+            bb = pp[gei];
         }
         term_len[tt] = tl;
-        b_base[tt] = bb;
+        b_bits[tt] = bb;
         low[tt] = (tl < cs_len) ? tl : cs_len;
         if (tl > cols) cols = tl;
     }
@@ -314,15 +321,19 @@ extern "C" __global__ __launch_bounds__(THREADS) void multiply_batch(
             cv[mm] = (j < cs_len) ? (u32)cs[cs_b[mm] + j] : 0u;
             mv[mm] = (j < mk_len) ? (u32)mk[mk_b[mm] + j] : 0u;
         }
-        u32 bv[TERM_GROUP];
-#pragma unroll
-        for (u32 tt = 0; tt < TERM_GROUP; ++tt)
-            bv[tt] = (j < term_len[tt]) ? (u32)pp[b_base[tt] + j] : 0u;
-
-        // One shift/mask pair per column, shared by every lane of the tile.
+        // One shift/mask pair per column, shared by every lane of the tile -- and now used for
+        // BOTH reading the term's digit and writing the accumulator's, since the two are the same
+        // packing.
         u32 jj = (j < PPART_MAX_LEN) ? j : 0;
         u32 sh = PP_SHIFT[jj];
         u32 fm = PP_MASK[jj];
+
+        // No load: the digit comes out of a register. Past PPART_MAX_LEN a p-part has no entries,
+        // so the value there is zero by construction rather than by a bounds test.
+        u32 bv[TERM_GROUP];
+#pragma unroll
+        for (u32 tt = 0; tt < TERM_GROUP; ++tt)
+            bv[tt] = (j < PPART_MAX_LEN) ? (u32)((b_bits[tt] >> sh) & fm) : 0u;
 #pragma unroll
         for (u32 mm = 0; mm < MATRIX_GROUP; ++mm) {
 #pragma unroll

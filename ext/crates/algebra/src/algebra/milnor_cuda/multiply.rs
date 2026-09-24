@@ -598,7 +598,7 @@ mod tests {
     struct HostStore {
         cs: Vec<u16>,
         mk: Vec<u16>,
-        pp: Vec<u16>,
+        pp: Vec<u64>,
         ln: Vec<u32>,
         g: Vec<u32>,
         xi: Vec<u32>,
@@ -613,8 +613,7 @@ mod tests {
         fn new(algebra: &MilnorAlgebra, max_s_degree: i32) -> Self {
             let (width, g) = algebra.seqno_table_u32();
             let mut basis = BasisLayout::default();
-            let (pp, ln, counts) =
-                basis_tables(algebra, width, 0, max_s_degree).expect("basis tables");
+            let (pp, ln, counts) = basis_tables(algebra, 0, max_s_degree).expect("basis tables");
             basis.extend(&counts);
             Self {
                 cs: Vec::new(),
@@ -704,7 +703,8 @@ mod tests {
 
                 let gei = a.term_gei[a.prod_term_start[p] as usize + t_base + tt] as usize;
                 let term_len = s.ln[gei] as usize;
-                let b_base = gei * s.width;
+                // The whole p-part in one word, exactly as the kernel holds it.
+                let b_bits = s.pp[gei];
 
                 let cols = cs_len.max(mk_len).max(term_len);
                 let low = term_len.min(cs_len);
@@ -714,8 +714,10 @@ mod tests {
                 let mut rejected = false;
                 #[allow(clippy::needless_range_loop)]
                 for j in 0..cols {
-                    let b = if j < term_len {
-                        s.pp[b_base + j] as u32
+                    // No load: the digit comes out of the packed word, exactly as the kernel
+                    // takes it out of a register.
+                    let b = if j < params::PPART_MAX_LEN {
+                        ((b_bits >> s.pp_shift[j]) & u64::from(s.pp_mask[j])) as u32
                     } else {
                         0
                     };

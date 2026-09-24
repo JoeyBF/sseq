@@ -210,14 +210,25 @@ pub fn r_tables(
     ))
 }
 
-/// Width-padded p-parts, true lengths, and the per-degree element counts, for degrees `from..=to`.
+/// Packed p-parts, true lengths, and the per-degree element counts, for degrees `from..=to`.
+///
+/// ONE `u64` PER ELEMENT, not a width-padded run of `u16`.
+///
+/// `PPart` already IS a single `u64` -- ten fields of widths 11, 10, 9, 8, 7, 6, 5, 4, 3, 1, which
+/// is exactly 64 bits -- so storing it unpacked was storing 20 bytes for something that is 8, and
+/// making the kernel do a global load per COLUMN for a value one shift away in a register. The
+/// device-side accumulator was already using this exact layout (`PP_SHIFT`/`PP_MASK` come from
+/// `PPart::shift`/`width`), so the term and the accumulator now speak the same representation and
+/// no conversion happens anywhere.
+///
+/// `ln` stays: the packed word gives the entries, but the column loop still needs the trimmed
+/// LENGTH to bound itself and to compute `min(term_len, cs_len)`.
 pub fn basis_tables(
     algebra: &MilnorAlgebra,
-    width: usize,
     from: i32,
     to: i32,
-) -> Result<(Vec<u16>, Vec<u32>, Vec<usize>)> {
-    let mut pp: Vec<u16> = Vec::new();
+) -> Result<(Vec<u64>, Vec<u32>, Vec<usize>)> {
+    let mut pp: Vec<u64> = Vec::new();
     let mut ln: Vec<u32> = Vec::new();
     let mut counts: Vec<usize> = Vec::new();
     for d in from..=to {
@@ -226,13 +237,7 @@ pub fn basis_tables(
         for i in 0..dim {
             let elt = algebra.basis_element_from_index(d, i);
             ln.push(elt.p_part.len() as u32);
-            let base = pp.len();
-            pp.resize(base + width, 0);
-            for (slot, v) in pp[base..base + width].iter_mut().zip(elt.p_part.iter()) {
-                *slot = u16::try_from(v).map_err(|_| {
-                    CudaError::Compile(format!("basis p-part entry {v} does not fit u16"))
-                })?;
-            }
+            pp.push(elt.p_part.bits());
         }
     }
     Ok((pp, ln, counts))
@@ -264,7 +269,7 @@ pub struct Resident {
     mk: GrowBuf,
     master: MasterLayout,
 
-    /// Width-padded Milnor basis and true p-part lengths.
+    /// The Milnor basis as one packed `u64` per element, and the true p-part lengths.
     pp: GrowBuf,
     ln: GrowBuf,
     basis: BasisLayout,
@@ -390,12 +395,11 @@ impl Resident {
         }
         assert!(self.width != 0, "ensure_seqno must run before ensure_basis");
         self.bind()?;
-        let (pp, ln, counts) =
-            basis_tables(algebra, self.width, self.basis.degree() + 1, max_degree)?;
+        let (pp, ln, counts) = basis_tables(algebra, self.basis.degree() + 1, max_degree)?;
         // Write BEFORE advancing the layout, so a failed upload cannot leave the layout claiming
         // elements the device does not have.
         self.pp
-            .write_at(self.basis.elems() * self.width * size_of::<u16>(), &pp)?;
+            .write_at(self.basis.elems() * size_of::<u64>(), &pp)?;
         self.ln
             .write_at(self.basis.elems() * size_of::<u32>(), &ln)?;
         self.basis.extend(&counts);
