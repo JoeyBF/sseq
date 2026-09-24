@@ -44,12 +44,11 @@ use crate::algebra::{Algebra, MilnorAlgebra, combinatorics::xi_degrees, milnor_a
 /// value fails a run that would otherwise have fit. This is exactly the knob that does not exist
 /// under cubecl, where the equivalent ceiling is `MASTER_MAX_SEG * seg_elems` and has to be tuned
 /// per card against total device memory.
-fn reserve_bytes(name: &str, default_gib: usize) -> usize {
+fn reserve_bytes(name: &str, default_bytes: usize) -> usize {
     std::env::var(name)
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(default_gib)
-        << 30
+        .map_or(default_bytes, |gib| gib << 30)
 }
 
 /// How a caller names an `R`: `(r_degree, r_idx)`, exactly as it appears in a `GpuProduct`.
@@ -300,15 +299,40 @@ impl Resident {
         rt.context().bind_to_thread().map_err(|_| {
             CudaError::Driver("bind_to_thread", sys::CUresult::CUDA_ERROR_INVALID_CONTEXT)
         })?;
+        // THE MASTER RESERVES THE WHOLE DEVICE, EACH HALF OF IT.
+        //
+        // A reservation is address space, not memory: nothing is backed until `grow_to` commits
+        // it. So the only thing a small reservation buys is a ceiling that fails a run which would
+        // otherwise have fitted -- and that is exactly what happened. The first stem-200 run on
+        // this backend died at (195, 2) with the masks master needing 48.70 GiB against a 48 GiB
+        // reservation, on a 133 GiB card, while the cubecl arm of the same comparison completed
+        // under its own 64 GiB-per-array ceiling. The old default was lower than the backend it
+        // replaces.
+        //
+        // With the device's full memory reserved for each, the reservation can never be what
+        // stops a run. Physical memory is, and running out of that is a real `cuMemCreate` OOM
+        // that `grow_to` reports -- loud, and named.
+        let device_bytes = rt.context().total_mem().unwrap_or(48 << 30);
         Ok(Self {
-            cs: GrowBuf::reserve(dev, reserve_bytes("NASSAU_CUDA_RESERVE_CS_GIB", 48))?,
-            mk: GrowBuf::reserve(dev, reserve_bytes("NASSAU_CUDA_RESERVE_MK_GIB", 48))?,
+            cs: GrowBuf::reserve(
+                dev,
+                reserve_bytes("NASSAU_CUDA_RESERVE_CS_GIB", device_bytes),
+            )?
+            .named("col_sums master"),
+            mk: GrowBuf::reserve(
+                dev,
+                reserve_bytes("NASSAU_CUDA_RESERVE_MK_GIB", device_bytes),
+            )?
+            .named("masks master"),
             master: MasterLayout::default(),
-            pp: GrowBuf::reserve(dev, reserve_bytes("NASSAU_CUDA_RESERVE_PP_GIB", 8))?,
-            ln: GrowBuf::reserve(dev, reserve_bytes("NASSAU_CUDA_RESERVE_LN_GIB", 2))?,
+            pp: GrowBuf::reserve(dev, reserve_bytes("NASSAU_CUDA_RESERVE_PP_GIB", 8 << 30))?
+                .named("packed basis"),
+            ln: GrowBuf::reserve(dev, reserve_bytes("NASSAU_CUDA_RESERVE_LN_GIB", 2 << 30))?
+                .named("basis lengths"),
             basis: BasisLayout::default(),
-            g: GrowBuf::reserve(dev, reserve_bytes("NASSAU_CUDA_RESERVE_G_GIB", 2))?,
-            xi: GrowBuf::reserve(dev, 1)?,
+            g: GrowBuf::reserve(dev, reserve_bytes("NASSAU_CUDA_RESERVE_G_GIB", 2 << 30))?
+                .named("seqno g table"),
+            xi: GrowBuf::reserve(dev, 1)?.named("xi degrees"),
             seqno_degree: -1,
             width: 0,
             rt,

@@ -62,6 +62,17 @@ pub enum CudaError {
     Compile(String),
     /// A kernel or module name was not valid C.
     BadName(String),
+    /// A `GrowBuf` was asked to grow past its reserved address space.
+    ///
+    /// Its own variant, naming the buffer and both sizes, because the generic driver error it
+    /// replaces -- "grow_to beyond reserved address space" -- was the whole of the message the
+    /// first stem-200 run on this backend died with, and it said neither which of six buffers
+    /// overflowed nor by how much. That is the difference between a one-line fix and a search.
+    Capacity {
+        buffer: &'static str,
+        requested: usize,
+        reserved: usize,
+    },
 }
 
 impl std::fmt::Display for CudaError {
@@ -70,6 +81,17 @@ impl std::fmt::Display for CudaError {
             Self::Driver(what, r) => write!(f, "CUDA driver call {what} failed: {r:?}"),
             Self::Compile(log) => write!(f, "NVRTC compilation failed:\n{log}"),
             Self::BadName(n) => write!(f, "invalid kernel or module name: {n}"),
+            Self::Capacity {
+                buffer,
+                requested,
+                reserved,
+            } => write!(
+                f,
+                "resident buffer `{buffer}` needs {:.2} GiB but only {:.2} GiB of address space is \
+                 reserved for it",
+                *requested as f64 / (1u64 << 30) as f64,
+                *reserved as f64 / (1u64 << 30) as f64,
+            ),
         }
     }
 }
@@ -111,6 +133,8 @@ pub struct GrowBuf {
     /// Physical handles, kept so they can be released in `Drop`.
     handles: Vec<sys::CUmemGenericAllocationHandle>,
     device: i32,
+    /// What this buffer holds, for error messages. See [`CudaError::Capacity`].
+    name: &'static str,
 }
 
 // The buffer owns its mapping; the raw pointer is not aliased outside it.
@@ -168,7 +192,14 @@ impl GrowBuf {
             granularity,
             handles: Vec::new(),
             device,
+            name: "unnamed",
         })
+    }
+
+    /// Label the buffer, so running out of room names it.
+    pub fn named(mut self, name: &'static str) -> Self {
+        self.name = name;
+        self
     }
 
     /// Device pointer to the start of the buffer. Stable across every `grow_to`.
@@ -197,10 +228,11 @@ impl GrowBuf {
         }
         if bytes > self.reserved {
             // Out of reserved address space: a real limit, surfaced rather than hidden.
-            return Err(CudaError::Driver(
-                "grow_to beyond reserved address space",
-                sys::CUresult::CUDA_ERROR_OUT_OF_MEMORY,
-            ));
+            return Err(CudaError::Capacity {
+                buffer: self.name,
+                requested: bytes,
+                reserved: self.reserved,
+            });
         }
         let target = bytes.div_ceil(self.granularity) * self.granularity;
         let extra = target - self.committed;
