@@ -79,6 +79,7 @@ impl LaunchArrays {
         self.prod_r_index.len()
     }
 
+    /// Total THREADS this launch needs, i.e. tiles, not pairs.
     fn total_pairs(&self) -> u64 {
         *self.prod_pair_start.last().unwrap_or(&0)
     }
@@ -161,9 +162,13 @@ pub(super) fn marshal(
         a.prod_r_index.push(ri);
         a.prod_row_base.push((prod.row * num_limbs) as u32);
         a.prod_out_offset.push(prod.out_offset as u32);
-        let pairs = a.r_num_mats[ri as usize] as u64 * prod.term_indices.len() as u64;
+        // TILES, not pairs: a thread covers MATRIX_GROUP x TERM_GROUP of them, so this prefix sum
+        // -- and therefore the coarse index built from it -- is over threads. The ragged edge of a
+        // partial tile is dropped inside the kernel, not here.
+        let mg = (a.r_num_mats[ri as usize] as u64).div_ceil(params::MATRIX_GROUP as u64);
+        let tg = (prod.term_indices.len() as u64).div_ceil(params::TERM_GROUP as u64);
         a.prod_pair_start
-            .push(a.prod_pair_start.last().unwrap() + pairs);
+            .push(a.prod_pair_start.last().unwrap() + mg * tg);
     }
     a.prod_coarse = build_coarse(&a.prod_pair_start);
     Ok(a)
@@ -597,6 +602,8 @@ mod tests {
         ln: Vec<u32>,
         g: Vec<u32>,
         xi: Vec<u32>,
+        pp_shift: Vec<u32>,
+        pp_mask: Vec<u32>,
         width: usize,
         master: MasterLayout,
         basis: BasisLayout,
@@ -616,6 +623,8 @@ mod tests {
                 ln,
                 g,
                 xi: xi_table(algebra),
+                pp_shift: params::pp_shifts(),
+                pp_mask: params::pp_masks(),
                 width,
                 master: MasterLayout::default(),
                 basis,
@@ -673,99 +682,117 @@ mod tests {
             let p = lo;
             let ri = a.prod_r_index[p] as usize;
             let local = k - a.prod_pair_start[p];
-            let num_mats = a.r_num_mats[ri] as u64;
-            let mi = (local % num_mats) as usize;
-            let t = (local / num_mats) as usize;
+            let num_mats = a.r_num_mats[ri] as usize;
+            let nt = a.prod_num_terms[p] as usize;
+            // The kernel's tile decode, reproduced exactly: matrix fastest, ragged lanes dropped.
+            let mg_count = num_mats.div_ceil(params::MATRIX_GROUP) as u64;
+            let m_base = (local % mg_count) as usize * params::MATRIX_GROUP;
+            let t_base = (local / mg_count) as usize * params::TERM_GROUP;
 
             let cs_len = a.r_cs_len[ri] as usize;
             let mk_len = a.r_mk_len[ri] as usize;
-            let cs_base = a.r_cs_offset[ri] as usize + mi * cs_len;
-            let mk_base = a.r_mk_offset[ri] as usize + mi * mk_len;
 
-            let gei = a.term_gei[a.prod_term_start[p] as usize + t] as usize;
-            let term_len = s.ln[gei] as usize;
-            let b_base = gei * s.width;
+            for (mm, tt) in (0..params::MATRIX_GROUP)
+                .flat_map(|mm| (0..params::TERM_GROUP).map(move |tt| (mm, tt)))
+            {
+                if m_base + mm >= num_mats || t_base + tt >= nt {
+                    continue;
+                }
+                let mi = m_base + mm;
+                let cs_base = a.r_cs_offset[ri] as usize + mi * cs_len;
+                let mk_base = a.r_mk_offset[ri] as usize + mi * mk_len;
 
-            let cols = cs_len.max(mk_len).max(term_len);
-            let low = term_len.min(cs_len);
-            let mut working = [0u32; params::PPART_MAX_LEN];
-            let mut rejected = false;
-            for j in 0..cols {
-                let b = if j < term_len {
-                    s.pp[b_base + j] as u32
-                } else {
-                    0
-                };
-                let c = if j < cs_len {
-                    s.cs[cs_base + j] as u32
-                } else {
-                    0
-                };
-                let msk = if j < mk_len {
-                    s.mk[mk_base + j] as u32
-                } else {
-                    0
-                };
-                // The same uniform per-position rule as `pair_col` in multiply.cu.
-                let val = if j < low {
-                    if c > b || ((b - c) & msk) != 0 {
+                let gei = a.term_gei[a.prod_term_start[p] as usize + t_base + tt] as usize;
+                let term_len = s.ln[gei] as usize;
+                let b_base = gei * s.width;
+
+                let cols = cs_len.max(mk_len).max(term_len);
+                let low = term_len.min(cs_len);
+                // Packed exactly as the kernel packs it, so the walk keeps testing what the kernel
+                // does rather than an equivalent-but-different assembly.
+                let mut working: u64 = 0;
+                let mut rejected = false;
+                #[allow(clippy::needless_range_loop)]
+                for j in 0..cols {
+                    let b = if j < term_len {
+                        s.pp[b_base + j] as u32
+                    } else {
+                        0
+                    };
+                    let c = if j < cs_len {
+                        s.cs[cs_base + j] as u32
+                    } else {
+                        0
+                    };
+                    let msk = if j < mk_len {
+                        s.mk[mk_base + j] as u32
+                    } else {
+                        0
+                    };
+                    // The same uniform per-position rule as `pair_col` in multiply.cu.
+                    let val = if j < low {
+                        if c > b || ((b - c) & msk) != 0 {
+                            None
+                        } else {
+                            Some((b - c) | msk)
+                        }
+                    } else if c > 0 || (b & msk) != 0 {
                         None
                     } else {
-                        Some((b - c) | msk)
-                    }
-                } else if c > 0 || (b & msk) != 0 {
-                    None
-                } else {
-                    Some(b | msk)
-                };
-                match val {
-                    None => rejected = true,
-                    Some(v) => {
-                        if j < params::PPART_MAX_LEN {
-                            working[j] = v;
+                        Some(b | msk)
+                    };
+                    match val {
+                        None => rejected = true,
+                        Some(v) => {
+                            if j < params::PPART_MAX_LEN {
+                                working |= u64::from(v & s.pp_mask[j]) << s.pp_shift[j];
+                            }
                         }
                     }
                 }
-            }
-            if rejected {
-                continue;
-            }
-
-            // seqno_core.
-            let mut cur_d = 0u32;
-            for h in 0..params::PPART_MAX_LEN {
-                cur_d += working[h] * s.xi[h];
-            }
-            let mut rank = 0u32;
-            for hh in 1..params::PPART_MAX_LEN {
-                let h = params::PPART_MAX_LEN - hh;
-                let r = working[h];
-                if r != 0 {
-                    let below = cur_d - r * s.xi[h];
-                    rank += s.g[cur_d as usize * s.width + h] - s.g[below as usize * s.width + h];
-                    cur_d = below;
-                }
-            }
-
-            let mut bit_pos = a.prod_out_offset[p] as usize + rank as usize;
-            if let Some(map) = col_map {
-                if bit_pos >= map.len() {
+                if rejected {
                     continue;
                 }
-                match map[bit_pos] {
-                    COL_MAP_DROP => continue,
-                    mapped => bit_pos = mapped as usize,
+
+                // seqno_core.
+                let digit =
+                    |h: usize| ((working >> s.pp_shift[h]) & u64::from(s.pp_mask[h])) as u32;
+                let mut cur_d = 0u32;
+                for h in 0..params::PPART_MAX_LEN {
+                    cur_d += digit(h) * s.xi[h];
                 }
+                let mut rank = 0u32;
+                for hh in 1..params::PPART_MAX_LEN {
+                    let h = params::PPART_MAX_LEN - hh;
+                    let r = digit(h);
+                    if r != 0 {
+                        let below = cur_d - r * s.xi[h];
+                        rank +=
+                            s.g[cur_d as usize * s.width + h] - s.g[below as usize * s.width + h];
+                        cur_d = below;
+                    }
+                }
+
+                let mut bit_pos = a.prod_out_offset[p] as usize + rank as usize;
+                if let Some(map) = col_map {
+                    if bit_pos >= map.len() {
+                        continue;
+                    }
+                    match map[bit_pos] {
+                        COL_MAP_DROP => continue,
+                        mapped => bit_pos = mapped as usize,
+                    }
+                }
+                let limb = bit_pos / 32;
+                if limb >= num_limbs {
+                    continue;
+                }
+                let word = a.prod_row_base[p] as usize + limb;
+                if word >= out.len() {
+                    continue;
+                }
+                out[word] ^= 1u32 << (bit_pos % 32);
             }
-            let limb = bit_pos / 32;
-            if limb >= num_limbs {
-                continue;
-            }
-            let word = a.prod_row_base[p] as usize + limb;
-            if word >= out.len() {
-                continue;
-            }
-            out[word] ^= 1u32 << (bit_pos % 32);
         }
         out
     }

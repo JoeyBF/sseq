@@ -20,6 +20,18 @@
 #ifndef COARSE_LOG
 #error "COARSE_LOG must be provided as an NVRTC -D option (see params.rs)"
 #endif
+#ifndef PP_SHIFTS
+#error "PP_SHIFTS must be provided as an NVRTC -D option (see params.rs)"
+#endif
+#ifndef PP_MASKS
+#error "PP_MASKS must be provided as an NVRTC -D option (see params.rs)"
+#endif
+#ifndef TERM_GROUP
+#error "TERM_GROUP must be provided as an NVRTC -D option (see params.rs)"
+#endif
+#ifndef MATRIX_GROUP
+#error "MATRIX_GROUP must be provided as an NVRTC -D option (see params.rs)"
+#endif
 
 typedef unsigned short u16;
 typedef unsigned int u32;
@@ -57,6 +69,14 @@ __device__ __forceinline__ u32 pair_col(u32 j, u32 low, u32 b, u32 cs, u32 mk) {
     return b | mk;
 }
 
+// Where each p-part digit sits inside the packed accumulator, straight from `PPart`'s own layout.
+//
+// `__device__ const` rather than a kernel argument: the values are compile-time constants, every
+// lane of a warp reads the same entry, and a broadcast out of the constant cache beats a global
+// load. They arrive as -D brace initializers so `PPart::shift` stays the single source of truth.
+__device__ static const u32 PP_SHIFT[PPART_MAX_LEN] = PP_SHIFTS;
+__device__ static const u32 PP_MASK[PPART_MAX_LEN] = PP_MASKS;
+
 // The index of P(working) in the Milnor basis of its degree, from the flat `g` table with no
 // hashing -- the device port of `MilnorAlgebra::seqno`.
 //
@@ -66,16 +86,17 @@ __device__ __forceinline__ u32 pair_col(u32 j, u32 low, u32 b, u32 cs, u32 mk) {
 // there is forced by that degree bound, not a cap something could exceed.
 __device__ __forceinline__ u32 seqno_core(const u32 *__restrict__ g,
                                           const u32 *__restrict__ xi,
-                                          const u32 *working, u32 wlen, u32 width) {
-    // cur_d = sum_h working[h] * xi[h]
+                                          u64 working, u32 wlen, u32 width) {
+    // cur_d = sum_h working[h] * xi[h], reading digits out of the packed word.
     u32 cur_d = 0;
-    for (u32 h = 0; h < wlen; ++h) cur_d += working[h] * xi[h];
+    for (u32 h = 0; h < wlen; ++h)
+        cur_d += (u32)((working >> PP_SHIFT[h]) & PP_MASK[h]) * xi[h];
 
     // Rank by consuming positions from high to low; position 0 contributes nothing.
     u32 rank = 0;
     for (u32 hh = 1; hh < wlen; ++hh) {
         u32 h = wlen - hh;
-        u32 r = working[h];
+        u32 r = (u32)((working >> PP_SHIFT[h]) & PP_MASK[h]);
         if (r != 0) {
             u32 below = cur_d - r * xi[h];
             rank += g[(u64)cur_d * width + h] - g[(u64)below * width + h];
@@ -85,7 +106,42 @@ __device__ __forceinline__ u32 seqno_core(const u32 *__restrict__ g,
     return rank;
 }
 
-// One launch covering all (R, s) products of a batch; one thread per (product, matrix, term) pair.
+// Write one accepted pair's F2 bit. Factored out because a tile has MATRIX_GROUP*TERM_GROUP of
+// these, and duplicating the bounds reasoning that many times is how one copy ends up missing a
+// guard.
+__device__ __forceinline__ void emit_bit(const u32 *__restrict__ g, const u32 *__restrict__ xi,
+                                         u32 *out, const u32 *__restrict__ col_map, u32 col_map_len,
+                                         u32 use_col_map, u64 working, u32 out_offset, u32 row_base,
+                                         u32 width, u32 num_limbs, u64 out_len) {
+    // No explicit trailing-zero trim is needed: seqno_core skips zero entries and `working` beyond
+    // the assembled length is zero, so running the full PPART_MAX_LEN is equivalent to the CPU's
+    // trimmed p_part.
+    u32 idx = seqno_core(g, xi, working, PPART_MAX_LEN, width);
+
+    // `out_offset` shifts the basis index to this product's target-generator block within the row
+    // (0 for a single-block output). Both are bit offsets, added before splitting into (limb, bit).
+    u64 bit_pos = (u64)out_offset + idx;
+    if (use_col_map) {
+        // bit_pos can exceed the full width -- a kept block's out_offset + seqno may span past it,
+        // which is exactly what the unmasked path drops via the num_limbs test below.
+        if (bit_pos >= (u64)col_map_len) return;
+        u32 mapped = col_map[bit_pos];
+        if (mapped == COL_MAP_DROP) return;
+        bit_pos = mapped;
+    }
+    // Two independent bounds, both required: `limb < num_limbs` keeps the write inside this row
+    // (out_offset + seqno can span past it, which would silently corrupt the NEXT row), and
+    // `word < out_len` guards the buffer itself. compute-sanitizer caught both as distinct
+    // out-of-bounds atomics when either was missing.
+    u64 limb = bit_pos / 32;
+    if (limb >= (u64)num_limbs) return;
+    u64 word = (u64)row_base + limb;
+    if (word >= out_len) return;
+    atomicXor(&out[word], 1u << (u32)(bit_pos % 32));
+}
+
+// One launch covering all (R, s) products of a batch; one thread per TILE of
+// MATRIX_GROUP x TERM_GROUP pairs.
 //
 // The pair a thread handles is DECODED rather than tabulated. A per-pair table would be seven
 // arrays of total-pair length -- gigabytes at scale, almost all of it redundant. Instead
@@ -178,69 +234,118 @@ extern "C" __global__ __launch_bounds__(THREADS) void multiply_batch(
     u32 ri = prod_r_index[p];
     u64 local = k - prod_pair_start[p];
     u32 num_mats = r_num_mats[ri];
-    // MATRIX varies fastest, term slowest. The obvious decode has the opposite order, and it is the
-    // kernel's dominant cost: consecutive threads then share a matrix but each takes a DIFFERENT
-    // term, whose p-part sits at an arbitrary basis index -- a 32-way scatter across a multi-GB
-    // resident basis, ~2 useful bytes per 32-byte sector fetched. Kept from the start because it is
-    // a permutation of the same pair set, not a change to what is computed.
-    u32 m = (u32)(local % num_mats);
-    u32 t = (u32)(local / num_mats);
+    u32 nt = prod_num_terms[p];
+
+    // A THREAD COVERS A TILE of MATRIX_GROUP matrices x TERM_GROUP terms.
+    //
+    // col_sums/masks depend only on the matrix and a term's p-part only on the term, so an MxT tile
+    // reads 2M + T values per column to evaluate M*T pairs -- 1.17 loads per pair at 2x3, against
+    // 1.67 at 1x3 and 3 at 1x1. The kernel is issue-limited on integer work, so fewer loads and
+    // fewer addresses is the lever.
+    //
+    // The two axes are NOT symmetric. Terms are few (nt ~ 5), so the ragged tail dominates the
+    // choice of TERM_GROUP and 4 loses to 3 purely on wasted lanes. Matrices are many (~20000), so
+    // a partial matrix tile costs a few idle lanes out of thousands.
+    //
+    // Matrix varies fastest. The opposite order gives each lane of a warp a different term, whose
+    // p-part sits at an arbitrary basis index -- a 32-way scatter across a multi-GB resident basis.
+    u32 mg_count = (num_mats + MATRIX_GROUP - 1) / MATRIX_GROUP;
+    u32 mg = (u32)(local % mg_count);
+    u32 tg = (u32)(local / mg_count);
+    u32 m_base = mg * MATRIX_GROUP;
+    u32 t_base = tg * TERM_GROUP;
 
     u32 cs_len = r_cs_len[ri];
     u32 mk_len = r_mk_len[ri];
-    u64 cs_base = r_cs_offset[ri] + (u64)m * cs_len;
-    u64 mk_base = r_mk_offset[ri] + (u64)m * mk_len;
 
-    u32 gei = term_gei[prod_term_start[p] + t];
-    u32 term_len = ln[gei];
-    u64 b_base = (u64)gei * width;
+    // Per-term p-part offsets and lengths. Lanes past `nt` carry term_len = 0 and are excluded at
+    // the emit below: an all-zero term against an all-zero column does NOT reject, so they would
+    // otherwise emit a spurious seqno(0) bit.
+    u32 term_len[TERM_GROUP];
+    u64 b_base[TERM_GROUP];
+    u32 low[TERM_GROUP];
+    u32 cols = (cs_len > mk_len) ? cs_len : mk_len;
+#pragma unroll
+    for (u32 tt = 0; tt < TERM_GROUP; ++tt) {
+        u32 tl = 0;
+        u64 bb = 0;
+        if (t_base + tt < nt) {
+            u32 gei = term_gei[prod_term_start[p] + t_base + tt];
+            tl = ln[gei];
+            bb = (u64)gei * width;
+        }
+        term_len[tt] = tl;
+        b_base[tt] = bb;
+        low[tt] = (tl < cs_len) ? tl : cs_len;
+        if (tl > cols) cols = tl;
+    }
+
+    // Matrix lane bases, CLAMPED rather than branched. A trailing lane of a partial tile then reads
+    // a real (duplicate) matrix instead of nothing, and the emit tail drops it on the same
+    // condition -- so nothing it computes is ever observed, while the branch and its reconvergence
+    // leave the column loop entirely. num_mats >= 1 for every live R (mg_count divides by it), so
+    // the clamp always names a real matrix.
+    u64 cs_b[MATRIX_GROUP];
+    u64 mk_b[MATRIX_GROUP];
+#pragma unroll
+    for (u32 mm = 0; mm < MATRIX_GROUP; ++mm) {
+        u32 mi = m_base + mm;
+        if (mi >= num_mats) mi = num_mats - 1;
+        cs_b[mm] = r_cs_offset[ri] + (u64)mi * cs_len;
+        mk_b[mm] = r_mk_offset[ri] + (u64)mi * mk_len;
+    }
+
+    u64 working[MATRIX_GROUP * TERM_GROUP];
+    u32 rejected[MATRIX_GROUP * TERM_GROUP];
+#pragma unroll
+    for (u32 i = 0; i < MATRIX_GROUP * TERM_GROUP; ++i) {
+        working[i] = 0;
+        rejected[i] = 0;
+    }
 
     // Past the longest of the three inputs, b, cs and mk are all zero, so pair_col returns 0 -- no
-    // rejection and nothing added to `working`. Stopping there is exact, not a truncation.
-    u32 cols = cs_len;
-    if (mk_len > cols) cols = mk_len;
-    if (term_len > cols) cols = term_len;
-
-    u32 low = (term_len < cs_len) ? term_len : cs_len;
-    u32 working[PPART_MAX_LEN];
-#pragma unroll
-    for (u32 i = 0; i < PPART_MAX_LEN; ++i) working[i] = 0;
-
-    u32 rejected = 0;
+    // rejection and nothing added. Stopping there is exact, not a truncation.
     for (u32 j = 0; j < cols; ++j) {
-        u32 b = (j < term_len) ? (u32)pp[b_base + j] : 0u;
-        u32 c = (j < cs_len) ? (u32)cs[cs_base + j] : 0u;
-        u32 msk = (j < mk_len) ? (u32)mk[mk_base + j] : 0u;
-        u32 val = pair_col(j, low, b, c, msk);
-        rejected |= val & PAIR_COL_REJECT;
-        if (j < PPART_MAX_LEN) working[j] = val & 0xffffu;
-    }
-    if (rejected) return;
+        // 2M + T loads feeding M*T evaluations: this is the whole point of the tile.
+        u32 cv[MATRIX_GROUP];
+        u32 mv[MATRIX_GROUP];
+#pragma unroll
+        for (u32 mm = 0; mm < MATRIX_GROUP; ++mm) {
+            cv[mm] = (j < cs_len) ? (u32)cs[cs_b[mm] + j] : 0u;
+            mv[mm] = (j < mk_len) ? (u32)mk[mk_b[mm] + j] : 0u;
+        }
+        u32 bv[TERM_GROUP];
+#pragma unroll
+        for (u32 tt = 0; tt < TERM_GROUP; ++tt)
+            bv[tt] = (j < term_len[tt]) ? (u32)pp[b_base[tt] + j] : 0u;
 
-    // No explicit trailing-zero trim is needed: seqno_core skips zero entries and `working` beyond
-    // the assembled length is zero, so running the full PPART_MAX_LEN is equivalent to the CPU's
-    // trimmed p_part. `xi` is host-padded to at least PPART_MAX_LEN so the cur_d sum stays in
-    // bounds; the extra terms are 0 * xi.
-    u32 idx = seqno_core(g, xi, working, PPART_MAX_LEN, width);
-
-    // `out_offset` shifts the basis index to this product's target-generator block within the row
-    // (0 for a single-block output). Both are bit offsets, added before splitting into (limb, bit).
-    u64 bit_pos = (u64)prod_out_offset[p] + idx;
-    if (use_col_map) {
-        // bit_pos can exceed the full width -- a kept block's out_offset + seqno may span past it,
-        // which is exactly what the unmasked path drops via the num_limbs test below.
-        if (bit_pos >= (u64)col_map_len) return;
-        u32 mapped = col_map[bit_pos];
-        if (mapped == COL_MAP_DROP) return;
-        bit_pos = mapped;
+        // One shift/mask pair per column, shared by every lane of the tile.
+        u32 jj = (j < PPART_MAX_LEN) ? j : 0;
+        u32 sh = PP_SHIFT[jj];
+        u32 fm = PP_MASK[jj];
+#pragma unroll
+        for (u32 mm = 0; mm < MATRIX_GROUP; ++mm) {
+#pragma unroll
+            for (u32 tt = 0; tt < TERM_GROUP; ++tt) {
+                u32 i = mm * TERM_GROUP + tt;
+                u32 val = pair_col(j, low[tt], bv[tt], cv[mm], mv[mm]);
+                rejected[i] |= val & PAIR_COL_REJECT;
+                if (j < PPART_MAX_LEN) working[i] |= (u64)(val & fm) << sh;
+            }
+        }
     }
-    // Two independent bounds, both required: `limb < num_limbs` keeps the write inside this row
-    // (out_offset + seqno can span past it, which would silently corrupt the NEXT row), and
-    // `word < out_len` guards the buffer itself. compute-sanitizer caught both as distinct
-    // out-of-bounds atomics when either was missing.
-    u64 limb = bit_pos / 32;
-    if (limb >= (u64)num_limbs) return;
-    u64 word = (u64)prod_row_base[p] + limb;
-    if (word >= out_len) return;
-    atomicXor(&out[word], 1u << (u32)(bit_pos % 32));
+
+    // Emit, dropping the lanes a partial tile invented.
+#pragma unroll
+    for (u32 mm = 0; mm < MATRIX_GROUP; ++mm) {
+        if (m_base + mm >= num_mats) continue;
+#pragma unroll
+        for (u32 tt = 0; tt < TERM_GROUP; ++tt) {
+            if (t_base + tt >= nt) continue;
+            u32 i = mm * TERM_GROUP + tt;
+            if (rejected[i]) continue;
+            emit_bit(g, xi, out, col_map, col_map_len, use_col_map, working[i], prod_out_offset[p],
+                     prod_row_base[p], width, num_limbs, out_len);
+        }
+    }
 }

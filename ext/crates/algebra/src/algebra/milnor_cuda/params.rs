@@ -53,6 +53,33 @@ pub const WORKING_CAP: usize = 32;
 /// Threads per block.
 pub const THREADS: usize = 256;
 
+/// Bit position of each packed p-part digit, from `PPart`'s own layout.
+///
+/// The accumulator the kernel assembles a p-part into is ONE `u64`, not an array, and these are
+/// where each digit lives in it. Read from `PPart::shift` rather than restated, so a change to the
+/// packing cannot leave the kernel silently reading the wrong bits.
+pub fn pp_shifts() -> Vec<u32> {
+    (0..PPART_MAX_LEN)
+        .map(|i| crate::algebra::milnor_algebra::PPart::shift(i))
+        .collect()
+}
+
+/// Field mask of each packed digit.
+pub fn pp_masks() -> Vec<u32> {
+    (0..PPART_MAX_LEN)
+        .map(|i| {
+            let w = crate::algebra::milnor_algebra::PPart::width(i);
+            ((1u64 << w) - 1) as u32
+        })
+        .collect()
+}
+
+/// Render a list as a C brace initializer, so a table can travel as a `-D` option.
+fn brace(values: &[u32]) -> String {
+    let body: Vec<String> = values.iter().map(u32::to_string).collect();
+    format!("{{{}}}", body.join(","))
+}
+
 /// The knobs as NVRTC `-D` options.
 ///
 /// Per-launch values (`num_segs`, `sq_len`, `cols`, `cs_transposed` in the cubecl kernel) are NOT
@@ -71,6 +98,10 @@ pub fn defines() -> Vec<(&'static str, String)> {
     ]
     .iter()
     .map(|(name, value)| (*name, value.to_string()))
+    .chain([
+        ("PP_SHIFTS", brace(&pp_shifts())),
+        ("PP_MASKS", brace(&pp_masks())),
+    ])
     .collect()
 }
 
