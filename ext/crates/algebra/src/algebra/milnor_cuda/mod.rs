@@ -38,6 +38,7 @@
 //! declined, and the banner still printed. Compiling at runtime also specialises per device
 //! architecture and lets `#[comptime]`-style folding become `-D` defines.
 
+pub mod enumerate;
 pub mod multiply;
 pub mod params;
 pub mod resident;

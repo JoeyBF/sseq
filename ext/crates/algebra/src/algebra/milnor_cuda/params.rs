@@ -74,6 +74,47 @@ pub fn defines() -> Vec<(&'static str, String)> {
     .collect()
 }
 
+/// Rows of the enumeration's per-thread matrix: `rows = |p_part| <= MAX_XI_TAU`.
+pub const ENUM_ROW_CAP: usize = fp::MAX_MULTINOMIAL_LEN;
+
+/// Columns of the enumeration's per-thread matrix.
+///
+/// `cols` is the widest BIT-LENGTH of any p-part entry, so its true bound is `PPart::width(0)` --
+/// the field holding `r_1`, the widest -- and NOT [`WORKING_CAP`], which sizes an unrelated array
+/// (the multiply kernel's assembled p-part) and is nearly 3x larger. That conflation once made
+/// `matrix`, the hottest per-thread array, 320 `u32` instead of 110. It is CUDA LOCAL memory --
+/// dynamically indexed, so it cannot be register-allocated and every access is a real off-chip
+/// load. Deriving the cap from the width table keeps it correct if `PPart`'s layout ever changes.
+pub const ENUM_COL_CAP: usize = crate::algebra::milnor_algebra::PPart::width(0) as usize;
+
+/// `matrix` is `rows * cols`, `col_sums` is `cols - 1`, `masks` is `rows + cols - 1`.
+pub const ENUM_MATRIX_CAP: usize = ENUM_ROW_CAP * ENUM_COL_CAP;
+pub const ENUM_MASK_CAP: usize = ENUM_ROW_CAP + ENUM_COL_CAP;
+
+/// Threads per block for the enumeration kernel.
+///
+/// Small on purpose, and it costs nothing. The kernel is one thread per `R`, and a production
+/// launch carries ~1293 `R`s on average -- about 6 blocks against an H200's 3168 block slots, i.e.
+/// `Waves Per SM = 0.002`. The SMs are empty either way, which a block-size sweep confirmed from
+/// the other side: 256/64/32 threads measured 561/569/542 s, flat. Grid width does not set this
+/// kernel's time; its LONGEST SINGLE `R` does, because one thread walks that `R`'s odometer
+/// sequentially.
+pub const ENUM_THREADS: usize = 32;
+
+/// The enumeration knobs as NVRTC `-D` options.
+pub fn enum_defines() -> Vec<(&'static str, String)> {
+    [
+        ("ENUM_ROW_CAP", ENUM_ROW_CAP),
+        ("ENUM_COL_CAP", ENUM_COL_CAP),
+        ("ENUM_MATRIX_CAP", ENUM_MATRIX_CAP),
+        ("ENUM_MASK_CAP", ENUM_MASK_CAP),
+        ("ENUM_THREADS", ENUM_THREADS),
+    ]
+    .iter()
+    .map(|(name, value)| (*name, value.to_string()))
+    .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
