@@ -399,13 +399,6 @@ fn run(
     let num_limbs = num_cols.div_ceil(32).max(1);
     let out_len = num_rows * num_limbs;
 
-    // Held across the whole launch. The resident buffers are append-only, so a concurrent append
-    // could not invalidate this launch's pointers -- but the layout bookkeeping is not yet
-    // lock-free, and correctness comes first.
-    let store = resident(rt)?;
-    let mut store = store.lock().unwrap();
-
-    // `ensure_seqno` FIRST: it establishes `width`, which is the stride `ensure_basis` pads to.
     let max_out_degree = products
         .iter()
         .map(|p| p.r_degree + p.s_degree)
@@ -413,35 +406,66 @@ fn run(
         .unwrap_or(0)
         .max(1);
     let max_s_degree = products.iter().map(|p| p.s_degree).max().unwrap_or(0);
-    store.ensure_seqno(algebra, max_out_degree)?;
-    store.ensure_basis(algebra, max_s_degree)?;
 
-    // Make every `R` this batch needs resident in ONE enumeration launch, before marshalling.
-    //
-    // Per-`R`, on demand, would be one launch each, and the enum kernel's duration is set by its
-    // longest single `R` rather than by how many it carries -- so batching turns a sum into a max.
-    // It also keeps the enumerated matrices off the host entirely: they are written straight into
-    // the resident buffers.
-    // One pass over the products decides both which `R`s to make resident and what the kernel's
-    // launch-local `R` index is for each product.
+    // OUTSIDE THE LOCK. One pass over the products decides both which `R`s to make resident and
+    // what the kernel's launch-local `R` index is for each product -- and it needs nothing from
+    // the store, so there is no reason for other threads to wait through it.
     let (needed, r_index) = plan_rs(algebra, products);
-    let r_infos = if cpu_enumeration() {
-        needed
-            .iter()
-            .map(|p| store.ensure_r(algebra, p))
-            .collect::<Result<Vec<_>>>()?
-    } else {
-        store.ensure_rs(rt, &needed)?
+
+    // THE CRITICAL SECTION IS ONLY WHAT MUTATES THE STORE, plus the snapshot taken out of it.
+    //
+    // Everything after this -- marshalling, the launches, the readback -- runs on locals. That is
+    // sound because the store is APPEND-ONLY: its device pointers are stable for the life of the
+    // process, and a concurrent append can add data but can never move or free what this launch
+    // has already resolved.
+    //
+    // Holding the lock across the whole launch instead measured a 0.95x "speedup" for four
+    // concurrent threads: full serialisation, plus the cost of contending for it. That matters
+    // more than any single launch's cost, because a frontier run has ~18 threads inside GPU calls
+    // at once.
+    let (r_infos, bases, p_cs, p_mk, p_pp, p_ln, p_g, p_xi, width) = {
+        let store = resident(rt)?;
+        let t_lock = Instant::now();
+        let mut store = store.lock().unwrap();
+        if std::env::var_os("NASSAU_CUDA_LOCK_INFO").is_some() {
+            eprintln!("[lock] waited {:.4}s", t_lock.elapsed().as_secs_f64());
+        }
+        // `ensure_seqno` FIRST: it establishes `width`, the stride `ensure_basis` pads to.
+        store.ensure_seqno(algebra, max_out_degree)?;
+        store.ensure_basis(algebra, max_s_degree)?;
+        // Every `R` this batch needs, made resident in ONE enumeration launch. Per-`R` on demand
+        // would be one launch each, and the enum kernel's duration is set by its longest single
+        // `R` rather than by how many it carries -- so batching turns a sum into a max.
+        let r_infos = if cpu_enumeration() {
+            needed
+                .iter()
+                .map(|p| store.ensure_r(algebra, p))
+                .collect::<Result<Vec<_>>>()?
+        } else {
+            store.ensure_rs(rt, &needed)?
+        };
+        // The basis is fully built above, so snapshotting each degree's base here is exact.
+        let bases: Vec<u32> = (0..=max_s_degree.max(0))
+            .map(|d| store.basis().gei(d, 0))
+            .collect();
+        (
+            r_infos,
+            bases,
+            store.cs_ptr(),
+            store.mk_ptr(),
+            store.pp_ptr(),
+            store.ln_ptr(),
+            store.g_ptr(),
+            store.xi_ptr(),
+            store.width() as u32,
+        )
     };
 
     timing.resident = t_resident.elapsed().as_secs_f64();
     let t_marshal = Instant::now();
 
-    // Shared by every block: the basis bases, the compiled module, the resident pointers and the
-    // column map. Only the per-product arrays and the output buffer are per block.
-    let bases: Vec<u32> = (0..=max_s_degree.max(0))
-        .map(|d| store.basis().gei(d, 0))
-        .collect();
+    // Shared by every block: the compiled module, the snapshotted resident pointers and the column
+    // map. Only the per-product arrays and the output buffer are per block.
     let gei_of = move |d: i32, ti: usize| bases[d as usize] + ti as u32;
 
     let module = rt.module(&module_key(), SRC, &params::defines())?;
@@ -479,20 +503,9 @@ fn run(
     let cm: Vec<u32> = col_map.map_or_else(|| vec![0u32], <[u32]>::to_vec);
     let d_cm = up!(cm);
 
-    // Resident buffers reach the kernel as raw device pointers. A `CUdeviceptr` is a `u64` and a
-    // kernel pointer parameter is a 64-bit value, so pushing it as a scalar is the same eight bytes
-    // cudarc would push for one of its own slices.
-    let p_cs = store.cs_ptr();
-    let p_mk = store.mk_ptr();
-    let p_pp = store.pp_ptr();
-    let p_ln = store.ln_ptr();
-    let p_g = store.g_ptr();
-    let p_xi = store.xi_ptr();
-
     // Scalars need bindings: `arg` borrows, so a temporary would be dropped before the launch.
     let col_map_len = col_map.map_or(0u32, |c| c.len() as u32);
     let use_col_map = u32::from(col_map.is_some());
-    let width = store.width() as u32;
     let num_limbs_u = num_limbs as u32;
     let threads = params::THREADS as u32;
     // Walk the pair space in pieces that each fit the 32-bit thread index, so one oversized row
@@ -1270,6 +1283,127 @@ mod tests {
         for (r, (a, b)) in got.iter_rows().zip(want.iter_rows()).enumerate() {
             assert_eq!(a, b, "row {r} differs from the masked CPU reference");
         }
+    }
+
+    /// Do concurrent launches on one device OVERLAP, or does the resident store serialise them?
+    ///
+    /// This matters more than any single launch's cost. A production frontier run has roughly 18
+    /// threads inside GPU calls at once against 3 devices; if they queue behind one mutex, every
+    /// per-launch optimisation in this module is competing for a lane that is already full.
+    ///
+    /// Reports the speedup of N threads against the same work done serially. Perfect overlap is
+    /// bounded well below N -- the device is shared and the kernel is most of the launch -- so the
+    /// number to watch is whether it is ABOVE 1.0 at all.
+    #[test]
+    #[ignore = "needs a CUDA device and captured batches; run explicitly with --ignored"]
+    fn cuda_concurrent_launches_overlap() {
+        use std::time::Instant;
+
+        let Ok(dir) = std::env::var("NASSAU_REPLAY_PRODUCTS") else {
+            panic!("NASSAU_REPLAY_PRODUCTS is unset; nothing to replay");
+        };
+        let mut files: Vec<String> = std::fs::read_dir(&dir)
+            .expect("read capture dir")
+            .filter_map(|e| e.ok())
+            .map(|e| e.path().display().to_string())
+            .filter(|p| p.ends_with(".bin"))
+            .collect();
+        files.sort();
+        assert!(files.len() >= 2, "need at least two captures to overlap");
+
+        let loaded: Vec<_> = files
+            .iter()
+            .map(|f| load_captured_batch(f).expect("load"))
+            .collect();
+        let max_degree = loaded
+            .iter()
+            .flat_map(|(_, _, _, prods)| prods.iter().map(|p| p.r_degree + p.s_degree))
+            .max()
+            .unwrap_or(1)
+            .max(1);
+        let algebra = algebra_to(max_degree);
+        let rt = super::super::runtime(0).expect("open device 0");
+
+        // Warm the store so the measurement is about the launch, not first-touch enumeration.
+        for (rows, cols, cm, prods) in &loaded {
+            cuda_multiply_batch(&rt, &algebra, *cols, *rows, prods, cm.as_deref()).expect("warm");
+        }
+
+        let reps = 3usize;
+        // The timed closure LAUNCHES AND DROPS. It must not digest: that is ~50ms of host work on
+        // a 338 MB output, it happens outside the store's lock, and letting it into the timed
+        // region makes the parallel arm look like it overlapped launches when what overlapped was
+        // the hashing. That confound read as a 1.73x speedup while the lock data showed 0.94s of
+        // genuine serialisation.
+        let run_one = |i: usize| {
+            let (rows, cols, cm, prods) = &loaded[i % loaded.len()];
+            let out = cuda_multiply_batch(&rt, &algebra, *cols, *rows, prods, cm.as_deref())
+                .expect("device batch");
+            out.rows()
+        };
+        // Correctness is checked once, untimed, comparing a serial pass against a concurrent one.
+        let digest_one = |i: usize| {
+            let (rows, cols, cm, prods) = &loaded[i % loaded.len()];
+            cuda_multiply_batch(&rt, &algebra, *cols, *rows, prods, cm.as_deref())
+                .expect("device batch")
+                .digest()
+        };
+        let serial_digests: Vec<_> = (0..loaded.len()).map(digest_one).collect();
+        let concurrent_digests: Vec<_> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..loaded.len())
+                .map(|i| {
+                    let digest_one = &digest_one;
+                    scope.spawn(move || digest_one(i))
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        assert_eq!(
+            serial_digests, concurrent_digests,
+            "concurrent launches disagreed with serial ones"
+        );
+        assert!(
+            serial_digests.iter().all(|&(_, ones)| ones > 0),
+            "all-zero outputs digest fine; this measured nothing"
+        );
+
+        // The serial arm must do the SAME work in the SAME grouping as the parallel one: each
+        // batch `reps` times in a row. Cycling the batches instead would give the parallel arm a
+        // locality advantage -- each of its threads repeats one batch -- and the measurement would
+        // credit that to overlap.
+        // Both arms do the SAME work in the SAME grouping: each batch `reps` times in a row.
+        let t = Instant::now();
+        for i in 0..loaded.len() {
+            for _ in 0..reps {
+                std::hint::black_box(run_one(i));
+            }
+        }
+        let serial = t.elapsed().as_secs_f64();
+
+        let t = Instant::now();
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..loaded.len())
+                .map(|i| {
+                    let run_one = &run_one;
+                    scope.spawn(move || {
+                        for _ in 0..reps {
+                            std::hint::black_box(run_one(i));
+                        }
+                    })
+                })
+                .collect();
+            for h in handles {
+                h.join().unwrap();
+            }
+        });
+        let parallel = t.elapsed().as_secs_f64();
+
+        eprintln!(
+            "[concurrency] {} threads x {reps} reps: serial={serial:.3}s parallel={parallel:.3}s \
+             speedup={:.2}x",
+            loaded.len(),
+            serial / parallel
+        );
     }
 
     /// Replay REAL captured batches through the device and against the CPU reference.
