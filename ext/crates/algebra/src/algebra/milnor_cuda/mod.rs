@@ -324,9 +324,15 @@ fn arch_str(major: u32, minor: u32) -> Option<&'static str> {
 /// copy never happens.
 pub struct PinnedBuf {
     ptr: *mut u32,
+    /// Elements the caller asked for. `limbs()` exposes exactly this many, which may be fewer than
+    /// `cap` when the buffer came from the pool.
     len: usize,
+    /// Elements the allocation actually holds.
+    cap: usize,
     /// Kept alive because freeing page-locked memory needs the context that allocated it.
-    _ctx: Arc<CudaContext>,
+    ctx: Arc<CudaContext>,
+    /// Where to return the allocation on drop, instead of unlocking it.
+    pool: Option<Arc<PinnedPool>>,
 }
 
 // The pointer is owned exclusively and the memory is plain host memory once allocated.
@@ -334,7 +340,7 @@ unsafe impl Send for PinnedBuf {}
 unsafe impl Sync for PinnedBuf {}
 
 impl PinnedBuf {
-    /// Allocate `len` `u32` of cached page-locked host memory.
+    /// Allocate `len` `u32` of cached page-locked host memory, unpooled.
     pub fn new(ctx: &Arc<CudaContext>, len: usize) -> Result<Self> {
         ctx.bind_to_thread().map_err(|_| {
             CudaError::Driver("bind_to_thread", sys::CUresult::CUDA_ERROR_INVALID_CONTEXT)
@@ -346,7 +352,9 @@ impl PinnedBuf {
         Ok(Self {
             ptr: p.cast(),
             len,
-            _ctx: ctx.clone(),
+            cap: len.max(1),
+            ctx: ctx.clone(),
+            pool: None,
         })
     }
 
@@ -359,11 +367,120 @@ impl PinnedBuf {
 
 impl Drop for PinnedBuf {
     fn drop(&mut self) {
+        if let Some(pool) = self.pool.take() {
+            pool.put(self.ptr, self.cap);
+            return;
+        }
         // SAFETY: `ptr` came from `cuMemHostAlloc` and is freed exactly once.
         unsafe {
             let _ = sys::cuMemFreeHost(self.ptr.cast());
         }
     }
+}
+
+/// A small pool of page-locked readback buffers.
+///
+/// # Why this is necessary and not an optimisation
+///
+/// `cuMemHostAlloc` PAGE-LOCKS the memory, and that cost scales with the size. Measured on a real
+/// stem-170 batch, 338 MB of readback: the allocation took 69.4 ms of a 76.8 ms readback phase,
+/// and the DMA itself took 7.4 ms -- which is 45.7 GB/s, exactly what a pinned transfer should
+/// give. So the buffer was doing its job perfectly and paying ten times its own benefit to exist.
+///
+/// Reusing the allocation removes that entirely: the pages are locked once and stay locked.
+///
+/// # Why it is BOUNDED
+///
+/// Page-locked memory cannot be paged out, so an unbounded pool is a way to consume all of host
+/// memory without appearing to. cubecl's per-stream pinned pools are exactly that failure -- they
+/// are never trimmed, and reached a measured ~240 GB of shared memory at stem 180 across 8
+/// streams, which was the OOM driver. This keeps at most `NASSAU_CUDA_PINNED_POOL` buffers
+/// (default 4) and frees the smallest when it overflows, so the steady state is a few buffers at
+/// the working size rather than one per launch ever issued.
+pub struct PinnedPool {
+    free: Mutex<Vec<(usize, *mut u32)>>,
+    max_buffers: usize,
+}
+
+// The pooled pointers are owned by the pool and handed out exclusively.
+unsafe impl Send for PinnedPool {}
+unsafe impl Sync for PinnedPool {}
+
+impl PinnedPool {
+    fn new() -> Self {
+        let max_buffers = std::env::var("NASSAU_CUDA_PINNED_POOL")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(4);
+        Self {
+            free: Mutex::new(Vec::new()),
+            max_buffers,
+        }
+    }
+
+    /// Take a buffer of at least `len` elements, reusing one if it fits.
+    pub fn take(self: &Arc<Self>, ctx: &Arc<CudaContext>, len: usize) -> Result<PinnedBuf> {
+        let want = len.max(1);
+        if let Some(pos) = {
+            let free = self.free.lock().unwrap();
+            free.iter().position(|&(cap, _)| cap >= want)
+        } {
+            let (cap, ptr) = self.free.lock().unwrap().remove(pos);
+            return Ok(PinnedBuf {
+                ptr,
+                len,
+                cap,
+                ctx: ctx.clone(),
+                pool: Some(self.clone()),
+            });
+        }
+        let mut buf = PinnedBuf::new(ctx, want)?;
+        buf.len = len;
+        buf.pool = Some(self.clone());
+        Ok(buf)
+    }
+
+    fn put(&self, ptr: *mut u32, cap: usize) {
+        let mut free = self.free.lock().unwrap();
+        free.push((cap, ptr));
+        if free.len() > self.max_buffers {
+            // Drop the SMALLEST: the launches that matter are the big ones, and a small buffer
+            // cannot serve them anyway.
+            let (i, _) = free
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, entry)| entry.0)
+                .expect("non-empty");
+            let (_, ptr) = free.remove(i);
+            // SAFETY: the pool owns every pointer in `free`, each allocated by `cuMemHostAlloc`.
+            unsafe {
+                let _ = sys::cuMemFreeHost(ptr.cast());
+            }
+        }
+    }
+}
+
+impl Drop for PinnedPool {
+    fn drop(&mut self) {
+        for (_, ptr) in self.free.lock().unwrap().drain(..) {
+            // SAFETY: as `put`.
+            unsafe {
+                let _ = sys::cuMemFreeHost(ptr.cast());
+            }
+        }
+    }
+}
+
+/// The process-wide readback pool for a device.
+pub fn pinned_pool(device: i32) -> Arc<PinnedPool> {
+    static POOLS: OnceLock<Mutex<HashMap<i32, Arc<PinnedPool>>>> = OnceLock::new();
+    POOLS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap()
+        .entry(device)
+        .or_insert_with(|| Arc::new(PinnedPool::new()))
+        .clone()
 }
 
 impl crate::algebra::milnor_batch::LimbBlock for PinnedBuf {

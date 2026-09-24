@@ -472,7 +472,9 @@ pub fn cuda_multiply_batch_timed(
     // direct DMA. And because `BatchOutput` stores `Box<dyn LimbBlock>`, the landing buffer IS the
     // result -- no second copy into a `Vec`, which at frontier sizes would be gigabytes of memcpy
     // for nothing.
-    let mut pinned = super::PinnedBuf::new(rt.context(), out_len)?;
+    // From the pool: page-locking is charged per allocation and dominated this phase outright
+    // (69.4 ms of 76.8 ms for 338 MB), while the transfer it enables runs at 45.7 GB/s.
+    let mut pinned = super::pinned_pool(rt.device()).take(rt.context(), out_len)?;
     stream
         .memcpy_dtoh(&d_out, pinned.as_mut_slice())
         .map_err(|e| CudaError::Compile(format!("readback: {e:?}")))?;
