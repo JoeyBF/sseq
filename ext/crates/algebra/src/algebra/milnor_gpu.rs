@@ -11115,6 +11115,73 @@ mod tests {
     ///   cargo test -p algebra --release --features gpu -- --ignored --nocapture \
     ///   replay_startup_profile
     /// ```
+    /// Digest a captured batch computed ENTIRELY ON THE CPU.
+    ///
+    /// The CPU is the ultimate reference: it owes nothing to cubecl, cudarc, a driver or a card, so
+    /// a digest produced here pins the right answer permanently. That matters for the migration off
+    /// cubecl — without this, validating a new backend means comparing it against the old one,
+    /// which cannot outlive the thing being removed.
+    ///
+    /// Run it once per captured batch and record the digest; thereafter it is a fixture. On the
+    /// 10,000-product prefix of the frontier batch the GPU path gives `386e9932663d5247`, and on
+    /// the full 2,285,427-product batch `5a7d7e6c3ae1e6c2`.
+    ///
+    /// Sizing warning: `cpu_multiply_batch_masked` computes at FULL width and gathers afterwards,
+    /// so a batch whose `col_map` is 4.68M entries allocates ~9.3 GB of host limbs for 15,901 rows,
+    /// and the work is scalar. Use a truncated prefix (see `truncate_batch.py`) rather than the
+    /// full batch, which is hours of scalar work.
+    ///
+    /// ```text
+    /// NASSAU_REPLAY_PRODUCTS=/path/to/n10000.bin \
+    ///   cargo test -p algebra --release --features gpu -- --ignored --nocapture \
+    ///   cpu_reference_digest
+    /// ```
+    #[test]
+    #[ignore = "CPU reference: slow and memory-hungry; run explicitly on a TRUNCATED batch"]
+    fn cpu_reference_digest() {
+        use std::{sync::Arc, time::Instant};
+
+        let Ok(path) = std::env::var("NASSAU_REPLAY_PRODUCTS") else {
+            eprintln!("[cpu-ref] NASSAU_REPLAY_PRODUCTS is unset; nothing to compute");
+            return;
+        };
+        let t0 = Instant::now();
+        let (rows, cols, cm, prods) =
+            super::load_captured_batch(&path).expect("failed to load the captured batch");
+        let max_degree = prods
+            .iter()
+            .map(|p| p.r_degree + p.s_degree)
+            .max()
+            .unwrap_or(0)
+            .max(1);
+        let p2 = fp::prime::ValidPrime::new(2);
+        let algebra = Arc::new(MilnorAlgebra::new(p2, false));
+        algebra.compute_basis(max_degree);
+        algebra.compute_seqno_tables(max_degree);
+        let setup = t0.elapsed().as_secs_f64();
+
+        let t1 = Instant::now();
+        let out = super::cpu_multiply_batch_masked(&algebra, cols, cm, rows, &prods);
+        let compute = t1.elapsed().as_secs_f64();
+
+        // Byte-identical to the digest in `replay_digest` / `replay_startup_profile`, so the
+        // numbers are directly comparable.
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        let mut ones: u64 = 0;
+        for row in out.iter_rows() {
+            for &limb in row {
+                h ^= limb as u64;
+                h = h.wrapping_mul(0x0100_0000_01b3);
+                ones += limb.count_ones() as u64;
+            }
+        }
+        eprintln!(
+            "[cpu-ref] products={} rows={rows} out_cols={cols} setup={setup:.2}s \
+             compute={compute:.2}s ones={ones} digest={h:016x}",
+            prods.len()
+        );
+    }
+
     #[test]
     #[ignore = "GPU perf profile: needs a CUDA device and a captured batch; run explicitly"]
     fn replay_startup_profile() {
