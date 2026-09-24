@@ -20,7 +20,8 @@
 
 use algebra::{
     MilnorAlgebra,
-    milnor_gpu::{COL_MAP_DROP, GpuProduct, multiply_batch_on_gpu, multiply_batch_on_gpu_masked},
+    milnor_batch::{COL_MAP_DROP, GpuProduct, multiply_batch},
+    milnor_gpu::multiply_batch_on_gpu,
     module::{
         FreeModule, Module,
         homomorphism::{FreeModuleHomomorphism, ModuleHomomorphism},
@@ -92,7 +93,7 @@ pub fn get_partial_matrix(hom: &NassauDifferential, degree: i32, inputs: &[usize
         // Idempotent + cheap (O(degree · width)); returns immediately once built.
         algebra.compute_seqno_tables(degree);
         let num_cols = target.dimension(degree);
-        let out = multiply_batch_on_gpu(&algebra, num_cols, inputs.len(), &products);
+        let out = multiply_batch(&algebra, num_cols, None, inputs.len(), &products);
         // Limb-wise readback; see the equivalent (truncating) loop in
         // [`get_partial_matrix_restricted`] for why the byte copy is valid. Here the widths already
         // agree, so only the partial final limb needs masking.
@@ -374,7 +375,10 @@ fn build_restricted(
                     products = p1 - p0
                 )
                 .in_scope(|| {
-                    multiply_batch_on_gpu_masked(
+                    // Backend-neutral: `NASSAU_BACKEND` picks cubecl, cudarc or the CPU, and
+                    // all three return the same digest on the same input. Default is unchanged
+                    // (cubecl when built with `gpu`), so this is a seam, not a switch.
+                    multiply_batch(
                         &algebra,
                         kernel_cols,
                         col_map.clone(),

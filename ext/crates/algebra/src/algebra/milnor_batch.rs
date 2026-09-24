@@ -243,6 +243,122 @@ pub fn cpu_multiply_batch_masked(
     BatchOutput::from_limbs(rows.concat(), out_limbs)
 }
 
+/// Which backend a batch multiply should run on.
+///
+/// Selected by `NASSAU_BACKEND` (`cubecl` / `cuda` / `cpu`). The DEFAULT IS DELIBERATELY THE OLD
+/// ONE: cubecl when the `gpu` feature is built, whatever the `cuda` feature says. A migration that
+/// silently switches the backend under a production run is not a migration, it is an incident --
+/// the new path becomes the default only when cubecl is deleted, and until then it has to be asked
+/// for by name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Backend {
+    /// The CPU reference. Always available, and the only one that is.
+    Cpu,
+    /// cubecl, the outgoing GPU backend.
+    Cubecl,
+    /// cudarc + NVRTC + VMM, the incoming one.
+    Cuda,
+}
+
+impl Backend {
+    /// The backend this process will use, resolved once.
+    pub fn selected() -> Self {
+        static SELECTED: LazyLock<Backend> = LazyLock::new(Backend::resolve);
+        *SELECTED
+    }
+
+    fn resolve() -> Self {
+        let requested = std::env::var("NASSAU_BACKEND").unwrap_or_default();
+        let available = |b: Backend| match b {
+            Backend::Cpu => true,
+            Backend::Cubecl => cfg!(feature = "gpu"),
+            Backend::Cuda => cfg!(feature = "cuda"),
+        };
+        let want = match requested.to_ascii_lowercase().as_str() {
+            "" => None,
+            "cpu" => Some(Backend::Cpu),
+            "cubecl" | "gpu" => Some(Backend::Cubecl),
+            "cuda" | "cudarc" => Some(Backend::Cuda),
+            other => {
+                // Not a fallback. A typo here would silently run a different backend than the one
+                // being measured, and every number from that run would be mislabelled.
+                panic!(
+                    "NASSAU_BACKEND={other:?} is not a backend; use cpu, cubecl or cuda \
+                     (this is fatal on purpose -- a typo would silently mislabel a whole run)"
+                )
+            }
+        };
+        if let Some(b) = want {
+            assert!(
+                available(b),
+                "NASSAU_BACKEND={requested} but this binary was not built with that backend's \
+                 feature; rebuild with --features {}",
+                match b {
+                    Backend::Cubecl => "gpu",
+                    Backend::Cuda => "cuda",
+                    Backend::Cpu => "(none needed)",
+                }
+            );
+            return b;
+        }
+        // Unasked: keep whatever this build has always done.
+        if available(Backend::Cubecl) {
+            Backend::Cubecl
+        } else if available(Backend::Cuda) {
+            Backend::Cuda
+        } else {
+            Backend::Cpu
+        }
+    }
+}
+
+/// Run a batch multiply on the selected backend.
+///
+/// One entry point for every caller, so switching backends is an env var rather than a rebuild and
+/// an A/B is two runs of the same binary. All three paths return the same `BatchOutput` and, on
+/// the same input, the same [`BatchOutput::digest`] -- which is what makes them interchangeable
+/// rather than merely similar.
+pub fn multiply_batch(
+    algebra: &Arc<MilnorAlgebra>,
+    out_cols: usize,
+    col_map: Option<Arc<[u32]>>,
+    num_rows: usize,
+    products: &[GpuProduct],
+) -> BatchOutput {
+    match Backend::selected() {
+        Backend::Cpu => cpu_multiply_batch_masked(algebra, out_cols, col_map, num_rows, products),
+        #[cfg(feature = "gpu")]
+        Backend::Cubecl => crate::algebra::milnor_gpu::multiply_batch_on_gpu_masked(
+            algebra, out_cols, col_map, num_rows, products,
+        ),
+        #[cfg(not(feature = "gpu"))]
+        Backend::Cubecl => unreachable!("Backend::selected rejects unavailable backends"),
+        #[cfg(feature = "cuda")]
+        Backend::Cuda => {
+            let device = std::env::var("NASSAU_CUDA_DEVICE")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0);
+            let rt = crate::algebra::milnor_cuda::runtime(device)
+                .expect("failed to open the CUDA device for the cuda backend");
+            // PANICS rather than falling back to the CPU. A silent fallback turns "the GPU path is
+            // broken" into "the run is mysteriously slow", and this project has already lost time
+            // to a swallowed GPU failure that surfaced as an all-zero result at exit 0.
+            crate::algebra::milnor_cuda::multiply::cuda_multiply_batch(
+                &rt,
+                algebra,
+                out_cols,
+                num_rows,
+                products,
+                col_map.as_deref(),
+            )
+            .expect("the cuda backend failed")
+        }
+        #[cfg(not(feature = "cuda"))]
+        Backend::Cuda => unreachable!("Backend::selected rejects unavailable backends"),
+    }
+}
+
 /// Capture/replay (`NASSAU_CAPTURE_PRODUCTS`): dump one REAL batch to disk so a bench can replay it.
 ///
 /// A synthetic bench cannot stand in for the frontier here. The in-tree one samples `R`s on a stride
