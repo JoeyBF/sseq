@@ -26,7 +26,7 @@ use super::{
 use crate::algebra::{
     Algebra, MilnorAlgebra,
     milnor_algebra::PPart,
-    milnor_batch::{BatchOutput, GpuProduct},
+    milnor_batch::{BatchOutput, GpuProduct, LimbBlock},
 };
 
 /// The kernel source, compiled at runtime by NVRTC.
@@ -160,6 +160,9 @@ pub(super) fn marshal(
     r_index: &[u32],
     r_infos: &[RInfo],
     gei_of: &dyn Fn(i32, usize) -> u32,
+    // First row of the block this launch covers. Output rows are numbered from it, so a block's
+    // buffer is only as tall as the block.
+    row0: usize,
 ) -> Result<LaunchArrays> {
     // Sized up front. These are per-product arrays over a batch with hundreds of thousands of
     // products, so growing them from empty is a run of reallocations and memcpys on the critical
@@ -199,7 +202,7 @@ pub(super) fn marshal(
             a.term_gei.push(gei_of(prod.s_degree, ti));
         }
         a.prod_r_index.push(ri);
-        a.prod_row_base.push((prod.row * num_limbs) as u32);
+        a.prod_row_base.push(((prod.row - row0) * num_limbs) as u32);
         a.prod_out_offset.push(prod.out_offset as u32);
         // TILES, not pairs: a thread covers MATRIX_GROUP x TERM_GROUP of them, so this prefix sum
         // -- and therefore the coarse index built from it -- is over threads. The ragged edge of a
@@ -274,6 +277,61 @@ impl LaunchTiming {
     pub fn total(&self) -> f64 {
         self.resident + self.marshal + self.upload + self.kernel + self.readback
     }
+}
+
+/// Output bytes a single launch may allocate, before it is split into row blocks.
+///
+/// The cudarc path used to launch every batch whole, which is fine until it is not: the output is
+/// `num_rows * num_limbs * 4` bytes and both factors grow with the frontier, so an unbounded launch
+/// eventually asks the device for more than it has. cubecl splits for exactly this reason, and part
+/// of its per-launch cost buys that safety.
+///
+/// The default is deliberately GENEROUS (1 GiB): a 426k-product stem-170 batch needs 338 MB and
+/// stays whole, so the bound costs nothing until it is actually needed.
+fn block_bytes() -> usize {
+    static BYTES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *BYTES.get_or_init(|| {
+        std::env::var("NASSAU_CUDA_BLOCK_MB")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(1024)
+            << 20
+    })
+}
+
+/// Split `products` into contiguous row blocks whose outputs each fit `block_bytes`.
+///
+/// Returns `(row0, row1, p0, p1)` per block. Rows are INDEPENDENT -- every product writes only its
+/// own row -- so concatenating the blocks' outputs in row order reproduces the single-launch result
+/// exactly. That is what lets `BatchOutput` hold one landing buffer per block instead of joining
+/// them.
+///
+/// A single row whose output exceeds the budget becomes a block of its own and overshoots: rows
+/// cannot be split without splitting the column space too, which is a different (and much larger)
+/// change. Saying so is better than silently pretending the bound holds.
+fn row_blocks(
+    products: &[GpuProduct],
+    num_rows: usize,
+    num_limbs: usize,
+    budget_bytes: usize,
+) -> Vec<(usize, usize, usize, usize)> {
+    let row_bytes = num_limbs * size_of::<u32>();
+    let max_rows = (budget_bytes / row_bytes.max(1)).max(1);
+    if num_rows <= max_rows {
+        return vec![(0, num_rows, 0, products.len())];
+    }
+    let mut blocks = Vec::new();
+    let (mut row0, mut p0) = (0usize, 0usize);
+    for (i, prod) in products.iter().enumerate() {
+        if prod.row >= row0 + max_rows {
+            // Close at this product: everything before it belongs to rows < prod.row.
+            blocks.push((row0, prod.row, p0, i));
+            row0 = prod.row;
+            p0 = i;
+        }
+    }
+    blocks.push((row0, num_rows, p0, products.len()));
+    blocks
 }
 
 /// Run a batch on the device and return the limbs, matching [`cpu_multiply_batch`] bit for bit.
@@ -351,31 +409,18 @@ pub fn cuda_multiply_batch_timed(
     timing.resident = t_resident.elapsed().as_secs_f64();
     let t_marshal = Instant::now();
 
-    let arrays = {
-        // The basis is fully built above, so snapshotting each degree's base here is exact, and it
-        // sidesteps borrowing the store twice inside `marshal`.
-        let bases: Vec<u32> = (0..=max_s_degree.max(0))
-            .map(|d| store.basis().gei(d, 0))
-            .collect();
-        let gei_of = move |d: i32, ti: usize| bases[d as usize] + ti as u32;
-        marshal(algebra, num_limbs, products, &r_index, &r_infos, &gei_of)?
-    };
-
-    if arrays.total_pairs() == 0 {
-        timing.marshal = t_marshal.elapsed().as_secs_f64();
-        return Ok((
-            BatchOutput::from_limbs(vec![0u32; out_len], num_limbs),
-            timing,
-        ));
-    }
+    // Shared by every block: the basis bases, the compiled module, the resident pointers and the
+    // column map. Only the per-product arrays and the output buffer are per block.
+    let bases: Vec<u32> = (0..=max_s_degree.max(0))
+        .map(|d| store.basis().gei(d, 0))
+        .collect();
+    let gei_of = move |d: i32, ti: usize| bases[d as usize] + ti as u32;
 
     let module = rt.module(&module_key(), SRC, &params::defines())?;
     let f = module
         .load_function("multiply_batch")
         .map_err(|e| CudaError::Compile(format!("load multiply_batch: {e:?}")))?;
     let stream = rt.context().default_stream();
-    timing.marshal = t_marshal.elapsed().as_secs_f64();
-    let t_upload = Instant::now();
 
     macro_rules! up {
         ($v:expr) => {
@@ -384,33 +429,10 @@ pub fn cuda_multiply_batch_timed(
                 .map_err(|e| CudaError::Compile(format!("upload {}: {e:?}", stringify!($v))))?
         };
     }
-    let d_tg = up!(arrays.term_gei);
-    let d_rco = up!(arrays.r_cs_offset);
-    let d_rmo = up!(arrays.r_mk_offset);
-    let d_rcl = up!(arrays.r_cs_len);
-    let d_rml = up!(arrays.r_mk_len);
-    let d_rnm = up!(arrays.r_num_mats);
-    let d_pri = up!(arrays.prod_r_index);
-    let d_pts = up!(arrays.prod_term_start);
-    let d_pnt = up!(arrays.prod_num_terms);
-    let d_prb = up!(arrays.prod_row_base);
-    let d_poo = up!(arrays.prod_out_offset);
-    let d_pps = up!(arrays.prod_pair_start);
-    let d_pc = up!(arrays.prod_coarse);
     // The argument is not optional, so an unrestricted launch binds a one-element dummy the kernel
-    // never reads.
+    // never reads. Uploaded ONCE: the map is indexed by full output column, which no block changes.
     let cm: Vec<u32> = col_map.map_or_else(|| vec![0u32], <[u32]>::to_vec);
     let d_cm = up!(cm);
-
-    let mut d_out = stream
-        .alloc_zeros::<u32>(out_len)
-        .map_err(|e| CudaError::Compile(format!("alloc out: {e:?}")))?;
-
-    stream
-        .synchronize()
-        .map_err(|e| CudaError::Compile(format!("sync after upload: {e:?}")))?;
-    timing.upload = t_upload.elapsed().as_secs_f64();
-    let t_kernel = Instant::now();
 
     // Resident buffers reach the kernel as raw device pointers. A `CUdeviceptr` is a `u64` and a
     // kernel pointer parameter is a 64-bit value, so pushing it as a scalar is the same eight bytes
@@ -423,88 +445,132 @@ pub fn cuda_multiply_batch_timed(
     let p_xi = store.xi_ptr();
 
     // Scalars need bindings: `arg` borrows, so a temporary would be dropped before the launch.
-    let num_products = arrays.num_products() as u32;
     let col_map_len = col_map.map_or(0u32, |c| c.len() as u32);
     let use_col_map = u32::from(col_map.is_some());
     let width = store.width() as u32;
     let num_limbs_u = num_limbs as u32;
-    let out_len_u = out_len as u64;
-
+    let threads = params::THREADS as u32;
     // Walk the pair space in pieces that each fit the 32-bit thread index, so one oversized row
     // cannot overflow the grid.
-    let threads = params::THREADS as u32;
     let chunk = (u32::MAX as u64 / threads as u64) * threads as u64;
-    let total = arrays.total_pairs();
-    let mut done: u64 = 0;
-    while done < total {
-        let n = (total - done).min(chunk);
-        let pair_offset = done;
-        let cfg = LaunchConfig {
-            grid_dim: ((n as u32).div_ceil(threads), 1, 1),
-            block_dim: (threads, 1, 1),
-            shared_mem_bytes: 0,
-        };
-        let mut b = stream.launch_builder(&f);
-        b.arg(&p_cs)
-            .arg(&p_mk)
-            .arg(&p_pp)
-            .arg(&p_ln)
-            .arg(&d_tg)
-            .arg(&p_g)
-            .arg(&p_xi)
-            .arg(&mut d_out)
-            .arg(&d_cm)
-            .arg(&col_map_len)
-            .arg(&use_col_map)
-            .arg(&d_rco)
-            .arg(&d_rmo)
-            .arg(&d_rcl)
-            .arg(&d_rml)
-            .arg(&d_rnm)
-            .arg(&d_pri)
-            .arg(&d_pts)
-            .arg(&d_pnt)
-            .arg(&d_prb)
-            .arg(&d_poo)
-            .arg(&d_pps)
-            .arg(&d_pc)
-            .arg(&num_products)
-            .arg(&pair_offset)
-            .arg(&width)
-            .arg(&num_limbs_u)
-            .arg(&out_len_u);
-        unsafe { b.launch(cfg) }
-            .map_err(|e| CudaError::Compile(format!("launch multiply_batch: {e:?}")))?;
-        done += n;
+
+    let plan = row_blocks(products, num_rows, num_limbs, block_bytes());
+    let mut out_blocks: Vec<Box<dyn LimbBlock>> = Vec::with_capacity(plan.len());
+
+    for &(row0, row1, p0, p1) in &plan {
+        let t_marshal = Instant::now();
+        let arrays = marshal(
+            algebra,
+            num_limbs,
+            &products[p0..p1],
+            &r_index[p0..p1],
+            &r_infos,
+            &gei_of,
+            row0,
+        )?;
+        timing.marshal += t_marshal.elapsed().as_secs_f64();
+
+        let blk_len = (row1 - row0) * num_limbs;
+        if arrays.total_pairs() == 0 {
+            // The rows still exist and still have to appear in the output, they are just empty.
+            out_blocks.push(Box::new(vec![0u32; blk_len]));
+            continue;
+        }
+
+        let t_upload = Instant::now();
+        let d_tg = up!(arrays.term_gei);
+        let d_rco = up!(arrays.r_cs_offset);
+        let d_rmo = up!(arrays.r_mk_offset);
+        let d_rcl = up!(arrays.r_cs_len);
+        let d_rml = up!(arrays.r_mk_len);
+        let d_rnm = up!(arrays.r_num_mats);
+        let d_pri = up!(arrays.prod_r_index);
+        let d_pts = up!(arrays.prod_term_start);
+        let d_pnt = up!(arrays.prod_num_terms);
+        let d_prb = up!(arrays.prod_row_base);
+        let d_poo = up!(arrays.prod_out_offset);
+        let d_pps = up!(arrays.prod_pair_start);
+        let d_pc = up!(arrays.prod_coarse);
+        let mut d_out = stream
+            .alloc_zeros::<u32>(blk_len)
+            .map_err(|e| CudaError::Compile(format!("alloc out: {e:?}")))?;
+        stream
+            .synchronize()
+            .map_err(|e| CudaError::Compile(format!("sync after upload: {e:?}")))?;
+        timing.upload += t_upload.elapsed().as_secs_f64();
+
+        let t_kernel = Instant::now();
+        let num_products = arrays.num_products() as u32;
+        let out_len_u = blk_len as u64;
+        let total = arrays.total_pairs();
+        let mut done: u64 = 0;
+        while done < total {
+            let n = (total - done).min(chunk);
+            let pair_offset = done;
+            let cfg = LaunchConfig {
+                grid_dim: ((n as u32).div_ceil(threads), 1, 1),
+                block_dim: (threads, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            let mut b = stream.launch_builder(&f);
+            b.arg(&p_cs)
+                .arg(&p_mk)
+                .arg(&p_pp)
+                .arg(&p_ln)
+                .arg(&d_tg)
+                .arg(&p_g)
+                .arg(&p_xi)
+                .arg(&mut d_out)
+                .arg(&d_cm)
+                .arg(&col_map_len)
+                .arg(&use_col_map)
+                .arg(&d_rco)
+                .arg(&d_rmo)
+                .arg(&d_rcl)
+                .arg(&d_rml)
+                .arg(&d_rnm)
+                .arg(&d_pri)
+                .arg(&d_pts)
+                .arg(&d_pnt)
+                .arg(&d_prb)
+                .arg(&d_poo)
+                .arg(&d_pps)
+                .arg(&d_pc)
+                .arg(&num_products)
+                .arg(&pair_offset)
+                .arg(&width)
+                .arg(&num_limbs_u)
+                .arg(&out_len_u);
+            unsafe { b.launch(cfg) }
+                .map_err(|e| CudaError::Compile(format!("launch multiply_batch: {e:?}")))?;
+            done += n;
+        }
+        stream
+            .synchronize()
+            .map_err(|e| CudaError::Compile(format!("sync after kernel: {e:?}")))?;
+        timing.kernel += t_kernel.elapsed().as_secs_f64();
+
+        // Land the readback in CACHED page-locked memory and hand that buffer straight to the
+        // caller. A device-to-host copy into pageable memory is staged by the driver through its
+        // own bounce buffer; into page-locked memory it is a direct DMA. And because `BatchOutput`
+        // stores `Box<dyn LimbBlock>`, the landing buffer IS the result -- no second copy into a
+        // `Vec`, which at frontier sizes would be gigabytes of memcpy for nothing.
+        //
+        // From the POOL: page-locking is charged per allocation and dominated this phase outright
+        // (69.4 ms of 76.8 ms for 338 MB), while the transfer it enables runs at 45.7 GB/s.
+        let t_readback = Instant::now();
+        let mut pinned = super::pinned_pool(rt.device()).take(rt.context(), blk_len)?;
+        stream
+            .memcpy_dtoh(&d_out, pinned.as_mut_slice())
+            .map_err(|e| CudaError::Compile(format!("readback: {e:?}")))?;
+        stream
+            .synchronize()
+            .map_err(|e| CudaError::Compile(format!("sync after readback: {e:?}")))?;
+        timing.readback += t_readback.elapsed().as_secs_f64();
+        out_blocks.push(Box::new(pinned));
     }
 
-    stream
-        .synchronize()
-        .map_err(|e| CudaError::Compile(format!("sync after kernel: {e:?}")))?;
-    timing.kernel = t_kernel.elapsed().as_secs_f64();
-    let t_readback = Instant::now();
-
-    // Land the readback in CACHED page-locked memory and hand that buffer straight to the caller.
-    //
-    // Two separate wins, and both need the memory to be pinned. A device-to-host copy into pageable
-    // memory is staged by the driver through its own bounce buffer; into page-locked memory it is a
-    // direct DMA. And because `BatchOutput` stores `Box<dyn LimbBlock>`, the landing buffer IS the
-    // result -- no second copy into a `Vec`, which at frontier sizes would be gigabytes of memcpy
-    // for nothing.
-    // From the pool: page-locking is charged per allocation and dominated this phase outright
-    // (69.4 ms of 76.8 ms for 338 MB), while the transfer it enables runs at 45.7 GB/s.
-    let mut pinned = super::pinned_pool(rt.device()).take(rt.context(), out_len)?;
-    stream
-        .memcpy_dtoh(&d_out, pinned.as_mut_slice())
-        .map_err(|e| CudaError::Compile(format!("readback: {e:?}")))?;
-    stream
-        .synchronize()
-        .map_err(|e| CudaError::Compile(format!("sync after readback: {e:?}")))?;
-    timing.readback = t_readback.elapsed().as_secs_f64();
-    Ok((
-        BatchOutput::from_blocks(vec![Box::new(pinned)], num_limbs),
-        timing,
-    ))
+    Ok((BatchOutput::from_blocks(out_blocks, num_limbs), timing))
 }
 
 /// Device memory currently COMMITTED by the resident store, for diagnostics.
@@ -855,9 +921,130 @@ mod tests {
                 .map(|d| store.basis.gei(d, 0))
                 .collect();
             let gei_of = move |d: i32, ti: usize| bases[d as usize] + ti as u32;
-            marshal(algebra, num_limbs, products, &r_index, &r_infos, &gei_of).expect("marshal")
+            marshal(algebra, num_limbs, products, &r_index, &r_infos, &gei_of, 0).expect("marshal")
         };
         simulate(&store, &arrays, num_rows, num_limbs, col_map)
+    }
+
+    /// Drive `marshal` and the walk BLOCK BY BLOCK, as the device path does.
+    fn walk_blocked(
+        algebra: &MilnorAlgebra,
+        products: &[GpuProduct],
+        num_rows: usize,
+        num_limbs: usize,
+        rows_per_block: usize,
+    ) -> Vec<u32> {
+        let max_s_degree = products.iter().map(|p| p.s_degree).max().unwrap_or(0);
+        let mut store = HostStore::new(algebra, max_s_degree);
+        let (needed, r_index) = plan_rs(algebra, products);
+        let r_infos: Vec<RInfo> = needed
+            .iter()
+            .map(|p| store.ensure_r(algebra, p).expect("host tables"))
+            .collect();
+        let bases: Vec<u32> = (0..=max_s_degree.max(0))
+            .map(|d| store.basis.gei(d, 0))
+            .collect();
+        let gei_of = move |d: i32, ti: usize| bases[d as usize] + ti as u32;
+
+        let plan = row_blocks(
+            products,
+            num_rows,
+            num_limbs,
+            rows_per_block * num_limbs * size_of::<u32>(),
+        );
+        let mut out = Vec::with_capacity(num_rows * num_limbs);
+        for &(row0, row1, p0, p1) in &plan {
+            let arrays = marshal(
+                algebra,
+                num_limbs,
+                &products[p0..p1],
+                &r_index[p0..p1],
+                &r_infos,
+                &gei_of,
+                row0,
+            )
+            .expect("marshal");
+            out.extend(simulate(&store, &arrays, row1 - row0, num_limbs, None));
+        }
+        out
+    }
+
+    /// The block plan must partition BOTH the rows and the products, exactly and in order.
+    ///
+    /// This is the property the whole split rests on: rows are independent, so concatenating the
+    /// blocks reproduces the single-launch result -- but only if every row appears in exactly one
+    /// block and every product goes with its row. An overlap would double-XOR a row, silently
+    /// cancelling it; a gap would drop one. Neither crashes, and both give a plausible wrong
+    /// answer, which is why this is checked directly rather than inferred from a digest.
+    #[test]
+    fn row_blocks_partition_rows_and_products() {
+        let max_degree = 40;
+        let algebra = algebra_to(max_degree);
+        let num_rows = 97;
+        let mut products = sample_products(&algebra, max_degree, num_rows, 500, 0xb10c);
+        // The planner requires row-sorted products, which is what the extract loops emit.
+        products.sort_by_key(|p| p.row);
+        let num_limbs = 64;
+
+        for rows_per_block in [1usize, 2, 7, 64, 1 << 20] {
+            let budget = rows_per_block * num_limbs * size_of::<u32>();
+            let plan = row_blocks(&products, num_rows, num_limbs, budget);
+            assert!(!plan.is_empty(), "{rows_per_block}: empty plan");
+            let (mut next_row, mut next_p) = (0usize, 0usize);
+            for &(r0, r1, p0, p1) in &plan {
+                assert_eq!(r0, next_row, "{rows_per_block}: rows are not contiguous");
+                assert_eq!(p0, next_p, "{rows_per_block}: products are not contiguous");
+                assert!(r1 > r0, "{rows_per_block}: empty row range");
+                for prod in &products[p0..p1] {
+                    assert!(
+                        (r0..r1).contains(&prod.row),
+                        "{rows_per_block}: product row {} outside block {r0}..{r1}",
+                        prod.row
+                    );
+                }
+                next_row = r1;
+                next_p = p1;
+            }
+            assert_eq!(next_row, num_rows, "{rows_per_block}: rows not covered");
+            assert_eq!(
+                next_p,
+                products.len(),
+                "{rows_per_block}: products not covered"
+            );
+        }
+    }
+
+    /// The marshalled walk, run block by block, reproduces the CPU reference.
+    ///
+    /// The device replay shows the digest unchanged from a 1 GiB budget down to 4 MB (one block to
+    /// ~85), but that needs a card. This covers the same property with none -- including the
+    /// per-block `row0` rebasing of `prod_row_base`, which is exactly where a split goes wrong.
+    #[test]
+    fn blocked_walk_matches_cpu_reference() {
+        let max_degree = 40;
+        let algebra = algebra_to(max_degree);
+        let num_rows = 48;
+        let mut products = sample_products(&algebra, max_degree, num_rows, 300, 0x5917);
+        products.sort_by_key(|p| p.row);
+        let num_cols = full_width(&algebra, &products);
+        let num_limbs = num_cols.div_ceil(32).max(1);
+
+        let want = cpu_multiply_batch(&algebra, num_cols, num_rows, &products);
+        assert!(
+            want.iter_rows().flatten().any(|&w| w != 0),
+            "the reference is all zero, so the comparison proves nothing"
+        );
+
+        for rows_per_block in [1usize, 5, 48] {
+            let got = walk_blocked(&algebra, &products, num_rows, num_limbs, rows_per_block);
+            for (r, want_row) in want.iter_rows().enumerate() {
+                let got_row = &got[r * num_limbs..(r + 1) * num_limbs];
+                assert_eq!(
+                    got_row, want_row,
+                    "rows_per_block {rows_per_block}, row {r}: blocked walk != CPU reference"
+                );
+            }
+        }
     }
 
     /// The marshalled arrays, walked the kernel's way, reproduce the CPU reference.
