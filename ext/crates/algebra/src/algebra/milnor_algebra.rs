@@ -1298,12 +1298,12 @@ impl MilnorAlgebra {
     /// the `seqno_applicable` regime (`p = 2`, trivial profile, stable), since
     /// the kernel indexes its output with the table-based `seqno`. Public so the
     /// resolution can gate its GPU dispatch without reaching into private state.
-    #[cfg(feature = "gpu")]
+    #[cfg(any(feature = "gpu", feature = "cuda"))]
     pub fn gpu_multiply_applicable(&self) -> bool {
         self.seqno_applicable()
     }
 
-    #[cfg(feature = "gpu")]
+    #[cfg(any(feature = "gpu", feature = "cuda"))]
     pub(crate) fn seqno_table_u32(&self) -> (usize, Vec<u32>) {
         let guard = self.seqno_tables.load();
         let t = guard
@@ -1323,7 +1323,7 @@ impl MilnorAlgebra {
     /// the multiply kernel's term test consumes (see
     /// [`Self::multiply_basis_element_by_element_2`]). Every matrix of a fixed `R`
     /// shares the same `cs_len`/`mk_len`, so the flattening is rectangular.
-    #[cfg(feature = "gpu")]
+    #[cfg(any(feature = "gpu", feature = "cuda"))]
     pub(crate) fn admissible_matrices(
         &self,
         r_p_part: PPart,
