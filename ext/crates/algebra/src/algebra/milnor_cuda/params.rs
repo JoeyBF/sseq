@@ -1,0 +1,113 @@
+//! Tuning knobs shared by the Rust host code and the CUDA kernel.
+//!
+//! Follows the convention PR 298 established for fp-cuda: the constants live here, reach NVRTC as
+//! `-D` options, and the kernel defines none of them itself — it `#error`s on a missing one, so a
+//! forgotten define is a compile error rather than a silently wrong default.
+//!
+//! Every value below is carried over from the cubecl kernel in `milnor_gpu`, where each was
+//! measured individually. They are repeated rather than imported because `milnor_gpu` is behind the
+//! `gpu` feature and will be deleted; the numbers, and the reasons for them, must outlive it.
+
+/// Matrices per thread tile.
+///
+/// A thread covers `MATRIX_GROUP` x `TERM_GROUP` pairs. `col_sums`/`masks` depend only on the
+/// matrix and a term's p-part only on the term, so an MxT tile reads `2M + T` values per column to
+/// evaluate `M*T` pairs — 1.17 loads per pair at 2x3, against 1.67 at 1x3 and 3 at 1x1. The kernel
+/// is issue-limited on integer work, so fewer loads and fewer addresses is the lever.
+pub const MATRIX_GROUP: usize = 2;
+
+/// Terms per thread tile.
+///
+/// NOT symmetric with [`MATRIX_GROUP`]: terms are few (`nt ~ 5`), so the ragged tail dominates and
+/// 4 loses to 3 purely on wasted lanes. Matrices are many (`~20 000`), so a partial matrix tile
+/// costs a few idle lanes out of thousands.
+pub const TERM_GROUP: usize = 3;
+
+/// Pairs per coarse-index bucket, as a power of two.
+///
+/// `prod_coarse[ci]` is the product owning pair `ci << COARSE_LOG`, bracketing the binary search
+/// before it starts. Each search step is a DEPENDENT global load — a full latency stall — and
+/// ablation put the unbracketed search at ~12% of kernel time. Two cheap loads replace ~15
+/// dependent ones.
+pub const COARSE_LOG: usize = 20;
+
+/// Longest p-part the packed accumulator holds.
+pub const PPART_MAX_LEN: usize = 10;
+
+/// Column index below which every packed digit lies wholly under bit 32.
+///
+/// Splits the column loop so "is this digit inside the packed accumulator?" and "where does it
+/// land?" are both answered at COMPILE time: below this the accumulate is 32-bit (half the shifts,
+/// half the ORs), above it there is no accumulator test. In the cubecl kernel the merged form spent
+/// 36 of 121 SASS instructions per column on exactly those two questions.
+pub const COL_SPLIT_32: usize = 3;
+
+/// Upper bound on a thread's column count, i.e. `max(cs_len, mk_len)`.
+///
+/// MUST NOT be hardcoded smaller: `mk_len = rows + cols - 1` grows with internal degree — 16
+/// suffices to t~510, but a 9th xi appears at t>=511 making it 17, then 18 past 1023. A fixed 16
+/// would silently truncate at stem 300: wrong answers, no error. The host asserts the per-launch
+/// value fits this cap.
+pub const WORKING_CAP: usize = 32;
+
+/// Threads per block.
+pub const THREADS: usize = 256;
+
+/// The knobs as NVRTC `-D` options.
+///
+/// Per-launch values (`num_segs`, `sq_len`, `cols`, `cs_transposed` in the cubecl kernel) are NOT
+/// here: they vary per launch, and specialising on a value that changes forces a recompile per
+/// distinct value. The cubecl kernel keeps `search_iters` a runtime scalar for exactly that reason
+/// — making it comptime widened a benchmark spread from 0.7% to 5.6%.
+pub fn defines() -> Vec<(&'static str, String)> {
+    [
+        ("MATRIX_GROUP", MATRIX_GROUP),
+        ("TERM_GROUP", TERM_GROUP),
+        ("COARSE_LOG", COARSE_LOG),
+        ("PPART_MAX_LEN", PPART_MAX_LEN),
+        ("COL_SPLIT_32", COL_SPLIT_32),
+        ("WORKING_CAP", WORKING_CAP),
+        ("THREADS", THREADS),
+    ]
+    .iter()
+    .map(|(name, value)| (*name, value.to_string()))
+    .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The packed accumulator must actually hold what the column split assumes.
+    #[test]
+    fn column_split_is_inside_the_accumulator() {
+        assert!(
+            COL_SPLIT_32 < PPART_MAX_LEN,
+            "COL_SPLIT_32 must fall inside the packed accumulator"
+        );
+        assert!(
+            PPART_MAX_LEN <= WORKING_CAP,
+            "the accumulator cannot be longer than a thread's column bound"
+        );
+    }
+
+    /// Every knob the kernel needs is actually emitted, or NVRTC would `#error`.
+    #[test]
+    fn defines_cover_every_knob() {
+        let names: Vec<&str> = defines().into_iter().map(|(n, _)| n).collect();
+        for want in [
+            "MATRIX_GROUP",
+            "TERM_GROUP",
+            "COARSE_LOG",
+            "PPART_MAX_LEN",
+            "COL_SPLIT_32",
+            "WORKING_CAP",
+            "THREADS",
+        ] {
+            assert!(
+                names.contains(&want),
+                "{want} is not emitted as a -D option"
+            );
+        }
+    }
+}

@@ -38,6 +38,8 @@
 //! declined, and the banner still printed. Compiling at runtime also specialises per device
 //! architecture and lets `#[comptime]`-style folding become `-D` defines.
 
+pub mod params;
+
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex, OnceLock},
