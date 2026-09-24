@@ -29,6 +29,8 @@ use std::{
 
 use cudarc::driver::sys;
 
+use rustc_hash::FxHashMap;
+
 use super::{
     CudaError, GrowBuf, MilnorCuda, Result,
     enumerate::{enumerate_into, r_dims},
@@ -49,6 +51,9 @@ fn reserve_bytes(name: &str, default_gib: usize) -> usize {
         .unwrap_or(default_gib)
         << 30
 }
+
+/// How a caller names an `R`: `(r_degree, r_idx)`, exactly as it appears in a `GpuProduct`.
+pub type RKey = (i32, usize);
 
 /// Where one `R`'s admissible matrices live in the master, and how many there are.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -90,20 +95,25 @@ fn narrow(values: &[u32], what: &str) -> Result<Vec<u16>> {
 pub struct MasterLayout {
     cs_elems: usize,
     mk_elems: usize,
-    /// Keyed by the `R`'s p-part rather than by `(degree, index)`: the same `Sq(R)` reached from
-    /// two different degrees is the same enumeration, and the p-part is what it consumes.
-    index: HashMap<PPart, RInfo>,
+    /// Keyed by `(r_degree, r_idx)`, NOT by the p-part.
+    ///
+    /// The two identify the same thing -- for a fixed degree the basis index determines the
+    /// p-part, and the p-part determines the degree -- so this is a bijection and either key is
+    /// correct. The pair is what a CALLER already has. Keying by p-part meant every launch called
+    /// `basis_element_from_index` for each of its distinct `R`s just to ask "is this resident?",
+    /// which on a warm launch is 54,107 constructions to answer yes 54,107 times.
+    index: FxHashMap<RKey, RInfo>,
 }
 
 impl MasterLayout {
-    pub fn get(&self, r_p_part: &PPart) -> Option<RInfo> {
-        self.index.get(r_p_part).copied()
+    pub fn get(&self, key: RKey) -> Option<RInfo> {
+        self.index.get(&key).copied()
     }
 
     /// Reserve space for a newly enumerated `R` and record where it went.
     pub fn place(
         &mut self,
-        r_p_part: &PPart,
+        key: RKey,
         cs_len: usize,
         mk_len: usize,
         num_mats: usize,
@@ -119,7 +129,7 @@ impl MasterLayout {
         };
         self.cs_elems += cs_total;
         self.mk_elems += mk_total;
-        self.index.insert(r_p_part.clone(), info);
+        self.index.insert(key, info);
         info
     }
 
@@ -322,8 +332,8 @@ impl Resident {
     }
 
     /// Where an `R` lives, if it is resident. `None` means it was never enumerated.
-    pub fn master_get(&self, r_p_part: &PPart) -> Option<RInfo> {
-        self.master.get(r_p_part)
+    pub fn master_get(&self, key: RKey) -> Option<RInfo> {
+        self.master.get(key)
     }
 
     pub fn cs_ptr(&self) -> sys::CUdeviceptr {
@@ -418,19 +428,28 @@ impl Resident {
     ///
     /// The enumerated matrices never touch the host. The count pass sizes each block, the layout
     /// places it, the buffers grow, and the emit pass writes straight into them.
-    pub fn ensure_rs(&mut self, rt: &Arc<MilnorCuda>, p_parts: &[PPart]) -> Result<Vec<RInfo>> {
-        // Distinct and NOT already resident, in first-seen order. The same `R` can appear many
-        // times in one batch -- that redundancy is the reason the master is deduplicated at all.
+    pub fn ensure_rs(
+        &mut self,
+        rt: &Arc<MilnorCuda>,
+        algebra: &MilnorAlgebra,
+        keys: &[RKey],
+    ) -> Result<Vec<RInfo>> {
+        // Not already resident, in first-seen order. `keys` is already distinct (`plan_rs` sees to
+        // that), so the only question per key is whether the master has it -- and ONLY a miss pays
+        // for `basis_element_from_index`. On a warm launch nothing here materialises a p-part.
+        let mut fresh_keys: Vec<RKey> = Vec::new();
         let mut fresh: Vec<PPart> = Vec::new();
-        let mut seen: HashMap<PPart, ()> = HashMap::new();
-        for p in p_parts {
-            if p.is_empty() {
-                return Err(CudaError::Compile(
-                    "empty R has no admissible matrices; Sq(1) is not a batch product".to_owned(),
-                ));
-            }
-            if self.master.get(p).is_none() && seen.insert(p.clone(), ()).is_none() {
-                fresh.push(p.clone());
+        for &key in keys {
+            if self.master.get(key).is_none() {
+                let p = algebra.basis_element_from_index(key.0, key.1).p_part;
+                if p.is_empty() {
+                    return Err(CudaError::Compile(
+                        "empty R has no admissible matrices; Sq(1) is not a batch product"
+                            .to_owned(),
+                    ));
+                }
+                fresh_keys.push(key);
+                fresh.push(p);
             }
         }
 
@@ -460,12 +479,12 @@ impl Resident {
             let mut cs_offsets = Vec::with_capacity(fresh.len());
             let mut mk_offsets = Vec::with_capacity(fresh.len());
             let mut infos = Vec::with_capacity(fresh.len());
-            for (i, p) in fresh.iter().enumerate() {
+            for (i, &key) in fresh_keys.iter().enumerate() {
                 let (cs_len, mk_len) = lens[i];
                 let n = counts[i] as usize;
                 let info = self
                     .master
-                    .place(p, cs_len, mk_len, n, n * cs_len, n * mk_len);
+                    .place(key, cs_len, mk_len, n, n * cs_len, n * mk_len);
                 cs_offsets.push(info.cs_offset);
                 mk_offsets.push(info.mk_offset);
                 infos.push(info);
@@ -495,12 +514,11 @@ impl Resident {
             }
         }
 
-        p_parts
-            .iter()
-            .map(|p| {
+        keys.iter()
+            .map(|&k| {
                 self.master
-                    .get(p)
-                    .ok_or_else(|| CudaError::Compile(format!("R {p:?} was not made resident")))
+                    .get(k)
+                    .ok_or_else(|| CudaError::Compile(format!("R {k:?} was not made resident")))
             })
             .collect()
     }
@@ -512,19 +530,20 @@ impl Resident {
     /// must produce identical masters, which is what `cuda_enumerate_matches_cpu_reference`
     /// asserts element by element. Prefer `ensure_rs` for real work -- this enumerates on the
     /// host, which is the cost the enum kernel exists to remove.
-    pub fn ensure_r(&mut self, algebra: &MilnorAlgebra, r_p_part: &PPart) -> Result<RInfo> {
-        if let Some(info) = self.master.get(r_p_part) {
+    pub fn ensure_r(&mut self, algebra: &MilnorAlgebra, key: RKey) -> Result<RInfo> {
+        if let Some(info) = self.master.get(key) {
             return Ok(info);
         }
         self.bind()?;
-        let (cs_len, mk_len, num_mats, cs_u, mk_u) = r_tables(algebra, r_p_part)?;
+        let r_p_part = algebra.basis_element_from_index(key.0, key.1).p_part;
+        let (cs_len, mk_len, num_mats, cs_u, mk_u) = r_tables(algebra, &r_p_part)?;
         let cs_at = self.master.cs_elems() * size_of::<u16>();
         let mk_at = self.master.mk_elems() * size_of::<u16>();
         self.cs.write_at(cs_at, &cs_u)?;
         self.mk.write_at(mk_at, &mk_u)?;
         Ok(self
             .master
-            .place(r_p_part, cs_len, mk_len, num_mats, cs_u.len(), mk_u.len()))
+            .place(key, cs_len, mk_len, num_mats, cs_u.len(), mk_u.len()))
     }
 }
 

@@ -21,7 +21,7 @@ use cudarc::driver::{LaunchConfig, PushKernelArg};
 
 use super::{
     CudaError, MilnorCuda, Result, params,
-    resident::{BasisLayout, MasterLayout, RInfo, r_tables, resident},
+    resident::{BasisLayout, MasterLayout, RInfo, RKey, r_tables, resident},
 };
 use crate::algebra::{
     Algebra, MilnorAlgebra,
@@ -66,16 +66,19 @@ fn cpu_enumeration() -> bool {
 ///
 /// Keyed by `(r_degree, r_idx)` rather than the p-part: the two identify the same thing, and this
 /// one hashes two words instead of ten. The p-part is materialised only on a miss.
-pub(super) fn plan_rs(algebra: &MilnorAlgebra, products: &[GpuProduct]) -> (Vec<PPart>, Vec<u32>) {
-    let mut order: Vec<PPart> = Vec::new();
-    // FxHashMap, not the std default. The key is two words and the map is consulted once per
-    // product -- 426k times on the profile batch -- so SipHash's per-key setup dominates a lookup
-    // that decides almost nothing. rustc-hash is already a dependency of this crate.
+pub(super) fn plan_rs(algebra: &MilnorAlgebra, products: &[GpuProduct]) -> (Vec<RKey>, Vec<u32>) {
+    // KEYS, not p-parts. A p-part is only needed to ENUMERATE an `R`, which happens once ever; a
+    // launch that finds all of its `R`s already resident should not construct a single one. This
+    // batch has 54,107 distinct `R`s, so that is 54,107 `basis_element_from_index` calls saved on
+    // every warm launch.
+    let mut order: Vec<RKey> = Vec::new();
+    // FxHashMap, not the std default. The key is two words, so SipHash's per-key setup dominates a
+    // lookup that decides almost nothing. rustc-hash is already a dependency of this crate.
     let mut local: FxHashMap<(i32, usize), u32> = FxHashMap::default();
-    // The products of one extract loop arrive PARTLY grouped by `R`, so the previous answer is
-    // often the next one and a two-word compare in front of the map skips the hash on a hit.
-    // Measured worth 9.3ms -> 8.3ms of the resident phase, i.e. a useful minority of lookups --
-    // not the overwhelming majority the "grouped" reading would predict.
+    // The products of one extract loop arrive grouped by `R`, so the previous answer is usually
+    // the next one and a two-word compare in front of the map skips the hash on a hit. COUNTED on
+    // the stem-170 batch: 426,521 products form only 57,088 consecutive runs, so the cache takes
+    // 86.6% of lookups and the map sees 57k rather than 426k.
     let mut last: Option<((i32, usize), u32)> = None;
     // POSITIONAL, one entry per product, `SKIP` where the product contributes nothing. Returning
     // the map instead would make `marshal` hash all 426k products a second time to ask a question
@@ -97,11 +100,7 @@ pub(super) fn plan_rs(algebra: &MilnorAlgebra, products: &[GpuProduct]) -> (Vec<
         }
         let ri = *local.entry(key).or_insert_with(|| {
             let ri = order.len() as u32;
-            order.push(
-                algebra
-                    .basis_element_from_index(prod.r_degree, prod.r_idx)
-                    .p_part,
-            );
+            order.push(key);
             ri
         });
         *slot = ri;
@@ -113,7 +112,8 @@ pub(super) fn plan_rs(algebra: &MilnorAlgebra, products: &[GpuProduct]) -> (Vec<
 /// Marks a product that contributes nothing, in the positional index [`plan_rs`] returns.
 ///
 /// `u32::MAX` is safe as a sentinel: it would need that many distinct `R`s in ONE batch, against a
-/// few thousand in practice, and the launch-local `R` count is bounded by the product count.
+/// 54,107 on the stem-170 profile batch, and the launch-local `R` count is bounded by the product
+/// count.
 pub(super) const SKIP: u32 = u32::MAX;
 
 /// The per-launch arrays, in device layout.
@@ -439,10 +439,10 @@ fn run(
         let r_infos = if cpu_enumeration() {
             needed
                 .iter()
-                .map(|p| store.ensure_r(algebra, p))
+                .map(|&k| store.ensure_r(algebra, k))
                 .collect::<Result<Vec<_>>>()?
         } else {
-            store.ensure_rs(rt, &needed)?
+            store.ensure_rs(rt, algebra, &needed)?
         };
         // The basis is fully built above, so snapshotting each degree's base here is exact.
         let bases: Vec<u32> = (0..=max_s_degree.max(0))
@@ -783,16 +783,17 @@ mod tests {
             }
         }
 
-        fn ensure_r(&mut self, algebra: &MilnorAlgebra, p: &PPart) -> Result<RInfo> {
-            if let Some(info) = self.master.get(p) {
+        fn ensure_r(&mut self, algebra: &MilnorAlgebra, key: RKey) -> Result<RInfo> {
+            if let Some(info) = self.master.get(key) {
                 return Ok(info);
             }
-            let (cs_len, mk_len, num_mats, cs_u, mk_u) = r_tables(algebra, p)?;
+            let p = algebra.basis_element_from_index(key.0, key.1).p_part;
+            let (cs_len, mk_len, num_mats, cs_u, mk_u) = r_tables(algebra, &p)?;
             self.cs.extend_from_slice(&cs_u);
             self.mk.extend_from_slice(&mk_u);
             Ok(self
                 .master
-                .place(p, cs_len, mk_len, num_mats, cs_u.len(), mk_u.len()))
+                .place(key, cs_len, mk_len, num_mats, cs_u.len(), mk_u.len()))
         }
     }
 
@@ -977,7 +978,7 @@ mod tests {
         let (needed, r_index) = plan_rs(algebra, products);
         let r_infos: Vec<RInfo> = needed
             .iter()
-            .map(|p| store.ensure_r(algebra, p).expect("host tables"))
+            .map(|&k| store.ensure_r(algebra, k).expect("host tables"))
             .collect();
         let arrays = {
             let bases: Vec<u32> = (0..=max_s_degree.max(0))
@@ -1002,7 +1003,7 @@ mod tests {
         let (needed, r_index) = plan_rs(algebra, products);
         let r_infos: Vec<RInfo> = needed
             .iter()
-            .map(|p| store.ensure_r(algebra, p).expect("host tables"))
+            .map(|&k| store.ensure_r(algebra, k).expect("host tables"))
             .collect();
         let bases: Vec<u32> = (0..=max_s_degree.max(0))
             .map(|d| store.basis.gei(d, 0))
@@ -1188,27 +1189,28 @@ mod tests {
     fn master_layout_is_append_only() {
         let algebra = algebra_to(30);
         let mut layout = MasterLayout::default();
-        let mut seen: Vec<(PPart, RInfo)> = Vec::new();
+        let mut seen: Vec<(RKey, RInfo)> = Vec::new();
         for d in 1..=10 {
             for i in 0..algebra.dimension(d) {
-                let p = algebra.basis_element_from_index(d, i).p_part.clone();
-                if p.is_empty() || layout.get(&p).is_some() {
+                let key = (d, i);
+                let p = algebra.basis_element_from_index(d, i).p_part;
+                if p.is_empty() || layout.get(key).is_some() {
                     continue;
                 }
                 let (cs_len, mk_len, num_mats, cs, mk) = r_tables(&algebra, &p).expect("tables");
-                let info = layout.place(&p, cs_len, mk_len, num_mats, cs.len(), mk.len());
+                let info = layout.place(key, cs_len, mk_len, num_mats, cs.len(), mk.len());
                 // A run of `num_mats` rectangular matrices, and nothing past the fill mark.
                 assert_eq!(cs.len(), num_mats * cs_len, "col_sums is not rectangular");
                 assert_eq!(mk.len(), num_mats * mk_len, "masks is not rectangular");
                 assert!(info.cs_offset as usize + cs.len() <= layout.cs_elems());
-                seen.push((p, info));
+                seen.push((key, info));
             }
         }
         assert!(seen.len() > 10, "too few distinct R to be a real check");
-        for (p, info) in &seen {
+        for &(key, info) in &seen {
             assert_eq!(
-                layout.get(p),
-                Some(*info),
+                layout.get(key),
+                Some(info),
                 "an earlier R MOVED as later ones were appended"
             );
         }
@@ -1601,11 +1603,7 @@ mod tests {
         let store = store.lock().unwrap();
         let mut pairs: u64 = 0;
         for prod in &prods {
-            let pp = algebra
-                .basis_element_from_index(prod.r_degree, prod.r_idx)
-                .p_part
-                .clone();
-            if let Some(info) = store.master_get(&pp) {
+            if let Some(info) = store.master_get((prod.r_degree, prod.r_idx)) {
                 pairs += info.num_mats as u64 * prod.term_indices.len() as u64;
             }
         }
