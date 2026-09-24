@@ -29,6 +29,9 @@
 #ifndef TERM_GROUP
 #error "TERM_GROUP must be provided as an NVRTC -D option (see params.rs)"
 #endif
+#ifndef COL_SPLIT_32
+#error "COL_SPLIT_32 must be provided as an NVRTC -D option (see params.rs)"
+#endif
 #ifndef MATRIX_GROUP
 #error "MATRIX_GROUP must be provided as an NVRTC -D option (see params.rs)"
 #endif
@@ -266,9 +269,11 @@ extern "C" __global__ __launch_bounds__(THREADS) void multiply_batch(
     // Per-term p-part offsets and lengths. Lanes past `nt` carry term_len = 0 and are excluded at
     // the emit below: an all-zero term against an all-zero column does NOT reject, so they would
     // otherwise emit a spurious seqno(0) bit.
-    u32 term_len[TERM_GROUP];
     // The term's whole p-part, held in a REGISTER for the length of the column loop. One load per
     // term for the entire tile, against one per term per column before.
+    //
+    // The trimmed LENGTH is no longer kept per lane: with the digits coming out of the packed word
+    // it is read only to form `low[tt]` and to widen `cols`, both done here.
     u64 b_bits[TERM_GROUP];
     u32 low[TERM_GROUP];
     u32 cols = (cs_len > mk_len) ? cs_len : mk_len;
@@ -281,7 +286,6 @@ extern "C" __global__ __launch_bounds__(THREADS) void multiply_batch(
             tl = ln[gei];
             bb = pp[gei];
         }
-        term_len[tt] = tl;
         b_bits[tt] = bb;
         low[tt] = (tl < cs_len) ? tl : cs_len;
         if (tl > cols) cols = tl;
@@ -319,37 +323,46 @@ extern "C" __global__ __launch_bounds__(THREADS) void multiply_batch(
     }
 
     u64 working[MATRIX_GROUP * TERM_GROUP];
+    // 32-BIT ACCUMULATOR for the columns below COL_SPLIT_32, folded into `working` before the
+    // 64-bit segment starts, so the two are never live at the same time.
+    //
+    // `PPart`'s first three fields are 11, 10 and 9 bits at shifts 0, 11 and 21, so digit 2 ends at
+    // bit 30 and those three digits fit wholly in a u32, while digit 3 starts at bit 30 and
+    // straddles the boundary. Below the split the shift-and-or is 32-bit: half the shifts and half
+    // the ORs, per LANE per column, and there are MATRIX_GROUP * TERM_GROUP lanes.
+    //
+    // `column_split_is_exactly_at_bit_32` checks both halves of that against `PPart::shift`, so a
+    // change to the packing fails a test rather than silently dropping the high half of a digit.
+    u32 acc32[MATRIX_GROUP * TERM_GROUP];
     u32 rejected[MATRIX_GROUP * TERM_GROUP];
 #pragma unroll
     for (u32 i = 0; i < MATRIX_GROUP * TERM_GROUP; ++i) {
         working[i] = 0;
+        acc32[i] = 0;
         rejected[i] = 0;
     }
 
+// The read half of a column, shared by both segments. A macro rather than two hand copies: the two
+// differ ONLY in the width of the accumulate, and letting them drift would be a correctness bug
+// that appears only for p-parts long enough to reach the second segment.
+#define READ_COLUMN(jj)                                           \
+    u32 cv[MATRIX_GROUP];                                         \
+    u32 mv[MATRIX_GROUP];                                         \
+    _Pragma("unroll") for (u32 mm = 0; mm < MATRIX_GROUP; ++mm) { \
+        cv[mm] = ((jj) < cs_len) ? (u32)cs[cs_b[mm] + (jj)] : 0u; \
+        mv[mm] = ((jj) < mk_len) ? (u32)mk[mk_b[mm] + (jj)] : 0u; \
+    }                                                             \
+    u32 sh = PP_SHIFT[jj];                                        \
+    u32 fm = PP_MASK[jj];                                         \
+    u32 bv[TERM_GROUP];                                           \
+    _Pragma("unroll") for (u32 tt = 0; tt < TERM_GROUP; ++tt)     \
+        bv[tt] = (u32)((b_bits[tt] >> sh) & fm);
+
     // Past the longest of the three inputs, b, cs and mk are all zero, so pair_col returns 0 -- no
     // rejection and nothing added. Stopping there is exact, not a truncation.
-    for (u32 j = 0; j < cols; ++j) {
-        // 2M + T loads feeding M*T evaluations: this is the whole point of the tile.
-        u32 cv[MATRIX_GROUP];
-        u32 mv[MATRIX_GROUP];
-#pragma unroll
-        for (u32 mm = 0; mm < MATRIX_GROUP; ++mm) {
-            cv[mm] = (j < cs_len) ? (u32)cs[cs_b[mm] + j] : 0u;
-            mv[mm] = (j < mk_len) ? (u32)mk[mk_b[mm] + j] : 0u;
-        }
-        // One shift/mask pair per column, shared by every lane of the tile -- and now used for
-        // BOTH reading the term's digit and writing the accumulator's, since the two are the same
-        // packing.
-        u32 jj = (j < PPART_MAX_LEN) ? j : 0;
-        u32 sh = PP_SHIFT[jj];
-        u32 fm = PP_MASK[jj];
-
-        // No load: the digit comes out of a register. Past PPART_MAX_LEN a p-part has no entries,
-        // so the value there is zero by construction rather than by a bounds test.
-        u32 bv[TERM_GROUP];
-#pragma unroll
-        for (u32 tt = 0; tt < TERM_GROUP; ++tt)
-            bv[tt] = (j < PPART_MAX_LEN) ? (u32)((b_bits[tt] >> sh) & fm) : 0u;
+    u32 end_lo = (cols < COL_SPLIT_32) ? cols : COL_SPLIT_32;
+    for (u32 j = 0; j < end_lo; ++j) {
+        READ_COLUMN(j)
 #pragma unroll
         for (u32 mm = 0; mm < MATRIX_GROUP; ++mm) {
 #pragma unroll
@@ -357,10 +370,28 @@ extern "C" __global__ __launch_bounds__(THREADS) void multiply_batch(
                 u32 i = mm * TERM_GROUP + tt;
                 u32 val = pair_col(j, low[tt], bv[tt], cv[mm], mv[mm]);
                 rejected[i] |= val & PAIR_COL_REJECT;
-                if (j < PPART_MAX_LEN) working[i] |= (u64)(val & fm) << sh;
+                acc32[i] |= (val & fm) << sh;
             }
         }
     }
+#pragma unroll
+    for (u32 i = 0; i < MATRIX_GROUP * TERM_GROUP; ++i) working[i] = (u64)acc32[i];
+
+    for (u32 j = end_lo; j < cols; ++j) {
+        READ_COLUMN(j)
+#pragma unroll
+        for (u32 mm = 0; mm < MATRIX_GROUP; ++mm) {
+#pragma unroll
+            for (u32 tt = 0; tt < TERM_GROUP; ++tt) {
+                u32 i = mm * TERM_GROUP + tt;
+                u32 val = pair_col(j, low[tt], bv[tt], cv[mm], mv[mm]);
+                rejected[i] |= val & PAIR_COL_REJECT;
+                working[i] |= (u64)(val & fm) << sh;
+            }
+        }
+    }
+#undef READ_COLUMN
+
 
     // Emit, dropping the lanes a partial tile invented.
 #pragma unroll

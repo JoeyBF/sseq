@@ -163,6 +163,26 @@ mod tests {
         );
     }
 
+    /// [`COL_SPLIT_32`] must be exactly where `PPart`'s packing crosses bit 32.
+    ///
+    /// The kernel accumulates the columns below it in `u32`, which is sound only if every digit
+    /// there ends below bit 32, and worth doing only if the next digit does not. Both halves are
+    /// read off `PPart::shift` rather than trusted to a comment, so a change to the packing fails
+    /// here instead of silently dropping the high half of a digit on the device.
+    #[test]
+    fn column_split_is_exactly_at_bit_32() {
+        use crate::algebra::milnor_algebra::PPart;
+        assert!(
+            PPart::shift(COL_SPLIT_32) <= 32,
+            "digit {COL_SPLIT_32} starts at bit {}, so a 32-bit accumulate would drop real bits",
+            PPart::shift(COL_SPLIT_32),
+        );
+        assert!(
+            PPart::shift(COL_SPLIT_32 + 1) > 32,
+            "the split is short: digit {COL_SPLIT_32} also fits below bit 32",
+        );
+    }
+
     /// Every knob the kernel needs is actually emitted, or NVRTC would `#error`.
     #[test]
     fn defines_cover_every_knob() {

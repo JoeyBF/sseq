@@ -658,6 +658,12 @@ mod tests {
     ///
     /// It also runs WITHOUT a card, so a marshalling regression is caught by an ordinary
     /// `cargo test --features cuda` rather than sitting unnoticed behind an `#[ignore]`.
+    ///
+    /// WHAT IT DOES NOT MODEL: the kernel's loop SEGMENTATION. The column loop is split at
+    /// `COL_SPLIT_32` into a 32-bit and a 64-bit accumulate, and this walks one uniform loop
+    /// instead. The two compute the same thing by construction -- that is the split's whole
+    /// premise -- but it means a bug in the segmentation shows up only on a device, so the
+    /// `#[ignore]`d tests are load-bearing for that and not merely a faster check.
     fn simulate(
         s: &HostStore,
         a: &LaunchArrays,
