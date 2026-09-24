@@ -70,6 +70,8 @@ pub(super) struct LaunchArrays {
     prod_out_offset: Vec<u32>,
     /// Prefix sum of pair counts, length `num_products + 1`.
     prod_pair_start: Vec<u64>,
+    /// Coarse index over the pair space; see `build_coarse`.
+    prod_coarse: Vec<u32>,
 }
 
 impl LaunchArrays {
@@ -110,6 +112,7 @@ pub(super) fn marshal(
         prod_row_base: Vec::new(),
         prod_out_offset: Vec::new(),
         prod_pair_start: vec![0],
+        prod_coarse: Vec::new(),
     };
 
     for prod in products {
@@ -151,7 +154,66 @@ pub(super) fn marshal(
         a.prod_pair_start
             .push(a.prod_pair_start.last().unwrap() + pairs);
     }
+    a.prod_coarse = build_coarse(&a.prod_pair_start);
     Ok(a)
+}
+
+/// Bucket the pair space so the kernel's product search starts from a narrow bracket.
+///
+/// `coarse[ci]` is the largest product whose pair range starts at or before `ci << COARSE_LOG`, so
+/// the owner of any pair in that bucket lies in `[coarse[ci], coarse[ci + 1]]`. Built in one pass
+/// over the products rather than by searching per bucket.
+///
+/// Length is one past the last bucket, because the kernel reads `ci + 1` unconditionally -- a
+/// thread in the final bucket would otherwise read off the end, which is an out-of-bounds load that
+/// yields a plausible bracket and therefore a plausible wrong answer.
+fn build_coarse(prod_pair_start: &[u64]) -> Vec<u32> {
+    let num_products = prod_pair_start.len().saturating_sub(1);
+    if num_products == 0 {
+        return vec![0, 0];
+    }
+    let total = *prod_pair_start.last().unwrap();
+    let buckets = (total >> params::COARSE_LOG) as usize + 2;
+    let mut coarse = vec![0u32; buckets];
+    let mut p = 0usize;
+    for (ci, slot) in coarse.iter_mut().enumerate() {
+        let target = (ci as u64) << params::COARSE_LOG;
+        while p + 1 < num_products && prod_pair_start[p + 1] <= target {
+            p += 1;
+        }
+        *slot = p as u32;
+    }
+    coarse
+}
+
+/// Where a launch's wall time actually went.
+///
+/// THIS EXISTS BECAUSE WALL TIME LIES ABOUT KERNELS. The first kernel optimisation re-introduced
+/// into this port -- the coarse index on the product search, worth ~12% of cubecl's KERNEL time --
+/// moved the end-to-end warm figure by 0.000s, because the kernel is a minority of it. This
+/// codebase has a harness on record where 87% of the measured wall time was overhead and every
+/// kernel change therefore measured as 0%; attributing that to "the optimisation does not work"
+/// would be exactly the wrong conclusion.
+///
+/// Each phase is separated by a stream SYNCHRONISE, so the numbers add up to the wall time and
+/// none of them hides behind another. That serialisation is the cost of being able to attribute,
+/// and it is why the timed entry point is separate from the plain one.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct LaunchTiming {
+    /// Building the per-launch arrays on the host, including making new `R`s resident.
+    pub marshal: f64,
+    /// Host-to-device of those arrays plus zeroing the output.
+    pub upload: f64,
+    /// The multiply kernel itself.
+    pub kernel: f64,
+    /// Device-to-host of the limbs.
+    pub readback: f64,
+}
+
+impl LaunchTiming {
+    pub fn total(&self) -> f64 {
+        self.marshal + self.upload + self.kernel + self.readback
+    }
 }
 
 /// Run a batch on the device and return the limbs, matching [`cpu_multiply_batch`] bit for bit.
@@ -170,6 +232,24 @@ pub fn cuda_multiply_batch(
     products: &[GpuProduct],
     col_map: Option<&[u32]>,
 ) -> Result<BatchOutput> {
+    cuda_multiply_batch_timed(rt, algebra, num_cols, num_rows, products, col_map).map(|(o, _)| o)
+}
+
+/// [`cuda_multiply_batch`], also reporting where the time went.
+///
+/// Separate entry point because the attribution costs a stream synchronise per phase. Production
+/// calls the plain one.
+pub fn cuda_multiply_batch_timed(
+    rt: &Arc<MilnorCuda>,
+    algebra: &MilnorAlgebra,
+    num_cols: usize,
+    num_rows: usize,
+    products: &[GpuProduct],
+    col_map: Option<&[u32]>,
+) -> Result<(BatchOutput, LaunchTiming)> {
+    use std::time::Instant;
+    let mut timing = LaunchTiming::default();
+    let t_marshal = Instant::now();
     let num_limbs = num_cols.div_ceil(32).max(1);
     let out_len = num_rows * num_limbs;
 
@@ -233,7 +313,11 @@ pub fn cuda_multiply_batch(
     };
 
     if arrays.total_pairs() == 0 {
-        return Ok(BatchOutput::from_limbs(vec![0u32; out_len], num_limbs));
+        timing.marshal = t_marshal.elapsed().as_secs_f64();
+        return Ok((
+            BatchOutput::from_limbs(vec![0u32; out_len], num_limbs),
+            timing,
+        ));
     }
 
     let module = rt.module(&module_key(), SRC, &params::defines())?;
@@ -241,6 +325,8 @@ pub fn cuda_multiply_batch(
         .load_function("multiply_batch")
         .map_err(|e| CudaError::Compile(format!("load multiply_batch: {e:?}")))?;
     let stream = rt.context().default_stream();
+    timing.marshal = t_marshal.elapsed().as_secs_f64();
+    let t_upload = Instant::now();
 
     macro_rules! up {
         ($v:expr) => {
@@ -261,6 +347,7 @@ pub fn cuda_multiply_batch(
     let d_prb = up!(arrays.prod_row_base);
     let d_poo = up!(arrays.prod_out_offset);
     let d_pps = up!(arrays.prod_pair_start);
+    let d_pc = up!(arrays.prod_coarse);
     // The argument is not optional, so an unrestricted launch binds a one-element dummy the kernel
     // never reads.
     let cm: Vec<u32> = col_map.map_or_else(|| vec![0u32], <[u32]>::to_vec);
@@ -269,6 +356,12 @@ pub fn cuda_multiply_batch(
     let mut d_out = stream
         .alloc_zeros::<u32>(out_len)
         .map_err(|e| CudaError::Compile(format!("alloc out: {e:?}")))?;
+
+    stream
+        .synchronize()
+        .map_err(|e| CudaError::Compile(format!("sync after upload: {e:?}")))?;
+    timing.upload = t_upload.elapsed().as_secs_f64();
+    let t_kernel = Instant::now();
 
     // Resident buffers reach the kernel as raw device pointers. A `CUdeviceptr` is a `u64` and a
     // kernel pointer parameter is a 64-bit value, so pushing it as a scalar is the same eight bytes
@@ -325,6 +418,7 @@ pub fn cuda_multiply_batch(
             .arg(&d_prb)
             .arg(&d_poo)
             .arg(&d_pps)
+            .arg(&d_pc)
             .arg(&num_products)
             .arg(&pair_offset)
             .arg(&width)
@@ -335,10 +429,17 @@ pub fn cuda_multiply_batch(
         done += n;
     }
 
+    stream
+        .synchronize()
+        .map_err(|e| CudaError::Compile(format!("sync after kernel: {e:?}")))?;
+    timing.kernel = t_kernel.elapsed().as_secs_f64();
+    let t_readback = Instant::now();
+
     let limbs = stream
         .clone_dtoh(&d_out)
         .map_err(|e| CudaError::Compile(format!("readback: {e:?}")))?;
-    Ok(BatchOutput::from_limbs(limbs, num_limbs))
+    timing.readback = t_readback.elapsed().as_secs_f64();
+    Ok((BatchOutput::from_limbs(limbs, num_limbs), timing))
 }
 
 /// Device memory currently COMMITTED by the resident store, for diagnostics.
@@ -519,8 +620,12 @@ mod tests {
         let total = a.total_pairs();
         let num_products = a.num_products();
         for k in 0..total {
-            // Largest p with prod_pair_start[p] <= k.
-            let (mut lo, mut hi) = (0usize, num_products);
+            // Largest p with prod_pair_start[p] <= k, from the SAME coarse bracket the kernel
+            // uses. Walking it unbracketed here would leave `build_coarse` untested, and a wrong
+            // bracket does not crash -- it silently attributes a pair to the wrong product.
+            let ci = (k >> params::COARSE_LOG) as usize;
+            let mut lo = a.prod_coarse[ci] as usize;
+            let mut hi = (a.prod_coarse[ci + 1] as usize + 1).min(num_products);
             while hi - lo > 1 {
                 let mid = (lo + hi) / 2;
                 if a.prod_pair_start[mid] <= k {
@@ -967,11 +1072,14 @@ mod tests {
         let rt = super::super::runtime(0).expect("open device 0");
         let mut times = Vec::new();
         let mut digests = Vec::new();
+        let mut phases: Vec<LaunchTiming> = Vec::new();
         for _ in 0..reps.max(2) {
             let t = Instant::now();
-            let out = cuda_multiply_batch(&rt, &algebra, cols, rows, &prods, cm.as_deref())
-                .expect("device batch");
+            let (out, tm) =
+                cuda_multiply_batch_timed(&rt, &algebra, cols, rows, &prods, cm.as_deref())
+                    .expect("device batch");
             times.push(t.elapsed().as_secs_f64());
+            phases.push(tm);
             let (h, ones) = out.digest();
             assert!(
                 ones > 0,
@@ -997,6 +1105,46 @@ mod tests {
             resident_committed_bytes(&super::super::runtime(0).expect("dev 0")).unwrap_or(0) as f64
                 / 1e6,
             digests[0],
+        );
+        // The WARM phase split, averaged over the warm reps. Wall time is not kernel time: a
+        // kernel optimisation can be real and still move the line above by nothing, and this is
+        // what says which of those happened.
+        let n = (phases.len() - 1) as f64;
+        let avg = |f: fn(&LaunchTiming) -> f64| phases[1..].iter().map(f).sum::<f64>() / n;
+        let (m, u, k, r) = (
+            avg(|t| t.marshal),
+            avg(|t| t.upload),
+            avg(|t| t.kernel),
+            avg(|t| t.readback),
+        );
+        let tot = m + u + k + r;
+        // Pair throughput, so this batch can be calibrated against the frontier rather than
+        // assumed representative of it. `pairs` counts (matrix, term) pairs -- kernel THREADS --
+        // which needs the resident matrix counts, not just the term counts.
+        let store = resident(&super::super::runtime(0).expect("dev 0")).expect("resident");
+        let store = store.lock().unwrap();
+        let mut pairs: u64 = 0;
+        for prod in &prods {
+            let pp = algebra
+                .basis_element_from_index(prod.r_degree, prod.r_idx)
+                .p_part
+                .clone();
+            if let Some(info) = store.master_get(&pp) {
+                pairs += info.num_mats as u64 * prod.term_indices.len() as u64;
+            }
+        }
+        drop(store);
+        eprintln!(
+            "  pairs={pairs} -> {:.3}e9 pairs/s in the kernel",
+            pairs as f64 / k / 1e9
+        );
+        eprintln!(
+            "  warm phases: marshal={m:.4}s ({:.1}%) upload={u:.4}s ({:.1}%) \
+             kernel={k:.4}s ({:.1}%) readback={r:.4}s ({:.1}%)",
+            100.0 * m / tot,
+            100.0 * u / tot,
+            100.0 * k / tot,
+            100.0 * r / tot,
         );
     }
 }

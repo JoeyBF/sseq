@@ -17,6 +17,9 @@
 #ifndef THREADS
 #error "THREADS must be provided as an NVRTC -D option (see params.rs)"
 #endif
+#ifndef COARSE_LOG
+#error "COARSE_LOG must be provided as an NVRTC -D option (see params.rs)"
+#endif
 
 typedef unsigned short u16;
 typedef unsigned int u32;
@@ -135,6 +138,10 @@ extern "C" __global__ __launch_bounds__(THREADS) void multiply_batch(
     // Prefix sum of pair counts, length num_products + 1. u64: a single unsplittable row's pair
     // space can exceed 2^32.
     const u64 *__restrict__ prod_pair_start,
+    // Coarse index over the pair space: entry `ci` is the product owning pair `ci << COARSE_LOG`,
+    // so the product owning any pair in that bucket lies in `[prod_coarse[ci], prod_coarse[ci+1]]`.
+    // One entry past the last bucket, so `ci + 1` is always readable.
+    const u32 *__restrict__ prod_coarse,
     u32 num_products,
     // First pair index this launch covers, so a pair space past the 32-bit thread index can be
     // walked in pieces. 0 for every launch of a normally-sized block.
@@ -150,10 +157,18 @@ extern "C" __global__ __launch_bounds__(THREADS) void multiply_batch(
     // Largest product p with prod_pair_start[p] <= k. Every product owns at least one pair, so
     // prod_pair_start is strictly increasing and p is unique.
     //
-    // Unbracketed on purpose: the cubecl kernel hands the search a coarse index so it starts from a
-    // two-product bracket, worth ~12% of kernel time. That is an optimisation to re-add with the
-    // digest held fixed, not part of being correct.
-    u32 lo = 0, hi = num_products;
+    // `prod_coarse` BRACKETS the search before it starts. Each step of an unbracketed search is a
+    // DEPENDENT global load of prod_pair_start[mid] -- a full latency stall before the thread can
+    // touch its own data. MEASURED on a real stem-130 batch, interleaved, kernel time only:
+    // 33.43e9 pairs/s unbracketed against 37.46e9 bracketed, i.e. 1.120x, matching the ~12% the
+    // cubecl ablation found. Two cheap loads replace ~15 dependent ones.
+    //
+    // The bracket is valid because products are ordered and each owns at least one pair; the
+    // sentinel entry keeps ci+1 readable for the final bucket.
+    u32 ci = (u32)(k >> COARSE_LOG);
+    u32 lo = prod_coarse[ci];
+    u32 hi = prod_coarse[ci + 1] + 1;
+    if (hi > num_products) hi = num_products;
     while (hi - lo > 1) {
         u32 mid = (lo + hi) / 2;
         if (prod_pair_start[mid] <= k) lo = mid; else hi = mid;
