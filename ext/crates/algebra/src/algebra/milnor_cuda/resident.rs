@@ -29,7 +29,10 @@ use std::{
 
 use cudarc::driver::sys;
 
-use super::{CudaError, GrowBuf, MilnorCuda, Result};
+use super::{
+    CudaError, GrowBuf, MilnorCuda, Result,
+    enumerate::{enumerate_into, r_dims},
+};
 use crate::algebra::{Algebra, MilnorAlgebra, combinatorics::xi_degrees, milnor_algebra::PPart};
 
 /// Address space reserved per buffer, in bytes, overridable by env var.
@@ -313,6 +316,11 @@ impl Resident {
         &self.basis
     }
 
+    /// Where an `R` lives, if it is resident. `None` means it was never enumerated.
+    pub fn master_get(&self, r_p_part: &PPart) -> Option<RInfo> {
+        self.master.get(r_p_part)
+    }
+
     pub fn cs_ptr(&self) -> sys::CUdeviceptr {
         self.cs.ptr()
     }
@@ -394,7 +402,112 @@ impl Resident {
         Ok(())
     }
 
-    /// Enumerate and append one `R`'s admissible matrices, or return what is already resident.
+    /// Make every `R` in `p_parts` resident, enumerating the new ones ON THE DEVICE, and return
+    /// their placements in the same order.
+    ///
+    /// This is the path that matters. [`Self::ensure_r`] enumerates on the CPU, one `R` at a time,
+    /// which is fine for a test and wrong for a workload twice over: the host enumeration is the
+    /// cost the enum kernel exists to remove, and doing it per `R` means one launch per `R` when
+    /// what the device wants is one launch per BATCH. A production batch's distinct `R` count is in
+    /// the thousands, and the enum kernel's duration is set by its longest single `R` rather than
+    /// by how many it carries -- so merging them turns a sum into a max.
+    ///
+    /// The enumerated matrices never touch the host. The count pass sizes each block, the layout
+    /// places it, the buffers grow, and the emit pass writes straight into them.
+    pub fn ensure_rs(&mut self, rt: &Arc<MilnorCuda>, p_parts: &[PPart]) -> Result<Vec<RInfo>> {
+        // Distinct and NOT already resident, in first-seen order. The same `R` can appear many
+        // times in one batch -- that redundancy is the reason the master is deduplicated at all.
+        let mut fresh: Vec<PPart> = Vec::new();
+        let mut seen: HashMap<PPart, ()> = HashMap::new();
+        for p in p_parts {
+            if p.is_empty() {
+                return Err(CudaError::Compile(
+                    "empty R has no admissible matrices; Sq(1) is not a batch product".to_owned(),
+                ));
+            }
+            if self.master.get(p).is_none() && seen.insert(p.clone(), ()).is_none() {
+                fresh.push(p.clone());
+            }
+        }
+
+        if !fresh.is_empty() {
+            self.bind()?;
+            // `cs_len`/`mk_len` come from the p-part's SHAPE, so they are known before anything is
+            // enumerated; only the matrix COUNT needs the device.
+            let dims: Vec<(usize, usize)> = fresh.iter().map(r_dims).collect();
+            let lens: Vec<(usize, usize)> = dims
+                .iter()
+                .map(|&(rows, cols)| (cols - 1, rows + cols - 1))
+                .collect();
+
+            // PASS 1: counts. Nothing is written, so the pointers only have to bind.
+            let zero = vec![0u64; fresh.len()];
+            let counts = enumerate_into(
+                rt,
+                &fresh,
+                false,
+                self.cs.ptr(),
+                self.mk.ptr(),
+                &zero,
+                &zero,
+            )?;
+
+            // Place each block, then commit the backing store BEFORE the emit pass writes into it.
+            let mut cs_offsets = Vec::with_capacity(fresh.len());
+            let mut mk_offsets = Vec::with_capacity(fresh.len());
+            let mut infos = Vec::with_capacity(fresh.len());
+            for (i, p) in fresh.iter().enumerate() {
+                let (cs_len, mk_len) = lens[i];
+                let n = counts[i] as usize;
+                let info = self
+                    .master
+                    .place(p, cs_len, mk_len, n, n * cs_len, n * mk_len);
+                cs_offsets.push(info.cs_offset);
+                mk_offsets.push(info.mk_offset);
+                infos.push(info);
+            }
+            self.cs.grow_to(self.master.cs_elems() * size_of::<u16>())?;
+            self.mk.grow_to(self.master.mk_elems() * size_of::<u16>())?;
+
+            // PASS 2: fill, directly into the resident buffers.
+            let recount = enumerate_into(
+                rt,
+                &fresh,
+                true,
+                self.cs.ptr(),
+                self.mk.ptr(),
+                &cs_offsets,
+                &mk_offsets,
+            )?;
+            // The passes run the same odometer, so a disagreement means the emit pass wrote outside
+            // the space the count pass sized -- the master is already corrupt, and the multiply that
+            // reads it would return a plausible wrong answer rather than fail.
+            if recount != counts {
+                return Err(CudaError::Compile(
+                    "the enumeration's count and emit passes disagree; the master is not \
+                     trustworthy"
+                        .to_owned(),
+                ));
+            }
+        }
+
+        p_parts
+            .iter()
+            .map(|p| {
+                self.master
+                    .get(p)
+                    .ok_or_else(|| CudaError::Compile(format!("R {p:?} was not made resident")))
+            })
+            .collect()
+    }
+
+    /// Enumerate and append one `R`'s admissible matrices ON THE CPU, or return what is
+    /// already resident.
+    ///
+    /// Kept as the fallback and as the thing [`Self::ensure_rs`] is checked against: the two
+    /// must produce identical masters, which is what `cuda_enumerate_matches_cpu_reference`
+    /// asserts element by element. Prefer `ensure_rs` for real work -- this enumerates on the
+    /// host, which is the cost the enum kernel exists to remove.
     pub fn ensure_r(&mut self, algebra: &MilnorAlgebra, r_p_part: &PPart) -> Result<RInfo> {
         if let Some(info) = self.master.get(r_p_part) {
             return Ok(info);

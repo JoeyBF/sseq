@@ -40,6 +40,19 @@ fn module_key() -> String {
     key
 }
 
+/// Enumerate admissible matrices on the CPU instead of on the device.
+///
+/// `NASSAU_CUDA_CPU_ENUM=1`. Off by default -- host enumeration is the cost the enum kernel exists
+/// to remove -- but kept reachable, because the two paths must produce identical masters and being
+/// able to flip between them in one process is how that gets checked on real input rather than on
+/// a test fixture.
+fn cpu_enumeration() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("NASSAU_CUDA_CPU_ENUM").is_ok_and(|v| v != "0" && !v.is_empty())
+    })
+}
+
 /// The per-launch arrays, in device layout.
 pub(super) struct LaunchArrays {
     /// Per distinct `R` in THIS launch, pointing into the resident master.
@@ -177,16 +190,45 @@ pub fn cuda_multiply_batch(
     store.ensure_seqno(algebra, max_out_degree)?;
     store.ensure_basis(algebra, max_s_degree)?;
 
+    // Make every `R` this batch needs resident in ONE enumeration launch, before marshalling.
+    //
+    // Per-`R`, on demand, would be one launch each, and the enum kernel's duration is set by its
+    // longest single `R` rather than by how many it carries -- so batching turns a sum into a max.
+    // It also keeps the enumerated matrices off the host entirely: they are written straight into
+    // the resident buffers.
+    let needed: Vec<PPart> = products
+        .iter()
+        .filter(|p| algebra.dimension(p.r_degree + p.s_degree) != 0 && !p.term_indices.is_empty())
+        .map(|p| {
+            algebra
+                .basis_element_from_index(p.r_degree, p.r_idx)
+                .p_part
+                .clone()
+        })
+        .collect();
+    if cpu_enumeration() {
+        for p in &needed {
+            store.ensure_r(algebra, p)?;
+        }
+    } else {
+        store.ensure_rs(rt, &needed)?;
+    }
+
     let arrays = {
-        // `r_of` appends to the store while `gei_of` reads the basis layout, and both are live at
-        // once inside `marshal`. The basis is fully built above, so snapshotting each degree's base
-        // here is exact and sidesteps the double borrow.
+        // The basis is fully built above, so snapshotting each degree's base here is exact, and it
+        // sidesteps borrowing the store twice inside `marshal`.
         let bases: Vec<u32> = (0..=max_s_degree.max(0))
             .map(|d| store.basis().gei(d, 0))
             .collect();
         let gei_of = move |d: i32, ti: usize| bases[d as usize] + ti as u32;
-        let store = &mut *store;
-        let mut r_of = |p: &PPart| store.ensure_r(algebra, p);
+        let store = &*store;
+        // Lookup only: every `R` was made resident above, so a miss here is a bug, not a cache
+        // fill, and saying so is better than silently enumerating on the host.
+        let mut r_of = |p: &PPart| {
+            store
+                .master_get(p)
+                .ok_or_else(|| CudaError::Compile(format!("R {p:?} was not made resident")))
+        };
         marshal(algebra, num_limbs, products, &mut r_of, &gei_of)?
     };
 

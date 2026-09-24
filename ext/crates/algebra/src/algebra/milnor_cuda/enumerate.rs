@@ -9,7 +9,7 @@
 
 use std::sync::Arc;
 
-use cudarc::driver::{LaunchConfig, PushKernelArg};
+use cudarc::driver::{LaunchConfig, PushKernelArg, sys};
 
 use super::{CudaError, MilnorCuda, Result, params};
 use crate::algebra::milnor_algebra::PPart;
@@ -29,7 +29,7 @@ fn module_key() -> String {
 ///
 /// `cols` is the widest BIT-LENGTH of any entry, not the entry count -- the odometer's digits are
 /// bit positions. Getting this wrong sizes every per-thread array wrongly.
-fn r_dims(p_part: &PPart) -> (usize, usize) {
+pub(super) fn r_dims(p_part: &PPart) -> (usize, usize) {
     let rows = p_part.len();
     let cols = p_part
         .iter()
@@ -41,7 +41,7 @@ fn r_dims(p_part: &PPart) -> (usize, usize) {
 }
 
 /// Flattened, zero-padded inputs for a batch of `R`s: `(width, p_parts, rows, cols)`.
-fn layout(p_parts: &[PPart]) -> (usize, Vec<u32>, Vec<u32>, Vec<u32>) {
+pub(super) fn layout(p_parts: &[PPart]) -> (usize, Vec<u32>, Vec<u32>, Vec<u32>) {
     let n_r = p_parts.len();
     let width = p_parts.iter().map(|p| p.len()).max().unwrap_or(1).max(1);
     let mut flat = vec![0u32; n_r * width];
@@ -56,6 +56,115 @@ fn layout(p_parts: &[PPart]) -> (usize, Vec<u32>, Vec<u32>, Vec<u32>) {
         r_cols[i] = cols as u32;
     }
     (width, flat, r_rows, r_cols)
+}
+
+/// Run the enumeration kernel, writing into buffers the CALLER owns.
+///
+/// This is what lets the resident master be built without the enumerated matrices ever touching the
+/// host. The count pass sizes each `R`'s block, the caller grows its `GrowBuf`s and decides where
+/// each block goes, and the emit pass writes there directly -- no staging buffer, no
+/// device-to-device copy, no host round trip of a structure that reaches tens of GB.
+///
+/// `cs_ptr`/`mk_ptr` are raw device pointers; `cs_offsets`/`mk_offsets` are ELEMENT offsets into
+/// them, one per `R`. With `emit = false` the pointers are never dereferenced and the offsets are
+/// ignored, so a counting caller may pass anything valid to bind.
+///
+/// # Safety-adjacent
+///
+/// The caller must have committed enough backing store for every offset plus its block. Nothing
+/// here can check that: the kernel writes where it is told. The two-pass discipline is what makes
+/// it sound -- the offsets come from the counts the count pass produced, for the same `R`s in the
+/// same order.
+pub(super) fn enumerate_into(
+    rt: &Arc<MilnorCuda>,
+    p_parts: &[PPart],
+    emit: bool,
+    cs_ptr: sys::CUdeviceptr,
+    mk_ptr: sys::CUdeviceptr,
+    cs_offsets: &[u64],
+    mk_offsets: &[u64],
+) -> Result<Vec<u32>> {
+    let n_r = p_parts.len();
+    if n_r == 0 {
+        return Ok(Vec::new());
+    }
+    assert_eq!(cs_offsets.len(), n_r, "one cs offset per R");
+    assert_eq!(mk_offsets.len(), n_r, "one mk offset per R");
+
+    let (width, flat, r_rows, r_cols) = layout(p_parts);
+    check_caps(&r_rows, &r_cols)?;
+
+    let module = rt.module(&module_key(), SRC, &params::enum_defines())?;
+    let f = module
+        .load_function("enumerate_admissible")
+        .map_err(|e| CudaError::Compile(format!("load enumerate_admissible: {e:?}")))?;
+    let stream = rt.context().default_stream();
+
+    macro_rules! up {
+        ($v:expr) => {
+            stream
+                .memcpy_stod(&$v)
+                .map_err(|e| CudaError::Compile(format!("upload {}: {e:?}", stringify!($v))))?
+        };
+    }
+    let d_pp = up!(flat);
+    let d_rr = up!(r_rows);
+    let d_rc = up!(r_cols);
+    // `to_vec`: cudarc uploads from an owned slice type, and these arrive as borrowed slices.
+    let cso = cs_offsets.to_vec();
+    let mko = mk_offsets.to_vec();
+    let d_cso = up!(cso);
+    let d_mko = up!(mko);
+    let mut d_counts = stream
+        .alloc_zeros::<u32>(n_r)
+        .map_err(|e| CudaError::Compile(format!("alloc counts: {e:?}")))?;
+
+    let threads = params::ENUM_THREADS as u32;
+    let cfg = LaunchConfig {
+        grid_dim: ((n_r as u32).div_ceil(threads), 1, 1),
+        block_dim: (threads, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let width_u = width as u32;
+    let n_r_u = n_r as u32;
+    let emit_u = u32::from(emit);
+    let cs_p = cs_ptr;
+    let mk_p = mk_ptr;
+
+    let mut b = stream.launch_builder(&f);
+    b.arg(&d_pp)
+        .arg(&d_rr)
+        .arg(&d_rc)
+        .arg(&d_cso)
+        .arg(&d_mko)
+        .arg(&cs_p)
+        .arg(&mk_p)
+        .arg(&mut d_counts)
+        .arg(&width_u)
+        .arg(&n_r_u)
+        .arg(&emit_u);
+    unsafe { b.launch(cfg) }
+        .map_err(|e| CudaError::Compile(format!("launch enumerate (emit={emit}): {e:?}")))?;
+
+    stream
+        .clone_dtoh(&d_counts)
+        .map_err(|e| CudaError::Compile(format!("readback counts: {e:?}")))
+}
+
+/// Guard the per-thread caps on the HOST, where it is an error message rather than a silent
+/// out-of-bounds write into a neighbouring local array inside the kernel.
+fn check_caps(r_rows: &[u32], r_cols: &[u32]) -> Result<()> {
+    for (i, (&rows, &cols)) in r_rows.iter().zip(r_cols).enumerate() {
+        if rows as usize > params::ENUM_ROW_CAP || cols as usize > params::ENUM_COL_CAP {
+            return Err(CudaError::Compile(format!(
+                "R #{i} is {rows}x{cols}, past the per-thread caps {}x{}; \
+                 the kernel's local arrays would overflow",
+                params::ENUM_ROW_CAP,
+                params::ENUM_COL_CAP,
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// What one enumeration launch produced.
@@ -103,18 +212,7 @@ pub fn cuda_enumerate(rt: &Arc<MilnorCuda>, p_parts: &[PPart]) -> Result<Enumera
         .map(|(&r, &c)| r + c - 1)
         .collect();
 
-    // Guard the per-thread caps on the host, where it is an error message rather than a silent
-    // out-of-bounds write into a neighbouring local array.
-    for (i, (&rows, &cols)) in r_rows.iter().zip(&r_cols).enumerate() {
-        if rows as usize > params::ENUM_ROW_CAP || cols as usize > params::ENUM_COL_CAP {
-            return Err(CudaError::Compile(format!(
-                "R #{i} is {rows}x{cols}, past the per-thread caps \
-                 {}x{}; the kernel's local arrays would overflow",
-                params::ENUM_ROW_CAP,
-                params::ENUM_COL_CAP,
-            )));
-        }
-    }
+    check_caps(&r_rows, &r_cols)?;
 
     let module = rt.module(&module_key(), SRC, &params::enum_defines())?;
     let f = module
