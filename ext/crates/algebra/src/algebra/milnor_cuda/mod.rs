@@ -40,6 +40,7 @@
 
 pub mod multiply;
 pub mod params;
+pub mod resident;
 
 use std::{
     collections::HashMap,
@@ -235,6 +236,35 @@ impl GrowBuf {
         self.handles.push(handle);
         self.committed = target;
         Ok(())
+    }
+
+    /// Grow as needed and copy `data` in at `offset_bytes`.
+    ///
+    /// This is the whole append path for the resident master, and it is worth noticing how little
+    /// there is of it. Under cubecl the same operation needed a segment table, a staging chunk size
+    /// (`STAGE_CHUNK`, because `create_from_slice` pins host pages per stream and never trims them
+    /// -- measured ~240 GB of pinned shmem at stem 180 across 8 streams), a copy kernel to move the
+    /// old contents into the new allocation, and a `MASTER_MAX_SEG` ceiling. Growth in place needs
+    /// none of it: the old bytes never move, so there is nothing to copy and nothing to stage.
+    ///
+    /// Synchronous, and the caller must already have the context bound -- `cuMemcpyHtoD_v2` is a
+    /// raw `sys::` entry point and does not bind one.
+    pub fn write_at<T: Copy>(&mut self, offset_bytes: usize, data: &[T]) -> Result<()> {
+        let bytes = std::mem::size_of_val(data);
+        if bytes == 0 {
+            return Ok(());
+        }
+        self.grow_to(offset_bytes + bytes)?;
+        unsafe {
+            ck(
+                "cuMemcpyHtoD",
+                sys::cuMemcpyHtoD_v2(
+                    self.base + offset_bytes as sys::CUdeviceptr,
+                    data.as_ptr().cast(),
+                    bytes,
+                ),
+            )
+        }
     }
 }
 

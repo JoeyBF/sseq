@@ -1,31 +1,36 @@
-//! Host side of the batched Milnor multiply: marshal a `[GpuProduct]` into the buffers
-//! [`multiply.cu`](../multiply.cu) reads, launch, and read the limbs back.
+//! Host side of the batched Milnor multiply: marshal a `[GpuProduct]` into what
+//! [`multiply.cu`](./multiply.cu) reads, launch, and read the limbs back.
 //!
-//! Like the kernel, this is the SIMPLEST form that is correct. Everything the cubecl host path
-//! does to avoid re-uploading data -- the process-shared resident master, the append-only resident
-//! basis, the per-device segment stores, the row batching and the un-awaited readback -- is
-//! deliberately absent. Those exist to make repeated launches cheap; none of them changes the
-//! answer, and each is far easier to add back against a path already known to agree with
-//! [`cpu_multiply_batch`] than to debug alongside a fresh kernel.
+//! The bulk data -- the admissible-matrix master, the Milnor basis, the seqno tables -- lives in
+//! [`super::resident`] and is uploaded once. What this module builds per launch is only the small
+//! per-product bookkeeping: which `R` each product uses, where its terms are, where its output
+//! lands, and the prefix sum that lets a thread decode its own pair. Everything here is
+//! proportional to the PRODUCT COUNT, not to the master: a frontier batch of ~540k products is a
+//! few MB of this against tens of GB of resident matrices, and that ratio is the whole reason the
+//! master is resident.
 //!
-//! So this marshals everything per call. It is the right shape for validation and the wrong shape
-//! for production, and the next commits close that gap one piece at a time.
+//! Still absent, and still deliberate: row batching, an un-awaited readback, and per-device
+//! streams. Those make repeated launches overlap; none of them changes the answer, so they follow
+//! with the digest already pinned.
 
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::Arc};
 
 use cudarc::driver::{LaunchConfig, PushKernelArg};
 
-use super::{CudaError, MilnorCuda, Result, params};
+use super::{
+    CudaError, MilnorCuda, Result, params,
+    resident::{BasisLayout, MasterLayout, RInfo, r_tables, resident},
+};
 use crate::algebra::{
     Algebra, MilnorAlgebra,
-    combinatorics::xi_degrees,
+    milnor_algebra::PPart,
     milnor_batch::{BatchOutput, GpuProduct},
 };
 
 /// The kernel source, compiled at runtime by NVRTC.
 const SRC: &str = include_str!("multiply.cu");
 
-/// Module cache key. Must change whenever the defines do, which they do only when `params.rs`
+/// Module cache key. Must change whenever the defines do -- which they do only when `params.rs`
 /// changes -- so the constants are folded into the key rather than trusted to stay put.
 fn module_key() -> String {
     let mut key = String::from("multiply_batch");
@@ -35,25 +40,15 @@ fn module_key() -> String {
     key
 }
 
-/// Everything one launch needs, in device layout.
-///
-/// Built by [`marshal`] and kept separate from the launch so a test can inspect it, and so the
-/// eventual resident-master version has an obvious seam to replace: only the `cs`/`mk`/`pp`/`ln`
-/// fields become long-lived, and the rest stays per launch.
-struct Marshalled {
-    /// Admissible-matrix master, concatenated over distinct `R`s.
-    cs: Vec<u16>,
-    mk: Vec<u16>,
-    /// Width-padded Milnor basis and true p-part lengths, indexed by global element index.
-    pp: Vec<u16>,
-    ln: Vec<u32>,
-    /// Per distinct `R`.
+/// The per-launch arrays, in device layout.
+pub(super) struct LaunchArrays {
+    /// Per distinct `R` in THIS launch, pointing into the resident master.
     r_cs_offset: Vec<u64>,
     r_mk_offset: Vec<u64>,
     r_cs_len: Vec<u32>,
     r_mk_len: Vec<u32>,
     r_num_mats: Vec<u32>,
-    /// Per product, in the order given.
+    /// Term global basis indices, run-concatenated per product.
     term_gei: Vec<u32>,
     prod_r_index: Vec<u32>,
     prod_term_start: Vec<u32>,
@@ -62,13 +57,9 @@ struct Marshalled {
     prod_out_offset: Vec<u32>,
     /// Prefix sum of pair counts, length `num_products + 1`.
     prod_pair_start: Vec<u64>,
-    /// Shared stride of the `g` table and the padded basis.
-    width: usize,
-    g: Vec<u32>,
-    xi: Vec<u32>,
 }
 
-impl Marshalled {
+impl LaunchArrays {
     fn num_products(&self) -> usize {
         self.prod_r_index.len()
     }
@@ -78,175 +69,88 @@ impl Marshalled {
     }
 }
 
-/// `col_sums`/`masks` arrive as `u32` but are stored as `u16` on the device, halving the master.
+/// Build the per-launch arrays.
 ///
-/// Checked rather than truncated. The one production bug this port must not reintroduce was
-/// exactly an unchecked narrowing: the masks master crossing `2^32` was read back through a `u16`
-/// index and silently truncated, which surfaced stems later as a non-zero differential at (180,92).
-fn narrow(values: &[u32], what: &str) -> Result<Vec<u16>> {
-    values
-        .iter()
-        .map(|&v| {
-            u16::try_from(v).map_err(|_| {
-                CudaError::Compile(format!(
-                    "{what} entry {v} does not fit u16; master layout wrong"
-                ))
-            })
-        })
-        .collect()
-}
-
-/// Build the device-side inputs for `products`.
-///
-/// `algebra` must have its seqno tables built through the highest output degree any product
-/// reaches; the caller owns that because building them is degree-monotone and shared.
-fn marshal(
+/// `r_of` resolves an `R`'s p-part to its place in the master, appending it if it is new; `gei_of`
+/// maps a term to its resident basis index. Both are passed IN rather than taken from a `Resident`
+/// so the device-free walk can drive this exact function against host-side layouts. The offsets and
+/// the prefix sum are the part most worth testing, and testing a reimplementation of them would
+/// prove nothing.
+pub(super) fn marshal(
     algebra: &MilnorAlgebra,
-    num_rows: usize,
     num_limbs: usize,
     products: &[GpuProduct],
-) -> Result<Marshalled> {
-    let (width, g) = algebra.seqno_table_u32();
-
-    // The basis has to cover every term's degree, and `g`/`width` fix the padding stride.
-    let max_s_degree = products.iter().map(|p| p.s_degree).max().unwrap_or(0);
-    let mut pp: Vec<u16> = Vec::new();
-    let mut ln: Vec<u32> = Vec::new();
-    // `global_base[d]` is the number of basis elements in degrees < d, so a term `(s_degree, ti)`
-    // maps to `gei = global_base[s_degree] + ti`. The concatenation order fixes every element's
-    // index, exactly as the resident basis does.
-    let mut global_base: Vec<u32> = vec![0];
-    for d in 0..=max_s_degree {
-        let dim = algebra.dimension(d);
-        for i in 0..dim {
-            let elt = algebra.basis_element_from_index(d, i);
-            ln.push(elt.p_part.len() as u32);
-            let base = pp.len();
-            pp.resize(base + width, 0);
-            for (slot, v) in pp[base..base + width].iter_mut().zip(elt.p_part.iter()) {
-                *slot = u16::try_from(v).map_err(|_| {
-                    CudaError::Compile(format!("basis p-part entry {v} does not fit u16"))
-                })?;
-            }
-        }
-        global_base.push(ln.len() as u32);
-    }
-
-    // Distinct `R`s, deduplicated: an `R` shared across many rows is enumerated and uploaded once.
-    let mut r_index: HashMap<(i32, usize), u32> = HashMap::new();
-    let mut cs: Vec<u16> = Vec::new();
-    let mut mk: Vec<u16> = Vec::new();
-    let (mut r_cs_offset, mut r_mk_offset) = (Vec::new(), Vec::new());
-    let (mut r_cs_len, mut r_mk_len, mut r_num_mats) = (Vec::new(), Vec::new(), Vec::new());
-
-    let mut term_gei: Vec<u32> = Vec::new();
-    let mut prod_r_index: Vec<u32> = Vec::new();
-    let mut prod_term_start: Vec<u32> = Vec::new();
-    let mut prod_num_terms: Vec<u32> = Vec::new();
-    let mut prod_row_base: Vec<u32> = Vec::new();
-    let mut prod_out_offset: Vec<u32> = Vec::new();
-    let mut prod_pair_start: Vec<u64> = vec![0];
+    r_of: &mut dyn FnMut(&PPart) -> Result<RInfo>,
+    gei_of: &dyn Fn(i32, usize) -> u32,
+) -> Result<LaunchArrays> {
+    let mut launch_r: HashMap<PPart, u32> = HashMap::new();
+    let mut a = LaunchArrays {
+        r_cs_offset: Vec::new(),
+        r_mk_offset: Vec::new(),
+        r_cs_len: Vec::new(),
+        r_mk_len: Vec::new(),
+        r_num_mats: Vec::new(),
+        term_gei: Vec::new(),
+        prod_r_index: Vec::new(),
+        prod_term_start: Vec::new(),
+        prod_num_terms: Vec::new(),
+        prod_row_base: Vec::new(),
+        prod_out_offset: Vec::new(),
+        prod_pair_start: vec![0],
+    };
 
     for prod in products {
         // A product whose output degree is empty contributes nothing; the CPU reference skips it
-        // and so must this, or its `num_mats * num_terms` pairs would all reject at a cost.
+        // and so must this, or its `num_mats * num_terms` pairs would all reject at full cost.
         if algebra.dimension(prod.r_degree + prod.s_degree) == 0 || prod.term_indices.is_empty() {
             continue;
         }
-        let key = (prod.r_degree, prod.r_idx);
-        let ri = match r_index.get(&key) {
+        let r_p_part = algebra
+            .basis_element_from_index(prod.r_degree, prod.r_idx)
+            .p_part
+            .clone();
+        // Launch-local index, so `r_*` is as long as THIS batch's distinct `R` count rather than as
+        // long as everything ever made resident.
+        let ri = match launch_r.get(&r_p_part) {
             Some(&ri) => ri,
             None => {
-                let r_p_part = algebra
-                    .basis_element_from_index(prod.r_degree, prod.r_idx)
-                    .p_part
-                    .clone();
-                // `Sq(empty) = 1` has no admissible matrices and is the caller's job, exactly as
-                // in `AdmissibleMatrix::new`. It cannot reach a batch: the resolution never emits
-                // a degree-0 operation as a product.
-                if r_p_part.is_empty() {
-                    return Err(CudaError::Compile(format!(
-                        "product at r_degree {} has an empty R; Sq(1) is not a batch product",
-                        prod.r_degree
-                    )));
-                }
-                let (cs_len, mk_len, cs_v, mk_v) = algebra.admissible_matrices(r_p_part);
-                let num_mats = if cs_len > 0 {
-                    cs_v.len() / cs_len
-                } else {
-                    mk_v.len() / mk_len.max(1)
-                };
-                let ri = r_cs_len.len() as u32;
-                r_cs_offset.push(cs.len() as u64);
-                r_mk_offset.push(mk.len() as u64);
-                r_cs_len.push(cs_len as u32);
-                r_mk_len.push(mk_len as u32);
-                r_num_mats.push(num_mats as u32);
-                cs.extend(narrow(&cs_v, "col_sums")?);
-                mk.extend(narrow(&mk_v, "masks")?);
-                r_index.insert(key, ri);
+                let info = r_of(&r_p_part)?;
+                let ri = a.r_cs_len.len() as u32;
+                a.r_cs_offset.push(info.cs_offset);
+                a.r_mk_offset.push(info.mk_offset);
+                a.r_cs_len.push(info.cs_len);
+                a.r_mk_len.push(info.mk_len);
+                a.r_num_mats.push(info.num_mats);
+                launch_r.insert(r_p_part, ri);
                 ri
             }
         };
 
-        let base = global_base[prod.s_degree as usize];
-        prod_term_start.push(term_gei.len() as u32);
-        prod_num_terms.push(prod.term_indices.len() as u32);
+        a.prod_term_start.push(a.term_gei.len() as u32);
+        a.prod_num_terms.push(prod.term_indices.len() as u32);
         for &ti in prod.term_indices.iter() {
-            term_gei.push(base + ti as u32);
+            a.term_gei.push(gei_of(prod.s_degree, ti));
         }
-        prod_r_index.push(ri);
-        prod_row_base.push((prod.row * num_limbs) as u32);
-        prod_out_offset.push(prod.out_offset as u32);
-        let pairs = r_num_mats[ri as usize] as u64 * prod.term_indices.len() as u64;
-        prod_pair_start.push(prod_pair_start.last().unwrap() + pairs);
+        a.prod_r_index.push(ri);
+        a.prod_row_base.push((prod.row * num_limbs) as u32);
+        a.prod_out_offset.push(prod.out_offset as u32);
+        let pairs = a.r_num_mats[ri as usize] as u64 * prod.term_indices.len() as u64;
+        a.prod_pair_start
+            .push(a.prod_pair_start.last().unwrap() + pairs);
     }
-
-    debug_assert!(
-        products.iter().all(|p| p.row < num_rows),
-        "row out of range"
-    );
-
-    // `xi` is indexed to `PPART_MAX_LEN` by the seqno loop regardless of how long the assembled
-    // p-part is, since the entries past it are zero and contribute `0 * xi`. Pad so those reads
-    // stay in bounds.
-    let mut xi: Vec<u32> = xi_degrees(algebra.prime())
-        .iter()
-        .map(|&d| d as u32)
-        .collect();
-    xi.resize(xi.len().max(params::PPART_MAX_LEN), 0);
-
-    Ok(Marshalled {
-        cs,
-        mk,
-        pp,
-        ln,
-        r_cs_offset,
-        r_mk_offset,
-        r_cs_len,
-        r_mk_len,
-        r_num_mats,
-        term_gei,
-        prod_r_index,
-        prod_term_start,
-        prod_num_terms,
-        prod_row_base,
-        prod_out_offset,
-        prod_pair_start,
-        width,
-        g,
-        xi,
-    })
+    Ok(a)
 }
 
 /// Run a batch on the device and return the limbs, matching [`cpu_multiply_batch`] bit for bit.
 ///
-/// `col_map` restricts the output to the masked columns, exactly as `cpu_multiply_batch_masked`
+/// `col_map` restricts the output to the masked columns exactly as `cpu_multiply_batch_masked`
 /// does: `num_cols` is then the MASKED width and `col_map.len()` the full one.
+///
+/// The algebra must have its basis and seqno tables built through every product's output degree.
 ///
 /// [`cpu_multiply_batch`]: crate::algebra::milnor_batch::cpu_multiply_batch
 pub fn cuda_multiply_batch(
-    rt: &MilnorCuda,
+    rt: &Arc<MilnorCuda>,
     algebra: &MilnorAlgebra,
     num_cols: usize,
     num_rows: usize,
@@ -254,10 +158,39 @@ pub fn cuda_multiply_batch(
     col_map: Option<&[u32]>,
 ) -> Result<BatchOutput> {
     let num_limbs = num_cols.div_ceil(32).max(1);
-    let m = marshal(algebra, num_rows, num_limbs, products)?;
     let out_len = num_rows * num_limbs;
 
-    if m.total_pairs() == 0 {
+    // Held across the whole launch. The resident buffers are append-only, so a concurrent append
+    // could not invalidate this launch's pointers -- but the layout bookkeeping is not yet
+    // lock-free, and correctness comes first.
+    let store = resident(rt)?;
+    let mut store = store.lock().unwrap();
+
+    // `ensure_seqno` FIRST: it establishes `width`, which is the stride `ensure_basis` pads to.
+    let max_out_degree = products
+        .iter()
+        .map(|p| p.r_degree + p.s_degree)
+        .max()
+        .unwrap_or(0)
+        .max(1);
+    let max_s_degree = products.iter().map(|p| p.s_degree).max().unwrap_or(0);
+    store.ensure_seqno(algebra, max_out_degree)?;
+    store.ensure_basis(algebra, max_s_degree)?;
+
+    let arrays = {
+        // `r_of` appends to the store while `gei_of` reads the basis layout, and both are live at
+        // once inside `marshal`. The basis is fully built above, so snapshotting each degree's base
+        // here is exact and sidesteps the double borrow.
+        let bases: Vec<u32> = (0..=max_s_degree.max(0))
+            .map(|d| store.basis().gei(d, 0))
+            .collect();
+        let gei_of = move |d: i32, ti: usize| bases[d as usize] + ti as u32;
+        let store = &mut *store;
+        let mut r_of = |p: &PPart| store.ensure_r(algebra, p);
+        marshal(algebra, num_limbs, products, &mut r_of, &gei_of)?
+    };
+
+    if arrays.total_pairs() == 0 {
         return Ok(BatchOutput::from_limbs(vec![0u32; out_len], num_limbs));
     }
 
@@ -274,24 +207,18 @@ pub fn cuda_multiply_batch(
                 .map_err(|e| CudaError::Compile(format!("upload {}: {e:?}", stringify!($v))))?
         };
     }
-    let d_cs = up!(m.cs);
-    let d_mk = up!(m.mk);
-    let d_pp = up!(m.pp);
-    let d_ln = up!(m.ln);
-    let d_tg = up!(m.term_gei);
-    let d_g = up!(m.g);
-    let d_xi = up!(m.xi);
-    let d_rco = up!(m.r_cs_offset);
-    let d_rmo = up!(m.r_mk_offset);
-    let d_rcl = up!(m.r_cs_len);
-    let d_rml = up!(m.r_mk_len);
-    let d_rnm = up!(m.r_num_mats);
-    let d_pri = up!(m.prod_r_index);
-    let d_pts = up!(m.prod_term_start);
-    let d_pnt = up!(m.prod_num_terms);
-    let d_prb = up!(m.prod_row_base);
-    let d_poo = up!(m.prod_out_offset);
-    let d_pps = up!(m.prod_pair_start);
+    let d_tg = up!(arrays.term_gei);
+    let d_rco = up!(arrays.r_cs_offset);
+    let d_rmo = up!(arrays.r_mk_offset);
+    let d_rcl = up!(arrays.r_cs_len);
+    let d_rml = up!(arrays.r_mk_len);
+    let d_rnm = up!(arrays.r_num_mats);
+    let d_pri = up!(arrays.prod_r_index);
+    let d_pts = up!(arrays.prod_term_start);
+    let d_pnt = up!(arrays.prod_num_terms);
+    let d_prb = up!(arrays.prod_row_base);
+    let d_poo = up!(arrays.prod_out_offset);
+    let d_pps = up!(arrays.prod_pair_start);
     // The argument is not optional, so an unrestricted launch binds a one-element dummy the kernel
     // never reads.
     let cm: Vec<u32> = col_map.map_or_else(|| vec![0u32], <[u32]>::to_vec);
@@ -301,19 +228,29 @@ pub fn cuda_multiply_batch(
         .alloc_zeros::<u32>(out_len)
         .map_err(|e| CudaError::Compile(format!("alloc out: {e:?}")))?;
 
+    // Resident buffers reach the kernel as raw device pointers. A `CUdeviceptr` is a `u64` and a
+    // kernel pointer parameter is a 64-bit value, so pushing it as a scalar is the same eight bytes
+    // cudarc would push for one of its own slices.
+    let p_cs = store.cs_ptr();
+    let p_mk = store.mk_ptr();
+    let p_pp = store.pp_ptr();
+    let p_ln = store.ln_ptr();
+    let p_g = store.g_ptr();
+    let p_xi = store.xi_ptr();
+
     // Scalars need bindings: `arg` borrows, so a temporary would be dropped before the launch.
-    let num_products = m.num_products() as u32;
+    let num_products = arrays.num_products() as u32;
     let col_map_len = col_map.map_or(0u32, |c| c.len() as u32);
     let use_col_map = u32::from(col_map.is_some());
-    let width = m.width as u32;
+    let width = store.width() as u32;
     let num_limbs_u = num_limbs as u32;
     let out_len_u = out_len as u64;
 
-    // The pair space is walked in pieces that each fit the 32-bit thread index, so a single
-    // oversized row cannot overflow the grid.
+    // Walk the pair space in pieces that each fit the 32-bit thread index, so one oversized row
+    // cannot overflow the grid.
     let threads = params::THREADS as u32;
     let chunk = (u32::MAX as u64 / threads as u64) * threads as u64;
-    let total = m.total_pairs();
+    let total = arrays.total_pairs();
     let mut done: u64 = 0;
     while done < total {
         let n = (total - done).min(chunk);
@@ -324,13 +261,13 @@ pub fn cuda_multiply_batch(
             shared_mem_bytes: 0,
         };
         let mut b = stream.launch_builder(&f);
-        b.arg(&d_cs)
-            .arg(&d_mk)
-            .arg(&d_pp)
-            .arg(&d_ln)
+        b.arg(&p_cs)
+            .arg(&p_mk)
+            .arg(&p_pp)
+            .arg(&p_ln)
             .arg(&d_tg)
-            .arg(&d_g)
-            .arg(&d_xi)
+            .arg(&p_g)
+            .arg(&p_xi)
             .arg(&mut d_out)
             .arg(&d_cm)
             .arg(&col_map_len)
@@ -362,15 +299,24 @@ pub fn cuda_multiply_batch(
     Ok(BatchOutput::from_limbs(limbs, num_limbs))
 }
 
+/// Device memory currently COMMITTED by the resident store, for diagnostics.
+///
+/// Committed, not reserved: the reservation is address space, which is free, and reporting it would
+/// make an idle process look like it is holding 100+ GB.
+pub fn resident_committed_bytes(rt: &Arc<MilnorCuda>) -> Result<usize> {
+    Ok(resident(rt)?.lock().unwrap().committed_bytes())
+}
+
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
     use fp::prime::ValidPrime;
 
-    use super::*;
+    use super::{
+        super::resident::{basis_tables, xi_table},
+        *,
+    };
     use crate::algebra::milnor_batch::{
-        COL_MAP_DROP, cpu_multiply_batch, cpu_multiply_batch_masked,
+        COL_MAP_DROP, cpu_multiply_batch, cpu_multiply_batch_masked, load_captured_batch,
     };
 
     /// A deterministic pseudo-random stream. No `rand` dependency, and the same sequence on every
@@ -392,11 +338,11 @@ mod tests {
         }
     }
 
-    /// Build a batch of products spread over many `(R, s)` pairs, rows and output offsets.
+    /// Build a batch of products spread over many `(R, s)` pairs and rows.
     ///
-    /// Deliberately NOT one product per row: the whole point of the output being XOR-accumulated is
-    /// that several products land in the same row, and a bug that drops or double-counts a pair is
-    /// invisible when every row has exactly one contributor.
+    /// Deliberately NOT one product per row: the output is XOR-accumulated, so several products
+    /// landing in the same row is the interesting case, and a bug that drops or double-counts a
+    /// pair is invisible when every row has exactly one contributor.
     fn sample_products(
         algebra: &MilnorAlgebra,
         max_degree: i32,
@@ -459,124 +405,103 @@ mod tests {
         algebra
     }
 
-    /// THE PORT'S ACCEPTANCE TEST: the device batch must equal the CPU reference bit for bit.
+    /// A host-only mirror of the resident store.
     ///
-    /// The CPU path owes nothing to any framework or card, so this pins the right answer
-    /// permanently. Every optimisation re-introduced into the kernel has to keep it passing.
-    #[test]
-    #[ignore = "needs a CUDA device; run explicitly with --ignored"]
-    fn cuda_batch_matches_cpu_reference() {
-        let max_degree = 40;
-        let algebra = algebra_to(max_degree);
-        let num_rows = 24;
-        let products = sample_products(&algebra, max_degree, num_rows, 400, 0x5eed);
-        let num_cols = full_width(&algebra, &products);
-
-        let want = cpu_multiply_batch(&algebra, num_cols, num_rows, &products);
-        let rt = super::super::runtime(0).expect("open device 0");
-        let got = cuda_multiply_batch(&rt, &algebra, num_cols, num_rows, &products, None)
-            .expect("device batch");
-
-        assert_eq!(got.num_limbs(), want.num_limbs(), "limb count");
-        assert!(
-            want.iter_rows().flatten().any(|&w| w != 0),
-            "the reference is all zero, so the comparison proves nothing"
-        );
-        for (r, (a, b)) in got.iter_rows().zip(want.iter_rows()).enumerate() {
-            assert_eq!(a, b, "row {r} differs from the CPU reference");
-        }
+    /// Uses the SAME [`MasterLayout`] / [`BasisLayout`] / [`r_tables`] / [`basis_tables`] the
+    /// device path uses, so the offsets it produces are the offsets the device would produce. Only
+    /// the upload is replaced by a `Vec` append. That is what makes the walk below a real test of
+    /// the bookkeeping rather than a test of a second implementation of it.
+    struct HostStore {
+        cs: Vec<u16>,
+        mk: Vec<u16>,
+        pp: Vec<u16>,
+        ln: Vec<u32>,
+        g: Vec<u32>,
+        xi: Vec<u32>,
+        width: usize,
+        master: MasterLayout,
+        basis: BasisLayout,
     }
 
-    /// The same, with the column restriction on: `out` is allocated at the MASKED width and the
-    /// kernel applies `col_map` itself, which is what lets the frontier's ~98%-discarded columns
-    /// never be allocated at all. A map that is off by one silently drops bits, so it is checked
-    /// against the CPU's compute-wide-then-gather rather than against the unmasked device run.
-    #[test]
-    #[ignore = "needs a CUDA device; run explicitly with --ignored"]
-    fn cuda_batch_matches_cpu_reference_masked() {
-        let max_degree = 40;
-        let algebra = algebra_to(max_degree);
-        let num_rows = 16;
-        let products = sample_products(&algebra, max_degree, num_rows, 200, 0xc0ffee);
-        let full = full_width(&algebra, &products);
-
-        // Keep every third column, exactly as a signature mask keeps a sparse subset.
-        let mut col_map = vec![COL_MAP_DROP; full];
-        let mut kept = 0u32;
-        for (i, slot) in col_map.iter_mut().enumerate() {
-            if i % 3 == 0 {
-                *slot = kept;
-                kept += 1;
+    impl HostStore {
+        fn new(algebra: &MilnorAlgebra, max_s_degree: i32) -> Self {
+            let (width, g) = algebra.seqno_table_u32();
+            let mut basis = BasisLayout::default();
+            let (pp, ln, counts) =
+                basis_tables(algebra, width, 0, max_s_degree).expect("basis tables");
+            basis.extend(&counts);
+            Self {
+                cs: Vec::new(),
+                mk: Vec::new(),
+                pp,
+                ln,
+                g,
+                xi: xi_table(algebra),
+                width,
+                master: MasterLayout::default(),
+                basis,
             }
         }
-        let out_cols = kept as usize;
 
-        let want = cpu_multiply_batch_masked(
-            &algebra,
-            out_cols,
-            Some(col_map.clone().into()),
-            num_rows,
-            &products,
-        );
-        let rt = super::super::runtime(0).expect("open device 0");
-        let got = cuda_multiply_batch(&rt, &algebra, out_cols, num_rows, &products, Some(&col_map))
-            .expect("device batch");
-
-        assert_eq!(got.num_limbs(), want.num_limbs(), "limb count");
-        assert!(
-            want.iter_rows().flatten().any(|&w| w != 0),
-            "the reference is all zero, so the comparison proves nothing"
-        );
-        for (r, (a, b)) in got.iter_rows().zip(want.iter_rows()).enumerate() {
-            assert_eq!(a, b, "row {r} differs from the masked CPU reference");
+        fn ensure_r(&mut self, algebra: &MilnorAlgebra, p: &PPart) -> Result<RInfo> {
+            if let Some(info) = self.master.get(p) {
+                return Ok(info);
+            }
+            let (cs_len, mk_len, num_mats, cs_u, mk_u) = r_tables(algebra, p)?;
+            self.cs.extend_from_slice(&cs_u);
+            self.mk.extend_from_slice(&mk_u);
+            Ok(self
+                .master
+                .place(p, cs_len, mk_len, num_mats, cs_u.len(), mk_u.len()))
         }
     }
 
     /// A CPU walk of EXACTLY what the kernel does: the same pair decode out of the same marshalled
-    /// buffers, the same per-column rule, the same seqno, the same emit.
+    /// arrays and the same store layout, the same per-column rule, the same seqno, the same emit.
     ///
-    /// This exists to split the port's two possible failure modes apart. If this disagrees with
-    /// `cpu_multiply_batch`, the bug is in [`marshal`] -- an offset, a dedup key, a prefix sum -- and
-    /// no GPU is needed to find it. If this agrees and the device does not, the bug is in the CUDA C
-    /// or the launch. Debugging both at once against one red test is what makes a kernel port drag.
+    /// This splits the port's two failure modes apart. If this disagrees with `cpu_multiply_batch`,
+    /// the bug is in the marshalling or the store layout -- an offset, a `gei`, a prefix sum -- and
+    /// no GPU is needed to find it. If this agrees and the device does not, the bug is in the CUDA
+    /// C or the launch. Debugging both at once against one red test is what makes a port drag.
     ///
     /// It also runs WITHOUT a card, so a marshalling regression is caught by an ordinary
     /// `cargo test --features cuda` rather than sitting unnoticed behind an `#[ignore]`.
     fn simulate(
-        m: &Marshalled,
+        s: &HostStore,
+        a: &LaunchArrays,
         num_rows: usize,
         num_limbs: usize,
         col_map: Option<&[u32]>,
     ) -> Vec<u32> {
         let mut out = vec![0u32; num_rows * num_limbs];
-        let total = m.total_pairs();
-        let num_products = m.num_products();
+        let total = a.total_pairs();
+        let num_products = a.num_products();
         for k in 0..total {
             // Largest p with prod_pair_start[p] <= k.
             let (mut lo, mut hi) = (0usize, num_products);
             while hi - lo > 1 {
                 let mid = (lo + hi) / 2;
-                if m.prod_pair_start[mid] <= k {
+                if a.prod_pair_start[mid] <= k {
                     lo = mid;
                 } else {
                     hi = mid;
                 }
             }
             let p = lo;
-            let ri = m.prod_r_index[p] as usize;
-            let local = k - m.prod_pair_start[p];
-            let num_mats = m.r_num_mats[ri] as u64;
+            let ri = a.prod_r_index[p] as usize;
+            let local = k - a.prod_pair_start[p];
+            let num_mats = a.r_num_mats[ri] as u64;
             let mi = (local % num_mats) as usize;
             let t = (local / num_mats) as usize;
 
-            let cs_len = m.r_cs_len[ri] as usize;
-            let mk_len = m.r_mk_len[ri] as usize;
-            let cs_base = m.r_cs_offset[ri] as usize + mi * cs_len;
-            let mk_base = m.r_mk_offset[ri] as usize + mi * mk_len;
+            let cs_len = a.r_cs_len[ri] as usize;
+            let mk_len = a.r_mk_len[ri] as usize;
+            let cs_base = a.r_cs_offset[ri] as usize + mi * cs_len;
+            let mk_base = a.r_mk_offset[ri] as usize + mi * mk_len;
 
-            let gei = m.term_gei[m.prod_term_start[p] as usize + t] as usize;
-            let term_len = m.ln[gei] as usize;
-            let b_base = gei * m.width;
+            let gei = a.term_gei[a.prod_term_start[p] as usize + t] as usize;
+            let term_len = s.ln[gei] as usize;
+            let b_base = gei * s.width;
 
             let cols = cs_len.max(mk_len).max(term_len);
             let low = term_len.min(cs_len);
@@ -584,17 +509,17 @@ mod tests {
             let mut rejected = false;
             for j in 0..cols {
                 let b = if j < term_len {
-                    m.pp[b_base + j] as u32
+                    s.pp[b_base + j] as u32
                 } else {
                     0
                 };
                 let c = if j < cs_len {
-                    m.cs[cs_base + j] as u32
+                    s.cs[cs_base + j] as u32
                 } else {
                     0
                 };
                 let msk = if j < mk_len {
-                    m.mk[mk_base + j] as u32
+                    s.mk[mk_base + j] as u32
                 } else {
                     0
                 };
@@ -626,20 +551,20 @@ mod tests {
             // seqno_core.
             let mut cur_d = 0u32;
             for h in 0..params::PPART_MAX_LEN {
-                cur_d += working[h] * m.xi[h];
+                cur_d += working[h] * s.xi[h];
             }
             let mut rank = 0u32;
             for hh in 1..params::PPART_MAX_LEN {
                 let h = params::PPART_MAX_LEN - hh;
                 let r = working[h];
                 if r != 0 {
-                    let below = cur_d - r * m.xi[h];
-                    rank += m.g[cur_d as usize * m.width + h] - m.g[below as usize * m.width + h];
+                    let below = cur_d - r * s.xi[h];
+                    rank += s.g[cur_d as usize * s.width + h] - s.g[below as usize * s.width + h];
                     cur_d = below;
                 }
             }
 
-            let mut bit_pos = m.prod_out_offset[p] as usize + rank as usize;
+            let mut bit_pos = a.prod_out_offset[p] as usize + rank as usize;
             if let Some(map) = col_map {
                 if bit_pos >= map.len() {
                     continue;
@@ -653,7 +578,7 @@ mod tests {
             if limb >= num_limbs {
                 continue;
             }
-            let word = m.prod_row_base[p] as usize + limb;
+            let word = a.prod_row_base[p] as usize + limb;
             if word >= out.len() {
                 continue;
             }
@@ -662,9 +587,29 @@ mod tests {
         out
     }
 
-    /// The marshalled buffers, walked the kernel's way, reproduce the CPU reference.
-    ///
-    /// No device needed: this is the marshalling half of the port under test on its own.
+    /// Drive `marshal` against a host store and walk the result.
+    fn walk(
+        algebra: &MilnorAlgebra,
+        products: &[GpuProduct],
+        num_rows: usize,
+        num_limbs: usize,
+        col_map: Option<&[u32]>,
+    ) -> Vec<u32> {
+        let max_s_degree = products.iter().map(|p| p.s_degree).max().unwrap_or(0);
+        let mut store = HostStore::new(algebra, max_s_degree);
+        let arrays = {
+            let bases: Vec<u32> = (0..=max_s_degree.max(0))
+                .map(|d| store.basis.gei(d, 0))
+                .collect();
+            let gei_of = move |d: i32, ti: usize| bases[d as usize] + ti as u32;
+            let store = &mut store;
+            let mut r_of = |p: &PPart| store.ensure_r(algebra, p);
+            marshal(algebra, num_limbs, products, &mut r_of, &gei_of).expect("marshal")
+        };
+        simulate(&store, &arrays, num_rows, num_limbs, col_map)
+    }
+
+    /// The marshalled arrays, walked the kernel's way, reproduce the CPU reference.
     #[test]
     fn marshalled_walk_matches_cpu_reference() {
         let max_degree = 40;
@@ -674,11 +619,9 @@ mod tests {
         let num_cols = full_width(&algebra, &products);
         let num_limbs = num_cols.div_ceil(32).max(1);
 
-        let m = marshal(&algebra, num_rows, num_limbs, &products).expect("marshal");
-        let got = simulate(&m, num_rows, num_limbs, None);
+        let got = walk(&algebra, &products, num_rows, num_limbs, None);
         let want = cpu_multiply_batch(&algebra, num_cols, num_rows, &products);
 
-        assert_eq!(got.len() / num_limbs, num_rows);
         // An all-zero result agreeing with an all-zero reference is the failure mode that cost this
         // project weeks: cubecl swallowed a failed allocation and returned a zeroed buffer at
         // exit 0. Every comparison here first insists the reference carries bits.
@@ -705,6 +648,7 @@ mod tests {
         let products = sample_products(&algebra, max_degree, num_rows, 200, 0xc0ffee);
         let full = full_width(&algebra, &products);
 
+        // Keep every third column, exactly as a signature mask keeps a sparse subset.
         let mut col_map = vec![COL_MAP_DROP; full];
         let mut kept = 0u32;
         for (i, slot) in col_map.iter_mut().enumerate() {
@@ -716,8 +660,7 @@ mod tests {
         let out_cols = kept as usize;
         let num_limbs = out_cols.div_ceil(32).max(1);
 
-        let m = marshal(&algebra, num_rows, num_limbs, &products).expect("marshal");
-        let got = simulate(&m, num_rows, num_limbs, Some(&col_map));
+        let got = walk(&algebra, &products, num_rows, num_limbs, Some(&col_map));
         let want = cpu_multiply_batch_masked(
             &algebra,
             out_cols,
@@ -736,16 +679,124 @@ mod tests {
         }
     }
 
+    /// Appending an `R` must not disturb where the previous ones live.
+    ///
+    /// This is the property the whole VMM design turns on -- growth in place -- and it is cheap to
+    /// assert directly on the layout, with no device involved.
+    #[test]
+    fn master_layout_is_append_only() {
+        let algebra = algebra_to(30);
+        let mut layout = MasterLayout::default();
+        let mut seen: Vec<(PPart, RInfo)> = Vec::new();
+        for d in 1..=10 {
+            for i in 0..algebra.dimension(d) {
+                let p = algebra.basis_element_from_index(d, i).p_part.clone();
+                if p.is_empty() || layout.get(&p).is_some() {
+                    continue;
+                }
+                let (cs_len, mk_len, num_mats, cs, mk) = r_tables(&algebra, &p).expect("tables");
+                let info = layout.place(&p, cs_len, mk_len, num_mats, cs.len(), mk.len());
+                // A run of `num_mats` rectangular matrices, and nothing past the fill mark.
+                assert_eq!(cs.len(), num_mats * cs_len, "col_sums is not rectangular");
+                assert_eq!(mk.len(), num_mats * mk_len, "masks is not rectangular");
+                assert!(info.cs_offset as usize + cs.len() <= layout.cs_elems());
+                seen.push((p, info));
+            }
+        }
+        assert!(seen.len() > 10, "too few distinct R to be a real check");
+        for (p, info) in &seen {
+            assert_eq!(
+                layout.get(p),
+                Some(*info),
+                "an earlier R MOVED as later ones were appended"
+            );
+        }
+    }
+
+    /// THE PORT'S ACCEPTANCE TEST: the device batch must equal the CPU reference bit for bit.
+    ///
+    /// The CPU path owes nothing to any framework or card, so this pins the right answer
+    /// permanently. Every optimisation re-introduced into the kernel has to keep it passing.
+    #[test]
+    #[ignore = "needs a CUDA device; run explicitly with --ignored"]
+    fn cuda_batch_matches_cpu_reference() {
+        let max_degree = 40;
+        let algebra = algebra_to(max_degree);
+        let num_rows = 24;
+        let products = sample_products(&algebra, max_degree, num_rows, 400, 0x5eed);
+        let num_cols = full_width(&algebra, &products);
+
+        let want = cpu_multiply_batch(&algebra, num_cols, num_rows, &products);
+        let rt = super::super::runtime(0).expect("open device 0");
+        let got = cuda_multiply_batch(&rt, &algebra, num_cols, num_rows, &products, None)
+            .expect("device batch");
+
+        assert_eq!(got.num_limbs(), want.num_limbs(), "limb count");
+        assert!(
+            want.iter_rows().flatten().any(|&w| w != 0),
+            "the reference is all zero, so the comparison proves nothing"
+        );
+        for (r, (a, b)) in got.iter_rows().zip(want.iter_rows()).enumerate() {
+            assert_eq!(a, b, "row {r} differs from the CPU reference");
+        }
+    }
+
+    /// The same, with the column restriction on: `out` is allocated at the MASKED width and the
+    /// kernel applies `col_map` itself, which is what lets the frontier's ~98%-discarded columns
+    /// never be allocated at all.
+    #[test]
+    #[ignore = "needs a CUDA device; run explicitly with --ignored"]
+    fn cuda_batch_matches_cpu_reference_masked() {
+        let max_degree = 40;
+        let algebra = algebra_to(max_degree);
+        let num_rows = 16;
+        let products = sample_products(&algebra, max_degree, num_rows, 200, 0xc0ffee);
+        let full = full_width(&algebra, &products);
+
+        let mut col_map = vec![COL_MAP_DROP; full];
+        let mut kept = 0u32;
+        for (i, slot) in col_map.iter_mut().enumerate() {
+            if i % 3 == 0 {
+                *slot = kept;
+                kept += 1;
+            }
+        }
+        let out_cols = kept as usize;
+
+        let want = cpu_multiply_batch_masked(
+            &algebra,
+            out_cols,
+            Some(col_map.clone().into()),
+            num_rows,
+            &products,
+        );
+        let rt = super::super::runtime(0).expect("open device 0");
+        let got = cuda_multiply_batch(&rt, &algebra, out_cols, num_rows, &products, Some(&col_map))
+            .expect("device batch");
+
+        assert_eq!(got.num_limbs(), want.num_limbs(), "limb count");
+        assert!(
+            want.iter_rows().flatten().any(|&w| w != 0),
+            "the reference is all zero, so the comparison proves nothing"
+        );
+        for (r, (a, b)) in got.iter_rows().zip(want.iter_rows()).enumerate() {
+            assert_eq!(a, b, "row {r} differs from the masked CPU reference");
+        }
+    }
+
     /// Replay REAL captured batches through the device and against the CPU reference.
     ///
-    /// The random products above span many `(R, s)` pairs but give every product a similar shape.
-    /// Real batches do not: the `R` distribution is steeply skewed, term counts vary per product,
-    /// and the row/offset layout is whatever the resolution happened to emit. A synthetic bench has
-    /// already been caught ranking a tile 4x2 at 0.706x where the truth was 1.16x -- the wrong sign
-    /// against a 0.4% noise floor -- so "agrees on generated input" is not the same claim as
-    /// "agrees on the input it will actually see".
+    /// The generated products above span many `(R, s)` pairs but give every product a similar
+    /// shape. Real batches do not: the `R` distribution is steeply skewed, term counts vary per
+    /// product, and the row/offset layout is whatever the resolution emitted. A synthetic bench has
+    /// already been caught ranking a 4x2 tile at 0.706x where the truth was 1.16x -- the WRONG SIGN
+    /// against a 0.4% noise floor -- so "agrees on generated input" is a weaker claim than it looks.
     ///
-    /// Point `NASSAU_REPLAY_PRODUCTS` at a file or at a directory of `batch_*.bin`. Capture with:
+    /// Running several batches in one process also exercises the RESIDENT store across launches,
+    /// which a single batch cannot: the later batches must reuse the `R`s and basis degrees the
+    /// earlier ones appended, and get identical answers out of them.
+    ///
+    /// Point `NASSAU_REPLAY_PRODUCTS` at a file or a directory of `batch_*.bin`. Capture with:
     ///
     /// ```text
     /// NASSAU_CAPTURE_PRODUCTS=<dir> NASSAU_CAPTURE_NTH=40 NASSAU_CAPTURE_COUNT=6 \
@@ -754,8 +805,6 @@ mod tests {
     #[test]
     #[ignore = "needs a CUDA device and a captured batch; run explicitly with --ignored"]
     fn cuda_replay_matches_cpu_reference() {
-        use crate::algebra::milnor_batch::load_captured_batch;
-
         let Ok(path) = std::env::var("NASSAU_REPLAY_PRODUCTS") else {
             panic!(
                 "NASSAU_REPLAY_PRODUCTS is unset. A replay test that silently passes with nothing \
@@ -801,9 +850,10 @@ mod tests {
             );
             eprintln!(
                 "[replay] {file}: products={} rows={rows} cols={cols} masked={} \
-                 ones={wones} digest={wh:016x}",
+                 ones={wones} digest={wh:016x} resident={:.1}MB",
                 prods.len(),
                 cm.is_some(),
+                resident_committed_bytes(&rt).unwrap_or(0) as f64 / 1e6,
             );
             assert_eq!(
                 (gh, gones),
