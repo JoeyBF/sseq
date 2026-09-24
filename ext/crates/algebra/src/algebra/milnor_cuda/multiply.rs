@@ -13,7 +13,9 @@
 //! streams. Those make repeated launches overlap; none of them changes the answer, so they follow
 //! with the digest already pinned.
 
-use std::{collections::HashMap, sync::Arc};
+use std::sync::Arc;
+
+use rustc_hash::FxHashMap;
 
 use cudarc::driver::{LaunchConfig, PushKernelArg};
 
@@ -64,19 +66,34 @@ fn cpu_enumeration() -> bool {
 ///
 /// Keyed by `(r_degree, r_idx)` rather than the p-part: the two identify the same thing, and this
 /// one hashes two words instead of ten. The p-part is materialised only on a miss.
-pub(super) fn plan_rs(
-    algebra: &MilnorAlgebra,
-    products: &[GpuProduct],
-) -> (Vec<PPart>, HashMap<(i32, usize), u32>) {
+pub(super) fn plan_rs(algebra: &MilnorAlgebra, products: &[GpuProduct]) -> (Vec<PPart>, Vec<u32>) {
     let mut order: Vec<PPart> = Vec::new();
-    let mut local: HashMap<(i32, usize), u32> = HashMap::new();
-    for prod in products {
+    // FxHashMap, not the std default. The key is two words and the map is consulted once per
+    // product -- 426k times on the profile batch -- so SipHash's per-key setup dominates a lookup
+    // that decides almost nothing. rustc-hash is already a dependency of this crate.
+    let mut local: FxHashMap<(i32, usize), u32> = FxHashMap::default();
+    // The products of one extract loop arrive grouped by `R`, so the previous answer is usually
+    // the next one. A two-word compare in front of the map skips the hash entirely on a hit.
+    let mut last: Option<((i32, usize), u32)> = None;
+    // POSITIONAL, one entry per product, `SKIP` where the product contributes nothing. Returning
+    // the map instead would make `marshal` hash all 426k products a second time to ask a question
+    // already answered here -- and re-evaluate the skip condition, which costs an `algebra
+    // .dimension` call of its own. A 1.7 MB vector buys both away.
+    let mut per_product = vec![SKIP; products.len()];
+    for (slot, prod) in per_product.iter_mut().zip(products) {
         // A product whose output degree is empty contributes nothing; the CPU reference skips it
         // and so must this, or its `R` would be enumerated for no reason.
         if algebra.dimension(prod.r_degree + prod.s_degree) == 0 || prod.term_indices.is_empty() {
             continue;
         }
-        local.entry((prod.r_degree, prod.r_idx)).or_insert_with(|| {
+        let key = (prod.r_degree, prod.r_idx);
+        if let Some((k, ri)) = last {
+            if k == key {
+                *slot = ri;
+                continue;
+            }
+        }
+        let ri = *local.entry(key).or_insert_with(|| {
             let ri = order.len() as u32;
             order.push(
                 algebra
@@ -85,9 +102,17 @@ pub(super) fn plan_rs(
             );
             ri
         });
+        *slot = ri;
+        last = Some((key, ri));
     }
-    (order, local)
+    (order, per_product)
 }
+
+/// Marks a product that contributes nothing, in the positional index [`plan_rs`] returns.
+///
+/// `u32::MAX` is safe as a sentinel: it would need that many distinct `R`s in ONE batch, against a
+/// few thousand in practice, and the launch-local `R` count is bounded by the product count.
+pub(super) const SKIP: u32 = u32::MAX;
 
 /// The per-launch arrays, in device layout.
 pub(super) struct LaunchArrays {
@@ -132,7 +157,7 @@ pub(super) fn marshal(
     algebra: &MilnorAlgebra,
     num_limbs: usize,
     products: &[GpuProduct],
-    r_local: &HashMap<(i32, usize), u32>,
+    r_index: &[u32],
     r_infos: &[RInfo],
     gei_of: &dyn Fn(i32, usize) -> u32,
 ) -> Result<LaunchArrays> {
@@ -161,18 +186,12 @@ pub(super) fn marshal(
         prod_coarse: Vec::new(),
     };
 
-    for prod in products {
-        // A product whose output degree is empty contributes nothing; the CPU reference skips it
-        // and so must this, or its `num_mats * num_terms` pairs would all reject at full cost.
-        if algebra.dimension(prod.r_degree + prod.s_degree) == 0 || prod.term_indices.is_empty() {
+    for (&ri, prod) in r_index.iter().zip(products) {
+        // The skip decision and the launch-local `R` index were both settled by `plan_rs`; asking
+        // again here would mean a second hash of every product and a second `dimension` call.
+        if ri == SKIP {
             continue;
         }
-        // Launch-local index, so `r_*` is as long as THIS batch's distinct `R` count rather than
-        // as long as everything ever made resident. A miss is impossible -- `plan_rs` saw the same
-        // products under the same skip condition -- so it is a bug rather than a cache fill.
-        let ri = *r_local
-            .get(&(prod.r_degree, prod.r_idx))
-            .expect("plan_rs did not record an R that marshal needs");
 
         a.prod_term_start.push(a.term_gei.len() as u32);
         a.prod_num_terms.push(prod.term_indices.len() as u32);
@@ -319,7 +338,7 @@ pub fn cuda_multiply_batch_timed(
     // the resident buffers.
     // One pass over the products decides both which `R`s to make resident and what the kernel's
     // launch-local `R` index is for each product.
-    let (needed, r_local) = plan_rs(algebra, products);
+    let (needed, r_index) = plan_rs(algebra, products);
     let r_infos = if cpu_enumeration() {
         needed
             .iter()
@@ -339,7 +358,7 @@ pub fn cuda_multiply_batch_timed(
             .map(|d| store.basis().gei(d, 0))
             .collect();
         let gei_of = move |d: i32, ti: usize| bases[d as usize] + ti as u32;
-        marshal(algebra, num_limbs, products, &r_local, &r_infos, &gei_of)?
+        marshal(algebra, num_limbs, products, &r_index, &r_infos, &gei_of)?
     };
 
     if arrays.total_pairs() == 0 {
@@ -823,7 +842,7 @@ mod tests {
     ) -> Vec<u32> {
         let max_s_degree = products.iter().map(|p| p.s_degree).max().unwrap_or(0);
         let mut store = HostStore::new(algebra, max_s_degree);
-        let (needed, r_local) = plan_rs(algebra, products);
+        let (needed, r_index) = plan_rs(algebra, products);
         let r_infos: Vec<RInfo> = needed
             .iter()
             .map(|p| store.ensure_r(algebra, p).expect("host tables"))
@@ -833,7 +852,7 @@ mod tests {
                 .map(|d| store.basis.gei(d, 0))
                 .collect();
             let gei_of = move |d: i32, ti: usize| bases[d as usize] + ti as u32;
-            marshal(algebra, num_limbs, products, &r_local, &r_infos, &gei_of).expect("marshal")
+            marshal(algebra, num_limbs, products, &r_index, &r_infos, &gei_of).expect("marshal")
         };
         simulate(&store, &arrays, num_rows, num_limbs, col_map)
     }
