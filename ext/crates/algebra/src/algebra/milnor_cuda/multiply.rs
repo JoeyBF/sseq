@@ -542,7 +542,12 @@ mod tests {
     ///
     /// It also runs WITHOUT a card, so a marshalling regression is caught by an ordinary
     /// `cargo test --features cuda` rather than sitting unnoticed behind an `#[ignore]`.
-    fn simulate(m: &Marshalled, num_rows: usize, num_limbs: usize, col_map: Option<&[u32]>) -> Vec<u32> {
+    fn simulate(
+        m: &Marshalled,
+        num_rows: usize,
+        num_limbs: usize,
+        col_map: Option<&[u32]>,
+    ) -> Vec<u32> {
         let mut out = vec![0u32; num_rows * num_limbs];
         let total = m.total_pairs();
         let num_products = m.num_products();
@@ -578,9 +583,21 @@ mod tests {
             let mut working = [0u32; params::PPART_MAX_LEN];
             let mut rejected = false;
             for j in 0..cols {
-                let b = if j < term_len { m.pp[b_base + j] as u32 } else { 0 };
-                let c = if j < cs_len { m.cs[cs_base + j] as u32 } else { 0 };
-                let msk = if j < mk_len { m.mk[mk_base + j] as u32 } else { 0 };
+                let b = if j < term_len {
+                    m.pp[b_base + j] as u32
+                } else {
+                    0
+                };
+                let c = if j < cs_len {
+                    m.cs[cs_base + j] as u32
+                } else {
+                    0
+                };
+                let msk = if j < mk_len {
+                    m.mk[mk_base + j] as u32
+                } else {
+                    0
+                };
                 // The same uniform per-position rule as `pair_col` in multiply.cu.
                 let val = if j < low {
                     if c > b || ((b - c) & msk) != 0 {
@@ -671,7 +688,10 @@ mod tests {
         );
         for (r, want_row) in want.iter_rows().enumerate() {
             let got_row = &got[r * num_limbs..(r + 1) * num_limbs];
-            assert_eq!(got_row, want_row, "row {r}: marshalled walk != CPU reference");
+            assert_eq!(
+                got_row, want_row,
+                "row {r}: marshalled walk != CPU reference"
+            );
         }
     }
 
@@ -715,5 +735,4 @@ mod tests {
             assert_eq!(got_row, want_row, "row {r}: masked walk != CPU reference");
         }
     }
-
 }
