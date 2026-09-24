@@ -295,6 +295,12 @@ pub struct Resident {
 
 impl Resident {
     fn new(rt: Arc<MilnorCuda>) -> Result<Self> {
+        Self::with_master_reservation(rt, None)
+    }
+
+    /// As [`Self::new`], but with the col_sums/masks reservations fixed rather than sized from the
+    /// device -- so a test can make the master run out of room on demand.
+    fn with_master_reservation(rt: Arc<MilnorCuda>, master_bytes: Option<usize>) -> Result<Self> {
         let dev = rt.device();
         rt.context().bind_to_thread().map_err(|_| {
             CudaError::Driver("bind_to_thread", sys::CUresult::CUDA_ERROR_INVALID_CONTEXT)
@@ -312,7 +318,8 @@ impl Resident {
         // With the device's full memory reserved for each, the reservation can never be what
         // stops a run. Physical memory is, and running out of that is a real `cuMemCreate` OOM
         // that `grow_to` reports -- loud, and named.
-        let device_bytes = rt.context().total_mem().unwrap_or(48 << 30);
+        let device_bytes =
+            master_bytes.unwrap_or_else(|| rt.context().total_mem().unwrap_or(48 << 30));
         Ok(Self {
             cs: GrowBuf::reserve(
                 dev,
@@ -499,22 +506,30 @@ impl Resident {
                 &zero,
             )?;
 
-            // Place each block, then commit the backing store BEFORE the emit pass writes into it.
+            // TRANSACTIONAL: compute where each block WOULD go, grow, fill, verify -- and only then
+            // record the `R`s in the layout.
+            //
+            // This used to `place()` every new `R` first. A failure after that -- `grow_to` running
+            // out of memory, or the emit launch failing -- left the layout claiming `R`s whose
+            // matrices were never written. And a failure here does NOT end the run: an
+            // out-of-memory is classed `DeviceExhausted` and the bidegree is RETRIED, so the retry
+            // found those `R`s "resident", skipped enumerating them, and multiplied against
+            // uncommitted or unwritten memory -- a silently wrong answer from a survivable error.
+            // On small cards running out of room here is routine, not exceptional.
+            let (cs_base, mk_base) = (self.master.cs_elems(), self.master.mk_elems());
             let mut cs_offsets = Vec::with_capacity(fresh.len());
             let mut mk_offsets = Vec::with_capacity(fresh.len());
-            let mut infos = Vec::with_capacity(fresh.len());
-            for (i, &key) in fresh_keys.iter().enumerate() {
+            let (mut cs_end, mut mk_end) = (cs_base, mk_base);
+            for (i, _) in fresh_keys.iter().enumerate() {
                 let (cs_len, mk_len) = lens[i];
                 let n = counts[i] as usize;
-                let info = self
-                    .master
-                    .place(key, cs_len, mk_len, n, n * cs_len, n * mk_len);
-                cs_offsets.push(info.cs_offset);
-                mk_offsets.push(info.mk_offset);
-                infos.push(info);
+                cs_offsets.push(cs_end as u64);
+                mk_offsets.push(mk_end as u64);
+                cs_end += n * cs_len;
+                mk_end += n * mk_len;
             }
-            self.cs.grow_to(self.master.cs_elems() * size_of::<u16>())?;
-            self.mk.grow_to(self.master.mk_elems() * size_of::<u16>())?;
+            self.cs.grow_to(cs_end * size_of::<u16>())?;
+            self.mk.grow_to(mk_end * size_of::<u16>())?;
 
             // PASS 2: fill, directly into the resident buffers.
             let recount = enumerate_into(
@@ -535,6 +550,23 @@ impl Resident {
                      trustworthy"
                         .to_owned(),
                 ));
+            }
+
+            // COMMIT. Everything is written and checked, so the layout may now claim it. `place`
+            // assigns offsets from the same counters in the same order, so it must reproduce the
+            // ones the data was written at; if it ever does not, the kernel would read another
+            // `R`'s matrices, so that is a hard stop rather than a debug check.
+            for (i, &key) in fresh_keys.iter().enumerate() {
+                let (cs_len, mk_len) = lens[i];
+                let n = counts[i] as usize;
+                let info = self
+                    .master
+                    .place(key, cs_len, mk_len, n, n * cs_len, n * mk_len);
+                assert_eq!(
+                    (info.cs_offset, info.mk_offset),
+                    (cs_offsets[i], mk_offsets[i]),
+                    "resident layout diverged from where the matrices were written"
+                );
             }
         }
 
@@ -592,4 +624,78 @@ pub fn resident(rt: &Arc<MilnorCuda>) -> Result<&'static Mutex<Resident>> {
         Box::leak(Box::new(Mutex::new(Resident::new(rt.clone())?)));
     guard.insert(rt.device(), slot);
     Ok(slot)
+}
+
+#[cfg(test)]
+mod tests {
+    use fp::prime::ValidPrime;
+
+    use super::*;
+
+    /// Every `R` up to `max_degree`, as the `(degree, index)` keys the store is addressed by.
+    fn all_keys(algebra: &MilnorAlgebra, max_degree: i32) -> Vec<RKey> {
+        (1..=max_degree)
+            .flat_map(|d| (0..algebra.dimension(d)).map(move |i| (d, i)))
+            .collect()
+    }
+
+    /// A failed `ensure_rs` must leave the layout EXACTLY as it found it.
+    ///
+    /// It used to record the new `R`s first and write their matrices second, so a failure in
+    /// between -- running out of room in `grow_to`, which on a small card is routine -- left the
+    /// layout claiming matrices that were never written. A failure there does not end the run: it
+    /// is classed `DeviceExhausted` and the bidegree is retried, and the retry then found those
+    /// `R`s "resident", skipped enumerating them, and multiplied against unwritten memory.
+    ///
+    /// So: a store whose master reservation is one allocation granule, asked for far more than
+    /// that. It must fail, claim none of the keys, and not have moved its fill marks -- and a store
+    /// with room must then succeed on the same keys, matching the CPU tables.
+    #[test]
+    #[ignore = "needs a CUDA device; run explicitly with --ignored"]
+    fn ensure_rs_leaves_no_trace_when_it_fails() {
+        let rt = super::super::runtime(0).expect("open device 0");
+        let max_degree = 80;
+        let algebra = MilnorAlgebra::new(ValidPrime::new(2), false);
+        algebra.compute_basis(max_degree);
+        let keys = all_keys(&algebra, max_degree);
+
+        let mut tiny = Resident::with_master_reservation(rt.clone(), Some(1)).expect("tiny store");
+        let err = tiny.ensure_rs(&rt, &algebra, &keys);
+        assert!(
+            matches!(err, Err(CudaError::Capacity { .. })),
+            "expected the tiny store to run out of room; raise max_degree if it fitted: {err:?}"
+        );
+        for &k in &keys {
+            assert!(
+                tiny.master_get(k).is_none(),
+                "{k:?} is claimed resident after a FAILED ensure_rs -- a retry would read \
+                 unwritten memory"
+            );
+        }
+        assert_eq!(
+            (tiny.master.cs_elems(), tiny.master.mk_elems()),
+            (0, 0),
+            "the fill marks moved although nothing was committed"
+        );
+
+        // The same keys, with room, succeed -- and each block matches what the CPU enumerates.
+        let mut roomy = Resident::with_master_reservation(rt.clone(), None).expect("store");
+        let infos = roomy
+            .ensure_rs(&rt, &algebra, &keys)
+            .expect("ensure_rs with room");
+        assert_eq!(infos.len(), keys.len());
+        for (&k, info) in keys.iter().zip(&infos) {
+            let p = algebra.basis_element_from_index(k.0, k.1).p_part;
+            let (cs_len, mk_len, num_mats, _, _) = r_tables(&algebra, &p).expect("cpu tables");
+            assert_eq!(
+                (
+                    info.cs_len as usize,
+                    info.mk_len as usize,
+                    info.num_mats as usize
+                ),
+                (cs_len, mk_len, num_mats),
+                "{k:?}: resident shape differs from the CPU enumeration"
+            );
+        }
+    }
 }
