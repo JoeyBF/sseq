@@ -405,6 +405,22 @@ static CAPTURE_MAX_GB: LazyLock<f64> = LazyLock::new(|| {
         .and_then(|v| v.parse().ok())
         .unwrap_or(40.0)
 });
+/// Only capture batches with at least this many products (`NASSAU_CAPTURE_MIN_PRODUCTS`).
+///
+/// [`CAPTURE_NTH`] counts CALLS, and calls are frequent and small early in a run and rare and huge
+/// late in it, so an ordinal selects by wall-clock position rather than by the thing anyone
+/// actually wants. Asking for the 3000th call of a stem-170 run to get a big batch produced three
+/// captures of 110 kB, 82 kB and 218 kB from the warm-up -- against 25 MB from a stem-130 run that
+/// happened to trip at a better moment. Size is the property being selected for, so select on it:
+/// set this and leave `NASSAU_CAPTURE_NTH=1`, and the first few batches past the threshold are
+/// taken wherever in the run they occur.
+static CAPTURE_MIN_PRODUCTS: LazyLock<usize> = LazyLock::new(|| {
+    std::env::var("NASSAU_CAPTURE_MIN_PRODUCTS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0)
+});
+
 static CAPTURE_SEEN: AtomicU64 = AtomicU64::new(0);
 static CAPTURE_CALLS: AtomicU64 = AtomicU64::new(0);
 /// Report capture-path entry counts on stderr. Opt-in, because the case it exists for is a
@@ -441,6 +457,12 @@ pub fn capture_batch(
     let Some(path) = CAPTURE_PATH.as_deref() else {
         return;
     };
+    // Size filter BEFORE the ordinal counter, so `NASSAU_CAPTURE_NTH` counts qualifying batches
+    // rather than every call. Otherwise the two knobs fight: the ordinal would still be consumed by
+    // the small batches this is meant to skip.
+    if products.len() < *CAPTURE_MIN_PRODUCTS {
+        return;
+    }
     // `fetch_add` returns a unique ticket per caller, so exactly one call sees the target. Comparing a
     // separate `load` against `== n` can fire never under ~100 concurrent callers.
     let n = CAPTURE_SEEN.fetch_add(1, Ordering::Relaxed) + 1;
