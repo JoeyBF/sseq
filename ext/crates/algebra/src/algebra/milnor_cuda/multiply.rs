@@ -98,20 +98,30 @@ pub(super) fn marshal(
     r_of: &mut dyn FnMut(&PPart) -> Result<RInfo>,
     gei_of: &dyn Fn(i32, usize) -> u32,
 ) -> Result<LaunchArrays> {
-    let mut launch_r: HashMap<PPart, u32> = HashMap::new();
+    // `(r_degree, r_idx)`, not the p-part: see the note at the call site. A `PPart` key here cost
+    // one `basis_element_from_index` and one clone per PRODUCT, and the p-part is only actually
+    // needed on a miss.
+    let mut launch_r: HashMap<(i32, usize), u32> = HashMap::new();
+    // Sized up front. These are per-product arrays over a batch with hundreds of thousands of
+    // products, so growing them from empty is a run of reallocations and memcpys on the critical
+    // path of a phase that already dominates the launch.
+    let n = products.len();
+    let terms: usize = products.iter().map(|p| p.term_indices.len()).sum();
+    let mut pps = Vec::with_capacity(n + 1);
+    pps.push(0);
     let mut a = LaunchArrays {
         r_cs_offset: Vec::new(),
         r_mk_offset: Vec::new(),
         r_cs_len: Vec::new(),
         r_mk_len: Vec::new(),
         r_num_mats: Vec::new(),
-        term_gei: Vec::new(),
-        prod_r_index: Vec::new(),
-        prod_term_start: Vec::new(),
-        prod_num_terms: Vec::new(),
-        prod_row_base: Vec::new(),
-        prod_out_offset: Vec::new(),
-        prod_pair_start: vec![0],
+        term_gei: Vec::with_capacity(terms),
+        prod_r_index: Vec::with_capacity(n),
+        prod_term_start: Vec::with_capacity(n),
+        prod_num_terms: Vec::with_capacity(n),
+        prod_row_base: Vec::with_capacity(n),
+        prod_out_offset: Vec::with_capacity(n),
+        prod_pair_start: pps,
         prod_coarse: Vec::new(),
     };
 
@@ -121,15 +131,16 @@ pub(super) fn marshal(
         if algebra.dimension(prod.r_degree + prod.s_degree) == 0 || prod.term_indices.is_empty() {
             continue;
         }
-        let r_p_part = algebra
-            .basis_element_from_index(prod.r_degree, prod.r_idx)
-            .p_part
-            .clone();
         // Launch-local index, so `r_*` is as long as THIS batch's distinct `R` count rather than as
         // long as everything ever made resident.
-        let ri = match launch_r.get(&r_p_part) {
+        let key = (prod.r_degree, prod.r_idx);
+        let ri = match launch_r.get(&key) {
             Some(&ri) => ri,
             None => {
+                let r_p_part = algebra
+                    .basis_element_from_index(prod.r_degree, prod.r_idx)
+                    .p_part
+                    .clone();
                 let info = r_of(&r_p_part)?;
                 let ri = a.r_cs_len.len() as u32;
                 a.r_cs_offset.push(info.cs_offset);
@@ -137,7 +148,7 @@ pub(super) fn marshal(
                 a.r_cs_len.push(info.cs_len);
                 a.r_mk_len.push(info.mk_len);
                 a.r_num_mats.push(info.num_mats);
-                launch_r.insert(r_p_part, ri);
+                launch_r.insert(key, ri);
                 ri
             }
         };
@@ -276,16 +287,27 @@ pub fn cuda_multiply_batch_timed(
     // longest single `R` rather than by how many it carries -- so batching turns a sum into a max.
     // It also keeps the enumerated matrices off the host entirely: they are written straight into
     // the resident buffers.
-    let needed: Vec<PPart> = products
-        .iter()
-        .filter(|p| algebra.dimension(p.r_degree + p.s_degree) != 0 && !p.term_indices.is_empty())
-        .map(|p| {
+    // Keyed by `(r_degree, r_idx)`, NOT by the p-part.
+    //
+    // The two identify the same thing -- for a fixed degree the basis index determines the p-part,
+    // and the p-part determines the degree -- so the map is a bijection and either key is correct.
+    // The cheap one is the pair: hashing it is two words against a `PPart`'s ten, and a miss is
+    // what pays for `basis_element_from_index` plus the clone. Keying by p-part meant one lookup
+    // and one clone PER PRODUCT; there are 264,646 products in the profile batch against a few
+    // thousand distinct `R`s, so nearly all of that work was redundant.
+    let mut distinct: HashMap<(i32, usize), PPart> = HashMap::new();
+    for p in products {
+        if algebra.dimension(p.r_degree + p.s_degree) == 0 || p.term_indices.is_empty() {
+            continue;
+        }
+        distinct.entry((p.r_degree, p.r_idx)).or_insert_with(|| {
             algebra
                 .basis_element_from_index(p.r_degree, p.r_idx)
                 .p_part
                 .clone()
-        })
-        .collect();
+        });
+    }
+    let needed: Vec<PPart> = distinct.values().cloned().collect();
     if cpu_enumeration() {
         for p in &needed {
             store.ensure_r(algebra, p)?;
@@ -435,11 +457,25 @@ pub fn cuda_multiply_batch_timed(
     timing.kernel = t_kernel.elapsed().as_secs_f64();
     let t_readback = Instant::now();
 
-    let limbs = stream
-        .clone_dtoh(&d_out)
+    // Land the readback in CACHED page-locked memory and hand that buffer straight to the caller.
+    //
+    // Two separate wins, and both need the memory to be pinned. A device-to-host copy into pageable
+    // memory is staged by the driver through its own bounce buffer; into page-locked memory it is a
+    // direct DMA. And because `BatchOutput` stores `Box<dyn LimbBlock>`, the landing buffer IS the
+    // result -- no second copy into a `Vec`, which at frontier sizes would be gigabytes of memcpy
+    // for nothing.
+    let mut pinned = super::PinnedBuf::new(rt.context(), out_len)?;
+    stream
+        .memcpy_dtoh(&d_out, pinned.as_mut_slice())
         .map_err(|e| CudaError::Compile(format!("readback: {e:?}")))?;
+    stream
+        .synchronize()
+        .map_err(|e| CudaError::Compile(format!("sync after readback: {e:?}")))?;
     timing.readback = t_readback.elapsed().as_secs_f64();
-    Ok((BatchOutput::from_limbs(limbs, num_limbs), timing))
+    Ok((
+        BatchOutput::from_blocks(vec![Box::new(pinned)], num_limbs),
+        timing,
+    ))
 }
 
 /// Device memory currently COMMITTED by the resident store, for diagnostics.

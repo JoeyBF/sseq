@@ -306,6 +306,73 @@ fn arch_str(major: u32, minor: u32) -> Option<&'static str> {
     })
 }
 
+/// Page-locked host memory that a `BatchOutput` can own directly.
+///
+/// # Why not `CudaContext::alloc_pinned`
+///
+/// cudarc's helper passes `CU_MEMHOSTALLOC_WRITECOMBINED`. Write-combined memory is the right
+/// choice for a HOST-TO-DEVICE staging buffer -- the host writes it once, streaming, and never
+/// reads it -- but it is close to the worst choice for a readback destination, because host reads
+/// of WC memory are uncached and unprefetched. The readback here is written by the device and then
+/// read in full by the caller, so it wants ordinary cached pinned memory: flags 0.
+///
+/// # Why own it rather than copy out of it
+///
+/// The device write has to land somewhere, and copying it again into a `Vec` is pure waste -- at
+/// frontier sizes that is gigabytes of memcpy for nothing. `BatchOutput` takes `Box<dyn LimbBlock>`
+/// precisely so a backend can hand over its own buffer, so this implements that trait and the
+/// copy never happens.
+pub struct PinnedBuf {
+    ptr: *mut u32,
+    len: usize,
+    /// Kept alive because freeing page-locked memory needs the context that allocated it.
+    _ctx: Arc<CudaContext>,
+}
+
+// The pointer is owned exclusively and the memory is plain host memory once allocated.
+unsafe impl Send for PinnedBuf {}
+unsafe impl Sync for PinnedBuf {}
+
+impl PinnedBuf {
+    /// Allocate `len` `u32` of cached page-locked host memory.
+    pub fn new(ctx: &Arc<CudaContext>, len: usize) -> Result<Self> {
+        ctx.bind_to_thread().map_err(|_| {
+            CudaError::Driver("bind_to_thread", sys::CUresult::CUDA_ERROR_INVALID_CONTEXT)
+        })?;
+        let mut p: *mut std::ffi::c_void = std::ptr::null_mut();
+        let bytes = len.max(1) * size_of::<u32>();
+        // flags 0: page-locked and CACHED. Not WRITECOMBINED -- see the type doc.
+        unsafe { ck("cuMemHostAlloc", sys::cuMemHostAlloc(&mut p, bytes, 0))? };
+        Ok(Self {
+            ptr: p.cast(),
+            len,
+            _ctx: ctx.clone(),
+        })
+    }
+
+    /// The buffer as a mutable slice, for a device-to-host copy to fill.
+    pub fn as_mut_slice(&mut self) -> &mut [u32] {
+        // SAFETY: `ptr` is a live allocation of `len` u32 owned exclusively by `self`.
+        unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) }
+    }
+}
+
+impl Drop for PinnedBuf {
+    fn drop(&mut self) {
+        // SAFETY: `ptr` came from `cuMemHostAlloc` and is freed exactly once.
+        unsafe {
+            let _ = sys::cuMemFreeHost(self.ptr.cast());
+        }
+    }
+}
+
+impl crate::algebra::milnor_batch::LimbBlock for PinnedBuf {
+    fn limbs(&self) -> &[u32] {
+        // SAFETY: as `as_mut_slice`.
+        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+    }
+}
+
 /// Compile CUDA C to PTX at runtime for this device's architecture.
 ///
 /// Follows the convention PR 298 established for fp-cuda:
