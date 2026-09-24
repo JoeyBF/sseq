@@ -904,4 +904,99 @@ mod tests {
             );
         }
     }
+
+    /// Time the cudarc path on a captured batch: cold, warm, and the gap between them.
+    ///
+    /// Reported separately because they answer different questions. COLD includes the CUDA context,
+    /// the NVRTC compile, and the first enumeration of every `R`; WARM is the launch alone against
+    /// an already-resident master. An edge worker that starts a process per unit of work pays cold
+    /// every time, which is the measurement that decides whether workers can be transient -- the
+    /// cubecl path measured ~68s cold against ~21s warm, i.e. ~47s of CUDA context plus JIT.
+    ///
+    /// The digest is checked ACROSS reps and must be identical. Without that, a warm timing could
+    /// be measuring a different (or empty) computation and look excellent doing it -- this
+    /// codebase has a crashed arm winning a sweep on record, because crashed runs are fast.
+    ///
+    /// ```text
+    /// NASSAU_REPLAY_PRODUCTS=<dir-or-file> NASSAU_REPLAY_REPS=5 \
+    ///   cargo test --release -p algebra --features cuda --lib cuda_replay_profile \
+    ///   -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "perf profile: needs a CUDA device and a captured batch; run explicitly"]
+    fn cuda_replay_profile() {
+        use std::time::Instant;
+
+        let Ok(path) = std::env::var("NASSAU_REPLAY_PRODUCTS") else {
+            panic!("NASSAU_REPLAY_PRODUCTS is unset; there is nothing to profile");
+        };
+        let file = if std::path::Path::new(&path).is_dir() {
+            let mut v: Vec<String> = std::fs::read_dir(&path)
+                .expect("read capture dir")
+                .filter_map(|e| e.ok())
+                .map(|e| e.path().display().to_string())
+                .filter(|p| p.ends_with(".bin"))
+                .collect();
+            v.sort();
+            // The LARGEST batch, not the first: a small one measures launch overhead, and this
+            // codebase has already been burned by a harness where 87% of the wall time was
+            // overhead and every kernel change measured as 0%.
+            v.into_iter()
+                .max_by_key(|f| std::fs::metadata(f).map(|m| m.len()).unwrap_or(0))
+                .expect("no .bin captures found")
+        } else {
+            path
+        };
+        let reps: usize = std::env::var("NASSAU_REPLAY_REPS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(5);
+
+        let (rows, cols, cm, prods) =
+            load_captured_batch(&file).expect("failed to load the captured batch");
+        let max_degree = prods
+            .iter()
+            .map(|p| p.r_degree + p.s_degree)
+            .max()
+            .unwrap_or(1)
+            .max(1);
+        let t_setup = Instant::now();
+        let algebra = algebra_to(max_degree);
+        let setup = t_setup.elapsed().as_secs_f64();
+
+        let rt = super::super::runtime(0).expect("open device 0");
+        let mut times = Vec::new();
+        let mut digests = Vec::new();
+        for _ in 0..reps.max(2) {
+            let t = Instant::now();
+            let out = cuda_multiply_batch(&rt, &algebra, cols, rows, &prods, cm.as_deref())
+                .expect("device batch");
+            times.push(t.elapsed().as_secs_f64());
+            let (h, ones) = out.digest();
+            assert!(
+                ones > 0,
+                "an all-zero output digests fine; this rep computed NOTHING"
+            );
+            digests.push(h);
+        }
+        assert!(
+            digests.iter().all(|d| *d == digests[0]),
+            "reps disagree, so the warm timings measure a DIFFERENT computation: {digests:?}"
+        );
+
+        let cold = times[0];
+        let warm: f64 = times[1..].iter().sum::<f64>() / (times.len() - 1) as f64;
+        let pairs: u64 = prods.iter().map(|p| p.term_indices.len() as u64).sum();
+        eprintln!(
+            "[cuda-profile] {file}\n  products={} terms={pairs} rows={rows} cols={cols} \
+             masked={}\n  algebra_setup={setup:.2}s cold={cold:.3}s warm={warm:.3}s \
+             startup={:.3}s resident={:.1}MB digest={:016x}",
+            prods.len(),
+            cm.is_some(),
+            (cold - warm).max(0.0),
+            resident_committed_bytes(&super::super::runtime(0).expect("dev 0")).unwrap_or(0) as f64
+                / 1e6,
+            digests[0],
+        );
+    }
 }
