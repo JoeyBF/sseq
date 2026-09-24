@@ -53,6 +53,42 @@ fn cpu_enumeration() -> bool {
     })
 }
 
+/// The distinct `R`s of a batch, in first-seen order, plus the map from a product's key to that
+/// `R`'s position in the list.
+///
+/// ONE HASH PASS OVER THE PRODUCTS, not two. Making the `R`s resident and marshalling the arrays
+/// both need to know which `R` a product uses, and each was building its own map -- 264,646
+/// lookups each on the profile batch, on a launch where the store is already warm and the answer
+/// is the same both times. The position in this list is also the launch-local `R` index the kernel
+/// indexes `r_*` with, so the second map had nothing extra to compute.
+///
+/// Keyed by `(r_degree, r_idx)` rather than the p-part: the two identify the same thing, and this
+/// one hashes two words instead of ten. The p-part is materialised only on a miss.
+pub(super) fn plan_rs(
+    algebra: &MilnorAlgebra,
+    products: &[GpuProduct],
+) -> (Vec<PPart>, HashMap<(i32, usize), u32>) {
+    let mut order: Vec<PPart> = Vec::new();
+    let mut local: HashMap<(i32, usize), u32> = HashMap::new();
+    for prod in products {
+        // A product whose output degree is empty contributes nothing; the CPU reference skips it
+        // and so must this, or its `R` would be enumerated for no reason.
+        if algebra.dimension(prod.r_degree + prod.s_degree) == 0 || prod.term_indices.is_empty() {
+            continue;
+        }
+        local.entry((prod.r_degree, prod.r_idx)).or_insert_with(|| {
+            let ri = order.len() as u32;
+            order.push(
+                algebra
+                    .basis_element_from_index(prod.r_degree, prod.r_idx)
+                    .p_part,
+            );
+            ri
+        });
+    }
+    (order, local)
+}
+
 /// The per-launch arrays, in device layout.
 pub(super) struct LaunchArrays {
     /// Per distinct `R` in THIS launch, pointing into the resident master.
@@ -96,13 +132,10 @@ pub(super) fn marshal(
     algebra: &MilnorAlgebra,
     num_limbs: usize,
     products: &[GpuProduct],
-    r_of: &mut dyn FnMut(&PPart) -> Result<RInfo>,
+    r_local: &HashMap<(i32, usize), u32>,
+    r_infos: &[RInfo],
     gei_of: &dyn Fn(i32, usize) -> u32,
 ) -> Result<LaunchArrays> {
-    // `(r_degree, r_idx)`, not the p-part: see the note at the call site. A `PPart` key here cost
-    // one `basis_element_from_index` and one clone per PRODUCT, and the p-part is only actually
-    // needed on a miss.
-    let mut launch_r: HashMap<(i32, usize), u32> = HashMap::new();
     // Sized up front. These are per-product arrays over a batch with hundreds of thousands of
     // products, so growing them from empty is a run of reallocations and memcpys on the critical
     // path of a phase that already dominates the launch.
@@ -110,12 +143,14 @@ pub(super) fn marshal(
     let terms: usize = products.iter().map(|p| p.term_indices.len()).sum();
     let mut pps = Vec::with_capacity(n + 1);
     pps.push(0);
+    // The per-`R` tables are just `r_infos` transposed -- every distinct `R` of this batch is
+    // already known and in kernel index order, so there is nothing to discover per product.
     let mut a = LaunchArrays {
-        r_cs_offset: Vec::new(),
-        r_mk_offset: Vec::new(),
-        r_cs_len: Vec::new(),
-        r_mk_len: Vec::new(),
-        r_num_mats: Vec::new(),
+        r_cs_offset: r_infos.iter().map(|i| i.cs_offset).collect(),
+        r_mk_offset: r_infos.iter().map(|i| i.mk_offset).collect(),
+        r_cs_len: r_infos.iter().map(|i| i.cs_len).collect(),
+        r_mk_len: r_infos.iter().map(|i| i.mk_len).collect(),
+        r_num_mats: r_infos.iter().map(|i| i.num_mats).collect(),
         term_gei: Vec::with_capacity(terms),
         prod_r_index: Vec::with_capacity(n),
         prod_term_start: Vec::with_capacity(n),
@@ -132,27 +167,12 @@ pub(super) fn marshal(
         if algebra.dimension(prod.r_degree + prod.s_degree) == 0 || prod.term_indices.is_empty() {
             continue;
         }
-        // Launch-local index, so `r_*` is as long as THIS batch's distinct `R` count rather than as
-        // long as everything ever made resident.
-        let key = (prod.r_degree, prod.r_idx);
-        let ri = match launch_r.get(&key) {
-            Some(&ri) => ri,
-            None => {
-                let r_p_part = algebra
-                    .basis_element_from_index(prod.r_degree, prod.r_idx)
-                    .p_part
-                    .clone();
-                let info = r_of(&r_p_part)?;
-                let ri = a.r_cs_len.len() as u32;
-                a.r_cs_offset.push(info.cs_offset);
-                a.r_mk_offset.push(info.mk_offset);
-                a.r_cs_len.push(info.cs_len);
-                a.r_mk_len.push(info.mk_len);
-                a.r_num_mats.push(info.num_mats);
-                launch_r.insert(key, ri);
-                ri
-            }
-        };
+        // Launch-local index, so `r_*` is as long as THIS batch's distinct `R` count rather than
+        // as long as everything ever made resident. A miss is impossible -- `plan_rs` saw the same
+        // products under the same skip condition -- so it is a bug rather than a cache fill.
+        let ri = *r_local
+            .get(&(prod.r_degree, prod.r_idx))
+            .expect("plan_rs did not record an R that marshal needs");
 
         a.prod_term_start.push(a.term_gei.len() as u32);
         a.prod_num_terms.push(prod.term_indices.len() as u32);
@@ -216,7 +236,12 @@ fn build_coarse(prod_pair_start: &[u64]) -> Vec<u32> {
 /// and it is why the timed entry point is separate from the plain one.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct LaunchTiming {
-    /// Building the per-launch arrays on the host, including making new `R`s resident.
+    /// Making the batch's `R`s, basis degrees and seqno tables resident, including enumerating
+    /// the new `R`s on the device. Separated from `marshal` because the two have completely
+    /// different fixes: this one shrinks as the store warms, that one is per-product host work
+    /// that never goes away.
+    pub resident: f64,
+    /// Building the per-launch arrays on the host.
     pub marshal: f64,
     /// Host-to-device of those arrays plus zeroing the output.
     pub upload: f64,
@@ -228,7 +253,7 @@ pub struct LaunchTiming {
 
 impl LaunchTiming {
     pub fn total(&self) -> f64 {
-        self.marshal + self.upload + self.kernel + self.readback
+        self.resident + self.marshal + self.upload + self.kernel + self.readback
     }
 }
 
@@ -265,7 +290,7 @@ pub fn cuda_multiply_batch_timed(
 ) -> Result<(BatchOutput, LaunchTiming)> {
     use std::time::Instant;
     let mut timing = LaunchTiming::default();
-    let t_marshal = Instant::now();
+    let t_resident = Instant::now();
     let num_limbs = num_cols.div_ceil(32).max(1);
     let out_len = num_rows * num_limbs;
 
@@ -292,34 +317,20 @@ pub fn cuda_multiply_batch_timed(
     // longest single `R` rather than by how many it carries -- so batching turns a sum into a max.
     // It also keeps the enumerated matrices off the host entirely: they are written straight into
     // the resident buffers.
-    // Keyed by `(r_degree, r_idx)`, NOT by the p-part.
-    //
-    // The two identify the same thing -- for a fixed degree the basis index determines the p-part,
-    // and the p-part determines the degree -- so the map is a bijection and either key is correct.
-    // The cheap one is the pair: hashing it is two words against a `PPart`'s ten, and a miss is
-    // what pays for `basis_element_from_index` plus the clone. Keying by p-part meant one lookup
-    // and one clone PER PRODUCT; there are 264,646 products in the profile batch against a few
-    // thousand distinct `R`s, so nearly all of that work was redundant.
-    let mut distinct: HashMap<(i32, usize), PPart> = HashMap::new();
-    for p in products {
-        if algebra.dimension(p.r_degree + p.s_degree) == 0 || p.term_indices.is_empty() {
-            continue;
-        }
-        distinct.entry((p.r_degree, p.r_idx)).or_insert_with(|| {
-            algebra
-                .basis_element_from_index(p.r_degree, p.r_idx)
-                .p_part
-                .clone()
-        });
-    }
-    let needed: Vec<PPart> = distinct.values().cloned().collect();
-    if cpu_enumeration() {
-        for p in &needed {
-            store.ensure_r(algebra, p)?;
-        }
+    // One pass over the products decides both which `R`s to make resident and what the kernel's
+    // launch-local `R` index is for each product.
+    let (needed, r_local) = plan_rs(algebra, products);
+    let r_infos = if cpu_enumeration() {
+        needed
+            .iter()
+            .map(|p| store.ensure_r(algebra, p))
+            .collect::<Result<Vec<_>>>()?
     } else {
-        store.ensure_rs(rt, &needed)?;
-    }
+        store.ensure_rs(rt, &needed)?
+    };
+
+    timing.resident = t_resident.elapsed().as_secs_f64();
+    let t_marshal = Instant::now();
 
     let arrays = {
         // The basis is fully built above, so snapshotting each degree's base here is exact, and it
@@ -328,15 +339,7 @@ pub fn cuda_multiply_batch_timed(
             .map(|d| store.basis().gei(d, 0))
             .collect();
         let gei_of = move |d: i32, ti: usize| bases[d as usize] + ti as u32;
-        let store = &*store;
-        // Lookup only: every `R` was made resident above, so a miss here is a bug, not a cache
-        // fill, and saying so is better than silently enumerating on the host.
-        let mut r_of = |p: &PPart| {
-            store
-                .master_get(p)
-                .ok_or_else(|| CudaError::Compile(format!("R {p:?} was not made resident")))
-        };
-        marshal(algebra, num_limbs, products, &mut r_of, &gei_of)?
+        marshal(algebra, num_limbs, products, &r_local, &r_infos, &gei_of)?
     };
 
     if arrays.total_pairs() == 0 {
@@ -812,14 +815,17 @@ mod tests {
     ) -> Vec<u32> {
         let max_s_degree = products.iter().map(|p| p.s_degree).max().unwrap_or(0);
         let mut store = HostStore::new(algebra, max_s_degree);
+        let (needed, r_local) = plan_rs(algebra, products);
+        let r_infos: Vec<RInfo> = needed
+            .iter()
+            .map(|p| store.ensure_r(algebra, p).expect("host tables"))
+            .collect();
         let arrays = {
             let bases: Vec<u32> = (0..=max_s_degree.max(0))
                 .map(|d| store.basis.gei(d, 0))
                 .collect();
             let gei_of = move |d: i32, ti: usize| bases[d as usize] + ti as u32;
-            let store = &mut store;
-            let mut r_of = |p: &PPart| store.ensure_r(algebra, p);
-            marshal(algebra, num_limbs, products, &mut r_of, &gei_of).expect("marshal")
+            marshal(algebra, num_limbs, products, &r_local, &r_infos, &gei_of).expect("marshal")
         };
         simulate(&store, &arrays, num_rows, num_limbs, col_map)
     }
@@ -1179,13 +1185,14 @@ mod tests {
         // what says which of those happened.
         let n = (phases.len() - 1) as f64;
         let avg = |f: fn(&LaunchTiming) -> f64| phases[1..].iter().map(f).sum::<f64>() / n;
-        let (m, u, k, r) = (
+        let (res, m, u, k, r) = (
+            avg(|t| t.resident),
             avg(|t| t.marshal),
             avg(|t| t.upload),
             avg(|t| t.kernel),
             avg(|t| t.readback),
         );
-        let tot = m + u + k + r;
+        let tot = res + m + u + k + r;
         // Pair throughput, so this batch can be calibrated against the frontier rather than
         // assumed representative of it. `pairs` counts (matrix, term) pairs -- kernel THREADS --
         // which needs the resident matrix counts, not just the term counts.
@@ -1207,8 +1214,9 @@ mod tests {
             pairs as f64 / k / 1e9
         );
         eprintln!(
-            "  warm phases: marshal={m:.4}s ({:.1}%) upload={u:.4}s ({:.1}%) \
-             kernel={k:.4}s ({:.1}%) readback={r:.4}s ({:.1}%)",
+            "  warm phases: resident={res:.4}s ({:.1}%) marshal={m:.4}s ({:.1}%) \
+             upload={u:.4}s ({:.1}%) kernel={k:.4}s ({:.1}%) readback={r:.4}s ({:.1}%)",
+            100.0 * res / tot,
             100.0 * m / tot,
             100.0 * u / tot,
             100.0 * k / tot,

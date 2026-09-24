@@ -263,7 +263,15 @@ pub enum Backend {
 impl Backend {
     /// The backend this process will use, resolved once.
     pub fn selected() -> Self {
-        static SELECTED: LazyLock<Backend> = LazyLock::new(Backend::resolve);
+        static SELECTED: LazyLock<Backend> = LazyLock::new(|| {
+            let b = Backend::resolve();
+            // ANNOUNCE IT. A run's log must say which backend produced its numbers: a dispatch
+            // that silently declines and falls through looks exactly like a dispatch that ran,
+            // and this project has already been caught comparing two arms that turned out to be
+            // the same code path. One line, once per process.
+            eprintln!("[nassau] multiply backend: {b:?}");
+            b
+        });
         *SELECTED
     }
 
