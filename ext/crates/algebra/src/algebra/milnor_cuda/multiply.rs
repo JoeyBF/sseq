@@ -116,6 +116,37 @@ pub(super) fn plan_rs(algebra: &MilnorAlgebra, products: &[GpuProduct]) -> (Vec<
 /// count.
 pub(super) const SKIP: u32 = u32::MAX;
 
+/// Which device OWNS an `R`: its admissible matrices live there and nowhere else.
+///
+/// Sharding by `R` rather than by rows is the design this backend inherited and briefly abandoned.
+/// Splitting a batch by rows makes every device need every `R` the batch touches, so the whole
+/// master is REPLICATED on every device and every `R` is enumerated once per device -- the first
+/// multi-device stem-200 run sat at ~93 GB on each of three GPUs for exactly that reason. The
+/// cubecl path had already found and fixed the same mistake ("round-robin made every device
+/// enumerate the same Rs; 4 dev == 2 dev"). With ownership by `R`, the master is PARTITIONED.
+///
+/// Hashed from `(r_degree, r_idx)` rather than from the p-part's bits: the key is what a caller
+/// already holds, and building a p-part per distinct `R` just to hash it is the 54k
+/// `basis_element_from_index` calls per launch that keying the master this way removed.
+///
+/// The splitmix64 finalizer, with the golden-ratio increment first so the structured input -- a
+/// small degree in the high word, a dense index in the low -- is fully avalanched. A bare modulo is
+/// NOT acceptable: assignment is permanent and the frontier walks degree upward, so a hash that is
+/// uniform overall but skewed within a degree band starves devices for long stretches. cubecl
+/// measured exactly that as a 3.3x device imbalance. `shard_of_is_uniform_over_real_rs` holds this
+/// to the same bound.
+pub(super) fn shard_of(key: RKey, devices: usize) -> usize {
+    (shard_hash(key) % devices.max(1) as u64) as usize
+}
+
+fn shard_hash((degree, idx): RKey) -> u64 {
+    let mut h = ((degree as u32 as u64) << 32) ^ (idx as u64 & 0xffff_ffff);
+    h = h.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    h = (h ^ (h >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    h = (h ^ (h >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    h ^ (h >> 31)
+}
+
 /// The per-launch arrays, in device layout.
 pub(super) struct LaunchArrays {
     /// Per distinct `R` in THIS launch, pointing into the resident master.
@@ -159,6 +190,13 @@ pub(super) fn marshal(
     algebra: &MilnorAlgebra,
     num_limbs: usize,
     products: &[GpuProduct],
+    // WHICH products, by index into `products`, and each one's `R` index into `r_infos`, aligned.
+    //
+    // A selection rather than a slice because a device marshals only the products whose `R` it
+    // OWNS, and those are interleaved with every other device's throughout the batch. Copying them
+    // out into a contiguous `Vec<GpuProduct>` per device would be one clone per product per launch;
+    // indexing costs nothing.
+    sel: &[u32],
     r_index: &[u32],
     r_infos: &[RInfo],
     // Generic, not `&dyn Fn`: this used to be a virtual call PER TERM, 4.15M of them on the
@@ -171,8 +209,12 @@ pub(super) fn marshal(
     // Sized up front. These are per-product arrays over a batch with hundreds of thousands of
     // products, so growing them from empty is a run of reallocations and memcpys on the critical
     // path of a phase that already dominates the launch.
-    let n = products.len();
-    let terms: usize = products.iter().map(|p| p.term_indices.len()).sum();
+    let _ = algebra;
+    let n = sel.len();
+    let terms: usize = sel
+        .iter()
+        .map(|&i| products[i as usize].term_indices.len())
+        .sum();
     let mut pps = Vec::with_capacity(n + 1);
     pps.push(0);
     // The per-`R` tables are just `r_infos` transposed -- every distinct `R` of this batch is
@@ -193,7 +235,8 @@ pub(super) fn marshal(
         prod_coarse: Vec::new(),
     };
 
-    for (&ri, prod) in r_index.iter().zip(products) {
+    for (&i, &ri) in sel.iter().zip(r_index) {
+        let prod = &products[i as usize];
         // The skip decision and the launch-local `R` index were both settled by `plan_rs`; asking
         // again here would mean a second hash of every product and a second `dimension` call.
         if ri == SKIP {
@@ -288,11 +331,13 @@ pub struct LaunchTiming {
     pub kernel: f64,
     /// Device-to-host of the limbs.
     pub readback: f64,
+    /// XOR-merging the devices' partial outputs, on the host. Zero on one device.
+    pub merge: f64,
 }
 
 impl LaunchTiming {
     pub fn total(&self) -> f64 {
-        self.resident + self.marshal + self.upload + self.kernel + self.readback
+        self.resident + self.marshal + self.upload + self.kernel + self.readback + self.merge
     }
 }
 
@@ -418,39 +463,42 @@ pub fn device_count() -> usize {
     })
 }
 
-/// One device's share of a launch: make the store resident, then run the blocks assigned to it.
+/// One device's shard of a launch.
 ///
-/// Each device keeps its OWN resident master. The offsets differ per device, so `r_infos` -- and
-/// therefore the marshalled `r_*` arrays -- are per device too, which is why the marshal happens
-/// inside here rather than once for the whole batch.
+/// The device OWNS a disjoint set of `R`s -- `shard_of` decides which -- so its resident master
+/// holds only those, and it evaluates only the products that use them. It returns, per row block,
+/// a PARTIAL output covering the whole block: the rows its products touch, zero elsewhere. `run`
+/// XORs the devices' partials together, which is exact because every product contributes by XOR,
+/// so contributions from different devices commute and split freely.
 #[allow(clippy::too_many_arguments)]
 fn run_on_device(
     device: i32,
     algebra: &MilnorAlgebra,
     products: &[GpuProduct],
-    r_index: &[u32],
-    needed: &[RKey],
-    blocks: &[(usize, (usize, usize, usize, usize))],
+    // This device's products, as indices into `products` (row-sorted, because `products` is), and
+    // each one's index into `keys` / the `r_infos` built from it.
+    sel: &[u32],
+    sel_ri: &[u32],
+    keys: &[RKey],
+    plan: &[(usize, usize, usize, usize)],
     num_limbs: usize,
     col_map: Option<&[u32]>,
     max_out_degree: i32,
     max_s_degree: i32,
     timed: bool,
-) -> Result<(Vec<(usize, Box<dyn LimbBlock>)>, LaunchTiming)> {
+) -> Result<(Vec<(usize, super::PinnedBuf)>, LaunchTiming)> {
     use std::time::Instant;
     let mut timing = LaunchTiming::default();
+    let mut out: Vec<(usize, super::PinnedBuf)> = Vec::new();
+    if sel.is_empty() {
+        return Ok((out, timing));
+    }
     let rt = super::runtime(device)?;
 
     let t_resident = Instant::now();
     // THE CRITICAL SECTION IS ONLY WHAT MUTATES THE STORE, plus the snapshot taken out of it.
-    //
-    // Everything after this -- marshalling, the launches, the readback -- runs on locals. That is
-    // sound because the store is APPEND-ONLY: its device pointers are stable for the life of the
-    // process, and a concurrent append can add data but can never move or free what this launch
-    // has already resolved.
-    //
-    // Holding the lock across the whole launch instead measured a 0.95x "speedup" for four
-    // concurrent threads: full serialisation, plus the cost of contending for it.
+    // Everything after runs on locals, which is sound because the store is APPEND-ONLY: its device
+    // pointers are stable, and a concurrent append can add data but never move or free it.
     let (r_infos, bases, p_cs, p_mk, p_pp, p_ln, p_g, p_xi, width) = {
         let store = resident(&rt)?;
         let t_lock = Instant::now();
@@ -461,19 +509,16 @@ fn run_on_device(
                 t_lock.elapsed().as_secs_f64()
             );
         }
-        // `ensure_seqno` FIRST: it establishes `width`, the stride `ensure_basis` pads to.
         store.ensure_seqno(algebra, max_out_degree)?;
         store.ensure_basis(algebra, max_s_degree)?;
-        // Every `R` this batch needs, made resident in ONE enumeration launch. Per-`R` on demand
-        // would be one launch each, and the enum kernel's duration is set by its longest single
-        // `R` rather than by how many it carries -- so batching turns a sum into a max.
+        // ONLY THIS DEVICE'S `R`s. This is the line that makes the master a partition rather than
+        // a replica: under the row split it was every `R` the batch touched, on every device.
         let r_infos = if cpu_enumeration() {
-            needed
-                .iter()
+            keys.iter()
                 .map(|&k| store.ensure_r(algebra, k))
                 .collect::<Result<Vec<_>>>()?
         } else {
-            store.ensure_rs(&rt, algebra, needed)?
+            store.ensure_rs(&rt, algebra, keys)?
         };
         let bases: Vec<u32> = (0..=max_s_degree.max(0))
             .map(|d| store.basis().gei(d, 0))
@@ -523,7 +568,6 @@ fn run_on_device(
     let cm: Vec<u32> = col_map.map_or_else(|| vec![0u32], <[u32]>::to_vec);
     let d_cm = up!(cm);
 
-    // Scalars need bindings: `arg` borrows, so a temporary would be dropped before the launch.
     let col_map_len = col_map.map_or(0u32, |c| c.len() as u32);
     let use_col_map = u32::from(col_map.is_some());
     let num_limbs_u = num_limbs as u32;
@@ -532,28 +576,33 @@ fn run_on_device(
     // cannot overflow the grid.
     let chunk = (u32::MAX as u64 / threads as u64) * threads as u64;
 
-    let mut out_blocks: Vec<(usize, Box<dyn LimbBlock>)> = Vec::with_capacity(blocks.len());
+    for (block_index, &(row0, row1, p0, p1)) in plan.iter().enumerate() {
+        // This device's products inside the block: `sel` is sorted, so it is a contiguous run.
+        let a = sel.partition_point(|&i| (i as usize) < p0);
+        let b = sel.partition_point(|&i| (i as usize) < p1);
+        if a == b {
+            // Nothing of this device's in the block: contribute no partial at all, rather than a
+            // block of zeros for the merge to XOR in for nothing.
+            continue;
+        }
 
-    for &(block_index, (row0, row1, p0, p1)) in blocks {
         let t_marshal = Instant::now();
         let arrays = marshal(
             algebra,
             num_limbs,
-            &products[p0..p1],
-            &r_index[p0..p1],
+            products,
+            &sel[a..b],
+            &sel_ri[a..b],
             &r_infos,
             &gei_of,
             row0,
         )?;
         timing.marshal += t_marshal.elapsed().as_secs_f64();
-
-        let blk_len = (row1 - row0) * num_limbs;
         if arrays.total_pairs() == 0 {
-            // The rows still exist and still have to appear in the output, they are just empty.
-            out_blocks.push((block_index, Box::new(vec![0u32; blk_len])));
             continue;
         }
 
+        let blk_len = (row1 - row0) * num_limbs;
         let t_upload = Instant::now();
         let d_tg = up!(arrays.term_gei);
         let d_rco = up!(arrays.r_cs_offset);
@@ -591,8 +640,8 @@ fn run_on_device(
                 block_dim: (threads, 1, 1),
                 shared_mem_bytes: 0,
             };
-            let mut b = stream.launch_builder(&f);
-            b.arg(&p_cs)
+            let mut bld = stream.launch_builder(&f);
+            bld.arg(&p_cs)
                 .arg(&p_mk)
                 .arg(&p_pp)
                 .arg(&p_ln)
@@ -620,7 +669,7 @@ fn run_on_device(
                 .arg(&width)
                 .arg(&num_limbs_u)
                 .arg(&out_len_u);
-            unsafe { b.launch(cfg) }
+            unsafe { bld.launch(cfg) }
                 .map_err(|e| CudaError::Compile(format!("launch multiply_batch: {e:?}")))?;
             done += n;
         }
@@ -631,14 +680,8 @@ fn run_on_device(
             timing.kernel += t_kernel.elapsed().as_secs_f64();
         }
 
-        // Land the readback in CACHED page-locked memory and hand that buffer straight to the
-        // caller. A device-to-host copy into pageable memory is staged by the driver through its
-        // own bounce buffer; into page-locked memory it is a direct DMA. And because `BatchOutput`
-        // stores `Box<dyn LimbBlock>`, the landing buffer IS the result -- no second copy into a
-        // `Vec`, which at frontier sizes would be gigabytes of memcpy for nothing.
-        //
-        // From the POOL: page-locking is charged per allocation and dominated this phase outright
-        // (69.4 ms of 76.8 ms for 338 MB), while the transfer it enables runs at 45.7 GB/s.
+        // Land the readback in CACHED page-locked memory, from the pool (page-locking is charged
+        // per allocation and once dominated this phase: 69.4 of 76.8 ms for 338 MB).
         let t_readback = Instant::now();
         let mut pinned = super::pinned_pool(device).take(rt.context(), blk_len)?;
         stream
@@ -649,16 +692,56 @@ fn run_on_device(
             .synchronize()
             .map_err(|e| CudaError::Compile(format!("sync after readback: {e:?}")))?;
         timing.readback += t_readback.elapsed().as_secs_f64();
-        out_blocks.push((block_index, Box::new(pinned)));
+        out.push((block_index, pinned));
     }
-    Ok((out_blocks, timing))
+    Ok((out, timing))
 }
 
-/// The launch, across every visible device, with phase attribution optional.
+/// XOR every partial into `dst`, split across threads by contiguous chunks.
+///
+/// The merge is pure memory bandwidth -- on the stem-170 batch, two 338 MB partials XORed into a
+/// third -- and one core cannot saturate the memory system. Single-threaded it was 29.7 ms, 30% of
+/// a three-device launch and enough to make three GPUs SLOWER than one (0.061 s against 0.049 s).
+///
+/// Scoped std threads, NOT rayon. This runs inside callers that are themselves on the rayon pool,
+/// and this codebase has a recorded 146 s stall from a `par_iter` over a hot host loop that
+/// inverted priorities against the resolution's own work. Plain threads cannot be stolen from.
+fn xor_into_parallel(dst: &mut [u32], parts: &[super::PinnedBuf]) {
+    // Enough chunks to spread the bandwidth, few enough that spawn cost stays negligible against
+    // hundreds of MB; small outputs (the masked frontier) are merged inline.
+    const MIN_CHUNK: usize = 1 << 20; // 4 MB of u32
+    let threads = std::thread::available_parallelism()
+        .map_or(8, |n| n.get())
+        .min(16);
+    let chunk = dst.len().div_ceil(threads).max(MIN_CHUNK);
+    if chunk >= dst.len() {
+        for part in parts {
+            for (x, y) in dst.iter_mut().zip(part.limbs()) {
+                *x ^= *y;
+            }
+        }
+        return;
+    }
+    std::thread::scope(|scope| {
+        for (c, dchunk) in dst.chunks_mut(chunk).enumerate() {
+            scope.spawn(move || {
+                let off = c * chunk;
+                for part in parts {
+                    let src = &part.limbs()[off..off + dchunk.len()];
+                    for (x, y) in dchunk.iter_mut().zip(src) {
+                        *x ^= *y;
+                    }
+                }
+            });
+        }
+    });
+}
+
+/// The launch, sharded across every visible device by `R`, with phase attribution optional.
 ///
 /// `timed` controls the intermediate stream synchronises. They exist ONLY so the phases add up:
 /// everything on a device runs on one stream and is therefore already ordered, so the sole
-/// synchronise production needs is the one before a readback buffer is handed to the caller.
+/// synchronise production needs is the one before a readback buffer is handed back.
 #[allow(clippy::too_many_arguments)]
 fn run(
     rt: &Arc<MilnorCuda>,
@@ -669,8 +752,8 @@ fn run(
     col_map: Option<&[u32]>,
     timed: bool,
 ) -> Result<(BatchOutput, LaunchTiming)> {
+    use std::time::Instant;
     let num_limbs = num_cols.div_ceil(32).max(1);
-    let out_len = num_rows * num_limbs;
 
     let max_out_degree = products
         .iter()
@@ -680,18 +763,13 @@ fn run(
         .max(1);
     let max_s_degree = products.iter().map(|p| p.s_degree).max().unwrap_or(0);
 
-    // ROW ORDER IS A PRECONDITION OF THE SPLIT, SO ESTABLISH IT HERE.
+    // ROW ORDER IS A PRECONDITION OF THE ROW BLOCKS, SO ESTABLISH IT HERE.
     //
-    // `row_blocks` hands each device a contiguous range of rows plus the contiguous slice of
-    // products belonging to them, which is only a partition if the products are sorted by row.
-    // The resolution does emit them in row order, so this is normally a single O(n) check -- but
-    // it was an unchecked assumption, and it broke the moment multi-device made every launch split:
-    // unsorted products landed in blocks that did not own their row, `prod.row - row0` wrapped, and
-    // the result was WRONG rather than a crash. One device never split, so it never noticed.
-    //
-    // Sorting is sound because the output is XOR-accumulated per row: the order of products
-    // WITHIN a row never mattered, only which row each lands in, which sorting preserves. It must
-    // happen before `plan_rs`, whose `r_index` is positional over this slice.
+    // A block is a contiguous range of rows plus the contiguous slice of products belonging to
+    // them, which is only a partition if the products are sorted by row. The resolution emits them
+    // in row order, so this is normally a single O(n) check; when it was an unchecked assumption,
+    // unsorted input produced WRONG answers. Sorting is sound because the output is XOR-accumulated
+    // per row: order within a row never mattered. It must precede `plan_rs`, which is positional.
     let sorted_storage;
     let products: &[GpuProduct] = if products.windows(2).all(|w| w[0].row <= w[1].row) {
         products
@@ -702,76 +780,78 @@ fn run(
         &sorted_storage
     };
 
-    // OUTSIDE ANY LOCK, and device-independent: one pass over the products decides both which `R`s
-    // to make resident and what the kernel's launch-local `R` index is for each product.
+    // Device-independent: which `R`s the batch uses, and each product's index into that list.
     let (needed, r_index) = plan_rs(algebra, products);
 
-    // SPLIT FOR THE DEVICES, not just for the memory bound.
-    //
-    // Rows are independent, so the row blocks that bound a launch's output are also the unit of
-    // work a device can take. Capping a block at `num_rows / devices` gives every device something
-    // to do; the byte budget still applies on top, so a batch large enough to need more blocks
-    // than there are devices simply gets more.
+    // SHARD BY `R`. Each distinct `R` belongs to exactly one device; its products go there, and its
+    // matrices live only there. This replaces a split by ROWS, which made every device need every
+    // `R` the batch touched -- the whole master replicated on every GPU, and every `R` enumerated
+    // once per GPU. The first multi-device stem-200 run sat at ~93 GB on each of three GPUs for
+    // exactly that reason.
     let n_dev = device_count().max(1);
-    let row_bytes = num_limbs * size_of::<u32>();
-    let per_device_bytes = num_rows.div_ceil(n_dev).max(1) * row_bytes;
-    let budget = block_bytes().min(per_device_bytes.max(row_bytes));
-    let plan = row_blocks(products, num_rows, num_limbs, budget);
-
-    // Round-robin, so a plan with more blocks than devices still spreads evenly.
-    let mut per_device: Vec<Vec<(usize, (usize, usize, usize, usize))>> = vec![Vec::new(); n_dev];
-    for (i, &blk) in plan.iter().enumerate() {
-        per_device[i % n_dev].push((i, blk));
+    let mut keys_by_dev: Vec<Vec<RKey>> = vec![Vec::new(); n_dev];
+    // For each launch-local `R`: (owning device, its index in that device's `keys`).
+    let owner: Vec<(u32, u32)> = needed
+        .iter()
+        .map(|&k| {
+            let d = shard_of(k, n_dev);
+            keys_by_dev[d].push(k);
+            (d as u32, (keys_by_dev[d].len() - 1) as u32)
+        })
+        .collect();
+    let mut sel_by_dev: Vec<Vec<u32>> = vec![Vec::new(); n_dev];
+    let mut ri_by_dev: Vec<Vec<u32>> = vec![Vec::new(); n_dev];
+    for (i, &ri) in r_index.iter().enumerate() {
+        if ri == SKIP {
+            continue;
+        }
+        let (d, local) = owner[ri as usize];
+        sel_by_dev[d as usize].push(i as u32);
+        ri_by_dev[d as usize].push(local);
     }
 
-    // Single device: stay on this thread. Spawning to run one closure would only add a join.
-    let results: Vec<Result<(Vec<(usize, Box<dyn LimbBlock>)>, LaunchTiming)>> = if n_dev == 1 {
-        vec![run_on_device(
-            rt.device(),
+    // Row blocks bound each device's partial output by the byte budget. They are NO LONGER capped
+    // by device count: parallelism across devices now comes from the `R` shards, so splitting a
+    // small batch into more blocks would only add launches.
+    let plan = row_blocks(products, num_rows, num_limbs, block_bytes());
+
+    let run_dev = |d: usize| {
+        run_on_device(
+            d as i32,
             algebra,
             products,
-            &r_index,
-            &needed,
-            &per_device[0],
+            &sel_by_dev[d],
+            &ri_by_dev[d],
+            &keys_by_dev[d],
+            &plan,
             num_limbs,
             col_map,
             max_out_degree,
             max_s_degree,
             timed,
-        )]
+        )
+    };
+    let results: Vec<Result<(Vec<(usize, super::PinnedBuf)>, LaunchTiming)>> = if n_dev == 1 {
+        let _ = rt;
+        vec![run_dev(0)]
     } else {
         std::thread::scope(|scope| {
-            let handles: Vec<_> = per_device
-                .iter()
-                .enumerate()
-                .filter(|(_, blocks)| !blocks.is_empty())
-                .map(|(d, blocks)| {
-                    let (needed, r_index) = (&needed, &r_index);
-                    scope.spawn(move || {
-                        run_on_device(
-                            d as i32,
-                            algebra,
-                            products,
-                            r_index,
-                            needed,
-                            blocks,
-                            num_limbs,
-                            col_map,
-                            max_out_degree,
-                            max_s_degree,
-                            timed,
-                        )
-                    })
+            let handles: Vec<_> = (0..n_dev)
+                .map(|d| {
+                    let run_dev = &run_dev;
+                    scope.spawn(move || run_dev(d))
                 })
                 .collect();
             handles.into_iter().map(|h| h.join().unwrap()).collect()
         })
     };
 
-    // Reassemble IN ROW ORDER. The devices finish in whatever order they finish; the output is a
-    // concatenation of row blocks and cares only about their index.
+    // MERGE. For each row block, XOR the devices' partials into the first one. Exact, because every
+    // product contributes by XOR and the contributions commute; and it is where sharding by `R`
+    // pays for partitioning the master -- the row split never had to do this. Timed as its own
+    // phase so the cost is visible rather than hidden inside readback.
     let mut timing = LaunchTiming::default();
-    let mut slots: Vec<Option<Box<dyn LimbBlock>>> = (0..plan.len()).map(|_| None).collect();
+    let mut partials: Vec<Vec<super::PinnedBuf>> = (0..plan.len()).map(|_| Vec::new()).collect();
     for result in results {
         let (blocks, t) = result?;
         timing.resident += t.resident;
@@ -780,19 +860,34 @@ fn run(
         timing.kernel += t.kernel;
         timing.readback += t.readback;
         for (i, buf) in blocks {
-            slots[i] = Some(buf);
+            partials[i].push(buf);
         }
     }
-    if plan.is_empty() {
+    let t_merge = Instant::now();
+    let mut out_blocks: Vec<Box<dyn LimbBlock>> = Vec::with_capacity(plan.len());
+    for (i, mut parts) in partials.into_iter().enumerate() {
+        let (row0, row1, _, _) = plan[i];
+        let blk_len = (row1 - row0) * num_limbs;
+        match parts.len() {
+            0 => out_blocks.push(Box::new(vec![0u32; blk_len])),
+            _ => {
+                let mut acc = parts.swap_remove(0);
+                if !parts.is_empty() {
+                    xor_into_parallel(acc.as_mut_slice(), &parts);
+                }
+                // The other partials go back to their devices' pools here.
+                drop(parts);
+                out_blocks.push(Box::new(acc));
+            }
+        }
+    }
+    timing.merge = t_merge.elapsed().as_secs_f64();
+    if out_blocks.is_empty() {
         return Ok((
-            BatchOutput::from_limbs(vec![0u32; out_len], num_limbs),
+            BatchOutput::from_limbs(vec![0u32; num_rows * num_limbs], num_limbs),
             timing,
         ));
     }
-    let out_blocks: Vec<Box<dyn LimbBlock>> = slots
-        .into_iter()
-        .map(|b| b.expect("every block was assigned to a device"))
-        .collect();
     Ok((BatchOutput::from_blocks(out_blocks, num_limbs), timing))
 }
 
@@ -900,6 +995,71 @@ mod tests {
         algebra.compute_basis(max_degree);
         algebra.compute_seqno_tables(max_degree);
         algebra
+    }
+
+    /// `shard_of` must split the real `R`s evenly, overall AND within each degree band.
+    ///
+    /// Held to the same bounds as cubecl's own test of its shard hash -- 5% overall, 15% per
+    /// 30-degree band -- because the failure it guards against is the same: assignment is
+    /// permanent and the frontier walks degree upward, so a hash that is fine on average but skewed
+    /// within a band starves devices for long stretches. Checked at 3 devices (the production split,
+    /// with a fourth reserved for row reduction) and at 4.
+    ///
+    #[test]
+    fn shard_of_is_uniform_over_real_rs() {
+        let max_degree = 150;
+        let algebra = MilnorAlgebra::new(ValidPrime::new(2), false);
+        algebra.compute_basis(max_degree);
+
+        for n_dev in [3usize, 4] {
+            let mut overall = vec![0usize; n_dev];
+            let mut raw = vec![0usize; n_dev];
+            let mut total = 0usize;
+            for band in 0..5 {
+                let (lo, hi) = (1 + band * 30, (band + 1) * 30);
+                let mut counts = vec![0usize; n_dev];
+                for deg in lo..=hi.min(max_degree as usize) {
+                    for idx in 0..algebra.dimension(deg as i32) {
+                        let d = shard_of((deg as i32, idx), n_dev);
+                        counts[d] += 1;
+                        overall[d] += 1;
+                        raw[(((deg as u64) << 32 | idx as u64) % n_dev as u64) as usize] += 1;
+                        total += 1;
+                    }
+                }
+                let n: usize = counts.iter().sum();
+                if n >= 500 {
+                    let ideal = n as f64 / n_dev as f64;
+                    for (d, &c) in counts.iter().enumerate() {
+                        let dev = (c as f64 - ideal).abs() / ideal;
+                        assert!(
+                            dev < 0.15,
+                            "{n_dev} devices, degree band {band}: device {d} off by {:.1}%",
+                            dev * 100.0
+                        );
+                    }
+                }
+            }
+            assert!(total > 10_000, "need a meaningful sample, got {total}");
+            let ideal = total as f64 / n_dev as f64;
+            let worst = |v: &[usize]| {
+                v.iter()
+                    .map(|&c| (c as f64 - ideal).abs() / ideal)
+                    .fold(0.0_f64, f64::max)
+            };
+            assert!(
+                worst(&overall) < 0.05,
+                "{n_dev} devices: worst overall deviation {:.1}%",
+                worst(&overall) * 100.0
+            );
+            // NOT asserted: that the unmixed key is worse. It was for cubecl, whose key was a
+            // p-part's bits with `r_1` -- which tracks degree -- in the low word. This key is
+            // `(degree, idx)` with `idx` dense inside a degree, so `idx % n` is uniform BY
+            // CONSTRUCTION and the raw key passes too. The mixing stays as cheap insurance against
+            // WORK correlating with index order, which a count test cannot see; that balance is
+            // measured on a real capture instead.
+            let _ = worst(&raw);
+        }
     }
 
     /// A host-only mirror of the resident store.
@@ -1145,7 +1305,12 @@ mod tests {
                 .map(|d| store.basis.gei(d, 0))
                 .collect();
             let gei_of = move |d: i32, ti: usize| bases[d as usize] + ti as u32;
-            marshal(algebra, num_limbs, products, &r_index, &r_infos, &gei_of, 0).expect("marshal")
+            // Every product, in order: the walk marshals the whole batch as one device would.
+            let sel: Vec<u32> = (0..products.len() as u32).collect();
+            marshal(
+                algebra, num_limbs, products, &sel, &r_index, &r_infos, &gei_of, 0,
+            )
+            .expect("marshal")
         };
         simulate(&store, &arrays, num_rows, num_limbs, col_map)
     }
@@ -1176,12 +1341,14 @@ mod tests {
             num_limbs,
             rows_per_block * num_limbs * size_of::<u32>(),
         );
+        let sel_all: Vec<u32> = (0..products.len() as u32).collect();
         let mut out = Vec::with_capacity(num_rows * num_limbs);
         for &(row0, row1, p0, p1) in &plan {
             let arrays = marshal(
                 algebra,
                 num_limbs,
-                &products[p0..p1],
+                products,
+                &sel_all[p0..p1],
                 &r_index[p0..p1],
                 &r_infos,
                 &gei_of,
@@ -1783,16 +1950,29 @@ mod tests {
         // The WARM phase split, averaged over the warm reps. Wall time is not kernel time: a
         // kernel optimisation can be real and still move the line above by nothing, and this is
         // what says which of those happened.
+        // The resident master on EVERY device, not just device 0: whether it is a partition or a
+        // replica is exactly what this number distinguishes.
+        let per_dev: Vec<String> = (0..device_count())
+            .map(|d| {
+                let rt = super::super::runtime(d as i32).expect("device");
+                format!(
+                    "{:.0}",
+                    resident_committed_bytes(&rt).unwrap_or(0) as f64 / 1e6
+                )
+            })
+            .collect();
+        eprintln!("  resident MB per device: [{}]", per_dev.join(", "));
         let n = (phases.len() - 1) as f64;
         let avg = |f: fn(&LaunchTiming) -> f64| phases[1..].iter().map(f).sum::<f64>() / n;
-        let (res, m, u, k, r) = (
+        let (res, m, u, k, r, mg) = (
             avg(|t| t.resident),
             avg(|t| t.marshal),
             avg(|t| t.upload),
             avg(|t| t.kernel),
             avg(|t| t.readback),
+            avg(|t| t.merge),
         );
-        let tot = res + m + u + k + r;
+        let tot = res + m + u + k + r + mg;
         // Pair throughput, so this batch can be calibrated against the frontier rather than
         // assumed representative of it. `pairs` counts (matrix, term) pairs -- kernel THREADS --
         // which needs the resident matrix counts, not just the term counts.
@@ -1811,12 +1991,14 @@ mod tests {
         );
         eprintln!(
             "  warm phases: resident={res:.4}s ({:.1}%) marshal={m:.4}s ({:.1}%) \
-             upload={u:.4}s ({:.1}%) kernel={k:.4}s ({:.1}%) readback={r:.4}s ({:.1}%)",
+             upload={u:.4}s ({:.1}%) kernel={k:.4}s ({:.1}%) readback={r:.4}s ({:.1}%) \
+             merge={mg:.4}s ({:.1}%)  [device phases SUMMED across devices, not wall]",
             100.0 * res / tot,
             100.0 * m / tot,
             100.0 * u / tot,
             100.0 * k / tot,
             100.0 * r / tot,
+            100.0 * mg / tot,
         );
     }
 }
