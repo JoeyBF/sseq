@@ -190,10 +190,21 @@ fn multiply_devices() -> usize {
             })
             .count()
     });
-    std::env::var("NASSAU_GPU_DEVICES")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
+    // BOTH multiply backends, not just cubecl's. `NASSAU_GPU_DEVICES` is the cubecl knob and
+    // `NASSAU_CUDA_DEVICES` the cudarc one; reading only the former meant that a run on the cudarc
+    // backend reported every visible device here, concluded the reduction GPU was shared, and
+    // turned the arbitration lock on -- which costs ~47% of multiply time. Once cubecl is deleted,
+    // `NASSAU_GPU_DEVICES` is a variable nobody sets, so this would have failed that way silently
+    // and permanently.
+    //
+    // The max when both are set: the span that matters is the widest one any backend uses.
+    let configured = ["NASSAU_GPU_DEVICES", "NASSAU_CUDA_DEVICES"]
+        .iter()
+        .filter_map(|k| std::env::var(k).ok())
+        .filter_map(|v| v.parse::<usize>().ok())
         .filter(|&n| n > 0)
+        .max();
+    configured
         .unwrap_or_else(|| visible.unwrap_or(physical).max(1))
         .clamp(1, MAX_GPUS)
 }
