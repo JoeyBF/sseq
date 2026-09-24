@@ -1484,6 +1484,43 @@ mod tests {
                 (wh, wones),
                 "{file}: the device disagrees with the CPU reference"
             );
+
+            // AND AGAIN THROUGH THE MASKED PATH, with a synthetic mask.
+            //
+            // Every capture on disk is unmasked, because the runs that produced them never reached
+            // the stems where signature masking starts -- but masking is the FRONTIER's dominant
+            // path, discarding ~98% of columns, and it is what lets the output be allocated at the
+            // masked width. Leaving it exercised only by generated products would mean the real
+            // `R` distribution and term counts never meet the `col_map` code at all.
+            if cm.is_none() {
+                let full = cols;
+                let mut map = vec![COL_MAP_DROP; full];
+                let mut kept = 0u32;
+                for (i, slot) in map.iter_mut().enumerate() {
+                    if i % 3 == 0 {
+                        *slot = kept;
+                        kept += 1;
+                    }
+                }
+                let out_cols = kept as usize;
+                let want_m = cpu_multiply_batch_masked(
+                    &algebra,
+                    out_cols,
+                    Some(map.clone().into()),
+                    rows,
+                    &prods,
+                );
+                let got_m = cuda_multiply_batch(&rt, &algebra, out_cols, rows, &prods, Some(&map))
+                    .expect("masked device batch");
+                let (wmh, wmones) = want_m.digest();
+                assert!(wmones > 0, "{file}: the masked reference is all zero");
+                assert_eq!(
+                    got_m.digest(),
+                    (wmh, wmones),
+                    "{file}: the device disagrees with the CPU reference under a column mask"
+                );
+                eprintln!("[replay]   masked to {out_cols} cols: ones={wmones} digest={wmh:016x}");
+            }
         }
     }
 
