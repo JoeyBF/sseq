@@ -72,8 +72,10 @@ pub(super) fn plan_rs(algebra: &MilnorAlgebra, products: &[GpuProduct]) -> (Vec<
     // product -- 426k times on the profile batch -- so SipHash's per-key setup dominates a lookup
     // that decides almost nothing. rustc-hash is already a dependency of this crate.
     let mut local: FxHashMap<(i32, usize), u32> = FxHashMap::default();
-    // The products of one extract loop arrive grouped by `R`, so the previous answer is usually
-    // the next one. A two-word compare in front of the map skips the hash entirely on a hit.
+    // The products of one extract loop arrive PARTLY grouped by `R`, so the previous answer is
+    // often the next one and a two-word compare in front of the map skips the hash on a hit.
+    // Measured worth 9.3ms -> 8.3ms of the resident phase, i.e. a useful minority of lookups --
+    // not the overwhelming majority the "grouped" reading would predict.
     let mut last: Option<((i32, usize), u32)> = None;
     // POSITIONAL, one entry per product, `SKIP` where the product contributes nothing. Returning
     // the map instead would make `marshal` hash all 426k products a second time to ask a question
@@ -159,7 +161,9 @@ pub(super) fn marshal(
     products: &[GpuProduct],
     r_index: &[u32],
     r_infos: &[RInfo],
-    gei_of: &dyn Fn(i32, usize) -> u32,
+    // Generic, not `&dyn Fn`: this used to be a virtual call PER TERM, 4.15M of them on the
+    // profile batch. Monomorphised it inlines to a vector index and an add.
+    gei_of: impl Fn(i32, usize) -> u32,
     // First row of the block this launch covers. Output rows are numbered from it, so a block's
     // buffer is only as tall as the block.
     row0: usize,
@@ -198,9 +202,12 @@ pub(super) fn marshal(
 
         a.prod_term_start.push(a.term_gei.len() as u32);
         a.prod_num_terms.push(prod.term_indices.len() as u32);
-        for &ti in prod.term_indices.iter() {
-            a.term_gei.push(gei_of(prod.s_degree, ti));
-        }
+        // The degree's base is the same for every term of a product, so resolve it ONCE per
+        // product rather than once per term -- `term_gei` is the longest array built here
+        // (4.15M entries on the profile batch) and this is its inner loop.
+        let base = gei_of(prod.s_degree, 0);
+        a.term_gei
+            .extend(prod.term_indices.iter().map(|&ti| base + ti as u32));
         a.prod_r_index.push(ri);
         a.prod_row_base.push(((prod.row - row0) * num_limbs) as u32);
         a.prod_out_offset.push(prod.out_offset as u32);
