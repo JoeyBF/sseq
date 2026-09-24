@@ -735,4 +735,81 @@ mod tests {
             assert_eq!(got_row, want_row, "row {r}: masked walk != CPU reference");
         }
     }
+
+    /// Replay REAL captured batches through the device and against the CPU reference.
+    ///
+    /// The random products above span many `(R, s)` pairs but give every product a similar shape.
+    /// Real batches do not: the `R` distribution is steeply skewed, term counts vary per product,
+    /// and the row/offset layout is whatever the resolution happened to emit. A synthetic bench has
+    /// already been caught ranking a tile 4x2 at 0.706x where the truth was 1.16x -- the wrong sign
+    /// against a 0.4% noise floor -- so "agrees on generated input" is not the same claim as
+    /// "agrees on the input it will actually see".
+    ///
+    /// Point `NASSAU_REPLAY_PRODUCTS` at a file or at a directory of `batch_*.bin`. Capture with:
+    ///
+    /// ```text
+    /// NASSAU_CAPTURE_PRODUCTS=<dir> NASSAU_CAPTURE_NTH=40 NASSAU_CAPTURE_COUNT=6 \
+    ///   ./resolve_through_stem   # then feed "S_2", "", 80, 30
+    /// ```
+    #[test]
+    #[ignore = "needs a CUDA device and a captured batch; run explicitly with --ignored"]
+    fn cuda_replay_matches_cpu_reference() {
+        use crate::algebra::milnor_batch::load_captured_batch;
+
+        let Ok(path) = std::env::var("NASSAU_REPLAY_PRODUCTS") else {
+            panic!(
+                "NASSAU_REPLAY_PRODUCTS is unset. A replay test that silently passes with nothing \
+                 to replay is worse than no test: set it to a capture file or directory."
+            );
+        };
+        let mut files: Vec<String> = if std::path::Path::new(&path).is_dir() {
+            let mut v: Vec<String> = std::fs::read_dir(&path)
+                .expect("read capture dir")
+                .filter_map(|e| e.ok())
+                .map(|e| e.path().display().to_string())
+                .filter(|p| p.ends_with(".bin"))
+                .collect();
+            v.sort();
+            v
+        } else {
+            vec![path]
+        };
+        assert!(!files.is_empty(), "no .bin captures found");
+        files.truncate(8);
+
+        let rt = super::super::runtime(0).expect("open device 0");
+        for file in &files {
+            let (rows, cols, cm, prods) =
+                load_captured_batch(file).expect("failed to load the captured batch");
+            let max_degree = prods
+                .iter()
+                .map(|p| p.r_degree + p.s_degree)
+                .max()
+                .unwrap_or(1)
+                .max(1);
+            let algebra = algebra_to(max_degree);
+
+            let want = cpu_multiply_batch_masked(&algebra, cols, cm.clone(), rows, &prods);
+            let got = cuda_multiply_batch(&rt, &algebra, cols, rows, &prods, cm.as_deref())
+                .expect("device batch");
+
+            let (wh, wones) = want.digest();
+            let (gh, gones) = got.digest();
+            assert!(
+                wones > 0,
+                "{file}: the CPU reference is all zero, so this comparison proves nothing"
+            );
+            eprintln!(
+                "[replay] {file}: products={} rows={rows} cols={cols} masked={} \
+                 ones={wones} digest={wh:016x}",
+                prods.len(),
+                cm.is_some(),
+            );
+            assert_eq!(
+                (gh, gones),
+                (wh, wones),
+                "{file}: the device disagrees with the CPU reference"
+            );
+        }
+    }
 }
