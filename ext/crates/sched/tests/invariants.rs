@@ -4,9 +4,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use proptest::prelude::*;
 use sched::{
-    BackfillConfig, BestFit, BestFitConfig, Defer, Greedy, GreedyConfig, JobId, JobSpec, LaneSet,
-    Lanes, LanesConfig, Policy, PriorityBackfill, Resources, SlowGate, SpeedConfig, SpeedPolicy,
-    Spoliation, WorkerId, WorkerState,
+    BackfillConfig, BestFit, BestFitConfig, Defer, Greedy, GreedyConfig, GroupOrder, JobId,
+    JobSpec, LaneSet, Lanes, LanesConfig, Policy, PriorityBackfill, Resources, SlowGate,
+    SpeedConfig, SpeedPolicy, Spoliation, WorkerId, WorkerState,
 };
 
 const LANE: WorkerId = 0;
@@ -32,13 +32,14 @@ enum Kind {
 impl Kind {
     /// The policy under test.
     fn build(&self, speed: SpeedConfig) -> Box<dyn Policy> {
-        let bf = |max_res, per_class, age, group_first| BackfillConfig {
+        let bf = |max_res, per_class, age, group_first, group_order| BackfillConfig {
             reserve_after: 30.0,
             max_reservations: max_res,
             per_class_reservations: per_class,
             age_limit: age,
             speed,
             group_first,
+            group_order,
             ..BackfillConfig::default()
         };
         match *self {
@@ -53,13 +54,14 @@ impl Kind {
                 per_class,
                 age,
                 group_first,
+                GroupOrder::Arrival,
             ))),
             Kind::BestFit { penalty, age } => Box::new(BestFit::new(BestFitConfig {
-                backfill: bf(1, false, age, false),
+                backfill: bf(1, false, age, false, GroupOrder::Id),
                 prefer_penalty: penalty,
             })),
             Kind::Lanes => Box::new(Lanes::new(LanesConfig {
-                backfill: bf(1, false, None, false),
+                backfill: bf(1, false, None, false, GroupOrder::Arrival),
                 lanes: LaneSet::Workers(vec![LANE]),
                 big_threshold: Resources::mem(LANE_BIG),
                 lane_reserve: Resources::mem(LANE_RESERVE),
@@ -78,6 +80,11 @@ impl Kind {
             Kind::Backfill { age, .. } | Kind::BestFit { age, .. } => age,
             _ => None,
         }
+    }
+
+    /// Whether groups are ordered by id (else by first arrival).
+    fn by_id(&self) -> bool {
+        matches!(self, Kind::BestFit { .. })
     }
 
     /// Whether groups come before priorities.
@@ -111,6 +118,7 @@ enum Op {
         priority: Option<i64>,
         prefer: Option<WorkerId>,
         avoid: Option<WorkerId>,
+        avoid_soft: bool,
         class: Option<u8>,
         work: Option<u32>,
     },
@@ -137,17 +145,21 @@ fn op() -> impl Strategy<Value = Op> {
             prop::option::weighted(0.2, -2i64..3),
             prop::option::of(0u64..4),
             prop::option::weighted(0.2, 0u64..4),
+            any::<bool>(),
             prop::option::weighted(0.15, 0u8..2),
             prop::option::weighted(0.7, 1u32..120),
         )
-            .prop_map(|(demand, group, priority, prefer, avoid, class, work)| Op::Submit {
-                demand,
-                group,
-                priority,
-                prefer,
-                avoid,
-                class,
-                work,
+            .prop_map(|(demand, group, priority, prefer, avoid, avoid_soft, class, work)| {
+                Op::Submit {
+                    demand,
+                    group,
+                    priority,
+                    prefer,
+                    avoid,
+                    avoid_soft,
+                    class,
+                    work,
+                }
             }),
         4 => any::<prop::sample::Index>().prop_map(|i| Op::Complete(i.index(1 << 16))),
         1 => any::<prop::sample::Index>().prop_map(|i| Op::Cancel(i.index(1 << 16))),
@@ -245,6 +257,7 @@ struct Shadow {
     speed: SpeedConfig,
     age: Option<f64>,
     group_first: bool,
+    by_id: bool,
 }
 
 /// The slow-worker gate's fleet view, recomputed independently of the engine.
@@ -322,12 +335,19 @@ impl Shadow {
             || s.reported_used.mem.max(s.reported_baseline.mem + placed) + demand <= s.budget.mem
     }
 
-    /// The hard constraints (class, avoid list), written out again.
+    /// The hard constraints (class, avoid list), written out again: a soft avoid list lapses
+    /// while no live worker of the class is off it.
     fn eligible(&self, spec: &JobSpec, w: WorkerId) -> bool {
-        spec.class
-            .as_ref()
-            .is_none_or(|c| *c == self.workers[&w].class)
-            && !spec.avoid.contains(&w)
+        let class_ok = |w: &WorkerState| spec.class.as_ref().is_none_or(|c| *c == w.class);
+        if !class_ok(&self.workers[&w]) {
+            return false;
+        }
+        !spec.avoid.contains(&w)
+            || (spec.avoid_soft
+                && !self
+                    .workers
+                    .values()
+                    .any(|o| o.slots > 0 && class_ok(o) && !spec.avoid.contains(&o.id)))
     }
 
     /// The lane rule, written out again.
@@ -345,7 +365,11 @@ impl Shadow {
     /// priority with `group_first`).
     fn urgency(&self, j: &SJob, age: Option<f64>) -> (bool, i64, u64, i64, u64) {
         let p = j.spec.priority.unwrap_or(0);
-        let g = self.groups[&j.spec.group];
+        let g = if self.by_id {
+            j.spec.group
+        } else {
+            self.groups[&j.spec.group]
+        };
         if age.is_some_and(|a| self.now - j.since >= a) {
             (false, 0, 0, 0, j.seq)
         } else if self.group_first {
@@ -378,7 +402,8 @@ impl Shadow {
 /// of the engine, keeps its own bookkeeping and re-checks each placement as it is made:
 ///
 /// - **no over-commit**: the production admission rule held at the moment of each placement;
-/// - **hard constraints**: no job runs on a worker its class or avoid list excludes;
+/// - **hard constraints**: no job runs on a worker its class or avoid list excludes (a soft avoid
+///   list only while some live worker of the class is off it);
 /// - **escape hatch**: after a dispatch, no worker with a free slot is empty while a job that may
 ///   run there waits;
 /// - **priority** (priority policies): when B is placed on w, every more urgent waiting job was
@@ -393,6 +418,7 @@ fn run(kind: &Kind, speed: SpeedConfig, ops: &[Op]) -> Result<Vec<String>, TestC
         speed,
         age: kind.age(),
         group_first: kind.group_first(),
+        by_id: kind.by_id(),
         ..Shadow::default()
     };
     let mut log = Vec::new();
@@ -404,6 +430,7 @@ fn run(kind: &Kind, speed: SpeedConfig, ops: &[Op]) -> Result<Vec<String>, TestC
                 priority,
                 prefer,
                 avoid,
+                avoid_soft,
                 class,
                 work,
             } => {
@@ -413,6 +440,7 @@ fn run(kind: &Kind, speed: SpeedConfig, ops: &[Op]) -> Result<Vec<String>, TestC
                 spec.priority = priority;
                 spec.prefer = prefer.into_iter().collect();
                 spec.avoid = avoid.into_iter().collect();
+                spec.avoid_soft = avoid_soft;
                 spec.class = class.map(|c| format!("c{c}"));
                 spec.work = work.map(f64::from);
                 sh.submit(spec, &mut *p);
@@ -482,8 +510,16 @@ fn run(kind: &Kind, speed: SpeedConfig, ops: &[Op]) -> Result<Vec<String>, TestC
         let full = p.dispatch_full(sh.now);
         let out = full.start;
         let after = p.stats();
+        if std::env::var_os("SCHED_TRACE").is_some() {
+            eprintln!("op {op:?} -> {out:?} deferred {:?}", after.deferred);
+            for j in sh.waiting.keys() {
+                eprintln!("  {}", p.explain(*j).unwrap_or_default());
+            }
+        }
         let holders: BTreeSet<JobId> = after.last_dispatch_holders.iter().copied().collect();
         let deferred: BTreeSet<JobId> = after.deferred.iter().map(|d| d.0).collect();
+        let deferred_any: BTreeSet<JobId> = after.deferred_any.iter().copied().collect();
+        prop_assert!(deferred.is_subset(&deferred_any));
         // Deferral is only for jobs with work, within their waiting window, onto a full, faster
         // worker; and its expiry is a wakeup.
         for &(j, w, at) in &after.deferred {
@@ -537,7 +573,7 @@ fn run(kind: &Kind, speed: SpeedConfig, ops: &[Op]) -> Result<Vec<String>, TestC
                 let mine = sh.urgency(&job, kind.age());
                 for a in sh.waiting.values() {
                     if a.spec.id != j && sh.urgency(a, kind.age()) < mine {
-                        let refused = deferred.contains(&a.spec.id)
+                        let refused = deferred_any.contains(&a.spec.id)
                             || sh.gated(a, w, gate)
                             || !sh.eligible(&a.spec, w)
                             || !sh.admits(a.spec.demand.mem, w)

@@ -4,11 +4,11 @@ use std::path::PathBuf;
 
 use clap::Parser;
 use sched::{
-    Defer, SlowGate, SpeedConfig, SpeedPolicy,
+    Defer, Learn, SlowGate, SpeedConfig, SpeedPolicy,
     sim::{
         model::fit,
         trace::Trace,
-        whole::{Census, Fleet, Pin, Placement, Plan, WholeConfig, World, simulate},
+        whole::{Census, Fleet, GroupKey, Pin, Placement, Plan, WholeConfig, World, simulate},
     },
 };
 
@@ -52,8 +52,10 @@ struct Args {
     /// placement suffixes: "+fast" (fastest first), "+eft" (earliest finish, waiting up to
     /// --max-defer for a faster worker), "+eft0" (earliest finish, no waiting), "+gate" (slow-worker
     /// gate, with fastest first unless +eft is given), "+fastonly" (only the fast class), "+cpop"
-    /// (critical tasks pinned to the fast class). "grouprank[-oracle]": oldest bidegree first,
-    /// rank within.
+    /// (critical tasks pinned to the fast class), "+learn" (speeds learned online from completions,
+    /// every worker reporting 1), "+smajor"/"+tmajor"/"+stem" (bidegrees ordered by (s, t), (t, s)
+    /// or (t - s, s) instead of by arrival). "grouprank[-oracle]": oldest bidegree first, rank
+    /// within.
     #[arg(
         long,
         value_delimiter = ',',
@@ -87,6 +89,9 @@ struct Args {
     /// Expand every bidegree's walk at the start (instead of when its zero step is ready).
     #[arg(long)]
     eager: bool,
+    /// Override a class's single-job speed, as class=speed,... (e.g. "l40s=1.39").
+    #[arg(long, value_delimiter = ',')]
+    class_speed: Vec<String>,
     /// Make throughput exactly linear up to the slot count (as dslab's exclusive cores).
     #[arg(long)]
     linear_ps: bool,
@@ -137,6 +142,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             c.k_sat = usize::MAX;
             c.alpha = 1.0;
         }
+    }
+    for cs in &args.class_speed {
+        let (class, speed) = cs.split_once('=').expect("--class-speed class=speed");
+        model
+            .classes
+            .get_mut(class)
+            .unwrap_or_else(|| panic!("no class {class} in the model"))
+            .speed = speed.parse()?;
     }
     let census = Census::load(&args.census)?;
     eprintln!("[whole] census: {} rows", census.rows.len());
@@ -266,6 +279,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let plan = plan_named(parts.next().unwrap(), &args);
             let mut speed = SpeedConfig::default();
             let mut pin = Pin::None;
+            let mut group_key = GroupKey::Arrival;
             for part in parts {
                 match part {
                     "fast" => speed.policy = SpeedPolicy::FastestFirst,
@@ -285,6 +299,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             max_wait: args.max_defer,
                         });
                     }
+                    "learn" => speed.learn = Some(Learn::default()),
+                    "smajor" => group_key = GroupKey::SMajor,
+                    "tmajor" => group_key = GroupKey::TMajor,
+                    "stem" => group_key = GroupKey::StemMajor,
                     "fastonly" => pin = Pin::All,
                     "cpop" => pin = Pin::Critical,
                     other => panic!("unknown placement suffix +{other}"),
@@ -299,6 +317,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     eager: args.eager,
                     explicit: args.explicit,
                     max_open: args.max_open,
+                    group_key,
                 },
             )
         })
