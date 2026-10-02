@@ -114,7 +114,7 @@ fn greedy_starves_and_backfill_does_not() {
         horizon: 5_000.0,
     };
     assert_eq!(
-        run(&mut Greedy::new(GreedyConfig {}), &s),
+        run(&mut Greedy::new(GreedyConfig::default()), &s),
         None,
         "greedy should starve it"
     );

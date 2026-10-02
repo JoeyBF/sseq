@@ -4,8 +4,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use proptest::prelude::*;
 use sched::{
-    BackfillConfig, BestFit, BestFitConfig, Greedy, GreedyConfig, JobId, JobSpec, LaneSet, Lanes,
-    LanesConfig, Policy, PriorityBackfill, Resources, WorkerId, WorkerState,
+    BackfillConfig, BestFit, BestFitConfig, Defer, Greedy, GreedyConfig, JobId, JobSpec, LaneSet,
+    Lanes, LanesConfig, Policy, PriorityBackfill, Resources, SlowGate, SpeedConfig, SpeedPolicy,
+    WorkerId, WorkerState,
 };
 
 const LANE: WorkerId = 0;
@@ -29,16 +30,17 @@ enum Kind {
 
 impl Kind {
     /// The policy under test.
-    fn build(&self) -> Box<dyn Policy> {
+    fn build(&self, speed: SpeedConfig) -> Box<dyn Policy> {
         let bf = |max_res, per_class, age| BackfillConfig {
             reserve_after: 30.0,
             max_reservations: max_res,
             per_class_reservations: per_class,
             age_limit: age,
+            speed,
             ..BackfillConfig::default()
         };
         match *self {
-            Kind::Greedy => Box::new(Greedy::new(GreedyConfig {})),
+            Kind::Greedy => Box::new(Greedy::new(GreedyConfig { speed })),
             Kind::Backfill {
                 max_res,
                 per_class,
@@ -91,6 +93,7 @@ enum Op {
         prefer: Option<WorkerId>,
         avoid: Option<WorkerId>,
         class: Option<u8>,
+        work: Option<u32>,
     },
     Complete(usize),
     Cancel(usize),
@@ -116,14 +119,16 @@ fn op() -> impl Strategy<Value = Op> {
             prop::option::of(0u64..4),
             prop::option::weighted(0.2, 0u64..4),
             prop::option::weighted(0.15, 0u8..2),
+            prop::option::weighted(0.7, 1u32..120),
         )
-            .prop_map(|(demand, group, priority, prefer, avoid, class)| Op::Submit {
+            .prop_map(|(demand, group, priority, prefer, avoid, class, work)| Op::Submit {
                 demand,
                 group,
                 priority,
                 prefer,
                 avoid,
                 class,
+                work,
             }),
         4 => any::<prop::sample::Index>().prop_map(|i| Op::Complete(i.index(1 << 16))),
         1 => any::<prop::sample::Index>().prop_map(|i| Op::Cancel(i.index(1 << 16))),
@@ -133,6 +138,37 @@ fn op() -> impl Strategy<Value = Op> {
         1 => (0u64..4).prop_map(Op::Gone),
         3 => (0u32..90).prop_map(Op::Tick),
     ]
+}
+
+/// Speed of a worker class in the tests: class 1 is the fast class.
+fn class_speed(class: u8) -> f64 {
+    if class == 1 { 2.5 } else { 1.0 }
+}
+
+/// A random speed configuration.
+fn speed() -> impl Strategy<Value = SpeedConfig> {
+    let policy =
+        prop_oneof![
+            Just(SpeedPolicy::Oblivious),
+            Just(SpeedPolicy::FastestFirst),
+            Just(SpeedPolicy::EarliestFinish(None)),
+            (
+                prop_oneof![Just(0.0), Just(0.2)],
+                prop_oneof![Just(40.0), Just(500.0)]
+            )
+                .prop_map(|(min_gain, max_wait)| SpeedPolicy::EarliestFinish(Some(
+                    Defer { max_wait, min_gain }
+                ))),
+        ];
+    let gate = prop::option::weighted(
+        0.4,
+        (
+            prop_oneof![Just(0.5), Just(1.0)],
+            prop_oneof![Just(50.0), Just(1e9)],
+        )
+            .prop_map(|(factor, max_wait)| SlowGate { factor, max_wait }),
+    );
+    (policy, gate).prop_map(|(policy, slow_gate)| SpeedConfig { policy, slow_gate })
 }
 
 /// A random policy configuration.
@@ -169,9 +205,66 @@ struct Shadow {
     groups: BTreeMap<u64, u64>,
     seq: u64,
     next_id: JobId,
+    speed: SpeedConfig,
+    age: Option<f64>,
+}
+
+/// The slow-worker gate's fleet view, recomputed independently of the engine.
+#[derive(Clone, Copy, Debug)]
+struct Gate {
+    fast_speed: f64,
+    fast_slots: usize,
+    backlog: usize,
 }
 
 impl Shadow {
+    /// The live workers of the fastest speed.
+    fn fast(&self) -> (f64, Vec<WorkerId>) {
+        let live = || self.workers.values().filter(|w| w.slots > 0);
+        let top = live().map(|w| w.speed).fold(0.0, f64::max);
+        (
+            top,
+            live().filter(|w| w.speed >= top).map(|w| w.id).collect(),
+        )
+    }
+
+    /// The gate's view now, if a gate is configured and some live worker is slower.
+    fn gate(&self) -> Option<Gate> {
+        self.speed.slow_gate?;
+        let (top, fast) = self.fast();
+        if !self.workers.values().any(|w| w.slots > 0 && w.speed < top) {
+            return None;
+        }
+        Some(Gate {
+            fast_speed: top,
+            fast_slots: fast.iter().map(|w| self.workers[w].slots).sum(),
+            backlog: self
+                .waiting
+                .values()
+                .filter(|j| self.fast_eligible(&j.spec))
+                .count(),
+        })
+    }
+
+    /// Whether a job may run on some fast worker.
+    fn fast_eligible(&self, spec: &JobSpec) -> bool {
+        self.fast().1.iter().any(|&w| self.eligible(spec, w))
+    }
+
+    /// Whether the gate keeps `j` off `w` (holders are handled by the caller).
+    fn gated(&self, j: &SJob, w: WorkerId, g: Option<Gate>) -> bool {
+        let (Some(g), Some(cfg)) = (g, self.speed.slow_gate) else {
+            return false;
+        };
+        let speed = self.workers[&w].speed;
+        speed < g.fast_speed
+            && g.fast_slots > 0
+            && !self.age.is_some_and(|a| self.now - j.since >= a)
+            && self.now - j.since < cfg.max_wait
+            && self.fast_eligible(&j.spec)
+            && (g.backlog as f64) / (g.fast_slots as f64) < cfg.factor * g.fast_speed / speed
+    }
+
     /// Running count and placed demand on a worker.
     fn load(&self, w: WorkerId) -> (usize, u64) {
         self.running
@@ -256,9 +349,13 @@ impl Shadow {
 /// - **bookkeeping**: running counts, placed demand and reservations agree with the shadow after
 ///   every event, and everything is released at the end;
 /// - **determinism**: replaying the stream gives identical placements and explanations.
-fn run(kind: &Kind, ops: &[Op]) -> Result<Vec<String>, TestCaseError> {
-    let mut p = kind.build();
-    let mut sh = Shadow::default();
+fn run(kind: &Kind, speed: SpeedConfig, ops: &[Op]) -> Result<Vec<String>, TestCaseError> {
+    let mut p = kind.build(speed);
+    let mut sh = Shadow {
+        speed,
+        age: kind.age(),
+        ..Shadow::default()
+    };
     let mut log = Vec::new();
     for op in ops {
         match *op {
@@ -269,6 +366,7 @@ fn run(kind: &Kind, ops: &[Op]) -> Result<Vec<String>, TestCaseError> {
                 prefer,
                 avoid,
                 class,
+                work,
             } => {
                 let id = sh.next_id;
                 sh.next_id += 1;
@@ -277,6 +375,7 @@ fn run(kind: &Kind, ops: &[Op]) -> Result<Vec<String>, TestCaseError> {
                 spec.prefer = prefer.into_iter().collect();
                 spec.avoid = avoid.into_iter().collect();
                 spec.class = class.map(|c| format!("c{c}"));
+                spec.work = work.map(f64::from);
                 sh.submit(spec, &mut *p);
             }
             Op::Complete(i) => {
@@ -311,6 +410,7 @@ fn run(kind: &Kind, ops: &[Op]) -> Result<Vec<String>, TestCaseError> {
                 let s = WorkerState {
                     reported_used: Resources::mem(used),
                     reported_baseline: Resources::mem(baseline),
+                    speed: class_speed(class),
                     ..WorkerState::new(id, format!("c{class}"), slots, Resources::mem(budget))
                 };
                 sh.workers.insert(id, s.clone());
@@ -339,9 +439,34 @@ fn run(kind: &Kind, ops: &[Op]) -> Result<Vec<String>, TestCaseError> {
         }
 
         let before = p.stats();
+        let mut gate = sh.gate();
         let out = p.dispatch(sh.now);
         let after = p.stats();
         let holders: BTreeSet<JobId> = after.last_dispatch_holders.iter().copied().collect();
+        let deferred: BTreeSet<JobId> = after.deferred.iter().map(|d| d.0).collect();
+        // Deferral is only for jobs with work, within their waiting window, onto a full, faster
+        // worker; and its expiry is a wakeup.
+        for &(j, w, at) in &after.deferred {
+            let job = &sh.waiting[&j];
+            let SpeedPolicy::EarliestFinish(Some(d)) = speed.policy else {
+                prop_assert!(false, "deferral without a Defer config");
+                unreachable!()
+            };
+            prop_assert!(job.spec.work.is_some() && sh.now - job.since < d.max_wait);
+            prop_assert!(
+                !kind.age().is_some_and(|a| sh.now - job.since >= a),
+                "aged job deferred"
+            );
+            prop_assert!(at >= sh.now);
+            prop_assert!(sh.workers.contains_key(&w));
+            prop_assert!(
+                p.next_wakeup()
+                    .is_some_and(|t| t > sh.now && t <= job.since + d.max_wait)
+            );
+        }
+        if let Some(t) = p.next_wakeup() {
+            prop_assert!(t > sh.now, "wakeup {} not in the future", t);
+        }
         for &(j, w) in &out {
             let job = sh.waiting.get(&j).cloned();
             prop_assert!(job.is_some(), "placed job {j} is not waiting");
@@ -362,13 +487,19 @@ fn run(kind: &Kind, ops: &[Op]) -> Result<Vec<String>, TestCaseError> {
                     "lane reserve broken"
                 );
             }
+            prop_assert!(
+                holders.contains(&j) || !sh.gated(&job, w, gate),
+                "{kind:?} {speed:?}: job {j} passed the slow-worker gate on {w}"
+            );
             // Priority: every more urgent waiting job is refused here (unless this is a holder
             // taking its own reserved worker, which nobody else could take).
             if kind.priority() && !holders.contains(&j) {
                 let mine = sh.urgency(&job, kind.age());
                 for a in sh.waiting.values() {
                     if a.spec.id != j && sh.urgency(a, kind.age()) < mine {
-                        let refused = !sh.eligible(&a.spec, w)
+                        let refused = deferred.contains(&a.spec.id)
+                            || sh.gated(a, w, gate)
+                            || !sh.eligible(&a.spec, w)
                             || !sh.admits(a.spec.demand.mem, w)
                             || (matches!(kind, Kind::Lanes)
                                 && sh.lane_refuses(a.spec.demand.mem, w));
@@ -381,13 +512,28 @@ fn run(kind: &Kind, ops: &[Op]) -> Result<Vec<String>, TestCaseError> {
                     }
                 }
             }
+            if let Some(g) = gate.as_mut()
+                && sh.fast_eligible(&job.spec)
+            {
+                g.backlog = g.backlog.saturating_sub(1);
+            }
             sh.waiting.remove(&j);
             sh.running.insert(j, (w, job.spec.demand.mem));
         }
-        // Escape hatch: an empty worker with a free slot leaves no job waiting that may run there.
+        // Escape hatch: an empty worker with a free slot leaves no job waiting that may run there,
+        // except one waiting for a faster worker by choice, or held back by the slow gate.
+        let held: BTreeMap<JobId, WorkerId> = after
+            .reservations
+            .iter()
+            .map(|r| (r.job, r.worker))
+            .collect();
         for (&w, s) in &sh.workers {
             if s.slots > 0 && sh.load(w).0 == 0 {
-                let stuck = sh.waiting.values().find(|j| sh.eligible(&j.spec, w));
+                let stuck = sh.waiting.values().find(|j| {
+                    sh.eligible(&j.spec, w)
+                        && !deferred.contains(&j.spec.id)
+                        && (held.get(&j.spec.id) == Some(&w) || !sh.gated(j, w, gate))
+                });
                 prop_assert!(
                     stuck.is_none(),
                     "{kind:?}: worker {w} empty while job {:?} waits",
@@ -425,7 +571,11 @@ fn run(kind: &Kind, ops: &[Op]) -> Result<Vec<String>, TestCaseError> {
             "too many reservations: {per:?}"
         );
         prop_assert!(before.placements_total + out.len() as u64 == after.placements_total);
-        log.push(format!("{out:?}"));
+        log.push(format!(
+            "{out:?} {:?} {:?}",
+            after.deferred,
+            p.next_wakeup()
+        ));
         for id in 0..sh.next_id {
             log.push(p.explain(id).unwrap_or_default());
         }
@@ -453,9 +603,9 @@ proptest! {
 
     /// Every invariant holds on random streams, and replays are identical.
     #[test]
-    fn invariants_hold(kind in kind(), ops in prop::collection::vec(op(), 1..160)) {
-        let first = run(&kind, &ops)?;
-        let second = run(&kind, &ops)?;
+    fn invariants_hold(kind in kind(), speed in speed(), ops in prop::collection::vec(op(), 1..160)) {
+        let first = run(&kind, speed, &ops)?;
+        let second = run(&kind, speed, &ops)?;
         prop_assert_eq!(first, second, "not deterministic");
     }
 }

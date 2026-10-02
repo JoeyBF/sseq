@@ -3,10 +3,13 @@
 use std::path::PathBuf;
 
 use clap::Parser;
-use sched::sim::{
-    model::fit,
-    trace::Trace,
-    whole::{Census, Fleet, Plan, WholeConfig, World, simulate},
+use sched::{
+    Defer, SlowGate, SpeedConfig, SpeedPolicy,
+    sim::{
+        model::fit,
+        trace::Trace,
+        whole::{Census, Fleet, Plan, WholeConfig, World, simulate},
+    },
 };
 
 /// Whole-run simulation of a Nassau resolution.
@@ -45,8 +48,10 @@ struct Args {
     /// Aging for the rank plans, seconds.
     #[arg(long, default_value_t = 3600.0)]
     age_limit: f64,
-    /// Plans: today, group, rank, rank-oracle, rank-noage, rank-oracle-noage; append "+fast" for
-    /// speed-aware placement.
+    /// Plans: today, group, rank, rank-oracle, rank-noage, rank-oracle-noage, each with optional
+    /// placement suffixes: "+fast" (fastest first), "+eft" (earliest finish, waiting up to
+    /// --max-defer for a faster worker), "+eft0" (earliest finish, no waiting), "+gate" (slow-worker
+    /// gate, with fastest first unless +eft is given).
     #[arg(
         long,
         value_delimiter = ',',
@@ -56,6 +61,15 @@ struct Args {
     /// Smallest task work (H200-seconds).
     #[arg(long, default_value_t = 0.05)]
     min_work: f64,
+    /// Longest voluntary wait for a faster worker (+eft) or behind the slow gate (+gate), seconds.
+    #[arg(long, default_value_t = 3600.0)]
+    max_defer: f64,
+    /// +eft: wait only if the expected finish improves by this fraction of the job's work.
+    #[arg(long, default_value_t = 0.0)]
+    min_gain: f64,
+    /// +gate: the slow-worker gate's factor.
+    #[arg(long, default_value_t = 1.0)]
+    gate_factor: f64,
     /// Write results as JSON here.
     #[arg(long)]
     json: Option<PathBuf>,
@@ -199,14 +213,36 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         hours(cap)
     );
 
-    let plans: Vec<(Plan, bool)> = args
+    let plans: Vec<(Plan, SpeedConfig)> = args
         .plans
         .iter()
         .map(|p| {
-            let (p, fast) = p
-                .strip_suffix("+fast")
-                .map_or((p.as_str(), false), |q| (q, true));
-            (plan_named(p, &args), fast)
+            let mut parts = p.split('+');
+            let plan = plan_named(parts.next().unwrap(), &args);
+            let mut speed = SpeedConfig::default();
+            for part in parts {
+                match part {
+                    "fast" => speed.policy = SpeedPolicy::FastestFirst,
+                    "eft" => {
+                        speed.policy = SpeedPolicy::EarliestFinish(Some(Defer {
+                            max_wait: args.max_defer,
+                            min_gain: args.min_gain,
+                        }))
+                    }
+                    "eft0" => speed.policy = SpeedPolicy::EarliestFinish(None),
+                    "gate" => {
+                        if speed.policy == SpeedPolicy::Oblivious {
+                            speed.policy = SpeedPolicy::FastestFirst;
+                        }
+                        speed.slow_gate = Some(SlowGate {
+                            factor: args.gate_factor,
+                            max_wait: args.max_defer,
+                        });
+                    }
+                    other => panic!("unknown placement suffix +{other}"),
+                }
+            }
+            (plan, speed)
         })
         .collect();
     let results: Vec<_> = std::thread::scope(|s| {

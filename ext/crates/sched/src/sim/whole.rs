@@ -16,8 +16,8 @@ use super::{
     trace::Trace,
 };
 use crate::{
-    BackfillConfig, Dag, DagConfig, DagJob, DagScheduler, DagTemplate, JobId, JobSpec,
-    PriorityBackfill, Resources, WorkerState,
+    BackfillConfig, Dag, DagConfig, DagJob, DagScheduler, DagTemplate, JobId, JobSpec, Policy,
+    PriorityBackfill, Resources, SpeedConfig, SpeedPolicy, WorkerState,
 };
 
 /// One census row (`ext::nassau` per-bidegree counters).
@@ -886,6 +886,8 @@ pub struct WholeMetrics {
 enum Ev {
     Release(JobId),
     Done(usize, u64),
+    /// The policy asked to be dispatched again ([`Policy::next_wakeup`]).
+    Wake,
 }
 
 /// A heap entry (earliest first).
@@ -923,15 +925,14 @@ struct Wk {
     busy: f64,
 }
 
-/// Simulate the whole run under `plan` on `fleet`. With `fast_first`, every job prefers the
-/// fastest class's workers (the slower ones take the overflow): speed-aware placement, the
-/// "earliest finish" half of HEFT in its simplest form.
+/// Simulate the whole run under `plan` on `fleet`, placing with `speed` (each worker's
+/// [`WorkerState::speed`] is its class's single-job throughput).
 pub fn simulate(
     world: &World,
     fleet: &Fleet,
     model: &dyn ServiceModel,
     plan: &Plan,
-    fast_first: bool,
+    speed: SpeedConfig,
 ) -> WholeMetrics {
     let clock = std::time::Instant::now();
     let (rank, oracle, age_limit) = match plan {
@@ -944,6 +945,7 @@ pub fn simulate(
     };
     let policy = PriorityBackfill::new(BackfillConfig {
         age_limit,
+        speed,
         ..BackfillConfig::default()
     });
     let mut dag = DagScheduler::new(
@@ -962,7 +964,10 @@ pub fn simulate(
         for _ in 0..*count {
             let id = workers.len() as u64;
             dag.worker_update(
-                WorkerState::new(id, class.clone(), *slots, Resources::mem(1 << 60)),
+                WorkerState {
+                    speed: model.throughput(class, 1),
+                    ..WorkerState::new(id, class.clone(), *slots, Resources::mem(1 << 60))
+                },
                 0.0,
             );
             workers.push(Wk {
@@ -975,22 +980,7 @@ pub fn simulate(
         }
     }
     let slots_total: usize = fleet.groups.iter().map(|g| g.1 * g.2).sum();
-    let fastest = workers
-        .iter()
-        .map(|w| model.throughput(&w.class, 1))
-        .fold(0.0, f64::max);
-    let fast: Vec<u64> = if fast_first {
-        (0..workers.len() as u64)
-            .filter(|&i| model.throughput(&workers[i as usize].class, 1) >= fastest)
-            .collect()
-    } else {
-        Vec::new()
-    };
-    let spec = |id: JobId, k: usize| {
-        let mut j = JobSpec::new(id, Resources::ZERO, k as u64);
-        j.prefer = fast.clone();
-        j
-    };
+    let spec = |id: JobId, k: usize| JobSpec::new(id, Resources::ZERO, k as u64);
 
     // The bidegree level, declared up front: zero steps and "registered" passthroughs. Each
     // "registered" node also waits for its walk (a forward reference, declared when the bidegree
@@ -1036,6 +1026,7 @@ pub fn simulate(
     let mut dispatch_us = Vec::new();
     let mut peak_nodes = 0usize;
     let mut next_sample = 0u64;
+    let mut wake_at = f64::NAN;
     let mut now = 0.0;
 
     // Declare bidegree k's walk: its signature template, then "walk done" after the sinks.
@@ -1138,6 +1129,13 @@ pub fn simulate(
                 push(&mut heap, t, ev)
             });
         }
+        // Voluntary waits (deferral, slow gate) expire without an event: wake the policy then.
+        if let Some(t) = dag.policy().next_wakeup()
+            && t != wake_at
+        {
+            wake_at = t;
+            push(&mut heap, t, Ev::Wake);
+        }
         if tasks >= next_sample {
             next_sample = tasks + 65_536;
             let s = dag.dag_stats();
@@ -1153,6 +1151,7 @@ pub fn simulate(
             Ev::Release(id) => {
                 dag.release(id, now);
             }
+            Ev::Wake => {}
             Ev::Done(w, v) => {
                 if v != workers[w].version {
                     continue;
@@ -1201,7 +1200,7 @@ pub fn simulate(
     let makespan = now;
     let busy: f64 = workers.iter().map(|w| w.busy).sum();
     WholeMetrics {
-        plan: plan.name() + if fast_first { ", fast first" } else { "" },
+        plan: plan.name() + &speed_name(&speed),
         makespan_h: makespan / 3600.0,
         tasks,
         slot_util: busy / (slots_total as f64 * makespan).max(1e-9),
@@ -1211,6 +1210,22 @@ pub fn simulate(
         dispatch_us: Quantiles::of(dispatch_us),
         sim_s: clock.elapsed().as_secs_f64(),
     }
+}
+
+/// A plan-name suffix describing speed-aware placement.
+pub fn speed_name(speed: &SpeedConfig) -> String {
+    let mut s = match speed.policy {
+        SpeedPolicy::Oblivious => String::new(),
+        SpeedPolicy::FastestFirst => ", fast first".into(),
+        SpeedPolicy::EarliestFinish(None) => ", earliest finish".into(),
+        SpeedPolicy::EarliestFinish(Some(d)) => {
+            format!(", earliest finish (wait <= {:.0}s)", d.max_wait)
+        }
+    };
+    if let Some(g) = speed.slow_gate {
+        s += &format!(", slow gate x{} (<= {:.0}s)", g.factor, g.max_wait);
+    }
+    s
 }
 
 /// Progress a worker's running tasks to `now` at their processor-sharing rate.
@@ -1377,7 +1392,7 @@ mod tests {
         ];
         let results: Vec<WholeMetrics> = plans
             .iter()
-            .map(|p| simulate(&world, &fleet, &model, p, false))
+            .map(|p| simulate(&world, &fleet, &model, p, SpeedConfig::default()))
             .collect();
         let expected = world.summary().signature_tasks + world.bideg.len() as u64;
         for m in &results {

@@ -599,6 +599,10 @@ impl<P: Policy> DagScheduler<P> {
             .spec
             .clone()
             .expect("submitting an undeclared job");
+        if spec.work.is_none() {
+            // The DAG layer's estimate feeds speed-aware placement (earliest finish).
+            spec.work = Some(self.graph[n].work);
+        }
         if self.config.rank_priority && spec.priority.is_none() {
             let rank = self.graph[n].rank + self.group_tail(spec.group);
             let p = -(rank * self.config.rank_scale).round();

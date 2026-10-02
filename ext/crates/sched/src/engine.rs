@@ -10,9 +10,61 @@ use crate::{
     Resources, WorkerId, WorkerLoad, WorkerState, WorkerView,
 };
 
-/// Configuration for [`Greedy`]. It has no parameters.
+/// Configuration for [`Greedy`].
 #[derive(Clone, Debug, Default)]
-pub struct GreedyConfig {}
+pub struct GreedyConfig {
+    /// Speed-aware placement. Default: oblivious (the historical behaviour).
+    pub speed: SpeedConfig,
+}
+
+/// How worker speed ([`WorkerState::speed`]) enters placement.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub enum SpeedPolicy {
+    /// Speed is ignored (the default).
+    #[default]
+    Oblivious,
+    /// Among the workers that admit a job, the fastest first; load and fit break ties within a
+    /// speed. On a span-bound run this is the single largest placement lever.
+    FastestFirst,
+    /// Earliest expected finish: like `FastestFirst` among workers free now, and, with
+    /// [`Defer`], a job with [`JobSpec::work`] may wait for a busy faster worker whose slot is
+    /// expected to free soon enough that it would still finish earlier there (HEFT's processor
+    /// choice, online; StarPU's dmda with a deferral window).
+    EarliestFinish(Option<Defer>),
+}
+
+/// When a job may wait for a faster, busy worker instead of starting on a slower free one.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Defer {
+    /// A job that has waited this long (seconds) no longer defers. Bounds the extra waiting;
+    /// expiry is reported by [`Policy::next_wakeup`](crate::Policy::next_wakeup).
+    pub max_wait: f64,
+    /// Defer only if the expected finish improves by at least this fraction of the job's work.
+    pub min_gain: f64,
+}
+
+/// HeteroPrio's slow-worker gate: a worker slower than the fastest class takes a job only while
+/// the backlog per fast slot is at least `factor * fast_speed / its_speed` -- that is, only when
+/// waiting for a fast slot would take longer than running slowly. Jobs that cannot run on the
+/// fast class, reservation holders, aged jobs, and jobs that have waited `max_wait` are exempt,
+/// which bounds the extra wait. The gate is the one rule that leaves an empty worker idle while
+/// jobs wait (deliberately: those jobs are expected to finish sooner on the fast class).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SlowGate {
+    /// Scale of the backlog threshold; 1 reproduces StarPU's automatic slow factor.
+    pub factor: f64,
+    /// A job that has waited this long (seconds) is no longer gated.
+    pub max_wait: f64,
+}
+
+/// Speed-aware placement settings, shared by every policy.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct SpeedConfig {
+    /// How speed orders the candidate workers.
+    pub policy: SpeedPolicy,
+    /// Keep slow workers idle while the fast class can absorb the backlog.
+    pub slow_gate: Option<SlowGate>,
+}
 
 /// Configuration for [`PriorityBackfill`] (and the backfill part of [`BestFit`] and [`Lanes`]).
 #[derive(Clone, Debug)]
@@ -34,6 +86,8 @@ pub struct BackfillConfig {
     /// but with arbitrary priorities (e.g. DAG ranks) it is not, and this bounds it. Default
     /// `None` (strict priority).
     pub age_limit: Option<f64>,
+    /// Speed-aware placement. Default: oblivious.
+    pub speed: SpeedConfig,
 }
 
 impl Default for BackfillConfig {
@@ -45,6 +99,7 @@ impl Default for BackfillConfig {
             per_class_reservations: false,
             default_priority: 0,
             age_limit: None,
+            speed: SpeedConfig::default(),
         }
     }
 }
@@ -109,6 +164,7 @@ struct Mode {
     age_limit: Option<f64>,
     choice: Choice,
     lanes: Option<LanesConfig>,
+    speed: SpeedConfig,
 }
 
 /// Urgency: smaller is more urgent.
@@ -152,6 +208,44 @@ struct Waiting {
 struct Running {
     worker: WorkerId,
     demand: Resources,
+    started: Instant,
+    work: Option<f64>,
+}
+
+/// The slow-worker gate's view of the fleet during one `dispatch`.
+#[derive(Clone, Copy, Debug)]
+struct GateState {
+    fast_speed: f64,
+    fast_slots: usize,
+    /// Waiting jobs that could run on the fast class.
+    backlog: usize,
+}
+
+/// Projected slot free times of busy workers during one `dispatch` (for deferral): per worker,
+/// the expected end of each running or deferred job, smallest first.
+type Projection = HashMap<WorkerId, Vec<f64>>;
+
+/// What `choose` decided for a job.
+enum Pick {
+    Place(WorkerId),
+    /// Wait for this worker, expected to start there at this time.
+    Defer(WorkerId, f64),
+    Nothing,
+}
+
+/// A float as a totally ordered integer key (for score tuples).
+fn ordered(x: f64) -> i64 {
+    let b = x.to_bits() as i64;
+    b ^ (((b >> 63) as u64) >> 1) as i64
+}
+
+/// A worker's speed, guarded against nonsense.
+fn speed_of(w: &Worker) -> f64 {
+    if w.state.speed > 0.0 && w.state.speed.is_finite() {
+        w.state.speed
+    } else {
+        1.0
+    }
 }
 
 /// Whether `job`'s hard constraints (class, avoid list) allow `w` at all.
@@ -169,6 +263,7 @@ enum Cursor {
 /// Why a worker does not take a job, for `explain`.
 enum Refusal {
     Ineligible,
+    SlowGate,
     ReservedFor(JobId),
     Lane,
     Admission,
@@ -206,6 +301,10 @@ struct Engine<A> {
     placements_total: u64,
     reservations_total: u64,
     last_dispatch_holders: Vec<JobId>,
+    /// Jobs the last dispatch deferred: (job, worker, expected start).
+    deferred: Vec<(JobId, WorkerId, Instant)>,
+    /// When the last dispatch's voluntary waits expire.
+    wakeup: Option<Instant>,
 }
 
 impl<A: Admission> Engine<A> {
@@ -226,6 +325,8 @@ impl<A: Admission> Engine<A> {
             placements_total: 0,
             reservations_total: 0,
             last_dispatch_holders: Vec::new(),
+            deferred: Vec::new(),
+            wakeup: None,
         }
     }
 
@@ -381,9 +482,14 @@ impl<A: Admission> Engine<A> {
 
     /// Whether `w` takes the job, or why not. Reservations and lanes are checked here; everything
     /// else is the admission rule.
-    fn refusal(&self, job: &Waiting, w: &Worker) -> Option<Refusal> {
+    fn refusal(&self, job: &Waiting, w: &Worker, gate: Option<&GateState>) -> Option<Refusal> {
         if !eligible(&job.spec, w) {
             return Some(Refusal::Ineligible);
+        }
+        if let Some(g) = gate
+            && self.gated(job, w, g)
+        {
+            return Some(Refusal::SlowGate);
         }
         if let Some(holder) = w.reserved_for
             && holder != job.spec.id
@@ -403,6 +509,49 @@ impl<A: Admission> Engine<A> {
             return Some(Refusal::Lane);
         }
         None
+    }
+
+    /// The gate's fleet view now, or `None` when there is no gate or no slower worker.
+    fn gate_state(&self) -> Option<GateState> {
+        self.mode.speed.slow_gate?;
+        let live = || self.workers.values().filter(|w| w.state.slots > 0);
+        let fast_speed = live().map(speed_of).fold(0.0, f64::max);
+        if !live().any(|w| speed_of(w) < fast_speed) {
+            return None;
+        }
+        let fast: Vec<&Worker> = live().filter(|w| speed_of(w) >= fast_speed).collect();
+        let fast_slots = fast.iter().map(|w| w.state.slots).sum();
+        let backlog = self
+            .waiting
+            .values()
+            .filter(|j| fast.iter().any(|w| eligible(&j.spec, w)))
+            .count();
+        Some(GateState {
+            fast_speed,
+            fast_slots,
+            backlog,
+        })
+    }
+
+    /// Whether the slow-worker gate keeps `job` off `w`.
+    fn gated(&self, job: &Waiting, w: &Worker, g: &GateState) -> bool {
+        let Some(cfg) = self.mode.speed.slow_gate else {
+            return false;
+        };
+        let speed = speed_of(w);
+        if speed >= g.fast_speed
+            || g.fast_slots == 0
+            || job.reserved == Some(w.state.id)
+            || self.aged(job)
+            || self.now - job.since >= cfg.max_wait
+            || !self
+                .workers
+                .values()
+                .any(|f| f.state.slots > 0 && speed_of(f) >= g.fast_speed && eligible(&job.spec, f))
+        {
+            return false;
+        }
+        (g.backlog as f64) / (g.fast_slots as f64) < cfg.factor * g.fast_speed / speed
     }
 
     /// Whether `job` has waited past the age limit.
@@ -442,18 +591,55 @@ impl<A: Admission> Engine<A> {
         }
     }
 
-    /// The best worker that takes `job`, if any.
-    fn choose(&self, job: &Waiting) -> Option<WorkerId> {
+    /// When a busy worker's next slot is expected to free: the earliest projected end, or `None`
+    /// if a running job's end is unknown on every slot.
+    fn next_free(&self, w: &Worker, proj: &mut Projection) -> Option<f64> {
+        let now = self.now;
+        let ends = proj.entry(w.state.id).or_insert_with(|| {
+            let speed = speed_of(w);
+            let mut ends: Vec<f64> = w
+                .jobs
+                .iter()
+                .map(|j| {
+                    let r = &self.running[j];
+                    match r.work {
+                        Some(work) => {
+                            let end = r.started + work / speed;
+                            // An overrunning job: assume it is half done (StarPU's rule).
+                            if end > now {
+                                end
+                            } else {
+                                now + (now - r.started).max(0.0)
+                            }
+                        }
+                        None => f64::INFINITY,
+                    }
+                })
+                .collect();
+            ends.sort_by(f64::total_cmp);
+            ends
+        });
+        ends.first().copied().filter(|e| e.is_finite())
+    }
+
+    /// The best worker that takes `job`, or a busy faster worker to wait for, if any.
+    fn choose(&self, job: &Waiting, gate: Option<&GateState>, proj: &mut Projection) -> Pick {
         let big = self.is_big(&job.spec.demand);
         let demand = job.spec.demand.mem as i128;
+        let speed_first = self.mode.speed.policy != SpeedPolicy::Oblivious;
         // Smallest tuple wins; the worker id makes the order total (determinism).
-        let mut best: Option<((u8, i128, bool, usize), WorkerId)> = None;
+        let mut best: Option<((u8, i64, i128, bool, usize), WorkerId)> = None;
         for (&id, w) in &self.workers {
-            if self.refusal(job, w).is_some() {
+            if self.refusal(job, w, gate).is_some() {
                 continue;
             }
             let preferred = job.spec.prefer.contains(&id);
             let lane_rank = u8::from(big && !w.lane);
+            let speed_key = if speed_first {
+                ordered(-speed_of(w))
+            } else {
+                0
+            };
             let fit = match self.mode.choice {
                 Choice::LeastLoaded => 0,
                 Choice::Tightest { prefer_penalty } => {
@@ -461,12 +647,61 @@ impl<A: Admission> Engine<A> {
                     after - if preferred { prefer_penalty as i128 } else { 0 }
                 }
             };
-            let score = (lane_rank, fit, !preferred, w.running);
+            let score = (lane_rank, speed_key, fit, !preferred, w.running);
             if best.as_ref().is_none_or(|(b, _)| score < *b) {
                 best = Some((score, id));
             }
         }
-        best.map(|(_, id)| id)
+        let Some((_, place)) = best else {
+            return Pick::Nothing;
+        };
+        if let SpeedPolicy::EarliestFinish(Some(defer)) = self.mode.speed.policy
+            && let Some(work) = job.spec.work
+            && job.reserved.is_none()
+            && !self.aged(job)
+            && self.now - job.since < defer.max_wait
+        {
+            let here = self.now + work / speed_of(&self.workers[&place]);
+            let mut wait: Option<(f64, WorkerId)> = None;
+            for (&id, w) in &self.workers {
+                // Only workers that refuse for want of a slot, and would admit with one free.
+                if speed_of(w) <= speed_of(&self.workers[&place])
+                    || w.running < w.state.slots
+                    || !eligible(&job.spec, w)
+                    || w.reserved_for.is_some_and(|h| h != job.spec.id)
+                {
+                    continue;
+                }
+                let view = WorkerView {
+                    running: w.state.slots.saturating_sub(1),
+                    ..w.view()
+                };
+                if w.state.slots == 0 || !self.admission.admits(&job.spec.demand, &view) {
+                    continue;
+                }
+                let Some(start) = self.next_free(w, proj) else {
+                    continue;
+                };
+                let eft = start.max(self.now) + work / speed_of(w);
+                if wait.is_none_or(|(e, _)| eft < e) {
+                    wait = Some((eft, id));
+                }
+            }
+            if let Some((eft, id)) = wait
+                && eft < here - defer.min_gain * work
+            {
+                // Book the slot so that later deferrals in this scan see it taken.
+                let w = &self.workers[&id];
+                let start = self.next_free(w, proj).unwrap();
+                let ends = proj.get_mut(&id).unwrap();
+                ends.remove(0);
+                let end = start.max(self.now) + work / speed_of(w);
+                let at = ends.partition_point(|&e| e < end);
+                ends.insert(at, end);
+                return Pick::Defer(id, start.max(self.now));
+            }
+        }
+        Pick::Place(place)
     }
 
     /// Move a waiting job onto a worker and record the placement.
@@ -489,6 +724,8 @@ impl<A: Admission> Engine<A> {
             Running {
                 worker,
                 demand: j.spec.demand,
+                started: self.now,
+                work: j.spec.work,
             },
         );
         self.placements_total += 1;
@@ -531,8 +768,10 @@ impl<A: Admission> Engine<A> {
                 .count();
             n >= cfg.max_reservations
         };
-        // Most headroom; then preferred; then fewest running; then smallest id.
-        let mut best: Option<((i64, bool, usize), WorkerId)> = None;
+        // Most headroom; then fastest (when speed-aware); then preferred; then fewest running;
+        // then smallest id.
+        let speed_first = self.mode.speed.policy != SpeedPolicy::Oblivious;
+        let mut best: Option<((i64, i64, bool, usize), WorkerId)> = None;
         for (&id, w) in &self.workers {
             if w.reserved_for.is_some()
                 || w.state.slots == 0
@@ -543,6 +782,11 @@ impl<A: Admission> Engine<A> {
             }
             let score = (
                 -w.view().headroom(),
+                if speed_first {
+                    ordered(-speed_of(w))
+                } else {
+                    0
+                },
                 !j.spec.prefer.contains(&id),
                 w.running,
             );
@@ -597,10 +841,43 @@ impl<A: Admission> Engine<A> {
         acc
     }
 
+    /// Dispatch bookkeeping for a job about to be placed: it leaves the gate's backlog and stops
+    /// waiting voluntarily.
+    fn placing(
+        &mut self,
+        job: JobId,
+        gate: &mut Option<GateState>,
+        timed: &mut BTreeMap<JobId, Instant>,
+    ) {
+        if let Some(g) = gate.as_mut()
+            && self.workers.values().any(|f| {
+                f.state.slots > 0
+                    && speed_of(f) >= g.fast_speed
+                    && eligible(&self.waiting[&job].spec, f)
+            })
+        {
+            g.backlog = g.backlog.saturating_sub(1);
+        }
+        self.deferred.retain(|d| d.0 != job);
+        timed.remove(&job);
+    }
+
+    /// Record a voluntary-wait deadline for `job`, keeping the earliest.
+    fn earliest(timed: &mut BTreeMap<JobId, Instant>, job: JobId, at: Instant) {
+        let t = timed.entry(job).or_insert(at);
+        *t = t.min(at);
+    }
+
     /// Scan waiting jobs in order, placing each where it is admitted, reserving for the starving.
     fn dispatch(&mut self, now: Instant) -> Vec<(JobId, WorkerId)> {
         self.now = now;
         self.last_dispatch_holders.clear();
+        self.deferred.clear();
+        self.wakeup = None;
+        let mut gate = self.gate_state();
+        let mut proj = Projection::new();
+        // Voluntary-wait deadlines by job; kept across scan restarts like `self.deferred`.
+        let mut timed: BTreeMap<JobId, Instant> = BTreeMap::new();
         let mut out = Vec::new();
         // A reservation on a worker that can never run anything again is dead weight.
         let dead: Vec<JobId> = self
@@ -618,6 +895,9 @@ impl<A: Admission> Engine<A> {
             }
             let mut bound = self.open_bound();
             let mut cursor = Cursor::Aged(None);
+            // Deferral records survive a restart (the scan may stop before reaching those jobs
+            // again); the slot bookings are rebuilt.
+            proj.clear();
             loop {
                 let Some(job) = self.next_job(&mut cursor) else {
                     break 'scan;
@@ -625,8 +905,21 @@ impl<A: Admission> Engine<A> {
                 let j = &self.waiting[&job];
                 let holder = j.reserved.is_some();
                 let hopeful = holder || bound.is_some_and(|b| j.spec.demand.fits_within(&b));
-                match hopeful.then(|| self.choose(j)).flatten() {
-                    Some(w) => {
+                let pick = if hopeful {
+                    self.choose(j, gate.as_ref(), &mut proj)
+                } else {
+                    Pick::Nothing
+                };
+                match pick {
+                    Pick::Defer(w, at) => {
+                        if let SpeedPolicy::EarliestFinish(Some(d)) = self.mode.speed.policy {
+                            Self::earliest(&mut timed, job, j.since + d.max_wait);
+                        }
+                        self.deferred.retain(|d| d.0 != job);
+                        self.deferred.push((job, w, at));
+                    }
+                    Pick::Place(w) => {
+                        self.placing(job, &mut gate, &mut timed);
                         self.place(job, w, &mut out);
                         if holder {
                             // Its worker is open again: more urgent jobs refused there because of
@@ -638,10 +931,24 @@ impl<A: Admission> Engine<A> {
                         }
                         bound = self.open_bound();
                     }
-                    None => {
-                        if self.try_reserve(job) {
+                    Pick::Nothing => {
+                        // A job kept off slow workers only by the gate is not starving: it waits
+                        // for the fast class, and the gate lets it go after `max_wait`.
+                        let gated = gate.as_ref().is_some_and(|g| {
+                            self.workers.values().any(|w| {
+                                matches!(self.refusal(j, w, Some(g)), Some(Refusal::SlowGate))
+                            })
+                        });
+                        if gated {
+                            if let Some(cfg) = self.mode.speed.slow_gate {
+                                Self::earliest(&mut timed, job, j.since + cfg.max_wait);
+                            }
+                        } else if self.try_reserve(job) {
                             // A taken-over worker may admit the job now that it is the holder.
-                            if let Some(w) = self.choose(&self.waiting[&job]) {
+                            if let Pick::Place(w) =
+                                self.choose(&self.waiting[&job], gate.as_ref(), &mut proj)
+                            {
+                                self.placing(job, &mut gate, &mut timed);
                                 self.place(job, w, &mut out);
                                 continue 'scan;
                             }
@@ -651,6 +958,11 @@ impl<A: Admission> Engine<A> {
                 }
             }
         }
+        self.wakeup = timed
+            .values()
+            .copied()
+            .filter(|&t| t > now)
+            .reduce(f64::min);
         out
     }
 
@@ -664,6 +976,7 @@ impl<A: Admission> Engine<A> {
             placed: w.placed,
             headroom: w.view().headroom(),
             reserved_for: w.reserved_for,
+            speed: speed_of(w),
         }
     }
 
@@ -687,6 +1000,7 @@ impl<A: Admission> Engine<A> {
             reservations_total: self.reservations_total,
             workers: self.workers.values().map(|w| self.load(w)).collect(),
             last_dispatch_holders: self.last_dispatch_holders.clone(),
+            deferred: self.deferred.clone(),
         }
     }
 
@@ -715,14 +1029,16 @@ impl<A: Admission> Engine<A> {
                 w.view().headroom() as f64 / GB
             );
         }
-        let (mut full, mut short, mut lane, mut excluded) = (0, 0, 0, 0);
+        let gate = self.gate_state();
+        let (mut full, mut short, mut lane, mut excluded, mut slow) = (0, 0, 0, 0, 0);
         let mut best_short: Option<(i64, WorkerId)> = None;
         let mut reserved = Vec::new();
         let mut takers = Vec::new();
         for (&id, w) in &self.workers {
-            match self.refusal(j, w) {
+            match self.refusal(j, w, gate.as_ref()) {
                 None => takers.push(id),
                 Some(Refusal::Ineligible) => excluded += 1,
+                Some(Refusal::SlowGate) => slow += 1,
                 Some(Refusal::ReservedFor(h)) => reserved.push(format!("worker {id} for job {h}")),
                 Some(Refusal::Lane) => lane += 1,
                 Some(Refusal::Admission) if w.running >= w.state.slots => full += 1,
@@ -749,6 +1065,14 @@ impl<A: Admission> Engine<A> {
         }
         if lane > 0 {
             msg += &format!("; {lane} big lane(s) keep their reserve headroom");
+        }
+        if slow > 0 {
+            msg += &format!(
+                "; {slow} slower worker(s) held back for the fast class (slow-worker gate)"
+            );
+        }
+        if let Some((_, w, at)) = self.deferred.iter().find(|d| d.0 == job) {
+            msg += &format!("; waiting for faster worker {w} (expected free at t={at:.0})");
         }
         if excluded > 0 {
             msg += &format!("; {excluded} worker(s) excluded by its class or avoid list");
@@ -832,6 +1156,11 @@ macro_rules! policy {
             fn stats(&self) -> PolicyStats {
                 self.0.stats()
             }
+
+            /// Forwarded to the engine.
+            fn next_wakeup(&self) -> Option<Instant> {
+                self.0.wakeup
+            }
         }
     };
 }
@@ -842,13 +1171,14 @@ policy!(
     /// priority, no reservations, so jobs larger than the typical headroom starve.
     Greedy,
     GreedyConfig,
-    |_c| Mode {
+    |c| Mode {
         priority_order: false,
         reservations: None,
         default_priority: 0,
         age_limit: None,
         choice: Choice::LeastLoaded,
         lanes: None,
+        speed: c.speed,
     }
 );
 
@@ -877,6 +1207,7 @@ policy!(
         priority_order: true,
         default_priority: c.default_priority,
         age_limit: c.age_limit,
+        speed: c.speed,
         reservations: Some(c),
         choice: Choice::LeastLoaded,
         lanes: None,
@@ -893,6 +1224,7 @@ policy!(
         priority_order: true,
         default_priority: c.backfill.default_priority,
         age_limit: c.backfill.age_limit,
+        speed: c.backfill.speed,
         reservations: Some(c.backfill),
         choice: Choice::Tightest { prefer_penalty: c.prefer_penalty },
         lanes: None,
@@ -908,6 +1240,7 @@ policy!(
         priority_order: true,
         default_priority: c.backfill.default_priority,
         age_limit: c.backfill.age_limit,
+        speed: c.backfill.speed,
         reservations: Some(c.backfill.clone()),
         choice: Choice::Tightest { prefer_penalty: 0 },
         lanes: Some(c),
@@ -933,7 +1266,7 @@ mod tests {
     /// Greedy spreads jobs over the least loaded workers in arrival order.
     #[test]
     fn greedy_fills_least_loaded_first() {
-        let mut p = Greedy::new(GreedyConfig {});
+        let mut p = Greedy::new(GreedyConfig::default());
         p.worker_update(worker(1, 4, 100), 0.0);
         p.worker_update(worker(2, 4, 100), 0.0);
         for i in 0..4 {
