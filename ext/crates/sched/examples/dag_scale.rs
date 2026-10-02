@@ -51,6 +51,7 @@ fn main() {
                     deps,
                     work_estimate: None,
                     passthrough: false,
+                    local: false,
                 }
             })
             .collect();

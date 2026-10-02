@@ -17,7 +17,7 @@ pub use admission::{Admission, ProductionAdmission, WorkerView};
 #[cfg(feature = "serde")]
 pub use dag::DagSnapshot;
 pub use dag::{
-    Dag, DagConfig, DagError, DagJob, DagScheduler, DagStats, DagTemplate, InstanceSpec,
+    Dag, DagConfig, DagError, DagJob, DagScheduler, DagStats, DagTemplate, InstanceSpec, NodeLabel,
 };
 pub use engine::{
     BackfillConfig, BestFit, BestFitConfig, DEFAULT_AGE_LIMIT, Defer, Greedy, GreedyConfig,

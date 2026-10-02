@@ -53,9 +53,9 @@ struct Args {
     /// --max-defer for a faster worker), "+eft0" (earliest finish, no waiting), "+gate" (slow-worker
     /// gate, with fastest first unless +eft is given), "+fastonly" (only the fast class), "+cpop"
     /// (critical tasks pinned to the fast class), "+learn" (speeds learned online from completions,
-    /// every worker reporting 1), "+smajor"/"+tmajor"/"+stem" (bidegrees ordered by (s, t), (t, s)
-    /// or (t - s, s) instead of by arrival). "grouprank[-oracle]": oldest bidegree first, rank
-    /// within.
+    /// every worker reporting 1), "+age" (aging at --age-limit for any plan), "+smajor"/"+tmajor"/
+    /// "+stem" (bidegrees ordered by (s, t), (t, s) or (t - s, s) instead of by arrival).
+    /// "grouprank[-oracle]": oldest bidegree first, rank within.
     #[arg(
         long,
         value_delimiter = ',',
@@ -280,6 +280,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut speed = SpeedConfig::default();
             let mut pin = Pin::None;
             let mut group_key = GroupKey::Arrival;
+            let mut age_limit = None;
             for part in parts {
                 match part {
                     "fast" => speed.policy = SpeedPolicy::FastestFirst,
@@ -300,6 +301,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         });
                     }
                     "learn" => speed.learn = Some(Learn::default()),
+                    "age" => age_limit = Some(args.age_limit),
                     "smajor" => group_key = GroupKey::SMajor,
                     "tmajor" => group_key = GroupKey::TMajor,
                     "stem" => group_key = GroupKey::StemMajor,
@@ -318,6 +320,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     explicit: args.explicit,
                     max_open: args.max_open,
                     group_key,
+                    age_limit,
                 },
             )
         })

@@ -1036,6 +1036,8 @@ pub struct Placement {
     pub max_open: Option<usize>,
     /// How bidegrees are ordered against each other.
     pub group_key: GroupKey,
+    /// Aging for any plan (overrides the rank plans' own).
+    pub age_limit: Option<f64>,
 }
 
 /// The order between bidegrees ("oldest first" and its restart-stable stand-ins).
@@ -1087,6 +1089,7 @@ impl Default for Placement {
             explicit: false,
             max_open: None,
             group_key: GroupKey::Arrival,
+            age_limit: None,
         }
     }
 }
@@ -1203,6 +1206,7 @@ pub fn simulate(
         } => (true, *oracle, *age_limit),
         _ => (false, false, None),
     };
+    let age_limit = place.age_limit.or(age_limit);
     let group_first = matches!(
         plan,
         Plan::Rank {
@@ -1364,6 +1368,9 @@ pub fn simulate(
                     proto: spec(0, k, place.pin == Pin::All),
                     work,
                     passthrough,
+                    demand: None,
+                    label: None,
+                    completed: Vec::new(),
                 },
                 now,
             )
@@ -1574,6 +1581,10 @@ pub fn simulate(
                 Pin::None => "",
                 Pin::All => ", fast class only",
                 Pin::Critical => ", critical pinned to fast (CPOP)",
+            }
+            + &match place.age_limit {
+                Some(a) if !matches!(plan, Plan::Rank { .. }) => format!(", aging {a:.0}s"),
+                _ => String::new(),
             }
             + match place.group_key {
                 GroupKey::Arrival => "",

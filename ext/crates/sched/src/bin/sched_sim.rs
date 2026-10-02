@@ -8,7 +8,7 @@ use sched::{
     LanesConfig, PriorityBackfill, Resources,
     sim::{
         model::{ClassCurve, PsModel, fit},
-        run::{Baseline, BoxPolicy, Metrics, SimSetup, production, simulate},
+        run::{Baseline, BoxPolicy, Metrics, SimSetup, Usage, production, simulate},
         trace::Trace,
     },
 };
@@ -64,7 +64,8 @@ struct Args {
     #[arg(long, default_value_t = 7.5)]
     big_gb: f64,
     /// Reported baseline: "floor" (production's rolling RSS floor, replayed from the samples),
-    /// "idle" (each worker's median idle RSS), or a constant in GB.
+    /// "excl" (the rolling floor of RSS minus the estimates running: `baseline_excl`), "idle"
+    /// (each worker's median idle RSS), or a constant in GB.
     #[arg(long, default_value = "floor")]
     baseline: String,
     /// Window of the rolling floor, seconds.
@@ -88,6 +89,17 @@ struct Args {
     /// ... and this saturation point.
     #[arg(long)]
     k_sat: Option<usize>,
+    /// Scale every estimate (demands, and what `excl` subtracts) by this, e.g. 0.32 to mimic a
+    /// recalibrated estimator.
+    #[arg(long, default_value_t = 1.0)]
+    est_scale: f64,
+    /// Count modelled overruns: jobs occupy their estimate times a per-job fraction, log-normal
+    /// around the trace's median ratio of (RSS - idle) to estimates running, with this spread...
+    #[arg(long, default_value_t = 0.5)]
+    usage_sd: f64,
+    /// ... capped at this fraction of the (unscaled) estimate (default: no cap).
+    #[arg(long, default_value_t = f64::INFINITY)]
+    usage_cap: f64,
 }
 
 /// The named policy configured from the command line, or `None` for an unknown name.
@@ -209,8 +221,36 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             window_s: args.floor_window,
             offset_gb: args.floor_offset_gb,
         },
+        "excl" => Baseline::RollingFloorExcl {
+            window_s: args.floor_window,
+            offset_gb: args.floor_offset_gb,
+        },
         "idle" => Baseline::PerWorker(trace.idle_baselines()),
         gb => Baseline::PerWorker(vec![gb.parse::<f64>()?; trace.workers.len()]),
+    };
+    let idle = trace.idle_baselines();
+    let ratios = trace.usage_ratios(&idle, 1.0);
+    let q = |p: f64| {
+        ratios
+            .get((p * ratios.len() as f64) as usize)
+            .copied()
+            .unwrap_or(0.0)
+    };
+    let (over, samples) = trace.samples_over_budget();
+    println!(
+        "\n## Memory\n\n(RSS - idle) / estimates running, over {} samples: p10 {:.3}, median \
+         {:.3}, p90 {:.3}, p99 {:.3}; trace samples over budget: {over}/{samples}",
+        ratios.len(),
+        q(0.1),
+        q(0.5),
+        q(0.9),
+        q(0.99)
+    );
+    let usage = Usage {
+        idle,
+        median: q(0.5),
+        sd: args.usage_sd,
+        cap: args.usage_cap,
     };
     let setup = SimSetup {
         trace: &trace,
@@ -226,6 +266,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }),
         big_gb: args.big_gb,
         explain: args.explain,
+        est_scale: args.est_scale,
+        usage: Some(usage),
     };
     let mut results: Vec<Metrics> = vec![production(&setup)];
     let clock = Instant::now();
@@ -260,13 +302,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!(
         "| policy | done | makespan | W/h | slot util | mem util | wait p50 | p90 | p99 | max | \
          big p50 | big p90 | big p99 | big max | group p50 | group p90 | group max | resv | idle \
-         draining | dispatch mean/max |"
+         draining | dispatch mean/max | modelled over budget |"
     );
-    println!("|{}", "---|".repeat(20));
+    println!("|{}", "---|".repeat(21));
     for m in &results {
         println!(
             "| {} | {}/{} | {} | {:.0} | {:.1}% | {:.1}% | {} | {} | {} | {} | {} | {} | {} | {} \
-             | {} | {} | {} | {} | {:.1} slot-h ({:.2}%) | {} |",
+             | {} | {} | {} | {} | {:.1} slot-h ({:.2}%) | {} | {:.3}% (max +{:.1} GB) |",
             m.policy,
             m.completed,
             m.jobs,
@@ -293,6 +335,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             } else {
                 "-".into()
             },
+            100.0 * m.overrun.frac,
+            m.overrun.max_excess_gb,
         );
     }
     println!("\n| policy | class | jobs | W/h | slot util | mem util |\n|---|---|---|---|---|---|");

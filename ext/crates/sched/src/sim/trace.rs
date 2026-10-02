@@ -364,6 +364,54 @@ impl Trace {
             .min_by(f64::total_cmp)
     }
 
+    /// The baseline a worker reporting `baseline_excl` would send at time `t` (GB): the same rolling
+    /// floor as [`floor_baseline`](Self::floor_baseline), of each sample's resident memory minus
+    /// `scale` times the estimates of the jobs it was running (at least 0). `None` before the
+    /// first sample.
+    pub fn floor_baseline_excl(&self, w: usize, t: f64, window_s: f64, scale: f64) -> Option<f64> {
+        let tw = &self.workers[w];
+        let idx = ((t - tw.join_s) / window_s).floor().max(0.0);
+        let from = tw.join_s + (idx - 1.0).max(0.0) * window_s;
+        let lo = tw.samples.partition_point(|s| s.t_s < from);
+        let hi = tw.samples.partition_point(|s| s.t_s <= t);
+        tw.samples[lo..hi]
+            .iter()
+            .map(|s| (s.rss_gb - scale * s.reserved_gb).max(0.0))
+            .min_by(f64::total_cmp)
+    }
+
+    /// Resident memory above idle per GB of estimate running, one value per sample with at least
+    /// `min_reserved_gb` of estimates running: how much of an estimate a job actually occupies,
+    /// summed over the jobs of a sample.
+    pub fn usage_ratios(&self, idle: &[f64], min_reserved_gb: f64) -> Vec<f64> {
+        let mut v: Vec<f64> = self
+            .workers
+            .iter()
+            .zip(idle)
+            .flat_map(|(w, &i)| {
+                w.samples
+                    .iter()
+                    .filter(move |s| s.reserved_gb >= min_reserved_gb)
+                    .map(move |s| (s.rss_gb - i).max(0.0) / s.reserved_gb)
+            })
+            .collect();
+        v.sort_by(f64::total_cmp);
+        v
+    }
+
+    /// Samples whose resident memory exceeded the worker's budget, and all samples.
+    pub fn samples_over_budget(&self) -> (usize, usize) {
+        let mut over = 0;
+        let mut all = 0;
+        for w in &self.workers {
+            for s in &w.samples {
+                all += 1;
+                over += usize::from(s.rss_gb > w.budget_gb);
+            }
+        }
+        (over, all)
+    }
+
     /// Per-worker baseline memory (GB), an alternative `reported_baseline` for the replay: the median
     /// resident memory over the worker's samples with nothing running, or, for a worker never
     /// sampled idle, the median of that over its class (falling back to all workers).

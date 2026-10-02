@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use super::{DagError, DagScheduler, DagTemplate, State};
-use crate::{Instant, JobId, JobSpec, Policy};
+use crate::{Instant, JobId, JobSpec, Policy, Resources};
 
 /// Counter sentinels (template in-degrees stay below them).
 pub(super) const COMPLETE: u16 = u16::MAX;
@@ -13,6 +13,8 @@ pub(super) const COMPLETE: u16 = u16::MAX;
 pub(super) const SUBMITTED: u16 = u16::MAX - 1;
 /// See [`COMPLETE`].
 pub(super) const HELD: u16 = u16::MAX - 2;
+/// The smallest sentinel: real counters are below it.
+pub(super) const SENTINEL: u16 = HELD;
 
 /// A group's sub-DAG, opened as an implicit instance of a shared [`DagTemplate`] with
 /// [`DagScheduler::open_instance`].
@@ -39,6 +41,26 @@ pub struct InstanceSpec {
     pub work: Vec<f64>,
     /// Nodes that are synchronisation points only: they complete by themselves when ready.
     pub passthrough: Vec<bool>,
+    /// Each node's demand, overriding `proto.demand` (one per template node).
+    pub demand: Option<Arc<[Resources]>>,
+    /// Each node's name in [`explain`](crate::Dag::explain) messages (not kept by snapshots).
+    pub label: Option<NodeLabel>,
+    /// Nodes already complete (e.g. restored from a checkpoint): they never run, and their
+    /// successors start with those dependencies met. Need not be closed under predecessors: an
+    /// incomplete predecessor of a complete node still runs, and its completion does not touch
+    /// the complete node.
+    pub completed: Vec<u32>,
+}
+
+/// A node's name for an instance: `label(i)` names node `i`.
+#[derive(Clone)]
+pub struct NodeLabel(pub Arc<dyn Fn(usize) -> String + Send + Sync>);
+
+impl std::fmt::Debug for NodeLabel {
+    /// The closure is opaque.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("NodeLabel(..)")
+    }
 }
 
 /// An open instance.
@@ -59,6 +81,8 @@ pub(super) struct Instance {
     pub(super) open: bool,
     /// Bottom levels (only with `rank_priority`).
     pub(super) below: Vec<f64>,
+    pub(super) demand: Option<Arc<[Resources]>>,
+    pub(super) label: Option<NodeLabel>,
 }
 
 impl Instance {
@@ -86,9 +110,12 @@ impl<P: Policy> DagScheduler<P> {
             "one passthrough flag per template node"
         );
         assert!(
-            (0..n).all(|i| spec.template.predecessors(i).len() < HELD as usize),
+            (0..n).all(|i| spec.template.predecessors(i).len() < SENTINEL as usize),
             "template in-degree too large for implicit instances"
         );
+        if let Some(d) = &spec.demand {
+            assert_eq!(d.len(), n, "one demand per template node");
+        }
         let end = spec
             .base
             .checked_add(n as u64)
@@ -142,10 +169,25 @@ impl<P: Policy> DagScheduler<P> {
         } else {
             Vec::new()
         };
+        let mut counter: Vec<u16> = (0..n)
+            .map(|i| spec.template.predecessors(i).len() as u16)
+            .collect();
+        let mut remaining = n as u32;
+        for &i in &spec.completed {
+            if counter[i as usize] != COMPLETE {
+                counter[i as usize] = COMPLETE;
+                remaining -= 1;
+            }
+        }
+        for &i in &spec.completed {
+            for &c in spec.template.successors(i as usize) {
+                if counter[c as usize] < SENTINEL {
+                    counter[c as usize] -= 1;
+                }
+            }
+        }
         let inst = Instance {
-            counter: (0..n)
-                .map(|i| spec.template.predecessors(i).len() as u16)
-                .collect(),
+            counter,
             template: spec.template,
             base: spec.base,
             entry: spec.entry,
@@ -153,9 +195,11 @@ impl<P: Policy> DagScheduler<P> {
             proto: spec.proto,
             work: spec.work,
             pass,
-            remaining: n as u32,
+            remaining,
             open: false,
             below,
+            demand: spec.demand,
+            label: spec.label,
         };
         let slot = match self.free_instances.pop() {
             Some(s) => {
@@ -168,8 +212,8 @@ impl<P: Policy> DagScheduler<P> {
             }
         };
         self.by_base.insert(spec.base, slot);
-        if n == 0 {
-            self.close_instance(slot, now);
+        if remaining == 0 {
+            self.close_slot(slot, now);
         } else if self.is_completed(spec.entry) {
             self.open_sources(slot, now);
         } else {
@@ -210,6 +254,10 @@ impl<P: Policy> DagScheduler<P> {
     /// Nodes whose last predecessor completed: passthroughs complete at once (a worklist), the
     /// rest are submitted or held.
     fn instance_ready(&mut self, slot: usize, ready: Vec<usize>, now: Instant) {
+        // Before the entry completes, nodes stay at zero; `open_sources` releases them.
+        if !self.inst(slot).open {
+            return;
+        }
         let mut work: Vec<usize> = ready.into_iter().rev().collect();
         while let Some(i) = work.pop() {
             if self.inst(slot).is_pass(i) {
@@ -233,7 +281,7 @@ impl<P: Policy> DagScheduler<P> {
             .as_ref()
             .is_some_and(|x| x.remaining == 0)
         {
-            self.close_instance(slot, now);
+            self.close_slot(slot, now);
         }
     }
 
@@ -245,6 +293,10 @@ impl<P: Policy> DagScheduler<P> {
         let mut ready = Vec::new();
         for &c in inst.template.successors(i) {
             let c = c as usize;
+            // A successor already complete (opened so, see `InstanceSpec::completed`) stays so.
+            if inst.counter[c] >= SENTINEL {
+                continue;
+            }
             inst.counter[c] -= 1;
             if inst.counter[c] == 0 {
                 ready.push(c);
@@ -264,12 +316,58 @@ impl<P: Policy> DagScheduler<P> {
             .as_ref()
             .is_some_and(|x| x.remaining == 0)
         {
-            self.close_instance(slot, now);
+            self.close_slot(slot, now);
         }
     }
 
+    /// Close an instance early (e.g. its remaining nodes are known to be no-ops): its nodes that
+    /// have not started complete as no-ops (waiting ones are withdrawn from the policy) and its
+    /// `done` job completes. `job` is the instance's `done` job or any of its nodes. Returns the
+    /// nodes already running: their workers keep their resources until each one's
+    /// [`completed`](crate::Dag::completed) (or [`resubmit`](Self::resubmit) after its worker
+    /// left), which then changes nothing else.
+    pub fn close_instance(&mut self, job: JobId, now: Instant) -> Result<Vec<JobId>, DagError> {
+        self.now = now;
+        let slot = match self.instance_of(job) {
+            Some((slot, _)) => slot,
+            None => self
+                .instances
+                .iter()
+                .position(|i| i.as_ref().is_some_and(|i| i.done == job))
+                .ok_or(DagError::NotFound(job))?,
+        };
+        let (base, len, entry) = {
+            let i = self.inst(slot);
+            (i.base, i.len(), i.entry)
+        };
+        let mut running = Vec::new();
+        for i in 0..len {
+            let id = base + i as u64;
+            if self.inst(slot).counter[i] == SUBMITTED {
+                if self.running.remove(&id) {
+                    self.ignored.insert(id);
+                    running.push(id);
+                } else {
+                    self.policy.cancel(id);
+                }
+            }
+        }
+        self.newly_ready
+            .retain(|j| !(base..base + len as u64).contains(j));
+        if let Some(v) = self.by_entry.get_mut(&entry) {
+            v.retain(|&s| s != slot);
+        }
+        self.waiting_to_open.retain(|&s| s != slot);
+        let inst = self.instances[slot].as_mut().unwrap();
+        inst.counter.fill(COMPLETE);
+        inst.remaining = 0;
+        self.close_slot(slot, now);
+        self.drain_passthrough(now);
+        Ok(running)
+    }
+
     /// Every node completed: drop the instance and complete its `done` job.
-    fn close_instance(&mut self, slot: usize, now: Instant) {
+    fn close_slot(&mut self, slot: usize, now: Instant) {
         let Some(inst) = self.instances[slot].take() else {
             return;
         };
@@ -297,6 +395,9 @@ impl<P: Policy> DagScheduler<P> {
         let mut spec = inst.proto.clone();
         spec.id = inst.base + i as u64;
         spec.work = Some(inst.work[i]);
+        if let Some(d) = &inst.demand {
+            spec.demand = d[i];
+        }
         if self.config.rank_priority && spec.priority.is_none() {
             // The rank below the instance, now (it may have grown since the instance opened).
             let done_rank = self
@@ -348,7 +449,7 @@ impl<P: Policy> DagScheduler<P> {
         job: JobId,
     ) -> Option<String> {
         let inst = self.inst(slot);
-        match inst.counter[i] {
+        let msg = match inst.counter[i] {
             SUBMITTED => self.policy.explain(job),
             HELD => Some(format!("job {job} is ready and held until release")),
             COMPLETE => Some(format!("job {job} completed")),
@@ -360,6 +461,10 @@ impl<P: Policy> DagScheduler<P> {
                 "job {job} waits for {k} dependenc{} within its group",
                 if k == 1 { "y" } else { "ies" }
             )),
+        };
+        match &inst.label {
+            Some(l) => msg.map(|m| format!("[{}] {m}", (l.0)(i))),
+            None => msg,
         }
     }
 
@@ -430,6 +535,8 @@ pub(super) struct InstanceSnapshot {
     counter: Vec<u16>,
     remaining: u32,
     open: bool,
+    #[serde(default)]
+    demand: Option<Vec<Resources>>,
 }
 
 #[cfg(feature = "serde")]
@@ -455,6 +562,7 @@ impl<P: Policy> DagScheduler<P> {
                 counter: inst.counter.clone(),
                 remaining: inst.remaining,
                 open: inst.open,
+                demand: inst.demand.as_ref().map(|d| d.to_vec()),
             });
         }
         out.sort_by_key(|i| i.base);
@@ -493,6 +601,8 @@ impl<P: Policy> DagScheduler<P> {
                 remaining: snap.remaining,
                 open: snap.open,
                 below,
+                demand: snap.demand.map(Arc::from),
+                label: None,
             };
             let slot = self.instances.len();
             if !inst.open {

@@ -111,6 +111,9 @@ fn build_with(w: &World, implicit: bool, budget: Option<usize>) -> DagScheduler<
                     proto,
                     work: vec![1.0; n],
                     passthrough: pass,
+                    demand: None,
+                    label: None,
+                    completed: Vec::new(),
                 },
                 0.0,
             )
@@ -216,6 +219,9 @@ fn small() -> DagScheduler<PriorityBackfill> {
             proto: JobSpec::new(0, Resources::ZERO, 0),
             work: vec![3.0, 4.0],
             passthrough: vec![false, false],
+            demand: None,
+            label: None,
+            completed: Vec::new(),
         },
         0.0,
     )
@@ -281,6 +287,9 @@ fn instance_validation() {
         proto: JobSpec::new(0, Resources::ZERO, 0),
         work: vec![1.0; 3],
         passthrough: vec![false; 3],
+        demand: None,
+        label: None,
+        completed: Vec::new(),
     };
     assert!(
         d.open_instance(spec(9, 98), 0.0).is_err(),
