@@ -129,6 +129,23 @@ fn template_basics() {
     assert_eq!(t.critical_path(|i| [1.0, 5.0, 2.0, 1.0][i]), 7.0);
 }
 
+/// Critical nodes are exactly those on a longest chain.
+#[test]
+fn critical_nodes_lie_on_the_longest_chain() {
+    // 0 -> 1 -> 3 (1 + 5 + 1) and 0 -> 2 -> 3 (1 + 2 + 1); 4 is isolated (3).
+    let t = DagTemplate::new(5, [(0, 1), (0, 2), (1, 3), (2, 3)]).unwrap();
+    let w = [1.0, 5.0, 2.0, 1.0, 3.0];
+    assert_eq!(
+        t.critical_nodes(|i| w[i], 1e-9),
+        vec![true, true, false, true, false]
+    );
+    // A tolerance wide enough to include the other branch (4 / 7 of the critical path).
+    assert_eq!(
+        t.critical_nodes(|i| w[i], 0.5),
+        vec![true, true, true, true, false]
+    );
+}
+
 /// Two instances of a template chain through their entry dependencies.
 #[test]
 fn templates_instantiate_per_group() {

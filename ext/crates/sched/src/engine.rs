@@ -88,6 +88,10 @@ pub struct BackfillConfig {
     pub age_limit: Option<f64>,
     /// Speed-aware placement. Default: oblivious.
     pub speed: SpeedConfig,
+    /// Order by group first arrival, then by priority within the group (instead of priority
+    /// first). With DAG-rank priorities this is "oldest group first, critical path within it".
+    /// Default false.
+    pub group_first: bool,
 }
 
 impl Default for BackfillConfig {
@@ -100,6 +104,7 @@ impl Default for BackfillConfig {
             default_priority: 0,
             age_limit: None,
             speed: SpeedConfig::default(),
+            group_first: false,
         }
     }
 }
@@ -162,6 +167,7 @@ struct Mode {
     reservations: Option<BackfillConfig>,
     default_priority: i64,
     age_limit: Option<f64>,
+    group_first: bool,
     choice: Choice,
     lanes: Option<LanesConfig>,
     speed: SpeedConfig,
@@ -172,6 +178,8 @@ struct Mode {
 struct Key {
     priority: i64,
     group: u64,
+    /// Priority within the group (only with `group_first`).
+    within: i64,
     seq: u64,
 }
 
@@ -356,16 +364,26 @@ impl<A: Admission> Engine<A> {
         let seq = self.next_seq;
         self.next_seq += 1;
         let group_seq = *self.groups.entry(spec.group).or_insert(seq);
-        let key = if self.mode.priority_order {
+        let priority = spec.priority.unwrap_or(self.mode.default_priority);
+        let key = if !self.mode.priority_order {
             Key {
-                priority: spec.priority.unwrap_or(self.mode.default_priority),
+                priority: 0,
+                group: 0,
+                within: 0,
+                seq,
+            }
+        } else if self.mode.group_first {
+            Key {
+                priority: 0,
                 group: group_seq,
+                within: priority,
                 seq,
             }
         } else {
             Key {
-                priority: 0,
-                group: 0,
+                priority,
+                group: group_seq,
+                within: 0,
                 seq,
             }
         };
@@ -740,6 +758,7 @@ impl<A: Admission> Engine<A> {
                 Key {
                     priority: 0,
                     group: 0,
+                    within: 0,
                     seq: job.key.seq,
                 },
             )
@@ -1176,6 +1195,7 @@ policy!(
         reservations: None,
         default_priority: 0,
         age_limit: None,
+        group_first: false,
         choice: Choice::LeastLoaded,
         lanes: None,
         speed: c.speed,
@@ -1207,6 +1227,7 @@ policy!(
         priority_order: true,
         default_priority: c.default_priority,
         age_limit: c.age_limit,
+        group_first: c.group_first,
         speed: c.speed,
         reservations: Some(c),
         choice: Choice::LeastLoaded,
@@ -1224,6 +1245,7 @@ policy!(
         priority_order: true,
         default_priority: c.backfill.default_priority,
         age_limit: c.backfill.age_limit,
+        group_first: c.backfill.group_first,
         speed: c.backfill.speed,
         reservations: Some(c.backfill),
         choice: Choice::Tightest { prefer_penalty: c.prefer_penalty },
@@ -1240,6 +1262,7 @@ policy!(
         priority_order: true,
         default_priority: c.backfill.default_priority,
         age_limit: c.backfill.age_limit,
+        group_first: c.backfill.group_first,
         speed: c.backfill.speed,
         reservations: Some(c.backfill.clone()),
         choice: Choice::Tightest { prefer_penalty: 0 },

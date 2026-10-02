@@ -20,6 +20,7 @@ enum Kind {
         max_res: usize,
         per_class: bool,
         age: Option<f64>,
+        group_first: bool,
     },
     BestFit {
         penalty: u64,
@@ -31,12 +32,13 @@ enum Kind {
 impl Kind {
     /// The policy under test.
     fn build(&self, speed: SpeedConfig) -> Box<dyn Policy> {
-        let bf = |max_res, per_class, age| BackfillConfig {
+        let bf = |max_res, per_class, age, group_first| BackfillConfig {
             reserve_after: 30.0,
             max_reservations: max_res,
             per_class_reservations: per_class,
             age_limit: age,
             speed,
+            group_first,
             ..BackfillConfig::default()
         };
         match *self {
@@ -45,13 +47,19 @@ impl Kind {
                 max_res,
                 per_class,
                 age,
-            } => Box::new(PriorityBackfill::new(bf(max_res, per_class, age))),
+                group_first,
+            } => Box::new(PriorityBackfill::new(bf(
+                max_res,
+                per_class,
+                age,
+                group_first,
+            ))),
             Kind::BestFit { penalty, age } => Box::new(BestFit::new(BestFitConfig {
-                backfill: bf(1, false, age),
+                backfill: bf(1, false, age, false),
                 prefer_penalty: penalty,
             })),
             Kind::Lanes => Box::new(Lanes::new(LanesConfig {
-                backfill: bf(1, false, None),
+                backfill: bf(1, false, None, false),
                 lanes: LaneSet::Workers(vec![LANE]),
                 big_threshold: Resources::mem(LANE_BIG),
                 lane_reserve: Resources::mem(LANE_RESERVE),
@@ -70,6 +78,17 @@ impl Kind {
             Kind::Backfill { age, .. } | Kind::BestFit { age, .. } => age,
             _ => None,
         }
+    }
+
+    /// Whether groups come before priorities.
+    fn group_first(&self) -> bool {
+        matches!(
+            self,
+            Kind::Backfill {
+                group_first: true,
+                ..
+            }
+        )
     }
 
     /// The reservation limit and whether it is per class.
@@ -176,13 +195,14 @@ fn kind() -> impl Strategy<Value = Kind> {
     let age = prop::option::of(prop_oneof![Just(0.0), Just(45.0), Just(200.0)]);
     prop_oneof![
         Just(Kind::Greedy),
-        (0usize..3, any::<bool>(), age.clone()).prop_map(|(max_res, per_class, age)| {
-            Kind::Backfill {
+        (0usize..3, any::<bool>(), age.clone(), any::<bool>()).prop_map(
+            |(max_res, per_class, age, group_first)| Kind::Backfill {
                 max_res,
                 per_class,
                 age,
+                group_first,
             }
-        }),
+        ),
         (prop_oneof![Just(0u64), Just(25)], age)
             .prop_map(|(penalty, age)| Kind::BestFit { penalty, age }),
         Just(Kind::Lanes),
@@ -207,6 +227,7 @@ struct Shadow {
     next_id: JobId,
     speed: SpeedConfig,
     age: Option<f64>,
+    group_first: bool,
 }
 
 /// The slow-worker gate's fleet view, recomputed independently of the engine.
@@ -303,17 +324,17 @@ impl Shadow {
             && (s.budget.mem as i64 - used as i64 - demand as i64) < LANE_RESERVE as i64
     }
 
-    /// Scan order: aged jobs by age, then priority, group arrival, FIFO.
-    fn urgency(&self, j: &SJob, age: Option<f64>) -> (bool, i64, u64, u64) {
+    /// Scan order: aged jobs by age, then priority, group arrival, FIFO (or group arrival before
+    /// priority with `group_first`).
+    fn urgency(&self, j: &SJob, age: Option<f64>) -> (bool, i64, u64, i64, u64) {
+        let p = j.spec.priority.unwrap_or(0);
+        let g = self.groups[&j.spec.group];
         if age.is_some_and(|a| self.now - j.since >= a) {
-            (false, 0, 0, j.seq)
+            (false, 0, 0, 0, j.seq)
+        } else if self.group_first {
+            (true, 0, g, p, j.seq)
         } else {
-            (
-                true,
-                j.spec.priority.unwrap_or(0),
-                self.groups[&j.spec.group],
-                j.seq,
-            )
+            (true, p, g, 0, j.seq)
         }
     }
 
@@ -354,6 +375,7 @@ fn run(kind: &Kind, speed: SpeedConfig, ops: &[Op]) -> Result<Vec<String>, TestC
     let mut sh = Shadow {
         speed,
         age: kind.age(),
+        group_first: kind.group_first(),
         ..Shadow::default()
     };
     let mut log = Vec::new();

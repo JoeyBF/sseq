@@ -8,7 +8,7 @@ use sched::{
     sim::{
         model::fit,
         trace::Trace,
-        whole::{Census, Fleet, Plan, WholeConfig, World, simulate},
+        whole::{Census, Fleet, Pin, Placement, Plan, WholeConfig, World, simulate},
     },
 };
 
@@ -51,7 +51,9 @@ struct Args {
     /// Plans: today, group, rank, rank-oracle, rank-noage, rank-oracle-noage, each with optional
     /// placement suffixes: "+fast" (fastest first), "+eft" (earliest finish, waiting up to
     /// --max-defer for a faster worker), "+eft0" (earliest finish, no waiting), "+gate" (slow-worker
-    /// gate, with fastest first unless +eft is given).
+    /// gate, with fastest first unless +eft is given), "+fastonly" (only the fast class), "+cpop"
+    /// (critical tasks pinned to the fast class). "grouprank[-oracle]": oldest bidegree first,
+    /// rank within.
     #[arg(
         long,
         value_delimiter = ',',
@@ -70,6 +72,12 @@ struct Args {
     /// +gate: the slow-worker gate's factor.
     #[arg(long, default_value_t = 1.0)]
     gate_factor: f64,
+    /// Make throughput exactly linear up to the slot count (as dslab's exclusive cores).
+    #[arg(long)]
+    linear_ps: bool,
+    /// Write the world as dslab-dag input (dag.yaml, dag_est.yaml, system.yaml) here, then exit.
+    #[arg(long)]
+    export_dslab: Option<PathBuf>,
     /// Write results as JSON here.
     #[arg(long)]
     json: Option<PathBuf>,
@@ -82,9 +90,10 @@ fn hours(s: f64) -> String {
 
 /// The plan a command-line name stands for.
 fn plan_named(name: &str, args: &Args) -> Plan {
-    let rank = |oracle, age: bool| Plan::Rank {
+    let rank = |oracle, age: bool, group_first| Plan::Rank {
         oracle,
         age_limit: age.then_some(args.age_limit),
+        group_first,
     };
     match name {
         "today" => Plan::Today {
@@ -92,10 +101,12 @@ fn plan_named(name: &str, args: &Args) -> Plan {
             per_bidegree: args.walk,
         },
         "group" => Plan::Group,
-        "rank" => rank(false, true),
-        "rank-oracle" => rank(true, true),
-        "rank-noage" => rank(false, false),
-        "rank-oracle-noage" => rank(true, false),
+        "rank" => rank(false, true, false),
+        "rank-oracle" => rank(true, true, false),
+        "rank-noage" => rank(false, false, false),
+        "rank-oracle-noage" => rank(true, false, false),
+        "grouprank" => rank(false, false, true),
+        "grouprank-oracle" => rank(true, false, true),
         other => panic!("unknown plan {other}"),
     }
 }
@@ -104,7 +115,14 @@ fn plan_named(name: &str, args: &Args) -> Plan {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
     let trace = Trace::load(&args.trace)?;
-    let (model, _, work) = fit(&trace);
+    let (mut model, _, work) = fit(&trace);
+    if args.linear_ps {
+        // Exclusive-core equivalent: per-job rate = speed at any concurrency (slots still cap it).
+        for c in model.classes.values_mut() {
+            c.k_sat = usize::MAX;
+            c.alpha = 1.0;
+        }
+    }
     let census = Census::load(&args.census)?;
     eprintln!("[whole] census: {} rows", census.rows.len());
 
@@ -212,14 +230,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         hours(cp),
         hours(cap)
     );
+    println!("(seconds: critical path {cp:.6}, capacity {cap:.6})");
+    if let Some(dir) = &args.export_dslab {
+        std::fs::create_dir_all(dir)?;
+        let (dag, system) = world.export_dslab(&fleet, &model, true);
+        std::fs::write(dir.join("dag.yaml"), dag)?;
+        std::fs::write(dir.join("system.yaml"), system)?;
+        let (dag, _) = world.export_dslab(&fleet, &model, false);
+        std::fs::write(dir.join("dag_est.yaml"), dag)?;
+        eprintln!("[whole] exported to {}", dir.display());
+        return Ok(());
+    }
 
-    let plans: Vec<(Plan, SpeedConfig)> = args
+    let plans: Vec<(Plan, Placement)> = args
         .plans
         .iter()
         .map(|p| {
             let mut parts = p.split('+');
             let plan = plan_named(parts.next().unwrap(), &args);
             let mut speed = SpeedConfig::default();
+            let mut pin = Pin::None;
             for part in parts {
                 match part {
                     "fast" => speed.policy = SpeedPolicy::FastestFirst,
@@ -239,10 +269,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             max_wait: args.max_defer,
                         });
                     }
+                    "fastonly" => pin = Pin::All,
+                    "cpop" => pin = Pin::Critical,
                     other => panic!("unknown placement suffix +{other}"),
                 }
             }
-            (plan, speed)
+            (plan, Placement { speed, pin })
         })
         .collect();
     let results: Vec<_> = std::thread::scope(|s| {
@@ -250,7 +282,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .iter()
             .map(|p| {
                 let (world, fleet, model) = (&world, &fleet, &model);
-                s.spawn(move || simulate(world, fleet, model, &p.0, p.1))
+                s.spawn(move || simulate(world, fleet, model, &p.0, &p.1))
             })
             .collect();
         handles.into_iter().map(|h| h.join().unwrap()).collect()

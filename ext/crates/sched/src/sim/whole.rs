@@ -720,6 +720,87 @@ impl World {
         deps
     }
 
+    /// The world as dslab-dag input (DAG YAML, system YAML), for cross-validation.
+    ///
+    /// Model alignment: one resource per worker with `cores = slots` and speed `10 x` the class's
+    /// single-job throughput; task flops `10 x` work (true or estimated), so durations are in
+    /// seconds; data items of size 0 on an infinitely fast network. Our two passthroughs per
+    /// bidegree ("walk done", "registered") become one join task of 1e-6 flops, as do signatures
+    /// with no work. Tasks are listed in topological order (bidegrees by `(t, s)`, then template
+    /// order), which dslab's static schedulers need.
+    pub fn export_dslab(
+        &self,
+        fleet: &Fleet,
+        model: &dyn ServiceModel,
+        truth: bool,
+    ) -> (String, String) {
+        use std::fmt::Write;
+        const EPS: f64 = 1e-6;
+        let mut dag = String::from("tasks:\n");
+        let mut task = |name: &str, flops: f64, inputs: &[String]| {
+            let inputs: Vec<String> = inputs.iter().map(|i| format!("\"{i}\"")).collect();
+            writeln!(
+                dag,
+                "  - name: {name}\n    flops: {:.9}\n    memory: 0\n    min_cores: 1\n    \
+                 max_cores: 1\n    inputs: [{}]\n    outputs: [{{\"name\": \"{name}\", \"size\": \
+                 0}}]",
+                flops.max(EPS),
+                inputs.join(", ")
+            )
+            .unwrap();
+        };
+        let mut order: Vec<usize> = (0..self.bideg.len()).collect();
+        order.sort_by_key(|&k| (self.bideg[k].t, self.bideg[k].s));
+        for k in order {
+            let b = &self.bideg[k];
+            let deps: Vec<String> = self
+                .compute_deps(k)
+                .iter()
+                .map(|d| format!("r{d}"))
+                .collect();
+            let zero = if truth { b.zero_true } else { b.zero_est };
+            task(&format!("z{k}"), 10.0 * zero, &deps);
+            let mut join = vec![format!("z{k}")];
+            if let Some(pi) = b.profile.filter(|_| b.live) {
+                let t = &self.profiles[pi].template;
+                for &i in t.topological_order() {
+                    let i = i as usize;
+                    let mut inputs: Vec<String> = t
+                        .predecessors(i)
+                        .iter()
+                        .map(|&p| format!("s{k}_{p}"))
+                        .collect();
+                    if inputs.is_empty() {
+                        inputs.push(format!("z{k}"));
+                    }
+                    task(
+                        &format!("s{k}_{i}"),
+                        10.0 * self.sig_work(k, i, truth),
+                        &inputs,
+                    );
+                }
+                join.extend(t.sinks().map(|i| format!("s{k}_{i}")));
+            }
+            join.extend(self.index(b.s, b.t - 1).map(|p| format!("r{p}")));
+            task(&format!("r{k}"), 0.0, &join);
+        }
+        let mut sys = String::from("resources:\n");
+        let mut id = 0;
+        for (class, count, slots) in &fleet.groups {
+            for _ in 0..*count {
+                writeln!(
+                    sys,
+                    "  - name: w{id}_{class}\n    speed: {:.9}\n    cores: {slots}\n    memory: 0",
+                    10.0 * model.throughput(class, 1)
+                )
+                .unwrap();
+                id += 1;
+            }
+        }
+        sys += "network:\n  model: ConstantBandwidth\n  bandwidth: 1000000000\n  latency: 0\n";
+        (dag, sys)
+    }
+
     /// Summary of the world for the report.
     pub fn summary(&self) -> WorldSummary {
         let known = self
@@ -834,7 +915,30 @@ pub enum Plan {
         oracle: bool,
         /// `BackfillConfig::age_limit`.
         age_limit: Option<f64>,
+        /// Oldest bidegree first, rank only within a bidegree (`BackfillConfig::group_first`).
+        group_first: bool,
     },
+}
+
+/// Which jobs are restricted to the fastest worker class.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize)]
+pub enum Pin {
+    /// None: placement alone decides.
+    #[default]
+    None,
+    /// Every job: the run uses only the fast class.
+    All,
+    /// CPOP: zero steps and each bidegree's critical signatures (by estimated cost).
+    Critical,
+}
+
+/// How the simulated coordinator places jobs.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Placement {
+    /// Speed-aware worker choice.
+    pub speed: SpeedConfig,
+    /// Pinning to the fast class.
+    pub pin: Pin,
 }
 
 impl Plan {
@@ -845,8 +949,17 @@ impl Plan {
                 format!("today (open<={open}, walk<={per_bidegree})")
             }
             Plan::Group => "group order, uncapped".into(),
-            Plan::Rank { oracle, age_limit } => format!(
-                "DAG rank{}{}",
+            Plan::Rank {
+                oracle,
+                age_limit,
+                group_first,
+            } => format!(
+                "{}DAG rank{}{}",
+                if *group_first {
+                    "group order, then "
+                } else {
+                    ""
+                },
                 if *oracle {
                     " (oracle costs)"
                 } else {
@@ -925,20 +1038,30 @@ struct Wk {
     busy: f64,
 }
 
-/// Simulate the whole run under `plan` on `fleet`, placing with `speed` (each worker's
+/// Simulate the whole run under `plan` on `fleet`, placing as `place` says (each worker's
 /// [`WorkerState::speed`] is its class's single-job throughput).
 pub fn simulate(
     world: &World,
     fleet: &Fleet,
     model: &dyn ServiceModel,
     plan: &Plan,
-    speed: SpeedConfig,
+    place: &Placement,
 ) -> WholeMetrics {
     let clock = std::time::Instant::now();
     let (rank, oracle, age_limit) = match plan {
-        Plan::Rank { oracle, age_limit } => (true, *oracle, *age_limit),
+        Plan::Rank {
+            oracle, age_limit, ..
+        } => (true, *oracle, *age_limit),
         _ => (false, false, None),
     };
+    let group_first = matches!(
+        plan,
+        Plan::Rank {
+            group_first: true,
+            ..
+        }
+    );
+    let speed = place.speed;
     let caps = match plan {
         Plan::Today { open, per_bidegree } => Some((*open, *per_bidegree)),
         _ => None,
@@ -946,6 +1069,7 @@ pub fn simulate(
     let policy = PriorityBackfill::new(BackfillConfig {
         age_limit,
         speed,
+        group_first,
         ..BackfillConfig::default()
     });
     let mut dag = DagScheduler::new(
@@ -980,7 +1104,22 @@ pub fn simulate(
         }
     }
     let slots_total: usize = fleet.groups.iter().map(|g| g.1 * g.2).sum();
-    let spec = |id: JobId, k: usize| JobSpec::new(id, Resources::ZERO, k as u64);
+    let fast_class = fleet
+        .groups
+        .iter()
+        .max_by(|a, b| {
+            model
+                .throughput(&a.0, 1)
+                .total_cmp(&model.throughput(&b.0, 1))
+        })
+        .map(|g| g.0.clone());
+    let spec = |id: JobId, k: usize, pinned: bool| {
+        let mut j = JobSpec::new(id, Resources::ZERO, k as u64);
+        if pinned {
+            j.class = fast_class.clone();
+        }
+        j
+    };
 
     // The bidegree level, declared up front: zero steps and "registered" passthroughs. Each
     // "registered" node also waits for its walk (a forward reference, declared when the bidegree
@@ -996,7 +1135,8 @@ pub fn simulate(
             .map(|&d| 4 * d as u64 + 1)
             .collect();
         jobs.push(
-            DagJob::new(spec(4 * k as u64, k), deps).with_work(cost(b.zero_est, b.zero_true)),
+            DagJob::new(spec(4 * k as u64, k, place.pin != Pin::None), deps)
+                .with_work(cost(b.zero_est, b.zero_true)),
         );
         let mut reg = vec![4 * k as u64, 4 * k as u64 + 2];
         reg.extend(world.index(b.s, b.t - 1).map(|p| 4 * p as u64 + 1));
@@ -1038,13 +1178,24 @@ pub fn simulate(
         if let Some(pi) = b.profile.filter(|_| b.live) {
             let info = &world.profiles[pi];
             let base = SIG_BASE + world.offsets[k];
+            let critical = match place.pin {
+                Pin::None => Vec::new(),
+                Pin::All => vec![true; info.template.len()],
+                Pin::Critical => info
+                    .template
+                    .critical_nodes(|i| world.sig_work(k, i, false), 1e-9),
+            };
             dag.declare_template(
                 &info.template,
                 |i| base + i as u64,
                 |i| {
                     let (est, truth) = (world.sig_work(k, i, false), world.sig_work(k, i, true));
                     if truth > 0.0 {
-                        DagJob::new(spec(0, k), vec![]).with_work(cost(est, truth))
+                        DagJob::new(
+                            spec(0, k, critical.get(i).copied().unwrap_or(false)),
+                            vec![],
+                        )
+                        .with_work(cost(est, truth))
                     } else {
                         DagJob::passthrough(0, k as u64, vec![], 0.0)
                     }
@@ -1151,6 +1302,7 @@ pub fn simulate(
             Ev::Release(id) => {
                 dag.release(id, now);
             }
+            // Stale wakeups (for jobs placed before their deadline) are harmless no-ops.
             Ev::Wake => {}
             Ev::Done(w, v) => {
                 if v != workers[w].version {
@@ -1197,10 +1349,17 @@ pub fn simulate(
         unfinished,
         plan.name()
     );
-    let makespan = now;
+    // The last completion, not the last event: stale wakeups may fire later.
+    let makespan = done_at.iter().copied().fold(0.0, f64::max);
     let busy: f64 = workers.iter().map(|w| w.busy).sum();
     WholeMetrics {
-        plan: plan.name() + &speed_name(&speed),
+        plan: plan.name()
+            + &speed_name(&speed)
+            + match place.pin {
+                Pin::None => "",
+                Pin::All => ", fast class only",
+                Pin::Critical => ", critical pinned to fast (CPOP)",
+            },
         makespan_h: makespan / 3600.0,
         tasks,
         slot_util: busy / (slots_total as f64 * makespan).max(1e-9),
@@ -1384,15 +1543,17 @@ mod tests {
             Plan::Rank {
                 oracle: false,
                 age_limit: Some(600.0),
+                group_first: false,
             },
             Plan::Rank {
                 oracle: true,
                 age_limit: None,
+                group_first: true,
             },
         ];
         let results: Vec<WholeMetrics> = plans
             .iter()
-            .map(|p| simulate(&world, &fleet, &model, p, SpeedConfig::default()))
+            .map(|p| simulate(&world, &fleet, &model, p, &Placement::default()))
             .collect();
         let expected = world.summary().signature_tasks + world.bideg.len() as u64;
         for m in &results {
@@ -1404,6 +1565,74 @@ mod tests {
             );
         }
         assert_eq!(results[0].peak_open, 2);
+        // Speed-aware placement on a mixed fleet; waiting for a fast slot must not drag the
+        // makespan out to its wait limit (stale wakeups once did).
+        let mixed = Fleet {
+            groups: vec![("x".into(), 1, 4), ("y".into(), 1, 4)],
+        };
+        let model = PsModel {
+            classes: BTreeMap::from([
+                (
+                    "x".to_string(),
+                    ClassCurve {
+                        speed: 1.0,
+                        k_sat: 4,
+                        alpha: 1.0,
+                    },
+                ),
+                (
+                    "y".to_string(),
+                    ClassCurve {
+                        speed: 3.0,
+                        k_sat: 4,
+                        alpha: 1.0,
+                    },
+                ),
+            ]),
+        };
+        let place = |policy, slow_gate| Placement {
+            speed: SpeedConfig { policy, slow_gate },
+            pin: Pin::None,
+        };
+        let fast = simulate(
+            &world,
+            &mixed,
+            &model,
+            &Plan::Group,
+            &place(SpeedPolicy::FastestFirst, None),
+        );
+        let defer = crate::Defer {
+            max_wait: 1e6,
+            min_gain: 0.0,
+        };
+        let eft = simulate(
+            &world,
+            &mixed,
+            &model,
+            &Plan::Group,
+            &place(SpeedPolicy::EarliestFinish(Some(defer)), None),
+        );
+        let gate = crate::SlowGate {
+            factor: 1.0,
+            max_wait: 1e6,
+        };
+        let gated = simulate(
+            &world,
+            &mixed,
+            &model,
+            &Plan::Group,
+            &place(SpeedPolicy::FastestFirst, Some(gate)),
+        );
+        for m in [&eft, &gated] {
+            assert_eq!(m.tasks, expected, "{}", m.plan);
+            assert!(
+                m.makespan_h < 1.5 * fast.makespan_h,
+                "{}: {} vs {}",
+                m.plan,
+                m.makespan_h,
+                fast.makespan_h
+            );
+        }
     }
 
     /// Missing census rows continue their row's exponential trend.
