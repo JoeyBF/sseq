@@ -13,8 +13,8 @@ pub use admission::{Admission, ProductionAdmission, WorkerView};
 pub use dag::DagSnapshot;
 pub use dag::{Dag, DagConfig, DagError, DagJob, DagScheduler, DagStats, DagTemplate};
 pub use engine::{
-    BackfillConfig, BestFit, BestFitConfig, Greedy, GreedyConfig, LaneSet, Lanes, LanesConfig,
-    PriorityBackfill,
+    BackfillConfig, BestFit, BestFitConfig, Defer, Greedy, GreedyConfig, LaneSet, Lanes,
+    LanesConfig, PriorityBackfill, SlowGate, SpeedConfig, SpeedPolicy,
 };
 
 /// A job identifier, chosen by the caller. Must be unique among live (waiting or running) jobs.
@@ -138,6 +138,10 @@ pub struct JobSpec {
     pub avoid: Vec<WorkerId>,
     /// If set, the job runs only on workers of this class (a hard constraint).
     pub class: Option<String>,
+    /// Estimated work, in seconds on a worker of [`WorkerState::speed`] 1.0. Used by
+    /// [`SpeedPolicy::EarliestFinish`] (and filled in from the DAG layer's estimate when unset).
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub work: Option<f64>,
 }
 
 impl JobSpec {
@@ -151,6 +155,7 @@ impl JobSpec {
             prefer: Vec::new(),
             avoid: Vec::new(),
             class: None,
+            work: None,
         }
     }
 }
@@ -171,6 +176,17 @@ pub struct WorkerState {
     pub reported_used: Resources,
     /// The part of `reported_used` not attributable to jobs (caches, runtime).
     pub reported_baseline: Resources,
+    /// How fast a job runs here, relative to a reference worker (1.0): a job with
+    /// [`JobSpec::work`] `w` takes `w / speed` seconds. Used by speed-aware placement
+    /// ([`SpeedPolicy`]); ignored otherwise. Default 1.0.
+    #[cfg_attr(feature = "serde", serde(default = "unit_speed"))]
+    pub speed: f64,
+}
+
+/// The default [`WorkerState::speed`].
+#[cfg(feature = "serde")]
+fn unit_speed() -> f64 {
+    1.0
 }
 
 impl WorkerState {
@@ -183,6 +199,7 @@ impl WorkerState {
             budget,
             reported_used: Resources::ZERO,
             reported_baseline: Resources::ZERO,
+            speed: 1.0,
         }
     }
 }
@@ -216,6 +233,8 @@ pub struct WorkerLoad {
     pub headroom: i64,
     /// The job this worker is reserved for, if any.
     pub reserved_for: Option<JobId>,
+    /// Its speed.
+    pub speed: f64,
 }
 
 /// A snapshot of a policy's state, for logs and metrics.
@@ -240,6 +259,10 @@ pub struct PolicyStats {
     /// Jobs the last `dispatch` placed on the worker they had reserved (a reservation paying
     /// off), in placement order.
     pub last_dispatch_holders: Vec<JobId>,
+    /// Jobs the last `dispatch` deliberately left waiting, at some point of its scan, for a faster
+    /// worker that was busy ([`Defer`]), and did not place afterwards: `(job, worker it waits
+    /// for, expected start there)`. Less urgent jobs may have taken slower workers meanwhile.
+    pub deferred: Vec<(JobId, WorkerId, Instant)>,
 }
 
 /// A placement policy, driven by events.
@@ -265,6 +288,12 @@ pub trait Policy {
     fn explain(&self, job: JobId) -> Option<String>;
     /// Counters and current state.
     fn stats(&self) -> PolicyStats;
+    /// The next time `dispatch` should be called even if no event arrives: a job's voluntary wait
+    /// (for a faster worker, or behind the slow-worker gate) expires then. `None` if nothing is
+    /// timed. Callers with frequent events may ignore it at the cost of that much extra waiting.
+    fn next_wakeup(&self) -> Option<Instant> {
+        None
+    }
 }
 
 impl<P: Policy + ?Sized> Policy for Box<P> {
@@ -306,5 +335,10 @@ impl<P: Policy + ?Sized> Policy for Box<P> {
     /// Forwarded to the boxed policy.
     fn stats(&self) -> PolicyStats {
         (**self).stats()
+    }
+
+    /// Forwarded.
+    fn next_wakeup(&self) -> Option<Instant> {
+        (**self).next_wakeup()
     }
 }

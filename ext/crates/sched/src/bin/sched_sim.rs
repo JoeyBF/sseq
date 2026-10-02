@@ -100,7 +100,7 @@ fn make_policy(name: &str, a: &Args) -> Option<BoxPolicy> {
         ..BackfillConfig::default()
     };
     Some(match name {
-        "greedy" => Box::new(Greedy::new(GreedyConfig {})),
+        "greedy" => Box::new(Greedy::new(GreedyConfig::default())),
         "backfill" => Box::new(PriorityBackfill::new(backfill)),
         "backfill-noreserve" => Box::new(PriorityBackfill::new(BackfillConfig {
             max_reservations: 0,
