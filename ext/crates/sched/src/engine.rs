@@ -467,7 +467,7 @@ impl<A: Admission> Engine<A> {
         self.mode
             .lanes
             .as_ref()
-            .is_some_and(|l| !demand.fits_within(&l.big_threshold))
+            .is_some_and(|l| demand.mem > l.big_threshold.mem)
     }
 
     /// Queue a job under its urgency key, recording its group's first arrival.
@@ -741,9 +741,15 @@ impl<A: Admission> Engine<A> {
         ends.sort_by(|a, b| a.0.total_cmp(&b.0));
         let fits = |running: usize, placed: Resources| {
             let state = &w.state;
+            let view = WorkerView {
+                state,
+                running,
+                placed,
+            };
             running < state.slots
                 && (running == 0
-                    || (state.reported_baseline + placed + demand).fits_within(&state.budget))
+                    || (state.reported_baseline.mem + placed.mem + demand.mem <= state.budget.mem
+                        && view.device_admits(demand.dev)))
         };
         let (mut running, mut placed) = (w.running, w.placed);
         if fits(running, placed) {
@@ -1368,6 +1374,7 @@ impl<A: Admission> Engine<A> {
             headroom: w.view().headroom(),
             reserved_for: w.reserved_for,
             speed: speed_of(w),
+            dev_headroom: w.view().dev_headroom(),
         }
     }
 
@@ -1423,6 +1430,7 @@ impl<A: Admission> Engine<A> {
         }
         let gate = self.gate_state();
         let (mut full, mut short, mut lane, mut excluded, mut slow) = (0, 0, 0, 0, 0);
+        let mut dev_short = 0;
         let mut best_short: Option<(i64, WorkerId)> = None;
         let mut reserved = Vec::new();
         let mut takers = Vec::new();
@@ -1434,6 +1442,9 @@ impl<A: Admission> Engine<A> {
                 Some(Refusal::ReservedFor(h)) => reserved.push(format!("worker {id} for job {h}")),
                 Some(Refusal::Lane) => lane += 1,
                 Some(Refusal::Admission) if w.running >= w.state.slots => full += 1,
+                Some(Refusal::Admission) if !w.view().device_admits(j.spec.demand.dev) => {
+                    dev_short += 1
+                }
                 Some(Refusal::Admission) => {
                     short += 1;
                     let h = w.view().headroom();
@@ -1454,6 +1465,9 @@ impl<A: Admission> Engine<A> {
                 "; memory short on {short} worker(s) (best headroom {:.2} GB on worker {w})",
                 h as f64 / GB
             );
+        }
+        if dev_short > 0 {
+            msg += &format!("; device memory short on {dev_short} worker(s)");
         }
         if lane > 0 {
             msg += &format!("; {lane} big lane(s) keep their reserve headroom");

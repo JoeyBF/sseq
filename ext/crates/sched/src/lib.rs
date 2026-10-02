@@ -37,44 +37,66 @@ pub type WorkerId = u64;
 /// caller should pass non-decreasing values.
 pub type Instant = f64;
 
-/// An additive resource vector.
+/// An additive resource vector: host memory and device memory.
 ///
-/// v1 tracks host memory only; the type is a struct so that further dimensions (GPU memory, CPU)
-/// can be added without changing call sites that use [`Resources::mem`] or the operators.
-/// Comparisons between vectors are component-wise ([`Resources::fits_within`]).
+/// Comparisons between vectors are component-wise ([`Resources::fits_within`]). As a capacity
+/// ([`WorkerState::budget`]), a zero `dev` means the worker's device capacity is unknown and is not
+/// enforced (see [`ProductionAdmission`]); as a demand, a zero `dev` means none.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[non_exhaustive]
 pub struct Resources {
     /// Host memory, in bytes.
     pub mem: u64,
+    /// Device (GPU) memory, in bytes.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub dev: u64,
+}
+
+/// Bytes in a gigabyte (10^9), rounding to the nearest byte.
+fn gb_bytes(gb: f64) -> u64 {
+    (gb.max(0.0) * 1e9).round() as u64
 }
 
 impl Resources {
     /// The largest representable vector (an "unbounded" capacity).
-    pub const MAX: Self = Self { mem: u64::MAX };
+    pub const MAX: Self = Self {
+        mem: u64::MAX,
+        dev: u64::MAX,
+    };
     /// No resources.
-    pub const ZERO: Self = Self { mem: 0 };
+    pub const ZERO: Self = Self { mem: 0, dev: 0 };
 
-    /// A vector with `bytes` of memory and nothing else.
+    /// A vector with `bytes` of host memory and nothing else.
     pub const fn mem(bytes: u64) -> Self {
-        Self { mem: bytes }
+        Self { mem: bytes, dev: 0 }
     }
 
-    /// A vector with `gb` gigabytes (10^9 bytes) of memory, rounded to the nearest byte.
+    /// A vector with `gb` gigabytes (10^9 bytes) of host memory, rounded to the nearest byte.
     pub fn mem_gb(gb: f64) -> Self {
-        Self::mem((gb.max(0.0) * 1e9).round() as u64)
+        Self::mem(gb_bytes(gb))
+    }
+
+    /// This vector with `bytes` of device memory.
+    pub const fn with_dev(self, bytes: u64) -> Self {
+        Self { dev: bytes, ..self }
+    }
+
+    /// This vector with `gb` gigabytes of device memory.
+    pub fn with_dev_gb(self, gb: f64) -> Self {
+        self.with_dev(gb_bytes(gb))
     }
 
     /// Whether every component of `self` is at most the matching component of `cap`.
     pub const fn fits_within(&self, cap: &Self) -> bool {
-        self.mem <= cap.mem
+        self.mem <= cap.mem && self.dev <= cap.dev
     }
 
     /// Component-wise maximum.
     pub fn max(self, other: Self) -> Self {
         Self {
             mem: self.mem.max(other.mem),
+            dev: self.dev.max(other.dev),
         }
     }
 
@@ -82,6 +104,7 @@ impl Resources {
     pub const fn saturating_add(self, other: Self) -> Self {
         Self {
             mem: self.mem.saturating_add(other.mem),
+            dev: self.dev.saturating_add(other.dev),
         }
     }
 
@@ -89,6 +112,7 @@ impl Resources {
     pub const fn saturating_sub(self, other: Self) -> Self {
         Self {
             mem: self.mem.saturating_sub(other.mem),
+            dev: self.dev.saturating_sub(other.dev),
         }
     }
 }
@@ -186,8 +210,14 @@ pub struct WorkerState {
     pub class: String,
     /// Maximum number of concurrent jobs.
     pub slots: usize,
-    /// Capacity.
+    /// Capacity: host memory, and device memory (the pool jobs' device allocations come from;
+    /// 0 = unknown, not enforced).
     pub budget: Resources,
+    /// Device memory one job of this worker is expected to take, learned by the worker (e.g. a
+    /// high percentile of recent launch requests); 0 = unknown. Each job counts for at least this
+    /// much against `budget.dev`, whatever its own [`JobSpec::demand`] says.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub dev_per_task: u64,
     /// Last reported resident usage (from a heartbeat; may lag by seconds).
     pub reported_used: Resources,
     /// The part of `reported_used` not attributable to jobs (caches, runtime).
@@ -216,6 +246,7 @@ impl WorkerState {
             reported_used: Resources::ZERO,
             reported_baseline: Resources::ZERO,
             speed: 1.0,
+            dev_per_task: 0,
         }
     }
 }
@@ -251,6 +282,9 @@ pub struct WorkerLoad {
     pub reserved_for: Option<JobId>,
     /// Its speed.
     pub speed: f64,
+    /// Device memory headroom as admission sees it (see [`WorkerView::dev_headroom`]); `None`
+    /// when the device capacity is unknown.
+    pub dev_headroom: Option<i64>,
 }
 
 /// A snapshot of a policy's state, for logs and metrics.

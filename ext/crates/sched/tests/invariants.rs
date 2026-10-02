@@ -121,6 +121,7 @@ enum Op {
         avoid_soft: bool,
         class: Option<u8>,
         work: Option<u32>,
+        dev: Option<u64>,
     },
     Complete(usize),
     Cancel(usize),
@@ -131,6 +132,8 @@ enum Op {
         used: u64,
         baseline: u64,
         class: u8,
+        dev_cap: u64,
+        per_task: u64,
     },
     Gone(WorkerId),
     Tick(u32),
@@ -148,8 +151,9 @@ fn op() -> impl Strategy<Value = Op> {
             any::<bool>(),
             prop::option::weighted(0.15, 0u8..2),
             prop::option::weighted(0.7, 1u32..120),
+            prop::option::weighted(0.5, 1u64..40),
         )
-            .prop_map(|(demand, group, priority, prefer, avoid, avoid_soft, class, work)| {
+            .prop_map(|(demand, group, priority, prefer, avoid, avoid_soft, class, work, dev)| {
                 Op::Submit {
                     demand,
                     group,
@@ -159,13 +163,24 @@ fn op() -> impl Strategy<Value = Op> {
                     avoid_soft,
                     class,
                     work,
+                    dev,
                 }
             }),
         4 => any::<prop::sample::Index>().prop_map(|i| Op::Complete(i.index(1 << 16))),
         1 => any::<prop::sample::Index>().prop_map(|i| Op::Cancel(i.index(1 << 16))),
-        2 => (0u64..4, 0usize..5, 20u64..150, 0u64..150, 0u64..60, 0u8..2).prop_map(
-            |(id, slots, budget, used, baseline, class)| Op::Worker { id, slots, budget, used, baseline, class }
-        ),
+        2 => (
+            0u64..4,
+            0usize..5,
+            20u64..150,
+            0u64..150,
+            0u64..60,
+            0u8..2,
+            prop_oneof![Just(0u64), 20u64..100],
+            prop_oneof![Just(0u64), 1u64..30],
+        )
+            .prop_map(|(id, slots, budget, used, baseline, class, dev_cap, per_task)| {
+                Op::Worker { id, slots, budget, used, baseline, class, dev_cap, per_task }
+            }),
         1 => (0u64..4).prop_map(Op::Gone),
         3 => (0u32..90).prop_map(Op::Tick),
     ]
@@ -248,6 +263,8 @@ struct Shadow {
     now: f64,
     workers: BTreeMap<WorkerId, WorkerState>,
     running: BTreeMap<JobId, (WorkerId, u64)>,
+    /// Device demands of jobs placed (looked up for the running ones).
+    devs: BTreeMap<JobId, u64>,
     /// Specs of running jobs, and how often each was preempted.
     specs: BTreeMap<JobId, (JobSpec, u32)>,
     waiting: BTreeMap<JobId, SJob>,
@@ -324,15 +341,32 @@ impl Shadow {
             .fold((0, 0), |(n, m), r| (n + 1, m + r.1))
     }
 
-    /// The production rule, written out again.
-    fn admits(&self, demand: u64, w: WorkerId) -> bool {
+    /// Device demand placed on a worker.
+    fn load_dev(&self, w: WorkerId) -> u64 {
+        self.running
+            .iter()
+            .filter(|r| r.1.0 == w)
+            .map(|r| self.devs.get(r.0).copied().unwrap_or(0))
+            .sum()
+    }
+
+    /// The production rule, written out again: host memory, and device memory unless the
+    /// worker's device capacity is unknown (0), each job counting at least `dev_per_task`.
+    fn admits(&self, demand: Resources, w: WorkerId) -> bool {
         let s = &self.workers[&w];
         let (running, placed) = self.load(w);
         if running >= s.slots {
             return false;
         }
-        running == 0
-            || s.reported_used.mem.max(s.reported_baseline.mem + placed) + demand <= s.budget.mem
+        if running == 0 {
+            return true;
+        }
+        let host =
+            s.reported_used.mem.max(s.reported_baseline.mem + placed) + demand.mem <= s.budget.mem;
+        let per = s.dev_per_task;
+        let dev_used = self.load_dev(w).max(running as u64 * per);
+        let device = s.budget.dev == 0 || dev_used + demand.dev.max(per) <= s.budget.dev;
+        host && device
     }
 
     /// The hard constraints (class, avoid list), written out again: a soft avoid list lapses
@@ -401,7 +435,9 @@ impl Shadow {
 /// Every policy is driven by the same random stream while a shadow model, written independently
 /// of the engine, keeps its own bookkeeping and re-checks each placement as it is made:
 ///
-/// - **no over-commit**: the production admission rule held at the moment of each placement;
+/// - **no over-commit**: the production admission rule held at the moment of each placement, host
+///   memory and device memory alike (the device rule never admits past capacity, escape hatch
+///   aside);
 /// - **hard constraints**: no job runs on a worker its class or avoid list excludes (a soft avoid
 ///   list only while some live worker of the class is off it);
 /// - **escape hatch**: after a dispatch, no worker with a free slot is empty while a job that may
@@ -433,10 +469,12 @@ fn run(kind: &Kind, speed: SpeedConfig, ops: &[Op]) -> Result<Vec<String>, TestC
                 avoid_soft,
                 class,
                 work,
+                dev,
             } => {
                 let id = sh.next_id;
                 sh.next_id += 1;
-                let mut spec = JobSpec::new(id, Resources::mem(demand), group);
+                let mut spec =
+                    JobSpec::new(id, Resources::mem(demand).with_dev(dev.unwrap_or(0)), group);
                 spec.priority = priority;
                 spec.prefer = prefer.into_iter().collect();
                 spec.avoid = avoid.into_iter().collect();
@@ -473,12 +511,20 @@ fn run(kind: &Kind, speed: SpeedConfig, ops: &[Op]) -> Result<Vec<String>, TestC
                 used,
                 baseline,
                 class,
+                dev_cap,
+                per_task,
             } => {
                 let s = WorkerState {
                     reported_used: Resources::mem(used),
                     reported_baseline: Resources::mem(baseline),
                     speed: class_speed(class),
-                    ..WorkerState::new(id, format!("c{class}"), slots, Resources::mem(budget))
+                    dev_per_task: per_task,
+                    ..WorkerState::new(
+                        id,
+                        format!("c{class}"),
+                        slots,
+                        Resources::mem(budget).with_dev(dev_cap),
+                    )
                 };
                 sh.workers.insert(id, s.clone());
                 p.worker_update(s, sh.now);
@@ -496,7 +542,8 @@ fn run(kind: &Kind, speed: SpeedConfig, ops: &[Op]) -> Result<Vec<String>, TestC
                         .collect();
                     for j in lost {
                         let (_, demand) = sh.running.remove(&j).unwrap();
-                        let mut spec = JobSpec::new(j, Resources::mem(demand), 0);
+                        let dev = sh.devs.get(&j).copied().unwrap_or(0);
+                        let mut spec = JobSpec::new(j, Resources::mem(demand).with_dev(dev), 0);
                         spec.avoid = vec![w];
                         sh.submit(spec, &mut *p);
                     }
@@ -554,7 +601,7 @@ fn run(kind: &Kind, speed: SpeedConfig, ops: &[Op]) -> Result<Vec<String>, TestC
             );
             // No over-commit (slots included).
             prop_assert!(
-                sh.admits(job.spec.demand.mem, w),
+                sh.admits(job.spec.demand, w),
                 "{kind:?}: job {j} over-commits worker {w}"
             );
             if matches!(kind, Kind::Lanes) {
@@ -576,7 +623,7 @@ fn run(kind: &Kind, speed: SpeedConfig, ops: &[Op]) -> Result<Vec<String>, TestC
                         let refused = deferred_any.contains(&a.spec.id)
                             || sh.gated(a, w, gate)
                             || !sh.eligible(&a.spec, w)
-                            || !sh.admits(a.spec.demand.mem, w)
+                            || !sh.admits(a.spec.demand, w)
                             || (matches!(kind, Kind::Lanes)
                                 && sh.lane_refuses(a.spec.demand.mem, w));
                         prop_assert!(
@@ -595,6 +642,7 @@ fn run(kind: &Kind, speed: SpeedConfig, ops: &[Op]) -> Result<Vec<String>, TestC
             }
             sh.waiting.remove(&j);
             sh.running.insert(j, (w, job.spec.demand.mem));
+            sh.devs.insert(j, job.spec.demand.dev);
             sh.specs.insert(j, (job.spec.clone(), 0));
         }
         let held: BTreeMap<JobId, WorkerId> = after
@@ -625,7 +673,7 @@ fn run(kind: &Kind, speed: SpeedConfig, ops: &[Op]) -> Result<Vec<String>, TestC
                 pr
             );
             prop_assert!(
-                sh.eligible(&spec, pr.to) && sh.admits(spec.demand.mem, pr.to),
+                sh.eligible(&spec, pr.to) && sh.admits(spec.demand, pr.to),
                 "{:?}",
                 pr
             );
@@ -643,7 +691,7 @@ fn run(kind: &Kind, speed: SpeedConfig, ops: &[Op]) -> Result<Vec<String>, TestC
             let wanted = sh.waiting.values().find(|j| {
                 !deferred.contains(&j.spec.id)
                     && sh.eligible(&j.spec, pr.to)
-                    && sh.admits(j.spec.demand.mem, pr.to)
+                    && sh.admits(j.spec.demand, pr.to)
                     && !(matches!(kind, Kind::Lanes) && sh.lane_refuses(j.spec.demand.mem, pr.to))
                     && !sh.gated(j, pr.to, gate)
             });
@@ -654,6 +702,7 @@ fn run(kind: &Kind, speed: SpeedConfig, ops: &[Op]) -> Result<Vec<String>, TestC
                 wanted.map(|j| j.spec.id)
             );
             sh.running.insert(pr.job, (pr.to, spec.demand.mem));
+            sh.devs.insert(pr.job, spec.demand.dev);
             sh.specs.insert(pr.job, (spec, n + 1));
             vacated.insert(pr.from);
         }
@@ -681,6 +730,12 @@ fn run(kind: &Kind, speed: SpeedConfig, ops: &[Op]) -> Result<Vec<String>, TestC
         for l in &after.workers {
             let (n, m) = sh.load(l.id);
             prop_assert_eq!((l.running, l.placed.mem), (n, m), "worker {} load", l.id);
+            prop_assert_eq!(
+                l.placed.dev,
+                sh.load_dev(l.id),
+                "worker {} device load",
+                l.id
+            );
         }
         let (max_res, per_class) = kind.max_reservations();
         let mut per: BTreeMap<String, usize> = BTreeMap::new();

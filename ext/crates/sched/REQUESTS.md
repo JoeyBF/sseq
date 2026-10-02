@@ -229,6 +229,37 @@ Registration, loading a saved bidegree and the commit step run on the coordinato
 
 ---
 
+### R13. Device memory as a second resource (new, 2026-10-02; blocks phase 1 deployment)
+
+A GPU out of memory is as costly as a host one (the user's words). Live evidence from job
+40506688 after our host estimates were calibrated:
+- every worker took 16 tasks, where the inflated estimates had held the 46 GB L40S cards at 7–10;
+- the multiply's device **launch pool** (card minus resident cache minus headroom: 19.5 GB on an
+  L40S) makes launches WAIT rather than fail;
+- one worker waited 23,500 s in about 2 h, with tasks holding their slots while they waited;
+- fleet output fell from 19.5 to about 8 billion products/h at 100% GPU utilization.
+
+What we built on our side (`ext`, uncommitted as I write):
+- the launch pool learns a per-task device **demand**: the 90th percentile of its last 256 launch
+  requests;
+- the worker gate admits only if `(running + 1) * demand <= pool cap` (plus the host rule; a task
+  alone always goes);
+- the heartbeat carries `dev_cap` and `dev_demand` (0 = unknown, which admits);
+- the gate's host baseline is now task-free (your R4), sampled as `rss - reserved`.
+
+What we'd like from the crate:
+- **`Resources` gets a device dimension,** e.g. `dev: u64`. `WorkerState` gets the device capacity
+  and the learned per-task device demand, or a per-job device demand when we can estimate one.
+- **The admission rule** becomes host AND device, with the escape hatch unchanged. Ours today is
+  the per-worker count form `tasks * demand <= cap`; a per-job sum form is better once we have
+  per-task device estimates.
+- **Replay:** the trace has no device data. Please make the device dimension optional, and add a
+  synthetic scenario for the sim: small-card workers with pool cap C, per-task demand D, and a
+  device-wait penalty when the sum exceeds C. Show that device-aware admission avoids the
+  slowdown at small cost.
+- **Done:** property tests that the device rule never admits past capacity (escape hatch aside),
+  and the RESULTS.md scenario.
+
 ## Status (from the crate side, 2026-10-02)
 
 All of R1–R12 are implemented and tested on branch `worktree-sched-crate`; the tag
@@ -249,8 +280,9 @@ has the replays.
 | R10 | `DagScheduler::close_instance(done_or_node, now) -> running ids` | no double `done`; ignored completions free resources |
 | R11 | `DagJob::local()` + `DagScheduler::take_local()`: never submitted, never released | unit test |
 | R12 | `snapshot`/`restore` (placed or running jobs come back submitted) | property test: random workloads, restarts at random points, every job completes exactly once |
+| R13 | `Resources::dev` (`with_dev_gb`), device pool as `WorkerState::budget.dev` (0 = unknown, admits), learned `WorkerState::dev_per_task`; `ProductionAdmission` is host AND device: `max(placed.dev, running * per_task) + max(demand.dev, per_task) <= pool`, escape hatch unchanged; count form and sum form both; the event log records device fields | invariants property test with device demands, caps and per-task demands (a mutation ignoring the device rule fails it); `sched-device` scenario in RESULTS.md: -39..-60% makespan at the live penalty |
 
-Three things that differ from what you assumed:
+Four things that differ from what you assumed:
 
 1. **Speed ratio.** At your measured 1.39x (L40S/H200), fast-first is worth about 9% on top of
    uncapping (it was about 25% at the fitted 2.41x); uncapping is still about 21%. Today ->
@@ -258,6 +290,10 @@ Three things that differ from what you assumed:
    start from your measured priors.
 2. **Estimates on the reference trace are about 1.7x actual use, not 6x**: the median of
    (RSS - idle) / estimates running is 0.595. Scaling them by 0.32 would put them below actual use.
-3. **Aging is FIFO by submission** among aged jobs: it bounds a job's wait behind work submitted
+3. **Report a per-task device demand near the mean job, not the 90th percentile.** In the count
+   form a high quantile is pessimistic for a sum (8 jobs' total concentrates near 8 x the mean):
+   with demand spread sd 0.3, p90 fits 5 jobs where 8 do, costing 53% when over-subscription is
+   harmless and leaving 39% instead of 56-60% at the live penalty. Per-job estimates are best.
+4. **Aging is FIFO by submission** among aged jobs: it bounds a job's wait behind work submitted
    after it, not behind work already queued. A restarted coordinator that resubmits everything at
    once should resubmit in `nassau::group` order.

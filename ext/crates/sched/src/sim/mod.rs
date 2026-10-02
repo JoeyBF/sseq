@@ -2,6 +2,8 @@
 
 /// The Milnor-subalgebra combinatorics that shape Nassau's job DAG.
 pub mod algebra;
+/// A synthetic device-memory scenario (small cards, a launch pool, device-aware admission).
+pub mod device;
 /// The processor-sharing service model and its fit to a trace.
 pub mod model;
 /// The event-driven replay and its metrics.

@@ -41,6 +41,11 @@ path = "src/bin/sched_whole.rs"
 required-features = ["sim"]
 
 [[bin]]
+name = "sched-device"
+path = "src/bin/sched_device.rs"
+required-features = ["sim"]
+
+[[bin]]
 name = "sched-pisa"
 path = "src/bin/sched_pisa.rs"
 required-features = ["sim"]
