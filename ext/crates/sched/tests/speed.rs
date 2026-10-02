@@ -41,6 +41,7 @@ fn fastest_first_picks_the_fast_worker() {
         policy: SpeedPolicy::FastestFirst,
         slow_gate: None,
         learn: None,
+        spoliation: None,
     };
     let policies: Vec<Box<dyn Policy>> = vec![
         Box::new(Greedy::new(GreedyConfig { speed })),
@@ -94,6 +95,7 @@ fn earliest_finish_defers_only_when_it_pays() {
         policy: SpeedPolicy::EarliestFinish(Some(defer)),
         slow_gate: None,
         learn: None,
+        spoliation: None,
     };
     for (running_work, expect_defer) in [(10.0, true), (1000.0, false)] {
         let mut p = backfill(speed);
@@ -134,6 +136,7 @@ fn deferral_expires() {
         policy: SpeedPolicy::EarliestFinish(Some(defer)),
         slow_gate: None,
         learn: None,
+        spoliation: None,
     };
     let mut p = backfill(speed);
     p.worker_update(worker(1, 1, 1.0), 0.0);
@@ -160,6 +163,7 @@ fn deferrals_book_slots_in_order() {
         policy: SpeedPolicy::EarliestFinish(Some(defer)),
         slow_gate: None,
         learn: None,
+        spoliation: None,
     };
     let mut p = backfill(speed);
     p.worker_update(worker(1, 1, 1.0), 0.0);
@@ -188,6 +192,7 @@ fn slow_gate() {
         policy: SpeedPolicy::FastestFirst,
         slow_gate: Some(gate),
         learn: None,
+        spoliation: None,
     };
     let mut p = backfill(speed);
     p.worker_update(worker(1, 2, 1.0), 0.0);
@@ -228,6 +233,7 @@ fn gate_exemptions() {
         policy: SpeedPolicy::FastestFirst,
         slow_gate: Some(gate),
         learn: None,
+        spoliation: None,
     };
     let mut p = PriorityBackfill::new(BackfillConfig {
         speed,
@@ -258,6 +264,7 @@ fn learned_speeds_replace_reported_ones() {
             weight: 0.05,
             min_samples: 20,
         }),
+        spoliation: None,
     };
     let mut p = backfill(speed);
     // Both report 1.0; worker 2 really runs three times faster.
@@ -293,4 +300,55 @@ fn learned_speeds_replace_reported_ones() {
     }
     p.submit(job(10_000, Some(6.0)), now);
     assert_eq!(p.dispatch(now), vec![(10_000, 2)]);
+}
+
+/// A long job stuck on a slow worker moves to a fast worker that frees up; completing it then
+/// releases the fast worker.
+#[test]
+fn spoliation_moves_a_stuck_job() {
+    let speed = SpeedConfig {
+        policy: SpeedPolicy::FastestFirst,
+        slow_gate: None,
+        learn: None,
+        spoliation: Some(sched::Spoliation::default()),
+    };
+    let mut p = backfill(speed);
+    p.worker_update(worker(1, 1, 1.0), 0.0);
+    p.worker_update(worker(2, 1, 4.0), 0.0);
+    // A short job takes the fast worker; the long one goes slow (100 s there, 25 s fast).
+    p.submit(job(0, Some(4.0)), 0.0);
+    p.submit(job(1, Some(100.0)), 0.0);
+    let d = p.dispatch_full(0.0);
+    assert_eq!(d.start, vec![(0, 2), (1, 1)]);
+    assert!(d.preempt.is_empty());
+    // The fast worker frees at 1 s: the long job ends at 100 s where it is, 26 s if restarted.
+    p.completed(0, 1.0);
+    let d = p.dispatch_full(1.0);
+    assert!(d.start.is_empty());
+    assert_eq!(
+        d.preempt,
+        vec![sched::Preemption {
+            job: 1,
+            from: 1,
+            to: 2
+        }]
+    );
+    // At most once: freeing the slow worker does not bounce it back.
+    assert!(p.dispatch_full(1.0).preempt.is_empty());
+    let loads = p.stats().workers;
+    assert_eq!((loads[0].running, loads[1].running), (0, 1));
+    p.completed(1, 26.0);
+    assert!(p.stats().workers.iter().all(|w| w.running == 0));
+    // Without spoliation, dispatch_full is plain dispatch.
+    let mut q = backfill(SpeedConfig {
+        spoliation: None,
+        ..speed
+    });
+    q.worker_update(worker(1, 1, 1.0), 0.0);
+    q.worker_update(worker(2, 1, 4.0), 0.0);
+    q.submit(job(0, Some(4.0)), 0.0);
+    q.submit(job(1, Some(100.0)), 0.0);
+    q.dispatch_full(0.0);
+    q.completed(0, 1.0);
+    assert!(q.dispatch_full(1.0).preempt.is_empty());
 }

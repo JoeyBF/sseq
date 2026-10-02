@@ -79,6 +79,34 @@ pub struct SpeedConfig {
     /// Learn each worker class's speed from completion times instead of trusting
     /// [`WorkerState::speed`].
     pub learn: Option<Learn>,
+    /// Restart running jobs on faster workers that would otherwise stay idle (only through
+    /// [`Policy::dispatch_full`](crate::Policy::dispatch_full)).
+    pub spoliation: Option<Spoliation>,
+}
+
+/// HeteroPrio's spoliation: after a dispatch, a worker with a free slot that no waiting job took
+/// restarts the running job, on a slower worker, that it would finish soonest relative to where
+/// it is (the one with the latest expected end among those that gain), if the restart finishes
+/// at least `min_gain` of the job's run time earlier. Needs [`JobSpec::work`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Spoliation {
+    /// Minimum gain, as a fraction of the job's run time on the faster worker.
+    pub min_gain: f64,
+    /// Seconds a restart costs on top of the run time.
+    pub restart_overhead: f64,
+    /// A job is preempted at most this many times (no ping-pong).
+    pub max_per_job: u32,
+}
+
+impl Default for Spoliation {
+    /// At least a quarter of the run time gained, no overhead, at most once per job.
+    fn default() -> Self {
+        Self {
+            min_gain: 0.25,
+            restart_overhead: 0.0,
+            max_per_job: 1,
+        }
+    }
 }
 
 /// Online speed learning: each completed job with [`JobSpec::work`] `w` that ran `d` seconds is a
@@ -258,6 +286,10 @@ struct Running {
     demand: Resources,
     started: Instant,
     work: Option<f64>,
+    /// Its spec (spoliation re-checks constraints on the new worker).
+    spec: JobSpec,
+    /// Times it was preempted.
+    preemptions: u32,
 }
 
 /// The slow-worker gate's view of the fleet during one `dispatch`.
@@ -604,15 +636,20 @@ impl<A: Admission> Engine<A> {
         if !self.admission.admits(&job.spec.demand, &view) {
             return Some(Refusal::Admission);
         }
-        if let Some(l) = &self.mode.lanes
-            && w.lane
-            && w.running > 0
-            && !self.is_big(&job.spec.demand)
-            && view.headroom() - (job.spec.demand.mem as i64) < l.lane_reserve.mem as i64
-        {
+        if self.lane_refuses(&job.spec.demand, w) {
             return Some(Refusal::Lane);
         }
         None
+    }
+
+    /// Whether a busy big lane keeps its reserve headroom from a small job of this demand.
+    fn lane_refuses(&self, demand: &Resources, w: &Worker) -> bool {
+        self.mode.lanes.as_ref().is_some_and(|l| {
+            w.lane
+                && w.running > 0
+                && !self.is_big(demand)
+                && w.view().headroom() - (demand.mem as i64) < l.lane_reserve.mem as i64
+        })
     }
 
     /// The gate's fleet view now, or `None` when there is no gate or no slower worker.
@@ -830,6 +867,8 @@ impl<A: Admission> Engine<A> {
                 demand: j.spec.demand,
                 started: self.now,
                 work: j.spec.work,
+                spec: j.spec,
+                preemptions: 0,
             },
         );
         self.placements_total += 1;
@@ -1071,6 +1110,79 @@ impl<A: Admission> Engine<A> {
         out
     }
 
+    /// Placements, then spoliation (see [`Spoliation`]).
+    fn dispatch_full(&mut self, now: Instant) -> crate::Dispatch {
+        let start = self.dispatch(now);
+        let preempt = self.spoliate();
+        crate::Dispatch { start, preempt }
+    }
+
+    /// Move running jobs from slower workers to faster ones with free slots left after dispatch.
+    fn spoliate(&mut self) -> Vec<crate::Preemption> {
+        let Some(cfg) = self.mode.speed.spoliation else {
+            return Vec::new();
+        };
+        let now = self.now;
+        let mut out = Vec::new();
+        let ids: Vec<WorkerId> = self.workers.keys().copied().collect();
+        for to in ids {
+            loop {
+                let w = &self.workers[&to];
+                if w.running >= w.state.slots || w.reserved_for.is_some() {
+                    break;
+                }
+                let sw = speed_of(w);
+                // Candidates: work known, on a slower worker, allowed and admitted here.
+                let mut best: Option<(f64, JobId)> = None;
+                for (&job, r) in &self.running {
+                    let (Some(work), Some(v)) = (r.work, self.workers.get(&r.worker)) else {
+                        continue;
+                    };
+                    let sv = speed_of(v);
+                    if sv >= sw || r.preemptions >= cfg.max_per_job || !eligible(&r.spec, w) {
+                        continue;
+                    }
+                    if !self.admission.admits(&r.demand, &w.view())
+                        || self.lane_refuses(&r.demand, w)
+                    {
+                        continue;
+                    }
+                    let end_here = r.started + work / sv;
+                    let end_v = if end_here > now {
+                        end_here
+                    } else {
+                        now + (now - r.started)
+                    };
+                    let run = work / sw;
+                    let end_w = now + run + cfg.restart_overhead;
+                    if end_v - end_w < cfg.min_gain * run || end_v <= end_w {
+                        continue;
+                    }
+                    if best.is_none_or(|(e, j)| end_v > e || (end_v == e && job < j)) {
+                        best = Some((end_v, job));
+                    }
+                }
+                let Some((_, job)) = best else { break };
+                let r = self.running.get_mut(&job).unwrap();
+                let from = r.worker;
+                r.worker = to;
+                r.started = now;
+                r.preemptions += 1;
+                let demand = r.demand;
+                let v = self.workers.get_mut(&from).unwrap();
+                v.running -= 1;
+                v.placed -= demand;
+                v.jobs.remove(&job);
+                let w = self.workers.get_mut(&to).unwrap();
+                w.running += 1;
+                w.placed += demand;
+                w.jobs.insert(job);
+                out.push(crate::Preemption { job, from, to });
+            }
+        }
+        out
+    }
+
     /// A worker's load as reported in the stats.
     fn load(&self, w: &Worker) -> WorkerLoad {
         WorkerLoad {
@@ -1265,6 +1377,11 @@ macro_rules! policy {
             /// Forwarded to the engine.
             fn next_wakeup(&self) -> Option<Instant> {
                 self.0.wakeup
+            }
+
+            /// Forwarded to the engine.
+            fn dispatch_full(&mut self, now: Instant) -> crate::Dispatch {
+                self.0.dispatch_full(now)
             }
         }
     };
