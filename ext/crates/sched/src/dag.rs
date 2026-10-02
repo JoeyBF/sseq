@@ -21,6 +21,146 @@ pub struct DagJob {
     pub deps: Vec<JobId>,
     /// Relative cost, for ranking. `None` uses [`DagConfig::default_work`].
     pub work_estimate: Option<f64>,
+    /// A pure synchronisation point ("group G is done"): when ready it completes by itself
+    /// instead of being submitted to the policy. Its `work_estimate` still counts in ranks, which
+    /// lets a placeholder stand for work that is not expanded yet (lower it later with
+    /// [`DagScheduler::update_work`]).
+    pub passthrough: bool,
+}
+
+impl DagJob {
+    /// A job to run, with default work.
+    pub fn new(spec: JobSpec, deps: Vec<JobId>) -> Self {
+        Self {
+            spec,
+            deps,
+            work_estimate: None,
+            passthrough: false,
+        }
+    }
+
+    /// A passthrough job (see [`DagJob::passthrough`]) of group `group`, worth `work` in ranks.
+    pub fn passthrough(id: JobId, group: u64, deps: Vec<JobId>, work: f64) -> Self {
+        Self {
+            spec: JobSpec::new(id, crate::Resources::ZERO, group),
+            deps,
+            work_estimate: Some(work),
+            passthrough: true,
+        }
+    }
+
+    /// Set the work estimate.
+    pub fn with_work(mut self, work: f64) -> Self {
+        self.work_estimate = Some(work);
+        self
+    }
+}
+
+/// A reusable dependency structure over nodes `0..len`, instantiated once per group with
+/// [`DagScheduler::declare_template`] (e.g. one signature DAG per subalgebra profile, shared by
+/// every bidegree with that profile). Building it checks acyclicity once.
+#[derive(Clone, Debug)]
+pub struct DagTemplate {
+    succ: Vec<Vec<u32>>,
+    pred: Vec<Vec<u32>>,
+    /// A topological order.
+    topo: Vec<u32>,
+}
+
+impl DagTemplate {
+    /// A template with `len` nodes and the given edges `(from, to)`: `to` depends on `from`.
+    /// Duplicate edges are merged; out-of-range nodes panic; a cycle is an error naming a node on
+    /// it.
+    pub fn new(len: usize, edges: impl IntoIterator<Item = (u32, u32)>) -> Result<Self, DagError> {
+        let mut succ: Vec<Vec<u32>> = vec![Vec::new(); len];
+        for (a, b) in edges {
+            assert!(
+                (a as usize) < len && (b as usize) < len,
+                "edge ({a}, {b}) out of range"
+            );
+            succ[a as usize].push(b);
+        }
+        let mut pred: Vec<Vec<u32>> = vec![Vec::new(); len];
+        for (a, row) in succ.iter_mut().enumerate() {
+            row.sort_unstable();
+            row.dedup();
+            for &b in row.iter() {
+                pred[b as usize].push(a as u32);
+            }
+        }
+        // Kahn's algorithm.
+        let mut indeg: Vec<usize> = pred.iter().map(Vec::len).collect();
+        let mut topo: Vec<u32> = (0..len as u32)
+            .filter(|&i| indeg[i as usize] == 0)
+            .collect();
+        let mut i = 0;
+        while i < topo.len() {
+            for &b in &succ[topo[i] as usize] {
+                indeg[b as usize] -= 1;
+                if indeg[b as usize] == 0 {
+                    topo.push(b);
+                }
+            }
+            i += 1;
+        }
+        if topo.len() < len {
+            let job = indeg.iter().position(|&d| d > 0).unwrap() as JobId;
+            return Err(DagError::Cycle { job });
+        }
+        Ok(Self { succ, pred, topo })
+    }
+
+    /// Number of nodes.
+    pub fn len(&self) -> usize {
+        self.succ.len()
+    }
+
+    /// Whether the template has no nodes.
+    pub fn is_empty(&self) -> bool {
+        self.succ.is_empty()
+    }
+
+    /// Number of (deduplicated) edges.
+    pub fn edge_count(&self) -> usize {
+        self.succ.iter().map(Vec::len).sum()
+    }
+
+    /// The nodes depending directly on `node`.
+    pub fn successors(&self, node: usize) -> &[u32] {
+        &self.succ[node]
+    }
+
+    /// The nodes `node` depends on directly.
+    pub fn predecessors(&self, node: usize) -> &[u32] {
+        &self.pred[node]
+    }
+
+    /// Nodes with no dependency inside the template (they receive a group's entry dependencies).
+    pub fn sources(&self) -> impl Iterator<Item = usize> + '_ {
+        (0..self.len()).filter(|&i| self.pred[i].is_empty())
+    }
+
+    /// Nodes nothing in the template depends on (a group is done when they are).
+    pub fn sinks(&self) -> impl Iterator<Item = usize> + '_ {
+        (0..self.len()).filter(|&i| self.succ[i].is_empty())
+    }
+
+    /// The longest chain of `work` through the template: a group's duration with unlimited
+    /// workers, i.e. the cost to give its placeholder.
+    pub fn critical_path(&self, work: impl Fn(usize) -> f64) -> f64 {
+        let mut below = vec![0.0f64; self.len()];
+        let mut best = 0.0f64;
+        for &n in self.topo.iter().rev() {
+            let n = n as usize;
+            let tail = self.succ[n]
+                .iter()
+                .map(|&c| below[c as usize])
+                .fold(0.0, f64::max);
+            below[n] = work(n) + tail;
+            best = best.max(below[n]);
+        }
+        best
+    }
 }
 
 /// Errors from [`Dag::declare`]. A failed declaration changes nothing.
@@ -67,6 +207,10 @@ pub struct DagConfig {
     /// with [`DagScheduler::release`] when it is actually sendable (e.g. after coordinator-side
     /// preparation).
     pub auto_submit: bool,
+    /// Record passthrough jobs as they complete, for [`DagScheduler::take_passed`]. Default false
+    /// (a caller that never drains the list would grow it without bound).
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub record_passthrough: bool,
 }
 
 impl Default for DagConfig {
@@ -78,6 +222,7 @@ impl Default for DagConfig {
             default_work: 1.0,
             rank_epsilon: 0.01,
             auto_submit: true,
+            record_passthrough: false,
         }
     }
 }
@@ -107,6 +252,9 @@ struct Node {
     work: f64,
     /// Upward rank: work plus the longest chain of work among descendants (approximate).
     rank: f64,
+    /// Completes by itself when ready (see [`DagJob::passthrough`]).
+    #[cfg_attr(feature = "serde", serde(default))]
+    passthrough: bool,
 }
 
 /// Counters describing the DAG layer's state.
@@ -177,6 +325,10 @@ pub struct DagScheduler<P> {
     /// group -> placeholder groups that wait for it.
     waiters: HashMap<u64, Vec<u64>>,
     tail_memo: HashMap<u64, f64>,
+    /// Ready passthrough nodes waiting for `drain_passthrough`.
+    passing: Vec<NodeIndex>,
+    /// Completed passthrough ids, for `take_passed`.
+    passed: Vec<JobId>,
     now: Instant,
 }
 
@@ -194,6 +346,8 @@ impl<P: Policy> DagScheduler<P> {
             placeholders: BTreeMap::new(),
             waiters: HashMap::new(),
             tail_memo: HashMap::new(),
+            passing: Vec::new(),
+            passed: Vec::new(),
             now: 0.0,
         }
     }
@@ -303,6 +457,7 @@ impl<P: Policy> DagScheduler<P> {
             unmet: 0,
             work: 0.0,
             rank: 0.0,
+            passthrough: false,
         });
         self.index.insert(id, n);
         n
@@ -417,6 +572,11 @@ impl<P: Policy> DagScheduler<P> {
 
     /// Record that a job has no unmet dependencies left, and submit or hold it.
     fn make_ready(&mut self, n: NodeIndex, now: Instant) {
+        if self.graph[n].passthrough {
+            self.graph[n].state = State::Held;
+            self.passing.push(n);
+            return;
+        }
         self.newly_ready.push(self.graph[n].id);
         if self.config.auto_submit {
             self.submit_node(n, now);
@@ -441,12 +601,108 @@ impl<P: Policy> DagScheduler<P> {
             node.spec = None;
             node.unmet = 0;
             node.work = 0.0;
+            node.passthrough = false;
         }
         for &n in created {
             if let Some(node) = self.graph.remove_node(n) {
                 self.index.remove(&node.id);
             }
         }
+    }
+
+    /// Release `job`'s dependents, drop its node and remember it as completed.
+    fn finish(&mut self, job: JobId, now: Instant) {
+        if let Some(n) = self.index.remove(&job) {
+            let mut dependents: Vec<_> = self
+                .graph
+                .neighbors_directed(n, Outgoing)
+                .map(|c| (self.graph[c].id, c))
+                .collect();
+            dependents.sort_unstable();
+            self.graph.remove_node(n);
+            for (_, c) in dependents {
+                let node = &mut self.graph[c];
+                node.unmet -= 1;
+                if node.unmet == 0 && node.state == State::Pending {
+                    self.make_ready(c, now);
+                }
+            }
+        }
+        if job >= self.completed_floor {
+            self.completed.insert(job);
+        }
+    }
+
+    /// Complete every ready passthrough job, and the ones that become ready as a result (a
+    /// worklist, so long chains of them do not recurse).
+    fn drain_passthrough(&mut self, now: Instant) {
+        while let Some(n) = self.passing.pop() {
+            let id = self.graph[n].id;
+            if self.config.record_passthrough {
+                self.passed.push(id);
+            }
+            self.finish(id, now);
+        }
+    }
+
+    /// Passthrough jobs completed since the last call, in completion order (only with
+    /// [`DagConfig::record_passthrough`]).
+    pub fn take_passed(&mut self) -> Vec<JobId> {
+        std::mem::take(&mut self.passed)
+    }
+
+    /// Change a declared job's work estimate (e.g. once its real size is known) and re-rank it
+    /// and its ancestors, up or down. Returns false for unknown or completed jobs. Jobs already
+    /// handed to the policy keep the priority they were submitted with.
+    pub fn update_work(&mut self, job: JobId, work: f64) -> bool {
+        let Some(&n) = self.index.get(&job) else {
+            return false;
+        };
+        self.graph[n].work = work;
+        let eps = self.config.rank_epsilon.max(0.0);
+        let mut stack = vec![n];
+        let mut first = true;
+        while let Some(m) = stack.pop() {
+            let below = self
+                .graph
+                .neighbors_directed(m, Outgoing)
+                .map(|c| self.graph[c].rank)
+                .fold(0.0, f64::max);
+            let new = self.graph[m].work + below;
+            let old = self.graph[m].rank;
+            if first || (new - old).abs() > eps * old.abs().max(new.abs()) {
+                self.graph[m].rank = new;
+                stack.extend(self.graph.neighbors_directed(m, Incoming));
+            }
+            first = false;
+        }
+        true
+    }
+
+    /// Instantiate `template` as jobs: node `i` becomes job `id(i)`, built by `node(i)` (which
+    /// supplies the spec, work and whether it is a passthrough; its id and `deps` are replaced).
+    /// Template edges become dependencies, and every source node also depends on `entry`. Edges
+    /// to and from existing jobs are still checked for cycles.
+    pub fn declare_template(
+        &mut self,
+        template: &DagTemplate,
+        id: impl Fn(usize) -> JobId,
+        mut node: impl FnMut(usize) -> DagJob,
+        entry: &[JobId],
+        now: Instant,
+    ) -> Result<(), DagError> {
+        let jobs = (0..template.len())
+            .map(|i| {
+                let mut j = node(i);
+                j.spec.id = id(i);
+                j.deps = template.pred[i].iter().map(|&p| id(p as usize)).collect();
+                if j.deps.is_empty() {
+                    j.deps.extend_from_slice(entry);
+                }
+                j
+            })
+            .collect();
+        self.declare(jobs, now)
     }
 
     /// Restore a scheduler from a snapshot, in front of a fresh `policy`. Jobs that were submitted
@@ -541,6 +797,7 @@ impl<P: Policy> Dag for DagScheduler<P> {
             node.state = State::Pending;
             node.spec = Some(j.spec.clone());
             node.work = j.work_estimate.unwrap_or(self.config.default_work);
+            node.passthrough = j.passthrough;
             batch.push(n);
         }
         for (j, &n) in jobs.iter().zip(&batch) {
@@ -581,6 +838,7 @@ impl<P: Policy> Dag for DagScheduler<P> {
                 self.make_ready(n, now);
             }
         }
+        self.drain_passthrough(now);
         Ok(())
     }
 
@@ -598,25 +856,8 @@ impl<P: Policy> Dag for DagScheduler<P> {
     fn completed(&mut self, job: JobId, now: Instant) {
         self.now = now;
         self.policy.completed(job, now);
-        if let Some(n) = self.index.remove(&job) {
-            let mut dependents: Vec<_> = self
-                .graph
-                .neighbors_directed(n, Outgoing)
-                .map(|c| (self.graph[c].id, c))
-                .collect();
-            dependents.sort_unstable();
-            self.graph.remove_node(n);
-            for (_, c) in dependents {
-                let node = &mut self.graph[c];
-                node.unmet -= 1;
-                if node.unmet == 0 && node.state == State::Pending {
-                    self.make_ready(c, now);
-                }
-            }
-        }
-        if job >= self.completed_floor {
-            self.completed.insert(job);
-        }
+        self.finish(job, now);
+        self.drain_passthrough(now);
     }
 
     /// Remove the job and its descendants, then any forward references only they needed.

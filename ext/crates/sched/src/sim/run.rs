@@ -346,6 +346,7 @@ pub fn simulate(setup: &SimSetup, name: &str, policy: BoxPolicy) -> Metrics {
                     spec: spec(trace, j),
                     deps: d.into_iter().map(|x| x as u64).collect(),
                     work_estimate: Some(setup.work[j]),
+                    passthrough: false,
                 })
                 .collect();
             dag.declare(jobs, 0.0)

@@ -154,6 +154,11 @@ struct Running {
     demand: Resources,
 }
 
+/// Whether `job`'s hard constraints (class, avoid list) allow `w` at all.
+fn eligible(job: &JobSpec, w: &Worker) -> bool {
+    job.class.as_ref().is_none_or(|c| *c == w.state.class) && !job.avoid.contains(&w.state.id)
+}
+
 /// Position of `dispatch`'s scan: first the aged jobs by age, then the rest by urgency.
 #[derive(Clone, Copy, Debug)]
 enum Cursor {
@@ -163,6 +168,7 @@ enum Cursor {
 
 /// Why a worker does not take a job, for `explain`.
 enum Refusal {
+    Ineligible,
     ReservedFor(JobId),
     Lane,
     Admission,
@@ -376,6 +382,9 @@ impl<A: Admission> Engine<A> {
     /// Whether `w` takes the job, or why not. Reservations and lanes are checked here; everything
     /// else is the admission rule.
     fn refusal(&self, job: &Waiting, w: &Worker) -> Option<Refusal> {
+        if !eligible(&job.spec, w) {
+            return Some(Refusal::Ineligible);
+        }
         if let Some(holder) = w.reserved_for
             && holder != job.spec.id
         {
@@ -525,7 +534,11 @@ impl<A: Admission> Engine<A> {
         // Most headroom; then preferred; then fewest running; then smallest id.
         let mut best: Option<((i64, bool, usize), WorkerId)> = None;
         for (&id, w) in &self.workers {
-            if w.reserved_for.is_some() || w.state.slots == 0 || class_full(&w.state.class) {
+            if w.reserved_for.is_some()
+                || w.state.slots == 0
+                || class_full(&w.state.class)
+                || !eligible(&j.spec, w)
+            {
                 continue;
             }
             let score = (
@@ -548,6 +561,7 @@ impl<A: Admission> Engine<A> {
         let victim = self
             .reservations
             .iter()
+            .filter(|r| eligible(&j.spec, &self.workers[&r.1]))
             .map(|r| (self.urgency(&self.waiting[&r.0]), r.0))
             .filter(|(u, _)| *u > mine)
             .max();
@@ -701,13 +715,14 @@ impl<A: Admission> Engine<A> {
                 w.view().headroom() as f64 / GB
             );
         }
-        let (mut full, mut short, mut lane) = (0, 0, 0);
+        let (mut full, mut short, mut lane, mut excluded) = (0, 0, 0, 0);
         let mut best_short: Option<(i64, WorkerId)> = None;
         let mut reserved = Vec::new();
         let mut takers = Vec::new();
         for (&id, w) in &self.workers {
             match self.refusal(j, w) {
                 None => takers.push(id),
+                Some(Refusal::Ineligible) => excluded += 1,
                 Some(Refusal::ReservedFor(h)) => reserved.push(format!("worker {id} for job {h}")),
                 Some(Refusal::Lane) => lane += 1,
                 Some(Refusal::Admission) if w.running >= w.state.slots => full += 1,
@@ -734,6 +749,9 @@ impl<A: Admission> Engine<A> {
         }
         if lane > 0 {
             msg += &format!("; {lane} big lane(s) keep their reserve headroom");
+        }
+        if excluded > 0 {
+            msg += &format!("; {excluded} worker(s) excluded by its class or avoid list");
         }
         if !reserved.is_empty() {
             msg += &format!("; reserved: {}", reserved.join(", "));
