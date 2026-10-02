@@ -10,6 +10,9 @@ use petgraph::{
 
 use crate::{Instant, JobId, JobSpec, Policy, PolicyStats, WorkerId, WorkerState};
 
+mod instance;
+pub use instance::InstanceSpec;
+
 /// A job with dependencies.
 #[derive(Clone, Debug, PartialEq)]
 pub struct DagJob {
@@ -60,6 +63,7 @@ impl DagJob {
 /// [`DagScheduler::declare_template`] (e.g. one signature DAG per subalgebra profile, shared by
 /// every bidegree with that profile). Building it checks acyclicity once.
 #[derive(Clone, Debug)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct DagTemplate {
     succ: Vec<Vec<u32>>,
     pred: Vec<Vec<u32>>,
@@ -219,8 +223,13 @@ impl DagTemplate {
     /// The longest chain of `work` through the template: a group's duration with unlimited
     /// workers, i.e. the cost to give its placeholder.
     pub fn critical_path(&self, work: impl Fn(usize) -> f64) -> f64 {
+        self.bottom_levels(work).into_iter().fold(0.0, f64::max)
+    }
+
+    /// Each node's bottom level: its work plus the longest chain of work below it (its upward
+    /// rank within the template).
+    pub fn bottom_levels(&self, work: impl Fn(usize) -> f64) -> Vec<f64> {
         let mut below = vec![0.0f64; self.len()];
-        let mut best = 0.0f64;
         for &n in self.topo.iter().rev() {
             let n = n as usize;
             let tail = self.succ[n]
@@ -228,9 +237,8 @@ impl DagTemplate {
                 .map(|&c| below[c as usize])
                 .fold(0.0, f64::max);
             below[n] = work(n) + tail;
-            best = best.max(below[n]);
         }
-        best
+        below
     }
 }
 
@@ -282,6 +290,11 @@ pub struct DagConfig {
     /// (a caller that never drains the list would grow it without bound).
     #[cfg_attr(feature = "serde", serde(default))]
     pub record_passthrough: bool,
+    /// At most this many implicit instances may be open (entry completed, nodes releasable) at
+    /// once; further ones wait, in the order their entries completed, until one closes. Bounds the
+    /// coordinator's frontier state. `None` (the default): unbounded. At least 1 is enforced.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub max_open_instances: Option<usize>,
 }
 
 impl Default for DagConfig {
@@ -294,6 +307,7 @@ impl Default for DagConfig {
             rank_epsilon: 0.01,
             auto_submit: true,
             record_passthrough: false,
+            max_open_instances: None,
         }
     }
 }
@@ -326,6 +340,10 @@ struct Node {
     /// Completes by itself when ready (see [`DagJob::passthrough`]).
     #[cfg_attr(feature = "serde", serde(default))]
     passthrough: bool,
+    /// Rank contributed by implicit instances this job is the entry of: their critical path plus
+    /// their `done` job's rank (they have no edges for ranks to flow along).
+    #[cfg_attr(feature = "serde", serde(default))]
+    implicit_below: f64,
 }
 
 /// Counters describing the DAG layer's state.
@@ -345,6 +363,13 @@ pub struct DagStats {
     pub completed_remembered: usize,
     /// Declared group placeholders.
     pub placeholders: usize,
+    /// Implicit instances ([`InstanceSpec`]) declared and not finished; their nodes count in
+    /// `pending`, `held` and `submitted`.
+    pub instances: usize,
+    /// Of those, the ones whose entry completed and that are not throttled.
+    pub instances_open: usize,
+    /// Approximate memory held by instances (counters, work, flags), bytes.
+    pub instance_bytes: usize,
 }
 
 /// The dependency layer's interface. [`DagScheduler`] implements it over any [`Policy`].
@@ -400,6 +425,17 @@ pub struct DagScheduler<P> {
     passing: Vec<NodeIndex>,
     /// Completed passthrough ids, for `take_passed`.
     passed: Vec<JobId>,
+    /// Implicit template instances (see [`InstanceSpec`]); `None` for free slots.
+    instances: Vec<Option<instance::Instance>>,
+    free_instances: Vec<usize>,
+    /// Instance base id -> slot.
+    by_base: BTreeMap<JobId, usize>,
+    /// Instances whose entry completed while `max_open_instances` was reached, oldest first.
+    waiting_to_open: std::collections::VecDeque<usize>,
+    /// Entry job -> instances whose sources wait for it.
+    by_entry: HashMap<JobId, Vec<usize>>,
+    /// An instance's `done` job -> (its entry, its critical path), for rank propagation.
+    by_done: HashMap<JobId, Vec<(JobId, f64)>>,
     now: Instant,
 }
 
@@ -419,6 +455,12 @@ impl<P: Policy> DagScheduler<P> {
             tail_memo: HashMap::new(),
             passing: Vec::new(),
             passed: Vec::new(),
+            instances: Vec::new(),
+            free_instances: Vec::new(),
+            by_base: BTreeMap::new(),
+            waiting_to_open: std::collections::VecDeque::new(),
+            by_entry: HashMap::new(),
+            by_done: HashMap::new(),
             now: 0.0,
         }
     }
@@ -443,6 +485,9 @@ impl<P: Policy> DagScheduler<P> {
     /// false if the job is not held.
     pub fn release(&mut self, job: JobId, now: Instant) -> bool {
         self.now = now;
+        if self.instance_of(job).is_some() {
+            return self.instance_release(job, now, instance::HELD);
+        }
         match self.index.get(&job) {
             Some(&n) if self.graph[n].state == State::Held => {
                 self.submit_node(n, now);
@@ -456,6 +501,9 @@ impl<P: Policy> DagScheduler<P> {
     /// and has not completed.
     pub fn resubmit(&mut self, job: JobId, now: Instant) -> bool {
         self.now = now;
+        if self.instance_of(job).is_some() {
+            return self.instance_release(job, now, instance::SUBMITTED);
+        }
         match self.index.get(&job) {
             Some(&n) if self.graph[n].state == State::Submitted => {
                 self.submit_node(n, now);
@@ -511,6 +559,13 @@ impl<P: Policy> DagScheduler<P> {
                 State::Submitted => s.submitted += 1,
             }
         }
+        let (p, h, sub) = self.instance_counts();
+        s.pending += p;
+        s.held += h;
+        s.submitted += sub;
+        s.instances = self.instances.iter().flatten().count();
+        s.instances_open = self.instances.iter().flatten().filter(|i| i.open).count();
+        s.instance_bytes = self.instance_bytes();
         s
     }
 
@@ -529,6 +584,7 @@ impl<P: Policy> DagScheduler<P> {
             work: 0.0,
             rank: 0.0,
             passthrough: false,
+            implicit_below: 0.0,
         });
         self.index.insert(id, n);
         n
@@ -584,6 +640,28 @@ impl<P: Policy> DagScheduler<P> {
                 if cand > old * (1.0 + eps) && cand > old {
                     self.graph[p].rank = cand;
                     stack.push(p);
+                }
+            }
+            // Across implicit instances: `n` may be the `done` job of instances whose entries
+            // must see its rank through the instance's critical path.
+            let links = self
+                .by_done
+                .get(&self.graph[n].id)
+                .cloned()
+                .unwrap_or_default();
+            for (entry, cp) in links {
+                let Some(&e) = self.index.get(&entry) else {
+                    continue;
+                };
+                let below = cp + r;
+                if below > self.graph[e].implicit_below {
+                    self.graph[e].implicit_below = below;
+                    let cand = self.graph[e].work + below;
+                    let old = self.graph[e].rank;
+                    if cand > old * (1.0 + eps) && cand > old {
+                        self.graph[e].rank = cand;
+                        stack.push(e);
+                    }
                 }
             }
         }
@@ -685,8 +763,56 @@ impl<P: Policy> DagScheduler<P> {
         }
     }
 
+    /// `cancel` for an explicit job (and its explicit descendants).
+    fn cancel_explicit(&mut self, job: JobId) -> Vec<JobId> {
+        let Some(&start) = self.index.get(&job) else {
+            self.policy.cancel(job);
+            return Vec::new();
+        };
+        let mut doomed = BTreeSet::new();
+        let mut stack = vec![start];
+        while let Some(n) = stack.pop() {
+            if doomed.insert((self.graph[n].id, n)) {
+                stack.extend(self.graph.neighbors_directed(n, Outgoing));
+            }
+        }
+        let mut orphan_candidates = Vec::new();
+        let mut cancelled = Vec::with_capacity(doomed.len());
+        for &(id, n) in &doomed {
+            orphan_candidates.extend(self.graph.neighbors_directed(n, Incoming));
+            if self.graph[n].state == State::Submitted {
+                self.policy.cancel(id);
+            }
+            if self.graph[n].state != State::Undeclared {
+                cancelled.push(id);
+            }
+        }
+        for &(id, n) in &doomed {
+            self.graph.remove_node(n);
+            self.index.remove(&id);
+        }
+        self.newly_ready
+            .retain(|j| !doomed.iter().any(|d| d.0 == *j));
+        // Forward references kept alive only by the cancelled jobs are no longer needed.
+        for n in orphan_candidates {
+            let orphan = self
+                .graph
+                .node_weight(n)
+                .is_some_and(|w| w.state == State::Undeclared)
+                && self.graph.neighbors_directed(n, Outgoing).next().is_none();
+            if orphan && let Some(w) = self.graph.remove_node(n) {
+                self.index.remove(&w.id);
+            }
+        }
+        cancelled
+    }
+
     /// Release `job`'s dependents, drop its node and remember it as completed.
     fn finish(&mut self, job: JobId, now: Instant) {
+        if let Some((slot, i)) = self.instance_of(job) {
+            self.finish_instance_node(slot, i, now);
+            return;
+        }
         if let Some(n) = self.index.remove(&job) {
             let mut dependents: Vec<_> = self
                 .graph
@@ -705,6 +831,13 @@ impl<P: Policy> DagScheduler<P> {
         }
         if job >= self.completed_floor {
             self.completed.insert(job);
+        }
+        if let Some(slots) = self.by_entry.remove(&job) {
+            for slot in slots {
+                if self.instances[slot].is_some() {
+                    self.open_sources(slot, now);
+                }
+            }
         }
     }
 
@@ -743,7 +876,7 @@ impl<P: Policy> DagScheduler<P> {
                 .neighbors_directed(m, Outgoing)
                 .map(|c| self.graph[c].rank)
                 .fold(0.0, f64::max);
-            let new = self.graph[m].work + below;
+            let new = self.graph[m].work + below.max(self.graph[m].implicit_below);
             let old = self.graph[m].rank;
             if first || (new - old).abs() > eps * old.abs().max(new.abs()) {
                 self.graph[m].rank = new;
@@ -782,7 +915,8 @@ impl<P: Policy> DagScheduler<P> {
 
     /// Restore a scheduler from a snapshot, in front of a fresh `policy`. Jobs that were submitted
     /// (waiting or running in the old policy) are submitted again at `now`; held jobs stay held and
-    /// are returned again by [`take_ready`](Self::take_ready).
+    /// are returned again by [`take_ready`](Self::take_ready). Open implicit instances are restored
+    /// with their templates (shared again among instances that shared them).
     #[cfg(feature = "serde")]
     pub fn restore(snapshot: DagSnapshot, policy: P, now: Instant) -> Self {
         let mut s = Self::new(snapshot.config, policy);
@@ -809,6 +943,7 @@ impl<P: Policy> DagScheduler<P> {
         }
         held.sort_unstable();
         s.newly_ready = held;
+        s.restore_instances(snapshot.templates, snapshot.instances, now);
         s.now = now;
         s
     }
@@ -819,12 +954,15 @@ impl<P: Policy> DagScheduler<P> {
     pub fn snapshot(&self) -> DagSnapshot {
         let mut completed: Vec<_> = self.completed.iter().copied().collect();
         completed.sort_unstable();
+        let (templates, instances) = self.snapshot_instances();
         DagSnapshot {
             config: self.config.clone(),
             graph: self.graph.clone(),
             completed,
             completed_floor: self.completed_floor,
             placeholders: self.placeholders.clone(),
+            templates,
+            instances,
         }
     }
 }
@@ -839,6 +977,12 @@ pub struct DagSnapshot {
     completed: Vec<JobId>,
     completed_floor: JobId,
     placeholders: BTreeMap<u64, (Vec<u64>, f64)>,
+    /// Templates of open instances, each once.
+    #[serde(default)]
+    templates: Vec<DagTemplate>,
+    /// Open instances.
+    #[serde(default)]
+    instances: Vec<instance::InstanceSnapshot>,
 }
 
 impl<P: Policy> Dag for DagScheduler<P> {
@@ -905,7 +1049,7 @@ impl<P: Policy> Dag for DagScheduler<P> {
                 .neighbors_directed(n, Outgoing)
                 .map(|c| self.graph[c].rank)
                 .fold(0.0, f64::max);
-            self.graph[n].rank = self.graph[n].work + below;
+            self.graph[n].rank = self.graph[n].work + below.max(self.graph[n].implicit_below);
             self.propagate_rank(n);
         }
         for &n in &batch {
@@ -937,46 +1081,27 @@ impl<P: Policy> Dag for DagScheduler<P> {
 
     /// Remove the job and its descendants, then any forward references only they needed.
     fn cancel(&mut self, job: JobId) -> Vec<JobId> {
-        let Some(&start) = self.index.get(&job) else {
-            self.policy.cancel(job);
-            return Vec::new();
-        };
-        let mut doomed = BTreeSet::new();
-        let mut stack = vec![start];
-        while let Some(n) = stack.pop() {
-            if doomed.insert((self.graph[n].id, n)) {
-                stack.extend(self.graph.neighbors_directed(n, Outgoing));
-            }
+        if let Some((slot, _)) = self.instance_of(job) {
+            let done = self.inst(slot).done;
+            let mut ids = self.cancel_instance(slot);
+            ids.extend(self.cancel(done));
+            return ids;
         }
-        let mut orphan_candidates = Vec::new();
-        let mut cancelled = Vec::with_capacity(doomed.len());
-        for &(id, n) in &doomed {
-            orphan_candidates.extend(self.graph.neighbors_directed(n, Incoming));
-            if self.graph[n].state == State::Submitted {
-                self.policy.cancel(id);
+        let mut ids = self.cancel_explicit(job);
+        // Instances waiting on a cancelled job can never open; their `done` dependents go too.
+        let mut k = 0;
+        while k < ids.len() {
+            let entry = ids[k];
+            for slot in self.by_entry.remove(&entry).unwrap_or_default() {
+                if self.instances[slot].is_some() {
+                    let done = self.inst(slot).done;
+                    ids.extend(self.cancel_instance(slot));
+                    ids.extend(self.cancel_explicit(done));
+                }
             }
-            if self.graph[n].state != State::Undeclared {
-                cancelled.push(id);
-            }
+            k += 1;
         }
-        for &(id, n) in &doomed {
-            self.graph.remove_node(n);
-            self.index.remove(&id);
-        }
-        self.newly_ready
-            .retain(|j| !doomed.iter().any(|d| d.0 == *j));
-        // Forward references kept alive only by the cancelled jobs are no longer needed.
-        for n in orphan_candidates {
-            let orphan = self
-                .graph
-                .node_weight(n)
-                .is_some_and(|w| w.state == State::Undeclared)
-                && self.graph.neighbors_directed(n, Outgoing).next().is_none();
-            if orphan && let Some(w) = self.graph.remove_node(n) {
-                self.index.remove(&w.id);
-            }
-        }
-        cancelled
+        ids
     }
 
     /// Forwarded to the policy.
@@ -999,6 +1124,9 @@ impl<P: Policy> Dag for DagScheduler<P> {
 
     /// The DAG's reason while the job is not submitted, the policy's afterwards.
     fn explain(&self, job: JobId) -> Option<String> {
+        if let Some((slot, i)) = self.instance_of(job) {
+            return self.explain_instance_node(slot, i, job);
+        }
         let Some(&n) = self.index.get(&job) else {
             return if self.is_completed(job) {
                 Some(format!("job {job} completed"))

@@ -43,6 +43,18 @@ pub struct Defer {
     pub min_gain: f64,
 }
 
+impl Default for Defer {
+    /// Wait at most an hour, and only for at least a quarter of the job's work in gain: in
+    /// simulation that keeps most of waiting's benefit while halving the cases where it backfires
+    /// (a barely faster, scarce class).
+    fn default() -> Self {
+        Self {
+            max_wait: 3600.0,
+            min_gain: 0.25,
+        }
+    }
+}
+
 /// HeteroPrio's slow-worker gate: a worker slower than the fastest class takes a job only while
 /// the backlog per fast slot is at least `factor * fast_speed / its_speed` -- that is, only when
 /// waiting for a fast slot would take longer than running slowly. Jobs that cannot run on the
