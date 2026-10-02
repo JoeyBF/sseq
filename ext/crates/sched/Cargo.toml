@@ -37,3 +37,8 @@ required-features = ["sim"]
 name = "sched-whole"
 path = "src/bin/sched_whole.rs"
 required-features = ["sim"]
+
+[[bin]]
+name = "sched-pisa"
+path = "src/bin/sched_pisa.rs"
+required-features = ["sim"]
