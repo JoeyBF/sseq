@@ -113,7 +113,9 @@ fn earliest_finish_defers_only_when_it_pays() {
         if expect_defer {
             assert!(out.is_empty(), "should wait for the fast worker: {out:?}");
             assert_eq!(p.stats().deferred, vec![(1, 2, 2.5)]);
-            assert_eq!(p.next_wakeup(), Some(100.0));
+            // The wait lapses at `max_wait`, unless the job may reserve before then.
+            let reserve_after = Config::default().reservations.unwrap().reserve_after;
+            assert_eq!(p.next_wakeup(), Some(reserve_after.min(100.0)));
             assert!(
                 p.explain(1)
                     .unwrap()

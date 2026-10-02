@@ -257,8 +257,9 @@ impl Default for Speculate {
 /// How often a failed job is retried.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RetryConfig {
-    /// Failed attempts per job before it is given up
-    /// ([`Output::GaveUp`](crate::Output::GaveUp)). Default 4; 0 counts as 1.
+    /// Rounds per job before it is given up ([`Output::GaveUp`](crate::Output::GaveUp)): a round
+    /// is an attempt started from the queue, with any speculative attempts made alongside it, and
+    /// it fails when its last live attempt does. Default 4; 0 counts as 1.
     pub max_attempts: u32,
 }
 

@@ -197,7 +197,6 @@ fn ticker_releases_timed_waits() {
 /// A thread whose worker left reports the lost link after the policy's retry was itself lost
 /// with its worker before the thread picked it up: it gets the job's next start, not the lost one.
 #[test]
-#[ignore = "lib bug: SharedPolicy hands out a retry start whose worker already left"]
 fn lost_retry_is_not_handed_out() {
     let s = SharedPolicy::new(Scheduler::new(Config::default()), || 0.0);
     s.worker_update(worker(1, 1));
@@ -224,7 +223,6 @@ fn lost_retry_is_not_handed_out() {
 
 /// The same when the lost retry was the last allowed attempt: the thread gets the give-up.
 #[test]
-#[ignore = "lib bug: SharedPolicy hands out a retry start whose worker already left"]
 fn lost_last_retry_gives_up() {
     let config = Config {
         retry: RetryConfig { max_attempts: 2 },
@@ -552,7 +550,6 @@ proptest! {
     /// leaks, over random sequences. Leases use a zero timeout (a job not started at once is
     /// withdrawn) and the clock stands still, so every start follows from an event.
     #[test]
-    #[ignore = "lib bug: SharedPolicy hands out a retry start whose worker already left"]
     fn attempts_avoid_and_no_leaks(ops in prop::collection::vec(op(), 1..120)) {
         let config = Config { retry: RetryConfig { max_attempts: MAX_ATTEMPTS }, ..Config::default() };
         let probe = Probe { inner: Scheduler::new(config), outputs: Vec::new(), failures: 0 };
@@ -577,7 +574,6 @@ proptest! {
 /// wakeup), no job runs twice at once, retries count up, and no worker runs more jobs than its
 /// slots.
 #[test]
-#[ignore = "lib bug: SharedPolicy hands out a retry start whose worker already left"]
 fn stress_many_threads_with_churn() {
     const THREADS: u64 = 1000;
     const JOBS_PER_THREAD: u64 = 5;

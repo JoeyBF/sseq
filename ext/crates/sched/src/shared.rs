@@ -275,6 +275,11 @@ impl<P: Policy> SharedPolicy<P> {
                 slot.lost = true;
                 hit.push(id);
             }
+            // A retry started there and not yet picked up fails with the worker; the thread
+            // waits for the one after it.
+            if slot.started.is_some_and(|h| h.1 == w) {
+                slot.started = None;
+            }
         }
         hit.sort_unstable();
         s.policy.handle(Input::WorkerGone(w), now);

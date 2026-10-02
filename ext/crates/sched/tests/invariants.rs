@@ -341,19 +341,27 @@ impl Shadow {
         })
     }
 
-    /// The hard constraints (class, avoid list), written out again: a soft avoid list lapses
-    /// while no live worker of the class is off it.
-    fn eligible(&self, spec: &JobSpec, w: WorkerId) -> bool {
+    /// The hard constraints (class, avoid lists), written out again: the caller's list is hard
+    /// unless `avoid_soft`; the workers of failed attempts are avoided softly; soft avoidance
+    /// lapses while no live worker of the class is off both lists.
+    fn eligible(&self, j: &SJob, w: WorkerId) -> bool {
+        let spec = &j.spec;
         let class_ok = |w: &WorkerState| spec.class.as_ref().is_none_or(|c| *c == w.class);
         if !class_ok(&self.workers[&w]) {
             return false;
         }
-        !spec.avoid.contains(&w)
-            || (spec.avoid_soft
-                && !self
-                    .workers
-                    .values()
-                    .any(|o| o.slots > 0 && class_ok(o) && !spec.avoid.contains(&o.id)))
+        let hard = |id: &WorkerId| !spec.avoid_soft && spec.avoid.contains(id);
+        let soft = |id: &WorkerId| {
+            (spec.avoid_soft && spec.avoid.contains(id)) || j.tried.iter().any(|t| t.worker == *id)
+        };
+        if hard(&w) {
+            return false;
+        }
+        !soft(&w)
+            || !self
+                .workers
+                .values()
+                .any(|o| o.slots > 0 && class_ok(o) && !hard(&o.id) && !soft(&o.id))
     }
 
     /// Scan order: aged jobs by age, then priority, group arrival, FIFO (or group arrival before
@@ -440,7 +448,8 @@ impl Shadow {
     }
 
     /// Live attempt `k` of `job` failed: once no attempt is live, the job is retried in its
-    /// original place, softly avoiding every worker it failed on, or given up.
+    /// original place, softly avoiding every worker it failed on, or given up after
+    /// `max_attempts` rounds (speculative attempts are not rounds).
     fn fail(&mut self, job: JobId, k: usize, kind: FailKind, why: String) {
         let r = self.running.get_mut(&job).unwrap();
         let l = r.live.remove(k);
@@ -452,14 +461,8 @@ impl Shadow {
         if !r.live.is_empty() {
             return;
         }
-        let mut j = self.running.remove(&job).unwrap().job;
-        if j.tried.len() < self.max_attempts.max(1) as usize {
-            for t in &j.tried {
-                if !j.spec.avoid.contains(&t.worker) {
-                    j.spec.avoid.push(t.worker);
-                }
-            }
-            j.spec.avoid_soft = true;
+        let j = self.running.remove(&job).unwrap().job;
+        if j.attempts - j.speculated < self.max_attempts.max(1) {
             self.waiting.insert(job, j);
         } else {
             let retryable = j.tried.iter().all(|t| t.kind == FailKind::DeviceOom);
@@ -700,7 +703,7 @@ fn run(
             if let Some(job) = sh.waiting.get(&j).cloned() {
                 prop_assert_eq!(attempt, job.attempts + 1, "job {} attempt", j);
                 prop_assert!(
-                    sh.eligible(&job.spec, w),
+                    sh.eligible(&job, w),
                     "{kind:?}: job {j} placed on excluded worker {w}"
                 );
                 // No over-commit (slots included).
@@ -715,7 +718,7 @@ fn run(
                     for a in sh.waiting.values() {
                         if a.spec.id != j && sh.urgency(a, kind.age()) < mine {
                             let refused = deferred_any.contains(&a.spec.id)
-                                || !sh.eligible(&a.spec, w)
+                                || !sh.eligible(a, w)
                                 || !sh.admits(a.spec.demand, w);
                             prop_assert!(
                                 refused,
@@ -755,6 +758,7 @@ fn run(
                     "job {j} over-speculated"
                 );
                 let spec = r.job.spec.clone();
+                let sjob = r.job.clone();
                 prop_assert!(
                     r.live
                         .iter()
@@ -763,7 +767,7 @@ fn run(
                     r.live
                 );
                 prop_assert!(
-                    sh.eligible(&spec, w) && sh.admits(spec.demand, w),
+                    sh.eligible(&sjob, w) && sh.admits(spec.demand, w),
                     "job {j} speculated onto {w}, which does not take it"
                 );
                 prop_assert!(
@@ -772,7 +776,7 @@ fn run(
                 );
                 let wanted = sh.waiting.values().find(|a| {
                     !deferred.contains(&a.spec.id)
-                        && sh.eligible(&a.spec, w)
+                        && sh.eligible(a, w)
                         && sh.admits(a.spec.demand, w)
                 });
                 prop_assert!(
@@ -820,7 +824,7 @@ fn run(
                 let stuck = sh
                     .waiting
                     .values()
-                    .find(|j| sh.eligible(&j.spec, w) && !deferred.contains(&j.spec.id));
+                    .find(|j| sh.eligible(j, w) && !deferred.contains(&j.spec.id));
                 prop_assert!(
                     stuck.is_none(),
                     "{kind:?}: worker {w} empty while job {:?} waits",

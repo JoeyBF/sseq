@@ -7,7 +7,7 @@
 ///
 /// `(s, t)` is the restart-stable key closest to arrival order: in the whole-run simulation it
 /// matches arrival's makespan with a tenth of its bidegree latency at the 90th percentile, where
-/// `(t, s)` and `(t - s, s)` are 5-8% slower (see RESULTS.md).
+/// `(t, s)` and `(t - s, s)` are 5-8% slower (see `sched-sim`'s RESULTS.md).
 pub fn group(s: u32, t: u32) -> u64 {
     (u64::from(s) << 32) | u64::from(t)
 }

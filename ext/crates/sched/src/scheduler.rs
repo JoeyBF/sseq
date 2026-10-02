@@ -61,6 +61,8 @@ struct Job {
     attempts: Attempt,
     /// Failed attempts.
     tried: Vec<Tried>,
+    /// Workers its failed attempts ran on, avoided softly whatever `spec.avoid_soft` says.
+    retry_avoid: Vec<WorkerId>,
     /// Speculative attempts started.
     speculated: u32,
 }
@@ -302,19 +304,26 @@ impl Scheduler {
             .reduce(f64::min)
     }
 
-    /// Whether `job`'s constraints (class, avoid list) allow `w` at all. A soft avoid list
-    /// lapses while every live worker of the job's class is on it; that depends on the worker
-    /// set only, not on load, so admission stays monotone.
-    fn eligible(&self, job: &JobSpec, w: &Worker) -> bool {
-        if !class_allows(job, w) {
+    /// Whether `job`'s constraints (class, avoid lists) allow `w` at all. Soft avoidance (the
+    /// caller's list with [`JobSpec::avoid_soft`], and the workers of failed attempts) lapses
+    /// while no live worker of the job's class is free of both lists; that depends on the
+    /// worker set only, not on load, so admission stays monotone.
+    fn eligible(&self, job: &Job, w: &Worker) -> bool {
+        let spec = &job.spec;
+        if !class_allows(spec, w) {
             return false;
         }
-        if !job.avoid.contains(&w.state.id) {
-            return true;
+        let listed = |id: &WorkerId| spec.avoid.contains(id);
+        let hard = |id: &WorkerId| !spec.avoid_soft && listed(id);
+        let soft = |id: &WorkerId| (spec.avoid_soft && listed(id)) || job.retry_avoid.contains(id);
+        let id = &w.state.id;
+        if hard(id) {
+            return false;
         }
-        job.avoid_soft
-            && !self.workers.values().any(|o| {
-                o.state.slots > 0 && class_allows(job, o) && !job.avoid.contains(&o.state.id)
+        !soft(id)
+            || !self.workers.values().any(|o| {
+                let o_id = &o.state.id;
+                o.state.slots > 0 && class_allows(spec, o) && !hard(o_id) && !soft(o_id)
             })
     }
 
@@ -365,6 +374,7 @@ impl Scheduler {
             since: now,
             attempts: 0,
             tried: Vec::new(),
+            retry_avoid: Vec::new(),
             speculated: 0,
         });
     }
@@ -481,20 +491,18 @@ impl Scheduler {
             kind,
             why,
         });
+        if !r.job.retry_avoid.contains(&run.worker) {
+            r.job.retry_avoid.push(run.worker);
+        }
         let demand = r.job.spec.demand;
         let idle = r.live.is_empty();
         self.release_run(job, demand, &run);
         if !idle {
             return;
         }
-        let mut j = self.running.remove(&job).unwrap().job;
-        if j.tried.len() < self.config.retry.max_attempts.max(1) as usize {
-            for t in &j.tried {
-                if !j.spec.avoid.contains(&t.worker) {
-                    j.spec.avoid.push(t.worker);
-                }
-            }
-            j.spec.avoid_soft = true;
+        let j = self.running.remove(&job).unwrap().job;
+        // Speculative attempts are extra tries within a round, not rounds of their own.
+        if j.attempts - j.speculated < self.config.retry.max_attempts.max(1) {
             self.enqueue(j);
         } else {
             let retryable = j.tried.iter().all(|t| t.kind == FailKind::DeviceOom);
@@ -638,14 +646,14 @@ impl Scheduler {
     }
 
     /// Whether `w` takes the job, or why not.
-    fn refusal(&self, job: &JobSpec, w: &Worker) -> Option<Refusal> {
+    fn refusal(&self, job: &Job, w: &Worker) -> Option<Refusal> {
         if !self.eligible(job, w) {
             return Some(Refusal::Ineligible);
         }
-        if let Some((by, hold)) = self.held(job, w) {
+        if let Some((by, hold)) = self.held(&job.spec, w) {
             return Some(Refusal::Held(by, hold));
         }
-        if !self.admission.admits(&job.demand, &w.view()) {
+        if !self.admission.admits(&job.spec.demand, &w.view()) {
             return Some(Refusal::Admission);
         }
         None
@@ -790,7 +798,7 @@ impl Scheduler {
         // Smallest tuple wins; the worker id makes the order total (determinism).
         let mut best: Option<((i64, i64, bool, usize), WorkerId)> = None;
         for (&id, w) in &self.workers {
-            if self.refusal(&job.spec, w).is_some() {
+            if self.refusal(job, w).is_some() {
                 continue;
             }
             let preferred = job.spec.prefer.contains(&id);
@@ -823,7 +831,7 @@ impl Scheduler {
                 // Only workers that refuse for want of a slot, and would admit with one free.
                 if w.speed <= self.workers[&place].speed
                     || w.running < w.state.slots
-                    || !self.eligible(&job.spec, w)
+                    || !self.eligible(job, w)
                     || w.reserved_for.is_some_and(|h| h != job.spec.id)
                 {
                     continue;
@@ -956,7 +964,7 @@ impl Scheduler {
             if w.reserved_for.is_some()
                 || w.state.slots == 0
                 || class_full(&w.state.class)
-                || !self.eligible(&j.spec, w)
+                || !self.eligible(j, w)
             {
                 continue;
             }
@@ -979,7 +987,7 @@ impl Scheduler {
         let mine = self.urgency(j);
         let victim = reservations
             .iter()
-            .filter(|r| self.eligible(&j.spec, &self.workers[&r.1]))
+            .filter(|r| self.eligible(j, &self.workers[&r.1]))
             .map(|r| (self.urgency(&self.waiting[&r.0]), r.0, r.1, r.2))
             .filter(|(u, ..)| *u > mine)
             .max();
@@ -1028,7 +1036,7 @@ impl Scheduler {
             .iter()
             .filter(|(job, h)| {
                 let w = &self.workers[&h.worker()];
-                w.state.slots == 0 || !self.eligible(&self.waiting[job].spec, w)
+                w.state.slots == 0 || !self.eligible(&self.waiting[job], w)
             })
             .map(|(&job, _)| job)
             .collect();
@@ -1131,7 +1139,7 @@ impl Scheduler {
                     });
                     if !slower
                         || r.job.speculated >= cfg.max_per_job
-                        || !self.eligible(&r.job.spec, w)
+                        || !self.eligible(&r.job, w)
                         || !self.admission.admits(&r.job.spec.demand, &w.view())
                     {
                         continue;
@@ -1155,12 +1163,27 @@ impl Scheduler {
         }
     }
 
-    /// The next time a hold lapses by itself, after now.
+    /// The next time, after now, that the passing of time alone changes what `dispatch` may do:
+    /// a hold lapses, a job ages, or a job waits long enough to reserve.
     fn next_wakeup(&self) -> Option<Instant> {
+        let now = self.now;
+        // `by_age` is in submission order, so the first job whose deadline is still ahead has
+        // the earliest one.
+        let first_after = |wait: f64| {
+            self.by_age
+                .values()
+                .map(|job| self.waiting[job].since + wait)
+                .find(|&t| t > now)
+        };
+        let aging = self.config.age_limit.and_then(first_after);
+        let reserving =
+            (self.config.reservations.as_ref()).and_then(|c| first_after(c.reserve_after));
         self.holds
             .values()
             .filter_map(Hold::until)
-            .filter(|&t| t > self.now)
+            .filter(|&t| t > now)
+            .chain(aging)
+            .chain(reserving)
             .reduce(f64::min)
     }
 
@@ -1267,7 +1290,7 @@ impl Scheduler {
         let mut reserved = Vec::new();
         let mut takers = Vec::new();
         for (&id, w) in &self.workers {
-            match self.refusal(&j.spec, w) {
+            match self.refusal(j, w) {
                 None => takers.push(id),
                 Some(Refusal::Ineligible) => excluded += 1,
                 Some(Refusal::Held(h, Hold::Reserve { .. })) => {
@@ -1347,7 +1370,7 @@ impl Policy for Scheduler {
         std::mem::take(&mut self.outbox)
     }
 
-    /// When the earliest deferral lapses.
+    /// When a hold lapses, a job ages or a job may reserve, whichever is first.
     fn next_wakeup(&self) -> Option<Instant> {
         Scheduler::next_wakeup(self)
     }
@@ -1594,6 +1617,50 @@ mod tests {
         assert_eq!(p.explain(0), None);
     }
 
+    /// Retries avoid the workers tried softly, but the caller's hard avoid list stays hard.
+    #[test]
+    fn hard_avoid_survives_retries() {
+        let mut p = Scheduler::new(Config::fifo());
+        let mut j = job(0, 1, 0);
+        j.avoid = vec![1];
+        let inputs = [
+            Input::Worker(worker(1, 1, 100)),
+            Input::Worker(worker(2, 1, 100)),
+            Input::Submit(j),
+        ];
+        assert_eq!(starts(&feed(&mut p, 0.0, inputs)), vec![(0, 2)]);
+        // Worker 2 is now avoided softly; the only other live worker is avoided hard, so the
+        // soft list lapses and the retry goes back to 2.
+        let out = feed(&mut p, 1.0, [fail(0, 1, FailKind::Other)]);
+        assert_eq!(
+            out,
+            vec![Output::Start {
+                job: 0,
+                attempt: 2,
+                worker: 2
+            }]
+        );
+    }
+
+    /// The next wakeup covers aging and reservation deadlines, not only deferrals.
+    #[test]
+    fn next_wakeup_reports_aging_and_reserving() {
+        let cfg = Config {
+            age_limit: Some(100.0),
+            ..Config::default()
+        };
+        let reserve_after = cfg.reservations.as_ref().unwrap().reserve_after;
+        let mut p = Scheduler::new(cfg);
+        assert_eq!(p.next_wakeup(), None);
+        feed(&mut p, 10.0, [Input::Submit(job(0, 1, 0))]);
+        assert_eq!(p.next_wakeup(), Some(10.0 + reserve_after.min(100.0)));
+        let later = 10.0 + reserve_after.max(100.0);
+        p.poll(10.0 + reserve_after.min(100.0));
+        assert_eq!(p.next_wakeup(), (reserve_after != 100.0).then_some(later));
+        p.poll(later);
+        assert_eq!(p.next_wakeup(), None);
+    }
+
     /// A give-up is retryable only if every attempt ran out of device memory.
     #[test]
     fn give_up_is_retryable_only_for_device_oom() {
@@ -1790,6 +1857,32 @@ mod tests {
         let out = feed(&mut p, 5.0, [Input::Cancel(0)]);
         assert_eq!(starts(&out), vec![]);
         assert_eq!(out.len(), 2);
+    }
+
+    /// A failed speculative attempt does not count against the retry limit: with two rounds
+    /// allowed, the original's failure after it is retried rather than given up.
+    #[test]
+    fn speculative_failure_is_not_a_round() {
+        let mut p = speculating();
+        p.config.retry.max_attempts = 2;
+        assert!(feed(&mut p, 5.0, [fail(0, 2, FailKind::Other)]).is_empty());
+        let out = feed(&mut p, 6.0, [fail(0, 1, FailKind::Other)]);
+        assert!(
+            matches!(
+                out[..],
+                [Output::Start {
+                    job: 0,
+                    attempt: 3,
+                    ..
+                }]
+            ),
+            "{out:?}"
+        );
+        let out = feed(&mut p, 7.0, [fail(0, 3, FailKind::Other)]);
+        assert!(
+            matches!(&out[..], [Output::GaveUp(g)] if g.tried.len() == 3),
+            "{out:?}"
+        );
     }
 
     /// Without enough gain, nothing is speculated.

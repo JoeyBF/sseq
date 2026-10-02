@@ -71,9 +71,8 @@ println!("{:?}", policy.explain(8)); // why a job is (not) running, for logs
 
 [`Policy::handle`] applies an input at once; outputs it causes (stops, give-ups) come out of the
 next [`Policy::poll`], which also places what can be placed. [`Policy::next_wakeup`] is when the
-policy next needs a poll without any input (a deferral lapsing); aging and reservations also need
-time to pass, so a caller with sparse inputs polls periodically too. A poll typically takes
-microseconds.
+policy next needs a poll without any input: a deferral lapses, a job ages, or a job has waited long
+enough to reserve. A poll typically takes microseconds.
 
 ## Model
 
@@ -164,8 +163,9 @@ give [`Policy::next_wakeup`]. Releasing a hold mid-scan restarts the scan, which
 invariant.
 
 **Retries and worker loss** ([`RetryConfig`]). A failed attempt, with no other attempt of the job
-live, requeues the job with its original place and age, softly avoiding every worker it failed on.
-After [`RetryConfig::max_attempts`] failures the policy emits [`Output::GaveUp`] with every
+live, requeues the job with its original place and age, softly avoiding every worker it failed on
+(a hard avoid list from the caller stays hard). After [`RetryConfig::max_attempts`] rounds -- a
+speculative attempt is an extra try within a round, not a round -- the policy emits [`Output::GaveUp`] with every
 [`Tried`] attempt, `retryable` when all were [`FailKind::DeviceOom`]. [`Input::WorkerGone`] fails
 each live attempt on the worker with [`FailKind::LinkDied`]; the caller never resubmits.
 [`Input::Cancel`] drops a waiting job or stops a running one's attempts.

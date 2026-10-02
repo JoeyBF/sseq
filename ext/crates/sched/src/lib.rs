@@ -368,7 +368,7 @@ pub struct Tried {
     pub why: String,
 }
 
-/// A job the policy stopped retrying ([`RetryConfig::max_attempts`] failures): it is forgotten.
+/// A job the policy stopped retrying ([`RetryConfig::max_attempts`] rounds): it is forgotten.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct GaveUp {
@@ -398,7 +398,7 @@ pub enum Input {
     },
     /// An attempt failed. If no other attempt of the job is live, the job is retried (it keeps its
     /// place in the queue and its age, and softly avoids the workers it failed on) or, after
-    /// [`RetryConfig::max_attempts`] failures, given up ([`Output::GaveUp`]). Ignored unless
+    /// [`RetryConfig::max_attempts`] rounds, given up ([`Output::GaveUp`]). Ignored unless
     /// `attempt` is live.
     Failed {
         /// The job.
@@ -482,9 +482,10 @@ pub trait Policy {
     fn handle(&mut self, input: Input, now: Instant);
     /// Place what can be placed now, and return every output since the last call, in order.
     fn poll(&mut self, now: Instant) -> Vec<Output>;
-    /// The next time `poll` should be called even if no event arrives: a job's voluntary wait for
-    /// a faster worker ([`Defer`]) expires then. `None` if nothing is timed. Callers with
-    /// frequent events may ignore it at the cost of that much extra waiting.
+    /// The next time `poll` should be called even if no event arrives: a hold lapses (e.g. a
+    /// [`Defer`] wait for a faster worker), a job ages, or a job may reserve. `None` if nothing
+    /// is timed. Callers with frequent events may ignore it at the cost of that much extra
+    /// waiting.
     fn next_wakeup(&self) -> Option<Instant>;
     /// Why a job is not running, in words (for logs). `None` for unknown jobs.
     fn explain(&self, job: JobId) -> Option<String>;
