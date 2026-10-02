@@ -1,0 +1,1408 @@
+//! The whole-run DAG of a Nassau resolution, its cost model, and its simulation.
+
+use std::{
+    cmp::Ordering,
+    collections::{BinaryHeap, HashMap, VecDeque},
+    path::Path,
+    sync::Arc,
+};
+
+use serde::Serialize;
+
+use super::{
+    algebra,
+    model::{ServiceModel, solve},
+    run::Quantiles,
+    trace::Trace,
+};
+use crate::{
+    BackfillConfig, Dag, DagConfig, DagJob, DagScheduler, DagTemplate, JobId, JobSpec,
+    PriorityBackfill, Resources, WorkerState,
+};
+
+/// One census row (`ext::nassau` per-bidegree counters).
+#[derive(Clone, Copy, Debug)]
+pub struct CensusRow {
+    /// Dimension of the zero step's masked target.
+    pub target_masked_dim: f64,
+    /// Dimension of the next module.
+    pub next_dim: f64,
+    /// Generators found.
+    pub gens: u32,
+    /// Signatures the subalgebra has at this degree (non-zero ones).
+    pub signatures: u32,
+    /// Dimension of the subalgebra (`2^sum(profile)`).
+    pub subalgebra_dim: u64,
+    /// Wall time of the bidegree, seconds.
+    pub wall_s: f64,
+    /// Index into [`Census::sources`] of the file the row came from.
+    pub source: usize,
+}
+
+/// Census rows by `(s, t)`; later files override earlier ones.
+#[derive(Clone, Debug, Default)]
+pub struct Census {
+    /// The rows.
+    pub rows: HashMap<(i32, i32), CensusRow>,
+    /// The files, in load order.
+    pub sources: Vec<String>,
+}
+
+impl Census {
+    /// Read census CSV files.
+    pub fn load(paths: &[impl AsRef<Path>]) -> Result<Self, Box<dyn std::error::Error>> {
+        let mut c = Census::default();
+        for path in paths {
+            let source = c.sources.len();
+            c.sources.push(path.as_ref().display().to_string());
+            let text = std::fs::read_to_string(path)?;
+            let mut lines = text.lines();
+            let header: Vec<&str> = lines.next().unwrap_or_default().split(',').collect();
+            let col = |name: &str| header.iter().position(|h| *h == name);
+            let (Some(s), Some(t), Some(tm), Some(nd), Some(g), Some(sd)) = (
+                col("s"),
+                col("t"),
+                col("target_masked_dim"),
+                col("next_dim"),
+                col("num_new_gens"),
+                col("subalgebra_dim"),
+            ) else {
+                return Err(format!("{}: missing census columns", path.as_ref().display()).into());
+            };
+            let sig = col("signatures_total").or(col("signatures"));
+            let wall = col("wall_us");
+            for line in lines {
+                let f: Vec<&str> = line.split(',').collect();
+                if f.len() < header.len() {
+                    continue;
+                }
+                let num = |i: usize| f[i].parse::<f64>().unwrap_or(0.0);
+                c.rows.insert(
+                    (num(s) as i32, num(t) as i32),
+                    CensusRow {
+                        target_masked_dim: num(tm),
+                        next_dim: num(nd),
+                        gens: num(g) as u32,
+                        signatures: sig.map_or(0, |i| num(i) as u32),
+                        subalgebra_dim: num(sd) as u64,
+                        wall_s: wall.map_or(0.0, |i| num(i) / 1e6),
+                        source,
+                    },
+                );
+            }
+        }
+        Ok(c)
+    }
+
+    /// How many rows the profile rule (capped at `max_len` entries) reproduces exactly: same
+    /// subalgebra dimension and same signature count. Returns `(matching, compared)`.
+    pub fn profile_agreement(&self, max_len: usize) -> (usize, usize) {
+        let mut ok = 0;
+        let mut n = 0;
+        for (&(s, t), r) in &self.rows {
+            if r.subalgebra_dim == 0 {
+                continue;
+            }
+            n += 1;
+            let p = algebra::optimal_profile(s, t, max_len);
+            let dim = 1u64 << p.iter().map(|&x| x as u32).sum::<u32>();
+            if dim == r.subalgebra_dim
+                && (r.signatures == 0
+                    || algebra::active_signatures(&p, t).len() == r.signatures as usize)
+            {
+                ok += 1;
+            }
+        }
+        (ok, n)
+    }
+}
+
+/// SplitMix64: a deterministic hash for per-task noise.
+fn mix(mut x: u64) -> u64 {
+    x = x.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    x = (x ^ (x >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    x ^ (x >> 31)
+}
+
+/// A uniform in `(0, 1)` from a key.
+fn uniform(key: u64) -> f64 {
+    ((mix(key) >> 11) as f64 + 0.5) / (1u64 << 53) as f64
+}
+
+/// A standard normal from a key (Box-Muller).
+fn normal(key: u64) -> f64 {
+    let (u, v) = (uniform(key), uniform(key ^ 0x5555_5555_5555_5555));
+    (-2.0 * u.ln()).sqrt() * (std::f64::consts::TAU * v).cos()
+}
+
+/// Dimensions and liveness for every bidegree of the region: the census where it has a row,
+/// extrapolated elsewhere.
+#[derive(Clone, Debug)]
+pub struct Dims {
+    max_n: i32,
+    max_s: i32,
+    tmd: Vec<f64>,
+    nd: Vec<f64>,
+    live: Vec<bool>,
+    known: Vec<bool>,
+}
+
+impl Dims {
+    /// Index of `(s, n)`, if in the region.
+    fn idx(&self, s: i32, n: i32) -> Option<usize> {
+        ((0..=self.max_s).contains(&s) && (0..=self.max_n).contains(&n))
+            .then(|| (s * (self.max_n + 1) + n) as usize)
+    }
+
+    /// Fill the region `n <= max_n, s <= max_s`. Missing dimensions continue each row's
+    /// exponential trend (a least-squares line through the log of its last known points);
+    /// missing liveness (whether the bidegree has generators) is drawn with the row's recent rate.
+    pub fn build(census: &Census, max_s: i32, max_n: i32) -> Self {
+        let len = ((max_s + 1) * (max_n + 1)) as usize;
+        let mut d = Dims {
+            max_n,
+            max_s,
+            tmd: vec![0.0; len],
+            nd: vec![0.0; len],
+            live: vec![false; len],
+            known: vec![false; len],
+        };
+        for s in 0..=max_s {
+            let known: Vec<(i32, CensusRow)> = (0..=max_n)
+                .filter_map(|n| census.rows.get(&(s, n + s)).map(|r| (n, *r)))
+                .collect();
+            // ln(value) ~ a + b n over the last points with positive values.
+            let trend = |get: &dyn Fn(&CensusRow) -> f64| -> Option<(f64, f64, i32)> {
+                let pts: Vec<(f64, f64)> = known
+                    .iter()
+                    .filter(|(_, r)| get(r) > 0.0)
+                    .map(|(n, r)| (*n as f64, get(r).ln()))
+                    .collect();
+                let pts = &pts[pts.len().saturating_sub(30)..];
+                if pts.len() < 3 {
+                    return pts.last().map(|&(n, y)| (y, 0.0, n as i32));
+                }
+                let m = pts.len() as f64;
+                let (sx, sy) = pts.iter().fold((0.0, 0.0), |a, p| (a.0 + p.0, a.1 + p.1));
+                let (mx, my) = (sx / m, sy / m);
+                let sxx: f64 = pts.iter().map(|p| (p.0 - mx).powi(2)).sum();
+                let sxy: f64 = pts.iter().map(|p| (p.0 - mx) * (p.1 - my)).sum();
+                let b = if sxx > 0.0 { sxy / sxx } else { 0.0 };
+                Some((my - b * mx, b, pts.last().unwrap().0 as i32))
+            };
+            let tmd_trend = trend(&|r| r.target_masked_dim);
+            let nd_trend = trend(&|r| r.next_dim);
+            let recent = &known[known.len().saturating_sub(50)..];
+            let p_live = if recent.is_empty() {
+                0.5
+            } else {
+                recent.iter().filter(|(_, r)| r.gens > 0).count() as f64 / recent.len() as f64
+            };
+            let rows: HashMap<i32, CensusRow> = known.into_iter().collect();
+            for n in 0..=max_n {
+                let i = d.idx(s, n).unwrap();
+                if let Some(r) = rows.get(&n) {
+                    d.tmd[i] = r.target_masked_dim;
+                    d.nd[i] = r.next_dim;
+                    d.live[i] = r.gens > 0;
+                    d.known[i] = true;
+                } else {
+                    let ext = |tr: Option<(f64, f64, i32)>| {
+                        tr.map_or(0.0, |(a, b, last)| {
+                            if n > last {
+                                (a + b * n as f64).exp()
+                            } else {
+                                0.0
+                            }
+                        })
+                    };
+                    d.tmd[i] = ext(tmd_trend);
+                    d.nd[i] = ext(nd_trend);
+                    d.live[i] = uniform(((s as u64) << 32) | n as u64) < p_live;
+                }
+            }
+        }
+        d
+    }
+
+    /// Masked target dimension of the zero step at `(s, t)` (0 outside the region).
+    pub fn tmd(&self, s: i32, t: i32) -> f64 {
+        self.idx(s, t - s).map_or(0.0, |i| self.tmd[i])
+    }
+
+    /// Next-module dimension at `(s, t)`.
+    pub fn nd(&self, s: i32, t: i32) -> f64 {
+        self.idx(s, t - s).map_or(0.0, |i| self.nd[i])
+    }
+
+    /// Whether `(s, t)` has generators (so its signature walk runs).
+    pub fn live(&self, s: i32, t: i32) -> bool {
+        self.idx(s, t - s).is_some_and(|i| self.live[i])
+    }
+
+    /// Whether `(s, t)` came from the census rather than extrapolation.
+    pub fn known(&self, s: i32, t: i32) -> bool {
+        self.idx(s, t - s).is_some_and(|i| self.known[i])
+    }
+}
+
+/// Task cost (H200-seconds of work), from a-priori dimensions. Scale and shape come from
+/// different data, because the trace alone covers too narrow a region to say how cost scales:
+///
+/// - **Across bidegrees**, the census: `ln wall = a . [1, ln tmd, ln nd, ln(signatures + 1),
+///   live] + effect(file)`, over every census row (tens of thousands of bidegrees, all stems),
+///   with a per-file effect absorbing different code versions and hardware.
+/// - **Level**: on the trace's own bidegrees, `level` = median of `ln(total work) - prediction`
+///   for the trace run's census file; its spread is the per-bidegree noise.
+/// - **Within a bidegree**: the zero step takes `zero_share` of the work, and signature `sigma`
+///   a share proportional to `exp(w . [ln tmd(s, t - deg sigma), ln deg sigma])`, fitted on the
+///   trace with bidegree fixed effects (residual sd = the per-signature noise).
+#[derive(Clone, Debug, Serialize)]
+pub struct CostModel {
+    /// Across-bidegree coefficients of `[1, ln tmd, ln nd, ln(signatures + 1), live]`.
+    pub across: Vec<f64>,
+    /// Per-census-file effect on `ln wall` (the first file is 0).
+    pub file_effect: Vec<f64>,
+    /// The file whose effect the level is calibrated against (the trace run's census).
+    pub reference: usize,
+    /// `ln` of trace work over the reference prediction (median over the trace's bidegrees).
+    pub level: f64,
+    /// Robust sd of that log ratio: per-bidegree noise of the "true" costs.
+    pub sd_bidegree: f64,
+    /// Median share of a bidegree's work in its zero step.
+    pub zero_share: f64,
+    /// Within-bidegree coefficients of `[ln tmd(s, t - deg), ln deg]`.
+    pub within: Vec<f64>,
+    /// Residual sd of the within fit: per-signature noise of the "true" costs.
+    pub sd_signature: f64,
+    /// R^2 of the across fit.
+    pub r2_across: f64,
+    /// R^2 of the within fit (after removing bidegree means).
+    pub r2_within: f64,
+    /// Rows in the across fit, bidegrees in the level, signatures in the within fit.
+    pub n: [usize; 3],
+}
+
+/// Median and robust (inter-quartile) sd.
+fn median_sd(mut v: Vec<f64>) -> (f64, f64) {
+    if v.is_empty() {
+        return (0.0, 0.0);
+    }
+    v.sort_by(f64::total_cmp);
+    let q = |p: f64| v[((v.len() - 1) as f64 * p).round() as usize];
+    (q(0.5), (q(0.75) - q(0.25)) / 1.349)
+}
+
+/// Signature degree of a Milnor exponent tuple.
+fn degree_of(sig: &[u32]) -> i32 {
+    sig.iter()
+        .enumerate()
+        .map(|(i, &r)| ((1 << (i + 1)) - 1) * r as i32)
+        .sum()
+}
+
+/// Least squares `y ~ X`; returns coefficients, R^2 and residual sd.
+fn ols(x: &[Vec<f64>], y: &[f64]) -> (Vec<f64>, f64, f64) {
+    let p = x.first().map_or(0, Vec::len);
+    let mut xtx = vec![vec![0.0; p]; p];
+    let mut xty = vec![0.0; p];
+    for (r, &yy) in x.iter().zip(y) {
+        for a in 0..p {
+            xty[a] += r[a] * yy;
+            for b in 0..p {
+                xtx[a][b] += r[a] * r[b];
+            }
+        }
+    }
+    let beta = solve(xtx, xty);
+    let n = y.len().max(1) as f64;
+    let mean = y.iter().sum::<f64>() / n;
+    let (mut sse, mut sst) = (0.0, 0.0);
+    for (r, &yy) in x.iter().zip(y) {
+        let f: f64 = r.iter().zip(&beta).map(|(a, b)| a * b).sum();
+        sse += (yy - f).powi(2);
+        sst += (yy - mean).powi(2);
+    }
+    (beta, 1.0 - sse / sst.max(1e-12), (sse / n).sqrt())
+}
+
+impl CostModel {
+    /// Fit from the census (scale) and the trace's tasks with work `work` (level and shape).
+    pub fn fit(trace: &Trace, work: &[f64], census: &Census) -> Self {
+        let files = census.sources.len().max(1);
+        let features = |r: &CensusRow| {
+            let mut x = vec![
+                1.0,
+                r.target_masked_dim.ln(),
+                r.next_dim.ln(),
+                ((r.signatures + 1) as f64).ln(),
+                f64::from(u8::from(r.gens > 0)),
+            ];
+            x.extend((1..files).map(|f| f64::from(u8::from(r.source == f))));
+            x
+        };
+        let usable =
+            |r: &CensusRow| r.wall_s > 0.0 && r.target_masked_dim > 0.0 && r.next_dim > 0.0;
+        let (mut x, mut y) = (Vec::new(), Vec::new());
+        let mut keys: Vec<&(i32, i32)> = census.rows.keys().collect();
+        keys.sort_unstable();
+        for key in keys {
+            let r = &census.rows[key];
+            if usable(r) {
+                x.push(features(r));
+                y.push(r.wall_s.ln());
+            }
+        }
+        let (beta, r2_across, _) = ols(&x, &y);
+        let across = beta[..5].to_vec();
+        let mut file_effect = vec![0.0];
+        file_effect.extend_from_slice(&beta[5..]);
+
+        // The trace's bidegrees: total work, zero work, and their census rows.
+        let mut per: HashMap<(i32, i32), (f64, f64)> = HashMap::new();
+        for (task, &w) in trace.tasks.iter().zip(work) {
+            let (n, s) = task.bidegree;
+            let e = per.entry((s as i32, (n + s) as i32)).or_default();
+            e.0 += w;
+            if task.zero {
+                e.1 += w;
+            }
+        }
+        let mut votes = vec![0usize; files];
+        for b in per.keys() {
+            if let Some(r) = census.rows.get(b) {
+                votes[r.source] += 1;
+            }
+        }
+        let reference = (0..files).max_by_key(|&f| (votes[f], f)).unwrap_or(0);
+        let predict = |r: &CensusRow| -> f64 {
+            let x = features(&CensusRow { gens: 1, ..*r });
+            across.iter().zip(&x).map(|(a, b)| a * b).sum::<f64>() + file_effect[reference]
+        };
+        let mut ratios = Vec::new();
+        let mut shares = Vec::new();
+        let mut bkeys: Vec<_> = per.keys().copied().collect();
+        bkeys.sort_unstable();
+        for b in &bkeys {
+            let (total, zero) = per[b];
+            if let Some(r) = census.rows.get(b).filter(|r| usable(r)) {
+                ratios.push(total.ln() - predict(r));
+            }
+            if total > 0.0 {
+                shares.push(zero / total);
+            }
+        }
+        let (level, sd_bidegree) = median_sd(ratios.clone());
+        let zero_share = median_sd(shares).0;
+
+        // Within-bidegree shape: demean by bidegree, then least squares.
+        let mut groups: HashMap<(i32, i32), Vec<[f64; 3]>> = HashMap::new();
+        for (task, &w) in trace.tasks.iter().zip(work) {
+            if task.zero || w <= 0.0 {
+                continue;
+            }
+            let (n, s) = task.bidegree;
+            let (s, t) = (s as i32, (n + s) as i32);
+            let deg = degree_of(&task.sig);
+            let Some(r) = census
+                .rows
+                .get(&(s, t - deg))
+                .filter(|r| deg > 0 && r.target_masked_dim > 0.0)
+            else {
+                continue;
+            };
+            groups.entry((s, t)).or_default().push([
+                r.target_masked_dim.ln(),
+                (deg as f64).ln(),
+                w.ln(),
+            ]);
+        }
+        let (mut xw, mut yw) = (Vec::new(), Vec::new());
+        let mut gkeys: Vec<_> = groups.keys().copied().collect();
+        gkeys.sort_unstable();
+        for g in gkeys {
+            let rows = &groups[&g];
+            let m = rows.len() as f64;
+            let mean: [f64; 3] =
+                std::array::from_fn(|c| rows.iter().map(|r| r[c]).sum::<f64>() / m);
+            for r in rows {
+                xw.push(vec![r[0] - mean[0], r[1] - mean[1]]);
+                yw.push(r[2] - mean[2]);
+            }
+        }
+        let (within, r2_within, sd_signature) = ols(&xw, &yw);
+        CostModel {
+            across,
+            file_effect,
+            reference,
+            level,
+            sd_bidegree,
+            zero_share,
+            within,
+            sd_signature,
+            r2_across,
+            r2_within,
+            n: [y.len(), ratios.len(), yw.len()],
+        }
+    }
+
+    /// Median total work of `(s, t)`'s zero step and live signature walk, with `signatures`
+    /// active signatures; `None` when its dimensions are empty.
+    pub fn total(&self, dims: &Dims, s: i32, t: i32, signatures: usize) -> Option<f64> {
+        let (tmd, nd) = (dims.tmd(s, t), dims.nd(s, t));
+        (tmd > 0.0 && nd > 0.0).then(|| {
+            let x = [1.0, tmd.ln(), nd.ln(), ((signatures + 1) as f64).ln(), 1.0];
+            let lin: f64 = self.across.iter().zip(&x).map(|(a, b)| a * b).sum();
+            (lin + self.file_effect[self.reference] + self.level).exp()
+        })
+    }
+
+    /// Relative weight of a signature of degree `deg` at `(s, t)` within its bidegree (0 if its
+    /// shifted problem is empty).
+    pub fn shape(&self, dims: &Dims, s: i32, t: i32, deg: i32) -> f64 {
+        let tmd = dims.tmd(s, t - deg);
+        if deg <= 0 || tmd <= 0.0 {
+            return 0.0;
+        }
+        (self.within[0] * tmd.ln() + self.within[1] * (deg as f64).ln()).exp()
+    }
+}
+
+/// A worker class in the simulated fleet.
+#[derive(Clone, Debug, Serialize)]
+pub struct Fleet {
+    /// `(class, workers, slots each)`.
+    pub groups: Vec<(String, usize, usize)>,
+}
+
+/// A profile's signature DAG and its signatures' degrees.
+#[derive(Debug)]
+struct ProfileInfo {
+    template: DagTemplate,
+    degree: Vec<i32>,
+}
+
+/// One bidegree of the region, with everything the simulation needs precomputed.
+#[derive(Clone, Debug)]
+struct Bideg {
+    s: i32,
+    t: i32,
+    /// Index into `World::profiles`, or `None` for `F_2` (no signatures).
+    profile: Option<usize>,
+    live: bool,
+    zero_est: f64,
+    zero_true: f64,
+    /// Critical path of the signature walk (excluding the zero step), estimated and true.
+    cp_est: f64,
+    cp_true: f64,
+    /// Signature tasks that run, and their total true work.
+    tasks: u32,
+    work_true: f64,
+    /// Work of the signature walk (estimated, true) and the sum of its signatures' shapes.
+    pool_est: f64,
+    pool_true: f64,
+    shape_sum: f64,
+}
+
+/// Configuration of the whole-run world.
+#[derive(Clone, Debug, Serialize)]
+pub struct WholeConfig {
+    /// Region: stems `0..=max_n`.
+    pub max_n: i32,
+    /// Region: homological degrees `0..=max_s`.
+    pub max_s: i32,
+    /// Profile length cap (`NASSAU_MAX_SUBALGEBRA` + 1).
+    pub max_profile_len: usize,
+    /// Smallest work of a dispatched task (H200-seconds).
+    pub min_work: f64,
+}
+
+/// The whole run, built a priori: bidegrees, templates, costs.
+pub struct World {
+    /// Its configuration.
+    pub config: WholeConfig,
+    /// The cost model.
+    pub cost: CostModel,
+    bideg: Vec<Bideg>,
+    profiles: Vec<Arc<ProfileInfo>>,
+    profile_names: Vec<Vec<u8>>,
+    /// First signature id of each bidegree.
+    offsets: Vec<u64>,
+    dims: Dims,
+}
+
+/// Ids: bidegree `k` has its zero step `4k`, its "registered" passthrough `4k + 1` and its "walk
+/// done" passthrough `4k + 2`; signature `i` of bidegree `k` is `SIG_BASE + offsets[k] + i`.
+const SIG_BASE: JobId = 1 << 62;
+
+/// What a job id names.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Node {
+    Zero(usize),
+    Registered(usize),
+    WalkDone(usize),
+    Sig(usize, usize),
+}
+
+impl World {
+    /// Build the world. Profiles' signature DAGs are built once each.
+    pub fn build(config: WholeConfig, census: &Census, cost_from: (&Trace, &[f64])) -> Self {
+        let dims = Dims::build(census, config.max_s, config.max_n);
+        let cost = CostModel::fit(cost_from.0, cost_from.1, census);
+        let mut profile_names: Vec<Vec<u8>> = Vec::new();
+        let mut profile_of: HashMap<Vec<u8>, usize> = HashMap::new();
+        let mut bideg = Vec::new();
+        for s in 0..=config.max_s {
+            for n in 0..=config.max_n {
+                let t = n + s;
+                let p = algebra::optimal_profile(s, t, config.max_profile_len);
+                // Rows 0 and 1 run `step0`/`step1`, which have no signature walk.
+                let p = if s <= 1 { Vec::new() } else { p };
+                let profile = (!p.is_empty()).then(|| {
+                    let next = profile_names.len();
+                    *profile_of.entry(p.clone()).or_insert_with(|| {
+                        profile_names.push(p.clone());
+                        next
+                    })
+                });
+                bideg.push(Bideg {
+                    s,
+                    t,
+                    profile,
+                    live: dims.live(s, t),
+                    zero_est: 0.0,
+                    zero_true: 0.0,
+                    cp_est: 0.0,
+                    cp_true: 0.0,
+                    tasks: 0,
+                    work_true: 0.0,
+                    pool_est: 0.0,
+                    pool_true: 0.0,
+                    shape_sum: 0.0,
+                });
+            }
+        }
+        let profiles: Vec<Arc<ProfileInfo>> = profile_names
+            .iter()
+            .map(|p| {
+                let clock = std::time::Instant::now();
+                let direct = algebra::signature_dag(p);
+                let template = direct.transitive_reduction();
+                let degree = (0..template.len())
+                    .map(|i| algebra::signature(i, p).1)
+                    .collect();
+                eprintln!(
+                    "[whole] profile {p:?}: {} signatures, {} direct edges, {} after reduction, \
+                     built in {:.1}s",
+                    template.len(),
+                    direct.edge_count(),
+                    template.edge_count(),
+                    clock.elapsed().as_secs_f64()
+                );
+                Arc::new(ProfileInfo { template, degree })
+            })
+            .collect();
+        let mut w = World {
+            config,
+            cost,
+            bideg,
+            profiles,
+            profile_names,
+            offsets: Vec::new(),
+            dims,
+        };
+        let mut offset = 0u64;
+        for k in 0..w.bideg.len() {
+            w.offsets.push(offset);
+            let (s, t) = (w.bideg[k].s, w.bideg[k].t);
+            let info = w.bideg[k].profile.map(|pi| Arc::clone(&w.profiles[pi]));
+            let active: Vec<usize> = info.as_ref().map_or(Vec::new(), |info| {
+                (1..info.template.len())
+                    .filter(|&i| info.degree[i] <= t)
+                    .collect()
+            });
+            let total = w.cost.total(&w.dims, s, t, active.len()).unwrap_or(0.0);
+            let total_true = total * (w.cost.sd_bidegree * normal(k as u64 * 2 + 1)).exp();
+            let zs = w.cost.zero_share;
+            w.bideg[k].zero_est = (zs * total).max(w.config.min_work);
+            w.bideg[k].zero_true = (zs * total_true).max(w.config.min_work);
+            if w.bideg[k].live {
+                w.bideg[k].pool_est = (1.0 - zs) * total;
+                w.bideg[k].pool_true = (1.0 - zs) * total_true;
+                w.bideg[k].shape_sum = active
+                    .iter()
+                    .map(|&i| {
+                        w.cost
+                            .shape(&w.dims, s, t, info.as_ref().unwrap().degree[i])
+                    })
+                    .sum();
+            }
+            if let Some(info) = info {
+                offset += info.template.len() as u64;
+                w.bideg[k].cp_est = info.template.critical_path(|i| w.sig_work(k, i, false));
+                w.bideg[k].cp_true = info.template.critical_path(|i| w.sig_work(k, i, true));
+                let mut tasks = 0;
+                let mut work = 0.0;
+                for i in 0..info.template.len() {
+                    let x = w.sig_work(k, i, true);
+                    if x > 0.0 {
+                        tasks += 1;
+                        work += x;
+                    }
+                }
+                w.bideg[k].tasks = tasks;
+                w.bideg[k].work_true = work;
+            }
+        }
+        w
+    }
+
+    /// Work of signature `i` of bidegree `k` (0 if it does not run): its share of the walk's
+    /// estimated work, or of the "true" work times a deterministic log-normal per-signature error.
+    fn sig_work(&self, k: usize, i: usize, truth: bool) -> f64 {
+        let b = &self.bideg[k];
+        let Some(pi) = b.profile else { return 0.0 };
+        let deg = self.profiles[pi].degree[i];
+        if i == 0 || !b.live || deg > b.t || b.shape_sum <= 0.0 {
+            return 0.0;
+        }
+        let share = self.cost.shape(&self.dims, b.s, b.t, deg) / b.shape_sum;
+        if share <= 0.0 {
+            return 0.0;
+        }
+        if truth {
+            let noise = (self.cost.sd_signature * normal(mix(k as u64) ^ i as u64)).exp();
+            (b.pool_true * share * noise).max(self.config.min_work)
+        } else {
+            (b.pool_est * share).max(self.config.min_work)
+        }
+    }
+
+    /// Bidegree index of `(s, t)`, if in the region.
+    fn index(&self, s: i32, t: i32) -> Option<usize> {
+        self.dims.idx(s, t - s)
+    }
+
+    /// What an id names.
+    fn node(&self, id: JobId) -> Node {
+        if id >= SIG_BASE {
+            let off = id - SIG_BASE;
+            let k = self.offsets.partition_point(|&o| o <= off) - 1;
+            Node::Sig(k, (off - self.offsets[k]) as usize)
+        } else {
+            let k = (id / 4) as usize;
+            match id % 4 {
+                0 => Node::Zero(k),
+                1 => Node::Registered(k),
+                _ => Node::WalkDone(k),
+            }
+        }
+    }
+
+    /// The bidegrees a zero step reads (`depgraph`'s edges into `Compute(s, t)`), as indices.
+    fn compute_deps(&self, k: usize) -> Vec<usize> {
+        let b = &self.bideg[k];
+        let (s, t) = (b.s, b.t);
+        let same_row = if s <= 1 {
+            t - 1
+        } else {
+            t - b
+                .profile
+                .map_or(1, |p| algebra::zero_sig_floor(&self.profile_names[p]))
+        };
+        let mut deps: Vec<usize> = self.index(s, same_row).into_iter().collect();
+        if s == 1 {
+            deps.extend(self.index(0, t));
+        } else if s >= 2 {
+            deps.extend(self.index(s - 1, t - 1));
+        }
+        deps
+    }
+
+    /// Summary of the world for the report.
+    pub fn summary(&self) -> WorldSummary {
+        let known = self
+            .bideg
+            .iter()
+            .filter(|b| self.dims.known(b.s, b.t))
+            .count();
+        let mut per_profile: HashMap<String, (usize, u64)> = HashMap::new();
+        for b in &self.bideg {
+            let name = b
+                .profile
+                .map_or("F2".to_string(), |p| format!("{:?}", self.profile_names[p]));
+            let e = per_profile.entry(name).or_default();
+            e.0 += 1;
+            e.1 += b.tasks as u64;
+        }
+        let mut per_profile: Vec<(String, usize, u64)> = per_profile
+            .into_iter()
+            .map(|(k, v)| (k, v.0, v.1))
+            .collect();
+        per_profile.sort();
+        WorldSummary {
+            bidegrees: self.bideg.len(),
+            from_census: known,
+            live: self.bideg.iter().filter(|b| b.live).count(),
+            signature_tasks: self.bideg.iter().map(|b| b.tasks as u64).sum(),
+            template_nodes: self.offsets.last().copied().unwrap_or(0)
+                + self
+                    .bideg
+                    .last()
+                    .and_then(|b| b.profile)
+                    .map_or(0, |p| self.profiles[p].template.len() as u64),
+            zero_work: self.bideg.iter().map(|b| b.zero_true).sum(),
+            signature_work: self.bideg.iter().map(|b| b.work_true).sum(),
+            per_profile,
+        }
+    }
+
+    /// Lower bounds on any schedule's makespan on `fleet`: the critical path at the fastest class's
+    /// single-job speed with unlimited workers, and total work over total throughput.
+    pub fn bounds(&self, fleet: &Fleet, model: &dyn ServiceModel) -> (f64, f64) {
+        let fastest = fleet
+            .groups
+            .iter()
+            .map(|g| model.throughput(&g.0, 1))
+            .fold(0.0, f64::max);
+        let capacity: f64 = fleet
+            .groups
+            .iter()
+            .map(|g| g.1 as f64 * model.throughput(&g.0, g.2))
+            .sum();
+        // Finish times in increasing t: every edge goes to a larger t.
+        let mut order: Vec<usize> = (0..self.bideg.len()).collect();
+        order.sort_by_key(|&k| (self.bideg[k].t, self.bideg[k].s));
+        let mut registered = vec![0.0f64; self.bideg.len()];
+        let mut best = 0.0f64;
+        for k in order {
+            let b = &self.bideg[k];
+            let start = self
+                .compute_deps(k)
+                .iter()
+                .map(|&d| registered[d])
+                .fold(0.0, f64::max);
+            let walk_done = start + (b.zero_true + b.cp_true) / fastest;
+            let prev = self.index(b.s, b.t - 1).map_or(0.0, |p| registered[p]);
+            registered[k] = walk_done.max(prev);
+            best = best.max(registered[k]);
+        }
+        let work: f64 = self.bideg.iter().map(|b| b.zero_true + b.work_true).sum();
+        (best, work / capacity)
+    }
+}
+
+/// Size of the whole-run DAG.
+#[derive(Clone, Debug, Serialize)]
+pub struct WorldSummary {
+    /// Bidegrees in the region.
+    pub bidegrees: usize,
+    /// Of which measured by the census (the rest extrapolated).
+    pub from_census: usize,
+    /// Bidegrees with generators (their signature walks run).
+    pub live: usize,
+    /// Signature tasks that run.
+    pub signature_tasks: u64,
+    /// Signature-DAG nodes over all bidegrees (including no-ops).
+    pub template_nodes: u64,
+    /// Total true work of zero steps and of signatures (H200-seconds).
+    pub zero_work: f64,
+    /// See `zero_work`.
+    pub signature_work: f64,
+    /// `(profile, bidegrees, signature tasks)`.
+    pub per_profile: Vec<(String, usize, u64)>,
+}
+
+/// How the run is driven.
+#[derive(Clone, Debug, Serialize)]
+pub enum Plan {
+    /// Today's coordinator: at most `open` bidegrees in flight (one coordinator thread each), at
+    /// most `per_bidegree` signature tasks in flight per bidegree (walk threads), oldest bidegree
+    /// first.
+    Today {
+        /// Open-bidegree cap.
+        open: usize,
+        /// In-flight cap per bidegree.
+        per_bidegree: usize,
+    },
+    /// Event-driven, oldest bidegree first, no caps.
+    Group,
+    /// Event-driven, by upward rank over the whole DAG (estimated or true costs), with aging.
+    Rank {
+        /// Use the true costs for ranks.
+        oracle: bool,
+        /// `BackfillConfig::age_limit`.
+        age_limit: Option<f64>,
+    },
+}
+
+impl Plan {
+    /// Short name for tables.
+    pub fn name(&self) -> String {
+        match self {
+            Plan::Today { open, per_bidegree } => {
+                format!("today (open<={open}, walk<={per_bidegree})")
+            }
+            Plan::Group => "group order, uncapped".into(),
+            Plan::Rank { oracle, age_limit } => format!(
+                "DAG rank{}{}",
+                if *oracle {
+                    " (oracle costs)"
+                } else {
+                    " (estimated costs)"
+                },
+                age_limit.map_or(String::new(), |a| format!(", aging {a:.0}s"))
+            ),
+        }
+    }
+}
+
+/// One plan's result.
+#[derive(Clone, Debug, Serialize)]
+pub struct WholeMetrics {
+    /// Plan name.
+    pub plan: String,
+    /// Makespan, hours.
+    pub makespan_h: f64,
+    /// Tasks dispatched to workers.
+    pub tasks: u64,
+    /// Busy slot-time over available slot-time.
+    pub slot_util: f64,
+    /// Bidegree latency (zero step ready to walk done), seconds.
+    pub bidegree_latency: Quantiles,
+    /// Most bidegrees open at once.
+    pub peak_open: usize,
+    /// Most DAG nodes live at once.
+    pub peak_dag_nodes: usize,
+    /// `dispatch` wall time, microseconds.
+    pub dispatch_us: Quantiles,
+    /// Wall time of the simulation, seconds.
+    pub sim_s: f64,
+}
+
+/// An event of the simulation.
+#[derive(Clone, Copy, Debug)]
+enum Ev {
+    Release(JobId),
+    Done(usize, u64),
+}
+
+/// A heap entry (earliest first).
+struct Item(f64, u64, Ev);
+
+impl PartialEq for Item {
+    /// Equal when [`Ord`] says so.
+    fn eq(&self, o: &Self) -> bool {
+        self.cmp(o) == Ordering::Equal
+    }
+}
+
+impl Eq for Item {}
+
+impl PartialOrd for Item {
+    /// The total order of [`Ord`].
+    fn partial_cmp(&self, o: &Self) -> Option<Ordering> {
+        Some(self.cmp(o))
+    }
+}
+
+impl Ord for Item {
+    /// Reversed for a min-heap; the sequence number breaks ties deterministically.
+    fn cmp(&self, o: &Self) -> Ordering {
+        o.0.total_cmp(&self.0).then(o.1.cmp(&self.1))
+    }
+}
+
+/// A simulated worker: processor sharing over its running tasks.
+struct Wk {
+    class: String,
+    running: Vec<(JobId, f64)>,
+    last: f64,
+    version: u64,
+    busy: f64,
+}
+
+/// Simulate the whole run under `plan` on `fleet`. With `fast_first`, every job prefers the
+/// fastest class's workers (the slower ones take the overflow): speed-aware placement, the
+/// "earliest finish" half of HEFT in its simplest form.
+pub fn simulate(
+    world: &World,
+    fleet: &Fleet,
+    model: &dyn ServiceModel,
+    plan: &Plan,
+    fast_first: bool,
+) -> WholeMetrics {
+    let clock = std::time::Instant::now();
+    let (rank, oracle, age_limit) = match plan {
+        Plan::Rank { oracle, age_limit } => (true, *oracle, *age_limit),
+        _ => (false, false, None),
+    };
+    let caps = match plan {
+        Plan::Today { open, per_bidegree } => Some((*open, *per_bidegree)),
+        _ => None,
+    };
+    let policy = PriorityBackfill::new(BackfillConfig {
+        age_limit,
+        ..BackfillConfig::default()
+    });
+    let mut dag = DagScheduler::new(
+        DagConfig {
+            rank_priority: rank,
+            rank_scale: 1000.0,
+            default_work: 0.0,
+            auto_submit: false,
+            record_passthrough: true,
+            ..DagConfig::default()
+        },
+        policy,
+    );
+    let mut workers: Vec<Wk> = Vec::new();
+    for (class, count, slots) in &fleet.groups {
+        for _ in 0..*count {
+            let id = workers.len() as u64;
+            dag.worker_update(
+                WorkerState::new(id, class.clone(), *slots, Resources::mem(1 << 60)),
+                0.0,
+            );
+            workers.push(Wk {
+                class: class.clone(),
+                running: Vec::new(),
+                last: 0.0,
+                version: 0,
+                busy: 0.0,
+            });
+        }
+    }
+    let slots_total: usize = fleet.groups.iter().map(|g| g.1 * g.2).sum();
+    let fastest = workers
+        .iter()
+        .map(|w| model.throughput(&w.class, 1))
+        .fold(0.0, f64::max);
+    let fast: Vec<u64> = if fast_first {
+        (0..workers.len() as u64)
+            .filter(|&i| model.throughput(&workers[i as usize].class, 1) >= fastest)
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let spec = |id: JobId, k: usize| {
+        let mut j = JobSpec::new(id, Resources::ZERO, k as u64);
+        j.prefer = fast.clone();
+        j
+    };
+
+    // The bidegree level, declared up front: zero steps and "registered" passthroughs. Each
+    // "registered" node also waits for its walk (a forward reference, declared when the bidegree
+    // opens) and stands in for the walk's critical path until then.
+    let n = world.bideg.len();
+    let cost = |est: f64, truth: f64| if oracle { truth } else { est };
+    let mut jobs = Vec::with_capacity(2 * n);
+    for k in 0..n {
+        let b = &world.bideg[k];
+        let deps: Vec<JobId> = world
+            .compute_deps(k)
+            .iter()
+            .map(|&d| 4 * d as u64 + 1)
+            .collect();
+        jobs.push(
+            DagJob::new(spec(4 * k as u64, k), deps).with_work(cost(b.zero_est, b.zero_true)),
+        );
+        let mut reg = vec![4 * k as u64, 4 * k as u64 + 2];
+        reg.extend(world.index(b.s, b.t - 1).map(|p| 4 * p as u64 + 1));
+        jobs.push(DagJob::passthrough(
+            4 * k as u64 + 1,
+            k as u64,
+            reg,
+            cost(b.cp_est, b.cp_true),
+        ));
+    }
+    dag.declare(jobs, 0.0).expect("the bidegree DAG is acyclic");
+
+    let mut heap = BinaryHeap::new();
+    let mut seq = 0u64;
+    let mut push = |heap: &mut BinaryHeap<Item>, t: f64, ev: Ev| {
+        seq += 1;
+        heap.push(Item(t, seq, ev));
+    };
+    let mut ready_at = vec![f64::NAN; n];
+    let mut done_at = vec![f64::NAN; n];
+    let mut open = 0usize;
+    let mut peak_open = 0usize;
+    let mut open_queue: VecDeque<usize> = VecDeque::new();
+    let mut inflight = vec![0usize; n];
+    let mut sig_queue: HashMap<usize, VecDeque<JobId>> = HashMap::new();
+    let mut tasks = 0u64;
+    let mut dispatch_us = Vec::new();
+    let mut peak_nodes = 0usize;
+    let mut next_sample = 0u64;
+    let mut now = 0.0;
+
+    // Declare bidegree k's walk: its signature template, then "walk done" after the sinks.
+    let instantiate = |dag: &mut DagScheduler<PriorityBackfill>, k: usize, now: f64| {
+        let b = &world.bideg[k];
+        let zero = 4 * k as u64;
+        let mut done_deps = vec![zero];
+        // A dead bidegree's walk is all no-ops: skip its template.
+        if let Some(pi) = b.profile.filter(|_| b.live) {
+            let info = &world.profiles[pi];
+            let base = SIG_BASE + world.offsets[k];
+            dag.declare_template(
+                &info.template,
+                |i| base + i as u64,
+                |i| {
+                    let (est, truth) = (world.sig_work(k, i, false), world.sig_work(k, i, true));
+                    if truth > 0.0 {
+                        DagJob::new(spec(0, k), vec![]).with_work(cost(est, truth))
+                    } else {
+                        DagJob::passthrough(0, k as u64, vec![], 0.0)
+                    }
+                },
+                &[zero],
+                now,
+            )
+            .expect("the signature DAG is acyclic");
+            done_deps.extend(info.template.sinks().map(|i| base + i as u64));
+        }
+        dag.declare(
+            vec![DagJob::passthrough(zero + 2, k as u64, done_deps, 0.0)],
+            now,
+        )
+        .expect("walk-done is new");
+        dag.update_work(zero + 1, 0.0);
+    };
+
+    loop {
+        // Newly ready jobs: open bidegrees and release (respecting today's caps).
+        for id in dag.take_ready() {
+            match world.node(id) {
+                Node::Zero(k) => {
+                    ready_at[k] = now;
+                    instantiate(&mut dag, k, now);
+                    match caps {
+                        Some((cap, _)) if open >= cap => open_queue.push_back(k),
+                        _ => {
+                            open += 1;
+                            push(&mut heap, now, Ev::Release(id));
+                        }
+                    }
+                }
+                Node::Sig(k, _) => match caps {
+                    Some((_, per)) if inflight[k] >= per => {
+                        sig_queue.entry(k).or_default().push_back(id)
+                    }
+                    _ => {
+                        inflight[k] += 1;
+                        push(&mut heap, now, Ev::Release(id));
+                    }
+                },
+                other => unreachable!("{other:?} is a passthrough"),
+            }
+        }
+        for id in dag.take_passed() {
+            if let Node::WalkDone(k) = world.node(id) {
+                done_at[k] = now;
+                open -= 1;
+                if let Some((cap, _)) = caps {
+                    while open < cap {
+                        let Some(q) = open_queue.pop_front() else {
+                            break;
+                        };
+                        open += 1;
+                        push(&mut heap, now, Ev::Release(4 * q as u64));
+                    }
+                }
+            }
+        }
+        peak_open = peak_open.max(open);
+        let c = std::time::Instant::now();
+        let out = dag.dispatch(now);
+        dispatch_us.push(c.elapsed().as_secs_f64() * 1e6);
+        let mut dirty = Vec::new();
+        for (id, w) in out {
+            let w = w as usize;
+            advance(&mut workers[w], model, now);
+            let work = match world.node(id) {
+                Node::Zero(k) => world.bideg[k].zero_true,
+                Node::Sig(k, i) => world.sig_work(k, i, true),
+                other => unreachable!("{other:?} was dispatched"),
+            };
+            workers[w].running.push((id, work));
+            tasks += 1;
+            dirty.push(w);
+        }
+        dirty.sort_unstable();
+        dirty.dedup();
+        for w in dirty {
+            schedule(&mut workers[w], w, model, now, &mut |t, ev| {
+                push(&mut heap, t, ev)
+            });
+        }
+        if tasks >= next_sample {
+            next_sample = tasks + 65_536;
+            let s = dag.dag_stats();
+            peak_nodes = peak_nodes.max(s.pending + s.held + s.submitted + s.undeclared);
+        }
+
+        // Next event.
+        let Some(Item(t, _, ev)) = heap.pop() else {
+            break;
+        };
+        now = t;
+        match ev {
+            Ev::Release(id) => {
+                dag.release(id, now);
+            }
+            Ev::Done(w, v) => {
+                if v != workers[w].version {
+                    continue;
+                }
+                advance(&mut workers[w], model, now);
+                // The event was scheduled for the task(s) with the least work left: finish them
+                // even if rounding left a sliver (a completion at `now + tiny` can round to `now`).
+                let least = workers[w]
+                    .running
+                    .iter()
+                    .map(|x| x.1)
+                    .fold(f64::INFINITY, f64::min);
+                let mut finished = Vec::new();
+                workers[w].running.retain(|&(id, rem)| {
+                    let fin = rem <= least.max(0.0) + 1e-9 * (1.0 + least.abs());
+                    if fin {
+                        finished.push(id);
+                    }
+                    !fin
+                });
+                finished.sort_unstable();
+                for id in finished {
+                    dag.completed(id, now);
+                    if let (Node::Sig(k, _), Some(_)) = (world.node(id), caps) {
+                        inflight[k] -= 1;
+                        if let Some(next) = sig_queue.get_mut(&k).and_then(VecDeque::pop_front) {
+                            inflight[k] += 1;
+                            push(&mut heap, now, Ev::Release(next));
+                        }
+                    }
+                }
+                schedule(&mut workers[w], w, model, now, &mut |t, ev| {
+                    push(&mut heap, t, ev)
+                });
+            }
+        }
+    }
+    let unfinished = done_at.iter().filter(|x| x.is_nan()).count();
+    assert_eq!(
+        unfinished,
+        0,
+        "{} bidegrees never finished under {}",
+        unfinished,
+        plan.name()
+    );
+    let makespan = now;
+    let busy: f64 = workers.iter().map(|w| w.busy).sum();
+    WholeMetrics {
+        plan: plan.name() + if fast_first { ", fast first" } else { "" },
+        makespan_h: makespan / 3600.0,
+        tasks,
+        slot_util: busy / (slots_total as f64 * makespan).max(1e-9),
+        bidegree_latency: Quantiles::of((0..n).map(|k| done_at[k] - ready_at[k]).collect()),
+        peak_open,
+        peak_dag_nodes: peak_nodes,
+        dispatch_us: Quantiles::of(dispatch_us),
+        sim_s: clock.elapsed().as_secs_f64(),
+    }
+}
+
+/// Progress a worker's running tasks to `now` at their processor-sharing rate.
+fn advance(w: &mut Wk, model: &dyn ServiceModel, now: f64) {
+    let dt = now - w.last;
+    let k = w.running.len();
+    if dt > 0.0 && k > 0 {
+        let r = model.throughput(&w.class, k) / k as f64;
+        for x in &mut w.running {
+            x.1 -= r * dt;
+        }
+        w.busy += k as f64 * dt;
+    }
+    w.last = now;
+}
+
+/// Schedule a worker's next completion (invalidating any earlier one).
+fn schedule(
+    w: &mut Wk,
+    idx: usize,
+    model: &dyn ServiceModel,
+    now: f64,
+    push: &mut dyn FnMut(f64, Ev),
+) {
+    w.version += 1;
+    if w.running.is_empty() {
+        return;
+    }
+    let r = model.throughput(&w.class, w.running.len()) / w.running.len() as f64;
+    let min = w
+        .running
+        .iter()
+        .map(|x| x.1)
+        .fold(f64::INFINITY, f64::min)
+        .max(0.0);
+    push(now + min / r, Ev::Done(idx, w.version));
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use super::*;
+    use crate::sim::{
+        model::{ClassCurve, PsModel},
+        trace::{TraceTask, group_id},
+    };
+
+    /// A census over `s <= 4, n <= 40` whose dimensions grow 20% per stem, with generators on a
+    /// third of the bidegrees, and wall times following the dimensions.
+    fn census() -> Census {
+        let mut c = Census {
+            sources: vec!["synthetic".into()],
+            ..Census::default()
+        };
+        for s in 0..=4 {
+            for n in 0..=40 {
+                let t = n + s;
+                let p = algebra::optimal_profile(s, t, 5);
+                let tmd = 10.0 * 1.2f64.powi(n);
+                c.rows.insert(
+                    (s, t),
+                    CensusRow {
+                        target_masked_dim: tmd,
+                        next_dim: 2.0 * tmd,
+                        gens: u32::from((s + n) % 3 == 0),
+                        signatures: algebra::active_signatures(&p, t).len() as u32,
+                        subalgebra_dim: 1 << p.iter().map(|&x| x as u32).sum::<u32>(),
+                        wall_s: 1e-3 * tmd * (1.0 + (s as f64)),
+                        source: 0,
+                    },
+                );
+            }
+        }
+        c
+    }
+
+    /// A trace of one bidegree's zero step and signature tasks, work falling with degree.
+    fn trace() -> (Trace, Vec<f64>) {
+        let (n, s) = (30i64, 3i64);
+        let p = algebra::optimal_profile(s as i32, (n + s) as i32, 5);
+        let mut tasks = Vec::new();
+        let mut work = Vec::new();
+        let task = |req, zero, sig: Vec<u32>| TraceTask {
+            req,
+            zero,
+            bidegree: (n, s),
+            group: group_id(n, s),
+            est_gb: 1.0,
+            target: 1.0,
+            next: 1.0,
+            ready_s: 0.0,
+            placed_s: 0.0,
+            done_s: 1.0,
+            worker: 0,
+            deps: Vec::new(),
+            after_groups: Vec::new(),
+            sig,
+        };
+        tasks.push(task(0, true, Vec::new()));
+        work.push(5.0);
+        for i in algebra::active_signatures(&p, (n + s) as i32) {
+            let (sig, deg) = algebra::signature(i, &p);
+            tasks.push(task(1 + i as u64, false, sig));
+            work.push(100.0 / deg as f64 * (1.0 + 0.1 * (i % 3) as f64));
+        }
+        (
+            Trace {
+                workers: Vec::new(),
+                tasks,
+            },
+            work,
+        )
+    }
+
+    /// Every plan finishes every bidegree, dispatches the same tasks, and respects the bounds.
+    #[test]
+    fn whole_run_plans_finish_within_bounds() {
+        let census = census();
+        let (trace, work) = trace();
+        let world = World::build(
+            WholeConfig {
+                max_n: 40,
+                max_s: 4,
+                max_profile_len: 5,
+                min_work: 0.01,
+            },
+            &census,
+            (&trace, &work),
+        );
+        assert!(
+            world.cost.within[1] < 0.0,
+            "work falls with degree: {:?}",
+            world.cost.within
+        );
+        let model = PsModel {
+            classes: BTreeMap::from([(
+                "x".to_string(),
+                ClassCurve {
+                    speed: 1.0,
+                    k_sat: 4,
+                    alpha: 1.0,
+                },
+            )]),
+        };
+        let fleet = Fleet {
+            groups: vec![("x".into(), 2, 4)],
+        };
+        let (cp, cap) = world.bounds(&fleet, &model);
+        let plans = [
+            Plan::Today {
+                open: 2,
+                per_bidegree: 3,
+            },
+            Plan::Group,
+            Plan::Rank {
+                oracle: false,
+                age_limit: Some(600.0),
+            },
+            Plan::Rank {
+                oracle: true,
+                age_limit: None,
+            },
+        ];
+        let results: Vec<WholeMetrics> = plans
+            .iter()
+            .map(|p| simulate(&world, &fleet, &model, p, false))
+            .collect();
+        let expected = world.summary().signature_tasks + world.bideg.len() as u64;
+        for m in &results {
+            assert_eq!(m.tasks, expected, "{}", m.plan);
+            assert!(
+                m.makespan_h * 3600.0 >= cp.max(cap) * (1.0 - 1e-9),
+                "{}: beats a bound",
+                m.plan
+            );
+        }
+        assert_eq!(results[0].peak_open, 2);
+    }
+
+    /// Missing census rows continue their row's exponential trend.
+    #[test]
+    fn dims_extrapolate_rows() {
+        let mut c = census();
+        c.rows.retain(|&(s, t), _| t - s <= 30);
+        let d = Dims::build(&c, 4, 40);
+        let want = 10.0 * 1.2f64.powi(40);
+        assert!(
+            (d.tmd(2, 42) / want - 1.0).abs() < 1e-6,
+            "{} vs {want}",
+            d.tmd(2, 42)
+        );
+        assert!(!d.known(2, 42) && d.known(2, 32));
+    }
+}

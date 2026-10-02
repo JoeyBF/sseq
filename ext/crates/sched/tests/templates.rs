@@ -269,3 +269,49 @@ proptest! {
         }
     }
 }
+
+/// Descendant sets of every node, by brute force.
+fn closure(t: &DagTemplate) -> Vec<std::collections::BTreeSet<usize>> {
+    (0..t.len())
+        .map(|v| {
+            let mut seen = std::collections::BTreeSet::new();
+            let mut stack: Vec<usize> = t.successors(v).iter().map(|&c| c as usize).collect();
+            while let Some(c) = stack.pop() {
+                if seen.insert(c) {
+                    stack.extend(t.successors(c).iter().map(|&x| x as usize));
+                }
+            }
+            seen
+        })
+        .collect()
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(256))]
+
+    /// The reduction keeps reachability and critical paths, and no kept edge is implied.
+    #[test]
+    fn transitive_reduction_is_minimal_and_equivalent(
+        n in 1usize..40,
+        edges in prop::collection::vec((0u32..40, 0u32..40), 0..200),
+        works in prop::collection::vec(0.0f64..10.0, 40),
+    ) {
+        let edges: Vec<(u32, u32)> =
+            edges.into_iter().filter(|&(a, b)| a < b && (b as usize) < n).collect();
+        let t = DagTemplate::new(n, edges).unwrap();
+        let r = t.transitive_reduction();
+        prop_assert_eq!(closure(&t), closure(&r));
+        prop_assert!((t.critical_path(|i| works[i]) - r.critical_path(|i| works[i])).abs() < 1e-9);
+        let reach = closure(&r);
+        for a in 0..n {
+            for &c in r.successors(a) {
+                for &other in r.successors(a) {
+                    prop_assert!(
+                        other == c || !reach[other as usize].contains(&(c as usize)),
+                        "edge {} -> {} is implied via {}", a, c, other
+                    );
+                }
+            }
+        }
+    }
+}

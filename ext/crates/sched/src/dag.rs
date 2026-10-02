@@ -145,6 +145,43 @@ impl DagTemplate {
         (0..self.len()).filter(|&i| self.succ[i].is_empty())
     }
 
+    /// The same partial order with every implied edge removed (an edge `a -> c` is implied when
+    /// `c` is reachable from another successor of `a`). Readiness and critical paths are
+    /// unchanged; instances get far fewer edges. Takes `O(len^2 / 8)` bytes of scratch.
+    pub fn transitive_reduction(&self) -> DagTemplate {
+        let n = self.len();
+        let words = n.div_ceil(64);
+        let mut position = vec![0usize; n];
+        for (p, &v) in self.topo.iter().enumerate() {
+            position[v as usize] = p;
+        }
+        // reach[v]: the strict descendants of v, filled in reverse topological order.
+        let mut reach = vec![0u64; n * words];
+        let mut edges = Vec::new();
+        let mut acc = vec![0u64; words];
+        for &v in self.topo.iter().rev() {
+            let v = v as usize;
+            let mut succ = self.succ[v].clone();
+            // Earlier successors (in topological order) are the only ones that can reach later
+            // ones, so a successor already covered by the earlier ones is implied.
+            succ.sort_unstable_by_key(|&c| position[c as usize]);
+            acc.fill(0);
+            for c in succ {
+                let c = c as usize;
+                if acc[c / 64] >> (c % 64) & 1 == 1 {
+                    continue;
+                }
+                edges.push((v as u32, c as u32));
+                acc[c / 64] |= 1 << (c % 64);
+                for (a, r) in acc.iter_mut().zip(&reach[c * words..(c + 1) * words]) {
+                    *a |= r;
+                }
+            }
+            reach[v * words..(v + 1) * words].copy_from_slice(&acc);
+        }
+        DagTemplate::new(n, edges).expect("a sub-DAG of a DAG is acyclic")
+    }
+
     /// The longest chain of `work` through the template: a group's duration with unlimited
     /// workers, i.e. the cost to give its placeholder.
     pub fn critical_path(&self, work: impl Fn(usize) -> f64) -> f64 {

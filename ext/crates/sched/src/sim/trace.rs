@@ -63,6 +63,8 @@ pub struct TraceTask {
     pub deps: Vec<u64>,
     /// Groups that must complete first (zero tasks only).
     pub after_groups: Vec<u64>,
+    /// The signature's Milnor exponents (empty for zero tasks).
+    pub sig: Vec<u32>,
 }
 
 /// A parsed trace.
@@ -114,6 +116,8 @@ struct TaskLine {
     deps: Vec<u64>,
     #[serde(default)]
     after_groups: Vec<(i64, i64)>,
+    #[serde(default)]
+    sig: Vec<u32>,
 }
 
 impl Trace {
@@ -198,6 +202,7 @@ impl Trace {
                         done_s,
                         worker,
                         deps: x.deps,
+                        sig: x.sig,
                         after_groups: x
                             .after_groups
                             .iter()
