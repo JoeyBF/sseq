@@ -16,7 +16,7 @@ pub use dag::{
 };
 pub use engine::{
     BackfillConfig, BestFit, BestFitConfig, Defer, Greedy, GreedyConfig, LaneSet, Lanes,
-    LanesConfig, Learn, PriorityBackfill, SlowGate, SpeedConfig, SpeedPolicy,
+    LanesConfig, Learn, PriorityBackfill, SlowGate, SpeedConfig, SpeedPolicy, Spoliation,
 };
 
 /// A job identifier, chosen by the caller. Must be unique among live (waiting or running) jobs.
@@ -290,6 +290,17 @@ pub trait Policy {
     fn explain(&self, job: JobId) -> Option<String>;
     /// Counters and current state.
     fn stats(&self) -> PolicyStats;
+    /// [`dispatch`](Self::dispatch) plus preemptions ([`Spoliation`]): running jobs to restart
+    /// on a faster worker. The caller kills each preempted job's instance on `from` and starts it
+    /// again on `to`; the policy already counts it on `to` only. If the old instance completes
+    /// before the kill lands, report `completed(job)` (that releases `to`) and kill the new one.
+    /// The default never preempts.
+    fn dispatch_full(&mut self, now: Instant) -> Dispatch {
+        Dispatch {
+            start: self.dispatch(now),
+            preempt: Vec::new(),
+        }
+    }
     /// The next time `dispatch` should be called even if no event arrives: a job's voluntary wait
     /// (for a faster worker, or behind the slow-worker gate) expires then. `None` if nothing is
     /// timed. Callers with frequent events may ignore it at the cost of that much extra waiting.
@@ -343,4 +354,29 @@ impl<P: Policy + ?Sized> Policy for Box<P> {
     fn next_wakeup(&self) -> Option<Instant> {
         (**self).next_wakeup()
     }
+
+    /// Forwarded.
+    fn dispatch_full(&mut self, now: Instant) -> Dispatch {
+        (**self).dispatch_full(now)
+    }
+}
+
+/// What [`Policy::dispatch_full`] decided: placements of waiting jobs, and preemptions.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Dispatch {
+    /// Waiting jobs to start: `(job, worker)`.
+    pub start: Vec<(JobId, WorkerId)>,
+    /// Running jobs to restart elsewhere.
+    pub preempt: Vec<Preemption>,
+}
+
+/// A running job moved to a faster worker (see [`Policy::dispatch_full`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Preemption {
+    /// The job.
+    pub job: JobId,
+    /// Where it was running (kill it there).
+    pub from: WorkerId,
+    /// Where it runs now (start it again there).
+    pub to: WorkerId,
 }

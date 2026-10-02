@@ -475,6 +475,12 @@ impl<P: Policy> DagScheduler<P> {
         &mut self.policy
     }
 
+    /// Passthrough of [`Policy::dispatch_full`]: placements and preemptions.
+    pub fn dispatch_full(&mut self, now: Instant) -> crate::Dispatch {
+        self.now = now;
+        self.policy.dispatch_full(now)
+    }
+
     /// Ids that became ready since the last call, in readiness order. With `auto_submit` they are
     /// already submitted; otherwise submit each with [`release`](Self::release).
     pub fn take_ready(&mut self) -> Vec<JobId> {

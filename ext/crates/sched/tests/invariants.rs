@@ -6,7 +6,7 @@ use proptest::prelude::*;
 use sched::{
     BackfillConfig, BestFit, BestFitConfig, Defer, Greedy, GreedyConfig, JobId, JobSpec, LaneSet,
     Lanes, LanesConfig, Policy, PriorityBackfill, Resources, SlowGate, SpeedConfig, SpeedPolicy,
-    WorkerId, WorkerState,
+    Spoliation, WorkerId, WorkerState,
 };
 
 const LANE: WorkerId = 0;
@@ -187,10 +187,21 @@ fn speed() -> impl Strategy<Value = SpeedConfig> {
         )
             .prop_map(|(factor, max_wait)| SlowGate { factor, max_wait }),
     );
-    (policy, gate).prop_map(|(policy, slow_gate)| SpeedConfig {
+    let spoliation = prop::option::weighted(
+        0.4,
+        (prop_oneof![Just(0.0), Just(0.25)], 1u32..3).prop_map(|(min_gain, max_per_job)| {
+            Spoliation {
+                min_gain,
+                restart_overhead: 0.0,
+                max_per_job,
+            }
+        }),
+    );
+    (policy, gate, spoliation).prop_map(|(policy, slow_gate, spoliation)| SpeedConfig {
         policy,
         slow_gate,
         learn: None,
+        spoliation,
     })
 }
 
@@ -225,6 +236,8 @@ struct Shadow {
     now: f64,
     workers: BTreeMap<WorkerId, WorkerState>,
     running: BTreeMap<JobId, (WorkerId, u64)>,
+    /// Specs of running jobs, and how often each was preempted.
+    specs: BTreeMap<JobId, (JobSpec, u32)>,
     waiting: BTreeMap<JobId, SJob>,
     groups: BTreeMap<u64, u64>,
     seq: u64,
@@ -466,7 +479,8 @@ fn run(kind: &Kind, speed: SpeedConfig, ops: &[Op]) -> Result<Vec<String>, TestC
 
         let before = p.stats();
         let mut gate = sh.gate();
-        let out = p.dispatch(sh.now);
+        let full = p.dispatch_full(sh.now);
+        let out = full.start;
         let after = p.stats();
         let holders: BTreeSet<JobId> = after.last_dispatch_holders.iter().copied().collect();
         let deferred: BTreeSet<JobId> = after.deferred.iter().map(|d| d.0).collect();
@@ -545,16 +559,73 @@ fn run(kind: &Kind, speed: SpeedConfig, ops: &[Op]) -> Result<Vec<String>, TestC
             }
             sh.waiting.remove(&j);
             sh.running.insert(j, (w, job.spec.demand.mem));
+            sh.specs.insert(j, (job.spec.clone(), 0));
         }
-        // Escape hatch: an empty worker with a free slot leaves no job waiting that may run there,
-        // except one waiting for a faster worker by choice, or held back by the slow gate.
         let held: BTreeMap<JobId, WorkerId> = after
             .reservations
             .iter()
             .map(|r| (r.job, r.worker))
             .collect();
+        // Spoliation: each preemption moves a running job, with work, from a strictly slower
+        // worker to one that admits it, whose free slot no waiting job wanted, at most
+        // `max_per_job` times.
+        let mut vacated = BTreeSet::new();
+        for pr in &full.preempt {
+            let Some(cfg) = speed.spoliation else {
+                prop_assert!(false, "preemption without spoliation");
+                unreachable!()
+            };
+            prop_assert_eq!(
+                sh.running.get(&pr.job).map(|r| r.0),
+                Some(pr.from),
+                "{:?}",
+                pr
+            );
+            let (spec, n) = sh.specs[&pr.job].clone();
+            prop_assert!(spec.work.is_some());
+            prop_assert!(
+                sh.workers[&pr.from].speed < sh.workers[&pr.to].speed,
+                "{:?}",
+                pr
+            );
+            prop_assert!(
+                sh.eligible(&spec, pr.to) && sh.admits(spec.demand.mem, pr.to),
+                "{:?}",
+                pr
+            );
+            prop_assert!(
+                !(matches!(kind, Kind::Lanes) && sh.lane_refuses(spec.demand.mem, pr.to)),
+                "preemption broke the lane reserve: {:?}",
+                pr
+            );
+            prop_assert!(n < cfg.max_per_job, "ping-pong: {:?}", pr);
+            prop_assert!(
+                !held.contains_key(&pr.job)
+                    && !after.reservations.iter().any(|r| r.worker == pr.to),
+                "preempted onto a reserved worker"
+            );
+            let wanted = sh.waiting.values().find(|j| {
+                !deferred.contains(&j.spec.id)
+                    && sh.eligible(&j.spec, pr.to)
+                    && sh.admits(j.spec.demand.mem, pr.to)
+                    && !(matches!(kind, Kind::Lanes) && sh.lane_refuses(j.spec.demand.mem, pr.to))
+                    && !sh.gated(j, pr.to, gate)
+            });
+            prop_assert!(
+                wanted.is_none(),
+                "preempted onto {} while job {:?} waits for it",
+                pr.to,
+                wanted.map(|j| j.spec.id)
+            );
+            sh.running.insert(pr.job, (pr.to, spec.demand.mem));
+            sh.specs.insert(pr.job, (spec, n + 1));
+            vacated.insert(pr.from);
+        }
+        // Escape hatch: an empty worker with a free slot leaves no job waiting that may run there,
+        // except one waiting for a faster worker by choice, or held back by the slow gate.
         for (&w, s) in &sh.workers {
-            if s.slots > 0 && sh.load(w).0 == 0 {
+            // A worker that just gave up a preempted job is refilled at the next dispatch.
+            if s.slots > 0 && sh.load(w).0 == 0 && !vacated.contains(&w) {
                 let stuck = sh.waiting.values().find(|j| {
                     sh.eligible(&j.spec, w)
                         && !deferred.contains(&j.spec.id)

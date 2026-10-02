@@ -28,7 +28,7 @@ use sched::{
 struct Args {
     /// Plan A: group | rank | rank-oracle | grouprank | grouprank-oracle, with optional suffixes
     /// +fast, +eft (wait up to --max-defer), +eft<percent> (wait only for that much gain), +gate,
-    /// +age<seconds>.
+    /// +spoil (restart stuck jobs on faster workers), +age<seconds>.
     #[arg(long)]
     a: String,
     /// Plan B, as plan A.
@@ -124,6 +124,12 @@ fn plan(name: &str, max_defer: f64) -> SmallPlan {
                     factor: 1.0,
                     max_wait: max_defer,
                 });
+            }
+            "spoil" => {
+                if p.speed.policy == SpeedPolicy::Oblivious {
+                    p.speed.policy = SpeedPolicy::FastestFirst;
+                }
+                p.speed.spoliation = Some(sched::Spoliation::default());
             }
             s if s.starts_with("age") => p.age_limit = Some(s[3..].parse().expect("+age<seconds>")),
             s if s.starts_with("eft") => {

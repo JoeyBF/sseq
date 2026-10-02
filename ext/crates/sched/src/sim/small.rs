@@ -105,6 +105,8 @@ pub struct SmallResult {
     pub idle_ready: f64,
     /// Fraction of the makespan spent running realised-critical-chain tasks on slow workers.
     pub slow_on_crit: f64,
+    /// Jobs restarted on a faster worker.
+    pub preemptions: u64,
 }
 
 impl SmallInstance {
@@ -243,18 +245,41 @@ pub fn simulate_small(inst: &SmallInstance, plan: &SmallPlan) -> SmallResult {
     let mut running = 0usize;
     let (mut now, mut contention, mut idle_ready) = (0.0f64, 0.0f64, 0.0f64);
     let mut wake = f64::NAN;
+    let mut epoch = vec![0u32; n];
+    let mut preemptions = 0u64;
     loop {
-        for (j, w) in dag.dispatch(now) {
-            let (j, w) = (j as usize, w as usize);
-            start[j] = now;
-            on[j] = w;
-            running += 1;
-            seq += 1;
-            heap.push(Ev(
-                now + inst.tasks[j].work / speed[w],
-                seq,
-                Some((j, w as u32)),
-            ));
+        // Dispatch until nothing moves: a preemption frees a slot on a slower worker.
+        loop {
+            let d = dag.dispatch_full(now);
+            for (j, w) in d.start {
+                let (j, w) = (j as usize, w as usize);
+                start[j] = now;
+                on[j] = w;
+                running += 1;
+                seq += 1;
+                heap.push(Ev(
+                    now + inst.tasks[j].work / speed[w],
+                    seq,
+                    Some((j, epoch[j])),
+                ));
+            }
+            if d.preempt.is_empty() {
+                break;
+            }
+            for pr in d.preempt {
+                // Kill on `from` (its pending completion goes stale), restart on `to`.
+                let (j, w) = (pr.job as usize, pr.to as usize);
+                epoch[j] += 1;
+                start[j] = now;
+                on[j] = w;
+                preemptions += 1;
+                seq += 1;
+                heap.push(Ev(
+                    now + inst.tasks[j].work / speed[w],
+                    seq,
+                    Some((j, epoch[j])),
+                ));
+            }
         }
         if let Some(t) = dag.policy().next_wakeup()
             && t != wake
@@ -280,7 +305,10 @@ pub fn simulate_small(inst: &SmallInstance, plan: &SmallPlan) -> SmallResult {
         while heap.peek().is_some_and(|e| e.0 == t) {
             events.push(heap.pop().unwrap().2);
         }
-        for (j, _) in events.into_iter().flatten() {
+        for (j, e) in events.into_iter().flatten() {
+            if e != epoch[j] {
+                continue; // a preempted instance
+            }
             running -= 1;
             finish[j] = now;
             dag.completed(j as u64, now);
@@ -320,6 +348,7 @@ pub fn simulate_small(inst: &SmallInstance, plan: &SmallPlan) -> SmallResult {
         contention: contention / m,
         idle_ready: idle_ready / m,
         slow_on_crit: slow_time / m,
+        preemptions,
     }
 }
 
@@ -595,6 +624,7 @@ mod tests {
                             policy,
                             slow_gate: None,
                             learn: None,
+                            spoliation: None,
                         },
                     };
                     let r = simulate_small(&inst, &plan);

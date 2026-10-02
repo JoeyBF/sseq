@@ -1757,6 +1757,7 @@ mod tests {
                 policy,
                 slow_gate,
                 learn: None,
+                spoliation: None,
             },
             ..Placement::default()
         };
