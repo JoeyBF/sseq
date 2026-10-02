@@ -40,6 +40,7 @@ fn fastest_first_picks_the_fast_worker() {
     let speed = SpeedConfig {
         policy: SpeedPolicy::FastestFirst,
         slow_gate: None,
+        learn: None,
     };
     let policies: Vec<Box<dyn Policy>> = vec![
         Box::new(Greedy::new(GreedyConfig { speed })),
@@ -92,6 +93,7 @@ fn earliest_finish_defers_only_when_it_pays() {
     let speed = SpeedConfig {
         policy: SpeedPolicy::EarliestFinish(Some(defer)),
         slow_gate: None,
+        learn: None,
     };
     for (running_work, expect_defer) in [(10.0, true), (1000.0, false)] {
         let mut p = backfill(speed);
@@ -131,6 +133,7 @@ fn deferral_expires() {
     let speed = SpeedConfig {
         policy: SpeedPolicy::EarliestFinish(Some(defer)),
         slow_gate: None,
+        learn: None,
     };
     let mut p = backfill(speed);
     p.worker_update(worker(1, 1, 1.0), 0.0);
@@ -156,6 +159,7 @@ fn deferrals_book_slots_in_order() {
     let speed = SpeedConfig {
         policy: SpeedPolicy::EarliestFinish(Some(defer)),
         slow_gate: None,
+        learn: None,
     };
     let mut p = backfill(speed);
     p.worker_update(worker(1, 1, 1.0), 0.0);
@@ -183,6 +187,7 @@ fn slow_gate() {
     let speed = SpeedConfig {
         policy: SpeedPolicy::FastestFirst,
         slow_gate: Some(gate),
+        learn: None,
     };
     let mut p = backfill(speed);
     p.worker_update(worker(1, 2, 1.0), 0.0);
@@ -222,6 +227,7 @@ fn gate_exemptions() {
     let speed = SpeedConfig {
         policy: SpeedPolicy::FastestFirst,
         slow_gate: Some(gate),
+        learn: None,
     };
     let mut p = PriorityBackfill::new(BackfillConfig {
         speed,
@@ -240,4 +246,51 @@ fn gate_exemptions() {
     assert_eq!(p.dispatch(1.0), vec![(1, 2)]);
     assert!(p.dispatch(50.0).is_empty());
     assert_eq!(p.dispatch(101.0), vec![(2, 1)], "aged jobs bypass the gate");
+}
+
+/// Speeds learned from completion times override the reported ones once warmed up.
+#[test]
+fn learned_speeds_replace_reported_ones() {
+    let speed = SpeedConfig {
+        policy: SpeedPolicy::FastestFirst,
+        slow_gate: None,
+        learn: Some(sched::Learn {
+            weight: 0.05,
+            min_samples: 20,
+        }),
+    };
+    let mut p = backfill(speed);
+    // Both report 1.0; worker 2 really runs three times faster.
+    p.worker_update(WorkerState::new(1, "a", 1, Resources::mem(1000)), 0.0);
+    p.worker_update(WorkerState::new(2, "b", 1, Resources::mem(1000)), 0.0);
+    let truth = |w: u64| if w == 2 { 3.0 } else { 1.0 };
+    let mut now = 0.0;
+    let mut id = 0;
+    let mut running: Vec<(u64, u64, f64)> = Vec::new();
+    for _ in 0..200 {
+        // Keep both workers busy: one queued job per free worker.
+        for _ in running.len()..2 {
+            p.submit(job(id, Some(6.0)), now);
+            id += 1;
+        }
+        for (j, w) in p.dispatch(now) {
+            running.push((j, w, now + 6.0 / truth(w)));
+        }
+        running.sort_by(|a, b| a.2.total_cmp(&b.2));
+        let (j, _, end) = running.remove(0);
+        now = end;
+        p.completed(j, now);
+    }
+    let loads = p.stats().workers;
+    let learned: Vec<f64> = loads.iter().map(|l| l.speed).collect();
+    assert!(
+        (learned[0] - 1.0).abs() < 1e-9 && (learned[1] - 3.0).abs() < 1e-9,
+        "{learned:?}"
+    );
+    // With both free, the truly fast worker is preferred now.
+    for (j, _, _) in running.drain(..) {
+        p.completed(j, now);
+    }
+    p.submit(job(10_000, Some(6.0)), now);
+    assert_eq!(p.dispatch(now), vec![(10_000, 2)]);
 }

@@ -76,6 +76,32 @@ pub struct SpeedConfig {
     pub policy: SpeedPolicy,
     /// Keep slow workers idle while the fast class can absorb the backlog.
     pub slow_gate: Option<SlowGate>,
+    /// Learn each worker class's speed from completion times instead of trusting
+    /// [`WorkerState::speed`].
+    pub learn: Option<Learn>,
+}
+
+/// Online speed learning: each completed job with [`JobSpec::work`] `w` that ran `d` seconds is a
+/// sample `ln(w / d)` of its worker class's speed, averaged in log space (durations are
+/// log-normal). Unlike StarPU's history models there is no outlier filter: with per-job noise of
+/// sd 0.6 a "50% off the mean" filter would discard most samples.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Learn {
+    /// Weight of a new sample once warmed up (an exponential moving average; plain averaging
+    /// until then).
+    pub weight: f64,
+    /// Samples a class needs before its learned speed replaces the reported one.
+    pub min_samples: u32,
+}
+
+impl Default for Learn {
+    /// A 5% moving average after 20 samples.
+    fn default() -> Self {
+        Self {
+            weight: 0.05,
+            min_samples: 20,
+        }
+    }
 }
 
 /// Configuration for [`PriorityBackfill`] (and the backfill part of [`BestFit`] and [`Lanes`]).
@@ -203,6 +229,8 @@ struct Worker {
     jobs: BTreeSet<JobId>,
     reserved_for: Option<JobId>,
     lane: bool,
+    /// Effective speed: learned for its class, or as reported.
+    speed: f64,
 }
 
 impl Worker {
@@ -259,13 +287,14 @@ fn ordered(x: f64) -> i64 {
     b ^ (((b >> 63) as u64) >> 1) as i64
 }
 
-/// A worker's speed, guarded against nonsense.
+/// A worker's effective speed.
 fn speed_of(w: &Worker) -> f64 {
-    if w.state.speed > 0.0 && w.state.speed.is_finite() {
-        w.state.speed
-    } else {
-        1.0
-    }
+    w.speed
+}
+
+/// A reported speed, guarded against nonsense.
+fn sane_speed(x: f64) -> f64 {
+    if x > 0.0 && x.is_finite() { x } else { 1.0 }
 }
 
 /// Whether `job`'s hard constraints (class, avoid list) allow `w` at all.
@@ -325,6 +354,8 @@ struct Engine<A> {
     deferred: Vec<(JobId, WorkerId, Instant)>,
     /// When the last dispatch's voluntary waits expire.
     wakeup: Option<Instant>,
+    /// Learned speeds by class: (mean of ln speed, samples).
+    learned: BTreeMap<String, (f64, u32)>,
 }
 
 impl<A: Admission> Engine<A> {
@@ -347,6 +378,7 @@ impl<A: Admission> Engine<A> {
             last_dispatch_holders: Vec::new(),
             deferred: Vec::new(),
             wakeup: None,
+            learned: BTreeMap::new(),
         }
     }
 
@@ -457,8 +489,47 @@ impl<A: Admission> Engine<A> {
     /// Release a running job (or drop it, if it was still waiting).
     fn completed(&mut self, job: JobId, now: Instant) {
         self.now = now;
+        self.learn_from(job, now);
         if !self.finish_running(job) {
             self.remove_waiting(job);
+        }
+    }
+
+    /// The speed to use for a worker of `class` that reports `reported`: learned, once there are
+    /// enough samples, else as reported.
+    fn class_speed(&self, class: &str, reported: f64) -> f64 {
+        match (self.mode.speed.learn, self.learned.get(class)) {
+            (Some(l), Some(&(mean, n))) if n >= l.min_samples => mean.exp(),
+            _ => sane_speed(reported),
+        }
+    }
+
+    /// A job finished: learn its worker class's speed from its duration.
+    fn learn_from(&mut self, job: JobId, now: Instant) {
+        let Some(cfg) = self.mode.speed.learn else {
+            return;
+        };
+        let Some(r) = self.running.get(&job) else {
+            return;
+        };
+        let (Some(work), Some(w)) = (r.work, self.workers.get(&r.worker)) else {
+            return;
+        };
+        let dt = now - r.started;
+        if !(work > 0.0 && dt > 0.0 && work.is_finite() && dt.is_finite()) {
+            return;
+        }
+        let class = w.state.class.clone();
+        let x = (work / dt).ln();
+        let e = self.learned.entry(class.clone()).or_insert((x, 0));
+        let alpha = cfg.weight.max(1.0 / f64::from(e.1 + 1));
+        e.0 += alpha * (x - e.0);
+        e.1 += 1;
+        if e.1 >= cfg.min_samples {
+            let speed = e.0.exp();
+            for w in self.workers.values_mut().filter(|w| w.state.class == class) {
+                w.speed = speed;
+            }
         }
     }
 
@@ -466,6 +537,7 @@ impl<A: Admission> Engine<A> {
     fn worker_update(&mut self, state: WorkerState, now: Instant) {
         self.now = now;
         let lane = self.is_lane(&state);
+        let speed = self.class_speed(&state.class, state.speed);
         match self.workers.get_mut(&state.id) {
             Some(w) => {
                 // A reservation counted against the old class (per-class limits) must not move to
@@ -475,6 +547,7 @@ impl<A: Admission> Engine<A> {
                     .flatten();
                 w.state = state;
                 w.lane = lane;
+                w.speed = speed;
                 if let Some(holder) = moved {
                     self.release_reservation_of(holder);
                 }
@@ -490,6 +563,7 @@ impl<A: Admission> Engine<A> {
                         jobs: BTreeSet::new(),
                         reserved_for: None,
                         lane,
+                        speed,
                     },
                 );
             }

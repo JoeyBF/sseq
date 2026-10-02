@@ -594,6 +594,7 @@ mod tests {
                         speed: SpeedConfig {
                             policy,
                             slow_gate: None,
+                            learn: None,
                         },
                     };
                     let r = simulate_small(&inst, &plan);

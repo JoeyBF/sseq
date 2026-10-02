@@ -1753,7 +1753,11 @@ mod tests {
             ]),
         };
         let place = |policy, slow_gate| Placement {
-            speed: SpeedConfig { policy, slow_gate },
+            speed: SpeedConfig {
+                policy,
+                slow_gate,
+                learn: None,
+            },
             ..Placement::default()
         };
         let fast = simulate(
