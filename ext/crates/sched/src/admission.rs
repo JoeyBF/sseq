@@ -34,6 +34,32 @@ impl WorkerView<'_> {
         let h = self.state.budget.mem as i128 - self.effective_used().mem as i128;
         h.clamp(i64::MIN as i128, i64::MAX as i128) as i64
     }
+
+    /// Device memory in use as admission counts it: `max(Σ placed dev, running * dev_per_task)`.
+    pub fn dev_used(&self) -> u64 {
+        self.placed
+            .dev
+            .max((self.running as u64).saturating_mul(self.state.dev_per_task))
+    }
+
+    /// Device headroom, `budget.dev - dev_used`, in bytes; `None` when the capacity is unknown.
+    pub fn dev_headroom(&self) -> Option<i64> {
+        let cap = self.state.budget.dev;
+        (cap > 0).then(|| {
+            (cap as i128 - self.dev_used() as i128).clamp(i64::MIN as i128, i64::MAX as i128) as i64
+        })
+    }
+
+    /// The device rule: a job needing `demand` bytes of device memory (at least the worker's
+    /// `dev_per_task`) fits in the remaining device capacity, or the capacity is unknown.
+    pub fn device_admits(&self, demand: u64) -> bool {
+        let cap = self.state.budget.dev;
+        cap == 0
+            || self
+                .dev_used()
+                .saturating_add(demand.max(self.state.dev_per_task))
+                <= cap
+    }
 }
 
 /// Whether a worker admits a job.
@@ -55,13 +81,20 @@ pub trait Admission {
     }
 }
 
-/// The production admission rule:
+/// The production admission rule, host memory AND device memory:
 ///
 /// ```text
 /// admit(job on w) iff running(w) < slots(w)
 ///                 and ( running(w) == 0      // escape hatch: a job alone always goes
-///                       or max(reported_used, reported_baseline + Σ placed) + demand <= budget )
+///                       or ( max(reported_used, reported_baseline + Σ placed) + demand <= budget
+///                            and device fits ) )
+/// device fits    iff budget.dev == 0         // unknown capacity: not enforced
+///                    or max(Σ placed.dev, running * dev_per_task)
+///                         + max(demand.dev, dev_per_task) <= budget.dev
 /// ```
+///
+/// With `dev_per_task` alone (jobs without device demands) the device rule is the per-worker count
+/// form `(running + 1) * dev_per_task <= cap`; with per-job device demands it is their sum.
 ///
 /// `reported_baseline` must exclude the running jobs (a worker's `baseline_excl`: its rolling RSS
 /// floor minus their estimates). A floor that contains them counts them twice, once in it and
@@ -75,7 +108,9 @@ impl Admission for ProductionAdmission {
         if w.running >= w.state.slots {
             return false;
         }
-        w.running == 0 || (w.effective_used() + *demand).fits_within(&w.state.budget)
+        w.running == 0
+            || (w.effective_used().mem.saturating_add(demand.mem) <= w.state.budget.mem
+                && w.device_admits(demand.dev))
     }
 
     /// The headroom left under the production rule (unbounded when the worker is empty).
@@ -85,9 +120,14 @@ impl Admission for ProductionAdmission {
         } else if w.running == 0 {
             Some(Resources::MAX)
         } else {
-            let used = w.effective_used();
-            used.fits_within(&w.state.budget)
-                .then(|| w.state.budget - used)
+            let used = w.effective_used().mem;
+            let mem = (used <= w.state.budget.mem).then(|| w.state.budget.mem - used)?;
+            let dev = match w.dev_headroom() {
+                None => u64::MAX,
+                Some(h) if h >= w.state.dev_per_task as i64 => h as u64,
+                Some(_) => return None,
+            };
+            Some(Resources::mem(mem).with_dev(dev))
         }
     }
 }
@@ -126,7 +166,10 @@ mod tests {
         // Slots full.
         assert!(!a.admits(&Resources::mem(0), &view(2, 0)));
         assert_eq!(a.bound(&view(2, 0)), None);
-        assert_eq!(a.bound(&view(1, 50)), Some(Resources::mem(40)));
+        assert_eq!(
+            a.bound(&view(1, 50)),
+            Some(Resources::mem(40).with_dev(u64::MAX))
+        );
         assert_eq!(view(1, 50).headroom(), 40);
     }
 

@@ -61,6 +61,9 @@ pub enum Event {
         budget_gb: f64,
         /// Its slots.
         slots: usize,
+        /// Its device memory capacity, GB (0: unknown).
+        #[cfg_attr(feature = "serde", serde(default, skip_serializing_if = "is_zero"))]
+        dev_cap_gb: f64,
     },
     /// A heartbeat (rate-limited): reported resident memory and the policy's own bookkeeping.
     Sample {
@@ -76,6 +79,9 @@ pub enum Event {
         reserved_gb: f64,
         /// Jobs placed there.
         running: usize,
+        /// The worker's learned device memory per job, GB (0: unknown).
+        #[cfg_attr(feature = "serde", serde(default, skip_serializing_if = "is_zero"))]
+        dev_per_task_gb: f64,
     },
     /// A worker left.
     Gone {
@@ -92,6 +98,9 @@ pub enum Event {
         job: JobId,
         /// Its demand, GB.
         est_gb: f64,
+        /// Its device memory demand, GB.
+        #[cfg_attr(feature = "serde", serde(default, skip_serializing_if = "is_zero"))]
+        dev_gb: f64,
         /// Its group.
         group: u64,
         /// Its priority, if any.
@@ -165,6 +174,12 @@ pub enum Event {
         /// The worker.
         worker: String,
     },
+}
+
+/// Whether a logged quantity is zero (left out of the line).
+#[cfg(feature = "serde")]
+fn is_zero(x: &f64) -> bool {
+    *x == 0.0
 }
 
 /// Where events go.
@@ -293,7 +308,7 @@ pub struct Logged<P> {
     inner: P,
     sink: Box<dyn EventSink>,
     sample_every: f64,
-    capacity: HashMap<WorkerId, (String, usize, u64)>,
+    capacity: HashMap<WorkerId, (String, usize, crate::Resources)>,
     last_sample: HashMap<WorkerId, Instant>,
     reserved: BTreeSet<(JobId, WorkerId)>,
     info: HashMap<JobId, TaskInfo>,
@@ -381,13 +396,14 @@ impl<P: Policy> Logged<P> {
 
     /// Log a worker's capacity if new or changed, and a sample if due.
     fn log_worker(&mut self, w: &WorkerState, now: Instant) {
-        let cap = (w.class.clone(), w.slots, w.budget.mem);
+        let cap = (w.class.clone(), w.slots, w.budget);
         if self.capacity.get(&w.id) != Some(&cap) {
             self.sink.record(&Event::Worker {
                 id: w.id.to_string(),
                 gpu: w.class.clone(),
                 budget_gb: gb(w.budget.mem),
                 slots: w.slots,
+                dev_cap_gb: gb(w.budget.dev),
             });
             self.capacity.insert(w.id, cap);
         }
@@ -409,6 +425,7 @@ impl<P: Policy> Logged<P> {
                 baseline_gb: gb(w.reported_baseline.mem),
                 reserved_gb: load.as_ref().map_or(0.0, |l| gb(l.placed.mem)),
                 running: load.map_or(0, |l| l.running),
+                dev_per_task_gb: gb(w.dev_per_task),
             });
             self.last_sample.insert(w.id, now);
         }
@@ -423,6 +440,7 @@ impl<P: Policy> Policy for Logged<P> {
             t_s: now,
             job: job.id,
             est_gb: gb(job.demand.mem),
+            dev_gb: gb(job.demand.dev),
             group: job.group,
             priority: job.priority,
             work: job.work,

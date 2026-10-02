@@ -290,6 +290,81 @@ the same seed):
 - **The fleet is fixed:** no joins, leaves or failures.
 
 
+## Restart-stable order, learned speeds, and the measured speed ratio
+
+Three noise seeds each, uncapped, fast first unless stated; makespan relative to the first row of
+each table. Raw results: `gk_seed*.json`, `age_seed*.json`, `r139_seed*.json`,
+`age139_seed*.json` next to the other whole-run results.
+
+**Group order** (fitted speeds, L40S 2.41x H200; bound about 854 h):
+
+| order between bidegrees | aging | makespan | vs arrival | bidegree latency p90 / max |
+|---|---|---|---|---|
+| arrival (first submission) | none | 1,226 h | -- | 5.6 h / 88 h |
+| `(s, t)` | none | 1,221 h | -0.4% (-1.2..+0.1) | 0.6 h / 132 h |
+| `(t, s)` | none | 1,293 h | +5.5% (+5.2..+5.8) | 0.9 h / 217 h |
+| `(t - s, s)` | none | 1,318 h | +7.6% (+6.1..+8.4) | 0.6 h / 253 h |
+| arrival | 30 min | 1,233 h | -- | 4.7 h / 82 h |
+| `(s, t)` | 30 min | 1,227 h | -0.5% (-1.4..-0.1) | 4.6 h / 83 h |
+| `(s, t)`, earliest finish with waiting | 30 min | 1,207 h | -2.2% (-2.7..-1.6) | 4.2 h / 74 h |
+
+- **`(s, t)` is the restart-stable order** (`nassau::group`): it matches arrival order's makespan.
+  Stem or `t`-major orders cost 5-8%.
+- Without aging, `(s, t)` cuts p90 bidegree latency ninefold but lets a few high-`s` bidegrees
+  wait longer (worst 132 h vs 88 h). **With the default 30-minute aging the two orders are
+  indistinguishable**: at full scale most jobs wait past the age limit, so aged FIFO decides, and
+  the worst bidegree is bounded (83 h).
+
+**Learned speeds.** Every worker reports speed 1 and `Learn::default()` (per worker, class prior,
+hysteresis) learns from completions with estimated work: +0.4% (-0.3..+1.1) against oracle speeds,
+-0.1% with `(s, t)` and aging. The estimator recovers the fast-first gain.
+
+**The measured speed ratio.** The fit gives L40S 2.41x H200 per worker process; production
+measures 1.39x per GPU. With `--class-speed l40s=1.39` (bound about 1,480 h):
+
+| plan | makespan | vs today |
+|---|---|---|
+| today (24 open bidegrees, 32 walk tasks each, speed-oblivious) | 2,750 h | -- |
+| uncapped, oldest first | 2,178 h | -20.8% |
+| uncapped, fast first | 1,991 h | -27.6% |
+| uncapped, earliest finish with waiting | 1,976 h | -28.2% |
+| uncapped, fast first, `(s, t)`, 30 min aging | 2,012 h | -26.8% |
+| uncapped, fast first, `(s, t)`, learned speeds | 1,987 h | -27.7% |
+
+Removing the caps is worth about 21% at either ratio; fast-first placement is worth about 9% on
+top at 1.39x, against about 25% at 2.41x. Today to uncapped fast-first is 1.38x at the measured
+ratio (1.65x at the fitted one).
+
+## Device memory (`sched-device`, synthetic)
+
+The trace has no device data, so `sched-device` builds a scenario after job 40506688: 14 small
+workers of 16 slots, a 19.5 GB device launch pool each, jobs needing about 2.4 GB (log-normal, sd
+0.3: about 8 fit), 20,000 jobs ready at once, work log-normal (median 600 s, sd 0.6). Over the
+pool, a job runs at `(C / S)^(1 + gamma)` of its speed for total demand `S`: `gamma = 0` means the
+pool only serialises launches, and `gamma = 1.29` reproduces the live drop (16 jobs delivering 0.41x
+of 8 jobs' throughput). Policy: backfill with the production rule, host AND device.
+
+| gamma | device admission | makespan vs host only | jobs per worker | pool over-subscribed |
+|---|---|---|---|---|
+| 0 | none (host only) | -- (37.7 h) | 15.6 | 98% |
+| 0 | per-task demand = p90 of jobs' | +53% | 5.0 | 0.1% |
+| 0 | per-task demand = p75 | +28% | 5.9 | 2% |
+| 0 | per-task demand = p50 | +2.5% | 7.9 | 60% |
+| 0 | per-job demands, exact | +0.1% | 7.6 | 0% |
+| 0 | per-job demands, error sd 0.3 | +10% | 7.4 | 44% |
+| 1.29 | none (host only) | -- (94.9 h) | 15.9 | 99% |
+| 1.29 | per-task demand = p90 | -39% | 5.0 | 0.1% |
+| 1.29 | per-task demand = p75 | -49% | 5.9 | 2% |
+| 1.29 | per-task demand = p50 | -56% | 7.9 | 63% |
+| 1.29 | per-job demands, exact | **-60%** | 7.6 | 0% |
+| 1.29 | per-job demands, error sd 0.3 | -52% | 7.5 | 49% |
+
+- **Device-aware admission avoids the slowdown:** 39-60% shorter makespan at the live penalty.
+- **Which per-task demand matters.** In the count form a high quantile is pessimistic for a sum:
+  8 jobs' total concentrates near 8 x the mean, not 8 x the 90th percentile, so the p90 form fits
+  only 5 jobs and, when over-subscription is harmless, costs 53%. Report a per-task demand near the
+  mean, or per-job estimates (the sum form), which cost nothing when exact.
+
 ## Cross-validation against dslab-dag
 
 `sched-whole --export-dslab DIR` writes a region as dslab-dag input (one resource per worker,
