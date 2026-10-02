@@ -22,13 +22,14 @@ sim = ["log", "dep:clap"]
 petgraph = { version = "0.8", default-features = false, features = ["stable_graph", "std"] }
 
 serde = { version = "1", features = ["derive"], optional = true }
-serde_json = { version = "1", optional = true }
+# `float_roundtrip`: a logged run replays exactly only if its times read back bit for bit.
+serde_json = { version = "1", features = ["float_roundtrip"], optional = true }
 flate2 = { version = "1", optional = true }
 clap = { version = "4", features = ["derive"], optional = true }
 
 [dev-dependencies]
 proptest = "1.7.0"
-serde_json = "1"
+serde_json = { version = "1", features = ["float_roundtrip"] }
 
 [[bin]]
 name = "sched-sim"

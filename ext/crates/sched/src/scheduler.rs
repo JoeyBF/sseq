@@ -7,9 +7,9 @@ use std::{
 };
 
 use crate::{
-    Admission, Config, DEV, DIMS, Fit, GroupOrder, Instant, JobId, JobSpec, MEM, Order, Policy,
-    PolicyStats, ProductionAdmission, ReservationInfo, Resources, SpeedEstimator, SpeedPolicy,
-    WorkerId, WorkerLoad, WorkerState, WorkerView,
+    Admission, Attempt, Config, DEV, DIMS, FailKind, Fit, GaveUp, GroupOrder, Input, Instant,
+    JobId, JobSpec, MEM, Order, Output, Policy, PolicyStats, ProductionAdmission, ReservationInfo,
+    Resources, SpeedEstimator, SpeedPolicy, Tried, WorkerId, WorkerLoad, WorkerState, WorkerView,
 };
 
 /// Urgency: smaller is more urgent.
@@ -25,9 +25,11 @@ struct Key {
 #[derive(Clone, Debug)]
 struct Worker {
     state: WorkerState,
+    /// Live attempts here.
     running: usize,
     placed: Resources,
-    jobs: BTreeSet<JobId>,
+    /// The jobs with a live attempt here, and that attempt (a job has at most one per worker).
+    jobs: BTreeMap<JobId, Attempt>,
     /// The job holding a [`Hold::Reserve`] on this worker, if any.
     reserved_for: Option<JobId>,
     /// Effective speed: learned, or as reported.
@@ -48,22 +50,36 @@ impl Worker {
     }
 }
 
+/// A job across its attempts. A retry requeues it with the same `key` and `since`, so it keeps
+/// its place and its age.
 #[derive(Clone, Debug)]
-struct Waiting {
+struct Job {
     spec: JobSpec,
     key: Key,
     since: Instant,
+    /// Attempts started so far: the last attempt's number.
+    attempts: Attempt,
+    /// Failed attempts.
+    tried: Vec<Tried>,
+    /// Speculative attempts started.
+    speculated: u32,
 }
 
+/// One live attempt of a running job.
 #[derive(Clone, Debug)]
-struct Running {
+struct Run {
+    attempt: Attempt,
     worker: WorkerId,
     started: Instant,
-    spec: JobSpec,
     /// The worker's `occ` when it started.
     occ0: f64,
-    /// Times it was preempted.
-    preemptions: u32,
+}
+
+/// A job with at least one live attempt.
+#[derive(Clone, Debug)]
+struct Running {
+    job: Job,
+    live: Vec<Run>,
 }
 
 /// A worker kept from a job on purpose although it might admit it: the one notion behind
@@ -176,20 +192,27 @@ fn class_allows(job: &JobSpec, w: &Worker) -> bool {
 /// - [`Config::reservations`] drain a worker for a starving job; every other worker keeps
 ///   admitting less urgent jobs.
 ///
-/// `dispatch` scans waiting jobs in order and gives each one a worker if any admits it. Because the
-/// scan is in urgency order and admission is monotone in load, a job is placed on a worker only if
-/// every more urgent waiting job was refused there -- the priority invariant -- without any
-/// explicit check. The one event that can make an already-refused worker admissible mid-scan is
-/// the release of a hold (a reservation whose holder is placed); the scan restarts from the top
-/// when that happens.
+/// - Failed attempts are retried ([`Config::retry`]) and, with
+///   [`SpeedConfig::speculate`](crate::SpeedConfig::speculate), idle fast workers run second
+///   attempts of jobs on slow ones.
+///
+/// Each [`poll`](Policy::poll) scans waiting jobs in order and gives each one a worker if any
+/// admits it. Because the scan is in urgency order and admission is monotone in load, a job is
+/// placed on a worker only if every more urgent waiting job was refused there -- the priority
+/// invariant -- without any explicit check. The one event that can make an already-refused worker
+/// admissible mid-scan is the release of a hold (a reservation whose holder is placed); the scan
+/// restarts from the top when that happens. Speculative attempts come after the scan, on workers
+/// every waiting job was refused on.
 pub struct Scheduler {
     config: Config,
     admission: Box<dyn Admission + Send>,
     workers: BTreeMap<WorkerId, Worker>,
     queue: BTreeMap<Key, JobId>,
     by_age: BTreeMap<u64, JobId>,
-    waiting: HashMap<JobId, Waiting>,
+    waiting: HashMap<JobId, Job>,
     running: HashMap<JobId, Running>,
+    /// Outputs not yet returned by `poll`.
+    outbox: Vec<Output>,
     /// Group -> sequence number of its first arrival.
     groups: HashMap<u64, u64>,
     /// Holds by job.
@@ -236,6 +259,7 @@ impl Scheduler {
             by_age: BTreeMap::new(),
             waiting: HashMap::new(),
             running: HashMap::new(),
+            outbox: Vec::new(),
             groups: HashMap::new(),
             holds: BTreeMap::new(),
             next_seq: 0,
@@ -260,16 +284,22 @@ impl Scheduler {
         job.work.map(|work| work / w.speed)
     }
 
-    /// When a running job is expected to end: its start plus its [`eta`](Self::eta), or, once
-    /// that has passed, as far beyond now as it has run (an overrunning job is assumed half done,
-    /// StarPU's rule). `None` if its run time is unknown.
+    /// When a running job is expected to end: the earliest expected end of its live attempts,
+    /// each its start plus its [`eta`](Self::eta), or, once that has passed, as far beyond now as
+    /// it has run (an overrunning attempt is assumed half done, StarPU's rule). `None` if its run
+    /// time is unknown.
     fn expected_end(&self, r: &Running) -> Option<Instant> {
-        let end = r.started + self.eta(&r.spec, self.workers.get(&r.worker)?)?;
-        Some(if end > self.now {
-            end
-        } else {
-            self.now + (self.now - r.started).max(0.0)
-        })
+        r.live
+            .iter()
+            .filter_map(|run| {
+                let end = run.started + self.eta(&r.job.spec, self.workers.get(&run.worker)?)?;
+                Some(if end > self.now {
+                    end
+                } else {
+                    self.now + (self.now - run.started).max(0.0)
+                })
+            })
+            .reduce(f64::min)
     }
 
     /// Whether `job`'s constraints (class, avoid list) allow `w` at all. A soft avoid list
@@ -288,9 +318,8 @@ impl Scheduler {
             })
     }
 
-    /// Queue a job under its urgency key, recording its group's first arrival.
+    /// Queue a new job under its urgency key, recording its group's first arrival.
     fn submit(&mut self, spec: JobSpec, now: Instant) {
-        self.now = now;
         if self.waiting.contains_key(&spec.id) || self.running.contains_key(&spec.id) {
             return;
         }
@@ -330,16 +359,21 @@ impl Scheduler {
                 }
             }
         };
-        self.queue.insert(key, spec.id);
-        self.by_age.insert(seq, spec.id);
-        self.waiting.insert(
-            spec.id,
-            Waiting {
-                spec,
-                key,
-                since: now,
-            },
-        );
+        self.enqueue(Job {
+            spec,
+            key,
+            since: now,
+            attempts: 0,
+            tried: Vec::new(),
+            speculated: 0,
+        });
+    }
+
+    /// Put a job in the waiting indexes under its key.
+    fn enqueue(&mut self, job: Job) {
+        self.queue.insert(job.key, job.spec.id);
+        self.by_age.insert(job.key.seq, job.spec.id);
+        self.waiting.insert(job.spec.id, job);
     }
 
     /// The worker `job` reserves, if any.
@@ -375,7 +409,7 @@ impl Scheduler {
     }
 
     /// Take a job out of the waiting indexes, releasing its hold.
-    fn remove_waiting(&mut self, job: JobId) -> Option<Waiting> {
+    fn remove_waiting(&mut self, job: JobId) -> Option<Job> {
         self.release_hold(job);
         let j = self.waiting.remove(&job)?;
         self.queue.remove(&j.key);
@@ -383,33 +417,92 @@ impl Scheduler {
         Some(j)
     }
 
-    /// Release a running job's slot and demand; false if it was not running.
-    fn finish_running(&mut self, job: JobId) -> bool {
-        let Some(r) = self.running.remove(&job) else {
-            return false;
-        };
-        if let Some(w) = self.workers.get_mut(&r.worker) {
+    /// Release an attempt's slot and demand on its worker (if the worker is still known).
+    fn release_run(&mut self, job: JobId, demand: Resources, run: &Run) {
+        if let Some(w) = self.workers.get_mut(&run.worker) {
             tick_occ(w, self.now);
             w.running -= 1;
-            w.placed -= r.spec.demand;
+            w.placed -= demand;
             w.jobs.remove(&job);
         }
-        true
     }
 
-    /// Drop a waiting job, or release a running one.
+    /// Release every live attempt of a running job, emitting a stop for each one except
+    /// `except`; returns the job.
+    fn stop_running(&mut self, job: JobId, except: Option<Attempt>) -> Option<Job> {
+        let r = self.running.remove(&job)?;
+        for run in &r.live {
+            self.release_run(job, r.job.spec.demand, run);
+            if Some(run.attempt) != except {
+                self.outbox.push(Output::Stop {
+                    job,
+                    attempt: run.attempt,
+                    worker: run.worker,
+                });
+            }
+        }
+        Some(r.job)
+    }
+
+    /// Drop a waiting job, or stop a running one.
     fn cancel(&mut self, job: JobId) {
         if self.remove_waiting(job).is_none() {
-            self.finish_running(job);
+            self.stop_running(job, None);
         }
     }
 
-    /// Release a running job (or drop it, if it was still waiting).
-    fn completed(&mut self, job: JobId, now: Instant) {
-        self.now = now;
-        self.learn_from(job, now);
-        if !self.finish_running(job) {
-            self.remove_waiting(job);
+    /// The index of `attempt` among `job`'s live attempts, if it is one.
+    fn live(&self, job: JobId, attempt: Attempt) -> Option<usize> {
+        self.running
+            .get(&job)?
+            .live
+            .iter()
+            .position(|r| r.attempt == attempt)
+    }
+
+    /// An attempt finished: the job is complete; its other attempts are stopped.
+    fn done(&mut self, job: JobId, attempt: Attempt) {
+        let Some(i) = self.live(job, attempt) else {
+            return;
+        };
+        self.learn_from(job, i);
+        self.stop_running(job, Some(attempt));
+    }
+
+    /// An attempt failed: record it, then retry or give up once no attempt is live.
+    fn failed(&mut self, job: JobId, attempt: Attempt, kind: FailKind, why: String) {
+        let Some(i) = self.live(job, attempt) else {
+            return;
+        };
+        let r = self.running.get_mut(&job).unwrap();
+        let run = r.live.remove(i);
+        r.job.tried.push(Tried {
+            worker: run.worker,
+            kind,
+            why,
+        });
+        let demand = r.job.spec.demand;
+        let idle = r.live.is_empty();
+        self.release_run(job, demand, &run);
+        if !idle {
+            return;
+        }
+        let mut j = self.running.remove(&job).unwrap().job;
+        if j.tried.len() < self.config.retry.max_attempts.max(1) as usize {
+            for t in &j.tried {
+                if !j.spec.avoid.contains(&t.worker) {
+                    j.spec.avoid.push(t.worker);
+                }
+            }
+            j.spec.avoid_soft = true;
+            self.enqueue(j);
+        } else {
+            let retryable = j.tried.iter().all(|t| t.kind == FailKind::DeviceOom);
+            self.outbox.push(Output::GaveUp(GaveUp {
+                job,
+                tried: j.tried,
+                retryable,
+            }));
         }
     }
 
@@ -422,21 +515,25 @@ impl Scheduler {
         }
     }
 
-    /// A job finished: learn its worker's speed from its duration and the worker's mean
-    /// concurrency meanwhile.
-    fn learn_from(&mut self, job: JobId, now: Instant) {
+    /// Live attempt `i` of a job finished: learn its worker's speed from its duration and the
+    /// worker's mean concurrency meanwhile.
+    fn learn_from(&mut self, job: JobId, i: usize) {
         if self.learned.is_none() {
             return;
         }
-        let Some(r) = self.running.get(&job) else {
-            return;
-        };
-        let (Some(work), Some(w)) = (r.spec.work, self.workers.get_mut(&r.worker)) else {
+        let now = self.now;
+        let r = &self.running[&job];
+        let run = &r.live[i];
+        let (Some(work), Some(w)) = (r.job.spec.work, self.workers.get_mut(&run.worker)) else {
             return;
         };
         tick_occ(w, now);
-        let dt = now - r.started;
-        let k = if dt > 0.0 { (w.occ - r.occ0) / dt } else { 1.0 };
+        let dt = now - run.started;
+        let k = if dt > 0.0 {
+            (w.occ - run.occ0) / dt
+        } else {
+            1.0
+        };
         let (id, class) = (w.state.id, w.state.class.clone());
         if !self
             .learned
@@ -474,7 +571,6 @@ impl Scheduler {
 
     /// Add a worker or replace its reported state, keeping its placements.
     fn worker_update(&mut self, state: WorkerState, now: Instant) {
-        self.now = now;
         let speed = self.worker_speed(state.id, &state.class, state.speed);
         match self.workers.get_mut(&state.id) {
             Some(w) => {
@@ -497,7 +593,7 @@ impl Scheduler {
                         state,
                         running: 0,
                         placed: Resources::ZERO,
-                        jobs: BTreeSet::new(),
+                        jobs: BTreeMap::new(),
                         reserved_for: None,
                         speed,
                         occ: 0.0,
@@ -508,16 +604,21 @@ impl Scheduler {
         }
     }
 
-    /// Forget a worker, its running jobs and every hold on it.
-    fn worker_gone(&mut self, id: WorkerId, now: Instant) {
-        self.now = now;
+    /// Forget a worker and every hold on it; each live attempt there fails with
+    /// [`FailKind::LinkDied`].
+    fn worker_gone(&mut self, id: WorkerId) {
         let Some(w) = self.workers.remove(&id) else {
             return;
         };
-        for job in &w.jobs {
-            self.running.remove(job);
-        }
         self.holds.retain(|_, h| h.worker() != id);
+        for (job, attempt) in w.jobs {
+            self.failed(
+                job,
+                attempt,
+                FailKind::LinkDied,
+                format!("worker {id} left"),
+            );
+        }
     }
 
     /// The hold that keeps `w` from `job`, and the job that has it: a reservation of `w` by
@@ -573,9 +674,9 @@ impl Scheduler {
     fn shadow_time(&self, w: &Worker, holder: JobId) -> Option<Instant> {
         let demand = self.waiting.get(&holder)?.spec.demand;
         let mut ends: Vec<(f64, Resources)> = Vec::with_capacity(w.jobs.len());
-        for j in &w.jobs {
+        for j in w.jobs.keys() {
             let r = &self.running[j];
-            ends.push((self.expected_end(r)?, r.spec.demand));
+            ends.push((self.expected_end(r)?, r.job.spec.demand));
         }
         ends.sort_by(|a, b| a.0.total_cmp(&b.0));
         // The projection assumes a released job frees what it was placed with; the reported
@@ -632,7 +733,7 @@ impl Scheduler {
     }
 
     /// Whether `job` has waited past the age limit.
-    fn aged(&self, job: &Waiting) -> bool {
+    fn aged(&self, job: &Job) -> bool {
         self.config
             .age_limit
             .is_some_and(|a| self.now - job.since >= a)
@@ -674,7 +775,7 @@ impl Scheduler {
         let ends = proj.entry(w.state.id).or_insert_with(|| {
             let mut ends: Vec<f64> = w
                 .jobs
-                .iter()
+                .keys()
                 .map(|j| self.expected_end(&self.running[j]).unwrap_or(f64::INFINITY))
                 .collect();
             ends.sort_by(f64::total_cmp);
@@ -684,7 +785,7 @@ impl Scheduler {
     }
 
     /// The best worker that takes `job`, or a busy faster worker to wait for, if any.
-    fn choose(&self, job: &Waiting, proj: &mut Projection) -> Pick {
+    fn choose(&self, job: &Job, proj: &mut Projection) -> Pick {
         let speed_first = self.config.speed.policy != SpeedPolicy::Oblivious;
         // Smallest tuple wins; the worker id makes the order total (determinism).
         let mut best: Option<((i64, i64, bool, usize), WorkerId)> = None;
@@ -758,39 +859,53 @@ impl Scheduler {
         Pick::Place(place)
     }
 
-    /// Move a waiting job onto a worker and record the placement.
-    fn place(&mut self, job: JobId, worker: WorkerId, out: &mut Vec<(JobId, WorkerId)>) {
+    /// Move a waiting job onto a worker as its next attempt.
+    fn place(&mut self, job: JobId, worker: WorkerId) {
         if self.reserved(job) == Some(worker) {
             self.last_dispatch_holders.push(job);
         }
         let j = self
             .remove_waiting(job)
             .expect("placing a job that is not waiting");
+        self.running.insert(
+            job,
+            Running {
+                job: j,
+                live: Vec::new(),
+            },
+        );
+        self.start(job, worker);
+    }
+
+    /// Start a new attempt of a running job on `worker` and emit it.
+    fn start(&mut self, job: JobId, worker: WorkerId) {
+        let r = self.running.get_mut(&job).unwrap();
+        r.job.attempts += 1;
+        let attempt = r.job.attempts;
         let w = self
             .workers
             .get_mut(&worker)
             .expect("placing on an unknown worker");
         tick_occ(w, self.now);
         w.running += 1;
-        w.placed += j.spec.demand;
-        w.jobs.insert(job);
-        let occ0 = w.occ;
-        self.running.insert(
-            job,
-            Running {
-                worker,
-                started: self.now,
-                spec: j.spec,
-                preemptions: 0,
-                occ0,
-            },
-        );
+        w.placed += r.job.spec.demand;
+        w.jobs.insert(job, attempt);
+        r.live.push(Run {
+            attempt,
+            worker,
+            started: self.now,
+            occ0: w.occ,
+        });
         self.placements_total += 1;
-        out.push((job, worker));
+        self.outbox.push(Output::Start {
+            job,
+            attempt,
+            worker,
+        });
     }
 
     /// Scan order as a sortable value: aged jobs first by age, then the rest by urgency.
-    fn urgency(&self, job: &Waiting) -> (bool, Key) {
+    fn urgency(&self, job: &Job) -> (bool, Key) {
         if self.aged(job) {
             (
                 false,
@@ -901,8 +1016,7 @@ impl Scheduler {
     }
 
     /// Scan waiting jobs in order, placing each where it is admitted, reserving for the starving.
-    fn dispatch(&mut self, now: Instant) -> Vec<(JobId, WorkerId)> {
-        self.now = now;
+    fn dispatch(&mut self) {
         self.last_dispatch_holders.clear();
         self.deferred_any.clear();
         // Deferrals are decided afresh by this scan. A reservation on a worker that can never run
@@ -922,7 +1036,6 @@ impl Scheduler {
             self.release_hold(job);
         }
         let mut proj = Projection::new();
-        let mut out = Vec::new();
         'scan: loop {
             if !self.workers.values().any(|w| w.running < w.state.slots) {
                 break;
@@ -963,7 +1076,7 @@ impl Scheduler {
                         }
                     }
                     Pick::Place(w) => {
-                        self.place(job, w, &mut out);
+                        self.place(job, w);
                         if holder {
                             // Its worker is open again: more urgent jobs refused there because of
                             // the reservation must get the first look.
@@ -980,7 +1093,7 @@ impl Scheduler {
                             self.refresh_shadows();
                             // A taken-over worker may admit the job now that it is the holder.
                             if let Pick::Place(w) = self.choose(&self.waiting[&job], &mut proj) {
-                                self.place(job, w, &mut out);
+                                self.place(job, w);
                                 continue 'scan;
                             }
                             bound = self.open_bound();
@@ -990,23 +1103,15 @@ impl Scheduler {
                 }
             }
         }
-        out
     }
 
-    /// Placements, then spoliation (see [`Spoliation`](crate::Spoliation)).
-    fn dispatch_full(&mut self, now: Instant) -> crate::Dispatch {
-        let start = self.dispatch(now);
-        let preempt = self.spoliate();
-        crate::Dispatch { start, preempt }
-    }
-
-    /// Move running jobs from slower workers to faster ones with free slots left after dispatch.
-    fn spoliate(&mut self) -> Vec<crate::Preemption> {
-        let Some(cfg) = self.config.speed.spoliation else {
-            return Vec::new();
+    /// Start speculative attempts on workers left with a free slot (see
+    /// [`Speculate`](crate::Speculate)).
+    fn speculate(&mut self) {
+        let Some(cfg) = self.config.speed.speculate else {
+            return;
         };
         let now = self.now;
-        let mut out = Vec::new();
         let ids: Vec<WorkerId> = self.workers.keys().copied().collect();
         for to in ids {
             loop {
@@ -1014,54 +1119,40 @@ impl Scheduler {
                 if w.running >= w.state.slots || w.reserved_for.is_some() {
                     break;
                 }
-                // Candidates: run time known, on a slower worker, allowed and admitted here.
+                let rank = self.speed_rank(w);
+                // Candidates: run time known, every live attempt on a slower worker, allowed and
+                // admitted here.
                 let mut best: Option<(f64, JobId)> = None;
                 for (&job, r) in &self.running {
-                    let Some(v) = self.workers.get(&r.worker) else {
-                        continue;
-                    };
-                    if self.speed_rank(v) <= self.speed_rank(w)
-                        || r.preemptions >= cfg.max_per_job
-                        || !self.eligible(&r.spec, w)
-                        || !self.admission.admits(&r.spec.demand, &w.view())
+                    let slower = r.live.iter().all(|run| {
+                        self.workers
+                            .get(&run.worker)
+                            .is_some_and(|v| self.speed_rank(v) > rank)
+                    });
+                    if !slower
+                        || r.job.speculated >= cfg.max_per_job
+                        || !self.eligible(&r.job.spec, w)
+                        || !self.admission.admits(&r.job.spec.demand, &w.view())
                     {
                         continue;
                     }
-                    let (Some(end_v), Some(run)) = (self.expected_end(r), self.eta(&r.spec, w))
+                    let (Some(end), Some(run)) = (self.expected_end(r), self.eta(&r.job.spec, w))
                     else {
                         continue;
                     };
-                    let end_w = now + run + cfg.restart_overhead;
-                    if end_v - end_w < cfg.min_gain * run || end_v <= end_w {
+                    let end_here = now + run + cfg.restart_overhead;
+                    if end - end_here < cfg.min_gain * run || end <= end_here {
                         continue;
                     }
-                    if best.is_none_or(|(e, j)| end_v > e || (end_v == e && job < j)) {
-                        best = Some((end_v, job));
+                    if best.is_none_or(|(e, j)| end > e || (end == e && job < j)) {
+                        best = Some((end, job));
                     }
                 }
                 let Some((_, job)) = best else { break };
-                let r = self.running.get_mut(&job).unwrap();
-                let from = r.worker;
-                r.worker = to;
-                r.started = now;
-                r.preemptions += 1;
-                let demand = r.spec.demand;
-                let v = self.workers.get_mut(&from).unwrap();
-                tick_occ(v, now);
-                v.running -= 1;
-                v.placed -= demand;
-                v.jobs.remove(&job);
-                let w = self.workers.get_mut(&to).unwrap();
-                tick_occ(w, now);
-                w.running += 1;
-                w.placed += demand;
-                w.jobs.insert(job);
-                let occ0 = w.occ;
-                self.running.get_mut(&job).unwrap().occ0 = occ0;
-                out.push(crate::Preemption { job, from, to });
+                self.running.get_mut(&job).unwrap().job.speculated += 1;
+                self.start(job, to);
             }
         }
-        out
     }
 
     /// The next time a hold lapses by itself, after now.
@@ -1128,7 +1219,12 @@ impl Scheduler {
     /// Classify every worker's reason to refuse the job, and summarise.
     fn explain(&self, job: JobId) -> Option<String> {
         if let Some(r) = self.running.get(&job) {
-            return Some(format!("job {job} is running on worker {}", r.worker));
+            let runs: Vec<String> = r
+                .live
+                .iter()
+                .map(|run| format!("attempt {} on worker {}", run.attempt, run.worker))
+                .collect();
+            return Some(format!("job {job} is running: {}", runs.join(", ")));
         }
         let j = self.waiting.get(&job)?;
         let ahead = self.queue.range(..j.key).count();
@@ -1138,6 +1234,15 @@ impl Scheduler {
             j.spec.group,
             self.now - j.since
         );
+        if let Some(last) = j.tried.last() {
+            msg += &format!(
+                "; failed {} time(s), last on worker {} ({:?}: {})",
+                j.tried.len(),
+                last.worker,
+                last.kind,
+                last.why
+            );
+        }
         match self.holds.get(&job) {
             Some(Hold::Reserve { worker, .. }) => {
                 let w = &self.workers[worker];
@@ -1207,8 +1312,8 @@ impl Scheduler {
         }
         if !takers.is_empty() {
             msg += &format!(
-                "; admitted on worker(s) {takers:?} (placed at the next dispatch unless a more \
-                 urgent job takes the slot)"
+                "; admitted on worker(s) {takers:?} (placed at the next poll unless a more urgent \
+                 job takes the slot)"
             );
         }
         Some(msg)
@@ -1216,34 +1321,35 @@ impl Scheduler {
 }
 
 impl Policy for Scheduler {
-    /// Queued under its urgency key.
-    fn submit(&mut self, job: JobSpec, now: Instant) {
-        Scheduler::submit(self, job, now)
+    /// Applied at once; stops and give-ups wait in the outbox for `poll`.
+    fn handle(&mut self, input: Input, now: Instant) {
+        self.now = now;
+        match input {
+            Input::Submit(spec) => self.submit(spec, now),
+            Input::Done { job, attempt } => self.done(job, attempt),
+            Input::Failed {
+                job,
+                attempt,
+                kind,
+                why,
+            } => self.failed(job, attempt, kind, why),
+            Input::Cancel(job) => self.cancel(job),
+            Input::Worker(w) => self.worker_update(w, now),
+            Input::WorkerGone(w) => self.worker_gone(w),
+        }
     }
 
-    /// Dropped, or released, with its hold.
-    fn cancel(&mut self, job: JobId) {
-        Scheduler::cancel(self, job)
+    /// One scan in urgency order, then speculation; the outbox, then the new starts.
+    fn poll(&mut self, now: Instant) -> Vec<Output> {
+        self.now = now;
+        self.dispatch();
+        self.speculate();
+        std::mem::take(&mut self.outbox)
     }
 
-    /// Added or updated, keeping its placements.
-    fn worker_update(&mut self, w: WorkerState, now: Instant) {
-        Scheduler::worker_update(self, w, now)
-    }
-
-    /// Forgotten with its running jobs and the holds on it.
-    fn worker_gone(&mut self, w: WorkerId, now: Instant) {
-        Scheduler::worker_gone(self, w, now)
-    }
-
-    /// Released, learning from its duration.
-    fn completed(&mut self, job: JobId, now: Instant) {
-        Scheduler::completed(self, job, now)
-    }
-
-    /// One scan in urgency order.
-    fn dispatch(&mut self, now: Instant) -> Vec<(JobId, WorkerId)> {
-        Scheduler::dispatch(self, now)
+    /// When the earliest deferral lapses.
+    fn next_wakeup(&self) -> Option<Instant> {
+        Scheduler::next_wakeup(self)
     }
 
     /// Every worker's reason to refuse it, summarised.
@@ -1255,21 +1361,12 @@ impl Policy for Scheduler {
     fn stats(&self) -> PolicyStats {
         Scheduler::stats(self)
     }
-
-    /// When the earliest deferral lapses.
-    fn next_wakeup(&self) -> Option<Instant> {
-        Scheduler::next_wakeup(self)
-    }
-
-    /// One scan, then spoliation.
-    fn dispatch_full(&mut self, now: Instant) -> crate::Dispatch {
-        Scheduler::dispatch_full(self, now)
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{RetryConfig, Speculate};
 
     const GB: u64 = 1_000_000_000;
 
@@ -1283,50 +1380,89 @@ mod tests {
         JobSpec::new(id, Resources::mem(gb * GB), group)
     }
 
+    /// Handle `inputs` at `t`, then poll.
+    fn feed(p: &mut Scheduler, t: Instant, inputs: impl IntoIterator<Item = Input>) -> Vec<Output> {
+        for i in inputs {
+            p.handle(i, t);
+        }
+        p.poll(t)
+    }
+
+    /// The `(job, worker)` of each start.
+    fn starts(out: &[Output]) -> Vec<(JobId, WorkerId)> {
+        out.iter()
+            .filter_map(|o| match *o {
+                Output::Start { job, worker, .. } => Some((job, worker)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A done message.
+    fn done(job: JobId, attempt: Attempt) -> Input {
+        Input::Done { job, attempt }
+    }
+
+    /// A failure message of kind `kind`.
+    fn fail(job: JobId, attempt: Attempt, kind: FailKind) -> Input {
+        Input::Failed {
+            job,
+            attempt,
+            kind,
+            why: "test".into(),
+        }
+    }
+
     /// FIFO spreads jobs over the least loaded workers in arrival order.
     #[test]
     fn fifo_fills_least_loaded_first() {
         let mut p = Scheduler::new(Config::fifo());
-        p.worker_update(worker(1, 4, 100), 0.0);
-        p.worker_update(worker(2, 4, 100), 0.0);
-        for i in 0..4 {
-            p.submit(job(i, 10, 0), 0.0);
-        }
-        let out = p.dispatch(0.0);
-        assert_eq!(out, vec![(0, 1), (1, 2), (2, 1), (3, 2)]);
+        let mut inputs = vec![
+            Input::Worker(worker(1, 4, 100)),
+            Input::Worker(worker(2, 4, 100)),
+        ];
+        inputs.extend((0..4).map(|i| Input::Submit(job(i, 10, 0))));
+        let out = feed(&mut p, 0.0, inputs);
+        assert_eq!(starts(&out), vec![(0, 1), (1, 2), (2, 1), (3, 2)]);
+        assert!(
+            out.iter()
+                .all(|o| matches!(o, Output::Start { attempt: 1, .. }))
+        );
     }
 
     /// A preferred worker is chosen over a less loaded one.
     #[test]
     fn preference_wins_over_load() {
         let mut p = Scheduler::new(Config::default());
-        p.worker_update(worker(1, 4, 100), 0.0);
-        p.worker_update(worker(2, 4, 100), 0.0);
-        p.submit(job(0, 10, 0), 0.0);
-        p.dispatch(0.0);
+        let inputs = [
+            Input::Worker(worker(1, 4, 100)),
+            Input::Worker(worker(2, 4, 100)),
+            Input::Submit(job(0, 10, 0)),
+        ];
+        feed(&mut p, 0.0, inputs);
         let mut j = job(1, 10, 0);
         j.prefer = vec![1];
-        p.submit(j, 0.0);
-        assert_eq!(p.dispatch(0.0), vec![(1, 1)]);
+        assert_eq!(starts(&feed(&mut p, 0.0, [Input::Submit(j)])), vec![(1, 1)]);
     }
 
     /// Explicit priority first, then the oldest group, then FIFO.
     #[test]
     fn priority_order_is_group_arrival_then_fifo() {
         let mut p = Scheduler::new(Config::default());
-        p.submit(job(10, 1, 7), 0.0); // group 7 arrives first
-        p.submit(job(11, 1, 3), 1.0);
-        p.submit(job(12, 1, 7), 2.0);
+        p.handle(Input::Submit(job(10, 1, 7)), 0.0); // group 7 arrives first
+        p.handle(Input::Submit(job(11, 1, 3)), 1.0);
+        p.handle(Input::Submit(job(12, 1, 7)), 2.0);
         let mut urgent = job(13, 1, 3);
         urgent.priority = Some(-1);
-        p.submit(urgent, 3.0);
-        p.worker_update(worker(1, 1, 100), 4.0);
+        p.handle(Input::Submit(urgent), 3.0);
+        p.handle(Input::Worker(worker(1, 1, 100)), 4.0);
         let mut order = Vec::new();
+        let mut finished = Vec::new();
         for t in 0..4 {
-            let out = p.dispatch(5.0 + t as f64);
+            let out = starts(&feed(&mut p, 5.0 + t as f64, finished.drain(..)));
             assert_eq!(out.len(), 1);
             order.push(out[0].0);
-            p.completed(out[0].0, 5.5 + t as f64);
+            finished.push(done(out[0].0, 1));
         }
         assert_eq!(order, vec![13, 10, 12, 11]);
     }
@@ -1335,16 +1471,17 @@ mod tests {
     #[test]
     fn best_fit_packs_tightly() {
         let mut p = Scheduler::new(Config::best_fit());
-        p.worker_update(worker(1, 4, 100), 0.0);
-        p.worker_update(worker(2, 4, 50), 0.0);
-        p.submit(job(0, 1, 0), 0.0);
-        p.submit(job(1, 1, 0), 0.0);
+        let inputs = [
+            Input::Worker(worker(1, 4, 100)),
+            Input::Worker(worker(2, 4, 50)),
+            Input::Submit(job(0, 1, 0)),
+            Input::Submit(job(1, 1, 0)),
+        ];
         // Both empty workers admit; the smaller one is the tighter fit.
-        assert_eq!(p.dispatch(0.0), vec![(0, 2), (1, 2)]);
-        p.submit(job(2, 50, 0), 0.0);
-        p.submit(job(3, 1, 0), 0.0);
+        assert_eq!(starts(&feed(&mut p, 0.0, inputs)), vec![(0, 2), (1, 2)]);
+        let inputs = [Input::Submit(job(2, 50, 0)), Input::Submit(job(3, 1, 0))];
         // Then worker 1 has 49 GB free (49%), worker 2 has 47 GB (94%): worker 1 is fuller.
-        assert_eq!(p.dispatch(0.0), vec![(2, 1), (3, 1)]);
+        assert_eq!(starts(&feed(&mut p, 0.0, inputs)), vec![(2, 1), (3, 1)]);
     }
 
     /// The tightest fit compares the bottleneck dimension.
@@ -1353,21 +1490,324 @@ mod tests {
         let mut p = Scheduler::new(Config::best_fit());
         // Worker 1 has most of its memory free but 20% of its device pool; worker 2 has 40% of
         // its memory free and all of its device pool.
-        p.worker_update(
-            WorkerState {
-                reported_used: Resources::ZERO.with_dev(8 * GB),
-                ..WorkerState::new(1, "x", 4, Resources::mem(100 * GB).with_dev(10 * GB))
-            },
-            0.0,
+        let w1 = WorkerState {
+            reported_used: Resources::ZERO.with_dev(8 * GB),
+            ..WorkerState::new(1, "x", 4, Resources::mem(100 * GB).with_dev(10 * GB))
+        };
+        let w2 = WorkerState {
+            reported_used: Resources::mem(59 * GB),
+            ..WorkerState::new(2, "x", 4, Resources::mem(100 * GB).with_dev(100 * GB))
+        };
+        let inputs = [
+            Input::Worker(w1),
+            Input::Worker(w2),
+            Input::Submit(job(0, 1, 0)),
+        ];
+        assert_eq!(starts(&feed(&mut p, 0.0, inputs)), vec![(0, 1)]);
+    }
+
+    /// A failed job is retried before less urgent jobs submitted after it, and keeps its age.
+    #[test]
+    fn retry_keeps_place_and_age() {
+        let mut p = Scheduler::new(Config::fifo());
+        let inputs = [
+            Input::Worker(worker(1, 1, 100)),
+            Input::Submit(job(0, 1, 0)),
+            Input::Submit(job(1, 1, 0)),
+        ];
+        assert_eq!(starts(&feed(&mut p, 0.0, inputs)), vec![(0, 1)]);
+        assert_eq!(p.stats().longest_wait, Some((1, 0.0)));
+        // Job 0 avoids worker 1 softly; it is the only live worker, so job 0 goes back there
+        // ahead of job 1.
+        let out = feed(&mut p, 5.0, [fail(0, 1, FailKind::Other)]);
+        assert_eq!(
+            out,
+            vec![Output::Start {
+                job: 0,
+                attempt: 2,
+                worker: 1
+            }]
         );
-        p.worker_update(
-            WorkerState {
-                reported_used: Resources::mem(59 * GB),
-                ..WorkerState::new(2, "x", 4, Resources::mem(100 * GB).with_dev(100 * GB))
-            },
-            0.0,
+        // Between the failure and the restart, job 0 counted as waiting since its submission.
+        let mut q = Scheduler::new(Config::fifo());
+        let inputs = [
+            Input::Worker(worker(1, 1, 100)),
+            Input::Worker(worker(2, 1, 100)),
+            Input::Submit(job(0, 1, 0)),
+            Input::Submit(job(1, 1, 0)),
+            Input::Submit(job(2, 1, 0)),
+        ];
+        assert_eq!(starts(&feed(&mut q, 0.0, inputs)), vec![(0, 1), (1, 2)]);
+        // Worker 1 frees, but job 0 avoids it while worker 2 lives: job 2 backfills it.
+        let out = feed(&mut q, 5.0, [fail(0, 1, FailKind::Other)]);
+        assert_eq!(starts(&out), vec![(2, 1)]);
+        assert_eq!(q.stats().longest_wait, Some((0, 5.0)));
+        let msg = q.explain(0).unwrap();
+        assert!(msg.contains("failed 1 time(s), last on worker 1"), "{msg}");
+        let out = feed(&mut q, 6.0, [done(1, 1)]);
+        assert_eq!(
+            out,
+            vec![Output::Start {
+                job: 0,
+                attempt: 2,
+                worker: 2
+            }]
         );
-        p.submit(job(0, 1, 0), 0.0);
-        assert_eq!(p.dispatch(0.0), vec![(0, 1)]);
+    }
+
+    /// Each failure adds its worker to the avoid list; once every live worker is avoided the soft
+    /// list lapses; after `max_attempts` failures the job is given up.
+    #[test]
+    fn avoid_grows_then_gives_up() {
+        let mut p = Scheduler::new(Config {
+            retry: RetryConfig { max_attempts: 4 },
+            ..Config::fifo()
+        });
+        let mut inputs: Vec<Input> = (1..=3).map(|w| Input::Worker(worker(w, 1, 100))).collect();
+        inputs.push(Input::Submit(job(0, 1, 0)));
+        let mut out = feed(&mut p, 0.0, inputs);
+        let mut seen = Vec::new();
+        for attempt in 1..=4 {
+            let [
+                Output::Start {
+                    job: 0,
+                    attempt: a,
+                    worker,
+                },
+            ] = out[..]
+            else {
+                panic!("expected one start, got {out:?}");
+            };
+            assert_eq!(a, attempt);
+            seen.push(worker);
+            out = feed(&mut p, attempt as f64, [fail(0, a, FailKind::DeviceOom)]);
+        }
+        // Three distinct workers, then the lapsed soft list allows any (the first).
+        assert_eq!(seen, vec![1, 2, 3, 1]);
+        let [Output::GaveUp(g)] = &out[..] else {
+            panic!("expected a give-up, got {out:?}");
+        };
+        assert_eq!(g.job, 0);
+        assert_eq!(g.tried.len(), 4);
+        assert!(g.retryable);
+        assert_eq!(p.stats().waiting + p.stats().running, 0);
+        assert_eq!(p.explain(0), None);
+    }
+
+    /// A give-up is retryable only if every attempt ran out of device memory.
+    #[test]
+    fn give_up_is_retryable_only_for_device_oom() {
+        let mut p = Scheduler::new(Config {
+            retry: RetryConfig { max_attempts: 2 },
+            ..Config::fifo()
+        });
+        let inputs = [
+            Input::Worker(worker(1, 1, 100)),
+            Input::Submit(job(0, 1, 0)),
+        ];
+        feed(&mut p, 0.0, inputs);
+        feed(&mut p, 1.0, [fail(0, 1, FailKind::DeviceOom)]);
+        let out = feed(&mut p, 2.0, [fail(0, 2, FailKind::Timeout)]);
+        let [Output::GaveUp(g)] = &out[..] else {
+            panic!("expected a give-up, got {out:?}");
+        };
+        assert!(!g.retryable);
+        assert_eq!(
+            g.tried.iter().map(|t| t.kind).collect::<Vec<_>>(),
+            vec![FailKind::DeviceOom, FailKind::Timeout]
+        );
+    }
+
+    /// A departing worker fails its attempts with `LinkDied`: the jobs are retried elsewhere
+    /// without the caller resubmitting, or given up when out of attempts.
+    #[test]
+    fn worker_gone_fails_and_requeues() {
+        let mut p = Scheduler::new(Config {
+            retry: RetryConfig { max_attempts: 2 },
+            ..Config::fifo()
+        });
+        let inputs = [
+            Input::Worker(worker(1, 2, 100)),
+            Input::Submit(job(0, 1, 0)),
+            Input::Submit(job(1, 1, 0)),
+        ];
+        assert_eq!(starts(&feed(&mut p, 0.0, inputs)), vec![(0, 1), (1, 1)]);
+        let out = feed(&mut p, 1.0, [Input::WorkerGone(1)]);
+        assert!(out.is_empty());
+        assert_eq!((p.stats().waiting, p.stats().running), (2, 0));
+        let out = feed(&mut p, 2.0, [Input::Worker(worker(2, 2, 100))]);
+        assert_eq!(starts(&out), vec![(0, 2), (1, 2)]);
+        assert!(
+            out.iter()
+                .all(|o| matches!(o, Output::Start { attempt: 2, .. }))
+        );
+        // The second loss exhausts both jobs' attempts.
+        let out = feed(&mut p, 3.0, [Input::WorkerGone(2)]);
+        assert_eq!(out.len(), 2);
+        for o in &out {
+            let Output::GaveUp(g) = o else {
+                panic!("expected give-ups, got {out:?}")
+            };
+            assert!(g.tried.iter().all(|t| t.kind == FailKind::LinkDied));
+            assert_eq!(g.tried[0].why, "worker 1 left");
+        }
+    }
+
+    /// Messages about attempts that are not live change nothing.
+    #[test]
+    fn stale_messages_are_ignored() {
+        let mut p = Scheduler::new(Config::fifo());
+        let inputs = [
+            Input::Worker(worker(1, 1, 100)),
+            Input::Submit(job(0, 1, 0)),
+        ];
+        feed(&mut p, 0.0, inputs);
+        feed(&mut p, 1.0, [fail(0, 1, FailKind::Other)]);
+        // Attempt 2 runs; reports about attempt 1, unknown attempts and unknown jobs are stale.
+        let stale = [
+            done(0, 1),
+            fail(0, 1, FailKind::Other),
+            done(0, 7),
+            done(9, 1),
+            fail(9, 1, FailKind::Other),
+            Input::Cancel(9),
+            Input::WorkerGone(9),
+        ];
+        assert!(feed(&mut p, 2.0, stale).is_empty());
+        let st = p.stats();
+        assert_eq!((st.waiting, st.running, st.workers[0].running), (0, 1, 1));
+        assert!(feed(&mut p, 3.0, [done(0, 2)]).is_empty());
+        let st = p.stats();
+        assert_eq!((st.running, st.workers[0].placed), (0, Resources::ZERO));
+        // A late duplicate of the winning report is stale too.
+        assert!(feed(&mut p, 4.0, [done(0, 2)]).is_empty());
+        assert_eq!(p.explain(0), None);
+    }
+
+    /// Cancelling a running job stops its attempt; a waiting one is dropped silently.
+    #[test]
+    fn cancel_stops_running_attempts() {
+        let mut p = Scheduler::new(Config::fifo());
+        let inputs = [
+            Input::Worker(worker(1, 1, 100)),
+            Input::Submit(job(0, 1, 0)),
+            Input::Submit(job(1, 1, 0)),
+        ];
+        feed(&mut p, 0.0, inputs);
+        assert!(feed(&mut p, 1.0, [Input::Cancel(1)]).is_empty());
+        let out = feed(&mut p, 2.0, [Input::Cancel(0)]);
+        assert_eq!(
+            out,
+            vec![Output::Stop {
+                job: 0,
+                attempt: 1,
+                worker: 1
+            }]
+        );
+        let st = p.stats();
+        assert_eq!((st.waiting, st.running, st.workers[0].running), (0, 0, 0));
+    }
+
+    /// A slow worker (speed 1) and, later, an idle fast one (speed 4), with speculation.
+    fn speculating() -> Scheduler {
+        let mut cfg = Config::fifo();
+        cfg.speed.speculate = Some(Speculate::default());
+        let mut p = Scheduler::new(cfg);
+        let mut j = job(0, 1, 0);
+        j.work = Some(100.0);
+        let inputs = [Input::Worker(worker(1, 1, 100)), Input::Submit(j)];
+        assert_eq!(starts(&feed(&mut p, 0.0, inputs)), vec![(0, 1)]);
+        let fast = WorkerState {
+            speed: 4.0,
+            ..worker(2, 1, 100)
+        };
+        let out = feed(&mut p, 1.0, [Input::Worker(fast)]);
+        assert_eq!(
+            out,
+            vec![Output::Start {
+                job: 0,
+                attempt: 2,
+                worker: 2
+            }]
+        );
+        let st = p.stats();
+        assert_eq!(st.running, 1);
+        assert_eq!(
+            st.workers.iter().map(|w| w.running).collect::<Vec<_>>(),
+            vec![1, 1]
+        );
+        // At most one speculative attempt per job.
+        assert!(p.poll(2.0).is_empty());
+        p
+    }
+
+    /// An idle fast worker starts a second attempt of a job on a slow one; the first to finish
+    /// wins and the other is stopped.
+    #[test]
+    fn speculation_first_done_wins() {
+        let mut p = speculating();
+        let out = feed(&mut p, 26.0, [done(0, 2)]);
+        assert_eq!(
+            out,
+            vec![Output::Stop {
+                job: 0,
+                attempt: 1,
+                worker: 1
+            }]
+        );
+        assert!(p.stats().workers.iter().all(|w| w.running == 0));
+        assert!(feed(&mut p, 27.0, [done(0, 1)]).is_empty());
+
+        let mut p = speculating();
+        let out = feed(&mut p, 10.0, [done(0, 1)]);
+        assert_eq!(
+            out,
+            vec![Output::Stop {
+                job: 0,
+                attempt: 2,
+                worker: 2
+            }]
+        );
+    }
+
+    /// A failing speculative attempt leaves the original running; cancelling stops both.
+    #[test]
+    fn speculation_failure_and_cancel() {
+        let mut p = speculating();
+        assert!(feed(&mut p, 5.0, [fail(0, 2, FailKind::Other)]).is_empty());
+        assert_eq!(p.stats().running, 1);
+        let out = feed(&mut p, 6.0, [Input::Cancel(0)]);
+        assert_eq!(
+            out,
+            vec![Output::Stop {
+                job: 0,
+                attempt: 1,
+                worker: 1
+            }]
+        );
+
+        let mut p = speculating();
+        let out = feed(&mut p, 5.0, [Input::Cancel(0)]);
+        assert_eq!(starts(&out), vec![]);
+        assert_eq!(out.len(), 2);
+    }
+
+    /// Without enough gain, nothing is speculated.
+    #[test]
+    fn speculation_needs_gain() {
+        let mut cfg = Config::fifo();
+        cfg.speed.speculate = Some(Speculate::default());
+        let mut p = Scheduler::new(cfg);
+        let mut j = job(0, 1, 0);
+        j.work = Some(100.0);
+        let inputs = [Input::Worker(worker(1, 1, 100)), Input::Submit(j)];
+        feed(&mut p, 0.0, inputs);
+        // At t=90 the slow attempt is expected to end at 100; a fresh one on a worker twice as
+        // fast would end at 140.
+        let fast = WorkerState {
+            speed: 2.0,
+            ..worker(2, 1, 100)
+        };
+        assert!(feed(&mut p, 90.0, [Input::Worker(fast)]).is_empty());
     }
 }

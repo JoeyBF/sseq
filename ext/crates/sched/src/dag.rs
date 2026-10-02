@@ -8,7 +8,7 @@ use petgraph::{
     visit::EdgeRef,
 };
 
-use crate::{Instant, JobId, JobSpec, Policy, PolicyStats, WorkerId, WorkerState};
+use crate::{Attempt, Input, Instant, JobId, JobSpec, Output, Policy, PolicyStats, WorkerId};
 
 mod instance;
 pub use instance::{InstanceSpec, NodeLabel};
@@ -30,8 +30,8 @@ pub struct DagJob {
     /// [`DagScheduler::update_work`]).
     pub passthrough: bool,
     /// Runs on the caller, not on a worker (registration, loading, commit steps): when ready it is
-    /// held, never submitted to the policy, and returned by [`DagScheduler::take_local`]; report
-    /// its completion with [`Dag::completed`] as usual.
+    /// held, never submitted to the policy, and announced by [`Output::RunLocal`]; report its
+    /// completion with [`Input::Done`] and attempt 0. It runs exactly once: it is not retried.
     pub local: bool,
 }
 
@@ -254,7 +254,7 @@ impl DagTemplate {
     }
 }
 
-/// Errors from [`Dag::declare`]. A failed declaration changes nothing.
+/// Errors from [`DagScheduler::declare`]. A failed declaration changes nothing.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DagError {
     /// The declaration would close a dependency cycle through this job.
@@ -297,12 +297,12 @@ pub struct DagConfig {
     /// propagated to the job's dependencies. Bounds the cost of growing the graph. Default 0.01.
     pub rank_epsilon: f64,
     /// Submit jobs to the policy as soon as they are ready (the default). When false, ready jobs
-    /// are queued; the caller collects them with [`DagScheduler::take_ready`] and submits each
-    /// with [`DagScheduler::release`] when it is actually sendable (e.g. after coordinator-side
+    /// are held and announced by [`Output::Ready`]; the caller submits each with
+    /// [`DagScheduler::release`] when it is actually sendable (e.g. after coordinator-side
     /// preparation).
     pub auto_submit: bool,
-    /// Record passthrough jobs as they complete, for [`DagScheduler::take_passed`]. Default false
-    /// (a caller that never drains the list would grow it without bound).
+    /// Announce passthrough jobs (and instances' `done` jobs) as they complete, with
+    /// [`Output::Passed`]. Default false.
     #[cfg_attr(feature = "serde", serde(default))]
     pub record_passthrough: bool,
     /// At most this many implicit instances may be open (entry completed, nodes releasable) at
@@ -347,7 +347,8 @@ enum State {
     Undeclared,
     /// Declared, some dependency not completed.
     Pending,
-    /// All dependencies completed, waiting for [`DagScheduler::release`].
+    /// All dependencies completed, waiting for [`DagScheduler::release`] (or to run locally, or
+    /// to complete as a passthrough). A job the policy gave up on returns here.
     Held,
     /// Handed to the policy (waiting or running there).
     Submitted,
@@ -403,38 +404,17 @@ pub struct DagStats {
     pub instance_bytes: usize,
 }
 
-/// The dependency layer's interface. [`DagScheduler`] implements it over any [`Policy`].
-pub trait Dag {
-    /// Declare jobs. The graph grows during the run; dependencies may be forward references.
-    /// Rejects (and leaves no trace of) a batch that would create a cycle or redeclare a job.
-    /// Jobs whose dependencies are all complete become ready immediately.
-    fn declare(&mut self, jobs: Vec<DagJob>, now: Instant) -> Result<(), DagError>;
-    /// Declare work known to come but not yet expandable: group `group` will exist after the
-    /// groups `after_groups` complete and costs about `cost`. Only ranks use this. Redeclaring a
-    /// group replaces its placeholder.
-    fn declare_group_placeholder(&mut self, group: u64, after_groups: Vec<u64>, cost: f64);
-    /// A job completed: its dependents may become ready. Forwards to the policy.
-    fn completed(&mut self, job: JobId, now: Instant);
-    /// Cancel a job and, transitively, every job depending on it (they can never run). Returns the
-    /// cancelled ids. Forwards each submitted one to the policy.
-    fn cancel(&mut self, job: JobId) -> Vec<JobId>;
-    /// Passthrough of [`Policy::worker_update`].
-    fn worker_update(&mut self, w: WorkerState, now: Instant);
-    /// Passthrough of [`Policy::worker_gone`]. Resubmit its jobs with
-    /// [`DagScheduler::resubmit`].
-    fn worker_gone(&mut self, w: WorkerId, now: Instant);
-    /// Passthrough of [`Policy::dispatch`].
-    fn dispatch(&mut self, now: Instant) -> Vec<(JobId, WorkerId)>;
-    /// Why a job is not running: unmet dependencies, held, or the policy's explanation.
-    fn explain(&self, job: JobId) -> Option<String>;
-    /// Passthrough of [`Policy::stats`].
-    fn stats(&self) -> PolicyStats;
-}
-
-/// A [`Dag`] in front of a [`Policy`].
+/// A dependency layer in front of a [`Policy`], itself a [`Policy`].
 ///
 /// Jobs are declared with their dependencies, possibly long before they are ready; a job is
-/// submitted to the policy when its last dependency completes. The graph lives in a petgraph
+/// submitted to the inner policy when its last dependency completes. Inputs go to the inner
+/// policy; an [`Input::Done`] of a live attempt also completes the job here, and its dependents
+/// may become ready. [`Policy::poll`] returns the inner policy's outputs and this layer's own:
+/// [`Output::RunLocal`], [`Output::Ready`] and [`Output::Passed`].
+///
+/// A job the inner policy gives up on ([`Output::GaveUp`], passed through) is held again: its
+/// dependents stay pending until the caller [`release`](Self::release)s it (another round of
+/// attempts) or [`cancel`](Self::cancel)s it. The graph lives in a petgraph
 /// [`StableGraph`](petgraph::stable_graph::StableGraph) (edges point from a dependency to its
 /// dependent); completed jobs are removed from it, so its size tracks the live frontier rather
 /// than the whole run.
@@ -446,22 +426,22 @@ pub struct DagScheduler<P> {
     index: HashMap<JobId, NodeIndex>,
     completed: HashSet<JobId>,
     completed_floor: JobId,
-    /// Ready ids not yet returned by `take_ready`, in readiness order.
-    newly_ready: Vec<JobId>,
-    /// Ready local jobs not yet returned by `take_local`.
-    newly_local: Vec<JobId>,
-    /// Jobs placed by dispatches and not completed, cancelled or resubmitted since.
-    running: HashSet<JobId>,
+    /// This layer's outputs not yet returned by `poll`.
+    outbox: Vec<Output>,
+    /// Live attempts of the inner policy's jobs, from its outputs and the inputs: an
+    /// [`Input::Done`] completes a job here only if its attempt is live.
+    live: HashMap<JobId, Vec<(Attempt, WorkerId)>>,
     /// Running jobs of instances closed early: their completion only frees their resources.
     ignored: HashSet<JobId>,
+    /// Stops the inner policy emits for attempts the caller has already reported (an ignored
+    /// job's failure, turned into a cancellation): not passed on.
+    quiet: HashSet<(JobId, Attempt)>,
     placeholders: BTreeMap<u64, (Vec<u64>, f64)>,
     /// group -> placeholder groups that wait for it.
     waiters: HashMap<u64, Vec<u64>>,
     tail_memo: HashMap<u64, f64>,
     /// Ready passthrough nodes waiting for `drain_passthrough`.
     passing: Vec<NodeIndex>,
-    /// Completed passthrough ids, for `take_passed`.
-    passed: Vec<JobId>,
     /// Implicit template instances (see [`InstanceSpec`]); `None` for free slots.
     instances: Vec<Option<instance::Instance>>,
     free_instances: Vec<usize>,
@@ -486,15 +466,14 @@ impl<P: Policy> DagScheduler<P> {
             index: HashMap::new(),
             completed: HashSet::new(),
             completed_floor: 0,
-            newly_ready: Vec::new(),
-            newly_local: Vec::new(),
-            running: HashSet::new(),
+            outbox: Vec::new(),
+            live: HashMap::new(),
             ignored: HashSet::new(),
+            quiet: HashSet::new(),
             placeholders: BTreeMap::new(),
             waiters: HashMap::new(),
             tail_memo: HashMap::new(),
             passing: Vec::new(),
-            passed: Vec::new(),
             instances: Vec::new(),
             free_instances: Vec::new(),
             by_base: BTreeMap::new(),
@@ -510,29 +489,10 @@ impl<P: Policy> DagScheduler<P> {
         &self.policy
     }
 
-    /// The wrapped policy, mutably (e.g. to call [`Policy::submit`] for jobs outside the DAG).
+    /// The wrapped policy, mutably. Inputs given to it directly bypass this layer's bookkeeping;
+    /// jobs outside the DAG are submitted with [`Input::Submit`] through this layer instead.
     pub fn policy_mut(&mut self) -> &mut P {
         &mut self.policy
-    }
-
-    /// Passthrough of [`Policy::dispatch_full`]: placements and preemptions.
-    pub fn dispatch_full(&mut self, now: Instant) -> crate::Dispatch {
-        self.now = now;
-        let d = self.policy.dispatch_full(now);
-        self.running.extend(d.start.iter().map(|x| x.0));
-        d
-    }
-
-    /// Local jobs (see [`DagJob::local`]) that became ready since the last call, in readiness
-    /// order. Run each on the caller and report it with [`Dag::completed`].
-    pub fn take_local(&mut self) -> Vec<JobId> {
-        std::mem::take(&mut self.newly_local)
-    }
-
-    /// Ids that became ready since the last call, in readiness order. With `auto_submit` they are
-    /// already submitted; otherwise submit each with [`release`](Self::release).
-    pub fn take_ready(&mut self) -> Vec<JobId> {
-        std::mem::take(&mut self.newly_ready)
     }
 
     /// Submit a ready, held job to the policy (only meaningful without `auto_submit`). Returns
@@ -540,30 +500,10 @@ impl<P: Policy> DagScheduler<P> {
     pub fn release(&mut self, job: JobId, now: Instant) -> bool {
         self.now = now;
         if self.instance_of(job).is_some() {
-            return self.instance_release(job, now, instance::HELD);
+            return self.instance_release(job, now);
         }
         match self.index.get(&job) {
             Some(&n) if self.graph[n].state == State::Held && !self.graph[n].local => {
-                self.submit_node(n, now);
-                true
-            }
-            _ => false,
-        }
-    }
-
-    /// Submit a job again (e.g. after its worker left). Returns false unless the job was submitted
-    /// and has not completed.
-    pub fn resubmit(&mut self, job: JobId, now: Instant) -> bool {
-        self.now = now;
-        self.running.remove(&job);
-        if self.ignored.remove(&job) {
-            return false;
-        }
-        if self.instance_of(job).is_some() {
-            return self.instance_release(job, now, instance::SUBMITTED);
-        }
-        match self.index.get(&job) {
-            Some(&n) if self.graph[n].state == State::Submitted => {
                 self.submit_node(n, now);
                 true
             }
@@ -779,7 +719,7 @@ impl<P: Policy> DagScheduler<P> {
             let p = -(rank * self.config.rank_scale).round();
             spec.priority = Some(p.clamp(i64::MIN as f64, i64::MAX as f64) as i64);
         }
-        self.policy.submit(spec, now);
+        self.policy.handle(Input::Submit(spec), now);
     }
 
     /// Record that a job has no unmet dependencies left, and submit or hold it.
@@ -789,16 +729,17 @@ impl<P: Policy> DagScheduler<P> {
             self.passing.push(n);
             return;
         }
+        let job = self.graph[n].id;
         if self.graph[n].local {
             self.graph[n].state = State::Held;
-            self.newly_local.push(self.graph[n].id);
+            self.outbox.push(Output::RunLocal { job });
             return;
         }
-        self.newly_ready.push(self.graph[n].id);
         if self.config.auto_submit {
             self.submit_node(n, now);
         } else {
             self.graph[n].state = State::Held;
+            self.outbox.push(Output::Ready { job });
         }
     }
 
@@ -831,7 +772,7 @@ impl<P: Policy> DagScheduler<P> {
     /// `cancel` for an explicit job (and its explicit descendants).
     fn cancel_explicit(&mut self, job: JobId) -> Vec<JobId> {
         let Some(&start) = self.index.get(&job) else {
-            self.policy.cancel(job);
+            self.policy.handle(Input::Cancel(job), self.now);
             return Vec::new();
         };
         let mut doomed = BTreeSet::new();
@@ -846,7 +787,7 @@ impl<P: Policy> DagScheduler<P> {
         for &(id, n) in &doomed {
             orphan_candidates.extend(self.graph.neighbors_directed(n, Incoming));
             if self.graph[n].state == State::Submitted {
-                self.policy.cancel(id);
+                self.policy.handle(Input::Cancel(id), self.now);
             }
             if self.graph[n].state != State::Undeclared {
                 cancelled.push(id);
@@ -856,8 +797,7 @@ impl<P: Policy> DagScheduler<P> {
             self.graph.remove_node(n);
             self.index.remove(&id);
         }
-        self.newly_ready
-            .retain(|j| !doomed.iter().any(|d| d.0 == *j));
+        self.unannounce(|j| doomed.iter().any(|d| d.0 == j));
         // Forward references kept alive only by the cancelled jobs are no longer needed.
         for n in orphan_candidates {
             let orphan = self
@@ -910,18 +850,12 @@ impl<P: Policy> DagScheduler<P> {
     /// worklist, so long chains of them do not recurse).
     fn drain_passthrough(&mut self, now: Instant) {
         while let Some(n) = self.passing.pop() {
-            let id = self.graph[n].id;
+            let job = self.graph[n].id;
             if self.config.record_passthrough {
-                self.passed.push(id);
+                self.outbox.push(Output::Passed { job });
             }
-            self.finish(id, now);
+            self.finish(job, now);
         }
-    }
-
-    /// Passthrough jobs completed since the last call, in completion order (only with
-    /// [`DagConfig::record_passthrough`]).
-    pub fn take_passed(&mut self) -> Vec<JobId> {
-        std::mem::take(&mut self.passed)
     }
 
     /// Change a declared job's work estimate (e.g. once its real size is known) and re-rank it
@@ -983,7 +917,7 @@ impl<P: Policy> DagScheduler<P> {
 
     /// Restore a scheduler from a snapshot, in front of a fresh `policy`. Jobs that were submitted
     /// (waiting or running in the old policy) are submitted again at `now`; held jobs stay held and
-    /// are returned again by [`take_ready`](Self::take_ready). Open implicit instances are restored
+    /// are announced again ([`Output::Ready`], [`Output::RunLocal`]). Open implicit instances are restored
     /// with their templates (shared again among instances that shared them).
     #[cfg(feature = "serde")]
     pub fn restore(snapshot: DagSnapshot, policy: P, now: Instant) -> Self {
@@ -1008,13 +942,15 @@ impl<P: Policy> DagScheduler<P> {
             }
         }
         local.sort_unstable();
-        s.newly_local = local;
+        s.outbox
+            .extend(local.into_iter().map(|job| Output::RunLocal { job }));
         submitted.sort_unstable();
         for (_, n) in submitted {
             s.submit_node(n, now);
         }
         held.sort_unstable();
-        s.newly_ready = held;
+        s.outbox
+            .extend(held.into_iter().map(|job| Output::Ready { job }));
         s.restore_instances(snapshot.templates, snapshot.instances, now);
         s.now = now;
         s
@@ -1058,7 +994,7 @@ pub struct DagSnapshot {
 }
 
 impl<P: Policy> DagScheduler<P> {
-    /// [`Dag::cancel`], before the running set is updated.
+    /// [`cancel`](Self::cancel), before the cancelled jobs' attempts are forgotten.
     fn cancel_inner(&mut self, job: JobId) -> Vec<JobId> {
         if let Some((slot, _)) = self.instance_of(job) {
             let done = self.inst(slot).done;
@@ -1082,11 +1018,19 @@ impl<P: Policy> DagScheduler<P> {
         }
         ids
     }
-}
 
-impl<P: Policy> Dag for DagScheduler<P> {
-    /// Validate ids, insert nodes and edges, reject cycles, update ranks, then release ready jobs.
-    fn declare(&mut self, jobs: Vec<DagJob>, now: Instant) -> Result<(), DagError> {
+    /// Drop announcements not yet polled ([`Output::Ready`], [`Output::RunLocal`]) of the jobs
+    /// for which `gone` holds.
+    fn unannounce(&mut self, gone: impl Fn(JobId) -> bool) {
+        self.outbox.retain(
+            |o| !matches!(*o, Output::Ready { job } | Output::RunLocal { job } if gone(job)),
+        );
+    }
+
+    /// Declare jobs. The graph grows during the run; dependencies may be forward references.
+    /// Rejects (and leaves no trace of) a batch that would create a cycle or redeclare a job.
+    /// Jobs whose dependencies are all complete become ready immediately.
+    pub fn declare(&mut self, jobs: Vec<DagJob>, now: Instant) -> Result<(), DagError> {
         self.now = now;
         // Validate ids before touching anything.
         let mut seen = HashSet::with_capacity(jobs.len());
@@ -1163,8 +1107,10 @@ impl<P: Policy> Dag for DagScheduler<P> {
         Ok(())
     }
 
-    /// Replace the group's placeholder and invalidate the memoised tails.
-    fn declare_group_placeholder(&mut self, group: u64, after_groups: Vec<u64>, cost: f64) {
+    /// Declare work known to come but not yet expandable: group `group` will exist after the
+    /// groups `after_groups` complete and costs about `cost`. Only ranks use this. Redeclaring a
+    /// group replaces its placeholder.
+    pub fn declare_group_placeholder(&mut self, group: u64, after_groups: Vec<u64>, cost: f64) {
         self.remove_group_placeholder(group);
         for &h in &after_groups {
             self.waiters.entry(h).or_default().push(group);
@@ -1173,11 +1119,54 @@ impl<P: Policy> Dag for DagScheduler<P> {
         self.tail_memo.clear();
     }
 
-    /// Release the job's dependents, drop its node and remember it as completed.
-    fn completed(&mut self, job: JobId, now: Instant) {
-        self.now = now;
-        self.policy.completed(job, now);
-        self.running.remove(&job);
+    /// Cancel a job and, transitively, every job depending on it (they can never run). Returns
+    /// the cancelled ids. Each one the inner policy has is cancelled there (its live attempts are
+    /// stopped). [`Input::Cancel`] does the same.
+    pub fn cancel(&mut self, job: JobId) -> Vec<JobId> {
+        let ids = self.cancel_inner(job);
+        for id in &ids {
+            self.live.remove(id);
+            self.ignored.remove(id);
+        }
+        ids
+    }
+
+    /// Forget a live attempt; whether it was one.
+    fn drop_attempt(&mut self, job: JobId, attempt: Attempt) -> bool {
+        let Some(v) = self.live.get_mut(&job) else {
+            return false;
+        };
+        let before = v.len();
+        v.retain(|a| a.0 != attempt);
+        let dropped = v.len() < before;
+        if v.is_empty() {
+            self.live.remove(&job);
+        }
+        dropped
+    }
+
+    /// An attempt (or, with attempt 0, a local job) finished.
+    fn done(&mut self, job: JobId, attempt: Attempt, now: Instant) {
+        if attempt == 0 {
+            let local = self.index.get(&job).is_some_and(|&n| {
+                let node = &self.graph[n];
+                node.local && node.state == State::Held
+            });
+            if local {
+                self.finish(job, now);
+                self.drain_passthrough(now);
+            }
+            return;
+        }
+        let accepted = self
+            .live
+            .get(&job)
+            .is_some_and(|v| v.iter().any(|a| a.0 == attempt));
+        self.policy.handle(Input::Done { job, attempt }, now);
+        if !accepted {
+            return;
+        }
+        self.live.remove(&job);
         if self.ignored.remove(&job) {
             return;
         }
@@ -1185,37 +1174,117 @@ impl<P: Policy> Dag for DagScheduler<P> {
         self.drain_passthrough(now);
     }
 
-    /// Remove the job and its descendants, then any forward references only they needed.
-    fn cancel(&mut self, job: JobId) -> Vec<JobId> {
-        let ids = self.cancel_inner(job);
-        for id in &ids {
-            self.running.remove(id);
-            self.ignored.remove(id);
+    /// An attempt failed. A job of a closed instance is not retried: its last failure cancels it.
+    fn failed(&mut self, job: JobId, attempt: Attempt, kind: crate::FailKind, why: String) {
+        let was_live = self.drop_attempt(job, attempt);
+        if was_live && self.ignored.contains(&job) && !self.live.contains_key(&job) {
+            self.ignored.remove(&job);
+            self.quiet.insert((job, attempt));
+            self.policy.handle(Input::Cancel(job), self.now);
+        } else {
+            let input = Input::Failed {
+                job,
+                attempt,
+                kind,
+                why,
+            };
+            self.policy.handle(input, self.now);
         }
-        ids
     }
 
-    /// Forwarded to the policy.
-    fn worker_update(&mut self, w: WorkerState, now: Instant) {
-        self.now = now;
-        self.policy.worker_update(w, now);
-    }
-
-    /// Forwarded to the policy.
+    /// A worker left: its attempts are no longer live. Jobs of closed instances that ran only
+    /// there are cancelled rather than retried.
     fn worker_gone(&mut self, w: WorkerId, now: Instant) {
-        self.now = now;
-        self.policy.worker_gone(w, now);
+        let mut orphaned = Vec::new();
+        self.live.retain(|&job, v| {
+            let lost: Vec<Attempt> = v.iter().filter(|a| a.1 == w).map(|a| a.0).collect();
+            v.retain(|a| a.1 != w);
+            if v.is_empty() && !lost.is_empty() && self.ignored.contains(&job) {
+                orphaned.push((job, lost));
+            }
+            !v.is_empty()
+        });
+        orphaned.sort_unstable();
+        for (job, lost) in orphaned {
+            self.ignored.remove(&job);
+            self.quiet.extend(lost.into_iter().map(|a| (job, a)));
+            self.policy.handle(Input::Cancel(job), now);
+        }
+        self.policy.handle(Input::WorkerGone(w), now);
     }
 
-    /// Forwarded to the policy.
-    fn dispatch(&mut self, now: Instant) -> Vec<(JobId, WorkerId)> {
+    /// The inner policy gave up on a job: hold it again, for `release` or `cancel`.
+    fn hold_again(&mut self, job: JobId) {
+        if let Some((slot, i)) = self.instance_of(job) {
+            let inst = self.instances[slot].as_mut().unwrap();
+            if inst.counter[i] == instance::SUBMITTED {
+                inst.counter[i] = instance::HELD;
+            }
+        } else if let Some(&n) = self.index.get(&job)
+            && self.graph[n].state == State::Submitted
+        {
+            self.graph[n].state = State::Held;
+        }
+    }
+}
+
+impl<P: Policy> Policy for DagScheduler<P> {
+    /// Forwarded to the inner policy, with this layer's bookkeeping: a done attempt completes its
+    /// job here (attempt 0 completes a local job, which the inner policy never sees), and a
+    /// cancellation cascades to the job's dependents ([`DagScheduler::cancel`]).
+    fn handle(&mut self, input: Input, now: Instant) {
         self.now = now;
-        let out = self.policy.dispatch(now);
-        self.running.extend(out.iter().map(|x| x.0));
+        match input {
+            Input::Done { job, attempt } => self.done(job, attempt, now),
+            Input::Failed {
+                job,
+                attempt,
+                kind,
+                why,
+            } => self.failed(job, attempt, kind, why),
+            Input::Cancel(job) => {
+                self.cancel(job);
+            }
+            Input::WorkerGone(w) => self.worker_gone(w, now),
+            input @ (Input::Submit(_) | Input::Worker(_)) => self.policy.handle(input, now),
+        }
+    }
+
+    /// This layer's announcements, then the inner policy's outputs.
+    fn poll(&mut self, now: Instant) -> Vec<Output> {
+        self.now = now;
+        let inner = self.policy.poll(now);
+        let mut out = std::mem::take(&mut self.outbox);
+        for o in inner {
+            match &o {
+                Output::Start {
+                    job,
+                    attempt,
+                    worker,
+                } => self.live.entry(*job).or_default().push((*attempt, *worker)),
+                Output::Stop { job, attempt, .. } => {
+                    self.drop_attempt(*job, *attempt);
+                    if self.quiet.remove(&(*job, *attempt)) {
+                        continue;
+                    }
+                }
+                Output::GaveUp(g) => {
+                    self.live.remove(&g.job);
+                    self.hold_again(g.job);
+                }
+                _ => {}
+            }
+            out.push(o);
+        }
         out
     }
 
-    /// The DAG's reason while the job is not submitted, the policy's afterwards.
+    /// Forwarded to the inner policy.
+    fn next_wakeup(&self) -> Option<Instant> {
+        self.policy.next_wakeup()
+    }
+
+    /// The DAG's reason while the job is not submitted, the inner policy's afterwards.
     fn explain(&self, job: JobId) -> Option<String> {
         if let Some((slot, i)) = self.instance_of(job) {
             return self.explain_instance_node(slot, i, job);
@@ -1253,8 +1322,322 @@ impl<P: Policy> Dag for DagScheduler<P> {
         }
     }
 
-    /// Forwarded to the policy.
+    /// Forwarded to the inner policy.
     fn stats(&self) -> PolicyStats {
         self.policy.stats()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::{Config, FailKind, GaveUp, Resources, RetryConfig, Scheduler, WorkerState};
+
+    /// A DAG over a FIFO scheduler with one one-slot worker, and `max_attempts` attempts per job.
+    fn dag(config: DagConfig, max_attempts: u32) -> DagScheduler<Scheduler> {
+        let mut d = DagScheduler::new(
+            config,
+            Scheduler::new(Config {
+                retry: RetryConfig { max_attempts },
+                ..Config::fifo()
+            }),
+        );
+        d.handle(
+            Input::Worker(WorkerState::new(1, "x", 1, Resources::mem(100))),
+            0.0,
+        );
+        d
+    }
+
+    /// A job of group 0 with the given dependencies.
+    fn job(id: JobId, deps: &[JobId]) -> DagJob {
+        DagJob::new(JobSpec::new(id, Resources::mem(1), 0), deps.to_vec())
+    }
+
+    /// The first start of `job` on worker 1.
+    fn start(job: JobId, attempt: Attempt) -> Output {
+        Output::Start {
+            job,
+            attempt,
+            worker: 1,
+        }
+    }
+
+    /// Handle `inputs` at `t`, then poll.
+    fn feed(
+        d: &mut DagScheduler<Scheduler>,
+        t: Instant,
+        inputs: impl IntoIterator<Item = Input>,
+    ) -> Vec<Output> {
+        for i in inputs {
+            d.handle(i, t);
+        }
+        d.poll(t)
+    }
+
+    /// A done message.
+    fn done(job: JobId, attempt: Attempt) -> Input {
+        Input::Done { job, attempt }
+    }
+
+    /// A failure message.
+    fn fail(job: JobId, attempt: Attempt) -> Input {
+        Input::Failed {
+            job,
+            attempt,
+            kind: FailKind::Other,
+            why: "test".into(),
+        }
+    }
+
+    /// The inner policy's starts come out of the DAG's poll, and a done attempt releases the
+    /// dependents.
+    #[test]
+    fn done_releases_dependents() {
+        let mut d = dag(DagConfig::default(), 4);
+        d.declare(vec![job(1, &[]), job(2, &[1])], 0.0).unwrap();
+        assert_eq!(d.poll(0.0), vec![start(1, 1)]);
+        assert_eq!(feed(&mut d, 1.0, [done(1, 1)]), vec![start(2, 1)]);
+        assert!(feed(&mut d, 2.0, [done(2, 1)]).is_empty());
+        let st = d.dag_stats();
+        assert_eq!(
+            (st.pending, st.submitted, st.completed_remembered),
+            (0, 0, 2)
+        );
+        assert_eq!(d.explain(2), Some("job 2 completed".into()));
+    }
+
+    /// A retried job's stale report does not complete it here either.
+    #[test]
+    fn stale_done_does_not_complete() {
+        let mut d = dag(DagConfig::default(), 4);
+        d.declare(vec![job(1, &[]), job(2, &[1])], 0.0).unwrap();
+        d.poll(0.0);
+        assert_eq!(feed(&mut d, 1.0, [fail(1, 1)]), vec![start(1, 2)]);
+        assert!(feed(&mut d, 2.0, [done(1, 1)]).is_empty());
+        assert_eq!(d.dag_stats().pending, 1);
+        assert_eq!(feed(&mut d, 3.0, [done(1, 2)]), vec![start(2, 1)]);
+    }
+
+    /// A worker leaving fails its attempts in the inner policy, which retries them: a late report
+    /// from the departed worker completes nothing.
+    #[test]
+    fn worker_gone_retries() {
+        let mut d = dag(DagConfig::default(), 4);
+        d.declare(vec![job(1, &[]), job(2, &[1])], 0.0).unwrap();
+        d.poll(0.0);
+        assert!(feed(&mut d, 1.0, [Input::WorkerGone(1)]).is_empty());
+        assert!(feed(&mut d, 2.0, [done(1, 1)]).is_empty());
+        let w = WorkerState::new(1, "x", 1, Resources::mem(100));
+        assert_eq!(feed(&mut d, 3.0, [Input::Worker(w)]), vec![start(1, 2)]);
+        assert_eq!(feed(&mut d, 4.0, [done(1, 2)]), vec![start(2, 1)]);
+    }
+
+    /// Local jobs are announced, never submitted, and completed with attempt 0.
+    #[test]
+    fn local_jobs_run_on_the_caller() {
+        let mut d = dag(DagConfig::default(), 4);
+        d.declare(vec![job(1, &[]).local(), job(2, &[1])], 0.0)
+            .unwrap();
+        assert_eq!(d.poll(0.0), vec![Output::RunLocal { job: 1 }]);
+        assert_eq!(d.stats().waiting, 0);
+        assert!(!d.release(1, 0.0));
+        // Attempt numbers of workers' jobs do not complete a local job.
+        assert!(feed(&mut d, 1.0, [done(1, 1)]).is_empty());
+        assert_eq!(feed(&mut d, 1.0, [done(1, 0)]), vec![start(2, 1)]);
+    }
+
+    /// Without `auto_submit`, ready jobs are announced and held until released.
+    #[test]
+    fn held_jobs_are_announced() {
+        let config = DagConfig {
+            auto_submit: false,
+            ..DagConfig::default()
+        };
+        let mut d = dag(config, 4);
+        d.declare(vec![job(1, &[]), job(2, &[1]), job(3, &[])], 0.0)
+            .unwrap();
+        assert_eq!(
+            d.poll(0.0),
+            vec![Output::Ready { job: 1 }, Output::Ready { job: 3 }]
+        );
+        assert!(d.release(1, 1.0));
+        assert!(!d.release(1, 1.0));
+        assert_eq!(d.poll(1.0), vec![start(1, 1)]);
+        assert_eq!(
+            feed(&mut d, 2.0, [done(1, 1)]),
+            vec![Output::Ready { job: 2 }]
+        );
+        // Cancelling withdraws an announcement not yet polled.
+        d.declare(vec![job(4, &[])], 3.0).unwrap();
+        assert_eq!(d.cancel(4), vec![4]);
+        assert!(d.poll(3.0).is_empty());
+    }
+
+    /// Passthrough jobs and instances' `done` jobs are announced when recorded.
+    #[test]
+    fn passthroughs_are_announced() {
+        let config = DagConfig {
+            record_passthrough: true,
+            ..DagConfig::default()
+        };
+        let mut d = dag(config, 4);
+        d.declare(
+            vec![job(1, &[]), DagJob::passthrough(2, 0, vec![1], 0.0)],
+            0.0,
+        )
+        .unwrap();
+        assert_eq!(d.poll(0.0), vec![start(1, 1)]);
+        assert_eq!(
+            feed(&mut d, 1.0, [done(1, 1)]),
+            vec![Output::Passed { job: 2 }]
+        );
+        let spec = InstanceSpec {
+            template: Arc::new(DagTemplate::new(1, []).unwrap()),
+            base: 100,
+            entry: 2,
+            done: 200,
+            proto: JobSpec::new(0, Resources::mem(1), 0),
+            work: vec![1.0],
+            passthrough: vec![false],
+            demand: None,
+            label: None,
+            completed: Vec::new(),
+        };
+        d.open_instance(spec, 2.0).unwrap();
+        assert_eq!(d.poll(2.0), vec![start(100, 1)]);
+        assert_eq!(
+            feed(&mut d, 3.0, [done(100, 1)]),
+            vec![Output::Passed { job: 200 }]
+        );
+    }
+
+    /// A give-up passes through and holds the job again; releasing it starts another round.
+    #[test]
+    fn give_up_holds_the_job() {
+        let mut d = dag(DagConfig::default(), 1);
+        d.declare(vec![job(1, &[]), job(2, &[1])], 0.0).unwrap();
+        d.poll(0.0);
+        let out = feed(&mut d, 1.0, [fail(1, 1)]);
+        let [Output::GaveUp(GaveUp { job: 1, .. })] = out[..] else {
+            panic!("expected a give-up, got {out:?}");
+        };
+        assert_eq!(d.dag_stats().held, 1);
+        assert!(d.explain(1).unwrap().contains("held until release"));
+        assert!(d.release(1, 2.0));
+        assert_eq!(d.poll(2.0), vec![start(1, 1)]);
+        assert_eq!(feed(&mut d, 3.0, [done(1, 1)]), vec![start(2, 1)]);
+    }
+
+    /// `Input::Cancel` cascades to dependents and stops running attempts.
+    #[test]
+    fn cancel_input_cascades() {
+        let mut d = dag(DagConfig::default(), 4);
+        d.declare(vec![job(1, &[]), job(2, &[1]), job(3, &[2])], 0.0)
+            .unwrap();
+        d.poll(0.0);
+        let out = feed(&mut d, 1.0, [Input::Cancel(1)]);
+        assert_eq!(
+            out,
+            vec![Output::Stop {
+                job: 1,
+                attempt: 1,
+                worker: 1
+            }]
+        );
+        assert_eq!(d.dag_stats(), DagStats::default());
+        assert_eq!(d.stats().running, 0);
+    }
+
+    /// A two-node instance after job 1, and job 2 after it; job 1 done, node 100 running, and
+    /// the instance closed early.
+    fn closed_instance() -> DagScheduler<Scheduler> {
+        let mut d = dag(DagConfig::default(), 4);
+        let spec = InstanceSpec {
+            template: Arc::new(DagTemplate::new(2, []).unwrap()),
+            base: 100,
+            entry: 1,
+            done: 200,
+            proto: JobSpec::new(0, Resources::mem(1), 0),
+            work: vec![1.0; 2],
+            passthrough: vec![false; 2],
+            demand: None,
+            label: None,
+            completed: Vec::new(),
+        };
+        d.declare(vec![job(1, &[]), job(2, &[200])], 0.0).unwrap();
+        d.open_instance(spec, 0.0).unwrap();
+        assert_eq!(d.poll(0.0), vec![start(1, 1)]);
+        assert_eq!(feed(&mut d, 1.0, [done(1, 1)]), vec![start(100, 1)]);
+        assert_eq!(d.close_instance(200, 2.0), Ok(vec![100]));
+        // Node 101 was withdrawn; `done` completed, releasing job 2 behind the running node.
+        let st = d.stats();
+        assert_eq!((st.waiting, st.running), (1, 1));
+        assert!(d.poll(2.0).is_empty());
+        d
+    }
+
+    /// A running node of an instance closed early keeps its resources until its attempt ends; a
+    /// failure then is neither retried nor reported.
+    #[test]
+    fn closed_instance_node_fails() {
+        let mut d = closed_instance();
+        assert_eq!(feed(&mut d, 3.0, [fail(100, 1)]), vec![start(2, 1)]);
+        assert_eq!(d.stats().running, 1);
+        assert_eq!(d.explain(100), None);
+    }
+
+    /// The same when the node's worker leaves.
+    #[test]
+    fn closed_instance_node_worker_gone() {
+        let mut d = closed_instance();
+        assert!(feed(&mut d, 3.0, [Input::WorkerGone(1)]).is_empty());
+        let st = d.stats();
+        assert_eq!((st.waiting, st.running), (1, 0));
+        let w = WorkerState::new(1, "x", 1, Resources::mem(100));
+        assert_eq!(feed(&mut d, 4.0, [Input::Worker(w)]), vec![start(2, 1)]);
+    }
+
+    /// Its completion only frees its resources.
+    #[test]
+    fn closed_instance_node_done() {
+        let mut d = closed_instance();
+        assert_eq!(feed(&mut d, 3.0, [done(100, 1)]), vec![start(2, 1)]);
+    }
+
+    /// A snapshot restores held jobs as announcements and submitted ones as fresh submissions.
+    #[cfg(feature = "serde")]
+    #[test]
+    fn restore_announces_held_jobs() {
+        let config = DagConfig {
+            auto_submit: false,
+            ..DagConfig::default()
+        };
+        let mut d = dag(config, 4);
+        d.declare(
+            vec![job(1, &[]), job(2, &[]), job(3, &[1]), job(4, &[]).local()],
+            0.0,
+        )
+        .unwrap();
+        d.poll(0.0);
+        assert!(d.release(1, 0.0));
+        assert_eq!(d.poll(0.0), vec![start(1, 1)]);
+        let snap = d.snapshot();
+        let mut r = DagScheduler::restore(snap, Scheduler::new(Config::fifo()), 5.0);
+        let w = WorkerState::new(7, "x", 1, Resources::mem(100));
+        assert_eq!(
+            feed(&mut r, 5.0, [Input::Worker(w)]),
+            vec![
+                Output::RunLocal { job: 4 },
+                Output::Ready { job: 2 },
+                Output::Start {
+                    job: 1,
+                    attempt: 1,
+                    worker: 7
+                }
+            ]
+        );
     }
 }

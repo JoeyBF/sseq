@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use super::{DagError, DagScheduler, DagTemplate, State};
-use crate::{Instant, JobId, JobSpec, Policy, Resources};
+use crate::{Input, Instant, JobId, JobSpec, Output, Policy, Resources};
 
 /// Counter sentinels (template in-degrees stay below them).
 pub(super) const COMPLETE: u16 = u16::MAX;
@@ -43,7 +43,7 @@ pub struct InstanceSpec {
     pub passthrough: Vec<bool>,
     /// Each node's demand, overriding `proto.demand` (one per template node).
     pub demand: Option<Arc<[Resources]>>,
-    /// Each node's name in [`explain`](crate::Dag::explain) messages (not kept by snapshots).
+    /// Each node's name in [`explain`](crate::Policy::explain) messages (not kept by snapshots).
     pub label: Option<NodeLabel>,
     /// Nodes already complete (e.g. restored from a checkpoint): they never run, and their
     /// successors start with those dependencies met. Need not be closed under predecessors: an
@@ -269,12 +269,12 @@ impl<P: Policy> DagScheduler<P> {
                 work.extend(next);
                 continue;
             }
-            let id = self.inst(slot).base + i as u64;
-            self.newly_ready.push(id);
             if self.config.auto_submit {
                 self.submit_instance_node(slot, i, now);
             } else {
+                let job = self.inst(slot).base + i as u64;
                 self.instances[slot].as_mut().unwrap().counter[i] = HELD;
+                self.outbox.push(Output::Ready { job });
             }
         }
         if self.instances[slot]
@@ -323,9 +323,9 @@ impl<P: Policy> DagScheduler<P> {
     /// Close an instance early (e.g. its remaining nodes are known to be no-ops): its nodes that
     /// have not started complete as no-ops (waiting ones are withdrawn from the policy) and its
     /// `done` job completes. `job` is the instance's `done` job or any of its nodes. Returns the
-    /// nodes already running: their workers keep their resources until each one's
-    /// [`completed`](crate::Dag::completed) (or [`resubmit`](Self::resubmit) after its worker
-    /// left), which then changes nothing else.
+    /// nodes already running: their workers keep their resources until each one's attempt ends
+    /// ([`Input::Done`], [`Input::Failed`], or its worker leaving), which then changes nothing
+    /// else; such a job is not retried.
     pub fn close_instance(&mut self, job: JobId, now: Instant) -> Result<Vec<JobId>, DagError> {
         self.now = now;
         let slot = match self.instance_of(job) {
@@ -344,16 +344,15 @@ impl<P: Policy> DagScheduler<P> {
         for i in 0..len {
             let id = base + i as u64;
             if self.inst(slot).counter[i] == SUBMITTED {
-                if self.running.remove(&id) {
+                if self.live.contains_key(&id) {
                     self.ignored.insert(id);
                     running.push(id);
                 } else {
-                    self.policy.cancel(id);
+                    self.policy.handle(Input::Cancel(id), now);
                 }
             }
         }
-        self.newly_ready
-            .retain(|j| !(base..base + len as u64).contains(j));
+        self.unannounce(|j| (base..base + len as u64).contains(&j));
         if let Some(v) = self.by_entry.get_mut(&entry) {
             v.retain(|&s| s != slot);
         }
@@ -376,7 +375,7 @@ impl<P: Policy> DagScheduler<P> {
         self.free_instances.push(slot);
         if self.config.record_passthrough {
             // An instance's `done` is a synchronisation point like a passthrough job.
-            self.passed.push(inst.done);
+            self.outbox.push(Output::Passed { job: inst.done });
         }
         // A throttled instance may open now.
         while let Some(next) = self.waiting_to_open.pop_front() {
@@ -410,7 +409,7 @@ impl<P: Policy> DagScheduler<P> {
             let p = -(rank * self.config.rank_scale).round();
             spec.priority = Some(p.clamp(i64::MIN as f64, i64::MAX as f64) as i64);
         }
-        self.policy.submit(spec, now);
+        self.policy.handle(Input::Submit(spec), now);
     }
 
     /// Cancel a whole instance (its pending, held and submitted nodes); returns their ids.
@@ -432,12 +431,12 @@ impl<P: Policy> DagScheduler<P> {
             }
             let id = inst.base + i as u64;
             if c == SUBMITTED {
-                self.policy.cancel(id);
+                self.policy.handle(Input::Cancel(id), self.now);
             }
             ids.push(id);
         }
-        self.newly_ready
-            .retain(|j| !(inst.base..inst.base + inst.len() as u64).contains(j));
+        let range = inst.base..inst.base + inst.len() as u64;
+        self.unannounce(|j| range.contains(&j));
         ids
     }
 
@@ -468,10 +467,10 @@ impl<P: Policy> DagScheduler<P> {
         }
     }
 
-    /// Release a held instance node, or resubmit a submitted one; false if neither applies.
-    pub(super) fn instance_release(&mut self, job: JobId, now: Instant, want: u16) -> bool {
+    /// Release a held instance node; false if it is not held.
+    pub(super) fn instance_release(&mut self, job: JobId, now: Instant) -> bool {
         match self.instance_of(job) {
-            Some((slot, i)) if self.inst(slot).counter[i] == want => {
+            Some((slot, i)) if self.inst(slot).counter[i] == HELD => {
                 self.submit_instance_node(slot, i, now);
                 true
             }
@@ -620,8 +619,9 @@ impl<P: Policy> DagScheduler<P> {
             for i in submitted {
                 self.submit_instance_node(slot, i, now);
             }
-            self.newly_ready
-                .extend(held.into_iter().map(|i| base + i as u64));
+            self.outbox.extend(held.into_iter().map(|i| Output::Ready {
+                job: base + i as u64,
+            }));
         }
     }
 }

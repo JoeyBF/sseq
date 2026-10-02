@@ -23,10 +23,13 @@ pub struct Config {
     pub fit: Fit,
     /// Speed-aware placement. Default: oblivious.
     pub speed: SpeedConfig,
+    /// Retries of failed attempts. Default [`RetryConfig::default`].
+    pub retry: RetryConfig,
 }
 
 impl Default for Config {
-    /// Priority order, [`DEFAULT_AGE_LIMIT`], one reservation, least loaded, speed-oblivious.
+    /// Priority order, [`DEFAULT_AGE_LIMIT`], one reservation, least loaded, speed-oblivious,
+    /// default retries.
     fn default() -> Self {
         Self {
             order: Order::default(),
@@ -34,6 +37,7 @@ impl Default for Config {
             reservations: Some(Reservations::default()),
             fit: Fit::LeastLoaded,
             speed: SpeedConfig::default(),
+            retry: RetryConfig::default(),
         }
     }
 }
@@ -48,6 +52,7 @@ impl Config {
             reservations: None,
             fit: Fit::LeastLoaded,
             speed: SpeedConfig::default(),
+            retry: RetryConfig::default(),
         }
     }
 
@@ -217,33 +222,49 @@ pub struct SpeedConfig {
     /// Learn each worker class's speed from completion times instead of trusting
     /// [`WorkerState::speed`](crate::WorkerState::speed).
     pub learn: Option<Learn>,
-    /// Restart running jobs on faster workers that would otherwise stay idle (only through
-    /// [`Policy::dispatch_full`](crate::Policy::dispatch_full)).
-    pub spoliation: Option<Spoliation>,
+    /// Start a second attempt of a running job on a faster worker that would otherwise stay idle.
+    pub speculate: Option<Speculate>,
 }
 
-/// HeteroPrio's spoliation: after a dispatch, a worker with a free slot that no waiting job took
-/// restarts the running job, on a slower worker, that it would finish soonest relative to where
-/// it is (the one with the latest expected end among those that gain), if the restart finishes
-/// at least `min_gain` of the job's run time earlier. Needs
+/// Speculative execution (HeteroPrio's spoliation, without the kill): after a poll's placements,
+/// a worker with a free slot that no waiting job took starts another attempt of the running job,
+/// on slower workers only, that it would finish soonest relative to where it runs (the one with
+/// the latest expected end among those that gain), if the new attempt is expected to finish at
+/// least `min_gain` of its run time earlier. The original keeps running; the first to finish
+/// wins and the other is stopped ([`Output::Stop`](crate::Output::Stop)). Needs
 /// [`JobSpec::work`](crate::JobSpec::work).
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct Spoliation {
-    /// Minimum gain, as a fraction of the job's run time on the faster worker.
+pub struct Speculate {
+    /// Minimum gain, as a fraction of the new attempt's run time.
     pub min_gain: f64,
-    /// Seconds a restart costs on top of the run time.
+    /// Seconds a new attempt costs on top of its run time (it starts from scratch).
     pub restart_overhead: f64,
-    /// A job is preempted at most this many times (no ping-pong).
+    /// A job gets at most this many speculative attempts.
     pub max_per_job: u32,
 }
 
-impl Default for Spoliation {
-    /// At least a quarter of the run time gained, no overhead, at most once per job.
+impl Default for Speculate {
+    /// At least a quarter of the run time gained, no overhead, at most one extra attempt per job.
     fn default() -> Self {
         Self {
             min_gain: 0.25,
             restart_overhead: 0.0,
             max_per_job: 1,
         }
+    }
+}
+
+/// How often a failed job is retried.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RetryConfig {
+    /// Failed attempts per job before it is given up
+    /// ([`Output::GaveUp`](crate::Output::GaveUp)). Default 4; 0 counts as 1.
+    pub max_attempts: u32,
+}
+
+impl Default for RetryConfig {
+    /// Four attempts.
+    fn default() -> Self {
+        Self { max_attempts: 4 }
     }
 }

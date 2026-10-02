@@ -16,18 +16,18 @@ mod speed;
 
 pub use admission::{Admission, ProductionAdmission, WorkerView};
 pub use config::{
-    Config, DEFAULT_AGE_LIMIT, Defer, Fit, GroupOrder, Order, Reservations, SpeedConfig,
-    SpeedPolicy, Spoliation,
+    Config, DEFAULT_AGE_LIMIT, Defer, Fit, GroupOrder, Order, Reservations, RetryConfig, Speculate,
+    SpeedConfig, SpeedPolicy,
 };
 #[cfg(feature = "serde")]
 pub use dag::DagSnapshot;
 pub use dag::{
-    Dag, DagConfig, DagError, DagJob, DagScheduler, DagStats, DagTemplate, InstanceSpec, NodeLabel,
+    DagConfig, DagError, DagJob, DagScheduler, DagStats, DagTemplate, InstanceSpec, NodeLabel,
 };
 pub use scheduler::Scheduler;
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
-pub use shared::{Attempt, FailKind, FailOutcome, Lease, Placement, RetryConfig, SharedPolicy};
+pub use shared::{Lease, SharedPolicy};
 pub use speed::{Learn, Sharing, SpeedEstimator};
 
 /// A job identifier, chosen by the caller. Must be unique among live (waiting or running) jobs.
@@ -198,7 +198,8 @@ pub struct JobSpec {
     /// If set, the job runs only on workers of this class (a hard constraint).
     pub class: Option<String>,
     /// Estimated work, in seconds on a worker of [`WorkerState::speed`] 1.0. Used by
-    /// [`SpeedPolicy::EarliestFinish`] (and filled in from the DAG layer's estimate when unset).
+    /// [`SpeedPolicy::EarliestFinish`], shadow backfill and [`Speculate`] (and filled in from the
+    /// DAG layer's estimate when unset).
     #[cfg_attr(feature = "serde", serde(default))]
     pub work: Option<f64>,
 }
@@ -292,9 +293,9 @@ pub struct WorkerLoad {
     pub class: String,
     /// Its slot count.
     pub slots: usize,
-    /// Jobs placed on it and not yet completed.
+    /// Live attempts on it (a job speculated onto it counts here and on its other worker).
     pub running: usize,
-    /// Sum of the demands of those jobs.
+    /// Sum of the demands of those attempts.
     pub placed: Resources,
     /// Headroom per dimension as admission sees it ([`WorkerView::headroom`]); `None` where the
     /// capacity is unknown.
@@ -312,114 +313,201 @@ pub struct PolicyStats {
     pub now: Instant,
     /// Number of waiting jobs.
     pub waiting: usize,
-    /// Number of running (placed, not completed) jobs.
+    /// Number of running jobs (with at least one live attempt), each counted once.
     pub running: usize,
     /// The waiting job that has waited longest, and for how long (seconds).
     pub longest_wait: Option<(JobId, f64)>,
     /// Current reservations.
     pub reservations: Vec<ReservationInfo>,
-    /// Total placements made since creation.
+    /// Total attempts started since creation (retries and speculative attempts included).
     pub placements_total: u64,
     /// Total reservations made since creation.
     pub reservations_total: u64,
     /// Per-worker load, ordered by worker id.
     pub workers: Vec<WorkerLoad>,
-    /// Jobs the last `dispatch` placed on the worker they had reserved (a reservation paying
+    /// Jobs the last [`Policy::poll`] placed on the worker they had reserved (a reservation paying
     /// off), in placement order.
     pub last_dispatch_holders: Vec<JobId>,
-    /// Jobs the last `dispatch` deliberately left waiting, at some point of its scan, for a faster
+    /// Jobs the last [`Policy::poll`] deliberately left waiting, at some point of its scan, for a faster
     /// worker that was busy ([`Defer`]), and did not place afterwards: `(job, worker it waits
     /// for, expected start there)`. Less urgent jobs may have taken slower workers meanwhile.
     pub deferred: Vec<(JobId, WorkerId, Instant)>,
-    /// Every job that deferred at some point of the last `dispatch`'s scan, including those placed
+    /// Every job that deferred at some point of the last [`Policy::poll`]'s scan, including those placed
     /// later in it (after a released reservation restarted the scan): while deferring, a job
     /// leaves the slower workers it declined to less urgent jobs.
     pub deferred_any: Vec<JobId>,
 }
 
-/// A placement policy, driven by events.
+/// The number of a job's attempt: 1 for its first start, counting retries and speculative
+/// attempts. The DAG layer's local jobs use 0 (see [`DagScheduler`]).
+pub type Attempt = u32;
+
+/// Why an attempt failed (the caller classifies; the policy records it in [`Tried`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub enum FailKind {
+    /// The worker ran out of device memory.
+    DeviceOom,
+    /// The connection to the worker died ([`Input::WorkerGone`] fails attempts with this).
+    LinkDied,
+    /// The worker refused the job.
+    Rejected,
+    /// The job took too long.
+    Timeout,
+    /// Anything else.
+    Other,
+}
+
+/// One failed attempt.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub struct Tried {
+    /// Where it ran.
+    pub worker: WorkerId,
+    /// How it failed.
+    pub kind: FailKind,
+    /// The caller's description.
+    pub why: String,
+}
+
+/// A job the policy stopped retrying ([`RetryConfig::max_attempts`] failures): it is forgotten.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub struct GaveUp {
+    /// The job.
+    pub job: JobId,
+    /// Every failed attempt, in order.
+    pub tried: Vec<Tried>,
+    /// Every attempt failed with [`FailKind::DeviceOom`]: the job might fit later, elsewhere, or
+    /// split.
+    pub retryable: bool,
+}
+
+/// An event a [`Policy`] reacts to.
+#[derive(Clone, Debug, PartialEq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+pub enum Input {
+    /// A job became ready. An id that is already waiting or running is ignored.
+    Submit(JobSpec),
+    /// An attempt finished: the job is complete, and every other live attempt of it is stopped
+    /// ([`Output::Stop`]). Ignored unless `attempt` is live.
+    Done {
+        /// The job.
+        job: JobId,
+        /// The attempt that finished.
+        attempt: Attempt,
+    },
+    /// An attempt failed. If no other attempt of the job is live, the job is retried (it keeps its
+    /// place in the queue and its age, and softly avoids the workers it failed on) or, after
+    /// [`RetryConfig::max_attempts`] failures, given up ([`Output::GaveUp`]). Ignored unless
+    /// `attempt` is live.
+    Failed {
+        /// The job.
+        job: JobId,
+        /// The attempt that failed.
+        attempt: Attempt,
+        /// How.
+        kind: FailKind,
+        /// The caller's description, kept in [`Tried`].
+        why: String,
+    },
+    /// The job is no longer wanted: dropped if waiting, its live attempts stopped
+    /// ([`Output::Stop`]) if running. Unknown ids are ignored.
+    Cancel(JobId),
+    /// A worker joined, or reported a heartbeat. Its live attempts are kept.
+    Worker(WorkerState),
+    /// A worker left: each live attempt on it fails with [`FailKind::LinkDied`], as if reported
+    /// by [`Input::Failed`].
+    WorkerGone(WorkerId),
+}
+
+/// What a [`Policy`] asks its caller to do.
+#[derive(Clone, Debug, PartialEq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+pub enum Output {
+    /// Start this attempt of the job on the worker. Report its end with [`Input::Done`] or
+    /// [`Input::Failed`].
+    Start {
+        /// The job.
+        job: JobId,
+        /// The attempt's number.
+        attempt: Attempt,
+        /// Where to run it.
+        worker: WorkerId,
+    },
+    /// Stop this attempt: another attempt won, or the job was cancelled. Its result is not wanted,
+    /// and the policy has already released its resources.
+    Stop {
+        /// The job.
+        job: JobId,
+        /// The attempt.
+        attempt: Attempt,
+        /// Where it runs.
+        worker: WorkerId,
+    },
+    /// The job failed too often and is forgotten.
+    GaveUp(GaveUp),
+    /// A [`DagJob::local`] job is ready: run it on the caller and report it with
+    /// [`Input::Done`] and attempt 0.
+    RunLocal {
+        /// The job.
+        job: JobId,
+    },
+    /// A job is ready and held (without [`DagConfig::auto_submit`]): submit it with
+    /// [`DagScheduler::release`] when it is sendable.
+    Ready {
+        /// The job.
+        job: JobId,
+    },
+    /// A passthrough job (or an instance's `done` job) completed (with
+    /// [`DagConfig::record_passthrough`]).
+    Passed {
+        /// The job.
+        job: JobId,
+    },
+}
+
+/// A placement policy, driven by messages.
 ///
-/// Every method is deterministic: the same sequence of calls (with the same `now`s) produces the
-/// same placements. The caller calls [`Policy::dispatch`] after every event (submission,
-/// completion, heartbeat) and sends each returned job to its worker, treating it as running.
+/// Jobs are idempotent: running one twice is harmless and the first completion wins. That is the
+/// caller's side of the contract; it lets the policy retry failed attempts, start a speculative
+/// second attempt ([`Speculate`]) and ignore late messages about attempts it no longer tracks.
+///
+/// The caller feeds every event to [`handle`](Self::handle), then calls [`poll`](Self::poll) and
+/// acts on each [`Output`]. Every method is deterministic: the same sequence of calls (with the
+/// same `now`s) produces the same outputs, which is what [`log::replay`] relies on.
 pub trait Policy {
-    /// A job became ready. Submitting an id that is already waiting or running is ignored.
-    fn submit(&mut self, job: JobSpec, now: Instant);
-    /// The job is no longer wanted. A waiting job is dropped; a running job's resources are
-    /// released as if it completed. Unknown ids are ignored.
-    fn cancel(&mut self, job: JobId);
-    /// A worker joined, or reported a heartbeat. Its running jobs and placed demand are kept.
-    fn worker_update(&mut self, w: WorkerState, now: Instant);
-    /// A worker left. Its running jobs are forgotten; the caller resubmits them if they should run.
-    fn worker_gone(&mut self, w: WorkerId, now: Instant);
-    /// A running job finished; its resources are released (and its duration may teach the
-    /// policy its worker's speed).
-    fn completed(&mut self, job: JobId, now: Instant);
-    /// A running job failed: its resources are released, nothing is learned from its duration.
-    /// The default cancels it; `why` is for logs ([`log::Logged`]).
-    fn failed(&mut self, job: JobId, now: Instant, why: &str) {
-        let _ = (now, why);
-        self.cancel(job);
-    }
-    /// The placements to make now.
-    fn dispatch(&mut self, now: Instant) -> Vec<(JobId, WorkerId)>;
-    /// Why a waiting job is not placed, in words (for logs). `None` for unknown jobs.
+    /// Take in one event at time `now` (non-decreasing across calls). Outputs it causes (stops,
+    /// give-ups) are returned by the next `poll`.
+    fn handle(&mut self, input: Input, now: Instant);
+    /// Place what can be placed now, and return every output since the last call, in order.
+    fn poll(&mut self, now: Instant) -> Vec<Output>;
+    /// The next time `poll` should be called even if no event arrives: a job's voluntary wait for
+    /// a faster worker ([`Defer`]) expires then. `None` if nothing is timed. Callers with
+    /// frequent events may ignore it at the cost of that much extra waiting.
+    fn next_wakeup(&self) -> Option<Instant>;
+    /// Why a job is not running, in words (for logs). `None` for unknown jobs.
     fn explain(&self, job: JobId) -> Option<String>;
     /// Counters and current state.
     fn stats(&self) -> PolicyStats;
-    /// [`dispatch`](Self::dispatch) plus preemptions ([`Spoliation`]): running jobs to restart
-    /// on a faster worker. The caller kills each preempted job's instance on `from` and starts it
-    /// again on `to`; the policy already counts it on `to` only. If the old instance completes
-    /// before the kill lands, report `completed(job)` (that releases `to`) and kill the new one.
-    /// The default never preempts.
-    fn dispatch_full(&mut self, now: Instant) -> Dispatch {
-        Dispatch {
-            start: self.dispatch(now),
-            preempt: Vec::new(),
-        }
-    }
-    /// The next time `dispatch` should be called even if no event arrives: a job's voluntary wait
-    /// for a faster worker ([`Defer`]) expires then. `None` if nothing is timed. Callers with
-    /// frequent events may ignore it at the cost of that much extra waiting.
-    fn next_wakeup(&self) -> Option<Instant> {
-        None
-    }
 }
 
 impl<P: Policy + ?Sized> Policy for Box<P> {
     /// Forwarded to the boxed policy.
-    fn submit(&mut self, job: JobSpec, now: Instant) {
-        (**self).submit(job, now)
+    fn handle(&mut self, input: Input, now: Instant) {
+        (**self).handle(input, now)
     }
 
     /// Forwarded to the boxed policy.
-    fn cancel(&mut self, job: JobId) {
-        (**self).cancel(job)
+    fn poll(&mut self, now: Instant) -> Vec<Output> {
+        (**self).poll(now)
     }
 
     /// Forwarded to the boxed policy.
-    fn worker_update(&mut self, w: WorkerState, now: Instant) {
-        (**self).worker_update(w, now)
-    }
-
-    /// Forwarded to the boxed policy.
-    fn worker_gone(&mut self, w: WorkerId, now: Instant) {
-        (**self).worker_gone(w, now)
-    }
-
-    /// Forwarded to the boxed policy.
-    fn completed(&mut self, job: JobId, now: Instant) {
-        (**self).completed(job, now)
-    }
-
-    /// Forwarded to the boxed policy.
-    fn failed(&mut self, job: JobId, now: Instant, why: &str) {
-        (**self).failed(job, now, why)
-    }
-
-    /// Forwarded to the boxed policy.
-    fn dispatch(&mut self, now: Instant) -> Vec<(JobId, WorkerId)> {
-        (**self).dispatch(now)
+    fn next_wakeup(&self) -> Option<Instant> {
+        (**self).next_wakeup()
     }
 
     /// Forwarded to the boxed policy.
@@ -431,34 +519,4 @@ impl<P: Policy + ?Sized> Policy for Box<P> {
     fn stats(&self) -> PolicyStats {
         (**self).stats()
     }
-
-    /// Forwarded.
-    fn next_wakeup(&self) -> Option<Instant> {
-        (**self).next_wakeup()
-    }
-
-    /// Forwarded.
-    fn dispatch_full(&mut self, now: Instant) -> Dispatch {
-        (**self).dispatch_full(now)
-    }
-}
-
-/// What [`Policy::dispatch_full`] decided: placements of waiting jobs, and preemptions.
-#[derive(Clone, Debug, Default, PartialEq)]
-pub struct Dispatch {
-    /// Waiting jobs to start: `(job, worker)`.
-    pub start: Vec<(JobId, WorkerId)>,
-    /// Running jobs to restart elsewhere.
-    pub preempt: Vec<Preemption>,
-}
-
-/// A running job moved to a faster worker (see [`Policy::dispatch_full`]).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Preemption {
-    /// The job.
-    pub job: JobId,
-    /// Where it was running (kill it there).
-    pub from: WorkerId,
-    /// Where it runs now (start it again there).
-    pub to: WorkerId,
 }

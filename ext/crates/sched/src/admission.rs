@@ -87,7 +87,8 @@ impl WorkerView<'_> {
 ///
 /// Implementations must be **monotone in load**: if a job is refused by a worker, it stays refused
 /// after more jobs are placed on that worker (with no completion or heartbeat in between). The
-/// scheduler relies on this to guarantee the priority invariant within one `dispatch`.
+/// scheduler relies on this to guarantee the priority invariant within one
+/// [`poll`](crate::Policy::poll).
 pub trait Admission {
     /// Whether `w` admits a job with demand `demand`.
     fn admits(&self, demand: &Resources, w: &WorkerView) -> bool;
