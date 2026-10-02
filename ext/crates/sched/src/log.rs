@@ -2,7 +2,9 @@
 
 use std::collections::{BTreeSet, HashMap};
 
-use crate::{Dispatch, Instant, JobId, JobSpec, Policy, PolicyStats, WorkerId, WorkerState};
+use crate::{
+    DEV, Dispatch, Instant, JobId, JobSpec, MEM, Policy, PolicyStats, WorkerId, WorkerState,
+};
 
 /// What a job is, for the simulator (optional; Nassau's vocabulary). Without it a logged job
 /// replays as a signature task of its group.
@@ -401,9 +403,9 @@ impl<P: Policy> Logged<P> {
             self.sink.record(&Event::Worker {
                 id: w.id.to_string(),
                 gpu: w.class.clone(),
-                budget_gb: gb(w.budget.mem),
+                budget_gb: gb(w.budget[MEM]),
                 slots: w.slots,
-                dev_cap_gb: gb(w.budget.dev),
+                dev_cap_gb: gb(w.budget[DEV]),
             });
             self.capacity.insert(w.id, cap);
         }
@@ -421,11 +423,11 @@ impl<P: Policy> Logged<P> {
             self.sink.record(&Event::Sample {
                 t_s: now,
                 worker: w.id.to_string(),
-                rss_gb: gb(w.reported_used.mem),
-                baseline_gb: gb(w.reported_baseline.mem),
-                reserved_gb: load.as_ref().map_or(0.0, |l| gb(l.placed.mem)),
+                rss_gb: gb(w.reported_used[MEM]),
+                baseline_gb: gb(w.reported_baseline[MEM]),
+                reserved_gb: load.as_ref().map_or(0.0, |l| gb(l.placed[MEM])),
                 running: load.map_or(0, |l| l.running),
-                dev_per_task_gb: gb(w.dev_per_task),
+                dev_per_task_gb: gb(w.per_task[DEV]),
             });
             self.last_sample.insert(w.id, now);
         }
@@ -439,8 +441,8 @@ impl<P: Policy> Policy for Logged<P> {
         self.sink.record(&Event::Submit {
             t_s: now,
             job: job.id,
-            est_gb: gb(job.demand.mem),
-            dev_gb: gb(job.demand.dev),
+            est_gb: gb(job.demand[MEM]),
+            dev_gb: gb(job.demand[DEV]),
             group: job.group,
             priority: job.priority,
             work: job.work,

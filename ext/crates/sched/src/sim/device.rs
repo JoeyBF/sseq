@@ -64,7 +64,7 @@ pub enum DeviceArm {
     /// The per-worker count form: the worker reports its pool and a learned per-task demand, this
     /// quantile of the jobs' demands (times `scale`, to price an over- or underestimate).
     Count {
-        /// Quantile of the demand distribution reported as `dev_per_task`.
+        /// Quantile of the demand distribution reported as the device `per_task`.
         quantile: f64,
         /// Multiplier on it.
         scale: f64,
@@ -165,7 +165,7 @@ pub fn simulate_device(sc: &DeviceScenario, arm: DeviceArm) -> DeviceMetrics {
     for w in 0..sc.workers {
         p.worker_update(
             WorkerState {
-                dev_per_task: (per_task * 1e9).round() as u64,
+                per_task: Resources::ZERO.with_dev((per_task * 1e9).round() as u64),
                 ..WorkerState::new(
                     w as WorkerId,
                     "small",

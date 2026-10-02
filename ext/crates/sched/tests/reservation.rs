@@ -170,7 +170,7 @@ fn per_class_reservations() {
             per_class_reservations: true,
             ..BackfillConfig::default()
         },
-        prefer_penalty: 0,
+        prefer_penalty: 0.0,
     });
     for (id, class) in [(1, "a"), (2, "a"), (3, "b"), (4, "b")] {
         p.worker_update(WorkerState::new(id, class, 4, Resources::mem(100)), 0.0);

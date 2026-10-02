@@ -62,14 +62,15 @@ thread; a typical call takes microseconds.
 
 ## Model
 
-- A **job** ([`JobSpec`]) has a demand ([`Resources`]: host and device memory), a priority group, an optional
-  explicit priority, optional preferred workers (cache affinity, never required), a required worker
-  class, and workers to avoid (e.g. ones it failed on). The avoid list is hard, or soft
+- A **job** ([`JobSpec`]) has a demand ([`Resources`]: a vector over the dimensions [`MEM`], host
+  memory, and [`DEV`], device memory), a priority group, an optional explicit priority, optional
+  preferred workers (cache affinity, never required), a required worker class, and workers to
+  avoid (e.g. ones it failed on). The avoid list is hard, or soft
   ([`JobSpec::avoid_soft`]): then avoided workers are used while no other live worker of the class
   exists.
-- A **worker** ([`WorkerState`]) has a class, slots, a budget (host memory, and its device pool;
-  a zero device budget is unknown and not enforced), a learned device demand per job
-  ([`WorkerState::dev_per_task`]), and its last reported usage and baseline. The library keeps its
+- A **worker** ([`WorkerState`]) has a class, slots, a budget per dimension (a zero component is
+  unknown and not enforced), a learned per-job floor ([`WorkerState::per_task`], e.g. the typical
+  device launch request), and its last reported usage and baseline. The library keeps its
   own sum of the demands it placed on each worker; heartbeats only update the reported figures.
 - An [`Admission`] rule decides whether a worker takes a job. The default,
   [`ProductionAdmission`], is
@@ -77,15 +78,18 @@ thread; a typical call takes microseconds.
   ```text
   admit iff running < slots
         and (running == 0                                   // escape hatch
-             or (max(reported_used, reported_baseline + placed) + demand <= budget    // host
-                 and (budget.dev == 0                                                  // device
-                      or max(placed.dev, running * dev_per_task)
-                           + max(demand.dev, dev_per_task) <= budget.dev)))
+             or for every dimension d with budget[d] > 0:
+                  max(reported_used[d],
+                      reported_baseline[d] + max(placed[d], running * per_task[d]))
+                    + max(demand[d], per_task[d]) <= budget[d])
   ```
 
-  With `dev_per_task` alone the device rule is a per-worker count, `(running + 1) * per_task <=
-  pool`; with per-job device demands it is their sum. A per-task figure should be near the mean
-  job, not a high quantile: a sum of jobs concentrates near its mean.
+  With a device `per_task` alone the device inequality is a per-worker count, `(running + 1) *
+  per_task <= pool`; with per-job device demands it is their sum. A per-task figure should be
+  near the mean job, not a high quantile: a sum of jobs concentrates near its mean.
+
+  Where one number must rank workers (the tightest fit, the most headroom), it is the free
+  fraction of capacity in the bottleneck dimension, [`WorkerView::free_share`].
 
   The escape hatch guarantees that any job can run somewhere: a job alone on a worker always goes.
   `reported_baseline` must exclude the running jobs' memory (the worker's resident floor minus
@@ -287,13 +291,13 @@ shared.worker_update(WorkerState {
     reported_used: Resources::mem_gb(rss),
     reported_baseline: Resources::mem_gb(baseline_excl),
     speed: if class == "l40s" { 1.39 } else { 1.0 },
-    dev_per_task: (dev_demand * 1e9) as u64,
+    per_task: Resources::ZERO.with_dev_gb(dev_demand),
     ..WorkerState::new(id, class, 16, Resources::mem_gb(123.7).with_dev_gb(dev_cap))
 });
 
 // acquire(res, key, est, b, what, avoid): one task, its bidegree (s, t), its estimate in GB and
 // expected seconds on an H200 (learning needs a work estimate; any size proxy proportional to it
-// works). A per-task device estimate, when known, goes in `spec.demand.dev` (`with_dev_gb`).
+// works). A per-task device estimate, when known, goes in `spec.demand[DEV]` (`with_dev_gb`).
 let (task, s, t, est_gb, work) = (123_456, 3, 200, 9.5, 600.0);
 shared.with(|p, _| {
     p.annotate(task, TaskInfo { kind: "sig".into(), bidegree: (t - s, s), ..TaskInfo::default() })

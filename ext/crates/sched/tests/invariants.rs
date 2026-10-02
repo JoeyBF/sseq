@@ -4,8 +4,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use proptest::prelude::*;
 use sched::{
-    BackfillConfig, BestFit, BestFitConfig, Defer, Greedy, GreedyConfig, GroupOrder, JobId,
-    JobSpec, LaneSet, Lanes, LanesConfig, Policy, PriorityBackfill, Resources, SlowGate,
+    BackfillConfig, BestFit, BestFitConfig, DIMS, Defer, Greedy, GreedyConfig, GroupOrder, JobId,
+    JobSpec, LaneSet, Lanes, LanesConfig, MEM, Policy, PriorityBackfill, Resources, SlowGate,
     SpeedConfig, SpeedPolicy, Spoliation, WorkerId, WorkerState,
 };
 
@@ -23,7 +23,7 @@ enum Kind {
         group_first: bool,
     },
     BestFit {
-        penalty: u64,
+        penalty: f64,
         age: Option<f64>,
     },
     Lanes,
@@ -245,7 +245,7 @@ fn kind() -> impl Strategy<Value = Kind> {
                 group_first,
             }
         ),
-        (prop_oneof![Just(0u64), Just(25)], age)
+        (prop_oneof![Just(0.0), Just(0.25)], age)
             .prop_map(|(penalty, age)| Kind::BestFit { penalty, age }),
         Just(Kind::Lanes),
     ]
@@ -262,9 +262,7 @@ struct SJob {
 struct Shadow {
     now: f64,
     workers: BTreeMap<WorkerId, WorkerState>,
-    running: BTreeMap<JobId, (WorkerId, u64)>,
-    /// Device demands of jobs placed (looked up for the running ones).
-    devs: BTreeMap<JobId, u64>,
+    running: BTreeMap<JobId, (WorkerId, Resources)>,
     /// Specs of running jobs, and how often each was preempted.
     specs: BTreeMap<JobId, (JobSpec, u32)>,
     waiting: BTreeMap<JobId, SJob>,
@@ -334,24 +332,15 @@ impl Shadow {
     }
 
     /// Running count and placed demand on a worker.
-    fn load(&self, w: WorkerId) -> (usize, u64) {
+    fn load(&self, w: WorkerId) -> (usize, Resources) {
         self.running
             .values()
             .filter(|r| r.0 == w)
-            .fold((0, 0), |(n, m), r| (n + 1, m + r.1))
+            .fold((0, Resources::ZERO), |(n, m), r| (n + 1, m + r.1))
     }
 
-    /// Device demand placed on a worker.
-    fn load_dev(&self, w: WorkerId) -> u64 {
-        self.running
-            .iter()
-            .filter(|r| r.1.0 == w)
-            .map(|r| self.devs.get(r.0).copied().unwrap_or(0))
-            .sum()
-    }
-
-    /// The production rule, written out again: host memory, and device memory unless the
-    /// worker's device capacity is unknown (0), each job counting at least `dev_per_task`.
+    /// The production rule, written out again: in every dimension whose capacity is known
+    /// (nonzero), each job counting at least `per_task`.
     fn admits(&self, demand: Resources, w: WorkerId) -> bool {
         let s = &self.workers[&w];
         let (running, placed) = self.load(w);
@@ -361,12 +350,11 @@ impl Shadow {
         if running == 0 {
             return true;
         }
-        let host =
-            s.reported_used.mem.max(s.reported_baseline.mem + placed) + demand.mem <= s.budget.mem;
-        let per = s.dev_per_task;
-        let dev_used = self.load_dev(w).max(running as u64 * per);
-        let device = s.budget.dev == 0 || dev_used + demand.dev.max(per) <= s.budget.dev;
-        host && device
+        (0..DIMS).all(|d| {
+            let held = placed[d].max(running as u64 * s.per_task[d]);
+            let used = s.reported_used[d].max(s.reported_baseline[d] + held);
+            s.budget[d] == 0 || used + demand[d].max(s.per_task[d]) <= s.budget[d]
+        })
     }
 
     /// The hard constraints (class, avoid list), written out again: a soft avoid list lapses
@@ -388,11 +376,11 @@ impl Shadow {
     fn lane_refuses(&self, demand: u64, w: WorkerId) -> bool {
         let s = &self.workers[&w];
         let (running, placed) = self.load(w);
-        let used = s.reported_used.mem.max(s.reported_baseline.mem + placed);
+        let used = s.reported_used[MEM].max(s.reported_baseline[MEM] + placed[MEM]);
         w == LANE
             && running > 0
             && demand <= LANE_BIG
-            && (s.budget.mem as i64 - used as i64 - demand as i64) < LANE_RESERVE as i64
+            && (s.budget[MEM] as i64 - used as i64 - demand as i64) < LANE_RESERVE as i64
     }
 
     /// Scan order: aged jobs by age, then priority, group arrival, FIFO (or group arrival before
@@ -518,7 +506,7 @@ fn run(kind: &Kind, speed: SpeedConfig, ops: &[Op]) -> Result<Vec<String>, TestC
                     reported_used: Resources::mem(used),
                     reported_baseline: Resources::mem(baseline),
                     speed: class_speed(class),
-                    dev_per_task: per_task,
+                    per_task: Resources::ZERO.with_dev(per_task),
                     ..WorkerState::new(
                         id,
                         format!("c{class}"),
@@ -542,8 +530,7 @@ fn run(kind: &Kind, speed: SpeedConfig, ops: &[Op]) -> Result<Vec<String>, TestC
                         .collect();
                     for j in lost {
                         let (_, demand) = sh.running.remove(&j).unwrap();
-                        let dev = sh.devs.get(&j).copied().unwrap_or(0);
-                        let mut spec = JobSpec::new(j, Resources::mem(demand).with_dev(dev), 0);
+                        let mut spec = JobSpec::new(j, demand, 0);
                         spec.avoid = vec![w];
                         sh.submit(spec, &mut *p);
                     }
@@ -606,7 +593,7 @@ fn run(kind: &Kind, speed: SpeedConfig, ops: &[Op]) -> Result<Vec<String>, TestC
             );
             if matches!(kind, Kind::Lanes) {
                 prop_assert!(
-                    !sh.lane_refuses(job.spec.demand.mem, w),
+                    !sh.lane_refuses(job.spec.demand[MEM], w),
                     "lane reserve broken"
                 );
             }
@@ -625,7 +612,7 @@ fn run(kind: &Kind, speed: SpeedConfig, ops: &[Op]) -> Result<Vec<String>, TestC
                             || !sh.eligible(&a.spec, w)
                             || !sh.admits(a.spec.demand, w)
                             || (matches!(kind, Kind::Lanes)
-                                && sh.lane_refuses(a.spec.demand.mem, w));
+                                && sh.lane_refuses(a.spec.demand[MEM], w));
                         prop_assert!(
                             refused,
                             "{kind:?}: job {j} placed on {w} while more urgent job {} is admitted \
@@ -641,8 +628,7 @@ fn run(kind: &Kind, speed: SpeedConfig, ops: &[Op]) -> Result<Vec<String>, TestC
                 g.backlog = g.backlog.saturating_sub(1);
             }
             sh.waiting.remove(&j);
-            sh.running.insert(j, (w, job.spec.demand.mem));
-            sh.devs.insert(j, job.spec.demand.dev);
+            sh.running.insert(j, (w, job.spec.demand));
             sh.specs.insert(j, (job.spec.clone(), 0));
         }
         let held: BTreeMap<JobId, WorkerId> = after
@@ -678,7 +664,7 @@ fn run(kind: &Kind, speed: SpeedConfig, ops: &[Op]) -> Result<Vec<String>, TestC
                 pr
             );
             prop_assert!(
-                !(matches!(kind, Kind::Lanes) && sh.lane_refuses(spec.demand.mem, pr.to)),
+                !(matches!(kind, Kind::Lanes) && sh.lane_refuses(spec.demand[MEM], pr.to)),
                 "preemption broke the lane reserve: {:?}",
                 pr
             );
@@ -692,7 +678,7 @@ fn run(kind: &Kind, speed: SpeedConfig, ops: &[Op]) -> Result<Vec<String>, TestC
                 !deferred.contains(&j.spec.id)
                     && sh.eligible(&j.spec, pr.to)
                     && sh.admits(j.spec.demand, pr.to)
-                    && !(matches!(kind, Kind::Lanes) && sh.lane_refuses(j.spec.demand.mem, pr.to))
+                    && !(matches!(kind, Kind::Lanes) && sh.lane_refuses(j.spec.demand[MEM], pr.to))
                     && !sh.gated(j, pr.to, gate)
             });
             prop_assert!(
@@ -701,8 +687,7 @@ fn run(kind: &Kind, speed: SpeedConfig, ops: &[Op]) -> Result<Vec<String>, TestC
                 pr.to,
                 wanted.map(|j| j.spec.id)
             );
-            sh.running.insert(pr.job, (pr.to, spec.demand.mem));
-            sh.devs.insert(pr.job, spec.demand.dev);
+            sh.running.insert(pr.job, (pr.to, spec.demand));
             sh.specs.insert(pr.job, (spec, n + 1));
             vacated.insert(pr.from);
         }
@@ -729,13 +714,7 @@ fn run(kind: &Kind, speed: SpeedConfig, ops: &[Op]) -> Result<Vec<String>, TestC
         prop_assert_eq!(after.workers.len(), sh.workers.len());
         for l in &after.workers {
             let (n, m) = sh.load(l.id);
-            prop_assert_eq!((l.running, l.placed.mem), (n, m), "worker {} load", l.id);
-            prop_assert_eq!(
-                l.placed.dev,
-                sh.load_dev(l.id),
-                "worker {} device load",
-                l.id
-            );
+            prop_assert_eq!((l.running, l.placed), (n, m), "worker {} load", l.id);
         }
         let (max_res, per_class) = kind.max_reservations();
         let mut per: BTreeMap<String, usize> = BTreeMap::new();
@@ -781,7 +760,7 @@ fn run(kind: &Kind, speed: SpeedConfig, ops: &[Op]) -> Result<Vec<String>, TestC
     prop_assert!(
         end.workers
             .iter()
-            .all(|l| l.running == 0 && l.placed.mem == 0 && l.reserved_for.is_none())
+            .all(|l| l.running == 0 && l.placed == Resources::ZERO && l.reserved_for.is_none())
     );
     Ok(log)
 }

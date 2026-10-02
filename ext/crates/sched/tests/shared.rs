@@ -299,7 +299,7 @@ proptest! {
         }
         let st = s.stats();
         prop_assert_eq!((st.waiting, st.running), (0, 0));
-        prop_assert!(st.workers.iter().all(|l| l.running == 0 && l.placed.mem == 0));
+        prop_assert!(st.workers.iter().all(|l| l.running == 0 && l.placed == Resources::ZERO));
     }
 }
 

@@ -51,7 +51,7 @@ fn fastest_first_picks_the_fast_worker() {
                 speed,
                 ..BackfillConfig::default()
             },
-            prefer_penalty: 0,
+            prefer_penalty: 0.0,
         })),
     ];
     for mut p in policies {

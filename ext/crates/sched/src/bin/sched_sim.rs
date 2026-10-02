@@ -123,7 +123,7 @@ fn make_policy(name: &str, a: &Args) -> Option<BoxPolicy> {
                 shadow_backfill: true,
                 ..backfill.clone()
             },
-            prefer_penalty: 0,
+            prefer_penalty: 0.0,
         })),
         "backfill-noreserve" => Box::new(PriorityBackfill::new(BackfillConfig {
             max_reservations: 0,
@@ -131,7 +131,7 @@ fn make_policy(name: &str, a: &Args) -> Option<BoxPolicy> {
         })),
         "bestfit" => Box::new(BestFit::new(BestFitConfig {
             backfill,
-            prefer_penalty: 0,
+            prefer_penalty: 0.0,
         })),
         "lanes" => Box::new(Lanes::new(LanesConfig {
             backfill,

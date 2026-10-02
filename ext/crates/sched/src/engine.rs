@@ -6,8 +6,9 @@ use std::{
 };
 
 use crate::{
-    Admission, Instant, JobId, JobSpec, Learn, Policy, PolicyStats, ProductionAdmission,
-    ReservationInfo, Resources, SpeedEstimator, WorkerId, WorkerLoad, WorkerState, WorkerView,
+    Admission, DEV, DIMS, Instant, JobId, JobSpec, Learn, MEM, Policy, PolicyStats,
+    ProductionAdmission, ReservationInfo, Resources, SpeedEstimator, WorkerId, WorkerLoad,
+    WorkerState, WorkerView,
 };
 
 /// Configuration for [`Greedy`].
@@ -185,10 +186,10 @@ impl Default for BackfillConfig {
 pub struct BestFitConfig {
     /// Priority, reservation and backfill parameters.
     pub backfill: BackfillConfig,
-    /// How much a preferred worker ([`JobSpec::prefer`]) is favoured, in bytes of headroom: a
-    /// preferred worker competes as if its headroom after placement were this much smaller. 0
-    /// (the default) makes preference a pure tie-breaker.
-    pub prefer_penalty: u64,
+    /// How much a preferred worker ([`JobSpec::prefer`]) is favoured, as a fraction of capacity:
+    /// a preferred worker competes as if its [free share](WorkerView::free_share) after placement
+    /// were this much smaller. 0 (the default) makes preference a pure tie-breaker.
+    pub prefer_penalty: f64,
 }
 
 /// Which workers are big lanes, for [`Lanes`].
@@ -226,10 +227,10 @@ impl Default for LanesConfig {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 enum Choice {
     LeastLoaded,
-    Tightest { prefer_penalty: u64 },
+    Tightest { prefer_penalty: f64 },
 }
 
 #[derive(Clone, Debug)]
@@ -324,6 +325,21 @@ enum Pick {
     /// Wait for this worker, expected to start there at this time.
     Defer(WorkerId, f64),
     Nothing,
+}
+
+/// Bytes per gigabyte, for `explain`.
+const GB: f64 = 1e9;
+
+/// Each dimension's name in `explain`, indexed by dimension.
+const DIM_NAMES: [&str; DIMS] = ["memory", "device memory"];
+
+/// A resource vector in words for `explain`: its nonzero components in GB, host memory always.
+fn gb_list(r: &Resources) -> String {
+    let mut parts = vec![format!("{:.2} GB", r[MEM] as f64 / GB)];
+    if r[DEV] > 0 {
+        parts.push(format!("{:.2} GB device", r[DEV] as f64 / GB));
+    }
+    parts.join(" + ")
 }
 
 /// A float as a totally ordered integer key (for score tuples).
@@ -467,7 +483,7 @@ impl<A: Admission> Engine<A> {
         self.mode
             .lanes
             .as_ref()
-            .is_some_and(|l| demand.mem > l.big_threshold.mem)
+            .is_some_and(|l| demand[MEM] > l.big_threshold[MEM])
     }
 
     /// Queue a job under its urgency key, recording its group's first arrival.
@@ -739,17 +755,19 @@ impl<A: Admission> Engine<A> {
             ));
         }
         ends.sort_by(|a, b| a.0.total_cmp(&b.0));
+        // The projection assumes a released job frees what it was placed with; the reported
+        // usage cannot be predicted, so the hypothetical worker reports none above its baseline.
+        let state = WorkerState {
+            reported_used: Resources::ZERO,
+            ..w.state.clone()
+        };
         let fits = |running: usize, placed: Resources| {
-            let state = &w.state;
             let view = WorkerView {
-                state,
+                state: &state,
                 running,
                 placed,
             };
-            running < state.slots
-                && (running == 0
-                    || (state.reported_baseline.mem + placed.mem + demand.mem <= state.budget.mem
-                        && view.device_admits(demand.dev)))
+            self.admission.admits(&demand, &view)
         };
         let (mut running, mut placed) = (w.running, w.placed);
         if fits(running, placed) {
@@ -793,7 +811,8 @@ impl<A: Admission> Engine<A> {
             w.lane
                 && w.running > 0
                 && !self.is_big(demand)
-                && w.view().headroom() - (demand.mem as i64) < l.lane_reserve.mem as i64
+                && w.view().headroom()[MEM]
+                    .is_some_and(|h| h - (demand[MEM] as i64) < l.lane_reserve[MEM] as i64)
         })
     }
 
@@ -914,10 +933,9 @@ impl<A: Admission> Engine<A> {
     /// The best worker that takes `job`, or a busy faster worker to wait for, if any.
     fn choose(&self, job: &Waiting, gate: Option<&GateState>, proj: &mut Projection) -> Pick {
         let big = self.is_big(&job.spec.demand);
-        let demand = job.spec.demand.mem as i128;
         let speed_first = self.mode.speed.policy != SpeedPolicy::Oblivious;
         // Smallest tuple wins; the worker id makes the order total (determinism).
-        let mut best: Option<((u8, i64, i128, bool, usize), WorkerId)> = None;
+        let mut best: Option<((u8, i64, i64, bool, usize), WorkerId)> = None;
         for (&id, w) in &self.workers {
             if self.refusal(job, w, gate).is_some() {
                 continue;
@@ -928,8 +946,8 @@ impl<A: Admission> Engine<A> {
             let fit = match self.mode.choice {
                 Choice::LeastLoaded => 0,
                 Choice::Tightest { prefer_penalty } => {
-                    let after = w.view().headroom() as i128 - demand;
-                    after - if preferred { prefer_penalty as i128 } else { 0 }
+                    let after = w.view().free_share(&job.spec.demand);
+                    ordered(after - if preferred { prefer_penalty } else { 0.0 })
                 }
             };
             let score = (lane_rank, speed_key, fit, !preferred, w.running);
@@ -1072,7 +1090,7 @@ impl<A: Admission> Engine<A> {
                 continue;
             }
             let score = (
-                -w.view().headroom(),
+                ordered(-w.view().free_share(&Resources::ZERO)),
                 if speed_first { self.speed_rank(w) } else { 0 },
                 !j.spec.prefer.contains(&id),
                 w.running,
@@ -1374,7 +1392,6 @@ impl<A: Admission> Engine<A> {
             headroom: w.view().headroom(),
             reserved_for: w.reserved_for,
             speed: speed_of(w),
-            dev_headroom: w.view().dev_headroom(),
         }
     }
 
@@ -1405,33 +1422,32 @@ impl<A: Admission> Engine<A> {
 
     /// Classify every worker's reason to refuse the job, and summarise.
     fn explain(&self, job: JobId) -> Option<String> {
-        const GB: f64 = 1e9;
         if let Some(r) = self.running.get(&job) {
             return Some(format!("job {job} is running on worker {}", r.worker));
         }
         let j = self.waiting.get(&job)?;
         let ahead = self.queue.range(..j.key).count();
         let mut msg = format!(
-            "job {job} (demand {:.2} GB, group {}) waiting {:.0}s, {ahead} more urgent job(s) \
-             waiting",
-            j.spec.demand.mem as f64 / GB,
+            "job {job} (demand {}, group {}) waiting {:.0}s, {ahead} more urgent job(s) waiting",
+            gb_list(&j.spec.demand),
             j.spec.group,
             self.now - j.since
         );
         if let Some(w) = j.reserved {
             let w = &self.workers[&w];
             msg += &format!(
-                "; holds the reservation on worker {} (draining: {}/{} running, headroom {:.2} GB)",
+                "; holds the reservation on worker {} (draining: {}/{} running, used {})",
                 w.state.id,
                 w.running,
                 w.state.slots,
-                w.view().headroom() as f64 / GB
+                gb_list(&w.view().used())
             );
         }
         let gate = self.gate_state();
-        let (mut full, mut short, mut lane, mut excluded, mut slow) = (0, 0, 0, 0, 0);
-        let mut dev_short = 0;
-        let mut best_short: Option<(i64, WorkerId)> = None;
+        let (mut full, mut lane, mut excluded, mut slow) = (0, 0, 0, 0);
+        // Per dimension: workers short of it, and the one with the most headroom there.
+        let mut short = [0usize; DIMS];
+        let mut best_short: [Option<(i64, WorkerId)>; DIMS] = [None; DIMS];
         let mut reserved = Vec::new();
         let mut takers = Vec::new();
         for (&id, w) in &self.workers {
@@ -1442,14 +1458,15 @@ impl<A: Admission> Engine<A> {
                 Some(Refusal::ReservedFor(h)) => reserved.push(format!("worker {id} for job {h}")),
                 Some(Refusal::Lane) => lane += 1,
                 Some(Refusal::Admission) if w.running >= w.state.slots => full += 1,
-                Some(Refusal::Admission) if !w.view().device_admits(j.spec.demand.dev) => {
-                    dev_short += 1
-                }
                 Some(Refusal::Admission) => {
-                    short += 1;
-                    let h = w.view().headroom();
-                    if best_short.is_none_or(|(b, _)| h > b) {
-                        best_short = Some((h, id));
+                    let view = w.view();
+                    let headroom = view.headroom();
+                    for d in view.short(&j.spec.demand) {
+                        short[d] += 1;
+                        let h = headroom[d].unwrap_or(i64::MAX);
+                        if best_short[d].is_none_or(|(b, _)| h > b) {
+                            best_short[d] = Some((h, id));
+                        }
                     }
                 }
             }
@@ -1460,14 +1477,15 @@ impl<A: Admission> Engine<A> {
         if full > 0 {
             msg += &format!("; slots full on {full} worker(s)");
         }
-        if let Some((h, w)) = best_short {
-            msg += &format!(
-                "; memory short on {short} worker(s) (best headroom {:.2} GB on worker {w})",
-                h as f64 / GB
-            );
-        }
-        if dev_short > 0 {
-            msg += &format!("; device memory short on {dev_short} worker(s)");
+        for d in 0..DIMS {
+            if let Some((h, w)) = best_short[d] {
+                msg += &format!(
+                    "; {} short on {} worker(s) (best headroom {:.2} GB on worker {w})",
+                    DIM_NAMES[d],
+                    short[d],
+                    h as f64 / GB
+                );
+            }
         }
         if lane > 0 {
             msg += &format!("; {lane} big lane(s) keep their reserve headroom");
@@ -1643,7 +1661,9 @@ policy!(
         group_first: c.backfill.group_first,
         speed: c.backfill.speed,
         reservations: Some(c.backfill),
-        choice: Choice::Tightest { prefer_penalty: c.prefer_penalty },
+        choice: Choice::Tightest {
+            prefer_penalty: c.prefer_penalty
+        },
         lanes: None,
     }
 );
@@ -1661,7 +1681,9 @@ policy!(
         group_first: c.backfill.group_first,
         speed: c.backfill.speed,
         reservations: Some(c.backfill.clone()),
-        choice: Choice::Tightest { prefer_penalty: 0 },
+        choice: Choice::Tightest {
+            prefer_penalty: 0.0
+        },
         lanes: Some(c),
     }
 );
@@ -1766,7 +1788,7 @@ mod tests {
         let on_lane = out.iter().filter(|(_, w)| *w == 1).count();
         let lane = p.stats().workers.into_iter().find(|w| w.id == 1).unwrap();
         assert_eq!(on_lane, 9);
-        assert_eq!(lane.headroom, 32 * GB as i64);
+        assert_eq!(lane.headroom[MEM], Some(32 * GB as i64));
         // A big job goes to the lane.
         p.submit(job(100, 20, 0), 0.0);
         assert_eq!(p.dispatch(0.0), vec![(100, 1)]);

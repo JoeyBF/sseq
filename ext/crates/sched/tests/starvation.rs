@@ -95,7 +95,7 @@ fn policies() -> Vec<(&'static str, Box<dyn Policy>)> {
             "bestfit",
             Box::new(BestFit::new(BestFitConfig {
                 backfill: bf.clone(),
-                prefer_penalty: 0,
+                prefer_penalty: 0.0,
             })),
         ),
         (

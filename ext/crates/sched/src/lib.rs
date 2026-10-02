@@ -24,6 +24,8 @@ pub use engine::{
     GroupOrder, LaneSet, Lanes, LanesConfig, PriorityBackfill, SlowGate, SpeedConfig, SpeedPolicy,
     Spoliation,
 };
+#[cfg(feature = "serde")]
+use serde::{Deserialize, Serialize};
 pub use shared::{Attempt, FailKind, FailOutcome, Lease, Placement, RetryConfig, SharedPolicy};
 pub use speed::{Learn, Sharing, SpeedEstimator};
 
@@ -37,21 +39,21 @@ pub type WorkerId = u64;
 /// caller should pass non-decreasing values.
 pub type Instant = f64;
 
-/// An additive resource vector: host memory and device memory.
+/// Number of resource dimensions in a [`Resources`] vector.
+pub const DIMS: usize = 2;
+/// The host-memory dimension of a [`Resources`] vector, in bytes.
+pub const MEM: usize = 0;
+/// The device-memory dimension of a [`Resources`] vector, in bytes.
+pub const DEV: usize = 1;
+
+/// An additive resource vector, one component per dimension ([`MEM`], [`DEV`]).
 ///
 /// Comparisons between vectors are component-wise ([`Resources::fits_within`]). As a capacity
-/// ([`WorkerState::budget`]), a zero `dev` means the worker's device capacity is unknown and is not
-/// enforced (see [`ProductionAdmission`]); as a demand, a zero `dev` means none.
+/// ([`WorkerState::budget`]), a zero component means that dimension's capacity is unknown and is
+/// not enforced (see [`ProductionAdmission`]); as a demand, a zero component means none.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-#[non_exhaustive]
-pub struct Resources {
-    /// Host memory, in bytes.
-    pub mem: u64,
-    /// Device (GPU) memory, in bytes.
-    #[cfg_attr(feature = "serde", serde(default))]
-    pub dev: u64,
-}
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub struct Resources(pub [u64; DIMS]);
 
 /// Bytes in a gigabyte (10^9), rounding to the nearest byte.
 fn gb_bytes(gb: f64) -> u64 {
@@ -60,16 +62,15 @@ fn gb_bytes(gb: f64) -> u64 {
 
 impl Resources {
     /// The largest representable vector (an "unbounded" capacity).
-    pub const MAX: Self = Self {
-        mem: u64::MAX,
-        dev: u64::MAX,
-    };
+    pub const MAX: Self = Self([u64::MAX; DIMS]);
     /// No resources.
-    pub const ZERO: Self = Self { mem: 0, dev: 0 };
+    pub const ZERO: Self = Self([0; DIMS]);
 
     /// A vector with `bytes` of host memory and nothing else.
     pub const fn mem(bytes: u64) -> Self {
-        Self { mem: bytes, dev: 0 }
+        let mut r = Self::ZERO;
+        r.0[MEM] = bytes;
+        r
     }
 
     /// A vector with `gb` gigabytes (10^9 bytes) of host memory, rounded to the nearest byte.
@@ -78,8 +79,9 @@ impl Resources {
     }
 
     /// This vector with `bytes` of device memory.
-    pub const fn with_dev(self, bytes: u64) -> Self {
-        Self { dev: bytes, ..self }
+    pub const fn with_dev(mut self, bytes: u64) -> Self {
+        self.0[DEV] = bytes;
+        self
     }
 
     /// This vector with `gb` gigabytes of device memory.
@@ -88,32 +90,49 @@ impl Resources {
     }
 
     /// Whether every component of `self` is at most the matching component of `cap`.
-    pub const fn fits_within(&self, cap: &Self) -> bool {
-        self.mem <= cap.mem && self.dev <= cap.dev
+    pub fn fits_within(&self, cap: &Self) -> bool {
+        (0..DIMS).all(|d| self[d] <= cap[d])
+    }
+
+    /// The vector `f(self[d], other[d])` for every dimension `d`.
+    fn zip(self, other: Self, f: impl Fn(u64, u64) -> u64) -> Self {
+        Self(std::array::from_fn(|d| f(self[d], other[d])))
     }
 
     /// Component-wise maximum.
     pub fn max(self, other: Self) -> Self {
-        Self {
-            mem: self.mem.max(other.mem),
-            dev: self.dev.max(other.dev),
-        }
+        self.zip(other, u64::max)
     }
 
     /// Component-wise saturating addition.
-    pub const fn saturating_add(self, other: Self) -> Self {
-        Self {
-            mem: self.mem.saturating_add(other.mem),
-            dev: self.dev.saturating_add(other.dev),
-        }
+    pub fn saturating_add(self, other: Self) -> Self {
+        self.zip(other, u64::saturating_add)
     }
 
     /// Component-wise saturating subtraction.
-    pub const fn saturating_sub(self, other: Self) -> Self {
-        Self {
-            mem: self.mem.saturating_sub(other.mem),
-            dev: self.dev.saturating_sub(other.dev),
-        }
+    pub fn saturating_sub(self, other: Self) -> Self {
+        self.zip(other, u64::saturating_sub)
+    }
+
+    /// Every component multiplied by `n`, saturating.
+    pub fn saturating_mul(self, n: u64) -> Self {
+        Self(self.0.map(|x| x.saturating_mul(n)))
+    }
+}
+
+impl std::ops::Index<usize> for Resources {
+    type Output = u64;
+
+    /// The component of dimension `d` ([`MEM`], [`DEV`]).
+    fn index(&self, d: usize) -> &u64 {
+        &self.0[d]
+    }
+}
+
+impl std::ops::IndexMut<usize> for Resources {
+    /// The component of dimension `d` ([`MEM`], [`DEV`]).
+    fn index_mut(&mut self, d: usize) -> &mut u64 {
+        &mut self.0[d]
     }
 }
 
@@ -151,7 +170,7 @@ impl std::ops::SubAssign for Resources {
 
 /// A job, as submitted to a [`Policy`].
 #[derive(Clone, Debug, PartialEq)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct JobSpec {
     /// The job's id.
     pub id: JobId,
@@ -202,22 +221,23 @@ impl JobSpec {
 
 /// A worker's declared capacity and last reported usage.
 #[derive(Clone, Debug, PartialEq)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct WorkerState {
     /// The worker's id.
     pub id: WorkerId,
-    /// The worker's class (e.g. GPU type), used by per-class reservations and lanes.
+    /// The worker's class (e.g. GPU type), used by class pins ([`JobSpec::class`]) and per-class
+    /// reservations.
     pub class: String,
     /// Maximum number of concurrent jobs.
     pub slots: usize,
-    /// Capacity: host memory, and device memory (the pool jobs' device allocations come from;
-    /// 0 = unknown, not enforced).
+    /// Capacity: host memory, and device memory (the pool jobs' device allocations come from). A
+    /// zero component is unknown and not enforced.
     pub budget: Resources,
-    /// Device memory one job of this worker is expected to take, learned by the worker (e.g. a
-    /// high percentile of recent launch requests); 0 = unknown. Each job counts for at least this
-    /// much against `budget.dev`, whatever its own [`JobSpec::demand`] says.
+    /// What one job of this worker is expected to take at least, learned by the worker (e.g. the
+    /// typical device launch request); zero components are unknown. Each job counts for at least
+    /// this much against `budget` in every dimension, whatever its own [`JobSpec::demand`] says.
     #[cfg_attr(feature = "serde", serde(default))]
-    pub dev_per_task: u64,
+    pub per_task: Resources,
     /// Last reported resident usage (from a heartbeat; may lag by seconds).
     pub reported_used: Resources,
     /// The part of `reported_used` not attributable to jobs (caches, runtime).
@@ -246,7 +266,7 @@ impl WorkerState {
             reported_used: Resources::ZERO,
             reported_baseline: Resources::ZERO,
             speed: 1.0,
-            dev_per_task: 0,
+            per_task: Resources::ZERO,
         }
     }
 }
@@ -275,16 +295,13 @@ pub struct WorkerLoad {
     pub running: usize,
     /// Sum of the demands of those jobs.
     pub placed: Resources,
-    /// Memory headroom as admission sees it: `budget - max(reported_used, baseline + placed)`, in
-    /// bytes (negative when over-committed, which the escape hatch allows).
-    pub headroom: i64,
+    /// Headroom per dimension as admission sees it ([`WorkerView::headroom`]); `None` where the
+    /// capacity is unknown.
+    pub headroom: [Option<i64>; DIMS],
     /// The job this worker is reserved for, if any.
     pub reserved_for: Option<JobId>,
     /// Its speed.
     pub speed: f64,
-    /// Device memory headroom as admission sees it (see [`WorkerView::dev_headroom`]); `None`
-    /// when the device capacity is unknown.
-    pub dev_headroom: Option<i64>,
 }
 
 /// A snapshot of a policy's state, for logs and metrics.
