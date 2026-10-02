@@ -102,6 +102,17 @@ fn make_policy(name: &str, a: &Args) -> Option<BoxPolicy> {
     Some(match name {
         "greedy" => Box::new(Greedy::new(GreedyConfig::default())),
         "backfill" => Box::new(PriorityBackfill::new(backfill)),
+        "backfill-shadow" => Box::new(PriorityBackfill::new(BackfillConfig {
+            shadow_backfill: true,
+            ..backfill.clone()
+        })),
+        "bestfit-shadow" => Box::new(BestFit::new(BestFitConfig {
+            backfill: BackfillConfig {
+                shadow_backfill: true,
+                ..backfill.clone()
+            },
+            prefer_penalty: 0,
+        })),
         "backfill-noreserve" => Box::new(PriorityBackfill::new(BackfillConfig {
             max_reservations: 0,
             ..backfill

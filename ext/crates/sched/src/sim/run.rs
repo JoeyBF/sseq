@@ -242,9 +242,11 @@ impl Driver {
 }
 
 /// The job submitted for task `j`: its estimate as demand, its bidegree as group.
-fn spec(trace: &Trace, j: usize) -> JobSpec {
+fn spec(trace: &Trace, work: &[f64], j: usize) -> JobSpec {
     let t = &trace.tasks[j];
-    JobSpec::new(j as u64, Resources::mem_gb(t.est_gb), t.group)
+    let mut s = JobSpec::new(j as u64, Resources::mem_gb(t.est_gb), t.group);
+    s.work = Some(work[j]);
+    s
 }
 
 /// The closed-loop dependency lists (as task indices) and gaps.
@@ -343,7 +345,7 @@ pub fn simulate(setup: &SimSetup, name: &str, policy: BoxPolicy) -> Metrics {
                 .into_iter()
                 .enumerate()
                 .map(|(j, d)| DagJob {
-                    spec: spec(trace, j),
+                    spec: spec(trace, setup.work, j),
                     deps: d.into_iter().map(|x| x as u64).collect(),
                     work_estimate: Some(setup.work[j]),
                     passthrough: false,
@@ -412,6 +414,7 @@ pub fn simulate(setup: &SimSetup, name: &str, policy: BoxPolicy) -> Metrics {
         WorkerState {
             reported_used: Resources::mem_gb(rss),
             reported_baseline: Resources::mem_gb(baseline),
+            speed: setup.model.throughput(&tw.class, 1),
             ..WorkerState::new(
                 w as u64,
                 tw.class.clone(),
@@ -446,7 +449,7 @@ pub fn simulate(setup: &SimSetup, name: &str, policy: BoxPolicy) -> Metrics {
             Ev::Arrive(j) => {
                 arrival[j] = t;
                 match &mut driver {
-                    Driver::Open(p) => p.submit(spec(trace, j), t),
+                    Driver::Open(p) => p.submit(spec(trace, setup.work, j), t),
                     Driver::Closed(d) => {
                         d.release(j as u64, t);
                     }
