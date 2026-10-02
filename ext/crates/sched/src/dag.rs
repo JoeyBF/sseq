@@ -125,6 +125,11 @@ impl DagTemplate {
         self.succ.iter().map(Vec::len).sum()
     }
 
+    /// The nodes in a topological order (every node after all its predecessors).
+    pub fn topological_order(&self) -> &[u32] {
+        &self.topo
+    }
+
     /// The nodes depending directly on `node`.
     pub fn successors(&self, node: usize) -> &[u32] {
         &self.succ[node]
@@ -180,6 +185,35 @@ impl DagTemplate {
             reach[v * words..(v + 1) * words].copy_from_slice(&acc);
         }
         DagTemplate::new(n, edges).expect("a sub-DAG of a DAG is acyclic")
+    }
+
+    /// Nodes on a longest chain of `work` (CPOP's critical nodes): those whose longest path
+    /// from a source plus longest path to a sink equals the critical path, within a relative
+    /// tolerance `tol`.
+    pub fn critical_nodes(&self, work: impl Fn(usize) -> f64, tol: f64) -> Vec<bool> {
+        let n = self.len();
+        let w: Vec<f64> = (0..n).map(&work).collect();
+        let mut below = vec![0.0f64; n];
+        for &v in self.topo.iter().rev() {
+            let v = v as usize;
+            let tail = self.succ[v]
+                .iter()
+                .map(|&c| below[c as usize])
+                .fold(0.0, f64::max);
+            below[v] = w[v] + tail;
+        }
+        let mut above = vec![0.0f64; n]; // longest path ending just before v
+        for &v in &self.topo {
+            let v = v as usize;
+            above[v] = self.pred[v]
+                .iter()
+                .map(|&p| above[p as usize] + w[p as usize])
+                .fold(0.0, f64::max);
+        }
+        let cp = below.iter().copied().fold(0.0, f64::max);
+        (0..n)
+            .map(|v| cp > 0.0 && above[v] + below[v] >= cp * (1.0 - tol))
+            .collect()
     }
 
     /// The longest chain of `work` through the template: a group's duration with unlimited
