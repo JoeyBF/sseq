@@ -124,7 +124,9 @@ impl<P: Policy> DagScheduler<P> {
             .index
             .get(&spec.done)
             .map_or(0.0, |&d| self.graph[d].rank);
-        if let Some(&e) = self.index.get(&spec.entry) {
+        if self.config.track_ranks
+            && let Some(&e) = self.index.get(&spec.entry)
+        {
             let below = cp + done_rank;
             if below > self.graph[e].implicit_below {
                 self.graph[e].implicit_below = below;

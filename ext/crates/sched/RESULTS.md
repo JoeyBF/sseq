@@ -150,8 +150,9 @@ stable.
 
 The stem-400 resolution as one DAG, built before any computation. Reproduce with
 `sched-whole --trace <trace> --census <csv>... --max-n 400 --max-s 202 --max-profile-len 5
---plans today,group,rank,rank-oracle,today+fast,group+fast,rank+fast,rank-oracle+fast`. Each plan
-simulates in about 8 minutes.
+--plans today,today+fast,group,group+fast,group+eft,rank+eft --noise-seed N`. Each plan
+simulates in about 5 minutes (rank plans and waiting plans longer). Raw results:
+`/rs/rs_grp_csht/resolutions/sphere_gpu_n400/full_seed{1,2,3}.json`.
 
 ## The DAG
 
@@ -186,46 +187,53 @@ simulates in about 8 minutes.
 
 ## Bounds and plans
 
-- **Lower bounds:**
-  - W/P (total work over total throughput) = **770 h**.
-  - D (critical path at the fastest single-job speed, unlimited workers) = **883 h**.
-  - The run is **span-bound**.
-- **Greedy guarantee:** any greedy schedule (Graham/Brent) finishes within W/P + D = 1,653 h. That
-  holds on identical machines; with mixed speeds it needs the critical tasks on fast machines.
+Corrected results (the first version of this table was produced by a simulator that dispatched
+after every individual event; see "Simulator artefacts" below). Lower bounds per noise seed:
+critical path 817-877 h, capacity (W/P) 772-776 h, so the run is **span-bound**. Any greedy
+schedule finishes within W/P + D (Graham/Brent) on identical machines; on mixed speeds that needs
+the critical tasks on fast machines.
 
-| plan | makespan | × max(W/P, D) | slot util | bidegree latency p90 | max |
-|---|---|---|---|---|---|
-| **today**: ≤ 24 open bidegrees, ≤ 32 walk tasks each, oldest first, speed-oblivious | 2,124 h | 2.40 | 36.5% | 13.5 h | 102 h |
-| group order (oldest bidegree first), uncapped | 1,683 h | 1.91 | 46.0% | 5.7 h | 127 h |
-| DAG rank, estimated costs, aging 1 h | 1,772 h | 2.01 | 43.8% | 5.0 h | 99 h |
-| DAG rank, oracle costs, aging 1 h | 1,724 h | 1.95 | 44.9% | 5.0 h | 111 h |
-| DAG rank, estimated costs, no aging | 1,909 h | 2.16 | 40.7% | 0.7 h | 348 h |
-| today, **fast first** | 1,466 h | 1.66 | 44.3% | 9.7 h | 83 h |
-| **group order, uncapped, fast first** | **1,237 h** | **1.40** | 59.5% | 7.3 h | 111 h |
-| DAG rank, estimated costs, no aging, fast first | 1,322 h | 1.50 | 55.5% | 0.6 h | 227 h |
-| DAG rank, oracle costs, no aging, fast first | 1,334 h | 1.51 | 55.1% | 0.6 h | 349 h |
+**The two levers** (noise seed 1, bound 869 h):
 
-"Fast first" means every job prefers the fastest class's workers, and slower workers take the
-overflow. `dispatch` stays at microseconds on average and at most about 1 ms, with up to 490k
-live DAG nodes.
+| plan | makespan | x bound | slot util | bidegree latency p90 / max |
+|---|---|---|---|---|
+| **today**: <= 24 open bidegrees, <= 32 walk tasks each, oldest first, speed-oblivious | 2,060 h | 2.37 | 37.9% | 13.5 h / 111 h |
+| today + fast first | 1,482 h | 1.71 | 44.3% | 10.4 h / 75 h |
+| oldest first, uncapped, speed-oblivious | 1,628 h | 1.87 | 48.0% | 5.9 h / 88 h |
+| **oldest first, uncapped, fast first** | **1,249 h** | **1.44** | 59.4% | 5.0 h / 96 h |
 
-## What the gain is made of
+- **Speed-aware placement: -23% to -28%.** In a span-bound run a critical task on a 2.4x slower
+  worker extends the run directly.
+- **Removing the caps: -16% to -21%.** Today's coordinator is not greedy: it idles slots while
+  ready work waits behind the open-bidegree and walk-thread caps. Uncapped, about 260 bidegrees are
+  open at the peak, with about 470k live DAG nodes.
+- **Combined: 1.65x faster than today** (2,060 h -> 1,249 h), at 1.44x the lower bound.
 
-1. **Speed-aware placement: −27% to −31%,** whatever the order. In a span-bound run, a
-   critical-path task on a 2.4× slower worker extends the run directly. This is the "earliest
-   finish time" half of HEFT, here in its crudest form: prefer the fast class.
-2. **Removing the caps: −16% to −21%.** Today's coordinator is not greedy: it idles slots while
-   ready work waits behind the open-bidegree and walk-thread caps. Uncapped, the peak is about
-   280 open bidegrees but only about 490k live DAG nodes, which is cheap.
-3. **Ordering: rank priority does not beat oldest-bidegree-first.** It is 4–7% worse, even with
-   oracle costs and fast-first, and much worse without aging (a 348 h worst bidegree).
-   - On this grid-shaped DAG, "oldest ready first" already advances the wavefront along the long
-     rows.
-   - Upward rank, frozen at submission and approximated (1% epsilon), lets low-rank work fall
-     behind until it becomes critical itself.
-   - This is the open question for the literature search.
-4. **Combined: group order + uncapped + fast first is 1.72× faster than today** (2,124 h →
-   1,237 h), at 1.40× the lower bound.
+**Refinements** (mean of 3 noise seeds, all uncapped; relative to oldest first + fast first on
+the same seed):
+
+| plan | makespan | vs oldest first + fast first | bidegree latency p90 / max | dispatch mean / max |
+|---|---|---|---|---|
+| oldest first, fast first | 1,226 h (1.44x) | -- | 4.3 h / 91 h | 1 us / 0.05 ms |
+| oldest first, earliest finish with waiting | 1,212 h | -1.2% (-2.3 .. +0.3) | **1.6 h / 69 h** | 82 us / 5.9 ms |
+| oldest first, fast first, slow gate | 1,218 h | -0.6% (-2.0 .. +0.4) | 7.1 h / 77 h | 64 us / 5.4 ms |
+| oldest first, rank within, earliest finish | 1,216 h | -0.8% (-2.4 .. +0.5) | 1.6 h / 79 h | 76 us / 4.6 ms |
+| DAG rank (true costs), fast first | 1,268 h | **+3.4%** (+3.2 .. +3.8) | 5.0 h / 76 h | 1 us / 13 ms |
+| DAG rank (true costs), earliest finish | 1,276 h | **+4.1%** (+2.1 .. +5.8) | 5.0 h / 76 h | 54 us / 20 ms |
+| DAG rank (estimated costs), earliest finish | 1,276 h | **+4.1%** (+2.5 .. +5.4) | 5.0 h / 69 h | 37 us / 5.7 ms |
+
+- **At full scale, oldest-bidegree-first is the right order.** Critical-path rank priority loses
+  3-4% on every seed, even with true costs and with the dispatch artefact fixed. It wins on small,
+  heavily contended replicas (below), which do not represent the production regime.
+- **Waiting for a fast slot** buys about 1% of makespan here but cuts bidegree latency p90 from
+  4.3 h to 1.6 h and the worst bidegree from 91 h to 69 h, for a few tens of microseconds per
+  dispatch.
+- All online plans stay at 1.42-1.49x the bound. On a 3.5k-task region, static HEFT with true
+  costs reaches the critical-path bound (see the cross-validation section): the remaining gap is
+  what full lookahead would buy, not what a better online ordering could.
+- Comparisons between builds of the simulator differ by up to about 1% for the same plan and seed
+  (the release order of simultaneous jobs), the same tie-break noise as between plans on one
+  instance; differences of that size are not conclusions.
 
 ## Caveats
 
@@ -241,3 +249,89 @@ live DAG nodes.
   bidegree, both read off the trace. Coordinator-local work, registration and log replay are
   zero-time.
 - **The fleet is fixed:** no joins, leaves or failures.
+
+
+## Cross-validation against dslab-dag
+
+`sched-whole --export-dslab DIR` writes a region as dslab-dag input (one resource per worker,
+speeds `10 x` single-job throughput, flops `10 x` work, zero-size data, both passthroughs of a
+bidegree merged into one 1e-6-flop join, topological task order). On the n <= 60, s <= 12 region
+(3,466 tasks), with `--linear-ps` (exclusive-core-equivalent throughput):
+
+| check | ours | dslab-dag |
+|---|---|---|
+| G1: unlimited capacity (one L40S, 100,000 cores) | 25.389159 s, every plan, = critical path | 25.39 s, every scheduler |
+| G2: one worker, one slot | 225.1285 s, every plan, = total work / speed | 225.13 s, all 46 configurations |
+| C1: 2 L40S + 1 H200, 4 slots each: rank + fastest worker | 30.157 s (exact ranks) | 30.01 s (`DynamicList[BottomLevel, Speed]`) |
+| C1: oldest-first + fast first / dslab FIFO + speed | 29.695 s | 32.89 s (`Simple`, id order) |
+| C1: speed-oblivious | 37.810 s (oldest first, least loaded) | 37.15 s (`DynamicList[BottomLevel, MaxAvailableCores]`) |
+| C1: static, full knowledge | -- | 25.39 s (HEFT, DLS, Lookahead[0]) = the critical path |
+
+The two exact checks validate the DAG, the costs and the bounds. The dynamic plans agree within a
+few percent where their semantics match (these C1 numbers predate the dispatch fix below). Static
+HEFT with true costs reaching the critical path on this instance shows what full lookahead buys:
+about 15% over any online rule.
+
+## Simulator artefacts found and fixed
+
+1. **Per-event dispatch.** `sched-whole` dispatched after every single event, including the burst
+   of same-instant releases when one completion readies many jobs, so whichever job happened to
+   be released first took the free slots, whatever its priority. All events of an instant are now
+   applied before dispatching (as a coordinator draining its queue would). With it fixed, the
+   small driver and `sched-whole` agree. It did not change the full-scale verdict: rank priority
+   still loses 3-4% to oldest-first there (see "Bounds and plans").
+2. **Makespan included stale wakeups.** Deferral deadlines that fired after the last completion
+   moved "now" forward; makespan is now the last completion. Regression test added.
+3. **`--linear-ps` capped linear throughput at the trace's 16 slots**, which slowed every job on
+   a 100,000-core worker. Linear means uncapped now.
+4. **Rank maintenance made non-rank plans slow.** With exact rank propagation every bidegree
+   opening pushed rank updates up the whole grid, even for plans that never read ranks (5,300 s
+   per plan instead of 300 s). `DagConfig::track_ranks` turns rank maintenance off.
+5. **Tie-breaks matter at the ±5% level on any single instance.** The small driver and
+   `sched-whole` agree exactly once they break ties between simultaneously ready bidegrees the same
+   way (s-major ids), and differ by 2-6% otherwise. Single-instance comparisons below that
+   resolution are noise (Graham's anomalies); the conclusions below use many perturbed instances
+   with common random numbers, and several noise seeds for the whole run.
+
+## Ordering and placement, over many instances (`sched-pisa`)
+
+`sched-pisa` simulates small instances through the real `DagScheduler` and engine: mini-Nassau
+grids with random parameters, or replicas of the real world's first bidegrees (n <= 60, s <= 12,
+3,466 tasks, 2 L40S + 1 H200 x 4 slots) with 20 random multiplicative perturbations of work,
+estimates and whole rows/columns per sample. Each sample runs both plans on the same instance.
+
+| A vs B | instances | mean ln(A/B) | A better in |
+|---|---|---|---|
+| oldest-first + fast first vs oldest-first, speed-oblivious | 200 replicas | -10.5% | 92% |
+| rank (true costs) + fast first vs oldest-first + fast first | 500 grids | -6.9% | 68% (worse in 7%) |
+| rank (true costs) + fast first vs oldest-first + fast first | 200 replicas | -4.2% | 74% |
+| rank (estimated costs) + fast first vs oldest-first + fast first | 200 replicas | +0.8% | 41% |
+| oldest-first, rank within (true costs) vs oldest-first, both fast first | 200 replicas | -1.9% | 61% |
+| slow gate vs fast first (oldest-first) | 200 replicas | -1.9% | 64% |
+| earliest finish, wait for >= 25% gain, vs fast first (oldest-first) | 500 grids / 150 replicas | -9.1% / -8.0% | 63% (worse 6%) / 96% |
+| **rank (estimated costs) + earliest finish (>= 25% gain) vs oldest-first + fast first** | 150 replicas | **-14.4%** | **100%** |
+| rank (true costs) + earliest finish (>= 25% gain) vs oldest-first + fast first | 150 replicas | -17.9% | 100% |
+
+- **Rank priority alone is fragile:** with true costs it helps (4-7%), with realistic estimate
+  error (sd 0.6) it does not. Annealing finds instances where rank + fast-first is 1.41x worse than
+  oldest-first: rank fills the fast slots with high-rank work, and the job that turns out critical
+  lands on a slow worker and stays there (63% of the realised critical chain on slow workers,
+  against 0% for oldest-first).
+- **Waiting for a fast slot fixes exactly that**, and is a large, consistent win: 7-9% with
+  oldest-first, 14-18% with rank, which only pays together with it. Annealing also finds where
+  waiting backfires (1.42x): a fast class barely faster than the slow one and holding a small share
+  of capacity, where urgent jobs queue for scarce fast slots. A minimum gain of 25% halves those
+  cases at no cost on average, hence `Defer::default()` (25%, at most an hour).
+- **The slow gate** helps a little (2%) and costs nothing on average.
+- **These small-instance results do not all transfer to the full run** (next section): there,
+  rank priority loses 3-4% and waiting gains about 1% in makespan. The small replicas (3 workers,
+  heavy contention throughout) exaggerate exactly the effects that ordering and waiting act on.
+
+## Implicit template instances
+
+`DagScheduler::open_instance` keeps a walk as dense counters over its shared template (PaRSEC's
+parameterised task graphs): 2 B counter + 8 B work + 1 bit per node, against an explicit node,
+its edges and its `JobSpec`. Readiness, entry ranks and snapshots are property-tested against
+the explicit layer, and `sched-whole` gives bit-identical makespans with `--explicit` and with
+instances (default) on every plan tried. `DagConfig::max_open_instances` is a frontier budget in
+open walks.
