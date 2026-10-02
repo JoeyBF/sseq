@@ -145,3 +145,99 @@ stable.
 - Closed loop uses each job's measured gap after its dependencies and oracle work estimates for
   ranks (the fitted `W`). Production's ranks would use estimates.
 - Lookahead reservation (spec §4b, optional) is not implemented.
+
+# Whole run, built a priori (`sched-whole`)
+
+The stem-400 resolution as one DAG, built before any computation. Reproduce with
+`sched-whole --trace <trace> --census <csv>... --max-n 400 --max-s 202 --max-profile-len 5
+--plans today,group,rank,rank-oracle,today+fast,group+fast,rank+fast,rank-oracle+fast`. Each plan
+simulates in about 8 minutes.
+
+## The DAG
+
+- **Bidegrees:** 81,403 (n ≤ 400, s ≤ 202).
+  - **Edges:** `ext::nassau`'s `depgraph`:
+    - `Register(s, t − floor) → Compute(s, t)`;
+    - `Register(s−1, t−1) → Compute(s, t)`;
+    - `Register(0, t) → Compute(1, t)`;
+    - `Register(s, t−1) → Register(s, t)`.
+  - **Subalgebra:** `optimal_for`'s rule, which reproduces 99.6% of 81,511 census rows at the
+    production cap.
+- **Walks:** each live bidegree (one with generators; 30,677 of them) expands its profile's
+  signature DAG.
+  - **Edges:** `sig_dag::direct`, which closes to the verified 938 (A(2)) and 137,081 (A(3))
+    edges.
+  - **Size:** transitively reduced, A(3)'s 51,859 direct edges shrink to its 4,028 covers and
+    A(4)'s 11.5M to 195,579.
+  - **Rows 0 and 1** run `step0`/`step1`, so they have no walk.
+- **Tasks:** 3.93M signature tasks and 81k zero steps. Work is 495k H200-hours of signatures and
+  2.4k of zero steps.
+- **Costs** (H200-seconds):
+  - **Scale across bidegrees** comes from the census, where 61k of the 81k bidegrees were
+    measured: `ln wall ~ 0.55 ln tmd + 0.50 ln nd + 0.87 ln(signatures+1)`, R² 0.80, with a
+    per-file effect.
+  - **Level** is calibrated on the trace's 150 bidegrees, with per-bidegree spread sd 0.31.
+  - **Zero step:** 0.5% of a bidegree's work.
+  - **Signature split:** the rest goes to signatures with weight `deg^-0.59 · tmd(t − deg)^-0.16`
+    (within-bidegree fit on 74,743 tasks, per-signature sd 0.60).
+  - **"True" costs** are the estimates times seeded log-normal noise with those spreads.
+- **Fleet:** the trace's 7 H200 and 14 L40S worker processes, 16 slots each. Throughput is linear
+  in concurrency, as fitted, and an L40S runs a job 2.41× faster.
+
+## Bounds and plans
+
+- **Lower bounds:**
+  - W/P (total work over total throughput) = **770 h**.
+  - D (critical path at the fastest single-job speed, unlimited workers) = **883 h**.
+  - The run is **span-bound**.
+- **Greedy guarantee:** any greedy schedule (Graham/Brent) finishes within W/P + D = 1,653 h. That
+  holds on identical machines; with mixed speeds it needs the critical tasks on fast machines.
+
+| plan | makespan | × max(W/P, D) | slot util | bidegree latency p90 | max |
+|---|---|---|---|---|---|
+| **today**: ≤ 24 open bidegrees, ≤ 32 walk tasks each, oldest first, speed-oblivious | 2,124 h | 2.40 | 36.5% | 13.5 h | 102 h |
+| group order (oldest bidegree first), uncapped | 1,683 h | 1.91 | 46.0% | 5.7 h | 127 h |
+| DAG rank, estimated costs, aging 1 h | 1,772 h | 2.01 | 43.8% | 5.0 h | 99 h |
+| DAG rank, oracle costs, aging 1 h | 1,724 h | 1.95 | 44.9% | 5.0 h | 111 h |
+| DAG rank, estimated costs, no aging | 1,909 h | 2.16 | 40.7% | 0.7 h | 348 h |
+| today, **fast first** | 1,466 h | 1.66 | 44.3% | 9.7 h | 83 h |
+| **group order, uncapped, fast first** | **1,237 h** | **1.40** | 59.5% | 7.3 h | 111 h |
+| DAG rank, estimated costs, no aging, fast first | 1,322 h | 1.50 | 55.5% | 0.6 h | 227 h |
+| DAG rank, oracle costs, no aging, fast first | 1,334 h | 1.51 | 55.1% | 0.6 h | 349 h |
+
+"Fast first" means every job prefers the fastest class's workers, and slower workers take the
+overflow. `dispatch` stays at microseconds on average and at most about 1 ms, with up to 490k
+live DAG nodes.
+
+## What the gain is made of
+
+1. **Speed-aware placement: −27% to −31%,** whatever the order. In a span-bound run, a
+   critical-path task on a 2.4× slower worker extends the run directly. This is the "earliest
+   finish time" half of HEFT, here in its crudest form: prefer the fast class.
+2. **Removing the caps: −16% to −21%.** Today's coordinator is not greedy: it idles slots while
+   ready work waits behind the open-bidegree and walk-thread caps. Uncapped, the peak is about
+   280 open bidegrees but only about 490k live DAG nodes, which is cheap.
+3. **Ordering: rank priority does not beat oldest-bidegree-first.** It is 4–7% worse, even with
+   oracle costs and fast-first, and much worse without aging (a 348 h worst bidegree).
+   - On this grid-shaped DAG, "oldest ready first" already advances the wavefront along the long
+     rows.
+   - Upward rank, frozen at submission and approximated (1% epsilon), lets low-rank work fall
+     behind until it becomes critical itself.
+   - This is the open question for the literature search.
+4. **Combined: group order + uncapped + fast first is 1.72× faster than today** (2,124 h →
+   1,237 h), at 1.40× the lower bound.
+
+## Caveats
+
+- **Memory is not modelled here:** the whole-run simulation enforces slots only. The trace
+  replay shows memory admission does bind in production.
+- **The cost model is a model.**
+  - 25% of bidegrees have extrapolated dims.
+  - The census mixes code versions; a per-file effect absorbs that.
+  - The within-bidegree fit explains only 24% of variance.
+  - Absolute hours are therefore indicative. Ratios between plans are the robust output, since
+    every plan sees identical costs.
+- **The "today" model is simplified:** a cap on open bidegrees and a cap on walk tasks per
+  bidegree, both read off the trace. Coordinator-local work, registration and log replay are
+  zero-time.
+- **The fleet is fixed:** no joins, leaves or failures.
