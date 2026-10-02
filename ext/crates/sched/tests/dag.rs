@@ -21,6 +21,7 @@ fn job(id: JobId, deps: &[JobId]) -> DagJob {
         spec: JobSpec::new(id, Resources::mem(1), 0),
         deps: deps.to_vec(),
         work_estimate: None,
+        passthrough: false,
     }
 }
 

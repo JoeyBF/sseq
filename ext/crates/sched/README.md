@@ -39,8 +39,8 @@ thread; a typical call takes microseconds.
 ## Model
 
 - A **job** ([`JobSpec`]) has a demand ([`Resources`], memory today), a priority group, an optional
-  explicit priority, optional preferred workers (cache affinity, never required) and an optional
-  class.
+  explicit priority, optional preferred workers (cache affinity, never required), and two hard
+  constraints: workers to avoid (e.g. ones it failed on) and a required worker class.
 - A **worker** ([`WorkerState`]) has a class, slots, a budget, and its last reported usage and
   baseline. The library keeps its own sum of the demands it placed on each worker; heartbeats only
   update the reported figures.
@@ -85,8 +85,13 @@ is submitted to the policy when its last dependency completes. Cycles are reject
 (the batch leaves no trace). Readiness is incremental (constant work per dependency edge);
 completed jobs are removed from the graph, which is a petgraph `StableGraph`. With
 `rank_priority`, jobs are prioritised by their upward rank -- their work plus the longest chain of
-work below them, plus group placeholders' costs -- instead of group arrival. With the `serde`
-feature (default) the declared graph can be snapshotted and restored.
+work below them, plus group placeholders' costs -- instead of group arrival. Work estimates can be
+refined later ([`DagScheduler::update_work`]), moving ranks up or down. **Passthrough** jobs are
+pure synchronisation points ("group G is done") that complete by themselves, and a
+[`DagTemplate`] is a dependency structure shared by many groups (e.g. one per algebra), checked
+once and instantiated per group with [`DagScheduler::declare_template`]; its
+[`critical_path`](DagTemplate::critical_path) gives an unexpanded group's rank weight. With the
+`serde` feature (default) the declared graph can be snapshotted and restored.
 
 ## Simulator
 

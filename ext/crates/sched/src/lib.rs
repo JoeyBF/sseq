@@ -11,7 +11,7 @@ pub mod sim;
 pub use admission::{Admission, ProductionAdmission, WorkerView};
 #[cfg(feature = "serde")]
 pub use dag::DagSnapshot;
-pub use dag::{Dag, DagConfig, DagError, DagJob, DagScheduler, DagStats};
+pub use dag::{Dag, DagConfig, DagError, DagJob, DagScheduler, DagStats, DagTemplate};
 pub use engine::{
     BackfillConfig, BestFit, BestFitConfig, Greedy, GreedyConfig, LaneSet, Lanes, LanesConfig,
     PriorityBackfill,
@@ -34,6 +34,7 @@ pub type Instant = f64;
 /// Comparisons between vectors are component-wise ([`Resources::fits_within`]).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[non_exhaustive]
 pub struct Resources {
     /// Host memory, in bytes.
     pub mem: u64,
@@ -131,12 +132,16 @@ pub struct JobSpec {
     pub priority: Option<i64>,
     /// Soft placement preference (cache affinity): workers to try first. Never required.
     pub prefer: Vec<WorkerId>,
-    /// Optional class constraint or preference (e.g. `"l40s"`). Ignored by the v1 policies.
+    /// Workers the job must not run on (e.g. ones it already failed on). A hard constraint: a job
+    /// that avoids every worker waits until one it does not avoid joins, so callers retrying
+    /// elsewhere should clear the list once it covers the whole pool.
+    pub avoid: Vec<WorkerId>,
+    /// If set, the job runs only on workers of this class (a hard constraint).
     pub class: Option<String>,
 }
 
 impl JobSpec {
-    /// A job with the given id, demand and group, and no priority, preference or class.
+    /// A job with the given id, demand and group, and no priority, preference, avoid list or class.
     pub fn new(id: JobId, demand: Resources, group: u64) -> Self {
         Self {
             id,
@@ -144,6 +149,7 @@ impl JobSpec {
             group,
             priority: None,
             prefer: Vec::new(),
+            avoid: Vec::new(),
             class: None,
         }
     }

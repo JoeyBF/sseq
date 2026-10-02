@@ -89,6 +89,8 @@ enum Op {
         group: u64,
         priority: Option<i64>,
         prefer: Option<WorkerId>,
+        avoid: Option<WorkerId>,
+        class: Option<u8>,
     },
     Complete(usize),
     Cancel(usize),
@@ -107,8 +109,22 @@ enum Op {
 /// A random event.
 fn op() -> impl Strategy<Value = Op> {
     prop_oneof![
-        6 => (1u64..80, 0u64..4, prop::option::weighted(0.2, -2i64..3), prop::option::of(0u64..4))
-            .prop_map(|(demand, group, priority, prefer)| Op::Submit { demand, group, priority, prefer }),
+        6 => (
+            1u64..80,
+            0u64..4,
+            prop::option::weighted(0.2, -2i64..3),
+            prop::option::of(0u64..4),
+            prop::option::weighted(0.2, 0u64..4),
+            prop::option::weighted(0.15, 0u8..2),
+        )
+            .prop_map(|(demand, group, priority, prefer, avoid, class)| Op::Submit {
+                demand,
+                group,
+                priority,
+                prefer,
+                avoid,
+                class,
+            }),
         4 => any::<prop::sample::Index>().prop_map(|i| Op::Complete(i.index(1 << 16))),
         1 => any::<prop::sample::Index>().prop_map(|i| Op::Cancel(i.index(1 << 16))),
         2 => (0u64..4, 0usize..5, 20u64..150, 0u64..150, 0u64..60, 0u8..2).prop_map(
@@ -175,6 +191,14 @@ impl Shadow {
             || s.reported_used.mem.max(s.reported_baseline.mem + placed) + demand <= s.budget.mem
     }
 
+    /// The hard constraints (class, avoid list), written out again.
+    fn eligible(&self, spec: &JobSpec, w: WorkerId) -> bool {
+        spec.class
+            .as_ref()
+            .is_none_or(|c| *c == self.workers[&w].class)
+            && !spec.avoid.contains(&w)
+    }
+
     /// The lane rule, written out again.
     fn lane_refuses(&self, demand: u64, w: WorkerId) -> bool {
         let s = &self.workers[&w];
@@ -223,7 +247,9 @@ impl Shadow {
 /// of the engine, keeps its own bookkeeping and re-checks each placement as it is made:
 ///
 /// - **no over-commit**: the production admission rule held at the moment of each placement;
-/// - **escape hatch**: after a dispatch, no worker with a free slot is empty while jobs wait;
+/// - **hard constraints**: no job runs on a worker its class or avoid list excludes;
+/// - **escape hatch**: after a dispatch, no worker with a free slot is empty while a job that may
+///   run there waits;
 /// - **priority** (priority policies): when B is placed on w, every more urgent waiting job was
 ///   refused by w at that moment (by the admission rule, or by a lane, or because w was B's
 ///   reservation);
@@ -241,12 +267,16 @@ fn run(kind: &Kind, ops: &[Op]) -> Result<Vec<String>, TestCaseError> {
                 group,
                 priority,
                 prefer,
+                avoid,
+                class,
             } => {
                 let id = sh.next_id;
                 sh.next_id += 1;
                 let mut spec = JobSpec::new(id, Resources::mem(demand), group);
                 spec.priority = priority;
                 spec.prefer = prefer.into_iter().collect();
+                spec.avoid = avoid.into_iter().collect();
+                spec.class = class.map(|c| format!("c{c}"));
                 sh.submit(spec, &mut *p);
             }
             Op::Complete(i) => {
@@ -289,7 +319,8 @@ fn run(kind: &Kind, ops: &[Op]) -> Result<Vec<String>, TestCaseError> {
             Op::Gone(w) => {
                 if sh.workers.remove(&w).is_some() {
                     p.worker_gone(w, sh.now);
-                    // The caller resubmits the jobs that were running there.
+                    // The caller resubmits the jobs that were running there, avoiding that worker
+                    // (it is gone, but a worker may rejoin under the same id).
                     let lost: Vec<JobId> = sh
                         .running
                         .iter()
@@ -298,7 +329,9 @@ fn run(kind: &Kind, ops: &[Op]) -> Result<Vec<String>, TestCaseError> {
                         .collect();
                     for j in lost {
                         let (_, demand) = sh.running.remove(&j).unwrap();
-                        sh.submit(JobSpec::new(j, Resources::mem(demand), 0), &mut *p);
+                        let mut spec = JobSpec::new(j, Resources::mem(demand), 0);
+                        spec.avoid = vec![w];
+                        sh.submit(spec, &mut *p);
                     }
                 }
             }
@@ -314,6 +347,10 @@ fn run(kind: &Kind, ops: &[Op]) -> Result<Vec<String>, TestCaseError> {
             prop_assert!(job.is_some(), "placed job {j} is not waiting");
             let job = job.unwrap();
             prop_assert!(sh.workers.contains_key(&w), "placed on unknown worker {w}");
+            prop_assert!(
+                sh.eligible(&job.spec, w),
+                "{kind:?}: job {j} placed on excluded worker {w}"
+            );
             // No over-commit (slots included).
             prop_assert!(
                 sh.admits(job.spec.demand.mem, w),
@@ -331,7 +368,8 @@ fn run(kind: &Kind, ops: &[Op]) -> Result<Vec<String>, TestCaseError> {
                 let mine = sh.urgency(&job, kind.age());
                 for a in sh.waiting.values() {
                     if a.spec.id != j && sh.urgency(a, kind.age()) < mine {
-                        let refused = !sh.admits(a.spec.demand.mem, w)
+                        let refused = !sh.eligible(&a.spec, w)
+                            || !sh.admits(a.spec.demand.mem, w)
                             || (matches!(kind, Kind::Lanes)
                                 && sh.lane_refuses(a.spec.demand.mem, w));
                         prop_assert!(
@@ -346,12 +384,14 @@ fn run(kind: &Kind, ops: &[Op]) -> Result<Vec<String>, TestCaseError> {
             sh.waiting.remove(&j);
             sh.running.insert(j, (w, job.spec.demand.mem));
         }
-        // Escape hatch: an empty worker with a free slot leaves no job waiting.
+        // Escape hatch: an empty worker with a free slot leaves no job waiting that may run there.
         for (&w, s) in &sh.workers {
             if s.slots > 0 && sh.load(w).0 == 0 {
+                let stuck = sh.waiting.values().find(|j| sh.eligible(&j.spec, w));
                 prop_assert!(
-                    sh.waiting.is_empty(),
-                    "{kind:?}: worker {w} empty while jobs wait"
+                    stuck.is_none(),
+                    "{kind:?}: worker {w} empty while job {:?} waits",
+                    stuck.map(|j| j.spec.id)
                 );
             }
         }

@@ -50,6 +50,7 @@ fn main() {
                     spec: JobSpec::new(id, Resources::mem(1), g),
                     deps,
                     work_estimate: None,
+                    passthrough: false,
                 }
             })
             .collect();
