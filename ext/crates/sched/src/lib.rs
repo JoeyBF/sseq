@@ -16,7 +16,7 @@ pub use dag::{
 };
 pub use engine::{
     BackfillConfig, BestFit, BestFitConfig, Defer, Greedy, GreedyConfig, LaneSet, Lanes,
-    LanesConfig, PriorityBackfill, SlowGate, SpeedConfig, SpeedPolicy,
+    LanesConfig, Learn, PriorityBackfill, SlowGate, SpeedConfig, SpeedPolicy,
 };
 
 /// A job identifier, chosen by the caller. Must be unique among live (waiting or running) jobs.

@@ -187,7 +187,11 @@ fn speed() -> impl Strategy<Value = SpeedConfig> {
         )
             .prop_map(|(factor, max_wait)| SlowGate { factor, max_wait }),
     );
-    (policy, gate).prop_map(|(policy, slow_gate)| SpeedConfig { policy, slow_gate })
+    (policy, gate).prop_map(|(policy, slow_gate)| SpeedConfig {
+        policy,
+        slow_gate,
+        learn: None,
+    })
 }
 
 /// A random policy configuration.
