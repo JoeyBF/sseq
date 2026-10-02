@@ -27,7 +27,8 @@ use sched::{
 #[command(about = "Typical-case and adversarial comparison of two dispatch plans")]
 struct Args {
     /// Plan A: group | rank | rank-oracle | grouprank | grouprank-oracle, with optional suffixes
-    /// +fast, +eft (wait up to --max-defer), +gate, +age<seconds>.
+    /// +fast, +eft (wait up to --max-defer), +eft<percent> (wait only for that much gain), +gate,
+    /// +age<seconds>.
     #[arg(long)]
     a: String,
     /// Plan B, as plan A.
@@ -125,6 +126,13 @@ fn plan(name: &str, max_defer: f64) -> SmallPlan {
                 });
             }
             s if s.starts_with("age") => p.age_limit = Some(s[3..].parse().expect("+age<seconds>")),
+            s if s.starts_with("eft") => {
+                let pct: f64 = s[3..].parse().expect("+eft<percent>");
+                p.speed.policy = SpeedPolicy::EarliestFinish(Some(Defer {
+                    max_wait: max_defer,
+                    min_gain: pct / 100.0,
+                }))
+            }
             other => panic!("unknown suffix +{other}"),
         }
     }

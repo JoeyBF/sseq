@@ -16,8 +16,8 @@ use super::{
     trace::Trace,
 };
 use crate::{
-    BackfillConfig, Dag, DagConfig, DagJob, DagScheduler, DagTemplate, JobId, JobSpec, Policy,
-    PriorityBackfill, Resources, SpeedConfig, SpeedPolicy, WorkerState,
+    BackfillConfig, Dag, DagConfig, DagJob, DagScheduler, DagTemplate, InstanceSpec, JobId,
+    JobSpec, Policy, PriorityBackfill, Resources, SpeedConfig, SpeedPolicy, WorkerState,
 };
 
 /// One census row (`ext::nassau` per-bidegree counters).
@@ -489,7 +489,7 @@ pub struct Fleet {
 /// A profile's signature DAG and its signatures' degrees.
 #[derive(Debug)]
 struct ProfileInfo {
-    template: DagTemplate,
+    template: Arc<DagTemplate>,
     degree: Vec<i32>,
 }
 
@@ -612,7 +612,10 @@ impl World {
                     template.edge_count(),
                     clock.elapsed().as_secs_f64()
                 );
-                Arc::new(ProfileInfo { template, degree })
+                Arc::new(ProfileInfo {
+                    template: Arc::new(template),
+                    degree,
+                })
             })
             .collect();
         let mut w = World {
@@ -1026,6 +1029,11 @@ pub struct Placement {
     pub rank_epsilon: f64,
     /// Expand every bidegree's walk at the start instead of when it becomes ready.
     pub eager: bool,
+    /// Expand walks as explicit graph nodes and edges instead of implicit instances (CPOP pinning
+    /// always does, since it pins individual nodes).
+    pub explicit: bool,
+    /// `DagConfig::max_open_instances`: a frontier budget in open walks.
+    pub max_open: Option<usize>,
 }
 
 impl Default for Placement {
@@ -1036,6 +1044,8 @@ impl Default for Placement {
             pin: Pin::None,
             rank_epsilon: DagConfig::default().rank_epsilon,
             eager: false,
+            explicit: false,
+            max_open: None,
         }
     }
 }
@@ -1178,6 +1188,7 @@ pub fn simulate(
             rank_epsilon: place.rank_epsilon,
             auto_submit: false,
             record_passthrough: true,
+            max_open_instances: place.max_open,
         },
         policy,
     );
@@ -1274,6 +1285,37 @@ pub fn simulate(
         let zero = 4 * k as u64;
         let mut done_deps = vec![zero];
         // A dead bidegree's walk is all no-ops: skip its template.
+        if let Some(pi) = b.profile.filter(|_| b.live)
+            && !place.explicit
+            && place.pin != Pin::Critical
+        {
+            // Implicit instance: counters over the shared template, "walk done" its `done` job.
+            let info = &world.profiles[pi];
+            let n = info.template.len();
+            let mut work = Vec::with_capacity(n);
+            let mut passthrough = Vec::with_capacity(n);
+            for i in 0..n {
+                let (est, truth) = (world.sig_work(k, i, false), world.sig_work(k, i, true));
+                work.push(cost(est, truth));
+                passthrough.push(truth <= 0.0);
+            }
+            // The walk's rank now flows through the instance, not the placeholder.
+            dag.update_work(zero + 1, 0.0);
+            dag.open_instance(
+                InstanceSpec {
+                    template: info.template.clone(),
+                    base: SIG_BASE + world.offsets[k],
+                    entry: zero,
+                    done: zero + 2,
+                    proto: spec(0, k, place.pin == Pin::All),
+                    work,
+                    passthrough,
+                },
+                now,
+            )
+            .expect("instance ids are disjoint");
+            return;
+        }
         if let Some(pi) = b.profile.filter(|_| b.live) {
             let info = &world.profiles[pi];
             let base = SIG_BASE + world.offsets[k];
@@ -1466,6 +1508,9 @@ pub fn simulate(
         plan: plan.name()
             + &speed_name(&speed)
             + if place.eager { ", eager" } else { "" }
+            + &place
+                .max_open
+                .map_or(String::new(), |m| format!(", <= {m} open walks"))
             + &if place.rank_epsilon != DagConfig::default().rank_epsilon {
                 format!(", rank eps {}", place.rank_epsilon)
             } else {

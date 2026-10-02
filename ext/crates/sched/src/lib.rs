@@ -11,7 +11,9 @@ pub mod sim;
 pub use admission::{Admission, ProductionAdmission, WorkerView};
 #[cfg(feature = "serde")]
 pub use dag::DagSnapshot;
-pub use dag::{Dag, DagConfig, DagError, DagJob, DagScheduler, DagStats, DagTemplate};
+pub use dag::{
+    Dag, DagConfig, DagError, DagJob, DagScheduler, DagStats, DagTemplate, InstanceSpec,
+};
 pub use engine::{
     BackfillConfig, BestFit, BestFitConfig, Defer, Greedy, GreedyConfig, LaneSet, Lanes,
     LanesConfig, PriorityBackfill, SlowGate, SpeedConfig, SpeedPolicy,

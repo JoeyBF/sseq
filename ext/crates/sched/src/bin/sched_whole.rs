@@ -67,7 +67,7 @@ struct Args {
     #[arg(long, default_value_t = 3600.0)]
     max_defer: f64,
     /// +eft: wait only if the expected finish improves by this fraction of the job's work.
-    #[arg(long, default_value_t = 0.0)]
+    #[arg(long, default_value_t = 0.25)]
     min_gain: f64,
     /// +gate: the slow-worker gate's factor.
     #[arg(long, default_value_t = 1.0)]
@@ -78,6 +78,12 @@ struct Args {
     /// `DagConfig::rank_epsilon` for the rank plans.
     #[arg(long, default_value_t = 0.01)]
     rank_epsilon: f64,
+    /// At most this many walks open at once (a frontier budget; implicit walks only).
+    #[arg(long)]
+    max_open: Option<usize>,
+    /// Expand walks as explicit graph nodes and edges instead of implicit instances.
+    #[arg(long)]
+    explicit: bool,
     /// Expand every bidegree's walk at the start (instead of when its zero step is ready).
     #[arg(long)]
     eager: bool,
@@ -291,6 +297,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     pin,
                     rank_epsilon: args.rank_epsilon,
                     eager: args.eager,
+                    explicit: args.explicit,
+                    max_open: args.max_open,
                 },
             )
         })
