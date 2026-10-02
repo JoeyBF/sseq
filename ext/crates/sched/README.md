@@ -2,9 +2,11 @@
 
 A pure, deterministic, resource-aware job-placement library: given a stream of jobs that each
 declare a resource demand, and a changing pool of workers that each have a capacity and a number
-of execution slots, it decides **which waiting job goes to which worker, and when**. Nothing else
--- no networking, threads, clocks or persistence. Every input is an event carrying the caller's
-"now", and the same events produce the same placements.
+of execution slots, it decides **which waiting job goes to which worker, and when**. The core does
+nothing else -- no networking, threads, clocks or persistence: every input is an event carrying the
+caller's "now", and the same events produce the same placements. Around it: a blocking front end
+for callers with a thread per task ([`SharedPolicy`]), an event log ([`log`]), and a dependency
+layer ([`DagScheduler`]).
 
 ## The problem, in general terms
 
@@ -61,8 +63,10 @@ thread; a typical call takes microseconds.
 ## Model
 
 - A **job** ([`JobSpec`]) has a demand ([`Resources`], memory today), a priority group, an optional
-  explicit priority, optional preferred workers (cache affinity, never required), and two hard
-  constraints: workers to avoid (e.g. ones it failed on) and a required worker class.
+  explicit priority, optional preferred workers (cache affinity, never required), a required worker
+  class, and workers to avoid (e.g. ones it failed on). The avoid list is hard, or soft
+  ([`JobSpec::avoid_soft`]): then avoided workers are used while no other live worker of the class
+  exists.
 - A **worker** ([`WorkerState`]) has a class, slots, a budget, and its last reported usage and
   baseline. The library keeps its own sum of the demands it placed on each worker; heartbeats only
   update the reported figures.
@@ -76,6 +80,8 @@ thread; a typical call takes microseconds.
   ```
 
   The escape hatch guarantees that any job can run somewhere: a job alone on a worker always goes.
+  `reported_baseline` must exclude the running jobs' memory (the worker's resident floor minus
+  their estimates); a floor that contains them counts them twice.
 
 ## Policies
 
@@ -93,16 +99,19 @@ there. **Reservation:** the most urgent job that has waited at least `reserve_af
 admitted nowhere reserves the worker with the most headroom; nothing else is admitted there until
 it is placed (at the latest when the worker empties). A more urgent starving job takes over the
 least urgent holder's reservation when none are left. Every other worker keeps admitting less
-urgent jobs. Optional **aging** (`age_limit`) puts long-waiting jobs ahead of everything else,
-which bounds waits even under priorities that are not arrival-ordered (such as DAG ranks).
+urgent jobs. **Aging** (`age_limit`, [`DEFAULT_AGE_LIMIT`] = 30 minutes by default, `None` for
+strict priority) puts jobs that have waited that long ahead of everything else, oldest first:
+a job waits behind work submitted after it for at most the age limit.
 
 **No starvation.** The most urgent waiting job is placed within `reserve_after` plus the longest
 running time of the jobs on the worker it reserves. With `shadow_backfill`, a reserved worker
 still takes jobs expected to finish before the holder could start (EASY backfilling), without
 weakening that bound.
 
-**Group order.** `group_first` orders by group arrival before priority (e.g. oldest bidegree
-first, critical path within it).
+**Group order.** Groups are ordered by first arrival ([`GroupOrder::Arrival`]) or by id
+([`GroupOrder::Id`]), which survives a restart that resubmits in another order ([`nassau::group`]
+gives Nassau's bidegrees an id order). `group_first` orders by group before priority (e.g. oldest
+bidegree first, critical path within it).
 
 ## Speed-aware placement
 
@@ -116,9 +125,59 @@ policy takes a [`SpeedConfig`]:
   expires. In simulation of a full Nassau run it trims makespan by about 1% and bidegree latency
   p90 by 2.7x over fastest-first (more on small, heavily contended instances).
 - [`SlowGate`] (HeteroPrio): keep slow workers idle while the fast class can absorb the backlog.
-- [`Learn`]: learn each class's speed online from completion times.
+- [`Learn`]: learn speeds online from completion times, per worker with its class as prior,
+  corrected for concurrency, with hysteresis; speed-ordered placement treats speeds within one
+  `resolution` step as equal, so load still balances a class. [`SpeedEstimator`] is the same
+  estimator on its own. Samples need [`JobSpec::work`].
 - [`Spoliation`] (HeteroPrio): restart a running job on a faster worker that would otherwise stay
   idle, through [`Policy::dispatch_full`]'s preemptions (the caller kills and restarts).
+
+## Thread-per-task callers: `SharedPolicy`
+
+[`SharedPolicy`] wraps any policy for a caller that runs each task on its own thread:
+[`place`](SharedPolicy::place) submits a job and blocks until it is placed (a wake handle per job,
+no polling), [`place_timeout`](SharedPolicy::place_timeout) gives up and withdraws it, and
+[`lease`](SharedPolicy::lease) returns a guard that releases the job if the thread unwinds.
+`dispatch` runs after every call, and [`spawn_ticker`](SharedPolicy::spawn_ticker) runs it when
+time passes (aging, reservations, voluntary waits).
+
+[`failed`](SharedPolicy::failed) frees a failed job's resources without learning from its duration
+and returns [`FailOutcome::Retry`] (the next `place` of the same id avoids, softly, every worker
+tried) or, after [`RetryConfig::max_attempts`], [`FailOutcome::GiveUp`] with every attempt and
+whether all were device OOMs.
+
+```rust
+use std::sync::Arc;
+use sched::{
+    BackfillConfig, FailKind, FailOutcome, JobSpec, PriorityBackfill, Resources, SharedPolicy,
+    WorkerState,
+};
+
+let shared = Arc::new(SharedPolicy::with_system_clock(PriorityBackfill::new(
+    BackfillConfig::default(),
+)));
+shared.worker_update(WorkerState::new(1, "l40s", 16, Resources::mem_gb(120.0)));
+let job = JobSpec::new(42, Resources::mem_gb(6.0), 3);
+loop {
+    let lease = shared.lease(job.clone()); // blocks until placed
+    let ok = lease.worker() == 1; // send the task to lease.worker() and wait for the reply
+    if ok {
+        lease.complete();
+        break;
+    }
+    if let FailOutcome::GiveUp { .. } = lease.fail(FailKind::LinkDied, "connection reset") {
+        break;
+    }
+}
+```
+
+## Event log
+
+[`log::Logged`] wraps a policy and records every event at its source -- submissions (with an
+optional [`log::TaskInfo`]), placements, completions, failures, worker capacity, heartbeat samples
+and reservations -- to an [`EventSink`]. `log::JsonlSink` (feature `log`) writes gzip-compressed
+JSON lines in the format `sched-sim --trace` reads, so a logged run is a simulator input: replaying
+it with the same policy reproduces its placements.
 
 ## Dependencies: the DAG layer
 
@@ -139,8 +198,17 @@ once and instantiated per group with [`DagScheduler::declare_template`]; its
 keep a group's sub-DAG as dense counters over its shared template instead of graph nodes and
 edges: about 11 bytes per node, a `JobSpec` built only when a node becomes ready, the group's
 `done` job completed when its last node does, and ranks flowing across instances as along edges.
-`DagConfig::max_open_instances` bounds how many are open at once (a frontier budget). With the
-`serde` feature (default) the declared graph, instances included, can be snapshotted and restored.
+`DagConfig::max_open_instances` bounds how many are open at once (a frontier budget). An instance
+can carry a demand and a label per node, open with nodes already complete (resuming from a
+checkpoint: those never run, their successors start with them met), and be closed early
+([`DagScheduler::close_instance`]: unstarted nodes complete as no-ops, running ones are returned and
+their later completions only free resources).
+
+**Local jobs** ([`DagJob::local`]) run on the caller (registration, loading, committing): when
+ready they are held, never submitted, and returned by [`DagScheduler::take_local`].
+
+With the `serde` feature (default) the declared graph, instances included, can be snapshotted and
+restored; jobs that were submitted or running are submitted again on restore.
 
 ## Simulator
 
@@ -168,9 +236,88 @@ and PaRSEC, and `LITERATURE.md` for references.
 ## Features
 
 - `serde` (default): DAG snapshots (`petgraph/serde-1`).
-- `sim`: the simulator (adds `serde_json`, `flate2`, `clap`).
+- `log`: the JSONL event-log writer (adds `serde_json`, `flate2`).
+- `sim`: the simulator (`log`, plus `clap`).
 
 Without features the only dependency is `petgraph`.
+
+## Integration notes (Nassau's coordinator)
+
+Phase 1 keeps the thread per task and replaces the inside of `acquire`/`release`:
+
+```rust,no_run
+# #[cfg(feature = "log")]
+# fn main() {
+use std::{sync::Arc, time::Duration};
+use sched::{
+    BackfillConfig, FailKind, FailOutcome, GroupOrder, JobSpec, Learn, PriorityBackfill,
+    Resources, SharedPolicy, SpeedConfig, SpeedPolicy, WorkerState,
+    log::{JsonlSink, Logged, TaskInfo},
+    nassau,
+};
+
+// Once: restart-stable bidegree order, 30-minute aging (the default), fast workers first with
+// speeds learned per worker, every decision logged.
+let policy = PriorityBackfill::new(BackfillConfig {
+    group_order: GroupOrder::Id,
+    speed: SpeedConfig {
+        policy: SpeedPolicy::FastestFirst,
+        learn: Some(Learn::default()),
+        ..SpeedConfig::default()
+    },
+    ..BackfillConfig::default()
+});
+let log = JsonlSink::create("sched_events.jsonl.gz".as_ref()).unwrap();
+let shared = Arc::new(SharedPolicy::with_system_clock(Logged::new(policy, log)));
+let _ticker = shared.spawn_ticker(Duration::from_secs(1));
+
+// Every MemReport: rss as reported_used, baseline_excl (the rolling floor minus the estimates
+// running) as reported_baseline, the class prior as speed (learning corrects it).
+let (id, class, rss, baseline_excl) = (7, "l40s", 40.0, 12.0);
+shared.worker_update(WorkerState {
+    reported_used: Resources::mem_gb(rss),
+    reported_baseline: Resources::mem_gb(baseline_excl),
+    speed: if class == "l40s" { 2.4 } else { 1.0 },
+    ..WorkerState::new(id, class, 16, Resources::mem_gb(123.7))
+});
+
+// acquire(res, key, est, b, what, avoid): one task, its bidegree (s, t), its estimate in GB and
+// expected seconds on an H200 (learning needs a work estimate; any size proxy proportional to it
+// works).
+let (task, s, t, est_gb, work) = (123_456, 3, 200, 9.5, 600.0);
+shared.with(|p, _| {
+    p.annotate(task, TaskInfo { kind: "sig".into(), bidegree: (t - s, s), ..TaskInfo::default() })
+});
+let mut spec = JobSpec::new(task, Resources::mem_gb(est_gb), nassau::group(s as u32, t as u32));
+spec.work = Some(work);
+loop {
+    let lease = shared.lease(spec.clone()); // blocks; no polling
+    let worker = lease.worker(); // send over TCP, block on the reply
+    let reply: Result<(), (FailKind, String)> = Ok(());
+    let _ = worker;
+    match reply {
+        Ok(()) => break lease.complete(), // release
+        Err((kind, why)) => match lease.fail(kind, &why) {
+            FailOutcome::Retry { .. } => continue, // avoids the workers tried, softly
+            FailOutcome::GiveUp { retryable, .. } => {
+                let _ = retryable; // all attempts were DeviceOom: retry at the bidegree level
+                break;
+            }
+        },
+    }
+}
+
+// A worker left: its tasks' threads will fail with LinkDied and retry.
+let _lost = shared.worker_gone(id);
+# }
+# #[cfg(not(feature = "log"))]
+# fn main() {}
+```
+
+Phase 2 drives the coordinator from a [`DagScheduler`]: bidegrees' zero steps, registrations and
+commits as explicit (local) jobs, each walk an instance of its profile's signature template with
+per-node demands, opened with its checkpointed nodes complete and closed early at the dead tail;
+`snapshot`/`restore` across coordinator restarts.
 
 ## License
 
