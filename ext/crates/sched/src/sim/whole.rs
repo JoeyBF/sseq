@@ -118,7 +118,7 @@ impl Census {
 }
 
 /// SplitMix64: a deterministic hash for per-task noise.
-fn mix(mut x: u64) -> u64 {
+pub(crate) fn mix(mut x: u64) -> u64 {
     x = x.wrapping_add(0x9e37_79b9_7f4a_7c15);
     x = (x ^ (x >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
     x = (x ^ (x >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
@@ -126,12 +126,12 @@ fn mix(mut x: u64) -> u64 {
 }
 
 /// A uniform in `(0, 1)` from a key.
-fn uniform(key: u64) -> f64 {
+pub(crate) fn uniform(key: u64) -> f64 {
     ((mix(key) >> 11) as f64 + 0.5) / (1u64 << 53) as f64
 }
 
 /// A standard normal from a key (Box-Muller).
-fn normal(key: u64) -> f64 {
+pub(crate) fn normal(key: u64) -> f64 {
     let (u, v) = (uniform(key), uniform(key ^ 0x5555_5555_5555_5555));
     (-2.0 * u.ln()).sqrt() * (std::f64::consts::TAU * v).cos()
 }
@@ -302,8 +302,18 @@ fn degree_of(sig: &[u32]) -> i32 {
         .sum()
 }
 
+/// [`ols`] for the binaries.
+pub fn ols_pub(x: &[Vec<f64>], y: &[f64]) -> (Vec<f64>, f64, f64) {
+    ols(x, y)
+}
+
+/// [`uniform`] for the binaries: a deterministic uniform in `(0, 1)` from a key.
+pub fn uniform_pub(key: u64) -> f64 {
+    uniform(key)
+}
+
 /// Least squares `y ~ X`; returns coefficients, R^2 and residual sd.
-fn ols(x: &[Vec<f64>], y: &[f64]) -> (Vec<f64>, f64, f64) {
+pub(crate) fn ols(x: &[Vec<f64>], y: &[f64]) -> (Vec<f64>, f64, f64) {
     let p = x.first().map_or(0, Vec::len);
     let mut xtx = vec![vec![0.0; p]; p];
     let mut xty = vec![0.0; p];
@@ -516,6 +526,8 @@ pub struct WholeConfig {
     pub max_profile_len: usize,
     /// Smallest work of a dispatched task (H200-seconds).
     pub min_work: f64,
+    /// Seed of the "true" costs' noise around the estimates (0: the reference draw).
+    pub noise_seed: u64,
 }
 
 /// The whole run, built a priori: bidegrees, templates, costs.
@@ -623,7 +635,9 @@ impl World {
                     .collect()
             });
             let total = w.cost.total(&w.dims, s, t, active.len()).unwrap_or(0.0);
-            let total_true = total * (w.cost.sd_bidegree * normal(k as u64 * 2 + 1)).exp();
+            let total_true = total
+                * (w.cost.sd_bidegree * normal((k as u64 * 2 + 1) ^ mix(w.config.noise_seed)))
+                    .exp();
             let zs = w.cost.zero_share;
             w.bideg[k].zero_est = (zs * total).max(w.config.min_work);
             w.bideg[k].zero_true = (zs * total_true).max(w.config.min_work);
@@ -672,7 +686,9 @@ impl World {
             return 0.0;
         }
         if truth {
-            let noise = (self.cost.sd_signature * normal(mix(k as u64) ^ i as u64)).exp();
+            let noise = (self.cost.sd_signature
+                * normal(mix(k as u64) ^ i as u64 ^ mix(self.config.noise_seed.wrapping_add(1))))
+            .exp();
             (b.pool_true * share * noise).max(self.config.min_work)
         } else {
             (b.pool_est * share).max(self.config.min_work)
@@ -799,6 +815,73 @@ impl World {
         }
         sys += "network:\n  model: ConstantBandwidth\n  bandwidth: 1000000000\n  latency: 0\n";
         (dag, sys)
+    }
+
+    /// The world flattened into a small instance (the PISA replica family): every task with its
+    /// true work and estimate, the two passthroughs of a bidegree merged into one join, groups
+    /// numbered in `(s, t)` order. Use a small region.
+    pub fn to_small(&self, fleet: &Fleet, model: &dyn ServiceModel) -> super::small::SmallInstance {
+        use super::small::{Class, Kind, SmallInstance, SmallTask};
+        // s-major, as `simulate`'s ids: the DAG layer releases simultaneous dependents in id
+        // order, so this keeps both simulators' tie-breaks between bidegrees identical. (It is
+        // topological: every bidegree edge goes to a higher s, or to the same s at a higher t.)
+        let mut order: Vec<usize> = (0..self.bideg.len()).collect();
+        order.sort_by_key(|&k| (self.bideg[k].s, self.bideg[k].t));
+        let mut join = vec![u32::MAX; self.bideg.len()];
+        let mut tasks: Vec<SmallTask> = Vec::new();
+        for (g, &k) in order.iter().enumerate() {
+            let b = &self.bideg[k];
+            let (row, col) = (b.s as u32, (b.t - b.s) as u32);
+            let task = |kind, work, est, deps| SmallTask {
+                group: g as u32,
+                row,
+                col,
+                kind,
+                work,
+                est,
+                deps,
+            };
+            let zero = tasks.len() as u32;
+            let deps = self.compute_deps(k).iter().map(|&d| join[d]).collect();
+            tasks.push(task(Kind::Zero, b.zero_true, b.zero_est, deps));
+            let mut sinks = vec![zero];
+            if let Some(pi) = b.profile.filter(|_| b.live) {
+                let t = &self.profiles[pi].template;
+                let mut id = vec![u32::MAX; t.len()];
+                for &i in t.topological_order() {
+                    let i = i as usize;
+                    let mut deps: Vec<u32> =
+                        t.predecessors(i).iter().map(|&p| id[p as usize]).collect();
+                    if deps.is_empty() {
+                        deps.push(zero);
+                    }
+                    id[i] = tasks.len() as u32;
+                    let (w, e) = (self.sig_work(k, i, true), self.sig_work(k, i, false));
+                    // A signature with nothing to do is a passthrough in `simulate`: a join here.
+                    let kind = if w > 0.0 { Kind::Sig } else { Kind::Join };
+                    tasks.push(task(kind, w, e, deps));
+                }
+                sinks = t.sinks().map(|i| id[i]).collect();
+            }
+            let mut deps = sinks;
+            deps.push(zero);
+            deps.extend(self.index(b.s, b.t - 1).map(|p| join[p]));
+            deps.sort_unstable();
+            deps.dedup();
+            join[k] = tasks.len() as u32;
+            tasks.push(task(Kind::Join, 0.0, 0.0, deps));
+        }
+        let classes = fleet
+            .groups
+            .iter()
+            .map(|(c, n, slots)| Class {
+                name: c.clone(),
+                speed: model.throughput(c, 1),
+                workers: *n as u32,
+                slots: *slots as u32,
+            })
+            .collect();
+        SmallInstance { tasks, classes }
     }
 
     /// Summary of the world for the report.
@@ -932,13 +1015,29 @@ pub enum Pin {
     Critical,
 }
 
-/// How the simulated coordinator places jobs.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+/// How the simulated coordinator places jobs and maintains ranks.
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Placement {
     /// Speed-aware worker choice.
     pub speed: SpeedConfig,
     /// Pinning to the fast class.
     pub pin: Pin,
+    /// `DagConfig::rank_epsilon` (approximate rank propagation).
+    pub rank_epsilon: f64,
+    /// Expand every bidegree's walk at the start instead of when it becomes ready.
+    pub eager: bool,
+}
+
+impl Default for Placement {
+    /// Oblivious placement, no pinning, `DagConfig`'s default epsilon, lazy expansion.
+    fn default() -> Self {
+        Self {
+            speed: SpeedConfig::default(),
+            pin: Pin::None,
+            rank_epsilon: DagConfig::default().rank_epsilon,
+            eager: false,
+        }
+    }
 }
 
 impl Plan {
@@ -997,7 +1096,6 @@ pub struct WholeMetrics {
 /// An event of the simulation.
 #[derive(Clone, Copy, Debug)]
 enum Ev {
-    Release(JobId),
     Done(usize, u64),
     /// The policy asked to be dispatched again ([`Policy::next_wakeup`]).
     Wake,
@@ -1077,9 +1175,9 @@ pub fn simulate(
             rank_priority: rank,
             rank_scale: 1000.0,
             default_work: 0.0,
+            rank_epsilon: place.rank_epsilon,
             auto_submit: false,
             record_passthrough: true,
-            ..DagConfig::default()
         },
         policy,
     );
@@ -1167,6 +1265,7 @@ pub fn simulate(
     let mut peak_nodes = 0usize;
     let mut next_sample = 0u64;
     let mut wake_at = f64::NAN;
+    let mut eager_done = false;
     let mut now = 0.0;
 
     // Declare bidegree k's walk: its signature template, then "walk done" after the sinks.
@@ -1215,17 +1314,25 @@ pub fn simulate(
     };
 
     loop {
+        if place.eager && now == 0.0 && tasks == 0 && !eager_done {
+            eager_done = true;
+            for k in 0..n {
+                instantiate(&mut dag, k, 0.0);
+            }
+        }
         // Newly ready jobs: open bidegrees and release (respecting today's caps).
         for id in dag.take_ready() {
             match world.node(id) {
                 Node::Zero(k) => {
                     ready_at[k] = now;
-                    instantiate(&mut dag, k, now);
+                    if !place.eager {
+                        instantiate(&mut dag, k, now);
+                    }
                     match caps {
                         Some((cap, _)) if open >= cap => open_queue.push_back(k),
                         _ => {
                             open += 1;
-                            push(&mut heap, now, Ev::Release(id));
+                            dag.release(id, now);
                         }
                     }
                 }
@@ -1235,7 +1342,7 @@ pub fn simulate(
                     }
                     _ => {
                         inflight[k] += 1;
-                        push(&mut heap, now, Ev::Release(id));
+                        dag.release(id, now);
                     }
                 },
                 other => unreachable!("{other:?} is a passthrough"),
@@ -1251,7 +1358,7 @@ pub fn simulate(
                             break;
                         };
                         open += 1;
-                        push(&mut heap, now, Ev::Release(4 * q as u64));
+                        dag.release(4 * q as u64, now);
                     }
                 }
             }
@@ -1293,52 +1400,55 @@ pub fn simulate(
             peak_nodes = peak_nodes.max(s.pending + s.held + s.submitted + s.undeclared);
         }
 
-        // Next event.
-        let Some(Item(t, _, ev)) = heap.pop() else {
+        // Next instant: every event at it is applied before the next dispatch, as a coordinator
+        // that drains its event queue would (dispatching between simultaneous completions would
+        // let whichever is processed first grab the free slots, regardless of priority).
+        let Some(Item(t, _, first)) = heap.pop() else {
             break;
         };
         now = t;
-        match ev {
-            Ev::Release(id) => {
-                dag.release(id, now);
+        let mut events = vec![first];
+        while heap.peek().is_some_and(|i| i.0 == t) {
+            events.push(heap.pop().unwrap().2);
+        }
+        for ev in events {
+            let Ev::Done(w, v) = ev else {
+                // Stale wakeups (for jobs placed before their deadline) are harmless no-ops.
+                continue;
+            };
+            if v != workers[w].version {
+                continue;
             }
-            // Stale wakeups (for jobs placed before their deadline) are harmless no-ops.
-            Ev::Wake => {}
-            Ev::Done(w, v) => {
-                if v != workers[w].version {
-                    continue;
+            advance(&mut workers[w], model, now);
+            // The event was scheduled for the task(s) with the least work left: finish them even
+            // if rounding left a sliver (a completion at `now + tiny` can round to `now`).
+            let least = workers[w]
+                .running
+                .iter()
+                .map(|x| x.1)
+                .fold(f64::INFINITY, f64::min);
+            let mut finished = Vec::new();
+            workers[w].running.retain(|&(id, rem)| {
+                let fin = rem <= least.max(0.0) + 1e-9 * (1.0 + least.abs());
+                if fin {
+                    finished.push(id);
                 }
-                advance(&mut workers[w], model, now);
-                // The event was scheduled for the task(s) with the least work left: finish them
-                // even if rounding left a sliver (a completion at `now + tiny` can round to `now`).
-                let least = workers[w]
-                    .running
-                    .iter()
-                    .map(|x| x.1)
-                    .fold(f64::INFINITY, f64::min);
-                let mut finished = Vec::new();
-                workers[w].running.retain(|&(id, rem)| {
-                    let fin = rem <= least.max(0.0) + 1e-9 * (1.0 + least.abs());
-                    if fin {
-                        finished.push(id);
-                    }
-                    !fin
-                });
-                finished.sort_unstable();
-                for id in finished {
-                    dag.completed(id, now);
-                    if let (Node::Sig(k, _), Some(_)) = (world.node(id), caps) {
-                        inflight[k] -= 1;
-                        if let Some(next) = sig_queue.get_mut(&k).and_then(VecDeque::pop_front) {
-                            inflight[k] += 1;
-                            push(&mut heap, now, Ev::Release(next));
-                        }
+                !fin
+            });
+            finished.sort_unstable();
+            for id in finished {
+                dag.completed(id, now);
+                if let (Node::Sig(k, _), Some(_)) = (world.node(id), caps) {
+                    inflight[k] -= 1;
+                    if let Some(next) = sig_queue.get_mut(&k).and_then(VecDeque::pop_front) {
+                        inflight[k] += 1;
+                        dag.release(next, now);
                     }
                 }
-                schedule(&mut workers[w], w, model, now, &mut |t, ev| {
-                    push(&mut heap, t, ev)
-                });
             }
+            schedule(&mut workers[w], w, model, now, &mut |t, ev| {
+                push(&mut heap, t, ev)
+            });
         }
     }
     let unfinished = done_at.iter().filter(|x| x.is_nan()).count();
@@ -1355,6 +1465,12 @@ pub fn simulate(
     WholeMetrics {
         plan: plan.name()
             + &speed_name(&speed)
+            + if place.eager { ", eager" } else { "" }
+            + &if place.rank_epsilon != DagConfig::default().rank_epsilon {
+                format!(", rank eps {}", place.rank_epsilon)
+            } else {
+                String::new()
+            }
             + match place.pin {
                 Pin::None => "",
                 Pin::All => ", fast class only",
@@ -1511,6 +1627,7 @@ mod tests {
                 max_s: 4,
                 max_profile_len: 5,
                 min_work: 0.01,
+                noise_seed: 0,
             },
             &census,
             (&trace, &work),
@@ -1592,7 +1709,7 @@ mod tests {
         };
         let place = |policy, slow_gate| Placement {
             speed: SpeedConfig { policy, slow_gate },
-            pin: Pin::None,
+            ..Placement::default()
         };
         let fast = simulate(
             &world,

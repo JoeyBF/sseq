@@ -6,6 +6,8 @@ pub mod algebra;
 pub mod model;
 /// The event-driven replay and its metrics.
 pub mod run;
+/// Small flat instances, their simulation and perturbations (PISA).
+pub mod small;
 /// The JSONL trace format.
 pub mod trace;
 /// The whole-run DAG, its cost model and its simulation.

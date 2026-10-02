@@ -72,6 +72,15 @@ struct Args {
     /// +gate: the slow-worker gate's factor.
     #[arg(long, default_value_t = 1.0)]
     gate_factor: f64,
+    /// Seed of the true costs' noise (0: the reference draw); vary it to average over draws.
+    #[arg(long, default_value_t = 0)]
+    noise_seed: u64,
+    /// `DagConfig::rank_epsilon` for the rank plans.
+    #[arg(long, default_value_t = 0.01)]
+    rank_epsilon: f64,
+    /// Expand every bidegree's walk at the start (instead of when its zero step is ready).
+    #[arg(long)]
+    eager: bool,
     /// Make throughput exactly linear up to the slot count (as dslab's exclusive cores).
     #[arg(long)]
     linear_ps: bool,
@@ -174,6 +183,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             max_s: args.max_s,
             max_profile_len,
             min_work: args.min_work,
+            noise_seed: args.noise_seed,
         },
         &census,
         (&trace, &work),
@@ -274,7 +284,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     other => panic!("unknown placement suffix +{other}"),
                 }
             }
-            (plan, Placement { speed, pin })
+            (
+                plan,
+                Placement {
+                    speed,
+                    pin,
+                    rank_epsilon: args.rank_epsilon,
+                    eager: args.eager,
+                },
+            )
         })
         .collect();
     let results: Vec<_> = std::thread::scope(|s| {
