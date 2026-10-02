@@ -1,8 +1,11 @@
-//! The trace format: gzip-compressed JSONL with `worker`, `task` and `sample` records.
+//! The trace format: gzip-compressed JSONL with `worker`, `task` and `sample` records, or the
+//! event log of [`crate::log`].
 
 use std::{collections::HashMap, io::BufRead, path::Path};
 
 use serde::Deserialize;
+
+use crate::log::TaskInfo;
 
 /// A worker of the trace.
 #[derive(Clone, Debug)]
@@ -98,6 +101,46 @@ enum Line {
         reserved_gb: f64,
         running: usize,
     },
+    // The event log (`crate::log`): folded into task records.
+    Submit {
+        t_s: f64,
+        job: u64,
+        est_gb: f64,
+        group: u64,
+        #[serde(default)]
+        info: Option<TaskInfo>,
+    },
+    Placed {
+        t_s: f64,
+        job: u64,
+        worker: String,
+    },
+    Moved {
+        t_s: f64,
+        job: u64,
+        to: String,
+    },
+    Done {
+        t_s: f64,
+        job: u64,
+    },
+    Failed {
+        job: u64,
+    },
+    Cancel {
+        job: u64,
+    },
+    Gone {},
+    Reserved {},
+}
+
+/// A logged job being folded into a task record.
+struct Pending {
+    ready_s: f64,
+    est_gb: f64,
+    group: u64,
+    info: Option<TaskInfo>,
+    placed: Option<(f64, String)>,
 }
 
 #[derive(Deserialize)]
@@ -133,6 +176,7 @@ impl Trace {
             Box::new(std::io::BufReader::new(file))
         };
         let mut t = Trace::default();
+        let mut pending: HashMap<u64, Pending> = HashMap::new();
         let mut names: HashMap<String, usize> = HashMap::new();
         let mut index = |t: &mut Trace, name: &str| -> usize {
             *names.entry(name.to_string()).or_insert_with(|| {
@@ -182,6 +226,82 @@ impl Trace {
                         running,
                     });
                 }
+                Line::Submit {
+                    t_s,
+                    job,
+                    est_gb,
+                    group,
+                    info,
+                } => {
+                    pending.insert(
+                        job,
+                        Pending {
+                            ready_s: t_s,
+                            est_gb,
+                            group,
+                            info,
+                            placed: None,
+                        },
+                    );
+                }
+                Line::Placed { t_s, job, worker }
+                | Line::Moved {
+                    t_s,
+                    job,
+                    to: worker,
+                } => {
+                    if let Some(p) = pending.get_mut(&job) {
+                        p.placed = Some((t_s, worker));
+                    }
+                }
+                Line::Failed { job } => {
+                    // The next placement is a retry; the task record keeps the last attempt.
+                    if let Some(p) = pending.get_mut(&job) {
+                        p.placed = None;
+                    }
+                }
+                Line::Cancel { job } => {
+                    pending.remove(&job);
+                }
+                Line::Done { t_s, job } => {
+                    let Some(p) = pending.remove(&job) else {
+                        continue;
+                    };
+                    let Some((placed_s, worker)) = p.placed else {
+                        continue;
+                    };
+                    let worker = index(&mut t, &worker);
+                    let info = p.info.unwrap_or_else(|| TaskInfo {
+                        kind: "sig".into(),
+                        ..TaskInfo::default()
+                    });
+                    t.tasks.push(TraceTask {
+                        req: job,
+                        zero: info.kind == "zero",
+                        bidegree: info.bidegree,
+                        // Without a bidegree, the logged group itself.
+                        group: if info.bidegree == (0, 0) {
+                            p.group
+                        } else {
+                            group_id(info.bidegree.0, info.bidegree.1)
+                        },
+                        est_gb: p.est_gb,
+                        target: info.target.unwrap_or(1.0),
+                        next: info.next.unwrap_or(0.0),
+                        ready_s: p.ready_s,
+                        placed_s,
+                        done_s: t_s,
+                        worker,
+                        deps: info.deps,
+                        sig: info.sig,
+                        after_groups: info
+                            .after_groups
+                            .iter()
+                            .map(|&(n, s)| group_id(n, s))
+                            .collect(),
+                    });
+                }
+                Line::Gone {} | Line::Reserved {} => {}
                 Line::Task(x) => {
                     let (Some(placed_s), Some(done_s), Some(worker)) =
                         (x.placed_s, x.done_s, x.worker)

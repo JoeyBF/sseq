@@ -5,8 +5,13 @@
 mod admission;
 mod dag;
 mod engine;
+pub mod log;
+pub use log::EventSink;
+pub mod nassau;
+mod shared;
 #[cfg(feature = "sim")]
 pub mod sim;
+mod speed;
 
 pub use admission::{Admission, ProductionAdmission, WorkerView};
 #[cfg(feature = "serde")]
@@ -15,9 +20,12 @@ pub use dag::{
     Dag, DagConfig, DagError, DagJob, DagScheduler, DagStats, DagTemplate, InstanceSpec,
 };
 pub use engine::{
-    BackfillConfig, BestFit, BestFitConfig, Defer, Greedy, GreedyConfig, LaneSet, Lanes,
-    LanesConfig, Learn, PriorityBackfill, SlowGate, SpeedConfig, SpeedPolicy, Spoliation,
+    BackfillConfig, BestFit, BestFitConfig, DEFAULT_AGE_LIMIT, Defer, Greedy, GreedyConfig,
+    GroupOrder, LaneSet, Lanes, LanesConfig, PriorityBackfill, SlowGate, SpeedConfig, SpeedPolicy,
+    Spoliation,
 };
+pub use shared::{Attempt, FailKind, FailOutcome, Lease, Placement, RetryConfig, SharedPolicy};
+pub use speed::{Learn, Sharing, SpeedEstimator};
 
 /// A job identifier, chosen by the caller. Must be unique among live (waiting or running) jobs.
 pub type JobId = u64;
@@ -134,10 +142,15 @@ pub struct JobSpec {
     pub priority: Option<i64>,
     /// Soft placement preference (cache affinity): workers to try first. Never required.
     pub prefer: Vec<WorkerId>,
-    /// Workers the job must not run on (e.g. ones it already failed on). A hard constraint: a job
-    /// that avoids every worker waits until one it does not avoid joins, so callers retrying
-    /// elsewhere should clear the list once it covers the whole pool.
+    /// Workers the job must not run on (e.g. ones it already failed on). Hard unless
+    /// [`avoid_soft`](Self::avoid_soft): a job that avoids every live worker it could run on
+    /// waits until one it does not avoid joins.
     pub avoid: Vec<WorkerId>,
+    /// Make `avoid` soft: avoided workers become eligible while no other live worker (one with
+    /// slots, of the job's class) exists. "Live", not "free": a retry still waits for a busy
+    /// healthy worker rather than returning to the one it failed on.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub avoid_soft: bool,
     /// If set, the job runs only on workers of this class (a hard constraint).
     pub class: Option<String>,
     /// Estimated work, in seconds on a worker of [`WorkerState::speed`] 1.0. Used by
@@ -156,6 +169,7 @@ impl JobSpec {
             priority: None,
             prefer: Vec::new(),
             avoid: Vec::new(),
+            avoid_soft: false,
             class: None,
             work: None,
         }
@@ -265,6 +279,10 @@ pub struct PolicyStats {
     /// worker that was busy ([`Defer`]), and did not place afterwards: `(job, worker it waits
     /// for, expected start there)`. Less urgent jobs may have taken slower workers meanwhile.
     pub deferred: Vec<(JobId, WorkerId, Instant)>,
+    /// Every job that deferred at some point of the last `dispatch`'s scan, including those placed
+    /// later in it (after a released reservation restarted the scan): while deferring, a job
+    /// leaves the slower workers it declined to less urgent jobs.
+    pub deferred_any: Vec<JobId>,
 }
 
 /// A placement policy, driven by events.
@@ -282,8 +300,15 @@ pub trait Policy {
     fn worker_update(&mut self, w: WorkerState, now: Instant);
     /// A worker left. Its running jobs are forgotten; the caller resubmits them if they should run.
     fn worker_gone(&mut self, w: WorkerId, now: Instant);
-    /// A running job finished (success or failure); its resources are released.
+    /// A running job finished; its resources are released (and its duration may teach the
+    /// policy its worker's speed).
     fn completed(&mut self, job: JobId, now: Instant);
+    /// A running job failed: its resources are released, nothing is learned from its duration.
+    /// The default cancels it; `why` is for logs ([`log::Logged`]).
+    fn failed(&mut self, job: JobId, now: Instant, why: &str) {
+        let _ = (now, why);
+        self.cancel(job);
+    }
     /// The placements to make now.
     fn dispatch(&mut self, now: Instant) -> Vec<(JobId, WorkerId)>;
     /// Why a waiting job is not placed, in words (for logs). `None` for unknown jobs.
@@ -333,6 +358,11 @@ impl<P: Policy + ?Sized> Policy for Box<P> {
     /// Forwarded to the boxed policy.
     fn completed(&mut self, job: JobId, now: Instant) {
         (**self).completed(job, now)
+    }
+
+    /// Forwarded to the boxed policy.
+    fn failed(&mut self, job: JobId, now: Instant, why: &str) {
+        (**self).failed(job, now, why)
     }
 
     /// Forwarded to the boxed policy.

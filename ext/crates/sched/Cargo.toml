@@ -13,8 +13,10 @@ license = "MIT OR Apache-2.0"
 default = ["serde"]
 # Snapshot/reload of the declared DAG (`DagScheduler::snapshot` / `restore`).
 serde = ["dep:serde", "petgraph/serde-1"]
+# The JSONL event-log writer (`log::JsonlSink`).
+log = ["serde", "dep:serde_json", "dep:flate2"]
 # The trace simulator (`sched-sim` binary and the `sim` module).
-sim = ["serde", "dep:serde_json", "dep:flate2", "dep:clap"]
+sim = ["log", "dep:clap"]
 
 [dependencies]
 petgraph = { version = "0.8", default-features = false, features = ["stable_graph", "std"] }

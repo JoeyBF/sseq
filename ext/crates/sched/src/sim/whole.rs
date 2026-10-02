@@ -16,8 +16,8 @@ use super::{
     trace::Trace,
 };
 use crate::{
-    BackfillConfig, Dag, DagConfig, DagJob, DagScheduler, DagTemplate, InstanceSpec, JobId,
-    JobSpec, Policy, PriorityBackfill, Resources, SpeedConfig, SpeedPolicy, WorkerState,
+    BackfillConfig, Dag, DagConfig, DagJob, DagScheduler, DagTemplate, GroupOrder, InstanceSpec,
+    JobId, JobSpec, Policy, PriorityBackfill, Resources, SpeedConfig, SpeedPolicy, WorkerState,
 };
 
 /// One census row (`ext::nassau` per-bidegree counters).
@@ -1034,6 +1034,46 @@ pub struct Placement {
     pub explicit: bool,
     /// `DagConfig::max_open_instances`: a frontier budget in open walks.
     pub max_open: Option<usize>,
+    /// How bidegrees are ordered against each other.
+    pub group_key: GroupKey,
+}
+
+/// The order between bidegrees ("oldest first" and its restart-stable stand-ins).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+pub enum GroupKey {
+    /// First submission ([`GroupOrder::Arrival`]): depends on release order, so not stable
+    /// across a coordinator restart.
+    #[default]
+    Arrival,
+    /// `(s, t)` ([`GroupOrder::Id`]).
+    SMajor,
+    /// `(t, s)`.
+    TMajor,
+    /// `(t - s, s)`: by stem.
+    StemMajor,
+}
+
+impl GroupKey {
+    /// Each bidegree's group id: its index for `Arrival`, its rank under the key otherwise.
+    fn ids(self, world: &World) -> Vec<u64> {
+        let n = world.bideg.len();
+        let key = |k: usize| {
+            let (s, t) = (world.bideg[k].s as i64, world.bideg[k].t as i64);
+            match self {
+                GroupKey::Arrival => (0, k as i64),
+                GroupKey::SMajor => (s, t),
+                GroupKey::TMajor => (t, s),
+                GroupKey::StemMajor => (t - s, s),
+            }
+        };
+        let mut order: Vec<usize> = (0..n).collect();
+        order.sort_by_key(|&k| key(k));
+        let mut ids = vec![0; n];
+        for (rank, k) in order.into_iter().enumerate() {
+            ids[k] = rank as u64;
+        }
+        ids
+    }
 }
 
 impl Default for Placement {
@@ -1046,6 +1086,7 @@ impl Default for Placement {
             eager: false,
             explicit: false,
             max_open: None,
+            group_key: GroupKey::Arrival,
         }
     }
 }
@@ -1170,6 +1211,7 @@ pub fn simulate(
         }
     );
     let speed = place.speed;
+    let gid = place.group_key.ids(world);
     let caps = match plan {
         Plan::Today { open, per_bidegree } => Some((*open, *per_bidegree)),
         _ => None,
@@ -1178,6 +1220,11 @@ pub fn simulate(
         age_limit,
         speed,
         group_first,
+        group_order: if place.group_key == GroupKey::Arrival {
+            GroupOrder::Arrival
+        } else {
+            GroupOrder::Id
+        },
         ..BackfillConfig::default()
     });
     let mut dag = DagScheduler::new(
@@ -1199,7 +1246,12 @@ pub fn simulate(
             let id = workers.len() as u64;
             dag.worker_update(
                 WorkerState {
-                    speed: model.throughput(class, 1),
+                    // Learning starts from no knowledge: every worker reports speed 1.
+                    speed: if speed.learn.is_some() {
+                        1.0
+                    } else {
+                        model.throughput(class, 1)
+                    },
                     ..WorkerState::new(id, class.clone(), *slots, Resources::mem(1 << 60))
                 },
                 0.0,
@@ -1224,7 +1276,7 @@ pub fn simulate(
         })
         .map(|g| g.0.clone());
     let spec = |id: JobId, k: usize, pinned: bool| {
-        let mut j = JobSpec::new(id, Resources::ZERO, k as u64);
+        let mut j = JobSpec::new(id, Resources::ZERO, gid[k]);
         if pinned {
             j.class = fast_class.clone();
         }
@@ -1237,6 +1289,7 @@ pub fn simulate(
     let n = world.bideg.len();
     let cost = |est: f64, truth: f64| if oracle { truth } else { est };
     let mut jobs = Vec::with_capacity(2 * n);
+    #[allow(clippy::needless_range_loop)] // `k` indexes the world, too
     for k in 0..n {
         let b = &world.bideg[k];
         let deps: Vec<JobId> = world
@@ -1252,7 +1305,7 @@ pub fn simulate(
         reg.extend(world.index(b.s, b.t - 1).map(|p| 4 * p as u64 + 1));
         jobs.push(DagJob::passthrough(
             4 * k as u64 + 1,
-            k as u64,
+            gid[k],
             reg,
             cost(b.cp_est, b.cp_true),
         ));
@@ -1339,7 +1392,7 @@ pub fn simulate(
                         )
                         .with_work(cost(est, truth))
                     } else {
-                        DagJob::passthrough(0, k as u64, vec![], 0.0)
+                        DagJob::passthrough(0, gid[k], vec![], 0.0)
                     }
                 },
                 &[zero],
@@ -1349,7 +1402,7 @@ pub fn simulate(
             done_deps.extend(info.template.sinks().map(|i| base + i as u64));
         }
         dag.declare(
-            vec![DagJob::passthrough(zero + 2, k as u64, done_deps, 0.0)],
+            vec![DagJob::passthrough(zero + 2, gid[k], done_deps, 0.0)],
             now,
         )
         .expect("walk-done is new");
@@ -1521,6 +1574,12 @@ pub fn simulate(
                 Pin::None => "",
                 Pin::All => ", fast class only",
                 Pin::Critical => ", critical pinned to fast (CPOP)",
+            }
+            + match place.group_key {
+                GroupKey::Arrival => "",
+                GroupKey::SMajor => ", groups by (s, t)",
+                GroupKey::TMajor => ", groups by (t, s)",
+                GroupKey::StemMajor => ", groups by (t - s, s)",
             },
         makespan_h: makespan / 3600.0,
         tasks,
@@ -1545,6 +1604,9 @@ pub fn speed_name(speed: &SpeedConfig) -> String {
     };
     if let Some(g) = speed.slow_gate {
         s += &format!(", slow gate x{} (<= {:.0}s)", g.factor, g.max_wait);
+    }
+    if speed.learn.is_some() {
+        s += ", learned speeds";
     }
     s
 }

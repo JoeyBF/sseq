@@ -6,8 +6,8 @@ use std::{
 };
 
 use crate::{
-    Admission, Instant, JobId, JobSpec, Policy, PolicyStats, ProductionAdmission, ReservationInfo,
-    Resources, WorkerId, WorkerLoad, WorkerState, WorkerView,
+    Admission, Instant, JobId, JobSpec, Learn, Policy, PolicyStats, ProductionAdmission,
+    ReservationInfo, Resources, SpeedEstimator, WorkerId, WorkerLoad, WorkerState, WorkerView,
 };
 
 /// Configuration for [`Greedy`].
@@ -109,27 +109,21 @@ impl Default for Spoliation {
     }
 }
 
-/// Online speed learning: each completed job with [`JobSpec::work`] `w` that ran `d` seconds is a
-/// sample `ln(w / d)` of its worker class's speed, averaged in log space (durations are
-/// log-normal). Unlike StarPU's history models there is no outlier filter: with per-job noise of
-/// sd 0.6 a "50% off the mean" filter would discard most samples.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct Learn {
-    /// Weight of a new sample once warmed up (an exponential moving average; plain averaging
-    /// until then).
-    pub weight: f64,
-    /// Samples a class needs before its learned speed replaces the reported one.
-    pub min_samples: u32,
-}
+/// [`BackfillConfig::age_limit`]'s default, seconds: in the trace replay, 30 minutes cut the
+/// maximum wait 8x at no throughput cost.
+pub const DEFAULT_AGE_LIMIT: f64 = 1800.0;
 
-impl Default for Learn {
-    /// A 5% moving average after 20 samples.
-    fn default() -> Self {
-        Self {
-            weight: 0.05,
-            min_samples: 20,
-        }
-    }
+/// How [`JobSpec::group`]s are ordered against each other (before FIFO within a group).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum GroupOrder {
+    /// By the group's first submission: "oldest group first". Depends on the order the caller
+    /// happens to submit in, so a restarted caller that resubmits in another order reorders
+    /// the groups.
+    #[default]
+    Arrival,
+    /// By the group id itself, smallest first: restart-stable when the caller derives ids from
+    /// the work (e.g. [`nassau::group`](crate::nassau::group)).
+    Id,
 }
 
 /// Configuration for [`PriorityBackfill`] (and the backfill part of [`BestFit`] and [`Lanes`]).
@@ -148,10 +142,11 @@ pub struct BackfillConfig {
     pub default_priority: i64,
     /// Aging: a job that has waited at least this long (seconds) becomes more urgent than every
     /// job that has not, oldest first. Strict priority starves a job for as long as more urgent
-    /// jobs keep arriving; with group-arrival order that is bounded by the older groups' work,
-    /// but with arbitrary priorities (e.g. DAG ranks) it is not, and this bounds it. Default
-    /// `None` (strict priority).
+    /// jobs keep arriving (a young group behind a wide old one), and this bounds it. Default
+    /// [`DEFAULT_AGE_LIMIT`]; `None` is strict priority.
     pub age_limit: Option<f64>,
+    /// How groups are ordered against each other. Default [`GroupOrder::Arrival`].
+    pub group_order: GroupOrder,
     /// Speed-aware placement. Default: oblivious.
     pub speed: SpeedConfig,
     /// Order by group first arrival, then by priority within the group (instead of priority
@@ -176,7 +171,8 @@ impl Default for BackfillConfig {
             max_reservations: 1,
             per_class_reservations: false,
             default_priority: 0,
-            age_limit: None,
+            age_limit: Some(DEFAULT_AGE_LIMIT),
+            group_order: GroupOrder::Arrival,
             speed: SpeedConfig::default(),
             group_first: false,
             shadow_backfill: false,
@@ -242,6 +238,7 @@ struct Mode {
     reservations: Option<BackfillConfig>,
     default_priority: i64,
     age_limit: Option<f64>,
+    group_order: GroupOrder,
     group_first: bool,
     choice: Choice,
     lanes: Option<LanesConfig>,
@@ -266,8 +263,11 @@ struct Worker {
     jobs: BTreeSet<JobId>,
     reserved_for: Option<JobId>,
     lane: bool,
-    /// Effective speed: learned for its class, or as reported.
+    /// Effective speed: learned, or as reported.
     speed: f64,
+    /// `∫ running dt` up to `occ_at` (mean concurrency over a job's run, for learning).
+    occ: f64,
+    occ_at: Instant,
 }
 
 impl Worker {
@@ -297,6 +297,8 @@ struct Running {
     work: Option<f64>,
     /// Its spec (spoliation re-checks constraints on the new worker).
     spec: JobSpec,
+    /// The worker's `occ` when it started.
+    occ0: f64,
     /// Times it was preempted.
     preemptions: u32,
 }
@@ -304,6 +306,8 @@ struct Running {
 /// The slow-worker gate's view of the fleet during one `dispatch`.
 #[derive(Clone, Copy, Debug)]
 struct GateState {
+    /// The fast class: workers of this [`Engine::speed_rank`].
+    fast_rank: i64,
     fast_speed: f64,
     fast_slots: usize,
     /// Waiting jobs that could run on the fast class.
@@ -333,14 +337,17 @@ fn speed_of(w: &Worker) -> f64 {
     w.speed
 }
 
-/// A reported speed, guarded against nonsense.
-fn sane_speed(x: f64) -> f64 {
-    if x > 0.0 && x.is_finite() { x } else { 1.0 }
+/// Bring a worker's concurrency integral up to `now`.
+fn tick_occ(w: &mut Worker, now: Instant) {
+    if now > w.occ_at {
+        w.occ += w.running as f64 * (now - w.occ_at);
+        w.occ_at = now;
+    }
 }
 
-/// Whether `job`'s hard constraints (class, avoid list) allow `w` at all.
-fn eligible(job: &JobSpec, w: &Worker) -> bool {
-    job.class.as_ref().is_none_or(|c| *c == w.state.class) && !job.avoid.contains(&w.state.id)
+/// Whether `job`'s class pin allows `w`.
+fn class_allows(job: &JobSpec, w: &Worker) -> bool {
+    job.class.as_ref().is_none_or(|c| *c == w.state.class)
 }
 
 /// Position of `dispatch`'s scan: first the aged jobs by age, then the rest by urgency.
@@ -393,10 +400,12 @@ struct Engine<A> {
     last_dispatch_holders: Vec<JobId>,
     /// Jobs the last dispatch deferred: (job, worker, expected start).
     deferred: Vec<(JobId, WorkerId, Instant)>,
+    /// Every job that deferred at some point of the last dispatch, placed later or not.
+    deferred_any: Vec<JobId>,
     /// When the last dispatch's voluntary waits expire.
     wakeup: Option<Instant>,
-    /// Learned speeds by class: (mean of ln speed, samples).
-    learned: BTreeMap<String, (f64, u32)>,
+    /// Learned speeds (with [`SpeedConfig::learn`]).
+    learned: Option<SpeedEstimator>,
     /// Shadow times of reserved workers, fixed when first computed for a reservation:
     /// worker -> (holder, shadow time).
     shadows: HashMap<WorkerId, (JobId, Instant)>,
@@ -406,6 +415,7 @@ impl<A: Admission> Engine<A> {
     /// An engine with no workers and no jobs.
     fn new(mode: Mode, admission: A) -> Self {
         Self {
+            learned: mode.speed.learn.map(SpeedEstimator::new),
             mode,
             admission,
             workers: BTreeMap::new(),
@@ -421,10 +431,26 @@ impl<A: Admission> Engine<A> {
             reservations_total: 0,
             last_dispatch_holders: Vec::new(),
             deferred: Vec::new(),
+            deferred_any: Vec::new(),
             wakeup: None,
-            learned: BTreeMap::new(),
             shadows: HashMap::new(),
         }
+    }
+
+    /// Whether `job`'s constraints (class, avoid list) allow `w` at all. A soft avoid list
+    /// lapses while every live worker of the job's class is on it; that depends on the worker
+    /// set only, not on load, so admission stays monotone.
+    fn eligible(&self, job: &JobSpec, w: &Worker) -> bool {
+        if !class_allows(job, w) {
+            return false;
+        }
+        if !job.avoid.contains(&w.state.id) {
+            return true;
+        }
+        job.avoid_soft
+            && !self.workers.values().any(|o| {
+                o.state.slots > 0 && class_allows(job, o) && !job.avoid.contains(&o.state.id)
+            })
     }
 
     /// Whether a worker is one of the configured big lanes.
@@ -452,7 +478,10 @@ impl<A: Admission> Engine<A> {
         }
         let seq = self.next_seq;
         self.next_seq += 1;
-        let group_seq = *self.groups.entry(spec.group).or_insert(seq);
+        let group_seq = match self.mode.group_order {
+            GroupOrder::Arrival => *self.groups.entry(spec.group).or_insert(seq),
+            GroupOrder::Id => spec.group,
+        };
         let priority = spec.priority.unwrap_or(self.mode.default_priority);
         let key = if !self.mode.priority_order {
             Key {
@@ -517,6 +546,7 @@ impl<A: Admission> Engine<A> {
             return false;
         };
         if let Some(w) = self.workers.get_mut(&r.worker) {
+            tick_occ(w, self.now);
             w.running -= 1;
             w.placed -= r.demand;
             w.jobs.remove(&job);
@@ -540,41 +570,62 @@ impl<A: Admission> Engine<A> {
         }
     }
 
-    /// The speed to use for a worker of `class` that reports `reported`: learned, once there are
-    /// enough samples, else as reported.
-    fn class_speed(&self, class: &str, reported: f64) -> f64 {
-        match (self.mode.speed.learn, self.learned.get(class)) {
-            (Some(l), Some(&(mean, n))) if n >= l.min_samples => mean.exp(),
-            _ => sane_speed(reported),
+    /// The speed to use for worker `id` of `class` that reports `reported`: learned, once there
+    /// are enough samples, else as reported.
+    fn worker_speed(&mut self, id: WorkerId, class: &str, reported: f64) -> f64 {
+        match self.learned.as_mut() {
+            Some(e) => e.speed(id, class, reported),
+            None => crate::speed::sane(reported),
         }
     }
 
-    /// A job finished: learn its worker class's speed from its duration.
+    /// A job finished: learn its worker's speed from its duration and the worker's mean
+    /// concurrency meanwhile.
     fn learn_from(&mut self, job: JobId, now: Instant) {
-        let Some(cfg) = self.mode.speed.learn else {
+        if self.learned.is_none() {
             return;
-        };
+        }
         let Some(r) = self.running.get(&job) else {
             return;
         };
-        let (Some(work), Some(w)) = (r.work, self.workers.get(&r.worker)) else {
+        let (Some(work), Some(w)) = (r.work, self.workers.get_mut(&r.worker)) else {
             return;
         };
+        tick_occ(w, now);
         let dt = now - r.started;
-        if !(work > 0.0 && dt > 0.0 && work.is_finite() && dt.is_finite()) {
+        let k = if dt > 0.0 { (w.occ - r.occ0) / dt } else { 1.0 };
+        let (id, class) = (w.state.id, w.state.class.clone());
+        if !self
+            .learned
+            .as_mut()
+            .unwrap()
+            .observe(id, &class, work, dt, k)
+        {
             return;
         }
-        let class = w.state.class.clone();
-        let x = (work / dt).ln();
-        let e = self.learned.entry(class.clone()).or_insert((x, 0));
-        let alpha = cfg.weight.max(1.0 / f64::from(e.1 + 1));
-        e.0 += alpha * (x - e.0);
-        e.1 += 1;
-        if e.1 >= cfg.min_samples {
-            let speed = e.0.exp();
-            for w in self.workers.values_mut().filter(|w| w.state.class == class) {
-                w.speed = speed;
-            }
+        // The class estimate moved too: refresh every worker of the class.
+        let ids: Vec<WorkerId> = self
+            .workers
+            .values()
+            .filter(|w| w.state.class == class)
+            .map(|w| w.state.id)
+            .collect();
+        for id in ids {
+            let reported = self.workers[&id].state.speed;
+            let speed = self.worker_speed(id, &class, reported);
+            self.workers.get_mut(&id).unwrap().speed = speed;
+        }
+    }
+
+    /// Speed as an ordering key (more negative is faster). With learning and a resolution, speeds
+    /// within one resolution step of each other compare equal, so per-worker noise does not
+    /// override load.
+    fn speed_rank(&self, w: &Worker) -> i64 {
+        let res = self.learned.as_ref().map_or(0.0, |e| e.config().resolution);
+        if res > 0.0 {
+            -(speed_of(w).ln() / res.ln_1p()).round() as i64
+        } else {
+            ordered(-speed_of(w))
         }
     }
 
@@ -582,7 +633,7 @@ impl<A: Admission> Engine<A> {
     fn worker_update(&mut self, state: WorkerState, now: Instant) {
         self.now = now;
         let lane = self.is_lane(&state);
-        let speed = self.class_speed(&state.class, state.speed);
+        let speed = self.worker_speed(state.id, &state.class, state.speed);
         match self.workers.get_mut(&state.id) {
             Some(w) => {
                 // A reservation counted against the old class (per-class limits) must not move to
@@ -609,6 +660,8 @@ impl<A: Admission> Engine<A> {
                         reserved_for: None,
                         lane,
                         speed,
+                        occ: 0.0,
+                        occ_at: now,
                     },
                 );
             }
@@ -632,7 +685,7 @@ impl<A: Admission> Engine<A> {
     /// Whether `w` takes the job, or why not. Reservations and lanes are checked here; everything
     /// else is the admission rule.
     fn refusal(&self, job: &Waiting, w: &Worker, gate: Option<&GateState>) -> Option<Refusal> {
-        if !eligible(&job.spec, w) {
+        if !self.eligible(&job.spec, w) {
             return Some(Refusal::Ineligible);
         }
         if let Some(g) = gate
@@ -742,18 +795,20 @@ impl<A: Admission> Engine<A> {
     fn gate_state(&self) -> Option<GateState> {
         self.mode.speed.slow_gate?;
         let live = || self.workers.values().filter(|w| w.state.slots > 0);
-        let fast_speed = live().map(speed_of).fold(0.0, f64::max);
-        if !live().any(|w| speed_of(w) < fast_speed) {
+        let fast_rank = live().map(|w| self.speed_rank(w)).min()?;
+        if !live().any(|w| self.speed_rank(w) > fast_rank) {
             return None;
         }
-        let fast: Vec<&Worker> = live().filter(|w| speed_of(w) >= fast_speed).collect();
+        let fast: Vec<&Worker> = live().filter(|w| self.speed_rank(w) == fast_rank).collect();
+        let fast_speed = fast.iter().map(|w| speed_of(w)).fold(0.0, f64::max);
         let fast_slots = fast.iter().map(|w| w.state.slots).sum();
         let backlog = self
             .waiting
             .values()
-            .filter(|j| fast.iter().any(|w| eligible(&j.spec, w)))
+            .filter(|j| fast.iter().any(|w| self.eligible(&j.spec, w)))
             .count();
         Some(GateState {
+            fast_rank,
             fast_speed,
             fast_slots,
             backlog,
@@ -766,15 +821,16 @@ impl<A: Admission> Engine<A> {
             return false;
         };
         let speed = speed_of(w);
-        if speed >= g.fast_speed
+        if self.speed_rank(w) <= g.fast_rank
             || g.fast_slots == 0
             || job.reserved == Some(w.state.id)
             || self.aged(job)
             || self.now - job.since >= cfg.max_wait
-            || !self
-                .workers
-                .values()
-                .any(|f| f.state.slots > 0 && speed_of(f) >= g.fast_speed && eligible(&job.spec, f))
+            || !self.workers.values().any(|f| {
+                f.state.slots > 0
+                    && self.speed_rank(f) <= g.fast_rank
+                    && self.eligible(&job.spec, f)
+            })
         {
             return false;
         }
@@ -862,11 +918,7 @@ impl<A: Admission> Engine<A> {
             }
             let preferred = job.spec.prefer.contains(&id);
             let lane_rank = u8::from(big && !w.lane);
-            let speed_key = if speed_first {
-                ordered(-speed_of(w))
-            } else {
-                0
-            };
+            let speed_key = if speed_first { self.speed_rank(w) } else { 0 };
             let fit = match self.mode.choice {
                 Choice::LeastLoaded => 0,
                 Choice::Tightest { prefer_penalty } => {
@@ -894,7 +946,7 @@ impl<A: Admission> Engine<A> {
                 // Only workers that refuse for want of a slot, and would admit with one free.
                 if speed_of(w) <= speed_of(&self.workers[&place])
                     || w.running < w.state.slots
-                    || !eligible(&job.spec, w)
+                    || !self.eligible(&job.spec, w)
                     || w.reserved_for.is_some_and(|h| h != job.spec.id)
                 {
                     continue;
@@ -943,9 +995,11 @@ impl<A: Admission> Engine<A> {
             .workers
             .get_mut(&worker)
             .expect("placing on an unknown worker");
+        tick_occ(w, self.now);
         w.running += 1;
         w.placed += j.spec.demand;
         w.jobs.insert(job);
+        let occ0 = w.occ;
         self.running.insert(
             job,
             Running {
@@ -955,6 +1009,7 @@ impl<A: Admission> Engine<A> {
                 work: j.spec.work,
                 spec: j.spec,
                 preemptions: 0,
+                occ0,
             },
         );
         self.placements_total += 1;
@@ -1006,17 +1061,13 @@ impl<A: Admission> Engine<A> {
             if w.reserved_for.is_some()
                 || w.state.slots == 0
                 || class_full(&w.state.class)
-                || !eligible(&j.spec, w)
+                || !self.eligible(&j.spec, w)
             {
                 continue;
             }
             let score = (
                 -w.view().headroom(),
-                if speed_first {
-                    ordered(-speed_of(w))
-                } else {
-                    0
-                },
+                if speed_first { self.speed_rank(w) } else { 0 },
                 !j.spec.prefer.contains(&id),
                 w.running,
             );
@@ -1035,7 +1086,7 @@ impl<A: Admission> Engine<A> {
         let victim = self
             .reservations
             .iter()
-            .filter(|r| eligible(&j.spec, &self.workers[&r.1]))
+            .filter(|r| self.eligible(&j.spec, &self.workers[&r.1]))
             .map(|r| (self.urgency(&self.waiting[&r.0]), r.0))
             .filter(|(u, _)| *u > mine)
             .max();
@@ -1095,8 +1146,8 @@ impl<A: Admission> Engine<A> {
         if let Some(g) = gate.as_mut()
             && self.workers.values().any(|f| {
                 f.state.slots > 0
-                    && speed_of(f) >= g.fast_speed
-                    && eligible(&self.waiting[&job].spec, f)
+                    && self.speed_rank(f) <= g.fast_rank
+                    && self.eligible(&self.waiting[&job].spec, f)
             })
         {
             g.backlog = g.backlog.saturating_sub(1);
@@ -1116,17 +1167,23 @@ impl<A: Admission> Engine<A> {
         self.now = now;
         self.last_dispatch_holders.clear();
         self.deferred.clear();
+        self.deferred_any.clear();
         self.wakeup = None;
         let mut gate = self.gate_state();
         let mut proj = Projection::new();
         // Voluntary-wait deadlines by job; kept across scan restarts like `self.deferred`.
         let mut timed: BTreeMap<JobId, Instant> = BTreeMap::new();
         let mut out = Vec::new();
-        // A reservation on a worker that can never run anything again is dead weight.
+        // A reservation on a worker that can never run anything again is dead weight, and so is
+        // one its holder may no longer use (a soft avoid list that lapsed when it reserved holds
+        // again once another worker joins).
         let dead: Vec<JobId> = self
             .reservations
             .iter()
-            .filter(|r| self.workers[&r.1].state.slots == 0)
+            .filter(|r| {
+                let w = &self.workers[&r.1];
+                w.state.slots == 0 || !self.eligible(&self.waiting[&r.0].spec, w)
+            })
             .map(|r| r.0)
             .collect();
         for job in dead {
@@ -1165,6 +1222,9 @@ impl<A: Admission> Engine<A> {
                         }
                         self.deferred.retain(|d| d.0 != job);
                         self.deferred.push((job, w, at));
+                        if !self.deferred_any.contains(&job) {
+                            self.deferred_any.push(job);
+                        }
                     }
                     Pick::Place(w) => {
                         self.placing(job, &mut gate, &mut timed);
@@ -1246,7 +1306,10 @@ impl<A: Admission> Engine<A> {
                         continue;
                     };
                     let sv = speed_of(v);
-                    if sv >= sw || r.preemptions >= cfg.max_per_job || !eligible(&r.spec, w) {
+                    if self.speed_rank(v) <= self.speed_rank(w)
+                        || r.preemptions >= cfg.max_per_job
+                        || !self.eligible(&r.spec, w)
+                    {
                         continue;
                     }
                     if !self.admission.admits(&r.demand, &w.view())
@@ -1277,13 +1340,17 @@ impl<A: Admission> Engine<A> {
                 r.preemptions += 1;
                 let demand = r.demand;
                 let v = self.workers.get_mut(&from).unwrap();
+                tick_occ(v, now);
                 v.running -= 1;
                 v.placed -= demand;
                 v.jobs.remove(&job);
                 let w = self.workers.get_mut(&to).unwrap();
+                tick_occ(w, now);
                 w.running += 1;
                 w.placed += demand;
                 w.jobs.insert(job);
+                let occ0 = w.occ;
+                self.running.get_mut(&job).unwrap().occ0 = occ0;
                 out.push(crate::Preemption { job, from, to });
             }
         }
@@ -1325,6 +1392,7 @@ impl<A: Admission> Engine<A> {
             workers: self.workers.values().map(|w| self.load(w)).collect(),
             last_dispatch_holders: self.last_dispatch_holders.clone(),
             deferred: self.deferred.clone(),
+            deferred_any: self.deferred_any.clone(),
         }
     }
 
@@ -1505,6 +1573,7 @@ policy!(
         reservations: None,
         default_priority: 0,
         age_limit: None,
+        group_order: GroupOrder::Arrival,
         group_first: false,
         choice: Choice::LeastLoaded,
         lanes: None,
@@ -1537,6 +1606,7 @@ policy!(
         priority_order: true,
         default_priority: c.default_priority,
         age_limit: c.age_limit,
+        group_order: c.group_order,
         group_first: c.group_first,
         speed: c.speed,
         reservations: Some(c),
@@ -1555,6 +1625,7 @@ policy!(
         priority_order: true,
         default_priority: c.backfill.default_priority,
         age_limit: c.backfill.age_limit,
+        group_order: c.backfill.group_order,
         group_first: c.backfill.group_first,
         speed: c.backfill.speed,
         reservations: Some(c.backfill),
@@ -1572,6 +1643,7 @@ policy!(
         priority_order: true,
         default_priority: c.backfill.default_priority,
         age_limit: c.backfill.age_limit,
+        group_order: c.backfill.group_order,
         group_first: c.backfill.group_first,
         speed: c.backfill.speed,
         reservations: Some(c.backfill.clone()),

@@ -260,10 +260,7 @@ fn learned_speeds_replace_reported_ones() {
     let speed = SpeedConfig {
         policy: SpeedPolicy::FastestFirst,
         slow_gate: None,
-        learn: Some(sched::Learn {
-            weight: 0.05,
-            min_samples: 20,
-        }),
+        learn: Some(sched::Learn::default()),
         spoliation: None,
     };
     let mut p = backfill(speed);
@@ -351,4 +348,50 @@ fn spoliation_moves_a_stuck_job() {
     q.dispatch_full(0.0);
     q.completed(0, 1.0);
     assert!(q.dispatch_full(1.0).preempt.is_empty());
+}
+
+/// A clock-capped worker of the same class is learned slower than its peers, so fastest-first
+/// fills it last; peers within the resolution still share work by load.
+#[test]
+fn capped_worker_learned_per_worker() {
+    let speed = SpeedConfig {
+        policy: SpeedPolicy::FastestFirst,
+        slow_gate: None,
+        learn: Some(sched::Learn::default()),
+        spoliation: None,
+    };
+    let mut p = backfill(speed);
+    for w in 1..=3 {
+        p.worker_update(WorkerState::new(w, "h200", 1, Resources::mem(1000)), 0.0);
+    }
+    let truth = |w: u64| if w == 3 { 0.765 } else { 1.0 };
+    let mut now = 0.0;
+    let mut id = 0;
+    let mut running: Vec<(u64, u64, f64)> = Vec::new();
+    for _ in 0..600 {
+        for _ in running.len()..3 {
+            p.submit(job(id, Some(10.0)), now);
+            id += 1;
+        }
+        for (j, w) in p.dispatch(now) {
+            running.push((j, w, now + 10.0 / truth(w)));
+        }
+        running.sort_by(|a, b| a.2.total_cmp(&b.2));
+        let (j, _, end) = running.remove(0);
+        now = end;
+        p.completed(j, now);
+    }
+    let speeds: Vec<f64> = p.stats().workers.iter().map(|l| l.speed).collect();
+    assert!(speeds[2] < 0.9 * speeds[0], "{speeds:?}");
+    assert!((speeds[0] / speeds[1] - 1.0).abs() < 0.1, "{speeds:?}");
+    // With all three free, the two healthy workers are taken first, in load order.
+    for (j, _, _) in running.drain(..) {
+        p.completed(j, now);
+    }
+    for k in 0..2 {
+        p.submit(job(10_000 + k, Some(10.0)), now);
+    }
+    let mut placed: Vec<u64> = p.dispatch(now).into_iter().map(|x| x.1).collect();
+    placed.sort();
+    assert_eq!(placed, vec![1, 2]);
 }
