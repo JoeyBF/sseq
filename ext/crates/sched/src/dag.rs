@@ -295,6 +295,18 @@ pub struct DagConfig {
     /// coordinator's frontier state. `None` (the default): unbounded. At least 1 is enforced.
     #[cfg_attr(feature = "serde", serde(default))]
     pub max_open_instances: Option<usize>,
+    /// Maintain upward ranks as the graph grows and work estimates change. Ranks are needed by
+    /// `rank_priority`, [`DagScheduler::rank`] and placeholders; without them, declaring and
+    /// re-estimating skip all rank propagation, which on long dependency chains is most of the
+    /// cost. Default true.
+    #[cfg_attr(feature = "serde", serde(default = "yes"))]
+    pub track_ranks: bool,
+}
+
+/// `true`, for serde defaults.
+#[cfg(feature = "serde")]
+fn yes() -> bool {
+    true
 }
 
 impl Default for DagConfig {
@@ -308,6 +320,7 @@ impl Default for DagConfig {
             auto_submit: true,
             record_passthrough: false,
             max_open_instances: None,
+            track_ranks: true,
         }
     }
 }
@@ -873,6 +886,9 @@ impl<P: Policy> DagScheduler<P> {
             return false;
         };
         self.graph[n].work = work;
+        if !self.config.track_ranks {
+            return true;
+        }
         let eps = self.config.rank_epsilon.max(0.0);
         let mut stack = vec![n];
         let mut first = true;
@@ -1056,7 +1072,9 @@ impl<P: Policy> Dag for DagScheduler<P> {
                 .map(|c| self.graph[c].rank)
                 .fold(0.0, f64::max);
             self.graph[n].rank = self.graph[n].work + below.max(self.graph[n].implicit_below);
-            self.propagate_rank(n);
+            if self.config.track_ranks {
+                self.propagate_rank(n);
+            }
         }
         for &n in &batch {
             if self.graph[n].unmet == 0 {

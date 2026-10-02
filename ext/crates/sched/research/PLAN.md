@@ -72,7 +72,7 @@ All nine items are implemented and tested; outcomes in `RESULTS.md`.
 | 3 | plans and bounds: fast-only, CPOP, group-then-rank | done | see the whole-run section |
 | 4 | learned per-class speed | done | exact recovery in tests; off by default |
 | 5 | dslab-dag cross-check | done | exact on unlimited capacity and one slot; within ~1% on contention |
-| 6 | `sched-pisa` | done | explained "rank loses": a simulator artefact (per-event dispatch), plus rank needing fast placement |
+| 6 | `sched-pisa` | done | found a simulator artefact (per-event dispatch) and the mechanism (rank parks critical jobs on slow workers; waiting fixes it); but at full scale rank still loses 3-4% |
 | 7 | implicit instances, frontier budget, snapshots | done | bit-identical makespans to the explicit layer |
 | 8 | shadow backfill | done | negligible on the trace (idle 0.97% → 0.92%); off by default |
 | 9 | spoliation | done | −4..8% over fast-first alone, nothing on top of waiting; off by default |

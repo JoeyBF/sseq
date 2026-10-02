@@ -113,7 +113,8 @@ policy takes a [`SpeedConfig`]:
 - [`SpeedPolicy::EarliestFinish`]: HEFT's processor choice online. With a [`Defer`], a job may
   *wait* for a busy faster worker when it would still finish earlier there (by at least
   `min_gain` of its work, at most `max_wait`); [`Policy::next_wakeup`] tells the caller when a wait
-  expires. In simulation this is the largest single lever: 7-18% on top of fastest-first.
+  expires. In simulation of a full Nassau run it trims makespan by about 1% and bidegree latency
+  p90 by 2.7x over fastest-first (more on small, heavily contended instances).
 - [`SlowGate`] (HeteroPrio): keep slow workers idle while the fast class can absorb the backlog.
 - [`Learn`]: learn each class's speed online from completion times.
 - [`Spoliation`] (HeteroPrio): restart a running job on a faster worker that would otherwise stay

@@ -1189,6 +1189,7 @@ pub fn simulate(
             auto_submit: false,
             record_passthrough: true,
             max_open_instances: place.max_open,
+            track_ranks: rank,
         },
         policy,
     );
