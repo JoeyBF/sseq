@@ -187,3 +187,102 @@ fn per_class_reservations() {
     assert_eq!(r.len(), 2, "one per class: {r:?}");
     assert_eq!(r.iter().map(|r| r.job).collect::<Vec<_>>(), vec![1, 2]);
 }
+
+/// [`starving`], with shadow-time backfill and known work: the two 60-unit jobs end at 100 s.
+fn starving_shadow() -> PriorityBackfill {
+    let mut p = PriorityBackfill::new(BackfillConfig {
+        shadow_backfill: true,
+        ..BackfillConfig::default()
+    });
+    p.worker_update(worker(1, 4, 100, 0), 0.0);
+    p.worker_update(worker(2, 4, 100, 0), 0.0);
+    for id in [10, 11] {
+        p.submit(
+            JobSpec {
+                work: Some(100.0),
+                ..job(id, 60, 1)
+            },
+            0.0,
+        );
+    }
+    assert_eq!(p.dispatch(0.0).len(), 2);
+    p.submit(job(1, 50, 0), 1.0);
+    p.dispatch(1.0);
+    assert!(p.dispatch(61.0).is_empty());
+    assert_eq!(p.stats().reservations.len(), 1);
+    // Fill the other worker, so only shadow backfill can place anything more.
+    let w = p.stats().reservations[0].worker;
+    p.submit(
+        JobSpec {
+            work: Some(1e6),
+            ..job(30, 40, 3)
+        },
+        61.0,
+    );
+    assert_eq!(p.dispatch(61.0), vec![(30, if w == 1 { 2 } else { 1 })]);
+    p
+}
+
+/// A short job backfills the reserved worker (it ends before the holder can start there); a long
+/// one does not.
+#[test]
+fn shadow_backfill_admits_jobs_that_end_in_time() {
+    let mut p = starving_shadow();
+    let w = p.stats().reservations[0].worker;
+    // 20 s of work ends at 81 s, before the shadow time 100 s; 50 s would end at 111 s.
+    p.submit(
+        JobSpec {
+            work: Some(50.0),
+            ..job(21, 5, 2)
+        },
+        62.0,
+    );
+    p.submit(
+        JobSpec {
+            work: Some(20.0),
+            ..job(20, 5, 2)
+        },
+        62.0,
+    );
+    assert_eq!(p.dispatch(62.0), vec![(20, w)]);
+    assert!(
+        p.explain(21)
+            .unwrap()
+            .contains(&format!("worker {w} for job 1"))
+    );
+    // Unknown work never backfills.
+    p.submit(job(22, 5, 2), 63.0);
+    assert!(p.dispatch(63.0).is_empty());
+}
+
+/// Once the shadow time has passed, the reserved worker drains strictly (overrunning jobs can no
+/// longer delay the holder through new backfill).
+#[test]
+fn shadow_backfill_stops_at_the_shadow_time() {
+    let mut p = starving_shadow();
+    let w = p.stats().reservations[0].worker;
+    // The shadow time is 100 s (the running jobs' expected end): a 1 s job at 95 s fits.
+    p.submit(
+        JobSpec {
+            work: Some(1.0),
+            ..job(20, 1, 2)
+        },
+        95.0,
+    );
+    assert_eq!(p.dispatch(95.0), vec![(20, w)]);
+    p.completed(20, 96.0);
+    // The running jobs overrun; from 100 s on, nothing but the holder goes there.
+    p.submit(
+        JobSpec {
+            work: Some(0.5),
+            ..job(21, 1, 2)
+        },
+        101.0,
+    );
+    assert!(p.dispatch(101.0).is_empty());
+    assert!(
+        p.explain(21)
+            .unwrap()
+            .contains(&format!("worker {w} for job 1"))
+    );
+}

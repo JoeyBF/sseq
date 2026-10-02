@@ -158,6 +158,14 @@ pub struct BackfillConfig {
     /// first). With DAG-rank priorities this is "oldest group first, critical path within it".
     /// Default false.
     pub group_first: bool,
+    /// EASY-style backfill on a reserved worker: less urgent jobs may still run there if they
+    /// are expected to finish before the holder could start, its *shadow time*. The shadow time is
+    /// computed once per reservation, from the running jobs' [`JobSpec::work`] and the worker's
+    /// speed, predicting usage from placed demands (heartbeat usage cannot be predicted); an
+    /// unknown end means no backfill. Once the shadow time passes nothing can finish before it,
+    /// so the worker drains strictly from then on: the holder waits at most for the jobs running
+    /// at the shadow time. Default false (strict draining from the start).
+    pub shadow_backfill: bool,
 }
 
 impl Default for BackfillConfig {
@@ -171,6 +179,7 @@ impl Default for BackfillConfig {
             age_limit: None,
             speed: SpeedConfig::default(),
             group_first: false,
+            shadow_backfill: false,
         }
     }
 }
@@ -388,6 +397,9 @@ struct Engine<A> {
     wakeup: Option<Instant>,
     /// Learned speeds by class: (mean of ln speed, samples).
     learned: BTreeMap<String, (f64, u32)>,
+    /// Shadow times of reserved workers, fixed when first computed for a reservation:
+    /// worker -> (holder, shadow time).
+    shadows: HashMap<WorkerId, (JobId, Instant)>,
 }
 
 impl<A: Admission> Engine<A> {
@@ -411,6 +423,7 @@ impl<A: Admission> Engine<A> {
             deferred: Vec::new(),
             wakeup: None,
             learned: BTreeMap::new(),
+            shadows: HashMap::new(),
         }
     }
 
@@ -629,6 +642,7 @@ impl<A: Admission> Engine<A> {
         }
         if let Some(holder) = w.reserved_for
             && holder != job.spec.id
+            && !self.shadow_backfills(job, w)
         {
             return Some(Refusal::ReservedFor(holder));
         }
@@ -640,6 +654,78 @@ impl<A: Admission> Engine<A> {
             return Some(Refusal::Lane);
         }
         None
+    }
+
+    /// Whether `job` may backfill reserved worker `w`: it is expected to finish before the
+    /// holder's shadow time.
+    fn shadow_backfills(&self, job: &Waiting, w: &Worker) -> bool {
+        let (Some(&(_, t)), Some(work)) = (self.shadows.get(&w.state.id), job.spec.work) else {
+            return false;
+        };
+        self.now + work / speed_of(w) <= t
+    }
+
+    /// The holder's shadow time on reserved worker `w`: the expected end of the running job
+    /// whose release lets the holder be admitted (now, if it already is). `None` if some end is
+    /// unknown or no release suffices.
+    fn shadow_time(&self, w: &Worker, holder: JobId) -> Option<Instant> {
+        let demand = self.waiting.get(&holder)?.spec.demand;
+        let speed = speed_of(w);
+        let mut ends: Vec<(f64, Resources)> = Vec::with_capacity(w.jobs.len());
+        for j in &w.jobs {
+            let r = &self.running[j];
+            let end = r.started + r.work? / speed;
+            // An overrunning job: assume it is half done.
+            ends.push((
+                if end > self.now {
+                    end
+                } else {
+                    self.now + (self.now - r.started)
+                },
+                r.demand,
+            ));
+        }
+        ends.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let fits = |running: usize, placed: Resources| {
+            let state = &w.state;
+            running < state.slots
+                && (running == 0
+                    || (state.reported_baseline + placed + demand).fits_within(&state.budget))
+        };
+        let (mut running, mut placed) = (w.running, w.placed);
+        if fits(running, placed) {
+            return Some(self.now);
+        }
+        for (end, d) in ends {
+            running -= 1;
+            placed -= d;
+            if fits(running, placed) {
+                return Some(end);
+            }
+        }
+        None
+    }
+
+    /// Compute the shadow time of each new reservation, and forget those of released ones. A
+    /// reservation's shadow time is fixed once known, so that an overrun can exceed it.
+    fn refresh_shadows(&mut self) {
+        if self
+            .mode
+            .reservations
+            .as_ref()
+            .is_none_or(|c| !c.shadow_backfill)
+        {
+            return;
+        }
+        let live: HashMap<WorkerId, JobId> = self.reservations.iter().map(|r| (r.1, r.0)).collect();
+        self.shadows.retain(|w, (h, _)| live.get(w) == Some(h));
+        for (&w, &holder) in &live {
+            if !self.shadows.contains_key(&w)
+                && let Some(t) = self.shadow_time(&self.workers[&w], holder)
+            {
+                self.shadows.insert(w, (holder, t));
+            }
+        }
     }
 
     /// Whether a busy big lane keeps its reserve headroom from a small job of this demand.
@@ -975,7 +1061,8 @@ impl<A: Admission> Engine<A> {
     fn open_bound(&self) -> Option<Resources> {
         let mut acc: Option<Resources> = None;
         for w in self.workers.values() {
-            if w.reserved_for.is_some() {
+            // A reserved worker takes others only by shadow backfill.
+            if w.reserved_for.is_some() && !self.shadows.contains_key(&w.state.id) {
                 continue;
             }
             if let Some(b) = self.admission.bound(&w.view()) {
@@ -1042,6 +1129,7 @@ impl<A: Admission> Engine<A> {
             // Deferral records survive a restart (the scan may stop before reaching those jobs
             // again); the slot bookings are rebuilt.
             proj.clear();
+            self.refresh_shadows();
             loop {
                 let Some(job) = self.next_job(&mut cursor) else {
                     break 'scan;
@@ -1088,6 +1176,7 @@ impl<A: Admission> Engine<A> {
                                 Self::earliest(&mut timed, job, j.since + cfg.max_wait);
                             }
                         } else if self.try_reserve(job) {
+                            self.refresh_shadows();
                             // A taken-over worker may admit the job now that it is the holder.
                             if let Pick::Place(w) =
                                 self.choose(&self.waiting[&job], gate.as_ref(), &mut proj)

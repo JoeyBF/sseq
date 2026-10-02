@@ -48,7 +48,9 @@ fn run(p: &mut dyn Policy, s: &Stream) -> Option<f64> {
         let waiting = p.stats().waiting;
         for _ in waiting..(s.workers * s.slots / 2).max(2) {
             let (demand, d) = s.small[next as usize % s.small.len()];
-            p.submit(JobSpec::new(next, Resources::mem(demand), 1_000 + next), t);
+            let mut small = JobSpec::new(next, Resources::mem(demand), 1_000 + next);
+            small.work = Some(d as f64);
+            p.submit(small, t);
             duration.insert(next, d);
             next += 1;
         }
@@ -82,6 +84,13 @@ fn policies() -> Vec<(&'static str, Box<dyn Policy>)> {
     };
     vec![
         ("backfill", Box::new(PriorityBackfill::new(bf.clone()))),
+        (
+            "backfill, shadow",
+            Box::new(PriorityBackfill::new(BackfillConfig {
+                shadow_backfill: true,
+                ..bf.clone()
+            })),
+        ),
         (
             "bestfit",
             Box::new(BestFit::new(BestFitConfig {
