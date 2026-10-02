@@ -136,10 +136,49 @@ stable.
   declares dependencies. Separately, and with a larger effect: exclude running tasks from the
   worker's reported baseline.
 
+## Admission without the double count (`baseline_excl`)
+
+The worker will report `baseline_excl`: its rolling RSS floor minus the estimates of the jobs it
+runs. With it as `reported_baseline`, `ProductionAdmission` is exactly
+`running < slots && (running == 0 || max(rss, baseline_excl + Σ placed) + demand <= budget)`.
+Replayed by rebuilding `baseline_excl` from the samples (`max(0, rss - estimates running)`, same
+rolling windows as the floor; `sched-sim --baseline excl`), open loop, `age_limit = 1800 s`:
+
+| baseline | estimates | policy | wait p90 / p99 / max | slot util | modelled heartbeats over budget (max excess) |
+|---|---|---|---|---|---|
+| floor (today) | as recorded | backfill | 57 s / 30.0 m / 37.6 m | 73.4% | 0% |
+| floor (today) | as recorded | best fit | 57 s / 30.0 m / 35.7 m | 74.6% | 0.003% (4.9 GB) |
+| **excl** | as recorded | **backfill** | **0 s / 7.8 s / 13.9 m** | 71.4% | **0.008% (5.7 GB)** |
+| excl | as recorded | best fit | 0 s / 5.2 s / 13.0 m | 60.7% | 0.19% (34 GB) |
+| idle (oracle) | as recorded | backfill | 0 s / 11.2 s / 37.2 m | 71.5% | 0.003% (0.1 GB) |
+| floor | x0.32 | backfill | 0 s / 7.6 s / 13.8 m | 71.4% | 0.05% (17 GB) |
+| excl | x0.32 | backfill | 0 s / 7.6 s / 13.8 m | 71.4% | 0.05% (17 GB) |
+| excl | x0.32 | best fit | 0 s / 4.9 s / 13.0 m | 60.6% | 0.34% (34 GB) |
+
+All arms finish the same work in the same time (W/h within 0.7%); slot utilisation drops because
+jobs no longer queue, not because work is lost.
+
+- **`baseline_excl` removes the double count**: waits collapse to seconds, as with the oracle idle
+  baseline, at unchanged throughput.
+- **Overrun risk.** The trace's RSS never exceeded a budget (0 of 37,521 samples), and it does not
+  respond to simulated placements, so the risk is modelled: each job occupies its recorded
+  estimate times a per-job fraction, log-normal (sd 0.5, an assumption) around the trace's median
+  ratio of `(RSS - idle)` to estimates running, **0.595** (p10 0.38, p90 0.87, p99 1.11, over
+  37,498 samples). With backfill and `baseline_excl` the modelled RSS exceeds the budget at 0.008%
+  of heartbeats (about 3 minutes in 33 hours over 21 workers). Best fit packs the L40S tighter
+  and raises that to 0.19%: prefer backfill with `baseline_excl`. Since admission still compares
+  against reported RSS, real overruns would also be capped by that safety term, which the replay
+  cannot show.
+- **The recorded estimates are not 6x.** On this trace jobs occupy about 0.6 of their recorded
+  estimate in aggregate (1.7x, not 6x), so the x0.32 arm puts estimates *below* actual use
+  (0.54x): it admits more and overruns 6x more often (0.05%), and with x0.32 the baseline no
+  longer matters (floor and excl agree). Scale estimates only as far as the measured peak allows.
+
 ## Limitations
 
-- RSS and the baseline are replayed from the trace, not modelled, so the simulation cannot show
-  memory overruns caused by a policy, nor a drained worker's RSS dropping.
+- RSS and the baseline are replayed from the trace (overruns only through the usage model above),
+  so the simulation cannot show a policy's effect on real memory, nor a drained worker's RSS
+  dropping.
 - Workers join at their trace join times and never leave, and job durations follow the
   processor-sharing model, so failures, retries and per-job variance beyond the model are absent.
 - Closed loop uses each job's measured gap after its dependencies and oracle work estimates for
