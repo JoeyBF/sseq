@@ -1,0 +1,723 @@
+//! The optional dependency layer in front of a [`Policy`].
+
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+
+use petgraph::{
+    Direction::{Incoming, Outgoing},
+    stable_graph::{NodeIndex, StableDiGraph},
+    visit::EdgeRef,
+};
+
+use crate::{Instant, JobId, JobSpec, Policy, PolicyStats, WorkerId, WorkerState};
+
+/// A job with dependencies.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DagJob {
+    /// The job, as it will be submitted to the policy.
+    pub spec: JobSpec,
+    /// Jobs that must all complete before this one is ready. A dependency may name a job that is
+    /// not declared yet (a forward reference): it is pending until declared and completed. A
+    /// dependency on a job that already completed is satisfied.
+    pub deps: Vec<JobId>,
+    /// Relative cost, for ranking. `None` uses [`DagConfig::default_work`].
+    pub work_estimate: Option<f64>,
+}
+
+/// Errors from [`Dag::declare`]. A failed declaration changes nothing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DagError {
+    /// The declaration would close a dependency cycle through this job.
+    Cycle {
+        /// A job on the cycle.
+        job: JobId,
+    },
+    /// The job is already declared (or completed), or appears twice in the batch.
+    Duplicate(JobId),
+}
+
+impl std::fmt::Display for DagError {
+    /// A one-line description of the error.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Cycle { job } => write!(f, "declaring job {job} would create a dependency cycle"),
+            Self::Duplicate(job) => write!(f, "job {job} is already declared"),
+        }
+    }
+}
+
+impl std::error::Error for DagError {}
+
+/// Configuration for [`DagScheduler`].
+#[derive(Clone, Debug, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct DagConfig {
+    /// Rank jobs by the critical path below them instead of "oldest group first": a job without an
+    /// explicit [`JobSpec::priority`] is submitted with priority `-(rank * rank_scale)`, so longer
+    /// remaining chains are more urgent. Default false.
+    pub rank_priority: bool,
+    /// Converts ranks (in work units) to integer priorities. Default 1000.
+    pub rank_scale: f64,
+    /// Work of a job declared without an estimate. Default 1.
+    pub default_work: f64,
+    /// Ranks are maintained approximately: a rank increase smaller than this fraction is not
+    /// propagated to the job's dependencies. Bounds the cost of growing the graph. Default 0.01.
+    pub rank_epsilon: f64,
+    /// Submit jobs to the policy as soon as they are ready (the default). When false, ready jobs
+    /// are queued; the caller collects them with [`DagScheduler::take_ready`] and submits each
+    /// with [`DagScheduler::release`] when it is actually sendable (e.g. after coordinator-side
+    /// preparation).
+    pub auto_submit: bool,
+}
+
+impl Default for DagConfig {
+    /// The defaults documented on each field.
+    fn default() -> Self {
+        Self {
+            rank_priority: false,
+            rank_scale: 1000.0,
+            default_work: 1.0,
+            rank_epsilon: 0.01,
+            auto_submit: true,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+enum State {
+    /// Referenced as a dependency, not declared yet.
+    Undeclared,
+    /// Declared, some dependency not completed.
+    Pending,
+    /// All dependencies completed, waiting for [`DagScheduler::release`].
+    Held,
+    /// Handed to the policy (waiting or running there).
+    Submitted,
+}
+
+#[derive(Clone, Debug)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+struct Node {
+    id: JobId,
+    state: State,
+    /// `None` while undeclared.
+    spec: Option<JobSpec>,
+    /// Dependencies not completed yet (= in-degree).
+    unmet: u32,
+    work: f64,
+    /// Upward rank: work plus the longest chain of work among descendants (approximate).
+    rank: f64,
+}
+
+/// Counters describing the DAG layer's state.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct DagStats {
+    /// Declared jobs whose dependencies are not all complete.
+    pub pending: usize,
+    /// Jobs referenced as dependencies but not declared yet.
+    pub undeclared: usize,
+    /// Ready jobs waiting for `release` (only without `auto_submit`).
+    pub held: usize,
+    /// Jobs handed to the policy and not completed.
+    pub submitted: usize,
+    /// Dependency edges between live jobs.
+    pub edges: usize,
+    /// Completed job ids remembered so that later dependencies on them are satisfied.
+    pub completed_remembered: usize,
+    /// Declared group placeholders.
+    pub placeholders: usize,
+}
+
+/// The dependency layer's interface. [`DagScheduler`] implements it over any [`Policy`].
+pub trait Dag {
+    /// Declare jobs. The graph grows during the run; dependencies may be forward references.
+    /// Rejects (and leaves no trace of) a batch that would create a cycle or redeclare a job.
+    /// Jobs whose dependencies are all complete become ready immediately.
+    fn declare(&mut self, jobs: Vec<DagJob>, now: Instant) -> Result<(), DagError>;
+    /// Declare work known to come but not yet expandable: group `group` will exist after the
+    /// groups `after_groups` complete and costs about `cost`. Only ranks use this. Redeclaring a
+    /// group replaces its placeholder.
+    fn declare_group_placeholder(&mut self, group: u64, after_groups: Vec<u64>, cost: f64);
+    /// A job completed: its dependents may become ready. Forwards to the policy.
+    fn completed(&mut self, job: JobId, now: Instant);
+    /// Cancel a job and, transitively, every job depending on it (they can never run). Returns the
+    /// cancelled ids. Forwards each submitted one to the policy.
+    fn cancel(&mut self, job: JobId) -> Vec<JobId>;
+    /// Passthrough of [`Policy::worker_update`].
+    fn worker_update(&mut self, w: WorkerState, now: Instant);
+    /// Passthrough of [`Policy::worker_gone`]. Resubmit its jobs with
+    /// [`DagScheduler::resubmit`].
+    fn worker_gone(&mut self, w: WorkerId, now: Instant);
+    /// Passthrough of [`Policy::dispatch`].
+    fn dispatch(&mut self, now: Instant) -> Vec<(JobId, WorkerId)>;
+    /// Why a job is not running: unmet dependencies, held, or the policy's explanation.
+    fn explain(&self, job: JobId) -> Option<String>;
+    /// Passthrough of [`Policy::stats`].
+    fn stats(&self) -> PolicyStats;
+}
+
+/// A [`Dag`] in front of a [`Policy`].
+///
+/// Jobs are declared with their dependencies, possibly long before they are ready; a job is
+/// submitted to the policy when its last dependency completes. The graph lives in a petgraph
+/// [`StableGraph`](petgraph::stable_graph::StableGraph) (edges point from a dependency to its
+/// dependent); completed jobs are removed from it, so its size tracks the live frontier rather
+/// than the whole run.
+#[derive(Clone, Debug)]
+pub struct DagScheduler<P> {
+    config: DagConfig,
+    policy: P,
+    graph: StableDiGraph<Node, ()>,
+    index: HashMap<JobId, NodeIndex>,
+    completed: HashSet<JobId>,
+    completed_floor: JobId,
+    /// Ready ids not yet returned by `take_ready`, in readiness order.
+    newly_ready: Vec<JobId>,
+    placeholders: BTreeMap<u64, (Vec<u64>, f64)>,
+    /// group -> placeholder groups that wait for it.
+    waiters: HashMap<u64, Vec<u64>>,
+    tail_memo: HashMap<u64, f64>,
+    now: Instant,
+}
+
+impl<P: Policy> DagScheduler<P> {
+    /// A DAG layer in front of `policy`.
+    pub fn new(config: DagConfig, policy: P) -> Self {
+        Self {
+            config,
+            policy,
+            graph: StableDiGraph::default(),
+            index: HashMap::new(),
+            completed: HashSet::new(),
+            completed_floor: 0,
+            newly_ready: Vec::new(),
+            placeholders: BTreeMap::new(),
+            waiters: HashMap::new(),
+            tail_memo: HashMap::new(),
+            now: 0.0,
+        }
+    }
+
+    /// The wrapped policy.
+    pub fn policy(&self) -> &P {
+        &self.policy
+    }
+
+    /// The wrapped policy, mutably (e.g. to call [`Policy::submit`] for jobs outside the DAG).
+    pub fn policy_mut(&mut self) -> &mut P {
+        &mut self.policy
+    }
+
+    /// Ids that became ready since the last call, in readiness order. With `auto_submit` they are
+    /// already submitted; otherwise submit each with [`release`](Self::release).
+    pub fn take_ready(&mut self) -> Vec<JobId> {
+        std::mem::take(&mut self.newly_ready)
+    }
+
+    /// Submit a ready, held job to the policy (only meaningful without `auto_submit`). Returns
+    /// false if the job is not held.
+    pub fn release(&mut self, job: JobId, now: Instant) -> bool {
+        self.now = now;
+        match self.index.get(&job) {
+            Some(&n) if self.graph[n].state == State::Held => {
+                self.submit_node(n, now);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Submit a job again (e.g. after its worker left). Returns false unless the job was submitted
+    /// and has not completed.
+    pub fn resubmit(&mut self, job: JobId, now: Instant) -> bool {
+        self.now = now;
+        match self.index.get(&job) {
+            Some(&n) if self.graph[n].state == State::Submitted => {
+                self.submit_node(n, now);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Forget remembered completed ids below `floor`, and treat every id below `floor` as
+    /// completed from now on. Use when ids are allocated increasingly and everything below `floor`
+    /// is known to be done, to keep memory proportional to the live frontier.
+    pub fn forget_completed_below(&mut self, floor: JobId) {
+        if floor > self.completed_floor {
+            self.completed_floor = floor;
+            self.completed.retain(|&j| j >= floor);
+        }
+    }
+
+    /// Remove a group placeholder.
+    pub fn remove_group_placeholder(&mut self, group: u64) {
+        if let Some((after, _)) = self.placeholders.remove(&group) {
+            for h in after {
+                if let Some(v) = self.waiters.get_mut(&h) {
+                    v.retain(|&g| g != group);
+                }
+            }
+            self.tail_memo.clear();
+        }
+    }
+
+    /// The job's current upward rank (its work plus the longest chain of descendants' work), plus
+    /// the estimated cost of placeholder groups waiting on its group. `None` for unknown jobs.
+    pub fn rank(&mut self, job: JobId) -> Option<f64> {
+        let &n = self.index.get(&job)?;
+        let group = self.graph[n].spec.as_ref().map(|s| s.group);
+        Some(self.graph[n].rank + group.map_or(0.0, |g| self.group_tail(g)))
+    }
+
+    /// Counters.
+    pub fn dag_stats(&self) -> DagStats {
+        let mut s = DagStats {
+            edges: self.graph.edge_count(),
+            completed_remembered: self.completed.len(),
+            placeholders: self.placeholders.len(),
+            ..DagStats::default()
+        };
+        for n in self.graph.node_weights() {
+            match n.state {
+                State::Undeclared => s.undeclared += 1,
+                State::Pending => s.pending += 1,
+                State::Held => s.held += 1,
+                State::Submitted => s.submitted += 1,
+            }
+        }
+        s
+    }
+
+    /// Whether `job` is known to have completed (remembered, or below the floor).
+    fn is_completed(&self, job: JobId) -> bool {
+        job < self.completed_floor || self.completed.contains(&job)
+    }
+
+    /// A placeholder node for a job named as a dependency before being declared.
+    fn undeclared(&mut self, id: JobId) -> NodeIndex {
+        let n = self.graph.add_node(Node {
+            id,
+            state: State::Undeclared,
+            spec: None,
+            unmet: 0,
+            work: 0.0,
+            rank: 0.0,
+        });
+        self.index.insert(id, n);
+        n
+    }
+
+    /// A job on a cycle reachable from `starts`, if any (iterative three-colour DFS along
+    /// dependent edges; only the part of the graph reachable from the new jobs is visited).
+    fn find_cycle(&self, starts: &[NodeIndex]) -> Option<JobId> {
+        // 1 = on the DFS stack, 2 = finished.
+        let mut colour: HashMap<NodeIndex, u8> = HashMap::new();
+        for &s in starts {
+            if colour.contains_key(&s) {
+                continue;
+            }
+            colour.insert(s, 1);
+            let mut stack = vec![(
+                s,
+                self.graph
+                    .neighbors_directed(s, Outgoing)
+                    .collect::<Vec<_>>(),
+            )];
+            while let Some((node, children)) = stack.last_mut() {
+                match children.pop() {
+                    Some(c) => match colour.get(&c) {
+                        Some(1) => return Some(self.graph[c].id),
+                        Some(_) => {}
+                        None => {
+                            colour.insert(c, 1);
+                            let next = self.graph.neighbors_directed(c, Outgoing).collect();
+                            stack.push((c, next));
+                        }
+                    },
+                    None => {
+                        colour.insert(*node, 2);
+                        stack.pop();
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Raise ancestors' ranks after `start`'s rank grew.
+    fn propagate_rank(&mut self, start: NodeIndex) {
+        let eps = self.config.rank_epsilon.max(0.0);
+        let mut stack = vec![start];
+        while let Some(n) = stack.pop() {
+            let r = self.graph[n].rank;
+            let preds: Vec<_> = self.graph.neighbors_directed(n, Incoming).collect();
+            for p in preds {
+                let cand = self.graph[p].work + r;
+                let old = self.graph[p].rank;
+                if cand > old * (1.0 + eps) && cand > old {
+                    self.graph[p].rank = cand;
+                    stack.push(p);
+                }
+            }
+        }
+    }
+
+    /// The longest chain of placeholder cost waiting on `group`, memoised until placeholders change.
+    fn group_tail(&mut self, group: u64) -> f64 {
+        /// Memoised depth-first longest path through the placeholder waiters of `g`.
+        fn go(
+            g: u64,
+            placeholders: &BTreeMap<u64, (Vec<u64>, f64)>,
+            waiters: &HashMap<u64, Vec<u64>>,
+            memo: &mut HashMap<u64, f64>,
+            visiting: &mut HashSet<u64>,
+        ) -> f64 {
+            if let Some(&t) = memo.get(&g) {
+                return t;
+            }
+            if !visiting.insert(g) {
+                return 0.0; // placeholder cycle: ignore the back edge
+            }
+            let mut best = 0.0f64;
+            for &p in waiters.get(&g).map_or(&[][..], |v| v) {
+                let cost = placeholders.get(&p).map_or(0.0, |x| x.1);
+                best = best.max(cost + go(p, placeholders, waiters, memo, visiting));
+            }
+            visiting.remove(&g);
+            memo.insert(g, best);
+            best
+        }
+        if self.placeholders.is_empty() {
+            return 0.0;
+        }
+        go(
+            group,
+            &self.placeholders,
+            &self.waiters,
+            &mut self.tail_memo,
+            &mut HashSet::new(),
+        )
+    }
+
+    /// Hand a ready job to the policy, with its rank as priority if configured.
+    fn submit_node(&mut self, n: NodeIndex, now: Instant) {
+        self.graph[n].state = State::Submitted;
+        let mut spec = self.graph[n]
+            .spec
+            .clone()
+            .expect("submitting an undeclared job");
+        if self.config.rank_priority && spec.priority.is_none() {
+            let rank = self.graph[n].rank + self.group_tail(spec.group);
+            let p = -(rank * self.config.rank_scale).round();
+            spec.priority = Some(p.clamp(i64::MIN as f64, i64::MAX as f64) as i64);
+        }
+        self.policy.submit(spec, now);
+    }
+
+    /// Record that a job has no unmet dependencies left, and submit or hold it.
+    fn make_ready(&mut self, n: NodeIndex, now: Instant) {
+        self.newly_ready.push(self.graph[n].id);
+        if self.config.auto_submit {
+            self.submit_node(n, now);
+        } else {
+            self.graph[n].state = State::Held;
+        }
+    }
+
+    /// Undo a rejected declaration: its edges, its new nodes and its filled-in forward references.
+    fn rollback(&mut self, batch: &[NodeIndex], created: &[NodeIndex]) {
+        for &n in batch {
+            let edges: Vec<_> = self
+                .graph
+                .edges_directed(n, Incoming)
+                .map(|e| e.id())
+                .collect();
+            for e in edges {
+                self.graph.remove_edge(e);
+            }
+            let node = &mut self.graph[n];
+            node.state = State::Undeclared;
+            node.spec = None;
+            node.unmet = 0;
+            node.work = 0.0;
+        }
+        for &n in created {
+            if let Some(node) = self.graph.remove_node(n) {
+                self.index.remove(&node.id);
+            }
+        }
+    }
+
+    /// Restore a scheduler from a snapshot, in front of a fresh `policy`. Jobs that were submitted
+    /// (waiting or running in the old policy) are submitted again at `now`; held jobs stay held and
+    /// are returned again by [`take_ready`](Self::take_ready).
+    #[cfg(feature = "serde")]
+    pub fn restore(snapshot: DagSnapshot, policy: P, now: Instant) -> Self {
+        let mut s = Self::new(snapshot.config, policy);
+        s.graph = snapshot.graph;
+        s.completed = snapshot.completed.into_iter().collect();
+        s.completed_floor = snapshot.completed_floor;
+        for (g, (after, cost)) in snapshot.placeholders {
+            s.declare_group_placeholder(g, after, cost);
+        }
+        let mut submitted = Vec::new();
+        let mut held = Vec::new();
+        for n in s.graph.node_indices() {
+            let node = &s.graph[n];
+            s.index.insert(node.id, n);
+            match node.state {
+                State::Submitted => submitted.push((node.id, n)),
+                State::Held => held.push(node.id),
+                _ => {}
+            }
+        }
+        submitted.sort_unstable();
+        for (_, n) in submitted {
+            s.submit_node(n, now);
+        }
+        held.sort_unstable();
+        s.newly_ready = held;
+        s.now = now;
+        s
+    }
+
+    /// A serialisable snapshot of the declared DAG (not of the policy): pending, held and
+    /// submitted jobs with their edges, remembered completions and placeholders.
+    #[cfg(feature = "serde")]
+    pub fn snapshot(&self) -> DagSnapshot {
+        let mut completed: Vec<_> = self.completed.iter().copied().collect();
+        completed.sort_unstable();
+        DagSnapshot {
+            config: self.config.clone(),
+            graph: self.graph.clone(),
+            completed,
+            completed_floor: self.completed_floor,
+            placeholders: self.placeholders.clone(),
+        }
+    }
+}
+
+/// A serialisable snapshot of a [`DagScheduler`]'s declared graph; see
+/// [`DagScheduler::snapshot`] and [`DagScheduler::restore`].
+#[cfg(feature = "serde")]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct DagSnapshot {
+    config: DagConfig,
+    graph: StableDiGraph<Node, ()>,
+    completed: Vec<JobId>,
+    completed_floor: JobId,
+    placeholders: BTreeMap<u64, (Vec<u64>, f64)>,
+}
+
+impl<P: Policy> Dag for DagScheduler<P> {
+    /// Validate ids, insert nodes and edges, reject cycles, update ranks, then release ready jobs.
+    fn declare(&mut self, jobs: Vec<DagJob>, now: Instant) -> Result<(), DagError> {
+        self.now = now;
+        // Validate ids before touching anything.
+        let mut seen = HashSet::with_capacity(jobs.len());
+        for j in &jobs {
+            let id = j.spec.id;
+            let redeclared = self
+                .index
+                .get(&id)
+                .is_some_and(|&n| self.graph[n].state != State::Undeclared);
+            if !seen.insert(id) || redeclared || self.is_completed(id) {
+                return Err(DagError::Duplicate(id));
+            }
+        }
+        let mut batch = Vec::with_capacity(jobs.len());
+        let mut created = Vec::new();
+        for j in &jobs {
+            let n = match self.index.get(&j.spec.id) {
+                Some(&n) => n,
+                None => {
+                    let n = self.undeclared(j.spec.id);
+                    created.push(n);
+                    n
+                }
+            };
+            let node = &mut self.graph[n];
+            node.state = State::Pending;
+            node.spec = Some(j.spec.clone());
+            node.work = j.work_estimate.unwrap_or(self.config.default_work);
+            batch.push(n);
+        }
+        for (j, &n) in jobs.iter().zip(&batch) {
+            let mut deps = j.deps.clone();
+            deps.sort_unstable();
+            deps.dedup();
+            for d in deps {
+                if self.is_completed(d) {
+                    continue;
+                }
+                let dn = match self.index.get(&d) {
+                    Some(&dn) => dn,
+                    None => {
+                        let dn = self.undeclared(d);
+                        created.push(dn);
+                        dn
+                    }
+                };
+                self.graph.add_edge(dn, n, ());
+                self.graph[n].unmet += 1;
+            }
+        }
+        if let Some(job) = self.find_cycle(&batch) {
+            self.rollback(&batch, &created);
+            return Err(DagError::Cycle { job });
+        }
+        for &n in &batch {
+            let below = self
+                .graph
+                .neighbors_directed(n, Outgoing)
+                .map(|c| self.graph[c].rank)
+                .fold(0.0, f64::max);
+            self.graph[n].rank = self.graph[n].work + below;
+            self.propagate_rank(n);
+        }
+        for &n in &batch {
+            if self.graph[n].unmet == 0 {
+                self.make_ready(n, now);
+            }
+        }
+        Ok(())
+    }
+
+    /// Replace the group's placeholder and invalidate the memoised tails.
+    fn declare_group_placeholder(&mut self, group: u64, after_groups: Vec<u64>, cost: f64) {
+        self.remove_group_placeholder(group);
+        for &h in &after_groups {
+            self.waiters.entry(h).or_default().push(group);
+        }
+        self.placeholders.insert(group, (after_groups, cost));
+        self.tail_memo.clear();
+    }
+
+    /// Release the job's dependents, drop its node and remember it as completed.
+    fn completed(&mut self, job: JobId, now: Instant) {
+        self.now = now;
+        self.policy.completed(job, now);
+        if let Some(n) = self.index.remove(&job) {
+            let mut dependents: Vec<_> = self
+                .graph
+                .neighbors_directed(n, Outgoing)
+                .map(|c| (self.graph[c].id, c))
+                .collect();
+            dependents.sort_unstable();
+            self.graph.remove_node(n);
+            for (_, c) in dependents {
+                let node = &mut self.graph[c];
+                node.unmet -= 1;
+                if node.unmet == 0 && node.state == State::Pending {
+                    self.make_ready(c, now);
+                }
+            }
+        }
+        if job >= self.completed_floor {
+            self.completed.insert(job);
+        }
+    }
+
+    /// Remove the job and its descendants, then any forward references only they needed.
+    fn cancel(&mut self, job: JobId) -> Vec<JobId> {
+        let Some(&start) = self.index.get(&job) else {
+            self.policy.cancel(job);
+            return Vec::new();
+        };
+        let mut doomed = BTreeSet::new();
+        let mut stack = vec![start];
+        while let Some(n) = stack.pop() {
+            if doomed.insert((self.graph[n].id, n)) {
+                stack.extend(self.graph.neighbors_directed(n, Outgoing));
+            }
+        }
+        let mut orphan_candidates = Vec::new();
+        let mut cancelled = Vec::with_capacity(doomed.len());
+        for &(id, n) in &doomed {
+            orphan_candidates.extend(self.graph.neighbors_directed(n, Incoming));
+            if self.graph[n].state == State::Submitted {
+                self.policy.cancel(id);
+            }
+            if self.graph[n].state != State::Undeclared {
+                cancelled.push(id);
+            }
+        }
+        for &(id, n) in &doomed {
+            self.graph.remove_node(n);
+            self.index.remove(&id);
+        }
+        self.newly_ready
+            .retain(|j| !doomed.iter().any(|d| d.0 == *j));
+        // Forward references kept alive only by the cancelled jobs are no longer needed.
+        for n in orphan_candidates {
+            let orphan = self
+                .graph
+                .node_weight(n)
+                .is_some_and(|w| w.state == State::Undeclared)
+                && self.graph.neighbors_directed(n, Outgoing).next().is_none();
+            if orphan && let Some(w) = self.graph.remove_node(n) {
+                self.index.remove(&w.id);
+            }
+        }
+        cancelled
+    }
+
+    /// Forwarded to the policy.
+    fn worker_update(&mut self, w: WorkerState, now: Instant) {
+        self.now = now;
+        self.policy.worker_update(w, now);
+    }
+
+    /// Forwarded to the policy.
+    fn worker_gone(&mut self, w: WorkerId, now: Instant) {
+        self.now = now;
+        self.policy.worker_gone(w, now);
+    }
+
+    /// Forwarded to the policy.
+    fn dispatch(&mut self, now: Instant) -> Vec<(JobId, WorkerId)> {
+        self.now = now;
+        self.policy.dispatch(now)
+    }
+
+    /// The DAG's reason while the job is not submitted, the policy's afterwards.
+    fn explain(&self, job: JobId) -> Option<String> {
+        let Some(&n) = self.index.get(&job) else {
+            return if self.is_completed(job) {
+                Some(format!("job {job} completed"))
+            } else {
+                self.policy.explain(job)
+            };
+        };
+        let node = &self.graph[n];
+        match node.state {
+            State::Undeclared => Some(format!(
+                "job {job} is not declared yet (named as a dependency of {} job(s))",
+                self.graph.neighbors_directed(n, Outgoing).count()
+            )),
+            State::Pending => {
+                let mut deps: Vec<JobId> = self
+                    .graph
+                    .neighbors_directed(n, Incoming)
+                    .map(|d| self.graph[d].id)
+                    .collect();
+                deps.sort_unstable();
+                let shown: Vec<_> = deps.iter().take(8).collect();
+                Some(format!(
+                    "job {job} waits for {} dependenc{} {shown:?}{}",
+                    deps.len(),
+                    if deps.len() == 1 { "y" } else { "ies" },
+                    if deps.len() > 8 { " ..." } else { "" }
+                ))
+            }
+            State::Held => Some(format!("job {job} is ready and held until release")),
+            State::Submitted => self.policy.explain(job),
+        }
+    }
+
+    /// Forwarded to the policy.
+    fn stats(&self) -> PolicyStats {
+        self.policy.stats()
+    }
+}
