@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use clap::Parser;
 use sched::{
-    Defer, SlowGate, SpeedConfig, SpeedPolicy,
+    Defer, SpeedConfig, SpeedPolicy,
     sim::{
         model::fit,
         small::{
@@ -27,7 +27,7 @@ use sched::{
 #[command(about = "Typical-case and adversarial comparison of two dispatch plans")]
 struct Args {
     /// Plan A: group | rank | rank-oracle | grouprank | grouprank-oracle, with optional suffixes
-    /// +fast, +eft (wait up to --max-defer), `+eft<percent>` (wait only for that much gain), +gate,
+    /// +fast, +eft (wait up to --max-defer), `+eft<percent>` (wait only for that much gain),
     /// +spoil (restart stuck jobs on faster workers), `+age<seconds>`.
     #[arg(long)]
     a: String,
@@ -53,7 +53,7 @@ struct Args {
     /// See `max_n`.
     #[arg(long, default_value = "l40s:2:4,h200:1:4")]
     fleet: String,
-    /// Voluntary-wait bound for +eft and +gate, seconds.
+    /// Voluntary-wait bound for +eft, seconds.
     #[arg(long, default_value_t = 1e9)]
     max_defer: f64,
     /// Replica: random cost perturbations applied to each sampled instance.
@@ -115,15 +115,6 @@ fn plan(name: &str, max_defer: f64) -> SmallPlan {
                     max_wait: max_defer,
                     min_gain: 0.0,
                 }))
-            }
-            "gate" => {
-                if p.speed.policy == SpeedPolicy::Oblivious {
-                    p.speed.policy = SpeedPolicy::FastestFirst;
-                }
-                p.speed.slow_gate = Some(SlowGate {
-                    factor: 1.0,
-                    max_wait: max_defer,
-                });
             }
             "spoil" => {
                 if p.speed.policy == SpeedPolicy::Oblivious {

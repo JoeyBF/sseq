@@ -12,8 +12,8 @@ use std::{
 
 use proptest::prelude::*;
 use sched::{
-    BackfillConfig, FailKind, FailOutcome, JobSpec, PriorityBackfill, Resources, RetryConfig,
-    SharedPolicy, SlowGate, SpeedConfig, SpeedPolicy, WorkerState,
+    Config, Defer, FailKind, FailOutcome, JobSpec, Resources, RetryConfig, Scheduler, SharedPolicy,
+    SpeedConfig, SpeedPolicy, WorkerState,
 };
 
 /// A worker of class "x".
@@ -27,8 +27,8 @@ fn job(id: u64) -> JobSpec {
 }
 
 /// A front end over the default backfill policy.
-fn shared() -> SharedPolicy<PriorityBackfill> {
-    SharedPolicy::with_system_clock(PriorityBackfill::new(BackfillConfig::default()))
+fn shared() -> SharedPolicy<Scheduler> {
+    SharedPolicy::with_system_clock(Scheduler::new(Config::default()))
 }
 
 /// `place` blocks until a worker joins, then returns it.
@@ -149,35 +149,40 @@ fn dropped_lease_releases() {
     assert_eq!(s.stats().running, 0);
 }
 
-/// Without events, the ticker lets a gated job go once its gate expires.
+/// Without events, the ticker lets a deferred job go once its deferral expires.
 #[test]
 fn ticker_releases_timed_waits() {
-    let policy = PriorityBackfill::new(BackfillConfig {
+    let policy = Scheduler::new(Config {
         speed: SpeedConfig {
-            policy: SpeedPolicy::FastestFirst,
-            slow_gate: Some(SlowGate {
-                factor: 1.0,
+            policy: SpeedPolicy::EarliestFinish(Some(Defer {
                 max_wait: 0.2,
-            }),
+                min_gain: 0.0,
+            })),
             ..SpeedConfig::default()
         },
-        ..BackfillConfig::default()
+        ..Config::default()
     });
+    let work = |id, work| JobSpec {
+        work: Some(work),
+        ..job(id)
+    };
     let s = Arc::new(SharedPolicy::with_system_clock(policy));
     s.worker_update(WorkerState {
         speed: 2.0,
         ..worker(1, 1)
     });
     s.worker_update(worker(2, 1));
-    // The fast worker is busy; the slow one is free but gated.
-    assert_eq!(s.place(job(1)).worker, 1);
+    // The fast worker is busy for 5 s; job 2 would still finish there first (15 s against 20 s on
+    // the slow worker), so it waits for it.
+    assert_eq!(s.place(work(1, 10.0)).worker, 1);
     assert!(
-        s.place_timeout(job(2), Duration::from_millis(50)).is_err(),
-        "gated"
+        s.place_timeout(work(2, 20.0), Duration::from_millis(50))
+            .is_err(),
+        "deferred"
     );
     let ticker = s.spawn_ticker(Duration::from_millis(20));
     let start = std::time::Instant::now();
-    let p = s.place(job(2));
+    let p = s.place(work(2, 20.0));
     assert_eq!(p.worker, 2);
     assert!(start.elapsed() < Duration::from_secs(5));
     s.stop_ticker();
@@ -211,7 +216,7 @@ proptest! {
     #[test]
     fn attempts_avoid_and_no_leaks(ops in prop::collection::vec(op(), 1..120)) {
         let s = SharedPolicy::with_retry(
-            PriorityBackfill::new(BackfillConfig::default()),
+            Scheduler::new(Config::default()),
             || 0.0,
             RetryConfig { max_attempts: 3 },
         );
@@ -312,7 +317,7 @@ fn stress_many_threads_with_churn() {
     const JOBS_PER_THREAD: u64 = 5;
     const SLOTS: usize = 16;
     let s = Arc::new(SharedPolicy::with_retry(
-        PriorityBackfill::new(BackfillConfig::default()),
+        Scheduler::new(Config::default()),
         {
             let start = std::time::Instant::now();
             move || start.elapsed().as_secs_f64()
@@ -439,7 +444,7 @@ fn dispatch_p99_at_frontier_size() {
     if cfg!(debug_assertions) {
         return;
     }
-    let mut p = PriorityBackfill::new(BackfillConfig::default());
+    let mut p = Scheduler::new(Config::default());
     for w in 0..21 {
         p.worker_update(
             WorkerState::new(
@@ -453,7 +458,7 @@ fn dispatch_p99_at_frontier_size() {
     }
     let mut next = 0u64;
     let mut running = std::collections::VecDeque::new();
-    let mut submit = |p: &mut PriorityBackfill, t: f64| {
+    let mut submit = |p: &mut Scheduler, t: f64| {
         let mut j = JobSpec::new(next, Resources::mem_gb(1.0 + (next % 13) as f64), next / 50);
         j.work = Some(60.0);
         p.submit(j, t);

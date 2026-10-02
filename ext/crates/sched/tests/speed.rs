@@ -1,8 +1,8 @@
-//! Speed-aware placement: fastest-first, earliest finish with deferral, and the slow-worker gate.
+//! Speed-aware placement: fastest-first, earliest finish with deferral, learning and spoliation.
 
 use sched::{
-    BackfillConfig, BestFit, BestFitConfig, Defer, Greedy, GreedyConfig, JobId, JobSpec, Policy,
-    PriorityBackfill, Resources, SlowGate, SpeedConfig, SpeedPolicy, WorkerState,
+    Config, Defer, JobId, JobSpec, Policy, Resources, Scheduler, SpeedConfig, SpeedPolicy,
+    WorkerState,
 };
 
 /// A worker of the given speed with ample memory.
@@ -27,34 +27,23 @@ fn job(id: JobId, work: Option<f64>) -> JobSpec {
 }
 
 /// A backfill policy with the given speed settings.
-fn backfill(speed: SpeedConfig) -> PriorityBackfill {
-    PriorityBackfill::new(BackfillConfig {
+fn backfill(speed: SpeedConfig) -> Scheduler {
+    Scheduler::new(Config {
         speed,
-        ..BackfillConfig::default()
+        ..Config::default()
     })
 }
 
-/// Fastest first beats load balancing, for every policy, including best fit's tight packing.
+/// Fastest first beats load balancing, for every preset, including best fit's tight packing.
 #[test]
 fn fastest_first_picks_the_fast_worker() {
     let speed = SpeedConfig {
         policy: SpeedPolicy::FastestFirst,
-        slow_gate: None,
         learn: None,
         spoliation: None,
     };
-    let policies: Vec<Box<dyn Policy>> = vec![
-        Box::new(Greedy::new(GreedyConfig { speed })),
-        Box::new(backfill(speed)),
-        Box::new(BestFit::new(BestFitConfig {
-            backfill: BackfillConfig {
-                speed,
-                ..BackfillConfig::default()
-            },
-            prefer_penalty: 0.0,
-        })),
-    ];
-    for mut p in policies {
+    for base in [Config::fifo(), Config::default(), Config::best_fit()] {
+        let mut p = Scheduler::new(Config { speed, ..base });
         p.worker_update(worker(1, 4, 1.0), 0.0);
         // The fast worker has more room left, which best fit alone would avoid.
         p.worker_update(
@@ -93,7 +82,6 @@ fn earliest_finish_defers_only_when_it_pays() {
     };
     let speed = SpeedConfig {
         policy: SpeedPolicy::EarliestFinish(Some(defer)),
-        slow_gate: None,
         learn: None,
         spoliation: None,
     };
@@ -134,7 +122,6 @@ fn deferral_expires() {
     };
     let speed = SpeedConfig {
         policy: SpeedPolicy::EarliestFinish(Some(defer)),
-        slow_gate: None,
         learn: None,
         spoliation: None,
     };
@@ -161,7 +148,6 @@ fn deferrals_book_slots_in_order() {
     };
     let speed = SpeedConfig {
         policy: SpeedPolicy::EarliestFinish(Some(defer)),
-        slow_gate: None,
         learn: None,
         spoliation: None,
     };
@@ -180,86 +166,11 @@ fn deferrals_book_slots_in_order() {
     assert_eq!(d, vec![(1, 1.0), (2, 6.0), (3, 11.0)]);
 }
 
-/// The gate keeps the slow worker idle while the fast one absorbs the backlog, opens when the
-/// backlog grows, and lets a job go after `max_wait`.
-#[test]
-fn slow_gate() {
-    let gate = SlowGate {
-        factor: 1.0,
-        max_wait: 60.0,
-    };
-    let speed = SpeedConfig {
-        policy: SpeedPolicy::FastestFirst,
-        slow_gate: Some(gate),
-        learn: None,
-        spoliation: None,
-    };
-    let mut p = backfill(speed);
-    p.worker_update(worker(1, 2, 1.0), 0.0);
-    p.worker_update(worker(2, 2, 2.0), 0.0);
-    // Threshold: backlog / 2 fast slots >= 2.0 / 1.0, i.e. backlog >= 4.
-    for i in 0..3 {
-        p.submit(job(i, None), 0.0);
-    }
-    // Backlog 3: two go fast, the third stays off the slow worker.
-    assert_eq!(p.dispatch(0.0), vec![(0, 2), (1, 2)]);
-    assert!(p.explain(2).unwrap().contains("slow-worker gate"));
-    assert_eq!(p.next_wakeup(), Some(60.0));
-    // A big backlog opens the slow worker.
-    for i in 3..8 {
-        p.submit(job(i, None), 1.0);
-    }
-    let out = p.dispatch(1.0);
-    assert_eq!(out.iter().filter(|x| x.1 == 1).count(), 2, "{out:?}");
-    // Drain to a small backlog again: the remainder waits, then goes after max_wait.
-    let mut q = backfill(speed);
-    q.worker_update(worker(1, 1, 1.0), 0.0);
-    q.worker_update(worker(2, 1, 2.0), 0.0);
-    q.submit(job(0, None), 0.0);
-    q.submit(job(1, None), 0.0);
-    assert_eq!(q.dispatch(0.0), vec![(0, 2)]);
-    assert!(q.dispatch(59.0).is_empty());
-    assert_eq!(q.dispatch(60.0), vec![(1, 1)]);
-}
-
-/// Jobs that cannot run on the fast class are never gated; aged jobs are not either.
-#[test]
-fn gate_exemptions() {
-    let gate = SlowGate {
-        factor: 1.0,
-        max_wait: 1e9,
-    };
-    let speed = SpeedConfig {
-        policy: SpeedPolicy::FastestFirst,
-        slow_gate: Some(gate),
-        learn: None,
-        spoliation: None,
-    };
-    let mut p = PriorityBackfill::new(BackfillConfig {
-        speed,
-        age_limit: Some(100.0),
-        ..BackfillConfig::default()
-    });
-    p.worker_update(worker(1, 1, 1.0), 0.0);
-    p.worker_update(worker(2, 1, 2.0), 0.0);
-    let mut pinned = job(0, None);
-    pinned.class = Some("slow".into());
-    p.submit(pinned, 0.0);
-    assert_eq!(p.dispatch(0.0), vec![(0, 1)]);
-    p.completed(0, 1.0);
-    p.submit(job(1, None), 1.0);
-    p.submit(job(2, None), 1.0);
-    assert_eq!(p.dispatch(1.0), vec![(1, 2)]);
-    assert!(p.dispatch(50.0).is_empty());
-    assert_eq!(p.dispatch(101.0), vec![(2, 1)], "aged jobs bypass the gate");
-}
-
 /// Speeds learned from completion times override the reported ones once warmed up.
 #[test]
 fn learned_speeds_replace_reported_ones() {
     let speed = SpeedConfig {
         policy: SpeedPolicy::FastestFirst,
-        slow_gate: None,
         learn: Some(sched::Learn::default()),
         spoliation: None,
     };
@@ -305,7 +216,6 @@ fn learned_speeds_replace_reported_ones() {
 fn spoliation_moves_a_stuck_job() {
     let speed = SpeedConfig {
         policy: SpeedPolicy::FastestFirst,
-        slow_gate: None,
         learn: None,
         spoliation: Some(sched::Spoliation::default()),
     };
@@ -356,7 +266,6 @@ fn spoliation_moves_a_stuck_job() {
 fn capped_worker_learned_per_worker() {
     let speed = SpeedConfig {
         policy: SpeedPolicy::FastestFirst,
-        slow_gate: None,
         learn: Some(sched::Learn::default()),
         spoliation: None,
     };

@@ -9,13 +9,13 @@ use std::{
 
 use proptest::prelude::*;
 use sched::{
-    BackfillConfig, Dag, DagConfig, DagJob, DagScheduler, DagTemplate, InstanceSpec, JobId,
-    JobSpec, NodeLabel, PriorityBackfill, Resources, WorkerState,
+    Config, Dag, DagConfig, DagJob, DagScheduler, DagTemplate, InstanceSpec, JobId, JobSpec,
+    NodeLabel, Resources, Scheduler, WorkerState,
 };
 
 /// A DAG layer over the default backfill policy with one worker of `slots` slots.
-fn sched(slots: usize, config: DagConfig) -> DagScheduler<PriorityBackfill> {
-    let mut d = DagScheduler::new(config, PriorityBackfill::new(BackfillConfig::default()));
+fn sched(slots: usize, config: DagConfig) -> DagScheduler<Scheduler> {
+    let mut d = DagScheduler::new(config, Scheduler::new(Config::default()));
     d.worker_update(
         WorkerState::new(0, "x", slots, Resources::mem(1 << 40)),
         0.0,
@@ -41,7 +41,7 @@ fn instance(template: &Arc<DagTemplate>, base: JobId, entry: JobId, done: JobId)
 }
 
 /// A local entry job `1` (the zero step), already completed.
-fn with_entry(d: &mut DagScheduler<PriorityBackfill>) {
+fn with_entry(d: &mut DagScheduler<Scheduler>) {
     d.declare(
         vec![DagJob::new(JobSpec::new(1, Resources::ZERO, 7), vec![]).local()],
         0.0,
@@ -87,7 +87,7 @@ fn per_node_demand_and_label() {
 
 /// The completion order of an instance driven to the end: every round, dispatch, then complete
 /// every running job in id order; also returns how often `done` (99) fired.
-fn drive(d: &mut DagScheduler<PriorityBackfill>) -> (Vec<JobId>, usize) {
+fn drive(d: &mut DagScheduler<Scheduler>) -> (Vec<JobId>, usize) {
     let mut order = Vec::new();
     let mut done = 0;
     for _ in 0..1000 {
@@ -309,7 +309,7 @@ fn done_id(w: usize) -> JobId {
 
 /// Declare the workload. A walk's `done` is depended on by a fresh explicit job (`600 + w`),
 /// which a later explicit job `after` also waits for only if `after > entry` (no cycles).
-fn declare(d: &mut DagScheduler<PriorityBackfill>, w: &Workload) -> BTreeSet<JobId> {
+fn declare(d: &mut DagScheduler<Scheduler>, w: &Workload) -> BTreeSet<JobId> {
     let mut all = BTreeSet::new();
     let mut jobs = Vec::new();
     for (i, (deps, local)) in w.explicit.iter().enumerate() {
@@ -355,7 +355,7 @@ fn run(w: &Workload, restarts: &BTreeSet<usize>) -> Result<BTreeMap<JobId, usize
             let snap = serde_json::to_string(&d.snapshot()).unwrap();
             d = DagScheduler::restore(
                 serde_json::from_str(&snap).unwrap(),
-                PriorityBackfill::new(BackfillConfig::default()),
+                Scheduler::new(Config::default()),
                 step as f64,
             );
             d.worker_update(

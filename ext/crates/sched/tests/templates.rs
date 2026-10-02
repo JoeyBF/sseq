@@ -4,13 +4,13 @@ use std::collections::BTreeMap;
 
 use proptest::prelude::*;
 use sched::{
-    BackfillConfig, Dag, DagConfig, DagError, DagJob, DagScheduler, DagTemplate, JobId, JobSpec,
-    Policy, PriorityBackfill, Resources, WorkerState,
+    Config, Dag, DagConfig, DagError, DagJob, DagScheduler, DagTemplate, JobId, JobSpec, Policy,
+    Resources, Scheduler, WorkerState,
 };
 
 /// A DAG layer over one 64-slot worker.
-fn dag(config: DagConfig) -> DagScheduler<PriorityBackfill> {
-    let mut d = DagScheduler::new(config, PriorityBackfill::new(BackfillConfig::default()));
+fn dag(config: DagConfig) -> DagScheduler<Scheduler> {
+    let mut d = DagScheduler::new(config, Scheduler::new(Config::default()));
     d.worker_update(WorkerState::new(0, "x", 64, Resources::mem(1000)), 0.0);
     d
 }
@@ -21,7 +21,7 @@ fn job(id: JobId, deps: &[JobId]) -> DagJob {
 }
 
 /// The ids placed by a dispatch, sorted.
-fn placed(d: &mut DagScheduler<PriorityBackfill>, now: f64) -> Vec<JobId> {
+fn placed(d: &mut DagScheduler<Scheduler>, now: f64) -> Vec<JobId> {
     let mut v: Vec<JobId> = d.dispatch(now).into_iter().map(|p| p.0).collect();
     v.sort_unstable();
     v
@@ -185,7 +185,7 @@ fn templates_instantiate_per_group() {
 /// Avoid lists and classes exclude workers; a job excluded everywhere waits and says so.
 #[test]
 fn avoid_and_class_are_hard_constraints() {
-    let mut p = PriorityBackfill::new(BackfillConfig::default());
+    let mut p = Scheduler::new(Config::default());
     p.worker_update(WorkerState::new(1, "h200", 4, Resources::mem(100)), 0.0);
     p.worker_update(WorkerState::new(2, "l40s", 4, Resources::mem(100)), 0.0);
     let mut retry = JobSpec::new(1, Resources::mem(1), 0);
@@ -266,7 +266,7 @@ proptest! {
         // No workers: nothing runs, so every job stays in the graph.
         let mut d = DagScheduler::new(
             DagConfig { rank_epsilon: 0.0, ..DagConfig::default() },
-            PriorityBackfill::new(BackfillConfig::default()),
+            Scheduler::new(Config::default()),
         );
         let ids: Vec<JobId> = (0..n as JobId).rev().collect();
         for chunk in ids.chunks(batch) {

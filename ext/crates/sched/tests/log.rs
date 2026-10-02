@@ -5,7 +5,7 @@
 use std::sync::{Arc, Mutex};
 
 use sched::{
-    BestFit, BestFitConfig, EventSink, Policy, Resources, WorkerState,
+    Config, EventSink, Policy, Resources, Scheduler, WorkerState,
     log::{Event, JsonlSink, Logged, TaskInfo},
     sim::{
         model::fit,
@@ -43,8 +43,8 @@ fn placements(events: &[Event]) -> Vec<(u64, String, f64)> {
 }
 
 /// The policy under test.
-fn policy() -> BestFit {
-    BestFit::new(BestFitConfig::default())
+fn policy() -> Scheduler {
+    Scheduler::new(Config::best_fit())
 }
 
 /// Run the workload with a simple event-driven driver (jobs run at speed 1 whatever the

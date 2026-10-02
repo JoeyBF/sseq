@@ -1,9 +1,6 @@
 //! Reservation edge cases: holder cancelled, worker loss and join, heartbeats.
 
-use sched::{
-    BackfillConfig, BestFit, BestFitConfig, JobSpec, Policy, PriorityBackfill, Resources,
-    WorkerState,
-};
+use sched::{Config, JobSpec, Policy, Reservations, Resources, Scheduler, WorkerState};
 
 /// A worker of class "x" with the given reported usage.
 fn worker(id: u64, slots: usize, budget: u64, used: u64) -> WorkerState {
@@ -20,8 +17,8 @@ fn job(id: u64, demand: u64, group: u64) -> JobSpec {
 
 /// Two workers (budget 100, 4 slots) each running one 60-unit job; a 50-unit job (group 0, the
 /// most urgent) fits nowhere. After `reserve_after` it reserves a worker.
-fn starving() -> PriorityBackfill {
-    let mut p = PriorityBackfill::new(BackfillConfig::default());
+fn starving() -> Scheduler {
+    let mut p = Scheduler::new(Config::default());
     p.worker_update(worker(1, 4, 100, 0), 0.0);
     p.worker_update(worker(2, 4, 100, 0), 0.0);
     p.submit(job(10, 60, 1), 0.0);
@@ -38,7 +35,7 @@ fn starving() -> PriorityBackfill {
 }
 
 /// The worker of the only reservation.
-fn reserved_worker(p: &PriorityBackfill) -> u64 {
+fn reserved_worker(p: &Scheduler) -> u64 {
     p.stats().reservations[0].worker
 }
 
@@ -122,7 +119,7 @@ fn heartbeat_lowering_usage_admits_the_holder_early() {
 /// Reported usage above the placed sum blocks admission until it drops.
 #[test]
 fn heartbeat_raising_usage_blocks_placements() {
-    let mut p = PriorityBackfill::new(BackfillConfig::default());
+    let mut p = Scheduler::new(Config::default());
     p.worker_update(worker(1, 4, 100, 0), 0.0);
     p.submit(job(1, 10, 0), 0.0);
     assert_eq!(p.dispatch(0.0).len(), 1);
@@ -165,12 +162,12 @@ fn more_urgent_job_cannot_take_a_reserved_worker() {
 /// Per-class limits allow one reservation per worker class.
 #[test]
 fn per_class_reservations() {
-    let mut p = BestFit::new(BestFitConfig {
-        backfill: BackfillConfig {
-            per_class_reservations: true,
-            ..BackfillConfig::default()
-        },
-        prefer_penalty: 0.0,
+    let mut p = Scheduler::new(Config {
+        reservations: Some(Reservations {
+            per_class: true,
+            ..Reservations::default()
+        }),
+        ..Config::best_fit()
     });
     for (id, class) in [(1, "a"), (2, "a"), (3, "b"), (4, "b")] {
         p.worker_update(WorkerState::new(id, class, 4, Resources::mem(100)), 0.0);
@@ -189,10 +186,13 @@ fn per_class_reservations() {
 }
 
 /// [`starving`], with shadow-time backfill and known work: the two 60-unit jobs end at 100 s.
-fn starving_shadow() -> PriorityBackfill {
-    let mut p = PriorityBackfill::new(BackfillConfig {
-        shadow_backfill: true,
-        ..BackfillConfig::default()
+fn starving_shadow() -> Scheduler {
+    let mut p = Scheduler::new(Config {
+        reservations: Some(Reservations {
+            shadow_backfill: true,
+            ..Reservations::default()
+        }),
+        ..Config::default()
     });
     p.worker_update(worker(1, 4, 100, 0), 0.0);
     p.worker_update(worker(2, 4, 100, 0), 0.0);

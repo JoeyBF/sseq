@@ -4,13 +4,13 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use proptest::prelude::*;
 use sched::{
-    BackfillConfig, Dag, DagConfig, DagError, DagJob, DagScheduler, JobId, JobSpec,
-    PriorityBackfill, Resources, WorkerState,
+    Config, Dag, DagConfig, DagError, DagJob, DagScheduler, JobId, JobSpec, Resources, Scheduler,
+    WorkerState,
 };
 
 /// A DAG layer over backfill with one roomy worker.
-fn dag(config: DagConfig) -> DagScheduler<PriorityBackfill> {
-    let mut d = DagScheduler::new(config, PriorityBackfill::new(BackfillConfig::default()));
+fn dag(config: DagConfig) -> DagScheduler<Scheduler> {
+    let mut d = DagScheduler::new(config, Scheduler::new(Config::default()));
     d.worker_update(WorkerState::new(0, "x", 64, Resources::mem(1000)), 0.0);
     d
 }
@@ -27,7 +27,7 @@ fn job(id: JobId, deps: &[JobId]) -> DagJob {
 }
 
 /// The ids placed by a dispatch, sorted.
-fn placed(d: &mut DagScheduler<PriorityBackfill>, now: f64) -> Vec<JobId> {
+fn placed(d: &mut DagScheduler<Scheduler>, now: f64) -> Vec<JobId> {
     let mut v: Vec<JobId> = d.dispatch(now).into_iter().map(|p| p.0).collect();
     v.sort_unstable();
     v
@@ -184,7 +184,7 @@ fn rank_priority_orders_ready_jobs() {
             rank_priority: true,
             ..DagConfig::default()
         },
-        PriorityBackfill::new(BackfillConfig::default()),
+        Scheduler::new(Config::default()),
     );
     d.worker_update(WorkerState::new(0, "x", 1, Resources::mem(1000)), 0.0);
     let w = |id, deps: &[JobId], work| DagJob {
@@ -236,7 +236,7 @@ fn snapshot_round_trip() {
     placed(&mut d, 0.0);
     let json = serde_json::to_string(&d.snapshot()).unwrap();
     let snap = serde_json::from_str(&json).unwrap();
-    let mut r = DagScheduler::restore(snap, PriorityBackfill::new(BackfillConfig::default()), 10.0);
+    let mut r = DagScheduler::restore(snap, Scheduler::new(Config::default()), 10.0);
     r.worker_update(WorkerState::new(0, "x", 64, Resources::mem(1000)), 10.0);
     assert_eq!(r.dag_stats(), d.dag_stats());
     // Job 1 was submitted before the snapshot: it is submitted again to the new policy.
@@ -277,13 +277,13 @@ proptest! {
                 deps.get_mut(&b).unwrap().insert(a);
             }
         }
-        let mut d = DagScheduler::new(DagConfig::default(), PriorityBackfill::new(BackfillConfig::default()));
+        let mut d = DagScheduler::new(DagConfig::default(), Scheduler::new(Config::default()));
         d.worker_update(WorkerState::new(0, "x", slots, Resources::mem(10)), 0.0);
         let ids: Vec<JobId> = order.into_iter().filter(|&i| i < n).map(|i| i as JobId).collect();
         let mut done: BTreeSet<JobId> = BTreeSet::new();
         let mut running: Vec<JobId> = Vec::new();
         let mut t = 0.0;
-        let step = |d: &mut DagScheduler<PriorityBackfill>,
+        let step = |d: &mut DagScheduler<Scheduler>,
                     done: &mut BTreeSet<JobId>,
                     running: &mut Vec<JobId>,
                     t: &mut f64|

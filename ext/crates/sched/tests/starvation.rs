@@ -3,10 +3,7 @@
 use std::collections::BTreeMap;
 
 use proptest::prelude::*;
-use sched::{
-    BackfillConfig, BestFit, BestFitConfig, Greedy, GreedyConfig, JobSpec, LaneSet, Lanes,
-    LanesConfig, Policy, PriorityBackfill, Resources, WorkerState,
-};
+use sched::{Config, JobSpec, Policy, Reservations, Resources, Scheduler, WorkerState};
 
 const TICK: f64 = 1.0;
 const RESERVE_AFTER: f64 = 60.0;
@@ -30,7 +27,7 @@ struct Stream {
 /// worker, so it is placed at the latest when the jobs running there at that moment finish:
 /// `wait <= reserve_after + D + tick`, where `D` is the longest small-job duration and `tick` the
 /// dispatch granularity. (A job behind more urgent starving jobs waits for their reservations
-/// first.) Greedy, as a control, starves the big job for the whole stream.
+/// first.) FIFO, as a control, starves the big job for the whole stream.
 fn run(p: &mut dyn Policy, s: &Stream) -> Option<f64> {
     for w in 0..s.workers {
         p.worker_update(
@@ -76,43 +73,32 @@ fn run(p: &mut dyn Policy, s: &Stream) -> Option<f64> {
     None
 }
 
-/// The policies that must not starve, with `RESERVE_AFTER`.
+/// The configurations that must not starve, with `RESERVE_AFTER`.
 fn policies() -> Vec<(&'static str, Box<dyn Policy>)> {
-    let bf = BackfillConfig {
-        reserve_after: RESERVE_AFTER,
-        ..BackfillConfig::default()
+    let reserve = |shadow_backfill| {
+        Some(Reservations {
+            reserve_after: RESERVE_AFTER,
+            shadow_backfill,
+            ..Reservations::default()
+        })
+    };
+    let make = |base: Config, shadow| -> Box<dyn Policy> {
+        Box::new(Scheduler::new(Config {
+            reservations: reserve(shadow),
+            ..base
+        }))
     };
     vec![
-        ("backfill", Box::new(PriorityBackfill::new(bf.clone()))),
-        (
-            "backfill, shadow",
-            Box::new(PriorityBackfill::new(BackfillConfig {
-                shadow_backfill: true,
-                ..bf.clone()
-            })),
-        ),
-        (
-            "bestfit",
-            Box::new(BestFit::new(BestFitConfig {
-                backfill: bf.clone(),
-                prefer_penalty: 0.0,
-            })),
-        ),
-        (
-            "lanes",
-            Box::new(Lanes::new(LanesConfig {
-                backfill: bf,
-                lanes: LaneSet::Workers(vec![0]),
-                big_threshold: Resources::mem(30),
-                lane_reserve: Resources::mem(10),
-            })),
-        ),
+        ("backfill", make(Config::default(), false)),
+        ("backfill, shadow", make(Config::default(), true)),
+        ("bestfit", make(Config::best_fit(), false)),
+        ("bestfit, shadow", make(Config::best_fit(), true)),
     ]
 }
 
-/// Greedy starves the big job; the reserving policies meet the bound.
+/// FIFO starves the big job; the reserving configurations meet the bound.
 #[test]
-fn greedy_starves_and_backfill_does_not() {
+fn fifo_starves_and_backfill_does_not() {
     let s = Stream {
         workers: 3,
         slots: 8,
@@ -123,9 +109,9 @@ fn greedy_starves_and_backfill_does_not() {
         horizon: 5_000.0,
     };
     assert_eq!(
-        run(&mut Greedy::new(GreedyConfig::default()), &s),
+        run(&mut Scheduler::new(Config::fifo()), &s),
         None,
-        "greedy should starve it"
+        "FIFO should starve it"
     );
     let d = s.small.iter().map(|x| x.1).max().unwrap() as f64;
     for (name, mut p) in policies() {

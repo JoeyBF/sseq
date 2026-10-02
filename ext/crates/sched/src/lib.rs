@@ -3,27 +3,28 @@
 #![warn(missing_docs)]
 
 mod admission;
+mod config;
 mod dag;
-mod engine;
 pub mod log;
 pub use log::EventSink;
 pub mod nassau;
+mod scheduler;
 mod shared;
 #[cfg(feature = "sim")]
 pub mod sim;
 mod speed;
 
 pub use admission::{Admission, ProductionAdmission, WorkerView};
+pub use config::{
+    Config, DEFAULT_AGE_LIMIT, Defer, Fit, GroupOrder, Order, Reservations, SpeedConfig,
+    SpeedPolicy, Spoliation,
+};
 #[cfg(feature = "serde")]
 pub use dag::DagSnapshot;
 pub use dag::{
     Dag, DagConfig, DagError, DagJob, DagScheduler, DagStats, DagTemplate, InstanceSpec, NodeLabel,
 };
-pub use engine::{
-    BackfillConfig, BestFit, BestFitConfig, DEFAULT_AGE_LIMIT, Defer, Greedy, GreedyConfig,
-    GroupOrder, LaneSet, Lanes, LanesConfig, PriorityBackfill, SlowGate, SpeedConfig, SpeedPolicy,
-    Spoliation,
-};
+pub use scheduler::Scheduler;
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 pub use shared::{Attempt, FailKind, FailOutcome, Lease, Placement, RetryConfig, SharedPolicy};
@@ -180,7 +181,7 @@ pub struct JobSpec {
     /// default priority is "oldest group first, then FIFO within a group".
     pub group: u64,
     /// Explicit priority overriding group order; smaller is more urgent. Jobs without one count as
-    /// the policy's `default_priority` (0 by default), so negative values jump ahead of
+    /// [`Order::Priority`]'s `default_priority` (0 by default), so negative values jump ahead of
     /// unprioritised jobs and positive values fall behind them.
     pub priority: Option<i64>,
     /// Soft placement preference (cache affinity): workers to try first. Never required.
@@ -378,8 +379,8 @@ pub trait Policy {
         }
     }
     /// The next time `dispatch` should be called even if no event arrives: a job's voluntary wait
-    /// (for a faster worker, or behind the slow-worker gate) expires then. `None` if nothing is
-    /// timed. Callers with frequent events may ignore it at the cost of that much extra waiting.
+    /// for a faster worker ([`Defer`]) expires then. `None` if nothing is timed. Callers with
+    /// frequent events may ignore it at the cost of that much extra waiting.
     fn next_wakeup(&self) -> Option<Instant> {
         None
     }

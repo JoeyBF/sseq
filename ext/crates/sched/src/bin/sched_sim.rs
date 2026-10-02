@@ -4,8 +4,7 @@ use std::{path::PathBuf, time::Instant};
 
 use clap::Parser;
 use sched::{
-    BackfillConfig, BestFit, BestFitConfig, DagConfig, Greedy, GreedyConfig, LaneSet, Lanes,
-    LanesConfig, PriorityBackfill, Resources,
+    Config, DagConfig, Fit, Reservations, Scheduler,
     sim::{
         model::{ClassCurve, PsModel, fit},
         run::{Baseline, BoxPolicy, Metrics, SimSetup, Usage, production, simulate},
@@ -25,12 +24,9 @@ struct Args {
     /// The trace (JSONL, optionally gzipped).
     #[arg(long)]
     trace: PathBuf,
-    /// Policies to run (greedy, backfill, bestfit, lanes, backfill-noreserve).
-    #[arg(
-        long,
-        value_delimiter = ',',
-        default_value = "greedy,backfill,bestfit,lanes"
-    )]
+    /// Policies to run (fifo, backfill, bestfit, backfill-shadow, bestfit-shadow,
+    /// backfill-noreserve).
+    #[arg(long, value_delimiter = ',', default_value = "fifo,backfill,bestfit")]
     policies: Vec<String>,
     /// Closed-loop arrivals (a job arrives the measured gap after its dependencies complete in the
     /// simulation) through the DAG layer, instead of at the trace's `ready_s`.
@@ -42,25 +38,19 @@ struct Args {
     /// Write all metrics and the model fit as JSON here.
     #[arg(long)]
     json: Option<PathBuf>,
-    /// BackfillConfig::reserve_after, seconds.
+    /// Reservations::reserve_after, seconds.
     #[arg(long, default_value_t = 60.0)]
     reserve_after: f64,
-    /// BackfillConfig::max_reservations.
+    /// Reservations::max.
     #[arg(long, default_value_t = 1)]
     max_reservations: usize,
-    /// BackfillConfig::age_limit, seconds (aging; none by default).
+    /// Config::age_limit, seconds (aging; none by default).
     #[arg(long)]
     age_limit: Option<f64>,
     /// Count reservations per worker class.
     #[arg(long)]
     per_class: bool,
-    /// Lanes: the worker class used as big lanes.
-    #[arg(long, default_value = "h200")]
-    lane_class: String,
-    /// Lanes: headroom (GB) a lane keeps free from small jobs.
-    #[arg(long, default_value_t = 12.0)]
-    lane_reserve_gb: f64,
-    /// Jobs above this estimate (GB) are "big" (metrics, lanes).
+    /// Jobs above this estimate (GB) are "big" in the metrics.
     #[arg(long, default_value_t = 7.5)]
     big_gb: f64,
     /// Reported baseline: "floor" (production's rolling RSS floor, replayed from the samples),
@@ -104,43 +94,46 @@ struct Args {
 
 /// The named policy configured from the command line, or `None` for an unknown name.
 fn make_policy(name: &str, a: &Args) -> Option<BoxPolicy> {
-    let backfill = BackfillConfig {
+    let reservations = Reservations {
         reserve_after: a.reserve_after,
-        max_reservations: a.max_reservations,
-        per_class_reservations: a.per_class,
-        age_limit: a.age_limit,
-        ..BackfillConfig::default()
+        max: a.max_reservations,
+        per_class: a.per_class,
+        shadow_backfill: false,
     };
-    Some(match name {
-        "greedy" => Box::new(Greedy::new(GreedyConfig::default())),
-        "backfill" => Box::new(PriorityBackfill::new(backfill)),
-        "backfill-shadow" => Box::new(PriorityBackfill::new(BackfillConfig {
+    let backfill = Config {
+        reservations: Some(reservations),
+        age_limit: a.age_limit,
+        ..Config::default()
+    };
+    let shadow = Config {
+        reservations: Some(Reservations {
             shadow_backfill: true,
-            ..backfill.clone()
-        })),
-        "bestfit-shadow" => Box::new(BestFit::new(BestFitConfig {
-            backfill: BackfillConfig {
-                shadow_backfill: true,
-                ..backfill.clone()
-            },
-            prefer_penalty: 0.0,
-        })),
-        "backfill-noreserve" => Box::new(PriorityBackfill::new(BackfillConfig {
-            max_reservations: 0,
+            ..reservations
+        }),
+        ..backfill.clone()
+    };
+    let tightest = Fit::Tightest {
+        prefer_penalty: 0.0,
+    };
+    let config = match name {
+        "fifo" => Config::fifo(),
+        "backfill" => backfill,
+        "backfill-shadow" => shadow,
+        "bestfit-shadow" => Config {
+            fit: tightest,
+            ..shadow
+        },
+        "backfill-noreserve" => Config {
+            reservations: None,
             ..backfill
-        })),
-        "bestfit" => Box::new(BestFit::new(BestFitConfig {
-            backfill,
-            prefer_penalty: 0.0,
-        })),
-        "lanes" => Box::new(Lanes::new(LanesConfig {
-            backfill,
-            lanes: LaneSet::Classes(vec![a.lane_class.clone()]),
-            big_threshold: Resources::mem_gb(a.big_gb),
-            lane_reserve: Resources::mem_gb(a.lane_reserve_gb),
-        })),
+        },
+        "bestfit" => Config {
+            fit: tightest,
+            ..backfill
+        },
         _ => return None,
-    })
+    };
+    Some(Box::new(Scheduler::new(config)))
 }
 
 /// A duration in seconds, in the largest unit that keeps it readable.

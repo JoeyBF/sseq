@@ -4,8 +4,8 @@ use std::{collections::BTreeSet, sync::Arc};
 
 use proptest::prelude::*;
 use sched::{
-    BackfillConfig, Dag, DagConfig, DagJob, DagScheduler, DagTemplate, InstanceSpec, JobId,
-    JobSpec, PriorityBackfill, Resources, WorkerState,
+    Config, Dag, DagConfig, DagJob, DagScheduler, DagTemplate, InstanceSpec, JobId, JobSpec,
+    Resources, Scheduler, WorkerState,
 };
 
 /// A random group structure: per group, its template index, its passthrough flags and the
@@ -65,12 +65,12 @@ fn world() -> impl Strategy<Value = World> {
 }
 
 /// A scheduler holding `w`, built explicitly or with instances.
-fn build(w: &World, implicit: bool) -> DagScheduler<PriorityBackfill> {
+fn build(w: &World, implicit: bool) -> DagScheduler<Scheduler> {
     build_with(w, implicit, None)
 }
 
 /// [`build`] with an open-instance budget.
-fn build_with(w: &World, implicit: bool, budget: Option<usize>) -> DagScheduler<PriorityBackfill> {
+fn build_with(w: &World, implicit: bool, budget: Option<usize>) -> DagScheduler<Scheduler> {
     let mut d = DagScheduler::new(
         DagConfig {
             auto_submit: false,
@@ -79,7 +79,7 @@ fn build_with(w: &World, implicit: bool, budget: Option<usize>) -> DagScheduler<
             max_open_instances: budget,
             ..DagConfig::default()
         },
-        PriorityBackfill::new(BackfillConfig::default()),
+        Scheduler::new(Config::default()),
     );
     d.worker_update(WorkerState::new(0, "x", 1, Resources::mem(1)), 0.0);
     let templates: Vec<Arc<DagTemplate>> = w
@@ -168,7 +168,7 @@ proptest! {
                 let json = serde_json::to_string(&y.snapshot()).unwrap();
                 y = DagScheduler::restore(
                     serde_json::from_str(&json).unwrap(),
-                    PriorityBackfill::new(BackfillConfig::default()),
+                    Scheduler::new(Config::default()),
                     steps as f64,
                 );
                 let again: BTreeSet<JobId> = y.take_ready().into_iter().collect();
@@ -194,11 +194,8 @@ proptest! {
 }
 
 /// A two-node instance with an explicit job after its `done`.
-fn small() -> DagScheduler<PriorityBackfill> {
-    let mut d = DagScheduler::new(
-        DagConfig::default(),
-        PriorityBackfill::new(BackfillConfig::default()),
-    );
+fn small() -> DagScheduler<Scheduler> {
+    let mut d = DagScheduler::new(DagConfig::default(), Scheduler::new(Config::default()));
     d.worker_update(WorkerState::new(0, "x", 8, Resources::mem(10)), 0.0);
     d.declare(
         vec![DagJob::new(JobSpec::new(1, Resources::ZERO, 0), vec![])],

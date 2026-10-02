@@ -33,10 +33,10 @@ priorities.
 ## Event loop
 
 ```rust
-use sched::{BackfillConfig, JobSpec, Policy, PriorityBackfill, Resources, WorkerState};
+use sched::{Config, JobSpec, Policy, Resources, Scheduler, WorkerState};
 
 let gb = |x: u64| Resources::mem(x << 30);
-let mut policy = PriorityBackfill::new(BackfillConfig::default());
+let mut policy = Scheduler::new(Config::default());
 
 // A worker joins (and later heartbeats): 16 slots, 120 GB, 20 GB used by its runtime.
 let mut w = WorkerState::new(1, "l40s", 16, gb(120));
@@ -95,30 +95,33 @@ thread; a typical call takes microseconds.
   `reported_baseline` must exclude the running jobs' memory (the worker's resident floor minus
   their estimates); a floor that contains them counts them twice.
 
-## Policies
+## The scheduler
 
-All implement [`Policy`]; parameters are plain config structs with defaults.
+[`Scheduler`] implements [`Policy`]; a plain [`Config`] decides its behaviour, with presets:
 
-| policy | order | worker choice | reservations |
+| preset | order ([`Order`]) | worker choice ([`Fit`]) | reservations |
 |---|---|---|---|
-| [`Greedy`] | arrival | preferred, then least loaded | none (big jobs starve) |
-| [`PriorityBackfill`] | priority, group arrival, FIFO | preferred, then least loaded | yes |
-| [`BestFit`] | as above | smallest headroom left (preference: tie-break or penalty) | yes |
-| [`Lanes`] | as above | big jobs to "lane" workers first; lanes keep headroom from small jobs | yes |
+| [`Config::fifo`] | arrival | preferred, then least loaded | none (big jobs starve) |
+| `Config::default()` | priority, group, FIFO; aging | preferred, then least loaded | yes |
+| [`Config::best_fit`] | as above | tightest fit (preference: tie-break or penalty) | yes |
 
 **Priority and backfill.** A job may take a worker only if no more urgent waiting job is admitted
-there. **Reservation:** the most urgent job that has waited at least `reserve_after` and is
-admitted nowhere reserves the worker with the most headroom; nothing else is admitted there until
-it is placed (at the latest when the worker empties). A more urgent starving job takes over the
-least urgent holder's reservation when none are left. Every other worker keeps admitting less
-urgent jobs. **Aging** (`age_limit`, [`DEFAULT_AGE_LIMIT`] = 30 minutes by default, `None` for
-strict priority) puts jobs that have waited that long ahead of everything else, oldest first:
-a job waits behind work submitted after it for at most the age limit.
+there. **Reservation** ([`Reservations`]): the most urgent job that has waited at least
+`reserve_after` and is admitted nowhere reserves the worker with the most headroom; nothing else is
+admitted there until it is placed (at the latest when the worker empties). A more urgent starving
+job takes over the least urgent holder's reservation when none are left. Every other worker keeps
+admitting less urgent jobs. **Aging** (`age_limit`, [`DEFAULT_AGE_LIMIT`] = 30 minutes by default,
+`None` for strict priority) puts jobs that have waited that long ahead of everything else, oldest
+first: a job waits behind work submitted after it for at most the age limit.
 
 **No starvation.** The most urgent waiting job is placed within `reserve_after` plus the longest
 running time of the jobs on the worker it reserves. With `shadow_backfill`, a reserved worker
 still takes jobs expected to finish before the holder could start (EASY backfilling), without
 weakening that bound.
+
+**Holds.** A reservation and a deferral (below) are the two ways a worker is kept from a job that
+it might admit; `explain` reports both, and [`Policy::next_wakeup`] is when the earliest deferral
+lapses.
 
 **Group order.** Groups are ordered by first arrival ([`GroupOrder::Arrival`]) or by id
 ([`GroupOrder::Id`]), which survives a restart that resubmits in another order ([`nassau::group`]
@@ -127,8 +130,9 @@ bidegree first, critical path within it).
 
 ## Speed-aware placement
 
-Workers report a [`WorkerState::speed`] and jobs may carry a [`JobSpec::work`] estimate. Every
-policy takes a [`SpeedConfig`]:
+Workers report a [`WorkerState::speed`] and jobs may carry a [`JobSpec::work`] estimate; a job's
+expected run time on a worker is its work over the worker's speed. [`Config::speed`] is a
+[`SpeedConfig`]:
 
 - [`SpeedPolicy::FastestFirst`]: among admitting workers, the fastest.
 - [`SpeedPolicy::EarliestFinish`]: HEFT's processor choice online. With a [`Defer`], a job may
@@ -136,7 +140,6 @@ policy takes a [`SpeedConfig`]:
   `min_gain` of its work, at most `max_wait`); [`Policy::next_wakeup`] tells the caller when a wait
   expires. In simulation of a full Nassau run it trims makespan by about 1% and bidegree latency
   p90 by 2.7x over fastest-first (more on small, heavily contended instances).
-- [`SlowGate`] (HeteroPrio): keep slow workers idle while the fast class can absorb the backlog.
 - [`Learn`]: learn speeds online from completion times, per worker with its class as prior,
   corrected for concurrency, with hysteresis; speed-ordered placement treats speeds within one
   `resolution` step as equal, so load still balances a class. [`SpeedEstimator`] is the same
@@ -161,13 +164,10 @@ whether all were device OOMs.
 ```rust
 use std::sync::Arc;
 use sched::{
-    BackfillConfig, FailKind, FailOutcome, JobSpec, PriorityBackfill, Resources, SharedPolicy,
-    WorkerState,
+    Config, FailKind, FailOutcome, JobSpec, Resources, Scheduler, SharedPolicy, WorkerState,
 };
 
-let shared = Arc::new(SharedPolicy::with_system_clock(PriorityBackfill::new(
-    BackfillConfig::default(),
-)));
+let shared = Arc::new(SharedPolicy::with_system_clock(Scheduler::new(Config::default())));
 shared.worker_update(WorkerState::new(1, "l40s", 16, Resources::mem_gb(120.0)));
 let job = JobSpec::new(42, Resources::mem_gb(6.0), 3);
 loop {
@@ -262,22 +262,26 @@ Phase 1 keeps the thread per task and replaces the inside of `acquire`/`release`
 # fn main() {
 use std::{sync::Arc, time::Duration};
 use sched::{
-    BackfillConfig, FailKind, FailOutcome, GroupOrder, JobSpec, Learn, PriorityBackfill,
-    Resources, SharedPolicy, SpeedConfig, SpeedPolicy, WorkerState,
+    Config, FailKind, FailOutcome, GroupOrder, JobSpec, Learn, Order, Resources, Scheduler,
+    SharedPolicy, SpeedConfig, SpeedPolicy, WorkerState,
     log::{JsonlSink, Logged, TaskInfo},
     nassau,
 };
 
 // Once: restart-stable bidegree order, 30-minute aging (the default), fast workers first with
 // speeds learned per worker, every decision logged.
-let policy = PriorityBackfill::new(BackfillConfig {
-    group_order: GroupOrder::Id,
+let policy = Scheduler::new(Config {
+    order: Order::Priority {
+        default_priority: 0,
+        group_order: GroupOrder::Id,
+        group_first: false,
+    },
     speed: SpeedConfig {
         policy: SpeedPolicy::FastestFirst,
         learn: Some(Learn::default()),
         ..SpeedConfig::default()
     },
-    ..BackfillConfig::default()
+    ..Config::default()
 });
 let log = JsonlSink::create("sched_events.jsonl.gz".as_ref()).unwrap();
 let shared = Arc::new(SharedPolicy::with_system_clock(Logged::new(policy, log)));

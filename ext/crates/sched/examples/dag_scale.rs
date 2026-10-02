@@ -2,9 +2,7 @@
 
 use std::time::Instant;
 
-use sched::{
-    BackfillConfig, Dag, DagConfig, DagJob, DagScheduler, JobSpec, PriorityBackfill, Resources,
-};
+use sched::{Config, Dag, DagConfig, DagJob, DagScheduler, JobSpec, Resources, Scheduler};
 
 /// Resident set size of this process, in MB (Linux only; 0 elsewhere).
 fn rss_mb() -> f64 {
@@ -28,7 +26,7 @@ fn main() {
             rank_priority: true,
             ..DagConfig::default()
         },
-        PriorityBackfill::new(BackfillConfig::default()),
+        Scheduler::new(Config::default()),
     );
     let clock = Instant::now();
     let mut edges = 0;

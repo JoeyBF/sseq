@@ -1,15 +1,24 @@
 //! Group order: restart-stable ordering by id, and aging behind a wide old group.
 
 use sched::{
-    BackfillConfig, BestFit, BestFitConfig, DEFAULT_AGE_LIMIT, GroupOrder, JobSpec, Policy,
-    PriorityBackfill, Resources, WorkerState, nassau,
+    Config, DEFAULT_AGE_LIMIT, GroupOrder, JobSpec, Order, Policy, Resources, Scheduler,
+    WorkerState, nassau,
 };
+
+/// Priority order with the given group order.
+fn by(group_order: GroupOrder) -> Order {
+    Order::Priority {
+        default_priority: 0,
+        group_order,
+        group_first: false,
+    }
+}
 
 /// The order in which a one-slot worker runs jobs submitted in `order` (group = job id here).
 fn run_order(order: &[u64], group_order: GroupOrder) -> Vec<u64> {
-    let mut p = PriorityBackfill::new(BackfillConfig {
-        group_order,
-        ..BackfillConfig::default()
+    let mut p = Scheduler::new(Config {
+        order: by(group_order),
+        ..Config::default()
     });
     for (i, &g) in order.iter().enumerate() {
         p.submit(JobSpec::new(g, Resources::mem(1), g), i as f64);
@@ -98,23 +107,26 @@ fn young_group_behind_wide_old_group_waits_at_most_age_limit() {
             assert!(t < 1e6, "the young job never ran");
         }
     };
-    let by_id = |age_limit| BackfillConfig {
-        group_order: GroupOrder::Id,
+    let by_id = |base: Config, age_limit| Config {
+        order: by(GroupOrder::Id),
         age_limit,
-        ..BackfillConfig::default()
+        ..base
     };
     let bound = DEFAULT_AGE_LIMIT + RUN + 1.0;
-    let w = wait(&mut PriorityBackfill::new(by_id(Some(DEFAULT_AGE_LIMIT))));
+    let w = wait(&mut Scheduler::new(by_id(
+        Config::default(),
+        Some(DEFAULT_AGE_LIMIT),
+    )));
     assert!(w <= bound, "backfill: {w}");
-    let w = wait(&mut BestFit::new(BestFitConfig {
-        backfill: by_id(Some(DEFAULT_AGE_LIMIT)),
-        ..BestFitConfig::default()
-    }));
+    let w = wait(&mut Scheduler::new(by_id(
+        Config::best_fit(),
+        Some(DEFAULT_AGE_LIMIT),
+    )));
     assert!(w <= bound, "best fit: {w}");
     // The default configuration ages.
-    assert_eq!(BackfillConfig::default().age_limit, Some(DEFAULT_AGE_LIMIT));
+    assert_eq!(Config::default().age_limit, Some(DEFAULT_AGE_LIMIT));
     // Control: strict priority waits for the whole old group.
-    let w = wait(&mut PriorityBackfill::new(by_id(None)));
+    let w = wait(&mut Scheduler::new(by_id(Config::default(), None)));
     assert!(
         w >= (OLD_JOBS as f64 / SLOTS as f64 - 1.0) * RUN,
         "strict: {w}"

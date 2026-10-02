@@ -5,9 +5,7 @@ use std::{cmp::Ordering, collections::BinaryHeap};
 
 use serde::Serialize;
 
-use crate::{
-    BackfillConfig, JobId, JobSpec, Policy, PriorityBackfill, Resources, WorkerId, WorkerState,
-};
+use crate::{Config, JobId, JobSpec, Policy, Resources, Scheduler, WorkerId, WorkerState};
 
 /// The scenario.
 #[derive(Clone, Debug, Serialize)]
@@ -142,7 +140,8 @@ struct Wk {
     over: f64,
 }
 
-/// Run one arm of the scenario through [`PriorityBackfill`] with the production admission rule.
+/// Run one arm of the scenario through the default [`Scheduler`] with the production admission
+/// rule.
 pub fn simulate_device(sc: &DeviceScenario, arm: DeviceArm) -> DeviceMetrics {
     let n = sc.jobs;
     let demand: Vec<f64> = (0..n as u64)
@@ -161,7 +160,7 @@ pub fn simulate_device(sc: &DeviceScenario, arm: DeviceArm) -> DeviceMetrics {
         }
         DeviceArm::Sum { .. } => (sc.cap_gb, 0.0),
     };
-    let mut p = PriorityBackfill::new(BackfillConfig::default());
+    let mut p = Scheduler::new(Config::default());
     for w in 0..sc.workers {
         p.worker_update(
             WorkerState {
@@ -220,24 +219,23 @@ pub fn simulate_device(sc: &DeviceScenario, arm: DeviceArm) -> DeviceMetrics {
     };
     let mut now = 0.0;
     let mut done = 0;
-    let place =
-        |p: &mut PriorityBackfill, ws: &mut Vec<Wk>, heap: &mut BinaryHeap<Ev>, now: f64| {
-            let out = p.dispatch(now);
-            let mut touched: Vec<usize> = Vec::new();
-            for (j, w) in out {
-                let w = w as usize;
-                if !touched.contains(&w) {
-                    advance(&mut ws[w], now);
-                    touched.push(w);
-                }
-                ws[w]
-                    .running
-                    .push((j, work[j as usize], demand[j as usize]));
+    let place = |p: &mut Scheduler, ws: &mut Vec<Wk>, heap: &mut BinaryHeap<Ev>, now: f64| {
+        let out = p.dispatch(now);
+        let mut touched: Vec<usize> = Vec::new();
+        for (j, w) in out {
+            let w = w as usize;
+            if !touched.contains(&w) {
+                advance(&mut ws[w], now);
+                touched.push(w);
             }
-            for w in touched {
-                schedule(&mut ws[w], w, now, heap);
-            }
-        };
+            ws[w]
+                .running
+                .push((j, work[j as usize], demand[j as usize]));
+        }
+        for w in touched {
+            schedule(&mut ws[w], w, now, heap);
+        }
+    };
     place(&mut p, &mut ws, &mut heap, now);
     while let Some(Ev(t, w, v)) = heap.pop() {
         if v != ws[w].version {

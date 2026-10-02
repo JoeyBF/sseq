@@ -1,10 +1,10 @@
 //! Hard and soft avoid lists.
 
-use sched::{BackfillConfig, JobSpec, Policy, PriorityBackfill, Resources, WorkerState};
+use sched::{Config, JobSpec, Policy, Resources, Scheduler, WorkerState};
 
 /// A policy with the given workers (id, slots), all of class "x".
-fn policy(workers: &[(u64, usize)]) -> PriorityBackfill {
-    let mut p = PriorityBackfill::new(BackfillConfig::default());
+fn policy(workers: &[(u64, usize)]) -> Scheduler {
+    let mut p = Scheduler::new(Config::default());
     for &(id, slots) in workers {
         p.worker_update(WorkerState::new(id, "x", slots, Resources::mem(100)), 0.0);
     }

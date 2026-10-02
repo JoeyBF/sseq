@@ -6,8 +6,8 @@ use serde::Serialize;
 
 use super::whole::{mix, normal, uniform};
 use crate::{
-    BackfillConfig, Dag, DagConfig, DagJob, DagScheduler, JobSpec, Policy, PriorityBackfill,
-    Resources, SpeedConfig, WorkerState,
+    Config, Dag, DagConfig, DagJob, DagScheduler, GroupOrder, JobSpec, Policy, Resources,
+    Scheduler, SpeedConfig, WorkerState,
 };
 
 /// What a task is.
@@ -84,7 +84,7 @@ pub enum Order {
 pub struct SmallPlan {
     /// Job order.
     pub order: Order,
-    /// `BackfillConfig::age_limit`.
+    /// `Config::age_limit`.
     pub age_limit: Option<f64>,
     /// Speed-aware placement.
     pub speed: SpeedConfig,
@@ -174,11 +174,15 @@ pub fn simulate_small(inst: &SmallInstance, plan: &SmallPlan) -> SmallResult {
         Order::Rank { oracle } => (true, oracle, false),
         Order::GroupRank { oracle } => (true, oracle, true),
     };
-    let policy = PriorityBackfill::new(BackfillConfig {
+    let policy = Scheduler::new(Config {
+        order: crate::Order::Priority {
+            default_priority: 0,
+            group_order: GroupOrder::Arrival,
+            group_first,
+        },
         age_limit: plan.age_limit,
         speed: plan.speed,
-        group_first,
-        ..BackfillConfig::default()
+        ..Config::default()
     });
     let mut dag = DagScheduler::new(
         DagConfig {
@@ -622,7 +626,6 @@ mod tests {
                         age_limit: None,
                         speed: SpeedConfig {
                             policy,
-                            slow_gate: None,
                             learn: None,
                             spoliation: None,
                         },

@@ -16,8 +16,8 @@ use super::{
     trace::Trace,
 };
 use crate::{
-    BackfillConfig, Dag, DagConfig, DagJob, DagScheduler, DagTemplate, GroupOrder, InstanceSpec,
-    JobId, JobSpec, Policy, PriorityBackfill, Resources, SpeedConfig, SpeedPolicy, WorkerState,
+    Config, Dag, DagConfig, DagJob, DagScheduler, DagTemplate, GroupOrder, InstanceSpec, JobId,
+    JobSpec, Policy, Resources, Scheduler, SpeedConfig, SpeedPolicy, WorkerState,
 };
 
 /// One census row (`ext::nassau` per-bidegree counters).
@@ -999,9 +999,9 @@ pub enum Plan {
     Rank {
         /// Use the true costs for ranks.
         oracle: bool,
-        /// `BackfillConfig::age_limit`.
+        /// `Config::age_limit`.
         age_limit: Option<f64>,
-        /// Oldest bidegree first, rank only within a bidegree (`BackfillConfig::group_first`).
+        /// Oldest bidegree first, rank only within a bidegree (`Order::Priority::group_first`).
         group_first: bool,
     },
 }
@@ -1220,16 +1220,19 @@ pub fn simulate(
         Plan::Today { open, per_bidegree } => Some((*open, *per_bidegree)),
         _ => None,
     };
-    let policy = PriorityBackfill::new(BackfillConfig {
+    let policy = Scheduler::new(Config {
+        order: crate::Order::Priority {
+            default_priority: 0,
+            group_order: if place.group_key == GroupKey::Arrival {
+                GroupOrder::Arrival
+            } else {
+                GroupOrder::Id
+            },
+            group_first,
+        },
         age_limit,
         speed,
-        group_first,
-        group_order: if place.group_key == GroupKey::Arrival {
-            GroupOrder::Arrival
-        } else {
-            GroupOrder::Id
-        },
-        ..BackfillConfig::default()
+        ..Config::default()
     });
     let mut dag = DagScheduler::new(
         DagConfig {
@@ -1338,7 +1341,7 @@ pub fn simulate(
     let mut now = 0.0;
 
     // Declare bidegree k's walk: its signature template, then "walk done" after the sinks.
-    let instantiate = |dag: &mut DagScheduler<PriorityBackfill>, k: usize, now: f64| {
+    let instantiate = |dag: &mut DagScheduler<Scheduler>, k: usize, now: f64| {
         let b = &world.bideg[k];
         let zero = 4 * k as u64;
         let mut done_deps = vec![zero];
@@ -1490,7 +1493,7 @@ pub fn simulate(
                 push(&mut heap, t, ev)
             });
         }
-        // Voluntary waits (deferral, slow gate) expire without an event: wake the policy then.
+        // Deferrals expire without an event: wake the policy then.
         if let Some(t) = dag.policy().next_wakeup()
             && t != wake_at
         {
@@ -1613,9 +1616,6 @@ pub fn speed_name(speed: &SpeedConfig) -> String {
             format!(", earliest finish (wait <= {:.0}s)", d.max_wait)
         }
     };
-    if let Some(g) = speed.slow_gate {
-        s += &format!(", slow gate x{} (<= {:.0}s)", g.factor, g.max_wait);
-    }
     if speed.learn.is_some() {
         s += ", learned speeds";
     }
@@ -1826,10 +1826,9 @@ mod tests {
                 ),
             ]),
         };
-        let place = |policy, slow_gate| Placement {
+        let place = |policy| Placement {
             speed: SpeedConfig {
                 policy,
-                slow_gate,
                 learn: None,
                 spoliation: None,
             },
@@ -1840,7 +1839,7 @@ mod tests {
             &mixed,
             &model,
             &Plan::Group,
-            &place(SpeedPolicy::FastestFirst, None),
+            &place(SpeedPolicy::FastestFirst),
         );
         let defer = crate::Defer {
             max_wait: 1e6,
@@ -1851,29 +1850,16 @@ mod tests {
             &mixed,
             &model,
             &Plan::Group,
-            &place(SpeedPolicy::EarliestFinish(Some(defer)), None),
+            &place(SpeedPolicy::EarliestFinish(Some(defer))),
         );
-        let gate = crate::SlowGate {
-            factor: 1.0,
-            max_wait: 1e6,
-        };
-        let gated = simulate(
-            &world,
-            &mixed,
-            &model,
-            &Plan::Group,
-            &place(SpeedPolicy::FastestFirst, Some(gate)),
+        assert_eq!(eft.tasks, expected, "{}", eft.plan);
+        assert!(
+            eft.makespan_h < 1.5 * fast.makespan_h,
+            "{}: {} vs {}",
+            eft.plan,
+            eft.makespan_h,
+            fast.makespan_h
         );
-        for m in [&eft, &gated] {
-            assert_eq!(m.tasks, expected, "{}", m.plan);
-            assert!(
-                m.makespan_h < 1.5 * fast.makespan_h,
-                "{}: {} vs {}",
-                m.plan,
-                m.makespan_h,
-                fast.makespan_h
-            );
-        }
     }
 
     /// Missing census rows continue their row's exponential trend.
