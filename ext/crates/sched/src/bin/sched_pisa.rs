@@ -27,8 +27,8 @@ use sched::{
 #[command(about = "Typical-case and adversarial comparison of two dispatch plans")]
 struct Args {
     /// Plan A: group | rank | rank-oracle | grouprank | grouprank-oracle, with optional suffixes
-    /// +fast, +eft (wait up to --max-defer), +eft<percent> (wait only for that much gain), +gate,
-    /// +spoil (restart stuck jobs on faster workers), +age<seconds>.
+    /// +fast, +eft (wait up to --max-defer), `+eft<percent>` (wait only for that much gain), +gate,
+    /// +spoil (restart stuck jobs on faster workers), `+age<seconds>`.
     #[arg(long)]
     a: String,
     /// Plan B, as plan A.

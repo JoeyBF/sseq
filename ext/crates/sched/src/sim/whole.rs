@@ -302,12 +302,12 @@ fn degree_of(sig: &[u32]) -> i32 {
         .sum()
 }
 
-/// [`ols`] for the binaries.
+/// Least squares `y ~ X` (coefficients, R^2, residual sd), for the binaries.
 pub fn ols_pub(x: &[Vec<f64>], y: &[f64]) -> (Vec<f64>, f64, f64) {
     ols(x, y)
 }
 
-/// [`uniform`] for the binaries: a deterministic uniform in `(0, 1)` from a key.
+/// A deterministic uniform in `(0, 1)` from a key, for the binaries.
 pub fn uniform_pub(key: u64) -> f64 {
     uniform(key)
 }

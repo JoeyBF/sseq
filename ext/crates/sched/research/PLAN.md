@@ -60,3 +60,19 @@ The effort figures are the reports' own estimates.
 Each step keeps the existing invariants (no over-commit, escape hatch, priority, no-starvation
 bound, determinism). Each step is accepted only if `sched-whole` and `sched-sim` show the
 expected effect.
+
+## Status (2026-10-02)
+
+All nine items are implemented and tested; outcomes in `RESULTS.md`.
+
+| # | item | status | outcome |
+|---|---|---|---|
+| 1 | `WorkerState::speed`, `FastestFirst`, slow gate | done | fast-first −10.5% on replicas; gate −1.9% |
+| 2 | `EarliestFinish` with deferral, `next_wakeup` | done | −7..9% over fast-first; −14..18% with rank; `Defer::default()` = 25% gain, 1 h |
+| 3 | plans and bounds: fast-only, CPOP, group-then-rank | done | see the whole-run section |
+| 4 | learned per-class speed | done | exact recovery in tests; off by default |
+| 5 | dslab-dag cross-check | done | exact on unlimited capacity and one slot; within ~1% on contention |
+| 6 | `sched-pisa` | done | explained "rank loses": a simulator artefact (per-event dispatch), plus rank needing fast placement |
+| 7 | implicit instances, frontier budget, snapshots | done | bit-identical makespans to the explicit layer |
+| 8 | shadow backfill | done | negligible on the trace (idle 0.97% → 0.92%); off by default |
+| 9 | spoliation | done | −4..8% over fast-first alone, nothing on top of waiting; off by default |

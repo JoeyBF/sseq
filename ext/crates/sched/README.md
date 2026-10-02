@@ -97,7 +97,27 @@ urgent jobs. Optional **aging** (`age_limit`) puts long-waiting jobs ahead of ev
 which bounds waits even under priorities that are not arrival-ordered (such as DAG ranks).
 
 **No starvation.** The most urgent waiting job is placed within `reserve_after` plus the longest
-running time of the jobs on the worker it reserves.
+running time of the jobs on the worker it reserves. With `shadow_backfill`, a reserved worker
+still takes jobs expected to finish before the holder could start (EASY backfilling), without
+weakening that bound.
+
+**Group order.** `group_first` orders by group arrival before priority (e.g. oldest bidegree
+first, critical path within it).
+
+## Speed-aware placement
+
+Workers report a [`WorkerState::speed`] and jobs may carry a [`JobSpec::work`] estimate. Every
+policy takes a [`SpeedConfig`]:
+
+- [`SpeedPolicy::FastestFirst`]: among admitting workers, the fastest.
+- [`SpeedPolicy::EarliestFinish`]: HEFT's processor choice online. With a [`Defer`], a job may
+  *wait* for a busy faster worker when it would still finish earlier there (by at least
+  `min_gain` of its work, at most `max_wait`); [`Policy::next_wakeup`] tells the caller when a wait
+  expires. In simulation this is the largest single lever: 7-18% on top of fastest-first.
+- [`SlowGate`] (HeteroPrio): keep slow workers idle while the fast class can absorb the backlog.
+- [`Learn`]: learn each class's speed online from completion times.
+- [`Spoliation`] (HeteroPrio): restart a running job on a faster worker that would otherwise stay
+  idle, through [`Policy::dispatch_full`]'s preemptions (the caller kills and restarts).
 
 ## Dependencies: the DAG layer
 
@@ -112,8 +132,14 @@ refined later ([`DagScheduler::update_work`]), moving ranks up or down. **Passth
 pure synchronisation points ("group G is done") that complete by themselves, and a
 [`DagTemplate`] is a dependency structure shared by many groups (e.g. one per algebra), checked
 once and instantiated per group with [`DagScheduler::declare_template`]; its
-[`critical_path`](DagTemplate::critical_path) gives an unexpanded group's rank weight. With the
-`serde` feature (default) the declared graph can be snapshotted and restored.
+[`critical_path`](DagTemplate::critical_path) gives an unexpanded group's rank weight.
+
+**Implicit instances** ([`DagScheduler::open_instance`], after PaRSEC's parameterised task graphs)
+keep a group's sub-DAG as dense counters over its shared template instead of graph nodes and
+edges: about 11 bytes per node, a `JobSpec` built only when a node becomes ready, the group's
+`done` job completed when its last node does, and ranks flowing across instances as along edges.
+`DagConfig::max_open_instances` bounds how many are open at once (a frontier budget). With the
+`serde` feature (default) the declared graph, instances included, can be snapshotted and restored.
 
 ## Simulator
 
@@ -127,7 +153,16 @@ cargo run --release --features sim --bin sched-sim -- --trace ... --closed --ran
 ```
 
 `--closed` derives arrivals from simulated dependency completions through the DAG layer instead of
-the trace's ready times. See `RESULTS.md` for the reference trace.
+the trace's ready times. Two more binaries:
+
+- `sched-whole` builds a whole Nassau run as one DAG a priori (bidegrees, signature-DAG templates,
+  census-fitted costs) and compares dispatch plans against its lower bounds; `--export-dslab`
+  writes an instance for dslab-dag cross-validation.
+- `sched-pisa` compares two plans on many small instances (random mini-grids, or perturbed replicas
+  of real data), typically and adversarially (simulated annealing with witness minimisation).
+
+See `RESULTS.md` for results, `research/` for what was taken from dslab-dag, StarPU, Batsim, SAGA
+and PaRSEC, and `LITERATURE.md` for references.
 
 ## Features
 
