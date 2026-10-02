@@ -1,0 +1,151 @@
+//! No starvation: a stream of small jobs keeps every worker packed while a big job waits.
+
+use std::collections::BTreeMap;
+
+use proptest::prelude::*;
+use sched::{
+    BackfillConfig, BestFit, BestFitConfig, Greedy, GreedyConfig, JobSpec, LaneSet, Lanes,
+    LanesConfig, Policy, PriorityBackfill, Resources, WorkerState,
+};
+
+const TICK: f64 = 1.0;
+const RESERVE_AFTER: f64 = 60.0;
+const BIG: u64 = u64::MAX / 2;
+
+struct Stream {
+    workers: usize,
+    slots: usize,
+    budget: u64,
+    /// (demand, duration) of the small jobs, cycled.
+    small: Vec<(u64, u64)>,
+    big_demand: u64,
+    big_at: f64,
+    horizon: f64,
+}
+
+/// Runs the stream; returns the big job's wait, or `None` if it was never placed.
+///
+/// The bound under test, for the most urgent waiting job: it reserves a worker at the first
+/// dispatch after it has waited `reserve_after`, and from then on nothing new is admitted on that
+/// worker, so it is placed at the latest when the jobs running there at that moment finish:
+/// `wait <= reserve_after + D + tick`, where `D` is the longest small-job duration and `tick` the
+/// dispatch granularity. (A job behind more urgent starving jobs waits for their reservations
+/// first.) Greedy, as a control, starves the big job for the whole stream.
+fn run(p: &mut dyn Policy, s: &Stream) -> Option<f64> {
+    for w in 0..s.workers {
+        p.worker_update(
+            WorkerState::new(w as u64, "x", s.slots, Resources::mem(s.budget)),
+            0.0,
+        );
+    }
+    let mut ends: BTreeMap<u64, f64> = BTreeMap::new();
+    let mut duration: BTreeMap<u64, u64> = BTreeMap::new();
+    let mut next = 0u64;
+    let mut big_submitted = false;
+    let mut t = 0.0;
+    while t < s.horizon {
+        // Keep a few small jobs waiting at all times, each in a new (younger) group.
+        let waiting = p.stats().waiting;
+        for _ in waiting..(s.workers * s.slots / 2).max(2) {
+            let (demand, d) = s.small[next as usize % s.small.len()];
+            p.submit(JobSpec::new(next, Resources::mem(demand), 1_000 + next), t);
+            duration.insert(next, d);
+            next += 1;
+        }
+        if !big_submitted && t >= s.big_at {
+            let mut big = JobSpec::new(BIG, Resources::mem(s.big_demand), 0);
+            big.priority = Some(-1);
+            p.submit(big, t);
+            big_submitted = true;
+        }
+        let done: Vec<u64> = ends.iter().filter(|e| *e.1 <= t).map(|e| *e.0).collect();
+        for j in done {
+            ends.remove(&j);
+            p.completed(j, t);
+        }
+        for (j, _) in p.dispatch(t) {
+            if j == BIG {
+                return Some(t - s.big_at);
+            }
+            ends.insert(j, t + duration[&j] as f64);
+        }
+        t += TICK;
+    }
+    None
+}
+
+/// The policies that must not starve, with `RESERVE_AFTER`.
+fn policies() -> Vec<(&'static str, Box<dyn Policy>)> {
+    let bf = BackfillConfig {
+        reserve_after: RESERVE_AFTER,
+        ..BackfillConfig::default()
+    };
+    vec![
+        ("backfill", Box::new(PriorityBackfill::new(bf.clone()))),
+        (
+            "bestfit",
+            Box::new(BestFit::new(BestFitConfig {
+                backfill: bf.clone(),
+                prefer_penalty: 0,
+            })),
+        ),
+        (
+            "lanes",
+            Box::new(Lanes::new(LanesConfig {
+                backfill: bf,
+                lanes: LaneSet::Workers(vec![0]),
+                big_threshold: Resources::mem(30),
+                lane_reserve: Resources::mem(10),
+            })),
+        ),
+    ]
+}
+
+/// Greedy starves the big job; the reserving policies meet the bound.
+#[test]
+fn greedy_starves_and_backfill_does_not() {
+    let s = Stream {
+        workers: 3,
+        slots: 8,
+        budget: 100,
+        small: vec![(12, 40), (15, 55), (9, 25), (14, 60)],
+        big_demand: 70,
+        big_at: 30.0,
+        horizon: 5_000.0,
+    };
+    assert_eq!(
+        run(&mut Greedy::new(GreedyConfig {}), &s),
+        None,
+        "greedy should starve it"
+    );
+    let d = s.small.iter().map(|x| x.1).max().unwrap() as f64;
+    for (name, mut p) in policies() {
+        let wait = run(&mut *p, &s).unwrap_or_else(|| panic!("{name} starved the big job"));
+        assert!(
+            wait <= RESERVE_AFTER + d + 2.0 * TICK,
+            "{name}: waited {wait}s"
+        );
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(64))]
+
+    /// The bound holds over random streams.
+    #[test]
+    fn starving_job_waits_at_most_reserve_after_plus_longest_job(
+        workers in 1usize..4,
+        slots in 2usize..10,
+        small in prop::collection::vec((5u64..40, 5u64..120), 1..6),
+        big_demand in 41u64..250,
+        big_at in 0.0f64..200.0,
+    ) {
+        let s = Stream { workers, slots, budget: 100, small, big_demand, big_at, horizon: 2_000.0 };
+        let d = s.small.iter().map(|x| x.1).max().unwrap() as f64;
+        for (name, mut p) in policies() {
+            let wait = run(&mut *p, &s);
+            prop_assert!(wait.is_some(), "{} starved the big job", name);
+            prop_assert!(wait.unwrap() <= RESERVE_AFTER + d + 2.0 * TICK, "{}: waited {:?}", name, wait);
+        }
+    }
+}
