@@ -142,6 +142,8 @@ fn logged_run_replays_exactly() {
         closed_loop: None,
         big_gb: 7.5,
         explain: None,
+        est_scale: 1.0,
+        usage: None,
     };
     let replayed = Arc::new(Mutex::new(Vec::new()));
     let m = simulate(

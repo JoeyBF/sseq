@@ -62,6 +62,10 @@ pub trait Admission {
 ///                 and ( running(w) == 0      // escape hatch: a job alone always goes
 ///                       or max(reported_used, reported_baseline + Σ placed) + demand <= budget )
 /// ```
+///
+/// `reported_baseline` must exclude the running jobs (a worker's `baseline_excl`: its rolling RSS
+/// floor minus their estimates). A floor that contains them counts them twice, once in it and
+/// once in `Σ placed`, and keeps a busy worker a few GB short of its budget.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ProductionAdmission;
 
@@ -124,6 +128,29 @@ mod tests {
         assert_eq!(a.bound(&view(2, 0)), None);
         assert_eq!(a.bound(&view(1, 50)), Some(Resources::mem(40)));
         assert_eq!(view(1, 50).headroom(), 40);
+    }
+
+    /// `baseline_excl` (the rolling RSS floor minus the estimates running) as `reported_baseline`
+    /// gives `running < slots && (running == 0 || max(rss, baseline_excl + Σ placed) + demand <=
+    /// budget)`: the floor no longer counts the running jobs twice.
+    #[test]
+    fn baseline_excl_removes_the_double_count() {
+        // RSS 60 with 40 of estimates running; the floor (50) contains those jobs.
+        let (rss, floor, placed, budget) = (60, 50, 40, 100);
+        let view = |s| WorkerView {
+            state: s,
+            running: 4,
+            placed: Resources::mem(placed),
+        };
+        let with_floor = worker(16, budget, rss, floor);
+        let with_excl = worker(16, budget, rss, floor - placed);
+        // Floor: max(60, 50 + 40) + 15 = 105 > 100. Excl: max(60, 10 + 40) + 40 = 100.
+        assert!(!ProductionAdmission.admits(&Resources::mem(15), &view(&with_floor)));
+        assert!(ProductionAdmission.admits(&Resources::mem(40), &view(&with_excl)));
+        assert!(!ProductionAdmission.admits(&Resources::mem(41), &view(&with_excl)));
+        // RSS stays the safety term: estimates that undercount cannot admit past it.
+        let undercount = worker(16, budget, 95, 0);
+        assert!(!ProductionAdmission.admits(&Resources::mem(6), &view(&undercount)));
     }
 
     /// Without slots, not even the escape hatch admits.

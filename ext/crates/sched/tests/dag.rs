@@ -22,6 +22,7 @@ fn job(id: JobId, deps: &[JobId]) -> DagJob {
         deps: deps.to_vec(),
         work_estimate: None,
         passthrough: false,
+        local: false,
     }
 }
 

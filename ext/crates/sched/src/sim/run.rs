@@ -24,8 +24,63 @@ pub enum Baseline {
         /// worker's gate samples it more often and so sees lower dips; this calibrates for that.
         offset_gb: f64,
     },
+    /// What a worker reporting `baseline_excl` sends: the rolling floor of resident memory minus
+    /// the estimates running (see
+    /// [`Trace::floor_baseline_excl`](super::trace::Trace::floor_baseline_excl)), with the
+    /// estimates scaled like the demands ([`SimSetup::est_scale`]).
+    RollingFloorExcl {
+        /// Window, seconds.
+        window_s: f64,
+        /// GB subtracted, as for `RollingFloor`.
+        offset_gb: f64,
+    },
     /// A constant per worker, GB.
     PerWorker(Vec<f64>),
+}
+
+/// A model of the memory jobs actually occupy, to estimate how often looser admission would push
+/// a worker over its budget (the trace's resident memory does not respond to the simulated
+/// placements).
+#[derive(Clone, Debug)]
+pub struct Usage {
+    /// Each worker's idle resident memory, GB.
+    pub idle: Vec<f64>,
+    /// Median fraction of its (unscaled) estimate a job occupies.
+    pub median: f64,
+    /// Log-normal spread of that fraction between jobs.
+    pub sd: f64,
+    /// Largest fraction (the estimator's guaranteed margin).
+    pub cap: f64,
+}
+
+impl Usage {
+    /// Job `j`'s fraction: deterministic in `j`.
+    fn fraction(&self, j: usize) -> f64 {
+        let mut x = (j as u64).wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut next = || {
+            x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = x;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            ((z ^ (z >> 31)) >> 11) as f64 / (1u64 << 53) as f64
+        };
+        let (u1, u2) = (next().max(1e-12), next());
+        let normal = (-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos();
+        (self.median * (self.sd * normal).exp()).min(self.cap)
+    }
+}
+
+/// How often the modelled resident memory exceeded the budget, at heartbeats.
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct Overrun {
+    /// Heartbeats checked.
+    pub samples: usize,
+    /// Of which over budget.
+    pub over: usize,
+    /// `over / samples`.
+    pub frac: f64,
+    /// Largest excess, GB.
+    pub max_excess_gb: f64,
 }
 
 /// A policy usable from a simulation thread.
@@ -52,6 +107,10 @@ pub struct SimSetup<'a> {
     /// Print the policy's `explain` for this request to stderr every 10 simulated minutes while
     /// it waits.
     pub explain: Option<u64>,
+    /// Demands are the trace's estimates times this (1: as recorded).
+    pub est_scale: f64,
+    /// Count modelled overruns at heartbeats.
+    pub usage: Option<Usage>,
 }
 
 /// Distribution summary.
@@ -144,6 +203,8 @@ pub struct Metrics {
     pub dispatch_us: Quantiles,
     /// The longest waits: `(req, est_gb, bidegree, arrival_s, wait_s)`.
     pub worst: Vec<(u64, f64, (i64, i64), f64, f64)>,
+    /// Modelled overruns ([`SimSetup::usage`]).
+    pub overrun: Overrun,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -241,10 +302,15 @@ impl Driver {
     }
 }
 
-/// The job submitted for task `j`: its estimate as demand, its bidegree as group.
-fn spec(trace: &Trace, work: &[f64], j: usize) -> JobSpec {
+/// The job submitted for task `j`: its (scaled) estimate as demand, its bidegree as group.
+fn spec(setup: &SimSetup, j: usize) -> JobSpec {
+    let (trace, work) = (setup.trace, setup.work);
     let t = &trace.tasks[j];
-    let mut s = JobSpec::new(j as u64, Resources::mem_gb(t.est_gb), t.group);
+    let mut s = JobSpec::new(
+        j as u64,
+        Resources::mem_gb(t.est_gb * setup.est_scale),
+        t.group,
+    );
     s.work = Some(work[j]);
     s
 }
@@ -345,10 +411,11 @@ pub fn simulate(setup: &SimSetup, name: &str, policy: BoxPolicy) -> Metrics {
                 .into_iter()
                 .enumerate()
                 .map(|(j, d)| DagJob {
-                    spec: spec(trace, setup.work, j),
+                    spec: spec(setup, j),
                     deps: d.into_iter().map(|x| x as u64).collect(),
                     work_estimate: Some(setup.work[j]),
                     passthrough: false,
+                    local: false,
                 })
                 .collect();
             dag.declare(jobs, 0.0)
@@ -370,6 +437,7 @@ pub fn simulate(setup: &SimSetup, name: &str, policy: BoxPolicy) -> Metrics {
     let mut reserved_idle = 0.0;
     let mut prev_t = 0.0;
     let mut dispatch_us = Vec::new();
+    let mut overrun = Overrun::default();
     let horizon = trace.tasks.iter().map(|t| t.done_s).fold(0.0, f64::max) * 50.0 + 1e6;
     let watched = setup
         .explain
@@ -405,6 +473,14 @@ pub fn simulate(setup: &SimSetup, name: &str, policy: BoxPolicy) -> Metrics {
                 window_s,
                 offset_gb,
             } => (trace.floor_baseline(w, t, *window_s).unwrap_or(0.0) - offset_gb).max(0.0),
+            Baseline::RollingFloorExcl {
+                window_s,
+                offset_gb,
+            } => (trace
+                .floor_baseline_excl(w, t, *window_s, setup.est_scale)
+                .unwrap_or(0.0)
+                - offset_gb)
+                .max(0.0),
             Baseline::PerWorker(v) => v[w],
         };
         let rss = match tw.samples.get(s.sample) {
@@ -440,6 +516,22 @@ pub fn simulate(setup: &SimSetup, name: &str, policy: BoxPolicy) -> Metrics {
                 push(&mut heap, t + setup.heartbeat_s, Ev::Heartbeat(w));
             }
             Ev::Heartbeat(w) => {
+                if let Some(u) = &setup.usage
+                    && completed < n
+                {
+                    let rss = u.idle[w]
+                        + ws[w]
+                            .running
+                            .iter()
+                            .map(|x| trace.tasks[x.0].est_gb * u.fraction(x.0))
+                            .sum::<f64>();
+                    let excess = rss - trace.workers[w].budget_gb;
+                    overrun.samples += 1;
+                    if excess > 0.0 {
+                        overrun.over += 1;
+                        overrun.max_excess_gb = overrun.max_excess_gb.max(excess);
+                    }
+                }
                 let st = state(w, &mut ws[w], t);
                 driver.worker_update(st, t);
                 if completed < n && t < horizon {
@@ -449,7 +541,7 @@ pub fn simulate(setup: &SimSetup, name: &str, policy: BoxPolicy) -> Metrics {
             Ev::Arrive(j) => {
                 arrival[j] = t;
                 match &mut driver {
-                    Driver::Open(p) => p.submit(spec(trace, setup.work, j), t),
+                    Driver::Open(p) => p.submit(spec(setup, j), t),
                     Driver::Closed(d) => {
                         d.release(j as u64, t);
                     }
@@ -564,6 +656,8 @@ pub fn simulate(setup: &SimSetup, name: &str, policy: BoxPolicy) -> Metrics {
     let slot_time = slot_time(setup.trace, &done);
     m.reserved_idle_frac = reserved_idle / slot_time.max(1e-9);
     m.dispatch_us = Quantiles::of(dispatch_us);
+    overrun.frac = overrun.over as f64 / overrun.samples.max(1) as f64;
+    m.overrun = overrun;
     m
 }
 
@@ -727,5 +821,42 @@ pub fn production(setup: &SimSetup) -> Metrics {
     );
     let worker_of: Vec<Option<usize>> = trace.tasks.iter().map(|t| Some(t.worker)).collect();
     attribute_work(setup, &mut m, &worker_of);
+    if let Some(u) = &setup.usage {
+        m.overrun = production_overrun(setup, u);
+    }
     m
+}
+
+/// The modelled overruns of production's own placements, on the replay's heartbeat grid.
+fn production_overrun(setup: &SimSetup, u: &Usage) -> Overrun {
+    let trace = setup.trace;
+    let end = trace.tasks.iter().map(|t| t.done_s).fold(0.0, f64::max);
+    let mut by_worker: Vec<Vec<(f64, f64)>> = vec![Vec::new(); trace.workers.len()];
+    for (j, t) in trace.tasks.iter().enumerate() {
+        let x = t.est_gb * u.fraction(j);
+        by_worker[t.worker].push((t.placed_s, x));
+        by_worker[t.worker].push((t.done_s, -x));
+    }
+    let mut o = Overrun::default();
+    for (w, ev) in by_worker.iter_mut().enumerate() {
+        // Completions before placements at equal times.
+        ev.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.total_cmp(&b.1)));
+        let (mut i, mut load) = (0, 0.0);
+        let mut t = trace.workers[w].join_s + setup.heartbeat_s;
+        while t < end {
+            while i < ev.len() && ev[i].0 <= t {
+                load += ev[i].1;
+                i += 1;
+            }
+            let excess = u.idle[w] + load - trace.workers[w].budget_gb;
+            o.samples += 1;
+            if excess > 1e-9 {
+                o.over += 1;
+                o.max_excess_gb = o.max_excess_gb.max(excess);
+            }
+            t += setup.heartbeat_s;
+        }
+    }
+    o.frac = o.over as f64 / o.samples.max(1) as f64;
+    o
 }

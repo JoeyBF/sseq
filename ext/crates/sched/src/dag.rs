@@ -11,7 +11,7 @@ use petgraph::{
 use crate::{Instant, JobId, JobSpec, Policy, PolicyStats, WorkerId, WorkerState};
 
 mod instance;
-pub use instance::InstanceSpec;
+pub use instance::{InstanceSpec, NodeLabel};
 
 /// A job with dependencies.
 #[derive(Clone, Debug, PartialEq)]
@@ -29,6 +29,10 @@ pub struct DagJob {
     /// lets a placeholder stand for work that is not expanded yet (lower it later with
     /// [`DagScheduler::update_work`]).
     pub passthrough: bool,
+    /// Runs on the caller, not on a worker (registration, loading, commit steps): when ready it is
+    /// held, never submitted to the policy, and returned by [`DagScheduler::take_local`]; report
+    /// its completion with [`Dag::completed`] as usual.
+    pub local: bool,
 }
 
 impl DagJob {
@@ -39,6 +43,7 @@ impl DagJob {
             deps,
             work_estimate: None,
             passthrough: false,
+            local: false,
         }
     }
 
@@ -49,7 +54,14 @@ impl DagJob {
             deps,
             work_estimate: Some(work),
             passthrough: true,
+            local: false,
         }
+    }
+
+    /// Make it a local job (see [`DagJob::local`]).
+    pub fn local(mut self) -> Self {
+        self.local = true;
+        self
     }
 
     /// Set the work estimate.
@@ -252,6 +264,8 @@ pub enum DagError {
     },
     /// The job is already declared (or completed), or appears twice in the batch.
     Duplicate(JobId),
+    /// No open instance has this job as a node or as its `done` job.
+    NotFound(JobId),
 }
 
 impl std::fmt::Display for DagError {
@@ -260,6 +274,7 @@ impl std::fmt::Display for DagError {
         match self {
             Self::Cycle { job } => write!(f, "declaring job {job} would create a dependency cycle"),
             Self::Duplicate(job) => write!(f, "job {job} is already declared"),
+            Self::NotFound(job) => write!(f, "no open instance contains job {job}"),
         }
     }
 }
@@ -357,6 +372,9 @@ struct Node {
     /// their `done` job's rank (they have no edges for ranks to flow along).
     #[cfg_attr(feature = "serde", serde(default))]
     implicit_below: f64,
+    /// Runs on the caller (see [`DagJob::local`]).
+    #[cfg_attr(feature = "serde", serde(default))]
+    local: bool,
 }
 
 /// Counters describing the DAG layer's state.
@@ -430,6 +448,12 @@ pub struct DagScheduler<P> {
     completed_floor: JobId,
     /// Ready ids not yet returned by `take_ready`, in readiness order.
     newly_ready: Vec<JobId>,
+    /// Ready local jobs not yet returned by `take_local`.
+    newly_local: Vec<JobId>,
+    /// Jobs placed by dispatches and not completed, cancelled or resubmitted since.
+    running: HashSet<JobId>,
+    /// Running jobs of instances closed early: their completion only frees their resources.
+    ignored: HashSet<JobId>,
     placeholders: BTreeMap<u64, (Vec<u64>, f64)>,
     /// group -> placeholder groups that wait for it.
     waiters: HashMap<u64, Vec<u64>>,
@@ -463,6 +487,9 @@ impl<P: Policy> DagScheduler<P> {
             completed: HashSet::new(),
             completed_floor: 0,
             newly_ready: Vec::new(),
+            newly_local: Vec::new(),
+            running: HashSet::new(),
+            ignored: HashSet::new(),
             placeholders: BTreeMap::new(),
             waiters: HashMap::new(),
             tail_memo: HashMap::new(),
@@ -491,7 +518,15 @@ impl<P: Policy> DagScheduler<P> {
     /// Passthrough of [`Policy::dispatch_full`]: placements and preemptions.
     pub fn dispatch_full(&mut self, now: Instant) -> crate::Dispatch {
         self.now = now;
-        self.policy.dispatch_full(now)
+        let d = self.policy.dispatch_full(now);
+        self.running.extend(d.start.iter().map(|x| x.0));
+        d
+    }
+
+    /// Local jobs (see [`DagJob::local`]) that became ready since the last call, in readiness
+    /// order. Run each on the caller and report it with [`Dag::completed`].
+    pub fn take_local(&mut self) -> Vec<JobId> {
+        std::mem::take(&mut self.newly_local)
     }
 
     /// Ids that became ready since the last call, in readiness order. With `auto_submit` they are
@@ -508,7 +543,7 @@ impl<P: Policy> DagScheduler<P> {
             return self.instance_release(job, now, instance::HELD);
         }
         match self.index.get(&job) {
-            Some(&n) if self.graph[n].state == State::Held => {
+            Some(&n) if self.graph[n].state == State::Held && !self.graph[n].local => {
                 self.submit_node(n, now);
                 true
             }
@@ -520,6 +555,10 @@ impl<P: Policy> DagScheduler<P> {
     /// and has not completed.
     pub fn resubmit(&mut self, job: JobId, now: Instant) -> bool {
         self.now = now;
+        self.running.remove(&job);
+        if self.ignored.remove(&job) {
+            return false;
+        }
         if self.instance_of(job).is_some() {
             return self.instance_release(job, now, instance::SUBMITTED);
         }
@@ -604,6 +643,7 @@ impl<P: Policy> DagScheduler<P> {
             rank: 0.0,
             passthrough: false,
             implicit_below: 0.0,
+            local: false,
         });
         self.index.insert(id, n);
         n
@@ -749,6 +789,11 @@ impl<P: Policy> DagScheduler<P> {
             self.passing.push(n);
             return;
         }
+        if self.graph[n].local {
+            self.graph[n].state = State::Held;
+            self.newly_local.push(self.graph[n].id);
+            return;
+        }
         self.newly_ready.push(self.graph[n].id);
         if self.config.auto_submit {
             self.submit_node(n, now);
@@ -774,6 +819,7 @@ impl<P: Policy> DagScheduler<P> {
             node.unmet = 0;
             node.work = 0.0;
             node.passthrough = false;
+            node.local = false;
         }
         for &n in created {
             if let Some(node) = self.graph.remove_node(n) {
@@ -950,15 +996,19 @@ impl<P: Policy> DagScheduler<P> {
         }
         let mut submitted = Vec::new();
         let mut held = Vec::new();
+        let mut local = Vec::new();
         for n in s.graph.node_indices() {
             let node = &s.graph[n];
             s.index.insert(node.id, n);
             match node.state {
                 State::Submitted => submitted.push((node.id, n)),
+                State::Held if node.local => local.push(node.id),
                 State::Held => held.push(node.id),
                 _ => {}
             }
         }
+        local.sort_unstable();
+        s.newly_local = local;
         submitted.sort_unstable();
         for (_, n) in submitted {
             s.submit_node(n, now);
@@ -1007,6 +1057,33 @@ pub struct DagSnapshot {
     instances: Vec<instance::InstanceSnapshot>,
 }
 
+impl<P: Policy> DagScheduler<P> {
+    /// [`Dag::cancel`], before the running set is updated.
+    fn cancel_inner(&mut self, job: JobId) -> Vec<JobId> {
+        if let Some((slot, _)) = self.instance_of(job) {
+            let done = self.inst(slot).done;
+            let mut ids = self.cancel_instance(slot);
+            ids.extend(self.cancel_inner(done));
+            return ids;
+        }
+        let mut ids = self.cancel_explicit(job);
+        // Instances waiting on a cancelled job can never open; their `done` dependents go too.
+        let mut k = 0;
+        while k < ids.len() {
+            let entry = ids[k];
+            for slot in self.by_entry.remove(&entry).unwrap_or_default() {
+                if self.instances[slot].is_some() {
+                    let done = self.inst(slot).done;
+                    ids.extend(self.cancel_instance(slot));
+                    ids.extend(self.cancel_explicit(done));
+                }
+            }
+            k += 1;
+        }
+        ids
+    }
+}
+
 impl<P: Policy> Dag for DagScheduler<P> {
     /// Validate ids, insert nodes and edges, reject cycles, update ranks, then release ready jobs.
     fn declare(&mut self, jobs: Vec<DagJob>, now: Instant) -> Result<(), DagError> {
@@ -1039,6 +1116,7 @@ impl<P: Policy> Dag for DagScheduler<P> {
             node.spec = Some(j.spec.clone());
             node.work = j.work_estimate.unwrap_or(self.config.default_work);
             node.passthrough = j.passthrough;
+            node.local = j.local;
             batch.push(n);
         }
         for (j, &n) in jobs.iter().zip(&batch) {
@@ -1099,31 +1177,20 @@ impl<P: Policy> Dag for DagScheduler<P> {
     fn completed(&mut self, job: JobId, now: Instant) {
         self.now = now;
         self.policy.completed(job, now);
+        self.running.remove(&job);
+        if self.ignored.remove(&job) {
+            return;
+        }
         self.finish(job, now);
         self.drain_passthrough(now);
     }
 
     /// Remove the job and its descendants, then any forward references only they needed.
     fn cancel(&mut self, job: JobId) -> Vec<JobId> {
-        if let Some((slot, _)) = self.instance_of(job) {
-            let done = self.inst(slot).done;
-            let mut ids = self.cancel_instance(slot);
-            ids.extend(self.cancel(done));
-            return ids;
-        }
-        let mut ids = self.cancel_explicit(job);
-        // Instances waiting on a cancelled job can never open; their `done` dependents go too.
-        let mut k = 0;
-        while k < ids.len() {
-            let entry = ids[k];
-            for slot in self.by_entry.remove(&entry).unwrap_or_default() {
-                if self.instances[slot].is_some() {
-                    let done = self.inst(slot).done;
-                    ids.extend(self.cancel_instance(slot));
-                    ids.extend(self.cancel_explicit(done));
-                }
-            }
-            k += 1;
+        let ids = self.cancel_inner(job);
+        for id in &ids {
+            self.running.remove(id);
+            self.ignored.remove(id);
         }
         ids
     }
@@ -1143,7 +1210,9 @@ impl<P: Policy> Dag for DagScheduler<P> {
     /// Forwarded to the policy.
     fn dispatch(&mut self, now: Instant) -> Vec<(JobId, WorkerId)> {
         self.now = now;
-        self.policy.dispatch(now)
+        let out = self.policy.dispatch(now);
+        self.running.extend(out.iter().map(|x| x.0));
+        out
     }
 
     /// The DAG's reason while the job is not submitted, the policy's afterwards.
