@@ -143,7 +143,7 @@ impl Occupancy {
 
 /// Solve the normal equations `A x = b` (small, symmetric) by Gaussian elimination with partial
 /// pivoting. Singular directions get 0.
-fn solve(mut a: Vec<Vec<f64>>, mut b: Vec<f64>) -> Vec<f64> {
+pub(crate) fn solve(mut a: Vec<Vec<f64>>, mut b: Vec<f64>) -> Vec<f64> {
     let n = b.len();
     for c in 0..n {
         let p = (c..n)

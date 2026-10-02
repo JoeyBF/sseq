@@ -457,9 +457,16 @@ pub fn simulate(setup: &SimSetup, name: &str, policy: BoxPolicy) -> Metrics {
                     continue;
                 }
                 advance(&mut ws[w], w, t);
+                // The event was scheduled for the job(s) with the least work left: finish them even if
+                // rounding left a sliver (a completion at `now + tiny` can round to `now`).
+                let least = ws[w]
+                    .running
+                    .iter()
+                    .map(|x| x.1)
+                    .fold(f64::INFINITY, f64::min);
                 let mut finished = Vec::new();
                 ws[w].running.retain(|&(j, rem)| {
-                    let fin = rem <= 1e-7;
+                    let fin = rem <= least.max(0.0) + 1e-7;
                     if fin {
                         finished.push(j);
                     }

@@ -32,3 +32,8 @@ serde_json = "1"
 name = "sched-sim"
 path = "src/bin/sched_sim.rs"
 required-features = ["sim"]
+
+[[bin]]
+name = "sched-whole"
+path = "src/bin/sched_whole.rs"
+required-features = ["sim"]

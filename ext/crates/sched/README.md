@@ -6,6 +6,28 @@ of execution slots, it decides **which waiting job goes to which worker, and whe
 -- no networking, threads, clocks or persistence. Every input is an event carrying the caller's
 "now", and the same events produce the same placements.
 
+## The problem, in general terms
+
+Online scheduling of a weighted DAG on heterogeneous machines, with resource constraints:
+
+- **Graph.** Jobs form a directed acyclic graph, possibly declared long before it is ready, and
+  possibly built by *substitution*: a coarse DAG whose nodes expand into copies of shared
+  sub-DAGs ([`DagTemplate`]), expanded lazily. Zero-weight join nodes ([`DagJob::passthrough`])
+  mark "group done".
+- **Weights.** Each job has work that is unknown until it runs, with an estimate to rank by; a
+  resource demand held while it runs.
+- **Machines.** Workers have slots, a capacity, and a class (speed); they join and leave.
+- **Policy.** At every event, choose which ready jobs start where, subject to admission, so as to
+  finish soon without starving anyone.
+
+Reference points: with total work `W`, total throughput `P` and critical path `D`, every
+schedule needs at least `max(W/P, D)`, and every *greedy* one -- never idle while a job is ready
+and admissible -- needs at most `W/P + D` (Graham; Brent), so greedy is within 2x. Policies here
+are greedy by construction (subject to admission). The order among ready jobs is list scheduling:
+group arrival, or upward rank (critical path below a job, as in HEFT). Memory-aware admission
+with reservations and backfill is EASY-style backfilling; aging bounds starvation under
+priorities.
+
 ## Event loop
 
 ```rust
