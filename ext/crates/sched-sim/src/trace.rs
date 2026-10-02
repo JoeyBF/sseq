@@ -1,11 +1,10 @@
 //! The trace format: gzip-compressed JSONL with `worker`, `task` and `sample` records, or the
-//! event log of [`crate::log`].
+//! event log of [`sched::log`].
 
 use std::{collections::HashMap, io::BufRead, path::Path};
 
+use sched::{Attempt, Input, MEM, Output, log::TaskInfo};
 use serde::Deserialize;
-
-use crate::log::TaskInfo;
 
 /// A worker of the trace.
 #[derive(Clone, Debug)]
@@ -84,6 +83,7 @@ pub fn group_id(n: i64, s: i64) -> u64 {
     ((n as u64) << 20) | (s as u64 & 0xfffff)
 }
 
+/// One line of either format.
 #[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 enum Line {
@@ -101,36 +101,18 @@ enum Line {
         reserved_gb: f64,
         running: usize,
     },
-    // The event log (`crate::log`): folded into task records.
-    Submit {
+    // The event log ([`sched::log::Event`]): folded into worker and task records.
+    Input {
         t_s: f64,
-        job: u64,
-        est_gb: f64,
-        group: u64,
+        input: Input,
         #[serde(default)]
         info: Option<TaskInfo>,
     },
-    Placed {
+    Poll {
         t_s: f64,
-        job: u64,
-        worker: String,
+        #[serde(default)]
+        out: Vec<Output>,
     },
-    Moved {
-        t_s: f64,
-        job: u64,
-        to: String,
-    },
-    Done {
-        t_s: f64,
-        job: u64,
-    },
-    Failed {
-        job: u64,
-    },
-    Cancel {
-        job: u64,
-    },
-    Gone {},
     Reserved {},
 }
 
@@ -140,7 +122,8 @@ struct Pending {
     est_gb: f64,
     group: u64,
     info: Option<TaskInfo>,
-    placed: Option<(f64, String)>,
+    /// Its attempts' starts: (attempt, time, worker).
+    starts: Vec<(Attempt, f64, String)>,
 }
 
 #[derive(Deserialize)]
@@ -226,82 +209,90 @@ impl Trace {
                         running,
                     });
                 }
-                Line::Submit {
-                    t_s,
-                    job,
-                    est_gb,
-                    group,
-                    info,
-                } => {
-                    pending.insert(
-                        job,
-                        Pending {
+                Line::Input { t_s, input, info } => match input {
+                    Input::Worker(w) => {
+                        let i = index(&mut t, &w.id.to_string());
+                        let tw = &mut t.workers[i];
+                        tw.class = w.class;
+                        tw.budget_gb = w.budget[MEM] as f64 / 1e9;
+                        tw.slots = w.slots;
+                    }
+                    Input::Submit(spec) => {
+                        // A duplicate submission of a live job is ignored by the policy too.
+                        pending.entry(spec.id).or_insert(Pending {
                             ready_s: t_s,
-                            est_gb,
-                            group,
+                            est_gb: spec.demand[MEM] as f64 / 1e9,
+                            group: spec.group,
                             info,
-                            placed: None,
-                        },
-                    );
-                }
-                Line::Placed { t_s, job, worker }
-                | Line::Moved {
-                    t_s,
-                    job,
-                    to: worker,
-                } => {
-                    if let Some(p) = pending.get_mut(&job) {
-                        p.placed = Some((t_s, worker));
+                            starts: Vec::new(),
+                        });
+                    }
+                    Input::Cancel(job) => {
+                        pending.remove(&job);
+                    }
+                    Input::Done { job, attempt } => {
+                        let Some(p) = pending.remove(&job) else {
+                            continue;
+                        };
+                        // The task record keeps the attempt that finished.
+                        let Some((_, placed_s, worker)) =
+                            p.starts.into_iter().find(|s| s.0 == attempt)
+                        else {
+                            continue;
+                        };
+                        let worker = index(&mut t, &worker);
+                        let info = p.info.unwrap_or_else(|| TaskInfo {
+                            kind: "sig".into(),
+                            ..TaskInfo::default()
+                        });
+                        t.tasks.push(TraceTask {
+                            req: job,
+                            zero: info.kind == "zero",
+                            bidegree: info.bidegree,
+                            // Without a bidegree, the logged group itself.
+                            group: if info.bidegree == (0, 0) {
+                                p.group
+                            } else {
+                                group_id(info.bidegree.0, info.bidegree.1)
+                            },
+                            est_gb: p.est_gb,
+                            target: info.target.unwrap_or(1.0),
+                            next: info.next.unwrap_or(0.0),
+                            ready_s: p.ready_s,
+                            placed_s,
+                            done_s: t_s,
+                            worker,
+                            deps: info.deps,
+                            sig: info.sig,
+                            after_groups: info
+                                .after_groups
+                                .iter()
+                                .map(|&(n, s)| group_id(n, s))
+                                .collect(),
+                        });
+                    }
+                    Input::Failed { .. } | Input::WorkerGone(_) => {}
+                },
+                Line::Poll { t_s, out } => {
+                    for o in out {
+                        match o {
+                            Output::Start {
+                                job,
+                                attempt,
+                                worker,
+                            } => {
+                                if let Some(p) = pending.get_mut(&job) {
+                                    p.starts.push((attempt, t_s, worker.to_string()));
+                                }
+                            }
+                            Output::GaveUp(g) => {
+                                pending.remove(&g.job);
+                            }
+                            _ => {}
+                        }
                     }
                 }
-                Line::Failed { job } => {
-                    // The next placement is a retry; the task record keeps the last attempt.
-                    if let Some(p) = pending.get_mut(&job) {
-                        p.placed = None;
-                    }
-                }
-                Line::Cancel { job } => {
-                    pending.remove(&job);
-                }
-                Line::Done { t_s, job } => {
-                    let Some(p) = pending.remove(&job) else {
-                        continue;
-                    };
-                    let Some((placed_s, worker)) = p.placed else {
-                        continue;
-                    };
-                    let worker = index(&mut t, &worker);
-                    let info = p.info.unwrap_or_else(|| TaskInfo {
-                        kind: "sig".into(),
-                        ..TaskInfo::default()
-                    });
-                    t.tasks.push(TraceTask {
-                        req: job,
-                        zero: info.kind == "zero",
-                        bidegree: info.bidegree,
-                        // Without a bidegree, the logged group itself.
-                        group: if info.bidegree == (0, 0) {
-                            p.group
-                        } else {
-                            group_id(info.bidegree.0, info.bidegree.1)
-                        },
-                        est_gb: p.est_gb,
-                        target: info.target.unwrap_or(1.0),
-                        next: info.next.unwrap_or(0.0),
-                        ready_s: p.ready_s,
-                        placed_s,
-                        done_s: t_s,
-                        worker,
-                        deps: info.deps,
-                        sig: info.sig,
-                        after_groups: info
-                            .after_groups
-                            .iter()
-                            .map(|&(n, s)| group_id(n, s))
-                            .collect(),
-                    });
-                }
-                Line::Gone {} | Line::Reserved {} => {}
+                Line::Reserved {} => {}
                 Line::Task(x) => {
                     let (Some(placed_s), Some(done_s), Some(worker)) =
                         (x.placed_s, x.done_s, x.worker)
@@ -447,5 +438,146 @@ impl Trace {
                 })
             })
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use sched::{FailKind, GaveUp, JobSpec, Resources, WorkerState, log::Event};
+
+    use super::*;
+
+    /// Load `lines` as a trace file.
+    fn load(name: &str, lines: &[String]) -> Trace {
+        let path =
+            std::env::temp_dir().join(format!("sched-sim-{name}-{}.jsonl", std::process::id()));
+        std::fs::write(&path, lines.join("\n")).unwrap();
+        let t = Trace::load(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        t
+    }
+
+    /// The standalone format: workers, samples, and the tasks that ran.
+    #[test]
+    fn reads_standalone_records() {
+        let lines = [
+            r#"{"type":"worker","id":"a:1","gpu":"h200","budget_gb":100.0,"slots":4}"#,
+            r#"{"type":"sample","t_s":5.0,"worker":"a:1","rss_gb":10.0,"reserved_gb":2.0,"running":1}"#,
+            r#"{"type":"task","req":7,"kind":"zero","bidegree":[10,2],"est_gb":2.0,"ready_s":1.0,"placed_s":3.0,"done_s":9.0,"worker":"a:1"}"#,
+            r#"{"type":"task","req":8,"kind":"sig","bidegree":[10,2],"est_gb":2.0,"ready_s":1.0}"#,
+        ]
+        .map(String::from);
+        let t = load("standalone", &lines);
+        assert_eq!(t.workers.len(), 1);
+        let w = &t.workers[0];
+        assert_eq!((w.class.as_str(), w.budget_gb, w.slots), ("h200", 100.0, 4));
+        assert_eq!((w.join_s, w.samples.len()), (3.0, 1));
+        assert_eq!(t.tasks.len(), 1);
+        let task = &t.tasks[0];
+        assert!(task.zero);
+        assert_eq!((task.req, task.placed_s, task.done_s), (7, 3.0, 9.0));
+        assert_eq!(task.group, group_id(10, 2));
+    }
+
+    /// The event log: a task record keeps the attempt that finished (a retry, or a speculative
+    /// attempt that beat the original); cancelled and given-up jobs leave none.
+    #[test]
+    fn reads_event_log_attempts() {
+        let input = |t_s: f64, input: Input| Event::Input {
+            t_s,
+            input,
+            info: None,
+        };
+        let start = |job, attempt, worker| Output::Start {
+            job,
+            attempt,
+            worker,
+        };
+        let poll = |t_s: f64, out: Vec<Output>| Event::Poll { t_s, out };
+        let worker = |id| WorkerState::new(id, "l40s", 8, Resources::mem_gb(50.0));
+        let submit = |id| Input::Submit(JobSpec::new(id, Resources::mem_gb(1.5), 9));
+        let events = vec![
+            input(0.0, Input::Worker(worker(1))),
+            input(0.0, Input::Worker(worker(2))),
+            Event::Input {
+                t_s: 1.0,
+                input: submit(1),
+                info: Some(Box::new(TaskInfo {
+                    kind: "zero".into(),
+                    bidegree: (12, 3),
+                    ..TaskInfo::default()
+                })),
+            },
+            input(1.0, submit(2)),
+            poll(1.0, vec![start(1, 1, 1), start(2, 1, 1)]),
+            input(
+                2.0,
+                Input::Failed {
+                    job: 2,
+                    attempt: 1,
+                    kind: FailKind::Other,
+                    why: "x".into(),
+                },
+            ),
+            poll(2.0, vec![start(2, 2, 2)]),
+            poll(3.0, vec![start(1, 2, 2)]),
+            input(4.0, Input::Done { job: 1, attempt: 2 }),
+            poll(
+                4.0,
+                vec![Output::Stop {
+                    job: 1,
+                    attempt: 1,
+                    worker: 1,
+                }],
+            ),
+            input(6.0, Input::Done { job: 2, attempt: 2 }),
+            input(6.0, submit(3)),
+            input(6.0, Input::Cancel(3)),
+            input(6.0, submit(4)),
+            poll(6.0, vec![start(4, 1, 1)]),
+            poll(
+                7.0,
+                vec![Output::GaveUp(GaveUp {
+                    job: 4,
+                    tried: Vec::new(),
+                    retryable: false,
+                })],
+            ),
+            Event::Sample {
+                t_s: 7.0,
+                worker: "1".into(),
+                rss_gb: 3.0,
+                baseline_gb: 1.0,
+                reserved_gb: 0.0,
+                running: 0,
+                dev_per_task_gb: 0.5,
+            },
+        ];
+        let lines: Vec<String> = events
+            .iter()
+            .map(|e| serde_json::to_string(e).unwrap())
+            .collect();
+        let t = load("log", &lines);
+        let names: Vec<&str> = t.workers.iter().map(|w| w.name.as_str()).collect();
+        assert_eq!(names, ["1", "2"]);
+        assert_eq!((t.workers[0].budget_gb, t.workers[0].slots), (50.0, 8));
+        assert_eq!(t.workers[0].samples.len(), 1);
+        let got: Vec<(u64, f64, f64, f64, usize, bool, u64)> = t
+            .tasks
+            .iter()
+            .map(|x| {
+                (
+                    x.req, x.ready_s, x.placed_s, x.done_s, x.worker, x.zero, x.group,
+                )
+            })
+            .collect();
+        assert_eq!(
+            got,
+            [
+                (1, 1.0, 3.0, 4.0, 1, true, group_id(12, 3)),
+                (2, 1.0, 2.0, 6.0, 1, false, 9),
+            ]
+        );
+        assert_eq!(t.tasks[0].est_gb, 1.5);
     }
 }

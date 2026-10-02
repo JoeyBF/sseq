@@ -3,7 +3,10 @@
 use std::collections::BTreeMap;
 
 use proptest::prelude::*;
-use sched::{Config, JobSpec, Policy, Reservations, Resources, Scheduler, WorkerState};
+use sched::{
+    Attempt, Config, Input, JobId, JobSpec, Output, Policy, Reservations, Resources, Scheduler,
+    WorkerState,
+};
 
 const TICK: f64 = 1.0;
 const RESERVE_AFTER: f64 = 60.0;
@@ -23,19 +26,25 @@ struct Stream {
 /// Runs the stream; returns the big job's wait, or `None` if it was never placed.
 ///
 /// The bound under test, for the most urgent waiting job: it reserves a worker at the first
-/// dispatch after it has waited `reserve_after`, and from then on nothing new is admitted on that
+/// poll after it has waited `reserve_after`, and from then on nothing new is admitted on that
 /// worker, so it is placed at the latest when the jobs running there at that moment finish:
 /// `wait <= reserve_after + D + tick`, where `D` is the longest small-job duration and `tick` the
-/// dispatch granularity. (A job behind more urgent starving jobs waits for their reservations
+/// poll granularity. (A job behind more urgent starving jobs waits for their reservations
 /// first.) FIFO, as a control, starves the big job for the whole stream.
 fn run(p: &mut dyn Policy, s: &Stream) -> Option<f64> {
     for w in 0..s.workers {
-        p.worker_update(
-            WorkerState::new(w as u64, "x", s.slots, Resources::mem(s.budget)),
+        p.handle(
+            Input::Worker(WorkerState::new(
+                w as u64,
+                "x",
+                s.slots,
+                Resources::mem(s.budget),
+            )),
             0.0,
         );
     }
-    let mut ends: BTreeMap<u64, f64> = BTreeMap::new();
+    // Running attempts: job -> (attempt, end).
+    let mut ends: BTreeMap<JobId, (Attempt, f64)> = BTreeMap::new();
     let mut duration: BTreeMap<u64, u64> = BTreeMap::new();
     let mut next = 0u64;
     let mut big_submitted = false;
@@ -47,26 +56,29 @@ fn run(p: &mut dyn Policy, s: &Stream) -> Option<f64> {
             let (demand, d) = s.small[next as usize % s.small.len()];
             let mut small = JobSpec::new(next, Resources::mem(demand), 1_000 + next);
             small.work = Some(d as f64);
-            p.submit(small, t);
+            p.handle(Input::Submit(small), t);
             duration.insert(next, d);
             next += 1;
         }
         if !big_submitted && t >= s.big_at {
             let mut big = JobSpec::new(BIG, Resources::mem(s.big_demand), 0);
             big.priority = Some(-1);
-            p.submit(big, t);
+            p.handle(Input::Submit(big), t);
             big_submitted = true;
         }
-        let done: Vec<u64> = ends.iter().filter(|e| *e.1 <= t).map(|e| *e.0).collect();
-        for j in done {
-            ends.remove(&j);
-            p.completed(j, t);
+        let done: Vec<JobId> = ends.iter().filter(|e| e.1.1 <= t).map(|e| *e.0).collect();
+        for job in done {
+            let (attempt, _) = ends.remove(&job).unwrap();
+            p.handle(Input::Done { job, attempt }, t);
         }
-        for (j, _) in p.dispatch(t) {
-            if j == BIG {
+        for o in p.poll(t) {
+            let Output::Start { job, attempt, .. } = o else {
+                panic!("unexpected output {o:?}");
+            };
+            if job == BIG {
                 return Some(t - s.big_at);
             }
-            ends.insert(j, t + duration[&j] as f64);
+            ends.insert(job, (attempt, t + duration[&job] as f64));
         }
         t += TICK;
     }

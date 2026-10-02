@@ -3,17 +3,15 @@
 use std::path::PathBuf;
 
 use clap::Parser;
-use sched::{
-    Defer, SpeedConfig, SpeedPolicy,
-    sim::{
-        model::fit,
-        small::{
-            GridParams, Kind, Order, SmallInstance, SmallPlan, SmallResult, grid, perturb,
-            simulate_small,
-        },
-        trace::Trace,
-        whole::{Census, Fleet, WholeConfig, World},
+use sched::{Defer, Speculate, SpeedConfig, SpeedPolicy};
+use sched_sim::{
+    model::fit,
+    small::{
+        GridParams, Kind, Order, SmallInstance, SmallPlan, SmallResult, grid, perturb,
+        simulate_small,
     },
+    trace::Trace,
+    whole::{Census, Fleet, WholeConfig, World},
 };
 
 /// Compare plan A against plan B on small scheduling instances.
@@ -28,7 +26,7 @@ use sched::{
 struct Args {
     /// Plan A: group | rank | rank-oracle | grouprank | grouprank-oracle, with optional suffixes
     /// +fast, +eft (wait up to --max-defer), `+eft<percent>` (wait only for that much gain),
-    /// +spoil (restart stuck jobs on faster workers), `+age<seconds>`.
+    /// +spec (a second attempt of a running job on an idle faster worker), `+age<seconds>`.
     #[arg(long)]
     a: String,
     /// Plan B, as plan A.
@@ -116,11 +114,11 @@ fn plan(name: &str, max_defer: f64) -> SmallPlan {
                     min_gain: 0.0,
                 }))
             }
-            "spoil" => {
+            "spec" => {
                 if p.speed.policy == SpeedPolicy::Oblivious {
                     p.speed.policy = SpeedPolicy::FastestFirst;
                 }
-                p.speed.spoliation = Some(sched::Spoliation::default());
+                p.speed.speculate = Some(Speculate::default());
             }
             s if s.starts_with("age") => p.age_limit = Some(s[3..].parse().expect("+age<seconds>")),
             s if s.starts_with("eft") => {
@@ -318,7 +316,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 x.push(row);
                 lns.push(l);
             }
-            let (beta, r2, sd) = sched::sim::whole::ols_pub(&x, &lns);
+            let (beta, r2, sd) = sched_sim::whole::ols_pub(&x, &lns);
             let mut sorted = lns.clone();
             sorted.sort_by(f64::total_cmp);
             let mean = lns.iter().sum::<f64>() / lns.len() as f64;
@@ -373,7 +371,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let next = perturb(&cur, key, base.is_none());
                     let e = compare(&next, &a, &b).0;
                     let accept = e >= e_cur
-                        || sched::sim::whole::uniform_pub(key ^ 0xdead) < ((e - e_cur) / t).exp();
+                        || sched_sim::whole::uniform_pub(key ^ 0xdead) < ((e - e_cur) / t).exp();
                     if accept {
                         cur = next;
                         e_cur = e;

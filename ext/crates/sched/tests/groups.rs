@@ -1,9 +1,19 @@
 //! Group order: restart-stable ordering by id, and aging behind a wide old group.
 
 use sched::{
-    Config, DEFAULT_AGE_LIMIT, GroupOrder, JobSpec, Order, Policy, Resources, Scheduler,
-    WorkerState, nassau,
+    Config, DEFAULT_AGE_LIMIT, GroupOrder, Input, JobId, JobSpec, Order, Output, Policy, Resources,
+    Scheduler, WorkerId, WorkerState, nassau,
 };
+
+/// The `(job, worker)` of each start in `out`.
+fn starts(out: Vec<Output>) -> Vec<(JobId, WorkerId)> {
+    out.into_iter()
+        .filter_map(|o| match o {
+            Output::Start { job, worker, .. } => Some((job, worker)),
+            _ => None,
+        })
+        .collect()
+}
 
 /// Priority order with the given group order.
 fn by(group_order: GroupOrder) -> Order {
@@ -21,15 +31,27 @@ fn run_order(order: &[u64], group_order: GroupOrder) -> Vec<u64> {
         ..Config::default()
     });
     for (i, &g) in order.iter().enumerate() {
-        p.submit(JobSpec::new(g, Resources::mem(1), g), i as f64);
+        p.handle(
+            Input::Submit(JobSpec::new(g, Resources::mem(1), g)),
+            i as f64,
+        );
     }
-    p.worker_update(WorkerState::new(0, "x", 1, Resources::mem(100)), 10.0);
+    p.handle(
+        Input::Worker(WorkerState::new(0, "x", 1, Resources::mem(100))),
+        10.0,
+    );
     let mut ran = Vec::new();
     for t in 0..order.len() {
-        let out = p.dispatch(10.0 + t as f64);
+        let out = starts(p.poll(10.0 + t as f64));
         assert_eq!(out.len(), 1);
         ran.push(out[0].0);
-        p.completed(out[0].0, 10.5 + t as f64);
+        p.handle(
+            Input::Done {
+                job: out[0].0,
+                attempt: 1,
+            },
+            10.5 + t as f64,
+        );
     }
     ran
 }
@@ -70,34 +92,41 @@ fn young_group_behind_wide_old_group_waits_at_most_age_limit() {
     const RUN: f64 = 100.0;
     const YOUNG: u64 = 1_000_000;
     let wait = |policy: &mut dyn Policy| -> f64 {
-        policy.worker_update(WorkerState::new(0, "x", SLOTS, Resources::mem(100)), 0.0);
+        policy.handle(
+            Input::Worker(WorkerState::new(0, "x", SLOTS, Resources::mem(100))),
+            0.0,
+        );
         let mut released = 0;
         let mut running: Vec<(u64, f64)> = Vec::new();
         let mut t = 0.0;
         loop {
             // The old walk keeps two jobs per slot ready.
             while released < OLD_JOBS && policy.stats().waiting < 2 * SLOTS {
-                policy.submit(
-                    JobSpec::new(released, Resources::mem(1), nassau::group(1, 20)),
+                policy.handle(
+                    Input::Submit(JobSpec::new(
+                        released,
+                        Resources::mem(1),
+                        nassau::group(1, 20),
+                    )),
                     t,
                 );
                 released += 1;
             }
             if t == 10.0 {
-                policy.submit(
-                    JobSpec::new(YOUNG, Resources::mem(1), nassau::group(3, 40)),
+                policy.handle(
+                    Input::Submit(JobSpec::new(YOUNG, Resources::mem(1), nassau::group(3, 40))),
                     t,
                 );
             }
             running.retain(|&(j, end)| {
                 if end <= t {
-                    policy.completed(j, t);
+                    policy.handle(Input::Done { job: j, attempt: 1 }, t);
                     false
                 } else {
                     true
                 }
             });
-            for (j, _) in policy.dispatch(t) {
+            for (j, _) in starts(policy.poll(t)) {
                 if j == YOUNG {
                     return t - 10.0;
                 }

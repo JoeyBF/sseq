@@ -4,15 +4,36 @@ use std::collections::BTreeMap;
 
 use proptest::prelude::*;
 use sched::{
-    Config, Dag, DagConfig, DagError, DagJob, DagScheduler, DagTemplate, JobId, JobSpec, Policy,
-    Resources, Scheduler, WorkerState,
+    Config, DagConfig, DagError, DagJob, DagScheduler, DagTemplate, Input, JobId, JobSpec, Output,
+    Policy, Resources, Scheduler, WorkerId, WorkerState,
 };
 
 /// A DAG layer over one 64-slot worker.
 fn dag(config: DagConfig) -> DagScheduler<Scheduler> {
     let mut d = DagScheduler::new(config, Scheduler::new(Config::default()));
-    d.worker_update(WorkerState::new(0, "x", 64, Resources::mem(1000)), 0.0);
+    let w = WorkerState::new(0, "x", 64, Resources::mem(1000));
+    d.handle(Input::Worker(w), 0.0);
     d
+}
+
+/// Report the first attempt of `job` done.
+fn complete(p: &mut impl Policy, job: JobId, now: f64) {
+    p.handle(Input::Done { job, attempt: 1 }, now);
+}
+
+/// The first attempts a poll started, as `(job, worker)`.
+fn starts(p: &mut impl Policy, now: f64) -> Vec<(JobId, WorkerId)> {
+    p.poll(now)
+        .into_iter()
+        .map(|o| match o {
+            Output::Start {
+                job,
+                attempt: 1,
+                worker,
+            } => (job, worker),
+            o => panic!("unexpected output {o:?}"),
+        })
+        .collect()
 }
 
 /// A unit job in group 0.
@@ -20,9 +41,9 @@ fn job(id: JobId, deps: &[JobId]) -> DagJob {
     DagJob::new(JobSpec::new(id, Resources::mem(1), 0), deps.to_vec())
 }
 
-/// The ids placed by a dispatch, sorted.
+/// The ids started by a poll, sorted.
 fn placed(d: &mut DagScheduler<Scheduler>, now: f64) -> Vec<JobId> {
-    let mut v: Vec<JobId> = d.dispatch(now).into_iter().map(|p| p.0).collect();
+    let mut v: Vec<JobId> = starts(d, now).into_iter().map(|p| p.0).collect();
     v.sort_unstable();
     v
 }
@@ -50,9 +71,13 @@ fn passthrough_jobs_complete_by_themselves() {
         Some(7.0),
         "the passthrough's work counts in ranks"
     );
-    d.completed(1, 1.0);
-    assert_eq!(d.take_passed(), vec![2]);
-    assert_eq!(placed(&mut d, 1.0), vec![3]);
+    complete(&mut d, 1, 1.0);
+    let start = Output::Start {
+        job: 3,
+        attempt: 1,
+        worker: 0,
+    };
+    assert_eq!(d.poll(1.0), vec![Output::Passed { job: 2 }, start]);
     assert_eq!(d.stats().placements_total, 2);
 }
 
@@ -66,7 +91,7 @@ fn long_passthrough_chains_do_not_recurse() {
     jobs.push(job(N, &[N - 1]));
     d.declare(jobs, 0.0).unwrap();
     assert_eq!(placed(&mut d, 0.0), vec![0]);
-    d.completed(0, 1.0);
+    complete(&mut d, 0, 1.0);
     assert_eq!(placed(&mut d, 1.0), vec![N]);
     assert_eq!(d.dag_stats().pending, 0);
 }
@@ -174,7 +199,7 @@ fn templates_instantiate_per_group() {
         let now = step as f64;
         let out = placed(&mut d, now);
         for &j in &out {
-            d.completed(j, now + 0.5);
+            complete(&mut d, j, now + 0.5);
         }
         order.push(out);
     }
@@ -186,24 +211,28 @@ fn templates_instantiate_per_group() {
 #[test]
 fn avoid_and_class_are_hard_constraints() {
     let mut p = Scheduler::new(Config::default());
-    p.worker_update(WorkerState::new(1, "h200", 4, Resources::mem(100)), 0.0);
-    p.worker_update(WorkerState::new(2, "l40s", 4, Resources::mem(100)), 0.0);
+    let join = |p: &mut Scheduler, id, class, slots, now| {
+        let w = WorkerState::new(id, class, slots, Resources::mem(100));
+        p.handle(Input::Worker(w), now);
+    };
+    join(&mut p, 1, "h200", 4, 0.0);
+    join(&mut p, 2, "l40s", 4, 0.0);
     let mut retry = JobSpec::new(1, Resources::mem(1), 0);
     retry.avoid = vec![1];
     retry.prefer = vec![1];
-    p.submit(retry, 0.0);
+    p.handle(Input::Submit(retry), 0.0);
     let mut pinned = JobSpec::new(2, Resources::mem(1), 0);
     pinned.class = Some("h200".into());
-    p.submit(pinned, 0.0);
-    assert_eq!(p.dispatch(0.0), vec![(1, 2), (2, 1)]);
+    p.handle(Input::Submit(pinned), 0.0);
+    assert_eq!(starts(&mut p, 0.0), vec![(1, 2), (2, 1)]);
     // A job excluded everywhere waits, and says why.
     let mut nowhere = JobSpec::new(3, Resources::mem(1), 0);
     nowhere.class = Some("v100".into());
-    p.submit(nowhere, 1.0);
-    assert!(p.dispatch(1.0).is_empty());
+    p.handle(Input::Submit(nowhere), 1.0);
+    assert!(starts(&mut p, 1.0).is_empty());
     assert!(p.explain(3).unwrap().contains("2 worker(s) excluded"));
-    p.worker_update(WorkerState::new(3, "v100", 1, Resources::mem(10)), 2.0);
-    assert_eq!(p.dispatch(2.0), vec![(3, 3)]);
+    join(&mut p, 3, "v100", 1, 2.0);
+    assert_eq!(starts(&mut p, 2.0), vec![(3, 3)]);
 }
 
 /// The exact longest path below each job, by brute force.

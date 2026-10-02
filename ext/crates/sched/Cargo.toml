@@ -15,8 +15,6 @@ default = ["serde"]
 serde = ["dep:serde", "petgraph/serde-1"]
 # The JSONL event-log writer (`log::JsonlSink`).
 log = ["serde", "dep:serde_json", "dep:flate2"]
-# The trace simulator (`sched-sim` binary and the `sim` module).
-sim = ["log", "dep:clap"]
 
 [dependencies]
 petgraph = { version = "0.8", default-features = false, features = ["stable_graph", "std"] }
@@ -25,28 +23,7 @@ serde = { version = "1", features = ["derive"], optional = true }
 # `float_roundtrip`: a logged run replays exactly only if its times read back bit for bit.
 serde_json = { version = "1", features = ["float_roundtrip"], optional = true }
 flate2 = { version = "1", optional = true }
-clap = { version = "4", features = ["derive"], optional = true }
 
 [dev-dependencies]
 proptest = "1.7.0"
 serde_json = { version = "1", features = ["float_roundtrip"] }
-
-[[bin]]
-name = "sched-sim"
-path = "src/bin/sched_sim.rs"
-required-features = ["sim"]
-
-[[bin]]
-name = "sched-whole"
-path = "src/bin/sched_whole.rs"
-required-features = ["sim"]
-
-[[bin]]
-name = "sched-device"
-path = "src/bin/sched_device.rs"
-required-features = ["sim"]
-
-[[bin]]
-name = "sched-pisa"
-path = "src/bin/sched_pisa.rs"
-required-features = ["sim"]

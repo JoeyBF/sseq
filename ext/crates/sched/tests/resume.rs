@@ -9,18 +9,50 @@ use std::{
 
 use proptest::prelude::*;
 use sched::{
-    Config, Dag, DagConfig, DagJob, DagScheduler, DagTemplate, InstanceSpec, JobId, JobSpec,
-    NodeLabel, Resources, Scheduler, WorkerState,
+    Attempt, Config, DagConfig, DagJob, DagScheduler, DagTemplate, Input, InstanceSpec, JobId,
+    JobSpec, NodeLabel, Output, Policy, Resources, Scheduler, WorkerState,
 };
 
 /// A DAG layer over the default backfill policy with one worker of `slots` slots.
 fn sched(slots: usize, config: DagConfig) -> DagScheduler<Scheduler> {
     let mut d = DagScheduler::new(config, Scheduler::new(Config::default()));
-    d.worker_update(
-        WorkerState::new(0, "x", slots, Resources::mem(1 << 40)),
-        0.0,
-    );
+    join(&mut d, slots, 0.0);
     d
+}
+
+/// Worker 0, with `slots` slots, joins.
+fn join(d: &mut DagScheduler<Scheduler>, slots: usize, now: f64) {
+    let w = WorkerState::new(0, "x", slots, Resources::mem(1 << 40));
+    d.handle(Input::Worker(w), now);
+}
+
+/// Report attempt `attempt` of `job` done (0 for a local job).
+fn done(d: &mut DagScheduler<Scheduler>, job: JobId, attempt: Attempt, now: f64) {
+    d.handle(Input::Done { job, attempt }, now);
+}
+
+/// The jobs a poll started (on worker 0, first attempts), in output order.
+fn starts(out: &[Output]) -> Vec<JobId> {
+    out.iter()
+        .filter_map(|o| match *o {
+            Output::Start {
+                job,
+                attempt: 1,
+                worker: 0,
+            } => Some(job),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The jobs a poll reported as passed.
+fn passed(out: &[Output]) -> Vec<JobId> {
+    out.iter()
+        .filter_map(|o| match *o {
+            Output::Passed { job } => Some(job),
+            _ => None,
+        })
+        .collect()
 }
 
 /// An instance of `template` at `base`, entered by `entry`, finished as `done`.
@@ -47,8 +79,8 @@ fn with_entry(d: &mut DagScheduler<Scheduler>) {
         0.0,
     )
     .unwrap();
-    assert_eq!(d.take_local(), vec![1]);
-    d.completed(1, 0.0);
+    assert_eq!(d.poll(0.0), vec![Output::RunLocal { job: 1 }]);
+    done(d, 1, 0, 0.0);
 }
 
 /// R8: each node is submitted with its own demand, and explained under its label.
@@ -79,30 +111,31 @@ fn per_node_demand_and_label() {
         "{:?}",
         d.explain(101)
     );
-    d.take_local();
-    d.completed(1, 0.0);
-    assert_eq!(d.dispatch(0.0).len(), 3);
+    assert_eq!(d.poll(0.0), vec![Output::RunLocal { job: 1 }]);
+    done(&mut d, 1, 0, 0.0);
+    assert_eq!(starts(&d.poll(0.0)).len(), 3);
     assert_eq!(d.stats().workers[0].placed, Resources::mem(17));
 }
 
-/// The completion order of an instance driven to the end: every round, dispatch, then complete
-/// every running job in id order; also returns how often `done` (99) fired.
+/// The completion order of an instance driven to the end: every round, poll, then complete every
+/// started job in id order; also returns how often `done` (99) fired.
 fn drive(d: &mut DagScheduler<Scheduler>) -> (Vec<JobId>, usize) {
     let mut order = Vec::new();
-    let mut done = 0;
+    let mut fired = 0;
     for _ in 0..1000 {
-        let mut placed: Vec<JobId> = d.dispatch(0.0).into_iter().map(|x| x.0).collect();
+        let out = d.poll(0.0);
+        fired += passed(&out).iter().filter(|&&j| j == 99).count();
+        let mut placed = starts(&out);
         if placed.is_empty() {
             break;
         }
         placed.sort_unstable();
         for j in placed {
             order.push(j);
-            d.completed(j, 0.0);
+            done(d, j, 1, 0.0);
         }
-        done += d.take_passed().iter().filter(|&&j| j == 99).count();
     }
-    (order, done)
+    (order, fired)
 }
 
 /// A random DAG on `n` nodes (edges from lower to higher index).
@@ -120,10 +153,9 @@ fn template() -> impl Strategy<Value = (usize, Vec<(u32, u32)>)> {
 }
 
 proptest! {
-    /// R9: opening with a completed set S behaves exactly like opening and then completing S in
-    /// a topological order: the same nodes run afterwards, round by round (every ready node runs
-    /// each round), `done` fires once,
-    /// and no node of S ever runs.
+    /// R9: opening with a completed set S behaves exactly like the template without S, every
+    /// edge out of S satisfied: the same nodes run afterwards, round by round (every ready node
+    /// runs each round), `done` fires once, and no node of S ever runs.
     #[test]
     fn opening_with_completed_equals_completing(
         (n, edges) in template(),
@@ -141,19 +173,32 @@ proptest! {
         with_entry(&mut a);
         a.open_instance(InstanceSpec { completed: s.clone(), ..instance(&t, 100, 1, 99) }, 0.0)
             .unwrap();
+        // The reference: the nodes outside S, declared explicitly after the entry, and `done`
+        // as a passthrough after all of them.
         let mut b = sched(1000, cfg);
         with_entry(&mut b);
-        b.open_instance(instance(&t, 100, 1, 99), 0.0).unwrap();
-        for &i in &s {
-            b.completed(100 + u64::from(i), 0.0);
-        }
-        let done_a = a.take_passed().iter().filter(|&&j| j == 99).count();
-        let done_b = b.take_passed().iter().filter(|&&j| j == 99).count();
-        let (order_a, more_a) = drive(&mut a);
-        let (order_b, more_b) = drive(&mut b);
+        let rest: Vec<u32> = (0..n as u32).filter(|i| !s.contains(i)).collect();
+        let mut jobs: Vec<DagJob> = rest
+            .iter()
+            .map(|&i| {
+                let mut deps: Vec<JobId> = t
+                    .predecessors(i as usize)
+                    .iter()
+                    .filter(|p| !s.contains(p))
+                    .map(|&p| 100 + JobId::from(p))
+                    .collect();
+                deps.push(1);
+                DagJob::new(JobSpec::new(100 + JobId::from(i), Resources::mem(1), 7), deps)
+            })
+            .collect();
+        let nodes = rest.iter().map(|&i| 100 + JobId::from(i)).collect();
+        jobs.push(DagJob::passthrough(99, 7, nodes, 0.0));
+        b.declare(jobs, 0.0).unwrap();
+        let (order_a, done_a) = drive(&mut a);
+        let (order_b, done_b) = drive(&mut b);
         prop_assert_eq!(&order_a, &order_b);
-        prop_assert_eq!(done_a + more_a, 1);
-        prop_assert_eq!(done_b + more_b, 1);
+        prop_assert_eq!(done_a, 1);
+        prop_assert_eq!(done_b, 1);
         for &i in &s {
             prop_assert!(!order_a.contains(&(100 + u64::from(i))), "node {} of S ran", i);
         }
@@ -183,30 +228,31 @@ fn close_instance_early() {
         0.0,
     )
     .unwrap();
-    let placed: Vec<JobId> = d.dispatch(0.0).into_iter().map(|x| x.0).collect();
-    assert_eq!(placed, vec![100, 101]);
-    d.take_passed();
+    assert_eq!(starts(&d.poll(0.0)), vec![100, 101]);
     let mut running = d.close_instance(99, 1.0).unwrap();
     running.sort_unstable();
     assert_eq!(running, vec![100, 101]);
-    assert_eq!(d.take_passed(), vec![99]);
-    // The waiting nodes were withdrawn; the walk's dependent is ready.
+    // `done` passed, and the walk's dependent is ready, but both slots are still taken.
+    assert_eq!(d.poll(1.0), vec![Output::Passed { job: 99 }]);
+    // The waiting nodes were withdrawn.
     let st = d.stats();
     assert_eq!((st.waiting, st.running), (1, 2));
     assert!(d.close_instance(99, 1.0).is_err(), "closed twice");
     // Ignored completions free their slots and change nothing else.
-    d.completed(100, 2.0);
-    d.completed(101, 2.0);
-    assert!(d.take_passed().is_empty(), "no second done");
-    assert_eq!(d.dispatch(2.0), vec![(200, 0)]);
-    d.completed(200, 3.0);
+    done(&mut d, 100, 1, 2.0);
+    done(&mut d, 101, 1, 2.0);
+    let out = d.poll(2.0);
+    assert!(passed(&out).is_empty(), "no second done");
+    assert_eq!(starts(&out), vec![200]);
+    done(&mut d, 200, 1, 3.0);
+    assert!(d.poll(3.0).is_empty());
     let st = d.stats();
     assert_eq!((st.waiting, st.running), (0, 0));
     assert_eq!(st.workers[0].placed, Resources::ZERO);
 }
 
-/// R11: local jobs are never submitted; they are returned by `take_local`, not `take_ready`,
-/// and `release` refuses them.
+/// R11: local jobs are never submitted; they are announced as [`Output::RunLocal`], not
+/// [`Output::Ready`], `release` refuses them, and they are reported done with attempt 0.
 #[test]
 fn local_jobs_stay_on_the_caller() {
     let mut d = sched(
@@ -225,16 +271,15 @@ fn local_jobs_stay_on_the_caller() {
         0.0,
     )
     .unwrap();
-    assert!(d.take_ready().is_empty());
-    assert_eq!(d.take_local(), vec![1]);
+    assert_eq!(d.poll(0.0), vec![Output::RunLocal { job: 1 }]);
     assert!(!d.release(1, 0.0));
-    assert!(d.dispatch(0.0).is_empty());
-    d.completed(1, 1.0);
-    assert_eq!(d.take_ready(), vec![2]);
+    assert!(d.poll(0.0).is_empty());
+    done(&mut d, 1, 0, 1.0);
+    assert_eq!(d.poll(1.0), vec![Output::Ready { job: 2 }]);
     assert!(d.release(2, 1.0));
-    assert_eq!(d.dispatch(1.0), vec![(2, 0)]);
-    d.completed(2, 2.0);
-    assert_eq!(d.take_local(), vec![3]);
+    assert_eq!(starts(&d.poll(1.0)), vec![2]);
+    done(&mut d, 2, 1, 2.0);
+    assert_eq!(d.poll(2.0), vec![Output::RunLocal { job: 3 }]);
     assert_eq!(d.stats().placements_total, 1);
 }
 
@@ -348,40 +393,42 @@ fn run(w: &Workload, restarts: &BTreeSet<usize>) -> Result<BTreeMap<JobId, usize
     let mut d = sched(3, DagConfig::default());
     let all = declare(&mut d, w);
     let mut completed: BTreeMap<JobId, usize> = BTreeMap::new();
-    let mut running: Vec<JobId> = Vec::new();
+    let mut running: Vec<(JobId, Attempt)> = Vec::new();
     let mut step = 0;
     while completed.len() < all.len() && step < 10_000 {
+        let t = step as f64;
         if restarts.contains(&step) {
             let snap = serde_json::to_string(&d.snapshot()).unwrap();
             d = DagScheduler::restore(
                 serde_json::from_str(&snap).unwrap(),
                 Scheduler::new(Config::default()),
-                step as f64,
+                t,
             );
-            d.worker_update(
-                WorkerState::new(0, "x", 3, Resources::mem(1 << 40)),
-                step as f64,
-            );
+            join(&mut d, 3, t);
             running.clear();
         }
-        let t = step as f64;
-        for j in d.take_local() {
-            *completed.entry(j).or_default() += 1;
-            d.completed(j, t);
-        }
-        for (j, _) in d.dispatch(t) {
-            prop_assert!(
-                !completed.contains_key(&j),
-                "job {} placed after completing",
-                j
-            );
-            running.push(j);
+        for o in d.poll(t) {
+            match o {
+                Output::RunLocal { job } => {
+                    *completed.entry(job).or_default() += 1;
+                    done(&mut d, job, 0, t);
+                }
+                Output::Start { job, attempt, .. } => {
+                    prop_assert!(
+                        !completed.contains_key(&job),
+                        "job {} placed after completing",
+                        job
+                    );
+                    running.push((job, attempt));
+                }
+                o => prop_assert!(false, "unexpected output {:?}", o),
+            }
         }
         // Complete the oldest running job.
         if !running.is_empty() {
-            let j = running.remove(0);
+            let (j, attempt) = running.remove(0);
             *completed.entry(j).or_default() += 1;
-            d.completed(j, t);
+            done(&mut d, j, attempt, t);
         }
         step += 1;
     }
@@ -419,10 +466,16 @@ fn nothing_runs_before_the_entry() {
     )
     .unwrap();
     let t = Arc::new(DagTemplate::new(2, [(0, 1)]).unwrap());
-    d.open_instance(instance(&t, 100, 1, 99), 0.0).unwrap();
-    assert_eq!(d.dispatch(0.0), vec![(1, 0)]);
-    d.completed(100, 1.0);
-    assert!(d.dispatch(1.0).is_empty(), "node 101 ran before the entry");
-    d.completed(1, 2.0);
-    assert_eq!(d.dispatch(2.0), vec![(101, 0)]);
+    let spec = InstanceSpec {
+        completed: vec![0],
+        ..instance(&t, 100, 1, 99)
+    };
+    d.open_instance(spec, 0.0).unwrap();
+    assert_eq!(
+        starts(&d.poll(0.0)),
+        vec![1],
+        "node 101 ran before the entry"
+    );
+    done(&mut d, 1, 1, 2.0);
+    assert_eq!(starts(&d.poll(2.0)), vec![101]);
 }

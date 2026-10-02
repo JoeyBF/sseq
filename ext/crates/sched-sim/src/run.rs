@@ -1,15 +1,16 @@
 //! The event-driven replay of a trace against a policy, and its metrics.
 
-use std::{
-    cmp::Ordering,
-    collections::{BTreeMap, BinaryHeap, HashMap, HashSet},
-};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
+use sched::{
+    DagConfig, DagJob, DagScheduler, Input, JobSpec, Output, Policy, Resources, WorkerState,
+};
 use serde::Serialize;
 
-use super::{model::ServiceModel, trace::Trace};
 use crate::{
-    Dag, DagConfig, DagJob, DagScheduler, JobSpec, Policy, PolicyStats, Resources, WorkerState,
+    engine::{PsWorker, Queue},
+    model::ServiceModel,
+    trace::Trace,
 };
 
 /// How the replay derives each worker's `reported_baseline`.
@@ -199,7 +200,7 @@ pub struct Metrics {
     pub reserved_idle_slot_h: f64,
     /// That, as a fraction of all available slot-time.
     pub reserved_idle_frac: f64,
-    /// Wall time of `dispatch` calls, microseconds.
+    /// Wall time of `poll` calls, microseconds.
     pub dispatch_us: Quantiles,
     /// The longest waits: `(req, est_gb, bidegree, arrival_s, wait_s)`.
     pub worst: Vec<(u64, f64, (i64, i64), f64, f64)>,
@@ -207,97 +208,49 @@ pub struct Metrics {
     pub overrun: Overrun,
 }
 
+/// An event of the replay.
 #[derive(Clone, Copy, Debug)]
 enum Ev {
+    /// A worker joins.
     Join(usize),
+    /// A worker reports a heartbeat.
     Heartbeat(usize),
+    /// A task becomes ready.
     Arrive(usize),
+    /// A worker's next completion, of this [`PsWorker`] version.
     Done(usize, u64),
 }
 
-struct Item {
-    t: f64,
-    seq: u64,
-    ev: Ev,
-}
-
-impl PartialEq for Item {
-    /// Equal when [`Ord`] says so.
-    fn eq(&self, o: &Self) -> bool {
-        self.cmp(o) == Ordering::Equal
-    }
-}
-
-impl Eq for Item {}
-
-impl PartialOrd for Item {
-    /// Total, from [`Ord`].
-    fn partial_cmp(&self, o: &Self) -> Option<Ordering> {
-        Some(self.cmp(o))
-    }
-}
-
-impl Ord for Item {
-    /// Reversed: `BinaryHeap` is a max-heap and we want the earliest event.
-    fn cmp(&self, o: &Self) -> Ordering {
-        o.t.total_cmp(&self.t).then(o.seq.cmp(&self.seq))
-    }
-}
-
+/// A simulated worker.
 #[derive(Default)]
 struct WSim {
-    running: Vec<(usize, f64)>,
-    last: f64,
-    version: u64,
-    joined: bool,
+    ps: PsWorker,
+    /// Index of its latest trace sample at or before the current time.
     sample: usize,
-    busy: f64,
+    /// Placed estimate-GB-seconds.
     mem: f64,
 }
 
+/// The policy, alone (open loop) or behind the DAG layer (closed loop).
 enum Driver {
     Open(BoxPolicy),
     Closed(Box<DagScheduler<BoxPolicy>>),
 }
 
 impl Driver {
-    /// Forwarded to the policy or the DAG layer.
-    fn worker_update(&mut self, w: WorkerState, t: f64) {
+    /// The policy the simulation talks to.
+    fn policy(&self) -> &dyn Policy {
         match self {
-            Self::Open(p) => p.worker_update(w, t),
-            Self::Closed(d) => d.worker_update(w, t),
+            Self::Open(p) => p,
+            Self::Closed(d) => &**d,
         }
     }
 
-    /// Forwarded to the policy or the DAG layer.
-    fn completed(&mut self, j: usize, t: f64) {
+    /// The policy the simulation talks to, mutably.
+    fn policy_mut(&mut self) -> &mut dyn Policy {
         match self {
-            Self::Open(p) => p.completed(j as u64, t),
-            Self::Closed(d) => d.completed(j as u64, t),
-        }
-    }
-
-    /// Forwarded to the policy or the DAG layer.
-    fn dispatch(&mut self, t: f64) -> Vec<(u64, u64)> {
-        match self {
-            Self::Open(p) => p.dispatch(t),
-            Self::Closed(d) => d.dispatch(t),
-        }
-    }
-
-    /// Forwarded to the policy or the DAG layer.
-    fn stats(&self) -> PolicyStats {
-        match self {
-            Self::Open(p) => p.stats(),
-            Self::Closed(d) => d.stats(),
-        }
-    }
-
-    /// Forwarded to the policy or the DAG layer.
-    fn explain(&self, j: usize) -> Option<String> {
-        match self {
-            Self::Open(p) => p.explain(j as u64),
-            Self::Closed(d) => d.explain(j as u64),
+            Self::Open(p) => p,
+            Self::Closed(d) => &mut **d,
         }
     }
 }
@@ -370,8 +323,10 @@ fn closed_loop_inputs(trace: &Trace) -> (Vec<Vec<usize>>, Vec<f64>) {
 /// Workers join at their trace join time and stay until the end. Every `heartbeat_s` each worker
 /// reports `reported_used` = the trace's resident-memory sample at that time and
 /// `reported_baseline` per [`Baseline`]; both are exogenous (replayed from the trace, not
-/// responsive to the simulated placements). Jobs run under the
-/// processor-sharing [`ServiceModel`]. The policy's `dispatch` is called after every event.
+/// responsive to the simulated placements). Jobs run under the processor-sharing
+/// [`ServiceModel`]. The policy is polled after every event. A speculative attempt
+/// ([`Speculate`](sched::Speculate)) runs beside the original until one of them finishes; the
+/// other is stopped.
 ///
 /// Arrivals are either **open-loop** (each job arrives at its trace `ready_s`) or **closed-loop**:
 /// all jobs are declared to a [`DagScheduler`] up front with the trace's dependencies, and a job
@@ -382,19 +337,14 @@ pub fn simulate(setup: &SimSetup, name: &str, policy: BoxPolicy) -> Metrics {
     let trace = setup.trace;
     let n = trace.tasks.len();
     let nw = trace.workers.len();
-    let mut heap = BinaryHeap::new();
-    let mut seq = 0u64;
-    let mut push = |heap: &mut BinaryHeap<Item>, t: f64, ev: Ev| {
-        seq += 1;
-        heap.push(Item { t, seq, ev });
-    };
+    let mut queue = Queue::new();
     for (w, tw) in trace.workers.iter().enumerate() {
-        push(&mut heap, tw.join_s, Ev::Join(w));
+        queue.push(tw.join_s, Ev::Join(w));
     }
     let (mut driver, gaps) = match &setup.closed_loop {
         None => {
             for (j, t) in trace.tasks.iter().enumerate() {
-                push(&mut heap, t.ready_s, Ev::Arrive(j));
+                queue.push(t.ready_s, Ev::Arrive(j));
             }
             (Driver::Open(policy), Vec::new())
         }
@@ -420,8 +370,11 @@ pub fn simulate(setup: &SimSetup, name: &str, policy: BoxPolicy) -> Metrics {
                 .collect();
             dag.declare(jobs, 0.0)
                 .expect("the trace's dependencies are acyclic");
-            for j in dag.take_ready() {
-                push(&mut heap, gaps[j as usize], Ev::Arrive(j as usize));
+            // No worker has joined yet: this poll only announces the jobs without dependencies.
+            for o in dag.poll(0.0) {
+                if let Output::Ready { job } = o {
+                    queue.push(gaps[job as usize], Ev::Arrive(job as usize));
+                }
             }
             (Driver::Closed(Box::new(dag)), gaps)
         }
@@ -446,22 +399,14 @@ pub fn simulate(setup: &SimSetup, name: &str, policy: BoxPolicy) -> Metrics {
     let rate = |w: usize, k: usize| setup.model.throughput(&trace.workers[w].class, k) / k as f64;
 
     let advance = |s: &mut WSim, w: usize, t: f64| {
-        let dt = t - s.last;
-        let k = s.running.len();
-        if dt > 0.0 && k > 0 {
-            let r = rate(w, k);
-            for x in &mut s.running {
-                x.1 -= r * dt;
-            }
-            s.busy += k as f64 * dt;
-            s.mem += s
-                .running
-                .iter()
-                .map(|x| trace.tasks[x.0].est_gb)
-                .sum::<f64>()
-                * dt;
+        if let Some((dt, _)) = s.ps.advance(t, |r| rate(w, r.len())) {
+            s.mem +=
+                s.ps.running
+                    .iter()
+                    .map(|x| trace.tasks[x.job as usize].est_gb)
+                    .sum::<f64>()
+                    * dt;
         }
-        s.last = t;
     };
     let state = |w: usize, s: &mut WSim, t: f64| -> WorkerState {
         let tw = &trace.workers[w];
@@ -500,20 +445,21 @@ pub fn simulate(setup: &SimSetup, name: &str, policy: BoxPolicy) -> Metrics {
         }
     };
 
-    while let Some(Item { t, ev, .. }) = heap.pop() {
+    while let Some((t, ev)) = queue.pop() {
         for &w in &reserved {
-            let free = trace.workers[w].slots.saturating_sub(ws[w].running.len());
+            let free = trace.workers[w]
+                .slots
+                .saturating_sub(ws[w].ps.running.len());
             reserved_idle += free as f64 * (t - prev_t);
         }
         prev_t = t;
         let mut dirty: Vec<usize> = Vec::new();
         match ev {
             Ev::Join(w) => {
-                ws[w].joined = true;
-                ws[w].last = t;
+                advance(&mut ws[w], w, t);
                 let st = state(w, &mut ws[w], t);
-                driver.worker_update(st, t);
-                push(&mut heap, t + setup.heartbeat_s, Ev::Heartbeat(w));
+                driver.policy_mut().handle(Input::Worker(st), t);
+                queue.push(t + setup.heartbeat_s, Ev::Heartbeat(w));
             }
             Ev::Heartbeat(w) => {
                 if let Some(u) = &setup.usage
@@ -521,9 +467,13 @@ pub fn simulate(setup: &SimSetup, name: &str, policy: BoxPolicy) -> Metrics {
                 {
                     let rss = u.idle[w]
                         + ws[w]
+                            .ps
                             .running
                             .iter()
-                            .map(|x| trace.tasks[x.0].est_gb * u.fraction(x.0))
+                            .map(|x| {
+                                let j = x.job as usize;
+                                trace.tasks[j].est_gb * u.fraction(j)
+                            })
                             .sum::<f64>();
                     let excess = rss - trace.workers[w].budget_gb;
                     overrun.samples += 1;
@@ -533,83 +483,94 @@ pub fn simulate(setup: &SimSetup, name: &str, policy: BoxPolicy) -> Metrics {
                     }
                 }
                 let st = state(w, &mut ws[w], t);
-                driver.worker_update(st, t);
+                driver.policy_mut().handle(Input::Worker(st), t);
                 if completed < n && t < horizon {
-                    push(&mut heap, t + setup.heartbeat_s, Ev::Heartbeat(w));
+                    queue.push(t + setup.heartbeat_s, Ev::Heartbeat(w));
                 }
             }
             Ev::Arrive(j) => {
                 arrival[j] = t;
                 match &mut driver {
-                    Driver::Open(p) => p.submit(spec(setup, j), t),
+                    Driver::Open(p) => p.handle(Input::Submit(spec(setup, j)), t),
                     Driver::Closed(d) => {
                         d.release(j as u64, t);
                     }
                 }
             }
             Ev::Done(w, v) => {
-                if v != ws[w].version {
+                if !ws[w].ps.is_current(v) {
                     continue;
                 }
                 advance(&mut ws[w], w, t);
-                // The event was scheduled for the job(s) with the least work left: finish them even if
-                // rounding left a sliver (a completion at `now + tiny` can round to `now`).
-                let least = ws[w]
-                    .running
-                    .iter()
-                    .map(|x| x.1)
-                    .fold(f64::INFINITY, f64::min);
-                let mut finished = Vec::new();
-                ws[w].running.retain(|&(j, rem)| {
-                    let fin = rem <= least.max(0.0) + 1e-7;
-                    if fin {
-                        finished.push(j);
+                // The event was scheduled for the job(s) with the least work left: finish them even
+                // if rounding left a sliver (a completion at `now + tiny` can round to `now`).
+                let mut finished = ws[w].ps.finish(|left, least| left <= least.max(0.0) + 1e-7);
+                finished.sort_unstable_by_key(|r| (r.job, r.attempt));
+                for r in finished {
+                    let j = r.job as usize;
+                    // Another attempt finished first; this one's stop is on its way.
+                    if done[j].is_finite() {
+                        continue;
                     }
-                    !fin
-                });
-                finished.sort_unstable();
-                for j in finished {
                     done[j] = t;
+                    ran_on[j] = Some(w);
                     completed += 1;
-                    driver.completed(j, t);
-                }
-                if let Driver::Closed(d) = &mut driver {
-                    for r in d.take_ready() {
-                        push(&mut heap, t + gaps[r as usize], Ev::Arrive(r as usize));
-                    }
+                    driver.policy_mut().handle(
+                        Input::Done {
+                            job: r.job,
+                            attempt: r.attempt,
+                        },
+                        t,
+                    );
                 }
                 dirty.push(w);
             }
         }
         let clock = std::time::Instant::now();
-        let out = driver.dispatch(t);
+        let out = driver.policy_mut().poll(t);
         dispatch_us.push(clock.elapsed().as_secs_f64() * 1e6);
-        for (j, w) in out {
-            let (j, w) = (j as usize, w as usize);
-            advance(&mut ws[w], w, t);
-            ws[w].running.push((j, setup.work[j]));
-            placed[j] = t;
-            ran_on[j] = Some(w);
-            dirty.push(w);
+        for o in out {
+            match o {
+                Output::Start {
+                    job,
+                    attempt,
+                    worker,
+                } => {
+                    let (j, w) = (job as usize, worker as usize);
+                    advance(&mut ws[w], w, t);
+                    ws[w].ps.start(job, attempt, setup.work[j]);
+                    if !placed[j].is_finite() {
+                        placed[j] = t;
+                    }
+                    dirty.push(w);
+                }
+                Output::Stop {
+                    job,
+                    attempt,
+                    worker,
+                } => {
+                    let w = worker as usize;
+                    advance(&mut ws[w], w, t);
+                    if ws[w].ps.stop(job, attempt) {
+                        dirty.push(w);
+                    }
+                }
+                Output::Ready { job } => {
+                    queue.push(t + gaps[job as usize], Ev::Arrive(job as usize));
+                }
+                Output::GaveUp(g) => unreachable!("job {} failed, but no attempt fails", g.job),
+                Output::RunLocal { .. } | Output::Passed { .. } => {}
+            }
         }
         dirty.sort_unstable();
         dirty.dedup();
         for w in dirty {
-            let s = &mut ws[w];
-            s.version += 1;
-            if !s.running.is_empty() {
-                let r = rate(w, s.running.len());
-                let min = s
-                    .running
-                    .iter()
-                    .map(|x| x.1)
-                    .fold(f64::INFINITY, f64::min)
-                    .max(0.0);
-                let v = s.version;
-                push(&mut heap, t + min / r, Ev::Done(w, v));
+            if let Some((at, v)) = ws[w].ps.next_completion(t, |r| rate(w, r.len())) {
+                queue.push(at, Ev::Done(w, v));
             }
         }
         reserved = driver
+            .policy()
             .stats()
             .reservations
             .iter()
@@ -623,12 +584,12 @@ pub fn simulate(setup: &SimSetup, name: &str, policy: BoxPolicy) -> Metrics {
             last_explain = t;
             eprintln!(
                 "[{name} t={t:.0}] {}",
-                driver.explain(j).unwrap_or_default()
+                driver.policy().explain(j as u64).unwrap_or_default()
             );
         }
     }
 
-    let stats = driver.stats();
+    let stats = driver.policy().stats();
     let jobs_done: Vec<usize> = (0..n).filter(|&j| done[j].is_finite()).collect();
     let mut m = summarize(
         setup,
@@ -642,14 +603,9 @@ pub fn simulate(setup: &SimSetup, name: &str, policy: BoxPolicy) -> Metrics {
         &arrival,
         &placed,
         &done,
-        &|w| ws[w].busy,
+        &|w| ws[w].ps.busy,
         &|w| ws[w].mem,
     );
-    for (j, w) in ran_on.iter_mut().enumerate() {
-        if !done[j].is_finite() {
-            *w = None;
-        }
-    }
     attribute_work(setup, &mut m, &ran_on);
     m.reservations = stats.reservations_total;
     m.reserved_idle_slot_h = reserved_idle / 3600.0;

@@ -3,13 +3,11 @@
 use std::{path::PathBuf, time::Instant};
 
 use clap::Parser;
-use sched::{
-    Config, DagConfig, Fit, Reservations, Scheduler,
-    sim::{
-        model::{ClassCurve, PsModel, fit},
-        run::{Baseline, BoxPolicy, Metrics, SimSetup, Usage, production, simulate},
-        trace::Trace,
-    },
+use sched::{Config, DagConfig, Fit, Reservations, Scheduler};
+use sched_sim::{
+    model::{ClassCurve, PsModel, fit},
+    run::{Baseline, BoxPolicy, Metrics, SimSetup, Usage, production, simulate},
+    trace::Trace,
 };
 
 /// Command-line arguments.

@@ -4,4 +4,5 @@
 #
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
-cc 7933a46d08dfe4923264b088c20000be3585f58e503fa1af5d694c94cde733ba # shrinks to ops = [Join(3, 1), Place(0), Gone(3), Join(3, 0)]
+cc 7933a46d08dfe4923264b088c20000be3585f58e503fa1af5d694c94cde733ba # shrinks to ops = [Join(3, 1), Lease(0), Gone(3), Join(3, 0)]
+cc 54c19d0304056530e679b4674914f46ccb663dd727264fc2988e8caf2d8e930d # shrinks to ops = [Join(1, 1), Lease(3), Join(4, 1), Gone(1), Join(0, 0), Gone(4), Fail(0, false)]

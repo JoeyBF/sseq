@@ -10,8 +10,6 @@ pub use log::EventSink;
 pub mod nassau;
 mod scheduler;
 mod shared;
-#[cfg(feature = "sim")]
-pub mod sim;
 mod speed;
 
 pub use admission::{Admission, ProductionAdmission, WorkerView};

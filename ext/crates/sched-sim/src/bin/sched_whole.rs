@@ -3,13 +3,11 @@
 use std::path::PathBuf;
 
 use clap::Parser;
-use sched::{
-    Defer, Learn, SpeedConfig, SpeedPolicy,
-    sim::{
-        model::fit,
-        trace::Trace,
-        whole::{Census, Fleet, GroupKey, Pin, Placement, Plan, WholeConfig, World, simulate},
-    },
+use sched::{Defer, Learn, SpeedConfig, SpeedPolicy};
+use sched_sim::{
+    model::fit,
+    trace::Trace,
+    whole::{Census, Fleet, GroupKey, Pin, Placement, Plan, WholeConfig, World, simulate},
 };
 
 /// Whole-run simulation of a Nassau resolution.

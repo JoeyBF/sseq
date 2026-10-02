@@ -1,13 +1,16 @@
 //! Small flat scheduling instances, their simulation, generators and perturbations (for PISA).
 
-use std::{cmp::Ordering, collections::BinaryHeap};
+use std::collections::HashMap;
 
+use sched::{
+    Attempt, Config, DagConfig, DagJob, DagScheduler, GroupOrder, Input, JobSpec, Output, Policy,
+    Resources, Scheduler, SpeedConfig, WorkerState,
+};
 use serde::Serialize;
 
-use super::whole::{mix, normal, uniform};
 use crate::{
-    Config, Dag, DagConfig, DagJob, DagScheduler, GroupOrder, JobSpec, Policy, Resources,
-    Scheduler, SpeedConfig, WorkerState,
+    engine::Queue,
+    whole::{mix, normal, uniform},
 };
 
 /// What a task is.
@@ -105,8 +108,8 @@ pub struct SmallResult {
     pub idle_ready: f64,
     /// Fraction of the makespan spent running realised-critical-chain tasks on slow workers.
     pub slow_on_crit: f64,
-    /// Jobs restarted on a faster worker.
-    pub preemptions: u64,
+    /// Speculative attempts started on a faster worker ([`Speculate`](sched::Speculate)).
+    pub speculations: u64,
 }
 
 impl SmallInstance {
@@ -146,28 +149,9 @@ impl SmallInstance {
     }
 }
 
-/// A completion event (earliest first).
-#[derive(PartialEq)]
-struct Ev(f64, u64, Option<(usize, u32)>);
-
-impl Eq for Ev {}
-
-impl PartialOrd for Ev {
-    /// The total order of [`Ord`].
-    fn partial_cmp(&self, o: &Self) -> Option<Ordering> {
-        Some(self.cmp(o))
-    }
-}
-
-impl Ord for Ev {
-    /// Reversed for a min-heap; the sequence number breaks ties.
-    fn cmp(&self, o: &Self) -> Ordering {
-        o.0.total_cmp(&self.0).then(o.1.cmp(&self.1))
-    }
-}
-
 /// Simulate `inst` under `plan` through the real [`DagScheduler`] and policy engine. Workers run
-/// each job at their speed (exclusive slots, i.e. linear processor sharing).
+/// each job at their speed (exclusive slots, i.e. linear processor sharing). A speculative attempt
+/// holds its own slot until the first attempt of its job finishes and the other is stopped.
 pub fn simulate_small(inst: &SmallInstance, plan: &SmallPlan) -> SmallResult {
     let (rank, oracle, group_first) = match plan.order {
         Order::Group => (false, false, false),
@@ -175,7 +159,7 @@ pub fn simulate_small(inst: &SmallInstance, plan: &SmallPlan) -> SmallResult {
         Order::GroupRank { oracle } => (true, oracle, true),
     };
     let policy = Scheduler::new(Config {
-        order: crate::Order::Priority {
+        order: sched::Order::Priority {
             default_priority: 0,
             group_order: GroupOrder::Arrival,
             group_first,
@@ -200,18 +184,16 @@ pub fn simulate_small(inst: &SmallInstance, plan: &SmallPlan) -> SmallResult {
     for c in &inst.classes {
         for _ in 0..c.workers {
             let id = speed.len() as u64;
-            dag.worker_update(
-                WorkerState {
-                    speed: c.speed,
-                    ..WorkerState::new(
-                        id,
-                        c.name.clone(),
-                        c.slots as usize,
-                        Resources::mem(1 << 60),
-                    )
-                },
-                0.0,
-            );
+            let state = WorkerState {
+                speed: c.speed,
+                ..WorkerState::new(
+                    id,
+                    c.name.clone(),
+                    c.slots as usize,
+                    Resources::mem(1 << 60),
+                )
+            };
+            dag.handle(Input::Worker(state), 0.0);
             speed.push(c.speed);
             slow.push(c.speed < fastest);
         }
@@ -244,78 +226,70 @@ pub fn simulate_small(inst: &SmallInstance, plan: &SmallPlan) -> SmallResult {
     let mut start = vec![f64::NAN; n];
     let mut finish = vec![f64::NAN; n];
     let mut on = vec![usize::MAX; n];
-    let mut heap = BinaryHeap::new();
-    let mut seq = 0u64;
-    let mut running = 0usize;
+    // Completion events: `Some((job, attempt))`, or `None` for a wakeup.
+    let mut queue: Queue<Option<(usize, Attempt)>> = Queue::new();
+    // Running attempts: (start, worker).
+    let mut live: HashMap<(usize, Attempt), (f64, usize)> = HashMap::new();
     let (mut now, mut contention, mut idle_ready) = (0.0f64, 0.0f64, 0.0f64);
     let mut wake = f64::NAN;
-    let mut epoch = vec![0u32; n];
-    let mut preemptions = 0u64;
+    let mut speculations = 0u64;
     loop {
-        // Dispatch until nothing moves: a preemption frees a slot on a slower worker.
-        loop {
-            let d = dag.dispatch_full(now);
-            for (j, w) in d.start {
-                let (j, w) = (j as usize, w as usize);
-                start[j] = now;
-                on[j] = w;
-                running += 1;
-                seq += 1;
-                heap.push(Ev(
-                    now + inst.tasks[j].work / speed[w],
-                    seq,
-                    Some((j, epoch[j])),
-                ));
-            }
-            if d.preempt.is_empty() {
-                break;
-            }
-            for pr in d.preempt {
-                // Kill on `from` (its pending completion goes stale), restart on `to`.
-                let (j, w) = (pr.job as usize, pr.to as usize);
-                epoch[j] += 1;
-                start[j] = now;
-                on[j] = w;
-                preemptions += 1;
-                seq += 1;
-                heap.push(Ev(
-                    now + inst.tasks[j].work / speed[w],
-                    seq,
-                    Some((j, epoch[j])),
-                ));
+        for o in dag.poll(now) {
+            match o {
+                Output::Start {
+                    job,
+                    attempt,
+                    worker,
+                } => {
+                    let (j, w) = (job as usize, worker as usize);
+                    live.insert((j, attempt), (now, w));
+                    speculations += u64::from(attempt > 1);
+                    queue.push(now + inst.tasks[j].work / speed[w], Some((j, attempt)));
+                }
+                // Its pending completion goes stale.
+                Output::Stop { job, attempt, .. } => {
+                    live.remove(&(job as usize, attempt));
+                }
+                Output::GaveUp(g) => unreachable!("job {} failed, but no attempt fails", g.job),
+                Output::RunLocal { .. } | Output::Ready { .. } | Output::Passed { .. } => {}
             }
         }
-        if let Some(t) = dag.policy().next_wakeup()
+        if let Some(t) = dag.next_wakeup()
             && t != wake
         {
             wake = t;
-            seq += 1;
-            heap.push(Ev(t, seq, None));
+            queue.push(t, None);
         }
-        let Some(Ev(t, _, ev)) = heap.pop() else {
+        let Some((t, events)) = queue.pop_instant() else {
             break;
         };
-        let waiting = dag.stats().waiting;
-        if waiting > 0 {
-            if running >= slots_total {
+        if dag.stats().waiting > 0 {
+            if live.len() >= slots_total {
                 contention += t - now;
             } else {
                 idle_ready += t - now;
             }
         }
         now = t;
-        // Apply every event of this instant before dispatching again.
-        let mut events = vec![ev];
-        while heap.peek().is_some_and(|e| e.0 == t) {
-            events.push(heap.pop().unwrap().2);
-        }
-        for (j, e) in events.into_iter().flatten() {
-            if e != epoch[j] {
-                continue; // a preempted instance
+        // Every event of this instant is applied before polling again.
+        for (j, attempt) in events.into_iter().flatten() {
+            let Some((s, w)) = live.remove(&(j, attempt)) else {
+                continue; // a stopped attempt
+            };
+            // The other attempt finished at the same instant; its stop is on its way.
+            if finish[j].is_finite() {
+                continue;
             }
-            running -= 1;
+            start[j] = s;
+            on[j] = w;
             finish[j] = now;
-            dag.completed(j as u64, now);
+            dag.handle(
+                Input::Done {
+                    job: j as u64,
+                    attempt,
+                },
+                now,
+            );
         }
     }
     // Joins finish with their last dependency.
@@ -352,7 +326,7 @@ pub fn simulate_small(inst: &SmallInstance, plan: &SmallPlan) -> SmallResult {
         contention: contention / m,
         idle_ready: idle_ready / m,
         slow_on_crit: slow_time / m,
-        preemptions,
+        speculations,
     }
 }
 
@@ -606,8 +580,9 @@ pub fn perturb(inst: &SmallInstance, key: u64, structural: bool) -> SmallInstanc
 
 #[cfg(test)]
 mod tests {
+    use sched::SpeedPolicy;
+
     use super::*;
-    use crate::SpeedPolicy;
 
     /// The driver respects the bounds, and a single slot equals total work.
     #[test]
@@ -627,7 +602,7 @@ mod tests {
                         speed: SpeedConfig {
                             policy,
                             learn: None,
-                            spoliation: None,
+                            speculate: None,
                         },
                     };
                     let r = simulate_small(&inst, &plan);
@@ -663,6 +638,30 @@ mod tests {
         );
         let work: f64 = one.tasks.iter().map(|t| t.work).sum();
         assert!((r.makespan - work / 2.0).abs() < 1e-9 * work);
+    }
+
+    /// Speculation on a mixed fleet starts second attempts, every job still finishes once (the
+    /// simulator asserts it), and no schedule beats the lower bounds.
+    #[test]
+    fn speculation_runs_second_attempts() {
+        let plan = SmallPlan {
+            order: Order::Group,
+            age_limit: None,
+            speed: SpeedConfig {
+                policy: SpeedPolicy::FastestFirst,
+                learn: None,
+                speculate: Some(sched::Speculate::default()),
+            },
+        };
+        let mut speculations = 0;
+        for seed in 0..40 {
+            let inst = grid(&GridParams::random(seed));
+            let (wp, d) = inst.bounds();
+            let r = simulate_small(&inst, &plan);
+            assert!(r.makespan >= wp.max(d) * (1.0 - 1e-9), "seed {seed}: {r:?}");
+            speculations += r.speculations;
+        }
+        assert!(speculations > 0);
     }
 
     /// Perturbations keep instances acyclic and well formed.

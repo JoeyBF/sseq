@@ -1,11 +1,10 @@
 //! A synthetic device-memory scenario: small cards whose launch pool makes over-subscribed jobs
 //! wait, with and without device-aware admission.
 
-use std::{cmp::Ordering, collections::BinaryHeap};
-
+use sched::{Config, Input, JobId, JobSpec, Output, Policy, Resources, Scheduler, WorkerState};
 use serde::Serialize;
 
-use crate::{Config, JobId, JobSpec, Policy, Resources, Scheduler, WorkerId, WorkerState};
+use crate::engine::{PsWorker, Queue, Run};
 
 /// The scenario.
 #[derive(Clone, Debug, Serialize)]
@@ -104,39 +103,10 @@ fn normal(seed: u64, i: u64) -> f64 {
     (-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos()
 }
 
-/// A completion event (earliest first; the version invalidates stale ones).
-struct Ev(f64, usize, u64);
-
-impl PartialEq for Ev {
-    /// Equal when [`Ord`] says so.
-    fn eq(&self, o: &Self) -> bool {
-        self.cmp(o) == Ordering::Equal
-    }
-}
-
-impl Eq for Ev {}
-
-impl PartialOrd for Ev {
-    /// The total order of [`Ord`].
-    fn partial_cmp(&self, o: &Self) -> Option<Ordering> {
-        Some(self.cmp(o))
-    }
-}
-
-impl Ord for Ev {
-    /// Reversed for a min-heap.
-    fn cmp(&self, o: &Self) -> Ordering {
-        o.0.total_cmp(&self.0).then(o.1.cmp(&self.1))
-    }
-}
-
-/// A worker: its running jobs `(job, remaining work, device demand)`.
+/// A worker: its running jobs, and the time its pool spent over-subscribed.
 #[derive(Default)]
 struct Wk {
-    running: Vec<(JobId, f64, f64)>,
-    last: f64,
-    version: u64,
-    busy: f64,
+    ps: PsWorker,
     over: f64,
 }
 
@@ -162,18 +132,16 @@ pub fn simulate_device(sc: &DeviceScenario, arm: DeviceArm) -> DeviceMetrics {
     };
     let mut p = Scheduler::new(Config::default());
     for w in 0..sc.workers {
-        p.worker_update(
-            WorkerState {
-                per_task: Resources::ZERO.with_dev((per_task * 1e9).round() as u64),
-                ..WorkerState::new(
-                    w as WorkerId,
-                    "small",
-                    sc.slots,
-                    Resources::mem_gb(1e6).with_dev_gb(cap),
-                )
-            },
-            0.0,
-        );
+        let state = WorkerState {
+            per_task: Resources::ZERO.with_dev((per_task * 1e9).round() as u64),
+            ..WorkerState::new(
+                w as u64,
+                "small",
+                sc.slots,
+                Resources::mem_gb(1e6).with_dev_gb(cap),
+            )
+        };
+        p.handle(Input::Worker(state), 0.0);
     }
     for (j, &d) in demand.iter().enumerate() {
         let est = match arm {
@@ -182,15 +150,14 @@ pub fn simulate_device(sc: &DeviceScenario, arm: DeviceArm) -> DeviceMetrics {
             }
             _ => 0.0,
         };
-        p.submit(
-            JobSpec::new(j as JobId, Resources::mem(1).with_dev_gb(est), 0),
-            0.0,
-        );
+        let spec = JobSpec::new(j as JobId, Resources::mem(1).with_dev_gb(est), 0);
+        p.handle(Input::Submit(spec), 0.0);
     }
     let mut ws: Vec<Wk> = (0..sc.workers).map(|_| Wk::default()).collect();
-    let mut heap = BinaryHeap::new();
-    let rate = |w: &Wk| {
-        let total: f64 = w.running.iter().map(|x| x.2).sum();
+    // Completion events `(worker, version)`, ties broken by worker.
+    let mut queue: Queue<(usize, u64)> = Queue::new();
+    let rate = |running: &[Run]| {
+        let total: f64 = running.iter().map(|x| demand[x.job as usize]).sum();
         if total > sc.cap_gb {
             (sc.cap_gb / total).powf(1.0 + sc.gamma)
         } else {
@@ -198,64 +165,74 @@ pub fn simulate_device(sc: &DeviceScenario, arm: DeviceArm) -> DeviceMetrics {
         }
     };
     let advance = |w: &mut Wk, now: f64| {
-        let dt = now - w.last;
-        if dt > 0.0 && !w.running.is_empty() {
-            let r = rate(w);
-            for x in &mut w.running {
-                x.1 -= r * dt;
-            }
-            w.busy += w.running.len() as f64 * dt;
-            if r < 1.0 {
-                w.over += dt;
-            }
+        if let Some((dt, r)) = w.ps.advance(now, rate)
+            && r < 1.0
+        {
+            w.over += dt;
         }
-        w.last = now;
     };
-    let schedule = |w: &mut Wk, i: usize, now: f64, heap: &mut BinaryHeap<Ev>| {
-        w.version += 1;
-        if let Some(min) = w.running.iter().map(|x| x.1).reduce(f64::min) {
-            heap.push(Ev(now + min.max(0.0) / rate(w), i, w.version));
+    let schedule = |w: &mut Wk, i: usize, now: f64, queue: &mut Queue<(usize, u64)>| {
+        if let Some((at, v)) = w.ps.next_completion(now, rate) {
+            queue.push_tied(at, i as u64, (i, v));
         }
     };
     let mut now = 0.0;
     let mut done = 0;
-    let place = |p: &mut Scheduler, ws: &mut Vec<Wk>, heap: &mut BinaryHeap<Ev>, now: f64| {
-        let out = p.dispatch(now);
+    let mut finished = vec![false; n];
+    let place = |p: &mut Scheduler, ws: &mut Vec<Wk>, queue: &mut Queue<(usize, u64)>, now: f64| {
         let mut touched: Vec<usize> = Vec::new();
-        for (j, w) in out {
-            let w = w as usize;
+        for o in p.poll(now) {
+            let (job, attempt, w, start) = match o {
+                Output::Start {
+                    job,
+                    attempt,
+                    worker,
+                } => (job, attempt, worker as usize, true),
+                Output::Stop {
+                    job,
+                    attempt,
+                    worker,
+                } => (job, attempt, worker as usize, false),
+                Output::GaveUp(g) => unreachable!("job {} failed, but no attempt fails", g.job),
+                _ => continue,
+            };
             if !touched.contains(&w) {
                 advance(&mut ws[w], now);
                 touched.push(w);
             }
-            ws[w]
-                .running
-                .push((j, work[j as usize], demand[j as usize]));
+            if start {
+                ws[w].ps.start(job, attempt, work[job as usize]);
+            } else {
+                ws[w].ps.stop(job, attempt);
+            }
         }
         for w in touched {
-            schedule(&mut ws[w], w, now, heap);
+            schedule(&mut ws[w], w, now, queue);
         }
     };
-    place(&mut p, &mut ws, &mut heap, now);
-    while let Some(Ev(t, w, v)) = heap.pop() {
-        if v != ws[w].version {
+    place(&mut p, &mut ws, &mut queue, now);
+    while let Some((t, (w, v))) = queue.pop() {
+        if !ws[w].ps.is_current(v) {
             continue;
         }
         now = t;
         advance(&mut ws[w], now);
-        let finished: Vec<JobId> = ws[w]
-            .running
-            .iter()
-            .filter(|x| x.1 <= 1e-9)
-            .map(|x| x.0)
-            .collect();
-        ws[w].running.retain(|x| x.1 > 1e-9);
-        for j in finished {
-            p.completed(j, now);
+        for r in ws[w].ps.finish(|left, _| left <= 1e-9) {
+            // A losing attempt finishing at the same time as the winner is not a second job.
+            if std::mem::replace(&mut finished[r.job as usize], true) {
+                continue;
+            }
+            p.handle(
+                Input::Done {
+                    job: r.job,
+                    attempt: r.attempt,
+                },
+                now,
+            );
             done += 1;
         }
-        schedule(&mut ws[w], w, now, &mut heap);
-        place(&mut p, &mut ws, &mut heap, now);
+        schedule(&mut ws[w], w, now, &mut queue);
+        place(&mut p, &mut ws, &mut queue, now);
     }
     assert_eq!(done, n, "every job finishes");
     let span = now.max(1e-9);
@@ -270,7 +247,7 @@ pub fn simulate_device(sc: &DeviceScenario, arm: DeviceArm) -> DeviceMetrics {
         },
         makespan_h: span / 3600.0,
         work_per_h: total / (span / 3600.0),
-        mean_running: ws.iter().map(|w| w.busy).sum::<f64>() / (span * sc.workers as f64),
+        mean_running: ws.iter().map(|w| w.ps.busy).sum::<f64>() / (span * sc.workers as f64),
         oversubscribed: ws.iter().map(|w| w.over).sum::<f64>() / (span * sc.workers as f64),
     }
 }

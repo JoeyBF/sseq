@@ -4,8 +4,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use proptest::prelude::*;
 use sched::{
-    Config, DIMS, Defer, Fit, GroupOrder, JobId, JobSpec, Order, Policy, Reservations, Resources,
-    Scheduler, SpeedConfig, SpeedPolicy, Spoliation, WorkerId, WorkerState,
+    Attempt, Config, DIMS, Defer, FailKind, Fit, GaveUp, GroupOrder, Input, JobId, JobSpec, Order,
+    Output, Policy, Reservations, Resources, RetryConfig, Scheduler, Speculate, SpeedConfig,
+    SpeedPolicy, Tried, WorkerId, WorkerState,
 };
 
 #[derive(Clone, Debug)]
@@ -25,7 +26,7 @@ enum Kind {
 
 impl Kind {
     /// The policy under test.
-    fn build(&self, speed: SpeedConfig) -> Box<dyn Policy> {
+    fn build(&self, speed: SpeedConfig, retry: RetryConfig) -> Box<dyn Policy> {
         let config = |max, per_class, age_limit, group_first, group_order| Config {
             order: Order::Priority {
                 default_priority: 0,
@@ -40,11 +41,13 @@ impl Kind {
             }),
             age_limit,
             speed,
+            retry,
             ..Config::default()
         };
         Box::new(Scheduler::new(match *self {
             Kind::Fifo => Config {
                 speed,
+                retry,
                 ..Config::fifo()
             },
             Kind::Backfill {
@@ -116,7 +119,16 @@ enum Op {
         work: Option<u32>,
         dev: Option<u64>,
     },
-    Complete(usize),
+    /// A live attempt (running job, then attempt, by index) finishes.
+    Complete(usize, usize),
+    /// A live attempt fails.
+    Fail(usize, usize, FailKind),
+    /// A report about an attempt that is not live (finished, failed, stopped or never started).
+    Stale {
+        job: usize,
+        attempt: usize,
+        done: bool,
+    },
     Cancel(usize),
     Worker {
         id: WorkerId,
@@ -132,8 +144,18 @@ enum Op {
     Tick(u32),
 }
 
+/// An index into a collection of up to `1 << 16` elements.
+fn index() -> impl Strategy<Value = usize> {
+    any::<prop::sample::Index>().prop_map(|i| i.index(1 << 16))
+}
+
 /// A random event.
 fn op() -> impl Strategy<Value = Op> {
+    let kind = prop_oneof![
+        Just(FailKind::DeviceOom),
+        Just(FailKind::Other),
+        Just(FailKind::Timeout)
+    ];
     prop_oneof![
         6 => (
             1u64..80,
@@ -159,8 +181,11 @@ fn op() -> impl Strategy<Value = Op> {
                     dev,
                 }
             }),
-        4 => any::<prop::sample::Index>().prop_map(|i| Op::Complete(i.index(1 << 16))),
-        1 => any::<prop::sample::Index>().prop_map(|i| Op::Cancel(i.index(1 << 16))),
+        4 => (index(), index()).prop_map(|(j, a)| Op::Complete(j, a)),
+        2 => (index(), index(), kind).prop_map(|(j, a, k)| Op::Fail(j, a, k)),
+        1 => (index(), index(), any::<bool>())
+            .prop_map(|(job, attempt, done)| Op::Stale { job, attempt, done }),
+        1 => index().prop_map(Op::Cancel),
         2 => (
             0u64..4,
             0usize..5,
@@ -199,20 +224,20 @@ fn speed() -> impl Strategy<Value = SpeedConfig> {
                     Defer { max_wait, min_gain }
                 ))),
         ];
-    let spoliation = prop::option::weighted(
+    let speculate = prop::option::weighted(
         0.4,
         (prop_oneof![Just(0.0), Just(0.25)], 1u32..3).prop_map(|(min_gain, max_per_job)| {
-            Spoliation {
+            Speculate {
                 min_gain,
                 restart_overhead: 0.0,
                 max_per_job,
             }
         }),
     );
-    (policy, spoliation).prop_map(|(policy, spoliation)| SpeedConfig {
+    (policy, speculate).prop_map(|(policy, speculate)| SpeedConfig {
         policy,
         learn: None,
-        spoliation,
+        speculate,
     })
 }
 
@@ -234,35 +259,68 @@ fn kind() -> impl Strategy<Value = Kind> {
     ]
 }
 
+/// A random retry limit (0 counts as 1).
+fn retry() -> impl Strategy<Value = RetryConfig> {
+    (0u32..5).prop_map(|max_attempts| RetryConfig { max_attempts })
+}
+
+/// A job as the model sees it, across its attempts.
 #[derive(Clone, Debug)]
 struct SJob {
     spec: JobSpec,
     since: f64,
     seq: u64,
+    /// The last attempt number started.
+    attempts: Attempt,
+    tried: Vec<Tried>,
+    speculated: u32,
+}
+
+/// A live attempt.
+#[derive(Clone, Debug)]
+struct Live {
+    attempt: Attempt,
+    worker: WorkerId,
+    started: f64,
+}
+
+/// A running job and its live attempts, in start order.
+#[derive(Clone, Debug)]
+struct SRun {
+    job: SJob,
+    live: Vec<Live>,
 }
 
 #[derive(Default)]
 struct Shadow {
     now: f64,
     workers: BTreeMap<WorkerId, WorkerState>,
-    running: BTreeMap<JobId, (WorkerId, Resources)>,
-    /// Specs of running jobs, and how often each was preempted.
-    specs: BTreeMap<JobId, (JobSpec, u32)>,
     waiting: BTreeMap<JobId, SJob>,
+    running: BTreeMap<JobId, SRun>,
+    /// The last attempt number ever started per job, kept after the job ends.
+    started: BTreeMap<JobId, Attempt>,
     groups: BTreeMap<u64, u64>,
     seq: u64,
     next_id: JobId,
     group_first: bool,
     by_id: bool,
+    max_attempts: u32,
+    /// Non-start outputs the next poll must return, in order.
+    expect: Vec<Output>,
 }
 
 impl Shadow {
-    /// Running count and placed demand on a worker.
+    /// Live attempts and their summed demand on a worker.
     fn load(&self, w: WorkerId) -> (usize, Resources) {
         self.running
             .values()
-            .filter(|r| r.0 == w)
-            .fold((0, Resources::ZERO), |(n, m), r| (n + 1, m + r.1))
+            .flat_map(|r| {
+                r.live
+                    .iter()
+                    .filter(move |l| l.worker == w)
+                    .map(move |_| r.job.spec.demand)
+            })
+            .fold((0, Resources::ZERO), |(n, m), d| (n + 1, m + d))
     }
 
     /// The production rule, written out again: in every dimension whose capacity is known
@@ -316,7 +374,39 @@ impl Shadow {
         }
     }
 
-    /// Submit to both the shadow and the policy.
+    /// The expected run time of `spec` on worker `w`.
+    fn eta(&self, spec: &JobSpec, w: WorkerId) -> Option<f64> {
+        Some(spec.work? / self.workers[&w].speed)
+    }
+
+    /// When a running job is expected to end: its earliest live attempt's expected end, an
+    /// overrunning attempt counting as half done.
+    fn expected_end(&self, r: &SRun) -> Option<f64> {
+        r.live
+            .iter()
+            .map(|l| {
+                let end = l.started + self.eta(&r.job.spec, l.worker)?;
+                Some(if end > self.now {
+                    end
+                } else {
+                    self.now + (self.now - l.started).max(0.0)
+                })
+            })
+            .reduce(|a, b| Some(a?.min(b?)))
+            .flatten()
+    }
+
+    /// The `i`-th running job and its `k`-th live attempt, if any job runs.
+    fn pick_live(&self, i: usize, k: usize) -> Option<(JobId, usize, Attempt)> {
+        if self.running.is_empty() {
+            return None;
+        }
+        let (&j, r) = self.running.iter().nth(i % self.running.len()).unwrap();
+        let k = k % r.live.len();
+        Some((j, k, r.live[k].attempt))
+    }
+
+    /// Submit to both the model and the policy.
     fn submit(&mut self, spec: JobSpec, p: &mut dyn Policy) {
         let seq = self.seq;
         self.seq += 1;
@@ -327,34 +417,100 @@ impl Shadow {
                 spec: spec.clone(),
                 since: self.now,
                 seq,
+                attempts: 0,
+                tried: Vec::new(),
+                speculated: 0,
             },
         );
-        p.submit(spec, self.now);
+        p.handle(Input::Submit(spec), self.now);
+    }
+
+    /// End a running job: every live attempt but `except` is stopped.
+    fn stop_all(&mut self, job: JobId, except: Option<Attempt>) {
+        let r = self.running.remove(&job).unwrap();
+        for l in r.live {
+            if Some(l.attempt) != except {
+                self.expect.push(Output::Stop {
+                    job,
+                    attempt: l.attempt,
+                    worker: l.worker,
+                });
+            }
+        }
+    }
+
+    /// Live attempt `k` of `job` failed: once no attempt is live, the job is retried in its
+    /// original place, softly avoiding every worker it failed on, or given up.
+    fn fail(&mut self, job: JobId, k: usize, kind: FailKind, why: String) {
+        let r = self.running.get_mut(&job).unwrap();
+        let l = r.live.remove(k);
+        r.job.tried.push(Tried {
+            worker: l.worker,
+            kind,
+            why,
+        });
+        if !r.live.is_empty() {
+            return;
+        }
+        let mut j = self.running.remove(&job).unwrap().job;
+        if j.tried.len() < self.max_attempts.max(1) as usize {
+            for t in &j.tried {
+                if !j.spec.avoid.contains(&t.worker) {
+                    j.spec.avoid.push(t.worker);
+                }
+            }
+            j.spec.avoid_soft = true;
+            self.waiting.insert(job, j);
+        } else {
+            let retryable = j.tried.iter().all(|t| t.kind == FailKind::DeviceOom);
+            self.expect.push(Output::GaveUp(GaveUp {
+                job,
+                tried: j.tried,
+                retryable,
+            }));
+        }
     }
 }
 
-/// Runs the stream, checking every invariant; returns the placements and explanations made.
+/// Runs the stream, checking every invariant; returns the outputs and explanations made.
 ///
-/// Every policy is driven by the same random stream while a shadow model, written independently
-/// of the engine, keeps its own bookkeeping and re-checks each placement as it is made:
+/// Every policy is driven by the same random stream while a model, written independently of the
+/// engine, keeps its own bookkeeping of jobs and their attempts and re-checks each start as it is
+/// made:
 ///
-/// - **no over-commit**: the production admission rule held at the moment of each placement, in
-///   every dimension (no enforced capacity is exceeded, escape hatch aside);
-/// - **hard constraints**: no job runs on a worker its class or avoid list excludes (a soft avoid
-///   list only while some live worker of the class is off it);
-/// - **escape hatch**: after a dispatch, no worker with a free slot is empty while a job that may
-///   run there waits;
+/// - **messages**: `Done` completes a job and stops its other attempts, `Failed` and `WorkerGone`
+///   retry it in its original place (softly avoiding where it failed) or give it up, `Cancel`
+///   stops every live attempt, and reports about attempts that are not live change nothing --
+///   every non-start output is exactly what the model predicts;
+/// - **attempts**: each start is the job's next attempt number; a job has two live attempts only
+///   by speculation, and a job with a live attempt is never also waiting;
+/// - **no over-commit**: the production admission rule held at the moment of each start, in every
+///   dimension (no enforced capacity is exceeded, escape hatch aside);
+/// - **hard constraints**: no attempt runs on a worker its class or avoid list excludes (a soft
+///   avoid list only while some live worker of the class is off it);
+/// - **escape hatch**: after a poll, no worker with a free slot is empty while a job that may run
+///   there waits;
 /// - **priority** (priority order): when B is placed on w, every more urgent waiting job was
 ///   refused by w at that moment (by the admission rule, or because w was B's reservation, or
 ///   because it chose to wait for a faster worker);
-/// - **bookkeeping**: running counts, placed demand and reservations agree with the shadow after
-///   every event, and everything is released at the end;
-/// - **determinism**: replaying the stream gives identical placements and explanations.
-fn run(kind: &Kind, speed: SpeedConfig, ops: &[Op]) -> Result<Vec<String>, TestCaseError> {
-    let mut p = kind.build(speed);
+/// - **speculation**: a second attempt goes to a strictly faster, unreserved worker that no
+///   waiting job wanted, is expected to gain at least `min_gain` of its run time, and respects
+///   `max_per_job`;
+/// - **bookkeeping**: per-worker slots and placed demand equal the sum over live attempts, job
+///   counts and reservations agree with the model after every event, and everything is released
+///   at the end;
+/// - **determinism**: replaying the stream gives identical outputs and explanations.
+fn run(
+    kind: &Kind,
+    speed: SpeedConfig,
+    retry: RetryConfig,
+    ops: &[Op],
+) -> Result<Vec<String>, TestCaseError> {
+    let mut p = kind.build(speed, retry);
     let mut sh = Shadow {
         group_first: kind.group_first(),
         by_id: kind.by_id(),
+        max_attempts: retry.max_attempts,
         ..Shadow::default()
     };
     let mut log = Vec::new();
@@ -383,11 +539,53 @@ fn run(kind: &Kind, speed: SpeedConfig, ops: &[Op]) -> Result<Vec<String>, TestC
                 spec.work = work.map(f64::from);
                 sh.submit(spec, &mut *p);
             }
-            Op::Complete(i) => {
-                if !sh.running.is_empty() {
-                    let j = *sh.running.keys().nth(i % sh.running.len()).unwrap();
-                    sh.running.remove(&j);
-                    p.completed(j, sh.now);
+            Op::Complete(i, k) => {
+                if let Some((job, _, attempt)) = sh.pick_live(i, k) {
+                    sh.stop_all(job, Some(attempt));
+                    p.handle(Input::Done { job, attempt }, sh.now);
+                }
+            }
+            Op::Fail(i, k, kind) => {
+                if let Some((job, k, attempt)) = sh.pick_live(i, k) {
+                    let why = format!("failed at {}", sh.now);
+                    sh.fail(job, k, kind, why.clone());
+                    p.handle(
+                        Input::Failed {
+                            job,
+                            attempt,
+                            kind,
+                            why,
+                        },
+                        sh.now,
+                    );
+                }
+            }
+            Op::Stale { job, attempt, done } => {
+                if sh.next_id > 0 {
+                    let job = job as JobId % sh.next_id;
+                    let live: Vec<Attempt> = sh
+                        .running
+                        .get(&job)
+                        .map(|r| r.live.iter().map(|l| l.attempt).collect())
+                        .unwrap_or_default();
+                    // Attempt 0 and the next attempt number were never started.
+                    let last = sh.started.get(&job).copied().unwrap_or(0);
+                    let stale: Vec<Attempt> =
+                        (0..=last + 1).filter(|a| !live.contains(a)).collect();
+                    let attempt = stale[attempt % stale.len()];
+                    p.handle(
+                        if done {
+                            Input::Done { job, attempt }
+                        } else {
+                            Input::Failed {
+                                job,
+                                attempt,
+                                kind: FailKind::Other,
+                                why: "stale".into(),
+                            }
+                        },
+                        sh.now,
+                    );
                 }
             }
             Op::Cancel(i) => {
@@ -399,9 +597,11 @@ fn run(kind: &Kind, speed: SpeedConfig, ops: &[Op]) -> Result<Vec<String>, TestC
                     .collect();
                 if !live.is_empty() {
                     let j = live[i % live.len()];
-                    sh.running.remove(&j);
+                    if sh.running.contains_key(&j) {
+                        sh.stop_all(j, None);
+                    }
                     sh.waiting.remove(&j);
-                    p.cancel(j);
+                    p.handle(Input::Cancel(j), sh.now);
                 }
             }
             Op::Worker {
@@ -427,33 +627,27 @@ fn run(kind: &Kind, speed: SpeedConfig, ops: &[Op]) -> Result<Vec<String>, TestC
                     )
                 };
                 sh.workers.insert(id, s.clone());
-                p.worker_update(s, sh.now);
+                p.handle(Input::Worker(s), sh.now);
             }
             Op::Gone(w) => {
                 if sh.workers.remove(&w).is_some() {
-                    p.worker_gone(w, sh.now);
-                    // The caller resubmits the jobs that were running there, avoiding that worker
-                    // (it is gone, but a worker may rejoin under the same id).
-                    let lost: Vec<JobId> = sh
+                    // Each live attempt there fails; the caller resubmits nothing.
+                    let lost: Vec<(JobId, usize)> = sh
                         .running
                         .iter()
-                        .filter(|r| r.1.0 == w)
-                        .map(|r| *r.0)
+                        .filter_map(|(&j, r)| Some((j, r.live.iter().position(|l| l.worker == w)?)))
                         .collect();
-                    for j in lost {
-                        let (_, demand) = sh.running.remove(&j).unwrap();
-                        let mut spec = JobSpec::new(j, demand, 0);
-                        spec.avoid = vec![w];
-                        sh.submit(spec, &mut *p);
+                    for (j, k) in lost {
+                        sh.fail(j, k, FailKind::LinkDied, format!("worker {w} left"));
                     }
                 }
+                p.handle(Input::WorkerGone(w), sh.now);
             }
             Op::Tick(dt) => sh.now += dt as f64,
         }
 
         let before = p.stats();
-        let full = p.dispatch_full(sh.now);
-        let out = full.start;
+        let out = p.poll(sh.now);
         let after = p.stats();
         if std::env::var_os("SCHED_TRACE").is_some() {
             eprintln!("op {op:?} -> {out:?} deferred {:?}", after.deferred);
@@ -461,6 +655,19 @@ fn run(kind: &Kind, speed: SpeedConfig, ops: &[Op]) -> Result<Vec<String>, TestC
                 eprintln!("  {}", p.explain(*j).unwrap_or_default());
             }
         }
+        let mut starts = Vec::new();
+        let mut other = Vec::new();
+        for o in &out {
+            match *o {
+                Output::Start {
+                    job,
+                    attempt,
+                    worker,
+                } => starts.push((job, attempt, worker)),
+                _ => other.push(o.clone()),
+            }
+        }
+        prop_assert_eq!(&other, &std::mem::take(&mut sh.expect), "after {:?}", op);
         let holders: BTreeSet<JobId> = after.last_dispatch_holders.iter().copied().collect();
         let deferred: BTreeSet<JobId> = after.deferred.iter().map(|d| d.0).collect();
         let deferred_any: BTreeSet<JobId> = after.deferred_any.iter().copied().collect();
@@ -488,100 +695,128 @@ fn run(kind: &Kind, speed: SpeedConfig, ops: &[Op]) -> Result<Vec<String>, TestC
         if let Some(t) = p.next_wakeup() {
             prop_assert!(t > sh.now, "wakeup {} not in the future", t);
         }
-        for &(j, w) in &out {
-            let job = sh.waiting.get(&j).cloned();
-            prop_assert!(job.is_some(), "placed job {j} is not waiting");
-            let job = job.unwrap();
-            prop_assert!(sh.workers.contains_key(&w), "placed on unknown worker {w}");
-            prop_assert!(
-                sh.eligible(&job.spec, w),
-                "{kind:?}: job {j} placed on excluded worker {w}"
-            );
-            // No over-commit (slots included).
-            prop_assert!(
-                sh.admits(job.spec.demand, w),
-                "{kind:?}: job {j} over-commits worker {w}"
-            );
-            // Priority: every more urgent waiting job is refused here (unless this is a holder
-            // taking its own reserved worker, which nobody else could take).
-            if kind.priority() && !holders.contains(&j) {
-                let mine = sh.urgency(&job, kind.age());
-                for a in sh.waiting.values() {
-                    if a.spec.id != j && sh.urgency(a, kind.age()) < mine {
-                        let refused = deferred_any.contains(&a.spec.id)
-                            || !sh.eligible(&a.spec, w)
-                            || !sh.admits(a.spec.demand, w);
-                        prop_assert!(
-                            refused,
-                            "{kind:?}: job {j} placed on {w} while more urgent job {} is admitted \
-                             there",
-                            a.spec.id
-                        );
+        for &(j, attempt, w) in &starts {
+            prop_assert!(sh.workers.contains_key(&w), "started on unknown worker {w}");
+            if let Some(job) = sh.waiting.get(&j).cloned() {
+                prop_assert_eq!(attempt, job.attempts + 1, "job {} attempt", j);
+                prop_assert!(
+                    sh.eligible(&job.spec, w),
+                    "{kind:?}: job {j} placed on excluded worker {w}"
+                );
+                // No over-commit (slots included).
+                prop_assert!(
+                    sh.admits(job.spec.demand, w),
+                    "{kind:?}: job {j} over-commits worker {w}"
+                );
+                // Priority: every more urgent waiting job is refused here (unless this is a holder
+                // taking its own reserved worker, which nobody else could take).
+                if kind.priority() && !holders.contains(&j) {
+                    let mine = sh.urgency(&job, kind.age());
+                    for a in sh.waiting.values() {
+                        if a.spec.id != j && sh.urgency(a, kind.age()) < mine {
+                            let refused = deferred_any.contains(&a.spec.id)
+                                || !sh.eligible(&a.spec, w)
+                                || !sh.admits(a.spec.demand, w);
+                            prop_assert!(
+                                refused,
+                                "{kind:?}: job {j} placed on {w} while more urgent job {} is \
+                                 admitted there",
+                                a.spec.id
+                            );
+                        }
                     }
                 }
+                sh.waiting.remove(&j);
+                sh.running.insert(
+                    j,
+                    SRun {
+                        job: SJob {
+                            attempts: attempt,
+                            ..job
+                        },
+                        live: vec![Live {
+                            attempt,
+                            worker: w,
+                            started: sh.now,
+                        }],
+                    },
+                );
+            } else if let Some(r) = sh.running.get(&j) {
+                // A second live attempt: only by speculation, onto a strictly faster worker that
+                // admits it, whose free slot no waiting job wanted, at most `max_per_job` times,
+                // when it gains enough.
+                let Some(cfg) = speed.speculate else {
+                    prop_assert!(false, "job {j} has two live attempts without speculation");
+                    unreachable!()
+                };
+                prop_assert_eq!(attempt, r.job.attempts + 1, "job {} attempt", j);
+                prop_assert!(
+                    r.job.speculated < cfg.max_per_job,
+                    "job {j} over-speculated"
+                );
+                let spec = r.job.spec.clone();
+                prop_assert!(
+                    r.live
+                        .iter()
+                        .all(|l| sh.workers[&l.worker].speed < sh.workers[&w].speed),
+                    "job {j} speculated onto {w}, not faster than {:?}",
+                    r.live
+                );
+                prop_assert!(
+                    sh.eligible(&spec, w) && sh.admits(spec.demand, w),
+                    "job {j} speculated onto {w}, which does not take it"
+                );
+                prop_assert!(
+                    !after.reservations.iter().any(|r| r.worker == w),
+                    "speculated onto a reserved worker"
+                );
+                let wanted = sh.waiting.values().find(|a| {
+                    !deferred.contains(&a.spec.id)
+                        && sh.eligible(&a.spec, w)
+                        && sh.admits(a.spec.demand, w)
+                });
+                prop_assert!(
+                    wanted.is_none(),
+                    "speculated onto {w} while job {:?} waits for it",
+                    wanted.map(|a| a.spec.id)
+                );
+                let end = sh.expected_end(r);
+                let run = sh.eta(&spec, w);
+                prop_assert!(
+                    end.is_some() && run.is_some(),
+                    "speculated without a run time"
+                );
+                let (end, run) = (end.unwrap(), run.unwrap());
+                let end_here = sh.now + run + cfg.restart_overhead;
+                prop_assert!(
+                    end > end_here && end - end_here >= cfg.min_gain * run,
+                    "job {j} speculated onto {w} for too little: {end} vs {end_here}"
+                );
+                let r = sh.running.get_mut(&j).unwrap();
+                r.job.attempts = attempt;
+                r.job.speculated += 1;
+                r.live.push(Live {
+                    attempt,
+                    worker: w,
+                    started: sh.now,
+                });
+            } else {
+                prop_assert!(
+                    false,
+                    "started job {j}, which is neither waiting nor running"
+                );
             }
-            sh.waiting.remove(&j);
-            sh.running.insert(j, (w, job.spec.demand));
-            sh.specs.insert(j, (job.spec.clone(), 0));
+            sh.started.insert(j, attempt);
         }
         let held: BTreeMap<JobId, WorkerId> = after
             .reservations
             .iter()
             .map(|r| (r.job, r.worker))
             .collect();
-        // Spoliation: each preemption moves a running job, with work, from a strictly slower
-        // worker to one that admits it, whose free slot no waiting job wanted, at most
-        // `max_per_job` times.
-        let mut vacated = BTreeSet::new();
-        for pr in &full.preempt {
-            let Some(cfg) = speed.spoliation else {
-                prop_assert!(false, "preemption without spoliation");
-                unreachable!()
-            };
-            prop_assert_eq!(
-                sh.running.get(&pr.job).map(|r| r.0),
-                Some(pr.from),
-                "{:?}",
-                pr
-            );
-            let (spec, n) = sh.specs[&pr.job].clone();
-            prop_assert!(spec.work.is_some());
-            prop_assert!(
-                sh.workers[&pr.from].speed < sh.workers[&pr.to].speed,
-                "{:?}",
-                pr
-            );
-            prop_assert!(
-                sh.eligible(&spec, pr.to) && sh.admits(spec.demand, pr.to),
-                "{:?}",
-                pr
-            );
-            prop_assert!(n < cfg.max_per_job, "ping-pong: {:?}", pr);
-            prop_assert!(
-                !held.contains_key(&pr.job)
-                    && !after.reservations.iter().any(|r| r.worker == pr.to),
-                "preempted onto a reserved worker"
-            );
-            let wanted = sh.waiting.values().find(|j| {
-                !deferred.contains(&j.spec.id)
-                    && sh.eligible(&j.spec, pr.to)
-                    && sh.admits(j.spec.demand, pr.to)
-            });
-            prop_assert!(
-                wanted.is_none(),
-                "preempted onto {} while job {:?} waits for it",
-                pr.to,
-                wanted.map(|j| j.spec.id)
-            );
-            sh.running.insert(pr.job, (pr.to, spec.demand));
-            sh.specs.insert(pr.job, (spec, n + 1));
-            vacated.insert(pr.from);
-        }
         // Escape hatch: an empty worker with a free slot leaves no job waiting that may run there,
         // except one waiting for a faster worker by choice.
         for (&w, s) in &sh.workers {
-            // A worker that just gave up a preempted job is refilled at the next dispatch.
-            if s.slots > 0 && sh.load(w).0 == 0 && !vacated.contains(&w) {
+            if s.slots > 0 && sh.load(w).0 == 0 {
                 let stuck = sh
                     .waiting
                     .values()
@@ -593,7 +828,8 @@ fn run(kind: &Kind, speed: SpeedConfig, ops: &[Op]) -> Result<Vec<String>, TestC
                 );
             }
         }
-        // Bookkeeping agrees with the shadow.
+        // Bookkeeping agrees with the model: job counts, live attempts per job, and per-worker
+        // slots and placed demand as the sum over live attempts.
         prop_assert_eq!(after.waiting, sh.waiting.len());
         prop_assert_eq!(after.running, sh.running.len());
         prop_assert_eq!(after.workers.len(), sh.workers.len());
@@ -601,18 +837,41 @@ fn run(kind: &Kind, speed: SpeedConfig, ops: &[Op]) -> Result<Vec<String>, TestC
             let (n, m) = sh.load(l.id);
             prop_assert_eq!((l.running, l.placed), (n, m), "worker {} load", l.id);
         }
+        for (&j, r) in &sh.running {
+            prop_assert!(
+                speed.speculate.is_some() || r.live.len() == 1,
+                "job {j} has live attempts {:?}",
+                r.live
+            );
+            let runs: Vec<String> = r
+                .live
+                .iter()
+                .map(|l| format!("attempt {} on worker {}", l.attempt, l.worker))
+                .collect();
+            prop_assert_eq!(
+                p.explain(j),
+                Some(format!("job {j} is running: {}", runs.join(", ")))
+            );
+        }
+        for &j in sh.waiting.keys() {
+            let e = p.explain(j).unwrap_or_default();
+            prop_assert!(
+                e.starts_with(&format!("job {j} (")),
+                "waiting job {j} explained as {e}"
+            );
+        }
         let (max_res, per_class) = kind.max_reservations();
         let mut per: BTreeMap<String, usize> = BTreeMap::new();
-        for r in &after.reservations {
+        for (&job, &worker) in &held {
             prop_assert!(
-                sh.waiting.contains_key(&r.job),
+                sh.waiting.contains_key(&job),
                 "holder {} is not waiting",
-                r.job
+                job
             );
-            let l = after.workers.iter().find(|l| l.id == r.worker);
-            prop_assert!(l.is_some_and(|l| l.reserved_for == Some(r.job)));
+            let l = after.workers.iter().find(|l| l.id == worker);
+            prop_assert!(l.is_some_and(|l| l.reserved_for == Some(job)));
             *per.entry(if per_class {
-                sh.workers[&r.worker].class.clone()
+                sh.workers[&worker].class.clone()
             } else {
                 String::new()
             })
@@ -622,7 +881,7 @@ fn run(kind: &Kind, speed: SpeedConfig, ops: &[Op]) -> Result<Vec<String>, TestC
             per.values().all(|&n| n <= max_res),
             "too many reservations: {per:?}"
         );
-        prop_assert!(before.placements_total + out.len() as u64 == after.placements_total);
+        prop_assert!(before.placements_total + starts.len() as u64 == after.placements_total);
         log.push(format!(
             "{out:?} {:?} {:?}",
             after.deferred,
@@ -633,11 +892,17 @@ fn run(kind: &Kind, speed: SpeedConfig, ops: &[Op]) -> Result<Vec<String>, TestC
         }
     }
     // Liveness of bookkeeping: completing and cancelling everything releases everything.
-    for j in sh.running.keys().copied().collect::<Vec<_>>() {
-        p.completed(j, sh.now);
+    for (j, r) in std::mem::take(&mut sh.running) {
+        p.handle(
+            Input::Done {
+                job: j,
+                attempt: r.live[0].attempt,
+            },
+            sh.now,
+        );
     }
-    for j in sh.waiting.keys().copied().collect::<Vec<_>>() {
-        p.cancel(j);
+    for j in sh.waiting.keys() {
+        p.handle(Input::Cancel(*j), sh.now);
     }
     let end = p.stats();
     prop_assert_eq!(end.waiting + end.running, 0);
@@ -655,9 +920,14 @@ proptest! {
 
     /// Every invariant holds on random streams, and replays are identical.
     #[test]
-    fn invariants_hold(kind in kind(), speed in speed(), ops in prop::collection::vec(op(), 1..160)) {
-        let first = run(&kind, speed, &ops)?;
-        let second = run(&kind, speed, &ops)?;
+    fn invariants_hold(
+        kind in kind(),
+        speed in speed(),
+        retry in retry(),
+        ops in prop::collection::vec(op(), 1..160),
+    ) {
+        let first = run(&kind, speed, retry, &ops)?;
+        let second = run(&kind, speed, retry, &ops)?;
         prop_assert_eq!(first, second, "not deterministic");
     }
 }

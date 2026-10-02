@@ -1,8 +1,11 @@
-//! Scale check of the DAG layer: declare a million pending jobs, then complete them all.
+//! Scale check of the DAG layer: declare a million pending jobs, then run them all.
 
 use std::time::Instant;
 
-use sched::{Config, Dag, DagConfig, DagJob, DagScheduler, JobSpec, Resources, Scheduler};
+use sched::{
+    Config, DagConfig, DagJob, DagScheduler, Input, JobSpec, Output, Policy, Resources, Scheduler,
+    WorkerState,
+};
 
 /// Resident set size of this process, in MB (Linux only; 0 elsewhere).
 fn rss_mb() -> f64 {
@@ -15,7 +18,7 @@ fn rss_mb() -> f64 {
         .map_or(0.0, |kb| kb / 1024.0)
 }
 
-/// Declare, then complete, a million jobs, reporting time and memory.
+/// Declare, then run to completion, a million jobs, reporting time and memory.
 fn main() {
     const GROUPS: u64 = 100;
     const PER_GROUP: u64 = 10_000;
@@ -65,13 +68,23 @@ fn main() {
         grown * 1048576.0 / jobs_total as f64,
     );
     let clock = Instant::now();
-    for id in 0..jobs_total {
-        d.completed(id, 1.0);
+    let worker = WorkerState::new(0, "x", 64, Resources::mem(1 << 40));
+    d.handle(Input::Worker(worker), 1.0);
+    let mut completed = 0;
+    while completed < jobs_total {
+        let out = d.poll(1.0);
+        assert!(!out.is_empty(), "stalled after {completed} completions");
+        for o in out {
+            if let Output::Start { job, attempt, .. } = o {
+                d.handle(Input::Done { job, attempt }, 1.0);
+                completed += 1;
+            }
+        }
     }
     d.forget_completed_below(jobs_total);
     let completed = clock.elapsed().as_secs_f64();
     println!(
-        "completed all in {completed:.2}s ({:.2}us/completion); left: {:?}",
+        "ran all in {completed:.2}s ({:.2}us/job, polls included); left: {:?}",
         completed * 1e6 / jobs_total as f64,
         d.dag_stats()
     );

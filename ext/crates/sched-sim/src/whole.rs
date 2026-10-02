@@ -1,23 +1,24 @@
 //! The whole-run DAG of a Nassau resolution, its cost model, and its simulation.
 
 use std::{
-    cmp::Ordering,
-    collections::{BinaryHeap, HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     path::Path,
     sync::Arc,
 };
 
+use sched::{
+    Config, DagConfig, DagJob, DagScheduler, DagTemplate, GroupOrder, Input, InstanceSpec, JobId,
+    JobSpec, Output, Policy, PolicyStats, Resources, Scheduler, SpeedConfig, SpeedPolicy,
+    WorkerState,
+};
 use serde::Serialize;
 
-use super::{
+use crate::{
     algebra,
+    engine::{PsWorker, Queue},
     model::{ServiceModel, solve},
     run::Quantiles,
     trace::Trace,
-};
-use crate::{
-    Config, Dag, DagConfig, DagJob, DagScheduler, DagTemplate, GroupOrder, InstanceSpec, JobId,
-    JobSpec, Policy, Resources, Scheduler, SpeedConfig, SpeedPolicy, WorkerState,
 };
 
 /// One census row (`ext::nassau` per-bidegree counters).
@@ -823,8 +824,8 @@ impl World {
     /// The world flattened into a small instance (the PISA replica family): every task with its
     /// true work and estimate, the two passthroughs of a bidegree merged into one join, groups
     /// numbered in `(s, t)` order. Use a small region.
-    pub fn to_small(&self, fleet: &Fleet, model: &dyn ServiceModel) -> super::small::SmallInstance {
-        use super::small::{Class, Kind, SmallInstance, SmallTask};
+    pub fn to_small(&self, fleet: &Fleet, model: &dyn ServiceModel) -> crate::small::SmallInstance {
+        use crate::small::{Class, Kind, SmallInstance, SmallTask};
         // s-major, as `simulate`'s ids: the DAG layer releases simultaneous dependents in id
         // order, so this keeps both simulators' tie-breaks between bidegrees identical. (It is
         // topological: every bidegree edge goes to a higher s, or to the same s at a higher t.)
@@ -1141,7 +1142,7 @@ pub struct WholeMetrics {
     pub peak_open: usize,
     /// Most DAG nodes live at once.
     pub peak_dag_nodes: usize,
-    /// `dispatch` wall time, microseconds.
+    /// Wall time of the placing `poll` calls, microseconds.
     pub dispatch_us: Quantiles,
     /// Wall time of the simulation, seconds.
     pub sim_s: f64,
@@ -1150,44 +1151,55 @@ pub struct WholeMetrics {
 /// An event of the simulation.
 #[derive(Clone, Copy, Debug)]
 enum Ev {
+    /// A worker's next completion, of this [`PsWorker`] version.
     Done(usize, u64),
-    /// The policy asked to be dispatched again ([`Policy::next_wakeup`]).
+    /// The policy asked to be polled again ([`Policy::next_wakeup`]).
     Wake,
-}
-
-/// A heap entry (earliest first).
-struct Item(f64, u64, Ev);
-
-impl PartialEq for Item {
-    /// Equal when [`Ord`] says so.
-    fn eq(&self, o: &Self) -> bool {
-        self.cmp(o) == Ordering::Equal
-    }
-}
-
-impl Eq for Item {}
-
-impl PartialOrd for Item {
-    /// The total order of [`Ord`].
-    fn partial_cmp(&self, o: &Self) -> Option<Ordering> {
-        Some(self.cmp(o))
-    }
-}
-
-impl Ord for Item {
-    /// Reversed for a min-heap; the sequence number breaks ties deterministically.
-    fn cmp(&self, o: &Self) -> Ordering {
-        o.0.total_cmp(&self.0).then(o.1.cmp(&self.1))
-    }
 }
 
 /// A simulated worker: processor sharing over its running tasks.
 struct Wk {
     class: String,
-    running: Vec<(JobId, f64)>,
-    last: f64,
-    version: u64,
-    busy: f64,
+    ps: PsWorker,
+}
+
+/// A policy whose placements can be held back. Closed, its [`Policy::poll`] places nothing and
+/// returns nothing, so that a [`DagScheduler`]'s poll only drains the DAG layer's announcements:
+/// the simulated coordinator releases the jobs announced ready before anything is placed.
+struct Gate<P> {
+    inner: P,
+    open: bool,
+}
+
+impl<P: Policy> Policy for Gate<P> {
+    /// Forwarded.
+    fn handle(&mut self, input: Input, now: f64) {
+        self.inner.handle(input, now);
+    }
+
+    /// Forwarded while open; nothing while closed.
+    fn poll(&mut self, now: f64) -> Vec<Output> {
+        if self.open {
+            self.inner.poll(now)
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Forwarded.
+    fn next_wakeup(&self) -> Option<f64> {
+        self.inner.next_wakeup()
+    }
+
+    /// Forwarded.
+    fn explain(&self, job: JobId) -> Option<String> {
+        self.inner.explain(job)
+    }
+
+    /// Forwarded.
+    fn stats(&self) -> PolicyStats {
+        self.inner.stats()
+    }
 }
 
 /// Simulate the whole run under `plan` on `fleet`, placing as `place` says (each worker's
@@ -1221,7 +1233,7 @@ pub fn simulate(
         _ => None,
     };
     let policy = Scheduler::new(Config {
-        order: crate::Order::Priority {
+        order: sched::Order::Priority {
             default_priority: 0,
             group_order: if place.group_key == GroupKey::Arrival {
                 GroupOrder::Arrival
@@ -1245,30 +1257,28 @@ pub fn simulate(
             max_open_instances: place.max_open,
             track_ranks: rank,
         },
-        policy,
+        Gate {
+            inner: policy,
+            open: false,
+        },
     );
     let mut workers: Vec<Wk> = Vec::new();
     for (class, count, slots) in &fleet.groups {
         for _ in 0..*count {
             let id = workers.len() as u64;
-            dag.worker_update(
-                WorkerState {
-                    // Learning starts from no knowledge: every worker reports speed 1.
-                    speed: if speed.learn.is_some() {
-                        1.0
-                    } else {
-                        model.throughput(class, 1)
-                    },
-                    ..WorkerState::new(id, class.clone(), *slots, Resources::mem(1 << 60))
+            let state = WorkerState {
+                // Learning starts from no knowledge: every worker reports speed 1.
+                speed: if speed.learn.is_some() {
+                    1.0
+                } else {
+                    model.throughput(class, 1)
                 },
-                0.0,
-            );
+                ..WorkerState::new(id, class.clone(), *slots, Resources::mem(1 << 60))
+            };
+            dag.handle(Input::Worker(state), 0.0);
             workers.push(Wk {
                 class: class.clone(),
-                running: Vec::new(),
-                last: 0.0,
-                version: 0,
-                busy: 0.0,
+                ps: PsWorker::default(),
             });
         }
     }
@@ -1319,12 +1329,7 @@ pub fn simulate(
     }
     dag.declare(jobs, 0.0).expect("the bidegree DAG is acyclic");
 
-    let mut heap = BinaryHeap::new();
-    let mut seq = 0u64;
-    let mut push = |heap: &mut BinaryHeap<Item>, t: f64, ev: Ev| {
-        seq += 1;
-        heap.push(Item(t, seq, ev));
-    };
+    let mut queue = Queue::new();
     let mut ready_at = vec![f64::NAN; n];
     let mut done_at = vec![f64::NAN; n];
     let mut open = 0usize;
@@ -1339,9 +1344,13 @@ pub fn simulate(
     let mut wake_at = f64::NAN;
     let mut eager_done = false;
     let mut now = 0.0;
+    // Announcements the placing poll returned, for the next instant.
+    let mut carry: Vec<Output> = Vec::new();
+    // Jobs with a running attempt: the first attempt to finish completes the job.
+    let mut running: HashSet<JobId> = HashSet::new();
 
     // Declare bidegree k's walk: its signature template, then "walk done" after the sinks.
-    let instantiate = |dag: &mut DagScheduler<Scheduler>, k: usize, now: f64| {
+    let instantiate = |dag: &mut DagScheduler<Gate<Scheduler>>, k: usize, now: f64| {
         let b = &world.bideg[k];
         let zero = 4 * k as u64;
         let mut done_deps = vec![zero];
@@ -1426,8 +1435,15 @@ pub fn simulate(
                 instantiate(&mut dag, k, 0.0);
             }
         }
-        // Newly ready jobs: open bidegrees and release (respecting today's caps).
-        for id in dag.take_ready() {
+        // Newly ready jobs: open bidegrees and release (respecting today's caps), before anything
+        // is placed.
+        dag.policy_mut().open = false;
+        let mut announced = std::mem::take(&mut carry);
+        announced.extend(dag.poll(now));
+        for o in &announced {
+            let &Output::Ready { job: id } = o else {
+                continue;
+            };
             match world.node(id) {
                 Node::Zero(k) => {
                     ready_at[k] = now;
@@ -1454,7 +1470,10 @@ pub fn simulate(
                 other => unreachable!("{other:?} is a passthrough"),
             }
         }
-        for id in dag.take_passed() {
+        for o in &announced {
+            let &Output::Passed { job: id } = o else {
+                continue;
+            };
             if let Node::WalkDone(k) = world.node(id) {
                 done_at[k] = now;
                 open -= 1;
@@ -1470,35 +1489,57 @@ pub fn simulate(
             }
         }
         peak_open = peak_open.max(open);
+        dag.policy_mut().open = true;
         let c = std::time::Instant::now();
-        let out = dag.dispatch(now);
+        let out = dag.poll(now);
         dispatch_us.push(c.elapsed().as_secs_f64() * 1e6);
         let mut dirty = Vec::new();
-        for (id, w) in out {
-            let w = w as usize;
-            advance(&mut workers[w], model, now);
-            let work = match world.node(id) {
-                Node::Zero(k) => world.bideg[k].zero_true,
-                Node::Sig(k, i) => world.sig_work(k, i, true),
-                other => unreachable!("{other:?} was dispatched"),
-            };
-            workers[w].running.push((id, work));
-            tasks += 1;
-            dirty.push(w);
+        for o in out {
+            match o {
+                Output::Start {
+                    job: id,
+                    attempt,
+                    worker,
+                } => {
+                    let w = worker as usize;
+                    advance(&mut workers[w], model, now);
+                    let work = match world.node(id) {
+                        Node::Zero(k) => world.bideg[k].zero_true,
+                        Node::Sig(k, i) => world.sig_work(k, i, true),
+                        other => unreachable!("{other:?} was placed"),
+                    };
+                    workers[w].ps.start(id, attempt, work);
+                    running.insert(id);
+                    tasks += 1;
+                    dirty.push(w);
+                }
+                Output::Stop {
+                    job,
+                    attempt,
+                    worker,
+                } => {
+                    let w = worker as usize;
+                    advance(&mut workers[w], model, now);
+                    if workers[w].ps.stop(job, attempt) {
+                        dirty.push(w);
+                    }
+                }
+                Output::Ready { .. } | Output::Passed { .. } => carry.push(o),
+                Output::GaveUp(g) => unreachable!("job {} failed, but no attempt fails", g.job),
+                Output::RunLocal { .. } => {}
+            }
         }
         dirty.sort_unstable();
         dirty.dedup();
         for w in dirty {
-            schedule(&mut workers[w], w, model, now, &mut |t, ev| {
-                push(&mut heap, t, ev)
-            });
+            schedule(&mut workers[w], w, model, now, &mut queue);
         }
         // Deferrals expire without an event: wake the policy then.
-        if let Some(t) = dag.policy().next_wakeup()
+        if let Some(t) = dag.next_wakeup()
             && t != wake_at
         {
             wake_at = t;
-            push(&mut heap, t, Ev::Wake);
+            queue.push(t, Ev::Wake);
         }
         if tasks >= next_sample {
             next_sample = tasks + 65_536;
@@ -1506,44 +1547,41 @@ pub fn simulate(
             peak_nodes = peak_nodes.max(s.pending + s.held + s.submitted + s.undeclared);
         }
 
-        // Next instant: every event at it is applied before the next dispatch, as a coordinator
-        // that drains its event queue would (dispatching between simultaneous completions would
-        // let whichever is processed first grab the free slots, regardless of priority).
-        let Some(Item(t, _, first)) = heap.pop() else {
+        // Next instant: every event at it is applied before the next poll, as a coordinator that
+        // drains its event queue would (placing between simultaneous completions would let
+        // whichever is processed first grab the free slots, regardless of priority).
+        let Some((t, events)) = queue.pop_instant() else {
             break;
         };
         now = t;
-        let mut events = vec![first];
-        while heap.peek().is_some_and(|i| i.0 == t) {
-            events.push(heap.pop().unwrap().2);
-        }
         for ev in events {
             let Ev::Done(w, v) = ev else {
                 // Stale wakeups (for jobs placed before their deadline) are harmless no-ops.
                 continue;
             };
-            if v != workers[w].version {
+            if !workers[w].ps.is_current(v) {
                 continue;
             }
             advance(&mut workers[w], model, now);
             // The event was scheduled for the task(s) with the least work left: finish them even
             // if rounding left a sliver (a completion at `now + tiny` can round to `now`).
-            let least = workers[w]
-                .running
-                .iter()
-                .map(|x| x.1)
-                .fold(f64::INFINITY, f64::min);
-            let mut finished = Vec::new();
-            workers[w].running.retain(|&(id, rem)| {
-                let fin = rem <= least.max(0.0) + 1e-9 * (1.0 + least.abs());
-                if fin {
-                    finished.push(id);
+            let mut finished = workers[w]
+                .ps
+                .finish(|left, least| left <= least.max(0.0) + 1e-9 * (1.0 + least.abs()));
+            finished.sort_unstable_by_key(|r| (r.job, r.attempt));
+            for r in finished {
+                let id = r.job;
+                // Another attempt finished first; this one's stop is on its way.
+                if !running.remove(&id) {
+                    continue;
                 }
-                !fin
-            });
-            finished.sort_unstable();
-            for id in finished {
-                dag.completed(id, now);
+                dag.handle(
+                    Input::Done {
+                        job: id,
+                        attempt: r.attempt,
+                    },
+                    now,
+                );
                 if let (Node::Sig(k, _), Some(_)) = (world.node(id), caps) {
                     inflight[k] -= 1;
                     if let Some(next) = sig_queue.get_mut(&k).and_then(VecDeque::pop_front) {
@@ -1552,9 +1590,7 @@ pub fn simulate(
                     }
                 }
             }
-            schedule(&mut workers[w], w, model, now, &mut |t, ev| {
-                push(&mut heap, t, ev)
-            });
+            schedule(&mut workers[w], w, model, now, &mut queue);
         }
     }
     let unfinished = done_at.iter().filter(|x| x.is_nan()).count();
@@ -1567,7 +1603,7 @@ pub fn simulate(
     );
     // The last completion, not the last event: stale wakeups may fire later.
     let makespan = done_at.iter().copied().fold(0.0, f64::max);
-    let busy: f64 = workers.iter().map(|w| w.busy).sum();
+    let busy: f64 = workers.iter().map(|w| w.ps.busy).sum();
     WholeMetrics {
         plan: plan.name()
             + &speed_name(&speed)
@@ -1622,40 +1658,23 @@ pub fn speed_name(speed: &SpeedConfig) -> String {
     s
 }
 
+/// A worker's per-task rate with `k` tasks running: its class's throughput, shared equally.
+fn ps_rate(w: &str, model: &dyn ServiceModel, k: usize) -> f64 {
+    model.throughput(w, k) / k as f64
+}
+
 /// Progress a worker's running tasks to `now` at their processor-sharing rate.
 fn advance(w: &mut Wk, model: &dyn ServiceModel, now: f64) {
-    let dt = now - w.last;
-    let k = w.running.len();
-    if dt > 0.0 && k > 0 {
-        let r = model.throughput(&w.class, k) / k as f64;
-        for x in &mut w.running {
-            x.1 -= r * dt;
-        }
-        w.busy += k as f64 * dt;
-    }
-    w.last = now;
+    w.ps.advance(now, |r| ps_rate(&w.class, model, r.len()));
 }
 
 /// Schedule a worker's next completion (invalidating any earlier one).
-fn schedule(
-    w: &mut Wk,
-    idx: usize,
-    model: &dyn ServiceModel,
-    now: f64,
-    push: &mut dyn FnMut(f64, Ev),
-) {
-    w.version += 1;
-    if w.running.is_empty() {
-        return;
+fn schedule(w: &mut Wk, idx: usize, model: &dyn ServiceModel, now: f64, queue: &mut Queue<Ev>) {
+    if let Some((at, v)) =
+        w.ps.next_completion(now, |r| ps_rate(&w.class, model, r.len()))
+    {
+        queue.push(at, Ev::Done(idx, v));
     }
-    let r = model.throughput(&w.class, w.running.len()) / w.running.len() as f64;
-    let min = w
-        .running
-        .iter()
-        .map(|x| x.1)
-        .fold(f64::INFINITY, f64::min)
-        .max(0.0);
-    push(now + min / r, Ev::Done(idx, w.version));
 }
 
 #[cfg(test)]
@@ -1663,7 +1682,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::*;
-    use crate::sim::{
+    use crate::{
         model::{ClassCurve, PsModel},
         trace::{TraceTask, group_id},
     };
@@ -1830,7 +1849,7 @@ mod tests {
             speed: SpeedConfig {
                 policy,
                 learn: None,
-                spoliation: None,
+                speculate: None,
             },
             ..Placement::default()
         };
@@ -1841,7 +1860,7 @@ mod tests {
             &Plan::Group,
             &place(SpeedPolicy::FastestFirst),
         );
-        let defer = crate::Defer {
+        let defer = sched::Defer {
             max_wait: 1e6,
             min_gain: 0.0,
         };

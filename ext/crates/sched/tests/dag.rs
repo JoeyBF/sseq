@@ -4,15 +4,29 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use proptest::prelude::*;
 use sched::{
-    Config, Dag, DagConfig, DagError, DagJob, DagScheduler, JobId, JobSpec, Resources, Scheduler,
-    WorkerState,
+    Attempt, Config, DagConfig, DagError, DagJob, DagScheduler, Input, JobId, JobSpec, Output,
+    Policy, Resources, RetryConfig, Scheduler, WorkerState,
 };
 
 /// A DAG layer over backfill with one roomy worker.
 fn dag(config: DagConfig) -> DagScheduler<Scheduler> {
     let mut d = DagScheduler::new(config, Scheduler::new(Config::default()));
-    d.worker_update(WorkerState::new(0, "x", 64, Resources::mem(1000)), 0.0);
+    join(
+        &mut d,
+        WorkerState::new(0, "x", 64, Resources::mem(1000)),
+        0.0,
+    );
     d
+}
+
+/// A worker joins.
+fn join(d: &mut DagScheduler<Scheduler>, w: WorkerState, now: f64) {
+    d.handle(Input::Worker(w), now);
+}
+
+/// Report the first attempt of `job` done.
+fn complete(d: &mut DagScheduler<Scheduler>, job: JobId, now: f64) {
+    d.handle(Input::Done { job, attempt: 1 }, now);
 }
 
 /// A unit job in group 0 with the given dependencies.
@@ -26,9 +40,16 @@ fn job(id: JobId, deps: &[JobId]) -> DagJob {
     }
 }
 
-/// The ids placed by a dispatch, sorted.
+/// The ids started by a poll, sorted.
 fn placed(d: &mut DagScheduler<Scheduler>, now: f64) -> Vec<JobId> {
-    let mut v: Vec<JobId> = d.dispatch(now).into_iter().map(|p| p.0).collect();
+    let mut v: Vec<JobId> = d
+        .poll(now)
+        .into_iter()
+        .filter_map(|o| match o {
+            Output::Start { job, .. } => Some(job),
+            _ => None,
+        })
+        .collect();
     v.sort_unstable();
     v
 }
@@ -41,11 +62,11 @@ fn chain_becomes_ready_in_order() {
         .unwrap();
     assert_eq!(placed(&mut d, 0.0), vec![1]);
     assert!(d.explain(3).unwrap().contains("waits for 1 dependency [2]"));
-    d.completed(1, 1.0);
+    complete(&mut d, 1, 1.0);
     assert_eq!(placed(&mut d, 1.0), vec![2]);
-    d.completed(2, 2.0);
+    complete(&mut d, 2, 2.0);
     assert_eq!(placed(&mut d, 2.0), vec![3]);
-    d.completed(3, 3.0);
+    complete(&mut d, 3, 3.0);
     let s = d.dag_stats();
     assert_eq!(
         (s.pending, s.submitted, s.edges, s.undeclared),
@@ -63,7 +84,7 @@ fn forward_references_wait_for_declaration() {
     assert!(d.explain(1).unwrap().contains("not declared yet"));
     d.declare(vec![job(1, &[])], 1.0).unwrap();
     assert_eq!(placed(&mut d, 1.0), vec![1]);
-    d.completed(1, 2.0);
+    complete(&mut d, 1, 2.0);
     assert_eq!(placed(&mut d, 2.0), vec![2]);
 }
 
@@ -73,7 +94,7 @@ fn dependency_on_a_completed_job_is_satisfied() {
     let mut d = dag(DagConfig::default());
     d.declare(vec![job(1, &[])], 0.0).unwrap();
     placed(&mut d, 0.0);
-    d.completed(1, 1.0);
+    complete(&mut d, 1, 1.0);
     d.declare(vec![job(2, &[1]), job(3, &[1, 1])], 2.0).unwrap();
     assert_eq!(placed(&mut d, 2.0), vec![2, 3]);
     // After forgetting, everything below the floor still counts as completed.
@@ -119,7 +140,7 @@ fn cycles_are_rejected_without_a_trace() {
     // The graph still works: declare 2 properly.
     d.declare(vec![job(2, &[])], 2.0).unwrap();
     assert_eq!(placed(&mut d, 2.0), vec![2, 3]);
-    d.completed(2, 3.0);
+    complete(&mut d, 2, 3.0);
     assert_eq!(placed(&mut d, 3.0), vec![1]);
 }
 
@@ -143,6 +164,12 @@ fn cancel_cascades_to_dependents() {
     c.sort_unstable();
     assert_eq!(c, vec![1, 2, 3]);
     assert_eq!(d.stats().running, 1, "the policy released job 1");
+    let stop = Output::Stop {
+        job: 1,
+        attempt: 1,
+        worker: 0,
+    };
+    assert_eq!(d.poll(0.0), vec![stop], "and stopped its attempt");
     // Cancelling 5 drops the forward reference 9 it alone kept alive.
     assert_eq!(d.cancel(5), vec![5]);
     let s = d.dag_stats();
@@ -186,7 +213,11 @@ fn rank_priority_orders_ready_jobs() {
         },
         Scheduler::new(Config::default()),
     );
-    d.worker_update(WorkerState::new(0, "x", 1, Resources::mem(1000)), 0.0);
+    join(
+        &mut d,
+        WorkerState::new(0, "x", 1, Resources::mem(1000)),
+        0.0,
+    );
     let w = |id, deps: &[JobId], work| DagJob {
         work_estimate: Some(work),
         ..job(id, deps)
@@ -196,7 +227,7 @@ fn rank_priority_orders_ready_jobs() {
     assert_eq!(placed(&mut d, 0.0), vec![2]);
 }
 
-/// Without auto-submit, ready jobs wait for `release`.
+/// Without auto-submit, ready jobs are announced and wait for `release`.
 #[test]
 fn held_jobs_wait_for_release() {
     let mut d = dag(DagConfig {
@@ -204,26 +235,36 @@ fn held_jobs_wait_for_release() {
         ..DagConfig::default()
     });
     d.declare(vec![job(1, &[]), job(2, &[1])], 0.0).unwrap();
-    assert_eq!(d.take_ready(), vec![1]);
-    assert!(placed(&mut d, 0.0).is_empty());
+    assert_eq!(d.poll(0.0), vec![Output::Ready { job: 1 }]);
+    assert!(d.poll(0.0).is_empty(), "announced once");
     assert!(d.explain(1).unwrap().contains("held"));
     assert!(d.release(1, 5.0));
     assert!(!d.release(1, 5.0));
     assert_eq!(placed(&mut d, 5.0), vec![1]);
-    d.completed(1, 6.0);
-    assert_eq!(d.take_ready(), vec![2]);
+    complete(&mut d, 1, 6.0);
+    assert_eq!(d.poll(6.0), vec![Output::Ready { job: 2 }]);
 }
 
-/// A job lost with its worker can be resubmitted from the DAG.
+/// A job lost with its worker is retried by the policy (attempt 2, on the next worker), and a
+/// late report of the lost attempt completes nothing.
 #[test]
-fn resubmit_after_worker_loss() {
+fn worker_loss_retries_automatically() {
     let mut d = dag(DagConfig::default());
-    d.declare(vec![job(1, &[])], 0.0).unwrap();
+    d.declare(vec![job(1, &[]), job(2, &[1])], 0.0).unwrap();
     assert_eq!(placed(&mut d, 0.0), vec![1]);
-    d.worker_gone(0, 1.0);
-    assert!(d.resubmit(1, 1.0));
-    d.worker_update(WorkerState::new(5, "x", 1, Resources::mem(10)), 2.0);
-    assert_eq!(d.dispatch(2.0), vec![(1, 5)]);
+    d.handle(Input::WorkerGone(0), 1.0);
+    assert!(d.poll(1.0).is_empty());
+    complete(&mut d, 1, 1.5);
+    assert!(d.poll(1.5).is_empty(), "the lost attempt's report is stale");
+    join(&mut d, WorkerState::new(5, "x", 1, Resources::mem(10)), 2.0);
+    let retry = Output::Start {
+        job: 1,
+        attempt: 2,
+        worker: 5,
+    };
+    assert_eq!(d.poll(2.0), vec![retry]);
+    d.handle(Input::Done { job: 1, attempt: 2 }, 3.0);
+    assert_eq!(placed(&mut d, 3.0), vec![2]);
 }
 
 /// A snapshot survives JSON and resumes with a fresh policy.
@@ -237,13 +278,17 @@ fn snapshot_round_trip() {
     let json = serde_json::to_string(&d.snapshot()).unwrap();
     let snap = serde_json::from_str(&json).unwrap();
     let mut r = DagScheduler::restore(snap, Scheduler::new(Config::default()), 10.0);
-    r.worker_update(WorkerState::new(0, "x", 64, Resources::mem(1000)), 10.0);
+    join(
+        &mut r,
+        WorkerState::new(0, "x", 64, Resources::mem(1000)),
+        10.0,
+    );
     assert_eq!(r.dag_stats(), d.dag_stats());
     // Job 1 was submitted before the snapshot: it is submitted again to the new policy.
     assert_eq!(placed(&mut r, 10.0), vec![1]);
-    r.completed(1, 11.0);
+    complete(&mut r, 1, 11.0);
     assert_eq!(placed(&mut r, 11.0), vec![2]);
-    r.completed(2, 12.0);
+    complete(&mut r, 2, 12.0);
     assert!(
         placed(&mut r, 12.0).is_empty(),
         "3 still waits for the forward reference 7"
@@ -257,7 +302,7 @@ proptest! {
 
     /// A random DAG (edges from lower to higher ids), declared in random batches in random order
     /// (so forward references abound), with random worker churn: no job is dispatched before its
-    /// dependencies completed, every job eventually runs, and an injected back edge is rejected.
+    /// dependencies completed (late reports of lost attempts complete nothing), every job eventually runs, and an injected back edge is rejected.
     #[test]
     fn never_dispatched_before_dependencies(
         n in 1usize..40,
@@ -269,6 +314,7 @@ proptest! {
         }),
         batch in 1usize..8,
         slots in 1usize..4,
+        churn in prop::collection::btree_set(0usize..200, 0..6),
     ) {
         let mut deps: BTreeMap<JobId, BTreeSet<JobId>> = (0..n as JobId).map(|i| (i, BTreeSet::new())).collect();
         for (a, b) in edges {
@@ -277,26 +323,42 @@ proptest! {
                 deps.get_mut(&b).unwrap().insert(a);
             }
         }
-        let mut d = DagScheduler::new(DagConfig::default(), Scheduler::new(Config::default()));
-        d.worker_update(WorkerState::new(0, "x", slots, Resources::mem(10)), 0.0);
+        // Enough attempts that churn never makes the policy give up.
+        let config = Config { retry: RetryConfig { max_attempts: 100 }, ..Config::default() };
+        let mut d = DagScheduler::new(DagConfig::default(), Scheduler::new(config));
+        join(&mut d, WorkerState::new(0, "x", slots, Resources::mem(10)), 0.0);
         let ids: Vec<JobId> = order.into_iter().filter(|&i| i < n).map(|i| i as JobId).collect();
         let mut done: BTreeSet<JobId> = BTreeSet::new();
-        let mut running: Vec<JobId> = Vec::new();
+        let mut running: Vec<(JobId, Attempt)> = Vec::new();
         let mut t = 0.0;
-        let step = |d: &mut DagScheduler<Scheduler>,
-                    done: &mut BTreeSet<JobId>,
-                    running: &mut Vec<JobId>,
-                    t: &mut f64|
+        let mut steps = 0;
+        let mut step = |d: &mut DagScheduler<Scheduler>,
+                        done: &mut BTreeSet<JobId>,
+                        running: &mut Vec<(JobId, Attempt)>,
+                        t: &mut f64|
          -> Result<(), TestCaseError> {
             *t += 1.0;
-            for (j, _) in d.dispatch(*t) {
-                prop_assert!(deps[&j].is_subset(done), "job {} dispatched before its deps", j);
-                running.push(j);
+            if churn.contains(&steps) {
+                // The worker leaves with its attempts, whose late reports must complete nothing,
+                // and comes back.
+                d.handle(Input::WorkerGone(0), *t);
+                for (job, attempt) in running.drain(..) {
+                    d.handle(Input::Done { job, attempt }, *t);
+                }
+                join(d, WorkerState::new(0, "x", slots, Resources::mem(10)), *t);
             }
-            if let Some(j) = running.first().copied() {
-                running.remove(0);
-                d.completed(j, *t);
-                done.insert(j);
+            steps += 1;
+            for o in d.poll(*t) {
+                if let Output::Start { job, attempt, .. } = o {
+                    prop_assert!(deps[&job].is_subset(done), "job {} dispatched before its deps", job);
+                    prop_assert!(!done.contains(&job), "job {} dispatched after completing", job);
+                    running.push((job, attempt));
+                }
+            }
+            if !running.is_empty() {
+                let (job, attempt) = running.remove(0);
+                d.handle(Input::Done { job, attempt }, *t);
+                done.insert(job);
             }
             Ok(())
         };

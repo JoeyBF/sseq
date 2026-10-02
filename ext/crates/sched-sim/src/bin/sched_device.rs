@@ -1,7 +1,7 @@
 //! Device-aware admission on a synthetic small-card scenario.
 
 use clap::Parser;
-use sched::sim::device::{DeviceArm, DeviceScenario, simulate_device};
+use sched_sim::device::{DeviceArm, DeviceScenario, simulate_device};
 
 /// Compare host-only and device-aware admission when over-subscribing a card's launch pool slows
 /// every job on it.

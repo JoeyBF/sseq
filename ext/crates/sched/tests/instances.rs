@@ -4,8 +4,8 @@ use std::{collections::BTreeSet, sync::Arc};
 
 use proptest::prelude::*;
 use sched::{
-    Config, Dag, DagConfig, DagJob, DagScheduler, DagTemplate, InstanceSpec, JobId, JobSpec,
-    Resources, Scheduler, WorkerState,
+    Config, DagConfig, DagJob, DagScheduler, DagTemplate, Input, InstanceSpec, JobId, JobSpec,
+    Output, Policy, Resources, Scheduler, WorkerId, WorkerState,
 };
 
 /// A random group structure: per group, its template index, its passthrough flags and the
@@ -81,7 +81,7 @@ fn build_with(w: &World, implicit: bool, budget: Option<usize>) -> DagScheduler<
         },
         Scheduler::new(Config::default()),
     );
-    d.worker_update(WorkerState::new(0, "x", 1, Resources::mem(1)), 0.0);
+    join(&mut d, 1, 0.0);
     let templates: Vec<Arc<DagTemplate>> = w
         .templates
         .iter()
@@ -142,6 +142,37 @@ fn build_with(w: &World, implicit: bool, budget: Option<usize>) -> DagScheduler<
     d
 }
 
+/// The worker, with `slots` slots, joins.
+fn join(d: &mut DagScheduler<Scheduler>, slots: usize, now: f64) {
+    let w = WorkerState::new(0, "x", slots, Resources::mem(1));
+    d.handle(Input::Worker(w), now);
+}
+
+/// The jobs a poll announced as ready; it must output nothing else.
+fn announced(d: &mut DagScheduler<Scheduler>, now: f64) -> BTreeSet<JobId> {
+    d.poll(now)
+        .into_iter()
+        .map(|o| match o {
+            Output::Ready { job } => job,
+            o => panic!("unexpected output {o:?}"),
+        })
+        .collect()
+}
+
+/// Release held job `j`, check that it starts, and report it done. Returns the jobs announced
+/// ready as a consequence.
+fn run(d: &mut DagScheduler<Scheduler>, j: JobId, now: f64) -> BTreeSet<JobId> {
+    assert!(d.release(j, now), "job {j} is not held");
+    let start = Output::Start {
+        job: j,
+        attempt: 1,
+        worker: 0,
+    };
+    assert_eq!(d.poll(now), vec![start]);
+    d.handle(Input::Done { job: j, attempt: 1 }, now);
+    announced(d, now)
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(512))]
 
@@ -156,7 +187,7 @@ proptest! {
             prop_assert!((rx - ry).abs() < 1e-6 * rx.max(1.0), "entry {} rank {} vs {}", g, rx, ry);
         }
         let mut ready: BTreeSet<JobId> = BTreeSet::new();
-        let (a, b): (BTreeSet<JobId>, BTreeSet<JobId>) = (x.take_ready().into_iter().collect(), y.take_ready().into_iter().collect());
+        let (a, b) = (announced(&mut x, 0.0), announced(&mut y, 0.0));
         prop_assert_eq!(&a, &b);
         ready.extend(a);
         let mut rng = seed;
@@ -171,14 +202,13 @@ proptest! {
                     Scheduler::new(Config::default()),
                     steps as f64,
                 );
-                let again: BTreeSet<JobId> = y.take_ready().into_iter().collect();
+                join(&mut y, 1, steps as f64);
+                let again = announced(&mut y, steps as f64);
                 prop_assert_eq!(&again, &ready, "restored held set");
             }
             let j = *ready.iter().nth((rng >> 33) as usize % ready.len()).unwrap();
             ready.remove(&j);
-            x.completed(j, steps as f64);
-            y.completed(j, steps as f64);
-            let (a, b): (BTreeSet<JobId>, BTreeSet<JobId>) = (x.take_ready().into_iter().collect(), y.take_ready().into_iter().collect());
+            let (a, b) = (run(&mut x, j, steps as f64), run(&mut y, j, steps as f64));
             prop_assert_eq!(&a, &b, "after completing {}", j);
             ready.extend(a);
             let (sx, sy) = (x.dag_stats(), y.dag_stats());
@@ -196,7 +226,7 @@ proptest! {
 /// A two-node instance with an explicit job after its `done`.
 fn small() -> DagScheduler<Scheduler> {
     let mut d = DagScheduler::new(DagConfig::default(), Scheduler::new(Config::default()));
-    d.worker_update(WorkerState::new(0, "x", 8, Resources::mem(10)), 0.0);
+    join(&mut d, 8, 0.0);
     d.declare(
         vec![DagJob::new(JobSpec::new(1, Resources::ZERO, 0), vec![])],
         0.0,
@@ -226,22 +256,42 @@ fn small() -> DagScheduler<Scheduler> {
     d
 }
 
+/// The first attempts a poll started, as `(job, worker)`; it must output nothing else.
+fn starts(d: &mut DagScheduler<Scheduler>, now: f64) -> Vec<(JobId, WorkerId)> {
+    d.poll(now)
+        .into_iter()
+        .map(|o| match o {
+            Output::Start {
+                job,
+                attempt: 1,
+                worker,
+            } => (job, worker),
+            o => panic!("unexpected output {o:?}"),
+        })
+        .collect()
+}
+
+/// Report the first attempt of `job` done.
+fn complete(d: &mut DagScheduler<Scheduler>, job: JobId, now: f64) {
+    d.handle(Input::Done { job, attempt: 1 }, now);
+}
+
 /// Instance nodes run, explain themselves, and release explicit dependents of `done`.
 #[test]
 fn instance_lifecycle() {
     let mut d = small();
     assert!(d.explain(10).unwrap().contains("entry job 1"));
-    assert_eq!(d.dispatch(0.0), vec![(1, 0)]);
-    d.completed(1, 1.0);
+    assert_eq!(starts(&mut d, 0.0), vec![(1, 0)]);
+    complete(&mut d, 1, 1.0);
     assert!(d.explain(11).unwrap().contains("1 dependency"));
-    assert_eq!(d.dispatch(1.0), vec![(10, 0)]);
+    assert_eq!(starts(&mut d, 1.0), vec![(10, 0)]);
     assert_eq!(d.dag_stats().instances, 1);
-    d.completed(10, 2.0);
-    assert_eq!(d.dispatch(2.0), vec![(11, 0)]);
-    d.completed(11, 3.0);
+    complete(&mut d, 10, 2.0);
+    assert_eq!(starts(&mut d, 2.0), vec![(11, 0)]);
+    complete(&mut d, 11, 3.0);
     assert_eq!(d.dag_stats().instances, 0, "closed on its last node");
     assert_eq!(
-        d.dispatch(3.0),
+        starts(&mut d, 3.0),
         vec![(2, 0)],
         "done released the explicit dependent"
     );
@@ -252,9 +302,9 @@ fn instance_lifecycle() {
 #[test]
 fn instance_cancellation() {
     let mut d = small();
-    d.dispatch(0.0);
-    d.completed(1, 1.0);
-    assert_eq!(d.dispatch(1.0), vec![(10, 0)]);
+    starts(&mut d, 0.0);
+    complete(&mut d, 1, 1.0);
+    assert_eq!(starts(&mut d, 1.0), vec![(10, 0)]);
     let mut c = d.cancel(11);
     c.sort_unstable();
     assert_eq!(c, vec![2, 10, 11]);
@@ -263,6 +313,12 @@ fn instance_cancellation() {
         0,
         "the submitted node was cancelled in the policy"
     );
+    let stop = Output::Stop {
+        job: 10,
+        attempt: 1,
+        worker: 0,
+    };
+    assert_eq!(d.poll(1.0), vec![stop]);
     let s = d.dag_stats();
     assert_eq!((s.instances, s.pending, s.submitted), (0, 0, 0));
 
@@ -310,7 +366,7 @@ proptest! {
     #[test]
     fn open_instance_budget(w in world(), seed in any::<u64>(), budget in 1usize..4) {
         let mut d = build_with(&w, true, Some(budget));
-        let mut ready: BTreeSet<JobId> = d.take_ready().into_iter().collect();
+        let mut ready = announced(&mut d, 0.0);
         let mut rng = seed;
         let mut steps = 0;
         while !ready.is_empty() {
@@ -318,8 +374,7 @@ proptest! {
             rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
             let j = *ready.iter().nth((rng >> 33) as usize % ready.len()).unwrap();
             ready.remove(&j);
-            d.completed(j, steps as f64);
-            ready.extend(d.take_ready());
+            ready.extend(run(&mut d, j, steps as f64));
             steps += 1;
         }
         let s = d.dag_stats();

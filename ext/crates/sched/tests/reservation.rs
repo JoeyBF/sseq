@@ -1,6 +1,24 @@
 //! Reservation edge cases: holder cancelled, worker loss and join, heartbeats.
 
-use sched::{Config, JobSpec, Policy, Reservations, Resources, Scheduler, WorkerState};
+use sched::{
+    Config, Input, JobId, JobSpec, Output, Policy, Reservations, Resources, Scheduler, WorkerId,
+    WorkerState,
+};
+
+/// The `(job, worker)` of each start in `out`.
+fn starts(out: Vec<Output>) -> Vec<(JobId, WorkerId)> {
+    out.into_iter()
+        .filter_map(|o| match o {
+            Output::Start { job, worker, .. } => Some((job, worker)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The first attempt of `job` finished.
+fn done(job: JobId) -> Input {
+    Input::Done { job, attempt: 1 }
+}
 
 /// A worker of class "x" with the given reported usage.
 fn worker(id: u64, slots: usize, budget: u64, used: u64) -> WorkerState {
@@ -19,15 +37,15 @@ fn job(id: u64, demand: u64, group: u64) -> JobSpec {
 /// most urgent) fits nowhere. After `reserve_after` it reserves a worker.
 fn starving() -> Scheduler {
     let mut p = Scheduler::new(Config::default());
-    p.worker_update(worker(1, 4, 100, 0), 0.0);
-    p.worker_update(worker(2, 4, 100, 0), 0.0);
-    p.submit(job(10, 60, 1), 0.0);
-    p.submit(job(11, 60, 1), 0.0);
-    assert_eq!(p.dispatch(0.0).len(), 2);
-    p.submit(job(1, 50, 0), 1.0);
-    assert!(p.dispatch(1.0).is_empty());
+    p.handle(Input::Worker(worker(1, 4, 100, 0)), 0.0);
+    p.handle(Input::Worker(worker(2, 4, 100, 0)), 0.0);
+    p.handle(Input::Submit(job(10, 60, 1)), 0.0);
+    p.handle(Input::Submit(job(11, 60, 1)), 0.0);
+    assert_eq!(starts(p.poll(0.0)).len(), 2);
+    p.handle(Input::Submit(job(1, 50, 0)), 1.0);
+    assert!(starts(p.poll(1.0)).is_empty());
     assert!(p.stats().reservations.is_empty(), "too early to reserve");
-    assert!(p.dispatch(61.0).is_empty());
+    assert!(starts(p.poll(61.0)).is_empty());
     let r = p.stats().reservations;
     assert_eq!(r.len(), 1);
     assert_eq!(r[0].job, 1);
@@ -45,15 +63,15 @@ fn reserved_worker_admits_only_its_holder() {
     let mut p = starving();
     let w = reserved_worker(&p);
     // A small job fits on both workers but must avoid the reserved one.
-    p.submit(job(20, 5, 2), 62.0);
-    let out = p.dispatch(62.0);
+    p.handle(Input::Submit(job(20, 5, 2)), 62.0);
+    let out = starts(p.poll(62.0));
     assert_eq!(out.len(), 1);
     assert_ne!(out[0].1, w);
     assert!(p.explain(1).unwrap().contains("holds the reservation"));
     // The reserved worker drains; the holder goes there by the escape hatch.
     let running_there = if w == 1 { 10 } else { 11 };
-    p.completed(running_there, 100.0);
-    assert_eq!(p.dispatch(100.0), vec![(1, w)]);
+    p.handle(done(running_there), 100.0);
+    assert_eq!(starts(p.poll(100.0)), vec![(1, w)]);
     assert!(p.stats().reservations.is_empty());
     assert_eq!(p.stats().last_dispatch_holders, vec![1]);
 }
@@ -63,29 +81,54 @@ fn reserved_worker_admits_only_its_holder() {
 fn holder_cancelled_releases_the_worker() {
     let mut p = starving();
     let w = reserved_worker(&p);
-    p.submit(job(20, 5, 2), 62.0);
-    p.submit(job(21, 5, 2), 62.0);
-    p.cancel(1);
+    p.handle(Input::Submit(job(20, 5, 2)), 62.0);
+    p.handle(Input::Submit(job(21, 5, 2)), 62.0);
+    p.handle(Input::Cancel(1), 62.0);
     assert!(p.stats().reservations.is_empty());
     // Both workers take small jobs again (least loaded first: one on each).
-    let out = p.dispatch(62.0);
+    let out = starts(p.poll(62.0));
     assert_eq!(out.len(), 2);
     assert!(out.iter().any(|&(_, x)| x == w));
 }
 
-/// Losing the reserved worker makes the holder reserve another.
+/// Losing the reserved worker fails the job running there; its retry keeps its original place,
+/// which is ahead of the holder, so it reserves the remaining worker and gets it as attempt 2.
 #[test]
-fn reserved_worker_leaves_and_the_holder_reserves_again() {
+fn reserved_worker_leaves_and_its_lost_job_reserves_again() {
     let mut p = starving();
     let w = reserved_worker(&p);
-    p.worker_gone(w, 70.0);
+    let (lost, other) = if w == 1 { (10, 2) } else { (11, 1) };
+    let running_on_other = if other == 1 { 10 } else { 11 };
+    p.handle(Input::WorkerGone(w), 70.0);
     assert!(p.stats().reservations.is_empty());
-    // Still admitted nowhere and still old enough: it reserves the remaining worker.
-    assert!(p.dispatch(70.0).is_empty());
+    assert_eq!(
+        p.stats().waiting,
+        2,
+        "the lost job is requeued, not forgotten"
+    );
+    // Both are admitted nowhere and old enough; the retry is the more urgent (older group).
+    assert!(starts(p.poll(70.0)).is_empty());
     let r = p.stats().reservations;
     assert_eq!(r.len(), 1);
-    assert_eq!(r[0].job, 1);
-    assert_ne!(r[0].worker, w);
+    assert_eq!((r[0].job, r[0].worker), (lost, other));
+    assert!(
+        p.explain(lost)
+            .unwrap()
+            .contains(&format!("failed 1 time(s), last on worker {w} (LinkDied"))
+    );
+    p.handle(done(running_on_other), 100.0);
+    assert_eq!(
+        p.poll(100.0),
+        vec![Output::Start {
+            job: lost,
+            attempt: 2,
+            worker: other
+        }]
+    );
+    // The original holder reserves again once it qualifies.
+    assert!(starts(p.poll(101.0)).is_empty());
+    let r = p.stats().reservations;
+    assert_eq!((r.len(), r[0].job), (1, 1));
 }
 
 /// A new empty worker takes the holder at once and ends the reservation.
@@ -93,8 +136,8 @@ fn reserved_worker_leaves_and_the_holder_reserves_again() {
 fn worker_joins_mid_reservation() {
     let mut p = starving();
     // A fresh, empty worker admits the holder at once (escape hatch); the reservation is released.
-    p.worker_update(worker(3, 4, 100, 0), 80.0);
-    assert_eq!(p.dispatch(80.0), vec![(1, 3)]);
+    p.handle(Input::Worker(worker(3, 4, 100, 0)), 80.0);
+    assert_eq!(starts(p.poll(80.0)), vec![(1, 3)]);
     assert!(p.stats().reservations.is_empty());
     assert!(p.stats().workers.iter().all(|w| w.reserved_for.is_none()));
 }
@@ -105,14 +148,14 @@ fn heartbeat_lowering_usage_admits_the_holder_early() {
     let mut p = starving();
     let w = reserved_worker(&p);
     // Reported usage dominates the placed sum: 95 used, nothing fits.
-    p.worker_update(worker(w, 4, 100, 95), 90.0);
-    assert!(p.dispatch(90.0).is_empty());
+    p.handle(Input::Worker(worker(w, 4, 100, 95)), 90.0);
+    assert!(starts(p.poll(90.0)).is_empty());
     // The heartbeat drops below what is placed (60): 60 + 50 > 100 still refuses ...
-    p.worker_update(worker(w, 4, 100, 10), 91.0);
-    assert!(p.dispatch(91.0).is_empty());
+    p.handle(Input::Worker(worker(w, 4, 100, 10)), 91.0);
+    assert!(starts(p.poll(91.0)).is_empty());
     // ... until the budget grows (e.g. a recalibrated limit): 60 + 50 <= 120.
-    p.worker_update(worker(w, 4, 120, 10), 92.0);
-    assert_eq!(p.dispatch(92.0), vec![(1, w)]);
+    p.handle(Input::Worker(worker(w, 4, 120, 10)), 92.0);
+    assert_eq!(starts(p.poll(92.0)), vec![(1, w)]);
     assert!(p.stats().reservations.is_empty());
 }
 
@@ -120,15 +163,15 @@ fn heartbeat_lowering_usage_admits_the_holder_early() {
 #[test]
 fn heartbeat_raising_usage_blocks_placements() {
     let mut p = Scheduler::new(Config::default());
-    p.worker_update(worker(1, 4, 100, 0), 0.0);
-    p.submit(job(1, 10, 0), 0.0);
-    assert_eq!(p.dispatch(0.0).len(), 1);
-    p.worker_update(worker(1, 4, 100, 95), 1.0);
-    p.submit(job(2, 10, 0), 1.0);
-    assert!(p.dispatch(1.0).is_empty());
+    p.handle(Input::Worker(worker(1, 4, 100, 0)), 0.0);
+    p.handle(Input::Submit(job(1, 10, 0)), 0.0);
+    assert_eq!(starts(p.poll(0.0)).len(), 1);
+    p.handle(Input::Worker(worker(1, 4, 100, 95)), 1.0);
+    p.handle(Input::Submit(job(2, 10, 0)), 1.0);
+    assert!(starts(p.poll(1.0)).is_empty());
     assert!(p.explain(2).unwrap().contains("memory short on 1"));
-    p.worker_update(worker(1, 4, 100, 20), 2.0);
-    assert_eq!(p.dispatch(2.0), vec![(2, 1)]);
+    p.handle(Input::Worker(worker(1, 4, 100, 20)), 2.0);
+    assert_eq!(starts(p.poll(2.0)), vec![(2, 1)]);
 }
 
 /// A holder placed on another worker releases its reservation.
@@ -138,8 +181,8 @@ fn holder_placed_elsewhere_releases_its_reservation() {
     let w = reserved_worker(&p);
     let other = if w == 1 { 2 } else { 1 };
     let running_there = if other == 1 { 10 } else { 11 };
-    p.completed(running_there, 100.0);
-    assert_eq!(p.dispatch(100.0), vec![(1, other)]);
+    p.handle(done(running_there), 100.0);
+    assert_eq!(starts(p.poll(100.0)), vec![(1, other)]);
     assert!(p.stats().reservations.is_empty());
     assert!(p.stats().last_dispatch_holders.is_empty());
 }
@@ -153,8 +196,8 @@ fn more_urgent_job_cannot_take_a_reserved_worker() {
     let mut urgent = job(30, 5, 9);
     urgent.priority = Some(-10);
     urgent.prefer = vec![w];
-    p.submit(urgent, 63.0);
-    let out = p.dispatch(63.0);
+    p.handle(Input::Submit(urgent), 63.0);
+    let out = starts(p.poll(63.0));
     assert_eq!(out.len(), 1);
     assert_ne!(out[0].1, w);
 }
@@ -170,16 +213,19 @@ fn per_class_reservations() {
         ..Config::best_fit()
     });
     for (id, class) in [(1, "a"), (2, "a"), (3, "b"), (4, "b")] {
-        p.worker_update(WorkerState::new(id, class, 4, Resources::mem(100)), 0.0);
+        p.handle(
+            Input::Worker(WorkerState::new(id, class, 4, Resources::mem(100))),
+            0.0,
+        );
     }
     for i in 0..4 {
-        p.submit(job(10 + i, 60, 1), 0.0);
+        p.handle(Input::Submit(job(10 + i, 60, 1)), 0.0);
     }
-    assert_eq!(p.dispatch(0.0).len(), 4);
-    p.submit(job(1, 50, 0), 1.0);
-    p.submit(job(2, 50, 0), 1.0);
-    p.submit(job(3, 50, 0), 1.0);
-    assert!(p.dispatch(100.0).is_empty());
+    assert_eq!(starts(p.poll(0.0)).len(), 4);
+    p.handle(Input::Submit(job(1, 50, 0)), 1.0);
+    p.handle(Input::Submit(job(2, 50, 0)), 1.0);
+    p.handle(Input::Submit(job(3, 50, 0)), 1.0);
+    assert!(starts(p.poll(100.0)).is_empty());
     let r = p.stats().reservations;
     assert_eq!(r.len(), 2, "one per class: {r:?}");
     assert_eq!(r.iter().map(|r| r.job).collect::<Vec<_>>(), vec![1, 2]);
@@ -194,32 +240,32 @@ fn starving_shadow() -> Scheduler {
         }),
         ..Config::default()
     });
-    p.worker_update(worker(1, 4, 100, 0), 0.0);
-    p.worker_update(worker(2, 4, 100, 0), 0.0);
+    p.handle(Input::Worker(worker(1, 4, 100, 0)), 0.0);
+    p.handle(Input::Worker(worker(2, 4, 100, 0)), 0.0);
     for id in [10, 11] {
-        p.submit(
-            JobSpec {
+        p.handle(
+            Input::Submit(JobSpec {
                 work: Some(100.0),
                 ..job(id, 60, 1)
-            },
+            }),
             0.0,
         );
     }
-    assert_eq!(p.dispatch(0.0).len(), 2);
-    p.submit(job(1, 50, 0), 1.0);
-    p.dispatch(1.0);
-    assert!(p.dispatch(61.0).is_empty());
+    assert_eq!(starts(p.poll(0.0)).len(), 2);
+    p.handle(Input::Submit(job(1, 50, 0)), 1.0);
+    starts(p.poll(1.0));
+    assert!(starts(p.poll(61.0)).is_empty());
     assert_eq!(p.stats().reservations.len(), 1);
     // Fill the other worker, so only shadow backfill can place anything more.
     let w = p.stats().reservations[0].worker;
-    p.submit(
-        JobSpec {
+    p.handle(
+        Input::Submit(JobSpec {
             work: Some(1e6),
             ..job(30, 40, 3)
-        },
+        }),
         61.0,
     );
-    assert_eq!(p.dispatch(61.0), vec![(30, if w == 1 { 2 } else { 1 })]);
+    assert_eq!(starts(p.poll(61.0)), vec![(30, if w == 1 { 2 } else { 1 })]);
     p
 }
 
@@ -230,29 +276,29 @@ fn shadow_backfill_admits_jobs_that_end_in_time() {
     let mut p = starving_shadow();
     let w = p.stats().reservations[0].worker;
     // 20 s of work ends at 81 s, before the shadow time 100 s; 50 s would end at 111 s.
-    p.submit(
-        JobSpec {
+    p.handle(
+        Input::Submit(JobSpec {
             work: Some(50.0),
             ..job(21, 5, 2)
-        },
+        }),
         62.0,
     );
-    p.submit(
-        JobSpec {
+    p.handle(
+        Input::Submit(JobSpec {
             work: Some(20.0),
             ..job(20, 5, 2)
-        },
+        }),
         62.0,
     );
-    assert_eq!(p.dispatch(62.0), vec![(20, w)]);
+    assert_eq!(starts(p.poll(62.0)), vec![(20, w)]);
     assert!(
         p.explain(21)
             .unwrap()
             .contains(&format!("worker {w} for job 1"))
     );
     // Unknown work never backfills.
-    p.submit(job(22, 5, 2), 63.0);
-    assert!(p.dispatch(63.0).is_empty());
+    p.handle(Input::Submit(job(22, 5, 2)), 63.0);
+    assert!(starts(p.poll(63.0)).is_empty());
 }
 
 /// Once the shadow time has passed, the reserved worker drains strictly (overrunning jobs can no
@@ -262,24 +308,24 @@ fn shadow_backfill_stops_at_the_shadow_time() {
     let mut p = starving_shadow();
     let w = p.stats().reservations[0].worker;
     // The shadow time is 100 s (the running jobs' expected end): a 1 s job at 95 s fits.
-    p.submit(
-        JobSpec {
+    p.handle(
+        Input::Submit(JobSpec {
             work: Some(1.0),
             ..job(20, 1, 2)
-        },
+        }),
         95.0,
     );
-    assert_eq!(p.dispatch(95.0), vec![(20, w)]);
-    p.completed(20, 96.0);
+    assert_eq!(starts(p.poll(95.0)), vec![(20, w)]);
+    p.handle(done(20), 96.0);
     // The running jobs overrun; from 100 s on, nothing but the holder goes there.
-    p.submit(
-        JobSpec {
+    p.handle(
+        Input::Submit(JobSpec {
             work: Some(0.5),
             ..job(21, 1, 2)
-        },
+        }),
         101.0,
     );
-    assert!(p.dispatch(101.0).is_empty());
+    assert!(starts(p.poll(101.0)).is_empty());
     assert!(
         p.explain(21)
             .unwrap()
