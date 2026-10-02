@@ -1056,6 +1056,18 @@ impl<A: Admission> Engine<A> {
         true
     }
 
+    /// Classes with an unreserved (or backfillable) worker that has a free slot.
+    fn open_classes(&self) -> BTreeSet<String> {
+        self.workers
+            .values()
+            .filter(|w| {
+                w.running < w.state.slots
+                    && (w.reserved_for.is_none() || self.shadows.contains_key(&w.state.id))
+            })
+            .map(|w| w.state.class.clone())
+            .collect()
+    }
+
     /// Component-wise maximum admission bound over unreserved workers with a free slot, or `None`
     /// if no unreserved worker can take anything.
     fn open_bound(&self) -> Option<Resources> {
@@ -1125,6 +1137,7 @@ impl<A: Admission> Engine<A> {
                 break;
             }
             let mut bound = self.open_bound();
+            let mut classes = self.open_classes();
             let mut cursor = Cursor::Aged(None);
             // Deferral records survive a restart (the scan may stop before reaching those jobs
             // again); the slot bookings are rebuilt.
@@ -1136,7 +1149,10 @@ impl<A: Admission> Engine<A> {
                 };
                 let j = &self.waiting[&job];
                 let holder = j.reserved.is_some();
-                let hopeful = holder || bound.is_some_and(|b| j.spec.demand.fits_within(&b));
+                // Cheap pruning: memory bound, and a class pin with no free slot of its class.
+                let hopeful = holder
+                    || (bound.is_some_and(|b| j.spec.demand.fits_within(&b))
+                        && j.spec.class.as_ref().is_none_or(|c| classes.contains(c)));
                 let pick = if hopeful {
                     self.choose(j, gate.as_ref(), &mut proj)
                 } else {
@@ -1162,6 +1178,7 @@ impl<A: Admission> Engine<A> {
                             break 'scan;
                         }
                         bound = self.open_bound();
+                        classes = self.open_classes();
                     }
                     Pick::Nothing => {
                         // A job kept off slow workers only by the gate is not starving: it waits
@@ -1186,6 +1203,7 @@ impl<A: Admission> Engine<A> {
                                 continue 'scan;
                             }
                             bound = self.open_bound();
+                            classes = self.open_classes();
                         }
                     }
                 }
