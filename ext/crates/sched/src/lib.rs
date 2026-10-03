@@ -579,7 +579,7 @@ pub enum Output {
         /// The job.
         job: JobId,
     },
-    /// A passthrough job (or an instance's `done` job) completed (with
+    /// A passthrough job, or a unit other than a plain job, completed (with
     /// [`DagConfig::record_passthrough`]).
     Passed {
         /// The job.
