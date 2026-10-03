@@ -96,10 +96,7 @@ fn unit(t: &Arc<DagTemplate>, k: u64, deps: Vec<JobId>) -> Unit {
 
 /// A DAG layer over an [`Immediate`] policy.
 fn layer(run: bool) -> DagScheduler<Immediate> {
-    let config = DagConfig {
-        rank_priority: true,
-        ..DagConfig::default()
-    };
+    let config = DagConfig::default();
     let policy = Immediate {
         run,
         queue: Vec::new(),

@@ -10,7 +10,7 @@ use crate::Timing;
 /// completion time, Jackson's rule for maximum lateness); on many machines, with resources and
 /// online arrivals, every one of them is a heuristic.
 ///
-/// - [`Default`]: makespan with bounded latency. Explicit priority, rank, group, then arrival;
+/// - [`Default`]: makespan with bounded latency. Explicit priority, group, then arrival;
 ///   aging and one reservation; fastest, preferred, then least loaded worker.
 /// - [`Config::fifo`]: arrival order, no aging or reservations. A baseline.
 /// - [`Config::best_fit`]: the default, packing each job into the tightest worker.
@@ -46,11 +46,11 @@ pub struct Config {
 }
 
 impl Default for Config {
-    /// Order `[Priority, Rank, Group]`, [`DEFAULT_AGE_LIMIT`], one reservation, score `[Speed,
+    /// Order `[Priority, Group]`, [`DEFAULT_AGE_LIMIT`], one reservation, score `[Speed,
     /// Preferred, Load]`, default retries.
     fn default() -> Self {
         Self {
-            order: vec![OrderTerm::Priority, OrderTerm::Rank, OrderTerm::Group],
+            order: vec![OrderTerm::Priority, OrderTerm::Group],
             group_order: GroupOrder::Arrival,
             default_priority: 0,
             age_limit: Some(DEFAULT_AGE_LIMIT),

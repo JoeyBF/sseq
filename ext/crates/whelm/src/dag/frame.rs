@@ -71,7 +71,8 @@ impl Frame {
 }
 
 /// Bottom levels of `t`'s nodes placed at leaf `leaf0` of sourced unit `unit`, before the unit's
-/// scale: a substituted unit weighs its own critical path.
+/// scale: a substituted unit weighs its own critical path, a leaf the source makes a passthrough
+/// nothing.
 pub(super) fn sourced_bottom_levels(
     src: &dyn NodeSource,
     unit: JobId,
@@ -84,6 +85,7 @@ pub(super) fn sourced_bottom_levels(
             TemplateNode::Unit(sub) => sourced_bottom_levels(src, unit, sub, leaf)
                 .into_iter()
                 .fold(0.0, f64::max),
+            _ if src.passthrough(unit, leaf) => 0.0,
             _ => src.work(unit, leaf),
         }
     })
@@ -286,8 +288,15 @@ impl<P: Policy> DagScheduler<P> {
     /// complete a passthrough, or enter a substituted unit.
     fn node_ready(&mut self, f: u32, i: usize, now: Instant) {
         let frame = self.frame(f);
-        let job = frame.base + frame.template.leaf_offset(i) as JobId;
+        let offset = frame.template.leaf_offset(i);
+        let job = frame.base + offset as JobId;
+        let rec = self.unit(frame.unit);
         match frame.template.node(i) {
+            TemplateNode::Job(_) | TemplateNode::Local(_)
+                if rec.sourced && self.src().passthrough(rec.id, frame.leaf0 + offset as u32) =>
+            {
+                self.pass(f, i, job)
+            }
             TemplateNode::Job(_) if self.config.auto_submit => self.submit(f, i, now),
             TemplateNode::Job(_) => {
                 self.frame_mut(f).counter[i] = HELD;
@@ -297,12 +306,7 @@ impl<P: Policy> DagScheduler<P> {
                 self.frame_mut(f).counter[i] = HELD;
                 self.outbox.push(Output::RunLocal { job });
             }
-            TemplateNode::Pass(_) => {
-                if self.config.record_passthrough {
-                    self.outbox.push(Output::Passed { job });
-                }
-                self.complete_node(f, i);
-            }
+            TemplateNode::Pass(_) => self.pass(f, i, job),
             TemplateNode::Unit(_) => {
                 let (template, base, leaf0, tail) = self.child_frame(f, i);
                 self.frame_mut(f).counter[i] = OPEN;
@@ -311,6 +315,14 @@ impl<P: Policy> DagScheduler<P> {
                 self.frame_mut(f).children.push((i as u32, child));
             }
         }
+    }
+
+    /// Complete node `i` of frame `f`, job `job`, a ready passthrough.
+    fn pass(&mut self, f: u32, i: usize, job: JobId) {
+        if self.config.record_passthrough {
+            self.outbox.push(Output::Passed { job });
+        }
+        self.complete_node(f, i);
     }
 
     /// Mark node `i` of frame `f` complete and queue what that releases.
@@ -382,7 +394,7 @@ impl<P: Policy> DagScheduler<P> {
             };
             spec.work = Some(rec.scale * own);
         }
-        if self.config.rank_priority && spec.rank.is_none() {
+        if self.config.track_ranks && spec.rank.is_none() {
             spec.rank = Some(self.node_rank(f, i));
         }
         if rec.sourced {

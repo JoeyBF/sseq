@@ -4,8 +4,8 @@ use std::{collections::BTreeMap, sync::Arc};
 
 use proptest::prelude::*;
 use whelm::{
-    Config, DagConfig, DagError, DagJob, DagScheduler, DagTemplate, Input, JobId, JobSpec, Output,
-    Policy, Resources, Scheduler, TemplateNode, Unit, WorkerId, WorkerState,
+    Config, DagConfig, DagError, DagJob, DagScheduler, DagTemplate, Input, JobId, JobSpec,
+    NodeSource, Output, Policy, Resources, Scheduler, TemplateNode, Unit, WorkerId, WorkerState,
 };
 
 /// A DAG layer over one 64-slot worker.
@@ -79,6 +79,59 @@ fn passthrough_jobs_complete_by_themselves() {
     };
     assert_eq!(d.poll(1.0), vec![Output::Passed { job: 2 }, start]);
     assert_eq!(d.stats().placements_total, 2);
+}
+
+/// Leaf `k` of a sourced unit weighs `k + 1`; leaf 1 of unit 10 does nothing.
+struct SkipOne;
+
+impl NodeSource for SkipOne {
+    /// `leaf + 1`.
+    fn work(&self, _unit: JobId, leaf: u32) -> f64 {
+        f64::from(leaf) + 1.0
+    }
+
+    /// Leaf 1 of unit 10 only.
+    fn passthrough(&self, unit: JobId, leaf: u32) -> bool {
+        (unit, leaf) == (10, 1)
+    }
+}
+
+/// A source makes a leaf a passthrough in one unit of a template and not in another, in ranks
+/// and in what runs.
+#[test]
+fn a_source_makes_a_leaf_a_passthrough_in_one_unit() {
+    let mut d = dag(DagConfig {
+        record_passthrough: true,
+        ..DagConfig::default()
+    })
+    .with_source(Arc::new(SkipOne));
+    // A chain: job, local job, job.
+    let nodes = vec![
+        TemplateNode::Job(1.0),
+        TemplateNode::Local(1.0),
+        TemplateNode::Job(1.0),
+    ];
+    let t = Arc::new(DagTemplate::with_nodes(nodes, [(0, 1), (1, 2)]).unwrap());
+    let spec = JobSpec::new(0, Resources::mem(1), 0);
+    let unit = |id, base| Unit::new(id, base, t.clone(), spec.clone(), vec![]).sourced();
+    d.declare([unit(10, 100), unit(20, 200)], 0.0).unwrap();
+    assert_eq!(d.rank(100), Some(1.0 + 3.0), "the no-op weighs nothing");
+    assert_eq!(d.rank(200), Some(1.0 + 2.0 + 3.0));
+    assert_eq!(placed(&mut d, 0.0), vec![100, 200]);
+    complete(&mut d, 100, 1.0);
+    complete(&mut d, 200, 1.0);
+    assert_eq!(
+        d.poll(1.0),
+        vec![
+            Output::Passed { job: 101 },
+            Output::RunLocal { job: 201 },
+            Output::Start {
+                job: 102,
+                attempt: 1,
+                worker: 0
+            },
+        ]
+    );
 }
 
 /// A 200,000-long chain of passthroughs completes without recursing.

@@ -179,6 +179,15 @@ pub trait NodeSource: Send + Sync {
     /// not change meanwhile.
     fn work(&self, unit: JobId, leaf: u32) -> f64;
 
+    /// Whether leaf `leaf` of unit `unit` does nothing in that unit, though other units of the
+    /// template may run it: it then acts as a [`TemplateNode::Pass`] of no work, completing by
+    /// itself once ready (announced by [`Output::Passed`] with
+    /// [`DagConfig::record_passthrough`]), and `work` is not read for it. Read when `work` is, so
+    /// it must not change meanwhile either. Default: no leaf.
+    fn passthrough(&self, _unit: JobId, _leaf: u32) -> bool {
+        false
+    }
+
     /// Finish the spec of leaf `leaf` of unit `unit` before it is submitted (e.g. its demand). It
     /// arrives as the unit's spec with the leaf's id, work and rank. Default: unchanged.
     fn spec(&self, _unit: JobId, _leaf: u32, _spec: &mut JobSpec) {}
@@ -237,9 +246,6 @@ impl std::error::Error for DagError {}
 #[derive(Clone, Debug, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct DagConfig {
-    /// Submit each job with its upward rank (the critical path below it) as [`JobSpec::rank`],
-    /// unless it has one, for [`OrderTerm::Rank`](crate::OrderTerm::Rank). Default false.
-    pub rank_priority: bool,
     /// Scale of a unit declared without one, i.e. the work of a [`DagJob`] without an estimate.
     /// Default 1.
     pub default_work: f64,
@@ -256,9 +262,11 @@ pub struct DagConfig {
     /// [`Output::Passed`]. Default false.
     #[cfg_attr(feature = "serde", serde(default))]
     pub record_passthrough: bool,
-    /// Maintain units' ranks as the graph grows and work changes. Ranks are needed by
-    /// `rank_priority` and [`DagScheduler::rank`]; without them, declaring and re-estimating skip
-    /// all rank propagation, which on long dependency chains is most of the cost. Default true.
+    /// Maintain units' ranks as the graph grows and work changes, and submit each job with its
+    /// upward rank (the critical path below it) as [`JobSpec::rank`] unless it has one. Whether
+    /// ranks order anything is up to the policy ([`OrderTerm::Rank`](crate::OrderTerm::Rank)).
+    /// Without them, declaring and re-estimating skip all rank propagation, which on long
+    /// dependency chains is most of the cost. Default true.
     #[cfg_attr(feature = "serde", serde(default = "yes"))]
     pub track_ranks: bool,
 }
@@ -273,7 +281,6 @@ impl Default for DagConfig {
     /// The defaults documented on each field.
     fn default() -> Self {
         Self {
-            rank_priority: false,
             default_work: 1.0,
             rank_epsilon: 0.01,
             auto_submit: true,
@@ -425,7 +432,7 @@ pub struct DagStats {
 /// inner policy when its last dependency completes. Inputs go to the inner policy; an
 /// [`Input::Done`] of a live attempt also completes the job here. [`Policy::poll`] returns the
 /// inner policy's outputs and this layer's own: [`Output::RunLocal`], [`Output::Ready`] and
-/// [`Output::Passed`].
+/// [`Output::Passed`], which [`announcements`](Self::announcements) drains alone.
 ///
 /// A job the inner policy gives up on ([`Output::GaveUp`], passed through) is held again: its
 /// dependents stay pending until the caller [`release`](Self::release)s it (another round of
@@ -787,6 +794,15 @@ impl<P: Policy> DagScheduler<P> {
         }
         self.settle(now);
         Ok(())
+    }
+
+    /// Drain this layer's own announcements ([`Output::RunLocal`], [`Output::Ready`] and
+    /// [`Output::Passed`]) without polling the inner policy, so the caller can act on them
+    /// (release, declare, close) before anything is placed in the same instant. The next
+    /// [`poll`](Policy::poll) returns the announcements made since, in order, ahead of the inner
+    /// policy's outputs.
+    pub fn announcements(&mut self) -> Vec<Output> {
+        std::mem::take(&mut self.outbox)
     }
 
     /// Submit a ready, held job to the policy (only meaningful without `auto_submit`). Returns
@@ -1193,7 +1209,7 @@ impl<P: Policy> Policy for DagScheduler<P> {
         }
     }
 
-    /// This layer's announcements, then the inner policy's outputs.
+    /// This layer's announcements not yet drained, then the inner policy's outputs.
     fn poll(&mut self, now: Instant) -> Vec<Output> {
         self.now = now;
         let inner = self.policy.poll(now);
@@ -1399,6 +1415,30 @@ mod tests {
         d.declare(vec![job(4, &[])], 3.0).unwrap();
         assert_eq!(d.cancel(4), vec![4]);
         assert!(d.poll(3.0).is_empty());
+    }
+
+    /// `announcements` drains the layer's own outputs without placing anything; the next poll
+    /// places, and returns only what was announced since.
+    #[test]
+    fn announcements_come_before_placement() {
+        let config = DagConfig {
+            auto_submit: false,
+            ..DagConfig::default()
+        };
+        let mut d = dag(config, 4);
+        d.declare(vec![job(1, &[]), job(2, &[]), job(3, &[1])], 0.0)
+            .unwrap();
+        assert_eq!(
+            d.announcements(),
+            vec![Output::Ready { job: 1 }, Output::Ready { job: 2 }]
+        );
+        assert!(d.announcements().is_empty());
+        // Job 2 is released first, so it takes the one slot.
+        assert!(d.release(2, 0.0) && d.release(1, 0.0));
+        assert_eq!(d.poll(0.0), vec![start(2, 1)]);
+        d.handle(done(2, 1), 1.0);
+        d.declare(vec![job(4, &[])], 1.0).unwrap();
+        assert_eq!(d.poll(1.0), vec![Output::Ready { job: 4 }, start(1, 1)]);
     }
 
     /// Passthrough jobs and units are announced when recorded; a plain job's unit is not.

@@ -1984,10 +1984,10 @@ mod tests {
         assert_eq!(run_order(Config::lateness(), jobs), vec![2, 1, 0]);
     }
 
-    /// The default order: explicit priority, then rank (largest first), then group arrival; a
-    /// repeated term changes nothing.
+    /// The default order: explicit priority, then group arrival, ranks ignored; with
+    /// [`OrderTerm::Rank`] between them, largest rank first. A repeated term changes nothing.
     #[test]
-    fn default_order_is_priority_rank_group() {
+    fn default_order_is_priority_group() {
         let spec = |id, group, priority, rank| JobSpec {
             priority,
             rank,
@@ -2001,12 +2001,17 @@ mod tests {
                 spec(3, 5, Some(-1), None),
             ]
         };
-        assert_eq!(run_order(Config::default(), jobs()), vec![3, 2, 1, 0]);
+        assert_eq!(run_order(Config::default(), jobs()), vec![3, 0, 1, 2]);
         let mut repeated = Config::default();
         repeated
             .order
             .extend([OrderTerm::Priority, OrderTerm::Group]);
-        assert_eq!(run_order(repeated, jobs()), vec![3, 2, 1, 0]);
+        assert_eq!(run_order(repeated, jobs()), vec![3, 0, 1, 2]);
+        let ranked = Config {
+            order: vec![OrderTerm::Priority, OrderTerm::Rank, OrderTerm::Group],
+            ..Config::default()
+        };
+        assert_eq!(run_order(ranked, jobs()), vec![3, 2, 1, 0]);
         // Group before rank: the older group first.
         let group_first = Config {
             order: vec![OrderTerm::Group, OrderTerm::Rank],

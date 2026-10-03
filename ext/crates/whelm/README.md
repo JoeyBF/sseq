@@ -120,7 +120,7 @@ next time a poll is needed without any input.
 
 | preset | objective | order | score | aging, reservations |
 |---|---|---|---|---|
-| `Config::default()` | makespan, bounded latency | priority, rank, group | speed, preferred, load | yes |
+| `Config::default()` | makespan, bounded latency | priority, group | speed, preferred, load | yes |
 | [`Config::fifo`] | baseline | arrival | preferred, load | no |
 | [`Config::best_fit`] | packing | as default | speed, tightest, preferred, load | yes |
 | [`Config::weighted_completion`] | Σ wC | priority, WSPT | as default | yes |
@@ -252,21 +252,23 @@ one-node template. A unit's leaf `k` is job `base + k`; other units depend on it
   submitted to the inner policy as soon as its last dependency completes.
 - **Per-leaf data.** Leaf work, demands and labels come from the template and the unit's spec and
   scale or, for a [`sourced`](Unit::sourced()) unit, from the scheduler's [`NodeSource`],
-  computed on demand rather than stored.
+  computed on demand rather than stored. The source can also make a leaf a no-op in one unit
+  ([`NodeSource::passthrough`]), so units of one template differ in which leaves run.
 - **Resume and close.** A unit can be declared with leaves already complete
   ([`Unit::with_completed`], e.g. from a checkpoint) and closed early
   ([`close`](DagScheduler::close)): unstarted jobs complete as no-ops, and running ones keep their
   resources until their attempt ends.
 - **Ranks.** Upward ranks (a job's work plus the longest chain of work below it, through the
   enclosing units and their dependents) are exact within a unit and maintained between units to
-  within [`DagConfig::rank_epsilon`]. With [`DagConfig::rank_priority`], jobs are submitted with
-  their [`rank`](JobSpec::rank), which [`OrderTerm::Rank`] orders by;
+  within [`DagConfig::rank_epsilon`]. Jobs are submitted with their [`rank`](JobSpec::rank),
+  which orders them only where [`Config::order`] lists [`OrderTerm::Rank`];
   [`update_work`](DagScheduler::update_work) rescales a unit later.
 - **Outputs.** A ready local job is announced by [`Output::RunLocal`] and reported with
   [`Input::Done`] and attempt 0. Without [`DagConfig::auto_submit`], ready jobs are announced by
   [`Output::Ready`] and submitted by [`release`](DagScheduler::release). With
   [`DagConfig::record_passthrough`], completed passthroughs and units other than plain jobs are
-  announced by [`Output::Passed`].
+  announced by [`Output::Passed`]. [`announcements`](DagScheduler::announcements) drains these
+  alone, so the caller can react before anything is placed.
 - **Give-ups and cancellation.** A job the inner policy gives up on is held again: its dependents
   wait until the caller releases it (another round of attempts) or cancels it.
   [`cancel`](DagScheduler::cancel) and [`Input::Cancel`] cascade to every dependent.

@@ -5,8 +5,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use proptest::prelude::*;
 use whelm::{
-    Attempt, Config, DagConfig, DagError, DagJob, DagScheduler, Input, JobId, JobSpec, Output,
-    Policy, Resources, RetryConfig, Scheduler, WorkerState,
+    Attempt, Config, DagConfig, DagError, DagJob, DagScheduler, Input, JobId, JobSpec, OrderTerm,
+    Output, Policy, Resources, RetryConfig, Scheduler, WorkerState,
 };
 
 /// A DAG layer over backfill with one roomy worker.
@@ -180,10 +180,7 @@ fn cancel_cascades_to_dependents() {
 /// Upward ranks follow the longest descendant chain.
 #[test]
 fn ranks_follow_the_critical_path() {
-    let mut d = dag(DagConfig {
-        rank_priority: true,
-        ..DagConfig::default()
-    });
+    let mut d = dag(DagConfig::default());
     let w = |id, deps: &[JobId], work| DagJob {
         work_estimate: Some(work),
         ..job(id, deps)
@@ -199,29 +196,36 @@ fn ranks_follow_the_critical_path() {
     assert_eq!(d.rank(99), None);
 }
 
-/// With rank priority, the job heading the longer chain runs first.
+/// With [`OrderTerm::Rank`] in the order, the job heading the longer chain runs first; without
+/// it, ranks are carried but order nothing.
 #[test]
-fn rank_priority_orders_ready_jobs() {
-    // One slot: the ready job with the longer chain below it goes first.
-    let mut d = DagScheduler::new(
-        DagConfig {
-            rank_priority: true,
-            ..DagConfig::default()
-        },
-        Scheduler::new(Config::default()),
-    );
-    join(
-        &mut d,
-        WorkerState::new(0, "x", 1, Resources::mem(1000)),
-        0.0,
-    );
-    let w = |id, deps: &[JobId], work| DagJob {
-        work_estimate: Some(work),
-        ..job(id, deps)
-    };
-    d.declare(vec![w(1, &[], 1.0), w(2, &[], 1.0), w(3, &[2], 50.0)], 0.0)
-        .unwrap();
-    assert_eq!(placed(&mut d, 0.0), vec![2]);
+fn the_rank_term_orders_ready_jobs() {
+    for (order, first) in [
+        (
+            vec![OrderTerm::Priority, OrderTerm::Rank, OrderTerm::Group],
+            2,
+        ),
+        (Config::default().order, 1),
+    ] {
+        // One slot: only the first job in order is placed.
+        let policy = Scheduler::new(Config {
+            order,
+            ..Config::default()
+        });
+        let mut d = DagScheduler::new(DagConfig::default(), policy);
+        join(
+            &mut d,
+            WorkerState::new(0, "x", 1, Resources::mem(1000)),
+            0.0,
+        );
+        let w = |id, deps: &[JobId], work| DagJob {
+            work_estimate: Some(work),
+            ..job(id, deps)
+        };
+        d.declare(vec![w(1, &[], 1.0), w(2, &[], 1.0), w(3, &[2], 50.0)], 0.0)
+            .unwrap();
+        assert_eq!(placed(&mut d, 0.0), vec![first]);
+    }
 }
 
 /// Without auto-submit, ready jobs are announced and wait for `release`.

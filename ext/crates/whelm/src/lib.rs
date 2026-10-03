@@ -248,7 +248,7 @@ pub struct JobSpec {
     /// more urgent. Jobs without one count as [`Config::default_priority`].
     pub priority: Option<i64>,
     /// Upward rank: the job's work plus the longest chain of work below it. Set by the DAG layer
-    /// ([`DagConfig::rank_priority`]); larger is more urgent ([`OrderTerm::Rank`]).
+    /// ([`DagConfig::track_ranks`]); larger is more urgent ([`OrderTerm::Rank`]).
     #[cfg_attr(feature = "serde", serde(default))]
     pub rank: Option<f64>,
     /// Weight in a weighted objective ([`OrderTerm::Wspt`]). Default 1.

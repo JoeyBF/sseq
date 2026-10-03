@@ -35,13 +35,19 @@ impl Rng {
     }
 }
 
-/// Leaf work of sourced units: a fixed function of the unit and the leaf.
+/// Leaf work of sourced units, and which of their leaves do nothing: fixed functions of the unit
+/// and the leaf.
 struct Works;
 
 impl NodeSource for Works {
     /// Between 0 and 2.
     fn work(&self, unit: JobId, leaf: u32) -> f64 {
         ((unit * 31 + u64::from(leaf) * 7) % 5) as f64 * 0.5
+    }
+
+    /// About one leaf in four, differing between units of a template.
+    fn passthrough(&self, unit: JobId, leaf: u32) -> bool {
+        (unit * 13 + u64::from(leaf) * 5).is_multiple_of(4)
     }
 }
 
@@ -97,6 +103,11 @@ impl UnitDecl {
             } else {
                 own
             }
+    }
+
+    /// Whether the source makes leaf `leaf` a passthrough.
+    fn passes(&self, leaf: u32) -> bool {
+        self.sourced && Works.passthrough(self.id, leaf)
     }
 }
 
@@ -310,7 +321,11 @@ impl Reference {
                         TemplateNode::Pass(w) => (Kind::Pass, w),
                         TemplateNode::Unit(_) => unreachable!(),
                     };
-                    let node = self.push(kind, Some(id), u.work(leaf, own), deps, k);
+                    let (kind, work) = match u.passes(leaf) {
+                        true => (Kind::Pass, 0.0),
+                        false => (kind, u.work(leaf, own)),
+                    };
+                    let node = self.push(kind, Some(id), work, deps, k);
                     self.by_id.insert(id, node);
                     node
                 }
@@ -434,7 +449,6 @@ fn set(out: Vec<Output>) -> BTreeSet<Ann> {
 fn scheduler(eps: f64) -> DagScheduler<Scheduler> {
     let config = DagConfig {
         auto_submit: false,
-        rank_priority: true,
         record_passthrough: true,
         rank_epsilon: eps,
         ..DagConfig::default()
@@ -478,7 +492,8 @@ proptest! {
     #![proptest_config(ProptestConfig::with_cases(512))]
 
     /// Random hierarchies of units (templates substituted up to three deep, sourced and scaled
-    /// work, leaves declared complete, plain jobs among them), declared in random batches and
+    /// work, leaves the source makes passthroughs, leaves declared complete, plain jobs among
+    /// them), declared in random batches and
     /// orders (so forward references abound), then run in a random order with a unit closed early
     /// and a snapshot restored at random points: every event announces exactly what the fully
     /// expanded graph makes ready, and every announced job's rank is its longest path there
