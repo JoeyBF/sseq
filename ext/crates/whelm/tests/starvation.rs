@@ -41,7 +41,7 @@ fn run(p: &mut dyn Policy, s: &Stream) -> Option<Duration> {
                 budget: Resources::mem(s.budget),
                 ..Default::default()
             }),
-            Time::ZERO,
+            Time::ORIGIN,
         );
     }
     // Running attempts: job -> (attempt, end).
@@ -49,7 +49,7 @@ fn run(p: &mut dyn Policy, s: &Stream) -> Option<Duration> {
     let mut duration: BTreeMap<u64, u64> = BTreeMap::new();
     let mut next = 0u64;
     let mut big_submitted = false;
-    let mut t = Time::ZERO;
+    let mut t = Time::ORIGIN;
     while t < s.horizon {
         // Keep a few small jobs waiting at all times, each in a new (younger) group.
         let waiting = p.stats().waiting;
@@ -127,8 +127,8 @@ fn fifo_starves_and_backfill_does_not() {
         budget: 100,
         small: vec![(12, 40), (15, 55), (9, 25), (14, 60)],
         big_demand: 70,
-        big_at: Time::from_secs(30),
-        horizon: Time::from_secs(5_000),
+        big_at: Time(Duration::from_secs(30)),
+        horizon: Time(Duration::from_secs(5_000)),
     };
     assert_eq!(
         run(&mut Scheduler::new(Config::fifo()), &s),
@@ -157,7 +157,7 @@ proptest! {
         big_demand in 41u64..250,
         big_at_ms in 0u64..200_000,
     ) {
-        let (big_at, horizon) = (Time::from_millis(big_at_ms), Time::from_secs(2_000));
+        let (big_at, horizon) = (Time(Duration::from_millis(big_at_ms)), Time(Duration::from_secs(2_000)));
         let s = Stream { workers, slots, budget: 100, small, big_demand, big_at, horizon };
         let d = Duration::from_secs(s.small.iter().map(|x| x.1).max().unwrap());
         for (name, mut p) in policies() {

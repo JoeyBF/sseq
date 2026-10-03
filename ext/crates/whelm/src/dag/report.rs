@@ -23,14 +23,14 @@ use crate::{JobId, Policy};
 ///     deps,
 ///     ..Default::default()
 /// };
-/// dag.declare([job(2, vec![1])], Time::ZERO).unwrap();
+/// dag.declare([job(2, vec![1])], Time::ORIGIN).unwrap();
 /// let s = dag.dag_stats();
 /// assert_eq!(
 ///     (s.units, s.undeclared, s.edges, s.pending, s.frames),
 ///     (1, 1, 1, 1, 0)
 /// );
 ///
-/// dag.declare([job(1, vec![])], Time::ZERO).unwrap();
+/// dag.declare([job(1, vec![])], Time::ORIGIN).unwrap();
 /// let s = dag.dag_stats();
 /// assert_eq!(
 ///     (s.units, s.open, s.undeclared, s.pending, s.submitted),

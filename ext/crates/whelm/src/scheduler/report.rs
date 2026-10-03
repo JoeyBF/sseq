@@ -116,7 +116,7 @@ impl Scheduler {
             Some(Hold::Defer { worker, at, .. }) => {
                 msg += &format!(
                     "; waiting for faster worker {worker} (expected free at t={:.0})",
-                    at.as_secs_f64()
+                    at.0.as_secs_f64()
                 );
             }
             None => {}

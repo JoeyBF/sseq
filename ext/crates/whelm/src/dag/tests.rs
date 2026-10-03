@@ -17,7 +17,7 @@ fn dag(config: DagConfig, max_attempts: u32) -> DagScheduler<Scheduler> {
             ..Config::fifo()
         }),
     );
-    d.handle(Input::Worker(worker(1)), Time::ZERO);
+    d.handle(Input::Worker(worker(1)), Time::ORIGIN);
     d
 }
 
@@ -110,14 +110,14 @@ fn unit(id: JobId, base: JobId, len: usize, deps: &[JobId]) -> Unit {
 #[test]
 fn done_releases_dependents() {
     let mut d = dag(DagConfig::default(), 4);
-    d.declare(vec![job(1, &[]), job(2, &[1])], Time::ZERO)
+    d.declare(vec![job(1, &[]), job(2, &[1])], Time::ORIGIN)
         .unwrap();
-    assert_eq!(d.poll(Time::ZERO), vec![start(1, 1)]);
+    assert_eq!(d.poll(Time::ORIGIN), vec![start(1, 1)]);
     assert_eq!(
-        feed(&mut d, Time::from_secs(1), [done(1, 1)]),
+        feed(&mut d, Time(Duration::from_secs(1)), [done(1, 1)]),
         vec![start(2, 1)]
     );
-    assert!(feed(&mut d, Time::from_secs(2), [done(2, 1)]).is_empty());
+    assert!(feed(&mut d, Time(Duration::from_secs(2)), [done(2, 1)]).is_empty());
     let st = d.dag_stats();
     assert_eq!(
         (st.pending, st.submitted, st.completed_remembered),
@@ -130,17 +130,17 @@ fn done_releases_dependents() {
 #[test]
 fn stale_done_does_not_complete() {
     let mut d = dag(DagConfig::default(), 4);
-    d.declare(vec![job(1, &[]), job(2, &[1])], Time::ZERO)
+    d.declare(vec![job(1, &[]), job(2, &[1])], Time::ORIGIN)
         .unwrap();
-    d.poll(Time::ZERO);
+    d.poll(Time::ORIGIN);
     assert_eq!(
-        feed(&mut d, Time::from_secs(1), [fail(1, 1)]),
+        feed(&mut d, Time(Duration::from_secs(1)), [fail(1, 1)]),
         vec![start(1, 2)]
     );
-    assert!(feed(&mut d, Time::from_secs(2), [done(1, 1)]).is_empty());
+    assert!(feed(&mut d, Time(Duration::from_secs(2)), [done(1, 1)]).is_empty());
     assert_eq!(d.dag_stats().pending, 1);
     assert_eq!(
-        feed(&mut d, Time::from_secs(3), [done(1, 2)]),
+        feed(&mut d, Time(Duration::from_secs(3)), [done(1, 2)]),
         vec![start(2, 1)]
     );
 }
@@ -150,18 +150,18 @@ fn stale_done_does_not_complete() {
 #[test]
 fn worker_gone_retries() {
     let mut d = dag(DagConfig::default(), 4);
-    d.declare(vec![job(1, &[]), job(2, &[1])], Time::ZERO)
+    d.declare(vec![job(1, &[]), job(2, &[1])], Time::ORIGIN)
         .unwrap();
-    d.poll(Time::ZERO);
-    assert!(feed(&mut d, Time::from_secs(1), [Input::WorkerGone(1)]).is_empty());
-    assert!(feed(&mut d, Time::from_secs(2), [done(1, 1)]).is_empty());
+    d.poll(Time::ORIGIN);
+    assert!(feed(&mut d, Time(Duration::from_secs(1)), [Input::WorkerGone(1)]).is_empty());
+    assert!(feed(&mut d, Time(Duration::from_secs(2)), [done(1, 1)]).is_empty());
     let w = worker(1);
     assert_eq!(
-        feed(&mut d, Time::from_secs(3), [Input::Worker(w)]),
+        feed(&mut d, Time(Duration::from_secs(3)), [Input::Worker(w)]),
         vec![start(1, 2)]
     );
     assert_eq!(
-        feed(&mut d, Time::from_secs(4), [done(1, 2)]),
+        feed(&mut d, Time(Duration::from_secs(4)), [done(1, 2)]),
         vec![start(2, 1)]
     );
 }
@@ -170,15 +170,15 @@ fn worker_gone_retries() {
 #[test]
 fn local_jobs_run_on_the_caller() {
     let mut d = dag(DagConfig::default(), 4);
-    d.declare(vec![local(1, &[]), job(2, &[1])], Time::ZERO)
+    d.declare(vec![local(1, &[]), job(2, &[1])], Time::ORIGIN)
         .unwrap();
-    assert_eq!(d.poll(Time::ZERO), vec![Output::RunLocal { job: 1 }]);
+    assert_eq!(d.poll(Time::ORIGIN), vec![Output::RunLocal { job: 1 }]);
     assert_eq!(d.stats().waiting, 0);
-    assert!(!d.release(1, Time::ZERO));
+    assert!(!d.release(1, Time::ORIGIN));
     // Attempt numbers of workers' jobs do not complete a local job.
-    assert!(feed(&mut d, Time::from_secs(1), [done(1, 1)]).is_empty());
+    assert!(feed(&mut d, Time(Duration::from_secs(1)), [done(1, 1)]).is_empty());
     assert_eq!(
-        feed(&mut d, Time::from_secs(1), [done(1, 0)]),
+        feed(&mut d, Time(Duration::from_secs(1)), [done(1, 0)]),
         vec![start(2, 1)]
     );
 }
@@ -191,23 +191,24 @@ fn held_jobs_are_announced() {
         ..DagConfig::default()
     };
     let mut d = dag(config, 4);
-    d.declare(vec![job(1, &[]), job(2, &[1]), job(3, &[])], Time::ZERO)
+    d.declare(vec![job(1, &[]), job(2, &[1]), job(3, &[])], Time::ORIGIN)
         .unwrap();
     assert_eq!(
-        d.poll(Time::ZERO),
+        d.poll(Time::ORIGIN),
         vec![Output::Ready { job: 1 }, Output::Ready { job: 3 }]
     );
-    assert!(d.release(1, Time::from_secs(1)));
-    assert!(!d.release(1, Time::from_secs(1)));
-    assert_eq!(d.poll(Time::from_secs(1)), vec![start(1, 1)]);
+    assert!(d.release(1, Time(Duration::from_secs(1))));
+    assert!(!d.release(1, Time(Duration::from_secs(1))));
+    assert_eq!(d.poll(Time(Duration::from_secs(1))), vec![start(1, 1)]);
     assert_eq!(
-        feed(&mut d, Time::from_secs(2), [done(1, 1)]),
+        feed(&mut d, Time(Duration::from_secs(2)), [done(1, 1)]),
         vec![Output::Ready { job: 2 }]
     );
     // Cancelling withdraws an announcement not yet polled.
-    d.declare(vec![job(4, &[])], Time::from_secs(3)).unwrap();
+    d.declare(vec![job(4, &[])], Time(Duration::from_secs(3)))
+        .unwrap();
     assert_eq!(d.cancel(4), vec![4]);
-    assert!(d.poll(Time::from_secs(3)).is_empty());
+    assert!(d.poll(Time(Duration::from_secs(3))).is_empty());
 }
 
 /// `announcements` drains the layer's own outputs without placing anything; the next poll
@@ -219,7 +220,7 @@ fn announcements_come_before_placement() {
         ..DagConfig::default()
     };
     let mut d = dag(config, 4);
-    d.declare(vec![job(1, &[]), job(2, &[]), job(3, &[1])], Time::ZERO)
+    d.declare(vec![job(1, &[]), job(2, &[]), job(3, &[1])], Time::ORIGIN)
         .unwrap();
     assert_eq!(
         d.announcements(),
@@ -227,12 +228,13 @@ fn announcements_come_before_placement() {
     );
     assert!(d.announcements().is_empty());
     // Job 2 is released first, so it takes the one slot.
-    assert!(d.release(2, Time::ZERO) && d.release(1, Time::ZERO));
-    assert_eq!(d.poll(Time::ZERO), vec![start(2, 1)]);
-    d.handle(done(2, 1), Time::from_secs(1));
-    d.declare(vec![job(4, &[])], Time::from_secs(1)).unwrap();
+    assert!(d.release(2, Time::ORIGIN) && d.release(1, Time::ORIGIN));
+    assert_eq!(d.poll(Time::ORIGIN), vec![start(2, 1)]);
+    d.handle(done(2, 1), Time(Duration::from_secs(1)));
+    d.declare(vec![job(4, &[])], Time(Duration::from_secs(1)))
+        .unwrap();
     assert_eq!(
-        d.poll(Time::from_secs(1)),
+        d.poll(Time(Duration::from_secs(1))),
         vec![Output::Ready { job: 4 }, start(1, 1)]
     );
 }
@@ -259,19 +261,19 @@ fn passthroughs_are_announced() {
                 ..Default::default()
             },
         ],
-        Time::ZERO,
+        Time::ORIGIN,
     )
     .unwrap();
-    assert_eq!(d.poll(Time::ZERO), vec![start(1, 1)]);
+    assert_eq!(d.poll(Time::ORIGIN), vec![start(1, 1)]);
     assert_eq!(
-        feed(&mut d, Time::from_secs(1), [done(1, 1)]),
+        feed(&mut d, Time(Duration::from_secs(1)), [done(1, 1)]),
         vec![Output::Passed { job: 2 }]
     );
-    d.declare([unit(200, 100, 1, &[2])], Time::from_secs(2))
+    d.declare([unit(200, 100, 1, &[2])], Time(Duration::from_secs(2)))
         .unwrap();
-    assert_eq!(d.poll(Time::from_secs(2)), vec![start(100, 1)]);
+    assert_eq!(d.poll(Time(Duration::from_secs(2))), vec![start(100, 1)]);
     assert_eq!(
-        feed(&mut d, Time::from_secs(3), [done(100, 1)]),
+        feed(&mut d, Time(Duration::from_secs(3)), [done(100, 1)]),
         vec![Output::Passed { job: 200 }]
     );
 }
@@ -280,19 +282,19 @@ fn passthroughs_are_announced() {
 #[test]
 fn give_up_holds_the_job() {
     let mut d = dag(DagConfig::default(), 1);
-    d.declare(vec![job(1, &[]), job(2, &[1])], Time::ZERO)
+    d.declare(vec![job(1, &[]), job(2, &[1])], Time::ORIGIN)
         .unwrap();
-    d.poll(Time::ZERO);
-    let out = feed(&mut d, Time::from_secs(1), [fail(1, 1)]);
+    d.poll(Time::ORIGIN);
+    let out = feed(&mut d, Time(Duration::from_secs(1)), [fail(1, 1)]);
     let [Output::GaveUp(GaveUp { job: 1, .. })] = out[..] else {
         panic!("expected a give-up, got {out:?}");
     };
     assert_eq!(d.dag_stats().held, 1);
     assert!(d.explain(1).unwrap().contains("held until release"));
-    assert!(d.release(1, Time::from_secs(2)));
-    assert_eq!(d.poll(Time::from_secs(2)), vec![start(1, 1)]);
+    assert!(d.release(1, Time(Duration::from_secs(2))));
+    assert_eq!(d.poll(Time(Duration::from_secs(2))), vec![start(1, 1)]);
     assert_eq!(
-        feed(&mut d, Time::from_secs(3), [done(1, 1)]),
+        feed(&mut d, Time(Duration::from_secs(3)), [done(1, 1)]),
         vec![start(2, 1)]
     );
 }
@@ -301,10 +303,10 @@ fn give_up_holds_the_job() {
 #[test]
 fn cancel_input_cascades() {
     let mut d = dag(DagConfig::default(), 4);
-    d.declare(vec![job(1, &[]), job(2, &[1]), job(3, &[2])], Time::ZERO)
+    d.declare(vec![job(1, &[]), job(2, &[1]), job(3, &[2])], Time::ORIGIN)
         .unwrap();
-    d.poll(Time::ZERO);
-    let out = feed(&mut d, Time::from_secs(1), [Input::Cancel(1)]);
+    d.poll(Time::ORIGIN);
+    let out = feed(&mut d, Time(Duration::from_secs(1)), [Input::Cancel(1)]);
     assert_eq!(
         out,
         vec![Output::Stop {
@@ -321,19 +323,19 @@ fn cancel_input_cascades() {
 /// closed early.
 fn closed_unit() -> DagScheduler<Scheduler> {
     let mut d = dag(DagConfig::default(), 4);
-    d.declare(vec![job(1, &[]), job(2, &[200])], Time::ZERO)
+    d.declare(vec![job(1, &[]), job(2, &[200])], Time::ORIGIN)
         .unwrap();
-    d.declare([unit(200, 100, 2, &[1])], Time::ZERO).unwrap();
-    assert_eq!(d.poll(Time::ZERO), vec![start(1, 1)]);
+    d.declare([unit(200, 100, 2, &[1])], Time::ORIGIN).unwrap();
+    assert_eq!(d.poll(Time::ORIGIN), vec![start(1, 1)]);
     assert_eq!(
-        feed(&mut d, Time::from_secs(1), [done(1, 1)]),
+        feed(&mut d, Time(Duration::from_secs(1)), [done(1, 1)]),
         vec![start(100, 1)]
     );
-    assert_eq!(d.close(200, Time::from_secs(2)), Ok(vec![100]));
+    assert_eq!(d.close(200, Time(Duration::from_secs(2))), Ok(vec![100]));
     // Leaf 101 was withdrawn; the unit completed, releasing job 2 behind the running leaf.
     let st = d.stats();
     assert_eq!((st.waiting, st.running), (1, 1));
-    assert!(d.poll(Time::from_secs(2)).is_empty());
+    assert!(d.poll(Time(Duration::from_secs(2))).is_empty());
     d
 }
 
@@ -343,7 +345,7 @@ fn closed_unit() -> DagScheduler<Scheduler> {
 fn closed_unit_job_fails() {
     let mut d = closed_unit();
     assert_eq!(
-        feed(&mut d, Time::from_secs(3), [fail(100, 1)]),
+        feed(&mut d, Time(Duration::from_secs(3)), [fail(100, 1)]),
         vec![start(2, 1)]
     );
     assert_eq!(d.stats().running, 1);
@@ -354,12 +356,12 @@ fn closed_unit_job_fails() {
 #[test]
 fn closed_unit_job_worker_gone() {
     let mut d = closed_unit();
-    assert!(feed(&mut d, Time::from_secs(3), [Input::WorkerGone(1)]).is_empty());
+    assert!(feed(&mut d, Time(Duration::from_secs(3)), [Input::WorkerGone(1)]).is_empty());
     let st = d.stats();
     assert_eq!((st.waiting, st.running), (1, 0));
     let w = worker(1);
     assert_eq!(
-        feed(&mut d, Time::from_secs(4), [Input::Worker(w)]),
+        feed(&mut d, Time(Duration::from_secs(4)), [Input::Worker(w)]),
         vec![start(2, 1)]
     );
 }
@@ -369,7 +371,7 @@ fn closed_unit_job_worker_gone() {
 fn closed_unit_job_done() {
     let mut d = closed_unit();
     assert_eq!(
-        feed(&mut d, Time::from_secs(3), [done(100, 1)]),
+        feed(&mut d, Time(Duration::from_secs(3)), [done(100, 1)]),
         vec![start(2, 1)]
     );
 }
@@ -385,22 +387,22 @@ fn restore_announces_held_jobs() {
     let mut d = dag(config, 4);
     d.declare(
         vec![job(1, &[]), job(2, &[]), job(3, &[1]), local(4, &[])],
-        Time::ZERO,
+        Time::ORIGIN,
     )
     .unwrap();
-    d.poll(Time::ZERO);
-    assert!(d.release(1, Time::ZERO));
-    assert_eq!(d.poll(Time::ZERO), vec![start(1, 1)]);
+    d.poll(Time::ORIGIN);
+    assert!(d.release(1, Time::ORIGIN));
+    assert_eq!(d.poll(Time::ORIGIN), vec![start(1, 1)]);
     let snap = d.snapshot();
     let mut r = DagScheduler::restore(
         snap,
         Scheduler::new(Config::fifo()),
         None,
-        Time::from_secs(5),
+        Time(Duration::from_secs(5)),
     );
     let w = worker(7);
     assert_eq!(
-        feed(&mut r, Time::from_secs(5), [Input::Worker(w)]),
+        feed(&mut r, Time(Duration::from_secs(5)), [Input::Worker(w)]),
         vec![
             Output::RunLocal { job: 4 },
             Output::Ready { job: 2 },
@@ -417,34 +419,34 @@ fn restore_announces_held_jobs() {
 #[test]
 fn overlapping_ids_are_refused() {
     let mut d = dag(DagConfig::default(), 4);
-    d.declare([unit(99, 10, 3, &[])], Time::ZERO).unwrap();
+    d.declare([unit(99, 10, 3, &[])], Time::ORIGIN).unwrap();
     assert_eq!(
-        d.declare([unit(98, 12, 3, &[])], Time::ZERO).unwrap_err(),
+        d.declare([unit(98, 12, 3, &[])], Time::ORIGIN).unwrap_err(),
         DagError::Overlap(12)
     );
     assert_eq!(
-        d.declare([job(11, &[])], Time::ZERO).unwrap_err(),
+        d.declare([job(11, &[])], Time::ORIGIN).unwrap_err(),
         DagError::Overlap(11)
     );
     assert_eq!(
-        d.declare([job(5, &[11])], Time::ZERO).unwrap_err(),
+        d.declare([job(5, &[11])], Time::ORIGIN).unwrap_err(),
         DagError::Overlap(11)
     );
     assert_eq!(
-        d.declare([unit(11, 20, 3, &[])], Time::ZERO).unwrap_err(),
+        d.declare([unit(11, 20, 3, &[])], Time::ORIGIN).unwrap_err(),
         DagError::Overlap(11)
     );
     assert_eq!(
-        d.declare([unit(30, 29, 3, &[])], Time::ZERO).unwrap_err(),
+        d.declare([unit(30, 29, 3, &[])], Time::ORIGIN).unwrap_err(),
         DagError::Overlap(30)
     );
     assert_eq!(
-        d.declare([unit(97, 0, 30, &[])], Time::ZERO).unwrap_err(),
+        d.declare([unit(97, 0, 30, &[])], Time::ORIGIN).unwrap_err(),
         DagError::Overlap(10)
     );
     assert_eq!(
-        d.declare([unit(99, 50, 3, &[])], Time::ZERO).unwrap_err(),
+        d.declare([unit(99, 50, 3, &[])], Time::ORIGIN).unwrap_err(),
         DagError::Duplicate(99)
     );
-    d.declare([unit(98, 13, 3, &[99])], Time::ZERO).unwrap();
+    d.declare([unit(98, 13, 3, &[99])], Time::ORIGIN).unwrap();
 }

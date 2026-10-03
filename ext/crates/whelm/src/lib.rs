@@ -44,6 +44,8 @@
 //! the attempt [`Done`](Input::Done) frees its slot and the scheduler forgets the job.
 //!
 //! ```
+//! use std::time::Duration;
+//!
 //! use whelm::{Config, Input, JobSpec, Output, Policy, Resources, Scheduler, Time, WorkerState};
 //!
 //! let mut policy = Scheduler::new(Config::default());
@@ -56,7 +58,7 @@
 //!     budget: Resources::mem_gb(16.0),
 //!     ..Default::default()
 //! };
-//! policy.handle(Input::Worker(worker), Time::ZERO);
+//! policy.handle(Input::Worker(worker), Time::ORIGIN);
 //!
 //! // Job 7 becomes ready: it expects to use 2 GB and belongs to group 3.
 //! let job = JobSpec {
@@ -65,11 +67,11 @@
 //!     group: 3,
 //!     ..Default::default()
 //! };
-//! policy.handle(Input::Submit(job), Time::ZERO);
+//! policy.handle(Input::Submit(job), Time::ORIGIN);
 //!
 //! // After a batch of inputs, poll: start attempt 1 of job 7 on worker 1.
 //! assert_eq!(
-//!     policy.poll(Time::ZERO),
+//!     policy.poll(Time::ORIGIN),
 //!     [Output::Start {
 //!         job: 7,
 //!         attempt: 1,
@@ -78,17 +80,20 @@
 //! );
 //!
 //! // Thirty seconds later the worker reports success. Nothing is left to do.
-//! policy.handle(Input::Done { job: 7, attempt: 1 }, Time::from_secs(30));
-//! assert!(policy.poll(Time::from_secs(30)).is_empty());
+//! let later = Time::ORIGIN + Duration::from_secs(30);
+//! policy.handle(Input::Done { job: 7, attempt: 1 }, later);
+//! assert!(policy.poll(later).is_empty());
 //! assert_eq!(policy.explain(7), None); // the job is forgotten
 //! assert_eq!(policy.stats().placements_total, 1);
 //! ```
 //!
-//! Every input and poll carries the current [`Time`]: a point on the caller's clock, counted at
-//! nanosecond resolution from an origin the caller picks (here the start of the run). The policy
-//! only compares times and measures the spans between them, which are [`std::time::Duration`]s,
-//! as are all the spans in the crate (work estimates, waiting bounds). `Time + Duration` and
-//! `Time - Time` saturate rather than panic.
+//! Every input and poll carries the current [`Time`]: a point on the caller's clock, the
+//! [`Duration`](std::time::Duration) since an origin the caller picks (here the start of the run,
+//! [`Time::ORIGIN`]). A point is written `Time::ORIGIN + span`, or `Time(span)` as the examples
+//! below do, and its `.0` is that span again. The policy only compares times and measures the
+//! spans between them, which are `Duration`s, as are all the spans in the crate (work estimates,
+//! waiting bounds). Moving a `Time` by a `Duration` and subtracting two `Time`s saturate rather
+//! than panic.
 //!
 //! Workers and jobs, like configurations, are plain structs written as literals: name the fields
 //! that matter and take the rest from [`Default`]. Each type's `Default` documents what the
@@ -110,19 +115,19 @@
 //!     slots: 2,
 //!     ..Default::default()
 //! };
-//! policy.handle(Input::Worker(worker), Time::ZERO);
+//! policy.handle(Input::Worker(worker), Time::ORIGIN);
 //! for id in 1..=3 {
 //!     let job = JobSpec {
 //!         id,
 //!         ..Default::default()
 //!     };
-//!     policy.handle(Input::Submit(job), Time::ZERO);
+//!     policy.handle(Input::Submit(job), Time::ORIGIN);
 //! }
 //!
 //! // The caller's side: attempts sent to workers and not yet answered.
 //! let mut in_flight = Vec::new();
-//! let mut now = Time::ZERO;
-//! while now < Time::from_secs(10) {
+//! let mut now = Time::ORIGIN;
+//! while now < Time(Duration::from_secs(10)) {
 //!     for out in policy.poll(now) {
 //!         match out {
 //!             Output::Start {
@@ -162,6 +167,7 @@
 //! ignored.
 //!
 //! ```
+//! # use std::time::Duration;
 //! # use whelm::{Config, Input, JobSpec, Output, Policy, Scheduler, Time, WorkerState};
 //! let mut p = Scheduler::new(Config::default());
 //! p.handle(
@@ -170,34 +176,40 @@
 //!         slots: 4,
 //!         ..Default::default()
 //!     }),
-//!     Time::ZERO,
+//!     Time::ORIGIN,
 //! );
 //! let job = JobSpec {
 //!     id: 1,
 //!     ..Default::default()
 //! };
 //!
-//! p.handle(Input::Submit(job.clone()), Time::ZERO);
-//! p.handle(Input::Submit(job.clone()), Time::ZERO); // already waiting: ignored
+//! p.handle(Input::Submit(job.clone()), Time::ORIGIN);
+//! p.handle(Input::Submit(job.clone()), Time::ORIGIN); // already waiting: ignored
 //! assert_eq!(
-//!     p.poll(Time::ZERO),
+//!     p.poll(Time::ORIGIN),
 //!     [Output::Start {
 //!         job: 1,
 //!         attempt: 1,
 //!         worker: 1
 //!     }]
 //! );
-//! p.handle(Input::Submit(job.clone()), Time::from_secs(1)); // already running: ignored
-//! assert!(p.poll(Time::from_secs(1)).is_empty());
+//! p.handle(Input::Submit(job.clone()), Time(Duration::from_secs(1))); // already running: ignored
+//! assert!(p.poll(Time(Duration::from_secs(1))).is_empty());
 //!
-//! p.handle(Input::Done { job: 1, attempt: 1 }, Time::from_secs(2));
-//! p.handle(Input::Done { job: 1, attempt: 1 }, Time::from_secs(2)); // no longer live: ignored
-//! assert!(p.poll(Time::from_secs(2)).is_empty());
+//! p.handle(
+//!     Input::Done { job: 1, attempt: 1 },
+//!     Time(Duration::from_secs(2)),
+//! );
+//! p.handle(
+//!     Input::Done { job: 1, attempt: 1 },
+//!     Time(Duration::from_secs(2)),
+//! ); // no longer live: ignored
+//! assert!(p.poll(Time(Duration::from_secs(2))).is_empty());
 //!
 //! // Once complete, the id is free again: a new submission is a new job.
-//! p.handle(Input::Submit(job), Time::from_secs(3));
+//! p.handle(Input::Submit(job), Time(Duration::from_secs(3)));
 //! assert_eq!(
-//!     p.poll(Time::from_secs(3)),
+//!     p.poll(Time(Duration::from_secs(3))),
 //!     [Output::Start {
 //!         job: 1,
 //!         attempt: 1,
@@ -214,6 +226,7 @@
 //! returning to worker 1, and goes back to worker 1 only once it has failed on both.
 //!
 //! ```
+//! # use std::time::Duration;
 //! # use whelm::{Config, FailKind, Input, JobSpec, Output, Policy, Scheduler, Time, WorkerState};
 //! let mut p = Scheduler::new(Config::default());
 //! for id in [1, 2] {
@@ -222,7 +235,7 @@
 //!             id,
 //!             ..Default::default()
 //!         }),
-//!         Time::ZERO,
+//!         Time::ORIGIN,
 //!     );
 //! }
 //! let fail = |job, attempt, why: &str| Input::Failed {
@@ -237,10 +250,10 @@
 //!         id,
 //!         ..Default::default()
 //!     };
-//!     p.handle(Input::Submit(job), Time::ZERO);
+//!     p.handle(Input::Submit(job), Time::ORIGIN);
 //! }
 //! assert_eq!(
-//!     p.poll(Time::ZERO),
+//!     p.poll(Time::ORIGIN),
 //!     [
 //!         Output::Start {
 //!             job: 5,
@@ -256,8 +269,8 @@
 //! );
 //!
 //! // Job 5 fails on worker 1. Worker 2 is busy, but job 5 waits for it.
-//! p.handle(fail(5, 1, "segfault"), Time::from_secs(10));
-//! assert!(p.poll(Time::from_secs(10)).is_empty());
+//! p.handle(fail(5, 1, "segfault"), Time(Duration::from_secs(10)));
+//! assert!(p.poll(Time(Duration::from_secs(10))).is_empty());
 //! assert_eq!(
 //!     p.explain(5).unwrap(),
 //!     "job 5 (demand 0.00 GB, group 0) waiting 10s, 0 more urgent job(s) waiting; failed 1 \
@@ -266,9 +279,9 @@
 //! );
 //!
 //! // Worker 2 frees up: attempt 2 runs there.
-//! p.handle(Input::Done { job: 6, attempt: 1 }, Time::from_secs(20));
+//! p.handle(Input::Done { job: 6, attempt: 1 }, Time(Duration::from_secs(20)));
 //! assert_eq!(
-//!     p.poll(Time::from_secs(20)),
+//!     p.poll(Time(Duration::from_secs(20))),
 //!     [Output::Start {
 //!         job: 5,
 //!         attempt: 2,
@@ -277,9 +290,9 @@
 //! );
 //!
 //! // It fails there too. Every worker is now avoided, so the avoidance lapses.
-//! p.handle(fail(5, 2, "segfault"), Time::from_secs(30));
+//! p.handle(fail(5, 2, "segfault"), Time(Duration::from_secs(30)));
 //! assert_eq!(
-//!     p.poll(Time::from_secs(30)),
+//!     p.poll(Time(Duration::from_secs(30))),
 //!     [Output::Start {
 //!         job: 5,
 //!         attempt: 3,
@@ -294,6 +307,7 @@
 //! that a smaller job, or a later attempt on a less loaded worker, may avoid.
 //!
 //! ```
+//! # use std::time::Duration;
 //! # use whelm::{
 //! #     Config, FailKind, GaveUp, Input, JobSpec, Output, Policy, RetryConfig, Scheduler, Time,
 //! #     Tried, WorkerState,
@@ -309,14 +323,14 @@
 //!         class: "gpu".into(),
 //!         ..Default::default()
 //!     }),
-//!     Time::ZERO,
+//!     Time::ORIGIN,
 //! );
 //! p.handle(
 //!     Input::Submit(JobSpec {
 //!         id: 5,
 //!         ..Default::default()
 //!     }),
-//!     Time::ZERO,
+//!     Time::ORIGIN,
 //! );
 //!
 //! let oom = |attempt| Input::Failed {
@@ -326,23 +340,23 @@
 //!     why: "out of device memory".into(),
 //! };
 //! assert_eq!(
-//!     p.poll(Time::ZERO),
+//!     p.poll(Time::ORIGIN),
 //!     [Output::Start {
 //!         job: 5,
 //!         attempt: 1,
 //!         worker: 1
 //!     }]
 //! );
-//! p.handle(oom(1), Time::from_secs(1));
+//! p.handle(oom(1), Time(Duration::from_secs(1)));
 //! assert_eq!(
-//!     p.poll(Time::from_secs(1)),
+//!     p.poll(Time(Duration::from_secs(1))),
 //!     [Output::Start {
 //!         job: 5,
 //!         attempt: 2,
 //!         worker: 1
 //!     }]
 //! );
-//! p.handle(oom(2), Time::from_secs(2));
+//! p.handle(oom(2), Time(Duration::from_secs(2)));
 //!
 //! let tried = Tried {
 //!     worker: 1,
@@ -350,7 +364,7 @@
 //!     why: "out of device memory".into(),
 //! };
 //! assert_eq!(
-//!     p.poll(Time::from_secs(2)),
+//!     p.poll(Time(Duration::from_secs(2))),
 //!     [Output::GaveUp(GaveUp {
 //!         job: 5,
 //!         tried: vec![tried.clone(), tried],
@@ -366,6 +380,7 @@
 //! attempt's resources at once and asks the caller to [`Stop`](Output::Stop) it.
 //!
 //! ```
+//! # use std::time::Duration;
 //! # use whelm::{Config, Input, JobSpec, Output, Policy, Scheduler, Time, WorkerState};
 //! let mut p = Scheduler::new(Config::default());
 //! p.handle(
@@ -373,16 +388,16 @@
 //!         id: 1,
 //!         ..Default::default()
 //!     }),
-//!     Time::ZERO,
+//!     Time::ORIGIN,
 //! );
 //! let job = |id| JobSpec {
 //!     id,
 //!     ..Default::default()
 //! };
-//! p.handle(Input::Submit(job(1)), Time::ZERO);
-//! p.handle(Input::Submit(job(2)), Time::ZERO);
+//! p.handle(Input::Submit(job(1)), Time::ORIGIN);
+//! p.handle(Input::Submit(job(2)), Time::ORIGIN);
 //! assert_eq!(
-//!     p.poll(Time::ZERO),
+//!     p.poll(Time::ORIGIN),
 //!     [Output::Start {
 //!         job: 1,
 //!         attempt: 1,
@@ -390,10 +405,10 @@
 //!     }]
 //! );
 //!
-//! p.handle(Input::Cancel(2), Time::from_secs(1)); // waiting: dropped
-//! p.handle(Input::Cancel(1), Time::from_secs(1)); // running: stopped
+//! p.handle(Input::Cancel(2), Time(Duration::from_secs(1))); // waiting: dropped
+//! p.handle(Input::Cancel(1), Time(Duration::from_secs(1))); // running: stopped
 //! assert_eq!(
-//!     p.poll(Time::from_secs(1)),
+//!     p.poll(Time(Duration::from_secs(1))),
 //!     [Output::Stop {
 //!         job: 1,
 //!         attempt: 1,
@@ -409,6 +424,7 @@
 //! running attempt 2.
 //!
 //! ```
+//! # use std::time::Duration;
 //! # use whelm::{Config, FailKind, Input, JobSpec, Output, Policy, Scheduler, Time, WorkerState};
 //! let mut p = Scheduler::new(Config::default());
 //! for id in [1, 2] {
@@ -417,7 +433,7 @@
 //!             id,
 //!             ..Default::default()
 //!         }),
-//!         Time::ZERO,
+//!         Time::ORIGIN,
 //!     );
 //! }
 //! p.handle(
@@ -425,10 +441,10 @@
 //!         id: 5,
 //!         ..Default::default()
 //!     }),
-//!     Time::ZERO,
+//!     Time::ORIGIN,
 //! );
 //! assert_eq!(
-//!     p.poll(Time::ZERO),
+//!     p.poll(Time::ORIGIN),
 //!     [Output::Start {
 //!         job: 5,
 //!         attempt: 1,
@@ -443,9 +459,9 @@
 //!     kind: FailKind::Timeout,
 //!     why,
 //! };
-//! p.handle(timeout, Time::from_secs(60));
+//! p.handle(timeout, Time(Duration::from_secs(60)));
 //! assert_eq!(
-//!     p.poll(Time::from_secs(60)),
+//!     p.poll(Time(Duration::from_secs(60))),
 //!     [Output::Start {
 //!         job: 5,
 //!         attempt: 2,
@@ -453,8 +469,8 @@
 //!     }]
 //! );
 //!
-//! p.handle(Input::Done { job: 5, attempt: 1 }, Time::from_secs(61)); // stale: ignored
-//! assert!(p.poll(Time::from_secs(61)).is_empty());
+//! p.handle(Input::Done { job: 5, attempt: 1 }, Time(Duration::from_secs(61))); // stale: ignored
+//! assert!(p.poll(Time(Duration::from_secs(61))).is_empty());
 //! assert_eq!(
 //!     p.explain(5).unwrap(),
 //!     "job 5 is running: attempt 2 on worker 2"
@@ -465,6 +481,7 @@
 //! [`FailKind::LinkDied`], and is retried like any other failure. The caller does not resubmit.
 //!
 //! ```
+//! # use std::time::Duration;
 //! # use whelm::{Config, Input, JobSpec, Output, Policy, Scheduler, Time, WorkerState};
 //! let mut p = Scheduler::new(Config::default());
 //! for id in [1, 2] {
@@ -473,7 +490,7 @@
 //!             id,
 //!             ..Default::default()
 //!         }),
-//!         Time::ZERO,
+//!         Time::ORIGIN,
 //!     );
 //! }
 //! p.handle(
@@ -481,10 +498,10 @@
 //!         id: 5,
 //!         ..Default::default()
 //!     }),
-//!     Time::ZERO,
+//!     Time::ORIGIN,
 //! );
 //! assert_eq!(
-//!     p.poll(Time::ZERO),
+//!     p.poll(Time::ORIGIN),
 //!     [Output::Start {
 //!         job: 5,
 //!         attempt: 1,
@@ -492,9 +509,9 @@
 //!     }]
 //! );
 //!
-//! p.handle(Input::WorkerGone(1), Time::from_secs(5));
+//! p.handle(Input::WorkerGone(1), Time(Duration::from_secs(5)));
 //! assert_eq!(
-//!     p.poll(Time::from_secs(5)),
+//!     p.poll(Time(Duration::from_secs(5))),
 //!     [Output::Start {
 //!         job: 5,
 //!         attempt: 2,
@@ -533,6 +550,7 @@
 //! [`explain`](Policy::explain) says why.
 //!
 //! ```
+//! # use std::time::Duration;
 //! # use whelm::{Config, Input, JobSpec, Output, Policy, Resources, Scheduler, Time, WorkerState};
 //! let mut p = Scheduler::new(Config::default());
 //! p.handle(
@@ -542,7 +560,7 @@
 //!         budget: Resources::mem_gb(10.0),
 //!         ..Default::default()
 //!     }),
-//!     Time::ZERO,
+//!     Time::ORIGIN,
 //! );
 //! p.handle(
 //!     Input::Submit(JobSpec {
@@ -550,7 +568,7 @@
 //!         demand: Resources::mem_gb(6.0),
 //!         ..Default::default()
 //!     }),
-//!     Time::ZERO,
+//!     Time::ORIGIN,
 //! );
 //! p.handle(
 //!     Input::Submit(JobSpec {
@@ -558,12 +576,12 @@
 //!         demand: Resources::mem_gb(6.0),
 //!         ..Default::default()
 //!     }),
-//!     Time::ZERO,
+//!     Time::ORIGIN,
 //! );
 //!
 //! // A slot is free, but 6 + 6 GB exceeds the 10 GB budget.
 //! assert_eq!(
-//!     p.poll(Time::ZERO),
+//!     p.poll(Time::ORIGIN),
 //!     [Output::Start {
 //!         job: 1,
 //!         attempt: 1,
@@ -576,9 +594,9 @@
 //!      on 1 worker(s) (best headroom 4.00 GB on worker 1)"
 //! );
 //!
-//! p.handle(Input::Done { job: 1, attempt: 1 }, Time::from_secs(50));
+//! p.handle(Input::Done { job: 1, attempt: 1 }, Time(Duration::from_secs(50)));
 //! assert_eq!(
-//!     p.poll(Time::from_secs(50)),
+//!     p.poll(Time(Duration::from_secs(50))),
 //!     [Output::Start {
 //!         job: 2,
 //!         attempt: 1,
@@ -594,6 +612,7 @@
 //! running job uses more than it said, and the heartbeat keeps a second job off the worker.
 //!
 //! ```
+//! # use std::time::Duration;
 //! # use whelm::{Config, Input, JobSpec, Output, Policy, Resources, Scheduler, Time, WorkerState};
 //! let mut p = Scheduler::new(Config::default());
 //! let worker = WorkerState {
@@ -602,17 +621,17 @@
 //!     budget: Resources::mem_gb(10.0),
 //!     ..Default::default()
 //! };
-//! p.handle(Input::Worker(worker.clone()), Time::ZERO);
+//! p.handle(Input::Worker(worker.clone()), Time::ORIGIN);
 //! p.handle(
 //!     Input::Submit(JobSpec {
 //!         id: 1,
 //!         demand: Resources::mem_gb(3.0),
 //!         ..Default::default()
 //!     }),
-//!     Time::ZERO,
+//!     Time::ORIGIN,
 //! );
 //! assert_eq!(
-//!     p.poll(Time::ZERO),
+//!     p.poll(Time::ORIGIN),
 //!     [Output::Start {
 //!         job: 1,
 //!         attempt: 1,
@@ -626,17 +645,17 @@
 //!     reported_baseline: Resources::mem_gb(1.0),
 //!     ..worker
 //! };
-//! p.handle(Input::Worker(heartbeat), Time::from_secs(5));
+//! p.handle(Input::Worker(heartbeat), Time(Duration::from_secs(5)));
 //! p.handle(
 //!     Input::Submit(JobSpec {
 //!         id: 2,
 //!         demand: Resources::mem_gb(3.0),
 //!         ..Default::default()
 //!     }),
-//!     Time::from_secs(5),
+//!     Time(Duration::from_secs(5)),
 //! );
 //! // max(8, 1 + 3) + 3 = 11 GB > 10 GB.
-//! assert!(p.poll(Time::from_secs(5)).is_empty());
+//! assert!(p.poll(Time(Duration::from_secs(5))).is_empty());
 //! ```
 //!
 //! Memory is a *soft* dimension. A job alone on a worker always runs, whatever its estimate (the
@@ -644,6 +663,7 @@
 //! and is not enforced. Slots are [`HARD`]: always enforced, with no escape hatch.
 //!
 //! ```
+//! # use std::time::Duration;
 //! # use whelm::{Config, Input, JobSpec, Output, Policy, Resources, Scheduler, Time, WorkerState};
 //! let mut p = Scheduler::new(Config::default());
 //! p.handle(
@@ -653,7 +673,7 @@
 //!         budget: Resources::mem_gb(10.0),
 //!         ..Default::default()
 //!     }),
-//!     Time::ZERO,
+//!     Time::ORIGIN,
 //! );
 //! p.handle(
 //!     Input::Submit(JobSpec {
@@ -661,7 +681,7 @@
 //!         demand: Resources::mem_gb(50.0),
 //!         ..Default::default()
 //!     }),
-//!     Time::ZERO,
+//!     Time::ORIGIN,
 //! );
 //! p.handle(
 //!     Input::Submit(JobSpec {
@@ -669,11 +689,11 @@
 //!         demand: Resources::mem_gb(1.0),
 //!         ..Default::default()
 //!     }),
-//!     Time::ZERO,
+//!     Time::ORIGIN,
 //! );
 //! // Job 1 is five times the budget but runs alone; job 2 must wait for it.
 //! assert_eq!(
-//!     p.poll(Time::ZERO),
+//!     p.poll(Time::ORIGIN),
 //!     [Output::Start {
 //!         job: 1,
 //!         attempt: 1,
@@ -688,7 +708,7 @@
 //!         slots: 2,
 //!         ..Default::default()
 //!     }),
-//!     Time::from_secs(1),
+//!     Time(Duration::from_secs(1)),
 //! );
 //! p.handle(
 //!     Input::Submit(JobSpec {
@@ -696,10 +716,10 @@
 //!         demand: Resources::mem_gb(500.0),
 //!         ..Default::default()
 //!     }),
-//!     Time::from_secs(1),
+//!     Time(Duration::from_secs(1)),
 //! );
 //! assert_eq!(
-//!     p.poll(Time::from_secs(1)),
+//!     p.poll(Time(Duration::from_secs(1))),
 //!     [
 //!         Output::Start {
 //!             job: 2,
@@ -718,9 +738,9 @@
 //!         id: 4,
 //!         ..Default::default()
 //!     }),
-//!     Time::from_secs(2),
+//!     Time(Duration::from_secs(2)),
 //! );
-//! assert!(p.poll(Time::from_secs(2)).is_empty());
+//! assert!(p.poll(Time(Duration::from_secs(2))).is_empty());
 //! assert!(p.explain(4).unwrap().contains("slots full on 1 worker(s)"));
 //! ```
 //!
@@ -741,16 +761,16 @@
 //!     budget: Resources::ZERO.with_dev_gb(10.0),
 //!     ..Default::default()
 //! };
-//! p.handle(Input::Worker(gpu), Time::ZERO);
+//! p.handle(Input::Worker(gpu), Time::ORIGIN);
 //! for id in 1..=3 {
 //!     let job = JobSpec {
 //!         id,
 //!         ..Default::default()
 //!     };
-//!     p.handle(Input::Submit(job), Time::ZERO);
+//!     p.handle(Input::Submit(job), Time::ORIGIN);
 //! }
 //! // (running + 1) * 4 GB <= 10 GB admits two jobs.
-//! assert_eq!(p.poll(Time::ZERO).len(), 2);
+//! assert_eq!(p.poll(Time::ORIGIN).len(), 2);
 //! let load = &p.stats().workers[0];
 //! assert_eq!(load.running, 2);
 //! assert_eq!(load.headroom, [None, Some(2_000_000_000), Some(6)]);
@@ -812,7 +832,7 @@
 //!         budget: Resources::mem_gb(10.0),
 //!         ..Default::default()
 //!     }),
-//!     Time::ZERO,
+//!     Time::ORIGIN,
 //! );
 //! for id in 1..=3 {
 //!     let job = JobSpec {
@@ -820,9 +840,9 @@
 //!         demand: Resources::mem_gb(50.0),
 //!         ..Default::default()
 //!     };
-//!     p.handle(Input::Submit(job), Time::ZERO);
+//!     p.handle(Input::Submit(job), Time::ORIGIN);
 //! }
-//! assert_eq!(p.poll(Time::ZERO).len(), 2);
+//! assert_eq!(p.poll(Time::ORIGIN).len(), 2);
 //! ```
 //!
 //! # Constraints
@@ -833,6 +853,7 @@
 //! constructors on [`Constraint`] cover each strength on one worker or one class.
 //!
 //! ```
+//! # use std::time::Duration;
 //! # use whelm::{Config, Constraint, Input, JobSpec, Output, Policy, Scheduler, Time, WorkerState};
 //! let mut p = Scheduler::new(Config::default());
 //! for (id, class) in [(1, "cpu"), (2, "gpu"), (3, "gpu")] {
@@ -842,7 +863,7 @@
 //!         slots: 4,
 //!         ..Default::default()
 //!     };
-//!     p.handle(Input::Worker(worker), Time::ZERO);
+//!     p.handle(Input::Worker(worker), Time::ORIGIN);
 //! }
 //! let job = |id, constraints| JobSpec {
 //!     id,
@@ -850,11 +871,11 @@
 //!     ..Default::default()
 //! };
 //! let gpu = Constraint::require_class("gpu");
-//! p.handle(Input::Submit(job(1, vec![gpu.clone()])), Time::ZERO);
+//! p.handle(Input::Submit(job(1, vec![gpu.clone()])), Time::ORIGIN);
 //! let not_2 = Constraint::forbid_worker(2);
-//! p.handle(Input::Submit(job(2, vec![gpu, not_2])), Time::ZERO);
+//! p.handle(Input::Submit(job(2, vec![gpu, not_2])), Time::ORIGIN);
 //! assert_eq!(
-//!     p.poll(Time::ZERO),
+//!     p.poll(Time::ORIGIN),
 //!     [
 //!         Output::Start {
 //!             job: 1,
@@ -871,8 +892,8 @@
 //!
 //! // No worker has the class: the job waits, and says why.
 //! let tpu = Constraint::require_class("tpu");
-//! p.handle(Input::Submit(job(3, vec![tpu])), Time::from_secs(1));
-//! assert!(p.poll(Time::from_secs(1)).is_empty());
+//! p.handle(Input::Submit(job(3, vec![tpu])), Time(Duration::from_secs(1)));
+//! assert!(p.poll(Time(Duration::from_secs(1))).is_empty());
 //! assert!(
 //!     p.explain(3)
 //!         .unwrap()
@@ -885,6 +906,7 @@
 //! [Ordering](#ordering)). Use it for cache affinity.
 //!
 //! ```
+//! # use std::time::Duration;
 //! # use whelm::{Config, Constraint, Input, JobSpec, Output, Policy, Scheduler, Time, WorkerState};
 //! let mut p = Scheduler::new(Config::default());
 //! for id in [1, 2] {
@@ -894,16 +916,16 @@
 //!             slots: 4,
 //!             ..Default::default()
 //!         }),
-//!         Time::ZERO,
+//!         Time::ORIGIN,
 //!     );
 //! }
 //! let job = |id| JobSpec {
 //!     id,
 //!     ..Default::default()
 //! };
-//! p.handle(Input::Submit(job(1)), Time::ZERO);
+//! p.handle(Input::Submit(job(1)), Time::ORIGIN);
 //! assert_eq!(
-//!     p.poll(Time::ZERO),
+//!     p.poll(Time::ORIGIN),
 //!     [Output::Start {
 //!         job: 1,
 //!         attempt: 1,
@@ -917,10 +939,10 @@
 //!     constraints: vec![Constraint::prefer_worker(1)],
 //!     ..Default::default()
 //! };
-//! p.handle(Input::Submit(fond), Time::from_secs(1));
-//! p.handle(Input::Submit(job(3)), Time::from_secs(1));
+//! p.handle(Input::Submit(fond), Time(Duration::from_secs(1)));
+//! p.handle(Input::Submit(job(3)), Time(Duration::from_secs(1)));
 //! assert_eq!(
-//!     p.poll(Time::from_secs(1)),
+//!     p.poll(Time(Duration::from_secs(1))),
 //!     [
 //!         Output::Start {
 //!             job: 2,
@@ -943,6 +965,7 @@
 //! drained (its slot count set to zero by a heartbeat).
 //!
 //! ```
+//! # use std::time::Duration;
 //! # use whelm::{Config, Constraint, Input, JobSpec, Output, Policy, Scheduler, Time, WorkerState};
 //! let mut p = Scheduler::new(Config::default());
 //! for id in [1, 2] {
@@ -951,7 +974,7 @@
 //!             id,
 //!             ..Default::default()
 //!         }),
-//!         Time::ZERO,
+//!         Time::ORIGIN,
 //!     );
 //! }
 //! let job = |id, constraint| JobSpec {
@@ -959,10 +982,10 @@
 //!     constraints: vec![constraint],
 //!     ..Default::default()
 //! };
-//! p.handle(Input::Submit(job(1, Constraint::prefer_worker(2))), Time::ZERO);
-//! p.handle(Input::Submit(job(2, Constraint::avoid_worker(1))), Time::ZERO);
+//! p.handle(Input::Submit(job(1, Constraint::prefer_worker(2))), Time::ORIGIN);
+//! p.handle(Input::Submit(job(2, Constraint::avoid_worker(1))), Time::ORIGIN);
 //! assert_eq!(
-//!     p.poll(Time::ZERO),
+//!     p.poll(Time::ORIGIN),
 //!     [Output::Start {
 //!         job: 1,
 //!         attempt: 1,
@@ -981,10 +1004,10 @@
 //!         slots: 0,
 //!         ..Default::default()
 //!     }),
-//!     Time::from_secs(1),
+//!     Time(Duration::from_secs(1)),
 //! );
 //! assert_eq!(
-//!     p.poll(Time::from_secs(1)),
+//!     p.poll(Time(Duration::from_secs(1))),
 //!     [Output::Start {
 //!         job: 2,
 //!         attempt: 1,
@@ -1020,7 +1043,7 @@
 //!             id: 1,
 //!             ..Default::default()
 //!         }),
-//!         Time::ZERO,
+//!         Time::ORIGIN,
 //!     );
 //!     // (id, group, weight, work, due)
 //!     let jobs = [(1, 5, 1.0, 10, 100), (2, 3, 1.0, 1, 50), (3, 5, 4.0, 5, 20)];
@@ -1030,12 +1053,12 @@
 //!             group,
 //!             weight,
 //!             work: Some(Duration::from_secs(work)),
-//!             due: Some(Time::from_secs(due)),
+//!             due: Some(Time(Duration::from_secs(due))),
 //!             ..Default::default()
 //!         };
-//!         p.handle(Input::Submit(spec), Time::ZERO);
+//!         p.handle(Input::Submit(spec), Time::ORIGIN);
 //!     }
-//!     let (mut order, mut now) = (Vec::new(), Time::ZERO);
+//!     let (mut order, mut now) = (Vec::new(), Time::ORIGIN);
 //!     while order.len() < 3 {
 //!         for out in p.poll(now) {
 //!             if let Output::Start { job, attempt, .. } = out {
@@ -1087,7 +1110,7 @@
 //!         id: 1,
 //!         ..Default::default()
 //!     }),
-//!     Time::ZERO,
+//!     Time::ORIGIN,
 //! );
 //! for (id, priority) in [(1, Some(1)), (2, None), (3, Some(-1))] {
 //!     let spec = JobSpec {
@@ -1095,10 +1118,10 @@
 //!         priority,
 //!         ..Default::default()
 //!     };
-//!     p.handle(Input::Submit(spec), Time::ZERO);
+//!     p.handle(Input::Submit(spec), Time::ORIGIN);
 //! }
 //! let mut order: Vec<JobId> = Vec::new();
-//! for now in [0, 1, 2].map(Time::from_secs) {
+//! for now in [0, 1, 2].map(|s| Time(Duration::from_secs(s))) {
 //!     for out in p.poll(now) {
 //!         if let Output::Start { job, attempt, .. } = out {
 //!             order.push(job);
@@ -1129,7 +1152,7 @@
 //!             budget: Resources::mem_gb(100.0),
 //!             ..Default::default()
 //!         }),
-//!         Time::ZERO,
+//!         Time::ORIGIN,
 //!     );
 //!     p.handle(
 //!         Input::Worker(WorkerState {
@@ -1139,15 +1162,15 @@
 //!             budget: Resources::mem_gb(20.0),
 //!             ..Default::default()
 //!         }),
-//!         Time::ZERO,
+//!         Time::ORIGIN,
 //!     );
 //!     let job = JobSpec {
 //!         id: 1,
 //!         demand: Resources::mem_gb(10.0),
 //!         ..Default::default()
 //!     };
-//!     p.handle(Input::Submit(job), Time::ZERO);
-//!     match p.poll(Time::ZERO)[..] {
+//!     p.handle(Input::Submit(job), Time::ORIGIN);
+//!     match p.poll(Time::ORIGIN)[..] {
 //!         [Output::Start { worker, .. }] => worker,
 //!         ref out => panic!("{out:?}"),
 //!     }
@@ -1170,7 +1193,7 @@
 //!         slots: 4,
 //!         ..Default::default()
 //!     }),
-//!     Time::ZERO,
+//!     Time::ORIGIN,
 //! );
 //! let fast = WorkerState {
 //!     id: 2,
@@ -1179,16 +1202,16 @@
 //!     speed: 2.5,
 //!     ..Default::default()
 //! };
-//! p.handle(Input::Worker(fast), Time::ZERO);
+//! p.handle(Input::Worker(fast), Time::ORIGIN);
 //! p.handle(
 //!     Input::Submit(JobSpec {
 //!         id: 1,
 //!         ..Default::default()
 //!     }),
-//!     Time::ZERO,
+//!     Time::ORIGIN,
 //! );
 //! assert_eq!(
-//!     p.poll(Time::ZERO),
+//!     p.poll(Time::ORIGIN),
 //!     [Output::Start {
 //!         job: 1,
 //!         attempt: 1,
@@ -1222,23 +1245,23 @@
 //!             id: 1,
 //!             ..Default::default()
 //!         }),
-//!         Time::ZERO,
+//!         Time::ORIGIN,
 //!     );
 //!     let job = |id| JobSpec {
 //!         id,
 //!         ..Default::default()
 //!     };
-//!     p.handle(Input::Submit(job(1)), Time::ZERO);
-//!     p.handle(Input::Submit(job(2)), Time::ZERO);
-//!     p.poll(Time::ZERO);
+//!     p.handle(Input::Submit(job(1)), Time::ORIGIN);
+//!     p.handle(Input::Submit(job(2)), Time::ORIGIN);
+//!     p.poll(Time::ORIGIN);
 //!     let urgent = JobSpec {
 //!         id: 3,
 //!         priority: Some(-1),
 //!         ..Default::default()
 //!     };
-//!     p.handle(Input::Submit(urgent), Time::from_secs(50));
-//!     p.handle(Input::Done { job: 1, attempt: 1 }, Time::from_secs(150));
-//!     match p.poll(Time::from_secs(150))[..] {
+//!     p.handle(Input::Submit(urgent), Time(Duration::from_secs(50)));
+//!     p.handle(Input::Done { job: 1, attempt: 1 }, Time(Duration::from_secs(150)));
+//!     match p.poll(Time(Duration::from_secs(150)))[..] {
 //!         [Output::Start { job, .. }] => job,
 //!         ref out => panic!("{out:?}"),
 //!     }
@@ -1254,6 +1277,7 @@
 //! jobs (backfill).
 //!
 //! ```
+//! # use std::time::Duration;
 //! # use whelm::{
 //! #     Config, Input, JobSpec, Output, Policy, ReservationInfo, Resources, Scheduler, Time,
 //! #     WorkerState,
@@ -1261,7 +1285,7 @@
 //! let mut p = Scheduler::new(Config::default()); // reserve after 60 s
 //! let worker =
 //!     WorkerState { id: 1, slots: 3, budget: Resources::mem_gb(10.0), ..Default::default() };
-//! p.handle(Input::Worker(worker), Time::ZERO);
+//! p.handle(Input::Worker(worker), Time::ORIGIN);
 //! let job = |id, gb| {
 //!     Input::Submit(JobSpec { id, demand: Resources::mem_gb(gb), ..Default::default() })
 //! };
@@ -1270,30 +1294,30 @@
 //!
 //! // Big job 9 needs 8 GB; small jobs 1 and 2 get in first.
 //! for input in [job(1, 4.0), job(9, 8.0), job(2, 4.0)] {
-//!     p.handle(input, Time::ZERO);
+//!     p.handle(input, Time::ORIGIN);
 //! }
-//! assert_eq!(p.poll(Time::ZERO), [start(1), start(2)]);
+//! assert_eq!(p.poll(Time::ORIGIN), [start(1), start(2)]);
 //!
 //! // A small job frees 4 GB; that is not enough for job 9, and another small job takes it.
-//! p.handle(done(1), Time::from_secs(30));
-//! p.handle(job(3, 4.0), Time::from_secs(30));
-//! assert_eq!(p.poll(Time::from_secs(30)), [start(3)]);
+//! p.handle(done(1), Time(Duration::from_secs(30)));
+//! p.handle(job(3, 4.0), Time(Duration::from_secs(30)));
+//! assert_eq!(p.poll(Time(Duration::from_secs(30))), [start(3)]);
 //!
 //! // At 60 s, job 9 reserves the worker.
-//! assert!(p.poll(Time::from_secs(60)).is_empty());
-//! let reservation = ReservationInfo { job: 9, worker: 1, since: Time::from_secs(60) };
+//! assert!(p.poll(Time(Duration::from_secs(60))).is_empty());
+//! let reservation = ReservationInfo { job: 9, worker: 1, since: Time(Duration::from_secs(60)) };
 //! assert_eq!(p.stats().reservations, [reservation]);
 //! assert!(p.explain(9).unwrap().contains("holds the reservation on worker 1"));
 //!
 //! // Small jobs no longer get in, although they would fit.
-//! p.handle(done(2), Time::from_secs(70));
-//! p.handle(job(4, 4.0), Time::from_secs(70));
-//! assert!(p.poll(Time::from_secs(70)).is_empty());
+//! p.handle(done(2), Time(Duration::from_secs(70)));
+//! p.handle(job(4, 4.0), Time(Duration::from_secs(70)));
+//! assert!(p.poll(Time(Duration::from_secs(70))).is_empty());
 //! assert!(p.explain(4).unwrap().ends_with("; reserved: worker 1 for job 9"));
 //!
 //! // Once enough has drained, the holder runs.
-//! p.handle(done(3), Time::from_secs(90));
-//! assert_eq!(p.poll(Time::from_secs(90)), [start(9)]);
+//! p.handle(done(3), Time(Duration::from_secs(90)));
+//! assert_eq!(p.poll(Time(Duration::from_secs(90))), [start(9)]);
 //! assert_eq!(p.stats().last_dispatch_holders, [9]);
 //! ```
 //!
@@ -1324,7 +1348,7 @@
 //!     budget: Resources::mem_gb(10.0),
 //!     ..Default::default()
 //! };
-//! p.handle(Input::Worker(worker), Time::ZERO);
+//! p.handle(Input::Worker(worker), Time::ORIGIN);
 //! let job = |id, gb, work| JobSpec {
 //!     id,
 //!     demand: Resources::mem_gb(gb),
@@ -1332,10 +1356,10 @@
 //!     ..Default::default()
 //! };
 //!
-//! p.handle(Input::Submit(job(1, 4.0, 100)), Time::ZERO);
-//! p.handle(Input::Submit(job(9, 8.0, 100)), Time::ZERO);
+//! p.handle(Input::Submit(job(1, 4.0, 100)), Time::ORIGIN);
+//! p.handle(Input::Submit(job(9, 8.0, 100)), Time::ORIGIN);
 //! assert_eq!(
-//!     p.poll(Time::ZERO),
+//!     p.poll(Time::ORIGIN),
 //!     [Output::Start {
 //!         job: 1,
 //!         attempt: 1,
@@ -1343,10 +1367,16 @@
 //!     }]
 //! );
 //!
-//! p.handle(Input::Submit(job(2, 4.0, 50)), Time::from_secs(60));
-//! p.handle(Input::Submit(job(3, 4.0, 30)), Time::from_secs(60));
+//! p.handle(
+//!     Input::Submit(job(2, 4.0, 50)),
+//!     Time(Duration::from_secs(60)),
+//! );
+//! p.handle(
+//!     Input::Submit(job(3, 4.0, 30)),
+//!     Time(Duration::from_secs(60)),
+//! );
 //! assert_eq!(
-//!     p.poll(Time::from_secs(60)),
+//!     p.poll(Time(Duration::from_secs(60))),
 //!     [Output::Start {
 //!         job: 3,
 //!         attempt: 1,
@@ -1371,11 +1401,11 @@
 //! let mut p = Scheduler::new(Config::default());
 //! let worker =
 //!     WorkerState { id: 1, slots: 2, budget: Resources::mem_gb(10.0), ..Default::default() };
-//! p.handle(Input::Worker(worker), Time::ZERO);
+//! p.handle(Input::Worker(worker), Time::ORIGIN);
 //! let job = |id| JobSpec { id, demand: Resources::mem_gb(6.0), ..Default::default() };
-//! p.handle(Input::Submit(job(1)), Time::ZERO); // runs for ever
-//! p.handle(Input::Submit(job(2)), Time::ZERO);
-//! p.poll(Time::ZERO);
+//! p.handle(Input::Submit(job(1)), Time::ORIGIN); // runs for ever
+//! p.handle(Input::Submit(job(2)), Time::ORIGIN);
+//! p.poll(Time::ORIGIN);
 //!
 //! // No events arrive: poll whenever the policy asks to.
 //! let mut wakeups = Vec::new();
@@ -1384,7 +1414,7 @@
 //!     p.poll(t);
 //! }
 //! let reserve_after = Reservations::default().reserve_after;
-//! assert_eq!(wakeups, [Time::ZERO + reserve_after, Time::ZERO + DEFAULT_AGE_LIMIT]);
+//! assert_eq!(wakeups, [Time::ORIGIN + reserve_after, Time::ORIGIN + DEFAULT_AGE_LIMIT]);
 //! assert_eq!(p.stats().reservations[0].job, 2);
 //! ```
 //!
@@ -1420,7 +1450,7 @@
 //!             slots: 4,
 //!             ..Default::default()
 //!         }),
-//!         Time::ZERO,
+//!         Time::ORIGIN,
 //!     );
 //!     let fast = WorkerState {
 //!         id: 2,
@@ -1429,13 +1459,13 @@
 //!         speed: 3.0,
 //!         ..Default::default()
 //!     };
-//!     p.handle(Input::Worker(fast), Time::ZERO);
+//!     p.handle(Input::Worker(fast), Time::ORIGIN);
 //!     let job = JobSpec {
 //!         id: 1,
 //!         ..Default::default()
 //!     };
-//!     p.handle(Input::Submit(job), Time::ZERO);
-//!     match p.poll(Time::ZERO)[..] {
+//!     p.handle(Input::Submit(job), Time::ORIGIN);
+//!     match p.poll(Time::ORIGIN)[..] {
 //!         [Output::Start { worker, .. }] => worker,
 //!         ref out => panic!("{out:?}"),
 //!     }
@@ -1470,12 +1500,12 @@
 //!         class: class.into(),
 //!         ..Default::default()
 //!     };
-//!     p.handle(Input::Worker(worker), Time::ZERO);
+//!     p.handle(Input::Worker(worker), Time::ORIGIN);
 //! }
 //!
 //! // Run jobs of 30 s of work on each worker in turn, pinned there by class.
 //! let work = Duration::from_secs(30);
-//! let (mut now, mut id) = (Time::ZERO, 0);
+//! let (mut now, mut id) = (Time::ORIGIN, 0);
 //! for _ in 0..Learn::default().min_samples {
 //!     for (class, true_speed) in [("a", 1.0), ("b", 3.0)] {
 //!         let spec = JobSpec {
@@ -1531,10 +1561,10 @@
 //!             class: class.into(),
 //!             ..Default::default()
 //!         };
-//!         p.handle(Input::Worker(worker), Time::ZERO);
+//!         p.handle(Input::Worker(worker), Time::ORIGIN);
 //!     }
 //!     let work = Duration::from_secs(8);
-//!     let (mut now, mut id) = (Time::ZERO, 0);
+//!     let (mut now, mut id) = (Time::ORIGIN, 0);
 //!     for _ in 0..20 {
 //!         let runs = [
 //!             ("a", "x", 4.0),
@@ -1620,7 +1650,7 @@
 //!         class: "slow".into(),
 //!         ..Default::default()
 //!     }),
-//!     Time::ZERO,
+//!     Time::ORIGIN,
 //! );
 //! let fast = WorkerState {
 //!     id: 2,
@@ -1628,7 +1658,7 @@
 //!     speed: 4.0,
 //!     ..Default::default()
 //! };
-//! p.handle(Input::Worker(fast), Time::ZERO);
+//! p.handle(Input::Worker(fast), Time::ORIGIN);
 //! let job = |id, work| JobSpec {
 //!     id,
 //!     work: Some(Duration::from_secs(work)),
@@ -1636,9 +1666,9 @@
 //! };
 //!
 //! // Job 1 takes the fast worker until 10 / 4 = 2.5 s.
-//! p.handle(Input::Submit(job(1, 10)), Time::ZERO);
+//! p.handle(Input::Submit(job(1, 10)), Time::ORIGIN);
 //! assert_eq!(
-//!     p.poll(Time::ZERO),
+//!     p.poll(Time::ORIGIN),
 //!     [Output::Start {
 //!         job: 1,
 //!         attempt: 1,
@@ -1647,18 +1677,18 @@
 //! );
 //!
 //! // Job 2 would take 40 s on the slow worker, or 2.5 + 10 s on the fast one: it waits.
-//! p.handle(Input::Submit(job(2, 40)), Time::ZERO);
-//! assert!(p.poll(Time::ZERO).is_empty());
-//! assert_eq!(p.stats().deferred, [(2, 2, Time::from_millis(2500))]);
+//! p.handle(Input::Submit(job(2, 40)), Time::ORIGIN);
+//! assert!(p.poll(Time::ORIGIN).is_empty());
+//! assert_eq!(p.stats().deferred, [(2, 2, Time(Duration::from_millis(2500)))]);
 //! assert!(
 //!     p.explain(2)
 //!         .unwrap()
 //!         .contains("waiting for faster worker 2")
 //! );
 //!
-//! p.handle(Input::Done { job: 1, attempt: 1 }, Time::from_millis(2500));
+//! p.handle(Input::Done { job: 1, attempt: 1 }, Time(Duration::from_millis(2500)));
 //! assert_eq!(
-//!     p.poll(Time::from_millis(2500)),
+//!     p.poll(Time(Duration::from_millis(2500))),
 //!     [Output::Start {
 //!         job: 2,
 //!         attempt: 1,
@@ -1692,16 +1722,16 @@
 //!         class: "slow".into(),
 //!         ..Default::default()
 //!     }),
-//!     Time::ZERO,
+//!     Time::ORIGIN,
 //! );
 //! let spec = JobSpec {
 //!     id: 1,
 //!     work: Some(Duration::from_secs(40)),
 //!     ..Default::default()
 //! };
-//! p.handle(Input::Submit(spec), Time::ZERO);
+//! p.handle(Input::Submit(spec), Time::ORIGIN);
 //! assert_eq!(
-//!     p.poll(Time::ZERO),
+//!     p.poll(Time::ORIGIN),
 //!     [Output::Start {
 //!         job: 1,
 //!         attempt: 1,
@@ -1716,9 +1746,9 @@
 //!     speed: 4.0,
 //!     ..Default::default()
 //! };
-//! p.handle(Input::Worker(fast), Time::from_secs(1));
+//! p.handle(Input::Worker(fast), Time(Duration::from_secs(1)));
 //! assert_eq!(
-//!     p.poll(Time::from_secs(1)),
+//!     p.poll(Time(Duration::from_secs(1))),
 //!     [Output::Start {
 //!         job: 1,
 //!         attempt: 2,
@@ -1727,9 +1757,12 @@
 //! );
 //!
 //! // The second attempt wins; the first is stopped.
-//! p.handle(Input::Done { job: 1, attempt: 2 }, Time::from_secs(11));
+//! p.handle(
+//!     Input::Done { job: 1, attempt: 2 },
+//!     Time(Duration::from_secs(11)),
+//! );
 //! assert_eq!(
-//!     p.poll(Time::from_secs(11)),
+//!     p.poll(Time(Duration::from_secs(11))),
 //!     [Output::Stop {
 //!         job: 1,
 //!         attempt: 1,
@@ -1746,6 +1779,8 @@
 //! explanations) goes through as before.
 //!
 //! ```
+//! use std::time::Duration;
+//!
 //! use whelm::{
 //!     Config, DagConfig, DagJob, DagScheduler, Input, JobSpec, Output, Policy, Scheduler, Time,
 //!     WorkerState,
@@ -1758,7 +1793,7 @@
 //!         slots: 4,
 //!         ..Default::default()
 //!     }),
-//!     Time::ZERO,
+//!     Time::ORIGIN,
 //! );
 //! // A job and the jobs it waits for.
 //! let job = |id, deps| DagJob {
@@ -1782,18 +1817,27 @@
 //!     job(3, vec![1]),
 //!     job(4, vec![2, 3]),
 //! ];
-//! dag.declare(jobs, Time::ZERO).unwrap();
-//! assert_eq!(dag.poll(Time::ZERO), [start(1)]);
+//! dag.declare(jobs, Time::ORIGIN).unwrap();
+//! assert_eq!(dag.poll(Time::ORIGIN), [start(1)]);
 //! assert_eq!(
 //!     dag.explain(4).unwrap(),
 //!     "job 4 waits for 2 dependencies [2, 3]"
 //! );
 //!
-//! dag.handle(Input::Done { job: 1, attempt: 1 }, Time::from_secs(1));
-//! assert_eq!(dag.poll(Time::from_secs(1)), [start(2), start(3)]);
-//! dag.handle(Input::Done { job: 2, attempt: 1 }, Time::from_secs(2));
-//! dag.handle(Input::Done { job: 3, attempt: 1 }, Time::from_secs(2));
-//! assert_eq!(dag.poll(Time::from_secs(2)), [start(4)]);
+//! dag.handle(
+//!     Input::Done { job: 1, attempt: 1 },
+//!     Time(Duration::from_secs(1)),
+//! );
+//! assert_eq!(dag.poll(Time(Duration::from_secs(1))), [start(2), start(3)]);
+//! dag.handle(
+//!     Input::Done { job: 2, attempt: 1 },
+//!     Time(Duration::from_secs(2)),
+//! );
+//! dag.handle(
+//!     Input::Done { job: 3, attempt: 1 },
+//!     Time(Duration::from_secs(2)),
+//! );
+//! assert_eq!(dag.poll(Time(Duration::from_secs(2))), [start(4)]);
 //! ```
 //!
 //! A declaration that would close a cycle, or redeclare a job, is rejected with a [`DagError`] and
@@ -1808,6 +1852,7 @@
 //! itself, and with [`DagConfig::record_passthrough`] is announced by [`Output::Passed`].
 //!
 //! ```
+//! # use std::time::Duration;
 //! # use whelm::{
 //! #     Config, DagConfig, DagJob, DagScheduler, Input, JobSpec, Output, Policy, Scheduler, Time,
 //! #     WorkerState,
@@ -1823,7 +1868,7 @@
 //!         slots: 4,
 //!         ..Default::default()
 //!     }),
-//!     Time::ZERO,
+//!     Time::ORIGIN,
 //! );
 //! let job = |id, deps| DagJob {
 //!     spec: JobSpec {
@@ -1846,12 +1891,12 @@
 //!     },
 //!     job(3, vec![2]),
 //! ];
-//! dag.declare(jobs, Time::ZERO).unwrap();
-//! assert_eq!(dag.poll(Time::ZERO), [Output::RunLocal { job: 1 }]);
+//! dag.declare(jobs, Time::ORIGIN).unwrap();
+//! assert_eq!(dag.poll(Time::ORIGIN), [Output::RunLocal { job: 1 }]);
 //!
-//! dag.handle(Input::Done { job: 1, attempt: 0 }, Time::from_secs(1));
+//! dag.handle(Input::Done { job: 1, attempt: 0 }, Time(Duration::from_secs(1)));
 //! assert_eq!(
-//!     dag.poll(Time::from_secs(1)),
+//!     dag.poll(Time(Duration::from_secs(1))),
 //!     [
 //!         Output::Passed { job: 2 },
 //!         Output::Start {
@@ -1884,7 +1929,7 @@
 //!         slots: 4,
 //!         ..Default::default()
 //!     }),
-//!     Time::ZERO,
+//!     Time::ORIGIN,
 //! );
 //!
 //! let job = DagJob {
@@ -1894,7 +1939,7 @@
 //!     },
 //!     ..Default::default()
 //! };
-//! dag.declare([job], Time::ZERO).unwrap();
+//! dag.declare([job], Time::ORIGIN).unwrap();
 //! assert_eq!(dag.announcements(), [Output::Ready { job: 1 }]);
 //! assert_eq!(
 //!     dag.explain(1).unwrap(),
@@ -1902,9 +1947,9 @@
 //! );
 //!
 //! // ... prepare the job's inputs, then hand it over.
-//! assert!(dag.release(1, Time::ZERO));
+//! assert!(dag.release(1, Time::ORIGIN));
 //! assert_eq!(
-//!     dag.poll(Time::ZERO),
+//!     dag.poll(Time::ORIGIN),
 //!     [Output::Start {
 //!         job: 1,
 //!         attempt: 1,
@@ -1935,7 +1980,7 @@
 //!         slots: 4,
 //!         ..Default::default()
 //!     }),
-//!     Time::ZERO,
+//!     Time::ORIGIN,
 //! );
 //! let start = |job| Output::Start {
 //!     job,
@@ -1974,20 +2019,23 @@
 //!     deps: vec![10],
 //!     ..Default::default()
 //! };
-//! dag.declare([first, second], Time::ZERO).unwrap();
-//! assert_eq!(dag.poll(Time::ZERO), [start(100)]);
+//! dag.declare([first, second], Time::ORIGIN).unwrap();
+//! assert_eq!(dag.poll(Time::ORIGIN), [start(100)]);
 //! assert_eq!(
 //!     dag.explain(20).unwrap(),
 //!     "unit 20 waits for 1 dependency [10]"
 //! );
 //!
-//! dag.handle(done(100), Time::from_secs(1));
-//! assert_eq!(dag.poll(Time::from_secs(1)), [start(101), start(102)]);
-//! dag.handle(done(101), Time::from_secs(2));
-//! dag.handle(done(102), Time::from_secs(2));
-//! assert_eq!(dag.poll(Time::from_secs(2)), [start(103)]);
-//! dag.handle(done(103), Time::from_secs(3));
-//! assert_eq!(dag.poll(Time::from_secs(3)), [start(200)]);
+//! dag.handle(done(100), Time(Duration::from_secs(1)));
+//! assert_eq!(
+//!     dag.poll(Time(Duration::from_secs(1))),
+//!     [start(101), start(102)]
+//! );
+//! dag.handle(done(101), Time(Duration::from_secs(2)));
+//! dag.handle(done(102), Time(Duration::from_secs(2)));
+//! assert_eq!(dag.poll(Time(Duration::from_secs(2))), [start(103)]);
+//! dag.handle(done(103), Time(Duration::from_secs(3)));
+//! assert_eq!(dag.poll(Time(Duration::from_secs(3))), [start(200)]);
 //! ```
 //!
 //! A unit costs a fixed amount of memory until its dependencies complete; only then is its per-node
@@ -2023,7 +2071,7 @@
 //!     .with_source(Arc::new(Growing));
 //! let worker =
 //!     WorkerState { id: 1, slots: 4, budget: Resources::mem_gb(100.0), ..Default::default() };
-//! dag.handle(Input::Worker(worker), Time::ZERO);
+//! dag.handle(Input::Worker(worker), Time::ORIGIN);
 //! let chain = TemplateSpec { edges: vec![(0, 1), (1, 2)], ..TemplateSpec::jobs(3) };
 //! let unit = Unit {
 //!     id: 10,
@@ -2032,9 +2080,9 @@
 //!     sourced: true,
 //!     ..Default::default()
 //! };
-//! dag.declare([unit], Time::ZERO).unwrap();
+//! dag.declare([unit], Time::ORIGIN).unwrap();
 //!
-//! assert_eq!(dag.poll(Time::ZERO), [Output::Start { job: 100, attempt: 1, worker: 1 }]);
+//! assert_eq!(dag.poll(Time::ORIGIN), [Output::Start { job: 100, attempt: 1, worker: 1 }]);
 //! assert_eq!(dag.stats().workers[0].placed[MEM], 1_000_000_000);
 //! assert_eq!(
 //!     dag.explain(102).unwrap(),
@@ -2065,7 +2113,7 @@
 //!             id: 1,
 //!             ..Default::default()
 //!         }),
-//!         Time::ZERO,
+//!         Time::ORIGIN,
 //!     );
 //!     let job = |id, deps| DagJob {
 //!         spec: JobSpec {
@@ -2082,13 +2130,13 @@
 //!             job(3, vec![2]),
 //!             job(4, vec![3]),
 //!         ],
-//!         Time::ZERO,
+//!         Time::ORIGIN,
 //!     )
 //!     .unwrap();
 //!     // Every job has the default work of a second.
 //!     let secs = |s| Some(Duration::from_secs(s));
 //!     assert_eq!((dag.rank(1), dag.rank(2)), (secs(1), secs(3)));
-//!     match dag.poll(Time::ZERO)[..] {
+//!     match dag.poll(Time::ORIGIN)[..] {
 //!         [Output::Start { job, .. }] => job,
 //!         ref out => panic!("{out:?}"),
 //!     }
@@ -2111,7 +2159,7 @@
 //! already running are returned, keeping their resources until their attempts end.
 //!
 //! ```
-//! # use std::sync::Arc;
+//! # use std::{sync::Arc, time::Duration};
 //! # use whelm::{
 //! #     Config, DagConfig, DagJob, DagScheduler, Input, JobSpec, Output, Policy, Scheduler,
 //! #     TemplateSpec, Time, Unit, WorkerState,
@@ -2122,7 +2170,7 @@
 //!         id: 1,
 //!         ..Default::default()
 //!     }),
-//!     Time::ZERO,
+//!     Time::ORIGIN,
 //! );
 //!
 //! // Unit 10: four independent jobs 100..104, the first two done before a restart. Job 20 follows.
@@ -2141,9 +2189,9 @@
 //!     deps: vec![10],
 //!     ..Default::default()
 //! };
-//! dag.declare([unit, after.into()], Time::ZERO).unwrap();
+//! dag.declare([unit, after.into()], Time::ORIGIN).unwrap();
 //! assert_eq!(
-//!     dag.poll(Time::ZERO),
+//!     dag.poll(Time::ORIGIN),
 //!     [Output::Start {
 //!         job: 102,
 //!         attempt: 1,
@@ -2152,17 +2200,17 @@
 //! );
 //!
 //! // Job 103 turns out to be unnecessary: close the unit. Job 102 is still running.
-//! assert_eq!(dag.close(10, Time::from_secs(1)), Ok(vec![102]));
-//! assert!(dag.poll(Time::from_secs(1)).is_empty()); // job 20 is ready, but 102 holds the slot
+//! assert_eq!(dag.close(10, Time(Duration::from_secs(1))), Ok(vec![102]));
+//! assert!(dag.poll(Time(Duration::from_secs(1))).is_empty()); // job 20 is ready, but 102 holds the slot
 //! dag.handle(
 //!     Input::Done {
 //!         job: 102,
 //!         attempt: 1,
 //!     },
-//!     Time::from_secs(2),
+//!     Time(Duration::from_secs(2)),
 //! );
 //! assert_eq!(
-//!     dag.poll(Time::from_secs(2)),
+//!     dag.poll(Time(Duration::from_secs(2))),
 //!     [Output::Start {
 //!         job: 20,
 //!         attempt: 1,
@@ -2181,6 +2229,7 @@
 //! ```
 //! # #[cfg(feature = "serde")]
 //! # fn main() {
+//! # use std::time::Duration;
 //! # use whelm::{
 //! #     Config, DagConfig, DagJob, DagScheduler, Input, JobSpec, Output, Policy, Scheduler, Time,
 //! #     WorkerState,
@@ -2190,7 +2239,7 @@
 //!     id: 1,
 //!     ..Default::default()
 //! };
-//! dag.handle(Input::Worker(worker.clone()), Time::ZERO);
+//! dag.handle(Input::Worker(worker.clone()), Time::ORIGIN);
 //! let job = |id, deps| DagJob {
 //!     spec: JobSpec {
 //!         id,
@@ -2199,11 +2248,11 @@
 //!     deps,
 //!     ..Default::default()
 //! };
-//! dag.declare([job(1, vec![]), job(2, vec![1])], Time::ZERO).unwrap();
-//! dag.poll(Time::ZERO);
-//! dag.handle(Input::Done { job: 1, attempt: 1 }, Time::from_secs(1));
+//! dag.declare([job(1, vec![]), job(2, vec![1])], Time::ORIGIN).unwrap();
+//! dag.poll(Time::ORIGIN);
+//! dag.handle(Input::Done { job: 1, attempt: 1 }, Time(Duration::from_secs(1)));
 //! assert_eq!(
-//!     dag.poll(Time::from_secs(1)),
+//!     dag.poll(Time(Duration::from_secs(1))),
 //!     [Output::Start {
 //!         job: 2,
 //!         attempt: 1,
@@ -2218,11 +2267,11 @@
 //!     snapshot,
 //!     Scheduler::new(Config::default()),
 //!     None,
-//!     Time::from_secs(5),
+//!     Time(Duration::from_secs(5)),
 //! );
-//! dag.handle(Input::Worker(worker), Time::from_secs(5));
+//! dag.handle(Input::Worker(worker), Time(Duration::from_secs(5)));
 //! assert_eq!(
-//!     dag.poll(Time::from_secs(5)),
+//!     dag.poll(Time(Duration::from_secs(5))),
 //!     [Output::Start {
 //!         job: 2,
 //!         attempt: 1,
@@ -2314,7 +2363,10 @@
 //! or replayed against another configuration.
 //!
 //! ```
-//! use std::sync::{Arc, Mutex};
+//! use std::{
+//!     sync::{Arc, Mutex},
+//!     time::Duration,
+//! };
 //!
 //! use whelm::{
 //!     Config, Input, JobSpec, Output, Policy, Scheduler, Time, WorkerState,
@@ -2329,24 +2381,27 @@
 //!         id: 1,
 //!         ..Default::default()
 //!     }),
-//!     Time::ZERO,
+//!     Time::ORIGIN,
 //! );
 //! let job = |id| JobSpec {
 //!     id,
 //!     ..Default::default()
 //! };
-//! p.handle(Input::Submit(job(1)), Time::ZERO);
-//! p.handle(Input::Submit(job(2)), Time::ZERO);
-//! p.poll(Time::ZERO);
-//! p.handle(Input::Done { job: 1, attempt: 1 }, Time::from_secs(5));
-//! p.poll(Time::from_secs(5));
+//! p.handle(Input::Submit(job(1)), Time::ORIGIN);
+//! p.handle(Input::Submit(job(2)), Time::ORIGIN);
+//! p.poll(Time::ORIGIN);
+//! p.handle(
+//!     Input::Done { job: 1, attempt: 1 },
+//!     Time(Duration::from_secs(5)),
+//! );
+//! p.poll(Time(Duration::from_secs(5)));
 //!
 //! let events = events.lock().unwrap().clone();
 //! let polls = log::polls(&events);
 //! assert_eq!(
 //!     polls[1],
 //!     (
-//!         Time::from_secs(5),
+//!         Time(Duration::from_secs(5)),
 //!         vec![Output::Start {
 //!             job: 2,
 //!             attempt: 1,
@@ -2369,6 +2424,8 @@
 //! [`Policy`], boxed or not.
 //!
 //! ```
+//! use std::time::Duration;
+//!
 //! use whelm::{
 //!     Config, DagConfig, DagScheduler, FailKind, Input, JobSpec, Output, Policy, Resources,
 //!     Scheduler, Time, WorkerState,
@@ -2407,10 +2464,13 @@
 //!         ..Default::default()
 //!     };
 //!     vec![
-//!         (Time::ZERO, vec![Input::Worker(worker)]),
-//!         (Time::from_secs(1), vec![job(1), job(2), job(3)]),
-//!         (Time::from_secs(2), vec![fail]),
-//!         (Time::from_secs(3), vec![Input::Done { job: 2, attempt: 1 }]),
+//!         (Time::ORIGIN, vec![Input::Worker(worker)]),
+//!         (Time(Duration::from_secs(1)), vec![job(1), job(2), job(3)]),
+//!         (Time(Duration::from_secs(2)), vec![fail]),
+//!         (
+//!             Time(Duration::from_secs(3)),
+//!             vec![Input::Done { job: 2, attempt: 1 }],
+//!         ),
 //!     ]
 //! };
 //!
@@ -2430,7 +2490,7 @@
 //! };
 //! assert_eq!(polls[1].1, [start(1, 1), start(2, 1)]);
 //! // The retry keeps job 1's place ahead of job 3.
-//! assert_eq!(polls[2], (Time::from_secs(2), vec![start(1, 2)]));
+//! assert_eq!(polls[2], (Time(Duration::from_secs(2)), vec![start(1, 2)]));
 //! assert_eq!(polls[3].1, [start(3, 1)]);
 //!
 //! // Inspect the end state.

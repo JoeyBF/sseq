@@ -13,7 +13,10 @@
 //! Log a run in which a job fails once and is retried on the other worker, then replay it:
 //!
 //! ```
-//! use std::sync::{Arc, Mutex};
+//! use std::{
+//!     sync::{Arc, Mutex},
+//!     time::Duration,
+//! };
 //!
 //! use whelm::{
 //!     Config, FailKind, Input, JobSpec, Output, Policy, Resources, Scheduler, Time, WorkerState,
@@ -28,7 +31,7 @@
 //!         budget: Resources::mem_gb(8.0),
 //!         ..Default::default()
 //!     };
-//!     p.handle(Input::Worker(worker), Time::ZERO);
+//!     p.handle(Input::Worker(worker), Time::ORIGIN);
 //! }
 //! p.handle(
 //!     Input::Submit(JobSpec {
@@ -36,10 +39,10 @@
 //!         demand: Resources::mem_gb(1.0),
 //!         ..Default::default()
 //!     }),
-//!     Time::ZERO,
+//!     Time::ORIGIN,
 //! );
 //! assert_eq!(
-//!     p.poll(Time::ZERO),
+//!     p.poll(Time::ORIGIN),
 //!     [Output::Start {
 //!         job: 7,
 //!         attempt: 1,
@@ -54,18 +57,21 @@
 //!         kind: FailKind::Other,
 //!         why,
 //!     },
-//!     Time::from_secs(5),
+//!     Time(Duration::from_secs(5)),
 //! );
 //! assert_eq!(
-//!     p.poll(Time::from_secs(5)),
+//!     p.poll(Time(Duration::from_secs(5))),
 //!     [Output::Start {
 //!         job: 7,
 //!         attempt: 2,
 //!         worker: 2
 //!     }]
 //! );
-//! p.handle(Input::Done { job: 7, attempt: 2 }, Time::from_secs(9));
-//! assert_eq!(p.poll(Time::from_secs(9)), []);
+//! p.handle(
+//!     Input::Done { job: 7, attempt: 2 },
+//!     Time(Duration::from_secs(9)),
+//! );
+//! assert_eq!(p.poll(Time(Duration::from_secs(9))), []);
 //!
 //! let events = events.lock().unwrap().clone();
 //! // Five inputs, three polls, and a sample of each worker's first heartbeat.
@@ -74,7 +80,7 @@
 //! assert_eq!(
 //!     logged[1],
 //!     (
-//!         Time::from_secs(5),
+//!         Time(Duration::from_secs(5)),
 //!         vec![Output::Start {
 //!             job: 7,
 //!             attempt: 2,

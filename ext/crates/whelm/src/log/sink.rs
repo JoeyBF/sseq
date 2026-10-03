@@ -50,7 +50,7 @@ use super::Logged;
 ///     budget: Resources::mem_gb(8.0),
 ///     ..Default::default()
 /// };
-/// p.handle(Input::Worker(worker), Time::ZERO);
+/// p.handle(Input::Worker(worker), Time::ORIGIN);
 /// for id in 1..=3 {
 ///     p.handle(
 ///         Input::Submit(JobSpec {
@@ -58,10 +58,10 @@ use super::Logged;
 ///             demand: Resources::mem_gb(1.0),
 ///             ..Default::default()
 ///         }),
-///         Time::ZERO,
+///         Time::ORIGIN,
 ///     );
 /// }
-/// p.poll(Time::ZERO);
+/// p.poll(Time::ORIGIN);
 /// // Two slots: the third job waits.
 /// assert_eq!(starts.load(Ordering::Relaxed), 2);
 /// ```
@@ -130,24 +130,27 @@ impl EventSink for std::sync::Arc<std::sync::Mutex<Vec<Event>>> {
 ///     budget: Resources::mem_gb(8.0),
 ///     ..Default::default()
 /// };
-/// p.handle(Input::Worker(worker), Time::ZERO);
+/// p.handle(Input::Worker(worker), Time::ORIGIN);
 /// p.handle(
 ///     Input::Submit(JobSpec {
 ///         id: 1,
 ///         demand: Resources::mem_gb(1.0),
 ///         ..Default::default()
 ///     }),
-///     Time::ZERO,
+///     Time::ORIGIN,
 /// );
-/// p.poll(Time::ZERO);
+/// p.poll(Time::ORIGIN);
 ///
 /// let text = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
 /// let lines: Vec<&str> = text.lines().collect();
-/// assert!(lines[0].starts_with(r#"{"type":"input","t":0,"input":{"worker":{"id":1,"#));
-/// assert!(lines[1].starts_with(r#"{"type":"sample","t":0,"worker":"1","#));
+/// assert!(lines[0].starts_with(r#"{"type":"input","t":{"secs":0,"nanos":0},"input":"#));
+/// assert!(lines[1].starts_with(r#"{"type":"sample","t":{"secs":0,"nanos":0},"worker":"1","#));
 /// assert_eq!(
 ///     lines[3],
-///     r#"{"type":"poll","t":0,"out":[{"start":{"job":1,"attempt":1,"worker":1}}]}"#
+///     concat!(
+///         r#"{"type":"poll","t":{"secs":0,"nanos":0},"#,
+///         r#""out":[{"start":{"job":1,"attempt":1,"worker":1}}]}"#
+///     )
 /// );
 ///
 /// let events: Vec<Event> = lines
@@ -188,7 +191,7 @@ impl JsonlSink {
     /// let mut p = Logged::new(Scheduler::new(Config::default()), sink);
     /// loop {
     ///     // Handle the events that arrived, then:
-    ///     p.poll(Time::ZERO);
+    ///     p.poll(Time::ORIGIN);
     ///     p.sink_mut().flush();
     /// #   break;
     /// }

@@ -18,34 +18,41 @@ impl<P: Policy> DagScheduler<P> {
     /// does nothing.
     ///
     /// ```
+    /// # use std::time::Duration;
     /// # use whelm::{
     /// #     Config, DagConfig, DagJob, DagScheduler, Input, JobSpec, Output, Policy, Scheduler,
     /// #     Time, WorkerState,
     /// # };
     /// # let config = DagConfig { auto_submit: false, ..DagConfig::default() };
     /// # let mut dag = DagScheduler::new(config, Scheduler::new(Config::fifo()));
-    /// # dag.handle(Input::Worker(WorkerState { id: 1, ..Default::default() }), Time::ZERO);
+    /// # dag.handle(Input::Worker(WorkerState { id: 1, ..Default::default() }), Time::ORIGIN);
     /// # let job = |id, deps| DagJob {
     /// #     spec: JobSpec { id, ..Default::default() },
     /// #     deps,
     /// #     ..Default::default()
     /// # };
-    /// dag.declare([job(1, vec![]), job(2, vec![1])], Time::ZERO)
+    /// dag.declare([job(1, vec![]), job(2, vec![1])], Time::ORIGIN)
     ///     .unwrap();
-    /// assert_eq!(dag.poll(Time::ZERO), vec![Output::Ready { job: 1 }]);
-    /// assert!(!dag.release(2, Time::ZERO));
-    /// assert!(dag.release(1, Time::ZERO));
-    /// assert!(!dag.release(1, Time::ZERO));
+    /// assert_eq!(dag.poll(Time::ORIGIN), vec![Output::Ready { job: 1 }]);
+    /// assert!(!dag.release(2, Time::ORIGIN));
+    /// assert!(dag.release(1, Time::ORIGIN));
+    /// assert!(!dag.release(1, Time::ORIGIN));
     /// assert_eq!(
-    ///     dag.poll(Time::ZERO),
+    ///     dag.poll(Time::ORIGIN),
     ///     vec![Output::Start {
     ///         job: 1,
     ///         attempt: 1,
     ///         worker: 1
     ///     }]
     /// );
-    /// dag.handle(Input::Done { job: 1, attempt: 1 }, Time::from_secs(1));
-    /// assert_eq!(dag.poll(Time::from_secs(1)), vec![Output::Ready { job: 2 }]);
+    /// dag.handle(
+    ///     Input::Done { job: 1, attempt: 1 },
+    ///     Time(Duration::from_secs(1)),
+    /// );
+    /// assert_eq!(
+    ///     dag.poll(Time(Duration::from_secs(1))),
+    ///     vec![Output::Ready { job: 2 }]
+    /// );
     /// ```
     pub fn release(&mut self, job: JobId, now: Time) -> bool {
         self.now = now;
@@ -69,32 +76,36 @@ impl<P: Policy> DagScheduler<P> {
     /// met, and declaring one is a [`DagError::Duplicate`].
     ///
     /// ```
+    /// # use std::time::Duration;
     /// # use whelm::{
     /// #     Config, DagConfig, DagError, DagJob, DagScheduler, Input, JobSpec, Output, Policy,
     /// #     Scheduler, Time, WorkerState,
     /// # };
     /// # let mut dag = DagScheduler::new(DagConfig::default(), Scheduler::new(Config::fifo()));
-    /// # dag.handle(Input::Worker(WorkerState { id: 1, ..Default::default() }), Time::ZERO);
+    /// # dag.handle(Input::Worker(WorkerState { id: 1, ..Default::default() }), Time::ORIGIN);
     /// # let job = |id, deps| DagJob {
     /// #     spec: JobSpec { id, ..Default::default() },
     /// #     deps,
     /// #     ..Default::default()
     /// # };
-    /// dag.declare([job(1, vec![])], Time::ZERO).unwrap();
-    /// dag.poll(Time::ZERO);
-    /// dag.handle(Input::Done { job: 1, attempt: 1 }, Time::from_secs(1));
+    /// dag.declare([job(1, vec![])], Time::ORIGIN).unwrap();
+    /// dag.poll(Time::ORIGIN);
+    /// dag.handle(
+    ///     Input::Done { job: 1, attempt: 1 },
+    ///     Time(Duration::from_secs(1)),
+    /// );
     /// assert_eq!(dag.dag_stats().completed_remembered, 1);
     ///
     /// dag.forget_completed_below(10);
     /// assert_eq!(dag.dag_stats().completed_remembered, 0);
     /// assert_eq!(
-    ///     dag.declare([job(5, vec![])], Time::from_secs(1)),
+    ///     dag.declare([job(5, vec![])], Time(Duration::from_secs(1))),
     ///     Err(DagError::Duplicate(5))
     /// );
-    /// dag.declare([job(10, vec![1, 9])], Time::from_secs(1))
+    /// dag.declare([job(10, vec![1, 9])], Time(Duration::from_secs(1)))
     ///     .unwrap();
     /// assert_eq!(
-    ///     dag.poll(Time::from_secs(1)),
+    ///     dag.poll(Time(Duration::from_secs(1))),
     ///     vec![Output::Start {
     ///         job: 10,
     ///         attempt: 1,
@@ -127,12 +138,13 @@ impl<P: Policy> DagScheduler<P> {
     /// Cancelling running job 1 takes its dependents 2 and 3 with it, and stops its attempt:
     ///
     /// ```
+    /// # use std::time::Duration;
     /// # use whelm::{
     /// #     Config, DagConfig, DagJob, DagScheduler, DagStats, Input, JobSpec, Output, Policy,
     /// #     Scheduler, Time, WorkerState,
     /// # };
     /// # let mut dag = DagScheduler::new(DagConfig::default(), Scheduler::new(Config::fifo()));
-    /// # dag.handle(Input::Worker(WorkerState { id: 1, ..Default::default() }), Time::ZERO);
+    /// # dag.handle(Input::Worker(WorkerState { id: 1, ..Default::default() }), Time::ORIGIN);
     /// # let job = |id, deps| DagJob {
     /// #     spec: JobSpec { id, ..Default::default() },
     /// #     deps,
@@ -140,13 +152,13 @@ impl<P: Policy> DagScheduler<P> {
     /// # };
     /// dag.declare(
     ///     [job(1, vec![]), job(2, vec![1]), job(3, vec![2])],
-    ///     Time::ZERO,
+    ///     Time::ORIGIN,
     /// )
     /// .unwrap();
-    /// dag.poll(Time::ZERO);
+    /// dag.poll(Time::ORIGIN);
     /// assert_eq!(dag.cancel(1), vec![1, 2, 3]);
     /// assert_eq!(
-    ///     dag.poll(Time::from_secs(1)),
+    ///     dag.poll(Time(Duration::from_secs(1))),
     ///     vec![Output::Stop {
     ///         job: 1,
     ///         attempt: 1,
@@ -228,13 +240,13 @@ impl<P: Policy> DagScheduler<P> {
     /// until its attempt ends. Unit 300, closed before it is entered, never runs anything.
     ///
     /// ```
-    /// # use std::sync::Arc;
+    /// # use std::{sync::Arc, time::Duration};
     /// # use whelm::{
     /// #     Config, DagConfig, DagJob, DagScheduler, Input, JobSpec, Output, Policy, Scheduler,
     /// #     TemplateSpec, Time, Unit, WorkerState,
     /// # };
     /// # let mut dag = DagScheduler::new(DagConfig::default(), Scheduler::new(Config::fifo()));
-    /// # dag.handle(Input::Worker(WorkerState { id: 1, ..Default::default() }), Time::ZERO);
+    /// # dag.handle(Input::Worker(WorkerState { id: 1, ..Default::default() }), Time::ORIGIN);
     /// # let job = |id, deps| DagJob {
     /// #     spec: JobSpec { id, ..Default::default() },
     /// #     deps,
@@ -254,18 +266,18 @@ impl<P: Policy> DagScheduler<P> {
     ///     deps: vec![2],
     ///     ..Default::default()
     /// };
-    /// dag.declare([first, second, job(2, vec![200]).into()], Time::ZERO)
+    /// dag.declare([first, second, job(2, vec![200]).into()], Time::ORIGIN)
     ///     .unwrap();
     /// assert_eq!(
-    ///     dag.poll(Time::ZERO),
+    ///     dag.poll(Time::ORIGIN),
     ///     vec![Output::Start {
     ///         job: 100,
     ///         attempt: 1,
     ///         worker: 1
     ///     }]
     /// );
-    /// assert_eq!(dag.close(300, Time::ZERO), Ok(vec![]));
-    /// assert_eq!(dag.close(200, Time::from_secs(1)), Ok(vec![100]));
+    /// assert_eq!(dag.close(300, Time::ORIGIN), Ok(vec![]));
+    /// assert_eq!(dag.close(200, Time(Duration::from_secs(1))), Ok(vec![100]));
     /// assert_eq!((dag.stats().waiting, dag.stats().running), (1, 1));
     ///
     /// dag.handle(
@@ -273,18 +285,21 @@ impl<P: Policy> DagScheduler<P> {
     ///         job: 100,
     ///         attempt: 1,
     ///     },
-    ///     Time::from_secs(2),
+    ///     Time(Duration::from_secs(2)),
     /// );
     /// assert_eq!(
-    ///     dag.poll(Time::from_secs(2)),
+    ///     dag.poll(Time(Duration::from_secs(2))),
     ///     vec![Output::Start {
     ///         job: 2,
     ///         attempt: 1,
     ///         worker: 1
     ///     }]
     /// );
-    /// dag.handle(Input::Done { job: 2, attempt: 1 }, Time::from_secs(3));
-    /// assert!(dag.poll(Time::from_secs(3)).is_empty());
+    /// dag.handle(
+    ///     Input::Done { job: 2, attempt: 1 },
+    ///     Time(Duration::from_secs(3)),
+    /// );
+    /// assert!(dag.poll(Time(Duration::from_secs(3))).is_empty());
     /// assert_eq!(dag.dag_stats().units, 0);
     /// ```
     pub fn close(&mut self, job: JobId, now: Time) -> Result<Vec<JobId>, DagError> {

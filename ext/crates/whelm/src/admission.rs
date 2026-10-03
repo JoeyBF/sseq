@@ -311,7 +311,7 @@ impl WorkerView<'_> {
 ///         budget: Resources::mem(100),
 ///         ..Default::default()
 ///     }),
-///     Time::ZERO,
+///     Time::ORIGIN,
 /// );
 /// for id in 0..3 {
 ///     s.handle(
@@ -320,10 +320,10 @@ impl WorkerView<'_> {
 ///             demand: Resources::mem(80),
 ///             ..Default::default()
 ///         }),
-///         Time::ZERO,
+///         Time::ORIGIN,
 ///     );
 /// }
-/// assert_eq!(s.poll(Time::ZERO).len(), 2);
+/// assert_eq!(s.poll(Time::ORIGIN).len(), 2);
 /// assert!(s.explain(2).unwrap().contains("slots full on 1 worker(s)"));
 /// ```
 pub trait Admission {

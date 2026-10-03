@@ -42,10 +42,10 @@ fn run(sink: impl EventSink + 'static) -> (usize, usize, usize) {
     let mut ends: Vec<(u32, JobId, Attempt)> = Vec::new();
     let (mut starts, mut stops, mut retries) = (0, 0, 0);
     for w in 1..=2 {
-        p.handle(Input::Worker(worker(w, 0.0)), Time::ZERO);
+        p.handle(Input::Worker(worker(w, 0.0)), Time::ORIGIN);
     }
     for t in 0..400u32 {
-        let now = Time::from_secs(t.into());
+        let now = Time(Duration::from_secs(t.into()));
         if t < 120 && t % 3 == 0 {
             let i = (t / 3) as JobId;
             let spec = JobSpec {
@@ -147,6 +147,6 @@ fn json_round_trip_replays() {
     assert_eq!(replay(&mut Scheduler::new(config()), back), polls(&events));
     assert!(
         text.iter()
-            .any(|l| l.starts_with(r#"{"type":"input","t":0,"input":{"worker""#))
+            .any(|l| l.starts_with(r#"{"type":"input","t":{"secs":0,"nanos":0},"input":{"worker""#))
     );
 }

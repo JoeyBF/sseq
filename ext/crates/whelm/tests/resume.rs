@@ -11,7 +11,7 @@ use whelm::{
 /// A DAG layer over the default backfill policy with one worker of `slots` slots.
 fn whelm(slots: usize, config: DagConfig) -> DagScheduler<Scheduler> {
     let mut d = DagScheduler::new(config, Scheduler::new(Config::default()));
-    join(&mut d, slots, Time::ZERO);
+    join(&mut d, slots, Time::ORIGIN);
     d
 }
 
@@ -104,9 +104,9 @@ fn local_entry(id: JobId) -> DagJob {
 
 /// A local entry job `1` (the zero step), already completed.
 fn with_entry(d: &mut DagScheduler<Scheduler>) {
-    d.declare(vec![local_entry(1)], Time::ZERO).unwrap();
-    assert_eq!(d.poll(Time::ZERO), vec![Output::RunLocal { job: 1 }]);
-    done(d, 1, 0, Time::ZERO);
+    d.declare(vec![local_entry(1)], Time::ORIGIN).unwrap();
+    assert_eq!(d.poll(Time::ORIGIN), vec![Output::RunLocal { job: 1 }]);
+    done(d, 1, 0, Time::ORIGIN);
 }
 
 /// Per-leaf demands and names, computed on demand.
@@ -135,20 +135,20 @@ impl NodeSource for Squares {
 fn per_node_demand_and_label() {
     let mut d = whelm(16, DagConfig::default()).with_source(Arc::new(Squares));
     let t = template_of(3, []);
-    d.declare(vec![local_entry(1)], Time::ZERO).unwrap();
+    d.declare(vec![local_entry(1)], Time::ORIGIN).unwrap();
     let unit = Unit {
         sourced: true,
         ..walk(&t, 100, 1, 99)
     };
-    d.declare([unit], Time::ZERO).unwrap();
+    d.declare([unit], Time::ORIGIN).unwrap();
     assert!(
         d.explain(101).unwrap().starts_with("[Sq(1)]"),
         "{:?}",
         d.explain(101)
     );
-    assert_eq!(d.poll(Time::ZERO), vec![Output::RunLocal { job: 1 }]);
-    done(&mut d, 1, 0, Time::ZERO);
-    assert_eq!(starts(&d.poll(Time::ZERO)).len(), 3);
+    assert_eq!(d.poll(Time::ORIGIN), vec![Output::RunLocal { job: 1 }]);
+    done(&mut d, 1, 0, Time::ORIGIN);
+    assert_eq!(starts(&d.poll(Time::ORIGIN)).len(), 3);
     assert_eq!(d.stats().workers[0].placed[MEM], 3 + 4 + 7);
 }
 
@@ -158,7 +158,7 @@ fn drive(d: &mut DagScheduler<Scheduler>) -> (Vec<JobId>, usize) {
     let mut order = Vec::new();
     let mut fired = 0;
     for _ in 0..1000 {
-        let out = d.poll(Time::ZERO);
+        let out = d.poll(Time::ORIGIN);
         fired += passed(&out).iter().filter(|&&j| j == 99).count();
         let mut placed = starts(&out);
         if placed.is_empty() {
@@ -167,7 +167,7 @@ fn drive(d: &mut DagScheduler<Scheduler>) -> (Vec<JobId>, usize) {
         placed.sort_unstable();
         for j in placed {
             order.push(j);
-            done(d, j, 1, Time::ZERO);
+            done(d, j, 1, Time::ORIGIN);
         }
     }
     (order, fired)
@@ -207,7 +207,7 @@ proptest! {
         let mut a = whelm(1000, cfg.clone());
         with_entry(&mut a);
         let unit = Unit { completed: s.clone(), ..walk(&t, 100, 1, 99) };
-        a.declare([unit], Time::ZERO).unwrap();
+        a.declare([unit], Time::ORIGIN).unwrap();
         // The reference: the nodes outside S, declared as plain jobs after the entry, and `done`
         // as a passthrough after all of them and the entry.
         let mut b = whelm(1000, cfg);
@@ -233,7 +233,7 @@ proptest! {
             work_estimate: Some(Duration::ZERO),
             ..plain(99, 0, 7, nodes)
         });
-        b.declare(jobs, Time::ZERO).unwrap();
+        b.declare(jobs, Time::ORIGIN).unwrap();
         let (order_a, done_a) = drive(&mut a);
         let (order_b, done_b) = drive(&mut b);
         prop_assert_eq!(&order_a, &order_b);
@@ -258,28 +258,34 @@ fn close_walk_early() {
     with_entry(&mut d);
     // Four independent nodes, a chain after them; two slots.
     let t = template_of(6, [(0, 4), (1, 4), (4, 5)]);
-    d.declare([walk(&t, 100, 1, 99)], Time::ZERO).unwrap();
+    d.declare([walk(&t, 100, 1, 99)], Time::ORIGIN).unwrap();
     // Something after the walk.
-    d.declare(vec![plain(200, 1, 8, vec![99])], Time::ZERO)
+    d.declare(vec![plain(200, 1, 8, vec![99])], Time::ORIGIN)
         .unwrap();
-    assert_eq!(starts(&d.poll(Time::ZERO)), vec![100, 101]);
-    let mut running = d.close(99, Time::from_secs(1)).unwrap();
+    assert_eq!(starts(&d.poll(Time::ORIGIN)), vec![100, 101]);
+    let mut running = d.close(99, Time(Duration::from_secs(1))).unwrap();
     running.sort_unstable();
     assert_eq!(running, vec![100, 101]);
     // The walk passed, and its dependent is ready, but both slots are still taken.
-    assert_eq!(d.poll(Time::from_secs(1)), vec![Output::Passed { job: 99 }]);
+    assert_eq!(
+        d.poll(Time(Duration::from_secs(1))),
+        vec![Output::Passed { job: 99 }]
+    );
     // The waiting nodes were withdrawn.
     let st = d.stats();
     assert_eq!((st.waiting, st.running), (1, 2));
-    assert!(d.close(99, Time::from_secs(1)).is_err(), "closed twice");
+    assert!(
+        d.close(99, Time(Duration::from_secs(1))).is_err(),
+        "closed twice"
+    );
     // Ignored completions free their slots and change nothing else.
-    done(&mut d, 100, 1, Time::from_secs(2));
-    done(&mut d, 101, 1, Time::from_secs(2));
-    let out = d.poll(Time::from_secs(2));
+    done(&mut d, 100, 1, Time(Duration::from_secs(2)));
+    done(&mut d, 101, 1, Time(Duration::from_secs(2)));
+    let out = d.poll(Time(Duration::from_secs(2)));
     assert!(passed(&out).is_empty(), "no second done");
     assert_eq!(starts(&out), vec![200]);
-    done(&mut d, 200, 1, Time::from_secs(3));
-    assert!(d.poll(Time::from_secs(3)).is_empty());
+    done(&mut d, 200, 1, Time(Duration::from_secs(3)));
+    assert!(d.poll(Time(Duration::from_secs(3))).is_empty());
     let st = d.stats();
     assert_eq!((st.waiting, st.running), (0, 0));
     assert_eq!(st.workers[0].placed, Resources::ZERO);
@@ -308,19 +314,22 @@ fn local_jobs_stay_on_the_caller() {
                 ..plain(3, 0, 0, vec![2])
             },
         ],
-        Time::ZERO,
+        Time::ORIGIN,
     )
     .unwrap();
-    assert_eq!(d.poll(Time::ZERO), vec![Output::RunLocal { job: 1 }]);
-    assert!(!d.release(1, Time::ZERO));
-    assert!(d.poll(Time::ZERO).is_empty());
-    done(&mut d, 1, 0, Time::from_secs(1));
-    assert_eq!(d.poll(Time::from_secs(1)), vec![Output::Ready { job: 2 }]);
-    assert!(d.release(2, Time::from_secs(1)));
-    assert_eq!(starts(&d.poll(Time::from_secs(1))), vec![2]);
-    done(&mut d, 2, 1, Time::from_secs(2));
+    assert_eq!(d.poll(Time::ORIGIN), vec![Output::RunLocal { job: 1 }]);
+    assert!(!d.release(1, Time::ORIGIN));
+    assert!(d.poll(Time::ORIGIN).is_empty());
+    done(&mut d, 1, 0, Time(Duration::from_secs(1)));
     assert_eq!(
-        d.poll(Time::from_secs(2)),
+        d.poll(Time(Duration::from_secs(1))),
+        vec![Output::Ready { job: 2 }]
+    );
+    assert!(d.release(2, Time(Duration::from_secs(1))));
+    assert_eq!(starts(&d.poll(Time(Duration::from_secs(1)))), vec![2]);
+    done(&mut d, 2, 1, Time(Duration::from_secs(2)));
+    assert_eq!(
+        d.poll(Time(Duration::from_secs(2))),
         vec![Output::RunLocal { job: 3 }]
     );
     assert_eq!(d.stats().placements_total, 1);
@@ -424,11 +433,11 @@ mod restart {
             jobs.push(plain(600 + k as JobId, 1, 50, vec![done_id(k)]));
             all.insert(600 + k as JobId);
         }
-        d.declare(jobs, Time::ZERO).unwrap();
+        d.declare(jobs, Time::ORIGIN).unwrap();
         for (k, (entry, len, edges, _)) in w.walks.iter().enumerate() {
             let t = template_of(*len, edges.iter().copied());
             let base = WALK_BASE + 100 * k as JobId;
-            d.declare([walk(&t, base, ex_id(*entry), done_id(k))], Time::ZERO)
+            d.declare([walk(&t, base, ex_id(*entry), done_id(k))], Time::ORIGIN)
                 .unwrap();
             all.extend((0..*len).map(|i| base + i as JobId));
         }
@@ -447,7 +456,7 @@ mod restart {
         let mut running: Vec<(JobId, Attempt)> = Vec::new();
         let mut step = 0;
         while completed.len() < all.len() && step < 10_000 {
-            let t = Time::from_secs(step as u64);
+            let t = Time(Duration::from_secs(step as u64));
             if restarts.contains(&step) {
                 let snap = serde_json::to_string(&d.snapshot()).unwrap();
                 d = DagScheduler::restore(
@@ -513,18 +522,19 @@ mod restart {
 #[test]
 fn nothing_runs_before_the_entry() {
     let mut d = whelm(4, DagConfig::default());
-    d.declare(vec![plain(1, 1, 7, vec![])], Time::ZERO).unwrap();
+    d.declare(vec![plain(1, 1, 7, vec![])], Time::ORIGIN)
+        .unwrap();
     let t = template_of(2, [(0, 1)]);
     let unit = Unit {
         completed: vec![0],
         ..walk(&t, 100, 1, 99)
     };
-    d.declare([unit], Time::ZERO).unwrap();
+    d.declare([unit], Time::ORIGIN).unwrap();
     assert_eq!(
-        starts(&d.poll(Time::ZERO)),
+        starts(&d.poll(Time::ORIGIN)),
         vec![1],
         "node 101 ran before the entry"
     );
-    done(&mut d, 1, 1, Time::from_secs(2));
-    assert_eq!(starts(&d.poll(Time::from_secs(2))), vec![101]);
+    done(&mut d, 1, 1, Time(Duration::from_secs(2)));
+    assert_eq!(starts(&d.poll(Time(Duration::from_secs(2)))), vec![101]);
 }

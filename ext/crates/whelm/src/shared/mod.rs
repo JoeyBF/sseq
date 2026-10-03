@@ -14,7 +14,7 @@
 //! use whelm::{Config, JobSpec, Resources, Scheduler, SharedPolicy, Time, WorkerState};
 //!
 //! let shared = Arc::new(SharedPolicy::new(Scheduler::new(Config::fifo()), || {
-//!     Time::ZERO
+//!     Time::ORIGIN
 //! }));
 //! shared.worker_update(WorkerState {
 //!     id: 1,
@@ -104,7 +104,7 @@ impl<P: Policy> SharedPolicy<P> {
     ///
     /// use whelm::{Config, JobSpec, Resources, Scheduler, SharedPolicy, Time, WorkerState};
     ///
-    /// let time = Arc::new(Mutex::new(Time::ZERO));
+    /// let time = Arc::new(Mutex::new(Time::ORIGIN));
     /// let clock = {
     ///     let time = time.clone();
     ///     move || *time.lock().unwrap()
@@ -134,18 +134,18 @@ impl<P: Policy> SharedPolicy<P> {
     /// while shared.waiting() == 0 {
     ///     thread::yield_now();
     /// }
-    /// *time.lock().unwrap() = Time::from_secs(7);
+    /// *time.lock().unwrap() = Time(Duration::from_secs(7));
     /// shared.tick();
-    /// *time.lock().unwrap() = Time::from_secs(3);
+    /// *time.lock().unwrap() = Time(Duration::from_secs(3));
     /// first.complete();
     /// assert_eq!(second.join().unwrap(), Duration::from_secs(7));
-    /// assert_eq!(shared.stats().now, Time::from_secs(7));
+    /// assert_eq!(shared.stats().now, Time(Duration::from_secs(7)));
     /// ```
     pub fn new(policy: P, clock: impl Fn() -> Time + Send + Sync + 'static) -> Self {
         Self {
             state: Mutex::new(State {
                 policy,
-                now: Time::ZERO,
+                now: Time::ORIGIN,
                 jobs: HashMap::new(),
                 ticker_generation: 0,
             }),
@@ -177,7 +177,7 @@ impl<P: Policy> SharedPolicy<P> {
     /// ```
     pub fn with_system_clock(policy: P) -> Self {
         let start = std::time::Instant::now();
-        Self::new(policy, move || Time::ZERO + start.elapsed())
+        Self::new(policy, move || Time::ORIGIN + start.elapsed())
     }
 
     /// Submit `job` and block until the policy starts it. Dropping the lease without
@@ -187,7 +187,7 @@ impl<P: Policy> SharedPolicy<P> {
     /// ```
     /// use whelm::{Config, JobSpec, Resources, Scheduler, SharedPolicy, Time, WorkerState};
     ///
-    /// let shared = SharedPolicy::new(Scheduler::new(Config::default()), || Time::ZERO);
+    /// let shared = SharedPolicy::new(Scheduler::new(Config::default()), || Time::ORIGIN);
     /// shared.worker_update(WorkerState {
     ///     id: 1,
     ///     budget: Resources::mem_gb(8.0),
@@ -213,7 +213,8 @@ impl<P: Policy> SharedPolicy<P> {
     }
 
     /// [`lease`](Self::lease), giving up after `timeout`: the job is then withdrawn from the
-    /// policy and returned. A start made concurrently with the timeout is still returned.
+    /// policy and returned. A start made concurrently with the timeout is still returned. A
+    /// `timeout` too long for an [`Instant`](std::time::Instant) never expires.
     ///
     /// With no worker, the job never starts:
     ///
@@ -222,7 +223,7 @@ impl<P: Policy> SharedPolicy<P> {
     ///
     /// use whelm::{Config, JobSpec, Resources, Scheduler, SharedPolicy, Time};
     ///
-    /// let shared = SharedPolicy::new(Scheduler::new(Config::default()), || Time::ZERO);
+    /// let shared = SharedPolicy::new(Scheduler::new(Config::default()), || Time::ORIGIN);
     /// let job = JobSpec {
     ///     id: 1,
     ///     demand: Resources::mem_gb(1.0),
@@ -240,7 +241,7 @@ impl<P: Policy> SharedPolicy<P> {
         job: JobSpec,
         timeout: Duration,
     ) -> Result<Lease<'_, P>, Box<JobSpec>> {
-        self.lease_until(job, Some(std::time::Instant::now() + timeout))
+        self.lease_until(job, std::time::Instant::now().checked_add(timeout))
     }
 
     /// A worker joined or reported a heartbeat.
@@ -253,7 +254,7 @@ impl<P: Policy> SharedPolicy<P> {
     /// use whelm::{Config, JobSpec, Resources, Scheduler, SharedPolicy, Time, WorkerState};
     ///
     /// let shared = Arc::new(SharedPolicy::new(Scheduler::new(Config::default()), || {
-    ///     Time::ZERO
+    ///     Time::ORIGIN
     /// }));
     /// let task = thread::spawn({
     ///     let shared = shared.clone();
@@ -292,7 +293,7 @@ impl<P: Policy> SharedPolicy<P> {
     /// ```
     /// use whelm::{Config, FailKind, JobSpec, Resources, Scheduler, SharedPolicy, Time, WorkerState};
     ///
-    /// let shared = SharedPolicy::new(Scheduler::new(Config::fifo()), || Time::ZERO);
+    /// let shared = SharedPolicy::new(Scheduler::new(Config::fifo()), || Time::ORIGIN);
     /// for w in [1, 2] {
     ///     shared.worker_update(WorkerState {
     ///         id: w,
@@ -357,7 +358,7 @@ impl<P: Policy> SharedPolicy<P> {
     ///     Config, JobSpec, Reservations, Resources, Scheduler, SharedPolicy, Time, WorkerState,
     /// };
     ///
-    /// let time = Arc::new(Mutex::new(Time::ZERO));
+    /// let time = Arc::new(Mutex::new(Time::ORIGIN));
     /// let clock = {
     ///     let time = time.clone();
     ///     move || *time.lock().unwrap()
@@ -391,7 +392,7 @@ impl<P: Policy> SharedPolicy<P> {
     /// }
     ///
     /// let wake = shared.next_wakeup().unwrap();
-    /// assert_eq!(wake, Time::ZERO + Reservations::default().reserve_after);
+    /// assert_eq!(wake, Time::ORIGIN + Reservations::default().reserve_after);
     /// *time.lock().unwrap() = wake;
     /// shared.tick();
     /// assert_eq!(shared.stats().reservations[0].job, 2);
@@ -424,7 +425,7 @@ impl<P: Policy> SharedPolicy<P> {
     /// ```
     /// use whelm::{Config, Input, JobSpec, Policy, Resources, Scheduler, SharedPolicy, Time};
     ///
-    /// let shared = SharedPolicy::new(Scheduler::new(Config::default()), || Time::ZERO);
+    /// let shared = SharedPolicy::new(Scheduler::new(Config::default()), || Time::ORIGIN);
     /// shared.worker_update(whelm::WorkerState {
     ///     id: 1,
     ///     budget: Resources::mem_gb(8.0),
@@ -473,7 +474,7 @@ impl<P: Policy + Send + 'static> SharedPolicy<P> {
     /// #     time::Duration,
     /// # };
     /// # use whelm::{Config, JobSpec, Resources, Scheduler, SharedPolicy, Time, WorkerState};
-    /// # let time = Arc::new(Mutex::new(Time::ZERO));
+    /// # let time = Arc::new(Mutex::new(Time::ORIGIN));
     /// # let clock = {
     /// #     let time = time.clone();
     /// #     move || *time.lock().unwrap()

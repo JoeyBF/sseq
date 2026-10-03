@@ -134,8 +134,11 @@ fn main() {
     let before = rss();
     let mut open = layer(false);
     let clock = Instant::now();
-    open.declare((0..OPEN_UNITS).map(|k| unit(&t, k, Vec::new())), Time::ZERO)
-        .unwrap();
+    open.declare(
+        (0..OPEN_UNITS).map(|k| unit(&t, k, Vec::new())),
+        Time::ORIGIN,
+    )
+    .unwrap();
     let opened = clock.elapsed().as_secs_f64();
     let grown = rss() - before;
     let s = open.dag_stats();
@@ -161,7 +164,7 @@ fn main() {
             deps.push(k - WIDTH);
         }
         edges += deps.len();
-        d.declare([unit(&t, k, deps)], Time::ZERO).unwrap();
+        d.declare([unit(&t, k, deps)], Time::ORIGIN).unwrap();
     }
     let declared = clock.elapsed().as_secs_f64();
     let grown = rss() - before;
@@ -179,11 +182,11 @@ fn main() {
     let (mut completed, mut rounds, mut peak_nodes, mut peak_open) = (0u64, 0u64, 0, 0);
     let mut next_sample = 0;
     while completed < virtual_nodes {
-        let out = d.poll(Time::from_secs(1));
+        let out = d.poll(Time(Duration::from_secs(1)));
         assert!(!out.is_empty(), "stalled after {completed} completions");
         for o in out {
             if let Output::Start { job, attempt, .. } = o {
-                d.handle(Input::Done { job, attempt }, Time::from_secs(1));
+                d.handle(Input::Done { job, attempt }, Time(Duration::from_secs(1)));
                 completed += 1;
             }
         }

@@ -50,7 +50,7 @@ pub struct TaskInfo {
     pub sig: Vec<u32>,
 }
 
-/// One logged event. Times are on the policy's clock, written as integer nanoseconds ([`Time`]).
+/// One logged event. Times are on the policy's clock ([`Time`]).
 ///
 /// The [`Input`](Event::Input) and [`Poll`](Event::Poll) records are the whole run: feeding them
 /// back with [`replay`] reproduces every output, reservations included. [`Sample`](Event::Sample)
@@ -63,7 +63,7 @@ pub struct TaskInfo {
 /// use whelm::{Input, JobSpec, Resources, Time, log::Event};
 ///
 /// let submit = Event::Input {
-///     t: Time::ZERO,
+///     t: Time::ORIGIN,
 ///     input: Input::Submit(JobSpec {
 ///         id: 1,
 ///         demand: Resources::mem_gb(1.0),
@@ -72,7 +72,7 @@ pub struct TaskInfo {
 ///     info: None,
 /// };
 /// let poll = Event::Poll {
-///     t: Time::ZERO,
+///     t: Time::ORIGIN,
 ///     out: Vec::new(),
 /// };
 /// # let _ = (submit, poll);

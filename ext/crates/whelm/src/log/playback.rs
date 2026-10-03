@@ -23,12 +23,12 @@ use crate::{Output, Policy, Time};
 /// };
 /// let events = vec![
 ///     Event::Input {
-///         t: Time::ZERO,
+///         t: Time::ORIGIN,
 ///         input: Input::Worker(w),
 ///         info: None,
 ///     },
 ///     Event::Input {
-///         t: Time::ZERO,
+///         t: Time::ORIGIN,
 ///         input: Input::Submit(JobSpec {
 ///             id: 1,
 ///             demand: Resources::mem_gb(1.0),
@@ -37,7 +37,7 @@ use crate::{Output, Policy, Time};
 ///         info: None,
 ///     },
 ///     Event::Poll {
-///         t: Time::ZERO,
+///         t: Time::ORIGIN,
 ///         out: Vec::new(),
 ///     },
 /// ];
@@ -45,7 +45,7 @@ use crate::{Output, Policy, Time};
 /// assert_eq!(
 ///     replayed,
 ///     [(
-///         Time::ZERO,
+///         Time::ORIGIN,
 ///         vec![Output::Start {
 ///             job: 1,
 ///             attempt: 1,
@@ -53,7 +53,7 @@ use crate::{Output, Policy, Time};
 ///         }]
 ///     )]
 /// );
-/// assert_eq!(log::polls(&events), [(Time::ZERO, vec![])]);
+/// assert_eq!(log::polls(&events), [(Time::ORIGIN, vec![])]);
 /// ```
 pub fn replay<P: Policy + ?Sized>(
     policy: &mut P,

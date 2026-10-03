@@ -30,7 +30,7 @@ use crate::{DagJob, DagScheduler, JobSpec, Output, TemplateSpec};
 /// };
 /// let ranks = |config| {
 ///     let mut dag = DagScheduler::new(config, Scheduler::new(Config::fifo()));
-///     dag.declare([job(1, vec![]), job(2, vec![1])], Time::ZERO)
+///     dag.declare([job(1, vec![]), job(2, vec![1])], Time::ORIGIN)
 ///         .unwrap();
 ///     (dag.rank(1), dag.rank(2))
 /// };
@@ -126,11 +126,11 @@ impl Default for DagConfig {
 ///     template: Arc::new(TemplateSpec::jobs(3).build().unwrap()),
 ///     ..Default::default()
 /// };
-/// dag.declare([unit], Time::ZERO).unwrap();
+/// dag.declare([unit], Time::ORIGIN).unwrap();
 ///
 /// let cycle = [job(1, vec![2]), job(2, vec![1])];
 /// assert_eq!(
-///     dag.declare(cycle, Time::ZERO),
+///     dag.declare(cycle, Time::ORIGIN),
 ///     Err(DagError::Cycle { job: 1 })
 /// );
 /// assert_eq!(
@@ -143,18 +143,18 @@ impl Default for DagConfig {
 ///     DagError::Cycle { job: 0 }
 /// );
 /// assert_eq!(
-///     dag.declare([job(99, vec![])], Time::ZERO),
+///     dag.declare([job(99, vec![])], Time::ORIGIN),
 ///     Err(DagError::Duplicate(99))
 /// );
 /// assert_eq!(
-///     dag.declare([job(11, vec![])], Time::ZERO),
+///     dag.declare([job(11, vec![])], Time::ORIGIN),
 ///     Err(DagError::Overlap(11))
 /// );
 /// assert_eq!(
-///     dag.declare([job(5, vec![11])], Time::ZERO),
+///     dag.declare([job(5, vec![11])], Time::ORIGIN),
 ///     Err(DagError::Overlap(11))
 /// );
-/// assert_eq!(dag.close(42, Time::ZERO), Err(DagError::NotFound(42)));
+/// assert_eq!(dag.close(42, Time::ORIGIN), Err(DagError::NotFound(42)));
 /// assert_eq!(
 ///     DagError::NotFound(42).to_string(),
 ///     "no live unit contains job 42"

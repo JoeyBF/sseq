@@ -151,18 +151,19 @@ impl<P: Policy> DagScheduler<P> {
     /// it is refused and the graph is as it was. A dependency on a completed job is met.
     ///
     /// ```
+    /// # use std::time::Duration;
     /// # use whelm::{
     /// #     Config, DagConfig, DagError, DagJob, DagScheduler, Input, JobSpec, Output, Policy,
     /// #     Scheduler, Time, WorkerState,
     /// # };
     /// # let mut dag = DagScheduler::new(DagConfig::default(), Scheduler::new(Config::fifo()));
-    /// # dag.handle(Input::Worker(WorkerState { id: 1, ..Default::default() }), Time::ZERO);
+    /// # dag.handle(Input::Worker(WorkerState { id: 1, ..Default::default() }), Time::ORIGIN);
     /// # let job = |id, deps| DagJob {
     /// #     spec: JobSpec { id, ..Default::default() },
     /// #     deps,
     /// #     ..Default::default()
     /// # };
-    /// dag.declare([job(1, vec![]), job(3, vec![2])], Time::ZERO)
+    /// dag.declare([job(1, vec![]), job(3, vec![2])], Time::ORIGIN)
     ///     .unwrap();
     /// assert_eq!(dag.explain(3).unwrap(), "job 3 waits for 1 dependency [2]");
     /// assert_eq!(
@@ -171,23 +172,27 @@ impl<P: Policy> DagScheduler<P> {
     /// );
     /// let before = dag.dag_stats();
     /// assert_eq!(
-    ///     dag.declare([job(2, vec![3])], Time::ZERO),
+    ///     dag.declare([job(2, vec![3])], Time::ORIGIN),
     ///     Err(DagError::Cycle { job: 2 })
     /// );
     /// assert_eq!(dag.dag_stats(), before);
     ///
     /// assert_eq!(
-    ///     dag.poll(Time::ZERO),
+    ///     dag.poll(Time::ORIGIN),
     ///     vec![Output::Start {
     ///         job: 1,
     ///         attempt: 1,
     ///         worker: 1
     ///     }]
     /// );
-    /// dag.handle(Input::Done { job: 1, attempt: 1 }, Time::from_secs(1));
-    /// dag.declare([job(2, vec![1])], Time::from_secs(1)).unwrap();
+    /// dag.handle(
+    ///     Input::Done { job: 1, attempt: 1 },
+    ///     Time(Duration::from_secs(1)),
+    /// );
+    /// dag.declare([job(2, vec![1])], Time(Duration::from_secs(1)))
+    ///     .unwrap();
     /// assert_eq!(
-    ///     dag.poll(Time::from_secs(1)),
+    ///     dag.poll(Time(Duration::from_secs(1))),
     ///     vec![Output::Start {
     ///         job: 2,
     ///         attempt: 1,
@@ -274,22 +279,22 @@ impl<P: Policy> DagScheduler<P> {
     /// # };
     /// # let config = DagConfig { auto_submit: false, ..DagConfig::default() };
     /// # let mut dag = DagScheduler::new(config, Scheduler::new(Config::fifo()));
-    /// # dag.handle(Input::Worker(WorkerState { id: 1, ..Default::default() }), Time::ZERO);
+    /// # dag.handle(Input::Worker(WorkerState { id: 1, ..Default::default() }), Time::ORIGIN);
     /// # let job = |id, deps| DagJob {
     /// #     spec: JobSpec { id, ..Default::default() },
     /// #     deps,
     /// #     ..Default::default()
     /// # };
-    /// dag.declare([job(1, vec![]), job(2, vec![])], Time::ZERO)
+    /// dag.declare([job(1, vec![]), job(2, vec![])], Time::ORIGIN)
     ///     .unwrap();
     /// assert_eq!(
     ///     dag.announcements(),
     ///     vec![Output::Ready { job: 1 }, Output::Ready { job: 2 }]
     /// );
     /// assert!(dag.announcements().is_empty());
-    /// assert!(dag.release(2, Time::ZERO) && dag.release(1, Time::ZERO));
+    /// assert!(dag.release(2, Time::ORIGIN) && dag.release(1, Time::ORIGIN));
     /// assert_eq!(
-    ///     dag.poll(Time::ZERO),
+    ///     dag.poll(Time::ORIGIN),
     ///     vec![Output::Start {
     ///         job: 2,
     ///         attempt: 1,

@@ -18,7 +18,7 @@ fn dag(config: DagConfig) -> DagScheduler<Scheduler> {
         budget: Resources::mem(1000),
         ..Default::default()
     };
-    d.handle(Input::Worker(w), Time::ZERO);
+    d.handle(Input::Worker(w), Time::ORIGIN);
     d
 }
 
@@ -108,23 +108,23 @@ fn passthrough_jobs_complete_by_themselves() {
             passthrough(2, &[1], Duration::from_secs(5)),
             job(3, &[2]),
         ],
-        Time::ZERO,
+        Time::ORIGIN,
     )
     .unwrap();
-    assert_eq!(placed(&mut d, Time::ZERO), vec![1]);
+    assert_eq!(placed(&mut d, Time::ORIGIN), vec![1]);
     assert_eq!(
         d.rank(1),
         Some(Duration::from_secs(7)),
         "the passthrough's work counts in ranks"
     );
-    complete(&mut d, 1, Time::from_secs(1));
+    complete(&mut d, 1, Time(Duration::from_secs(1)));
     let start = Output::Start {
         job: 3,
         attempt: 1,
         worker: 0,
     };
     assert_eq!(
-        d.poll(Time::from_secs(1)),
+        d.poll(Time(Duration::from_secs(1))),
         vec![Output::Passed { job: 2 }, start]
     );
     assert_eq!(d.stats().placements_total, 2);
@@ -176,16 +176,16 @@ fn a_source_makes_a_leaf_a_passthrough_in_one_unit() {
         sourced: true,
         ..Default::default()
     };
-    d.declare([unit(10, 100), unit(20, 200)], Time::ZERO)
+    d.declare([unit(10, 100), unit(20, 200)], Time::ORIGIN)
         .unwrap();
     let secs = Duration::from_secs;
     assert_eq!(d.rank(100), Some(secs(1 + 3)), "the no-op weighs nothing");
     assert_eq!(d.rank(200), Some(secs(1 + 2 + 3)));
-    assert_eq!(placed(&mut d, Time::ZERO), vec![100, 200]);
-    complete(&mut d, 100, Time::from_secs(1));
-    complete(&mut d, 200, Time::from_secs(1));
+    assert_eq!(placed(&mut d, Time::ORIGIN), vec![100, 200]);
+    complete(&mut d, 100, Time(Duration::from_secs(1)));
+    complete(&mut d, 200, Time(Duration::from_secs(1)));
     assert_eq!(
-        d.poll(Time::from_secs(1)),
+        d.poll(Time(Duration::from_secs(1))),
         vec![
             Output::Passed { job: 101 },
             Output::RunLocal { job: 201 },
@@ -206,10 +206,10 @@ fn long_passthrough_chains_do_not_recurse() {
     let mut jobs = vec![job(0, &[])];
     jobs.extend((1..N).map(|i| passthrough(i, &[i - 1], Duration::ZERO)));
     jobs.push(job(N, &[N - 1]));
-    d.declare(jobs, Time::ZERO).unwrap();
-    assert_eq!(placed(&mut d, Time::ZERO), vec![0]);
-    complete(&mut d, 0, Time::from_secs(1));
-    assert_eq!(placed(&mut d, Time::from_secs(1)), vec![N]);
+    d.declare(jobs, Time::ORIGIN).unwrap();
+    assert_eq!(placed(&mut d, Time::ORIGIN), vec![0]);
+    complete(&mut d, 0, Time(Duration::from_secs(1)));
+    assert_eq!(placed(&mut d, Time(Duration::from_secs(1))), vec![N]);
     assert_eq!(d.dag_stats().pending, 0);
 }
 
@@ -219,10 +219,10 @@ fn a_ready_passthrough_completes_at_declaration() {
     let mut d = dag(DagConfig::default());
     d.declare(
         vec![passthrough(1, &[], Duration::ZERO), job(2, &[1])],
-        Time::ZERO,
+        Time::ORIGIN,
     )
     .unwrap();
-    assert_eq!(placed(&mut d, Time::ZERO), vec![2]);
+    assert_eq!(placed(&mut d, Time::ORIGIN), vec![2]);
 }
 
 /// Lowering and raising work moves ranks both ways, switching the critical path.
@@ -240,7 +240,7 @@ fn update_work_raises_and_lowers_ranks() {
             worked(3, &[1], Duration::from_secs(2)),
             worked(4, &[2, 3], Duration::from_secs(1)),
         ],
-        Time::ZERO,
+        Time::ORIGIN,
     )
     .unwrap();
     assert_eq!(d.rank(1), Some(Duration::from_secs(12)));
@@ -319,11 +319,11 @@ fn units_of_a_template() {
             },
             ..Default::default()
         };
-        d.declare([unit], Time::ZERO).unwrap();
+        d.declare([unit], Time::ORIGIN).unwrap();
     }
     let mut order = Vec::new();
     for step in 0..10 {
-        let now = Time::from_secs(step);
+        let now = Time(Duration::from_secs(step));
         let out = placed(&mut d, now);
         for &j in &out {
             complete(&mut d, j, now + Duration::from_millis(500));
@@ -381,28 +381,28 @@ fn substituted_units() {
     };
     d.declare(
         [unit, worked(2, &[1], Duration::from_secs(7)).into()],
-        Time::ZERO,
+        Time::ORIGIN,
     )
     .unwrap();
     // Leaf 12 (inner node 1): 2 * (3 + 4) + 7.
     assert_eq!(d.rank(12), Some(Duration::from_secs(21)));
     assert_eq!(d.rank(1), Some(Duration::from_secs(27)));
-    assert_eq!(placed(&mut d, Time::ZERO), vec![10, 14]);
+    assert_eq!(placed(&mut d, Time::ORIGIN), vec![10, 14]);
     assert!(
         d.explain(11).unwrap().contains("to be entered"),
         "{:?}",
         d.explain(11)
     );
-    complete(&mut d, 10, Time::from_secs(1));
-    assert_eq!(placed(&mut d, Time::from_secs(1)), vec![11]);
+    complete(&mut d, 10, Time(Duration::from_secs(1)));
+    assert_eq!(placed(&mut d, Time(Duration::from_secs(1))), vec![11]);
     assert_eq!(d.dag_stats().frames, 2);
-    complete(&mut d, 11, Time::from_secs(2));
-    assert_eq!(placed(&mut d, Time::from_secs(2)), vec![12]);
-    complete(&mut d, 12, Time::from_secs(3));
-    assert_eq!(placed(&mut d, Time::from_secs(3)), vec![13]);
-    complete(&mut d, 13, Time::from_secs(4));
-    complete(&mut d, 14, Time::from_secs(4));
-    assert_eq!(placed(&mut d, Time::from_secs(4)), vec![2]);
+    complete(&mut d, 11, Time(Duration::from_secs(2)));
+    assert_eq!(placed(&mut d, Time(Duration::from_secs(2))), vec![12]);
+    complete(&mut d, 12, Time(Duration::from_secs(3)));
+    assert_eq!(placed(&mut d, Time(Duration::from_secs(3))), vec![13]);
+    complete(&mut d, 13, Time(Duration::from_secs(4)));
+    complete(&mut d, 14, Time(Duration::from_secs(4)));
+    assert_eq!(placed(&mut d, Time(Duration::from_secs(4))), vec![2]);
     assert_eq!(d.dag_stats().frames, 1, "only job 2's");
 }
 
@@ -420,8 +420,8 @@ fn forbid_and_class_are_hard_constraints() {
         };
         p.handle(Input::Worker(w), now);
     };
-    join(&mut p, 1, "h200", 4, Time::ZERO);
-    join(&mut p, 2, "l40s", 4, Time::ZERO);
+    join(&mut p, 1, "h200", 4, Time::ORIGIN);
+    join(&mut p, 2, "l40s", 4, Time::ORIGIN);
     let spec = |id, constraints| JobSpec {
         id,
         demand: Resources::mem(1),
@@ -432,17 +432,17 @@ fn forbid_and_class_are_hard_constraints() {
         1,
         vec![Constraint::forbid_worker(1), Constraint::prefer_worker(1)],
     );
-    p.handle(Input::Submit(retry), Time::ZERO);
+    p.handle(Input::Submit(retry), Time::ORIGIN);
     let pinned = spec(2, vec![Constraint::require_class("h200")]);
-    p.handle(Input::Submit(pinned), Time::ZERO);
-    assert_eq!(starts(&mut p, Time::ZERO), vec![(1, 2), (2, 1)]);
+    p.handle(Input::Submit(pinned), Time::ORIGIN);
+    assert_eq!(starts(&mut p, Time::ORIGIN), vec![(1, 2), (2, 1)]);
     // A job excluded everywhere waits, and says why.
     let nowhere = spec(3, vec![Constraint::require_class("v100")]);
-    p.handle(Input::Submit(nowhere), Time::from_secs(1));
-    assert!(starts(&mut p, Time::from_secs(1)).is_empty());
+    p.handle(Input::Submit(nowhere), Time(Duration::from_secs(1)));
+    assert!(starts(&mut p, Time(Duration::from_secs(1))).is_empty());
     assert!(p.explain(3).unwrap().contains("2 worker(s) excluded"));
-    join(&mut p, 3, "v100", 1, Time::from_secs(2));
-    assert_eq!(starts(&mut p, Time::from_secs(2)), vec![(3, 3)]);
+    join(&mut p, 3, "v100", 1, Time(Duration::from_secs(2)));
+    assert_eq!(starts(&mut p, Time(Duration::from_secs(2))), vec![(3, 3)]);
 }
 
 /// The exact longest path below each job, by brute force.
@@ -512,7 +512,7 @@ proptest! {
         let ids: Vec<JobId> = (0..n as JobId).rev().collect();
         for chunk in ids.chunks(batch) {
             let jobs: Vec<DagJob> = chunk.iter().map(|&i| worked(i, &deps[&i], work[&i])).collect();
-            d.declare(jobs, Time::ZERO).unwrap();
+            d.declare(jobs, Time::ORIGIN).unwrap();
         }
         for (j, w) in updates {
             if j < n {

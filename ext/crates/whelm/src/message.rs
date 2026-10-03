@@ -40,6 +40,8 @@ pub enum FailKind {
 /// A worker leaving is recorded like a reported failure.
 ///
 /// ```
+/// use std::time::Duration;
+///
 /// use whelm::{
 ///     Config, FailKind, GaveUp, Input, JobSpec, Output, Policy, RetryConfig, Scheduler, Time,
 ///     Tried, WorkerState,
@@ -56,24 +58,24 @@ pub enum FailKind {
 ///         class: "cpu".into(),
 ///         ..Default::default()
 ///     }),
-///     Time::ZERO,
+///     Time::ORIGIN,
 /// );
 /// p.handle(
 ///     Input::Submit(JobSpec {
 ///         id: 1,
 ///         ..Default::default()
 ///     }),
-///     Time::ZERO,
+///     Time::ORIGIN,
 /// );
-/// p.poll(Time::ZERO);
-/// p.handle(Input::WorkerGone(3), Time::from_secs(1));
+/// p.poll(Time::ORIGIN);
+/// p.handle(Input::WorkerGone(3), Time(Duration::from_secs(1)));
 /// let tried = Tried {
 ///     worker: 3,
 ///     kind: FailKind::LinkDied,
 ///     why: "worker 3 left".into(),
 /// };
 /// assert_eq!(
-///     p.poll(Time::from_secs(1)),
+///     p.poll(Time(Duration::from_secs(1))),
 ///     [Output::GaveUp(GaveUp {
 ///         job: 1,
 ///         tried: vec![tried],
@@ -190,17 +192,17 @@ pub enum Input {
 ///         slots: 2,
 ///         ..Default::default()
 ///     }),
-///     Time::ZERO,
+///     Time::ORIGIN,
 /// );
 /// p.handle(
 ///     Input::Submit(JobSpec {
 ///         id: 1,
 ///         ..Default::default()
 ///     }),
-///     Time::ZERO,
+///     Time::ORIGIN,
 /// );
 /// let mut sent = Vec::new();
-/// for out in p.poll(Time::ZERO) {
+/// for out in p.poll(Time::ORIGIN) {
 ///     match out {
 ///         Output::Start {
 ///             job,
@@ -326,7 +328,7 @@ pub enum Output {
 ///         slots: 4,
 ///         ..Default::default()
 ///     }),
-///     Time::ZERO,
+///     Time::ORIGIN,
 /// );
 /// for id in 1..=3 {
 ///     p.handle(
@@ -334,10 +336,10 @@ pub enum Output {
 ///             id,
 ///             ..Default::default()
 ///         }),
-///         Time::ZERO,
+///         Time::ORIGIN,
 ///     );
 /// }
-/// p.poll(Time::ZERO);
+/// p.poll(Time::ORIGIN);
 /// assert_eq!(p.starts, 3);
 /// ```
 pub trait Policy {

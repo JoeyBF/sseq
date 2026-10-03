@@ -102,7 +102,7 @@
 //!         id: 1,
 //!         ..Default::default()
 //!     }),
-//!     Time::ZERO,
+//!     Time::ORIGIN,
 //! );
 //!
 //! // Unit 1000 has jobs 0..3, unit 2000 jobs 10..13 and waits for unit 1000.
@@ -119,7 +119,7 @@
 //!     deps: vec![1000],
 //!     ..Default::default()
 //! };
-//! dag.declare([first, second], Time::ZERO).unwrap();
+//! dag.declare([first, second], Time::ORIGIN).unwrap();
 //! // Ranks run through both units: 1 + 2 in each.
 //! assert_eq!(
 //!     [0, 1, 10].map(|j| dag.rank(j)),
@@ -128,20 +128,29 @@
 //! let stats = dag.dag_stats();
 //! assert_eq!((stats.units, stats.open, stats.frames), (2, 1, 1));
 //!
-//! assert_eq!(dag.poll(Time::ZERO), vec![Output::RunLocal { job: 0 }]);
-//! dag.handle(Input::Done { job: 0, attempt: 0 }, Time::from_secs(1));
+//! assert_eq!(dag.poll(Time::ORIGIN), vec![Output::RunLocal { job: 0 }]);
+//! dag.handle(
+//!     Input::Done { job: 0, attempt: 0 },
+//!     Time(Duration::from_secs(1)),
+//! );
 //! let start = |job| Output::Start {
 //!     job,
 //!     attempt: 1,
 //!     worker: 1,
 //! };
-//! assert_eq!(dag.poll(Time::from_secs(1)), vec![start(1)]);
-//! dag.handle(Input::Done { job: 1, attempt: 1 }, Time::from_secs(3));
-//! assert_eq!(dag.poll(Time::from_secs(3)), vec![start(2)]);
+//! assert_eq!(dag.poll(Time(Duration::from_secs(1))), vec![start(1)]);
+//! dag.handle(
+//!     Input::Done { job: 1, attempt: 1 },
+//!     Time(Duration::from_secs(3)),
+//! );
+//! assert_eq!(dag.poll(Time(Duration::from_secs(3))), vec![start(2)]);
 //! // The last job of unit 1000 completes it, which enters unit 2000.
-//! dag.handle(Input::Done { job: 2, attempt: 1 }, Time::from_secs(5));
+//! dag.handle(
+//!     Input::Done { job: 2, attempt: 1 },
+//!     Time(Duration::from_secs(5)),
+//! );
 //! assert_eq!(
-//!     dag.poll(Time::from_secs(5)),
+//!     dag.poll(Time(Duration::from_secs(5))),
 //!     vec![Output::RunLocal { job: 10 }]
 //! );
 //! let stats = dag.dag_stats();
@@ -315,6 +324,8 @@ impl Loc {
 /// dependent follows.
 ///
 /// ```
+/// use std::time::Duration;
+///
 /// use whelm::{
 ///     Config, DagConfig, DagJob, DagScheduler, FailKind, GaveUp, Input, JobSpec, Output, Policy,
 ///     RetryConfig, Scheduler, Time, WorkerState,
@@ -330,7 +341,7 @@ impl Loc {
 ///         id: 1,
 ///         ..Default::default()
 ///     }),
-///     Time::ZERO,
+///     Time::ORIGIN,
 /// );
 /// let job = |id, deps| DagJob {
 ///     spec: JobSpec {
@@ -340,10 +351,10 @@ impl Loc {
 ///     deps,
 ///     ..Default::default()
 /// };
-/// dag.declare([job(1, vec![]), job(2, vec![1])], Time::ZERO)
+/// dag.declare([job(1, vec![]), job(2, vec![1])], Time::ORIGIN)
 ///     .unwrap();
 /// assert_eq!(
-///     dag.poll(Time::ZERO),
+///     dag.poll(Time::ORIGIN),
 ///     vec![Output::Start {
 ///         job: 1,
 ///         attempt: 1,
@@ -359,27 +370,30 @@ impl Loc {
 ///         kind: FailKind::Other,
 ///         why,
 ///     },
-///     Time::from_secs(1),
+///     Time(Duration::from_secs(1)),
 /// );
-/// let out = dag.poll(Time::from_secs(1));
+/// let out = dag.poll(Time(Duration::from_secs(1)));
 /// assert!(matches!(out[..], [Output::GaveUp(GaveUp { job: 1, .. })]));
 /// assert_eq!(
 ///     dag.explain(1).unwrap(),
 ///     "job 1 is ready and held until release"
 /// );
 ///
-/// assert!(dag.release(1, Time::from_secs(2)));
+/// assert!(dag.release(1, Time(Duration::from_secs(2))));
 /// assert_eq!(
-///     dag.poll(Time::from_secs(2)),
+///     dag.poll(Time(Duration::from_secs(2))),
 ///     vec![Output::Start {
 ///         job: 1,
 ///         attempt: 1,
 ///         worker: 1
 ///     }]
 /// );
-/// dag.handle(Input::Done { job: 1, attempt: 1 }, Time::from_secs(3));
+/// dag.handle(
+///     Input::Done { job: 1, attempt: 1 },
+///     Time(Duration::from_secs(3)),
+/// );
 /// assert_eq!(
-///     dag.poll(Time::from_secs(3)),
+///     dag.poll(Time(Duration::from_secs(3))),
 ///     vec![Output::Start {
 ///         job: 2,
 ///         attempt: 1,
@@ -434,15 +448,15 @@ impl<P: Policy> DagScheduler<P> {
     ///         id: 1,
     ///         ..Default::default()
     ///     }),
-    ///     Time::ZERO,
+    ///     Time::ORIGIN,
     /// );
     /// let job = JobSpec {
     ///     id: 7,
     ///     ..Default::default()
     /// };
-    /// dag.handle(Input::Submit(job), Time::ZERO);
+    /// dag.handle(Input::Submit(job), Time::ORIGIN);
     /// assert_eq!(
-    ///     dag.poll(Time::ZERO),
+    ///     dag.poll(Time::ORIGIN),
     ///     vec![Output::Start {
     ///         job: 7,
     ///         attempt: 1,
@@ -469,7 +483,7 @@ impl<P: Policy> DagScheduler<P> {
             live: HashMap::new(),
             ignored: HashSet::new(),
             quiet: HashSet::new(),
-            now: Time::ZERO,
+            now: Time::ORIGIN,
         }
     }
 
@@ -492,13 +506,13 @@ impl<P: Policy> DagScheduler<P> {
     /// #     Time, WorkerState,
     /// # };
     /// # let mut dag = DagScheduler::new(DagConfig::default(), Scheduler::new(Config::fifo()));
-    /// # dag.handle(Input::Worker(WorkerState { id: 1, ..Default::default() }), Time::ZERO);
+    /// # dag.handle(Input::Worker(WorkerState { id: 1, ..Default::default() }), Time::ORIGIN);
     /// # let job = |id, deps| DagJob {
     /// #     spec: JobSpec { id, ..Default::default() },
     /// #     deps,
     /// #     ..Default::default()
     /// # };
-    /// dag.declare([job(1, vec![]), job(2, vec![1])], Time::ZERO)
+    /// dag.declare([job(1, vec![]), job(2, vec![1])], Time::ORIGIN)
     ///     .unwrap();
     /// assert_eq!(dag.policy().stats().waiting, 1);
     /// ```

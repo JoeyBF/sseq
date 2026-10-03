@@ -462,7 +462,7 @@ fn scheduler(eps: f64) -> DagScheduler<Scheduler> {
     };
     let mut d =
         DagScheduler::new(config, Scheduler::new(Config::default())).with_source(Arc::new(Works));
-    join(&mut d, Time::ZERO);
+    join(&mut d, Time::ORIGIN);
     d
 }
 
@@ -531,11 +531,11 @@ proptest! {
         while at < order.len() {
             let batch = &order[at..(at + 1 + rng.below(3)).min(order.len())];
             at += batch.len();
-            d.declare(batch.iter().map(|&k| units[k].unit()), Time::ZERO).unwrap();
+            d.declare(batch.iter().map(|&k| units[k].unit()), Time::ORIGIN).unwrap();
             for &k in batch {
                 r.declared[k] = true;
             }
-            let (got, want) = (set(d.poll(Time::ZERO)), r.advance());
+            let (got, want) = (set(d.poll(Time::ORIGIN)), r.advance());
             prop_assert_eq!(&got, &want, "after declaring {:?}", batch);
             ready.extend(got.into_iter().filter(|o| !matches!(o, Ann::Passed(_))));
         }
@@ -545,7 +545,7 @@ proptest! {
         let longest = r.ranks.iter().copied().fold(0.0, f64::max);
         let slack = ((1.0 + eps).powi(units.len() as i32) - 1.0) * longest + 1e-9;
         loop {
-            let t = Time::from_secs(steps as u64);
+            let t = Time(Duration::from_secs(steps as u64));
             // Materialised or not.
             for (&job, &v) in r.by_id.iter().filter(|&(_, &v)| !r.done[v]) {
                 let (got, want) = (d.rank(job).unwrap().as_secs_f64(), r.ranks[v]);

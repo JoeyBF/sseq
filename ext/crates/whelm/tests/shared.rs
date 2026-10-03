@@ -207,7 +207,7 @@ fn ticker_releases_timed_waits() {
 /// with its worker before the thread picked it up: it gets the job's next start, not the lost one.
 #[test]
 fn lost_retry_is_not_handed_out() {
-    let s = SharedPolicy::new(Scheduler::new(Config::default()), || Time::ZERO);
+    let s = SharedPolicy::new(Scheduler::new(Config::default()), || Time::ORIGIN);
     s.worker_update(worker(1, 1));
     s.worker_update(worker(2, 1));
     let lease = s.lease(job(7));
@@ -237,7 +237,7 @@ fn lost_last_retry_gives_up() {
         retry: RetryConfig { max_attempts: 2 },
         ..Config::default()
     };
-    let s = SharedPolicy::new(Scheduler::new(config), || Time::ZERO);
+    let s = SharedPolicy::new(Scheduler::new(config), || Time::ORIGIN);
     s.worker_update(worker(1, 1));
     s.worker_update(worker(2, 1));
     let lease = s.lease(job(7));
@@ -562,7 +562,7 @@ proptest! {
     fn attempts_avoid_and_no_leaks(ops in prop::collection::vec(op(), 1..120)) {
         let config = Config { retry: RetryConfig { max_attempts: MAX_ATTEMPTS }, ..Config::default() };
         let probe = Probe { inner: Scheduler::new(config), outputs: Vec::new(), failures: 0 };
-        let s = SharedPolicy::new(probe, || Time::ZERO);
+        let s = SharedPolicy::new(probe, || Time::ORIGIN);
         std::thread::scope(|scope| {
             let mut m = Model { s: &s, scope, workers: BTreeMap::new(), jobs: BTreeMap::new() };
             let r = ops.iter().try_for_each(|op| m.apply(op));
@@ -743,7 +743,7 @@ fn poll_p99_at_frontier_size() {
             budget: Resources::mem_gb(150.0),
             ..Default::default()
         };
-        p.handle(Input::Worker(w), Time::ZERO);
+        p.handle(Input::Worker(w), Time::ORIGIN);
     }
     let mut next = 0u64;
     let mut running = std::collections::VecDeque::new();
@@ -766,12 +766,12 @@ fn poll_p99_at_frontier_size() {
         })
     }
     for _ in 0..1000 + 21 * 16 {
-        submit(&mut p, Time::ZERO);
+        submit(&mut p, Time::ORIGIN);
     }
-    running.extend(started(p.poll(Time::ZERO)));
+    running.extend(started(p.poll(Time::ORIGIN)));
     let mut times = Vec::new();
     for e in 1..=3000 {
-        let t = Time::from_secs(e);
+        let t = Time(Duration::from_secs(e));
         if let Some((job, attempt)) = running.pop_front() {
             p.handle(Input::Done { job, attempt }, t);
         }

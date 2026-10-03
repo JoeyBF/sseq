@@ -32,7 +32,7 @@ pub(super) struct Slot {
 /// The state behind the lock.
 pub(super) struct State<P> {
     pub(super) policy: P,
-    /// The latest time the clock gave; `Time::ZERO`, the earliest, until the first lock.
+    /// The latest time the clock gave; `Time::ORIGIN`, the earliest, until the first lock.
     pub(super) now: Time,
     /// Jobs with a lease, held or awaited.
     pub(super) jobs: HashMap<JobId, Slot>,

@@ -27,7 +27,7 @@ fn shared(max_attempts: u32) -> SharedPolicy<Scheduler> {
             retry: RetryConfig { max_attempts },
             ..Config::fifo()
         }),
-        || Time::ZERO,
+        || Time::ORIGIN,
     )
 }
 
@@ -140,7 +140,7 @@ fn complete_after_worker_gone_cancels_the_retry() {
 fn speculative_start_is_rejected() {
     let mut cfg = Config::fifo();
     cfg.speed.speculate = Some(Speculate::default());
-    let s = SharedPolicy::new(Scheduler::new(cfg), || Time::ZERO);
+    let s = SharedPolicy::new(Scheduler::new(cfg), || Time::ORIGIN);
     s.worker_update(worker(1));
     let mut j = job(7);
     j.work = Some(Duration::from_secs(100));

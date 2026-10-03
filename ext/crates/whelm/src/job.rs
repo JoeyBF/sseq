@@ -72,7 +72,7 @@ impl Selector {
 ///         class: class.into(),
 ///         ..Default::default()
 ///     };
-///     p.handle(Input::Worker(w), Time::ZERO);
+///     p.handle(Input::Worker(w), Time::ORIGIN);
 /// }
 /// for id in 1..=3 {
 ///     let job = JobSpec {
@@ -83,10 +83,10 @@ impl Selector {
 ///         ],
 ///         ..Default::default()
 ///     };
-///     p.handle(Input::Submit(job), Time::ZERO);
+///     p.handle(Input::Submit(job), Time::ORIGIN);
 /// }
 /// assert_eq!(
-///     p.poll(Time::ZERO),
+///     p.poll(Time::ORIGIN),
 ///     [
 ///         Output::Start {
 ///             job: 1,
@@ -182,16 +182,16 @@ impl Constraint {
     ///         class: class.into(),
     ///         ..Default::default()
     ///     };
-    ///     p.handle(Input::Worker(w), Time::ZERO);
+    ///     p.handle(Input::Worker(w), Time::ORIGIN);
     /// }
     /// let job = JobSpec {
     ///     id: 1,
     ///     constraints: vec![Constraint::require_class("gpu")],
     ///     ..Default::default()
     /// };
-    /// p.handle(Input::Submit(job), Time::ZERO);
+    /// p.handle(Input::Submit(job), Time::ORIGIN);
     /// assert_eq!(
-    ///     p.poll(Time::ZERO),
+    ///     p.poll(Time::ORIGIN),
     ///     [Output::Start {
     ///         job: 1,
     ///         attempt: 1,
@@ -221,15 +221,15 @@ impl Constraint {
     ///         id: 1,
     ///         ..Default::default()
     ///     }),
-    ///     Time::ZERO,
+    ///     Time::ORIGIN,
     /// );
     /// let job = JobSpec {
     ///     id: 1,
     ///     constraints: vec![Constraint::forbid_worker(1)],
     ///     ..Default::default()
     /// };
-    /// p.handle(Input::Submit(job), Time::ZERO);
-    /// assert!(p.poll(Time::ZERO).is_empty());
+    /// p.handle(Input::Submit(job), Time::ORIGIN);
+    /// assert!(p.poll(Time::ORIGIN).is_empty());
     /// ```
     pub fn forbid_worker(w: WorkerId) -> Self {
         Self {
@@ -273,16 +273,16 @@ impl Constraint {
     ///         id: 1,
     ///         ..Default::default()
     ///     }),
-    ///     Time::ZERO,
+    ///     Time::ORIGIN,
     /// );
     /// let job = JobSpec {
     ///     id: 1,
     ///     constraints: vec![Constraint::avoid_worker(1)],
     ///     ..Default::default()
     /// };
-    /// p.handle(Input::Submit(job), Time::ZERO);
+    /// p.handle(Input::Submit(job), Time::ORIGIN);
     /// assert_eq!(
-    ///     p.poll(Time::ZERO),
+    ///     p.poll(Time::ORIGIN),
     ///     [Output::Start {
     ///         job: 1,
     ///         attempt: 1,
@@ -331,7 +331,7 @@ impl Constraint {
     ///             id,
     ///             ..Default::default()
     ///         }),
-    ///         Time::ZERO,
+    ///         Time::ORIGIN,
     ///     );
     /// }
     /// let job = JobSpec {
@@ -339,9 +339,9 @@ impl Constraint {
     ///     constraints: vec![Constraint::prefer_worker(2)],
     ///     ..Default::default()
     /// };
-    /// p.handle(Input::Submit(job), Time::ZERO);
+    /// p.handle(Input::Submit(job), Time::ORIGIN);
     /// assert_eq!(
-    ///     p.poll(Time::ZERO),
+    ///     p.poll(Time::ORIGIN),
     ///     [Output::Start {
     ///         job: 1,
     ///         attempt: 1,

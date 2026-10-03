@@ -25,20 +25,20 @@
 //!         ..Default::default()
 //!     })
 //! };
-//! p.handle(submit(1, group(3, 20)), Time::ZERO);
-//! p.handle(submit(2, group(2, 40)), Time::ZERO);
+//! p.handle(submit(1, group(3, 20)), Time::ORIGIN);
+//! p.handle(submit(2, group(2, 40)), Time::ORIGIN);
 //! let worker = WorkerState {
 //!     id: 1,
 //!     budget: Resources::mem_gb(8.0),
 //!     ..Default::default()
 //! };
-//! p.handle(Input::Worker(worker), Time::ZERO);
+//! p.handle(Input::Worker(worker), Time::ORIGIN);
 //! let start = Output::Start {
 //!     job: 2,
 //!     attempt: 1,
 //!     worker: 1,
 //! };
-//! assert_eq!(p.poll(Time::ZERO), [start]);
+//! assert_eq!(p.poll(Time::ORIGIN), [start]);
 //! assert_eq!(bidegree(group(2, 40)), (2, 40));
 //! ```
 

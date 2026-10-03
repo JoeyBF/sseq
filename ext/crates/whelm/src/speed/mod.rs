@@ -75,7 +75,7 @@ pub enum Timing {
     /// #     });
     /// #     for (id, class) in [(1, "x"), (2, "y")] {
     /// #         let w = WorkerState { id, class: class.into(), ..Default::default() };
-    /// #         s.handle(Input::Worker(w), Time::ZERO);
+    /// #         s.handle(Input::Worker(w), Time::ORIGIN);
     /// #     }
     /// #     s
     /// # }
@@ -94,13 +94,13 @@ pub enum Timing {
     ///     ..Default::default()
     /// };
     /// let mut s = two_classes(Timing::Identical);
-    /// s.handle(Input::Worker(fast.clone()), Time::ZERO);
-    /// assert_eq!(place(&mut s, JobSpec::default(), Time::ZERO), 1);
+    /// s.handle(Input::Worker(fast.clone()), Time::ORIGIN);
+    /// assert_eq!(place(&mut s, JobSpec::default(), Time::ORIGIN), 1);
     /// assert_eq!(s.stats().workers[1].speed, 1.0);
     /// // The default, related machines at their reported speeds, prefers it.
     /// let mut s = two_classes(Timing::default());
-    /// s.handle(Input::Worker(fast), Time::ZERO);
-    /// assert_eq!(place(&mut s, JobSpec::default(), Time::ZERO), 2);
+    /// s.handle(Input::Worker(fast), Time::ORIGIN);
+    /// assert_eq!(place(&mut s, JobSpec::default(), Time::ORIGIN), 2);
     /// assert_eq!(s.stats().workers[1].speed, 4.0);
     /// ```
     Identical,
@@ -139,7 +139,7 @@ pub enum Timing {
     /// #     });
     /// #     for (id, class) in [(1, "x"), (2, "y")] {
     /// #         let w = WorkerState { id, class: class.into(), ..Default::default() };
-    /// #         s.handle(Input::Worker(w), Time::ZERO);
+    /// #         s.handle(Input::Worker(w), Time::ORIGIN);
     /// #     }
     /// #     s
     /// # }
@@ -157,7 +157,7 @@ pub enum Timing {
     ///     _ => 1.0,
     /// };
     /// let train = |s: &mut Scheduler| {
-    ///     let (mut now, mut id) = (Time::ZERO, 0);
+    ///     let (mut now, mut id) = (Time::ORIGIN, 0);
     ///     for _ in 0..20 {
     ///         for kind in ["a", "b"] {
     ///             for (w, class) in [(1, "x"), (2, "y")] {
@@ -238,7 +238,7 @@ impl Timing {
     /// #     });
     /// #     for (id, class) in [(1, "x"), (2, "y")] {
     /// #         let w = WorkerState { id, class: class.into(), ..Default::default() };
-    /// #         s.handle(Input::Worker(w), Time::ZERO);
+    /// #         s.handle(Input::Worker(w), Time::ORIGIN);
     /// #     }
     /// #     s
     /// # }
@@ -251,7 +251,7 @@ impl Timing {
     /// #     worker
     /// # }
     /// let mut s = two_classes(Timing::learned());
-    /// let mut now = Time::ZERO;
+    /// let mut now = Time::ORIGIN;
     /// for id in 0..u64::from(Learn::default().min_samples) {
     ///     let job = JobSpec {
     ///         id,

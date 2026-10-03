@@ -66,7 +66,7 @@ fn speed_first_picks_the_fast_worker() {
     for base in [Config::fifo(), Config::default(), Config::best_fit()] {
         let score = [vec![ScoreTerm::Speed], base.score.clone()].concat();
         let mut p = Scheduler::new(Config { score, ..base });
-        p.handle(Input::Worker(worker(1, 4, 1.0)), Time::ZERO);
+        p.handle(Input::Worker(worker(1, 4, 1.0)), Time::ORIGIN);
         // The fast worker has more room left, which best fit alone would avoid.
         p.handle(
             Input::Worker(WorkerState {
@@ -77,12 +77,12 @@ fn speed_first_picks_the_fast_worker() {
                 speed: 2.4,
                 ..Default::default()
             }),
-            Time::ZERO,
+            Time::ORIGIN,
         );
         for i in 0..6 {
-            p.handle(Input::Submit(job(i, None)), Time::ZERO);
+            p.handle(Input::Submit(job(i, None)), Time::ORIGIN);
         }
-        let out = starts(p.poll(Time::ZERO));
+        let out = starts(p.poll(Time::ORIGIN));
         let on_fast = out.iter().filter(|x| x.1 == 2).count();
         assert_eq!(on_fast, 4, "{out:?}");
         assert_eq!(out.len(), 6, "the overflow still runs on the slow worker");
@@ -96,10 +96,10 @@ fn without_speed_term_speed_is_ignored() {
         score: vec![ScoreTerm::Preferred, ScoreTerm::Load],
         ..Config::default()
     });
-    p.handle(Input::Worker(worker(1, 4, 1.0)), Time::ZERO);
-    p.handle(Input::Worker(worker(2, 4, 2.4)), Time::ZERO);
-    p.handle(Input::Submit(job(0, None)), Time::ZERO);
-    assert_eq!(starts(p.poll(Time::ZERO)), vec![(0, 1)]);
+    p.handle(Input::Worker(worker(1, 4, 1.0)), Time::ORIGIN);
+    p.handle(Input::Worker(worker(2, 4, 2.4)), Time::ORIGIN);
+    p.handle(Input::Submit(job(0, None)), Time::ORIGIN);
+    assert_eq!(starts(p.poll(Time::ORIGIN)), vec![(0, 1)]);
 }
 
 /// Deferral waits for a fast slot that frees soon, but not for one that frees late.
@@ -115,36 +115,42 @@ fn earliest_finish_defers_only_when_it_pays() {
     };
     for (running_work, expect_defer) in [(10, true), (1000, false)] {
         let mut p = backfill(speed);
-        p.handle(Input::Worker(worker(1, 1, 1.0)), Time::ZERO);
-        p.handle(Input::Worker(worker(2, 1, 4.0)), Time::ZERO);
+        p.handle(Input::Worker(worker(1, 1, 1.0)), Time::ORIGIN);
+        p.handle(Input::Worker(worker(2, 1, 4.0)), Time::ORIGIN);
         // Occupy the fast worker: it frees at running_work / 4.
         p.handle(
             Input::Submit(job(0, Some(Duration::from_secs(running_work)))),
-            Time::ZERO,
+            Time::ORIGIN,
         );
-        assert_eq!(starts(p.poll(Time::ZERO)), vec![(0, 2)]);
+        assert_eq!(starts(p.poll(Time::ORIGIN)), vec![(0, 2)]);
         // 40 units of work: 40 s on the slow worker, or 10 s after the fast one frees.
         p.handle(
             Input::Submit(job(1, Some(Duration::from_secs(40)))),
-            Time::ZERO,
+            Time::ORIGIN,
         );
-        let out = starts(p.poll(Time::ZERO));
+        let out = starts(p.poll(Time::ORIGIN));
         if expect_defer {
             assert!(out.is_empty(), "should wait for the fast worker: {out:?}");
-            assert_eq!(p.stats().deferred, vec![(1, 2, Time::from_millis(2500))]);
+            assert_eq!(
+                p.stats().deferred,
+                vec![(1, 2, Time(Duration::from_millis(2500)))]
+            );
             // The wait lapses at `max_wait`, unless the job may reserve before then.
             let reserve_after = Config::default().reservations.unwrap().reserve_after;
             assert_eq!(
                 p.next_wakeup(),
-                Some(Time::ZERO + reserve_after.min(Duration::from_secs(100)))
+                Some(Time::ORIGIN + reserve_after.min(Duration::from_secs(100)))
             );
             assert!(
                 p.explain(1)
                     .unwrap()
                     .contains("waiting for faster worker 2")
             );
-            p.handle(done(0), Time::from_millis(2500));
-            assert_eq!(starts(p.poll(Time::from_millis(2500))), vec![(1, 2)]);
+            p.handle(done(0), Time(Duration::from_millis(2500)));
+            assert_eq!(
+                starts(p.poll(Time(Duration::from_millis(2500)))),
+                vec![(1, 2)]
+            );
         } else {
             assert_eq!(out, vec![(1, 1)]);
             assert!(p.stats().deferred.is_empty());
@@ -164,22 +170,22 @@ fn deferral_expires() {
         ..SpeedConfig::default()
     };
     let mut p = backfill(speed);
-    p.handle(Input::Worker(worker(1, 1, 1.0)), Time::ZERO);
-    p.handle(Input::Worker(worker(2, 1, 10.0)), Time::ZERO);
+    p.handle(Input::Worker(worker(1, 1, 1.0)), Time::ORIGIN);
+    p.handle(Input::Worker(worker(2, 1, 10.0)), Time::ORIGIN);
     p.handle(
         Input::Submit(job(0, Some(Duration::from_secs(200)))),
-        Time::ZERO,
+        Time::ORIGIN,
     ); // frees at 20 on the fast worker
-    starts(p.poll(Time::ZERO));
+    starts(p.poll(Time::ORIGIN));
     p.handle(
         Input::Submit(job(1, Some(Duration::from_secs(100)))),
-        Time::ZERO,
+        Time::ORIGIN,
     ); // 100 s slow vs 30 s after waiting
-    assert!(starts(p.poll(Time::ZERO)).is_empty());
-    assert_eq!(p.next_wakeup(), Some(Time::from_secs(30)));
+    assert!(starts(p.poll(Time::ORIGIN)).is_empty());
+    assert_eq!(p.next_wakeup(), Some(Time(Duration::from_secs(30))));
     // The fast job overruns: still busy at the deadline, so the waiter gives up and runs slowly.
-    assert!(starts(p.poll(Time::from_secs(29))).is_empty());
-    assert_eq!(starts(p.poll(Time::from_secs(30))), vec![(1, 1)]);
+    assert!(starts(p.poll(Time(Duration::from_secs(29)))).is_empty());
+    assert_eq!(starts(p.poll(Time(Duration::from_secs(30)))), vec![(1, 1)]);
     assert_eq!(p.next_wakeup(), None);
 }
 
@@ -195,24 +201,24 @@ fn deferrals_book_slots_in_order() {
         ..SpeedConfig::default()
     };
     let mut p = backfill(speed);
-    p.handle(Input::Worker(worker(1, 1, 1.0)), Time::ZERO);
-    p.handle(Input::Worker(worker(2, 1, 10.0)), Time::ZERO);
+    p.handle(Input::Worker(worker(1, 1, 1.0)), Time::ORIGIN);
+    p.handle(Input::Worker(worker(2, 1, 10.0)), Time::ORIGIN);
     p.handle(
         Input::Submit(job(0, Some(Duration::from_secs(10)))),
-        Time::ZERO,
+        Time::ORIGIN,
     ); // fast worker frees at 1
-    starts(p.poll(Time::ZERO));
+    starts(p.poll(Time::ORIGIN));
     for i in 1..=3 {
         p.handle(
             Input::Submit(job(i, Some(Duration::from_secs(50)))),
-            Time::ZERO,
+            Time::ORIGIN,
         ); // 50 s slow, 5 s fast
     }
     // Job 1 waits (start 1, done 6); job 2 waits (start 6, done 11); job 3 would finish at 16 on
     // the fast worker but at 50 on the slow one, so it waits too.
-    assert!(starts(p.poll(Time::ZERO)).is_empty());
+    assert!(starts(p.poll(Time::ORIGIN)).is_empty());
     let d: Vec<_> = p.stats().deferred.iter().map(|d| (d.0, d.2)).collect();
-    let at = Time::from_secs;
+    let at = |s| Time(Duration::from_secs(s));
     assert_eq!(d, vec![(1, at(1)), (2, at(6)), (3, at(11))]);
 }
 
@@ -225,10 +231,10 @@ fn learned_speeds_replace_reported_ones() {
     };
     let mut p = backfill(speed);
     // Both report 1.0; worker 2 really runs three times faster.
-    p.handle(Input::Worker(plain_worker(1, "a", 1)), Time::ZERO);
-    p.handle(Input::Worker(plain_worker(2, "b", 1)), Time::ZERO);
+    p.handle(Input::Worker(plain_worker(1, "a", 1)), Time::ORIGIN);
+    p.handle(Input::Worker(plain_worker(2, "b", 1)), Time::ORIGIN);
     let truth = |w: u64| if w == 2 { 3.0 } else { 1.0 };
-    let mut now = Time::ZERO;
+    let mut now = Time::ORIGIN;
     let mut id = 0;
     let mut running: Vec<(u64, u64, Time)> = Vec::new();
     for _ in 0..200 {
@@ -270,18 +276,18 @@ fn stuck(speculate: Option<Speculate>) -> Scheduler {
         speculate,
         ..SpeedConfig::default()
     });
-    p.handle(Input::Worker(worker(1, 1, 1.0)), Time::ZERO);
-    p.handle(Input::Worker(worker(2, 1, 4.0)), Time::ZERO);
+    p.handle(Input::Worker(worker(1, 1, 1.0)), Time::ORIGIN);
+    p.handle(Input::Worker(worker(2, 1, 4.0)), Time::ORIGIN);
     p.handle(
         Input::Submit(job(0, Some(Duration::from_secs(4)))),
-        Time::ZERO,
+        Time::ORIGIN,
     );
     p.handle(
         Input::Submit(job(1, Some(Duration::from_secs(100)))),
-        Time::ZERO,
+        Time::ORIGIN,
     );
-    assert_eq!(starts(p.poll(Time::ZERO)), vec![(0, 2), (1, 1)]);
-    p.handle(done(0), Time::from_secs(1));
+    assert_eq!(starts(p.poll(Time::ORIGIN)), vec![(0, 2), (1, 1)]);
+    p.handle(done(0), Time(Duration::from_secs(1)));
     p
 }
 
@@ -301,9 +307,9 @@ fn start1(attempt: Attempt, worker: WorkerId) -> Output {
 fn speculation_starts_a_second_attempt_and_the_first_done_wins() {
     for winner in [2, 1] {
         let mut p = stuck(Some(Speculate::default()));
-        assert_eq!(p.poll(Time::from_secs(1)), vec![start1(2, 2)]);
+        assert_eq!(p.poll(Time(Duration::from_secs(1))), vec![start1(2, 2)]);
         // At most `max_per_job` speculative attempts.
-        assert_eq!(p.poll(Time::from_secs(1)), vec![]);
+        assert_eq!(p.poll(Time(Duration::from_secs(1))), vec![]);
         let s = p.stats();
         assert_eq!((s.running, s.placements_total), (1, 3));
         assert_eq!((s.workers[0].running, s.workers[1].running), (1, 1));
@@ -314,7 +320,7 @@ fn speculation_starts_a_second_attempt_and_the_first_done_wins() {
         );
         // Attempt n runs on worker n.
         let (loser, at) = if winner == 2 { (1, 26) } else { (2, 100) };
-        let at = Time::from_secs(at);
+        let at = Time(Duration::from_secs(at));
         p.handle(
             Input::Done {
                 job: 1,
@@ -348,14 +354,17 @@ fn speculation_starts_a_second_attempt_and_the_first_done_wins() {
 #[test]
 fn failed_speculative_attempt_leaves_the_original_running() {
     let mut p = stuck(Some(Speculate::default()));
-    assert_eq!(p.poll(Time::from_secs(1)), vec![start1(2, 2)]);
-    p.handle(Input::WorkerGone(2), Time::from_secs(5));
-    assert_eq!(p.poll(Time::from_secs(5)), vec![]);
+    assert_eq!(p.poll(Time(Duration::from_secs(1))), vec![start1(2, 2)]);
+    p.handle(Input::WorkerGone(2), Time(Duration::from_secs(5)));
+    assert_eq!(p.poll(Time(Duration::from_secs(5))), vec![]);
     let s = p.stats();
     assert_eq!((s.running, s.waiting), (1, 0));
     assert!(p.explain(1).unwrap().contains("attempt 1 on worker 1"));
-    p.handle(Input::Done { job: 1, attempt: 1 }, Time::from_secs(100));
-    assert_eq!(p.poll(Time::from_secs(100)), vec![]);
+    p.handle(
+        Input::Done { job: 1, attempt: 1 },
+        Time(Duration::from_secs(100)),
+    );
+    assert_eq!(p.poll(Time(Duration::from_secs(100))), vec![]);
     assert_eq!(p.stats().running, 0);
 }
 
@@ -365,11 +374,11 @@ fn speculation_yields_to_waiting_jobs_and_is_opt_in() {
     let mut p = stuck(Some(Speculate::default()));
     p.handle(
         Input::Submit(job(2, Some(Duration::from_secs(4)))),
-        Time::from_secs(1),
+        Time(Duration::from_secs(1)),
     );
-    assert_eq!(starts(p.poll(Time::from_secs(1))), vec![(2, 2)]);
+    assert_eq!(starts(p.poll(Time(Duration::from_secs(1)))), vec![(2, 2)]);
     let mut q = stuck(None);
-    assert_eq!(q.poll(Time::from_secs(1)), vec![]);
+    assert_eq!(q.poll(Time(Duration::from_secs(1))), vec![]);
 }
 
 /// A clock-capped worker of the same class is learned slower than its peers, so the speed term
@@ -382,10 +391,10 @@ fn capped_worker_learned_per_worker() {
     };
     let mut p = backfill(speed);
     for w in 1..=3 {
-        p.handle(Input::Worker(plain_worker(w, "h200", 1)), Time::ZERO);
+        p.handle(Input::Worker(plain_worker(w, "h200", 1)), Time::ORIGIN);
     }
     let truth = |w: u64| if w == 3 { 0.765 } else { 1.0 };
-    let mut now = Time::ZERO;
+    let mut now = Time::ORIGIN;
     let mut id = 0;
     let mut running: Vec<(u64, u64, Time)> = Vec::new();
     for _ in 0..600 {
@@ -431,26 +440,26 @@ fn identical_machines_ignore_speeds() {
         }),
         speculate: Some(Speculate::default()),
     });
-    p.handle(Input::Worker(worker(1, 1, 1.0)), Time::ZERO);
-    p.handle(Input::Worker(worker(2, 1, 4.0)), Time::ZERO);
+    p.handle(Input::Worker(worker(1, 1, 1.0)), Time::ORIGIN);
+    p.handle(Input::Worker(worker(2, 1, 4.0)), Time::ORIGIN);
     p.handle(
         Input::Submit(job(0, Some(Duration::from_secs(4)))),
-        Time::ZERO,
+        Time::ORIGIN,
     );
     p.handle(
         Input::Submit(job(1, Some(Duration::from_secs(100)))),
-        Time::ZERO,
+        Time::ORIGIN,
     );
-    assert_eq!(starts(p.poll(Time::ZERO)), vec![(0, 1), (1, 2)]);
+    assert_eq!(starts(p.poll(Time::ORIGIN)), vec![(0, 1), (1, 2)]);
     assert!(p.stats().workers.iter().all(|w| w.speed == 1.0));
     // Worker 1 frees after the job's work in seconds; it is no faster, so no second attempt.
-    p.handle(done(0), Time::from_secs(4));
-    assert_eq!(p.poll(Time::from_secs(4)), vec![]);
+    p.handle(done(0), Time(Duration::from_secs(4)));
+    assert_eq!(p.poll(Time(Duration::from_secs(4))), vec![]);
     p.handle(
         Input::Submit(job(2, Some(Duration::from_secs(40)))),
-        Time::from_secs(4),
+        Time(Duration::from_secs(4)),
     );
-    assert_eq!(starts(p.poll(Time::from_secs(4))), vec![(2, 1)]);
+    assert_eq!(starts(p.poll(Time(Duration::from_secs(4)))), vec![(2, 1)]);
 }
 
 /// A one-slot worker of class "x" (1) and one of class "y" (2), both reporting speed 1.
@@ -460,7 +469,7 @@ fn two_classes(timing: Timing) -> Scheduler {
         ..SpeedConfig::default()
     });
     for (id, class) in [(1, "x"), (2, "y")] {
-        p.handle(Input::Worker(plain_worker(id, class, 1)), Time::ZERO);
+        p.handle(Input::Worker(plain_worker(id, class, 1)), Time::ORIGIN);
     }
     p
 }
@@ -477,7 +486,7 @@ fn truth(kind: &str, worker: WorkerId) -> f64 {
 /// Run 20 jobs of each kind on each class, one at a time, pinned there by a class requirement;
 /// returns the time at the end.
 fn train(p: &mut Scheduler) -> Time {
-    let mut now = Time::ZERO;
+    let mut now = Time::ORIGIN;
     let mut id = 0;
     for _ in 0..20 {
         for kind in ["a", "b"] {
@@ -557,10 +566,10 @@ fn busy_run(timing: Timing, kind: Option<&str>) -> (Vec<Output>, Vec<f64>) {
         ..SpeedConfig::default()
     });
     for (id, class) in [(1, "a"), (2, "b")] {
-        p.handle(Input::Worker(plain_worker(id, class, 1)), Time::ZERO);
+        p.handle(Input::Worker(plain_worker(id, class, 1)), Time::ORIGIN);
     }
     let truth = |w: u64| if w == 2 { 3.0 } else { 1.0 };
-    let (mut now, mut id, mut log) = (Time::ZERO, 0, Vec::new());
+    let (mut now, mut id, mut log) = (Time::ORIGIN, 0, Vec::new());
     let mut running: Vec<(u64, u64, Time)> = Vec::new();
     for _ in 0..200 {
         for _ in running.len()..2 {

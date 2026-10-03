@@ -665,7 +665,7 @@ impl Shadow {
                 OrderTerm::Wspt => {
                     TermKey::Real(spec.work.map(|w| -(spec.weight / w.as_secs_f64())))
                 }
-                OrderTerm::Edd => TermKey::Real(spec.due.map(Time::as_secs_f64)),
+                OrderTerm::Edd => TermKey::Real(spec.due.map(|d| d.0.as_secs_f64())),
             });
         }
         Urgency {
@@ -867,7 +867,7 @@ fn run(
                     priority,
                     rank: rank.map(|r| Duration::from_secs(r.into())),
                     weight,
-                    due: due.map(|d| Time::from_secs(d.into())),
+                    due: due.map(|d| Time(Duration::from_secs(d.into()))),
                     constraints: constraints.clone(),
                     work: work.map(|w| Duration::from_secs(w.into())),
                     kind: kind.map(|k| format!("k{k}")),
@@ -883,7 +883,7 @@ fn run(
             }
             Op::Fail(i, k, kind) => {
                 if let Some((job, k, attempt)) = sh.pick_live(i, k) {
-                    let why = format!("failed at {}", sh.now);
+                    let why = format!("failed at {:?}", sh.now.0);
                     sh.fail(job, k, kind, why.clone());
                     p.handle(
                         Input::Failed {

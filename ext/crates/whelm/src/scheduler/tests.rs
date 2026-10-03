@@ -72,7 +72,7 @@ fn fifo_fills_least_loaded_first() {
         Input::Worker(worker(2, 4, 100)),
     ];
     inputs.extend((0..4).map(|i| Input::Submit(job(i, 10, 0))));
-    let out = feed(&mut p, Time::ZERO, inputs);
+    let out = feed(&mut p, Time::ORIGIN, inputs);
     assert_eq!(starts(&out), vec![(0, 1), (1, 2), (2, 1), (3, 2)]);
     assert!(
         out.iter()
@@ -89,13 +89,13 @@ fn preference_wins_over_load() {
         Input::Worker(worker(2, 4, 100)),
         Input::Submit(job(0, 10, 0)),
     ];
-    feed(&mut p, Time::ZERO, inputs);
+    feed(&mut p, Time::ORIGIN, inputs);
     let j = JobSpec {
         constraints: vec![Constraint::prefer_worker(1)],
         ..job(1, 10, 0)
     };
     assert_eq!(
-        starts(&feed(&mut p, Time::ZERO, [Input::Submit(j)])),
+        starts(&feed(&mut p, Time::ORIGIN, [Input::Submit(j)])),
         vec![(1, 1)]
     );
 }
@@ -104,17 +104,24 @@ fn preference_wins_over_load() {
 #[test]
 fn priority_order_is_group_arrival_then_fifo() {
     let mut p = Scheduler::new(Config::default());
-    p.handle(Input::Submit(job(10, 1, 7)), Time::ZERO); // group 7 arrives first
-    p.handle(Input::Submit(job(11, 1, 3)), Time::from_secs(1));
-    p.handle(Input::Submit(job(12, 1, 7)), Time::from_secs(2));
+    p.handle(Input::Submit(job(10, 1, 7)), Time::ORIGIN); // group 7 arrives first
+    p.handle(Input::Submit(job(11, 1, 3)), Time(Duration::from_secs(1)));
+    p.handle(Input::Submit(job(12, 1, 7)), Time(Duration::from_secs(2)));
     let mut urgent = job(13, 1, 3);
     urgent.priority = Some(-1);
-    p.handle(Input::Submit(urgent), Time::from_secs(3));
-    p.handle(Input::Worker(worker(1, 1, 100)), Time::from_secs(4));
+    p.handle(Input::Submit(urgent), Time(Duration::from_secs(3)));
+    p.handle(
+        Input::Worker(worker(1, 1, 100)),
+        Time(Duration::from_secs(4)),
+    );
     let mut order = Vec::new();
     let mut finished = Vec::new();
     for t in 0..4 {
-        let out = starts(&feed(&mut p, Time::from_secs(5 + t), finished.drain(..)));
+        let out = starts(&feed(
+            &mut p,
+            Time(Duration::from_secs(5 + t)),
+            finished.drain(..),
+        ));
         assert_eq!(out.len(), 1);
         order.push(out[0].0);
         finished.push(done(out[0].0, 1));
@@ -134,13 +141,13 @@ fn best_fit_packs_tightly() {
     ];
     // Both empty workers admit; the smaller one is the tighter fit.
     assert_eq!(
-        starts(&feed(&mut p, Time::ZERO, inputs)),
+        starts(&feed(&mut p, Time::ORIGIN, inputs)),
         vec![(0, 2), (1, 2)]
     );
     let inputs = [Input::Submit(job(2, 50, 0)), Input::Submit(job(3, 1, 0))];
     // Then worker 1 has 49 GB free (49%), worker 2 has 47 GB (94%): worker 1 is fuller.
     assert_eq!(
-        starts(&feed(&mut p, Time::ZERO, inputs)),
+        starts(&feed(&mut p, Time::ORIGIN, inputs)),
         vec![(2, 1), (3, 1)]
     );
 }
@@ -172,7 +179,7 @@ fn best_fit_ranks_by_the_bottleneck() {
         Input::Worker(w2),
         Input::Submit(job(0, 1, 0)),
     ];
-    assert_eq!(starts(&feed(&mut p, Time::ZERO, inputs)), vec![(0, 1)]);
+    assert_eq!(starts(&feed(&mut p, Time::ORIGIN, inputs)), vec![(0, 1)]);
 }
 
 /// A failed job is retried before less urgent jobs submitted after it, and keeps its age.
@@ -184,11 +191,15 @@ fn retry_keeps_place_and_age() {
         Input::Submit(job(0, 1, 0)),
         Input::Submit(job(1, 1, 0)),
     ];
-    assert_eq!(starts(&feed(&mut p, Time::ZERO, inputs)), vec![(0, 1)]);
+    assert_eq!(starts(&feed(&mut p, Time::ORIGIN, inputs)), vec![(0, 1)]);
     assert_eq!(p.stats().longest_wait, Some((1, Duration::ZERO)));
     // Job 0 avoids worker 1 softly; it is the only live worker, so job 0 goes back there
     // ahead of job 1.
-    let out = feed(&mut p, Time::from_secs(5), [fail(0, 1, FailKind::Other)]);
+    let out = feed(
+        &mut p,
+        Time(Duration::from_secs(5)),
+        [fail(0, 1, FailKind::Other)],
+    );
     assert_eq!(
         out,
         vec![Output::Start {
@@ -207,16 +218,20 @@ fn retry_keeps_place_and_age() {
         Input::Submit(job(2, 1, 0)),
     ];
     assert_eq!(
-        starts(&feed(&mut q, Time::ZERO, inputs)),
+        starts(&feed(&mut q, Time::ORIGIN, inputs)),
         vec![(0, 1), (1, 2)]
     );
     // Worker 1 frees, but job 0 avoids it while worker 2 lives: job 2 backfills it.
-    let out = feed(&mut q, Time::from_secs(5), [fail(0, 1, FailKind::Other)]);
+    let out = feed(
+        &mut q,
+        Time(Duration::from_secs(5)),
+        [fail(0, 1, FailKind::Other)],
+    );
     assert_eq!(starts(&out), vec![(2, 1)]);
     assert_eq!(q.stats().longest_wait, Some((0, Duration::from_secs(5))));
     let msg = q.explain(0).unwrap();
     assert!(msg.contains("failed 1 time(s), last on worker 1"), "{msg}");
-    let out = feed(&mut q, Time::from_secs(6), [done(1, 1)]);
+    let out = feed(&mut q, Time(Duration::from_secs(6)), [done(1, 1)]);
     assert_eq!(
         out,
         vec![Output::Start {
@@ -237,7 +252,7 @@ fn avoid_grows_then_gives_up() {
     });
     let mut inputs: Vec<Input> = (1..=3).map(|w| Input::Worker(worker(w, 1, 100))).collect();
     inputs.push(Input::Submit(job(0, 1, 0)));
-    let mut out = feed(&mut p, Time::ZERO, inputs);
+    let mut out = feed(&mut p, Time::ORIGIN, inputs);
     let mut seen = Vec::new();
     for attempt in 1..=4 {
         let [
@@ -254,7 +269,7 @@ fn avoid_grows_then_gives_up() {
         seen.push(worker);
         out = feed(
             &mut p,
-            Time::from_secs(attempt.into()),
+            Time(Duration::from_secs(attempt.into())),
             [fail(0, a, FailKind::DeviceOom)],
         );
     }
@@ -283,10 +298,14 @@ fn forbid_survives_retries() {
         Input::Worker(worker(2, 1, 100)),
         Input::Submit(j),
     ];
-    assert_eq!(starts(&feed(&mut p, Time::ZERO, inputs)), vec![(0, 2)]);
+    assert_eq!(starts(&feed(&mut p, Time::ORIGIN, inputs)), vec![(0, 2)]);
     // Worker 2 is now avoided softly; the only other live worker is forbidden, so the
     // avoidance lapses and the retry goes back to 2.
-    let out = feed(&mut p, Time::from_secs(1), [fail(0, 1, FailKind::Other)]);
+    let out = feed(
+        &mut p,
+        Time(Duration::from_secs(1)),
+        [fail(0, 1, FailKind::Other)],
+    );
     assert_eq!(
         out,
         vec![Output::Start {
@@ -307,8 +326,12 @@ fn next_wakeup_reports_aging_and_reserving() {
     let reserve_after = cfg.reservations.as_ref().unwrap().reserve_after;
     let mut p = Scheduler::new(cfg);
     assert_eq!(p.next_wakeup(), None);
-    feed(&mut p, Time::from_secs(10), [Input::Submit(job(0, 1, 0))]);
-    let (age_limit, ten) = (Duration::from_secs(100), Time::from_secs(10));
+    feed(
+        &mut p,
+        Time(Duration::from_secs(10)),
+        [Input::Submit(job(0, 1, 0))],
+    );
+    let (age_limit, ten) = (Duration::from_secs(100), Time(Duration::from_secs(10)));
     assert_eq!(p.next_wakeup(), Some(ten + reserve_after.min(age_limit)));
     let later = ten + reserve_after.max(age_limit);
     p.poll(ten + reserve_after.min(age_limit));
@@ -331,13 +354,17 @@ fn give_up_is_retryable_only_for_device_oom() {
         Input::Worker(worker(1, 1, 100)),
         Input::Submit(job(0, 1, 0)),
     ];
-    feed(&mut p, Time::ZERO, inputs);
+    feed(&mut p, Time::ORIGIN, inputs);
     feed(
         &mut p,
-        Time::from_secs(1),
+        Time(Duration::from_secs(1)),
         [fail(0, 1, FailKind::DeviceOom)],
     );
-    let out = feed(&mut p, Time::from_secs(2), [fail(0, 2, FailKind::Timeout)]);
+    let out = feed(
+        &mut p,
+        Time(Duration::from_secs(2)),
+        [fail(0, 2, FailKind::Timeout)],
+    );
     let [Output::GaveUp(g)] = &out[..] else {
         panic!("expected a give-up, got {out:?}");
     };
@@ -362,15 +389,15 @@ fn worker_gone_fails_and_requeues() {
         Input::Submit(job(1, 1, 0)),
     ];
     assert_eq!(
-        starts(&feed(&mut p, Time::ZERO, inputs)),
+        starts(&feed(&mut p, Time::ORIGIN, inputs)),
         vec![(0, 1), (1, 1)]
     );
-    let out = feed(&mut p, Time::from_secs(1), [Input::WorkerGone(1)]);
+    let out = feed(&mut p, Time(Duration::from_secs(1)), [Input::WorkerGone(1)]);
     assert!(out.is_empty());
     assert_eq!((p.stats().waiting, p.stats().running), (2, 0));
     let out = feed(
         &mut p,
-        Time::from_secs(2),
+        Time(Duration::from_secs(2)),
         [Input::Worker(worker(2, 2, 100))],
     );
     assert_eq!(starts(&out), vec![(0, 2), (1, 2)]);
@@ -379,7 +406,7 @@ fn worker_gone_fails_and_requeues() {
             .all(|o| matches!(o, Output::Start { attempt: 2, .. }))
     );
     // The second loss exhausts both jobs' attempts.
-    let out = feed(&mut p, Time::from_secs(3), [Input::WorkerGone(2)]);
+    let out = feed(&mut p, Time(Duration::from_secs(3)), [Input::WorkerGone(2)]);
     assert_eq!(out.len(), 2);
     for o in &out {
         let Output::GaveUp(g) = o else {
@@ -398,8 +425,12 @@ fn stale_messages_are_ignored() {
         Input::Worker(worker(1, 1, 100)),
         Input::Submit(job(0, 1, 0)),
     ];
-    feed(&mut p, Time::ZERO, inputs);
-    feed(&mut p, Time::from_secs(1), [fail(0, 1, FailKind::Other)]);
+    feed(&mut p, Time::ORIGIN, inputs);
+    feed(
+        &mut p,
+        Time(Duration::from_secs(1)),
+        [fail(0, 1, FailKind::Other)],
+    );
     // Attempt 2 runs; reports about attempt 1, unknown attempts and unknown jobs are stale.
     let stale = [
         done(0, 1),
@@ -410,14 +441,14 @@ fn stale_messages_are_ignored() {
         Input::Cancel(9),
         Input::WorkerGone(9),
     ];
-    assert!(feed(&mut p, Time::from_secs(2), stale).is_empty());
+    assert!(feed(&mut p, Time(Duration::from_secs(2)), stale).is_empty());
     let st = p.stats();
     assert_eq!((st.waiting, st.running, st.workers[0].running), (0, 1, 1));
-    assert!(feed(&mut p, Time::from_secs(3), [done(0, 2)]).is_empty());
+    assert!(feed(&mut p, Time(Duration::from_secs(3)), [done(0, 2)]).is_empty());
     let st = p.stats();
     assert_eq!((st.running, st.workers[0].placed), (0, Resources::ZERO));
     // A late duplicate of the winning report is stale too.
-    assert!(feed(&mut p, Time::from_secs(4), [done(0, 2)]).is_empty());
+    assert!(feed(&mut p, Time(Duration::from_secs(4)), [done(0, 2)]).is_empty());
     assert_eq!(p.explain(0), None);
 }
 
@@ -430,9 +461,9 @@ fn cancel_stops_running_attempts() {
         Input::Submit(job(0, 1, 0)),
         Input::Submit(job(1, 1, 0)),
     ];
-    feed(&mut p, Time::ZERO, inputs);
-    assert!(feed(&mut p, Time::from_secs(1), [Input::Cancel(1)]).is_empty());
-    let out = feed(&mut p, Time::from_secs(2), [Input::Cancel(0)]);
+    feed(&mut p, Time::ORIGIN, inputs);
+    assert!(feed(&mut p, Time(Duration::from_secs(1)), [Input::Cancel(1)]).is_empty());
+    let out = feed(&mut p, Time(Duration::from_secs(2)), [Input::Cancel(0)]);
     assert_eq!(
         out,
         vec![Output::Stop {
@@ -453,12 +484,12 @@ fn speculating() -> Scheduler {
     let mut j = job(0, 1, 0);
     j.work = Some(Duration::from_secs(100));
     let inputs = [Input::Worker(worker(1, 1, 100)), Input::Submit(j)];
-    assert_eq!(starts(&feed(&mut p, Time::ZERO, inputs)), vec![(0, 1)]);
+    assert_eq!(starts(&feed(&mut p, Time::ORIGIN, inputs)), vec![(0, 1)]);
     let fast = WorkerState {
         speed: 4.0,
         ..worker(2, 1, 100)
     };
-    let out = feed(&mut p, Time::from_secs(1), [Input::Worker(fast)]);
+    let out = feed(&mut p, Time(Duration::from_secs(1)), [Input::Worker(fast)]);
     assert_eq!(
         out,
         vec![Output::Start {
@@ -474,7 +505,7 @@ fn speculating() -> Scheduler {
         vec![1, 1]
     );
     // At most one speculative attempt per job.
-    assert!(p.poll(Time::from_secs(2)).is_empty());
+    assert!(p.poll(Time(Duration::from_secs(2))).is_empty());
     p
 }
 
@@ -483,7 +514,7 @@ fn speculating() -> Scheduler {
 #[test]
 fn speculation_first_done_wins() {
     let mut p = speculating();
-    let out = feed(&mut p, Time::from_secs(26), [done(0, 2)]);
+    let out = feed(&mut p, Time(Duration::from_secs(26)), [done(0, 2)]);
     assert_eq!(
         out,
         vec![Output::Stop {
@@ -493,10 +524,10 @@ fn speculation_first_done_wins() {
         }]
     );
     assert!(p.stats().workers.iter().all(|w| w.running == 0));
-    assert!(feed(&mut p, Time::from_secs(27), [done(0, 1)]).is_empty());
+    assert!(feed(&mut p, Time(Duration::from_secs(27)), [done(0, 1)]).is_empty());
 
     let mut p = speculating();
-    let out = feed(&mut p, Time::from_secs(10), [done(0, 1)]);
+    let out = feed(&mut p, Time(Duration::from_secs(10)), [done(0, 1)]);
     assert_eq!(
         out,
         vec![Output::Stop {
@@ -511,9 +542,16 @@ fn speculation_first_done_wins() {
 #[test]
 fn speculation_failure_and_cancel() {
     let mut p = speculating();
-    assert!(feed(&mut p, Time::from_secs(5), [fail(0, 2, FailKind::Other)]).is_empty());
+    assert!(
+        feed(
+            &mut p,
+            Time(Duration::from_secs(5)),
+            [fail(0, 2, FailKind::Other)]
+        )
+        .is_empty()
+    );
     assert_eq!(p.stats().running, 1);
-    let out = feed(&mut p, Time::from_secs(6), [Input::Cancel(0)]);
+    let out = feed(&mut p, Time(Duration::from_secs(6)), [Input::Cancel(0)]);
     assert_eq!(
         out,
         vec![Output::Stop {
@@ -524,7 +562,7 @@ fn speculation_failure_and_cancel() {
     );
 
     let mut p = speculating();
-    let out = feed(&mut p, Time::from_secs(5), [Input::Cancel(0)]);
+    let out = feed(&mut p, Time(Duration::from_secs(5)), [Input::Cancel(0)]);
     assert_eq!(starts(&out), vec![]);
     assert_eq!(out.len(), 2);
 }
@@ -535,8 +573,19 @@ fn speculation_failure_and_cancel() {
 fn speculative_failure_is_not_a_round() {
     let mut p = speculating();
     p.config.retry.max_attempts = 2;
-    assert!(feed(&mut p, Time::from_secs(5), [fail(0, 2, FailKind::Other)]).is_empty());
-    let out = feed(&mut p, Time::from_secs(6), [fail(0, 1, FailKind::Other)]);
+    assert!(
+        feed(
+            &mut p,
+            Time(Duration::from_secs(5)),
+            [fail(0, 2, FailKind::Other)]
+        )
+        .is_empty()
+    );
+    let out = feed(
+        &mut p,
+        Time(Duration::from_secs(6)),
+        [fail(0, 1, FailKind::Other)],
+    );
     assert!(
         matches!(
             out[..],
@@ -548,7 +597,11 @@ fn speculative_failure_is_not_a_round() {
         ),
         "{out:?}"
     );
-    let out = feed(&mut p, Time::from_secs(7), [fail(0, 3, FailKind::Other)]);
+    let out = feed(
+        &mut p,
+        Time(Duration::from_secs(7)),
+        [fail(0, 3, FailKind::Other)],
+    );
     assert!(
         matches!(&out[..], [Output::GaveUp(g)] if g.tried.len() == 3),
         "{out:?}"
@@ -559,11 +612,11 @@ fn speculative_failure_is_not_a_round() {
 fn run_order(config: Config, jobs: Vec<JobSpec>) -> Vec<JobId> {
     let mut p = Scheduler::new(config);
     let n = jobs.len();
-    feed(&mut p, Time::ZERO, jobs.into_iter().map(Input::Submit));
-    p.handle(Input::Worker(worker(1, 1, 100)), Time::ZERO);
+    feed(&mut p, Time::ORIGIN, jobs.into_iter().map(Input::Submit));
+    p.handle(Input::Worker(worker(1, 1, 100)), Time::ORIGIN);
     let mut order = Vec::new();
     for t in 0..n {
-        let t = Time::from_secs(t as u64);
+        let t = Time(Duration::from_secs(t as u64));
         let out = starts(&p.poll(t));
         assert_eq!(out.len(), 1, "{out:?}");
         order.push(out[0].0);
@@ -600,8 +653,8 @@ fn edd_orders_by_due_date() {
     };
     let jobs = vec![
         spec(0, None),
-        spec(1, Some(Time::from_secs(50))),
-        spec(2, Some(Time::from_secs(3))),
+        spec(1, Some(Time(Duration::from_secs(50)))),
+        spec(2, Some(Time(Duration::from_secs(3)))),
     ];
     assert_eq!(run_order(Config::lateness(), jobs), vec![2, 1, 0]);
 }
@@ -694,7 +747,7 @@ fn requires_and_forbids() {
     inputs.extend([either, both, forbidden, worker_or].map(Input::Submit));
     // Job 0 takes the less loaded of b and c; jobs 1 and 2 match nothing.
     assert_eq!(
-        starts(&feed(&mut p, Time::ZERO, inputs)),
+        starts(&feed(&mut p, Time::ORIGIN, inputs)),
         vec![(0, 2), (3, 3)]
     );
     let msg = p.explain(1).unwrap();
@@ -728,7 +781,7 @@ fn prefer_class_and_loosest() {
             ..job(0, 1, 0)
         }),
     ];
-    assert_eq!(starts(&feed(&mut p, Time::ZERO, inputs)), vec![(0, 2)]);
+    assert_eq!(starts(&feed(&mut p, Time::ORIGIN, inputs)), vec![(0, 2)]);
     let mut p = Scheduler::new(Config {
         score: vec![ScoreTerm::Loosest],
         ..Config::default()
@@ -738,7 +791,7 @@ fn prefer_class_and_loosest() {
         Input::Worker(worker(2, 4, 50)),
         Input::Submit(job(0, 1, 0)),
     ];
-    assert_eq!(starts(&feed(&mut p, Time::ZERO, inputs)), vec![(0, 1)]);
+    assert_eq!(starts(&feed(&mut p, Time::ORIGIN, inputs)), vec![(0, 1)]);
 }
 
 /// Slots are a resource dimension: every job takes exactly one, whatever the caller wrote,
@@ -755,7 +808,7 @@ fn slots_are_a_hard_dimension() {
         Input::Submit(job(2, 1, 0)),
     ];
     assert_eq!(
-        starts(&feed(&mut p, Time::ZERO, inputs)),
+        starts(&feed(&mut p, Time::ORIGIN, inputs)),
         vec![(0, 1), (1, 1)]
     );
     let load = &p.stats().workers[0];
@@ -776,12 +829,12 @@ fn speculation_needs_gain() {
     let mut j = job(0, 1, 0);
     j.work = Some(Duration::from_secs(100));
     let inputs = [Input::Worker(worker(1, 1, 100)), Input::Submit(j)];
-    feed(&mut p, Time::ZERO, inputs);
+    feed(&mut p, Time::ORIGIN, inputs);
     // At t=90 the slow attempt is expected to end at 100; a fresh one on a worker twice as
     // fast would end at 140.
     let fast = WorkerState {
         speed: 2.0,
         ..worker(2, 1, 100)
     };
-    assert!(feed(&mut p, Time::from_secs(90), [Input::Worker(fast)]).is_empty());
+    assert!(feed(&mut p, Time(Duration::from_secs(90)), [Input::Worker(fast)]).is_empty());
 }

@@ -44,12 +44,15 @@ fn run_order(order: &[u64], group_order: GroupOrder) -> Vec<u64> {
         ..Config::default()
     });
     for (i, &g) in order.iter().enumerate() {
-        p.handle(Input::Submit(job(g, g)), Time::from_secs(i as u64));
+        p.handle(
+            Input::Submit(job(g, g)),
+            Time(Duration::from_secs(i as u64)),
+        );
     }
-    p.handle(Input::Worker(worker(1)), Time::from_secs(10));
+    p.handle(Input::Worker(worker(1)), Time(Duration::from_secs(10)));
     let mut ran = Vec::new();
     for t in 0..order.len() as u64 {
-        let t = Time::from_secs(10 + t);
+        let t = Time(Duration::from_secs(10 + t));
         let out = starts(p.poll(t));
         assert_eq!(out.len(), 1);
         ran.push(out[0].0);
@@ -99,10 +102,10 @@ fn young_group_behind_wide_old_group_waits_at_most_age_limit() {
     const RUN: Duration = Duration::from_secs(100);
     const YOUNG: u64 = 1_000_000;
     let wait = |policy: &mut dyn Policy| -> Duration {
-        policy.handle(Input::Worker(worker(SLOTS)), Time::ZERO);
+        policy.handle(Input::Worker(worker(SLOTS)), Time::ORIGIN);
         let mut released = 0;
         let mut running: Vec<(u64, Time)> = Vec::new();
-        let (mut t, ten) = (Time::ZERO, Time::from_secs(10));
+        let (mut t, ten) = (Time::ORIGIN, Time(Duration::from_secs(10)));
         loop {
             // The old walk keeps two jobs per slot ready.
             while released < OLD_JOBS && policy.stats().waiting < 2 * SLOTS {
@@ -127,7 +130,10 @@ fn young_group_behind_wide_old_group_waits_at_most_age_limit() {
                 running.push((j, t + RUN));
             }
             t += Duration::from_secs(1);
-            assert!(t < Time::from_secs(1_000_000), "the young job never ran");
+            assert!(
+                t < Time(Duration::from_secs(1_000_000)),
+                "the young job never ran"
+            );
         }
     };
     let by_id = |base: Config, age_limit| Config {

@@ -19,12 +19,12 @@ const BUDGET_GB: f64 = 10.0;
 const JOBS: u64 = 80;
 const HEARTBEAT: Duration = Duration::from_secs(60);
 /// When worker 0 leaves (and rejoins at the next heartbeat).
-const LOSS: Time = Time::from_millis(50_050);
+const LOSS: Time = Time(Duration::from_millis(50_050));
 
 /// Job `i`: arrival, run time and demand (GB). Times are chosen so that no two events coincide.
 fn job(i: u64) -> (Time, Duration, f64) {
     (
-        Time::from_millis(370 + 1300 * i),
+        Time(Duration::from_millis(370 + 1300 * i)),
         Duration::from_millis(5000 + (i * 7 % 11) * 1000 + 123 * i),
         1.0 + (i * 5 % 6) as f64,
     )
@@ -75,11 +75,11 @@ fn run(sink: impl EventSink + 'static) -> Vec<(JobId, Attempt)> {
         }
     };
     for w in 0..WORKERS {
-        p.handle(Input::Worker(state(w)), Time::ZERO);
+        p.handle(Input::Worker(state(w)), Time::ORIGIN);
     }
-    poll(&mut p, Time::ZERO, &mut ends, &mut started);
+    poll(&mut p, Time::ORIGIN, &mut ends, &mut started);
     let mut next_arrival = 0;
-    let mut next_beat = Time::ZERO + HEARTBEAT;
+    let mut next_beat = Time::ORIGIN + HEARTBEAT;
     let mut lost = false;
     let mut done = 0;
     while done < JOBS {
@@ -181,7 +181,7 @@ fn jsonl_round_trip_replays() {
     let file = std::io::BufReader::new(std::fs::File::open(&path).unwrap());
     let lines: Vec<String> = file.lines().map(Result::unwrap).collect();
     let _ = std::fs::remove_dir_all(&dir);
-    assert!(lines[0].starts_with(r#"{"type":"input","t":0,"input":{"worker""#));
+    assert!(lines[0].starts_with(r#"{"type":"input","t":{"secs":0,"nanos":0},"input":{"worker""#));
     let back: Vec<Event> = lines
         .iter()
         .map(|l| serde_json::from_str(l).unwrap())

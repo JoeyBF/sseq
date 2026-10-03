@@ -62,9 +62,9 @@ impl Scheduler {
                     (spec.work).map_or(i64::MAX, |w| ordered(-(spec.weight / w.as_secs_f64())))
                 }
                 // Order-preserving from u64 to i64.
-                OrderTerm::Edd => spec
-                    .due
-                    .map_or(i64::MAX, |d| d.as_nanos() as i64 ^ i64::MIN),
+                OrderTerm::Edd => spec.due.map_or(i64::MAX, |d| {
+                    u64::try_from(d.0.as_nanos()).unwrap_or(u64::MAX) as i64 ^ i64::MIN
+                }),
             };
         }
         Key { terms, seq }

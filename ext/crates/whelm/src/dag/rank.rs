@@ -62,7 +62,7 @@ impl<P: Policy> DagScheduler<P> {
     ///     work_estimate: Some(Duration::from_secs(2)),
     ///     ..Default::default()
     /// };
-    /// dag.declare([unit, after.into()], Time::ZERO).unwrap();
+    /// dag.declare([unit, after.into()], Time::ORIGIN).unwrap();
     /// assert_eq!(
     ///     [10, 100, 101, 20].map(|j| dag.rank(j)),
     ///     [5, 3, 5, 2].map(|s| Some(Duration::from_secs(s)))
@@ -91,13 +91,13 @@ impl<P: Policy> DagScheduler<P> {
     /// #     Time, WorkerState,
     /// # };
     /// # let mut dag = DagScheduler::new(DagConfig::default(), Scheduler::new(Config::fifo()));
-    /// # dag.handle(Input::Worker(WorkerState { id: 1, ..Default::default() }), Time::ZERO);
+    /// # dag.handle(Input::Worker(WorkerState { id: 1, ..Default::default() }), Time::ORIGIN);
     /// # let job = |id, deps| DagJob {
     /// #     spec: JobSpec { id, ..Default::default() },
     /// #     deps,
     /// #     ..Default::default()
     /// # };
-    /// dag.declare([job(1, vec![]), job(2, vec![1])], Time::ZERO)
+    /// dag.declare([job(1, vec![]), job(2, vec![1])], Time::ORIGIN)
     ///     .unwrap();
     /// assert_eq!(dag.rank(1), Some(Duration::from_secs(2)));
     /// assert!(dag.update_work(2, 5.0));

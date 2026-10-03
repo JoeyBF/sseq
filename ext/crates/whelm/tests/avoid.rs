@@ -1,5 +1,7 @@
 //! Forbid and Avoid constraints, and the soft avoidance of retries.
 
+use std::time::Duration;
+
 use whelm::{
     Config, Constraint, FailKind, Input, JobId, JobSpec, Output, Policy, Resources, Scheduler,
     Time, WorkerId, WorkerState,
@@ -30,7 +32,7 @@ fn worker(id: WorkerId, slots: usize) -> WorkerState {
 fn policy(workers: &[(WorkerId, usize)]) -> Scheduler {
     let mut p = Scheduler::new(Config::default());
     for &(id, slots) in workers {
-        p.handle(Input::Worker(worker(id, slots)), Time::ZERO);
+        p.handle(Input::Worker(worker(id, slots)), Time::ORIGIN);
     }
     p
 }
@@ -54,12 +56,12 @@ fn job(id: JobId, avoid: &[WorkerId], soft: bool) -> JobSpec {
 #[test]
 fn soft_avoid_lapses_when_only_avoided_workers_are_live() {
     let mut p = policy(&[(1, 4)]);
-    p.handle(Input::Submit(job(10, &[1], false)), Time::ZERO);
-    p.handle(Input::Submit(job(11, &[1], true)), Time::ZERO);
-    assert_eq!(starts(p.poll(Time::ZERO)), vec![(11, 1)]);
+    p.handle(Input::Submit(job(10, &[1], false)), Time::ORIGIN);
+    p.handle(Input::Submit(job(11, &[1], true)), Time::ORIGIN);
+    assert_eq!(starts(p.poll(Time::ORIGIN)), vec![(11, 1)]);
     // A worker the job does not avoid joins: the hard one runs there.
-    p.handle(Input::Worker(worker(2, 4)), Time::from_secs(1));
-    assert_eq!(starts(p.poll(Time::from_secs(1))), vec![(10, 2)]);
+    p.handle(Input::Worker(worker(2, 4)), Time(Duration::from_secs(1)));
+    assert_eq!(starts(p.poll(Time(Duration::from_secs(1)))), vec![(10, 2)]);
 }
 
 /// While a worker the job does not avoid is live, Avoid holds even if that worker is busy: a
@@ -67,18 +69,24 @@ fn soft_avoid_lapses_when_only_avoided_workers_are_live() {
 #[test]
 fn soft_avoid_holds_while_another_worker_is_live() {
     let mut p = policy(&[(1, 4), (2, 1)]);
-    p.handle(Input::Submit(job(0, &[], false)), Time::ZERO);
+    p.handle(Input::Submit(job(0, &[], false)), Time::ORIGIN);
     // Fill worker 2 explicitly by forbidding worker 1.
-    p.handle(Input::Submit(job(1, &[1], false)), Time::ZERO);
-    let placed = starts(p.poll(Time::ZERO));
+    p.handle(Input::Submit(job(1, &[1], false)), Time::ORIGIN);
+    let placed = starts(p.poll(Time::ORIGIN));
     assert!(placed.contains(&(1, 2)), "{placed:?}");
     // Worker 2 is now full; a job avoiding worker 1 waits.
-    p.handle(Input::Submit(job(2, &[1], true)), Time::from_secs(1));
-    let placed = starts(p.poll(Time::from_secs(1)));
+    p.handle(
+        Input::Submit(job(2, &[1], true)),
+        Time(Duration::from_secs(1)),
+    );
+    let placed = starts(p.poll(Time(Duration::from_secs(1))));
     assert!(!placed.iter().any(|&(j, _)| j == 2), "{placed:?}");
     // Worker 2 frees: it goes there.
-    p.handle(Input::Done { job: 1, attempt: 1 }, Time::from_secs(2));
-    assert_eq!(starts(p.poll(Time::from_secs(2))), vec![(2, 2)]);
+    p.handle(
+        Input::Done { job: 1, attempt: 1 },
+        Time(Duration::from_secs(2)),
+    );
+    assert_eq!(starts(p.poll(Time(Duration::from_secs(2)))), vec![(2, 2)]);
 }
 
 /// A worker with no slots is not live, and one the hard constraints exclude does not count.
@@ -90,12 +98,12 @@ fn soft_avoid_ignores_dead_and_foreign_workers() {
             class: "y".into(),
             ..worker(3, 2)
         }),
-        Time::ZERO,
+        Time::ORIGIN,
     );
     let mut pinned = job(5, &[1], true);
     pinned.constraints.push(Constraint::require_class("x"));
-    p.handle(Input::Submit(pinned), Time::ZERO);
-    assert_eq!(starts(p.poll(Time::ZERO)), vec![(5, 1)]);
+    p.handle(Input::Submit(pinned), Time::ORIGIN);
+    assert_eq!(starts(p.poll(Time::ORIGIN)), vec![(5, 1)]);
 }
 
 /// A failed attempt's retry softly avoids the worker it failed on: it waits for the busy healthy
@@ -103,9 +111,9 @@ fn soft_avoid_ignores_dead_and_foreign_workers() {
 #[test]
 fn retry_softly_avoids_the_worker_it_failed_on() {
     let mut p = policy(&[(1, 1), (2, 1)]);
-    p.handle(Input::Submit(job(0, &[], false)), Time::ZERO);
-    p.handle(Input::Submit(job(1, &[], false)), Time::ZERO);
-    assert_eq!(starts(p.poll(Time::ZERO)), vec![(0, 1), (1, 2)]);
+    p.handle(Input::Submit(job(0, &[], false)), Time::ORIGIN);
+    p.handle(Input::Submit(job(1, &[], false)), Time::ORIGIN);
+    assert_eq!(starts(p.poll(Time::ORIGIN)), vec![(0, 1), (1, 2)]);
     p.handle(
         Input::Failed {
             job: 0,
@@ -113,18 +121,18 @@ fn retry_softly_avoids_the_worker_it_failed_on() {
             kind: FailKind::Other,
             why: "boom".into(),
         },
-        Time::from_secs(1),
+        Time(Duration::from_secs(1)),
     );
     // Worker 1 is free but avoided while worker 2 lives.
-    assert_eq!(starts(p.poll(Time::from_secs(1))), vec![]);
+    assert_eq!(starts(p.poll(Time(Duration::from_secs(1)))), vec![]);
     assert!(
         p.explain(0)
             .unwrap()
             .contains("failed 1 time(s), last on worker 1")
     );
     // Worker 2 leaves: its job fails too, and both retries fall back to worker 1, the only one.
-    p.handle(Input::WorkerGone(2), Time::from_secs(2));
-    let out = p.poll(Time::from_secs(2));
+    p.handle(Input::WorkerGone(2), Time(Duration::from_secs(2)));
+    let out = p.poll(Time(Duration::from_secs(2)));
     assert_eq!(
         out,
         vec![Output::Start {
@@ -133,9 +141,12 @@ fn retry_softly_avoids_the_worker_it_failed_on() {
             worker: 1
         }]
     );
-    p.handle(Input::Done { job: 0, attempt: 2 }, Time::from_secs(3));
+    p.handle(
+        Input::Done { job: 0, attempt: 2 },
+        Time(Duration::from_secs(3)),
+    );
     assert_eq!(
-        p.poll(Time::from_secs(3)),
+        p.poll(Time(Duration::from_secs(3))),
         vec![Output::Start {
             job: 1,
             attempt: 2,

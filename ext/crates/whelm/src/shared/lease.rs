@@ -21,7 +21,7 @@ use crate::{Attempt, FailKind, GaveUp, Input, JobId, Policy, WorkerId};
 ///     retry: RetryConfig { max_attempts: 3 },
 ///     ..Config::fifo()
 /// };
-/// let shared = SharedPolicy::new(Scheduler::new(config), || Time::ZERO);
+/// let shared = SharedPolicy::new(Scheduler::new(config), || Time::ORIGIN);
 /// for w in [1, 2] {
 ///     shared.worker_update(WorkerState {
 ///         id: w,
@@ -94,7 +94,7 @@ impl<'a, P: Policy> Lease<'a, P> {
     /// ```
     /// use whelm::{Config, Input, JobSpec, Policy, Resources, Scheduler, SharedPolicy, Time};
     ///
-    /// let shared = SharedPolicy::new(Scheduler::new(Config::default()), || Time::ZERO);
+    /// let shared = SharedPolicy::new(Scheduler::new(Config::default()), || Time::ORIGIN);
     /// shared.worker_update(whelm::WorkerState {
     ///     id: 1,
     ///     budget: Resources::mem_gb(8.0),
@@ -121,7 +121,7 @@ impl<'a, P: Policy> Lease<'a, P> {
     /// ```
     /// use whelm::{Config, JobSpec, Resources, Scheduler, SharedPolicy, Time, WorkerState};
     ///
-    /// let shared = SharedPolicy::new(Scheduler::new(Config::fifo()), || Time::ZERO);
+    /// let shared = SharedPolicy::new(Scheduler::new(Config::fifo()), || Time::ORIGIN);
     /// for w in [1, 2] {
     ///     shared.worker_update(WorkerState {
     ///         id: w,

@@ -31,7 +31,7 @@ use crate::{Defer, Policy, Reservations, Timing, WorkerView};
 ///         budget: Resources::mem_gb(10.0),
 ///         ..Default::default()
 ///     }),
-///     Time::ZERO,
+///     Time::ORIGIN,
 /// );
 /// p.handle(
 ///     Input::Submit(JobSpec {
@@ -39,7 +39,7 @@ use crate::{Defer, Policy, Reservations, Timing, WorkerView};
 ///         demand: Resources::mem_gb(6.0),
 ///         ..Default::default()
 ///     }),
-///     Time::ZERO,
+///     Time::ORIGIN,
 /// );
 /// p.handle(
 ///     Input::Submit(JobSpec {
@@ -47,10 +47,10 @@ use crate::{Defer, Policy, Reservations, Timing, WorkerView};
 ///         demand: Resources::mem_gb(6.0),
 ///         ..Default::default()
 ///     }),
-///     Time::ZERO,
+///     Time::ORIGIN,
 /// );
-/// p.poll(Time::ZERO);
-/// let t = Time::ZERO + Reservations::default().reserve_after;
+/// p.poll(Time::ORIGIN);
+/// let t = Time::ORIGIN + Reservations::default().reserve_after;
 /// p.poll(t);
 /// assert_eq!(
 ///     p.stats().reservations,
@@ -87,7 +87,7 @@ pub struct ReservationInfo {
 ///         budget: Resources::mem_gb(10.0),
 ///         ..Default::default()
 ///     }),
-///     Time::ZERO,
+///     Time::ORIGIN,
 /// );
 /// p.handle(
 ///     Input::Submit(JobSpec {
@@ -95,9 +95,9 @@ pub struct ReservationInfo {
 ///         demand: Resources::mem_gb(3.0),
 ///         ..Default::default()
 ///     }),
-///     Time::ZERO,
+///     Time::ORIGIN,
 /// );
-/// p.poll(Time::ZERO);
+/// p.poll(Time::ORIGIN);
 /// let load = &p.stats().workers[0];
 /// assert_eq!((load.id, load.running, load.reserved_for), (1, 1, None));
 /// assert_eq!(load.headroom, [Some(7_000_000_000), None, Some(3)]);
@@ -140,7 +140,7 @@ pub struct WorkerLoad {
 ///         class: "cpu".into(),
 ///         ..Default::default()
 ///     }),
-///     Time::ZERO,
+///     Time::ORIGIN,
 /// );
 /// for id in 1..=3 {
 ///     p.handle(
@@ -148,15 +148,15 @@ pub struct WorkerLoad {
 ///             id,
 ///             ..Default::default()
 ///         }),
-///         Time::ZERO,
+///         Time::ORIGIN,
 ///     );
 /// }
-/// p.poll(Time::ZERO);
-/// p.poll(Time::from_secs(25));
+/// p.poll(Time::ORIGIN);
+/// p.poll(Time(Duration::from_secs(25)));
 /// let stats = p.stats();
 /// assert_eq!(
 ///     (stats.now, stats.waiting, stats.running),
-///     (Time::from_secs(25), 2, 1)
+///     (Time(Duration::from_secs(25)), 2, 1)
 /// );
 /// assert_eq!(stats.longest_wait, Some((2, Duration::from_secs(25))));
 /// assert_eq!(stats.placements_total, 1);

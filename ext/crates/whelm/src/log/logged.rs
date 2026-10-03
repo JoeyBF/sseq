@@ -70,17 +70,17 @@ impl<P: Policy> Logged<P> {
     ///     budget: Resources::mem_gb(8.0),
     ///     ..Default::default()
     /// };
-    /// p.handle(Input::Worker(w.clone()), Time::ZERO);
+    /// p.handle(Input::Worker(w.clone()), Time::ORIGIN);
     /// let job = JobSpec {
     ///     id: 1,
     ///     demand: Resources::mem_gb(2.0),
     ///     ..Default::default()
     /// };
-    /// p.handle(Input::Submit(job), Time::ZERO);
-    /// p.poll(Time::ZERO);
+    /// p.handle(Input::Submit(job), Time::ORIGIN);
+    /// p.poll(Time::ORIGIN);
     /// w.reported_used = Resources::mem_gb(1.5);
     /// for t in [10, 20, 30] {
-    ///     p.handle(Input::Worker(w.clone()), Time::from_secs(t));
+    ///     p.handle(Input::Worker(w.clone()), Time(Duration::from_secs(t)));
     /// }
     ///
     /// let samples: Vec<Event> = events
@@ -94,7 +94,7 @@ impl<P: Policy> Logged<P> {
     /// assert_eq!(
     ///     samples[1],
     ///     Event::Sample {
-    ///         t: Time::from_secs(30),
+    ///         t: Time(Duration::from_secs(30)),
     ///         worker: "1".into(),
     ///         rss_gb: 1.5,
     ///         baseline_gb: 0.0,
@@ -114,7 +114,10 @@ impl<P: Policy> Logged<P> {
     /// The annotation is used once, by the job's next submission:
     ///
     /// ```
-    /// use std::sync::{Arc, Mutex};
+    /// use std::{
+    ///     sync::{Arc, Mutex},
+    ///     time::Duration,
+    /// };
     ///
     /// use whelm::{
     ///     Config, Input, JobSpec, Policy, Resources, Scheduler, Time,
@@ -135,16 +138,16 @@ impl<P: Policy> Logged<P> {
     ///         demand: Resources::mem_gb(1.0),
     ///         ..Default::default()
     ///     }),
-    ///     Time::ZERO,
+    ///     Time::ORIGIN,
     /// );
-    /// p.handle(Input::Cancel(1), Time::from_secs(1));
+    /// p.handle(Input::Cancel(1), Time(Duration::from_secs(1)));
     /// p.handle(
     ///     Input::Submit(JobSpec {
     ///         id: 1,
     ///         demand: Resources::mem_gb(1.0),
     ///         ..Default::default()
     ///     }),
-    ///     Time::from_secs(2),
+    ///     Time(Duration::from_secs(2)),
     /// );
     ///
     /// let events = events.lock().unwrap();
