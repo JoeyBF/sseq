@@ -82,14 +82,17 @@ pub enum Order {
         /// Rank on true costs.
         oracle: bool,
     },
-    /// An offline plan's order: each job's start in a [`heft`] schedule (on estimated costs, or
-    /// true costs when `oracle`) is its [`JobSpec::priority`].
+    /// An offline plan's order: a job's start in a [`heft`] schedule is its priority.
+    ///
+    /// The start becomes [`JobSpec::priority`]; the plan uses estimated costs, or true costs when
+    /// `oracle`.
     Heft {
         /// Plan on true costs.
         oracle: bool,
     },
-    /// Smith's rule ([`Config::weighted_completion`]): shortest estimated work first, all weights
-    /// being 1.
+    /// Smith's rule ([`Config::weighted_completion`]): shortest estimated work first.
+    ///
+    /// All weights are 1.
     Wspt,
 }
 
@@ -173,8 +176,9 @@ impl SmallInstance {
         self.tasks.iter().filter(|t| t.kind != Kind::Join).count()
     }
 
-    /// The speed of every slot of every worker: the machines of the offline models, which match
-    /// [`simulate_small`]'s exclusive slots.
+    /// The speed of every slot of every worker: the machines of the offline models.
+    ///
+    /// They match [`simulate_small`]'s exclusive slots.
     pub fn machines(&self) -> Vec<f64> {
         (self.classes.iter())
             .flat_map(|c| std::iter::repeat_n(c.speed, (c.workers * c.slots) as usize))
@@ -182,9 +186,11 @@ impl SmallInstance {
     }
 }
 
-/// Simulate `inst` under `plan` through the real [`DagScheduler`] and policy engine. Workers run
-/// each job at their speed (exclusive slots, i.e. linear processor sharing). A speculative attempt
-/// holds its own slot until the first attempt of its job finishes and the other is stopped.
+/// Simulate `inst` under `plan` through the real [`DagScheduler`] and policy engine.
+///
+/// Workers run each job at their speed (exclusive slots, i.e. linear processor sharing). A
+/// speculative attempt holds its own slot until the first attempt of its job finishes and the
+/// other is stopped.
 pub fn simulate_small(inst: &SmallInstance, plan: &SmallPlan) -> SmallResult {
     let (order, oracle) = plan.order.terms();
     let policy = Scheduler::new(Config {
@@ -416,8 +422,10 @@ impl GridParams {
     }
 }
 
-/// Build a mini-Nassau instance: a grid of groups with `depgraph`'s edges, each group a zero
-/// task, an optional layered walk, and a join.
+/// Build a mini-Nassau instance from `p`.
+///
+/// It is a grid of groups with `depgraph`'s edges, each group a zero task, an optional layered
+/// walk, and a join.
 pub fn grid(p: &GridParams) -> SmallInstance {
     let key = |a: u64, b: u64| mix(p.seed ^ mix(a ^ mix(b)));
     let mut tasks: Vec<SmallTask> = Vec::new();
@@ -517,8 +525,10 @@ pub fn grid(p: &GridParams) -> SmallInstance {
     }
 }
 
-/// A random multiplicative perturbation of `inst` (work, estimates, walk edges, fleet, or a
-/// whole row or column), keyed by `key`. `structural` allows edge and fleet changes.
+/// A random multiplicative perturbation of `inst`, keyed by `key`.
+///
+/// It changes work, estimates, walk edges, the fleet, or a whole row or column; `structural`
+/// allows edge and fleet changes.
 pub fn perturb(inst: &SmallInstance, key: u64, structural: bool) -> SmallInstance {
     let mut x = inst.clone();
     let u = |k: u64| uniform(mix(key) ^ k);
@@ -603,14 +613,15 @@ pub fn perturb(inst: &SmallInstance, key: u64, structural: bool) -> SmallInstanc
     x
 }
 
-/// Jobs in a [`tiny`] instance: few enough for [`exact::solve`](crate::exact::solve) to prove
-/// optimality quickly.
+/// Jobs in a [`tiny`] instance.
+///
+/// Few enough for [`exact::solve`](crate::exact::solve) to prove optimality quickly.
 pub const TINY_JOBS: std::ops::RangeInclusive<usize> = 8..=20;
 
-/// A tiny mini-Nassau instance, for comparing plans against the exact optimum: a grid of at most
-/// two rows and four columns, short narrow walks, and two or three workers of one or two slots,
-/// with [`TINY_JOBS`] jobs. Parameters are drawn from `seed`, redrawn deterministically until the
-/// job count fits.
+/// A tiny mini-Nassau instance of [`TINY_JOBS`] jobs, for comparing plans against the optimum.
+///
+/// A small grid with short narrow walks on a small two-class fleet. Parameters are drawn from
+/// `seed`, redrawn deterministically until the job count fits.
 pub fn tiny(seed: u64) -> SmallInstance {
     for attempt in 0u64.. {
         let key = mix(seed ^ mix(attempt));
@@ -703,8 +714,9 @@ mod tests {
         assert!((r.makespan - work / 2.0).abs() < 1e-9 * work);
     }
 
-    /// Speculation on a mixed fleet starts second attempts, every job still finishes once (the
-    /// simulator asserts it), and no schedule beats the lower bounds.
+    /// Speculation on a mixed fleet starts second attempts, and no schedule beats the bounds.
+    ///
+    /// Every job finishes once; the simulator asserts it.
     #[test]
     fn speculation_runs_second_attempts() {
         let mut p = plan(Order::Group, true);

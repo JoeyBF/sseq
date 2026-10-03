@@ -16,17 +16,21 @@ use crate::{
 /// How the replay derives each worker's `reported_baseline`.
 #[derive(Clone, Debug)]
 pub enum Baseline {
-    /// Production's rule: the rolling RSS floor (see
-    /// [`Trace::floor_baseline`](super::trace::Trace::floor_baseline)), replayed from the trace.
+    /// Production's rule: the rolling RSS floor, replayed from the trace.
+    ///
+    /// See [`Trace::floor_baseline`](super::trace::Trace::floor_baseline).
     RollingFloor {
         /// Window, seconds.
         window_s: f64,
-        /// GB subtracted from the replayed floor. The trace samples RSS once a minute while the
-        /// worker's gate samples it more often and so sees lower dips; this calibrates for that.
+        /// GB subtracted from the replayed floor, calibrating for the trace's sampling.
+        ///
+        /// The trace samples RSS once a minute while the worker's gate samples it more often and
+        /// so sees lower dips.
         offset_gb: f64,
     },
-    /// What a worker reporting `baseline_excl` sends: the rolling floor of resident memory minus
-    /// the estimates running (see
+    /// What a worker reporting `baseline_excl` sends.
+    ///
+    /// The rolling floor of resident memory minus the estimates running (see
     /// [`Trace::floor_baseline_excl`](super::trace::Trace::floor_baseline_excl)), with the
     /// estimates scaled like the demands ([`SimSetup::est_scale`]).
     RollingFloorExcl {
@@ -39,9 +43,10 @@ pub enum Baseline {
     PerWorker(Vec<f64>),
 }
 
-/// A model of the memory jobs actually occupy, to estimate how often looser admission would push
-/// a worker over its budget (the trace's resident memory does not respond to the simulated
-/// placements).
+/// A model of the memory jobs actually occupy.
+///
+/// It estimates how often looser admission would push a worker over its budget, which the trace's
+/// resident memory cannot show: it does not respond to the simulated placements.
 #[derive(Clone, Debug)]
 pub struct Usage {
     /// Each worker's idle resident memory, GB.
@@ -84,6 +89,9 @@ pub struct Overrun {
     pub max_excess_gb: f64,
 }
 
+/// How often, in simulated seconds, [`SimSetup::explain`] prints.
+pub const EXPLAIN_PERIOD_S: f64 = 600.0;
+
 /// A policy usable from a simulation thread.
 pub type BoxPolicy = Box<dyn Policy + Send>;
 
@@ -105,8 +113,9 @@ pub struct SimSetup<'a> {
     pub closed_loop: Option<DagConfig>,
     /// Jobs whose estimate exceeds this many GB are "big" in the metrics.
     pub big_gb: f64,
-    /// Print the policy's `explain` for this request to stderr every 10 simulated minutes while
-    /// it waits.
+    /// Print the policy's `explain` for this request to stderr while it waits.
+    ///
+    /// It prints every [`EXPLAIN_PERIOD_S`] simulated seconds.
     pub explain: Option<u64>,
     /// Demands are the trace's estimates times this (1: as recorded).
     pub est_scale: f64,
@@ -576,7 +585,7 @@ pub fn simulate(setup: &SimSetup, name: &str, policy: BoxPolicy) -> Metrics {
         if let Some(j) = watched
             && arrival[j].is_finite()
             && !placed[j].is_finite()
-            && t - last_explain >= 600.0
+            && t - last_explain >= EXPLAIN_PERIOD_S
         {
             last_explain = t;
             eprintln!(

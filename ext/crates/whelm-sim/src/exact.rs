@@ -17,8 +17,7 @@ pub struct Limits {
 }
 
 impl Default for Limits {
-    /// Ten million nodes or ten seconds: [`TINY_JOBS`](crate::small::TINY_JOBS)-sized instances
-    /// usually finish far below either.
+    /// Limits that [`TINY_JOBS`](crate::small::TINY_JOBS)-sized instances usually stay far below.
     fn default() -> Self {
         Self {
             nodes: 10_000_000,
@@ -32,8 +31,9 @@ impl Default for Limits {
 pub struct Solution {
     /// The best makespan found.
     pub makespan: f64,
-    /// Whether the search finished, so that `makespan` is optimal; otherwise it is the best found
-    /// within the [`Limits`].
+    /// Whether the search finished, so that `makespan` is optimal.
+    ///
+    /// Otherwise `makespan` is the best found within the [`Limits`].
     pub optimal: bool,
     /// A lower bound on the optimum: `makespan` when optimal, else the root's bound.
     pub lower_bound: f64,
@@ -43,8 +43,9 @@ pub struct Solution {
     pub seconds: f64,
 }
 
-/// The scheduling problem behind an instance: its jobs (joins contracted into dependencies) and
-/// its machines.
+/// The scheduling problem behind an instance: its jobs and its machines.
+///
+/// Joins are contracted into dependencies.
 #[derive(Clone, Debug)]
 struct Problem {
     /// Each job's true work.
@@ -128,9 +129,10 @@ struct Search<'a> {
 }
 
 impl Search<'_> {
-    /// A lower bound on every completion of the partial schedule whose last job started at `t0`
-    /// (every job left starts no earlier, by the search's order) and whose jobs finish by
-    /// `cur_max`:
+    /// A lower bound on every completion of a partial schedule.
+    ///
+    /// The partial schedule's last job started at `t0` (every job left starts no earlier, by the
+    /// search's order) and its jobs finish by `cur_max`. The bound is the largest of:
     ///
     /// - per job: its earliest start (from its predecessors, at the fastest speed for unscheduled
     ///   ones), its earliest finish on any machine from there, and the rest of its chain at the
@@ -179,8 +181,9 @@ impl Search<'_> {
         lb.max(t)
     }
 
-    /// Extend the partial schedule (`scheduled` jobs, the last being job `last.1` started at
-    /// `last.0`) in every canonical way that may beat the incumbent.
+    /// Extend the partial schedule in every canonical way that may beat the incumbent.
+    ///
+    /// It has `scheduled` jobs, the last being job `last.1`, started at `last.0`.
     fn dfs(&mut self, last: (f64, usize), cur_max: f64, scheduled: usize) {
         let pb = self.pb;
         let n = pb.work.len();
@@ -249,9 +252,10 @@ impl Search<'_> {
     }
 }
 
-/// The optimal makespan of `inst` with its true work known in advance (Q|prec|Cmax: each worker
-/// slot a machine at its worker's speed, as [`simulate_small`](crate::small::simulate_small)
-/// runs them, joins taking no time), or the best found within `limits`.
+/// The optimal makespan of `inst` given its true work, or the best found within `limits`.
+///
+/// The problem is Q|prec|Cmax: each worker slot is a machine at its worker's speed, as
+/// [`simulate_small`](crate::small::simulate_small) runs them, and joins take no time.
 ///
 /// Depth-first branch and bound over semi-active schedules (every job starts as soon as its
 /// predecessors and its machine allow), each generated once: jobs are appended in nondecreasing
@@ -345,8 +349,10 @@ mod tests {
         }
     }
 
-    /// A random instance of `jobs` jobs with joins among them, on `slots` slots of speed 1 and one
-    /// of speed 2.5 (or 1 when `identical`).
+    /// A random instance of `jobs` jobs with joins among them.
+    ///
+    /// The fleet is a slow worker of `slots` slots and a one-slot worker that is faster unless
+    /// `identical`.
     fn random(seed: u64, jobs: usize, slots: u32, identical: bool) -> SmallInstance {
         let u = |k: u64| uniform(mix(seed) ^ k);
         let mut tasks: Vec<SmallTask> = Vec::new();
@@ -406,8 +412,10 @@ mod tests {
         }
     }
 
-    /// On tiny instances the optimum is proved, lies between the lower bounds and every online
-    /// plan's makespan, and HEFT's offline schedule is no better than it.
+    /// On tiny instances the optimum is proved, no bound exceeds it and no schedule beats it.
+    ///
+    /// The lower bounds stay below it; HEFT's offline schedule and every online plan's makespan
+    /// stay above it.
     #[test]
     fn optimum_bounds_the_plans() {
         for seed in 0..12 {

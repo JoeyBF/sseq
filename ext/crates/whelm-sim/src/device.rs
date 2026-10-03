@@ -1,5 +1,4 @@
-//! A synthetic device-memory scenario: small cards whose launch pool makes over-subscribed jobs
-//! wait, with and without device-aware admission.
+//! A synthetic device-memory scenario: small cards whose over-subscribed launch pool slows jobs.
 
 use serde::Serialize;
 use whelm::{Config, Input, JobId, JobSpec, Output, Policy, Resources, Scheduler, WorkerState};
@@ -25,18 +24,20 @@ pub struct DeviceScenario {
     pub work_s: f64,
     /// Log-normal spread of the work.
     pub work_sd: f64,
-    /// Over-subscription penalty: with total device demand `S > C` running, each job runs at
-    /// `(C / S)^(1 + gamma)` of its speed (0: the pool only serialises launches; > 0: contention
-    /// wastes capacity too).
+    /// Over-subscription penalty.
+    ///
+    /// With total device demand `S > C` running, each job runs at `(C / S)^(1 + gamma)` of its
+    /// speed (0: the pool only serialises launches; > 0: contention wastes capacity too).
     pub gamma: f64,
     /// Seed of the job draws.
     pub seed: u64,
 }
 
 impl Default for DeviceScenario {
-    /// An L40S fleet as in job 40506688: 14 workers x 16 slots, a 19.5 GB launch pool, jobs
-    /// needing about 2.4 GB each (8 fit), and the penalty that turns 16 jobs into the observed
-    /// 0.41x of 8 jobs' throughput (`2^-gamma = 8 / 19.5`).
+    /// An L40S fleet as in job 40506688.
+    ///
+    /// `gamma` reproduces the throughput drop measured there between running only the jobs that
+    /// fit the pool and filling every slot (see "Device memory" in RESULTS.md).
     fn default() -> Self {
         Self {
             workers: 14,
@@ -58,16 +59,19 @@ impl Default for DeviceScenario {
 pub enum DeviceArm {
     /// Host memory only: the device capacity is not reported.
     HostOnly,
-    /// The per-worker count form: the worker reports its pool and a learned per-task demand, this
-    /// quantile of the jobs' demands (times `scale`, to price an over- or underestimate).
+    /// The per-worker count form: the worker reports its pool and a learned per-task demand.
+    ///
+    /// That demand is this quantile of the jobs' demands, times `scale` to price an over- or
+    /// underestimate.
     Count {
         /// Quantile of the demand distribution reported as the device `per_task`.
         quantile: f64,
         /// Multiplier on it.
         scale: f64,
     },
-    /// The per-job sum form: each job carries a device estimate, its true demand times a
-    /// log-normal error of this spread.
+    /// The per-job sum form: each job carries a device estimate.
+    ///
+    /// The estimate is its true demand times a log-normal error of this spread.
     Sum {
         /// Spread of the estimate's error.
         error_sd: f64,
@@ -110,8 +114,7 @@ struct Wk {
     over: f64,
 }
 
-/// Run one arm of the scenario through the default [`Scheduler`] with the production admission
-/// rule.
+/// Run one arm of the scenario through the default [`Scheduler`] (production admission rule).
 pub fn simulate_device(sc: &DeviceScenario, arm: DeviceArm) -> DeviceMetrics {
     let n = sc.jobs;
     let demand: Vec<f64> = (0..n as u64)
@@ -256,9 +259,11 @@ pub fn simulate_device(sc: &DeviceScenario, arm: DeviceArm) -> DeviceMetrics {
 mod tests {
     use super::*;
 
-    /// With the observed penalty, device-aware admission beats host-only admission by a wide
-    /// margin; without a penalty, exact per-job demands cost nothing while a pessimistic
-    /// per-task demand (the 90th percentile) leaves capacity idle.
+    /// Device-aware admission avoids the slowdown, at a price where over-subscription is harmless.
+    ///
+    /// With the observed penalty it beats host-only admission by a wide margin; without a penalty,
+    /// exact per-job demands cost nothing while a pessimistic per-task demand (a high quantile)
+    /// leaves capacity idle.
     #[test]
     fn device_aware_admission_avoids_the_slowdown() {
         let sc = DeviceScenario {

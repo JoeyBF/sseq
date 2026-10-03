@@ -1,5 +1,4 @@
-//! The trace format: gzip-compressed JSONL with `worker`, `task` and `sample` records, or the
-//! event log of [`whelm::log`].
+//! The trace formats: standalone JSONL records or a [`whelm::log`] event log, optionally gzipped.
 
 use std::{collections::HashMap, io::BufRead, path::Path};
 
@@ -23,7 +22,7 @@ pub struct TraceWorker {
     pub samples: Vec<Sample>,
 }
 
-/// One per-minute heartbeat sample.
+/// One heartbeat sample.
 #[derive(Clone, Copy, Debug)]
 pub struct Sample {
     /// Time, seconds.
@@ -84,6 +83,9 @@ pub fn group_id(n: i64, s: i64) -> u64 {
 }
 
 /// One line of either format.
+///
+/// `worker`, `task` and `sample` make up the standalone format; `input`, `poll` and `reserved` are
+/// the event log ([`whelm::log::Event`]), folded into worker and task records.
 #[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 enum Line {
@@ -101,7 +103,6 @@ enum Line {
         reserved_gb: f64,
         running: usize,
     },
-    // The event log ([`whelm::log::Event`]): folded into worker and task records.
     Input {
         t_s: f64,
         input: Input,
@@ -126,6 +127,7 @@ struct Pending {
     starts: Vec<(Attempt, f64, String)>,
 }
 
+/// A standalone `task` record.
 #[derive(Deserialize)]
 struct TaskLine {
     req: u64,
@@ -147,8 +149,9 @@ struct TaskLine {
 }
 
 impl Trace {
-    /// Read a trace from a (possibly gzip-compressed) JSONL file. Tasks that never ran in
-    /// production are dropped (they cannot be given a service time).
+    /// Read a trace from a (possibly gzip-compressed) JSONL file.
+    ///
+    /// Tasks that never ran in production are dropped: they cannot be given a service time.
     pub fn load(path: &Path) -> Result<Self, Box<dyn std::error::Error>> {
         let file = std::fs::File::open(path)?;
         let reader: Box<dyn BufRead> = if path.extension().is_some_and(|e| e == "gz") {
@@ -339,10 +342,11 @@ impl Trace {
         Ok(t)
     }
 
-    /// The baseline production's worker reported at time `t` (GB): its memory gate's rolling RSS
-    /// floor, the minimum resident set over the current and the previous `window_s` window
-    /// (counted from the worker's join). It includes whatever jobs were resident, so it overstates
-    /// the task-free footprint on a busy worker. `None` before the first sample.
+    /// The baseline a production worker reported at time `t` (GB); `None` before any sample.
+    ///
+    /// That is its memory gate's rolling RSS floor: the minimum resident set over the current and
+    /// the previous `window_s` window (counted from the worker's join). It includes whatever jobs
+    /// were resident, so it overstates the task-free footprint on a busy worker.
     pub fn floor_baseline(&self, w: usize, t: f64, window_s: f64) -> Option<f64> {
         let tw = &self.workers[w];
         let idx = ((t - tw.join_s) / window_s).floor().max(0.0);
@@ -355,10 +359,11 @@ impl Trace {
             .min_by(f64::total_cmp)
     }
 
-    /// The baseline a worker reporting `baseline_excl` would send at time `t` (GB): the same rolling
-    /// floor as [`floor_baseline`](Self::floor_baseline), of each sample's resident memory minus
-    /// `scale` times the estimates of the jobs it was running (at least 0). `None` before the
-    /// first sample.
+    /// The baseline a worker reporting `baseline_excl` would send at time `t` (GB).
+    ///
+    /// The same rolling floor as [`floor_baseline`](Self::floor_baseline), of each sample's
+    /// resident memory minus `scale` times the estimates of the jobs it was running (at least 0).
+    /// `None` before any sample.
     pub fn floor_baseline_excl(&self, w: usize, t: f64, window_s: f64, scale: f64) -> Option<f64> {
         let tw = &self.workers[w];
         let idx = ((t - tw.join_s) / window_s).floor().max(0.0);
@@ -371,9 +376,10 @@ impl Trace {
             .min_by(f64::total_cmp)
     }
 
-    /// Resident memory above idle per GB of estimate running, one value per sample with at least
-    /// `min_reserved_gb` of estimates running: how much of an estimate a job actually occupies,
-    /// summed over the jobs of a sample.
+    /// Resident memory above idle per GB of estimate running, one sorted value per sample.
+    ///
+    /// Only samples with at least `min_reserved_gb` of estimates running count. Each value is how
+    /// much of an estimate a job actually occupies, summed over the jobs of a sample.
     pub fn usage_ratios(&self, idle: &[f64], min_reserved_gb: f64) -> Vec<f64> {
         let mut v: Vec<f64> = self
             .workers
@@ -403,9 +409,10 @@ impl Trace {
         (over, all)
     }
 
-    /// Per-worker baseline memory (GB), an alternative `reported_baseline` for the replay: the median
-    /// resident memory over the worker's samples with nothing running, or, for a worker never
-    /// sampled idle, the median of that over its class (falling back to all workers).
+    /// Per-worker baseline memory (GB): an alternative `reported_baseline` for the replay.
+    ///
+    /// The median resident memory over the worker's samples with nothing running, or, for a worker
+    /// never sampled idle, the median of that over its class (falling back to all workers).
     pub fn idle_baselines(&self) -> Vec<f64> {
         /// The upper median, or `None` for no samples.
         fn median(mut v: Vec<f64>) -> Option<f64> {
@@ -479,8 +486,10 @@ mod tests {
         assert_eq!(task.group, group_id(10, 2));
     }
 
-    /// The event log: a task record keeps the attempt that finished (a retry, or a speculative
-    /// attempt that beat the original); cancelled and given-up jobs leave none.
+    /// The event log: a task record keeps the attempt that finished.
+    ///
+    /// That may be a retry, or a speculative attempt that beat the original; cancelled and given-up
+    /// jobs leave no record.
     #[test]
     fn reads_event_log_attempts() {
         let input = |t_s: f64, input: Input| Event::Input {

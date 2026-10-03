@@ -2,13 +2,14 @@
 
 use whelm::{ScoreTerm, SpeedConfig, Timing};
 
-/// Speed-aware placement: whether workers are ranked by speed, and the scheduler's
-/// [`SpeedConfig`] (machine model, deferral, speculation).
+/// Speed-aware placement, as a plan names it.
+///
+/// Whether workers are ranked by speed, and the scheduler's [`SpeedConfig`].
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct SpeedPlan {
-    /// Rank the workers that admit a job fastest first ([`ScoreTerm::Speed`]); otherwise speed
-    /// does not rank workers, though [`SpeedConfig::defer`] and [`SpeedConfig::speculate`] still
-    /// read it.
+    /// Rank the workers that admit a job fastest first ([`ScoreTerm::Speed`]).
+    ///
+    /// [`SpeedConfig::defer`] and [`SpeedConfig::speculate`] read speed either way.
     pub fast: bool,
     /// The machine model, deferral and speculation.
     pub config: SpeedConfig,
@@ -24,8 +25,9 @@ impl SpeedPlan {
         s
     }
 
-    /// Whether speeds are learned. Simulated workers then report speed 1, so that learning
-    /// starts from no knowledge.
+    /// Whether speeds are learned.
+    ///
+    /// Simulated workers then report speed 1, so that learning starts from no knowledge.
     pub fn learned(&self) -> bool {
         self.config.timing.learn().is_some()
     }
@@ -50,9 +52,10 @@ impl SpeedPlan {
     }
 }
 
-/// The machine model a command-line name stands for: `p` (identical: speed ignored), `q` (related,
-/// at the reported speeds), `q-learn` (related, learned) or `r` (unrelated: learned per job kind
-/// and worker class).
+/// The machine model a command-line name stands for.
+///
+/// `p` (identical: speed ignored), `q` (related, at the reported speeds), `q-learn` (related,
+/// learned) or `r` (unrelated: learned per job kind and worker class).
 pub fn timing_named(name: &str) -> Result<Timing, String> {
     match name {
         "p" => Ok(Timing::Identical),

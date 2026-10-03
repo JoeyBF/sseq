@@ -96,8 +96,10 @@ impl Census {
         Ok(c)
     }
 
-    /// How many rows the profile rule (capped at `max_len` entries) reproduces exactly: same
-    /// subalgebra dimension and same signature count. Returns `(matching, compared)`.
+    /// How many rows the profile rule (capped at `max_len` entries) reproduces, of those compared.
+    ///
+    /// A row is reproduced when its subalgebra dimension and signature count match. Returns
+    /// `(matching, compared)`.
     pub fn profile_agreement(&self, max_len: usize) -> (usize, usize) {
         let mut ok = 0;
         let mut n = 0;
@@ -138,8 +140,9 @@ pub(crate) fn normal(key: u64) -> f64 {
     (-2.0 * u.ln()).sqrt() * (std::f64::consts::TAU * v).cos()
 }
 
-/// Dimensions and liveness for every bidegree of the region: the census where it has a row,
-/// extrapolated elsewhere.
+/// Dimensions and liveness for every bidegree of the region.
+///
+/// The census gives them where it has a row; elsewhere they are extrapolated.
 #[derive(Clone, Debug)]
 pub struct Dims {
     max_n: i32,
@@ -157,9 +160,11 @@ impl Dims {
             .then(|| (s * (self.max_n + 1) + n) as usize)
     }
 
-    /// Fill the region `n <= max_n, s <= max_s`. Missing dimensions continue each row's
-    /// exponential trend (a least-squares line through the log of its last known points);
-    /// missing liveness (whether the bidegree has generators) is drawn with the row's recent rate.
+    /// Fill the region `n <= max_n, s <= max_s`.
+    ///
+    /// Missing dimensions continue each row's exponential trend (a least-squares line through the
+    /// log of its last known points); missing liveness (whether the bidegree has generators) is
+    /// drawn with the row's recent rate.
     pub fn build(census: &Census, max_s: i32, max_n: i32) -> Self {
         let len = ((max_s + 1) * (max_n + 1)) as usize;
         let mut d = Dims {
@@ -249,12 +254,14 @@ impl Dims {
     }
 }
 
-/// Task cost (H200-seconds of work), from a-priori dimensions. Scale and shape come from
-/// different data, because the trace alone covers too narrow a region to say how cost scales:
+/// Task cost (H200-seconds of work), from a-priori dimensions.
+///
+/// Scale and shape come from different data, because the trace alone covers too narrow a region
+/// to say how cost scales:
 ///
 /// - **Across bidegrees**, the census: `ln wall = a . [1, ln tmd, ln nd, ln(signatures + 1),
-///   live] + effect(file)`, over every census row (tens of thousands of bidegrees, all stems),
-///   with a per-file effect absorbing different code versions and hardware.
+///   live] + effect(file)`, over every usable census row, with a per-file effect absorbing
+///   different code versions and hardware.
 /// - **Level**: on the trace's own bidegrees, `level` = median of `ln(total work) - prediction`
 ///   for the trace run's census file; its spread is the per-bidegree noise.
 /// - **Within a bidegree**: the zero step takes `zero_share` of the work, and signature `sigma`
@@ -459,8 +466,9 @@ impl CostModel {
         }
     }
 
-    /// Median total work of `(s, t)`'s zero step and live signature walk, with `signatures`
-    /// active signatures; `None` when its dimensions are empty.
+    /// Median total work of `(s, t)`'s zero step and live signature walk.
+    ///
+    /// `signatures` is its number of active signatures; `None` when its dimensions are empty.
     pub fn total(&self, dims: &Dims, s: i32, t: i32, signatures: usize) -> Option<f64> {
         let (tmd, nd) = (dims.tmd(s, t), dims.nd(s, t));
         (tmd > 0.0 && nd > 0.0).then(|| {
@@ -470,8 +478,9 @@ impl CostModel {
         })
     }
 
-    /// Relative weight of a signature of degree `deg` at `(s, t)` within its bidegree (0 if its
-    /// shifted problem is empty).
+    /// Relative weight of a signature of degree `deg` at `(s, t)` within its bidegree.
+    ///
+    /// 0 if its shifted problem is empty.
     pub fn shape(&self, dims: &Dims, s: i32, t: i32, deg: i32) -> f64 {
         let tmd = dims.tmd(s, t - deg);
         if deg <= 0 || tmd <= 0.0 {
@@ -481,7 +490,7 @@ impl CostModel {
     }
 }
 
-/// A worker class in the simulated fleet.
+/// The simulated fleet, by worker class.
 #[derive(Clone, Debug, Serialize)]
 pub struct Fleet {
     /// `(class, workers, slots each)`.
@@ -515,8 +524,9 @@ struct Bideg {
     pool_est: f64,
     pool_true: f64,
     shape_sum: f64,
-    /// The walk's template, if it runs: the profile's signature DAG, whose signatures that do not
-    /// run here [`Walks`] makes passthroughs.
+    /// The walk's template, if it runs: the profile's signature DAG.
+    ///
+    /// [`Walks`] makes its signatures that do not run here passthroughs.
     walk: Option<Arc<DagTemplate>>,
 }
 
@@ -550,9 +560,20 @@ pub struct World {
     dims: Dims,
 }
 
-/// Ids: bidegree `k` has its zero step `4k`, its "registered" passthrough `4k + 1` and its "walk
-/// done" passthrough `4k + 2`; signature `i` of bidegree `k` is `SIG_BASE + offsets[k] + i`.
+/// The first signature job id.
+///
+/// Bidegree `k` has its zero step `4k`, its "registered" passthrough `4k + 1` and its "walk done"
+/// passthrough `4k + 2`; signature `i` of bidegree `k` is `SIG_BASE + offsets[k] + i`.
 const SIG_BASE: JobId = 1 << 62;
+
+/// dslab-dag flops per unit of work, and resource speed per unit of single-job throughput.
+const DSLAB_SCALE: f64 = 10.0;
+
+/// Flops of a dslab-dag task that stands for no work: a join, or a signature that does not run.
+const DSLAB_EPS: f64 = 1e-6;
+
+/// Tasks dispatched between samples of [`WholeMetrics::peak_dag_nodes`].
+const NODE_SAMPLE_TASKS: u64 = 65_536;
 
 /// What a job id names.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -685,8 +706,10 @@ impl World {
         w
     }
 
-    /// Work of signature `i` of bidegree `k` (0 if it does not run): its share of the walk's
-    /// estimated work, or of the "true" work times a deterministic log-normal per-signature error.
+    /// Work of signature `i` of bidegree `k`, 0 if it does not run.
+    ///
+    /// It is its share of the walk's estimated work, or of the "true" work times a deterministic
+    /// log-normal per-signature error.
     fn sig_work(&self, k: usize, i: usize, truth: bool) -> f64 {
         let b = &self.bideg[k];
         let Some(pi) = b.profile else { return 0.0 };
@@ -751,12 +774,12 @@ impl World {
 
     /// The world as dslab-dag input (DAG YAML, system YAML), for cross-validation.
     ///
-    /// Model alignment: one resource per worker with `cores = slots` and speed `10 x` the class's
-    /// single-job throughput; task flops `10 x` work (true or estimated), so durations are in
-    /// seconds; data items of size 0 on an infinitely fast network. Our two passthroughs per
-    /// bidegree ("walk done", "registered") become one join task of 1e-6 flops, as do signatures
-    /// with no work. Tasks are listed in topological order (bidegrees by `(t, s)`, then template
-    /// order), which dslab's static schedulers need.
+    /// Model alignment: one resource per worker with `cores = slots` and speed `DSLAB_SCALE` times
+    /// the class's single-job throughput; task flops `DSLAB_SCALE` times work (true or estimated),
+    /// so durations are in seconds; data items of size 0 on an infinitely fast network. Our two
+    /// passthroughs per bidegree ("walk done", "registered") become one join task of `DSLAB_EPS`
+    /// flops, as do signatures with no work. Tasks are listed in topological order (bidegrees by
+    /// `(t, s)`, then template order), which dslab's static schedulers need.
     pub fn export_dslab(
         &self,
         fleet: &Fleet,
@@ -764,7 +787,6 @@ impl World {
         truth: bool,
     ) -> (String, String) {
         use std::fmt::Write;
-        const EPS: f64 = 1e-6;
         let mut dag = String::from("tasks:\n");
         let mut task = |name: &str, flops: f64, inputs: &[String]| {
             let inputs: Vec<String> = inputs.iter().map(|i| format!("\"{i}\"")).collect();
@@ -773,7 +795,7 @@ impl World {
                 "  - name: {name}\n    flops: {:.9}\n    memory: 0\n    min_cores: 1\n    \
                  max_cores: 1\n    inputs: [{}]\n    outputs: [{{\"name\": \"{name}\", \"size\": \
                  0}}]",
-                flops.max(EPS),
+                flops.max(DSLAB_EPS),
                 inputs.join(", ")
             )
             .unwrap();
@@ -788,7 +810,7 @@ impl World {
                 .map(|d| format!("r{d}"))
                 .collect();
             let zero = if truth { b.zero_true } else { b.zero_est };
-            task(&format!("z{k}"), 10.0 * zero, &deps);
+            task(&format!("z{k}"), DSLAB_SCALE * zero, &deps);
             let mut join = vec![format!("z{k}")];
             if let Some(pi) = b.profile.filter(|_| b.live) {
                 let t = &self.profiles[pi].template;
@@ -804,7 +826,7 @@ impl World {
                     }
                     task(
                         &format!("s{k}_{i}"),
-                        10.0 * self.sig_work(k, i, truth),
+                        DSLAB_SCALE * self.sig_work(k, i, truth),
                         &inputs,
                     );
                 }
@@ -820,7 +842,7 @@ impl World {
                 writeln!(
                     sys,
                     "  - name: w{id}_{class}\n    speed: {:.9}\n    cores: {slots}\n    memory: 0",
-                    10.0 * model.throughput(class, 1)
+                    DSLAB_SCALE * model.throughput(class, 1)
                 )
                 .unwrap();
                 id += 1;
@@ -830,9 +852,10 @@ impl World {
         (dag, sys)
     }
 
-    /// The world flattened into a small instance (the PISA replica family): every task with its
-    /// true work and estimate, the two passthroughs of a bidegree merged into one join, groups
-    /// numbered in `(s, t)` order. Use a small region.
+    /// The world flattened into a small instance (the PISA replica family); use a small region.
+    ///
+    /// Every task keeps its true work and estimate, the two passthroughs of a bidegree merge into
+    /// one join, and groups are numbered in `(s, t)` order.
     pub fn to_small(&self, fleet: &Fleet, model: &dyn ServiceModel) -> crate::small::SmallInstance {
         use crate::small::{Class, Kind, SmallInstance, SmallTask};
         // s-major, as `simulate`'s ids: the DAG layer releases simultaneous dependents in id
@@ -935,8 +958,10 @@ impl World {
         }
     }
 
-    /// Lower bounds on any schedule's makespan on `fleet`: the critical path at the fastest class's
-    /// single-job speed with unlimited workers, and total work over total throughput.
+    /// Lower bounds on any schedule's makespan on `fleet`: the critical path, and work/capacity.
+    ///
+    /// The critical path is at the fastest class's single-job speed with unlimited workers;
+    /// work/capacity is total work over total throughput.
     pub fn bounds(&self, fleet: &Fleet, model: &dyn ServiceModel) -> (f64, f64) {
         let fastest = fleet
             .groups
@@ -994,9 +1019,10 @@ pub struct WorldSummary {
 /// How the run is driven.
 #[derive(Clone, Debug, Serialize)]
 pub enum Plan {
-    /// Today's coordinator: at most `open` bidegrees in flight (one coordinator thread each), at
-    /// most `per_bidegree` signature tasks in flight per bidegree (walk threads), oldest bidegree
-    /// first.
+    /// Today's coordinator: capped bidegrees and walk tasks in flight, oldest bidegree first.
+    ///
+    /// At most `open` bidegrees are in flight (one coordinator thread each), and at most
+    /// `per_bidegree` signature tasks per bidegree (walk threads).
     Today {
         /// Open-bidegree cap.
         open: usize,
@@ -1037,10 +1063,11 @@ pub struct Placement {
     pub pin: Pin,
     /// `DagConfig::rank_epsilon` (approximate rank propagation).
     pub rank_epsilon: f64,
-    /// At most this many walks open at once: a walk opens when its first signature job is ready,
-    /// and while the budget is spent its jobs are held, in the order the walks became ready. A
-    /// frontier budget of the simulated coordinator (the DAG layer materialises lazily and has
-    /// none); it changes the schedule.
+    /// At most this many walks open at once; it changes the schedule.
+    ///
+    /// A walk opens when its first signature job is ready, and while the budget is spent its jobs
+    /// are held, in the order the walks became ready. The budget belongs to the simulated
+    /// coordinator: the DAG layer materialises lazily and has none.
     pub max_open: Option<usize>,
     /// How bidegrees are ordered against each other.
     pub group_key: GroupKey,
@@ -1051,8 +1078,9 @@ pub struct Placement {
 /// The order between bidegrees ("oldest first" and its restart-stable stand-ins).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
 pub enum GroupKey {
-    /// First submission ([`GroupOrder::Arrival`]): depends on release order, so not stable
-    /// across a coordinator restart.
+    /// First submission ([`GroupOrder::Arrival`]).
+    ///
+    /// It depends on release order, so it is not stable across a coordinator restart.
     #[default]
     Arrival,
     /// `(s, t)` ([`GroupOrder::Id`]).
@@ -1087,8 +1115,7 @@ impl GroupKey {
 }
 
 impl Default for Placement {
-    /// Oblivious placement on reported speeds, no pinning, `DagConfig`'s default epsilon, no walk
-    /// budget.
+    /// Speed-oblivious placement, every other option at its library default or off.
     fn default() -> Self {
         Self {
             speed: SpeedPlan::default(),
@@ -1146,8 +1173,9 @@ pub struct WholeMetrics {
     pub bidegree_latency: Quantiles,
     /// Most bidegrees open at once.
     pub peak_open: usize,
-    /// Most template nodes with materialised state at once ([`DagStats::nodes`](whelm::DagStats),
-    /// sampled every few thousand tasks).
+    /// Most template nodes with materialised state at once ([`DagStats::nodes`](whelm::DagStats)).
+    ///
+    /// Sampled every `NODE_SAMPLE_TASKS` tasks dispatched.
     pub peak_dag_nodes: usize,
     /// Wall time of the placing `poll` calls, microseconds.
     pub dispatch_us: Quantiles,
@@ -1173,8 +1201,9 @@ struct Wk {
 /// The simulated coordinator's DAG layer.
 type Dag = DagScheduler<Scheduler>;
 
-/// The walks' signatures, as the DAG layer's [`NodeSource`]: walk `4k + 2`'s leaf `i` is
-/// signature `i` of bidegree `k`.
+/// The walks' signatures, as the DAG layer's [`NodeSource`].
+///
+/// Walk `4k + 2`'s leaf `i` is signature `i` of bidegree `k`.
 struct Walks {
     world: World,
     /// Work is the true cost rather than the estimate.
@@ -1211,8 +1240,9 @@ impl NodeSource for Walks {
     }
 }
 
-/// The simulated coordinator's caps on releasing signature jobs: today's per-bidegree in-flight
-/// cap, and the open-walk budget ([`Placement::max_open`]).
+/// The simulated coordinator's caps on releasing signature jobs.
+///
+/// Today's per-bidegree in-flight cap, and the open-walk budget ([`Placement::max_open`]).
 struct SigGates {
     /// Today's in-flight cap per bidegree.
     per_bidegree: Option<usize>,
@@ -1293,13 +1323,15 @@ impl SigGates {
     }
 }
 
-/// Simulate the whole run under `plan` on `fleet`, placing as `place` says (each worker's
-/// [`WorkerState::speed`] is its class's single-job throughput, or 1 when speeds are learned).
+/// Simulate the whole run under `plan` on `fleet`, placing as `place` says.
 ///
-/// The whole DAG is declared up front: per bidegree `k`, its zero step `4k`, its walk `4k + 2`
-/// (a unit of its profile's signature DAG whose leaves' costs, and which of them run, come from
-/// the world, or a passthrough when it has none) and its "registered" passthrough `4k + 1`. The DAG layer materialises each walk when
-/// its zero step completes.
+/// Each worker's [`WorkerState::speed`] is its class's single-job throughput, or 1 when speeds are
+/// learned.
+///
+/// The whole DAG is declared up front: per bidegree, its zero step, its walk and its "registered"
+/// passthrough (ids as on `SIG_BASE`). The walk is a unit of the profile's signature DAG, whose
+/// leaves' costs, and which of them run, come from the world, or a passthrough when it has none;
+/// the DAG layer materialises it when the zero step completes.
 pub fn simulate(
     world: &World,
     fleet: &Fleet,
@@ -1561,7 +1593,7 @@ pub fn simulate(
             queue.push(t, Ev::Wake);
         }
         if tasks >= next_sample {
-            next_sample = tasks + 65_536;
+            next_sample = tasks + NODE_SAMPLE_TASKS;
             peak_nodes = peak_nodes.max(dag.dag_stats().nodes);
         }
 
@@ -1684,8 +1716,10 @@ mod tests {
         trace::{TraceTask, group_id},
     };
 
-    /// A census over `s <= 4, n <= 40` whose dimensions grow 20% per stem, with generators on a
-    /// third of the bidegrees, and wall times following the dimensions.
+    /// A synthetic census over a small region.
+    ///
+    /// Dimensions grow geometrically per stem, some bidegrees have generators, and wall times
+    /// follow the dimensions.
     fn census() -> Census {
         let mut c = Census {
             sources: vec!["synthetic".into()],
@@ -1833,7 +1867,8 @@ mod tests {
             assert!(m.makespan_h * 3600.0 >= cp.max(cap) * (1.0 - 1e-9));
         }
         // Speed-aware placement on a mixed fleet; waiting for a fast slot must not drag the
-        // makespan out to its wait limit (stale wakeups once did).
+        // makespan out to its wait limit, as counting stale wakeups after the last completion
+        // would.
         let mixed = Fleet {
             groups: vec![("x".into(), 1, 4), ("y".into(), 1, 4)],
         };

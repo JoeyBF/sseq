@@ -79,10 +79,11 @@ pub struct FitReport {
     pub r2_within: f64,
     /// Residual standard deviation of `ln s` (so `exp` of it is the typical multiplicative error).
     pub resid_sd: f64,
-    /// Residual sum of squares of the best `(k_sat, alpha)` for each class, and for the "no
-    /// sharing effect" model (`alpha = 0`), to show how much concurrency explains.
+    /// Residual sum of squares of the best `(k_sat, alpha)` for each class.
+    ///
+    /// Against `sse_alpha0` it shows how much concurrency explains.
     pub sse_best: f64,
-    /// See `sse_best`.
+    /// Residual sum of squares of the "no sharing effect" model (`alpha = 0`).
     pub sse_alpha0: f64,
 }
 
@@ -141,8 +142,9 @@ impl Occupancy {
     }
 }
 
-/// Solve the normal equations `A x = b` (small, symmetric) by Gaussian elimination with partial
-/// pivoting. Singular directions get 0.
+/// Solve the normal equations `A x = b` (small, symmetric).
+///
+/// Gaussian elimination with partial pivoting; singular directions get 0.
 pub(crate) fn solve(mut a: Vec<Vec<f64>>, mut b: Vec<f64>) -> Vec<f64> {
     let n = b.len();
     for c in 0..n {
@@ -178,17 +180,18 @@ pub(crate) fn solve(mut a: Vec<Vec<f64>>, mut b: Vec<f64>) -> Vec<f64> {
         .collect()
 }
 
+/// The fit's regression data, one row per job kept.
 struct Design {
     rows: Vec<usize>,
     ln_s: Vec<f64>,
-    /// Group-demeaned covariates: 3 size covariates + one dummy per non-reference class.
+    /// Covariates: those of [`FitReport::beta`], then one dummy per non-reference class.
     x: Vec<Vec<f64>>,
     group: Vec<usize>,
     ngroups: usize,
     class: Vec<usize>,
 }
 
-/// Fit the model to a trace. Returns the model, the report, and each task's work `W`.
+/// Fit the model to a trace, returning the model, the report, and each task's work `W`.
 ///
 /// In production a job's service time is `s = ∫ k(t) / f(k(t)) dt`-weighted work, i.e.
 /// `ln s = ln W + ln mean_run(k / g(k)) - ln speed` with `g(k) = min(k, k_sat)^alpha` and `k(t)`

@@ -2,22 +2,25 @@
 
 use crate::small::{Kind, SmallInstance};
 
-/// A static schedule: every task's planned start, finish and machine (an index into
-/// [`SmallInstance::machines`]; `None` for joins, which take no time).
+/// A static schedule: every task's planned start, finish and machine.
 #[derive(Clone, Debug)]
 pub struct Schedule {
     /// Planned start of each task.
     pub start: Vec<f64>,
     /// Planned finish of each task.
     pub finish: Vec<f64>,
-    /// Machine of each task.
+    /// Machine of each task, an index into [`SmallInstance::machines`].
+    ///
+    /// `None` for joins, which take no time.
     pub machine: Vec<Option<usize>>,
     /// The last planned finish.
     pub makespan: f64,
 }
 
-/// Each task's upward rank at the machines' mean speed: its cost plus the longest chain of cost
-/// below it, both over that speed. Joins cost nothing.
+/// Each task's upward rank at the machines' mean speed.
+///
+/// That is its cost plus the longest chain of cost below it, both over that speed. Joins cost
+/// nothing.
 pub fn upward_ranks(inst: &SmallInstance, cost: &[f64]) -> Vec<f64> {
     let speeds = inst.machines();
     let mean = speeds.iter().sum::<f64>() / speeds.len().max(1) as f64;
@@ -37,10 +40,11 @@ pub fn upward_ranks(inst: &SmallInstance, cost: &[f64]) -> Vec<f64> {
     rank
 }
 
-/// HEFT (Topcuoglu, Hariri and Wu): tasks in decreasing upward rank at the mean speed, each put on
-/// the machine where it finishes earliest, inserted into the first idle gap long enough for it.
-/// Costs are the estimates, or the true work when `oracle`; the schedule's times are in those
-/// costs.
+/// HEFT (Topcuoglu, Hariri and Wu) on the estimates, or on the true work when `oracle`.
+///
+/// Tasks go in decreasing upward rank at the mean speed, each on the machine where it finishes
+/// earliest, inserted into the first idle gap long enough for it. The schedule's times are in the
+/// costs used.
 ///
 /// Every predecessor ranks at least as high as its successors and has a lower index, so breaking
 /// rank ties by index keeps the order topological.
@@ -94,8 +98,9 @@ pub fn heft(inst: &SmallInstance, oracle: bool) -> Schedule {
     }
 }
 
-/// The earliest start at or after `ready` of a task of duration `d` among `busy` intervals, and
-/// the position to insert it at.
+/// The earliest start at or after `ready` of a task of duration `d` among `busy` intervals.
+///
+/// Also returns the position to insert it at.
 fn earliest_gap(busy: &[(f64, f64)], ready: f64, d: f64) -> (f64, usize) {
     let mut s = ready;
     for (k, &(a, b)) in busy.iter().enumerate() {
@@ -107,10 +112,11 @@ fn earliest_gap(busy: &[(f64, f64)], ready: f64, d: f64) -> (f64, usize) {
     (s, busy.len())
 }
 
-/// The schedule's order as [`JobSpec::priority`](whelm::JobSpec::priority)s: each task's position
-/// when sorted by planned start, ties by planned finish, then index. (HEFT's selection order is
-/// the upward-rank order, which the rank plans already use; the start order also carries what its
-/// machine choices implied.)
+/// The schedule's order as [`JobSpec::priority`](whelm::JobSpec::priority)s.
+///
+/// Each task's position when sorted by planned start, ties by planned finish, then index. HEFT's
+/// selection order is the upward-rank order the rank plans use; the start order also carries what
+/// its machine choices implied.
 pub fn priorities(plan: &Schedule) -> Vec<i64> {
     let n = plan.start.len();
     let mut order: Vec<usize> = (0..n).collect();
@@ -131,8 +137,9 @@ mod tests {
     use super::*;
     use crate::small::{GridParams, grid};
 
-    /// A HEFT schedule respects dependencies, never overlaps two tasks on a machine, and with true
-    /// costs is a feasible schedule no shorter than the lower bounds.
+    /// A HEFT schedule on true costs is feasible and no shorter than the lower bounds.
+    ///
+    /// Feasible: it respects dependencies and never overlaps two tasks on a machine.
     #[test]
     fn heft_schedules_are_feasible() {
         for seed in 0..30 {

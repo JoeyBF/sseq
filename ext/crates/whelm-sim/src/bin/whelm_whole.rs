@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 
 use clap::Parser;
-use whelm::{Defer, Timing};
+use whelm::{DagConfig, Defer, Timing};
 use whelm_sim::{
     model::fit,
     plan::{SpeedPlan, timing_named},
@@ -31,8 +31,9 @@ struct Args {
     /// Region: largest homological degree.
     #[arg(long, default_value_t = 202)]
     max_s: i32,
-    /// Profile length cap (NASSAU_MAX_SUBALGEBRA + 1); default: the cap that best reproduces the
-    /// census.
+    /// Profile length cap (NASSAU_MAX_SUBALGEBRA + 1).
+    ///
+    /// Default: the cap that best reproduces the census.
     #[arg(long)]
     max_profile_len: Option<usize>,
     /// Fleet as class:workers:slots,... (default: the trace's workers).
@@ -47,14 +48,15 @@ struct Args {
     /// Aging for the rank plans, seconds.
     #[arg(long, default_value_t = 3600.0)]
     age_limit: f64,
-    /// Plans: today, group, rank, rank-oracle, rank-noage, rank-oracle-noage, each with optional
-    /// placement suffixes: "+fast" (fastest first), "+eft" (earliest finish, waiting up to
-    /// --max-defer for a faster worker), "+eft0" (earliest finish, no waiting: the same as
-    /// +fast), "+fastonly" (only the fast class), "+cpop" (critical tasks pinned to the fast
-    /// class), "+learn" (speeds learned online from completions, every worker reporting 1: --timing
-    /// q-learn for this plan), "+age" (aging at --age-limit for any plan), "+smajor"/"+tmajor"/
-    /// "+stem" (bidegrees ordered by (s, t), (t, s) or (t - s, s) instead of by arrival).
-    /// "grouprank[-oracle]": oldest bidegree first, rank within.
+    /// Plans: today, group, rank, rank-oracle, rank-noage, rank-oracle-noage, grouprank[-oracle].
+    ///
+    /// "grouprank[-oracle]" is oldest bidegree first, rank within. Each takes optional placement
+    /// suffixes: "+fast" (fastest first), "+eft" (earliest finish, waiting up to --max-defer for a
+    /// faster worker), "+eft0" (earliest finish, no waiting: the same as +fast), "+fastonly" (only
+    /// the fast class), "+cpop" (critical tasks pinned to the fast class), "+learn" (speeds
+    /// learned online from completions, every worker reporting 1: --timing q-learn for this plan),
+    /// "+age" (aging at --age-limit for any plan), "+smajor"/"+tmajor"/"+stem" (bidegrees ordered
+    /// by (s, t), (t, s) or (t - s, s) rather than by arrival).
     #[arg(
         long,
         value_delimiter = ',',
@@ -65,26 +67,35 @@ struct Args {
     #[arg(long, default_value_t = 0.05)]
     min_work: f64,
     /// Longest voluntary wait for a faster worker (+eft), seconds.
-    #[arg(long, default_value_t = 3600.0)]
+    ///
+    /// Longer waits catch more fast slots but can leave urgent jobs queued behind scarce ones;
+    /// RESULTS.md has the measurements.
+    #[arg(long, default_value_t = Defer::default().max_wait)]
     max_defer: f64,
     /// +eft: wait only if the expected finish improves by this fraction of the job's work.
-    #[arg(long, default_value_t = 0.25)]
+    ///
+    /// Higher values wait less often: fewer cases where waiting backfires, and less of its gain.
+    /// RESULTS.md (`whelm-pisa`) has the trade-off.
+    #[arg(long, default_value_t = Defer::default().min_gain)]
     min_gain: f64,
     /// Seed of the true costs' noise (0: the reference draw); vary it to average over draws.
     #[arg(long, default_value_t = 0)]
     noise_seed: u64,
     /// `DagConfig::rank_epsilon` for the rank plans.
-    #[arg(long, default_value_t = 0.01)]
+    #[arg(long, default_value_t = DagConfig::default().rank_epsilon)]
     rank_epsilon: f64,
-    /// At most this many walks open at once: a frontier budget of the simulated coordinator,
-    /// which holds the jobs of further walks back (it changes the schedule).
+    /// At most this many walks open at once (it changes the schedule).
+    ///
+    /// A frontier budget of the simulated coordinator, which holds the jobs of further walks back.
     #[arg(long)]
     max_open: Option<usize>,
-    /// Machine model: p (identical), q (related, reported speeds), q-learn (related, learned,
-    /// every worker reporting 1) or r (unrelated: learned per job kind and worker class).
+    /// Machine model: p, q, q-learn or r.
+    ///
+    /// p (identical), q (related, reported speeds), q-learn (related, learned, every worker
+    /// reporting 1) or r (unrelated: learned per job kind and worker class).
     #[arg(long, default_value = "q", value_parser = timing_named)]
     timing: Timing,
-    /// Override a class's single-job speed, as class=speed,... (e.g. "l40s=1.39").
+    /// Override a class's single-job speed, as class=speed,... (RESULTS.md has the measured ratio).
     #[arg(long, value_delimiter = ',')]
     class_speed: Vec<String>,
     /// Make throughput exactly linear up to the slot count (as dslab's exclusive cores).
@@ -132,7 +143,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let trace = Trace::load(&args.trace)?;
     let (mut model, _, work) = fit(&trace);
     if args.linear_ps {
-        // Exclusive-core equivalent: per-job rate = speed at any concurrency (slots still cap it).
+        // Exclusive-core equivalent: per-job rate = speed at any concurrency (slots cap it).
         for c in model.classes.values_mut() {
             c.k_sat = usize::MAX;
             c.alpha = 1.0;

@@ -3,28 +3,33 @@
 use clap::Parser;
 use whelm_sim::device::{DeviceArm, DeviceScenario, simulate_device};
 
-/// Compare host-only and device-aware admission when over-subscribing a card's launch pool slows
-/// every job on it.
+/// Compare host-only and device-aware admission.
+///
+/// Over-subscribing a card's launch pool slows every job on it.
 #[derive(Parser, Debug)]
 #[command(about = "Device-aware admission on a synthetic small-card scenario")]
 struct Args {
     /// Workers.
-    #[arg(long, default_value_t = 14)]
+    #[arg(long, default_value_t = DeviceScenario::default().workers)]
     workers: usize,
     /// Jobs (all ready at the start).
-    #[arg(long, default_value_t = 20_000)]
+    #[arg(long, default_value_t = DeviceScenario::default().jobs)]
     jobs: usize,
     /// Launch-pool capacity per worker, GB.
-    #[arg(long, default_value_t = 19.5)]
+    #[arg(long, default_value_t = DeviceScenario::default().cap_gb)]
     cap_gb: f64,
     /// Median device demand per job, GB.
-    #[arg(long, default_value_t = 2.4)]
+    #[arg(long, default_value_t = DeviceScenario::default().demand_gb)]
     demand_gb: f64,
     /// Over-subscription penalties to try (default: none, and the one matching the live drop).
-    #[arg(long, value_delimiter = ',', default_values_t = vec![0.0, (19.5f64 / 8.0).log2()])]
+    #[arg(
+        long,
+        value_delimiter = ',',
+        default_values_t = vec![0.0, DeviceScenario::default().gamma]
+    )]
     gamma: Vec<f64>,
     /// Seed.
-    #[arg(long, default_value_t = 1)]
+    #[arg(long, default_value_t = DeviceScenario::default().seed)]
     seed: u64,
     /// Write results as JSON here.
     #[arg(long)]

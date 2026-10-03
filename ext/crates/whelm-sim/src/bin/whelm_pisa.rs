@@ -28,29 +28,34 @@ use whelm_sim::{
 #[derive(Parser, Debug)]
 #[command(about = "Typical-case and adversarial comparison of two dispatch plans")]
 struct Args {
-    /// Plan A: group | rank | rank-oracle | grouprank | grouprank-oracle | heft | heft-oracle |
-    /// wspt, with optional suffixes +fast, +eft (wait up to --max-defer), `+eft<percent>` (wait
-    /// only for that much gain), +spec (a second attempt of a running job on an idle faster
-    /// worker), `+age<seconds>`. heft[-oracle]: an offline HEFT schedule (on estimated or true
-    /// costs) whose start order is every job's priority. wspt: Smith's rule, shortest estimated
-    /// work first.
+    /// Plan A: an order with optional suffixes.
+    ///
+    /// Orders: group | rank | rank-oracle | grouprank | grouprank-oracle | heft | heft-oracle |
+    /// wspt. Suffixes: +fast, +eft (wait up to --max-defer), `+eft<percent>` (wait only for that
+    /// much gain), +spec (a second attempt of a running job on an idle faster worker),
+    /// `+age<seconds>`. heft[-oracle]: an offline HEFT schedule (on estimated or true costs) whose
+    /// start order is every job's priority. wspt: Smith's rule, shortest estimated work first.
     #[arg(long)]
     a: String,
     /// Plan B, as plan A.
     #[arg(long)]
     b: String,
-    /// Instance family: "grid" (mini-Nassau grids with random parameters), "tiny" (grids of 8 to
-    /// 20 jobs on two or three workers, solved exactly) or "replica" (the real world's first
-    /// bidegrees, from --trace and --census, with perturbed costs).
+    /// Instance family: grid, tiny or replica.
+    ///
+    /// "grid": mini-Nassau grids with random parameters; "tiny": grids small enough to solve
+    /// exactly; "replica": the real world's first bidegrees, from --trace and --census, with
+    /// perturbed costs.
     #[arg(long, default_value = "grid")]
     family: String,
-    /// Machine model of both plans: p (identical), q (related, reported speeds), q-learn
-    /// (related, learned, every worker reporting 1) or r (unrelated: learned per job kind and
-    /// worker class).
+    /// Machine model of both plans: p, q, q-learn or r.
+    ///
+    /// p (identical), q (related, reported speeds), q-learn (related, learned, every worker
+    /// reporting 1) or r (unrelated: learned per job kind and worker class).
     #[arg(long, default_value = "q", value_parser = timing_named)]
     timing: Timing,
-    /// Solve every instance exactly and report each plan's gap to the optimum (always on for
-    /// --family tiny; beyond tiny sizes the search mostly stops at its limits).
+    /// Solve every instance exactly and report each plan's gap to the optimum.
+    ///
+    /// Always on for --family tiny; beyond tiny sizes the search mostly stops at its limits.
     #[arg(long)]
     exact: bool,
     /// Exact search: node limit per instance.
@@ -94,8 +99,10 @@ struct Args {
 /// What `whelm-pisa` does.
 #[derive(clap::Subcommand, Debug)]
 enum Mode {
-    /// Sample instances (grid: random parameters; replica: random cost perturbations) and report
-    /// the distribution of ln(makespan A / makespan B), with a regression on features.
+    /// Sample instances and report the distribution of ln(makespan A / makespan B).
+    ///
+    /// Grid samples random parameters, replica random cost perturbations; a regression on features
+    /// follows.
     Typical {
         /// Instances to sample.
         #[arg(long, default_value_t = 1000)]
@@ -166,11 +173,12 @@ fn plan(name: &str, max_defer: f64, timing: Timing) -> SmallPlan {
     p
 }
 
-/// Each plan's makespan over the optimum, minus one, and how many instances it hit the optimum
-/// on.
+/// Each instance's gaps to the optimum, and the exact searches behind them.
 #[derive(Default)]
 struct Gaps {
-    /// `(A, B, HEFT's offline schedule on true costs)` per instance.
+    /// Per instance, makespan over the optimum, minus one, of `[A, B, HEFT]`.
+    ///
+    /// HEFT is its offline schedule on true costs.
     rows: Vec<[f64; 3]>,
     /// The exact searches.
     solutions: Vec<Solution>,
@@ -284,7 +292,12 @@ fn q(v: &[f64], p: f64) -> f64 {
     v[((v.len() - 1) as f64 * p).round() as usize]
 }
 
-/// Make groups' walks trivial and drop walk edges while A stays at least 95% as bad as `e`.
+/// The fraction of a witness's makespan ratio A / B that minimising it must keep.
+const MINIMISE_KEEP: f64 = 0.95;
+
+/// Shrink a witness while A / B stays within [`MINIMISE_KEEP`] of `exp(e)`.
+///
+/// It makes groups' walks trivial and drops walk edges.
 fn minimise(inst: &SmallInstance, a: &SmallPlan, b: &SmallPlan, e: f64) -> SmallInstance {
     let mut cur = inst.clone();
     let groups: Vec<u32> = {
@@ -297,7 +310,7 @@ fn minimise(inst: &SmallInstance, a: &SmallPlan, b: &SmallPlan, e: f64) -> Small
         g.dedup();
         g
     };
-    let keep = |x: &SmallInstance| compare(x, a, b).0 >= e + (0.95f64).ln();
+    let keep = |x: &SmallInstance| compare(x, a, b).0 >= e + MINIMISE_KEEP.ln();
     for g in groups {
         let mut x = cur.clone();
         for t in x

@@ -4,8 +4,10 @@ use std::{cmp::Ordering, collections::BinaryHeap};
 
 use whelm::{Attempt, JobId};
 
-/// Timed events, earliest first. Events at the same time come out by their tie key: push order
-/// for [`push`](Self::push), so every run is deterministic.
+/// Timed events, earliest first.
+///
+/// Events at the same time come out by their tie key: push order for [`push`](Self::push), so
+/// every run is deterministic.
 pub struct Queue<E> {
     heap: BinaryHeap<Item<E>>,
     seq: u64,
@@ -74,8 +76,10 @@ impl<E> Queue<E> {
         self.heap.pop().map(|i| (i.t, i.ev))
     }
 
-    /// Every event of the earliest instant, in order, and that instant. A coordinator that drains
-    /// its event queue before placing applies them all before the next poll.
+    /// Every event of the earliest instant, in order, and that instant.
+    ///
+    /// A coordinator that drains its event queue before placing applies them all before the next
+    /// poll.
     pub fn pop_instant(&mut self) -> Option<(f64, Vec<E>)> {
         let (t, first) = self.pop()?;
         let mut events = vec![first];
@@ -97,8 +101,10 @@ pub struct Run {
     pub left: f64,
 }
 
-/// A simulated worker sharing its throughput among its running attempts, all progressing at one
-/// rate that the simulator derives from them (e.g. from how many there are).
+/// A simulated worker sharing its throughput among its running attempts.
+///
+/// They all progress at one rate that the simulator derives from them (e.g. from how many there
+/// are).
 ///
 /// The worker has at most one pending completion event: each
 /// [`next_completion`](Self::next_completion) supersedes the previous one, which the event loop
@@ -114,8 +120,9 @@ pub struct PsWorker {
 }
 
 impl PsWorker {
-    /// Progress every running attempt to `now` at `rate(running)` per attempt. Returns the time
-    /// elapsed and the rate, if anything ran.
+    /// Progress every running attempt to `now` at `rate(running)` per attempt.
+    ///
+    /// Returns the time elapsed and the rate, if anything ran.
     pub fn advance(&mut self, now: f64, rate: impl FnOnce(&[Run]) -> f64) -> Option<(f64, f64)> {
         let dt = now - self.last;
         self.last = now;
@@ -140,8 +147,9 @@ impl PsWorker {
         });
     }
 
-    /// Remove an attempt without finishing it (call [`advance`](Self::advance) first). Returns
-    /// whether it was running here.
+    /// Remove an attempt without finishing it (call [`advance`](Self::advance) first).
+    ///
+    /// Returns whether it was running here.
     pub fn stop(&mut self, job: JobId, attempt: Attempt) -> bool {
         let before = self.running.len();
         self.running
@@ -149,8 +157,9 @@ impl PsWorker {
         self.running.len() < before
     }
 
-    /// The time and version of the next completion at the rate `rate(running)`, if anything
-    /// runs. Supersedes every earlier one.
+    /// The time and version of the next completion at the rate `rate(running)`, if anything runs.
+    ///
+    /// Supersedes every earlier one.
     pub fn next_completion(
         &mut self,
         now: f64,
@@ -174,8 +183,9 @@ impl PsWorker {
         version == self.version
     }
 
-    /// Remove and return the attempts `done(left, least)` says are finished, `least` being the
-    /// smallest work left of any running attempt; they come out in start order.
+    /// Remove and return the attempts `done(left, least)` says are finished, in start order.
+    ///
+    /// `least` is the smallest work left of any running attempt.
     pub fn finish(&mut self, done: impl Fn(f64, f64) -> bool) -> Vec<Run> {
         let least = self
             .running

@@ -12,8 +12,9 @@ fn xi_degree(i: usize) -> i32 {
     (1 << (i + 1)) - 1
 }
 
-/// The sequence of subalgebras `optimal_for` walks: `[1]`, `[1,1]`, `[2,1]`, `[2,1,1]`, `[2,2,1]`,
-/// `[3,2,1]`, ... (`SubalgebraIterator` in `ext::nassau`).
+/// The sequence of subalgebras `optimal_for` walks (`SubalgebraIterator` in `ext::nassau`).
+///
+/// `[1]`, `[1,1]`, `[2,1]`, `[2,1,1]`, `[2,2,1]`, `[3,2,1]`, ...
 pub fn subalgebra_sequence() -> impl Iterator<Item = Vec<u8>> {
     let mut current: Vec<u8> = Vec::new();
     std::iter::from_fn(move || {
@@ -40,10 +41,12 @@ pub fn top_degree(profile: &[u8]) -> i32 {
         .sum()
 }
 
-/// The profile Nassau uses at `(s, t)` (like everything in this module, a pure function of the
-/// bidegree, which is why the whole run's DAG can be built before any computation): the last subalgebra of the sequence whose vanishing line
-/// `t >= (2^len - 1)(s + 1) + top_degree` holds, at most `max_len` entries long (the
-/// `NASSAU_MAX_SUBALGEBRA` cap is `k + 1` for `A(k)`). Empty means `F_2`.
+/// The profile Nassau uses at `(s, t)`, at most `max_len` entries long; empty means `F_2`.
+///
+/// It is the last subalgebra of the sequence whose vanishing line
+/// `t >= (2^len - 1)(s + 1) + top_degree` holds; the `NASSAU_MAX_SUBALGEBRA` cap is `k + 1` for
+/// `A(k)`. Like everything in this module it is a pure function of the bidegree, which is why the
+/// whole run's DAG can be built before any computation.
 pub fn optimal_profile(s: i32, t: i32, max_len: usize) -> Vec<u8> {
     subalgebra_sequence()
         .take_while(|p| {
@@ -55,8 +58,9 @@ pub fn optimal_profile(s: i32, t: i32, max_len: usize) -> Vec<u8> {
         .unwrap_or_default()
 }
 
-/// Smallest positive degree carrying the zero signature (`zero_sig_floor`): how far back in its
-/// own row a bidegree reads.
+/// Smallest positive degree carrying the zero signature (`zero_sig_floor`).
+///
+/// It is how far back in its own row a bidegree reads.
 pub fn zero_sig_floor(profile: &[u8]) -> i32 {
     profile
         .iter()
@@ -162,9 +166,11 @@ fn support_single(r: &[u32], s1: u32) -> Vec<Vec<u32>> {
         .collect()
 }
 
-/// The signature DAG's direct edges (`sig_dag::direct`): `a -> b` when some `Sq(R)` of signature
-/// `a` times a generator `Sq(2^k)` has a term of signature `b`. Node 0 (the zero signature) has no
-/// edges; it is the zero step, which precedes the whole walk.
+/// The signature DAG's direct edges (`sig_dag::direct`).
+///
+/// `a -> b` when some `Sq(R)` of signature `a` times a generator `Sq(2^k)` has a term of signature
+/// `b`. Node 0 (the zero signature) has no edges; it is the zero step, which precedes the whole
+/// walk.
 pub fn signature_dag(profile: &[u8]) -> DagTemplate {
     let n = signature_count(profile);
     let radices: Vec<usize> = profile.iter().map(|&p| 1usize << p).collect();
@@ -221,14 +227,14 @@ mod tests {
         assert_eq!(top_degree(&[4, 3, 2, 1]), 15 + 21 + 21 + 15);
         assert_eq!(top_degree(&[5, 4, 3, 2, 1]), 201);
         assert!(optimal_profile(0, 0, usize::MAX).is_empty());
-        // The zero-signature floors measured in `ext::nassau`: A(0)=2 ... A(4)=32.
+        // The zero-signature floors measured in `ext::nassau`.
         for (k, floor) in [(0usize, 2), (1, 4), (2, 8), (3, 16), (4, 32)] {
             let profile: Vec<u8> = (0..=k).map(|i| (k + 1 - i) as u8).collect();
             assert_eq!(zero_sig_floor(&profile), floor, "A({k})");
         }
     }
 
-    /// The A(3) signature order has 4028 covering relations (its transitive reduction).
+    /// The transitive reduction of the A(3) signature DAG has the known number of covers.
     #[test]
     fn signature_dag_reduces_to_its_covers() {
         assert_eq!(
@@ -239,8 +245,7 @@ mod tests {
         );
     }
 
-    /// Edge counts printed by `ext::nassau` for the transitively closed DAG are 938 at A(2) and
-    /// 137,081 at A(3); the direct DAG must close to exactly those.
+    /// The direct DAG closes to the edge counts `ext::nassau` prints at A(2) and A(3).
     #[test]
     fn signature_dag_closes_to_the_verified_counts() {
         for (profile, closed) in [(vec![3u8, 2, 1], 938u64), (vec![4, 3, 2, 1], 137_081)] {

@@ -22,16 +22,19 @@ struct Args {
     /// The trace (JSONL, optionally gzipped).
     #[arg(long)]
     trace: PathBuf,
-    /// Policies to run (fifo, backfill, bestfit, backfill-shadow, bestfit-shadow,
-    /// backfill-noreserve, wspt). All rank workers by fit and load, not speed; wspt is backfill
-    /// with Smith's rule (shortest work first) as the order.
+    /// Policies to run.
+    ///
+    /// fifo, backfill, bestfit, backfill-shadow, bestfit-shadow, backfill-noreserve or wspt. All
+    /// rank workers by fit and load, not speed; wspt is backfill with Smith's rule (shortest work
+    /// first) as the order.
     #[arg(long, value_delimiter = ',', default_value = "fifo,backfill,bestfit")]
     policies: Vec<String>,
-    /// Closed-loop arrivals (a job arrives the measured gap after its dependencies complete in the
-    /// simulation) through the DAG layer, instead of at the trace's `ready_s`.
+    /// Closed-loop arrivals through the DAG layer, rather than at the trace's `ready_s`.
+    ///
+    /// A job arrives the measured gap after its dependencies complete in the simulation.
     #[arg(long)]
     closed: bool,
-    /// With --closed: prioritise by the DAG's upward rank (critical path) instead of group order.
+    /// With --closed: prioritise by the DAG's upward rank (critical path) rather than group order.
     #[arg(long)]
     rank: bool,
     /// Write all metrics and the model fit as JSON here.
@@ -52,21 +55,26 @@ struct Args {
     /// Jobs above this estimate (GB) are "big" in the metrics.
     #[arg(long, default_value_t = 7.5)]
     big_gb: f64,
-    /// Reported baseline: "floor" (production's rolling RSS floor, replayed from the samples),
-    /// "excl" (the rolling floor of RSS minus the estimates running: `baseline_excl`), "idle"
-    /// (each worker's median idle RSS), or a constant in GB.
+    /// Reported baseline: floor, excl, idle, or a constant in GB.
+    ///
+    /// "floor" is production's rolling RSS floor, replayed from the samples; "excl" the rolling
+    /// floor of RSS minus the estimates running (`baseline_excl`); "idle" each worker's median idle
+    /// RSS.
     #[arg(long, default_value = "floor")]
     baseline: String,
     /// Window of the rolling floor, seconds.
     #[arg(long, default_value_t = 300.0)]
     floor_window: f64,
-    /// GB subtracted from the replayed rolling floor (calibration; see RESULTS.md).
+    /// GB subtracted from the replayed rolling floor, calibrating for the trace's sampling.
+    ///
+    /// Larger values loosen admission; RESULTS.md ("Memory model and validation") has the
+    /// calibration.
     #[arg(long, default_value_t = 3.0)]
     floor_offset_gb: f64,
     /// Do not replay the trace's RSS samples as reported usage (report the baseline only).
     #[arg(long)]
     no_rss: bool,
-    /// Print the policy's explanation for this request every 10 simulated minutes while it waits.
+    /// Print the policy's explanation for this request periodically while it waits.
     #[arg(long)]
     explain: Option<u64>,
     /// Heartbeat period, seconds.
@@ -78,12 +86,16 @@ struct Args {
     /// ... and this saturation point.
     #[arg(long)]
     k_sat: Option<usize>,
-    /// Scale every estimate (demands, and what `excl` subtracts) by this, e.g. 0.32 to mimic a
-    /// recalibrated estimator.
+    /// Scale every estimate (demands, and what `excl` subtracts) by this.
+    ///
+    /// Below 1 mimics a recalibrated estimator: admission loosens and modelled overruns rise.
+    /// RESULTS.md ("Admission without the double count") has the scales tried.
     #[arg(long, default_value_t = 1.0)]
     est_scale: f64,
-    /// Count modelled overruns: jobs occupy their estimate times a per-job fraction, log-normal
-    /// around the trace's median ratio of (RSS - idle) to estimates running, with this spread...
+    /// Spread of each job's modelled memory use, for counting modelled overruns.
+    ///
+    /// Jobs occupy their estimate times a per-job fraction, log-normal with this spread around the
+    /// trace's median ratio of (RSS - idle) to estimates running...
     #[arg(long, default_value_t = 0.5)]
     usage_sd: f64,
     /// ... capped at this fraction of the (unscaled) estimate (default: no cap).

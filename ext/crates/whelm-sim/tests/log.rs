@@ -1,5 +1,4 @@
-//! The event log as a simulator input: a run logged through [`Logged`] is a trace `whelm-sim`
-//! reads, and replaying that trace with the same policy reproduces the run's placements.
+//! A run logged through [`Logged`] reads back as a trace and replays to the same placements.
 
 use std::sync::{Arc, Mutex};
 
@@ -14,14 +13,20 @@ use whelm_sim::{
     trace::Trace,
 };
 
+/// Workers in the logged run.
 const WORKERS: u64 = 3;
+/// Slots per worker.
 const SLOTS: usize = 2;
+/// Memory budget per worker.
 const BUDGET_GB: f64 = 10.0;
+/// Jobs in the logged run.
 const JOBS: u64 = 80;
+/// Heartbeat period, seconds.
 const HEARTBEAT: f64 = 60.0;
 
-/// Job `i`: arrival, run time (on the reference class, alone or not) and demand (GB). Times are
-/// chosen so that no two events coincide.
+/// Job `i`: arrival, run time (on the reference class, alone or not) and demand (GB).
+///
+/// Times are chosen so that no two events coincide.
 fn job(i: u64) -> (f64, f64, f64) {
     let x = i as f64;
     (
@@ -56,8 +61,10 @@ fn policy() -> Scheduler {
     Scheduler::new(Config::best_fit())
 }
 
-/// Run the workload with a simple event-driven driver (jobs run at speed 1 whatever the
-/// concurrency, every worker heartbeats each `HEARTBEAT` seconds), logging to `sink`.
+/// Run the workload with a simple event-driven driver, logging to `sink`.
+///
+/// Jobs run at speed 1 whatever the concurrency, and every worker heartbeats each `HEARTBEAT`
+/// seconds.
 fn run(sink: impl EventSink + 'static) {
     let mut p = Logged::new(policy(), sink);
     let state = |w: u64| WorkerState::new(w, "h200", SLOTS, Resources::mem_gb(BUDGET_GB));
@@ -120,9 +127,10 @@ fn run(sink: impl EventSink + 'static) {
     p.sink_mut().flush();
 }
 
-/// The logged run, written as gzip JSONL, reads back as a trace with the run's records, and the
-/// simulator's replay of that trace with the same policy places every job on the same worker at
-/// the same time.
+/// The logged run reads back as a trace, and replaying it with the same policy reproduces it.
+///
+/// The run is written as gzip JSONL; the trace has the run's records, and the simulator's replay
+/// places every job on the same worker at the same time.
 #[test]
 fn logged_run_replays_exactly() {
     let dir = std::env::temp_dir().join(format!("whelm-sim-log-{}", std::process::id()));
