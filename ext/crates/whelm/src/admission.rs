@@ -1,8 +1,70 @@
 //! The admission rule: whether a worker accepts a job right now.
+//!
+//! The [`Scheduler`](crate::Scheduler) places a job only where its [`Admission`] rule admits it,
+//! so the rule alone enforces capacity, slots included. The rule sees a worker as a
+//! [`WorkerView`]: the worker's last reported [`WorkerState`] plus the demands the scheduler has
+//! placed there itself. [`ProductionAdmission`] is the rule [`Scheduler::new`] uses: one
+//! inequality per resource dimension, with an escape hatch for a job alone on a worker. Any other
+//! rule goes to [`Scheduler::with_admission`].
+//!
+//! A worker with 100 bytes of memory and two slots, running one 60-byte job, takes a 40-byte job
+//! beside it but not a 41-byte one. The scheduler asks with demands that take one [`SLOTS`]
+//! each, as the `job` closure builds them:
+//!
+//! ```
+//! use whelm::{Admission, ProductionAdmission, Resources, SLOTS, WorkerState, WorkerView};
+//!
+//! let job = |bytes| {
+//!     let mut demand = Resources::mem(bytes);
+//!     demand[SLOTS] = 1;
+//!     demand
+//! };
+//! let state = WorkerState::new(1, "cpu", 2, Resources::mem(100));
+//! let view = WorkerView {
+//!     state: &state,
+//!     placed: job(60),
+//! };
+//! assert!(ProductionAdmission.admits(&job(40), &view));
+//! assert!(!ProductionAdmission.admits(&job(41), &view));
+//! ```
+//!
+//! [`Scheduler::new`]: crate::Scheduler::new
+//! [`Scheduler::with_admission`]: crate::Scheduler::with_admission
 
 use crate::{DIMS, HARD, Resources, SLOTS, WorkerState};
 
 /// A worker as an [`Admission`] rule sees it: its state plus the library's own bookkeeping.
+///
+/// The methods are the vocabulary [`ProductionAdmission`] is written in, and a custom rule may
+/// use them too; [`free_share`](Self::free_share) is also what
+/// [`ScoreTerm::Tightest`](crate::ScoreTerm::Tightest) and reservations rank workers by.
+///
+/// A worker with 100 bytes of memory, unknown device memory and four slots reports 30 bytes in
+/// use, 10 of them its own baseline, and runs one job placed with 50 bytes. The examples on the
+/// methods continue from this one.
+///
+/// ```
+/// use whelm::{DEV, MEM, Resources, SLOTS, WorkerState, WorkerView};
+///
+/// // A demand as the scheduler sends it: one slot per job.
+/// let job = |bytes| {
+///     let mut demand = Resources::mem(bytes);
+///     demand[SLOTS] = 1;
+///     demand
+/// };
+/// let state = WorkerState {
+///     reported_used: Resources::mem(30),
+///     reported_baseline: Resources::mem(10),
+///     ..WorkerState::new(1, "cpu", 4, Resources::mem(100))
+/// };
+/// let view = WorkerView {
+///     state: &state,
+///     placed: job(50),
+/// };
+/// assert_eq!(view.running(), 1);
+/// // Memory and slots are enforced; device memory, with a zero budget, is not.
+/// assert!(view.enforced(MEM) && view.enforced(SLOTS) && !view.enforced(DEV));
+/// ```
 #[derive(Clone, Copy, Debug)]
 pub struct WorkerView<'a> {
     /// The worker's last reported state.
@@ -26,6 +88,24 @@ impl WorkerView<'_> {
 
     /// What a job of demand `demand` counts for here: at least the worker's
     /// [`per_task`](WorkerState::per_task) in every dimension.
+    ///
+    /// On a worker whose jobs each take at least 30 bytes of device memory, a job declaring 5
+    /// counts for 30:
+    ///
+    /// ```
+    /// use whelm::{Resources, WorkerState, WorkerView};
+    ///
+    /// let state = WorkerState {
+    ///     per_task: Resources::ZERO.with_dev(30),
+    ///     ..WorkerState::new(1, "gpu", 4, Resources::mem(100).with_dev(100))
+    /// };
+    /// let view = WorkerView {
+    ///     state: &state,
+    ///     placed: Resources::ZERO,
+    /// };
+    /// let demand = Resources::mem(5).with_dev(5);
+    /// assert_eq!(view.charge(&demand), Resources::mem(5).with_dev(30));
+    /// ```
     pub fn charge(&self, demand: &Resources) -> Resources {
         demand.max(self.state.per_task)
     }
@@ -35,6 +115,28 @@ impl WorkerView<'_> {
     ///
     /// The reported figure lags (heartbeats); the placed sum is exact but only an estimate of what
     /// the jobs use. Taking the maximum is conservative in both directions.
+    ///
+    /// For the worker of the [type-level example](WorkerView), the baseline plus the placed 50
+    /// bytes outweighs the 30 reported:
+    ///
+    /// ```
+    /// # use whelm::{Resources, SLOTS, WorkerState, WorkerView};
+    /// # let job = |bytes| {
+    /// #     let mut demand = Resources::mem(bytes);
+    /// #     demand[SLOTS] = 1;
+    /// #     demand
+    /// # };
+    /// # let state = WorkerState {
+    /// #     reported_used: Resources::mem(30),
+    /// #     reported_baseline: Resources::mem(10),
+    /// #     ..WorkerState::new(1, "cpu", 4, Resources::mem(100))
+    /// # };
+    /// # let view = WorkerView {
+    /// #     state: &state,
+    /// #     placed: job(50),
+    /// # };
+    /// assert_eq!(view.used(), job(60)); // max(30, 10 + 50) bytes, and one slot
+    /// ```
     pub fn used(&self) -> Resources {
         let floor = self.state.per_task.saturating_mul(self.running());
         self.state
@@ -44,6 +146,28 @@ impl WorkerView<'_> {
 
     /// Headroom per dimension, `budget - used`; negative when over-committed, `None` where the
     /// dimension is not [`enforced`](Self::enforced).
+    ///
+    /// For the worker of the [type-level example](WorkerView):
+    ///
+    /// ```
+    /// # use whelm::{Resources, SLOTS, WorkerState, WorkerView};
+    /// # let job = |bytes| {
+    /// #     let mut demand = Resources::mem(bytes);
+    /// #     demand[SLOTS] = 1;
+    /// #     demand
+    /// # };
+    /// # let state = WorkerState {
+    /// #     reported_used: Resources::mem(30),
+    /// #     reported_baseline: Resources::mem(10),
+    /// #     ..WorkerState::new(1, "cpu", 4, Resources::mem(100))
+    /// # };
+    /// # let view = WorkerView {
+    /// #     state: &state,
+    /// #     placed: job(50),
+    /// # };
+    /// // 100 - 60 bytes of memory, device memory unknown, 4 - 1 slots.
+    /// assert_eq!(view.headroom(), [Some(40), None, Some(3)]);
+    /// ```
     pub fn headroom(&self) -> [Option<i64>; DIMS] {
         let used = self.used();
         std::array::from_fn(|d| {
@@ -55,7 +179,31 @@ impl WorkerView<'_> {
     }
 
     /// The enforced dimensions in which a job of demand `demand` does not fit beside the jobs
-    /// already here: `used + charge > budget`.
+    /// already here: `used + charge > budget`. It ignores the escape hatch, so it names what a
+    /// refusal is about rather than deciding one.
+    ///
+    /// For the worker of the [type-level example](WorkerView):
+    ///
+    /// ```
+    /// # use whelm::{Resources, SLOTS, WorkerState, WorkerView};
+    /// # let job = |bytes| {
+    /// #     let mut demand = Resources::mem(bytes);
+    /// #     demand[SLOTS] = 1;
+    /// #     demand
+    /// # };
+    /// # let state = WorkerState {
+    /// #     reported_used: Resources::mem(30),
+    /// #     reported_baseline: Resources::mem(10),
+    /// #     ..WorkerState::new(1, "cpu", 4, Resources::mem(100))
+    /// # };
+    /// # let view = WorkerView {
+    /// #     state: &state,
+    /// #     placed: job(50),
+    /// # };
+    /// # use whelm::MEM;
+    /// assert_eq!(view.short(&job(40)).count(), 0);
+    /// assert_eq!(view.short(&job(41)).collect::<Vec<_>>(), vec![MEM]);
+    /// ```
     pub fn short(&self, demand: &Resources) -> impl Iterator<Item = usize> + '_ {
         let (used, charge) = (self.used(), self.charge(demand));
         (0..DIMS).filter(move |&d| {
@@ -70,6 +218,35 @@ impl WorkerView<'_> {
     /// This is the one scalar workers are compared by: smallest for the tightest fit, largest
     /// (with a zero demand) for the most headroom. [`HARD`] dimensions are counts rather than
     /// capacity to pack into, and are left to [`ScoreTerm::Load`](crate::ScoreTerm::Load).
+    ///
+    /// For the worker of the [type-level example](WorkerView), 60 of 100 bytes in use:
+    ///
+    /// ```
+    /// # use whelm::{Resources, SLOTS, WorkerState, WorkerView};
+    /// # let job = |bytes| {
+    /// #     let mut demand = Resources::mem(bytes);
+    /// #     demand[SLOTS] = 1;
+    /// #     demand
+    /// # };
+    /// # let state = WorkerState {
+    /// #     reported_used: Resources::mem(30),
+    /// #     reported_baseline: Resources::mem(10),
+    /// #     ..WorkerState::new(1, "cpu", 4, Resources::mem(100))
+    /// # };
+    /// # let view = WorkerView {
+    /// #     state: &state,
+    /// #     placed: job(50),
+    /// # };
+    /// assert_eq!(view.free_share(&Resources::ZERO), 0.4);
+    /// assert_eq!(view.free_share(&job(20)), 0.2);
+    /// // A worker with no memory budget enforces no soft dimension.
+    /// let unknown = WorkerState::new(2, "cpu", 4, Resources::ZERO);
+    /// let view = WorkerView {
+    ///     state: &unknown,
+    ///     placed: Resources::ZERO,
+    /// };
+    /// assert_eq!(view.free_share(&job(20)), f64::INFINITY);
+    /// ```
     pub fn free_share(&self, demand: &Resources) -> f64 {
         let (used, charge) = (self.used(), self.charge(demand));
         (0..DIMS)
@@ -93,13 +270,44 @@ impl WorkerView<'_> {
 ///
 /// The rule alone enforces capacity, slots included: the scheduler places a job wherever the rule
 /// admits it.
+///
+/// # Example
+///
+/// A rule that counts slots and nothing else: two 80-byte jobs share a 100-byte worker, where
+/// [`ProductionAdmission`] would run them one at a time.
+///
+/// ```
+/// use whelm::{
+///     Admission, Config, Input, JobSpec, Policy, Resources, Scheduler, WorkerState, WorkerView,
+/// };
+///
+/// /// Admits while a slot is free, whatever the memory.
+/// struct SlotsOnly;
+///
+/// impl Admission for SlotsOnly {
+///     fn admits(&self, _demand: &Resources, w: &WorkerView) -> bool {
+///         w.running() < w.state.slots as u64
+///     }
+/// }
+///
+/// let mut s = Scheduler::with_admission(Config::fifo(), SlotsOnly);
+/// s.handle(
+///     Input::Worker(WorkerState::new(1, "cpu", 2, Resources::mem(100))),
+///     0.0,
+/// );
+/// for id in 0..3 {
+///     s.handle(Input::Submit(JobSpec::new(id, Resources::mem(80), 0)), 0.0);
+/// }
+/// assert_eq!(s.poll(0.0).len(), 2);
+/// assert!(s.explain(2).unwrap().contains("slots full on 1 worker(s)"));
+/// ```
 pub trait Admission {
     /// Whether `w` admits a job with demand `demand`.
     fn admits(&self, demand: &Resources, w: &WorkerView) -> bool;
 
     /// An upper bound on admitted demands, used only to skip hopeless checks quickly: if
     /// `admits(d, w)` then `d.fits_within(bound(w))`. `None` means `w` admits nothing. The default
-    /// is no bound.
+    /// is no bound. [`ProductionAdmission::bound`] has an example.
     fn bound(&self, _w: &WorkerView) -> Option<Resources> {
         Some(Resources::MAX)
     }
@@ -123,6 +331,60 @@ pub trait Admission {
 /// `reported_baseline` must exclude the running jobs (a worker's `baseline_excl`: its rolling RSS
 /// floor minus their estimates). A floor that contains them counts them twice, once in it and
 /// once in `placed`, and keeps a busy worker a few GB short of its budget.
+///
+/// # Examples
+///
+/// The escape hatch: an empty worker takes a job larger than its memory budget, a busy one does
+/// not. Slots have no escape hatch, so a worker without slots takes nothing.
+///
+/// ```
+/// use whelm::{Admission, ProductionAdmission, Resources, SLOTS, WorkerState, WorkerView};
+///
+/// let job = |bytes| {
+///     let mut demand = Resources::mem(bytes);
+///     demand[SLOTS] = 1;
+///     demand
+/// };
+/// let state = WorkerState::new(1, "cpu", 2, Resources::mem(100));
+/// let view = |placed| WorkerView {
+///     state: &state,
+///     placed,
+/// };
+/// assert!(ProductionAdmission.admits(&job(1000), &view(Resources::ZERO)));
+/// assert!(!ProductionAdmission.admits(&job(1000), &view(job(1))));
+///
+/// let no_slots = WorkerState::new(2, "cpu", 0, Resources::mem(100));
+/// let view = WorkerView {
+///     state: &no_slots,
+///     placed: Resources::ZERO,
+/// };
+/// assert!(!ProductionAdmission.admits(&job(1), &view));
+/// ```
+///
+/// A device `per_task` alone caps the jobs per worker: with 100 bytes of device memory and 30 per
+/// job, three jobs fit and a fourth does not, whatever their own (zero) device demands.
+///
+/// ```
+/// # use whelm::{Admission, ProductionAdmission, Resources, SLOTS, WorkerState, WorkerView};
+/// let state = WorkerState {
+///     per_task: Resources::ZERO.with_dev(30),
+///     ..WorkerState::new(1, "gpu", 8, Resources::ZERO.with_dev(100))
+/// };
+/// let slots = |n| {
+///     let mut r = Resources::ZERO;
+///     r[SLOTS] = n;
+///     r
+/// };
+/// let admits_with = |running| {
+///     let view = WorkerView {
+///         state: &state,
+///         placed: slots(running),
+///     };
+///     ProductionAdmission.admits(&slots(1), &view)
+/// };
+/// assert!(admits_with(2));
+/// assert!(!admits_with(3));
+/// ```
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ProductionAdmission;
 
@@ -135,6 +397,31 @@ impl Admission for ProductionAdmission {
 
     /// The headroom left under the production rule (unbounded in the dimensions not enforced, and
     /// in the soft ones when the worker is empty).
+    ///
+    /// ```
+    /// use whelm::{Admission, MEM, ProductionAdmission, Resources, SLOTS, WorkerState, WorkerView};
+    ///
+    /// let job = |bytes| {
+    ///     let mut demand = Resources::mem(bytes);
+    ///     demand[SLOTS] = 1;
+    ///     demand
+    /// };
+    /// let state = WorkerState::new(1, "cpu", 2, Resources::mem(100));
+    /// let view = |placed| WorkerView {
+    ///     state: &state,
+    ///     placed,
+    /// };
+    /// // Empty: memory unbounded (the escape hatch), two slots.
+    /// let empty = ProductionAdmission.bound(&view(Resources::ZERO)).unwrap();
+    /// assert_eq!((empty[MEM], empty[SLOTS]), (u64::MAX, 2));
+    /// // One 60-byte job: 40 bytes and one slot left.
+    /// let busy = ProductionAdmission.bound(&view(job(60))).unwrap();
+    /// assert_eq!((busy[MEM], busy[SLOTS]), (40, 1));
+    /// // Both slots taken: nothing is admitted.
+    /// let mut full = job(60);
+    /// full[SLOTS] = 2;
+    /// assert_eq!(ProductionAdmission.bound(&view(full)), None);
+    /// ```
     fn bound(&self, w: &WorkerView) -> Option<Resources> {
         let (used, empty) = (w.used(), w.running() == 0);
         let mut bound = Resources::MAX;

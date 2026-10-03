@@ -1,4 +1,46 @@
 //! The one placement policy, [`Scheduler`].
+//!
+//! A [`Scheduler`] is a [`Policy`]: [`handle`](Policy::handle) applies an event to its state at
+//! once, and [`poll`](Policy::poll) decides placements and returns every [`Output`] since the last
+//! poll. A poll scans the waiting jobs in urgency order ([`Config::order`], with aged jobs first)
+//! and for each job looks at every worker in turn:
+//!
+//! 1. the job's constraints must allow the worker ([`Strength`]);
+//! 2. no hold may keep the worker from the job: a [reservation](crate::Reservations) by another
+//!    job, or the job's own [deferral](crate::Defer) to a faster worker;
+//! 3. the [`Admission`] rule must admit the job's demand there;
+//!
+//! and among the workers left, [`Config::score`] picks one. A job no worker takes may reserve one
+//! instead. After the scan, idle fast workers may start [speculative](crate::Speculate) second
+//! attempts of jobs running on slow ones. Failed attempts come back to the queue
+//! ([`Config::retry`]).
+//!
+//! Two one-slot workers and three jobs: two start at once, the third when a slot frees.
+//!
+//! ```
+//! use whelm::{Config, Input, JobSpec, Output, Policy, Resources, Scheduler, WorkerState};
+//!
+//! let mut s = Scheduler::new(Config::default());
+//! for w in [1, 2] {
+//!     let budget = Resources::mem_gb(8.0);
+//!     s.handle(Input::Worker(WorkerState::new(w, "cpu", 1, budget)), 0.0);
+//! }
+//! for id in 0..3 {
+//!     s.handle(
+//!         Input::Submit(JobSpec::new(id, Resources::mem_gb(2.0), 0)),
+//!         0.0,
+//!     );
+//! }
+//! let start = |job, worker| Output::Start {
+//!     job,
+//!     attempt: 1,
+//!     worker,
+//! };
+//! assert_eq!(s.poll(0.0), [start(0, 1), start(1, 2)]);
+//! assert!(s.explain(2).unwrap().contains("slots full on 2 worker(s)"));
+//! s.handle(Input::Done { job: 0, attempt: 1 }, 10.0);
+//! assert_eq!(s.poll(10.0), [start(2, 1)]);
+//! ```
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
@@ -268,10 +310,15 @@ fn dedup<T: PartialEq + Copy>(terms: &[T]) -> Vec<T> {
 ///   workers that admit it, the one [`Config::score`] ranks first.
 /// - [`Config::reservations`] drain a worker for a starving job; every other worker keeps
 ///   admitting less urgent jobs.
-///
 /// - Failed attempts are retried ([`Config::retry`]) and, with
 ///   [`SpeedConfig::speculate`](crate::SpeedConfig::speculate), idle fast workers run second
 ///   attempts of jobs on slow ones.
+///
+/// The examples below share the hidden helpers `worker(id, slots, bytes)`, `job(id, bytes)` and
+/// `start(job, attempt, worker)`, which build a [`WorkerState`], a [`JobSpec`] and an
+/// [`Output::Start`].
+///
+/// # The scan
 ///
 /// Each [`poll`](Policy::poll) scans waiting jobs in order and gives each one a worker if any
 /// admits it. Because the scan is in urgency order and admission is monotone in load, a job is
@@ -280,6 +327,183 @@ fn dedup<T: PartialEq + Copy>(terms: &[T]) -> Vec<T> {
 /// admissible mid-scan is the release of a hold (a reservation whose holder is placed); the scan
 /// restarts from the top when that happens. Speculative attempts come after the scan, on workers
 /// every waiting job was refused on.
+///
+/// A less urgent job that fits backfills the room a more urgent one cannot use:
+///
+/// ```
+/// # use whelm::{Config, Input, JobSpec, Output, Policy, Resources, Scheduler, WorkerState};
+/// # let worker = |id, slots, bytes| WorkerState::new(id, "x", slots, Resources::mem(bytes));
+/// # let job = |id, bytes| JobSpec::new(id, Resources::mem(bytes), 0);
+/// # let start = |job, attempt, worker| Output::Start { job, attempt, worker };
+/// let mut s = Scheduler::new(Config::default());
+/// s.handle(Input::Worker(worker(1, 4, 100)), 0.0);
+/// s.handle(Input::Submit(job(0, 70)), 0.0);
+/// assert_eq!(s.poll(0.0), [start(0, 1, 1)]);
+/// let urgent = JobSpec {
+///     priority: Some(-1),
+///     ..job(1, 50)
+/// };
+/// s.handle(Input::Submit(urgent), 1.0);
+/// s.handle(Input::Submit(job(2, 20)), 1.0);
+/// assert_eq!(s.poll(1.0), [start(2, 1, 1)]);
+/// let why = s.explain(1).unwrap();
+/// assert!(why.contains("memory short on 1 worker(s)"), "{why}");
+/// ```
+///
+/// # Retries
+///
+/// A failed attempt sends its job back to the queue with its place and age; the retry avoids,
+/// softly, the workers it failed on. Reports about attempts that are no longer live are ignored,
+/// and cancelling a running job stops it.
+///
+/// ```
+/// # use whelm::{Config, Input, JobSpec, Output, Policy, Resources, Scheduler, WorkerState};
+/// # let worker = |id, slots, bytes| WorkerState::new(id, "x", slots, Resources::mem(bytes));
+/// # let job = |id, bytes| JobSpec::new(id, Resources::mem(bytes), 0);
+/// # let start = |job, attempt, worker| Output::Start { job, attempt, worker };
+/// use whelm::FailKind;
+///
+/// let mut s = Scheduler::new(Config::default());
+/// s.handle(Input::Worker(worker(1, 1, 100)), 0.0);
+/// s.handle(Input::Worker(worker(2, 1, 100)), 0.0);
+/// s.handle(Input::Submit(job(0, 10)), 0.0);
+/// assert_eq!(s.poll(0.0), [start(0, 1, 1)]);
+/// let failed = Input::Failed {
+///     job: 0,
+///     attempt: 1,
+///     kind: FailKind::Other,
+///     why: "segfault".into(),
+/// };
+/// s.handle(failed, 1.0);
+/// assert_eq!(s.poll(1.0), [start(0, 2, 2)]);
+/// s.handle(Input::Done { job: 0, attempt: 1 }, 2.0); // stale
+/// assert_eq!((s.poll(2.0), s.stats().running), (vec![], 1));
+/// s.handle(Input::Cancel(0), 3.0);
+/// let stop = Output::Stop {
+///     job: 0,
+///     attempt: 2,
+///     worker: 2,
+/// };
+/// assert_eq!(s.poll(3.0), [stop]);
+/// ```
+///
+/// [`RetryConfig`](crate::RetryConfig) shows a job given up.
+///
+/// # Holds: reservations and deferral
+///
+/// A hold keeps a worker from a job on purpose although it might admit it. A
+/// [reservation](crate::Reservations) keeps a worker from every job but its holder, so that it
+/// drains for a job that fits nowhere. Here two workers each run a 60-byte job, a 50-byte job
+/// reserves worker 1 once it has waited `reserve_after`, a small job keeps to worker 2, and the
+/// holder starts when worker 1 drains:
+///
+/// ```
+/// # use whelm::{Config, Input, JobSpec, Output, Policy, Resources, Scheduler, WorkerState};
+/// # let worker = |id, slots, bytes| WorkerState::new(id, "x", slots, Resources::mem(bytes));
+/// # let job = |id, bytes| JobSpec::new(id, Resources::mem(bytes), 0);
+/// # let start = |job, attempt, worker| Output::Start { job, attempt, worker };
+/// let mut s = Scheduler::new(Config::default());
+/// s.handle(Input::Worker(worker(1, 4, 100)), 0.0);
+/// s.handle(Input::Worker(worker(2, 4, 100)), 0.0);
+/// s.handle(Input::Submit(job(10, 60)), 0.0);
+/// s.handle(Input::Submit(job(11, 60)), 0.0);
+/// s.handle(Input::Submit(job(1, 50)), 0.0);
+/// assert_eq!(s.poll(0.0), [start(10, 1, 1), start(11, 1, 2)]);
+/// let reserve_after = Config::default().reservations.unwrap().reserve_after;
+/// assert_eq!(s.next_wakeup(), Some(reserve_after));
+/// assert_eq!(s.poll(reserve_after), []);
+/// let reservation = &s.stats().reservations[0];
+/// assert_eq!((reservation.job, reservation.worker), (1, 1));
+/// s.handle(Input::Submit(job(20, 5)), 70.0);
+/// assert_eq!(s.poll(70.0), [start(20, 1, 2)]);
+/// assert!(s.explain(1).unwrap().contains("holds the reservation on worker 1"));
+/// s.handle(Input::Done { job: 10, attempt: 1 }, 100.0);
+/// assert_eq!(s.poll(100.0), [start(1, 1, 1)]);
+/// assert_eq!(s.stats().last_dispatch_holders, [1]);
+/// ```
+///
+/// A [deferral](crate::Defer) is a job's own hold: it declines a slow free worker to wait for a
+/// fast busy one, when it expects to finish sooner that way. Here job 1, of 40 s of work, waits
+/// 2.5 s for the worker four times as fast instead of starting on the slow one:
+///
+/// ```
+/// # use whelm::{Config, Input, JobSpec, Output, Policy, Resources, Scheduler, WorkerState};
+/// # let worker = |id, slots, bytes| WorkerState::new(id, "x", slots, Resources::mem(bytes));
+/// # let job = |id, bytes| JobSpec::new(id, Resources::mem(bytes), 0);
+/// # let start = |job, attempt, worker| Output::Start { job, attempt, worker };
+/// use whelm::{Defer, SpeedConfig};
+///
+/// let mut s = Scheduler::new(Config {
+///     speed: SpeedConfig {
+///         defer: Some(Defer::default()),
+///         ..SpeedConfig::default()
+///     },
+///     ..Config::default()
+/// });
+/// let fast = WorkerState {
+///     speed: 4.0,
+///     ..worker(2, 1, 100)
+/// };
+/// s.handle(Input::Worker(worker(1, 1, 100)), 0.0);
+/// s.handle(Input::Worker(fast), 0.0);
+/// let work = |id, work| JobSpec {
+///     work: Some(work),
+///     ..job(id, 10)
+/// };
+/// s.handle(Input::Submit(work(0, 10.0)), 0.0);
+/// assert_eq!(s.poll(0.0), [start(0, 1, 2)]);
+/// s.handle(Input::Submit(work(1, 40.0)), 0.0);
+/// assert_eq!(s.poll(0.0), []);
+/// assert_eq!(s.stats().deferred, [(1, 2, 2.5)]);
+/// assert!(s.explain(1).unwrap().contains("waiting for faster worker 2"));
+/// s.handle(Input::Done { job: 0, attempt: 1 }, 2.5);
+/// assert_eq!(s.poll(2.5), [start(1, 1, 2)]);
+/// ```
+///
+/// # Speculation
+///
+/// With [`Speculate`](crate::Speculate), a fast worker left idle after the scan starts a second
+/// attempt of a long job running on a slow worker. Both run; the first to finish wins, and the
+/// other is stopped:
+///
+/// ```
+/// # use whelm::{Config, Input, JobSpec, Output, Policy, Resources, Scheduler, WorkerState};
+/// # let worker = |id, slots, bytes| WorkerState::new(id, "x", slots, Resources::mem(bytes));
+/// # let job = |id, bytes| JobSpec::new(id, Resources::mem(bytes), 0);
+/// # let start = |job, attempt, worker| Output::Start { job, attempt, worker };
+/// use whelm::{Speculate, SpeedConfig};
+///
+/// let mut s = Scheduler::new(Config {
+///     speed: SpeedConfig {
+///         speculate: Some(Speculate::default()),
+///         ..SpeedConfig::default()
+///     },
+///     ..Config::default()
+/// });
+/// let fast = WorkerState {
+///     speed: 4.0,
+///     ..worker(2, 1, 100)
+/// };
+/// s.handle(Input::Worker(worker(1, 1, 100)), 0.0);
+/// s.handle(Input::Worker(fast), 0.0);
+/// let work = |id, work| JobSpec {
+///     work: Some(work),
+///     ..job(id, 10)
+/// };
+/// s.handle(Input::Submit(work(0, 4.0)), 0.0);
+/// s.handle(Input::Submit(work(1, 100.0)), 0.0);
+/// assert_eq!(s.poll(0.0), [start(0, 1, 2), start(1, 1, 1)]);
+/// // The fast worker frees at 1 s; job 1 would end there at 26 s instead of 100 s.
+/// s.handle(Input::Done { job: 0, attempt: 1 }, 1.0);
+/// assert_eq!(s.poll(1.0), [start(1, 2, 2)]);
+/// s.handle(Input::Done { job: 1, attempt: 2 }, 26.0);
+/// let stop = Output::Stop {
+///     job: 1,
+///     attempt: 1,
+///     worker: 1,
+/// };
+/// assert_eq!(s.poll(26.0), [stop]);
+/// ```
 pub struct Scheduler {
     config: Config,
     admission: Box<dyn Admission + Send>,
@@ -320,12 +544,58 @@ impl fmt::Debug for Scheduler {
 }
 
 impl Scheduler {
-    /// A scheduler with the production admission rule.
+    /// A scheduler with the production admission rule ([`ProductionAdmission`]).
+    ///
+    /// It starts with no workers and no jobs, so nothing is timed:
+    ///
+    /// ```
+    /// use whelm::{Config, Policy, Scheduler};
+    ///
+    /// let s = Scheduler::new(Config::default());
+    /// assert_eq!((s.stats().waiting, s.next_wakeup()), (0, None));
+    /// ```
     pub fn new(config: Config) -> Self {
         Self::with_admission(config, ProductionAdmission)
     }
 
     /// A scheduler with a custom admission rule.
+    ///
+    /// The rule must be monotone in load ([`Admission`] has the contract and another example).
+    /// Here the production rule is kept, and workers of class "draining" take nothing new:
+    ///
+    /// ```
+    /// use whelm::{
+    ///     Admission, Config, Input, JobSpec, Output, Policy, ProductionAdmission, Resources,
+    ///     Scheduler, WorkerState, WorkerView,
+    /// };
+    ///
+    /// struct SkipDraining;
+    ///
+    /// impl Admission for SkipDraining {
+    ///     fn admits(&self, demand: &Resources, w: &WorkerView) -> bool {
+    ///         w.state.class != "draining" && ProductionAdmission.admits(demand, w)
+    ///     }
+    /// }
+    ///
+    /// let mut s = Scheduler::with_admission(Config::default(), SkipDraining);
+    /// s.handle(
+    ///     Input::Worker(WorkerState::new(1, "draining", 4, Resources::ZERO)),
+    ///     0.0,
+    /// );
+    /// s.handle(
+    ///     Input::Worker(WorkerState::new(2, "cpu", 4, Resources::ZERO)),
+    ///     0.0,
+    /// );
+    /// s.handle(Input::Submit(JobSpec::new(0, Resources::ZERO, 0)), 0.0);
+    /// assert_eq!(
+    ///     s.poll(0.0),
+    ///     [Output::Start {
+    ///         job: 0,
+    ///         attempt: 1,
+    ///         worker: 2
+    ///     }]
+    /// );
+    /// ```
     pub fn with_admission(mut config: Config, admission: impl Admission + Send + 'static) -> Self {
         config.order = dedup(&config.order);
         config.score = dedup(&config.score);
@@ -352,7 +622,37 @@ impl Scheduler {
     }
 
     /// Forget a group's first-arrival time. A later job of that group then counts as a new group.
-    /// Use it when a group is known to be finished, to bound memory.
+    /// Use it when a group is known to be finished, to bound memory. Only
+    /// [`GroupOrder::Arrival`] records arrivals.
+    ///
+    /// Group 1 arrived first, so a new job of it would run before one of group 2; once group 1
+    /// is forgotten, the new job counts as arriving after group 2:
+    ///
+    /// ```
+    /// use whelm::{Config, Input, JobSpec, Output, Policy, Resources, Scheduler, WorkerState};
+    ///
+    /// let next = |forget| {
+    ///     let mut s = Scheduler::new(Config::default());
+    ///     s.handle(
+    ///         Input::Worker(WorkerState::new(1, "x", 1, Resources::ZERO)),
+    ///         0.0,
+    ///     );
+    ///     s.handle(Input::Submit(JobSpec::new(0, Resources::ZERO, 1)), 0.0);
+    ///     s.poll(0.0); // job 0, the last of group 1 for now, takes the slot
+    ///     if forget {
+    ///         s.forget_group(1);
+    ///     }
+    ///     s.handle(Input::Submit(JobSpec::new(1, Resources::ZERO, 2)), 1.0);
+    ///     s.handle(Input::Submit(JobSpec::new(2, Resources::ZERO, 1)), 1.0);
+    ///     s.handle(Input::Done { job: 0, attempt: 1 }, 2.0);
+    ///     match s.poll(2.0)[..] {
+    ///         [Output::Start { job, .. }] => job,
+    ///         ref out => panic!("{out:?}"),
+    ///     }
+    /// };
+    /// assert_eq!(next(false), 2);
+    /// assert_eq!(next(true), 1);
+    /// ```
     pub fn forget_group(&mut self, group: u64) {
         self.groups.remove(&group);
     }
