@@ -1,4 +1,45 @@
 //! A thread-safe, blocking front end over a [`Policy`], for callers with a thread per task.
+//!
+//! A [`Policy`] is driven by one event loop. A caller that runs each task on its own thread
+//! instead wraps the policy in a [`SharedPolicy`]: the thread calls
+//! [`lease`](SharedPolicy::lease), which blocks until the policy starts its job and returns a
+//! [`Lease`] naming the worker, then reports the outcome on the lease. Worker heartbeats and
+//! departures come from whichever thread sees them.
+//!
+//! Two threads share a worker with one slot; the second blocks until the first lease ends:
+//!
+//! ```
+//! use std::{sync::Arc, thread};
+//!
+//! use whelm::{Config, JobSpec, Resources, Scheduler, SharedPolicy, WorkerState};
+//!
+//! let shared = Arc::new(SharedPolicy::new(Scheduler::new(Config::fifo()), || 0.0));
+//! shared.worker_update(WorkerState::new(1, "x", 1, Resources::mem_gb(8.0)));
+//! let job = |id| JobSpec::new(id, Resources::mem_gb(1.0), 0);
+//!
+//! let first = shared.lease(job(1));
+//! let second = thread::spawn({
+//!     let shared = shared.clone();
+//!     move || {
+//!         let lease = shared.lease(job(2));
+//!         let worker = lease.worker();
+//!         lease.complete();
+//!         worker
+//!     }
+//! });
+//! while shared.waiting() == 0 {
+//!     thread::yield_now();
+//! }
+//! assert!(
+//!     shared
+//!         .explain(2)
+//!         .unwrap()
+//!         .ends_with("slots full on 1 worker(s)")
+//! );
+//! first.complete();
+//! assert_eq!(second.join().unwrap(), 1);
+//! assert_eq!(shared.stats().placements_total, 2);
+//! ```
 
 use std::{
     collections::HashMap,
@@ -69,6 +110,47 @@ pub struct SharedPolicy<P> {
 
 impl<P: Policy> SharedPolicy<P> {
     /// A front end over `policy`, reading time from `clock` (seconds; made non-decreasing here).
+    ///
+    /// A clock the caller sets makes time-dependent behaviour reproducible. Here the second job
+    /// waits while the clock moves to 7, and a clock going back to 3 is read as 7:
+    ///
+    /// ```
+    /// use std::{
+    ///     sync::{Arc, Mutex},
+    ///     thread,
+    /// };
+    ///
+    /// use whelm::{Config, JobSpec, Resources, Scheduler, SharedPolicy, WorkerState};
+    ///
+    /// let time = Arc::new(Mutex::new(0.0));
+    /// let clock = {
+    ///     let time = time.clone();
+    ///     move || *time.lock().unwrap()
+    /// };
+    /// let shared = Arc::new(SharedPolicy::new(Scheduler::new(Config::default()), clock));
+    /// shared.worker_update(WorkerState::new(1, "x", 1, Resources::mem_gb(8.0)));
+    /// let job = |id| JobSpec::new(id, Resources::mem_gb(1.0), 0);
+    ///
+    /// let first = shared.lease(job(1));
+    /// let second = thread::spawn({
+    ///     let shared = shared.clone();
+    ///     move || {
+    ///         let lease = shared.lease(job(2));
+    ///         let waited = lease.waited();
+    ///         lease.complete();
+    ///         waited
+    ///     }
+    /// });
+    /// while shared.waiting() == 0 {
+    ///     thread::yield_now();
+    /// }
+    /// *time.lock().unwrap() = 7.0;
+    /// shared.tick();
+    /// *time.lock().unwrap() = 3.0;
+    /// first.complete();
+    /// assert_eq!(second.join().unwrap(), 7.0);
+    /// assert_eq!(shared.stats().now, 7.0);
+    /// ```
     pub fn new(policy: P, clock: impl Fn() -> Instant + Send + Sync + 'static) -> Self {
         Self {
             state: Mutex::new(State {
@@ -82,6 +164,16 @@ impl<P: Policy> SharedPolicy<P> {
     }
 
     /// A front end whose clock is seconds since its creation.
+    ///
+    /// ```
+    /// use whelm::{Config, JobSpec, Resources, Scheduler, SharedPolicy, WorkerState};
+    ///
+    /// let shared = SharedPolicy::with_system_clock(Scheduler::new(Config::default()));
+    /// shared.worker_update(WorkerState::new(1, "x", 4, Resources::mem_gb(8.0)));
+    /// let lease = shared.lease(JobSpec::new(1, Resources::mem_gb(1.0), 0));
+    /// assert!(lease.waited() >= 0.0);
+    /// lease.complete();
+    /// ```
     pub fn with_system_clock(policy: P) -> Self {
         let start = std::time::Instant::now();
         Self::new(policy, move || start.elapsed().as_secs_f64())
@@ -238,6 +330,18 @@ impl<P: Policy> SharedPolicy<P> {
     /// [`complete`](Lease::complete) or [`fail`](Lease::fail) (e.g. when the caller unwinds)
     /// cancels the job.
     ///
+    /// ```
+    /// use whelm::{Config, JobSpec, Resources, Scheduler, SharedPolicy, WorkerState};
+    ///
+    /// let shared = SharedPolicy::new(Scheduler::new(Config::default()), || 0.0);
+    /// shared.worker_update(WorkerState::new(1, "x", 1, Resources::mem_gb(8.0)));
+    /// let lease = shared.lease(JobSpec::new(1, Resources::mem_gb(1.0), 0));
+    /// assert_eq!((lease.worker(), lease.attempt()), (1, 1));
+    /// assert_eq!(shared.stats().running, 1);
+    /// drop(lease);
+    /// assert_eq!(shared.stats().running, 0);
+    /// ```
+    ///
     /// # Panics
     ///
     /// If a job with this id is already leased here.
@@ -248,6 +352,23 @@ impl<P: Policy> SharedPolicy<P> {
 
     /// [`lease`](Self::lease), giving up after `timeout`: the job is then withdrawn from the
     /// policy and returned. A start made concurrently with the timeout is still returned.
+    ///
+    /// With no worker, the job never starts:
+    ///
+    /// ```
+    /// use std::time::Duration;
+    ///
+    /// use whelm::{Config, JobSpec, Resources, Scheduler, SharedPolicy};
+    ///
+    /// let shared = SharedPolicy::new(Scheduler::new(Config::default()), || 0.0);
+    /// let job = JobSpec::new(1, Resources::mem_gb(1.0), 0);
+    /// let back = shared
+    ///     .lease_timeout(job, Duration::from_millis(10))
+    ///     .err()
+    ///     .unwrap();
+    /// assert_eq!(back.id, 1);
+    /// assert_eq!(shared.stats().waiting, 0);
+    /// ```
     pub fn lease_timeout(
         &self,
         job: JobSpec,
@@ -257,6 +378,30 @@ impl<P: Policy> SharedPolicy<P> {
     }
 
     /// A worker joined or reported a heartbeat.
+    ///
+    /// A worker joining wakes the threads whose jobs it starts:
+    ///
+    /// ```
+    /// use std::{sync::Arc, thread};
+    ///
+    /// use whelm::{Config, JobSpec, Resources, Scheduler, SharedPolicy, WorkerState};
+    ///
+    /// let shared = Arc::new(SharedPolicy::new(Scheduler::new(Config::default()), || 0.0));
+    /// let task = thread::spawn({
+    ///     let shared = shared.clone();
+    ///     move || {
+    ///         let lease = shared.lease(JobSpec::new(1, Resources::mem_gb(1.0), 0));
+    ///         let worker = lease.worker();
+    ///         lease.complete();
+    ///         worker
+    ///     }
+    /// });
+    /// while shared.waiting() == 0 {
+    ///     thread::yield_now();
+    /// }
+    /// shared.worker_update(WorkerState::new(5, "x", 1, Resources::mem_gb(8.0)));
+    /// assert_eq!(task.join().unwrap(), 5);
+    /// ```
     pub fn worker_update(&self, w: WorkerState) {
         let (mut s, now) = self.lock();
         s.policy.handle(Input::Worker(w), now);
@@ -267,6 +412,22 @@ impl<P: Policy> SharedPolicy<P> {
     /// given up) at once. Returns the leased jobs whose attempt ran there, by id: each thread's
     /// later [`Lease::fail`] returns the job's next attempt (or its give-up), and its
     /// [`Lease::complete`] cancels the retry.
+    ///
+    /// ```
+    /// use whelm::{Config, FailKind, JobSpec, Resources, Scheduler, SharedPolicy, WorkerState};
+    ///
+    /// let shared = SharedPolicy::new(Scheduler::new(Config::fifo()), || 0.0);
+    /// for w in [1, 2] {
+    ///     shared.worker_update(WorkerState::new(w, "x", 1, Resources::mem_gb(8.0)));
+    /// }
+    /// let lease = shared.lease(JobSpec::new(7, Resources::mem_gb(1.0), 0));
+    /// assert_eq!(lease.worker(), 1);
+    /// assert_eq!(shared.worker_gone(1), [7]);
+    /// // The thread learns of it from its own link, and gets the retry the policy already made.
+    /// let retry = lease.fail(FailKind::LinkDied, "connection reset").unwrap();
+    /// assert_eq!((retry.worker(), retry.attempt()), (2, 2));
+    /// retry.complete();
+    /// ```
     pub fn worker_gone(&self, w: WorkerId) -> Vec<JobId> {
         let (mut s, now) = self.lock();
         let mut hit = Vec::new();
@@ -288,28 +449,89 @@ impl<P: Policy> SharedPolicy<P> {
     }
 
     /// Poll now (time has passed).
+    ///
+    /// Every other call polls too; `tick` is for time passing without events, at
+    /// [`next_wakeup`](Self::next_wakeup) or on a [ticker](Self::spawn_ticker).
     pub fn tick(&self) {
         let (mut s, now) = self.lock();
         Self::pump(&mut s, now);
     }
 
     /// When the policy next needs a poll without events, on the policy clock.
+    ///
+    /// A job too big for a busy worker's headroom reserves it once it has waited
+    /// [`Reservations::reserve_after`](crate::Reservations::reserve_after); ticking then makes
+    /// the reservation:
+    ///
+    /// ```
+    /// use std::{
+    ///     sync::{Arc, Mutex},
+    ///     thread,
+    /// };
+    ///
+    /// use whelm::{Config, JobSpec, Reservations, Resources, Scheduler, SharedPolicy, WorkerState};
+    ///
+    /// let time = Arc::new(Mutex::new(0.0));
+    /// let clock = {
+    ///     let time = time.clone();
+    ///     move || *time.lock().unwrap()
+    /// };
+    /// let shared = Arc::new(SharedPolicy::new(Scheduler::new(Config::default()), clock));
+    /// shared.worker_update(WorkerState::new(1, "x", 4, Resources::mem_gb(8.0)));
+    /// let first = shared.lease(JobSpec::new(1, Resources::mem_gb(4.0), 0));
+    /// let big = thread::spawn({
+    ///     let shared = shared.clone();
+    ///     move || {
+    ///         shared
+    ///             .lease(JobSpec::new(2, Resources::mem_gb(6.0), 0))
+    ///             .complete()
+    ///     }
+    /// });
+    /// while shared.waiting() == 0 {
+    ///     thread::yield_now();
+    /// }
+    ///
+    /// let wake = shared.next_wakeup().unwrap();
+    /// assert_eq!(wake, Reservations::default().reserve_after);
+    /// *time.lock().unwrap() = wake;
+    /// shared.tick();
+    /// assert_eq!(shared.stats().reservations[0].job, 2);
+    /// assert!(
+    ///     shared
+    ///         .explain(2)
+    ///         .unwrap()
+    ///         .contains("holds the reservation on worker 1")
+    /// );
+    /// first.complete();
+    /// big.join().unwrap();
+    /// ```
     pub fn next_wakeup(&self) -> Option<Instant> {
         self.lock().0.policy.next_wakeup()
     }
 
-    /// Why a job is not running.
+    /// Why a job is not running ([`Policy::explain`]); see the [module example](self).
     pub fn explain(&self, job: JobId) -> Option<String> {
         self.lock().0.policy.explain(job)
     }
 
-    /// The policy's counters.
+    /// The policy's counters ([`Policy::stats`]).
     pub fn stats(&self) -> PolicyStats {
         self.lock().0.policy.stats()
     }
 
     /// Run `f` on the policy under the lock (e.g. to forget a group), then poll. Starts of jobs
     /// submitted through `f` are cancelled: nobody waits for them.
+    ///
+    /// ```
+    /// use whelm::{Config, Input, JobSpec, Policy, Resources, Scheduler, SharedPolicy};
+    ///
+    /// let shared = SharedPolicy::new(Scheduler::new(Config::default()), || 0.0);
+    /// shared.worker_update(whelm::WorkerState::new(1, "x", 1, Resources::mem_gb(8.0)));
+    /// let job = JobSpec::new(1, Resources::mem_gb(1.0), 0);
+    /// shared.with(|p, now| p.handle(Input::Submit(job), now));
+    /// let stats = shared.stats();
+    /// assert_eq!((stats.placements_total, stats.running), (1, 0));
+    /// ```
     pub fn with<R>(&self, f: impl FnOnce(&mut P, Instant) -> R) -> R {
         let (mut s, now) = self.lock();
         let r = f(&mut s.policy, now);
@@ -317,7 +539,8 @@ impl<P: Policy> SharedPolicy<P> {
         r
     }
 
-    /// Threads blocked waiting for a start.
+    /// Threads blocked waiting for a start: in [`lease`](Self::lease), or in [`Lease::fail`] for
+    /// a retry.
     pub fn waiting(&self) -> usize {
         self.lock()
             .0
@@ -332,6 +555,42 @@ impl<P: Policy + Send + 'static> SharedPolicy<P> {
     /// A thread that calls [`tick`](Self::tick) every `period`, or sooner when the policy asks
     /// ([`Policy::next_wakeup`]). It stops when the front end is dropped or
     /// [`stop_ticker`](Self::stop_ticker) is called.
+    ///
+    /// With a ticker, the reservation of the [`next_wakeup`](Self::next_wakeup) example is made
+    /// without calling [`tick`](Self::tick):
+    ///
+    /// ```
+    /// # use std::{
+    /// #     sync::{Arc, Mutex},
+    /// #     thread,
+    /// #     time::Duration,
+    /// # };
+    /// # use whelm::{Config, JobSpec, Resources, Scheduler, SharedPolicy, WorkerState};
+    /// # let time = Arc::new(Mutex::new(0.0));
+    /// # let clock = {
+    /// #     let time = time.clone();
+    /// #     move || *time.lock().unwrap()
+    /// # };
+    /// # let shared = Arc::new(SharedPolicy::new(Scheduler::new(Config::default()), clock));
+    /// # shared.worker_update(WorkerState::new(1, "x", 4, Resources::mem_gb(8.0)));
+    /// # let first = shared.lease(JobSpec::new(1, Resources::mem_gb(4.0), 0));
+    /// # let big = thread::spawn({
+    /// #     let shared = shared.clone();
+    /// #     move || shared.lease(JobSpec::new(2, Resources::mem_gb(6.0), 0)).complete()
+    /// # });
+    /// # while shared.waiting() == 0 {
+    /// #     thread::yield_now();
+    /// # }
+    /// let ticker = shared.spawn_ticker(Duration::from_millis(1));
+    /// *time.lock().unwrap() = shared.next_wakeup().unwrap();
+    /// while shared.stats().reservations.is_empty() {
+    ///     thread::yield_now();
+    /// }
+    /// shared.stop_ticker();
+    /// ticker.join().unwrap();
+    /// # first.complete();
+    /// # big.join().unwrap();
+    /// ```
     pub fn spawn_ticker(self: &Arc<Self>, period: Duration) -> JoinHandle<()> {
         let weak: Weak<Self> = Arc::downgrade(self);
         std::thread::Builder::new()
@@ -357,6 +616,8 @@ impl<P: Policy + Send + 'static> SharedPolicy<P> {
     }
 
     /// Stop a ticker started by [`spawn_ticker`](Self::spawn_ticker) (it exits within a period).
+    /// It stops every ticker of this front end, for good: a ticker spawned afterwards exits at
+    /// once.
     pub fn stop_ticker(&self) {
         self.lock().0.stopped = true;
     }
@@ -364,6 +625,40 @@ impl<P: Policy + Send + 'static> SharedPolicy<P> {
 
 /// A started attempt of a leased job (see [`SharedPolicy::lease`]). Dropping it without
 /// [`complete`](Self::complete) or [`fail`](Self::fail) cancels the job.
+///
+/// A lease is a loop: run the attempt on [`worker`](Self::worker), and on failure take the lease
+/// [`fail`](Self::fail) returns for the next attempt, until the job completes or is given up:
+///
+/// ```
+/// use whelm::{
+///     Config, FailKind, JobSpec, Resources, RetryConfig, Scheduler, SharedPolicy, WorkerState,
+/// };
+///
+/// let config = Config {
+///     retry: RetryConfig { max_attempts: 3 },
+///     ..Config::fifo()
+/// };
+/// let shared = SharedPolicy::new(Scheduler::new(config), || 0.0);
+/// for w in [1, 2] {
+///     shared.worker_update(WorkerState::new(w, "x", 1, Resources::mem_gb(8.0)));
+/// }
+/// // Every attempt runs out of device memory.
+/// let mut lease = shared.lease(JobSpec::new(7, Resources::mem_gb(1.0), 0));
+/// let mut workers = Vec::new();
+/// let gave_up = loop {
+///     workers.push(lease.worker());
+///     match lease.fail(FailKind::DeviceOom, "out of memory") {
+///         Ok(retry) => lease = retry,
+///         Err(gave_up) => break gave_up,
+///     }
+/// };
+/// // Each retry softly avoids the workers already tried.
+/// assert_eq!(workers, [1, 2, 1]);
+/// assert_eq!(
+///     (gave_up.job, gave_up.tried.len(), gave_up.retryable),
+///     (7, 3, true)
+/// );
+/// ```
 pub struct Lease<'a, P: Policy> {
     shared: &'a SharedPolicy<P>,
     job: JobId,
@@ -392,6 +687,18 @@ impl<'a, P: Policy> Lease<'a, P> {
 
     /// Whether the policy stopped this attempt (the job was cancelled through
     /// [`SharedPolicy::with`]): its result is not wanted.
+    ///
+    /// ```
+    /// use whelm::{Config, Input, JobSpec, Policy, Resources, Scheduler, SharedPolicy};
+    ///
+    /// let shared = SharedPolicy::new(Scheduler::new(Config::default()), || 0.0);
+    /// shared.worker_update(whelm::WorkerState::new(1, "x", 1, Resources::mem_gb(8.0)));
+    /// let lease = shared.lease(JobSpec::new(1, Resources::mem_gb(1.0), 0));
+    /// assert!(!lease.stopped());
+    /// shared.with(|p, now| p.handle(Input::Cancel(1), now));
+    /// assert!(lease.stopped());
+    /// lease.complete();
+    /// ```
     pub fn stopped(&self) -> bool {
         let (s, _) = self.shared.lock();
         s.jobs.get(&self.job).is_some_and(|slot| slot.stopped)
@@ -399,6 +706,21 @@ impl<'a, P: Policy> Lease<'a, P> {
 
     /// The job finished. If its worker left meanwhile ([`SharedPolicy::worker_gone`]), the
     /// policy's retry is cancelled instead: the result is in hand.
+    ///
+    /// ```
+    /// use whelm::{Config, JobSpec, Resources, Scheduler, SharedPolicy, WorkerState};
+    ///
+    /// let shared = SharedPolicy::new(Scheduler::new(Config::fifo()), || 0.0);
+    /// for w in [1, 2] {
+    ///     shared.worker_update(WorkerState::new(w, "x", 1, Resources::mem_gb(8.0)));
+    /// }
+    /// let lease = shared.lease(JobSpec::new(7, Resources::mem_gb(1.0), 0));
+    /// shared.worker_gone(lease.worker());
+    /// // The policy is running a retry on worker 2, but the result arrived anyway.
+    /// assert_eq!(shared.stats().running, 1);
+    /// lease.complete();
+    /// assert_eq!(shared.stats().running, 0);
+    /// ```
     pub fn complete(mut self) {
         self.open = false;
         let (mut s, now) = self.shared.lock();
@@ -417,7 +739,8 @@ impl<'a, P: Policy> Lease<'a, P> {
 
     /// The attempt failed: block until the policy starts the job again (the returned lease) or
     /// gives it up. After the worker left, the policy has already retried the job, and this
-    /// returns that retry's start (or the give-up).
+    /// returns that retry's start (or the give-up). The [type's example](Lease) runs this to
+    /// give-up.
     pub fn fail(mut self, kind: FailKind, why: &str) -> Result<Lease<'a, P>, GaveUp> {
         self.open = false;
         let shared = self.shared;
