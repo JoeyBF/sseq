@@ -1,4 +1,5 @@
-//! The DAG layer: readiness, forward references, cycles, cancellation, ranks, snapshots.
+//! The DAG layer over plain jobs: readiness, forward references, cycles, cancellation, ranks,
+//! snapshots.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -176,7 +177,7 @@ fn cancel_cascades_to_dependents() {
     assert_eq!((s.pending, s.undeclared, s.submitted), (0, 0, 1));
 }
 
-/// Upward ranks follow the longest descendant chain, plus placeholder tails.
+/// Upward ranks follow the longest descendant chain.
 #[test]
 fn ranks_follow_the_critical_path() {
     let mut d = dag(DagConfig {
@@ -194,11 +195,8 @@ fn ranks_follow_the_critical_path() {
     d.declare(vec![w(4, &[1], 10.0)], 0.0).unwrap();
     assert_eq!(d.rank(1), Some(11.0));
     assert_eq!(d.rank(2), Some(5.0));
-    // A placeholder group waiting on group 0 adds its cost below every job of group 0.
-    d.declare_group_placeholder(7, vec![0], 100.0);
-    assert_eq!(d.rank(3), Some(103.0));
-    d.remove_group_placeholder(7);
     assert_eq!(d.rank(3), Some(3.0));
+    assert_eq!(d.rank(99), None);
 }
 
 /// With rank priority, the job heading the longer chain runs first.
@@ -272,11 +270,10 @@ fn snapshot_round_trip() {
     let mut d = dag(DagConfig::default());
     d.declare(vec![job(1, &[]), job(2, &[1]), job(3, &[2, 7])], 0.0)
         .unwrap();
-    d.declare_group_placeholder(9, vec![0], 4.0);
     placed(&mut d, 0.0);
     let json = serde_json::to_string(&d.snapshot()).unwrap();
     let snap = serde_json::from_str(&json).unwrap();
-    let mut r = DagScheduler::restore(snap, Scheduler::new(Config::default()), 10.0);
+    let mut r = DagScheduler::restore(snap, Scheduler::new(Config::default()), None, 10.0);
     join(
         &mut r,
         WorkerState::new(0, "x", 64, Resources::mem(1000)),
@@ -301,7 +298,8 @@ proptest! {
 
     /// A random DAG (edges from lower to higher ids), declared in random batches in random order
     /// (so forward references abound), with random worker churn: no job is dispatched before its
-    /// dependencies completed (late reports of lost attempts complete nothing), every job eventually runs, and an injected back edge is rejected.
+    /// dependencies completed (late reports of lost attempts complete nothing), every job eventually
+    /// runs, and an injected back edge is rejected.
     #[test]
     fn never_dispatched_before_dependencies(
         n in 1usize..40,
@@ -362,7 +360,7 @@ proptest! {
             Ok(())
         };
         for chunk in ids.chunks(batch) {
-            let jobs = chunk.iter().map(|&i| job(i, &deps[&i].iter().copied().collect::<Vec<_>>())).collect();
+            let jobs: Vec<DagJob> = chunk.iter().map(|&i| job(i, &deps[&i].iter().copied().collect::<Vec<_>>())).collect();
             d.declare(jobs, t).unwrap();
             step(&mut d, &mut done, &mut running, &mut t)?;
         }

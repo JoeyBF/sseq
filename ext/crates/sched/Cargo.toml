@@ -12,13 +12,11 @@ license = "MIT OR Apache-2.0"
 [features]
 default = ["serde"]
 # Snapshot/reload of the declared DAG (`DagScheduler::snapshot` / `restore`).
-serde = ["dep:serde", "petgraph/serde-1"]
+serde = ["dep:serde"]
 # The JSONL event-log writer (`log::JsonlSink`).
 log = ["serde", "dep:serde_json", "dep:flate2"]
 
 [dependencies]
-petgraph = { version = "0.8", default-features = false, features = ["stable_graph", "std"] }
-
 serde = { version = "1", features = ["derive"], optional = true }
 # `float_roundtrip`: a logged run replays exactly only if its times read back bit for bit.
 serde_json = { version = "1", features = ["float_roundtrip"], optional = true }

@@ -240,27 +240,24 @@ of the simulator.
 
 ## Dependencies: the DAG layer
 
-[`DagScheduler`] wraps any policy and is itself a [`Policy`]. Jobs are declared with their
-dependencies ([`DagJob`]), possibly long before they are ready and possibly naming jobs not
-declared yet; a job is submitted to the inner policy when its last dependency completes, and an
-[`Input::Done`] of a live attempt completes it here. Cycles are rejected at declaration (the batch
-leaves no trace). Readiness is incremental, and completed jobs leave the graph, so its size tracks
-the live frontier.
+[`DagScheduler`] wraps any policy and is itself a [`Policy`]. The graph is a coarse DAG of
+[`Unit`]s, each an instance of a [`DagTemplate`] whose nodes are jobs or, recursively, units of
+other templates; a plain job ([`DagJob`]) is a unit of a one-node template. Units are declared with
+their dependencies, possibly long before they are ready and possibly naming units not declared yet;
+a job is submitted to the inner policy when its last dependency completes, and an [`Input::Done`]
+of a live attempt completes it here. Cycles are rejected at declaration (the batch leaves no
+trace). A unit's per-node state is materialised when its dependencies complete and freed when it
+completes, so memory tracks the live frontier while ranks see the whole declared graph.
 
 - **Ranks.** With [`DagConfig::rank_priority`], jobs are submitted with their upward rank
-  ([`JobSpec::rank`]: their work plus the longest chain of work below them, plus group
-  placeholders' costs), which [`OrderTerm::Rank`] orders by.
-  [`DagScheduler::update_work`] refines estimates later.
-- **Templates.** A [`DagTemplate`] is a dependency structure shared by many groups, checked once and
-  instantiated per group with [`DagScheduler::declare_template`]; its
-  [`critical_path`](DagTemplate::critical_path) gives an unexpanded group's placeholder cost.
-- **Implicit instances** ([`DagScheduler::open_instance`], after PaRSEC's parameterised task
-  graphs) keep a group's sub-DAG as dense counters over its template ([`InstanceSpec`]) instead of
-  graph nodes and edges, build a `JobSpec` only when a node becomes ready, and complete the group's
-  `done` job with its last node. An instance can carry per-node demands and labels, open with nodes
-  already complete (resuming from a checkpoint), and be closed early
-  ([`DagScheduler::close_instance`]: unstarted nodes complete as no-ops, running ones only free
-  their resources when they end). [`DagConfig::max_open_instances`] bounds how many are open.
+  ([`JobSpec::rank`]: their work plus the longest chain of work below them, through the enclosing
+  units and their dependents), which [`OrderTerm::Rank`] orders by.
+  [`DagScheduler::update_work`] rescales a unit later.
+- **Units.** A [`DagTemplate`] is checked once and shared by every unit built on it. Per-leaf work,
+  demands and labels can come from a [`NodeSource`] instead of being stored. A unit can be declared
+  with leaves already complete (resuming from a checkpoint) and closed early
+  ([`DagScheduler::close`]: unstarted jobs complete as no-ops, running ones only free their
+  resources when they end).
 - **Outputs.** A ready local job is announced by [`Output::RunLocal`] and reported with
   [`Input::Done`] and attempt 0. Without [`DagConfig::auto_submit`], ready jobs are announced by
   [`Output::Ready`] and submitted by [`DagScheduler::release`]. **Passthrough** jobs
@@ -270,7 +267,7 @@ the live frontier.
   stay pending until the caller releases it (another round of attempts) or cancels it.
   [`DagScheduler::cancel`] and [`Input::Cancel`] cascade to every dependent.
 - **Snapshots** (feature `serde`): `DagScheduler::snapshot` and `DagScheduler::restore` save the
-  declared graph, instances included; submitted jobs are submitted again on restore.
+  coarse graph and the materialised units; submitted jobs are submitted again on restore.
 
 ```rust
 use sched::{
@@ -292,10 +289,10 @@ To log a DAG-driven run, log the inner policy: `DagScheduler<Logged<Scheduler>>`
 
 ## Features
 
-- `serde` (default): serialisation of the message types and DAG snapshots (`petgraph/serde-1`).
+- `serde` (default): serialisation of the message types and DAG snapshots.
 - `log`: the JSONL event-log writer `log::JsonlSink` (adds `serde_json`, `flate2`).
 
-Without features the only dependency is `petgraph`.
+Without features the crate has no dependencies.
 
 ## Simulator
 
