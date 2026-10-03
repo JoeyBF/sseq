@@ -222,7 +222,7 @@ pub fn simulate_small(inst: &SmallInstance, plan: &SmallPlan) -> SmallResult {
                 speed: if plan.speed.learned() { 1.0 } else { c.speed },
                 ..Default::default()
             };
-            dag.handle(Input::Worker(state), Time::ZERO);
+            dag.handle(Input::Worker(state), Time::ORIGIN);
             speed.push(c.speed);
             slow.push(c.speed < fastest);
         }
@@ -273,7 +273,7 @@ pub fn simulate_small(inst: &SmallInstance, plan: &SmallPlan) -> SmallResult {
             }
         })
         .collect();
-    dag.declare(jobs, Time::ZERO)
+    dag.declare(jobs, Time::ORIGIN)
         .expect("small instances are acyclic");
 
     let n = inst.tasks.len();
@@ -288,7 +288,7 @@ pub fn simulate_small(inst: &SmallInstance, plan: &SmallPlan) -> SmallResult {
     let mut wake = None;
     let mut speculations = 0u64;
     loop {
-        for o in dag.poll(Time::from_secs_f64(now)) {
+        for o in dag.poll(Time(Duration::from_secs_f64(now))) {
             match o {
                 Output::Start {
                     job,
@@ -312,7 +312,7 @@ pub fn simulate_small(inst: &SmallInstance, plan: &SmallPlan) -> SmallResult {
             && Some(t) != wake
         {
             wake = Some(t);
-            queue.push(t.as_secs_f64(), None);
+            queue.push(t.0.as_secs_f64(), None);
         }
         let Some((t, events)) = queue.pop_instant() else {
             break;
@@ -342,7 +342,7 @@ pub fn simulate_small(inst: &SmallInstance, plan: &SmallPlan) -> SmallResult {
                     job: j as u64,
                     attempt,
                 },
-                Time::from_secs_f64(now),
+                Time(Duration::from_secs_f64(now)),
             );
         }
     }

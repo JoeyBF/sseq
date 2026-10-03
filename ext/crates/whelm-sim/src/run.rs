@@ -382,10 +382,10 @@ pub fn simulate(setup: &SimSetup, name: &str, policy: BoxPolicy) -> Metrics {
                     }
                 })
                 .collect();
-            dag.declare(jobs, Time::ZERO)
+            dag.declare(jobs, Time::ORIGIN)
                 .expect("the trace's dependencies are acyclic");
             // No worker has joined yet: this poll only announces the jobs without dependencies.
-            for o in dag.poll(Time::ZERO) {
+            for o in dag.poll(Time::ORIGIN) {
                 if let Output::Ready { job } = o {
                     queue.push(gaps[job as usize], Ev::Arrive(job as usize));
                 }
@@ -466,7 +466,7 @@ pub fn simulate(setup: &SimSetup, name: &str, policy: BoxPolicy) -> Metrics {
             reserved_idle += free as f64 * (t - prev_t);
         }
         prev_t = t;
-        let now = Time::from_secs_f64(t);
+        let now = Time(Duration::from_secs_f64(t));
         let mut dirty: Vec<usize> = Vec::new();
         match ev {
             Ev::Join(w) => {

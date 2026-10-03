@@ -1438,7 +1438,7 @@ pub fn simulate(
                 },
                 ..Default::default()
             };
-            dag.handle(Input::Worker(state), Time::ZERO);
+            dag.handle(Input::Worker(state), Time::ORIGIN);
             workers.push(Wk {
                 class: class.clone(),
                 ps: PsWorker::default(),
@@ -1510,7 +1510,7 @@ pub fn simulate(
         reg.extend(world.index(b.s, b.t - 1).map(|p| 4 * p as u64 + 1));
         units.push(pass(zero + 1, k, reg));
     }
-    dag.declare(units, Time::ZERO)
+    dag.declare(units, Time::ORIGIN)
         .expect("the whole-run DAG is acyclic");
 
     let mut queue = Queue::new();
@@ -1543,7 +1543,7 @@ pub fn simulate(
     loop {
         // Newly ready jobs: release them (through the simulated coordinator's caps) before
         // anything is placed.
-        let at = Time::from_secs_f64(now);
+        let at = Time(Duration::from_secs_f64(now));
         let mut announced = std::mem::take(&mut carry);
         announced.extend(dag.announcements());
         for o in &announced {
@@ -1634,7 +1634,7 @@ pub fn simulate(
             && Some(t) != wake_at
         {
             wake_at = Some(t);
-            queue.push(t.as_secs_f64(), Ev::Wake);
+            queue.push(t.0.as_secs_f64(), Ev::Wake);
         }
         if tasks >= next_sample {
             next_sample = tasks + NODE_SAMPLE_TASKS;
@@ -1648,7 +1648,7 @@ pub fn simulate(
             break;
         };
         now = t;
-        let at = Time::from_secs_f64(now);
+        let at = Time(Duration::from_secs_f64(now));
         for ev in events {
             let Ev::Done(w, v) = ev else {
                 // Stale wakeups (for jobs placed before their deadline) are harmless no-ops.

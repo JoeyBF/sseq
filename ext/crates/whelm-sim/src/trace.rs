@@ -211,7 +211,7 @@ impl Trace {
                     reserved_gb,
                     running,
                 } => {
-                    let t_s = (t_s.or(at.map(Time::as_secs_f64)))
+                    let t_s = (t_s.or(at.map(|t| t.0.as_secs_f64())))
                         .ok_or_else(|| format!("line {}: a sample without a time", i + 1))?;
                     let w = index(&mut t, &worker);
                     t.workers[w].samples.push(Sample {
@@ -232,7 +232,7 @@ impl Trace {
                     Input::Submit(spec) => {
                         // A duplicate submission of a live job is ignored by the policy too.
                         pending.entry(spec.id).or_insert(Pending {
-                            ready_s: at.as_secs_f64(),
+                            ready_s: at.0.as_secs_f64(),
                             est_gb: spec.demand[MEM] as f64 / 1e9,
                             group: spec.group,
                             info,
@@ -272,7 +272,7 @@ impl Trace {
                             next: info.next.unwrap_or(0.0),
                             ready_s: p.ready_s,
                             placed_s,
-                            done_s: at.as_secs_f64(),
+                            done_s: at.0.as_secs_f64(),
                             worker,
                             deps: info.deps,
                             sig: info.sig,
@@ -294,7 +294,7 @@ impl Trace {
                                 worker,
                             } => {
                                 if let Some(p) = pending.get_mut(&job) {
-                                    let placed_s = at.as_secs_f64();
+                                    let placed_s = at.0.as_secs_f64();
                                     p.starts.push((attempt, placed_s, worker.to_string()));
                                 }
                             }
@@ -460,6 +460,8 @@ impl Trace {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use whelm::{FailKind, GaveUp, JobSpec, Resources, WorkerState, log::Event};
 
     use super::*;
@@ -503,7 +505,7 @@ mod tests {
     #[test]
     fn reads_event_log_attempts() {
         let input = |t: u64, input: Input| Event::Input {
-            t: Time::from_secs(t),
+            t: Time(Duration::from_secs(t)),
             input,
             info: None,
         };
@@ -513,7 +515,7 @@ mod tests {
             worker,
         };
         let poll = |t: u64, out: Vec<Output>| Event::Poll {
-            t: Time::from_secs(t),
+            t: Time(Duration::from_secs(t)),
             out,
         };
         let worker = |id| WorkerState {
@@ -535,7 +537,7 @@ mod tests {
             input(0, Input::Worker(worker(1))),
             input(0, Input::Worker(worker(2))),
             Event::Input {
-                t: Time::from_secs(1),
+                t: Time(Duration::from_secs(1)),
                 input: submit(1),
                 info: Some(Box::new(TaskInfo {
                     kind: "zero".into(),
@@ -579,7 +581,7 @@ mod tests {
                 })],
             ),
             Event::Sample {
-                t: Time::from_secs(7),
+                t: Time(Duration::from_secs(7)),
                 worker: "1".into(),
                 rss_gb: 3.0,
                 baseline_gb: 1.0,

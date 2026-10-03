@@ -1,5 +1,7 @@
 //! A synthetic device-memory scenario: small cards whose over-subscribed launch pool slows jobs.
 
+use std::time::Duration;
+
 use serde::Serialize;
 use whelm::{
     Config, Input, JobId, JobSpec, Output, Policy, Resources, Scheduler, Time, WorkerState,
@@ -145,7 +147,7 @@ pub fn simulate_device(sc: &DeviceScenario, arm: DeviceArm) -> DeviceMetrics {
             per_task: Resources::ZERO.with_dev((per_task * 1e9).round() as u64),
             ..Default::default()
         };
-        p.handle(Input::Worker(state), Time::ZERO);
+        p.handle(Input::Worker(state), Time::ORIGIN);
     }
     for (j, &d) in demand.iter().enumerate() {
         let est = match arm {
@@ -159,7 +161,7 @@ pub fn simulate_device(sc: &DeviceScenario, arm: DeviceArm) -> DeviceMetrics {
             demand: Resources::mem(1).with_dev_gb(est),
             ..Default::default()
         };
-        p.handle(Input::Submit(spec), Time::ZERO);
+        p.handle(Input::Submit(spec), Time::ORIGIN);
     }
     let mut ws: Vec<Wk> = (0..sc.workers).map(|_| Wk::default()).collect();
     // Completion events `(worker, version)`, ties broken by worker.
@@ -189,7 +191,7 @@ pub fn simulate_device(sc: &DeviceScenario, arm: DeviceArm) -> DeviceMetrics {
     let mut finished = vec![false; n];
     let place = |p: &mut Scheduler, ws: &mut Vec<Wk>, queue: &mut Queue<(usize, u64)>, now: f64| {
         let mut touched: Vec<usize> = Vec::new();
-        for o in p.poll(Time::from_secs_f64(now)) {
+        for o in p.poll(Time(Duration::from_secs_f64(now))) {
             let (job, attempt, w, start) = match o {
                 Output::Start {
                     job,
@@ -235,7 +237,7 @@ pub fn simulate_device(sc: &DeviceScenario, arm: DeviceArm) -> DeviceMetrics {
                     job: r.job,
                     attempt: r.attempt,
                 },
-                Time::from_secs_f64(now),
+                Time(Duration::from_secs_f64(now)),
             );
             done += 1;
         }

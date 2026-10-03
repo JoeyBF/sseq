@@ -80,7 +80,7 @@ fn run(sink: impl EventSink + 'static) {
     // Completions: (time, job, attempt).
     let mut ends: Vec<(f64, JobId, Attempt)> = Vec::new();
     let poll = |p: &mut Logged<Scheduler>, t: f64, ends: &mut Vec<(f64, JobId, Attempt)>| {
-        for o in p.poll(Time::from_secs_f64(t)) {
+        for o in p.poll(Time(Duration::from_secs_f64(t))) {
             if let Output::Start {
                 job: j, attempt, ..
             } = o
@@ -90,7 +90,7 @@ fn run(sink: impl EventSink + 'static) {
         }
     };
     for w in 0..WORKERS {
-        p.handle(Input::Worker(state(w)), Time::ZERO);
+        p.handle(Input::Worker(state(w)), Time::ORIGIN);
         poll(&mut p, 0.0, &mut ends);
     }
     let mut next_arrival = 0;
@@ -107,7 +107,7 @@ fn run(sink: impl EventSink + 'static) {
         if t == next_beat {
             next_beat += HEARTBEAT;
             for w in 0..WORKERS {
-                p.handle(Input::Worker(state(w)), Time::from_secs_f64(t));
+                p.handle(Input::Worker(state(w)), Time(Duration::from_secs_f64(t)));
                 poll(&mut p, t, &mut ends);
             }
             continue;
@@ -130,10 +130,13 @@ fn run(sink: impl EventSink + 'static) {
                     ..TaskInfo::default()
                 },
             );
-            p.handle(Input::Submit(spec), Time::from_secs_f64(t));
+            p.handle(Input::Submit(spec), Time(Duration::from_secs_f64(t)));
         } else {
             let (_, job, attempt) = ends.pop().unwrap();
-            p.handle(Input::Done { job, attempt }, Time::from_secs_f64(t));
+            p.handle(
+                Input::Done { job, attempt },
+                Time(Duration::from_secs_f64(t)),
+            );
             done += 1;
         }
         poll(&mut p, t, &mut ends);
@@ -205,8 +208,8 @@ fn logged_run_replays_exactly() {
     for (a, b) in original.iter().zip(&replay) {
         assert_eq!((a.0, &a.1), (b.0, &b.1), "job {} placed elsewhere", a.0);
         assert!(
-            a.2.since(b.2).max(b.2.since(a.2)) < Duration::from_micros(1),
-            "job {} placed at {} vs {}",
+            (a.2 - b.2).max(b.2 - a.2) < Duration::from_micros(1),
+            "job {} placed at {:?} vs {:?}",
             a.0,
             a.2,
             b.2
