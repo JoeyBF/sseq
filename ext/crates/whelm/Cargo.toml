@@ -1,0 +1,27 @@
+[package]
+name = "whelm"
+version = "0.1.0"
+authors = ["Joey Beauvais-Feisthauer <joeybf@wayne.edu>"]
+edition = "2024"
+description = "Pure, deterministic, resource-aware job placement (priority, backfill, best-fit) with an optional dependency-DAG layer"
+license = "MIT OR Apache-2.0"
+
+# Standalone: not a member of the `ext` workspace, so it builds, locks and tests on its own.
+[workspace]
+
+[features]
+default = ["serde"]
+# Snapshot/reload of the declared DAG (`DagScheduler::snapshot` / `restore`).
+serde = ["dep:serde"]
+# The JSONL event-log writer (`log::JsonlSink`).
+log = ["serde", "dep:serde_json", "dep:flate2"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"], optional = true }
+# `float_roundtrip`: a logged run replays exactly only if its times read back bit for bit.
+serde_json = { version = "1", features = ["float_roundtrip"], optional = true }
+flate2 = { version = "1", optional = true }
+
+[dev-dependencies]
+proptest = "1.7.0"
+serde_json = { version = "1", features = ["float_roundtrip"] }
