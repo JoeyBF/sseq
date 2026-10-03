@@ -94,16 +94,15 @@ pub enum Order {
 }
 
 impl Order {
-    /// The scheduler's order terms, whether the DAG layer sets ranks, and whether ranks and plans
-    /// see true costs.
-    fn terms(self) -> (Vec<OrderTerm>, bool, bool) {
+    /// The scheduler's order terms, and whether ranks and plans see true costs.
+    fn terms(self) -> (Vec<OrderTerm>, bool) {
         use OrderTerm::{Group, Priority, Rank};
         match self {
-            Self::Group => (vec![Group], false, false),
-            Self::Rank { oracle } => (vec![Rank, Group], true, oracle),
-            Self::GroupRank { oracle } => (vec![Group, Rank], true, oracle),
-            Self::Heft { oracle } => (vec![Priority, Group], false, oracle),
-            Self::Wspt => (Config::weighted_completion().order, false, false),
+            Self::Group => (vec![Group], false),
+            Self::Rank { oracle } => (vec![Rank, Group], oracle),
+            Self::GroupRank { oracle } => (vec![Group, Rank], oracle),
+            Self::Heft { oracle } => (vec![Priority, Group], oracle),
+            Self::Wspt => (Config::weighted_completion().order, false),
         }
     }
 }
@@ -187,7 +186,7 @@ impl SmallInstance {
 /// each job at their speed (exclusive slots, i.e. linear processor sharing). A speculative attempt
 /// holds its own slot until the first attempt of its job finishes and the other is stopped.
 pub fn simulate_small(inst: &SmallInstance, plan: &SmallPlan) -> SmallResult {
-    let (order, rank, oracle) = plan.order.terms();
+    let (order, oracle) = plan.order.terms();
     let policy = Scheduler::new(Config {
         order,
         age_limit: plan.age_limit,
@@ -197,7 +196,6 @@ pub fn simulate_small(inst: &SmallInstance, plan: &SmallPlan) -> SmallResult {
     });
     let mut dag = DagScheduler::new(
         DagConfig {
-            rank_priority: rank,
             default_work: 0.0,
             rank_epsilon: 0.0,
             ..DagConfig::default()

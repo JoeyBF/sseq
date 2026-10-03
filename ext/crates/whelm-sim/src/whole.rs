@@ -9,8 +9,8 @@ use std::{
 use serde::Serialize;
 use whelm::{
     Config, Constraint, DagConfig, DagJob, DagScheduler, DagTemplate, GroupOrder, Input, JobId,
-    JobSpec, NodeSource, OrderTerm, Output, Policy, PolicyStats, Resources, Scheduler, Selector,
-    Strength, TemplateNode, Unit, WorkerState,
+    JobSpec, NodeSource, OrderTerm, Output, Policy, Resources, Scheduler, Selector, Strength, Unit,
+    WorkerState,
 };
 
 use crate::{
@@ -515,8 +515,8 @@ struct Bideg {
     pool_est: f64,
     pool_true: f64,
     shape_sum: f64,
-    /// The walk's template, if it runs: the profile's signature DAG with the signatures that do
-    /// not run here as passthroughs.
+    /// The walk's template, if it runs: the profile's signature DAG, whose signatures that do not
+    /// run here [`Walks`] makes passthroughs.
     walk: Option<Arc<DagTemplate>>,
 }
 
@@ -553,25 +553,6 @@ pub struct World {
 /// Ids: bidegree `k` has its zero step `4k`, its "registered" passthrough `4k + 1` and its "walk
 /// done" passthrough `4k + 2`; signature `i` of bidegree `k` is `SIG_BASE + offsets[k] + i`.
 const SIG_BASE: JobId = 1 << 62;
-
-/// The profile index of a bidegree that has one.
-fn pi_of(b: &Bideg) -> usize {
-    b.profile.expect("a bidegree with a walk has a profile")
-}
-
-/// A profile's signature DAG with the signatures that do not run (`!runs[i]`) as passthroughs,
-/// which complete by themselves. Work comes from the simulation's [`NodeSource`].
-fn walk_template(profile: &DagTemplate, runs: &[bool]) -> DagTemplate {
-    let nodes = (runs.iter())
-        .map(|&r| match r {
-            true => TemplateNode::Job(1.0),
-            false => TemplateNode::Pass(0.0),
-        })
-        .collect();
-    let edges =
-        (0..profile.len()).flat_map(|a| profile.successors(a).iter().map(move |&b| (a as u32, b)));
-    DagTemplate::with_nodes(nodes, edges).expect("a profile's signature DAG is acyclic")
-}
 
 /// What a job id names.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -654,8 +635,6 @@ impl World {
             dims,
         };
         let mut offset = 0u64;
-        // Walk templates by profile and the set of signatures that run.
-        let mut walks: HashMap<(usize, Vec<bool>), Arc<DagTemplate>> = HashMap::new();
         for k in 0..w.bideg.len() {
             w.offsets.push(offset);
             let (s, t) = (w.bideg[k].s, w.bideg[k].t);
@@ -699,24 +678,10 @@ impl World {
                 w.bideg[k].tasks = tasks;
                 w.bideg[k].work_true = work;
                 if w.bideg[k].live {
-                    let runs: Vec<bool> = (0..info.template.len())
-                        .map(|i| w.sig_work(k, i, true) > 0.0)
-                        .collect();
-                    let walk =
-                        walks
-                            .entry((pi_of(&w.bideg[k]), runs))
-                            .or_insert_with_key(|(_, runs)| {
-                                Arc::new(walk_template(&info.template, runs))
-                            });
-                    w.bideg[k].walk = Some(Arc::clone(walk));
+                    w.bideg[k].walk = Some(Arc::clone(&info.template));
                 }
             }
         }
-        eprintln!(
-            "[whole] {} walk templates over {} profiles",
-            walks.len(),
-            w.profiles.len()
-        );
         w
     }
 
@@ -1205,49 +1170,8 @@ struct Wk {
     ps: PsWorker,
 }
 
-/// A policy whose placements can be held back. Closed, its [`Policy::poll`] places nothing and
-/// returns nothing, so that a [`DagScheduler`]'s poll only drains the DAG layer's announcements:
-/// the simulated coordinator releases the jobs announced ready (through today's caps) before
-/// anything is placed. Without it a poll would place the jobs already waiting into the free slots
-/// before the newly ready ones were released.
-struct Gate<P> {
-    inner: P,
-    open: bool,
-}
-
-impl<P: Policy> Policy for Gate<P> {
-    /// Forwarded.
-    fn handle(&mut self, input: Input, now: f64) {
-        self.inner.handle(input, now);
-    }
-
-    /// Forwarded while open; nothing while closed.
-    fn poll(&mut self, now: f64) -> Vec<Output> {
-        if self.open {
-            self.inner.poll(now)
-        } else {
-            Vec::new()
-        }
-    }
-
-    /// Forwarded.
-    fn next_wakeup(&self) -> Option<f64> {
-        self.inner.next_wakeup()
-    }
-
-    /// Forwarded.
-    fn explain(&self, job: JobId) -> Option<String> {
-        self.inner.explain(job)
-    }
-
-    /// Forwarded.
-    fn stats(&self) -> PolicyStats {
-        self.inner.stats()
-    }
-}
-
 /// The simulated coordinator's DAG layer.
-type Dag = DagScheduler<Gate<Scheduler>>;
+type Dag = DagScheduler<Scheduler>;
 
 /// The walks' signatures, as the DAG layer's [`NodeSource`]: walk `4k + 2`'s leaf `i` is
 /// signature `i` of bidegree `k`.
@@ -1264,6 +1188,12 @@ impl NodeSource for Walks {
     fn work(&self, unit: JobId, leaf: u32) -> f64 {
         let (k, i) = ((unit / 4) as usize, leaf as usize);
         self.world.sig_work(k, i, self.oracle)
+    }
+
+    /// The signature does not run at this bidegree: it has no true work.
+    fn passthrough(&self, unit: JobId, leaf: u32) -> bool {
+        let (k, i) = ((unit / 4) as usize, leaf as usize);
+        self.world.sig_work(k, i, true) <= 0.0
     }
 
     /// Pins a critical signature to the fast class.
@@ -1367,8 +1297,8 @@ impl SigGates {
 /// [`WorkerState::speed`] is its class's single-job throughput, or 1 when speeds are learned).
 ///
 /// The whole DAG is declared up front: per bidegree `k`, its zero step `4k`, its walk `4k + 2`
-/// (a unit of its walk template whose leaves' costs come from the world, or a passthrough when it
-/// has none) and its "registered" passthrough `4k + 1`. The DAG layer materialises each walk when
+/// (a unit of its profile's signature DAG whose leaves' costs, and which of them run, come from
+/// the world, or a passthrough when it has none) and its "registered" passthrough `4k + 1`. The DAG layer materialises each walk when
 /// its zero step completes.
 pub fn simulate(
     world: &World,
@@ -1440,17 +1370,13 @@ pub fn simulate(
     };
     let mut dag: Dag = DagScheduler::new(
         DagConfig {
-            rank_priority: rank,
             default_work: 0.0,
             rank_epsilon: place.rank_epsilon,
             auto_submit: false,
             record_passthrough: true,
             track_ranks: rank,
         },
-        Gate {
-            inner: policy,
-            open: false,
-        },
+        policy,
     )
     .with_source(Arc::new(source));
     let mut workers: Vec<Wk> = Vec::new();
@@ -1542,9 +1468,8 @@ pub fn simulate(
     loop {
         // Newly ready jobs: release them (through the simulated coordinator's caps) before
         // anything is placed.
-        dag.policy_mut().open = false;
         let mut announced = std::mem::take(&mut carry);
-        announced.extend(dag.poll(now));
+        announced.extend(dag.announcements());
         for o in &announced {
             let &Output::Ready { job: id } = o else {
                 continue;
@@ -1584,7 +1509,6 @@ pub fn simulate(
             }
         }
         peak_open = peak_open.max(open);
-        dag.policy_mut().open = true;
         let c = std::time::Instant::now();
         let out = dag.poll(now);
         dispatch_us.push(c.elapsed().as_secs_f64() * 1e6);

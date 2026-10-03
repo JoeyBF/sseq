@@ -3,7 +3,7 @@
 use std::{path::PathBuf, time::Instant};
 
 use clap::Parser;
-use whelm::{Config, DagConfig, Reservations, Scheduler, ScoreTerm};
+use whelm::{Config, DagConfig, OrderTerm, Reservations, Scheduler, ScoreTerm};
 use whelm_sim::{
     model::{ClassCurve, PsModel, fit},
     run::{Baseline, BoxPolicy, Metrics, SimSetup, Usage, production, simulate},
@@ -99,7 +99,12 @@ fn make_policy(name: &str, a: &Args) -> Option<BoxPolicy> {
         per_class: a.per_class,
         shadow_backfill: false,
     };
+    let order = match a.rank {
+        true => vec![OrderTerm::Priority, OrderTerm::Rank, OrderTerm::Group],
+        false => Config::default().order,
+    };
     let backfill = Config {
+        order,
         reservations: Some(reservations),
         age_limit: a.age_limit,
         score: vec![ScoreTerm::Preferred, ScoreTerm::Load],
@@ -254,10 +259,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         baseline,
         replay_rss: !args.no_rss,
         heartbeat_s: args.heartbeat,
-        closed_loop: args.closed.then(|| DagConfig {
-            rank_priority: args.rank,
-            ..DagConfig::default()
-        }),
+        closed_loop: args.closed.then(DagConfig::default),
         big_gb: args.big_gb,
         explain: args.explain,
         est_scale: args.est_scale,
