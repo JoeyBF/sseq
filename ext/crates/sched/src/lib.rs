@@ -20,7 +20,8 @@ pub use config::{
 #[cfg(feature = "serde")]
 pub use dag::DagSnapshot;
 pub use dag::{
-    DagConfig, DagError, DagJob, DagScheduler, DagStats, DagTemplate, InstanceSpec, NodeLabel,
+    DagConfig, DagError, DagJob, DagScheduler, DagStats, DagTemplate, NodeSource, TemplateNode,
+    Unit,
 };
 pub use scheduler::Scheduler;
 #[cfg(feature = "serde")]

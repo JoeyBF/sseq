@@ -1,6 +1,6 @@
-//! Driving a coordinator from the DAG layer: per-node demands and labels, opening a walk with
-//! nodes already complete, closing a walk early, coordinator-local jobs, and snapshot/restore of
-//! an open frontier.
+//! Driving a coordinator from the DAG layer: per-node demands and labels from a node source,
+//! entering a walk with leaves already complete, closing a walk early, coordinator-local jobs, and
+//! snapshot/restore of an open frontier.
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashSet},
@@ -9,8 +9,8 @@ use std::{
 
 use proptest::prelude::*;
 use sched::{
-    Attempt, Config, DagConfig, DagJob, DagScheduler, DagTemplate, Input, InstanceSpec, JobId,
-    JobSpec, MEM, NodeLabel, Output, Policy, Resources, Scheduler, WorkerState,
+    Attempt, Config, DagConfig, DagJob, DagScheduler, DagTemplate, Input, JobId, JobSpec, MEM,
+    NodeSource, Output, Policy, Resources, Scheduler, Unit, WorkerState,
 };
 
 /// A DAG layer over the default backfill policy with one worker of `slots` slots.
@@ -55,21 +55,15 @@ fn passed(out: &[Output]) -> Vec<JobId> {
         .collect()
 }
 
-/// An instance of `template` at `base`, entered by `entry`, finished as `done`.
-fn instance(template: &Arc<DagTemplate>, base: JobId, entry: JobId, done: JobId) -> InstanceSpec {
-    let n = template.len();
-    InstanceSpec {
-        template: template.clone(),
-        base,
-        entry,
+/// A walk: a unit `done` of `template` at `base`, after `entry`.
+fn walk(template: &Arc<DagTemplate>, base: JobId, entry: JobId, done: JobId) -> Unit {
+    Unit::new(
         done,
-        proto: JobSpec::new(0, Resources::mem(1), 7),
-        work: vec![1.0; n],
-        passthrough: vec![false; n],
-        demand: None,
-        label: None,
-        completed: Vec::new(),
-    }
+        base,
+        template.clone(),
+        JobSpec::new(0, Resources::mem(1), 7),
+        vec![entry],
+    )
 }
 
 /// A local entry job `1` (the zero step), already completed.
@@ -83,29 +77,38 @@ fn with_entry(d: &mut DagScheduler<Scheduler>) {
     done(d, 1, 0, 0.0);
 }
 
-/// R8: each node is submitted with its own demand, and explained under its label.
+/// Per-leaf demands and names, computed on demand.
+struct Squares;
+
+impl NodeSource for Squares {
+    /// Unit work.
+    fn work(&self, _unit: JobId, _leaf: u32) -> f64 {
+        1.0
+    }
+
+    /// Leaf `i` demands `i^2 + 3` bytes.
+    fn spec(&self, _unit: JobId, leaf: u32, spec: &mut JobSpec) {
+        spec.demand = Resources::mem(u64::from(leaf * leaf + 3));
+    }
+
+    /// `Sq(i)`.
+    fn label(&self, _unit: JobId, leaf: u32) -> Option<String> {
+        Some(format!("Sq({leaf})"))
+    }
+}
+
+/// R8: each leaf of a sourced unit is submitted with its own demand, and explained under its
+/// label.
 #[test]
 fn per_node_demand_and_label() {
-    let mut d = sched(16, DagConfig::default());
+    let mut d = sched(16, DagConfig::default()).with_source(Arc::new(Squares));
     let t = Arc::new(DagTemplate::new(3, []).unwrap());
     d.declare(
         vec![DagJob::new(JobSpec::new(1, Resources::ZERO, 7), vec![]).local()],
         0.0,
     )
     .unwrap();
-    d.open_instance(
-        InstanceSpec {
-            demand: Some(Arc::from(vec![
-                Resources::mem(3),
-                Resources::mem(5),
-                Resources::mem(9),
-            ])),
-            label: Some(NodeLabel(Arc::new(|i| format!("Sq({i})")))),
-            ..instance(&t, 100, 1, 99)
-        },
-        0.0,
-    )
-    .unwrap();
+    d.declare([walk(&t, 100, 1, 99).sourced()], 0.0).unwrap();
     assert!(
         d.explain(101).unwrap().starts_with("[Sq(1)]"),
         "{:?}",
@@ -114,10 +117,10 @@ fn per_node_demand_and_label() {
     assert_eq!(d.poll(0.0), vec![Output::RunLocal { job: 1 }]);
     done(&mut d, 1, 0, 0.0);
     assert_eq!(starts(&d.poll(0.0)).len(), 3);
-    assert_eq!(d.stats().workers[0].placed[MEM], 17);
+    assert_eq!(d.stats().workers[0].placed[MEM], 3 + 4 + 7);
 }
 
-/// The completion order of an instance driven to the end: every round, poll, then complete every
+/// The completion order of a walk driven to the end: every round, poll, then complete every
 /// started job in id order; also returns how often `done` (99) fired.
 fn drive(d: &mut DagScheduler<Scheduler>) -> (Vec<JobId>, usize) {
     let mut order = Vec::new();
@@ -153,7 +156,7 @@ fn template() -> impl Strategy<Value = (usize, Vec<(u32, u32)>)> {
 }
 
 proptest! {
-    /// R9: opening with a completed set S behaves exactly like the template without S, every
+    /// R9: entering with a completed set S behaves exactly like the template without S, every
     /// edge out of S satisfied: the same nodes run afterwards, round by round (every ready node
     /// runs each round), `done` fires once, and no node of S ever runs.
     #[test]
@@ -171,10 +174,9 @@ proptest! {
         let cfg = DagConfig { record_passthrough: true, ..DagConfig::default() };
         let mut a = sched(1000, cfg.clone());
         with_entry(&mut a);
-        a.open_instance(InstanceSpec { completed: s.clone(), ..instance(&t, 100, 1, 99) }, 0.0)
-            .unwrap();
-        // The reference: the nodes outside S, declared explicitly after the entry, and `done`
-        // as a passthrough after all of them.
+        a.declare([walk(&t, 100, 1, 99).with_completed(s.clone())], 0.0).unwrap();
+        // The reference: the nodes outside S, declared as plain jobs after the entry, and `done`
+        // as a passthrough after all of them and the entry.
         let mut b = sched(1000, cfg);
         with_entry(&mut b);
         let rest: Vec<u32> = (0..n as u32).filter(|i| !s.contains(i)).collect();
@@ -191,7 +193,8 @@ proptest! {
                 DagJob::new(JobSpec::new(100 + JobId::from(i), Resources::mem(1), 7), deps)
             })
             .collect();
-        let nodes = rest.iter().map(|&i| 100 + JobId::from(i)).collect();
+        let mut nodes: Vec<JobId> = rest.iter().map(|&i| 100 + JobId::from(i)).collect();
+        nodes.push(1);
         jobs.push(DagJob::passthrough(99, 7, nodes, 0.0));
         b.declare(jobs, 0.0).unwrap();
         let (order_a, done_a) = drive(&mut a);
@@ -206,10 +209,10 @@ proptest! {
     }
 }
 
-/// R10: closing early completes `done` once, withdraws waiting nodes, and returns the running
+/// R10: closing early completes the walk once, withdraws waiting leaves, and returns the running
 /// ones, whose later completions only free their resources.
 #[test]
-fn close_instance_early() {
+fn close_walk_early() {
     let cfg = DagConfig {
         record_passthrough: true,
         ..DagConfig::default()
@@ -218,7 +221,7 @@ fn close_instance_early() {
     with_entry(&mut d);
     // Four independent nodes, a chain after them; two slots.
     let t = Arc::new(DagTemplate::new(6, [(0, 4), (1, 4), (4, 5)]).unwrap());
-    d.open_instance(instance(&t, 100, 1, 99), 0.0).unwrap();
+    d.declare([walk(&t, 100, 1, 99)], 0.0).unwrap();
     // Something after the walk.
     d.declare(
         vec![DagJob::new(
@@ -229,15 +232,15 @@ fn close_instance_early() {
     )
     .unwrap();
     assert_eq!(starts(&d.poll(0.0)), vec![100, 101]);
-    let mut running = d.close_instance(99, 1.0).unwrap();
+    let mut running = d.close(99, 1.0).unwrap();
     running.sort_unstable();
     assert_eq!(running, vec![100, 101]);
-    // `done` passed, and the walk's dependent is ready, but both slots are still taken.
+    // The walk passed, and its dependent is ready, but both slots are still taken.
     assert_eq!(d.poll(1.0), vec![Output::Passed { job: 99 }]);
     // The waiting nodes were withdrawn.
     let st = d.stats();
     assert_eq!((st.waiting, st.running), (1, 2));
-    assert!(d.close_instance(99, 1.0).is_err(), "closed twice");
+    assert!(d.close(99, 1.0).is_err(), "closed twice");
     // Ignored completions free their slots and change nothing else.
     done(&mut d, 100, 1, 2.0);
     done(&mut d, 101, 1, 2.0);
@@ -283,11 +286,11 @@ fn local_jobs_stay_on_the_caller() {
     assert_eq!(d.stats().placements_total, 1);
 }
 
-/// A random workload: explicit jobs (some local) with dependencies on earlier ones, and walks
-/// (instances) entered by an explicit job and depended on by a later one.
+/// A random workload: plain jobs (some local) with dependencies on earlier ones, and walks
+/// (units) entered after a plain job and depended on by a later one.
 #[derive(Clone, Debug)]
 struct Workload {
-    explicit: Vec<(Vec<usize>, bool)>,
+    plain: Vec<(Vec<usize>, bool)>,
     walks: Vec<(usize, usize, Vec<(u32, u32)>, usize)>,
 }
 
@@ -313,7 +316,7 @@ fn workload() -> impl Strategy<Value = Workload> {
     )
         .prop_map(|(ex, walks)| {
             let n = ex.len();
-            let explicit = ex
+            let plain = ex
                 .into_iter()
                 .enumerate()
                 .map(|(i, (deps, local))| {
@@ -337,7 +340,7 @@ fn workload() -> impl Strategy<Value = Workload> {
                     (entry, len, edges, after)
                 })
                 .collect();
-            Workload { explicit, walks }
+            Workload { plain, walks }
         })
 }
 
@@ -352,12 +355,12 @@ fn done_id(w: usize) -> JobId {
     500 + w as JobId
 }
 
-/// Declare the workload. A walk's `done` is depended on by a fresh explicit job (`600 + w`),
-/// which a later explicit job `after` also waits for only if `after > entry` (no cycles).
+/// Declare the workload. A walk's `done` is depended on by a fresh plain job (`600 + w`),
+/// which a later plain job `after` also waits for only if `after > entry` (no cycles).
 fn declare(d: &mut DagScheduler<Scheduler>, w: &Workload) -> BTreeSet<JobId> {
     let mut all = BTreeSet::new();
     let mut jobs = Vec::new();
-    for (i, (deps, local)) in w.explicit.iter().enumerate() {
+    for (i, (deps, local)) in w.plain.iter().enumerate() {
         let mut deps: Vec<JobId> = deps.iter().map(|&j| ex_id(j)).collect();
         for (k, walk) in w.walks.iter().enumerate() {
             if walk.3 == i && walk.3 > walk.0 {
@@ -380,7 +383,7 @@ fn declare(d: &mut DagScheduler<Scheduler>, w: &Workload) -> BTreeSet<JobId> {
     for (k, (entry, len, edges, _)) in w.walks.iter().enumerate() {
         let t = Arc::new(DagTemplate::new(*len, edges.iter().copied()).unwrap());
         let base = WALK_BASE + 100 * k as JobId;
-        d.open_instance(instance(&t, base, ex_id(*entry), done_id(k)), 0.0)
+        d.declare([walk(&t, base, ex_id(*entry), done_id(k))], 0.0)
             .unwrap();
         all.extend((0..*len).map(|i| base + i as JobId));
     }
@@ -402,6 +405,7 @@ fn run(w: &Workload, restarts: &BTreeSet<usize>) -> Result<BTreeMap<JobId, usize
             d = DagScheduler::restore(
                 serde_json::from_str(&snap).unwrap(),
                 Scheduler::new(Config::default()),
+                None,
                 t,
             );
             join(&mut d, 3, t);
@@ -455,7 +459,7 @@ proptest! {
     }
 }
 
-/// Nodes completed before the walk's entry (a checkpoint replayed early) do not release their
+/// Leaves completed before the walk's entry (a checkpoint replayed early) do not release their
 /// successors until the entry completes.
 #[test]
 fn nothing_runs_before_the_entry() {
@@ -466,11 +470,8 @@ fn nothing_runs_before_the_entry() {
     )
     .unwrap();
     let t = Arc::new(DagTemplate::new(2, [(0, 1)]).unwrap());
-    let spec = InstanceSpec {
-        completed: vec![0],
-        ..instance(&t, 100, 1, 99)
-    };
-    d.open_instance(spec, 0.0).unwrap();
+    d.declare([walk(&t, 100, 1, 99).with_completed(vec![0])], 0.0)
+        .unwrap();
     assert_eq!(
         starts(&d.poll(0.0)),
         vec![1],

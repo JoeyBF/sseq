@@ -1,11 +1,11 @@
-//! Passthrough jobs, work updates, templates, and the avoid/class constraints.
+//! Passthrough jobs, work updates, templates and substitution, and the avoid/class constraints.
 
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, sync::Arc};
 
 use proptest::prelude::*;
 use sched::{
     Config, DagConfig, DagError, DagJob, DagScheduler, DagTemplate, Input, JobId, JobSpec, Output,
-    Policy, Resources, Scheduler, WorkerId, WorkerState,
+    Policy, Resources, Scheduler, TemplateNode, Unit, WorkerId, WorkerState,
 };
 
 /// A DAG layer over one 64-slot worker.
@@ -171,28 +171,28 @@ fn critical_nodes_lie_on_the_longest_chain() {
     );
 }
 
-/// Two instances of a template chain through their entry dependencies.
+/// Two units of a template chain through their dependencies.
 #[test]
-fn templates_instantiate_per_group() {
-    // A diamond, instantiated twice; group 2's sources wait for group 1's sink.
-    let t = DagTemplate::new(4, [(0, 1), (0, 2), (1, 3), (2, 3)]).unwrap();
+fn units_of_a_template() {
+    // A diamond whose node 2 is a passthrough, twice; unit 2 waits for unit 1.
+    let t = Arc::new(
+        DagTemplate::with_nodes(
+            vec![
+                TemplateNode::Job(1.0),
+                TemplateNode::Job(1.0),
+                TemplateNode::Pass(0.0),
+                TemplateNode::Job(1.0),
+            ],
+            [(0, 1), (0, 2), (1, 3), (2, 3)],
+        )
+        .unwrap(),
+    );
     let mut d = dag(DagConfig::default());
     for g in 1..=2u64 {
-        let entry: Vec<JobId> = if g == 2 { vec![13] } else { vec![] };
-        d.declare_template(
-            &t,
-            |i| g * 10 + i as JobId,
-            |i| {
-                if i == 2 {
-                    DagJob::passthrough(0, g, vec![], 0.0)
-                } else {
-                    DagJob::new(JobSpec::new(0, Resources::mem(1), g), vec![])
-                }
-            },
-            &entry,
-            0.0,
-        )
-        .unwrap();
+        let deps: Vec<JobId> = if g == 2 { vec![101] } else { vec![] };
+        let spec = JobSpec::new(0, Resources::mem(1), g);
+        d.declare([Unit::new(100 + g, g * 10, t.clone(), spec, deps)], 0.0)
+            .unwrap();
     }
     let mut order = Vec::new();
     for step in 0..10 {
@@ -205,6 +205,72 @@ fn templates_instantiate_per_group() {
     }
     let flat: Vec<JobId> = order.into_iter().flatten().collect();
     assert_eq!(flat, vec![10, 11, 13, 20, 21, 23]);
+}
+
+/// A substituted unit numbers its leaves after the enclosing node's offset, weighs its span in
+/// bottom levels, and runs in place of its node.
+#[test]
+fn substituted_units() {
+    // inner: 0 -> 1 (work 2, 3); outer: job 0 -> inner -> job 2, and an isolated job 3.
+    let inner = Arc::new(
+        DagTemplate::with_nodes(
+            vec![TemplateNode::Job(2.0), TemplateNode::Job(3.0)],
+            [(0, 1)],
+        )
+        .unwrap(),
+    );
+    let outer = Arc::new(
+        DagTemplate::with_nodes(
+            vec![
+                TemplateNode::Job(1.0),
+                TemplateNode::Unit(inner.clone()),
+                TemplateNode::Job(4.0),
+                TemplateNode::Job(1.0),
+            ],
+            [(0, 1), (1, 2)],
+        )
+        .unwrap(),
+    );
+    assert_eq!(outer.leaves(), 5);
+    assert_eq!(
+        (0..4).map(|i| outer.leaf_offset(i)).collect::<Vec<_>>(),
+        vec![0, 1, 3, 4]
+    );
+    assert_eq!(inner.span(), 5.0);
+    assert_eq!(outer.span(), 10.0);
+    let mut d = dag(DagConfig {
+        rank_epsilon: 0.0,
+        ..DagConfig::default()
+    });
+    let spec = JobSpec::new(0, Resources::mem(1), 0);
+    d.declare(
+        [
+            Unit::new(1, 10, outer, spec, vec![]).with_scale(2.0),
+            job(2, &[1]).with_work(7.0).into(),
+        ],
+        0.0,
+    )
+    .unwrap();
+    // Leaf 12 (inner node 1): 2 * (3 + 4) + 7.
+    assert_eq!(d.rank(12), Some(21.0));
+    assert_eq!(d.rank(1), Some(27.0));
+    assert_eq!(placed(&mut d, 0.0), vec![10, 14]);
+    assert!(
+        d.explain(11).unwrap().contains("to be entered"),
+        "{:?}",
+        d.explain(11)
+    );
+    complete(&mut d, 10, 1.0);
+    assert_eq!(placed(&mut d, 1.0), vec![11]);
+    assert_eq!(d.dag_stats().frames, 2);
+    complete(&mut d, 11, 2.0);
+    assert_eq!(placed(&mut d, 2.0), vec![12]);
+    complete(&mut d, 12, 3.0);
+    assert_eq!(placed(&mut d, 3.0), vec![13]);
+    complete(&mut d, 13, 4.0);
+    complete(&mut d, 14, 4.0);
+    assert_eq!(placed(&mut d, 4.0), vec![2]);
+    assert_eq!(d.dag_stats().frames, 1, "only job 2's");
 }
 
 /// Forbids and required classes exclude workers; a job excluded everywhere waits and says so.
@@ -297,7 +363,7 @@ proptest! {
         );
         let ids: Vec<JobId> = (0..n as JobId).rev().collect();
         for chunk in ids.chunks(batch) {
-            let jobs = chunk.iter().map(|&i| job(i, &deps[&i]).with_work(work[&i])).collect();
+            let jobs: Vec<DagJob> = chunk.iter().map(|&i| job(i, &deps[&i]).with_work(work[&i])).collect();
             d.declare(jobs, 0.0).unwrap();
         }
         for (j, w) in updates {
