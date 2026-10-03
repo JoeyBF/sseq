@@ -4,13 +4,14 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
     path::Path,
     sync::Arc,
+    time::Duration,
 };
 
 use serde::Serialize;
 use whelm::{
     Config, Constraint, DagConfig, DagJob, DagScheduler, DagTemplate, GroupOrder, Input, JobId,
-    JobSpec, NodeSource, OrderTerm, Output, Policy, Resources, Scheduler, Selector, Strength, Unit,
-    WorkerState,
+    JobSpec, NodeSource, OrderTerm, Output, Policy, Resources, Scheduler, Selector, Strength, Time,
+    Unit, WorkerState,
 };
 
 use crate::{
@@ -685,8 +686,14 @@ impl World {
             }
             if let Some(info) = info {
                 offset += info.template.len() as u64;
-                w.bideg[k].cp_est = info.template.critical_path(|i| w.sig_work(k, i, false));
-                w.bideg[k].cp_true = info.template.critical_path(|i| w.sig_work(k, i, true));
+                let cp = |truth| {
+                    (info.template)
+                        .critical_path(|i| Duration::from_secs_f64(w.sig_work(k, i, truth)))
+                        .as_secs_f64()
+                };
+                let (cp_est, cp_true) = (cp(false), cp(true));
+                w.bideg[k].cp_est = cp_est;
+                w.bideg[k].cp_true = cp_true;
                 let mut tasks = 0;
                 let mut work = 0.0;
                 for i in 0..info.template.len() {
@@ -1036,7 +1043,7 @@ pub enum Plan {
         /// Use the true costs for ranks.
         oracle: bool,
         /// `Config::age_limit`.
-        age_limit: Option<f64>,
+        age_limit: Option<Duration>,
         /// Oldest bidegree first, rank only within a bidegree.
         group_first: bool,
     },
@@ -1072,7 +1079,7 @@ pub struct Placement {
     /// How bidegrees are ordered against each other.
     pub group_key: GroupKey,
     /// Aging for any plan (overrides the rank plans' own).
-    pub age_limit: Option<f64>,
+    pub age_limit: Option<Duration>,
 }
 
 /// The order between bidegrees ("oldest first" and its restart-stable stand-ins).
@@ -1152,7 +1159,10 @@ impl Plan {
                 } else {
                     " (estimated costs)"
                 },
-                age_limit.map_or(String::new(), |a| format!(", aging {a:.0}s"))
+                age_limit.map_or(String::new(), |a| format!(
+                    ", aging {:.0}s",
+                    a.as_secs_f64()
+                ))
             ),
         }
     }
@@ -1214,9 +1224,9 @@ struct Walks {
 
 impl NodeSource for Walks {
     /// The signature's estimated or true work.
-    fn work(&self, unit: JobId, leaf: u32) -> f64 {
+    fn work(&self, unit: JobId, leaf: u32) -> Duration {
         let (k, i) = ((unit / 4) as usize, leaf as usize);
-        self.world.sig_work(k, i, self.oracle)
+        Duration::from_secs_f64(self.world.sig_work(k, i, self.oracle))
     }
 
     /// The signature does not run at this bidegree: it has no true work.
@@ -1259,7 +1269,7 @@ struct SigGates {
 
 impl SigGates {
     /// Signature job `id` of bidegree `k` is ready: release it unless a cap holds it.
-    fn ready(&mut self, dag: &mut Dag, k: usize, id: JobId, now: f64) {
+    fn ready(&mut self, dag: &mut Dag, k: usize, id: JobId, now: Time) {
         if let Some(max) = self.max_open
             && !self.walk_open[k]
         {
@@ -1279,7 +1289,7 @@ impl SigGates {
     }
 
     /// Release signature job `id` of open walk `k`, or queue it behind the per-bidegree cap.
-    fn release(&mut self, dag: &mut Dag, k: usize, id: JobId, now: f64) {
+    fn release(&mut self, dag: &mut Dag, k: usize, id: JobId, now: Time) {
         match self.per_bidegree {
             Some(per) if self.inflight[k] >= per => self.queued.entry(k).or_default().push_back(id),
             _ => {
@@ -1290,7 +1300,7 @@ impl SigGates {
     }
 
     /// A signature job of bidegree `k` completed: release the next one it held back.
-    fn done(&mut self, dag: &mut Dag, k: usize, now: f64) {
+    fn done(&mut self, dag: &mut Dag, k: usize, now: Time) {
         if self.per_bidegree.is_none() {
             return;
         }
@@ -1302,7 +1312,7 @@ impl SigGates {
     }
 
     /// Bidegree `k`'s walk completed: open the walks waiting for its share of the budget.
-    fn walk_done(&mut self, dag: &mut Dag, k: usize, now: f64) {
+    fn walk_done(&mut self, dag: &mut Dag, k: usize, now: Time) {
         let Some(max) = self.max_open else {
             return;
         };
@@ -1390,7 +1400,8 @@ pub fn simulate(
         let marks = (0..n)
             .filter_map(|k| {
                 let t = world.bideg[k].walk.as_ref()?;
-                Some((k, t.critical_nodes(|i| world.sig_work(k, i, false), 1e-9)))
+                let work = |i| Duration::from_secs_f64(world.sig_work(k, i, false));
+                Some((k, t.critical_nodes(work, 1e-9)))
             })
             .collect();
         (fast_class.clone().unwrap_or_default(), marks)
@@ -1402,7 +1413,7 @@ pub fn simulate(
     };
     let mut dag: Dag = DagScheduler::new(
         DagConfig {
-            default_work: 0.0,
+            default_work: Duration::ZERO,
             rank_epsilon: place.rank_epsilon,
             auto_submit: false,
             record_passthrough: true,
@@ -1427,7 +1438,7 @@ pub fn simulate(
                 },
                 ..Default::default()
             };
-            dag.handle(Input::Worker(state), 0.0);
+            dag.handle(Input::Worker(state), Time::ZERO);
             workers.push(Wk {
                 class: class.clone(),
                 ps: PsWorker::default(),
@@ -1457,7 +1468,7 @@ pub fn simulate(
                 ..Default::default()
             },
             deps,
-            work_estimate: Some(0.0),
+            work_estimate: Some(Duration::ZERO),
             passthrough: true,
             ..Default::default()
         }
@@ -1477,7 +1488,7 @@ pub fn simulate(
         let job = DagJob {
             spec: spec(zero, k, "zero", place.pin != Pin::None),
             deps,
-            work_estimate: Some(cost(b.zero_est, b.zero_true)),
+            work_estimate: Some(Duration::from_secs_f64(cost(b.zero_est, b.zero_true))),
             ..Default::default()
         };
         units.push(job.into());
@@ -1499,7 +1510,7 @@ pub fn simulate(
         reg.extend(world.index(b.s, b.t - 1).map(|p| 4 * p as u64 + 1));
         units.push(pass(zero + 1, k, reg));
     }
-    dag.declare(units, 0.0)
+    dag.declare(units, Time::ZERO)
         .expect("the whole-run DAG is acyclic");
 
     let mut queue = Queue::new();
@@ -1522,7 +1533,7 @@ pub fn simulate(
     let mut dispatch_us = Vec::new();
     let mut peak_nodes = 0usize;
     let mut next_sample = 0u64;
-    let mut wake_at = f64::NAN;
+    let mut wake_at = None;
     let mut now = 0.0;
     // Announcements the placing poll returned, for the next instant.
     let mut carry: Vec<Output> = Vec::new();
@@ -1532,6 +1543,7 @@ pub fn simulate(
     loop {
         // Newly ready jobs: release them (through the simulated coordinator's caps) before
         // anything is placed.
+        let at = Time::from_secs_f64(now);
         let mut announced = std::mem::take(&mut carry);
         announced.extend(dag.announcements());
         for o in &announced {
@@ -1545,11 +1557,11 @@ pub fn simulate(
                         Some((cap, _)) if open >= cap => open_queue.push_back(k),
                         _ => {
                             open += 1;
-                            dag.release(id, now);
+                            dag.release(id, at);
                         }
                     }
                 }
-                Node::Sig(k, _) => gates.ready(&mut dag, k, id, now),
+                Node::Sig(k, _) => gates.ready(&mut dag, k, id, at),
                 other => unreachable!("{other:?} is a passthrough"),
             }
         }
@@ -1566,15 +1578,15 @@ pub fn simulate(
                             break;
                         };
                         open += 1;
-                        dag.release(4 * q as u64, now);
+                        dag.release(4 * q as u64, at);
                     }
                 }
-                gates.walk_done(&mut dag, k, now);
+                gates.walk_done(&mut dag, k, at);
             }
         }
         peak_open = peak_open.max(open);
         let c = std::time::Instant::now();
-        let out = dag.poll(now);
+        let out = dag.poll(at);
         dispatch_us.push(c.elapsed().as_secs_f64() * 1e6);
         let mut dirty = Vec::new();
         for o in out {
@@ -1619,10 +1631,10 @@ pub fn simulate(
         }
         // Deferrals expire without an event: wake the policy then.
         if let Some(t) = dag.next_wakeup()
-            && t != wake_at
+            && Some(t) != wake_at
         {
-            wake_at = t;
-            queue.push(t, Ev::Wake);
+            wake_at = Some(t);
+            queue.push(t.as_secs_f64(), Ev::Wake);
         }
         if tasks >= next_sample {
             next_sample = tasks + NODE_SAMPLE_TASKS;
@@ -1636,6 +1648,7 @@ pub fn simulate(
             break;
         };
         now = t;
+        let at = Time::from_secs_f64(now);
         for ev in events {
             let Ev::Done(w, v) = ev else {
                 // Stale wakeups (for jobs placed before their deadline) are harmless no-ops.
@@ -1662,10 +1675,10 @@ pub fn simulate(
                         job: id,
                         attempt: r.attempt,
                     },
-                    now,
+                    at,
                 );
                 if let Node::Sig(k, _) = world.node(id) {
-                    gates.done(&mut dag, k, now);
+                    gates.done(&mut dag, k, at);
                 }
             }
             schedule(&mut workers[w], w, model, now, &mut queue);
@@ -1699,7 +1712,9 @@ pub fn simulate(
                 Pin::Critical => ", critical pinned to fast (CPOP)",
             }
             + &match place.age_limit {
-                Some(a) if !matches!(plan, Plan::Rank { .. }) => format!(", aging {a:.0}s"),
+                Some(a) if !matches!(plan, Plan::Rank { .. }) => {
+                    format!(", aging {:.0}s", a.as_secs_f64())
+                }
                 _ => String::new(),
             }
             + match place.group_key {
@@ -1860,7 +1875,7 @@ mod tests {
             Plan::Group,
             Plan::Rank {
                 oracle: false,
-                age_limit: Some(600.0),
+                age_limit: Some(Duration::from_secs(600)),
                 group_first: false,
             },
             Plan::Rank {
@@ -1936,7 +1951,7 @@ mod tests {
         };
         let fast = simulate(&world, &mixed, &model, &Plan::Group, &place(true, None));
         let defer = whelm::Defer {
-            max_wait: 1e6,
+            max_wait: Duration::from_secs(1_000_000),
             min_gain: 0.0,
         };
         let eft = simulate(

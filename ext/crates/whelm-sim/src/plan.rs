@@ -35,7 +35,10 @@ impl SpeedPlan {
     /// A plan-name suffix describing it (empty for speed-oblivious placement on reported speeds).
     pub fn name(&self) -> String {
         let mut s = match (self.fast, self.config.defer) {
-            (_, Some(d)) => format!(", earliest finish (wait <= {:.0}s)", d.max_wait),
+            (_, Some(d)) => format!(
+                ", earliest finish (wait <= {:.0}s)",
+                d.max_wait.as_secs_f64()
+            ),
             (true, None) => ", fast first".into(),
             (false, None) => String::new(),
         };

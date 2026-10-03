@@ -1,11 +1,11 @@
 //! Small flat scheduling instances, their simulation, generators and perturbations (for PISA).
 
-use std::collections::HashMap;
+use std::{collections::HashMap, time::Duration};
 
 use serde::Serialize;
 use whelm::{
     Attempt, Config, DagConfig, DagJob, DagScheduler, Input, JobSpec, OrderTerm, Output, Policy,
-    Resources, Scheduler, WorkerState,
+    Resources, Scheduler, Time, WorkerState,
 };
 
 use crate::{
@@ -116,7 +116,7 @@ pub struct SmallPlan {
     /// Job order.
     pub order: Order,
     /// `Config::age_limit`.
-    pub age_limit: Option<f64>,
+    pub age_limit: Option<Duration>,
     /// Speed-aware placement and the machine model.
     pub speed: SpeedPlan,
 }
@@ -202,7 +202,7 @@ pub fn simulate_small(inst: &SmallInstance, plan: &SmallPlan) -> SmallResult {
     });
     let mut dag = DagScheduler::new(
         DagConfig {
-            default_work: 0.0,
+            default_work: Duration::ZERO,
             rank_epsilon: 0.0,
             ..DagConfig::default()
         },
@@ -222,7 +222,7 @@ pub fn simulate_small(inst: &SmallInstance, plan: &SmallPlan) -> SmallResult {
                 speed: if plan.speed.learned() { 1.0 } else { c.speed },
                 ..Default::default()
             };
-            dag.handle(Input::Worker(state), 0.0);
+            dag.handle(Input::Worker(state), Time::ZERO);
             speed.push(c.speed);
             slow.push(c.speed < fastest);
         }
@@ -248,7 +248,7 @@ pub fn simulate_small(inst: &SmallInstance, plan: &SmallPlan) -> SmallResult {
                         ..Default::default()
                     },
                     deps,
-                    work_estimate: Some(0.0),
+                    work_estimate: Some(Duration::ZERO),
                     passthrough: true,
                     ..Default::default()
                 }
@@ -263,13 +263,18 @@ pub fn simulate_small(inst: &SmallInstance, plan: &SmallPlan) -> SmallResult {
                         ..Default::default()
                     },
                     deps,
-                    work_estimate: Some(if oracle { t.work } else { t.est }),
+                    work_estimate: Some(Duration::from_secs_f64(if oracle {
+                        t.work
+                    } else {
+                        t.est
+                    })),
                     ..Default::default()
                 }
             }
         })
         .collect();
-    dag.declare(jobs, 0.0).expect("small instances are acyclic");
+    dag.declare(jobs, Time::ZERO)
+        .expect("small instances are acyclic");
 
     let n = inst.tasks.len();
     let mut start = vec![f64::NAN; n];
@@ -280,10 +285,10 @@ pub fn simulate_small(inst: &SmallInstance, plan: &SmallPlan) -> SmallResult {
     // Running attempts: (start, worker).
     let mut live: HashMap<(usize, Attempt), (f64, usize)> = HashMap::new();
     let (mut now, mut contention, mut idle_ready) = (0.0f64, 0.0f64, 0.0f64);
-    let mut wake = f64::NAN;
+    let mut wake = None;
     let mut speculations = 0u64;
     loop {
-        for o in dag.poll(now) {
+        for o in dag.poll(Time::from_secs_f64(now)) {
             match o {
                 Output::Start {
                     job,
@@ -304,10 +309,10 @@ pub fn simulate_small(inst: &SmallInstance, plan: &SmallPlan) -> SmallResult {
             }
         }
         if let Some(t) = dag.next_wakeup()
-            && t != wake
+            && Some(t) != wake
         {
-            wake = t;
-            queue.push(t, None);
+            wake = Some(t);
+            queue.push(t.as_secs_f64(), None);
         }
         let Some((t, events)) = queue.pop_instant() else {
             break;
@@ -337,7 +342,7 @@ pub fn simulate_small(inst: &SmallInstance, plan: &SmallPlan) -> SmallResult {
                     job: j as u64,
                     attempt,
                 },
-                now,
+                Time::from_secs_f64(now),
             );
         }
     }

@@ -3,7 +3,7 @@
 use std::{collections::HashMap, io::BufRead, path::Path};
 
 use serde::Deserialize;
-use whelm::{Attempt, Input, MEM, Output, log::TaskInfo};
+use whelm::{Attempt, Input, MEM, Output, Time, log::TaskInfo};
 
 /// A worker of the trace.
 #[derive(Clone, Debug)]
@@ -84,8 +84,9 @@ pub fn group_id(n: i64, s: i64) -> u64 {
 
 /// One line of either format.
 ///
-/// `worker`, `task` and `sample` make up the standalone format; `input`, `poll` and `reserved` are
-/// the event log ([`whelm::log::Event`]), folded into worker and task records.
+/// `worker`, `task` and `sample` make up the standalone format; `input`, `poll`, `sample` and
+/// `reserved` are the event log ([`whelm::log::Event`]), folded into worker and task records. The
+/// standalone format gives times as seconds (`t_s`), the event log as a [`Time`] (`t`).
 #[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 enum Line {
@@ -97,20 +98,25 @@ enum Line {
     },
     Task(TaskLine),
     Sample {
-        t_s: f64,
+        /// Standalone format.
+        #[serde(default)]
+        t_s: Option<f64>,
+        /// Event log.
+        #[serde(default)]
+        t: Option<Time>,
         worker: String,
         rss_gb: f64,
         reserved_gb: f64,
         running: usize,
     },
     Input {
-        t_s: f64,
+        t: Time,
         input: Input,
         #[serde(default)]
         info: Option<TaskInfo>,
     },
     Poll {
-        t_s: f64,
+        t: Time,
         #[serde(default)]
         out: Vec<Output>,
     },
@@ -199,11 +205,14 @@ impl Trace {
                 }
                 Line::Sample {
                     t_s,
+                    t: at,
                     worker,
                     rss_gb,
                     reserved_gb,
                     running,
                 } => {
+                    let t_s = (t_s.or(at.map(Time::as_secs_f64)))
+                        .ok_or_else(|| format!("line {}: a sample without a time", i + 1))?;
                     let w = index(&mut t, &worker);
                     t.workers[w].samples.push(Sample {
                         t_s,
@@ -212,7 +221,7 @@ impl Trace {
                         running,
                     });
                 }
-                Line::Input { t_s, input, info } => match input {
+                Line::Input { t: at, input, info } => match input {
                     Input::Worker(w) => {
                         let i = index(&mut t, &w.id.to_string());
                         let tw = &mut t.workers[i];
@@ -223,7 +232,7 @@ impl Trace {
                     Input::Submit(spec) => {
                         // A duplicate submission of a live job is ignored by the policy too.
                         pending.entry(spec.id).or_insert(Pending {
-                            ready_s: t_s,
+                            ready_s: at.as_secs_f64(),
                             est_gb: spec.demand[MEM] as f64 / 1e9,
                             group: spec.group,
                             info,
@@ -263,7 +272,7 @@ impl Trace {
                             next: info.next.unwrap_or(0.0),
                             ready_s: p.ready_s,
                             placed_s,
-                            done_s: t_s,
+                            done_s: at.as_secs_f64(),
                             worker,
                             deps: info.deps,
                             sig: info.sig,
@@ -276,7 +285,7 @@ impl Trace {
                     }
                     Input::Failed { .. } | Input::WorkerGone(_) => {}
                 },
-                Line::Poll { t_s, out } => {
+                Line::Poll { t: at, out } => {
                     for o in out {
                         match o {
                             Output::Start {
@@ -285,7 +294,8 @@ impl Trace {
                                 worker,
                             } => {
                                 if let Some(p) = pending.get_mut(&job) {
-                                    p.starts.push((attempt, t_s, worker.to_string()));
+                                    let placed_s = at.as_secs_f64();
+                                    p.starts.push((attempt, placed_s, worker.to_string()));
                                 }
                             }
                             Output::GaveUp(g) => {
@@ -492,8 +502,8 @@ mod tests {
     /// jobs leave no record.
     #[test]
     fn reads_event_log_attempts() {
-        let input = |t_s: f64, input: Input| Event::Input {
-            t_s,
+        let input = |t: u64, input: Input| Event::Input {
+            t: Time::from_secs(t),
             input,
             info: None,
         };
@@ -502,7 +512,10 @@ mod tests {
             attempt,
             worker,
         };
-        let poll = |t_s: f64, out: Vec<Output>| Event::Poll { t_s, out };
+        let poll = |t: u64, out: Vec<Output>| Event::Poll {
+            t: Time::from_secs(t),
+            out,
+        };
         let worker = |id| WorkerState {
             id,
             class: "l40s".into(),
@@ -519,10 +532,10 @@ mod tests {
             })
         };
         let events = vec![
-            input(0.0, Input::Worker(worker(1))),
-            input(0.0, Input::Worker(worker(2))),
+            input(0, Input::Worker(worker(1))),
+            input(0, Input::Worker(worker(2))),
             Event::Input {
-                t_s: 1.0,
+                t: Time::from_secs(1),
                 input: submit(1),
                 info: Some(Box::new(TaskInfo {
                     kind: "zero".into(),
@@ -530,10 +543,10 @@ mod tests {
                     ..TaskInfo::default()
                 })),
             },
-            input(1.0, submit(2)),
-            poll(1.0, vec![start(1, 1, 1), start(2, 1, 1)]),
+            input(1, submit(2)),
+            poll(1, vec![start(1, 1, 1), start(2, 1, 1)]),
             input(
-                2.0,
+                2,
                 Input::Failed {
                     job: 2,
                     attempt: 1,
@@ -541,24 +554,24 @@ mod tests {
                     why: "x".into(),
                 },
             ),
-            poll(2.0, vec![start(2, 2, 2)]),
-            poll(3.0, vec![start(1, 2, 2)]),
-            input(4.0, Input::Done { job: 1, attempt: 2 }),
+            poll(2, vec![start(2, 2, 2)]),
+            poll(3, vec![start(1, 2, 2)]),
+            input(4, Input::Done { job: 1, attempt: 2 }),
             poll(
-                4.0,
+                4,
                 vec![Output::Stop {
                     job: 1,
                     attempt: 1,
                     worker: 1,
                 }],
             ),
-            input(6.0, Input::Done { job: 2, attempt: 2 }),
-            input(6.0, submit(3)),
-            input(6.0, Input::Cancel(3)),
-            input(6.0, submit(4)),
-            poll(6.0, vec![start(4, 1, 1)]),
+            input(6, Input::Done { job: 2, attempt: 2 }),
+            input(6, submit(3)),
+            input(6, Input::Cancel(3)),
+            input(6, submit(4)),
+            poll(6, vec![start(4, 1, 1)]),
             poll(
-                7.0,
+                7,
                 vec![Output::GaveUp(GaveUp {
                     job: 4,
                     tried: Vec::new(),
@@ -566,7 +579,7 @@ mod tests {
                 })],
             ),
             Event::Sample {
-                t_s: 7.0,
+                t: Time::from_secs(7),
                 worker: "1".into(),
                 rss_gb: 3.0,
                 baseline_gb: 1.0,

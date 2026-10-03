@@ -1,6 +1,9 @@
 //! Replay a scheduling trace against the policies and compare them.
 
-use std::{path::PathBuf, time::Instant};
+use std::{
+    path::PathBuf,
+    time::{Duration, Instant},
+};
 
 use clap::Parser;
 use whelm::{Config, DagConfig, OrderTerm, Reservations, Scheduler, ScoreTerm};
@@ -106,7 +109,7 @@ struct Args {
 /// The named policy configured from the command line, or `None` for an unknown name.
 fn make_policy(name: &str, a: &Args) -> Option<BoxPolicy> {
     let reservations = Reservations {
-        reserve_after: a.reserve_after,
+        reserve_after: Duration::from_secs_f64(a.reserve_after),
         max: a.max_reservations,
         per_class: a.per_class,
         shadow_backfill: false,
@@ -118,7 +121,7 @@ fn make_policy(name: &str, a: &Args) -> Option<BoxPolicy> {
     let backfill = Config {
         order,
         reservations: Some(reservations),
-        age_limit: a.age_limit,
+        age_limit: a.age_limit.map(Duration::from_secs_f64),
         score: vec![ScoreTerm::Preferred, ScoreTerm::Load],
         ..Config::default()
     };

@@ -1,9 +1,12 @@
 //! A run logged through [`Logged`] reads back as a trace and replays to the same placements.
 
-use std::sync::{Arc, Mutex};
+use std::{
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use whelm::{
-    Attempt, Config, EventSink, Input, JobId, JobSpec, Output, Policy, Resources, Scheduler,
+    Attempt, Config, EventSink, Input, JobId, JobSpec, Output, Policy, Resources, Scheduler, Time,
     WorkerState,
     log::{Event, JsonlSink, Logged, TaskInfo},
 };
@@ -40,14 +43,14 @@ fn job(i: u64) -> (f64, f64, f64) {
 fn placements(
     events: &[Event],
     name: impl Fn(JobId, u64) -> (JobId, String),
-) -> Vec<(JobId, String, f64)> {
+) -> Vec<(JobId, String, Time)> {
     let mut v = Vec::new();
     for e in events {
-        if let Event::Poll { t_s, out } = e {
+        if let Event::Poll { t, out } = e {
             for o in out {
                 if let Output::Start { job, worker, .. } = o {
                     let (job, worker) = name(*job, *worker);
-                    v.push((job, worker, *t_s));
+                    v.push((job, worker, *t));
                 }
             }
         }
@@ -77,7 +80,7 @@ fn run(sink: impl EventSink + 'static) {
     // Completions: (time, job, attempt).
     let mut ends: Vec<(f64, JobId, Attempt)> = Vec::new();
     let poll = |p: &mut Logged<Scheduler>, t: f64, ends: &mut Vec<(f64, JobId, Attempt)>| {
-        for o in p.poll(t) {
+        for o in p.poll(Time::from_secs_f64(t)) {
             if let Output::Start {
                 job: j, attempt, ..
             } = o
@@ -87,7 +90,7 @@ fn run(sink: impl EventSink + 'static) {
         }
     };
     for w in 0..WORKERS {
-        p.handle(Input::Worker(state(w)), 0.0);
+        p.handle(Input::Worker(state(w)), Time::ZERO);
         poll(&mut p, 0.0, &mut ends);
     }
     let mut next_arrival = 0;
@@ -104,7 +107,7 @@ fn run(sink: impl EventSink + 'static) {
         if t == next_beat {
             next_beat += HEARTBEAT;
             for w in 0..WORKERS {
-                p.handle(Input::Worker(state(w)), t);
+                p.handle(Input::Worker(state(w)), Time::from_secs_f64(t));
                 poll(&mut p, t, &mut ends);
             }
             continue;
@@ -116,7 +119,7 @@ fn run(sink: impl EventSink + 'static) {
                 id,
                 demand: Resources::mem_gb(job(id).2),
                 group: id / 10,
-                work: Some(job(id).1),
+                work: Some(Duration::from_secs_f64(job(id).1)),
                 ..Default::default()
             };
             p.annotate(
@@ -127,10 +130,10 @@ fn run(sink: impl EventSink + 'static) {
                     ..TaskInfo::default()
                 },
             );
-            p.handle(Input::Submit(spec), t);
+            p.handle(Input::Submit(spec), Time::from_secs_f64(t));
         } else {
             let (_, job, attempt) = ends.pop().unwrap();
-            p.handle(Input::Done { job, attempt }, t);
+            p.handle(Input::Done { job, attempt }, Time::from_secs_f64(t));
             done += 1;
         }
         poll(&mut p, t, &mut ends);
@@ -202,7 +205,7 @@ fn logged_run_replays_exactly() {
     for (a, b) in original.iter().zip(&replay) {
         assert_eq!((a.0, &a.1), (b.0, &b.1), "job {} placed elsewhere", a.0);
         assert!(
-            (a.2 - b.2).abs() < 1e-6,
+            a.2.since(b.2).max(b.2.since(a.2)) < Duration::from_micros(1),
             "job {} placed at {} vs {}",
             a.0,
             a.2,

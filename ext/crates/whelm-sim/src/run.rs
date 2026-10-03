@@ -1,10 +1,13 @@
 //! The event-driven replay of a trace against a policy, and its metrics.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::{
+    collections::{BTreeMap, HashMap, HashSet},
+    time::Duration,
+};
 
 use serde::Serialize;
 use whelm::{
-    DagConfig, DagJob, DagScheduler, Input, JobSpec, Output, Policy, Resources, WorkerState,
+    DagConfig, DagJob, DagScheduler, Input, JobSpec, Output, Policy, Resources, Time, WorkerState,
 };
 
 use crate::{
@@ -272,7 +275,7 @@ fn spec(setup: &SimSetup, j: usize) -> JobSpec {
         id: j as u64,
         demand: Resources::mem_gb(t.est_gb * setup.est_scale),
         group: t.group,
-        work: Some(work[j]),
+        work: Some(Duration::from_secs_f64(work[j])),
         ..Default::default()
     }
 }
@@ -374,15 +377,15 @@ pub fn simulate(setup: &SimSetup, name: &str, policy: BoxPolicy) -> Metrics {
                     DagJob {
                         spec: spec(setup, j),
                         deps,
-                        work_estimate: Some(setup.work[j]),
+                        work_estimate: Some(Duration::from_secs_f64(setup.work[j])),
                         ..Default::default()
                     }
                 })
                 .collect();
-            dag.declare(jobs, 0.0)
+            dag.declare(jobs, Time::ZERO)
                 .expect("the trace's dependencies are acyclic");
             // No worker has joined yet: this poll only announces the jobs without dependencies.
-            for o in dag.poll(0.0) {
+            for o in dag.poll(Time::ZERO) {
                 if let Output::Ready { job } = o {
                     queue.push(gaps[job as usize], Ev::Arrive(job as usize));
                 }
@@ -463,12 +466,13 @@ pub fn simulate(setup: &SimSetup, name: &str, policy: BoxPolicy) -> Metrics {
             reserved_idle += free as f64 * (t - prev_t);
         }
         prev_t = t;
+        let now = Time::from_secs_f64(t);
         let mut dirty: Vec<usize> = Vec::new();
         match ev {
             Ev::Join(w) => {
                 advance(&mut ws[w], w, t);
                 let st = state(w, &mut ws[w], t);
-                driver.policy_mut().handle(Input::Worker(st), t);
+                driver.policy_mut().handle(Input::Worker(st), now);
                 queue.push(t + setup.heartbeat_s, Ev::Heartbeat(w));
             }
             Ev::Heartbeat(w) => {
@@ -493,7 +497,7 @@ pub fn simulate(setup: &SimSetup, name: &str, policy: BoxPolicy) -> Metrics {
                     }
                 }
                 let st = state(w, &mut ws[w], t);
-                driver.policy_mut().handle(Input::Worker(st), t);
+                driver.policy_mut().handle(Input::Worker(st), now);
                 if completed < n && t < horizon {
                     queue.push(t + setup.heartbeat_s, Ev::Heartbeat(w));
                 }
@@ -501,9 +505,9 @@ pub fn simulate(setup: &SimSetup, name: &str, policy: BoxPolicy) -> Metrics {
             Ev::Arrive(j) => {
                 arrival[j] = t;
                 match &mut driver {
-                    Driver::Open(p) => p.handle(Input::Submit(spec(setup, j)), t),
+                    Driver::Open(p) => p.handle(Input::Submit(spec(setup, j)), now),
                     Driver::Closed(d) => {
-                        d.release(j as u64, t);
+                        d.release(j as u64, now);
                     }
                 }
             }
@@ -530,14 +534,14 @@ pub fn simulate(setup: &SimSetup, name: &str, policy: BoxPolicy) -> Metrics {
                             job: r.job,
                             attempt: r.attempt,
                         },
-                        t,
+                        now,
                     );
                 }
                 dirty.push(w);
             }
         }
         let clock = std::time::Instant::now();
-        let out = driver.policy_mut().poll(t);
+        let out = driver.policy_mut().poll(now);
         dispatch_us.push(clock.elapsed().as_secs_f64() * 1e6);
         for o in out {
             match o {

@@ -1,6 +1,6 @@
 //! Compare two dispatch plans on many small instances, typically and adversarially (PISA).
 
-use std::path::PathBuf;
+use std::{path::PathBuf, time::Duration};
 
 use clap::Parser;
 use whelm::{Defer, Speculate, SpeedConfig, Timing};
@@ -150,7 +150,7 @@ fn plan(name: &str, max_defer: f64, timing: Timing) -> SmallPlan {
             "eft" => {
                 p.speed.fast = true;
                 p.speed.config.defer = Some(Defer {
-                    max_wait: max_defer,
+                    max_wait: Duration::from_secs_f64(max_defer),
                     min_gain: 0.0,
                 });
             }
@@ -158,12 +158,16 @@ fn plan(name: &str, max_defer: f64, timing: Timing) -> SmallPlan {
                 p.speed.fast = true;
                 p.speed.config.speculate = Some(Speculate::default());
             }
-            s if s.starts_with("age") => p.age_limit = Some(s[3..].parse().expect("+age<seconds>")),
+            s if s.starts_with("age") => {
+                p.age_limit = Some(Duration::from_secs_f64(
+                    s[3..].parse().expect("+age<seconds>"),
+                ))
+            }
             s if s.starts_with("eft") => {
                 let pct: f64 = s[3..].parse().expect("+eft<percent>");
                 p.speed.fast = true;
                 p.speed.config.defer = Some(Defer {
-                    max_wait: max_defer,
+                    max_wait: Duration::from_secs_f64(max_defer),
                     min_gain: pct / 100.0,
                 });
             }

@@ -1,6 +1,6 @@
 //! Simulate a whole Nassau run, built as one DAG a priori, under several dispatch plans.
 
-use std::path::PathBuf;
+use std::{path::PathBuf, time::Duration};
 
 use clap::Parser;
 use whelm::{DagConfig, Defer, Timing};
@@ -70,7 +70,7 @@ struct Args {
     ///
     /// Longer waits catch more fast slots but can leave urgent jobs queued behind scarce ones;
     /// RESULTS.md has the measurements.
-    #[arg(long, default_value_t = Defer::default().max_wait)]
+    #[arg(long, default_value_t = Defer::default().max_wait.as_secs_f64())]
     max_defer: f64,
     /// +eft: wait only if the expected finish improves by this fraction of the job's work.
     ///
@@ -118,7 +118,7 @@ fn hours(s: f64) -> String {
 fn plan_named(name: &str, args: &Args) -> Plan {
     let rank = |oracle, age: bool, group_first| Plan::Rank {
         oracle,
-        age_limit: age.then_some(args.age_limit),
+        age_limit: age.then_some(Duration::from_secs_f64(args.age_limit)),
         group_first,
     };
     match name {
@@ -294,12 +294,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     "eft" => {
                         speed.fast = true;
                         speed.config.defer = Some(Defer {
-                            max_wait: args.max_defer,
+                            max_wait: Duration::from_secs_f64(args.max_defer),
                             min_gain: args.min_gain,
                         });
                     }
                     "learn" => speed.config.timing = Timing::learned(),
-                    "age" => age_limit = Some(args.age_limit),
+                    "age" => age_limit = Some(Duration::from_secs_f64(args.age_limit)),
                     "smajor" => group_key = GroupKey::SMajor,
                     "tmajor" => group_key = GroupKey::TMajor,
                     "stem" => group_key = GroupKey::StemMajor,
