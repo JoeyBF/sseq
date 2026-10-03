@@ -1,4 +1,11 @@
 //! Snapshots of the coarse graph and the materialised units.
+//!
+//! A [`DagSnapshot`] holds what the DAG layer knows and its policy does not: every live unit with
+//! its dependencies, forward references and ranks, the per-node state of entered units, and the
+//! remembered completions. It is plain data, serialised with any serde format; templates shared by
+//! several units are stored once. The policy is not part of it: [`DagScheduler::restore`] puts a
+//! fresh one behind the restored layer and resubmits the jobs the old one had, so a coordinator
+//! restarted from a snapshot loses no job and runs none that had completed.
 
 use std::{collections::HashMap, sync::Arc};
 
@@ -11,8 +18,29 @@ use super::{
 };
 use crate::{Instant, JobId, JobSpec, Output, Policy};
 
-/// A serialisable snapshot of a [`DagScheduler`]'s declared graph (not of its policy); see
-/// [`DagScheduler::snapshot`] and [`DagScheduler::restore`].
+/// A serialisable snapshot of a [`DagScheduler`]'s declared graph (not of its policy).
+///
+/// Taken by [`DagScheduler::snapshot`] and turned back into a scheduler by
+/// [`DagScheduler::restore`]. Its fields are private: it is meant to be stored and read back, not
+/// inspected.
+///
+/// A round trip through JSON:
+///
+/// ```
+/// use whelm::{
+///     Config, DagConfig, DagJob, DagScheduler, DagSnapshot, JobSpec, Resources, Scheduler,
+/// };
+///
+/// let mut dag = DagScheduler::new(DagConfig::default(), Scheduler::new(Config::fifo()));
+/// let job = |id, deps| DagJob::new(JobSpec::new(id, Resources::mem(1), 0), deps);
+/// dag.declare([job(1, vec![]), job(2, vec![1])], 0.0).unwrap();
+///
+/// let json = serde_json::to_string(&dag.snapshot()).unwrap();
+/// let snapshot: DagSnapshot = serde_json::from_str(&json).unwrap();
+/// let restored = DagScheduler::restore(snapshot, Scheduler::new(Config::fifo()), None, 0.0);
+/// assert_eq!(restored.dag_stats(), dag.dag_stats());
+/// assert_eq!(restored.rank(1), Some(2.0));
+/// ```
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DagSnapshot {
     config: DagConfig,
@@ -102,9 +130,50 @@ impl Templates {
 }
 
 impl<P: Policy> DagScheduler<P> {
-    /// A serialisable snapshot of the declared graph (not of the policy): the coarse graph of
-    /// units with their ranks, the materialised state of entered ones, and remembered
-    /// completions. Running jobs of units closed early are not kept.
+    /// A serialisable snapshot of the declared graph (not of the policy).
+    ///
+    /// It holds the coarse graph of units with their ranks, the materialised state of entered
+    /// ones, and remembered completions. Running jobs of units closed early are not kept.
+    ///
+    /// Job 1 completed before the snapshot and job 3 was a forward reference: after restoring, a
+    /// dependency on job 1 is met and declaring job 3 releases job 2.
+    ///
+    /// ```
+    /// use whelm::{
+    ///     Config, DagConfig, DagJob, DagScheduler, Input, JobSpec, Output, Policy, Resources,
+    ///     Scheduler, WorkerState,
+    /// };
+    ///
+    /// let worker = || Input::Worker(WorkerState::new(1, "cpu", 1, Resources::mem(100)));
+    /// let job = |id, deps| DagJob::new(JobSpec::new(id, Resources::mem(1), 0), deps);
+    /// let mut dag = DagScheduler::new(DagConfig::default(), Scheduler::new(Config::fifo()));
+    /// dag.handle(worker(), 0.0);
+    /// dag.declare([job(1, vec![]), job(2, vec![3])], 0.0).unwrap();
+    /// dag.poll(0.0);
+    /// dag.handle(Input::Done { job: 1, attempt: 1 }, 1.0);
+    /// let snapshot = dag.snapshot();
+    ///
+    /// let mut dag = DagScheduler::restore(snapshot, Scheduler::new(Config::fifo()), None, 2.0);
+    /// dag.handle(worker(), 2.0);
+    /// dag.declare([job(3, vec![1])], 2.0).unwrap();
+    /// assert_eq!(
+    ///     dag.poll(2.0),
+    ///     vec![Output::Start {
+    ///         job: 3,
+    ///         attempt: 1,
+    ///         worker: 1
+    ///     }]
+    /// );
+    /// dag.handle(Input::Done { job: 3, attempt: 1 }, 3.0);
+    /// assert_eq!(
+    ///     dag.poll(3.0),
+    ///     vec![Output::Start {
+    ///         job: 2,
+    ///         attempt: 1,
+    ///         worker: 1
+    ///     }]
+    /// );
+    /// ```
     pub fn snapshot(&self) -> DagSnapshot {
         let mut templates = Templates::default();
         let mut live: Vec<&UnitRec> = self.units.iter().flatten().collect();
@@ -155,9 +224,68 @@ impl<P: Policy> DagScheduler<P> {
     }
 
     /// Restore a scheduler from a snapshot, in front of a fresh `policy`, with the [`NodeSource`]
-    /// its sourced units need. Jobs that were submitted (waiting or running in the old policy)
-    /// are submitted again at `now`; held jobs stay held and are announced again
-    /// ([`Output::RunLocal`], then [`Output::Ready`]).
+    /// its sourced units need.
+    ///
+    /// Jobs that were submitted (waiting or running in the old policy) are submitted again at
+    /// `now`; held jobs stay held and are announced again ([`Output::RunLocal`], then
+    /// [`Output::Ready`]).
+    ///
+    /// Without [`DagConfig::auto_submit`]: job 1 was released and running, job 2 ready and held,
+    /// job 4 a local job not yet run.
+    ///
+    /// ```
+    /// # use whelm::{Config, DagConfig, DagJob, DagScheduler, Input, JobSpec, Output, Policy,
+    /// #     Resources, Scheduler, WorkerState};
+    /// let config = DagConfig {
+    ///     auto_submit: false,
+    ///     ..DagConfig::default()
+    /// };
+    /// let mut dag = DagScheduler::new(config, Scheduler::new(Config::fifo()));
+    /// dag.handle(
+    ///     Input::Worker(WorkerState::new(1, "cpu", 1, Resources::mem(100))),
+    ///     0.0,
+    /// );
+    /// let job = |id, deps| DagJob::new(JobSpec::new(id, Resources::mem(1), 0), deps);
+    /// dag.declare(
+    ///     [
+    ///         job(1, vec![]),
+    ///         job(2, vec![]),
+    ///         job(3, vec![1]),
+    ///         job(4, vec![]).local(),
+    ///     ],
+    ///     0.0,
+    /// )
+    /// .unwrap();
+    /// dag.announcements();
+    /// dag.release(1, 0.0);
+    /// assert_eq!(
+    ///     dag.poll(0.0),
+    ///     vec![Output::Start {
+    ///         job: 1,
+    ///         attempt: 1,
+    ///         worker: 1
+    ///     }]
+    /// );
+    ///
+    /// let snapshot = dag.snapshot();
+    /// let mut dag = DagScheduler::restore(snapshot, Scheduler::new(Config::fifo()), None, 5.0);
+    /// dag.handle(
+    ///     Input::Worker(WorkerState::new(7, "cpu", 1, Resources::mem(100))),
+    ///     5.0,
+    /// );
+    /// assert_eq!(
+    ///     dag.poll(5.0),
+    ///     vec![
+    ///         Output::RunLocal { job: 4 },
+    ///         Output::Ready { job: 2 },
+    ///         Output::Start {
+    ///             job: 1,
+    ///             attempt: 1,
+    ///             worker: 7
+    ///         },
+    ///     ]
+    /// );
+    /// ```
     pub fn restore(
         snapshot: DagSnapshot,
         policy: P,

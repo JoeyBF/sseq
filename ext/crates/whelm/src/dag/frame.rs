@@ -1,4 +1,18 @@
 //! Materialised units: a counter per template node, from entry to completion.
+//!
+//! An entered unit gets a [`Frame`]: one `u16` per node of its template, counting the node's unmet
+//! predecessors, or once the node is past waiting a sentinel saying where it is ([`HELD`],
+//! [`SUBMITTED`], [`OPEN`] for a substituted unit with a frame of its own, [`COMPLETE`]). A
+//! substituted unit's frame is a child of its node's and is made only when that node is ready.
+//! Leaves declared complete start as [`COMPLETE`] with their successors' counts reduced.
+//!
+//! Readiness is processed as a queue of [`Work`] events drained by `settle`, so completing one
+//! node can release a chain of passthroughs, nested frames and units without recursion. A frame
+//! is freed as soon as its last node completes, and the unit's record when its top frame is.
+//!
+//! Ranks do not depend on frames: a leaf's rank comes from the template's bottom levels, the
+//! unit's scale and the rank below the unit, whether or not the leaf is materialised
+//! (`leaf_rank`).
 
 use std::sync::Arc;
 
@@ -32,6 +46,7 @@ pub(super) enum Work {
 pub(super) struct Frame {
     /// The top-level unit's slot.
     pub(super) unit: u32,
+    /// The template this frame instantiates: the unit's, or a substituted node's.
     pub(super) template: Arc<DagTemplate>,
     /// The id of the frame's first leaf.
     pub(super) base: JobId,

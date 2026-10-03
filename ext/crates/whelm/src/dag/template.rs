@@ -1,4 +1,39 @@
 //! Templates: the dependency structure units share.
+//!
+//! A [`DagTemplate`] is built once per shape of work and shared by every [`Unit`](super::Unit) of
+//! that shape. Building it checks acyclicity and precomputes the bottom levels ranks need, so
+//! declaring a unit of it costs nothing per node. Its nodes are [`TemplateNode`]s; a node may
+//! itself be a unit of another template, which gives the hierarchy its depth: the leaves of a
+//! substituted unit are numbered among the enclosing template's, in node order.
+//!
+//! The analysis methods ([`bottom_levels`](DagTemplate::bottom_levels),
+//! [`critical_path`](DagTemplate::critical_path), [`critical_nodes`](DagTemplate::critical_nodes))
+//! take the work per node as a function, so one template answers for units of any size or per-leaf
+//! cost.
+//!
+//! A three-stage pipeline whose middle stage is a nested fan-out of two jobs:
+//!
+//! ```
+//! use std::sync::Arc;
+//!
+//! use whelm::{DagTemplate, TemplateNode};
+//!
+//! let fan = Arc::new(DagTemplate::new(2, []).unwrap());
+//! let pipeline = DagTemplate::with_nodes(
+//!     vec![
+//!         TemplateNode::Local(1.0),
+//!         TemplateNode::Unit(fan),
+//!         TemplateNode::Pass(0.0),
+//!     ],
+//!     [(0, 1), (1, 2)],
+//! )
+//! .unwrap();
+//! // Leaves: the load is leaf 0, the fan-out's jobs leaves 1 and 2, the barrier leaf 3.
+//! assert_eq!((pipeline.len(), pipeline.leaves()), (3, 4));
+//! assert_eq!([0, 1, 2].map(|i| pipeline.leaf_offset(i)), [0, 1, 3]);
+//! // The fan-out weighs its own span, 1: the pipeline's critical path is 1 + 1 + 0.
+//! assert_eq!(pipeline.span(), 2.0);
+//! ```
 
 use std::sync::{Arc, LazyLock};
 
@@ -6,6 +41,9 @@ use super::{DagError, frame::SENTINEL};
 use crate::JobId;
 
 /// One node of a [`DagTemplate`].
+///
+/// A leaf's `f64` is its work before the unit's scale; a [`Unit`](Self::Unit) node weighs its
+/// template's [`span`](DagTemplate::span) instead.
 #[derive(Clone, Debug)]
 pub enum TemplateNode {
     /// A job run on a worker, of this much work (before the unit's
@@ -21,14 +59,32 @@ pub enum TemplateNode {
     Unit(Arc<DagTemplate>),
 }
 
-/// A dependency structure over nodes `0..len`, shared by every [`Unit`](super::Unit) built on it
-/// (e.g. one signature DAG per subalgebra profile, shared by every bidegree with that profile).
+/// A dependency structure over nodes `0..len`, shared by every [`Unit`](super::Unit) built on it.
+///
+/// For example, one signature DAG per subalgebra profile, shared by every bidegree with that
+/// profile.
 ///
 /// Building it checks acyclicity once and computes what ranks need: each node's bottom level (its
 /// work plus the longest chain of work below it, a substituted unit weighing its template's
 /// [`span`](Self::span)) and the template's span. Its *leaves* are its `Job`, `Local` and `Pass`
 /// nodes, those of substituted units included, numbered in node order; a unit's leaf `k` is job
 /// `base + k`.
+///
+/// A diamond: node 0 before nodes 1 and 2, both before node 3.
+///
+/// ```
+/// use whelm::DagTemplate;
+///
+/// let diamond = DagTemplate::new(4, [(0, 1), (0, 2), (1, 3), (2, 3)]).unwrap();
+/// assert_eq!(diamond.sources().collect::<Vec<_>>(), [0]);
+/// assert_eq!(diamond.sinks().collect::<Vec<_>>(), [3]);
+/// assert_eq!(
+///     (diamond.successors(0), diamond.predecessors(3)),
+///     (&[1, 2][..], &[1, 2][..])
+/// );
+/// assert_eq!(diamond.topological_order(), [0, 1, 2, 3]);
+/// assert_eq!((diamond.edge_count(), diamond.span()), (4, 3.0));
+/// ```
 #[derive(Clone, Debug)]
 pub struct DagTemplate {
     nodes: Vec<TemplateNode>,
@@ -57,13 +113,45 @@ fn single(node: fn(f64) -> TemplateNode) -> Arc<DagTemplate> {
 
 impl DagTemplate {
     /// A template of `len` worker jobs of unit work, with the given edges `(from, to)`: `to`
-    /// depends on `from`. Duplicate edges are merged; out-of-range nodes panic; a cycle is an
-    /// error naming a node on it.
+    /// depends on `from`.
+    ///
+    /// Duplicate edges are merged; out-of-range nodes panic; a cycle is an error naming a node on
+    /// it.
+    ///
+    /// ```
+    /// use whelm::{DagError, DagTemplate};
+    ///
+    /// let chain = DagTemplate::new(3, [(0, 1), (1, 2), (0, 1)]).unwrap();
+    /// assert_eq!((chain.len(), chain.edge_count(), chain.span()), (3, 2, 3.0));
+    /// let cycle = DagTemplate::new(3, [(0, 1), (1, 2), (2, 1)]);
+    /// assert_eq!(cycle.unwrap_err(), DagError::Cycle { job: 1 });
+    /// ```
     pub fn new(len: usize, edges: impl IntoIterator<Item = (u32, u32)>) -> Result<Self, DagError> {
         Self::with_nodes(vec![TemplateNode::Job(1.0); len], edges)
     }
 
     /// A template of the given nodes and edges (as for [`new`](Self::new)).
+    ///
+    /// Nodes of each kind, one of them a nested template: the two-job chain substituted for node
+    /// 1 counts as its span, 2, in the outer template's critical path.
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    ///
+    /// use whelm::{DagTemplate, TemplateNode};
+    ///
+    /// let chain = Arc::new(DagTemplate::new(2, [(0, 1)]).unwrap());
+    /// let nodes = vec![
+    ///     TemplateNode::Local(0.5),
+    ///     TemplateNode::Unit(chain),
+    ///     TemplateNode::Job(4.0),
+    ///     TemplateNode::Pass(0.0),
+    /// ];
+    /// let t = DagTemplate::with_nodes(nodes, [(0, 1), (0, 2), (1, 3), (2, 3)]).unwrap();
+    /// assert_eq!(t.leaves(), 5);
+    /// assert!(matches!(t.node(1), TemplateNode::Unit(sub) if sub.leaves() == 2));
+    /// assert_eq!(t.span(), 4.5);
+    /// ```
     pub fn with_nodes(
         nodes: Vec<TemplateNode>,
         edges: impl IntoIterator<Item = (u32, u32)>,
@@ -214,10 +302,22 @@ impl DagTemplate {
         (0..self.len()).filter(|&i| self.succ[i].is_empty())
     }
 
-    /// The same partial order over the same nodes with every implied edge removed (an edge
-    /// `a -> c` is implied when `c` is reachable from another successor of `a`). Readiness and
-    /// critical paths are unchanged; materialised units count down fewer edges. Takes
+    /// The same partial order over the same nodes with every implied edge removed.
+    ///
+    /// An edge `a -> c` is implied when `c` is reachable from another successor of `a`. Readiness
+    /// and critical paths are unchanged; materialised units count down fewer edges. Takes
     /// `O(len^2 / 8)` bytes of scratch.
+    ///
+    /// ```
+    /// use whelm::DagTemplate;
+    ///
+    /// // 0 -> 2 is implied by 0 -> 1 -> 2.
+    /// let t = DagTemplate::new(3, [(0, 1), (1, 2), (0, 2)]).unwrap();
+    /// let r = t.transitive_reduction();
+    /// assert_eq!((t.edge_count(), r.edge_count()), (3, 2));
+    /// assert_eq!(r.successors(0), [1]);
+    /// assert_eq!(r.span(), t.span());
+    /// ```
     pub fn transitive_reduction(&self) -> DagTemplate {
         let n = self.len();
         let words = n.div_ceil(64);
@@ -252,9 +352,19 @@ impl DagTemplate {
         DagTemplate::with_nodes(self.nodes.clone(), edges).expect("a sub-DAG of a DAG is acyclic")
     }
 
-    /// Nodes on a longest chain of `work` (CPOP's critical nodes): those whose longest path
-    /// from a source plus longest path to a sink equals the critical path, within a relative
-    /// tolerance `tol`.
+    /// Nodes on a longest chain of `work` (CPOP's critical nodes).
+    ///
+    /// These are the nodes whose longest path from a source plus longest path to a sink equals
+    /// the critical path, within a relative tolerance `tol`.
+    ///
+    /// ```
+    /// use whelm::DagTemplate;
+    ///
+    /// // Node 0 before nodes 1 and 2; node 2 is the heavier branch.
+    /// let fork = DagTemplate::new(3, [(0, 1), (0, 2)]).unwrap();
+    /// let work = [1.0, 1.0, 5.0];
+    /// assert_eq!(fork.critical_nodes(|i| work[i], 0.0), [true, false, true]);
+    /// ```
     pub fn critical_nodes(&self, work: impl Fn(usize) -> f64, tol: f64) -> Vec<bool> {
         let n = self.len();
         let w: Vec<f64> = (0..n).map(&work).collect();
@@ -274,12 +384,34 @@ impl DagTemplate {
     }
 
     /// The longest chain of `work` through the template.
+    ///
+    /// With the template's own work this is its [`span`](Self::span); any other `work` (per-leaf
+    /// costs of one unit, say) gives that unit's critical path.
+    ///
+    /// ```
+    /// use whelm::DagTemplate;
+    ///
+    /// let fork = DagTemplate::new(3, [(0, 1), (0, 2)]).unwrap();
+    /// assert_eq!(fork.critical_path(|_| 1.0), fork.span());
+    /// let work = [1.0, 1.0, 5.0];
+    /// assert_eq!(fork.critical_path(|i| work[i]), 6.0);
+    /// ```
     pub fn critical_path(&self, work: impl Fn(usize) -> f64) -> f64 {
         self.bottom_levels(work).into_iter().fold(0.0, f64::max)
     }
 
-    /// Each node's bottom level under `work`: its work plus the longest chain of work below it
-    /// (its upward rank within the template).
+    /// Each node's bottom level under `work`: its work plus the longest chain of work below it.
+    ///
+    /// This is its upward rank within the template; the DAG layer adds the scale and the rank
+    /// below the unit.
+    ///
+    /// ```
+    /// use whelm::DagTemplate;
+    ///
+    /// let fork = DagTemplate::new(3, [(0, 1), (0, 2)]).unwrap();
+    /// let work = [1.0, 1.0, 5.0];
+    /// assert_eq!(fork.bottom_levels(|i| work[i]), [6.0, 1.0, 5.0]);
+    /// ```
     pub fn bottom_levels(&self, work: impl Fn(usize) -> f64) -> Vec<f64> {
         let mut below = vec![0.0f64; self.len()];
         for &n in self.topo.iter().rev() {
