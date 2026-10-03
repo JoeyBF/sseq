@@ -79,8 +79,8 @@ struct State<P> {
     now: Instant,
     /// Jobs with a lease, held or awaited.
     jobs: HashMap<JobId, Slot>,
-    /// The ticker should exit.
-    stopped: bool,
+    /// Tickers spawned before this generation exit.
+    ticker_generation: u64,
 }
 
 /// Why waiting for a start ended without one.
@@ -157,7 +157,7 @@ impl<P: Policy> SharedPolicy<P> {
                 policy,
                 now: f64::NEG_INFINITY,
                 jobs: HashMap::new(),
-                stopped: false,
+                ticker_generation: 0,
             }),
             clock: Box::new(clock),
         }
@@ -593,6 +593,7 @@ impl<P: Policy + Send + 'static> SharedPolicy<P> {
     /// ```
     pub fn spawn_ticker(self: &Arc<Self>, period: Duration) -> JoinHandle<()> {
         let weak: Weak<Self> = Arc::downgrade(self);
+        let generation = self.lock().0.ticker_generation;
         std::thread::Builder::new()
             .name("whelm-ticker".into())
             .spawn(move || {
@@ -600,7 +601,7 @@ impl<P: Policy + Send + 'static> SharedPolicy<P> {
                     let sleep = {
                         let Some(me) = weak.upgrade() else { return };
                         let (mut s, now) = me.lock();
-                        if s.stopped {
+                        if s.ticker_generation != generation {
                             return;
                         }
                         Self::pump(&mut s, now);
@@ -615,11 +616,10 @@ impl<P: Policy + Send + 'static> SharedPolicy<P> {
             .expect("spawning the ticker thread")
     }
 
-    /// Stop a ticker started by [`spawn_ticker`](Self::spawn_ticker) (it exits within a period).
-    /// It stops every ticker of this front end, for good: a ticker spawned afterwards exits at
-    /// once.
+    /// Stop every ticker started by [`spawn_ticker`](Self::spawn_ticker) so far (each exits
+    /// within a period). Tickers spawned afterwards run normally.
     pub fn stop_ticker(&self) {
-        self.lock().0.stopped = true;
+        self.lock().0.ticker_generation += 1;
     }
 }
 
@@ -666,6 +666,18 @@ pub struct Lease<'a, P: Policy> {
     worker: WorkerId,
     waited: f64,
     open: bool,
+}
+
+impl<P: Policy> std::fmt::Debug for Lease<'_, P> {
+    /// The attempt the lease holds; the front end it belongs to is left out.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Lease")
+            .field("job", &self.job)
+            .field("attempt", &self.attempt)
+            .field("worker", &self.worker)
+            .field("waited", &self.waited)
+            .finish()
+    }
 }
 
 impl<'a, P: Policy> Lease<'a, P> {
@@ -799,6 +811,21 @@ mod tests {
             }),
             || 0.0,
         )
+    }
+
+    /// Stopping the tickers ends those running; one spawned afterwards keeps running until it is
+    /// stopped in turn.
+    #[test]
+    fn ticker_restarts_after_stop() {
+        let s = Arc::new(shared(1));
+        let first = s.spawn_ticker(Duration::from_millis(1));
+        s.stop_ticker();
+        first.join().unwrap();
+        let second = s.spawn_ticker(Duration::from_millis(1));
+        std::thread::sleep(Duration::from_millis(20));
+        assert!(!second.is_finished());
+        s.stop_ticker();
+        second.join().unwrap();
     }
 
     /// A job.

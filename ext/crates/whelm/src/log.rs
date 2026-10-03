@@ -479,14 +479,18 @@ fn gb(bytes: u64) -> f64 {
     bytes as f64 / 1e9
 }
 
+/// Seconds between heartbeat samples of one worker in a [`Logged`] log, unless set with
+/// [`Logged::sample_every`]. Shorter gives the simulator a finer memory history and a larger log.
+pub const DEFAULT_SAMPLE_EVERY: f64 = 60.0;
+
 impl<P: Policy> Logged<P> {
-    /// Log `inner`'s events to `sink`, with a heartbeat sample at most every 60 s per worker
-    /// (see [`sample_every`](Self::sample_every)).
+    /// Log `inner`'s events to `sink`, with a heartbeat sample at most every
+    /// [`DEFAULT_SAMPLE_EVERY`] seconds per worker (see [`sample_every`](Self::sample_every)).
     pub fn new(inner: P, sink: impl EventSink + 'static) -> Self {
         Self {
             inner,
             sink: Box::new(sink),
-            sample_every: 60.0,
+            sample_every: DEFAULT_SAMPLE_EVERY,
             last_sample: HashMap::new(),
             info: HashMap::new(),
         }
