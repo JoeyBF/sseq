@@ -268,13 +268,13 @@ impl Driver {
 fn spec(setup: &SimSetup, j: usize) -> JobSpec {
     let (trace, work) = (setup.trace, setup.work);
     let t = &trace.tasks[j];
-    let mut s = JobSpec::new(
-        j as u64,
-        Resources::mem_gb(t.est_gb * setup.est_scale),
-        t.group,
-    );
-    s.work = Some(work[j]);
-    s
+    JobSpec {
+        id: j as u64,
+        demand: Resources::mem_gb(t.est_gb * setup.est_scale),
+        group: t.group,
+        work: Some(work[j]),
+        ..Default::default()
+    }
 }
 
 /// The closed-loop dependency lists (as task indices) and gaps.
@@ -371,7 +371,12 @@ pub fn simulate(setup: &SimSetup, name: &str, policy: BoxPolicy) -> Metrics {
                 .enumerate()
                 .map(|(j, d)| {
                     let deps = d.into_iter().map(|x| x as u64).collect();
-                    DagJob::new(spec(setup, j), deps).with_work(setup.work[j])
+                    DagJob {
+                        spec: spec(setup, j),
+                        deps,
+                        work_estimate: Some(setup.work[j]),
+                        ..Default::default()
+                    }
                 })
                 .collect();
             dag.declare(jobs, 0.0)
@@ -442,12 +447,11 @@ pub fn simulate(setup: &SimSetup, name: &str, policy: BoxPolicy) -> Metrics {
             reported_used: Resources::mem_gb(rss),
             reported_baseline: Resources::mem_gb(baseline),
             speed: setup.model.throughput(&tw.class, 1),
-            ..WorkerState::new(
-                w as u64,
-                tw.class.clone(),
-                tw.slots,
-                Resources::mem_gb(tw.budget_gb),
-            )
+            id: w as u64,
+            class: tw.class.clone(),
+            slots: tw.slots,
+            budget: Resources::mem_gb(tw.budget_gb),
+            ..Default::default()
         }
     };
 

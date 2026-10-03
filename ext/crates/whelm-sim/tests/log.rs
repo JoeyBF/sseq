@@ -67,7 +67,13 @@ fn policy() -> Scheduler {
 /// seconds.
 fn run(sink: impl EventSink + 'static) {
     let mut p = Logged::new(policy(), sink);
-    let state = |w: u64| WorkerState::new(w, "h200", SLOTS, Resources::mem_gb(BUDGET_GB));
+    let state = |w: u64| WorkerState {
+        id: w,
+        class: "h200".into(),
+        slots: SLOTS,
+        budget: Resources::mem_gb(BUDGET_GB),
+        ..Default::default()
+    };
     // Completions: (time, job, attempt).
     let mut ends: Vec<(f64, JobId, Attempt)> = Vec::new();
     let poll = |p: &mut Logged<Scheduler>, t: f64, ends: &mut Vec<(f64, JobId, Attempt)>| {
@@ -106,8 +112,13 @@ fn run(sink: impl EventSink + 'static) {
         if Some(t) == arrival {
             let id = next_arrival;
             next_arrival += 1;
-            let mut spec = JobSpec::new(id, Resources::mem_gb(job(id).2), id / 10);
-            spec.work = Some(job(id).1);
+            let spec = JobSpec {
+                id,
+                demand: Resources::mem_gb(job(id).2),
+                group: id / 10,
+                work: Some(job(id).1),
+                ..Default::default()
+            };
             p.annotate(
                 id,
                 TaskInfo {

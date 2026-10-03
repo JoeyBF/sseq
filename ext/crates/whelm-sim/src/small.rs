@@ -215,13 +215,12 @@ pub fn simulate_small(inst: &SmallInstance, plan: &SmallPlan) -> SmallResult {
         for _ in 0..c.workers {
             let id = speed.len() as u64;
             let state = WorkerState {
+                id,
+                class: c.name.clone(),
+                slots: c.slots as usize,
+                budget: Resources::mem(1 << 60),
                 speed: if plan.speed.learned() { 1.0 } else { c.speed },
-                ..WorkerState::new(
-                    id,
-                    c.name.clone(),
-                    c.slots as usize,
-                    Resources::mem(1 << 60),
-                )
+                ..Default::default()
             };
             dag.handle(Input::Worker(state), 0.0);
             speed.push(c.speed);
@@ -242,12 +241,31 @@ pub fn simulate_small(inst: &SmallInstance, plan: &SmallPlan) -> SmallResult {
         .map(|(i, t)| {
             let deps = t.deps.iter().map(|&d| d as u64).collect();
             if t.kind == Kind::Join {
-                DagJob::passthrough(i as u64, t.group as u64, deps, 0.0)
+                DagJob {
+                    spec: JobSpec {
+                        id: i as u64,
+                        group: t.group as u64,
+                        ..Default::default()
+                    },
+                    deps,
+                    work_estimate: Some(0.0),
+                    passthrough: true,
+                    ..Default::default()
+                }
             } else {
-                let mut spec = JobSpec::new(i as u64, Resources::ZERO, t.group as u64)
-                    .with_kind(if t.kind == Kind::Zero { "zero" } else { "sig" });
-                spec.priority = priority.as_ref().map(|p| p[i]);
-                DagJob::new(spec, deps).with_work(if oracle { t.work } else { t.est })
+                let kind = if t.kind == Kind::Zero { "zero" } else { "sig" };
+                DagJob {
+                    spec: JobSpec {
+                        id: i as u64,
+                        group: t.group as u64,
+                        priority: priority.as_ref().map(|p| p[i]),
+                        kind: Some(kind.into()),
+                        ..Default::default()
+                    },
+                    deps,
+                    work_estimate: Some(if oracle { t.work } else { t.est }),
+                    ..Default::default()
+                }
             }
         })
         .collect();

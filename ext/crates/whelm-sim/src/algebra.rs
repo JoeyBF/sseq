@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use whelm::DagTemplate;
+use whelm::{DagTemplate, TemplateSpec};
 
 /// Bits per Milnor exponent in the packed representation (`PPart::WIDTHS` in `algebra`).
 const WIDTHS: [u32; 16] = [11, 10, 9, 8, 7, 6, 5, 4, 3, 1, 0, 0, 0, 0, 0, 0];
@@ -202,7 +202,12 @@ pub fn signature_dag(profile: &[u8]) -> DagTemplate {
             }
         }
     }
-    DagTemplate::new(n, edges).expect("the signature DAG is acyclic")
+    TemplateSpec {
+        edges,
+        ..TemplateSpec::jobs(n)
+    }
+    .build()
+    .expect("the signature DAG is acyclic")
 }
 
 #[cfg(test)]

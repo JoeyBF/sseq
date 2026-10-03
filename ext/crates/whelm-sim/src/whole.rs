@@ -1416,12 +1416,16 @@ pub fn simulate(
         for _ in 0..*count {
             let id = workers.len() as u64;
             let state = WorkerState {
+                id,
+                class: class.clone(),
+                slots: *slots,
+                budget: Resources::mem(1 << 60),
                 speed: if place.speed.learned() {
                     1.0
                 } else {
                     model.throughput(class, 1)
                 },
-                ..WorkerState::new(id, class.clone(), *slots, Resources::mem(1 << 60))
+                ..Default::default()
             };
             dag.handle(Input::Worker(state), 0.0);
             workers.push(Wk {
@@ -1432,11 +1436,32 @@ pub fn simulate(
     }
     let slots_total: usize = fleet.groups.iter().map(|g| g.1 * g.2).sum();
     let spec = |id: JobId, k: usize, kind: &str, pinned: bool| {
-        let j = JobSpec::new(id, Resources::ZERO, gid[k]).with_kind(kind);
-        match (&fast_class, pinned) {
-            (Some(c), true) => j.require_class(c.clone()),
-            _ => j,
+        let constraints = match (&fast_class, pinned) {
+            (Some(c), true) => vec![Constraint::require_class(c.clone())],
+            _ => Vec::new(),
+        };
+        JobSpec {
+            id,
+            group: gid[k],
+            kind: Some(kind.into()),
+            constraints,
+            ..Default::default()
         }
+    };
+    // A barrier of no work, completing by itself once `deps` are done.
+    let pass = |id: JobId, k: usize, deps: Vec<JobId>| -> Unit {
+        DagJob {
+            spec: JobSpec {
+                id,
+                group: gid[k],
+                ..Default::default()
+            },
+            deps,
+            work_estimate: Some(0.0),
+            passthrough: true,
+            ..Default::default()
+        }
+        .into()
     };
 
     let cost = |est: f64, truth: f64| if oracle { truth } else { est };
@@ -1449,23 +1474,30 @@ pub fn simulate(
             .iter()
             .map(|&d| 4 * d as u64 + 1)
             .collect();
-        let job = DagJob::new(spec(zero, k, "zero", place.pin != Pin::None), deps);
-        units.push(job.with_work(cost(b.zero_est, b.zero_true)).into());
+        let job = DagJob {
+            spec: spec(zero, k, "zero", place.pin != Pin::None),
+            deps,
+            work_estimate: Some(cost(b.zero_est, b.zero_true)),
+            ..Default::default()
+        };
+        units.push(job.into());
         units.push(match &b.walk {
-            Some(t) => Unit::new(
-                zero + 2,
-                SIG_BASE + world.offsets[k],
-                Arc::clone(t),
-                spec(0, k, "sig", place.pin == Pin::All),
-                vec![zero],
-            )
-            .sourced(),
+            Some(t) => Unit {
+                id: zero + 2,
+                base: SIG_BASE + world.offsets[k],
+                template: Arc::clone(t),
+                deps: vec![zero],
+                spec: spec(0, k, "sig", place.pin == Pin::All),
+                scale: Some(1.0),
+                sourced: true,
+                ..Default::default()
+            },
             // A dead bidegree's walk is all no-ops.
-            None => DagJob::passthrough(zero + 2, gid[k], vec![zero], 0.0).into(),
+            None => pass(zero + 2, k, vec![zero]),
         });
         let mut reg = vec![zero, zero + 2];
         reg.extend(world.index(b.s, b.t - 1).map(|p| 4 * p as u64 + 1));
-        units.push(DagJob::passthrough(zero + 1, gid[k], reg, 0.0).into());
+        units.push(pass(zero + 1, k, reg));
     }
     dag.declare(units, 0.0)
         .expect("the whole-run DAG is acyclic");

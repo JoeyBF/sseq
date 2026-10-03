@@ -136,13 +136,12 @@ pub fn simulate_device(sc: &DeviceScenario, arm: DeviceArm) -> DeviceMetrics {
     let mut p = Scheduler::new(Config::default());
     for w in 0..sc.workers {
         let state = WorkerState {
+            id: w as u64,
+            class: "small".into(),
+            slots: sc.slots,
+            budget: Resources::mem_gb(1e6).with_dev_gb(cap),
             per_task: Resources::ZERO.with_dev((per_task * 1e9).round() as u64),
-            ..WorkerState::new(
-                w as u64,
-                "small",
-                sc.slots,
-                Resources::mem_gb(1e6).with_dev_gb(cap),
-            )
+            ..Default::default()
         };
         p.handle(Input::Worker(state), 0.0);
     }
@@ -153,7 +152,11 @@ pub fn simulate_device(sc: &DeviceScenario, arm: DeviceArm) -> DeviceMetrics {
             }
             _ => 0.0,
         };
-        let spec = JobSpec::new(j as JobId, Resources::mem(1).with_dev_gb(est), 0);
+        let spec = JobSpec {
+            id: j as JobId,
+            demand: Resources::mem(1).with_dev_gb(est),
+            ..Default::default()
+        };
         p.handle(Input::Submit(spec), 0.0);
     }
     let mut ws: Vec<Wk> = (0..sc.workers).map(|_| Wk::default()).collect();

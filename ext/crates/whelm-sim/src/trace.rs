@@ -503,8 +503,21 @@ mod tests {
             worker,
         };
         let poll = |t_s: f64, out: Vec<Output>| Event::Poll { t_s, out };
-        let worker = |id| WorkerState::new(id, "l40s", 8, Resources::mem_gb(50.0));
-        let submit = |id| Input::Submit(JobSpec::new(id, Resources::mem_gb(1.5), 9));
+        let worker = |id| WorkerState {
+            id,
+            class: "l40s".into(),
+            slots: 8,
+            budget: Resources::mem_gb(50.0),
+            ..Default::default()
+        };
+        let submit = |id| {
+            Input::Submit(JobSpec {
+                id,
+                demand: Resources::mem_gb(1.5),
+                group: 9,
+                ..Default::default()
+            })
+        };
         let events = vec![
             input(0.0, Input::Worker(worker(1))),
             input(0.0, Input::Worker(worker(2))),
