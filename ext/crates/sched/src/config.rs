@@ -1,6 +1,6 @@
 //! The [`Scheduler`](crate::Scheduler)'s configuration.
 
-use crate::Learn;
+use crate::Timing;
 
 /// How a [`Scheduler`](crate::Scheduler) behaves: plain data, with presets.
 ///
@@ -38,7 +38,8 @@ pub struct Config {
     /// Which of the workers that admit a job it goes to: lexicographic over these terms, then the
     /// smallest worker id. A term listed twice adds nothing; the repeat is ignored.
     pub score: Vec<ScoreTerm>,
-    /// Speed learning, deferral and speculation. Default: none of them.
+    /// The machine model, deferral and speculation. Default: reported speeds, neither of the
+    /// others.
     pub speed: SpeedConfig,
     /// Retries of failed attempts. Default [`RetryConfig::default`].
     pub retry: RetryConfig,
@@ -135,9 +136,10 @@ pub enum OrderTerm {
 /// One term of [`Config::score`], ranking the workers that admit a job.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ScoreTerm {
-    /// The fastest first ([`WorkerState::speed`](crate::WorkerState::speed), or learned). With
-    /// [`Learn`] and a resolution, speeds within one resolution step of each other tie, so
-    /// per-worker noise does not override the later terms.
+    /// The fastest for the job first, as [`SpeedConfig::timing`] has it: under
+    /// [`Timing::Unrelated`] a worker can rank first for one kind of job and last for another.
+    /// With [`Learn`](crate::Learn) and a resolution, speeds within one resolution step of each
+    /// other tie, so per-worker noise does not override the later terms.
     Speed,
     /// The tightest fit: the smallest [`WorkerView::free_share`](crate::WorkerView::free_share)
     /// after placement.
@@ -238,9 +240,9 @@ impl Default for Defer {
 /// [`Config::score`].
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct SpeedConfig {
-    /// Learn each worker class's speed from completion times instead of trusting
-    /// [`WorkerState::speed`](crate::WorkerState::speed).
-    pub learn: Option<Learn>,
+    /// The machine model: a job's speed on each worker, reported or learned. Default
+    /// [`Timing::default`].
+    pub timing: Timing,
     /// Wait for a faster busy worker when it pays.
     pub defer: Option<Defer>,
     /// Start a second attempt of a running job on a faster worker that would otherwise stay idle.

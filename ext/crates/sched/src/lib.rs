@@ -26,7 +26,7 @@ pub use scheduler::Scheduler;
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 pub use shared::{Lease, SharedPolicy};
-pub use speed::{Learn, Sharing, SpeedEstimator};
+pub use speed::{Learn, Sharing, SpeedEstimator, Timing};
 
 /// A job identifier, chosen by the caller. Must be unique among live (waiting or running) jobs.
 pub type JobId = u64;
@@ -261,6 +261,13 @@ pub struct JobSpec {
     /// DAG layer's estimate when unset).
     #[cfg_attr(feature = "serde", serde(default))]
     pub work: Option<f64>,
+    /// What kind of job it is, for [`Timing::Unrelated`], which learns each kind's speed on each
+    /// worker class; other timings ignore it.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Option::is_none")
+    )]
+    pub kind: Option<String>,
     /// Where the job may, should and should not run. A retried job also avoids, softly, the
     /// workers its failed attempts ran on.
     #[cfg_attr(
@@ -282,8 +289,15 @@ impl JobSpec {
             weight: 1.0,
             due: None,
             work: None,
+            kind: None,
             constraints: Vec::new(),
         }
+    }
+
+    /// This job, of kind `kind` ([`JobSpec::kind`]).
+    pub fn with_kind(mut self, kind: impl Into<String>) -> Self {
+        self.kind = Some(kind.into());
+        self
     }
 
     /// This job with one more constraint.
@@ -338,7 +352,8 @@ pub struct WorkerState {
     pub reported_baseline: Resources,
     /// How fast a job runs here, relative to a reference worker (1.0): a job with
     /// [`JobSpec::work`] `w` takes `w / speed` seconds. Used by [`ScoreTerm::Speed`], [`Defer`]
-    /// and [`Speculate`]. Default 1.0.
+    /// and [`Speculate`] as the [`Timing`] says: ignored by identical machines, a prior for
+    /// learned ones. Default 1.0.
     #[cfg_attr(feature = "serde", serde(default = "unit"))]
     pub speed: f64,
 }
@@ -403,7 +418,8 @@ pub struct WorkerLoad {
     pub headroom: [Option<i64>; DIMS],
     /// The job this worker is reserved for, if any.
     pub reserved_for: Option<JobId>,
-    /// Its speed.
+    /// Its speed for a job of no particular kind ([`Timing`]); under [`Timing::Unrelated`], a
+    /// kind's speed is this times the kind's factor on the worker's class.
     pub speed: f64,
 }
 

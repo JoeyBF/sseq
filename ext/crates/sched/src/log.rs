@@ -393,12 +393,12 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use super::*;
-    use crate::{Attempt, Config, FailKind, JobSpec, Learn, Resources, Scheduler, Speculate};
+    use crate::{Attempt, Config, FailKind, JobSpec, Resources, Scheduler, Speculate, Timing};
 
     /// A configuration exercising learning, speculation, retries and reservations.
     fn config() -> Config {
         let mut c = Config::default();
-        c.speed.learn = Some(Learn::default());
+        c.speed.timing = Timing::learned();
         c.speed.speculate = Some(Speculate::default());
         c
     }

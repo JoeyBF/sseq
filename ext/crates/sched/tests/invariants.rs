@@ -8,8 +8,8 @@ use std::{
 use proptest::prelude::*;
 use sched::{
     Attempt, Config, Constraint, DIMS, Defer, FailKind, GaveUp, GroupOrder, Input, JobId, JobSpec,
-    OrderTerm, Output, Policy, Reservations, Resources, RetryConfig, SLOTS, Scheduler, ScoreTerm,
-    Selector, Speculate, SpeedConfig, Strength, Tried, WorkerId, WorkerState,
+    Learn, OrderTerm, Output, Policy, Reservations, Resources, RetryConfig, SLOTS, Scheduler,
+    ScoreTerm, Selector, Speculate, SpeedConfig, Strength, Timing, Tried, WorkerId, WorkerState,
 };
 
 /// The configuration under test, minus speed and retries.
@@ -59,6 +59,7 @@ enum Op {
         constraints: Vec<Constraint>,
         work: Option<u32>,
         dev: Option<u64>,
+        kind: Option<u8>,
     },
     /// A live attempt (running job, then attempt, by index) finishes.
     Complete(usize, usize),
@@ -121,9 +122,20 @@ fn op() -> impl Strategy<Value = Op> {
         prop::option::weighted(0.4, prop::collection::vec(constraint(), 1..3)),
         prop::option::weighted(0.7, 1u32..120),
         prop::option::weighted(0.5, 1u64..40),
+        prop::option::weighted(0.6, 0u8..3),
     )
         .prop_map(
-            |((demand, slots, group), priority, rank, weight, due, constraints, work, dev)| {
+            |(
+                (demand, slots, group),
+                priority,
+                rank,
+                weight,
+                due,
+                constraints,
+                work,
+                dev,
+                kind,
+            )| {
                 Op::Submit {
                     demand,
                     slots,
@@ -135,6 +147,7 @@ fn op() -> impl Strategy<Value = Op> {
                     constraints: constraints.unwrap_or_default(),
                     work,
                     dev,
+                    kind,
                 }
             },
         );
@@ -187,11 +200,40 @@ fn speed() -> impl Strategy<Value = SpeedConfig> {
             }
         }),
     );
-    (defer, speculate).prop_map(|(defer, speculate)| SpeedConfig {
-        learn: None,
+    (timing(), defer, speculate).prop_map(|(timing, defer, speculate)| SpeedConfig {
+        timing,
         defer,
         speculate,
     })
+}
+
+/// A random machine model; learning warms up within a stream and is not corrected for
+/// concurrency (the model does not track it).
+fn timing() -> impl Strategy<Value = Timing> {
+    let learn = (
+        prop_oneof![Just(0.05), Just(0.5)],
+        0u32..3,
+        any::<bool>(),
+        prop_oneof![Just(0.0), Just(5.0)],
+        prop_oneof![Just(0.0), Just(0.1)],
+    )
+        .prop_map(
+            |(weight, min_samples, per_worker, worker_prior, resolution)| Learn {
+                weight,
+                min_samples,
+                per_worker,
+                worker_prior,
+                resolution,
+                sharing: None,
+            },
+        );
+    prop_oneof![
+        1 => Just(Timing::Identical),
+        1 => Just(Timing::Related { learn: None }),
+        1 => learn.clone().prop_map(|l| Timing::Related { learn: Some(l) }),
+        2 => (learn, prop_oneof![Just(0.0), Just(5.0)])
+            .prop_map(|(learn, kind_prior)| Timing::Unrelated { learn, kind_prior }),
+    ]
 }
 
 /// A random list-scheduling rule: any order and score terms, in any order, sometimes repeated.
@@ -327,8 +369,179 @@ struct SRun {
     live: Vec<Live>,
 }
 
+/// A moving mean of `ln speed` samples: plain averaging, then weight `weight` per sample.
+#[derive(Clone, Copy, Debug, Default)]
+struct Mean {
+    mean: f64,
+    n: u32,
+}
+
+impl Mean {
+    /// Add a sample.
+    fn add(&mut self, x: f64, weight: f64) {
+        let a = weight.max(1.0 / f64::from(self.n + 1));
+        self.mean += a * (x - self.mean);
+        self.n += 1;
+    }
+
+    /// The count a prior is weighed against: `n`, capped at `1 / weight`.
+    fn count(&self, weight: f64) -> f64 {
+        f64::from(self.n).min(1.0 / weight.max(1e-9))
+    }
+}
+
+/// The machine model, written out again: per worker its published speed (1 for identical
+/// machines, the reported one, or learned per worker with its class as prior, behind a hysteresis
+/// band), and per (class, kind) a published factor, the kind's mean shrunk towards the class's.
+/// A worker's samples have the kind's current deviation from the class taken out.
+#[derive(Debug, Default)]
+struct Speeds {
+    timing: Timing,
+    classes: BTreeMap<String, Mean>,
+    /// Per worker: its own samples and the speed last published.
+    workers: BTreeMap<WorkerId, (Mean, Option<f64>)>,
+    /// Per (class, kind): its samples, and `ln` of the factor last published.
+    kinds: BTreeMap<(String, String), (Mean, Option<f64>)>,
+    /// The speed each live worker currently has.
+    published: BTreeMap<WorkerId, f64>,
+}
+
+impl Speeds {
+    /// The learning configuration, and the kind prior for unrelated machines.
+    fn learn(&self) -> Option<(Learn, Option<f64>)> {
+        match self.timing {
+            Timing::Identical | Timing::Related { learn: None } => None,
+            Timing::Related { learn: Some(l) } => Some((l, None)),
+            Timing::Unrelated { learn, kind_prior } => Some((learn, Some(kind_prior))),
+        }
+    }
+
+    /// The width of the hysteresis band and of a ranking step, in `ln speed`.
+    fn band(&self) -> f64 {
+        self.learn()
+            .map_or(0.0, |(l, _)| l.resolution.max(0.0).ln_1p())
+    }
+
+    /// Publish worker `id`'s speed, as on a worker report or after its class learned something.
+    fn refresh(&mut self, id: WorkerId, class: &str, reported: f64) {
+        let speed = match self.learn() {
+            None if self.timing == Timing::Identical => 1.0,
+            None => reported,
+            Some((l, _)) => {
+                let class_log = match self.classes.get(class) {
+                    Some(c) if c.n >= l.min_samples => c.mean,
+                    _ => reported.ln(),
+                };
+                let log = match self.workers.get(&id) {
+                    Some((own, _)) if l.per_worker && own.n > 0 => {
+                        let (n, k) = (own.count(l.weight), l.worker_prior.max(0.0));
+                        (n * own.mean + k * class_log) / (n + k)
+                    }
+                    _ => class_log,
+                };
+                let est = log.exp();
+                let band = self.band();
+                let (_, published) = self.workers.entry(id).or_default();
+                match *published {
+                    Some(p) if (est.ln() - p.ln()).abs() <= band => p,
+                    _ => *published.insert(est),
+                }
+            }
+        };
+        self.published.insert(id, speed);
+    }
+
+    /// `ln` of a kind's factor on a class from its samples.
+    fn kind_log(&self, class: &str, kind: &str) -> f64 {
+        let (Some((l, Some(prior))), Some((m, _))) = (
+            self.learn(),
+            self.kinds.get(&(class.to_string(), kind.to_string())),
+        ) else {
+            return 0.0;
+        };
+        let n = m.count(l.weight);
+        n * (m.mean - self.classes[class].mean) / (n + prior.max(0.0))
+    }
+
+    /// Learn from `work` taking `dt` on worker `id` of `class`; returns whether it was a sample,
+    /// after which the caller refreshes the class's workers.
+    fn observe(
+        &mut self,
+        id: WorkerId,
+        class: &str,
+        kind: Option<&str>,
+        work: f64,
+        dt: f64,
+    ) -> bool {
+        let Some((l, prior)) = self.learn() else {
+            return false;
+        };
+        if !(work > 0.0 && dt > 0.0) {
+            return false;
+        }
+        let x = (work / dt).ln();
+        let kind = kind.filter(|_| prior.is_some());
+        let deviation = kind.map_or(0.0, |k| self.kind_log(class, k));
+        self.classes
+            .entry(class.to_string())
+            .or_default()
+            .add(x, l.weight);
+        self.workers
+            .entry(id)
+            .or_default()
+            .0
+            .add(x - deviation, l.weight);
+        if let Some(k) = kind {
+            (self
+                .kinds
+                .entry((class.to_string(), k.to_string()))
+                .or_default()
+                .0)
+                .add(x, l.weight);
+            let band = self.band();
+            let on_class: Vec<String> = (self.kinds.keys())
+                .filter(|(c, _)| c == class)
+                .map(|(_, k)| k.clone())
+                .collect();
+            for k in on_class {
+                let raw = self.kind_log(class, &k);
+                let published = &mut self.kinds.get_mut(&(class.to_string(), k)).unwrap().1;
+                if published.is_none_or(|p| (raw - p).abs() > band) {
+                    *published = Some(raw);
+                }
+            }
+        }
+        true
+    }
+
+    /// A job's speed on worker `w` of `class`: the worker's speed times its kind's factor there.
+    fn speed(&self, spec: &JobSpec, w: WorkerId, class: &str) -> f64 {
+        let factor = match (self.learn(), &spec.kind) {
+            (Some((_, Some(_))), Some(k)) => self
+                .kinds
+                .get(&(class.to_string(), k.clone()))
+                .and_then(|(_, p)| *p)
+                .map_or(1.0, f64::exp),
+            _ => 1.0,
+        };
+        self.published[&w] * factor
+    }
+
+    /// Whether `a` is strictly faster than `b` as the speed term ranks: by whole steps of the
+    /// resolution when there is one.
+    fn faster(&self, a: f64, b: f64) -> bool {
+        let band = self.band();
+        if band > 0.0 {
+            (a.ln() / band).round() > (b.ln() / band).round()
+        } else {
+            a > b
+        }
+    }
+}
+
 #[derive(Default)]
 struct Shadow {
+    speeds: Speeds,
     now: f64,
     workers: BTreeMap<WorkerId, WorkerState>,
     waiting: BTreeMap<JobId, SJob>,
@@ -447,7 +660,33 @@ impl Shadow {
 
     /// The expected run time of `spec` on worker `w`.
     fn eta(&self, spec: &JobSpec, w: WorkerId) -> Option<f64> {
-        Some(spec.work? / self.workers[&w].speed)
+        Some(spec.work? / self.speed(spec, w))
+    }
+
+    /// `spec`'s speed on worker `w`.
+    fn speed(&self, spec: &JobSpec, w: WorkerId) -> f64 {
+        self.speeds.speed(spec, w, &self.workers[&w].class)
+    }
+
+    /// Live attempt `k` of `job` finished: learn from it, and refresh its class's workers.
+    fn learn(&mut self, job: JobId, k: usize) {
+        let r = &self.running[&job];
+        let l = &r.live[k];
+        let Some(work) = r.job.spec.work else {
+            return;
+        };
+        let class = self.workers[&l.worker].class.clone();
+        let kind = r.job.spec.kind.as_deref();
+        if self
+            .speeds
+            .observe(l.worker, &class, kind, work, self.now - l.started)
+        {
+            for (&id, s) in &self.workers {
+                if s.class == class {
+                    self.speeds.refresh(id, &class, s.speed);
+                }
+            }
+        }
     }
 
     /// When a running job is expected to end: its earliest live attempt's expected end, an
@@ -578,6 +817,10 @@ fn run(
     let mut sh = Shadow {
         rule: Some(rule.clone()),
         max_attempts: retry.max_attempts,
+        speeds: Speeds {
+            timing: speed.timing,
+            ..Speeds::default()
+        },
         ..Shadow::default()
     };
     let mut log = Vec::new();
@@ -594,6 +837,7 @@ fn run(
                 ref constraints,
                 work,
                 dev,
+                kind,
             } => {
                 let id = sh.next_id;
                 sh.next_id += 1;
@@ -606,12 +850,14 @@ fn run(
                     due: due.map(f64::from),
                     constraints: constraints.clone(),
                     work: work.map(f64::from),
+                    kind: kind.map(|k| format!("k{k}")),
                     ..JobSpec::new(id, demand, group)
                 };
                 sh.submit(spec, &mut *p);
             }
             Op::Complete(i, k) => {
-                if let Some((job, _, attempt)) = sh.pick_live(i, k) {
+                if let Some((job, k, attempt)) = sh.pick_live(i, k) {
+                    sh.learn(job, k);
                     sh.stop_all(job, Some(attempt));
                     p.handle(Input::Done { job, attempt }, sh.now);
                 }
@@ -697,11 +943,13 @@ fn run(
                         Resources::mem(budget).with_dev(dev_cap),
                     )
                 };
+                sh.speeds.refresh(id, &s.class, s.speed);
                 sh.workers.insert(id, s.clone());
                 p.handle(Input::Worker(s), sh.now);
             }
             Op::Gone(w) => {
                 if sh.workers.remove(&w).is_some() {
+                    sh.speeds.published.remove(&w);
                     // Each live attempt there fails; the caller resubmits nothing.
                     let lost: Vec<(JobId, usize)> = sh
                         .running
@@ -797,6 +1045,29 @@ fn run(
                         }
                     }
                 }
+                // Speed first: no other worker that would take the job is faster for it. Only
+                // checked in polls that made no reservation (one made and dropped within a poll
+                // leaves no trace in the stats); a reservation the poll started with counts as
+                // keeping its worker throughout.
+                if rule.score.first() == Some(&ScoreTerm::Speed)
+                    && after.reservations_total == before.reservations_total
+                {
+                    let mine = sh.speed(&job.spec, w);
+                    for &v in sh.workers.keys() {
+                        let reserved =
+                            (before.reservations.iter()).any(|r| r.worker == v && r.job != j);
+                        if v != w
+                            && !reserved
+                            && sh.eligible(&job, v)
+                            && sh.admits(job.spec.demand, v)
+                        {
+                            prop_assert!(
+                                !sh.speeds.faster(sh.speed(&job.spec, v), mine),
+                                "{rule:?}: job {j} placed on {w} while {v} is faster for it"
+                            );
+                        }
+                    }
+                }
                 sh.waiting.remove(&j);
                 sh.running.insert(
                     j,
@@ -827,11 +1098,12 @@ fn run(
                 );
                 let spec = r.job.spec.clone();
                 let sjob = r.job.clone();
+                let here = sh.speed(&spec, w);
                 prop_assert!(
                     r.live
                         .iter()
-                        .all(|l| sh.workers[&l.worker].speed < sh.workers[&w].speed),
-                    "job {j} speculated onto {w}, not faster than {:?}",
+                        .all(|l| sh.speeds.faster(here, sh.speed(&spec, l.worker))),
+                    "job {j} speculated onto {w}, not faster for it than {:?}",
                     r.live
                 );
                 prop_assert!(
@@ -900,14 +1172,15 @@ fn run(
                 );
             }
         }
-        // Bookkeeping agrees with the model: job counts, live attempts per job, and per-worker
-        // slots and placed demand as the sum over live attempts.
+        // Bookkeeping agrees with the model: job counts, live attempts per job, per-worker slots
+        // and placed demand as the sum over live attempts, and per-worker speeds.
         prop_assert_eq!(after.waiting, sh.waiting.len());
         prop_assert_eq!(after.running, sh.running.len());
         prop_assert_eq!(after.workers.len(), sh.workers.len());
         for l in &after.workers {
             let (n, m) = sh.load(l.id);
             prop_assert_eq!((l.running, l.placed), (n, m), "worker {} load", l.id);
+            prop_assert_eq!(l.speed, sh.speeds.published[&l.id], "worker {} speed", l.id);
         }
         for (&j, r) in &sh.running {
             prop_assert!(

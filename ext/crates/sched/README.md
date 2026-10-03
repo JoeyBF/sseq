@@ -312,7 +312,7 @@ Phase 1 keeps the thread per task and replaces the inside of `acquire`/`release`
 # fn main() {
 use std::{sync::Arc, time::Duration};
 use sched::{
-    Config, FailKind, GroupOrder, JobSpec, Learn, Resources, Scheduler, SharedPolicy, SpeedConfig,
+    Config, FailKind, GroupOrder, JobSpec, Resources, Scheduler, SharedPolicy, SpeedConfig, Timing,
     WorkerState,
     log::{JsonlSink, Logged, TaskInfo},
     nassau,
@@ -323,7 +323,7 @@ use sched::{
 let policy = Scheduler::new(Config {
     group_order: GroupOrder::Id,
     speed: SpeedConfig {
-        learn: Some(Learn::default()),
+        timing: Timing::learned(),
         ..SpeedConfig::default()
     },
     ..Config::default()

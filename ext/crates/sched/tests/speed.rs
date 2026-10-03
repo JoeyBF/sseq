@@ -1,8 +1,9 @@
-//! Speed-aware placement: the speed score, deferral to a faster worker, learning and speculation.
+//! Speed-aware placement: the speed score, deferral to a faster worker, learning, speculation,
+//! and the machine models.
 
 use sched::{
     Attempt, Config, Defer, Input, JobId, JobSpec, Output, Policy, Resources, Scheduler, ScoreTerm,
-    Speculate, SpeedConfig, WorkerId, WorkerState,
+    Speculate, SpeedConfig, Timing, WorkerId, WorkerState,
 };
 
 /// The `(job, worker)` of each start in `out`.
@@ -184,7 +185,7 @@ fn deferrals_book_slots_in_order() {
 #[test]
 fn learned_speeds_replace_reported_ones() {
     let speed = SpeedConfig {
-        learn: Some(sched::Learn::default()),
+        timing: Timing::learned(),
         ..SpeedConfig::default()
     };
     let mut p = backfill(speed);
@@ -334,7 +335,7 @@ fn speculation_yields_to_waiting_jobs_and_is_opt_in() {
 #[test]
 fn capped_worker_learned_per_worker() {
     let speed = SpeedConfig {
-        learn: Some(sched::Learn::default()),
+        timing: Timing::learned(),
         ..SpeedConfig::default()
     };
     let mut p = backfill(speed);
@@ -374,4 +375,169 @@ fn capped_worker_learned_per_worker() {
     let mut placed: Vec<u64> = starts(p.poll(now)).into_iter().map(|x| x.1).collect();
     placed.sort();
     assert_eq!(placed, vec![1, 2]);
+}
+
+/// Identical machines ignore reported speeds: the speed term ties, so load and id decide; nothing
+/// defers to the "faster" worker and nothing is speculated onto it.
+#[test]
+fn identical_machines_ignore_speeds() {
+    let mut p = backfill(SpeedConfig {
+        timing: Timing::Identical,
+        defer: Some(Defer {
+            max_wait: 1e9,
+            min_gain: 0.0,
+        }),
+        speculate: Some(Speculate::default()),
+    });
+    p.handle(Input::Worker(worker(1, 1, 1.0)), 0.0);
+    p.handle(Input::Worker(worker(2, 1, 4.0)), 0.0);
+    p.handle(Input::Submit(job(0, Some(4.0))), 0.0);
+    p.handle(Input::Submit(job(1, Some(100.0))), 0.0);
+    assert_eq!(starts(p.poll(0.0)), vec![(0, 1), (1, 2)]);
+    assert!(p.stats().workers.iter().all(|w| w.speed == 1.0));
+    // Worker 1 frees after the job's work in seconds; it is no faster, so no second attempt.
+    p.handle(done(0), 4.0);
+    assert_eq!(p.poll(4.0), vec![]);
+    p.handle(Input::Submit(job(2, Some(40.0))), 4.0);
+    assert_eq!(starts(p.poll(4.0)), vec![(2, 1)]);
+}
+
+/// A one-slot worker of class "x" (1) and one of class "y" (2), both reporting speed 1.
+fn two_classes(timing: Timing) -> Scheduler {
+    let mut p = backfill(SpeedConfig {
+        timing,
+        ..SpeedConfig::default()
+    });
+    for (id, class) in [(1, "x"), (2, "y")] {
+        p.handle(
+            Input::Worker(WorkerState::new(id, class, 1, Resources::mem(1000))),
+            0.0,
+        );
+    }
+    p
+}
+
+/// True speeds: kind "a" runs 4x on class x and 1x on y; kind "b" 1x on x and 2x on y.
+fn truth(kind: &str, worker: WorkerId) -> f64 {
+    match (kind, worker) {
+        ("a", 1) => 4.0,
+        ("b", 2) => 2.0,
+        _ => 1.0,
+    }
+}
+
+/// Run 20 jobs of each kind on each class, one at a time, pinned there by a class requirement;
+/// returns the time at the end.
+fn train(p: &mut Scheduler) -> f64 {
+    let mut now = 0.0;
+    let mut id = 0;
+    for _ in 0..20 {
+        for kind in ["a", "b"] {
+            for (w, class) in [(1, "x"), (2, "y")] {
+                let spec = job(id, Some(8.0)).with_kind(kind).require_class(class);
+                p.handle(Input::Submit(spec), now);
+                assert_eq!(starts(p.poll(now)), vec![(id, w)]);
+                now += 8.0 / truth(kind, w);
+                p.handle(done(id), now);
+                id += 1;
+            }
+        }
+    }
+    now
+}
+
+/// Where a lone job of `kind` (or of none) goes, both workers free.
+fn place_alone(p: &mut Scheduler, id: JobId, kind: Option<&str>, now: f64) -> WorkerId {
+    let spec = JobSpec {
+        kind: kind.map(str::to_string),
+        ..job(id, Some(8.0))
+    };
+    p.handle(Input::Submit(spec), now);
+    let out = starts(p.poll(now));
+    assert_eq!(out.len(), 1, "{out:?}");
+    p.handle(done(id), now);
+    out[0].1
+}
+
+/// Unrelated machines learn that kind a is fast on class x and kind b on class y, and place each
+/// kind there; related machines see one average speed per class and send both kinds to x. A new
+/// kind, and a job without one, start from the related speed.
+#[test]
+fn unrelated_machines_learn_speeds_per_kind() {
+    let mut r = two_classes(Timing::unrelated());
+    let now = train(&mut r);
+    assert_eq!(place_alone(&mut r, 1000, Some("b"), now), 2);
+    assert_eq!(place_alone(&mut r, 1001, Some("a"), now), 1);
+    // Per worker, the related speed: class x averages 4 and 1, class y 1 and 2.
+    let speeds: Vec<f64> = r.stats().workers.iter().map(|w| w.speed).collect();
+    assert!(speeds[0] > speeds[1], "{speeds:?}");
+    assert_eq!(place_alone(&mut r, 1002, Some("new"), now), 1);
+    assert_eq!(place_alone(&mut r, 1003, None, now), 1);
+    // A waiting job's explanation names its kind's learned factors.
+    r.handle(Input::Submit(job(1004, Some(8.0)).with_kind("a")), now);
+    let e = r.explain(1004).unwrap();
+    assert!(
+        e.contains("kind a runs") && e.contains("on class x") && e.contains("on class y"),
+        "{e}"
+    );
+    r.handle(Input::Submit(job(1005, Some(8.0)).with_kind("new")), now);
+    assert!(!r.explain(1005).unwrap().contains("kind new"));
+
+    let mut q = two_classes(Timing::learned());
+    let now = train(&mut q);
+    assert_eq!(place_alone(&mut q, 1000, Some("b"), now), 1);
+    assert_eq!(place_alone(&mut q, 1001, Some("a"), now), 1);
+}
+
+/// Workers 1 (class "a", truly speed 1) and 2 (class "b", truly speed 3) kept busy with jobs of
+/// `kind`; every output, and the speeds learned.
+fn busy_run(timing: Timing, kind: Option<&str>) -> (Vec<Output>, Vec<f64>) {
+    let mut p = backfill(SpeedConfig {
+        timing,
+        ..SpeedConfig::default()
+    });
+    for (id, class) in [(1, "a"), (2, "b")] {
+        p.handle(
+            Input::Worker(WorkerState::new(id, class, 1, Resources::mem(1000))),
+            0.0,
+        );
+    }
+    let truth = |w: u64| if w == 2 { 3.0 } else { 1.0 };
+    let (mut now, mut id, mut log) = (0.0, 0, Vec::new());
+    let mut running: Vec<(u64, u64, f64)> = Vec::new();
+    for _ in 0..200 {
+        for _ in running.len()..2 {
+            let spec = JobSpec {
+                kind: kind.map(str::to_string),
+                ..job(id, Some(6.0))
+            };
+            p.handle(Input::Submit(spec), now);
+            id += 1;
+        }
+        let out = p.poll(now);
+        for &(j, w) in &starts(out.clone()) {
+            running.push((j, w, now + 6.0 / truth(w)));
+        }
+        log.extend(out);
+        running.sort_by(|a, b| a.2.total_cmp(&b.2));
+        let (j, _, end) = running.remove(0);
+        now = end;
+        p.handle(done(j), now);
+    }
+    (log, p.stats().workers.iter().map(|w| w.speed).collect())
+}
+
+/// Related machines ignore kinds, and unrelated ones with a single kind (or none) learn exactly
+/// the related speeds: the kind's factor on each class is 1 when it is the class's only kind.
+#[test]
+fn unrelated_reduces_to_related() {
+    let q = busy_run(Timing::learned(), None);
+    assert!((q.1[1] - 3.0).abs() < 1e-9, "{:?}", q.1);
+    assert_eq!(busy_run(Timing::learned(), Some("k")), q);
+    assert_eq!(busy_run(Timing::unrelated(), None), q);
+    let one_kind = busy_run(Timing::unrelated(), Some("k"));
+    assert_eq!(one_kind.0, q.0);
+    for (a, b) in one_kind.1.iter().zip(&q.1) {
+        assert!((a - b).abs() < 1e-9, "{:?} vs {:?}", one_kind.1, q.1);
+    }
 }

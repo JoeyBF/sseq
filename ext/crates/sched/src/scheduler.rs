@@ -9,8 +9,9 @@ use std::{
 use crate::{
     Admission, Attempt, Config, DEV, DIMS, FailKind, GaveUp, GroupOrder, Input, Instant, JobId,
     JobSpec, MEM, OrderTerm, Output, Policy, PolicyStats, ProductionAdmission, ReservationInfo,
-    Resources, SLOTS, ScoreTerm, Selector, SpeedEstimator, Strength, Tried, WorkerId, WorkerLoad,
-    WorkerState, WorkerView,
+    Resources, SLOTS, ScoreTerm, Selector, Strength, Tried, WorkerId, WorkerLoad, WorkerState,
+    WorkerView,
+    speed::{ClassId, KindId, Speeds},
 };
 
 /// The most terms a [`Config::order`] has once repeats are dropped: one per [`OrderTerm`].
@@ -38,7 +39,9 @@ struct Worker {
     jobs: BTreeMap<JobId, Attempt>,
     /// The job holding a [`Hold::Reserve`] on this worker, if any.
     reserved_for: Option<JobId>,
-    /// Effective speed: learned, or as reported.
+    /// `state.class`, interned.
+    class: ClassId,
+    /// Speed for a job of no particular kind: learned, as reported, or 1 ([`crate::Timing`]).
     speed: f64,
     /// `∫ running dt` up to `occ_at` (mean concurrency over a job's run, for learning).
     occ: f64,
@@ -70,6 +73,8 @@ impl Worker {
 #[derive(Clone, Debug)]
 struct Job {
     spec: JobSpec,
+    /// `spec.kind`, interned if the timing distinguishes kinds.
+    kind: Option<KindId>,
     key: Key,
     since: Instant,
     /// Attempts started so far: the last attempt's number.
@@ -297,8 +302,8 @@ pub struct Scheduler {
     last_dispatch_holders: Vec<JobId>,
     /// Every job that deferred at some point of the last dispatch, placed later or not.
     deferred_any: Vec<JobId>,
-    /// Learned speeds (with [`SpeedConfig::learn`](crate::SpeedConfig::learn)).
-    learned: Option<SpeedEstimator>,
+    /// The machine model's state ([`SpeedConfig::timing`](crate::SpeedConfig::timing)).
+    speeds: Speeds,
 }
 
 impl fmt::Debug for Scheduler {
@@ -324,7 +329,7 @@ impl Scheduler {
         config.order = dedup(&config.order);
         config.score = dedup(&config.score);
         Self {
-            learned: config.speed.learn.map(SpeedEstimator::new),
+            speeds: Speeds::new(config.speed.timing),
             config,
             admission: Box::new(admission),
             workers: BTreeMap::new(),
@@ -351,10 +356,16 @@ impl Scheduler {
         self.groups.remove(&group);
     }
 
-    /// The expected run time of `job` on `w`: its work over the worker's speed, `None` without a
-    /// work estimate. Every run-time estimate goes through here.
-    fn eta(&self, job: &JobSpec, w: &Worker) -> Option<f64> {
-        job.work.map(|work| work / w.speed)
+    /// How fast `job` runs on `w`: the worker's speed times the job kind's factor on its class.
+    /// Every speed a decision reads goes through here.
+    fn speed(&self, job: &Job, w: &Worker) -> f64 {
+        w.speed * self.speeds.factor(job.kind, w.class)
+    }
+
+    /// The expected run time of `job` on `w`: its work over its [`speed`](Self::speed) there,
+    /// `None` without a work estimate. Every run-time estimate goes through here.
+    fn eta(&self, job: &Job, w: &Worker) -> Option<f64> {
+        job.spec.work.map(|work| work / self.speed(job, w))
     }
 
     /// When a running job is expected to end: the earliest expected end of its live attempts,
@@ -365,7 +376,7 @@ impl Scheduler {
         r.live
             .iter()
             .filter_map(|run| {
-                let end = run.started + self.eta(&r.job.spec, self.workers.get(&run.worker)?)?;
+                let end = run.started + self.eta(&r.job, self.workers.get(&run.worker)?)?;
                 Some(if end > self.now {
                     end
                 } else {
@@ -417,7 +428,9 @@ impl Scheduler {
         let seq = self.next_seq;
         self.next_seq += 1;
         let key = self.key(&spec, seq);
+        let kind = self.speeds.kind(spec.kind.as_deref());
         self.enqueue(Job {
+            kind,
             spec,
             key,
             since: now,
@@ -562,24 +575,13 @@ impl Scheduler {
         }
     }
 
-    /// The speed to use for worker `id` of `class` that reports `reported`: learned, once there
-    /// are enough samples, else as reported.
-    fn worker_speed(&mut self, id: WorkerId, class: &str, reported: f64) -> f64 {
-        match self.learned.as_mut() {
-            Some(e) => e.speed(id, class, reported),
-            None => crate::speed::sane(reported),
-        }
-    }
-
-    /// Live attempt `i` of a job finished: learn its worker's speed from its duration and the
+    /// Live attempt `i` of a job finished: learn its speed on its worker from its duration and the
     /// worker's mean concurrency meanwhile.
     fn learn_from(&mut self, job: JobId, i: usize) {
-        if self.learned.is_none() {
-            return;
-        }
         let now = self.now;
         let r = &self.running[&job];
         let run = &r.live[i];
+        let kind = r.job.kind;
         let (Some(work), Some(w)) = (r.job.spec.work, self.workers.get_mut(&run.worker)) else {
             return;
         };
@@ -590,44 +592,33 @@ impl Scheduler {
         } else {
             1.0
         };
-        let (id, class) = (w.state.id, w.state.class.clone());
-        if !self
-            .learned
-            .as_mut()
-            .unwrap()
-            .observe(id, &class, work, dt, k)
-        {
+        let (id, class) = (w.state.id, w.class);
+        if !self.speeds.observe(id, class, kind, work, dt, k) {
             return;
         }
         // The class estimate moved too: refresh every worker of the class.
-        let ids: Vec<WorkerId> = self
-            .workers
-            .values()
-            .filter(|w| w.state.class == class)
-            .map(|w| w.state.id)
-            .collect();
-        for id in ids {
-            let reported = self.workers[&id].state.speed;
-            let speed = self.worker_speed(id, &class, reported);
-            self.workers.get_mut(&id).unwrap().speed = speed;
+        for w in self.workers.values_mut().filter(|w| w.class == class) {
+            w.speed = self.speeds.worker_speed(w.state.id, class, w.state.speed);
         }
     }
 
-    /// Speed as an ordering key (more negative is faster). With learning and a resolution, speeds
-    /// within one resolution step of each other compare equal, so per-worker noise does not
-    /// override load.
-    fn speed_rank(&self, w: &Worker) -> i64 {
-        let res = self.learned.as_ref().map_or(0.0, |e| e.config().resolution);
+    /// `job`'s speed on `w` as an ordering key (more negative is faster). With learning and a
+    /// resolution, speeds within one resolution step of each other compare equal, so per-worker
+    /// noise does not override load.
+    fn speed_rank(&self, job: &Job, w: &Worker) -> i64 {
+        let speed = self.speed(job, w);
+        let res = self.speeds.resolution();
         if res > 0.0 {
-            -(w.speed.ln() / res.ln_1p()).round() as i64
+            -(speed.ln() / res.ln_1p()).round() as i64
         } else {
-            ordered(-w.speed)
+            ordered(-speed)
         }
     }
 
     /// Add a worker or replace its reported state, keeping its placements.
     fn worker_update(&mut self, state: WorkerState, now: Instant) {
-        let speed = self.worker_speed(state.id, &state.class, state.speed);
+        let class = self.speeds.class(&state.class);
+        let speed = self.speeds.worker_speed(state.id, class, state.speed);
         match self.workers.get_mut(&state.id) {
             Some(w) => {
                 // A reservation counted against the old class (per-class limits) must not move to
@@ -636,6 +627,7 @@ impl Scheduler {
                     .then_some(w.reserved_for)
                     .flatten();
                 w.state = state;
+                w.class = class;
                 w.speed = speed;
                 if let Some(holder) = moved {
                     self.release_hold(holder);
@@ -650,6 +642,7 @@ impl Scheduler {
                         placed: Resources::ZERO,
                         jobs: BTreeMap::new(),
                         reserved_for: None,
+                        class,
                         speed,
                         occ: 0.0,
                         occ_at: now,
@@ -679,15 +672,15 @@ impl Scheduler {
     /// The hold that keeps `w` from `job`, and the job that has it: a reservation of `w` by
     /// another job that `job` cannot backfill, or `job`'s own deferral to another worker. This is
     /// the one place holds are enforced.
-    fn held(&self, job: &JobSpec, w: &Worker) -> Option<(JobId, Hold)> {
+    fn held(&self, job: &Job, w: &Worker) -> Option<(JobId, Hold)> {
         if let Some(holder) = w.reserved_for
-            && holder != job.id
+            && holder != job.spec.id
             && !self.shadow_backfills(job, w)
         {
             return Some((holder, self.holds[&holder]));
         }
-        match self.holds.get(&job.id) {
-            Some(&h @ Hold::Defer { worker, .. }) if worker != w.state.id => Some((job.id, h)),
+        match self.holds.get(&job.spec.id) {
+            Some(&h @ Hold::Defer { worker, .. }) if worker != w.state.id => Some((job.spec.id, h)),
             _ => None,
         }
     }
@@ -697,7 +690,7 @@ impl Scheduler {
         if !self.eligible(job, w) {
             return Some(Refusal::Ineligible);
         }
-        if let Some((by, hold)) = self.held(&job.spec, w) {
+        if let Some((by, hold)) = self.held(job, w) {
             return Some(Refusal::Held(by, hold));
         }
         if !self.admission.admits(&job.spec.demand, &w.view()) {
@@ -716,7 +709,7 @@ impl Scheduler {
 
     /// Whether `job` may backfill reserved worker `w`: it is expected to finish before the
     /// holder's shadow time.
-    fn shadow_backfills(&self, job: &JobSpec, w: &Worker) -> bool {
+    fn shadow_backfills(&self, job: &Job, w: &Worker) -> bool {
         let (Some(t), Some(run)) = (self.shadow(w), self.eta(job, w)) else {
             return false;
         };
@@ -838,14 +831,14 @@ impl Scheduler {
     }
 
     /// Worker `w`'s rank for `job` under [`Config::score`].
-    fn score(&self, job: &JobSpec, w: &Worker) -> Score {
+    fn score(&self, job: &Job, w: &Worker) -> Score {
         let mut score = [0; SCORE_TERMS];
         for (slot, term) in score.iter_mut().zip(&self.config.score) {
             *slot = match term {
-                ScoreTerm::Speed => self.speed_rank(w),
-                ScoreTerm::Tightest => ordered(w.view().free_share(&job.demand)),
-                ScoreTerm::Loosest => ordered(-w.view().free_share(&job.demand)),
-                ScoreTerm::Preferred => !prefers(job, &w.state) as i64,
+                ScoreTerm::Speed => self.speed_rank(job, w),
+                ScoreTerm::Tightest => ordered(w.view().free_share(&job.spec.demand)),
+                ScoreTerm::Loosest => ordered(-w.view().free_share(&job.spec.demand)),
+                ScoreTerm::Preferred => !prefers(&job.spec, &w.state) as i64,
                 ScoreTerm::Load => w.running() as i64,
             };
         }
@@ -860,7 +853,7 @@ impl Scheduler {
             if self.refusal(job, w).is_some() {
                 continue;
             }
-            let score = self.score(&job.spec, w);
+            let score = self.score(job, w);
             if best.as_ref().is_none_or(|(b, _)| score < *b) {
                 best = Some((score, id));
             }
@@ -869,18 +862,19 @@ impl Scheduler {
             return Pick::Nothing;
         };
         if let Some(defer) = self.config.speed.defer
-            && let Some(run_here) = self.eta(&job.spec, &self.workers[&place])
+            && let Some(run_here) = self.eta(job, &self.workers[&place])
             && self.reserved(job.spec.id).is_none()
             && !self.aged(job)
             && self.now - job.since < defer.max_wait
         {
             let work = job.spec.work.unwrap_or_default();
             let here = self.now + run_here;
+            let speed_here = self.speed(job, &self.workers[&place]);
             let mut wait: Option<(f64, WorkerId)> = None;
             for (&id, w) in &self.workers {
                 let slots = w.state.slots;
                 // Only full workers, and only if they would admit the job with one slot free.
-                if w.speed <= self.workers[&place].speed
+                if self.speed(job, w) <= speed_here
                     || slots == 0
                     || w.running() < slots
                     || !self.eligible(job, w)
@@ -897,8 +891,7 @@ impl Scheduler {
                 if !self.admission.admits(&job.spec.demand, &view) {
                     continue;
                 }
-                let (Some(start), Some(run)) = (self.next_free(w, proj), self.eta(&job.spec, w))
-                else {
+                let (Some(start), Some(run)) = (self.next_free(w, proj), self.eta(job, w)) else {
                     continue;
                 };
                 let eft = start.max(self.now) + run;
@@ -1019,7 +1012,7 @@ impl Scheduler {
             }
             let score = (
                 ordered(-w.view().free_share(&Resources::ZERO)),
-                self.score(&j.spec, w),
+                self.score(j, w),
             );
             if best.as_ref().is_none_or(|(b, _)| score < *b) {
                 best = Some((score, id));
@@ -1178,15 +1171,15 @@ impl Scheduler {
                 if !self.has_room(w) || w.reserved_for.is_some() {
                     break;
                 }
-                let rank = self.speed_rank(w);
-                // Candidates: run time known, every live attempt on a slower worker, allowed and
-                // admitted here.
+                // Candidates: run time known, every live attempt on a worker slower for the job,
+                // allowed and admitted here.
                 let mut best: Option<(f64, JobId)> = None;
                 for (&job, r) in &self.running {
+                    let rank = self.speed_rank(&r.job, w);
                     let slower = r.live.iter().all(|run| {
                         self.workers
                             .get(&run.worker)
-                            .is_some_and(|v| self.speed_rank(v) > rank)
+                            .is_some_and(|v| self.speed_rank(&r.job, v) > rank)
                     });
                     if !slower
                         || r.job.speculated >= cfg.max_per_job
@@ -1195,8 +1188,7 @@ impl Scheduler {
                     {
                         continue;
                     }
-                    let (Some(end), Some(run)) = (self.expected_end(r), self.eta(&r.job.spec, w))
-                    else {
+                    let (Some(end), Some(run)) = (self.expected_end(r), self.eta(&r.job, w)) else {
                         continue;
                     };
                     let end_here = now + run + cfg.restart_overhead;
@@ -1333,6 +1325,14 @@ impl Scheduler {
                     &format!("; waiting for faster worker {worker} (expected free at t={at:.0})");
             }
             None => {}
+        }
+        if let (Some(kind), Some(name)) = (j.kind, &j.spec.kind) {
+            let factors: Vec<String> = (self.speeds.kind_factors(kind).into_iter())
+                .map(|(class, f)| format!("{f:.2}x on class {class}"))
+                .collect();
+            if !factors.is_empty() {
+                msg += &format!("; kind {name} runs {}", factors.join(", "));
+            }
         }
         let (mut full, mut excluded) = (0, 0);
         // Per dimension: workers short of it, and the one with the most headroom there.
