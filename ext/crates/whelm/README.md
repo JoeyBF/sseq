@@ -2,48 +2,48 @@
 
 Pure, deterministic placement of jobs onto a changing fleet of workers: which job runs on which
 worker, and when, so as to neither overwhelm nor underwhelm the machines. The core is sans-IO and
-message-driven: the caller feeds it [`Input`]s, each stamped with the caller's "now", and acts on
-the [`Output`]s it returns. It has no networking, threads, clocks or persistence, and the same
-inputs produce the same outputs. Around the core sit a dependency layer ([`DagScheduler`]), a
-replayable event log ([`log`]) and a blocking front end for callers with a thread per task
-([`SharedPolicy`]).
+message-driven: the caller feeds it `Input`s, each stamped with the caller's "now", and acts on the
+`Output`s it returns. It has no networking, threads, clocks or persistence, and the same inputs
+produce the same outputs. Around the core sit a dependency layer (`DagScheduler`), a replayable
+event log (`log`) and a blocking front end for callers with a thread per task (`SharedPolicy`).
+
+The crate documentation (`cargo doc --open`) is a guided tour of the API, chapter by chapter, with
+an example of every behaviour; this page is the overview.
 
 ## The problem
 
 In α|β|γ notation:
 
-- **α, machines.** Workers ([`WorkerState`]) join, heartbeat and leave at any time. Each has a
-  class, a number of execution slots, a capacity per resource dimension, and a speed. The timing
-  model ([`Timing`]) is identical machines (P, [`Timing::Identical`]), uniformly related ones (Q,
-  [`Timing::Related`]: one speed per worker) or unrelated ones (R, [`Timing::Unrelated`]: a speed
-  per job kind and worker class). Speeds are reported, or learned online from completion times
-  ([`Learn`]; [`SpeedEstimator`] is the same learner on its own).
-- **β, jobs.** A job ([`JobSpec`]) has
-  - a vector demand ([`Resources`] over [`DIMS`] dimensions: [`MEM`], [`DEV`] and [`SLOTS`]),
-    checked by one per-dimension admission rule (below);
-  - [`Constraint`]s on a worker or a class ([`Selector`]) with a [`Strength`]: Require and Forbid
-    are hard, Avoid is soft, Prefer only ranks workers;
+- **α, machines.** Workers (`WorkerState`) join, heartbeat and leave at any time. Each has a class,
+  a number of execution slots, a capacity per resource dimension, and a speed. The timing model
+  (`Timing`) is identical machines (P, `Timing::Identical`), uniformly related ones (Q,
+  `Timing::Related`: one speed per worker) or unrelated ones (R, `Timing::Unrelated`: a speed per
+  job kind and worker class). Speeds are reported, or learned online from completion times (`Learn`;
+  `SpeedEstimator` is the same learner on its own).
+- **β, jobs.** A job (`JobSpec`) has
+  - a vector demand (`Resources` over `DIMS` dimensions: `MEM`, `DEV` and `SLOTS`), checked by one
+    per-dimension admission rule (below);
+  - `Constraint`s on a worker or a class (`Selector`) with a `Strength`: Require and Forbid are
+    hard, Avoid is soft, Prefer only ranks workers;
   - dependencies, through the DAG layer;
-  - estimates: its [`work`](JobSpec::work) in seconds at speed 1, and a [`kind`](JobSpec::kind)
-    for unrelated machines;
-  - a [`weight`](JobSpec::weight), a [`due`](JobSpec::due) date, an explicit
-    [`priority`](JobSpec::priority) and a [`group`](JobSpec::group).
+  - estimates: its `work` in seconds at speed 1, and a `kind` for unrelated machines;
+  - a `weight`, a `due` date, an explicit `priority` and a `group`.
 
   Jobs arrive online. There is no preemption or migration: a job runs to completion, or another
   attempt of it restarts from scratch (retries, speculation).
-- **γ, objective.** Chosen by the configuration's [`order`](Config::order) and
-  [`score`](Config::score) term lists, with presets for makespan with bounded latency, weighted
-  completion time and maximum lateness (see [the scheduler](#the-scheduler)).
+- **γ, objective.** Chosen by the configuration's `order` and `score` term lists, with presets for
+  makespan with bounded latency, weighted completion time and maximum lateness (see [the
+  scheduler](#the-scheduler)).
 
 The algorithm is greedy list scheduling: at every poll, waiting jobs are taken in the configured
 order and each goes to the best-scored worker that admits it. On identical machines with slots as
 the only binding resource and no holds, that is a list schedule in Graham's sense, so its makespan
-is within `2 - 1/m` of optimal, `m` the total number of slots, precedence constraints included.
-With memory demands, speeds, holds or arrivals over time every rule here is a heuristic.
+is within `2 - 1/m` of optimal, `m` the total number of slots, precedence constraints included. With
+memory demands, speeds, holds or arrivals over time every rule here is a heuristic.
 
 ### Admission
 
-An [`Admission`] rule decides whether a worker takes a job. [`ProductionAdmission`] applies one
+An `Admission` rule decides whether a worker takes a job. `ProductionAdmission` applies one
 inequality to every enforced dimension:
 
 ```text
@@ -54,27 +54,27 @@ admit iff for every enforced dimension d:
           or (d is soft and running == 0)                 // escape hatch
 ```
 
-- [`HARD`] dimensions (slots) are always enforced and have no escape hatch. A soft dimension
-  (memory) is enforced only where its capacity is nonzero: a zero capacity is unknown.
-- [`per_task`](WorkerState::per_task) is a per-job floor, so with a device floor and no per-job
-  device demands the device inequality counts jobs, `(running + 1) * per_task <= capacity`.
-- The escape hatch lets a job alone on a worker with a free slot run whatever its estimate, so
-  every job can run somewhere.
-- [`reported_baseline`](WorkerState::reported_baseline) must exclude the running jobs' usage; a
-  floor that contains them counts them twice.
+- `HARD` dimensions (slots) are always enforced and have no escape hatch. A soft dimension (memory)
+  is enforced only where its capacity is nonzero: a zero capacity is unknown.
+- `per_task` is a per-job floor, so with a device floor and no per-job device demands the device
+  inequality counts jobs, `(running + 1) * per_task <= capacity`.
+- The escape hatch lets a job alone on a worker with a free slot run whatever its estimate, so every
+  job can run somewhere.
+- `reported_baseline` must exclude the running jobs' usage; a floor that contains them counts them
+  twice.
 
 Where one number must compare workers (tightest fit, most headroom) it is the free fraction of
-capacity in the bottleneck soft dimension, [`WorkerView::free_share`]. A custom rule goes in
-through [`Scheduler::with_admission`] and must be monotone in load (see [`Admission`]).
+capacity in the bottleneck soft dimension, `WorkerView::free_share`. A custom rule goes in through
+`Scheduler::with_admission` and must be monotone in load (see `Admission`).
 
 ## Jobs, attempts and messages
 
 Jobs are idempotent: running one twice is harmless and the first completion wins. That is the
-caller's side of the [`Policy`] contract, and it lets the policy retry failed attempts, run
-speculative second attempts and ignore late messages. Every start carries an [`Attempt`] number
-(1 for the first); [`Input::Done`] and [`Input::Failed`] name the attempt they report and are
-ignored unless it is live. The DAG layer's local jobs ([`DagJob::local`](field@DagJob::local))
-are the exception: the caller runs those exactly once.
+caller's side of the `Policy` contract, and it lets the policy retry failed attempts, run
+speculative second attempts and ignore late messages. Every start carries an `Attempt` number (1 for
+the first); `Input::Done` and `Input::Failed` name the attempt they report and are ignored unless it
+is live. The DAG layer's local jobs (`DagJob::local`) are the exception: the caller runs those
+exactly once.
 
 ```rust
 use whelm::{Config, Input, JobSpec, Output, Policy, Resources, Scheduler, WorkerState};
@@ -108,82 +108,81 @@ assert!(policy.poll(95.0).is_empty());
 println!("{:?}", policy.explain(8)); // why a job is (not) running, for logs
 ```
 
-[`Policy::handle`] applies an input at once; the outputs it causes (stops, give-ups) come out of
-the next [`Policy::poll`], which also places what can be placed. [`Policy::next_wakeup`] is the
-next time a poll is needed without any input.
+`Policy::handle` applies an input at once; the outputs it causes (stops, give-ups) come out of the
+next `Policy::poll`, which also places what can be placed. `Policy::next_wakeup` is the next time a
+poll is needed without any input.
 
 ## The scheduler
 
-[`Scheduler`] implements [`Policy`], configured by a plain [`Config`]. Its
-[`order`](Config::order) ([`OrderTerm`]s, then arrival) and [`score`](Config::score)
-([`ScoreTerm`]s, then worker id) are lexicographic lists, and the presets map objectives to them:
+`Scheduler` implements `Policy`, configured by a plain `Config`. Its `order` (`OrderTerm`s, then
+arrival) and `score` (`ScoreTerm`s, then worker id) are lexicographic lists, and the presets map
+objectives to them:
 
 | preset | objective | order | score | aging, reservations |
 |---|---|---|---|---|
 | `Config::default()` | makespan, bounded latency | priority, group | speed, preferred, load | yes |
-| [`Config::fifo`] | baseline | arrival | preferred, load | no |
-| [`Config::best_fit`] | packing | as default | speed, tightest, preferred, load | yes |
-| [`Config::weighted_completion`] | Σ wC | priority, WSPT | as default | yes |
-| [`Config::lateness`] | max lateness | priority, EDD | as default | yes |
+| `Config::fifo` | baseline | arrival | preferred, load | no |
+| `Config::best_fit` | packing | as default | speed, tightest, preferred, load | yes |
+| `Config::weighted_completion` | Σ wC | priority, WSPT | as default | yes |
+| `Config::lateness` | max lateness | priority, EDD | as default | yes |
 
 WSPT (Smith's rule) and EDD (Jackson's rule) are optimal on one machine only. Keys are computed
 once, at submission; a job lacking what a term reads (a rank, a work estimate, a due date) sorts
-after the jobs that have it. [`OrderTerm::Group`] orders groups by first arrival
-([`GroupOrder::Arrival`]) or by id ([`GroupOrder::Id`]), which survives a restart that resubmits
-in another order; [`Scheduler::forget_group`] bounds the memory of arrivals.
+after the jobs that have it. `OrderTerm::Group` orders groups by first arrival
+(`GroupOrder::Arrival`) or by id (`GroupOrder::Id`), which survives a restart that resubmits in
+another order; `Scheduler::forget_group` bounds the memory of arrivals.
 
-**Order and backfill.** Each poll scans waiting jobs in order, so a job takes a worker only if
-every more urgent waiting job was refused there. That priority invariant follows from admission
-being monotone in load, without an explicit check.
+**Order and backfill.** Each poll scans waiting jobs in order, so a job takes a worker only if every
+more urgent waiting job was refused there. That priority invariant follows from admission being
+monotone in load, without an explicit check.
 
-**Aging** ([`Config::age_limit`], default [`DEFAULT_AGE_LIMIT`]; `None` is strict priority) puts
-jobs that have waited that long ahead of everything else, oldest first.
+**Aging** (`Config::age_limit`, default `DEFAULT_AGE_LIMIT`; `None` is strict priority) puts jobs
+that have waited that long ahead of everything else, oldest first.
 
-**Reservations** ([`Reservations`]): the most urgent job that has waited `reserve_after` and is
+**Reservations** (`Reservations`): the most urgent job that has waited `reserve_after` and is
 admitted nowhere reserves the worker with the most headroom, which takes no other job until the
 holder is placed (at the latest when the worker empties). The most urgent waiting job is therefore
 placed within `reserve_after` plus the longest running time of the jobs on the worker it reserves.
 With `shadow_backfill`, a reserved worker still takes jobs expected to finish before the holder
 could start (EASY backfilling), without weakening that bound.
 
-**Speed** ([`SpeedConfig`]). A job's expected run time on a worker is its work over its speed
-there, as [`SpeedConfig::timing`] has it.
+**Speed** (`SpeedConfig`). A job's expected run time on a worker is its work over its speed there,
+as `SpeedConfig::timing` has it.
 
-- [`ScoreTerm::Speed`] ranks the fastest admitting worker first. With learning, speeds within one
-  [`resolution`](Learn::resolution) step tie, so load still balances a class.
-- [`Defer`] (earliest finish, HEFT's processor choice, online): a job may wait for a busy worker
-  faster than the one the score picked, when it would finish earlier there by at least `min_gain`
-  of its work, for at most `max_wait`.
-- [`Speculate`]: a worker left with a free slot after the scan starts a second attempt of a job
+- `ScoreTerm::Speed` ranks the fastest admitting worker first. With learning, speeds within one
+  `resolution` step tie, so load still balances a class.
+- `Defer` (earliest finish, HEFT's processor choice, online): a job may wait for a busy worker
+  faster than the one the score picked, when it would finish earlier there by at least `min_gain` of
+  its work, for at most `max_wait`.
+- `Speculate`: a worker left with a free slot after the scan starts a second attempt of a job
   running on a slower worker, if that attempt is expected to finish at least `min_gain` of its run
-  time earlier. Both run; the first to finish wins and the other gets an [`Output::Stop`].
+  time earlier. Both run; the first to finish wins and the other gets an `Output::Stop`.
 
 **Holds.** A reservation and a deferral are one notion: a worker kept from a job it might admit,
-lapsing when the holder is placed or, for a deferral, at a deadline. Holds are enforced in one
-place and reported by [`Policy::explain`]; their deadlines, with the aging and reservation
-thresholds, give [`Policy::next_wakeup`]. Releasing a hold mid-scan restarts the scan, which keeps
-the priority invariant.
+lapsing when the holder is placed or, for a deferral, at a deadline. Holds are enforced in one place
+and reported by `Policy::explain`; their deadlines, with the aging and reservation thresholds, give
+`Policy::next_wakeup`. Releasing a hold mid-scan restarts the scan, which keeps the priority
+invariant.
 
-**Retries, worker loss, cancellation** ([`RetryConfig`]). A failed attempt with no other attempt
-of the job live requeues the job with its original place and age, softly avoiding every worker it
-failed on (the caller's Forbids stay hard). After [`RetryConfig::max_attempts`] rounds (a
-speculative attempt is an extra try within a round) the policy emits [`Output::GaveUp`] with every
-[`Tried`] attempt, `retryable` when all failed with [`FailKind::DeviceOom`].
-[`Input::WorkerGone`] fails each live attempt on the worker with [`FailKind::LinkDied`]; the
-caller never resubmits. [`Input::Cancel`] drops a waiting job or stops a running one's attempts.
+**Retries, worker loss, cancellation** (`RetryConfig`). A failed attempt with no other attempt of
+the job live requeues the job with its original place and age, softly avoiding every worker it
+failed on (the caller's Forbids stay hard). After `RetryConfig::max_attempts` rounds (a speculative
+attempt is an extra try within a round) the policy emits `Output::GaveUp` with every `Tried`
+attempt, `retryable` when all failed with `FailKind::DeviceOom`. `Input::WorkerGone` fails each live
+attempt on the worker with `FailKind::LinkDied`; the caller never resubmits. `Input::Cancel` drops a
+waiting job or stops a running one's attempts.
 
 ## Thread-per-task callers: `SharedPolicy`
 
-[`SharedPolicy`] wraps a flat policy behind a lock. [`lease`](SharedPolicy::lease) submits a job
-and blocks until it starts (each start wakes only its job's thread); the [`Lease`] names the
-worker and attempt and ends with [`Lease::complete`] or [`Lease::fail`], which blocks for the
-retry's start or returns the [`GaveUp`]. Dropping a lease cancels its job;
-[`lease_timeout`](SharedPolicy::lease_timeout) withdraws it after a timeout. The front end polls
-after every call, and [`spawn_ticker`](SharedPolicy::spawn_ticker) polls as time passes.
+`SharedPolicy` wraps a flat policy behind a lock. `lease` submits a job and blocks until it starts
+(each start wakes only its job's thread); the `Lease` names the worker and attempt and ends with
+`Lease::complete` or `Lease::fail`, which blocks for the retry's start or returns the `GaveUp`.
+Dropping a lease cancels its job; `lease_timeout` withdraws it after a timeout. The front end polls
+after every call, and `spawn_ticker` polls as time passes.
 
-A thread runs one attempt at a time, so speculation should be off: a speculative start of a
-leased job is answered with [`FailKind::Rejected`]. When a worker leaves, the thread's later
-`fail(LinkDied)` still receives the job's retry or give-up, and its `complete` cancels the retry.
+A thread runs one attempt at a time, so speculation should be off: a speculative start of a leased
+job is answered with `FailKind::Rejected`. When a worker leaves, the thread's later `fail(LinkDied)`
+still receives the job's retry or give-up, and its `complete` cancels the retry.
 
 ```rust
 use std::sync::Arc;
@@ -207,11 +206,10 @@ loop {
 
 ## Event log and replay
 
-[`log::Logged`] wraps a policy and records every input it handles (a submission with an optional
-[`log::TaskInfo`]) and every poll's outputs to an [`EventSink`], plus rate-limited heartbeat
-samples for the trace reader. [`log::replay`] feeds a log into a fresh policy with the same
-configuration and reproduces every poll; learned speeds live in the scheduler, so it relearns
-them.
+`log::Logged` wraps a policy and records every input it handles (a submission with an optional
+`log::TaskInfo`) and every poll's outputs to an `EventSink`, plus rate-limited heartbeat samples for
+the trace reader. `log::replay` feeds a log into a fresh policy with the same configuration and
+reproduces every poll; learned speeds live in the scheduler, so it relearns them.
 
 ```rust
 use std::sync::{Arc, Mutex};
@@ -236,42 +234,38 @@ trace format.
 
 ## Dependencies: the DAG layer
 
-[`DagScheduler`] wraps any policy and is itself a [`Policy`]. Its graph is a coarse DAG of
-[`Unit`]s. A unit is an instance of a [`DagTemplate`], a dependency structure checked once and
-shared by every unit built on it, whose nodes ([`TemplateNode`]) are worker jobs, local jobs,
-passthroughs or, recursively, units of other templates. A plain job ([`DagJob`]) is a unit of a
-one-node template. A unit's leaf `k` is job `base + k`; other units depend on it by its id.
+`DagScheduler` wraps any policy and is itself a `Policy`. Its graph is a coarse DAG of `Unit`s. A
+unit is an instance of a `DagTemplate`, a dependency structure checked once and shared by every unit
+built on it, whose nodes (`TemplateNode`) are worker jobs, local jobs, passthroughs or, recursively,
+units of other templates. A plain job (`DagJob`) is a unit of a one-node template. A unit's leaf `k`
+is job `base + k`; other units depend on it by its id.
 
-- **Declaration.** [`declare`](DagScheduler::declare) takes units with their dependencies,
-  possibly long before they are ready and possibly naming units not declared yet. A batch that
-  would close a cycle, redeclare a unit or overlap another unit's ids is rejected and leaves no
-  trace.
+- **Declaration.** `declare` takes units with their dependencies, possibly long before they are
+  ready and possibly naming units not declared yet. A batch that would close a cycle, redeclare a
+  unit or overlap another unit's ids is rejected and leaves no trace.
 - **Lazy materialisation.** A unit costs a fixed amount until its dependencies complete; then its
-  per-node counters are allocated, and they are freed when it completes, so memory follows the
-  live frontier. Materialisation is bookkeeping only and never changes the schedule: a job is
-  submitted to the inner policy as soon as its last dependency completes.
+  per-node counters are allocated, and they are freed when it completes, so memory follows the live
+  frontier. Materialisation is bookkeeping only and never changes the schedule: a job is submitted
+  to the inner policy as soon as its last dependency completes.
 - **Per-leaf data.** Leaf work, demands and labels come from the template and the unit's spec and
-  scale or, for a [`sourced`](Unit::sourced()) unit, from the scheduler's [`NodeSource`],
-  computed on demand rather than stored. The source can also make a leaf a no-op in one unit
-  ([`NodeSource::passthrough`]), so units of one template differ in which leaves run.
-- **Resume and close.** A unit can be declared with leaves already complete
-  ([`Unit::with_completed`], e.g. from a checkpoint) and closed early
-  ([`close`](DagScheduler::close)): unstarted jobs complete as no-ops, and running ones keep their
-  resources until their attempt ends.
+  scale or, for a `sourced`) unit, from the scheduler's `NodeSource`, computed on demand rather than
+  stored. The source can also make a leaf a no-op in one unit (`NodeSource::passthrough`), so units
+  of one template differ in which leaves run.
+- **Resume and close.** A unit can be declared with leaves already complete (`Unit::with_completed`,
+  e.g. from a checkpoint) and closed early (`close`): unstarted jobs complete as no-ops, and running
+  ones keep their resources until their attempt ends.
 - **Ranks.** Upward ranks (a job's work plus the longest chain of work below it, through the
   enclosing units and their dependents) are exact within a unit and maintained between units to
-  within [`DagConfig::rank_epsilon`]. Jobs are submitted with their [`rank`](JobSpec::rank),
-  which orders them only where [`Config::order`] lists [`OrderTerm::Rank`];
-  [`update_work`](DagScheduler::update_work) rescales a unit later.
-- **Outputs.** A ready local job is announced by [`Output::RunLocal`] and reported with
-  [`Input::Done`] and attempt 0. Without [`DagConfig::auto_submit`], ready jobs are announced by
-  [`Output::Ready`] and submitted by [`release`](DagScheduler::release). With
-  [`DagConfig::record_passthrough`], completed passthroughs and units other than plain jobs are
-  announced by [`Output::Passed`]. [`announcements`](DagScheduler::announcements) drains these
-  alone, so the caller can react before anything is placed.
+  within `DagConfig::rank_epsilon`. Jobs are submitted with their `rank`, which orders them only
+  where `Config::order` lists `OrderTerm::Rank`; `update_work` rescales a unit later.
+- **Outputs.** A ready local job is announced by `Output::RunLocal` and reported with `Input::Done`
+  and attempt 0. Without `DagConfig::auto_submit`, ready jobs are announced by `Output::Ready` and
+  submitted by `release`. With `DagConfig::record_passthrough`, completed passthroughs and units
+  other than plain jobs are announced by `Output::Passed`. `announcements` drains these alone, so
+  the caller can react before anything is placed.
 - **Give-ups and cancellation.** A job the inner policy gives up on is held again: its dependents
-  wait until the caller releases it (another round of attempts) or cancels it.
-  [`cancel`](DagScheduler::cancel) and [`Input::Cancel`] cascade to every dependent.
+  wait until the caller releases it (another round of attempts) or cancels it. `cancel` and
+  `Input::Cancel` cascade to every dependent.
 - **Snapshots** (feature `serde`): `DagScheduler::snapshot` and `DagScheduler::restore` save the
   coarse graph and the materialised units; submitted jobs are submitted again on restore.
 
@@ -307,18 +301,17 @@ Without features the crate has no dependencies.
 ## Simulator
 
 The sibling crate `ext/crates/whelm-sim` holds the simulators, their results and the literature
-notes: `whelm-sim` replays `log::JsonlSink` traces against this crate's policies, and
-`whelm-whole`, `whelm-device` and `whelm-pisa` model a whole Nassau run, device memory and
-synthetic instances.
+notes: `whelm-sim` replays `log::JsonlSink` traces against this crate's policies, and `whelm-whole`,
+`whelm-device` and `whelm-pisa` model a whole Nassau run, device memory and synthetic instances.
 
 ## Integrating with Nassau's coordinator
 
 **Phase 1** keeps the thread per task and replaces the inside of `acquire`/`release` with a lease
-loop over a logged [`SharedPolicy`]. Each heartbeat maps onto a [`WorkerState`]: RSS as
-`reported_used`, `baseline_excl` (the rolling RSS floor minus the estimates running) as
-`reported_baseline`, the class prior as `speed` (learning corrects it), the device launch pool as
-the device capacity and the learned per-task device demand as the device `per_task`. Bidegrees
-become groups through [`nassau::group`] under [`GroupOrder::Id`].
+loop over a logged `SharedPolicy`. Each heartbeat maps onto a `WorkerState`: RSS as `reported_used`,
+`baseline_excl` (the rolling RSS floor minus the estimates running) as `reported_baseline`, the
+class prior as `speed` (learning corrects it), the device launch pool as the device capacity and the
+learned per-task device demand as the device `per_task`. Bidegrees become groups through
+`nassau::group` under `GroupOrder::Id`.
 
 ```rust,no_run
 # #[cfg(feature = "log")]
@@ -389,13 +382,12 @@ let _lost = shared.worker_gone(id);
 # fn main() {}
 ```
 
-**Phase 2** drives the coordinator from one event loop over a
-`DagScheduler<Logged<Scheduler>>`. Each bidegree is a [`sourced`](Unit::sourced()) unit of its
-profile's signature template, its [`NodeSource`] supplying per-node work and demands; it is
-declared with its checkpointed nodes complete ([`Unit::with_completed`]) and
-[`close`](DagScheduler::close)d at the dead tail. Zero steps, registrations and commits are local
-jobs ([`Output::RunLocal`]). `snapshot`/`restore` carry the graph across coordinator restarts, and
-worker loss needs no resubmission: the core retries the lost attempts.
+**Phase 2** drives the coordinator from one event loop over a `DagScheduler<Logged<Scheduler>>`.
+Each bidegree is a `sourced`) unit of its profile's signature template, its `NodeSource` supplying
+per-node work and demands; it is declared with its checkpointed nodes complete
+(`Unit::with_completed`) and `close`d at the dead tail. Zero steps, registrations and commits are
+local jobs (`Output::RunLocal`). `snapshot`/`restore` carry the graph across coordinator restarts,
+and worker loss needs no resubmission: the core retries the lost attempts.
 
 ## License
 
