@@ -69,7 +69,7 @@ pub(super) struct Frame {
 
 impl Frame {
     /// Node `i`'s bottom level before the unit's scale.
-    pub(super) fn bottom_level(&self, i: usize) -> f64 {
+    fn bottom_level(&self, i: usize) -> f64 {
         match &self.bl {
             Some(bl) => bl[i],
             None => self.template.own_bottom_level(i),
@@ -253,7 +253,7 @@ impl<P: Policy> DagScheduler<P> {
     }
 
     /// Queue a new frame's ready nodes, or its completion if nothing is left to do.
-    pub(super) fn queue_frame(&mut self, f: u32) {
+    fn queue_frame(&mut self, f: u32) {
         let frame = self.frame(f);
         if frame.remaining == 0 {
             self.work.push_back(Work::FrameDone(f));
