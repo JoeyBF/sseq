@@ -446,6 +446,8 @@ estimates and whole rows/columns per sample. Each sample runs both plans on the 
 `DagScheduler::open_instance` keeps a walk as dense counters over its shared template (PaRSEC's
 parameterised task graphs): 2 B counter + 8 B work + 1 bit per node, against an explicit node,
 its edges and its `JobSpec`. Readiness, entry ranks and snapshots are property-tested against
-the explicit layer, and `whelm-whole` gives bit-identical makespans with `--explicit` and with
-instances (default) on every plan tried. `DagConfig::max_open_instances` is a frontier budget in
-open walks.
+the explicit layer, and `whelm-whole` gave bit-identical makespans with explicit walks and with
+instances on every plan tried. (That layer has since been replaced by lazily materialised units of
+shared templates, and the `--explicit` and `--eager` flags with it. The frontier budget in open
+walks, once `DagConfig::max_open_instances`, is `whelm-whole --max-open`, modelled by the simulated
+coordinator.)

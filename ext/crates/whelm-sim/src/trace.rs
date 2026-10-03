@@ -3,8 +3,8 @@
 
 use std::{collections::HashMap, io::BufRead, path::Path};
 
-use whelm::{Attempt, Input, MEM, Output, log::TaskInfo};
 use serde::Deserialize;
+use whelm::{Attempt, Input, MEM, Output, log::TaskInfo};
 
 /// A worker of the trace.
 #[derive(Clone, Debug)]

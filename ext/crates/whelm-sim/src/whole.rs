@@ -6,17 +6,18 @@ use std::{
     sync::Arc,
 };
 
-use whelm::{
-    Config, DagConfig, DagJob, DagScheduler, DagTemplate, GroupOrder, Input, InstanceSpec, JobId,
-    JobSpec, Output, Policy, PolicyStats, Resources, Scheduler, SpeedConfig, SpeedPolicy,
-    WorkerState,
-};
 use serde::Serialize;
+use whelm::{
+    Config, Constraint, DagConfig, DagJob, DagScheduler, DagTemplate, GroupOrder, Input, JobId,
+    JobSpec, NodeSource, OrderTerm, Output, Policy, PolicyStats, Resources, Scheduler, Selector,
+    Strength, TemplateNode, Unit, WorkerState,
+};
 
 use crate::{
     algebra,
     engine::{PsWorker, Queue},
     model::{ServiceModel, solve},
+    plan::SpeedPlan,
     run::Quantiles,
     trace::Trace,
 };
@@ -514,6 +515,9 @@ struct Bideg {
     pool_est: f64,
     pool_true: f64,
     shape_sum: f64,
+    /// The walk's template, if it runs: the profile's signature DAG with the signatures that do
+    /// not run here as passthroughs.
+    walk: Option<Arc<DagTemplate>>,
 }
 
 /// Configuration of the whole-run world.
@@ -532,6 +536,7 @@ pub struct WholeConfig {
 }
 
 /// The whole run, built a priori: bidegrees, templates, costs.
+#[derive(Clone)]
 pub struct World {
     /// Its configuration.
     pub config: WholeConfig,
@@ -548,6 +553,25 @@ pub struct World {
 /// Ids: bidegree `k` has its zero step `4k`, its "registered" passthrough `4k + 1` and its "walk
 /// done" passthrough `4k + 2`; signature `i` of bidegree `k` is `SIG_BASE + offsets[k] + i`.
 const SIG_BASE: JobId = 1 << 62;
+
+/// The profile index of a bidegree that has one.
+fn pi_of(b: &Bideg) -> usize {
+    b.profile.expect("a bidegree with a walk has a profile")
+}
+
+/// A profile's signature DAG with the signatures that do not run (`!runs[i]`) as passthroughs,
+/// which complete by themselves. Work comes from the simulation's [`NodeSource`].
+fn walk_template(profile: &DagTemplate, runs: &[bool]) -> DagTemplate {
+    let nodes = (runs.iter())
+        .map(|&r| match r {
+            true => TemplateNode::Job(1.0),
+            false => TemplateNode::Pass(0.0),
+        })
+        .collect();
+    let edges =
+        (0..profile.len()).flat_map(|a| profile.successors(a).iter().map(move |&b| (a as u32, b)));
+    DagTemplate::with_nodes(nodes, edges).expect("a profile's signature DAG is acyclic")
+}
 
 /// What a job id names.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -593,6 +617,7 @@ impl World {
                     pool_est: 0.0,
                     pool_true: 0.0,
                     shape_sum: 0.0,
+                    walk: None,
                 });
             }
         }
@@ -629,6 +654,8 @@ impl World {
             dims,
         };
         let mut offset = 0u64;
+        // Walk templates by profile and the set of signatures that run.
+        let mut walks: HashMap<(usize, Vec<bool>), Arc<DagTemplate>> = HashMap::new();
         for k in 0..w.bideg.len() {
             w.offsets.push(offset);
             let (s, t) = (w.bideg[k].s, w.bideg[k].t);
@@ -671,8 +698,25 @@ impl World {
                 }
                 w.bideg[k].tasks = tasks;
                 w.bideg[k].work_true = work;
+                if w.bideg[k].live {
+                    let runs: Vec<bool> = (0..info.template.len())
+                        .map(|i| w.sig_work(k, i, true) > 0.0)
+                        .collect();
+                    let walk =
+                        walks
+                            .entry((pi_of(&w.bideg[k]), runs))
+                            .or_insert_with_key(|(_, runs)| {
+                                Arc::new(walk_template(&info.template, runs))
+                            });
+                    w.bideg[k].walk = Some(Arc::clone(walk));
+                }
             }
         }
+        eprintln!(
+            "[whole] {} walk templates over {} profiles",
+            walks.len(),
+            w.profiles.len()
+        );
         w
     }
 
@@ -1002,7 +1046,7 @@ pub enum Plan {
         oracle: bool,
         /// `Config::age_limit`.
         age_limit: Option<f64>,
-        /// Oldest bidegree first, rank only within a bidegree (`Order::Priority::group_first`).
+        /// Oldest bidegree first, rank only within a bidegree.
         group_first: bool,
     },
 }
@@ -1022,18 +1066,16 @@ pub enum Pin {
 /// How the simulated coordinator places jobs and maintains ranks.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Placement {
-    /// Speed-aware worker choice.
-    pub speed: SpeedConfig,
+    /// Speed-aware worker choice and the machine model.
+    pub speed: SpeedPlan,
     /// Pinning to the fast class.
     pub pin: Pin,
     /// `DagConfig::rank_epsilon` (approximate rank propagation).
     pub rank_epsilon: f64,
-    /// Expand every bidegree's walk at the start instead of when it becomes ready.
-    pub eager: bool,
-    /// Expand walks as explicit graph nodes and edges instead of implicit instances (CPOP pinning
-    /// always does, since it pins individual nodes).
-    pub explicit: bool,
-    /// `DagConfig::max_open_instances`: a frontier budget in open walks.
+    /// At most this many walks open at once: a walk opens when its first signature job is ready,
+    /// and while the budget is spent its jobs are held, in the order the walks became ready. A
+    /// frontier budget of the simulated coordinator (the DAG layer materialises lazily and has
+    /// none); it changes the schedule.
     pub max_open: Option<usize>,
     /// How bidegrees are ordered against each other.
     pub group_key: GroupKey,
@@ -1080,14 +1122,13 @@ impl GroupKey {
 }
 
 impl Default for Placement {
-    /// Oblivious placement, no pinning, `DagConfig`'s default epsilon, lazy expansion.
+    /// Oblivious placement on reported speeds, no pinning, `DagConfig`'s default epsilon, no walk
+    /// budget.
     fn default() -> Self {
         Self {
-            speed: SpeedConfig::default(),
+            speed: SpeedPlan::default(),
             pin: Pin::None,
             rank_epsilon: DagConfig::default().rank_epsilon,
-            eager: false,
-            explicit: false,
             max_open: None,
             group_key: GroupKey::Arrival,
             age_limit: None,
@@ -1140,7 +1181,8 @@ pub struct WholeMetrics {
     pub bidegree_latency: Quantiles,
     /// Most bidegrees open at once.
     pub peak_open: usize,
-    /// Most DAG nodes live at once.
+    /// Most template nodes with materialised state at once ([`DagStats::nodes`](whelm::DagStats),
+    /// sampled every few thousand tasks).
     pub peak_dag_nodes: usize,
     /// Wall time of the placing `poll` calls, microseconds.
     pub dispatch_us: Quantiles,
@@ -1165,7 +1207,9 @@ struct Wk {
 
 /// A policy whose placements can be held back. Closed, its [`Policy::poll`] places nothing and
 /// returns nothing, so that a [`DagScheduler`]'s poll only drains the DAG layer's announcements:
-/// the simulated coordinator releases the jobs announced ready before anything is placed.
+/// the simulated coordinator releases the jobs announced ready (through today's caps) before
+/// anything is placed. Without it a poll would place the jobs already waiting into the free slots
+/// before the newly ready ones were released.
 struct Gate<P> {
     inner: P,
     open: bool,
@@ -1202,8 +1246,130 @@ impl<P: Policy> Policy for Gate<P> {
     }
 }
 
+/// The simulated coordinator's DAG layer.
+type Dag = DagScheduler<Gate<Scheduler>>;
+
+/// The walks' signatures, as the DAG layer's [`NodeSource`]: walk `4k + 2`'s leaf `i` is
+/// signature `i` of bidegree `k`.
+struct Walks {
+    world: World,
+    /// Work is the true cost rather than the estimate.
+    oracle: bool,
+    /// [`Pin::Critical`]: the fast class, and each live bidegree's critical signatures.
+    critical: Option<(String, HashMap<usize, Vec<bool>>)>,
+}
+
+impl NodeSource for Walks {
+    /// The signature's estimated or true work.
+    fn work(&self, unit: JobId, leaf: u32) -> f64 {
+        let (k, i) = ((unit / 4) as usize, leaf as usize);
+        self.world.sig_work(k, i, self.oracle)
+    }
+
+    /// Pins a critical signature to the fast class.
+    fn spec(&self, unit: JobId, leaf: u32, spec: &mut JobSpec) {
+        if let Some((class, critical)) = &self.critical
+            && critical
+                .get(&((unit / 4) as usize))
+                .is_some_and(|c| c[leaf as usize])
+        {
+            spec.constraints.push(Constraint {
+                on: Selector::Class(class.clone()),
+                strength: Strength::Require,
+            });
+        }
+    }
+}
+
+/// The simulated coordinator's caps on releasing signature jobs: today's per-bidegree in-flight
+/// cap, and the open-walk budget ([`Placement::max_open`]).
+struct SigGates {
+    /// Today's in-flight cap per bidegree.
+    per_bidegree: Option<usize>,
+    inflight: Vec<usize>,
+    queued: HashMap<usize, VecDeque<JobId>>,
+    /// The open-walk budget.
+    max_open: Option<usize>,
+    walk_open: Vec<bool>,
+    open_walks: usize,
+    /// Walks waiting for the budget, and their jobs announced ready meanwhile.
+    walk_queue: VecDeque<usize>,
+    walk_held: HashMap<usize, Vec<JobId>>,
+}
+
+impl SigGates {
+    /// Signature job `id` of bidegree `k` is ready: release it unless a cap holds it.
+    fn ready(&mut self, dag: &mut Dag, k: usize, id: JobId, now: f64) {
+        if let Some(max) = self.max_open
+            && !self.walk_open[k]
+        {
+            if self.open_walks < max {
+                self.walk_open[k] = true;
+                self.open_walks += 1;
+            } else {
+                let held = self.walk_held.entry(k).or_default();
+                if held.is_empty() {
+                    self.walk_queue.push_back(k);
+                }
+                held.push(id);
+                return;
+            }
+        }
+        self.release(dag, k, id, now);
+    }
+
+    /// Release signature job `id` of open walk `k`, or queue it behind the per-bidegree cap.
+    fn release(&mut self, dag: &mut Dag, k: usize, id: JobId, now: f64) {
+        match self.per_bidegree {
+            Some(per) if self.inflight[k] >= per => self.queued.entry(k).or_default().push_back(id),
+            _ => {
+                self.inflight[k] += 1;
+                dag.release(id, now);
+            }
+        }
+    }
+
+    /// A signature job of bidegree `k` completed: release the next one it held back.
+    fn done(&mut self, dag: &mut Dag, k: usize, now: f64) {
+        if self.per_bidegree.is_none() {
+            return;
+        }
+        self.inflight[k] -= 1;
+        if let Some(next) = self.queued.get_mut(&k).and_then(VecDeque::pop_front) {
+            self.inflight[k] += 1;
+            dag.release(next, now);
+        }
+    }
+
+    /// Bidegree `k`'s walk completed: open the walks waiting for its share of the budget.
+    fn walk_done(&mut self, dag: &mut Dag, k: usize, now: f64) {
+        let Some(max) = self.max_open else {
+            return;
+        };
+        if self.walk_open[k] {
+            self.walk_open[k] = false;
+            self.open_walks -= 1;
+        }
+        while self.open_walks < max {
+            let Some(q) = self.walk_queue.pop_front() else {
+                break;
+            };
+            self.walk_open[q] = true;
+            self.open_walks += 1;
+            for id in self.walk_held.remove(&q).unwrap_or_default() {
+                self.release(dag, q, id, now);
+            }
+        }
+    }
+}
+
 /// Simulate the whole run under `plan` on `fleet`, placing as `place` says (each worker's
-/// [`WorkerState::speed`] is its class's single-job throughput).
+/// [`WorkerState::speed`] is its class's single-job throughput, or 1 when speeds are learned).
+///
+/// The whole DAG is declared up front: per bidegree `k`, its zero step `4k`, its walk `4k + 2`
+/// (a unit of its walk template whose leaves' costs come from the world, or a passthrough when it
+/// has none) and its "registered" passthrough `4k + 1`. The DAG layer materialises each walk when
+/// its zero step completes.
 pub fn simulate(
     world: &World,
     fleet: &Fleet,
@@ -1226,49 +1392,73 @@ pub fn simulate(
             ..
         }
     );
-    let speed = place.speed;
     let gid = place.group_key.ids(world);
     let caps = match plan {
         Plan::Today { open, per_bidegree } => Some((*open, *per_bidegree)),
         _ => None,
     };
+    let order = match (rank, group_first) {
+        (false, _) => vec![OrderTerm::Group],
+        (true, false) => vec![OrderTerm::Rank, OrderTerm::Group],
+        (true, true) => vec![OrderTerm::Group, OrderTerm::Rank],
+    };
     let policy = Scheduler::new(Config {
-        order: whelm::Order::Priority {
-            default_priority: 0,
-            group_order: if place.group_key == GroupKey::Arrival {
-                GroupOrder::Arrival
-            } else {
-                GroupOrder::Id
-            },
-            group_first,
+        order,
+        group_order: if place.group_key == GroupKey::Arrival {
+            GroupOrder::Arrival
+        } else {
+            GroupOrder::Id
         },
         age_limit,
-        speed,
+        score: place.speed.score(),
+        speed: place.speed.config,
         ..Config::default()
     });
-    let mut dag = DagScheduler::new(
+    let fast_class = fleet
+        .groups
+        .iter()
+        .max_by(|a, b| {
+            model
+                .throughput(&a.0, 1)
+                .total_cmp(&model.throughput(&b.0, 1))
+        })
+        .map(|g| g.0.clone());
+    let n = world.bideg.len();
+    let critical = (place.pin == Pin::Critical).then(|| {
+        let marks = (0..n)
+            .filter_map(|k| {
+                let t = world.bideg[k].walk.as_ref()?;
+                Some((k, t.critical_nodes(|i| world.sig_work(k, i, false), 1e-9)))
+            })
+            .collect();
+        (fast_class.clone().unwrap_or_default(), marks)
+    });
+    let source = Walks {
+        world: world.clone(),
+        oracle,
+        critical,
+    };
+    let mut dag: Dag = DagScheduler::new(
         DagConfig {
             rank_priority: rank,
-            rank_scale: 1000.0,
             default_work: 0.0,
             rank_epsilon: place.rank_epsilon,
             auto_submit: false,
             record_passthrough: true,
-            max_open_instances: place.max_open,
             track_ranks: rank,
         },
         Gate {
             inner: policy,
             open: false,
         },
-    );
+    )
+    .with_source(Arc::new(source));
     let mut workers: Vec<Wk> = Vec::new();
     for (class, count, slots) in &fleet.groups {
         for _ in 0..*count {
             let id = workers.len() as u64;
             let state = WorkerState {
-                // Learning starts from no knowledge: every worker reports speed 1.
-                speed: if speed.learn.is_some() {
+                speed: if place.speed.learned() {
                     1.0
                 } else {
                     model.throughput(class, 1)
@@ -1283,51 +1473,44 @@ pub fn simulate(
         }
     }
     let slots_total: usize = fleet.groups.iter().map(|g| g.1 * g.2).sum();
-    let fast_class = fleet
-        .groups
-        .iter()
-        .max_by(|a, b| {
-            model
-                .throughput(&a.0, 1)
-                .total_cmp(&model.throughput(&b.0, 1))
-        })
-        .map(|g| g.0.clone());
-    let spec = |id: JobId, k: usize, pinned: bool| {
-        let mut j = JobSpec::new(id, Resources::ZERO, gid[k]);
-        if pinned {
-            j.class = fast_class.clone();
+    let spec = |id: JobId, k: usize, kind: &str, pinned: bool| {
+        let j = JobSpec::new(id, Resources::ZERO, gid[k]).with_kind(kind);
+        match (&fast_class, pinned) {
+            (Some(c), true) => j.require_class(c.clone()),
+            _ => j,
         }
-        j
     };
 
-    // The bidegree level, declared up front: zero steps and "registered" passthroughs. Each
-    // "registered" node also waits for its walk (a forward reference, declared when the bidegree
-    // opens) and stands in for the walk's critical path until then.
-    let n = world.bideg.len();
     let cost = |est: f64, truth: f64| if oracle { truth } else { est };
-    let mut jobs = Vec::with_capacity(2 * n);
-    #[allow(clippy::needless_range_loop)] // `k` indexes the world, too
+    let mut units: Vec<Unit> = Vec::with_capacity(3 * n);
     for k in 0..n {
         let b = &world.bideg[k];
+        let zero = 4 * k as u64;
         let deps: Vec<JobId> = world
             .compute_deps(k)
             .iter()
             .map(|&d| 4 * d as u64 + 1)
             .collect();
-        jobs.push(
-            DagJob::new(spec(4 * k as u64, k, place.pin != Pin::None), deps)
-                .with_work(cost(b.zero_est, b.zero_true)),
-        );
-        let mut reg = vec![4 * k as u64, 4 * k as u64 + 2];
+        let job = DagJob::new(spec(zero, k, "zero", place.pin != Pin::None), deps);
+        units.push(job.with_work(cost(b.zero_est, b.zero_true)).into());
+        units.push(match &b.walk {
+            Some(t) => Unit::new(
+                zero + 2,
+                SIG_BASE + world.offsets[k],
+                Arc::clone(t),
+                spec(0, k, "sig", place.pin == Pin::All),
+                vec![zero],
+            )
+            .sourced(),
+            // A dead bidegree's walk is all no-ops.
+            None => DagJob::passthrough(zero + 2, gid[k], vec![zero], 0.0).into(),
+        });
+        let mut reg = vec![zero, zero + 2];
         reg.extend(world.index(b.s, b.t - 1).map(|p| 4 * p as u64 + 1));
-        jobs.push(DagJob::passthrough(
-            4 * k as u64 + 1,
-            gid[k],
-            reg,
-            cost(b.cp_est, b.cp_true),
-        ));
+        units.push(DagJob::passthrough(zero + 1, gid[k], reg, 0.0).into());
     }
-    dag.declare(jobs, 0.0).expect("the bidegree DAG is acyclic");
+    dag.declare(units, 0.0)
+        .expect("the whole-run DAG is acyclic");
 
     let mut queue = Queue::new();
     let mut ready_at = vec![f64::NAN; n];
@@ -1335,108 +1518,30 @@ pub fn simulate(
     let mut open = 0usize;
     let mut peak_open = 0usize;
     let mut open_queue: VecDeque<usize> = VecDeque::new();
-    let mut inflight = vec![0usize; n];
-    let mut sig_queue: HashMap<usize, VecDeque<JobId>> = HashMap::new();
+    let mut gates = SigGates {
+        per_bidegree: caps.map(|c| c.1),
+        inflight: vec![0; n],
+        queued: HashMap::new(),
+        max_open: place.max_open.map(|m| m.max(1)),
+        walk_open: vec![false; n],
+        open_walks: 0,
+        walk_queue: VecDeque::new(),
+        walk_held: HashMap::new(),
+    };
     let mut tasks = 0u64;
     let mut dispatch_us = Vec::new();
     let mut peak_nodes = 0usize;
     let mut next_sample = 0u64;
     let mut wake_at = f64::NAN;
-    let mut eager_done = false;
     let mut now = 0.0;
     // Announcements the placing poll returned, for the next instant.
     let mut carry: Vec<Output> = Vec::new();
     // Jobs with a running attempt: the first attempt to finish completes the job.
     let mut running: HashSet<JobId> = HashSet::new();
 
-    // Declare bidegree k's walk: its signature template, then "walk done" after the sinks.
-    let instantiate = |dag: &mut DagScheduler<Gate<Scheduler>>, k: usize, now: f64| {
-        let b = &world.bideg[k];
-        let zero = 4 * k as u64;
-        let mut done_deps = vec![zero];
-        // A dead bidegree's walk is all no-ops: skip its template.
-        if let Some(pi) = b.profile.filter(|_| b.live)
-            && !place.explicit
-            && place.pin != Pin::Critical
-        {
-            // Implicit instance: counters over the shared template, "walk done" its `done` job.
-            let info = &world.profiles[pi];
-            let n = info.template.len();
-            let mut work = Vec::with_capacity(n);
-            let mut passthrough = Vec::with_capacity(n);
-            for i in 0..n {
-                let (est, truth) = (world.sig_work(k, i, false), world.sig_work(k, i, true));
-                work.push(cost(est, truth));
-                passthrough.push(truth <= 0.0);
-            }
-            // The walk's rank now flows through the instance, not the placeholder.
-            dag.update_work(zero + 1, 0.0);
-            dag.open_instance(
-                InstanceSpec {
-                    template: info.template.clone(),
-                    base: SIG_BASE + world.offsets[k],
-                    entry: zero,
-                    done: zero + 2,
-                    proto: spec(0, k, place.pin == Pin::All),
-                    work,
-                    passthrough,
-                    demand: None,
-                    label: None,
-                    completed: Vec::new(),
-                },
-                now,
-            )
-            .expect("instance ids are disjoint");
-            return;
-        }
-        if let Some(pi) = b.profile.filter(|_| b.live) {
-            let info = &world.profiles[pi];
-            let base = SIG_BASE + world.offsets[k];
-            let critical = match place.pin {
-                Pin::None => Vec::new(),
-                Pin::All => vec![true; info.template.len()],
-                Pin::Critical => info
-                    .template
-                    .critical_nodes(|i| world.sig_work(k, i, false), 1e-9),
-            };
-            dag.declare_template(
-                &info.template,
-                |i| base + i as u64,
-                |i| {
-                    let (est, truth) = (world.sig_work(k, i, false), world.sig_work(k, i, true));
-                    if truth > 0.0 {
-                        DagJob::new(
-                            spec(0, k, critical.get(i).copied().unwrap_or(false)),
-                            vec![],
-                        )
-                        .with_work(cost(est, truth))
-                    } else {
-                        DagJob::passthrough(0, gid[k], vec![], 0.0)
-                    }
-                },
-                &[zero],
-                now,
-            )
-            .expect("the signature DAG is acyclic");
-            done_deps.extend(info.template.sinks().map(|i| base + i as u64));
-        }
-        dag.declare(
-            vec![DagJob::passthrough(zero + 2, gid[k], done_deps, 0.0)],
-            now,
-        )
-        .expect("walk-done is new");
-        dag.update_work(zero + 1, 0.0);
-    };
-
     loop {
-        if place.eager && now == 0.0 && tasks == 0 && !eager_done {
-            eager_done = true;
-            for k in 0..n {
-                instantiate(&mut dag, k, 0.0);
-            }
-        }
-        // Newly ready jobs: open bidegrees and release (respecting today's caps), before anything
-        // is placed.
+        // Newly ready jobs: release them (through the simulated coordinator's caps) before
+        // anything is placed.
         dag.policy_mut().open = false;
         let mut announced = std::mem::take(&mut carry);
         announced.extend(dag.poll(now));
@@ -1447,9 +1552,6 @@ pub fn simulate(
             match world.node(id) {
                 Node::Zero(k) => {
                     ready_at[k] = now;
-                    if !place.eager {
-                        instantiate(&mut dag, k, now);
-                    }
                     match caps {
                         Some((cap, _)) if open >= cap => open_queue.push_back(k),
                         _ => {
@@ -1458,15 +1560,7 @@ pub fn simulate(
                         }
                     }
                 }
-                Node::Sig(k, _) => match caps {
-                    Some((_, per)) if inflight[k] >= per => {
-                        sig_queue.entry(k).or_default().push_back(id)
-                    }
-                    _ => {
-                        inflight[k] += 1;
-                        dag.release(id, now);
-                    }
-                },
+                Node::Sig(k, _) => gates.ready(&mut dag, k, id, now),
                 other => unreachable!("{other:?} is a passthrough"),
             }
         }
@@ -1486,6 +1580,7 @@ pub fn simulate(
                         dag.release(4 * q as u64, now);
                     }
                 }
+                gates.walk_done(&mut dag, k, now);
             }
         }
         peak_open = peak_open.max(open);
@@ -1543,8 +1638,7 @@ pub fn simulate(
         }
         if tasks >= next_sample {
             next_sample = tasks + 65_536;
-            let s = dag.dag_stats();
-            peak_nodes = peak_nodes.max(s.pending + s.held + s.submitted + s.undeclared);
+            peak_nodes = peak_nodes.max(dag.dag_stats().nodes);
         }
 
         // Next instant: every event at it is applied before the next poll, as a coordinator that
@@ -1582,12 +1676,8 @@ pub fn simulate(
                     },
                     now,
                 );
-                if let (Node::Sig(k, _), Some(_)) = (world.node(id), caps) {
-                    inflight[k] -= 1;
-                    if let Some(next) = sig_queue.get_mut(&k).and_then(VecDeque::pop_front) {
-                        inflight[k] += 1;
-                        dag.release(next, now);
-                    }
+                if let Node::Sig(k, _) = world.node(id) {
+                    gates.done(&mut dag, k, now);
                 }
             }
             schedule(&mut workers[w], w, model, now, &mut queue);
@@ -1606,8 +1696,7 @@ pub fn simulate(
     let busy: f64 = workers.iter().map(|w| w.ps.busy).sum();
     WholeMetrics {
         plan: plan.name()
-            + &speed_name(&speed)
-            + if place.eager { ", eager" } else { "" }
+            + &place.speed.name()
             + &place
                 .max_open
                 .map_or(String::new(), |m| format!(", <= {m} open walks"))
@@ -1640,22 +1729,6 @@ pub fn simulate(
         dispatch_us: Quantiles::of(dispatch_us),
         sim_s: clock.elapsed().as_secs_f64(),
     }
-}
-
-/// A plan-name suffix describing speed-aware placement.
-pub fn speed_name(speed: &SpeedConfig) -> String {
-    let mut s = match speed.policy {
-        SpeedPolicy::Oblivious => String::new(),
-        SpeedPolicy::FastestFirst => ", fast first".into(),
-        SpeedPolicy::EarliestFinish(None) => ", earliest finish".into(),
-        SpeedPolicy::EarliestFinish(Some(d)) => {
-            format!(", earliest finish (wait <= {:.0}s)", d.max_wait)
-        }
-    };
-    if speed.learn.is_some() {
-        s += ", learned speeds";
-    }
-    s
 }
 
 /// A worker's per-task rate with `k` tasks running: its class's throughput, shared equally.
@@ -1820,6 +1893,21 @@ mod tests {
             );
         }
         assert_eq!(results[0].peak_open, 2);
+        // The simulated open-walk budget, and pinning per signature, keep every task.
+        for place in [
+            Placement {
+                max_open: Some(1),
+                ..Placement::default()
+            },
+            Placement {
+                pin: Pin::Critical,
+                ..Placement::default()
+            },
+        ] {
+            let m = simulate(&world, &fleet, &model, &Plan::Group, &place);
+            assert_eq!(m.tasks, expected, "{}", m.plan);
+            assert!(m.makespan_h * 3600.0 >= cp.max(cap) * (1.0 - 1e-9));
+        }
         // Speed-aware placement on a mixed fleet; waiting for a fast slot must not drag the
         // makespan out to its wait limit (stale wakeups once did).
         let mixed = Fleet {
@@ -1845,21 +1933,17 @@ mod tests {
                 ),
             ]),
         };
-        let place = |policy| Placement {
-            speed: SpeedConfig {
-                policy,
-                learn: None,
-                speculate: None,
+        let place = |fast, defer| Placement {
+            speed: SpeedPlan {
+                fast,
+                config: whelm::SpeedConfig {
+                    defer,
+                    ..whelm::SpeedConfig::default()
+                },
             },
             ..Placement::default()
         };
-        let fast = simulate(
-            &world,
-            &mixed,
-            &model,
-            &Plan::Group,
-            &place(SpeedPolicy::FastestFirst),
-        );
+        let fast = simulate(&world, &mixed, &model, &Plan::Group, &place(true, None));
         let defer = whelm::Defer {
             max_wait: 1e6,
             min_gain: 0.0,
@@ -1869,7 +1953,7 @@ mod tests {
             &mixed,
             &model,
             &Plan::Group,
-            &place(SpeedPolicy::EarliestFinish(Some(defer))),
+            &place(true, Some(defer)),
         );
         assert_eq!(eft.tasks, expected, "{}", eft.plan);
         assert!(

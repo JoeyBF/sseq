@@ -2,14 +2,16 @@
 
 use std::collections::HashMap;
 
-use whelm::{
-    Attempt, Config, DagConfig, DagJob, DagScheduler, GroupOrder, Input, JobSpec, Output, Policy,
-    Resources, Scheduler, SpeedConfig, WorkerState,
-};
 use serde::Serialize;
+use whelm::{
+    Attempt, Config, DagConfig, DagJob, DagScheduler, Input, JobSpec, OrderTerm, Output, Policy,
+    Resources, Scheduler, WorkerState,
+};
 
 use crate::{
     engine::Queue,
+    heft,
+    plan::SpeedPlan,
     whole::{mix, normal, uniform},
 };
 
@@ -80,6 +82,30 @@ pub enum Order {
         /// Rank on true costs.
         oracle: bool,
     },
+    /// An offline plan's order: each job's start in a [`heft`] schedule (on estimated costs, or
+    /// true costs when `oracle`) is its [`JobSpec::priority`].
+    Heft {
+        /// Plan on true costs.
+        oracle: bool,
+    },
+    /// Smith's rule ([`Config::weighted_completion`]): shortest estimated work first, all weights
+    /// being 1.
+    Wspt,
+}
+
+impl Order {
+    /// The scheduler's order terms, whether the DAG layer sets ranks, and whether ranks and plans
+    /// see true costs.
+    fn terms(self) -> (Vec<OrderTerm>, bool, bool) {
+        use OrderTerm::{Group, Priority, Rank};
+        match self {
+            Self::Group => (vec![Group], false, false),
+            Self::Rank { oracle } => (vec![Rank, Group], true, oracle),
+            Self::GroupRank { oracle } => (vec![Group, Rank], true, oracle),
+            Self::Heft { oracle } => (vec![Priority, Group], false, oracle),
+            Self::Wspt => (Config::weighted_completion().order, false, false),
+        }
+    }
 }
 
 /// A dispatch plan for small instances.
@@ -89,8 +115,8 @@ pub struct SmallPlan {
     pub order: Order,
     /// `Config::age_limit`.
     pub age_limit: Option<f64>,
-    /// Speed-aware placement.
-    pub speed: SpeedConfig,
+    /// Speed-aware placement and the machine model.
+    pub speed: SpeedPlan,
 }
 
 /// One simulation's outcome and features.
@@ -147,31 +173,31 @@ impl SmallInstance {
     pub fn jobs(&self) -> usize {
         self.tasks.iter().filter(|t| t.kind != Kind::Join).count()
     }
+
+    /// The speed of every slot of every worker: the machines of the offline models, which match
+    /// [`simulate_small`]'s exclusive slots.
+    pub fn machines(&self) -> Vec<f64> {
+        (self.classes.iter())
+            .flat_map(|c| std::iter::repeat_n(c.speed, (c.workers * c.slots) as usize))
+            .collect()
+    }
 }
 
 /// Simulate `inst` under `plan` through the real [`DagScheduler`] and policy engine. Workers run
 /// each job at their speed (exclusive slots, i.e. linear processor sharing). A speculative attempt
 /// holds its own slot until the first attempt of its job finishes and the other is stopped.
 pub fn simulate_small(inst: &SmallInstance, plan: &SmallPlan) -> SmallResult {
-    let (rank, oracle, group_first) = match plan.order {
-        Order::Group => (false, false, false),
-        Order::Rank { oracle } => (true, oracle, false),
-        Order::GroupRank { oracle } => (true, oracle, true),
-    };
+    let (order, rank, oracle) = plan.order.terms();
     let policy = Scheduler::new(Config {
-        order: whelm::Order::Priority {
-            default_priority: 0,
-            group_order: GroupOrder::Arrival,
-            group_first,
-        },
+        order,
         age_limit: plan.age_limit,
-        speed: plan.speed,
+        score: plan.speed.score(),
+        speed: plan.speed.config,
         ..Config::default()
     });
     let mut dag = DagScheduler::new(
         DagConfig {
             rank_priority: rank,
-            rank_scale: 1e6,
             default_work: 0.0,
             rank_epsilon: 0.0,
             ..DagConfig::default()
@@ -185,7 +211,7 @@ pub fn simulate_small(inst: &SmallInstance, plan: &SmallPlan) -> SmallResult {
         for _ in 0..c.workers {
             let id = speed.len() as u64;
             let state = WorkerState {
-                speed: c.speed,
+                speed: if plan.speed.learned() { 1.0 } else { c.speed },
                 ..WorkerState::new(
                     id,
                     c.name.clone(),
@@ -203,7 +229,9 @@ pub fn simulate_small(inst: &SmallInstance, plan: &SmallPlan) -> SmallResult {
         .iter()
         .map(|c| (c.workers * c.slots) as usize)
         .sum();
-    let jobs = inst
+    let priority = matches!(plan.order, Order::Heft { .. })
+        .then(|| heft::priorities(&heft::heft(inst, oracle)));
+    let jobs: Vec<DagJob> = inst
         .tasks
         .iter()
         .enumerate()
@@ -212,11 +240,10 @@ pub fn simulate_small(inst: &SmallInstance, plan: &SmallPlan) -> SmallResult {
             if t.kind == Kind::Join {
                 DagJob::passthrough(i as u64, t.group as u64, deps, 0.0)
             } else {
-                DagJob::new(
-                    JobSpec::new(i as u64, Resources::ZERO, t.group as u64),
-                    deps,
-                )
-                .with_work(if oracle { t.work } else { t.est })
+                let mut spec = JobSpec::new(i as u64, Resources::ZERO, t.group as u64)
+                    .with_kind(if t.kind == Kind::Zero { "zero" } else { "sig" });
+                spec.priority = priority.as_ref().map(|p| p[i]);
+                DagJob::new(spec, deps).with_work(if oracle { t.work } else { t.est })
             }
         })
         .collect();
@@ -578,11 +605,62 @@ pub fn perturb(inst: &SmallInstance, key: u64, structural: bool) -> SmallInstanc
     x
 }
 
+/// Jobs in a [`tiny`] instance: few enough for [`exact::solve`](crate::exact::solve) to prove
+/// optimality quickly.
+pub const TINY_JOBS: std::ops::RangeInclusive<usize> = 8..=20;
+
+/// A tiny mini-Nassau instance, for comparing plans against the exact optimum: a grid of at most
+/// two rows and four columns, short narrow walks, and two or three workers of one or two slots,
+/// with [`TINY_JOBS`] jobs. Parameters are drawn from `seed`, redrawn deterministically until the
+/// job count fits.
+pub fn tiny(seed: u64) -> SmallInstance {
+    for attempt in 0u64.. {
+        let key = mix(seed ^ mix(attempt));
+        let u = |k: u64| uniform(key ^ k);
+        let pick =
+            |k: u64, lo: u32, hi: u32| lo + ((u(k) * (hi - lo + 1) as f64) as u32).min(hi - lo);
+        let p = GridParams {
+            rows: pick(1, 1, 2),
+            cols: pick(2, 2, 4),
+            floor: pick(3, 1, 2),
+            depth: pick(4, 1, 2),
+            width: pick(5, 1, 3),
+            live: 0.5 + 0.5 * u(6),
+            growth: 1.0 + 0.3 * u(7),
+            row_decay: 0.5 + 0.5 * u(8),
+            sigma_task: 0.8 * u(9),
+            sigma_group: 0.4 * u(10),
+            fast_speed: 1.0 + 3.0 * u(11),
+            fast_workers: 1,
+            slow_workers: pick(13, 1, 2),
+            slots: pick(14, 1, 2),
+            seed: key,
+        };
+        let inst = grid(&p);
+        if TINY_JOBS.contains(&inst.jobs()) {
+            return inst;
+        }
+    }
+    unreachable!("the attempts are unbounded")
+}
+
 #[cfg(test)]
 mod tests {
-    use whelm::SpeedPolicy;
+    use whelm::{SpeedConfig, Timing};
 
     use super::*;
+
+    /// A plan with the given order and speed-awareness and nothing else.
+    fn plan(order: Order, fast: bool) -> SmallPlan {
+        SmallPlan {
+            order,
+            age_limit: None,
+            speed: SpeedPlan {
+                fast,
+                config: SpeedConfig::default(),
+            },
+        }
+    }
 
     /// The driver respects the bounds, and a single slot equals total work.
     #[test]
@@ -594,20 +672,14 @@ mod tests {
                 Order::Group,
                 Order::Rank { oracle: true },
                 Order::GroupRank { oracle: false },
+                Order::Heft { oracle: false },
+                Order::Wspt,
             ] {
-                for policy in [SpeedPolicy::Oblivious, SpeedPolicy::FastestFirst] {
-                    let plan = SmallPlan {
-                        order,
-                        age_limit: None,
-                        speed: SpeedConfig {
-                            policy,
-                            learn: None,
-                            speculate: None,
-                        },
-                    };
-                    let r = simulate_small(&inst, &plan);
+                for fast in [false, true] {
+                    let r = simulate_small(&inst, &plan(order, fast));
                     assert!(r.makespan >= wp.max(d) * (1.0 - 1e-9), "seed {seed}: {r:?}");
-                    // Graham: a greedy schedule on related machines is within W/P_slowest + D_slowest.
+                    // Graham: a greedy schedule on related machines is within
+                    // W/P_slowest + D_slowest.
                     let slow = inst
                         .classes
                         .iter()
@@ -628,14 +700,7 @@ mod tests {
             workers: 1,
             slots: 1,
         }];
-        let r = simulate_small(
-            &one,
-            &SmallPlan {
-                order: Order::Group,
-                age_limit: None,
-                speed: SpeedConfig::default(),
-            },
-        );
+        let r = simulate_small(&one, &plan(Order::Group, false));
         let work: f64 = one.tasks.iter().map(|t| t.work).sum();
         assert!((r.makespan - work / 2.0).abs() < 1e-9 * work);
     }
@@ -644,24 +709,49 @@ mod tests {
     /// simulator asserts it), and no schedule beats the lower bounds.
     #[test]
     fn speculation_runs_second_attempts() {
-        let plan = SmallPlan {
-            order: Order::Group,
-            age_limit: None,
-            speed: SpeedConfig {
-                policy: SpeedPolicy::FastestFirst,
-                learn: None,
-                speculate: Some(whelm::Speculate::default()),
-            },
-        };
+        let mut p = plan(Order::Group, true);
+        p.speed.config.speculate = Some(whelm::Speculate::default());
         let mut speculations = 0;
         for seed in 0..40 {
             let inst = grid(&GridParams::random(seed));
             let (wp, d) = inst.bounds();
-            let r = simulate_small(&inst, &plan);
+            let r = simulate_small(&inst, &p);
             assert!(r.makespan >= wp.max(d) * (1.0 - 1e-9), "seed {seed}: {r:?}");
             speculations += r.speculations;
         }
         assert!(speculations > 0);
+    }
+
+    /// Every machine model runs every instance to completion within the bounds.
+    #[test]
+    fn every_timing_finishes() {
+        for timing in [
+            Timing::Identical,
+            Timing::default(),
+            Timing::learned(),
+            Timing::unrelated(),
+        ] {
+            let mut p = plan(Order::Rank { oracle: false }, true);
+            p.speed.config.timing = timing;
+            for seed in 0..10 {
+                let inst = grid(&GridParams::random(seed));
+                let (wp, d) = inst.bounds();
+                let r = simulate_small(&inst, &p);
+                assert!(r.makespan >= wp.max(d) * (1.0 - 1e-9), "{timing:?}: {r:?}");
+            }
+        }
+    }
+
+    /// Tiny instances have the advertised size and stay valid.
+    #[test]
+    fn tiny_instances_fit() {
+        for seed in 0..50 {
+            let inst = tiny(seed);
+            assert!(TINY_JOBS.contains(&inst.jobs()), "seed {seed}");
+            for (i, t) in inst.tasks.iter().enumerate() {
+                assert!(t.deps.iter().all(|&d| (d as usize) < i));
+            }
+        }
     }
 
     /// Perturbations keep instances acyclic and well formed.
@@ -675,13 +765,6 @@ mod tests {
                 assert!(t.work.is_finite() && t.work >= 0.0);
             }
         }
-        simulate_small(
-            &inst,
-            &SmallPlan {
-                order: Order::Group,
-                age_limit: None,
-                speed: SpeedConfig::default(),
-            },
-        );
+        simulate_small(&inst, &plan(Order::Group, false));
     }
 }

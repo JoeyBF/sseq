@@ -24,7 +24,21 @@ cargo run --release --bin whelm-device
 # include +fast, +eft, +spec (speculative second attempts) and +age<seconds>.
 cargo run --release --bin whelm-pisa -- --a rank-oracle+fast --b group+fast typical --samples 2000
 cargo run --release --bin whelm-pisa -- --a rank-oracle+fast --b group+fast anneal --restarts 8
+
+# The same on tiny instances (8 to 20 jobs), with each plan's gap to the exact optimum.
+cargo run --release --bin whelm-pisa -- --a heft-oracle+fast --b group+fast --family tiny typical
 ```
+
+Plans order jobs by group (oldest bidegree first), by upward rank, or, in `whelm-pisa`, by an
+offline HEFT schedule (`heft`, `heft-oracle`: each job's planned start becomes its
+`JobSpec::priority`) or by Smith's rule (`wspt`). `--timing p|q|q-learn|r` picks the scheduler's
+machine model in `whelm-pisa` and `whelm-whole`: identical machines, related machines at reported
+or learned speeds, or unrelated machines learned per job kind and worker class.
+
+The exact oracle (`exact::solve`) is a branch and bound for Q|prec|Cmax with known durations,
+each worker slot a machine at its worker's speed. It reports whether it proved its makespan
+optimal or stopped at its node or time limit (`--nodes`, `--time-limit`) with the best schedule
+found; `--exact` runs it on other families too, where it mostly stops at the limit.
 
 Each binary's `--help` lists its options. `cargo test` runs the unit tests and the round trip of
 a logged run through the trace reader and the replay.

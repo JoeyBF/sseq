@@ -3,9 +3,10 @@
 use std::path::PathBuf;
 
 use clap::Parser;
-use whelm::{Defer, Learn, SpeedConfig, SpeedPolicy};
+use whelm::{Defer, Timing};
 use whelm_sim::{
     model::fit,
+    plan::{SpeedPlan, timing_named},
     trace::Trace,
     whole::{Census, Fleet, GroupKey, Pin, Placement, Plan, WholeConfig, World, simulate},
 };
@@ -48,9 +49,10 @@ struct Args {
     age_limit: f64,
     /// Plans: today, group, rank, rank-oracle, rank-noage, rank-oracle-noage, each with optional
     /// placement suffixes: "+fast" (fastest first), "+eft" (earliest finish, waiting up to
-    /// --max-defer for a faster worker), "+eft0" (earliest finish, no waiting), "+fastonly" (only
-    /// the fast class), "+cpop" (critical tasks pinned to the fast class), "+learn" (speeds learned online from completions,
-    /// every worker reporting 1), "+age" (aging at --age-limit for any plan), "+smajor"/"+tmajor"/
+    /// --max-defer for a faster worker), "+eft0" (earliest finish, no waiting: the same as
+    /// +fast), "+fastonly" (only the fast class), "+cpop" (critical tasks pinned to the fast
+    /// class), "+learn" (speeds learned online from completions, every worker reporting 1: --timing
+    /// q-learn for this plan), "+age" (aging at --age-limit for any plan), "+smajor"/"+tmajor"/
     /// "+stem" (bidegrees ordered by (s, t), (t, s) or (t - s, s) instead of by arrival).
     /// "grouprank[-oracle]": oldest bidegree first, rank within.
     #[arg(
@@ -74,15 +76,14 @@ struct Args {
     /// `DagConfig::rank_epsilon` for the rank plans.
     #[arg(long, default_value_t = 0.01)]
     rank_epsilon: f64,
-    /// At most this many walks open at once (a frontier budget; implicit walks only).
+    /// At most this many walks open at once: a frontier budget of the simulated coordinator,
+    /// which holds the jobs of further walks back (it changes the schedule).
     #[arg(long)]
     max_open: Option<usize>,
-    /// Expand walks as explicit graph nodes and edges instead of implicit instances.
-    #[arg(long)]
-    explicit: bool,
-    /// Expand every bidegree's walk at the start (instead of when its zero step is ready).
-    #[arg(long)]
-    eager: bool,
+    /// Machine model: p (identical), q (related, reported speeds), q-learn (related, learned,
+    /// every worker reporting 1) or r (unrelated: learned per job kind and worker class).
+    #[arg(long, default_value = "q", value_parser = timing_named)]
+    timing: Timing,
     /// Override a class's single-job speed, as class=speed,... (e.g. "l40s=1.39").
     #[arg(long, value_delimiter = ',')]
     class_speed: Vec<String>,
@@ -271,21 +272,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map(|p| {
             let mut parts = p.split('+');
             let plan = plan_named(parts.next().unwrap(), &args);
-            let mut speed = SpeedConfig::default();
+            let mut speed = SpeedPlan::default();
+            speed.config.timing = args.timing;
             let mut pin = Pin::None;
             let mut group_key = GroupKey::Arrival;
             let mut age_limit = None;
             for part in parts {
                 match part {
-                    "fast" => speed.policy = SpeedPolicy::FastestFirst,
+                    "fast" | "eft0" => speed.fast = true,
                     "eft" => {
-                        speed.policy = SpeedPolicy::EarliestFinish(Some(Defer {
+                        speed.fast = true;
+                        speed.config.defer = Some(Defer {
                             max_wait: args.max_defer,
                             min_gain: args.min_gain,
-                        }))
+                        });
                     }
-                    "eft0" => speed.policy = SpeedPolicy::EarliestFinish(None),
-                    "learn" => speed.learn = Some(Learn::default()),
+                    "learn" => speed.config.timing = Timing::learned(),
                     "age" => age_limit = Some(args.age_limit),
                     "smajor" => group_key = GroupKey::SMajor,
                     "tmajor" => group_key = GroupKey::TMajor,
@@ -301,8 +303,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     speed,
                     pin,
                     rank_epsilon: args.rank_epsilon,
-                    eager: args.eager,
-                    explicit: args.explicit,
                     max_open: args.max_open,
                     group_key,
                     age_limit,
@@ -322,7 +322,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
     println!(
         "\n## Plans\n\n| plan | makespan | vs bound | tasks | slot util | bidegree latency p50 | \
-         p90 | max | peak open | peak DAG nodes | dispatch mean/max | sim time \
+         p90 | max | peak open | peak materialised nodes | dispatch mean/max | sim time \
          |\n|---|---|---|---|---|---|---|---|---|---|---|---|"
     );
     let bound = cp.max(cap);

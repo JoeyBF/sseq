@@ -7,8 +7,14 @@ pub mod algebra;
 pub mod device;
 /// The pieces every simulator's event loop shares: the event queue and processor-sharing workers.
 pub mod engine;
+/// An exact branch-and-bound oracle for tiny instances.
+pub mod exact;
+/// Offline HEFT planning on small instances.
+pub mod heft;
 /// The processor-sharing service model and its fit to a trace.
 pub mod model;
+/// Speed-aware placement and machine models, as the simulators' plans name them.
+pub mod plan;
 /// The event-driven replay and its metrics.
 pub mod run;
 /// Small flat instances, their simulation and perturbations (PISA).

@@ -3,12 +3,15 @@
 use std::path::PathBuf;
 
 use clap::Parser;
-use whelm::{Defer, Speculate, SpeedConfig, SpeedPolicy};
+use whelm::{Defer, Speculate, SpeedConfig, Timing};
 use whelm_sim::{
+    exact::{self, Limits, Solution},
+    heft,
     model::fit,
+    plan::{SpeedPlan, timing_named},
     small::{
         GridParams, Kind, Order, SmallInstance, SmallPlan, SmallResult, grid, perturb,
-        simulate_small,
+        simulate_small, tiny,
     },
     trace::Trace,
     whole::{Census, Fleet, WholeConfig, World},
@@ -20,22 +23,42 @@ use whelm_sim::{
 /// whelm-pisa --a rank-oracle+fast --b group+fast typical --samples 2000
 /// whelm-pisa --a rank-oracle+fast --b group+fast anneal --restarts 8 --iters 3000
 /// whelm-pisa --a ... --b ... --family replica --trace T --census C... typical
+/// whelm-pisa --a heft-oracle+fast --b group+fast --family tiny typical --samples 200
 /// ```
 #[derive(Parser, Debug)]
 #[command(about = "Typical-case and adversarial comparison of two dispatch plans")]
 struct Args {
-    /// Plan A: group | rank | rank-oracle | grouprank | grouprank-oracle, with optional suffixes
-    /// +fast, +eft (wait up to --max-defer), `+eft<percent>` (wait only for that much gain),
-    /// +spec (a second attempt of a running job on an idle faster worker), `+age<seconds>`.
+    /// Plan A: group | rank | rank-oracle | grouprank | grouprank-oracle | heft | heft-oracle |
+    /// wspt, with optional suffixes +fast, +eft (wait up to --max-defer), `+eft<percent>` (wait
+    /// only for that much gain), +spec (a second attempt of a running job on an idle faster
+    /// worker), `+age<seconds>`. heft[-oracle]: an offline HEFT schedule (on estimated or true
+    /// costs) whose start order is every job's priority. wspt: Smith's rule, shortest estimated
+    /// work first.
     #[arg(long)]
     a: String,
     /// Plan B, as plan A.
     #[arg(long)]
     b: String,
-    /// Instance family: "grid" (mini-Nassau grids with random parameters) or "replica" (the real
-    /// world's first bidegrees, from --trace and --census, with perturbed costs).
+    /// Instance family: "grid" (mini-Nassau grids with random parameters), "tiny" (grids of 8 to
+    /// 20 jobs on two or three workers, solved exactly) or "replica" (the real world's first
+    /// bidegrees, from --trace and --census, with perturbed costs).
     #[arg(long, default_value = "grid")]
     family: String,
+    /// Machine model of both plans: p (identical), q (related, reported speeds), q-learn
+    /// (related, learned, every worker reporting 1) or r (unrelated: learned per job kind and
+    /// worker class).
+    #[arg(long, default_value = "q", value_parser = timing_named)]
+    timing: Timing,
+    /// Solve every instance exactly and report each plan's gap to the optimum (always on for
+    /// --family tiny; beyond tiny sizes the search mostly stops at its limits).
+    #[arg(long)]
+    exact: bool,
+    /// Exact search: node limit per instance.
+    #[arg(long, default_value_t = Limits::default().nodes)]
+    nodes: u64,
+    /// Exact search: time limit per instance, seconds.
+    #[arg(long, default_value_t = Limits::default().seconds)]
+    time_limit: f64,
     /// Replica: the scheduling trace.
     #[arg(long)]
     trace: Option<PathBuf>,
@@ -90,7 +113,7 @@ enum Mode {
 }
 
 /// Parse a plan name with suffixes.
-fn plan(name: &str, max_defer: f64) -> SmallPlan {
+fn plan(name: &str, max_defer: f64, timing: Timing) -> SmallPlan {
     let mut parts = name.split('+');
     let order = match parts.next().unwrap() {
         "group" => Order::Group,
@@ -98,40 +121,116 @@ fn plan(name: &str, max_defer: f64) -> SmallPlan {
         "rank-oracle" => Order::Rank { oracle: true },
         "grouprank" => Order::GroupRank { oracle: false },
         "grouprank-oracle" => Order::GroupRank { oracle: true },
+        "heft" => Order::Heft { oracle: false },
+        "heft-oracle" => Order::Heft { oracle: true },
+        "wspt" => Order::Wspt,
         other => panic!("unknown order {other}"),
     };
     let mut p = SmallPlan {
         order,
         age_limit: None,
-        speed: SpeedConfig::default(),
+        speed: SpeedPlan {
+            fast: false,
+            config: SpeedConfig {
+                timing,
+                ..SpeedConfig::default()
+            },
+        },
     };
     for s in parts {
         match s {
-            "fast" => p.speed.policy = SpeedPolicy::FastestFirst,
+            "fast" => p.speed.fast = true,
             "eft" => {
-                p.speed.policy = SpeedPolicy::EarliestFinish(Some(Defer {
+                p.speed.fast = true;
+                p.speed.config.defer = Some(Defer {
                     max_wait: max_defer,
                     min_gain: 0.0,
-                }))
+                });
             }
             "spec" => {
-                if p.speed.policy == SpeedPolicy::Oblivious {
-                    p.speed.policy = SpeedPolicy::FastestFirst;
-                }
-                p.speed.speculate = Some(Speculate::default());
+                p.speed.fast = true;
+                p.speed.config.speculate = Some(Speculate::default());
             }
             s if s.starts_with("age") => p.age_limit = Some(s[3..].parse().expect("+age<seconds>")),
             s if s.starts_with("eft") => {
                 let pct: f64 = s[3..].parse().expect("+eft<percent>");
-                p.speed.policy = SpeedPolicy::EarliestFinish(Some(Defer {
+                p.speed.fast = true;
+                p.speed.config.defer = Some(Defer {
                     max_wait: max_defer,
                     min_gain: pct / 100.0,
-                }))
+                });
             }
             other => panic!("unknown suffix +{other}"),
         }
     }
     p
+}
+
+/// Each plan's makespan over the optimum, minus one, and how many instances it hit the optimum
+/// on.
+#[derive(Default)]
+struct Gaps {
+    /// `(A, B, HEFT's offline schedule on true costs)` per instance.
+    rows: Vec<[f64; 3]>,
+    /// The exact searches.
+    solutions: Vec<Solution>,
+}
+
+impl Gaps {
+    /// Solve `inst` and record the gaps of A's and B's makespans and of HEFT's offline schedule.
+    fn add(&mut self, inst: &SmallInstance, ra: &SmallResult, rb: &SmallResult, limits: Limits) {
+        let sol = exact::solve(inst, limits);
+        let opt = sol.makespan.max(1e-12);
+        let h = heft::heft(inst, true).makespan;
+        self.rows.push([
+            ra.makespan / opt - 1.0,
+            rb.makespan / opt - 1.0,
+            h / opt - 1.0,
+        ]);
+        self.solutions.push(sol);
+    }
+
+    /// The report: a table of gaps and the search's effort.
+    fn print(&self, a: &str, b: &str) {
+        let n = self.rows.len();
+        let proved = self.solutions.iter().filter(|s| s.optimal).count();
+        println!(
+            "\n## Gap to the optimum (exact branch and bound)\n\n{proved} of {n} instances proved \
+             optimal{}\n\n| plan | mean gap | p50 | p90 | max | at the optimum \
+             |\n|---|---|---|---|---|---|",
+            if proved < n {
+                "; the others are gaps to the best schedule found, which understate them"
+            } else {
+                ""
+            }
+        );
+        for (c, name) in [a, b, "HEFT offline schedule (true costs)"]
+            .iter()
+            .enumerate()
+        {
+            let mut v: Vec<f64> = self.rows.iter().map(|r| r[c]).collect();
+            v.sort_by(f64::total_cmp);
+            let mean = v.iter().sum::<f64>() / n as f64;
+            let hit = v.iter().filter(|&&g| g <= 1e-9).count();
+            println!(
+                "| {name} | {:.2}% | {:.2}% | {:.2}% | {:.2}% | {:.1}% |",
+                100.0 * mean,
+                100.0 * q(&v, 0.5),
+                100.0 * q(&v, 0.9),
+                100.0 * q(&v, 1.0),
+                100.0 * hit as f64 / n as f64
+            );
+        }
+        let nodes: Vec<f64> = self.solutions.iter().map(|s| s.nodes as f64).collect();
+        let secs: Vec<f64> = self.solutions.iter().map(|s| s.seconds).collect();
+        println!(
+            "\nsearch: nodes mean {:.0}, max {:.0}; seconds mean {:.4}, max {:.4}",
+            nodes.iter().sum::<f64>() / n as f64,
+            nodes.iter().copied().fold(0.0, f64::max),
+            secs.iter().sum::<f64>() / n as f64,
+            secs.iter().copied().fold(0.0, f64::max)
+        );
+    }
 }
 
 /// One comparison: ln(A / B) and both results.
@@ -271,7 +370,15 @@ fn replica(args: &Args) -> Result<SmallInstance, Box<dyn std::error::Error>> {
 /// Run the comparison and report.
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
-    let (a, b) = (plan(&args.a, args.max_defer), plan(&args.b, args.max_defer));
+    let (a, b) = (
+        plan(&args.a, args.max_defer, args.timing),
+        plan(&args.b, args.max_defer, args.timing),
+    );
+    let exact = args.exact || args.family == "tiny";
+    let limits = Limits {
+        nodes: args.nodes,
+        seconds: args.time_limit,
+    };
     let base = (args.family == "replica")
         .then(|| replica(&args))
         .transpose()?;
@@ -285,6 +392,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // The k-th instance of the family.
     let instance = |k: u64| -> SmallInstance {
         match &base {
+            None if args.family == "tiny" => tiny(args.seed.wrapping_add(k)),
             None => grid(&GridParams::random(args.seed.wrapping_add(k))),
             Some(r) => {
                 let mut x = r.clone();
@@ -303,9 +411,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     match args.mode {
         Mode::Typical { samples } => {
             let (mut lns, mut x, mut names) = (Vec::new(), Vec::new(), Vec::new());
+            let mut gaps = Gaps::default();
             for k in 0..samples {
                 let inst = instance(k);
                 let (l, ra, rb) = compare(&inst, &a, &b);
+                if exact {
+                    gaps.add(&inst, &ra, &rb, limits);
+                }
                 if samples == 1 {
                     println!("A {ra:?}\nB {rb:?}");
                 }
@@ -347,6 +459,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             for (i, n) in names.iter().enumerate() {
                 let m = x.iter().map(|r| r[i + 1]).sum::<f64>() / x.len() as f64;
                 println!("| {n} | {:+.4} | {m:.4} |", beta[i + 1]);
+            }
+            if exact {
+                gaps.print(&args.a, &args.b);
+                out["gaps"] = serde_json::json!(gaps.rows);
+                out["exact"] = serde_json::json!(gaps.solutions);
             }
             out["ln_ratio"] = serde_json::json!(lns);
             out["features"] = serde_json::json!(names);
@@ -402,6 +519,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     e.exp(),
                     features(&inst, &ra, &rb)
                 );
+                if exact {
+                    let mut gaps = Gaps::default();
+                    gaps.add(&inst, &ra, &rb, limits);
+                    gaps.print(&args.a, &args.b);
+                }
                 out["witness"] = serde_json::to_value(&inst)?;
             }
         }

@@ -3,7 +3,7 @@
 use std::{path::PathBuf, time::Instant};
 
 use clap::Parser;
-use whelm::{Config, DagConfig, Fit, Reservations, Scheduler};
+use whelm::{Config, DagConfig, Reservations, Scheduler, ScoreTerm};
 use whelm_sim::{
     model::{ClassCurve, PsModel, fit},
     run::{Baseline, BoxPolicy, Metrics, SimSetup, Usage, production, simulate},
@@ -23,7 +23,8 @@ struct Args {
     #[arg(long)]
     trace: PathBuf,
     /// Policies to run (fifo, backfill, bestfit, backfill-shadow, bestfit-shadow,
-    /// backfill-noreserve).
+    /// backfill-noreserve, wspt). All rank workers by fit and load, not speed; wspt is backfill
+    /// with Smith's rule (shortest work first) as the order.
     #[arg(long, value_delimiter = ',', default_value = "fifo,backfill,bestfit")]
     policies: Vec<String>,
     /// Closed-loop arrivals (a job arrives the measured gap after its dependencies complete in the
@@ -101,6 +102,7 @@ fn make_policy(name: &str, a: &Args) -> Option<BoxPolicy> {
     let backfill = Config {
         reservations: Some(reservations),
         age_limit: a.age_limit,
+        score: vec![ScoreTerm::Preferred, ScoreTerm::Load],
         ..Config::default()
     };
     let shadow = Config {
@@ -110,15 +112,13 @@ fn make_policy(name: &str, a: &Args) -> Option<BoxPolicy> {
         }),
         ..backfill.clone()
     };
-    let tightest = Fit::Tightest {
-        prefer_penalty: 0.0,
-    };
+    let tightest = vec![ScoreTerm::Tightest, ScoreTerm::Preferred, ScoreTerm::Load];
     let config = match name {
         "fifo" => Config::fifo(),
         "backfill" => backfill,
         "backfill-shadow" => shadow,
         "bestfit-shadow" => Config {
-            fit: tightest,
+            score: tightest,
             ..shadow
         },
         "backfill-noreserve" => Config {
@@ -126,7 +126,11 @@ fn make_policy(name: &str, a: &Args) -> Option<BoxPolicy> {
             ..backfill
         },
         "bestfit" => Config {
-            fit: tightest,
+            score: tightest,
+            ..backfill
+        },
+        "wspt" => Config {
+            order: Config::weighted_completion().order,
             ..backfill
         },
         _ => return None,
@@ -252,7 +256,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         heartbeat_s: args.heartbeat,
         closed_loop: args.closed.then(|| DagConfig {
             rank_priority: args.rank,
-            rank_scale: 1.0,
             ..DagConfig::default()
         }),
         big_gb: args.big_gb,

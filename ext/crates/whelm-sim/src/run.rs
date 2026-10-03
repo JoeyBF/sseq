@@ -2,10 +2,10 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
+use serde::Serialize;
 use whelm::{
     DagConfig, DagJob, DagScheduler, Input, JobSpec, Output, Policy, Resources, WorkerState,
 };
-use serde::Serialize;
 
 use crate::{
     engine::{PsWorker, Queue},
@@ -357,15 +357,12 @@ pub fn simulate(setup: &SimSetup, name: &str, policy: BoxPolicy) -> Metrics {
                 },
                 policy,
             );
-            let jobs = deps
+            let jobs: Vec<DagJob> = deps
                 .into_iter()
                 .enumerate()
-                .map(|(j, d)| DagJob {
-                    spec: spec(setup, j),
-                    deps: d.into_iter().map(|x| x as u64).collect(),
-                    work_estimate: Some(setup.work[j]),
-                    passthrough: false,
-                    local: false,
+                .map(|(j, d)| {
+                    let deps = d.into_iter().map(|x| x as u64).collect();
+                    DagJob::new(spec(setup, j), deps).with_work(setup.work[j])
                 })
                 .collect();
             dag.declare(jobs, 0.0)

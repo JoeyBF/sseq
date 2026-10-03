@@ -1,8 +1,8 @@
 //! A synthetic device-memory scenario: small cards whose launch pool makes over-subscribed jobs
 //! wait, with and without device-aware admission.
 
-use whelm::{Config, Input, JobId, JobSpec, Output, Policy, Resources, Scheduler, WorkerState};
 use serde::Serialize;
+use whelm::{Config, Input, JobId, JobSpec, Output, Policy, Resources, Scheduler, WorkerState};
 
 use crate::engine::{PsWorker, Queue, Run};
 
