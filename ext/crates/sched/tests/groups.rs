@@ -1,7 +1,7 @@
 //! Group order: restart-stable ordering by id, and aging behind a wide old group.
 
 use sched::{
-    Config, DEFAULT_AGE_LIMIT, GroupOrder, Input, JobId, JobSpec, Order, Output, Policy, Resources,
+    Config, DEFAULT_AGE_LIMIT, GroupOrder, Input, JobId, JobSpec, Output, Policy, Resources,
     Scheduler, WorkerId, WorkerState, nassau,
 };
 
@@ -15,19 +15,10 @@ fn starts(out: Vec<Output>) -> Vec<(JobId, WorkerId)> {
         .collect()
 }
 
-/// Priority order with the given group order.
-fn by(group_order: GroupOrder) -> Order {
-    Order::Priority {
-        default_priority: 0,
-        group_order,
-        group_first: false,
-    }
-}
-
 /// The order in which a one-slot worker runs jobs submitted in `order` (group = job id here).
 fn run_order(order: &[u64], group_order: GroupOrder) -> Vec<u64> {
     let mut p = Scheduler::new(Config {
-        order: by(group_order),
+        group_order,
         ..Config::default()
     });
     for (i, &g) in order.iter().enumerate() {
@@ -137,7 +128,7 @@ fn young_group_behind_wide_old_group_waits_at_most_age_limit() {
         }
     };
     let by_id = |base: Config, age_limit| Config {
-        order: by(GroupOrder::Id),
+        group_order: GroupOrder::Id,
         age_limit,
         ..base
     };

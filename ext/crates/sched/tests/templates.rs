@@ -207,9 +207,9 @@ fn templates_instantiate_per_group() {
     assert_eq!(flat, vec![10, 11, 13, 20, 21, 23]);
 }
 
-/// Avoid lists and classes exclude workers; a job excluded everywhere waits and says so.
+/// Forbids and required classes exclude workers; a job excluded everywhere waits and says so.
 #[test]
-fn avoid_and_class_are_hard_constraints() {
+fn forbid_and_class_are_hard_constraints() {
     let mut p = Scheduler::new(Config::default());
     let join = |p: &mut Scheduler, id, class, slots, now| {
         let w = WorkerState::new(id, class, slots, Resources::mem(100));
@@ -217,17 +217,15 @@ fn avoid_and_class_are_hard_constraints() {
     };
     join(&mut p, 1, "h200", 4, 0.0);
     join(&mut p, 2, "l40s", 4, 0.0);
-    let mut retry = JobSpec::new(1, Resources::mem(1), 0);
-    retry.avoid = vec![1];
-    retry.prefer = vec![1];
+    let retry = JobSpec::new(1, Resources::mem(1), 0)
+        .forbid_worker(1)
+        .prefer_worker(1);
     p.handle(Input::Submit(retry), 0.0);
-    let mut pinned = JobSpec::new(2, Resources::mem(1), 0);
-    pinned.class = Some("h200".into());
+    let pinned = JobSpec::new(2, Resources::mem(1), 0).require_class("h200");
     p.handle(Input::Submit(pinned), 0.0);
     assert_eq!(starts(&mut p, 0.0), vec![(1, 2), (2, 1)]);
     // A job excluded everywhere waits, and says why.
-    let mut nowhere = JobSpec::new(3, Resources::mem(1), 0);
-    nowhere.class = Some("v100".into());
+    let nowhere = JobSpec::new(3, Resources::mem(1), 0).require_class("v100");
     p.handle(Input::Submit(nowhere), 1.0);
     assert!(starts(&mut p, 1.0).is_empty());
     assert!(p.explain(3).unwrap().contains("2 worker(s) excluded"));

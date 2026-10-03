@@ -181,7 +181,6 @@ fn cancel_cascades_to_dependents() {
 fn ranks_follow_the_critical_path() {
     let mut d = dag(DagConfig {
         rank_priority: true,
-        rank_scale: 1.0,
         ..DagConfig::default()
     });
     let w = |id, deps: &[JobId], work| DagJob {

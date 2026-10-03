@@ -4,38 +4,57 @@ use crate::Learn;
 
 /// How a [`Scheduler`](crate::Scheduler) behaves: plain data, with presets.
 ///
-/// [`Default`] is priority order with aging, one reservation and least-loaded placement;
-/// [`Config::fifo`] and [`Config::best_fit`] are the other presets. Every field is independent of
-/// the others.
+/// A configuration is a list-scheduling rule: [`order`](Self::order) says which waiting job goes
+/// first and [`score`](Self::score) which of the workers that admit it it goes to. The presets map
+/// objectives to rules. On one machine some of these rules are optimal (Smith's rule for weighted
+/// completion time, Jackson's rule for maximum lateness); on many machines, with resources and
+/// online arrivals, every one of them is a heuristic.
+///
+/// - [`Default`]: makespan with bounded latency. Explicit priority, rank, group, then arrival;
+///   aging and one reservation; fastest, preferred, then least loaded worker.
+/// - [`Config::fifo`]: arrival order, no aging or reservations. A baseline.
+/// - [`Config::best_fit`]: the default, packing each job into the tightest worker.
+/// - [`Config::weighted_completion`]: weighted completion time ([`OrderTerm::Wspt`]).
+/// - [`Config::lateness`]: maximum lateness ([`OrderTerm::Edd`]).
 #[derive(Clone, Debug, PartialEq)]
 pub struct Config {
-    /// The order waiting jobs are considered in. Default [`Order::default`].
-    pub order: Order,
+    /// The order waiting jobs are considered in: lexicographic over these terms, then submission
+    /// order. A term listed twice adds nothing; the repeat is ignored.
+    pub order: Vec<OrderTerm>,
+    /// How [`OrderTerm::Group`] orders groups. Default [`GroupOrder::Arrival`].
+    pub group_order: GroupOrder,
+    /// The priority of jobs whose [`JobSpec::priority`](crate::JobSpec::priority) is `None`, for
+    /// [`OrderTerm::Priority`]. Default 0, so negative priorities jump ahead of unprioritised jobs
+    /// and positive ones fall behind them.
+    pub default_priority: i64,
     /// Aging: a job that has waited at least this long (seconds) becomes more urgent than every
-    /// job that has not, oldest first. Strict priority starves a job for as long as more urgent
-    /// jobs keep arriving (a young group behind a wide old one), and this bounds it. Default
-    /// [`DEFAULT_AGE_LIMIT`]; `None` is strict priority.
+    /// job that has not, oldest first, whatever [`order`](Self::order) says. Strict priority
+    /// starves a job for as long as more urgent jobs keep arriving (a young group behind a wide
+    /// old one), and this bounds it. Default [`DEFAULT_AGE_LIMIT`]; `None` is strict priority.
     pub age_limit: Option<f64>,
     /// Workers drained for starving jobs. Default [`Reservations::default`]; `None` allows
     /// starvation of jobs larger than the typical headroom.
     pub reservations: Option<Reservations>,
-    /// Which of the workers that admit a job it goes to. Default [`Fit::LeastLoaded`].
-    pub fit: Fit,
-    /// Speed-aware placement. Default: oblivious.
+    /// Which of the workers that admit a job it goes to: lexicographic over these terms, then the
+    /// smallest worker id. A term listed twice adds nothing; the repeat is ignored.
+    pub score: Vec<ScoreTerm>,
+    /// Speed learning, deferral and speculation. Default: none of them.
     pub speed: SpeedConfig,
     /// Retries of failed attempts. Default [`RetryConfig::default`].
     pub retry: RetryConfig,
 }
 
 impl Default for Config {
-    /// Priority order, [`DEFAULT_AGE_LIMIT`], one reservation, least loaded, speed-oblivious,
-    /// default retries.
+    /// Order `[Priority, Rank, Group]`, [`DEFAULT_AGE_LIMIT`], one reservation, score `[Speed,
+    /// Preferred, Load]`, default retries.
     fn default() -> Self {
         Self {
-            order: Order::default(),
+            order: vec![OrderTerm::Priority, OrderTerm::Rank, OrderTerm::Group],
+            group_order: GroupOrder::Arrival,
+            default_priority: 0,
             age_limit: Some(DEFAULT_AGE_LIMIT),
             reservations: Some(Reservations::default()),
-            fit: Fit::LeastLoaded,
+            score: vec![ScoreTerm::Speed, ScoreTerm::Preferred, ScoreTerm::Load],
             speed: SpeedConfig::default(),
             retry: RetryConfig::default(),
         }
@@ -43,26 +62,46 @@ impl Default for Config {
 }
 
 impl Config {
-    /// Arrival order, no aging, no reservations, least loaded: each job takes any worker that
-    /// admits it, and jobs larger than the typical headroom starve. A baseline.
+    /// Arrival order, no aging, no reservations, score `[Preferred, Load]`: each job takes any
+    /// worker that admits it, and jobs larger than the typical headroom starve. A baseline.
     pub fn fifo() -> Self {
         Self {
-            order: Order::Fifo,
+            order: Vec::new(),
             age_limit: None,
             reservations: None,
-            fit: Fit::LeastLoaded,
-            speed: SpeedConfig::default(),
-            retry: RetryConfig::default(),
+            score: vec![ScoreTerm::Preferred, ScoreTerm::Load],
+            ..Self::default()
         }
     }
 
-    /// The default with [`Fit::Tightest`] and no preference penalty: packs small jobs tightly and
+    /// The default with score `[Speed, Tightest, Preferred, Load]`: packs small jobs tightly and
     /// keeps big holes open.
     pub fn best_fit() -> Self {
         Self {
-            fit: Fit::Tightest {
-                prefer_penalty: 0.0,
-            },
+            score: vec![
+                ScoreTerm::Speed,
+                ScoreTerm::Tightest,
+                ScoreTerm::Preferred,
+                ScoreTerm::Load,
+            ],
+            ..Self::default()
+        }
+    }
+
+    /// The default with order `[Priority, Wspt]`, for the sum of weighted completion times:
+    /// Smith's rule, optimal on one machine.
+    pub fn weighted_completion() -> Self {
+        Self {
+            order: vec![OrderTerm::Priority, OrderTerm::Wspt],
+            ..Self::default()
+        }
+    }
+
+    /// The default with order `[Priority, Edd]`, for maximum lateness: Jackson's rule, optimal on
+    /// one machine.
+    pub fn lateness() -> Self {
+        Self {
+            order: vec![OrderTerm::Priority, OrderTerm::Edd],
             ..Self::default()
         }
     }
@@ -72,35 +111,46 @@ impl Config {
 /// 8x at no throughput cost.
 pub const DEFAULT_AGE_LIMIT: f64 = 1800.0;
 
-/// The order waiting jobs are considered in (after aged jobs, see [`Config::age_limit`]).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Order {
-    /// Submission order.
-    Fifo,
-    /// By [`JobSpec::priority`](crate::JobSpec::priority), then group, then submission order.
-    Priority {
-        /// The priority of jobs whose [`JobSpec::priority`](crate::JobSpec::priority) is `None`.
-        default_priority: i64,
-        /// How groups are ordered against each other.
-        group_order: GroupOrder,
-        /// Order by group, then by priority within the group (instead of priority first). With
-        /// DAG-rank priorities this is "oldest group first, critical path within it".
-        group_first: bool,
-    },
+/// One term of [`Config::order`]. Every key is computed once, at submission; a job that lacks
+/// what a term reads sorts after every job that has it, within that term.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum OrderTerm {
+    /// [`JobSpec::priority`](crate::JobSpec::priority), smallest first; unset counts as
+    /// [`Config::default_priority`].
+    Priority,
+    /// [`JobSpec::rank`](crate::JobSpec::rank), largest first: the longest remaining chain first,
+    /// as in HEFT. Set by the DAG layer; unset sorts last.
+    Rank,
+    /// [`JobSpec::group`](crate::JobSpec::group), in [`Config::group_order`].
+    Group,
+    /// Weighted shortest processing time, Smith's rule: largest
+    /// [`weight`](crate::JobSpec::weight) over [`work`](crate::JobSpec::work) first. Jobs without
+    /// a work estimate sort last.
+    Wspt,
+    /// Earliest due date, Jackson's rule: smallest [`due`](crate::JobSpec::due) first. Jobs
+    /// without one sort last.
+    Edd,
 }
 
-impl Default for Order {
-    /// Priority 0 by default, groups by arrival, priority before group.
-    fn default() -> Self {
-        Self::Priority {
-            default_priority: 0,
-            group_order: GroupOrder::Arrival,
-            group_first: false,
-        }
-    }
+/// One term of [`Config::score`], ranking the workers that admit a job.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ScoreTerm {
+    /// The fastest first ([`WorkerState::speed`](crate::WorkerState::speed), or learned). With
+    /// [`Learn`] and a resolution, speeds within one resolution step of each other tie, so
+    /// per-worker noise does not override the later terms.
+    Speed,
+    /// The tightest fit: the smallest [`WorkerView::free_share`](crate::WorkerView::free_share)
+    /// after placement.
+    Tightest,
+    /// The loosest fit: the largest free share after placement.
+    Loosest,
+    /// Workers a [`Strength::Prefer`](crate::Strength::Prefer) constraint selects first.
+    Preferred,
+    /// The fewest live attempts.
+    Load,
 }
 
-/// How [`JobSpec::group`](crate::JobSpec::group)s are ordered against each other.
+/// How [`OrderTerm::Group`] orders [`JobSpec::group`](crate::JobSpec::group)s.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum GroupOrder {
     /// By the group's first submission: "oldest group first". Depends on the order the caller
@@ -159,40 +209,10 @@ impl Default for Reservations {
     }
 }
 
-/// Which of the workers that admit a job it goes to. Preferred workers
-/// ([`JobSpec::prefer`](crate::JobSpec::prefer)) and then the fewest running jobs break ties.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub enum Fit {
-    /// The least loaded (fewest running jobs), preferred workers first.
-    #[default]
-    LeastLoaded,
-    /// The tightest fit: the smallest [`WorkerView::free_share`](crate::WorkerView::free_share)
-    /// after placement.
-    Tightest {
-        /// How much a preferred worker is favoured, as a fraction of capacity: it competes as if
-        /// its free share after placement were this much smaller. 0 makes preference a pure
-        /// tie-breaker.
-        prefer_penalty: f64,
-    },
-}
-
-/// How worker speed ([`WorkerState::speed`](crate::WorkerState::speed)) enters placement.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub enum SpeedPolicy {
-    /// Speed is ignored (the default).
-    #[default]
-    Oblivious,
-    /// Among the workers that admit a job, the fastest first; load and fit break ties within a
-    /// speed. On a span-bound run this is the single largest placement lever.
-    FastestFirst,
-    /// Earliest expected finish: like `FastestFirst` among workers free now, and, with
-    /// [`Defer`], a job with [`JobSpec::work`](crate::JobSpec::work) may wait for a busy faster
-    /// worker whose slot is expected to free soon enough that it would still finish earlier there
-    /// (HEFT's processor choice, online; StarPU's dmda with a deferral window).
-    EarliestFinish(Option<Defer>),
-}
-
-/// When a job may wait for a faster, busy worker instead of starting on a slower free one.
+/// When a job may wait for a busy worker faster than the one [`Config::score`] picked, instead of
+/// starting there: earliest finish time with a deferral window (HEFT's processor choice, online;
+/// StarPU's dmda). A job with [`JobSpec::work`](crate::JobSpec::work) waits for the full, faster
+/// worker on which it is expected to finish earliest, if that beats starting now by enough.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Defer {
     /// A job that has waited this long (seconds) no longer defers. Bounds the extra waiting;
@@ -214,14 +234,15 @@ impl Default for Defer {
     }
 }
 
-/// Speed-aware placement settings.
+/// Speed-aware settings. How speed ranks workers is [`ScoreTerm::Speed`]'s place in
+/// [`Config::score`].
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct SpeedConfig {
-    /// How speed orders the candidate workers.
-    pub policy: SpeedPolicy,
     /// Learn each worker class's speed from completion times instead of trusting
     /// [`WorkerState::speed`](crate::WorkerState::speed).
     pub learn: Option<Learn>,
+    /// Wait for a faster busy worker when it pays.
+    pub defer: Option<Defer>,
     /// Start a second attempt of a running job on a faster worker that would otherwise stay idle.
     pub speculate: Option<Speculate>,
 }

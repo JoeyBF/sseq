@@ -397,7 +397,7 @@ impl<P: Policy> DagScheduler<P> {
         if let Some(d) = &inst.demand {
             spec.demand = d[i];
         }
-        if self.config.rank_priority && spec.priority.is_none() {
+        if self.config.rank_priority && spec.rank.is_none() {
             // The rank below the instance, now (it may have grown since the instance opened).
             let done_rank = self
                 .index
@@ -405,9 +405,7 @@ impl<P: Policy> DagScheduler<P> {
                 .map_or(0.0, |&d| self.graph[d].rank);
             let below = inst.below[i];
             let group = spec.group;
-            let rank = below + done_rank + self.group_tail(group);
-            let p = -(rank * self.config.rank_scale).round();
-            spec.priority = Some(p.clamp(i64::MIN as f64, i64::MAX as f64) as i64);
+            spec.rank = Some(below + done_rank + self.group_tail(group));
         }
         self.policy.handle(Input::Submit(spec), now);
     }

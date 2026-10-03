@@ -1,108 +1,47 @@
 //! Property tests of the policy invariants over random event streams.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    cmp::Ordering,
+    collections::{BTreeMap, BTreeSet},
+};
 
 use proptest::prelude::*;
 use sched::{
-    Attempt, Config, DIMS, Defer, FailKind, Fit, GaveUp, GroupOrder, Input, JobId, JobSpec, Order,
-    Output, Policy, Reservations, Resources, RetryConfig, Scheduler, Speculate, SpeedConfig,
-    SpeedPolicy, Tried, WorkerId, WorkerState,
+    Attempt, Config, Constraint, DIMS, Defer, FailKind, GaveUp, GroupOrder, Input, JobId, JobSpec,
+    OrderTerm, Output, Policy, Reservations, Resources, RetryConfig, SLOTS, Scheduler, ScoreTerm,
+    Selector, Speculate, SpeedConfig, Strength, Tried, WorkerId, WorkerState,
 };
 
+/// The configuration under test, minus speed and retries.
 #[derive(Clone, Debug)]
-enum Kind {
-    Fifo,
-    Backfill {
-        max_res: usize,
-        per_class: bool,
-        age: Option<f64>,
-        group_first: bool,
-    },
-    BestFit {
-        penalty: f64,
-        age: Option<f64>,
-    },
+struct Rule {
+    order: Vec<OrderTerm>,
+    group_order: GroupOrder,
+    default_priority: i64,
+    age: Option<f64>,
+    /// Reservation limit and whether it is per class; `None` for no reservations.
+    reservations: Option<(usize, bool)>,
+    score: Vec<ScoreTerm>,
 }
 
-impl Kind {
+impl Rule {
     /// The policy under test.
     fn build(&self, speed: SpeedConfig, retry: RetryConfig) -> Box<dyn Policy> {
-        let config = |max, per_class, age_limit, group_first, group_order| Config {
-            order: Order::Priority {
-                default_priority: 0,
-                group_order,
-                group_first,
-            },
-            reservations: Some(Reservations {
+        Box::new(Scheduler::new(Config {
+            order: self.order.clone(),
+            group_order: self.group_order,
+            default_priority: self.default_priority,
+            age_limit: self.age,
+            reservations: self.reservations.map(|(max, per_class)| Reservations {
                 reserve_after: 30.0,
                 max,
                 per_class,
                 shadow_backfill: false,
             }),
-            age_limit,
+            score: self.score.clone(),
             speed,
             retry,
-            ..Config::default()
-        };
-        Box::new(Scheduler::new(match *self {
-            Kind::Fifo => Config {
-                speed,
-                retry,
-                ..Config::fifo()
-            },
-            Kind::Backfill {
-                max_res,
-                per_class,
-                age,
-                group_first,
-            } => config(max_res, per_class, age, group_first, GroupOrder::Arrival),
-            Kind::BestFit { penalty, age } => Config {
-                fit: Fit::Tightest {
-                    prefer_penalty: penalty,
-                },
-                ..config(1, false, age, false, GroupOrder::Id)
-            },
         }))
-    }
-
-    /// Whether the priority invariant applies.
-    fn priority(&self) -> bool {
-        !matches!(self, Kind::Fifo)
-    }
-
-    /// The configured age limit.
-    fn age(&self) -> Option<f64> {
-        match *self {
-            Kind::Backfill { age, .. } | Kind::BestFit { age, .. } => age,
-            _ => None,
-        }
-    }
-
-    /// Whether groups are ordered by id (else by first arrival).
-    fn by_id(&self) -> bool {
-        matches!(self, Kind::BestFit { .. })
-    }
-
-    /// Whether groups come before priorities.
-    fn group_first(&self) -> bool {
-        matches!(
-            self,
-            Kind::Backfill {
-                group_first: true,
-                ..
-            }
-        )
-    }
-
-    /// The reservation limit and whether it is per class.
-    fn max_reservations(&self) -> (usize, bool) {
-        match *self {
-            Kind::Fifo => (0, false),
-            Kind::Backfill {
-                max_res, per_class, ..
-            } => (max_res, per_class),
-            Kind::BestFit { .. } => (1, false),
-        }
     }
 }
 
@@ -110,12 +49,14 @@ impl Kind {
 enum Op {
     Submit {
         demand: u64,
+        /// What the caller writes in the slot component, which the policy overrides.
+        slots: u64,
         group: u64,
         priority: Option<i64>,
-        prefer: Option<WorkerId>,
-        avoid: Option<WorkerId>,
-        avoid_soft: bool,
-        class: Option<u8>,
+        rank: Option<u8>,
+        weight: f64,
+        due: Option<u16>,
+        constraints: Vec<Constraint>,
         work: Option<u32>,
         dev: Option<u64>,
     },
@@ -149,6 +90,21 @@ fn index() -> impl Strategy<Value = usize> {
     any::<prop::sample::Index>().prop_map(|i| i.index(1 << 16))
 }
 
+/// A random constraint over the workers and classes the streams use.
+fn constraint() -> impl Strategy<Value = Constraint> {
+    let on = prop_oneof![
+        (0u64..4).prop_map(Selector::Worker),
+        (0u8..2).prop_map(|c| Selector::Class(format!("c{c}"))),
+    ];
+    let strength = prop_oneof![
+        Just(Strength::Require),
+        Just(Strength::Forbid),
+        Just(Strength::Avoid),
+        Just(Strength::Prefer),
+    ];
+    (on, strength).prop_map(|(on, strength)| Constraint { on, strength })
+}
+
 /// A random event.
 fn op() -> impl Strategy<Value = Op> {
     let kind = prop_oneof![
@@ -156,31 +112,34 @@ fn op() -> impl Strategy<Value = Op> {
         Just(FailKind::Other),
         Just(FailKind::Timeout)
     ];
-    prop_oneof![
-        6 => (
-            1u64..80,
-            0u64..4,
-            prop::option::weighted(0.2, -2i64..3),
-            prop::option::of(0u64..4),
-            prop::option::weighted(0.2, 0u64..4),
-            any::<bool>(),
-            prop::option::weighted(0.15, 0u8..2),
-            prop::option::weighted(0.7, 1u32..120),
-            prop::option::weighted(0.5, 1u64..40),
-        )
-            .prop_map(|(demand, group, priority, prefer, avoid, avoid_soft, class, work, dev)| {
+    let submit = (
+        (1u64..80, 0u64..3, 0u64..4),
+        prop::option::weighted(0.2, -2i64..3),
+        prop::option::weighted(0.5, 0u8..6),
+        prop_oneof![Just(1.0), Just(0.5), Just(3.0)],
+        prop::option::weighted(0.5, 0u16..300),
+        prop::option::weighted(0.4, prop::collection::vec(constraint(), 1..3)),
+        prop::option::weighted(0.7, 1u32..120),
+        prop::option::weighted(0.5, 1u64..40),
+    )
+        .prop_map(
+            |((demand, slots, group), priority, rank, weight, due, constraints, work, dev)| {
                 Op::Submit {
                     demand,
+                    slots,
                     group,
                     priority,
-                    prefer,
-                    avoid,
-                    avoid_soft,
-                    class,
+                    rank,
+                    weight,
+                    due,
+                    constraints: constraints.unwrap_or_default(),
                     work,
                     dev,
                 }
-            }),
+            },
+        );
+    prop_oneof![
+        6 => submit,
         4 => (index(), index()).prop_map(|(j, a)| Op::Complete(j, a)),
         2 => (index(), index(), kind).prop_map(|(j, a, k)| Op::Fail(j, a, k)),
         1 => (index(), index(), any::<bool>())
@@ -211,19 +170,13 @@ fn class_speed(class: u8) -> f64 {
 
 /// A random speed configuration.
 fn speed() -> impl Strategy<Value = SpeedConfig> {
-    let policy =
-        prop_oneof![
-            Just(SpeedPolicy::Oblivious),
-            Just(SpeedPolicy::FastestFirst),
-            Just(SpeedPolicy::EarliestFinish(None)),
-            (
-                prop_oneof![Just(0.0), Just(0.2)],
-                prop_oneof![Just(40.0), Just(500.0)]
-            )
-                .prop_map(|(min_gain, max_wait)| SpeedPolicy::EarliestFinish(Some(
-                    Defer { max_wait, min_gain }
-                ))),
-        ];
+    let defer = prop::option::of(
+        (
+            prop_oneof![Just(0.0), Just(0.2)],
+            prop_oneof![Just(40.0), Just(500.0)],
+        )
+            .prop_map(|(min_gain, max_wait)| Defer { max_wait, min_gain }),
+    );
     let speculate = prop::option::weighted(
         0.4,
         (prop_oneof![Just(0.0), Just(0.25)], 1u32..3).prop_map(|(min_gain, max_per_job)| {
@@ -234,34 +187,117 @@ fn speed() -> impl Strategy<Value = SpeedConfig> {
             }
         }),
     );
-    (policy, speculate).prop_map(|(policy, speculate)| SpeedConfig {
-        policy,
+    (defer, speculate).prop_map(|(defer, speculate)| SpeedConfig {
         learn: None,
+        defer,
         speculate,
     })
 }
 
-/// A random policy configuration.
-fn kind() -> impl Strategy<Value = Kind> {
+/// A random list-scheduling rule: any order and score terms, in any order, sometimes repeated.
+fn rule() -> impl Strategy<Value = Rule> {
+    let order = prop::sample::subsequence(
+        vec![
+            OrderTerm::Priority,
+            OrderTerm::Rank,
+            OrderTerm::Group,
+            OrderTerm::Wspt,
+            OrderTerm::Edd,
+        ],
+        0..=5,
+    )
+    .prop_shuffle();
+    let score = prop::sample::subsequence(
+        vec![
+            ScoreTerm::Speed,
+            ScoreTerm::Tightest,
+            ScoreTerm::Loosest,
+            ScoreTerm::Preferred,
+            ScoreTerm::Load,
+        ],
+        0..=5,
+    )
+    .prop_shuffle();
+    // Repeat the first term at the end, sometimes.
+    let repeat = |mut v: Vec<OrderTerm>, again: bool| {
+        if again && let Some(&t) = v.first() {
+            v.push(t);
+        }
+        v
+    };
     let age = prop::option::of(prop_oneof![Just(0.0), Just(45.0), Just(200.0)]);
-    prop_oneof![
-        Just(Kind::Fifo),
-        (0usize..3, any::<bool>(), age.clone(), any::<bool>()).prop_map(
-            |(max_res, per_class, age, group_first)| Kind::Backfill {
-                max_res,
-                per_class,
+    let reservations = prop::option::weighted(0.7, (0usize..3, any::<bool>()));
+    (
+        (order, any::<bool>()).prop_map(move |(o, again)| repeat(o, again)),
+        prop_oneof![Just(GroupOrder::Arrival), Just(GroupOrder::Id)],
+        -1i64..2,
+        age,
+        reservations,
+        score,
+    )
+        .prop_map(
+            |(order, group_order, default_priority, age, reservations, score)| Rule {
+                order,
+                group_order,
+                default_priority,
                 age,
-                group_first,
-            }
-        ),
-        (prop_oneof![Just(0.0), Just(0.25)], age)
-            .prop_map(|(penalty, age)| Kind::BestFit { penalty, age }),
-    ]
+                reservations,
+                score,
+            },
+        )
 }
 
 /// A random retry limit (0 counts as 1).
 fn retry() -> impl Strategy<Value = RetryConfig> {
     (0u32..5).prop_map(|max_attempts| RetryConfig { max_attempts })
+}
+
+/// One order term's key as the model compares it: an integer, or a float that may be missing
+/// (missing sorts last).
+#[derive(Clone, Copy, Debug)]
+enum TermKey {
+    Int(i128),
+    Real(Option<f64>),
+}
+
+impl TermKey {
+    /// Smaller is more urgent.
+    fn cmp(&self, other: &Self) -> Ordering {
+        match (self, other) {
+            (Self::Int(a), Self::Int(b)) => a.cmp(b),
+            (Self::Real(a), Self::Real(b)) => match (a, b) {
+                (Some(a), Some(b)) => a.total_cmp(b),
+                _ => a.is_none().cmp(&b.is_none()),
+            },
+            _ => unreachable!("one term, one kind of key"),
+        }
+    }
+}
+
+/// A job's place in the scan: aged jobs first by submission, then the rest by the order terms,
+/// then by submission.
+#[derive(Clone, Debug)]
+struct Urgency {
+    aged: bool,
+    terms: Vec<TermKey>,
+    seq: u64,
+}
+
+impl Urgency {
+    /// Smaller is more urgent.
+    fn cmp(&self, other: &Self) -> Ordering {
+        (!self.aged).cmp(&!other.aged).then_with(|| {
+            let terms = if self.aged {
+                Ordering::Equal
+            } else {
+                (self.terms.iter().zip(&other.terms))
+                    .map(|(a, b)| a.cmp(b))
+                    .find(|o| o.is_ne())
+                    .unwrap_or(Ordering::Equal)
+            };
+            terms.then(self.seq.cmp(&other.seq))
+        })
+    }
 }
 
 /// A job as the model sees it, across its attempts.
@@ -302,8 +338,7 @@ struct Shadow {
     groups: BTreeMap<u64, u64>,
     seq: u64,
     next_id: JobId,
-    group_first: bool,
-    by_id: bool,
+    rule: Option<Rule>,
     max_attempts: u32,
     /// Non-start outputs the next poll must return, in order.
     expect: Vec<Output>,
@@ -323,62 +358,89 @@ impl Shadow {
             .fold((0, Resources::ZERO), |(n, m), d| (n + 1, m + d))
     }
 
-    /// The production rule, written out again: in every dimension whose capacity is known
-    /// (nonzero), each job counting at least `per_task`.
+    /// The production rule, written out again: in every dimension that is enforced (slots
+    /// always, memory where its capacity is nonzero), each job counting at least `per_task`;
+    /// memory may be exceeded by a job alone on the worker, slots never.
     fn admits(&self, demand: Resources, w: WorkerId) -> bool {
         let s = &self.workers[&w];
         let (running, placed) = self.load(w);
-        if running >= s.slots {
-            return false;
-        }
-        if running == 0 {
-            return true;
-        }
         (0..DIMS).all(|d| {
+            let hard = d == SLOTS;
+            if !hard && s.budget[d] == 0 {
+                return true;
+            }
             let held = placed[d].max(running as u64 * s.per_task[d]);
             let used = s.reported_used[d].max(s.reported_baseline[d] + held);
-            s.budget[d] == 0 || used + demand[d].max(s.per_task[d]) <= s.budget[d]
+            used + demand[d].max(s.per_task[d]) <= s.budget[d] || (!hard && running == 0)
         })
     }
 
-    /// The hard constraints (class, avoid lists), written out again: the caller's list is hard
-    /// unless `avoid_soft`; the workers of failed attempts are avoided softly; soft avoidance
-    /// lapses while no live worker of the class is off both lists.
+    /// The constraints, written out again: no Forbid selects the worker; for workers and for
+    /// classes alike, if the job requires any, one of them selects it; Avoids and the workers of
+    /// failed attempts are avoided while some live worker passing the hard constraints is free
+    /// of them.
     fn eligible(&self, j: &SJob, w: WorkerId) -> bool {
-        let spec = &j.spec;
-        let class_ok = |w: &WorkerState| spec.class.as_ref().is_none_or(|c| *c == w.class);
-        if !class_ok(&self.workers[&w]) {
-            return false;
-        }
-        let hard = |id: &WorkerId| !spec.avoid_soft && spec.avoid.contains(id);
-        let soft = |id: &WorkerId| {
-            (spec.avoid_soft && spec.avoid.contains(id)) || j.tried.iter().any(|t| t.worker == *id)
+        let selects = |on: &Selector, s: &WorkerState| match on {
+            Selector::Worker(id) => *id == s.id,
+            Selector::Class(c) => *c == s.class,
         };
-        if hard(&w) {
-            return false;
-        }
-        !soft(&w)
-            || !self
-                .workers
-                .values()
-                .any(|o| o.slots > 0 && class_ok(o) && !hard(&o.id) && !soft(&o.id))
+        let with = |strength| {
+            j.spec
+                .constraints
+                .iter()
+                .filter(move |c| c.strength == strength)
+        };
+        let hard = |s: &WorkerState| {
+            let requires = |class: bool| {
+                let mut of_kind = with(Strength::Require)
+                    .filter(|c| matches!(c.on, Selector::Class(_)) == class)
+                    .peekable();
+                of_kind.peek().is_none() || of_kind.any(|c| selects(&c.on, s))
+            };
+            !with(Strength::Forbid).any(|c| selects(&c.on, s)) && requires(false) && requires(true)
+        };
+        let avoided = |s: &WorkerState| {
+            with(Strength::Avoid).any(|c| selects(&c.on, s))
+                || j.tried.iter().any(|t| t.worker == s.id)
+        };
+        let s = &self.workers[&w];
+        hard(s)
+            && (!avoided(s)
+                || !self
+                    .workers
+                    .values()
+                    .any(|o| o.budget[SLOTS] > 0 && hard(o) && !avoided(o)))
     }
 
-    /// Scan order: aged jobs by age, then priority, group arrival, FIFO (or group arrival before
-    /// priority with `group_first`).
-    fn urgency(&self, j: &SJob, age: Option<f64>) -> (bool, i64, u64, i64, u64) {
-        let p = j.spec.priority.unwrap_or(0);
-        let g = if self.by_id {
-            j.spec.group
-        } else {
-            self.groups[&j.spec.group]
-        };
-        if age.is_some_and(|a| self.now - j.since >= a) {
-            (false, 0, 0, 0, j.seq)
-        } else if self.group_first {
-            (true, 0, g, p, j.seq)
-        } else {
-            (true, p, g, 0, j.seq)
+    /// Scan order: aged jobs by age, then the configured order terms (each once, at its first
+    /// mention), then submission.
+    fn urgency(&self, j: &SJob) -> Urgency {
+        let rule = self.rule.as_ref().unwrap();
+        let mut seen = Vec::new();
+        let mut terms = Vec::new();
+        for &t in &rule.order {
+            if seen.contains(&t) {
+                continue;
+            }
+            seen.push(t);
+            let spec = &j.spec;
+            terms.push(match t {
+                OrderTerm::Priority => {
+                    TermKey::Int(spec.priority.unwrap_or(rule.default_priority) as i128)
+                }
+                OrderTerm::Rank => TermKey::Real(spec.rank.map(|r| -r)),
+                OrderTerm::Group => TermKey::Int(match rule.group_order {
+                    GroupOrder::Id => spec.group as i128,
+                    GroupOrder::Arrival => self.groups[&spec.group] as i128,
+                }),
+                OrderTerm::Wspt => TermKey::Real(spec.work.map(|w| -(spec.weight / w))),
+                OrderTerm::Edd => TermKey::Real(spec.due),
+            });
+        }
+        Urgency {
+            aged: rule.age.is_some_and(|a| self.now - j.since >= a),
+            terms,
+            seq: j.seq,
         }
     }
 
@@ -414,15 +476,17 @@ impl Shadow {
         Some((j, k, r.live[k].attempt))
     }
 
-    /// Submit to both the model and the policy.
+    /// Submit to both the model and the policy. The model's copy demands one slot.
     fn submit(&mut self, spec: JobSpec, p: &mut dyn Policy) {
         let seq = self.seq;
         self.seq += 1;
         self.groups.entry(spec.group).or_insert(seq);
+        let mut model = spec.clone();
+        model.demand[SLOTS] = 1;
         self.waiting.insert(
             spec.id,
             SJob {
-                spec: spec.clone(),
+                spec: model,
                 since: self.now,
                 seq,
                 attempts: 0,
@@ -488,12 +552,12 @@ impl Shadow {
 /// - **attempts**: each start is the job's next attempt number; a job has two live attempts only
 ///   by speculation, and a job with a live attempt is never also waiting;
 /// - **no over-commit**: the production admission rule held at the moment of each start, in every
-///   dimension (no enforced capacity is exceeded, escape hatch aside);
-/// - **hard constraints**: no attempt runs on a worker its class or avoid list excludes (a soft
-///   avoid list only while some live worker of the class is off it);
+///   dimension (no slot over-used; no known memory capacity exceeded, escape hatch aside);
+/// - **constraints**: no attempt runs on a worker its Requires or Forbids exclude, nor on an
+///   avoided one while some live worker they allow is not avoided;
 /// - **escape hatch**: after a poll, no worker with a free slot is empty while a job that may run
 ///   there waits;
-/// - **priority** (priority order): when B is placed on w, every more urgent waiting job was
+/// - **priority** (the configured order): when B is placed on w, every more urgent waiting job was
 ///   refused by w at that moment (by the admission rule, or because w was B's reservation, or
 ///   because it chose to wait for a faster worker);
 /// - **speculation**: a second attempt goes to a strictly faster, unreserved worker that no
@@ -504,15 +568,14 @@ impl Shadow {
 ///   at the end;
 /// - **determinism**: replaying the stream gives identical outputs and explanations.
 fn run(
-    kind: &Kind,
+    rule: &Rule,
     speed: SpeedConfig,
     retry: RetryConfig,
     ops: &[Op],
 ) -> Result<Vec<String>, TestCaseError> {
-    let mut p = kind.build(speed, retry);
+    let mut p = rule.build(speed, retry);
     let mut sh = Shadow {
-        group_first: kind.group_first(),
-        by_id: kind.by_id(),
+        rule: Some(rule.clone()),
         max_attempts: retry.max_attempts,
         ..Shadow::default()
     };
@@ -521,25 +584,29 @@ fn run(
         match *op {
             Op::Submit {
                 demand,
+                slots,
                 group,
                 priority,
-                prefer,
-                avoid,
-                avoid_soft,
-                class,
+                rank,
+                weight,
+                due,
+                ref constraints,
                 work,
                 dev,
             } => {
                 let id = sh.next_id;
                 sh.next_id += 1;
-                let mut spec =
-                    JobSpec::new(id, Resources::mem(demand).with_dev(dev.unwrap_or(0)), group);
-                spec.priority = priority;
-                spec.prefer = prefer.into_iter().collect();
-                spec.avoid = avoid.into_iter().collect();
-                spec.avoid_soft = avoid_soft;
-                spec.class = class.map(|c| format!("c{c}"));
-                spec.work = work.map(f64::from);
+                let mut demand = Resources::mem(demand).with_dev(dev.unwrap_or(0));
+                demand[SLOTS] = slots;
+                let spec = JobSpec {
+                    priority,
+                    rank: rank.map(f64::from),
+                    weight,
+                    due: due.map(f64::from),
+                    constraints: constraints.clone(),
+                    work: work.map(f64::from),
+                    ..JobSpec::new(id, demand, group)
+                };
                 sh.submit(spec, &mut *p);
             }
             Op::Complete(i, k) => {
@@ -679,13 +746,13 @@ fn run(
         // worker; and its expiry is a wakeup.
         for &(j, w, at) in &after.deferred {
             let job = &sh.waiting[&j];
-            let SpeedPolicy::EarliestFinish(Some(d)) = speed.policy else {
+            let Some(d) = speed.defer else {
                 prop_assert!(false, "deferral without a Defer config");
                 unreachable!()
             };
             prop_assert!(job.spec.work.is_some() && sh.now - job.since < d.max_wait);
             prop_assert!(
-                !kind.age().is_some_and(|a| sh.now - job.since >= a),
+                !rule.age.is_some_and(|a| sh.now - job.since >= a),
                 "aged job deferred"
             );
             prop_assert!(at >= sh.now);
@@ -704,25 +771,25 @@ fn run(
                 prop_assert_eq!(attempt, job.attempts + 1, "job {} attempt", j);
                 prop_assert!(
                     sh.eligible(&job, w),
-                    "{kind:?}: job {j} placed on excluded worker {w}"
+                    "{rule:?}: job {j} placed on excluded worker {w}"
                 );
                 // No over-commit (slots included).
                 prop_assert!(
                     sh.admits(job.spec.demand, w),
-                    "{kind:?}: job {j} over-commits worker {w}"
+                    "{rule:?}: job {j} over-commits worker {w}"
                 );
                 // Priority: every more urgent waiting job is refused here (unless this is a holder
                 // taking its own reserved worker, which nobody else could take).
-                if kind.priority() && !holders.contains(&j) {
-                    let mine = sh.urgency(&job, kind.age());
+                if !holders.contains(&j) {
+                    let mine = sh.urgency(&job);
                     for a in sh.waiting.values() {
-                        if a.spec.id != j && sh.urgency(a, kind.age()) < mine {
+                        if a.spec.id != j && sh.urgency(a).cmp(&mine).is_lt() {
                             let refused = deferred_any.contains(&a.spec.id)
                                 || !sh.eligible(a, w)
                                 || !sh.admits(a.spec.demand, w);
                             prop_assert!(
                                 refused,
-                                "{kind:?}: job {j} placed on {w} while more urgent job {} is \
+                                "{rule:?}: job {j} placed on {w} while more urgent job {} is \
                                  admitted there",
                                 a.spec.id
                             );
@@ -820,14 +887,14 @@ fn run(
         // Escape hatch: an empty worker with a free slot leaves no job waiting that may run there,
         // except one waiting for a faster worker by choice.
         for (&w, s) in &sh.workers {
-            if s.slots > 0 && sh.load(w).0 == 0 {
+            if s.budget[SLOTS] > 0 && sh.load(w).0 == 0 {
                 let stuck = sh
                     .waiting
                     .values()
                     .find(|j| sh.eligible(j, w) && !deferred.contains(&j.spec.id));
                 prop_assert!(
                     stuck.is_none(),
-                    "{kind:?}: worker {w} empty while job {:?} waits",
+                    "{rule:?}: worker {w} empty while job {:?} waits",
                     stuck.map(|j| j.spec.id)
                 );
             }
@@ -864,7 +931,7 @@ fn run(
                 "waiting job {j} explained as {e}"
             );
         }
-        let (max_res, per_class) = kind.max_reservations();
+        let (max_res, per_class) = rule.reservations.unwrap_or((0, false));
         let mut per: BTreeMap<String, usize> = BTreeMap::new();
         for (&job, &worker) in &held {
             prop_assert!(
@@ -925,13 +992,13 @@ proptest! {
     /// Every invariant holds on random streams, and replays are identical.
     #[test]
     fn invariants_hold(
-        kind in kind(),
+        rule in rule(),
         speed in speed(),
         retry in retry(),
         ops in prop::collection::vec(op(), 1..160),
     ) {
-        let first = run(&kind, speed, retry, &ops)?;
-        let second = run(&kind, speed, retry, &ops)?;
+        let first = run(&rule, speed, retry, &ops)?;
+        let second = run(&rule, speed, retry, &ops)?;
         prop_assert_eq!(first, second, "not deterministic");
     }
 }

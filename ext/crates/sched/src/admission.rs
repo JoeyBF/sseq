@@ -1,27 +1,27 @@
 //! The admission rule: whether a worker accepts a job right now.
 
-use crate::{DIMS, Resources, WorkerState};
+use crate::{DIMS, HARD, Resources, SLOTS, WorkerState};
 
 /// A worker as an [`Admission`] rule sees it: its state plus the library's own bookkeeping.
 #[derive(Clone, Copy, Debug)]
 pub struct WorkerView<'a> {
     /// The worker's last reported state.
     pub state: &'a WorkerState,
-    /// Jobs placed on the worker and not yet completed.
-    pub running: usize,
-    /// Sum of the demands of those jobs.
+    /// Sum of the demands of the attempts placed on the worker and not yet ended, each counting
+    /// one [`SLOTS`].
     pub placed: Resources,
 }
 
 impl WorkerView<'_> {
-    /// Free execution slots.
-    pub fn free_slots(&self) -> usize {
-        self.state.slots.saturating_sub(self.running)
+    /// Attempts placed here: `placed[SLOTS]`, since each demands one slot.
+    pub fn running(&self) -> u64 {
+        self.placed[SLOTS]
     }
 
-    /// Whether dimension `d` of the worker's capacity is known, and so enforced.
+    /// Whether dimension `d` is enforced: always if it is [`HARD`], else if its capacity is known
+    /// (nonzero).
     pub fn enforced(&self, d: usize) -> bool {
-        self.state.budget[d] > 0
+        HARD[d] || self.state.budget[d] > 0
     }
 
     /// What a job of demand `demand` counts for here: at least the worker's
@@ -36,14 +36,14 @@ impl WorkerView<'_> {
     /// The reported figure lags (heartbeats); the placed sum is exact but only an estimate of what
     /// the jobs use. Taking the maximum is conservative in both directions.
     pub fn used(&self) -> Resources {
-        let floor = self.state.per_task.saturating_mul(self.running as u64);
+        let floor = self.state.per_task.saturating_mul(self.running());
         self.state
             .reported_used
             .max(self.state.reported_baseline + self.placed.max(floor))
     }
 
     /// Headroom per dimension, `budget - used`; negative when over-committed, `None` where the
-    /// capacity is unknown.
+    /// dimension is not [`enforced`](Self::enforced).
     pub fn headroom(&self) -> [Option<i64>; DIMS] {
         let used = self.used();
         std::array::from_fn(|d| {
@@ -64,15 +64,16 @@ impl WorkerView<'_> {
     }
 
     /// The fraction of capacity left after placing `demand`, in the bottleneck dimension: `min_d
-    /// (budget - used - charge) / budget` over the enforced dimensions (one minus the dominant
-    /// share, as in dominant-resource fairness), infinite when none is enforced.
+    /// (budget - used - charge) / budget` over the enforced soft dimensions (one minus the
+    /// dominant share, as in dominant-resource fairness), infinite when none is enforced.
     ///
-    /// This is the one scalar the policies compare workers by: smallest for the tightest fit,
-    /// largest (with a zero demand) for the most headroom.
+    /// This is the one scalar workers are compared by: smallest for the tightest fit, largest
+    /// (with a zero demand) for the most headroom. [`HARD`] dimensions are counts rather than
+    /// capacity to pack into, and are left to [`ScoreTerm::Load`](crate::ScoreTerm::Load).
     pub fn free_share(&self, demand: &Resources) -> f64 {
         let (used, charge) = (self.used(), self.charge(demand));
         (0..DIMS)
-            .filter(|&d| self.enforced(d))
+            .filter(|&d| !HARD[d] && self.enforced(d))
             .map(|d| {
                 let cap = self.state.budget[d] as f64;
                 (cap - used[d] as f64 - charge[d] as f64) / cap
@@ -89,6 +90,9 @@ impl WorkerView<'_> {
 /// after more jobs are placed on that worker (with no completion or heartbeat in between). The
 /// scheduler relies on this to guarantee the priority invariant within one
 /// [`poll`](crate::Policy::poll).
+///
+/// The rule alone enforces capacity, slots included: the scheduler places a job wherever the rule
+/// admits it.
 pub trait Admission {
     /// Whether `w` admits a job with demand `demand`.
     fn admits(&self, demand: &Resources, w: &WorkerView) -> bool;
@@ -101,20 +105,20 @@ pub trait Admission {
     }
 }
 
-/// The production admission rule, one inequality per resource dimension `d`:
+/// The production admission rule, one inequality per enforced resource dimension `d`:
 ///
 /// ```text
-/// admit(job on w) iff running < slots
-///                 and ( running == 0      // escape hatch: a job alone always goes
-///                       or for every d with budget[d] > 0:
-///                            max(reported_used[d],
-///                                reported_baseline[d] + max(placed[d], running * per_task[d]))
-///                              + max(demand[d], per_task[d]) <= budget[d] )
+/// admit(job on w) iff for every enforced d:
+///                       max(reported_used[d],
+///                           reported_baseline[d] + max(placed[d], running * per_task[d]))
+///                         + max(demand[d], per_task[d]) <= budget[d]
+///                     or (d is soft and running == 0)      // escape hatch: a job alone goes
 /// ```
 ///
-/// A zero capacity component is unknown and not enforced. With a device `per_task` alone (jobs
-/// without device demands) the device inequality is the per-worker count `(running + 1) *
-/// per_task <= cap`; with per-job device demands it is their sum.
+/// [`HARD`] dimensions (slots) are always enforced and have no escape hatch; a soft dimension is
+/// enforced where its capacity is nonzero. With a device `per_task` alone (jobs without device
+/// demands) the device inequality is the per-worker count `(running + 1) * per_task <= cap`; with
+/// per-job device demands it is their sum.
 ///
 /// `reported_baseline` must exclude the running jobs (a worker's `baseline_excl`: its rolling RSS
 /// floor minus their estimates). A floor that contains them counts them twice, once in it and
@@ -125,28 +129,24 @@ pub struct ProductionAdmission;
 impl Admission for ProductionAdmission {
     /// The production rule itself.
     fn admits(&self, demand: &Resources, w: &WorkerView) -> bool {
-        w.running < w.state.slots && (w.running == 0 || w.short(demand).next().is_none())
+        let empty = w.running() == 0;
+        w.short(demand).all(|d| !HARD[d] && empty)
     }
 
-    /// The headroom left under the production rule (unbounded when the worker is empty, and in
-    /// the dimensions not enforced).
+    /// The headroom left under the production rule (unbounded in the dimensions not enforced, and
+    /// in the soft ones when the worker is empty).
     fn bound(&self, w: &WorkerView) -> Option<Resources> {
-        if w.running >= w.state.slots {
-            return None;
-        }
-        if w.running == 0 {
-            return Some(Resources::MAX);
-        }
-        let headroom = w.headroom();
+        let (used, empty) = (w.used(), w.running() == 0);
         let mut bound = Resources::MAX;
-        for (d, h) in headroom.into_iter().enumerate() {
-            if let Some(h) = h {
-                // Every job counts for at least `per_task`, so less room than that admits nothing.
-                if h < 0 || (h as u64) < w.state.per_task[d] {
-                    return None;
-                }
-                bound[d] = h as u64;
+        for d in (0..DIMS).filter(|&d| w.enforced(d) && (HARD[d] || !empty)) {
+            let room = w.state.budget[d].checked_sub(used[d])?;
+            // Every job counts for at least `per_task` and takes a slot, so less room than that
+            // admits nothing.
+            let least = w.state.per_task[d].max((d == SLOTS) as u64);
+            if room < least {
+                return None;
             }
+            bound[d] = room;
         }
         Some(bound)
     }
@@ -166,6 +166,12 @@ mod tests {
         }
     }
 
+    /// `running` attempts' worth of slots on top of `r`.
+    fn with_running(mut r: Resources, running: u64) -> Resources {
+        r[SLOTS] = running;
+        r
+    }
+
     /// The rule, its escape hatch and its bound, at the boundaries.
     #[test]
     fn production_rule() {
@@ -173,8 +179,7 @@ mod tests {
         let s = worker(2, 100, 30, 10);
         let view = |running, placed| WorkerView {
             state: &s,
-            running,
-            placed: Resources::mem(placed),
+            placed: with_running(Resources::mem(placed), running),
         };
         // Escape hatch: alone, anything goes, even beyond the budget.
         assert!(a.admits(&Resources::mem(1000), &view(0, 0)));
@@ -184,27 +189,26 @@ mod tests {
         // Reported usage dominates: max(30, 10 + 5) + 70 = 100.
         assert!(a.admits(&Resources::mem(70), &view(1, 5)));
         assert!(!a.admits(&Resources::mem(71), &view(1, 5)));
-        // Slots full.
-        assert!(!a.admits(&Resources::mem(0), &view(2, 0)));
+        // Slots full: no escape hatch for a hard dimension.
+        assert!(!a.admits(&with_running(Resources::ZERO, 1), &view(2, 0)));
         assert_eq!(a.bound(&view(2, 0)), None);
         assert_eq!(
             a.bound(&view(1, 50)),
-            Some(Resources::mem(40).with_dev(u64::MAX))
+            Some(with_running(Resources::mem(40).with_dev(u64::MAX), 1))
         );
-        assert_eq!(view(1, 50).headroom(), [Some(40), None]);
+        assert_eq!(view(1, 50).headroom(), [Some(40), None, Some(1)]);
     }
 
     /// `baseline_excl` (the rolling RSS floor minus the estimates running) as `reported_baseline`
-    /// gives `running < slots && (running == 0 || max(rss, baseline_excl + Σ placed) + demand <=
-    /// budget)`: the floor no longer counts the running jobs twice.
+    /// gives `max(rss, baseline_excl + Σ placed) + demand <= budget`: the floor does not count the
+    /// running jobs twice.
     #[test]
     fn baseline_excl_removes_the_double_count() {
         // RSS 60 with 40 of estimates running; the floor (50) contains those jobs.
         let (rss, floor, placed, budget) = (60, 50, 40, 100);
         let view = |s| WorkerView {
             state: s,
-            running: 4,
-            placed: Resources::mem(placed),
+            placed: with_running(Resources::mem(placed), 4),
         };
         let with_floor = worker(16, budget, rss, floor);
         let with_excl = worker(16, budget, rss, floor - placed);
@@ -218,7 +222,7 @@ mod tests {
     }
 
     /// Every dimension follows the same inequality, with `per_task` as a per-job floor; a zero
-    /// capacity component is not enforced, host memory included.
+    /// capacity component of a soft dimension is not enforced, host memory included.
     #[test]
     fn one_rule_per_dimension() {
         let a = ProductionAdmission;
@@ -228,8 +232,7 @@ mod tests {
         };
         let view = |running, placed| WorkerView {
             state: &s,
-            running,
-            placed,
+            placed: with_running(placed, running),
         };
         // Device: max(10, 2 * 30) + max(5, 30) = 90 <= 100, and 60 + 41 > 100.
         let v = view(2, Resources::mem(40).with_dev(10));
@@ -239,43 +242,46 @@ mod tests {
         let v = view(3, Resources::mem(40));
         assert_eq!(v.short(&Resources::ZERO).collect::<Vec<_>>(), vec![DEV]);
         // Host: the floor counts 3 * 20 = 60 against the 40 placed.
-        assert_eq!(v.headroom(), [Some(40), Some(10)]);
+        assert_eq!(v.headroom(), [Some(40), Some(10), Some(5)]);
         assert_eq!(a.bound(&v), None);
-        // A zero budget leaves its dimension unenforced.
+        // A zero memory budget leaves its dimension unenforced; slots stay enforced.
         let free = WorkerState::new(2, "x", 8, Resources::ZERO);
         let v = WorkerView {
             state: &free,
-            running: 7,
-            placed: Resources::mem(1 << 40),
+            placed: with_running(Resources::mem(1 << 40), 7),
         };
-        assert!(a.admits(&Resources::MAX, &v));
-        assert_eq!(v.headroom(), [None, None]);
+        let mut huge = Resources::MAX;
+        huge[SLOTS] = 1;
+        assert!(a.admits(&huge, &v));
+        assert!(!a.admits(&Resources::MAX, &v));
+        assert_eq!(v.headroom(), [None, None, Some(1)]);
         assert_eq!(v.free_share(&Resources::MAX), f64::INFINITY);
     }
 
-    /// The scalar comparison is the bottleneck dimension's free fraction.
+    /// The scalar comparison is the bottleneck memory dimension's free fraction; slots do not
+    /// enter it.
     #[test]
     fn free_share_is_the_bottleneck() {
-        let s = WorkerState::new(1, "x", 8, Resources::mem(100).with_dev(10));
+        let s = WorkerState::new(1, "x", 2, Resources::mem(100).with_dev(10));
         let v = WorkerView {
             state: &s,
-            running: 1,
-            placed: Resources::mem(50).with_dev(2),
+            placed: with_running(Resources::mem(50).with_dev(2), 1),
         };
-        // Host 1 - 60/100 = 0.4, device 1 - 4/10 = 0.6.
-        let share = v.free_share(&Resources::mem(10).with_dev(2));
+        // Host 1 - 60/100 = 0.4, device 1 - 4/10 = 0.6; slots would be 1 - 2/2 = 0.
+        let share = v.free_share(&with_running(Resources::mem(10).with_dev(2), 1));
         assert!((share - 0.4).abs() < 1e-12);
     }
 
-    /// Without slots, not even the escape hatch admits.
+    /// Slots are hard: without a free one, not even the escape hatch admits.
     #[test]
     fn zero_slots_admit_nothing() {
         let s = worker(0, 100, 0, 0);
         let v = WorkerView {
             state: &s,
-            running: 0,
             placed: Resources::ZERO,
         };
-        assert!(!ProductionAdmission.admits(&Resources::ZERO, &v));
+        let one_slot = with_running(Resources::ZERO, 1);
+        assert!(!ProductionAdmission.admits(&one_slot, &v));
+        assert_eq!(ProductionAdmission.bound(&v), None);
     }
 }

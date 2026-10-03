@@ -12,18 +12,20 @@ for callers with a thread per task ([`SharedPolicy`]).
 ## The problem
 
 In α|β|γ terms: Q (uniform machines, with speeds and classes) that join and leave online; jobs with
-vector resource demands, eligibility constraints (class pins, avoid lists), precedence constraints
+vector resource demands, eligibility constraints (required classes, forbidden and avoided
+workers), precedence constraints
 (the DAG layer) and work estimates rather than known processing times; objective makespan, with
 bounded per-group latency (no starvation).
 
-The policy is list scheduling: at every poll, waiting jobs are taken in priority order and each
-goes to a worker that admits it. With total work `W`, total throughput `P` and critical path `D`,
+The policy is list scheduling: at every poll, waiting jobs are taken in a configured order and
+each goes to the best-scored worker that admits it. With total work `W`, total throughput `P` and critical path `D`,
 every schedule needs at least `max(W/P, D)`, and every *greedy* one -- never idle while a job is
 ready and admissible -- needs at most `W/P + D` (Graham; Brent). Placement is greedy within
 admission, apart from two deliberate holds (below) that keep a worker from a job to bound
-starvation or to wait for a faster worker. The priority order is group arrival, or upward rank
-(critical path below a job, as in HEFT); reservations with backfill are EASY-style backfilling;
-aging bounds starvation under priorities.
+starvation or to wait for a faster worker. The order is a list of terms: explicit priority, upward
+rank (critical path below a job, as in HEFT), group, weighted shortest processing time, earliest
+due date; reservations with backfill are EASY-style backfilling; aging bounds starvation under any
+order.
 
 ## Idempotent jobs
 
@@ -77,15 +79,15 @@ enough to reserve. A poll typically takes microseconds.
 ## Model
 
 - A **job** ([`JobSpec`]) has a demand ([`Resources`]: a vector over [`DIMS`] dimensions, [`MEM`]
-  for host memory and [`DEV`] for device memory), a priority group, an optional explicit priority,
-  optional preferred workers (cache affinity, never required), a required worker class, workers to
-  avoid, and an optional work estimate ([`JobSpec::work`], seconds at speed 1). The avoid list is
-  hard, or soft ([`JobSpec::avoid_soft`]): avoided workers are then used while no other live worker
-  of the class exists.
-- A **worker** ([`WorkerState`]) has a class, slots, a speed, a budget per dimension, a per-job
-  floor ([`WorkerState::per_task`], e.g. the typical device launch request), and its last reported
-  usage and baseline. The scheduler keeps its own sum of the demands it placed on each worker;
-  heartbeats only update the reported figures.
+  for host memory, [`DEV`] for device memory and [`SLOTS`], which the scheduler sets to one), a
+  priority group, an optional explicit priority, rank, weight and due date, an optional work
+  estimate ([`JobSpec::work`], seconds at speed 1), and [`Constraint`]s: a [`Selector`] (a worker
+  or a class) with a [`Strength`]. Require and Forbid are hard; Avoid is soft (avoided workers are
+  used while no other live worker the hard constraints allow exists); Prefer is a score term.
+- A **worker** ([`WorkerState`]) has a class, a speed, a budget per dimension (slots included), a
+  per-job floor ([`WorkerState::per_task`], e.g. the typical device launch request), and its last
+  reported usage and baseline. The scheduler keeps its own sum of the demands it placed on each
+  worker; heartbeats only update the reported figures.
 
 ### Admission
 
@@ -93,44 +95,49 @@ An [`Admission`] rule decides whether a worker takes a job. [`ProductionAdmissio
 inequality to every dimension:
 
 ```text
-admit iff running < slots
-      and (running == 0                                   // escape hatch
-           or for every dimension d with budget[d] > 0:
-                max(reported_used[d],
-                    reported_baseline[d] + max(placed[d], running * per_task[d]))
-                  + max(demand[d], per_task[d]) <= budget[d])
+admit iff for every enforced dimension d:
+            max(reported_used[d],
+                reported_baseline[d] + max(placed[d], running * per_task[d]))
+              + max(demand[d], per_task[d]) <= budget[d]
+          or (d is soft and running == 0)                 // escape hatch
 ```
 
-- A zero budget component is unknown and not enforced, in every dimension alike.
+- [`HARD`] dimensions (slots) are always enforced and have no escape hatch. A zero budget
+  component of a soft dimension (memory) is unknown and not enforced.
 - `per_task` is a floor: each job counts for at least that much. With a device `per_task` alone the
   device inequality is a per-worker count, `(running + 1) * per_task <= budget`; with per-job device
   demands it is their sum. A floor should be near the mean job, not a high quantile: a sum of jobs
   concentrates near its mean.
-- The escape hatch guarantees that every job can run somewhere: a job alone on a worker always goes.
+- The escape hatch guarantees that every job can run somewhere: a job alone on a worker with a slot
+  always goes.
 - `reported_baseline` must exclude the running jobs' usage (the worker's resident floor minus their
   estimates); a floor that contains them counts them twice.
 
 Where one number must rank workers (tightest fit, most headroom), it is the free fraction of
-capacity in the bottleneck dimension, [`WorkerView::free_share`]. A custom rule goes in through
+capacity in the bottleneck memory dimension, [`WorkerView::free_share`]. A custom rule goes in through
 [`Scheduler::with_admission`]; it must be monotone in load (see [`Admission`]).
 
 ## The scheduler
 
-[`Scheduler`] implements [`Policy`]; a plain [`Config`] decides its behaviour, with presets:
+[`Scheduler`] implements [`Policy`]; a plain [`Config`] decides its behaviour. Its
+[`order`](Config::order) ([`OrderTerm`]s, then arrival) and [`score`](Config::score)
+([`ScoreTerm`]s, then worker id) are lexicographic lists; the presets map objectives to them:
 
-| preset | order ([`Order`]) | worker choice ([`Fit`]) | reservations |
-|---|---|---|---|
-| [`Config::fifo`] | arrival | preferred, then least loaded | none (big jobs starve) |
-| `Config::default()` | priority, group, FIFO; aging | preferred, then least loaded | yes |
-| [`Config::best_fit`] | as above | tightest fit (preference: tie-break or penalty) | yes |
+| preset | objective | order | score | reservations |
+|---|---|---|---|---|
+| [`Config::fifo`] | baseline | arrival | preferred, load | none (big jobs starve) |
+| `Config::default()` | makespan, bounded latency | priority, rank, group; aging | speed, preferred, load | yes |
+| [`Config::best_fit`] | as above, packing | as above | speed, tightest, preferred, load | yes |
+| [`Config::weighted_completion`] | Σ w·C | priority, WSPT; aging | as default | yes |
+| [`Config::lateness`] | max lateness | priority, EDD; aging | as default | yes |
 
-**Priority and backfill.** Each poll scans waiting jobs in urgency order, so a job takes a worker
-only if every more urgent waiting job was refused there. [`Order::Priority`] orders by explicit
-priority, then group, then submission; `group_first` puts the group first (e.g. oldest bidegree
-first, critical path within it). Groups are ordered by first arrival ([`GroupOrder::Arrival`]) or
-by id ([`GroupOrder::Id`]), which survives a restart that resubmits in another order
-([`nassau::group`] gives Nassau's bidegrees such ids). [`Scheduler::forget_group`] bounds the
-memory of group arrivals.
+WSPT and EDD are optimal on one machine only; here, as every rule, they are heuristics.
+
+**Order and backfill.** Each poll scans waiting jobs in urgency order, so a job takes a worker
+only if every more urgent waiting job was refused there. Keys are computed once, at submission.
+Groups are ordered by first arrival ([`GroupOrder::Arrival`]) or by id ([`GroupOrder::Id`]), which
+survives a restart that resubmits in another order ([`nassau::group`] gives Nassau's bidegrees such
+ids). [`Scheduler::forget_group`] bounds the memory of group arrivals.
 
 **Aging** ([`Config::age_limit`], default [`DEFAULT_AGE_LIMIT`], `None` for strict priority) puts
 jobs that have waited that long ahead of everything else, oldest first.
@@ -145,10 +152,10 @@ holder could start (EASY backfilling), without weakening that bound.
 **Speed** ([`SpeedConfig`]). A job's expected run time on a worker is its work over the worker's
 speed.
 
-- [`SpeedPolicy::FastestFirst`]: among the workers that admit a job, the fastest.
-- [`SpeedPolicy::EarliestFinish`]: HEFT's processor choice, online. With a [`Defer`], a job may
-  wait for a busy faster worker when it would still finish earlier there (by at least `min_gain` of
-  its work, for at most `max_wait`).
+- [`ScoreTerm::Speed`]: among the workers that admit a job, the fastest.
+- [`Defer`]: earliest finish, HEFT's processor choice, online. A job may wait for a busy worker
+  faster than the one the score picked when it would still finish earlier there (by at least
+  `min_gain` of its work, for at most `max_wait`).
 - [`Learn`]: learn speeds from completion times, per worker with its class as prior, corrected for
   concurrency, with hysteresis; speed-ordered placement treats speeds within one `resolution` step
   as equal, so load still balances a class. [`SpeedEstimator`] is the same estimator on its own.
@@ -164,7 +171,7 @@ invariant.
 
 **Retries and worker loss** ([`RetryConfig`]). A failed attempt, with no other attempt of the job
 live, requeues the job with its original place and age, softly avoiding every worker it failed on
-(a hard avoid list from the caller stays hard). After [`RetryConfig::max_attempts`] rounds -- a
+(the caller's Forbids stay hard). After [`RetryConfig::max_attempts`] rounds -- a
 speculative attempt is an extra try within a round, not a round -- the policy emits [`Output::GaveUp`] with every
 [`Tried`] attempt, `retryable` when all were [`FailKind::DeviceOom`]. [`Input::WorkerGone`] fails
 each live attempt on the worker with [`FailKind::LinkDied`]; the caller never resubmits.
@@ -207,7 +214,7 @@ loop {
 
 [`log::Logged`] wraps a policy and records every input it handles (submissions with an optional
 [`log::TaskInfo`]) and every poll's outputs to an [`EventSink`], with rate-limited heartbeat
-samples and reservations for the trace reader. [`log::replay`] feeds a log back into a fresh policy
+samples for the trace reader. [`log::replay`] feeds a log back into a fresh policy
 with the same configuration and reproduces every poll:
 
 ```rust
@@ -240,8 +247,9 @@ declared yet; a job is submitted to the inner policy when its last dependency co
 leaves no trace). Readiness is incremental, and completed jobs leave the graph, so its size tracks
 the live frontier.
 
-- **Ranks.** With [`DagConfig::rank_priority`], jobs are prioritised by upward rank (their work plus
-  the longest chain of work below them, plus group placeholders' costs) instead of group arrival.
+- **Ranks.** With [`DagConfig::rank_priority`], jobs are submitted with their upward rank
+  ([`JobSpec::rank`]: their work plus the longest chain of work below them, plus group
+  placeholders' costs), which [`OrderTerm::Rank`] orders by.
   [`DagScheduler::update_work`] refines estimates later.
 - **Templates.** A [`DagTemplate`] is a dependency structure shared by many groups, checked once and
   instantiated per group with [`DagScheduler::declare_template`]; its
@@ -304,8 +312,8 @@ Phase 1 keeps the thread per task and replaces the inside of `acquire`/`release`
 # fn main() {
 use std::{sync::Arc, time::Duration};
 use sched::{
-    Config, FailKind, GroupOrder, JobSpec, Learn, Order, Resources, Scheduler, SharedPolicy,
-    SpeedConfig, SpeedPolicy, WorkerState,
+    Config, FailKind, GroupOrder, JobSpec, Learn, Resources, Scheduler, SharedPolicy, SpeedConfig,
+    WorkerState,
     log::{JsonlSink, Logged, TaskInfo},
     nassau,
 };
@@ -313,13 +321,8 @@ use sched::{
 // Once: restart-stable bidegree order, aging at `DEFAULT_AGE_LIMIT`, fast workers first with
 // speeds learned per worker, every input and poll logged.
 let policy = Scheduler::new(Config {
-    order: Order::Priority {
-        default_priority: 0,
-        group_order: GroupOrder::Id,
-        group_first: false,
-    },
+    group_order: GroupOrder::Id,
     speed: SpeedConfig {
-        policy: SpeedPolicy::FastestFirst,
         learn: Some(Learn::default()),
         ..SpeedConfig::default()
     },

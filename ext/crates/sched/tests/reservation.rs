@@ -193,9 +193,8 @@ fn more_urgent_job_cannot_take_a_reserved_worker() {
     let mut p = starving();
     let w = reserved_worker(&p);
     // An explicitly urgent small job still may not use the reserved worker.
-    let mut urgent = job(30, 5, 9);
+    let mut urgent = job(30, 5, 9).prefer_worker(w);
     urgent.priority = Some(-10);
-    urgent.prefer = vec![w];
     p.handle(Input::Submit(urgent), 63.0);
     let out = starts(p.poll(63.0));
     assert_eq!(out.len(), 1);

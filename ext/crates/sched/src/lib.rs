@@ -14,8 +14,8 @@ mod speed;
 
 pub use admission::{Admission, ProductionAdmission, WorkerView};
 pub use config::{
-    Config, DEFAULT_AGE_LIMIT, Defer, Fit, GroupOrder, Order, Reservations, RetryConfig, Speculate,
-    SpeedConfig, SpeedPolicy,
+    Config, DEFAULT_AGE_LIMIT, Defer, GroupOrder, OrderTerm, Reservations, RetryConfig, ScoreTerm,
+    Speculate, SpeedConfig,
 };
 #[cfg(feature = "serde")]
 pub use dag::DagSnapshot;
@@ -39,17 +39,31 @@ pub type WorkerId = u64;
 pub type Instant = f64;
 
 /// Number of resource dimensions in a [`Resources`] vector.
-pub const DIMS: usize = 2;
+pub const DIMS: usize = 3;
 /// The host-memory dimension of a [`Resources`] vector, in bytes.
 pub const MEM: usize = 0;
 /// The device-memory dimension of a [`Resources`] vector, in bytes.
 pub const DEV: usize = 1;
+/// The execution-slot dimension of a [`Resources`] vector. Every job demands one slot: the
+/// scheduler sets that component of [`JobSpec::demand`] at submission, whatever the caller wrote.
+pub const SLOTS: usize = 2;
 
-/// An additive resource vector, one component per dimension ([`MEM`], [`DEV`]).
+/// Which dimensions are hard. A hard dimension is always enforced, a zero capacity included, and
+/// has no escape hatch; a soft one is enforced only where its capacity is known (nonzero), and a
+/// job alone on a worker ignores it (see [`ProductionAdmission`]). Slots are counted exactly, so
+/// they are hard; memory figures are estimates, so they are soft.
+pub const HARD: [bool; DIMS] = {
+    let mut hard = [false; DIMS];
+    hard[SLOTS] = true;
+    hard
+};
+
+/// An additive resource vector, one component per dimension ([`MEM`], [`DEV`], [`SLOTS`]).
 ///
 /// Comparisons between vectors are component-wise ([`Resources::fits_within`]). As a capacity
-/// ([`WorkerState::budget`]), a zero component means that dimension's capacity is unknown and is
-/// not enforced (see [`ProductionAdmission`]); as a demand, a zero component means none.
+/// ([`WorkerState::budget`]), a zero component of a soft dimension means its capacity is unknown
+/// and not enforced, and a zero component of a [`HARD`] one means none (see
+/// [`ProductionAdmission`]); as a demand, a zero component means none.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct Resources(pub [u64; DIMS]);
@@ -122,14 +136,14 @@ impl Resources {
 impl std::ops::Index<usize> for Resources {
     type Output = u64;
 
-    /// The component of dimension `d` ([`MEM`], [`DEV`]).
+    /// The component of dimension `d` ([`MEM`], [`DEV`], [`SLOTS`]).
     fn index(&self, d: usize) -> &u64 {
         &self.0[d]
     }
 }
 
 impl std::ops::IndexMut<usize> for Resources {
-    /// The component of dimension `d` ([`MEM`], [`DEV`]).
+    /// The component of dimension `d` ([`MEM`], [`DEV`], [`SLOTS`]).
     fn index_mut(&mut self, d: usize) -> &mut u64 {
         &mut self.0[d]
     }
@@ -167,55 +181,135 @@ impl std::ops::SubAssign for Resources {
     }
 }
 
+/// What a [`Constraint`] is about: one worker, or every worker of a class.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+pub enum Selector {
+    /// The worker with this id.
+    Worker(WorkerId),
+    /// The workers of this class ([`WorkerState::class`]).
+    Class(String),
+}
+
+impl Selector {
+    /// Whether worker `w` is selected.
+    pub fn matches(&self, w: &WorkerState) -> bool {
+        match self {
+            Self::Worker(id) => *id == w.id,
+            Self::Class(class) => *class == w.class,
+        }
+    }
+}
+
+/// How a [`Constraint`] binds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+pub enum Strength {
+    /// Run only on a selected worker. Requires of the same kind (all on workers, or all on
+    /// classes) are alternatives, since a worker has one id and one class: the job runs on a
+    /// worker matching at least one Require of each kind it has.
+    Require,
+    /// Never run on a selected worker.
+    Forbid,
+    /// Run on a selected worker only while no live worker (one with slots) that the hard
+    /// constraints allow is free of every Avoid. That depends on the set of workers, not on their
+    /// load, so a retry waits for a busy healthy worker rather than returning to the one it failed
+    /// on.
+    Avoid,
+    /// Favour a selected worker where [`ScoreTerm::Preferred`] ranks workers (cache affinity).
+    Prefer,
+}
+
+/// One placement constraint of a job ([`JobSpec::constraints`]).
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub struct Constraint {
+    /// The workers it is about.
+    pub on: Selector,
+    /// How it binds.
+    pub strength: Strength,
+}
+
 /// A job, as submitted to a [`Policy`].
 #[derive(Clone, Debug, PartialEq)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct JobSpec {
     /// The job's id.
     pub id: JobId,
-    /// What the job is expected to use while running (an estimate; it may be pessimistic).
+    /// What the job is expected to use while running (an estimate; it may be pessimistic). The
+    /// [`SLOTS`] component is the scheduler's to set.
     pub demand: Resources,
-    /// Priority group, e.g. the bidegree a job belongs to. Groups are ordered by first arrival: the
-    /// default priority is "oldest group first, then FIFO within a group".
+    /// Priority group, e.g. the bidegree a job belongs to ([`OrderTerm::Group`]).
     pub group: u64,
-    /// Explicit priority overriding group order; smaller is more urgent. Jobs without one count as
-    /// [`Order::Priority`]'s `default_priority` (0 by default), so negative values jump ahead of
-    /// unprioritised jobs and positive values fall behind them.
+    /// Explicit priority, the hook for an external planner ([`OrderTerm::Priority`]); smaller is
+    /// more urgent. Jobs without one count as [`Config::default_priority`].
     pub priority: Option<i64>,
-    /// Soft placement preference (cache affinity): workers to try first. Never required.
-    pub prefer: Vec<WorkerId>,
-    /// Workers the job must not run on (e.g. ones it already failed on). Hard unless
-    /// [`avoid_soft`](Self::avoid_soft): a job that avoids every live worker it could run on
-    /// waits until one it does not avoid joins.
-    pub avoid: Vec<WorkerId>,
-    /// Make `avoid` soft: avoided workers become eligible while no other live worker (one with
-    /// slots, of the job's class) exists. "Live", not "free": a retry still waits for a busy
-    /// healthy worker rather than returning to the one it failed on.
+    /// Upward rank: the job's work plus the longest chain of work below it. Set by the DAG layer
+    /// ([`DagConfig::rank_priority`]); larger is more urgent ([`OrderTerm::Rank`]).
     #[cfg_attr(feature = "serde", serde(default))]
-    pub avoid_soft: bool,
-    /// If set, the job runs only on workers of this class (a hard constraint).
-    pub class: Option<String>,
+    pub rank: Option<f64>,
+    /// Weight in a weighted objective ([`OrderTerm::Wspt`]). Default 1.
+    #[cfg_attr(feature = "serde", serde(default = "unit"))]
+    pub weight: f64,
+    /// Due date, on the policy's clock ([`OrderTerm::Edd`]).
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub due: Option<Instant>,
     /// Estimated work, in seconds on a worker of [`WorkerState::speed`] 1.0. Used by
-    /// [`SpeedPolicy::EarliestFinish`], shadow backfill and [`Speculate`] (and filled in from the
+    /// [`OrderTerm::Wspt`], [`Defer`], shadow backfill and [`Speculate`] (and filled in from the
     /// DAG layer's estimate when unset).
     #[cfg_attr(feature = "serde", serde(default))]
     pub work: Option<f64>,
+    /// Where the job may, should and should not run. A retried job also avoids, softly, the
+    /// workers its failed attempts ran on.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Vec::is_empty")
+    )]
+    pub constraints: Vec<Constraint>,
 }
 
 impl JobSpec {
-    /// A job with the given id, demand and group, and no priority, preference, avoid list or class.
+    /// A job with the given id, demand and group, weight 1 and nothing else.
     pub fn new(id: JobId, demand: Resources, group: u64) -> Self {
         Self {
             id,
             demand,
             group,
             priority: None,
-            prefer: Vec::new(),
-            avoid: Vec::new(),
-            avoid_soft: false,
-            class: None,
+            rank: None,
+            weight: 1.0,
+            due: None,
             work: None,
+            constraints: Vec::new(),
         }
+    }
+
+    /// This job with one more constraint.
+    pub fn constrain(mut self, strength: Strength, on: Selector) -> Self {
+        self.constraints.push(Constraint { on, strength });
+        self
+    }
+
+    /// This job, run only on workers of `class` (or of another required class).
+    pub fn require_class(self, class: impl Into<String>) -> Self {
+        self.constrain(Strength::Require, Selector::Class(class.into()))
+    }
+
+    /// This job, never run on worker `w`.
+    pub fn forbid_worker(self, w: WorkerId) -> Self {
+        self.constrain(Strength::Forbid, Selector::Worker(w))
+    }
+
+    /// This job, softly avoiding worker `w`.
+    pub fn avoid_worker(self, w: WorkerId) -> Self {
+        self.constrain(Strength::Avoid, Selector::Worker(w))
+    }
+
+    /// This job, preferring worker `w`.
+    pub fn prefer_worker(self, w: WorkerId) -> Self {
+        self.constrain(Strength::Prefer, Selector::Worker(w))
     }
 }
 
@@ -225,13 +319,11 @@ impl JobSpec {
 pub struct WorkerState {
     /// The worker's id.
     pub id: WorkerId,
-    /// The worker's class (e.g. GPU type), used by class pins ([`JobSpec::class`]) and per-class
-    /// reservations.
+    /// The worker's class (e.g. GPU type), used by [`Selector::Class`] and per-class reservations.
     pub class: String,
-    /// Maximum number of concurrent jobs.
-    pub slots: usize,
-    /// Capacity: host memory, and device memory (the pool jobs' device allocations come from). A
-    /// zero component is unknown and not enforced.
+    /// Capacity: host memory, device memory (the pool jobs' device allocations come from) and
+    /// execution slots. A zero memory component is unknown and not enforced; zero slots admit
+    /// nothing. Replacing the whole vector replaces the slot count too.
     pub budget: Resources,
     /// What one job of this worker is expected to take at least, learned by the worker (e.g. the
     /// typical device launch request); zero components are unknown. Each job counts for at least
@@ -243,31 +335,42 @@ pub struct WorkerState {
     /// The part of `reported_used` not attributable to jobs (caches, runtime).
     pub reported_baseline: Resources,
     /// How fast a job runs here, relative to a reference worker (1.0): a job with
-    /// [`JobSpec::work`] `w` takes `w / speed` seconds. Used by speed-aware placement
-    /// ([`SpeedPolicy`]); ignored otherwise. Default 1.0.
-    #[cfg_attr(feature = "serde", serde(default = "unit_speed"))]
+    /// [`JobSpec::work`] `w` takes `w / speed` seconds. Used by [`ScoreTerm::Speed`], [`Defer`]
+    /// and [`Speculate`]. Default 1.0.
+    #[cfg_attr(feature = "serde", serde(default = "unit"))]
     pub speed: f64,
 }
 
-/// The default [`WorkerState::speed`].
+/// The default [`WorkerState::speed`] and [`JobSpec::weight`].
 #[cfg(feature = "serde")]
-fn unit_speed() -> f64 {
+fn unit() -> f64 {
     1.0
 }
 
 impl WorkerState {
-    /// A worker with the given capacity and nothing reported yet.
-    pub fn new(id: WorkerId, class: impl Into<String>, slots: usize, budget: Resources) -> Self {
+    /// A worker with `slots` execution slots, the memory capacity in `budget` (whose [`SLOTS`]
+    /// component is replaced), and nothing reported yet.
+    pub fn new(
+        id: WorkerId,
+        class: impl Into<String>,
+        slots: usize,
+        mut budget: Resources,
+    ) -> Self {
+        budget[SLOTS] = slots as u64;
         Self {
             id,
             class: class.into(),
-            slots,
             budget,
             reported_used: Resources::ZERO,
             reported_baseline: Resources::ZERO,
             speed: 1.0,
             per_task: Resources::ZERO,
         }
+    }
+
+    /// The worker's execution slots, `budget[SLOTS]`.
+    pub fn slots(&self) -> usize {
+        self.budget[SLOTS] as usize
     }
 }
 

@@ -1,4 +1,4 @@
-//! Hard and soft avoid lists.
+//! Forbid and Avoid constraints, and the soft avoidance of retries.
 
 use sched::{
     Config, FailKind, Input, JobId, JobSpec, Output, Policy, Resources, Scheduler, WorkerId,
@@ -29,16 +29,19 @@ fn policy(workers: &[(WorkerId, usize)]) -> Scheduler {
     p
 }
 
-/// A job avoiding `avoid`.
+/// A job that avoids (`soft`) or forbids every worker of `avoid`.
 fn job(id: JobId, avoid: &[WorkerId], soft: bool) -> JobSpec {
-    JobSpec {
-        avoid: avoid.to_vec(),
-        avoid_soft: soft,
-        ..JobSpec::new(id, Resources::mem(1), 0)
-    }
+    let job = JobSpec::new(id, Resources::mem(1), 0);
+    avoid.iter().fold(job, |job, &w| {
+        if soft {
+            job.avoid_worker(w)
+        } else {
+            job.forbid_worker(w)
+        }
+    })
 }
 
-/// The incident: every live worker is on the avoid list. Hard avoid waits; soft avoid runs.
+/// The incident: every live worker is excluded. Forbid waits; Avoid runs.
 #[test]
 fn soft_avoid_lapses_when_only_avoided_workers_are_live() {
     let mut p = policy(&[(1, 4)]);
@@ -50,17 +53,17 @@ fn soft_avoid_lapses_when_only_avoided_workers_are_live() {
     assert_eq!(starts(p.poll(1.0)), vec![(10, 2)]);
 }
 
-/// While a worker off the list is live, soft avoid holds even if that worker is busy: a retry
-/// waits for a healthy worker instead of returning to the one it failed on.
+/// While a worker the job does not avoid is live, Avoid holds even if that worker is busy: a
+/// retry waits for a healthy worker instead of returning to the one it failed on.
 #[test]
 fn soft_avoid_holds_while_another_worker_is_live() {
     let mut p = policy(&[(1, 4), (2, 1)]);
     p.handle(Input::Submit(JobSpec::new(0, Resources::mem(1), 0)), 0.0);
-    // Fill worker 2 explicitly via a hard avoid of worker 1.
+    // Fill worker 2 explicitly by forbidding worker 1.
     p.handle(Input::Submit(job(1, &[1], false)), 0.0);
     let placed = starts(p.poll(0.0));
     assert!(placed.contains(&(1, 2)), "{placed:?}");
-    // Worker 2 is now full; a soft-avoid job for worker 1 waits.
+    // Worker 2 is now full; a job avoiding worker 1 waits.
     p.handle(Input::Submit(job(2, &[1], true)), 1.0);
     let placed = starts(p.poll(1.0));
     assert!(!placed.iter().any(|&(j, _)| j == 2), "{placed:?}");
@@ -69,7 +72,7 @@ fn soft_avoid_holds_while_another_worker_is_live() {
     assert_eq!(starts(p.poll(2.0)), vec![(2, 2)]);
 }
 
-/// A worker with no slots is not live, and neither is a different class.
+/// A worker with no slots is not live, and one the hard constraints exclude does not count.
 #[test]
 fn soft_avoid_ignores_dead_and_foreign_workers() {
     let mut p = policy(&[(1, 2), (2, 0)]);
@@ -77,13 +80,7 @@ fn soft_avoid_ignores_dead_and_foreign_workers() {
         Input::Worker(WorkerState::new(3, "y", 2, Resources::mem(100))),
         0.0,
     );
-    p.handle(
-        Input::Submit(JobSpec {
-            class: Some("x".into()),
-            ..job(5, &[1], true)
-        }),
-        0.0,
-    );
+    p.handle(Input::Submit(job(5, &[1], true).require_class("x")), 0.0);
     assert_eq!(starts(p.poll(0.0)), vec![(5, 1)]);
 }
 

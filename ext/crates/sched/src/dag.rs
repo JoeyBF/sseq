@@ -285,12 +285,9 @@ impl std::error::Error for DagError {}
 #[derive(Clone, Debug, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct DagConfig {
-    /// Rank jobs by the critical path below them instead of "oldest group first": a job without an
-    /// explicit [`JobSpec::priority`] is submitted with priority `-(rank * rank_scale)`, so longer
-    /// remaining chains are more urgent. Default false.
+    /// Submit each job with its upward rank (the critical path below it) as [`JobSpec::rank`],
+    /// unless it has one, for [`OrderTerm::Rank`](crate::OrderTerm::Rank). Default false.
     pub rank_priority: bool,
-    /// Converts ranks (in work units) to integer priorities. Default 1000.
-    pub rank_scale: f64,
     /// Work of a job declared without an estimate. Default 1.
     pub default_work: f64,
     /// Ranks are maintained approximately: a rank increase smaller than this fraction is not
@@ -329,7 +326,6 @@ impl Default for DagConfig {
     fn default() -> Self {
         Self {
             rank_priority: false,
-            rank_scale: 1000.0,
             default_work: 1.0,
             rank_epsilon: 0.01,
             auto_submit: true,
@@ -703,7 +699,7 @@ impl<P: Policy> DagScheduler<P> {
         )
     }
 
-    /// Hand a ready job to the policy, with its rank as priority if configured.
+    /// Hand a ready job to the policy, with its rank if configured.
     fn submit_node(&mut self, n: NodeIndex, now: Instant) {
         self.graph[n].state = State::Submitted;
         let mut spec = self.graph[n]
@@ -714,10 +710,8 @@ impl<P: Policy> DagScheduler<P> {
             // The DAG layer's estimate feeds speed-aware placement (earliest finish).
             spec.work = Some(self.graph[n].work);
         }
-        if self.config.rank_priority && spec.priority.is_none() {
-            let rank = self.graph[n].rank + self.group_tail(spec.group);
-            let p = -(rank * self.config.rank_scale).round();
-            spec.priority = Some(p.clamp(i64::MIN as f64, i64::MAX as f64) as i64);
+        if self.config.rank_priority && spec.rank.is_none() {
+            spec.rank = Some(self.graph[n].rank + self.group_tail(spec.group));
         }
         self.policy.handle(Input::Submit(spec), now);
     }
@@ -860,7 +854,7 @@ impl<P: Policy> DagScheduler<P> {
 
     /// Change a declared job's work estimate (e.g. once its real size is known) and re-rank it
     /// and its ancestors, up or down. Returns false for unknown or completed jobs. Jobs already
-    /// handed to the policy keep the priority they were submitted with.
+    /// handed to the policy keep the rank they were submitted with.
     pub fn update_work(&mut self, job: JobId, work: f64) -> bool {
         let Some(&n) = self.index.get(&job) else {
             return false;

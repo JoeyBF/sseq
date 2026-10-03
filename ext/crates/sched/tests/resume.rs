@@ -10,7 +10,7 @@ use std::{
 use proptest::prelude::*;
 use sched::{
     Attempt, Config, DagConfig, DagJob, DagScheduler, DagTemplate, Input, InstanceSpec, JobId,
-    JobSpec, NodeLabel, Output, Policy, Resources, Scheduler, WorkerState,
+    JobSpec, MEM, NodeLabel, Output, Policy, Resources, Scheduler, WorkerState,
 };
 
 /// A DAG layer over the default backfill policy with one worker of `slots` slots.
@@ -114,7 +114,7 @@ fn per_node_demand_and_label() {
     assert_eq!(d.poll(0.0), vec![Output::RunLocal { job: 1 }]);
     done(&mut d, 1, 0, 0.0);
     assert_eq!(starts(&d.poll(0.0)).len(), 3);
-    assert_eq!(d.stats().workers[0].placed, Resources::mem(17));
+    assert_eq!(d.stats().workers[0].placed[MEM], 17);
 }
 
 /// The completion order of an instance driven to the end: every round, poll, then complete every

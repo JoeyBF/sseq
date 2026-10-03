@@ -1,8 +1,8 @@
-//! Speed-aware placement: fastest-first, earliest finish with deferral, learning and speculation.
+//! Speed-aware placement: the speed score, deferral to a faster worker, learning and speculation.
 
 use sched::{
-    Attempt, Config, Defer, Input, JobId, JobSpec, Output, Policy, Resources, Scheduler, Speculate,
-    SpeedConfig, SpeedPolicy, WorkerId, WorkerState,
+    Attempt, Config, Defer, Input, JobId, JobSpec, Output, Policy, Resources, Scheduler, ScoreTerm,
+    Speculate, SpeedConfig, WorkerId, WorkerState,
 };
 
 /// The `(job, worker)` of each start in `out`.
@@ -49,22 +49,19 @@ fn backfill(speed: SpeedConfig) -> Scheduler {
     })
 }
 
-/// Fastest first beats load balancing, for every preset, including best fit's tight packing.
+/// A speed term first beats load balancing, for every preset, including best fit's tight
+/// packing.
 #[test]
-fn fastest_first_picks_the_fast_worker() {
-    let speed = SpeedConfig {
-        policy: SpeedPolicy::FastestFirst,
-        learn: None,
-        speculate: None,
-    };
+fn speed_first_picks_the_fast_worker() {
     for base in [Config::fifo(), Config::default(), Config::best_fit()] {
-        let mut p = Scheduler::new(Config { speed, ..base });
+        let score = [vec![ScoreTerm::Speed], base.score.clone()].concat();
+        let mut p = Scheduler::new(Config { score, ..base });
         p.handle(Input::Worker(worker(1, 4, 1.0)), 0.0);
         // The fast worker has more room left, which best fit alone would avoid.
         p.handle(
             Input::Worker(WorkerState {
-                budget: Resources::mem(5000),
-                ..worker(2, 4, 2.4)
+                speed: 2.4,
+                ..WorkerState::new(2, "fast", 4, Resources::mem(5000))
             }),
             0.0,
         );
@@ -78,17 +75,20 @@ fn fastest_first_picks_the_fast_worker() {
     }
 }
 
-/// Oblivious placement keeps the historical least-loaded choice.
+/// Without a speed term, placement ignores speed: the least loaded, then the smallest id.
 #[test]
-fn oblivious_ignores_speed() {
-    let mut p = backfill(SpeedConfig::default());
+fn without_speed_term_speed_is_ignored() {
+    let mut p = Scheduler::new(Config {
+        score: vec![ScoreTerm::Preferred, ScoreTerm::Load],
+        ..Config::default()
+    });
     p.handle(Input::Worker(worker(1, 4, 1.0)), 0.0);
     p.handle(Input::Worker(worker(2, 4, 2.4)), 0.0);
     p.handle(Input::Submit(job(0, None)), 0.0);
     assert_eq!(starts(p.poll(0.0)), vec![(0, 1)]);
 }
 
-/// Earliest finish waits for a fast slot that frees soon, but not for one that frees late.
+/// Deferral waits for a fast slot that frees soon, but not for one that frees late.
 #[test]
 fn earliest_finish_defers_only_when_it_pays() {
     let defer = Defer {
@@ -96,9 +96,8 @@ fn earliest_finish_defers_only_when_it_pays() {
         min_gain: 0.0,
     };
     let speed = SpeedConfig {
-        policy: SpeedPolicy::EarliestFinish(Some(defer)),
-        learn: None,
-        speculate: None,
+        defer: Some(defer),
+        ..SpeedConfig::default()
     };
     for (running_work, expect_defer) in [(10.0, true), (1000.0, false)] {
         let mut p = backfill(speed);
@@ -138,9 +137,8 @@ fn deferral_expires() {
         min_gain: 0.0,
     };
     let speed = SpeedConfig {
-        policy: SpeedPolicy::EarliestFinish(Some(defer)),
-        learn: None,
-        speculate: None,
+        defer: Some(defer),
+        ..SpeedConfig::default()
     };
     let mut p = backfill(speed);
     p.handle(Input::Worker(worker(1, 1, 1.0)), 0.0);
@@ -164,9 +162,8 @@ fn deferrals_book_slots_in_order() {
         min_gain: 0.0,
     };
     let speed = SpeedConfig {
-        policy: SpeedPolicy::EarliestFinish(Some(defer)),
-        learn: None,
-        speculate: None,
+        defer: Some(defer),
+        ..SpeedConfig::default()
     };
     let mut p = backfill(speed);
     p.handle(Input::Worker(worker(1, 1, 1.0)), 0.0);
@@ -187,9 +184,8 @@ fn deferrals_book_slots_in_order() {
 #[test]
 fn learned_speeds_replace_reported_ones() {
     let speed = SpeedConfig {
-        policy: SpeedPolicy::FastestFirst,
         learn: Some(sched::Learn::default()),
-        speculate: None,
+        ..SpeedConfig::default()
     };
     let mut p = backfill(speed);
     // Both report 1.0; worker 2 really runs three times faster.
@@ -238,9 +234,8 @@ fn learned_speeds_replace_reported_ones() {
 /// short one ends at 1 s.
 fn stuck(speculate: Option<Speculate>) -> Scheduler {
     let mut p = backfill(SpeedConfig {
-        policy: SpeedPolicy::FastestFirst,
-        learn: None,
         speculate,
+        ..SpeedConfig::default()
     });
     p.handle(Input::Worker(worker(1, 1, 1.0)), 0.0);
     p.handle(Input::Worker(worker(2, 1, 4.0)), 0.0);
@@ -334,14 +329,13 @@ fn speculation_yields_to_waiting_jobs_and_is_opt_in() {
     assert_eq!(q.poll(1.0), vec![]);
 }
 
-/// A clock-capped worker of the same class is learned slower than its peers, so fastest-first
+/// A clock-capped worker of the same class is learned slower than its peers, so the speed term
 /// fills it last; peers within the resolution still share work by load.
 #[test]
 fn capped_worker_learned_per_worker() {
     let speed = SpeedConfig {
-        policy: SpeedPolicy::FastestFirst,
         learn: Some(sched::Learn::default()),
-        speculate: None,
+        ..SpeedConfig::default()
     };
     let mut p = backfill(speed);
     for w in 1..=3 {

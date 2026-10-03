@@ -15,8 +15,8 @@ use std::{
 use proptest::prelude::*;
 use sched::{
     Attempt, Config, Defer, FailKind, GaveUp, Input, Instant, JobId, JobSpec, Lease, Output,
-    Policy, PolicyStats, Resources, RetryConfig, Scheduler, SharedPolicy, SpeedConfig, SpeedPolicy,
-    WorkerId, WorkerState,
+    Policy, PolicyStats, Resources, RetryConfig, Scheduler, SharedPolicy, SpeedConfig, WorkerId,
+    WorkerState,
 };
 
 /// A worker of class "x".
@@ -156,10 +156,10 @@ fn dropped_lease_releases() {
 fn ticker_releases_timed_waits() {
     let policy = Scheduler::new(Config {
         speed: SpeedConfig {
-            policy: SpeedPolicy::EarliestFinish(Some(Defer {
+            defer: Some(Defer {
                 max_wait: 0.2,
                 min_gain: 0.0,
-            })),
+            }),
             ..SpeedConfig::default()
         },
         ..Config::default()

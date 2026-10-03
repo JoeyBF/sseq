@@ -7,26 +7,32 @@ use std::{
 };
 
 use crate::{
-    Admission, Attempt, Config, DEV, DIMS, FailKind, Fit, GaveUp, GroupOrder, Input, Instant,
-    JobId, JobSpec, MEM, Order, Output, Policy, PolicyStats, ProductionAdmission, ReservationInfo,
-    Resources, SpeedEstimator, SpeedPolicy, Tried, WorkerId, WorkerLoad, WorkerState, WorkerView,
+    Admission, Attempt, Config, DEV, DIMS, FailKind, GaveUp, GroupOrder, Input, Instant, JobId,
+    JobSpec, MEM, OrderTerm, Output, Policy, PolicyStats, ProductionAdmission, ReservationInfo,
+    Resources, SLOTS, ScoreTerm, Selector, SpeedEstimator, Strength, Tried, WorkerId, WorkerLoad,
+    WorkerState, WorkerView,
 };
 
-/// Urgency: smaller is more urgent.
+/// The most terms a [`Config::order`] has once repeats are dropped: one per [`OrderTerm`].
+const ORDER_TERMS: usize = 5;
+
+/// The most terms a [`Config::score`] has once repeats are dropped: one per [`ScoreTerm`].
+const SCORE_TERMS: usize = 5;
+
+/// Urgency: smaller is more urgent. `terms[i]` is the key of `config.order[i]`; the rest are 0.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct Key {
-    priority: i64,
-    group: u64,
-    /// Priority within the group (only with `group_first`).
-    within: i64,
+    terms: [i64; ORDER_TERMS],
     seq: u64,
 }
+
+/// A worker's rank for a job under [`Config::score`]: smaller is better, like [`Key`].
+type Score = [i64; SCORE_TERMS];
 
 #[derive(Clone, Debug)]
 struct Worker {
     state: WorkerState,
-    /// Live attempts here.
-    running: usize,
+    /// The demands of the live attempts here, one slot each.
     placed: Resources,
     /// The jobs with a live attempt here, and that attempt (a job has at most one per worker).
     jobs: BTreeMap<JobId, Attempt>,
@@ -44,9 +50,18 @@ impl Worker {
     fn view(&self) -> WorkerView<'_> {
         WorkerView {
             state: &self.state,
-            running: self.running,
             placed: self.placed,
         }
+    }
+
+    /// Live attempts here.
+    fn running(&self) -> usize {
+        self.placed[SLOTS] as usize
+    }
+
+    /// Whether the worker can ever run anything: it has slots.
+    fn live(&self) -> bool {
+        self.state.slots() > 0
     }
 }
 
@@ -61,7 +76,7 @@ struct Job {
     attempts: Attempt,
     /// Failed attempts.
     tried: Vec<Tried>,
-    /// Workers its failed attempts ran on, avoided softly whatever `spec.avoid_soft` says.
+    /// Workers its failed attempts ran on, avoided softly like a [`Strength::Avoid`].
     retry_avoid: Vec<WorkerId>,
     /// Speculative attempts started.
     speculated: u32,
@@ -155,7 +170,7 @@ enum Cursor {
 const GB: f64 = 1e9;
 
 /// Each dimension's name in `explain`, indexed by dimension.
-const DIM_NAMES: [&str; DIMS] = ["memory", "device memory"];
+const DIM_NAMES: [&str; DIMS] = ["memory", "device memory", "slots"];
 
 /// A resource vector in words for `explain`: host memory always, device memory when nonzero.
 fn gb_list(r: &Resources) -> String {
@@ -166,7 +181,7 @@ fn gb_list(r: &Resources) -> String {
     parts.join(" + ")
 }
 
-/// A float as a totally ordered integer key (for score tuples).
+/// A float as a totally ordered integer key (for order and score keys).
 fn ordered(x: f64) -> i64 {
     let b = x.to_bits() as i64;
     b ^ (((b >> 63) as u64) >> 1) as i64
@@ -175,14 +190,68 @@ fn ordered(x: f64) -> i64 {
 /// Bring a worker's concurrency integral up to `now`.
 fn tick_occ(w: &mut Worker, now: Instant) {
     if now > w.occ_at {
-        w.occ += w.running as f64 * (now - w.occ_at);
+        w.occ += w.running() as f64 * (now - w.occ_at);
         w.occ_at = now;
     }
 }
 
-/// Whether `job`'s class pin allows `w`.
-fn class_allows(job: &JobSpec, w: &Worker) -> bool {
-    job.class.as_ref().is_none_or(|c| *c == w.state.class)
+/// Whether `job`'s hard constraints allow `w`: no [`Strength::Forbid`] selects it, and for each
+/// kind of selector the job requires on, some [`Strength::Require`] of that kind selects it.
+fn allows(job: &JobSpec, w: &WorkerState) -> bool {
+    // Per selector kind (worker, class): whether the job has a Require of it, and one selects w.
+    let (mut required, mut met) = ([false; 2], [false; 2]);
+    for c in &job.constraints {
+        let selects = c.on.matches(w);
+        match c.strength {
+            Strength::Forbid if selects => return false,
+            Strength::Require => {
+                let kind = matches!(c.on, Selector::Class(_)) as usize;
+                required[kind] = true;
+                met[kind] |= selects;
+            }
+            _ => {}
+        }
+    }
+    required == met
+}
+
+/// Whether a [`Strength::Avoid`] of `job`, or one of its failed attempts, selects `w`.
+fn avoids(job: &Job, w: &WorkerState) -> bool {
+    job.retry_avoid.contains(&w.id)
+        || job
+            .spec
+            .constraints
+            .iter()
+            .any(|c| c.strength == Strength::Avoid && c.on.matches(w))
+}
+
+/// Whether a [`Strength::Prefer`] of `job` selects `w`.
+fn prefers(job: &JobSpec, w: &WorkerState) -> bool {
+    job.constraints
+        .iter()
+        .any(|c| c.strength == Strength::Prefer && c.on.matches(w))
+}
+
+/// Whether `job` can run on some worker of `classes` as far as its class Requires go.
+fn class_possible(job: &JobSpec, classes: &BTreeSet<String>) -> bool {
+    let mut required = (job.constraints.iter())
+        .filter_map(|c| match (&c.on, c.strength) {
+            (Selector::Class(class), Strength::Require) => Some(class),
+            _ => None,
+        })
+        .peekable();
+    required.peek().is_none() || required.any(|c| classes.contains(c))
+}
+
+/// `terms` without repeats, keeping first occurrences.
+fn dedup<T: PartialEq + Copy>(terms: &[T]) -> Vec<T> {
+    let mut out = Vec::with_capacity(terms.len());
+    for &t in terms {
+        if !out.contains(&t) {
+            out.push(t);
+        }
+    }
+    out
 }
 
 /// The placement policy: list scheduling with admission, reservations and backfill, configured
@@ -190,7 +259,7 @@ fn class_allows(job: &JobSpec, w: &Worker) -> bool {
 ///
 /// - Jobs are considered in [`Config::order`], aged jobs first ([`Config::age_limit`]).
 /// - A job takes a worker only if no more urgent waiting job is admitted there; among the
-///   workers that admit it, the one [`Config::fit`] and [`Config::speed`] rank first.
+///   workers that admit it, the one [`Config::score`] ranks first.
 /// - [`Config::reservations`] drain a worker for a starving job; every other worker keeps
 ///   admitting less urgent jobs.
 ///
@@ -251,7 +320,9 @@ impl Scheduler {
     }
 
     /// A scheduler with a custom admission rule.
-    pub fn with_admission(config: Config, admission: impl Admission + Send + 'static) -> Self {
+    pub fn with_admission(mut config: Config, admission: impl Admission + Send + 'static) -> Self {
+        config.order = dedup(&config.order);
+        config.score = dedup(&config.score);
         Self {
             learned: config.speed.learn.map(SpeedEstimator::new),
             config,
@@ -304,70 +375,48 @@ impl Scheduler {
             .reduce(f64::min)
     }
 
-    /// Whether `job`'s constraints (class, avoid lists) allow `w` at all. Soft avoidance (the
-    /// caller's list with [`JobSpec::avoid_soft`], and the workers of failed attempts) lapses
-    /// while no live worker of the job's class is free of both lists; that depends on the
-    /// worker set only, not on load, so admission stays monotone.
+    /// Whether `job`'s constraints allow `w` at all. Avoidance (its [`Strength::Avoid`]s and the
+    /// workers of failed attempts) lapses while no live worker that the hard constraints allow is
+    /// free of it; that depends on the worker set only, not on load, so admission stays monotone.
     fn eligible(&self, job: &Job, w: &Worker) -> bool {
         let spec = &job.spec;
-        if !class_allows(spec, w) {
-            return false;
-        }
-        let listed = |id: &WorkerId| spec.avoid.contains(id);
-        let hard = |id: &WorkerId| !spec.avoid_soft && listed(id);
-        let soft = |id: &WorkerId| (spec.avoid_soft && listed(id)) || job.retry_avoid.contains(id);
-        let id = &w.state.id;
-        if hard(id) {
-            return false;
-        }
-        !soft(id)
-            || !self.workers.values().any(|o| {
-                let o_id = &o.state.id;
-                o.state.slots > 0 && class_allows(spec, o) && !hard(o_id) && !soft(o_id)
-            })
+        allows(spec, &w.state)
+            && (!avoids(job, &w.state)
+                || !self
+                    .workers
+                    .values()
+                    .any(|o| o.live() && allows(spec, &o.state) && !avoids(job, &o.state)))
     }
 
-    /// Queue a new job under its urgency key, recording its group's first arrival.
-    fn submit(&mut self, spec: JobSpec, now: Instant) {
+    /// The urgency key of a job submitted as number `seq`, recording its group's first arrival
+    /// if groups are ordered by it.
+    fn key(&mut self, spec: &JobSpec, seq: u64) -> Key {
+        let mut terms = [0; ORDER_TERMS];
+        for (slot, term) in terms.iter_mut().zip(&self.config.order) {
+            *slot = match term {
+                OrderTerm::Priority => spec.priority.unwrap_or(self.config.default_priority),
+                OrderTerm::Rank => spec.rank.map_or(i64::MAX, |r| ordered(-r)),
+                OrderTerm::Group => match self.config.group_order {
+                    GroupOrder::Arrival => *self.groups.entry(spec.group).or_insert(seq) as i64,
+                    // Order-preserving from u64 to i64.
+                    GroupOrder::Id => spec.group as i64 ^ i64::MIN,
+                },
+                OrderTerm::Wspt => spec.work.map_or(i64::MAX, |w| ordered(-(spec.weight / w))),
+                OrderTerm::Edd => spec.due.map_or(i64::MAX, ordered),
+            };
+        }
+        Key { terms, seq }
+    }
+
+    /// Queue a new job under its urgency key, demanding one slot.
+    fn submit(&mut self, mut spec: JobSpec, now: Instant) {
         if self.waiting.contains_key(&spec.id) || self.running.contains_key(&spec.id) {
             return;
         }
+        spec.demand[SLOTS] = 1;
         let seq = self.next_seq;
         self.next_seq += 1;
-        let key = match self.config.order {
-            Order::Fifo => Key {
-                priority: 0,
-                group: 0,
-                within: 0,
-                seq,
-            },
-            Order::Priority {
-                default_priority,
-                group_order,
-                group_first,
-            } => {
-                let group = match group_order {
-                    GroupOrder::Arrival => *self.groups.entry(spec.group).or_insert(seq),
-                    GroupOrder::Id => spec.group,
-                };
-                let priority = spec.priority.unwrap_or(default_priority);
-                if group_first {
-                    Key {
-                        priority: 0,
-                        group,
-                        within: priority,
-                        seq,
-                    }
-                } else {
-                    Key {
-                        priority,
-                        group,
-                        within: 0,
-                        seq,
-                    }
-                }
-            }
-        };
+        let key = self.key(&spec, seq);
         self.enqueue(Job {
             spec,
             key,
@@ -431,7 +480,6 @@ impl Scheduler {
     fn release_run(&mut self, job: JobId, demand: Resources, run: &Run) {
         if let Some(w) = self.workers.get_mut(&run.worker) {
             tick_occ(w, self.now);
-            w.running -= 1;
             w.placed -= demand;
             w.jobs.remove(&job);
         }
@@ -599,7 +647,6 @@ impl Scheduler {
                     id,
                     Worker {
                         state,
-                        running: 0,
                         placed: Resources::ZERO,
                         jobs: BTreeMap::new(),
                         reserved_for: None,
@@ -693,22 +740,20 @@ impl Scheduler {
             reported_used: Resources::ZERO,
             ..w.state.clone()
         };
-        let fits = |running: usize, placed: Resources| {
+        let fits = |placed: Resources| {
             let view = WorkerView {
                 state: &state,
-                running,
                 placed,
             };
             self.admission.admits(&demand, &view)
         };
-        let (mut running, mut placed) = (w.running, w.placed);
-        if fits(running, placed) {
+        let mut placed = w.placed;
+        if fits(placed) {
             return Some(self.now);
         }
         for (end, d) in ends {
-            running -= 1;
             placed -= d;
-            if fits(running, placed) {
+            if fits(placed) {
                 return Some(end);
             }
         }
@@ -792,25 +837,30 @@ impl Scheduler {
         ends.first().copied().filter(|e| e.is_finite())
     }
 
+    /// Worker `w`'s rank for `job` under [`Config::score`].
+    fn score(&self, job: &JobSpec, w: &Worker) -> Score {
+        let mut score = [0; SCORE_TERMS];
+        for (slot, term) in score.iter_mut().zip(&self.config.score) {
+            *slot = match term {
+                ScoreTerm::Speed => self.speed_rank(w),
+                ScoreTerm::Tightest => ordered(w.view().free_share(&job.demand)),
+                ScoreTerm::Loosest => ordered(-w.view().free_share(&job.demand)),
+                ScoreTerm::Preferred => !prefers(job, &w.state) as i64,
+                ScoreTerm::Load => w.running() as i64,
+            };
+        }
+        score
+    }
+
     /// The best worker that takes `job`, or a busy faster worker to wait for, if any.
     fn choose(&self, job: &Job, proj: &mut Projection) -> Pick {
-        let speed_first = self.config.speed.policy != SpeedPolicy::Oblivious;
-        // Smallest tuple wins; the worker id makes the order total (determinism).
-        let mut best: Option<((i64, i64, bool, usize), WorkerId)> = None;
+        // Smallest score wins; the worker id makes the order total (determinism).
+        let mut best: Option<(Score, WorkerId)> = None;
         for (&id, w) in &self.workers {
             if self.refusal(job, w).is_some() {
                 continue;
             }
-            let preferred = job.spec.prefer.contains(&id);
-            let speed_key = if speed_first { self.speed_rank(w) } else { 0 };
-            let fit = match self.config.fit {
-                Fit::LeastLoaded => 0,
-                Fit::Tightest { prefer_penalty } => {
-                    let after = w.view().free_share(&job.spec.demand);
-                    ordered(after - if preferred { prefer_penalty } else { 0.0 })
-                }
-            };
-            let score = (speed_key, fit, !preferred, w.running);
+            let score = self.score(&job.spec, w);
             if best.as_ref().is_none_or(|(b, _)| score < *b) {
                 best = Some((score, id));
             }
@@ -818,7 +868,7 @@ impl Scheduler {
         let Some((_, place)) = best else {
             return Pick::Nothing;
         };
-        if let SpeedPolicy::EarliestFinish(Some(defer)) = self.config.speed.policy
+        if let Some(defer) = self.config.speed.defer
             && let Some(run_here) = self.eta(&job.spec, &self.workers[&place])
             && self.reserved(job.spec.id).is_none()
             && !self.aged(job)
@@ -828,19 +878,23 @@ impl Scheduler {
             let here = self.now + run_here;
             let mut wait: Option<(f64, WorkerId)> = None;
             for (&id, w) in &self.workers {
-                // Only workers that refuse for want of a slot, and would admit with one free.
+                let slots = w.state.slots();
+                // Only full workers, and only if they would admit the job with one slot free.
                 if w.speed <= self.workers[&place].speed
-                    || w.running < w.state.slots
+                    || slots == 0
+                    || w.running() < slots
                     || !self.eligible(job, w)
                     || w.reserved_for.is_some_and(|h| h != job.spec.id)
                 {
                     continue;
                 }
+                let mut placed = w.placed;
+                placed[SLOTS] = slots as u64 - 1;
                 let view = WorkerView {
-                    running: w.state.slots.saturating_sub(1),
-                    ..w.view()
+                    state: &w.state,
+                    placed,
                 };
-                if w.state.slots == 0 || !self.admission.admits(&job.spec.demand, &view) {
+                if !self.admission.admits(&job.spec.demand, &view) {
                     continue;
                 }
                 let (Some(start), Some(run)) = (self.next_free(w, proj), self.eta(&job.spec, w))
@@ -895,7 +949,6 @@ impl Scheduler {
             .get_mut(&worker)
             .expect("placing on an unknown worker");
         tick_occ(w, self.now);
-        w.running += 1;
         w.placed += r.job.spec.demand;
         w.jobs.insert(job, attempt);
         r.live.push(Run {
@@ -918,9 +971,7 @@ impl Scheduler {
             (
                 false,
                 Key {
-                    priority: 0,
-                    group: 0,
-                    within: 0,
+                    terms: [0; ORDER_TERMS],
                     seq: job.key.seq,
                 },
             )
@@ -956,13 +1007,11 @@ impl Scheduler {
                 .count();
             n >= cfg.max
         };
-        // Most headroom; then fastest (when speed-aware); then preferred; then fewest running;
-        // then smallest id.
-        let speed_first = self.config.speed.policy != SpeedPolicy::Oblivious;
-        let mut best: Option<((i64, i64, bool, usize), WorkerId)> = None;
+        // Most headroom; then the configured score; then smallest id.
+        let mut best: Option<((i64, Score), WorkerId)> = None;
         for (&id, w) in &self.workers {
             if w.reserved_for.is_some()
-                || w.state.slots == 0
+                || !w.live()
                 || class_full(&w.state.class)
                 || !self.eligible(j, w)
             {
@@ -970,9 +1019,7 @@ impl Scheduler {
             }
             let score = (
                 ordered(-w.view().free_share(&Resources::ZERO)),
-                if speed_first { self.speed_rank(w) } else { 0 },
-                !j.spec.prefer.contains(&id),
-                w.running,
+                self.score(&j.spec, w),
             );
             if best.as_ref().is_none_or(|(b, _)| score < *b) {
                 best = Some((score, id));
@@ -1004,11 +1051,16 @@ impl Scheduler {
         w.reserved_for.is_none() || self.shadow(w).is_some()
     }
 
-    /// Classes with an open worker that has a free slot.
+    /// Whether worker `w` admits anything at all, by the admission bound.
+    fn has_room(&self, w: &Worker) -> bool {
+        self.admission.bound(&w.view()).is_some()
+    }
+
+    /// Classes with an open worker that has room.
     fn open_classes(&self) -> BTreeSet<String> {
         self.workers
             .values()
-            .filter(|w| w.running < w.state.slots && self.open(w))
+            .filter(|w| self.open(w) && self.has_room(w))
             .map(|w| w.state.class.clone())
             .collect()
     }
@@ -1036,7 +1088,7 @@ impl Scheduler {
             .iter()
             .filter(|(job, h)| {
                 let w = &self.workers[&h.worker()];
-                w.state.slots == 0 || !self.eligible(&self.waiting[job], w)
+                !w.live() || !self.eligible(&self.waiting[job], w)
             })
             .map(|(&job, _)| job)
             .collect();
@@ -1045,7 +1097,7 @@ impl Scheduler {
         }
         let mut proj = Projection::new();
         'scan: loop {
-            if !self.workers.values().any(|w| w.running < w.state.slots) {
+            if !self.workers.values().any(|w| self.has_room(w)) {
                 break;
             }
             let mut bound = self.open_bound();
@@ -1062,11 +1114,10 @@ impl Scheduler {
                 }
                 let j = &self.waiting[&job];
                 let holder = self.reserved(job).is_some();
-                // Cheap pruning: the admission bound, and a class pin with no free slot of its
-                // class.
+                // Cheap pruning: the admission bound, and required classes without room.
                 let hopeful = holder
                     || (bound.is_some_and(|b| j.spec.demand.fits_within(&b))
-                        && j.spec.class.as_ref().is_none_or(|c| classes.contains(c)));
+                        && class_possible(&j.spec, &classes));
                 let pick = if hopeful {
                     self.choose(j, &mut proj)
                 } else {
@@ -1074,7 +1125,7 @@ impl Scheduler {
                 };
                 match pick {
                     Pick::Defer(worker, at) => {
-                        let SpeedPolicy::EarliestFinish(Some(d)) = self.config.speed.policy else {
+                        let Some(d) = self.config.speed.defer else {
                             unreachable!("deferral without a Defer config")
                         };
                         let until = j.since + d.max_wait;
@@ -1090,7 +1141,7 @@ impl Scheduler {
                             // the reservation must get the first look.
                             continue 'scan;
                         }
-                        if !self.workers.values().any(|w| w.running < w.state.slots) {
+                        if !self.workers.values().any(|w| self.has_room(w)) {
                             break 'scan;
                         }
                         bound = self.open_bound();
@@ -1124,7 +1175,7 @@ impl Scheduler {
         for to in ids {
             loop {
                 let w = &self.workers[&to];
-                if w.running >= w.state.slots || w.reserved_for.is_some() {
+                if !self.has_room(w) || w.reserved_for.is_some() {
                     break;
                 }
                 let rank = self.speed_rank(w);
@@ -1192,8 +1243,8 @@ impl Scheduler {
         WorkerLoad {
             id: w.state.id,
             class: w.state.class.clone(),
-            slots: w.state.slots,
-            running: w.running,
+            slots: w.state.slots(),
+            running: w.running(),
             placed: w.placed,
             headroom: w.view().headroom(),
             reserved_for: w.reserved_for,
@@ -1272,8 +1323,8 @@ impl Scheduler {
                 msg += &format!(
                     "; holds the reservation on worker {} (draining: {}/{} running, used {})",
                     w.state.id,
-                    w.running,
-                    w.state.slots,
+                    w.running(),
+                    w.state.slots(),
                     gb_list(&w.view().used())
                 );
             }
@@ -1297,11 +1348,15 @@ impl Scheduler {
                     reserved.push(format!("worker {id} for job {h}"))
                 }
                 Some(Refusal::Held(_, Hold::Defer { .. })) => {}
-                Some(Refusal::Admission) if w.running >= w.state.slots => full += 1,
                 Some(Refusal::Admission) => {
                     let view = w.view();
                     let headroom = view.headroom();
-                    for d in view.short(&j.spec.demand) {
+                    let lacking: Vec<usize> = view.short(&j.spec.demand).collect();
+                    if lacking.contains(&SLOTS) {
+                        full += 1;
+                        continue;
+                    }
+                    for d in lacking {
                         short[d] += 1;
                         let h = headroom[d].unwrap_or(i64::MAX);
                         if best_short[d].is_none_or(|(b, _)| h > b) {
@@ -1328,7 +1383,7 @@ impl Scheduler {
             }
         }
         if excluded > 0 {
-            msg += &format!("; {excluded} worker(s) excluded by its class or avoid list");
+            msg += &format!("; {excluded} worker(s) excluded by its constraints");
         }
         if !reserved.is_empty() {
             msg += &format!("; reserved: {}", reserved.join(", "));
@@ -1463,8 +1518,7 @@ mod tests {
             Input::Submit(job(0, 10, 0)),
         ];
         feed(&mut p, 0.0, inputs);
-        let mut j = job(1, 10, 0);
-        j.prefer = vec![1];
+        let j = job(1, 10, 0).prefer_worker(1);
         assert_eq!(starts(&feed(&mut p, 0.0, [Input::Submit(j)])), vec![(1, 1)]);
     }
 
@@ -1617,20 +1671,19 @@ mod tests {
         assert_eq!(p.explain(0), None);
     }
 
-    /// Retries avoid the workers tried softly, but the caller's hard avoid list stays hard.
+    /// Retries avoid the workers tried softly, but the caller's Forbid stays hard.
     #[test]
-    fn hard_avoid_survives_retries() {
+    fn forbid_survives_retries() {
         let mut p = Scheduler::new(Config::fifo());
-        let mut j = job(0, 1, 0);
-        j.avoid = vec![1];
+        let j = job(0, 1, 0).forbid_worker(1);
         let inputs = [
             Input::Worker(worker(1, 1, 100)),
             Input::Worker(worker(2, 1, 100)),
             Input::Submit(j),
         ];
         assert_eq!(starts(&feed(&mut p, 0.0, inputs)), vec![(0, 2)]);
-        // Worker 2 is now avoided softly; the only other live worker is avoided hard, so the
-        // soft list lapses and the retry goes back to 2.
+        // Worker 2 is now avoided softly; the only other live worker is forbidden, so the
+        // avoidance lapses and the retry goes back to 2.
         let out = feed(&mut p, 1.0, [fail(0, 1, FailKind::Other)]);
         assert_eq!(
             out,
@@ -1883,6 +1936,159 @@ mod tests {
             matches!(&out[..], [Output::GaveUp(g)] if g.tried.len() == 3),
             "{out:?}"
         );
+    }
+
+    /// The order in which a one-slot worker runs `jobs`, all submitted before it joins.
+    fn run_order(config: Config, jobs: Vec<JobSpec>) -> Vec<JobId> {
+        let mut p = Scheduler::new(config);
+        let n = jobs.len();
+        feed(&mut p, 0.0, jobs.into_iter().map(Input::Submit));
+        p.handle(Input::Worker(worker(1, 1, 100)), 0.0);
+        let mut order = Vec::new();
+        for t in 0..n {
+            let out = starts(&p.poll(t as f64));
+            assert_eq!(out.len(), 1, "{out:?}");
+            order.push(out[0].0);
+            p.handle(done(out[0].0, 1), t as f64 + 0.5);
+        }
+        order
+    }
+
+    /// Smith's rule: largest weight over work first; jobs without work last, in arrival order.
+    #[test]
+    fn wspt_orders_by_weight_over_work() {
+        let spec = |id, weight, work| JobSpec {
+            weight,
+            work,
+            ..job(id, 1, 0)
+        };
+        let jobs = vec![
+            spec(0, 1.0, None),
+            spec(1, 1.0, Some(10.0)),
+            spec(2, 3.0, Some(10.0)),
+            spec(3, 1.0, Some(2.0)),
+            spec(4, 1.0, None),
+        ];
+        let order = run_order(Config::weighted_completion(), jobs);
+        assert_eq!(order, vec![3, 2, 1, 0, 4]);
+    }
+
+    /// Jackson's rule: earliest due date first; jobs without one last.
+    #[test]
+    fn edd_orders_by_due_date() {
+        let spec = |id, due| JobSpec {
+            due,
+            ..job(id, 1, 0)
+        };
+        let jobs = vec![spec(0, None), spec(1, Some(50.0)), spec(2, Some(-3.0))];
+        assert_eq!(run_order(Config::lateness(), jobs), vec![2, 1, 0]);
+    }
+
+    /// The default order: explicit priority, then rank (largest first), then group arrival; a
+    /// repeated term changes nothing.
+    #[test]
+    fn default_order_is_priority_rank_group() {
+        let spec = |id, group, priority, rank| JobSpec {
+            priority,
+            rank,
+            ..job(id, 1, group)
+        };
+        let jobs = || {
+            vec![
+                spec(0, 5, None, None),
+                spec(1, 6, None, Some(2.0)),
+                spec(2, 6, None, Some(9.0)),
+                spec(3, 5, Some(-1), None),
+            ]
+        };
+        assert_eq!(run_order(Config::default(), jobs()), vec![3, 2, 1, 0]);
+        let mut repeated = Config::default();
+        repeated
+            .order
+            .extend([OrderTerm::Priority, OrderTerm::Group]);
+        assert_eq!(run_order(repeated, jobs()), vec![3, 2, 1, 0]);
+        // Group before rank: the older group first.
+        let group_first = Config {
+            order: vec![OrderTerm::Group, OrderTerm::Rank],
+            ..Config::default()
+        };
+        assert_eq!(run_order(group_first, jobs()), vec![0, 3, 2, 1]);
+    }
+
+    /// Requires of one kind are alternatives; of different kinds, all must hold. Forbid wins.
+    #[test]
+    fn requires_and_forbids() {
+        let mut p = Scheduler::new(Config::fifo());
+        let mut inputs: Vec<Input> = [(1, "a"), (2, "b"), (3, "c")]
+            .into_iter()
+            .map(|(id, class)| {
+                Input::Worker(WorkerState::new(id, class, 4, Resources::mem(100 * GB)))
+            })
+            .collect();
+        let either = job(0, 1, 0).require_class("c").require_class("b");
+        let both = job(1, 1, 0)
+            .require_class("a")
+            .constrain(Strength::Require, Selector::Worker(2));
+        let forbidden = job(2, 1, 0)
+            .require_class("a")
+            .constrain(Strength::Forbid, Selector::Class("a".into()));
+        let worker_or = job(3, 1, 0)
+            .constrain(Strength::Require, Selector::Worker(3))
+            .constrain(Strength::Require, Selector::Worker(1))
+            .forbid_worker(1);
+        inputs.extend([either, both, forbidden, worker_or].map(Input::Submit));
+        // Job 0 takes the less loaded of b and c; jobs 1 and 2 match nothing.
+        assert_eq!(starts(&feed(&mut p, 0.0, inputs)), vec![(0, 2), (3, 3)]);
+        let msg = p.explain(1).unwrap();
+        assert!(
+            msg.contains("3 worker(s) excluded by its constraints"),
+            "{msg}"
+        );
+    }
+
+    /// A Prefer on a class ranks the whole class first; Loosest picks the emptiest worker.
+    #[test]
+    fn prefer_class_and_loosest() {
+        let mut p = Scheduler::new(Config::default());
+        let inputs = [
+            Input::Worker(WorkerState::new(1, "a", 4, Resources::mem(100 * GB))),
+            Input::Worker(WorkerState::new(2, "b", 4, Resources::mem(100 * GB))),
+            Input::Submit(job(0, 1, 0).constrain(Strength::Prefer, Selector::Class("b".into()))),
+        ];
+        assert_eq!(starts(&feed(&mut p, 0.0, inputs)), vec![(0, 2)]);
+        let mut p = Scheduler::new(Config {
+            score: vec![ScoreTerm::Loosest],
+            ..Config::default()
+        });
+        let inputs = [
+            Input::Worker(worker(1, 4, 100)),
+            Input::Worker(worker(2, 4, 50)),
+            Input::Submit(job(0, 1, 0)),
+        ];
+        assert_eq!(starts(&feed(&mut p, 0.0, inputs)), vec![(0, 1)]);
+    }
+
+    /// Slots are a resource dimension: every job takes exactly one, whatever the caller wrote,
+    /// and a full worker is explained as such.
+    #[test]
+    fn slots_are_a_hard_dimension() {
+        let mut p = Scheduler::new(Config::fifo());
+        let mut greedy = job(0, 1, 0);
+        greedy.demand[SLOTS] = 5;
+        let inputs = [
+            Input::Worker(worker(1, 2, 100)),
+            Input::Submit(greedy),
+            Input::Submit(job(1, 1, 0)),
+            Input::Submit(job(2, 1, 0)),
+        ];
+        assert_eq!(starts(&feed(&mut p, 0.0, inputs)), vec![(0, 1), (1, 1)]);
+        let load = &p.stats().workers[0];
+        assert_eq!(
+            (load.running, load.placed[SLOTS], load.headroom[SLOTS]),
+            (2, 2, Some(0))
+        );
+        let msg = p.explain(2).unwrap();
+        assert!(msg.contains("slots full on 1 worker(s)"), "{msg}");
     }
 
     /// Without enough gain, nothing is speculated.

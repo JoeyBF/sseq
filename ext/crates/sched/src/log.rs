@@ -1,6 +1,6 @@
 //! A replayable log of a policy's inputs and outputs, readable by the trace simulator.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
@@ -51,9 +51,9 @@ pub struct TaskInfo {
 /// One logged event. Times are on the policy's clock, in seconds.
 ///
 /// The [`Input`](Event::Input) and [`Poll`](Event::Poll) records are the whole run: feeding them
-/// back with [`replay`] reproduces every output. [`Sample`](Event::Sample) and
-/// [`Reserved`](Event::Reserved) summarise the policy's state for the trace reader. Worker ids in
-/// those two are written as strings (the trace format names workers).
+/// back with [`replay`] reproduces every output, reservations included. [`Sample`](Event::Sample)
+/// summarises a worker's state for the trace reader, with its id written as a string (the trace
+/// format names workers).
 #[derive(Clone, Debug, PartialEq)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[cfg_attr(feature = "serde", serde(tag = "type", rename_all = "lowercase"))]
@@ -99,15 +99,6 @@ pub enum Event {
         /// The worker's learned device memory per job, GB (0: unknown).
         #[cfg_attr(feature = "serde", serde(default, skip_serializing_if = "is_zero"))]
         dev_per_task_gb: f64,
-    },
-    /// A job reserved a worker.
-    Reserved {
-        /// When.
-        t_s: f64,
-        /// The holder.
-        job: JobId,
-        /// The worker.
-        worker: String,
     },
 }
 
@@ -237,16 +228,13 @@ impl Drop for GzMembers {
 /// A [`Policy`] that records every input it handles and every poll's outputs to an
 /// [`EventSink`], so that [`replay`] can reproduce the run.
 ///
-/// Heartbeats are also summarised as samples at most every `sample_every` seconds per worker, and
-/// reservations are logged when made (aging is not logged: it follows from submission times and
-/// the age limit). Under a [`DagScheduler`](crate::DagScheduler), wrap the inner policy
+/// Heartbeats are also summarised as samples at most every `sample_every` seconds per worker. Under a [`DagScheduler`](crate::DagScheduler), wrap the inner policy
 /// (`DagScheduler<Logged<Scheduler>>`): the DAG's own operations are method calls, not inputs.
 pub struct Logged<P> {
     inner: P,
     sink: Box<dyn EventSink>,
     sample_every: f64,
     last_sample: HashMap<WorkerId, Instant>,
-    reserved: BTreeSet<(JobId, WorkerId)>,
     info: HashMap<JobId, TaskInfo>,
 }
 
@@ -263,7 +251,6 @@ impl<P: Policy> Logged<P> {
             sink: Box::new(sink),
             sample_every: 60.0,
             last_sample: HashMap::new(),
-            reserved: BTreeSet::new(),
             info: HashMap::new(),
         }
     }
@@ -321,25 +308,6 @@ impl<P: Policy> Logged<P> {
         });
         self.last_sample.insert(w.id, now);
     }
-
-    /// Log the reservations made since the last poll.
-    fn log_reservations(&mut self, now: Instant) {
-        let current: BTreeSet<(JobId, WorkerId)> = self
-            .inner
-            .stats()
-            .reservations
-            .iter()
-            .map(|r| (r.job, r.worker))
-            .collect();
-        for &(job, w) in current.difference(&self.reserved) {
-            self.sink.record(&Event::Reserved {
-                t_s: now,
-                job,
-                worker: w.to_string(),
-            });
-        }
-        self.reserved = current;
-    }
 }
 
 impl<P: Policy> Policy for Logged<P> {
@@ -360,20 +328,18 @@ impl<P: Policy> Policy for Logged<P> {
             Input::Worker(w) => self.log_sample(&w, now),
             Input::WorkerGone(w) => {
                 self.last_sample.remove(&w);
-                self.reserved.retain(|r| r.1 != w);
             }
             _ => {}
         }
     }
 
-    /// Forwarded, then logged with any new reservation.
+    /// Forwarded, then logged.
     fn poll(&mut self, now: Instant) -> Vec<Output> {
         let out = self.inner.poll(now);
         self.sink.record(&Event::Poll {
             t_s: now,
             out: out.clone(),
         });
-        self.log_reservations(now);
         out
     }
 
@@ -405,7 +371,7 @@ pub fn replay<P: Policy + ?Sized>(
         match e {
             Event::Input { t_s, input, .. } => policy.handle(input, t_s),
             Event::Poll { t_s, .. } => out.push((t_s, policy.poll(t_s))),
-            Event::Sample { .. } | Event::Reserved { .. } => {}
+            Event::Sample { .. } => {}
         }
     }
     out
@@ -427,14 +393,11 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use super::*;
-    use crate::{
-        Attempt, Config, FailKind, JobSpec, Learn, Resources, Scheduler, Speculate, SpeedPolicy,
-    };
+    use crate::{Attempt, Config, FailKind, JobSpec, Learn, Resources, Scheduler, Speculate};
 
     /// A configuration exercising learning, speculation, retries and reservations.
     fn config() -> Config {
         let mut c = Config::default();
-        c.speed.policy = SpeedPolicy::FastestFirst;
         c.speed.learn = Some(Learn::default());
         c.speed.speculate = Some(Speculate::default());
         c
