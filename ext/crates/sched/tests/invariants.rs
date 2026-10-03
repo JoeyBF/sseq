@@ -366,12 +366,13 @@ impl Shadow {
         let (running, placed) = self.load(w);
         (0..DIMS).all(|d| {
             let hard = d == SLOTS;
-            if !hard && s.budget[d] == 0 {
+            let cap = if hard { s.slots as u64 } else { s.budget[d] };
+            if !hard && cap == 0 {
                 return true;
             }
             let held = placed[d].max(running as u64 * s.per_task[d]);
             let used = s.reported_used[d].max(s.reported_baseline[d] + held);
-            used + demand[d].max(s.per_task[d]) <= s.budget[d] || (!hard && running == 0)
+            used + demand[d].max(s.per_task[d]) <= cap || (!hard && running == 0)
         })
     }
 
@@ -409,7 +410,7 @@ impl Shadow {
                 || !self
                     .workers
                     .values()
-                    .any(|o| o.budget[SLOTS] > 0 && hard(o) && !avoided(o)))
+                    .any(|o| o.slots > 0 && hard(o) && !avoided(o)))
     }
 
     /// Scan order: aged jobs by age, then the configured order terms (each once, at its first
@@ -887,7 +888,7 @@ fn run(
         // Escape hatch: an empty worker with a free slot leaves no job waiting that may run there,
         // except one waiting for a faster worker by choice.
         for (&w, s) in &sh.workers {
-            if s.budget[SLOTS] > 0 && sh.load(w).0 == 0 {
+            if s.slots > 0 && sh.load(w).0 == 0 {
                 let stuck = sh
                     .waiting
                     .values()

@@ -21,7 +21,7 @@ impl WorkerView<'_> {
     /// Whether dimension `d` is enforced: always if it is [`HARD`], else if its capacity is known
     /// (nonzero).
     pub fn enforced(&self, d: usize) -> bool {
-        HARD[d] || self.state.budget[d] > 0
+        HARD[d] || self.state.capacity()[d] > 0
     }
 
     /// What a job of demand `demand` counts for here: at least the worker's
@@ -48,7 +48,7 @@ impl WorkerView<'_> {
         let used = self.used();
         std::array::from_fn(|d| {
             self.enforced(d).then(|| {
-                (self.state.budget[d] as i128 - used[d] as i128)
+                (self.state.capacity()[d] as i128 - used[d] as i128)
                     .clamp(i64::MIN as i128, i64::MAX as i128) as i64
             })
         })
@@ -59,7 +59,7 @@ impl WorkerView<'_> {
     pub fn short(&self, demand: &Resources) -> impl Iterator<Item = usize> + '_ {
         let (used, charge) = (self.used(), self.charge(demand));
         (0..DIMS).filter(move |&d| {
-            self.enforced(d) && used[d].saturating_add(charge[d]) > self.state.budget[d]
+            self.enforced(d) && used[d].saturating_add(charge[d]) > self.state.capacity()[d]
         })
     }
 
@@ -75,7 +75,7 @@ impl WorkerView<'_> {
         (0..DIMS)
             .filter(|&d| !HARD[d] && self.enforced(d))
             .map(|d| {
-                let cap = self.state.budget[d] as f64;
+                let cap = self.state.capacity()[d] as f64;
                 (cap - used[d] as f64 - charge[d] as f64) / cap
             })
             .fold(f64::INFINITY, f64::min)
@@ -139,7 +139,7 @@ impl Admission for ProductionAdmission {
         let (used, empty) = (w.used(), w.running() == 0);
         let mut bound = Resources::MAX;
         for d in (0..DIMS).filter(|&d| w.enforced(d) && (HARD[d] || !empty)) {
-            let room = w.state.budget[d].checked_sub(used[d])?;
+            let room = w.state.capacity()[d].checked_sub(used[d])?;
             // Every job counts for at least `per_task` and takes a slot, so less room than that
             // admits nothing.
             let least = w.state.per_task[d].max((d == SLOTS) as u64);

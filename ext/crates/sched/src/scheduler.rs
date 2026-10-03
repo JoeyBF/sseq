@@ -61,7 +61,7 @@ impl Worker {
 
     /// Whether the worker can ever run anything: it has slots.
     fn live(&self) -> bool {
-        self.state.slots() > 0
+        self.state.slots > 0
     }
 }
 
@@ -878,7 +878,7 @@ impl Scheduler {
             let here = self.now + run_here;
             let mut wait: Option<(f64, WorkerId)> = None;
             for (&id, w) in &self.workers {
-                let slots = w.state.slots();
+                let slots = w.state.slots;
                 // Only full workers, and only if they would admit the job with one slot free.
                 if w.speed <= self.workers[&place].speed
                     || slots == 0
@@ -1243,7 +1243,7 @@ impl Scheduler {
         WorkerLoad {
             id: w.state.id,
             class: w.state.class.clone(),
-            slots: w.state.slots(),
+            slots: w.state.slots,
             running: w.running(),
             placed: w.placed,
             headroom: w.view().headroom(),
@@ -1324,7 +1324,7 @@ impl Scheduler {
                     "; holds the reservation on worker {} (draining: {}/{} running, used {})",
                     w.state.id,
                     w.running(),
-                    w.state.slots(),
+                    w.state.slots,
                     gb_list(&w.view().used())
                 );
             }

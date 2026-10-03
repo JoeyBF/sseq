@@ -703,8 +703,14 @@ fn stress_many_threads_with_churn() {
     let hit = churn.join().unwrap();
     s.stop_ticker();
     ticker.join().unwrap();
+    // A thread that checked `gone` just before its worker left completes instead of failing
+    // (allowed: completing after the worker left cancels the retry), so `hit` only bounds the
+    // lost links from above.
     assert!(hit > 0, "no worker left while a lease was held there");
-    assert!(link_died.load(Ordering::SeqCst) >= hit);
+    assert!(
+        link_died.load(Ordering::SeqCst) > 0,
+        "no thread reported a lost link"
+    );
     let st = s.stats();
     assert_eq!((st.waiting, st.running), (0, 0));
     assert!(st.workers.iter().all(|l| l.running == 0));

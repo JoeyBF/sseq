@@ -321,9 +321,11 @@ pub struct WorkerState {
     pub id: WorkerId,
     /// The worker's class (e.g. GPU type), used by [`Selector::Class`] and per-class reservations.
     pub class: String,
-    /// Capacity: host memory, device memory (the pool jobs' device allocations come from) and
-    /// execution slots. A zero memory component is unknown and not enforced; zero slots admit
-    /// nothing. Replacing the whole vector replaces the slot count too.
+    /// Concurrent jobs at most; zero admits nothing.
+    pub slots: usize,
+    /// Memory capacity: host memory, and device memory (the pool jobs' device allocations come
+    /// from). A zero component is unknown and not enforced. Its [`SLOTS`] component is ignored:
+    /// [`capacity`](Self::capacity) takes it from `slots`.
     pub budget: Resources,
     /// What one job of this worker is expected to take at least, learned by the worker (e.g. the
     /// typical device launch request); zero components are unknown. Each job counts for at least
@@ -348,18 +350,13 @@ fn unit() -> f64 {
 }
 
 impl WorkerState {
-    /// A worker with `slots` execution slots, the memory capacity in `budget` (whose [`SLOTS`]
-    /// component is replaced), and nothing reported yet.
-    pub fn new(
-        id: WorkerId,
-        class: impl Into<String>,
-        slots: usize,
-        mut budget: Resources,
-    ) -> Self {
-        budget[SLOTS] = slots as u64;
+    /// A worker with `slots` execution slots, the memory capacity in `budget`, and nothing
+    /// reported yet.
+    pub fn new(id: WorkerId, class: impl Into<String>, slots: usize, budget: Resources) -> Self {
         Self {
             id,
             class: class.into(),
+            slots,
             budget,
             reported_used: Resources::ZERO,
             reported_baseline: Resources::ZERO,
@@ -368,9 +365,12 @@ impl WorkerState {
         }
     }
 
-    /// The worker's execution slots, `budget[SLOTS]`.
-    pub fn slots(&self) -> usize {
-        self.budget[SLOTS] as usize
+    /// The capacity admission enforces: `budget` in the memory dimensions, `slots` in
+    /// [`SLOTS`].
+    pub fn capacity(&self) -> Resources {
+        let mut c = self.budget;
+        c[SLOTS] = self.slots as u64;
+        c
     }
 }
 
