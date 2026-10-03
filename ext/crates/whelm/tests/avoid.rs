@@ -41,7 +41,7 @@ fn job(id: JobId, avoid: &[WorkerId], soft: bool) -> JobSpec {
     })
 }
 
-/// The incident: every live worker is excluded. Forbid waits; Avoid runs.
+/// Every live worker is excluded. Forbid waits; Avoid runs.
 #[test]
 fn soft_avoid_lapses_when_only_avoided_workers_are_live() {
     let mut p = policy(&[(1, 4)]);

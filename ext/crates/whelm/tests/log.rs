@@ -1,5 +1,4 @@
-//! The event log round trip: a run logged through [`Logged`] replays exactly, from memory and
-//! from the JSON lines a [`JsonlSink`] writes.
+//! The event log round trip: a logged run replays exactly, from memory and from JSON lines.
 #![cfg(feature = "log")]
 
 use std::{

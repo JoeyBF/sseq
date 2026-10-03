@@ -30,6 +30,7 @@ struct Key {
 /// A worker's rank for a job under [`Config::score`]: smaller is better, like [`Key`].
 type Score = [i64; SCORE_TERMS];
 
+/// A worker's reported state with the scheduler's bookkeeping of it.
 #[derive(Clone, Debug)]
 struct Worker {
     state: WorkerState,

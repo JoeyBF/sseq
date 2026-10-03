@@ -228,7 +228,8 @@ impl Drop for GzMembers {
 /// A [`Policy`] that records every input it handles and every poll's outputs to an
 /// [`EventSink`], so that [`replay`] can reproduce the run.
 ///
-/// Heartbeats are also summarised as samples at most every `sample_every` seconds per worker. Under a [`DagScheduler`](crate::DagScheduler), wrap the inner policy
+/// Heartbeats are also summarised as samples at most every `sample_every` seconds per worker.
+/// Under a [`DagScheduler`](crate::DagScheduler), wrap the inner policy
 /// (`DagScheduler<Logged<Scheduler>>`): the DAG's own operations are method calls, not inputs.
 pub struct Logged<P> {
     inner: P,

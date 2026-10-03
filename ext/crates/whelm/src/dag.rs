@@ -5,6 +5,9 @@ use std::{
     sync::Arc,
 };
 
+#[cfg(feature = "serde")]
+use serde::{Deserialize, Serialize};
+
 use crate::{Attempt, Input, Instant, JobId, JobSpec, Output, Policy, PolicyStats, WorkerId};
 
 mod frame;
@@ -47,7 +50,8 @@ impl DagJob {
         }
     }
 
-    /// A passthrough job (see [`DagJob::passthrough`]) of group `group`, worth `work` in ranks.
+    /// A passthrough job (see [`passthrough`](field@DagJob::passthrough)) of group `group`, worth
+    /// `work` in ranks.
     pub fn passthrough(id: JobId, group: u64, deps: Vec<JobId>, work: f64) -> Self {
         Self {
             spec: JobSpec::new(id, crate::Resources::ZERO, group),
@@ -58,7 +62,7 @@ impl DagJob {
         }
     }
 
-    /// Make it a local job (see [`DagJob::local`]).
+    /// Make it a local job (see [`local`](field@DagJob::local)).
     pub fn local(mut self) -> Self {
         self.local = true;
         self
@@ -244,29 +248,27 @@ impl std::error::Error for DagError {}
 
 /// Configuration for [`DagScheduler`].
 #[derive(Clone, Debug, PartialEq)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct DagConfig {
     /// Scale of a unit declared without one, i.e. the work of a [`DagJob`] without an estimate.
-    /// Default 1.
     pub default_work: f64,
     /// Ranks between units are maintained approximately: a rank increase smaller than this
-    /// fraction is not propagated to the unit's dependencies. Bounds the cost of growing the
-    /// graph; ranks within a unit are exact. Default 0.01.
+    /// fraction is not propagated to the unit's dependencies. Larger makes growing the graph
+    /// cheaper and ranks between units less exact; ranks within a unit are exact.
     pub rank_epsilon: f64,
-    /// Submit jobs to the policy as soon as they are ready (the default). When false, ready jobs
-    /// are held and announced by [`Output::Ready`]; the caller submits each with
-    /// [`DagScheduler::release`] when it is actually sendable (e.g. after coordinator-side
-    /// preparation).
+    /// Submit jobs to the policy as soon as they are ready. When false, ready jobs are held and
+    /// announced by [`Output::Ready`]; the caller submits each with [`DagScheduler::release`] when
+    /// it is actually sendable (e.g. after coordinator-side preparation).
     pub auto_submit: bool,
     /// Announce passthrough leaves, and units other than plain jobs, as they complete, with
-    /// [`Output::Passed`]. Default false.
+    /// [`Output::Passed`].
     #[cfg_attr(feature = "serde", serde(default))]
     pub record_passthrough: bool,
     /// Maintain units' ranks as the graph grows and work changes, and submit each job with its
     /// upward rank (the critical path below it) as [`JobSpec::rank`] unless it has one. Whether
     /// ranks order anything is up to the policy ([`OrderTerm::Rank`](crate::OrderTerm::Rank)).
     /// Without them, declaring and re-estimating skip all rank propagation, which on long
-    /// dependency chains is most of the cost. Default true.
+    /// dependency chains is most of the cost.
     #[cfg_attr(feature = "serde", serde(default = "yes"))]
     pub track_ranks: bool,
 }
@@ -278,7 +280,8 @@ fn yes() -> bool {
 }
 
 impl Default for DagConfig {
-    /// The defaults documented on each field.
+    /// Ranks tracked, jobs submitted as soon as they are ready, and nothing announced but local
+    /// jobs.
     fn default() -> Self {
         Self {
             default_work: 1.0,
@@ -1286,7 +1289,7 @@ mod tests {
         DagJob::new(JobSpec::new(id, Resources::mem(1), 0), deps.to_vec())
     }
 
-    /// The first start of `job` on worker 1.
+    /// The start of attempt `attempt` of `job` on worker 1.
     fn start(job: JobId, attempt: Attempt) -> Output {
         Output::Start {
             job,

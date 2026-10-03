@@ -73,8 +73,8 @@ Jobs are idempotent: running one twice is harmless and the first completion wins
 caller's side of the [`Policy`] contract, and it lets the policy retry failed attempts, run
 speculative second attempts and ignore late messages. Every start carries an [`Attempt`] number
 (1 for the first); [`Input::Done`] and [`Input::Failed`] name the attempt they report and are
-ignored unless it is live. The DAG layer's local jobs ([`DagJob::local`]) are the exception: the
-caller runs those exactly once.
+ignored unless it is live. The DAG layer's local jobs ([`DagJob::local`](field@DagJob::local))
+are the exception: the caller runs those exactly once.
 
 ```rust
 use whelm::{Config, Input, JobSpec, Output, Policy, Resources, Scheduler, WorkerState};

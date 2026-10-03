@@ -1,4 +1,4 @@
-//! Scale check of the DAG layer: 10^5 units of a 10^3-node template, 10^8 jobs in all.
+//! Scale check of the DAG layer: `UNITS` units of one `NODES`-node template.
 
 use std::{sync::Arc, time::Instant};
 

@@ -77,8 +77,9 @@ impl Timing {
 
 /// Online speed learning: each completed job with work `w` (seconds at speed 1) that ran `d`
 /// seconds is a sample `ln(w / d)` of its worker's speed, averaged in log space (durations are
-/// log-normal). Unlike StarPU's history models there is no outlier filter: with per-job noise of
-/// sd 0.6 a "50% off the mean" filter would discard most samples.
+/// log-normal). Unlike StarPU's history models there is no outlier filter: per-job noise is wide
+/// enough that a "50% off the mean" filter would discard most samples (see `whelm-sim`'s
+/// RESULTS.md, "The DAG", for the fitted spread).
 ///
 /// A class's estimate replaces the reported speed once the class has `min_samples` samples. With
 /// `per_worker`, each worker's estimate is its own mean shrunk towards its class's estimate, so
@@ -87,8 +88,10 @@ impl Timing {
 pub struct Learn {
     /// Weight of a new sample once warmed up (an exponential moving average; plain averaging
     /// until then). It also caps how many samples a worker's own mean counts for, `1 / weight`.
+    /// Larger follows a changing speed sooner, with noisier estimates.
     pub weight: f64,
-    /// Samples a class needs before its learned speed replaces the reported one.
+    /// Samples a class needs before its learned speed replaces the reported one. Fewer trusts a
+    /// noisier estimate sooner.
     pub min_samples: u32,
     /// Learn each worker's speed (shrunk towards its class), not only each class's.
     pub per_worker: bool,
@@ -100,14 +103,15 @@ pub struct Learn {
     /// so load still breaks ties within a class. 0 disables both.
     pub resolution: f64,
     /// How a worker's per-job speed depends on its concurrency, to normalise samples taken at
-    /// different loads. `None`: per-job speed does not depend on load (our fitted model up to the
-    /// slot count).
+    /// different loads. `None`: per-job speed does not depend on load (the fitted service model,
+    /// up to the slot count; see `whelm-sim`'s RESULTS.md).
     pub sharing: Option<Sharing>,
 }
 
 impl Default for Learn {
-    /// A 5% moving average after 20 samples, per worker with the class worth 5 samples, 10%
-    /// hysteresis, load-independent per-job speed.
+    /// Per worker with its class as prior, smoothed and with hysteresis against per-job noise;
+    /// load-independent per-job speed. Its effect on a whole run is in `whelm-sim`'s RESULTS.md,
+    /// "Restart-stable order, learned speeds".
     fn default() -> Self {
         Self {
             weight: 0.05,

@@ -71,11 +71,10 @@ fn group_order_by_id_ignores_submission_order() {
     );
 }
 
-/// The incident of 2026-10-02: a young group behind a wide old one whose walk keeps releasing
-/// jobs. Strict group order makes the young job wait for the whole old group; aging (on by
-/// default) bounds its wait by the age limit plus one old job's run time. (Aged jobs run in
-/// submission order, so aging bounds the wait behind work released after the job, not behind
-/// work already queued before it.)
+/// A young group behind a wide old one whose walk keeps releasing jobs. Strict group order makes
+/// the young job wait for the whole old group; aging (on by default) bounds its wait by the age
+/// limit plus one old job's run time. (Aged jobs run in submission order, so aging bounds the
+/// wait behind work released after the job, not behind work already queued before it.)
 #[test]
 fn young_group_behind_wide_old_group_waits_at_most_age_limit() {
     const SLOTS: usize = 4;

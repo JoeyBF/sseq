@@ -1,5 +1,4 @@
-//! The blocking front end: leases, timeouts, failures and retries, the ticker, a model-checked
-//! random sequence of events, and a many-thread stress test with worker churn.
+//! The blocking front end: leases, retries, the ticker, a model check and a many-thread stress.
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
@@ -569,7 +568,7 @@ proptest! {
     }
 }
 
-/// 1,000 task threads with random run times, failures, and workers leaving (while threads hold
+/// `THREADS` task threads with random run times, failures, and workers leaving (while threads hold
 /// leases there, which then report the lost link) and joining: every job finishes (no lost
 /// wakeup), no job runs twice at once, retries count up, and no worker runs more jobs than its
 /// slots.
@@ -716,8 +715,8 @@ fn stress_many_threads_with_churn() {
     assert!(st.workers.iter().all(|l| l.running == 0));
 }
 
-/// The frontier's size: 21 full workers of 16 slots and 1,000 waiting jobs, one completion and
-/// one submission per event. `poll` stays under a millisecond at the 99th percentile (release
+/// A production-sized frontier: every worker full and a long queue waiting, one completion and
+/// one submission per event. `poll`'s 99th percentile stays under the asserted bound (release
 /// builds only; a regression guard, not a benchmark).
 #[test]
 fn poll_p99_at_frontier_size() {

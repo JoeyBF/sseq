@@ -8,7 +8,7 @@ use whelm::{
     NodeSource, Output, Policy, Resources, Scheduler, TemplateNode, Unit, WorkerId, WorkerState,
 };
 
-/// A DAG layer over one 64-slot worker.
+/// A DAG layer over one worker with many slots.
 fn dag(config: DagConfig) -> DagScheduler<Scheduler> {
     let mut d = DagScheduler::new(config, Scheduler::new(Config::default()));
     let w = WorkerState::new(0, "x", 64, Resources::mem(1000));
@@ -134,7 +134,7 @@ fn a_source_makes_a_leaf_a_passthrough_in_one_unit() {
     );
 }
 
-/// A 200,000-long chain of passthroughs completes without recursing.
+/// A chain of `N` passthroughs completes without recursing.
 #[test]
 fn long_passthrough_chains_do_not_recurse() {
     let mut d = dag(DagConfig::default());

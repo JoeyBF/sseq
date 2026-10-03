@@ -10,44 +10,43 @@ use crate::Timing;
 /// completion time, Jackson's rule for maximum lateness); on many machines, with resources and
 /// online arrivals, every one of them is a heuristic.
 ///
-/// - [`Default`]: makespan with bounded latency. Explicit priority, group, then arrival;
-///   aging and one reservation; fastest, preferred, then least loaded worker.
-/// - [`Config::fifo`]: arrival order, no aging or reservations. A baseline.
-/// - [`Config::best_fit`]: the default, packing each job into the tightest worker.
-/// - [`Config::weighted_completion`]: weighted completion time ([`OrderTerm::Wspt`]).
-/// - [`Config::lateness`]: maximum lateness ([`OrderTerm::Edd`]).
+/// - [`Default`]: makespan with bounded latency.
+/// - [`Config::fifo`]: a baseline.
+/// - [`Config::best_fit`]: makespan, packing each job into the tightest worker.
+/// - [`Config::weighted_completion`]: weighted completion time.
+/// - [`Config::lateness`]: maximum lateness.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Config {
     /// The order waiting jobs are considered in: lexicographic over these terms, then submission
     /// order. A term listed twice adds nothing; the repeat is ignored.
     pub order: Vec<OrderTerm>,
-    /// How [`OrderTerm::Group`] orders groups. Default [`GroupOrder::Arrival`].
+    /// How [`OrderTerm::Group`] orders groups.
     pub group_order: GroupOrder,
     /// The priority of jobs whose [`JobSpec::priority`](crate::JobSpec::priority) is `None`, for
-    /// [`OrderTerm::Priority`]. Default 0, so negative priorities jump ahead of unprioritised jobs
-    /// and positive ones fall behind them.
+    /// [`OrderTerm::Priority`]: priorities below it jump ahead of unprioritised jobs, and those
+    /// above fall behind them.
     pub default_priority: i64,
     /// Aging: a job that has waited at least this long (seconds) becomes more urgent than every
     /// job that has not, oldest first, whatever [`order`](Self::order) says. Strict priority
     /// starves a job for as long as more urgent jobs keep arriving (a young group behind a wide
-    /// old one), and this bounds it. Default [`DEFAULT_AGE_LIMIT`]; `None` is strict priority.
+    /// old one), and this bounds it. Shorter bounds the worst wait more tightly but overrides
+    /// `order` for more jobs. Default [`DEFAULT_AGE_LIMIT`]; `None` is strict priority.
     pub age_limit: Option<f64>,
-    /// Workers drained for starving jobs. Default [`Reservations::default`]; `None` allows
-    /// starvation of jobs larger than the typical headroom.
+    /// Workers drained for starving jobs. `None` allows starvation of jobs larger than the
+    /// typical headroom.
     pub reservations: Option<Reservations>,
     /// Which of the workers that admit a job it goes to: lexicographic over these terms, then the
     /// smallest worker id. A term listed twice adds nothing; the repeat is ignored.
     pub score: Vec<ScoreTerm>,
-    /// The machine model, deferral and speculation. Default: reported speeds, neither of the
-    /// others.
+    /// The machine model, deferral and speculation.
     pub speed: SpeedConfig,
-    /// Retries of failed attempts. Default [`RetryConfig::default`].
+    /// Retries of failed attempts.
     pub retry: RetryConfig,
 }
 
 impl Default for Config {
-    /// Order `[Priority, Group]`, [`DEFAULT_AGE_LIMIT`], one reservation, score `[Speed,
-    /// Preferred, Load]`, default retries.
+    /// Makespan with bounded latency: explicit priority, then group, then arrival; aging and a
+    /// reservation against starvation; the fastest, preferred, then least loaded worker.
     fn default() -> Self {
         Self {
             order: vec![OrderTerm::Priority, OrderTerm::Group],
@@ -108,8 +107,9 @@ impl Config {
     }
 }
 
-/// [`Config::age_limit`]'s default, seconds: in the trace replay, 30 minutes cut the maximum wait
-/// 8x at no throughput cost.
+/// [`Config::age_limit`]'s default, seconds. Shorter bounds the worst wait more tightly but lets
+/// aged FIFO override [`Config::order`] for more jobs; its effect on the trace replay's waits and
+/// throughput is in `whelm-sim`'s RESULTS.md, "Headline".
 pub const DEFAULT_AGE_LIMIT: f64 = 1800.0;
 
 /// One term of [`Config::order`]. Every key is computed once, at submission; a job that lacks
@@ -182,25 +182,28 @@ pub enum GroupOrder {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Reservations {
     /// A job that has waited at least this long (seconds) and is admitted nowhere may reserve a
-    /// worker. Default 60.
+    /// worker. Shorter bounds starvation more tightly but drains workers, idling their slots,
+    /// more often.
     pub reserve_after: f64,
-    /// Maximum number of simultaneous reservations (per worker class if `per_class`). Default 1.
-    /// Zero makes no reservations.
+    /// Maximum number of simultaneous reservations (per worker class if `per_class`). Zero makes
+    /// no reservations. More drain more workers at once, idling more slots; `whelm-sim`'s
+    /// RESULTS.md, "Headline", has their cost on the trace replay.
     pub max: usize,
-    /// Count `max` per worker class instead of globally. Default false.
+    /// Count `max` per worker class instead of globally.
     pub per_class: bool,
     /// EASY-style backfill on a reserved worker: less urgent jobs may still run there if they
     /// are expected to finish before the holder could start, its *shadow time*. The shadow time is
     /// computed once per reservation, from the running jobs' expected ends, predicting usage from
     /// placed demands (heartbeat usage cannot be predicted); an unknown end means no backfill.
     /// Once the shadow time passes nothing can finish before it, so the worker drains strictly
-    /// from then on: the holder waits at most for the jobs running at the shadow time. Default
-    /// false (strict draining from the start).
+    /// from then on: the holder waits at most for the jobs running at the shadow time. Off, the
+    /// worker drains strictly from the start.
     pub shadow_backfill: bool,
 }
 
 impl Default for Reservations {
-    /// The defaults documented on each field.
+    /// One reservation at a time, drained strictly: more only add idle slot time (see
+    /// [`max`](Self::max)).
     fn default() -> Self {
         Self {
             reserve_after: 60.0,
@@ -221,13 +224,14 @@ pub struct Defer {
     /// expiry is reported by [`Policy::next_wakeup`](crate::Policy::next_wakeup).
     pub max_wait: f64,
     /// Defer only if the expected finish improves by at least this fraction of the job's work.
+    /// Lower defers more often, also for a barely faster, scarce class, where waiting backfires;
+    /// higher gives up more of waiting's benefit. `whelm-sim`'s RESULTS.md, "Ordering and
+    /// placement", has both effects.
     pub min_gain: f64,
 }
 
 impl Default for Defer {
-    /// Wait at most an hour, and only for at least a quarter of the job's work in gain: in
-    /// simulation that keeps most of waiting's benefit while halving the cases where it backfires
-    /// (a barely faster, scarce class).
+    /// Bounded waiting, and only for a substantial gain (see [`min_gain`](Self::min_gain)).
     fn default() -> Self {
         Self {
             max_wait: 3600.0,
@@ -240,8 +244,7 @@ impl Default for Defer {
 /// [`Config::score`].
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct SpeedConfig {
-    /// The machine model: a job's speed on each worker, reported or learned. Default
-    /// [`Timing::default`].
+    /// The machine model: a job's speed on each worker, reported or learned.
     pub timing: Timing,
     /// Wait for a faster busy worker when it pays.
     pub defer: Option<Defer>,
@@ -267,7 +270,8 @@ pub struct Speculate {
 }
 
 impl Default for Speculate {
-    /// At least a quarter of the run time gained, no overhead, at most one extra attempt per job.
+    /// Speculate only for a substantial gain, assuming no restart cost, with few extra attempts
+    /// per job.
     fn default() -> Self {
         Self {
             min_gain: 0.25,
@@ -282,12 +286,12 @@ impl Default for Speculate {
 pub struct RetryConfig {
     /// Rounds per job before it is given up ([`Output::GaveUp`](crate::Output::GaveUp)): a round
     /// is an attempt started from the queue, with any speculative attempts made alongside it, and
-    /// it fails when its last live attempt does. Default 4; 0 counts as 1.
+    /// it fails when its last live attempt does. 0 counts as 1.
     pub max_attempts: u32,
 }
 
 impl Default for RetryConfig {
-    /// Four attempts.
+    /// A few rounds before giving up.
     fn default() -> Self {
         Self { max_attempts: 4 }
     }

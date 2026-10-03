@@ -493,11 +493,11 @@ proptest! {
 
     /// Random hierarchies of units (templates substituted up to three deep, sourced and scaled
     /// work, leaves the source makes passthroughs, leaves declared complete, plain jobs among
-    /// them), declared in random batches and
-    /// orders (so forward references abound), then run in a random order with a unit closed early
-    /// and a snapshot restored at random points: every event announces exactly what the fully
-    /// expanded graph makes ready, and every announced job's rank is its longest path there
-    /// (exactly, or within the compounded `rank_epsilon` above).
+    /// them), declared in random batches and orders (so forward references abound), then run in a
+    /// random order with a unit closed early and, with `serde`, a snapshot restored at a random
+    /// point: every event announces exactly what the fully expanded graph makes ready, and every
+    /// announced job's rank is its longest path there (exactly, or within the compounded
+    /// `rank_epsilon` above).
     #[test]
     fn units_match_the_expanded_graph(
         seed in any::<u64>(),
@@ -505,6 +505,8 @@ proptest! {
         close_at in 0usize..40,
         approximate in any::<bool>(),
     ) {
+        #[cfg(not(feature = "serde"))]
+        let _ = snap_at;
         let mut rng = Rng(seed);
         let units = world(&mut rng);
         let mut r = Reference::new(&units);
@@ -542,6 +544,7 @@ proptest! {
                     "job {}: rank {} vs {}", job, got, want
                 );
             }
+            #[cfg(feature = "serde")]
             if steps == snap_at {
                 let json = serde_json::to_string(&d.snapshot()).unwrap();
                 d = DagScheduler::restore(

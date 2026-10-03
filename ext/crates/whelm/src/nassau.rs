@@ -5,9 +5,8 @@
 /// bidegrees ordered by `s`, then by `t`. It depends only on the bidegree, so the order survives
 /// a coordinator restart, unlike [`GroupOrder::Arrival`](crate::GroupOrder::Arrival).
 ///
-/// `(s, t)` is the restart-stable key closest to arrival order: in the whole-run simulation it
-/// matches arrival's makespan with a tenth of its bidegree latency at the 90th percentile, where
-/// `(t, s)` and `(t - s, s)` are 5-8% slower (see `whelm-sim`'s RESULTS.md).
+/// Of the restart-stable keys, `(s, t)` comes closest to arrival order's makespan, and `(t, s)`
+/// and `(t - s, s)` are slower: see `whelm-sim`'s RESULTS.md, "Restart-stable order".
 pub fn group(s: u32, t: u32) -> u64 {
     (u64::from(s) << 32) | u64::from(t)
 }

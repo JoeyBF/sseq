@@ -1,5 +1,4 @@
-//! The DAG layer over plain jobs: readiness, forward references, cycles, cancellation, ranks,
-//! snapshots.
+//! The DAG layer over plain jobs: readiness, references, cycles, cancellation, ranks, snapshots.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -269,6 +268,7 @@ fn worker_loss_retries_automatically() {
 }
 
 /// A snapshot survives JSON and resumes with a fresh policy.
+#[cfg(feature = "serde")]
 #[test]
 fn snapshot_round_trip() {
     let mut d = dag(DagConfig::default());
@@ -302,8 +302,8 @@ proptest! {
 
     /// A random DAG (edges from lower to higher ids), declared in random batches in random order
     /// (so forward references abound), with random worker churn: no job is dispatched before its
-    /// dependencies completed (late reports of lost attempts complete nothing), every job eventually
-    /// runs, and an injected back edge is rejected.
+    /// dependencies completed (late reports of lost attempts complete nothing), every job
+    /// eventually runs, and an injected back edge is rejected.
     #[test]
     fn never_dispatched_before_dependencies(
         n in 1usize..40,

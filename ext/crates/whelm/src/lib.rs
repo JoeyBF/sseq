@@ -251,7 +251,7 @@ pub struct JobSpec {
     /// ([`DagConfig::track_ranks`]); larger is more urgent ([`OrderTerm::Rank`]).
     #[cfg_attr(feature = "serde", serde(default))]
     pub rank: Option<f64>,
-    /// Weight in a weighted objective ([`OrderTerm::Wspt`]). Default 1.
+    /// Weight in a weighted objective ([`OrderTerm::Wspt`]).
     #[cfg_attr(feature = "serde", serde(default = "unit"))]
     pub weight: f64,
     /// Due date, on the policy's clock ([`OrderTerm::Edd`]).
@@ -354,7 +354,7 @@ pub struct WorkerState {
     /// How fast a job runs here, relative to a reference worker (1.0): a job with
     /// [`JobSpec::work`] `w` takes `w / speed` seconds. Used by [`ScoreTerm::Speed`], [`Defer`]
     /// and [`Speculate`] as the [`Timing`] says: ignored by identical machines, a prior for
-    /// learned ones. Default 1.0.
+    /// learned ones.
     #[cfg_attr(feature = "serde", serde(default = "unit"))]
     pub speed: f64,
 }
@@ -366,8 +366,8 @@ fn unit() -> f64 {
 }
 
 impl WorkerState {
-    /// A worker with `slots` execution slots, the memory capacity in `budget`, and nothing
-    /// reported yet.
+    /// A worker with `slots` execution slots, the memory capacity in `budget`, the reference
+    /// speed, and nothing reported yet.
     pub fn new(id: WorkerId, class: impl Into<String>, slots: usize, budget: Resources) -> Self {
         Self {
             id,
@@ -446,13 +446,14 @@ pub struct PolicyStats {
     /// Jobs the last [`Policy::poll`] placed on the worker they had reserved (a reservation paying
     /// off), in placement order.
     pub last_dispatch_holders: Vec<JobId>,
-    /// Jobs the last [`Policy::poll`] deliberately left waiting, at some point of its scan, for a faster
-    /// worker that was busy ([`Defer`]), and did not place afterwards: `(job, worker it waits
-    /// for, expected start there)`. Less urgent jobs may have taken slower workers meanwhile.
+    /// Jobs the last [`Policy::poll`] deliberately left waiting, at some point of its scan, for a
+    /// faster worker that was busy ([`Defer`]), and did not place afterwards: `(job, worker it
+    /// waits for, expected start there)`. Less urgent jobs may have taken slower workers
+    /// meanwhile.
     pub deferred: Vec<(JobId, WorkerId, Instant)>,
-    /// Every job that deferred at some point of the last [`Policy::poll`]'s scan, including those placed
-    /// later in it (after a released reservation restarted the scan): while deferring, a job
-    /// leaves the slower workers it declined to less urgent jobs.
+    /// Every job that deferred at some point of the last [`Policy::poll`]'s scan, including those
+    /// placed later in it (after a released reservation restarted the scan): while deferring, a
+    /// job leaves the slower workers it declined to less urgent jobs.
     pub deferred_any: Vec<JobId>,
 }
 
@@ -567,7 +568,7 @@ pub enum Output {
     },
     /// The job failed too often and is forgotten.
     GaveUp(GaveUp),
-    /// A [`DagJob::local`] job is ready: run it on the caller and report it with
+    /// A [local](field@DagJob::local) job is ready: run it on the caller and report it with
     /// [`Input::Done`] and attempt 0.
     RunLocal {
         /// The job.

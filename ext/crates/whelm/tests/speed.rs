@@ -1,5 +1,4 @@
-//! Speed-aware placement: the speed score, deferral to a faster worker, learning, speculation,
-//! and the machine models.
+//! Speed-aware placement: speed score, deferral, learning, speculation and machine models.
 
 use whelm::{
     Attempt, Config, Defer, Input, JobId, JobSpec, Output, Policy, Resources, Scheduler, ScoreTerm,
