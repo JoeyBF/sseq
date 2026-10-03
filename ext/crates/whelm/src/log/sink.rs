@@ -21,7 +21,7 @@ use super::Logged;
 /// };
 ///
 /// use whelm::{
-///     Config, EventSink, Input, JobSpec, Output, Policy, Resources, Scheduler, WorkerState,
+///     Config, EventSink, Input, JobSpec, Output, Policy, Resources, Scheduler, Time, WorkerState,
 ///     log::{Event, Logged},
 /// };
 ///
@@ -50,7 +50,7 @@ use super::Logged;
 ///     budget: Resources::mem_gb(8.0),
 ///     ..Default::default()
 /// };
-/// p.handle(Input::Worker(worker), 0.0);
+/// p.handle(Input::Worker(worker), Time::ZERO);
 /// for id in 1..=3 {
 ///     p.handle(
 ///         Input::Submit(JobSpec {
@@ -58,10 +58,10 @@ use super::Logged;
 ///             demand: Resources::mem_gb(1.0),
 ///             ..Default::default()
 ///         }),
-///         0.0,
+///         Time::ZERO,
 ///     );
 /// }
-/// p.poll(0.0);
+/// p.poll(Time::ZERO);
 /// // Two slots: the third job waits.
 /// assert_eq!(starts.load(Ordering::Relaxed), 2);
 /// ```
@@ -102,7 +102,7 @@ impl EventSink for std::sync::Arc<std::sync::Mutex<Vec<Event>>> {
 /// };
 ///
 /// use whelm::{
-///     Config, Input, JobSpec, Policy, Resources, Scheduler, WorkerState,
+///     Config, Input, JobSpec, Policy, Resources, Scheduler, Time, WorkerState,
 ///     log::{self, Event, JsonlSink, Logged},
 /// };
 ///
@@ -130,24 +130,24 @@ impl EventSink for std::sync::Arc<std::sync::Mutex<Vec<Event>>> {
 ///     budget: Resources::mem_gb(8.0),
 ///     ..Default::default()
 /// };
-/// p.handle(Input::Worker(worker), 0.0);
+/// p.handle(Input::Worker(worker), Time::ZERO);
 /// p.handle(
 ///     Input::Submit(JobSpec {
 ///         id: 1,
 ///         demand: Resources::mem_gb(1.0),
 ///         ..Default::default()
 ///     }),
-///     0.0,
+///     Time::ZERO,
 /// );
-/// p.poll(0.0);
+/// p.poll(Time::ZERO);
 ///
 /// let text = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
 /// let lines: Vec<&str> = text.lines().collect();
-/// assert!(lines[0].starts_with(r#"{"type":"input","t_s":0.0,"input":{"worker":{"id":1,"#));
-/// assert!(lines[1].starts_with(r#"{"type":"sample","t_s":0.0,"worker":"1","#));
+/// assert!(lines[0].starts_with(r#"{"type":"input","t":0,"input":{"worker":{"id":1,"#));
+/// assert!(lines[1].starts_with(r#"{"type":"sample","t":0,"worker":"1","#));
 /// assert_eq!(
 ///     lines[3],
-///     r#"{"type":"poll","t_s":0.0,"out":[{"start":{"job":1,"attempt":1,"worker":1}}]}"#
+///     r#"{"type":"poll","t":0,"out":[{"start":{"job":1,"attempt":1,"worker":1}}]}"#
 /// );
 ///
 /// let events: Vec<Event> = lines
@@ -180,7 +180,7 @@ impl JsonlSink {
     /// use std::path::Path;
     ///
     /// use whelm::{
-    ///     Config, EventSink, Policy, Scheduler,
+    ///     Config, EventSink, Policy, Scheduler, Time,
     ///     log::{JsonlSink, Logged},
     /// };
     ///
@@ -188,7 +188,7 @@ impl JsonlSink {
     /// let mut p = Logged::new(Scheduler::new(Config::default()), sink);
     /// loop {
     ///     // Handle the events that arrived, then:
-    ///     p.poll(0.0);
+    ///     p.poll(Time::ZERO);
     ///     p.sink_mut().flush();
     /// #   break;
     /// }

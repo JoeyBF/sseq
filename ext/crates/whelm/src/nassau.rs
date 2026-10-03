@@ -9,7 +9,8 @@
 //!
 //! ```
 //! use whelm::{
-//!     Config, GroupOrder, Input, JobSpec, Output, Policy, Resources, Scheduler, WorkerState,
+//!     Config, GroupOrder, Input, JobSpec, Output, Policy, Resources, Scheduler, Time,
+//!     WorkerState,
 //!     nassau::{bidegree, group},
 //! };
 //!
@@ -24,20 +25,20 @@
 //!         ..Default::default()
 //!     })
 //! };
-//! p.handle(submit(1, group(3, 20)), 0.0);
-//! p.handle(submit(2, group(2, 40)), 0.0);
+//! p.handle(submit(1, group(3, 20)), Time::ZERO);
+//! p.handle(submit(2, group(2, 40)), Time::ZERO);
 //! let worker = WorkerState {
 //!     id: 1,
 //!     budget: Resources::mem_gb(8.0),
 //!     ..Default::default()
 //! };
-//! p.handle(Input::Worker(worker), 0.0);
+//! p.handle(Input::Worker(worker), Time::ZERO);
 //! let start = Output::Start {
 //!     job: 2,
 //!     attempt: 1,
 //!     worker: 1,
 //! };
-//! assert_eq!(p.poll(0.0), [start]);
+//! assert_eq!(p.poll(Time::ZERO), [start]);
 //! assert_eq!(bidegree(group(2, 40)), (2, 40));
 //! ```
 

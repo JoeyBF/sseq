@@ -5,11 +5,7 @@ use serde::{Deserialize, Serialize};
 
 #[cfg(doc)]
 use crate::{DagConfig, DagJob, DagScheduler, Defer, RetryConfig, Scheduler, Speculate, log};
-use crate::{JobId, JobSpec, PolicyStats, WorkerId, WorkerState};
-
-/// A point in time, in seconds, on the caller's clock. Only differences and ordering are used; the
-/// caller should pass non-decreasing values.
-pub type Instant = f64;
+use crate::{JobId, JobSpec, PolicyStats, Time, WorkerId, WorkerState};
 
 /// The number of a job's attempt: 1 for its first start, counting retries and speculative
 /// attempts. The DAG layer's local jobs use 0 (see [`DagScheduler`]).
@@ -45,8 +41,8 @@ pub enum FailKind {
 ///
 /// ```
 /// use whelm::{
-///     Config, FailKind, GaveUp, Input, JobSpec, Output, Policy, RetryConfig, Scheduler, Tried,
-///     WorkerState,
+///     Config, FailKind, GaveUp, Input, JobSpec, Output, Policy, RetryConfig, Scheduler, Time,
+///     Tried, WorkerState,
 /// };
 ///
 /// let config = Config {
@@ -60,24 +56,24 @@ pub enum FailKind {
 ///         class: "cpu".into(),
 ///         ..Default::default()
 ///     }),
-///     0.0,
+///     Time::ZERO,
 /// );
 /// p.handle(
 ///     Input::Submit(JobSpec {
 ///         id: 1,
 ///         ..Default::default()
 ///     }),
-///     0.0,
+///     Time::ZERO,
 /// );
-/// p.poll(0.0);
-/// p.handle(Input::WorkerGone(3), 1.0);
+/// p.poll(Time::ZERO);
+/// p.handle(Input::WorkerGone(3), Time::from_secs(1));
 /// let tried = Tried {
 ///     worker: 3,
 ///     kind: FailKind::LinkDied,
 ///     why: "worker 3 left".into(),
 /// };
 /// assert_eq!(
-///     p.poll(1.0),
+///     p.poll(Time::from_secs(1)),
 ///     [Output::GaveUp(GaveUp {
 ///         job: 1,
 ///         tried: vec![tried],
@@ -184,7 +180,7 @@ pub enum Input {
 /// A caller's dispatch over the outputs of one poll.
 ///
 /// ```
-/// use whelm::{Config, Input, JobSpec, Output, Policy, Scheduler, WorkerState};
+/// use whelm::{Config, Input, JobSpec, Output, Policy, Scheduler, Time, WorkerState};
 ///
 /// let mut p = Scheduler::new(Config::default());
 /// p.handle(
@@ -194,17 +190,17 @@ pub enum Input {
 ///         slots: 2,
 ///         ..Default::default()
 ///     }),
-///     0.0,
+///     Time::ZERO,
 /// );
 /// p.handle(
 ///     Input::Submit(JobSpec {
 ///         id: 1,
 ///         ..Default::default()
 ///     }),
-///     0.0,
+///     Time::ZERO,
 /// );
 /// let mut sent = Vec::new();
-/// for out in p.poll(0.0) {
+/// for out in p.poll(Time::ZERO) {
 ///     match out {
 ///         Output::Start {
 ///             job,
@@ -283,7 +279,7 @@ pub enum Output {
 ///
 /// ```
 /// use whelm::{
-///     Config, Input, Instant, JobId, JobSpec, Output, Policy, PolicyStats, Scheduler, WorkerState,
+///     Config, Input, JobId, JobSpec, Output, Policy, PolicyStats, Scheduler, Time, WorkerState,
 /// };
 ///
 /// /// Counts every start the inner policy emits.
@@ -293,11 +289,11 @@ pub enum Output {
 /// }
 ///
 /// impl<P: Policy> Policy for Counting<P> {
-///     fn handle(&mut self, input: Input, now: Instant) {
+///     fn handle(&mut self, input: Input, now: Time) {
 ///         self.inner.handle(input, now)
 ///     }
 ///
-///     fn poll(&mut self, now: Instant) -> Vec<Output> {
+///     fn poll(&mut self, now: Time) -> Vec<Output> {
 ///         let out = self.inner.poll(now);
 ///         self.starts += out
 ///             .iter()
@@ -306,7 +302,7 @@ pub enum Output {
 ///         out
 ///     }
 ///
-///     fn next_wakeup(&self) -> Option<Instant> {
+///     fn next_wakeup(&self) -> Option<Time> {
 ///         self.inner.next_wakeup()
 ///     }
 ///
@@ -330,7 +326,7 @@ pub enum Output {
 ///         slots: 4,
 ///         ..Default::default()
 ///     }),
-///     0.0,
+///     Time::ZERO,
 /// );
 /// for id in 1..=3 {
 ///     p.handle(
@@ -338,23 +334,23 @@ pub enum Output {
 ///             id,
 ///             ..Default::default()
 ///         }),
-///         0.0,
+///         Time::ZERO,
 ///     );
 /// }
-/// p.poll(0.0);
+/// p.poll(Time::ZERO);
 /// assert_eq!(p.starts, 3);
 /// ```
 pub trait Policy {
     /// Take in one event at time `now` (non-decreasing across calls). Outputs it causes (stops,
     /// give-ups) are returned by the next `poll`.
-    fn handle(&mut self, input: Input, now: Instant);
+    fn handle(&mut self, input: Input, now: Time);
     /// Place what can be placed now, and return every output since the last call, in order.
-    fn poll(&mut self, now: Instant) -> Vec<Output>;
+    fn poll(&mut self, now: Time) -> Vec<Output>;
     /// The next time `poll` should be called even if no event arrives: a hold lapses (e.g. a
     /// [`Defer`] wait for a faster worker), a job ages, or a job may reserve. `None` if nothing
     /// is timed. Callers with frequent events may ignore it at the cost of that much extra
     /// waiting.
-    fn next_wakeup(&self) -> Option<Instant>;
+    fn next_wakeup(&self) -> Option<Time>;
     /// Why a job is not running, in words (for logs). `None` for unknown jobs.
     fn explain(&self, job: JobId) -> Option<String>;
     /// Counters and current state.
@@ -363,17 +359,17 @@ pub trait Policy {
 
 impl<P: Policy + ?Sized> Policy for Box<P> {
     /// Forwarded to the boxed policy.
-    fn handle(&mut self, input: Input, now: Instant) {
+    fn handle(&mut self, input: Input, now: Time) {
         (**self).handle(input, now)
     }
 
     /// Forwarded to the boxed policy.
-    fn poll(&mut self, now: Instant) -> Vec<Output> {
+    fn poll(&mut self, now: Time) -> Vec<Output> {
         (**self).poll(now)
     }
 
     /// Forwarded to the boxed policy.
-    fn next_wakeup(&self) -> Option<Instant> {
+    fn next_wakeup(&self) -> Option<Time> {
         (**self).next_wakeup()
     }
 

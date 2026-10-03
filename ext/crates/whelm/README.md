@@ -2,10 +2,11 @@
 
 Pure, deterministic placement of jobs onto a changing fleet of workers: which job runs on which
 worker, and when, so as to neither overwhelm nor underwhelm the machines. The core is sans-IO and
-message-driven: the caller feeds it `Input`s, each stamped with the caller's "now", and acts on the
-`Output`s it returns. It has no networking, threads, clocks or persistence, and the same inputs
-produce the same outputs. Around the core sit a dependency layer (`DagScheduler`), a replayable
-event log (`log`) and a blocking front end for callers with a thread per task (`SharedPolicy`).
+message-driven: the caller feeds it `Input`s, each stamped with the caller's "now" (a `Time` on the
+caller's clock; spans are `std::time::Duration`s), and acts on the `Output`s it returns. It has no
+networking, threads, clocks or persistence, and the same inputs produce the same outputs. Around
+the core sit a dependency layer (`DagScheduler`), a replayable event log (`log`) and a blocking
+front end for callers with a thread per task (`SharedPolicy`).
 
 The crate documentation (`cargo doc --open`) is a guided tour of the API, chapter by chapter, with
 an example of every behaviour; this page is the overview.
@@ -26,7 +27,7 @@ In α|β|γ notation:
   - `Constraint`s on a worker or a class (`Selector`) with a `Strength`: Require and Forbid are
     hard, Avoid is soft, Prefer only ranks workers;
   - dependencies, through the DAG layer;
-  - estimates: its `work` in seconds at speed 1, and a `kind` for unrelated machines;
+  - estimates: its `work` (run time) at speed 1, and a `kind` for unrelated machines;
   - a `weight`, a `due` date, an explicit `priority` and a `group`.
 
   Jobs arrive online. There is no preemption or migration: a job runs to completion, or another
@@ -77,7 +78,7 @@ is live. The DAG layer's local jobs (`DagJob::local`) are the exception: the cal
 exactly once.
 
 ```rust
-use whelm::{Config, Input, JobSpec, Output, Policy, Resources, Scheduler, WorkerState};
+use whelm::{Config, Input, JobSpec, Output, Policy, Resources, Scheduler, Time, WorkerState};
 
 let mut policy = Scheduler::new(Config::default());
 
@@ -92,17 +93,17 @@ policy.handle(
         reported_baseline: Resources::mem_gb(20.0),
         ..Default::default()
     }),
-    0.0,
+    Time::ZERO,
 );
 
 // Jobs and workers are struct literals; `Default` fills in what they leave out.
 let job = |id, gb| JobSpec { id, demand: Resources::mem_gb(gb), group: 3, ..Default::default() };
-policy.handle(Input::Submit(job(7, 6.0)), 1.0);
-policy.handle(Input::Submit(job(8, 30.0)), 1.0);
+policy.handle(Input::Submit(job(7, 6.0)), Time::from_secs(1));
+policy.handle(Input::Submit(job(8, 30.0)), Time::from_secs(1));
 
 // After every batch of inputs, poll and act on each output.
 let mut started = Vec::new();
-for out in policy.poll(1.0) {
+for out in policy.poll(Time::from_secs(1)) {
     match out {
         Output::Start { job, attempt, worker } => started.push((job, attempt, worker)),
         Output::Stop { .. } => {}   // cancel that attempt: its result is not wanted
@@ -113,8 +114,8 @@ for out in policy.poll(1.0) {
 assert_eq!(started, [(7, 1, 1), (8, 1, 1)]);
 
 // Report each attempt's end; it frees its slot and demand.
-policy.handle(Input::Done { job: 7, attempt: 1 }, 95.0);
-assert!(policy.poll(95.0).is_empty());
+policy.handle(Input::Done { job: 7, attempt: 1 }, Time::from_secs(95));
+assert!(policy.poll(Time::from_secs(95)).is_empty());
 println!("{:?}", policy.explain(8)); // why a job is (not) running, for logs
 ```
 
@@ -231,17 +232,17 @@ reproduces every poll; learned speeds live in the scheduler, so it relearns them
 ```rust
 use std::sync::{Arc, Mutex};
 use whelm::{
-    Config, Input, JobSpec, Policy, Resources, Scheduler, WorkerState,
+    Config, Input, JobSpec, Policy, Resources, Scheduler, Time, WorkerState,
     log::{self, Event, Logged},
 };
 
 let events = Arc::new(Mutex::new(Vec::<Event>::new()));
 let mut p = Logged::new(Scheduler::new(Config::default()), events.clone());
 let worker = WorkerState { id: 1, slots: 2, budget: Resources::mem_gb(10.0), ..Default::default() };
-p.handle(Input::Worker(worker), 0.0);
+p.handle(Input::Worker(worker), Time::ZERO);
 let job = JobSpec { id: 1, demand: Resources::mem_gb(4.0), ..Default::default() };
-p.handle(Input::Submit(job), 0.0);
-p.poll(0.0);
+p.handle(Input::Submit(job), Time::ZERO);
+p.poll(Time::ZERO);
 
 let events = events.lock().unwrap().clone();
 let mut fresh = Scheduler::new(Config::default());
@@ -292,11 +293,11 @@ is job `base + k`; other units depend on it by its id.
 use std::sync::Arc;
 use whelm::{
     Config, DagConfig, DagJob, DagScheduler, Input, JobSpec, Output, Policy, Scheduler,
-    TemplateSpec, Unit, WorkerState,
+    TemplateSpec, Time, Unit, WorkerState,
 };
 
 let mut dag = DagScheduler::new(DagConfig::default(), Scheduler::new(Config::default()));
-dag.handle(Input::Worker(WorkerState { id: 1, slots: 4, ..Default::default() }), 0.0);
+dag.handle(Input::Worker(WorkerState { id: 1, slots: 4, ..Default::default() }), Time::ZERO);
 
 // A local job 1, then unit 10: a chain of jobs 100 -> 101 -> 102, the first checkpointed.
 let spec = JobSpec { id: 1, ..Default::default() };
@@ -310,10 +311,10 @@ let unit = Unit {
     completed: vec![0],
     ..Default::default()
 };
-dag.declare([load.into(), unit], 0.0).unwrap();
-assert_eq!(dag.poll(0.0), [Output::RunLocal { job: 1 }]);
-dag.handle(Input::Done { job: 1, attempt: 0 }, 1.0);
-assert_eq!(dag.poll(1.0), [Output::Start { job: 101, attempt: 1, worker: 1 }]);
+dag.declare([load.into(), unit], Time::ZERO).unwrap();
+assert_eq!(dag.poll(Time::ZERO), [Output::RunLocal { job: 1 }]);
+dag.handle(Input::Done { job: 1, attempt: 0 }, Time::from_secs(1));
+assert_eq!(dag.poll(Time::from_secs(1)), [Output::Start { job: 101, attempt: 1, worker: 1 }]);
 ```
 
 To log a DAG-driven run, log the inner policy: `DagScheduler<Logged<Scheduler>>`.
@@ -346,9 +347,7 @@ learned per-task device demand as the device `per_task`. Bidegrees become groups
 use std::{sync::Arc, time::Duration};
 use whelm::{
     Config, FailKind, GroupOrder, JobSpec, Resources, Scheduler, SharedPolicy, SpeedConfig, Timing,
-    WorkerState,
-    log::{JsonlSink, Logged, TaskInfo},
-    nassau,
+    WorkerState, log::{JsonlSink, Logged, TaskInfo}, nassau,
 };
 
 // Once: restart-stable bidegree order, speeds learned per worker, every input and poll logged.
@@ -378,9 +377,9 @@ shared.worker_update(WorkerState {
     speed: prior,
 });
 
-// acquire: one task of bidegree (s, t), its memory estimate and its expected seconds at speed 1
+// acquire: one task of bidegree (s, t), its memory estimate and its expected run time at speed 1
 // (any size proxy proportional to the run time works for learning).
-let (task, s, t, est_gb, work) = (123_456, 3, 200, 9.5, 600.0);
+let (task, s, t, est_gb, work) = (123_456, 3, 200, 9.5, Duration::from_secs(600));
 shared.with(|p, _| {
     p.annotate(task, TaskInfo { kind: "sig".into(), bidegree: (t - s, s), ..TaskInfo::default() })
 });

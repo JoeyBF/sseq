@@ -289,7 +289,8 @@ impl WorkerView<'_> {
 ///
 /// ```
 /// use whelm::{
-///     Admission, Config, Input, JobSpec, Policy, Resources, Scheduler, WorkerState, WorkerView,
+///     Admission, Config, Input, JobSpec, Policy, Resources, Scheduler, Time, WorkerState,
+///     WorkerView,
 /// };
 ///
 /// /// Admits while a slot is free, whatever the memory.
@@ -310,7 +311,7 @@ impl WorkerView<'_> {
 ///         budget: Resources::mem(100),
 ///         ..Default::default()
 ///     }),
-///     0.0,
+///     Time::ZERO,
 /// );
 /// for id in 0..3 {
 ///     s.handle(
@@ -319,10 +320,10 @@ impl WorkerView<'_> {
 ///             demand: Resources::mem(80),
 ///             ..Default::default()
 ///         }),
-///         0.0,
+///         Time::ZERO,
 ///     );
 /// }
-/// assert_eq!(s.poll(0.0).len(), 2);
+/// assert_eq!(s.poll(Time::ZERO).len(), 2);
 /// assert!(s.explain(2).unwrap().contains("slots full on 1 worker(s)"));
 /// ```
 pub trait Admission {

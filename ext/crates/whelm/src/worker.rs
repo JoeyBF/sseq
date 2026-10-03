@@ -58,7 +58,7 @@ pub struct WorkerState {
     /// The part of `reported_used` not attributable to jobs (caches, runtime).
     pub reported_baseline: Resources,
     /// How fast a job runs here, relative to a reference worker (1.0): a job with
-    /// [`JobSpec::work`] `w` takes `w / speed` seconds. Used by [`ScoreTerm::Speed`], [`Defer`]
+    /// [`JobSpec::work`] `w` takes `w / speed`. Used by [`ScoreTerm::Speed`], [`Defer`]
     /// and [`Speculate`] as the [`Timing`] says: ignored by identical machines, a prior for
     /// learned ones.
     #[cfg_attr(feature = "serde", serde(default = "unit"))]

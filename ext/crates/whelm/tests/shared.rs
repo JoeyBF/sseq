@@ -13,8 +13,8 @@ use std::{
 
 use proptest::prelude::*;
 use whelm::{
-    Attempt, Config, Defer, FailKind, GaveUp, Input, Instant, JobId, JobSpec, Lease, Output,
-    Policy, PolicyStats, Resources, RetryConfig, Scheduler, SharedPolicy, SpeedConfig, WorkerId,
+    Attempt, Config, Defer, FailKind, GaveUp, Input, JobId, JobSpec, Lease, Output, Policy,
+    PolicyStats, Resources, RetryConfig, Scheduler, SharedPolicy, SpeedConfig, Time, WorkerId,
     WorkerState,
 };
 
@@ -166,7 +166,7 @@ fn ticker_releases_timed_waits() {
     let policy = Scheduler::new(Config {
         speed: SpeedConfig {
             defer: Some(Defer {
-                max_wait: 0.2,
+                max_wait: Duration::from_millis(200),
                 min_gain: 0.0,
             }),
             ..SpeedConfig::default()
@@ -185,16 +185,16 @@ fn ticker_releases_timed_waits() {
     s.worker_update(worker(2, 1));
     // The fast worker is busy for 5 s; job 2 would still finish there first (15 s against 20 s on
     // the slow worker), so it waits for it.
-    let first = s.lease(work(1, 10.0));
+    let first = s.lease(work(1, Duration::from_secs(10)));
     assert_eq!(first.worker(), 1);
     assert!(
-        s.lease_timeout(work(2, 20.0), Duration::from_millis(50))
+        s.lease_timeout(work(2, Duration::from_secs(20)), Duration::from_millis(50))
             .is_err(),
         "deferred"
     );
     let ticker = s.spawn_ticker(Duration::from_millis(20));
     let start = std::time::Instant::now();
-    let second = s.lease(work(2, 20.0));
+    let second = s.lease(work(2, Duration::from_secs(20)));
     assert_eq!(second.worker(), 2);
     assert!(start.elapsed() < Duration::from_secs(5));
     s.stop_ticker();
@@ -207,7 +207,7 @@ fn ticker_releases_timed_waits() {
 /// with its worker before the thread picked it up: it gets the job's next start, not the lost one.
 #[test]
 fn lost_retry_is_not_handed_out() {
-    let s = SharedPolicy::new(Scheduler::new(Config::default()), || 0.0);
+    let s = SharedPolicy::new(Scheduler::new(Config::default()), || Time::ZERO);
     s.worker_update(worker(1, 1));
     s.worker_update(worker(2, 1));
     let lease = s.lease(job(7));
@@ -237,7 +237,7 @@ fn lost_last_retry_gives_up() {
         retry: RetryConfig { max_attempts: 2 },
         ..Config::default()
     };
-    let s = SharedPolicy::new(Scheduler::new(config), || 0.0);
+    let s = SharedPolicy::new(Scheduler::new(config), || Time::ZERO);
     s.worker_update(worker(1, 1));
     s.worker_update(worker(2, 1));
     let lease = s.lease(job(7));
@@ -257,20 +257,20 @@ struct Probe {
 
 impl Policy for Probe {
     /// Counted if a failure, then forwarded.
-    fn handle(&mut self, input: Input, now: Instant) {
+    fn handle(&mut self, input: Input, now: Time) {
         self.failures += matches!(input, Input::Failed { .. }) as usize;
         self.inner.handle(input, now);
     }
 
     /// Forwarded, and recorded.
-    fn poll(&mut self, now: Instant) -> Vec<Output> {
+    fn poll(&mut self, now: Time) -> Vec<Output> {
         let out = self.inner.poll(now);
         self.outputs.extend(out.iter().cloned());
         out
     }
 
     /// Forwarded.
-    fn next_wakeup(&self) -> Option<Instant> {
+    fn next_wakeup(&self) -> Option<Time> {
         self.inner.next_wakeup()
     }
 
@@ -562,7 +562,7 @@ proptest! {
     fn attempts_avoid_and_no_leaks(ops in prop::collection::vec(op(), 1..120)) {
         let config = Config { retry: RetryConfig { max_attempts: MAX_ATTEMPTS }, ..Config::default() };
         let probe = Probe { inner: Scheduler::new(config), outputs: Vec::new(), failures: 0 };
-        let s = SharedPolicy::new(probe, || 0.0);
+        let s = SharedPolicy::new(probe, || Time::ZERO);
         std::thread::scope(|scope| {
             let mut m = Model { s: &s, scope, workers: BTreeMap::new(), jobs: BTreeMap::new() };
             let r = ops.iter().try_for_each(|op| m.apply(op));
@@ -743,16 +743,16 @@ fn poll_p99_at_frontier_size() {
             budget: Resources::mem_gb(150.0),
             ..Default::default()
         };
-        p.handle(Input::Worker(w), 0.0);
+        p.handle(Input::Worker(w), Time::ZERO);
     }
     let mut next = 0u64;
     let mut running = std::collections::VecDeque::new();
-    let mut submit = |p: &mut Scheduler, t: f64| {
+    let mut submit = |p: &mut Scheduler, t: Time| {
         let j = JobSpec {
             id: next,
             demand: Resources::mem_gb(1.0 + (next % 13) as f64),
             group: next / 50,
-            work: Some(60.0),
+            work: Some(Duration::from_secs(60)),
             ..Default::default()
         };
         p.handle(Input::Submit(j), t);
@@ -766,12 +766,12 @@ fn poll_p99_at_frontier_size() {
         })
     }
     for _ in 0..1000 + 21 * 16 {
-        submit(&mut p, 0.0);
+        submit(&mut p, Time::ZERO);
     }
-    running.extend(started(p.poll(0.0)));
+    running.extend(started(p.poll(Time::ZERO)));
     let mut times = Vec::new();
     for e in 1..=3000 {
-        let t = e as f64;
+        let t = Time::from_secs(e);
         if let Some((job, attempt)) = running.pop_front() {
             p.handle(Input::Done { job, attempt }, t);
         }

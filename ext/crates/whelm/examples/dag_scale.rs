@@ -1,10 +1,13 @@
 //! Scale check of the DAG layer: `UNITS` units of one `NODES`-node template.
 
-use std::{sync::Arc, time::Instant};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use whelm::{
     DagConfig, DagScheduler, DagTemplate, Input, JobId, JobSpec, Output, Policy, PolicyStats,
-    Resources, TemplateNode, TemplateSpec, Unit,
+    Resources, TemplateNode, TemplateSpec, Time, Unit,
 };
 
 /// Units on a side of the coarse grid: unit `k` waits for its left and upper neighbours.
@@ -42,7 +45,7 @@ struct Immediate {
 
 impl Policy for Immediate {
     /// Queue submissions.
-    fn handle(&mut self, input: Input, _now: f64) {
+    fn handle(&mut self, input: Input, _now: Time) {
         if let Input::Submit(spec) = input {
             self.submitted += 1;
             if self.run {
@@ -52,7 +55,7 @@ impl Policy for Immediate {
     }
 
     /// Start everything queued.
-    fn poll(&mut self, _now: f64) -> Vec<Output> {
+    fn poll(&mut self, _now: Time) -> Vec<Output> {
         self.queue
             .drain(..)
             .map(|job| Output::Start {
@@ -64,7 +67,7 @@ impl Policy for Immediate {
     }
 
     /// Nothing is timed.
-    fn next_wakeup(&self) -> Option<f64> {
+    fn next_wakeup(&self) -> Option<Time> {
         None
     }
 
@@ -82,7 +85,7 @@ impl Policy for Immediate {
 /// A layered template: node `i` waits for node `i - 1` and one pseudo-random earlier node.
 fn template() -> Arc<DagTemplate> {
     let nodes = (0..NODES)
-        .map(|i| TemplateNode::Job(1.0 + f64::from(i % 7)))
+        .map(|i| TemplateNode::Job(Duration::from_secs(1 + u64::from(i % 7))))
         .collect();
     let edges = (1..NODES)
         .flat_map(|i| [(i - 1, i), ((i * 7919 + 13) % i, i)])
@@ -131,7 +134,7 @@ fn main() {
     let before = rss();
     let mut open = layer(false);
     let clock = Instant::now();
-    open.declare((0..OPEN_UNITS).map(|k| unit(&t, k, Vec::new())), 0.0)
+    open.declare((0..OPEN_UNITS).map(|k| unit(&t, k, Vec::new())), Time::ZERO)
         .unwrap();
     let opened = clock.elapsed().as_secs_f64();
     let grown = rss() - before;
@@ -158,7 +161,7 @@ fn main() {
             deps.push(k - WIDTH);
         }
         edges += deps.len();
-        d.declare([unit(&t, k, deps)], 0.0).unwrap();
+        d.declare([unit(&t, k, deps)], Time::ZERO).unwrap();
     }
     let declared = clock.elapsed().as_secs_f64();
     let grown = rss() - before;
@@ -176,11 +179,11 @@ fn main() {
     let (mut completed, mut rounds, mut peak_nodes, mut peak_open) = (0u64, 0u64, 0, 0);
     let mut next_sample = 0;
     while completed < virtual_nodes {
-        let out = d.poll(1.0);
+        let out = d.poll(Time::from_secs(1));
         assert!(!out.is_empty(), "stalled after {completed} completions");
         for o in out {
             if let Output::Start { job, attempt, .. } = o {
-                d.handle(Input::Done { job, attempt }, 1.0);
+                d.handle(Input::Done { job, attempt }, Time::from_secs(1));
                 completed += 1;
             }
         }

@@ -5,7 +5,7 @@ use std::ops::Bound;
 use super::{Job, Scheduler};
 #[cfg(doc)]
 use crate::Config;
-use crate::{GroupOrder, Instant, JobId, JobSpec, OrderTerm, SLOTS};
+use crate::{GroupOrder, JobId, JobSpec, OrderTerm, SLOTS, Time};
 
 /// The most terms a [`Config::order`] has once repeats are dropped: one per [`OrderTerm`].
 const ORDER_TERMS: usize = 5;
@@ -49,21 +49,29 @@ impl Scheduler {
         for (slot, term) in terms.iter_mut().zip(&self.config.order) {
             *slot = match term {
                 OrderTerm::Priority => spec.priority.unwrap_or(self.config.default_priority),
-                OrderTerm::Rank => spec.rank.map_or(i64::MAX, |r| ordered(-r)),
+                // Never `i64::MAX`, so a zero rank still beats none.
+                OrderTerm::Rank => spec.rank.map_or(i64::MAX, |r| {
+                    -(i64::try_from(r.as_nanos()).unwrap_or(i64::MAX))
+                }),
                 OrderTerm::Group => match self.config.group_order {
                     GroupOrder::Arrival => *self.groups.entry(spec.group).or_insert(seq) as i64,
                     // Order-preserving from u64 to i64.
                     GroupOrder::Id => spec.group as i64 ^ i64::MIN,
                 },
-                OrderTerm::Wspt => spec.work.map_or(i64::MAX, |w| ordered(-(spec.weight / w))),
-                OrderTerm::Edd => spec.due.map_or(i64::MAX, ordered),
+                OrderTerm::Wspt => {
+                    (spec.work).map_or(i64::MAX, |w| ordered(-(spec.weight / w.as_secs_f64())))
+                }
+                // Order-preserving from u64 to i64.
+                OrderTerm::Edd => spec
+                    .due
+                    .map_or(i64::MAX, |d| d.as_nanos() as i64 ^ i64::MIN),
             };
         }
         Key { terms, seq }
     }
 
     /// Queue a new job under its urgency key, demanding one slot.
-    pub(super) fn submit(&mut self, mut spec: JobSpec, now: Instant) {
+    pub(super) fn submit(&mut self, mut spec: JobSpec, now: Time) {
         if self.waiting.contains_key(&spec.id) || self.running.contains_key(&spec.id) {
             return;
         }

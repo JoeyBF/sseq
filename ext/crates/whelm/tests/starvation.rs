@@ -1,15 +1,15 @@
 //! No starvation: a stream of small jobs keeps every worker packed while a big job waits.
 
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, time::Duration};
 
 use proptest::prelude::*;
 use whelm::{
     Attempt, Config, Input, JobId, JobSpec, Output, Policy, Reservations, Resources, Scheduler,
-    WorkerState,
+    Time, WorkerState,
 };
 
-const TICK: f64 = 1.0;
-const RESERVE_AFTER: f64 = 60.0;
+const TICK: Duration = Duration::from_secs(1);
+const RESERVE_AFTER: Duration = Duration::from_secs(60);
 const BIG: u64 = u64::MAX / 2;
 
 struct Stream {
@@ -19,8 +19,8 @@ struct Stream {
     /// (demand, duration) of the small jobs, cycled.
     small: Vec<(u64, u64)>,
     big_demand: u64,
-    big_at: f64,
-    horizon: f64,
+    big_at: Time,
+    horizon: Time,
 }
 
 /// Runs the stream; returns the big job's wait, or `None` if it was never placed.
@@ -31,7 +31,7 @@ struct Stream {
 /// `wait <= reserve_after + D + tick`, where `D` is the longest small-job duration and `tick` the
 /// poll granularity. (A job behind more urgent starving jobs waits for their reservations
 /// first.) FIFO, as a control, starves the big job for the whole stream.
-fn run(p: &mut dyn Policy, s: &Stream) -> Option<f64> {
+fn run(p: &mut dyn Policy, s: &Stream) -> Option<Duration> {
     for w in 0..s.workers {
         p.handle(
             Input::Worker(WorkerState {
@@ -41,15 +41,15 @@ fn run(p: &mut dyn Policy, s: &Stream) -> Option<f64> {
                 budget: Resources::mem(s.budget),
                 ..Default::default()
             }),
-            0.0,
+            Time::ZERO,
         );
     }
     // Running attempts: job -> (attempt, end).
-    let mut ends: BTreeMap<JobId, (Attempt, f64)> = BTreeMap::new();
+    let mut ends: BTreeMap<JobId, (Attempt, Time)> = BTreeMap::new();
     let mut duration: BTreeMap<u64, u64> = BTreeMap::new();
     let mut next = 0u64;
     let mut big_submitted = false;
-    let mut t = 0.0;
+    let mut t = Time::ZERO;
     while t < s.horizon {
         // Keep a few small jobs waiting at all times, each in a new (younger) group.
         let waiting = p.stats().waiting;
@@ -59,7 +59,7 @@ fn run(p: &mut dyn Policy, s: &Stream) -> Option<f64> {
                 id: next,
                 demand: Resources::mem(demand),
                 group: 1_000 + next,
-                work: Some(d as f64),
+                work: Some(Duration::from_secs(d)),
                 ..Default::default()
             };
             p.handle(Input::Submit(small), t);
@@ -88,7 +88,7 @@ fn run(p: &mut dyn Policy, s: &Stream) -> Option<f64> {
             if job == BIG {
                 return Some(t - s.big_at);
             }
-            ends.insert(job, (attempt, t + duration[&job] as f64));
+            ends.insert(job, (attempt, t + Duration::from_secs(duration[&job])));
         }
         t += TICK;
     }
@@ -127,20 +127,20 @@ fn fifo_starves_and_backfill_does_not() {
         budget: 100,
         small: vec![(12, 40), (15, 55), (9, 25), (14, 60)],
         big_demand: 70,
-        big_at: 30.0,
-        horizon: 5_000.0,
+        big_at: Time::from_secs(30),
+        horizon: Time::from_secs(5_000),
     };
     assert_eq!(
         run(&mut Scheduler::new(Config::fifo()), &s),
         None,
         "FIFO should starve it"
     );
-    let d = s.small.iter().map(|x| x.1).max().unwrap() as f64;
+    let d = Duration::from_secs(s.small.iter().map(|x| x.1).max().unwrap());
     for (name, mut p) in policies() {
         let wait = run(&mut *p, &s).unwrap_or_else(|| panic!("{name} starved the big job"));
         assert!(
-            wait <= RESERVE_AFTER + d + 2.0 * TICK,
-            "{name}: waited {wait}s"
+            wait <= RESERVE_AFTER + d + 2 * TICK,
+            "{name}: waited {wait:?}"
         );
     }
 }
@@ -155,14 +155,15 @@ proptest! {
         slots in 2usize..10,
         small in prop::collection::vec((5u64..40, 5u64..120), 1..6),
         big_demand in 41u64..250,
-        big_at in 0.0f64..200.0,
+        big_at_ms in 0u64..200_000,
     ) {
-        let s = Stream { workers, slots, budget: 100, small, big_demand, big_at, horizon: 2_000.0 };
-        let d = s.small.iter().map(|x| x.1).max().unwrap() as f64;
+        let (big_at, horizon) = (Time::from_millis(big_at_ms), Time::from_secs(2_000));
+        let s = Stream { workers, slots, budget: 100, small, big_demand, big_at, horizon };
+        let d = Duration::from_secs(s.small.iter().map(|x| x.1).max().unwrap());
         for (name, mut p) in policies() {
             let wait = run(&mut *p, &s);
             prop_assert!(wait.is_some(), "{} starved the big job", name);
-            prop_assert!(wait.unwrap() <= RESERVE_AFTER + d + 2.0 * TICK, "{}: waited {:?}", name, wait);
+            prop_assert!(wait.unwrap() <= RESERVE_AFTER + d + 2 * TICK, "{}: waited {:?}", name, wait);
         }
     }
 }

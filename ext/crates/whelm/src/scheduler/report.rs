@@ -91,7 +91,7 @@ impl Scheduler {
             "job {job} (demand {}, group {}) waiting {:.0}s, {ahead} more urgent job(s) waiting",
             gb_list(&j.spec.demand),
             j.spec.group,
-            self.now - j.since
+            (self.now - j.since).as_secs_f64()
         );
         if let Some(last) = j.tried.last() {
             msg += &format!(
@@ -114,8 +114,10 @@ impl Scheduler {
                 );
             }
             Some(Hold::Defer { worker, at, .. }) => {
-                msg +=
-                    &format!("; waiting for faster worker {worker} (expected free at t={at:.0})");
+                msg += &format!(
+                    "; waiting for faster worker {worker} (expected free at t={:.0})",
+                    at.as_secs_f64()
+                );
             }
             None => {}
         }

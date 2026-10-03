@@ -11,9 +11,11 @@
 //! ```
 //! use std::{sync::Arc, thread};
 //!
-//! use whelm::{Config, JobSpec, Resources, Scheduler, SharedPolicy, WorkerState};
+//! use whelm::{Config, JobSpec, Resources, Scheduler, SharedPolicy, Time, WorkerState};
 //!
-//! let shared = Arc::new(SharedPolicy::new(Scheduler::new(Config::fifo()), || 0.0));
+//! let shared = Arc::new(SharedPolicy::new(Scheduler::new(Config::fifo()), || {
+//!     Time::ZERO
+//! }));
 //! shared.worker_update(WorkerState {
 //!     id: 1,
 //!     budget: Resources::mem_gb(8.0),
@@ -66,7 +68,7 @@ use mailbox::State;
 
 #[cfg(doc)]
 use crate::FailKind;
-use crate::{Input, Instant, JobId, JobSpec, Policy, PolicyStats, WorkerId, WorkerState};
+use crate::{Input, JobId, JobSpec, Policy, PolicyStats, Time, WorkerId, WorkerState};
 
 /// A thread-safe front end over a [`Policy`]: each task thread calls [`lease`](Self::lease),
 /// which submits its job and blocks until the policy starts it, then ends the lease with
@@ -84,24 +86,25 @@ use crate::{Input, Instant, JobId, JobSpec, Policy, PolicyStats, WorkerId, Worke
 /// The policy stays deterministic; only the clock and the interleaving of callers are not.
 pub struct SharedPolicy<P> {
     state: Mutex<State<P>>,
-    clock: Box<dyn Fn() -> Instant + Send + Sync>,
+    clock: Box<dyn Fn() -> Time + Send + Sync>,
 }
 
 impl<P: Policy> SharedPolicy<P> {
-    /// A front end over `policy`, reading time from `clock` (seconds; made non-decreasing here).
+    /// A front end over `policy`, reading time from `clock` (any origin; made non-decreasing here).
     ///
     /// A clock the caller sets makes time-dependent behaviour reproducible. Here the second job
-    /// waits while the clock moves to 7, and a clock going back to 3 is read as 7:
+    /// waits while the clock moves to 7 s, and a clock going back to 3 s is read as 7 s:
     ///
     /// ```
     /// use std::{
     ///     sync::{Arc, Mutex},
     ///     thread,
+    ///     time::Duration,
     /// };
     ///
-    /// use whelm::{Config, JobSpec, Resources, Scheduler, SharedPolicy, WorkerState};
+    /// use whelm::{Config, JobSpec, Resources, Scheduler, SharedPolicy, Time, WorkerState};
     ///
-    /// let time = Arc::new(Mutex::new(0.0));
+    /// let time = Arc::new(Mutex::new(Time::ZERO));
     /// let clock = {
     ///     let time = time.clone();
     ///     move || *time.lock().unwrap()
@@ -131,18 +134,18 @@ impl<P: Policy> SharedPolicy<P> {
     /// while shared.waiting() == 0 {
     ///     thread::yield_now();
     /// }
-    /// *time.lock().unwrap() = 7.0;
+    /// *time.lock().unwrap() = Time::from_secs(7);
     /// shared.tick();
-    /// *time.lock().unwrap() = 3.0;
+    /// *time.lock().unwrap() = Time::from_secs(3);
     /// first.complete();
-    /// assert_eq!(second.join().unwrap(), 7.0);
-    /// assert_eq!(shared.stats().now, 7.0);
+    /// assert_eq!(second.join().unwrap(), Duration::from_secs(7));
+    /// assert_eq!(shared.stats().now, Time::from_secs(7));
     /// ```
-    pub fn new(policy: P, clock: impl Fn() -> Instant + Send + Sync + 'static) -> Self {
+    pub fn new(policy: P, clock: impl Fn() -> Time + Send + Sync + 'static) -> Self {
         Self {
             state: Mutex::new(State {
                 policy,
-                now: f64::NEG_INFINITY,
+                now: Time::ZERO,
                 jobs: HashMap::new(),
                 ticker_generation: 0,
             }),
@@ -150,9 +153,11 @@ impl<P: Policy> SharedPolicy<P> {
         }
     }
 
-    /// A front end whose clock is seconds since its creation.
+    /// A front end whose clock reads the time since its creation.
     ///
     /// ```
+    /// use std::time::Duration;
+    ///
     /// use whelm::{Config, JobSpec, Resources, Scheduler, SharedPolicy, WorkerState};
     ///
     /// let shared = SharedPolicy::with_system_clock(Scheduler::new(Config::default()));
@@ -167,12 +172,12 @@ impl<P: Policy> SharedPolicy<P> {
     ///     demand: Resources::mem_gb(1.0),
     ///     ..Default::default()
     /// });
-    /// assert!(lease.waited() >= 0.0);
+    /// assert!(lease.waited() < Duration::from_secs(60)); // the worker was free
     /// lease.complete();
     /// ```
     pub fn with_system_clock(policy: P) -> Self {
         let start = std::time::Instant::now();
-        Self::new(policy, move || start.elapsed().as_secs_f64())
+        Self::new(policy, move || Time::ZERO + start.elapsed())
     }
 
     /// Submit `job` and block until the policy starts it. Dropping the lease without
@@ -180,9 +185,9 @@ impl<P: Policy> SharedPolicy<P> {
     /// cancels the job.
     ///
     /// ```
-    /// use whelm::{Config, JobSpec, Resources, Scheduler, SharedPolicy, WorkerState};
+    /// use whelm::{Config, JobSpec, Resources, Scheduler, SharedPolicy, Time, WorkerState};
     ///
-    /// let shared = SharedPolicy::new(Scheduler::new(Config::default()), || 0.0);
+    /// let shared = SharedPolicy::new(Scheduler::new(Config::default()), || Time::ZERO);
     /// shared.worker_update(WorkerState {
     ///     id: 1,
     ///     budget: Resources::mem_gb(8.0),
@@ -215,9 +220,9 @@ impl<P: Policy> SharedPolicy<P> {
     /// ```
     /// use std::time::Duration;
     ///
-    /// use whelm::{Config, JobSpec, Resources, Scheduler, SharedPolicy};
+    /// use whelm::{Config, JobSpec, Resources, Scheduler, SharedPolicy, Time};
     ///
-    /// let shared = SharedPolicy::new(Scheduler::new(Config::default()), || 0.0);
+    /// let shared = SharedPolicy::new(Scheduler::new(Config::default()), || Time::ZERO);
     /// let job = JobSpec {
     ///     id: 1,
     ///     demand: Resources::mem_gb(1.0),
@@ -245,9 +250,11 @@ impl<P: Policy> SharedPolicy<P> {
     /// ```
     /// use std::{sync::Arc, thread};
     ///
-    /// use whelm::{Config, JobSpec, Resources, Scheduler, SharedPolicy, WorkerState};
+    /// use whelm::{Config, JobSpec, Resources, Scheduler, SharedPolicy, Time, WorkerState};
     ///
-    /// let shared = Arc::new(SharedPolicy::new(Scheduler::new(Config::default()), || 0.0));
+    /// let shared = Arc::new(SharedPolicy::new(Scheduler::new(Config::default()), || {
+    ///     Time::ZERO
+    /// }));
     /// let task = thread::spawn({
     ///     let shared = shared.clone();
     ///     move || {
@@ -283,9 +290,9 @@ impl<P: Policy> SharedPolicy<P> {
     /// [`Lease::complete`] cancels the retry.
     ///
     /// ```
-    /// use whelm::{Config, FailKind, JobSpec, Resources, Scheduler, SharedPolicy, WorkerState};
+    /// use whelm::{Config, FailKind, JobSpec, Resources, Scheduler, SharedPolicy, Time, WorkerState};
     ///
-    /// let shared = SharedPolicy::new(Scheduler::new(Config::fifo()), || 0.0);
+    /// let shared = SharedPolicy::new(Scheduler::new(Config::fifo()), || Time::ZERO);
     /// for w in [1, 2] {
     ///     shared.worker_update(WorkerState {
     ///         id: w,
@@ -346,9 +353,11 @@ impl<P: Policy> SharedPolicy<P> {
     ///     thread,
     /// };
     ///
-    /// use whelm::{Config, JobSpec, Reservations, Resources, Scheduler, SharedPolicy, WorkerState};
+    /// use whelm::{
+    ///     Config, JobSpec, Reservations, Resources, Scheduler, SharedPolicy, Time, WorkerState,
+    /// };
     ///
-    /// let time = Arc::new(Mutex::new(0.0));
+    /// let time = Arc::new(Mutex::new(Time::ZERO));
     /// let clock = {
     ///     let time = time.clone();
     ///     move || *time.lock().unwrap()
@@ -382,7 +391,7 @@ impl<P: Policy> SharedPolicy<P> {
     /// }
     ///
     /// let wake = shared.next_wakeup().unwrap();
-    /// assert_eq!(wake, Reservations::default().reserve_after);
+    /// assert_eq!(wake, Time::ZERO + Reservations::default().reserve_after);
     /// *time.lock().unwrap() = wake;
     /// shared.tick();
     /// assert_eq!(shared.stats().reservations[0].job, 2);
@@ -395,7 +404,7 @@ impl<P: Policy> SharedPolicy<P> {
     /// first.complete();
     /// big.join().unwrap();
     /// ```
-    pub fn next_wakeup(&self) -> Option<Instant> {
+    pub fn next_wakeup(&self) -> Option<Time> {
         self.lock().0.policy.next_wakeup()
     }
 
@@ -413,9 +422,9 @@ impl<P: Policy> SharedPolicy<P> {
     /// submitted through `f` are cancelled: nobody waits for them.
     ///
     /// ```
-    /// use whelm::{Config, Input, JobSpec, Policy, Resources, Scheduler, SharedPolicy};
+    /// use whelm::{Config, Input, JobSpec, Policy, Resources, Scheduler, SharedPolicy, Time};
     ///
-    /// let shared = SharedPolicy::new(Scheduler::new(Config::default()), || 0.0);
+    /// let shared = SharedPolicy::new(Scheduler::new(Config::default()), || Time::ZERO);
     /// shared.worker_update(whelm::WorkerState {
     ///     id: 1,
     ///     budget: Resources::mem_gb(8.0),
@@ -430,7 +439,7 @@ impl<P: Policy> SharedPolicy<P> {
     /// let stats = shared.stats();
     /// assert_eq!((stats.placements_total, stats.running), (1, 0));
     /// ```
-    pub fn with<R>(&self, f: impl FnOnce(&mut P, Instant) -> R) -> R {
+    pub fn with<R>(&self, f: impl FnOnce(&mut P, Time) -> R) -> R {
         let (mut s, now) = self.lock();
         let r = f(&mut s.policy, now);
         Self::pump(&mut s, now);
@@ -463,8 +472,8 @@ impl<P: Policy + Send + 'static> SharedPolicy<P> {
     /// #     thread,
     /// #     time::Duration,
     /// # };
-    /// # use whelm::{Config, JobSpec, Resources, Scheduler, SharedPolicy, WorkerState};
-    /// # let time = Arc::new(Mutex::new(0.0));
+    /// # use whelm::{Config, JobSpec, Resources, Scheduler, SharedPolicy, Time, WorkerState};
+    /// # let time = Arc::new(Mutex::new(Time::ZERO));
     /// # let clock = {
     /// #     let time = time.clone();
     /// #     move || *time.lock().unwrap()
@@ -510,7 +519,7 @@ impl<P: Policy + Send + 'static> SharedPolicy<P> {
                         }
                         Self::pump(&mut s, now);
                         match s.policy.next_wakeup() {
-                            Some(t) if t > now => period.min(Duration::from_secs_f64(t - now)),
+                            Some(t) if t > now => period.min(t - now),
                             _ => period,
                         }
                     };

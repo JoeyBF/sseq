@@ -12,8 +12,8 @@ use super::{
 #[cfg(doc)]
 use crate::Config;
 use crate::{
-    JobId, JobSpec, Resources, SLOTS, ScoreTerm, Selector, Strength, WorkerId, WorkerState,
-    WorkerView,
+    JobId, JobSpec, Resources, SLOTS, ScoreTerm, Selector, Strength, Time, WorkerId, WorkerState,
+    WorkerView, time::secs,
 };
 
 /// The most terms a [`Config::score`] has once repeats are dropped: one per [`ScoreTerm`].
@@ -24,13 +24,13 @@ pub(super) type Score = [i64; SCORE_TERMS];
 
 /// Projected slot free times of busy workers during one `dispatch` (for deferral): per worker,
 /// the expected end of each running or deferred job, smallest first.
-type Projection = HashMap<WorkerId, Vec<f64>>;
+type Projection = HashMap<WorkerId, Vec<Option<Time>>>;
 
 /// What `choose` decided for a job.
 enum Pick {
     Place(WorkerId),
     /// Wait for this worker, expected to start there at this time.
-    Defer(WorkerId, f64),
+    Defer(WorkerId, Time),
     Nothing,
 }
 
@@ -120,17 +120,15 @@ impl Scheduler {
 
     /// When a busy worker's next slot is expected to free: the earliest projected end, or `None`
     /// if a running job's end is unknown on every slot.
-    fn next_free(&self, w: &Worker, proj: &mut Projection) -> Option<f64> {
+    fn next_free(&self, w: &Worker, proj: &mut Projection) -> Option<Time> {
         let ends = proj.entry(w.state.id).or_insert_with(|| {
-            let mut ends: Vec<f64> = w
-                .jobs
-                .keys()
-                .map(|j| self.expected_end(&self.running[j]).unwrap_or(f64::INFINITY))
+            let mut ends: Vec<Option<Time>> = (w.jobs.keys())
+                .map(|j| self.expected_end(&self.running[j]))
                 .collect();
-            ends.sort_by(f64::total_cmp);
+            ends.sort_by_key(|e| (e.is_none(), *e));
             ends
         });
-        ends.first().copied().filter(|e| e.is_finite())
+        ends.first().copied().flatten()
     }
 
     /// Worker `w`'s rank for `job` under [`Config::score`].
@@ -173,7 +171,7 @@ impl Scheduler {
             let work = job.spec.work.unwrap_or_default();
             let here = self.now + run_here;
             let speed_here = self.speed(job, &self.workers[&place]);
-            let mut wait: Option<(f64, WorkerId)> = None;
+            let mut wait: Option<(Time, WorkerId)> = None;
             for (&id, w) in &self.workers {
                 let slots = w.state.slots;
                 // Only full workers, and only if they would admit the job with one slot free.
@@ -203,14 +201,14 @@ impl Scheduler {
                 }
             }
             if let Some((eft, id)) = wait
-                && eft < here - defer.min_gain * work
+                && eft + secs(work.as_secs_f64() * defer.min_gain) < here
             {
                 // Book the slot so that later deferrals in this scan see it taken.
                 let start = self.next_free(&self.workers[&id], proj).unwrap();
                 let ends = proj.get_mut(&id).unwrap();
                 ends.remove(0);
-                let at = ends.partition_point(|&e| e < eft);
-                ends.insert(at, eft);
+                let at = ends.partition_point(|&e| e.is_some_and(|e| e < eft));
+                ends.insert(at, Some(eft));
                 return Pick::Defer(id, start.max(self.now));
             }
         }

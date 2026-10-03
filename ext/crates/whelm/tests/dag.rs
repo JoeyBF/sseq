@@ -1,17 +1,20 @@
 //! The DAG layer over plain jobs: readiness, references, cycles, cancellation, ranks, snapshots.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    time::Duration,
+};
 
 use proptest::prelude::*;
 use whelm::{
     Attempt, Config, DagConfig, DagError, DagJob, DagScheduler, Input, JobId, JobSpec, OrderTerm,
-    Output, Policy, Resources, RetryConfig, Scheduler, WorkerState,
+    Output, Policy, Resources, RetryConfig, Scheduler, Time, WorkerState,
 };
 
 /// A DAG layer over backfill with one roomy worker.
 fn dag(config: DagConfig) -> DagScheduler<Scheduler> {
     let mut d = DagScheduler::new(config, Scheduler::new(Config::default()));
-    join(&mut d, worker(0, 64, 1000), 0.0);
+    join(&mut d, worker(0, 64, 1000), Time::ZERO);
     d
 }
 
@@ -27,12 +30,12 @@ fn worker(id: u64, slots: usize, bytes: u64) -> WorkerState {
 }
 
 /// A worker joins.
-fn join(d: &mut DagScheduler<Scheduler>, w: WorkerState, now: f64) {
+fn join(d: &mut DagScheduler<Scheduler>, w: WorkerState, now: Time) {
     d.handle(Input::Worker(w), now);
 }
 
 /// Report the first attempt of `job` done.
-fn complete(d: &mut DagScheduler<Scheduler>, job: JobId, now: f64) {
+fn complete(d: &mut DagScheduler<Scheduler>, job: JobId, now: Time) {
     d.handle(Input::Done { job, attempt: 1 }, now);
 }
 
@@ -50,7 +53,7 @@ fn job(id: JobId, deps: &[JobId]) -> DagJob {
 }
 
 /// The ids started by a poll, sorted.
-fn placed(d: &mut DagScheduler<Scheduler>, now: f64) -> Vec<JobId> {
+fn placed(d: &mut DagScheduler<Scheduler>, now: Time) -> Vec<JobId> {
     let mut v: Vec<JobId> = d
         .poll(now)
         .into_iter()
@@ -67,15 +70,15 @@ fn placed(d: &mut DagScheduler<Scheduler>, now: f64) -> Vec<JobId> {
 #[test]
 fn chain_becomes_ready_in_order() {
     let mut d = dag(DagConfig::default());
-    d.declare(vec![job(1, &[]), job(2, &[1]), job(3, &[2])], 0.0)
+    d.declare(vec![job(1, &[]), job(2, &[1]), job(3, &[2])], Time::ZERO)
         .unwrap();
-    assert_eq!(placed(&mut d, 0.0), vec![1]);
+    assert_eq!(placed(&mut d, Time::ZERO), vec![1]);
     assert!(d.explain(3).unwrap().contains("waits for 1 dependency [2]"));
-    complete(&mut d, 1, 1.0);
-    assert_eq!(placed(&mut d, 1.0), vec![2]);
-    complete(&mut d, 2, 2.0);
-    assert_eq!(placed(&mut d, 2.0), vec![3]);
-    complete(&mut d, 3, 3.0);
+    complete(&mut d, 1, Time::from_secs(1));
+    assert_eq!(placed(&mut d, Time::from_secs(1)), vec![2]);
+    complete(&mut d, 2, Time::from_secs(2));
+    assert_eq!(placed(&mut d, Time::from_secs(2)), vec![3]);
+    complete(&mut d, 3, Time::from_secs(3));
     let s = d.dag_stats();
     assert_eq!(
         (s.pending, s.submitted, s.edges, s.undeclared),
@@ -87,32 +90,33 @@ fn chain_becomes_ready_in_order() {
 #[test]
 fn forward_references_wait_for_declaration() {
     let mut d = dag(DagConfig::default());
-    d.declare(vec![job(2, &[1])], 0.0).unwrap();
-    assert!(placed(&mut d, 0.0).is_empty());
+    d.declare(vec![job(2, &[1])], Time::ZERO).unwrap();
+    assert!(placed(&mut d, Time::ZERO).is_empty());
     assert_eq!(d.dag_stats().undeclared, 1);
     assert!(d.explain(1).unwrap().contains("not declared yet"));
-    d.declare(vec![job(1, &[])], 1.0).unwrap();
-    assert_eq!(placed(&mut d, 1.0), vec![1]);
-    complete(&mut d, 1, 2.0);
-    assert_eq!(placed(&mut d, 2.0), vec![2]);
+    d.declare(vec![job(1, &[])], Time::from_secs(1)).unwrap();
+    assert_eq!(placed(&mut d, Time::from_secs(1)), vec![1]);
+    complete(&mut d, 1, Time::from_secs(2));
+    assert_eq!(placed(&mut d, Time::from_secs(2)), vec![2]);
 }
 
 /// Completed (and forgotten) jobs satisfy later dependencies.
 #[test]
 fn dependency_on_a_completed_job_is_satisfied() {
     let mut d = dag(DagConfig::default());
-    d.declare(vec![job(1, &[])], 0.0).unwrap();
-    placed(&mut d, 0.0);
-    complete(&mut d, 1, 1.0);
-    d.declare(vec![job(2, &[1]), job(3, &[1, 1])], 2.0).unwrap();
-    assert_eq!(placed(&mut d, 2.0), vec![2, 3]);
+    d.declare(vec![job(1, &[])], Time::ZERO).unwrap();
+    placed(&mut d, Time::ZERO);
+    complete(&mut d, 1, Time::from_secs(1));
+    d.declare(vec![job(2, &[1]), job(3, &[1, 1])], Time::from_secs(2))
+        .unwrap();
+    assert_eq!(placed(&mut d, Time::from_secs(2)), vec![2, 3]);
     // After forgetting, everything below the floor still counts as completed.
     d.forget_completed_below(2);
     assert_eq!(d.dag_stats().completed_remembered, 0);
-    d.declare(vec![job(4, &[1])], 3.0).unwrap();
-    assert_eq!(placed(&mut d, 3.0), vec![4]);
+    d.declare(vec![job(4, &[1])], Time::from_secs(3)).unwrap();
+    assert_eq!(placed(&mut d, Time::from_secs(3)), vec![4]);
     assert_eq!(
-        d.declare(vec![job(1, &[])], 3.0),
+        d.declare(vec![job(1, &[])], Time::from_secs(3)),
         Err(DagError::Duplicate(1))
     );
 }
@@ -122,35 +126,39 @@ fn dependency_on_a_completed_job_is_satisfied() {
 fn cycles_are_rejected_without_a_trace() {
     let mut d = dag(DagConfig::default());
     assert_eq!(
-        d.declare(vec![job(1, &[1])], 0.0),
+        d.declare(vec![job(1, &[1])], Time::ZERO),
         Err(DagError::Cycle { job: 1 })
     );
     assert_eq!(d.dag_stats(), whelm::DagStats::default());
 
-    d.declare(vec![job(1, &[2]), job(3, &[])], 0.0).unwrap();
+    d.declare(vec![job(1, &[2]), job(3, &[])], Time::ZERO)
+        .unwrap();
     let before = d.dag_stats();
     // 2 -> 1 exists (1 depends on 2); declaring 2 depending on 1 closes the loop.
     assert!(matches!(
-        d.declare(vec![job(2, &[1])], 1.0),
+        d.declare(vec![job(2, &[1])], Time::from_secs(1)),
         Err(DagError::Cycle { .. })
     ));
     assert_eq!(d.dag_stats(), before);
     // A cycle entirely inside one batch, through a forward reference.
     assert!(matches!(
-        d.declare(vec![job(10, &[12]), job(11, &[10]), job(12, &[11])], 1.0),
+        d.declare(
+            vec![job(10, &[12]), job(11, &[10]), job(12, &[11])],
+            Time::from_secs(1)
+        ),
         Err(DagError::Cycle { .. })
     ));
     assert_eq!(d.dag_stats(), before);
     // Duplicates within a batch.
     assert_eq!(
-        d.declare(vec![job(20, &[]), job(20, &[])], 1.0),
+        d.declare(vec![job(20, &[]), job(20, &[])], Time::from_secs(1)),
         Err(DagError::Duplicate(20))
     );
     // The graph still works: declare 2 properly.
-    d.declare(vec![job(2, &[])], 2.0).unwrap();
-    assert_eq!(placed(&mut d, 2.0), vec![2, 3]);
-    complete(&mut d, 2, 3.0);
-    assert_eq!(placed(&mut d, 3.0), vec![1]);
+    d.declare(vec![job(2, &[])], Time::from_secs(2)).unwrap();
+    assert_eq!(placed(&mut d, Time::from_secs(2)), vec![2, 3]);
+    complete(&mut d, 2, Time::from_secs(3));
+    assert_eq!(placed(&mut d, Time::from_secs(3)), vec![1]);
 }
 
 /// Cancelling removes all dependents and the forward references they alone held.
@@ -165,10 +173,10 @@ fn cancel_cascades_to_dependents() {
             job(4, &[]),
             job(5, &[9]),
         ],
-        0.0,
+        Time::ZERO,
     )
     .unwrap();
-    assert_eq!(placed(&mut d, 0.0), vec![1, 4]);
+    assert_eq!(placed(&mut d, Time::ZERO), vec![1, 4]);
     let mut c = d.cancel(1);
     c.sort_unstable();
     assert_eq!(c, vec![1, 2, 3]);
@@ -178,7 +186,7 @@ fn cancel_cascades_to_dependents() {
         attempt: 1,
         worker: 0,
     };
-    assert_eq!(d.poll(0.0), vec![stop], "and stopped its attempt");
+    assert_eq!(d.poll(Time::ZERO), vec![stop], "and stopped its attempt");
     // Cancelling 5 drops the forward reference 9 it alone kept alive.
     assert_eq!(d.cancel(5), vec![5]);
     let s = d.dag_stats();
@@ -194,13 +202,21 @@ fn ranks_follow_the_critical_path() {
         ..job(id, deps)
     };
     // 1 -> 2 -> 3 and 1 -> 4: rank(1) = 1 + max(2 + 3, 10).
-    d.declare(vec![w(1, &[], 1.0), w(2, &[1], 2.0), w(3, &[2], 3.0)], 0.0)
+    d.declare(
+        vec![
+            w(1, &[], Duration::from_secs(1)),
+            w(2, &[1], Duration::from_secs(2)),
+            w(3, &[2], Duration::from_secs(3)),
+        ],
+        Time::ZERO,
+    )
+    .unwrap();
+    assert_eq!(d.rank(1), Some(Duration::from_secs(6)));
+    d.declare(vec![w(4, &[1], Duration::from_secs(10))], Time::ZERO)
         .unwrap();
-    assert_eq!(d.rank(1), Some(6.0));
-    d.declare(vec![w(4, &[1], 10.0)], 0.0).unwrap();
-    assert_eq!(d.rank(1), Some(11.0));
-    assert_eq!(d.rank(2), Some(5.0));
-    assert_eq!(d.rank(3), Some(3.0));
+    assert_eq!(d.rank(1), Some(Duration::from_secs(11)));
+    assert_eq!(d.rank(2), Some(Duration::from_secs(5)));
+    assert_eq!(d.rank(3), Some(Duration::from_secs(3)));
     assert_eq!(d.rank(99), None);
 }
 
@@ -221,14 +237,21 @@ fn the_rank_term_orders_ready_jobs() {
             ..Config::default()
         });
         let mut d = DagScheduler::new(DagConfig::default(), policy);
-        join(&mut d, worker(0, 1, 1000), 0.0);
+        join(&mut d, worker(0, 1, 1000), Time::ZERO);
         let w = |id, deps: &[JobId], work| DagJob {
             work_estimate: Some(work),
             ..job(id, deps)
         };
-        d.declare(vec![w(1, &[], 1.0), w(2, &[], 1.0), w(3, &[2], 50.0)], 0.0)
-            .unwrap();
-        assert_eq!(placed(&mut d, 0.0), vec![first]);
+        d.declare(
+            vec![
+                w(1, &[], Duration::from_secs(1)),
+                w(2, &[], Duration::from_secs(1)),
+                w(3, &[2], Duration::from_secs(50)),
+            ],
+            Time::ZERO,
+        )
+        .unwrap();
+        assert_eq!(placed(&mut d, Time::ZERO), vec![first]);
     }
 }
 
@@ -239,15 +262,16 @@ fn held_jobs_wait_for_release() {
         auto_submit: false,
         ..DagConfig::default()
     });
-    d.declare(vec![job(1, &[]), job(2, &[1])], 0.0).unwrap();
-    assert_eq!(d.poll(0.0), vec![Output::Ready { job: 1 }]);
-    assert!(d.poll(0.0).is_empty(), "announced once");
+    d.declare(vec![job(1, &[]), job(2, &[1])], Time::ZERO)
+        .unwrap();
+    assert_eq!(d.poll(Time::ZERO), vec![Output::Ready { job: 1 }]);
+    assert!(d.poll(Time::ZERO).is_empty(), "announced once");
     assert!(d.explain(1).unwrap().contains("held"));
-    assert!(d.release(1, 5.0));
-    assert!(!d.release(1, 5.0));
-    assert_eq!(placed(&mut d, 5.0), vec![1]);
-    complete(&mut d, 1, 6.0);
-    assert_eq!(d.poll(6.0), vec![Output::Ready { job: 2 }]);
+    assert!(d.release(1, Time::from_secs(5)));
+    assert!(!d.release(1, Time::from_secs(5)));
+    assert_eq!(placed(&mut d, Time::from_secs(5)), vec![1]);
+    complete(&mut d, 1, Time::from_secs(6));
+    assert_eq!(d.poll(Time::from_secs(6)), vec![Output::Ready { job: 2 }]);
 }
 
 /// A job lost with its worker is retried by the policy (attempt 2, on the next worker), and a
@@ -255,21 +279,25 @@ fn held_jobs_wait_for_release() {
 #[test]
 fn worker_loss_retries_automatically() {
     let mut d = dag(DagConfig::default());
-    d.declare(vec![job(1, &[]), job(2, &[1])], 0.0).unwrap();
-    assert_eq!(placed(&mut d, 0.0), vec![1]);
-    d.handle(Input::WorkerGone(0), 1.0);
-    assert!(d.poll(1.0).is_empty());
-    complete(&mut d, 1, 1.5);
-    assert!(d.poll(1.5).is_empty(), "the lost attempt's report is stale");
-    join(&mut d, worker(5, 1, 10), 2.0);
+    d.declare(vec![job(1, &[]), job(2, &[1])], Time::ZERO)
+        .unwrap();
+    assert_eq!(placed(&mut d, Time::ZERO), vec![1]);
+    d.handle(Input::WorkerGone(0), Time::from_secs(1));
+    assert!(d.poll(Time::from_secs(1)).is_empty());
+    complete(&mut d, 1, Time::from_millis(1500));
+    assert!(
+        d.poll(Time::from_millis(1500)).is_empty(),
+        "the lost attempt's report is stale"
+    );
+    join(&mut d, worker(5, 1, 10), Time::from_secs(2));
     let retry = Output::Start {
         job: 1,
         attempt: 2,
         worker: 5,
     };
-    assert_eq!(d.poll(2.0), vec![retry]);
-    d.handle(Input::Done { job: 1, attempt: 2 }, 3.0);
-    assert_eq!(placed(&mut d, 3.0), vec![2]);
+    assert_eq!(d.poll(Time::from_secs(2)), vec![retry]);
+    d.handle(Input::Done { job: 1, attempt: 2 }, Time::from_secs(3));
+    assert_eq!(placed(&mut d, Time::from_secs(3)), vec![2]);
 }
 
 /// A snapshot survives JSON and resumes with a fresh policy.
@@ -277,25 +305,30 @@ fn worker_loss_retries_automatically() {
 #[test]
 fn snapshot_round_trip() {
     let mut d = dag(DagConfig::default());
-    d.declare(vec![job(1, &[]), job(2, &[1]), job(3, &[2, 7])], 0.0)
+    d.declare(vec![job(1, &[]), job(2, &[1]), job(3, &[2, 7])], Time::ZERO)
         .unwrap();
-    placed(&mut d, 0.0);
+    placed(&mut d, Time::ZERO);
     let json = serde_json::to_string(&d.snapshot()).unwrap();
     let snap = serde_json::from_str(&json).unwrap();
-    let mut r = DagScheduler::restore(snap, Scheduler::new(Config::default()), None, 10.0);
-    join(&mut r, worker(0, 64, 1000), 10.0);
+    let mut r = DagScheduler::restore(
+        snap,
+        Scheduler::new(Config::default()),
+        None,
+        Time::from_secs(10),
+    );
+    join(&mut r, worker(0, 64, 1000), Time::from_secs(10));
     assert_eq!(r.dag_stats(), d.dag_stats());
     // Job 1 was submitted before the snapshot: it is submitted again to the new policy.
-    assert_eq!(placed(&mut r, 10.0), vec![1]);
-    complete(&mut r, 1, 11.0);
-    assert_eq!(placed(&mut r, 11.0), vec![2]);
-    complete(&mut r, 2, 12.0);
+    assert_eq!(placed(&mut r, Time::from_secs(10)), vec![1]);
+    complete(&mut r, 1, Time::from_secs(11));
+    assert_eq!(placed(&mut r, Time::from_secs(11)), vec![2]);
+    complete(&mut r, 2, Time::from_secs(12));
     assert!(
-        placed(&mut r, 12.0).is_empty(),
+        placed(&mut r, Time::from_secs(12)).is_empty(),
         "3 still waits for the forward reference 7"
     );
-    r.declare(vec![job(7, &[])], 13.0).unwrap();
-    assert_eq!(placed(&mut r, 13.0), vec![7]);
+    r.declare(vec![job(7, &[])], Time::from_secs(13)).unwrap();
+    assert_eq!(placed(&mut r, Time::from_secs(13)), vec![7]);
 }
 
 proptest! {
@@ -328,18 +361,18 @@ proptest! {
         // Enough attempts that churn never makes the policy give up.
         let config = Config { retry: RetryConfig { max_attempts: 100 }, ..Config::default() };
         let mut d = DagScheduler::new(DagConfig::default(), Scheduler::new(config));
-        join(&mut d, worker(0, slots, 10), 0.0);
+        join(&mut d, worker(0, slots, 10), Time::ZERO);
         let ids: Vec<JobId> = order.into_iter().filter(|&i| i < n).map(|i| i as JobId).collect();
         let mut done: BTreeSet<JobId> = BTreeSet::new();
         let mut running: Vec<(JobId, Attempt)> = Vec::new();
-        let mut t = 0.0;
+        let mut t = Time::ZERO;
         let mut steps = 0;
         let mut step = |d: &mut DagScheduler<Scheduler>,
                         done: &mut BTreeSet<JobId>,
                         running: &mut Vec<(JobId, Attempt)>,
-                        t: &mut f64|
+                        t: &mut Time|
          -> Result<(), TestCaseError> {
-            *t += 1.0;
+            *t += Duration::from_secs(1);
             if churn.contains(&steps) {
                 // The worker leaves with its attempts, whose late reports must complete nothing,
                 // and comes back.

@@ -1,7 +1,7 @@
 //! Holds: reservations, their shadow backfill, and deferral to a faster worker.
 
 use super::{Job, Scheduler, Worker, order::ordered, placement::Score};
-use crate::{Instant, JobId, Resources, WorkerId, WorkerState, WorkerView};
+use crate::{JobId, Resources, Time, WorkerId, WorkerState, WorkerView};
 
 /// A worker kept from a job on purpose although it might admit it: the one notion behind
 /// reservations, their shadow backfill and deferral. Each waiting job has at most one.
@@ -11,18 +11,18 @@ pub(super) enum Hold {
     /// `shadow` (shadow backfill). Lasts until the job is placed or the reservation is released.
     Reserve {
         worker: WorkerId,
-        since: Instant,
+        since: Time,
         /// Position among the reservations, for reporting them in creation order.
         order: u64,
         /// The holder's shadow time, fixed once known (so that an overrun can exceed it).
-        shadow: Option<Instant>,
+        shadow: Option<Time>,
     },
     /// The job waits for the faster, busy `worker`, expected to free at `at`, and declines every
     /// other worker until `until`. Decided afresh whenever `dispatch` reaches the job.
     Defer {
         worker: WorkerId,
-        at: Instant,
-        until: Instant,
+        at: Time,
+        until: Time,
     },
 }
 
@@ -35,7 +35,7 @@ impl Hold {
     }
 
     /// When the hold lapses by itself, if it does.
-    pub(super) fn until(&self) -> Option<Instant> {
+    pub(super) fn until(&self) -> Option<Time> {
         match *self {
             Hold::Reserve { .. } => None,
             Hold::Defer { until, .. } => Some(until),
@@ -93,7 +93,7 @@ impl Scheduler {
     }
 
     /// The shadow time of the reservation on `w`, once known.
-    pub(super) fn shadow(&self, w: &Worker) -> Option<Instant> {
+    pub(super) fn shadow(&self, w: &Worker) -> Option<Time> {
         match self.holds.get(&w.reserved_for?)? {
             Hold::Reserve { shadow, .. } => *shadow,
             Hold::Defer { .. } => None,
@@ -112,14 +112,14 @@ impl Scheduler {
     /// The holder's shadow time on reserved worker `w`: the expected end of the running job
     /// whose release lets the configured admission rule admit the holder (now, if it already
     /// does). `None` if some end is unknown or no release suffices.
-    fn shadow_time(&self, w: &Worker, holder: JobId) -> Option<Instant> {
+    fn shadow_time(&self, w: &Worker, holder: JobId) -> Option<Time> {
         let demand = self.waiting.get(&holder)?.spec.demand;
-        let mut ends: Vec<(f64, Resources)> = Vec::with_capacity(w.jobs.len());
+        let mut ends: Vec<(Time, Resources)> = Vec::with_capacity(w.jobs.len());
         for j in w.jobs.keys() {
             let r = &self.running[j];
             ends.push((self.expected_end(r)?, r.job.spec.demand));
         }
-        ends.sort_by(|a, b| a.0.total_cmp(&b.0));
+        ends.sort_by_key(|e| e.0);
         // The projection assumes a released job frees what it was placed with; the reported
         // usage cannot be predicted, so the hypothetical worker reports none above its baseline.
         let state = WorkerState {

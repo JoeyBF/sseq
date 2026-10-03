@@ -1,5 +1,7 @@
 //! A leased attempt, held by the thread running it.
 
+use std::time::Duration;
+
 use super::{SharedPolicy, mailbox::NoStart};
 use crate::{Attempt, FailKind, GaveUp, Input, JobId, Policy, WorkerId};
 
@@ -11,14 +13,15 @@ use crate::{Attempt, FailKind, GaveUp, Input, JobId, Policy, WorkerId};
 ///
 /// ```
 /// use whelm::{
-///     Config, FailKind, JobSpec, Resources, RetryConfig, Scheduler, SharedPolicy, WorkerState,
+///     Config, FailKind, JobSpec, Resources, RetryConfig, Scheduler, SharedPolicy, Time,
+///     WorkerState,
 /// };
 ///
 /// let config = Config {
 ///     retry: RetryConfig { max_attempts: 3 },
 ///     ..Config::fifo()
 /// };
-/// let shared = SharedPolicy::new(Scheduler::new(config), || 0.0);
+/// let shared = SharedPolicy::new(Scheduler::new(config), || Time::ZERO);
 /// for w in [1, 2] {
 ///     shared.worker_update(WorkerState {
 ///         id: w,
@@ -52,7 +55,7 @@ pub struct Lease<'a, P: Policy> {
     pub(super) job: JobId,
     pub(super) attempt: Attempt,
     pub(super) worker: WorkerId,
-    pub(super) waited: f64,
+    pub(super) waited: Duration,
     pub(super) open: bool,
 }
 
@@ -79,9 +82,9 @@ impl<'a, P: Policy> Lease<'a, P> {
         self.attempt
     }
 
-    /// Seconds (policy clock) from the request to this start: from the lease for the first
+    /// How long (policy clock) from the request to this start: from the lease for the first
     /// attempt, from the failure for a retry.
-    pub fn waited(&self) -> f64 {
+    pub fn waited(&self) -> Duration {
         self.waited
     }
 
@@ -89,9 +92,9 @@ impl<'a, P: Policy> Lease<'a, P> {
     /// [`SharedPolicy::with`]): its result is not wanted.
     ///
     /// ```
-    /// use whelm::{Config, Input, JobSpec, Policy, Resources, Scheduler, SharedPolicy};
+    /// use whelm::{Config, Input, JobSpec, Policy, Resources, Scheduler, SharedPolicy, Time};
     ///
-    /// let shared = SharedPolicy::new(Scheduler::new(Config::default()), || 0.0);
+    /// let shared = SharedPolicy::new(Scheduler::new(Config::default()), || Time::ZERO);
     /// shared.worker_update(whelm::WorkerState {
     ///     id: 1,
     ///     budget: Resources::mem_gb(8.0),
@@ -116,9 +119,9 @@ impl<'a, P: Policy> Lease<'a, P> {
     /// policy's retry is cancelled instead: the result is in hand.
     ///
     /// ```
-    /// use whelm::{Config, JobSpec, Resources, Scheduler, SharedPolicy, WorkerState};
+    /// use whelm::{Config, JobSpec, Resources, Scheduler, SharedPolicy, Time, WorkerState};
     ///
-    /// let shared = SharedPolicy::new(Scheduler::new(Config::fifo()), || 0.0);
+    /// let shared = SharedPolicy::new(Scheduler::new(Config::fifo()), || Time::ZERO);
     /// for w in [1, 2] {
     ///     shared.worker_update(WorkerState {
     ///         id: w,

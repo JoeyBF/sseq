@@ -12,14 +12,28 @@
 //! speed they report.
 //!
 //! ```
+//! use std::time::Duration;
+//!
 //! use whelm::{Learn, SpeedEstimator};
 //!
 //! let mut e = SpeedEstimator::new(Learn::default());
 //! for _ in 1..Learn::default().min_samples {
-//!     e.observe(1, "gpu", 10.0, 5.0, 1.0);
+//!     e.observe(
+//!         1,
+//!         "gpu",
+//!         Duration::from_secs(10),
+//!         Duration::from_secs(5),
+//!         1.0,
+//!     );
 //! }
 //! assert_eq!(e.speed(2, "gpu", 1.5), 1.5);
-//! e.observe(1, "gpu", 10.0, 5.0, 1.0);
+//! e.observe(
+//!     1,
+//!     "gpu",
+//!     Duration::from_secs(10),
+//!     Duration::from_secs(5),
+//!     1.0,
+//! );
 //! assert!((e.speed(2, "gpu", 1.5) - 2.0).abs() < 1e-9);
 //! ```
 
@@ -49,7 +63,7 @@ pub enum Timing {
     ///
     /// ```
     /// # use whelm::{
-    /// #     Config, Input, JobSpec, Output, Policy, Scheduler, SpeedConfig, Timing,
+    /// #     Config, Input, JobSpec, Output, Policy, Scheduler, SpeedConfig, Time, Timing,
     /// #     WorkerId, WorkerState,
     /// # };
     /// # /// A scheduler with `timing` and two one-slot workers: 1 of class "x" and 2 of class "y",
@@ -61,12 +75,12 @@ pub enum Timing {
     /// #     });
     /// #     for (id, class) in [(1, "x"), (2, "y")] {
     /// #         let w = WorkerState { id, class: class.into(), ..Default::default() };
-    /// #         s.handle(Input::Worker(w), 0.0);
+    /// #         s.handle(Input::Worker(w), Time::ZERO);
     /// #     }
     /// #     s
     /// # }
     /// # /// Where a lone job goes, both workers free, and that it then finishes at once.
-    /// # fn place(s: &mut Scheduler, job: JobSpec, now: f64) -> WorkerId {
+    /// # fn place(s: &mut Scheduler, job: JobSpec, now: Time) -> WorkerId {
     /// #     let id = job.id;
     /// #     s.handle(Input::Submit(job), now);
     /// #     let [Output::Start { worker, .. }] = s.poll(now)[..] else { panic!() };
@@ -80,13 +94,13 @@ pub enum Timing {
     ///     ..Default::default()
     /// };
     /// let mut s = two_classes(Timing::Identical);
-    /// s.handle(Input::Worker(fast.clone()), 0.0);
-    /// assert_eq!(place(&mut s, JobSpec::default(), 0.0), 1);
+    /// s.handle(Input::Worker(fast.clone()), Time::ZERO);
+    /// assert_eq!(place(&mut s, JobSpec::default(), Time::ZERO), 1);
     /// assert_eq!(s.stats().workers[1].speed, 1.0);
     /// // The default, related machines at their reported speeds, prefers it.
     /// let mut s = two_classes(Timing::default());
-    /// s.handle(Input::Worker(fast), 0.0);
-    /// assert_eq!(place(&mut s, JobSpec::default(), 0.0), 2);
+    /// s.handle(Input::Worker(fast), Time::ZERO);
+    /// assert_eq!(place(&mut s, JobSpec::default(), Time::ZERO), 2);
     /// assert_eq!(s.stats().workers[1].speed, 4.0);
     /// ```
     Identical,
@@ -111,9 +125,10 @@ pub enum Timing {
     /// related model, one speed per worker, sends both to "x", whose average is higher.
     ///
     /// ```
+    /// # use std::time::Duration;
     /// # use whelm::{
-    /// #     Config, Constraint, Input, JobSpec, Output, Policy, Scheduler, SpeedConfig, Timing,
-    /// #     WorkerId, WorkerState,
+    /// #     Config, Constraint, Input, JobSpec, Output, Policy, Scheduler, SpeedConfig, Time,
+    /// #     Timing, WorkerId, WorkerState,
     /// # };
     /// # /// A scheduler with `timing` and two one-slot workers: 1 of class "x" and 2 of class "y",
     /// # /// each reporting speed 1.
@@ -124,12 +139,12 @@ pub enum Timing {
     /// #     });
     /// #     for (id, class) in [(1, "x"), (2, "y")] {
     /// #         let w = WorkerState { id, class: class.into(), ..Default::default() };
-    /// #         s.handle(Input::Worker(w), 0.0);
+    /// #         s.handle(Input::Worker(w), Time::ZERO);
     /// #     }
     /// #     s
     /// # }
     /// # /// Where a lone job goes, both workers free, and that it then finishes at once.
-    /// # fn place(s: &mut Scheduler, job: JobSpec, now: f64) -> WorkerId {
+    /// # fn place(s: &mut Scheduler, job: JobSpec, now: Time) -> WorkerId {
     /// #     let id = job.id;
     /// #     s.handle(Input::Submit(job), now);
     /// #     let [Output::Start { worker, .. }] = s.poll(now)[..] else { panic!() };
@@ -142,20 +157,20 @@ pub enum Timing {
     ///     _ => 1.0,
     /// };
     /// let train = |s: &mut Scheduler| {
-    ///     let (mut now, mut id) = (0.0, 0);
+    ///     let (mut now, mut id) = (Time::ZERO, 0);
     ///     for _ in 0..20 {
     ///         for kind in ["a", "b"] {
     ///             for (w, class) in [(1, "x"), (2, "y")] {
     ///                 let job = JobSpec {
     ///                     id,
-    ///                     work: Some(8.0),
+    ///                     work: Some(Duration::from_secs(8)),
     ///                     kind: Some(kind.into()),
     ///                     constraints: vec![Constraint::require_class(class)],
     ///                     ..Default::default()
     ///                 };
     ///                 s.handle(Input::Submit(job), now);
     ///                 assert_eq!(s.poll(now).len(), 1);
-    ///                 now += 8.0 / truth(kind, w);
+    ///                 now += Duration::from_secs(8).div_f64(truth(kind, w));
     ///                 s.handle(Input::Done { job: id, attempt: 1 }, now);
     ///                 id += 1;
     ///             }
@@ -165,7 +180,7 @@ pub enum Timing {
     /// };
     /// let kind = |id, kind: &str| JobSpec {
     ///     id,
-    ///     work: Some(8.0),
+    ///     work: Some(Duration::from_secs(8)),
     ///     kind: Some(kind.into()),
     ///     ..Default::default()
     /// };
@@ -209,9 +224,10 @@ impl Timing {
     /// goes there:
     ///
     /// ```
+    /// # use std::time::Duration;
     /// # use whelm::{
-    /// #     Config, Constraint, Input, JobSpec, Output, Policy, Scheduler, SpeedConfig, Timing,
-    /// #     WorkerId, WorkerState,
+    /// #     Config, Constraint, Input, JobSpec, Output, Policy, Scheduler, SpeedConfig, Time,
+    /// #     Timing, WorkerId, WorkerState,
     /// # };
     /// # /// A scheduler with `timing` and two one-slot workers: 1 of class "x" and 2 of class "y",
     /// # /// each reporting speed 1.
@@ -222,12 +238,12 @@ impl Timing {
     /// #     });
     /// #     for (id, class) in [(1, "x"), (2, "y")] {
     /// #         let w = WorkerState { id, class: class.into(), ..Default::default() };
-    /// #         s.handle(Input::Worker(w), 0.0);
+    /// #         s.handle(Input::Worker(w), Time::ZERO);
     /// #     }
     /// #     s
     /// # }
     /// # /// Where a lone job goes, both workers free, and that it then finishes at once.
-    /// # fn place(s: &mut Scheduler, job: JobSpec, now: f64) -> WorkerId {
+    /// # fn place(s: &mut Scheduler, job: JobSpec, now: Time) -> WorkerId {
     /// #     let id = job.id;
     /// #     s.handle(Input::Submit(job), now);
     /// #     let [Output::Start { worker, .. }] = s.poll(now)[..] else { panic!() };
@@ -235,17 +251,17 @@ impl Timing {
     /// #     worker
     /// # }
     /// let mut s = two_classes(Timing::learned());
-    /// let mut now = 0.0;
+    /// let mut now = Time::ZERO;
     /// for id in 0..u64::from(Learn::default().min_samples) {
     ///     let job = JobSpec {
     ///         id,
-    ///         work: Some(10.0),
+    ///         work: Some(Duration::from_secs(10)),
     ///         constraints: vec![Constraint::require_class("y")],
     ///         ..Default::default()
     ///     };
     ///     s.handle(Input::Submit(job), now);
     ///     s.poll(now);
-    ///     now += 5.0;
+    ///     now += Duration::from_secs(5);
     ///     s.handle(Input::Done { job: id, attempt: 1 }, now);
     /// }
     /// assert!((s.stats().workers[1].speed - 2.0).abs() < 1e-9);
@@ -291,8 +307,8 @@ impl Timing {
     }
 }
 
-/// Online speed learning: each completed job with work `w` (seconds at speed 1) that ran `d`
-/// seconds is a sample `ln(w / d)` of its worker's speed, averaged in log space (durations are
+/// Online speed learning: each completed job with work `w` (its run time at speed 1) that ran for
+/// `d` is a sample `ln(w / d)` of its worker's speed, averaged in log space (durations are
 /// log-normal). Unlike StarPU's history models there is no outlier filter: per-job noise is wide
 /// enough that a "50% off the mean" filter would discard most samples (see `whelm-sim`'s
 /// RESULTS.md, "The DAG", for the fitted spread).
@@ -305,13 +321,33 @@ impl Timing {
 /// class, but not as slow as its own samples say: its class is its prior.
 ///
 /// ```
+/// use std::time::Duration;
+///
 /// use whelm::{Learn, SpeedEstimator};
 ///
 /// let mut e = SpeedEstimator::new(Learn::default());
 /// for _ in 0..100 {
-///     e.observe(1, "gpu", 10.0, 10.0, 1.0);
-///     e.observe(2, "gpu", 10.0, 10.0, 1.0);
-///     e.observe(3, "gpu", 10.0, 20.0, 1.0); // half speed
+///     e.observe(
+///         1,
+///         "gpu",
+///         Duration::from_secs(10),
+///         Duration::from_secs(10),
+///         1.0,
+///     );
+///     e.observe(
+///         2,
+///         "gpu",
+///         Duration::from_secs(10),
+///         Duration::from_secs(10),
+///         1.0,
+///     );
+///     e.observe(
+///         3,
+///         "gpu",
+///         Duration::from_secs(10),
+///         Duration::from_secs(20),
+///         1.0,
+///     ); // half speed
 /// }
 /// let (healthy, capped) = (e.speed(1, "gpu", 1.0), e.speed(3, "gpu", 1.0));
 /// assert!(
@@ -324,8 +360,20 @@ impl Timing {
 ///     ..Learn::default()
 /// });
 /// for _ in 0..100 {
-///     e.observe(1, "gpu", 10.0, 10.0, 1.0);
-///     e.observe(3, "gpu", 10.0, 20.0, 1.0);
+///     e.observe(
+///         1,
+///         "gpu",
+///         Duration::from_secs(10),
+///         Duration::from_secs(10),
+///         1.0,
+///     );
+///     e.observe(
+///         3,
+///         "gpu",
+///         Duration::from_secs(10),
+///         Duration::from_secs(20),
+///         1.0,
+///     );
 /// }
 /// assert_eq!(e.speed(1, "gpu", 1.0), e.speed(3, "gpu", 1.0));
 /// ```
@@ -378,6 +426,8 @@ impl Default for Learn {
 /// 4 is a sample of speed 1, not 0.25.
 ///
 /// ```
+/// use std::time::Duration;
+///
 /// use whelm::{Learn, Sharing, SpeedEstimator};
 ///
 /// let learned = |sharing| {
@@ -386,7 +436,13 @@ impl Default for Learn {
 ///         min_samples: 1,
 ///         ..Learn::default()
 ///     });
-///     e.observe(1, "cpu", 10.0, 40.0, 4.0);
+///     e.observe(
+///         1,
+///         "cpu",
+///         Duration::from_secs(10),
+///         Duration::from_secs(40),
+///         4.0,
+///     );
 ///     e.speed(1, "cpu", 1.0)
 /// };
 /// let no_gain = Sharing {

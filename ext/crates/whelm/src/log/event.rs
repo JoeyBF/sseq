@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 #[cfg(doc)]
 use super::{Logged, replay};
-use crate::{Input, JobId, Output};
+use crate::{Input, JobId, Output, Time};
 
 /// What a job is, for the simulator (optional; Nassau's vocabulary). Without it a logged job
 /// replays as a signature task of its group.
@@ -50,7 +50,7 @@ pub struct TaskInfo {
     pub sig: Vec<u32>,
 }
 
-/// One logged event. Times are on the policy's clock, in seconds.
+/// One logged event. Times are on the policy's clock, written as integer nanoseconds ([`Time`]).
 ///
 /// The [`Input`](Event::Input) and [`Poll`](Event::Poll) records are the whole run: feeding them
 /// back with [`replay`] reproduces every output, reservations included. [`Sample`](Event::Sample)
@@ -60,10 +60,10 @@ pub struct TaskInfo {
 /// Events can be written by hand, e.g. to script a run for [`replay`]:
 ///
 /// ```
-/// use whelm::{Input, JobSpec, Resources, log::Event};
+/// use whelm::{Input, JobSpec, Resources, Time, log::Event};
 ///
 /// let submit = Event::Input {
-///     t_s: 0.0,
+///     t: Time::ZERO,
 ///     input: Input::Submit(JobSpec {
 ///         id: 1,
 ///         demand: Resources::mem_gb(1.0),
@@ -72,7 +72,7 @@ pub struct TaskInfo {
 ///     info: None,
 /// };
 /// let poll = Event::Poll {
-///     t_s: 0.0,
+///     t: Time::ZERO,
 ///     out: Vec::new(),
 /// };
 /// # let _ = (submit, poll);
@@ -84,7 +84,7 @@ pub enum Event {
     /// An input, exactly as the policy handled it.
     Input {
         /// When.
-        t_s: f64,
+        t: Time,
         /// The input.
         input: Input,
         /// What a submitted job is ([`Logged::annotate`]).
@@ -97,7 +97,7 @@ pub enum Event {
     /// A poll, and what it returned.
     Poll {
         /// When.
-        t_s: f64,
+        t: Time,
         /// Its outputs, in order.
         #[cfg_attr(
             feature = "serde",
@@ -108,7 +108,7 @@ pub enum Event {
     /// A heartbeat (rate-limited): reported resident memory and the policy's own bookkeeping.
     Sample {
         /// When.
-        t_s: f64,
+        t: Time,
         /// The worker.
         worker: String,
         /// Reported resident memory, GB.

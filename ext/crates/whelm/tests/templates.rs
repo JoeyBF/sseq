@@ -1,12 +1,12 @@
 //! Passthrough jobs, work updates, templates and substitution, and the avoid/class constraints.
 
-use std::{collections::BTreeMap, sync::Arc};
+use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
 use proptest::prelude::*;
 use whelm::{
     Config, Constraint, DagConfig, DagError, DagJob, DagScheduler, DagTemplate, Input, JobId,
-    JobSpec, NodeSource, Output, Policy, Resources, Scheduler, TemplateNode, TemplateSpec, Unit,
-    WorkerId, WorkerState,
+    JobSpec, NodeSource, Output, Policy, Resources, Scheduler, TemplateNode, TemplateSpec, Time,
+    Unit, WorkerId, WorkerState,
 };
 
 /// A DAG layer over one worker with many slots.
@@ -18,17 +18,17 @@ fn dag(config: DagConfig) -> DagScheduler<Scheduler> {
         budget: Resources::mem(1000),
         ..Default::default()
     };
-    d.handle(Input::Worker(w), 0.0);
+    d.handle(Input::Worker(w), Time::ZERO);
     d
 }
 
 /// Report the first attempt of `job` done.
-fn complete(p: &mut impl Policy, job: JobId, now: f64) {
+fn complete(p: &mut impl Policy, job: JobId, now: Time) {
     p.handle(Input::Done { job, attempt: 1 }, now);
 }
 
 /// The first attempts a poll started, as `(job, worker)`.
-fn starts(p: &mut impl Policy, now: f64) -> Vec<(JobId, WorkerId)> {
+fn starts(p: &mut impl Policy, now: Time) -> Vec<(JobId, WorkerId)> {
     p.poll(now)
         .into_iter()
         .map(|o| match o {
@@ -56,7 +56,7 @@ fn job(id: JobId, deps: &[JobId]) -> DagJob {
 }
 
 /// A unit job in group 0 with a work estimate.
-fn worked(id: JobId, deps: &[JobId], work: f64) -> DagJob {
+fn worked(id: JobId, deps: &[JobId], work: Duration) -> DagJob {
     DagJob {
         work_estimate: Some(work),
         ..job(id, deps)
@@ -64,7 +64,7 @@ fn worked(id: JobId, deps: &[JobId], work: f64) -> DagJob {
 }
 
 /// A passthrough in group 0 worth `work` in ranks.
-fn passthrough(id: JobId, deps: &[JobId], work: f64) -> DagJob {
+fn passthrough(id: JobId, deps: &[JobId], work: Duration) -> DagJob {
     DagJob {
         spec: JobSpec {
             id,
@@ -88,7 +88,7 @@ fn template_of(
 }
 
 /// The ids started by a poll, sorted.
-fn placed(d: &mut DagScheduler<Scheduler>, now: f64) -> Vec<JobId> {
+fn placed(d: &mut DagScheduler<Scheduler>, now: Time) -> Vec<JobId> {
     let mut v: Vec<JobId> = starts(d, now).into_iter().map(|p| p.0).collect();
     v.sort_unstable();
     v
@@ -103,23 +103,30 @@ fn passthrough_jobs_complete_by_themselves() {
     });
     // 1 -> done(2) -> 3: the passthrough never reaches the policy.
     d.declare(
-        vec![job(1, &[]), passthrough(2, &[1], 5.0), job(3, &[2])],
-        0.0,
+        vec![
+            job(1, &[]),
+            passthrough(2, &[1], Duration::from_secs(5)),
+            job(3, &[2]),
+        ],
+        Time::ZERO,
     )
     .unwrap();
-    assert_eq!(placed(&mut d, 0.0), vec![1]);
+    assert_eq!(placed(&mut d, Time::ZERO), vec![1]);
     assert_eq!(
         d.rank(1),
-        Some(7.0),
+        Some(Duration::from_secs(7)),
         "the passthrough's work counts in ranks"
     );
-    complete(&mut d, 1, 1.0);
+    complete(&mut d, 1, Time::from_secs(1));
     let start = Output::Start {
         job: 3,
         attempt: 1,
         worker: 0,
     };
-    assert_eq!(d.poll(1.0), vec![Output::Passed { job: 2 }, start]);
+    assert_eq!(
+        d.poll(Time::from_secs(1)),
+        vec![Output::Passed { job: 2 }, start]
+    );
     assert_eq!(d.stats().placements_total, 2);
 }
 
@@ -127,9 +134,9 @@ fn passthrough_jobs_complete_by_themselves() {
 struct SkipOne;
 
 impl NodeSource for SkipOne {
-    /// `leaf + 1`.
-    fn work(&self, _unit: JobId, leaf: u32) -> f64 {
-        f64::from(leaf) + 1.0
+    /// `leaf + 1` seconds.
+    fn work(&self, _unit: JobId, leaf: u32) -> Duration {
+        Duration::from_secs(u64::from(leaf) + 1)
     }
 
     /// Leaf 1 of unit 10 only.
@@ -149,9 +156,9 @@ fn a_source_makes_a_leaf_a_passthrough_in_one_unit() {
     .with_source(Arc::new(SkipOne));
     // A chain: job, local job, job.
     let nodes = vec![
-        TemplateNode::Job(1.0),
-        TemplateNode::Local(1.0),
-        TemplateNode::Job(1.0),
+        TemplateNode::Job(Duration::from_secs(1)),
+        TemplateNode::Local(Duration::from_secs(1)),
+        TemplateNode::Job(Duration::from_secs(1)),
     ];
     let t = TemplateSpec {
         nodes,
@@ -169,14 +176,16 @@ fn a_source_makes_a_leaf_a_passthrough_in_one_unit() {
         sourced: true,
         ..Default::default()
     };
-    d.declare([unit(10, 100), unit(20, 200)], 0.0).unwrap();
-    assert_eq!(d.rank(100), Some(1.0 + 3.0), "the no-op weighs nothing");
-    assert_eq!(d.rank(200), Some(1.0 + 2.0 + 3.0));
-    assert_eq!(placed(&mut d, 0.0), vec![100, 200]);
-    complete(&mut d, 100, 1.0);
-    complete(&mut d, 200, 1.0);
+    d.declare([unit(10, 100), unit(20, 200)], Time::ZERO)
+        .unwrap();
+    let secs = Duration::from_secs;
+    assert_eq!(d.rank(100), Some(secs(1 + 3)), "the no-op weighs nothing");
+    assert_eq!(d.rank(200), Some(secs(1 + 2 + 3)));
+    assert_eq!(placed(&mut d, Time::ZERO), vec![100, 200]);
+    complete(&mut d, 100, Time::from_secs(1));
+    complete(&mut d, 200, Time::from_secs(1));
     assert_eq!(
-        d.poll(1.0),
+        d.poll(Time::from_secs(1)),
         vec![
             Output::Passed { job: 101 },
             Output::RunLocal { job: 201 },
@@ -195,12 +204,12 @@ fn long_passthrough_chains_do_not_recurse() {
     let mut d = dag(DagConfig::default());
     const N: u64 = 200_000;
     let mut jobs = vec![job(0, &[])];
-    jobs.extend((1..N).map(|i| passthrough(i, &[i - 1], 0.0)));
+    jobs.extend((1..N).map(|i| passthrough(i, &[i - 1], Duration::ZERO)));
     jobs.push(job(N, &[N - 1]));
-    d.declare(jobs, 0.0).unwrap();
-    assert_eq!(placed(&mut d, 0.0), vec![0]);
-    complete(&mut d, 0, 1.0);
-    assert_eq!(placed(&mut d, 1.0), vec![N]);
+    d.declare(jobs, Time::ZERO).unwrap();
+    assert_eq!(placed(&mut d, Time::ZERO), vec![0]);
+    complete(&mut d, 0, Time::from_secs(1));
+    assert_eq!(placed(&mut d, Time::from_secs(1)), vec![N]);
     assert_eq!(d.dag_stats().pending, 0);
 }
 
@@ -208,9 +217,12 @@ fn long_passthrough_chains_do_not_recurse() {
 #[test]
 fn a_ready_passthrough_completes_at_declaration() {
     let mut d = dag(DagConfig::default());
-    d.declare(vec![passthrough(1, &[], 0.0), job(2, &[1])], 0.0)
-        .unwrap();
-    assert_eq!(placed(&mut d, 0.0), vec![2]);
+    d.declare(
+        vec![passthrough(1, &[], Duration::ZERO), job(2, &[1])],
+        Time::ZERO,
+    )
+    .unwrap();
+    assert_eq!(placed(&mut d, Time::ZERO), vec![2]);
 }
 
 /// Lowering and raising work moves ranks both ways, switching the critical path.
@@ -223,23 +235,23 @@ fn update_work_raises_and_lowers_ranks() {
     // 1 -> 2 -> 4 and 1 -> 3 -> 4.
     d.declare(
         vec![
-            worked(1, &[], 1.0),
-            worked(2, &[1], 10.0),
-            worked(3, &[1], 2.0),
-            worked(4, &[2, 3], 1.0),
+            worked(1, &[], Duration::from_secs(1)),
+            worked(2, &[1], Duration::from_secs(10)),
+            worked(3, &[1], Duration::from_secs(2)),
+            worked(4, &[2, 3], Duration::from_secs(1)),
         ],
-        0.0,
+        Time::ZERO,
     )
     .unwrap();
-    assert_eq!(d.rank(1), Some(12.0));
+    assert_eq!(d.rank(1), Some(Duration::from_secs(12)));
     assert!(d.update_work(2, 0.5));
     assert_eq!(
         d.rank(1),
-        Some(4.0),
+        Some(Duration::from_secs(4)),
         "the other branch is now the critical path"
     );
     assert!(d.update_work(3, 20.0));
-    assert_eq!(d.rank(1), Some(22.0));
+    assert_eq!(d.rank(1), Some(Duration::from_secs(22)));
     assert!(!d.update_work(99, 1.0));
 }
 
@@ -255,7 +267,10 @@ fn template_basics() {
     assert_eq!(t.edge_count(), 4);
     assert_eq!(t.sources().collect::<Vec<_>>(), vec![0]);
     assert_eq!(t.sinks().collect::<Vec<_>>(), vec![3]);
-    assert_eq!(t.critical_path(|i| [1.0, 5.0, 2.0, 1.0][i]), 7.0);
+    assert_eq!(
+        t.critical_path(|i| Duration::from_secs([1, 5, 2, 1][i])),
+        Duration::from_secs(7)
+    );
 }
 
 /// Critical nodes are exactly those on a longest chain.
@@ -263,7 +278,7 @@ fn template_basics() {
 fn critical_nodes_lie_on_the_longest_chain() {
     // 0 -> 1 -> 3 (1 + 5 + 1) and 0 -> 2 -> 3 (1 + 2 + 1); 4 is isolated (3).
     let t = template_of(5, [(0, 1), (0, 2), (1, 3), (2, 3)]).unwrap();
-    let w = [1.0, 5.0, 2.0, 1.0, 3.0];
+    let w = [1, 5, 2, 1, 3].map(Duration::from_secs);
     assert_eq!(
         t.critical_nodes(|i| w[i], 1e-9),
         vec![true, true, false, true, false]
@@ -281,10 +296,10 @@ fn units_of_a_template() {
     // A diamond whose node 2 is a passthrough, twice; unit 2 waits for unit 1.
     let t = TemplateSpec {
         nodes: vec![
-            TemplateNode::Job(1.0),
-            TemplateNode::Job(1.0),
-            TemplateNode::Pass(0.0),
-            TemplateNode::Job(1.0),
+            TemplateNode::Job(Duration::from_secs(1)),
+            TemplateNode::Job(Duration::from_secs(1)),
+            TemplateNode::Pass(Duration::ZERO),
+            TemplateNode::Job(Duration::from_secs(1)),
         ],
         edges: vec![(0, 1), (0, 2), (1, 3), (2, 3)],
     };
@@ -304,14 +319,14 @@ fn units_of_a_template() {
             },
             ..Default::default()
         };
-        d.declare([unit], 0.0).unwrap();
+        d.declare([unit], Time::ZERO).unwrap();
     }
     let mut order = Vec::new();
     for step in 0..10 {
-        let now = step as f64;
+        let now = Time::from_secs(step);
         let out = placed(&mut d, now);
         for &j in &out {
-            complete(&mut d, j, now + 0.5);
+            complete(&mut d, j, now + Duration::from_millis(500));
         }
         order.push(out);
     }
@@ -325,16 +340,19 @@ fn units_of_a_template() {
 fn substituted_units() {
     // inner: 0 -> 1 (work 2, 3); outer: job 0 -> inner -> job 2, and an isolated job 3.
     let inner = TemplateSpec {
-        nodes: vec![TemplateNode::Job(2.0), TemplateNode::Job(3.0)],
+        nodes: vec![
+            TemplateNode::Job(Duration::from_secs(2)),
+            TemplateNode::Job(Duration::from_secs(3)),
+        ],
         edges: vec![(0, 1)],
     };
     let inner = Arc::new(inner.build().unwrap());
     let outer = TemplateSpec {
         nodes: vec![
-            TemplateNode::Job(1.0),
+            TemplateNode::Job(Duration::from_secs(1)),
             TemplateNode::Unit(inner.clone()),
-            TemplateNode::Job(4.0),
-            TemplateNode::Job(1.0),
+            TemplateNode::Job(Duration::from_secs(4)),
+            TemplateNode::Job(Duration::from_secs(1)),
         ],
         edges: vec![(0, 1), (1, 2)],
     };
@@ -344,8 +362,8 @@ fn substituted_units() {
         (0..4).map(|i| outer.leaf_offset(i)).collect::<Vec<_>>(),
         vec![0, 1, 3, 4]
     );
-    assert_eq!(inner.span(), 5.0);
-    assert_eq!(outer.span(), 10.0);
+    assert_eq!(inner.span(), Duration::from_secs(5));
+    assert_eq!(outer.span(), Duration::from_secs(10));
     let mut d = dag(DagConfig {
         rank_epsilon: 0.0,
         ..DagConfig::default()
@@ -361,26 +379,30 @@ fn substituted_units() {
         scale: Some(2.0),
         ..Default::default()
     };
-    d.declare([unit, worked(2, &[1], 7.0).into()], 0.0).unwrap();
+    d.declare(
+        [unit, worked(2, &[1], Duration::from_secs(7)).into()],
+        Time::ZERO,
+    )
+    .unwrap();
     // Leaf 12 (inner node 1): 2 * (3 + 4) + 7.
-    assert_eq!(d.rank(12), Some(21.0));
-    assert_eq!(d.rank(1), Some(27.0));
-    assert_eq!(placed(&mut d, 0.0), vec![10, 14]);
+    assert_eq!(d.rank(12), Some(Duration::from_secs(21)));
+    assert_eq!(d.rank(1), Some(Duration::from_secs(27)));
+    assert_eq!(placed(&mut d, Time::ZERO), vec![10, 14]);
     assert!(
         d.explain(11).unwrap().contains("to be entered"),
         "{:?}",
         d.explain(11)
     );
-    complete(&mut d, 10, 1.0);
-    assert_eq!(placed(&mut d, 1.0), vec![11]);
+    complete(&mut d, 10, Time::from_secs(1));
+    assert_eq!(placed(&mut d, Time::from_secs(1)), vec![11]);
     assert_eq!(d.dag_stats().frames, 2);
-    complete(&mut d, 11, 2.0);
-    assert_eq!(placed(&mut d, 2.0), vec![12]);
-    complete(&mut d, 12, 3.0);
-    assert_eq!(placed(&mut d, 3.0), vec![13]);
-    complete(&mut d, 13, 4.0);
-    complete(&mut d, 14, 4.0);
-    assert_eq!(placed(&mut d, 4.0), vec![2]);
+    complete(&mut d, 11, Time::from_secs(2));
+    assert_eq!(placed(&mut d, Time::from_secs(2)), vec![12]);
+    complete(&mut d, 12, Time::from_secs(3));
+    assert_eq!(placed(&mut d, Time::from_secs(3)), vec![13]);
+    complete(&mut d, 13, Time::from_secs(4));
+    complete(&mut d, 14, Time::from_secs(4));
+    assert_eq!(placed(&mut d, Time::from_secs(4)), vec![2]);
     assert_eq!(d.dag_stats().frames, 1, "only job 2's");
 }
 
@@ -398,8 +420,8 @@ fn forbid_and_class_are_hard_constraints() {
         };
         p.handle(Input::Worker(w), now);
     };
-    join(&mut p, 1, "h200", 4, 0.0);
-    join(&mut p, 2, "l40s", 4, 0.0);
+    join(&mut p, 1, "h200", 4, Time::ZERO);
+    join(&mut p, 2, "l40s", 4, Time::ZERO);
     let spec = |id, constraints| JobSpec {
         id,
         demand: Resources::mem(1),
@@ -410,38 +432,39 @@ fn forbid_and_class_are_hard_constraints() {
         1,
         vec![Constraint::forbid_worker(1), Constraint::prefer_worker(1)],
     );
-    p.handle(Input::Submit(retry), 0.0);
+    p.handle(Input::Submit(retry), Time::ZERO);
     let pinned = spec(2, vec![Constraint::require_class("h200")]);
-    p.handle(Input::Submit(pinned), 0.0);
-    assert_eq!(starts(&mut p, 0.0), vec![(1, 2), (2, 1)]);
+    p.handle(Input::Submit(pinned), Time::ZERO);
+    assert_eq!(starts(&mut p, Time::ZERO), vec![(1, 2), (2, 1)]);
     // A job excluded everywhere waits, and says why.
     let nowhere = spec(3, vec![Constraint::require_class("v100")]);
-    p.handle(Input::Submit(nowhere), 1.0);
-    assert!(starts(&mut p, 1.0).is_empty());
+    p.handle(Input::Submit(nowhere), Time::from_secs(1));
+    assert!(starts(&mut p, Time::from_secs(1)).is_empty());
     assert!(p.explain(3).unwrap().contains("2 worker(s) excluded"));
-    join(&mut p, 3, "v100", 1, 2.0);
-    assert_eq!(starts(&mut p, 2.0), vec![(3, 3)]);
+    join(&mut p, 3, "v100", 1, Time::from_secs(2));
+    assert_eq!(starts(&mut p, Time::from_secs(2)), vec![(3, 3)]);
 }
 
 /// The exact longest path below each job, by brute force.
 fn exact_ranks(
-    work: &BTreeMap<JobId, f64>,
+    work: &BTreeMap<JobId, Duration>,
     deps: &BTreeMap<JobId, Vec<JobId>>,
-) -> BTreeMap<JobId, f64> {
+) -> BTreeMap<JobId, Duration> {
     /// Memoised longest path below `j`.
     fn go(
         j: JobId,
-        work: &BTreeMap<JobId, f64>,
+        work: &BTreeMap<JobId, Duration>,
         kids: &BTreeMap<JobId, Vec<JobId>>,
-        memo: &mut BTreeMap<JobId, f64>,
-    ) -> f64 {
+        memo: &mut BTreeMap<JobId, Duration>,
+    ) -> Duration {
         if let Some(&r) = memo.get(&j) {
             return r;
         }
-        let below = kids.get(&j).map_or(0.0, |k| {
+        let below = kids.get(&j).map_or(Duration::ZERO, |k| {
             k.iter()
                 .map(|&c| go(c, work, kids, memo))
-                .fold(0.0, f64::max)
+                .max()
+                .unwrap_or_default()
         });
         let r = work[&j] + below;
         memo.insert(j, r);
@@ -468,8 +491,8 @@ proptest! {
     fn ranks_stay_exact(
         n in 1usize..30,
         edges in prop::collection::vec((0usize..30, 0usize..30), 0..80),
-        works in prop::collection::vec(0.0f64..10.0, 30),
-        updates in prop::collection::vec((0usize..30, 0.0f64..20.0), 0..20),
+        works in prop::collection::vec(0u64..10_000_000_000, 30),
+        updates in prop::collection::vec((0usize..30, 0u64..20_000_000_000), 0..20),
         batch in 1usize..6,
     ) {
         let mut deps: BTreeMap<JobId, Vec<JobId>> = (0..n as JobId).map(|i| (i, Vec::new())).collect();
@@ -479,7 +502,8 @@ proptest! {
                 deps.get_mut(&(b as JobId)).unwrap().push(a as JobId);
             }
         }
-        let mut work: BTreeMap<JobId, f64> = (0..n as JobId).map(|i| (i, works[i as usize])).collect();
+        let mut work: BTreeMap<JobId, Duration> =
+            (0..n as JobId).map(|i| (i, Duration::from_nanos(works[i as usize]))).collect();
         // No workers: nothing runs, so every job stays in the graph.
         let mut d = DagScheduler::new(
             DagConfig { rank_epsilon: 0.0, ..DagConfig::default() },
@@ -488,18 +512,23 @@ proptest! {
         let ids: Vec<JobId> = (0..n as JobId).rev().collect();
         for chunk in ids.chunks(batch) {
             let jobs: Vec<DagJob> = chunk.iter().map(|&i| worked(i, &deps[&i], work[&i])).collect();
-            d.declare(jobs, 0.0).unwrap();
+            d.declare(jobs, Time::ZERO).unwrap();
         }
         for (j, w) in updates {
             if j < n {
-                d.update_work(j as JobId, w);
+                let w = Duration::from_nanos(w);
+                d.update_work(j as JobId, w.as_secs_f64());
                 work.insert(j as JobId, w);
             }
         }
         let exact = exact_ranks(&work, &deps);
         for (&j, &r) in &exact {
             let got = d.rank(j).unwrap();
-            prop_assert!((got - r).abs() < 1e-9, "job {}: rank {} vs exact {}", j, got, r);
+            // Ranks are kept in f64 seconds, then rounded to the nanosecond.
+            prop_assert!(
+                got.abs_diff(r) <= Duration::from_nanos(1),
+                "job {}: rank {:?} vs exact {:?}", j, got, r
+            );
         }
     }
 }
@@ -528,14 +557,15 @@ proptest! {
     fn transitive_reduction_is_minimal_and_equivalent(
         n in 1usize..40,
         edges in prop::collection::vec((0u32..40, 0u32..40), 0..200),
-        works in prop::collection::vec(0.0f64..10.0, 40),
+        works in prop::collection::vec(0u64..10_000_000_000, 40),
     ) {
+        let works: Vec<Duration> = works.into_iter().map(Duration::from_nanos).collect();
         let edges: Vec<(u32, u32)> =
             edges.into_iter().filter(|&(a, b)| a < b && (b as usize) < n).collect();
         let t = template_of(n, edges).unwrap();
         let r = t.transitive_reduction();
         prop_assert_eq!(closure(&t), closure(&r));
-        prop_assert!((t.critical_path(|i| works[i]) - r.critical_path(|i| works[i])).abs() < 1e-9);
+        prop_assert_eq!(t.critical_path(|i| works[i]), r.critical_path(|i| works[i]));
         let reach = closure(&r);
         for a in 0..n {
             for &c in r.successors(a) {

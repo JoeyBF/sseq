@@ -12,7 +12,7 @@ use crate::{JobId, Policy};
 /// job 2 a pending unit with no materialised state. Declaring job 1 enters and submits it.
 ///
 /// ```
-/// use whelm::{Config, DagConfig, DagJob, DagScheduler, DagStats, JobSpec, Scheduler};
+/// use whelm::{Config, DagConfig, DagJob, DagScheduler, DagStats, JobSpec, Scheduler, Time};
 ///
 /// let mut dag = DagScheduler::new(DagConfig::default(), Scheduler::new(Config::fifo()));
 /// let job = |id, deps| DagJob {
@@ -23,14 +23,14 @@ use crate::{JobId, Policy};
 ///     deps,
 ///     ..Default::default()
 /// };
-/// dag.declare([job(2, vec![1])], 0.0).unwrap();
+/// dag.declare([job(2, vec![1])], Time::ZERO).unwrap();
 /// let s = dag.dag_stats();
 /// assert_eq!(
 ///     (s.units, s.undeclared, s.edges, s.pending, s.frames),
 ///     (1, 1, 1, 1, 0)
 /// );
 ///
-/// dag.declare([job(1, vec![])], 0.0).unwrap();
+/// dag.declare([job(1, vec![])], Time::ZERO).unwrap();
 /// let s = dag.dag_stats();
 /// assert_eq!(
 ///     (s.units, s.open, s.undeclared, s.pending, s.submitted),

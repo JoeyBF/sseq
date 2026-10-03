@@ -79,19 +79,19 @@
 //! only once the first completes.
 //!
 //! ```
-//! use std::sync::Arc;
+//! use std::{sync::Arc, time::Duration};
 //!
 //! use whelm::{
 //!     Config, DagConfig, DagScheduler, Input, Output, Policy, Scheduler, TemplateNode,
-//!     TemplateSpec, Unit, WorkerState,
+//!     TemplateSpec, Time, Unit, WorkerState,
 //! };
 //!
 //! // Node 0 loads (on the caller), nodes 1 and 2 compute after it.
 //! let template = TemplateSpec {
 //!     nodes: vec![
-//!         TemplateNode::Local(1.0),
-//!         TemplateNode::Job(2.0),
-//!         TemplateNode::Job(2.0),
+//!         TemplateNode::Local(Duration::from_secs(1)),
+//!         TemplateNode::Job(Duration::from_secs(2)),
+//!         TemplateNode::Job(Duration::from_secs(2)),
 //!     ],
 //!     edges: vec![(0, 1), (0, 2)],
 //! };
@@ -102,7 +102,7 @@
 //!         id: 1,
 //!         ..Default::default()
 //!     }),
-//!     0.0,
+//!     Time::ZERO,
 //! );
 //!
 //! // Unit 1000 has jobs 0..3, unit 2000 jobs 10..13 and waits for unit 1000.
@@ -119,28 +119,31 @@
 //!     deps: vec![1000],
 //!     ..Default::default()
 //! };
-//! dag.declare([first, second], 0.0).unwrap();
+//! dag.declare([first, second], Time::ZERO).unwrap();
 //! // Ranks run through both units: 1 + 2 in each.
 //! assert_eq!(
-//!     (dag.rank(0), dag.rank(1), dag.rank(10)),
-//!     (Some(6.0), Some(5.0), Some(3.0))
+//!     [0, 1, 10].map(|j| dag.rank(j)),
+//!     [6, 5, 3].map(|s| Some(Duration::from_secs(s)))
 //! );
 //! let stats = dag.dag_stats();
 //! assert_eq!((stats.units, stats.open, stats.frames), (2, 1, 1));
 //!
-//! assert_eq!(dag.poll(0.0), vec![Output::RunLocal { job: 0 }]);
-//! dag.handle(Input::Done { job: 0, attempt: 0 }, 1.0);
+//! assert_eq!(dag.poll(Time::ZERO), vec![Output::RunLocal { job: 0 }]);
+//! dag.handle(Input::Done { job: 0, attempt: 0 }, Time::from_secs(1));
 //! let start = |job| Output::Start {
 //!     job,
 //!     attempt: 1,
 //!     worker: 1,
 //! };
-//! assert_eq!(dag.poll(1.0), vec![start(1)]);
-//! dag.handle(Input::Done { job: 1, attempt: 1 }, 3.0);
-//! assert_eq!(dag.poll(3.0), vec![start(2)]);
+//! assert_eq!(dag.poll(Time::from_secs(1)), vec![start(1)]);
+//! dag.handle(Input::Done { job: 1, attempt: 1 }, Time::from_secs(3));
+//! assert_eq!(dag.poll(Time::from_secs(3)), vec![start(2)]);
 //! // The last job of unit 1000 completes it, which enters unit 2000.
-//! dag.handle(Input::Done { job: 2, attempt: 1 }, 5.0);
-//! assert_eq!(dag.poll(5.0), vec![Output::RunLocal { job: 10 }]);
+//! dag.handle(Input::Done { job: 2, attempt: 1 }, Time::from_secs(5));
+//! assert_eq!(
+//!     dag.poll(Time::from_secs(5)),
+//!     vec![Output::RunLocal { job: 10 }]
+//! );
 //! let stats = dag.dag_stats();
 //! assert_eq!((stats.units, stats.open, stats.frames), (1, 1, 1));
 //! ```
@@ -150,7 +153,7 @@ use std::{
     sync::Arc,
 };
 
-use crate::{Attempt, Input, Instant, JobId, JobSpec, Output, Policy, PolicyStats, WorkerId};
+use crate::{Attempt, Input, JobId, JobSpec, Output, Policy, PolicyStats, Time, WorkerId};
 
 mod config;
 mod declare;
@@ -314,7 +317,7 @@ impl Loc {
 /// ```
 /// use whelm::{
 ///     Config, DagConfig, DagJob, DagScheduler, FailKind, GaveUp, Input, JobSpec, Output, Policy,
-///     RetryConfig, Scheduler, WorkerState,
+///     RetryConfig, Scheduler, Time, WorkerState,
 /// };
 ///
 /// let config = Config {
@@ -327,7 +330,7 @@ impl Loc {
 ///         id: 1,
 ///         ..Default::default()
 ///     }),
-///     0.0,
+///     Time::ZERO,
 /// );
 /// let job = |id, deps| DagJob {
 ///     spec: JobSpec {
@@ -337,9 +340,10 @@ impl Loc {
 ///     deps,
 ///     ..Default::default()
 /// };
-/// dag.declare([job(1, vec![]), job(2, vec![1])], 0.0).unwrap();
+/// dag.declare([job(1, vec![]), job(2, vec![1])], Time::ZERO)
+///     .unwrap();
 /// assert_eq!(
-///     dag.poll(0.0),
+///     dag.poll(Time::ZERO),
 ///     vec![Output::Start {
 ///         job: 1,
 ///         attempt: 1,
@@ -355,27 +359,27 @@ impl Loc {
 ///         kind: FailKind::Other,
 ///         why,
 ///     },
-///     1.0,
+///     Time::from_secs(1),
 /// );
-/// let out = dag.poll(1.0);
+/// let out = dag.poll(Time::from_secs(1));
 /// assert!(matches!(out[..], [Output::GaveUp(GaveUp { job: 1, .. })]));
 /// assert_eq!(
 ///     dag.explain(1).unwrap(),
 ///     "job 1 is ready and held until release"
 /// );
 ///
-/// assert!(dag.release(1, 2.0));
+/// assert!(dag.release(1, Time::from_secs(2)));
 /// assert_eq!(
-///     dag.poll(2.0),
+///     dag.poll(Time::from_secs(2)),
 ///     vec![Output::Start {
 ///         job: 1,
 ///         attempt: 1,
 ///         worker: 1
 ///     }]
 /// );
-/// dag.handle(Input::Done { job: 1, attempt: 1 }, 3.0);
+/// dag.handle(Input::Done { job: 1, attempt: 1 }, Time::from_secs(3));
 /// assert_eq!(
-///     dag.poll(3.0),
+///     dag.poll(Time::from_secs(3)),
 ///     vec![Output::Start {
 ///         job: 2,
 ///         attempt: 1,
@@ -410,7 +414,7 @@ pub struct DagScheduler<P> {
     /// Stops the inner policy emits for attempts the caller has already reported (an ignored
     /// job's failure, turned into a cancellation): not passed on.
     quiet: HashSet<(JobId, Attempt)>,
-    now: Instant,
+    now: Time,
 }
 
 impl<P: Policy> DagScheduler<P> {
@@ -420,23 +424,25 @@ impl<P: Policy> DagScheduler<P> {
     /// inner policy.
     ///
     /// ```
-    /// # use whelm::{Config, DagConfig, DagScheduler, Input, JobSpec, Output, Policy,
-    /// #     Scheduler, WorkerState};
+    /// # use whelm::{
+    /// #     Config, DagConfig, DagScheduler, Input, JobSpec, Output, Policy, Scheduler, Time,
+    /// #     WorkerState,
+    /// # };
     /// let mut dag = DagScheduler::new(DagConfig::default(), Scheduler::new(Config::fifo()));
     /// dag.handle(
     ///     Input::Worker(WorkerState {
     ///         id: 1,
     ///         ..Default::default()
     ///     }),
-    ///     0.0,
+    ///     Time::ZERO,
     /// );
     /// let job = JobSpec {
     ///     id: 7,
     ///     ..Default::default()
     /// };
-    /// dag.handle(Input::Submit(job), 0.0);
+    /// dag.handle(Input::Submit(job), Time::ZERO);
     /// assert_eq!(
-    ///     dag.poll(0.0),
+    ///     dag.poll(Time::ZERO),
     ///     vec![Output::Start {
     ///         job: 7,
     ///         attempt: 1,
@@ -463,7 +469,7 @@ impl<P: Policy> DagScheduler<P> {
             live: HashMap::new(),
             ignored: HashSet::new(),
             quiet: HashSet::new(),
-            now: 0.0,
+            now: Time::ZERO,
         }
     }
 
@@ -481,16 +487,19 @@ impl<P: Policy> DagScheduler<P> {
     /// job 1.
     ///
     /// ```
-    /// # use whelm::{Config, DagConfig, DagJob, DagScheduler, Input, JobSpec, Output, Policy,
-    /// #     Scheduler, WorkerState};
+    /// # use whelm::{
+    /// #     Config, DagConfig, DagJob, DagScheduler, Input, JobSpec, Output, Policy, Scheduler,
+    /// #     Time, WorkerState,
+    /// # };
     /// # let mut dag = DagScheduler::new(DagConfig::default(), Scheduler::new(Config::fifo()));
-    /// # dag.handle(Input::Worker(WorkerState { id: 1, ..Default::default() }), 0.0);
+    /// # dag.handle(Input::Worker(WorkerState { id: 1, ..Default::default() }), Time::ZERO);
     /// # let job = |id, deps| DagJob {
     /// #     spec: JobSpec { id, ..Default::default() },
     /// #     deps,
     /// #     ..Default::default()
     /// # };
-    /// dag.declare([job(1, vec![]), job(2, vec![1])], 0.0).unwrap();
+    /// dag.declare([job(1, vec![]), job(2, vec![1])], Time::ZERO)
+    ///     .unwrap();
     /// assert_eq!(dag.policy().stats().waiting, 1);
     /// ```
     pub fn policy(&self) -> &P {
@@ -578,7 +587,7 @@ impl<P: Policy> Policy for DagScheduler<P> {
     /// Forwarded to the inner policy, with this layer's bookkeeping: a done attempt completes its
     /// job here (attempt 0 completes a local job, which the inner policy never sees), and a
     /// cancellation cascades to the job's dependents ([`DagScheduler::cancel`]).
-    fn handle(&mut self, input: Input, now: Instant) {
+    fn handle(&mut self, input: Input, now: Time) {
         self.now = now;
         match input {
             Input::Done { job, attempt } => self.done(job, attempt, now),
@@ -597,7 +606,7 @@ impl<P: Policy> Policy for DagScheduler<P> {
     }
 
     /// This layer's announcements not yet drained, then the inner policy's outputs.
-    fn poll(&mut self, now: Instant) -> Vec<Output> {
+    fn poll(&mut self, now: Time) -> Vec<Output> {
         self.now = now;
         let inner = self.policy.poll(now);
         let mut out = std::mem::take(&mut self.outbox);
@@ -626,7 +635,7 @@ impl<P: Policy> Policy for DagScheduler<P> {
     }
 
     /// Forwarded to the inner policy.
-    fn next_wakeup(&self) -> Option<Instant> {
+    fn next_wakeup(&self) -> Option<Time> {
         self.policy.next_wakeup()
     }
 

@@ -3,12 +3,13 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::Arc,
+    time::Duration,
 };
 
 use proptest::prelude::*;
 use whelm::{
     Config, DagConfig, DagJob, DagScheduler, DagTemplate, Input, JobId, JobSpec, NodeSource,
-    Output, Policy, Scheduler, TemplateNode, TemplateSpec, Unit, WorkerState,
+    Output, Policy, Scheduler, TemplateNode, TemplateSpec, Time, Unit, WorkerState,
 };
 
 /// A small deterministic generator (splitmix64).
@@ -40,9 +41,9 @@ impl Rng {
 struct Works;
 
 impl NodeSource for Works {
-    /// Between 0 and 2.
-    fn work(&self, unit: JobId, leaf: u32) -> f64 {
-        ((unit * 31 + u64::from(leaf) * 7) % 5) as f64 * 0.5
+    /// Between 0 and 2 seconds.
+    fn work(&self, unit: JobId, leaf: u32) -> Duration {
+        Duration::from_millis((unit * 31 + u64::from(leaf) * 7) % 5 * 500)
     }
 
     /// About one leaf in four, differing between units of a template.
@@ -79,7 +80,7 @@ impl UnitDecl {
                     ..Default::default()
                 },
                 deps: self.deps.clone(),
-                work_estimate: Some(self.scale),
+                work_estimate: Some(Duration::from_secs_f64(self.scale)),
                 passthrough: matches!(node, TemplateNode::Pass(_)),
                 local: matches!(node, TemplateNode::Local(_)),
             };
@@ -97,14 +98,13 @@ impl UnitDecl {
         }
     }
 
-    /// Leaf `leaf`'s work.
-    fn work(&self, leaf: u32, own: f64) -> f64 {
-        self.scale
-            * if self.sourced {
-                Works.work(self.id, leaf)
-            } else {
-                own
-            }
+    /// Leaf `leaf`'s work, seconds.
+    fn work(&self, leaf: u32, own: Duration) -> f64 {
+        let own = match self.sourced {
+            true => Works.work(self.id, leaf),
+            false => own,
+        };
+        self.scale * own.as_secs_f64()
     }
 
     /// Whether the source makes leaf `leaf` a passthrough.
@@ -115,7 +115,7 @@ impl UnitDecl {
 
 /// A random leaf.
 fn leaf(rng: &mut Rng) -> TemplateNode {
-    let work = rng.below(4) as f64;
+    let work = Duration::from_secs(rng.below(4) as u64);
     match rng.below(8) {
         0 => TemplateNode::Pass(work),
         1 => TemplateNode::Local(work),
@@ -163,9 +163,9 @@ fn world(rng: &mut Rng) -> Vec<UnitDecl> {
         let u = if rng.chance(0.3) {
             // A plain job's work is its scale.
             let node = match leaf(rng) {
-                TemplateNode::Local(_) => TemplateNode::Local(1.0),
-                TemplateNode::Pass(_) => TemplateNode::Pass(1.0),
-                _ => TemplateNode::Job(1.0),
+                TemplateNode::Local(_) => TemplateNode::Local(Duration::from_secs(1)),
+                TemplateNode::Pass(_) => TemplateNode::Pass(Duration::from_secs(1)),
+                _ => TemplateNode::Job(Duration::from_secs(1)),
             };
             let spec = TemplateSpec {
                 nodes: vec![node],
@@ -462,12 +462,12 @@ fn scheduler(eps: f64) -> DagScheduler<Scheduler> {
     };
     let mut d =
         DagScheduler::new(config, Scheduler::new(Config::default())).with_source(Arc::new(Works));
-    join(&mut d, 0.0);
+    join(&mut d, Time::ZERO);
     d
 }
 
 /// The worker joins.
-fn join(d: &mut DagScheduler<Scheduler>, now: f64) {
+fn join(d: &mut DagScheduler<Scheduler>, now: Time) {
     d.handle(
         Input::Worker(WorkerState {
             class: "x".into(),
@@ -478,7 +478,7 @@ fn join(d: &mut DagScheduler<Scheduler>, now: f64) {
 }
 
 /// Run ready job `j` to completion; returns the outputs that follow.
-fn run(d: &mut DagScheduler<Scheduler>, j: Ann, now: f64) -> BTreeSet<Ann> {
+fn run(d: &mut DagScheduler<Scheduler>, j: Ann, now: Time) -> BTreeSet<Ann> {
     match j {
         Ann::Ready(job) => {
             assert!(d.release(job, now), "job {job} is not held");
@@ -531,11 +531,11 @@ proptest! {
         while at < order.len() {
             let batch = &order[at..(at + 1 + rng.below(3)).min(order.len())];
             at += batch.len();
-            d.declare(batch.iter().map(|&k| units[k].unit()), 0.0).unwrap();
+            d.declare(batch.iter().map(|&k| units[k].unit()), Time::ZERO).unwrap();
             for &k in batch {
                 r.declared[k] = true;
             }
-            let (got, want) = (set(d.poll(0.0)), r.advance());
+            let (got, want) = (set(d.poll(Time::ZERO)), r.advance());
             prop_assert_eq!(&got, &want, "after declaring {:?}", batch);
             ready.extend(got.into_iter().filter(|o| !matches!(o, Ann::Passed(_))));
         }
@@ -545,10 +545,10 @@ proptest! {
         let longest = r.ranks.iter().copied().fold(0.0, f64::max);
         let slack = ((1.0 + eps).powi(units.len() as i32) - 1.0) * longest + 1e-9;
         loop {
-            let t = steps as f64;
+            let t = Time::from_secs(steps as u64);
             // Materialised or not.
             for (&job, &v) in r.by_id.iter().filter(|&(_, &v)| !r.done[v]) {
-                let (got, want) = (d.rank(job).unwrap(), r.ranks[v]);
+                let (got, want) = (d.rank(job).unwrap().as_secs_f64(), r.ranks[v]);
                 prop_assert!(
                     got <= want + 1e-9 && got >= want - slack,
                     "job {}: rank {} vs {}", job, got, want

@@ -1,5 +1,7 @@
 //! The DAG layer's configuration and its errors.
 
+use std::time::Duration;
+
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
@@ -14,7 +16,9 @@ use crate::{DagJob, DagScheduler, JobSpec, Output, TemplateSpec};
 /// without an estimate.
 ///
 /// ```
-/// use whelm::{Config, DagConfig, DagJob, DagScheduler, JobSpec, Scheduler};
+/// use std::time::Duration;
+///
+/// use whelm::{Config, DagConfig, DagJob, DagScheduler, JobSpec, Scheduler, Time};
 ///
 /// let job = |id, deps| DagJob {
 ///     spec: JobSpec {
@@ -26,27 +30,33 @@ use crate::{DagJob, DagScheduler, JobSpec, Output, TemplateSpec};
 /// };
 /// let ranks = |config| {
 ///     let mut dag = DagScheduler::new(config, Scheduler::new(Config::fifo()));
-///     dag.declare([job(1, vec![]), job(2, vec![1])], 0.0).unwrap();
+///     dag.declare([job(1, vec![]), job(2, vec![1])], Time::ZERO)
+///         .unwrap();
 ///     (dag.rank(1), dag.rank(2))
 /// };
 /// let config = DagConfig {
-///     default_work: 2.0,
+///     default_work: Duration::from_secs(2),
 ///     ..DagConfig::default()
 /// };
-/// assert_eq!(ranks(config.clone()), (Some(4.0), Some(2.0)));
+/// let (two, four) = (Duration::from_secs(2), Duration::from_secs(4));
+/// assert_eq!(ranks(config.clone()), (Some(four), Some(two)));
 /// assert_eq!(
 ///     ranks(DagConfig {
 ///         track_ranks: false,
 ///         ..config
 ///     }),
-///     (Some(2.0), Some(2.0))
+///     (Some(two), Some(two))
 /// );
 /// ```
 #[derive(Clone, Debug, PartialEq)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct DagConfig {
-    /// Scale of a unit declared without one, i.e. the work of a [`DagJob`] without an estimate.
-    pub default_work: f64,
+    /// The work of a [`DagJob`] declared without an estimate.
+    ///
+    /// A [`Unit`](crate::Unit) declared without a scale takes this, in seconds, as its scale. A
+    /// plain job is a unit of a one-node template of one second of work, as are the nodes of
+    /// [`TemplateSpec::jobs`], so each such job gets `default_work`.
+    pub default_work: Duration,
     /// Ranks between units are maintained approximately: a rank increase smaller than this
     /// fraction is not propagated to the unit's dependencies. Larger makes growing the graph
     /// cheaper and ranks between units less exact; ranks within a unit are exact.
@@ -79,7 +89,7 @@ impl Default for DagConfig {
     /// jobs.
     fn default() -> Self {
         Self {
-            default_work: 1.0,
+            default_work: Duration::from_secs(1),
             rank_epsilon: 0.01,
             auto_submit: true,
             record_passthrough: false,
@@ -96,7 +106,8 @@ impl Default for DagConfig {
 /// use std::sync::Arc;
 ///
 /// use whelm::{
-///     Config, DagConfig, DagError, DagJob, DagScheduler, JobSpec, Scheduler, TemplateSpec, Unit,
+///     Config, DagConfig, DagError, DagJob, DagScheduler, JobSpec, Scheduler, TemplateSpec, Time,
+///     Unit,
 /// };
 ///
 /// let mut dag = DagScheduler::new(DagConfig::default(), Scheduler::new(Config::fifo()));
@@ -115,10 +126,13 @@ impl Default for DagConfig {
 ///     template: Arc::new(TemplateSpec::jobs(3).build().unwrap()),
 ///     ..Default::default()
 /// };
-/// dag.declare([unit], 0.0).unwrap();
+/// dag.declare([unit], Time::ZERO).unwrap();
 ///
 /// let cycle = [job(1, vec![2]), job(2, vec![1])];
-/// assert_eq!(dag.declare(cycle, 0.0), Err(DagError::Cycle { job: 1 }));
+/// assert_eq!(
+///     dag.declare(cycle, Time::ZERO),
+///     Err(DagError::Cycle { job: 1 })
+/// );
 /// assert_eq!(
 ///     TemplateSpec {
 ///         edges: vec![(0, 1), (1, 0)],
@@ -129,18 +143,18 @@ impl Default for DagConfig {
 ///     DagError::Cycle { job: 0 }
 /// );
 /// assert_eq!(
-///     dag.declare([job(99, vec![])], 0.0),
+///     dag.declare([job(99, vec![])], Time::ZERO),
 ///     Err(DagError::Duplicate(99))
 /// );
 /// assert_eq!(
-///     dag.declare([job(11, vec![])], 0.0),
+///     dag.declare([job(11, vec![])], Time::ZERO),
 ///     Err(DagError::Overlap(11))
 /// );
 /// assert_eq!(
-///     dag.declare([job(5, vec![11])], 0.0),
+///     dag.declare([job(5, vec![11])], Time::ZERO),
 ///     Err(DagError::Overlap(11))
 /// );
-/// assert_eq!(dag.close(42, 0.0), Err(DagError::NotFound(42)));
+/// assert_eq!(dag.close(42, Time::ZERO), Err(DagError::NotFound(42)));
 /// assert_eq!(
 ///     DagError::NotFound(42).to_string(),
 ///     "no live unit contains job 42"

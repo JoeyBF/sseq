@@ -1,7 +1,9 @@
 //! Upward ranks: each unit's critical path to the end of the graph.
 
+use std::time::Duration;
+
 use super::{DagScheduler, Loc, UnitState};
-use crate::{JobId, Policy};
+use crate::{JobId, Policy, time::secs};
 
 impl<P: Policy> DagScheduler<P> {
     /// Raise dependencies' ranks after `start`'s rank grew.
@@ -32,12 +34,17 @@ impl<P: Policy> DagScheduler<P> {
     /// A unit of two independent jobs of work 1 and 3, followed by a job of work 2:
     ///
     /// ```
-    /// # use std::sync::Arc;
-    /// # use whelm::{Config, DagConfig, DagJob, DagScheduler, JobSpec, Scheduler, TemplateNode,
-    /// #     TemplateSpec, Unit};
+    /// # use std::{sync::Arc, time::Duration};
+    /// # use whelm::{
+    /// #     Config, DagConfig, DagJob, DagScheduler, JobSpec, Scheduler, TemplateNode,
+    /// #     TemplateSpec, Time, Unit,
+    /// # };
     /// # let mut dag = DagScheduler::new(DagConfig::default(), Scheduler::new(Config::fifo()));
     /// let pair = TemplateSpec {
-    ///     nodes: vec![TemplateNode::Job(1.0), TemplateNode::Job(3.0)],
+    ///     nodes: vec![
+    ///         TemplateNode::Job(Duration::from_secs(1)),
+    ///         TemplateNode::Job(Duration::from_secs(3)),
+    ///     ],
     ///     ..Default::default()
     /// };
     /// let unit = Unit {
@@ -52,21 +59,22 @@ impl<P: Policy> DagScheduler<P> {
     ///         ..Default::default()
     ///     },
     ///     deps: vec![10],
-    ///     work_estimate: Some(2.0),
+    ///     work_estimate: Some(Duration::from_secs(2)),
     ///     ..Default::default()
     /// };
-    /// dag.declare([unit, after.into()], 0.0).unwrap();
+    /// dag.declare([unit, after.into()], Time::ZERO).unwrap();
     /// assert_eq!(
-    ///     (dag.rank(10), dag.rank(100), dag.rank(101)),
-    ///     (Some(5.0), Some(3.0), Some(5.0))
+    ///     [10, 100, 101, 20].map(|j| dag.rank(j)),
+    ///     [5, 3, 5, 2].map(|s| Some(Duration::from_secs(s)))
     /// );
-    /// assert_eq!((dag.rank(20), dag.rank(99)), (Some(2.0), None));
+    /// assert_eq!(dag.rank(99), None);
     /// ```
-    pub fn rank(&self, job: JobId) -> Option<f64> {
-        match self.locate(job)? {
-            Loc::Unit(u) => Some(self.unit(u).top()),
-            Loc::Leaf { unit, leaf } => Some(self.leaf_rank(unit, leaf)),
-        }
+    pub fn rank(&self, job: JobId) -> Option<Duration> {
+        let rank = match self.locate(job)? {
+            Loc::Unit(u) => self.unit(u).top(),
+            Loc::Leaf { unit, leaf } => self.leaf_rank(unit, leaf),
+        };
+        Some(secs(rank))
     }
 
     /// Change a unit's scale (a plain job's work, e.g. once its real size is known) and re-rank
@@ -76,21 +84,26 @@ impl<P: Policy> DagScheduler<P> {
     /// keep the rank they were submitted with.
     ///
     /// ```
-    /// # use whelm::{Config, DagConfig, DagJob, DagScheduler, Input, JobSpec, Output, Policy,
-    /// #     Scheduler, WorkerState};
+    /// # use std::time::Duration;
+    /// #
+    /// # use whelm::{
+    /// #     Config, DagConfig, DagJob, DagScheduler, Input, JobSpec, Output, Policy, Scheduler,
+    /// #     Time, WorkerState,
+    /// # };
     /// # let mut dag = DagScheduler::new(DagConfig::default(), Scheduler::new(Config::fifo()));
-    /// # dag.handle(Input::Worker(WorkerState { id: 1, ..Default::default() }), 0.0);
+    /// # dag.handle(Input::Worker(WorkerState { id: 1, ..Default::default() }), Time::ZERO);
     /// # let job = |id, deps| DagJob {
     /// #     spec: JobSpec { id, ..Default::default() },
     /// #     deps,
     /// #     ..Default::default()
     /// # };
-    /// dag.declare([job(1, vec![]), job(2, vec![1])], 0.0).unwrap();
-    /// assert_eq!(dag.rank(1), Some(2.0));
+    /// dag.declare([job(1, vec![]), job(2, vec![1])], Time::ZERO)
+    ///     .unwrap();
+    /// assert_eq!(dag.rank(1), Some(Duration::from_secs(2)));
     /// assert!(dag.update_work(2, 5.0));
-    /// assert_eq!(dag.rank(1), Some(6.0));
+    /// assert_eq!(dag.rank(1), Some(Duration::from_secs(6)));
     /// assert!(dag.update_work(2, 0.5));
-    /// assert_eq!(dag.rank(1), Some(1.5));
+    /// assert_eq!(dag.rank(1), Some(Duration::from_millis(1500)));
     /// assert!(!dag.update_work(3, 1.0));
     /// ```
     pub fn update_work(&mut self, job: JobId, scale: f64) -> bool {

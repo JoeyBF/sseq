@@ -1,6 +1,8 @@
 //! What a policy reports about its state.
 
-use crate::{DIMS, Instant, JobId, Resources, WorkerId};
+use std::time::Duration;
+
+use crate::{DIMS, JobId, Resources, Time, WorkerId};
 #[cfg(doc)]
 use crate::{Defer, Policy, Reservations, Timing, WorkerView};
 
@@ -16,7 +18,7 @@ use crate::{Defer, Policy, Reservations, Timing, WorkerView};
 ///
 /// ```
 /// use whelm::{
-///     Config, Input, JobSpec, Policy, ReservationInfo, Reservations, Resources, Scheduler,
+///     Config, Input, JobSpec, Policy, ReservationInfo, Reservations, Resources, Scheduler, Time,
 ///     WorkerState,
 /// };
 ///
@@ -29,7 +31,7 @@ use crate::{Defer, Policy, Reservations, Timing, WorkerView};
 ///         budget: Resources::mem_gb(10.0),
 ///         ..Default::default()
 ///     }),
-///     0.0,
+///     Time::ZERO,
 /// );
 /// p.handle(
 ///     Input::Submit(JobSpec {
@@ -37,7 +39,7 @@ use crate::{Defer, Policy, Reservations, Timing, WorkerView};
 ///         demand: Resources::mem_gb(6.0),
 ///         ..Default::default()
 ///     }),
-///     0.0,
+///     Time::ZERO,
 /// );
 /// p.handle(
 ///     Input::Submit(JobSpec {
@@ -45,10 +47,10 @@ use crate::{Defer, Policy, Reservations, Timing, WorkerView};
 ///         demand: Resources::mem_gb(6.0),
 ///         ..Default::default()
 ///     }),
-///     0.0,
+///     Time::ZERO,
 /// );
-/// p.poll(0.0);
-/// let t = Reservations::default().reserve_after;
+/// p.poll(Time::ZERO);
+/// let t = Time::ZERO + Reservations::default().reserve_after;
 /// p.poll(t);
 /// assert_eq!(
 ///     p.stats().reservations,
@@ -66,7 +68,7 @@ pub struct ReservationInfo {
     /// The reserved worker.
     pub worker: WorkerId,
     /// When the reservation was made.
-    pub since: Instant,
+    pub since: Time,
 }
 
 /// The library's view of one worker's load.
@@ -74,7 +76,7 @@ pub struct ReservationInfo {
 /// # Examples
 ///
 /// ```
-/// use whelm::{Config, Input, JobSpec, Policy, Resources, Scheduler, WorkerState};
+/// use whelm::{Config, Input, JobSpec, Policy, Resources, Scheduler, Time, WorkerState};
 ///
 /// let mut p = Scheduler::new(Config::default());
 /// p.handle(
@@ -85,7 +87,7 @@ pub struct ReservationInfo {
 ///         budget: Resources::mem_gb(10.0),
 ///         ..Default::default()
 ///     }),
-///     0.0,
+///     Time::ZERO,
 /// );
 /// p.handle(
 ///     Input::Submit(JobSpec {
@@ -93,9 +95,9 @@ pub struct ReservationInfo {
 ///         demand: Resources::mem_gb(3.0),
 ///         ..Default::default()
 ///     }),
-///     0.0,
+///     Time::ZERO,
 /// );
-/// p.poll(0.0);
+/// p.poll(Time::ZERO);
 /// let load = &p.stats().workers[0];
 /// assert_eq!((load.id, load.running, load.reserved_for), (1, 1, None));
 /// assert_eq!(load.headroom, [Some(7_000_000_000), None, Some(3)]);
@@ -127,7 +129,9 @@ pub struct WorkerLoad {
 /// # Examples
 ///
 /// ```
-/// use whelm::{Config, Input, JobSpec, Policy, Scheduler, WorkerState};
+/// use std::time::Duration;
+///
+/// use whelm::{Config, Input, JobSpec, Policy, Scheduler, Time, WorkerState};
 ///
 /// let mut p = Scheduler::new(Config::default());
 /// p.handle(
@@ -136,7 +140,7 @@ pub struct WorkerLoad {
 ///         class: "cpu".into(),
 ///         ..Default::default()
 ///     }),
-///     0.0,
+///     Time::ZERO,
 /// );
 /// for id in 1..=3 {
 ///     p.handle(
@@ -144,26 +148,29 @@ pub struct WorkerLoad {
 ///             id,
 ///             ..Default::default()
 ///         }),
-///         0.0,
+///         Time::ZERO,
 ///     );
 /// }
-/// p.poll(0.0);
-/// p.poll(25.0);
+/// p.poll(Time::ZERO);
+/// p.poll(Time::from_secs(25));
 /// let stats = p.stats();
-/// assert_eq!((stats.now, stats.waiting, stats.running), (25.0, 2, 1));
-/// assert_eq!(stats.longest_wait, Some((2, 25.0)));
+/// assert_eq!(
+///     (stats.now, stats.waiting, stats.running),
+///     (Time::from_secs(25), 2, 1)
+/// );
+/// assert_eq!(stats.longest_wait, Some((2, Duration::from_secs(25))));
 /// assert_eq!(stats.placements_total, 1);
 /// ```
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct PolicyStats {
     /// The latest `now` seen in any event.
-    pub now: Instant,
+    pub now: Time,
     /// Number of waiting jobs.
     pub waiting: usize,
     /// Number of running jobs (with at least one live attempt), each counted once.
     pub running: usize,
-    /// The waiting job that has waited longest, and for how long (seconds).
-    pub longest_wait: Option<(JobId, f64)>,
+    /// The waiting job that has waited longest, and for how long.
+    pub longest_wait: Option<(JobId, Duration)>,
     /// Current reservations.
     pub reservations: Vec<ReservationInfo>,
     /// Total attempts started since creation (retries and speculative attempts included).
@@ -179,7 +186,7 @@ pub struct PolicyStats {
     /// faster worker that was busy ([`Defer`]), and did not place afterwards: `(job, worker it
     /// waits for, expected start there)`. Less urgent jobs may have taken slower workers
     /// meanwhile.
-    pub deferred: Vec<(JobId, WorkerId, Instant)>,
+    pub deferred: Vec<(JobId, WorkerId, Time)>,
     /// Every job that deferred at some point of the last [`Policy::poll`]'s scan, including those
     /// placed later in it (after a released reservation restarted the scan): while deferring, a
     /// job leaves the slower workers it declined to less urgent jobs.

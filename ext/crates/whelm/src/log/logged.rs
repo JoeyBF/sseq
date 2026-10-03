@@ -1,16 +1,16 @@
 //! The recording wrapper, [`Logged`].
 
-use std::collections::HashMap;
+use std::{collections::HashMap, time::Duration};
 
 #[cfg(doc)]
 use super::replay;
 use super::{Event, EventSink, TaskInfo};
-use crate::{DEV, Input, Instant, JobId, MEM, Output, Policy, PolicyStats, WorkerId, WorkerState};
+use crate::{DEV, Input, JobId, MEM, Output, Policy, PolicyStats, Time, WorkerId, WorkerState};
 
 /// A [`Policy`] that records every input it handles and every poll's outputs to an
 /// [`EventSink`], so that [`replay`] can reproduce the run.
 ///
-/// Heartbeats are also summarised as samples at most every `sample_every` seconds per worker.
+/// Heartbeats are also summarised as samples at most every `sample_every` per worker.
 /// Under a [`DagScheduler`](crate::DagScheduler), wrap the inner policy
 /// (`DagScheduler<Logged<Scheduler>>`): the DAG's own operations are method calls, not inputs.
 ///
@@ -18,8 +18,8 @@ use crate::{DEV, Input, Instant, JobId, MEM, Output, Policy, PolicyStats, Worker
 pub struct Logged<P> {
     inner: P,
     sink: Box<dyn EventSink>,
-    sample_every: f64,
-    last_sample: HashMap<WorkerId, Instant>,
+    sample_every: Duration,
+    last_sample: HashMap<WorkerId, Time>,
     info: HashMap<JobId, TaskInfo>,
 }
 
@@ -28,13 +28,13 @@ fn gb(bytes: u64) -> f64 {
     bytes as f64 / 1e9
 }
 
-/// Seconds between heartbeat samples of one worker in a [`Logged`] log, unless set with
+/// The time between heartbeat samples of one worker in a [`Logged`] log, unless set with
 /// [`Logged::sample_every`]. Shorter gives the simulator a finer memory history and a larger log.
-pub const DEFAULT_SAMPLE_EVERY: f64 = 60.0;
+pub const DEFAULT_SAMPLE_EVERY: Duration = Duration::from_secs(60);
 
 impl<P: Policy> Logged<P> {
     /// Log `inner`'s events to `sink`, with a heartbeat sample at most every
-    /// [`DEFAULT_SAMPLE_EVERY`] seconds per worker (see [`sample_every`](Self::sample_every)).
+    /// [`DEFAULT_SAMPLE_EVERY`] per worker (see [`sample_every`](Self::sample_every)).
     pub fn new(inner: P, sink: impl EventSink + 'static) -> Self {
         Self {
             inner,
@@ -45,39 +45,42 @@ impl<P: Policy> Logged<P> {
         }
     }
 
-    /// Sample heartbeats at most every `seconds` per worker (0: every heartbeat).
+    /// Sample heartbeats at most every `every` per worker (zero: every heartbeat).
     ///
     /// A sample shows what the worker reported next to what the policy placed there. A worker's
-    /// first heartbeat is always sampled; later ones only once `seconds` have passed:
+    /// first heartbeat is always sampled; later ones only once `every` has passed:
     ///
     /// ```
-    /// use std::sync::{Arc, Mutex};
+    /// use std::{
+    ///     sync::{Arc, Mutex},
+    ///     time::Duration,
+    /// };
     ///
     /// use whelm::{
-    ///     Config, Input, JobSpec, Policy, Resources, Scheduler, WorkerState,
+    ///     Config, Input, JobSpec, Policy, Resources, Scheduler, Time, WorkerState,
     ///     log::{Event, Logged},
     /// };
     ///
     /// let events = Arc::new(Mutex::new(Vec::<Event>::new()));
     /// let inner = Scheduler::new(Config::default());
-    /// let mut p = Logged::new(inner, events.clone()).sample_every(30.0);
+    /// let mut p = Logged::new(inner, events.clone()).sample_every(Duration::from_secs(30));
     /// let mut w = WorkerState {
     ///     id: 1,
     ///     slots: 2,
     ///     budget: Resources::mem_gb(8.0),
     ///     ..Default::default()
     /// };
-    /// p.handle(Input::Worker(w.clone()), 0.0);
+    /// p.handle(Input::Worker(w.clone()), Time::ZERO);
     /// let job = JobSpec {
     ///     id: 1,
     ///     demand: Resources::mem_gb(2.0),
     ///     ..Default::default()
     /// };
-    /// p.handle(Input::Submit(job), 0.0);
-    /// p.poll(0.0);
+    /// p.handle(Input::Submit(job), Time::ZERO);
+    /// p.poll(Time::ZERO);
     /// w.reported_used = Resources::mem_gb(1.5);
-    /// for t in [10.0, 20.0, 30.0] {
-    ///     p.handle(Input::Worker(w.clone()), t);
+    /// for t in [10, 20, 30] {
+    ///     p.handle(Input::Worker(w.clone()), Time::from_secs(t));
     /// }
     ///
     /// let samples: Vec<Event> = events
@@ -91,7 +94,7 @@ impl<P: Policy> Logged<P> {
     /// assert_eq!(
     ///     samples[1],
     ///     Event::Sample {
-    ///         t_s: 30.0,
+    ///         t: Time::from_secs(30),
     ///         worker: "1".into(),
     ///         rss_gb: 1.5,
     ///         baseline_gb: 0.0,
@@ -101,8 +104,8 @@ impl<P: Policy> Logged<P> {
     ///     },
     /// );
     /// ```
-    pub fn sample_every(mut self, seconds: f64) -> Self {
-        self.sample_every = seconds;
+    pub fn sample_every(mut self, every: Duration) -> Self {
+        self.sample_every = every;
         self
     }
 
@@ -114,7 +117,7 @@ impl<P: Policy> Logged<P> {
     /// use std::sync::{Arc, Mutex};
     ///
     /// use whelm::{
-    ///     Config, Input, JobSpec, Policy, Resources, Scheduler,
+    ///     Config, Input, JobSpec, Policy, Resources, Scheduler, Time,
     ///     log::{Event, Logged, TaskInfo},
     /// };
     ///
@@ -132,16 +135,16 @@ impl<P: Policy> Logged<P> {
     ///         demand: Resources::mem_gb(1.0),
     ///         ..Default::default()
     ///     }),
-    ///     0.0,
+    ///     Time::ZERO,
     /// );
-    /// p.handle(Input::Cancel(1), 1.0);
+    /// p.handle(Input::Cancel(1), Time::from_secs(1));
     /// p.handle(
     ///     Input::Submit(JobSpec {
     ///         id: 1,
     ///         demand: Resources::mem_gb(1.0),
     ///         ..Default::default()
     ///     }),
-    ///     2.0,
+    ///     Time::from_secs(2),
     /// );
     ///
     /// let events = events.lock().unwrap();
@@ -177,7 +180,7 @@ impl<P: Policy> Logged<P> {
     }
 
     /// Log a sample of a worker's heartbeat, if one is due.
-    fn log_sample(&mut self, w: &WorkerState, now: Instant) {
+    fn log_sample(&mut self, w: &WorkerState, now: Time) {
         let due = self
             .last_sample
             .get(&w.id)
@@ -192,7 +195,7 @@ impl<P: Policy> Logged<P> {
             .into_iter()
             .find(|l| l.id == w.id);
         self.sink.record(&Event::Sample {
-            t_s: now,
+            t: now,
             worker: w.id.to_string(),
             rss_gb: gb(w.reported_used[MEM]),
             baseline_gb: gb(w.reported_baseline[MEM]),
@@ -207,13 +210,13 @@ impl<P: Policy> Logged<P> {
 impl<P: Policy> Policy for Logged<P> {
     /// Logged (with the job's annotation, for a submission), then forwarded; a heartbeat is
     /// sampled after it is forwarded, so that the sample shows the policy's bookkeeping.
-    fn handle(&mut self, input: Input, now: Instant) {
+    fn handle(&mut self, input: Input, now: Time) {
         let info = match &input {
             Input::Submit(spec) => self.info.remove(&spec.id).map(Box::new),
             _ => None,
         };
         self.sink.record(&Event::Input {
-            t_s: now,
+            t: now,
             input: input.clone(),
             info,
         });
@@ -228,17 +231,17 @@ impl<P: Policy> Policy for Logged<P> {
     }
 
     /// Forwarded, then logged.
-    fn poll(&mut self, now: Instant) -> Vec<Output> {
+    fn poll(&mut self, now: Time) -> Vec<Output> {
         let out = self.inner.poll(now);
         self.sink.record(&Event::Poll {
-            t_s: now,
+            t: now,
             out: out.clone(),
         });
         out
     }
 
     /// Forwarded.
-    fn next_wakeup(&self) -> Option<Instant> {
+    fn next_wakeup(&self) -> Option<Time> {
         self.inner.next_wakeup()
     }
 

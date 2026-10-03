@@ -4,11 +4,12 @@
 use std::{
     io::BufRead,
     sync::{Arc, Mutex},
+    time::Duration,
 };
 
 use whelm::{
     Attempt, Config, EventSink, FailKind, Input, JobId, JobSpec, Output, Policy, Resources,
-    Scheduler, WorkerState,
+    Scheduler, Time, WorkerState,
     log::{Event, JsonlSink, Logged, TaskInfo, polls, replay},
 };
 
@@ -16,16 +17,15 @@ const WORKERS: u64 = 3;
 const SLOTS: usize = 2;
 const BUDGET_GB: f64 = 10.0;
 const JOBS: u64 = 80;
-const HEARTBEAT: f64 = 60.0;
+const HEARTBEAT: Duration = Duration::from_secs(60);
 /// When worker 0 leaves (and rejoins at the next heartbeat).
-const LOSS: f64 = 50.05;
+const LOSS: Time = Time::from_millis(50_050);
 
 /// Job `i`: arrival, run time and demand (GB). Times are chosen so that no two events coincide.
-fn job(i: u64) -> (f64, f64, f64) {
-    let x = i as f64;
+fn job(i: u64) -> (Time, Duration, f64) {
     (
-        0.37 + 1.3 * x,
-        5.0 + (i * 7 % 11) as f64 + 0.123 * x,
+        Time::from_millis(370 + 1300 * i),
+        Duration::from_millis(5000 + (i * 7 % 11) * 1000 + 123 * i),
         1.0 + (i * 5 % 6) as f64,
     )
 }
@@ -58,11 +58,11 @@ fn run(sink: impl EventSink + 'static) -> Vec<(JobId, Attempt)> {
     let mut p = Logged::new(policy(), sink);
     let mut started = Vec::new();
     // Ends of running attempts: (time, job, attempt).
-    let mut ends: Vec<(f64, JobId, Attempt)> = Vec::new();
+    let mut ends: Vec<(Time, JobId, Attempt)> = Vec::new();
     // Poll and schedule the end of every attempt started.
     let poll = |p: &mut Logged<Scheduler>,
-                t: f64,
-                ends: &mut Vec<(f64, JobId, Attempt)>,
+                t: Time,
+                ends: &mut Vec<(Time, JobId, Attempt)>,
                 started: &mut Vec<(JobId, Attempt)>| {
         for o in p.poll(t) {
             if let Output::Start {
@@ -75,20 +75,20 @@ fn run(sink: impl EventSink + 'static) -> Vec<(JobId, Attempt)> {
         }
     };
     for w in 0..WORKERS {
-        p.handle(Input::Worker(state(w)), 0.0);
+        p.handle(Input::Worker(state(w)), Time::ZERO);
     }
-    poll(&mut p, 0.0, &mut ends, &mut started);
+    poll(&mut p, Time::ZERO, &mut ends, &mut started);
     let mut next_arrival = 0;
-    let mut next_beat = HEARTBEAT;
+    let mut next_beat = Time::ZERO + HEARTBEAT;
     let mut lost = false;
     let mut done = 0;
     while done < JOBS {
         let arrival = (next_arrival < JOBS).then(|| job(next_arrival).0);
-        let end = ends.iter().map(|e| e.0).min_by(f64::total_cmp);
+        let end = ends.iter().map(|e| e.0).min();
         let t = [arrival, end, Some(next_beat), (!lost).then_some(LOSS)]
             .into_iter()
             .flatten()
-            .min_by(f64::total_cmp)
+            .min()
             .unwrap();
         if arrival == Some(t) {
             let i = next_arrival;
@@ -181,7 +181,7 @@ fn jsonl_round_trip_replays() {
     let file = std::io::BufReader::new(std::fs::File::open(&path).unwrap());
     let lines: Vec<String> = file.lines().map(Result::unwrap).collect();
     let _ = std::fs::remove_dir_all(&dir);
-    assert!(lines[0].starts_with(r#"{"type":"input","t_s":0.0,"input":{"worker""#));
+    assert!(lines[0].starts_with(r#"{"type":"input","t":0,"input":{"worker""#));
     let back: Vec<Event> = lines
         .iter()
         .map(|l| serde_json::from_str(l).unwrap())

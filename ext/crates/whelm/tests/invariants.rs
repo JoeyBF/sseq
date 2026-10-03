@@ -3,14 +3,22 @@
 use std::{
     cmp::Ordering,
     collections::{BTreeMap, BTreeSet},
+    time::Duration,
 };
 
 use proptest::prelude::*;
 use whelm::{
     Attempt, Config, Constraint, DIMS, Defer, FailKind, GaveUp, GroupOrder, Input, JobId, JobSpec,
     Learn, OrderTerm, Output, Policy, Reservations, Resources, RetryConfig, SLOTS, Scheduler,
-    ScoreTerm, Selector, Speculate, SpeedConfig, Strength, Timing, Tried, WorkerId, WorkerState,
+    ScoreTerm, Selector, Speculate, SpeedConfig, Strength, Time, Timing, Tried, WorkerId,
+    WorkerState,
 };
+
+/// `x` seconds rounded to the nanosecond, as the policy turns its run-time arithmetic back into a
+/// span (negative gives zero).
+fn secs(x: f64) -> Duration {
+    Duration::from_nanos((x * 1e9).round().max(0.0) as u64)
+}
 
 /// The configuration under test, minus speed and retries.
 #[derive(Clone, Debug)]
@@ -18,7 +26,7 @@ struct Rule {
     order: Vec<OrderTerm>,
     group_order: GroupOrder,
     default_priority: i64,
-    age: Option<f64>,
+    age: Option<Duration>,
     /// Reservation limit and whether it is per class; `None` for no reservations.
     reservations: Option<(usize, bool)>,
     score: Vec<ScoreTerm>,
@@ -33,7 +41,7 @@ impl Rule {
             default_priority: self.default_priority,
             age_limit: self.age,
             reservations: self.reservations.map(|(max, per_class)| Reservations {
-                reserve_after: 30.0,
+                reserve_after: Duration::from_secs(30),
                 max,
                 per_class,
                 shadow_backfill: false,
@@ -186,7 +194,10 @@ fn speed() -> impl Strategy<Value = SpeedConfig> {
     let defer = prop::option::of(
         (
             prop_oneof![Just(0.0), Just(0.2)],
-            prop_oneof![Just(40.0), Just(500.0)],
+            prop_oneof![
+                Just(Duration::from_secs(40)),
+                Just(Duration::from_secs(500))
+            ],
         )
             .prop_map(|(min_gain, max_wait)| Defer { max_wait, min_gain }),
     );
@@ -195,7 +206,7 @@ fn speed() -> impl Strategy<Value = SpeedConfig> {
         (prop_oneof![Just(0.0), Just(0.25)], 1u32..3).prop_map(|(min_gain, max_per_job)| {
             Speculate {
                 min_gain,
-                restart_overhead: 0.0,
+                restart_overhead: Duration::ZERO,
                 max_per_job,
             }
         }),
@@ -267,7 +278,11 @@ fn rule() -> impl Strategy<Value = Rule> {
         }
         v
     };
-    let age = prop::option::of(prop_oneof![Just(0.0), Just(45.0), Just(200.0)]);
+    let age = prop::option::of(prop_oneof![
+        Just(Duration::ZERO),
+        Just(Duration::from_secs(45)),
+        Just(Duration::from_secs(200)),
+    ]);
     let reservations = prop::option::weighted(0.7, (0usize..3, any::<bool>()));
     (
         (order, any::<bool>()).prop_map(move |(o, again)| repeat(o, again)),
@@ -346,7 +361,7 @@ impl Urgency {
 #[derive(Clone, Debug)]
 struct SJob {
     spec: JobSpec,
-    since: f64,
+    since: Time,
     seq: u64,
     /// The last attempt number started.
     attempts: Attempt,
@@ -359,7 +374,7 @@ struct SJob {
 struct Live {
     attempt: Attempt,
     worker: WorkerId,
-    started: f64,
+    started: Time,
 }
 
 /// A running job and its live attempts, in start order.
@@ -470,16 +485,16 @@ impl Speeds {
         id: WorkerId,
         class: &str,
         kind: Option<&str>,
-        work: f64,
-        dt: f64,
+        work: Duration,
+        dt: Duration,
     ) -> bool {
         let Some((l, prior)) = self.learn() else {
             return false;
         };
-        if !(work > 0.0 && dt > 0.0) {
+        if work.is_zero() || dt.is_zero() {
             return false;
         }
-        let x = (work / dt).ln();
+        let x = (work.as_secs_f64() / dt.as_secs_f64()).ln();
         let kind = kind.filter(|_| prior.is_some());
         let deviation = kind.map_or(0.0, |k| self.kind_log(class, k));
         self.classes
@@ -542,7 +557,7 @@ impl Speeds {
 #[derive(Default)]
 struct Shadow {
     speeds: Speeds,
-    now: f64,
+    now: Time,
     workers: BTreeMap<WorkerId, WorkerState>,
     waiting: BTreeMap<JobId, SJob>,
     running: BTreeMap<JobId, SRun>,
@@ -642,13 +657,15 @@ impl Shadow {
                 OrderTerm::Priority => {
                     TermKey::Int(spec.priority.unwrap_or(rule.default_priority) as i128)
                 }
-                OrderTerm::Rank => TermKey::Real(spec.rank.map(|r| -r)),
+                OrderTerm::Rank => TermKey::Real(spec.rank.map(|r| -r.as_secs_f64())),
                 OrderTerm::Group => TermKey::Int(match rule.group_order {
                     GroupOrder::Id => spec.group as i128,
                     GroupOrder::Arrival => self.groups[&spec.group] as i128,
                 }),
-                OrderTerm::Wspt => TermKey::Real(spec.work.map(|w| -(spec.weight / w))),
-                OrderTerm::Edd => TermKey::Real(spec.due),
+                OrderTerm::Wspt => {
+                    TermKey::Real(spec.work.map(|w| -(spec.weight / w.as_secs_f64())))
+                }
+                OrderTerm::Edd => TermKey::Real(spec.due.map(Time::as_secs_f64)),
             });
         }
         Urgency {
@@ -658,9 +675,9 @@ impl Shadow {
         }
     }
 
-    /// The expected run time of `spec` on worker `w`.
-    fn eta(&self, spec: &JobSpec, w: WorkerId) -> Option<f64> {
-        Some(spec.work? / self.speed(spec, w))
+    /// The expected run time of `spec` on worker `w`, rounded to the nanosecond.
+    fn eta(&self, spec: &JobSpec, w: WorkerId) -> Option<Duration> {
+        Some(secs(spec.work?.as_secs_f64() / self.speed(spec, w)))
     }
 
     /// `spec`'s speed on worker `w`.
@@ -691,7 +708,7 @@ impl Shadow {
 
     /// When a running job is expected to end: its earliest live attempt's expected end, an
     /// overrunning attempt counting as half done.
-    fn expected_end(&self, r: &SRun) -> Option<f64> {
+    fn expected_end(&self, r: &SRun) -> Option<Time> {
         r.live
             .iter()
             .map(|l| {
@@ -699,7 +716,7 @@ impl Shadow {
                 Some(if end > self.now {
                     end
                 } else {
-                    self.now + (self.now - l.started).max(0.0)
+                    self.now + (self.now - l.started)
                 })
             })
             .reduce(|a, b| Some(a?.min(b?)))
@@ -848,11 +865,11 @@ fn run(
                         .with_slots(slots),
                     group,
                     priority,
-                    rank: rank.map(f64::from),
+                    rank: rank.map(|r| Duration::from_secs(r.into())),
                     weight,
-                    due: due.map(f64::from),
+                    due: due.map(|d| Time::from_secs(d.into())),
                     constraints: constraints.clone(),
-                    work: work.map(f64::from),
+                    work: work.map(|w| Duration::from_secs(w.into())),
                     kind: kind.map(|k| format!("k{k}")),
                 };
                 sh.submit(spec, &mut *p);
@@ -962,7 +979,7 @@ fn run(
                 }
                 p.handle(Input::WorkerGone(w), sh.now);
             }
-            Op::Tick(dt) => sh.now += dt as f64,
+            Op::Tick(dt) => sh.now += Duration::from_secs(dt.into()),
         }
 
         let before = p.stats();
@@ -1012,7 +1029,7 @@ fn run(
             );
         }
         if let Some(t) = p.next_wakeup() {
-            prop_assert!(t > sh.now, "wakeup {} not in the future", t);
+            prop_assert!(t > sh.now, "wakeup {:?} not in the future", t);
         }
         for &(j, attempt, w) in &starts {
             prop_assert!(sh.workers.contains_key(&w), "started on unknown worker {w}");
@@ -1133,8 +1150,8 @@ fn run(
                 let (end, run) = (end.unwrap(), run.unwrap());
                 let end_here = sh.now + run + cfg.restart_overhead;
                 prop_assert!(
-                    end > end_here && end - end_here >= cfg.min_gain * run,
-                    "job {j} speculated onto {w} for too little: {end} vs {end_here}"
+                    end > end_here && end - end_here >= secs(run.as_secs_f64() * cfg.min_gain),
+                    "job {j} speculated onto {w} for too little: {end:?} vs {end_here:?}"
                 );
                 let r = sh.running.get_mut(&j).unwrap();
                 r.job.attempts = attempt;

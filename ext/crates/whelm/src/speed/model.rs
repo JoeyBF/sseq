@@ -1,6 +1,9 @@
 //! The scheduler's side of a [`Timing`]: interned classes and kinds, and the speeds it learns.
 
-use std::collections::{BTreeMap, HashMap};
+use std::{
+    collections::{BTreeMap, HashMap},
+    time::Duration,
+};
 
 use super::{
     SpeedEstimator, Timing,
@@ -144,8 +147,8 @@ impl Speeds {
         worker: WorkerId,
         class: ClassId,
         kind: Option<KindId>,
-        work: f64,
-        duration: f64,
+        work: Duration,
+        duration: Duration,
         concurrency: f64,
     ) -> bool {
         let Some(x) = (self.estimator.as_ref()).and_then(|e| e.sample(work, duration, concurrency))
@@ -191,6 +194,8 @@ impl Speeds {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::Speeds;
     use crate::{Learn, Timing};
 
@@ -202,7 +207,8 @@ mod tests {
         let x = p.class("x");
         assert_eq!(p.worker_speed(1, x, 4.0), 1.0);
         assert_eq!(p.kind(Some("a")), None);
-        assert!(!p.observe(1, x, None, 1.0, 1.0, 1.0));
+        let second = Duration::from_secs(1);
+        assert!(!p.observe(1, x, None, second, second, 1.0));
         let mut q = Speeds::new(Timing::default());
         let x = q.class("x");
         assert_eq!(q.worker_speed(1, x, 4.0), 4.0);
@@ -223,17 +229,19 @@ mod tests {
         let mut s = Speeds::new(timing);
         let x = s.class("x");
         let (a, b, new) = (s.kind(Some("a")), s.kind(Some("b")), s.kind(Some("new")));
+        // Kind a takes a quarter of b's time.
+        let (ten, quarter) = (Duration::from_secs(10), Duration::from_millis(2500));
         // Kind a alone: it is the class's average, so its factor is 1 and the worker learns 4.
         for _ in 0..40 {
-            s.observe(1, x, a, 10.0, 2.5, 1.0);
+            s.observe(1, x, a, ten, quarter, 1.0);
         }
         assert_eq!(s.factor(a, x), 1.0);
         assert!((s.worker_speed(1, x, 1.0) - 4.0).abs() < 1e-9);
         // Kind b at speed 1 drags the class average down; a's factor rises above 1, b's is
         // below, and each sits between 1 and its unshrunk ratio to the class mean.
         for _ in 0..40 {
-            s.observe(1, x, b, 10.0, 10.0, 1.0);
-            s.observe(1, x, a, 10.0, 2.5, 1.0);
+            s.observe(1, x, b, ten, ten, 1.0);
+            s.observe(1, x, a, ten, quarter, 1.0);
         }
         let (fa, fb) = (s.factor(a, x), s.factor(b, x));
         assert!(fa > 1.0 && fb < 1.0, "{fa} {fb}");

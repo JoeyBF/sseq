@@ -4,7 +4,8 @@ use std::collections::BTreeMap;
 
 use super::{Job, Run, Running, Scheduler, Worker, tick_occ};
 use crate::{
-    Attempt, FailKind, GaveUp, Instant, JobId, Output, Resources, Tried, WorkerId, WorkerState,
+    Attempt, FailKind, GaveUp, JobId, Output, Resources, Time, Tried, WorkerId, WorkerState,
+    time::secs,
 };
 
 impl Scheduler {
@@ -139,7 +140,7 @@ impl Scheduler {
     }
 
     /// Add a worker or replace its reported state, keeping its placements.
-    pub(super) fn worker_update(&mut self, state: WorkerState, now: Instant) {
+    pub(super) fn worker_update(&mut self, state: WorkerState, now: Time) {
         let class = self.speeds.class(&state.class);
         let speed = self.speeds.worker_speed(state.id, class, state.speed);
         match self.workers.get_mut(&state.id) {
@@ -208,7 +209,7 @@ impl Scheduler {
                 }
                 // Candidates: run time known, every live attempt on a worker slower for the job,
                 // allowed and admitted here.
-                let mut best: Option<(f64, JobId)> = None;
+                let mut best: Option<(Time, JobId)> = None;
                 for (&job, r) in &self.running {
                     let rank = self.speed_rank(&r.job, w);
                     let slower = r.live.iter().all(|run| {
@@ -227,7 +228,7 @@ impl Scheduler {
                         continue;
                     };
                     let end_here = now + run + cfg.restart_overhead;
-                    if end - end_here < cfg.min_gain * run || end <= end_here {
+                    if end <= end_here || end - end_here < secs(run.as_secs_f64() * cfg.min_gain) {
                         continue;
                     }
                     if best.is_none_or(|(e, j)| end > e || (end == e && job < j)) {

@@ -1,5 +1,7 @@
 //! Job descriptions and their placement constraints.
 
+use std::time::Duration;
+
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
@@ -7,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     Config, DagConfig, DagScheduler, Defer, OrderTerm, Policy, SLOTS, ScoreTerm, Speculate, Timing,
 };
-use crate::{Instant, Resources, WorkerId, WorkerState};
+use crate::{Resources, Time, WorkerId, WorkerState};
 
 /// A job identifier, chosen by the caller. Must be unique among live (waiting or running) jobs.
 ///
@@ -61,7 +63,7 @@ impl Selector {
 /// Requires of one kind are alternatives: this job may run on either class.
 ///
 /// ```
-/// use whelm::{Config, Constraint, Input, JobSpec, Output, Policy, Scheduler, WorkerState};
+/// use whelm::{Config, Constraint, Input, JobSpec, Output, Policy, Scheduler, Time, WorkerState};
 ///
 /// let mut p = Scheduler::new(Config::default());
 /// for (id, class) in [(1, "cpu"), (2, "a100"), (3, "h100")] {
@@ -70,7 +72,7 @@ impl Selector {
 ///         class: class.into(),
 ///         ..Default::default()
 ///     };
-///     p.handle(Input::Worker(w), 0.0);
+///     p.handle(Input::Worker(w), Time::ZERO);
 /// }
 /// for id in 1..=3 {
 ///     let job = JobSpec {
@@ -81,10 +83,10 @@ impl Selector {
 ///         ],
 ///         ..Default::default()
 ///     };
-///     p.handle(Input::Submit(job), 0.0);
+///     p.handle(Input::Submit(job), Time::ZERO);
 /// }
 /// assert_eq!(
-///     p.poll(0.0),
+///     p.poll(Time::ZERO),
 ///     [
 ///         Output::Start {
 ///             job: 1,
@@ -171,7 +173,7 @@ impl Constraint {
     /// # Examples
     ///
     /// ```
-    /// use whelm::{Config, Constraint, Input, JobSpec, Output, Policy, Scheduler, WorkerState};
+    /// use whelm::{Config, Constraint, Input, JobSpec, Output, Policy, Scheduler, Time, WorkerState};
     ///
     /// let mut p = Scheduler::new(Config::default());
     /// for (id, class) in [(1, "cpu"), (2, "gpu")] {
@@ -180,16 +182,16 @@ impl Constraint {
     ///         class: class.into(),
     ///         ..Default::default()
     ///     };
-    ///     p.handle(Input::Worker(w), 0.0);
+    ///     p.handle(Input::Worker(w), Time::ZERO);
     /// }
     /// let job = JobSpec {
     ///     id: 1,
     ///     constraints: vec![Constraint::require_class("gpu")],
     ///     ..Default::default()
     /// };
-    /// p.handle(Input::Submit(job), 0.0);
+    /// p.handle(Input::Submit(job), Time::ZERO);
     /// assert_eq!(
-    ///     p.poll(0.0),
+    ///     p.poll(Time::ZERO),
     ///     [Output::Start {
     ///         job: 1,
     ///         attempt: 1,
@@ -211,7 +213,7 @@ impl Constraint {
     /// Unlike an avoided worker, a forbidden one is never used, even when it is the only one.
     ///
     /// ```
-    /// use whelm::{Config, Constraint, Input, JobSpec, Policy, Scheduler, WorkerState};
+    /// use whelm::{Config, Constraint, Input, JobSpec, Policy, Scheduler, Time, WorkerState};
     ///
     /// let mut p = Scheduler::new(Config::default());
     /// p.handle(
@@ -219,15 +221,15 @@ impl Constraint {
     ///         id: 1,
     ///         ..Default::default()
     ///     }),
-    ///     0.0,
+    ///     Time::ZERO,
     /// );
     /// let job = JobSpec {
     ///     id: 1,
     ///     constraints: vec![Constraint::forbid_worker(1)],
     ///     ..Default::default()
     /// };
-    /// p.handle(Input::Submit(job), 0.0);
-    /// assert!(p.poll(0.0).is_empty());
+    /// p.handle(Input::Submit(job), Time::ZERO);
+    /// assert!(p.poll(Time::ZERO).is_empty());
     /// ```
     pub fn forbid_worker(w: WorkerId) -> Self {
         Self {
@@ -263,7 +265,7 @@ impl Constraint {
     /// With no other live worker, the avoided one is used after all (see [`Strength::Avoid`]).
     ///
     /// ```
-    /// use whelm::{Config, Constraint, Input, JobSpec, Output, Policy, Scheduler, WorkerState};
+    /// use whelm::{Config, Constraint, Input, JobSpec, Output, Policy, Scheduler, Time, WorkerState};
     ///
     /// let mut p = Scheduler::new(Config::default());
     /// p.handle(
@@ -271,16 +273,16 @@ impl Constraint {
     ///         id: 1,
     ///         ..Default::default()
     ///     }),
-    ///     0.0,
+    ///     Time::ZERO,
     /// );
     /// let job = JobSpec {
     ///     id: 1,
     ///     constraints: vec![Constraint::avoid_worker(1)],
     ///     ..Default::default()
     /// };
-    /// p.handle(Input::Submit(job), 0.0);
+    /// p.handle(Input::Submit(job), Time::ZERO);
     /// assert_eq!(
-    ///     p.poll(0.0),
+    ///     p.poll(Time::ZERO),
     ///     [Output::Start {
     ///         job: 1,
     ///         attempt: 1,
@@ -320,7 +322,7 @@ impl Constraint {
     /// # Examples
     ///
     /// ```
-    /// use whelm::{Config, Constraint, Input, JobSpec, Output, Policy, Scheduler, WorkerState};
+    /// use whelm::{Config, Constraint, Input, JobSpec, Output, Policy, Scheduler, Time, WorkerState};
     ///
     /// let mut p = Scheduler::new(Config::default());
     /// for id in [1, 2] {
@@ -329,7 +331,7 @@ impl Constraint {
     ///             id,
     ///             ..Default::default()
     ///         }),
-    ///         0.0,
+    ///         Time::ZERO,
     ///     );
     /// }
     /// let job = JobSpec {
@@ -337,9 +339,9 @@ impl Constraint {
     ///     constraints: vec![Constraint::prefer_worker(2)],
     ///     ..Default::default()
     /// };
-    /// p.handle(Input::Submit(job), 0.0);
+    /// p.handle(Input::Submit(job), Time::ZERO);
     /// assert_eq!(
-    ///     p.poll(0.0),
+    ///     p.poll(Time::ZERO),
     ///     [Output::Start {
     ///         job: 1,
     ///         attempt: 1,
@@ -385,6 +387,8 @@ impl Constraint {
 /// Name the fields that matter and take the rest from [`Default`].
 ///
 /// ```
+/// use std::time::Duration;
+///
 /// use whelm::{Constraint, JobSpec, Resources};
 ///
 /// let job = JobSpec {
@@ -392,7 +396,7 @@ impl Constraint {
 ///     demand: Resources::mem_gb(6.0),
 ///     group: 3,
 ///     priority: Some(-1),
-///     work: Some(120.0),
+///     work: Some(Duration::from_secs(120)),
 ///     kind: Some("sig".into()),
 ///     constraints: vec![Constraint::require_class("gpu")],
 ///     ..Default::default()
@@ -415,18 +419,18 @@ pub struct JobSpec {
     /// Upward rank: the job's work plus the longest chain of work below it. Set by the DAG layer
     /// ([`DagConfig::track_ranks`]); larger is more urgent ([`OrderTerm::Rank`]).
     #[cfg_attr(feature = "serde", serde(default))]
-    pub rank: Option<f64>,
+    pub rank: Option<Duration>,
     /// Weight in a weighted objective ([`OrderTerm::Wspt`]).
     #[cfg_attr(feature = "serde", serde(default = "crate::worker::unit"))]
     pub weight: f64,
     /// Due date, on the policy's clock ([`OrderTerm::Edd`]).
     #[cfg_attr(feature = "serde", serde(default))]
-    pub due: Option<Instant>,
-    /// Estimated work, in seconds on a worker of [`WorkerState::speed`] 1.0. Used by
+    pub due: Option<Time>,
+    /// Estimated work: the run time on a worker of [`WorkerState::speed`] 1.0. Used by
     /// [`OrderTerm::Wspt`], [`Defer`], shadow backfill and [`Speculate`] (and filled in from the
     /// DAG layer's estimate when unset).
     #[cfg_attr(feature = "serde", serde(default))]
-    pub work: Option<f64>,
+    pub work: Option<Duration>,
     /// What kind of job it is, for [`Timing::Unrelated`], which learns each kind's speed on each
     /// worker class; other timings ignore it.
     #[cfg_attr(

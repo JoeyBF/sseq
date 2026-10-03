@@ -1,7 +1,7 @@
 //! Reading a log back: replaying its inputs, and the polls it recorded.
 
 use super::Event;
-use crate::{Instant, Output, Policy};
+use crate::{Output, Policy, Time};
 
 /// Feed a log's inputs and polls to `policy`, in order, and return what each poll returned, with
 /// its time. Given a fresh policy built as the logged one was (same [`Config`](crate::Config),
@@ -12,7 +12,7 @@ use crate::{Instant, Output, Policy};
 ///
 /// ```
 /// use whelm::{
-///     Config, Input, JobSpec, Output, Resources, Scheduler, WorkerState,
+///     Config, Input, JobSpec, Output, Resources, Scheduler, Time, WorkerState,
 ///     log::{self, Event},
 /// };
 ///
@@ -23,12 +23,12 @@ use crate::{Instant, Output, Policy};
 /// };
 /// let events = vec![
 ///     Event::Input {
-///         t_s: 0.0,
+///         t: Time::ZERO,
 ///         input: Input::Worker(w),
 ///         info: None,
 ///     },
 ///     Event::Input {
-///         t_s: 0.0,
+///         t: Time::ZERO,
 ///         input: Input::Submit(JobSpec {
 ///             id: 1,
 ///             demand: Resources::mem_gb(1.0),
@@ -37,7 +37,7 @@ use crate::{Instant, Output, Policy};
 ///         info: None,
 ///     },
 ///     Event::Poll {
-///         t_s: 0.0,
+///         t: Time::ZERO,
 ///         out: Vec::new(),
 ///     },
 /// ];
@@ -45,7 +45,7 @@ use crate::{Instant, Output, Policy};
 /// assert_eq!(
 ///     replayed,
 ///     [(
-///         0.0,
+///         Time::ZERO,
 ///         vec![Output::Start {
 ///             job: 1,
 ///             attempt: 1,
@@ -53,17 +53,17 @@ use crate::{Instant, Output, Policy};
 ///         }]
 ///     )]
 /// );
-/// assert_eq!(log::polls(&events), [(0.0, vec![])]);
+/// assert_eq!(log::polls(&events), [(Time::ZERO, vec![])]);
 /// ```
 pub fn replay<P: Policy + ?Sized>(
     policy: &mut P,
     events: impl IntoIterator<Item = Event>,
-) -> Vec<(Instant, Vec<Output>)> {
+) -> Vec<(Time, Vec<Output>)> {
     let mut out = Vec::new();
     for e in events {
         match e {
-            Event::Input { t_s, input, .. } => policy.handle(input, t_s),
-            Event::Poll { t_s, .. } => out.push((t_s, policy.poll(t_s))),
+            Event::Input { t, input, .. } => policy.handle(input, t),
+            Event::Poll { t, .. } => out.push((t, policy.poll(t))),
             Event::Sample { .. } => {}
         }
     }
@@ -72,11 +72,11 @@ pub fn replay<P: Policy + ?Sized>(
 
 /// The polls recorded in a log, with their times and outputs: what [`replay`] should reproduce.
 /// Inputs and samples are skipped (see the [module example](super)).
-pub fn polls<'a>(events: impl IntoIterator<Item = &'a Event>) -> Vec<(Instant, Vec<Output>)> {
+pub fn polls<'a>(events: impl IntoIterator<Item = &'a Event>) -> Vec<(Time, Vec<Output>)> {
     events
         .into_iter()
         .filter_map(|e| match e {
-            Event::Poll { t_s, out } => Some((*t_s, out.clone())),
+            Event::Poll { t, out } => Some((*t, out.clone())),
             _ => None,
         })
         .collect()

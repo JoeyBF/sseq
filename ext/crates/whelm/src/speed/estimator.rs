@@ -1,6 +1,6 @@
 //! Online estimates of worker speeds, [`SpeedEstimator`].
 
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, time::Duration};
 
 use super::Learn;
 #[cfg(doc)]
@@ -39,11 +39,19 @@ struct WorkerStat {
 /// heartbeat; the scheduler then trusts it under the default [`Timing`].
 ///
 /// ```
+/// use std::time::Duration;
+///
 /// use whelm::{Input, Learn, Resources, SpeedEstimator, WorkerState};
 ///
 /// let mut e = SpeedEstimator::new(Learn::default());
 /// for _ in 0..Learn::default().min_samples {
-///     e.observe(7, "h100", 30.0, 10.0, 1.0);
+///     e.observe(
+///         7,
+///         "h100",
+///         Duration::from_secs(30),
+///         Duration::from_secs(10),
+///         1.0,
+///     );
 /// }
 /// let state = WorkerState {
 ///     id: 7,
@@ -79,24 +87,27 @@ impl SpeedEstimator {
         &self.cfg
     }
 
-    /// Record a completion on `worker` (of `class`): `work` seconds at speed 1 took `duration`
-    /// seconds while the worker ran `concurrency` jobs on average (this one included). Samples
-    /// with a non-positive or non-finite work or duration are ignored. Returns whether it was used.
+    /// Record a completion on `worker` (of `class`): `work` at speed 1 took `duration` while the
+    /// worker ran `concurrency` jobs on average (this one included). Samples with a zero work or
+    /// duration are ignored. Returns whether it was used.
     ///
     /// ```
+    /// use std::time::Duration;
+    ///
     /// use whelm::{Learn, SpeedEstimator};
     ///
     /// let mut e = SpeedEstimator::new(Learn::default());
-    /// assert!(e.observe(1, "cpu", 10.0, 5.0, 1.0));
-    /// assert!(!e.observe(1, "cpu", 10.0, 0.0, 1.0));
+    /// let ten = Duration::from_secs(10);
+    /// assert!(e.observe(1, "cpu", ten, Duration::from_secs(5), 1.0));
+    /// assert!(!e.observe(1, "cpu", ten, Duration::ZERO, 1.0));
     /// assert_eq!((e.class_samples("cpu"), e.worker_samples(1)), (1, 1));
     /// ```
     pub fn observe(
         &mut self,
         worker: WorkerId,
         class: &str,
-        work: f64,
-        duration: f64,
+        work: Duration,
+        duration: Duration,
         concurrency: f64,
     ) -> bool {
         let Some(x) = self.sample(work, duration, concurrency) else {
@@ -108,11 +119,16 @@ impl SpeedEstimator {
 
     /// The `ln speed` sample of a completion (see [`observe`](Self::observe)), corrected for
     /// concurrency; `None` if the work or duration is unusable.
-    pub(super) fn sample(&self, work: f64, duration: f64, concurrency: f64) -> Option<f64> {
-        if !(work > 0.0 && duration > 0.0 && work.is_finite() && duration.is_finite()) {
+    pub(super) fn sample(
+        &self,
+        work: Duration,
+        duration: Duration,
+        concurrency: f64,
+    ) -> Option<f64> {
+        if work.is_zero() || duration.is_zero() {
             return None;
         }
-        let mut x = (work / duration).ln();
+        let mut x = (work.as_secs_f64() / duration.as_secs_f64()).ln();
         if let Some(s) = self.cfg.sharing
             && concurrency.is_finite()
         {
@@ -159,11 +175,19 @@ impl SpeedEstimator {
     /// A worker never seen gets its class's estimate, and a class never seen keeps the prior:
     ///
     /// ```
+    /// use std::time::Duration;
+    ///
     /// use whelm::{Learn, SpeedEstimator};
     ///
     /// let mut e = SpeedEstimator::new(Learn::default());
     /// for _ in 0..Learn::default().min_samples {
-    ///     e.observe(1, "gpu", 10.0, 5.0, 1.0);
+    ///     e.observe(
+    ///         1,
+    ///         "gpu",
+    ///         Duration::from_secs(10),
+    ///         Duration::from_secs(5),
+    ///         1.0,
+    ///     );
     /// }
     /// assert!((e.estimate(1, "gpu", 1.0) - 2.0).abs() < 1e-9);
     /// assert!((e.estimate(2, "gpu", 1.0) - 2.0).abs() < 1e-9);
@@ -190,14 +214,17 @@ impl SpeedEstimator {
     /// One job three times slower than usual moves the estimate but not the speed:
     ///
     /// ```
+    /// use std::time::Duration;
+    ///
     /// use whelm::{Learn, SpeedEstimator};
     ///
     /// let mut e = SpeedEstimator::new(Learn::default());
+    /// let one = Duration::from_secs(1);
     /// for _ in 0..100 {
-    ///     e.observe(1, "cpu", 1.0, 1.0, 1.0);
+    ///     e.observe(1, "cpu", one, one, 1.0);
     /// }
     /// let before = e.speed(1, "cpu", 1.0);
-    /// e.observe(1, "cpu", 1.0, 3.0, 1.0);
+    /// e.observe(1, "cpu", one, Duration::from_secs(3), 1.0);
     /// assert!(e.estimate(1, "cpu", 1.0) < before);
     /// assert_eq!(e.speed(1, "cpu", 1.0), before);
     /// ```
@@ -232,16 +259,23 @@ pub(super) fn sane(x: f64) -> f64 {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::SpeedEstimator;
     use crate::{Learn, Sharing};
+
+    /// `n` seconds.
+    fn secs(n: u64) -> Duration {
+        Duration::from_secs(n)
+    }
 
     /// Noise-free samples recover each class's speed exactly.
     #[test]
     fn exact_recovery() {
         let mut e = SpeedEstimator::new(Learn::default());
         for i in 0..40 {
-            e.observe(1 + i % 2, "a", 10.0, 5.0, 1.0);
-            e.observe(10, "b", 10.0, 10.0, 1.0);
+            e.observe(1 + i % 2, "a", secs(10), secs(5), 1.0);
+            e.observe(10, "b", secs(10), secs(10), 1.0);
         }
         assert!((e.speed(1, "a", 1.0) - 2.0).abs() < 1e-9);
         assert!((e.speed(10, "b", 7.0) - 1.0).abs() < 1e-9);
@@ -257,9 +291,9 @@ mod tests {
         let mut e = SpeedEstimator::new(Learn::default());
         for _ in 0..200 {
             for w in 1..=5 {
-                e.observe(w, "h200", 100.0, 100.0, 4.0);
+                e.observe(w, "h200", secs(100), secs(100), 4.0);
             }
-            e.observe(6, "h200", 76.5, 100.0, 4.0);
+            e.observe(6, "h200", Duration::from_millis(76_500), secs(100), 4.0);
         }
         let normal = e.speed(1, "h200", 1.0);
         let capped = e.speed(6, "h200", 1.0);
@@ -272,10 +306,10 @@ mod tests {
     fn hysteresis_absorbs_outliers() {
         let mut e = SpeedEstimator::new(Learn::default());
         for _ in 0..100 {
-            e.observe(1, "a", 1.0, 1.0, 1.0);
+            e.observe(1, "a", secs(1), secs(1), 1.0);
         }
         let before = e.speed(1, "a", 1.0);
-        e.observe(1, "a", 1.0, 3.0, 1.0);
+        e.observe(1, "a", secs(1), secs(3), 1.0);
         assert_eq!(e.speed(1, "a", 1.0), before);
         assert!(e.estimate(1, "a", 1.0) < before);
     }
@@ -294,7 +328,7 @@ mod tests {
         };
         let mut e = SpeedEstimator::new(flat);
         for _ in 0..30 {
-            e.observe(1, "a", 10.0, 40.0, 4.0);
+            e.observe(1, "a", secs(10), secs(40), 4.0);
         }
         assert!((e.speed(1, "a", 1.0) - 1.0).abs() < 1e-9);
         let linear = Learn {
@@ -307,7 +341,7 @@ mod tests {
         };
         let mut e = SpeedEstimator::new(linear);
         for _ in 0..30 {
-            e.observe(1, "a", 10.0, 10.0, 4.0);
+            e.observe(1, "a", secs(10), secs(10), 4.0);
         }
         assert!((e.speed(1, "a", 1.0) - 1.0).abs() < 1e-9);
     }

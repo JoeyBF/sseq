@@ -7,7 +7,7 @@ use std::{
 };
 
 use super::{SharedPolicy, lease::Lease};
-use crate::{Attempt, FailKind, GaveUp, Input, Instant, JobId, JobSpec, Output, Policy, WorkerId};
+use crate::{Attempt, FailKind, GaveUp, Input, JobId, JobSpec, Output, Policy, Time, WorkerId};
 
 /// One leased job's mailbox, from its first submission until the lease ends.
 pub(super) struct Slot {
@@ -16,7 +16,7 @@ pub(super) struct Slot {
     /// The job as submitted, returned if a timed lease expires.
     pub(super) spec: JobSpec,
     /// When the thread started waiting for the next attempt (lease or failure).
-    pub(super) asked: Instant,
+    pub(super) asked: Time,
     /// The attempt the thread holds, while it holds one.
     pub(super) held: Option<(Attempt, WorkerId)>,
     /// The held attempt was failed by its worker leaving: the policy treats it as stale.
@@ -32,7 +32,8 @@ pub(super) struct Slot {
 /// The state behind the lock.
 pub(super) struct State<P> {
     pub(super) policy: P,
-    pub(super) now: Instant,
+    /// The latest time the clock gave; `Time::ZERO`, the earliest, until the first lock.
+    pub(super) now: Time,
     /// Jobs with a lease, held or awaited.
     pub(super) jobs: HashMap<JobId, Slot>,
     /// Tickers spawned before this generation exit.
@@ -48,7 +49,7 @@ pub(super) enum NoStart {
 impl<P: Policy> SharedPolicy<P> {
     /// Lock the state and advance its clock. A poisoned lock (a caller panicked inside the
     /// policy) is taken over: the policy's own state is updated atomically per call.
-    pub(super) fn lock(&self) -> (MutexGuard<'_, State<P>>, Instant) {
+    pub(super) fn lock(&self) -> (MutexGuard<'_, State<P>>, Time) {
         let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let now = (self.clock)().max(s.now);
         s.now = now;
@@ -58,7 +59,7 @@ impl<P: Policy> SharedPolicy<P> {
     /// Poll, and deliver each output to its job's slot. Rejecting a speculative start, or
     /// cancelling a start nobody waits for, frees a slot, so polling repeats until neither
     /// happens.
-    pub(super) fn pump(s: &mut State<P>, now: Instant) {
+    pub(super) fn pump(s: &mut State<P>, now: Time) {
         loop {
             let mut again = false;
             for o in s.policy.poll(now) {

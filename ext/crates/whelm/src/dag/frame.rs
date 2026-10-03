@@ -17,7 +17,7 @@
 use std::sync::Arc;
 
 use super::{DagScheduler, DagTemplate, Loc, NodeSource, TemplateNode, UnitState};
-use crate::{Input, Instant, JobId, Output, Policy};
+use crate::{Input, JobId, Output, Policy, Time, time::secs};
 
 /// Counter sentinels (template in-degrees stay below them).
 pub(super) const COMPLETE: u16 = u16::MAX;
@@ -94,14 +94,14 @@ pub(super) fn sourced_bottom_levels(
     t: &DagTemplate,
     leaf0: u32,
 ) -> Vec<f64> {
-    t.bottom_levels(|i| {
+    t.levels(|i| {
         let leaf = leaf0 + t.leaf_offset(i) as u32;
         match t.node(i) {
             TemplateNode::Unit(sub) => sourced_bottom_levels(src, unit, sub, leaf)
                 .into_iter()
                 .fold(0.0, f64::max),
             _ if src.passthrough(unit, leaf) => 0.0,
-            _ => src.work(unit, leaf),
+            _ => src.work(unit, leaf).as_secs_f64(),
         }
     })
 }
@@ -167,7 +167,7 @@ impl<P: Policy> DagScheduler<P> {
                 true => sourced_bottom_levels(self.src(), rec.id, sub, first)
                     .into_iter()
                     .fold(0.0, f64::max),
-                false => sub.span(),
+                false => sub.span().as_secs_f64(),
             };
             tail += level(i) - span;
             leaf0 = first;
@@ -176,7 +176,7 @@ impl<P: Policy> DagScheduler<P> {
     }
 
     /// Process readiness events until none is left.
-    pub(super) fn settle(&mut self, now: Instant) {
+    pub(super) fn settle(&mut self, now: Time) {
         while let Some(w) = self.work.pop_front() {
             match w {
                 Work::Open(u) => self.enter(u),
@@ -293,7 +293,7 @@ impl<P: Policy> DagScheduler<P> {
             true => sourced_bottom_levels(self.src(), rec.id, sub, leaf0)
                 .into_iter()
                 .fold(0.0, f64::max),
-            false => sub.span(),
+            false => sub.span().as_secs_f64(),
         };
         let tail = frame.tail + frame.bottom_level(i) - span;
         (sub.clone(), frame.base + offset as JobId, leaf0, tail)
@@ -301,7 +301,7 @@ impl<P: Policy> DagScheduler<P> {
 
     /// Node `i` of frame `f` has no unmet dependency left: submit, hold or announce a job,
     /// complete a passthrough, or enter a substituted unit.
-    fn node_ready(&mut self, f: u32, i: usize, now: Instant) {
+    fn node_ready(&mut self, f: u32, i: usize, now: Time) {
         let frame = self.frame(f);
         let offset = frame.template.leaf_offset(i);
         let job = frame.base + offset as JobId;
@@ -393,7 +393,7 @@ impl<P: Policy> DagScheduler<P> {
     }
 
     /// Hand node `i` of frame `f`, a ready job, to the policy.
-    pub(super) fn submit(&mut self, f: u32, i: usize, now: Instant) {
+    pub(super) fn submit(&mut self, f: u32, i: usize, now: Time) {
         self.frame_mut(f).counter[i] = SUBMITTED;
         let frame = self.frame(f);
         let rec = self.unit(frame.unit);
@@ -407,10 +407,10 @@ impl<P: Policy> DagScheduler<P> {
                 (false, TemplateNode::Job(w)) => *w,
                 (false, _) => unreachable!("only worker jobs are submitted"),
             };
-            spec.work = Some(rec.scale * own);
+            spec.work = Some(secs(rec.scale * own.as_secs_f64()));
         }
         if self.config.track_ranks && spec.rank.is_none() {
-            spec.rank = Some(self.node_rank(f, i));
+            spec.rank = Some(secs(self.node_rank(f, i)));
         }
         if rec.sourced {
             self.src().spec(rec.id, leaf, &mut spec);

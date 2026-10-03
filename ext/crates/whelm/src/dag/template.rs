@@ -2,9 +2,10 @@
 //!
 //! A [`DagTemplate`] is built from a [`TemplateSpec`] once per shape of work, and shared by every
 //! [`Unit`](super::Unit) of that shape. Building it checks acyclicity and precomputes the bottom
-//! levels ranks need, so declaring a unit of it costs nothing per node. Its nodes are [`TemplateNode`]s; a node may
-//! itself be a unit of another template, which gives the hierarchy its depth: the leaves of a
-//! substituted unit are numbered among the enclosing template's, in node order.
+//! levels ranks need, so declaring a unit of it costs nothing per node. Its nodes are
+//! [`TemplateNode`]s; a node may itself be a unit of another template, which gives the hierarchy
+//! its depth: the leaves of a substituted unit are numbered among the enclosing template's, in
+//! node order.
 //!
 //! The analysis methods ([`bottom_levels`](DagTemplate::bottom_levels),
 //! [`critical_path`](DagTemplate::critical_path), [`critical_nodes`](DagTemplate::critical_nodes))
@@ -14,16 +15,16 @@
 //! A three-stage pipeline whose middle stage is a nested fan-out of two jobs:
 //!
 //! ```
-//! use std::sync::Arc;
+//! use std::{sync::Arc, time::Duration};
 //!
 //! use whelm::{TemplateNode, TemplateSpec};
 //!
 //! let fan = Arc::new(TemplateSpec::jobs(2).build().unwrap());
 //! let pipeline = TemplateSpec {
 //!     nodes: vec![
-//!         TemplateNode::Local(1.0),
+//!         TemplateNode::Local(Duration::from_secs(1)),
 //!         TemplateNode::Unit(fan),
-//!         TemplateNode::Pass(0.0),
+//!         TemplateNode::Pass(Duration::ZERO),
 //!     ],
 //!     edges: vec![(0, 1), (1, 2)],
 //! }
@@ -33,27 +34,30 @@
 //! assert_eq!((pipeline.len(), pipeline.leaves()), (3, 4));
 //! assert_eq!([0, 1, 2].map(|i| pipeline.leaf_offset(i)), [0, 1, 3]);
 //! // The fan-out weighs its own span, 1: the pipeline's critical path is 1 + 1 + 0.
-//! assert_eq!(pipeline.span(), 2.0);
+//! assert_eq!(pipeline.span(), Duration::from_secs(2));
 //! ```
 
-use std::sync::{Arc, LazyLock};
+use std::{
+    sync::{Arc, LazyLock},
+    time::Duration,
+};
 
 use super::{DagError, frame::SENTINEL};
-use crate::JobId;
+use crate::{JobId, time::secs};
 
 /// One node of a [`DagTemplate`].
 ///
-/// A leaf's `f64` is its work before the unit's scale; a [`Unit`](Self::Unit) node weighs its
-/// template's [`span`](DagTemplate::span) instead.
+/// A leaf's [`Duration`] is its work before the unit's scale; a [`Unit`](Self::Unit) node weighs
+/// its template's [`span`](DagTemplate::span) instead.
 #[derive(Clone, Debug)]
 pub enum TemplateNode {
     /// A job run on a worker, of this much work (before the unit's
     /// [`scale`](super::Unit::scale)).
-    Job(f64),
+    Job(Duration),
     /// A job run on the caller ([`Output::RunLocal`](crate::Output::RunLocal)), of this much work.
-    Local(f64),
+    Local(Duration),
     /// A synchronisation point, of this much work: it completes by itself once ready.
-    Pass(f64),
+    Pass(Duration),
     /// A unit of another template substituted for the node: its sources wait for the node's
     /// predecessors, and the node is complete once all of its nodes are. Its leaves take the next
     /// ids of the enclosing unit (see [`DagTemplate::leaf_offset`]).
@@ -74,6 +78,8 @@ pub enum TemplateNode {
 /// A diamond: node 0 before nodes 1 and 2, both before node 3.
 ///
 /// ```
+/// use std::time::Duration;
+///
 /// use whelm::TemplateSpec;
 ///
 /// let diamond = TemplateSpec {
@@ -89,7 +95,10 @@ pub enum TemplateNode {
 ///     (&[1, 2][..], &[1, 2][..])
 /// );
 /// assert_eq!(diamond.topological_order(), [0, 1, 2, 3]);
-/// assert_eq!((diamond.edge_count(), diamond.span()), (4, 3.0));
+/// assert_eq!(
+///     (diamond.edge_count(), diamond.span()),
+///     (4, Duration::from_secs(3))
+/// );
 /// ```
 #[derive(Clone, Debug)]
 pub struct DagTemplate {
@@ -100,21 +109,24 @@ pub struct DagTemplate {
     topo: Vec<u32>,
     /// Each node's first leaf, then the number of leaves.
     offset: Vec<u32>,
-    /// Each node's bottom level with the nodes' own work.
+    /// Each node's bottom level with the nodes' own work, in seconds (rank arithmetic is in
+    /// seconds).
     bl: Vec<f64>,
-    span: f64,
+    span: Duration,
 }
 
-/// The one-node templates of plain jobs ([`DagJob`](super::DagJob)), of unit work.
+/// The one-node templates of plain jobs ([`DagJob`](super::DagJob)), of one second of work, so
+/// that a unit's scale is the job's work in seconds.
 pub(super) static JOB: LazyLock<Arc<DagTemplate>> = LazyLock::new(|| single(TemplateNode::Job));
 /// See [`JOB`].
 pub(super) static LOCAL: LazyLock<Arc<DagTemplate>> = LazyLock::new(|| single(TemplateNode::Local));
 /// See [`JOB`].
 pub(super) static PASS: LazyLock<Arc<DagTemplate>> = LazyLock::new(|| single(TemplateNode::Pass));
 
-/// A one-node template of unit work.
-fn single(node: fn(f64) -> TemplateNode) -> Arc<DagTemplate> {
-    Arc::new(DagTemplate::build(vec![node(1.0)], []).expect("one node is acyclic"))
+/// A one-node template of one second of work.
+fn single(node: fn(Duration) -> TemplateNode) -> Arc<DagTemplate> {
+    let node = node(Duration::from_secs(1));
+    Arc::new(DagTemplate::build(vec![node], []).expect("one node is acyclic"))
 }
 
 /// What a [`DagTemplate`] is built from: its nodes, and its edges `(from, to)`, `to` depending on
@@ -129,7 +141,7 @@ fn single(node: fn(f64) -> TemplateNode) -> Arc<DagTemplate> {
 /// counts as its span, 2, in the outer template's critical path.
 ///
 /// ```
-/// use std::sync::Arc;
+/// use std::{sync::Arc, time::Duration};
 ///
 /// use whelm::{TemplateNode, TemplateSpec};
 ///
@@ -139,10 +151,10 @@ fn single(node: fn(f64) -> TemplateNode) -> Arc<DagTemplate> {
 /// };
 /// let t = TemplateSpec {
 ///     nodes: vec![
-///         TemplateNode::Local(0.5),
+///         TemplateNode::Local(Duration::from_millis(500)),
 ///         TemplateNode::Unit(Arc::new(chain.build().unwrap())),
-///         TemplateNode::Job(4.0),
-///         TemplateNode::Pass(0.0),
+///         TemplateNode::Job(Duration::from_secs(4)),
+///         TemplateNode::Pass(Duration::ZERO),
 ///     ],
 ///     edges: vec![(0, 1), (0, 2), (1, 3), (2, 3)],
 /// }
@@ -150,7 +162,7 @@ fn single(node: fn(f64) -> TemplateNode) -> Arc<DagTemplate> {
 /// .unwrap();
 /// assert_eq!(t.leaves(), 5);
 /// assert!(matches!(t.node(1), TemplateNode::Unit(sub) if sub.leaves() == 2));
-/// assert_eq!(t.span(), 4.5);
+/// assert_eq!(t.span(), Duration::from_millis(4500));
 /// ```
 #[derive(Clone, Debug, Default)]
 pub struct TemplateSpec {
@@ -161,19 +173,24 @@ pub struct TemplateSpec {
 }
 
 impl TemplateSpec {
-    /// `n` worker jobs of unit work and no edges.
+    /// `n` worker jobs of one second of work each and no edges.
     ///
     /// # Examples
     ///
     /// ```
+    /// use std::time::Duration;
+    ///
     /// use whelm::TemplateSpec;
     ///
     /// let three = TemplateSpec::jobs(3).build().unwrap();
-    /// assert_eq!((three.len(), three.edge_count(), three.span()), (3, 0, 1.0));
+    /// assert_eq!(
+    ///     (three.len(), three.edge_count(), three.span()),
+    ///     (3, 0, Duration::from_secs(1))
+    /// );
     /// ```
     pub fn jobs(n: usize) -> Self {
         Self {
-            nodes: vec![TemplateNode::Job(1.0); n],
+            nodes: vec![TemplateNode::Job(Duration::from_secs(1)); n],
             edges: Vec::new(),
         }
     }
@@ -185,6 +202,8 @@ impl TemplateSpec {
     /// # Examples
     ///
     /// ```
+    /// use std::time::Duration;
+    ///
     /// use whelm::{DagError, TemplateSpec};
     ///
     /// let chain = TemplateSpec {
@@ -192,7 +211,10 @@ impl TemplateSpec {
     ///     ..TemplateSpec::jobs(3)
     /// };
     /// let chain = chain.build().unwrap();
-    /// assert_eq!((chain.len(), chain.edge_count(), chain.span()), (3, 2, 3.0));
+    /// assert_eq!(
+    ///     (chain.len(), chain.edge_count(), chain.span()),
+    ///     (3, 2, Duration::from_secs(3))
+    /// );
     /// let cycle = TemplateSpec {
     ///     edges: vec![(0, 1), (1, 2), (2, 1)],
     ///     ..TemplateSpec::jobs(3)
@@ -268,15 +290,15 @@ impl DagTemplate {
             topo,
             offset,
             bl: Vec::new(),
-            span: 0.0,
+            span: Duration::ZERO,
         };
-        t.bl = t.bottom_levels(|i| t.own_work(i));
-        t.span = t.bl.iter().copied().fold(0.0, f64::max);
+        t.span = t.critical_path(|i| t.own_work(i));
+        t.bl = t.levels(|i| t.own_work(i).as_secs_f64());
         Ok(t)
     }
 
     /// Node `i`'s own work: a leaf's work, or a substituted unit's span.
-    fn own_work(&self, i: usize) -> f64 {
+    fn own_work(&self, i: usize) -> Duration {
         match &self.nodes[i] {
             TemplateNode::Job(w) | TemplateNode::Local(w) | TemplateNode::Pass(w) => *w,
             TemplateNode::Unit(t) => t.span,
@@ -317,11 +339,11 @@ impl DagTemplate {
 
     /// The longest chain of the nodes' own work, a substituted unit weighing its template's span:
     /// a unit's duration with unlimited workers, at scale 1.
-    pub fn span(&self) -> f64 {
+    pub fn span(&self) -> Duration {
         self.span
     }
 
-    /// Node `i`'s bottom level with the nodes' own work (see [`span`](Self::span)).
+    /// Node `i`'s bottom level with the nodes' own work (see [`span`](Self::span)), seconds.
     pub(super) fn own_bottom_level(&self, i: usize) -> f64 {
         self.bl[i]
     }
@@ -417,6 +439,8 @@ impl DagTemplate {
     /// the critical path, within a relative tolerance `tol`.
     ///
     /// ```
+    /// use std::time::Duration;
+    ///
     /// use whelm::TemplateSpec;
     ///
     /// // Node 0 before nodes 1 and 2; node 2 is the heavier branch.
@@ -426,24 +450,25 @@ impl DagTemplate {
     /// }
     /// .build()
     /// .unwrap();
-    /// let work = [1.0, 1.0, 5.0];
+    /// let work = [1, 1, 5].map(Duration::from_secs);
     /// assert_eq!(fork.critical_nodes(|i| work[i], 0.0), [true, false, true]);
     /// ```
-    pub fn critical_nodes(&self, work: impl Fn(usize) -> f64, tol: f64) -> Vec<bool> {
+    pub fn critical_nodes(&self, work: impl Fn(usize) -> Duration, tol: f64) -> Vec<bool> {
         let n = self.len();
-        let w: Vec<f64> = (0..n).map(&work).collect();
+        let w: Vec<Duration> = (0..n).map(&work).collect();
         let below = self.bottom_levels(|i| w[i]);
-        let mut above = vec![0.0f64; n]; // longest path ending just before v
+        let mut above = vec![Duration::ZERO; n]; // longest path ending just before v
         for &v in &self.topo {
             let v = v as usize;
-            above[v] = self.pred[v]
-                .iter()
-                .map(|&p| above[p as usize] + w[p as usize])
-                .fold(0.0, f64::max);
+            above[v] = (self.pred[v].iter())
+                .map(|&p| above[p as usize].saturating_add(w[p as usize]))
+                .max()
+                .unwrap_or_default();
         }
-        let cp = below.iter().copied().fold(0.0, f64::max);
+        let cp = below.iter().copied().max().unwrap_or_default();
+        let bar = secs(cp.as_secs_f64() * (1.0 - tol));
         (0..n)
-            .map(|v| cp > 0.0 && above[v] + below[v] >= cp * (1.0 - tol))
+            .map(|v| !cp.is_zero() && above[v] + below[v] >= bar)
             .collect()
     }
 
@@ -453,6 +478,8 @@ impl DagTemplate {
     /// costs of one unit, say) gives that unit's critical path.
     ///
     /// ```
+    /// use std::time::Duration;
+    ///
     /// use whelm::TemplateSpec;
     ///
     /// let fork = TemplateSpec {
@@ -461,12 +488,12 @@ impl DagTemplate {
     /// }
     /// .build()
     /// .unwrap();
-    /// assert_eq!(fork.critical_path(|_| 1.0), fork.span());
-    /// let work = [1.0, 1.0, 5.0];
-    /// assert_eq!(fork.critical_path(|i| work[i]), 6.0);
+    /// assert_eq!(fork.critical_path(|_| Duration::from_secs(1)), fork.span());
+    /// let work = [1, 1, 5].map(Duration::from_secs);
+    /// assert_eq!(fork.critical_path(|i| work[i]), Duration::from_secs(6));
     /// ```
-    pub fn critical_path(&self, work: impl Fn(usize) -> f64) -> f64 {
-        self.bottom_levels(work).into_iter().fold(0.0, f64::max)
+    pub fn critical_path(&self, work: impl Fn(usize) -> Duration) -> Duration {
+        (self.bottom_levels(work).into_iter().max()).unwrap_or_default()
     }
 
     /// Each node's bottom level under `work`: its work plus the longest chain of work below it.
@@ -475,6 +502,8 @@ impl DagTemplate {
     /// below the unit.
     ///
     /// ```
+    /// use std::time::Duration;
+    ///
     /// use whelm::TemplateSpec;
     ///
     /// let fork = TemplateSpec {
@@ -483,10 +512,26 @@ impl DagTemplate {
     /// }
     /// .build()
     /// .unwrap();
-    /// let work = [1.0, 1.0, 5.0];
-    /// assert_eq!(fork.bottom_levels(|i| work[i]), [6.0, 1.0, 5.0]);
+    /// let work = [1, 1, 5].map(Duration::from_secs);
+    /// assert_eq!(
+    ///     fork.bottom_levels(|i| work[i]),
+    ///     [6, 1, 5].map(Duration::from_secs)
+    /// );
     /// ```
-    pub fn bottom_levels(&self, work: impl Fn(usize) -> f64) -> Vec<f64> {
+    pub fn bottom_levels(&self, work: impl Fn(usize) -> Duration) -> Vec<Duration> {
+        let mut below = vec![Duration::ZERO; self.len()];
+        for &n in self.topo.iter().rev() {
+            let n = n as usize;
+            let tail = (self.succ[n].iter().map(|&c| below[c as usize]))
+                .max()
+                .unwrap_or_default();
+            below[n] = work(n).saturating_add(tail);
+        }
+        below
+    }
+
+    /// [`bottom_levels`](Self::bottom_levels) in seconds, for the DAG layer's rank arithmetic.
+    pub(super) fn levels(&self, work: impl Fn(usize) -> f64) -> Vec<f64> {
         let mut below = vec![0.0f64; self.len()];
         for &n in self.topo.iter().rev() {
             let n = n as usize;

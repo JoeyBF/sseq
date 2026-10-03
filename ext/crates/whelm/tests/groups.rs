@@ -1,8 +1,10 @@
 //! Group order: restart-stable ordering by id, and aging behind a wide old group.
 
+use std::time::Duration;
+
 use whelm::{
     Config, DEFAULT_AGE_LIMIT, GroupOrder, Input, JobId, JobSpec, Output, Policy, Resources,
-    Scheduler, WorkerId, WorkerState, nassau,
+    Scheduler, Time, WorkerId, WorkerState, nassau,
 };
 
 /// The `(job, worker)` of each start in `out`.
@@ -42,12 +44,13 @@ fn run_order(order: &[u64], group_order: GroupOrder) -> Vec<u64> {
         ..Config::default()
     });
     for (i, &g) in order.iter().enumerate() {
-        p.handle(Input::Submit(job(g, g)), i as f64);
+        p.handle(Input::Submit(job(g, g)), Time::from_secs(i as u64));
     }
-    p.handle(Input::Worker(worker(1)), 10.0);
+    p.handle(Input::Worker(worker(1)), Time::from_secs(10));
     let mut ran = Vec::new();
-    for t in 0..order.len() {
-        let out = starts(p.poll(10.0 + t as f64));
+    for t in 0..order.len() as u64 {
+        let t = Time::from_secs(10 + t);
+        let out = starts(p.poll(t));
         assert_eq!(out.len(), 1);
         ran.push(out[0].0);
         p.handle(
@@ -55,7 +58,7 @@ fn run_order(order: &[u64], group_order: GroupOrder) -> Vec<u64> {
                 job: out[0].0,
                 attempt: 1,
             },
-            10.5 + t as f64,
+            t + Duration::from_millis(500),
         );
     }
     ran
@@ -93,20 +96,20 @@ fn group_order_by_id_ignores_submission_order() {
 fn young_group_behind_wide_old_group_waits_at_most_age_limit() {
     const SLOTS: usize = 4;
     const OLD_JOBS: u64 = 1000;
-    const RUN: f64 = 100.0;
+    const RUN: Duration = Duration::from_secs(100);
     const YOUNG: u64 = 1_000_000;
-    let wait = |policy: &mut dyn Policy| -> f64 {
-        policy.handle(Input::Worker(worker(SLOTS)), 0.0);
+    let wait = |policy: &mut dyn Policy| -> Duration {
+        policy.handle(Input::Worker(worker(SLOTS)), Time::ZERO);
         let mut released = 0;
-        let mut running: Vec<(u64, f64)> = Vec::new();
-        let mut t = 0.0;
+        let mut running: Vec<(u64, Time)> = Vec::new();
+        let (mut t, ten) = (Time::ZERO, Time::from_secs(10));
         loop {
             // The old walk keeps two jobs per slot ready.
             while released < OLD_JOBS && policy.stats().waiting < 2 * SLOTS {
                 policy.handle(Input::Submit(job(released, nassau::group(1, 20))), t);
                 released += 1;
             }
-            if t == 10.0 {
+            if t == ten {
                 policy.handle(Input::Submit(job(YOUNG, nassau::group(3, 40))), t);
             }
             running.retain(|&(j, end)| {
@@ -119,12 +122,12 @@ fn young_group_behind_wide_old_group_waits_at_most_age_limit() {
             });
             for (j, _) in starts(policy.poll(t)) {
                 if j == YOUNG {
-                    return t - 10.0;
+                    return t - ten;
                 }
                 running.push((j, t + RUN));
             }
-            t += 1.0;
-            assert!(t < 1e6, "the young job never ran");
+            t += Duration::from_secs(1);
+            assert!(t < Time::from_secs(1_000_000), "the young job never ran");
         }
     };
     let by_id = |base: Config, age_limit| Config {
@@ -132,23 +135,23 @@ fn young_group_behind_wide_old_group_waits_at_most_age_limit() {
         age_limit,
         ..base
     };
-    let bound = DEFAULT_AGE_LIMIT + RUN + 1.0;
+    let bound = DEFAULT_AGE_LIMIT + RUN + Duration::from_secs(1);
     let w = wait(&mut Scheduler::new(by_id(
         Config::default(),
         Some(DEFAULT_AGE_LIMIT),
     )));
-    assert!(w <= bound, "backfill: {w}");
+    assert!(w <= bound, "backfill: {w:?}");
     let w = wait(&mut Scheduler::new(by_id(
         Config::best_fit(),
         Some(DEFAULT_AGE_LIMIT),
     )));
-    assert!(w <= bound, "best fit: {w}");
+    assert!(w <= bound, "best fit: {w:?}");
     // The default configuration ages.
     assert_eq!(Config::default().age_limit, Some(DEFAULT_AGE_LIMIT));
     // Control: strict priority waits for the whole old group.
     let w = wait(&mut Scheduler::new(by_id(Config::default(), None)));
     assert!(
-        w >= (OLD_JOBS as f64 / SLOTS as f64 - 1.0) * RUN,
-        "strict: {w}"
+        w.as_secs_f64() >= (OLD_JOBS as f64 / SLOTS as f64 - 1.0) * RUN.as_secs_f64(),
+        "strict: {w:?}"
     );
 }

@@ -37,7 +37,7 @@ pub const DEV: usize = 1;
 /// The demands placed on a worker count its jobs in this dimension.
 ///
 /// ```
-/// use whelm::{Config, Input, JobSpec, Policy, Resources, SLOTS, Scheduler, WorkerState};
+/// use whelm::{Config, Input, JobSpec, Policy, Resources, SLOTS, Scheduler, Time, WorkerState};
 ///
 /// let mut p = Scheduler::new(Config::default());
 /// p.handle(
@@ -47,7 +47,7 @@ pub const DEV: usize = 1;
 ///         slots: 4,
 ///         ..Default::default()
 ///     }),
-///     0.0,
+///     Time::ZERO,
 /// );
 /// for id in 1..=3 {
 ///     p.handle(
@@ -56,10 +56,10 @@ pub const DEV: usize = 1;
 ///             demand: Resources::mem(10),
 ///             ..Default::default()
 ///         }),
-///         0.0,
+///         Time::ZERO,
 ///     );
 /// }
-/// p.poll(0.0);
+/// p.poll(Time::ZERO);
 /// let placed = p.stats().workers[0].placed;
 /// assert_eq!((placed[SLOTS], placed[whelm::MEM]), (3, 30));
 /// ```

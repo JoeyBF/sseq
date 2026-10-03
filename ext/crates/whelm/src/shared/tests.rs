@@ -7,7 +7,7 @@ use std::{
 
 use crate::{
     Config, FailKind, Input, JobId, JobSpec, Policy, Resources, RetryConfig, Scheduler,
-    SharedPolicy, Speculate, WorkerId, WorkerState,
+    SharedPolicy, Speculate, Time, WorkerId, WorkerState,
 };
 
 /// A one-slot worker of class "x".
@@ -27,7 +27,7 @@ fn shared(max_attempts: u32) -> SharedPolicy<Scheduler> {
             retry: RetryConfig { max_attempts },
             ..Config::fifo()
         }),
-        || 0.0,
+        || Time::ZERO,
     )
 }
 
@@ -140,10 +140,10 @@ fn complete_after_worker_gone_cancels_the_retry() {
 fn speculative_start_is_rejected() {
     let mut cfg = Config::fifo();
     cfg.speed.speculate = Some(Speculate::default());
-    let s = SharedPolicy::new(Scheduler::new(cfg), || 0.0);
+    let s = SharedPolicy::new(Scheduler::new(cfg), || Time::ZERO);
     s.worker_update(worker(1));
     let mut j = job(7);
-    j.work = Some(100.0);
+    j.work = Some(Duration::from_secs(100));
     let l = s.lease(j);
     s.worker_update(WorkerState {
         speed: 4.0,

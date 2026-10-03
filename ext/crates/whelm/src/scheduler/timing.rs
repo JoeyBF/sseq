@@ -1,7 +1,9 @@
 //! Run-time estimates from the machine model, and learning from finished attempts.
 
+use std::time::Duration;
+
 use super::{Job, Running, Scheduler, Worker, order::ordered, tick_occ};
-use crate::{Instant, JobId};
+use crate::{JobId, Time, time::secs};
 
 impl Scheduler {
     /// How fast `job` runs on `w`: the worker's speed times the job kind's factor on its class.
@@ -12,15 +14,15 @@ impl Scheduler {
 
     /// The expected run time of `job` on `w`: its work over its [`speed`](Self::speed) there,
     /// `None` without a work estimate. Every run-time estimate goes through here.
-    pub(super) fn eta(&self, job: &Job, w: &Worker) -> Option<f64> {
-        job.spec.work.map(|work| work / self.speed(job, w))
+    pub(super) fn eta(&self, job: &Job, w: &Worker) -> Option<Duration> {
+        (job.spec.work).map(|work| secs(work.as_secs_f64() / self.speed(job, w)))
     }
 
     /// When a running job is expected to end: the earliest expected end of its live attempts,
     /// each its start plus its [`eta`](Self::eta), or, once that has passed, as far beyond now as
     /// it has run (an overrunning attempt is assumed half done, StarPU's rule). `None` if its run
     /// time is unknown.
-    pub(super) fn expected_end(&self, r: &Running) -> Option<Instant> {
+    pub(super) fn expected_end(&self, r: &Running) -> Option<Time> {
         r.live
             .iter()
             .filter_map(|run| {
@@ -28,10 +30,10 @@ impl Scheduler {
                 Some(if end > self.now {
                     end
                 } else {
-                    self.now + (self.now - run.started).max(0.0)
+                    self.now + (self.now - run.started)
                 })
             })
-            .reduce(f64::min)
+            .min()
     }
 
     /// Live attempt `i` of a job finished: learn its speed on its worker from its duration and the
@@ -46,8 +48,8 @@ impl Scheduler {
         };
         tick_occ(w, now);
         let dt = now - run.started;
-        let k = if dt > 0.0 {
-            (w.occ - run.occ0) / dt
+        let k = if dt > Duration::ZERO {
+            (w.occ - run.occ0) / dt.as_secs_f64()
         } else {
             1.0
         };
