@@ -11,12 +11,19 @@ use whelm::{
 /// A DAG layer over backfill with one roomy worker.
 fn dag(config: DagConfig) -> DagScheduler<Scheduler> {
     let mut d = DagScheduler::new(config, Scheduler::new(Config::default()));
-    join(
-        &mut d,
-        WorkerState::new(0, "x", 64, Resources::mem(1000)),
-        0.0,
-    );
+    join(&mut d, worker(0, 64, 1000), 0.0);
     d
+}
+
+/// Worker `id`, of class "x", with `slots` slots and `bytes` of memory.
+fn worker(id: u64, slots: usize, bytes: u64) -> WorkerState {
+    WorkerState {
+        id,
+        class: "x".into(),
+        slots,
+        budget: Resources::mem(bytes),
+        ..Default::default()
+    }
 }
 
 /// A worker joins.
@@ -32,11 +39,13 @@ fn complete(d: &mut DagScheduler<Scheduler>, job: JobId, now: f64) {
 /// A unit job in group 0 with the given dependencies.
 fn job(id: JobId, deps: &[JobId]) -> DagJob {
     DagJob {
-        spec: JobSpec::new(id, Resources::mem(1), 0),
+        spec: JobSpec {
+            id,
+            demand: Resources::mem(1),
+            ..Default::default()
+        },
         deps: deps.to_vec(),
-        work_estimate: None,
-        passthrough: false,
-        local: false,
+        ..Default::default()
     }
 }
 
@@ -212,11 +221,7 @@ fn the_rank_term_orders_ready_jobs() {
             ..Config::default()
         });
         let mut d = DagScheduler::new(DagConfig::default(), policy);
-        join(
-            &mut d,
-            WorkerState::new(0, "x", 1, Resources::mem(1000)),
-            0.0,
-        );
+        join(&mut d, worker(0, 1, 1000), 0.0);
         let w = |id, deps: &[JobId], work| DagJob {
             work_estimate: Some(work),
             ..job(id, deps)
@@ -256,7 +261,7 @@ fn worker_loss_retries_automatically() {
     assert!(d.poll(1.0).is_empty());
     complete(&mut d, 1, 1.5);
     assert!(d.poll(1.5).is_empty(), "the lost attempt's report is stale");
-    join(&mut d, WorkerState::new(5, "x", 1, Resources::mem(10)), 2.0);
+    join(&mut d, worker(5, 1, 10), 2.0);
     let retry = Output::Start {
         job: 1,
         attempt: 2,
@@ -278,11 +283,7 @@ fn snapshot_round_trip() {
     let json = serde_json::to_string(&d.snapshot()).unwrap();
     let snap = serde_json::from_str(&json).unwrap();
     let mut r = DagScheduler::restore(snap, Scheduler::new(Config::default()), None, 10.0);
-    join(
-        &mut r,
-        WorkerState::new(0, "x", 64, Resources::mem(1000)),
-        10.0,
-    );
+    join(&mut r, worker(0, 64, 1000), 10.0);
     assert_eq!(r.dag_stats(), d.dag_stats());
     // Job 1 was submitted before the snapshot: it is submitted again to the new policy.
     assert_eq!(placed(&mut r, 10.0), vec![1]);
@@ -327,7 +328,7 @@ proptest! {
         // Enough attempts that churn never makes the policy give up.
         let config = Config { retry: RetryConfig { max_attempts: 100 }, ..Config::default() };
         let mut d = DagScheduler::new(DagConfig::default(), Scheduler::new(config));
-        join(&mut d, WorkerState::new(0, "x", slots, Resources::mem(10)), 0.0);
+        join(&mut d, worker(0, slots, 10), 0.0);
         let ids: Vec<JobId> = order.into_iter().filter(|&i| i < n).map(|i| i as JobId).collect();
         let mut done: BTreeSet<JobId> = BTreeSet::new();
         let mut running: Vec<(JobId, Attempt)> = Vec::new();
@@ -346,7 +347,7 @@ proptest! {
                 for (job, attempt) in running.drain(..) {
                     d.handle(Input::Done { job, attempt }, *t);
                 }
-                join(d, WorkerState::new(0, "x", slots, Resources::mem(10)), *t);
+                join(d, worker(0, slots, 10), *t);
             }
             steps += 1;
             for o in d.poll(*t) {

@@ -34,12 +34,13 @@ struct Stream {
 fn run(p: &mut dyn Policy, s: &Stream) -> Option<f64> {
     for w in 0..s.workers {
         p.handle(
-            Input::Worker(WorkerState::new(
-                w as u64,
-                "x",
-                s.slots,
-                Resources::mem(s.budget),
-            )),
+            Input::Worker(WorkerState {
+                id: w as u64,
+                class: "x".into(),
+                slots: s.slots,
+                budget: Resources::mem(s.budget),
+                ..Default::default()
+            }),
             0.0,
         );
     }
@@ -54,15 +55,24 @@ fn run(p: &mut dyn Policy, s: &Stream) -> Option<f64> {
         let waiting = p.stats().waiting;
         for _ in waiting..(s.workers * s.slots / 2).max(2) {
             let (demand, d) = s.small[next as usize % s.small.len()];
-            let mut small = JobSpec::new(next, Resources::mem(demand), 1_000 + next);
-            small.work = Some(d as f64);
+            let small = JobSpec {
+                id: next,
+                demand: Resources::mem(demand),
+                group: 1_000 + next,
+                work: Some(d as f64),
+                ..Default::default()
+            };
             p.handle(Input::Submit(small), t);
             duration.insert(next, d);
             next += 1;
         }
         if !big_submitted && t >= s.big_at {
-            let mut big = JobSpec::new(BIG, Resources::mem(s.big_demand), 0);
-            big.priority = Some(-1);
+            let big = JobSpec {
+                id: BIG,
+                demand: Resources::mem(s.big_demand),
+                priority: Some(-1),
+                ..Default::default()
+            };
             p.handle(Input::Submit(big), t);
             big_submitted = true;
         }

@@ -19,11 +19,15 @@ impl<P: Policy> DagScheduler<P> {
     ///
     /// ```
     /// # use whelm::{Config, DagConfig, DagJob, DagScheduler, Input, JobSpec, Output, Policy,
-    /// #     Resources, Scheduler, WorkerState};
+    /// #     Scheduler, WorkerState};
     /// # let config = DagConfig { auto_submit: false, ..DagConfig::default() };
     /// # let mut dag = DagScheduler::new(config, Scheduler::new(Config::fifo()));
-    /// # dag.handle(Input::Worker(WorkerState::new(1, "cpu", 1, Resources::mem(100))), 0.0);
-    /// # let job = |id, deps| DagJob::new(JobSpec::new(id, Resources::mem(1), 0), deps);
+    /// # dag.handle(Input::Worker(WorkerState { id: 1, ..Default::default() }), 0.0);
+    /// # let job = |id, deps| DagJob {
+    /// #     spec: JobSpec { id, ..Default::default() },
+    /// #     deps,
+    /// #     ..Default::default()
+    /// # };
     /// dag.declare([job(1, vec![]), job(2, vec![1])], 0.0).unwrap();
     /// assert_eq!(dag.poll(0.0), vec![Output::Ready { job: 1 }]);
     /// assert!(!dag.release(2, 0.0));
@@ -63,10 +67,14 @@ impl<P: Policy> DagScheduler<P> {
     ///
     /// ```
     /// # use whelm::{Config, DagConfig, DagError, DagJob, DagScheduler, Input, JobSpec, Output,
-    /// #     Policy, Resources, Scheduler, WorkerState};
+    /// #     Policy, Scheduler, WorkerState};
     /// # let mut dag = DagScheduler::new(DagConfig::default(), Scheduler::new(Config::fifo()));
-    /// # dag.handle(Input::Worker(WorkerState::new(1, "cpu", 1, Resources::mem(100))), 0.0);
-    /// # let job = |id, deps| DagJob::new(JobSpec::new(id, Resources::mem(1), 0), deps);
+    /// # dag.handle(Input::Worker(WorkerState { id: 1, ..Default::default() }), 0.0);
+    /// # let job = |id, deps| DagJob {
+    /// #     spec: JobSpec { id, ..Default::default() },
+    /// #     deps,
+    /// #     ..Default::default()
+    /// # };
     /// dag.declare([job(1, vec![])], 0.0).unwrap();
     /// dag.poll(0.0);
     /// dag.handle(Input::Done { job: 1, attempt: 1 }, 1.0);
@@ -114,10 +122,14 @@ impl<P: Policy> DagScheduler<P> {
     ///
     /// ```
     /// # use whelm::{Config, DagConfig, DagJob, DagScheduler, DagStats, Input, JobSpec, Output,
-    /// #     Policy, Resources, Scheduler, WorkerState};
+    /// #     Policy, Scheduler, WorkerState};
     /// # let mut dag = DagScheduler::new(DagConfig::default(), Scheduler::new(Config::fifo()));
-    /// # dag.handle(Input::Worker(WorkerState::new(1, "cpu", 1, Resources::mem(100))), 0.0);
-    /// # let job = |id, deps| DagJob::new(JobSpec::new(id, Resources::mem(1), 0), deps);
+    /// # dag.handle(Input::Worker(WorkerState { id: 1, ..Default::default() }), 0.0);
+    /// # let job = |id, deps| DagJob {
+    /// #     spec: JobSpec { id, ..Default::default() },
+    /// #     deps,
+    /// #     ..Default::default()
+    /// # };
     /// dag.declare([job(1, vec![]), job(2, vec![1]), job(3, vec![2])], 0.0)
     ///     .unwrap();
     /// dag.poll(0.0);
@@ -206,29 +218,58 @@ impl<P: Policy> DagScheduler<P> {
     ///
     /// ```
     /// # use std::sync::Arc;
-    /// # use whelm::{Config, DagConfig, DagJob, DagScheduler, DagTemplate, Input, JobSpec, Output,
-    /// #     Policy, Resources, Scheduler, Unit, WorkerState};
+    /// # use whelm::{Config, DagConfig, DagJob, DagScheduler, Input, JobSpec, Output, Policy,
+    /// #     Scheduler, TemplateSpec, Unit, WorkerState};
     /// # let mut dag = DagScheduler::new(DagConfig::default(), Scheduler::new(Config::fifo()));
-    /// # dag.handle(Input::Worker(WorkerState::new(1, "cpu", 1, Resources::mem(100))), 0.0);
-    /// # let job = |id, deps| DagJob::new(JobSpec::new(id, Resources::mem(1), 0), deps);
-    /// let pair = Arc::new(DagTemplate::new(2, []).unwrap());
-    /// let spec = JobSpec::new(0, Resources::mem(1), 0);
-    /// dag.declare(
-    ///     [
-    ///         Unit::new(200, 100, pair.clone(), spec.clone(), vec![]),
-    ///         Unit::new(300, 110, pair, spec, vec![2]),
-    ///         job(2, vec![200]).into(),
-    ///     ],
-    ///     0.0,
-    /// )
-    /// .unwrap();
-    /// assert_eq!(dag.poll(0.0), vec![Output::Start { job: 100, attempt: 1, worker: 1 }]);
+    /// # dag.handle(Input::Worker(WorkerState { id: 1, ..Default::default() }), 0.0);
+    /// # let job = |id, deps| DagJob {
+    /// #     spec: JobSpec { id, ..Default::default() },
+    /// #     deps,
+    /// #     ..Default::default()
+    /// # };
+    /// let pair = Arc::new(TemplateSpec::jobs(2).build().unwrap());
+    /// let first = Unit {
+    ///     id: 200,
+    ///     base: 100,
+    ///     template: pair.clone(),
+    ///     ..Default::default()
+    /// };
+    /// let second = Unit {
+    ///     id: 300,
+    ///     base: 110,
+    ///     template: pair,
+    ///     deps: vec![2],
+    ///     ..Default::default()
+    /// };
+    /// dag.declare([first, second, job(2, vec![200]).into()], 0.0)
+    ///     .unwrap();
+    /// assert_eq!(
+    ///     dag.poll(0.0),
+    ///     vec![Output::Start {
+    ///         job: 100,
+    ///         attempt: 1,
+    ///         worker: 1
+    ///     }]
+    /// );
     /// assert_eq!(dag.close(300, 0.0), Ok(vec![]));
     /// assert_eq!(dag.close(200, 1.0), Ok(vec![100]));
     /// assert_eq!((dag.stats().waiting, dag.stats().running), (1, 1));
     ///
-    /// dag.handle(Input::Done { job: 100, attempt: 1 }, 2.0);
-    /// assert_eq!(dag.poll(2.0), vec![Output::Start { job: 2, attempt: 1, worker: 1 }]);
+    /// dag.handle(
+    ///     Input::Done {
+    ///         job: 100,
+    ///         attempt: 1,
+    ///     },
+    ///     2.0,
+    /// );
+    /// assert_eq!(
+    ///     dag.poll(2.0),
+    ///     vec![Output::Start {
+    ///         job: 2,
+    ///         attempt: 1,
+    ///         worker: 1
+    ///     }]
+    /// );
     /// dag.handle(Input::Done { job: 2, attempt: 1 }, 3.0);
     /// assert!(dag.poll(3.0).is_empty());
     /// assert_eq!(dag.dag_stats().units, 0);

@@ -841,9 +841,12 @@ fn run(
             } => {
                 let id = sh.next_id;
                 sh.next_id += 1;
-                let mut demand = Resources::mem(demand).with_dev(dev.unwrap_or(0));
-                demand[SLOTS] = slots;
                 let spec = JobSpec {
+                    id,
+                    demand: Resources::mem(demand)
+                        .with_dev(dev.unwrap_or(0))
+                        .with_slots(slots),
+                    group,
                     priority,
                     rank: rank.map(f64::from),
                     weight,
@@ -851,7 +854,6 @@ fn run(
                     constraints: constraints.clone(),
                     work: work.map(f64::from),
                     kind: kind.map(|k| format!("k{k}")),
-                    ..JobSpec::new(id, demand, group)
                 };
                 sh.submit(spec, &mut *p);
             }
@@ -932,16 +934,14 @@ fn run(
                 per_task,
             } => {
                 let s = WorkerState {
+                    id,
+                    class: format!("c{class}"),
+                    slots,
+                    budget: Resources::mem(budget).with_dev(dev_cap),
                     reported_used: Resources::mem(used),
                     reported_baseline: Resources::mem(baseline),
                     speed: class_speed(class),
                     per_task: Resources::ZERO.with_dev(per_task),
-                    ..WorkerState::new(
-                        id,
-                        format!("c{class}"),
-                        slots,
-                        Resources::mem(budget).with_dev(dev_cap),
-                    )
                 };
                 sh.speeds.refresh(id, &s.class, s.speed);
                 sh.workers.insert(id, s.clone());

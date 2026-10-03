@@ -12,7 +12,12 @@ use crate::{
 
 /// A one-slot worker of class "x".
 fn worker(id: WorkerId) -> WorkerState {
-    WorkerState::new(id, "x", 1, Resources::mem(100))
+    WorkerState {
+        id,
+        class: "x".into(),
+        budget: Resources::mem(100),
+        ..Default::default()
+    }
 }
 
 /// A shared FIFO scheduler with `max_attempts` attempts per job, on a manual clock of 0.
@@ -43,7 +48,11 @@ fn ticker_restarts_after_stop() {
 
 /// A job.
 fn job(id: JobId) -> JobSpec {
-    JobSpec::new(id, Resources::mem(1), 0)
+    JobSpec {
+        id,
+        demand: Resources::mem(1),
+        ..Default::default()
+    }
 }
 
 /// A failed lease is retried on another worker, then completes.

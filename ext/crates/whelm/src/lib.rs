@@ -49,14 +49,23 @@
 //! let mut policy = Scheduler::new(Config::default());
 //!
 //! // Worker 1 joins: class "cpu", 4 execution slots, 16 GB of host memory.
-//! let worker = WorkerState::new(1, "cpu", 4, Resources::mem_gb(16.0));
+//! let worker = WorkerState {
+//!     id: 1,
+//!     class: "cpu".into(),
+//!     slots: 4,
+//!     budget: Resources::mem_gb(16.0),
+//!     ..Default::default()
+//! };
 //! policy.handle(Input::Worker(worker), 0.0);
 //!
-//! // Job 7 becomes ready: it expects to use 2 GB and belongs to group 0.
-//! policy.handle(
-//!     Input::Submit(JobSpec::new(7, Resources::mem_gb(2.0), 0)),
-//!     0.0,
-//! );
+//! // Job 7 becomes ready: it expects to use 2 GB and belongs to group 3.
+//! let job = JobSpec {
+//!     id: 7,
+//!     demand: Resources::mem_gb(2.0),
+//!     group: 3,
+//!     ..Default::default()
+//! };
+//! policy.handle(Input::Submit(job), 0.0);
 //!
 //! // After a batch of inputs, poll: start attempt 1 of job 7 on worker 1.
 //! assert_eq!(
@@ -75,6 +84,11 @@
 //! assert_eq!(policy.stats().placements_total, 1);
 //! ```
 //!
+//! Workers and jobs, like configurations, are plain structs written as literals: name the fields
+//! that matter and take the rest from [`Default`]. Each type's `Default` documents what the
+//! omitted fields mean; a [`JobSpec`] needs little more than an id, a [`WorkerState`] an id and
+//! its capacity.
+//!
 //! That is the whole protocol: [`handle`](Policy::handle) every event as it happens, then
 //! [`poll`](Policy::poll) and act on each output. `handle` applies an input at once but never
 //! places anything; placement happens in `poll`, which also returns the outputs earlier inputs
@@ -82,14 +96,20 @@
 //! for the workers and reports completions back.
 //!
 //! ```
-//! # use whelm::{Config, Input, JobSpec, Output, Policy, Resources, Scheduler, WorkerState};
+//! # use whelm::{Config, Input, JobSpec, Output, Policy, Scheduler, WorkerState};
 //! let mut policy = Scheduler::new(Config::default());
-//! policy.handle(
-//!     Input::Worker(WorkerState::new(1, "cpu", 2, Resources::ZERO)),
-//!     0.0,
-//! );
+//! let worker = WorkerState {
+//!     id: 1,
+//!     slots: 2,
+//!     ..Default::default()
+//! };
+//! policy.handle(Input::Worker(worker), 0.0);
 //! for id in 1..=3 {
-//!     policy.handle(Input::Submit(JobSpec::new(id, Resources::ZERO, 0)), 0.0);
+//!     let job = JobSpec {
+//!         id,
+//!         ..Default::default()
+//!     };
+//!     policy.handle(Input::Submit(job), 0.0);
 //! }
 //!
 //! // The caller's side: attempts sent to workers and not yet answered.
@@ -135,13 +155,20 @@
 //! ignored.
 //!
 //! ```
-//! # use whelm::{Config, Input, JobSpec, Output, Policy, Resources, Scheduler, WorkerState};
+//! # use whelm::{Config, Input, JobSpec, Output, Policy, Scheduler, WorkerState};
 //! let mut p = Scheduler::new(Config::default());
 //! p.handle(
-//!     Input::Worker(WorkerState::new(1, "cpu", 4, Resources::ZERO)),
+//!     Input::Worker(WorkerState {
+//!         id: 1,
+//!         slots: 4,
+//!         ..Default::default()
+//!     }),
 //!     0.0,
 //! );
-//! let job = JobSpec::new(1, Resources::ZERO, 0);
+//! let job = JobSpec {
+//!     id: 1,
+//!     ..Default::default()
+//! };
 //!
 //! p.handle(Input::Submit(job.clone()), 0.0);
 //! p.handle(Input::Submit(job.clone()), 0.0); // already waiting: ignored
@@ -181,12 +208,15 @@
 //!
 //! ```
 //! # use whelm::{
-//! #     Config, FailKind, Input, JobSpec, Output, Policy, Resources, Scheduler, WorkerState
+//! #     Config, FailKind, Input, JobSpec, Output, Policy, Scheduler, WorkerState
 //! # };
 //! let mut p = Scheduler::new(Config::default());
 //! for id in [1, 2] {
 //!     p.handle(
-//!         Input::Worker(WorkerState::new(id, "cpu", 1, Resources::ZERO)),
+//!         Input::Worker(WorkerState {
+//!             id,
+//!             ..Default::default()
+//!         }),
 //!         0.0,
 //!     );
 //! }
@@ -197,8 +227,13 @@
 //!     why: why.into(),
 //! };
 //!
-//! p.handle(Input::Submit(JobSpec::new(5, Resources::ZERO, 0)), 0.0);
-//! p.handle(Input::Submit(JobSpec::new(6, Resources::ZERO, 0)), 0.0);
+//! for id in [5, 6] {
+//!     let job = JobSpec {
+//!         id,
+//!         ..Default::default()
+//!     };
+//!     p.handle(Input::Submit(job), 0.0);
+//! }
 //! assert_eq!(
 //!     p.poll(0.0),
 //!     [
@@ -255,7 +290,7 @@
 //!
 //! ```
 //! # use whelm::{
-//! #     Config, FailKind, GaveUp, Input, JobSpec, Output, Policy, Resources, RetryConfig,
+//! #     Config, FailKind, GaveUp, Input, JobSpec, Output, Policy, RetryConfig,
 //! #     Scheduler, Tried, WorkerState,
 //! # };
 //! let config = Config {
@@ -264,10 +299,20 @@
 //! };
 //! let mut p = Scheduler::new(config);
 //! p.handle(
-//!     Input::Worker(WorkerState::new(1, "gpu", 1, Resources::ZERO)),
+//!     Input::Worker(WorkerState {
+//!         id: 1,
+//!         class: "gpu".into(),
+//!         ..Default::default()
+//!     }),
 //!     0.0,
 //! );
-//! p.handle(Input::Submit(JobSpec::new(5, Resources::ZERO, 0)), 0.0);
+//! p.handle(
+//!     Input::Submit(JobSpec {
+//!         id: 5,
+//!         ..Default::default()
+//!     }),
+//!     0.0,
+//! );
 //!
 //! let oom = |attempt| Input::Failed {
 //!     job: 5,
@@ -316,14 +361,21 @@
 //! attempt's resources at once and asks the caller to [`Stop`](Output::Stop) it.
 //!
 //! ```
-//! # use whelm::{Config, Input, JobSpec, Output, Policy, Resources, Scheduler, WorkerState};
+//! # use whelm::{Config, Input, JobSpec, Output, Policy, Scheduler, WorkerState};
 //! let mut p = Scheduler::new(Config::default());
 //! p.handle(
-//!     Input::Worker(WorkerState::new(1, "cpu", 1, Resources::ZERO)),
+//!     Input::Worker(WorkerState {
+//!         id: 1,
+//!         ..Default::default()
+//!     }),
 //!     0.0,
 //! );
-//! p.handle(Input::Submit(JobSpec::new(1, Resources::ZERO, 0)), 0.0);
-//! p.handle(Input::Submit(JobSpec::new(2, Resources::ZERO, 0)), 0.0);
+//! let job = |id| JobSpec {
+//!     id,
+//!     ..Default::default()
+//! };
+//! p.handle(Input::Submit(job(1)), 0.0);
+//! p.handle(Input::Submit(job(2)), 0.0);
 //! assert_eq!(
 //!     p.poll(0.0),
 //!     [Output::Start {
@@ -353,16 +405,25 @@
 //!
 //! ```
 //! # use whelm::{
-//! #     Config, FailKind, Input, JobSpec, Output, Policy, Resources, Scheduler, WorkerState
+//! #     Config, FailKind, Input, JobSpec, Output, Policy, Scheduler, WorkerState
 //! # };
 //! let mut p = Scheduler::new(Config::default());
 //! for id in [1, 2] {
 //!     p.handle(
-//!         Input::Worker(WorkerState::new(id, "cpu", 1, Resources::ZERO)),
+//!         Input::Worker(WorkerState {
+//!             id,
+//!             ..Default::default()
+//!         }),
 //!         0.0,
 //!     );
 //! }
-//! p.handle(Input::Submit(JobSpec::new(5, Resources::ZERO, 0)), 0.0);
+//! p.handle(
+//!     Input::Submit(JobSpec {
+//!         id: 5,
+//!         ..Default::default()
+//!     }),
+//!     0.0,
+//! );
 //! assert_eq!(
 //!     p.poll(0.0),
 //!     [Output::Start {
@@ -401,15 +462,24 @@
 //! [`FailKind::LinkDied`], and is retried like any other failure. The caller does not resubmit.
 //!
 //! ```
-//! # use whelm::{Config, Input, JobSpec, Output, Policy, Resources, Scheduler, WorkerState};
+//! # use whelm::{Config, Input, JobSpec, Output, Policy, Scheduler, WorkerState};
 //! let mut p = Scheduler::new(Config::default());
 //! for id in [1, 2] {
 //!     p.handle(
-//!         Input::Worker(WorkerState::new(id, "cpu", 1, Resources::ZERO)),
+//!         Input::Worker(WorkerState {
+//!             id,
+//!             ..Default::default()
+//!         }),
 //!         0.0,
 //!     );
 //! }
-//! p.handle(Input::Submit(JobSpec::new(5, Resources::ZERO, 0)), 0.0);
+//! p.handle(
+//!     Input::Submit(JobSpec {
+//!         id: 5,
+//!         ..Default::default()
+//!     }),
+//!     0.0,
+//! );
 //! assert_eq!(
 //!     p.poll(0.0),
 //!     [Output::Start {
@@ -463,15 +533,28 @@
 //! # use whelm::{Config, Input, JobSpec, Output, Policy, Resources, Scheduler, WorkerState};
 //! let mut p = Scheduler::new(Config::default());
 //! p.handle(
-//!     Input::Worker(WorkerState::new(1, "cpu", 2, Resources::mem_gb(10.0))),
+//!     Input::Worker(WorkerState {
+//!         id: 1,
+//!         slots: 2,
+//!         budget: Resources::mem_gb(10.0),
+//!         ..Default::default()
+//!     }),
 //!     0.0,
 //! );
 //! p.handle(
-//!     Input::Submit(JobSpec::new(1, Resources::mem_gb(6.0), 0)),
+//!     Input::Submit(JobSpec {
+//!         id: 1,
+//!         demand: Resources::mem_gb(6.0),
+//!         ..Default::default()
+//!     }),
 //!     0.0,
 //! );
 //! p.handle(
-//!     Input::Submit(JobSpec::new(2, Resources::mem_gb(6.0), 0)),
+//!     Input::Submit(JobSpec {
+//!         id: 2,
+//!         demand: Resources::mem_gb(6.0),
+//!         ..Default::default()
+//!     }),
 //!     0.0,
 //! );
 //!
@@ -510,10 +593,19 @@
 //! ```
 //! # use whelm::{Config, Input, JobSpec, Output, Policy, Resources, Scheduler, WorkerState};
 //! let mut p = Scheduler::new(Config::default());
-//! let worker = WorkerState::new(1, "cpu", 4, Resources::mem_gb(10.0));
+//! let worker = WorkerState {
+//!     id: 1,
+//!     slots: 4,
+//!     budget: Resources::mem_gb(10.0),
+//!     ..Default::default()
+//! };
 //! p.handle(Input::Worker(worker.clone()), 0.0);
 //! p.handle(
-//!     Input::Submit(JobSpec::new(1, Resources::mem_gb(3.0), 0)),
+//!     Input::Submit(JobSpec {
+//!         id: 1,
+//!         demand: Resources::mem_gb(3.0),
+//!         ..Default::default()
+//!     }),
 //!     0.0,
 //! );
 //! assert_eq!(
@@ -533,7 +625,11 @@
 //! };
 //! p.handle(Input::Worker(heartbeat), 5.0);
 //! p.handle(
-//!     Input::Submit(JobSpec::new(2, Resources::mem_gb(3.0), 0)),
+//!     Input::Submit(JobSpec {
+//!         id: 2,
+//!         demand: Resources::mem_gb(3.0),
+//!         ..Default::default()
+//!     }),
 //!     5.0,
 //! );
 //! // max(8, 1 + 3) + 3 = 11 GB > 10 GB.
@@ -548,15 +644,28 @@
 //! # use whelm::{Config, Input, JobSpec, Output, Policy, Resources, Scheduler, WorkerState};
 //! let mut p = Scheduler::new(Config::default());
 //! p.handle(
-//!     Input::Worker(WorkerState::new(1, "cpu", 4, Resources::mem_gb(10.0))),
+//!     Input::Worker(WorkerState {
+//!         id: 1,
+//!         slots: 4,
+//!         budget: Resources::mem_gb(10.0),
+//!         ..Default::default()
+//!     }),
 //!     0.0,
 //! );
 //! p.handle(
-//!     Input::Submit(JobSpec::new(1, Resources::mem_gb(50.0), 0)),
+//!     Input::Submit(JobSpec {
+//!         id: 1,
+//!         demand: Resources::mem_gb(50.0),
+//!         ..Default::default()
+//!     }),
 //!     0.0,
 //! );
 //! p.handle(
-//!     Input::Submit(JobSpec::new(2, Resources::mem_gb(1.0), 0)),
+//!     Input::Submit(JobSpec {
+//!         id: 2,
+//!         demand: Resources::mem_gb(1.0),
+//!         ..Default::default()
+//!     }),
 //!     0.0,
 //! );
 //! // Job 1 is five times the budget but runs alone; job 2 must wait for it.
@@ -571,11 +680,19 @@
 //!
 //! // A worker of unknown memory: only its two slots limit it.
 //! p.handle(
-//!     Input::Worker(WorkerState::new(2, "cpu", 2, Resources::ZERO)),
+//!     Input::Worker(WorkerState {
+//!         id: 2,
+//!         slots: 2,
+//!         ..Default::default()
+//!     }),
 //!     1.0,
 //! );
 //! p.handle(
-//!     Input::Submit(JobSpec::new(3, Resources::mem_gb(500.0), 0)),
+//!     Input::Submit(JobSpec {
+//!         id: 3,
+//!         demand: Resources::mem_gb(500.0),
+//!         ..Default::default()
+//!     }),
 //!     1.0,
 //! );
 //! assert_eq!(
@@ -593,7 +710,13 @@
 //!         },
 //!     ]
 //! );
-//! p.handle(Input::Submit(JobSpec::new(4, Resources::ZERO, 0)), 2.0);
+//! p.handle(
+//!     Input::Submit(JobSpec {
+//!         id: 4,
+//!         ..Default::default()
+//!     }),
+//!     2.0,
+//! );
 //! assert!(p.poll(2.0).is_empty());
 //! assert!(p.explain(4).unwrap().contains("slots full on 1 worker(s)"));
 //! ```
@@ -609,11 +732,19 @@
 //! // 8 slots, unknown host memory, 10 GB of device memory, at least 4 GB of it per job.
 //! let gpu = WorkerState {
 //!     per_task: Resources::ZERO.with_dev_gb(4.0),
-//!     ..WorkerState::new(1, "gpu", 8, Resources::ZERO.with_dev_gb(10.0))
+//!     id: 1,
+//!     class: "gpu".into(),
+//!     slots: 8,
+//!     budget: Resources::ZERO.with_dev_gb(10.0),
+//!     ..Default::default()
 //! };
 //! p.handle(Input::Worker(gpu), 0.0);
 //! for id in 1..=3 {
-//!     p.handle(Input::Submit(JobSpec::new(id, Resources::ZERO, 0)), 0.0);
+//!     let job = JobSpec {
+//!         id,
+//!         ..Default::default()
+//!     };
+//!     p.handle(Input::Submit(job), 0.0);
 //! }
 //! // (running + 1) * 4 GB <= 10 GB admits two jobs.
 //! assert_eq!(p.poll(0.0).len(), 2);
@@ -628,18 +759,24 @@
 //! that scores compare workers by.
 //!
 //! ```
-//! use whelm::{Admission, ProductionAdmission, Resources, SLOTS, WorkerState, WorkerView};
+//! use whelm::{Admission, ProductionAdmission, Resources, WorkerState, WorkerView};
 //!
-//! let state = WorkerState::new(1, "cpu", 4, Resources::mem_gb(10.0));
-//! let mut placed = Resources::mem_gb(6.0);
-//! placed[SLOTS] = 1; // one job running
+//! let state = WorkerState {
+//!     id: 1,
+//!     slots: 4,
+//!     budget: Resources::mem_gb(10.0),
+//!     ..Default::default()
+//! };
+//! // One job running, which took a slot.
 //! let view = WorkerView {
 //!     state: &state,
-//!     placed,
+//!     placed: Resources::mem_gb(6.0).with_slots(1),
 //! };
 //!
-//! assert!(ProductionAdmission.admits(&Resources::mem_gb(4.0), &view));
-//! assert!(!ProductionAdmission.admits(&Resources::mem_gb(5.0), &view));
+//! // The scheduler asks with demands that take one slot each.
+//! let job = |gb| Resources::mem_gb(gb).with_slots(1);
+//! assert!(ProductionAdmission.admits(&job(4.0), &view));
+//! assert!(!ProductionAdmission.admits(&job(5.0), &view));
 //! assert_eq!(view.headroom(), [Some(4_000_000_000), None, Some(3)]);
 //! // After placing 2 GB more, a fifth of the memory would be left.
 //! assert_eq!(view.free_share(&Resources::mem_gb(2.0)), 0.2);
@@ -665,14 +802,21 @@
 //!
 //! let mut p = Scheduler::with_admission(Config::default(), SlotsOnly);
 //! p.handle(
-//!     Input::Worker(WorkerState::new(1, "cpu", 2, Resources::mem_gb(10.0))),
+//!     Input::Worker(WorkerState {
+//!         id: 1,
+//!         slots: 2,
+//!         budget: Resources::mem_gb(10.0),
+//!         ..Default::default()
+//!     }),
 //!     0.0,
 //! );
 //! for id in 1..=3 {
-//!     p.handle(
-//!         Input::Submit(JobSpec::new(id, Resources::mem_gb(50.0), 0)),
-//!         0.0,
-//!     );
+//!     let job = JobSpec {
+//!         id,
+//!         demand: Resources::mem_gb(50.0),
+//!         ..Default::default()
+//!     };
+//!     p.handle(Input::Submit(job), 0.0);
 //! }
 //! assert_eq!(p.poll(0.0).len(), 2);
 //! ```
@@ -682,23 +826,29 @@
 //! A job's [`constraints`](JobSpec::constraints) restrict where it runs. Each names workers with a
 //! [`Selector`] (one worker, or a class of workers) and binds with a [`Strength`]: `Require` and
 //! `Forbid` are hard, `Avoid` is soft, and `Prefer` only ranks the workers that admit the job. The
-//! builders on [`JobSpec`] cover the common cases.
+//! constructors on [`Constraint`] cover each strength on one worker or one class.
 //!
 //! ```
-//! # use whelm::{Config, Input, JobSpec, Output, Policy, Resources, Scheduler, WorkerState};
+//! # use whelm::{Config, Constraint, Input, JobSpec, Output, Policy, Scheduler, WorkerState};
 //! let mut p = Scheduler::new(Config::default());
 //! for (id, class) in [(1, "cpu"), (2, "gpu"), (3, "gpu")] {
-//!     p.handle(
-//!         Input::Worker(WorkerState::new(id, class, 4, Resources::ZERO)),
-//!         0.0,
-//!     );
+//!     let worker = WorkerState {
+//!         id,
+//!         class: class.into(),
+//!         slots: 4,
+//!         ..Default::default()
+//!     };
+//!     p.handle(Input::Worker(worker), 0.0);
 //! }
-//! let job = |id| JobSpec::new(id, Resources::ZERO, 0);
-//! p.handle(Input::Submit(job(1).require_class("gpu")), 0.0);
-//! p.handle(
-//!     Input::Submit(job(2).require_class("gpu").forbid_worker(2)),
-//!     0.0,
-//! );
+//! let job = |id, constraints| JobSpec {
+//!     id,
+//!     constraints,
+//!     ..Default::default()
+//! };
+//! let gpu = Constraint::require_class("gpu");
+//! p.handle(Input::Submit(job(1, vec![gpu.clone()])), 0.0);
+//! let not_2 = Constraint::forbid_worker(2);
+//! p.handle(Input::Submit(job(2, vec![gpu, not_2])), 0.0);
 //! assert_eq!(
 //!     p.poll(0.0),
 //!     [
@@ -716,7 +866,8 @@
 //! );
 //!
 //! // No worker has the class: the job waits, and says why.
-//! p.handle(Input::Submit(job(3).require_class("tpu")), 1.0);
+//! let tpu = Constraint::require_class("tpu");
+//! p.handle(Input::Submit(job(3, vec![tpu])), 1.0);
 //! assert!(p.poll(1.0).is_empty());
 //! assert!(
 //!     p.explain(3)
@@ -730,15 +881,23 @@
 //! [Ordering](#ordering)). Use it for cache affinity.
 //!
 //! ```
-//! # use whelm::{Config, Input, JobSpec, Output, Policy, Resources, Scheduler, WorkerState};
+//! # use whelm::{Config, Constraint, Input, JobSpec, Output, Policy, Scheduler, WorkerState};
 //! let mut p = Scheduler::new(Config::default());
 //! for id in [1, 2] {
 //!     p.handle(
-//!         Input::Worker(WorkerState::new(id, "cpu", 4, Resources::ZERO)),
+//!         Input::Worker(WorkerState {
+//!             id,
+//!             slots: 4,
+//!             ..Default::default()
+//!         }),
 //!         0.0,
 //!     );
 //! }
-//! p.handle(Input::Submit(JobSpec::new(1, Resources::ZERO, 0)), 0.0);
+//! let job = |id| JobSpec {
+//!     id,
+//!     ..Default::default()
+//! };
+//! p.handle(Input::Submit(job(1)), 0.0);
 //! assert_eq!(
 //!     p.poll(0.0),
 //!     [Output::Start {
@@ -749,11 +908,13 @@
 //! );
 //!
 //! // Worker 1 is busier, but job 2 prefers it; job 3 has no preference.
-//! p.handle(
-//!     Input::Submit(JobSpec::new(2, Resources::ZERO, 0).prefer_worker(1)),
-//!     1.0,
-//! );
-//! p.handle(Input::Submit(JobSpec::new(3, Resources::ZERO, 0)), 1.0);
+//! let fond = JobSpec {
+//!     id: 2,
+//!     constraints: vec![Constraint::prefer_worker(1)],
+//!     ..Default::default()
+//! };
+//! p.handle(Input::Submit(fond), 1.0);
+//! p.handle(Input::Submit(job(3)), 1.0);
 //! assert_eq!(
 //!     p.poll(1.0),
 //!     [
@@ -778,22 +939,24 @@
 //! drained (its slot count set to zero by a heartbeat).
 //!
 //! ```
-//! # use whelm::{Config, Input, JobSpec, Output, Policy, Resources, Scheduler, WorkerState};
+//! # use whelm::{Config, Constraint, Input, JobSpec, Output, Policy, Scheduler, WorkerState};
 //! let mut p = Scheduler::new(Config::default());
 //! for id in [1, 2] {
 //!     p.handle(
-//!         Input::Worker(WorkerState::new(id, "cpu", 1, Resources::ZERO)),
+//!         Input::Worker(WorkerState {
+//!             id,
+//!             ..Default::default()
+//!         }),
 //!         0.0,
 //!     );
 //! }
-//! p.handle(
-//!     Input::Submit(JobSpec::new(1, Resources::ZERO, 0).prefer_worker(2)),
-//!     0.0,
-//! );
-//! p.handle(
-//!     Input::Submit(JobSpec::new(2, Resources::ZERO, 0).avoid_worker(1)),
-//!     0.0,
-//! );
+//! let job = |id, constraint| JobSpec {
+//!     id,
+//!     constraints: vec![constraint],
+//!     ..Default::default()
+//! };
+//! p.handle(Input::Submit(job(1, Constraint::prefer_worker(2))), 0.0);
+//! p.handle(Input::Submit(job(2, Constraint::avoid_worker(1))), 0.0);
 //! assert_eq!(
 //!     p.poll(0.0),
 //!     [Output::Start {
@@ -809,7 +972,11 @@
 //! );
 //!
 //! p.handle(
-//!     Input::Worker(WorkerState::new(2, "cpu", 0, Resources::ZERO)),
+//!     Input::Worker(WorkerState {
+//!         id: 2,
+//!         slots: 0,
+//!         ..Default::default()
+//!     }),
 //!     1.0,
 //! );
 //! assert_eq!(
@@ -836,15 +1003,17 @@
 //!
 //! ```
 //! use whelm::{
-//!     Config, GroupOrder, Input, JobId, JobSpec, Output, Policy, Resources, Scheduler,
-//!     WorkerState,
+//!     Config, GroupOrder, Input, JobId, JobSpec, Output, Policy, Scheduler, WorkerState,
 //! };
 //!
 //! /// The order one single-slot worker runs three jobs in under `config`.
 //! fn run_order(config: Config) -> Vec<JobId> {
 //!     let mut p = Scheduler::new(config);
 //!     p.handle(
-//!         Input::Worker(WorkerState::new(1, "cpu", 1, Resources::ZERO)),
+//!         Input::Worker(WorkerState {
+//!             id: 1,
+//!             ..Default::default()
+//!         }),
 //!         0.0,
 //!     );
 //!     // (id, group, weight, work, due)
@@ -855,10 +1024,12 @@
 //!     ];
 //!     for (id, group, weight, work, due) in jobs {
 //!         let spec = JobSpec {
+//!             id,
+//!             group,
 //!             weight,
 //!             work: Some(work),
 //!             due: Some(due),
-//!             ..JobSpec::new(id, Resources::ZERO, group)
+//!             ..Default::default()
 //!         };
 //!         p.handle(Input::Submit(spec), 0.0);
 //!     }
@@ -906,11 +1077,21 @@
 //! behind.
 //!
 //! ```
-//! # use whelm::{Config, Input, JobId, JobSpec, Output, Policy, Resources, Scheduler, WorkerState};
+//! # use whelm::{Config, Input, JobId, JobSpec, Output, Policy, Scheduler, WorkerState};
 //! let mut p = Scheduler::new(Config::default());
-//! p.handle(Input::Worker(WorkerState::new(1, "cpu", 1, Resources::ZERO)), 0.0);
+//! p.handle(
+//!     Input::Worker(WorkerState {
+//!         id: 1,
+//!         ..Default::default()
+//!     }),
+//!     0.0,
+//! );
 //! for (id, priority) in [(1, Some(1)), (2, None), (3, Some(-1))] {
-//!     let spec = JobSpec { priority, ..JobSpec::new(id, Resources::ZERO, 0) };
+//!     let spec = JobSpec {
+//!         id,
+//!         priority,
+//!         ..Default::default()
+//!     };
 //!     p.handle(Input::Submit(spec), 0.0);
 //! }
 //! let mut order: Vec<JobId> = Vec::new();
@@ -938,17 +1119,31 @@
 //! fn place(config: Config) -> u64 {
 //!     let mut p = Scheduler::new(config);
 //!     p.handle(
-//!         Input::Worker(WorkerState::new(1, "big", 4, Resources::mem_gb(100.0))),
+//!         Input::Worker(WorkerState {
+//!             id: 1,
+//!             class: "big".into(),
+//!             slots: 4,
+//!             budget: Resources::mem_gb(100.0),
+//!             ..Default::default()
+//!         }),
 //!         0.0,
 //!     );
 //!     p.handle(
-//!         Input::Worker(WorkerState::new(2, "small", 4, Resources::mem_gb(20.0))),
+//!         Input::Worker(WorkerState {
+//!             id: 2,
+//!             class: "small".into(),
+//!             slots: 4,
+//!             budget: Resources::mem_gb(20.0),
+//!             ..Default::default()
+//!         }),
 //!         0.0,
 //!     );
-//!     p.handle(
-//!         Input::Submit(JobSpec::new(1, Resources::mem_gb(10.0), 0)),
-//!         0.0,
-//!     );
+//!     let job = JobSpec {
+//!         id: 1,
+//!         demand: Resources::mem_gb(10.0),
+//!         ..Default::default()
+//!     };
+//!     p.handle(Input::Submit(job), 0.0);
 //!     match p.poll(0.0)[..] {
 //!         [Output::Start { worker, .. }] => worker,
 //!         ref out => panic!("{out:?}"),
@@ -963,18 +1158,32 @@
 //! where speeds come from and what else they drive.
 //!
 //! ```
-//! # use whelm::{Config, Input, JobSpec, Output, Policy, Resources, Scheduler, WorkerState};
+//! # use whelm::{Config, Input, JobSpec, Output, Policy, Scheduler, WorkerState};
 //! let mut p = Scheduler::new(Config::default());
 //! p.handle(
-//!     Input::Worker(WorkerState::new(1, "old", 4, Resources::ZERO)),
+//!     Input::Worker(WorkerState {
+//!         id: 1,
+//!         class: "old".into(),
+//!         slots: 4,
+//!         ..Default::default()
+//!     }),
 //!     0.0,
 //! );
 //! let fast = WorkerState {
+//!     id: 2,
+//!     class: "new".into(),
+//!     slots: 4,
 //!     speed: 2.5,
-//!     ..WorkerState::new(2, "new", 4, Resources::ZERO)
+//!     ..Default::default()
 //! };
 //! p.handle(Input::Worker(fast), 0.0);
-//! p.handle(Input::Submit(JobSpec::new(1, Resources::ZERO, 0)), 0.0);
+//! p.handle(
+//!     Input::Submit(JobSpec {
+//!         id: 1,
+//!         ..Default::default()
+//!     }),
+//!     0.0,
+//! );
 //! assert_eq!(
 //!     p.poll(0.0),
 //!     [Output::Start {
@@ -996,15 +1205,33 @@
 //! first; without aging, job 3 would.
 //!
 //! ```
-//! # use whelm::{Config, Input, JobId, JobSpec, Output, Policy, Resources, Scheduler, WorkerState};
+//! # use whelm::{Config, Input, JobId, JobSpec, Output, Policy, Scheduler, WorkerState};
 //! /// The job that runs after job 1, under an age limit.
 //! fn second(age_limit: Option<f64>) -> JobId {
-//!     let mut p = Scheduler::new(Config { age_limit, reservations: None, ..Config::default() });
-//!     p.handle(Input::Worker(WorkerState::new(1, "cpu", 1, Resources::ZERO)), 0.0);
-//!     p.handle(Input::Submit(JobSpec::new(1, Resources::ZERO, 0)), 0.0);
-//!     p.handle(Input::Submit(JobSpec::new(2, Resources::ZERO, 0)), 0.0);
+//!     let mut p = Scheduler::new(Config {
+//!         age_limit,
+//!         reservations: None,
+//!         ..Config::default()
+//!     });
+//!     p.handle(
+//!         Input::Worker(WorkerState {
+//!             id: 1,
+//!             ..Default::default()
+//!         }),
+//!         0.0,
+//!     );
+//!     let job = |id| JobSpec {
+//!         id,
+//!         ..Default::default()
+//!     };
+//!     p.handle(Input::Submit(job(1)), 0.0);
+//!     p.handle(Input::Submit(job(2)), 0.0);
 //!     p.poll(0.0);
-//!     let urgent = JobSpec { priority: Some(-1), ..JobSpec::new(3, Resources::ZERO, 0) };
+//!     let urgent = JobSpec {
+//!         id: 3,
+//!         priority: Some(-1),
+//!         ..Default::default()
+//!     };
 //!     p.handle(Input::Submit(urgent), 50.0);
 //!     p.handle(Input::Done { job: 1, attempt: 1 }, 150.0);
 //!     match p.poll(150.0)[..] {
@@ -1027,8 +1254,12 @@
 //! #     Config, Input, JobSpec, Output, Policy, ReservationInfo, Resources, Scheduler, WorkerState
 //! # };
 //! let mut p = Scheduler::new(Config::default()); // reserve after 60 s
-//! p.handle(Input::Worker(WorkerState::new(1, "cpu", 3, Resources::mem_gb(10.0))), 0.0);
-//! let job = |id, gb| Input::Submit(JobSpec::new(id, Resources::mem_gb(gb), 0));
+//! let worker =
+//!     WorkerState { id: 1, slots: 3, budget: Resources::mem_gb(10.0), ..Default::default() };
+//! p.handle(Input::Worker(worker), 0.0);
+//! let job = |id, gb| {
+//!     Input::Submit(JobSpec { id, demand: Resources::mem_gb(gb), ..Default::default() })
+//! };
 //! let start = |job| Output::Start { job, attempt: 1, worker: 1 };
 //! let done = |job| Input::Done { job, attempt: 1 };
 //!
@@ -1073,10 +1304,14 @@
 //! # };
 //! let reservations = Reservations { shadow_backfill: true, ..Reservations::default() };
 //! let mut p = Scheduler::new(Config { reservations: Some(reservations), ..Config::default() });
-//! p.handle(Input::Worker(WorkerState::new(1, "cpu", 3, Resources::mem_gb(10.0))), 0.0);
+//! let worker =
+//!     WorkerState { id: 1, slots: 3, budget: Resources::mem_gb(10.0), ..Default::default() };
+//! p.handle(Input::Worker(worker), 0.0);
 //! let job = |id, gb, work| JobSpec {
+//!     id,
+//!     demand: Resources::mem_gb(gb),
 //!     work: Some(work),
-//!     ..JobSpec::new(id, Resources::mem_gb(gb), 0)
+//!     ..Default::default()
 //! };
 //!
 //! p.handle(Input::Submit(job(1, 4.0, 100.0)), 0.0);
@@ -1102,9 +1337,12 @@
 //! #     WorkerState
 //! # };
 //! let mut p = Scheduler::new(Config::default());
-//! p.handle(Input::Worker(WorkerState::new(1, "cpu", 2, Resources::mem_gb(10.0))), 0.0);
-//! p.handle(Input::Submit(JobSpec::new(1, Resources::mem_gb(6.0), 0)), 0.0); // runs for ever
-//! p.handle(Input::Submit(JobSpec::new(2, Resources::mem_gb(6.0), 0)), 0.0);
+//! let worker =
+//!     WorkerState { id: 1, slots: 2, budget: Resources::mem_gb(10.0), ..Default::default() };
+//! p.handle(Input::Worker(worker), 0.0);
+//! let job = |id| JobSpec { id, demand: Resources::mem_gb(6.0), ..Default::default() };
+//! p.handle(Input::Submit(job(1)), 0.0); // runs for ever
+//! p.handle(Input::Submit(job(2)), 0.0);
 //! p.poll(0.0);
 //!
 //! // No events arrive: poll whenever the policy asks to.
@@ -1131,7 +1369,7 @@
 //!
 //! ```
 //! # use whelm::{
-//! #     Config, Input, JobSpec, Output, Policy, Resources, Scheduler, SpeedConfig, Timing,
+//! #     Config, Input, JobSpec, Output, Policy, Scheduler, SpeedConfig, Timing,
 //! #     WorkerState
 //! # };
 //! /// The worker a job goes to, given a reference worker 1 and a worker 2 reporting speed 3.
@@ -1144,15 +1382,27 @@
 //!         ..Config::default()
 //!     });
 //!     p.handle(
-//!         Input::Worker(WorkerState::new(1, "a", 4, Resources::ZERO)),
+//!         Input::Worker(WorkerState {
+//!             id: 1,
+//!             class: "a".into(),
+//!             slots: 4,
+//!             ..Default::default()
+//!         }),
 //!         0.0,
 //!     );
 //!     let fast = WorkerState {
+//!         id: 2,
+//!         class: "b".into(),
+//!         slots: 4,
 //!         speed: 3.0,
-//!         ..WorkerState::new(2, "b", 4, Resources::ZERO)
+//!         ..Default::default()
 //!     };
 //!     p.handle(Input::Worker(fast), 0.0);
-//!     p.handle(Input::Submit(JobSpec::new(1, Resources::ZERO, 0)), 0.0);
+//!     let job = JobSpec {
+//!         id: 1,
+//!         ..Default::default()
+//!     };
+//!     p.handle(Input::Submit(job), 0.0);
 //!     match p.poll(0.0)[..] {
 //!         [Output::Start { worker, .. }] => worker,
 //!         ref out => panic!("{out:?}"),
@@ -1171,7 +1421,7 @@
 //!
 //! ```
 //! # use whelm::{
-//! #     Config, Input, JobSpec, Learn, Policy, Resources, Scheduler, SpeedConfig, Timing,
+//! #     Config, Constraint, Input, JobSpec, Learn, Policy, Scheduler, SpeedConfig, Timing,
 //! #     WorkerState
 //! # };
 //! let mut p = Scheduler::new(Config {
@@ -1182,10 +1432,12 @@
 //!     ..Config::default()
 //! });
 //! for (id, class) in [(1, "a"), (2, "b")] {
-//!     p.handle(
-//!         Input::Worker(WorkerState::new(id, class, 1, Resources::ZERO)),
-//!         0.0,
-//!     );
+//!     let worker = WorkerState {
+//!         id,
+//!         class: class.into(),
+//!         ..Default::default()
+//!     };
+//!     p.handle(Input::Worker(worker), 0.0);
 //! }
 //!
 //! // Run jobs of 30 s of work on each worker in turn, pinned there by class.
@@ -1193,10 +1445,12 @@
 //! for _ in 0..Learn::default().min_samples {
 //!     for (class, true_speed) in [("a", 1.0), ("b", 3.0)] {
 //!         let spec = JobSpec {
+//!             id,
 //!             work: Some(30.0),
-//!             ..JobSpec::new(id, Resources::ZERO, 0)
+//!             constraints: vec![Constraint::require_class(class)],
+//!             ..Default::default()
 //!         };
-//!         p.handle(Input::Submit(spec.require_class(class)), now);
+//!         p.handle(Input::Submit(spec), now);
 //!         p.poll(now);
 //!         now += 30.0 / true_speed;
 //!         p.handle(
@@ -1223,28 +1477,53 @@
 //!
 //! ```
 //! # use whelm::{
-//! #     Config, Input, JobId, JobSpec, Output, Policy, Resources, Scheduler, SpeedConfig, Timing,
+//! #     Config, Constraint, Input, JobSpec, Output, Policy, Scheduler, SpeedConfig, Timing,
 //! #     WorkerState
 //! # };
 //! /// Workers 1 (class x) and 2 (class y) after training: kind "a" runs four times faster on x,
 //! /// kind "b" twice as fast on y. Returns the policy and the time.
 //! fn trained(timing: Timing) -> (Scheduler, f64) {
 //!     let mut p = Scheduler::new(Config {
-//!         speed: SpeedConfig { timing, ..SpeedConfig::default() },
+//!         speed: SpeedConfig {
+//!             timing,
+//!             ..SpeedConfig::default()
+//!         },
 //!         ..Config::default()
 //!     });
 //!     for (id, class) in [(1, "x"), (2, "y")] {
-//!         p.handle(Input::Worker(WorkerState::new(id, class, 1, Resources::ZERO)), 0.0);
+//!         let worker = WorkerState {
+//!             id,
+//!             class: class.into(),
+//!             ..Default::default()
+//!         };
+//!         p.handle(Input::Worker(worker), 0.0);
 //!     }
 //!     let (mut now, mut id) = (0.0, 0);
 //!     for _ in 0..20 {
-//!         let runs = [("a", "x", 4.0), ("a", "y", 1.0), ("b", "x", 1.0), ("b", "y", 2.0)];
+//!         let runs = [
+//!             ("a", "x", 4.0),
+//!             ("a", "y", 1.0),
+//!             ("b", "x", 1.0),
+//!             ("b", "y", 2.0),
+//!         ];
 //!         for (kind, class, true_speed) in runs {
-//!             let spec = JobSpec { work: Some(8.0), ..JobSpec::new(id, Resources::ZERO, 0) };
-//!             p.handle(Input::Submit(spec.with_kind(kind).require_class(class)), now);
+//!             let spec = JobSpec {
+//!                 id,
+//!                 work: Some(8.0),
+//!                 kind: Some(kind.into()),
+//!                 constraints: vec![Constraint::require_class(class)],
+//!                 ..Default::default()
+//!             };
+//!             p.handle(Input::Submit(spec), now);
 //!             p.poll(now);
 //!             now += 8.0 / true_speed;
-//!             p.handle(Input::Done { job: id, attempt: 1 }, now);
+//!             p.handle(
+//!                 Input::Done {
+//!                     job: id,
+//!                     attempt: 1,
+//!                 },
+//!                 now,
+//!             );
 //!             id += 1;
 //!         }
 //!     }
@@ -1254,15 +1533,29 @@
 //! /// Where a lone job of `kind` goes once trained.
 //! fn place(timing: Timing, kind: &str) -> u64 {
 //!     let (mut p, now) = trained(timing);
-//!     let spec = JobSpec { work: Some(8.0), ..JobSpec::new(1000, Resources::ZERO, 0) };
-//!     p.handle(Input::Submit(spec.with_kind(kind)), now);
+//!     let spec = JobSpec {
+//!         id: 1000,
+//!         work: Some(8.0),
+//!         kind: Some(kind.into()),
+//!         ..Default::default()
+//!     };
+//!     p.handle(Input::Submit(spec), now);
 //!     match p.poll(now)[..] {
 //!         [Output::Start { worker, .. }] => worker,
 //!         ref out => panic!("{out:?}"),
 //!     }
 //! }
-//! assert_eq!((place(Timing::unrelated(), "a"), place(Timing::unrelated(), "b")), (1, 2));
-//! assert_eq!((place(Timing::learned(), "a"), place(Timing::learned(), "b")), (1, 1));
+//! assert_eq!(
+//!     (
+//!         place(Timing::unrelated(), "a"),
+//!         place(Timing::unrelated(), "b")
+//!     ),
+//!     (1, 2)
+//! );
+//! assert_eq!(
+//!     (place(Timing::learned(), "a"), place(Timing::learned(), "b")),
+//!     (1, 1)
+//! );
 //! ```
 //!
 //! ## Waiting for a faster worker
@@ -1274,7 +1567,7 @@
 //!
 //! ```
 //! # use whelm::{
-//! #     Config, Defer, Input, JobSpec, Output, Policy, Resources, Scheduler, SpeedConfig,
+//! #     Config, Defer, Input, JobSpec, Output, Policy, Scheduler, SpeedConfig,
 //! #     WorkerState
 //! # };
 //! let mut p = Scheduler::new(Config {
@@ -1285,17 +1578,24 @@
 //!     ..Config::default()
 //! });
 //! p.handle(
-//!     Input::Worker(WorkerState::new(1, "slow", 1, Resources::ZERO)),
+//!     Input::Worker(WorkerState {
+//!         id: 1,
+//!         class: "slow".into(),
+//!         ..Default::default()
+//!     }),
 //!     0.0,
 //! );
 //! let fast = WorkerState {
+//!     id: 2,
+//!     class: "fast".into(),
 //!     speed: 4.0,
-//!     ..WorkerState::new(2, "fast", 1, Resources::ZERO)
+//!     ..Default::default()
 //! };
 //! p.handle(Input::Worker(fast), 0.0);
 //! let job = |id, work| JobSpec {
+//!     id,
 //!     work: Some(work),
-//!     ..JobSpec::new(id, Resources::ZERO, 0)
+//!     ..Default::default()
 //! };
 //!
 //! // Job 1 takes the fast worker until 10 / 4 = 2.5 s.
@@ -1338,26 +1638,66 @@
 //!
 //! ```
 //! # use whelm::{
-//! #     Config, Input, JobSpec, Output, Policy, Resources, Scheduler, Speculate, SpeedConfig,
+//! #     Config, Input, JobSpec, Output, Policy, Scheduler, Speculate, SpeedConfig,
 //! #     WorkerState
 //! # };
 //! let mut p = Scheduler::new(Config {
-//!     speed: SpeedConfig { speculate: Some(Speculate::default()), ..SpeedConfig::default() },
+//!     speed: SpeedConfig {
+//!         speculate: Some(Speculate::default()),
+//!         ..SpeedConfig::default()
+//!     },
 //!     ..Config::default()
 //! });
-//! p.handle(Input::Worker(WorkerState::new(1, "slow", 1, Resources::ZERO)), 0.0);
-//! let spec = JobSpec { work: Some(40.0), ..JobSpec::new(1, Resources::ZERO, 0) };
+//! p.handle(
+//!     Input::Worker(WorkerState {
+//!         id: 1,
+//!         class: "slow".into(),
+//!         ..Default::default()
+//!     }),
+//!     0.0,
+//! );
+//! let spec = JobSpec {
+//!     id: 1,
+//!     work: Some(40.0),
+//!     ..Default::default()
+//! };
 //! p.handle(Input::Submit(spec), 0.0);
-//! assert_eq!(p.poll(0.0), [Output::Start { job: 1, attempt: 1, worker: 1 }]);
+//! assert_eq!(
+//!     p.poll(0.0),
+//!     [Output::Start {
+//!         job: 1,
+//!         attempt: 1,
+//!         worker: 1
+//!     }]
+//! );
 //!
 //! // A worker four times faster joins at 1 s: done at 11 s rather than 40 s.
-//! let fast = WorkerState { speed: 4.0, ..WorkerState::new(2, "fast", 1, Resources::ZERO) };
+//! let fast = WorkerState {
+//!     id: 2,
+//!     class: "fast".into(),
+//!     speed: 4.0,
+//!     ..Default::default()
+//! };
 //! p.handle(Input::Worker(fast), 1.0);
-//! assert_eq!(p.poll(1.0), [Output::Start { job: 1, attempt: 2, worker: 2 }]);
+//! assert_eq!(
+//!     p.poll(1.0),
+//!     [Output::Start {
+//!         job: 1,
+//!         attempt: 2,
+//!         worker: 2
+//!     }]
+//! );
 //!
 //! // The second attempt wins; the first is stopped.
 //! p.handle(Input::Done { job: 1, attempt: 2 }, 11.0);
-//! assert_eq!(p.poll(11.0), [Output::Stop { job: 1, attempt: 1, worker: 1 }]);
+//! assert_eq!(
+//!     p.poll(11.0),
+//!     [Output::Stop {
+//!         job: 1,
+//!         attempt: 1,
+//!         worker: 1
+//!     }]
+//! );
 //! ```
 //!
 //! # Dependencies
@@ -1369,16 +1709,28 @@
 //!
 //! ```
 //! use whelm::{
-//!     Config, DagConfig, DagJob, DagScheduler, Input, JobSpec, Output, Policy, Resources,
-//!     Scheduler, WorkerState,
+//!     Config, DagConfig, DagJob, DagScheduler, Input, JobSpec, Output, Policy, Scheduler,
+//!     WorkerState,
 //! };
 //!
 //! let mut dag = DagScheduler::new(DagConfig::default(), Scheduler::new(Config::default()));
 //! dag.handle(
-//!     Input::Worker(WorkerState::new(1, "cpu", 4, Resources::ZERO)),
+//!     Input::Worker(WorkerState {
+//!         id: 1,
+//!         slots: 4,
+//!         ..Default::default()
+//!     }),
 //!     0.0,
 //! );
-//! let job = |id| JobSpec::new(id, Resources::ZERO, 0);
+//! // A job and the jobs it waits for.
+//! let job = |id, deps| DagJob {
+//!     spec: JobSpec {
+//!         id,
+//!         ..Default::default()
+//!     },
+//!     deps,
+//!     ..Default::default()
+//! };
 //! let start = |job| Output::Start {
 //!     job,
 //!     attempt: 1,
@@ -1387,10 +1739,10 @@
 //!
 //! // A diamond: 1 -> {2, 3} -> 4.
 //! let jobs = [
-//!     DagJob::new(job(1), vec![]),
-//!     DagJob::new(job(2), vec![1]),
-//!     DagJob::new(job(3), vec![1]),
-//!     DagJob::new(job(4), vec![2, 3]),
+//!     job(1, vec![]),
+//!     job(2, vec![1]),
+//!     job(3, vec![1]),
+//!     job(4, vec![2, 3]),
 //! ];
 //! dag.declare(jobs, 0.0).unwrap();
 //! assert_eq!(dag.poll(0.0), [start(1)]);
@@ -1419,8 +1771,8 @@
 //!
 //! ```
 //! # use whelm::{
-//! #     Config, DagConfig, DagJob, DagScheduler, Input, JobSpec, Output, Policy, Resources,
-//! #     Scheduler, WorkerState
+//! #     Config, DagConfig, DagJob, DagScheduler, Input, JobSpec, Output, Policy, Scheduler,
+//! #     WorkerState
 //! # };
 //! let config = DagConfig {
 //!     record_passthrough: true,
@@ -1428,16 +1780,33 @@
 //! };
 //! let mut dag = DagScheduler::new(config, Scheduler::new(Config::default()));
 //! dag.handle(
-//!     Input::Worker(WorkerState::new(1, "cpu", 4, Resources::ZERO)),
+//!     Input::Worker(WorkerState {
+//!         id: 1,
+//!         slots: 4,
+//!         ..Default::default()
+//!     }),
 //!     0.0,
 //! );
-//! let job = |id| JobSpec::new(id, Resources::ZERO, 0);
+//! let job = |id, deps| DagJob {
+//!     spec: JobSpec {
+//!         id,
+//!         ..Default::default()
+//!     },
+//!     deps,
+//!     ..Default::default()
+//! };
 //!
 //! // Load locally (1), then a barrier (2), then compute (3).
 //! let jobs = [
-//!     DagJob::new(job(1), vec![]).local(),
-//!     DagJob::passthrough(2, 0, vec![1], 0.0),
-//!     DagJob::new(job(3), vec![2]),
+//!     DagJob {
+//!         local: true,
+//!         ..job(1, vec![])
+//!     },
+//!     DagJob {
+//!         passthrough: true,
+//!         ..job(2, vec![1])
+//!     },
+//!     job(3, vec![2]),
 //! ];
 //! dag.declare(jobs, 0.0).unwrap();
 //! assert_eq!(dag.poll(0.0), [Output::RunLocal { job: 1 }]);
@@ -1463,8 +1832,8 @@
 //!
 //! ```
 //! # use whelm::{
-//! #     Config, DagConfig, DagJob, DagScheduler, Input, JobSpec, Output, Policy, Resources,
-//! #     Scheduler, WorkerState
+//! #     Config, DagConfig, DagJob, DagScheduler, Input, JobSpec, Output, Policy, Scheduler,
+//! #     WorkerState
 //! # };
 //! let config = DagConfig {
 //!     auto_submit: false,
@@ -1472,15 +1841,22 @@
 //! };
 //! let mut dag = DagScheduler::new(config, Scheduler::new(Config::default()));
 //! dag.handle(
-//!     Input::Worker(WorkerState::new(1, "cpu", 4, Resources::ZERO)),
+//!     Input::Worker(WorkerState {
+//!         id: 1,
+//!         slots: 4,
+//!         ..Default::default()
+//!     }),
 //!     0.0,
 //! );
 //!
-//! dag.declare(
-//!     [DagJob::new(JobSpec::new(1, Resources::ZERO, 0), vec![])],
-//!     0.0,
-//! )
-//! .unwrap();
+//! let job = DagJob {
+//!     spec: JobSpec {
+//!         id: 1,
+//!         ..Default::default()
+//!     },
+//!     ..Default::default()
+//! };
+//! dag.declare([job], 0.0).unwrap();
 //! assert_eq!(dag.announcements(), [Output::Ready { job: 1 }]);
 //! assert_eq!(
 //!     dag.explain(1).unwrap(),
@@ -1510,13 +1886,17 @@
 //! use std::sync::Arc;
 //!
 //! use whelm::{
-//!     Config, DagConfig, DagScheduler, DagTemplate, Input, JobSpec, Output, Policy, Resources,
-//!     Scheduler, TemplateNode, Unit, WorkerState,
+//!     Config, DagConfig, DagScheduler, Input, Output, Policy, Scheduler, TemplateNode,
+//!     TemplateSpec, Unit, WorkerState,
 //! };
 //!
 //! let mut dag = DagScheduler::new(DagConfig::default(), Scheduler::new(Config::default()));
 //! dag.handle(
-//!     Input::Worker(WorkerState::new(1, "cpu", 4, Resources::ZERO)),
+//!     Input::Worker(WorkerState {
+//!         id: 1,
+//!         slots: 4,
+//!         ..Default::default()
+//!     }),
 //!     0.0,
 //! );
 //! let start = |job| Output::Start {
@@ -1527,26 +1907,36 @@
 //! let done = |job| Input::Done { job, attempt: 1 };
 //!
 //! // A job, then a pair of independent jobs, then a job: four leaves.
-//! let pair = Arc::new(DagTemplate::new(2, []).unwrap());
-//! let nodes = vec![
-//!     TemplateNode::Job(1.0),
-//!     TemplateNode::Unit(pair),
-//!     TemplateNode::Job(1.0),
-//! ];
-//! let shape = DagTemplate::with_nodes(nodes, [(0, 1), (1, 2)]).unwrap();
+//! let pair = Arc::new(TemplateSpec::jobs(2).build().unwrap());
+//! let shape = TemplateSpec {
+//!     nodes: vec![
+//!         TemplateNode::Job(1.0),
+//!         TemplateNode::Unit(pair),
+//!         TemplateNode::Job(1.0),
+//!     ],
+//!     edges: vec![(0, 1), (1, 2)],
+//! }
+//! .build()
+//! .unwrap();
 //! assert_eq!((shape.len(), shape.leaves()), (3, 4));
 //! let shape = Arc::new(shape);
 //!
-//! // Unit 10 is jobs 100..104; unit 20, jobs 200..204, runs after it.
-//! let spec = JobSpec::new(0, Resources::ZERO, 0); // each leaf's, with the leaf's id
-//! dag.declare(
-//!     [
-//!         Unit::new(10, 100, shape.clone(), spec.clone(), vec![]),
-//!         Unit::new(20, 200, shape, spec, vec![10]),
-//!     ],
-//!     0.0,
-//! )
-//! .unwrap();
+//! // Unit 10 is jobs 100..104; unit 20, jobs 200..204, runs after it. Each leaf is submitted
+//! // with the unit's `spec`, here the default one, under the leaf's id.
+//! let first = Unit {
+//!     id: 10,
+//!     base: 100,
+//!     template: shape.clone(),
+//!     ..Default::default()
+//! };
+//! let second = Unit {
+//!     id: 20,
+//!     base: 200,
+//!     template: shape,
+//!     deps: vec![10],
+//!     ..Default::default()
+//! };
+//! dag.declare([first, second], 0.0).unwrap();
 //! assert_eq!(dag.poll(0.0), [start(100)]);
 //! assert_eq!(
 //!     dag.explain(20).unwrap(),
@@ -1565,14 +1955,14 @@
 //! A unit costs a fixed amount of memory until its dependencies complete; only then is its per-node
 //! state allocated, and it is freed when the unit completes ([`DagStats`] counts both). Per-leaf
 //! data that differs between units of one template comes from a [`NodeSource`] rather than being
-//! stored: a [`sourced`](Unit::sourced()) unit asks the scheduler's source for each leaf's work,
-//! final spec and label, on demand.
+//! stored: a [`sourced`](field@Unit::sourced) unit asks the scheduler's source for each leaf's
+//! work, final spec and label, on demand.
 //!
 //! ```
 //! # use std::sync::Arc;
 //! # use whelm::{
-//! #     Config, DagConfig, DagScheduler, DagTemplate, Input, JobSpec, Output, Policy, Resources,
-//! #     Scheduler, Unit, WorkerState,
+//! #     Config, DagConfig, DagScheduler, Input, JobSpec, Output, Policy, Resources, Scheduler,
+//! #     TemplateSpec, Unit, WorkerState,
 //! # };
 //! use whelm::{JobId, MEM, NodeSource};
 //!
@@ -1593,9 +1983,17 @@
 //!
 //! let mut dag = DagScheduler::new(DagConfig::default(), Scheduler::new(Config::default()))
 //!     .with_source(Arc::new(Growing));
-//! dag.handle(Input::Worker(WorkerState::new(1, "cpu", 4, Resources::mem_gb(100.0))), 0.0);
-//! let chain = Arc::new(DagTemplate::new(3, [(0, 1), (1, 2)]).unwrap());
-//! let unit = Unit::new(10, 100, chain, JobSpec::new(0, Resources::ZERO, 0), vec![]).sourced();
+//! let worker =
+//!     WorkerState { id: 1, slots: 4, budget: Resources::mem_gb(100.0), ..Default::default() };
+//! dag.handle(Input::Worker(worker), 0.0);
+//! let chain = TemplateSpec { edges: vec![(0, 1), (1, 2)], ..TemplateSpec::jobs(3) };
+//! let unit = Unit {
+//!     id: 10,
+//!     base: 100,
+//!     template: Arc::new(chain.build().unwrap()),
+//!     sourced: true,
+//!     ..Default::default()
+//! };
 //! dag.declare([unit], 0.0).unwrap();
 //!
 //! assert_eq!(dag.poll(0.0), [Output::Start { job: 100, attempt: 1, worker: 1 }]);
@@ -1615,8 +2013,8 @@
 //!
 //! ```
 //! # use whelm::{
-//! #     Config, DagConfig, DagJob, DagScheduler, Input, JobSpec, Output, Policy, Resources,
-//! #     Scheduler, WorkerState
+//! #     Config, DagConfig, DagJob, DagScheduler, Input, JobSpec, Output, Policy, Scheduler,
+//! #     WorkerState
 //! # };
 //! use whelm::OrderTerm;
 //!
@@ -1624,10 +2022,20 @@
 //! fn first(config: Config) -> u64 {
 //!     let mut dag = DagScheduler::new(DagConfig::default(), Scheduler::new(config));
 //!     dag.handle(
-//!         Input::Worker(WorkerState::new(1, "cpu", 1, Resources::ZERO)),
+//!         Input::Worker(WorkerState {
+//!             id: 1,
+//!             ..Default::default()
+//!         }),
 //!         0.0,
 //!     );
-//!     let job = |id, deps| DagJob::new(JobSpec::new(id, Resources::ZERO, 0), deps);
+//!     let job = |id, deps| DagJob {
+//!         spec: JobSpec {
+//!             id,
+//!             ..Default::default()
+//!         },
+//!         deps,
+//!         ..Default::default()
+//!     };
 //!     dag.declare(
 //!         [
 //!             job(1, vec![]),
@@ -1656,7 +2064,7 @@
 //!
 //! ## Resuming and closing units
 //!
-//! A unit can be declared with some leaves already complete ([`Unit::with_completed`], e.g. from a
+//! A unit can be declared with some leaves already complete ([`Unit::completed`], e.g. from a
 //! checkpoint), and closed early ([`close`](DagScheduler::close)) when its remaining jobs are known
 //! to be no-ops. Closing completes the unit at once: its unstarted jobs are dropped, and the jobs
 //! already running are returned, keeping their resources until their attempts end.
@@ -1664,24 +2072,62 @@
 //! ```
 //! # use std::sync::Arc;
 //! # use whelm::{
-//! #     Config, DagConfig, DagJob, DagScheduler, DagTemplate, Input, JobSpec, Output, Policy,
-//! #     Resources, Scheduler, Unit, WorkerState
+//! #     Config, DagConfig, DagJob, DagScheduler, Input, JobSpec, Output, Policy, Scheduler,
+//! #     TemplateSpec, Unit, WorkerState
 //! # };
 //! let mut dag = DagScheduler::new(DagConfig::default(), Scheduler::new(Config::default()));
-//! dag.handle(Input::Worker(WorkerState::new(1, "cpu", 1, Resources::ZERO)), 0.0);
-//! let spec = |id| JobSpec::new(id, Resources::ZERO, 0);
+//! dag.handle(
+//!     Input::Worker(WorkerState {
+//!         id: 1,
+//!         ..Default::default()
+//!     }),
+//!     0.0,
+//! );
 //!
 //! // Unit 10: four independent jobs 100..104, the first two done before a restart. Job 20 follows.
-//! let four = Arc::new(DagTemplate::new(4, []).unwrap());
-//! let unit = Unit::new(10, 100, four, spec(0), vec![]).with_completed(vec![0, 1]);
-//! dag.declare([unit, DagJob::new(spec(20), vec![10]).into()], 0.0).unwrap();
-//! assert_eq!(dag.poll(0.0), [Output::Start { job: 102, attempt: 1, worker: 1 }]);
+//! let unit = Unit {
+//!     id: 10,
+//!     base: 100,
+//!     template: Arc::new(TemplateSpec::jobs(4).build().unwrap()),
+//!     completed: vec![0, 1],
+//!     ..Default::default()
+//! };
+//! let after = DagJob {
+//!     spec: JobSpec {
+//!         id: 20,
+//!         ..Default::default()
+//!     },
+//!     deps: vec![10],
+//!     ..Default::default()
+//! };
+//! dag.declare([unit, after.into()], 0.0).unwrap();
+//! assert_eq!(
+//!     dag.poll(0.0),
+//!     [Output::Start {
+//!         job: 102,
+//!         attempt: 1,
+//!         worker: 1
+//!     }]
+//! );
 //!
 //! // Job 103 turns out to be unnecessary: close the unit. Job 102 is still running.
 //! assert_eq!(dag.close(10, 1.0), Ok(vec![102]));
 //! assert!(dag.poll(1.0).is_empty()); // job 20 is ready, but 102 holds the slot
-//! dag.handle(Input::Done { job: 102, attempt: 1 }, 2.0);
-//! assert_eq!(dag.poll(2.0), [Output::Start { job: 20, attempt: 1, worker: 1 }]);
+//! dag.handle(
+//!     Input::Done {
+//!         job: 102,
+//!         attempt: 1,
+//!     },
+//!     2.0,
+//! );
+//! assert_eq!(
+//!     dag.poll(2.0),
+//!     [Output::Start {
+//!         job: 20,
+//!         attempt: 1,
+//!         worker: 1
+//!     }]
+//! );
 //! ```
 //!
 //! ## Snapshots
@@ -1695,13 +2141,23 @@
 //! # #[cfg(feature = "serde")]
 //! # fn main() {
 //! # use whelm::{
-//! #     Config, DagConfig, DagJob, DagScheduler, Input, JobSpec, Output, Policy, Resources,
-//! #     Scheduler, WorkerState
+//! #     Config, DagConfig, DagJob, DagScheduler, Input, JobSpec, Output, Policy, Scheduler,
+//! #     WorkerState
 //! # };
 //! let mut dag = DagScheduler::new(DagConfig::default(), Scheduler::new(Config::default()));
-//! let worker = WorkerState::new(1, "cpu", 1, Resources::ZERO);
+//! let worker = WorkerState {
+//!     id: 1,
+//!     ..Default::default()
+//! };
 //! dag.handle(Input::Worker(worker.clone()), 0.0);
-//! let job = |id, deps| DagJob::new(JobSpec::new(id, Resources::ZERO, 0), deps);
+//! let job = |id, deps| DagJob {
+//!     spec: JobSpec {
+//!         id,
+//!         ..Default::default()
+//!     },
+//!     deps,
+//!     ..Default::default()
+//! };
 //! dag.declare([job(1, vec![]), job(2, vec![1])], 0.0).unwrap();
 //! dag.poll(0.0);
 //! dag.handle(Input::Done { job: 1, attempt: 1 }, 1.0);
@@ -1742,16 +2198,23 @@
 //! run one after another.
 //!
 //! ```
-//! use whelm::{Config, JobSpec, Resources, Scheduler, SharedPolicy, WorkerState};
+//! use whelm::{Config, JobSpec, Scheduler, SharedPolicy, WorkerState};
 //!
 //! let shared = SharedPolicy::with_system_clock(Scheduler::new(Config::default()));
-//! shared.worker_update(WorkerState::new(1, "cpu", 1, Resources::ZERO));
+//! shared.worker_update(WorkerState {
+//!     id: 1,
+//!     ..Default::default()
+//! });
 //!
 //! std::thread::scope(|s| {
 //!     for id in 1..=3 {
 //!         let shared = &shared;
 //!         s.spawn(move || {
-//!             let lease = shared.lease(JobSpec::new(id, Resources::ZERO, 0)); // blocks
+//!             let job = JobSpec {
+//!                 id,
+//!                 ..Default::default()
+//!             };
+//!             let lease = shared.lease(job); // blocks
 //!             assert_eq!((lease.worker(), lease.attempt()), (1, 1));
 //!             // ... send the task to lease.worker() and wait for its reply ...
 //!             lease.complete();
@@ -1770,15 +2233,24 @@
 //!
 //! ```
 //! # use whelm::{
-//! #     Config, FailKind, JobSpec, Resources, RetryConfig, Scheduler, SharedPolicy, WorkerState
+//! #     Config, FailKind, JobSpec, RetryConfig, Scheduler, SharedPolicy, WorkerState
 //! # };
-//! let config = Config { retry: RetryConfig { max_attempts: 2 }, ..Config::default() };
+//! let config = Config {
+//!     retry: RetryConfig { max_attempts: 2 },
+//!     ..Config::default()
+//! };
 //! let shared = SharedPolicy::with_system_clock(Scheduler::new(config));
 //! for id in [1, 2] {
-//!     shared.worker_update(WorkerState::new(id, "cpu", 1, Resources::ZERO));
+//!     shared.worker_update(WorkerState {
+//!         id,
+//!         ..Default::default()
+//!     });
 //! }
 //!
-//! let lease = shared.lease(JobSpec::new(1, Resources::ZERO, 0));
+//! let lease = shared.lease(JobSpec {
+//!     id: 1,
+//!     ..Default::default()
+//! });
 //! assert_eq!(lease.worker(), 1);
 //! let retry = lease.fail(FailKind::Timeout, "no reply").unwrap();
 //! assert_eq!((retry.worker(), retry.attempt()), (2, 2));
@@ -1801,7 +2273,7 @@
 //! use std::sync::{Arc, Mutex};
 //!
 //! use whelm::{
-//!     Config, Input, JobSpec, Output, Policy, Resources, Scheduler, WorkerState,
+//!     Config, Input, JobSpec, Output, Policy, Scheduler, WorkerState,
 //!     log::{self, Event, Logged},
 //! };
 //!
@@ -1809,11 +2281,18 @@
 //! let events = Arc::new(Mutex::new(Vec::<Event>::new()));
 //! let mut p = Logged::new(Scheduler::new(Config::default()), events.clone());
 //! p.handle(
-//!     Input::Worker(WorkerState::new(1, "cpu", 1, Resources::ZERO)),
+//!     Input::Worker(WorkerState {
+//!         id: 1,
+//!         ..Default::default()
+//!     }),
 //!     0.0,
 //! );
-//! p.handle(Input::Submit(JobSpec::new(1, Resources::ZERO, 0)), 0.0);
-//! p.handle(Input::Submit(JobSpec::new(2, Resources::ZERO, 0)), 0.0);
+//! let job = |id| JobSpec {
+//!     id,
+//!     ..Default::default()
+//! };
+//! p.handle(Input::Submit(job(1)), 0.0);
+//! p.handle(Input::Submit(job(2)), 0.0);
 //! p.poll(0.0);
 //! p.handle(Input::Done { job: 1, attempt: 1 }, 5.0);
 //! p.poll(5.0);
@@ -1864,23 +2343,27 @@
 //! }
 //!
 //! let script = || {
-//!     let job = |id| Input::Submit(JobSpec::new(id, Resources::mem_gb(4.0), 0));
+//!     let job = |id| {
+//!         Input::Submit(JobSpec {
+//!             id,
+//!             demand: Resources::mem_gb(4.0),
+//!             ..Default::default()
+//!         })
+//!     };
 //!     let fail = Input::Failed {
 //!         job: 1,
 //!         attempt: 1,
 //!         kind: FailKind::Other,
 //!         why: "test".into(),
 //!     };
+//!     let worker = WorkerState {
+//!         id: 1,
+//!         slots: 2,
+//!         budget: Resources::mem_gb(8.0),
+//!         ..Default::default()
+//!     };
 //!     vec![
-//!         (
-//!             0.0,
-//!             vec![Input::Worker(WorkerState::new(
-//!                 1,
-//!                 "cpu",
-//!                 2,
-//!                 Resources::mem_gb(8.0),
-//!             ))],
-//!         ),
+//!         (0.0, vec![Input::Worker(worker)]),
 //!         (1.0, vec![job(1), job(2), job(3)]),
 //!         (2.0, vec![fail]),
 //!         (3.0, vec![Input::Done { job: 2, attempt: 1 }]),
@@ -1968,7 +2451,7 @@ pub use config::{
 pub use dag::DagSnapshot;
 pub use dag::{
     DagConfig, DagError, DagJob, DagScheduler, DagStats, DagTemplate, NodeSource, TemplateNode,
-    Unit,
+    TemplateSpec, Unit,
 };
 #[doc(inline)]
 pub use job::{Constraint, JobId, JobSpec, Selector, Strength};

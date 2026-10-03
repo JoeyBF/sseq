@@ -12,7 +12,8 @@ use std::{collections::HashMap, sync::Arc};
 use serde::{Deserialize, Serialize};
 
 use super::{
-    DagConfig, DagScheduler, DagTemplate, NodeSource, Source, TemplateNode, UnitRec, UnitState,
+    DagConfig, DagScheduler, DagTemplate, NodeSource, Source, TemplateNode, TemplateSpec, UnitRec,
+    UnitState,
     frame::{Frame, HELD, SUBMITTED, sourced_bottom_levels},
 };
 use crate::{Instant, JobId, JobSpec, Output, Policy};
@@ -26,12 +27,17 @@ use crate::{Instant, JobId, JobSpec, Output, Policy};
 /// A round trip through JSON:
 ///
 /// ```
-/// use whelm::{
-///     Config, DagConfig, DagJob, DagScheduler, DagSnapshot, JobSpec, Resources, Scheduler,
-/// };
+/// use whelm::{Config, DagConfig, DagJob, DagScheduler, DagSnapshot, JobSpec, Scheduler};
 ///
 /// let mut dag = DagScheduler::new(DagConfig::default(), Scheduler::new(Config::fifo()));
-/// let job = |id, deps| DagJob::new(JobSpec::new(id, Resources::mem(1), 0), deps);
+/// let job = |id, deps| DagJob {
+///     spec: JobSpec {
+///         id,
+///         ..Default::default()
+///     },
+///     deps,
+///     ..Default::default()
+/// };
 /// dag.declare([job(1, vec![]), job(2, vec![1])], 0.0).unwrap();
 ///
 /// let json = serde_json::to_string(&dag.snapshot()).unwrap();
@@ -139,12 +145,24 @@ impl<P: Policy> DagScheduler<P> {
     ///
     /// ```
     /// use whelm::{
-    ///     Config, DagConfig, DagJob, DagScheduler, Input, JobSpec, Output, Policy, Resources,
-    ///     Scheduler, WorkerState,
+    ///     Config, DagConfig, DagJob, DagScheduler, Input, JobSpec, Output, Policy, Scheduler,
+    ///     WorkerState,
     /// };
     ///
-    /// let worker = || Input::Worker(WorkerState::new(1, "cpu", 1, Resources::mem(100)));
-    /// let job = |id, deps| DagJob::new(JobSpec::new(id, Resources::mem(1), 0), deps);
+    /// let worker = || {
+    ///     Input::Worker(WorkerState {
+    ///         id: 1,
+    ///         ..Default::default()
+    ///     })
+    /// };
+    /// let job = |id, deps| DagJob {
+    ///     spec: JobSpec {
+    ///         id,
+    ///         ..Default::default()
+    ///     },
+    ///     deps,
+    ///     ..Default::default()
+    /// };
     /// let mut dag = DagScheduler::new(DagConfig::default(), Scheduler::new(Config::fifo()));
     /// dag.handle(worker(), 0.0);
     /// dag.declare([job(1, vec![]), job(2, vec![3])], 0.0).unwrap();
@@ -234,23 +252,36 @@ impl<P: Policy> DagScheduler<P> {
     ///
     /// ```
     /// # use whelm::{Config, DagConfig, DagJob, DagScheduler, Input, JobSpec, Output, Policy,
-    /// #     Resources, Scheduler, WorkerState};
+    /// #     Scheduler, WorkerState};
     /// let config = DagConfig {
     ///     auto_submit: false,
     ///     ..DagConfig::default()
     /// };
     /// let mut dag = DagScheduler::new(config, Scheduler::new(Config::fifo()));
     /// dag.handle(
-    ///     Input::Worker(WorkerState::new(1, "cpu", 1, Resources::mem(100))),
+    ///     Input::Worker(WorkerState {
+    ///         id: 1,
+    ///         ..Default::default()
+    ///     }),
     ///     0.0,
     /// );
-    /// let job = |id, deps| DagJob::new(JobSpec::new(id, Resources::mem(1), 0), deps);
+    /// let job = |id, deps| DagJob {
+    ///     spec: JobSpec {
+    ///         id,
+    ///         ..Default::default()
+    ///     },
+    ///     deps,
+    ///     ..Default::default()
+    /// };
     /// dag.declare(
     ///     [
     ///         job(1, vec![]),
     ///         job(2, vec![]),
     ///         job(3, vec![1]),
-    ///         job(4, vec![]).local(),
+    ///         DagJob {
+    ///             local: true,
+    ///             ..job(4, vec![])
+    ///         },
     ///     ],
     ///     0.0,
     /// )
@@ -269,7 +300,10 @@ impl<P: Policy> DagScheduler<P> {
     /// let snapshot = dag.snapshot();
     /// let mut dag = DagScheduler::restore(snapshot, Scheduler::new(Config::fifo()), None, 5.0);
     /// dag.handle(
-    ///     Input::Worker(WorkerState::new(7, "cpu", 1, Resources::mem(100))),
+    ///     Input::Worker(WorkerState {
+    ///         id: 7,
+    ///         ..Default::default()
+    ///     }),
     ///     5.0,
     /// );
     /// assert_eq!(
@@ -307,7 +341,11 @@ impl<P: Policy> DagScheduler<P> {
                     NodeSnapshot::Unit(i) => TemplateNode::Unit(templates[i].clone()),
                 })
                 .collect();
-            let t = DagTemplate::with_nodes(nodes, t.edges).expect("a snapshot's template");
+            let spec = TemplateSpec {
+                nodes,
+                edges: t.edges,
+            };
+            let t = spec.build().expect("a snapshot's template");
             templates.push(Arc::new(t));
         }
         let mut preds = Vec::with_capacity(snapshot.units.len());

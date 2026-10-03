@@ -20,9 +20,13 @@ pub type JobId = u64;
 /// # Examples
 ///
 /// ```
-/// use whelm::{Resources, Selector, WorkerState};
+/// use whelm::{Selector, WorkerState};
 ///
-/// let w = WorkerState::new(7, "gpu", 4, Resources::ZERO);
+/// let w = WorkerState {
+///     id: 7,
+///     class: "gpu".into(),
+///     ..Default::default()
+/// };
 /// assert!(Selector::Worker(7).matches(&w));
 /// assert!(Selector::Class("gpu".into()).matches(&w));
 /// assert!(!Selector::Class("cpu".into()).matches(&w));
@@ -57,19 +61,26 @@ impl Selector {
 /// Requires of one kind are alternatives: this job may run on either class.
 ///
 /// ```
-/// use whelm::{Config, Input, JobSpec, Output, Policy, Resources, Scheduler, WorkerState};
+/// use whelm::{Config, Constraint, Input, JobSpec, Output, Policy, Scheduler, WorkerState};
 ///
 /// let mut p = Scheduler::new(Config::default());
 /// for (id, class) in [(1, "cpu"), (2, "a100"), (3, "h100")] {
-///     p.handle(
-///         Input::Worker(WorkerState::new(id, class, 1, Resources::ZERO)),
-///         0.0,
-///     );
+///     let w = WorkerState {
+///         id,
+///         class: class.into(),
+///         ..Default::default()
+///     };
+///     p.handle(Input::Worker(w), 0.0);
 /// }
 /// for id in 1..=3 {
-///     let job = JobSpec::new(id, Resources::ZERO, 0)
-///         .require_class("a100")
-///         .require_class("h100");
+///     let job = JobSpec {
+///         id,
+///         constraints: vec![
+///             Constraint::require_class("a100"),
+///             Constraint::require_class("h100"),
+///         ],
+///         ..Default::default()
+///     };
 ///     p.handle(Input::Submit(job), 0.0);
 /// }
 /// assert_eq!(
@@ -109,14 +120,19 @@ pub enum Strength {
 
 /// One placement constraint of a job ([`JobSpec::constraints`]).
 ///
+/// The named constructors cover each [`Strength`] on one worker or one class; the literal says the
+/// same thing at more length.
+///
 /// # Examples
 ///
-/// The [`JobSpec`] builders push constraints; [`JobSpec::constrain`] takes any combination.
-///
 /// ```
-/// use whelm::{Constraint, JobSpec, Resources, Selector, Strength};
+/// use whelm::{Constraint, JobSpec, Selector, Strength};
 ///
-/// let job = JobSpec::new(1, Resources::ZERO, 0).avoid_worker(3);
+/// let job = JobSpec {
+///     id: 1,
+///     constraints: vec![Constraint::avoid_worker(3)],
+///     ..Default::default()
+/// };
 /// let avoid = Constraint {
 ///     on: Selector::Worker(3),
 ///     strength: Strength::Avoid,
@@ -132,6 +148,233 @@ pub struct Constraint {
     pub strength: Strength,
 }
 
+impl Constraint {
+    /// Run only on worker `w` (or on another required worker).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use whelm::{Constraint, Selector, Strength};
+    ///
+    /// let c = Constraint::require_worker(2);
+    /// assert_eq!((c.on, c.strength), (Selector::Worker(2), Strength::Require));
+    /// ```
+    pub fn require_worker(w: WorkerId) -> Self {
+        Self {
+            on: Selector::Worker(w),
+            strength: Strength::Require,
+        }
+    }
+
+    /// Run only on workers of `class` (or of another required class).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use whelm::{Config, Constraint, Input, JobSpec, Output, Policy, Scheduler, WorkerState};
+    ///
+    /// let mut p = Scheduler::new(Config::default());
+    /// for (id, class) in [(1, "cpu"), (2, "gpu")] {
+    ///     let w = WorkerState {
+    ///         id,
+    ///         class: class.into(),
+    ///         ..Default::default()
+    ///     };
+    ///     p.handle(Input::Worker(w), 0.0);
+    /// }
+    /// let job = JobSpec {
+    ///     id: 1,
+    ///     constraints: vec![Constraint::require_class("gpu")],
+    ///     ..Default::default()
+    /// };
+    /// p.handle(Input::Submit(job), 0.0);
+    /// assert_eq!(
+    ///     p.poll(0.0),
+    ///     [Output::Start {
+    ///         job: 1,
+    ///         attempt: 1,
+    ///         worker: 2
+    ///     }]
+    /// );
+    /// ```
+    pub fn require_class(class: impl Into<String>) -> Self {
+        Self {
+            on: Selector::Class(class.into()),
+            strength: Strength::Require,
+        }
+    }
+
+    /// Never run on worker `w`.
+    ///
+    /// # Examples
+    ///
+    /// Unlike an avoided worker, a forbidden one is never used, even when it is the only one.
+    ///
+    /// ```
+    /// use whelm::{Config, Constraint, Input, JobSpec, Policy, Scheduler, WorkerState};
+    ///
+    /// let mut p = Scheduler::new(Config::default());
+    /// p.handle(
+    ///     Input::Worker(WorkerState {
+    ///         id: 1,
+    ///         ..Default::default()
+    ///     }),
+    ///     0.0,
+    /// );
+    /// let job = JobSpec {
+    ///     id: 1,
+    ///     constraints: vec![Constraint::forbid_worker(1)],
+    ///     ..Default::default()
+    /// };
+    /// p.handle(Input::Submit(job), 0.0);
+    /// assert!(p.poll(0.0).is_empty());
+    /// ```
+    pub fn forbid_worker(w: WorkerId) -> Self {
+        Self {
+            on: Selector::Worker(w),
+            strength: Strength::Forbid,
+        }
+    }
+
+    /// Never run on a worker of `class`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use whelm::{Constraint, Selector, Strength};
+    ///
+    /// let c = Constraint::forbid_class("cpu");
+    /// assert_eq!(
+    ///     (c.on, c.strength),
+    ///     (Selector::Class("cpu".into()), Strength::Forbid)
+    /// );
+    /// ```
+    pub fn forbid_class(class: impl Into<String>) -> Self {
+        Self {
+            on: Selector::Class(class.into()),
+            strength: Strength::Forbid,
+        }
+    }
+
+    /// Softly avoid worker `w`.
+    ///
+    /// # Examples
+    ///
+    /// With no other live worker, the avoided one is used after all (see [`Strength::Avoid`]).
+    ///
+    /// ```
+    /// use whelm::{Config, Constraint, Input, JobSpec, Output, Policy, Scheduler, WorkerState};
+    ///
+    /// let mut p = Scheduler::new(Config::default());
+    /// p.handle(
+    ///     Input::Worker(WorkerState {
+    ///         id: 1,
+    ///         ..Default::default()
+    ///     }),
+    ///     0.0,
+    /// );
+    /// let job = JobSpec {
+    ///     id: 1,
+    ///     constraints: vec![Constraint::avoid_worker(1)],
+    ///     ..Default::default()
+    /// };
+    /// p.handle(Input::Submit(job), 0.0);
+    /// assert_eq!(
+    ///     p.poll(0.0),
+    ///     [Output::Start {
+    ///         job: 1,
+    ///         attempt: 1,
+    ///         worker: 1
+    ///     }]
+    /// );
+    /// ```
+    pub fn avoid_worker(w: WorkerId) -> Self {
+        Self {
+            on: Selector::Worker(w),
+            strength: Strength::Avoid,
+        }
+    }
+
+    /// Softly avoid the workers of `class`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use whelm::{Constraint, Selector, Strength};
+    ///
+    /// let c = Constraint::avoid_class("flaky");
+    /// assert_eq!(
+    ///     (c.on, c.strength),
+    ///     (Selector::Class("flaky".into()), Strength::Avoid)
+    /// );
+    /// ```
+    pub fn avoid_class(class: impl Into<String>) -> Self {
+        Self {
+            on: Selector::Class(class.into()),
+            strength: Strength::Avoid,
+        }
+    }
+
+    /// Prefer worker `w`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use whelm::{Config, Constraint, Input, JobSpec, Output, Policy, Scheduler, WorkerState};
+    ///
+    /// let mut p = Scheduler::new(Config::default());
+    /// for id in [1, 2] {
+    ///     p.handle(
+    ///         Input::Worker(WorkerState {
+    ///             id,
+    ///             ..Default::default()
+    ///         }),
+    ///         0.0,
+    ///     );
+    /// }
+    /// let job = JobSpec {
+    ///     id: 1,
+    ///     constraints: vec![Constraint::prefer_worker(2)],
+    ///     ..Default::default()
+    /// };
+    /// p.handle(Input::Submit(job), 0.0);
+    /// assert_eq!(
+    ///     p.poll(0.0),
+    ///     [Output::Start {
+    ///         job: 1,
+    ///         attempt: 1,
+    ///         worker: 2
+    ///     }]
+    /// );
+    /// ```
+    pub fn prefer_worker(w: WorkerId) -> Self {
+        Self {
+            on: Selector::Worker(w),
+            strength: Strength::Prefer,
+        }
+    }
+
+    /// Prefer the workers of `class`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use whelm::{Constraint, Selector, Strength};
+    ///
+    /// let c = Constraint::prefer_class("l40s");
+    /// assert_eq!(
+    ///     (c.on, c.strength),
+    ///     (Selector::Class("l40s".into()), Strength::Prefer)
+    /// );
+    /// ```
+    pub fn prefer_class(class: impl Into<String>) -> Self {
+        Self {
+            on: Selector::Class(class.into()),
+            strength: Strength::Prefer,
+        }
+    }
+}
+
 /// A job, as submitted to a [`Policy`].
 ///
 /// Only the id, demand and group are needed; every other field refines ordering, placement or
@@ -139,21 +382,22 @@ pub struct Constraint {
 ///
 /// # Examples
 ///
-/// Start from [`JobSpec::new`] and fill in the rest with struct update syntax or the builders.
+/// Name the fields that matter and take the rest from [`Default`].
 ///
 /// ```
-/// use whelm::{JobSpec, Resources};
+/// use whelm::{Constraint, JobSpec, Resources};
 ///
 /// let job = JobSpec {
+///     id: 42,
+///     demand: Resources::mem_gb(6.0),
+///     group: 3,
 ///     priority: Some(-1),
 ///     work: Some(120.0),
-///     ..JobSpec::new(42, Resources::mem_gb(6.0), 3)
-/// }
-/// .with_kind("sig")
-/// .require_class("gpu");
-/// assert_eq!((job.id, job.group, job.weight), (42, 3, 1.0));
-/// assert_eq!(job.kind.as_deref(), Some("sig"));
-/// assert_eq!(job.constraints.len(), 1);
+///     kind: Some("sig".into()),
+///     constraints: vec![Constraint::require_class("gpu")],
+///     ..Default::default()
+/// };
+/// assert_eq!((job.weight, job.due), (1.0, None));
 /// ```
 #[derive(Clone, Debug, PartialEq)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
@@ -199,23 +443,13 @@ pub struct JobSpec {
     pub constraints: Vec<Constraint>,
 }
 
-impl JobSpec {
-    /// A job with the given id, demand and group, weight 1 and nothing else.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use whelm::{JobSpec, Resources};
-    ///
-    /// let job = JobSpec::new(1, Resources::mem_gb(2.0), 0);
-    /// assert_eq!((job.priority, job.work, job.weight), (None, None, 1.0));
-    /// assert!(job.constraints.is_empty());
-    /// ```
-    pub fn new(id: JobId, demand: Resources, group: u64) -> Self {
+impl Default for JobSpec {
+    /// A job weighing 1, so that a weighted objective counts jobs it is not told about alike.
+    fn default() -> Self {
         Self {
-            id,
-            demand,
-            group,
+            id: 0,
+            demand: Resources::ZERO,
+            group: 0,
             priority: None,
             rank: None,
             weight: 1.0,
@@ -224,159 +458,5 @@ impl JobSpec {
             kind: None,
             constraints: Vec::new(),
         }
-    }
-
-    /// This job, of kind `kind` ([`JobSpec::kind`]).
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use whelm::{JobSpec, Resources};
-    ///
-    /// let job = JobSpec::new(1, Resources::ZERO, 0).with_kind("zero");
-    /// assert_eq!(job.kind.as_deref(), Some("zero"));
-    /// ```
-    pub fn with_kind(mut self, kind: impl Into<String>) -> Self {
-        self.kind = Some(kind.into());
-        self
-    }
-
-    /// This job with one more constraint.
-    ///
-    /// # Examples
-    ///
-    /// Constraints the shorthand builders do not cover, such as avoiding a whole class.
-    ///
-    /// ```
-    /// use whelm::{JobSpec, Resources, Selector, Strength};
-    ///
-    /// let job = JobSpec::new(1, Resources::ZERO, 0)
-    ///     .constrain(Strength::Avoid, Selector::Class("flaky".into()));
-    /// assert_eq!(job.constraints[0].strength, Strength::Avoid);
-    /// ```
-    pub fn constrain(mut self, strength: Strength, on: Selector) -> Self {
-        self.constraints.push(Constraint { on, strength });
-        self
-    }
-
-    /// This job, run only on workers of `class` (or of another required class).
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use whelm::{Config, Input, JobSpec, Output, Policy, Resources, Scheduler, WorkerState};
-    ///
-    /// let mut p = Scheduler::new(Config::default());
-    /// p.handle(
-    ///     Input::Worker(WorkerState::new(1, "cpu", 1, Resources::ZERO)),
-    ///     0.0,
-    /// );
-    /// p.handle(
-    ///     Input::Worker(WorkerState::new(2, "gpu", 1, Resources::ZERO)),
-    ///     0.0,
-    /// );
-    /// p.handle(
-    ///     Input::Submit(JobSpec::new(1, Resources::ZERO, 0).require_class("gpu")),
-    ///     0.0,
-    /// );
-    /// assert_eq!(
-    ///     p.poll(0.0),
-    ///     [Output::Start {
-    ///         job: 1,
-    ///         attempt: 1,
-    ///         worker: 2
-    ///     }]
-    /// );
-    /// ```
-    pub fn require_class(self, class: impl Into<String>) -> Self {
-        self.constrain(Strength::Require, Selector::Class(class.into()))
-    }
-
-    /// This job, never run on worker `w`.
-    ///
-    /// # Examples
-    ///
-    /// Unlike an avoided worker, a forbidden one is never used, even when it is the only one.
-    ///
-    /// ```
-    /// use whelm::{Config, Input, JobSpec, Policy, Resources, Scheduler, WorkerState};
-    ///
-    /// let mut p = Scheduler::new(Config::default());
-    /// p.handle(
-    ///     Input::Worker(WorkerState::new(1, "cpu", 1, Resources::ZERO)),
-    ///     0.0,
-    /// );
-    /// p.handle(
-    ///     Input::Submit(JobSpec::new(1, Resources::ZERO, 0).forbid_worker(1)),
-    ///     0.0,
-    /// );
-    /// assert!(p.poll(0.0).is_empty());
-    /// ```
-    pub fn forbid_worker(self, w: WorkerId) -> Self {
-        self.constrain(Strength::Forbid, Selector::Worker(w))
-    }
-
-    /// This job, softly avoiding worker `w`.
-    ///
-    /// # Examples
-    ///
-    /// With no other live worker, the avoided one is used after all (see [`Strength::Avoid`]).
-    ///
-    /// ```
-    /// use whelm::{Config, Input, JobSpec, Output, Policy, Resources, Scheduler, WorkerState};
-    ///
-    /// let mut p = Scheduler::new(Config::default());
-    /// p.handle(
-    ///     Input::Worker(WorkerState::new(1, "cpu", 1, Resources::ZERO)),
-    ///     0.0,
-    /// );
-    /// p.handle(
-    ///     Input::Submit(JobSpec::new(1, Resources::ZERO, 0).avoid_worker(1)),
-    ///     0.0,
-    /// );
-    /// assert_eq!(
-    ///     p.poll(0.0),
-    ///     [Output::Start {
-    ///         job: 1,
-    ///         attempt: 1,
-    ///         worker: 1
-    ///     }]
-    /// );
-    /// ```
-    pub fn avoid_worker(self, w: WorkerId) -> Self {
-        self.constrain(Strength::Avoid, Selector::Worker(w))
-    }
-
-    /// This job, preferring worker `w`.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use whelm::{Config, Input, JobSpec, Output, Policy, Resources, Scheduler, WorkerState};
-    ///
-    /// let mut p = Scheduler::new(Config::default());
-    /// p.handle(
-    ///     Input::Worker(WorkerState::new(1, "cpu", 1, Resources::ZERO)),
-    ///     0.0,
-    /// );
-    /// p.handle(
-    ///     Input::Worker(WorkerState::new(2, "cpu", 1, Resources::ZERO)),
-    ///     0.0,
-    /// );
-    /// p.handle(
-    ///     Input::Submit(JobSpec::new(1, Resources::ZERO, 0).prefer_worker(2)),
-    ///     0.0,
-    /// );
-    /// assert_eq!(
-    ///     p.poll(0.0),
-    ///     [Output::Start {
-    ///         job: 1,
-    ///         attempt: 1,
-    ///         worker: 2
-    ///     }]
-    /// );
-    /// ```
-    pub fn prefer_worker(self, w: WorkerId) -> Self {
-        self.constrain(Strength::Prefer, Selector::Worker(w))
     }
 }

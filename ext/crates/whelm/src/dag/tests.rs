@@ -3,9 +3,9 @@
 use std::sync::Arc;
 
 use crate::{
-    Attempt, Config, DagConfig, DagError, DagJob, DagScheduler, DagStats, DagTemplate, FailKind,
-    GaveUp, Input, Instant, JobId, JobSpec, Output, Policy, Resources, RetryConfig, Scheduler,
-    Unit, WorkerState,
+    Attempt, Config, DagConfig, DagError, DagJob, DagScheduler, DagStats, FailKind, GaveUp, Input,
+    Instant, JobId, JobSpec, Output, Policy, Resources, RetryConfig, Scheduler, TemplateSpec, Unit,
+    WorkerId, WorkerState,
 };
 
 /// A DAG over a FIFO scheduler with one one-slot worker, and `max_attempts` attempts per job.
@@ -17,16 +17,40 @@ fn dag(config: DagConfig, max_attempts: u32) -> DagScheduler<Scheduler> {
             ..Config::fifo()
         }),
     );
-    d.handle(
-        Input::Worker(WorkerState::new(1, "x", 1, Resources::mem(100))),
-        0.0,
-    );
+    d.handle(Input::Worker(worker(1)), 0.0);
     d
+}
+
+/// A one-slot worker of 100 bytes.
+fn worker(id: WorkerId) -> WorkerState {
+    WorkerState {
+        id,
+        class: "x".into(),
+        slots: 1,
+        budget: Resources::mem(100),
+        ..Default::default()
+    }
 }
 
 /// A job of group 0 with the given dependencies.
 fn job(id: JobId, deps: &[JobId]) -> DagJob {
-    DagJob::new(JobSpec::new(id, Resources::mem(1), 0), deps.to_vec())
+    DagJob {
+        spec: JobSpec {
+            id,
+            demand: Resources::mem(1),
+            ..Default::default()
+        },
+        deps: deps.to_vec(),
+        ..Default::default()
+    }
+}
+
+/// A local job with the given dependencies.
+fn local(id: JobId, deps: &[JobId]) -> DagJob {
+    DagJob {
+        local: true,
+        ..job(id, deps)
+    }
 }
 
 /// The start of attempt `attempt` of `job` on worker 1.
@@ -67,13 +91,18 @@ fn fail(job: JobId, attempt: Attempt) -> Input {
 
 /// A unit `id` of a template of `len` independent jobs at `base`, after `deps`.
 fn unit(id: JobId, base: JobId, len: usize, deps: &[JobId]) -> Unit {
-    Unit::new(
+    Unit {
         id,
         base,
-        Arc::new(DagTemplate::new(len, []).unwrap()),
-        JobSpec::new(0, Resources::mem(1), 0),
-        deps.to_vec(),
-    )
+        template: Arc::new(TemplateSpec::jobs(len).build().unwrap()),
+        deps: deps.to_vec(),
+        spec: JobSpec {
+            demand: Resources::mem(1),
+            ..Default::default()
+        },
+        scale: Some(1.0),
+        ..Default::default()
+    }
 }
 
 /// The inner policy's starts come out of the DAG's poll, and a done attempt releases the
@@ -114,7 +143,7 @@ fn worker_gone_retries() {
     d.poll(0.0);
     assert!(feed(&mut d, 1.0, [Input::WorkerGone(1)]).is_empty());
     assert!(feed(&mut d, 2.0, [done(1, 1)]).is_empty());
-    let w = WorkerState::new(1, "x", 1, Resources::mem(100));
+    let w = worker(1);
     assert_eq!(feed(&mut d, 3.0, [Input::Worker(w)]), vec![start(1, 2)]);
     assert_eq!(feed(&mut d, 4.0, [done(1, 2)]), vec![start(2, 1)]);
 }
@@ -123,8 +152,7 @@ fn worker_gone_retries() {
 #[test]
 fn local_jobs_run_on_the_caller() {
     let mut d = dag(DagConfig::default(), 4);
-    d.declare(vec![job(1, &[]).local(), job(2, &[1])], 0.0)
-        .unwrap();
+    d.declare(vec![local(1, &[]), job(2, &[1])], 0.0).unwrap();
     assert_eq!(d.poll(0.0), vec![Output::RunLocal { job: 1 }]);
     assert_eq!(d.stats().waiting, 0);
     assert!(!d.release(1, 0.0));
@@ -193,7 +221,19 @@ fn passthroughs_are_announced() {
     };
     let mut d = dag(config, 4);
     d.declare(
-        vec![job(1, &[]), DagJob::passthrough(2, 0, vec![1], 0.0)],
+        vec![
+            job(1, &[]),
+            DagJob {
+                spec: JobSpec {
+                    id: 2,
+                    ..Default::default()
+                },
+                deps: vec![1],
+                work_estimate: Some(0.0),
+                passthrough: true,
+                ..Default::default()
+            },
+        ],
         0.0,
     )
     .unwrap();
@@ -280,7 +320,7 @@ fn closed_unit_job_worker_gone() {
     assert!(feed(&mut d, 3.0, [Input::WorkerGone(1)]).is_empty());
     let st = d.stats();
     assert_eq!((st.waiting, st.running), (1, 0));
-    let w = WorkerState::new(1, "x", 1, Resources::mem(100));
+    let w = worker(1);
     assert_eq!(feed(&mut d, 4.0, [Input::Worker(w)]), vec![start(2, 1)]);
 }
 
@@ -301,7 +341,7 @@ fn restore_announces_held_jobs() {
     };
     let mut d = dag(config, 4);
     d.declare(
-        vec![job(1, &[]), job(2, &[]), job(3, &[1]), job(4, &[]).local()],
+        vec![job(1, &[]), job(2, &[]), job(3, &[1]), local(4, &[])],
         0.0,
     )
     .unwrap();
@@ -310,7 +350,7 @@ fn restore_announces_held_jobs() {
     assert_eq!(d.poll(0.0), vec![start(1, 1)]);
     let snap = d.snapshot();
     let mut r = DagScheduler::restore(snap, Scheduler::new(Config::fifo()), None, 5.0);
-    let w = WorkerState::new(7, "x", 1, Resources::mem(100));
+    let w = worker(7);
     assert_eq!(
         feed(&mut r, 5.0, [Input::Worker(w)]),
         vec![

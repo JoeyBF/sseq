@@ -20,12 +20,22 @@ use whelm::{
 
 /// A worker of class "x".
 fn worker(id: u64, slots: usize) -> WorkerState {
-    WorkerState::new(id, "x", slots, Resources::mem(1 << 40))
+    WorkerState {
+        id,
+        class: "x".into(),
+        slots,
+        budget: Resources::mem(1 << 40),
+        ..Default::default()
+    }
 }
 
 /// A unit job.
 fn job(id: u64) -> JobSpec {
-    JobSpec::new(id, Resources::mem(1), 0)
+    JobSpec {
+        id,
+        demand: Resources::mem(1),
+        ..Default::default()
+    }
 }
 
 /// A front end over the default backfill policy.
@@ -726,14 +736,25 @@ fn poll_p99_at_frontier_size() {
     let mut p = Scheduler::new(Config::default());
     for w in 0..21 {
         let class = if w < 7 { "h200" } else { "l40s" };
-        let w = WorkerState::new(w, class, 16, Resources::mem_gb(150.0));
+        let w = WorkerState {
+            id: w,
+            class: class.into(),
+            slots: 16,
+            budget: Resources::mem_gb(150.0),
+            ..Default::default()
+        };
         p.handle(Input::Worker(w), 0.0);
     }
     let mut next = 0u64;
     let mut running = std::collections::VecDeque::new();
     let mut submit = |p: &mut Scheduler, t: f64| {
-        let mut j = JobSpec::new(next, Resources::mem_gb(1.0 + (next % 13) as f64), next / 50);
-        j.work = Some(60.0);
+        let j = JobSpec {
+            id: next,
+            demand: Resources::mem_gb(1.0 + (next % 13) as f64),
+            group: next / 50,
+            work: Some(60.0),
+            ..Default::default()
+        };
         p.handle(Input::Submit(j), t);
         next += 1;
     };

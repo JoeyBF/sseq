@@ -44,13 +44,20 @@ use super::Logged;
 ///     Scheduler::new(Config::default()),
 ///     CountStarts(starts.clone()),
 /// );
-/// p.handle(
-///     Input::Worker(WorkerState::new(1, "x", 2, Resources::mem_gb(8.0))),
-///     0.0,
-/// );
+/// let worker = WorkerState {
+///     id: 1,
+///     slots: 2,
+///     budget: Resources::mem_gb(8.0),
+///     ..Default::default()
+/// };
+/// p.handle(Input::Worker(worker), 0.0);
 /// for id in 1..=3 {
 ///     p.handle(
-///         Input::Submit(JobSpec::new(id, Resources::mem_gb(1.0), 0)),
+///         Input::Submit(JobSpec {
+///             id,
+///             demand: Resources::mem_gb(1.0),
+///             ..Default::default()
+///         }),
 ///         0.0,
 ///     );
 /// }
@@ -118,12 +125,18 @@ impl EventSink for std::sync::Arc<std::sync::Mutex<Vec<Event>>> {
 ///     Scheduler::new(Config::default()),
 ///     JsonlSink::new(buf.clone()),
 /// );
+/// let worker = WorkerState {
+///     id: 1,
+///     budget: Resources::mem_gb(8.0),
+///     ..Default::default()
+/// };
+/// p.handle(Input::Worker(worker), 0.0);
 /// p.handle(
-///     Input::Worker(WorkerState::new(1, "x", 1, Resources::mem_gb(8.0))),
-///     0.0,
-/// );
-/// p.handle(
-///     Input::Submit(JobSpec::new(1, Resources::mem_gb(1.0), 0)),
+///     Input::Submit(JobSpec {
+///         id: 1,
+///         demand: Resources::mem_gb(1.0),
+///         ..Default::default()
+///     }),
 ///     0.0,
 /// );
 /// p.poll(0.0);

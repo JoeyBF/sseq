@@ -1,21 +1,31 @@
 //! Behaviour of the whole [`Scheduler`], driven through [`Policy`].
 
 use crate::{
-    Attempt, Config, FailKind, Input, Instant, JobId, JobSpec, OrderTerm, Output, Policy,
-    Resources, RetryConfig, SLOTS, Scheduler, ScoreTerm, Selector, Speculate, Strength, WorkerId,
-    WorkerState,
+    Attempt, Config, Constraint, FailKind, Input, Instant, JobId, JobSpec, OrderTerm, Output,
+    Policy, Resources, RetryConfig, SLOTS, Scheduler, ScoreTerm, Speculate, WorkerId, WorkerState,
 };
 
 const GB: u64 = 1_000_000_000;
 
 /// A worker of class "x" with a budget in GB.
 fn worker(id: WorkerId, slots: usize, budget_gb: u64) -> WorkerState {
-    WorkerState::new(id, "x", slots, Resources::mem(budget_gb * GB))
+    WorkerState {
+        id,
+        class: "x".into(),
+        slots,
+        budget: Resources::mem(budget_gb * GB),
+        ..Default::default()
+    }
 }
 
 /// A job with a demand in GB.
 fn job(id: JobId, gb: u64, group: u64) -> JobSpec {
-    JobSpec::new(id, Resources::mem(gb * GB), group)
+    JobSpec {
+        id,
+        demand: Resources::mem(gb * GB),
+        group,
+        ..Default::default()
+    }
 }
 
 /// Handle `inputs` at `t`, then poll.
@@ -78,7 +88,10 @@ fn preference_wins_over_load() {
         Input::Submit(job(0, 10, 0)),
     ];
     feed(&mut p, 0.0, inputs);
-    let j = job(1, 10, 0).prefer_worker(1);
+    let j = JobSpec {
+        constraints: vec![Constraint::prefer_worker(1)],
+        ..job(1, 10, 0)
+    };
     assert_eq!(starts(&feed(&mut p, 0.0, [Input::Submit(j)])), vec![(1, 1)]);
 }
 
@@ -128,12 +141,20 @@ fn best_fit_ranks_by_the_bottleneck() {
     // Worker 1 has most of its memory free but 20% of its device pool; worker 2 has 40% of
     // its memory free and all of its device pool.
     let w1 = WorkerState {
+        id: 1,
+        class: "x".into(),
+        slots: 4,
+        budget: Resources::mem(100 * GB).with_dev(10 * GB),
         reported_used: Resources::ZERO.with_dev(8 * GB),
-        ..WorkerState::new(1, "x", 4, Resources::mem(100 * GB).with_dev(10 * GB))
+        ..Default::default()
     };
     let w2 = WorkerState {
+        id: 2,
+        class: "x".into(),
+        slots: 4,
+        budget: Resources::mem(100 * GB).with_dev(100 * GB),
         reported_used: Resources::mem(59 * GB),
-        ..WorkerState::new(2, "x", 4, Resources::mem(100 * GB).with_dev(100 * GB))
+        ..Default::default()
     };
     let inputs = [
         Input::Worker(w1),
@@ -235,7 +256,10 @@ fn avoid_grows_then_gives_up() {
 #[test]
 fn forbid_survives_retries() {
     let mut p = Scheduler::new(Config::fifo());
-    let j = job(0, 1, 0).forbid_worker(1);
+    let j = JobSpec {
+        constraints: vec![Constraint::forbid_worker(1)],
+        ..job(0, 1, 0)
+    };
     let inputs = [
         Input::Worker(worker(1, 1, 100)),
         Input::Worker(worker(2, 1, 100)),
@@ -586,19 +610,49 @@ fn requires_and_forbids() {
     let mut p = Scheduler::new(Config::fifo());
     let mut inputs: Vec<Input> = [(1, "a"), (2, "b"), (3, "c")]
         .into_iter()
-        .map(|(id, class)| Input::Worker(WorkerState::new(id, class, 4, Resources::mem(100 * GB))))
+        .map(|(id, class)| {
+            Input::Worker(WorkerState {
+                id,
+                class: class.into(),
+                slots: 4,
+                budget: Resources::mem(100 * GB),
+                ..Default::default()
+            })
+        })
         .collect();
-    let either = job(0, 1, 0).require_class("c").require_class("b");
-    let both = job(1, 1, 0)
-        .require_class("a")
-        .constrain(Strength::Require, Selector::Worker(2));
-    let forbidden = job(2, 1, 0)
-        .require_class("a")
-        .constrain(Strength::Forbid, Selector::Class("a".into()));
-    let worker_or = job(3, 1, 0)
-        .constrain(Strength::Require, Selector::Worker(3))
-        .constrain(Strength::Require, Selector::Worker(1))
-        .forbid_worker(1);
+    let constrained = |id, constraints| JobSpec {
+        constraints,
+        ..job(id, 1, 0)
+    };
+    let either = constrained(
+        0,
+        vec![
+            Constraint::require_class("c"),
+            Constraint::require_class("b"),
+        ],
+    );
+    let both = constrained(
+        1,
+        vec![
+            Constraint::require_class("a"),
+            Constraint::require_worker(2),
+        ],
+    );
+    let forbidden = constrained(
+        2,
+        vec![
+            Constraint::require_class("a"),
+            Constraint::forbid_class("a"),
+        ],
+    );
+    let worker_or = constrained(
+        3,
+        vec![
+            Constraint::require_worker(3),
+            Constraint::require_worker(1),
+            Constraint::forbid_worker(1),
+        ],
+    );
     inputs.extend([either, both, forbidden, worker_or].map(Input::Submit));
     // Job 0 takes the less loaded of b and c; jobs 1 and 2 match nothing.
     assert_eq!(starts(&feed(&mut p, 0.0, inputs)), vec![(0, 2), (3, 3)]);
@@ -614,9 +668,24 @@ fn requires_and_forbids() {
 fn prefer_class_and_loosest() {
     let mut p = Scheduler::new(Config::default());
     let inputs = [
-        Input::Worker(WorkerState::new(1, "a", 4, Resources::mem(100 * GB))),
-        Input::Worker(WorkerState::new(2, "b", 4, Resources::mem(100 * GB))),
-        Input::Submit(job(0, 1, 0).constrain(Strength::Prefer, Selector::Class("b".into()))),
+        Input::Worker(WorkerState {
+            id: 1,
+            class: "a".into(),
+            slots: 4,
+            budget: Resources::mem(100 * GB),
+            ..Default::default()
+        }),
+        Input::Worker(WorkerState {
+            id: 2,
+            class: "b".into(),
+            slots: 4,
+            budget: Resources::mem(100 * GB),
+            ..Default::default()
+        }),
+        Input::Submit(JobSpec {
+            constraints: vec![Constraint::prefer_class("b")],
+            ..job(0, 1, 0)
+        }),
     ];
     assert_eq!(starts(&feed(&mut p, 0.0, inputs)), vec![(0, 2)]);
     let mut p = Scheduler::new(Config {

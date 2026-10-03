@@ -1,8 +1,8 @@
 //! Templates: the dependency structure units share.
 //!
-//! A [`DagTemplate`] is built once per shape of work and shared by every [`Unit`](super::Unit) of
-//! that shape. Building it checks acyclicity and precomputes the bottom levels ranks need, so
-//! declaring a unit of it costs nothing per node. Its nodes are [`TemplateNode`]s; a node may
+//! A [`DagTemplate`] is built from a [`TemplateSpec`] once per shape of work, and shared by every
+//! [`Unit`](super::Unit) of that shape. Building it checks acyclicity and precomputes the bottom
+//! levels ranks need, so declaring a unit of it costs nothing per node. Its nodes are [`TemplateNode`]s; a node may
 //! itself be a unit of another template, which gives the hierarchy its depth: the leaves of a
 //! substituted unit are numbered among the enclosing template's, in node order.
 //!
@@ -16,17 +16,18 @@
 //! ```
 //! use std::sync::Arc;
 //!
-//! use whelm::{DagTemplate, TemplateNode};
+//! use whelm::{TemplateNode, TemplateSpec};
 //!
-//! let fan = Arc::new(DagTemplate::new(2, []).unwrap());
-//! let pipeline = DagTemplate::with_nodes(
-//!     vec![
+//! let fan = Arc::new(TemplateSpec::jobs(2).build().unwrap());
+//! let pipeline = TemplateSpec {
+//!     nodes: vec![
 //!         TemplateNode::Local(1.0),
 //!         TemplateNode::Unit(fan),
 //!         TemplateNode::Pass(0.0),
 //!     ],
-//!     [(0, 1), (1, 2)],
-//! )
+//!     edges: vec![(0, 1), (1, 2)],
+//! }
+//! .build()
 //! .unwrap();
 //! // Leaves: the load is leaf 0, the fan-out's jobs leaves 1 and 2, the barrier leaf 3.
 //! assert_eq!((pipeline.len(), pipeline.leaves()), (3, 4));
@@ -62,7 +63,7 @@ pub enum TemplateNode {
 /// A dependency structure over nodes `0..len`, shared by every [`Unit`](super::Unit) built on it.
 ///
 /// For example, one signature DAG per subalgebra profile, shared by every bidegree with that
-/// profile.
+/// profile. [`TemplateSpec::build`] builds one.
 ///
 /// Building it checks acyclicity once and computes what ranks need: each node's bottom level (its
 /// work plus the longest chain of work below it, a substituted unit weighing its template's
@@ -73,9 +74,14 @@ pub enum TemplateNode {
 /// A diamond: node 0 before nodes 1 and 2, both before node 3.
 ///
 /// ```
-/// use whelm::DagTemplate;
+/// use whelm::TemplateSpec;
 ///
-/// let diamond = DagTemplate::new(4, [(0, 1), (0, 2), (1, 3), (2, 3)]).unwrap();
+/// let diamond = TemplateSpec {
+///     edges: vec![(0, 1), (0, 2), (1, 3), (2, 3)],
+///     ..TemplateSpec::jobs(4)
+/// }
+/// .build()
+/// .unwrap();
 /// assert_eq!(diamond.sources().collect::<Vec<_>>(), [0]);
 /// assert_eq!(diamond.sinks().collect::<Vec<_>>(), [3]);
 /// assert_eq!(
@@ -108,51 +114,99 @@ pub(super) static PASS: LazyLock<Arc<DagTemplate>> = LazyLock::new(|| single(Tem
 
 /// A one-node template of unit work.
 fn single(node: fn(f64) -> TemplateNode) -> Arc<DagTemplate> {
-    Arc::new(DagTemplate::with_nodes(vec![node(1.0)], []).expect("one node is acyclic"))
+    Arc::new(DagTemplate::build(vec![node(1.0)], []).expect("one node is acyclic"))
+}
+
+/// What a [`DagTemplate`] is built from: its nodes, and its edges `(from, to)`, `to` depending on
+/// `from`.
+///
+/// [`build`](Self::build) checks the structure and analyses it. [`jobs`](Self::jobs) gives the
+/// commonest nodes, worker jobs of unit work, to which a literal adds the edges.
+///
+/// # Examples
+///
+/// Nodes of each kind, one of them a nested template: the two-job chain substituted for node 1
+/// counts as its span, 2, in the outer template's critical path.
+///
+/// ```
+/// use std::sync::Arc;
+///
+/// use whelm::{TemplateNode, TemplateSpec};
+///
+/// let chain = TemplateSpec {
+///     edges: vec![(0, 1)],
+///     ..TemplateSpec::jobs(2)
+/// };
+/// let t = TemplateSpec {
+///     nodes: vec![
+///         TemplateNode::Local(0.5),
+///         TemplateNode::Unit(Arc::new(chain.build().unwrap())),
+///         TemplateNode::Job(4.0),
+///         TemplateNode::Pass(0.0),
+///     ],
+///     edges: vec![(0, 1), (0, 2), (1, 3), (2, 3)],
+/// }
+/// .build()
+/// .unwrap();
+/// assert_eq!(t.leaves(), 5);
+/// assert!(matches!(t.node(1), TemplateNode::Unit(sub) if sub.leaves() == 2));
+/// assert_eq!(t.span(), 4.5);
+/// ```
+#[derive(Clone, Debug, Default)]
+pub struct TemplateSpec {
+    /// The nodes, node `i` at index `i`.
+    pub nodes: Vec<TemplateNode>,
+    /// The edges `(from, to)`: node `to` depends on node `from`. Duplicates are merged.
+    pub edges: Vec<(u32, u32)>,
+}
+
+impl TemplateSpec {
+    /// `n` worker jobs of unit work and no edges.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use whelm::TemplateSpec;
+    ///
+    /// let three = TemplateSpec::jobs(3).build().unwrap();
+    /// assert_eq!((three.len(), three.edge_count(), three.span()), (3, 0, 1.0));
+    /// ```
+    pub fn jobs(n: usize) -> Self {
+        Self {
+            nodes: vec![TemplateNode::Job(1.0); n],
+            edges: Vec::new(),
+        }
+    }
+
+    /// The template of these nodes and edges.
+    ///
+    /// A cycle is an error naming a node on it; an edge naming a node out of range panics.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use whelm::{DagError, TemplateSpec};
+    ///
+    /// let chain = TemplateSpec {
+    ///     edges: vec![(0, 1), (1, 2), (0, 1)],
+    ///     ..TemplateSpec::jobs(3)
+    /// };
+    /// let chain = chain.build().unwrap();
+    /// assert_eq!((chain.len(), chain.edge_count(), chain.span()), (3, 2, 3.0));
+    /// let cycle = TemplateSpec {
+    ///     edges: vec![(0, 1), (1, 2), (2, 1)],
+    ///     ..TemplateSpec::jobs(3)
+    /// };
+    /// assert_eq!(cycle.build().unwrap_err(), DagError::Cycle { job: 1 });
+    /// ```
+    pub fn build(self) -> Result<DagTemplate, DagError> {
+        DagTemplate::build(self.nodes, self.edges)
+    }
 }
 
 impl DagTemplate {
-    /// A template of `len` worker jobs of unit work, with the given edges `(from, to)`: `to`
-    /// depends on `from`.
-    ///
-    /// Duplicate edges are merged; out-of-range nodes panic; a cycle is an error naming a node on
-    /// it.
-    ///
-    /// ```
-    /// use whelm::{DagError, DagTemplate};
-    ///
-    /// let chain = DagTemplate::new(3, [(0, 1), (1, 2), (0, 1)]).unwrap();
-    /// assert_eq!((chain.len(), chain.edge_count(), chain.span()), (3, 2, 3.0));
-    /// let cycle = DagTemplate::new(3, [(0, 1), (1, 2), (2, 1)]);
-    /// assert_eq!(cycle.unwrap_err(), DagError::Cycle { job: 1 });
-    /// ```
-    pub fn new(len: usize, edges: impl IntoIterator<Item = (u32, u32)>) -> Result<Self, DagError> {
-        Self::with_nodes(vec![TemplateNode::Job(1.0); len], edges)
-    }
-
-    /// A template of the given nodes and edges (as for [`new`](Self::new)).
-    ///
-    /// Nodes of each kind, one of them a nested template: the two-job chain substituted for node
-    /// 1 counts as its span, 2, in the outer template's critical path.
-    ///
-    /// ```
-    /// use std::sync::Arc;
-    ///
-    /// use whelm::{DagTemplate, TemplateNode};
-    ///
-    /// let chain = Arc::new(DagTemplate::new(2, [(0, 1)]).unwrap());
-    /// let nodes = vec![
-    ///     TemplateNode::Local(0.5),
-    ///     TemplateNode::Unit(chain),
-    ///     TemplateNode::Job(4.0),
-    ///     TemplateNode::Pass(0.0),
-    /// ];
-    /// let t = DagTemplate::with_nodes(nodes, [(0, 1), (0, 2), (1, 3), (2, 3)]).unwrap();
-    /// assert_eq!(t.leaves(), 5);
-    /// assert!(matches!(t.node(1), TemplateNode::Unit(sub) if sub.leaves() == 2));
-    /// assert_eq!(t.span(), 4.5);
-    /// ```
-    pub fn with_nodes(
+    /// The template of `nodes` and `edges` (see [`TemplateSpec::build`]).
+    fn build(
         nodes: Vec<TemplateNode>,
         edges: impl IntoIterator<Item = (u32, u32)>,
     ) -> Result<Self, DagError> {
@@ -309,10 +363,15 @@ impl DagTemplate {
     /// `O(len^2 / 8)` bytes of scratch.
     ///
     /// ```
-    /// use whelm::DagTemplate;
+    /// use whelm::TemplateSpec;
     ///
     /// // 0 -> 2 is implied by 0 -> 1 -> 2.
-    /// let t = DagTemplate::new(3, [(0, 1), (1, 2), (0, 2)]).unwrap();
+    /// let t = TemplateSpec {
+    ///     edges: vec![(0, 1), (1, 2), (0, 2)],
+    ///     ..TemplateSpec::jobs(3)
+    /// }
+    /// .build()
+    /// .unwrap();
     /// let r = t.transitive_reduction();
     /// assert_eq!((t.edge_count(), r.edge_count()), (3, 2));
     /// assert_eq!(r.successors(0), [1]);
@@ -349,7 +408,7 @@ impl DagTemplate {
             }
             reach[v * words..(v + 1) * words].copy_from_slice(&acc);
         }
-        DagTemplate::with_nodes(self.nodes.clone(), edges).expect("a sub-DAG of a DAG is acyclic")
+        DagTemplate::build(self.nodes.clone(), edges).expect("a sub-DAG of a DAG is acyclic")
     }
 
     /// Nodes on a longest chain of `work` (CPOP's critical nodes).
@@ -358,10 +417,15 @@ impl DagTemplate {
     /// the critical path, within a relative tolerance `tol`.
     ///
     /// ```
-    /// use whelm::DagTemplate;
+    /// use whelm::TemplateSpec;
     ///
     /// // Node 0 before nodes 1 and 2; node 2 is the heavier branch.
-    /// let fork = DagTemplate::new(3, [(0, 1), (0, 2)]).unwrap();
+    /// let fork = TemplateSpec {
+    ///     edges: vec![(0, 1), (0, 2)],
+    ///     ..TemplateSpec::jobs(3)
+    /// }
+    /// .build()
+    /// .unwrap();
     /// let work = [1.0, 1.0, 5.0];
     /// assert_eq!(fork.critical_nodes(|i| work[i], 0.0), [true, false, true]);
     /// ```
@@ -389,9 +453,14 @@ impl DagTemplate {
     /// costs of one unit, say) gives that unit's critical path.
     ///
     /// ```
-    /// use whelm::DagTemplate;
+    /// use whelm::TemplateSpec;
     ///
-    /// let fork = DagTemplate::new(3, [(0, 1), (0, 2)]).unwrap();
+    /// let fork = TemplateSpec {
+    ///     edges: vec![(0, 1), (0, 2)],
+    ///     ..TemplateSpec::jobs(3)
+    /// }
+    /// .build()
+    /// .unwrap();
     /// assert_eq!(fork.critical_path(|_| 1.0), fork.span());
     /// let work = [1.0, 1.0, 5.0];
     /// assert_eq!(fork.critical_path(|i| work[i]), 6.0);
@@ -406,9 +475,14 @@ impl DagTemplate {
     /// below the unit.
     ///
     /// ```
-    /// use whelm::DagTemplate;
+    /// use whelm::TemplateSpec;
     ///
-    /// let fork = DagTemplate::new(3, [(0, 1), (0, 2)]).unwrap();
+    /// let fork = TemplateSpec {
+    ///     edges: vec![(0, 1), (0, 2)],
+    ///     ..TemplateSpec::jobs(3)
+    /// }
+    /// .build()
+    /// .unwrap();
     /// let work = [1.0, 1.0, 5.0];
     /// assert_eq!(fork.bottom_levels(|i| work[i]), [6.0, 1.0, 5.0]);
     /// ```

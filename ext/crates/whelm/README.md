@@ -82,13 +82,23 @@ use whelm::{Config, Input, JobSpec, Output, Policy, Resources, Scheduler, Worker
 let mut policy = Scheduler::new(Config::default());
 
 // A worker joins (and later heartbeats): 16 slots, 120 GB, 20 GB used by its runtime.
-let mut w = WorkerState::new(1, "l40s", 16, Resources::mem_gb(120.0));
-w.reported_used = Resources::mem_gb(20.0);
-w.reported_baseline = Resources::mem_gb(20.0);
-policy.handle(Input::Worker(w), 0.0);
+policy.handle(
+    Input::Worker(WorkerState {
+        id: 1,
+        class: "l40s".into(),
+        slots: 16,
+        budget: Resources::mem_gb(120.0),
+        reported_used: Resources::mem_gb(20.0),
+        reported_baseline: Resources::mem_gb(20.0),
+        ..Default::default()
+    }),
+    0.0,
+);
 
-policy.handle(Input::Submit(JobSpec::new(7, Resources::mem_gb(6.0), /* group */ 3)), 1.0);
-policy.handle(Input::Submit(JobSpec::new(8, Resources::mem_gb(30.0), 3)), 1.0);
+// Jobs and workers are struct literals; `Default` fills in what they leave out.
+let job = |id, gb| JobSpec { id, demand: Resources::mem_gb(gb), group: 3, ..Default::default() };
+policy.handle(Input::Submit(job(7, 6.0)), 1.0);
+policy.handle(Input::Submit(job(8, 30.0)), 1.0);
 
 // After every batch of inputs, poll and act on each output.
 let mut started = Vec::new();
@@ -189,8 +199,15 @@ use std::sync::Arc;
 use whelm::{Config, FailKind, JobSpec, Resources, Scheduler, SharedPolicy, WorkerState};
 
 let shared = Arc::new(SharedPolicy::with_system_clock(Scheduler::new(Config::default())));
-shared.worker_update(WorkerState::new(1, "l40s", 16, Resources::mem_gb(120.0)));
-let mut lease = shared.lease(JobSpec::new(42, Resources::mem_gb(6.0), 3)); // blocks
+shared.worker_update(WorkerState {
+    id: 1,
+    class: "l40s".into(),
+    slots: 16,
+    budget: Resources::mem_gb(120.0),
+    ..Default::default()
+});
+let job = JobSpec { id: 42, demand: Resources::mem_gb(6.0), group: 3, ..Default::default() };
+let mut lease = shared.lease(job); // blocks
 loop {
     // Send the task to `lease.worker()` and wait for the reply.
     let reply: Result<(), (FailKind, String)> = Ok(());
@@ -220,8 +237,10 @@ use whelm::{
 
 let events = Arc::new(Mutex::new(Vec::<Event>::new()));
 let mut p = Logged::new(Scheduler::new(Config::default()), events.clone());
-p.handle(Input::Worker(WorkerState::new(1, "x", 2, Resources::mem_gb(10.0))), 0.0);
-p.handle(Input::Submit(JobSpec::new(1, Resources::mem_gb(4.0), 0)), 0.0);
+let worker = WorkerState { id: 1, slots: 2, budget: Resources::mem_gb(10.0), ..Default::default() };
+p.handle(Input::Worker(worker), 0.0);
+let job = JobSpec { id: 1, demand: Resources::mem_gb(4.0), ..Default::default() };
+p.handle(Input::Submit(job), 0.0);
 p.poll(0.0);
 
 let events = events.lock().unwrap().clone();
@@ -248,10 +267,10 @@ is job `base + k`; other units depend on it by its id.
   frontier. Materialisation is bookkeeping only and never changes the schedule: a job is submitted
   to the inner policy as soon as its last dependency completes.
 - **Per-leaf data.** Leaf work, demands and labels come from the template and the unit's spec and
-  scale or, for a `sourced`) unit, from the scheduler's `NodeSource`, computed on demand rather than
+  scale or, for a `sourced` unit, from the scheduler's `NodeSource`, computed on demand rather than
   stored. The source can also make a leaf a no-op in one unit (`NodeSource::passthrough`), so units
   of one template differ in which leaves run.
-- **Resume and close.** A unit can be declared with leaves already complete (`Unit::with_completed`,
+- **Resume and close.** A unit can be declared with leaves already complete (`Unit::completed`,
   e.g. from a checkpoint) and closed early (`close`): unstarted jobs complete as no-ops, and running
   ones keep their resources until their attempt ends.
 - **Ranks.** Upward ranks (a job's work plus the longest chain of work below it, through the
@@ -272,18 +291,26 @@ is job `base + k`; other units depend on it by its id.
 ```rust
 use std::sync::Arc;
 use whelm::{
-    Config, DagConfig, DagJob, DagScheduler, DagTemplate, Input, JobSpec, Output, Policy,
-    Resources, Scheduler, Unit, WorkerState,
+    Config, DagConfig, DagJob, DagScheduler, Input, JobSpec, Output, Policy, Scheduler,
+    TemplateSpec, Unit, WorkerState,
 };
 
 let mut dag = DagScheduler::new(DagConfig::default(), Scheduler::new(Config::default()));
-dag.handle(Input::Worker(WorkerState::new(1, "x", 4, Resources::ZERO)), 0.0);
-let job = |id| JobSpec::new(id, Resources::ZERO, 0);
+dag.handle(Input::Worker(WorkerState { id: 1, slots: 4, ..Default::default() }), 0.0);
 
 // A local job 1, then unit 10: a chain of jobs 100 -> 101 -> 102, the first checkpointed.
-let chain = Arc::new(DagTemplate::new(3, [(0, 1), (1, 2)]).unwrap());
-let unit = Unit::new(10, 100, chain, job(0), vec![1]).with_completed(vec![0]);
-dag.declare([DagJob::new(job(1), vec![]).local().into(), unit], 0.0).unwrap();
+let spec = JobSpec { id: 1, ..Default::default() };
+let load = DagJob { spec, local: true, ..Default::default() };
+let chain = TemplateSpec { edges: vec![(0, 1), (1, 2)], ..TemplateSpec::jobs(3) };
+let unit = Unit {
+    id: 10,
+    base: 100,
+    template: Arc::new(chain.build().unwrap()),
+    deps: vec![1],
+    completed: vec![0],
+    ..Default::default()
+};
+dag.declare([load.into(), unit], 0.0).unwrap();
 assert_eq!(dag.poll(0.0), [Output::RunLocal { job: 1 }]);
 dag.handle(Input::Done { job: 1, attempt: 0 }, 1.0);
 assert_eq!(dag.poll(1.0), [Output::Start { job: 101, attempt: 1, worker: 1 }]);
@@ -341,11 +368,14 @@ let _ticker = shared.spawn_ticker(Duration::from_secs(1));
 let (id, class, rss, baseline_excl, dev_cap, dev_per_task) = (7, "l40s", 40.0, 12.0, 19.5, 2.4);
 let prior = if class == "l40s" { 1.39 } else { 1.0 };
 shared.worker_update(WorkerState {
+    id,
+    class: class.into(),
+    slots: 16,
+    budget: Resources::mem_gb(123.7).with_dev_gb(dev_cap),
+    per_task: Resources::ZERO.with_dev_gb(dev_per_task),
     reported_used: Resources::mem_gb(rss),
     reported_baseline: Resources::mem_gb(baseline_excl),
     speed: prior,
-    per_task: Resources::ZERO.with_dev_gb(dev_per_task),
-    ..WorkerState::new(id, class, 16, Resources::mem_gb(123.7).with_dev_gb(dev_cap))
 });
 
 // acquire: one task of bidegree (s, t), its memory estimate and its expected seconds at speed 1
@@ -354,8 +384,13 @@ let (task, s, t, est_gb, work) = (123_456, 3, 200, 9.5, 600.0);
 shared.with(|p, _| {
     p.annotate(task, TaskInfo { kind: "sig".into(), bidegree: (t - s, s), ..TaskInfo::default() })
 });
-let mut spec = JobSpec::new(task, Resources::mem_gb(est_gb), nassau::group(s as u32, t as u32));
-spec.work = Some(work);
+let spec = JobSpec {
+    id: task,
+    demand: Resources::mem_gb(est_gb),
+    group: nassau::group(s as u32, t as u32),
+    work: Some(work),
+    ..Default::default()
+};
 let mut lease = shared.lease(spec);
 loop {
     let _worker = lease.worker(); // send over TCP, block on the reply
@@ -383,9 +418,9 @@ let _lost = shared.worker_gone(id);
 ```
 
 **Phase 2** drives the coordinator from one event loop over a `DagScheduler<Logged<Scheduler>>`.
-Each bidegree is a `sourced`) unit of its profile's signature template, its `NodeSource` supplying
+Each bidegree is a `sourced` unit of its profile's signature template, its `NodeSource` supplying
 per-node work and demands; it is declared with its checkpointed nodes complete
-(`Unit::with_completed`) and `close`d at the dead tail. Zero steps, registrations and commits are
+(`Unit::completed`) and `close`d at the dead tail. Zero steps, registrations and commits are
 local jobs (`Output::RunLocal`). `snapshot`/`restore` carry the graph across coordinator restarts,
 and worker loss needs no resubmission: the core retries the lost attempts.
 

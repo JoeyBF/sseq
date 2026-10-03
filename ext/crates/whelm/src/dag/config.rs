@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::JobId;
 #[cfg(doc)]
-use crate::{DagJob, DagScheduler, DagTemplate, JobSpec, Output};
+use crate::{DagJob, DagScheduler, JobSpec, Output, TemplateSpec};
 
 /// Configuration for [`DagScheduler`].
 ///
@@ -14,9 +14,16 @@ use crate::{DagJob, DagScheduler, DagTemplate, JobSpec, Output};
 /// without an estimate.
 ///
 /// ```
-/// use whelm::{Config, DagConfig, DagJob, DagScheduler, JobSpec, Resources, Scheduler};
+/// use whelm::{Config, DagConfig, DagJob, DagScheduler, JobSpec, Scheduler};
 ///
-/// let job = |id, deps| DagJob::new(JobSpec::new(id, Resources::mem(1), 0), deps);
+/// let job = |id, deps| DagJob {
+///     spec: JobSpec {
+///         id,
+///         ..Default::default()
+///     },
+///     deps,
+///     ..Default::default()
+/// };
 /// let ranks = |config| {
 ///     let mut dag = DagScheduler::new(config, Scheduler::new(Config::fifo()));
 ///     dag.declare([job(1, vec![]), job(2, vec![1])], 0.0).unwrap();
@@ -81,8 +88,7 @@ impl Default for DagConfig {
     }
 }
 
-/// Errors from [`DagScheduler::declare`], [`DagScheduler::close`] and building a
-/// [`DagTemplate`].
+/// Errors from [`DagScheduler::declare`], [`DagScheduler::close`] and [`TemplateSpec::build`].
 ///
 /// A failed declaration changes nothing. Each variant, as it is returned:
 ///
@@ -90,22 +96,36 @@ impl Default for DagConfig {
 /// use std::sync::Arc;
 ///
 /// use whelm::{
-///     Config, DagConfig, DagError, DagJob, DagScheduler, DagTemplate, JobSpec, Resources,
-///     Scheduler, Unit,
+///     Config, DagConfig, DagError, DagJob, DagScheduler, JobSpec, Scheduler, TemplateSpec, Unit,
 /// };
 ///
 /// let mut dag = DagScheduler::new(DagConfig::default(), Scheduler::new(Config::fifo()));
-/// let job = |id, deps| DagJob::new(JobSpec::new(id, Resources::mem(1), 0), deps);
-/// let three = Arc::new(DagTemplate::new(3, []).unwrap());
-/// let spec = JobSpec::new(0, Resources::mem(1), 0);
+/// let job = |id, deps| DagJob {
+///     spec: JobSpec {
+///         id,
+///         ..Default::default()
+///     },
+///     deps,
+///     ..Default::default()
+/// };
 /// // Unit 99 owns ids 10, 11 and 12.
-/// dag.declare([Unit::new(99, 10, three, spec, vec![])], 0.0)
-///     .unwrap();
+/// let unit = Unit {
+///     id: 99,
+///     base: 10,
+///     template: Arc::new(TemplateSpec::jobs(3).build().unwrap()),
+///     ..Default::default()
+/// };
+/// dag.declare([unit], 0.0).unwrap();
 ///
 /// let cycle = [job(1, vec![2]), job(2, vec![1])];
 /// assert_eq!(dag.declare(cycle, 0.0), Err(DagError::Cycle { job: 1 }));
 /// assert_eq!(
-///     DagTemplate::new(2, [(0, 1), (1, 0)]).unwrap_err(),
+///     TemplateSpec {
+///         edges: vec![(0, 1), (1, 0)],
+///         ..TemplateSpec::jobs(2)
+///     }
+///     .build()
+///     .unwrap_err(),
 ///     DagError::Cycle { job: 0 }
 /// );
 /// assert_eq!(

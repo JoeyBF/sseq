@@ -8,7 +8,7 @@ use std::{
 use proptest::prelude::*;
 use whelm::{
     Config, DagConfig, DagJob, DagScheduler, DagTemplate, Input, JobId, JobSpec, NodeSource,
-    Output, Policy, Resources, Scheduler, TemplateNode, Unit, WorkerState,
+    Output, Policy, Scheduler, TemplateNode, TemplateSpec, Unit, WorkerState,
 };
 
 /// A small deterministic generator (splitmix64).
@@ -72,27 +72,29 @@ impl UnitDecl {
     /// The unit to declare.
     fn unit(&self) -> Unit {
         if self.plain() {
-            let spec = JobSpec::new(self.id, Resources::ZERO, 0);
-            let mut j = DagJob::new(spec, self.deps.clone()).with_work(self.scale);
-            match self.template.node(0) {
-                TemplateNode::Local(_) => j = j.local(),
-                TemplateNode::Pass(_) => j.passthrough = true,
-                _ => {}
-            }
+            let node = self.template.node(0);
+            let j = DagJob {
+                spec: JobSpec {
+                    id: self.id,
+                    ..Default::default()
+                },
+                deps: self.deps.clone(),
+                work_estimate: Some(self.scale),
+                passthrough: matches!(node, TemplateNode::Pass(_)),
+                local: matches!(node, TemplateNode::Local(_)),
+            };
             return j.into();
         }
-        let spec = JobSpec::new(0, Resources::ZERO, 0);
-        let mut u = Unit::new(
-            self.id,
-            self.base,
-            self.template.clone(),
-            spec,
-            self.deps.clone(),
-        )
-        .with_scale(self.scale)
-        .with_completed(self.completed.clone());
-        u.sourced = self.sourced;
-        u
+        Unit {
+            id: self.id,
+            base: self.base,
+            template: self.template.clone(),
+            deps: self.deps.clone(),
+            spec: JobSpec::default(),
+            scale: Some(self.scale),
+            sourced: self.sourced,
+            completed: self.completed.clone(),
+        }
     }
 
     /// Leaf `leaf`'s work.
@@ -146,7 +148,8 @@ fn world(rng: &mut Rng) -> Vec<UnitDecl> {
                 })
                 .collect();
             let e = edges(rng, n);
-            templates.push(Arc::new(DagTemplate::with_nodes(nodes, e).unwrap()));
+            let spec = TemplateSpec { nodes, edges: e };
+            templates.push(Arc::new(spec.build().unwrap()));
         }
     }
     let mut units: Vec<UnitDecl> = Vec::new();
@@ -164,7 +167,11 @@ fn world(rng: &mut Rng) -> Vec<UnitDecl> {
                 TemplateNode::Pass(_) => TemplateNode::Pass(1.0),
                 _ => TemplateNode::Job(1.0),
             };
-            let t = Arc::new(DagTemplate::with_nodes(vec![node], []).unwrap());
+            let spec = TemplateSpec {
+                nodes: vec![node],
+                ..Default::default()
+            };
+            let t = Arc::new(spec.build().unwrap());
             UnitDecl {
                 id: base,
                 base,
@@ -462,7 +469,10 @@ fn scheduler(eps: f64) -> DagScheduler<Scheduler> {
 /// The worker joins.
 fn join(d: &mut DagScheduler<Scheduler>, now: f64) {
     d.handle(
-        Input::Worker(WorkerState::new(0, "x", 1, Resources::ZERO)),
+        Input::Worker(WorkerState {
+            class: "x".into(),
+            ..Default::default()
+        }),
         now,
     );
 }

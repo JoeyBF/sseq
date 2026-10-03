@@ -22,15 +22,29 @@ use crate::{Defer, Policy, Reservations, Timing, WorkerView};
 ///
 /// let mut p = Scheduler::new(Config::default());
 /// p.handle(
-///     Input::Worker(WorkerState::new(1, "cpu", 2, Resources::mem_gb(10.0))),
+///     Input::Worker(WorkerState {
+///         id: 1,
+///         class: "cpu".into(),
+///         slots: 2,
+///         budget: Resources::mem_gb(10.0),
+///         ..Default::default()
+///     }),
 ///     0.0,
 /// );
 /// p.handle(
-///     Input::Submit(JobSpec::new(1, Resources::mem_gb(6.0), 0)),
+///     Input::Submit(JobSpec {
+///         id: 1,
+///         demand: Resources::mem_gb(6.0),
+///         ..Default::default()
+///     }),
 ///     0.0,
 /// );
 /// p.handle(
-///     Input::Submit(JobSpec::new(2, Resources::mem_gb(6.0), 0)),
+///     Input::Submit(JobSpec {
+///         id: 2,
+///         demand: Resources::mem_gb(6.0),
+///         ..Default::default()
+///     }),
 ///     0.0,
 /// );
 /// p.poll(0.0);
@@ -64,11 +78,21 @@ pub struct ReservationInfo {
 ///
 /// let mut p = Scheduler::new(Config::default());
 /// p.handle(
-///     Input::Worker(WorkerState::new(1, "cpu", 4, Resources::mem_gb(10.0))),
+///     Input::Worker(WorkerState {
+///         id: 1,
+///         class: "cpu".into(),
+///         slots: 4,
+///         budget: Resources::mem_gb(10.0),
+///         ..Default::default()
+///     }),
 ///     0.0,
 /// );
 /// p.handle(
-///     Input::Submit(JobSpec::new(1, Resources::mem_gb(3.0), 0)),
+///     Input::Submit(JobSpec {
+///         id: 1,
+///         demand: Resources::mem_gb(3.0),
+///         ..Default::default()
+///     }),
 ///     0.0,
 /// );
 /// p.poll(0.0);
@@ -103,15 +127,25 @@ pub struct WorkerLoad {
 /// # Examples
 ///
 /// ```
-/// use whelm::{Config, Input, JobSpec, Policy, Resources, Scheduler, WorkerState};
+/// use whelm::{Config, Input, JobSpec, Policy, Scheduler, WorkerState};
 ///
 /// let mut p = Scheduler::new(Config::default());
 /// p.handle(
-///     Input::Worker(WorkerState::new(1, "cpu", 1, Resources::ZERO)),
+///     Input::Worker(WorkerState {
+///         id: 1,
+///         class: "cpu".into(),
+///         ..Default::default()
+///     }),
 ///     0.0,
 /// );
 /// for id in 1..=3 {
-///     p.handle(Input::Submit(JobSpec::new(id, Resources::ZERO, 0)), 0.0);
+///     p.handle(
+///         Input::Submit(JobSpec {
+///             id,
+///             ..Default::default()
+///         }),
+///         0.0,
+///     );
 /// }
 /// p.poll(0.0);
 /// p.poll(25.0);

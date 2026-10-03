@@ -1,8 +1,8 @@
 //! Forbid and Avoid constraints, and the soft avoidance of retries.
 
 use whelm::{
-    Config, FailKind, Input, JobId, JobSpec, Output, Policy, Resources, Scheduler, WorkerId,
-    WorkerState,
+    Config, Constraint, FailKind, Input, JobId, JobSpec, Output, Policy, Resources, Scheduler,
+    WorkerId, WorkerState,
 };
 
 /// The `(job, worker)` of each start in `out`.
@@ -17,7 +17,13 @@ fn starts(out: Vec<Output>) -> Vec<(JobId, WorkerId)> {
 
 /// A worker of class "x" with the given slots.
 fn worker(id: WorkerId, slots: usize) -> WorkerState {
-    WorkerState::new(id, "x", slots, Resources::mem(100))
+    WorkerState {
+        id,
+        class: "x".into(),
+        slots,
+        budget: Resources::mem(100),
+        ..Default::default()
+    }
 }
 
 /// A policy with the given workers (id, slots), all of class "x".
@@ -31,14 +37,17 @@ fn policy(workers: &[(WorkerId, usize)]) -> Scheduler {
 
 /// A job that avoids (`soft`) or forbids every worker of `avoid`.
 fn job(id: JobId, avoid: &[WorkerId], soft: bool) -> JobSpec {
-    let job = JobSpec::new(id, Resources::mem(1), 0);
-    avoid.iter().fold(job, |job, &w| {
-        if soft {
-            job.avoid_worker(w)
-        } else {
-            job.forbid_worker(w)
-        }
-    })
+    let constraint = if soft {
+        Constraint::avoid_worker
+    } else {
+        Constraint::forbid_worker
+    };
+    JobSpec {
+        id,
+        demand: Resources::mem(1),
+        constraints: avoid.iter().map(|&w| constraint(w)).collect(),
+        ..Default::default()
+    }
 }
 
 /// Every live worker is excluded. Forbid waits; Avoid runs.
@@ -58,7 +67,7 @@ fn soft_avoid_lapses_when_only_avoided_workers_are_live() {
 #[test]
 fn soft_avoid_holds_while_another_worker_is_live() {
     let mut p = policy(&[(1, 4), (2, 1)]);
-    p.handle(Input::Submit(JobSpec::new(0, Resources::mem(1), 0)), 0.0);
+    p.handle(Input::Submit(job(0, &[], false)), 0.0);
     // Fill worker 2 explicitly by forbidding worker 1.
     p.handle(Input::Submit(job(1, &[1], false)), 0.0);
     let placed = starts(p.poll(0.0));
@@ -77,10 +86,15 @@ fn soft_avoid_holds_while_another_worker_is_live() {
 fn soft_avoid_ignores_dead_and_foreign_workers() {
     let mut p = policy(&[(1, 2), (2, 0)]);
     p.handle(
-        Input::Worker(WorkerState::new(3, "y", 2, Resources::mem(100))),
+        Input::Worker(WorkerState {
+            class: "y".into(),
+            ..worker(3, 2)
+        }),
         0.0,
     );
-    p.handle(Input::Submit(job(5, &[1], true).require_class("x")), 0.0);
+    let mut pinned = job(5, &[1], true);
+    pinned.constraints.push(Constraint::require_class("x"));
+    p.handle(Input::Submit(pinned), 0.0);
     assert_eq!(starts(p.poll(0.0)), vec![(5, 1)]);
 }
 
@@ -89,8 +103,8 @@ fn soft_avoid_ignores_dead_and_foreign_workers() {
 #[test]
 fn retry_softly_avoids_the_worker_it_failed_on() {
     let mut p = policy(&[(1, 1), (2, 1)]);
-    p.handle(Input::Submit(JobSpec::new(0, Resources::mem(1), 0)), 0.0);
-    p.handle(Input::Submit(JobSpec::new(1, Resources::mem(1), 0)), 0.0);
+    p.handle(Input::Submit(job(0, &[], false)), 0.0);
+    p.handle(Input::Submit(job(1, &[], false)), 0.0);
     assert_eq!(starts(p.poll(0.0)), vec![(0, 1), (1, 2)]);
     p.handle(
         Input::Failed {

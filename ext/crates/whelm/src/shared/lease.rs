@@ -20,10 +20,18 @@ use crate::{Attempt, FailKind, GaveUp, Input, JobId, Policy, WorkerId};
 /// };
 /// let shared = SharedPolicy::new(Scheduler::new(config), || 0.0);
 /// for w in [1, 2] {
-///     shared.worker_update(WorkerState::new(w, "x", 1, Resources::mem_gb(8.0)));
+///     shared.worker_update(WorkerState {
+///         id: w,
+///         budget: Resources::mem_gb(8.0),
+///         ..Default::default()
+///     });
 /// }
 /// // Every attempt runs out of device memory.
-/// let mut lease = shared.lease(JobSpec::new(7, Resources::mem_gb(1.0), 0));
+/// let mut lease = shared.lease(JobSpec {
+///     id: 7,
+///     demand: Resources::mem_gb(1.0),
+///     ..Default::default()
+/// });
 /// let mut workers = Vec::new();
 /// let gave_up = loop {
 ///     workers.push(lease.worker());
@@ -84,8 +92,16 @@ impl<'a, P: Policy> Lease<'a, P> {
     /// use whelm::{Config, Input, JobSpec, Policy, Resources, Scheduler, SharedPolicy};
     ///
     /// let shared = SharedPolicy::new(Scheduler::new(Config::default()), || 0.0);
-    /// shared.worker_update(whelm::WorkerState::new(1, "x", 1, Resources::mem_gb(8.0)));
-    /// let lease = shared.lease(JobSpec::new(1, Resources::mem_gb(1.0), 0));
+    /// shared.worker_update(whelm::WorkerState {
+    ///     id: 1,
+    ///     budget: Resources::mem_gb(8.0),
+    ///     ..Default::default()
+    /// });
+    /// let lease = shared.lease(JobSpec {
+    ///     id: 1,
+    ///     demand: Resources::mem_gb(1.0),
+    ///     ..Default::default()
+    /// });
     /// assert!(!lease.stopped());
     /// shared.with(|p, now| p.handle(Input::Cancel(1), now));
     /// assert!(lease.stopped());
@@ -104,9 +120,17 @@ impl<'a, P: Policy> Lease<'a, P> {
     ///
     /// let shared = SharedPolicy::new(Scheduler::new(Config::fifo()), || 0.0);
     /// for w in [1, 2] {
-    ///     shared.worker_update(WorkerState::new(w, "x", 1, Resources::mem_gb(8.0)));
+    ///     shared.worker_update(WorkerState {
+    ///         id: w,
+    ///         budget: Resources::mem_gb(8.0),
+    ///         ..Default::default()
+    ///     });
     /// }
-    /// let lease = shared.lease(JobSpec::new(7, Resources::mem_gb(1.0), 0));
+    /// let lease = shared.lease(JobSpec {
+    ///     id: 7,
+    ///     demand: Resources::mem_gb(1.0),
+    ///     ..Default::default()
+    /// });
     /// shared.worker_gone(lease.worker());
     /// // The policy is running a retry on worker 2, but the result arrived anyway.
     /// assert_eq!(shared.stats().running, 1);

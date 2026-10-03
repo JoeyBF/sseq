@@ -46,8 +46,12 @@ struct WorkerStat {
 ///     e.observe(7, "h100", 30.0, 10.0, 1.0);
 /// }
 /// let state = WorkerState {
+///     id: 7,
+///     class: "h100".into(),
+///     slots: 4,
+///     budget: Resources::mem_gb(80.0),
 ///     speed: e.speed(7, "h100", 1.0),
-///     ..WorkerState::new(7, "h100", 4, Resources::mem_gb(80.0))
+///     ..Default::default()
 /// };
 /// assert!((state.speed - 3.0).abs() < 1e-9);
 /// let heartbeat = Input::Worker(state);

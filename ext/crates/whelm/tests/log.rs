@@ -42,7 +42,13 @@ fn policy() -> Scheduler {
 
 /// Worker `w`'s heartbeat.
 fn state(w: u64) -> WorkerState {
-    WorkerState::new(w, "h200", SLOTS, Resources::mem_gb(BUDGET_GB))
+    WorkerState {
+        id: w,
+        class: "h200".into(),
+        slots: SLOTS,
+        budget: Resources::mem_gb(BUDGET_GB),
+        ..Default::default()
+    }
 }
 
 /// Run the workload with a simple event-driven driver (jobs run at speed 1 whatever the
@@ -87,8 +93,13 @@ fn run(sink: impl EventSink + 'static) -> Vec<(JobId, Attempt)> {
         if arrival == Some(t) {
             let i = next_arrival;
             next_arrival += 1;
-            let mut spec = JobSpec::new(i, Resources::mem_gb(job(i).2), i / 10);
-            spec.work = Some(job(i).1);
+            let spec = JobSpec {
+                id: i,
+                demand: Resources::mem_gb(job(i).2),
+                group: i / 10,
+                work: Some(job(i).1),
+                ..Default::default()
+            };
             let info = TaskInfo {
                 kind: "sig".into(),
                 bidegree: (20 + (i / 10) as i64, 3),

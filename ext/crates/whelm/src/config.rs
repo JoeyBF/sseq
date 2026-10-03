@@ -58,16 +58,14 @@ use crate::Timing;
 /// jobs, then runs them one by one on the worker.)
 ///
 /// ```
-/// # use whelm::{
-/// #     Config, Input, JobId, JobSpec, Output, Policy, Resources, Scheduler, WorkerState,
-/// # };
+/// # use whelm::{Config, Input, JobId, JobSpec, Output, Policy, Scheduler, WorkerState};
 /// # /// The order a one-slot worker runs `jobs` in, all submitted before it joins.
 /// # fn run_order(config: Config, jobs: Vec<JobSpec>) -> Vec<JobId> {
 /// #     let mut s = Scheduler::new(config);
 /// #     for j in jobs {
 /// #         s.handle(Input::Submit(j), 0.0);
 /// #     }
-/// #     s.handle(Input::Worker(WorkerState::new(1, "x", 1, Resources::ZERO)), 0.0);
+/// #     s.handle(Input::Worker(WorkerState { id: 1, ..Default::default() }), 0.0);
 /// #     let (mut order, mut t) = (Vec::new(), 0.0);
 /// #     while let [Output::Start { job, attempt, .. }] = s.poll(t)[..] {
 /// #         order.push(job);
@@ -77,9 +75,11 @@ use crate::Timing;
 /// #     order
 /// # }
 /// let spec = |id, group, work, due| JobSpec {
+///     id,
+///     group,
 ///     work: Some(work),
 ///     due,
-///     ..JobSpec::new(id, Resources::ZERO, group)
+///     ..Default::default()
 /// };
 /// let jobs = || {
 ///     vec![
@@ -137,16 +137,14 @@ impl Default for Config {
     /// priority below [`default_priority`](Config::default_priority):
     ///
     /// ```
-    /// # use whelm::{
-    /// #     Config, Input, JobId, JobSpec, Output, Policy, Resources, Scheduler, WorkerState,
-    /// # };
+    /// # use whelm::{Config, Input, JobId, JobSpec, Output, Policy, Scheduler, WorkerState};
     /// # /// The order a one-slot worker runs `jobs` in, all submitted before it joins.
     /// # fn run_order(config: Config, jobs: Vec<JobSpec>) -> Vec<JobId> {
     /// #     let mut s = Scheduler::new(config);
     /// #     for j in jobs {
     /// #         s.handle(Input::Submit(j), 0.0);
     /// #     }
-    /// #     s.handle(Input::Worker(WorkerState::new(1, "x", 1, Resources::ZERO)), 0.0);
+    /// #     s.handle(Input::Worker(WorkerState { id: 1, ..Default::default() }), 0.0);
     /// #     let (mut order, mut t) = (Vec::new(), 0.0);
     /// #     while let [Output::Start { job, attempt, .. }] = s.poll(t)[..] {
     /// #         order.push(job);
@@ -155,15 +153,16 @@ impl Default for Config {
     /// #     }
     /// #     order
     /// # }
-    /// let jobs = vec![
-    ///     JobSpec::new(10, Resources::ZERO, 7),
-    ///     JobSpec::new(11, Resources::ZERO, 3),
-    ///     JobSpec::new(12, Resources::ZERO, 7),
-    ///     JobSpec {
-    ///         priority: Some(-1),
-    ///         ..JobSpec::new(13, Resources::ZERO, 3)
-    ///     },
-    /// ];
+    /// let job = |id, group| JobSpec {
+    ///     id,
+    ///     group,
+    ///     ..Default::default()
+    /// };
+    /// let urgent = JobSpec {
+    ///     priority: Some(-1),
+    ///     ..job(13, 3)
+    /// };
+    /// let jobs = vec![job(10, 7), job(11, 3), job(12, 7), urgent];
     /// assert_eq!(run_order(Config::default(), jobs), [13, 10, 12, 11]);
     /// ```
     fn default() -> Self {
@@ -187,16 +186,14 @@ impl Config {
     /// Priorities and groups are ignored:
     ///
     /// ```
-    /// # use whelm::{
-    /// #     Config, Input, JobId, JobSpec, Output, Policy, Resources, Scheduler, WorkerState,
-    /// # };
+    /// # use whelm::{Config, Input, JobId, JobSpec, Output, Policy, Scheduler, WorkerState};
     /// # /// The order a one-slot worker runs `jobs` in, all submitted before it joins.
     /// # fn run_order(config: Config, jobs: Vec<JobSpec>) -> Vec<JobId> {
     /// #     let mut s = Scheduler::new(config);
     /// #     for j in jobs {
     /// #         s.handle(Input::Submit(j), 0.0);
     /// #     }
-    /// #     s.handle(Input::Worker(WorkerState::new(1, "x", 1, Resources::ZERO)), 0.0);
+    /// #     s.handle(Input::Worker(WorkerState { id: 1, ..Default::default() }), 0.0);
     /// #     let (mut order, mut t) = (Vec::new(), 0.0);
     /// #     while let [Output::Start { job, attempt, .. }] = s.poll(t)[..] {
     /// #         order.push(job);
@@ -207,10 +204,16 @@ impl Config {
     /// # }
     /// let jobs = || {
     ///     vec![
-    ///         JobSpec::new(0, Resources::ZERO, 9),
     ///         JobSpec {
+    ///             id: 0,
+    ///             group: 9,
+    ///             ..Default::default()
+    ///         },
+    ///         JobSpec {
+    ///             id: 1,
+    ///             group: 1,
     ///             priority: Some(-5),
-    ///             ..JobSpec::new(1, Resources::ZERO, 1)
+    ///             ..Default::default()
     ///         },
     ///     ]
     /// };
@@ -240,14 +243,31 @@ impl Config {
     /// let place = |config| {
     ///     let mut s = Scheduler::new(config);
     ///     s.handle(
-    ///         Input::Worker(WorkerState::new(1, "x", 4, Resources::mem(100))),
+    ///         Input::Worker(WorkerState {
+    ///             id: 1,
+    ///             slots: 4,
+    ///             budget: Resources::mem(100),
+    ///             ..Default::default()
+    ///         }),
     ///         0.0,
     ///     );
     ///     s.handle(
-    ///         Input::Worker(WorkerState::new(2, "x", 4, Resources::mem(50))),
+    ///         Input::Worker(WorkerState {
+    ///             id: 2,
+    ///             slots: 4,
+    ///             budget: Resources::mem(50),
+    ///             ..Default::default()
+    ///         }),
     ///         0.0,
     ///     );
-    ///     s.handle(Input::Submit(JobSpec::new(0, Resources::mem(1), 0)), 0.0);
+    ///     s.handle(
+    ///         Input::Submit(JobSpec {
+    ///             id: 0,
+    ///             demand: Resources::mem(1),
+    ///             ..Default::default()
+    ///         }),
+    ///         0.0,
+    ///     );
     ///     s.poll(0.0)
     /// };
     /// let on = |worker| {
@@ -279,16 +299,14 @@ impl Config {
     /// without a work estimate last, in arrival order:
     ///
     /// ```
-    /// # use whelm::{
-    /// #     Config, Input, JobId, JobSpec, Output, Policy, Resources, Scheduler, WorkerState,
-    /// # };
+    /// # use whelm::{Config, Input, JobId, JobSpec, Output, Policy, Scheduler, WorkerState};
     /// # /// The order a one-slot worker runs `jobs` in, all submitted before it joins.
     /// # fn run_order(config: Config, jobs: Vec<JobSpec>) -> Vec<JobId> {
     /// #     let mut s = Scheduler::new(config);
     /// #     for j in jobs {
     /// #         s.handle(Input::Submit(j), 0.0);
     /// #     }
-    /// #     s.handle(Input::Worker(WorkerState::new(1, "x", 1, Resources::ZERO)), 0.0);
+    /// #     s.handle(Input::Worker(WorkerState { id: 1, ..Default::default() }), 0.0);
     /// #     let (mut order, mut t) = (Vec::new(), 0.0);
     /// #     while let [Output::Start { job, attempt, .. }] = s.poll(t)[..] {
     /// #         order.push(job);
@@ -298,9 +316,10 @@ impl Config {
     /// #     order
     /// # }
     /// let spec = |id, weight, work| JobSpec {
+    ///     id,
     ///     weight,
     ///     work,
-    ///     ..JobSpec::new(id, Resources::ZERO, 0)
+    ///     ..Default::default()
     /// };
     /// let jobs = vec![
     ///     spec(0, 1.0, None),
@@ -327,16 +346,14 @@ impl Config {
     /// Earliest [`due`](crate::JobSpec::due) date first; jobs without one last:
     ///
     /// ```
-    /// # use whelm::{
-    /// #     Config, Input, JobId, JobSpec, Output, Policy, Resources, Scheduler, WorkerState,
-    /// # };
+    /// # use whelm::{Config, Input, JobId, JobSpec, Output, Policy, Scheduler, WorkerState};
     /// # /// The order a one-slot worker runs `jobs` in, all submitted before it joins.
     /// # fn run_order(config: Config, jobs: Vec<JobSpec>) -> Vec<JobId> {
     /// #     let mut s = Scheduler::new(config);
     /// #     for j in jobs {
     /// #         s.handle(Input::Submit(j), 0.0);
     /// #     }
-    /// #     s.handle(Input::Worker(WorkerState::new(1, "x", 1, Resources::ZERO)), 0.0);
+    /// #     s.handle(Input::Worker(WorkerState { id: 1, ..Default::default() }), 0.0);
     /// #     let (mut order, mut t) = (Vec::new(), 0.0);
     /// #     while let [Output::Start { job, attempt, .. }] = s.poll(t)[..] {
     /// #         order.push(job);
@@ -346,8 +363,9 @@ impl Config {
     /// #     order
     /// # }
     /// let spec = |id, due| JobSpec {
+    ///     id,
     ///     due,
-    ///     ..JobSpec::new(id, Resources::ZERO, 0)
+    ///     ..Default::default()
     /// };
     /// let jobs = vec![spec(0, None), spec(1, Some(50.0)), spec(2, Some(-3.0))];
     /// assert_eq!(run_order(Config::lateness(), jobs), [2, 1, 0]);
@@ -372,8 +390,7 @@ impl Config {
 ///
 /// ```
 /// use whelm::{
-///     Config, DEFAULT_AGE_LIMIT, Input, JobSpec, Output, Policy, Resources, Scheduler,
-///     WorkerState,
+///     Config, DEFAULT_AGE_LIMIT, Input, JobSpec, Output, Policy, Scheduler, WorkerState,
 /// };
 ///
 /// let next = |age_limit| {
@@ -383,19 +400,32 @@ impl Config {
 ///         ..Config::default()
 ///     });
 ///     s.handle(
-///         Input::Worker(WorkerState::new(1, "x", 1, Resources::ZERO)),
+///         Input::Worker(WorkerState {
+///             id: 1,
+///             ..Default::default()
+///         }),
 ///         0.0,
 ///     );
-///     s.handle(Input::Submit(JobSpec::new(0, Resources::ZERO, 0)), 0.0);
+///     s.handle(
+///         Input::Submit(JobSpec {
+///             id: 0,
+///             ..Default::default()
+///         }),
+///         0.0,
+///     );
 ///     s.poll(0.0); // job 0 takes the slot
 ///     let low = JobSpec {
+///         id: 1,
 ///         priority: Some(5),
-///         ..JobSpec::new(1, Resources::ZERO, 0)
+///         ..Default::default()
 ///     };
 ///     s.handle(Input::Submit(low), 0.0);
 ///     // Aging is timed: the scheduler asks to be polled when job 1 ages.
 ///     assert_eq!(s.next_wakeup(), age_limit);
-///     let urgent = JobSpec::new(2, Resources::ZERO, 0);
+///     let urgent = JobSpec {
+///         id: 2,
+///         ..Default::default()
+///     };
 ///     s.handle(Input::Submit(urgent), DEFAULT_AGE_LIMIT - 1.0);
 ///     s.handle(Input::Done { job: 0, attempt: 1 }, DEFAULT_AGE_LIMIT);
 ///     match s.poll(DEFAULT_AGE_LIMIT)[..] {
@@ -416,16 +446,14 @@ pub const DEFAULT_AGE_LIMIT: f64 = 1800.0;
 /// chain (job 2) first:
 ///
 /// ```
-/// # use whelm::{
-/// #     Config, Input, JobId, JobSpec, Output, Policy, Resources, Scheduler, WorkerState,
-/// # };
+/// # use whelm::{Config, Input, JobId, JobSpec, Output, Policy, Scheduler, WorkerState};
 /// # /// The order a one-slot worker runs `jobs` in, all submitted before it joins.
 /// # fn run_order(config: Config, jobs: Vec<JobSpec>) -> Vec<JobId> {
 /// #     let mut s = Scheduler::new(config);
 /// #     for j in jobs {
 /// #         s.handle(Input::Submit(j), 0.0);
 /// #     }
-/// #     s.handle(Input::Worker(WorkerState::new(1, "x", 1, Resources::ZERO)), 0.0);
+/// #     s.handle(Input::Worker(WorkerState { id: 1, ..Default::default() }), 0.0);
 /// #     let (mut order, mut t) = (Vec::new(), 0.0);
 /// #     while let [Output::Start { job, attempt, .. }] = s.poll(t)[..] {
 /// #         order.push(job);
@@ -437,8 +465,10 @@ pub const DEFAULT_AGE_LIMIT: f64 = 1800.0;
 /// use whelm::OrderTerm::{Group, Rank};
 ///
 /// let spec = |id, group, rank| JobSpec {
+///     id,
+///     group,
 ///     rank,
-///     ..JobSpec::new(id, Resources::ZERO, group)
+///     ..Default::default()
 /// };
 /// let jobs = || {
 ///     vec![
@@ -463,16 +493,14 @@ pub enum OrderTerm {
     /// to ahead of it:
     ///
     /// ```
-    /// # use whelm::{
-    /// #     Config, Input, JobId, JobSpec, Output, Policy, Resources, Scheduler, WorkerState,
-    /// # };
+    /// # use whelm::{Config, Input, JobId, JobSpec, Output, Policy, Scheduler, WorkerState};
     /// # /// The order a one-slot worker runs `jobs` in, all submitted before it joins.
     /// # fn run_order(config: Config, jobs: Vec<JobSpec>) -> Vec<JobId> {
     /// #     let mut s = Scheduler::new(config);
     /// #     for j in jobs {
     /// #         s.handle(Input::Submit(j), 0.0);
     /// #     }
-    /// #     s.handle(Input::Worker(WorkerState::new(1, "x", 1, Resources::ZERO)), 0.0);
+    /// #     s.handle(Input::Worker(WorkerState { id: 1, ..Default::default() }), 0.0);
     /// #     let (mut order, mut t) = (Vec::new(), 0.0);
     /// #     while let [Output::Start { job, attempt, .. }] = s.poll(t)[..] {
     /// #         order.push(job);
@@ -483,10 +511,14 @@ pub enum OrderTerm {
     /// # }
     /// let jobs = || {
     ///     vec![
-    ///         JobSpec::new(0, Resources::ZERO, 0),
     ///         JobSpec {
+    ///             id: 0,
+    ///             ..Default::default()
+    ///         },
+    ///         JobSpec {
+    ///             id: 1,
     ///             priority: Some(1),
-    ///             ..JobSpec::new(1, Resources::ZERO, 0)
+    ///             ..Default::default()
     ///         },
     ///     ]
     /// };
@@ -529,7 +561,7 @@ pub enum ScoreTerm {
     ///
     /// ```
     /// # use whelm::{
-    /// #     Config, Input, JobSpec, Output, Policy, Resources, Scheduler, ScoreTerm, WorkerId,
+    /// #     Config, Input, JobSpec, Output, Policy, Scheduler, ScoreTerm, WorkerId,
     /// #     WorkerState,
     /// # };
     /// # /// Where `job` goes among `workers`, ranked by `score`.
@@ -549,11 +581,25 @@ pub enum ScoreTerm {
     /// #     }
     /// # }
     /// let fast = WorkerState {
+    ///     id: 2,
+    ///     slots: 4,
     ///     speed: 2.0,
-    ///     ..WorkerState::new(2, "x", 4, Resources::ZERO)
+    ///     ..Default::default()
     /// };
-    /// let workers = || vec![WorkerState::new(1, "x", 4, Resources::ZERO), fast.clone()];
-    /// let job = || JobSpec::new(0, Resources::ZERO, 0);
+    /// let workers = || {
+    ///     vec![
+    ///         WorkerState {
+    ///             id: 1,
+    ///             slots: 4,
+    ///             ..Default::default()
+    ///         },
+    ///         fast.clone(),
+    ///     ]
+    /// };
+    /// let job = || JobSpec {
+    ///     id: 0,
+    ///     ..Default::default()
+    /// };
     /// assert_eq!(first_worker(vec![ScoreTerm::Speed], workers(), job()), 2);
     /// assert_eq!(first_worker(vec![ScoreTerm::Load], workers(), job()), 1);
     /// ```
@@ -585,10 +631,24 @@ pub enum ScoreTerm {
     /// #     }
     /// # }
     /// let workers = vec![
-    ///     WorkerState::new(1, "x", 4, Resources::mem(50)),
-    ///     WorkerState::new(2, "x", 4, Resources::mem(100)),
+    ///     WorkerState {
+    ///         id: 1,
+    ///         slots: 4,
+    ///         budget: Resources::mem(50),
+    ///         ..Default::default()
+    ///     },
+    ///     WorkerState {
+    ///         id: 2,
+    ///         slots: 4,
+    ///         budget: Resources::mem(100),
+    ///         ..Default::default()
+    ///     },
     /// ];
-    /// let job = JobSpec::new(0, Resources::mem(10), 0);
+    /// let job = JobSpec {
+    ///     id: 0,
+    ///     demand: Resources::mem(10),
+    ///     ..Default::default()
+    /// };
     /// assert_eq!(first_worker(vec![ScoreTerm::Loosest], workers, job), 2);
     /// ```
     Loosest,
@@ -596,7 +656,7 @@ pub enum ScoreTerm {
     ///
     /// ```
     /// # use whelm::{
-    /// #     Config, Input, JobSpec, Output, Policy, Resources, Scheduler, ScoreTerm, WorkerId,
+    /// #     Config, Constraint, Input, JobSpec, Output, Policy, Scheduler, ScoreTerm, WorkerId,
     /// #     WorkerState,
     /// # };
     /// # /// Where `job` goes among `workers`, ranked by `score`.
@@ -616,10 +676,22 @@ pub enum ScoreTerm {
     /// #     }
     /// # }
     /// let workers = vec![
-    ///     WorkerState::new(1, "x", 4, Resources::ZERO),
-    ///     WorkerState::new(2, "x", 4, Resources::ZERO),
+    ///     WorkerState {
+    ///         id: 1,
+    ///         slots: 4,
+    ///         ..Default::default()
+    ///     },
+    ///     WorkerState {
+    ///         id: 2,
+    ///         slots: 4,
+    ///         ..Default::default()
+    ///     },
     /// ];
-    /// let job = JobSpec::new(0, Resources::ZERO, 0).prefer_worker(2);
+    /// let job = JobSpec {
+    ///     id: 0,
+    ///     constraints: vec![Constraint::prefer_worker(2)],
+    ///     ..Default::default()
+    /// };
     /// assert_eq!(first_worker(vec![ScoreTerm::Preferred], workers, job), 2);
     /// ```
     Preferred,
@@ -628,9 +700,7 @@ pub enum ScoreTerm {
     /// Jobs spread over equal workers:
     ///
     /// ```
-    /// use whelm::{
-    ///     Config, Input, JobSpec, Output, Policy, Resources, Scheduler, ScoreTerm, WorkerState,
-    /// };
+    /// use whelm::{Config, Input, JobSpec, Output, Policy, Scheduler, ScoreTerm, WorkerState};
     ///
     /// let mut s = Scheduler::new(Config {
     ///     score: vec![ScoreTerm::Load],
@@ -638,12 +708,22 @@ pub enum ScoreTerm {
     /// });
     /// for w in [1, 2] {
     ///     s.handle(
-    ///         Input::Worker(WorkerState::new(w, "x", 4, Resources::ZERO)),
+    ///         Input::Worker(WorkerState {
+    ///             id: w,
+    ///             slots: 4,
+    ///             ..Default::default()
+    ///         }),
     ///         0.0,
     ///     );
     /// }
     /// for id in 0..3 {
-    ///     s.handle(Input::Submit(JobSpec::new(id, Resources::ZERO, 0)), 0.0);
+    ///     s.handle(
+    ///         Input::Submit(JobSpec {
+    ///             id,
+    ///             ..Default::default()
+    ///         }),
+    ///         0.0,
+    ///     );
     /// }
     /// let workers: Vec<_> = (s.poll(0.0).into_iter())
     ///     .map(|o| match o {
@@ -661,16 +741,14 @@ pub enum ScoreTerm {
 /// Group 9 is submitted before group 2:
 ///
 /// ```
-/// # use whelm::{
-/// #     Config, Input, JobId, JobSpec, Output, Policy, Resources, Scheduler, WorkerState,
-/// # };
+/// # use whelm::{Config, Input, JobId, JobSpec, Output, Policy, Scheduler, WorkerState};
 /// # /// The order a one-slot worker runs `jobs` in, all submitted before it joins.
 /// # fn run_order(config: Config, jobs: Vec<JobSpec>) -> Vec<JobId> {
 /// #     let mut s = Scheduler::new(config);
 /// #     for j in jobs {
 /// #         s.handle(Input::Submit(j), 0.0);
 /// #     }
-/// #     s.handle(Input::Worker(WorkerState::new(1, "x", 1, Resources::ZERO)), 0.0);
+/// #     s.handle(Input::Worker(WorkerState { id: 1, ..Default::default() }), 0.0);
 /// #     let (mut order, mut t) = (Vec::new(), 0.0);
 /// #     while let [Output::Start { job, attempt, .. }] = s.poll(t)[..] {
 /// #         order.push(job);
@@ -683,8 +761,16 @@ pub enum ScoreTerm {
 ///
 /// let jobs = || {
 ///     vec![
-///         JobSpec::new(0, Resources::ZERO, 9),
-///         JobSpec::new(1, Resources::ZERO, 2),
+///         JobSpec {
+///             id: 0,
+///             group: 9,
+///             ..Default::default()
+///         },
+///         JobSpec {
+///             id: 1,
+///             group: 2,
+///             ..Default::default()
+///         },
 ///     ]
 /// };
 /// let config = |group_order| Config {
@@ -743,12 +829,19 @@ pub enum GroupOrder {
 ///     ..Config::default()
 /// });
 /// let job = |id, bytes, work| JobSpec {
+///     id,
+///     demand: Resources::mem(bytes),
 ///     work: Some(work),
-///     ..JobSpec::new(id, Resources::mem(bytes), 0)
+///     ..Default::default()
 /// };
 /// for w in [1, 2] {
 ///     s.handle(
-///         Input::Worker(WorkerState::new(w, "x", 4, Resources::mem(100))),
+///         Input::Worker(WorkerState {
+///             id: w,
+///             slots: 4,
+///             budget: Resources::mem(100),
+///             ..Default::default()
+///         }),
 ///         0.0,
 ///     );
 /// }
@@ -825,8 +918,7 @@ impl Default for Reservations {
 ///
 /// ```
 /// use whelm::{
-///     Config, Defer, Input, JobSpec, Output, Policy, Resources, Scheduler, SpeedConfig,
-///     WorkerState,
+///     Config, Defer, Input, JobSpec, Output, Policy, Scheduler, SpeedConfig, WorkerState,
 /// };
 ///
 /// let mut s = Scheduler::new(Config {
@@ -840,12 +932,14 @@ impl Default for Reservations {
 ///     ..Config::default()
 /// });
 /// let worker = |id, speed| WorkerState {
+///     id,
 ///     speed,
-///     ..WorkerState::new(id, "x", 1, Resources::ZERO)
+///     ..Default::default()
 /// };
 /// let job = |id, work| JobSpec {
+///     id,
 ///     work: Some(work),
-///     ..JobSpec::new(id, Resources::ZERO, 0)
+///     ..Default::default()
 /// };
 /// s.handle(Input::Worker(worker(1, 1.0)), 0.0);
 /// s.handle(Input::Worker(worker(2, 10.0)), 0.0);
@@ -926,9 +1020,7 @@ pub struct SpeedConfig {
 /// end at 140 s.
 ///
 /// ```
-/// use whelm::{
-///     Config, Input, JobSpec, Policy, Resources, Scheduler, Speculate, SpeedConfig, WorkerState,
-/// };
+/// use whelm::{Config, Input, JobSpec, Policy, Scheduler, Speculate, SpeedConfig, WorkerState};
 ///
 /// let mut s = Scheduler::new(Config {
 ///     speed: SpeedConfig {
@@ -938,18 +1030,23 @@ pub struct SpeedConfig {
 ///     ..Config::fifo()
 /// });
 /// s.handle(
-///     Input::Worker(WorkerState::new(1, "x", 1, Resources::ZERO)),
+///     Input::Worker(WorkerState {
+///         id: 1,
+///         ..Default::default()
+///     }),
 ///     0.0,
 /// );
 /// let job = JobSpec {
+///     id: 0,
 ///     work: Some(100.0),
-///     ..JobSpec::new(0, Resources::ZERO, 0)
+///     ..Default::default()
 /// };
 /// s.handle(Input::Submit(job), 0.0);
 /// assert_eq!(s.poll(0.0).len(), 1);
 /// let fast = WorkerState {
+///     id: 2,
 ///     speed: 2.0,
-///     ..WorkerState::new(2, "x", 1, Resources::ZERO)
+///     ..Default::default()
 /// };
 /// s.handle(Input::Worker(fast), 90.0);
 /// assert_eq!(s.poll(90.0), []);
@@ -984,8 +1081,7 @@ impl Default for Speculate {
 ///
 /// ```
 /// use whelm::{
-///     Config, FailKind, Input, JobSpec, Output, Policy, Resources, RetryConfig, Scheduler,
-///     WorkerState,
+///     Config, FailKind, Input, JobSpec, Output, Policy, RetryConfig, Scheduler, WorkerState,
 /// };
 ///
 /// let mut s = Scheduler::new(Config {
@@ -993,10 +1089,19 @@ impl Default for Speculate {
 ///     ..Config::default()
 /// });
 /// s.handle(
-///     Input::Worker(WorkerState::new(1, "x", 1, Resources::ZERO)),
+///     Input::Worker(WorkerState {
+///         id: 1,
+///         ..Default::default()
+///     }),
 ///     0.0,
 /// );
-/// s.handle(Input::Submit(JobSpec::new(0, Resources::ZERO, 0)), 0.0);
+/// s.handle(
+///     Input::Submit(JobSpec {
+///         id: 0,
+///         ..Default::default()
+///     }),
+///     0.0,
+/// );
 /// s.poll(0.0);
 /// let fail = |attempt, kind| Input::Failed {
 ///     job: 0,

@@ -23,13 +23,19 @@
 //! let events = Arc::new(Mutex::new(Vec::<Event>::new()));
 //! let mut p = Logged::new(Scheduler::new(Config::default()), events.clone());
 //! for w in [1, 2] {
-//!     p.handle(
-//!         Input::Worker(WorkerState::new(w, "x", 1, Resources::mem_gb(8.0))),
-//!         0.0,
-//!     );
+//!     let worker = WorkerState {
+//!         id: w,
+//!         budget: Resources::mem_gb(8.0),
+//!         ..Default::default()
+//!     };
+//!     p.handle(Input::Worker(worker), 0.0);
 //! }
 //! p.handle(
-//!     Input::Submit(JobSpec::new(7, Resources::mem_gb(1.0), 0)),
+//!     Input::Submit(JobSpec {
+//!         id: 7,
+//!         demand: Resources::mem_gb(1.0),
+//!         ..Default::default()
+//!     }),
 //!     0.0,
 //! );
 //! assert_eq!(

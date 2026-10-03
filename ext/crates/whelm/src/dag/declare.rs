@@ -152,10 +152,14 @@ impl<P: Policy> DagScheduler<P> {
     ///
     /// ```
     /// # use whelm::{Config, DagConfig, DagError, DagJob, DagScheduler, Input, JobSpec, Output,
-    /// #     Policy, Resources, Scheduler, WorkerState};
+    /// #     Policy, Scheduler, WorkerState};
     /// # let mut dag = DagScheduler::new(DagConfig::default(), Scheduler::new(Config::fifo()));
-    /// # dag.handle(Input::Worker(WorkerState::new(1, "cpu", 1, Resources::mem(100))), 0.0);
-    /// # let job = |id, deps| DagJob::new(JobSpec::new(id, Resources::mem(1), 0), deps);
+    /// # dag.handle(Input::Worker(WorkerState { id: 1, ..Default::default() }), 0.0);
+    /// # let job = |id, deps| DagJob {
+    /// #     spec: JobSpec { id, ..Default::default() },
+    /// #     deps,
+    /// #     ..Default::default()
+    /// # };
     /// dag.declare([job(1, vec![]), job(3, vec![2])], 0.0).unwrap();
     /// assert_eq!(dag.explain(3).unwrap(), "job 3 waits for 1 dependency [2]");
     /// assert_eq!(
@@ -262,11 +266,15 @@ impl<P: Policy> DagScheduler<P> {
     ///
     /// ```
     /// # use whelm::{Config, DagConfig, DagJob, DagScheduler, Input, JobSpec, Output, Policy,
-    /// #     Resources, Scheduler, WorkerState};
+    /// #     Scheduler, WorkerState};
     /// # let config = DagConfig { auto_submit: false, ..DagConfig::default() };
     /// # let mut dag = DagScheduler::new(config, Scheduler::new(Config::fifo()));
-    /// # dag.handle(Input::Worker(WorkerState::new(1, "cpu", 1, Resources::mem(100))), 0.0);
-    /// # let job = |id, deps| DagJob::new(JobSpec::new(id, Resources::mem(1), 0), deps);
+    /// # dag.handle(Input::Worker(WorkerState { id: 1, ..Default::default() }), 0.0);
+    /// # let job = |id, deps| DagJob {
+    /// #     spec: JobSpec { id, ..Default::default() },
+    /// #     deps,
+    /// #     ..Default::default()
+    /// # };
     /// dag.declare([job(1, vec![]), job(2, vec![])], 0.0).unwrap();
     /// assert_eq!(
     ///     dag.announcements(),

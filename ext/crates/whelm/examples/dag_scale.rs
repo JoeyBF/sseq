@@ -4,7 +4,7 @@ use std::{sync::Arc, time::Instant};
 
 use whelm::{
     DagConfig, DagScheduler, DagTemplate, Input, JobId, JobSpec, Output, Policy, PolicyStats,
-    Resources, TemplateNode, Unit,
+    Resources, TemplateNode, TemplateSpec, Unit,
 };
 
 /// Units on a side of the coarse grid: unit `k` waits for its left and upper neighbours.
@@ -84,14 +84,27 @@ fn template() -> Arc<DagTemplate> {
     let nodes = (0..NODES)
         .map(|i| TemplateNode::Job(1.0 + f64::from(i % 7)))
         .collect();
-    let edges = (1..NODES).flat_map(|i| [(i - 1, i), ((i * 7919 + 13) % i, i)]);
-    Arc::new(DagTemplate::with_nodes(nodes, edges).expect("forward edges"))
+    let edges = (1..NODES)
+        .flat_map(|i| [(i - 1, i), ((i * 7919 + 13) % i, i)])
+        .collect();
+    let spec = TemplateSpec { nodes, edges };
+    Arc::new(spec.build().expect("forward edges"))
 }
 
 /// Unit `k`: id `k`, leaves from `(k + 1) << 20`.
 fn unit(t: &Arc<DagTemplate>, k: u64, deps: Vec<JobId>) -> Unit {
-    let spec = JobSpec::new(0, Resources::mem(1), k);
-    Unit::new(k, (k + 1) << 20, t.clone(), spec, deps)
+    Unit {
+        id: k,
+        base: (k + 1) << 20,
+        template: t.clone(),
+        deps,
+        spec: JobSpec {
+            demand: Resources::mem(1),
+            group: k,
+            ..Default::default()
+        },
+        ..Default::default()
+    }
 }
 
 /// A DAG layer over an [`Immediate`] policy.

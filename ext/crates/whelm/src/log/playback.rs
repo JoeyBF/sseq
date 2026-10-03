@@ -16,7 +16,11 @@ use crate::{Instant, Output, Policy};
 ///     log::{self, Event},
 /// };
 ///
-/// let w = WorkerState::new(1, "x", 1, Resources::mem_gb(8.0));
+/// let w = WorkerState {
+///     id: 1,
+///     budget: Resources::mem_gb(8.0),
+///     ..Default::default()
+/// };
 /// let events = vec![
 ///     Event::Input {
 ///         t_s: 0.0,
@@ -25,7 +29,11 @@ use crate::{Instant, Output, Policy};
 ///     },
 ///     Event::Input {
 ///         t_s: 0.0,
-///         input: Input::Submit(JobSpec::new(1, Resources::mem_gb(1.0), 0)),
+///         input: Input::Submit(JobSpec {
+///             id: 1,
+///             demand: Resources::mem_gb(1.0),
+///             ..Default::default()
+///         }),
 ///         info: None,
 ///     },
 ///     Event::Poll {

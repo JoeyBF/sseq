@@ -5,7 +5,7 @@ use std::sync::Arc;
 use proptest::prelude::*;
 use whelm::{
     Attempt, Config, DagConfig, DagJob, DagScheduler, DagTemplate, Input, JobId, JobSpec, MEM,
-    NodeSource, Output, Policy, Resources, Scheduler, Unit, WorkerState,
+    NodeSource, Output, Policy, Resources, Scheduler, TemplateSpec, Unit, WorkerState,
 };
 
 /// A DAG layer over the default backfill policy with one worker of `slots` slots.
@@ -17,7 +17,12 @@ fn whelm(slots: usize, config: DagConfig) -> DagScheduler<Scheduler> {
 
 /// Worker 0, with `slots` slots, joins.
 fn join(d: &mut DagScheduler<Scheduler>, slots: usize, now: f64) {
-    let w = WorkerState::new(0, "x", slots, Resources::mem(1 << 40));
+    let w = WorkerState {
+        class: "x".into(),
+        slots,
+        budget: Resources::mem(1 << 40),
+        ..Default::default()
+    };
     d.handle(Input::Worker(w), now);
 }
 
@@ -52,22 +57,54 @@ fn passed(out: &[Output]) -> Vec<JobId> {
 
 /// A walk: a unit `done` of `template` at `base`, after `entry`.
 fn walk(template: &Arc<DagTemplate>, base: JobId, entry: JobId, done: JobId) -> Unit {
-    Unit::new(
-        done,
+    Unit {
+        id: done,
         base,
-        template.clone(),
-        JobSpec::new(0, Resources::mem(1), 7),
-        vec![entry],
-    )
+        template: template.clone(),
+        deps: vec![entry],
+        spec: JobSpec {
+            demand: Resources::mem(1),
+            group: 7,
+            ..Default::default()
+        },
+        ..Default::default()
+    }
+}
+
+/// A plain job of `demand` bytes in group `group`, after `deps`.
+fn plain(id: JobId, demand: u64, group: u64, deps: Vec<JobId>) -> DagJob {
+    DagJob {
+        spec: JobSpec {
+            id,
+            demand: Resources::mem(demand),
+            group,
+            ..Default::default()
+        },
+        deps,
+        ..Default::default()
+    }
+}
+
+/// The template of `n` worker jobs with the given edges.
+fn template_of(n: usize, edges: impl IntoIterator<Item = (u32, u32)>) -> Arc<DagTemplate> {
+    let spec = TemplateSpec {
+        edges: edges.into_iter().collect(),
+        ..TemplateSpec::jobs(n)
+    };
+    Arc::new(spec.build().unwrap())
+}
+
+/// A local job in group 7 with no dependency.
+fn local_entry(id: JobId) -> DagJob {
+    DagJob {
+        local: true,
+        ..plain(id, 0, 7, vec![])
+    }
 }
 
 /// A local entry job `1` (the zero step), already completed.
 fn with_entry(d: &mut DagScheduler<Scheduler>) {
-    d.declare(
-        vec![DagJob::new(JobSpec::new(1, Resources::ZERO, 7), vec![]).local()],
-        0.0,
-    )
-    .unwrap();
+    d.declare(vec![local_entry(1)], 0.0).unwrap();
     assert_eq!(d.poll(0.0), vec![Output::RunLocal { job: 1 }]);
     done(d, 1, 0, 0.0);
 }
@@ -97,13 +134,13 @@ impl NodeSource for Squares {
 #[test]
 fn per_node_demand_and_label() {
     let mut d = whelm(16, DagConfig::default()).with_source(Arc::new(Squares));
-    let t = Arc::new(DagTemplate::new(3, []).unwrap());
-    d.declare(
-        vec![DagJob::new(JobSpec::new(1, Resources::ZERO, 7), vec![]).local()],
-        0.0,
-    )
-    .unwrap();
-    d.declare([walk(&t, 100, 1, 99).sourced()], 0.0).unwrap();
+    let t = template_of(3, []);
+    d.declare(vec![local_entry(1)], 0.0).unwrap();
+    let unit = Unit {
+        sourced: true,
+        ..walk(&t, 100, 1, 99)
+    };
+    d.declare([unit], 0.0).unwrap();
     assert!(
         d.explain(101).unwrap().starts_with("[Sq(1)]"),
         "{:?}",
@@ -159,7 +196,7 @@ proptest! {
         (n, edges) in template(),
         mask in prop::collection::vec(any::<bool>(), 14),
     ) {
-        let t = Arc::new(DagTemplate::new(n, edges).unwrap());
+        let t = template_of(n, edges);
         let s: Vec<u32> = t
             .topological_order()
             .iter()
@@ -169,7 +206,8 @@ proptest! {
         let cfg = DagConfig { record_passthrough: true, ..DagConfig::default() };
         let mut a = whelm(1000, cfg.clone());
         with_entry(&mut a);
-        a.declare([walk(&t, 100, 1, 99).with_completed(s.clone())], 0.0).unwrap();
+        let unit = Unit { completed: s.clone(), ..walk(&t, 100, 1, 99) };
+        a.declare([unit], 0.0).unwrap();
         // The reference: the nodes outside S, declared as plain jobs after the entry, and `done`
         // as a passthrough after all of them and the entry.
         let mut b = whelm(1000, cfg);
@@ -185,12 +223,16 @@ proptest! {
                     .map(|&p| 100 + JobId::from(p))
                     .collect();
                 deps.push(1);
-                DagJob::new(JobSpec::new(100 + JobId::from(i), Resources::mem(1), 7), deps)
+                plain(100 + JobId::from(i), 1, 7, deps)
             })
             .collect();
         let mut nodes: Vec<JobId> = rest.iter().map(|&i| 100 + JobId::from(i)).collect();
         nodes.push(1);
-        jobs.push(DagJob::passthrough(99, 7, nodes, 0.0));
+        jobs.push(DagJob {
+            passthrough: true,
+            work_estimate: Some(0.0),
+            ..plain(99, 0, 7, nodes)
+        });
         b.declare(jobs, 0.0).unwrap();
         let (order_a, done_a) = drive(&mut a);
         let (order_b, done_b) = drive(&mut b);
@@ -215,17 +257,10 @@ fn close_walk_early() {
     let mut d = whelm(2, cfg);
     with_entry(&mut d);
     // Four independent nodes, a chain after them; two slots.
-    let t = Arc::new(DagTemplate::new(6, [(0, 4), (1, 4), (4, 5)]).unwrap());
+    let t = template_of(6, [(0, 4), (1, 4), (4, 5)]);
     d.declare([walk(&t, 100, 1, 99)], 0.0).unwrap();
     // Something after the walk.
-    d.declare(
-        vec![DagJob::new(
-            JobSpec::new(200, Resources::mem(1), 8),
-            vec![99],
-        )],
-        0.0,
-    )
-    .unwrap();
+    d.declare(vec![plain(200, 1, 8, vec![99])], 0.0).unwrap();
     assert_eq!(starts(&d.poll(0.0)), vec![100, 101]);
     let mut running = d.close(99, 1.0).unwrap();
     running.sort_unstable();
@@ -262,9 +297,15 @@ fn local_jobs_stay_on_the_caller() {
     );
     d.declare(
         vec![
-            DagJob::new(JobSpec::new(1, Resources::ZERO, 0), vec![]).local(),
-            DagJob::new(JobSpec::new(2, Resources::mem(1), 0), vec![1]),
-            DagJob::new(JobSpec::new(3, Resources::ZERO, 0), vec![2]).local(),
+            DagJob {
+                local: true,
+                ..plain(1, 0, 0, vec![])
+            },
+            plain(2, 1, 0, vec![1]),
+            DagJob {
+                local: true,
+                ..plain(3, 0, 0, vec![2])
+            },
         ],
         0.0,
     )
@@ -369,21 +410,19 @@ mod restart {
                     deps.push(600 + k as JobId);
                 }
             }
-            let mut j = DagJob::new(JobSpec::new(ex_id(i), Resources::mem(1), i as u64), deps);
-            j.local = *local;
-            jobs.push(j);
+            jobs.push(DagJob {
+                local: *local,
+                ..plain(ex_id(i), 1, i as u64, deps)
+            });
             all.insert(ex_id(i));
         }
         for k in 0..w.walks.len() {
-            jobs.push(DagJob::new(
-                JobSpec::new(600 + k as JobId, Resources::mem(1), 50),
-                vec![done_id(k)],
-            ));
+            jobs.push(plain(600 + k as JobId, 1, 50, vec![done_id(k)]));
             all.insert(600 + k as JobId);
         }
         d.declare(jobs, 0.0).unwrap();
         for (k, (entry, len, edges, _)) in w.walks.iter().enumerate() {
-            let t = Arc::new(DagTemplate::new(*len, edges.iter().copied()).unwrap());
+            let t = template_of(*len, edges.iter().copied());
             let base = WALK_BASE + 100 * k as JobId;
             d.declare([walk(&t, base, ex_id(*entry), done_id(k))], 0.0)
                 .unwrap();
@@ -470,14 +509,13 @@ mod restart {
 #[test]
 fn nothing_runs_before_the_entry() {
     let mut d = whelm(4, DagConfig::default());
-    d.declare(
-        vec![DagJob::new(JobSpec::new(1, Resources::mem(1), 7), vec![])],
-        0.0,
-    )
-    .unwrap();
-    let t = Arc::new(DagTemplate::new(2, [(0, 1)]).unwrap());
-    d.declare([walk(&t, 100, 1, 99).with_completed(vec![0])], 0.0)
-        .unwrap();
+    d.declare(vec![plain(1, 1, 7, vec![])], 0.0).unwrap();
+    let t = template_of(2, [(0, 1)]);
+    let unit = Unit {
+        completed: vec![0],
+        ..walk(&t, 100, 1, 99)
+    };
+    d.declare([unit], 0.0).unwrap();
     assert_eq!(
         starts(&d.poll(0.0)),
         vec![1],

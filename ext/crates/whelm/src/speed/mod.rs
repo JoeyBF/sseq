@@ -49,7 +49,7 @@ pub enum Timing {
     ///
     /// ```
     /// # use whelm::{
-    /// #     Config, Input, JobSpec, Output, Policy, Resources, Scheduler, SpeedConfig, Timing,
+    /// #     Config, Input, JobSpec, Output, Policy, Scheduler, SpeedConfig, Timing,
     /// #     WorkerId, WorkerState,
     /// # };
     /// # /// A scheduler with `timing` and two one-slot workers: 1 of class "x" and 2 of class "y",
@@ -60,7 +60,8 @@ pub enum Timing {
     /// #         ..Config::default()
     /// #     });
     /// #     for (id, class) in [(1, "x"), (2, "y")] {
-    /// #         s.handle(Input::Worker(WorkerState::new(id, class, 1, Resources::ZERO)), 0.0);
+    /// #         let w = WorkerState { id, class: class.into(), ..Default::default() };
+    /// #         s.handle(Input::Worker(w), 0.0);
     /// #     }
     /// #     s
     /// # }
@@ -73,17 +74,19 @@ pub enum Timing {
     /// #     worker
     /// # }
     /// let fast = WorkerState {
+    ///     id: 2,
+    ///     class: "y".into(),
     ///     speed: 4.0,
-    ///     ..WorkerState::new(2, "y", 1, Resources::ZERO)
+    ///     ..Default::default()
     /// };
     /// let mut s = two_classes(Timing::Identical);
     /// s.handle(Input::Worker(fast.clone()), 0.0);
-    /// assert_eq!(place(&mut s, JobSpec::new(0, Resources::ZERO, 0), 0.0), 1);
+    /// assert_eq!(place(&mut s, JobSpec::default(), 0.0), 1);
     /// assert_eq!(s.stats().workers[1].speed, 1.0);
     /// // The default, related machines at their reported speeds, prefers it.
     /// let mut s = two_classes(Timing::default());
     /// s.handle(Input::Worker(fast), 0.0);
-    /// assert_eq!(place(&mut s, JobSpec::new(0, Resources::ZERO, 0), 0.0), 2);
+    /// assert_eq!(place(&mut s, JobSpec::default(), 0.0), 2);
     /// assert_eq!(s.stats().workers[1].speed, 4.0);
     /// ```
     Identical,
@@ -109,7 +112,7 @@ pub enum Timing {
     ///
     /// ```
     /// # use whelm::{
-    /// #     Config, Input, JobSpec, Output, Policy, Resources, Scheduler, SpeedConfig, Timing,
+    /// #     Config, Constraint, Input, JobSpec, Output, Policy, Scheduler, SpeedConfig, Timing,
     /// #     WorkerId, WorkerState,
     /// # };
     /// # /// A scheduler with `timing` and two one-slot workers: 1 of class "x" and 2 of class "y",
@@ -120,7 +123,8 @@ pub enum Timing {
     /// #         ..Config::default()
     /// #     });
     /// #     for (id, class) in [(1, "x"), (2, "y")] {
-    /// #         s.handle(Input::Worker(WorkerState::new(id, class, 1, Resources::ZERO)), 0.0);
+    /// #         let w = WorkerState { id, class: class.into(), ..Default::default() };
+    /// #         s.handle(Input::Worker(w), 0.0);
     /// #     }
     /// #     s
     /// # }
@@ -143,10 +147,13 @@ pub enum Timing {
     ///         for kind in ["a", "b"] {
     ///             for (w, class) in [(1, "x"), (2, "y")] {
     ///                 let job = JobSpec {
+    ///                     id,
     ///                     work: Some(8.0),
-    ///                     ..JobSpec::new(id, Resources::ZERO, 0)
+    ///                     kind: Some(kind.into()),
+    ///                     constraints: vec![Constraint::require_class(class)],
+    ///                     ..Default::default()
     ///                 };
-    ///                 s.handle(Input::Submit(job.with_kind(kind).require_class(class)), now);
+    ///                 s.handle(Input::Submit(job), now);
     ///                 assert_eq!(s.poll(now).len(), 1);
     ///                 now += 8.0 / truth(kind, w);
     ///                 s.handle(Input::Done { job: id, attempt: 1 }, now);
@@ -156,11 +163,12 @@ pub enum Timing {
     ///     }
     ///     now
     /// };
-    /// let kind = |id, kind| JobSpec {
+    /// let kind = |id, kind: &str| JobSpec {
+    ///     id,
     ///     work: Some(8.0),
-    ///     ..JobSpec::new(id, Resources::ZERO, 0)
-    /// }
-    /// .with_kind(kind);
+    ///     kind: Some(kind.into()),
+    ///     ..Default::default()
+    /// };
     ///
     /// let mut s = two_classes(Timing::unrelated());
     /// let now = train(&mut s);
@@ -202,7 +210,7 @@ impl Timing {
     ///
     /// ```
     /// # use whelm::{
-    /// #     Config, Input, JobSpec, Output, Policy, Resources, Scheduler, SpeedConfig, Timing,
+    /// #     Config, Constraint, Input, JobSpec, Output, Policy, Scheduler, SpeedConfig, Timing,
     /// #     WorkerId, WorkerState,
     /// # };
     /// # /// A scheduler with `timing` and two one-slot workers: 1 of class "x" and 2 of class "y",
@@ -213,7 +221,8 @@ impl Timing {
     /// #         ..Config::default()
     /// #     });
     /// #     for (id, class) in [(1, "x"), (2, "y")] {
-    /// #         s.handle(Input::Worker(WorkerState::new(id, class, 1, Resources::ZERO)), 0.0);
+    /// #         let w = WorkerState { id, class: class.into(), ..Default::default() };
+    /// #         s.handle(Input::Worker(w), 0.0);
     /// #     }
     /// #     s
     /// # }
@@ -229,16 +238,22 @@ impl Timing {
     /// let mut now = 0.0;
     /// for id in 0..u64::from(Learn::default().min_samples) {
     ///     let job = JobSpec {
+    ///         id,
     ///         work: Some(10.0),
-    ///         ..JobSpec::new(id, Resources::ZERO, 0)
+    ///         constraints: vec![Constraint::require_class("y")],
+    ///         ..Default::default()
     ///     };
-    ///     s.handle(Input::Submit(job.require_class("y")), now);
+    ///     s.handle(Input::Submit(job), now);
     ///     s.poll(now);
     ///     now += 5.0;
     ///     s.handle(Input::Done { job: id, attempt: 1 }, now);
     /// }
     /// assert!((s.stats().workers[1].speed - 2.0).abs() < 1e-9);
-    /// assert_eq!(place(&mut s, JobSpec::new(1000, Resources::ZERO, 0), now), 2);
+    /// let job = JobSpec {
+    ///     id: 1000,
+    ///     ..Default::default()
+    /// };
+    /// assert_eq!(place(&mut s, job, now), 2);
     /// # use whelm::Learn;
     /// ```
     pub fn learned() -> Self {
@@ -387,6 +402,19 @@ pub struct Sharing {
     pub k_sat: f64,
     /// Growth exponent below saturation (1: linear, each job at full speed).
     pub alpha: f64,
+}
+
+impl Default for Sharing {
+    /// Throughput linear in concurrency, never saturating: each job runs at the worker's full
+    /// speed, the same as no [`Learn::sharing`].
+    ///
+    /// It corrects nothing, so a literal that sets one parameter models that one alone.
+    fn default() -> Self {
+        Self {
+            k_sat: f64::INFINITY,
+            alpha: 1.0,
+        }
+    }
 }
 
 impl Sharing {

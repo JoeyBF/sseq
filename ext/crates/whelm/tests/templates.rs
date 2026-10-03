@@ -4,14 +4,20 @@ use std::{collections::BTreeMap, sync::Arc};
 
 use proptest::prelude::*;
 use whelm::{
-    Config, DagConfig, DagError, DagJob, DagScheduler, DagTemplate, Input, JobId, JobSpec,
-    NodeSource, Output, Policy, Resources, Scheduler, TemplateNode, Unit, WorkerId, WorkerState,
+    Config, Constraint, DagConfig, DagError, DagJob, DagScheduler, DagTemplate, Input, JobId,
+    JobSpec, NodeSource, Output, Policy, Resources, Scheduler, TemplateNode, TemplateSpec, Unit,
+    WorkerId, WorkerState,
 };
 
 /// A DAG layer over one worker with many slots.
 fn dag(config: DagConfig) -> DagScheduler<Scheduler> {
     let mut d = DagScheduler::new(config, Scheduler::new(Config::default()));
-    let w = WorkerState::new(0, "x", 64, Resources::mem(1000));
+    let w = WorkerState {
+        class: "x".into(),
+        slots: 64,
+        budget: Resources::mem(1000),
+        ..Default::default()
+    };
     d.handle(Input::Worker(w), 0.0);
     d
 }
@@ -38,7 +44,47 @@ fn starts(p: &mut impl Policy, now: f64) -> Vec<(JobId, WorkerId)> {
 
 /// A unit job in group 0.
 fn job(id: JobId, deps: &[JobId]) -> DagJob {
-    DagJob::new(JobSpec::new(id, Resources::mem(1), 0), deps.to_vec())
+    DagJob {
+        spec: JobSpec {
+            id,
+            demand: Resources::mem(1),
+            ..Default::default()
+        },
+        deps: deps.to_vec(),
+        ..Default::default()
+    }
+}
+
+/// A unit job in group 0 with a work estimate.
+fn worked(id: JobId, deps: &[JobId], work: f64) -> DagJob {
+    DagJob {
+        work_estimate: Some(work),
+        ..job(id, deps)
+    }
+}
+
+/// A passthrough in group 0 worth `work` in ranks.
+fn passthrough(id: JobId, deps: &[JobId], work: f64) -> DagJob {
+    DagJob {
+        spec: JobSpec {
+            id,
+            ..Default::default()
+        },
+        passthrough: true,
+        ..worked(id, deps, work)
+    }
+}
+
+/// The template of `n` worker jobs of unit work with the given edges.
+fn template_of(
+    n: usize,
+    edges: impl IntoIterator<Item = (u32, u32)>,
+) -> Result<DagTemplate, DagError> {
+    TemplateSpec {
+        edges: edges.into_iter().collect(),
+        ..TemplateSpec::jobs(n)
+    }
+    .build()
 }
 
 /// The ids started by a poll, sorted.
@@ -57,11 +103,7 @@ fn passthrough_jobs_complete_by_themselves() {
     });
     // 1 -> done(2) -> 3: the passthrough never reaches the policy.
     d.declare(
-        vec![
-            job(1, &[]),
-            DagJob::passthrough(2, 0, vec![1], 5.0),
-            job(3, &[2]),
-        ],
+        vec![job(1, &[]), passthrough(2, &[1], 5.0), job(3, &[2])],
         0.0,
     )
     .unwrap();
@@ -111,9 +153,22 @@ fn a_source_makes_a_leaf_a_passthrough_in_one_unit() {
         TemplateNode::Local(1.0),
         TemplateNode::Job(1.0),
     ];
-    let t = Arc::new(DagTemplate::with_nodes(nodes, [(0, 1), (1, 2)]).unwrap());
-    let spec = JobSpec::new(0, Resources::mem(1), 0);
-    let unit = |id, base| Unit::new(id, base, t.clone(), spec.clone(), vec![]).sourced();
+    let t = TemplateSpec {
+        nodes,
+        edges: vec![(0, 1), (1, 2)],
+    };
+    let t = Arc::new(t.build().unwrap());
+    let unit = |id, base| Unit {
+        id,
+        base,
+        template: t.clone(),
+        spec: JobSpec {
+            demand: Resources::mem(1),
+            ..Default::default()
+        },
+        sourced: true,
+        ..Default::default()
+    };
     d.declare([unit(10, 100), unit(20, 200)], 0.0).unwrap();
     assert_eq!(d.rank(100), Some(1.0 + 3.0), "the no-op weighs nothing");
     assert_eq!(d.rank(200), Some(1.0 + 2.0 + 3.0));
@@ -140,7 +195,7 @@ fn long_passthrough_chains_do_not_recurse() {
     let mut d = dag(DagConfig::default());
     const N: u64 = 200_000;
     let mut jobs = vec![job(0, &[])];
-    jobs.extend((1..N).map(|i| DagJob::passthrough(i, 0, vec![i - 1], 0.0)));
+    jobs.extend((1..N).map(|i| passthrough(i, &[i - 1], 0.0)));
     jobs.push(job(N, &[N - 1]));
     d.declare(jobs, 0.0).unwrap();
     assert_eq!(placed(&mut d, 0.0), vec![0]);
@@ -153,11 +208,8 @@ fn long_passthrough_chains_do_not_recurse() {
 #[test]
 fn a_ready_passthrough_completes_at_declaration() {
     let mut d = dag(DagConfig::default());
-    d.declare(
-        vec![DagJob::passthrough(1, 0, vec![], 0.0), job(2, &[1])],
-        0.0,
-    )
-    .unwrap();
+    d.declare(vec![passthrough(1, &[], 0.0), job(2, &[1])], 0.0)
+        .unwrap();
     assert_eq!(placed(&mut d, 0.0), vec![2]);
 }
 
@@ -169,13 +221,12 @@ fn update_work_raises_and_lowers_ranks() {
         ..DagConfig::default()
     });
     // 1 -> 2 -> 4 and 1 -> 3 -> 4.
-    let w = |id, deps: &[JobId], work| job(id, deps).with_work(work);
     d.declare(
         vec![
-            w(1, &[], 1.0),
-            w(2, &[1], 10.0),
-            w(3, &[1], 2.0),
-            w(4, &[2, 3], 1.0),
+            worked(1, &[], 1.0),
+            worked(2, &[1], 10.0),
+            worked(3, &[1], 2.0),
+            worked(4, &[2, 3], 1.0),
         ],
         0.0,
     )
@@ -196,10 +247,10 @@ fn update_work_raises_and_lowers_ranks() {
 #[test]
 fn template_basics() {
     assert_eq!(
-        DagTemplate::new(3, [(0, 1), (1, 2), (2, 0)]).unwrap_err(),
+        template_of(3, [(0, 1), (1, 2), (2, 0)]).unwrap_err(),
         DagError::Cycle { job: 0 }
     );
-    let t = DagTemplate::new(4, [(0, 1), (0, 2), (1, 3), (2, 3), (0, 1)]).unwrap();
+    let t = template_of(4, [(0, 1), (0, 2), (1, 3), (2, 3), (0, 1)]).unwrap();
     assert_eq!(t.len(), 4);
     assert_eq!(t.edge_count(), 4);
     assert_eq!(t.sources().collect::<Vec<_>>(), vec![0]);
@@ -211,7 +262,7 @@ fn template_basics() {
 #[test]
 fn critical_nodes_lie_on_the_longest_chain() {
     // 0 -> 1 -> 3 (1 + 5 + 1) and 0 -> 2 -> 3 (1 + 2 + 1); 4 is isolated (3).
-    let t = DagTemplate::new(5, [(0, 1), (0, 2), (1, 3), (2, 3)]).unwrap();
+    let t = template_of(5, [(0, 1), (0, 2), (1, 3), (2, 3)]).unwrap();
     let w = [1.0, 5.0, 2.0, 1.0, 3.0];
     assert_eq!(
         t.critical_nodes(|i| w[i], 1e-9),
@@ -228,24 +279,32 @@ fn critical_nodes_lie_on_the_longest_chain() {
 #[test]
 fn units_of_a_template() {
     // A diamond whose node 2 is a passthrough, twice; unit 2 waits for unit 1.
-    let t = Arc::new(
-        DagTemplate::with_nodes(
-            vec![
-                TemplateNode::Job(1.0),
-                TemplateNode::Job(1.0),
-                TemplateNode::Pass(0.0),
-                TemplateNode::Job(1.0),
-            ],
-            [(0, 1), (0, 2), (1, 3), (2, 3)],
-        )
-        .unwrap(),
-    );
+    let t = TemplateSpec {
+        nodes: vec![
+            TemplateNode::Job(1.0),
+            TemplateNode::Job(1.0),
+            TemplateNode::Pass(0.0),
+            TemplateNode::Job(1.0),
+        ],
+        edges: vec![(0, 1), (0, 2), (1, 3), (2, 3)],
+    };
+    let t = Arc::new(t.build().unwrap());
     let mut d = dag(DagConfig::default());
     for g in 1..=2u64 {
         let deps: Vec<JobId> = if g == 2 { vec![101] } else { vec![] };
-        let spec = JobSpec::new(0, Resources::mem(1), g);
-        d.declare([Unit::new(100 + g, g * 10, t.clone(), spec, deps)], 0.0)
-            .unwrap();
+        let unit = Unit {
+            id: 100 + g,
+            base: g * 10,
+            template: t.clone(),
+            deps,
+            spec: JobSpec {
+                demand: Resources::mem(1),
+                group: g,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        d.declare([unit], 0.0).unwrap();
     }
     let mut order = Vec::new();
     for step in 0..10 {
@@ -265,25 +324,21 @@ fn units_of_a_template() {
 #[test]
 fn substituted_units() {
     // inner: 0 -> 1 (work 2, 3); outer: job 0 -> inner -> job 2, and an isolated job 3.
-    let inner = Arc::new(
-        DagTemplate::with_nodes(
-            vec![TemplateNode::Job(2.0), TemplateNode::Job(3.0)],
-            [(0, 1)],
-        )
-        .unwrap(),
-    );
-    let outer = Arc::new(
-        DagTemplate::with_nodes(
-            vec![
-                TemplateNode::Job(1.0),
-                TemplateNode::Unit(inner.clone()),
-                TemplateNode::Job(4.0),
-                TemplateNode::Job(1.0),
-            ],
-            [(0, 1), (1, 2)],
-        )
-        .unwrap(),
-    );
+    let inner = TemplateSpec {
+        nodes: vec![TemplateNode::Job(2.0), TemplateNode::Job(3.0)],
+        edges: vec![(0, 1)],
+    };
+    let inner = Arc::new(inner.build().unwrap());
+    let outer = TemplateSpec {
+        nodes: vec![
+            TemplateNode::Job(1.0),
+            TemplateNode::Unit(inner.clone()),
+            TemplateNode::Job(4.0),
+            TemplateNode::Job(1.0),
+        ],
+        edges: vec![(0, 1), (1, 2)],
+    };
+    let outer = Arc::new(outer.build().unwrap());
     assert_eq!(outer.leaves(), 5);
     assert_eq!(
         (0..4).map(|i| outer.leaf_offset(i)).collect::<Vec<_>>(),
@@ -295,15 +350,18 @@ fn substituted_units() {
         rank_epsilon: 0.0,
         ..DagConfig::default()
     });
-    let spec = JobSpec::new(0, Resources::mem(1), 0);
-    d.declare(
-        [
-            Unit::new(1, 10, outer, spec, vec![]).with_scale(2.0),
-            job(2, &[1]).with_work(7.0).into(),
-        ],
-        0.0,
-    )
-    .unwrap();
+    let unit = Unit {
+        id: 1,
+        base: 10,
+        template: outer,
+        spec: JobSpec {
+            demand: Resources::mem(1),
+            ..Default::default()
+        },
+        scale: Some(2.0),
+        ..Default::default()
+    };
+    d.declare([unit, worked(2, &[1], 7.0).into()], 0.0).unwrap();
     // Leaf 12 (inner node 1): 2 * (3 + 4) + 7.
     assert_eq!(d.rank(12), Some(21.0));
     assert_eq!(d.rank(1), Some(27.0));
@@ -331,20 +389,33 @@ fn substituted_units() {
 fn forbid_and_class_are_hard_constraints() {
     let mut p = Scheduler::new(Config::default());
     let join = |p: &mut Scheduler, id, class, slots, now| {
-        let w = WorkerState::new(id, class, slots, Resources::mem(100));
+        let w = WorkerState {
+            id,
+            class: String::from(class),
+            slots,
+            budget: Resources::mem(100),
+            ..Default::default()
+        };
         p.handle(Input::Worker(w), now);
     };
     join(&mut p, 1, "h200", 4, 0.0);
     join(&mut p, 2, "l40s", 4, 0.0);
-    let retry = JobSpec::new(1, Resources::mem(1), 0)
-        .forbid_worker(1)
-        .prefer_worker(1);
+    let spec = |id, constraints| JobSpec {
+        id,
+        demand: Resources::mem(1),
+        constraints,
+        ..Default::default()
+    };
+    let retry = spec(
+        1,
+        vec![Constraint::forbid_worker(1), Constraint::prefer_worker(1)],
+    );
     p.handle(Input::Submit(retry), 0.0);
-    let pinned = JobSpec::new(2, Resources::mem(1), 0).require_class("h200");
+    let pinned = spec(2, vec![Constraint::require_class("h200")]);
     p.handle(Input::Submit(pinned), 0.0);
     assert_eq!(starts(&mut p, 0.0), vec![(1, 2), (2, 1)]);
     // A job excluded everywhere waits, and says why.
-    let nowhere = JobSpec::new(3, Resources::mem(1), 0).require_class("v100");
+    let nowhere = spec(3, vec![Constraint::require_class("v100")]);
     p.handle(Input::Submit(nowhere), 1.0);
     assert!(starts(&mut p, 1.0).is_empty());
     assert!(p.explain(3).unwrap().contains("2 worker(s) excluded"));
@@ -416,7 +487,7 @@ proptest! {
         );
         let ids: Vec<JobId> = (0..n as JobId).rev().collect();
         for chunk in ids.chunks(batch) {
-            let jobs: Vec<DagJob> = chunk.iter().map(|&i| job(i, &deps[&i]).with_work(work[&i])).collect();
+            let jobs: Vec<DagJob> = chunk.iter().map(|&i| worked(i, &deps[&i], work[&i])).collect();
             d.declare(jobs, 0.0).unwrap();
         }
         for (j, w) in updates {
@@ -461,7 +532,7 @@ proptest! {
     ) {
         let edges: Vec<(u32, u32)> =
             edges.into_iter().filter(|&(a, b)| a < b && (b as usize) < n).collect();
-        let t = DagTemplate::new(n, edges).unwrap();
+        let t = template_of(n, edges).unwrap();
         let r = t.transitive_reduction();
         prop_assert_eq!(closure(&t), closure(&r));
         prop_assert!((t.critical_path(|i| works[i]) - r.critical_path(|i| works[i])).abs() < 1e-9);

@@ -1,8 +1,8 @@
 //! Speed-aware placement: speed score, deferral, learning, speculation and machine models.
 
 use whelm::{
-    Attempt, Config, Defer, Input, JobId, JobSpec, Output, Policy, Resources, Scheduler, ScoreTerm,
-    Speculate, SpeedConfig, Timing, WorkerId, WorkerState,
+    Attempt, Config, Constraint, Defer, Input, JobId, JobSpec, Output, Policy, Resources,
+    Scheduler, ScoreTerm, Speculate, SpeedConfig, Timing, WorkerId, WorkerState,
 };
 
 /// The `(job, worker)` of each start in `out`.
@@ -24,20 +24,28 @@ fn done(job: JobId) -> Input {
 fn worker(id: u64, slots: usize, speed: f64) -> WorkerState {
     WorkerState {
         speed,
-        ..WorkerState::new(
-            id,
-            if speed > 1.0 { "fast" } else { "slow" },
-            slots,
-            Resources::mem(1000),
-        )
+        ..plain_worker(id, if speed > 1.0 { "fast" } else { "slow" }, slots)
+    }
+}
+
+/// A worker of the reference speed with 1000 bytes of memory.
+fn plain_worker(id: u64, class: &str, slots: usize) -> WorkerState {
+    WorkerState {
+        id,
+        class: class.into(),
+        slots,
+        budget: Resources::mem(1000),
+        ..Default::default()
     }
 }
 
 /// A unit-demand job with optional work.
 fn job(id: JobId, work: Option<f64>) -> JobSpec {
     JobSpec {
+        id,
+        demand: Resources::mem(1),
         work,
-        ..JobSpec::new(id, Resources::mem(1), 0)
+        ..Default::default()
     }
 }
 
@@ -60,8 +68,12 @@ fn speed_first_picks_the_fast_worker() {
         // The fast worker has more room left, which best fit alone would avoid.
         p.handle(
             Input::Worker(WorkerState {
+                id: 2,
+                class: "fast".into(),
+                slots: 4,
+                budget: Resources::mem(5000),
                 speed: 2.4,
-                ..WorkerState::new(2, "fast", 4, Resources::mem(5000))
+                ..Default::default()
             }),
             0.0,
         );
@@ -189,14 +201,8 @@ fn learned_speeds_replace_reported_ones() {
     };
     let mut p = backfill(speed);
     // Both report 1.0; worker 2 really runs three times faster.
-    p.handle(
-        Input::Worker(WorkerState::new(1, "a", 1, Resources::mem(1000))),
-        0.0,
-    );
-    p.handle(
-        Input::Worker(WorkerState::new(2, "b", 1, Resources::mem(1000))),
-        0.0,
-    );
+    p.handle(Input::Worker(plain_worker(1, "a", 1)), 0.0);
+    p.handle(Input::Worker(plain_worker(2, "b", 1)), 0.0);
     let truth = |w: u64| if w == 2 { 3.0 } else { 1.0 };
     let mut now = 0.0;
     let mut id = 0;
@@ -339,10 +345,7 @@ fn capped_worker_learned_per_worker() {
     };
     let mut p = backfill(speed);
     for w in 1..=3 {
-        p.handle(
-            Input::Worker(WorkerState::new(w, "h200", 1, Resources::mem(1000))),
-            0.0,
-        );
+        p.handle(Input::Worker(plain_worker(w, "h200", 1)), 0.0);
     }
     let truth = |w: u64| if w == 3 { 0.765 } else { 1.0 };
     let mut now = 0.0;
@@ -408,10 +411,7 @@ fn two_classes(timing: Timing) -> Scheduler {
         ..SpeedConfig::default()
     });
     for (id, class) in [(1, "x"), (2, "y")] {
-        p.handle(
-            Input::Worker(WorkerState::new(id, class, 1, Resources::mem(1000))),
-            0.0,
-        );
+        p.handle(Input::Worker(plain_worker(id, class, 1)), 0.0);
     }
     p
 }
@@ -433,7 +433,11 @@ fn train(p: &mut Scheduler) -> f64 {
     for _ in 0..20 {
         for kind in ["a", "b"] {
             for (w, class) in [(1, "x"), (2, "y")] {
-                let spec = job(id, Some(8.0)).with_kind(kind).require_class(class);
+                let spec = JobSpec {
+                    kind: Some(kind.into()),
+                    constraints: vec![Constraint::require_class(class)],
+                    ..job(id, Some(8.0))
+                };
                 p.handle(Input::Submit(spec), now);
                 assert_eq!(starts(p.poll(now)), vec![(id, w)]);
                 now += 8.0 / truth(kind, w);
@@ -473,13 +477,21 @@ fn unrelated_machines_learn_speeds_per_kind() {
     assert_eq!(place_alone(&mut r, 1002, Some("new"), now), 1);
     assert_eq!(place_alone(&mut r, 1003, None, now), 1);
     // A waiting job's explanation names its kind's learned factors.
-    r.handle(Input::Submit(job(1004, Some(8.0)).with_kind("a")), now);
+    let spec = JobSpec {
+        kind: Some("a".into()),
+        ..job(1004, Some(8.0))
+    };
+    r.handle(Input::Submit(spec), now);
     let e = r.explain(1004).unwrap();
     assert!(
         e.contains("kind a runs") && e.contains("on class x") && e.contains("on class y"),
         "{e}"
     );
-    r.handle(Input::Submit(job(1005, Some(8.0)).with_kind("new")), now);
+    let spec = JobSpec {
+        kind: Some("new".into()),
+        ..job(1005, Some(8.0))
+    };
+    r.handle(Input::Submit(spec), now);
     assert!(!r.explain(1005).unwrap().contains("kind new"));
 
     let mut q = two_classes(Timing::learned());
@@ -496,10 +508,7 @@ fn busy_run(timing: Timing, kind: Option<&str>) -> (Vec<Output>, Vec<f64>) {
         ..SpeedConfig::default()
     });
     for (id, class) in [(1, "a"), (2, "b")] {
-        p.handle(
-            Input::Worker(WorkerState::new(id, class, 1, Resources::mem(1000))),
-            0.0,
-        );
+        p.handle(Input::Worker(plain_worker(id, class, 1)), 0.0);
     }
     let truth = |w: u64| if w == 2 { 3.0 } else { 1.0 };
     let (mut now, mut id, mut log) = (0.0, 0, Vec::new());

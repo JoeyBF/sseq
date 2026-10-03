@@ -15,6 +15,26 @@ fn starts(out: Vec<Output>) -> Vec<(JobId, WorkerId)> {
         .collect()
 }
 
+/// A one-byte job of group `group`.
+fn job(id: JobId, group: u64) -> JobSpec {
+    JobSpec {
+        id,
+        demand: Resources::mem(1),
+        group,
+        ..Default::default()
+    }
+}
+
+/// Worker 0, of class "x", with 100 bytes and `slots` slots.
+fn worker(slots: usize) -> WorkerState {
+    WorkerState {
+        class: "x".into(),
+        slots,
+        budget: Resources::mem(100),
+        ..Default::default()
+    }
+}
+
 /// The order in which a one-slot worker runs jobs submitted in `order` (group = job id here).
 fn run_order(order: &[u64], group_order: GroupOrder) -> Vec<u64> {
     let mut p = Scheduler::new(Config {
@@ -22,15 +42,9 @@ fn run_order(order: &[u64], group_order: GroupOrder) -> Vec<u64> {
         ..Config::default()
     });
     for (i, &g) in order.iter().enumerate() {
-        p.handle(
-            Input::Submit(JobSpec::new(g, Resources::mem(1), g)),
-            i as f64,
-        );
+        p.handle(Input::Submit(job(g, g)), i as f64);
     }
-    p.handle(
-        Input::Worker(WorkerState::new(0, "x", 1, Resources::mem(100))),
-        10.0,
-    );
+    p.handle(Input::Worker(worker(1)), 10.0);
     let mut ran = Vec::new();
     for t in 0..order.len() {
         let out = starts(p.poll(10.0 + t as f64));
@@ -82,31 +96,18 @@ fn young_group_behind_wide_old_group_waits_at_most_age_limit() {
     const RUN: f64 = 100.0;
     const YOUNG: u64 = 1_000_000;
     let wait = |policy: &mut dyn Policy| -> f64 {
-        policy.handle(
-            Input::Worker(WorkerState::new(0, "x", SLOTS, Resources::mem(100))),
-            0.0,
-        );
+        policy.handle(Input::Worker(worker(SLOTS)), 0.0);
         let mut released = 0;
         let mut running: Vec<(u64, f64)> = Vec::new();
         let mut t = 0.0;
         loop {
             // The old walk keeps two jobs per slot ready.
             while released < OLD_JOBS && policy.stats().waiting < 2 * SLOTS {
-                policy.handle(
-                    Input::Submit(JobSpec::new(
-                        released,
-                        Resources::mem(1),
-                        nassau::group(1, 20),
-                    )),
-                    t,
-                );
+                policy.handle(Input::Submit(job(released, nassau::group(1, 20))), t);
                 released += 1;
             }
             if t == 10.0 {
-                policy.handle(
-                    Input::Submit(JobSpec::new(YOUNG, Resources::mem(1), nassau::group(3, 40))),
-                    t,
-                );
+                policy.handle(Input::Submit(job(YOUNG, nassau::group(3, 40))), t);
             }
             running.retain(|&(j, end)| {
                 if end <= t {

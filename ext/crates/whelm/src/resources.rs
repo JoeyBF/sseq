@@ -4,7 +4,7 @@
 use serde::{Deserialize, Serialize};
 
 #[cfg(doc)]
-use crate::{JobSpec, ProductionAdmission, WorkerLoad, WorkerState};
+use crate::{Admission, JobSpec, ProductionAdmission, WorkerLoad, WorkerState, WorkerView};
 
 /// Number of resource dimensions in a [`Resources`] vector.
 ///
@@ -41,11 +41,23 @@ pub const DEV: usize = 1;
 ///
 /// let mut p = Scheduler::new(Config::default());
 /// p.handle(
-///     Input::Worker(WorkerState::new(1, "cpu", 4, Resources::ZERO)),
+///     Input::Worker(WorkerState {
+///         id: 1,
+///         class: "cpu".into(),
+///         slots: 4,
+///         ..Default::default()
+///     }),
 ///     0.0,
 /// );
 /// for id in 1..=3 {
-///     p.handle(Input::Submit(JobSpec::new(id, Resources::mem(10), 0)), 0.0);
+///     p.handle(
+///         Input::Submit(JobSpec {
+///             id,
+///             demand: Resources::mem(10),
+///             ..Default::default()
+///         }),
+///         0.0,
+///     );
 /// }
 /// p.poll(0.0);
 /// let placed = p.stats().workers[0].placed;
@@ -175,6 +187,24 @@ impl Resources {
     /// ```
     pub fn with_dev_gb(self, gb: f64) -> Self {
         self.with_dev(gb_bytes(gb))
+    }
+
+    /// This vector with `n` [`SLOTS`].
+    ///
+    /// The scheduler sets a job's slot component itself, so this is for working with demands as
+    /// it sees them, such as testing an [`Admission`] rule against a [`WorkerView`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use whelm::{MEM, Resources, SLOTS};
+    ///
+    /// let r = Resources::mem(8).with_slots(1);
+    /// assert_eq!((r[MEM], r[SLOTS]), (8, 1));
+    /// ```
+    pub const fn with_slots(mut self, n: u64) -> Self {
+        self.0[SLOTS] = n;
+        self
     }
 
     /// Whether every component of `self` is at most the matching component of `cap`.

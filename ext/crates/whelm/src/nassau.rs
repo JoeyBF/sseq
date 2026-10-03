@@ -16,10 +16,21 @@
 //! let mut config = Config::default();
 //! config.group_order = GroupOrder::Id;
 //! let mut p = Scheduler::new(config);
-//! let submit = |id, g| Input::Submit(JobSpec::new(id, Resources::mem_gb(1.0), g));
+//! let submit = |id, g| {
+//!     Input::Submit(JobSpec {
+//!         id,
+//!         demand: Resources::mem_gb(1.0),
+//!         group: g,
+//!         ..Default::default()
+//!     })
+//! };
 //! p.handle(submit(1, group(3, 20)), 0.0);
 //! p.handle(submit(2, group(2, 40)), 0.0);
-//! let worker = WorkerState::new(1, "x", 1, Resources::mem_gb(8.0));
+//! let worker = WorkerState {
+//!     id: 1,
+//!     budget: Resources::mem_gb(8.0),
+//!     ..Default::default()
+//! };
 //! p.handle(Input::Worker(worker), 0.0);
 //! let start = Output::Start {
 //!     job: 2,

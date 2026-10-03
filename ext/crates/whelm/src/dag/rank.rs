@@ -33,22 +33,29 @@ impl<P: Policy> DagScheduler<P> {
     ///
     /// ```
     /// # use std::sync::Arc;
-    /// # use whelm::{Config, DagConfig, DagJob, DagScheduler, DagTemplate, JobSpec, Resources,
-    /// #     Scheduler, TemplateNode, Unit};
+    /// # use whelm::{Config, DagConfig, DagJob, DagScheduler, JobSpec, Scheduler, TemplateNode,
+    /// #     TemplateSpec, Unit};
     /// # let mut dag = DagScheduler::new(DagConfig::default(), Scheduler::new(Config::fifo()));
-    /// let nodes = vec![TemplateNode::Job(1.0), TemplateNode::Job(3.0)];
-    /// let pair = DagTemplate::with_nodes(nodes, []).unwrap();
-    /// let spec = JobSpec::new(0, Resources::mem(1), 0);
-    /// dag.declare(
-    ///     [
-    ///         Unit::new(10, 100, Arc::new(pair), spec.clone(), vec![]),
-    ///         DagJob::new(JobSpec { id: 20, ..spec }, vec![10])
-    ///             .with_work(2.0)
-    ///             .into(),
-    ///     ],
-    ///     0.0,
-    /// )
-    /// .unwrap();
+    /// let pair = TemplateSpec {
+    ///     nodes: vec![TemplateNode::Job(1.0), TemplateNode::Job(3.0)],
+    ///     ..Default::default()
+    /// };
+    /// let unit = Unit {
+    ///     id: 10,
+    ///     base: 100,
+    ///     template: Arc::new(pair.build().unwrap()),
+    ///     ..Default::default()
+    /// };
+    /// let after = DagJob {
+    ///     spec: JobSpec {
+    ///         id: 20,
+    ///         ..Default::default()
+    ///     },
+    ///     deps: vec![10],
+    ///     work_estimate: Some(2.0),
+    ///     ..Default::default()
+    /// };
+    /// dag.declare([unit, after.into()], 0.0).unwrap();
     /// assert_eq!(
     ///     (dag.rank(10), dag.rank(100), dag.rank(101)),
     ///     (Some(5.0), Some(3.0), Some(5.0))
@@ -70,10 +77,14 @@ impl<P: Policy> DagScheduler<P> {
     ///
     /// ```
     /// # use whelm::{Config, DagConfig, DagJob, DagScheduler, Input, JobSpec, Output, Policy,
-    /// #     Resources, Scheduler, WorkerState};
+    /// #     Scheduler, WorkerState};
     /// # let mut dag = DagScheduler::new(DagConfig::default(), Scheduler::new(Config::fifo()));
-    /// # dag.handle(Input::Worker(WorkerState::new(1, "cpu", 1, Resources::mem(100))), 0.0);
-    /// # let job = |id, deps| DagJob::new(JobSpec::new(id, Resources::mem(1), 0), deps);
+    /// # dag.handle(Input::Worker(WorkerState { id: 1, ..Default::default() }), 0.0);
+    /// # let job = |id, deps| DagJob {
+    /// #     spec: JobSpec { id, ..Default::default() },
+    /// #     deps,
+    /// #     ..Default::default()
+    /// # };
     /// dag.declare([job(1, vec![]), job(2, vec![1])], 0.0).unwrap();
     /// assert_eq!(dag.rank(1), Some(2.0));
     /// assert!(dag.update_work(2, 5.0));

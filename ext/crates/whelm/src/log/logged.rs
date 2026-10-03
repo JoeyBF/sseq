@@ -61,12 +61,19 @@ impl<P: Policy> Logged<P> {
     /// let events = Arc::new(Mutex::new(Vec::<Event>::new()));
     /// let inner = Scheduler::new(Config::default());
     /// let mut p = Logged::new(inner, events.clone()).sample_every(30.0);
-    /// let mut w = WorkerState::new(1, "x", 2, Resources::mem_gb(8.0));
+    /// let mut w = WorkerState {
+    ///     id: 1,
+    ///     slots: 2,
+    ///     budget: Resources::mem_gb(8.0),
+    ///     ..Default::default()
+    /// };
     /// p.handle(Input::Worker(w.clone()), 0.0);
-    /// p.handle(
-    ///     Input::Submit(JobSpec::new(1, Resources::mem_gb(2.0), 0)),
-    ///     0.0,
-    /// );
+    /// let job = JobSpec {
+    ///     id: 1,
+    ///     demand: Resources::mem_gb(2.0),
+    ///     ..Default::default()
+    /// };
+    /// p.handle(Input::Submit(job), 0.0);
     /// p.poll(0.0);
     /// w.reported_used = Resources::mem_gb(1.5);
     /// for t in [10.0, 20.0, 30.0] {
@@ -120,12 +127,20 @@ impl<P: Policy> Logged<P> {
     /// };
     /// p.annotate(1, info.clone());
     /// p.handle(
-    ///     Input::Submit(JobSpec::new(1, Resources::mem_gb(1.0), 0)),
+    ///     Input::Submit(JobSpec {
+    ///         id: 1,
+    ///         demand: Resources::mem_gb(1.0),
+    ///         ..Default::default()
+    ///     }),
     ///     0.0,
     /// );
     /// p.handle(Input::Cancel(1), 1.0);
     /// p.handle(
-    ///     Input::Submit(JobSpec::new(1, Resources::mem_gb(1.0), 0)),
+    ///     Input::Submit(JobSpec {
+    ///         id: 1,
+    ///         demand: Resources::mem_gb(1.0),
+    ///         ..Default::default()
+    ///     }),
     ///     2.0,
     /// );
     ///

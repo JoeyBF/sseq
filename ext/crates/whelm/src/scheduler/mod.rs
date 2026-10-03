@@ -23,11 +23,23 @@
 //! let mut s = Scheduler::new(Config::default());
 //! for w in [1, 2] {
 //!     let budget = Resources::mem_gb(8.0);
-//!     s.handle(Input::Worker(WorkerState::new(w, "cpu", 1, budget)), 0.0);
+//!     s.handle(
+//!         Input::Worker(WorkerState {
+//!             id: w,
+//!             class: "cpu".into(),
+//!             budget,
+//!             ..Default::default()
+//!         }),
+//!         0.0,
+//!     );
 //! }
 //! for id in 0..3 {
 //!     s.handle(
-//!         Input::Submit(JobSpec::new(id, Resources::mem_gb(2.0), 0)),
+//!         Input::Submit(JobSpec {
+//!             id,
+//!             demand: Resources::mem_gb(2.0),
+//!             ..Default::default()
+//!         }),
 //!         0.0,
 //!     );
 //! }
@@ -180,8 +192,13 @@ fn tick_occ(w: &mut Worker, now: Instant) {
 ///
 /// ```
 /// # use whelm::{Config, Input, JobSpec, Output, Policy, Resources, Scheduler, WorkerState};
-/// # let worker = |id, slots, bytes| WorkerState::new(id, "x", slots, Resources::mem(bytes));
-/// # let job = |id, bytes| JobSpec::new(id, Resources::mem(bytes), 0);
+/// # let worker = |id, slots, bytes| WorkerState {
+/// #     id,
+/// #     slots,
+/// #     budget: Resources::mem(bytes),
+/// #     ..Default::default()
+/// # };
+/// # let job = |id, bytes| JobSpec { id, demand: Resources::mem(bytes), ..Default::default() };
 /// # let start = |job, attempt, worker| Output::Start { job, attempt, worker };
 /// let mut s = Scheduler::new(Config::default());
 /// s.handle(Input::Worker(worker(1, 4, 100)), 0.0);
@@ -206,8 +223,13 @@ fn tick_occ(w: &mut Worker, now: Instant) {
 ///
 /// ```
 /// # use whelm::{Config, Input, JobSpec, Output, Policy, Resources, Scheduler, WorkerState};
-/// # let worker = |id, slots, bytes| WorkerState::new(id, "x", slots, Resources::mem(bytes));
-/// # let job = |id, bytes| JobSpec::new(id, Resources::mem(bytes), 0);
+/// # let worker = |id, slots, bytes| WorkerState {
+/// #     id,
+/// #     slots,
+/// #     budget: Resources::mem(bytes),
+/// #     ..Default::default()
+/// # };
+/// # let job = |id, bytes| JobSpec { id, demand: Resources::mem(bytes), ..Default::default() };
 /// # let start = |job, attempt, worker| Output::Start { job, attempt, worker };
 /// use whelm::FailKind;
 ///
@@ -247,8 +269,13 @@ fn tick_occ(w: &mut Worker, now: Instant) {
 ///
 /// ```
 /// # use whelm::{Config, Input, JobSpec, Output, Policy, Resources, Scheduler, WorkerState};
-/// # let worker = |id, slots, bytes| WorkerState::new(id, "x", slots, Resources::mem(bytes));
-/// # let job = |id, bytes| JobSpec::new(id, Resources::mem(bytes), 0);
+/// # let worker = |id, slots, bytes| WorkerState {
+/// #     id,
+/// #     slots,
+/// #     budget: Resources::mem(bytes),
+/// #     ..Default::default()
+/// # };
+/// # let job = |id, bytes| JobSpec { id, demand: Resources::mem(bytes), ..Default::default() };
 /// # let start = |job, attempt, worker| Output::Start { job, attempt, worker };
 /// let mut s = Scheduler::new(Config::default());
 /// s.handle(Input::Worker(worker(1, 4, 100)), 0.0);
@@ -276,8 +303,13 @@ fn tick_occ(w: &mut Worker, now: Instant) {
 ///
 /// ```
 /// # use whelm::{Config, Input, JobSpec, Output, Policy, Resources, Scheduler, WorkerState};
-/// # let worker = |id, slots, bytes| WorkerState::new(id, "x", slots, Resources::mem(bytes));
-/// # let job = |id, bytes| JobSpec::new(id, Resources::mem(bytes), 0);
+/// # let worker = |id, slots, bytes| WorkerState {
+/// #     id,
+/// #     slots,
+/// #     budget: Resources::mem(bytes),
+/// #     ..Default::default()
+/// # };
+/// # let job = |id, bytes| JobSpec { id, demand: Resources::mem(bytes), ..Default::default() };
 /// # let start = |job, attempt, worker| Output::Start { job, attempt, worker };
 /// use whelm::{Defer, SpeedConfig};
 ///
@@ -316,8 +348,13 @@ fn tick_occ(w: &mut Worker, now: Instant) {
 ///
 /// ```
 /// # use whelm::{Config, Input, JobSpec, Output, Policy, Resources, Scheduler, WorkerState};
-/// # let worker = |id, slots, bytes| WorkerState::new(id, "x", slots, Resources::mem(bytes));
-/// # let job = |id, bytes| JobSpec::new(id, Resources::mem(bytes), 0);
+/// # let worker = |id, slots, bytes| WorkerState {
+/// #     id,
+/// #     slots,
+/// #     budget: Resources::mem(bytes),
+/// #     ..Default::default()
+/// # };
+/// # let job = |id, bytes| JobSpec { id, demand: Resources::mem(bytes), ..Default::default() };
 /// # let start = |job, attempt, worker| Output::Start { job, attempt, worker };
 /// use whelm::{Speculate, SpeedConfig};
 ///
@@ -427,14 +464,30 @@ impl Scheduler {
     ///
     /// let mut s = Scheduler::with_admission(Config::default(), SkipDraining);
     /// s.handle(
-    ///     Input::Worker(WorkerState::new(1, "draining", 4, Resources::ZERO)),
+    ///     Input::Worker(WorkerState {
+    ///         id: 1,
+    ///         class: "draining".into(),
+    ///         slots: 4,
+    ///         ..Default::default()
+    ///     }),
     ///     0.0,
     /// );
     /// s.handle(
-    ///     Input::Worker(WorkerState::new(2, "cpu", 4, Resources::ZERO)),
+    ///     Input::Worker(WorkerState {
+    ///         id: 2,
+    ///         class: "cpu".into(),
+    ///         slots: 4,
+    ///         ..Default::default()
+    ///     }),
     ///     0.0,
     /// );
-    /// s.handle(Input::Submit(JobSpec::new(0, Resources::ZERO, 0)), 0.0);
+    /// s.handle(
+    ///     Input::Submit(JobSpec {
+    ///         id: 0,
+    ///         ..Default::default()
+    ///     }),
+    ///     0.0,
+    /// );
     /// assert_eq!(
     ///     s.poll(0.0),
     ///     [Output::Start {
@@ -477,21 +530,45 @@ impl Scheduler {
     /// is forgotten, the new job counts as arriving after group 2:
     ///
     /// ```
-    /// use whelm::{Config, Input, JobSpec, Output, Policy, Resources, Scheduler, WorkerState};
+    /// use whelm::{Config, Input, JobSpec, Output, Policy, Scheduler, WorkerState};
     ///
     /// let next = |forget| {
     ///     let mut s = Scheduler::new(Config::default());
     ///     s.handle(
-    ///         Input::Worker(WorkerState::new(1, "x", 1, Resources::ZERO)),
+    ///         Input::Worker(WorkerState {
+    ///             id: 1,
+    ///             ..Default::default()
+    ///         }),
     ///         0.0,
     ///     );
-    ///     s.handle(Input::Submit(JobSpec::new(0, Resources::ZERO, 1)), 0.0);
+    ///     s.handle(
+    ///         Input::Submit(JobSpec {
+    ///             id: 0,
+    ///             group: 1,
+    ///             ..Default::default()
+    ///         }),
+    ///         0.0,
+    ///     );
     ///     s.poll(0.0); // job 0, the last of group 1 for now, takes the slot
     ///     if forget {
     ///         s.forget_group(1);
     ///     }
-    ///     s.handle(Input::Submit(JobSpec::new(1, Resources::ZERO, 2)), 1.0);
-    ///     s.handle(Input::Submit(JobSpec::new(2, Resources::ZERO, 1)), 1.0);
+    ///     s.handle(
+    ///         Input::Submit(JobSpec {
+    ///             id: 1,
+    ///             group: 2,
+    ///             ..Default::default()
+    ///         }),
+    ///         1.0,
+    ///     );
+    ///     s.handle(
+    ///         Input::Submit(JobSpec {
+    ///             id: 2,
+    ///             group: 1,
+    ///             ..Default::default()
+    ///         }),
+    ///         1.0,
+    ///     );
     ///     s.handle(Input::Done { job: 0, attempt: 1 }, 2.0);
     ///     match s.poll(2.0)[..] {
     ///         [Output::Start { job, .. }] => job,

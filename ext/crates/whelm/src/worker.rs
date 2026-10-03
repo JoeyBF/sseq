@@ -24,10 +24,14 @@ pub type WorkerId = u64;
 /// use whelm::{Resources, SLOTS, WorkerState};
 ///
 /// let w = WorkerState {
+///     id: 7,
+///     class: "l40s".into(),
+///     slots: 16,
+///     budget: Resources::mem_gb(120.0).with_dev_gb(20.0),
 ///     reported_used: Resources::mem_gb(30.0),
 ///     reported_baseline: Resources::mem_gb(12.0),
 ///     speed: 1.4,
-///     ..WorkerState::new(7, "l40s", 16, Resources::mem_gb(120.0).with_dev_gb(20.0))
+///     ..Default::default()
 /// };
 /// assert_eq!(w.capacity()[SLOTS], 16);
 /// ```
@@ -67,34 +71,27 @@ pub(crate) fn unit() -> f64 {
     1.0
 }
 
-impl WorkerState {
-    /// A worker with `slots` execution slots, the memory capacity in `budget`, the reference
-    /// speed, and nothing reported yet.
+impl Default for WorkerState {
+    /// A worker that runs one job at a time, of unknown memory, at the reference speed.
     ///
-    /// # Examples
-    ///
-    /// ```
-    /// use whelm::{Resources, WorkerState};
-    ///
-    /// let w = WorkerState::new(1, "cpu", 8, Resources::mem_gb(64.0));
-    /// assert_eq!(
-    ///     (w.speed, w.reported_used, w.per_task),
-    ///     (1.0, Resources::ZERO, Resources::ZERO)
-    /// );
-    /// ```
-    pub fn new(id: WorkerId, class: impl Into<String>, slots: usize, budget: Resources) -> Self {
+    /// A worker of zero slots admits nothing, so a default of zero would make a worker that
+    /// silently never runs a job; with one, a worker that leaves `slots` out still runs its jobs,
+    /// in turn.
+    fn default() -> Self {
         Self {
-            id,
-            class: class.into(),
-            slots,
-            budget,
+            id: 0,
+            class: String::new(),
+            slots: 1,
+            budget: Resources::ZERO,
+            per_task: Resources::ZERO,
             reported_used: Resources::ZERO,
             reported_baseline: Resources::ZERO,
             speed: 1.0,
-            per_task: Resources::ZERO,
         }
     }
+}
 
+impl WorkerState {
     /// The capacity admission enforces: `budget` in the memory dimensions, `slots` in
     /// [`SLOTS`].
     ///
@@ -103,7 +100,12 @@ impl WorkerState {
     /// ```
     /// use whelm::{MEM, Resources, SLOTS, WorkerState};
     ///
-    /// let cap = WorkerState::new(1, "cpu", 8, Resources::mem(100)).capacity();
+    /// let w = WorkerState {
+    ///     slots: 8,
+    ///     budget: Resources::mem(100),
+    ///     ..Default::default()
+    /// };
+    /// let cap = w.capacity();
     /// assert_eq!((cap[MEM], cap[SLOTS]), (100, 8));
     /// ```
     pub fn capacity(&self) -> Resources {

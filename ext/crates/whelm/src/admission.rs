@@ -9,17 +9,19 @@
 //!
 //! A worker with 100 bytes of memory and two slots, running one 60-byte job, takes a 40-byte job
 //! beside it but not a 41-byte one. The scheduler asks with demands that take one [`SLOTS`]
-//! each, as the `job` closure builds them:
+//! each ([`Resources::with_slots`]), as the `job` closure builds them:
 //!
 //! ```
-//! use whelm::{Admission, ProductionAdmission, Resources, SLOTS, WorkerState, WorkerView};
+//! use whelm::{Admission, ProductionAdmission, Resources, WorkerState, WorkerView};
 //!
-//! let job = |bytes| {
-//!     let mut demand = Resources::mem(bytes);
-//!     demand[SLOTS] = 1;
-//!     demand
+//! let job = |bytes| Resources::mem(bytes).with_slots(1);
+//! let state = WorkerState {
+//!     id: 1,
+//!     class: "cpu".into(),
+//!     slots: 2,
+//!     budget: Resources::mem(100),
+//!     ..Default::default()
 //! };
-//! let state = WorkerState::new(1, "cpu", 2, Resources::mem(100));
 //! let view = WorkerView {
 //!     state: &state,
 //!     placed: job(60),
@@ -47,15 +49,15 @@ use crate::{DIMS, HARD, Resources, SLOTS, WorkerState};
 /// use whelm::{DEV, MEM, Resources, SLOTS, WorkerState, WorkerView};
 ///
 /// // A demand as the scheduler sends it: one slot per job.
-/// let job = |bytes| {
-///     let mut demand = Resources::mem(bytes);
-///     demand[SLOTS] = 1;
-///     demand
-/// };
+/// let job = |bytes| Resources::mem(bytes).with_slots(1);
 /// let state = WorkerState {
+///     id: 1,
+///     class: "cpu".into(),
+///     slots: 4,
+///     budget: Resources::mem(100),
 ///     reported_used: Resources::mem(30),
 ///     reported_baseline: Resources::mem(10),
-///     ..WorkerState::new(1, "cpu", 4, Resources::mem(100))
+///     ..Default::default()
 /// };
 /// let view = WorkerView {
 ///     state: &state,
@@ -96,8 +98,12 @@ impl WorkerView<'_> {
     /// use whelm::{Resources, WorkerState, WorkerView};
     ///
     /// let state = WorkerState {
+    ///     id: 1,
+    ///     class: "gpu".into(),
+    ///     slots: 4,
+    ///     budget: Resources::mem(100).with_dev(100),
     ///     per_task: Resources::ZERO.with_dev(30),
-    ///     ..WorkerState::new(1, "gpu", 4, Resources::mem(100).with_dev(100))
+    ///     ..Default::default()
     /// };
     /// let view = WorkerView {
     ///     state: &state,
@@ -120,16 +126,16 @@ impl WorkerView<'_> {
     /// bytes outweighs the 30 reported:
     ///
     /// ```
-    /// # use whelm::{Resources, SLOTS, WorkerState, WorkerView};
-    /// # let job = |bytes| {
-    /// #     let mut demand = Resources::mem(bytes);
-    /// #     demand[SLOTS] = 1;
-    /// #     demand
-    /// # };
+    /// # use whelm::{Resources, WorkerState, WorkerView};
+    /// # let job = |bytes| Resources::mem(bytes).with_slots(1);
     /// # let state = WorkerState {
+    /// #     id: 1,
+    /// #     class: "cpu".into(),
+    /// #     slots: 4,
+    /// #     budget: Resources::mem(100),
     /// #     reported_used: Resources::mem(30),
     /// #     reported_baseline: Resources::mem(10),
-    /// #     ..WorkerState::new(1, "cpu", 4, Resources::mem(100))
+    /// #     ..Default::default()
     /// # };
     /// # let view = WorkerView {
     /// #     state: &state,
@@ -150,16 +156,16 @@ impl WorkerView<'_> {
     /// For the worker of the [type-level example](WorkerView):
     ///
     /// ```
-    /// # use whelm::{Resources, SLOTS, WorkerState, WorkerView};
-    /// # let job = |bytes| {
-    /// #     let mut demand = Resources::mem(bytes);
-    /// #     demand[SLOTS] = 1;
-    /// #     demand
-    /// # };
+    /// # use whelm::{Resources, WorkerState, WorkerView};
+    /// # let job = |bytes| Resources::mem(bytes).with_slots(1);
     /// # let state = WorkerState {
+    /// #     id: 1,
+    /// #     class: "cpu".into(),
+    /// #     slots: 4,
+    /// #     budget: Resources::mem(100),
     /// #     reported_used: Resources::mem(30),
     /// #     reported_baseline: Resources::mem(10),
-    /// #     ..WorkerState::new(1, "cpu", 4, Resources::mem(100))
+    /// #     ..Default::default()
     /// # };
     /// # let view = WorkerView {
     /// #     state: &state,
@@ -185,16 +191,16 @@ impl WorkerView<'_> {
     /// For the worker of the [type-level example](WorkerView):
     ///
     /// ```
-    /// # use whelm::{Resources, SLOTS, WorkerState, WorkerView};
-    /// # let job = |bytes| {
-    /// #     let mut demand = Resources::mem(bytes);
-    /// #     demand[SLOTS] = 1;
-    /// #     demand
-    /// # };
+    /// # use whelm::{Resources, WorkerState, WorkerView};
+    /// # let job = |bytes| Resources::mem(bytes).with_slots(1);
     /// # let state = WorkerState {
+    /// #     id: 1,
+    /// #     class: "cpu".into(),
+    /// #     slots: 4,
+    /// #     budget: Resources::mem(100),
     /// #     reported_used: Resources::mem(30),
     /// #     reported_baseline: Resources::mem(10),
-    /// #     ..WorkerState::new(1, "cpu", 4, Resources::mem(100))
+    /// #     ..Default::default()
     /// # };
     /// # let view = WorkerView {
     /// #     state: &state,
@@ -222,16 +228,16 @@ impl WorkerView<'_> {
     /// For the worker of the [type-level example](WorkerView), 60 of 100 bytes in use:
     ///
     /// ```
-    /// # use whelm::{Resources, SLOTS, WorkerState, WorkerView};
-    /// # let job = |bytes| {
-    /// #     let mut demand = Resources::mem(bytes);
-    /// #     demand[SLOTS] = 1;
-    /// #     demand
-    /// # };
+    /// # use whelm::{Resources, WorkerState, WorkerView};
+    /// # let job = |bytes| Resources::mem(bytes).with_slots(1);
     /// # let state = WorkerState {
+    /// #     id: 1,
+    /// #     class: "cpu".into(),
+    /// #     slots: 4,
+    /// #     budget: Resources::mem(100),
     /// #     reported_used: Resources::mem(30),
     /// #     reported_baseline: Resources::mem(10),
-    /// #     ..WorkerState::new(1, "cpu", 4, Resources::mem(100))
+    /// #     ..Default::default()
     /// # };
     /// # let view = WorkerView {
     /// #     state: &state,
@@ -240,7 +246,12 @@ impl WorkerView<'_> {
     /// assert_eq!(view.free_share(&Resources::ZERO), 0.4);
     /// assert_eq!(view.free_share(&job(20)), 0.2);
     /// // A worker with no memory budget enforces no soft dimension.
-    /// let unknown = WorkerState::new(2, "cpu", 4, Resources::ZERO);
+    /// let unknown = WorkerState {
+    ///     id: 2,
+    ///     class: "cpu".into(),
+    ///     slots: 4,
+    ///     ..Default::default()
+    /// };
     /// let view = WorkerView {
     ///     state: &unknown,
     ///     placed: Resources::ZERO,
@@ -292,11 +303,24 @@ impl WorkerView<'_> {
 ///
 /// let mut s = Scheduler::with_admission(Config::fifo(), SlotsOnly);
 /// s.handle(
-///     Input::Worker(WorkerState::new(1, "cpu", 2, Resources::mem(100))),
+///     Input::Worker(WorkerState {
+///         id: 1,
+///         class: "cpu".into(),
+///         slots: 2,
+///         budget: Resources::mem(100),
+///         ..Default::default()
+///     }),
 ///     0.0,
 /// );
 /// for id in 0..3 {
-///     s.handle(Input::Submit(JobSpec::new(id, Resources::mem(80), 0)), 0.0);
+///     s.handle(
+///         Input::Submit(JobSpec {
+///             id,
+///             demand: Resources::mem(80),
+///             ..Default::default()
+///         }),
+///         0.0,
+///     );
 /// }
 /// assert_eq!(s.poll(0.0).len(), 2);
 /// assert!(s.explain(2).unwrap().contains("slots full on 1 worker(s)"));
@@ -338,14 +362,16 @@ pub trait Admission {
 /// not. Slots have no escape hatch, so a worker without slots takes nothing.
 ///
 /// ```
-/// use whelm::{Admission, ProductionAdmission, Resources, SLOTS, WorkerState, WorkerView};
+/// use whelm::{Admission, ProductionAdmission, Resources, WorkerState, WorkerView};
 ///
-/// let job = |bytes| {
-///     let mut demand = Resources::mem(bytes);
-///     demand[SLOTS] = 1;
-///     demand
+/// let job = |bytes| Resources::mem(bytes).with_slots(1);
+/// let state = WorkerState {
+///     id: 1,
+///     class: "cpu".into(),
+///     slots: 2,
+///     budget: Resources::mem(100),
+///     ..Default::default()
 /// };
-/// let state = WorkerState::new(1, "cpu", 2, Resources::mem(100));
 /// let view = |placed| WorkerView {
 ///     state: &state,
 ///     placed,
@@ -353,7 +379,13 @@ pub trait Admission {
 /// assert!(ProductionAdmission.admits(&job(1000), &view(Resources::ZERO)));
 /// assert!(!ProductionAdmission.admits(&job(1000), &view(job(1))));
 ///
-/// let no_slots = WorkerState::new(2, "cpu", 0, Resources::mem(100));
+/// let no_slots = WorkerState {
+///     id: 2,
+///     class: "cpu".into(),
+///     slots: 0,
+///     budget: Resources::mem(100),
+///     ..Default::default()
+/// };
 /// let view = WorkerView {
 ///     state: &no_slots,
 ///     placed: Resources::ZERO,
@@ -365,22 +397,21 @@ pub trait Admission {
 /// job, three jobs fit and a fourth does not, whatever their own (zero) device demands.
 ///
 /// ```
-/// # use whelm::{Admission, ProductionAdmission, Resources, SLOTS, WorkerState, WorkerView};
+/// # use whelm::{Admission, ProductionAdmission, Resources, WorkerState, WorkerView};
 /// let state = WorkerState {
+///     id: 1,
+///     class: "gpu".into(),
+///     slots: 8,
+///     budget: Resources::ZERO.with_dev(100),
 ///     per_task: Resources::ZERO.with_dev(30),
-///     ..WorkerState::new(1, "gpu", 8, Resources::ZERO.with_dev(100))
-/// };
-/// let slots = |n| {
-///     let mut r = Resources::ZERO;
-///     r[SLOTS] = n;
-///     r
+///     ..Default::default()
 /// };
 /// let admits_with = |running| {
 ///     let view = WorkerView {
 ///         state: &state,
-///         placed: slots(running),
+///         placed: Resources::ZERO.with_slots(running),
 ///     };
-///     ProductionAdmission.admits(&slots(1), &view)
+///     ProductionAdmission.admits(&Resources::ZERO.with_slots(1), &view)
 /// };
 /// assert!(admits_with(2));
 /// assert!(!admits_with(3));
@@ -401,12 +432,14 @@ impl Admission for ProductionAdmission {
     /// ```
     /// use whelm::{Admission, MEM, ProductionAdmission, Resources, SLOTS, WorkerState, WorkerView};
     ///
-    /// let job = |bytes| {
-    ///     let mut demand = Resources::mem(bytes);
-    ///     demand[SLOTS] = 1;
-    ///     demand
+    /// let job = |bytes| Resources::mem(bytes).with_slots(1);
+    /// let state = WorkerState {
+    ///     id: 1,
+    ///     class: "cpu".into(),
+    ///     slots: 2,
+    ///     budget: Resources::mem(100),
+    ///     ..Default::default()
     /// };
-    /// let state = WorkerState::new(1, "cpu", 2, Resources::mem(100));
     /// let view = |placed| WorkerView {
     ///     state: &state,
     ///     placed,
@@ -418,8 +451,7 @@ impl Admission for ProductionAdmission {
     /// let busy = ProductionAdmission.bound(&view(job(60))).unwrap();
     /// assert_eq!((busy[MEM], busy[SLOTS]), (40, 1));
     /// // Both slots taken: nothing is admitted.
-    /// let mut full = job(60);
-    /// full[SLOTS] = 2;
+    /// let full = Resources::mem(60).with_slots(2);
     /// assert_eq!(ProductionAdmission.bound(&view(full)), None);
     /// ```
     fn bound(&self, w: &WorkerView) -> Option<Resources> {
@@ -447,9 +479,12 @@ mod tests {
     /// A worker state with the given capacity and reported usage.
     fn worker(slots: usize, budget: u64, used: u64, baseline: u64) -> WorkerState {
         WorkerState {
+            id: 1,
+            slots,
+            budget: Resources::mem(budget),
             reported_used: Resources::mem(used),
             reported_baseline: Resources::mem(baseline),
-            ..WorkerState::new(1, "x", slots, Resources::mem(budget))
+            ..Default::default()
         }
     }
 
@@ -514,8 +549,11 @@ mod tests {
     fn one_rule_per_dimension() {
         let a = ProductionAdmission;
         let s = WorkerState {
+            id: 1,
+            slots: 8,
+            budget: Resources::mem(100).with_dev(100),
             per_task: Resources::mem(20).with_dev(30),
-            ..WorkerState::new(1, "x", 8, Resources::mem(100).with_dev(100))
+            ..Default::default()
         };
         let view = |running, placed| WorkerView {
             state: &s,
@@ -532,7 +570,11 @@ mod tests {
         assert_eq!(v.headroom(), [Some(40), Some(10), Some(5)]);
         assert_eq!(a.bound(&v), None);
         // A zero memory budget leaves its dimension unenforced; slots stay enforced.
-        let free = WorkerState::new(2, "x", 8, Resources::ZERO);
+        let free = WorkerState {
+            id: 2,
+            slots: 8,
+            ..Default::default()
+        };
         let v = WorkerView {
             state: &free,
             placed: with_running(Resources::mem(1 << 40), 7),
@@ -549,7 +591,12 @@ mod tests {
     /// enter it.
     #[test]
     fn free_share_is_the_bottleneck() {
-        let s = WorkerState::new(1, "x", 2, Resources::mem(100).with_dev(10));
+        let s = WorkerState {
+            id: 1,
+            slots: 2,
+            budget: Resources::mem(100).with_dev(10),
+            ..Default::default()
+        };
         let v = WorkerView {
             state: &s,
             placed: with_running(Resources::mem(50).with_dev(2), 1),

@@ -45,8 +45,8 @@ pub enum FailKind {
 ///
 /// ```
 /// use whelm::{
-///     Config, FailKind, GaveUp, Input, JobSpec, Output, Policy, Resources, RetryConfig,
-///     Scheduler, Tried, WorkerState,
+///     Config, FailKind, GaveUp, Input, JobSpec, Output, Policy, RetryConfig, Scheduler, Tried,
+///     WorkerState,
 /// };
 ///
 /// let config = Config {
@@ -55,10 +55,20 @@ pub enum FailKind {
 /// };
 /// let mut p = Scheduler::new(config);
 /// p.handle(
-///     Input::Worker(WorkerState::new(3, "cpu", 1, Resources::ZERO)),
+///     Input::Worker(WorkerState {
+///         id: 3,
+///         class: "cpu".into(),
+///         ..Default::default()
+///     }),
 ///     0.0,
 /// );
-/// p.handle(Input::Submit(JobSpec::new(1, Resources::ZERO, 0)), 0.0);
+/// p.handle(
+///     Input::Submit(JobSpec {
+///         id: 1,
+///         ..Default::default()
+///     }),
+///     0.0,
+/// );
 /// p.poll(0.0);
 /// p.handle(Input::WorkerGone(3), 1.0);
 /// let tried = Tried {
@@ -174,14 +184,25 @@ pub enum Input {
 /// A caller's dispatch over the outputs of one poll.
 ///
 /// ```
-/// use whelm::{Config, Input, JobSpec, Output, Policy, Resources, Scheduler, WorkerState};
+/// use whelm::{Config, Input, JobSpec, Output, Policy, Scheduler, WorkerState};
 ///
 /// let mut p = Scheduler::new(Config::default());
 /// p.handle(
-///     Input::Worker(WorkerState::new(1, "cpu", 2, Resources::ZERO)),
+///     Input::Worker(WorkerState {
+///         id: 1,
+///         class: "cpu".into(),
+///         slots: 2,
+///         ..Default::default()
+///     }),
 ///     0.0,
 /// );
-/// p.handle(Input::Submit(JobSpec::new(1, Resources::ZERO, 0)), 0.0);
+/// p.handle(
+///     Input::Submit(JobSpec {
+///         id: 1,
+///         ..Default::default()
+///     }),
+///     0.0,
+/// );
 /// let mut sent = Vec::new();
 /// for out in p.poll(0.0) {
 ///     match out {
@@ -262,8 +283,7 @@ pub enum Output {
 ///
 /// ```
 /// use whelm::{
-///     Config, Input, Instant, JobId, JobSpec, Output, Policy, PolicyStats, Resources, Scheduler,
-///     WorkerState,
+///     Config, Input, Instant, JobId, JobSpec, Output, Policy, PolicyStats, Scheduler, WorkerState,
 /// };
 ///
 /// /// Counts every start the inner policy emits.
@@ -304,11 +324,22 @@ pub enum Output {
 ///     starts: 0,
 /// };
 /// p.handle(
-///     Input::Worker(WorkerState::new(1, "cpu", 4, Resources::ZERO)),
+///     Input::Worker(WorkerState {
+///         id: 1,
+///         class: "cpu".into(),
+///         slots: 4,
+///         ..Default::default()
+///     }),
 ///     0.0,
 /// );
 /// for id in 1..=3 {
-///     p.handle(Input::Submit(JobSpec::new(id, Resources::ZERO, 0)), 0.0);
+///     p.handle(
+///         Input::Submit(JobSpec {
+///             id,
+///             ..Default::default()
+///         }),
+///         0.0,
+///     );
 /// }
 /// p.poll(0.0);
 /// assert_eq!(p.starts, 3);

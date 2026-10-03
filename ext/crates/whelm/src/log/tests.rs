@@ -21,9 +21,13 @@ fn config() -> Config {
 /// Worker `w`: 2 slots, 10 GB, worker 3 three times as fast.
 fn worker(w: WorkerId, used_gb: f64) -> WorkerState {
     WorkerState {
-        speed: if w == 3 { 3.0 } else { 1.0 },
+        id: w,
+        class: "x".into(),
+        slots: 2,
+        budget: Resources::mem_gb(10.0),
         reported_used: Resources::mem_gb(used_gb),
-        ..WorkerState::new(w, "x", 2, Resources::mem_gb(10.0))
+        speed: if w == 3 { 3.0 } else { 1.0 },
+        ..Default::default()
     }
 }
 
@@ -41,8 +45,13 @@ fn run(sink: impl EventSink + 'static) -> (usize, usize, usize) {
         let now = t as f64;
         if t < 120 && t % 3 == 0 {
             let i = (t / 3) as JobId;
-            let mut spec = JobSpec::new(i, Resources::mem_gb(1.0 + (i * 5 % 6) as f64), i / 8);
-            spec.work = Some(5.0 + (i * 7 % 11) as f64);
+            let spec = JobSpec {
+                id: i,
+                demand: Resources::mem_gb(1.0 + (i * 5 % 6) as f64),
+                group: i / 8,
+                work: Some(5.0 + (i * 7 % 11) as f64),
+                ..Default::default()
+            };
             p.annotate(i, TaskInfo::default());
             p.handle(Input::Submit(spec), now);
         }

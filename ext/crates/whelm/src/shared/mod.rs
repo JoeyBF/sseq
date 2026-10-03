@@ -14,8 +14,16 @@
 //! use whelm::{Config, JobSpec, Resources, Scheduler, SharedPolicy, WorkerState};
 //!
 //! let shared = Arc::new(SharedPolicy::new(Scheduler::new(Config::fifo()), || 0.0));
-//! shared.worker_update(WorkerState::new(1, "x", 1, Resources::mem_gb(8.0)));
-//! let job = |id| JobSpec::new(id, Resources::mem_gb(1.0), 0);
+//! shared.worker_update(WorkerState {
+//!     id: 1,
+//!     budget: Resources::mem_gb(8.0),
+//!     ..Default::default()
+//! });
+//! let job = |id| JobSpec {
+//!     id,
+//!     demand: Resources::mem_gb(1.0),
+//!     ..Default::default()
+//! };
 //!
 //! let first = shared.lease(job(1));
 //! let second = thread::spawn({
@@ -99,8 +107,16 @@ impl<P: Policy> SharedPolicy<P> {
     ///     move || *time.lock().unwrap()
     /// };
     /// let shared = Arc::new(SharedPolicy::new(Scheduler::new(Config::default()), clock));
-    /// shared.worker_update(WorkerState::new(1, "x", 1, Resources::mem_gb(8.0)));
-    /// let job = |id| JobSpec::new(id, Resources::mem_gb(1.0), 0);
+    /// shared.worker_update(WorkerState {
+    ///     id: 1,
+    ///     budget: Resources::mem_gb(8.0),
+    ///     ..Default::default()
+    /// });
+    /// let job = |id| JobSpec {
+    ///     id,
+    ///     demand: Resources::mem_gb(1.0),
+    ///     ..Default::default()
+    /// };
     ///
     /// let first = shared.lease(job(1));
     /// let second = thread::spawn({
@@ -140,8 +156,17 @@ impl<P: Policy> SharedPolicy<P> {
     /// use whelm::{Config, JobSpec, Resources, Scheduler, SharedPolicy, WorkerState};
     ///
     /// let shared = SharedPolicy::with_system_clock(Scheduler::new(Config::default()));
-    /// shared.worker_update(WorkerState::new(1, "x", 4, Resources::mem_gb(8.0)));
-    /// let lease = shared.lease(JobSpec::new(1, Resources::mem_gb(1.0), 0));
+    /// shared.worker_update(WorkerState {
+    ///     id: 1,
+    ///     slots: 4,
+    ///     budget: Resources::mem_gb(8.0),
+    ///     ..Default::default()
+    /// });
+    /// let lease = shared.lease(JobSpec {
+    ///     id: 1,
+    ///     demand: Resources::mem_gb(1.0),
+    ///     ..Default::default()
+    /// });
     /// assert!(lease.waited() >= 0.0);
     /// lease.complete();
     /// ```
@@ -158,8 +183,16 @@ impl<P: Policy> SharedPolicy<P> {
     /// use whelm::{Config, JobSpec, Resources, Scheduler, SharedPolicy, WorkerState};
     ///
     /// let shared = SharedPolicy::new(Scheduler::new(Config::default()), || 0.0);
-    /// shared.worker_update(WorkerState::new(1, "x", 1, Resources::mem_gb(8.0)));
-    /// let lease = shared.lease(JobSpec::new(1, Resources::mem_gb(1.0), 0));
+    /// shared.worker_update(WorkerState {
+    ///     id: 1,
+    ///     budget: Resources::mem_gb(8.0),
+    ///     ..Default::default()
+    /// });
+    /// let lease = shared.lease(JobSpec {
+    ///     id: 1,
+    ///     demand: Resources::mem_gb(1.0),
+    ///     ..Default::default()
+    /// });
     /// assert_eq!((lease.worker(), lease.attempt()), (1, 1));
     /// assert_eq!(shared.stats().running, 1);
     /// drop(lease);
@@ -185,7 +218,11 @@ impl<P: Policy> SharedPolicy<P> {
     /// use whelm::{Config, JobSpec, Resources, Scheduler, SharedPolicy};
     ///
     /// let shared = SharedPolicy::new(Scheduler::new(Config::default()), || 0.0);
-    /// let job = JobSpec::new(1, Resources::mem_gb(1.0), 0);
+    /// let job = JobSpec {
+    ///     id: 1,
+    ///     demand: Resources::mem_gb(1.0),
+    ///     ..Default::default()
+    /// };
     /// let back = shared
     ///     .lease_timeout(job, Duration::from_millis(10))
     ///     .err()
@@ -214,7 +251,11 @@ impl<P: Policy> SharedPolicy<P> {
     /// let task = thread::spawn({
     ///     let shared = shared.clone();
     ///     move || {
-    ///         let lease = shared.lease(JobSpec::new(1, Resources::mem_gb(1.0), 0));
+    ///         let lease = shared.lease(JobSpec {
+    ///             id: 1,
+    ///             demand: Resources::mem_gb(1.0),
+    ///             ..Default::default()
+    ///         });
     ///         let worker = lease.worker();
     ///         lease.complete();
     ///         worker
@@ -223,7 +264,11 @@ impl<P: Policy> SharedPolicy<P> {
     /// while shared.waiting() == 0 {
     ///     thread::yield_now();
     /// }
-    /// shared.worker_update(WorkerState::new(5, "x", 1, Resources::mem_gb(8.0)));
+    /// shared.worker_update(WorkerState {
+    ///     id: 5,
+    ///     budget: Resources::mem_gb(8.0),
+    ///     ..Default::default()
+    /// });
     /// assert_eq!(task.join().unwrap(), 5);
     /// ```
     pub fn worker_update(&self, w: WorkerState) {
@@ -242,9 +287,17 @@ impl<P: Policy> SharedPolicy<P> {
     ///
     /// let shared = SharedPolicy::new(Scheduler::new(Config::fifo()), || 0.0);
     /// for w in [1, 2] {
-    ///     shared.worker_update(WorkerState::new(w, "x", 1, Resources::mem_gb(8.0)));
+    ///     shared.worker_update(WorkerState {
+    ///         id: w,
+    ///         budget: Resources::mem_gb(8.0),
+    ///         ..Default::default()
+    ///     });
     /// }
-    /// let lease = shared.lease(JobSpec::new(7, Resources::mem_gb(1.0), 0));
+    /// let lease = shared.lease(JobSpec {
+    ///     id: 7,
+    ///     demand: Resources::mem_gb(1.0),
+    ///     ..Default::default()
+    /// });
     /// assert_eq!(lease.worker(), 1);
     /// assert_eq!(shared.worker_gone(1), [7]);
     /// // The thread learns of it from its own link, and gets the retry the policy already made.
@@ -301,13 +354,26 @@ impl<P: Policy> SharedPolicy<P> {
     ///     move || *time.lock().unwrap()
     /// };
     /// let shared = Arc::new(SharedPolicy::new(Scheduler::new(Config::default()), clock));
-    /// shared.worker_update(WorkerState::new(1, "x", 4, Resources::mem_gb(8.0)));
-    /// let first = shared.lease(JobSpec::new(1, Resources::mem_gb(4.0), 0));
+    /// shared.worker_update(WorkerState {
+    ///     id: 1,
+    ///     slots: 4,
+    ///     budget: Resources::mem_gb(8.0),
+    ///     ..Default::default()
+    /// });
+    /// let first = shared.lease(JobSpec {
+    ///     id: 1,
+    ///     demand: Resources::mem_gb(4.0),
+    ///     ..Default::default()
+    /// });
     /// let big = thread::spawn({
     ///     let shared = shared.clone();
     ///     move || {
     ///         shared
-    ///             .lease(JobSpec::new(2, Resources::mem_gb(6.0), 0))
+    ///             .lease(JobSpec {
+    ///                 id: 2,
+    ///                 demand: Resources::mem_gb(6.0),
+    ///                 ..Default::default()
+    ///             })
     ///             .complete()
     ///     }
     /// });
@@ -350,8 +416,16 @@ impl<P: Policy> SharedPolicy<P> {
     /// use whelm::{Config, Input, JobSpec, Policy, Resources, Scheduler, SharedPolicy};
     ///
     /// let shared = SharedPolicy::new(Scheduler::new(Config::default()), || 0.0);
-    /// shared.worker_update(whelm::WorkerState::new(1, "x", 1, Resources::mem_gb(8.0)));
-    /// let job = JobSpec::new(1, Resources::mem_gb(1.0), 0);
+    /// shared.worker_update(whelm::WorkerState {
+    ///     id: 1,
+    ///     budget: Resources::mem_gb(8.0),
+    ///     ..Default::default()
+    /// });
+    /// let job = JobSpec {
+    ///     id: 1,
+    ///     demand: Resources::mem_gb(1.0),
+    ///     ..Default::default()
+    /// };
     /// shared.with(|p, now| p.handle(Input::Submit(job), now));
     /// let stats = shared.stats();
     /// assert_eq!((stats.placements_total, stats.running), (1, 0));
@@ -396,11 +470,17 @@ impl<P: Policy + Send + 'static> SharedPolicy<P> {
     /// #     move || *time.lock().unwrap()
     /// # };
     /// # let shared = Arc::new(SharedPolicy::new(Scheduler::new(Config::default()), clock));
-    /// # shared.worker_update(WorkerState::new(1, "x", 4, Resources::mem_gb(8.0)));
-    /// # let first = shared.lease(JobSpec::new(1, Resources::mem_gb(4.0), 0));
+    /// # let job = |id, gb| JobSpec { id, demand: Resources::mem_gb(gb), ..Default::default() };
+    /// # shared.worker_update(WorkerState {
+    /// #     id: 1,
+    /// #     slots: 4,
+    /// #     budget: Resources::mem_gb(8.0),
+    /// #     ..Default::default()
+    /// # });
+    /// # let first = shared.lease(job(1, 4.0));
     /// # let big = thread::spawn({
     /// #     let shared = shared.clone();
-    /// #     move || shared.lease(JobSpec::new(2, Resources::mem_gb(6.0), 0)).complete()
+    /// #     move || shared.lease(job(2, 6.0)).complete()
     /// # });
     /// # while shared.waiting() == 0 {
     /// #     thread::yield_now();

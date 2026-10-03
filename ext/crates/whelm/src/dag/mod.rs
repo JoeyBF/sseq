@@ -61,7 +61,7 @@
 //!
 //! # Resuming and closing
 //!
-//! A unit declared with leaves already complete ([`Unit::with_completed`]) runs only the rest, so
+//! A unit declared with leaves already complete ([`Unit::completed`]) runs only the rest, so
 //! a run restarted from a checkpoint redoes nothing. [`DagScheduler::close`] completes a unit early
 //! when its remaining jobs are known to be no-ops, and [`DagScheduler::cancel`] removes a unit and
 //! everything depending on it.
@@ -82,38 +82,44 @@
 //! use std::sync::Arc;
 //!
 //! use whelm::{
-//!     Config, DagConfig, DagScheduler, DagTemplate, Input, Output, Policy, Resources, Scheduler,
-//!     TemplateNode, Unit, WorkerState,
+//!     Config, DagConfig, DagScheduler, Input, Output, Policy, Scheduler, TemplateNode,
+//!     TemplateSpec, Unit, WorkerState,
 //! };
 //!
 //! // Node 0 loads (on the caller), nodes 1 and 2 compute after it.
-//! let template = Arc::new(
-//!     DagTemplate::with_nodes(
-//!         vec![
-//!             TemplateNode::Local(1.0),
-//!             TemplateNode::Job(2.0),
-//!             TemplateNode::Job(2.0),
-//!         ],
-//!         [(0, 1), (0, 2)],
-//!     )
-//!     .unwrap(),
-//! );
-//! let spec = whelm::JobSpec::new(0, Resources::mem(1), 0);
+//! let template = TemplateSpec {
+//!     nodes: vec![
+//!         TemplateNode::Local(1.0),
+//!         TemplateNode::Job(2.0),
+//!         TemplateNode::Job(2.0),
+//!     ],
+//!     edges: vec![(0, 1), (0, 2)],
+//! };
+//! let template = Arc::new(template.build().unwrap());
 //! let mut dag = DagScheduler::new(DagConfig::default(), Scheduler::new(Config::fifo()));
 //! dag.handle(
-//!     Input::Worker(WorkerState::new(1, "cpu", 1, Resources::mem(100))),
+//!     Input::Worker(WorkerState {
+//!         id: 1,
+//!         ..Default::default()
+//!     }),
 //!     0.0,
 //! );
 //!
 //! // Unit 1000 has jobs 0..3, unit 2000 jobs 10..13 and waits for unit 1000.
-//! dag.declare(
-//!     [
-//!         Unit::new(1000, 0, template.clone(), spec.clone(), vec![]),
-//!         Unit::new(2000, 10, template, spec, vec![1000]),
-//!     ],
-//!     0.0,
-//! )
-//! .unwrap();
+//! let first = Unit {
+//!     id: 1000,
+//!     base: 0,
+//!     template: template.clone(),
+//!     ..Default::default()
+//! };
+//! let second = Unit {
+//!     id: 2000,
+//!     base: 10,
+//!     template,
+//!     deps: vec![1000],
+//!     ..Default::default()
+//! };
+//! dag.declare([first, second], 0.0).unwrap();
 //! // Ranks run through both units: 1 + 2 in each.
 //! assert_eq!(
 //!     (dag.rank(0), dag.rank(1), dag.rank(10)),
@@ -164,7 +170,7 @@ use frame::{Frame, Work};
 pub use report::DagStats;
 #[cfg(feature = "serde")]
 pub use snapshot::DagSnapshot;
-pub use template::{DagTemplate, TemplateNode};
+pub use template::{DagTemplate, TemplateNode, TemplateSpec};
 pub use unit::{DagJob, NodeSource, Unit};
 
 /// The scheduler's [`NodeSource`], opaque to `Debug`.
@@ -226,7 +232,10 @@ impl UnitRec {
             closed: false,
             sourced: false,
             template: None,
-            spec: JobSpec::new(id, crate::Resources::ZERO, 0),
+            spec: JobSpec {
+                id,
+                ..Default::default()
+            },
             scale: 0.0,
             span: 0.0,
             tail: 0.0,
@@ -305,7 +314,7 @@ impl Loc {
 /// ```
 /// use whelm::{
 ///     Config, DagConfig, DagJob, DagScheduler, FailKind, GaveUp, Input, JobSpec, Output, Policy,
-///     Resources, RetryConfig, Scheduler, WorkerState,
+///     RetryConfig, Scheduler, WorkerState,
 /// };
 ///
 /// let config = Config {
@@ -314,10 +323,20 @@ impl Loc {
 /// };
 /// let mut dag = DagScheduler::new(DagConfig::default(), Scheduler::new(config));
 /// dag.handle(
-///     Input::Worker(WorkerState::new(1, "cpu", 1, Resources::mem(100))),
+///     Input::Worker(WorkerState {
+///         id: 1,
+///         ..Default::default()
+///     }),
 ///     0.0,
 /// );
-/// let job = |id, deps| DagJob::new(JobSpec::new(id, Resources::mem(1), 0), deps);
+/// let job = |id, deps| DagJob {
+///     spec: JobSpec {
+///         id,
+///         ..Default::default()
+///     },
+///     deps,
+///     ..Default::default()
+/// };
 /// dag.declare([job(1, vec![]), job(2, vec![1])], 0.0).unwrap();
 /// assert_eq!(
 ///     dag.poll(0.0),
@@ -402,13 +421,20 @@ impl<P: Policy> DagScheduler<P> {
     ///
     /// ```
     /// # use whelm::{Config, DagConfig, DagScheduler, Input, JobSpec, Output, Policy,
-    /// #     Resources, Scheduler, WorkerState};
+    /// #     Scheduler, WorkerState};
     /// let mut dag = DagScheduler::new(DagConfig::default(), Scheduler::new(Config::fifo()));
     /// dag.handle(
-    ///     Input::Worker(WorkerState::new(1, "cpu", 1, Resources::mem(100))),
+    ///     Input::Worker(WorkerState {
+    ///         id: 1,
+    ///         ..Default::default()
+    ///     }),
     ///     0.0,
     /// );
-    /// dag.handle(Input::Submit(JobSpec::new(7, Resources::mem(1), 0)), 0.0);
+    /// let job = JobSpec {
+    ///     id: 7,
+    ///     ..Default::default()
+    /// };
+    /// dag.handle(Input::Submit(job), 0.0);
     /// assert_eq!(
     ///     dag.poll(0.0),
     ///     vec![Output::Start {
@@ -441,7 +467,7 @@ impl<P: Policy> DagScheduler<P> {
         }
     }
 
-    /// This scheduler, describing [`sourced`](Unit::sourced) units' leaves with `source`.
+    /// This scheduler, describing [`sourced`](field@Unit::sourced) units' leaves with `source`.
     ///
     /// Declaring a sourced unit without one panics. See [`NodeSource`] for an example.
     pub fn with_source(mut self, source: Arc<dyn NodeSource>) -> Self {
@@ -456,10 +482,14 @@ impl<P: Policy> DagScheduler<P> {
     ///
     /// ```
     /// # use whelm::{Config, DagConfig, DagJob, DagScheduler, Input, JobSpec, Output, Policy,
-    /// #     Resources, Scheduler, WorkerState};
+    /// #     Scheduler, WorkerState};
     /// # let mut dag = DagScheduler::new(DagConfig::default(), Scheduler::new(Config::fifo()));
-    /// # dag.handle(Input::Worker(WorkerState::new(1, "cpu", 1, Resources::mem(100))), 0.0);
-    /// # let job = |id, deps| DagJob::new(JobSpec::new(id, Resources::mem(1), 0), deps);
+    /// # dag.handle(Input::Worker(WorkerState { id: 1, ..Default::default() }), 0.0);
+    /// # let job = |id, deps| DagJob {
+    /// #     spec: JobSpec { id, ..Default::default() },
+    /// #     deps,
+    /// #     ..Default::default()
+    /// # };
     /// dag.declare([job(1, vec![]), job(2, vec![1])], 0.0).unwrap();
     /// assert_eq!(dag.policy().stats().waiting, 1);
     /// ```

@@ -1,8 +1,8 @@
 //! Reservation edge cases: holder cancelled, worker loss and join, heartbeats.
 
 use whelm::{
-    Config, Input, JobId, JobSpec, Output, Policy, Reservations, Resources, Scheduler, WorkerId,
-    WorkerState,
+    Config, Constraint, Input, JobId, JobSpec, Output, Policy, Reservations, Resources, Scheduler,
+    WorkerId, WorkerState,
 };
 
 /// The `(job, worker)` of each start in `out`.
@@ -23,14 +23,23 @@ fn done(job: JobId) -> Input {
 /// A worker of class "x" with the given reported usage.
 fn worker(id: u64, slots: usize, budget: u64, used: u64) -> WorkerState {
     WorkerState {
+        id,
+        class: "x".into(),
+        slots,
+        budget: Resources::mem(budget),
         reported_used: Resources::mem(used),
-        ..WorkerState::new(id, "x", slots, Resources::mem(budget))
+        ..Default::default()
     }
 }
 
 /// A job with the given demand and group.
 fn job(id: u64, demand: u64, group: u64) -> JobSpec {
-    JobSpec::new(id, Resources::mem(demand), group)
+    JobSpec {
+        id,
+        demand: Resources::mem(demand),
+        group,
+        ..Default::default()
+    }
 }
 
 /// Two workers (budget 100, 4 slots) each running one 60-unit job; a 50-unit job (group 0, the
@@ -193,8 +202,11 @@ fn more_urgent_job_cannot_take_a_reserved_worker() {
     let mut p = starving();
     let w = reserved_worker(&p);
     // An explicitly urgent small job still may not use the reserved worker.
-    let mut urgent = job(30, 5, 9).prefer_worker(w);
-    urgent.priority = Some(-10);
+    let urgent = JobSpec {
+        priority: Some(-10),
+        constraints: vec![Constraint::prefer_worker(w)],
+        ..job(30, 5, 9)
+    };
     p.handle(Input::Submit(urgent), 63.0);
     let out = starts(p.poll(63.0));
     assert_eq!(out.len(), 1);
@@ -213,7 +225,13 @@ fn per_class_reservations() {
     });
     for (id, class) in [(1, "a"), (2, "a"), (3, "b"), (4, "b")] {
         p.handle(
-            Input::Worker(WorkerState::new(id, class, 4, Resources::mem(100))),
+            Input::Worker(WorkerState {
+                id,
+                class: class.into(),
+                slots: 4,
+                budget: Resources::mem(100),
+                ..Default::default()
+            }),
             0.0,
         );
     }
