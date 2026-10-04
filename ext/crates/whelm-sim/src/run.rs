@@ -598,7 +598,7 @@ pub fn simulate(setup: &SimSetup, name: &str, policy: BoxPolicy) -> Metrics {
             last_explain = t;
             eprintln!(
                 "[{name} t={t:.0}] {}",
-                driver.policy().explain(j as u64).unwrap_or_default()
+                (driver.policy().explain(j as u64)).map_or_else(String::new, |e| e.to_string())
             );
         }
     }
