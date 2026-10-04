@@ -7,7 +7,8 @@ use std::{
 
 use serde::Serialize;
 use whelm::{
-    DagConfig, DagJob, DagScheduler, Input, JobSpec, Output, Policy, Resources, Time, WorkerState,
+    DagConfig, DagJob, DagScheduler, Input, JobSpec, MEMORY, Output, Policy, Resources, SLOTS,
+    Time, WorkerState, gb,
 };
 
 use crate::{
@@ -273,7 +274,7 @@ fn spec(setup: &SimSetup, j: usize) -> JobSpec {
     let t = &trace.tasks[j];
     JobSpec {
         id: j as u64,
-        demand: Resources::mem_gb(t.est_gb * setup.est_scale),
+        demand: Resources::new().with(MEMORY, gb(t.est_gb * setup.est_scale)),
         group: t.group,
         work: Some(Duration::from_secs_f64(work[j])),
         ..Default::default()
@@ -447,12 +448,14 @@ pub fn simulate(setup: &SimSetup, name: &str, policy: BoxPolicy) -> Metrics {
             _ => baseline,
         };
         WorkerState {
-            reported_used: Resources::mem_gb(rss),
-            reported_baseline: Resources::mem_gb(baseline),
+            reported_used: Resources::new().with(MEMORY, gb(rss)),
+            reported_baseline: Resources::new().with(MEMORY, gb(baseline)),
             speed: setup.model.throughput(&tw.class, 1),
             id: w as u64,
             class: tw.class.clone(),
-            capacity: Resources::mem_gb(tw.budget_gb).with_slots(tw.slots as u64),
+            capacity: Resources::new()
+                .with(MEMORY, gb(tw.budget_gb))
+                .with(SLOTS, tw.slots as u64),
             ..Default::default()
         }
     };
@@ -572,6 +575,7 @@ pub fn simulate(setup: &SimSetup, name: &str, policy: BoxPolicy) -> Metrics {
                     queue.push(t + gaps[job as usize], Ev::Arrive(job as usize));
                 }
                 Output::GaveUp(g) => unreachable!("job {} failed, but no attempt fails", g.job),
+                Output::Rejected { job, reason } => unreachable!("job {job} rejected: {reason}"),
                 Output::RunLocal { .. } | Output::Passed { .. } => {}
             }
         }

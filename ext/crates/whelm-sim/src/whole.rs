@@ -10,8 +10,8 @@ use std::{
 use serde::Serialize;
 use whelm::{
     Config, Constraint, DagConfig, DagJob, DagScheduler, DagTemplate, GroupOrder, Input, JobId,
-    JobSpec, NodeSource, OrderTerm, Output, Policy, Resources, Scheduler, Selector, Strength, Time,
-    Unit, WorkerState,
+    JobSpec, MEMORY, NodeSource, OrderTerm, Output, Policy, Resources, SLOTS, Scheduler, Selector,
+    Strength, Time, Unit, WorkerState,
 };
 
 use crate::{
@@ -1429,7 +1429,9 @@ pub fn simulate(
             let state = WorkerState {
                 id,
                 class: class.clone(),
-                capacity: Resources::mem(1 << 60).with_slots(*slots as u64),
+                capacity: Resources::new()
+                    .with(MEMORY, 1 << 60)
+                    .with(SLOTS, *slots as u64),
                 speed: if place.speed.learned() {
                     1.0
                 } else {
@@ -1620,6 +1622,7 @@ pub fn simulate(
                 }
                 Output::Ready { .. } | Output::Passed { .. } => carry.push(o),
                 Output::GaveUp(g) => unreachable!("job {} failed, but no attempt fails", g.job),
+                Output::Rejected { job, reason } => unreachable!("job {job} rejected: {reason}"),
                 Output::RunLocal { .. } => {}
             }
         }

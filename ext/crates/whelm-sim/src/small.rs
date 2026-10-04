@@ -4,8 +4,8 @@ use std::{collections::HashMap, time::Duration};
 
 use serde::Serialize;
 use whelm::{
-    Attempt, Config, DagConfig, DagJob, DagScheduler, Input, JobSpec, OrderTerm, Output, Policy,
-    Resources, Scheduler, Time, WorkerState,
+    Attempt, Config, DagConfig, DagJob, DagScheduler, Input, JobSpec, MEMORY, OrderTerm, Output,
+    Policy, Resources, SLOTS, Scheduler, Time, WorkerState,
 };
 
 use crate::{
@@ -217,7 +217,9 @@ pub fn simulate_small(inst: &SmallInstance, plan: &SmallPlan) -> SmallResult {
             let state = WorkerState {
                 id,
                 class: c.name.clone(),
-                capacity: Resources::mem(1 << 60).with_slots(c.slots.into()),
+                capacity: Resources::new()
+                    .with(MEMORY, 1 << 60)
+                    .with(SLOTS, c.slots.into()),
                 speed: if plan.speed.learned() { 1.0 } else { c.speed },
                 ..Default::default()
             };
@@ -304,6 +306,7 @@ pub fn simulate_small(inst: &SmallInstance, plan: &SmallPlan) -> SmallResult {
                     live.remove(&(job as usize, attempt));
                 }
                 Output::GaveUp(g) => unreachable!("job {} failed, but no attempt fails", g.job),
+                Output::Rejected { job, reason } => unreachable!("job {job} rejected: {reason}"),
                 Output::RunLocal { .. } | Output::Ready { .. } | Output::Passed { .. } => {}
             }
         }

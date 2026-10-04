@@ -4,7 +4,8 @@ use std::time::Duration;
 
 use serde::Serialize;
 use whelm::{
-    Config, Input, JobId, JobSpec, Output, Policy, Resources, Scheduler, Time, WorkerState,
+    Config, DEVICE_MEMORY, Input, JobId, JobSpec, MEMORY, Output, Policy, Resources, SLOTS,
+    Scheduler, Time, WorkerState, gb,
 };
 
 use crate::engine::{PsWorker, Queue, Run};
@@ -142,10 +143,11 @@ pub fn simulate_device(sc: &DeviceScenario, arm: DeviceArm) -> DeviceMetrics {
         let state = WorkerState {
             id: w as u64,
             class: "small".into(),
-            capacity: Resources::mem_gb(1e6)
-                .with_dev_gb(cap)
-                .with_slots(sc.slots as u64),
-            per_task: Resources::ZERO.with_dev((per_task * 1e9).round() as u64),
+            capacity: Resources::new()
+                .with(MEMORY, gb(1e6))
+                .with(DEVICE_MEMORY, gb(cap))
+                .with(SLOTS, sc.slots as u64),
+            per_task: Resources::new().with(DEVICE_MEMORY, (per_task * 1e9).round() as u64),
             ..Default::default()
         };
         p.handle(Input::Worker(state), Time::ORIGIN);
@@ -159,7 +161,9 @@ pub fn simulate_device(sc: &DeviceScenario, arm: DeviceArm) -> DeviceMetrics {
         };
         let spec = JobSpec {
             id: j as JobId,
-            demand: Resources::mem(1).with_dev_gb(est),
+            demand: Resources::new()
+                .with(MEMORY, 1)
+                .with(DEVICE_MEMORY, gb(est)),
             ..Default::default()
         };
         p.handle(Input::Submit(spec), Time::ORIGIN);
@@ -205,6 +209,7 @@ pub fn simulate_device(sc: &DeviceScenario, arm: DeviceArm) -> DeviceMetrics {
                     worker,
                 } => (job, attempt, worker as usize, false),
                 Output::GaveUp(g) => unreachable!("job {} failed, but no attempt fails", g.job),
+                Output::Rejected { job, reason } => unreachable!("job {job} rejected: {reason}"),
                 _ => continue,
             };
             if !touched.contains(&w) {

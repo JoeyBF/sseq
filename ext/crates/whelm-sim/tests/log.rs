@@ -6,8 +6,8 @@ use std::{
 };
 
 use whelm::{
-    Attempt, Config, EventSink, Input, JobId, JobSpec, Output, Policy, Resources, Scheduler, Time,
-    WorkerState,
+    Attempt, Config, EventSink, Input, JobId, JobSpec, MEMORY, Output, Policy, Resources, SLOTS,
+    Scheduler, Time, WorkerState, gb,
     log::{Event, JsonlSink, Logged, TaskInfo},
 };
 use whelm_sim::{
@@ -19,7 +19,7 @@ use whelm_sim::{
 /// Workers in the logged run.
 const WORKERS: u64 = 3;
 /// Slots per worker.
-const SLOTS: usize = 2;
+const WORKER_SLOTS: usize = 2;
 /// Memory budget per worker.
 const BUDGET_GB: f64 = 10.0;
 /// Jobs in the logged run.
@@ -73,7 +73,9 @@ fn run(sink: impl EventSink + 'static) {
     let state = |w: u64| WorkerState {
         id: w,
         class: "h200".into(),
-        capacity: Resources::mem_gb(BUDGET_GB).with_slots(SLOTS as u64),
+        capacity: Resources::new()
+            .with(MEMORY, gb(BUDGET_GB))
+            .with(SLOTS, WORKER_SLOTS as u64),
         ..Default::default()
     };
     // Completions: (time, job, attempt).
@@ -116,7 +118,7 @@ fn run(sink: impl EventSink + 'static) {
             next_arrival += 1;
             let spec = JobSpec {
                 id,
-                demand: Resources::mem_gb(job(id).2),
+                demand: Resources::new().with(MEMORY, gb(job(id).2)),
                 group: id / 10,
                 work: Some(Duration::from_secs_f64(job(id).1)),
                 ..Default::default()
@@ -164,7 +166,7 @@ fn logged_run_replays_exactly() {
     for w in &trace.workers {
         assert_eq!(
             (w.class.as_str(), w.slots, w.budget_gb),
-            ("h200", SLOTS, BUDGET_GB)
+            ("h200", WORKER_SLOTS, BUDGET_GB)
         );
     }
     for t in &trace.tasks {

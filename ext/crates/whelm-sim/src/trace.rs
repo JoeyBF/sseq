@@ -3,7 +3,7 @@
 use std::{collections::HashMap, io::BufRead, path::Path};
 
 use serde::Deserialize;
-use whelm::{Attempt, Input, Output, ResourceId, Time, log::TaskInfo};
+use whelm::{Attempt, GaveUp, Input, MEMORY, Output, SLOTS, Time, log::TaskInfo};
 
 /// A worker of the trace.
 #[derive(Clone, Debug)]
@@ -226,14 +226,14 @@ impl Trace {
                         let i = index(&mut t, &w.id.to_string());
                         let tw = &mut t.workers[i];
                         tw.class = w.class;
-                        tw.budget_gb = w.capacity[ResourceId::MEM] as f64 / 1e9;
-                        tw.slots = w.capacity[ResourceId::SLOTS] as usize;
+                        tw.budget_gb = w.capacity.get(MEMORY) as f64 / 1e9;
+                        tw.slots = w.capacity.get(SLOTS) as usize;
                     }
                     Input::Submit(spec) => {
                         // A duplicate submission of a live job is ignored by the policy too.
                         pending.entry(spec.id).or_insert(Pending {
                             ready_s: at.0.as_secs_f64(),
-                            est_gb: spec.demand[ResourceId::MEM] as f64 / 1e9,
+                            est_gb: spec.demand.get(MEMORY) as f64 / 1e9,
                             group: spec.group,
                             info,
                             starts: Vec::new(),
@@ -298,8 +298,8 @@ impl Trace {
                                     p.starts.push((attempt, placed_s, worker.to_string()));
                                 }
                             }
-                            Output::GaveUp(g) => {
-                                pending.remove(&g.job);
+                            Output::GaveUp(GaveUp { job, .. }) | Output::Rejected { job, .. } => {
+                                pending.remove(&job);
                             }
                             _ => {}
                         }
@@ -462,7 +462,7 @@ impl Trace {
 mod tests {
     use std::time::Duration;
 
-    use whelm::{FailKind, GaveUp, JobSpec, Resources, WorkerState, log::Event};
+    use whelm::{FailKind, JobSpec, Resources, WorkerState, gb, log::Event};
 
     use super::*;
 
@@ -521,13 +521,13 @@ mod tests {
         let worker = |id| WorkerState {
             id,
             class: "l40s".into(),
-            capacity: Resources::mem_gb(50.0).with_slots(8),
+            capacity: Resources::new().with(MEMORY, gb(50.0)).with(SLOTS, 8),
             ..Default::default()
         };
         let submit = |id| {
             Input::Submit(JobSpec {
                 id,
-                demand: Resources::mem_gb(1.5),
+                demand: Resources::new().with(MEMORY, gb(1.5)),
                 group: 9,
                 ..Default::default()
             })
