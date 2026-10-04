@@ -1429,8 +1429,7 @@ pub fn simulate(
             let state = WorkerState {
                 id,
                 class: class.clone(),
-                slots: *slots,
-                budget: Resources::mem(1 << 60),
+                capacity: Resources::mem(1 << 60).with_slots(*slots as u64),
                 speed: if place.speed.learned() {
                     1.0
                 } else {

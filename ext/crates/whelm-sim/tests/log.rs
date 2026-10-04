@@ -73,8 +73,7 @@ fn run(sink: impl EventSink + 'static) {
     let state = |w: u64| WorkerState {
         id: w,
         class: "h200".into(),
-        slots: SLOTS,
-        budget: Resources::mem_gb(BUDGET_GB),
+        capacity: Resources::mem_gb(BUDGET_GB).with_slots(SLOTS as u64),
         ..Default::default()
     };
     // Completions: (time, job, attempt).

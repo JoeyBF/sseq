@@ -452,8 +452,7 @@ pub fn simulate(setup: &SimSetup, name: &str, policy: BoxPolicy) -> Metrics {
             speed: setup.model.throughput(&tw.class, 1),
             id: w as u64,
             class: tw.class.clone(),
-            slots: tw.slots,
-            budget: Resources::mem_gb(tw.budget_gb),
+            capacity: Resources::mem_gb(tw.budget_gb).with_slots(tw.slots as u64),
             ..Default::default()
         }
     };

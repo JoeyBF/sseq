@@ -217,8 +217,7 @@ pub fn simulate_small(inst: &SmallInstance, plan: &SmallPlan) -> SmallResult {
             let state = WorkerState {
                 id,
                 class: c.name.clone(),
-                slots: c.slots as usize,
-                budget: Resources::mem(1 << 60),
+                capacity: Resources::mem(1 << 60).with_slots(c.slots.into()),
                 speed: if plan.speed.learned() { 1.0 } else { c.speed },
                 ..Default::default()
             };

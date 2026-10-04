@@ -142,8 +142,9 @@ pub fn simulate_device(sc: &DeviceScenario, arm: DeviceArm) -> DeviceMetrics {
         let state = WorkerState {
             id: w as u64,
             class: "small".into(),
-            slots: sc.slots,
-            budget: Resources::mem_gb(1e6).with_dev_gb(cap),
+            capacity: Resources::mem_gb(1e6)
+                .with_dev_gb(cap)
+                .with_slots(sc.slots as u64),
             per_task: Resources::ZERO.with_dev((per_task * 1e9).round() as u64),
             ..Default::default()
         };

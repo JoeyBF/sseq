@@ -3,7 +3,7 @@
 use std::{collections::HashMap, io::BufRead, path::Path};
 
 use serde::Deserialize;
-use whelm::{Attempt, Input, MEM, Output, Time, log::TaskInfo};
+use whelm::{Attempt, Input, Output, ResourceId, Time, log::TaskInfo};
 
 /// A worker of the trace.
 #[derive(Clone, Debug)]
@@ -226,14 +226,14 @@ impl Trace {
                         let i = index(&mut t, &w.id.to_string());
                         let tw = &mut t.workers[i];
                         tw.class = w.class;
-                        tw.budget_gb = w.budget[MEM] as f64 / 1e9;
-                        tw.slots = w.slots;
+                        tw.budget_gb = w.capacity[ResourceId::MEM] as f64 / 1e9;
+                        tw.slots = w.capacity[ResourceId::SLOTS] as usize;
                     }
                     Input::Submit(spec) => {
                         // A duplicate submission of a live job is ignored by the policy too.
                         pending.entry(spec.id).or_insert(Pending {
                             ready_s: at.0.as_secs_f64(),
-                            est_gb: spec.demand[MEM] as f64 / 1e9,
+                            est_gb: spec.demand[ResourceId::MEM] as f64 / 1e9,
                             group: spec.group,
                             info,
                             starts: Vec::new(),
@@ -521,8 +521,7 @@ mod tests {
         let worker = |id| WorkerState {
             id,
             class: "l40s".into(),
-            slots: 8,
-            budget: Resources::mem_gb(50.0),
+            capacity: Resources::mem_gb(50.0).with_slots(8),
             ..Default::default()
         };
         let submit = |id| {
