@@ -17,7 +17,7 @@
 //! ```
 //! use std::{sync::Arc, time::Duration};
 //!
-//! use whelm::{TemplateNode, TemplateSpec};
+//! use whelm::dag::{TemplateNode, TemplateSpec};
 //!
 //! let fan = Arc::new(TemplateSpec::jobs(2).build().unwrap());
 //! let pipeline = TemplateSpec {
@@ -43,7 +43,7 @@ use std::{
 };
 
 use super::{DagError, frame::SENTINEL};
-use crate::{JobId, time::secs};
+use crate::{job::JobId, time::secs};
 
 /// One node of a [`DagTemplate`].
 ///
@@ -54,7 +54,8 @@ pub enum TemplateNode {
     /// A job run on a worker, of this much work (before the unit's
     /// [`scale`](super::Unit::scale)).
     Job(Duration),
-    /// A job run on the caller ([`Output::RunLocal`](crate::Output::RunLocal)), of this much work.
+    /// A job run on the caller ([`Output::RunLocal`](crate::policy::Output::RunLocal)), of this
+    /// much work.
     Local(Duration),
     /// A synchronisation point, of this much work: it completes by itself once ready.
     Pass(Duration),
@@ -80,7 +81,7 @@ pub enum TemplateNode {
 /// ```
 /// use std::time::Duration;
 ///
-/// use whelm::TemplateSpec;
+/// use whelm::dag::TemplateSpec;
 ///
 /// let diamond = TemplateSpec {
 ///     edges: vec![(0, 1), (0, 2), (1, 3), (2, 3)],
@@ -143,7 +144,7 @@ fn single(node: fn(Duration) -> TemplateNode) -> Arc<DagTemplate> {
 /// ```
 /// use std::{sync::Arc, time::Duration};
 ///
-/// use whelm::{TemplateNode, TemplateSpec};
+/// use whelm::dag::{TemplateNode, TemplateSpec};
 ///
 /// let chain = TemplateSpec {
 ///     edges: vec![(0, 1)],
@@ -180,7 +181,7 @@ impl TemplateSpec {
     /// ```
     /// use std::time::Duration;
     ///
-    /// use whelm::TemplateSpec;
+    /// use whelm::dag::TemplateSpec;
     ///
     /// let three = TemplateSpec::jobs(3).build().unwrap();
     /// assert_eq!(
@@ -204,7 +205,7 @@ impl TemplateSpec {
     /// ```
     /// use std::time::Duration;
     ///
-    /// use whelm::{DagError, TemplateSpec};
+    /// use whelm::dag::{DagError, TemplateSpec};
     ///
     /// let chain = TemplateSpec {
     ///     edges: vec![(0, 1), (1, 2), (0, 1)],
@@ -385,7 +386,7 @@ impl DagTemplate {
     /// `O(len^2 / 8)` bytes of scratch.
     ///
     /// ```
-    /// use whelm::TemplateSpec;
+    /// use whelm::dag::TemplateSpec;
     ///
     /// // 0 -> 2 is implied by 0 -> 1 -> 2.
     /// let t = TemplateSpec {
@@ -441,7 +442,7 @@ impl DagTemplate {
     /// ```
     /// use std::time::Duration;
     ///
-    /// use whelm::TemplateSpec;
+    /// use whelm::dag::TemplateSpec;
     ///
     /// // Node 0 before nodes 1 and 2; node 2 is the heavier branch.
     /// let fork = TemplateSpec {
@@ -480,7 +481,7 @@ impl DagTemplate {
     /// ```
     /// use std::time::Duration;
     ///
-    /// use whelm::TemplateSpec;
+    /// use whelm::dag::TemplateSpec;
     ///
     /// let fork = TemplateSpec {
     ///     edges: vec![(0, 1), (0, 2)],
@@ -504,7 +505,7 @@ impl DagTemplate {
     /// ```
     /// use std::time::Duration;
     ///
-    /// use whelm::TemplateSpec;
+    /// use whelm::dag::TemplateSpec;
     ///
     /// let fork = TemplateSpec {
     ///     edges: vec![(0, 1), (0, 2)],

@@ -11,8 +11,21 @@ use std::{borrow::Cow, fmt, time::Duration};
 use serde::{Deserialize, Serialize};
 
 #[cfg(doc)]
-use crate::{Admission, DagScheduler, Defer, Policy, Reservations, Scheduler, Timing, WorkerView};
-use crate::{Attempt, JobId, Resource, ResourceUnit, Resources, Time, Tried, WorkerId};
+use crate::{
+    admission::{Admission, WorkerView},
+    config::{Defer, Reservations},
+    dag::DagScheduler,
+    policy::Policy,
+    scheduler::Scheduler,
+    speed::Timing,
+};
+use crate::{
+    job::JobId,
+    policy::{Attempt, Tried},
+    resources::{Resource, ResourceUnit, Resources},
+    time::Time,
+    worker::WorkerId,
+};
 
 /// Bytes per gigabyte, for the [`Display`](fmt::Display) form.
 const GB: f64 = 1e9;
@@ -32,8 +45,8 @@ const SHOWN_DEPS: usize = 8;
 ///
 /// ```
 /// use whelm::{
-///     Config, Explanation, Input, JobSpec, Policy, Resources, SLOTS, Scheduler, Status, Time,
-///     Verdict, WorkerState,
+///     explain::{Explanation, Status, Verdict},
+///     prelude::*,
 /// };
 ///
 /// let mut p = Scheduler::new(Config::fifo());
@@ -84,7 +97,7 @@ pub struct Explanation {
     pub job: JobId,
     /// Whether `job` names a [`DagScheduler`] unit of several jobs rather than one job.
     pub unit: bool,
-    /// The job's label from its unit's [`NodeSource`](crate::NodeSource), if it has one.
+    /// The job's label from its unit's [`NodeSource`](crate::dag::NodeSource), if it has one.
     pub label: Option<String>,
     /// Where the job is.
     pub status: Status,
@@ -162,8 +175,9 @@ pub enum Status {
 pub struct Waiting {
     /// Its demand, as the scheduler holds it ([`Admission`] says how).
     pub demand: Resources,
-    /// The resources the scheduler declares ([`Config::resources`](crate::Config::resources)):
-    /// the order the [`Display`](fmt::Display) form lists amounts in, and their units.
+    /// The resources the scheduler declares
+    /// ([`Config::resources`](crate::config::Config::resources)): the order the
+    /// [`Display`](fmt::Display) form lists amounts in, and their units.
     pub resources: Vec<Resource>,
     /// Its group.
     pub group: u64,
@@ -173,8 +187,8 @@ pub struct Waiting {
     pub waited: Duration,
     /// Waiting jobs ahead of it in urgency order.
     pub ahead: usize,
-    /// Whether it has waited past [`Config::age_limit`](crate::Config::age_limit), which puts it
-    /// first in the scan.
+    /// Whether it has waited past [`Config::age_limit`](crate::config::Config::age_limit), which
+    /// puts it first in the scan.
     pub aged: bool,
     /// Its failed attempts, in order.
     pub tried: Vec<Tried>,
@@ -476,7 +490,11 @@ impl fmt::Display for Waiting {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Config, DEVICE_MEMORY, FailKind, MEMORY, SLOTS, gb};
+    use crate::{
+        config::Config,
+        policy::FailKind,
+        resources::{DEVICE_MEMORY, MEMORY, SLOTS, gb},
+    };
 
     /// A waiting job with one worker of each verdict.
     fn waiting() -> Explanation {

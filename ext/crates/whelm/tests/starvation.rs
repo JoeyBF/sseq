@@ -3,10 +3,7 @@
 use std::{collections::BTreeMap, time::Duration};
 
 use proptest::prelude::*;
-use whelm::{
-    Attempt, Config, Input, JobId, JobSpec, MEMORY, Output, Policy, Reservations, Resources, SLOTS,
-    Scheduler, Time, WorkerState,
-};
+use whelm::{config::Reservations, job::JobId, policy::Attempt, prelude::*};
 
 const TICK: Duration = Duration::from_secs(1);
 const RESERVE_AFTER: Duration = Duration::from_secs(60);

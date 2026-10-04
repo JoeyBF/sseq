@@ -4,10 +4,14 @@ use std::ops::Bound;
 
 use super::{Job, Scheduler};
 #[cfg(doc)]
-use crate::Config;
+use crate::config::Config;
 use crate::{
-    GroupOrder, JobId, JobSpec, OrderTerm, Output, Rejection, Time, admission::fill_defaults,
+    admission::fill_defaults,
+    config::{GroupOrder, OrderTerm},
+    job::{JobId, JobSpec},
+    policy::{Output, Rejection},
     resources::dense,
+    time::Time,
 };
 
 /// The most terms a [`Config::order`] has once repeats are dropped: one per [`OrderTerm`].

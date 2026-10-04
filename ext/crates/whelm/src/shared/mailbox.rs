@@ -8,7 +8,10 @@ use std::{
 
 use super::{SharedPolicy, lease::Lease};
 use crate::{
-    Attempt, FailKind, GaveUp, Input, JobId, JobSpec, Output, Policy, Rejection, Time, WorkerId,
+    job::{JobId, JobSpec},
+    policy::{Attempt, FailKind, GaveUp, Input, Output, Policy, Rejection},
+    time::Time,
+    worker::WorkerId,
 };
 
 /// One leased job's mailbox, from its first submission until the lease ends.

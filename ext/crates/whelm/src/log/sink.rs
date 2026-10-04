@@ -21,9 +21,8 @@ use super::Logged;
 /// };
 ///
 /// use whelm::{
-///     Config, EventSink, Input, JobSpec, MEMORY, Output, Policy, Resources, SLOTS, Scheduler,
-///     Time, WorkerState, gb,
-///     log::{Event, Logged},
+///     log::{Event, EventSink, Logged},
+///     prelude::*,
 /// };
 ///
 /// struct CountStarts(Arc<AtomicUsize>);
@@ -104,8 +103,8 @@ impl EventSink for std::sync::Arc<std::sync::Mutex<Vec<Event>>> {
 /// };
 ///
 /// use whelm::{
-///     Config, Input, JobSpec, MEMORY, Policy, Resources, SLOTS, Scheduler, Time, WorkerState, gb,
 ///     log::{self, Event, JsonlSink, Logged},
+///     prelude::*,
 /// };
 ///
 /// /// A writer appending to a buffer the caller also holds.
@@ -187,8 +186,8 @@ impl JsonlSink {
     /// use std::path::Path;
     ///
     /// use whelm::{
-    ///     Config, EventSink, Policy, Scheduler, Time,
-    ///     log::{JsonlSink, Logged},
+    ///     log::{EventSink, JsonlSink, Logged},
+    ///     prelude::*,
     /// };
     ///
     /// let sink = JsonlSink::create(Path::new("run.jsonl.gz")).unwrap();

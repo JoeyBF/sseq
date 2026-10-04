@@ -9,7 +9,7 @@ use super::{
     SpeedEstimator, Timing,
     estimator::{Stat, sane},
 };
-use crate::WorkerId;
+use crate::worker::WorkerId;
 
 /// An interned worker class.
 pub(crate) type ClassId = u32;
@@ -197,7 +197,7 @@ mod tests {
     use std::time::Duration;
 
     use super::Speeds;
-    use crate::{Learn, Timing};
+    use crate::speed::{Learn, Timing};
 
     /// Identical machines report speed 1 whatever the worker says; related ones without learning
     /// trust it; neither distinguishes kinds.

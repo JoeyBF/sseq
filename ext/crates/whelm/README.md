@@ -9,8 +9,9 @@ inputs produce the same outputs. Around the core sit a dependency layer (`DagSch
 replayable event log (`log`) and a blocking front end for callers with a thread per task
 (`SharedPolicy`).
 
-The crate documentation (`cargo doc --open`) is a guided tour of the API, chapter by chapter, with
-an example of every behaviour; this page is the overview.
+The crate documentation (`cargo doc --open`) teaches the API: the crate page covers the event loop
+and lists the modules in reading order, and each module's page is a chapter with an example of
+every behaviour. This page is the overview.
 
 ## The problem
 
@@ -84,10 +85,7 @@ exactly once.
 ```rust
 use std::time::Duration;
 
-use whelm::{
-    Config, Input, JobSpec, MEMORY, Output, Policy, Resources, SLOTS, Scheduler, Time, WorkerState,
-    gb,
-};
+use whelm::prelude::*;
 
 let mut policy = Scheduler::new(Config::default());
 // Points on the caller's clock: here, seconds since the start of the run.
@@ -208,9 +206,9 @@ still receives the job's retry or give-up, and its `complete` cancels the retry.
 
 ```rust
 use std::sync::Arc;
-use whelm::{
-    Config, FailKind, JobSpec, MEMORY, Resources, SLOTS, Scheduler, SharedPolicy, WorkerState, gb,
-};
+use whelm::policy::FailKind;
+use whelm::prelude::*;
+use whelm::shared::SharedPolicy;
 
 let shared = Arc::new(SharedPolicy::with_system_clock(Scheduler::new(Config::default())));
 shared.worker_update(WorkerState {
@@ -243,10 +241,8 @@ reproduces every poll; learned speeds live in the scheduler, so it relearns them
 
 ```rust
 use std::sync::{Arc, Mutex};
-use whelm::{
-    Config, Input, JobSpec, MEMORY, Policy, Resources, SLOTS, Scheduler, Time, WorkerState, gb,
-    log::{self, Event, Logged},
-};
+use whelm::log::{self, Event, Logged};
+use whelm::prelude::*;
 
 let events = Arc::new(Mutex::new(Vec::<Event>::new()));
 let mut p = Logged::new(Scheduler::new(Config::default()), events.clone());
@@ -305,10 +301,8 @@ is job `base + k`; other units depend on it by its id.
 ```rust
 use std::{sync::Arc, time::Duration};
 
-use whelm::{
-    Config, DagConfig, DagJob, DagScheduler, Input, Output, Policy, Resources, SLOTS, Scheduler,
-    TemplateSpec, Time, Unit, WorkerState,
-};
+use whelm::dag::{DagConfig, DagJob, DagScheduler, TemplateSpec, Unit};
+use whelm::prelude::*;
 
 let mut dag = DagScheduler::new(DagConfig::default(), Scheduler::new(Config::default()));
 let worker = WorkerState { id: 1, capacity: Resources::new().with(SLOTS, 4), ..Default::default() };
@@ -359,10 +353,13 @@ learned per-task device demand as the device `per_task`. Bidegrees become groups
 # #[cfg(feature = "log")]
 # fn main() {
 use std::{sync::Arc, time::Duration};
-use whelm::{
-    Config, DEVICE_MEMORY, FailKind, GroupOrder, JobSpec, MEMORY, Resources, SLOTS, Scheduler,
-    SharedPolicy, SpeedConfig, Timing, WorkerState, gb, log::{JsonlSink, Logged, TaskInfo}, nassau,
-};
+use whelm::config::{GroupOrder, SpeedConfig};
+use whelm::log::{JsonlSink, Logged, TaskInfo};
+use whelm::nassau;
+use whelm::policy::FailKind;
+use whelm::prelude::*;
+use whelm::shared::SharedPolicy;
+use whelm::speed::Timing;
 
 // Once: restart-stable bidegree order, speeds learned per worker, every input and poll logged.
 let policy = Scheduler::new(Config {

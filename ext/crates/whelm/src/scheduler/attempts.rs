@@ -4,10 +4,12 @@ use std::collections::BTreeMap;
 
 use super::{Job, Run, Running, Scheduler, Worker, tick_occ};
 use crate::{
-    Attempt, FailKind, GaveUp, JobId, Output, Time, Tried, WorkerId, WorkerState,
     admission::WorkerAmounts,
+    job::JobId,
+    policy::{Attempt, FailKind, GaveUp, Output, Tried},
     resources::{add, sub},
-    time::secs,
+    time::{Time, secs},
+    worker::{WorkerId, WorkerState},
 };
 
 impl Scheduler {
@@ -208,7 +210,7 @@ impl Scheduler {
     }
 
     /// Start speculative attempts on workers left with room (see
-    /// [`Speculate`](crate::Speculate)).
+    /// [`Speculate`](crate::config::Speculate)).
     pub(super) fn speculate(&mut self) {
         let Some(cfg) = self.config.speed.speculate else {
             return;

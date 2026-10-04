@@ -4,9 +4,14 @@ use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
 use proptest::prelude::*;
 use whelm::{
-    Config, Constraint, DagConfig, DagError, DagJob, DagScheduler, DagTemplate, Input, JobId,
-    JobSpec, MEMORY, NodeSource, Output, Policy, Resources, SLOTS, Scheduler, Status, TemplateNode,
-    TemplateSpec, Time, Unit, Verdict, WorkerId, WorkerState,
+    dag::{
+        DagConfig, DagError, DagJob, DagScheduler, DagTemplate, NodeSource, TemplateNode,
+        TemplateSpec, Unit,
+    },
+    explain::{Status, Verdict},
+    job::{Constraint, JobId},
+    prelude::*,
+    worker::WorkerId,
 };
 
 /// A DAG layer over one worker with many slots.

@@ -3,8 +3,9 @@
 //! [`Logged`] wraps a [`Policy`] and records an [`Event`] to an [`EventSink`] for every input it
 //! handles and every poll it answers. A policy is deterministic, so those records are the whole
 //! run: [`replay`] feeds them to a fresh policy built the same way and gets every output back,
-//! which [`polls`] reads straight from the log. That reproduces a production run offline, and
-//! `whelm-sim --trace` replays a written log against other configurations.
+//! which must equal what [`polls`] reads straight from the log. A production run can thus be
+//! reproduced offline, inspected with `explain`, or replayed against another configuration, as
+//! `whelm-sim --trace` does with a written log.
 //!
 //! The sinks provided keep events in a `Vec<Event>`, in an `Arc<Mutex<Vec<Event>>>` (readable from
 //! outside while the run goes on), or, with the `log` feature, write them as JSON lines with
@@ -19,9 +20,9 @@
 //! };
 //!
 //! use whelm::{
-//!     Config, FailKind, Input, JobSpec, MEMORY, Output, Policy, Resources, SLOTS, Scheduler,
-//!     Time, WorkerState, gb,
 //!     log::{self, Event, Logged},
+//!     policy::FailKind,
+//!     prelude::*,
 //! };
 //!
 //! let events = Arc::new(Mutex::new(Vec::<Event>::new()));
@@ -96,6 +97,9 @@
 //!     logged
 //! );
 //! ```
+//!
+//! To log a run driven through the [DAG layer](crate::dag), log the inner policy:
+//! `DagScheduler<Logged<Scheduler>>`. The DAG's own operations are method calls, not inputs.
 
 mod event;
 mod logged;
@@ -112,4 +116,4 @@ pub use sink::EventSink;
 pub use sink::JsonlSink;
 
 #[cfg(doc)]
-use crate::Policy;
+use crate::policy::Policy;

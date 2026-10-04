@@ -7,8 +7,13 @@ use super::{
     frame::{HELD, SUBMITTED},
 };
 #[cfg(doc)]
-use crate::DagConfig;
-use crate::{Attempt, Input, JobId, Output, Policy, Time, WorkerId};
+use crate::dag::DagConfig;
+use crate::{
+    job::JobId,
+    policy::{Attempt, Input, Output, Policy},
+    time::Time,
+    worker::WorkerId,
+};
 
 impl<P: Policy> DagScheduler<P> {
     /// Submit a ready, held job to the policy.
@@ -19,10 +24,8 @@ impl<P: Policy> DagScheduler<P> {
     ///
     /// ```
     /// # use std::time::Duration;
-    /// # use whelm::{
-    /// #     Config, DagConfig, DagJob, DagScheduler, Input, Output, Policy, Resources,
-    /// #     SLOTS, Scheduler, Time, WorkerState,
-    /// # };
+    /// # use whelm::prelude::*;
+    /// # use whelm::dag::{DagConfig, DagJob, DagScheduler};
     /// # let config = DagConfig { auto_submit: false, ..DagConfig::default() };
     /// # let mut dag = DagScheduler::new(config, Scheduler::new(Config::fifo()));
     /// # let capacity = Resources::new().with(SLOTS, 1);
@@ -87,10 +90,8 @@ impl<P: Policy> DagScheduler<P> {
     ///
     /// ```
     /// # use std::time::Duration;
-    /// # use whelm::{
-    /// #     Config, DagConfig, DagError, DagJob, DagScheduler, Input, Output, Policy,
-    /// #     Resources, SLOTS, Scheduler, Time, WorkerState,
-    /// # };
+    /// # use whelm::prelude::*;
+    /// # use whelm::dag::{DagConfig, DagError, DagJob, DagScheduler};
     /// # let mut dag = DagScheduler::new(DagConfig::default(), Scheduler::new(Config::fifo()));
     /// # let capacity = Resources::new().with(SLOTS, 1);
     /// # let worker = WorkerState { id: 1, capacity, ..Default::default() };
@@ -166,10 +167,8 @@ impl<P: Policy> DagScheduler<P> {
     ///
     /// ```
     /// # use std::time::Duration;
-    /// # use whelm::{
-    /// #     Config, DagConfig, DagJob, DagScheduler, DagStats, Input, Output, Policy,
-    /// #     Resources, SLOTS, Scheduler, Time, WorkerState,
-    /// # };
+    /// # use whelm::prelude::*;
+    /// # use whelm::dag::{DagConfig, DagJob, DagScheduler, DagStats};
     /// # let mut dag = DagScheduler::new(DagConfig::default(), Scheduler::new(Config::fifo()));
     /// # let capacity = Resources::new().with(SLOTS, 1);
     /// # let worker = WorkerState { id: 1, capacity, ..Default::default() };
@@ -280,10 +279,8 @@ impl<P: Policy> DagScheduler<P> {
     ///
     /// ```
     /// # use std::{sync::Arc, time::Duration};
-    /// # use whelm::{
-    /// #     Config, DagConfig, DagJob, DagScheduler, Input, Output, Policy, Resources,
-    /// #     SLOTS, Scheduler, TemplateSpec, Time, Unit, WorkerState,
-    /// # };
+    /// # use whelm::prelude::*;
+    /// # use whelm::dag::{DagConfig, DagJob, DagScheduler, TemplateSpec, Unit};
     /// # let mut dag = DagScheduler::new(DagConfig::default(), Scheduler::new(Config::fifo()));
     /// # let capacity = Resources::new().with(SLOTS, 1);
     /// # let worker = WorkerState { id: 1, capacity, ..Default::default() };
@@ -432,7 +429,7 @@ impl<P: Policy> DagScheduler<P> {
         &mut self,
         job: JobId,
         attempt: Attempt,
-        kind: crate::FailKind,
+        kind: crate::policy::FailKind,
         why: String,
     ) {
         let was_live = self.drop_attempt(job, attempt);

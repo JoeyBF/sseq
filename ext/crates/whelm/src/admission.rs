@@ -1,47 +1,365 @@
-//! The admission rule: whether a worker accepts a job right now.
+//! The admission rule: whether a worker takes a job right now.
 //!
-//! The [`Scheduler`](crate::Scheduler) places a job only where its [`Admission`] rule admits it,
-//! so the rule alone enforces capacity, slots included. The rule sees a worker as a
-//! [`WorkerView`]: the resources the configuration declares, the worker's last reported
-//! [`WorkerState`], and the demands the scheduler has placed there itself; and a job's demand as
-//! [`Amounts`] of the declared resources. [`ProductionAdmission`] is the rule [`Scheduler::new`]
-//! uses: one inequality per declared resource, with an escape hatch for a job alone on a worker in
-//! the soft ones. Any other rule goes to [`Scheduler::with_admission`].
+//! A [`Scheduler`] places a job only where its [`Admission`] rule admits it, so the rule alone
+//! enforces capacity, slots included. The default, [`ProductionAdmission`], admits a job if, in
+//! every declared [resource](crate::resources), what the worker already uses plus the job's demand
+//! fits its capacity. A job that fits nowhere waits, and [`explain`](Policy::explain) says why: its
+//! [`Explanation`] gives the job's [`Status`], and for a job [`Waiting`] for a worker, one
+//! [`Verdict`] per worker. Displayed, it is one line for a log.
 //!
-//! A worker with 100 bytes of memory and two slots, running one 60-byte job, takes a 40-byte job
-//! beside it but not a 41-byte one. [`WorkerView::new`] builds the view the scheduler would pass,
-//! and [`WorkerView::demand`] a demand as the scheduler holds it, with the slot every job takes
-//! filled in:
+//! ```
+//! # use std::time::Duration;
+//! # use whelm::prelude::*;
+//! use whelm::explain::{Status, Verdict};
+//!
+//! let mut p = Scheduler::new(Config::default());
+//! p.handle(
+//!     Input::Worker(WorkerState {
+//!         id: 1,
+//!         capacity: Resources::new().with(MEMORY, gb(10.0)).with(SLOTS, 2),
+//!         ..Default::default()
+//!     }),
+//!     Time::ORIGIN,
+//! );
+//! p.handle(
+//!     Input::Submit {
+//!         job: 1,
+//!         spec: JobSpec {
+//!             demand: Resources::new().with(MEMORY, gb(6.0)),
+//!             ..Default::default()
+//!         },
+//!     },
+//!     Time::ORIGIN,
+//! );
+//! p.handle(
+//!     Input::Submit {
+//!         job: 2,
+//!         spec: JobSpec {
+//!             demand: Resources::new().with(MEMORY, gb(6.0)),
+//!             ..Default::default()
+//!         },
+//!     },
+//!     Time::ORIGIN,
+//! );
+//!
+//! // A slot is free, but 6 + 6 GB exceeds the 10 GB of memory.
+//! assert_eq!(
+//!     p.poll(Time::ORIGIN),
+//!     [Output::Start {
+//!         job: 1,
+//!         attempt: 1,
+//!         worker: 1
+//!     }]
+//! );
+//! let why = p.explain(2).unwrap();
+//! let Status::Waiting(waiting) = &why.status else {
+//!     panic!("job 2 is not waiting");
+//! };
+//! for (worker, verdict) in &waiting.workers {
+//!     match verdict {
+//!         Verdict::Short { dims, headroom } => {
+//!             // Short of memory only, with 4 GB left; resources are named.
+//!             assert_eq!((*worker, &dims[..]), (1, &[MEMORY.name][..]));
+//!             assert_eq!(headroom[0], (MEMORY.name, Some(4_000_000_000)));
+//!         }
+//!         other => panic!("worker {worker}: {other:?}"),
+//!     }
+//! }
+//! assert_eq!(
+//!     why.to_string(),
+//!     "job 2 (demand [memory 6.00 GB, slots 1], group 0) waiting 0s, 0 more urgent job(s) \
+//!      waiting; memory short on 1 worker(s) (best headroom 4.00 GB on worker 1)"
+//! );
+//!
+//! p.handle(
+//!     Input::Done { job: 1, attempt: 1 },
+//!     Time(Duration::from_secs(50)),
+//! );
+//! assert_eq!(
+//!     p.poll(Time(Duration::from_secs(50))),
+//!     [Output::Start {
+//!         job: 2,
+//!         attempt: 1,
+//!         worker: 1
+//!     }]
+//! );
+//! ```
+//!
+//! # Reported usage
+//!
+//! Demands are estimates, so the worker's own reports count too. A heartbeat ([`Input::Worker`]
+//! again, with the same id) carries the worker's [`reported_used`](WorkerState::reported_used)
+//! memory and the [`reported_baseline`](WorkerState::reported_baseline) not due to any job; the
+//! rule takes the larger of the reported usage and the baseline plus the placed demands. Here the
+//! running job uses more than it said, and the heartbeat keeps a second job off the worker.
+//!
+//! ```
+//! # use std::time::Duration;
+//! # use whelm::prelude::*;
+//! let mut p = Scheduler::new(Config::default());
+//! let worker = WorkerState {
+//!     id: 1,
+//!     capacity: Resources::new().with(MEMORY, gb(10.0)).with(SLOTS, 4),
+//!     ..Default::default()
+//! };
+//! p.handle(Input::Worker(worker.clone()), Time::ORIGIN);
+//! p.handle(
+//!     Input::Submit {
+//!         job: 1,
+//!         spec: JobSpec {
+//!             demand: Resources::new().with(MEMORY, gb(3.0)),
+//!             ..Default::default()
+//!         },
+//!     },
+//!     Time::ORIGIN,
+//! );
+//! assert_eq!(
+//!     p.poll(Time::ORIGIN),
+//!     [Output::Start {
+//!         job: 1,
+//!         attempt: 1,
+//!         worker: 1
+//!     }]
+//! );
+//!
+//! // Heartbeat: 8 GB resident, 1 GB of it the worker's own runtime.
+//! let heartbeat = WorkerState {
+//!     reported_used: Resources::new().with(MEMORY, gb(8.0)),
+//!     reported_baseline: Resources::new().with(MEMORY, gb(1.0)),
+//!     ..worker
+//! };
+//! p.handle(Input::Worker(heartbeat), Time(Duration::from_secs(5)));
+//! p.handle(
+//!     Input::Submit {
+//!         job: 2,
+//!         spec: JobSpec {
+//!             demand: Resources::new().with(MEMORY, gb(3.0)),
+//!             ..Default::default()
+//!         },
+//!     },
+//!     Time(Duration::from_secs(5)),
+//! );
+//! // max(8, 1 + 3) + 3 = 11 GB > 10 GB.
+//! assert!(p.poll(Time(Duration::from_secs(5))).is_empty());
+//! ```
+//!
+//! # Soft and hard resources
+//!
+//! Memory is a *soft* resource. A job alone on a worker always runs, whatever its estimate (the
+//! escape hatch, so that every job can run somewhere), and a zero memory capacity means "unknown"
+//! and is not enforced. Slots are [*hard*](Resource::hard): always enforced, with no escape hatch.
+//!
+//! ```
+//! # use std::time::Duration;
+//! # use whelm::prelude::*;
+//! let mut p = Scheduler::new(Config::default());
+//! p.handle(
+//!     Input::Worker(WorkerState {
+//!         id: 1,
+//!         capacity: Resources::new().with(MEMORY, gb(10.0)).with(SLOTS, 4),
+//!         ..Default::default()
+//!     }),
+//!     Time::ORIGIN,
+//! );
+//! p.handle(
+//!     Input::Submit {
+//!         job: 1,
+//!         spec: JobSpec {
+//!             demand: Resources::new().with(MEMORY, gb(50.0)),
+//!             ..Default::default()
+//!         },
+//!     },
+//!     Time::ORIGIN,
+//! );
+//! p.handle(
+//!     Input::Submit {
+//!         job: 2,
+//!         spec: JobSpec {
+//!             demand: Resources::new().with(MEMORY, gb(1.0)),
+//!             ..Default::default()
+//!         },
+//!     },
+//!     Time::ORIGIN,
+//! );
+//! // Job 1 is five times the memory but runs alone; job 2 must wait for it.
+//! assert_eq!(
+//!     p.poll(Time::ORIGIN),
+//!     [Output::Start {
+//!         job: 1,
+//!         attempt: 1,
+//!         worker: 1
+//!     }]
+//! );
+//!
+//! // A worker of unknown memory: only its two slots limit it.
+//! p.handle(
+//!     Input::Worker(WorkerState {
+//!         id: 2,
+//!         capacity: Resources::new().with(SLOTS, 2),
+//!         ..Default::default()
+//!     }),
+//!     Time(Duration::from_secs(1)),
+//! );
+//! p.handle(
+//!     Input::Submit {
+//!         job: 3,
+//!         spec: JobSpec {
+//!             demand: Resources::new().with(MEMORY, gb(500.0)),
+//!             ..Default::default()
+//!         },
+//!     },
+//!     Time(Duration::from_secs(1)),
+//! );
+//! assert_eq!(
+//!     p.poll(Time(Duration::from_secs(1))),
+//!     [
+//!         Output::Start {
+//!             job: 2,
+//!             attempt: 1,
+//!             worker: 2
+//!         },
+//!         Output::Start {
+//!             job: 3,
+//!             attempt: 1,
+//!             worker: 2
+//!         },
+//!     ]
+//! );
+//! p.handle(
+//!     Input::Submit {
+//!         job: 4,
+//!         spec: JobSpec::default(),
+//!     },
+//!     Time(Duration::from_secs(2)),
+//! );
+//! assert!(p.poll(Time(Duration::from_secs(2))).is_empty());
+//! assert!((p.explain(4).unwrap().to_string()).contains("slots full on 1 worker(s)"));
+//! ```
+//!
+//! A worker can also declare a [`per_task`](WorkerState::per_task) floor: what any one job takes
+//! there at least, whatever its demand says. With a device-memory floor and jobs that declare no
+//! device demand, the device memory simply counts jobs. [`PolicyStats::workers`] shows each
+//! worker's load and headroom as admission sees it.
+//!
+//! ```
+//! # use whelm::prelude::*;
+//! let mut p = Scheduler::new(Config::default());
+//! // 8 slots, unknown host memory, 10 GB of device memory, at least 4 GB of it per job.
+//! let gpu = WorkerState {
+//!     per_task: Resources::new().with(DEVICE_MEMORY, gb(4.0)),
+//!     id: 1,
+//!     class: "gpu".into(),
+//!     capacity: Resources::new()
+//!         .with(DEVICE_MEMORY, gb(10.0))
+//!         .with(SLOTS, 8),
+//!     ..Default::default()
+//! };
+//! p.handle(Input::Worker(gpu), Time::ORIGIN);
+//! for job in 1..=3 {
+//!     p.handle(
+//!         Input::Submit {
+//!             job,
+//!             spec: JobSpec::default(),
+//!         },
+//!         Time::ORIGIN,
+//!     );
+//! }
+//! // (running + 1) * 4 GB <= 10 GB admits two jobs.
+//! assert_eq!(p.poll(Time::ORIGIN).len(), 2);
+//! let load = &p.stats().workers[0];
+//! assert_eq!(load.running, 2);
+//! let headroom: Vec<_> = load.headroom.iter().map(|(_, h)| *h).collect();
+//! assert_eq!(headroom, [None, Some(2_000_000_000), Some(6)]); // memory, device memory, slots
+//! ```
+//!
+//! # The rule on its own
+//!
+//! The rule sees a worker as a [`WorkerView`]: the declared resources, the worker's last reported
+//! [`WorkerState`], and the demands the scheduler has placed there itself, as [`WorkerView::new`]
+//! builds it. A job's demand goes in as [`Amounts`] of the declared resources, the way the
+//! scheduler holds it, with the default demands filled in ([`WorkerView::demand`]). The view's
+//! methods give the pieces of the rule per resource, such as the [`headroom`](WorkerView::headroom)
+//! and the [`free_share`](WorkerView::free_share) that scores compare workers by.
 //!
 //! ```
 //! use whelm::{
-//!     Admission, Config, MEMORY, ProductionAdmission, Resources, SLOTS, WorkerState, WorkerView,
+//!     admission::{Admission, ProductionAdmission, WorkerView},
+//!     prelude::*,
 //! };
 //!
 //! let config = Config::default();
 //! let state = WorkerState {
 //!     id: 1,
-//!     class: "cpu".into(),
-//!     capacity: Resources::new().with(MEMORY, 100).with(SLOTS, 2),
+//!     capacity: Resources::new().with(MEMORY, gb(10.0)).with(SLOTS, 4),
 //!     ..Default::default()
 //! };
-//! let placed = Resources::new().with(MEMORY, 60).with(SLOTS, 1);
+//! // One job running, which took 6 GB and a slot.
+//! let placed = Resources::new().with(MEMORY, gb(6.0)).with(SLOTS, 1);
 //! let view = WorkerView::new(&config.resources, &state, &placed, 1);
-//! let job = |bytes| view.demand(&Resources::new().with(MEMORY, bytes));
-//! assert!(ProductionAdmission.admits(&job(40), &view));
-//! assert!(!ProductionAdmission.admits(&job(41), &view));
+//!
+//! let job = |x| view.demand(&Resources::new().with(MEMORY, gb(x)));
+//! assert!(ProductionAdmission.admits(&job(4.0), &view));
+//! assert!(!ProductionAdmission.admits(&job(5.0), &view));
+//! assert_eq!(view.headroom(MEMORY), Some(4_000_000_000));
+//! assert_eq!(view.headroom(SLOTS), Some(3));
+//! // After placing 2 GB more, a fifth of the memory would be left.
+//! assert_eq!(view.free_share(&job(2.0)), 0.2);
 //! ```
 //!
-//! [`Scheduler::new`]: crate::Scheduler::new
-//! [`Scheduler::with_admission`]: crate::Scheduler::with_admission
+//! # A rule of your own
+//!
+//! A different rule plugs in with [`Scheduler::with_admission`]. It must be monotone in load (see
+//! [`Admission`]) and it alone enforces capacity, slots included. This one trusts no memory figure
+//! and counts slots only.
+//!
+//! ```
+//! use whelm::{
+//!     admission::{Admission, Amounts, WorkerView},
+//!     prelude::*,
+//! };
+//!
+//! /// Admits while a slot is free, whatever the memory figures say.
+//! struct SlotsOnly;
+//!
+//! impl Admission for SlotsOnly {
+//!     fn admits(&self, _demand: &Amounts, w: &WorkerView) -> bool {
+//!         (w.running() as u64) < w.capacity(SLOTS)
+//!     }
+//! }
+//!
+//! let mut p = Scheduler::with_admission(Config::default(), SlotsOnly);
+//! p.handle(
+//!     Input::Worker(WorkerState {
+//!         id: 1,
+//!         capacity: Resources::new().with(MEMORY, gb(10.0)).with(SLOTS, 2),
+//!         ..Default::default()
+//!     }),
+//!     Time::ORIGIN,
+//! );
+//! for job in 1..=3 {
+//!     let spec = JobSpec {
+//!         demand: Resources::new().with(MEMORY, gb(50.0)),
+//!         ..Default::default()
+//!     };
+//!     p.handle(Input::Submit { job, spec }, Time::ORIGIN);
+//! }
+//! assert_eq!(p.poll(Time::ORIGIN).len(), 2);
+//! ```
 
 use std::borrow::Cow;
 
 #[cfg(doc)]
-use crate::{Config, JobSpec, ScoreTerm};
 use crate::{
-    Resource, Resources, WorkerState,
-    resources::{Dense, dense, named, position},
+    config::{Config, ScoreTerm},
+    explain::{Explanation, Status, Verdict, Waiting},
+    job::JobSpec,
+    policy::{Input, Policy},
+    scheduler::Scheduler,
+    stats::PolicyStats,
+};
+use crate::{
+    resources::{Dense, Resource, Resources, dense, named, position},
+    worker::WorkerState,
 };
 
 /// A worker's reported amounts over a declaration: the scheduler's working form of a
@@ -90,7 +408,7 @@ impl WorkerAmounts {
 /// # Examples
 ///
 /// ```
-/// use whelm::{Config, MEMORY, Resource, Resources, SLOTS, WorkerState, WorkerView};
+/// use whelm::{admission::WorkerView, prelude::*, resources::Resource};
 ///
 /// let config = Config::default();
 /// let state = WorkerState::default();
@@ -181,7 +499,7 @@ pub struct Usage<'a> {
 /// methods continue from this one.
 ///
 /// ```
-/// use whelm::{Config, DEVICE_MEMORY, MEMORY, Resources, SLOTS, WorkerState, WorkerView};
+/// use whelm::{admission::WorkerView, prelude::*};
 ///
 /// let config = Config::default();
 /// let state = WorkerState {
@@ -213,7 +531,7 @@ pub struct WorkerView<'a> {
 
 impl<'a> WorkerView<'a> {
     /// The view of a worker in state `state`, under the declaration `resources`, running
-    /// `running` attempts whose demands sum to `placed`: what a [`Scheduler`](crate::Scheduler)
+    /// `running` attempts whose demands sum to `placed`: what a [`Scheduler`]
     /// would pass a rule, for calling one directly.
     ///
     /// `placed` is taken as it is, so it should include the default demands the scheduler fills
@@ -305,7 +623,8 @@ impl<'a> WorkerView<'a> {
     /// For the worker of the [type-level example](WorkerView):
     ///
     /// ```
-    /// # use whelm::{Config, MEMORY, Resources, SLOTS, WorkerState, WorkerView};
+    /// # use whelm::prelude::*;
+    /// # use whelm::admission::WorkerView;
     /// # let config = Config::default();
     /// # let state = WorkerState {
     /// #     id: 1,
@@ -366,7 +685,8 @@ impl<'a> WorkerView<'a> {
     /// bytes outweighs the 30 reported:
     ///
     /// ```
-    /// # use whelm::{Config, MEMORY, Resources, SLOTS, WorkerState, WorkerView};
+    /// # use whelm::prelude::*;
+    /// # use whelm::admission::WorkerView;
     /// # let config = Config::default();
     /// # let state = WorkerState {
     /// #     id: 1,
@@ -397,7 +717,8 @@ impl<'a> WorkerView<'a> {
     /// For the worker of the [type-level example](WorkerView):
     ///
     /// ```
-    /// # use whelm::{Config, DEVICE_MEMORY, MEMORY, Resources, SLOTS, WorkerState, WorkerView};
+    /// # use whelm::prelude::*;
+    /// # use whelm::admission::WorkerView;
     /// # let config = Config::default();
     /// # let state = WorkerState {
     /// #     id: 1,
@@ -425,7 +746,8 @@ impl<'a> WorkerView<'a> {
     /// For the worker of the [type-level example](WorkerView):
     ///
     /// ```
-    /// # use whelm::{Config, MEMORY, Resources, SLOTS, WorkerState, WorkerView};
+    /// # use whelm::prelude::*;
+    /// # use whelm::admission::WorkerView;
     /// # let config = Config::default();
     /// # let state = WorkerState {
     /// #     id: 1,
@@ -457,7 +779,8 @@ impl<'a> WorkerView<'a> {
     /// For the worker of the [type-level example](WorkerView), 60 of 100 bytes in use:
     ///
     /// ```
-    /// # use whelm::{Config, MEMORY, Resources, SLOTS, WorkerState, WorkerView};
+    /// # use whelm::prelude::*;
+    /// # use whelm::admission::WorkerView;
     /// # let config = Config::default();
     /// # let state = WorkerState {
     /// #     id: 1,
@@ -564,7 +887,7 @@ pub(crate) fn fill_defaults(resources: &[Resource], values: &mut [u64]) {
 /// Implementations must be **monotone in load**: if a job is refused by a worker, it stays refused
 /// after more jobs are placed on that worker (with no completion or heartbeat in between). The
 /// scheduler relies on this to guarantee the priority invariant within one
-/// [`poll`](crate::Policy::poll).
+/// [`poll`](crate::policy::Policy::poll).
 ///
 /// The rule alone enforces capacity, slots included: the scheduler places a job wherever the rule
 /// admits it. It sees demands as the scheduler holds them: over the declared resources, with
@@ -577,8 +900,9 @@ pub(crate) fn fill_defaults(resources: &[Resource], values: &mut [u64]) {
 ///
 /// ```
 /// use whelm::{
-///     Admission, Amounts, Config, Input, JobSpec, MEMORY, Policy, Resources, SLOTS, Scheduler,
-///     Time, Verdict, WorkerState, WorkerView,
+///     admission::{Admission, Amounts, WorkerView},
+///     explain::Verdict,
+///     prelude::*,
 /// };
 ///
 /// /// Admits while a slot is free, whatever the memory.
@@ -663,7 +987,8 @@ pub trait Admission {
 ///
 /// ```
 /// use whelm::{
-///     Admission, Config, MEMORY, ProductionAdmission, Resources, SLOTS, WorkerState, WorkerView,
+///     admission::{Admission, ProductionAdmission, WorkerView},
+///     prelude::*,
 /// };
 ///
 /// let config = Config::default();
@@ -696,8 +1021,8 @@ pub trait Admission {
 ///
 /// ```
 /// use whelm::{
-///     Admission, Config, DEVICE_MEMORY, ProductionAdmission, Resources, SLOTS, WorkerState,
-///     WorkerView,
+///     admission::{Admission, ProductionAdmission, WorkerView},
+///     prelude::*,
 /// };
 ///
 /// let config = Config::default();
@@ -732,7 +1057,8 @@ impl Admission for ProductionAdmission {
     ///
     /// ```
     /// use whelm::{
-    ///     Admission, Config, MEMORY, ProductionAdmission, Resources, SLOTS, WorkerState, WorkerView,
+    ///     admission::{Admission, ProductionAdmission, WorkerView},
+    ///     prelude::*,
     /// };
     ///
     /// let config = Config::default();
@@ -778,7 +1104,10 @@ impl Admission for ProductionAdmission {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Config, DEVICE_MEMORY, MEMORY, ResourceUnit, SLOTS};
+    use crate::{
+        config::Config,
+        resources::{DEVICE_MEMORY, MEMORY, ResourceUnit, SLOTS},
+    };
 
     /// `bytes` of memory.
     fn mem(bytes: u64) -> Resources {

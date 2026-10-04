@@ -1,20 +1,210 @@
-//! Machine models: how fast a job runs on a worker, learned from completion times.
+//! Machine models: how fast a job runs on a worker, reported or learned, and what speed drives.
 //!
-//! [`Timing`] is the machine model a [`Scheduler`](crate::Scheduler) uses
-//! ([`SpeedConfig::timing`](crate::SpeedConfig::timing)): identical machines, machines with one
-//! speed each, or speeds that also depend on the kind of job. Speeds are reported by the workers
-//! ([`WorkerState::speed`](crate::WorkerState::speed)) or learned from completion times as
-//! [`Learn`] configures, with [`Sharing`] correcting for the worker's load. The learner is a
-//! [`SpeedEstimator`], which a caller may also use on its own.
+//! Workers differ in speed. A job's [`work`](JobSpec::work) is its run time on a worker of speed
+//! 1, so on a worker of speed `s` it is expected to take `work / s`. The machine model,
+//! [`Timing`] in [`SpeedConfig::timing`], says where speeds come from:
 //!
-//! An estimator learns a class's speed from completions: work of 10 s at speed 1 that took 5 s
-//! is a sample of speed 2. Until the class has [`Learn::min_samples`] samples, its workers get the
-//! speed they report.
+//! - [`Timing::Identical`]: every worker runs at speed 1, whatever it reports.
+//! - [`Timing::Related`] (the default): each worker has one speed, as reported in
+//!   [`WorkerState::speed`] or, with [`Learn`], learned from completion times.
+//! - [`Timing::Unrelated`]: a job's speed also depends on its [`kind`](JobSpec::kind), learned per
+//!   kind and worker class.
+//!
+//! With [`ScoreTerm::Speed`] in the score, a worker reporting speed 3 wins a job under the default
+//! model, and counts as any other worker under `Identical`:
+//!
+//! ```
+//! # use whelm::prelude::*;
+//! # use whelm::config::SpeedConfig;
+//! # use whelm::speed::Timing;
+//! /// The worker a job goes to, given a reference worker 1 and a worker 2 reporting speed 3.
+//! fn place(timing: Timing) -> u64 {
+//!     let mut p = Scheduler::new(Config {
+//!         speed: SpeedConfig {
+//!             timing,
+//!             ..SpeedConfig::default()
+//!         },
+//!         ..Config::default()
+//!     });
+//!     p.handle(
+//!         Input::Worker(WorkerState {
+//!             id: 1,
+//!             class: "a".into(),
+//!             capacity: Resources::new().with(SLOTS, 4),
+//!             ..Default::default()
+//!         }),
+//!         Time::ORIGIN,
+//!     );
+//!     let fast = WorkerState {
+//!         id: 2,
+//!         class: "b".into(),
+//!         capacity: Resources::new().with(SLOTS, 4),
+//!         speed: 3.0,
+//!         ..Default::default()
+//!     };
+//!     p.handle(Input::Worker(fast), Time::ORIGIN);
+//!     p.handle(
+//!         Input::Submit {
+//!             job: 1,
+//!             spec: JobSpec::default(),
+//!         },
+//!         Time::ORIGIN,
+//!     );
+//!     match p.poll(Time::ORIGIN)[..] {
+//!         [Output::Start { worker, .. }] => worker,
+//!         ref out => panic!("{out:?}"),
+//!     }
+//! }
+//! assert_eq!(place(Timing::default()), 2);
+//! assert_eq!(place(Timing::Identical), 1);
+//! ```
+//!
+//! # Learning speeds
+//!
+//! With [`Timing::learned`], each completion of a job with a work estimate is a sample of its
+//! worker's speed, and a class's estimate replaces the reported speed once it has
+//! [`min_samples`](Learn::min_samples); [`Sharing`] corrects each sample for the worker's load.
+//! Here both workers report speed 1, but worker 2 really runs three times faster;
+//! [`WorkerLoad::speed`] shows what the policy has learned.
+//!
+//! ```
+//! # use std::time::Duration;
+//! # use whelm::prelude::*;
+//! # use whelm::config::SpeedConfig;
+//! # use whelm::job::Constraint;
+//! # use whelm::speed::{Learn, Timing};
+//! let mut p = Scheduler::new(Config {
+//!     speed: SpeedConfig {
+//!         timing: Timing::learned(),
+//!         ..SpeedConfig::default()
+//!     },
+//!     ..Config::default()
+//! });
+//! for (id, class) in [(1, "a"), (2, "b")] {
+//!     let worker = WorkerState {
+//!         id,
+//!         class: class.into(),
+//!         capacity: Resources::new().with(SLOTS, 1),
+//!         ..Default::default()
+//!     };
+//!     p.handle(Input::Worker(worker), Time::ORIGIN);
+//! }
+//!
+//! // Run jobs of 30 s of work on each worker in turn, pinned there by class.
+//! let work = Duration::from_secs(30);
+//! let (mut now, mut job) = (Time::ORIGIN, 0);
+//! for _ in 0..Learn::default().min_samples {
+//!     for (class, true_speed) in [("a", 1.0), ("b", 3.0)] {
+//!         let spec = JobSpec {
+//!             work: Some(work),
+//!             constraints: vec![Constraint::require_class(class)],
+//!             ..Default::default()
+//!         };
+//!         p.handle(Input::Submit { job, spec }, now);
+//!         p.poll(now);
+//!         now += work.div_f64(true_speed);
+//!         p.handle(Input::Done { job, attempt: 1 }, now);
+//!         job += 1;
+//!     }
+//! }
+//! let speeds: Vec<f64> = p.stats().workers.iter().map(|w| w.speed).collect();
+//! assert!(
+//!     (speeds[0] - 1.0).abs() < 1e-9 && (speeds[1] - 3.0).abs() < 1e-9,
+//!     "{speeds:?}"
+//! );
+//! ```
+//!
+//! Under [`Timing::unrelated`], the same samples are also split by job kind: a kind that runs
+//! unusually fast on one class learns a factor there. Two kinds that favour different classes then
+//! go to different workers, where one speed per worker would send both to the faster one on
+//! average.
+//!
+//! ```
+//! # use std::time::Duration;
+//! # use whelm::prelude::*;
+//! # use whelm::config::SpeedConfig;
+//! # use whelm::job::Constraint;
+//! # use whelm::speed::Timing;
+//! /// Workers 1 (class x) and 2 (class y) after training: kind "a" runs four times faster on x,
+//! /// kind "b" twice as fast on y. Returns the policy and the time.
+//! fn trained(timing: Timing) -> (Scheduler, Time) {
+//!     let mut p = Scheduler::new(Config {
+//!         speed: SpeedConfig {
+//!             timing,
+//!             ..SpeedConfig::default()
+//!         },
+//!         ..Config::default()
+//!     });
+//!     for (id, class) in [(1, "x"), (2, "y")] {
+//!         let worker = WorkerState {
+//!             id,
+//!             class: class.into(),
+//!             capacity: Resources::new().with(SLOTS, 1),
+//!             ..Default::default()
+//!         };
+//!         p.handle(Input::Worker(worker), Time::ORIGIN);
+//!     }
+//!     let work = Duration::from_secs(8);
+//!     let (mut now, mut job) = (Time::ORIGIN, 0);
+//!     for _ in 0..20 {
+//!         let runs = [
+//!             ("a", "x", 4.0),
+//!             ("a", "y", 1.0),
+//!             ("b", "x", 1.0),
+//!             ("b", "y", 2.0),
+//!         ];
+//!         for (kind, class, true_speed) in runs {
+//!             let spec = JobSpec {
+//!                 work: Some(work),
+//!                 kind: Some(kind.into()),
+//!                 constraints: vec![Constraint::require_class(class)],
+//!                 ..Default::default()
+//!             };
+//!             p.handle(Input::Submit { job, spec }, now);
+//!             p.poll(now);
+//!             now += work.div_f64(true_speed);
+//!             p.handle(Input::Done { job, attempt: 1 }, now);
+//!             job += 1;
+//!         }
+//!     }
+//!     (p, now)
+//! }
+//!
+//! /// Where a lone job of `kind` goes once trained.
+//! fn place(timing: Timing, kind: &str) -> u64 {
+//!     let (mut p, now) = trained(timing);
+//!     let spec = JobSpec {
+//!         work: Some(Duration::from_secs(8)),
+//!         kind: Some(kind.into()),
+//!         ..Default::default()
+//!     };
+//!     p.handle(Input::Submit { job: 1000, spec }, now);
+//!     match p.poll(now)[..] {
+//!         [Output::Start { worker, .. }] => worker,
+//!         ref out => panic!("{out:?}"),
+//!     }
+//! }
+//! assert_eq!(
+//!     (
+//!         place(Timing::unrelated(), "a"),
+//!         place(Timing::unrelated(), "b")
+//!     ),
+//!     (1, 2)
+//! );
+//! assert_eq!(
+//!     (place(Timing::learned(), "a"), place(Timing::learned(), "b")),
+//!     (1, 1)
+//! );
+//! ```
+//!
+//! The learner is a [`SpeedEstimator`], which a caller may also use on its own. It learns a class's
+//! speed from completions: work of 10 s at speed 1 that took 5 s is a sample of speed 2. Until the
+//! class has [`Learn::min_samples`] samples, its workers get the speed they report.
 //!
 //! ```
 //! use std::time::Duration;
 //!
-//! use whelm::{Learn, SpeedEstimator};
+//! use whelm::speed::{Learn, SpeedEstimator};
 //!
 //! let mut e = SpeedEstimator::new(Learn::default());
 //! for _ in 1..Learn::default().min_samples {
@@ -36,6 +226,180 @@
 //! );
 //! assert!((e.speed(2, "gpu", 1.5) - 2.0).abs() < 1e-9);
 //! ```
+//!
+//! # Waiting for a faster worker
+//!
+//! The score picks the best worker that admits a job *now*. With [`SpeedConfig::defer`], a job may
+//! instead wait for a busy, faster worker on which it would finish sooner (earliest finish time, as
+//! in HEFT). The wait is a [hold](crate::scheduler#holds-and-wakeups): it shows in
+//! [`PolicyStats::deferred`] and as an `explain`'s [`Holding::Deferral`], and it lapses after
+//! [`max_wait`](Defer::max_wait).
+//!
+//! ```
+//! # use std::time::Duration;
+//! #
+//! # use whelm::prelude::*;
+//! # use whelm::config::{Defer, SpeedConfig};
+//! let mut p = Scheduler::new(Config {
+//!     speed: SpeedConfig {
+//!         defer: Some(Defer::default()),
+//!         ..SpeedConfig::default()
+//!     },
+//!     ..Config::default()
+//! });
+//! p.handle(
+//!     Input::Worker(WorkerState {
+//!         id: 1,
+//!         class: "slow".into(),
+//!         capacity: Resources::new().with(SLOTS, 1),
+//!         ..Default::default()
+//!     }),
+//!     Time::ORIGIN,
+//! );
+//! let fast = WorkerState {
+//!     id: 2,
+//!     class: "fast".into(),
+//!     speed: 4.0,
+//!     capacity: Resources::new().with(SLOTS, 1),
+//!     ..Default::default()
+//! };
+//! p.handle(Input::Worker(fast), Time::ORIGIN);
+//! let spec = |work| JobSpec {
+//!     work: Some(Duration::from_secs(work)),
+//!     ..Default::default()
+//! };
+//!
+//! // Job 1 takes the fast worker until 10 / 4 = 2.5 s.
+//! p.handle(
+//!     Input::Submit {
+//!         job: 1,
+//!         spec: spec(10),
+//!     },
+//!     Time::ORIGIN,
+//! );
+//! assert_eq!(
+//!     p.poll(Time::ORIGIN),
+//!     [Output::Start {
+//!         job: 1,
+//!         attempt: 1,
+//!         worker: 2
+//!     }]
+//! );
+//!
+//! // Job 2 would take 40 s on the slow worker, or 2.5 + 10 s on the fast one: it waits.
+//! p.handle(
+//!     Input::Submit {
+//!         job: 2,
+//!         spec: spec(40),
+//!     },
+//!     Time::ORIGIN,
+//! );
+//! assert!(p.poll(Time::ORIGIN).is_empty());
+//! assert_eq!(
+//!     p.stats().deferred,
+//!     [(2, 2, Time(Duration::from_millis(2500)))]
+//! );
+//! assert!(matches!(
+//!     p.explain(2).unwrap().waiting().unwrap().hold,
+//!     Some(whelm::explain::Holding::Deferral { worker: 2, .. })
+//! ));
+//!
+//! p.handle(
+//!     Input::Done { job: 1, attempt: 1 },
+//!     Time(Duration::from_millis(2500)),
+//! );
+//! assert_eq!(
+//!     p.poll(Time(Duration::from_millis(2500))),
+//!     [Output::Start {
+//!         job: 2,
+//!         attempt: 1,
+//!         worker: 2
+//!     }]
+//! );
+//! ```
+//!
+//! # Speculative attempts
+//!
+//! With [`SpeedConfig::speculate`], a worker left idle after a poll starts a second attempt of a
+//! job running on a slower worker, when it would finish sufficiently sooner. Both attempts run; the
+//! first to finish completes the job and the other is stopped.
+//! [Idempotence](crate#messages-and-attempts) is what makes this safe.
+//!
+//! ```
+//! # use std::time::Duration;
+//! # use whelm::prelude::*;
+//! # use whelm::config::{Speculate, SpeedConfig};
+//! let mut p = Scheduler::new(Config {
+//!     speed: SpeedConfig {
+//!         speculate: Some(Speculate::default()),
+//!         ..SpeedConfig::default()
+//!     },
+//!     ..Config::default()
+//! });
+//! p.handle(
+//!     Input::Worker(WorkerState {
+//!         id: 1,
+//!         class: "slow".into(),
+//!         capacity: Resources::new().with(SLOTS, 1),
+//!         ..Default::default()
+//!     }),
+//!     Time::ORIGIN,
+//! );
+//! let spec = JobSpec {
+//!     work: Some(Duration::from_secs(40)),
+//!     ..Default::default()
+//! };
+//! p.handle(Input::Submit { job: 1, spec }, Time::ORIGIN);
+//! assert_eq!(
+//!     p.poll(Time::ORIGIN),
+//!     [Output::Start {
+//!         job: 1,
+//!         attempt: 1,
+//!         worker: 1
+//!     }]
+//! );
+//!
+//! // A worker four times faster joins at 1 s: done at 11 s rather than 40 s.
+//! let fast = WorkerState {
+//!     id: 2,
+//!     class: "fast".into(),
+//!     speed: 4.0,
+//!     capacity: Resources::new().with(SLOTS, 1),
+//!     ..Default::default()
+//! };
+//! p.handle(Input::Worker(fast), Time(Duration::from_secs(1)));
+//! assert_eq!(
+//!     p.poll(Time(Duration::from_secs(1))),
+//!     [Output::Start {
+//!         job: 1,
+//!         attempt: 2,
+//!         worker: 2
+//!     }]
+//! );
+//!
+//! // The second attempt wins; the first is stopped.
+//! p.handle(
+//!     Input::Done { job: 1, attempt: 2 },
+//!     Time(Duration::from_secs(11)),
+//! );
+//! assert_eq!(
+//!     p.poll(Time(Duration::from_secs(11))),
+//!     [Output::Stop {
+//!         job: 1,
+//!         attempt: 1,
+//!         worker: 1
+//!     }]
+//! );
+//! ```
+
+#[cfg(doc)]
+use crate::{
+    config::{Defer, ScoreTerm, Speculate, SpeedConfig},
+    explain::Holding,
+    job::JobSpec,
+    stats::{PolicyStats, WorkerLoad},
+    worker::WorkerState,
+};
 
 mod estimator;
 mod model;
@@ -45,9 +409,9 @@ pub(crate) use model::{ClassId, KindId, Speeds};
 
 /// The machine model: how a job's speed depends on the worker it runs on.
 ///
-/// A job's run time is its [`JobSpec::work`](crate::JobSpec::work) over that speed;
-/// [`ScoreTerm::Speed`](crate::ScoreTerm::Speed) ranks workers by it, and
-/// [`Defer`](crate::Defer), shadow backfill and [`Speculate`](crate::Speculate) estimate run times
+/// A job's run time is its [`JobSpec::work`](crate::job::JobSpec::work) over that speed;
+/// [`ScoreTerm::Speed`] ranks workers by it, and
+/// [`Defer`], shadow backfill and [`Speculate`] estimate run times
 /// with it. What is learned lives in the scheduler, so replaying a log rebuilds it.
 ///
 /// The examples on the variants share two hidden helpers: `two_classes(timing)`, a scheduler with
@@ -62,10 +426,11 @@ pub enum Timing {
     /// A worker reporting speed 4 gets no preference, and the statistics show speed 1:
     ///
     /// ```
-    /// # use whelm::{
-    /// #     Config, Input, JobId, JobSpec, Output, Policy, Resources, SLOTS, Scheduler,
-    /// #     SpeedConfig, Time, Timing, WorkerId, WorkerState,
-    /// # };
+    /// # use whelm::prelude::*;
+    /// # use whelm::config::SpeedConfig;
+    /// # use whelm::job::JobId;
+    /// # use whelm::speed::Timing;
+    /// # use whelm::worker::WorkerId;
     /// # /// A scheduler with `timing` and two one-slot workers: 1 of class "x" and 2 of class "y",
     /// # /// each reporting speed 1.
     /// # fn two_classes(timing: Timing) -> Scheduler {
@@ -106,19 +471,20 @@ pub enum Timing {
     /// ```
     Identical,
     /// Uniformly related machines (Q): every job runs at its worker's speed, the reported
-    /// [`WorkerState::speed`](crate::WorkerState::speed) or, with `learn`, an estimate learned per
-    /// worker ([`SpeedEstimator`]: its class as prior, the reported speed as the class's prior).
-    /// [`Timing::Identical`] shows reported speeds, and [`Timing::learned`] learned ones.
+    /// [`WorkerState::speed`](crate::worker::WorkerState::speed) or, with `learn`, an estimate
+    /// learned per worker ([`SpeedEstimator`]: its class as prior, the reported speed as the
+    /// class's prior). [`Timing::Identical`] shows reported speeds, and [`Timing::learned`] learned
+    /// ones.
     Related {
         /// Learn speeds instead of trusting the reported ones.
         learn: Option<Learn>,
     },
-    /// Unrelated machines (R): a job's speed depends on its [`kind`](crate::JobSpec::kind) as well
-    /// as its worker. On worker `w` it is `w`'s speed as [`Timing::Related`] learns it, from jobs
-    /// of every kind, times the kind's factor on `w`'s class: how much faster the kind runs there
-    /// than the class's average job, learned per (kind, class) and shrunk towards 1. A new kind,
-    /// or a job without one, runs at the related speed; a worker slow for its class is slow for
-    /// every kind. Kinds are interned for good, so they should be a small set (the job's
+    /// Unrelated machines (R): a job's speed depends on its [`kind`](crate::job::JobSpec::kind) as
+    /// well as its worker. On worker `w` it is `w`'s speed as [`Timing::Related`] learns it, from
+    /// jobs of every kind, times the kind's factor on `w`'s class: how much faster the kind runs
+    /// there than the class's average job, learned per (kind, class) and shrunk towards 1. A new
+    /// kind, or a job without one, runs at the related speed; a worker slow for its class is slow
+    /// for every kind. Kinds are interned for good, so they should be a small set (the job's
     /// algorithm, not its size).
     ///
     /// Kind "a" runs four times as fast on class "x" as on "y", and kind "b" twice as fast on "y"
@@ -127,10 +493,11 @@ pub enum Timing {
     ///
     /// ```
     /// # use std::time::Duration;
-    /// # use whelm::{
-    /// #     Config, Constraint, Input, JobId, JobSpec, Output, Policy, Resources, SLOTS,
-    /// #     Scheduler, SpeedConfig, Time, Timing, WorkerId, WorkerState,
-    /// # };
+    /// # use whelm::prelude::*;
+    /// # use whelm::config::SpeedConfig;
+    /// # use whelm::job::{Constraint, JobId};
+    /// # use whelm::speed::Timing;
+    /// # use whelm::worker::WorkerId;
     /// # /// A scheduler with `timing` and two one-slot workers: 1 of class "x" and 2 of class "y",
     /// # /// each reporting speed 1.
     /// # fn two_classes(timing: Timing) -> Scheduler {
@@ -227,10 +594,11 @@ impl Timing {
     ///
     /// ```
     /// # use std::time::Duration;
-    /// # use whelm::{
-    /// #     Config, Constraint, Input, JobId, JobSpec, Output, Policy, Resources, SLOTS,
-    /// #     Scheduler, SpeedConfig, Time, Timing, WorkerId, WorkerState,
-    /// # };
+    /// # use whelm::prelude::*;
+    /// # use whelm::config::SpeedConfig;
+    /// # use whelm::job::{Constraint, JobId};
+    /// # use whelm::speed::Timing;
+    /// # use whelm::worker::WorkerId;
     /// # /// A scheduler with `timing` and two one-slot workers: 1 of class "x" and 2 of class "y",
     /// # /// each reporting speed 1.
     /// # fn two_classes(timing: Timing) -> Scheduler {
@@ -267,7 +635,7 @@ impl Timing {
     /// }
     /// assert!((s.stats().workers[1].speed - 2.0).abs() < 1e-9);
     /// assert_eq!(place(&mut s, 1000, JobSpec::default(), now), 2);
-    /// # use whelm::Learn;
+    /// # use whelm::speed::Learn;
     /// ```
     pub fn learned() -> Self {
         Self::Related {
@@ -289,7 +657,7 @@ impl Timing {
     /// How speeds are learned, if they are.
     ///
     /// ```
-    /// use whelm::{Learn, Timing};
+    /// use whelm::speed::{Learn, Timing};
     ///
     /// assert_eq!(Timing::Identical.learn(), None);
     /// assert_eq!(Timing::default().learn(), None);
@@ -320,7 +688,7 @@ impl Timing {
 /// ```
 /// use std::time::Duration;
 ///
-/// use whelm::{Learn, SpeedEstimator};
+/// use whelm::speed::{Learn, SpeedEstimator};
 ///
 /// let mut e = SpeedEstimator::new(Learn::default());
 /// for _ in 0..100 {
@@ -425,7 +793,7 @@ impl Default for Learn {
 /// ```
 /// use std::time::Duration;
 ///
-/// use whelm::{Learn, Sharing, SpeedEstimator};
+/// use whelm::speed::{Learn, Sharing, SpeedEstimator};
 ///
 /// let learned = |sharing| {
 ///     let mut e = SpeedEstimator::new(Learn {

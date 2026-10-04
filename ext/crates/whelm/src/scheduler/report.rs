@@ -4,10 +4,13 @@ use std::borrow::Cow;
 
 use super::{Job, Scheduler, Worker, holds::Hold, placement::Refusal};
 #[cfg(doc)]
-use crate::Policy;
+use crate::policy::Policy;
 use crate::{
-    Explanation, Holding, JobId, PolicyStats, ReservationInfo, Status, Verdict, Waiting,
-    WorkerLoad, WorkerView, resources::named,
+    admission::WorkerView,
+    explain::{Explanation, Holding, Status, Verdict, Waiting},
+    job::JobId,
+    resources::named,
+    stats::{PolicyStats, ReservationInfo, WorkerLoad},
 };
 
 impl Scheduler {

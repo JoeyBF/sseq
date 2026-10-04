@@ -10,11 +10,14 @@ use super::{
     order::{Cursor, ordered},
 };
 #[cfg(doc)]
-use crate::Config;
+use crate::config::Config;
 use crate::{
-    Amounts, JobId, JobSpec, ScoreTerm, Selector, Strength, Time, WorkerId, WorkerState,
+    admission::Amounts,
+    config::ScoreTerm,
+    job::{JobId, JobSpec, Selector, Strength},
     resources::{Dense, fits_within, sub},
-    time::secs,
+    time::{Time, secs},
+    worker::{WorkerId, WorkerState},
 };
 
 /// The most terms a [`Config::score`] has once repeats are dropped: one per [`ScoreTerm`].
@@ -35,7 +38,7 @@ enum Pick {
     Nothing,
 }
 
-/// Why a worker does not take a job, for [`Verdict`](crate::Verdict).
+/// Why a worker does not take a job, for [`Verdict`](crate::explain::Verdict).
 pub(super) enum Refusal {
     Ineligible,
     /// A hold, and the job that has it.
@@ -239,7 +242,7 @@ impl Scheduler {
         self.admission.admits(&self.demand(job), &after)
     }
 
-    /// [`WorkerView::free_share`](crate::WorkerView::free_share) of `demand` on `w`.
+    /// [`WorkerView::free_share`](crate::admission::WorkerView::free_share) of `demand` on `w`.
     pub(super) fn free_share(&self, w: &Worker, demand: &[u64]) -> f64 {
         w.view(&self.config.resources).free_share_at(demand)
     }

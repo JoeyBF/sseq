@@ -3,13 +3,18 @@
 use std::{borrow::Cow, time::Duration};
 
 #[cfg(doc)]
-use crate::{Defer, Policy, Reservations, Timing, WorkerView};
-use crate::{JobId, Resources, Time, WorkerId};
+use crate::{
+    admission::WorkerView,
+    config::{Defer, Reservations},
+    policy::Policy,
+    speed::Timing,
+};
+use crate::{job::JobId, resources::Resources, time::Time, worker::WorkerId};
 
 /// A reservation: `worker` admits no job other than `job` until `job` is placed.
 ///
-/// Listed by [`PolicyStats::reservations`]; the crate's [Time](crate#time) chapter shows one made
-/// and paid off.
+/// Listed by [`PolicyStats::reservations`]; the scheduler's
+/// [Reservations](crate::scheduler#reservations) chapter shows one made and paid off.
 ///
 /// # Examples
 ///
@@ -17,10 +22,7 @@ use crate::{JobId, Resources, Time, WorkerId};
 /// [`reserve_after`](Reservations::reserve_after).
 ///
 /// ```
-/// use whelm::{
-///     Config, Input, JobSpec, MEMORY, Policy, ReservationInfo, Reservations, Resources, SLOTS,
-///     Scheduler, Time, WorkerState, gb,
-/// };
+/// use whelm::{config::Reservations, prelude::*, stats::ReservationInfo};
 ///
 /// let mut p = Scheduler::new(Config::default());
 /// p.handle(
@@ -72,10 +74,7 @@ pub struct ReservationInfo {
 /// # Examples
 ///
 /// ```
-/// use whelm::{
-///     Config, DEVICE_MEMORY, Input, JobSpec, MEMORY, Policy, Resources, SLOTS, Scheduler, Time,
-///     WorkerState, gb,
-/// };
+/// use whelm::prelude::*;
 ///
 /// let mut p = Scheduler::new(Config::default());
 /// p.handle(
@@ -137,7 +136,7 @@ pub struct WorkerLoad {
 /// ```
 /// use std::time::Duration;
 ///
-/// use whelm::{Config, Input, JobSpec, Policy, Resources, SLOTS, Scheduler, Time, WorkerState};
+/// use whelm::prelude::*;
 ///
 /// let mut p = Scheduler::new(Config::default());
 /// p.handle(

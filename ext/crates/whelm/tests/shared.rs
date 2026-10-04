@@ -13,9 +13,14 @@ use std::{
 
 use proptest::prelude::*;
 use whelm::{
-    Attempt, Config, Defer, Explanation, FailKind, GaveUp, Input, JobId, JobSpec, Lease, MEMORY,
-    Output, Policy, PolicyStats, Resources, RetryConfig, SLOTS, Scheduler, SharedPolicy,
-    SpeedConfig, Time, WorkerId, WorkerState, gb,
+    config::{Defer, RetryConfig, SpeedConfig},
+    explain::Explanation,
+    job::JobId,
+    policy::{Attempt, FailKind, GaveUp},
+    prelude::*,
+    shared::{Lease, SharedPolicy},
+    stats::PolicyStats,
+    worker::WorkerId,
 };
 
 /// A worker of class "x".

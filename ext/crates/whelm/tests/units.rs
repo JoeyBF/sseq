@@ -8,9 +8,11 @@ use std::{
 
 use proptest::prelude::*;
 use whelm::{
-    Config, DagConfig, DagJob, DagScheduler, DagTemplate, Input, JobId, JobSpec, NodeSource,
-    Output, Policy, Resources, SLOTS, Scheduler, TemplateNode, TemplateSpec, Time, Unit,
-    WorkerState,
+    dag::{
+        DagConfig, DagJob, DagScheduler, DagTemplate, NodeSource, TemplateNode, TemplateSpec, Unit,
+    },
+    job::JobId,
+    prelude::*,
 };
 
 /// A small deterministic generator (splitmix64).

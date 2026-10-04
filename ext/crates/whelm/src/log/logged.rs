@@ -6,15 +6,20 @@ use std::{collections::HashMap, time::Duration};
 use super::replay;
 use super::{Event, EventSink, TaskInfo};
 use crate::{
-    DEVICE_MEMORY, Explanation, Input, JobId, MEMORY, Output, Policy, PolicyStats, Time, WorkerId,
-    WorkerState,
+    explain::Explanation,
+    job::JobId,
+    policy::{Input, Output, Policy},
+    resources::{DEVICE_MEMORY, MEMORY},
+    stats::PolicyStats,
+    time::Time,
+    worker::{WorkerId, WorkerState},
 };
 
 /// A [`Policy`] that records every input it handles and every poll's outputs to an
 /// [`EventSink`], so that [`replay`] can reproduce the run.
 ///
 /// Heartbeats are also summarised as samples at most every `sample_every` per worker.
-/// Under a [`DagScheduler`](crate::DagScheduler), wrap the inner policy
+/// Under a [`DagScheduler`](crate::dag::DagScheduler), wrap the inner policy
 /// (`DagScheduler<Logged<Scheduler>>`): the DAG's own operations are method calls, not inputs.
 ///
 /// The [module example](super) logs a run and replays it.
@@ -60,8 +65,8 @@ impl<P: Policy> Logged<P> {
     /// };
     ///
     /// use whelm::{
-    ///     Config, Input, JobSpec, MEMORY, Policy, Resources, SLOTS, Scheduler, Time, WorkerState, gb,
     ///     log::{Event, Logged},
+    ///     prelude::*,
     /// };
     ///
     /// let events = Arc::new(Mutex::new(Vec::<Event>::new()));
@@ -121,8 +126,8 @@ impl<P: Policy> Logged<P> {
     /// };
     ///
     /// use whelm::{
-    ///     Config, Input, JobSpec, MEMORY, Policy, Resources, Scheduler, Time, gb,
     ///     log::{Event, Logged, TaskInfo},
+    ///     prelude::*,
     /// };
     ///
     /// let events = Arc::new(Mutex::new(Vec::<Event>::new()));

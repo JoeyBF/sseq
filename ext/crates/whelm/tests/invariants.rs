@@ -8,10 +8,16 @@ use std::{
 
 use proptest::prelude::*;
 use whelm::{
-    Attempt, Config, Constraint, Defer, Explanation, FailKind, GaveUp, GroupOrder, Input, JobId,
-    JobSpec, Learn, OrderTerm, Output, Policy, Rejection, Reservations, Resource, Resources,
-    RetryConfig, Scheduler, ScoreTerm, Selector, Speculate, SpeedConfig, Status, Strength, Time,
-    Timing, Tried, WorkerId, WorkerState,
+    config::{
+        Defer, GroupOrder, OrderTerm, Reservations, RetryConfig, ScoreTerm, Speculate, SpeedConfig,
+    },
+    explain::{Explanation, Status},
+    job::{Constraint, JobId, Selector, Strength},
+    policy::{Attempt, FailKind, GaveUp, Rejection, Tried},
+    prelude::*,
+    resources::Resource,
+    speed::{Learn, Timing},
+    worker::WorkerId,
 };
 
 /// `x` seconds rounded to the nanosecond, as the policy turns its run-time arithmetic back into a

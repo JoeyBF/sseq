@@ -9,7 +9,7 @@ use std::{
 use serde::{Deserialize, Serialize};
 
 #[cfg(doc)]
-use crate::Policy;
+use crate::policy::Policy;
 
 /// A point in time: the [`Duration`] since the caller's clock origin.
 ///
@@ -30,7 +30,7 @@ use crate::Policy;
 /// ```
 /// use std::time::Duration;
 ///
-/// use whelm::Time;
+/// use whelm::prelude::*;
 ///
 /// let start = Time::ORIGIN + Duration::from_secs(30);
 /// let end = start + Duration::from_millis(1500);
@@ -54,7 +54,7 @@ impl Time {
     /// ```
     /// use std::time::Duration;
     ///
-    /// use whelm::Time;
+    /// use whelm::prelude::*;
     ///
     /// let (a, b) = (Time(Duration::from_secs(5)), Time(Duration::from_secs(8)));
     /// assert_eq!(b.duration_since(a), Duration::from_secs(3));
@@ -71,7 +71,7 @@ impl Time {
     /// ```
     /// use std::time::Duration;
     ///
-    /// use whelm::Time;
+    /// use whelm::prelude::*;
     ///
     /// let t = Time(Duration::from_secs(1));
     /// assert_eq!(
@@ -94,7 +94,7 @@ impl Time {
     /// ```
     /// use std::time::Duration;
     ///
-    /// use whelm::Time;
+    /// use whelm::prelude::*;
     ///
     /// let t = Time(Duration::from_secs(1));
     /// assert_eq!(t.checked_sub(Duration::from_secs(1)), Some(Time::ORIGIN));

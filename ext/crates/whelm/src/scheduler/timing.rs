@@ -3,7 +3,10 @@
 use std::time::Duration;
 
 use super::{Job, Running, Scheduler, Worker, order::ordered, tick_occ};
-use crate::{JobId, Time, time::secs};
+use crate::{
+    job::JobId,
+    time::{Time, secs},
+};
 
 impl Scheduler {
     /// How fast `job` runs on `w`: the worker's speed times the job kind's factor on its class.

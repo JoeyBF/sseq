@@ -3,9 +3,13 @@
 use std::time::Duration;
 
 use whelm::{
-    Attempt, Config, Constraint, Defer, Holding, Input, JobId, JobSpec, MEMORY, Output, Policy,
-    Resources, SLOTS, Scheduler, ScoreTerm, Speculate, SpeedConfig, Status, Time, Timing, WorkerId,
-    WorkerState,
+    config::{Defer, ScoreTerm, Speculate, SpeedConfig},
+    explain::{Holding, Status},
+    job::{Constraint, JobId},
+    policy::Attempt,
+    prelude::*,
+    speed::Timing,
+    worker::WorkerId,
 };
 
 /// The `(job, worker)` of each start in `out`.

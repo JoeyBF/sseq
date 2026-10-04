@@ -4,7 +4,11 @@ use super::{
     DagScheduler, UnitState,
     frame::{self, COMPLETE, HELD, SUBMITTED},
 };
-use crate::{Explanation, JobId, Policy, Status};
+use crate::{
+    explain::{Explanation, Status},
+    job::JobId,
+    policy::Policy,
+};
 
 /// Counters describing the DAG layer's state, from [`DagScheduler::dag_stats`].
 ///
@@ -12,7 +16,10 @@ use crate::{Explanation, JobId, Policy, Status};
 /// job 2 a pending unit with no materialised state. Declaring job 1 enters and submits it.
 ///
 /// ```
-/// use whelm::{Config, DagConfig, DagJob, DagScheduler, DagStats, Scheduler, Time};
+/// use whelm::{
+///     dag::{DagConfig, DagJob, DagScheduler, DagStats},
+///     prelude::*,
+/// };
 ///
 /// let mut dag = DagScheduler::new(DagConfig::default(), Scheduler::new(Config::fifo()));
 /// dag.declare(

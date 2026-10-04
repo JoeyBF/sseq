@@ -9,8 +9,14 @@ use std::{
 use super::Event;
 use super::{EventSink, Logged, TaskInfo, polls, replay};
 use crate::{
-    Attempt, Config, FailKind, Input, JobId, JobSpec, MEMORY, Output, Policy, Resources, SLOTS,
-    Scheduler, Speculate, Time, Timing, WorkerId, WorkerState, gb,
+    config::{Config, Speculate},
+    job::{JobId, JobSpec},
+    policy::{Attempt, FailKind, Input, Output, Policy},
+    resources::{MEMORY, Resources, SLOTS, gb},
+    scheduler::Scheduler,
+    speed::Timing,
+    time::Time,
+    worker::{WorkerId, WorkerState},
 };
 
 /// A configuration exercising learning, speculation, retries and reservations.

@@ -5,7 +5,7 @@ use std::{collections::BTreeMap, time::Duration};
 use super::Learn;
 #[cfg(doc)]
 use super::Timing;
-use crate::WorkerId;
+use crate::worker::WorkerId;
 
 /// A running mean of `ln speed`.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -32,7 +32,7 @@ struct WorkerStat {
 }
 
 /// Online estimates of worker speeds (see [`Learn`]), usable on its own to set
-/// [`WorkerState::speed`](crate::WorkerState::speed), and what the scheduler learns related
+/// [`WorkerState::speed`](crate::worker::WorkerState::speed), and what the scheduler learns related
 /// speeds with ([`Timing`]). Deterministic.
 ///
 /// Used on its own, the estimator turns completions into the speed a worker reports in its next
@@ -41,7 +41,10 @@ struct WorkerStat {
 /// ```
 /// use std::time::Duration;
 ///
-/// use whelm::{Input, Learn, MEMORY, Resources, SLOTS, SpeedEstimator, WorkerState, gb};
+/// use whelm::{
+///     prelude::*,
+///     speed::{Learn, SpeedEstimator},
+/// };
 ///
 /// let mut e = SpeedEstimator::new(Learn::default());
 /// for _ in 0..Learn::default().min_samples {
@@ -93,7 +96,7 @@ impl SpeedEstimator {
     /// ```
     /// use std::time::Duration;
     ///
-    /// use whelm::{Learn, SpeedEstimator};
+    /// use whelm::speed::{Learn, SpeedEstimator};
     ///
     /// let mut e = SpeedEstimator::new(Learn::default());
     /// let ten = Duration::from_secs(10);
@@ -176,7 +179,7 @@ impl SpeedEstimator {
     /// ```
     /// use std::time::Duration;
     ///
-    /// use whelm::{Learn, SpeedEstimator};
+    /// use whelm::speed::{Learn, SpeedEstimator};
     ///
     /// let mut e = SpeedEstimator::new(Learn::default());
     /// for _ in 0..Learn::default().min_samples {
@@ -215,7 +218,7 @@ impl SpeedEstimator {
     /// ```
     /// use std::time::Duration;
     ///
-    /// use whelm::{Learn, SpeedEstimator};
+    /// use whelm::speed::{Learn, SpeedEstimator};
     ///
     /// let mut e = SpeedEstimator::new(Learn::default());
     /// let one = Duration::from_secs(1);
@@ -261,7 +264,7 @@ mod tests {
     use std::time::Duration;
 
     use super::SpeedEstimator;
-    use crate::{Learn, Sharing};
+    use crate::speed::{Learn, Sharing};
 
     /// `n` seconds.
     fn secs(n: u64) -> Duration {

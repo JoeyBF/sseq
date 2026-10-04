@@ -3,7 +3,7 @@
 use std::time::Duration;
 
 use super::{DagScheduler, Loc, UnitState};
-use crate::{JobId, Policy, time::secs};
+use crate::{job::JobId, policy::Policy, time::secs};
 
 impl<P: Policy> DagScheduler<P> {
     /// Raise dependencies' ranks after `start`'s rank grew.
@@ -35,10 +35,8 @@ impl<P: Policy> DagScheduler<P> {
     ///
     /// ```
     /// # use std::{sync::Arc, time::Duration};
-    /// # use whelm::{
-    /// #     Config, DagConfig, DagJob, DagScheduler, JobSpec, Scheduler, TemplateNode,
-    /// #     TemplateSpec, Time, Unit,
-    /// # };
+    /// # use whelm::prelude::*;
+    /// # use whelm::dag::{DagConfig, DagJob, DagScheduler, TemplateNode, TemplateSpec, Unit};
     /// # let mut dag = DagScheduler::new(DagConfig::default(), Scheduler::new(Config::fifo()));
     /// let pair = TemplateSpec {
     ///     nodes: vec![
@@ -86,10 +84,8 @@ impl<P: Policy> DagScheduler<P> {
     /// ```
     /// # use std::time::Duration;
     /// #
-    /// # use whelm::{
-    /// #     Config, DagConfig, DagJob, DagScheduler, Input, Output, Policy, Resources,
-    /// #     SLOTS, Scheduler, Time, WorkerState,
-    /// # };
+    /// # use whelm::prelude::*;
+    /// # use whelm::dag::{DagConfig, DagJob, DagScheduler};
     /// # let mut dag = DagScheduler::new(DagConfig::default(), Scheduler::new(Config::fifo()));
     /// # let capacity = Resources::new().with(SLOTS, 1);
     /// # let worker = WorkerState { id: 1, capacity, ..Default::default() };

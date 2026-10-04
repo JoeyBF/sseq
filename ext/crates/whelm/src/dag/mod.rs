@@ -1,19 +1,172 @@
 //! The optional dependency layer in front of a [`Policy`].
 //!
-//! [`DagScheduler`] wraps any [`Policy`] and is one itself. It holds jobs back until their
-//! dependencies complete, then submits them to the inner policy, which places them as it places
-//! any job. Everything below is deterministic, like the policy it wraps.
+//! [`DagScheduler`] wraps any [`Policy`] and is one itself. Jobs are *declared* with their
+//! dependencies, possibly long before they can run; each is submitted to the inner policy when its
+//! last dependency completes, and placed as it places any job. A [`DagJob`] is a job's id, the ids
+//! it depends on and the [`JobSpec`] it is submitted with. Everything else (workers, reports,
+//! explanations) passes through to the inner policy, and everything is deterministic, like the
+//! policy it wraps.
+//!
+//! ```
+//! use std::time::Duration;
+//!
+//! use whelm::{
+//!     dag::{DagConfig, DagJob, DagScheduler},
+//!     prelude::*,
+//! };
+//!
+//! let mut dag = DagScheduler::new(DagConfig::default(), Scheduler::new(Config::default()));
+//! dag.handle(
+//!     Input::Worker(WorkerState {
+//!         id: 1,
+//!         capacity: Resources::new().with(SLOTS, 4),
+//!         ..Default::default()
+//!     }),
+//!     Time::ORIGIN,
+//! );
+//! let start = |job| Output::Start {
+//!     job,
+//!     attempt: 1,
+//!     worker: 1,
+//! };
+//!
+//! // A diamond: 1 -> {2, 3} -> 4.
+//! let jobs = [
+//!     DagJob {
+//!         id: 1,
+//!         ..Default::default()
+//!     },
+//!     DagJob {
+//!         id: 2,
+//!         deps: vec![1],
+//!         ..Default::default()
+//!     },
+//!     DagJob {
+//!         id: 3,
+//!         deps: vec![1],
+//!         ..Default::default()
+//!     },
+//!     DagJob {
+//!         id: 4,
+//!         deps: vec![2, 3],
+//!         ..Default::default()
+//!     },
+//! ];
+//! dag.declare(jobs, Time::ORIGIN).unwrap();
+//! assert_eq!(dag.poll(Time::ORIGIN), [start(1)]);
+//! assert_eq!(
+//!     dag.explain(4).unwrap().status,
+//!     whelm::explain::Status::Pending {
+//!         unit: 4,
+//!         closed: false,
+//!         unmet: vec![2, 3]
+//!     }
+//! );
+//!
+//! dag.handle(
+//!     Input::Done { job: 1, attempt: 1 },
+//!     Time(Duration::from_secs(1)),
+//! );
+//! assert_eq!(dag.poll(Time(Duration::from_secs(1))), [start(2), start(3)]);
+//! dag.handle(
+//!     Input::Done { job: 2, attempt: 1 },
+//!     Time(Duration::from_secs(2)),
+//! );
+//! dag.handle(
+//!     Input::Done { job: 3, attempt: 1 },
+//!     Time(Duration::from_secs(2)),
+//! );
+//! assert_eq!(dag.poll(Time(Duration::from_secs(2))), [start(4)]);
+//! ```
+//!
+//! A declaration that would close a cycle, or redeclare a job, is rejected with a [`DagError`] and
+//! leaves no trace. A dependency may name a job not declared yet; it is pending until declared and
+//! completed.
 //!
 //! # Units over templates
 //!
-//! The graph has two levels. A [`DagTemplate`] is a dependency structure over nodes, each a
-//! [`TemplateNode`]: a job run on a worker, a job run on the caller, a passthrough (a
-//! synchronisation point that runs nothing), or a unit of another template substituted for the
-//! node. A [`Unit`] is one instance of a template, with its own id and dependencies on other units;
-//! the units form the *coarse graph*. A unit's jobs are its template's *leaves*, numbered in node
-//! order from the unit's [`base`](Unit::base). Units share their template through an `Arc`, so
-//! declaring one costs the same however many jobs it holds. A [`DagJob`] is the degenerate case: a
-//! unit of a one-node template whose id is its job's.
+//! Large graphs repeat a structure, so the graph has two levels. A [`DagTemplate`] is a dependency
+//! structure over nodes, checked once and shared. Each node is a [`TemplateNode`]: a job run on a
+//! worker, a job run on the caller, a passthrough (a synchronisation point that runs nothing), or a
+//! unit of another template substituted for the node, so templates nest. A [`Unit`] is one instance
+//! of a template, with its own id, by which other units depend on it; the units form the *coarse
+//! graph*. A unit's jobs are its template's *leaves*, numbered in node order from the unit's
+//! [`base`](Unit::base): leaf `k` is job `base + k`. Units share their template through an `Arc`,
+//! so declaring one costs the same however many jobs it holds. A [`DagJob`] is the degenerate case:
+//! a unit of a one-node template whose id is its job's.
+//!
+//! ```
+//! use std::{sync::Arc, time::Duration};
+//!
+//! use whelm::{
+//!     dag::{DagConfig, DagScheduler, TemplateNode, TemplateSpec, Unit},
+//!     prelude::*,
+//! };
+//!
+//! let mut dag = DagScheduler::new(DagConfig::default(), Scheduler::new(Config::default()));
+//! dag.handle(
+//!     Input::Worker(WorkerState {
+//!         id: 1,
+//!         capacity: Resources::new().with(SLOTS, 4),
+//!         ..Default::default()
+//!     }),
+//!     Time::ORIGIN,
+//! );
+//! let start = |job| Output::Start {
+//!     job,
+//!     attempt: 1,
+//!     worker: 1,
+//! };
+//! let done = |job| Input::Done { job, attempt: 1 };
+//!
+//! // A job, then a pair of independent jobs, then a job: four leaves.
+//! let pair = Arc::new(TemplateSpec::jobs(2).build().unwrap());
+//! let shape = TemplateSpec {
+//!     nodes: vec![
+//!         TemplateNode::Job(Duration::from_secs(1)),
+//!         TemplateNode::Unit(pair),
+//!         TemplateNode::Job(Duration::from_secs(1)),
+//!     ],
+//!     edges: vec![(0, 1), (1, 2)],
+//! }
+//! .build()
+//! .unwrap();
+//! assert_eq!((shape.len(), shape.leaves()), (3, 4));
+//! let shape = Arc::new(shape);
+//!
+//! // Unit 10 is jobs 100..104; unit 20, jobs 200..204, runs after it. Each leaf is submitted
+//! // with the unit's `spec`, here the default one, under the leaf's id.
+//! let first = Unit {
+//!     id: 10,
+//!     base: 100,
+//!     template: shape.clone(),
+//!     ..Default::default()
+//! };
+//! let second = Unit {
+//!     id: 20,
+//!     base: 200,
+//!     template: shape,
+//!     deps: vec![10],
+//!     ..Default::default()
+//! };
+//! dag.declare([first, second], Time::ORIGIN).unwrap();
+//! assert_eq!(dag.poll(Time::ORIGIN), [start(100)]);
+//! assert_eq!(
+//!     dag.explain(20).unwrap().to_string(),
+//!     "unit 20 waits for 1 dependency [10]"
+//! );
+//!
+//! dag.handle(done(100), Time(Duration::from_secs(1)));
+//! assert_eq!(
+//!     dag.poll(Time(Duration::from_secs(1))),
+//!     [start(101), start(102)]
+//! );
+//! dag.handle(done(101), Time(Duration::from_secs(2)));
+//! dag.handle(done(102), Time(Duration::from_secs(2)));
+//! assert_eq!(dag.poll(Time(Duration::from_secs(2))), [start(103)]);
+//! dag.handle(done(103), Time(Duration::from_secs(3)));
+//! assert_eq!(dag.poll(Time(Duration::from_secs(3))), [start(200)]);
+//! ```
 //!
 //! # Readiness
 //!
@@ -24,13 +177,121 @@
 //! - a worker job ([`TemplateNode::Job`]): submitted to the inner policy, or, without
 //!   [`DagConfig::auto_submit`], held and announced by [`Output::Ready`] until the caller
 //!   [`release`](DagScheduler::release)s it;
-//! - a local job ([`TemplateNode::Local`]): held and announced by [`Output::RunLocal`]; the caller
-//!   runs it and reports [`Input::Done`] with attempt 0;
-//! - a passthrough ([`TemplateNode::Pass`]): complete at once, announced by [`Output::Passed`] with
+//! - a local job ([`TemplateNode::Local`], or a [local](field@DagJob::local) [`DagJob`]): held and
+//!   announced by [`Output::RunLocal`]; the caller runs it and reports [`Input::Done`] with
+//!   attempt 0;
+//! - a passthrough ([`TemplateNode::Pass`], or a [passthrough](field@DagJob::passthrough)
+//!   [`DagJob`]): complete at once, announced by [`Output::Passed`] with
 //!   [`DagConfig::record_passthrough`];
 //! - a substituted unit ([`TemplateNode::Unit`]): entered in turn.
 //!
-//! A unit completes once all of its nodes have, which may release its dependents.
+//! A unit completes once all of its nodes have, which may release its dependents. Here a job loads
+//! its input on the caller, a barrier follows, then the computation:
+//!
+//! ```
+//! # use std::time::Duration;
+//! # use whelm::prelude::*;
+//! # use whelm::dag::{DagConfig, DagJob, DagScheduler};
+//! let config = DagConfig {
+//!     record_passthrough: true,
+//!     ..DagConfig::default()
+//! };
+//! let mut dag = DagScheduler::new(config, Scheduler::new(Config::default()));
+//! dag.handle(
+//!     Input::Worker(WorkerState {
+//!         id: 1,
+//!         capacity: Resources::new().with(SLOTS, 4),
+//!         ..Default::default()
+//!     }),
+//!     Time::ORIGIN,
+//! );
+//!
+//! // Load locally (1), then a barrier (2), then compute (3).
+//! let jobs = [
+//!     DagJob {
+//!         id: 1,
+//!         local: true,
+//!         ..Default::default()
+//!     },
+//!     DagJob {
+//!         id: 2,
+//!         deps: vec![1],
+//!         passthrough: true,
+//!         ..Default::default()
+//!     },
+//!     DagJob {
+//!         id: 3,
+//!         deps: vec![2],
+//!         ..Default::default()
+//!     },
+//! ];
+//! dag.declare(jobs, Time::ORIGIN).unwrap();
+//! assert_eq!(dag.poll(Time::ORIGIN), [Output::RunLocal { job: 1 }]);
+//!
+//! dag.handle(
+//!     Input::Done { job: 1, attempt: 0 },
+//!     Time(Duration::from_secs(1)),
+//! );
+//! assert_eq!(
+//!     dag.poll(Time(Duration::from_secs(1))),
+//!     [
+//!         Output::Passed { job: 2 },
+//!         Output::Start {
+//!             job: 3,
+//!             attempt: 1,
+//!             worker: 1
+//!         }
+//!     ]
+//! );
+//! ```
+//!
+//! # Outputs
+//!
+//! [`poll`](Policy::poll) returns this layer's announcements ([`Output::RunLocal`],
+//! [`Output::Ready`], [`Output::Passed`]) and then the inner policy's outputs.
+//! [`DagScheduler::announcements`] drains the announcements alone, so the caller can react
+//! (release, declare, close) before anything is placed. Without [`DagConfig::auto_submit`], the
+//! caller releases a ready job once it is actually sendable:
+//!
+//! ```
+//! # use whelm::prelude::*;
+//! # use whelm::dag::{DagConfig, DagJob, DagScheduler};
+//! let config = DagConfig {
+//!     auto_submit: false,
+//!     ..DagConfig::default()
+//! };
+//! let mut dag = DagScheduler::new(config, Scheduler::new(Config::default()));
+//! dag.handle(
+//!     Input::Worker(WorkerState {
+//!         id: 1,
+//!         capacity: Resources::new().with(SLOTS, 4),
+//!         ..Default::default()
+//!     }),
+//!     Time::ORIGIN,
+//! );
+//!
+//! let job = DagJob {
+//!     id: 1,
+//!     ..Default::default()
+//! };
+//! dag.declare([job], Time::ORIGIN).unwrap();
+//! assert_eq!(dag.announcements(), [Output::Ready { job: 1 }]);
+//! assert_eq!(dag.explain(1).unwrap().status, whelm::explain::Status::Held);
+//!
+//! // ... prepare the job's inputs, then hand it over.
+//! assert!(dag.release(1, Time::ORIGIN));
+//! assert_eq!(
+//!     dag.poll(Time::ORIGIN),
+//!     [Output::Start {
+//!         job: 1,
+//!         attempt: 1,
+//!         worker: 1
+//!     }]
+//! );
+//! ```
+//!
+//! A job the inner policy gives up on ([`Output::GaveUp`]) or rejects ([`Output::Rejected`]) is
+//! held again rather than forgotten: its dependents wait until it is released or cancelled.
 //!
 //! # Lazy materialisation
 //!
@@ -41,37 +302,269 @@
 //! jobs are ready when, and with what ranks, is the same as if every unit were materialised at
 //! declaration.
 //!
+//! Per-leaf data that differs between units of one template comes from a [`NodeSource`] rather than
+//! being stored: a [`sourced`](field@Unit::sourced) unit asks the scheduler's source for each
+//! leaf's work, final spec and label, on demand.
+//!
+//! ```
+//! # use std::{sync::Arc, time::Duration};
+//! # use whelm::prelude::*;
+//! # use whelm::dag::{DagConfig, DagScheduler, TemplateSpec, Unit};
+//! use whelm::{dag::NodeSource, job::JobId};
+//!
+//! /// Leaf `k` has work `10 (k + 1)` seconds and needs `k + 1` GB.
+//! struct Growing;
+//!
+//! impl NodeSource for Growing {
+//!     fn work(&self, _unit: JobId, leaf: u32) -> Duration {
+//!         Duration::from_secs(10 * (u64::from(leaf) + 1))
+//!     }
+//!
+//!     fn spec(&self, _unit: JobId, leaf: u32, spec: &mut JobSpec) {
+//!         spec.demand = Resources::new().with(MEMORY, gb(f64::from(leaf + 1)));
+//!     }
+//!
+//!     fn label(&self, unit: JobId, leaf: u32) -> Option<String> {
+//!         Some(format!("unit {unit} step {leaf}"))
+//!     }
+//! }
+//!
+//! let mut dag = DagScheduler::new(DagConfig::default(), Scheduler::new(Config::default()))
+//!     .with_source(Arc::new(Growing));
+//! let capacity = Resources::new().with(MEMORY, gb(100.0)).with(SLOTS, 4);
+//! let worker = WorkerState {
+//!     id: 1,
+//!     capacity,
+//!     ..Default::default()
+//! };
+//! dag.handle(Input::Worker(worker), Time::ORIGIN);
+//! let chain = TemplateSpec {
+//!     edges: vec![(0, 1), (1, 2)],
+//!     ..TemplateSpec::jobs(3)
+//! };
+//! let unit = Unit {
+//!     id: 10,
+//!     base: 100,
+//!     template: Arc::new(chain.build().unwrap()),
+//!     sourced: true,
+//!     ..Default::default()
+//! };
+//! dag.declare([unit], Time::ORIGIN).unwrap();
+//!
+//! assert_eq!(
+//!     dag.poll(Time::ORIGIN),
+//!     [Output::Start {
+//!         job: 100,
+//!         attempt: 1,
+//!         worker: 1
+//!     }]
+//! );
+//! assert_eq!(dag.stats().workers[0].placed.get(MEMORY), 1_000_000_000);
+//! assert_eq!(
+//!     dag.explain(102).unwrap().to_string(),
+//!     "[unit 10 step 2] job 102 waits for 1 dependency within its unit"
+//! );
+//! ```
+//!
 //! # Ranks
 //!
-//! With [`DagConfig::track_ranks`], each job is submitted with its upward rank as
-//! [`JobSpec::rank`]: its work plus the longest chain of work below it, through its own unit and
-//! on through the units depending on it. A policy orders by it with
-//! [`OrderTerm::Rank`](crate::OrderTerm::Rank), which runs the longest remaining chain first.
-//! Ranks within a unit are exact; ranks between units are maintained approximately
-//! ([`DagConfig::rank_epsilon`]) as the graph grows and [`DagScheduler::update_work`] revises
-//! estimates. [`DagScheduler::rank`] reads them.
+//! With [`DagConfig::track_ranks`], each job is submitted with its *upward rank* as
+//! [`JobSpec::rank`]: its work (its spec's [`work`](JobSpec::work), or [`DagConfig::default_work`]
+//! if unset) plus the longest chain of work below it, through its own unit and on through the units
+//! depending on it. A policy orders by it with [`OrderTerm::Rank`], which runs the longest
+//! remaining chain first, as HEFT does; that keeps the critical path moving. Ranks within a unit
+//! are exact; ranks between units are maintained approximately ([`DagConfig::rank_epsilon`]) as the
+//! graph grows and [`DagScheduler::update_work`] revises estimates. [`DagScheduler::rank`] reads
+//! them.
 //!
-//! # Outputs
+//! ```
+//! # use std::time::Duration;
+//! # use whelm::prelude::*;
+//! # use whelm::dag::{DagConfig, DagJob, DagScheduler};
+//! use whelm::config::OrderTerm;
 //!
-//! [`poll`](Policy::poll) returns this layer's announcements ([`Output::RunLocal`],
-//! [`Output::Ready`], [`Output::Passed`]) and then the inner policy's outputs.
-//! [`DagScheduler::announcements`] drains the announcements alone, so the caller can act on them
-//! before anything is placed. A job the inner policy gives up on ([`Output::GaveUp`]) or rejects
-//! ([`Output::Rejected`]) is held again rather than forgotten: its dependents wait until it is
-//! released or cancelled.
+//! /// The first job one single-slot worker starts: a lone job 1, or the head of chain 2 -> 3 -> 4.
+//! fn first(config: Config) -> u64 {
+//!     let mut dag = DagScheduler::new(DagConfig::default(), Scheduler::new(config));
+//!     dag.handle(
+//!         Input::Worker(WorkerState {
+//!             id: 1,
+//!             capacity: Resources::new().with(SLOTS, 1),
+//!             ..Default::default()
+//!         }),
+//!         Time::ORIGIN,
+//!     );
+//!     dag.declare(
+//!         [
+//!             DagJob {
+//!                 id: 1,
+//!                 ..Default::default()
+//!             },
+//!             DagJob {
+//!                 id: 2,
+//!                 ..Default::default()
+//!             },
+//!             DagJob {
+//!                 id: 3,
+//!                 deps: vec![2],
+//!                 ..Default::default()
+//!             },
+//!             DagJob {
+//!                 id: 4,
+//!                 deps: vec![3],
+//!                 ..Default::default()
+//!             },
+//!         ],
+//!         Time::ORIGIN,
+//!     )
+//!     .unwrap();
+//!     // Every job has the default work of a second.
+//!     let secs = |s| Some(Duration::from_secs(s));
+//!     assert_eq!((dag.rank(1), dag.rank(2)), (secs(1), secs(3)));
+//!     match dag.poll(Time::ORIGIN)[..] {
+//!         [Output::Start { job, .. }] => job,
+//!         ref out => panic!("{out:?}"),
+//!     }
+//! }
+//! assert_eq!(first(Config::default()), 1);
+//! assert_eq!(
+//!     first(Config {
+//!         order: vec![OrderTerm::Rank],
+//!         ..Config::default()
+//!     }),
+//!     2
+//! );
+//! ```
 //!
 //! # Resuming and closing
 //!
 //! A unit declared with leaves already complete ([`Unit::completed`]) runs only the rest, so
 //! a run restarted from a checkpoint redoes nothing. [`DagScheduler::close`] completes a unit early
-//! when its remaining jobs are known to be no-ops, and [`DagScheduler::cancel`] removes a unit and
-//! everything depending on it.
+//! when its remaining jobs are known to be no-ops: its unstarted jobs are dropped, and the jobs
+//! already running are returned, keeping their resources until their attempts end.
+//! [`DagScheduler::cancel`] removes a unit and everything depending on it.
+//!
+//! ```
+//! # use std::{sync::Arc, time::Duration};
+//! # use whelm::prelude::*;
+//! # use whelm::dag::{DagConfig, DagJob, DagScheduler, TemplateSpec, Unit};
+//! let mut dag = DagScheduler::new(DagConfig::default(), Scheduler::new(Config::default()));
+//! dag.handle(
+//!     Input::Worker(WorkerState {
+//!         id: 1,
+//!         capacity: Resources::new().with(SLOTS, 1),
+//!         ..Default::default()
+//!     }),
+//!     Time::ORIGIN,
+//! );
+//!
+//! // Unit 10: four independent jobs 100..104, the first two done before a restart. Job 20 follows.
+//! let unit = Unit {
+//!     id: 10,
+//!     base: 100,
+//!     template: Arc::new(TemplateSpec::jobs(4).build().unwrap()),
+//!     completed: vec![0, 1],
+//!     ..Default::default()
+//! };
+//! let after = DagJob { id: 20, deps: vec![10], ..Default::default() };
+//! dag.declare([unit, after.into()], Time::ORIGIN).unwrap();
+//! assert_eq!(
+//!     dag.poll(Time::ORIGIN),
+//!     [Output::Start {
+//!         job: 102,
+//!         attempt: 1,
+//!         worker: 1
+//!     }]
+//! );
+//!
+//! // Job 103 turns out to be unnecessary: close the unit. Job 102 is still running.
+//! assert_eq!(dag.close(10, Time(Duration::from_secs(1))), Ok(vec![102]));
+//! assert!(dag.poll(Time(Duration::from_secs(1))).is_empty()); // job 20 is ready, but 102 holds the slot
+//! dag.handle(
+//!     Input::Done {
+//!         job: 102,
+//!         attempt: 1,
+//!     },
+//!     Time(Duration::from_secs(2)),
+//! );
+//! assert_eq!(
+//!     dag.poll(Time(Duration::from_secs(2))),
+//!     [Output::Start {
+//!         job: 20,
+//!         attempt: 1,
+//!         worker: 1
+//!     }]
+//! );
+//! ```
 //!
 //! # Snapshots
 //!
 //! With the `serde` feature, `DagScheduler::snapshot` captures the declared graph and the
-//! materialised state as a `DagSnapshot`, and `DagScheduler::restore` rebuilds the layer in front
-//! of a fresh policy, resubmitting the jobs the old policy had.
+//! materialised state (not the inner policy) as a `DagSnapshot`, and `DagScheduler::restore`
+//! rebuilds the layer in front of a fresh policy, resubmitting the jobs the old policy had. A
+//! restarted coordinator thus only loses the attempts in flight.
+//!
+//! ```
+//! # #[cfg(feature = "serde")]
+//! # fn main() {
+//! # use std::time::Duration;
+//! # use whelm::prelude::*;
+//! # use whelm::dag::{DagConfig, DagJob, DagScheduler};
+//! let mut dag = DagScheduler::new(DagConfig::default(), Scheduler::new(Config::default()));
+//! let worker = WorkerState {
+//!     id: 1,
+//!     capacity: Resources::new().with(SLOTS, 1),
+//!     ..Default::default()
+//! };
+//! dag.handle(Input::Worker(worker.clone()), Time::ORIGIN);
+//! let jobs = [
+//!     DagJob {
+//!         id: 1,
+//!         ..Default::default()
+//!     },
+//!     DagJob {
+//!         id: 2,
+//!         deps: vec![1],
+//!         ..Default::default()
+//!     },
+//! ];
+//! dag.declare(jobs, Time::ORIGIN).unwrap();
+//! dag.poll(Time::ORIGIN);
+//! dag.handle(
+//!     Input::Done { job: 1, attempt: 1 },
+//!     Time(Duration::from_secs(1)),
+//! );
+//! assert_eq!(
+//!     dag.poll(Time(Duration::from_secs(1))),
+//!     [Output::Start {
+//!         job: 2,
+//!         attempt: 1,
+//!         worker: 1
+//!     }]
+//! );
+//!
+//! // The coordinator saves its graph, restarts, and its workers reconnect.
+//! let json = serde_json::to_string(&dag.snapshot()).unwrap();
+//! let snapshot = serde_json::from_str(&json).unwrap();
+//! let mut dag = DagScheduler::restore(
+//!     snapshot,
+//!     Scheduler::new(Config::default()),
+//!     None,
+//!     Time(Duration::from_secs(5)),
+//! );
+//! dag.handle(Input::Worker(worker), Time(Duration::from_secs(5)));
+//! assert_eq!(
+//!     dag.poll(Time(Duration::from_secs(5))),
+//!     [Output::Start {
+//!         job: 2,
+//!         attempt: 1,
+//!         worker: 1
+//!     }]
+//! );
+//! # }
+//! # #[cfg(not(feature = "serde"))]
+//! # fn main() {}
+//! ```
 //!
 //! # Example
 //!
@@ -83,8 +576,8 @@
 //! use std::{sync::Arc, time::Duration};
 //!
 //! use whelm::{
-//!     Config, DagConfig, DagScheduler, Input, Output, Policy, Resources, SLOTS, Scheduler,
-//!     TemplateNode, TemplateSpec, Time, Unit, WorkerState,
+//!     dag::{DagConfig, DagScheduler, TemplateNode, TemplateSpec, Unit},
+//!     prelude::*,
 //! };
 //!
 //! // Node 0 loads (on the caller), nodes 1 and 2 compute after it.
@@ -164,9 +657,15 @@ use std::{
     sync::Arc,
 };
 
+#[cfg(doc)]
+use crate::config::OrderTerm;
 use crate::{
-    Attempt, Explanation, GaveUp, Input, JobId, JobSpec, Output, Policy, PolicyStats, Status, Time,
-    WorkerId,
+    explain::{Explanation, Status},
+    job::{JobId, JobSpec},
+    policy::{Attempt, GaveUp, Input, Output, Policy},
+    stats::PolicyStats,
+    time::Time,
+    worker::WorkerId,
 };
 
 mod config;
@@ -329,8 +828,10 @@ impl Loc {
 /// use std::time::Duration;
 ///
 /// use whelm::{
-///     Config, DagConfig, DagJob, DagScheduler, FailKind, GaveUp, Input, Output, Policy,
-///     Resources, RetryConfig, SLOTS, Scheduler, Time, WorkerState,
+///     config::RetryConfig,
+///     dag::{DagConfig, DagJob, DagScheduler},
+///     policy::{FailKind, GaveUp},
+///     prelude::*,
 /// };
 ///
 /// let config = Config {
@@ -382,7 +883,7 @@ impl Loc {
 /// );
 /// let out = dag.poll(Time(Duration::from_secs(1)));
 /// assert!(matches!(out[..], [Output::GaveUp(GaveUp { job: 1, .. })]));
-/// assert_eq!(dag.explain(1).unwrap().status, whelm::Status::Held);
+/// assert_eq!(dag.explain(1).unwrap().status, whelm::explain::Status::Held);
 ///
 /// assert!(dag.release(1, Time(Duration::from_secs(2))));
 /// assert_eq!(
@@ -443,10 +944,8 @@ impl<P: Policy> DagScheduler<P> {
     /// inner policy.
     ///
     /// ```
-    /// # use whelm::{
-    /// #     Config, DagConfig, DagScheduler, Input, JobSpec, Output, Policy, Resources, SLOTS,
-    /// #     Scheduler, Time, WorkerState,
-    /// # };
+    /// # use whelm::prelude::*;
+    /// # use whelm::dag::{DagConfig, DagScheduler};
     /// let mut dag = DagScheduler::new(DagConfig::default(), Scheduler::new(Config::fifo()));
     /// dag.handle(
     ///     Input::Worker(WorkerState {
@@ -506,10 +1005,8 @@ impl<P: Policy> DagScheduler<P> {
     /// job 1.
     ///
     /// ```
-    /// # use whelm::{
-    /// #     Config, DagConfig, DagJob, DagScheduler, Input, Output, Policy, Resources,
-    /// #     SLOTS, Scheduler, Time, WorkerState,
-    /// # };
+    /// # use whelm::prelude::*;
+    /// # use whelm::dag::{DagConfig, DagJob, DagScheduler};
     /// # let mut dag = DagScheduler::new(DagConfig::default(), Scheduler::new(Config::fifo()));
     /// # let capacity = Resources::new().with(SLOTS, 1);
     /// # let worker = WorkerState { id: 1, capacity, ..Default::default() };

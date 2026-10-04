@@ -17,7 +17,11 @@
 use std::sync::Arc;
 
 use super::{DagScheduler, DagTemplate, Loc, NodeSource, TemplateNode, UnitState};
-use crate::{Input, JobId, Output, Policy, Time, time::secs};
+use crate::{
+    job::JobId,
+    policy::{Input, Output, Policy},
+    time::{Time, secs},
+};
 
 /// Counter sentinels (template in-degrees stay below them).
 pub(super) const COMPLETE: u16 = u16::MAX;

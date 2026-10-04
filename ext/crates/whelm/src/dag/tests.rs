@@ -3,9 +3,15 @@
 use std::{sync::Arc, time::Duration};
 
 use crate::{
-    Attempt, Config, DagConfig, DagError, DagJob, DagScheduler, DagStats, Explanation, FailKind,
-    GaveUp, Input, JobId, JobSpec, MEMORY, Output, Policy, Resources, RetryConfig, SLOTS,
-    Scheduler, Status, TemplateSpec, Time, Unit, WorkerId, WorkerState,
+    config::{Config, RetryConfig},
+    dag::{DagConfig, DagError, DagJob, DagScheduler, DagStats, TemplateSpec, Unit},
+    explain::{Explanation, Status},
+    job::{JobId, JobSpec},
+    policy::{Attempt, FailKind, GaveUp, Input, Output, Policy},
+    resources::{MEMORY, Resources, SLOTS},
+    scheduler::Scheduler,
+    time::Time,
+    worker::{WorkerId, WorkerState},
 };
 
 /// A DAG over a FIFO scheduler with one one-slot worker, and `max_attempts` attempts per job.

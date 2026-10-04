@@ -4,8 +4,12 @@ use std::collections::HashMap;
 
 use super::{DagError, DagScheduler, Loc, Unit, UnitRec, UnitState, frame, frame::Work};
 #[cfg(doc)]
-use crate::DagJob;
-use crate::{JobId, Output, Policy, Time};
+use crate::dag::DagJob;
+use crate::{
+    job::JobId,
+    policy::{Output, Policy},
+    time::Time,
+};
 
 impl<P: Policy> DagScheduler<P> {
     /// Check a unit against the live ones, and enter it: fill its forward reference or take a new
@@ -152,10 +156,8 @@ impl<P: Policy> DagScheduler<P> {
     ///
     /// ```
     /// # use std::time::Duration;
-    /// # use whelm::{
-    /// #     Config, DagConfig, DagError, DagJob, DagScheduler, Input, Output, Policy,
-    /// #     Resources, SLOTS, Scheduler, Time, WorkerState,
-    /// # };
+    /// # use whelm::prelude::*;
+    /// # use whelm::dag::{DagConfig, DagError, DagJob, DagScheduler};
     /// # let mut dag = DagScheduler::new(DagConfig::default(), Scheduler::new(Config::fifo()));
     /// # let capacity = Resources::new().with(SLOTS, 1);
     /// # let worker = WorkerState { id: 1, capacity, ..Default::default() };
@@ -181,7 +183,7 @@ impl<P: Policy> DagScheduler<P> {
     /// );
     /// assert_eq!(
     ///     dag.explain(2).unwrap().status,
-    ///     whelm::Status::Undeclared { dependents: 1 }
+    ///     whelm::explain::Status::Undeclared { dependents: 1 }
     /// );
     /// let before = dag.dag_stats();
     /// assert_eq!(
@@ -300,10 +302,8 @@ impl<P: Policy> DagScheduler<P> {
     /// slot.
     ///
     /// ```
-    /// # use whelm::{
-    /// #     Config, DagConfig, DagJob, DagScheduler, Input, Output, Policy, Resources,
-    /// #     SLOTS, Scheduler, Time, WorkerState,
-    /// # };
+    /// # use whelm::prelude::*;
+    /// # use whelm::dag::{DagConfig, DagJob, DagScheduler};
     /// # let config = DagConfig { auto_submit: false, ..DagConfig::default() };
     /// # let mut dag = DagScheduler::new(config, Scheduler::new(Config::fifo()));
     /// # let capacity = Resources::new().with(SLOTS, 1);

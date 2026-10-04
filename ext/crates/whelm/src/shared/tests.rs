@@ -6,8 +6,14 @@ use std::{
 };
 
 use crate::{
-    Config, FailKind, Input, JobSpec, MEMORY, Policy, Resources, RetryConfig, SLOTS, Scheduler,
-    SharedPolicy, Speculate, Time, WorkerId, WorkerState,
+    config::{Config, RetryConfig, Speculate},
+    job::JobSpec,
+    policy::{FailKind, Input, Policy},
+    resources::{MEMORY, Resources, SLOTS},
+    scheduler::Scheduler,
+    shared::SharedPolicy,
+    time::Time,
+    worker::{WorkerId, WorkerState},
 };
 
 /// A one-slot worker of class "x".

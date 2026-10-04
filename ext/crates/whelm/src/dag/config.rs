@@ -5,9 +5,13 @@ use std::time::Duration;
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
-use crate::JobId;
+use crate::job::JobId;
 #[cfg(doc)]
-use crate::{DagJob, DagScheduler, JobSpec, Output, TemplateSpec};
+use crate::{
+    dag::{DagJob, DagScheduler, TemplateSpec},
+    job::JobSpec,
+    policy::Output,
+};
 
 /// Configuration for [`DagScheduler`].
 ///
@@ -18,7 +22,10 @@ use crate::{DagJob, DagScheduler, JobSpec, Output, TemplateSpec};
 /// ```
 /// use std::time::Duration;
 ///
-/// use whelm::{Config, DagConfig, DagJob, DagScheduler, Scheduler, Time};
+/// use whelm::{
+///     dag::{DagConfig, DagJob, DagScheduler},
+///     prelude::*,
+/// };
 ///
 /// let ranks = |config| {
 ///     let mut dag = DagScheduler::new(config, Scheduler::new(Config::fifo()));
@@ -58,8 +65,8 @@ use crate::{DagJob, DagScheduler, JobSpec, Output, TemplateSpec};
 pub struct DagConfig {
     /// The work of a [`DagJob`] whose spec has no [`work`](JobSpec::work).
     ///
-    /// A [`Unit`](crate::Unit) declared without a scale takes this, in seconds, as its scale. A
-    /// plain job is a unit of a one-node template of one second of work, as are the nodes of
+    /// A [`Unit`](crate::dag::Unit) declared without a scale takes this, in seconds, as its scale.
+    /// A plain job is a unit of a one-node template of one second of work, as are the nodes of
     /// [`TemplateSpec::jobs`], so each such job gets `default_work`.
     pub default_work: Duration,
     /// Ranks between units are maintained approximately: a rank increase smaller than this
@@ -76,9 +83,10 @@ pub struct DagConfig {
     pub record_passthrough: bool,
     /// Maintain units' ranks as the graph grows and work changes, and submit each job with its
     /// upward rank (the critical path below it) as [`JobSpec::rank`] unless it has one. Whether
-    /// ranks order anything is up to the policy ([`OrderTerm::Rank`](crate::OrderTerm::Rank)).
-    /// Without them, declaring and re-estimating skip all rank propagation, which on long
-    /// dependency chains is most of the cost.
+    /// ranks order anything is up to the policy
+    /// ([`OrderTerm::Rank`](crate::config::OrderTerm::Rank)). Without them, declaring and
+    /// re-estimating skip all rank propagation, which on long dependency chains is most of the
+    /// cost.
     #[cfg_attr(feature = "serde", serde(default = "yes"))]
     pub track_ranks: bool,
 }
@@ -111,7 +119,8 @@ impl Default for DagConfig {
 /// use std::sync::Arc;
 ///
 /// use whelm::{
-///     Config, DagConfig, DagError, DagJob, DagScheduler, Scheduler, TemplateSpec, Time, Unit,
+///     dag::{DagConfig, DagError, DagJob, DagScheduler, TemplateSpec, Unit},
+///     prelude::*,
 /// };
 ///
 /// let mut dag = DagScheduler::new(DagConfig::default(), Scheduler::new(Config::fifo()));

@@ -3,9 +3,14 @@
 use std::time::Duration;
 
 use crate::{
-    Attempt, Config, Constraint, DEVICE_MEMORY, FailKind, Input, JobId, JobSpec, MEMORY, OrderTerm,
-    Output, Policy, Rejection, Reservations, Resource, Resources, RetryConfig, SLOTS, Scheduler,
-    ScoreTerm, Speculate, SpeedConfig, Time, Verdict, WorkerId, WorkerState,
+    config::{Config, OrderTerm, Reservations, RetryConfig, ScoreTerm, Speculate, SpeedConfig},
+    explain::Verdict,
+    job::{Constraint, JobId, JobSpec},
+    policy::{Attempt, FailKind, Input, Output, Policy, Rejection},
+    resources::{DEVICE_MEMORY, MEMORY, Resource, Resources, SLOTS},
+    scheduler::Scheduler,
+    time::Time,
+    worker::{WorkerId, WorkerState},
 };
 
 const GB: u64 = 1_000_000_000;
@@ -906,7 +911,7 @@ fn deferral_waits_for_hard_capacity() {
     const GPUS: Resource = Resource::new("gpus").hard();
     let mut config = Config {
         speed: SpeedConfig {
-            defer: Some(crate::Defer::default()),
+            defer: Some(crate::config::Defer::default()),
             ..SpeedConfig::default()
         },
         ..Config::fifo()

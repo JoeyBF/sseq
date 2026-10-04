@@ -3,7 +3,11 @@
 use std::time::Duration;
 
 use super::{SharedPolicy, mailbox::NoStart};
-use crate::{Attempt, FailKind, GaveUp, Input, JobId, Policy, WorkerId};
+use crate::{
+    job::JobId,
+    policy::{Attempt, FailKind, GaveUp, Input, Policy},
+    worker::WorkerId,
+};
 
 /// A started attempt of a leased job (see [`SharedPolicy::lease`]). Dropping it without
 /// [`complete`](Self::complete) or [`fail`](Self::fail) cancels the job.
@@ -12,10 +16,7 @@ use crate::{Attempt, FailKind, GaveUp, Input, JobId, Policy, WorkerId};
 /// [`fail`](Self::fail) returns for the next attempt, until the job completes or is given up:
 ///
 /// ```
-/// use whelm::{
-///     Config, FailKind, JobSpec, MEMORY, Resources, RetryConfig, SLOTS, Scheduler, SharedPolicy,
-///     Time, WorkerState, gb,
-/// };
+/// use whelm::{config::RetryConfig, policy::FailKind, prelude::*, shared::SharedPolicy};
 ///
 /// let config = Config {
 ///     retry: RetryConfig { max_attempts: 3 },
@@ -94,12 +95,10 @@ impl<'a, P: Policy> Lease<'a, P> {
     /// [`SharedPolicy::with`]): its result is not wanted.
     ///
     /// ```
-    /// use whelm::{
-    ///     Config, Input, JobSpec, MEMORY, Policy, Resources, SLOTS, Scheduler, SharedPolicy, Time, gb,
-    /// };
+    /// use whelm::{prelude::*, shared::SharedPolicy};
     ///
     /// let shared = SharedPolicy::new(Scheduler::new(Config::default()), || Time::ORIGIN);
-    /// shared.worker_update(whelm::WorkerState {
+    /// shared.worker_update(whelm::worker::WorkerState {
     ///     id: 1,
     ///     capacity: Resources::new().with(MEMORY, gb(8.0)).with(SLOTS, 1),
     ///     ..Default::default()
@@ -125,9 +124,7 @@ impl<'a, P: Policy> Lease<'a, P> {
     /// policy's retry is cancelled instead: the result is in hand.
     ///
     /// ```
-    /// use whelm::{
-    ///     Config, JobSpec, MEMORY, Resources, SLOTS, Scheduler, SharedPolicy, Time, WorkerState, gb,
-    /// };
+    /// use whelm::{prelude::*, shared::SharedPolicy};
     ///
     /// let shared = SharedPolicy::new(Scheduler::new(Config::fifo()), || Time::ORIGIN);
     /// for w in [1, 2] {

@@ -16,7 +16,11 @@ use super::{
     UnitState,
     frame::{Frame, HELD, SUBMITTED, sourced_bottom_levels},
 };
-use crate::{JobId, JobSpec, Output, Policy, Time};
+use crate::{
+    job::{JobId, JobSpec},
+    policy::{Output, Policy},
+    time::Time,
+};
 
 /// A serialisable snapshot of a [`DagScheduler`]'s declared graph (not of its policy).
 ///
@@ -29,7 +33,10 @@ use crate::{JobId, JobSpec, Output, Policy, Time};
 /// ```
 /// use std::time::Duration;
 ///
-/// use whelm::{Config, DagConfig, DagJob, DagScheduler, DagSnapshot, Scheduler, Time};
+/// use whelm::{
+///     dag::{DagConfig, DagJob, DagScheduler, DagSnapshot},
+///     prelude::*,
+/// };
 ///
 /// let mut dag = DagScheduler::new(DagConfig::default(), Scheduler::new(Config::fifo()));
 /// dag.declare(
@@ -156,8 +163,8 @@ impl<P: Policy> DagScheduler<P> {
     /// use std::time::Duration;
     ///
     /// use whelm::{
-    ///     Config, DagConfig, DagJob, DagScheduler, Input, Output, Policy, Resources, SLOTS,
-    ///     Scheduler, Time, WorkerState,
+    ///     dag::{DagConfig, DagJob, DagScheduler},
+    ///     prelude::*,
     /// };
     ///
     /// let worker = || {
@@ -289,10 +296,8 @@ impl<P: Policy> DagScheduler<P> {
     ///
     /// ```
     /// # use std::time::Duration;
-    /// # use whelm::{
-    /// #     Config, DagConfig, DagJob, DagScheduler, Input, Output, Policy, Resources,
-    /// #     SLOTS, Scheduler, Time, WorkerState,
-    /// # };
+    /// # use whelm::prelude::*;
+    /// # use whelm::dag::{DagConfig, DagJob, DagScheduler};
     /// let config = DagConfig {
     ///     auto_submit: false,
     ///     ..DagConfig::default()

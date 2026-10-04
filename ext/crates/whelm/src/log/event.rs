@@ -5,7 +5,11 @@ use serde::{Deserialize, Serialize};
 
 #[cfg(doc)]
 use super::{Logged, replay};
-use crate::{Input, JobId, Output, Time};
+use crate::{
+    job::JobId,
+    policy::{Input, Output},
+    time::Time,
+};
 
 /// What a job is, for the simulator (optional; Nassau's vocabulary). Without it a logged job
 /// replays as a signature task of its group.
@@ -60,7 +64,7 @@ pub struct TaskInfo {
 /// Events can be written by hand, e.g. to script a run for [`replay`]:
 ///
 /// ```
-/// use whelm::{Input, JobSpec, MEMORY, Resources, Time, gb, log::Event};
+/// use whelm::{log::Event, prelude::*};
 ///
 /// let submit = Event::Input {
 ///     t: Time::ORIGIN,

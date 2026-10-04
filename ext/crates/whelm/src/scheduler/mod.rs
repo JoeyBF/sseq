@@ -1,4 +1,4 @@
-//! The one placement policy, [`Scheduler`].
+//! The one placement policy, [`Scheduler`], and how it bounds a job's wait.
 //!
 //! A [`Scheduler`] is a [`Policy`]: [`handle`](Policy::handle) applies an event to its state at
 //! once, and [`poll`](Policy::poll) decides placements and returns every [`Output`] since the last
@@ -6,24 +6,21 @@
 //! and for each job looks at every worker in turn:
 //!
 //! 1. the job's constraints must allow the worker ([`Strength`]);
-//! 2. no hold may keep the worker from the job: a [reservation](crate::Reservations) by another
-//!    job, or the job's own [deferral](crate::Defer) to a faster worker;
+//! 2. no hold may keep the worker from the job: a [reservation](#reservations) by another job, or
+//!    the job's own [deferral](crate::speed#waiting-for-a-faster-worker) to a faster worker;
 //! 3. the [`Admission`] rule must admit the job's demand there;
 //!
 //! and among the workers left, [`Config::score`] picks one. A job no worker takes may reserve one
-//! instead. After the scan, idle fast workers may start [speculative](crate::Speculate) second
-//! attempts of jobs running on slow ones. Failed attempts come back to the queue
-//! ([`Config::retry`]).
+//! instead. After the scan, idle fast workers may start
+//! [speculative](crate::speed#speculative-attempts) second attempts of jobs running on slow ones.
+//! Failed attempts come back to the queue ([`Config::retry`]).
 //!
 //! Two one-slot workers and three jobs: two start at once, the third when a slot frees.
 //!
 //! ```
 //! use std::time::Duration;
 //!
-//! use whelm::{
-//!     Config, Input, JobSpec, MEMORY, Output, Policy, Resources, SLOTS, Scheduler, Time,
-//!     WorkerState, gb,
-//! };
+//! use whelm::prelude::*;
 //!
 //! let mut s = Scheduler::new(Config::default());
 //! for w in [1, 2] {
@@ -67,6 +64,278 @@
 //! );
 //! assert_eq!(s.poll(Time(Duration::from_secs(10))), [start(2, 1)]);
 //! ```
+//!
+//! # Time
+//!
+//! The policy reads time only from the `now` passed with each call, and some of its decisions
+//! depend on how long a job has waited. Two mechanisms bound waiting under strict priority order:
+//! aging and reservations.
+//!
+//! ## Aging
+//!
+//! [`Config::age_limit`]: a job that has waited that long becomes more urgent than every job that
+//! has not, oldest first. Below, job 2 waits behind a running job; a more urgent job 3 arrives
+//! later. When the worker frees at 150 s, job 2 has waited past the 100 s limit and goes first;
+//! without aging, job 3 would.
+//!
+//! ```
+//! # use std::time::Duration;
+//! # use whelm::prelude::*;
+//! # use whelm::job::JobId;
+//! /// The job that runs after job 1, under an age limit.
+//! fn second(age_limit: Option<Duration>) -> JobId {
+//!     let mut p = Scheduler::new(Config {
+//!         age_limit,
+//!         reservations: None,
+//!         ..Config::default()
+//!     });
+//!     p.handle(
+//!         Input::Worker(WorkerState {
+//!             id: 1,
+//!             capacity: Resources::new().with(SLOTS, 1),
+//!             ..Default::default()
+//!         }),
+//!         Time::ORIGIN,
+//!     );
+//!     for job in [1, 2] {
+//!         p.handle(
+//!             Input::Submit {
+//!                 job,
+//!                 spec: JobSpec::default(),
+//!             },
+//!             Time::ORIGIN,
+//!         );
+//!     }
+//!     p.poll(Time::ORIGIN);
+//!     let urgent = JobSpec {
+//!         priority: Some(-1),
+//!         ..Default::default()
+//!     };
+//!     p.handle(
+//!         Input::Submit {
+//!             job: 3,
+//!             spec: urgent,
+//!         },
+//!         Time(Duration::from_secs(50)),
+//!     );
+//!     p.handle(
+//!         Input::Done { job: 1, attempt: 1 },
+//!         Time(Duration::from_secs(150)),
+//!     );
+//!     match p.poll(Time(Duration::from_secs(150)))[..] {
+//!         [Output::Start { job, .. }] => job,
+//!         ref out => panic!("{out:?}"),
+//!     }
+//! }
+//! assert_eq!(second(Some(Duration::from_secs(100))), 2);
+//! assert_eq!(second(None), 3);
+//! ```
+//!
+//! ## Reservations
+//!
+//! [`Config::reservations`]: a large job can starve while smaller ones keep filling the space it
+//! needs. The most urgent job that has waited [`reserve_after`](Reservations::reserve_after) and is
+//! admitted nowhere reserves a worker, which then takes no other job until the holder is placed.
+//! Every other worker keeps taking less urgent jobs (backfill).
+//!
+//! ```
+//! # use std::time::Duration;
+//! # use whelm::prelude::*;
+//! # use whelm::explain::{Holding, Verdict};
+//! # use whelm::stats::ReservationInfo;
+//! let mut p = Scheduler::new(Config::default()); // reserve after 60 s
+//! let capacity = Resources::new().with(MEMORY, gb(10.0)).with(SLOTS, 3);
+//! let worker = WorkerState {
+//!     id: 1,
+//!     capacity,
+//!     ..Default::default()
+//! };
+//! p.handle(Input::Worker(worker), Time::ORIGIN);
+//! let job = |job, size| {
+//!     let demand = Resources::new().with(MEMORY, gb(size));
+//!     Input::Submit {
+//!         job,
+//!         spec: JobSpec {
+//!             demand,
+//!             ..Default::default()
+//!         },
+//!     }
+//! };
+//! let start = |job| Output::Start {
+//!     job,
+//!     attempt: 1,
+//!     worker: 1,
+//! };
+//! let done = |job| Input::Done { job, attempt: 1 };
+//!
+//! // Big job 9 needs 8 GB; small jobs 1 and 2 get in first.
+//! for input in [job(1, 4.0), job(9, 8.0), job(2, 4.0)] {
+//!     p.handle(input, Time::ORIGIN);
+//! }
+//! assert_eq!(p.poll(Time::ORIGIN), [start(1), start(2)]);
+//!
+//! // A small job frees 4 GB; that is not enough for job 9, and another small job takes it.
+//! p.handle(done(1), Time(Duration::from_secs(30)));
+//! p.handle(job(3, 4.0), Time(Duration::from_secs(30)));
+//! assert_eq!(p.poll(Time(Duration::from_secs(30))), [start(3)]);
+//!
+//! // At 60 s, job 9 reserves the worker.
+//! assert!(p.poll(Time(Duration::from_secs(60))).is_empty());
+//! let reservation = ReservationInfo {
+//!     job: 9,
+//!     worker: 1,
+//!     since: Time(Duration::from_secs(60)),
+//! };
+//! assert_eq!(p.stats().reservations, [reservation]);
+//! let hold = p.explain(9).unwrap().waiting().unwrap().hold.clone();
+//! assert!(matches!(hold, Some(Holding::Reservation { worker: 1, .. })));
+//!
+//! // Small jobs no longer get in, although they would fit.
+//! p.handle(done(2), Time(Duration::from_secs(70)));
+//! p.handle(job(4, 4.0), Time(Duration::from_secs(70)));
+//! assert!(p.poll(Time(Duration::from_secs(70))).is_empty());
+//! assert_eq!(
+//!     p.explain(4).unwrap().waiting().unwrap().workers,
+//!     [(1, Verdict::Reserved { by: 9 })]
+//! );
+//!
+//! // Once enough has drained, the holder runs.
+//! p.handle(done(3), Time(Duration::from_secs(90)));
+//! assert_eq!(p.poll(Time(Duration::from_secs(90))), [start(9)]);
+//! assert_eq!(p.stats().last_dispatch_holders, [9]);
+//! ```
+//!
+//! A drained worker idles slots. With [`shadow_backfill`](Reservations::shadow_backfill), the
+//! reserved worker still takes jobs expected to finish before the holder could start (its *shadow
+//! time*, from the running jobs' [`work`](JobSpec::work) estimates), which costs the holder
+//! nothing. Here the holder can start when job 1 ends at 100 s: job 3 would end at 90 s and
+//! backfills, job 2 would end at 110 s and does not.
+//!
+//! ```
+//! # use std::time::Duration;
+//! #
+//! # use whelm::prelude::*;
+//! # use whelm::config::Reservations;
+//! let reservations = Reservations {
+//!     shadow_backfill: true,
+//!     ..Reservations::default()
+//! };
+//! let mut p = Scheduler::new(Config {
+//!     reservations: Some(reservations),
+//!     ..Config::default()
+//! });
+//! let worker = WorkerState {
+//!     id: 1,
+//!     capacity: Resources::new().with(MEMORY, gb(10.0)).with(SLOTS, 3),
+//!     ..Default::default()
+//! };
+//! p.handle(Input::Worker(worker), Time::ORIGIN);
+//! let spec = |size, work| JobSpec {
+//!     demand: Resources::new().with(MEMORY, gb(size)),
+//!     work: Some(Duration::from_secs(work)),
+//!     ..Default::default()
+//! };
+//!
+//! p.handle(
+//!     Input::Submit {
+//!         job: 1,
+//!         spec: spec(4.0, 100),
+//!     },
+//!     Time::ORIGIN,
+//! );
+//! p.handle(
+//!     Input::Submit {
+//!         job: 9,
+//!         spec: spec(8.0, 100),
+//!     },
+//!     Time::ORIGIN,
+//! );
+//! assert_eq!(
+//!     p.poll(Time::ORIGIN),
+//!     [Output::Start {
+//!         job: 1,
+//!         attempt: 1,
+//!         worker: 1
+//!     }]
+//! );
+//!
+//! let t = Time(Duration::from_secs(60));
+//! p.handle(
+//!     Input::Submit {
+//!         job: 2,
+//!         spec: spec(4.0, 50),
+//!     },
+//!     t,
+//! );
+//! p.handle(
+//!     Input::Submit {
+//!         job: 3,
+//!         spec: spec(4.0, 30),
+//!     },
+//!     t,
+//! );
+//! assert_eq!(
+//!     p.poll(Time(Duration::from_secs(60))),
+//!     [Output::Start {
+//!         job: 3,
+//!         attempt: 1,
+//!         worker: 1
+//!     }]
+//! );
+//! assert_eq!(p.stats().reservations[0].job, 9);
+//! ```
+//!
+//! ## Holds and wakeups
+//!
+//! Reservations and voluntary waits for a faster worker ([`Defer`], in the
+//! [`speed`](crate::speed#waiting-for-a-faster-worker) chapter) are both *holds*: a worker kept
+//! from a job that it might admit. Holds, aging and reservation thresholds make the passing of time
+//! matter even when no event arrives, so the policy says when it next needs a poll:
+//! [`next_wakeup`](Policy::next_wakeup). A caller sleeps until the earlier of its next event and
+//! that time. Here a job that fits nowhere has two deadlines: it may reserve at
+//! [`reserve_after`](Reservations::reserve_after) and it ages at [`DEFAULT_AGE_LIMIT`].
+//!
+//! ```
+//! # use whelm::prelude::*;
+//! # use whelm::config::{DEFAULT_AGE_LIMIT, Reservations};
+//! let mut p = Scheduler::new(Config::default());
+//! let capacity = Resources::new().with(MEMORY, gb(10.0)).with(SLOTS, 2);
+//! let worker = WorkerState {
+//!     id: 1,
+//!     capacity,
+//!     ..Default::default()
+//! };
+//! p.handle(Input::Worker(worker), Time::ORIGIN);
+//! let spec = JobSpec {
+//!     demand: Resources::new().with(MEMORY, gb(6.0)),
+//!     ..Default::default()
+//! };
+//! p.handle(
+//!     Input::Submit {
+//!         job: 1,
+//!         spec: spec.clone(),
+//!     },
+//!     Time::ORIGIN,
+//! ); // runs for ever
+//! p.handle(Input::Submit { job: 2, spec }, Time::ORIGIN);
+//! p.poll(Time::ORIGIN);
+//!
+//! // No events arrive: poll whenever the policy asks to.
+//! let mut wakeups = Vec::new();
+//! while let Some(t) = p.next_wakeup() {
+//!     wakeups.push(t);
+//!     p.poll(t);
+//! }
+//! let reserve_after = Reservations::default().reserve_after;
+//! assert_eq!(
+//!     wakeups,
+//!     [
+//!         Time::ORIGIN + reserve_after,
+//!         Time::ORIGIN + DEFAULT_AGE_LIMIT
+//!     ]
+//! );
+//! assert_eq!(p.stats().reservations[0].job, 2);
+//! ```
 
 mod attempts;
 mod holds;
@@ -88,14 +357,22 @@ use holds::Hold;
 use order::{Key, dedup};
 
 use crate::{
-    Admission, Attempt, Config, Explanation, Input, JobId, JobSpec, Output, Policy, PolicyStats,
-    ProductionAdmission, Resource, Time, Tried, WorkerId, WorkerState, WorkerView,
-    admission::WorkerAmounts,
-    resources::Dense,
+    admission::{Admission, ProductionAdmission, WorkerAmounts, WorkerView},
+    config::Config,
+    explain::Explanation,
+    job::{JobId, JobSpec},
+    policy::{Attempt, Input, Output, Policy, Tried},
+    resources::{Dense, Resource},
     speed::{ClassId, KindId, Speeds},
+    stats::PolicyStats,
+    time::Time,
+    worker::{WorkerId, WorkerState},
 };
 #[cfg(doc)]
-use crate::{GroupOrder, Strength};
+use crate::{
+    config::{DEFAULT_AGE_LIMIT, Defer, GroupOrder, Reservations},
+    job::Strength,
+};
 
 /// A worker's reported state with the scheduler's bookkeeping of it.
 #[derive(Clone, Debug)]
@@ -111,7 +388,8 @@ struct Worker {
     reserved_for: Option<JobId>,
     /// `state.class`, interned.
     class: ClassId,
-    /// Speed for a job of no particular kind: learned, as reported, or 1 ([`crate::Timing`]).
+    /// Speed for a job of no particular kind: learned, as reported, or 1
+    /// ([`crate::speed::Timing`]).
     speed: f64,
     /// `∫ running dt`, in seconds, up to `occ_at` (mean concurrency over a job's run, for
     /// learning).
@@ -193,8 +471,8 @@ fn tick_occ(w: &mut Worker, now: Time) {
 /// - [`Config::reservations`] drain a worker for a starving job; every other worker keeps
 ///   admitting less urgent jobs.
 /// - Failed attempts are retried ([`Config::retry`]) and, with
-///   [`SpeedConfig::speculate`](crate::SpeedConfig::speculate), idle fast workers run second
-///   attempts of jobs on slow ones.
+///   [`SpeedConfig::speculate`](crate::config::SpeedConfig::speculate), idle fast workers run
+///   second attempts of jobs on slow ones.
 ///
 /// The examples below share the hidden helpers `worker(id, slots, bytes)`, `job(bytes)` and
 /// `start(job, attempt, worker)`, which build a [`WorkerState`], a [`JobSpec`] demanding `bytes`
@@ -214,10 +492,7 @@ fn tick_occ(w: &mut Worker, now: Time) {
 ///
 /// ```
 /// # use std::time::Duration;
-/// # use whelm::{
-/// #     Config, Input, JobSpec, MEMORY, Output, Policy, Resources, SLOTS, Scheduler, Time,
-/// #     WorkerState,
-/// # };
+/// # use whelm::prelude::*;
 /// # let worker = |id, slots, bytes| WorkerState {
 /// #     id,
 /// #     capacity: Resources::new().with(MEMORY, bytes).with(SLOTS, slots),
@@ -248,10 +523,7 @@ fn tick_occ(w: &mut Worker, now: Time) {
 ///
 /// ```
 /// # use std::time::Duration;
-/// # use whelm::{
-/// #     Config, Input, JobSpec, MEMORY, Output, Policy, Resources, SLOTS, Scheduler, Time,
-/// #     WorkerState,
-/// # };
+/// # use whelm::prelude::*;
 /// # let worker = |id, slots, bytes| WorkerState {
 /// #     id,
 /// #     capacity: Resources::new().with(MEMORY, bytes).with(SLOTS, slots),
@@ -259,7 +531,7 @@ fn tick_occ(w: &mut Worker, now: Time) {
 /// # };
 /// # let job = |bytes| JobSpec { demand: Resources::new().with(MEMORY, bytes), ..Default::default() };
 /// # let start = |job, attempt, worker| Output::Start { job, attempt, worker };
-/// use whelm::FailKind;
+/// use whelm::policy::FailKind;
 ///
 /// let mut s = Scheduler::new(Config::default());
 /// s.handle(Input::Worker(worker(1, 1, 100)), Time::ORIGIN);
@@ -285,22 +557,19 @@ fn tick_occ(w: &mut Worker, now: Time) {
 /// assert_eq!(s.poll(Time(Duration::from_secs(3))), [stop]);
 /// ```
 ///
-/// [`RetryConfig`](crate::RetryConfig) shows a job given up.
+/// [`RetryConfig`](crate::config::RetryConfig) shows a job given up.
 ///
 /// # Holds: reservations and deferral
 ///
 /// A hold keeps a worker from a job on purpose although it might admit it. A
-/// [reservation](crate::Reservations) keeps a worker from every job but its holder, so that it
-/// drains for a job that fits nowhere. Here two workers each run a 60-byte job, a 50-byte job
+/// [reservation](crate::config::Reservations) keeps a worker from every job but its holder, so that
+/// it drains for a job that fits nowhere. Here two workers each run a 60-byte job, a 50-byte job
 /// reserves worker 1 once it has waited `reserve_after`, a small job keeps to worker 2, and the
 /// holder starts when worker 1 drains:
 ///
 /// ```
 /// # use std::time::Duration;
-/// # use whelm::{
-/// #     Config, Input, JobSpec, MEMORY, Output, Policy, Resources, SLOTS, Scheduler, Time,
-/// #     WorkerState,
-/// # };
+/// # use whelm::prelude::*;
 /// # let worker = |id, slots, bytes| WorkerState {
 /// #     id,
 /// #     capacity: Resources::new().with(MEMORY, bytes).with(SLOTS, slots),
@@ -325,24 +594,21 @@ fn tick_occ(w: &mut Worker, now: Time) {
 /// assert_eq!(s.poll(Time(Duration::from_secs(70))), [start(20, 1, 2)]);
 /// assert!(matches!(
 ///     s.explain(1).unwrap().waiting().unwrap().hold,
-///     Some(whelm::Holding::Reservation { worker: 1, .. })
+///     Some(whelm::explain::Holding::Reservation { worker: 1, .. })
 /// ));
 /// s.handle(Input::Done { job: 10, attempt: 1 }, Time(Duration::from_secs(100)));
 /// assert_eq!(s.poll(Time(Duration::from_secs(100))), [start(1, 1, 1)]);
 /// assert_eq!(s.stats().last_dispatch_holders, [1]);
 /// ```
 ///
-/// A [deferral](crate::Defer) is a job's own hold: it declines a slow free worker to wait for a
-/// fast busy one, when it expects to finish sooner that way. Here job 1, of 40 s of work, waits
-/// 2.5 s for the worker four times as fast instead of starting on the slow one:
+/// A [deferral](crate::config::Defer) is a job's own hold: it declines a slow free worker to wait
+/// for a fast busy one, when it expects to finish sooner that way. Here job 1, of 40 s of work,
+/// waits 2.5 s for the worker four times as fast instead of starting on the slow one:
 ///
 /// ```
 /// # use std::time::Duration;
 /// #
-/// # use whelm::{
-/// #     Config, Input, JobSpec, MEMORY, Output, Policy, Resources, SLOTS, Scheduler, Time,
-/// #     WorkerState,
-/// # };
+/// # use whelm::prelude::*;
 /// # let worker = |id, slots, bytes| WorkerState {
 /// #     id,
 /// #     capacity: Resources::new().with(MEMORY, bytes).with(SLOTS, slots),
@@ -350,7 +616,7 @@ fn tick_occ(w: &mut Worker, now: Time) {
 /// # };
 /// # let job = |bytes| JobSpec { demand: Resources::new().with(MEMORY, bytes), ..Default::default() };
 /// # let start = |job, attempt, worker| Output::Start { job, attempt, worker };
-/// use whelm::{Defer, SpeedConfig};
+/// use whelm::config::{Defer, SpeedConfig};
 ///
 /// let mut s = Scheduler::new(Config {
 ///     speed: SpeedConfig {
@@ -376,7 +642,7 @@ fn tick_occ(w: &mut Worker, now: Time) {
 /// assert_eq!(s.stats().deferred, [(1, 2, Time(Duration::from_millis(2500)))]);
 /// assert!(matches!(
 ///     s.explain(1).unwrap().waiting().unwrap().hold,
-///     Some(whelm::Holding::Deferral { worker: 2, .. })
+///     Some(whelm::explain::Holding::Deferral { worker: 2, .. })
 /// ));
 /// s.handle(Input::Done { job: 0, attempt: 1 }, Time(Duration::from_millis(2500)));
 /// assert_eq!(s.poll(Time(Duration::from_millis(2500))), [start(1, 1, 2)]);
@@ -384,17 +650,14 @@ fn tick_occ(w: &mut Worker, now: Time) {
 ///
 /// # Speculation
 ///
-/// With [`Speculate`](crate::Speculate), a fast worker left idle after the scan starts a second
-/// attempt of a long job running on a slow worker. Both run; the first to finish wins, and the
-/// other is stopped:
+/// With [`Speculate`](crate::config::Speculate), a fast worker left idle after the scan starts a
+/// second attempt of a long job running on a slow worker. Both run; the first to finish wins, and
+/// the other is stopped:
 ///
 /// ```
 /// # use std::time::Duration;
 /// #
-/// # use whelm::{
-/// #     Config, Input, JobSpec, MEMORY, Output, Policy, Resources, SLOTS, Scheduler, Time,
-/// #     WorkerState,
-/// # };
+/// # use whelm::prelude::*;
 /// # let worker = |id, slots, bytes| WorkerState {
 /// #     id,
 /// #     capacity: Resources::new().with(MEMORY, bytes).with(SLOTS, slots),
@@ -402,7 +665,7 @@ fn tick_occ(w: &mut Worker, now: Time) {
 /// # };
 /// # let job = |bytes| JobSpec { demand: Resources::new().with(MEMORY, bytes), ..Default::default() };
 /// # let start = |job, attempt, worker| Output::Start { job, attempt, worker };
-/// use whelm::{Speculate, SpeedConfig};
+/// use whelm::config::{Speculate, SpeedConfig};
 ///
 /// let mut s = Scheduler::new(Config {
 ///     speed: SpeedConfig {
@@ -458,7 +721,7 @@ pub struct Scheduler {
     last_dispatch_holders: Vec<JobId>,
     /// Every job that deferred at some point of the last dispatch, placed later or not.
     deferred_any: Vec<JobId>,
-    /// The machine model's state ([`SpeedConfig::timing`](crate::SpeedConfig::timing)).
+    /// The machine model's state ([`SpeedConfig::timing`](crate::config::SpeedConfig::timing)).
     speeds: Speeds,
     /// A zero amount of every declared resource: an empty worker's load.
     zero: Dense,
@@ -482,7 +745,7 @@ impl Scheduler {
     /// It starts with no workers and no jobs, so nothing is timed:
     ///
     /// ```
-    /// use whelm::{Config, Policy, Scheduler};
+    /// use whelm::prelude::*;
     ///
     /// let s = Scheduler::new(Config::default());
     /// assert_eq!((s.stats().waiting, s.next_wakeup()), (0, None));
@@ -503,8 +766,8 @@ impl Scheduler {
     ///
     /// ```
     /// use whelm::{
-    ///     Admission, Amounts, Config, Input, JobSpec, Output, Policy, ProductionAdmission, Resources,
-    ///     SLOTS, Scheduler, Time, WorkerState, WorkerView,
+    ///     admission::{Admission, Amounts, ProductionAdmission, WorkerView},
+    ///     prelude::*,
     /// };
     ///
     /// struct SkipDraining;
@@ -594,9 +857,7 @@ impl Scheduler {
     /// ```
     /// use std::time::Duration;
     ///
-    /// use whelm::{
-    ///     Config, Input, JobSpec, Output, Policy, Resources, SLOTS, Scheduler, Time, WorkerState,
-    /// };
+    /// use whelm::prelude::*;
     ///
     /// let next = |forget| {
     ///     let mut s = Scheduler::new(Config::default());

@@ -6,9 +6,12 @@ use std::{
 };
 
 use whelm::{
-    Config, DagConfig, DagJob, DagScheduler, Defer, Input, JobId, JobSpec, MEMORY, Output, Policy,
-    Reservations, Resources, SLOTS, Scheduler, SharedPolicy, Speculate, SpeedConfig, Time,
-    WorkerState, log::Logged,
+    config::{Defer, Reservations, Speculate, SpeedConfig},
+    dag::{DagConfig, DagJob, DagScheduler},
+    job::JobId,
+    log::Logged,
+    prelude::*,
+    shared::SharedPolicy,
 };
 
 /// The latest representable time.

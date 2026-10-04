@@ -1,17 +1,17 @@
 //! Helpers for driving a Nassau resolution (bidegrees `(s, t)`) with this crate.
 //!
 //! A resolution's work comes in bidegrees, and a bidegree's tasks are best kept together: make
-//! each bidegree a [group](crate::JobSpec::group) with [`group`], order groups by id with
-//! [`GroupOrder::Id`](crate::GroupOrder::Id), and read a group back with [`bidegree`].
+//! each bidegree a [group](crate::job::JobSpec::group) with [`group`], order groups by id with
+//! [`GroupOrder::Id`](crate::config::GroupOrder::Id), and read a group back with [`bidegree`].
 //!
 //! The two jobs below are submitted out of order, but the one in the lower homological degree
 //! starts first: group ids order by `s`, then by `t`.
 //!
 //! ```
 //! use whelm::{
-//!     Config, GroupOrder, Input, JobSpec, MEMORY, Output, Policy, Resources, SLOTS, Scheduler,
-//!     Time, WorkerState, gb,
+//!     config::GroupOrder,
 //!     nassau::{bidegree, group},
+//!     prelude::*,
 //! };
 //!
 //! let mut config = Config::default();
@@ -52,9 +52,10 @@
 //! ```
 
 /// The group id of bidegree `(s, t)` (homological degree `s`, internal degree `t`), for
-/// [`JobSpec::group`](crate::JobSpec::group) with [`GroupOrder::Id`](crate::GroupOrder::Id):
-/// bidegrees ordered by `s`, then by `t`. It depends only on the bidegree, so the order survives
-/// a coordinator restart, unlike [`GroupOrder::Arrival`](crate::GroupOrder::Arrival).
+/// [`JobSpec::group`](crate::job::JobSpec::group) with
+/// [`GroupOrder::Id`](crate::config::GroupOrder::Id): bidegrees ordered by `s`, then by `t`. It
+/// depends only on the bidegree, so the order survives a coordinator restart, unlike
+/// [`GroupOrder::Arrival`](crate::config::GroupOrder::Arrival).
 ///
 /// Every bidegree in a lower homological degree sorts first, however large its `t`:
 ///
@@ -73,8 +74,8 @@ pub fn group(s: u32, t: u32) -> u64 {
 
 /// The bidegree of a [`group`] id: `(s, t)`.
 ///
-/// It inverts [`group`], so a group id (e.g. one quoted by [`explain`](crate::Policy::explain))
-/// reads back as a bidegree:
+/// It inverts [`group`], so a group id (e.g. one quoted by
+/// [`explain`](crate::policy::Policy::explain)) reads back as a bidegree:
 ///
 /// ```
 /// use whelm::nassau::{bidegree, group};

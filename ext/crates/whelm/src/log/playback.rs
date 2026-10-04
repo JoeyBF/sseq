@@ -1,19 +1,23 @@
 //! Reading a log back: replaying its inputs, and the polls it recorded.
 
 use super::Event;
-use crate::{Output, Policy, Time};
+use crate::{
+    policy::{Output, Policy},
+    time::Time,
+};
 
 /// Feed a log's inputs and polls to `policy`, in order, and return what each poll returned, with
-/// its time. Given a fresh policy built as the logged one was (same [`Config`](crate::Config),
-/// same admission rule), the result equals [`polls`] of the same log.
+/// its time. Given a fresh policy built as the logged one was (same
+/// [`Config`](crate::config::Config), same admission rule), the result equals [`polls`] of the same
+/// log.
 ///
 /// The outputs are recomputed, not copied from the log: a scripted log with empty polls replays
 /// into the policy's actual decisions.
 ///
 /// ```
 /// use whelm::{
-///     Config, Input, JobSpec, MEMORY, Output, Resources, SLOTS, Scheduler, Time, WorkerState, gb,
 ///     log::{self, Event},
+///     prelude::*,
 /// };
 ///
 /// let w = WorkerState {

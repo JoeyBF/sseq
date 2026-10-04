@@ -1,4 +1,13 @@
 //! The messages between a caller and a [`Policy`], and the trait itself.
+//!
+//! A caller drives a policy with [`Input`]s, each stamped with the current time, and acts on the
+//! [`Output`]s that [`poll`](Policy::poll) returns. Every start names an [`Attempt`], and the
+//! reports about it name that attempt again: [`Input::Done`], or [`Input::Failed`] with a
+//! [`FailKind`]. A job the policy stops retrying comes back as a [`GaveUp`].
+//!
+//! The crate page walks through the protocol: the event loop in its
+//! [Quick start](crate#quick-start), then attempts, retries, cancellation and lost workers in
+//! [Messages and attempts](crate#messages-and-attempts).
 
 use std::{borrow::Cow, fmt};
 
@@ -7,9 +16,18 @@ use serde::{Deserialize, Serialize};
 
 #[cfg(doc)]
 use crate::{
-    Config, DagConfig, DagJob, DagScheduler, Defer, RetryConfig, Scheduler, Speculate, log,
+    config::{Config, Defer, RetryConfig, Speculate},
+    dag::{DagConfig, DagJob, DagScheduler},
+    log,
+    scheduler::Scheduler,
 };
-use crate::{Explanation, JobId, JobSpec, PolicyStats, Time, WorkerId, WorkerState};
+use crate::{
+    explain::Explanation,
+    job::{JobId, JobSpec},
+    stats::PolicyStats,
+    time::Time,
+    worker::{WorkerId, WorkerState},
+};
 
 /// The number of a job's attempt: 1 for its first start, counting retries and speculative
 /// attempts. The DAG layer's local jobs use 0 (see [`DagScheduler`]).
@@ -47,8 +65,9 @@ pub enum FailKind {
 /// use std::time::Duration;
 ///
 /// use whelm::{
-///     Config, FailKind, GaveUp, Input, JobSpec, Output, Policy, Resources, RetryConfig, SLOTS,
-///     Scheduler, Time, Tried, WorkerState,
+///     config::RetryConfig,
+///     policy::{FailKind, GaveUp, Tried},
+///     prelude::*,
 /// };
 ///
 /// let config = Config {
@@ -122,9 +141,7 @@ pub struct GaveUp {
 /// A job demanding GPUs from a scheduler that does not declare them:
 ///
 /// ```
-/// use whelm::{
-///     Config, Input, JobSpec, Output, Policy, Rejection, Resource, Resources, Scheduler, Time,
-/// };
+/// use whelm::{policy::Rejection, prelude::*, resources::Resource};
 ///
 /// const GPUS: Resource = Resource::new("gpus").hard();
 ///
@@ -180,7 +197,7 @@ impl fmt::Display for Rejection {
 /// ```
 /// # #[cfg(feature = "serde")]
 /// # fn main() {
-/// use whelm::Input;
+/// use whelm::prelude::*;
 ///
 /// let json = serde_json::to_string(&Input::Done { job: 7, attempt: 1 }).unwrap();
 /// assert_eq!(json, r#"{"done":{"job":7,"attempt":1}}"#);
@@ -251,9 +268,7 @@ pub enum Input {
 /// A caller's dispatch over the outputs of one poll.
 ///
 /// ```
-/// use whelm::{
-///     Config, Input, JobSpec, Output, Policy, Resources, SLOTS, Scheduler, Time, WorkerState,
-/// };
+/// use whelm::prelude::*;
 ///
 /// let mut p = Scheduler::new(Config::default());
 /// p.handle(
@@ -359,10 +374,7 @@ pub enum Output {
 /// A wrapper that counts the starts of the policy it wraps.
 ///
 /// ```
-/// use whelm::{
-///     Config, Explanation, Input, JobId, JobSpec, Output, Policy, PolicyStats, Resources, SLOTS,
-///     Scheduler, Time, WorkerState,
-/// };
+/// use whelm::{explain::Explanation, job::JobId, prelude::*, stats::PolicyStats};
 ///
 /// /// Counts every start the inner policy emits.
 /// struct Counting<P> {

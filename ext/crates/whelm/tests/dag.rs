@@ -7,8 +7,12 @@ use std::{
 
 use proptest::prelude::*;
 use whelm::{
-    Attempt, Config, DagConfig, DagError, DagJob, DagScheduler, Input, JobId, JobSpec, MEMORY,
-    OrderTerm, Output, Policy, Resources, RetryConfig, SLOTS, Scheduler, Status, Time, WorkerState,
+    config::{OrderTerm, RetryConfig},
+    dag::{DagConfig, DagError, DagJob, DagScheduler},
+    explain::Status,
+    job::JobId,
+    policy::Attempt,
+    prelude::*,
 };
 
 /// A DAG layer over backfill with one roomy worker.
@@ -154,7 +158,7 @@ fn cycles_are_rejected_without_a_trace() {
         d.declare(vec![job(1, &[1])], Time::ORIGIN),
         Err(DagError::Cycle { job: 1 })
     );
-    assert_eq!(d.dag_stats(), whelm::DagStats::default());
+    assert_eq!(d.dag_stats(), whelm::dag::DagStats::default());
 
     d.declare(vec![job(1, &[2]), job(3, &[])], Time::ORIGIN)
         .unwrap();

@@ -1,23 +1,100 @@
-//! The [`Scheduler`](crate::Scheduler)'s configuration.
+//! The [`Scheduler`]'s configuration: which job goes first, and to which worker.
 //!
 //! A [`Config`] is plain data. Its parts, in the order a poll uses them:
 //!
 //! - [`Config::resources`] declares the [`Resource`]s that workers have and jobs demand, which
-//!   admission enforces.
+//!   [admission](crate::admission) enforces.
 //! - [`Config::order`] (with [`GroupOrder`] and [`Config::default_priority`]) ranks the waiting
 //!   jobs, as a list of [`OrderTerm`]s; [`Config::age_limit`] lets jobs that waited long jump
-//!   that order.
+//!   that order ([aging](crate::scheduler#aging)).
 //! - [`Config::score`] ranks the workers that admit a job, as a list of [`ScoreTerm`]s.
-//! - [`Config::reservations`] ([`Reservations`]) drains a worker for a job that fits nowhere.
+//! - [`Config::reservations`] ([`Reservations`]) drains a worker for a job that fits nowhere
+//!   ([reservations](crate::scheduler#reservations)).
 //! - [`Config::speed`] ([`SpeedConfig`]) chooses the machine model ([`Timing`]), and whether a job
-//!   may wait for a faster busy worker ([`Defer`]) or run twice ([`Speculate`]).
+//!   may wait for a faster busy worker ([`Defer`]) or run twice ([`Speculate`]); the
+//!   [`speed`](crate::speed) chapter covers them.
 //! - [`Config::retry`] ([`RetryConfig`]) bounds the retries of failed attempts.
 //!
-//! The presets on [`Config`] cover the common objectives; anything else is a preset with some
-//! fields replaced:
+//! This page is about the first two: ordering jobs and choosing workers.
+//!
+//! # Ordering
+//!
+//! A `Config` is a list-scheduling rule in two parts. Its [`order`](Config::order) decides which
+//! waiting job is considered first: a lexicographic list of [`OrderTerm`]s, ties broken by arrival.
+//! Its [`score`](Config::score) decides which of the workers that admit the job it goes to: a list
+//! of [`ScoreTerm`]s, ties broken by the smallest worker id. Each [`poll`](Policy::poll) scans the
+//! waiting jobs in order and places each one on its best admitting worker, so a job takes a worker
+//! only if every more urgent job was refused there.
+//!
+//! The presets map objectives to rules. The same three jobs, run one at a time on one worker, start
+//! in a different order under each:
 //!
 //! ```
-//! use whelm::{Config, OrderTerm, Reservations, Scheduler};
+//! use std::time::Duration;
+//!
+//! use whelm::{config::GroupOrder, job::JobId, prelude::*};
+//!
+//! /// The order one single-slot worker runs three jobs in under `config`.
+//! fn run_order(config: Config) -> Vec<JobId> {
+//!     let mut p = Scheduler::new(config);
+//!     p.handle(
+//!         Input::Worker(WorkerState {
+//!             id: 1,
+//!             capacity: Resources::new().with(SLOTS, 1),
+//!             ..Default::default()
+//!         }),
+//!         Time::ORIGIN,
+//!     );
+//!     // (job, group, weight, work, due)
+//!     let jobs = [(1, 5, 1.0, 10, 100), (2, 3, 1.0, 1, 50), (3, 5, 4.0, 5, 20)];
+//!     for (job, group, weight, work, due) in jobs {
+//!         let spec = JobSpec {
+//!             group,
+//!             weight,
+//!             work: Some(Duration::from_secs(work)),
+//!             due: Some(Time(Duration::from_secs(due))),
+//!             ..Default::default()
+//!         };
+//!         p.handle(Input::Submit { job, spec }, Time::ORIGIN);
+//!     }
+//!     let (mut order, mut now) = (Vec::new(), Time::ORIGIN);
+//!     while order.len() < 3 {
+//!         for out in p.poll(now) {
+//!             if let Output::Start { job, attempt, .. } = out {
+//!                 order.push(job);
+//!                 now += Duration::from_secs(1);
+//!                 p.handle(Input::Done { job, attempt }, now);
+//!             }
+//!         }
+//!     }
+//!     order
+//! }
+//!
+//! // Groups in order of first arrival (group 5 first), then arrival within a group.
+//! assert_eq!(run_order(Config::default()), [1, 3, 2]);
+//! // Arrival only.
+//! assert_eq!(run_order(Config::fifo()), [1, 2, 3]);
+//! // Largest weight / work first (Smith's rule): 1.0, 0.8, 0.1 per second.
+//! assert_eq!(run_order(Config::weighted_completion()), [2, 3, 1]);
+//! // Earliest due date first (Jackson's rule).
+//! assert_eq!(run_order(Config::lateness()), [3, 2, 1]);
+//! // Groups by id rather than by arrival.
+//! assert_eq!(
+//!     run_order(Config {
+//!         group_order: GroupOrder::Id,
+//!         ..Config::default()
+//!     }),
+//!     [2, 1, 3]
+//! );
+//! ```
+//!
+//! Anything else is a preset with some fields replaced:
+//!
+//! ```
+//! use whelm::{
+//!     config::{OrderTerm, Reservations},
+//!     prelude::*,
+//! };
 //!
 //! // Best fit, with the DAG layer's ranks breaking ties between equal priorities, and two
 //! // reservations at a time.
@@ -33,14 +110,154 @@
 //! let scheduler = Scheduler::new(config);
 //! # let _ = scheduler;
 //! ```
+//!
+//! # Groups
+//!
+//! [Groups](JobSpec::group) gather related jobs (Nassau's bidegrees, through [`nassau::group`]) so
+//! that [`OrderTerm::Group`] finishes one group before starting the next. [`GroupOrder::Arrival`]
+//! depends on the order the caller happened to submit in; [`GroupOrder::Id`] does not, so it
+//! survives a caller restart. [`Scheduler::forget_group`] drops a finished group's arrival record.
+//!
+//! # Explicit priorities
+//!
+//! [`OrderTerm::Priority`], first in every preset but FIFO, is the hook for an external planner:
+//! smaller [`priority`](JobSpec::priority) values go first, and jobs without one count as
+//! [`Config::default_priority`], so a planner can pull some jobs ahead of the rest and push others
+//! behind.
+//!
+//! ```
+//! # use std::time::Duration;
+//! # use whelm::prelude::*;
+//! # use whelm::job::JobId;
+//! let mut p = Scheduler::new(Config::default());
+//! p.handle(
+//!     Input::Worker(WorkerState {
+//!         id: 1,
+//!         capacity: Resources::new().with(SLOTS, 1),
+//!         ..Default::default()
+//!     }),
+//!     Time::ORIGIN,
+//! );
+//! for (job, priority) in [(1, Some(1)), (2, None), (3, Some(-1))] {
+//!     let spec = JobSpec {
+//!         priority,
+//!         ..Default::default()
+//!     };
+//!     p.handle(Input::Submit { job, spec }, Time::ORIGIN);
+//! }
+//! let mut order: Vec<JobId> = Vec::new();
+//! for now in [0, 1, 2].map(|s| Time(Duration::from_secs(s))) {
+//!     for out in p.poll(now) {
+//!         if let Output::Start { job, attempt, .. } = out {
+//!             order.push(job);
+//!             p.handle(
+//!                 Input::Done { job, attempt },
+//!                 now + Duration::from_millis(500),
+//!             );
+//!         }
+//!     }
+//! }
+//! assert_eq!(order, [3, 2, 1]);
+//! ```
+//!
+//! # Choosing a worker
+//!
+//! The default score is [`Speed`](ScoreTerm::Speed), [`Preferred`](ScoreTerm::Preferred),
+//! [`Load`](ScoreTerm::Load): the fastest admitting worker, then a preferred one, then the least
+//! loaded. [`Config::best_fit`] inserts [`Tightest`](ScoreTerm::Tightest) after speed, packing each
+//! job where it leaves the least room and keeping large holes open for large jobs.
+//!
+//! ```
+//! # use whelm::prelude::*;
+//! /// The worker a 10 GB job goes to, given a 100 GB worker 1 and a 20 GB worker 2.
+//! fn place(config: Config) -> u64 {
+//!     let mut p = Scheduler::new(config);
+//!     p.handle(
+//!         Input::Worker(WorkerState {
+//!             id: 1,
+//!             class: "big".into(),
+//!             capacity: Resources::new().with(MEMORY, gb(100.0)).with(SLOTS, 4),
+//!             ..Default::default()
+//!         }),
+//!         Time::ORIGIN,
+//!     );
+//!     p.handle(
+//!         Input::Worker(WorkerState {
+//!             id: 2,
+//!             class: "small".into(),
+//!             capacity: Resources::new().with(MEMORY, gb(20.0)).with(SLOTS, 4),
+//!             ..Default::default()
+//!         }),
+//!         Time::ORIGIN,
+//!     );
+//!     let spec = JobSpec {
+//!         demand: Resources::new().with(MEMORY, gb(10.0)),
+//!         ..Default::default()
+//!     };
+//!     p.handle(Input::Submit { job: 1, spec }, Time::ORIGIN);
+//!     match p.poll(Time::ORIGIN)[..] {
+//!         [Output::Start { worker, .. }] => worker,
+//!         ref out => panic!("{out:?}"),
+//!     }
+//! }
+//! assert_eq!(place(Config::default()), 1); // equally loaded: the smaller id
+//! assert_eq!(place(Config::best_fit()), 2); // the tighter fit
+//! ```
+//!
+//! Workers report a [`speed`](WorkerState::speed) relative to a reference worker; with
+//! [`ScoreTerm::Speed`] in the score the fastest admitting worker wins. The [`speed`](crate::speed)
+//! chapter covers where speeds come from and what else they drive.
+//!
+//! ```
+//! # use whelm::prelude::*;
+//! let mut p = Scheduler::new(Config::default());
+//! p.handle(
+//!     Input::Worker(WorkerState {
+//!         id: 1,
+//!         class: "old".into(),
+//!         capacity: Resources::new().with(SLOTS, 4),
+//!         ..Default::default()
+//!     }),
+//!     Time::ORIGIN,
+//! );
+//! let fast = WorkerState {
+//!     id: 2,
+//!     class: "new".into(),
+//!     capacity: Resources::new().with(SLOTS, 4),
+//!     speed: 2.5,
+//!     ..Default::default()
+//! };
+//! p.handle(Input::Worker(fast), Time::ORIGIN);
+//! p.handle(
+//!     Input::Submit {
+//!         job: 1,
+//!         spec: JobSpec::default(),
+//!     },
+//!     Time::ORIGIN,
+//! );
+//! assert_eq!(
+//!     p.poll(Time::ORIGIN),
+//!     [Output::Start {
+//!         job: 1,
+//!         attempt: 1,
+//!         worker: 2
+//!     }]
+//! );
+//! ```
 
 use std::time::Duration;
 
 #[cfg(doc)]
-use crate::Resources;
-use crate::{DEVICE_MEMORY, MEMORY, Resource, SLOTS, Timing};
+use crate::{
+    job::JobSpec, nassau, policy::Policy, resources::Resources, scheduler::Scheduler,
+    worker::WorkerState,
+};
+use crate::{
+    resources::{DEVICE_MEMORY, MEMORY, Resource, SLOTS},
+    speed::Timing,
+};
 
-/// How a [`Scheduler`](crate::Scheduler) behaves: plain data, with presets.
+/// How a [`Scheduler`] behaves: plain data, with presets.
 ///
 /// A configuration is a list-scheduling rule: [`order`](Self::order) says which waiting job goes
 /// first and [`score`](Self::score) which of the workers that admit it it goes to. The presets map
@@ -64,10 +281,8 @@ use crate::{DEVICE_MEMORY, MEMORY, Resource, SLOTS, Timing};
 /// jobs, the `k`th as id `k`, then runs them one by one on the worker.)
 ///
 /// ```
-/// # use whelm::{
-/// #     Config, Input, JobId, JobSpec, Output, Policy, Resources, SLOTS, Scheduler, Time,
-/// #     WorkerState,
-/// # };
+/// # use whelm::prelude::*;
+/// # use whelm::job::JobId;
 /// # /// The order one slot runs `jobs` in, job `k` as id `k`, all submitted before it joins.
 /// # fn run_order(config: Config, jobs: Vec<JobSpec>) -> Vec<JobId> {
 /// #     let mut s = Scheduler::new(config);
@@ -114,9 +329,9 @@ use crate::{DEVICE_MEMORY, MEMORY, Resource, SLOTS, Timing};
 /// ```
 #[derive(Clone, Debug, PartialEq)]
 pub struct Config {
-    /// The resources workers have and jobs demand, and their rules: the names [`Resources`]
-    /// amounts may use, each declared once ([`Scheduler::new`](crate::Scheduler::new) panics on a
-    /// repeat). The default is [`MEMORY`], [`DEVICE_MEMORY`] and [`SLOTS`].
+    /// The resources workers have and jobs demand, and their rules: the names [`Resources`] amounts
+    /// may use, each declared once ([`Scheduler::new`](crate::scheduler::Scheduler::new) panics on
+    /// a repeat). The default is [`MEMORY`], [`DEVICE_MEMORY`] and [`SLOTS`].
     ///
     /// A [`Resource`] is identified by its name, and its rules are read from here alone: a
     /// constant with the same name and other rules names the resource declared here.
@@ -126,8 +341,8 @@ pub struct Config {
     pub order: Vec<OrderTerm>,
     /// How [`OrderTerm::Group`] orders groups.
     pub group_order: GroupOrder,
-    /// The priority of jobs whose [`JobSpec::priority`](crate::JobSpec::priority) is `None`, for
-    /// [`OrderTerm::Priority`]: priorities below it jump ahead of unprioritised jobs, and those
+    /// The priority of jobs whose [`JobSpec::priority`](crate::job::JobSpec::priority) is `None`,
+    /// for [`OrderTerm::Priority`]: priorities below it jump ahead of unprioritised jobs, and those
     /// above fall behind them.
     pub default_priority: i64,
     /// Aging: a job that has waited at least this long becomes more urgent than every
@@ -156,10 +371,8 @@ impl Default for Config {
     /// priority below [`default_priority`](Config::default_priority):
     ///
     /// ```
-    /// # use whelm::{
-    /// #     Config, Input, JobId, JobSpec, Output, Policy, Resources, SLOTS, Scheduler, Time,
-    /// #     WorkerState,
-    /// # };
+    /// # use whelm::prelude::*;
+    /// # use whelm::job::JobId;
     /// # /// The order one slot runs `jobs` in, job `k` as id `k`, all submitted before it joins.
     /// # fn run_order(config: Config, jobs: Vec<JobSpec>) -> Vec<JobId> {
     /// #     let mut s = Scheduler::new(config);
@@ -205,10 +418,8 @@ impl Config {
     /// Priorities and groups are ignored:
     ///
     /// ```
-    /// # use whelm::{
-    /// #     Config, Input, JobId, JobSpec, Output, Policy, Resources, SLOTS, Scheduler, Time,
-    /// #     WorkerState,
-    /// # };
+    /// # use whelm::prelude::*;
+    /// # use whelm::job::JobId;
     /// # /// The order one slot runs `jobs` in, job `k` as id `k`, all submitted before it joins.
     /// # fn run_order(config: Config, jobs: Vec<JobSpec>) -> Vec<JobId> {
     /// #     let mut s = Scheduler::new(config);
@@ -260,10 +471,7 @@ impl Config {
     /// default's least-loaded rule breaks the tie by worker id instead.
     ///
     /// ```
-    /// use whelm::{
-    ///     Config, Input, JobSpec, MEMORY, Output, Policy, Resources, SLOTS, Scheduler, Time,
-    ///     WorkerState,
-    /// };
+    /// use whelm::prelude::*;
     ///
     /// let place = |config| {
     ///     let mut s = Scheduler::new(config);
@@ -320,14 +528,12 @@ impl Config {
     /// The default with order `[Priority, Wspt]`, for the sum of weighted completion times:
     /// Smith's rule, optimal on one machine.
     ///
-    /// Largest [`weight`](crate::JobSpec::weight) over [`work`](crate::JobSpec::work) first; jobs
-    /// without a work estimate last, in arrival order:
+    /// Largest [`weight`](crate::job::JobSpec::weight) over [`work`](crate::job::JobSpec::work)
+    /// first; jobs without a work estimate last, in arrival order:
     ///
     /// ```
-    /// # use whelm::{
-    /// #     Config, Input, JobId, JobSpec, Output, Policy, Resources, SLOTS, Scheduler, Time,
-    /// #     WorkerState,
-    /// # };
+    /// # use whelm::prelude::*;
+    /// # use whelm::job::JobId;
     /// # /// The order one slot runs `jobs` in, job `k` as id `k`, all submitted before it joins.
     /// # fn run_order(config: Config, jobs: Vec<JobSpec>) -> Vec<JobId> {
     /// #     let mut s = Scheduler::new(config);
@@ -374,14 +580,12 @@ impl Config {
     /// The default with order `[Priority, Edd]`, for maximum lateness: Jackson's rule, optimal on
     /// one machine.
     ///
-    /// Earliest [`due`](crate::JobSpec::due) date first; jobs without one last:
+    /// Earliest [`due`](crate::job::JobSpec::due) date first; jobs without one last:
     ///
     /// ```
     /// # use std::time::Duration;
-    /// # use whelm::{
-    /// #     Config, Input, JobId, JobSpec, Output, Policy, Resources, SLOTS, Scheduler, Time,
-    /// #     WorkerState,
-    /// # };
+    /// # use whelm::prelude::*;
+    /// # use whelm::job::JobId;
     /// # /// The order one slot runs `jobs` in, job `k` as id `k`, all submitted before it joins.
     /// # fn run_order(config: Config, jobs: Vec<JobSpec>) -> Vec<JobId> {
     /// #     let mut s = Scheduler::new(config);
@@ -428,10 +632,7 @@ impl Config {
 /// ```
 /// use std::time::Duration;
 ///
-/// use whelm::{
-///     Config, DEFAULT_AGE_LIMIT, Input, JobSpec, Output, Policy, Resources, SLOTS, Scheduler,
-///     Time, WorkerState,
-/// };
+/// use whelm::{config::DEFAULT_AGE_LIMIT, prelude::*};
 ///
 /// let next = |age_limit| {
 ///     let mut s = Scheduler::new(Config {
@@ -485,10 +686,8 @@ pub const DEFAULT_AGE_LIMIT: Duration = Duration::from_secs(1800);
 /// chain (job 2) first:
 ///
 /// ```
-/// # use whelm::{
-/// #     Config, Input, JobId, JobSpec, Output, Policy, Resources, SLOTS, Scheduler, Time,
-/// #     WorkerState,
-/// # };
+/// # use whelm::prelude::*;
+/// # use whelm::job::JobId;
 /// # /// The order one slot runs `jobs` in, job `k` as id `k`, all submitted before it joins.
 /// # fn run_order(config: Config, jobs: Vec<JobSpec>) -> Vec<JobId> {
 /// #     let mut s = Scheduler::new(config);
@@ -508,7 +707,7 @@ pub const DEFAULT_AGE_LIMIT: Duration = Duration::from_secs(1800);
 /// # }
 /// use std::time::Duration;
 ///
-/// use whelm::OrderTerm::{Group, Rank};
+/// use whelm::config::OrderTerm::{Group, Rank};
 ///
 /// let spec = |group, rank| JobSpec {
 ///     group,
@@ -531,17 +730,15 @@ pub const DEFAULT_AGE_LIMIT: Duration = Duration::from_secs(1800);
 /// ```
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum OrderTerm {
-    /// [`JobSpec::priority`](crate::JobSpec::priority), smallest first; unset counts as
+    /// [`JobSpec::priority`](crate::job::JobSpec::priority), smallest first; unset counts as
     /// [`Config::default_priority`].
     ///
     /// Raising the default priority moves a job of priority 1 from behind the unprioritised job
     /// to ahead of it:
     ///
     /// ```
-    /// # use whelm::{
-    /// #     Config, Input, JobId, JobSpec, Output, Policy, Resources, SLOTS, Scheduler, Time,
-    /// #     WorkerState,
-    /// # };
+    /// # use whelm::prelude::*;
+    /// # use whelm::job::JobId;
     /// # /// The order one slot runs `jobs` in, job `k` as id `k`, all submitted before it joins.
     /// # fn run_order(config: Config, jobs: Vec<JobSpec>) -> Vec<JobId> {
     /// #     let mut s = Scheduler::new(config);
@@ -576,17 +773,17 @@ pub enum OrderTerm {
     /// assert_eq!(run_order(default_priority(2), jobs()), [1, 0]);
     /// ```
     Priority,
-    /// [`JobSpec::rank`](crate::JobSpec::rank), largest first: the longest remaining chain first,
-    /// as in HEFT. Set by the DAG layer; unset sorts last.
+    /// [`JobSpec::rank`](crate::job::JobSpec::rank), largest first: the longest remaining chain
+    /// first, as in HEFT. Set by the DAG layer; unset sorts last.
     Rank,
-    /// [`JobSpec::group`](crate::JobSpec::group), in [`Config::group_order`] ([`GroupOrder`] has
-    /// an example).
+    /// [`JobSpec::group`](crate::job::JobSpec::group), in [`Config::group_order`] ([`GroupOrder`]
+    /// has an example).
     Group,
     /// Weighted shortest processing time, Smith's rule: largest
-    /// [`weight`](crate::JobSpec::weight) over [`work`](crate::JobSpec::work) first. Jobs without
-    /// a work estimate sort last. [`Config::weighted_completion`] has an example.
+    /// [`weight`](crate::job::JobSpec::weight) over [`work`](crate::job::JobSpec::work) first. Jobs
+    /// without a work estimate sort last. [`Config::weighted_completion`] has an example.
     Wspt,
-    /// Earliest due date, Jackson's rule: smallest [`due`](crate::JobSpec::due) first. Jobs
+    /// Earliest due date, Jackson's rule: smallest [`due`](crate::job::JobSpec::due) first. Jobs
     /// without one sort last. [`Config::lateness`] has an example.
     Edd,
 }
@@ -599,17 +796,16 @@ pub enum OrderTerm {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ScoreTerm {
     /// The fastest for the job first, as [`SpeedConfig::timing`] has it: under
-    /// [`Timing::Unrelated`] a worker can rank first for one kind of job and last for another.
-    /// With [`Learn`](crate::Learn) and a resolution, speeds within one resolution step of each
+    /// [`Timing::Unrelated`] a worker can rank first for one kind of job and last for another. With
+    /// [`Learn`](crate::speed::Learn) and a resolution, speeds within one resolution step of each
     /// other tie, so per-worker noise does not override the later terms.
     ///
     /// A worker reporting twice the speed wins over a lower id:
     ///
     /// ```
-    /// # use whelm::{
-    /// #     Config, Input, JobSpec, Output, Policy, Resources, SLOTS, Scheduler, ScoreTerm, Time,
-    /// #     WorkerId, WorkerState,
-    /// # };
+    /// # use whelm::prelude::*;
+    /// # use whelm::config::ScoreTerm;
+    /// # use whelm::worker::WorkerId;
     /// # /// Where a job of `spec` goes among `workers`, ranked by `score`.
     /// # fn first_worker(
     /// #     score: Vec<ScoreTerm>,
@@ -643,20 +839,23 @@ pub enum ScoreTerm {
     ///     ]
     /// };
     /// let job = JobSpec::default();
-    /// assert_eq!(first_worker(vec![ScoreTerm::Speed], workers(), job.clone()), 2);
+    /// assert_eq!(
+    ///     first_worker(vec![ScoreTerm::Speed], workers(), job.clone()),
+    ///     2
+    /// );
     /// assert_eq!(first_worker(vec![ScoreTerm::Load], workers(), job), 1);
     /// ```
     Speed,
-    /// The tightest fit: the smallest [`WorkerView::free_share`](crate::WorkerView::free_share)
-    /// after placement. [`Config::best_fit`] has an example.
+    /// The tightest fit: the smallest
+    /// [`WorkerView::free_share`](crate::admission::WorkerView::free_share) after placement.
+    /// [`Config::best_fit`] has an example.
     Tightest,
     /// The loosest fit: the largest free share after placement.
     ///
     /// ```
-    /// # use whelm::{
-    /// #     Config, Input, JobSpec, MEMORY, Output, Policy, Resources, SLOTS, Scheduler,
-    /// #     ScoreTerm, Time, WorkerId, WorkerState,
-    /// # };
+    /// # use whelm::prelude::*;
+    /// # use whelm::config::ScoreTerm;
+    /// # use whelm::worker::WorkerId;
     /// # /// Where a job of `spec` goes among `workers`, ranked by `score`.
     /// # fn first_worker(
     /// #     score: Vec<ScoreTerm>,
@@ -692,13 +891,13 @@ pub enum ScoreTerm {
     /// assert_eq!(first_worker(vec![ScoreTerm::Loosest], workers, job), 2);
     /// ```
     Loosest,
-    /// Workers a [`Strength::Prefer`](crate::Strength::Prefer) constraint selects first.
+    /// Workers a [`Strength::Prefer`](crate::job::Strength::Prefer) constraint selects first.
     ///
     /// ```
-    /// # use whelm::{
-    /// #     Config, Constraint, Input, JobSpec, Output, Policy, Resources, SLOTS, Scheduler,
-    /// #     ScoreTerm, Time, WorkerId, WorkerState,
-    /// # };
+    /// # use whelm::prelude::*;
+    /// # use whelm::config::ScoreTerm;
+    /// # use whelm::job::Constraint;
+    /// # use whelm::worker::WorkerId;
     /// # /// Where a job of `spec` goes among `workers`, ranked by `score`.
     /// # fn first_worker(
     /// #     score: Vec<ScoreTerm>,
@@ -739,10 +938,7 @@ pub enum ScoreTerm {
     /// Jobs spread over equal workers:
     ///
     /// ```
-    /// use whelm::{
-    ///     Config, Input, JobSpec, Output, Policy, Resources, SLOTS, Scheduler, ScoreTerm, Time,
-    ///     WorkerState,
-    /// };
+    /// use whelm::{config::ScoreTerm, prelude::*};
     ///
     /// let mut s = Scheduler::new(Config {
     ///     score: vec![ScoreTerm::Load],
@@ -778,15 +974,13 @@ pub enum ScoreTerm {
     Load,
 }
 
-/// How [`OrderTerm::Group`] orders [`JobSpec::group`](crate::JobSpec::group)s.
+/// How [`OrderTerm::Group`] orders [`JobSpec::group`](crate::job::JobSpec::group)s.
 ///
 /// Group 9 is submitted before group 2:
 ///
 /// ```
-/// # use whelm::{
-/// #     Config, Input, JobId, JobSpec, Output, Policy, Resources, SLOTS, Scheduler, Time,
-/// #     WorkerState,
-/// # };
+/// # use whelm::prelude::*;
+/// # use whelm::job::JobId;
 /// # /// The order one slot runs `jobs` in, job `k` as id `k`, all submitted before it joins.
 /// # fn run_order(config: Config, jobs: Vec<JobSpec>) -> Vec<JobId> {
 /// #     let mut s = Scheduler::new(config);
@@ -804,7 +998,7 @@ pub enum ScoreTerm {
 /// #     }
 /// #     order
 /// # }
-/// use whelm::GroupOrder;
+/// use whelm::config::GroupOrder;
 ///
 /// let jobs = || {
 ///     vec![
@@ -833,14 +1027,14 @@ pub enum GroupOrder {
     #[default]
     Arrival,
     /// By the group id itself, smallest first: restart-stable when the caller derives ids from
-    /// the work (e.g. [`nassau::group`](crate::nassau::group)).
+    /// the work (e.g. [`nassau::group`]).
     Id,
 }
 
 /// Reservations: the most urgent job that has waited at least `reserve_after` and is admitted
 /// nowhere reserves the worker with the most headroom
-/// ([`WorkerView::free_share`](crate::WorkerView::free_share)), which admits no other job until
-/// the holder is placed -- at the latest when the worker empties, by the escape hatch.
+/// ([`WorkerView::free_share`](crate::admission::WorkerView::free_share)), which admits no other
+/// job until the holder is placed -- at the latest when the worker empties, by the escape hatch.
 ///
 /// A reservation is released when its holder is placed (anywhere) or cancelled, or its worker
 /// leaves or changes class (the holder may then reserve again). When all reservations are taken,
@@ -852,7 +1046,7 @@ pub enum GroupOrder {
 /// running time of the jobs on the worker it reserves (nothing new is admitted there once it holds
 /// the reservation, and nobody more urgent can take the reservation over).
 ///
-/// [`Scheduler`](crate::Scheduler) shows a reservation from start to finish.
+/// [`Scheduler`] shows a reservation from start to finish.
 ///
 /// # Example
 ///
@@ -864,10 +1058,7 @@ pub enum GroupOrder {
 /// ```
 /// use std::time::Duration;
 ///
-/// use whelm::{
-///     Config, Input, JobSpec, MEMORY, Output, Policy, Reservations, Resources, SLOTS, Scheduler,
-///     Time, WorkerState,
-/// };
+/// use whelm::{config::Reservations, prelude::*};
 ///
 /// let mut s = Scheduler::new(Config {
 ///     reservations: Some(Reservations {
@@ -988,13 +1179,13 @@ impl Default for Reservations {
 
 /// When a job may wait for a busy worker faster than the one [`Config::score`] picked, instead of
 /// starting there: earliest finish time with a deferral window (HEFT's processor choice, online;
-/// StarPU's dmda). A job with [`JobSpec::work`](crate::JobSpec::work) waits for the faster worker
-/// on which it is expected to finish earliest, if that beats starting now by enough. It waits only
-/// for a worker short of a [hard](crate::Resource::hard) resource for it (every slot taken, under
-/// the default declaration) that would admit it once a job demanding as much of those resources
-/// ends there.
+/// StarPU's dmda). A job with [`JobSpec::work`](crate::job::JobSpec::work) waits for the faster
+/// worker on which it is expected to finish earliest, if that beats starting now by enough. It
+/// waits only for a worker short of a [hard](crate::resources::Resource::hard) resource for it
+/// (every slot taken, under the default declaration) that would admit it once a job demanding as
+/// much of those resources ends there.
 ///
-/// A deferral is a hold that lapses by itself; [`Scheduler`](crate::Scheduler) shows one paying
+/// A deferral is a hold that lapses by itself; [`Scheduler`] shows one paying
 /// off.
 ///
 /// # Example
@@ -1008,8 +1199,8 @@ impl Default for Reservations {
 /// use std::time::Duration;
 ///
 /// use whelm::{
-///     Config, Defer, Input, JobSpec, Output, Policy, Resources, SLOTS, Scheduler, SpeedConfig,
-///     Time, WorkerState,
+///     config::{Defer, SpeedConfig},
+///     prelude::*,
 /// };
 ///
 /// let mut s = Scheduler::new(Config {
@@ -1065,7 +1256,7 @@ impl Default for Reservations {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Defer {
     /// A job that has waited this long no longer defers. Bounds the extra waiting;
-    /// expiry is reported by [`Policy::next_wakeup`](crate::Policy::next_wakeup).
+    /// expiry is reported by [`Policy::next_wakeup`].
     pub max_wait: Duration,
     /// Defer only if the expected finish improves by at least this fraction of the job's work.
     /// Lower defers more often, also for a barely faster, scarce class, where waiting backfires;
@@ -1090,7 +1281,7 @@ impl Default for Defer {
 /// The default trusts reported speeds and neither defers nor speculates:
 ///
 /// ```
-/// use whelm::{SpeedConfig, Timing};
+/// use whelm::{config::SpeedConfig, speed::Timing};
 ///
 /// let speed = SpeedConfig::default();
 /// assert_eq!(speed.timing, Timing::Related { learn: None });
@@ -1106,15 +1297,16 @@ pub struct SpeedConfig {
     pub speculate: Option<Speculate>,
 }
 
-/// Speculative execution (HeteroPrio's spoliation, without the kill): after a poll's placements,
-/// a worker with room left (its admission bound admits something) that no waiting job took starts
+/// Speculative execution (HeteroPrio's spoliation, without the kill): after a poll's placements, a
+/// worker with room left (its admission bound admits something) that no waiting job took starts
 /// another attempt of the running job, on slower workers only, that it would finish soonest
 /// relative to where it runs (the one with the latest expected end among those that gain), if the
 /// new attempt is expected to finish at least `min_gain` of its run time earlier. The original
 /// keeps running; the first to finish wins and the other is stopped
-/// ([`Output::Stop`](crate::Output::Stop)). Needs [`JobSpec::work`](crate::JobSpec::work).
+/// ([`Output::Stop`](crate::policy::Output::Stop)). Needs
+/// [`JobSpec::work`](crate::job::JobSpec::work).
 ///
-/// [`Scheduler`](crate::Scheduler) shows a speculative attempt winning.
+/// [`Scheduler`] shows a speculative attempt winning.
 ///
 /// # Example
 ///
@@ -1126,8 +1318,8 @@ pub struct SpeedConfig {
 /// use std::time::Duration;
 ///
 /// use whelm::{
-///     Config, Input, JobSpec, Policy, Resources, SLOTS, Scheduler, Speculate, SpeedConfig, Time,
-///     WorkerState,
+///     config::{Speculate, SpeedConfig},
+///     prelude::*,
 /// };
 ///
 /// let mut s = Scheduler::new(Config {
@@ -1184,17 +1376,14 @@ impl Default for Speculate {
 
 /// How often a failed job is retried.
 ///
-/// [`Scheduler`](crate::Scheduler) shows a retry. With two rounds, the second failure gives the
-/// job up; it is [`retryable`](crate::GaveUp::retryable) only if every attempt ran out of device
-/// memory.
+/// [`Scheduler`] shows a retry. With two rounds, the second failure gives the
+/// job up; it is [`retryable`](crate::policy::GaveUp::retryable) only if every attempt ran out of
+/// device memory.
 ///
 /// ```
 /// use std::time::Duration;
 ///
-/// use whelm::{
-///     Config, FailKind, Input, JobSpec, Output, Policy, Resources, RetryConfig, SLOTS, Scheduler,
-///     Time, WorkerState,
-/// };
+/// use whelm::{config::RetryConfig, policy::FailKind, prelude::*};
 ///
 /// let mut s = Scheduler::new(Config {
 ///     retry: RetryConfig { max_attempts: 2 },
@@ -1240,9 +1429,9 @@ impl Default for Speculate {
 /// ```
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RetryConfig {
-    /// Rounds per job before it is given up ([`Output::GaveUp`](crate::Output::GaveUp)): a round
-    /// is an attempt started from the queue, with any speculative attempts made alongside it, and
-    /// it fails when its last live attempt does. 0 counts as 1.
+    /// Rounds per job before it is given up ([`Output::GaveUp`](crate::policy::Output::GaveUp)): a
+    /// round is an attempt started from the queue, with any speculative attempts made alongside it,
+    /// and it fails when its last live attempt does. 0 counts as 1.
     pub max_attempts: u32,
 }
 

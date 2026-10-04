@@ -8,9 +8,10 @@ use std::{
 };
 
 use whelm::{
-    Attempt, Config, EventSink, FailKind, Input, JobId, JobSpec, MEMORY, Output, Policy, Resources,
-    SLOTS, Scheduler, Time, WorkerState, gb,
-    log::{Event, JsonlSink, Logged, TaskInfo, polls, replay},
+    job::JobId,
+    log::{Event, EventSink, JsonlSink, Logged, TaskInfo, polls, replay},
+    policy::{Attempt, FailKind},
+    prelude::*,
 };
 
 const WORKERS: u64 = 3;

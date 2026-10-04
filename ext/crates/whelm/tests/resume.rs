@@ -4,8 +4,10 @@ use std::{sync::Arc, time::Duration};
 
 use proptest::prelude::*;
 use whelm::{
-    Attempt, Config, DagConfig, DagJob, DagScheduler, DagTemplate, Input, JobId, JobSpec, MEMORY,
-    NodeSource, Output, Policy, Resources, SLOTS, Scheduler, TemplateSpec, Time, Unit, WorkerState,
+    dag::{DagConfig, DagJob, DagScheduler, DagTemplate, NodeSource, TemplateSpec, Unit},
+    job::JobId,
+    policy::Attempt,
+    prelude::*,
 };
 
 /// A DAG layer over the default backfill policy with one worker of `slots` slots.

@@ -1,27 +1,103 @@
 //! Resource kinds, and the amounts of them that jobs demand and workers have.
 //!
-//! A [`Resource`] describes one kind of resource: its name, whether it is hard or soft, what a job
-//! takes of it by default, and how its amounts read. [`Config::resources`] declares the ones a
-//! scheduler knows, and a [`Resources`] value holds amounts of them keyed by name. The default
-//! declaration is [`MEMORY`], [`DEVICE_MEMORY`] and [`SLOTS`].
+//! A configuration declares the resources its workers have and its jobs use, as a list of
+//! [`Resource`]s in [`Config::resources`]. A `Resource` describes one kind of resource: its name,
+//! whether it is hard or soft, what a job takes of it by default, and how its amounts read. It is
+//! usually a constant, and the default declaration is three of them: host memory ([`MEMORY`]) and
+//! device memory ([`DEVICE_MEMORY`]), in bytes, and execution slots ([`SLOTS`]).
 //!
-//! Here workers count their GPUs: a hard resource that jobs take none of unless they say so.
+//! A [`Resources`] value holds amounts of resources keyed by name, built up with
+//! [`with`](Resources::with): a job's [`demand`](JobSpec::demand) is what it is expected to use,
+//! and a worker's [`capacity`](WorkerState::capacity) is what it has. A resource it leaves out has
+//! amount zero, and [`gb`] turns gigabytes into bytes.
 //!
 //! ```
-//! use whelm::{Config, MEMORY, Resource, Resources, SLOTS, gb};
+//! use whelm::prelude::*;
+//!
+//! let demand = Resources::new()
+//!     .with(MEMORY, gb(6.0))
+//!     .with(DEVICE_MEMORY, gb(2.0));
+//! assert_eq!(demand.get(MEMORY), 6_000_000_000);
+//! assert_eq!(demand.get(SLOTS), 0);
+//! // Setting a resource again replaces its amount.
+//! assert_eq!(demand.with(MEMORY, 1).get(MEMORY), 1);
+//! ```
+//!
+//! A resource's [`default_demand`](Resource::default_demand) is what a job takes of it when its
+//! demand leaves it out: one slot, so every job takes a slot unless it asks for more. A worker
+//! states its capacity whole, so its slots too; one without slots runs nothing. Whether a resource
+//! is [hard](Resource::hard) or soft decides how [admission](crate::admission) enforces it: slots
+//! always, memory with an escape hatch for a job alone on a worker.
+//!
+//! # Declaring a resource
+//!
+//! Any other resource is a declaration away: a constant, made with [`Resource::new`] and its
+//! `const` builder methods, added to [`Config::resources`]. Here workers count their GPUs, a hard
+//! resource that jobs take none of unless they say so: the GPU jobs share the one worker that has
+//! GPUs, the others go anywhere, and a job no worker has a GPU left for is explained by name. A
+//! license pool per worker, or a scratch disk (soft, like memory), is declared the same way.
+//!
+//! A resource is its name. The scheduler reads a resource's rules (hard or soft, default demand,
+//! unit) from its declaration alone, so amounts built with another constant of the same name mean
+//! the declared resource. A name the declaration lacks is a mistake the scheduler reports rather
+//! than ignores: a job demanding it is [rejected](Output::Rejected) and forgotten, and a worker
+//! state naming it is a panic ([`Input::Worker`]).
+//!
+//! ```
+//! # use whelm::prelude::*;
+//! use whelm::{policy::Rejection, resources::Resource};
 //!
 //! const GPUS: Resource = Resource::new("gpus").hard();
 //!
 //! let mut config = Config::default();
 //! config.resources.push(GPUS);
+//! let mut p = Scheduler::new(config);
 //!
-//! let capacity = Resources::new()
-//!     .with(MEMORY, gb(64.0))
-//!     .with(SLOTS, 8)
-//!     .with(GPUS, 4);
-//! let demand = Resources::new().with(MEMORY, gb(2.0)).with(GPUS, 1);
-//! assert_eq!((capacity.get(GPUS), demand.get(GPUS)), (4, 1));
-//! assert_eq!(demand.get(SLOTS), 0); // the scheduler fills in the default demand
+//! // Worker 1 has no GPU, worker 2 has two; both have eight slots.
+//! for (id, n) in [(1, 0), (2, 2)] {
+//!     let worker = WorkerState {
+//!         id,
+//!         capacity: Resources::new().with(SLOTS, 8).with(GPUS, n),
+//!         ..Default::default()
+//!     };
+//!     p.handle(Input::Worker(worker), Time::ORIGIN);
+//! }
+//! // Jobs 1 to 3 need a GPU each; job 4 needs none.
+//! for job in 1..=4 {
+//!     let spec = JobSpec {
+//!         demand: Resources::new().with(GPUS, (job < 4).into()),
+//!         ..Default::default()
+//!     };
+//!     p.handle(Input::Submit { job, spec }, Time::ORIGIN);
+//! }
+//! // Job 5 needs a TPU, which this configuration does not declare.
+//! let spec = JobSpec {
+//!     demand: Resources::new().with(Resource::new("tpus"), 1),
+//!     ..Default::default()
+//! };
+//! p.handle(Input::Submit { job: 5, spec }, Time::ORIGIN);
+//!
+//! let start = |job, worker| Output::Start {
+//!     job,
+//!     attempt: 1,
+//!     worker,
+//! };
+//! let rejected = Output::Rejected {
+//!     job: 5,
+//!     reason: Rejection::Undeclared {
+//!         resource: "tpus".into(),
+//!     },
+//! };
+//! assert_eq!(
+//!     p.poll(Time::ORIGIN),
+//!     [rejected, start(1, 2), start(2, 2), start(4, 1)]
+//! );
+//! assert_eq!(
+//!     p.explain(3).unwrap().to_string(),
+//!     "job 3 (demand [slots 1, gpus 1], group 0) waiting 0s, 0 more urgent job(s) waiting; gpus \
+//!      full on 2 worker(s)"
+//! );
+//! assert_eq!(p.explain(5), None);
 //! ```
 
 use std::{borrow::Cow, fmt};
@@ -31,7 +107,13 @@ use serde::{Deserialize, Serialize};
 
 #[cfg(doc)]
 use crate::{
-    Admission, Config, Explanation, JobSpec, Output, ProductionAdmission, Scheduler, WorkerState,
+    admission::{Admission, ProductionAdmission},
+    config::Config,
+    explain::Explanation,
+    job::JobSpec,
+    policy::{Input, Output},
+    scheduler::Scheduler,
+    worker::WorkerState,
 };
 
 /// How a [`Resource`]'s amounts read when an [`Explanation`] is displayed.
@@ -70,7 +152,7 @@ pub enum ResourceUnit {
 /// run time goes in the [`name`](Self::name) field.
 ///
 /// ```
-/// use whelm::{Resource, ResourceUnit};
+/// use whelm::resources::{Resource, ResourceUnit};
 ///
 /// const LICENSES: Resource = Resource::new("licenses").hard();
 /// const SCRATCH: Resource = Resource::new("scratch").unit(ResourceUnit::Bytes);
@@ -152,7 +234,7 @@ pub const SLOTS: Resource = Resource::new("slots").hard().default_demand(1);
 /// # Examples
 ///
 /// ```
-/// use whelm::gb;
+/// use whelm::prelude::*;
 ///
 /// assert_eq!(gb(1.5), 1_500_000_000);
 /// assert_eq!(gb(-1.0), 0);
@@ -176,7 +258,7 @@ pub fn gb(x: f64) -> u64 {
 /// # Examples
 ///
 /// ```
-/// use whelm::{DEVICE_MEMORY, MEMORY, Resources, SLOTS, gb};
+/// use whelm::prelude::*;
 ///
 /// let demand = Resources::new()
 ///     .with(MEMORY, gb(4.0))

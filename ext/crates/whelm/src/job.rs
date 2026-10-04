@@ -1,4 +1,206 @@
 //! Job descriptions and their placement constraints.
+//!
+//! A [`JobSpec`] is what the caller says about a job when it submits it: what it is expected to use
+//! ([`demand`](JobSpec::demand), see [`resources`](crate::resources)), the group it belongs to, and
+//! the optional fields that the [ordering](crate::config) and [speed](crate::speed) features read.
+//! This page is about the one part of a spec that restricts where the job may run: its constraints.
+//!
+//! # Constraints
+//!
+//! A job's [`constraints`](JobSpec::constraints) restrict where it runs. Each names workers with a
+//! [`Selector`] (one worker, or a class of workers) and binds with a [`Strength`]: `Require` and
+//! `Forbid` are hard, `Avoid` is soft, and `Prefer` only ranks the workers that admit the job. The
+//! constructors on [`Constraint`] cover each strength on one worker or one class.
+//!
+//! ```
+//! # use std::time::Duration;
+//! # use whelm::prelude::*;
+//! # use whelm::job::Constraint;
+//! let mut p = Scheduler::new(Config::default());
+//! for (id, class) in [(1, "cpu"), (2, "gpu"), (3, "gpu")] {
+//!     let worker = WorkerState {
+//!         id,
+//!         class: class.into(),
+//!         capacity: Resources::new().with(SLOTS, 4),
+//!         ..Default::default()
+//!     };
+//!     p.handle(Input::Worker(worker), Time::ORIGIN);
+//! }
+//! let constrained = |constraints| JobSpec {
+//!     constraints,
+//!     ..Default::default()
+//! };
+//! let gpu = Constraint::require_class("gpu");
+//! let spec = constrained(vec![gpu.clone()]);
+//! p.handle(Input::Submit { job: 1, spec }, Time::ORIGIN);
+//! let not_2 = Constraint::forbid_worker(2);
+//! let spec = constrained(vec![gpu, not_2]);
+//! p.handle(Input::Submit { job: 2, spec }, Time::ORIGIN);
+//! assert_eq!(
+//!     p.poll(Time::ORIGIN),
+//!     [
+//!         Output::Start {
+//!             job: 1,
+//!             attempt: 1,
+//!             worker: 2
+//!         },
+//!         Output::Start {
+//!             job: 2,
+//!             attempt: 1,
+//!             worker: 3
+//!         },
+//!     ]
+//! );
+//!
+//! // No worker has the class: the job waits, and says why.
+//! let tpu = Constraint::require_class("tpu");
+//! let spec = constrained(vec![tpu]);
+//! p.handle(Input::Submit { job: 3, spec }, Time(Duration::from_secs(1)));
+//! assert!(p.poll(Time(Duration::from_secs(1))).is_empty());
+//! let why = p.explain(3).unwrap();
+//! let verdicts = &why.waiting().unwrap().workers;
+//! assert!(
+//!     verdicts
+//!         .iter()
+//!         .all(|(_, v)| *v == whelm::explain::Verdict::Ineligible)
+//! );
+//! assert!(
+//!     why.to_string()
+//!         .ends_with("; 3 worker(s) excluded by its constraints")
+//! );
+//! ```
+//!
+//! # Preferring a worker
+//!
+//! A preferred worker wins over a less loaded one: the default score ranks
+//! [`Preferred`](ScoreTerm::Preferred) before [`Load`](ScoreTerm::Load) (see
+//! [choosing a worker](crate::config#choosing-a-worker)). Use it for cache affinity.
+//!
+//! ```
+//! # use std::time::Duration;
+//! # use whelm::prelude::*;
+//! # use whelm::job::Constraint;
+//! let mut p = Scheduler::new(Config::default());
+//! for id in [1, 2] {
+//!     p.handle(
+//!         Input::Worker(WorkerState {
+//!             id,
+//!             capacity: Resources::new().with(SLOTS, 4),
+//!             ..Default::default()
+//!         }),
+//!         Time::ORIGIN,
+//!     );
+//! }
+//! p.handle(
+//!     Input::Submit {
+//!         job: 1,
+//!         spec: JobSpec::default(),
+//!     },
+//!     Time::ORIGIN,
+//! );
+//! assert_eq!(
+//!     p.poll(Time::ORIGIN),
+//!     [Output::Start {
+//!         job: 1,
+//!         attempt: 1,
+//!         worker: 1
+//!     }]
+//! );
+//!
+//! // Worker 1 is busier, but job 2 prefers it; job 3 has no preference.
+//! let fond = JobSpec {
+//!     constraints: vec![Constraint::prefer_worker(1)],
+//!     ..Default::default()
+//! };
+//! let later = Time(Duration::from_secs(1));
+//! p.handle(Input::Submit { job: 2, spec: fond }, later);
+//! p.handle(
+//!     Input::Submit {
+//!         job: 3,
+//!         spec: JobSpec::default(),
+//!     },
+//!     later,
+//! );
+//! assert_eq!(
+//!     p.poll(Time(Duration::from_secs(1))),
+//!     [
+//!         Output::Start {
+//!             job: 2,
+//!             attempt: 1,
+//!             worker: 1
+//!         },
+//!         Output::Start {
+//!             job: 3,
+//!             attempt: 1,
+//!             worker: 2
+//!         },
+//!     ]
+//! );
+//! ```
+//!
+//! # Avoiding a worker
+//!
+//! An avoided worker is used only while no live worker (one with slots) that the hard constraints
+//! allow is free of every `Avoid`. That depends on which workers exist, not on how loaded they are,
+//! so the job waits for a busy acceptable worker; it is the same rule a
+//! [retry](crate#failures-and-retries) applies to the workers it failed on. Here job 2 avoids
+//! worker 1 and waits for worker 2, until worker 2 is drained (its slot count set to zero by a
+//! heartbeat).
+//!
+//! ```
+//! # use std::time::Duration;
+//! # use whelm::prelude::*;
+//! # use whelm::job::Constraint;
+//! let mut p = Scheduler::new(Config::default());
+//! for id in [1, 2] {
+//!     p.handle(
+//!         Input::Worker(WorkerState {
+//!             id,
+//!             capacity: Resources::new().with(SLOTS, 1),
+//!             ..Default::default()
+//!         }),
+//!         Time::ORIGIN,
+//!     );
+//! }
+//! let constrained = |constraint| JobSpec {
+//!     constraints: vec![constraint],
+//!     ..Default::default()
+//! };
+//! let spec = constrained(Constraint::prefer_worker(2));
+//! p.handle(Input::Submit { job: 1, spec }, Time::ORIGIN);
+//! let spec = constrained(Constraint::avoid_worker(1));
+//! p.handle(Input::Submit { job: 2, spec }, Time::ORIGIN);
+//! assert_eq!(
+//!     p.poll(Time::ORIGIN),
+//!     [Output::Start {
+//!         job: 1,
+//!         attempt: 1,
+//!         worker: 2
+//!     }]
+//! );
+//! let why = p.explain(2).unwrap();
+//! assert_eq!(
+//!     why.waiting().unwrap().workers[0],
+//!     (1, whelm::explain::Verdict::Ineligible)
+//! );
+//!
+//! p.handle(
+//!     Input::Worker(WorkerState {
+//!         id: 2,
+//!         capacity: Resources::new().with(SLOTS, 0),
+//!         ..Default::default()
+//!     }),
+//!     Time(Duration::from_secs(1)),
+//! );
+//! assert_eq!(
+//!     p.poll(Time(Duration::from_secs(1))),
+//!     [Output::Start {
+//!         job: 2,
+//!         attempt: 1,
+//!         worker: 1
+//!     }]
+//! );
+//! ```
 
 use std::time::Duration;
 
@@ -7,10 +209,17 @@ use serde::{Deserialize, Serialize};
 
 #[cfg(doc)]
 use crate::{
-    Config, DagConfig, DagScheduler, Defer, Input, OrderTerm, Output, Policy, Resource, ScoreTerm,
-    Speculate, Timing,
+    config::{Config, Defer, OrderTerm, ScoreTerm, Speculate},
+    dag::{DagConfig, DagScheduler},
+    policy::{Input, Output, Policy},
+    resources::Resource,
+    speed::Timing,
 };
-use crate::{Resources, Time, WorkerId, WorkerState};
+use crate::{
+    resources::Resources,
+    time::Time,
+    worker::{WorkerId, WorkerState},
+};
 
 /// A job identifier, chosen by the caller. Must be unique among live (waiting or running) jobs.
 ///
@@ -23,7 +232,7 @@ pub type JobId = u64;
 /// # Examples
 ///
 /// ```
-/// use whelm::{Resources, SLOTS, Selector, WorkerState};
+/// use whelm::{job::Selector, prelude::*};
 ///
 /// let w = WorkerState {
 ///     id: 7,
@@ -57,18 +266,15 @@ impl Selector {
 
 /// How a [`Constraint`] binds.
 ///
-/// `Require` and `Forbid` are hard, `Avoid` is soft and `Prefer` only ranks workers. The crate's
-/// [Constraints](crate#constraints) chapter shows each one placing jobs.
+/// `Require` and `Forbid` are hard, `Avoid` is soft and `Prefer` only ranks workers. The module's
+/// [Constraints](crate::job#constraints) chapter shows each one placing jobs.
 ///
 /// # Examples
 ///
 /// Requires of one kind are alternatives: this job may run on either class.
 ///
 /// ```
-/// use whelm::{
-///     Config, Constraint, Input, JobSpec, Output, Policy, Resources, SLOTS, Scheduler, Time,
-///     WorkerState,
-/// };
+/// use whelm::{job::Constraint, prelude::*};
 ///
 /// let mut p = Scheduler::new(Config::default());
 /// for (id, class) in [(1, "cpu"), (2, "a100"), (3, "h100")] {
@@ -133,7 +339,10 @@ pub enum Strength {
 /// # Examples
 ///
 /// ```
-/// use whelm::{Constraint, JobSpec, Selector, Strength};
+/// use whelm::{
+///     job::{Constraint, Selector, Strength},
+///     prelude::*,
+/// };
 ///
 /// let job = JobSpec {
 ///     constraints: vec![Constraint::avoid_worker(3)],
@@ -160,7 +369,7 @@ impl Constraint {
     /// # Examples
     ///
     /// ```
-    /// use whelm::{Constraint, Selector, Strength};
+    /// use whelm::job::{Constraint, Selector, Strength};
     ///
     /// let c = Constraint::require_worker(2);
     /// assert_eq!((c.on, c.strength), (Selector::Worker(2), Strength::Require));
@@ -177,10 +386,7 @@ impl Constraint {
     /// # Examples
     ///
     /// ```
-    /// use whelm::{
-    ///     Config, Constraint, Input, JobSpec, Output, Policy, Resources, SLOTS, Scheduler, Time,
-    ///     WorkerState,
-    /// };
+    /// use whelm::{job::Constraint, prelude::*};
     ///
     /// let mut p = Scheduler::new(Config::default());
     /// for (id, class) in [(1, "cpu"), (2, "gpu")] {
@@ -220,9 +426,7 @@ impl Constraint {
     /// Unlike an avoided worker, a forbidden one is never used, even when it is the only one.
     ///
     /// ```
-    /// use whelm::{
-    ///     Config, Constraint, Input, JobSpec, Policy, Resources, SLOTS, Scheduler, Time, WorkerState,
-    /// };
+    /// use whelm::{job::Constraint, prelude::*};
     ///
     /// let mut p = Scheduler::new(Config::default());
     /// p.handle(
@@ -252,7 +456,7 @@ impl Constraint {
     /// # Examples
     ///
     /// ```
-    /// use whelm::{Constraint, Selector, Strength};
+    /// use whelm::job::{Constraint, Selector, Strength};
     ///
     /// let c = Constraint::forbid_class("cpu");
     /// assert_eq!(
@@ -274,10 +478,7 @@ impl Constraint {
     /// With no other live worker, the avoided one is used after all (see [`Strength::Avoid`]).
     ///
     /// ```
-    /// use whelm::{
-    ///     Config, Constraint, Input, JobSpec, Output, Policy, Resources, SLOTS, Scheduler, Time,
-    ///     WorkerState,
-    /// };
+    /// use whelm::{job::Constraint, prelude::*};
     ///
     /// let mut p = Scheduler::new(Config::default());
     /// p.handle(
@@ -314,7 +515,7 @@ impl Constraint {
     /// # Examples
     ///
     /// ```
-    /// use whelm::{Constraint, Selector, Strength};
+    /// use whelm::job::{Constraint, Selector, Strength};
     ///
     /// let c = Constraint::avoid_class("flaky");
     /// assert_eq!(
@@ -334,10 +535,7 @@ impl Constraint {
     /// # Examples
     ///
     /// ```
-    /// use whelm::{
-    ///     Config, Constraint, Input, JobSpec, Output, Policy, Resources, SLOTS, Scheduler, Time,
-    ///     WorkerState,
-    /// };
+    /// use whelm::{job::Constraint, prelude::*};
     ///
     /// let mut p = Scheduler::new(Config::default());
     /// for id in [1, 2] {
@@ -376,7 +574,7 @@ impl Constraint {
     /// # Examples
     ///
     /// ```
-    /// use whelm::{Constraint, Selector, Strength};
+    /// use whelm::job::{Constraint, Selector, Strength};
     ///
     /// let c = Constraint::prefer_class("l40s");
     /// assert_eq!(
@@ -404,7 +602,7 @@ impl Constraint {
 /// ```
 /// use std::time::Duration;
 ///
-/// use whelm::{Constraint, JobSpec, MEMORY, Resources, gb};
+/// use whelm::{job::Constraint, prelude::*};
 ///
 /// let job = JobSpec {
 ///     demand: Resources::new().with(MEMORY, gb(6.0)),

@@ -3,9 +3,12 @@
 use std::{sync::Arc, time::Duration};
 
 use super::{DagTemplate, template};
+use crate::job::{JobId, JobSpec};
 #[cfg(doc)]
-use crate::{DagConfig, DagScheduler, Input, Output, Policy, TemplateNode, TemplateSpec};
-use crate::{JobId, JobSpec};
+use crate::{
+    dag::{DagConfig, DagScheduler, TemplateNode, TemplateSpec},
+    policy::{Input, Output, Policy},
+};
 
 /// A plain job with dependencies.
 ///
@@ -21,8 +24,8 @@ use crate::{JobId, JobSpec};
 /// use std::time::Duration;
 ///
 /// use whelm::{
-///     Config, DagConfig, DagJob, DagScheduler, Input, Output, Policy, Resources, SLOTS,
-///     Scheduler, Time, WorkerState,
+///     dag::{DagConfig, DagJob, DagScheduler},
+///     prelude::*,
 /// };
 ///
 /// let mut dag = DagScheduler::new(DagConfig::default(), Scheduler::new(Config::fifo()));
@@ -100,7 +103,8 @@ pub struct DagJob {
     /// ```
     /// # use std::time::Duration;
     /// #
-    /// # use whelm::{Config, DagConfig, DagJob, DagScheduler, JobSpec, Scheduler, Time};
+    /// # use whelm::prelude::*;
+    /// # use whelm::dag::{DagConfig, DagJob, DagScheduler};
     /// # let mut dag = DagScheduler::new(DagConfig::default(), Scheduler::new(Config::fifo()));
     /// let lead = DagJob {
     ///     id: 1,
@@ -136,10 +140,8 @@ pub struct DagJob {
     /// ```
     /// # use std::time::Duration;
     /// #
-    /// # use whelm::{
-    /// #     Config, DagConfig, DagJob, DagScheduler, Input, JobSpec, Output, Policy, Resources,
-    /// #     SLOTS, Scheduler, Time, WorkerState,
-    /// # };
+    /// # use whelm::prelude::*;
+    /// # use whelm::dag::{DagConfig, DagJob, DagScheduler};
     /// let config = DagConfig {
     ///     record_passthrough: true,
     ///     ..DagConfig::default()
@@ -203,10 +205,8 @@ pub struct DagJob {
     ///
     /// ```
     /// # use std::time::Duration;
-    /// # use whelm::{
-    /// #     Config, DagConfig, DagJob, DagScheduler, Input, Output, Policy, Resources,
-    /// #     SLOTS, Scheduler, Time, WorkerState,
-    /// # };
+    /// # use whelm::prelude::*;
+    /// # use whelm::dag::{DagConfig, DagJob, DagScheduler};
     /// # let mut dag = DagScheduler::new(DagConfig::default(), Scheduler::new(Config::fifo()));
     /// # let capacity = Resources::new().with(SLOTS, 1);
     /// # let worker = WorkerState { id: 1, capacity, ..Default::default() };
@@ -265,8 +265,8 @@ pub struct DagJob {
 /// use std::{sync::Arc, time::Duration};
 ///
 /// use whelm::{
-///     Config, DagConfig, DagScheduler, Input, Output, Policy, Resources, SLOTS, Scheduler,
-///     TemplateNode, TemplateSpec, Time, Unit, WorkerState,
+///     dag::{DagConfig, DagScheduler, TemplateNode, TemplateSpec, Unit},
+///     prelude::*,
 /// };
 ///
 /// let chain = TemplateSpec {
@@ -327,10 +327,8 @@ pub struct Unit {
     ///
     /// ```
     /// # use std::{sync::Arc, time::Duration};
-    /// # use whelm::{
-    /// #     Config, DagConfig, DagJob, DagScheduler, Input, Output, Policy, Resources,
-    /// #     SLOTS, Scheduler, TemplateSpec, Time, Unit, WorkerState,
-    /// # };
+    /// # use whelm::prelude::*;
+    /// # use whelm::dag::{DagConfig, DagJob, DagScheduler, TemplateSpec, Unit};
     /// let mut dag = DagScheduler::new(DagConfig::default(), Scheduler::new(Config::fifo()));
     /// let w = WorkerState {
     ///     id: 1,
@@ -388,7 +386,8 @@ pub struct Unit {
     ///
     /// ```
     /// # use std::{sync::Arc, time::Duration};
-    /// # use whelm::{Config, DagConfig, DagScheduler, Scheduler, TemplateSpec, Time, Unit};
+    /// # use whelm::prelude::*;
+    /// # use whelm::dag::{DagConfig, DagScheduler, TemplateSpec, Unit};
     /// # let mut dag = DagScheduler::new(DagConfig::default(), Scheduler::new(Config::fifo()));
     /// let chain = TemplateSpec {
     ///     edges: vec![(0, 1)],
@@ -416,10 +415,9 @@ pub struct Unit {
     ///
     /// ```
     /// # use std::{sync::Arc, time::Duration};
-    /// # use whelm::{
-    /// #     Config, DagConfig, DagScheduler, JobId, NodeSource, Scheduler, TemplateSpec, Time,
-    /// #     Unit,
-    /// # };
+    /// # use whelm::prelude::*;
+    /// # use whelm::dag::{DagConfig, DagScheduler, NodeSource, TemplateSpec, Unit};
+    /// # use whelm::job::JobId;
     /// struct Growing;
     /// impl NodeSource for Growing {
     ///     fn work(&self, _unit: JobId, leaf: u32) -> Duration {
@@ -453,10 +451,8 @@ pub struct Unit {
     ///
     /// ```
     /// # use std::sync::Arc;
-    /// # use whelm::{
-    /// #     Config, DagConfig, DagScheduler, Input, Output, Policy, Resources, SLOTS, Scheduler,
-    /// #     TemplateSpec, Time, Unit, WorkerState,
-    /// # };
+    /// # use whelm::prelude::*;
+    /// # use whelm::dag::{DagConfig, DagScheduler, TemplateSpec, Unit};
     /// # let mut dag = DagScheduler::new(DagConfig::default(), Scheduler::new(Config::fifo()));
     /// # let capacity = Resources::new().with(SLOTS, 1);
     /// # let worker = WorkerState { id: 1, capacity, ..Default::default() };
@@ -529,8 +525,9 @@ impl From<DagJob> for Unit {
 /// use std::{sync::Arc, time::Duration};
 ///
 /// use whelm::{
-///     Config, Constraint, DagConfig, DagScheduler, Input, JobId, JobSpec, NodeSource, Output,
-///     Policy, Resources, SLOTS, Scheduler, TemplateSpec, Time, Unit, WorkerState,
+///     dag::{DagConfig, DagScheduler, NodeSource, TemplateSpec, Unit},
+///     job::{Constraint, JobId},
+///     prelude::*,
 /// };
 ///
 /// struct Steps;
@@ -638,7 +635,7 @@ pub trait NodeSource: Send + Sync {
     /// arrives as the unit's spec with the leaf's work and rank. Default: unchanged.
     fn spec(&self, _unit: JobId, _leaf: u32, _spec: &mut JobSpec) {}
 
-    /// The leaf's [`label`](crate::Explanation::label) when explained. Default: none.
+    /// The leaf's [`label`](crate::explain::Explanation::label) when explained. Default: none.
     fn label(&self, _unit: JobId, _leaf: u32) -> Option<String> {
         None
     }

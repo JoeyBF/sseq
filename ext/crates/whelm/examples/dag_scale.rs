@@ -6,8 +6,11 @@ use std::{
 };
 
 use whelm::{
-    DagConfig, DagScheduler, DagTemplate, Explanation, Input, JobId, JobSpec, MEMORY, Output,
-    Policy, PolicyStats, Resources, TemplateNode, TemplateSpec, Time, Unit,
+    dag::{DagConfig, DagScheduler, DagTemplate, TemplateNode, TemplateSpec, Unit},
+    explain::Explanation,
+    job::JobId,
+    prelude::*,
+    stats::PolicyStats,
 };
 
 /// Units on a side of the coarse grid: unit `k` waits for its left and upper neighbours.

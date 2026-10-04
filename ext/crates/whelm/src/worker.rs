@@ -3,11 +3,19 @@
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
-use crate::Resources;
+use crate::resources::Resources;
 #[cfg(doc)]
-use crate::{Config, Resource, SLOTS};
+use crate::{
+    config::Config,
+    resources::{Resource, SLOTS},
+};
 #[cfg(doc)]
-use crate::{Defer, Input, JobSpec, ScoreTerm, Selector, Speculate, Timing};
+use crate::{
+    config::{Defer, ScoreTerm, Speculate},
+    job::{JobSpec, Selector},
+    policy::Input,
+    speed::Timing,
+};
 
 /// A worker identifier. The caller maps its own ids (e.g. `"host:port"`) to these.
 pub type WorkerId = u64;
@@ -23,7 +31,7 @@ pub type WorkerId = u64;
 /// resident of which 12 GB is its runtime, and running at 1.4 times the reference speed.
 ///
 /// ```
-/// use whelm::{DEVICE_MEMORY, MEMORY, Resources, SLOTS, WorkerState, gb};
+/// use whelm::prelude::*;
 ///
 /// let w = WorkerState {
 ///     id: 7,
@@ -78,7 +86,7 @@ impl Default for WorkerState {
     ///
     /// Under the default declaration it runs nothing until its capacity has slots: a worker
     /// writes its capacity whole, slots included. A job no worker has slots for is
-    /// [explained](crate::Policy::explain) as slots full there.
+    /// [explained](crate::policy::Policy::explain) as slots full there.
     fn default() -> Self {
         Self {
             id: 0,

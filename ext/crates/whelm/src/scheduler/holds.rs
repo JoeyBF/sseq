@@ -1,7 +1,7 @@
 //! Holds: reservations, their shadow backfill, and deferral to a faster worker.
 
 use super::{Job, Scheduler, Worker, order::ordered, placement::Score};
-use crate::{JobId, Time, WorkerId, resources::sub};
+use crate::{job::JobId, resources::sub, time::Time, worker::WorkerId};
 
 /// A worker kept from a job on purpose although it might admit it: the one notion behind
 /// reservations, their shadow backfill and deferral. Each waiting job has at most one.
