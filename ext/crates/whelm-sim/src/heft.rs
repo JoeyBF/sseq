@@ -112,7 +112,7 @@ fn earliest_gap(busy: &[(f64, f64)], ready: f64, d: f64) -> (f64, usize) {
     (s, busy.len())
 }
 
-/// The schedule's order as [`JobSpec::priority`](whelm::JobSpec::priority)s.
+/// The schedule's order as [`JobSpec::priority`](whelm::job::JobSpec::priority)s.
 ///
 /// Each task's position when sorted by planned start, ties by planned finish, then index. HEFT's
 /// selection order is the upward-rank order the rank plans use; the start order also carries what

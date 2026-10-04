@@ -7,8 +7,8 @@ use std::{
 
 use serde::Serialize;
 use whelm::{
-    DagConfig, DagJob, DagScheduler, Input, JobSpec, MEMORY, Output, Policy, Resources, SLOTS,
-    Time, WorkerState, gb,
+    dag::{DagConfig, DagJob, DagScheduler},
+    prelude::*,
 };
 
 use crate::{
@@ -335,10 +335,10 @@ fn closed_loop_inputs(trace: &Trace) -> (Vec<Vec<usize>>, Vec<f64>) {
 /// Workers join at their trace join time and stay until the end. Every `heartbeat_s` each worker
 /// reports `reported_used` = the trace's resident-memory sample at that time and
 /// `reported_baseline` per [`Baseline`]; both are exogenous (replayed from the trace, not
-/// responsive to the simulated placements). Jobs run under the processor-sharing
-/// [`ServiceModel`]. The policy is polled after every event. A speculative attempt
-/// ([`Speculate`](whelm::Speculate)) runs beside the original until one of them finishes; the
-/// other is stopped.
+/// responsive to the simulated placements). Jobs run under the processor-sharing [`ServiceModel`].
+/// The policy is polled after every event. A speculative attempt
+/// ([`Speculate`](whelm::config::Speculate)) runs beside the original until one of them finishes;
+/// the other is stopped.
 ///
 /// Arrivals are either **open-loop** (each job arrives at its trace `ready_s`) or **closed-loop**:
 /// all jobs are declared to a [`DagScheduler`] up front with the trace's dependencies, and a job

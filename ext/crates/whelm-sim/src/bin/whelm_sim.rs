@@ -6,7 +6,11 @@ use std::{
 };
 
 use clap::Parser;
-use whelm::{Config, DagConfig, OrderTerm, Reservations, Scheduler, ScoreTerm};
+use whelm::{
+    config::{OrderTerm, Reservations, ScoreTerm},
+    dag::DagConfig,
+    prelude::*,
+};
 use whelm_sim::{
     model::{ClassCurve, PsModel, fit},
     run::{Baseline, BoxPolicy, Metrics, SimSetup, Usage, production, simulate},

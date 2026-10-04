@@ -3,7 +3,7 @@
 use std::{path::PathBuf, time::Duration};
 
 use clap::Parser;
-use whelm::{DagConfig, Defer, Timing};
+use whelm::{config::Defer, dag::DagConfig, speed::Timing};
 use whelm_sim::{
     model::fit,
     plan::{SpeedPlan, timing_named},

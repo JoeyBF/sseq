@@ -9,9 +9,10 @@ use std::{
 
 use serde::Serialize;
 use whelm::{
-    Config, Constraint, DagConfig, DagJob, DagScheduler, DagTemplate, GroupOrder, Input, JobId,
-    JobSpec, MEMORY, NodeSource, OrderTerm, Output, Policy, Resources, SLOTS, Scheduler, Selector,
-    Strength, Time, Unit, WorkerState,
+    config::{GroupOrder, OrderTerm},
+    dag::{DagConfig, DagJob, DagScheduler, DagTemplate, NodeSource, Unit},
+    job::{Constraint, JobId, Selector, Strength},
+    prelude::*,
 };
 
 use crate::{
@@ -1183,7 +1184,8 @@ pub struct WholeMetrics {
     pub bidegree_latency: Quantiles,
     /// Most bidegrees open at once.
     pub peak_open: usize,
-    /// Most template nodes with materialised state at once ([`DagStats::nodes`](whelm::DagStats)).
+    /// Most template nodes with materialised state at once
+    /// ([`DagStats::nodes`](whelm::dag::DagStats)).
     ///
     /// Sampled every `NODE_SAMPLE_TASKS` tasks dispatched.
     pub peak_dag_nodes: usize,
@@ -1946,15 +1948,15 @@ mod tests {
         let place = |fast, defer| Placement {
             speed: SpeedPlan {
                 fast,
-                config: whelm::SpeedConfig {
+                config: whelm::config::SpeedConfig {
                     defer,
-                    ..whelm::SpeedConfig::default()
+                    ..whelm::config::SpeedConfig::default()
                 },
             },
             ..Placement::default()
         };
         let fast = simulate(&world, &mixed, &model, &Plan::Group, &place(true, None));
-        let defer = whelm::Defer {
+        let defer = whelm::config::Defer {
             max_wait: Duration::from_secs(1_000_000),
             min_gain: 0.0,
         };

@@ -1,6 +1,9 @@
 //! Speed-aware placement and machine models, as the simulators' plans name them.
 
-use whelm::{ScoreTerm, SpeedConfig, Timing};
+use whelm::{
+    config::{ScoreTerm, SpeedConfig},
+    speed::Timing,
+};
 
 /// Speed-aware placement, as a plan names it.
 ///

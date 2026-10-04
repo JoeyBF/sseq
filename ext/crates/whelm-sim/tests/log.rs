@@ -6,9 +6,10 @@ use std::{
 };
 
 use whelm::{
-    Attempt, Config, EventSink, Input, JobId, JobSpec, MEMORY, Output, Policy, Resources, SLOTS,
-    Scheduler, Time, WorkerState, gb,
-    log::{Event, JsonlSink, Logged, TaskInfo},
+    job::JobId,
+    log::{Event, EventSink, JsonlSink, Logged, TaskInfo},
+    policy::Attempt,
+    prelude::*,
 };
 use whelm_sim::{
     model::fit,

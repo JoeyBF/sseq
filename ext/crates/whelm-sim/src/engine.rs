@@ -2,7 +2,7 @@
 
 use std::{cmp::Ordering, collections::BinaryHeap};
 
-use whelm::{Attempt, JobId};
+use whelm::{job::JobId, policy::Attempt};
 
 /// Timed events, earliest first.
 ///

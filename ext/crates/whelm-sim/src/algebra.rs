@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use whelm::{DagTemplate, TemplateSpec};
+use whelm::dag::{DagTemplate, TemplateSpec};
 
 /// Bits per Milnor exponent in the packed representation (`PPart::WIDTHS` in `algebra`).
 const WIDTHS: [u32; 16] = [11, 10, 9, 8, 7, 6, 5, 4, 3, 1, 0, 0, 0, 0, 0, 0];

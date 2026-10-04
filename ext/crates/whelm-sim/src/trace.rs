@@ -3,7 +3,11 @@
 use std::{collections::HashMap, io::BufRead, path::Path};
 
 use serde::Deserialize;
-use whelm::{Attempt, GaveUp, Input, MEMORY, Output, SLOTS, Time, log::TaskInfo};
+use whelm::{
+    log::TaskInfo,
+    policy::{Attempt, GaveUp},
+    prelude::*,
+};
 
 /// A worker of the trace.
 #[derive(Clone, Debug)]
@@ -462,7 +466,7 @@ impl Trace {
 mod tests {
     use std::time::Duration;
 
-    use whelm::{FailKind, JobSpec, Resources, WorkerState, gb, log::Event};
+    use whelm::{log::Event, policy::FailKind};
 
     use super::*;
 

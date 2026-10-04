@@ -3,7 +3,10 @@
 use std::{path::PathBuf, time::Duration};
 
 use clap::Parser;
-use whelm::{Defer, Speculate, SpeedConfig, Timing};
+use whelm::{
+    config::{Defer, Speculate, SpeedConfig},
+    speed::Timing,
+};
 use whelm_sim::{
     exact::{self, Limits, Solution},
     heft,

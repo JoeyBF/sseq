@@ -4,8 +4,10 @@ use std::{collections::HashMap, time::Duration};
 
 use serde::Serialize;
 use whelm::{
-    Attempt, Config, DagConfig, DagJob, DagScheduler, Input, JobSpec, MEMORY, OrderTerm, Output,
-    Policy, Resources, SLOTS, Scheduler, Time, WorkerState,
+    config::OrderTerm,
+    dag::{DagConfig, DagJob, DagScheduler},
+    policy::Attempt,
+    prelude::*,
 };
 
 use crate::{
@@ -136,7 +138,7 @@ pub struct SmallResult {
     pub idle_ready: f64,
     /// Fraction of the makespan spent running realised-critical-chain tasks on slow workers.
     pub slow_on_crit: f64,
-    /// Speculative attempts started on a faster worker ([`Speculate`](whelm::Speculate)).
+    /// Speculative attempts started on a faster worker ([`Speculate`](whelm::config::Speculate)).
     pub speculations: u64,
 }
 
@@ -677,7 +679,7 @@ pub fn tiny(seed: u64) -> SmallInstance {
 
 #[cfg(test)]
 mod tests {
-    use whelm::{SpeedConfig, Timing};
+    use whelm::{config::SpeedConfig, speed::Timing};
 
     use super::*;
 
@@ -742,7 +744,7 @@ mod tests {
     #[test]
     fn speculation_runs_second_attempts() {
         let mut p = plan(Order::Group, true);
-        p.speed.config.speculate = Some(whelm::Speculate::default());
+        p.speed.config.speculate = Some(whelm::config::Speculate::default());
         let mut speculations = 0;
         for seed in 0..40 {
             let inst = grid(&GridParams::random(seed));
