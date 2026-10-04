@@ -56,8 +56,7 @@ struct WorkerStat {
 /// let state = WorkerState {
 ///     id: 7,
 ///     class: "h100".into(),
-///     slots: 4,
-///     budget: Resources::mem_gb(80.0),
+///     capacity: Resources::mem_gb(80.0).with_slots(4),
 ///     speed: e.speed(7, "h100", 1.0),
 ///     ..Default::default()
 /// };

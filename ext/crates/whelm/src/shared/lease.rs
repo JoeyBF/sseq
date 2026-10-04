@@ -25,7 +25,7 @@ use crate::{Attempt, FailKind, GaveUp, Input, JobId, Policy, WorkerId};
 /// for w in [1, 2] {
 ///     shared.worker_update(WorkerState {
 ///         id: w,
-///         budget: Resources::mem_gb(8.0),
+///         capacity: Resources::mem_gb(8.0).with_slots(1),
 ///         ..Default::default()
 ///     });
 /// }
@@ -97,7 +97,7 @@ impl<'a, P: Policy> Lease<'a, P> {
     /// let shared = SharedPolicy::new(Scheduler::new(Config::default()), || Time::ORIGIN);
     /// shared.worker_update(whelm::WorkerState {
     ///     id: 1,
-    ///     budget: Resources::mem_gb(8.0),
+    ///     capacity: Resources::mem_gb(8.0).with_slots(1),
     ///     ..Default::default()
     /// });
     /// let lease = shared.lease(JobSpec {
@@ -125,7 +125,7 @@ impl<'a, P: Policy> Lease<'a, P> {
     /// for w in [1, 2] {
     ///     shared.worker_update(WorkerState {
     ///         id: w,
-    ///         budget: Resources::mem_gb(8.0),
+    ///         capacity: Resources::mem_gb(8.0).with_slots(1),
     ///         ..Default::default()
     ///     });
     /// }

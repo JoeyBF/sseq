@@ -57,8 +57,7 @@ fn workers() -> [WorkerState; 2] {
     [(1, 1.0), (2, 4.0)].map(|(id, speed)| WorkerState {
         id,
         class: format!("w{id}"),
-        slots: 1,
-        budget: Resources::mem(100),
+        capacity: Resources::mem(100).with_slots(1),
         speed,
         ..Default::default()
     })

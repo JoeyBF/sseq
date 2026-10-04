@@ -26,8 +26,7 @@ fn worker(w: WorkerId, used_gb: f64) -> WorkerState {
     WorkerState {
         id: w,
         class: "x".into(),
-        slots: 2,
-        budget: Resources::mem_gb(10.0),
+        capacity: Resources::mem_gb(10.0).with_slots(2),
         reported_used: Resources::mem_gb(used_gb),
         speed: if w == 3 { 3.0 } else { 1.0 },
         ..Default::default()

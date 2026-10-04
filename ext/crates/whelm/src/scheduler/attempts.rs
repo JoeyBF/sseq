@@ -37,7 +37,7 @@ impl Scheduler {
             .get_mut(&worker)
             .expect("placing on an unknown worker");
         tick_occ(w, self.now);
-        w.placed += r.job.spec.demand;
+        w.placed += &r.job.spec.demand;
         w.jobs.insert(job, attempt);
         r.live.push(Run {
             attempt,
@@ -53,10 +53,16 @@ impl Scheduler {
         });
     }
 
-    /// Release an attempt's slot and demand on its worker (if the worker is still known).
-    fn release_run(&mut self, job: JobId, demand: Resources, run: &Run) {
-        if let Some(w) = self.workers.get_mut(&run.worker) {
-            tick_occ(w, self.now);
+    /// Release an attempt's demand on its worker (if the worker is still known).
+    fn release_run(
+        workers: &mut BTreeMap<WorkerId, Worker>,
+        now: Time,
+        job: JobId,
+        demand: &Resources,
+        run: &Run,
+    ) {
+        if let Some(w) = workers.get_mut(&run.worker) {
+            tick_occ(w, now);
             w.placed -= demand;
             w.jobs.remove(&job);
         }
@@ -67,7 +73,7 @@ impl Scheduler {
     fn stop_running(&mut self, job: JobId, except: Option<Attempt>) -> Option<Job> {
         let r = self.running.remove(&job)?;
         for run in &r.live {
-            self.release_run(job, r.job.spec.demand, run);
+            Self::release_run(&mut self.workers, self.now, job, &r.job.spec.demand, run);
             if Some(run.attempt) != except {
                 self.outbox.push(Output::Stop {
                     job,
@@ -119,9 +125,8 @@ impl Scheduler {
         if !r.job.retry_avoid.contains(&run.worker) {
             r.job.retry_avoid.push(run.worker);
         }
-        let demand = r.job.spec.demand;
         let idle = r.live.is_empty();
-        self.release_run(job, demand, &run);
+        Self::release_run(&mut self.workers, self.now, job, &r.job.spec.demand, &run);
         if !idle {
             return;
         }
@@ -193,7 +198,7 @@ impl Scheduler {
         }
     }
 
-    /// Start speculative attempts on workers left with a free slot (see
+    /// Start speculative attempts on workers left with room (see
     /// [`Speculate`](crate::Speculate)).
     pub(super) fn speculate(&mut self) {
         let Some(cfg) = self.config.speed.speculate else {
@@ -220,7 +225,8 @@ impl Scheduler {
                     if !slower
                         || r.job.speculated >= cfg.max_per_job
                         || !self.eligible(&r.job, w)
-                        || !self.admission.admits(&r.job.spec.demand, &w.view())
+                        || !(self.admission)
+                            .admits(&r.job.spec.demand, &w.view(&self.config.resources))
                     {
                         continue;
                     }

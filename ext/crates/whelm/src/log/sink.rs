@@ -46,8 +46,7 @@ use super::Logged;
 /// );
 /// let worker = WorkerState {
 ///     id: 1,
-///     slots: 2,
-///     budget: Resources::mem_gb(8.0),
+///     capacity: Resources::mem_gb(8.0).with_slots(2),
 ///     ..Default::default()
 /// };
 /// p.handle(Input::Worker(worker), Time::ORIGIN);
@@ -127,7 +126,7 @@ impl EventSink for std::sync::Arc<std::sync::Mutex<Vec<Event>>> {
 /// );
 /// let worker = WorkerState {
 ///     id: 1,
-///     budget: Resources::mem_gb(8.0),
+///     capacity: Resources::mem_gb(8.0).with_slots(1),
 ///     ..Default::default()
 /// };
 /// p.handle(Input::Worker(worker), Time::ORIGIN);

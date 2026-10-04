@@ -113,11 +113,11 @@ impl Scheduler {
     /// whose release lets the configured admission rule admit the holder (now, if it already
     /// does). `None` if some end is unknown or no release suffices.
     fn shadow_time(&self, w: &Worker, holder: JobId) -> Option<Time> {
-        let demand = self.waiting.get(&holder)?.spec.demand;
-        let mut ends: Vec<(Time, Resources)> = Vec::with_capacity(w.jobs.len());
+        let demand = &self.waiting.get(&holder)?.spec.demand;
+        let mut ends: Vec<(Time, &Resources)> = Vec::with_capacity(w.jobs.len());
         for j in w.jobs.keys() {
             let r = &self.running[j];
-            ends.push((self.expected_end(r)?, r.job.spec.demand));
+            ends.push((self.expected_end(r)?, &r.job.spec.demand));
         }
         ends.sort_by_key(|e| e.0);
         // The projection assumes a released job frees what it was placed with; the reported
@@ -126,21 +126,23 @@ impl Scheduler {
             reported_used: Resources::ZERO,
             ..w.state.clone()
         };
-        let fits = |placed: Resources| {
+        let fits = |placed: &Resources, running| {
             let view = WorkerView {
+                resources: &self.config.resources,
                 state: &state,
                 placed,
+                running,
             };
-            self.admission.admits(&demand, &view)
+            self.admission.admits(demand, &view)
         };
-        let mut placed = w.placed;
-        if fits(placed) {
+        let mut placed = w.placed.clone();
+        if fits(&placed, ends.len()) {
             return Some(self.now);
         }
-        for (end, d) in ends {
-            placed -= d;
-            if fits(placed) {
-                return Some(end);
+        for (i, (end, d)) in ends.iter().enumerate() {
+            placed -= *d;
+            if fits(&placed, ends.len() - i - 1) {
+                return Some(*end);
             }
         }
         None
@@ -171,10 +173,11 @@ impl Scheduler {
         }
     }
 
-    /// If `job` qualifies (waited long enough, no reservation yet), reserve a worker for it: the
-    /// one with the most headroom if reservations are left, otherwise take over the reservation
-    /// of the least urgent holder that is less urgent than `job` (its worker has been draining
-    /// already). Returns whether `job` now holds a reservation.
+    /// If `job` qualifies (waited long enough, no reservation yet), reserve a worker for it among
+    /// those it [fits](Self::fits_empty) and may use: the one with the most headroom if
+    /// reservations are left, otherwise take over the reservation of the least urgent holder that
+    /// is less urgent than `job` (its worker has been draining already). Returns whether `job` now
+    /// holds a reservation.
     pub(super) fn try_reserve(&mut self, job: JobId) -> bool {
         let Some(cfg) = self.config.reservations else {
             return false;
@@ -202,14 +205,14 @@ impl Scheduler {
         let mut best: Option<((i64, Score), WorkerId)> = None;
         for (&id, w) in &self.workers {
             if w.reserved_for.is_some()
-                || !w.live()
+                || !self.fits_empty(j, w)
                 || class_full(&w.state.class)
                 || !self.eligible(j, w)
             {
                 continue;
             }
             let score = (
-                ordered(-w.view().free_share(&Resources::ZERO)),
+                ordered(-self.free_share(w, &Resources::ZERO)),
                 self.score(j, w),
             );
             if best.as_ref().is_none_or(|(b, _)| score < *b) {
@@ -225,7 +228,10 @@ impl Scheduler {
         let mine = self.urgency(j);
         let victim = reservations
             .iter()
-            .filter(|r| self.eligible(j, &self.workers[&r.1]))
+            .filter(|r| {
+                let w = &self.workers[&r.1];
+                self.fits_empty(j, w) && self.eligible(j, w)
+            })
             .map(|r| (self.urgency(&self.waiting[&r.0]), r.0, r.1, r.2))
             .filter(|(u, ..)| *u > mine)
             .max();

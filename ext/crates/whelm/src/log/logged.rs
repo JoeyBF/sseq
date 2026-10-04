@@ -6,7 +6,7 @@ use std::{collections::HashMap, time::Duration};
 use super::replay;
 use super::{Event, EventSink, TaskInfo};
 use crate::{
-    DEV, Explanation, Input, JobId, MEM, Output, Policy, PolicyStats, Time, WorkerId, WorkerState,
+    Explanation, Input, JobId, Output, Policy, PolicyStats, ResourceId, Time, WorkerId, WorkerState,
 };
 
 /// A [`Policy`] that records every input it handles and every poll's outputs to an
@@ -68,8 +68,7 @@ impl<P: Policy> Logged<P> {
     /// let mut p = Logged::new(inner, events.clone()).sample_every(Duration::from_secs(30));
     /// let mut w = WorkerState {
     ///     id: 1,
-    ///     slots: 2,
-    ///     budget: Resources::mem_gb(8.0),
+    ///     capacity: Resources::mem_gb(8.0).with_slots(2),
     ///     ..Default::default()
     /// };
     /// p.handle(Input::Worker(w.clone()), Time::ORIGIN);
@@ -202,11 +201,11 @@ impl<P: Policy> Logged<P> {
         self.sink.record(&Event::Sample {
             t: now,
             worker: w.id.to_string(),
-            rss_gb: gb(w.reported_used[MEM]),
-            baseline_gb: gb(w.reported_baseline[MEM]),
-            reserved_gb: load.as_ref().map_or(0.0, |l| gb(l.placed[MEM])),
+            rss_gb: gb(w.reported_used[ResourceId::MEM]),
+            baseline_gb: gb(w.reported_baseline[ResourceId::MEM]),
+            reserved_gb: load.as_ref().map_or(0.0, |l| gb(l.placed[ResourceId::MEM])),
             running: load.map_or(0, |l| l.running),
-            dev_per_task_gb: gb(w.per_task[DEV]),
+            dev_per_task_gb: gb(w.per_task[ResourceId::DEV]),
         });
         self.last_sample.insert(w.id, now);
     }

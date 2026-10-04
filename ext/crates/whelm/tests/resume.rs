@@ -4,8 +4,9 @@ use std::{sync::Arc, time::Duration};
 
 use proptest::prelude::*;
 use whelm::{
-    Attempt, Config, DagConfig, DagJob, DagScheduler, DagTemplate, Input, JobId, JobSpec, MEM,
-    NodeSource, Output, Policy, Resources, Scheduler, TemplateSpec, Time, Unit, WorkerState,
+    Attempt, Config, DagConfig, DagJob, DagScheduler, DagTemplate, Input, JobId, JobSpec,
+    NodeSource, Output, Policy, ResourceId, Resources, Scheduler, TemplateSpec, Time, Unit,
+    WorkerState,
 };
 
 /// A DAG layer over the default backfill policy with one worker of `slots` slots.
@@ -19,8 +20,7 @@ fn whelm(slots: usize, config: DagConfig) -> DagScheduler<Scheduler> {
 fn join(d: &mut DagScheduler<Scheduler>, slots: usize, now: Time) {
     let w = WorkerState {
         class: "x".into(),
-        slots,
-        budget: Resources::mem(1 << 40),
+        capacity: Resources::mem(1 << 40).with_slots(slots as u64),
         ..Default::default()
     };
     d.handle(Input::Worker(w), now);
@@ -147,7 +147,7 @@ fn per_node_demand_and_label() {
     assert_eq!(d.poll(Time::ORIGIN), vec![Output::RunLocal { job: 1 }]);
     done(&mut d, 1, 0, Time::ORIGIN);
     assert_eq!(starts(&d.poll(Time::ORIGIN)).len(), 3);
-    assert_eq!(d.stats().workers[0].placed[MEM], 3 + 4 + 7);
+    assert_eq!(d.stats().workers[0].placed[ResourceId::MEM], 3 + 4 + 7);
 }
 
 /// The completion order of a walk driven to the end: every round, poll, then complete every

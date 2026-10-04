@@ -37,8 +37,7 @@ fn run(p: &mut dyn Policy, s: &Stream) -> Option<Duration> {
             Input::Worker(WorkerState {
                 id: w as u64,
                 class: "x".into(),
-                slots: s.slots,
-                budget: Resources::mem(s.budget),
+                capacity: Resources::mem(s.budget).with_slots(s.slots as u64),
                 ..Default::default()
             }),
             Time::ORIGIN,

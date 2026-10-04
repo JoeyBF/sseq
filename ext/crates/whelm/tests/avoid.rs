@@ -22,8 +22,7 @@ fn worker(id: WorkerId, slots: usize) -> WorkerState {
     WorkerState {
         id,
         class: "x".into(),
-        slots,
-        budget: Resources::mem(100),
+        capacity: Resources::mem(100).with_slots(slots as u64),
         ..Default::default()
     }
 }

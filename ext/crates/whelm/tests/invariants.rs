@@ -8,10 +8,10 @@ use std::{
 
 use proptest::prelude::*;
 use whelm::{
-    Attempt, Config, Constraint, DIMS, Defer, Explanation, FailKind, GaveUp, GroupOrder, Input,
-    JobId, JobSpec, Learn, OrderTerm, Output, Policy, Reservations, Resources, RetryConfig, SLOTS,
-    Scheduler, ScoreTerm, Selector, Speculate, SpeedConfig, Status, Strength, Time, Timing, Tried,
-    WorkerId, WorkerState,
+    Attempt, Config, Constraint, Defer, Explanation, FailKind, GaveUp, GroupOrder, Input, JobId,
+    JobSpec, Learn, OrderTerm, Output, Policy, Reservations, Resource, ResourceId, Resources,
+    RetryConfig, Scheduler, ScoreTerm, Selector, Speculate, SpeedConfig, Status, Strength, Time,
+    Timing, Tried, WorkerId, WorkerState,
 };
 
 /// `x` seconds rounded to the nanosecond, as the policy turns its run-time arithmetic back into a
@@ -23,6 +23,7 @@ fn secs(x: f64) -> Duration {
 /// The configuration under test, minus speed and retries.
 #[derive(Clone, Debug)]
 struct Rule {
+    resources: Vec<Resource>,
     order: Vec<OrderTerm>,
     group_order: GroupOrder,
     default_priority: i64,
@@ -36,6 +37,7 @@ impl Rule {
     /// The policy under test.
     fn build(&self, speed: SpeedConfig, retry: RetryConfig) -> Box<dyn Policy> {
         Box::new(Scheduler::new(Config {
+            resources: self.resources.clone(),
             order: self.order.clone(),
             group_order: self.group_order,
             default_priority: self.default_priority,
@@ -53,12 +55,18 @@ impl Rule {
     }
 }
 
+/// The most resources a declaration has; a demand also has one component beyond it.
+const MAX_RESOURCES: usize = 5;
+
+/// One amount per resource, on two scales: a count for a hard resource, a size for a soft one
+/// ([`Shadow::pick`]).
+type Amounts = Vec<(u64, u64)>;
+
 #[derive(Clone, Debug)]
 enum Op {
     Submit {
-        demand: u64,
-        /// What the caller writes in the slot component, which the policy overrides.
-        slots: u64,
+        /// Zero components take the default demand; those beyond the declaration are ignored.
+        demand: Amounts,
         group: u64,
         priority: Option<i64>,
         rank: Option<u8>,
@@ -66,7 +74,6 @@ enum Op {
         due: Option<u16>,
         constraints: Vec<Constraint>,
         work: Option<u32>,
-        dev: Option<u64>,
         kind: Option<u8>,
     },
     /// A live attempt (running job, then attempt, by index) finishes.
@@ -82,13 +89,11 @@ enum Op {
     Cancel(usize),
     Worker {
         id: WorkerId,
-        slots: usize,
-        budget: u64,
-        used: u64,
-        baseline: u64,
+        capacity: Amounts,
+        used: Amounts,
+        baseline: Amounts,
+        per_task: Amounts,
         class: u8,
-        dev_cap: u64,
-        per_task: u64,
     },
     Gone(WorkerId),
     Tick(u32),
@@ -114,6 +119,43 @@ fn constraint() -> impl Strategy<Value = Constraint> {
     (on, strength).prop_map(|(on, strength)| Constraint { on, strength })
 }
 
+/// `n` random amounts, each zero with weight `zero` and otherwise up to `count` on the count
+/// scale and in `size` on the size scale.
+fn amounts(
+    n: usize,
+    zero: u32,
+    count: u64,
+    size: std::ops::Range<u64>,
+) -> impl Strategy<Value = Amounts> {
+    let one = prop_oneof![
+        zero => Just((0, 0)),
+        10 => (1..=count, size),
+    ];
+    prop::collection::vec(one, n)
+}
+
+/// A random resource declaration: 1 to [`MAX_RESOURCES`] resources, mixed hard and soft, with
+/// random default demands; or, a quarter of the time, the default one.
+fn resources() -> impl Strategy<Value = Vec<Resource>> {
+    let one = (any::<bool>(), prop_oneof![2 => Just(0u64), 1 => 1u64..3]).prop_map(
+        |(hard, default_demand)| Resource {
+            hard,
+            default_demand,
+            ..Resource::default()
+        },
+    );
+    let random = prop::collection::vec(one, 1..=MAX_RESOURCES).prop_map(|mut v| {
+        for (i, r) in v.iter_mut().enumerate() {
+            r.name = format!("r{i}");
+        }
+        v
+    });
+    prop_oneof![
+        1 => Just(Config::default().resources),
+        3 => random,
+    ]
+}
+
 /// A random event.
 fn op() -> impl Strategy<Value = Op> {
     let kind = prop_oneof![
@@ -122,41 +164,26 @@ fn op() -> impl Strategy<Value = Op> {
         Just(FailKind::Timeout)
     ];
     let submit = (
-        (1u64..80, 0u64..3, 0u64..4),
+        (amounts(MAX_RESOURCES + 1, 6, 2, 1..80), 0u64..4),
         prop::option::weighted(0.2, -2i64..3),
         prop::option::weighted(0.5, 0u8..6),
         prop_oneof![Just(1.0), Just(0.5), Just(3.0)],
         prop::option::weighted(0.5, 0u16..300),
         prop::option::weighted(0.4, prop::collection::vec(constraint(), 1..3)),
         prop::option::weighted(0.7, 1u32..120),
-        prop::option::weighted(0.5, 1u64..40),
         prop::option::weighted(0.6, 0u8..3),
     )
         .prop_map(
-            |(
-                (demand, slots, group),
+            |((demand, group), priority, rank, weight, due, constraints, work, kind)| Op::Submit {
+                demand,
+                group,
                 priority,
                 rank,
                 weight,
                 due,
-                constraints,
+                constraints: constraints.unwrap_or_default(),
                 work,
-                dev,
                 kind,
-            )| {
-                Op::Submit {
-                    demand,
-                    slots,
-                    group,
-                    priority,
-                    rank,
-                    weight,
-                    due,
-                    constraints: constraints.unwrap_or_default(),
-                    work,
-                    dev,
-                    kind,
-                }
             },
         );
     prop_oneof![
@@ -168,16 +195,14 @@ fn op() -> impl Strategy<Value = Op> {
         1 => index().prop_map(Op::Cancel),
         2 => (
             0u64..4,
-            0usize..5,
-            20u64..150,
-            0u64..150,
-            0u64..60,
+            amounts(MAX_RESOURCES, 2, 4, 20..150),
+            amounts(MAX_RESOURCES, 20, 1, 0..150),
+            amounts(MAX_RESOURCES, 20, 1, 0..60),
+            amounts(MAX_RESOURCES, 30, 1, 1..30),
             0u8..2,
-            prop_oneof![Just(0u64), 20u64..100],
-            prop_oneof![Just(0u64), 1u64..30],
         )
-            .prop_map(|(id, slots, budget, used, baseline, class, dev_cap, per_task)| {
-                Op::Worker { id, slots, budget, used, baseline, class, dev_cap, per_task }
+            .prop_map(|(id, capacity, used, baseline, per_task, class)| {
+                Op::Worker { id, capacity, used, baseline, per_task, class }
             }),
         1 => (0u64..4).prop_map(Op::Gone),
         3 => (0u32..90).prop_map(Op::Tick),
@@ -285,6 +310,7 @@ fn rule() -> impl Strategy<Value = Rule> {
     ]);
     let reservations = prop::option::weighted(0.7, (0usize..3, any::<bool>()));
     (
+        resources(),
         (order, any::<bool>()).prop_map(move |(o, again)| repeat(o, again)),
         prop_oneof![Just(GroupOrder::Arrival), Just(GroupOrder::Id)],
         -1i64..2,
@@ -293,7 +319,8 @@ fn rule() -> impl Strategy<Value = Rule> {
         score,
     )
         .prop_map(
-            |(order, group_order, default_priority, age, reservations, score)| Rule {
+            |(resources, order, group_order, default_priority, age, reservations, score)| Rule {
+                resources,
                 order,
                 group_order,
                 default_priority,
@@ -581,33 +608,64 @@ impl Shadow {
                 r.live
                     .iter()
                     .filter(move |l| l.worker == w)
-                    .map(move |_| r.job.spec.demand)
+                    .map(move |_| &r.job.spec.demand)
             })
             .fold((0, Resources::ZERO), |(n, m), d| (n + 1, m + d))
     }
 
-    /// The production rule, written out again: in every dimension that is enforced (slots
-    /// always, memory where its capacity is nonzero), each job counting at least `per_task`;
-    /// memory may be exceeded by a job alone on the worker, slots never.
-    fn admits(&self, demand: Resources, w: WorkerId) -> bool {
+    /// The declared resources.
+    fn resources(&self) -> &[Resource] {
+        &self.rule.as_ref().unwrap().resources
+    }
+
+    /// The amounts as a vector: the count of each pair for a hard resource, its size for a soft
+    /// one or one beyond the declaration.
+    fn pick(&self, amounts: &Amounts) -> Resources {
+        let r = self.resources();
+        Resources::of(amounts.iter().enumerate().map(|(d, &(count, size))| {
+            let hard = r.get(d).is_some_and(|r| r.hard);
+            (ResourceId(d), if hard { count } else { size })
+        }))
+    }
+
+    /// The production rule, written out again: in every declared resource that is enforced (a
+    /// hard one always, a soft one where its capacity is nonzero), each job counting at least
+    /// `per_task`; a soft resource may be exceeded by a job alone on the worker, a hard one never.
+    fn admits_with(
+        &self,
+        demand: &Resources,
+        w: WorkerId,
+        running: usize,
+        placed: &Resources,
+    ) -> bool {
         let s = &self.workers[&w];
-        let (running, placed) = self.load(w);
-        (0..DIMS).all(|d| {
-            let hard = d == SLOTS;
-            let cap = if hard { s.slots as u64 } else { s.budget[d] };
-            if !hard && cap == 0 {
+        self.resources().iter().enumerate().all(|(d, r)| {
+            let d = ResourceId(d);
+            let cap = s.capacity[d];
+            if !r.hard && cap == 0 {
                 return true;
             }
             let held = placed[d].max(running as u64 * s.per_task[d]);
             let used = s.reported_used[d].max(s.reported_baseline[d] + held);
-            used + demand[d].max(s.per_task[d]) <= cap || (!hard && running == 0)
+            used + demand[d].max(s.per_task[d]) <= cap || (!r.hard && running == 0)
         })
+    }
+
+    /// [`admits_with`](Self::admits_with) the worker's current load.
+    fn admits(&self, demand: &Resources, w: WorkerId) -> bool {
+        let (running, placed) = self.load(w);
+        self.admits_with(demand, w, running, &placed)
+    }
+
+    /// Whether `w` would admit `demand` if it ran nothing.
+    fn admits_empty(&self, demand: &Resources, w: WorkerId) -> bool {
+        self.admits_with(demand, w, 0, &Resources::ZERO)
     }
 
     /// The constraints, written out again: no Forbid selects the worker; for workers and for
     /// classes alike, if the job requires any, one of them selects it; Avoids and the workers of
-    /// failed attempts are avoided while some live worker passing the hard constraints is free
-    /// of them.
+    /// failed attempts are avoided while some worker that would take the job if empty and passes
+    /// the hard constraints is free of them.
     fn eligible(&self, j: &SJob, w: WorkerId) -> bool {
         let selects = |on: &Selector, s: &WorkerState| match on {
             Selector::Worker(id) => *id == s.id,
@@ -635,10 +693,8 @@ impl Shadow {
         let s = &self.workers[&w];
         hard(s)
             && (!avoided(s)
-                || !self
-                    .workers
-                    .values()
-                    .any(|o| o.slots > 0 && hard(o) && !avoided(o)))
+                || !(self.workers.values())
+                    .any(|o| self.admits_empty(&j.spec.demand, o.id) && hard(o) && !avoided(o)))
     }
 
     /// Scan order: aged jobs by age, then the configured order terms (each once, at its first
@@ -733,13 +789,18 @@ impl Shadow {
         Some((j, k, r.live[k].attempt))
     }
 
-    /// Submit to both the model and the policy. The model's copy demands one slot.
+    /// Submit to both the model and the policy. The model's copy demands nothing beyond the
+    /// declared resources, and their default demands where it says nothing.
     fn submit(&mut self, spec: JobSpec, p: &mut dyn Policy) {
         let seq = self.seq;
         self.seq += 1;
         self.groups.entry(spec.group).or_insert(seq);
         let mut model = spec.clone();
-        model.demand[SLOTS] = 1;
+        model.demand = Resources::of(self.resources().iter().enumerate().map(|(d, r)| {
+            let d = ResourceId(d);
+            let own = spec.demand[d];
+            (d, if own == 0 { r.default_demand } else { own })
+        }));
         self.waiting.insert(
             spec.id,
             SJob {
@@ -809,18 +870,18 @@ impl Shadow {
 /// - **attempts**: each start is the job's next attempt number; a job has two live attempts only
 ///   by speculation, and a job with a live attempt is never also waiting;
 /// - **no over-commit**: the production admission rule held at the moment of each start, in every
-///   dimension (no slot over-used; no known memory capacity exceeded, escape hatch aside);
+///   declared resource (no hard one over-used; no known capacity of a soft one exceeded, escape
+///   hatch aside), whatever the declaration;
 /// - **constraints**: no attempt runs on a worker its Requires or Forbids exclude, nor on an
 ///   avoided one while some live worker they allow is not avoided;
-/// - **escape hatch**: after a poll, no worker with a free slot is empty while a job that may run
-///   there waits;
+/// - **escape hatch**: after a poll, no worker is empty while a job that it would admit waits;
 /// - **priority** (the configured order): when B is placed on w, every more urgent waiting job was
 ///   refused by w at that moment (by the admission rule, or because w was B's reservation, or
 ///   because it chose to wait for a faster worker);
 /// - **speculation**: a second attempt goes to a strictly faster, unreserved worker that no
 ///   waiting job wanted, is expected to gain at least `min_gain` of its run time, and respects
 ///   `max_per_job`;
-/// - **bookkeeping**: per-worker slots and placed demand equal the sum over live attempts, job
+/// - **bookkeeping**: per-worker attempts and placed demand equal the sum over live attempts, job
 ///   counts and reservations agree with the model after every event, and everything is released
 ///   at the end;
 /// - **determinism**: replaying the stream gives identical outputs and explanations.
@@ -844,8 +905,7 @@ fn run(
     for op in ops {
         match *op {
             Op::Submit {
-                demand,
-                slots,
+                ref demand,
                 group,
                 priority,
                 rank,
@@ -853,16 +913,13 @@ fn run(
                 due,
                 ref constraints,
                 work,
-                dev,
                 kind,
             } => {
                 let id = sh.next_id;
                 sh.next_id += 1;
                 let spec = JobSpec {
                     id,
-                    demand: Resources::mem(demand)
-                        .with_dev(dev.unwrap_or(0))
-                        .with_slots(slots),
+                    demand: sh.pick(demand),
                     group,
                     priority,
                     rank: rank.map(|r| Duration::from_secs(r.into())),
@@ -942,23 +999,20 @@ fn run(
             }
             Op::Worker {
                 id,
-                slots,
-                budget,
-                used,
-                baseline,
+                ref capacity,
+                ref used,
+                ref baseline,
+                ref per_task,
                 class,
-                dev_cap,
-                per_task,
             } => {
                 let s = WorkerState {
                     id,
                     class: format!("c{class}"),
-                    slots,
-                    budget: Resources::mem(budget).with_dev(dev_cap),
-                    reported_used: Resources::mem(used),
-                    reported_baseline: Resources::mem(baseline),
+                    capacity: sh.pick(capacity),
+                    reported_used: sh.pick(used),
+                    reported_baseline: sh.pick(baseline),
                     speed: class_speed(class),
-                    per_task: Resources::ZERO.with_dev(per_task),
+                    per_task: sh.pick(per_task),
                 };
                 sh.speeds.refresh(id, &s.class, s.speed);
                 sh.workers.insert(id, s.clone());
@@ -1041,7 +1095,7 @@ fn run(
                 );
                 // No over-commit (slots included).
                 prop_assert!(
-                    sh.admits(job.spec.demand, w),
+                    sh.admits(&job.spec.demand, w),
                     "{rule:?}: job {j} over-commits worker {w}"
                 );
                 // Priority: every more urgent waiting job is refused here (unless this is a holder
@@ -1052,7 +1106,7 @@ fn run(
                         if a.spec.id != j && sh.urgency(a).cmp(&mine).is_lt() {
                             let refused = deferred_any.contains(&a.spec.id)
                                 || !sh.eligible(a, w)
-                                || !sh.admits(a.spec.demand, w);
+                                || !sh.admits(&a.spec.demand, w);
                             prop_assert!(
                                 refused,
                                 "{rule:?}: job {j} placed on {w} while more urgent job {} is \
@@ -1076,7 +1130,7 @@ fn run(
                         if v != w
                             && !reserved
                             && sh.eligible(&job, v)
-                            && sh.admits(job.spec.demand, v)
+                            && sh.admits(&job.spec.demand, v)
                         {
                             prop_assert!(
                                 !sh.speeds.faster(sh.speed(&job.spec, v), mine),
@@ -1124,7 +1178,7 @@ fn run(
                     r.live
                 );
                 prop_assert!(
-                    sh.eligible(&sjob, w) && sh.admits(spec.demand, w),
+                    sh.eligible(&sjob, w) && sh.admits(&spec.demand, w),
                     "job {j} speculated onto {w}, which does not take it"
                 );
                 prop_assert!(
@@ -1134,7 +1188,7 @@ fn run(
                 let wanted = sh.waiting.values().find(|a| {
                     !deferred.contains(&a.spec.id)
                         && sh.eligible(a, w)
-                        && sh.admits(a.spec.demand, w)
+                        && sh.admits(&a.spec.demand, w)
                 });
                 prop_assert!(
                     wanted.is_none(),
@@ -1174,14 +1228,15 @@ fn run(
             .iter()
             .map(|r| (r.job, r.worker))
             .collect();
-        // Escape hatch: an empty worker with a free slot leaves no job waiting that may run there,
-        // except one waiting for a faster worker by choice.
-        for (&w, s) in &sh.workers {
-            if s.slots > 0 && sh.load(w).0 == 0 {
-                let stuck = sh
-                    .waiting
-                    .values()
-                    .find(|j| sh.eligible(j, w) && !deferred.contains(&j.spec.id));
+        // Escape hatch: an empty worker leaves no job waiting that it would admit and that may
+        // run there, except one waiting for a faster worker by choice.
+        for &w in sh.workers.keys() {
+            if sh.load(w).0 == 0 {
+                let stuck = sh.waiting.values().find(|j| {
+                    sh.eligible(j, w)
+                        && sh.admits_empty(&j.spec.demand, w)
+                        && !deferred.contains(&j.spec.id)
+                });
                 prop_assert!(
                     stuck.is_none(),
                     "{rule:?}: worker {w} empty while job {:?} waits",
@@ -1196,7 +1251,7 @@ fn run(
         prop_assert_eq!(after.workers.len(), sh.workers.len());
         for l in &after.workers {
             let (n, m) = sh.load(l.id);
-            prop_assert_eq!((l.running, l.placed), (n, m), "worker {} load", l.id);
+            prop_assert_eq!((l.running, &l.placed), (n, &m), "worker {} load", l.id);
             prop_assert_eq!(l.speed, sh.speeds.published[&l.id], "worker {} speed", l.id);
         }
         for (&j, r) in &sh.running {

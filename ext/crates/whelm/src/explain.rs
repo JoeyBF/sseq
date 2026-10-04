@@ -12,13 +12,10 @@ use serde::{Deserialize, Serialize};
 
 #[cfg(doc)]
 use crate::{Admission, DagScheduler, Defer, Policy, Reservations, Scheduler, Timing, WorkerView};
-use crate::{Attempt, DEV, DIMS, JobId, MEM, Resources, Time, Tried, WorkerId};
+use crate::{Attempt, JobId, Resource, ResourceId, ResourceUnit, Resources, Time, Tried, WorkerId};
 
 /// Bytes per gigabyte, for the [`Display`](fmt::Display) form.
 const GB: f64 = 1e9;
-
-/// Each dimension's name in the [`Display`](fmt::Display) form, indexed by dimension.
-const DIM_NAMES: [&str; DIMS] = ["memory", "device memory", "slots"];
 
 /// The most unmet dependencies [`Status::Pending`] lists in its
 /// [`Display`](fmt::Display) form.
@@ -35,7 +32,8 @@ const SHOWN_DEPS: usize = 8;
 ///
 /// ```
 /// use whelm::{
-///     Config, Explanation, Input, JobSpec, Policy, Scheduler, Status, Time, Verdict, WorkerState,
+///     Config, Explanation, Input, JobSpec, Policy, ResourceId, Resources, Scheduler, Status,
+///     Time, Verdict, WorkerState,
 /// };
 ///
 /// let mut p = Scheduler::new(Config::fifo());
@@ -43,7 +41,7 @@ const SHOWN_DEPS: usize = 8;
 ///     Input::Worker(WorkerState {
 ///         id: 1,
 ///         class: "cpu".into(),
-///         slots: 1,
+///         capacity: Resources::ZERO.with_slots(1),
 ///         ..Default::default()
 ///     }),
 ///     Time::ORIGIN,
@@ -63,11 +61,14 @@ const SHOWN_DEPS: usize = 8;
 /// let Status::Waiting(w) = &e.status else {
 ///     panic!("job 2 runs");
 /// };
-/// assert_eq!(w.workers, [(1, Verdict::SlotsFull)]);
+/// let full = Verdict::Full {
+///     dims: vec![ResourceId::SLOTS],
+/// };
+/// assert_eq!(w.workers, [(1, full)]);
 /// assert_eq!(
 ///     e.to_string(),
-///     "job 2 (demand 0.00 GB, group 0) waiting 0s, 0 more urgent job(s) waiting; slots full on \
-///      1 worker(s)"
+///     "job 2 (demand [slots 1], group 0) waiting 0s, 0 more urgent job(s) waiting; slots full \
+///      on 1 worker(s)"
 /// );
 /// assert_eq!(
 ///     p.explain(1).unwrap().status,
@@ -159,8 +160,11 @@ pub enum Status {
 #[derive(Clone, Debug, PartialEq)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct Waiting {
-    /// Its demand.
+    /// Its demand, as the scheduler holds it ([`Admission`] says how).
     pub demand: Resources,
+    /// The resources the scheduler declares ([`Config::resources`](crate::Config::resources)),
+    /// which name the components of the vectors here.
+    pub resources: Vec<Resource>,
     /// Its group.
     pub group: u64,
     /// When it was submitted (or last went back to waiting).
@@ -210,8 +214,8 @@ pub enum Holding {
         shadow: Option<Time>,
         /// Attempts still running on the worker.
         running: usize,
-        /// The worker's slot count.
-        slots: usize,
+        /// The worker's capacity.
+        capacity: Resources,
         /// The worker's usage as admission sees it ([`WorkerView::used`]).
         used: Resources,
     },
@@ -243,25 +247,37 @@ pub enum Verdict {
     },
     /// The job declines it, waiting for a faster worker ([`Holding::Deferral`]).
     Deferred,
-    /// Admission refuses: every slot is taken.
-    SlotsFull,
-    /// Admission refuses with a slot free.
+    /// Admission refuses for want of a [hard](Resource::hard) resource: under the default
+    /// declaration, every slot is taken.
+    Full {
+        /// The hard resources the job does not fit in ([`WorkerView::short`]).
+        dims: Vec<ResourceId>,
+    },
+    /// Admission refuses with room in every hard resource.
     Short {
-        /// The dimensions the job does not fit in ([`WorkerView::short`]). None at all when the
-        /// [`Admission`] rule refuses for reasons of its own.
-        dims: [bool; DIMS],
-        /// The worker's headroom per dimension ([`WorkerView::headroom`]).
-        headroom: [Option<i64>; DIMS],
+        /// The soft resources the job does not fit in ([`WorkerView::short`]). None at all when
+        /// the [`Admission`] rule refuses for reasons of its own.
+        dims: Vec<ResourceId>,
+        /// The worker's headroom per declared resource ([`WorkerView::headroom`]).
+        headroom: Vec<Option<i64>>,
     },
 }
 
-/// A resource vector in words: host memory always, device memory when nonzero.
-fn gb_list(r: &Resources) -> String {
-    let mut s = format!("{:.2} GB", r[MEM] as f64 / GB);
-    if r[DEV] > 0 {
-        s += &format!(" + {:.2} GB device", r[DEV] as f64 / GB);
+/// An amount of `resource` in words.
+fn amount(resource: &Resource, x: i128) -> String {
+    match resource.unit {
+        ResourceUnit::Count => x.to_string(),
+        ResourceUnit::Bytes => format!("{:.2} GB", x as f64 / GB),
     }
-    s
+}
+
+/// A resource vector in words: each nonzero component by name, in declaration order.
+fn list(r: &Resources, resources: &[Resource]) -> String {
+    let parts: Vec<String> = (resources.iter().enumerate())
+        .filter(|&(d, _)| r[ResourceId(d)] > 0)
+        .map(|(d, res)| format!("{} {}", res.name, amount(res, r[ResourceId(d)].into())))
+        .collect();
+    format!("[{}]", parts.join(", "))
 }
 
 /// "1 dependency" or "`n` dependencies".
@@ -337,7 +353,7 @@ impl fmt::Display for Waiting {
         write!(
             f,
             "(demand {}, group {}) waiting {:.0}s",
-            gb_list(&self.demand),
+            list(&self.demand, &self.resources),
             self.group,
             self.waited.as_secs_f64()
         )?;
@@ -359,14 +375,15 @@ impl fmt::Display for Waiting {
             Some(Holding::Reservation {
                 worker,
                 running,
-                slots,
+                capacity,
                 used,
                 ..
             }) => write!(
                 f,
-                "; holds the reservation on worker {worker} (draining: {running}/{slots} running, \
-                 used {})",
-                gb_list(used)
+                "; holds the reservation on worker {worker} (draining: {running} running, using \
+                 {} of {})",
+                list(used, &self.resources),
+                list(capacity, &self.resources)
             )?,
             Some(Holding::Deferral {
                 worker,
@@ -392,20 +409,25 @@ impl fmt::Display for Waiting {
             write!(f, "; no workers")?;
         }
         let count = |v: &Verdict| self.workers.iter().filter(|(_, w)| w == v).count();
-        let full = count(&Verdict::SlotsFull);
-        if full > 0 {
-            write!(f, "; slots full on {full} worker(s)")?;
+        for (d, r) in self.resources.iter().enumerate() {
+            let d = ResourceId(d);
+            let full = (self.workers.iter())
+                .filter(|(_, v)| matches!(v, Verdict::Full { dims } if dims.contains(&d)))
+                .count();
+            if full > 0 {
+                write!(f, "; {} full on {full} worker(s)", r.name)?;
+            }
         }
-        for (d, name) in DIM_NAMES.iter().enumerate() {
+        for (d, r) in self.resources.iter().enumerate() {
             // Workers short of `d`, and the first with the most headroom there.
             let mut short = 0;
             let mut best: Option<(i64, WorkerId)> = None;
             for (id, v) in &self.workers {
                 if let Verdict::Short { dims, headroom } = v
-                    && dims[d]
+                    && dims.contains(&ResourceId(d))
                 {
                     short += 1;
-                    let h = headroom[d].unwrap_or(i64::MAX);
+                    let h = headroom.get(d).copied().flatten().unwrap_or(i64::MAX);
                     if best.is_none_or(|(b, _)| h > b) {
                         best = Some((h, *id));
                     }
@@ -414,8 +436,9 @@ impl fmt::Display for Waiting {
             if let Some((h, w)) = best {
                 write!(
                     f,
-                    "; {name} short on {short} worker(s) (best headroom {:.2} GB on worker {w})",
-                    h as f64 / GB
+                    "; {} short on {short} worker(s) (best headroom {} on worker {w})",
+                    r.name,
+                    amount(r, h.into())
                 )?;
             }
         }
@@ -448,14 +471,13 @@ impl fmt::Display for Waiting {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::FailKind;
+    use crate::{Config, FailKind};
 
     /// A waiting job with one worker of each verdict.
     fn waiting() -> Explanation {
-        let mut short = [false; DIMS];
-        short[MEM] = true;
         let w = Waiting {
-            demand: Resources::mem_gb(2.0).with_dev_gb(1.0),
+            demand: Resources::mem_gb(2.0).with_dev_gb(1.0).with_slots(1),
+            resources: Config::default().resources,
             group: 3,
             since: Time::ORIGIN,
             waited: Duration::from_secs(90),
@@ -471,21 +493,26 @@ mod tests {
                 since: Time::ORIGIN,
                 shadow: None,
                 running: 1,
-                slots: 2,
-                used: Resources::mem_gb(3.0),
+                capacity: Resources::mem_gb(8.0).with_slots(2),
+                used: Resources::mem_gb(3.0).with_slots(1),
             }),
             kind: Some("k".into()),
             kind_factors: vec![("a".into(), 1.5), ("b".into(), 0.5)],
             workers: vec![
                 (1, Verdict::Takes),
-                (2, Verdict::SlotsFull),
+                (
+                    2,
+                    Verdict::Full {
+                        dims: vec![ResourceId::SLOTS],
+                    },
+                ),
                 (3, Verdict::Ineligible),
                 (4, Verdict::Reserved { by: 9 }),
                 (
                     5,
                     Verdict::Short {
-                        dims: short,
-                        headroom: [Some(1_000_000_000), None, Some(1)],
+                        dims: vec![ResourceId::MEM],
+                        headroom: vec![Some(1_000_000_000), None, Some(1)],
                     },
                 ),
             ],
@@ -498,13 +525,14 @@ mod tests {
     fn display() {
         assert_eq!(
             waiting().to_string(),
-            "job 7 (demand 2.00 GB + 1.00 GB device, group 3) waiting 90s (aged), 4 more urgent \
-             job(s) waiting; failed 1 time(s), last on worker 6 (Timeout: slow); holds the \
-             reservation on worker 2 (draining: 1/2 running, used 3.00 GB); kind k runs 1.50x on \
-             class a, 0.50x on class b; slots full on 1 worker(s); memory short on 1 worker(s) \
-             (best headroom 1.00 GB on worker 5); 1 worker(s) excluded by its constraints; \
-             reserved: worker 4 for job 9; admitted on worker(s) [1] (placed at the next poll \
-             unless a more urgent job takes the slot)"
+            "job 7 (demand [memory 2.00 GB, device memory 1.00 GB, slots 1], group 3) waiting 90s \
+             (aged), 4 more urgent job(s) waiting; failed 1 time(s), last on worker 6 (Timeout: \
+             slow); holds the reservation on worker 2 (draining: 1 running, using [memory 3.00 \
+             GB, slots 1] of [memory 8.00 GB, slots 2]); kind k runs 1.50x on class a, 0.50x on \
+             class b; slots full on 1 worker(s); memory short on 1 worker(s) (best headroom 1.00 \
+             GB on worker 5); 1 worker(s) excluded by its constraints; reserved: worker 4 for job \
+             9; admitted on worker(s) [1] (placed at the next poll unless a more urgent job takes \
+             the slot)"
         );
         let pending = Explanation {
             unit: true,

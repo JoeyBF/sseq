@@ -63,8 +63,8 @@ pub enum Timing {
     ///
     /// ```
     /// # use whelm::{
-    /// #     Config, Input, JobSpec, Output, Policy, Scheduler, SpeedConfig, Time, Timing,
-    /// #     WorkerId, WorkerState,
+    /// #     Config, Input, JobSpec, Output, Policy, Resources, Scheduler, SpeedConfig, Time,
+    /// #     Timing, WorkerId, WorkerState,
     /// # };
     /// # /// A scheduler with `timing` and two one-slot workers: 1 of class "x" and 2 of class "y",
     /// # /// each reporting speed 1.
@@ -74,7 +74,8 @@ pub enum Timing {
     /// #         ..Config::default()
     /// #     });
     /// #     for (id, class) in [(1, "x"), (2, "y")] {
-    /// #         let w = WorkerState { id, class: class.into(), ..Default::default() };
+    /// #         let capacity = Resources::ZERO.with_slots(1);
+    /// #         let w = WorkerState { id, class: class.into(), capacity, ..Default::default() };
     /// #         s.handle(Input::Worker(w), Time::ORIGIN);
     /// #     }
     /// #     s
@@ -91,6 +92,7 @@ pub enum Timing {
     ///     id: 2,
     ///     class: "y".into(),
     ///     speed: 4.0,
+    ///     capacity: Resources::ZERO.with_slots(1),
     ///     ..Default::default()
     /// };
     /// let mut s = two_classes(Timing::Identical);
@@ -127,8 +129,8 @@ pub enum Timing {
     /// ```
     /// # use std::time::Duration;
     /// # use whelm::{
-    /// #     Config, Constraint, Input, JobSpec, Output, Policy, Scheduler, SpeedConfig, Time,
-    /// #     Timing, WorkerId, WorkerState,
+    /// #     Config, Constraint, Input, JobSpec, Output, Policy, Resources, Scheduler, SpeedConfig,
+    /// #     Time, Timing, WorkerId, WorkerState,
     /// # };
     /// # /// A scheduler with `timing` and two one-slot workers: 1 of class "x" and 2 of class "y",
     /// # /// each reporting speed 1.
@@ -138,7 +140,8 @@ pub enum Timing {
     /// #         ..Config::default()
     /// #     });
     /// #     for (id, class) in [(1, "x"), (2, "y")] {
-    /// #         let w = WorkerState { id, class: class.into(), ..Default::default() };
+    /// #         let capacity = Resources::ZERO.with_slots(1);
+    /// #         let w = WorkerState { id, class: class.into(), capacity, ..Default::default() };
     /// #         s.handle(Input::Worker(w), Time::ORIGIN);
     /// #     }
     /// #     s
@@ -229,8 +232,8 @@ impl Timing {
     /// ```
     /// # use std::time::Duration;
     /// # use whelm::{
-    /// #     Config, Constraint, Input, JobSpec, Output, Policy, Scheduler, SpeedConfig, Time,
-    /// #     Timing, WorkerId, WorkerState,
+    /// #     Config, Constraint, Input, JobSpec, Output, Policy, Resources, Scheduler, SpeedConfig,
+    /// #     Time, Timing, WorkerId, WorkerState,
     /// # };
     /// # /// A scheduler with `timing` and two one-slot workers: 1 of class "x" and 2 of class "y",
     /// # /// each reporting speed 1.
@@ -240,7 +243,8 @@ impl Timing {
     /// #         ..Config::default()
     /// #     });
     /// #     for (id, class) in [(1, "x"), (2, "y")] {
-    /// #         let w = WorkerState { id, class: class.into(), ..Default::default() };
+    /// #         let capacity = Resources::ZERO.with_slots(1);
+    /// #         let w = WorkerState { id, class: class.into(), capacity, ..Default::default() };
     /// #         s.handle(Input::Worker(w), Time::ORIGIN);
     /// #     }
     /// #     s

@@ -17,14 +17,15 @@ an example of every behaviour; this page is the overview.
 In α|β|γ notation:
 
 - **α, machines.** Workers (`WorkerState`) join, heartbeat and leave at any time. Each has a class,
-  a number of execution slots, a capacity per resource dimension, and a speed. The timing model
+  a capacity of each declared resource, and a speed. The timing model
   (`Timing`) is identical machines (P, `Timing::Identical`), uniformly related ones (Q,
   `Timing::Related`: one speed per worker) or unrelated ones (R, `Timing::Unrelated`: a speed per
   job kind and worker class). Speeds are reported, or learned online from completion times (`Learn`;
   `SpeedEstimator` is the same learner on its own).
 - **β, jobs.** A job (`JobSpec`) has
-  - a vector demand (`Resources` over `DIMS` dimensions: `MEM`, `DEV` and `SLOTS`), checked by one
-    per-dimension admission rule (below);
+  - a vector demand (`Resources`, one amount per resource that `Config::resources` declares: by
+    default host memory, device memory and execution slots), checked by one per-resource admission
+    rule (below);
   - `Constraint`s on a worker or a class (`Selector`) with a `Strength`: Require and Forbid are
     hard, Avoid is soft, Prefer only ranks workers;
   - dependencies, through the DAG layer;
@@ -46,27 +47,29 @@ memory demands, speeds, holds or arrivals over time every rule here is a heurist
 ### Admission
 
 An `Admission` rule decides whether a worker takes a job. `ProductionAdmission` applies one
-inequality to every enforced dimension:
+inequality to every enforced resource:
 
 ```text
-admit iff for every enforced dimension d:
+admit iff for every enforced resource d:
             max(reported_used[d],
                 reported_baseline[d] + max(placed[d], running * per_task[d]))
               + max(demand[d], per_task[d]) <= capacity[d]
           or (d is soft and running == 0)                 // escape hatch
 ```
 
-- `HARD` dimensions (slots) are always enforced and have no escape hatch. A soft dimension (memory)
-  is enforced only where its capacity is nonzero: a zero capacity is unknown.
+- The configuration declares each resource (`Resource`) hard or soft, with a default demand for jobs
+  that leave it at zero. Hard resources (slots, a GPU count, a license pool) are always enforced and
+  have no escape hatch; a worker with zero capacity of one runs no job that demands it. A soft
+  resource (memory) is enforced only where its capacity is nonzero: a zero capacity is unknown.
 - `per_task` is a per-job floor, so with a device floor and no per-job device demands the device
   inequality counts jobs, `(running + 1) * per_task <= capacity`.
-- The escape hatch lets a job alone on a worker with a free slot run whatever its estimate, so every
-  job can run somewhere.
+- The escape hatch lets a job alone on a worker run whatever its soft estimates, so every job that
+  fits the hard resources of some worker can run somewhere.
 - `reported_baseline` must exclude the running jobs' usage; a floor that contains them counts them
   twice.
 
 Where one number must compare workers (tightest fit, most headroom) it is the free fraction of
-capacity in the bottleneck soft dimension, `WorkerView::free_share`. A custom rule goes in through
+capacity in the bottleneck soft resource, `WorkerView::free_share`. A custom rule goes in through
 `Scheduler::with_admission` and must be monotone in load (see `Admission`).
 
 ## Jobs, attempts and messages
@@ -92,8 +95,7 @@ policy.handle(
     Input::Worker(WorkerState {
         id: 1,
         class: "l40s".into(),
-        slots: 16,
-        budget: Resources::mem_gb(120.0),
+        capacity: Resources::mem_gb(120.0).with_slots(16),
         reported_used: Resources::mem_gb(20.0),
         reported_baseline: Resources::mem_gb(20.0),
         ..Default::default()
@@ -208,8 +210,7 @@ let shared = Arc::new(SharedPolicy::with_system_clock(Scheduler::new(Config::def
 shared.worker_update(WorkerState {
     id: 1,
     class: "l40s".into(),
-    slots: 16,
-    budget: Resources::mem_gb(120.0),
+    capacity: Resources::mem_gb(120.0).with_slots(16),
     ..Default::default()
 });
 let job = JobSpec { id: 42, demand: Resources::mem_gb(6.0), group: 3, ..Default::default() };
@@ -243,7 +244,8 @@ use whelm::{
 
 let events = Arc::new(Mutex::new(Vec::<Event>::new()));
 let mut p = Logged::new(Scheduler::new(Config::default()), events.clone());
-let worker = WorkerState { id: 1, slots: 2, budget: Resources::mem_gb(10.0), ..Default::default() };
+let capacity = Resources::mem_gb(10.0).with_slots(2);
+let worker = WorkerState { id: 1, capacity, ..Default::default() };
 p.handle(Input::Worker(worker), Time::ORIGIN);
 let job = JobSpec { id: 1, demand: Resources::mem_gb(4.0), ..Default::default() };
 p.handle(Input::Submit(job), Time::ORIGIN);
@@ -298,12 +300,13 @@ is job `base + k`; other units depend on it by its id.
 use std::{sync::Arc, time::Duration};
 
 use whelm::{
-    Config, DagConfig, DagJob, DagScheduler, Input, JobSpec, Output, Policy, Scheduler,
+    Config, DagConfig, DagJob, DagScheduler, Input, JobSpec, Output, Policy, Resources, Scheduler,
     TemplateSpec, Time, Unit, WorkerState,
 };
 
 let mut dag = DagScheduler::new(DagConfig::default(), Scheduler::new(Config::default()));
-dag.handle(Input::Worker(WorkerState { id: 1, slots: 4, ..Default::default() }), Time::ORIGIN);
+let worker = WorkerState { id: 1, capacity: Resources::ZERO.with_slots(4), ..Default::default() };
+dag.handle(Input::Worker(worker), Time::ORIGIN);
 
 // A local job 1, then unit 10: a chain of jobs 100 -> 101 -> 102, the first checkpointed.
 let spec = JobSpec { id: 1, ..Default::default() };
@@ -375,8 +378,7 @@ let prior = if class == "l40s" { 1.39 } else { 1.0 };
 shared.worker_update(WorkerState {
     id,
     class: class.into(),
-    slots: 16,
-    budget: Resources::mem_gb(123.7).with_dev_gb(dev_cap),
+    capacity: Resources::mem_gb(123.7).with_dev_gb(dev_cap).with_slots(16),
     per_task: Resources::ZERO.with_dev_gb(dev_per_task),
     reported_used: Resources::mem_gb(rss),
     reported_baseline: Resources::mem_gb(baseline_excl),

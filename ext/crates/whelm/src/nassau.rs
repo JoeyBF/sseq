@@ -29,7 +29,7 @@
 //! p.handle(submit(2, group(2, 40)), Time::ORIGIN);
 //! let worker = WorkerState {
 //!     id: 1,
-//!     budget: Resources::mem_gb(8.0),
+//!     capacity: Resources::mem_gb(8.0).with_slots(1),
 //!     ..Default::default()
 //! };
 //! p.handle(Input::Worker(worker), Time::ORIGIN);

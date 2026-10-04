@@ -45,8 +45,7 @@ fn state(w: u64) -> WorkerState {
     WorkerState {
         id: w,
         class: "h200".into(),
-        slots: SLOTS,
-        budget: Resources::mem_gb(BUDGET_GB),
+        capacity: Resources::mem_gb(BUDGET_GB).with_slots(SLOTS as u64),
         ..Default::default()
     }
 }

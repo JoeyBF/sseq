@@ -43,8 +43,8 @@ pub enum FailKind {
 /// use std::time::Duration;
 ///
 /// use whelm::{
-///     Config, FailKind, GaveUp, Input, JobSpec, Output, Policy, RetryConfig, Scheduler, Time,
-///     Tried, WorkerState,
+///     Config, FailKind, GaveUp, Input, JobSpec, Output, Policy, Resources, RetryConfig,
+///     Scheduler, Time, Tried, WorkerState,
 /// };
 ///
 /// let config = Config {
@@ -56,6 +56,7 @@ pub enum FailKind {
 ///     Input::Worker(WorkerState {
 ///         id: 3,
 ///         class: "cpu".into(),
+///         capacity: Resources::ZERO.with_slots(1),
 ///         ..Default::default()
 ///     }),
 ///     Time::ORIGIN,
@@ -182,14 +183,14 @@ pub enum Input {
 /// A caller's dispatch over the outputs of one poll.
 ///
 /// ```
-/// use whelm::{Config, Input, JobSpec, Output, Policy, Scheduler, Time, WorkerState};
+/// use whelm::{Config, Input, JobSpec, Output, Policy, Resources, Scheduler, Time, WorkerState};
 ///
 /// let mut p = Scheduler::new(Config::default());
 /// p.handle(
 ///     Input::Worker(WorkerState {
 ///         id: 1,
 ///         class: "cpu".into(),
-///         slots: 2,
+///         capacity: Resources::ZERO.with_slots(2),
 ///         ..Default::default()
 ///     }),
 ///     Time::ORIGIN,
@@ -281,8 +282,8 @@ pub enum Output {
 ///
 /// ```
 /// use whelm::{
-///     Config, Explanation, Input, JobId, JobSpec, Output, Policy, PolicyStats, Scheduler, Time,
-///     WorkerState,
+///     Config, Explanation, Input, JobId, JobSpec, Output, Policy, PolicyStats, Resources,
+///     Scheduler, Time, WorkerState,
 /// };
 ///
 /// /// Counts every start the inner policy emits.
@@ -326,7 +327,7 @@ pub enum Output {
 ///     Input::Worker(WorkerState {
 ///         id: 1,
 ///         class: "cpu".into(),
-///         slots: 4,
+///         capacity: Resources::ZERO.with_slots(4),
 ///         ..Default::default()
 ///     }),
 ///     Time::ORIGIN,

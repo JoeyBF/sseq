@@ -23,8 +23,7 @@ fn worker(id: u64, slots: usize) -> WorkerState {
     WorkerState {
         id,
         class: "x".into(),
-        slots,
-        budget: Resources::mem(1 << 40),
+        capacity: Resources::mem(1 << 40).with_slots(slots as u64),
         ..Default::default()
     }
 }
@@ -739,8 +738,7 @@ fn poll_p99_at_frontier_size() {
         let w = WorkerState {
             id: w,
             class: class.into(),
-            slots: 16,
-            budget: Resources::mem_gb(150.0),
+            capacity: Resources::mem_gb(150.0).with_slots(16),
             ..Default::default()
         };
         p.handle(Input::Worker(w), Time::ORIGIN);

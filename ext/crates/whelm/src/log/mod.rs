@@ -28,7 +28,7 @@
 //! for w in [1, 2] {
 //!     let worker = WorkerState {
 //!         id: w,
-//!         budget: Resources::mem_gb(8.0),
+//!         capacity: Resources::mem_gb(8.0).with_slots(1),
 //!         ..Default::default()
 //!     };
 //!     p.handle(Input::Worker(worker), Time::ORIGIN);

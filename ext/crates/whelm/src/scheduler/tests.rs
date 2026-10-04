@@ -4,19 +4,20 @@ use std::time::Duration;
 
 use crate::{
     Attempt, Config, Constraint, FailKind, Input, JobId, JobSpec, OrderTerm, Output, Policy,
-    Resources, RetryConfig, SLOTS, Scheduler, ScoreTerm, Speculate, Time, Verdict, WorkerId,
-    WorkerState,
+    Reservations, Resource, ResourceId, Resources, RetryConfig, Scheduler, ScoreTerm, Speculate,
+    SpeedConfig, Time, Verdict, WorkerId, WorkerState,
 };
 
 const GB: u64 = 1_000_000_000;
 
-/// A worker of class "x" with a budget in GB.
-fn worker(id: WorkerId, slots: usize, budget_gb: u64) -> WorkerState {
+const SLOTS: ResourceId = ResourceId::SLOTS;
+
+/// A worker of class "x" with a memory capacity in GB.
+fn worker(id: WorkerId, slots: u64, budget_gb: u64) -> WorkerState {
     WorkerState {
         id,
         class: "x".into(),
-        slots,
-        budget: Resources::mem(budget_gb * GB),
+        capacity: Resources::mem(budget_gb * GB).with_slots(slots),
         ..Default::default()
     }
 }
@@ -162,16 +163,14 @@ fn best_fit_ranks_by_the_bottleneck() {
     let w1 = WorkerState {
         id: 1,
         class: "x".into(),
-        slots: 4,
-        budget: Resources::mem(100 * GB).with_dev(10 * GB),
+        capacity: Resources::mem(100 * GB).with_dev(10 * GB).with_slots(4),
         reported_used: Resources::ZERO.with_dev(8 * GB),
         ..Default::default()
     };
     let w2 = WorkerState {
         id: 2,
         class: "x".into(),
-        slots: 4,
-        budget: Resources::mem(100 * GB).with_dev(100 * GB),
+        capacity: Resources::mem(100 * GB).with_dev(100 * GB).with_slots(4),
         reported_used: Resources::mem(59 * GB),
         ..Default::default()
     };
@@ -238,10 +237,7 @@ fn retry_keeps_place_and_age() {
         "{e}"
     );
     // The avoidance of worker 1 holds while worker 2 lives, and excludes it like a constraint.
-    assert_eq!(
-        w.workers,
-        [(1, Verdict::Ineligible), (2, Verdict::SlotsFull)]
-    );
+    assert_eq!(w.workers, [(1, Verdict::Ineligible), (2, slots_full())]);
     let out = feed(&mut q, Time(Duration::from_secs(6)), [done(1, 1)]);
     assert_eq!(
         out,
@@ -457,7 +453,7 @@ fn stale_messages_are_ignored() {
     assert_eq!((st.waiting, st.running, st.workers[0].running), (0, 1, 1));
     assert!(feed(&mut p, Time(Duration::from_secs(3)), [done(0, 2)]).is_empty());
     let st = p.stats();
-    assert_eq!((st.running, st.workers[0].placed), (0, Resources::ZERO));
+    assert_eq!((st.running, &st.workers[0].placed), (0, &Resources::ZERO));
     // A late duplicate of the winning report is stale too.
     assert!(feed(&mut p, Time(Duration::from_secs(4)), [done(0, 2)]).is_empty());
     assert_eq!(p.explain(0), None);
@@ -716,8 +712,7 @@ fn requires_and_forbids() {
             Input::Worker(WorkerState {
                 id,
                 class: class.into(),
-                slots: 4,
-                budget: Resources::mem(100 * GB),
+                capacity: Resources::mem(100 * GB).with_slots(4),
                 ..Default::default()
             })
         })
@@ -780,15 +775,13 @@ fn prefer_class_and_loosest() {
         Input::Worker(WorkerState {
             id: 1,
             class: "a".into(),
-            slots: 4,
-            budget: Resources::mem(100 * GB),
+            capacity: Resources::mem(100 * GB).with_slots(4),
             ..Default::default()
         }),
         Input::Worker(WorkerState {
             id: 2,
             class: "b".into(),
-            slots: 4,
-            budget: Resources::mem(100 * GB),
+            capacity: Resources::mem(100 * GB).with_slots(4),
             ..Default::default()
         }),
         Input::Submit(JobSpec {
@@ -809,15 +802,22 @@ fn prefer_class_and_loosest() {
     assert_eq!(starts(&feed(&mut p, Time::ORIGIN, inputs)), vec![(0, 1)]);
 }
 
-/// Slots are a resource dimension: every job takes exactly one, whatever the caller wrote,
-/// and a full worker is explained as such.
+/// The verdict of a worker with every slot taken.
+fn slots_full() -> Verdict {
+    Verdict::Full { dims: vec![SLOTS] }
+}
+
+/// Slots are a hard resource: a job takes one unless it says otherwise, and a full worker is
+/// explained as such.
 #[test]
-fn slots_are_a_hard_dimension() {
+fn slots_are_a_hard_resource() {
     let mut p = Scheduler::new(Config::fifo());
-    let mut greedy = job(0, 1, 0);
-    greedy.demand[SLOTS] = 5;
+    let greedy = JobSpec {
+        demand: Resources::ZERO.with_slots(2),
+        ..job(0, 1, 0)
+    };
     let inputs = [
-        Input::Worker(worker(1, 2, 100)),
+        Input::Worker(worker(1, 3, 100)),
         Input::Submit(greedy),
         Input::Submit(job(1, 1, 0)),
         Input::Submit(job(2, 1, 0)),
@@ -828,11 +828,126 @@ fn slots_are_a_hard_dimension() {
     );
     let load = &p.stats().workers[0];
     assert_eq!(
-        (load.running, load.placed[SLOTS], load.headroom[SLOTS]),
-        (2, 2, Some(0))
+        (load.running, load.placed[SLOTS], load.headroom[SLOTS.0]),
+        (2, 3, Some(0))
     );
     let e = p.explain(2).unwrap();
-    assert_eq!(e.waiting().unwrap().workers, [(1, Verdict::SlotsFull)]);
+    assert_eq!(e.waiting().unwrap().workers, [(1, slots_full())]);
+}
+
+/// A declaration of its own: a GPU count, hard and demanded by some jobs only, beside slots.
+/// A job that needs GPUs waits for, reserves and defers to GPU workers only; the others run
+/// anywhere; explanations name the GPUs.
+#[test]
+fn declared_gpu_count() {
+    let gpus = ResourceId(1);
+    let config = Config {
+        resources: vec![
+            Resource::slots(),
+            Resource {
+                name: "gpus".into(),
+                hard: true,
+                ..Default::default()
+            },
+        ],
+        reservations: Some(Reservations {
+            reserve_after: Duration::ZERO,
+            ..Reservations::default()
+        }),
+        ..Config::fifo()
+    };
+    let w = |id, slots, g| WorkerState {
+        id,
+        class: if g > 0 { "gpu" } else { "cpu" }.into(),
+        capacity: Resources::of([(ResourceId(0), slots), (gpus, g)]),
+        ..Default::default()
+    };
+    let needs = |id, g| JobSpec {
+        id,
+        demand: Resources::of([(gpus, g)]),
+        ..Default::default()
+    };
+    let mut p = Scheduler::new(config);
+    let inputs = [
+        Input::Worker(w(1, 8, 0)),
+        Input::Worker(w(2, 8, 2)),
+        Input::Submit(needs(0, 2)),
+        Input::Submit(needs(1, 1)),
+        Input::Submit(needs(2, 0)),
+    ];
+    // Job 0 takes both GPUs; job 1 reserves the GPU worker, not the idle CPU one with more
+    // headroom, and job 2 runs on the CPU worker.
+    assert_eq!(
+        starts(&feed(&mut p, Time::ORIGIN, inputs)),
+        vec![(0, 2), (2, 1)]
+    );
+    let r = &p.stats().reservations;
+    assert_eq!((r.len(), r[0].job, r[0].worker), (1, 1, 2));
+    let why = p.explain(1).unwrap();
+    assert_eq!(
+        why.waiting().unwrap().workers,
+        [
+            (1, Verdict::Full { dims: vec![gpus] }),
+            (2, Verdict::Full { dims: vec![gpus] })
+        ]
+    );
+    assert!(
+        why.to_string()
+            .contains("(demand [slots 1, gpus 1], group 0)")
+            && why.to_string().contains("gpus full on 2 worker(s)"),
+        "{why}"
+    );
+    let t = Time(Duration::from_secs(1));
+    assert_eq!(
+        starts(&feed(&mut p, t, [Input::Done { job: 0, attempt: 1 }])),
+        vec![(1, 2)]
+    );
+}
+
+/// A job may wait for a faster worker short of a hard resource it needs, but not for one that
+/// could never fit it.
+#[test]
+fn deferral_waits_for_hard_capacity() {
+    let gpus = ResourceId(3);
+    let mut config = Config {
+        speed: SpeedConfig {
+            defer: Some(crate::Defer::default()),
+            ..SpeedConfig::default()
+        },
+        ..Config::fifo()
+    };
+    config.resources.push(Resource {
+        name: "gpus".into(),
+        hard: true,
+        ..Default::default()
+    });
+    let w = |id, g, speed| WorkerState {
+        id,
+        capacity: Resources::ZERO.with_slots(4).with(gpus, g),
+        speed,
+        ..Default::default()
+    };
+    let gpu_job = |id, work| JobSpec {
+        id,
+        demand: Resources::ZERO.with(gpus, 1),
+        work: Some(Duration::from_secs(work)),
+        ..Default::default()
+    };
+    for (fast_gpus, deferred) in [(1, true), (0, false)] {
+        let mut p = Scheduler::new(config.clone());
+        let inputs = [
+            Input::Worker(w(1, fast_gpus, 4.0)),
+            Input::Worker(w(2, 4, 1.0)),
+            Input::Submit(gpu_job(0, 10)),
+        ];
+        let first = feed(&mut p, Time::ORIGIN, inputs);
+        let on = if fast_gpus > 0 { 1 } else { 2 };
+        assert_eq!(starts(&first), vec![(0, on)]);
+        let out = feed(&mut p, Time::ORIGIN, [Input::Submit(gpu_job(1, 40))]);
+        assert_eq!(out.is_empty(), deferred, "{out:?}");
+        let held: Vec<_> = p.stats().deferred.iter().map(|d| (d.0, d.1)).collect();
+        assert_eq!(held, if deferred { vec![(1, 1)] } else { vec![] });
+    }
 }
 
 /// Without enough gain, nothing is speculated.

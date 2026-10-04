@@ -24,12 +24,11 @@
 //!
 //! let mut s = Scheduler::new(Config::default());
 //! for w in [1, 2] {
-//!     let budget = Resources::mem_gb(8.0);
 //!     s.handle(
 //!         Input::Worker(WorkerState {
 //!             id: w,
 //!             class: "cpu".into(),
-//!             budget,
+//!             capacity: Resources::mem_gb(8.0).with_slots(1),
 //!             ..Default::default()
 //!         }),
 //!         Time::ORIGIN,
@@ -83,7 +82,7 @@ use order::{Key, dedup};
 
 use crate::{
     Admission, Attempt, Config, Explanation, Input, JobId, JobSpec, Output, Policy, PolicyStats,
-    ProductionAdmission, Resources, SLOTS, Time, Tried, WorkerId, WorkerState, WorkerView,
+    ProductionAdmission, Resource, Resources, Time, Tried, WorkerId, WorkerState, WorkerView,
     speed::{ClassId, KindId, Speeds},
 };
 #[cfg(doc)]
@@ -93,7 +92,7 @@ use crate::{GroupOrder, Strength};
 #[derive(Clone, Debug)]
 struct Worker {
     state: WorkerState,
-    /// The demands of the live attempts here, one slot each.
+    /// The demands of the live attempts here.
     placed: Resources,
     /// The jobs with a live attempt here, and that attempt (a job has at most one per worker).
     jobs: BTreeMap<JobId, Attempt>,
@@ -110,22 +109,19 @@ struct Worker {
 }
 
 impl Worker {
-    /// The worker as the admission rule sees it.
-    fn view(&self) -> WorkerView<'_> {
+    /// The worker as the admission rule sees it, under the declaration `resources`.
+    fn view<'a>(&'a self, resources: &'a [Resource]) -> WorkerView<'a> {
         WorkerView {
+            resources,
             state: &self.state,
-            placed: self.placed,
+            placed: &self.placed,
+            running: self.running(),
         }
     }
 
     /// Live attempts here.
     fn running(&self) -> usize {
-        self.placed[SLOTS] as usize
-    }
-
-    /// Whether the worker can ever run anything: it has slots.
-    fn live(&self) -> bool {
-        self.state.slots > 0
+        self.jobs.len()
     }
 }
 
@@ -206,8 +202,7 @@ fn tick_occ(w: &mut Worker, now: Time) {
 /// # use whelm::{Config, Input, JobSpec, Output, Policy, Resources, Scheduler, Time, WorkerState};
 /// # let worker = |id, slots, bytes| WorkerState {
 /// #     id,
-/// #     slots,
-/// #     budget: Resources::mem(bytes),
+/// #     capacity: Resources::mem(bytes).with_slots(slots),
 /// #     ..Default::default()
 /// # };
 /// # let job = |id, bytes| JobSpec { id, demand: Resources::mem(bytes), ..Default::default() };
@@ -238,8 +233,7 @@ fn tick_occ(w: &mut Worker, now: Time) {
 /// # use whelm::{Config, Input, JobSpec, Output, Policy, Resources, Scheduler, Time, WorkerState};
 /// # let worker = |id, slots, bytes| WorkerState {
 /// #     id,
-/// #     slots,
-/// #     budget: Resources::mem(bytes),
+/// #     capacity: Resources::mem(bytes).with_slots(slots),
 /// #     ..Default::default()
 /// # };
 /// # let job = |id, bytes| JobSpec { id, demand: Resources::mem(bytes), ..Default::default() };
@@ -285,8 +279,7 @@ fn tick_occ(w: &mut Worker, now: Time) {
 /// # use whelm::{Config, Input, JobSpec, Output, Policy, Resources, Scheduler, Time, WorkerState};
 /// # let worker = |id, slots, bytes| WorkerState {
 /// #     id,
-/// #     slots,
-/// #     budget: Resources::mem(bytes),
+/// #     capacity: Resources::mem(bytes).with_slots(slots),
 /// #     ..Default::default()
 /// # };
 /// # let job = |id, bytes| JobSpec { id, demand: Resources::mem(bytes), ..Default::default() };
@@ -325,8 +318,7 @@ fn tick_occ(w: &mut Worker, now: Time) {
 /// # use whelm::{Config, Input, JobSpec, Output, Policy, Resources, Scheduler, Time, WorkerState};
 /// # let worker = |id, slots, bytes| WorkerState {
 /// #     id,
-/// #     slots,
-/// #     budget: Resources::mem(bytes),
+/// #     capacity: Resources::mem(bytes).with_slots(slots),
 /// #     ..Default::default()
 /// # };
 /// # let job = |id, bytes| JobSpec { id, demand: Resources::mem(bytes), ..Default::default() };
@@ -375,8 +367,7 @@ fn tick_occ(w: &mut Worker, now: Time) {
 /// # use whelm::{Config, Input, JobSpec, Output, Policy, Resources, Scheduler, Time, WorkerState};
 /// # let worker = |id, slots, bytes| WorkerState {
 /// #     id,
-/// #     slots,
-/// #     budget: Resources::mem(bytes),
+/// #     capacity: Resources::mem(bytes).with_slots(slots),
 /// #     ..Default::default()
 /// # };
 /// # let job = |id, bytes| JobSpec { id, demand: Resources::mem(bytes), ..Default::default() };
@@ -492,7 +483,7 @@ impl Scheduler {
     ///     Input::Worker(WorkerState {
     ///         id: 1,
     ///         class: "draining".into(),
-    ///         slots: 4,
+    ///         capacity: Resources::ZERO.with_slots(4),
     ///         ..Default::default()
     ///     }),
     ///     Time::ORIGIN,
@@ -501,7 +492,7 @@ impl Scheduler {
     ///     Input::Worker(WorkerState {
     ///         id: 2,
     ///         class: "cpu".into(),
-    ///         slots: 4,
+    ///         capacity: Resources::ZERO.with_slots(4),
     ///         ..Default::default()
     ///     }),
     ///     Time::ORIGIN,
@@ -557,13 +548,14 @@ impl Scheduler {
     /// ```
     /// use std::time::Duration;
     ///
-    /// use whelm::{Config, Input, JobSpec, Output, Policy, Scheduler, Time, WorkerState};
+    /// use whelm::{Config, Input, JobSpec, Output, Policy, Resources, Scheduler, Time, WorkerState};
     ///
     /// let next = |forget| {
     ///     let mut s = Scheduler::new(Config::default());
     ///     s.handle(
     ///         Input::Worker(WorkerState {
     ///             id: 1,
+    ///             capacity: Resources::ZERO.with_slots(1),
     ///             ..Default::default()
     ///         }),
     ///         Time::ORIGIN,

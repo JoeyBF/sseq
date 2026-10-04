@@ -3,9 +3,11 @@
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
+use crate::Resources;
+#[cfg(doc)]
+use crate::{Config, Resource, ResourceId};
 #[cfg(doc)]
 use crate::{Defer, Input, JobSpec, ScoreTerm, Selector, Speculate, Timing};
-use crate::{Resources, SLOTS};
 
 /// A worker identifier. The caller maps its own ids (e.g. `"host:port"`) to these.
 pub type WorkerId = u64;
@@ -17,23 +19,22 @@ pub type WorkerId = u64;
 ///
 /// # Examples
 ///
-/// A GPU worker with 16 slots, 120 GB of host memory and 20 GB of device memory, reporting 30 GB
+/// A GPU worker with 120 GB of host memory, 20 GB of device memory and 16 slots, reporting 30 GB
 /// resident of which 12 GB is its runtime, and running at 1.4 times the reference speed.
 ///
 /// ```
-/// use whelm::{Resources, SLOTS, WorkerState};
+/// use whelm::{ResourceId, Resources, WorkerState};
 ///
 /// let w = WorkerState {
 ///     id: 7,
 ///     class: "l40s".into(),
-///     slots: 16,
-///     budget: Resources::mem_gb(120.0).with_dev_gb(20.0),
+///     capacity: Resources::mem_gb(120.0).with_dev_gb(20.0).with_slots(16),
 ///     reported_used: Resources::mem_gb(30.0),
 ///     reported_baseline: Resources::mem_gb(12.0),
 ///     speed: 1.4,
 ///     ..Default::default()
 /// };
-/// assert_eq!(w.capacity()[SLOTS], 16);
+/// assert_eq!(w.capacity[ResourceId::SLOTS], 16);
 /// ```
 #[derive(Clone, Debug, PartialEq)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
@@ -42,15 +43,14 @@ pub struct WorkerState {
     pub id: WorkerId,
     /// The worker's class (e.g. GPU type), used by [`Selector::Class`] and per-class reservations.
     pub class: String,
-    /// Concurrent jobs at most; zero admits nothing.
-    pub slots: usize,
-    /// Memory capacity: host memory, and device memory (the pool jobs' device allocations come
-    /// from). A zero component is unknown and not enforced. Its [`SLOTS`] component is ignored:
-    /// [`capacity`](Self::capacity) takes it from `slots`.
-    pub budget: Resources,
+    /// What the worker has of each [declared resource](Config::resources). A zero component of a
+    /// [hard](Resource::hard) resource is none of it, and of a soft one, an unknown amount that is
+    /// not enforced. Under the default declaration, the worker runs nothing without
+    /// [slots](ResourceId::SLOTS).
+    pub capacity: Resources,
     /// What one job of this worker is expected to take at least, learned by the worker (e.g. the
     /// typical device launch request); zero components are unknown. Each job counts for at least
-    /// this much against `budget` in every dimension, whatever its own [`JobSpec::demand`] says.
+    /// this much against `capacity` in every resource, whatever its own [`JobSpec::demand`] says.
     #[cfg_attr(feature = "serde", serde(default))]
     pub per_task: Resources,
     /// Last reported resident usage (from a heartbeat; may lag by seconds).
@@ -72,45 +72,20 @@ pub(crate) fn unit() -> f64 {
 }
 
 impl Default for WorkerState {
-    /// A worker that runs one job at a time, of unknown memory, at the reference speed.
+    /// A worker of zero capacity, at the reference speed.
     ///
-    /// A worker of zero slots admits nothing, so a default of zero would make a worker that
-    /// silently never runs a job; with one, a worker that leaves `slots` out still runs its jobs,
-    /// in turn.
+    /// Under the default declaration it runs nothing until its capacity has slots: a worker
+    /// writes its capacity whole, slots included. A job no worker has slots for is
+    /// [explained](crate::Policy::explain) as slots full there.
     fn default() -> Self {
         Self {
             id: 0,
             class: String::new(),
-            slots: 1,
-            budget: Resources::ZERO,
+            capacity: Resources::ZERO,
             per_task: Resources::ZERO,
             reported_used: Resources::ZERO,
             reported_baseline: Resources::ZERO,
             speed: 1.0,
         }
-    }
-}
-
-impl WorkerState {
-    /// The capacity admission enforces: `budget` in the memory dimensions, `slots` in
-    /// [`SLOTS`].
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use whelm::{MEM, Resources, SLOTS, WorkerState};
-    ///
-    /// let w = WorkerState {
-    ///     slots: 8,
-    ///     budget: Resources::mem(100),
-    ///     ..Default::default()
-    /// };
-    /// let cap = w.capacity();
-    /// assert_eq!((cap[MEM], cap[SLOTS]), (100, 8));
-    /// ```
-    pub fn capacity(&self) -> Resources {
-        let mut c = self.budget;
-        c[SLOTS] = self.slots as u64;
-        c
     }
 }

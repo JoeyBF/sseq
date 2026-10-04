@@ -4,8 +4,7 @@ use super::{Job, Scheduler, Worker, holds::Hold, placement::Refusal};
 #[cfg(doc)]
 use crate::Policy;
 use crate::{
-    DIMS, Explanation, Holding, JobId, PolicyStats, ReservationInfo, SLOTS, Status, Verdict,
-    Waiting, WorkerLoad,
+    Explanation, Holding, JobId, PolicyStats, ReservationInfo, Status, Verdict, Waiting, WorkerLoad,
 };
 
 impl Scheduler {
@@ -14,10 +13,10 @@ impl Scheduler {
         WorkerLoad {
             id: w.state.id,
             class: w.state.class.clone(),
-            slots: w.state.slots,
+            capacity: w.state.capacity.clone(),
             running: w.running(),
-            placed: w.placed,
-            headroom: w.view().headroom(),
+            placed: w.placed.clone(),
+            headroom: w.view(&self.config.resources).headroom(),
             reserved_for: w.reserved_for,
             speed: w.speed,
         }
@@ -81,8 +80,8 @@ impl Scheduler {
                     since,
                     shadow,
                     running: w.running(),
-                    slots: w.state.slots,
-                    used: w.view().used(),
+                    capacity: w.state.capacity.clone(),
+                    used: w.view(&self.config.resources).used(),
                 }
             }
             Hold::Defer { worker, at, until } => Holding::Deferral {
@@ -102,7 +101,8 @@ impl Scheduler {
             .map(|(&id, w)| (id, self.verdict(j, w)))
             .collect();
         let waiting = Waiting {
-            demand: j.spec.demand,
+            demand: j.spec.demand.clone(),
+            resources: self.config.resources.clone(),
             group: j.spec.group,
             since: j.since,
             waited: self.now - j.since,
@@ -125,18 +125,17 @@ impl Scheduler {
             Some(Refusal::Held(by, Hold::Reserve { .. })) => Verdict::Reserved { by },
             Some(Refusal::Held(_, Hold::Defer { .. })) => Verdict::Deferred,
             Some(Refusal::Admission) => {
-                let view = w.view();
-                let mut dims = [false; DIMS];
-                for d in view.short(&job.spec.demand) {
-                    dims[d] = true;
-                }
-                if dims[SLOTS] {
-                    Verdict::SlotsFull
-                } else {
+                let resources = &self.config.resources;
+                let view = w.view(resources);
+                let (hard, soft): (Vec<_>, Vec<_>) =
+                    (view.short(&job.spec.demand)).partition(|d| resources[d.0].hard);
+                if hard.is_empty() {
                     Verdict::Short {
-                        dims,
+                        dims: soft,
                         headroom: view.headroom(),
                     }
+                } else {
+                    Verdict::Full { dims: hard }
                 }
             }
         }

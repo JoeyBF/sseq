@@ -12,8 +12,8 @@ use super::{
 #[cfg(doc)]
 use crate::Config;
 use crate::{
-    JobId, JobSpec, Resources, SLOTS, ScoreTerm, Selector, Strength, Time, WorkerId, WorkerState,
-    WorkerView, time::secs,
+    JobId, JobSpec, ResourceId, Resources, ScoreTerm, Selector, Strength, Time, WorkerId,
+    WorkerState, WorkerView, time::secs,
 };
 
 /// The most terms a [`Config::score`] has once repeats are dropped: one per [`ScoreTerm`].
@@ -22,7 +22,7 @@ const SCORE_TERMS: usize = 5;
 /// A worker's rank for a job under [`Config::score`]: smaller is better, like [`Key`].
 pub(super) type Score = [i64; SCORE_TERMS];
 
-/// Projected slot free times of busy workers during one `dispatch` (for deferral): per worker,
+/// Projected free times of busy workers during one `dispatch` (for deferral): per worker,
 /// the expected end of each running or deferred job, smallest first.
 type Projection = HashMap<WorkerId, Vec<Option<Time>>>;
 
@@ -92,16 +92,27 @@ fn class_possible(job: &JobSpec, classes: &BTreeSet<String>) -> bool {
 
 impl Scheduler {
     /// Whether `job`'s constraints allow `w` at all. Avoidance (its [`Strength::Avoid`]s and the
-    /// workers of failed attempts) lapses while no live worker that the hard constraints allow is
-    /// free of it; that depends on the worker set only, not on load, so admission stays monotone.
+    /// workers of failed attempts) lapses while no worker that the hard constraints allow and
+    /// that [fits](Self::fits_empty) the job is free of it; that depends on the worker set only,
+    /// not on load, so admission stays monotone.
     pub(super) fn eligible(&self, job: &Job, w: &Worker) -> bool {
         let spec = &job.spec;
         allows(spec, &w.state)
             && (!avoids(job, &w.state)
-                || !self
-                    .workers
-                    .values()
-                    .any(|o| o.live() && allows(spec, &o.state) && !avoids(job, &o.state)))
+                || !self.workers.values().any(|o| {
+                    allows(spec, &o.state) && !avoids(job, &o.state) && self.fits_empty(job, o)
+                }))
+    }
+
+    /// Whether `w` would admit `job` if it ran nothing, as it reports itself now: whether the job
+    /// can ever run there.
+    pub(super) fn fits_empty(&self, job: &Job, w: &Worker) -> bool {
+        let empty = WorkerView {
+            placed: &Resources::ZERO,
+            running: 0,
+            ..w.view(&self.config.resources)
+        };
+        self.admission.admits(&job.spec.demand, &empty)
     }
 
     /// Whether `w` takes the job, or why not.
@@ -112,14 +123,14 @@ impl Scheduler {
         if let Some((by, hold)) = self.held(job, w) {
             return Some(Refusal::Held(by, hold));
         }
-        if !self.admission.admits(&job.spec.demand, &w.view()) {
+        if !(self.admission).admits(&job.spec.demand, &w.view(&self.config.resources)) {
             return Some(Refusal::Admission);
         }
         None
     }
 
-    /// When a busy worker's next slot is expected to free: the earliest projected end, or `None`
-    /// if a running job's end is unknown on every slot.
+    /// When a busy worker is next expected to free room: the earliest projected end, or `None` if
+    /// no running job's end there is known.
     fn next_free(&self, w: &Worker, proj: &mut Projection) -> Option<Time> {
         let ends = proj.entry(w.state.id).or_insert_with(|| {
             let mut ends: Vec<Option<Time>> = (w.jobs.keys())
@@ -137,8 +148,8 @@ impl Scheduler {
         for (slot, term) in score.iter_mut().zip(&self.config.score) {
             *slot = match term {
                 ScoreTerm::Speed => self.speed_rank(job, w),
-                ScoreTerm::Tightest => ordered(w.view().free_share(&job.spec.demand)),
-                ScoreTerm::Loosest => ordered(-w.view().free_share(&job.spec.demand)),
+                ScoreTerm::Tightest => ordered(self.free_share(w, &job.spec.demand)),
+                ScoreTerm::Loosest => ordered(-self.free_share(w, &job.spec.demand)),
                 ScoreTerm::Preferred => !prefers(&job.spec, &w.state) as i64,
                 ScoreTerm::Load => w.running() as i64,
             };
@@ -173,23 +184,11 @@ impl Scheduler {
             let speed_here = self.speed(job, &self.workers[&place]);
             let mut wait: Option<(Time, WorkerId)> = None;
             for (&id, w) in &self.workers {
-                let slots = w.state.slots;
-                // Only full workers, and only if they would admit the job with one slot free.
                 if self.speed(job, w) <= speed_here
-                    || slots == 0
-                    || w.running() < slots
                     || !self.eligible(job, w)
                     || w.reserved_for.is_some_and(|h| h != job.spec.id)
+                    || !self.waits_for(job, w)
                 {
-                    continue;
-                }
-                let mut placed = w.placed;
-                placed[SLOTS] = slots as u64 - 1;
-                let view = WorkerView {
-                    state: &w.state,
-                    placed,
-                };
-                if !self.admission.admits(&job.spec.demand, &view) {
                     continue;
                 }
                 let (Some(start), Some(run)) = (self.next_free(w, proj), self.eta(job, w)) else {
@@ -220,9 +219,37 @@ impl Scheduler {
         w.reserved_for.is_none() || self.shadow(w).is_some()
     }
 
+    /// Whether a deferring `job` may wait for busy worker `w`: `w` is short of a hard resource
+    /// for it, and would admit it once one job's worth of that is free, as though a job demanding
+    /// what it demands in the hard resources had ended there and nothing else had changed.
+    fn waits_for(&self, job: &Job, w: &Worker) -> bool {
+        let resources = &self.config.resources;
+        let hard = |d: &ResourceId| resources[d.0].hard;
+        let view = w.view(resources);
+        let demand = &job.spec.demand;
+        if w.running() == 0 || !view.short(demand).any(|d| hard(&d)) {
+            return false;
+        }
+        let freed = Resources::of(view.ids().filter(hard).map(|d| (d, demand[d])));
+        let placed = w.placed.clone() - &freed;
+        let after = WorkerView {
+            placed: &placed,
+            running: w.running() - 1,
+            ..view
+        };
+        self.admission.admits(demand, &after)
+    }
+
+    /// [`WorkerView::free_share`] of `demand` on `w`.
+    pub(super) fn free_share(&self, w: &Worker, demand: &Resources) -> f64 {
+        w.view(&self.config.resources).free_share(demand)
+    }
+
     /// Whether worker `w` admits anything at all, by the admission bound.
     pub(super) fn has_room(&self, w: &Worker) -> bool {
-        self.admission.bound(&w.view()).is_some()
+        (self.admission)
+            .bound(&w.view(&self.config.resources))
+            .is_some()
     }
 
     /// Classes with an open worker that has room.
@@ -240,7 +267,7 @@ impl Scheduler {
         self.workers
             .values()
             .filter(|w| self.open(w))
-            .filter_map(|w| self.admission.bound(&w.view()))
+            .filter_map(|w| self.admission.bound(&w.view(&self.config.resources)))
             .reduce(Resources::max)
     }
 
@@ -249,15 +276,17 @@ impl Scheduler {
         self.last_dispatch_holders.clear();
         self.deferred_any.clear();
         // Deferrals are decided afresh by this scan. A reservation on a worker that can never run
-        // anything again is dead weight, and so is one its holder may no longer use (a soft avoid
-        // list that lapsed when it reserved holds again once another worker joins).
+        // its holder is dead weight, whether for want of capacity or because the holder may no
+        // longer use it (a soft avoid list that lapsed when it reserved holds again once another
+        // worker joins).
         self.holds.retain(|_, h| matches!(h, Hold::Reserve { .. }));
         let dead: Vec<JobId> = self
             .holds
             .iter()
             .filter(|(job, h)| {
                 let w = &self.workers[&h.worker()];
-                !w.live() || !self.eligible(&self.waiting[job], w)
+                let j = &self.waiting[job];
+                !self.fits_empty(j, w) || !self.eligible(j, w)
             })
             .map(|(&job, _)| job)
             .collect();
@@ -285,7 +314,7 @@ impl Scheduler {
                 let holder = self.reserved(job).is_some();
                 // Cheap pruning: the admission bound, and required classes without room.
                 let hopeful = holder
-                    || (bound.is_some_and(|b| j.spec.demand.fits_within(&b))
+                    || (bound.as_ref().is_some_and(|b| j.spec.demand.fits_within(b))
                         && class_possible(&j.spec, &classes));
                 let pick = if hopeful {
                     self.choose(j, &mut proj)

@@ -7,7 +7,8 @@ use serde::{Deserialize, Serialize};
 
 #[cfg(doc)]
 use crate::{
-    Config, DagConfig, DagScheduler, Defer, OrderTerm, Policy, SLOTS, ScoreTerm, Speculate, Timing,
+    Config, DagConfig, DagScheduler, Defer, OrderTerm, Policy, Resource, ScoreTerm, Speculate,
+    Timing,
 };
 use crate::{Resources, Time, WorkerId, WorkerState};
 
@@ -22,11 +23,12 @@ pub type JobId = u64;
 /// # Examples
 ///
 /// ```
-/// use whelm::{Selector, WorkerState};
+/// use whelm::{Resources, Selector, WorkerState};
 ///
 /// let w = WorkerState {
 ///     id: 7,
 ///     class: "gpu".into(),
+///     capacity: Resources::ZERO.with_slots(1),
 ///     ..Default::default()
 /// };
 /// assert!(Selector::Worker(7).matches(&w));
@@ -63,13 +65,16 @@ impl Selector {
 /// Requires of one kind are alternatives: this job may run on either class.
 ///
 /// ```
-/// use whelm::{Config, Constraint, Input, JobSpec, Output, Policy, Scheduler, Time, WorkerState};
+/// use whelm::{
+///     Config, Constraint, Input, JobSpec, Output, Policy, Resources, Scheduler, Time, WorkerState,
+/// };
 ///
 /// let mut p = Scheduler::new(Config::default());
 /// for (id, class) in [(1, "cpu"), (2, "a100"), (3, "h100")] {
 ///     let w = WorkerState {
 ///         id,
 ///         class: class.into(),
+///         capacity: Resources::ZERO.with_slots(1),
 ///         ..Default::default()
 ///     };
 ///     p.handle(Input::Worker(w), Time::ORIGIN);
@@ -111,10 +116,10 @@ pub enum Strength {
     Require,
     /// Never run on a selected worker.
     Forbid,
-    /// Run on a selected worker only while no live worker (one with slots) that the hard
-    /// constraints allow is free of every Avoid. That depends on the set of workers, not on their
-    /// load, so a retry waits for a busy healthy worker rather than returning to the one it failed
-    /// on.
+    /// Run on a selected worker only while no live worker (one that would admit some job if it
+    /// were empty) that the hard constraints allow is free of every Avoid. That depends on the set
+    /// of workers, not on their load, so a retry waits for a busy healthy worker rather than
+    /// returning to the one it failed on.
     Avoid,
     /// Favour a selected worker where [`ScoreTerm::Preferred`] ranks workers (cache affinity).
     Prefer,
@@ -173,13 +178,16 @@ impl Constraint {
     /// # Examples
     ///
     /// ```
-    /// use whelm::{Config, Constraint, Input, JobSpec, Output, Policy, Scheduler, Time, WorkerState};
+    /// use whelm::{
+    ///     Config, Constraint, Input, JobSpec, Output, Policy, Resources, Scheduler, Time, WorkerState,
+    /// };
     ///
     /// let mut p = Scheduler::new(Config::default());
     /// for (id, class) in [(1, "cpu"), (2, "gpu")] {
     ///     let w = WorkerState {
     ///         id,
     ///         class: class.into(),
+    ///         capacity: Resources::ZERO.with_slots(1),
     ///         ..Default::default()
     ///     };
     ///     p.handle(Input::Worker(w), Time::ORIGIN);
@@ -213,12 +221,15 @@ impl Constraint {
     /// Unlike an avoided worker, a forbidden one is never used, even when it is the only one.
     ///
     /// ```
-    /// use whelm::{Config, Constraint, Input, JobSpec, Policy, Scheduler, Time, WorkerState};
+    /// use whelm::{
+    ///     Config, Constraint, Input, JobSpec, Policy, Resources, Scheduler, Time, WorkerState,
+    /// };
     ///
     /// let mut p = Scheduler::new(Config::default());
     /// p.handle(
     ///     Input::Worker(WorkerState {
     ///         id: 1,
+    ///         capacity: Resources::ZERO.with_slots(1),
     ///         ..Default::default()
     ///     }),
     ///     Time::ORIGIN,
@@ -265,12 +276,15 @@ impl Constraint {
     /// With no other live worker, the avoided one is used after all (see [`Strength::Avoid`]).
     ///
     /// ```
-    /// use whelm::{Config, Constraint, Input, JobSpec, Output, Policy, Scheduler, Time, WorkerState};
+    /// use whelm::{
+    ///     Config, Constraint, Input, JobSpec, Output, Policy, Resources, Scheduler, Time, WorkerState,
+    /// };
     ///
     /// let mut p = Scheduler::new(Config::default());
     /// p.handle(
     ///     Input::Worker(WorkerState {
     ///         id: 1,
+    ///         capacity: Resources::ZERO.with_slots(1),
     ///         ..Default::default()
     ///     }),
     ///     Time::ORIGIN,
@@ -322,13 +336,16 @@ impl Constraint {
     /// # Examples
     ///
     /// ```
-    /// use whelm::{Config, Constraint, Input, JobSpec, Output, Policy, Scheduler, Time, WorkerState};
+    /// use whelm::{
+    ///     Config, Constraint, Input, JobSpec, Output, Policy, Resources, Scheduler, Time, WorkerState,
+    /// };
     ///
     /// let mut p = Scheduler::new(Config::default());
     /// for id in [1, 2] {
     ///     p.handle(
     ///         Input::Worker(WorkerState {
     ///             id,
+    ///             capacity: Resources::ZERO.with_slots(1),
     ///             ..Default::default()
     ///         }),
     ///         Time::ORIGIN,
@@ -409,7 +426,9 @@ pub struct JobSpec {
     /// The job's id.
     pub id: JobId,
     /// What the job is expected to use while running (an estimate; it may be pessimistic). The
-    /// [`SLOTS`] component is the scheduler's to set.
+    /// scheduler ignores components beyond [`Config::resources`] and fills in each zero one with
+    /// its resource's [`default_demand`](Resource::default_demand): one slot, under the default
+    /// declaration.
     pub demand: Resources,
     /// Priority group, e.g. the bidegree a job belongs to ([`OrderTerm::Group`]).
     pub group: u64,

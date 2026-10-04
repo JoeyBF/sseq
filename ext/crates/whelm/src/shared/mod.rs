@@ -18,7 +18,7 @@
 //! }));
 //! shared.worker_update(WorkerState {
 //!     id: 1,
-//!     budget: Resources::mem_gb(8.0),
+//!     capacity: Resources::mem_gb(8.0).with_slots(1),
 //!     ..Default::default()
 //! });
 //! let job = |id| JobSpec {
@@ -42,7 +42,12 @@
 //! }
 //! assert_eq!(
 //!     shared.explain(2).unwrap().waiting().unwrap().workers,
-//!     [(1, whelm::Verdict::SlotsFull)]
+//!     [(
+//!         1,
+//!         whelm::Verdict::Full {
+//!             dims: vec![whelm::ResourceId::SLOTS]
+//!         }
+//!     )]
 //! );
 //! first.complete();
 //! assert_eq!(second.join().unwrap(), 1);
@@ -110,7 +115,7 @@ impl<P: Policy> SharedPolicy<P> {
     /// let shared = Arc::new(SharedPolicy::new(Scheduler::new(Config::default()), clock));
     /// shared.worker_update(WorkerState {
     ///     id: 1,
-    ///     budget: Resources::mem_gb(8.0),
+    ///     capacity: Resources::mem_gb(8.0).with_slots(1),
     ///     ..Default::default()
     /// });
     /// let job = |id| JobSpec {
@@ -161,8 +166,7 @@ impl<P: Policy> SharedPolicy<P> {
     /// let shared = SharedPolicy::with_system_clock(Scheduler::new(Config::default()));
     /// shared.worker_update(WorkerState {
     ///     id: 1,
-    ///     slots: 4,
-    ///     budget: Resources::mem_gb(8.0),
+    ///     capacity: Resources::mem_gb(8.0).with_slots(4),
     ///     ..Default::default()
     /// });
     /// let lease = shared.lease(JobSpec {
@@ -188,7 +192,7 @@ impl<P: Policy> SharedPolicy<P> {
     /// let shared = SharedPolicy::new(Scheduler::new(Config::default()), || Time::ORIGIN);
     /// shared.worker_update(WorkerState {
     ///     id: 1,
-    ///     budget: Resources::mem_gb(8.0),
+    ///     capacity: Resources::mem_gb(8.0).with_slots(1),
     ///     ..Default::default()
     /// });
     /// let lease = shared.lease(JobSpec {
@@ -272,7 +276,7 @@ impl<P: Policy> SharedPolicy<P> {
     /// }
     /// shared.worker_update(WorkerState {
     ///     id: 5,
-    ///     budget: Resources::mem_gb(8.0),
+    ///     capacity: Resources::mem_gb(8.0).with_slots(1),
     ///     ..Default::default()
     /// });
     /// assert_eq!(task.join().unwrap(), 5);
@@ -295,7 +299,7 @@ impl<P: Policy> SharedPolicy<P> {
     /// for w in [1, 2] {
     ///     shared.worker_update(WorkerState {
     ///         id: w,
-    ///         budget: Resources::mem_gb(8.0),
+    ///         capacity: Resources::mem_gb(8.0).with_slots(1),
     ///         ..Default::default()
     ///     });
     /// }
@@ -364,8 +368,7 @@ impl<P: Policy> SharedPolicy<P> {
     /// let shared = Arc::new(SharedPolicy::new(Scheduler::new(Config::default()), clock));
     /// shared.worker_update(WorkerState {
     ///     id: 1,
-    ///     slots: 4,
-    ///     budget: Resources::mem_gb(8.0),
+    ///     capacity: Resources::mem_gb(8.0).with_slots(4),
     ///     ..Default::default()
     /// });
     /// let first = shared.lease(JobSpec {
@@ -424,7 +427,7 @@ impl<P: Policy> SharedPolicy<P> {
     /// let shared = SharedPolicy::new(Scheduler::new(Config::default()), || Time::ORIGIN);
     /// shared.worker_update(whelm::WorkerState {
     ///     id: 1,
-    ///     budget: Resources::mem_gb(8.0),
+    ///     capacity: Resources::mem_gb(8.0).with_slots(1),
     ///     ..Default::default()
     /// });
     /// let job = JobSpec {
@@ -479,8 +482,7 @@ impl<P: Policy + Send + 'static> SharedPolicy<P> {
     /// # let job = |id, gb| JobSpec { id, demand: Resources::mem_gb(gb), ..Default::default() };
     /// # shared.worker_update(WorkerState {
     /// #     id: 1,
-    /// #     slots: 4,
-    /// #     budget: Resources::mem_gb(8.0),
+    /// #     capacity: Resources::mem_gb(8.0).with_slots(4),
     /// #     ..Default::default()
     /// # });
     /// # let first = shared.lease(job(1, 4.0));

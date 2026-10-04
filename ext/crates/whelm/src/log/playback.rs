@@ -18,7 +18,7 @@ use crate::{Output, Policy, Time};
 ///
 /// let w = WorkerState {
 ///     id: 1,
-///     budget: Resources::mem_gb(8.0),
+///     capacity: Resources::mem_gb(8.0).with_slots(1),
 ///     ..Default::default()
 /// };
 /// let events = vec![

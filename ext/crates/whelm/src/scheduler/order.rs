@@ -5,7 +5,7 @@ use std::ops::Bound;
 use super::{Job, Scheduler};
 #[cfg(doc)]
 use crate::Config;
-use crate::{GroupOrder, JobId, JobSpec, OrderTerm, SLOTS, Time};
+use crate::{GroupOrder, JobId, JobSpec, OrderTerm, ResourceId, Time};
 
 /// The most terms a [`Config::order`] has once repeats are dropped: one per [`OrderTerm`].
 const ORDER_TERMS: usize = 5;
@@ -70,12 +70,19 @@ impl Scheduler {
         Key { terms, seq }
     }
 
-    /// Queue a new job under its urgency key, demanding one slot.
+    /// Queue a new job under its urgency key, its demand cut to the declared resources and the
+    /// default demands filled in.
     pub(super) fn submit(&mut self, mut spec: JobSpec, now: Time) {
         if self.waiting.contains_key(&spec.id) || self.running.contains_key(&spec.id) {
             return;
         }
-        spec.demand[SLOTS] = 1;
+        let resources = &self.config.resources;
+        spec.demand.truncate(resources.len());
+        for (d, r) in resources.iter().enumerate() {
+            if spec.demand[ResourceId(d)] == 0 && r.default_demand > 0 {
+                spec.demand[ResourceId(d)] = r.default_demand;
+            }
+        }
         let seq = self.next_seq;
         self.next_seq += 1;
         let key = self.key(&spec, seq);

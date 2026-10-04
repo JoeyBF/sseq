@@ -2,9 +2,9 @@
 
 use std::time::Duration;
 
-use crate::{DIMS, JobId, Resources, Time, WorkerId};
 #[cfg(doc)]
 use crate::{Defer, Policy, Reservations, Timing, WorkerView};
+use crate::{JobId, Resources, Time, WorkerId};
 
 /// A reservation: `worker` admits no job other than `job` until `job` is placed.
 ///
@@ -27,8 +27,7 @@ use crate::{Defer, Policy, Reservations, Timing, WorkerView};
 ///     Input::Worker(WorkerState {
 ///         id: 1,
 ///         class: "cpu".into(),
-///         slots: 2,
-///         budget: Resources::mem_gb(10.0),
+///         capacity: Resources::mem_gb(10.0).with_slots(2),
 ///         ..Default::default()
 ///     }),
 ///     Time::ORIGIN,
@@ -83,8 +82,7 @@ pub struct ReservationInfo {
 ///     Input::Worker(WorkerState {
 ///         id: 1,
 ///         class: "cpu".into(),
-///         slots: 4,
-///         budget: Resources::mem_gb(10.0),
+///         capacity: Resources::mem_gb(10.0).with_slots(4),
 ///         ..Default::default()
 ///     }),
 ///     Time::ORIGIN,
@@ -108,15 +106,15 @@ pub struct WorkerLoad {
     pub id: WorkerId,
     /// Its class.
     pub class: String,
-    /// Its slot count.
-    pub slots: usize,
+    /// Its capacity.
+    pub capacity: Resources,
     /// Live attempts on it (a job speculated onto it counts here and on its other worker).
     pub running: usize,
     /// Sum of the demands of those attempts.
     pub placed: Resources,
-    /// Headroom per dimension as admission sees it ([`WorkerView::headroom`]); `None` where the
-    /// capacity is unknown.
-    pub headroom: [Option<i64>; DIMS],
+    /// Headroom per declared resource as admission sees it ([`WorkerView::headroom`]); `None`
+    /// where the capacity is unknown.
+    pub headroom: Vec<Option<i64>>,
     /// The job this worker is reserved for, if any.
     pub reserved_for: Option<JobId>,
     /// Its speed for a job of no particular kind ([`Timing`]); under [`Timing::Unrelated`], a
@@ -131,13 +129,14 @@ pub struct WorkerLoad {
 /// ```
 /// use std::time::Duration;
 ///
-/// use whelm::{Config, Input, JobSpec, Policy, Scheduler, Time, WorkerState};
+/// use whelm::{Config, Input, JobSpec, Policy, Resources, Scheduler, Time, WorkerState};
 ///
 /// let mut p = Scheduler::new(Config::default());
 /// p.handle(
 ///     Input::Worker(WorkerState {
 ///         id: 1,
 ///         class: "cpu".into(),
+///         capacity: Resources::ZERO.with_slots(1),
 ///         ..Default::default()
 ///     }),
 ///     Time::ORIGIN,

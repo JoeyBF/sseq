@@ -14,8 +14,7 @@ fn dag(config: DagConfig) -> DagScheduler<Scheduler> {
     let mut d = DagScheduler::new(config, Scheduler::new(Config::default()));
     let w = WorkerState {
         class: "x".into(),
-        slots: 64,
-        budget: Resources::mem(1000),
+        capacity: Resources::mem(1000).with_slots(64),
         ..Default::default()
     };
     d.handle(Input::Worker(w), Time::ORIGIN);
@@ -410,8 +409,7 @@ fn forbid_and_class_are_hard_constraints() {
         let w = WorkerState {
             id,
             class: String::from(class),
-            slots,
-            budget: Resources::mem(100),
+            capacity: Resources::mem(100).with_slots(slots),
             ..Default::default()
         };
         p.handle(Input::Worker(w), now);

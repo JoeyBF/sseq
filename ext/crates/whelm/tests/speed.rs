@@ -35,8 +35,7 @@ fn plain_worker(id: u64, class: &str, slots: usize) -> WorkerState {
     WorkerState {
         id,
         class: class.into(),
-        slots,
-        budget: Resources::mem(1000),
+        capacity: Resources::mem(1000).with_slots(slots as u64),
         ..Default::default()
     }
 }
@@ -72,8 +71,7 @@ fn speed_first_picks_the_fast_worker() {
             Input::Worker(WorkerState {
                 id: 2,
                 class: "fast".into(),
-                slots: 4,
-                budget: Resources::mem(5000),
+                capacity: Resources::mem(5000).with_slots(4),
                 speed: 2.4,
                 ..Default::default()
             }),

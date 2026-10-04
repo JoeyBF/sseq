@@ -27,8 +27,7 @@ fn worker(id: u64, slots: usize, budget: u64, used: u64) -> WorkerState {
     WorkerState {
         id,
         class: "x".into(),
-        slots,
-        budget: Resources::mem(budget),
+        capacity: Resources::mem(budget).with_slots(slots as u64),
         reported_used: Resources::mem(used),
         ..Default::default()
     }
@@ -259,8 +258,7 @@ fn per_class_reservations() {
             Input::Worker(WorkerState {
                 id,
                 class: class.into(),
-                slots: 4,
-                budget: Resources::mem(100),
+                capacity: Resources::mem(100).with_slots(4),
                 ..Default::default()
             }),
             Time::ORIGIN,

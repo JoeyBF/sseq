@@ -82,7 +82,7 @@
 //! use std::{sync::Arc, time::Duration};
 //!
 //! use whelm::{
-//!     Config, DagConfig, DagScheduler, Input, Output, Policy, Scheduler, TemplateNode,
+//!     Config, DagConfig, DagScheduler, Input, Output, Policy, Resources, Scheduler, TemplateNode,
 //!     TemplateSpec, Time, Unit, WorkerState,
 //! };
 //!
@@ -100,6 +100,7 @@
 //! dag.handle(
 //!     Input::Worker(WorkerState {
 //!         id: 1,
+//!         capacity: Resources::ZERO.with_slots(1),
 //!         ..Default::default()
 //!     }),
 //!     Time::ORIGIN,
@@ -331,7 +332,7 @@ impl Loc {
 ///
 /// use whelm::{
 ///     Config, DagConfig, DagJob, DagScheduler, FailKind, GaveUp, Input, JobSpec, Output, Policy,
-///     RetryConfig, Scheduler, Time, WorkerState,
+///     Resources, RetryConfig, Scheduler, Time, WorkerState,
 /// };
 ///
 /// let config = Config {
@@ -342,6 +343,7 @@ impl Loc {
 /// dag.handle(
 ///     Input::Worker(WorkerState {
 ///         id: 1,
+///         capacity: Resources::ZERO.with_slots(1),
 ///         ..Default::default()
 ///     }),
 ///     Time::ORIGIN,
@@ -439,13 +441,14 @@ impl<P: Policy> DagScheduler<P> {
     ///
     /// ```
     /// # use whelm::{
-    /// #     Config, DagConfig, DagScheduler, Input, JobSpec, Output, Policy, Scheduler, Time,
-    /// #     WorkerState,
+    /// #     Config, DagConfig, DagScheduler, Input, JobSpec, Output, Policy, Resources, Scheduler,
+    /// #     Time, WorkerState,
     /// # };
     /// let mut dag = DagScheduler::new(DagConfig::default(), Scheduler::new(Config::fifo()));
     /// dag.handle(
     ///     Input::Worker(WorkerState {
     ///         id: 1,
+    ///         capacity: Resources::ZERO.with_slots(1),
     ///         ..Default::default()
     ///     }),
     ///     Time::ORIGIN,
@@ -502,11 +505,13 @@ impl<P: Policy> DagScheduler<P> {
     ///
     /// ```
     /// # use whelm::{
-    /// #     Config, DagConfig, DagJob, DagScheduler, Input, JobSpec, Output, Policy, Scheduler,
-    /// #     Time, WorkerState,
+    /// #     Config, DagConfig, DagJob, DagScheduler, Input, JobSpec, Output, Policy, Resources,
+    /// #     Scheduler, Time, WorkerState,
     /// # };
     /// # let mut dag = DagScheduler::new(DagConfig::default(), Scheduler::new(Config::fifo()));
-    /// # dag.handle(Input::Worker(WorkerState { id: 1, ..Default::default() }), Time::ORIGIN);
+    /// # let capacity = Resources::ZERO.with_slots(1);
+    /// # let worker = WorkerState { id: 1, capacity, ..Default::default() };
+    /// # dag.handle(Input::Worker(worker), Time::ORIGIN);
     /// # let job = |id, deps| DagJob {
     /// #     spec: JobSpec { id, ..Default::default() },
     /// #     deps,
