@@ -1447,13 +1447,12 @@ pub fn simulate(
         }
     }
     let slots_total: usize = fleet.groups.iter().map(|g| g.1 * g.2).sum();
-    let spec = |id: JobId, k: usize, kind: &str, pinned: bool| {
+    let spec = |k: usize, kind: &str, pinned: bool| {
         let constraints = match (&fast_class, pinned) {
             (Some(c), true) => vec![Constraint::require_class(c.clone())],
             _ => Vec::new(),
         };
         JobSpec {
-            id,
             group: gid[k],
             kind: Some(kind.into()),
             constraints,
@@ -1463,13 +1462,13 @@ pub fn simulate(
     // A barrier of no work, completing by itself once `deps` are done.
     let pass = |id: JobId, k: usize, deps: Vec<JobId>| -> Unit {
         DagJob {
+            id,
+            deps,
             spec: JobSpec {
-                id,
                 group: gid[k],
+                work: Some(Duration::ZERO),
                 ..Default::default()
             },
-            deps,
-            work_estimate: Some(Duration::ZERO),
             passthrough: true,
             ..Default::default()
         }
@@ -1487,9 +1486,12 @@ pub fn simulate(
             .map(|&d| 4 * d as u64 + 1)
             .collect();
         let job = DagJob {
-            spec: spec(zero, k, "zero", place.pin != Pin::None),
+            id: zero,
             deps,
-            work_estimate: Some(Duration::from_secs_f64(cost(b.zero_est, b.zero_true))),
+            spec: JobSpec {
+                work: Some(Duration::from_secs_f64(cost(b.zero_est, b.zero_true))),
+                ..spec(k, "zero", place.pin != Pin::None)
+            },
             ..Default::default()
         };
         units.push(job.into());
@@ -1499,7 +1501,7 @@ pub fn simulate(
                 base: SIG_BASE + world.offsets[k],
                 template: Arc::clone(t),
                 deps: vec![zero],
-                spec: spec(0, k, "sig", place.pin == Pin::All),
+                spec: spec(k, "sig", place.pin == Pin::All),
                 scale: Some(1.0),
                 sourced: true,
                 ..Default::default()

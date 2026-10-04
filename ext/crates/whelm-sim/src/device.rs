@@ -160,13 +160,13 @@ pub fn simulate_device(sc: &DeviceScenario, arm: DeviceArm) -> DeviceMetrics {
             _ => 0.0,
         };
         let spec = JobSpec {
-            id: j as JobId,
             demand: Resources::new()
                 .with(MEMORY, 1)
                 .with(DEVICE_MEMORY, gb(est)),
             ..Default::default()
         };
-        p.handle(Input::Submit(spec), Time::ORIGIN);
+        let job = j as JobId;
+        p.handle(Input::Submit { job, spec }, Time::ORIGIN);
     }
     let mut ws: Vec<Wk> = (0..sc.workers).map(|_| Wk::default()).collect();
     // Completion events `(worker, version)`, ties broken by worker.

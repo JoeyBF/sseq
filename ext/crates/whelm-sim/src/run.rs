@@ -273,7 +273,6 @@ fn spec(setup: &SimSetup, j: usize) -> JobSpec {
     let (trace, work) = (setup.trace, setup.work);
     let t = &trace.tasks[j];
     JobSpec {
-        id: j as u64,
         demand: Resources::new().with(MEMORY, gb(t.est_gb * setup.est_scale)),
         group: t.group,
         work: Some(Duration::from_secs_f64(work[j])),
@@ -376,9 +375,9 @@ pub fn simulate(setup: &SimSetup, name: &str, policy: BoxPolicy) -> Metrics {
                 .map(|(j, d)| {
                     let deps = d.into_iter().map(|x| x as u64).collect();
                     DagJob {
-                        spec: spec(setup, j),
+                        id: j as u64,
                         deps,
-                        work_estimate: Some(Duration::from_secs_f64(setup.work[j])),
+                        spec: spec(setup, j),
                         ..Default::default()
                     }
                 })
@@ -507,7 +506,10 @@ pub fn simulate(setup: &SimSetup, name: &str, policy: BoxPolicy) -> Metrics {
             Ev::Arrive(j) => {
                 arrival[j] = t;
                 match &mut driver {
-                    Driver::Open(p) => p.handle(Input::Submit(spec(setup, j)), now),
+                    Driver::Open(p) => {
+                        let (job, spec) = (j as u64, spec(setup, j));
+                        p.handle(Input::Submit { job, spec }, now);
+                    }
                     Driver::Closed(d) => {
                         d.release(j as u64, now);
                     }

@@ -117,7 +117,6 @@ fn run(sink: impl EventSink + 'static) {
             let id = next_arrival;
             next_arrival += 1;
             let spec = JobSpec {
-                id,
                 demand: Resources::new().with(MEMORY, gb(job(id).2)),
                 group: id / 10,
                 work: Some(Duration::from_secs_f64(job(id).1)),
@@ -131,7 +130,10 @@ fn run(sink: impl EventSink + 'static) {
                     ..TaskInfo::default()
                 },
             );
-            p.handle(Input::Submit(spec), Time(Duration::from_secs_f64(t)));
+            p.handle(
+                Input::Submit { job: id, spec },
+                Time(Duration::from_secs_f64(t)),
+            );
         } else {
             let (_, job, attempt) = ends.pop().unwrap();
             p.handle(

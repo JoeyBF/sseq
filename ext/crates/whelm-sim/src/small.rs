@@ -243,32 +243,29 @@ pub fn simulate_small(inst: &SmallInstance, plan: &SmallPlan) -> SmallResult {
             let deps = t.deps.iter().map(|&d| d as u64).collect();
             if t.kind == Kind::Join {
                 DagJob {
+                    id: i as u64,
+                    deps,
                     spec: JobSpec {
-                        id: i as u64,
                         group: t.group as u64,
+                        work: Some(Duration::ZERO),
                         ..Default::default()
                     },
-                    deps,
-                    work_estimate: Some(Duration::ZERO),
                     passthrough: true,
                     ..Default::default()
                 }
             } else {
                 let kind = if t.kind == Kind::Zero { "zero" } else { "sig" };
+                let work = if oracle { t.work } else { t.est };
                 DagJob {
+                    id: i as u64,
+                    deps,
                     spec: JobSpec {
-                        id: i as u64,
                         group: t.group as u64,
                         priority: priority.as_ref().map(|p| p[i]),
+                        work: Some(Duration::from_secs_f64(work)),
                         kind: Some(kind.into()),
                         ..Default::default()
                     },
-                    deps,
-                    work_estimate: Some(Duration::from_secs_f64(if oracle {
-                        t.work
-                    } else {
-                        t.est
-                    })),
                     ..Default::default()
                 }
             }

@@ -229,9 +229,9 @@ impl Trace {
                         tw.budget_gb = w.capacity.get(MEMORY) as f64 / 1e9;
                         tw.slots = w.capacity.get(SLOTS) as usize;
                     }
-                    Input::Submit(spec) => {
+                    Input::Submit { job, spec } => {
                         // A duplicate submission of a live job is ignored by the policy too.
-                        pending.entry(spec.id).or_insert(Pending {
+                        pending.entry(job).or_insert(Pending {
                             ready_s: at.0.as_secs_f64(),
                             est_gb: spec.demand.get(MEMORY) as f64 / 1e9,
                             group: spec.group,
@@ -524,13 +524,13 @@ mod tests {
             capacity: Resources::new().with(MEMORY, gb(50.0)).with(SLOTS, 8),
             ..Default::default()
         };
-        let submit = |id| {
-            Input::Submit(JobSpec {
-                id,
+        let submit = |job| Input::Submit {
+            job,
+            spec: JobSpec {
                 demand: Resources::new().with(MEMORY, gb(1.5)),
                 group: 9,
                 ..Default::default()
-            })
+            },
         };
         let events = vec![
             input(0, Input::Worker(worker(1))),
