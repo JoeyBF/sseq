@@ -95,7 +95,6 @@ fn run(sink: impl EventSink + 'static) -> Vec<(JobId, Attempt)> {
             let i = next_arrival;
             next_arrival += 1;
             let spec = JobSpec {
-                id: i,
                 demand: Resources::new().with(MEMORY, gb(job(i).2)),
                 group: i / 10,
                 work: Some(job(i).1),
@@ -107,7 +106,7 @@ fn run(sink: impl EventSink + 'static) -> Vec<(JobId, Attempt)> {
                 ..TaskInfo::default()
             };
             p.annotate(i, info);
-            p.handle(Input::Submit(spec), t);
+            p.handle(Input::Submit { job: i, spec }, t);
         } else if end == Some(t) {
             let k = ends.iter().position(|e| e.0 == t).unwrap();
             let (_, j, attempt) = ends.swap_remove(k);
@@ -162,8 +161,13 @@ fn logged_run_replays_exactly() {
     let memory = Arc::new(Mutex::new(Vec::new()));
     check_run(&run(memory.clone()));
     let events = memory.lock().unwrap().clone();
-    let submits = events.iter().filter(|e| {
-        matches!(e, Event::Input { input: Input::Submit(_), info: Some(i), .. } if i.kind == "sig")
+    let submits = events.iter().filter(|e| match e {
+        Event::Input {
+            input: Input::Submit { .. },
+            info: Some(i),
+            ..
+        } => i.kind == "sig",
+        _ => false,
     });
     assert_eq!(submits.count(), JOBS as usize, "annotations are logged");
     assert!(events.iter().any(|e| matches!(e, Event::Sample { .. })));

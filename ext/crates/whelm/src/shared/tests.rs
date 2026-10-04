@@ -6,8 +6,8 @@ use std::{
 };
 
 use crate::{
-    Config, FailKind, Input, JobId, JobSpec, MEMORY, Policy, Resources, RetryConfig, SLOTS,
-    Scheduler, SharedPolicy, Speculate, Time, WorkerId, WorkerState,
+    Config, FailKind, Input, JobSpec, MEMORY, Policy, Resources, RetryConfig, SLOTS, Scheduler,
+    SharedPolicy, Speculate, Time, WorkerId, WorkerState,
 };
 
 /// A one-slot worker of class "x".
@@ -46,10 +46,9 @@ fn ticker_restarts_after_stop() {
     second.join().unwrap();
 }
 
-/// A job.
-fn job(id: JobId) -> JobSpec {
+/// A job's spec.
+fn job() -> JobSpec {
     JobSpec {
-        id,
         demand: Resources::new().with(MEMORY, 1),
         ..Default::default()
     }
@@ -61,7 +60,7 @@ fn fail_returns_the_retry() {
     let s = shared(4);
     s.worker_update(worker(1));
     s.worker_update(worker(2));
-    let l = s.lease(job(7));
+    let l = s.lease(7, job());
     assert_eq!((l.worker(), l.attempt()), (1, 1));
     let l = l.fail(FailKind::Other, "boom").unwrap();
     assert_eq!((l.worker(), l.attempt()), (2, 2));
@@ -76,12 +75,12 @@ fn fail_returns_the_retry() {
 fn fail_gives_up() {
     let s = shared(2);
     s.worker_update(worker(1));
-    let l = s.lease(job(7)).fail(FailKind::DeviceOom, "oom").unwrap();
+    let l = s.lease(7, job()).fail(FailKind::DeviceOom, "oom").unwrap();
     let g = l.fail(FailKind::DeviceOom, "oom").err().unwrap();
     assert_eq!((g.job, g.tried.len(), g.retryable), (7, 2, true));
     assert_eq!(s.stats().running, 0);
     // The id can be leased afresh.
-    s.lease(job(7)).complete();
+    s.lease(7, job()).complete();
 }
 
 /// A thread blocked in `lease` is woken by a worker joining; one whose worker leaves gets the
@@ -95,7 +94,7 @@ fn worker_gone_then_fail_link_died() {
     let t = {
         let s = s.clone();
         std::thread::spawn(move || {
-            let l = s.lease(job(7));
+            let l = s.lease(7, job());
             tx.send((l.worker(), l.attempt())).unwrap();
             go_rx.recv().unwrap();
             let l = l.fail(FailKind::LinkDied, "connection reset").unwrap();
@@ -126,7 +125,7 @@ fn complete_after_worker_gone_cancels_the_retry() {
     let s = shared(4);
     s.worker_update(worker(1));
     s.worker_update(worker(2));
-    let l = s.lease(job(7));
+    let l = s.lease(7, job());
     s.worker_gone(l.worker());
     assert_eq!(s.stats().running, 1);
     l.complete();
@@ -142,9 +141,9 @@ fn speculative_start_is_rejected() {
     cfg.speed.speculate = Some(Speculate::default());
     let s = SharedPolicy::new(Scheduler::new(cfg), || Time::ORIGIN);
     s.worker_update(worker(1));
-    let mut j = job(7);
+    let mut j = job();
     j.work = Some(Duration::from_secs(100));
-    let l = s.lease(j);
+    let l = s.lease(7, j);
     s.worker_update(WorkerState {
         speed: 4.0,
         ..worker(2)
@@ -162,11 +161,11 @@ fn speculative_start_is_rejected() {
 fn drop_and_timeout_cancel() {
     let s = shared(4);
     s.worker_update(worker(1));
-    drop(s.lease(job(1)));
+    drop(s.lease(1, job()));
     assert_eq!(s.stats().running, 0);
-    let held = s.lease(job(2));
-    let back = s.lease_timeout(job(3), Duration::from_millis(10)).err();
-    assert_eq!(back.map(|j| j.id), Some(3));
+    let held = s.lease(2, job());
+    let back = s.lease_timeout(3, job(), Duration::from_millis(10)).err();
+    assert_eq!(back.as_deref(), Some(&job()));
     assert_eq!(s.stats().waiting, 0);
     held.complete();
 }
@@ -176,7 +175,7 @@ fn drop_and_timeout_cancel() {
 fn stop_is_visible() {
     let s = shared(4);
     s.worker_update(worker(1));
-    let l = s.lease(job(1));
+    let l = s.lease(1, job());
     s.with(|p, now| p.handle(Input::Cancel(1), now));
     assert!(l.stopped());
     l.complete();

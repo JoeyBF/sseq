@@ -44,9 +44,8 @@ fn plain_worker(id: u64, class: &str, slots: usize) -> WorkerState {
 }
 
 /// A unit-demand job with optional work.
-fn job(id: JobId, work: Option<Duration>) -> JobSpec {
+fn job(work: Option<Duration>) -> JobSpec {
     JobSpec {
-        id,
         demand: Resources::new().with(MEMORY, 1),
         work,
         ..Default::default()
@@ -81,7 +80,13 @@ fn speed_first_picks_the_fast_worker() {
             Time::ORIGIN,
         );
         for i in 0..6 {
-            p.handle(Input::Submit(job(i, None)), Time::ORIGIN);
+            p.handle(
+                Input::Submit {
+                    job: i,
+                    spec: job(None),
+                },
+                Time::ORIGIN,
+            );
         }
         let out = starts(p.poll(Time::ORIGIN));
         let on_fast = out.iter().filter(|x| x.1 == 2).count();
@@ -99,7 +104,13 @@ fn without_speed_term_speed_is_ignored() {
     });
     p.handle(Input::Worker(worker(1, 4, 1.0)), Time::ORIGIN);
     p.handle(Input::Worker(worker(2, 4, 2.4)), Time::ORIGIN);
-    p.handle(Input::Submit(job(0, None)), Time::ORIGIN);
+    p.handle(
+        Input::Submit {
+            job: 0,
+            spec: job(None),
+        },
+        Time::ORIGIN,
+    );
     assert_eq!(starts(p.poll(Time::ORIGIN)), vec![(0, 1)]);
 }
 
@@ -120,13 +131,19 @@ fn earliest_finish_defers_only_when_it_pays() {
         p.handle(Input::Worker(worker(2, 1, 4.0)), Time::ORIGIN);
         // Occupy the fast worker: it frees at running_work / 4.
         p.handle(
-            Input::Submit(job(0, Some(Duration::from_secs(running_work)))),
+            Input::Submit {
+                job: 0,
+                spec: job(Some(Duration::from_secs(running_work))),
+            },
             Time::ORIGIN,
         );
         assert_eq!(starts(p.poll(Time::ORIGIN)), vec![(0, 2)]);
         // 40 units of work: 40 s on the slow worker, or 10 s after the fast one frees.
         p.handle(
-            Input::Submit(job(1, Some(Duration::from_secs(40)))),
+            Input::Submit {
+                job: 1,
+                spec: job(Some(Duration::from_secs(40))),
+            },
             Time::ORIGIN,
         );
         let out = starts(p.poll(Time::ORIGIN));
@@ -173,12 +190,18 @@ fn deferral_expires() {
     p.handle(Input::Worker(worker(1, 1, 1.0)), Time::ORIGIN);
     p.handle(Input::Worker(worker(2, 1, 10.0)), Time::ORIGIN);
     p.handle(
-        Input::Submit(job(0, Some(Duration::from_secs(200)))),
+        Input::Submit {
+            job: 0,
+            spec: job(Some(Duration::from_secs(200))),
+        },
         Time::ORIGIN,
     ); // frees at 20 on the fast worker
     starts(p.poll(Time::ORIGIN));
     p.handle(
-        Input::Submit(job(1, Some(Duration::from_secs(100)))),
+        Input::Submit {
+            job: 1,
+            spec: job(Some(Duration::from_secs(100))),
+        },
         Time::ORIGIN,
     ); // 100 s slow vs 30 s after waiting
     assert!(starts(p.poll(Time::ORIGIN)).is_empty());
@@ -204,13 +227,19 @@ fn deferrals_book_slots_in_order() {
     p.handle(Input::Worker(worker(1, 1, 1.0)), Time::ORIGIN);
     p.handle(Input::Worker(worker(2, 1, 10.0)), Time::ORIGIN);
     p.handle(
-        Input::Submit(job(0, Some(Duration::from_secs(10)))),
+        Input::Submit {
+            job: 0,
+            spec: job(Some(Duration::from_secs(10))),
+        },
         Time::ORIGIN,
     ); // fast worker frees at 1
     starts(p.poll(Time::ORIGIN));
     for i in 1..=3 {
         p.handle(
-            Input::Submit(job(i, Some(Duration::from_secs(50)))),
+            Input::Submit {
+                job: i,
+                spec: job(Some(Duration::from_secs(50))),
+            },
             Time::ORIGIN,
         ); // 50 s slow, 5 s fast
     }
@@ -240,7 +269,13 @@ fn learned_speeds_replace_reported_ones() {
     for _ in 0..200 {
         // Keep both workers busy: one queued job per free worker.
         for _ in running.len()..2 {
-            p.handle(Input::Submit(job(id, Some(Duration::from_secs(6)))), now);
+            p.handle(
+                Input::Submit {
+                    job: id,
+                    spec: job(Some(Duration::from_secs(6))),
+                },
+                now,
+            );
             id += 1;
         }
         for (j, w) in starts(p.poll(now)) {
@@ -262,7 +297,10 @@ fn learned_speeds_replace_reported_ones() {
         p.handle(done(j), now);
     }
     p.handle(
-        Input::Submit(job(10_000, Some(Duration::from_secs(6)))),
+        Input::Submit {
+            job: 10_000,
+            spec: job(Some(Duration::from_secs(6))),
+        },
         now,
     );
     assert_eq!(starts(p.poll(now)), vec![(10_000, 2)]);
@@ -279,11 +317,17 @@ fn stuck(speculate: Option<Speculate>) -> Scheduler {
     p.handle(Input::Worker(worker(1, 1, 1.0)), Time::ORIGIN);
     p.handle(Input::Worker(worker(2, 1, 4.0)), Time::ORIGIN);
     p.handle(
-        Input::Submit(job(0, Some(Duration::from_secs(4)))),
+        Input::Submit {
+            job: 0,
+            spec: job(Some(Duration::from_secs(4))),
+        },
         Time::ORIGIN,
     );
     p.handle(
-        Input::Submit(job(1, Some(Duration::from_secs(100)))),
+        Input::Submit {
+            job: 1,
+            spec: job(Some(Duration::from_secs(100))),
+        },
         Time::ORIGIN,
     );
     assert_eq!(starts(p.poll(Time::ORIGIN)), vec![(0, 2), (1, 1)]);
@@ -379,7 +423,10 @@ fn failed_speculative_attempt_leaves_the_original_running() {
 fn speculation_yields_to_waiting_jobs_and_is_opt_in() {
     let mut p = stuck(Some(Speculate::default()));
     p.handle(
-        Input::Submit(job(2, Some(Duration::from_secs(4)))),
+        Input::Submit {
+            job: 2,
+            spec: job(Some(Duration::from_secs(4))),
+        },
         Time(Duration::from_secs(1)),
     );
     assert_eq!(starts(p.poll(Time(Duration::from_secs(1)))), vec![(2, 2)]);
@@ -405,7 +452,13 @@ fn capped_worker_learned_per_worker() {
     let mut running: Vec<(u64, u64, Time)> = Vec::new();
     for _ in 0..600 {
         for _ in running.len()..3 {
-            p.handle(Input::Submit(job(id, Some(Duration::from_secs(10)))), now);
+            p.handle(
+                Input::Submit {
+                    job: id,
+                    spec: job(Some(Duration::from_secs(10))),
+                },
+                now,
+            );
             id += 1;
         }
         for (j, w) in starts(p.poll(now)) {
@@ -425,7 +478,10 @@ fn capped_worker_learned_per_worker() {
     }
     for k in 0..2 {
         p.handle(
-            Input::Submit(job(10_000 + k, Some(Duration::from_secs(10)))),
+            Input::Submit {
+                job: 10_000 + k,
+                spec: job(Some(Duration::from_secs(10))),
+            },
             now,
         );
     }
@@ -449,11 +505,17 @@ fn identical_machines_ignore_speeds() {
     p.handle(Input::Worker(worker(1, 1, 1.0)), Time::ORIGIN);
     p.handle(Input::Worker(worker(2, 1, 4.0)), Time::ORIGIN);
     p.handle(
-        Input::Submit(job(0, Some(Duration::from_secs(4)))),
+        Input::Submit {
+            job: 0,
+            spec: job(Some(Duration::from_secs(4))),
+        },
         Time::ORIGIN,
     );
     p.handle(
-        Input::Submit(job(1, Some(Duration::from_secs(100)))),
+        Input::Submit {
+            job: 1,
+            spec: job(Some(Duration::from_secs(100))),
+        },
         Time::ORIGIN,
     );
     assert_eq!(starts(p.poll(Time::ORIGIN)), vec![(0, 1), (1, 2)]);
@@ -462,7 +524,10 @@ fn identical_machines_ignore_speeds() {
     p.handle(done(0), Time(Duration::from_secs(4)));
     assert_eq!(p.poll(Time(Duration::from_secs(4))), vec![]);
     p.handle(
-        Input::Submit(job(2, Some(Duration::from_secs(40)))),
+        Input::Submit {
+            job: 2,
+            spec: job(Some(Duration::from_secs(40))),
+        },
         Time(Duration::from_secs(4)),
     );
     assert_eq!(starts(p.poll(Time(Duration::from_secs(4)))), vec![(2, 1)]);
@@ -500,9 +565,9 @@ fn train(p: &mut Scheduler) -> Time {
                 let spec = JobSpec {
                     kind: Some(kind.into()),
                     constraints: vec![Constraint::require_class(class)],
-                    ..job(id, Some(Duration::from_secs(8)))
+                    ..job(Some(Duration::from_secs(8)))
                 };
-                p.handle(Input::Submit(spec), now);
+                p.handle(Input::Submit { job: id, spec }, now);
                 assert_eq!(starts(p.poll(now)), vec![(id, w)]);
                 now += Duration::from_secs_f64(8.0 / truth(kind, w));
                 p.handle(done(id), now);
@@ -517,9 +582,9 @@ fn train(p: &mut Scheduler) -> Time {
 fn place_alone(p: &mut Scheduler, id: JobId, kind: Option<&str>, now: Time) -> WorkerId {
     let spec = JobSpec {
         kind: kind.map(str::to_string),
-        ..job(id, Some(Duration::from_secs(8)))
+        ..job(Some(Duration::from_secs(8)))
     };
-    p.handle(Input::Submit(spec), now);
+    p.handle(Input::Submit { job: id, spec }, now);
     let out = starts(p.poll(now));
     assert_eq!(out.len(), 1, "{out:?}");
     p.handle(done(id), now);
@@ -543,9 +608,9 @@ fn unrelated_machines_learn_speeds_per_kind() {
     // A waiting job's explanation names its kind's learned factors.
     let spec = JobSpec {
         kind: Some("a".into()),
-        ..job(1004, Some(Duration::from_secs(8)))
+        ..job(Some(Duration::from_secs(8)))
     };
-    r.handle(Input::Submit(spec), now);
+    r.handle(Input::Submit { job: 1004, spec }, now);
     let e = r.explain(1004).unwrap();
     let w = e.waiting().unwrap();
     let classes: Vec<&str> = w.kind_factors.iter().map(|(c, _)| c.as_str()).collect();
@@ -557,9 +622,9 @@ fn unrelated_machines_learn_speeds_per_kind() {
     assert!(e.to_string().contains("; kind a runs "), "{e}");
     let spec = JobSpec {
         kind: Some("new".into()),
-        ..job(1005, Some(Duration::from_secs(8)))
+        ..job(Some(Duration::from_secs(8)))
     };
-    r.handle(Input::Submit(spec), now);
+    r.handle(Input::Submit { job: 1005, spec }, now);
     let e = r.explain(1005).unwrap();
     assert!(e.waiting().unwrap().kind_factors.is_empty(), "{e}");
 
@@ -586,9 +651,9 @@ fn busy_run(timing: Timing, kind: Option<&str>) -> (Vec<Output>, Vec<f64>) {
         for _ in running.len()..2 {
             let spec = JobSpec {
                 kind: kind.map(str::to_string),
-                ..job(id, Some(Duration::from_secs(6)))
+                ..job(Some(Duration::from_secs(6)))
             };
-            p.handle(Input::Submit(spec), now);
+            p.handle(Input::Submit { job: id, spec }, now);
             id += 1;
         }
         let out = p.poll(now);

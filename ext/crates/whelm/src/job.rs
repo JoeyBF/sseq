@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 
 #[cfg(doc)]
 use crate::{
-    Config, DagConfig, DagScheduler, Defer, OrderTerm, Output, Policy, Resource, ScoreTerm,
+    Config, DagConfig, DagScheduler, Defer, Input, OrderTerm, Output, Policy, Resource, ScoreTerm,
     Speculate, Timing,
 };
 use crate::{Resources, Time, WorkerId, WorkerState};
@@ -81,15 +81,14 @@ impl Selector {
 ///     p.handle(Input::Worker(w), Time::ORIGIN);
 /// }
 /// for id in 1..=3 {
-///     let job = JobSpec {
-///         id,
+///     let spec = JobSpec {
 ///         constraints: vec![
 ///             Constraint::require_class("a100"),
 ///             Constraint::require_class("h100"),
 ///         ],
 ///         ..Default::default()
 ///     };
-///     p.handle(Input::Submit(job), Time::ORIGIN);
+///     p.handle(Input::Submit { job: id, spec }, Time::ORIGIN);
 /// }
 /// assert_eq!(
 ///     p.poll(Time::ORIGIN),
@@ -137,7 +136,6 @@ pub enum Strength {
 /// use whelm::{Constraint, JobSpec, Selector, Strength};
 ///
 /// let job = JobSpec {
-///     id: 1,
 ///     constraints: vec![Constraint::avoid_worker(3)],
 ///     ..Default::default()
 /// };
@@ -194,12 +192,11 @@ impl Constraint {
     ///     };
     ///     p.handle(Input::Worker(w), Time::ORIGIN);
     /// }
-    /// let job = JobSpec {
-    ///     id: 1,
+    /// let spec = JobSpec {
     ///     constraints: vec![Constraint::require_class("gpu")],
     ///     ..Default::default()
     /// };
-    /// p.handle(Input::Submit(job), Time::ORIGIN);
+    /// p.handle(Input::Submit { job: 1, spec }, Time::ORIGIN);
     /// assert_eq!(
     ///     p.poll(Time::ORIGIN),
     ///     [Output::Start {
@@ -236,12 +233,11 @@ impl Constraint {
     ///     }),
     ///     Time::ORIGIN,
     /// );
-    /// let job = JobSpec {
-    ///     id: 1,
+    /// let spec = JobSpec {
     ///     constraints: vec![Constraint::forbid_worker(1)],
     ///     ..Default::default()
     /// };
-    /// p.handle(Input::Submit(job), Time::ORIGIN);
+    /// p.handle(Input::Submit { job: 1, spec }, Time::ORIGIN);
     /// assert!(p.poll(Time::ORIGIN).is_empty());
     /// ```
     pub fn forbid_worker(w: WorkerId) -> Self {
@@ -292,12 +288,11 @@ impl Constraint {
     ///     }),
     ///     Time::ORIGIN,
     /// );
-    /// let job = JobSpec {
-    ///     id: 1,
+    /// let spec = JobSpec {
     ///     constraints: vec![Constraint::avoid_worker(1)],
     ///     ..Default::default()
     /// };
-    /// p.handle(Input::Submit(job), Time::ORIGIN);
+    /// p.handle(Input::Submit { job: 1, spec }, Time::ORIGIN);
     /// assert_eq!(
     ///     p.poll(Time::ORIGIN),
     ///     [Output::Start {
@@ -355,12 +350,11 @@ impl Constraint {
     ///         Time::ORIGIN,
     ///     );
     /// }
-    /// let job = JobSpec {
-    ///     id: 1,
+    /// let spec = JobSpec {
     ///     constraints: vec![Constraint::prefer_worker(2)],
     ///     ..Default::default()
     /// };
-    /// p.handle(Input::Submit(job), Time::ORIGIN);
+    /// p.handle(Input::Submit { job: 1, spec }, Time::ORIGIN);
     /// assert_eq!(
     ///     p.poll(Time::ORIGIN),
     ///     [Output::Start {
@@ -398,10 +392,10 @@ impl Constraint {
     }
 }
 
-/// A job, as submitted to a [`Policy`].
+/// What a job is, submitted to a [`Policy`] beside its id ([`Input::Submit`]).
 ///
-/// Only the id, demand and group are needed; every other field refines ordering, placement or
-/// timing, and is read only by the [`Config`] terms and features that use it.
+/// Only the demand and group are needed; every other field refines ordering, placement or timing,
+/// and is read only by the [`Config`] terms and features that use it.
 ///
 /// # Examples
 ///
@@ -413,7 +407,6 @@ impl Constraint {
 /// use whelm::{Constraint, JobSpec, MEMORY, Resources, gb};
 ///
 /// let job = JobSpec {
-///     id: 42,
 ///     demand: Resources::new().with(MEMORY, gb(6.0)),
 ///     group: 3,
 ///     priority: Some(-1),
@@ -427,8 +420,6 @@ impl Constraint {
 #[derive(Clone, Debug, PartialEq)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct JobSpec {
-    /// The job's id.
-    pub id: JobId,
     /// What the job is expected to use while running (an estimate; it may be pessimistic). The
     /// scheduler fills in each declared resource it leaves out with that resource's
     /// [`default_demand`](Resource::default_demand) (one slot, under the default declaration), and
@@ -451,8 +442,8 @@ pub struct JobSpec {
     #[cfg_attr(feature = "serde", serde(default))]
     pub due: Option<Time>,
     /// Estimated work: the run time on a worker of [`WorkerState::speed`] 1.0. Used by
-    /// [`OrderTerm::Wspt`], [`Defer`], shadow backfill and [`Speculate`] (and filled in from the
-    /// DAG layer's estimate when unset).
+    /// [`OrderTerm::Wspt`], [`Defer`], shadow backfill and [`Speculate`], and by the DAG layer's
+    /// ranks, which fill it in when unset.
     #[cfg_attr(feature = "serde", serde(default))]
     pub work: Option<Duration>,
     /// What kind of job it is, for [`Timing::Unrelated`], which learns each kind's speed on each
@@ -475,7 +466,6 @@ impl Default for JobSpec {
     /// A job weighing 1, so that a weighted objective counts jobs it is not told about alike.
     fn default() -> Self {
         Self {
-            id: 0,
             demand: Resources::new(),
             group: 0,
             priority: None,

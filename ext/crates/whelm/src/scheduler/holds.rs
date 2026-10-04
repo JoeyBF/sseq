@@ -81,13 +81,13 @@ impl Scheduler {
     /// the one place holds are enforced.
     pub(super) fn held(&self, job: &Job, w: &Worker) -> Option<(JobId, Hold)> {
         if let Some(holder) = w.reserved_for
-            && holder != job.spec.id
+            && holder != job.id
             && !self.shadow_backfills(job, w)
         {
             return Some((holder, self.holds[&holder]));
         }
-        match self.holds.get(&job.spec.id) {
-            Some(&h @ Hold::Defer { worker, .. }) if worker != w.state.id => Some((job.spec.id, h)),
+        match self.holds.get(&job.id) {
+            Some(&h @ Hold::Defer { worker, .. }) if worker != w.state.id => Some((job.id, h)),
             _ => None,
         }
     }

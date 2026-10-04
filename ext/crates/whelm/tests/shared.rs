@@ -31,9 +31,8 @@ fn worker(id: u64, slots: usize) -> WorkerState {
 }
 
 /// A unit job.
-fn job(id: u64) -> JobSpec {
+fn job() -> JobSpec {
     JobSpec {
-        id,
         demand: Resources::new().with(MEMORY, 1),
         ..Default::default()
     }
@@ -51,7 +50,7 @@ fn lease_blocks_until_a_worker_joins() {
     let t = {
         let s = s.clone();
         std::thread::spawn(move || {
-            let lease = s.lease(job(1));
+            let lease = s.lease(1, job());
             let got = (lease.worker(), lease.attempt());
             lease.complete();
             got
@@ -70,15 +69,15 @@ fn lease_blocks_until_a_worker_joins() {
 fn timeout_withdraws() {
     let s = shared();
     let back = s
-        .lease_timeout(job(1), Duration::from_millis(20))
+        .lease_timeout(1, job(), Duration::from_millis(20))
         .err()
         .unwrap();
-    assert_eq!(back.id, 1);
+    assert_eq!(*back, job());
     let st = s.stats();
     assert_eq!((st.waiting, st.running), (0, 0));
     // The id can be leased again.
     s.worker_update(worker(1, 1));
-    let lease = s.lease(job(1));
+    let lease = s.lease(1, job());
     assert_eq!(lease.worker(), 1);
     lease.complete();
 }
@@ -93,7 +92,7 @@ fn retries_avoid_tried_workers_then_give_up() {
     }
     let max = RetryConfig::default().max_attempts;
     let mut tried = Vec::new();
-    let mut lease = s.lease(job(9));
+    let mut lease = s.lease(9, job());
     for attempt in 1..=max {
         assert_eq!(lease.attempt(), attempt);
         assert!(
@@ -118,11 +117,11 @@ fn retries_avoid_tried_workers_then_give_up() {
         }
     }
     // The history is forgotten: a new lease is attempt 1 again.
-    let lease = s.lease(job(9));
+    let lease = s.lease(9, job());
     assert_eq!(lease.attempt(), 1);
     lease.complete();
     // A mixed history is not retryable.
-    let mut lease = s.lease(job(10));
+    let mut lease = s.lease(10, job());
     for kind in [FailKind::DeviceOom, FailKind::LinkDied, FailKind::DeviceOom] {
         lease = lease.fail(kind, "x").unwrap();
     }
@@ -135,7 +134,7 @@ fn retries_avoid_tried_workers_then_give_up() {
 fn retry_on_the_only_worker() {
     let s = shared();
     s.worker_update(worker(1, 1));
-    let lease = s.lease(job(1));
+    let lease = s.lease(1, job());
     assert_eq!(lease.worker(), 1);
     let lease = lease.fail(FailKind::DeviceOom, "oom").unwrap();
     assert_eq!((lease.worker(), lease.attempt()), (1, 2));
@@ -148,14 +147,14 @@ fn dropped_lease_releases() {
     let s = shared();
     s.worker_update(worker(1, 1));
     let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let lease = s.lease(job(1));
+        let lease = s.lease(1, job());
         assert_eq!(lease.worker(), 1);
         panic!("the task thread unwinds");
     }));
     assert!(r.is_err());
     assert_eq!(s.stats().running, 0);
     // The slot is free again.
-    let lease = s.lease(job(2));
+    let lease = s.lease(2, job());
     assert_eq!(lease.attempt(), 1);
     lease.complete();
     assert_eq!(s.stats().running, 0);
@@ -174,9 +173,9 @@ fn ticker_releases_timed_waits() {
         },
         ..Config::default()
     });
-    let work = |id, work| JobSpec {
+    let work = |work| JobSpec {
         work: Some(work),
-        ..job(id)
+        ..job()
     };
     let s = Arc::new(SharedPolicy::with_system_clock(policy));
     s.worker_update(WorkerState {
@@ -186,16 +185,16 @@ fn ticker_releases_timed_waits() {
     s.worker_update(worker(2, 1));
     // The fast worker is busy for 5 s; job 2 would still finish there first (15 s against 20 s on
     // the slow worker), so it waits for it.
-    let first = s.lease(work(1, Duration::from_secs(10)));
+    let first = s.lease(1, work(Duration::from_secs(10)));
     assert_eq!(first.worker(), 1);
     assert!(
-        s.lease_timeout(work(2, Duration::from_secs(20)), Duration::from_millis(50))
+        s.lease_timeout(2, work(Duration::from_secs(20)), Duration::from_millis(50))
             .is_err(),
         "deferred"
     );
     let ticker = s.spawn_ticker(Duration::from_millis(20));
     let start = std::time::Instant::now();
-    let second = s.lease(work(2, Duration::from_secs(20)));
+    let second = s.lease(2, work(Duration::from_secs(20)));
     assert_eq!(second.worker(), 2);
     assert!(start.elapsed() < Duration::from_secs(5));
     s.stop_ticker();
@@ -211,7 +210,7 @@ fn lost_retry_is_not_handed_out() {
     let s = SharedPolicy::new(Scheduler::new(Config::default()), || Time::ORIGIN);
     s.worker_update(worker(1, 1));
     s.worker_update(worker(2, 1));
-    let lease = s.lease(job(7));
+    let lease = s.lease(7, job());
     assert_eq!(lease.worker(), 1);
     assert_eq!(s.worker_gone(1), vec![7]);
     // The retry started on worker 2, which leaves before the thread asks for it.
@@ -241,7 +240,7 @@ fn lost_last_retry_gives_up() {
     let s = SharedPolicy::new(Scheduler::new(config), || Time::ORIGIN);
     s.worker_update(worker(1, 1));
     s.worker_update(worker(2, 1));
-    let lease = s.lease(job(7));
+    let lease = s.lease(7, job());
     s.worker_gone(1);
     s.worker_gone(2);
     let g = lease.fail(FailKind::LinkDied, "reset").err().unwrap();
@@ -463,7 +462,7 @@ impl<'scope, 'env> Model<'scope, 'env> {
             }
             Op::Lease(id) => {
                 if !self.jobs.contains_key(&id)
-                    && let Ok(lease) = self.s.lease_timeout(job(id), Duration::ZERO)
+                    && let Ok(lease) = self.s.lease_timeout(id, job(), Duration::ZERO)
                 {
                     prop_assert_eq!(lease.attempt(), 1);
                     let job = Job {
@@ -652,7 +651,7 @@ fn stress_many_threads_with_churn() {
                 let mut rng = t.wrapping_mul(0x9E3779B97F4A7C15) | 1;
                 for k in 0..JOBS_PER_THREAD {
                     let id = t * 1000 + k;
-                    let mut lease = s.lease(job(id));
+                    let mut lease = s.lease(id, job());
                     let mut attempt = 0;
                     loop {
                         assert!(lease.attempt() > attempt, "job {id} attempt went back");
@@ -749,13 +748,12 @@ fn poll_p99_at_frontier_size() {
     let mut running = std::collections::VecDeque::new();
     let mut submit = |p: &mut Scheduler, t: Time| {
         let j = JobSpec {
-            id: next,
             demand: Resources::new().with(MEMORY, gb(1.0 + (next % 13) as f64)),
             group: next / 50,
             work: Some(Duration::from_secs(60)),
             ..Default::default()
         };
-        p.handle(Input::Submit(j), t);
+        p.handle(Input::Submit { job: next, spec: j }, t);
         next += 1;
     };
     /// The attempts a poll started.

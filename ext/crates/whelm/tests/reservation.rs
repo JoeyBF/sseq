@@ -36,9 +36,8 @@ fn worker(id: u64, slots: usize, budget: u64, used: u64) -> WorkerState {
 }
 
 /// A job with the given demand and group.
-fn job(id: u64, demand: u64, group: u64) -> JobSpec {
+fn job(demand: u64, group: u64) -> JobSpec {
     JobSpec {
-        id,
         demand: Resources::new().with(MEMORY, demand),
         group,
         ..Default::default()
@@ -51,10 +50,28 @@ fn starving() -> Scheduler {
     let mut p = Scheduler::new(Config::default());
     p.handle(Input::Worker(worker(1, 4, 100, 0)), Time::ORIGIN);
     p.handle(Input::Worker(worker(2, 4, 100, 0)), Time::ORIGIN);
-    p.handle(Input::Submit(job(10, 60, 1)), Time::ORIGIN);
-    p.handle(Input::Submit(job(11, 60, 1)), Time::ORIGIN);
+    p.handle(
+        Input::Submit {
+            job: 10,
+            spec: job(60, 1),
+        },
+        Time::ORIGIN,
+    );
+    p.handle(
+        Input::Submit {
+            job: 11,
+            spec: job(60, 1),
+        },
+        Time::ORIGIN,
+    );
     assert_eq!(starts(p.poll(Time::ORIGIN)).len(), 2);
-    p.handle(Input::Submit(job(1, 50, 0)), Time(Duration::from_secs(1)));
+    p.handle(
+        Input::Submit {
+            job: 1,
+            spec: job(50, 0),
+        },
+        Time(Duration::from_secs(1)),
+    );
     assert!(starts(p.poll(Time(Duration::from_secs(1)))).is_empty());
     assert!(p.stats().reservations.is_empty(), "too early to reserve");
     assert!(starts(p.poll(Time(Duration::from_secs(61)))).is_empty());
@@ -75,7 +92,13 @@ fn reserved_worker_admits_only_its_holder() {
     let mut p = starving();
     let w = reserved_worker(&p);
     // A small job fits on both workers but must avoid the reserved one.
-    p.handle(Input::Submit(job(20, 5, 2)), Time(Duration::from_secs(62)));
+    p.handle(
+        Input::Submit {
+            job: 20,
+            spec: job(5, 2),
+        },
+        Time(Duration::from_secs(62)),
+    );
     let out = starts(p.poll(Time(Duration::from_secs(62))));
     assert_eq!(out.len(), 1);
     assert_ne!(out[0].1, w);
@@ -96,8 +119,20 @@ fn reserved_worker_admits_only_its_holder() {
 fn holder_cancelled_releases_the_worker() {
     let mut p = starving();
     let w = reserved_worker(&p);
-    p.handle(Input::Submit(job(20, 5, 2)), Time(Duration::from_secs(62)));
-    p.handle(Input::Submit(job(21, 5, 2)), Time(Duration::from_secs(62)));
+    p.handle(
+        Input::Submit {
+            job: 20,
+            spec: job(5, 2),
+        },
+        Time(Duration::from_secs(62)),
+    );
+    p.handle(
+        Input::Submit {
+            job: 21,
+            spec: job(5, 2),
+        },
+        Time(Duration::from_secs(62)),
+    );
     p.handle(Input::Cancel(1), Time(Duration::from_secs(62)));
     assert!(p.stats().reservations.is_empty());
     // Both workers take small jobs again (least loaded first: one on each).
@@ -191,13 +226,25 @@ fn heartbeat_lowering_usage_admits_the_holder_early() {
 fn heartbeat_raising_usage_blocks_placements() {
     let mut p = Scheduler::new(Config::default());
     p.handle(Input::Worker(worker(1, 4, 100, 0)), Time::ORIGIN);
-    p.handle(Input::Submit(job(1, 10, 0)), Time::ORIGIN);
+    p.handle(
+        Input::Submit {
+            job: 1,
+            spec: job(10, 0),
+        },
+        Time::ORIGIN,
+    );
     assert_eq!(starts(p.poll(Time::ORIGIN)).len(), 1);
     p.handle(
         Input::Worker(worker(1, 4, 100, 95)),
         Time(Duration::from_secs(1)),
     );
-    p.handle(Input::Submit(job(2, 10, 0)), Time(Duration::from_secs(1)));
+    p.handle(
+        Input::Submit {
+            job: 2,
+            spec: job(10, 0),
+        },
+        Time(Duration::from_secs(1)),
+    );
     assert!(starts(p.poll(Time(Duration::from_secs(1)))).is_empty());
     assert!(
         p.explain(2)
@@ -237,9 +284,15 @@ fn more_urgent_job_cannot_take_a_reserved_worker() {
     let urgent = JobSpec {
         priority: Some(-10),
         constraints: vec![Constraint::prefer_worker(w)],
-        ..job(30, 5, 9)
+        ..job(5, 9)
     };
-    p.handle(Input::Submit(urgent), Time(Duration::from_secs(63)));
+    p.handle(
+        Input::Submit {
+            job: 30,
+            spec: urgent,
+        },
+        Time(Duration::from_secs(63)),
+    );
     let out = starts(p.poll(Time(Duration::from_secs(63))));
     assert_eq!(out.len(), 1);
     assert_ne!(out[0].1, w);
@@ -267,12 +320,36 @@ fn per_class_reservations() {
         );
     }
     for i in 0..4 {
-        p.handle(Input::Submit(job(10 + i, 60, 1)), Time::ORIGIN);
+        p.handle(
+            Input::Submit {
+                job: 10 + i,
+                spec: job(60, 1),
+            },
+            Time::ORIGIN,
+        );
     }
     assert_eq!(starts(p.poll(Time::ORIGIN)).len(), 4);
-    p.handle(Input::Submit(job(1, 50, 0)), Time(Duration::from_secs(1)));
-    p.handle(Input::Submit(job(2, 50, 0)), Time(Duration::from_secs(1)));
-    p.handle(Input::Submit(job(3, 50, 0)), Time(Duration::from_secs(1)));
+    p.handle(
+        Input::Submit {
+            job: 1,
+            spec: job(50, 0),
+        },
+        Time(Duration::from_secs(1)),
+    );
+    p.handle(
+        Input::Submit {
+            job: 2,
+            spec: job(50, 0),
+        },
+        Time(Duration::from_secs(1)),
+    );
+    p.handle(
+        Input::Submit {
+            job: 3,
+            spec: job(50, 0),
+        },
+        Time(Duration::from_secs(1)),
+    );
     assert!(starts(p.poll(Time(Duration::from_secs(100)))).is_empty());
     let r = p.stats().reservations;
     assert_eq!(r.len(), 2, "one per class: {r:?}");
@@ -292,25 +369,37 @@ fn starving_shadow() -> Scheduler {
     p.handle(Input::Worker(worker(2, 4, 100, 0)), Time::ORIGIN);
     for id in [10, 11] {
         p.handle(
-            Input::Submit(JobSpec {
-                work: Some(Duration::from_secs(100)),
-                ..job(id, 60, 1)
-            }),
+            Input::Submit {
+                job: id,
+                spec: JobSpec {
+                    work: Some(Duration::from_secs(100)),
+                    ..job(60, 1)
+                },
+            },
             Time::ORIGIN,
         );
     }
     assert_eq!(starts(p.poll(Time::ORIGIN)).len(), 2);
-    p.handle(Input::Submit(job(1, 50, 0)), Time(Duration::from_secs(1)));
+    p.handle(
+        Input::Submit {
+            job: 1,
+            spec: job(50, 0),
+        },
+        Time(Duration::from_secs(1)),
+    );
     starts(p.poll(Time(Duration::from_secs(1))));
     assert!(starts(p.poll(Time(Duration::from_secs(61)))).is_empty());
     assert_eq!(p.stats().reservations.len(), 1);
     // Fill the other worker, so only shadow backfill can place anything more.
     let w = p.stats().reservations[0].worker;
     p.handle(
-        Input::Submit(JobSpec {
-            work: Some(Duration::from_secs(1_000_000)),
-            ..job(30, 40, 3)
-        }),
+        Input::Submit {
+            job: 30,
+            spec: JobSpec {
+                work: Some(Duration::from_secs(1_000_000)),
+                ..job(40, 3)
+            },
+        },
         Time(Duration::from_secs(61)),
     );
     assert_eq!(
@@ -328,17 +417,23 @@ fn shadow_backfill_admits_jobs_that_end_in_time() {
     let w = p.stats().reservations[0].worker;
     // 20 s of work ends at 81 s, before the shadow time 100 s; 50 s would end at 111 s.
     p.handle(
-        Input::Submit(JobSpec {
-            work: Some(Duration::from_secs(50)),
-            ..job(21, 5, 2)
-        }),
+        Input::Submit {
+            job: 21,
+            spec: JobSpec {
+                work: Some(Duration::from_secs(50)),
+                ..job(5, 2)
+            },
+        },
         Time(Duration::from_secs(62)),
     );
     p.handle(
-        Input::Submit(JobSpec {
-            work: Some(Duration::from_secs(20)),
-            ..job(20, 5, 2)
-        }),
+        Input::Submit {
+            job: 20,
+            spec: JobSpec {
+                work: Some(Duration::from_secs(20)),
+                ..job(5, 2)
+            },
+        },
         Time(Duration::from_secs(62)),
     );
     assert_eq!(starts(p.poll(Time(Duration::from_secs(62)))), vec![(20, w)]);
@@ -350,7 +445,13 @@ fn shadow_backfill_admits_jobs_that_end_in_time() {
             .contains(&(w, Verdict::Reserved { by: 1 }))
     );
     // Unknown work never backfills.
-    p.handle(Input::Submit(job(22, 5, 2)), Time(Duration::from_secs(63)));
+    p.handle(
+        Input::Submit {
+            job: 22,
+            spec: job(5, 2),
+        },
+        Time(Duration::from_secs(63)),
+    );
     assert!(starts(p.poll(Time(Duration::from_secs(63)))).is_empty());
 }
 
@@ -362,20 +463,26 @@ fn shadow_backfill_stops_at_the_shadow_time() {
     let w = p.stats().reservations[0].worker;
     // The shadow time is 100 s (the running jobs' expected end): a 1 s job at 95 s fits.
     p.handle(
-        Input::Submit(JobSpec {
-            work: Some(Duration::from_secs(1)),
-            ..job(20, 1, 2)
-        }),
+        Input::Submit {
+            job: 20,
+            spec: JobSpec {
+                work: Some(Duration::from_secs(1)),
+                ..job(1, 2)
+            },
+        },
         Time(Duration::from_secs(95)),
     );
     assert_eq!(starts(p.poll(Time(Duration::from_secs(95)))), vec![(20, w)]);
     p.handle(done(20), Time(Duration::from_secs(96)));
     // The running jobs overrun; from 100 s on, nothing but the holder goes there.
     p.handle(
-        Input::Submit(JobSpec {
-            work: Some(Duration::from_millis(500)),
-            ..job(21, 1, 2)
-        }),
+        Input::Submit {
+            job: 21,
+            spec: JobSpec {
+                work: Some(Duration::from_millis(500)),
+                ..job(1, 2)
+            },
+        },
         Time(Duration::from_secs(101)),
     );
     assert!(starts(p.poll(Time(Duration::from_secs(101)))).is_empty());

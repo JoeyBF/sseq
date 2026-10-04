@@ -76,12 +76,12 @@ impl UnitDecl {
         if self.plain() {
             let node = self.template.node(0);
             let j = DagJob {
+                id: self.id,
+                deps: self.deps.clone(),
                 spec: JobSpec {
-                    id: self.id,
+                    work: Some(Duration::from_secs_f64(self.scale)),
                     ..Default::default()
                 },
-                deps: self.deps.clone(),
-                work_estimate: Some(Duration::from_secs_f64(self.scale)),
                 passthrough: matches!(node, TemplateNode::Pass(_)),
                 local: matches!(node, TemplateNode::Local(_)),
             };

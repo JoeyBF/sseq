@@ -23,9 +23,8 @@ fn worker(id: WorkerId, slots: u64, budget_gb: u64) -> WorkerState {
 }
 
 /// A job with a demand in GB.
-fn job(id: JobId, gb: u64, group: u64) -> JobSpec {
+fn job(gb: u64, group: u64) -> JobSpec {
     JobSpec {
-        id,
         demand: Resources::new().with(MEMORY, gb * GB),
         group,
         ..Default::default()
@@ -48,6 +47,11 @@ fn starts(out: &[Output]) -> Vec<(JobId, WorkerId)> {
             _ => None,
         })
         .collect()
+}
+
+/// A submission.
+fn submit(job: JobId, spec: JobSpec) -> Input {
+    Input::Submit { job, spec }
 }
 
 /// A done message.
@@ -73,7 +77,7 @@ fn fifo_fills_least_loaded_first() {
         Input::Worker(worker(1, 4, 100)),
         Input::Worker(worker(2, 4, 100)),
     ];
-    inputs.extend((0..4).map(|i| Input::Submit(job(i, 10, 0))));
+    inputs.extend((0..4).map(|i| submit(i, job(10, 0))));
     let out = feed(&mut p, Time::ORIGIN, inputs);
     assert_eq!(starts(&out), vec![(0, 1), (1, 2), (2, 1), (3, 2)]);
     assert!(
@@ -89,15 +93,15 @@ fn preference_wins_over_load() {
     let inputs = [
         Input::Worker(worker(1, 4, 100)),
         Input::Worker(worker(2, 4, 100)),
-        Input::Submit(job(0, 10, 0)),
+        submit(0, job(10, 0)),
     ];
     feed(&mut p, Time::ORIGIN, inputs);
     let j = JobSpec {
         constraints: vec![Constraint::prefer_worker(1)],
-        ..job(1, 10, 0)
+        ..job(10, 0)
     };
     assert_eq!(
-        starts(&feed(&mut p, Time::ORIGIN, [Input::Submit(j)])),
+        starts(&feed(&mut p, Time::ORIGIN, [submit(1, j)])),
         vec![(1, 1)]
     );
 }
@@ -106,12 +110,12 @@ fn preference_wins_over_load() {
 #[test]
 fn priority_order_is_group_arrival_then_fifo() {
     let mut p = Scheduler::new(Config::default());
-    p.handle(Input::Submit(job(10, 1, 7)), Time::ORIGIN); // group 7 arrives first
-    p.handle(Input::Submit(job(11, 1, 3)), Time(Duration::from_secs(1)));
-    p.handle(Input::Submit(job(12, 1, 7)), Time(Duration::from_secs(2)));
-    let mut urgent = job(13, 1, 3);
+    p.handle(submit(10, job(1, 7)), Time::ORIGIN); // group 7 arrives first
+    p.handle(submit(11, job(1, 3)), Time(Duration::from_secs(1)));
+    p.handle(submit(12, job(1, 7)), Time(Duration::from_secs(2)));
+    let mut urgent = job(1, 3);
     urgent.priority = Some(-1);
-    p.handle(Input::Submit(urgent), Time(Duration::from_secs(3)));
+    p.handle(submit(13, urgent), Time(Duration::from_secs(3)));
     p.handle(
         Input::Worker(worker(1, 1, 100)),
         Time(Duration::from_secs(4)),
@@ -138,15 +142,15 @@ fn best_fit_packs_tightly() {
     let inputs = [
         Input::Worker(worker(1, 4, 100)),
         Input::Worker(worker(2, 4, 50)),
-        Input::Submit(job(0, 1, 0)),
-        Input::Submit(job(1, 1, 0)),
+        submit(0, job(1, 0)),
+        submit(1, job(1, 0)),
     ];
     // Both empty workers admit; the smaller one is the tighter fit.
     assert_eq!(
         starts(&feed(&mut p, Time::ORIGIN, inputs)),
         vec![(0, 2), (1, 2)]
     );
-    let inputs = [Input::Submit(job(2, 50, 0)), Input::Submit(job(3, 1, 0))];
+    let inputs = [submit(2, job(50, 0)), submit(3, job(1, 0))];
     // Then worker 1 has 49 GB free (49%), worker 2 has 47 GB (94%): worker 1 is fuller.
     assert_eq!(
         starts(&feed(&mut p, Time::ORIGIN, inputs)),
@@ -180,11 +184,7 @@ fn best_fit_ranks_by_the_bottleneck() {
         reported_used: Resources::new().with(MEMORY, 59 * GB),
         ..Default::default()
     };
-    let inputs = [
-        Input::Worker(w1),
-        Input::Worker(w2),
-        Input::Submit(job(0, 1, 0)),
-    ];
+    let inputs = [Input::Worker(w1), Input::Worker(w2), submit(0, job(1, 0))];
     assert_eq!(starts(&feed(&mut p, Time::ORIGIN, inputs)), vec![(0, 1)]);
 }
 
@@ -194,8 +194,8 @@ fn retry_keeps_place_and_age() {
     let mut p = Scheduler::new(Config::fifo());
     let inputs = [
         Input::Worker(worker(1, 1, 100)),
-        Input::Submit(job(0, 1, 0)),
-        Input::Submit(job(1, 1, 0)),
+        submit(0, job(1, 0)),
+        submit(1, job(1, 0)),
     ];
     assert_eq!(starts(&feed(&mut p, Time::ORIGIN, inputs)), vec![(0, 1)]);
     assert_eq!(p.stats().longest_wait, Some((1, Duration::ZERO)));
@@ -219,9 +219,9 @@ fn retry_keeps_place_and_age() {
     let inputs = [
         Input::Worker(worker(1, 1, 100)),
         Input::Worker(worker(2, 1, 100)),
-        Input::Submit(job(0, 1, 0)),
-        Input::Submit(job(1, 1, 0)),
-        Input::Submit(job(2, 1, 0)),
+        submit(0, job(1, 0)),
+        submit(1, job(1, 0)),
+        submit(2, job(1, 0)),
     ];
     assert_eq!(
         starts(&feed(&mut q, Time::ORIGIN, inputs)),
@@ -264,7 +264,7 @@ fn avoid_grows_then_gives_up() {
         ..Config::fifo()
     });
     let mut inputs: Vec<Input> = (1..=3).map(|w| Input::Worker(worker(w, 1, 100))).collect();
-    inputs.push(Input::Submit(job(0, 1, 0)));
+    inputs.push(submit(0, job(1, 0)));
     let mut out = feed(&mut p, Time::ORIGIN, inputs);
     let mut seen = Vec::new();
     for attempt in 1..=4 {
@@ -304,12 +304,12 @@ fn forbid_survives_retries() {
     let mut p = Scheduler::new(Config::fifo());
     let j = JobSpec {
         constraints: vec![Constraint::forbid_worker(1)],
-        ..job(0, 1, 0)
+        ..job(1, 0)
     };
     let inputs = [
         Input::Worker(worker(1, 1, 100)),
         Input::Worker(worker(2, 1, 100)),
-        Input::Submit(j),
+        submit(0, j),
     ];
     assert_eq!(starts(&feed(&mut p, Time::ORIGIN, inputs)), vec![(0, 2)]);
     // Worker 2 is now avoided softly; the only other live worker is forbidden, so the
@@ -342,7 +342,7 @@ fn next_wakeup_reports_aging_and_reserving() {
     feed(
         &mut p,
         Time(Duration::from_secs(10)),
-        [Input::Submit(job(0, 1, 0))],
+        [submit(0, job(1, 0))],
     );
     let (age_limit, ten) = (Duration::from_secs(100), Time(Duration::from_secs(10)));
     assert_eq!(p.next_wakeup(), Some(ten + reserve_after.min(age_limit)));
@@ -363,10 +363,7 @@ fn give_up_is_retryable_only_for_device_oom() {
         retry: RetryConfig { max_attempts: 2 },
         ..Config::fifo()
     });
-    let inputs = [
-        Input::Worker(worker(1, 1, 100)),
-        Input::Submit(job(0, 1, 0)),
-    ];
+    let inputs = [Input::Worker(worker(1, 1, 100)), submit(0, job(1, 0))];
     feed(&mut p, Time::ORIGIN, inputs);
     feed(
         &mut p,
@@ -398,8 +395,8 @@ fn worker_gone_fails_and_requeues() {
     });
     let inputs = [
         Input::Worker(worker(1, 2, 100)),
-        Input::Submit(job(0, 1, 0)),
-        Input::Submit(job(1, 1, 0)),
+        submit(0, job(1, 0)),
+        submit(1, job(1, 0)),
     ];
     assert_eq!(
         starts(&feed(&mut p, Time::ORIGIN, inputs)),
@@ -434,10 +431,7 @@ fn worker_gone_fails_and_requeues() {
 #[test]
 fn stale_messages_are_ignored() {
     let mut p = Scheduler::new(Config::fifo());
-    let inputs = [
-        Input::Worker(worker(1, 1, 100)),
-        Input::Submit(job(0, 1, 0)),
-    ];
+    let inputs = [Input::Worker(worker(1, 1, 100)), submit(0, job(1, 0))];
     feed(&mut p, Time::ORIGIN, inputs);
     feed(
         &mut p,
@@ -471,8 +465,8 @@ fn cancel_stops_running_attempts() {
     let mut p = Scheduler::new(Config::fifo());
     let inputs = [
         Input::Worker(worker(1, 1, 100)),
-        Input::Submit(job(0, 1, 0)),
-        Input::Submit(job(1, 1, 0)),
+        submit(0, job(1, 0)),
+        submit(1, job(1, 0)),
     ];
     feed(&mut p, Time::ORIGIN, inputs);
     assert!(feed(&mut p, Time(Duration::from_secs(1)), [Input::Cancel(1)]).is_empty());
@@ -494,9 +488,9 @@ fn speculating() -> Scheduler {
     let mut cfg = Config::fifo();
     cfg.speed.speculate = Some(Speculate::default());
     let mut p = Scheduler::new(cfg);
-    let mut j = job(0, 1, 0);
+    let mut j = job(1, 0);
     j.work = Some(Duration::from_secs(100));
-    let inputs = [Input::Worker(worker(1, 1, 100)), Input::Submit(j)];
+    let inputs = [Input::Worker(worker(1, 1, 100)), submit(0, j)];
     assert_eq!(starts(&feed(&mut p, Time::ORIGIN, inputs)), vec![(0, 1)]);
     let fast = WorkerState {
         speed: 4.0,
@@ -621,11 +615,13 @@ fn speculative_failure_is_not_a_round() {
     );
 }
 
-/// The order in which a one-slot worker runs `jobs`, all submitted before it joins.
+/// The order in which a one-slot worker runs `jobs`, submitted as jobs 0, 1, ... before it
+/// joins.
 fn run_order(config: Config, jobs: Vec<JobSpec>) -> Vec<JobId> {
     let mut p = Scheduler::new(config);
     let n = jobs.len();
-    feed(&mut p, Time::ORIGIN, jobs.into_iter().map(Input::Submit));
+    let submits = (0..).zip(jobs).map(|(id, spec)| submit(id, spec));
+    feed(&mut p, Time::ORIGIN, submits);
     p.handle(Input::Worker(worker(1, 1, 100)), Time::ORIGIN);
     let mut order = Vec::new();
     for t in 0..n {
@@ -641,17 +637,17 @@ fn run_order(config: Config, jobs: Vec<JobSpec>) -> Vec<JobId> {
 /// Smith's rule: largest weight over work first; jobs without work last, in arrival order.
 #[test]
 fn wspt_orders_by_weight_over_work() {
-    let spec = |id, weight, work| JobSpec {
+    let spec = |weight, work| JobSpec {
         weight,
         work,
-        ..job(id, 1, 0)
+        ..job(1, 0)
     };
     let jobs = vec![
-        spec(0, 1.0, None),
-        spec(1, 1.0, Some(Duration::from_secs(10))),
-        spec(2, 3.0, Some(Duration::from_secs(10))),
-        spec(3, 1.0, Some(Duration::from_secs(2))),
-        spec(4, 1.0, None),
+        spec(1.0, None),
+        spec(1.0, Some(Duration::from_secs(10))),
+        spec(3.0, Some(Duration::from_secs(10))),
+        spec(1.0, Some(Duration::from_secs(2))),
+        spec(1.0, None),
     ];
     let order = run_order(Config::weighted_completion(), jobs);
     assert_eq!(order, vec![3, 2, 1, 0, 4]);
@@ -660,14 +656,11 @@ fn wspt_orders_by_weight_over_work() {
 /// Jackson's rule: earliest due date first; jobs without one last.
 #[test]
 fn edd_orders_by_due_date() {
-    let spec = |id, due| JobSpec {
-        due,
-        ..job(id, 1, 0)
-    };
+    let spec = |due| JobSpec { due, ..job(1, 0) };
     let jobs = vec![
-        spec(0, None),
-        spec(1, Some(Time(Duration::from_secs(50)))),
-        spec(2, Some(Time(Duration::from_secs(3)))),
+        spec(None),
+        spec(Some(Time(Duration::from_secs(50)))),
+        spec(Some(Time(Duration::from_secs(3)))),
     ];
     assert_eq!(run_order(Config::lateness(), jobs), vec![2, 1, 0]);
 }
@@ -676,17 +669,17 @@ fn edd_orders_by_due_date() {
 /// [`OrderTerm::Rank`] between them, largest rank first. A repeated term changes nothing.
 #[test]
 fn default_order_is_priority_group() {
-    let spec = |id, group, priority, rank| JobSpec {
+    let spec = |group, priority, rank| JobSpec {
         priority,
         rank,
-        ..job(id, 1, group)
+        ..job(1, group)
     };
     let jobs = || {
         vec![
-            spec(0, 5, None, None),
-            spec(1, 6, None, Some(Duration::from_secs(2))),
-            spec(2, 6, None, Some(Duration::from_secs(9))),
-            spec(3, 5, Some(-1), None),
+            spec(5, None, None),
+            spec(6, None, Some(Duration::from_secs(2))),
+            spec(6, None, Some(Duration::from_secs(9))),
+            spec(5, Some(-1), None),
         ]
     };
     assert_eq!(run_order(Config::default(), jobs()), vec![3, 0, 1, 2]);
@@ -723,40 +716,29 @@ fn requires_and_forbids() {
             })
         })
         .collect();
-    let constrained = |id, constraints| JobSpec {
+    let constrained = |constraints| JobSpec {
         constraints,
-        ..job(id, 1, 0)
+        ..job(1, 0)
     };
-    let either = constrained(
-        0,
-        vec![
-            Constraint::require_class("c"),
-            Constraint::require_class("b"),
-        ],
-    );
-    let both = constrained(
-        1,
-        vec![
-            Constraint::require_class("a"),
-            Constraint::require_worker(2),
-        ],
-    );
-    let forbidden = constrained(
-        2,
-        vec![
-            Constraint::require_class("a"),
-            Constraint::forbid_class("a"),
-        ],
-    );
-    let worker_or = constrained(
-        3,
-        vec![
-            Constraint::require_worker(3),
-            Constraint::require_worker(1),
-            Constraint::forbid_worker(1),
-        ],
-    );
-    inputs.extend([either, both, forbidden, worker_or].map(Input::Submit));
+    let either = constrained(vec![
+        Constraint::require_class("c"),
+        Constraint::require_class("b"),
+    ]);
+    let both = constrained(vec![
+        Constraint::require_class("a"),
+        Constraint::require_worker(2),
+    ]);
+    let forbidden = constrained(vec![
+        Constraint::require_class("a"),
+        Constraint::forbid_class("a"),
+    ]);
+    let worker_or = constrained(vec![
+        Constraint::require_worker(3),
+        Constraint::require_worker(1),
+        Constraint::forbid_worker(1),
+    ]);
+    let jobs = [either, both, forbidden, worker_or];
+    inputs.extend((0..).zip(jobs).map(|(id, spec)| submit(id, spec)));
     // Job 0 takes the less loaded of b and c; jobs 1 and 2 match nothing.
     assert_eq!(
         starts(&feed(&mut p, Time::ORIGIN, inputs)),
@@ -790,10 +772,13 @@ fn prefer_class_and_loosest() {
             capacity: Resources::new().with(MEMORY, 100 * GB).with(SLOTS, 4),
             ..Default::default()
         }),
-        Input::Submit(JobSpec {
-            constraints: vec![Constraint::prefer_class("b")],
-            ..job(0, 1, 0)
-        }),
+        submit(
+            0,
+            JobSpec {
+                constraints: vec![Constraint::prefer_class("b")],
+                ..job(1, 0)
+            },
+        ),
     ];
     assert_eq!(starts(&feed(&mut p, Time::ORIGIN, inputs)), vec![(0, 2)]);
     let mut p = Scheduler::new(Config {
@@ -803,7 +788,7 @@ fn prefer_class_and_loosest() {
     let inputs = [
         Input::Worker(worker(1, 4, 100)),
         Input::Worker(worker(2, 4, 50)),
-        Input::Submit(job(0, 1, 0)),
+        submit(0, job(1, 0)),
     ];
     assert_eq!(starts(&feed(&mut p, Time::ORIGIN, inputs)), vec![(0, 1)]);
 }
@@ -822,13 +807,13 @@ fn slots_are_a_hard_resource() {
     let mut p = Scheduler::new(Config::fifo());
     let greedy = JobSpec {
         demand: Resources::new().with(SLOTS, 2),
-        ..job(0, 1, 0)
+        ..job(1, 0)
     };
     let inputs = [
         Input::Worker(worker(1, 3, 100)),
-        Input::Submit(greedy),
-        Input::Submit(job(1, 1, 0)),
-        Input::Submit(job(2, 1, 0)),
+        submit(0, greedy),
+        submit(1, job(1, 0)),
+        submit(2, job(1, 0)),
     ];
     assert_eq!(
         starts(&feed(&mut p, Time::ORIGIN, inputs)),
@@ -863,8 +848,7 @@ fn declared_gpu_count() {
         capacity: Resources::new().with(SLOTS, slots).with(GPUS, g),
         ..Default::default()
     };
-    let needs = |id, g| JobSpec {
-        id,
+    let needs = |g| JobSpec {
         demand: Resources::new().with(GPUS, g),
         ..Default::default()
     };
@@ -872,9 +856,9 @@ fn declared_gpu_count() {
     let inputs = [
         Input::Worker(w(1, 8, 0)),
         Input::Worker(w(2, 8, 2)),
-        Input::Submit(needs(0, 2)),
-        Input::Submit(needs(1, 1)),
-        Input::Submit(needs(2, 0)),
+        submit(0, needs(2)),
+        submit(1, needs(1)),
+        submit(2, needs(0)),
     ];
     // Job 0 takes both GPUs; job 1 reserves the GPU worker, not the idle CPU one with more
     // headroom, and job 2 runs on the CPU worker.
@@ -934,8 +918,7 @@ fn deferral_waits_for_hard_capacity() {
         speed,
         ..Default::default()
     };
-    let gpu_job = |id, work| JobSpec {
-        id,
+    let gpu_job = |work| JobSpec {
         demand: Resources::new().with(GPUS, 1),
         work: Some(Duration::from_secs(work)),
         ..Default::default()
@@ -945,12 +928,12 @@ fn deferral_waits_for_hard_capacity() {
         let inputs = [
             Input::Worker(w(1, fast_gpus, 4.0)),
             Input::Worker(w(2, 4, 1.0)),
-            Input::Submit(gpu_job(0, 10)),
+            submit(0, gpu_job(10)),
         ];
         let first = feed(&mut p, Time::ORIGIN, inputs);
         let on = if fast_gpus > 0 { 1 } else { 2 };
         assert_eq!(starts(&first), vec![(0, on)]);
-        let out = feed(&mut p, Time::ORIGIN, [Input::Submit(gpu_job(1, 40))]);
+        let out = feed(&mut p, Time::ORIGIN, [submit(1, gpu_job(40))]);
         assert_eq!(out.is_empty(), deferred, "{out:?}");
         let held: Vec<_> = p.stats().deferred.iter().map(|d| (d.0, d.1)).collect();
         assert_eq!(held, if deferred { vec![(1, 1)] } else { vec![] });
@@ -963,9 +946,9 @@ fn speculation_needs_gain() {
     let mut cfg = Config::fifo();
     cfg.speed.speculate = Some(Speculate::default());
     let mut p = Scheduler::new(cfg);
-    let mut j = job(0, 1, 0);
+    let mut j = job(1, 0);
     j.work = Some(Duration::from_secs(100));
-    let inputs = [Input::Worker(worker(1, 1, 100)), Input::Submit(j)];
+    let inputs = [Input::Worker(worker(1, 1, 100)), submit(0, j)];
     feed(&mut p, Time::ORIGIN, inputs);
     // At t=90 the slow attempt is expected to end at 100; a fresh one on a worker twice as
     // fast would end at 140.
@@ -984,12 +967,12 @@ fn undeclared_demand_is_rejected() {
     let mut p = Scheduler::new(Config::fifo());
     let stray = JobSpec {
         demand: Resources::new().with(MEMORY, 1).with(GPUS, 1),
-        ..job(0, 1, 0)
+        ..job(1, 0)
     };
     let inputs = [
         Input::Worker(worker(1, 2, 100)),
-        Input::Submit(stray),
-        Input::Submit(job(1, 1, 0)),
+        submit(0, stray),
+        submit(1, job(1, 0)),
     ];
     let out = feed(&mut p, Time::ORIGIN, inputs);
     let reason = Rejection::Undeclared {

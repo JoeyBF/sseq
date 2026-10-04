@@ -153,20 +153,28 @@ impl<P: Policy> DagScheduler<P> {
     /// ```
     /// # use std::time::Duration;
     /// # use whelm::{
-    /// #     Config, DagConfig, DagError, DagJob, DagScheduler, Input, JobSpec, Output, Policy,
+    /// #     Config, DagConfig, DagError, DagJob, DagScheduler, Input, Output, Policy,
     /// #     Resources, SLOTS, Scheduler, Time, WorkerState,
     /// # };
     /// # let mut dag = DagScheduler::new(DagConfig::default(), Scheduler::new(Config::fifo()));
     /// # let capacity = Resources::new().with(SLOTS, 1);
     /// # let worker = WorkerState { id: 1, capacity, ..Default::default() };
     /// # dag.handle(Input::Worker(worker), Time::ORIGIN);
-    /// # let job = |id, deps| DagJob {
-    /// #     spec: JobSpec { id, ..Default::default() },
-    /// #     deps,
-    /// #     ..Default::default()
-    /// # };
-    /// dag.declare([job(1, vec![]), job(3, vec![2])], Time::ORIGIN)
-    ///     .unwrap();
+    /// dag.declare(
+    ///     [
+    ///         DagJob {
+    ///             id: 1,
+    ///             ..Default::default()
+    ///         },
+    ///         DagJob {
+    ///             id: 3,
+    ///             deps: vec![2],
+    ///             ..Default::default()
+    ///         },
+    ///     ],
+    ///     Time::ORIGIN,
+    /// )
+    /// .unwrap();
     /// assert_eq!(
     ///     dag.explain(3).unwrap().to_string(),
     ///     "job 3 waits for 1 dependency [2]"
@@ -177,7 +185,14 @@ impl<P: Policy> DagScheduler<P> {
     /// );
     /// let before = dag.dag_stats();
     /// assert_eq!(
-    ///     dag.declare([job(2, vec![3])], Time::ORIGIN),
+    ///     dag.declare(
+    ///         [DagJob {
+    ///             id: 2,
+    ///             deps: vec![3],
+    ///             ..Default::default()
+    ///         }],
+    ///         Time::ORIGIN
+    ///     ),
     ///     Err(DagError::Cycle { job: 2 })
     /// );
     /// assert_eq!(dag.dag_stats(), before);
@@ -194,8 +209,15 @@ impl<P: Policy> DagScheduler<P> {
     ///     Input::Done { job: 1, attempt: 1 },
     ///     Time(Duration::from_secs(1)),
     /// );
-    /// dag.declare([job(2, vec![1])], Time(Duration::from_secs(1)))
-    ///     .unwrap();
+    /// dag.declare(
+    ///     [DagJob {
+    ///         id: 2,
+    ///         deps: vec![1],
+    ///         ..Default::default()
+    ///     }],
+    ///     Time(Duration::from_secs(1)),
+    /// )
+    /// .unwrap();
     /// assert_eq!(
     ///     dag.poll(Time(Duration::from_secs(1))),
     ///     vec![Output::Start {
@@ -279,7 +301,7 @@ impl<P: Policy> DagScheduler<P> {
     ///
     /// ```
     /// # use whelm::{
-    /// #     Config, DagConfig, DagJob, DagScheduler, Input, JobSpec, Output, Policy, Resources,
+    /// #     Config, DagConfig, DagJob, DagScheduler, Input, Output, Policy, Resources,
     /// #     SLOTS, Scheduler, Time, WorkerState,
     /// # };
     /// # let config = DagConfig { auto_submit: false, ..DagConfig::default() };
@@ -287,13 +309,20 @@ impl<P: Policy> DagScheduler<P> {
     /// # let capacity = Resources::new().with(SLOTS, 1);
     /// # let worker = WorkerState { id: 1, capacity, ..Default::default() };
     /// # dag.handle(Input::Worker(worker), Time::ORIGIN);
-    /// # let job = |id, deps| DagJob {
-    /// #     spec: JobSpec { id, ..Default::default() },
-    /// #     deps,
-    /// #     ..Default::default()
-    /// # };
-    /// dag.declare([job(1, vec![]), job(2, vec![])], Time::ORIGIN)
-    ///     .unwrap();
+    /// dag.declare(
+    ///     [
+    ///         DagJob {
+    ///             id: 1,
+    ///             ..Default::default()
+    ///         },
+    ///         DagJob {
+    ///             id: 2,
+    ///             ..Default::default()
+    ///         },
+    ///     ],
+    ///     Time::ORIGIN,
+    /// )
+    /// .unwrap();
     /// assert_eq!(
     ///     dag.announcements(),
     ///     vec![Output::Ready { job: 1 }, Output::Ready { job: 2 }]

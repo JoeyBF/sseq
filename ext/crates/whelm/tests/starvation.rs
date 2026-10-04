@@ -57,24 +57,34 @@ fn run(p: &mut dyn Policy, s: &Stream) -> Option<Duration> {
         for _ in waiting..(s.workers * s.slots / 2).max(2) {
             let (demand, d) = s.small[next as usize % s.small.len()];
             let small = JobSpec {
-                id: next,
                 demand: Resources::new().with(MEMORY, demand),
                 group: 1_000 + next,
                 work: Some(Duration::from_secs(d)),
                 ..Default::default()
             };
-            p.handle(Input::Submit(small), t);
+            p.handle(
+                Input::Submit {
+                    job: next,
+                    spec: small,
+                },
+                t,
+            );
             duration.insert(next, d);
             next += 1;
         }
         if !big_submitted && t >= s.big_at {
             let big = JobSpec {
-                id: BIG,
                 demand: Resources::new().with(MEMORY, s.big_demand),
                 priority: Some(-1),
                 ..Default::default()
             };
-            p.handle(Input::Submit(big), t);
+            p.handle(
+                Input::Submit {
+                    job: BIG,
+                    spec: big,
+                },
+                t,
+            );
             big_submitted = true;
         }
         let done: Vec<JobId> = ends.iter().filter(|e| e.1.1 <= t).map(|e| *e.0).collect();

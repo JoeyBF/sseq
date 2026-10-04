@@ -34,12 +34,12 @@ fn worker(id: WorkerId) -> WorkerState {
 /// A job of group 0 with the given dependencies.
 fn job(id: JobId, deps: &[JobId]) -> DagJob {
     DagJob {
+        id,
+        deps: deps.to_vec(),
         spec: JobSpec {
-            id,
             demand: Resources::new().with(MEMORY, 1),
             ..Default::default()
         },
-        deps: deps.to_vec(),
         ..Default::default()
     }
 }
@@ -252,12 +252,12 @@ fn passthroughs_are_announced() {
         vec![
             job(1, &[]),
             DagJob {
+                id: 2,
+                deps: vec![1],
                 spec: JobSpec {
-                    id: 2,
+                    work: Some(Duration::ZERO),
                     ..Default::default()
                 },
-                deps: vec![1],
-                work_estimate: Some(Duration::ZERO),
                 passthrough: true,
                 ..Default::default()
             },

@@ -44,33 +44,34 @@ fn starts(p: &mut impl Policy, now: Time) -> Vec<(JobId, WorkerId)> {
 /// A unit job in group 0.
 fn job(id: JobId, deps: &[JobId]) -> DagJob {
     DagJob {
+        id,
+        deps: deps.to_vec(),
         spec: JobSpec {
-            id,
             demand: Resources::new().with(MEMORY, 1),
             ..Default::default()
         },
-        deps: deps.to_vec(),
         ..Default::default()
     }
 }
 
 /// A unit job in group 0 with a work estimate.
 fn worked(id: JobId, deps: &[JobId], work: Duration) -> DagJob {
-    DagJob {
-        work_estimate: Some(work),
-        ..job(id, deps)
-    }
+    let mut j = job(id, deps);
+    j.spec.work = Some(work);
+    j
 }
 
 /// A passthrough in group 0 worth `work` in ranks.
 fn passthrough(id: JobId, deps: &[JobId], work: Duration) -> DagJob {
     DagJob {
+        id,
+        deps: deps.to_vec(),
         spec: JobSpec {
-            id,
+            work: Some(work),
             ..Default::default()
         },
         passthrough: true,
-        ..worked(id, deps, work)
+        ..Default::default()
     }
 }
 
@@ -416,23 +417,40 @@ fn forbid_and_class_are_hard_constraints() {
     };
     join(&mut p, 1, "h200", 4, Time::ORIGIN);
     join(&mut p, 2, "l40s", 4, Time::ORIGIN);
-    let spec = |id, constraints| JobSpec {
-        id,
+    let spec = |constraints| JobSpec {
         demand: Resources::new().with(MEMORY, 1),
         constraints,
         ..Default::default()
     };
-    let retry = spec(
-        1,
-        vec![Constraint::forbid_worker(1), Constraint::prefer_worker(1)],
+    let retry = spec(vec![
+        Constraint::forbid_worker(1),
+        Constraint::prefer_worker(1),
+    ]);
+    p.handle(
+        Input::Submit {
+            job: 1,
+            spec: retry,
+        },
+        Time::ORIGIN,
     );
-    p.handle(Input::Submit(retry), Time::ORIGIN);
-    let pinned = spec(2, vec![Constraint::require_class("h200")]);
-    p.handle(Input::Submit(pinned), Time::ORIGIN);
+    let pinned = spec(vec![Constraint::require_class("h200")]);
+    p.handle(
+        Input::Submit {
+            job: 2,
+            spec: pinned,
+        },
+        Time::ORIGIN,
+    );
     assert_eq!(starts(&mut p, Time::ORIGIN), vec![(1, 2), (2, 1)]);
     // A job excluded everywhere waits, and says why.
-    let nowhere = spec(3, vec![Constraint::require_class("v100")]);
-    p.handle(Input::Submit(nowhere), Time(Duration::from_secs(1)));
+    let nowhere = spec(vec![Constraint::require_class("v100")]);
+    p.handle(
+        Input::Submit {
+            job: 3,
+            spec: nowhere,
+        },
+        Time(Duration::from_secs(1)),
+    );
     assert!(starts(&mut p, Time(Duration::from_secs(1))).is_empty());
     let e = p.explain(3).unwrap();
     let verdicts: Vec<Verdict> = e

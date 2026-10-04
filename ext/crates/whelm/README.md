@@ -22,7 +22,7 @@ In α|β|γ notation:
   `Timing::Related`: one speed per worker) or unrelated ones (R, `Timing::Unrelated`: a speed per
   job kind and worker class). Speeds are reported, or learned online from completion times (`Learn`;
   `SpeedEstimator` is the same learner on its own).
-- **β, jobs.** A job (`JobSpec`) has
+- **β, jobs.** A job is an id the caller chooses (`JobId`) and a description (`JobSpec`); it has
   - a demand (`Resources`: amounts keyed by the names of the resources that `Config::resources`
     declares, by default `MEMORY`, `DEVICE_MEMORY` and `SLOTS`; a job naming another is rejected),
     checked by one per-resource admission rule (below);
@@ -107,9 +107,9 @@ policy.handle(
 );
 
 // Jobs and workers are struct literals; `Default` fills in what they leave out.
-let job = |id, size| JobSpec { id, demand: Resources::new().with(MEMORY, gb(size)), group: 3, ..Default::default() };
-policy.handle(Input::Submit(job(7, 6.0)), at(1));
-policy.handle(Input::Submit(job(8, 30.0)), at(1));
+let spec = |size| JobSpec { demand: Resources::new().with(MEMORY, gb(size)), group: 3, ..Default::default() };
+policy.handle(Input::Submit { job: 7, spec: spec(6.0) }, at(1));
+policy.handle(Input::Submit { job: 8, spec: spec(30.0) }, at(1));
 
 // After every batch of inputs, poll and act on each output.
 let mut started = Vec::new();
@@ -219,8 +219,8 @@ shared.worker_update(WorkerState {
     capacity: Resources::new().with(MEMORY, gb(120.0)).with(SLOTS, 16),
     ..Default::default()
 });
-let job = JobSpec { id: 42, demand: Resources::new().with(MEMORY, gb(6.0)), group: 3, ..Default::default() };
-let mut lease = shared.lease(job); // blocks
+let spec = JobSpec { demand: Resources::new().with(MEMORY, gb(6.0)), group: 3, ..Default::default() };
+let mut lease = shared.lease(42, spec); // blocks
 loop {
     // Send the task to `lease.worker()` and wait for the reply.
     let reply: Result<(), (FailKind, String)> = Ok(());
@@ -253,8 +253,8 @@ let mut p = Logged::new(Scheduler::new(Config::default()), events.clone());
 let capacity = Resources::new().with(MEMORY, gb(10.0)).with(SLOTS, 2);
 let worker = WorkerState { id: 1, capacity, ..Default::default() };
 p.handle(Input::Worker(worker), Time::ORIGIN);
-let job = JobSpec { id: 1, demand: Resources::new().with(MEMORY, gb(4.0)), ..Default::default() };
-p.handle(Input::Submit(job), Time::ORIGIN);
+let spec = JobSpec { demand: Resources::new().with(MEMORY, gb(4.0)), ..Default::default() };
+p.handle(Input::Submit { job: 1, spec }, Time::ORIGIN);
 p.poll(Time::ORIGIN);
 
 let events = events.lock().unwrap().clone();
@@ -306,8 +306,8 @@ is job `base + k`; other units depend on it by its id.
 use std::{sync::Arc, time::Duration};
 
 use whelm::{
-    Config, DagConfig, DagJob, DagScheduler, Input, JobSpec, Output, Policy, Resources, SLOTS,
-    Scheduler, TemplateSpec, Time, Unit, WorkerState,
+    Config, DagConfig, DagJob, DagScheduler, Input, Output, Policy, Resources, SLOTS, Scheduler,
+    TemplateSpec, Time, Unit, WorkerState,
 };
 
 let mut dag = DagScheduler::new(DagConfig::default(), Scheduler::new(Config::default()));
@@ -315,8 +315,7 @@ let worker = WorkerState { id: 1, capacity: Resources::new().with(SLOTS, 4), ..D
 dag.handle(Input::Worker(worker), Time::ORIGIN);
 
 // A local job 1, then unit 10: a chain of jobs 100 -> 101 -> 102, the first checkpointed.
-let spec = JobSpec { id: 1, ..Default::default() };
-let load = DagJob { spec, local: true, ..Default::default() };
+let load = DagJob { id: 1, local: true, ..Default::default() };
 let chain = TemplateSpec { edges: vec![(0, 1), (1, 2)], ..TemplateSpec::jobs(3) };
 let unit = Unit {
     id: 10,
@@ -401,13 +400,12 @@ shared.with(|p, _| {
     p.annotate(task, TaskInfo { kind: "sig".into(), bidegree: (t - s, s), ..TaskInfo::default() })
 });
 let spec = JobSpec {
-    id: task,
     demand: Resources::new().with(MEMORY, gb(est_gb)),
     group: nassau::group(s as u32, t as u32),
     work: Some(work),
     ..Default::default()
 };
-let mut lease = shared.lease(spec);
+let mut lease = shared.lease(task, spec);
 loop {
     let _worker = lease.worker(); // send over TCP, block on the reply
     let reply: Result<(), (FailKind, String)> = Ok(());

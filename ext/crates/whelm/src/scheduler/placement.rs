@@ -177,7 +177,7 @@ impl Scheduler {
         };
         if let Some(defer) = self.config.speed.defer
             && let Some(run_here) = self.eta(job, &self.workers[&place])
-            && self.reserved(job.spec.id).is_none()
+            && self.reserved(job.id).is_none()
             && !self.aged(job)
             && self.now - job.since < defer.max_wait
         {
@@ -188,7 +188,7 @@ impl Scheduler {
             for (&id, w) in &self.workers {
                 if self.speed(job, w) <= speed_here
                     || !self.eligible(job, w)
-                    || w.reserved_for.is_some_and(|h| h != job.spec.id)
+                    || w.reserved_for.is_some_and(|h| h != job.id)
                     || !self.waits_for(job, w)
                 {
                     continue;

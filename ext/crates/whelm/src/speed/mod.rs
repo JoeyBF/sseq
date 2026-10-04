@@ -63,8 +63,8 @@ pub enum Timing {
     ///
     /// ```
     /// # use whelm::{
-    /// #     Config, Input, JobSpec, Output, Policy, Resources, SLOTS, Scheduler, SpeedConfig,
-    /// #     Time, Timing, WorkerId, WorkerState,
+    /// #     Config, Input, JobId, JobSpec, Output, Policy, Resources, SLOTS, Scheduler,
+    /// #     SpeedConfig, Time, Timing, WorkerId, WorkerState,
     /// # };
     /// # /// A scheduler with `timing` and two one-slot workers: 1 of class "x" and 2 of class "y",
     /// # /// each reporting speed 1.
@@ -81,11 +81,10 @@ pub enum Timing {
     /// #     s
     /// # }
     /// # /// Where a lone job goes, both workers free, and that it then finishes at once.
-    /// # fn place(s: &mut Scheduler, job: JobSpec, now: Time) -> WorkerId {
-    /// #     let id = job.id;
-    /// #     s.handle(Input::Submit(job), now);
+    /// # fn place(s: &mut Scheduler, job: JobId, spec: JobSpec, now: Time) -> WorkerId {
+    /// #     s.handle(Input::Submit { job, spec }, now);
     /// #     let [Output::Start { worker, .. }] = s.poll(now)[..] else { panic!() };
-    /// #     s.handle(Input::Done { job: id, attempt: 1 }, now);
+    /// #     s.handle(Input::Done { job, attempt: 1 }, now);
     /// #     worker
     /// # }
     /// let fast = WorkerState {
@@ -97,12 +96,12 @@ pub enum Timing {
     /// };
     /// let mut s = two_classes(Timing::Identical);
     /// s.handle(Input::Worker(fast.clone()), Time::ORIGIN);
-    /// assert_eq!(place(&mut s, JobSpec::default(), Time::ORIGIN), 1);
+    /// assert_eq!(place(&mut s, 0, JobSpec::default(), Time::ORIGIN), 1);
     /// assert_eq!(s.stats().workers[1].speed, 1.0);
     /// // The default, related machines at their reported speeds, prefers it.
     /// let mut s = two_classes(Timing::default());
     /// s.handle(Input::Worker(fast), Time::ORIGIN);
-    /// assert_eq!(place(&mut s, JobSpec::default(), Time::ORIGIN), 2);
+    /// assert_eq!(place(&mut s, 0, JobSpec::default(), Time::ORIGIN), 2);
     /// assert_eq!(s.stats().workers[1].speed, 4.0);
     /// ```
     Identical,
@@ -129,8 +128,8 @@ pub enum Timing {
     /// ```
     /// # use std::time::Duration;
     /// # use whelm::{
-    /// #     Config, Constraint, Input, JobSpec, Output, Policy, Resources, SLOTS, Scheduler,
-    /// #     SpeedConfig, Time, Timing, WorkerId, WorkerState,
+    /// #     Config, Constraint, Input, JobId, JobSpec, Output, Policy, Resources, SLOTS,
+    /// #     Scheduler, SpeedConfig, Time, Timing, WorkerId, WorkerState,
     /// # };
     /// # /// A scheduler with `timing` and two one-slot workers: 1 of class "x" and 2 of class "y",
     /// # /// each reporting speed 1.
@@ -147,11 +146,10 @@ pub enum Timing {
     /// #     s
     /// # }
     /// # /// Where a lone job goes, both workers free, and that it then finishes at once.
-    /// # fn place(s: &mut Scheduler, job: JobSpec, now: Time) -> WorkerId {
-    /// #     let id = job.id;
-    /// #     s.handle(Input::Submit(job), now);
+    /// # fn place(s: &mut Scheduler, job: JobId, spec: JobSpec, now: Time) -> WorkerId {
+    /// #     s.handle(Input::Submit { job, spec }, now);
     /// #     let [Output::Start { worker, .. }] = s.poll(now)[..] else { panic!() };
-    /// #     s.handle(Input::Done { job: id, attempt: 1 }, now);
+    /// #     s.handle(Input::Done { job, attempt: 1 }, now);
     /// #     worker
     /// # }
     /// let truth = |kind, worker| match (kind, worker) {
@@ -164,14 +162,13 @@ pub enum Timing {
     ///     for _ in 0..20 {
     ///         for kind in ["a", "b"] {
     ///             for (w, class) in [(1, "x"), (2, "y")] {
-    ///                 let job = JobSpec {
-    ///                     id,
+    ///                 let spec = JobSpec {
     ///                     work: Some(Duration::from_secs(8)),
     ///                     kind: Some(kind.into()),
     ///                     constraints: vec![Constraint::require_class(class)],
     ///                     ..Default::default()
     ///                 };
-    ///                 s.handle(Input::Submit(job), now);
+    ///                 s.handle(Input::Submit { job: id, spec }, now);
     ///                 assert_eq!(s.poll(now).len(), 1);
     ///                 now += Duration::from_secs(8).div_f64(truth(kind, w));
     ///                 s.handle(Input::Done { job: id, attempt: 1 }, now);
@@ -181,8 +178,7 @@ pub enum Timing {
     ///     }
     ///     now
     /// };
-    /// let kind = |id, kind: &str| JobSpec {
-    ///     id,
+    /// let kind = |kind: &str| JobSpec {
     ///     work: Some(Duration::from_secs(8)),
     ///     kind: Some(kind.into()),
     ///     ..Default::default()
@@ -190,9 +186,9 @@ pub enum Timing {
     ///
     /// let mut s = two_classes(Timing::unrelated());
     /// let now = train(&mut s);
-    /// assert_eq!(place(&mut s, kind(100, "a"), now), 1);
-    /// assert_eq!(place(&mut s, kind(101, "b"), now), 2);
-    /// s.handle(Input::Submit(kind(102, "a")), now);
+    /// assert_eq!(place(&mut s, 100, kind("a"), now), 1);
+    /// assert_eq!(place(&mut s, 101, kind("b"), now), 2);
+    /// s.handle(Input::Submit { job: 102, spec: kind("a") }, now);
     /// let why = s.explain(102).unwrap();
     /// let classes: Vec<&str> = (why.waiting().unwrap().kind_factors.iter())
     ///     .map(|(class, _)| class.as_str())
@@ -201,8 +197,8 @@ pub enum Timing {
     ///
     /// let mut s = two_classes(Timing::learned());
     /// let now = train(&mut s);
-    /// assert_eq!(place(&mut s, kind(100, "a"), now), 1);
-    /// assert_eq!(place(&mut s, kind(101, "b"), now), 1);
+    /// assert_eq!(place(&mut s, 100, kind("a"), now), 1);
+    /// assert_eq!(place(&mut s, 101, kind("b"), now), 1);
     /// ```
     Unrelated {
         /// The learning of the related speeds, whose moving-average weight, hysteresis and
@@ -232,8 +228,8 @@ impl Timing {
     /// ```
     /// # use std::time::Duration;
     /// # use whelm::{
-    /// #     Config, Constraint, Input, JobSpec, Output, Policy, Resources, SLOTS, Scheduler,
-    /// #     SpeedConfig, Time, Timing, WorkerId, WorkerState,
+    /// #     Config, Constraint, Input, JobId, JobSpec, Output, Policy, Resources, SLOTS,
+    /// #     Scheduler, SpeedConfig, Time, Timing, WorkerId, WorkerState,
     /// # };
     /// # /// A scheduler with `timing` and two one-slot workers: 1 of class "x" and 2 of class "y",
     /// # /// each reporting speed 1.
@@ -250,33 +246,27 @@ impl Timing {
     /// #     s
     /// # }
     /// # /// Where a lone job goes, both workers free, and that it then finishes at once.
-    /// # fn place(s: &mut Scheduler, job: JobSpec, now: Time) -> WorkerId {
-    /// #     let id = job.id;
-    /// #     s.handle(Input::Submit(job), now);
+    /// # fn place(s: &mut Scheduler, job: JobId, spec: JobSpec, now: Time) -> WorkerId {
+    /// #     s.handle(Input::Submit { job, spec }, now);
     /// #     let [Output::Start { worker, .. }] = s.poll(now)[..] else { panic!() };
-    /// #     s.handle(Input::Done { job: id, attempt: 1 }, now);
+    /// #     s.handle(Input::Done { job, attempt: 1 }, now);
     /// #     worker
     /// # }
     /// let mut s = two_classes(Timing::learned());
     /// let mut now = Time::ORIGIN;
-    /// for id in 0..u64::from(Learn::default().min_samples) {
-    ///     let job = JobSpec {
-    ///         id,
-    ///         work: Some(Duration::from_secs(10)),
-    ///         constraints: vec![Constraint::require_class("y")],
-    ///         ..Default::default()
-    ///     };
-    ///     s.handle(Input::Submit(job), now);
-    ///     s.poll(now);
-    ///     now += Duration::from_secs(5);
-    ///     s.handle(Input::Done { job: id, attempt: 1 }, now);
-    /// }
-    /// assert!((s.stats().workers[1].speed - 2.0).abs() < 1e-9);
-    /// let job = JobSpec {
-    ///     id: 1000,
+    /// let spec = JobSpec {
+    ///     work: Some(Duration::from_secs(10)),
+    ///     constraints: vec![Constraint::require_class("y")],
     ///     ..Default::default()
     /// };
-    /// assert_eq!(place(&mut s, job, now), 2);
+    /// for job in 0..u64::from(Learn::default().min_samples) {
+    ///     s.handle(Input::Submit { job, spec: spec.clone() }, now);
+    ///     s.poll(now);
+    ///     now += Duration::from_secs(5);
+    ///     s.handle(Input::Done { job, attempt: 1 }, now);
+    /// }
+    /// assert!((s.stats().workers[1].speed - 2.0).abs() < 1e-9);
+    /// assert_eq!(place(&mut s, 1000, JobSpec::default(), now), 2);
     /// # use whelm::Learn;
     /// ```
     pub fn learned() -> Self {

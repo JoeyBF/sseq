@@ -66,10 +66,10 @@ pub enum FailKind {
 ///     Time::ORIGIN,
 /// );
 /// p.handle(
-///     Input::Submit(JobSpec {
-///         id: 1,
-///         ..Default::default()
-///     }),
+///     Input::Submit {
+///         job: 1,
+///         spec: JobSpec::default(),
+///     },
 ///     Time::ORIGIN,
 /// );
 /// p.poll(Time::ORIGIN);
@@ -129,12 +129,11 @@ pub struct GaveUp {
 /// const GPUS: Resource = Resource::new("gpus").hard();
 ///
 /// let mut p = Scheduler::new(Config::default());
-/// let job = JobSpec {
-///     id: 1,
+/// let spec = JobSpec {
 ///     demand: Resources::new().with(GPUS, 1),
 ///     ..Default::default()
 /// };
-/// p.handle(Input::Submit(job), Time::ORIGIN);
+/// p.handle(Input::Submit { job: 1, spec }, Time::ORIGIN);
 /// let reason = Rejection::Undeclared {
 ///     resource: "gpus".into(),
 /// };
@@ -199,7 +198,12 @@ impl fmt::Display for Rejection {
 pub enum Input {
     /// A job became ready. An id that is already waiting or running is ignored, and a job whose
     /// demand names a resource the policy does not declare is [rejected](Output::Rejected).
-    Submit(JobSpec),
+    Submit {
+        /// The job's id, chosen by the caller.
+        job: JobId,
+        /// What it is.
+        spec: JobSpec,
+    },
     /// An attempt finished: the job is complete, and every other live attempt of it is stopped
     /// ([`Output::Stop`]). Ignored unless `attempt` is live.
     Done {
@@ -262,10 +266,10 @@ pub enum Input {
 ///     Time::ORIGIN,
 /// );
 /// p.handle(
-///     Input::Submit(JobSpec {
-///         id: 1,
-///         ..Default::default()
-///     }),
+///     Input::Submit {
+///         job: 1,
+///         spec: JobSpec::default(),
+///     },
 ///     Time::ORIGIN,
 /// );
 /// let mut sent = Vec::new();
@@ -408,10 +412,10 @@ pub enum Output {
 /// );
 /// for id in 1..=3 {
 ///     p.handle(
-///         Input::Submit(JobSpec {
-///             id,
-///             ..Default::default()
-///         }),
+///         Input::Submit {
+///             job: id,
+///             spec: JobSpec::default(),
+///         },
 ///         Time::ORIGIN,
 ///     );
 /// }

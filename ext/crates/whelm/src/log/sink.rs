@@ -53,11 +53,13 @@ use super::Logged;
 /// p.handle(Input::Worker(worker), Time::ORIGIN);
 /// for id in 1..=3 {
 ///     p.handle(
-///         Input::Submit(JobSpec {
-///             id,
-///             demand: Resources::new().with(MEMORY, gb(1.0)),
-///             ..Default::default()
-///         }),
+///         Input::Submit {
+///             job: id,
+///             spec: JobSpec {
+///                 demand: Resources::new().with(MEMORY, gb(1.0)),
+///                 ..Default::default()
+///             },
+///         },
 ///         Time::ORIGIN,
 ///     );
 /// }
@@ -132,11 +134,13 @@ impl EventSink for std::sync::Arc<std::sync::Mutex<Vec<Event>>> {
 /// };
 /// p.handle(Input::Worker(worker), Time::ORIGIN);
 /// p.handle(
-///     Input::Submit(JobSpec {
-///         id: 1,
-///         demand: Resources::new().with(MEMORY, gb(1.0)),
-///         ..Default::default()
-///     }),
+///     Input::Submit {
+///         job: 1,
+///         spec: JobSpec {
+///             demand: Resources::new().with(MEMORY, gb(1.0)),
+///             ..Default::default()
+///         },
+///     },
 ///     Time::ORIGIN,
 /// );
 /// p.poll(Time::ORIGIN);

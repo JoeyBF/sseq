@@ -30,11 +30,13 @@ use crate::{Attempt, FailKind, GaveUp, Input, JobId, Policy, WorkerId};
 ///     });
 /// }
 /// // Every attempt runs out of device memory.
-/// let mut lease = shared.lease(JobSpec {
-///     id: 7,
-///     demand: Resources::new().with(MEMORY, gb(1.0)),
-///     ..Default::default()
-/// });
+/// let mut lease = shared.lease(
+///     7,
+///     JobSpec {
+///         demand: Resources::new().with(MEMORY, gb(1.0)),
+///         ..Default::default()
+///     },
+/// );
 /// let mut workers = Vec::new();
 /// let gave_up = loop {
 ///     workers.push(lease.worker());
@@ -102,11 +104,13 @@ impl<'a, P: Policy> Lease<'a, P> {
     ///     capacity: Resources::new().with(MEMORY, gb(8.0)).with(SLOTS, 1),
     ///     ..Default::default()
     /// });
-    /// let lease = shared.lease(JobSpec {
-    ///     id: 1,
-    ///     demand: Resources::new().with(MEMORY, gb(1.0)),
-    ///     ..Default::default()
-    /// });
+    /// let lease = shared.lease(
+    ///     1,
+    ///     JobSpec {
+    ///         demand: Resources::new().with(MEMORY, gb(1.0)),
+    ///         ..Default::default()
+    ///     },
+    /// );
     /// assert!(!lease.stopped());
     /// shared.with(|p, now| p.handle(Input::Cancel(1), now));
     /// assert!(lease.stopped());
@@ -133,11 +137,13 @@ impl<'a, P: Policy> Lease<'a, P> {
     ///         ..Default::default()
     ///     });
     /// }
-    /// let lease = shared.lease(JobSpec {
-    ///     id: 7,
-    ///     demand: Resources::new().with(MEMORY, gb(1.0)),
-    ///     ..Default::default()
-    /// });
+    /// let lease = shared.lease(
+    ///     7,
+    ///     JobSpec {
+    ///         demand: Resources::new().with(MEMORY, gb(1.0)),
+    ///         ..Default::default()
+    ///     },
+    /// );
     /// shared.worker_gone(lease.worker());
     /// // The policy is running a retry on worker 2, but the result arrived anyway.
     /// assert_eq!(shared.stats().running, 1);

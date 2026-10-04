@@ -75,8 +75,8 @@ impl Scheduler {
 
     /// Queue a new job under its urgency key, its demand over the declared resources with the
     /// default demands filled in; or reject it if its demand names another resource.
-    pub(super) fn submit(&mut self, spec: JobSpec, now: Time) {
-        if self.waiting.contains_key(&spec.id) || self.running.contains_key(&spec.id) {
+    pub(super) fn submit(&mut self, id: JobId, spec: JobSpec, now: Time) {
+        if self.waiting.contains_key(&id) || self.running.contains_key(&id) {
             return;
         }
         let resources = &self.config.resources;
@@ -84,10 +84,7 @@ impl Scheduler {
             Ok(demand) => demand,
             Err(resource) => {
                 let reason = Rejection::Undeclared { resource };
-                self.outbox.push(Output::Rejected {
-                    job: spec.id,
-                    reason,
-                });
+                self.outbox.push(Output::Rejected { job: id, reason });
                 return;
             }
         };
@@ -97,6 +94,7 @@ impl Scheduler {
         let key = self.key(&spec, seq);
         let kind = self.speeds.kind(spec.kind.as_deref());
         self.enqueue(Job {
+            id,
             kind,
             spec,
             demand,
@@ -111,9 +109,9 @@ impl Scheduler {
 
     /// Put a job in the waiting indexes under its key.
     pub(super) fn enqueue(&mut self, job: Job) {
-        self.queue.insert(job.key, job.spec.id);
-        self.by_age.insert(job.key.seq, job.spec.id);
-        self.waiting.insert(job.spec.id, job);
+        self.queue.insert(job.key, job.id);
+        self.by_age.insert(job.key.seq, job.id);
+        self.waiting.insert(job.id, job);
     }
 
     /// Take a job out of the waiting indexes, releasing its hold.

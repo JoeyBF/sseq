@@ -75,13 +75,13 @@ fn walk(template: &Arc<DagTemplate>, base: JobId, entry: JobId, done: JobId) -> 
 /// A plain job of `demand` bytes in group `group`, after `deps`.
 fn plain(id: JobId, demand: u64, group: u64, deps: Vec<JobId>) -> DagJob {
     DagJob {
+        id,
+        deps,
         spec: JobSpec {
-            id,
             demand: Resources::new().with(MEMORY, demand),
             group,
             ..Default::default()
         },
-        deps,
         ..Default::default()
     }
 }
@@ -227,11 +227,12 @@ proptest! {
             .collect();
         let mut nodes: Vec<JobId> = rest.iter().map(|&i| 100 + JobId::from(i)).collect();
         nodes.push(1);
-        jobs.push(DagJob {
+        let mut exit = DagJob {
             passthrough: true,
-            work_estimate: Some(Duration::ZERO),
             ..plain(99, 0, 7, nodes)
-        });
+        };
+        exit.spec.work = Some(Duration::ZERO);
+        jobs.push(exit);
         b.declare(jobs, Time::ORIGIN).unwrap();
         let (order_a, done_a) = drive(&mut a);
         let (order_b, done_b) = drive(&mut b);

@@ -17,16 +17,25 @@
 //! let mut config = Config::default();
 //! config.group_order = GroupOrder::Id;
 //! let mut p = Scheduler::new(config);
-//! let submit = |id, g| {
-//!     Input::Submit(JobSpec {
-//!         id,
-//!         demand: Resources::new().with(MEMORY, gb(1.0)),
-//!         group: g,
-//!         ..Default::default()
-//!     })
+//! let spec = |group| JobSpec {
+//!     demand: Resources::new().with(MEMORY, gb(1.0)),
+//!     group,
+//!     ..Default::default()
 //! };
-//! p.handle(submit(1, group(3, 20)), Time::ORIGIN);
-//! p.handle(submit(2, group(2, 40)), Time::ORIGIN);
+//! p.handle(
+//!     Input::Submit {
+//!         job: 1,
+//!         spec: spec(group(3, 20)),
+//!     },
+//!     Time::ORIGIN,
+//! );
+//! p.handle(
+//!     Input::Submit {
+//!         job: 2,
+//!         spec: spec(group(2, 40)),
+//!     },
+//!     Time::ORIGIN,
+//! );
 //! let worker = WorkerState {
 //!     id: 1,
 //!     capacity: Resources::new().with(MEMORY, gb(8.0)).with(SLOTS, 1),

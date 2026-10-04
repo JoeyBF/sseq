@@ -63,13 +63,12 @@
 //! policy.handle(Input::Worker(worker), Time::ORIGIN);
 //!
 //! // Job 7 becomes ready: it expects to use 2 GB and belongs to group 3.
-//! let job = JobSpec {
-//!     id: 7,
+//! let spec = JobSpec {
 //!     demand: Resources::new().with(MEMORY, gb(2.0)),
 //!     group: 3,
 //!     ..Default::default()
 //! };
-//! policy.handle(Input::Submit(job), Time::ORIGIN);
+//! policy.handle(Input::Submit { job: 7, spec }, Time::ORIGIN);
 //!
 //! // After a batch of inputs, poll: start attempt 1 of job 7 on worker 1.
 //! assert_eq!(
@@ -99,8 +98,9 @@
 //!
 //! Workers and jobs, like configurations, are plain structs written as literals: name the fields
 //! that matter and take the rest from [`Default`]. Each type's `Default` documents what the
-//! omitted fields mean; a [`JobSpec`] needs little more than an id, a [`WorkerState`] an id and
-//! its capacity.
+//! omitted fields mean; a [`WorkerState`] needs little more than an id and its capacity, and a
+//! [`JobSpec`] often nothing at all. A job's id is not part of its spec: the caller picks it and
+//! passes it beside the spec in [`Input::Submit`], as every other message about the job names it.
 //!
 //! That is the whole protocol: [`handle`](Policy::handle) every event as it happens, then
 //! [`poll`](Policy::poll) and act on each output. `handle` applies an input at once but never
@@ -120,12 +120,9 @@
 //!     ..Default::default()
 //! };
 //! policy.handle(Input::Worker(worker), Time::ORIGIN);
-//! for id in 1..=3 {
-//!     let job = JobSpec {
-//!         id,
-//!         ..Default::default()
-//!     };
-//!     policy.handle(Input::Submit(job), Time::ORIGIN);
+//! for job in 1..=3 {
+//!     let spec = JobSpec::default();
+//!     policy.handle(Input::Submit { job, spec }, Time::ORIGIN);
 //! }
 //!
 //! // The caller's side: attempts sent to workers and not yet answered.
@@ -184,13 +181,10 @@
 //!     }),
 //!     Time::ORIGIN,
 //! );
-//! let job = JobSpec {
-//!     id: 1,
-//!     ..Default::default()
-//! };
+//! let submit = Input::Submit { job: 1, spec: JobSpec::default() };
 //!
-//! p.handle(Input::Submit(job.clone()), Time::ORIGIN);
-//! p.handle(Input::Submit(job.clone()), Time::ORIGIN); // already waiting: ignored
+//! p.handle(submit.clone(), Time::ORIGIN);
+//! p.handle(submit.clone(), Time::ORIGIN); // already waiting: ignored
 //! assert_eq!(
 //!     p.poll(Time::ORIGIN),
 //!     [Output::Start {
@@ -199,7 +193,7 @@
 //!         worker: 1
 //!     }]
 //! );
-//! p.handle(Input::Submit(job.clone()), Time(Duration::from_secs(1))); // already running: ignored
+//! p.handle(submit.clone(), Time(Duration::from_secs(1))); // already running: ignored
 //! assert!(p.poll(Time(Duration::from_secs(1))).is_empty());
 //!
 //! p.handle(
@@ -213,7 +207,7 @@
 //! assert!(p.poll(Time(Duration::from_secs(2))).is_empty());
 //!
 //! // Once complete, the id is free again: a new submission is a new job.
-//! p.handle(Input::Submit(job), Time(Duration::from_secs(3)));
+//! p.handle(submit, Time(Duration::from_secs(3)));
 //! assert_eq!(
 //!     p.poll(Time(Duration::from_secs(3))),
 //!     [Output::Start {
@@ -255,12 +249,9 @@
 //!     why: why.into(),
 //! };
 //!
-//! for id in [5, 6] {
-//!     let job = JobSpec {
-//!         id,
-//!         ..Default::default()
-//!     };
-//!     p.handle(Input::Submit(job), Time::ORIGIN);
+//! for job in [5, 6] {
+//!     let spec = JobSpec::default();
+//!     p.handle(Input::Submit { job, spec }, Time::ORIGIN);
 //! }
 //! assert_eq!(
 //!     p.poll(Time::ORIGIN),
@@ -337,10 +328,7 @@
 //!     Time::ORIGIN,
 //! );
 //! p.handle(
-//!     Input::Submit(JobSpec {
-//!         id: 5,
-//!         ..Default::default()
-//!     }),
+//!     Input::Submit { job: 5, spec: JobSpec::default() },
 //!     Time::ORIGIN,
 //! );
 //!
@@ -404,12 +392,9 @@
 //!     }),
 //!     Time::ORIGIN,
 //! );
-//! let job = |id| JobSpec {
-//!     id,
-//!     ..Default::default()
-//! };
-//! p.handle(Input::Submit(job(1)), Time::ORIGIN);
-//! p.handle(Input::Submit(job(2)), Time::ORIGIN);
+//! for job in [1, 2] {
+//!     p.handle(Input::Submit { job, spec: JobSpec::default() }, Time::ORIGIN);
+//! }
 //! assert_eq!(
 //!     p.poll(Time::ORIGIN),
 //!     [Output::Start {
@@ -455,10 +440,7 @@
 //!     );
 //! }
 //! p.handle(
-//!     Input::Submit(JobSpec {
-//!         id: 5,
-//!         ..Default::default()
-//!     }),
+//!     Input::Submit { job: 5, spec: JobSpec::default() },
 //!     Time::ORIGIN,
 //! );
 //! assert_eq!(
@@ -517,10 +499,7 @@
 //!     );
 //! }
 //! p.handle(
-//!     Input::Submit(JobSpec {
-//!         id: 5,
-//!         ..Default::default()
-//!     }),
+//!     Input::Submit { job: 5, spec: JobSpec::default() },
 //!     Time::ORIGIN,
 //! );
 //! assert_eq!(
@@ -595,19 +574,23 @@
 //!     Time::ORIGIN,
 //! );
 //! p.handle(
-//!     Input::Submit(JobSpec {
-//!         id: 1,
-//!         demand: Resources::new().with(MEMORY, gb(6.0)),
-//!         ..Default::default()
-//!     }),
+//!     Input::Submit {
+//!         job: 1,
+//!         spec: JobSpec {
+//!             demand: Resources::new().with(MEMORY, gb(6.0)),
+//!             ..Default::default()
+//!         },
+//!     },
 //!     Time::ORIGIN,
 //! );
 //! p.handle(
-//!     Input::Submit(JobSpec {
-//!         id: 2,
-//!         demand: Resources::new().with(MEMORY, gb(6.0)),
-//!         ..Default::default()
-//!     }),
+//!     Input::Submit {
+//!         job: 2,
+//!         spec: JobSpec {
+//!             demand: Resources::new().with(MEMORY, gb(6.0)),
+//!             ..Default::default()
+//!         },
+//!     },
 //!     Time::ORIGIN,
 //! );
 //!
@@ -674,11 +657,13 @@
 //! };
 //! p.handle(Input::Worker(worker.clone()), Time::ORIGIN);
 //! p.handle(
-//!     Input::Submit(JobSpec {
-//!         id: 1,
-//!         demand: Resources::new().with(MEMORY, gb(3.0)),
-//!         ..Default::default()
-//!     }),
+//!     Input::Submit {
+//!         job: 1,
+//!         spec: JobSpec {
+//!             demand: Resources::new().with(MEMORY, gb(3.0)),
+//!             ..Default::default()
+//!         },
+//!     },
 //!     Time::ORIGIN,
 //! );
 //! assert_eq!(
@@ -698,11 +683,13 @@
 //! };
 //! p.handle(Input::Worker(heartbeat), Time(Duration::from_secs(5)));
 //! p.handle(
-//!     Input::Submit(JobSpec {
-//!         id: 2,
-//!         demand: Resources::new().with(MEMORY, gb(3.0)),
-//!         ..Default::default()
-//!     }),
+//!     Input::Submit {
+//!         job: 2,
+//!         spec: JobSpec {
+//!             demand: Resources::new().with(MEMORY, gb(3.0)),
+//!             ..Default::default()
+//!         },
+//!     },
 //!     Time(Duration::from_secs(5)),
 //! );
 //! // max(8, 1 + 3) + 3 = 11 GB > 10 GB.
@@ -729,19 +716,23 @@
 //!     Time::ORIGIN,
 //! );
 //! p.handle(
-//!     Input::Submit(JobSpec {
-//!         id: 1,
-//!         demand: Resources::new().with(MEMORY, gb(50.0)),
-//!         ..Default::default()
-//!     }),
+//!     Input::Submit {
+//!         job: 1,
+//!         spec: JobSpec {
+//!             demand: Resources::new().with(MEMORY, gb(50.0)),
+//!             ..Default::default()
+//!         },
+//!     },
 //!     Time::ORIGIN,
 //! );
 //! p.handle(
-//!     Input::Submit(JobSpec {
-//!         id: 2,
-//!         demand: Resources::new().with(MEMORY, gb(1.0)),
-//!         ..Default::default()
-//!     }),
+//!     Input::Submit {
+//!         job: 2,
+//!         spec: JobSpec {
+//!             demand: Resources::new().with(MEMORY, gb(1.0)),
+//!             ..Default::default()
+//!         },
+//!     },
 //!     Time::ORIGIN,
 //! );
 //! // Job 1 is five times the memory but runs alone; job 2 must wait for it.
@@ -764,11 +755,13 @@
 //!     Time(Duration::from_secs(1)),
 //! );
 //! p.handle(
-//!     Input::Submit(JobSpec {
-//!         id: 3,
-//!         demand: Resources::new().with(MEMORY, gb(500.0)),
-//!         ..Default::default()
-//!     }),
+//!     Input::Submit {
+//!         job: 3,
+//!         spec: JobSpec {
+//!             demand: Resources::new().with(MEMORY, gb(500.0)),
+//!             ..Default::default()
+//!         },
+//!     },
 //!     Time(Duration::from_secs(1)),
 //! );
 //! assert_eq!(
@@ -787,10 +780,10 @@
 //!     ]
 //! );
 //! p.handle(
-//!     Input::Submit(JobSpec {
-//!         id: 4,
-//!         ..Default::default()
-//!     }),
+//!     Input::Submit {
+//!         job: 4,
+//!         spec: JobSpec::default(),
+//!     },
 //!     Time(Duration::from_secs(2)),
 //! );
 //! assert!(p.poll(Time(Duration::from_secs(2))).is_empty());
@@ -817,12 +810,8 @@
 //!     ..Default::default()
 //! };
 //! p.handle(Input::Worker(gpu), Time::ORIGIN);
-//! for id in 1..=3 {
-//!     let job = JobSpec {
-//!         id,
-//!         ..Default::default()
-//!     };
-//!     p.handle(Input::Submit(job), Time::ORIGIN);
+//! for job in 1..=3 {
+//!     p.handle(Input::Submit { job, spec: JobSpec::default() }, Time::ORIGIN);
 //! }
 //! // (running + 1) * 4 GB <= 10 GB admits two jobs.
 //! assert_eq!(p.poll(Time::ORIGIN).len(), 2);
@@ -866,21 +855,19 @@
 //!     p.handle(Input::Worker(worker), Time::ORIGIN);
 //! }
 //! // Jobs 1 to 3 need a GPU each; job 4 needs none.
-//! for id in 1..=4 {
-//!     let job = JobSpec {
-//!         id,
-//!         demand: Resources::new().with(GPUS, (id < 4).into()),
+//! for job in 1..=4 {
+//!     let spec = JobSpec {
+//!         demand: Resources::new().with(GPUS, (job < 4).into()),
 //!         ..Default::default()
 //!     };
-//!     p.handle(Input::Submit(job), Time::ORIGIN);
+//!     p.handle(Input::Submit { job, spec }, Time::ORIGIN);
 //! }
 //! // Job 5 needs a TPU, which this configuration does not declare.
-//! let tpu_job = JobSpec {
-//!     id: 5,
+//! let spec = JobSpec {
 //!     demand: Resources::new().with(Resource::new("tpus"), 1),
 //!     ..Default::default()
 //! };
-//! p.handle(Input::Submit(tpu_job), Time::ORIGIN);
+//! p.handle(Input::Submit { job: 5, spec }, Time::ORIGIN);
 //!
 //! let start = |job, worker| Output::Start {
 //!     job,
@@ -965,13 +952,12 @@
 //!     }),
 //!     Time::ORIGIN,
 //! );
-//! for id in 1..=3 {
-//!     let job = JobSpec {
-//!         id,
+//! for job in 1..=3 {
+//!     let spec = JobSpec {
 //!         demand: Resources::new().with(MEMORY, gb(50.0)),
 //!         ..Default::default()
 //!     };
-//!     p.handle(Input::Submit(job), Time::ORIGIN);
+//!     p.handle(Input::Submit { job, spec }, Time::ORIGIN);
 //! }
 //! assert_eq!(p.poll(Time::ORIGIN).len(), 2);
 //! ```
@@ -999,15 +985,16 @@
 //!     };
 //!     p.handle(Input::Worker(worker), Time::ORIGIN);
 //! }
-//! let job = |id, constraints| JobSpec {
-//!     id,
+//! let constrained = |constraints| JobSpec {
 //!     constraints,
 //!     ..Default::default()
 //! };
 //! let gpu = Constraint::require_class("gpu");
-//! p.handle(Input::Submit(job(1, vec![gpu.clone()])), Time::ORIGIN);
+//! let spec = constrained(vec![gpu.clone()]);
+//! p.handle(Input::Submit { job: 1, spec }, Time::ORIGIN);
 //! let not_2 = Constraint::forbid_worker(2);
-//! p.handle(Input::Submit(job(2, vec![gpu, not_2])), Time::ORIGIN);
+//! let spec = constrained(vec![gpu, not_2]);
+//! p.handle(Input::Submit { job: 2, spec }, Time::ORIGIN);
 //! assert_eq!(
 //!     p.poll(Time::ORIGIN),
 //!     [
@@ -1026,10 +1013,8 @@
 //!
 //! // No worker has the class: the job waits, and says why.
 //! let tpu = Constraint::require_class("tpu");
-//! p.handle(
-//!     Input::Submit(job(3, vec![tpu])),
-//!     Time(Duration::from_secs(1)),
-//! );
+//! let spec = constrained(vec![tpu]);
+//! p.handle(Input::Submit { job: 3, spec }, Time(Duration::from_secs(1)));
 //! assert!(p.poll(Time(Duration::from_secs(1))).is_empty());
 //! let why = p.explain(3).unwrap();
 //! let verdicts = &why.waiting().unwrap().workers;
@@ -1065,11 +1050,7 @@
 //!         Time::ORIGIN,
 //!     );
 //! }
-//! let job = |id| JobSpec {
-//!     id,
-//!     ..Default::default()
-//! };
-//! p.handle(Input::Submit(job(1)), Time::ORIGIN);
+//! p.handle(Input::Submit { job: 1, spec: JobSpec::default() }, Time::ORIGIN);
 //! assert_eq!(
 //!     p.poll(Time::ORIGIN),
 //!     [Output::Start {
@@ -1081,12 +1062,12 @@
 //!
 //! // Worker 1 is busier, but job 2 prefers it; job 3 has no preference.
 //! let fond = JobSpec {
-//!     id: 2,
 //!     constraints: vec![Constraint::prefer_worker(1)],
 //!     ..Default::default()
 //! };
-//! p.handle(Input::Submit(fond), Time(Duration::from_secs(1)));
-//! p.handle(Input::Submit(job(3)), Time(Duration::from_secs(1)));
+//! let later = Time(Duration::from_secs(1));
+//! p.handle(Input::Submit { job: 2, spec: fond }, later);
+//! p.handle(Input::Submit { job: 3, spec: JobSpec::default() }, later);
 //! assert_eq!(
 //!     p.poll(Time(Duration::from_secs(1))),
 //!     [
@@ -1127,19 +1108,14 @@
 //!         Time::ORIGIN,
 //!     );
 //! }
-//! let job = |id, constraint| JobSpec {
-//!     id,
+//! let constrained = |constraint| JobSpec {
 //!     constraints: vec![constraint],
 //!     ..Default::default()
 //! };
-//! p.handle(
-//!     Input::Submit(job(1, Constraint::prefer_worker(2))),
-//!     Time::ORIGIN,
-//! );
-//! p.handle(
-//!     Input::Submit(job(2, Constraint::avoid_worker(1))),
-//!     Time::ORIGIN,
-//! );
+//! let spec = constrained(Constraint::prefer_worker(2));
+//! p.handle(Input::Submit { job: 1, spec }, Time::ORIGIN);
+//! let spec = constrained(Constraint::avoid_worker(1));
+//! p.handle(Input::Submit { job: 2, spec }, Time::ORIGIN);
 //! assert_eq!(
 //!     p.poll(Time::ORIGIN),
 //!     [Output::Start {
@@ -1203,18 +1179,17 @@
 //!         }),
 //!         Time::ORIGIN,
 //!     );
-//!     // (id, group, weight, work, due)
+//!     // (job, group, weight, work, due)
 //!     let jobs = [(1, 5, 1.0, 10, 100), (2, 3, 1.0, 1, 50), (3, 5, 4.0, 5, 20)];
-//!     for (id, group, weight, work, due) in jobs {
+//!     for (job, group, weight, work, due) in jobs {
 //!         let spec = JobSpec {
-//!             id,
 //!             group,
 //!             weight,
 //!             work: Some(Duration::from_secs(work)),
 //!             due: Some(Time(Duration::from_secs(due))),
 //!             ..Default::default()
 //!         };
-//!         p.handle(Input::Submit(spec), Time::ORIGIN);
+//!         p.handle(Input::Submit { job, spec }, Time::ORIGIN);
 //!     }
 //!     let (mut order, mut now) = (Vec::new(), Time::ORIGIN);
 //!     while order.len() < 3 {
@@ -1274,13 +1249,12 @@
 //!     }),
 //!     Time::ORIGIN,
 //! );
-//! for (id, priority) in [(1, Some(1)), (2, None), (3, Some(-1))] {
+//! for (job, priority) in [(1, Some(1)), (2, None), (3, Some(-1))] {
 //!     let spec = JobSpec {
-//!         id,
 //!         priority,
 //!         ..Default::default()
 //!     };
-//!     p.handle(Input::Submit(spec), Time::ORIGIN);
+//!     p.handle(Input::Submit { job, spec }, Time::ORIGIN);
 //! }
 //! let mut order: Vec<JobId> = Vec::new();
 //! for now in [0, 1, 2].map(|s| Time(Duration::from_secs(s))) {
@@ -1330,12 +1304,11 @@
 //!         }),
 //!         Time::ORIGIN,
 //!     );
-//!     let job = JobSpec {
-//!         id: 1,
+//!     let spec = JobSpec {
 //!         demand: Resources::new().with(MEMORY, gb(10.0)),
 //!         ..Default::default()
 //!     };
-//!     p.handle(Input::Submit(job), Time::ORIGIN);
+//!     p.handle(Input::Submit { job: 1, spec }, Time::ORIGIN);
 //!     match p.poll(Time::ORIGIN)[..] {
 //!         [Output::Start { worker, .. }] => worker,
 //!         ref out => panic!("{out:?}"),
@@ -1372,10 +1345,7 @@
 //! };
 //! p.handle(Input::Worker(fast), Time::ORIGIN);
 //! p.handle(
-//!     Input::Submit(JobSpec {
-//!         id: 1,
-//!         ..Default::default()
-//!     }),
+//!     Input::Submit { job: 1, spec: JobSpec::default() },
 //!     Time::ORIGIN,
 //! );
 //! assert_eq!(
@@ -1419,19 +1389,27 @@
 //!         }),
 //!         Time::ORIGIN,
 //!     );
-//!     let job = |id| JobSpec {
-//!         id,
-//!         ..Default::default()
-//!     };
-//!     p.handle(Input::Submit(job(1)), Time::ORIGIN);
-//!     p.handle(Input::Submit(job(2)), Time::ORIGIN);
+//!     for job in [1, 2] {
+//!         p.handle(
+//!             Input::Submit {
+//!                 job,
+//!                 spec: JobSpec::default(),
+//!             },
+//!             Time::ORIGIN,
+//!         );
+//!     }
 //!     p.poll(Time::ORIGIN);
 //!     let urgent = JobSpec {
-//!         id: 3,
 //!         priority: Some(-1),
 //!         ..Default::default()
 //!     };
-//!     p.handle(Input::Submit(urgent), Time(Duration::from_secs(50)));
+//!     p.handle(
+//!         Input::Submit {
+//!             job: 3,
+//!             spec: urgent,
+//!         },
+//!         Time(Duration::from_secs(50)),
+//!     );
 //!     p.handle(
 //!         Input::Done { job: 1, attempt: 1 },
 //!         Time(Duration::from_secs(150)),
@@ -1461,8 +1439,9 @@
 //! let capacity = Resources::new().with(MEMORY, gb(10.0)).with(SLOTS, 3);
 //! let worker = WorkerState { id: 1, capacity, ..Default::default() };
 //! p.handle(Input::Worker(worker), Time::ORIGIN);
-//! let job = |id, size| {
-//!     Input::Submit(JobSpec { id, demand: Resources::new().with(MEMORY, gb(size)), ..Default::default() })
+//! let job = |job, size| {
+//!     let demand = Resources::new().with(MEMORY, gb(size));
+//!     Input::Submit { job, spec: JobSpec { demand, ..Default::default() } }
 //! };
 //! let start = |job| Output::Start { job, attempt: 1, worker: 1 };
 //! let done = |job| Input::Done { job, attempt: 1 };
@@ -1527,15 +1506,14 @@
 //!     ..Default::default()
 //! };
 //! p.handle(Input::Worker(worker), Time::ORIGIN);
-//! let job = |id, size, work| JobSpec {
-//!     id,
+//! let spec = |size, work| JobSpec {
 //!     demand: Resources::new().with(MEMORY, gb(size)),
 //!     work: Some(Duration::from_secs(work)),
 //!     ..Default::default()
 //! };
 //!
-//! p.handle(Input::Submit(job(1, 4.0, 100)), Time::ORIGIN);
-//! p.handle(Input::Submit(job(9, 8.0, 100)), Time::ORIGIN);
+//! p.handle(Input::Submit { job: 1, spec: spec(4.0, 100) }, Time::ORIGIN);
+//! p.handle(Input::Submit { job: 9, spec: spec(8.0, 100) }, Time::ORIGIN);
 //! assert_eq!(
 //!     p.poll(Time::ORIGIN),
 //!     [Output::Start {
@@ -1545,14 +1523,9 @@
 //!     }]
 //! );
 //!
-//! p.handle(
-//!     Input::Submit(job(2, 4.0, 50)),
-//!     Time(Duration::from_secs(60)),
-//! );
-//! p.handle(
-//!     Input::Submit(job(3, 4.0, 30)),
-//!     Time(Duration::from_secs(60)),
-//! );
+//! let t = Time(Duration::from_secs(60));
+//! p.handle(Input::Submit { job: 2, spec: spec(4.0, 50) }, t);
+//! p.handle(Input::Submit { job: 3, spec: spec(4.0, 30) }, t);
 //! assert_eq!(
 //!     p.poll(Time(Duration::from_secs(60))),
 //!     [Output::Start {
@@ -1580,9 +1553,9 @@
 //! let capacity = Resources::new().with(MEMORY, gb(10.0)).with(SLOTS, 2);
 //! let worker = WorkerState { id: 1, capacity, ..Default::default() };
 //! p.handle(Input::Worker(worker), Time::ORIGIN);
-//! let job = |id| JobSpec { id, demand: Resources::new().with(MEMORY, gb(6.0)), ..Default::default() };
-//! p.handle(Input::Submit(job(1)), Time::ORIGIN); // runs for ever
-//! p.handle(Input::Submit(job(2)), Time::ORIGIN);
+//! let spec = JobSpec { demand: Resources::new().with(MEMORY, gb(6.0)), ..Default::default() };
+//! p.handle(Input::Submit { job: 1, spec: spec.clone() }, Time::ORIGIN); // runs for ever
+//! p.handle(Input::Submit { job: 2, spec }, Time::ORIGIN);
 //! p.poll(Time::ORIGIN);
 //!
 //! // No events arrive: poll whenever the policy asks to.
@@ -1639,11 +1612,7 @@
 //!         ..Default::default()
 //!     };
 //!     p.handle(Input::Worker(fast), Time::ORIGIN);
-//!     let job = JobSpec {
-//!         id: 1,
-//!         ..Default::default()
-//!     };
-//!     p.handle(Input::Submit(job), Time::ORIGIN);
+//!     p.handle(Input::Submit { job: 1, spec: JobSpec::default() }, Time::ORIGIN);
 //!     match p.poll(Time::ORIGIN)[..] {
 //!         [Output::Start { worker, .. }] => worker,
 //!         ref out => panic!("{out:?}"),
@@ -1685,26 +1654,19 @@
 //!
 //! // Run jobs of 30 s of work on each worker in turn, pinned there by class.
 //! let work = Duration::from_secs(30);
-//! let (mut now, mut id) = (Time::ORIGIN, 0);
+//! let (mut now, mut job) = (Time::ORIGIN, 0);
 //! for _ in 0..Learn::default().min_samples {
 //!     for (class, true_speed) in [("a", 1.0), ("b", 3.0)] {
 //!         let spec = JobSpec {
-//!             id,
 //!             work: Some(work),
 //!             constraints: vec![Constraint::require_class(class)],
 //!             ..Default::default()
 //!         };
-//!         p.handle(Input::Submit(spec), now);
+//!         p.handle(Input::Submit { job, spec }, now);
 //!         p.poll(now);
 //!         now += work.div_f64(true_speed);
-//!         p.handle(
-//!             Input::Done {
-//!                 job: id,
-//!                 attempt: 1,
-//!             },
-//!             now,
-//!         );
-//!         id += 1;
+//!         p.handle(Input::Done { job, attempt: 1 }, now);
+//!         job += 1;
 //!     }
 //! }
 //! let speeds: Vec<f64> = p.stats().workers.iter().map(|w| w.speed).collect();
@@ -1745,7 +1707,7 @@
 //!         p.handle(Input::Worker(worker), Time::ORIGIN);
 //!     }
 //!     let work = Duration::from_secs(8);
-//!     let (mut now, mut id) = (Time::ORIGIN, 0);
+//!     let (mut now, mut job) = (Time::ORIGIN, 0);
 //!     for _ in 0..20 {
 //!         let runs = [
 //!             ("a", "x", 4.0),
@@ -1755,23 +1717,16 @@
 //!         ];
 //!         for (kind, class, true_speed) in runs {
 //!             let spec = JobSpec {
-//!                 id,
 //!                 work: Some(work),
 //!                 kind: Some(kind.into()),
 //!                 constraints: vec![Constraint::require_class(class)],
 //!                 ..Default::default()
 //!             };
-//!             p.handle(Input::Submit(spec), now);
+//!             p.handle(Input::Submit { job, spec }, now);
 //!             p.poll(now);
 //!             now += work.div_f64(true_speed);
-//!             p.handle(
-//!                 Input::Done {
-//!                     job: id,
-//!                     attempt: 1,
-//!                 },
-//!                 now,
-//!             );
-//!             id += 1;
+//!             p.handle(Input::Done { job, attempt: 1 }, now);
+//!             job += 1;
 //!         }
 //!     }
 //!     (p, now)
@@ -1781,12 +1736,11 @@
 //! fn place(timing: Timing, kind: &str) -> u64 {
 //!     let (mut p, now) = trained(timing);
 //!     let spec = JobSpec {
-//!         id: 1000,
 //!         work: Some(Duration::from_secs(8)),
 //!         kind: Some(kind.into()),
 //!         ..Default::default()
 //!     };
-//!     p.handle(Input::Submit(spec), now);
+//!     p.handle(Input::Submit { job: 1000, spec }, now);
 //!     match p.poll(now)[..] {
 //!         [Output::Start { worker, .. }] => worker,
 //!         ref out => panic!("{out:?}"),
@@ -1843,14 +1797,13 @@
 //!     ..Default::default()
 //! };
 //! p.handle(Input::Worker(fast), Time::ORIGIN);
-//! let job = |id, work| JobSpec {
-//!     id,
+//! let spec = |work| JobSpec {
 //!     work: Some(Duration::from_secs(work)),
 //!     ..Default::default()
 //! };
 //!
 //! // Job 1 takes the fast worker until 10 / 4 = 2.5 s.
-//! p.handle(Input::Submit(job(1, 10)), Time::ORIGIN);
+//! p.handle(Input::Submit { job: 1, spec: spec(10) }, Time::ORIGIN);
 //! assert_eq!(
 //!     p.poll(Time::ORIGIN),
 //!     [Output::Start {
@@ -1861,7 +1814,7 @@
 //! );
 //!
 //! // Job 2 would take 40 s on the slow worker, or 2.5 + 10 s on the fast one: it waits.
-//! p.handle(Input::Submit(job(2, 40)), Time::ORIGIN);
+//! p.handle(Input::Submit { job: 2, spec: spec(40) }, Time::ORIGIN);
 //! assert!(p.poll(Time::ORIGIN).is_empty());
 //! assert_eq!(p.stats().deferred, [(2, 2, Time(Duration::from_millis(2500)))]);
 //! assert!(matches!(
@@ -1909,11 +1862,10 @@
 //!     Time::ORIGIN,
 //! );
 //! let spec = JobSpec {
-//!     id: 1,
 //!     work: Some(Duration::from_secs(40)),
 //!     ..Default::default()
 //! };
-//! p.handle(Input::Submit(spec), Time::ORIGIN);
+//! p.handle(Input::Submit { job: 1, spec }, Time::ORIGIN);
 //! assert_eq!(
 //!     p.poll(Time::ORIGIN),
 //!     [Output::Start {
@@ -1960,8 +1912,9 @@
 //!
 //! [`DagScheduler`] puts a dependency layer in front of any policy and is itself a [`Policy`]. Jobs
 //! are *declared* with their dependencies, possibly long before they can run; each is submitted to
-//! the inner policy when its last dependency completes. Everything else (workers, reports,
-//! explanations) goes through as before.
+//! the inner policy when its last dependency completes. A [`DagJob`] is a job's id, the ids it
+//! depends on and the [`JobSpec`] it is submitted with. Everything else (workers, reports,
+//! explanations) passes through to the inner policy.
 //!
 //! ```
 //! use std::time::Duration;
@@ -1980,15 +1933,6 @@
 //!     }),
 //!     Time::ORIGIN,
 //! );
-//! // A job and the jobs it waits for.
-//! let job = |id, deps| DagJob {
-//!     spec: JobSpec {
-//!         id,
-//!         ..Default::default()
-//!     },
-//!     deps,
-//!     ..Default::default()
-//! };
 //! let start = |job| Output::Start {
 //!     job,
 //!     attempt: 1,
@@ -1997,10 +1941,25 @@
 //!
 //! // A diamond: 1 -> {2, 3} -> 4.
 //! let jobs = [
-//!     job(1, vec![]),
-//!     job(2, vec![1]),
-//!     job(3, vec![1]),
-//!     job(4, vec![2, 3]),
+//!     DagJob {
+//!         id: 1,
+//!         ..Default::default()
+//!     },
+//!     DagJob {
+//!         id: 2,
+//!         deps: vec![1],
+//!         ..Default::default()
+//!     },
+//!     DagJob {
+//!         id: 3,
+//!         deps: vec![1],
+//!         ..Default::default()
+//!     },
+//!     DagJob {
+//!         id: 4,
+//!         deps: vec![2, 3],
+//!         ..Default::default()
+//!     },
 //! ];
 //! dag.declare(jobs, Time::ORIGIN).unwrap();
 //! assert_eq!(dag.poll(Time::ORIGIN), [start(1)]);
@@ -2059,26 +2018,12 @@
 //!     }),
 //!     Time::ORIGIN,
 //! );
-//! let job = |id, deps| DagJob {
-//!     spec: JobSpec {
-//!         id,
-//!         ..Default::default()
-//!     },
-//!     deps,
-//!     ..Default::default()
-//! };
 //!
 //! // Load locally (1), then a barrier (2), then compute (3).
 //! let jobs = [
-//!     DagJob {
-//!         local: true,
-//!         ..job(1, vec![])
-//!     },
-//!     DagJob {
-//!         passthrough: true,
-//!         ..job(2, vec![1])
-//!     },
-//!     job(3, vec![2]),
+//!     DagJob { id: 1, local: true, ..Default::default() },
+//!     DagJob { id: 2, deps: vec![1], passthrough: true, ..Default::default() },
+//!     DagJob { id: 3, deps: vec![2], ..Default::default() },
 //! ];
 //! dag.declare(jobs, Time::ORIGIN).unwrap();
 //! assert_eq!(dag.poll(Time::ORIGIN), [Output::RunLocal { job: 1 }]);
@@ -2124,13 +2069,7 @@
 //!     Time::ORIGIN,
 //! );
 //!
-//! let job = DagJob {
-//!     spec: JobSpec {
-//!         id: 1,
-//!         ..Default::default()
-//!     },
-//!     ..Default::default()
-//! };
+//! let job = DagJob { id: 1, ..Default::default() };
 //! dag.declare([job], Time::ORIGIN).unwrap();
 //! assert_eq!(dag.announcements(), [Output::Ready { job: 1 }]);
 //! assert_eq!(dag.explain(1).unwrap().status, whelm::Status::Held);
@@ -2281,8 +2220,9 @@
 //!
 //! ## Ranks
 //!
-//! The layer computes each job's *upward rank*: its work plus the longest chain of work below it,
-//! through its unit and the units that depend on it ([`DagScheduler::rank`]). Jobs are submitted
+//! The layer computes each job's *upward rank*: its work (its spec's [`work`](JobSpec::work), or
+//! [`DagConfig::default_work`] if unset) plus the longest chain of work below it, through its unit
+//! and the units that depend on it ([`DagScheduler::rank`]). Jobs are submitted
 //! with it as [`JobSpec::rank`], and [`OrderTerm::Rank`] orders by it, longest remaining chain
 //! first, as HEFT does. That keeps the critical path moving.
 //!
@@ -2305,20 +2245,12 @@
 //!         }),
 //!         Time::ORIGIN,
 //!     );
-//!     let job = |id, deps| DagJob {
-//!         spec: JobSpec {
-//!             id,
-//!             ..Default::default()
-//!         },
-//!         deps,
-//!         ..Default::default()
-//!     };
 //!     dag.declare(
 //!         [
-//!             job(1, vec![]),
-//!             job(2, vec![]),
-//!             job(3, vec![2]),
-//!             job(4, vec![3]),
+//!             DagJob { id: 1, ..Default::default() },
+//!             DagJob { id: 2, ..Default::default() },
+//!             DagJob { id: 3, deps: vec![2], ..Default::default() },
+//!             DagJob { id: 4, deps: vec![3], ..Default::default() },
 //!         ],
 //!         Time::ORIGIN,
 //!     )
@@ -2372,14 +2304,7 @@
 //!     completed: vec![0, 1],
 //!     ..Default::default()
 //! };
-//! let after = DagJob {
-//!     spec: JobSpec {
-//!         id: 20,
-//!         ..Default::default()
-//!     },
-//!     deps: vec![10],
-//!     ..Default::default()
-//! };
+//! let after = DagJob { id: 20, deps: vec![10], ..Default::default() };
 //! dag.declare([unit, after.into()], Time::ORIGIN).unwrap();
 //! assert_eq!(
 //!     dag.poll(Time::ORIGIN),
@@ -2432,16 +2357,11 @@
 //!     ..Default::default()
 //! };
 //! dag.handle(Input::Worker(worker.clone()), Time::ORIGIN);
-//! let job = |id, deps| DagJob {
-//!     spec: JobSpec {
-//!         id,
-//!         ..Default::default()
-//!     },
-//!     deps,
-//!     ..Default::default()
-//! };
-//! dag.declare([job(1, vec![]), job(2, vec![1])], Time::ORIGIN)
-//!     .unwrap();
+//! let jobs = [
+//!     DagJob { id: 1, ..Default::default() },
+//!     DagJob { id: 2, deps: vec![1], ..Default::default() },
+//! ];
+//! dag.declare(jobs, Time::ORIGIN).unwrap();
 //! dag.poll(Time::ORIGIN);
 //! dag.handle(
 //!     Input::Done { job: 1, attempt: 1 },
@@ -2499,14 +2419,10 @@
 //! });
 //!
 //! std::thread::scope(|s| {
-//!     for id in 1..=3 {
+//!     for job in 1..=3 {
 //!         let shared = &shared;
 //!         s.spawn(move || {
-//!             let job = JobSpec {
-//!                 id,
-//!                 ..Default::default()
-//!             };
-//!             let lease = shared.lease(job); // blocks
+//!             let lease = shared.lease(job, JobSpec::default()); // blocks
 //!             assert_eq!((lease.worker(), lease.attempt()), (1, 1));
 //!             // ... send the task to lease.worker() and wait for its reply ...
 //!             lease.complete();
@@ -2541,10 +2457,7 @@
 //!     });
 //! }
 //!
-//! let lease = shared.lease(JobSpec {
-//!     id: 1,
-//!     ..Default::default()
-//! });
+//! let lease = shared.lease(1, JobSpec::default());
 //! assert_eq!(lease.worker(), 1);
 //! let retry = lease.fail(FailKind::Timeout, "no reply").unwrap();
 //! assert_eq!((retry.worker(), retry.attempt()), (2, 2));
@@ -2585,12 +2498,15 @@
 //!     }),
 //!     Time::ORIGIN,
 //! );
-//! let job = |id| JobSpec {
-//!     id,
-//!     ..Default::default()
-//! };
-//! p.handle(Input::Submit(job(1)), Time::ORIGIN);
-//! p.handle(Input::Submit(job(2)), Time::ORIGIN);
+//! for job in [1, 2] {
+//!     p.handle(
+//!         Input::Submit {
+//!             job,
+//!             spec: JobSpec::default(),
+//!         },
+//!         Time::ORIGIN,
+//!     );
+//! }
 //! p.poll(Time::ORIGIN);
 //! p.handle(
 //!     Input::Done { job: 1, attempt: 1 },
@@ -2646,12 +2562,13 @@
 //! }
 //!
 //! let script = || {
-//!     let job = |id| {
-//!         Input::Submit(JobSpec {
-//!             id,
-//!             demand: Resources::new().with(MEMORY, gb(4.0)),
-//!             ..Default::default()
-//!         })
+//!     let spec = JobSpec {
+//!         demand: Resources::new().with(MEMORY, gb(4.0)),
+//!         ..Default::default()
+//!     };
+//!     let submit = |job| Input::Submit {
+//!         job,
+//!         spec: spec.clone(),
 //!     };
 //!     let fail = Input::Failed {
 //!         job: 1,
@@ -2666,7 +2583,10 @@
 //!     };
 //!     vec![
 //!         (Time::ORIGIN, vec![Input::Worker(worker)]),
-//!         (Time(Duration::from_secs(1)), vec![job(1), job(2), job(3)]),
+//!         (
+//!             Time(Duration::from_secs(1)),
+//!             vec![submit(1), submit(2), submit(3)],
+//!         ),
 //!         (Time(Duration::from_secs(2)), vec![fail]),
 //!         (
 //!             Time(Duration::from_secs(3)),

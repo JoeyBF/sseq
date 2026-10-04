@@ -399,8 +399,8 @@ impl<P: Policy> DagScheduler<P> {
         let rec = self.unit(frame.unit);
         let offset = frame.template.leaf_offset(i);
         let leaf = frame.leaf0 + offset as u32;
+        let job = frame.base + offset as JobId;
         let mut spec = rec.spec.clone();
-        spec.id = frame.base + offset as JobId;
         if spec.work.is_none() {
             let own = match (rec.sourced, frame.template.node(i)) {
                 (true, _) => self.src().work(rec.id, leaf),
@@ -415,7 +415,7 @@ impl<P: Policy> DagScheduler<P> {
         if rec.sourced {
             self.src().spec(rec.id, leaf, &mut spec);
         }
-        self.policy.handle(Input::Submit(spec), now);
+        self.policy.handle(Input::Submit { job, spec }, now);
     }
 
     /// Free every frame of open unit `u`; returns its submitted and its held jobs.

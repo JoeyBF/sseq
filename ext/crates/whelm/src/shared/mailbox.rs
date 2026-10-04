@@ -178,20 +178,20 @@ impl<P: Policy> SharedPolicy<P> {
         }
     }
 
-    /// Submit `job` and wait for its start, at most until `deadline`.
+    /// Submit job `id` and wait for its start, at most until `deadline`.
     pub(super) fn lease_until(
         &self,
-        job: JobSpec,
+        id: JobId,
+        spec: JobSpec,
         deadline: Option<std::time::Instant>,
     ) -> Result<Lease<'_, P>, Box<JobSpec>> {
-        let id = job.id;
         let (mut s, now) = self.lock();
         assert!(!s.jobs.contains_key(&id), "job {id} is already leased");
         s.jobs.insert(
             id,
             Slot {
                 cv: Arc::new(Condvar::new()),
-                spec: job.clone(),
+                spec: spec.clone(),
                 asked: now,
                 held: None,
                 lost: false,
@@ -201,11 +201,11 @@ impl<P: Policy> SharedPolicy<P> {
                 rejected: None,
             },
         );
-        s.policy.handle(Input::Submit(job), now);
+        s.policy.handle(Input::Submit { job: id, spec }, now);
         Self::pump(&mut s, now);
         match self.wait(s, id, deadline) {
             Ok(lease) => Ok(lease),
-            Err(NoStart::Timeout(job)) => Err(job),
+            Err(NoStart::Timeout(spec)) => Err(spec),
             Err(NoStart::GaveUp(_)) => unreachable!("a job is given up only after failing"),
             Err(NoStart::Rejected(reason)) => panic!("job {id} was rejected: {reason}"),
         }

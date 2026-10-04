@@ -46,12 +46,12 @@ const SHOWN_DEPS: usize = 8;
 ///     }),
 ///     Time::ORIGIN,
 /// );
-/// for id in 1..=2 {
+/// for job in 1..=2 {
 ///     p.handle(
-///         Input::Submit(JobSpec {
-///             id,
-///             ..Default::default()
-///         }),
+///         Input::Submit {
+///             job,
+///             spec: JobSpec::default(),
+///         },
 ///         Time::ORIGIN,
 ///     );
 /// }

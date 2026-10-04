@@ -37,14 +37,13 @@ fn policy(workers: &[(WorkerId, usize)]) -> Scheduler {
 }
 
 /// A job that avoids (`soft`) or forbids every worker of `avoid`.
-fn job(id: JobId, avoid: &[WorkerId], soft: bool) -> JobSpec {
+fn job(avoid: &[WorkerId], soft: bool) -> JobSpec {
     let constraint = if soft {
         Constraint::avoid_worker
     } else {
         Constraint::forbid_worker
     };
     JobSpec {
-        id,
         demand: Resources::new().with(MEMORY, 1),
         constraints: avoid.iter().map(|&w| constraint(w)).collect(),
         ..Default::default()
@@ -55,8 +54,20 @@ fn job(id: JobId, avoid: &[WorkerId], soft: bool) -> JobSpec {
 #[test]
 fn soft_avoid_lapses_when_only_avoided_workers_are_live() {
     let mut p = policy(&[(1, 4)]);
-    p.handle(Input::Submit(job(10, &[1], false)), Time::ORIGIN);
-    p.handle(Input::Submit(job(11, &[1], true)), Time::ORIGIN);
+    p.handle(
+        Input::Submit {
+            job: 10,
+            spec: job(&[1], false),
+        },
+        Time::ORIGIN,
+    );
+    p.handle(
+        Input::Submit {
+            job: 11,
+            spec: job(&[1], true),
+        },
+        Time::ORIGIN,
+    );
     assert_eq!(starts(p.poll(Time::ORIGIN)), vec![(11, 1)]);
     // A worker the job does not avoid joins: the hard one runs there.
     p.handle(Input::Worker(worker(2, 4)), Time(Duration::from_secs(1)));
@@ -68,14 +79,29 @@ fn soft_avoid_lapses_when_only_avoided_workers_are_live() {
 #[test]
 fn soft_avoid_holds_while_another_worker_is_live() {
     let mut p = policy(&[(1, 4), (2, 1)]);
-    p.handle(Input::Submit(job(0, &[], false)), Time::ORIGIN);
+    p.handle(
+        Input::Submit {
+            job: 0,
+            spec: job(&[], false),
+        },
+        Time::ORIGIN,
+    );
     // Fill worker 2 explicitly by forbidding worker 1.
-    p.handle(Input::Submit(job(1, &[1], false)), Time::ORIGIN);
+    p.handle(
+        Input::Submit {
+            job: 1,
+            spec: job(&[1], false),
+        },
+        Time::ORIGIN,
+    );
     let placed = starts(p.poll(Time::ORIGIN));
     assert!(placed.contains(&(1, 2)), "{placed:?}");
     // Worker 2 is now full; a job avoiding worker 1 waits.
     p.handle(
-        Input::Submit(job(2, &[1], true)),
+        Input::Submit {
+            job: 2,
+            spec: job(&[1], true),
+        },
         Time(Duration::from_secs(1)),
     );
     let placed = starts(p.poll(Time(Duration::from_secs(1))));
@@ -99,9 +125,15 @@ fn soft_avoid_ignores_dead_and_foreign_workers() {
         }),
         Time::ORIGIN,
     );
-    let mut pinned = job(5, &[1], true);
+    let mut pinned = job(&[1], true);
     pinned.constraints.push(Constraint::require_class("x"));
-    p.handle(Input::Submit(pinned), Time::ORIGIN);
+    p.handle(
+        Input::Submit {
+            job: 5,
+            spec: pinned,
+        },
+        Time::ORIGIN,
+    );
     assert_eq!(starts(p.poll(Time::ORIGIN)), vec![(5, 1)]);
 }
 
@@ -110,8 +142,20 @@ fn soft_avoid_ignores_dead_and_foreign_workers() {
 #[test]
 fn retry_softly_avoids_the_worker_it_failed_on() {
     let mut p = policy(&[(1, 1), (2, 1)]);
-    p.handle(Input::Submit(job(0, &[], false)), Time::ORIGIN);
-    p.handle(Input::Submit(job(1, &[], false)), Time::ORIGIN);
+    p.handle(
+        Input::Submit {
+            job: 0,
+            spec: job(&[], false),
+        },
+        Time::ORIGIN,
+    );
+    p.handle(
+        Input::Submit {
+            job: 1,
+            spec: job(&[], false),
+        },
+        Time::ORIGIN,
+    );
     assert_eq!(starts(p.poll(Time::ORIGIN)), vec![(0, 1), (1, 2)]);
     p.handle(
         Input::Failed {

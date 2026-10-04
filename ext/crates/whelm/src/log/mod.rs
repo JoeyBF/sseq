@@ -35,11 +35,13 @@
 //!     p.handle(Input::Worker(worker), Time::ORIGIN);
 //! }
 //! p.handle(
-//!     Input::Submit(JobSpec {
-//!         id: 7,
-//!         demand: Resources::new().with(MEMORY, gb(1.0)),
-//!         ..Default::default()
-//!     }),
+//!     Input::Submit {
+//!         job: 7,
+//!         spec: JobSpec {
+//!             demand: Resources::new().with(MEMORY, gb(1.0)),
+//!             ..Default::default()
+//!         },
+//!     },
 //!     Time::ORIGIN,
 //! );
 //! assert_eq!(

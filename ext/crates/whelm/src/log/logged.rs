@@ -73,12 +73,11 @@ impl<P: Policy> Logged<P> {
     ///     ..Default::default()
     /// };
     /// p.handle(Input::Worker(w.clone()), Time::ORIGIN);
-    /// let job = JobSpec {
-    ///     id: 1,
+    /// let spec = JobSpec {
     ///     demand: Resources::new().with(MEMORY, gb(2.0)),
     ///     ..Default::default()
     /// };
-    /// p.handle(Input::Submit(job), Time::ORIGIN);
+    /// p.handle(Input::Submit { job: 1, spec }, Time::ORIGIN);
     /// p.poll(Time::ORIGIN);
     /// w.reported_used = Resources::new().with(MEMORY, gb(1.5));
     /// for t in [10, 20, 30] {
@@ -135,20 +134,24 @@ impl<P: Policy> Logged<P> {
     /// };
     /// p.annotate(1, info.clone());
     /// p.handle(
-    ///     Input::Submit(JobSpec {
-    ///         id: 1,
-    ///         demand: Resources::new().with(MEMORY, gb(1.0)),
-    ///         ..Default::default()
-    ///     }),
+    ///     Input::Submit {
+    ///         job: 1,
+    ///         spec: JobSpec {
+    ///             demand: Resources::new().with(MEMORY, gb(1.0)),
+    ///             ..Default::default()
+    ///         },
+    ///     },
     ///     Time::ORIGIN,
     /// );
     /// p.handle(Input::Cancel(1), Time(Duration::from_secs(1)));
     /// p.handle(
-    ///     Input::Submit(JobSpec {
-    ///         id: 1,
-    ///         demand: Resources::new().with(MEMORY, gb(1.0)),
-    ///         ..Default::default()
-    ///     }),
+    ///     Input::Submit {
+    ///         job: 1,
+    ///         spec: JobSpec {
+    ///             demand: Resources::new().with(MEMORY, gb(1.0)),
+    ///             ..Default::default()
+    ///         },
+    ///     },
     ///     Time(Duration::from_secs(2)),
     /// );
     ///
@@ -217,7 +220,7 @@ impl<P: Policy> Policy for Logged<P> {
     /// sampled after it is forwarded, so that the sample shows the policy's bookkeeping.
     fn handle(&mut self, input: Input, now: Time) {
         let info = match &input {
-            Input::Submit(spec) => self.info.remove(&spec.id).map(Box::new),
+            Input::Submit { job, .. } => self.info.remove(job).map(Box::new),
             _ => None,
         };
         self.sink.record(&Event::Input {

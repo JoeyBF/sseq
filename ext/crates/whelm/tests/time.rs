@@ -63,10 +63,9 @@ fn workers() -> [WorkerState; 2] {
     })
 }
 
-/// A job with work from tiny to the longest span, due at the end of time.
+/// Job `id`'s spec: work from tiny to the longest span by its parity, due at the end of time.
 fn job(id: JobId) -> JobSpec {
     JobSpec {
-        id,
         demand: Resources::new().with(MEMORY, 1),
         work: Some([Duration::from_nanos(1), Duration::MAX][id as usize % 2]),
         due: Some(END),
@@ -86,7 +85,13 @@ fn drive(p: &mut impl Policy) {
             p.handle(Input::Done { job, attempt }, now);
         }
         for id in 3 * i as JobId..3 * i as JobId + 3 {
-            p.handle(Input::Submit(job(id)), now);
+            p.handle(
+                Input::Submit {
+                    job: id,
+                    spec: job(id),
+                },
+                now,
+            );
         }
         for o in p.poll(now) {
             if let Output::Start { job, attempt, .. } = o {
@@ -116,8 +121,9 @@ fn logged_saturates() {
 fn dag_saturates() {
     let mut d = DagScheduler::new(DagConfig::default(), policy());
     let chain = (1000..1004).map(|id| DagJob {
-        spec: job(id),
+        id,
         deps: if id > 1000 { vec![id - 1] } else { vec![] },
+        spec: job(id),
         ..Default::default()
     });
     d.declare(chain, END).unwrap();
@@ -140,7 +146,7 @@ fn shared_clock_saturates() {
     }
     assert_eq!(shared.stats().now, END);
     shared
-        .lease_timeout(job(0), Duration::MAX)
+        .lease_timeout(0, job(0), Duration::MAX)
         .unwrap()
         .complete();
 }

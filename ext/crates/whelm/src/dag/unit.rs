@@ -21,34 +21,40 @@ use crate::{JobId, JobSpec};
 /// use std::time::Duration;
 ///
 /// use whelm::{
-///     Config, DagConfig, DagJob, DagScheduler, Input, JobSpec, MEMORY, Output, Policy, Resources,
-///     SLOTS, Scheduler, Time, WorkerState,
+///     Config, DagConfig, DagJob, DagScheduler, Input, Output, Policy, Resources, SLOTS,
+///     Scheduler, Time, WorkerState,
 /// };
 ///
 /// let mut dag = DagScheduler::new(DagConfig::default(), Scheduler::new(Config::fifo()));
 /// for id in [1, 2] {
 ///     let w = WorkerState {
 ///         id,
-///         capacity: Resources::new().with(MEMORY, 100).with(SLOTS, 1),
+///         capacity: Resources::new().with(SLOTS, 1),
 ///         ..Default::default()
 ///     };
 ///     dag.handle(Input::Worker(w), Time::ORIGIN);
 /// }
-/// let job = |id, deps| DagJob {
-///     spec: JobSpec {
-///         id,
-///         demand: Resources::new().with(MEMORY, 1),
-///         ..Default::default()
-///     },
-///     deps,
-///     ..Default::default()
-/// };
 /// dag.declare(
 ///     [
-///         job(1, vec![]),
-///         job(2, vec![1]),
-///         job(3, vec![1]),
-///         job(4, vec![2, 3]),
+///         DagJob {
+///             id: 1,
+///             ..Default::default()
+///         },
+///         DagJob {
+///             id: 2,
+///             deps: vec![1],
+///             ..Default::default()
+///         },
+///         DagJob {
+///             id: 3,
+///             deps: vec![1],
+///             ..Default::default()
+///         },
+///         DagJob {
+///             id: 4,
+///             deps: vec![2, 3],
+///             ..Default::default()
+///         },
 ///     ],
 ///     Time::ORIGIN,
 /// )
@@ -81,43 +87,47 @@ use crate::{JobId, JobSpec};
 /// ```
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct DagJob {
-    /// The job, as it will be submitted to the policy.
-    pub spec: JobSpec,
+    /// The job's id, which is also the unit's: dependents name it.
+    pub id: JobId,
     /// Units that must all complete before this one is ready (see [`Unit::deps`]).
     pub deps: Vec<JobId>,
-    /// Estimated work (the run time at speed 1), for ranks. `None` uses
-    /// [`DagConfig::default_work`].
+    /// The job, as it will be submitted to the policy. Its [`work`](JobSpec::work), or
+    /// [`DagConfig::default_work`] if unset, is the job's work in ranks.
     ///
-    /// The estimate becomes the submitted [`JobSpec::work`] unless that is set. Job 1 leads a
-    /// chain of 5 s then 1 s of work; job 3, independent and of default work, ranks below it.
+    /// Job 1 leads a chain of 5 s then 1 s of work; job 3, independent and of default work, ranks
+    /// below it.
     ///
     /// ```
     /// # use std::time::Duration;
     /// #
     /// # use whelm::{Config, DagConfig, DagJob, DagScheduler, JobSpec, Scheduler, Time};
     /// # let mut dag = DagScheduler::new(DagConfig::default(), Scheduler::new(Config::fifo()));
-    /// let job = |id, deps| DagJob {
+    /// let lead = DagJob {
+    ///     id: 1,
     ///     spec: JobSpec {
-    ///         id,
+    ///         work: Some(Duration::from_secs(5)),
     ///         ..Default::default()
     ///     },
-    ///     deps,
     ///     ..Default::default()
     /// };
-    /// let lead = DagJob {
-    ///     work_estimate: Some(Duration::from_secs(5)),
-    ///     ..job(1, vec![])
+    /// let next = DagJob {
+    ///     id: 2,
+    ///     deps: vec![1],
+    ///     ..Default::default()
     /// };
-    /// dag.declare([lead, job(2, vec![1]), job(3, vec![])], Time::ORIGIN)
-    ///     .unwrap();
+    /// let other = DagJob {
+    ///     id: 3,
+    ///     ..Default::default()
+    /// };
+    /// dag.declare([lead, next, other], Time::ORIGIN).unwrap();
     /// assert_eq!(
     ///     [1, 2, 3].map(|j| dag.rank(j)),
     ///     [6, 1, 1].map(|s| Some(Duration::from_secs(s)))
     /// );
     /// ```
-    pub work_estimate: Option<Duration>,
+    pub spec: JobSpec,
     /// A pure synchronisation point ("group G is done"): when ready it completes by itself
-    /// instead of being submitted to the policy. Its `work_estimate` still counts in ranks.
+    /// instead of being submitted to the policy. Its spec's `work` still counts in ranks.
     ///
     /// A barrier: job 3 stands for "jobs 1 and 2 are done", so that job 4 can name one dependency
     /// instead of every job before it. It completes without reaching the policy, and with
@@ -141,24 +151,27 @@ pub struct DagJob {
     ///     ..Default::default()
     /// };
     /// dag.handle(Input::Worker(w), Time::ORIGIN);
-    /// let job = |id, deps| DagJob {
+    /// let barrier = DagJob {
+    ///     id: 3,
+    ///     deps: vec![1, 2],
     ///     spec: JobSpec {
-    ///         id,
+    ///         work: Some(Duration::ZERO),
     ///         ..Default::default()
     ///     },
-    ///     deps,
+    ///     passthrough: true,
     ///     ..Default::default()
     /// };
-    /// let barrier = DagJob {
-    ///     passthrough: true,
-    ///     work_estimate: Some(Duration::ZERO),
-    ///     ..job(3, vec![1, 2])
+    /// let after = DagJob {
+    ///     id: 4,
+    ///     deps: vec![3],
+    ///     ..Default::default()
     /// };
-    /// dag.declare(
-    ///     [job(1, vec![]), job(2, vec![]), barrier, job(4, vec![3])],
-    ///     Time::ORIGIN,
-    /// )
-    /// .unwrap();
+    /// let first = [1, 2].map(|id| DagJob {
+    ///     id,
+    ///     ..Default::default()
+    /// });
+    /// dag.declare(first, Time::ORIGIN).unwrap();
+    /// dag.declare([barrier, after], Time::ORIGIN).unwrap();
     /// assert_eq!(dag.poll(Time::ORIGIN).len(), 2);
     /// dag.handle(
     ///     Input::Done { job: 1, attempt: 1 },
@@ -191,27 +204,24 @@ pub struct DagJob {
     /// ```
     /// # use std::time::Duration;
     /// # use whelm::{
-    /// #     Config, DagConfig, DagJob, DagScheduler, Input, JobSpec, Output, Policy, Resources,
+    /// #     Config, DagConfig, DagJob, DagScheduler, Input, Output, Policy, Resources,
     /// #     SLOTS, Scheduler, Time, WorkerState,
     /// # };
     /// # let mut dag = DagScheduler::new(DagConfig::default(), Scheduler::new(Config::fifo()));
     /// # let capacity = Resources::new().with(SLOTS, 1);
     /// # let worker = WorkerState { id: 1, capacity, ..Default::default() };
     /// # dag.handle(Input::Worker(worker), Time::ORIGIN);
-    /// let job = |id, deps| DagJob {
-    ///     spec: JobSpec {
-    ///         id,
-    ///         ..Default::default()
-    ///     },
-    ///     deps,
+    /// let register = DagJob {
+    ///     id: 1,
+    ///     local: true,
     ///     ..Default::default()
     /// };
-    /// let register = DagJob {
-    ///     local: true,
-    ///     ..job(1, vec![])
+    /// let after = DagJob {
+    ///     id: 2,
+    ///     deps: vec![1],
+    ///     ..Default::default()
     /// };
-    /// dag.declare([register, job(2, vec![1])], Time::ORIGIN)
-    ///     .unwrap();
+    /// dag.declare([register, after], Time::ORIGIN).unwrap();
     /// assert_eq!(dag.poll(Time::ORIGIN), vec![Output::RunLocal { job: 1 }]);
     /// assert_eq!(dag.stats().waiting, 0);
     ///
@@ -318,7 +328,7 @@ pub struct Unit {
     /// ```
     /// # use std::{sync::Arc, time::Duration};
     /// # use whelm::{
-    /// #     Config, DagConfig, DagJob, DagScheduler, Input, JobSpec, Output, Policy, Resources,
+    /// #     Config, DagConfig, DagJob, DagScheduler, Input, Output, Policy, Resources,
     /// #     SLOTS, Scheduler, TemplateSpec, Time, Unit, WorkerState,
     /// # };
     /// let mut dag = DagScheduler::new(DagConfig::default(), Scheduler::new(Config::fifo()));
@@ -335,10 +345,7 @@ pub struct Unit {
     ///     ..Default::default()
     /// };
     /// let after = DagJob {
-    ///     spec: JobSpec {
-    ///         id: 5,
-    ///         ..Default::default()
-    ///     },
+    ///     id: 5,
     ///     deps: vec![10],
     ///     ..Default::default()
     /// };
@@ -371,7 +378,8 @@ pub struct Unit {
     /// unit not declared yet (a forward reference): it is pending until declared and completed.
     /// A dependency on a unit that already completed is satisfied.
     pub deps: Vec<JobId>,
-    /// Every leaf's spec, with `id` replaced by the leaf's and `work`, if unset, by its work.
+    /// Every leaf's spec, with `work`, if unset, replaced by the leaf's work. Each leaf is
+    /// submitted under its own id, `base` plus its leaf index.
     pub spec: JobSpec,
     /// Multiplies every leaf's work. `None` uses [`DagConfig::default_work`], in seconds.
     ///
@@ -496,12 +504,12 @@ impl From<DagJob> for Unit {
             &template::JOB
         };
         Self {
-            id: j.spec.id,
-            base: j.spec.id,
+            id: j.id,
+            base: j.id,
             template: Arc::clone(template),
             deps: j.deps,
+            scale: j.spec.work.map(|w| w.as_secs_f64()),
             spec: j.spec,
-            scale: j.work_estimate.map(|w| w.as_secs_f64()),
             sourced: false,
             completed: Vec::new(),
         }
@@ -627,7 +635,7 @@ pub trait NodeSource: Send + Sync {
     }
 
     /// Finish the spec of leaf `leaf` of unit `unit` before it is submitted (e.g. its demand). It
-    /// arrives as the unit's spec with the leaf's id, work and rank. Default: unchanged.
+    /// arrives as the unit's spec with the leaf's work and rank. Default: unchanged.
     fn spec(&self, _unit: JobId, _leaf: u32, _spec: &mut JobSpec) {}
 
     /// The leaf's [`label`](crate::Explanation::label) when explained. Default: none.

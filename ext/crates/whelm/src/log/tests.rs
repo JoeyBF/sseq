@@ -48,14 +48,13 @@ fn run(sink: impl EventSink + 'static) -> (usize, usize, usize) {
         if t < 120 && t % 3 == 0 {
             let i = (t / 3) as JobId;
             let spec = JobSpec {
-                id: i,
                 demand: Resources::new().with(MEMORY, gb(1.0 + (i * 5 % 6) as f64)),
                 group: i / 8,
                 work: Some(Duration::from_secs(5 + i * 7 % 11)),
                 ..Default::default()
             };
             p.annotate(i, TaskInfo::default());
-            p.handle(Input::Submit(spec), now);
+            p.handle(Input::Submit { job: i, spec }, now);
         }
         match t {
             20 => p.handle(Input::Worker(worker(3, 0.0)), now),

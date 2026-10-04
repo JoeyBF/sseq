@@ -13,25 +13,30 @@ use crate::{DagJob, DagScheduler, JobSpec, Output, TemplateSpec};
 ///
 /// Without [`track_ranks`](Self::track_ranks), a job's rank covers its own unit only; with it,
 /// the chain of dependents counts too. [`default_work`](Self::default_work) sizes jobs declared
-/// without an estimate.
+/// without a [`work`](JobSpec::work).
 ///
 /// ```
 /// use std::time::Duration;
 ///
-/// use whelm::{Config, DagConfig, DagJob, DagScheduler, JobSpec, Scheduler, Time};
+/// use whelm::{Config, DagConfig, DagJob, DagScheduler, Scheduler, Time};
 ///
-/// let job = |id, deps| DagJob {
-///     spec: JobSpec {
-///         id,
-///         ..Default::default()
-///     },
-///     deps,
-///     ..Default::default()
-/// };
 /// let ranks = |config| {
 ///     let mut dag = DagScheduler::new(config, Scheduler::new(Config::fifo()));
-///     dag.declare([job(1, vec![]), job(2, vec![1])], Time::ORIGIN)
-///         .unwrap();
+///     dag.declare(
+///         [
+///             DagJob {
+///                 id: 1,
+///                 ..Default::default()
+///             },
+///             DagJob {
+///                 id: 2,
+///                 deps: vec![1],
+///                 ..Default::default()
+///             },
+///         ],
+///         Time::ORIGIN,
+///     )
+///     .unwrap();
 ///     (dag.rank(1), dag.rank(2))
 /// };
 /// let config = DagConfig {
@@ -51,7 +56,7 @@ use crate::{DagJob, DagScheduler, JobSpec, Output, TemplateSpec};
 #[derive(Clone, Debug, PartialEq)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct DagConfig {
-    /// The work of a [`DagJob`] declared without an estimate.
+    /// The work of a [`DagJob`] whose spec has no [`work`](JobSpec::work).
     ///
     /// A [`Unit`](crate::Unit) declared without a scale takes this, in seconds, as its scale. A
     /// plain job is a unit of a one-node template of one second of work, as are the nodes of
@@ -106,19 +111,10 @@ impl Default for DagConfig {
 /// use std::sync::Arc;
 ///
 /// use whelm::{
-///     Config, DagConfig, DagError, DagJob, DagScheduler, JobSpec, Scheduler, TemplateSpec, Time,
-///     Unit,
+///     Config, DagConfig, DagError, DagJob, DagScheduler, Scheduler, TemplateSpec, Time, Unit,
 /// };
 ///
 /// let mut dag = DagScheduler::new(DagConfig::default(), Scheduler::new(Config::fifo()));
-/// let job = |id, deps| DagJob {
-///     spec: JobSpec {
-///         id,
-///         ..Default::default()
-///     },
-///     deps,
-///     ..Default::default()
-/// };
 /// // Unit 99 owns ids 10, 11 and 12.
 /// let unit = Unit {
 ///     id: 99,
@@ -128,7 +124,18 @@ impl Default for DagConfig {
 /// };
 /// dag.declare([unit], Time::ORIGIN).unwrap();
 ///
-/// let cycle = [job(1, vec![2]), job(2, vec![1])];
+/// let cycle = [
+///     DagJob {
+///         id: 1,
+///         deps: vec![2],
+///         ..Default::default()
+///     },
+///     DagJob {
+///         id: 2,
+///         deps: vec![1],
+///         ..Default::default()
+///     },
+/// ];
 /// assert_eq!(
 ///     dag.declare(cycle, Time::ORIGIN),
 ///     Err(DagError::Cycle { job: 1 })
@@ -143,15 +150,34 @@ impl Default for DagConfig {
 ///     DagError::Cycle { job: 0 }
 /// );
 /// assert_eq!(
-///     dag.declare([job(99, vec![])], Time::ORIGIN),
+///     dag.declare(
+///         [DagJob {
+///             id: 99,
+///             ..Default::default()
+///         }],
+///         Time::ORIGIN
+///     ),
 ///     Err(DagError::Duplicate(99))
 /// );
 /// assert_eq!(
-///     dag.declare([job(11, vec![])], Time::ORIGIN),
+///     dag.declare(
+///         [DagJob {
+///             id: 11,
+///             ..Default::default()
+///         }],
+///         Time::ORIGIN
+///     ),
 ///     Err(DagError::Overlap(11))
 /// );
 /// assert_eq!(
-///     dag.declare([job(5, vec![11])], Time::ORIGIN),
+///     dag.declare(
+///         [DagJob {
+///             id: 5,
+///             deps: vec![11],
+///             ..Default::default()
+///         }],
+///         Time::ORIGIN
+///     ),
 ///     Err(DagError::Overlap(11))
 /// );
 /// assert_eq!(dag.close(42, Time::ORIGIN), Err(DagError::NotFound(42)));

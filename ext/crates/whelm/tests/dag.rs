@@ -43,14 +43,21 @@ fn complete(d: &mut DagScheduler<Scheduler>, job: JobId, now: Time) {
 /// A unit job in group 0 with the given dependencies.
 fn job(id: JobId, deps: &[JobId]) -> DagJob {
     DagJob {
+        id,
+        deps: deps.to_vec(),
         spec: JobSpec {
-            id,
             demand: Resources::new().with(MEMORY, 1),
             ..Default::default()
         },
-        deps: deps.to_vec(),
         ..Default::default()
     }
+}
+
+/// [`job`] with `work`.
+fn worked(id: JobId, deps: &[JobId], work: Duration) -> DagJob {
+    let mut j = job(id, deps);
+    j.spec.work = Some(work);
+    j
 }
 
 /// The ids started by a poll, sorted.
@@ -219,22 +226,18 @@ fn cancel_cascades_to_dependents() {
 #[test]
 fn ranks_follow_the_critical_path() {
     let mut d = dag(DagConfig::default());
-    let w = |id, deps: &[JobId], work| DagJob {
-        work_estimate: Some(work),
-        ..job(id, deps)
-    };
     // 1 -> 2 -> 3 and 1 -> 4: rank(1) = 1 + max(2 + 3, 10).
     d.declare(
         vec![
-            w(1, &[], Duration::from_secs(1)),
-            w(2, &[1], Duration::from_secs(2)),
-            w(3, &[2], Duration::from_secs(3)),
+            worked(1, &[], Duration::from_secs(1)),
+            worked(2, &[1], Duration::from_secs(2)),
+            worked(3, &[2], Duration::from_secs(3)),
         ],
         Time::ORIGIN,
     )
     .unwrap();
     assert_eq!(d.rank(1), Some(Duration::from_secs(6)));
-    d.declare(vec![w(4, &[1], Duration::from_secs(10))], Time::ORIGIN)
+    d.declare(vec![worked(4, &[1], Duration::from_secs(10))], Time::ORIGIN)
         .unwrap();
     assert_eq!(d.rank(1), Some(Duration::from_secs(11)));
     assert_eq!(d.rank(2), Some(Duration::from_secs(5)));
@@ -260,15 +263,11 @@ fn the_rank_term_orders_ready_jobs() {
         });
         let mut d = DagScheduler::new(DagConfig::default(), policy);
         join(&mut d, worker(0, 1, 1000), Time::ORIGIN);
-        let w = |id, deps: &[JobId], work| DagJob {
-            work_estimate: Some(work),
-            ..job(id, deps)
-        };
         d.declare(
             vec![
-                w(1, &[], Duration::from_secs(1)),
-                w(2, &[], Duration::from_secs(1)),
-                w(3, &[2], Duration::from_secs(50)),
+                worked(1, &[], Duration::from_secs(1)),
+                worked(2, &[], Duration::from_secs(1)),
+                worked(3, &[2], Duration::from_secs(50)),
             ],
             Time::ORIGIN,
         )

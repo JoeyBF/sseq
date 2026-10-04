@@ -46,10 +46,10 @@ struct Immediate {
 impl Policy for Immediate {
     /// Queue submissions.
     fn handle(&mut self, input: Input, _now: Time) {
-        if let Input::Submit(spec) = input {
+        if let Input::Submit { job, .. } = input {
             self.submitted += 1;
             if self.run {
-                self.queue.push(spec.id);
+                self.queue.push(job);
             }
         }
     }

@@ -64,11 +64,13 @@ pub struct TaskInfo {
 ///
 /// let submit = Event::Input {
 ///     t: Time::ORIGIN,
-///     input: Input::Submit(JobSpec {
-///         id: 1,
-///         demand: Resources::new().with(MEMORY, gb(1.0)),
-///         ..Default::default()
-///     }),
+///     input: Input::Submit {
+///         job: 1,
+///         spec: JobSpec {
+///             demand: Resources::new().with(MEMORY, gb(1.0)),
+///             ..Default::default()
+///         },
+///     },
 ///     info: None,
 /// };
 /// let poll = Event::Poll {

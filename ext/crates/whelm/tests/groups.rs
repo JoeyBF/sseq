@@ -18,9 +18,8 @@ fn starts(out: Vec<Output>) -> Vec<(JobId, WorkerId)> {
 }
 
 /// A one-byte job of group `group`.
-fn job(id: JobId, group: u64) -> JobSpec {
+fn job(group: u64) -> JobSpec {
     JobSpec {
-        id,
         demand: Resources::new().with(MEMORY, 1),
         group,
         ..Default::default()
@@ -44,7 +43,10 @@ fn run_order(order: &[u64], group_order: GroupOrder) -> Vec<u64> {
     });
     for (i, &g) in order.iter().enumerate() {
         p.handle(
-            Input::Submit(job(g, g)),
+            Input::Submit {
+                job: g,
+                spec: job(g),
+            },
             Time(Duration::from_secs(i as u64)),
         );
     }
@@ -108,11 +110,19 @@ fn young_group_behind_wide_old_group_waits_at_most_age_limit() {
         loop {
             // The old walk keeps two jobs per slot ready.
             while released < OLD_JOBS && policy.stats().waiting < 2 * WORKER_SLOTS {
-                policy.handle(Input::Submit(job(released, nassau::group(1, 20))), t);
+                let spec = job(nassau::group(1, 20));
+                policy.handle(
+                    Input::Submit {
+                        job: released,
+                        spec,
+                    },
+                    t,
+                );
                 released += 1;
             }
             if t == ten {
-                policy.handle(Input::Submit(job(YOUNG, nassau::group(3, 40))), t);
+                let spec = job(nassau::group(3, 40));
+                policy.handle(Input::Submit { job: YOUNG, spec }, t);
             }
             running.retain(|&(j, end)| {
                 if end <= t {

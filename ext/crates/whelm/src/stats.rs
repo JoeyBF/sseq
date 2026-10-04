@@ -32,22 +32,19 @@ use crate::{JobId, Resources, Time, WorkerId};
 ///     }),
 ///     Time::ORIGIN,
 /// );
-/// p.handle(
-///     Input::Submit(JobSpec {
-///         id: 1,
-///         demand: Resources::new().with(MEMORY, gb(6.0)),
-///         ..Default::default()
-///     }),
-///     Time::ORIGIN,
-/// );
-/// p.handle(
-///     Input::Submit(JobSpec {
-///         id: 2,
-///         demand: Resources::new().with(MEMORY, gb(6.0)),
-///         ..Default::default()
-///     }),
-///     Time::ORIGIN,
-/// );
+/// let spec = JobSpec {
+///     demand: Resources::new().with(MEMORY, gb(6.0)),
+///     ..Default::default()
+/// };
+/// for job in [1, 2] {
+///     p.handle(
+///         Input::Submit {
+///             job,
+///             spec: spec.clone(),
+///         },
+///         Time::ORIGIN,
+///     );
+/// }
 /// p.poll(Time::ORIGIN);
 /// let t = Time::ORIGIN + Reservations::default().reserve_after;
 /// p.poll(t);
@@ -90,14 +87,11 @@ pub struct ReservationInfo {
 ///     }),
 ///     Time::ORIGIN,
 /// );
-/// p.handle(
-///     Input::Submit(JobSpec {
-///         id: 1,
-///         demand: Resources::new().with(MEMORY, gb(3.0)),
-///         ..Default::default()
-///     }),
-///     Time::ORIGIN,
-/// );
+/// let spec = JobSpec {
+///     demand: Resources::new().with(MEMORY, gb(3.0)),
+///     ..Default::default()
+/// };
+/// p.handle(Input::Submit { job: 1, spec }, Time::ORIGIN);
 /// p.poll(Time::ORIGIN);
 /// let load = &p.stats().workers[0];
 /// assert_eq!((load.id, load.running, load.reserved_for), (1, 1, None));
@@ -155,12 +149,12 @@ pub struct WorkerLoad {
 ///     }),
 ///     Time::ORIGIN,
 /// );
-/// for id in 1..=3 {
+/// for job in 1..=3 {
 ///     p.handle(
-///         Input::Submit(JobSpec {
-///             id,
-///             ..Default::default()
-///         }),
+///         Input::Submit {
+///             job,
+///             spec: JobSpec::default(),
+///         },
 ///         Time::ORIGIN,
 ///     );
 /// }

@@ -37,13 +37,16 @@
 //!         Time::ORIGIN,
 //!     );
 //! }
-//! for id in 0..3 {
+//! let spec = JobSpec {
+//!     demand: Resources::new().with(MEMORY, gb(2.0)),
+//!     ..Default::default()
+//! };
+//! for job in 0..3 {
 //!     s.handle(
-//!         Input::Submit(JobSpec {
-//!             id,
-//!             demand: Resources::new().with(MEMORY, gb(2.0)),
-//!             ..Default::default()
-//!         }),
+//!         Input::Submit {
+//!             job,
+//!             spec: spec.clone(),
+//!         },
 //!         Time::ORIGIN,
 //!     );
 //! }
@@ -138,6 +141,7 @@ impl Worker {
 /// its place and its age.
 #[derive(Clone, Debug)]
 struct Job {
+    id: JobId,
     spec: JobSpec,
     /// `spec.demand` over the declared resources, with the default demands filled in.
     demand: Dense,
@@ -192,9 +196,9 @@ fn tick_occ(w: &mut Worker, now: Time) {
 ///   [`SpeedConfig::speculate`](crate::SpeedConfig::speculate), idle fast workers run second
 ///   attempts of jobs on slow ones.
 ///
-/// The examples below share the hidden helpers `worker(id, slots, bytes)`, `job(id, bytes)` and
-/// `start(job, attempt, worker)`, which build a [`WorkerState`], a [`JobSpec`] and an
-/// [`Output::Start`].
+/// The examples below share the hidden helpers `worker(id, slots, bytes)`, `job(bytes)` and
+/// `start(job, attempt, worker)`, which build a [`WorkerState`], a [`JobSpec`] demanding `bytes`
+/// of memory and an [`Output::Start`].
 ///
 /// # The scan
 ///
@@ -219,18 +223,18 @@ fn tick_occ(w: &mut Worker, now: Time) {
 /// #     capacity: Resources::new().with(MEMORY, bytes).with(SLOTS, slots),
 /// #     ..Default::default()
 /// # };
-/// # let job = |id, bytes| JobSpec { id, demand: Resources::new().with(MEMORY, bytes), ..Default::default() };
+/// # let job = |bytes| JobSpec { demand: Resources::new().with(MEMORY, bytes), ..Default::default() };
 /// # let start = |job, attempt, worker| Output::Start { job, attempt, worker };
 /// let mut s = Scheduler::new(Config::default());
 /// s.handle(Input::Worker(worker(1, 4, 100)), Time::ORIGIN);
-/// s.handle(Input::Submit(job(0, 70)), Time::ORIGIN);
+/// s.handle(Input::Submit { job: 0, spec: job(70) }, Time::ORIGIN);
 /// assert_eq!(s.poll(Time::ORIGIN), [start(0, 1, 1)]);
 /// let urgent = JobSpec {
 ///     priority: Some(-1),
-///     ..job(1, 50)
+///     ..job(50)
 /// };
-/// s.handle(Input::Submit(urgent), Time(Duration::from_secs(1)));
-/// s.handle(Input::Submit(job(2, 20)), Time(Duration::from_secs(1)));
+/// s.handle(Input::Submit { job: 1, spec: urgent }, Time(Duration::from_secs(1)));
+/// s.handle(Input::Submit { job: 2, spec: job(20) }, Time(Duration::from_secs(1)));
 /// assert_eq!(s.poll(Time(Duration::from_secs(1))), [start(2, 1, 1)]);
 /// let why = s.explain(1).unwrap();
 /// assert!(why.to_string().contains("memory short on 1 worker(s)"), "{why}");
@@ -253,14 +257,14 @@ fn tick_occ(w: &mut Worker, now: Time) {
 /// #     capacity: Resources::new().with(MEMORY, bytes).with(SLOTS, slots),
 /// #     ..Default::default()
 /// # };
-/// # let job = |id, bytes| JobSpec { id, demand: Resources::new().with(MEMORY, bytes), ..Default::default() };
+/// # let job = |bytes| JobSpec { demand: Resources::new().with(MEMORY, bytes), ..Default::default() };
 /// # let start = |job, attempt, worker| Output::Start { job, attempt, worker };
 /// use whelm::FailKind;
 ///
 /// let mut s = Scheduler::new(Config::default());
 /// s.handle(Input::Worker(worker(1, 1, 100)), Time::ORIGIN);
 /// s.handle(Input::Worker(worker(2, 1, 100)), Time::ORIGIN);
-/// s.handle(Input::Submit(job(0, 10)), Time::ORIGIN);
+/// s.handle(Input::Submit { job: 0, spec: job(10) }, Time::ORIGIN);
 /// assert_eq!(s.poll(Time::ORIGIN), [start(0, 1, 1)]);
 /// let failed = Input::Failed {
 ///     job: 0,
@@ -302,14 +306,14 @@ fn tick_occ(w: &mut Worker, now: Time) {
 /// #     capacity: Resources::new().with(MEMORY, bytes).with(SLOTS, slots),
 /// #     ..Default::default()
 /// # };
-/// # let job = |id, bytes| JobSpec { id, demand: Resources::new().with(MEMORY, bytes), ..Default::default() };
+/// # let job = |bytes| JobSpec { demand: Resources::new().with(MEMORY, bytes), ..Default::default() };
 /// # let start = |job, attempt, worker| Output::Start { job, attempt, worker };
 /// let mut s = Scheduler::new(Config::default());
 /// s.handle(Input::Worker(worker(1, 4, 100)), Time::ORIGIN);
 /// s.handle(Input::Worker(worker(2, 4, 100)), Time::ORIGIN);
-/// s.handle(Input::Submit(job(10, 60)), Time::ORIGIN);
-/// s.handle(Input::Submit(job(11, 60)), Time::ORIGIN);
-/// s.handle(Input::Submit(job(1, 50)), Time::ORIGIN);
+/// s.handle(Input::Submit { job: 10, spec: job(60) }, Time::ORIGIN);
+/// s.handle(Input::Submit { job: 11, spec: job(60) }, Time::ORIGIN);
+/// s.handle(Input::Submit { job: 1, spec: job(50) }, Time::ORIGIN);
 /// assert_eq!(s.poll(Time::ORIGIN), [start(10, 1, 1), start(11, 1, 2)]);
 /// let reserve_after = Config::default().reservations.unwrap().reserve_after;
 /// let reserve_at = Time::ORIGIN + reserve_after;
@@ -317,7 +321,7 @@ fn tick_occ(w: &mut Worker, now: Time) {
 /// assert_eq!(s.poll(reserve_at), []);
 /// let reservation = &s.stats().reservations[0];
 /// assert_eq!((reservation.job, reservation.worker), (1, 1));
-/// s.handle(Input::Submit(job(20, 5)), Time(Duration::from_secs(70)));
+/// s.handle(Input::Submit { job: 20, spec: job(5) }, Time(Duration::from_secs(70)));
 /// assert_eq!(s.poll(Time(Duration::from_secs(70))), [start(20, 1, 2)]);
 /// assert!(matches!(
 ///     s.explain(1).unwrap().waiting().unwrap().hold,
@@ -344,7 +348,7 @@ fn tick_occ(w: &mut Worker, now: Time) {
 /// #     capacity: Resources::new().with(MEMORY, bytes).with(SLOTS, slots),
 /// #     ..Default::default()
 /// # };
-/// # let job = |id, bytes| JobSpec { id, demand: Resources::new().with(MEMORY, bytes), ..Default::default() };
+/// # let job = |bytes| JobSpec { demand: Resources::new().with(MEMORY, bytes), ..Default::default() };
 /// # let start = |job, attempt, worker| Output::Start { job, attempt, worker };
 /// use whelm::{Defer, SpeedConfig};
 ///
@@ -361,13 +365,13 @@ fn tick_occ(w: &mut Worker, now: Time) {
 /// };
 /// s.handle(Input::Worker(worker(1, 1, 100)), Time::ORIGIN);
 /// s.handle(Input::Worker(fast), Time::ORIGIN);
-/// let work = |id, work| JobSpec {
+/// let work = |work| JobSpec {
 ///     work: Some(Duration::from_secs(work)),
-///     ..job(id, 10)
+///     ..job(10)
 /// };
-/// s.handle(Input::Submit(work(0, 10)), Time::ORIGIN);
+/// s.handle(Input::Submit { job: 0, spec: work(10) }, Time::ORIGIN);
 /// assert_eq!(s.poll(Time::ORIGIN), [start(0, 1, 2)]);
-/// s.handle(Input::Submit(work(1, 40)), Time::ORIGIN);
+/// s.handle(Input::Submit { job: 1, spec: work(40) }, Time::ORIGIN);
 /// assert_eq!(s.poll(Time::ORIGIN), []);
 /// assert_eq!(s.stats().deferred, [(1, 2, Time(Duration::from_millis(2500)))]);
 /// assert!(matches!(
@@ -396,7 +400,7 @@ fn tick_occ(w: &mut Worker, now: Time) {
 /// #     capacity: Resources::new().with(MEMORY, bytes).with(SLOTS, slots),
 /// #     ..Default::default()
 /// # };
-/// # let job = |id, bytes| JobSpec { id, demand: Resources::new().with(MEMORY, bytes), ..Default::default() };
+/// # let job = |bytes| JobSpec { demand: Resources::new().with(MEMORY, bytes), ..Default::default() };
 /// # let start = |job, attempt, worker| Output::Start { job, attempt, worker };
 /// use whelm::{Speculate, SpeedConfig};
 ///
@@ -413,12 +417,12 @@ fn tick_occ(w: &mut Worker, now: Time) {
 /// };
 /// s.handle(Input::Worker(worker(1, 1, 100)), Time::ORIGIN);
 /// s.handle(Input::Worker(fast), Time::ORIGIN);
-/// let work = |id, work| JobSpec {
+/// let work = |work| JobSpec {
 ///     work: Some(Duration::from_secs(work)),
-///     ..job(id, 10)
+///     ..job(10)
 /// };
-/// s.handle(Input::Submit(work(0, 4)), Time::ORIGIN);
-/// s.handle(Input::Submit(work(1, 100)), Time::ORIGIN);
+/// s.handle(Input::Submit { job: 0, spec: work(4) }, Time::ORIGIN);
+/// s.handle(Input::Submit { job: 1, spec: work(100) }, Time::ORIGIN);
 /// assert_eq!(s.poll(Time::ORIGIN), [start(0, 1, 2), start(1, 1, 1)]);
 /// // The fast worker frees at 1 s; job 1 would end there at 26 s instead of 100 s.
 /// s.handle(Input::Done { job: 0, attempt: 1 }, Time(Duration::from_secs(1)));
@@ -531,10 +535,10 @@ impl Scheduler {
     ///     Time::ORIGIN,
     /// );
     /// s.handle(
-    ///     Input::Submit(JobSpec {
-    ///         id: 0,
-    ///         ..Default::default()
-    ///     }),
+    ///     Input::Submit {
+    ///         job: 0,
+    ///         spec: JobSpec::default(),
+    ///     },
     ///     Time::ORIGIN,
     /// );
     /// assert_eq!(
@@ -604,34 +608,25 @@ impl Scheduler {
     ///         }),
     ///         Time::ORIGIN,
     ///     );
-    ///     s.handle(
-    ///         Input::Submit(JobSpec {
-    ///             id: 0,
-    ///             group: 1,
-    ///             ..Default::default()
-    ///         }),
-    ///         Time::ORIGIN,
-    ///     );
+    ///     let spec = JobSpec {
+    ///         group: 1,
+    ///         ..Default::default()
+    ///     };
+    ///     s.handle(Input::Submit { job: 0, spec }, Time::ORIGIN);
     ///     s.poll(Time::ORIGIN); // job 0, the last of group 1 for now, takes the slot
     ///     if forget {
     ///         s.forget_group(1);
     ///     }
-    ///     s.handle(
-    ///         Input::Submit(JobSpec {
-    ///             id: 1,
-    ///             group: 2,
-    ///             ..Default::default()
-    ///         }),
-    ///         Time(Duration::from_secs(1)),
-    ///     );
-    ///     s.handle(
-    ///         Input::Submit(JobSpec {
-    ///             id: 2,
-    ///             group: 1,
-    ///             ..Default::default()
-    ///         }),
-    ///         Time(Duration::from_secs(1)),
-    ///     );
+    ///     let spec = JobSpec {
+    ///         group: 2,
+    ///         ..Default::default()
+    ///     };
+    ///     s.handle(Input::Submit { job: 1, spec }, Time(Duration::from_secs(1)));
+    ///     let spec = JobSpec {
+    ///         group: 1,
+    ///         ..Default::default()
+    ///     };
+    ///     s.handle(Input::Submit { job: 2, spec }, Time(Duration::from_secs(1)));
     ///     s.handle(
     ///         Input::Done { job: 0, attempt: 1 },
     ///         Time(Duration::from_secs(2)),
@@ -678,7 +673,7 @@ impl Policy for Scheduler {
     fn handle(&mut self, input: Input, now: Time) {
         self.now = now;
         match input {
-            Input::Submit(spec) => self.submit(spec, now),
+            Input::Submit { job, spec } => self.submit(job, spec, now),
             Input::Done { job, attempt } => self.done(job, attempt),
             Input::Failed {
                 job,

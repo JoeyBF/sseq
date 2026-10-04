@@ -54,12 +54,12 @@ impl<P: Policy> DagScheduler<P> {
     ///     ..Default::default()
     /// };
     /// let after = DagJob {
+    ///     id: 20,
+    ///     deps: vec![10],
     ///     spec: JobSpec {
-    ///         id: 20,
+    ///         work: Some(Duration::from_secs(2)),
     ///         ..Default::default()
     ///     },
-    ///     deps: vec![10],
-    ///     work_estimate: Some(Duration::from_secs(2)),
     ///     ..Default::default()
     /// };
     /// dag.declare([unit, after.into()], Time::ORIGIN).unwrap();
@@ -87,20 +87,28 @@ impl<P: Policy> DagScheduler<P> {
     /// # use std::time::Duration;
     /// #
     /// # use whelm::{
-    /// #     Config, DagConfig, DagJob, DagScheduler, Input, JobSpec, Output, Policy, Resources,
+    /// #     Config, DagConfig, DagJob, DagScheduler, Input, Output, Policy, Resources,
     /// #     SLOTS, Scheduler, Time, WorkerState,
     /// # };
     /// # let mut dag = DagScheduler::new(DagConfig::default(), Scheduler::new(Config::fifo()));
     /// # let capacity = Resources::new().with(SLOTS, 1);
     /// # let worker = WorkerState { id: 1, capacity, ..Default::default() };
     /// # dag.handle(Input::Worker(worker), Time::ORIGIN);
-    /// # let job = |id, deps| DagJob {
-    /// #     spec: JobSpec { id, ..Default::default() },
-    /// #     deps,
-    /// #     ..Default::default()
-    /// # };
-    /// dag.declare([job(1, vec![]), job(2, vec![1])], Time::ORIGIN)
-    ///     .unwrap();
+    /// dag.declare(
+    ///     [
+    ///         DagJob {
+    ///             id: 1,
+    ///             ..Default::default()
+    ///         },
+    ///         DagJob {
+    ///             id: 2,
+    ///             deps: vec![1],
+    ///             ..Default::default()
+    ///         },
+    ///     ],
+    ///     Time::ORIGIN,
+    /// )
+    /// .unwrap();
     /// assert_eq!(dag.rank(1), Some(Duration::from_secs(2)));
     /// assert!(dag.update_work(2, 5.0));
     /// assert_eq!(dag.rank(1), Some(Duration::from_secs(6)));

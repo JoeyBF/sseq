@@ -443,6 +443,7 @@ impl Urgency {
 /// A job as the model sees it, across its attempts.
 #[derive(Clone, Debug)]
 struct SJob {
+    id: JobId,
     spec: JobSpec,
     /// Its demand over the declared resources, default demands filled in.
     demand: Named,
@@ -865,19 +866,16 @@ impl Shadow {
         Some((j, k, r.live[k].attempt))
     }
 
-    /// Submit to both the model and the policy a job demanding `demand`: rejected, naming the
+    /// Submit to both the model and the policy job `id` demanding `demand`: rejected, naming the
     /// first undeclared resource by name, if it demands any; otherwise waiting, with the default
     /// demands where it says nothing.
-    fn submit(&mut self, spec: JobSpec, demand: Named, p: &mut dyn Policy) {
+    fn submit(&mut self, id: JobId, spec: JobSpec, demand: Named, p: &mut dyn Policy) {
         if let Some(&name) = demand.keys().find(|n| self.decl(n).is_none()) {
             let reason = Rejection::Undeclared {
                 resource: name.into(),
             };
-            self.expect.push(Output::Rejected {
-                job: spec.id,
-                reason,
-            });
-            p.handle(Input::Submit(spec), self.now);
+            self.expect.push(Output::Rejected { job: id, reason });
+            p.handle(Input::Submit { job: id, spec }, self.now);
             return;
         }
         let seq = self.seq;
@@ -893,8 +891,9 @@ impl Shadow {
             .filter(|&(_, x)| x > 0)
             .collect();
         self.waiting.insert(
-            spec.id,
+            id,
             SJob {
+                id,
                 spec: spec.clone(),
                 demand: full,
                 since: self.now,
@@ -904,7 +903,7 @@ impl Shadow {
                 speculated: 0,
             },
         );
-        p.handle(Input::Submit(spec), self.now);
+        p.handle(Input::Submit { job: id, spec }, self.now);
     }
 
     /// End a running job: every live attempt but `except` is stopped.
@@ -1025,7 +1024,6 @@ fn run(
                 sh.next_id += 1;
                 let demand = sh.pick(demand, stray);
                 let spec = JobSpec {
-                    id,
                     demand: to_policy(&demand),
                     group,
                     priority,
@@ -1036,7 +1034,7 @@ fn run(
                     work: work.map(|w| Duration::from_secs(w.into())),
                     kind: kind.map(|k| format!("k{k}")),
                 };
-                sh.submit(spec, demand, &mut *p);
+                sh.submit(id, spec, demand, &mut *p);
             }
             Op::Complete(i, k) => {
                 if let Some((job, k, attempt)) = sh.pick_live(i, k) {
@@ -1218,15 +1216,15 @@ fn run(
                 if !holders.contains(&j) {
                     let mine = sh.urgency(&job);
                     for a in sh.waiting.values() {
-                        if a.spec.id != j && sh.urgency(a).cmp(&mine).is_lt() {
-                            let refused = deferred_any.contains(&a.spec.id)
+                        if a.id != j && sh.urgency(a).cmp(&mine).is_lt() {
+                            let refused = deferred_any.contains(&a.id)
                                 || !sh.eligible(a, w)
                                 || !sh.admits(&a.demand, w);
                             prop_assert!(
                                 refused,
                                 "{rule:?}: job {j} placed on {w} while more urgent job {} is \
                                  admitted there",
-                                a.spec.id
+                                a.id
                             );
                         }
                     }
@@ -1298,12 +1296,12 @@ fn run(
                     "speculated onto a reserved worker"
                 );
                 let wanted = sh.waiting.values().find(|a| {
-                    !deferred.contains(&a.spec.id) && sh.eligible(a, w) && sh.admits(&a.demand, w)
+                    !deferred.contains(&a.id) && sh.eligible(a, w) && sh.admits(&a.demand, w)
                 });
                 prop_assert!(
                     wanted.is_none(),
                     "speculated onto {w} while job {:?} waits for it",
-                    wanted.map(|a| a.spec.id)
+                    wanted.map(|a| a.id)
                 );
                 let end = sh.expected_end(r);
                 let run = sh.eta(&spec, w);
@@ -1343,14 +1341,12 @@ fn run(
         for &w in sh.workers.keys() {
             if sh.load(w).0 == 0 {
                 let stuck = sh.waiting.values().find(|j| {
-                    sh.eligible(j, w)
-                        && sh.admits_empty(&j.demand, w)
-                        && !deferred.contains(&j.spec.id)
+                    sh.eligible(j, w) && sh.admits_empty(&j.demand, w) && !deferred.contains(&j.id)
                 });
                 prop_assert!(
                     stuck.is_none(),
                     "{rule:?}: worker {w} empty while job {:?} waits",
-                    stuck.map(|j| j.spec.id)
+                    stuck.map(|j| j.id)
                 );
             }
         }

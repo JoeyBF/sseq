@@ -600,13 +600,16 @@ pub(crate) fn fill_defaults(resources: &[Resource], values: &mut [u64]) {
 ///     }),
 ///     Time::ORIGIN,
 /// );
-/// for id in 0..3 {
+/// let spec = JobSpec {
+///     demand: Resources::new().with(MEMORY, 80),
+///     ..Default::default()
+/// };
+/// for job in 0..3 {
 ///     s.handle(
-///         Input::Submit(JobSpec {
-///             id,
-///             demand: Resources::new().with(MEMORY, 80),
-///             ..Default::default()
-///         }),
+///         Input::Submit {
+///             job,
+///             spec: spec.clone(),
+///         },
 ///         Time::ORIGIN,
 ///     );
 /// }

@@ -29,19 +29,24 @@ use crate::{JobId, JobSpec, Output, Policy, Time};
 /// ```
 /// use std::time::Duration;
 ///
-/// use whelm::{Config, DagConfig, DagJob, DagScheduler, DagSnapshot, JobSpec, Scheduler, Time};
+/// use whelm::{Config, DagConfig, DagJob, DagScheduler, DagSnapshot, Scheduler, Time};
 ///
 /// let mut dag = DagScheduler::new(DagConfig::default(), Scheduler::new(Config::fifo()));
-/// let job = |id, deps| DagJob {
-///     spec: JobSpec {
-///         id,
-///         ..Default::default()
-///     },
-///     deps,
-///     ..Default::default()
-/// };
-/// dag.declare([job(1, vec![]), job(2, vec![1])], Time::ORIGIN)
-///     .unwrap();
+/// dag.declare(
+///     [
+///         DagJob {
+///             id: 1,
+///             ..Default::default()
+///         },
+///         DagJob {
+///             id: 2,
+///             deps: vec![1],
+///             ..Default::default()
+///         },
+///     ],
+///     Time::ORIGIN,
+/// )
+/// .unwrap();
 ///
 /// let json = serde_json::to_string(&dag.snapshot()).unwrap();
 /// let snapshot: DagSnapshot = serde_json::from_str(&json).unwrap();
@@ -151,7 +156,7 @@ impl<P: Policy> DagScheduler<P> {
     /// use std::time::Duration;
     ///
     /// use whelm::{
-    ///     Config, DagConfig, DagJob, DagScheduler, Input, JobSpec, Output, Policy, Resources, SLOTS,
+    ///     Config, DagConfig, DagJob, DagScheduler, Input, Output, Policy, Resources, SLOTS,
     ///     Scheduler, Time, WorkerState,
     /// };
     ///
@@ -162,18 +167,23 @@ impl<P: Policy> DagScheduler<P> {
     ///         ..Default::default()
     ///     })
     /// };
-    /// let job = |id, deps| DagJob {
-    ///     spec: JobSpec {
-    ///         id,
-    ///         ..Default::default()
-    ///     },
-    ///     deps,
-    ///     ..Default::default()
-    /// };
     /// let mut dag = DagScheduler::new(DagConfig::default(), Scheduler::new(Config::fifo()));
     /// dag.handle(worker(), Time::ORIGIN);
-    /// dag.declare([job(1, vec![]), job(2, vec![3])], Time::ORIGIN)
-    ///     .unwrap();
+    /// dag.declare(
+    ///     [
+    ///         DagJob {
+    ///             id: 1,
+    ///             ..Default::default()
+    ///         },
+    ///         DagJob {
+    ///             id: 2,
+    ///             deps: vec![3],
+    ///             ..Default::default()
+    ///         },
+    ///     ],
+    ///     Time::ORIGIN,
+    /// )
+    /// .unwrap();
     /// dag.poll(Time::ORIGIN);
     /// dag.handle(
     ///     Input::Done { job: 1, attempt: 1 },
@@ -188,8 +198,15 @@ impl<P: Policy> DagScheduler<P> {
     ///     Time(Duration::from_secs(2)),
     /// );
     /// dag.handle(worker(), Time(Duration::from_secs(2)));
-    /// dag.declare([job(3, vec![1])], Time(Duration::from_secs(2)))
-    ///     .unwrap();
+    /// dag.declare(
+    ///     [DagJob {
+    ///         id: 3,
+    ///         deps: vec![1],
+    ///         ..Default::default()
+    ///     }],
+    ///     Time(Duration::from_secs(2)),
+    /// )
+    /// .unwrap();
     /// assert_eq!(
     ///     dag.poll(Time(Duration::from_secs(2))),
     ///     vec![Output::Start {
@@ -273,7 +290,7 @@ impl<P: Policy> DagScheduler<P> {
     /// ```
     /// # use std::time::Duration;
     /// # use whelm::{
-    /// #     Config, DagConfig, DagJob, DagScheduler, Input, JobSpec, Output, Policy, Resources,
+    /// #     Config, DagConfig, DagJob, DagScheduler, Input, Output, Policy, Resources,
     /// #     SLOTS, Scheduler, Time, WorkerState,
     /// # };
     /// let config = DagConfig {
@@ -289,22 +306,25 @@ impl<P: Policy> DagScheduler<P> {
     ///     }),
     ///     Time::ORIGIN,
     /// );
-    /// let job = |id, deps| DagJob {
-    ///     spec: JobSpec {
-    ///         id,
-    ///         ..Default::default()
-    ///     },
-    ///     deps,
-    ///     ..Default::default()
-    /// };
     /// dag.declare(
     ///     [
-    ///         job(1, vec![]),
-    ///         job(2, vec![]),
-    ///         job(3, vec![1]),
     ///         DagJob {
+    ///             id: 1,
+    ///             ..Default::default()
+    ///         },
+    ///         DagJob {
+    ///             id: 2,
+    ///             ..Default::default()
+    ///         },
+    ///         DagJob {
+    ///             id: 3,
+    ///             deps: vec![1],
+    ///             ..Default::default()
+    ///         },
+    ///         DagJob {
+    ///             id: 4,
     ///             local: true,
-    ///             ..job(4, vec![])
+    ///             ..Default::default()
     ///         },
     ///     ],
     ///     Time::ORIGIN,
