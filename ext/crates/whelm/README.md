@@ -121,7 +121,7 @@ assert_eq!(started, [(7, 1, 1), (8, 1, 1)]);
 // Report each attempt's end; it frees its slot and demand.
 policy.handle(Input::Done { job: 7, attempt: 1 }, at(95));
 assert!(policy.poll(at(95)).is_empty());
-println!("{:?}", policy.explain(8)); // why a job is (not) running, for logs
+println!("{}", policy.explain(8).unwrap()); // why a job is (not) running, one line for logs
 ```
 
 `Policy::handle` applies an input at once; the outputs it causes (stops, give-ups) come out of the

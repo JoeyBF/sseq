@@ -6,8 +6,8 @@ use std::{
 };
 
 use whelm::{
-    DagConfig, DagScheduler, DagTemplate, Input, JobId, JobSpec, Output, Policy, PolicyStats,
-    Resources, TemplateNode, TemplateSpec, Time, Unit,
+    DagConfig, DagScheduler, DagTemplate, Explanation, Input, JobId, JobSpec, Output, Policy,
+    PolicyStats, Resources, TemplateNode, TemplateSpec, Time, Unit,
 };
 
 /// Units on a side of the coarse grid: unit `k` waits for its left and upper neighbours.
@@ -72,7 +72,7 @@ impl Policy for Immediate {
     }
 
     /// Nothing to say.
-    fn explain(&self, _job: JobId) -> Option<String> {
+    fn explain(&self, _job: JobId) -> Option<Explanation> {
         None
     }
 

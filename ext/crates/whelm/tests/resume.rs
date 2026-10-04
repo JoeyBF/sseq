@@ -141,11 +141,9 @@ fn per_node_demand_and_label() {
         ..walk(&t, 100, 1, 99)
     };
     d.declare([unit], Time::ORIGIN).unwrap();
-    assert!(
-        d.explain(101).unwrap().starts_with("[Sq(1)]"),
-        "{:?}",
-        d.explain(101)
-    );
+    let e = d.explain(101).unwrap();
+    assert_eq!(e.label.as_deref(), Some("Sq(1)"));
+    assert!(e.to_string().starts_with("[Sq(1)] job 101 "), "{e}");
     assert_eq!(d.poll(Time::ORIGIN), vec![Output::RunLocal { job: 1 }]);
     done(&mut d, 1, 0, Time::ORIGIN);
     assert_eq!(starts(&d.poll(Time::ORIGIN)).len(), 3);

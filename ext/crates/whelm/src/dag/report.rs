@@ -4,7 +4,7 @@ use super::{
     DagScheduler, UnitState,
     frame::{self, COMPLETE, HELD, SUBMITTED},
 };
-use crate::{JobId, Policy};
+use crate::{Explanation, JobId, Policy, Status};
 
 /// Counters describing the DAG layer's state, from [`DagScheduler::dag_stats`].
 ///
@@ -107,66 +107,59 @@ impl<P: Policy> DagScheduler<P> {
         s
     }
 
-    /// A unit's state in words.
-    pub(super) fn explain_unit(&self, u: u32, what: &str) -> String {
+    /// The status of unit `u` itself.
+    pub(super) fn unit_status(&self, u: u32) -> Status {
         let rec = self.unit(u);
-        let id = rec.id;
         match rec.state {
-            UnitState::Undeclared => format!(
-                "{what} {id} is not declared yet (named as a dependency of {} unit(s))",
-                rec.succs.len()
-            ),
+            UnitState::Undeclared => Status::Undeclared {
+                dependents: rec.succs.len(),
+            },
             UnitState::Pending => {
-                let mut deps: Vec<JobId> = rec.preds.iter().map(|&d| self.unit(d).id).collect();
-                deps.sort_unstable();
-                let shown: Vec<_> = deps.iter().take(8).collect();
-                format!(
-                    "{what} {id} {}waits for {} dependenc{} {shown:?}{}",
-                    if rec.closed { "is closed and " } else { "" },
-                    deps.len(),
-                    if deps.len() == 1 { "y" } else { "ies" },
-                    if deps.len() > 8 { " ..." } else { "" }
-                )
+                let mut unmet: Vec<JobId> = rec.preds.iter().map(|&d| self.unit(d).id).collect();
+                unmet.sort_unstable();
+                Status::Pending {
+                    unit: rec.id,
+                    closed: rec.closed,
+                    unmet,
+                }
             }
-            UnitState::Open => format!("{what} {id} is open"),
+            UnitState::Open => Status::Open,
         }
     }
 
     /// `explain` for leaf `leaf` of unit `u`.
-    pub(super) fn explain_leaf(&self, u: u32, leaf: u32, job: JobId) -> Option<String> {
+    pub(super) fn explain_leaf(&self, u: u32, leaf: u32, job: JobId) -> Option<Explanation> {
         let rec = self.unit(u);
-        let msg = if rec.plain() && rec.state == UnitState::Pending {
-            Some(self.explain_unit(u, "job"))
+        let pending = rec.state == UnitState::Pending;
+        let status = if pending && (rec.plain() || !rec.leaf_completed(leaf)) {
+            self.unit_status(u)
         } else if rec.leaf_completed(leaf) {
-            Some(format!("job {job} completed"))
-        } else if rec.state == UnitState::Pending {
-            Some(format!(
-                "job {job} waits for its unit: {}",
-                self.explain_unit(u, "unit")
-            ))
+            Status::Completed
         } else {
             match self.leaf_node(job) {
-                None => Some(format!(
-                    "job {job} waits for its part of unit {} to be entered",
-                    rec.id
-                )),
+                None => Status::Unentered { unit: rec.id },
                 Some((f, i)) => match self.frame(f).counter[i] {
-                    SUBMITTED => self.policy.explain(job),
-                    HELD => Some(format!("job {job} is ready and held until release")),
-                    COMPLETE => Some(format!("job {job} completed")),
-                    k => Some(format!(
-                        "job {job} waits for {k} dependenc{} within its unit",
-                        if k == 1 { "y" } else { "ies" }
-                    )),
+                    SUBMITTED => return self.labelled(u, leaf, self.policy.explain(job)?),
+                    HELD => Status::Held,
+                    COMPLETE => Status::Completed,
+                    k => Status::PendingWithin { unmet: k.into() },
                 },
             }
         };
-        match rec.sourced {
-            true => match self.src().label(rec.id, leaf) {
-                Some(l) => msg.map(|m| format!("[{l}] {m}")),
-                None => msg,
-            },
-            false => msg,
-        }
+        self.labelled(u, leaf, Explanation::new(job, status))
+    }
+
+    /// `e` with the label of leaf `leaf` of unit `u`, if its source gives one.
+    fn labelled(&self, u: u32, leaf: u32, e: Explanation) -> Option<Explanation> {
+        let rec = self.unit(u);
+        let label = if rec.sourced {
+            self.src().label(rec.id, leaf)
+        } else {
+            None
+        };
+        Some(Explanation {
+            label: label.or(e.label),
+            ..e
+        })
     }
 }

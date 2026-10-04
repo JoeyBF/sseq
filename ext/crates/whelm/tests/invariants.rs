@@ -8,10 +8,10 @@ use std::{
 
 use proptest::prelude::*;
 use whelm::{
-    Attempt, Config, Constraint, DIMS, Defer, FailKind, GaveUp, GroupOrder, Input, JobId, JobSpec,
-    Learn, OrderTerm, Output, Policy, Reservations, Resources, RetryConfig, SLOTS, Scheduler,
-    ScoreTerm, Selector, Speculate, SpeedConfig, Strength, Time, Timing, Tried, WorkerId,
-    WorkerState,
+    Attempt, Config, Constraint, DIMS, Defer, Explanation, FailKind, GaveUp, GroupOrder, Input,
+    JobId, JobSpec, Learn, OrderTerm, Output, Policy, Reservations, Resources, RetryConfig, SLOTS,
+    Scheduler, ScoreTerm, Selector, Speculate, SpeedConfig, Status, Strength, Time, Timing, Tried,
+    WorkerId, WorkerState,
 };
 
 /// `x` seconds rounded to the nanosecond, as the policy turns its run-time arithmetic back into a
@@ -988,7 +988,7 @@ fn run(
         if std::env::var_os("SCHED_TRACE").is_some() {
             eprintln!("op {op:?} -> {out:?} deferred {:?}", after.deferred);
             for j in sh.waiting.keys() {
-                eprintln!("  {}", p.explain(*j).unwrap_or_default());
+                eprintln!("  {}", p.explain(*j).unwrap());
             }
         }
         let mut starts = Vec::new();
@@ -1205,21 +1205,17 @@ fn run(
                 "job {j} has live attempts {:?}",
                 r.live
             );
-            let runs: Vec<String> = r
-                .live
-                .iter()
-                .map(|l| format!("attempt {} on worker {}", l.attempt, l.worker))
-                .collect();
+            let attempts = r.live.iter().map(|l| (l.attempt, l.worker)).collect();
             prop_assert_eq!(
                 p.explain(j),
-                Some(format!("job {j} is running: {}", runs.join(", ")))
+                Some(Explanation::new(j, Status::Running { attempts }))
             );
         }
         for &j in sh.waiting.keys() {
-            let e = p.explain(j).unwrap_or_default();
+            let e = p.explain(j);
             prop_assert!(
-                e.starts_with(&format!("job {j} (")),
-                "waiting job {j} explained as {e}"
+                e.as_ref().is_some_and(|e| e.waiting().is_some()),
+                "waiting job {j} explained as {e:?}"
             );
         }
         let (max_res, per_class) = rule.reservations.unwrap_or((0, false));
@@ -1250,7 +1246,7 @@ fn run(
             p.next_wakeup()
         ));
         for id in 0..sh.next_id {
-            log.push(p.explain(id).unwrap_or_default());
+            log.push(format!("{:?}", p.explain(id)));
         }
     }
     // Liveness of bookkeeping: completing and cancelling everything releases everything.

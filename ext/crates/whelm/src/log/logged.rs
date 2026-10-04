@@ -5,7 +5,9 @@ use std::{collections::HashMap, time::Duration};
 #[cfg(doc)]
 use super::replay;
 use super::{Event, EventSink, TaskInfo};
-use crate::{DEV, Input, JobId, MEM, Output, Policy, PolicyStats, Time, WorkerId, WorkerState};
+use crate::{
+    DEV, Explanation, Input, JobId, MEM, Output, Policy, PolicyStats, Time, WorkerId, WorkerState,
+};
 
 /// A [`Policy`] that records every input it handles and every poll's outputs to an
 /// [`EventSink`], so that [`replay`] can reproduce the run.
@@ -249,7 +251,7 @@ impl<P: Policy> Policy for Logged<P> {
     }
 
     /// Forwarded.
-    fn explain(&self, job: JobId) -> Option<String> {
+    fn explain(&self, job: JobId) -> Option<Explanation> {
         self.inner.explain(job)
     }
 

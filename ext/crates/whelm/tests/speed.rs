@@ -3,8 +3,8 @@
 use std::time::Duration;
 
 use whelm::{
-    Attempt, Config, Constraint, Defer, Input, JobId, JobSpec, Output, Policy, Resources,
-    Scheduler, ScoreTerm, Speculate, SpeedConfig, Time, Timing, WorkerId, WorkerState,
+    Attempt, Config, Constraint, Defer, Holding, Input, JobId, JobSpec, Output, Policy, Resources,
+    Scheduler, ScoreTerm, Speculate, SpeedConfig, Status, Time, Timing, WorkerId, WorkerState,
 };
 
 /// The `(job, worker)` of each start in `out`.
@@ -141,11 +141,10 @@ fn earliest_finish_defers_only_when_it_pays() {
                 p.next_wakeup(),
                 Some(Time::ORIGIN + reserve_after.min(Duration::from_secs(100)))
             );
-            assert!(
-                p.explain(1)
-                    .unwrap()
-                    .contains("waiting for faster worker 2")
-            );
+            assert!(matches!(
+                p.explain(1).unwrap().waiting().unwrap().hold,
+                Some(Holding::Deferral { worker: 2, .. })
+            ));
             p.handle(done(0), Time(Duration::from_millis(2500)));
             assert_eq!(
                 starts(p.poll(Time(Duration::from_millis(2500)))),
@@ -313,10 +312,11 @@ fn speculation_starts_a_second_attempt_and_the_first_done_wins() {
         let s = p.stats();
         assert_eq!((s.running, s.placements_total), (1, 3));
         assert_eq!((s.workers[0].running, s.workers[1].running), (1, 1));
-        assert!(
-            p.explain(1)
-                .unwrap()
-                .contains("attempt 1 on worker 1, attempt 2 on worker 2")
+        assert_eq!(
+            p.explain(1).unwrap().status,
+            Status::Running {
+                attempts: vec![(1, 1), (2, 2)]
+            }
         );
         // Attempt n runs on worker n.
         let (loser, at) = if winner == 2 { (1, 26) } else { (2, 100) };
@@ -359,7 +359,12 @@ fn failed_speculative_attempt_leaves_the_original_running() {
     assert_eq!(p.poll(Time(Duration::from_secs(5))), vec![]);
     let s = p.stats();
     assert_eq!((s.running, s.waiting), (1, 0));
-    assert!(p.explain(1).unwrap().contains("attempt 1 on worker 1"));
+    assert_eq!(
+        p.explain(1).unwrap().status,
+        Status::Running {
+            attempts: vec![(1, 1)]
+        }
+    );
     p.handle(
         Input::Done { job: 1, attempt: 1 },
         Time(Duration::from_secs(100)),
@@ -541,16 +546,21 @@ fn unrelated_machines_learn_speeds_per_kind() {
     };
     r.handle(Input::Submit(spec), now);
     let e = r.explain(1004).unwrap();
-    assert!(
-        e.contains("kind a runs") && e.contains("on class x") && e.contains("on class y"),
+    let w = e.waiting().unwrap();
+    let classes: Vec<&str> = w.kind_factors.iter().map(|(c, _)| c.as_str()).collect();
+    assert_eq!(
+        (w.kind.as_deref(), classes),
+        (Some("a"), vec!["x", "y"]),
         "{e}"
     );
+    assert!(e.to_string().contains("; kind a runs "), "{e}");
     let spec = JobSpec {
         kind: Some("new".into()),
         ..job(1005, Some(Duration::from_secs(8)))
     };
     r.handle(Input::Submit(spec), now);
-    assert!(!r.explain(1005).unwrap().contains("kind new"));
+    let e = r.explain(1005).unwrap();
+    assert!(e.waiting().unwrap().kind_factors.is_empty(), "{e}");
 
     let mut q = two_classes(Timing::learned());
     let now = train(&mut q);

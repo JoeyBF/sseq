@@ -40,11 +40,9 @@
 //! while shared.waiting() == 0 {
 //!     thread::yield_now();
 //! }
-//! assert!(
-//!     shared
-//!         .explain(2)
-//!         .unwrap()
-//!         .ends_with("slots full on 1 worker(s)")
+//! assert_eq!(
+//!     shared.explain(2).unwrap().waiting().unwrap().workers,
+//!     [(1, whelm::Verdict::SlotsFull)]
 //! );
 //! first.complete();
 //! assert_eq!(second.join().unwrap(), 1);
@@ -68,7 +66,7 @@ use mailbox::State;
 
 #[cfg(doc)]
 use crate::FailKind;
-use crate::{Input, JobId, JobSpec, Policy, PolicyStats, Time, WorkerId, WorkerState};
+use crate::{Explanation, Input, JobId, JobSpec, Policy, PolicyStats, Time, WorkerId, WorkerState};
 
 /// A thread-safe front end over a [`Policy`]: each task thread calls [`lease`](Self::lease),
 /// which submits its job and blocks until the policy starts it, then ends the lease with
@@ -396,12 +394,10 @@ impl<P: Policy> SharedPolicy<P> {
     /// *time.lock().unwrap() = wake;
     /// shared.tick();
     /// assert_eq!(shared.stats().reservations[0].job, 2);
-    /// assert!(
-    ///     shared
-    ///         .explain(2)
-    ///         .unwrap()
-    ///         .contains("holds the reservation on worker 1")
-    /// );
+    /// assert!(matches!(
+    ///     shared.explain(2).unwrap().waiting().unwrap().hold,
+    ///     Some(whelm::Holding::Reservation { worker: 1, .. })
+    /// ));
     /// first.complete();
     /// big.join().unwrap();
     /// ```
@@ -410,7 +406,7 @@ impl<P: Policy> SharedPolicy<P> {
     }
 
     /// Why a job is not running ([`Policy::explain`]); see the [module example](self).
-    pub fn explain(&self, job: JobId) -> Option<String> {
+    pub fn explain(&self, job: JobId) -> Option<Explanation> {
         self.lock().0.policy.explain(job)
     }
 

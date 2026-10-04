@@ -4,7 +4,8 @@ use std::time::Duration;
 
 use crate::{
     Attempt, Config, Constraint, FailKind, Input, JobId, JobSpec, OrderTerm, Output, Policy,
-    Resources, RetryConfig, SLOTS, Scheduler, ScoreTerm, Speculate, Time, WorkerId, WorkerState,
+    Resources, RetryConfig, SLOTS, Scheduler, ScoreTerm, Speculate, Time, Verdict, WorkerId,
+    WorkerState,
 };
 
 const GB: u64 = 1_000_000_000;
@@ -229,8 +230,18 @@ fn retry_keeps_place_and_age() {
     );
     assert_eq!(starts(&out), vec![(2, 1)]);
     assert_eq!(q.stats().longest_wait, Some((0, Duration::from_secs(5))));
-    let msg = q.explain(0).unwrap();
-    assert!(msg.contains("failed 1 time(s), last on worker 1"), "{msg}");
+    let e = q.explain(0).unwrap();
+    let w = e.waiting().unwrap();
+    assert_eq!(
+        w.tried.iter().map(|t| t.worker).collect::<Vec<_>>(),
+        [1],
+        "{e}"
+    );
+    // The avoidance of worker 1 holds while worker 2 lives, and excludes it like a constraint.
+    assert_eq!(
+        w.workers,
+        [(1, Verdict::Ineligible), (2, Verdict::SlotsFull)]
+    );
     let out = feed(&mut q, Time(Duration::from_secs(6)), [done(1, 1)]);
     assert_eq!(
         out,
@@ -750,10 +761,14 @@ fn requires_and_forbids() {
         starts(&feed(&mut p, Time::ORIGIN, inputs)),
         vec![(0, 2), (3, 3)]
     );
-    let msg = p.explain(1).unwrap();
+    let e = p.explain(1).unwrap();
+    let w = e.waiting().unwrap();
+    assert!(w.workers.iter().all(|w| w.1 == Verdict::Ineligible), "{e}");
+    assert_eq!(w.workers.len(), 3);
     assert!(
-        msg.contains("3 worker(s) excluded by its constraints"),
-        "{msg}"
+        e.to_string()
+            .ends_with("; 3 worker(s) excluded by its constraints"),
+        "{e}"
     );
 }
 
@@ -816,8 +831,8 @@ fn slots_are_a_hard_dimension() {
         (load.running, load.placed[SLOTS], load.headroom[SLOTS]),
         (2, 2, Some(0))
     );
-    let msg = p.explain(2).unwrap();
-    assert!(msg.contains("slots full on 1 worker(s)"), "{msg}");
+    let e = p.explain(2).unwrap();
+    assert_eq!(e.waiting().unwrap().workers, [(1, Verdict::SlotsFull)]);
 }
 
 /// Without enough gain, nothing is speculated.

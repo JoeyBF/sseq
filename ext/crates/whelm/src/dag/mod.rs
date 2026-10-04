@@ -162,7 +162,10 @@ use std::{
     sync::Arc,
 };
 
-use crate::{Attempt, Input, JobId, JobSpec, Output, Policy, PolicyStats, Time, WorkerId};
+use crate::{
+    Attempt, Explanation, Input, JobId, JobSpec, Output, Policy, PolicyStats, Status, Time,
+    WorkerId,
+};
 
 mod config;
 mod declare;
@@ -374,10 +377,7 @@ impl Loc {
 /// );
 /// let out = dag.poll(Time(Duration::from_secs(1)));
 /// assert!(matches!(out[..], [Output::GaveUp(GaveUp { job: 1, .. })]));
-/// assert_eq!(
-///     dag.explain(1).unwrap(),
-///     "job 1 is ready and held until release"
-/// );
+/// assert_eq!(dag.explain(1).unwrap().status, whelm::Status::Held);
 ///
 /// assert!(dag.release(1, Time(Duration::from_secs(2))));
 /// assert_eq!(
@@ -655,11 +655,14 @@ impl<P: Policy> Policy for DagScheduler<P> {
 
     /// The DAG's reason while the job is not submitted, the inner policy's afterwards. Units are
     /// explained by their id.
-    fn explain(&self, job: JobId) -> Option<String> {
+    fn explain(&self, job: JobId) -> Option<Explanation> {
         match self.locate(job) {
-            Some(Loc::Unit(u)) => Some(self.explain_unit(u, "unit")),
+            Some(Loc::Unit(u)) => Some(Explanation {
+                unit: true,
+                ..Explanation::new(job, self.unit_status(u))
+            }),
             Some(Loc::Leaf { unit, leaf }) => self.explain_leaf(unit, leaf, job),
-            None if self.is_completed(job) => Some(format!("job {job} completed")),
+            None if self.is_completed(job) => Some(Explanation::new(job, Status::Completed)),
             None => self.policy.explain(job),
         }
     }

@@ -51,7 +51,11 @@
 //!     worker,
 //! };
 //! assert_eq!(s.poll(Time::ORIGIN), [start(0, 1), start(1, 2)]);
-//! assert!(s.explain(2).unwrap().contains("slots full on 2 worker(s)"));
+//! let why = s.explain(2).unwrap();
+//! assert!(
+//!     why.to_string().contains("slots full on 2 worker(s)"),
+//!     "{why}"
+//! );
 //! s.handle(
 //!     Input::Done { job: 0, attempt: 1 },
 //!     Time(Duration::from_secs(10)),
@@ -78,7 +82,7 @@ use holds::Hold;
 use order::{Key, dedup};
 
 use crate::{
-    Admission, Attempt, Config, Input, JobId, JobSpec, Output, Policy, PolicyStats,
+    Admission, Attempt, Config, Explanation, Input, JobId, JobSpec, Output, Policy, PolicyStats,
     ProductionAdmission, Resources, SLOTS, Time, Tried, WorkerId, WorkerState, WorkerView,
     speed::{ClassId, KindId, Speeds},
 };
@@ -220,7 +224,7 @@ fn tick_occ(w: &mut Worker, now: Time) {
 /// s.handle(Input::Submit(job(2, 20)), Time(Duration::from_secs(1)));
 /// assert_eq!(s.poll(Time(Duration::from_secs(1))), [start(2, 1, 1)]);
 /// let why = s.explain(1).unwrap();
-/// assert!(why.contains("memory short on 1 worker(s)"), "{why}");
+/// assert!(why.to_string().contains("memory short on 1 worker(s)"), "{why}");
 /// ```
 ///
 /// # Retries
@@ -302,7 +306,10 @@ fn tick_occ(w: &mut Worker, now: Time) {
 /// assert_eq!((reservation.job, reservation.worker), (1, 1));
 /// s.handle(Input::Submit(job(20, 5)), Time(Duration::from_secs(70)));
 /// assert_eq!(s.poll(Time(Duration::from_secs(70))), [start(20, 1, 2)]);
-/// assert!(s.explain(1).unwrap().contains("holds the reservation on worker 1"));
+/// assert!(matches!(
+///     s.explain(1).unwrap().waiting().unwrap().hold,
+///     Some(whelm::Holding::Reservation { worker: 1, .. })
+/// ));
 /// s.handle(Input::Done { job: 10, attempt: 1 }, Time(Duration::from_secs(100)));
 /// assert_eq!(s.poll(Time(Duration::from_secs(100))), [start(1, 1, 1)]);
 /// assert_eq!(s.stats().last_dispatch_holders, [1]);
@@ -348,7 +355,10 @@ fn tick_occ(w: &mut Worker, now: Time) {
 /// s.handle(Input::Submit(work(1, 40)), Time::ORIGIN);
 /// assert_eq!(s.poll(Time::ORIGIN), []);
 /// assert_eq!(s.stats().deferred, [(1, 2, Time(Duration::from_millis(2500)))]);
-/// assert!(s.explain(1).unwrap().contains("waiting for faster worker 2"));
+/// assert!(matches!(
+///     s.explain(1).unwrap().waiting().unwrap().hold,
+///     Some(whelm::Holding::Deferral { worker: 2, .. })
+/// ));
 /// s.handle(Input::Done { job: 0, attempt: 1 }, Time(Duration::from_millis(2500)));
 /// assert_eq!(s.poll(Time(Duration::from_millis(2500))), [start(1, 1, 2)]);
 /// ```
@@ -660,7 +670,7 @@ impl Policy for Scheduler {
     }
 
     /// Every worker's reason to refuse it, summarised.
-    fn explain(&self, job: JobId) -> Option<String> {
+    fn explain(&self, job: JobId) -> Option<Explanation> {
         Scheduler::explain(self, job)
     }
 

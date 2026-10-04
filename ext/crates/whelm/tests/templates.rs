@@ -5,8 +5,8 @@ use std::{collections::BTreeMap, sync::Arc, time::Duration};
 use proptest::prelude::*;
 use whelm::{
     Config, Constraint, DagConfig, DagError, DagJob, DagScheduler, DagTemplate, Input, JobId,
-    JobSpec, NodeSource, Output, Policy, Resources, Scheduler, TemplateNode, TemplateSpec, Time,
-    Unit, WorkerId, WorkerState,
+    JobSpec, NodeSource, Output, Policy, Resources, Scheduler, Status, TemplateNode, TemplateSpec,
+    Time, Unit, Verdict, WorkerId, WorkerState,
 };
 
 /// A DAG layer over one worker with many slots.
@@ -388,11 +388,7 @@ fn substituted_units() {
     assert_eq!(d.rank(12), Some(Duration::from_secs(21)));
     assert_eq!(d.rank(1), Some(Duration::from_secs(27)));
     assert_eq!(placed(&mut d, Time::ORIGIN), vec![10, 14]);
-    assert!(
-        d.explain(11).unwrap().contains("to be entered"),
-        "{:?}",
-        d.explain(11)
-    );
+    assert_eq!(d.explain(11).unwrap().status, Status::Unentered { unit: 1 });
     complete(&mut d, 10, Time(Duration::from_secs(1)));
     assert_eq!(placed(&mut d, Time(Duration::from_secs(1))), vec![11]);
     assert_eq!(d.dag_stats().frames, 2);
@@ -440,7 +436,15 @@ fn forbid_and_class_are_hard_constraints() {
     let nowhere = spec(3, vec![Constraint::require_class("v100")]);
     p.handle(Input::Submit(nowhere), Time(Duration::from_secs(1)));
     assert!(starts(&mut p, Time(Duration::from_secs(1))).is_empty());
-    assert!(p.explain(3).unwrap().contains("2 worker(s) excluded"));
+    let e = p.explain(3).unwrap();
+    let verdicts: Vec<Verdict> = e
+        .waiting()
+        .unwrap()
+        .workers
+        .iter()
+        .map(|w| w.1.clone())
+        .collect();
+    assert_eq!(verdicts, [Verdict::Ineligible, Verdict::Ineligible]);
     join(&mut p, 3, "v100", 1, Time(Duration::from_secs(2)));
     assert_eq!(starts(&mut p, Time(Duration::from_secs(2))), vec![(3, 3)]);
 }

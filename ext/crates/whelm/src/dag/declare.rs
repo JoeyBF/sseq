@@ -165,10 +165,13 @@ impl<P: Policy> DagScheduler<P> {
     /// # };
     /// dag.declare([job(1, vec![]), job(3, vec![2])], Time::ORIGIN)
     ///     .unwrap();
-    /// assert_eq!(dag.explain(3).unwrap(), "job 3 waits for 1 dependency [2]");
     /// assert_eq!(
-    ///     dag.explain(2).unwrap(),
-    ///     "unit 2 is not declared yet (named as a dependency of 1 unit(s))"
+    ///     dag.explain(3).unwrap().to_string(),
+    ///     "job 3 waits for 1 dependency [2]"
+    /// );
+    /// assert_eq!(
+    ///     dag.explain(2).unwrap().status,
+    ///     whelm::Status::Undeclared { dependents: 1 }
     /// );
     /// let before = dag.dag_stats();
     /// assert_eq!(

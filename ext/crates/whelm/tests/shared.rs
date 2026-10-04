@@ -13,9 +13,9 @@ use std::{
 
 use proptest::prelude::*;
 use whelm::{
-    Attempt, Config, Defer, FailKind, GaveUp, Input, JobId, JobSpec, Lease, Output, Policy,
-    PolicyStats, Resources, RetryConfig, Scheduler, SharedPolicy, SpeedConfig, Time, WorkerId,
-    WorkerState,
+    Attempt, Config, Defer, Explanation, FailKind, GaveUp, Input, JobId, JobSpec, Lease, Output,
+    Policy, PolicyStats, Resources, RetryConfig, Scheduler, SharedPolicy, SpeedConfig, Time,
+    WorkerId, WorkerState,
 };
 
 /// A worker of class "x".
@@ -275,7 +275,7 @@ impl Policy for Probe {
     }
 
     /// Forwarded.
-    fn explain(&self, job: JobId) -> Option<String> {
+    fn explain(&self, job: JobId) -> Option<Explanation> {
         self.inner.explain(job)
     }
 

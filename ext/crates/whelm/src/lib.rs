@@ -272,7 +272,7 @@
 //! p.handle(fail(5, 1, "segfault"), Time(Duration::from_secs(10)));
 //! assert!(p.poll(Time(Duration::from_secs(10))).is_empty());
 //! assert_eq!(
-//!     p.explain(5).unwrap(),
+//!     p.explain(5).unwrap().to_string(),
 //!     "job 5 (demand 0.00 GB, group 0) waiting 10s, 0 more urgent job(s) waiting; failed 1 \
 //!      time(s), last on worker 1 (Other: segfault); slots full on 1 worker(s); 1 worker(s) \
 //!      excluded by its constraints"
@@ -472,8 +472,10 @@
 //! p.handle(Input::Done { job: 5, attempt: 1 }, Time(Duration::from_secs(61))); // stale: ignored
 //! assert!(p.poll(Time(Duration::from_secs(61))).is_empty());
 //! assert_eq!(
-//!     p.explain(5).unwrap(),
-//!     "job 5 is running: attempt 2 on worker 2"
+//!     p.explain(5).unwrap().status,
+//!     whelm::Status::Running {
+//!         attempts: vec![(2, 2)]
+//!     }
 //! );
 //! ```
 //!
@@ -547,11 +549,14 @@
 //! Whether a worker takes a job is up to an [`Admission`] rule; the default,
 //! [`ProductionAdmission`], admits a job if, in every dimension, what the worker already uses plus
 //! the job's demand fits its capacity. A job that fits nowhere waits, and
-//! [`explain`](Policy::explain) says why.
+//! [`explain`](Policy::explain) says why: its [`Explanation`] gives the job's [`Status`], and for a
+//! job [`Waiting`] for a worker, one [`Verdict`] per worker. Displayed, it is one line for a log.
 //!
 //! ```
 //! # use std::time::Duration;
 //! # use whelm::{Config, Input, JobSpec, Output, Policy, Resources, Scheduler, Time, WorkerState};
+//! use whelm::{MEM, Status, Verdict};
+//!
 //! let mut p = Scheduler::new(Config::default());
 //! p.handle(
 //!     Input::Worker(WorkerState {
@@ -588,8 +593,22 @@
 //!         worker: 1
 //!     }]
 //! );
+//! let why = p.explain(2).unwrap();
+//! let Status::Waiting(waiting) = &why.status else {
+//!     panic!("job 2 is not waiting");
+//! };
+//! for (worker, verdict) in &waiting.workers {
+//!     match verdict {
+//!         Verdict::Short { dims, headroom } => {
+//!             // Short of memory only, with 4 GB left.
+//!             assert_eq!((*worker, dims[MEM]), (1, true));
+//!             assert_eq!(headroom[MEM], Some(4_000_000_000));
+//!         }
+//!         other => panic!("worker {worker}: {other:?}"),
+//!     }
+//! }
 //! assert_eq!(
-//!     p.explain(2).unwrap(),
+//!     why.to_string(),
 //!     "job 2 (demand 6.00 GB, group 0) waiting 0s, 0 more urgent job(s) waiting; memory short \
 //!      on 1 worker(s) (best headroom 4.00 GB on worker 1)"
 //! );
@@ -741,7 +760,9 @@
 //!     Time(Duration::from_secs(2)),
 //! );
 //! assert!(p.poll(Time(Duration::from_secs(2))).is_empty());
-//! assert!(p.explain(4).unwrap().contains("slots full on 1 worker(s)"));
+//! assert!(
+//!     (p.explain(4).unwrap().to_string()).contains("slots full on 1 worker(s)")
+//! );
 //! ```
 //!
 //! A worker can also declare a [`per_task`](WorkerState::per_task) floor: what any one job takes
@@ -894,11 +915,10 @@
 //! let tpu = Constraint::require_class("tpu");
 //! p.handle(Input::Submit(job(3, vec![tpu])), Time(Duration::from_secs(1)));
 //! assert!(p.poll(Time(Duration::from_secs(1))).is_empty());
-//! assert!(
-//!     p.explain(3)
-//!         .unwrap()
-//!         .ends_with("; 3 worker(s) excluded by its constraints")
-//! );
+//! let why = p.explain(3).unwrap();
+//! let verdicts = &why.waiting().unwrap().workers;
+//! assert!(verdicts.iter().all(|(_, v)| *v == whelm::Verdict::Ineligible));
+//! assert!(why.to_string().ends_with("; 3 worker(s) excluded by its constraints"));
 //! ```
 //!
 //! A preferred worker wins over a less loaded one: the default score ranks
@@ -992,11 +1012,8 @@
 //!         worker: 2
 //!     }]
 //! );
-//! assert!(
-//!     p.explain(2)
-//!         .unwrap()
-//!         .contains("1 worker(s) excluded by its constraints")
-//! );
+//! let why = p.explain(2).unwrap();
+//! assert_eq!(why.waiting().unwrap().workers[0], (1, whelm::Verdict::Ineligible));
 //!
 //! p.handle(
 //!     Input::Worker(WorkerState {
@@ -1279,8 +1296,8 @@
 //! ```
 //! # use std::time::Duration;
 //! # use whelm::{
-//! #     Config, Input, JobSpec, Output, Policy, ReservationInfo, Resources, Scheduler, Time,
-//! #     WorkerState,
+//! #     Config, Holding, Input, JobSpec, Output, Policy, ReservationInfo, Resources, Scheduler,
+//! #     Time, Verdict, WorkerState,
 //! # };
 //! let mut p = Scheduler::new(Config::default()); // reserve after 60 s
 //! let worker =
@@ -1307,13 +1324,17 @@
 //! assert!(p.poll(Time(Duration::from_secs(60))).is_empty());
 //! let reservation = ReservationInfo { job: 9, worker: 1, since: Time(Duration::from_secs(60)) };
 //! assert_eq!(p.stats().reservations, [reservation]);
-//! assert!(p.explain(9).unwrap().contains("holds the reservation on worker 1"));
+//! let hold = p.explain(9).unwrap().waiting().unwrap().hold.clone();
+//! assert!(matches!(hold, Some(Holding::Reservation { worker: 1, .. })));
 //!
 //! // Small jobs no longer get in, although they would fit.
 //! p.handle(done(2), Time(Duration::from_secs(70)));
 //! p.handle(job(4, 4.0), Time(Duration::from_secs(70)));
 //! assert!(p.poll(Time(Duration::from_secs(70))).is_empty());
-//! assert!(p.explain(4).unwrap().ends_with("; reserved: worker 1 for job 9"));
+//! assert_eq!(
+//!     p.explain(4).unwrap().waiting().unwrap().workers,
+//!     [(1, Verdict::Reserved { by: 9 })]
+//! );
 //!
 //! // Once enough has drained, the holder runs.
 //! p.handle(done(3), Time(Duration::from_secs(90)));
@@ -1628,7 +1649,7 @@
 //!
 //! The score picks the best worker that admits a job *now*. With [`SpeedConfig::defer`], a job may
 //! instead wait for a busy, faster worker on which it would finish sooner (earliest finish time, as
-//! in HEFT). The wait is a hold: it shows in [`PolicyStats::deferred`] and in `explain`, and it
+//! in HEFT). The wait is a hold: it shows in [`PolicyStats::deferred`] and as an `explain`'s [`Holding::Deferral`], and it
 //! lapses after [`max_wait`](Defer::max_wait).
 //!
 //! ```
@@ -1680,11 +1701,10 @@
 //! p.handle(Input::Submit(job(2, 40)), Time::ORIGIN);
 //! assert!(p.poll(Time::ORIGIN).is_empty());
 //! assert_eq!(p.stats().deferred, [(2, 2, Time(Duration::from_millis(2500)))]);
-//! assert!(
-//!     p.explain(2)
-//!         .unwrap()
-//!         .contains("waiting for faster worker 2")
-//! );
+//! assert!(matches!(
+//!     p.explain(2).unwrap().waiting().unwrap().hold,
+//!     Some(whelm::Holding::Deferral { worker: 2, .. })
+//! ));
 //!
 //! p.handle(Input::Done { job: 1, attempt: 1 }, Time(Duration::from_millis(2500)));
 //! assert_eq!(
@@ -1820,8 +1840,12 @@
 //! dag.declare(jobs, Time::ORIGIN).unwrap();
 //! assert_eq!(dag.poll(Time::ORIGIN), [start(1)]);
 //! assert_eq!(
-//!     dag.explain(4).unwrap(),
-//!     "job 4 waits for 2 dependencies [2, 3]"
+//!     dag.explain(4).unwrap().status,
+//!     whelm::Status::Pending {
+//!         unit: 4,
+//!         closed: false,
+//!         unmet: vec![2, 3]
+//!     }
 //! );
 //!
 //! dag.handle(
@@ -1941,10 +1965,7 @@
 //! };
 //! dag.declare([job], Time::ORIGIN).unwrap();
 //! assert_eq!(dag.announcements(), [Output::Ready { job: 1 }]);
-//! assert_eq!(
-//!     dag.explain(1).unwrap(),
-//!     "job 1 is ready and held until release"
-//! );
+//! assert_eq!(dag.explain(1).unwrap().status, whelm::Status::Held);
 //!
 //! // ... prepare the job's inputs, then hand it over.
 //! assert!(dag.release(1, Time::ORIGIN));
@@ -2022,7 +2043,7 @@
 //! dag.declare([first, second], Time::ORIGIN).unwrap();
 //! assert_eq!(dag.poll(Time::ORIGIN), [start(100)]);
 //! assert_eq!(
-//!     dag.explain(20).unwrap(),
+//!     dag.explain(20).unwrap().to_string(),
 //!     "unit 20 waits for 1 dependency [10]"
 //! );
 //!
@@ -2085,7 +2106,7 @@
 //! assert_eq!(dag.poll(Time::ORIGIN), [Output::Start { job: 100, attempt: 1, worker: 1 }]);
 //! assert_eq!(dag.stats().workers[0].placed[MEM], 1_000_000_000);
 //! assert_eq!(
-//!     dag.explain(102).unwrap(),
+//!     dag.explain(102).unwrap().to_string(),
 //!     "[unit 10 step 2] job 102 waits for 1 dependency within its unit"
 //! );
 //! ```
@@ -2497,16 +2518,18 @@
 //! let stats = flat.stats();
 //! assert_eq!((stats.running, stats.placements_total), (2, 4));
 //! assert_eq!(stats.workers[0].headroom[whelm::MEM], Some(0));
-//! assert!(
-//!     flat.explain(1)
-//!         .unwrap()
-//!         .starts_with("job 1 is running: attempt 2")
+//! assert_eq!(
+//!     flat.explain(1).unwrap().status,
+//!     whelm::Status::Running {
+//!         attempts: vec![(2, 1)]
+//!     }
 //! );
 //! ```
 //!
-//! [`Policy::explain`] and [`Policy::stats`] are the windows into a running policy: the first says,
-//! in words, why a job is not running (fit, constraints, holds, past failures), and the second
-//! counts jobs, reservations, placements and every worker's load. Both are cheap enough to log.
+//! [`Policy::explain`] and [`Policy::stats`] are the windows into a running policy: the first says
+//! why a job is not running (fit, constraints, holds, past failures), as an [`Explanation`] that
+//! prints as one line, and the second counts jobs, reservations, placements and every worker's
+//! load. Both are cheap enough to log.
 //!
 //! # Where to look next
 //!
@@ -2521,6 +2544,8 @@
 //!   last usable on its own).
 //! - [`dag`]: [`DagScheduler`], templates, units and [`NodeSource`].
 //! - [`shared`]: [`SharedPolicy`], the blocking front end for a thread per task.
+//! - [`explain`]: what [`Policy::explain`] reports: [`Explanation`] and the per-worker
+//!   [`Verdict`]s.
 //! - [`log`]: event logs, sinks and replay.
 //! - [`time`]: [`Time`], the points on the caller's clock that every call carries.
 //! - [`nassau`]: helpers for driving a Nassau resolution.
@@ -2536,6 +2561,7 @@
 pub mod admission;
 pub mod config;
 pub mod dag;
+pub mod explain;
 pub mod job;
 pub mod log;
 pub mod message;
@@ -2559,6 +2585,8 @@ pub use dag::{
     DagConfig, DagError, DagJob, DagScheduler, DagStats, DagTemplate, NodeSource, TemplateNode,
     TemplateSpec, Unit,
 };
+#[doc(inline)]
+pub use explain::{Explanation, Holding, Status, Verdict, Waiting};
 #[doc(inline)]
 pub use job::{Constraint, JobId, JobSpec, Selector, Strength};
 pub use log::EventSink;

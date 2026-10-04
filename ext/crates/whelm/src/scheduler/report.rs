@@ -1,26 +1,12 @@
 //! What the scheduler reports: [`Policy::stats`] and [`Policy::explain`].
 
-use super::{Scheduler, Worker, holds::Hold, placement::Refusal};
+use super::{Job, Scheduler, Worker, holds::Hold, placement::Refusal};
 #[cfg(doc)]
 use crate::Policy;
 use crate::{
-    DEV, DIMS, JobId, MEM, PolicyStats, ReservationInfo, Resources, SLOTS, WorkerId, WorkerLoad,
+    DIMS, Explanation, Holding, JobId, PolicyStats, ReservationInfo, SLOTS, Status, Verdict,
+    Waiting, WorkerLoad,
 };
-
-/// Bytes per gigabyte, for `explain`.
-pub(super) const GB: f64 = 1e9;
-
-/// Each dimension's name in `explain`, indexed by dimension.
-const DIM_NAMES: [&str; DIMS] = ["memory", "device memory", "slots"];
-
-/// A resource vector in words for `explain`: host memory always, device memory when nonzero.
-fn gb_list(r: &Resources) -> String {
-    let mut parts = vec![format!("{:.2} GB", r[MEM] as f64 / GB)];
-    if r[DEV] > 0 {
-        parts.push(format!("{:.2} GB device", r[DEV] as f64 / GB));
-    }
-    parts.join(" + ")
-}
 
 impl Scheduler {
     /// A worker's load as reported in the stats.
@@ -75,120 +61,84 @@ impl Scheduler {
         }
     }
 
-    /// Classify every worker's reason to refuse the job, and summarise.
-    pub(super) fn explain(&self, job: JobId) -> Option<String> {
+    /// The job's live attempts if it runs, otherwise its wait and every worker's verdict.
+    pub(super) fn explain(&self, job: JobId) -> Option<Explanation> {
         if let Some(r) = self.running.get(&job) {
-            let runs: Vec<String> = r
-                .live
-                .iter()
-                .map(|run| format!("attempt {} on worker {}", run.attempt, run.worker))
-                .collect();
-            return Some(format!("job {job} is running: {}", runs.join(", ")));
+            let attempts = r.live.iter().map(|run| (run.attempt, run.worker)).collect();
+            return Some(Explanation::new(job, Status::Running { attempts }));
         }
         let j = self.waiting.get(&job)?;
-        let ahead = self.queue.range(..j.key).count();
-        let mut msg = format!(
-            "job {job} (demand {}, group {}) waiting {:.0}s, {ahead} more urgent job(s) waiting",
-            gb_list(&j.spec.demand),
-            j.spec.group,
-            (self.now - j.since).as_secs_f64()
-        );
-        if let Some(last) = j.tried.last() {
-            msg += &format!(
-                "; failed {} time(s), last on worker {} ({:?}: {})",
-                j.tried.len(),
-                last.worker,
-                last.kind,
-                last.why
-            );
-        }
-        match self.holds.get(&job) {
-            Some(Hold::Reserve { worker, .. }) => {
-                let w = &self.workers[worker];
-                msg += &format!(
-                    "; holds the reservation on worker {} (draining: {}/{} running, used {})",
-                    w.state.id,
-                    w.running(),
-                    w.state.slots,
-                    gb_list(&w.view().used())
-                );
-            }
-            Some(Hold::Defer { worker, at, .. }) => {
-                msg += &format!(
-                    "; waiting for faster worker {worker} (expected free at t={:.0})",
-                    at.0.as_secs_f64()
-                );
-            }
-            None => {}
-        }
-        if let (Some(kind), Some(name)) = (j.kind, &j.spec.kind) {
-            let factors: Vec<String> = (self.speeds.kind_factors(kind).into_iter())
-                .map(|(class, f)| format!("{f:.2}x on class {class}"))
-                .collect();
-            if !factors.is_empty() {
-                msg += &format!("; kind {name} runs {}", factors.join(", "));
-            }
-        }
-        let (mut full, mut excluded) = (0, 0);
-        // Per dimension: workers short of it, and the one with the most headroom there.
-        let mut short = [0usize; DIMS];
-        let mut best_short: [Option<(i64, WorkerId)>; DIMS] = [None; DIMS];
-        let mut reserved = Vec::new();
-        let mut takers = Vec::new();
-        for (&id, w) in &self.workers {
-            match self.refusal(j, w) {
-                None => takers.push(id),
-                Some(Refusal::Ineligible) => excluded += 1,
-                Some(Refusal::Held(h, Hold::Reserve { .. })) => {
-                    reserved.push(format!("worker {id} for job {h}"))
+        let hold = self.holds.get(&job).map(|h| match *h {
+            Hold::Reserve {
+                worker,
+                since,
+                shadow,
+                ..
+            } => {
+                let w = &self.workers[&worker];
+                Holding::Reservation {
+                    worker,
+                    since,
+                    shadow,
+                    running: w.running(),
+                    slots: w.state.slots,
+                    used: w.view().used(),
                 }
-                Some(Refusal::Held(_, Hold::Defer { .. })) => {}
-                Some(Refusal::Admission) => {
-                    let view = w.view();
-                    let headroom = view.headroom();
-                    let lacking: Vec<usize> = view.short(&j.spec.demand).collect();
-                    if lacking.contains(&SLOTS) {
-                        full += 1;
-                        continue;
-                    }
-                    for d in lacking {
-                        short[d] += 1;
-                        let h = headroom[d].unwrap_or(i64::MAX);
-                        if best_short[d].is_none_or(|(b, _)| h > b) {
-                            best_short[d] = Some((h, id));
-                        }
+            }
+            Hold::Defer { worker, at, until } => Holding::Deferral {
+                worker,
+                expected_free: at,
+                until,
+            },
+        });
+        let mut kind_factors: Vec<(String, f64)> = match j.kind {
+            Some(kind) => (self.speeds.kind_factors(kind).into_iter())
+                .map(|(class, f)| (class.to_owned(), f))
+                .collect(),
+            None => Vec::new(),
+        };
+        kind_factors.sort_by(|a, b| a.0.cmp(&b.0));
+        let workers = (self.workers.iter())
+            .map(|(&id, w)| (id, self.verdict(j, w)))
+            .collect();
+        let waiting = Waiting {
+            demand: j.spec.demand,
+            group: j.spec.group,
+            since: j.since,
+            waited: self.now - j.since,
+            ahead: self.queue.range(..j.key).count(),
+            aged: self.aged(j),
+            tried: j.tried.clone(),
+            hold,
+            kind: j.spec.kind.clone(),
+            kind_factors,
+            workers,
+        };
+        Some(Explanation::new(job, Status::Waiting(Box::new(waiting))))
+    }
+
+    /// Whether `w` takes `job`, or why not, from its [`Refusal`].
+    fn verdict(&self, job: &Job, w: &Worker) -> Verdict {
+        match self.refusal(job, w) {
+            None => Verdict::Takes,
+            Some(Refusal::Ineligible) => Verdict::Ineligible,
+            Some(Refusal::Held(by, Hold::Reserve { .. })) => Verdict::Reserved { by },
+            Some(Refusal::Held(_, Hold::Defer { .. })) => Verdict::Deferred,
+            Some(Refusal::Admission) => {
+                let view = w.view();
+                let mut dims = [false; DIMS];
+                for d in view.short(&job.spec.demand) {
+                    dims[d] = true;
+                }
+                if dims[SLOTS] {
+                    Verdict::SlotsFull
+                } else {
+                    Verdict::Short {
+                        dims,
+                        headroom: view.headroom(),
                     }
                 }
             }
         }
-        if self.workers.is_empty() {
-            msg += "; no workers";
-        }
-        if full > 0 {
-            msg += &format!("; slots full on {full} worker(s)");
-        }
-        for d in 0..DIMS {
-            if let Some((h, w)) = best_short[d] {
-                msg += &format!(
-                    "; {} short on {} worker(s) (best headroom {:.2} GB on worker {w})",
-                    DIM_NAMES[d],
-                    short[d],
-                    h as f64 / GB
-                );
-            }
-        }
-        if excluded > 0 {
-            msg += &format!("; {excluded} worker(s) excluded by its constraints");
-        }
-        if !reserved.is_empty() {
-            msg += &format!("; reserved: {}", reserved.join(", "));
-        }
-        if !takers.is_empty() {
-            msg += &format!(
-                "; admitted on worker(s) {takers:?} (placed at the next poll unless a more urgent \
-                 job takes the slot)"
-            );
-        }
-        Some(msg)
     }
 }

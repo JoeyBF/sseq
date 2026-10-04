@@ -191,7 +191,10 @@ pub enum Timing {
     /// assert_eq!(place(&mut s, kind(101, "b"), now), 2);
     /// s.handle(Input::Submit(kind(102, "a")), now);
     /// let why = s.explain(102).unwrap();
-    /// assert!(why.contains("kind a runs") && why.contains("on class y"), "{why}");
+    /// let classes: Vec<&str> = (why.waiting().unwrap().kind_factors.iter())
+    ///     .map(|(class, _)| class.as_str())
+    ///     .collect();
+    /// assert_eq!(classes, ["x", "y"], "{why}");
     ///
     /// let mut s = two_classes(Timing::learned());
     /// let now = train(&mut s);

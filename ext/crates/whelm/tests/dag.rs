@@ -8,7 +8,7 @@ use std::{
 use proptest::prelude::*;
 use whelm::{
     Attempt, Config, DagConfig, DagError, DagJob, DagScheduler, Input, JobId, JobSpec, OrderTerm,
-    Output, Policy, Resources, RetryConfig, Scheduler, Time, WorkerState,
+    Output, Policy, Resources, RetryConfig, Scheduler, Status, Time, WorkerState,
 };
 
 /// A DAG layer over backfill with one roomy worker.
@@ -73,7 +73,16 @@ fn chain_becomes_ready_in_order() {
     d.declare(vec![job(1, &[]), job(2, &[1]), job(3, &[2])], Time::ORIGIN)
         .unwrap();
     assert_eq!(placed(&mut d, Time::ORIGIN), vec![1]);
-    assert!(d.explain(3).unwrap().contains("waits for 1 dependency [2]"));
+    let e = d.explain(3).unwrap();
+    assert_eq!(
+        e.status,
+        Status::Pending {
+            unit: 3,
+            closed: false,
+            unmet: vec![2]
+        }
+    );
+    assert_eq!(e.to_string(), "job 3 waits for 1 dependency [2]");
     complete(&mut d, 1, Time(Duration::from_secs(1)));
     assert_eq!(placed(&mut d, Time(Duration::from_secs(1))), vec![2]);
     complete(&mut d, 2, Time(Duration::from_secs(2)));
@@ -93,7 +102,10 @@ fn forward_references_wait_for_declaration() {
     d.declare(vec![job(2, &[1])], Time::ORIGIN).unwrap();
     assert!(placed(&mut d, Time::ORIGIN).is_empty());
     assert_eq!(d.dag_stats().undeclared, 1);
-    assert!(d.explain(1).unwrap().contains("not declared yet"));
+    assert_eq!(
+        d.explain(1).unwrap().status,
+        Status::Undeclared { dependents: 1 }
+    );
     d.declare(vec![job(1, &[])], Time(Duration::from_secs(1)))
         .unwrap();
     assert_eq!(placed(&mut d, Time(Duration::from_secs(1))), vec![1]);
@@ -275,7 +287,7 @@ fn held_jobs_wait_for_release() {
         .unwrap();
     assert_eq!(d.poll(Time::ORIGIN), vec![Output::Ready { job: 1 }]);
     assert!(d.poll(Time::ORIGIN).is_empty(), "announced once");
-    assert!(d.explain(1).unwrap().contains("held"));
+    assert_eq!(d.explain(1).unwrap().status, Status::Held);
     assert!(d.release(1, Time(Duration::from_secs(5))));
     assert!(!d.release(1, Time(Duration::from_secs(5))));
     assert_eq!(placed(&mut d, Time(Duration::from_secs(5))), vec![1]);

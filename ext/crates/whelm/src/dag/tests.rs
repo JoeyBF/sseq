@@ -3,9 +3,9 @@
 use std::{sync::Arc, time::Duration};
 
 use crate::{
-    Attempt, Config, DagConfig, DagError, DagJob, DagScheduler, DagStats, FailKind, GaveUp, Input,
-    JobId, JobSpec, Output, Policy, Resources, RetryConfig, Scheduler, TemplateSpec, Time, Unit,
-    WorkerId, WorkerState,
+    Attempt, Config, DagConfig, DagError, DagJob, DagScheduler, DagStats, Explanation, FailKind,
+    GaveUp, Input, JobId, JobSpec, Output, Policy, Resources, RetryConfig, Scheduler, Status,
+    TemplateSpec, Time, Unit, WorkerId, WorkerState,
 };
 
 /// A DAG over a FIFO scheduler with one one-slot worker, and `max_attempts` attempts per job.
@@ -123,7 +123,9 @@ fn done_releases_dependents() {
         (st.pending, st.submitted, st.completed_remembered),
         (0, 0, 2)
     );
-    assert_eq!(d.explain(2), Some("job 2 completed".into()));
+    let e = d.explain(2).unwrap();
+    assert_eq!(e, Explanation::new(2, Status::Completed));
+    assert_eq!(e.to_string(), "job 2 completed");
 }
 
 /// A retried job's stale report does not complete it here either.
@@ -290,7 +292,7 @@ fn give_up_holds_the_job() {
         panic!("expected a give-up, got {out:?}");
     };
     assert_eq!(d.dag_stats().held, 1);
-    assert!(d.explain(1).unwrap().contains("held until release"));
+    assert_eq!(d.explain(1).unwrap().status, Status::Held);
     assert!(d.release(1, Time(Duration::from_secs(2))));
     assert_eq!(d.poll(Time(Duration::from_secs(2))), vec![start(1, 1)]);
     assert_eq!(

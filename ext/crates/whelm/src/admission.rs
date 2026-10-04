@@ -324,7 +324,10 @@ impl WorkerView<'_> {
 ///     );
 /// }
 /// assert_eq!(s.poll(Time::ORIGIN).len(), 2);
-/// assert!(s.explain(2).unwrap().contains("slots full on 1 worker(s)"));
+/// assert_eq!(
+///     s.explain(2).unwrap().waiting().unwrap().workers,
+///     [(1, whelm::Verdict::SlotsFull)]
+/// );
 /// ```
 pub trait Admission {
     /// Whether `w` admits a job with demand `demand`.

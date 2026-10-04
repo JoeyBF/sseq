@@ -577,8 +577,10 @@ impl From<DagJob> for Unit {
 ///         worker: 1
 ///     }]
 /// );
+/// let why = dag.explain(102).unwrap();
+/// assert_eq!(why.label.as_deref(), Some("unit 10 step 2"));
 /// assert_eq!(
-///     dag.explain(102).unwrap(),
+///     why.to_string(),
 ///     "[unit 10 step 2] job 102 waits for 1 dependency within its unit"
 /// );
 /// dag.handle(
@@ -619,7 +621,7 @@ pub trait NodeSource: Send + Sync {
     /// arrives as the unit's spec with the leaf's id, work and rank. Default: unchanged.
     fn spec(&self, _unit: JobId, _leaf: u32, _spec: &mut JobSpec) {}
 
-    /// The leaf's name in [`explain`](Policy::explain) messages. Default: none.
+    /// The leaf's [`label`](crate::Explanation::label) when explained. Default: none.
     fn label(&self, _unit: JobId, _leaf: u32) -> Option<String> {
         None
     }

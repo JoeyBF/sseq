@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 #[cfg(doc)]
 use crate::{DagConfig, DagJob, DagScheduler, Defer, RetryConfig, Scheduler, Speculate, log};
-use crate::{JobId, JobSpec, PolicyStats, Time, WorkerId, WorkerState};
+use crate::{Explanation, JobId, JobSpec, PolicyStats, Time, WorkerId, WorkerState};
 
 /// The number of a job's attempt: 1 for its first start, counting retries and speculative
 /// attempts. The DAG layer's local jobs use 0 (see [`DagScheduler`]).
@@ -281,7 +281,8 @@ pub enum Output {
 ///
 /// ```
 /// use whelm::{
-///     Config, Input, JobId, JobSpec, Output, Policy, PolicyStats, Scheduler, Time, WorkerState,
+///     Config, Explanation, Input, JobId, JobSpec, Output, Policy, PolicyStats, Scheduler, Time,
+///     WorkerState,
 /// };
 ///
 /// /// Counts every start the inner policy emits.
@@ -308,7 +309,7 @@ pub enum Output {
 ///         self.inner.next_wakeup()
 ///     }
 ///
-///     fn explain(&self, job: JobId) -> Option<String> {
+///     fn explain(&self, job: JobId) -> Option<Explanation> {
 ///         self.inner.explain(job)
 ///     }
 ///
@@ -353,8 +354,9 @@ pub trait Policy {
     /// is timed. Callers with frequent events may ignore it at the cost of that much extra
     /// waiting.
     fn next_wakeup(&self) -> Option<Time>;
-    /// Why a job is not running, in words (for logs). `None` for unknown jobs.
-    fn explain(&self, job: JobId) -> Option<String>;
+    /// Why a job is (not) running; its [`Display`](std::fmt::Display) form is one line for logs.
+    /// `None` for unknown jobs.
+    fn explain(&self, job: JobId) -> Option<Explanation>;
     /// Counters and current state.
     fn stats(&self) -> PolicyStats;
 }
@@ -376,7 +378,7 @@ impl<P: Policy + ?Sized> Policy for Box<P> {
     }
 
     /// Forwarded to the boxed policy.
-    fn explain(&self, job: JobId) -> Option<String> {
+    fn explain(&self, job: JobId) -> Option<Explanation> {
         (**self).explain(job)
     }
 

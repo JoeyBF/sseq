@@ -3,8 +3,8 @@
 use std::time::Duration;
 
 use whelm::{
-    Config, Constraint, Input, JobId, JobSpec, Output, Policy, Reservations, Resources, Scheduler,
-    Time, WorkerId, WorkerState,
+    Config, Constraint, FailKind, Holding, Input, JobId, JobSpec, Output, Policy, Reservations,
+    Resources, Scheduler, Time, Verdict, WorkerId, WorkerState,
 };
 
 /// The `(job, worker)` of each start in `out`.
@@ -78,7 +78,10 @@ fn reserved_worker_admits_only_its_holder() {
     let out = starts(p.poll(Time(Duration::from_secs(62))));
     assert_eq!(out.len(), 1);
     assert_ne!(out[0].1, w);
-    assert!(p.explain(1).unwrap().contains("holds the reservation"));
+    assert!(matches!(
+        p.explain(1).unwrap().waiting().unwrap().hold,
+        Some(Holding::Reservation { worker, .. }) if worker == w
+    ));
     // The reserved worker drains; the holder goes there by the escape hatch.
     let running_there = if w == 1 { 10 } else { 11 };
     p.handle(done(running_there), Time(Duration::from_secs(100)));
@@ -122,11 +125,11 @@ fn reserved_worker_leaves_and_its_lost_job_reserves_again() {
     let r = p.stats().reservations;
     assert_eq!(r.len(), 1);
     assert_eq!((r[0].job, r[0].worker), (lost, other));
-    assert!(
-        p.explain(lost)
-            .unwrap()
-            .contains(&format!("failed 1 time(s), last on worker {w} (LinkDied"))
-    );
+    let e = p.explain(lost).unwrap();
+    let tried: Vec<_> = (e.waiting().unwrap().tried.iter())
+        .map(|t| (t.worker, t.kind))
+        .collect();
+    assert_eq!(tried, [(w, FailKind::LinkDied)]);
     p.handle(done(running_on_other), Time(Duration::from_secs(100)));
     assert_eq!(
         p.poll(Time(Duration::from_secs(100))),
@@ -195,7 +198,12 @@ fn heartbeat_raising_usage_blocks_placements() {
     );
     p.handle(Input::Submit(job(2, 10, 0)), Time(Duration::from_secs(1)));
     assert!(starts(p.poll(Time(Duration::from_secs(1)))).is_empty());
-    assert!(p.explain(2).unwrap().contains("memory short on 1"));
+    assert!(
+        p.explain(2)
+            .unwrap()
+            .to_string()
+            .contains("memory short on 1")
+    );
     p.handle(
         Input::Worker(worker(1, 4, 100, 20)),
         Time(Duration::from_secs(2)),
@@ -334,10 +342,12 @@ fn shadow_backfill_admits_jobs_that_end_in_time() {
         Time(Duration::from_secs(62)),
     );
     assert_eq!(starts(p.poll(Time(Duration::from_secs(62)))), vec![(20, w)]);
+    let e = p.explain(21).unwrap();
     assert!(
-        p.explain(21)
+        e.waiting()
             .unwrap()
-            .contains(&format!("worker {w} for job 1"))
+            .workers
+            .contains(&(w, Verdict::Reserved { by: 1 }))
     );
     // Unknown work never backfills.
     p.handle(Input::Submit(job(22, 5, 2)), Time(Duration::from_secs(63)));
@@ -369,9 +379,11 @@ fn shadow_backfill_stops_at_the_shadow_time() {
         Time(Duration::from_secs(101)),
     );
     assert!(starts(p.poll(Time(Duration::from_secs(101)))).is_empty());
+    let e = p.explain(21).unwrap();
     assert!(
-        p.explain(21)
+        e.waiting()
             .unwrap()
-            .contains(&format!("worker {w} for job 1"))
+            .workers
+            .contains(&(w, Verdict::Reserved { by: 1 }))
     );
 }

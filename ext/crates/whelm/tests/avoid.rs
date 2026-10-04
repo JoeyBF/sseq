@@ -125,11 +125,15 @@ fn retry_softly_avoids_the_worker_it_failed_on() {
     );
     // Worker 1 is free but avoided while worker 2 lives.
     assert_eq!(starts(p.poll(Time(Duration::from_secs(1)))), vec![]);
-    assert!(
-        p.explain(0)
-            .unwrap()
-            .contains("failed 1 time(s), last on worker 1")
-    );
+    let e = p.explain(0).unwrap();
+    let tried: Vec<WorkerId> = e
+        .waiting()
+        .unwrap()
+        .tried
+        .iter()
+        .map(|t| t.worker)
+        .collect();
+    assert_eq!(tried, [1]);
     // Worker 2 leaves: its job fails too, and both retries fall back to worker 1, the only one.
     p.handle(Input::WorkerGone(2), Time(Duration::from_secs(2)));
     let out = p.poll(Time(Duration::from_secs(2)));

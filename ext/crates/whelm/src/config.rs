@@ -885,10 +885,10 @@ pub enum GroupOrder {
 ///     s.poll(Time(Duration::from_secs(61))),
 ///     [start(30, 2), start(21, 1)]
 /// );
+/// let why = s.explain(20).unwrap();
 /// assert!(
-///     s.explain(20)
-///         .unwrap()
-///         .contains("reserved: worker 1 for job 1")
+///     why.to_string().contains("reserved: worker 1 for job 1"),
+///     "{why}"
 /// );
 /// ```
 #[derive(Clone, Copy, Debug, PartialEq)]

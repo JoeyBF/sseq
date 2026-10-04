@@ -34,7 +34,7 @@ enum Pick {
     Nothing,
 }
 
-/// Why a worker does not take a job, for `explain`.
+/// Why a worker does not take a job, for [`Verdict`](crate::Verdict).
 pub(super) enum Refusal {
     Ineligible,
     /// A hold, and the job that has it.
