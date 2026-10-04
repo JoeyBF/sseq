@@ -151,14 +151,14 @@ impl<P: Policy> DagScheduler<P> {
     /// use std::time::Duration;
     ///
     /// use whelm::{
-    ///     Config, DagConfig, DagJob, DagScheduler, Input, JobSpec, Output, Policy, Resources,
+    ///     Config, DagConfig, DagJob, DagScheduler, Input, JobSpec, Output, Policy, Resources, SLOTS,
     ///     Scheduler, Time, WorkerState,
     /// };
     ///
     /// let worker = || {
     ///     Input::Worker(WorkerState {
     ///         id: 1,
-    ///         capacity: Resources::ZERO.with_slots(1),
+    ///         capacity: Resources::new().with(SLOTS, 1),
     ///         ..Default::default()
     ///     })
     /// };
@@ -274,7 +274,7 @@ impl<P: Policy> DagScheduler<P> {
     /// # use std::time::Duration;
     /// # use whelm::{
     /// #     Config, DagConfig, DagJob, DagScheduler, Input, JobSpec, Output, Policy, Resources,
-    /// #     Scheduler, Time, WorkerState,
+    /// #     SLOTS, Scheduler, Time, WorkerState,
     /// # };
     /// let config = DagConfig {
     ///     auto_submit: false,
@@ -284,7 +284,7 @@ impl<P: Policy> DagScheduler<P> {
     /// dag.handle(
     ///     Input::Worker(WorkerState {
     ///         id: 1,
-    ///         capacity: Resources::ZERO.with_slots(1),
+    ///         capacity: Resources::new().with(SLOTS, 1),
     ///         ..Default::default()
     ///     }),
     ///     Time::ORIGIN,
@@ -331,7 +331,7 @@ impl<P: Policy> DagScheduler<P> {
     /// dag.handle(
     ///     Input::Worker(WorkerState {
     ///         id: 7,
-    ///         capacity: Resources::ZERO.with_slots(1),
+    ///         capacity: Resources::new().with(SLOTS, 1),
     ///         ..Default::default()
     ///     }),
     ///     Time(Duration::from_secs(5)),

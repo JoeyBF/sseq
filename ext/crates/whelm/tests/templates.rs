@@ -5,8 +5,8 @@ use std::{collections::BTreeMap, sync::Arc, time::Duration};
 use proptest::prelude::*;
 use whelm::{
     Config, Constraint, DagConfig, DagError, DagJob, DagScheduler, DagTemplate, Input, JobId,
-    JobSpec, NodeSource, Output, Policy, Resources, Scheduler, Status, TemplateNode, TemplateSpec,
-    Time, Unit, Verdict, WorkerId, WorkerState,
+    JobSpec, MEMORY, NodeSource, Output, Policy, Resources, SLOTS, Scheduler, Status, TemplateNode,
+    TemplateSpec, Time, Unit, Verdict, WorkerId, WorkerState,
 };
 
 /// A DAG layer over one worker with many slots.
@@ -14,7 +14,7 @@ fn dag(config: DagConfig) -> DagScheduler<Scheduler> {
     let mut d = DagScheduler::new(config, Scheduler::new(Config::default()));
     let w = WorkerState {
         class: "x".into(),
-        capacity: Resources::mem(1000).with_slots(64),
+        capacity: Resources::new().with(MEMORY, 1000).with(SLOTS, 64),
         ..Default::default()
     };
     d.handle(Input::Worker(w), Time::ORIGIN);
@@ -46,7 +46,7 @@ fn job(id: JobId, deps: &[JobId]) -> DagJob {
     DagJob {
         spec: JobSpec {
             id,
-            demand: Resources::mem(1),
+            demand: Resources::new().with(MEMORY, 1),
             ..Default::default()
         },
         deps: deps.to_vec(),
@@ -169,7 +169,7 @@ fn a_source_makes_a_leaf_a_passthrough_in_one_unit() {
         base,
         template: t.clone(),
         spec: JobSpec {
-            demand: Resources::mem(1),
+            demand: Resources::new().with(MEMORY, 1),
             ..Default::default()
         },
         sourced: true,
@@ -312,7 +312,7 @@ fn units_of_a_template() {
             template: t.clone(),
             deps,
             spec: JobSpec {
-                demand: Resources::mem(1),
+                demand: Resources::new().with(MEMORY, 1),
                 group: g,
                 ..Default::default()
             },
@@ -372,7 +372,7 @@ fn substituted_units() {
         base: 10,
         template: outer,
         spec: JobSpec {
-            demand: Resources::mem(1),
+            demand: Resources::new().with(MEMORY, 1),
             ..Default::default()
         },
         scale: Some(2.0),
@@ -409,7 +409,7 @@ fn forbid_and_class_are_hard_constraints() {
         let w = WorkerState {
             id,
             class: String::from(class),
-            capacity: Resources::mem(100).with_slots(slots),
+            capacity: Resources::new().with(MEMORY, 100).with(SLOTS, slots),
             ..Default::default()
         };
         p.handle(Input::Worker(w), now);
@@ -418,7 +418,7 @@ fn forbid_and_class_are_hard_constraints() {
     join(&mut p, 2, "l40s", 4, Time::ORIGIN);
     let spec = |id, constraints| JobSpec {
         id,
-        demand: Resources::mem(1),
+        demand: Resources::new().with(MEMORY, 1),
         constraints,
         ..Default::default()
     };

@@ -88,10 +88,10 @@ impl<P: Policy> DagScheduler<P> {
     /// #
     /// # use whelm::{
     /// #     Config, DagConfig, DagJob, DagScheduler, Input, JobSpec, Output, Policy, Resources,
-    /// #     Scheduler, Time, WorkerState,
+    /// #     SLOTS, Scheduler, Time, WorkerState,
     /// # };
     /// # let mut dag = DagScheduler::new(DagConfig::default(), Scheduler::new(Config::fifo()));
-    /// # let capacity = Resources::ZERO.with_slots(1);
+    /// # let capacity = Resources::new().with(SLOTS, 1);
     /// # let worker = WorkerState { id: 1, capacity, ..Default::default() };
     /// # dag.handle(Input::Worker(worker), Time::ORIGIN);
     /// # let job = |id, deps| DagJob {

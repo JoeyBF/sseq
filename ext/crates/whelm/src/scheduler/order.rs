@@ -5,7 +5,10 @@ use std::ops::Bound;
 use super::{Job, Scheduler};
 #[cfg(doc)]
 use crate::Config;
-use crate::{GroupOrder, JobId, JobSpec, OrderTerm, ResourceId, Time};
+use crate::{
+    GroupOrder, JobId, JobSpec, OrderTerm, Output, Rejection, Time, admission::fill_defaults,
+    resources::dense,
+};
 
 /// The most terms a [`Config::order`] has once repeats are dropped: one per [`OrderTerm`].
 const ORDER_TERMS: usize = 5;
@@ -70,19 +73,25 @@ impl Scheduler {
         Key { terms, seq }
     }
 
-    /// Queue a new job under its urgency key, its demand cut to the declared resources and the
-    /// default demands filled in.
-    pub(super) fn submit(&mut self, mut spec: JobSpec, now: Time) {
+    /// Queue a new job under its urgency key, its demand over the declared resources with the
+    /// default demands filled in; or reject it if its demand names another resource.
+    pub(super) fn submit(&mut self, spec: JobSpec, now: Time) {
         if self.waiting.contains_key(&spec.id) || self.running.contains_key(&spec.id) {
             return;
         }
         let resources = &self.config.resources;
-        spec.demand.truncate(resources.len());
-        for (d, r) in resources.iter().enumerate() {
-            if spec.demand[ResourceId(d)] == 0 && r.default_demand > 0 {
-                spec.demand[ResourceId(d)] = r.default_demand;
+        let mut demand = match dense(resources, &spec.demand) {
+            Ok(demand) => demand,
+            Err(resource) => {
+                let reason = Rejection::Undeclared { resource };
+                self.outbox.push(Output::Rejected {
+                    job: spec.id,
+                    reason,
+                });
+                return;
             }
-        }
+        };
+        fill_defaults(resources, &mut demand);
         let seq = self.next_seq;
         self.next_seq += 1;
         let key = self.key(&spec, seq);
@@ -90,6 +99,7 @@ impl Scheduler {
         self.enqueue(Job {
             kind,
             spec,
+            demand,
             key,
             since: now,
             attempts: 0,

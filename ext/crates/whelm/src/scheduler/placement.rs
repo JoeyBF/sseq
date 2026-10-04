@@ -12,8 +12,9 @@ use super::{
 #[cfg(doc)]
 use crate::Config;
 use crate::{
-    JobId, JobSpec, ResourceId, Resources, ScoreTerm, Selector, Strength, Time, WorkerId,
-    WorkerState, WorkerView, time::secs,
+    Amounts, JobId, JobSpec, ScoreTerm, Selector, Strength, Time, WorkerId, WorkerState,
+    resources::{Dense, fits_within, sub},
+    time::secs,
 };
 
 /// The most terms a [`Config::score`] has once repeats are dropped: one per [`ScoreTerm`].
@@ -107,12 +108,13 @@ impl Scheduler {
     /// Whether `w` would admit `job` if it ran nothing, as it reports itself now: whether the job
     /// can ever run there.
     pub(super) fn fits_empty(&self, job: &Job, w: &Worker) -> bool {
-        let empty = WorkerView {
-            placed: &Resources::ZERO,
-            running: 0,
-            ..w.view(&self.config.resources)
-        };
-        self.admission.admits(&job.spec.demand, &empty)
+        let empty = w.view(&self.config.resources).with_load(&self.zero[..], 0);
+        self.admission.admits(&self.demand(job), &empty)
+    }
+
+    /// `job`'s demand as the admission rule sees it.
+    pub(super) fn demand<'a>(&'a self, job: &'a Job) -> Amounts<'a> {
+        Amounts::new(&self.config.resources, &job.demand[..])
     }
 
     /// Whether `w` takes the job, or why not.
@@ -123,7 +125,7 @@ impl Scheduler {
         if let Some((by, hold)) = self.held(job, w) {
             return Some(Refusal::Held(by, hold));
         }
-        if !(self.admission).admits(&job.spec.demand, &w.view(&self.config.resources)) {
+        if !(self.admission).admits(&self.demand(job), &w.view(&self.config.resources)) {
             return Some(Refusal::Admission);
         }
         None
@@ -148,8 +150,8 @@ impl Scheduler {
         for (slot, term) in score.iter_mut().zip(&self.config.score) {
             *slot = match term {
                 ScoreTerm::Speed => self.speed_rank(job, w),
-                ScoreTerm::Tightest => ordered(self.free_share(w, &job.spec.demand)),
-                ScoreTerm::Loosest => ordered(-self.free_share(w, &job.spec.demand)),
+                ScoreTerm::Tightest => ordered(self.free_share(w, &job.demand)),
+                ScoreTerm::Loosest => ordered(-self.free_share(w, &job.demand)),
                 ScoreTerm::Preferred => !prefers(&job.spec, &w.state) as i64,
                 ScoreTerm::Load => w.running() as i64,
             };
@@ -224,25 +226,22 @@ impl Scheduler {
     /// what it demands in the hard resources had ended there and nothing else had changed.
     fn waits_for(&self, job: &Job, w: &Worker) -> bool {
         let resources = &self.config.resources;
-        let hard = |d: &ResourceId| resources[d.0].hard;
         let view = w.view(resources);
-        let demand = &job.spec.demand;
-        if w.running() == 0 || !view.short(demand).any(|d| hard(&d)) {
+        if w.running() == 0 || !view.short_at(&job.demand).any(|d| resources[d].hard) {
             return false;
         }
-        let freed = Resources::of(view.ids().filter(hard).map(|d| (d, demand[d])));
-        let placed = w.placed.clone() - &freed;
-        let after = WorkerView {
-            placed: &placed,
-            running: w.running() - 1,
-            ..view
-        };
-        self.admission.admits(demand, &after)
+        let freed: Dense = (resources.iter().zip(&job.demand))
+            .map(|(r, &x)| if r.hard { x } else { 0 })
+            .collect();
+        let mut placed = w.placed.clone();
+        sub(&mut placed, &freed);
+        let after = view.with_load(placed, w.running() - 1);
+        self.admission.admits(&self.demand(job), &after)
     }
 
-    /// [`WorkerView::free_share`] of `demand` on `w`.
-    pub(super) fn free_share(&self, w: &Worker, demand: &Resources) -> f64 {
-        w.view(&self.config.resources).free_share(demand)
+    /// [`WorkerView::free_share`](crate::WorkerView::free_share) of `demand` on `w`.
+    pub(super) fn free_share(&self, w: &Worker, demand: &[u64]) -> f64 {
+        w.view(&self.config.resources).free_share_at(demand)
     }
 
     /// Whether worker `w` admits anything at all, by the admission bound.
@@ -263,12 +262,20 @@ impl Scheduler {
 
     /// Component-wise maximum admission bound over open workers, or `None` if no open worker can
     /// take anything.
-    fn open_bound(&self) -> Option<Resources> {
+    fn open_bound(&self) -> Option<Dense> {
         self.workers
             .values()
             .filter(|w| self.open(w))
-            .filter_map(|w| self.admission.bound(&w.view(&self.config.resources)))
-            .reduce(Resources::max)
+            .filter_map(|w| {
+                let b = self.admission.bound(&w.view(&self.config.resources))?;
+                Some(b.values().to_vec())
+            })
+            .reduce(|mut a, b| {
+                for (x, y) in a.iter_mut().zip(b) {
+                    *x = (*x).max(y);
+                }
+                a
+            })
     }
 
     /// Scan waiting jobs in order, placing each where it is admitted, reserving for the starving.
@@ -314,7 +321,7 @@ impl Scheduler {
                 let holder = self.reserved(job).is_some();
                 // Cheap pruning: the admission bound, and required classes without room.
                 let hopeful = holder
-                    || (bound.as_ref().is_some_and(|b| j.spec.demand.fits_within(b))
+                    || (bound.as_ref().is_some_and(|b| fits_within(&j.demand, b))
                         && class_possible(&j.spec, &classes));
                 let pick = if hopeful {
                     self.choose(j, &mut proj)

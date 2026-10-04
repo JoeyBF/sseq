@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::Resources;
 #[cfg(doc)]
-use crate::{Config, Resource, ResourceId};
+use crate::{Config, Resource, SLOTS};
 #[cfg(doc)]
 use crate::{Defer, Input, JobSpec, ScoreTerm, Selector, Speculate, Timing};
 
@@ -23,18 +23,21 @@ pub type WorkerId = u64;
 /// resident of which 12 GB is its runtime, and running at 1.4 times the reference speed.
 ///
 /// ```
-/// use whelm::{ResourceId, Resources, WorkerState};
+/// use whelm::{DEVICE_MEMORY, MEMORY, Resources, SLOTS, WorkerState, gb};
 ///
 /// let w = WorkerState {
 ///     id: 7,
 ///     class: "l40s".into(),
-///     capacity: Resources::mem_gb(120.0).with_dev_gb(20.0).with_slots(16),
-///     reported_used: Resources::mem_gb(30.0),
-///     reported_baseline: Resources::mem_gb(12.0),
+///     capacity: Resources::new()
+///         .with(MEMORY, gb(120.0))
+///         .with(DEVICE_MEMORY, gb(20.0))
+///         .with(SLOTS, 16),
+///     reported_used: Resources::new().with(MEMORY, gb(30.0)),
+///     reported_baseline: Resources::new().with(MEMORY, gb(12.0)),
 ///     speed: 1.4,
 ///     ..Default::default()
 /// };
-/// assert_eq!(w.capacity[ResourceId::SLOTS], 16);
+/// assert_eq!(w.capacity.get(SLOTS), 16);
 /// ```
 #[derive(Clone, Debug, PartialEq)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
@@ -43,13 +46,12 @@ pub struct WorkerState {
     pub id: WorkerId,
     /// The worker's class (e.g. GPU type), used by [`Selector::Class`] and per-class reservations.
     pub class: String,
-    /// What the worker has of each [declared resource](Config::resources). A zero component of a
+    /// What the worker has of each [declared resource](Config::resources). A zero amount of a
     /// [hard](Resource::hard) resource is none of it, and of a soft one, an unknown amount that is
-    /// not enforced. Under the default declaration, the worker runs nothing without
-    /// [slots](ResourceId::SLOTS).
+    /// not enforced. Under the default declaration, the worker runs nothing without [`SLOTS`].
     pub capacity: Resources,
     /// What one job of this worker is expected to take at least, learned by the worker (e.g. the
-    /// typical device launch request); zero components are unknown. Each job counts for at least
+    /// typical device launch request); zero amounts are unknown. Each job counts for at least
     /// this much against `capacity` in every resource, whatever its own [`JobSpec::demand`] says.
     #[cfg_attr(feature = "serde", serde(default))]
     pub per_task: Resources,
@@ -81,10 +83,10 @@ impl Default for WorkerState {
         Self {
             id: 0,
             class: String::new(),
-            capacity: Resources::ZERO,
-            per_task: Resources::ZERO,
-            reported_used: Resources::ZERO,
-            reported_baseline: Resources::ZERO,
+            capacity: Resources::new(),
+            per_task: Resources::new(),
+            reported_used: Resources::new(),
+            reported_baseline: Resources::new(),
             speed: 1.0,
         }
     }

@@ -6,8 +6,8 @@ use std::{
 };
 
 use whelm::{
-    DagConfig, DagScheduler, DagTemplate, Explanation, Input, JobId, JobSpec, Output, Policy,
-    PolicyStats, Resources, TemplateNode, TemplateSpec, Time, Unit,
+    DagConfig, DagScheduler, DagTemplate, Explanation, Input, JobId, JobSpec, MEMORY, Output,
+    Policy, PolicyStats, Resources, TemplateNode, TemplateSpec, Time, Unit,
 };
 
 /// Units on a side of the coarse grid: unit `k` waits for its left and upper neighbours.
@@ -102,7 +102,7 @@ fn unit(t: &Arc<DagTemplate>, k: u64, deps: Vec<JobId>) -> Unit {
         template: t.clone(),
         deps,
         spec: JobSpec {
-            demand: Resources::mem(1),
+            demand: Resources::new().with(MEMORY, 1),
             group: k,
             ..Default::default()
         },

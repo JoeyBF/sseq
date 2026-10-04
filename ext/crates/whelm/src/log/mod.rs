@@ -19,7 +19,8 @@
 //! };
 //!
 //! use whelm::{
-//!     Config, FailKind, Input, JobSpec, Output, Policy, Resources, Scheduler, Time, WorkerState,
+//!     Config, FailKind, Input, JobSpec, MEMORY, Output, Policy, Resources, SLOTS, Scheduler,
+//!     Time, WorkerState, gb,
 //!     log::{self, Event, Logged},
 //! };
 //!
@@ -28,7 +29,7 @@
 //! for w in [1, 2] {
 //!     let worker = WorkerState {
 //!         id: w,
-//!         capacity: Resources::mem_gb(8.0).with_slots(1),
+//!         capacity: Resources::new().with(MEMORY, gb(8.0)).with(SLOTS, 1),
 //!         ..Default::default()
 //!     };
 //!     p.handle(Input::Worker(worker), Time::ORIGIN);
@@ -36,7 +37,7 @@
 //! p.handle(
 //!     Input::Submit(JobSpec {
 //!         id: 7,
-//!         demand: Resources::mem_gb(1.0),
+//!         demand: Resources::new().with(MEMORY, gb(1.0)),
 //!         ..Default::default()
 //!     }),
 //!     Time::ORIGIN,

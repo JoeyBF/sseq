@@ -9,8 +9,8 @@ use std::{
 use super::Event;
 use super::{EventSink, Logged, TaskInfo, polls, replay};
 use crate::{
-    Attempt, Config, FailKind, Input, JobId, JobSpec, Output, Policy, Resources, Scheduler,
-    Speculate, Time, Timing, WorkerId, WorkerState,
+    Attempt, Config, FailKind, Input, JobId, JobSpec, MEMORY, Output, Policy, Resources, SLOTS,
+    Scheduler, Speculate, Time, Timing, WorkerId, WorkerState, gb,
 };
 
 /// A configuration exercising learning, speculation, retries and reservations.
@@ -26,8 +26,8 @@ fn worker(w: WorkerId, used_gb: f64) -> WorkerState {
     WorkerState {
         id: w,
         class: "x".into(),
-        capacity: Resources::mem_gb(10.0).with_slots(2),
-        reported_used: Resources::mem_gb(used_gb),
+        capacity: Resources::new().with(MEMORY, gb(10.0)).with(SLOTS, 2),
+        reported_used: Resources::new().with(MEMORY, gb(used_gb)),
         speed: if w == 3 { 3.0 } else { 1.0 },
         ..Default::default()
     }
@@ -49,7 +49,7 @@ fn run(sink: impl EventSink + 'static) -> (usize, usize, usize) {
             let i = (t / 3) as JobId;
             let spec = JobSpec {
                 id: i,
-                demand: Resources::mem_gb(1.0 + (i * 5 % 6) as f64),
+                demand: Resources::new().with(MEMORY, gb(1.0 + (i * 5 % 6) as f64)),
                 group: i / 8,
                 work: Some(Duration::from_secs(5 + i * 7 % 11)),
                 ..Default::default()

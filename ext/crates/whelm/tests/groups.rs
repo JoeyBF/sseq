@@ -3,8 +3,8 @@
 use std::time::Duration;
 
 use whelm::{
-    Config, DEFAULT_AGE_LIMIT, GroupOrder, Input, JobId, JobSpec, Output, Policy, Resources,
-    Scheduler, Time, WorkerId, WorkerState, nassau,
+    Config, DEFAULT_AGE_LIMIT, GroupOrder, Input, JobId, JobSpec, MEMORY, Output, Policy,
+    Resources, SLOTS, Scheduler, Time, WorkerId, WorkerState, nassau,
 };
 
 /// The `(job, worker)` of each start in `out`.
@@ -21,7 +21,7 @@ fn starts(out: Vec<Output>) -> Vec<(JobId, WorkerId)> {
 fn job(id: JobId, group: u64) -> JobSpec {
     JobSpec {
         id,
-        demand: Resources::mem(1),
+        demand: Resources::new().with(MEMORY, 1),
         group,
         ..Default::default()
     }
@@ -31,7 +31,7 @@ fn job(id: JobId, group: u64) -> JobSpec {
 fn worker(slots: usize) -> WorkerState {
     WorkerState {
         class: "x".into(),
-        capacity: Resources::mem(100).with_slots(slots as u64),
+        capacity: Resources::new().with(MEMORY, 100).with(SLOTS, slots as u64),
         ..Default::default()
     }
 }
@@ -96,18 +96,18 @@ fn group_order_by_id_ignores_submission_order() {
 /// wait behind work released after the job, not behind work already queued before it.)
 #[test]
 fn young_group_behind_wide_old_group_waits_at_most_age_limit() {
-    const SLOTS: usize = 4;
+    const WORKER_SLOTS: usize = 4;
     const OLD_JOBS: u64 = 1000;
     const RUN: Duration = Duration::from_secs(100);
     const YOUNG: u64 = 1_000_000;
     let wait = |policy: &mut dyn Policy| -> Duration {
-        policy.handle(Input::Worker(worker(SLOTS)), Time::ORIGIN);
+        policy.handle(Input::Worker(worker(WORKER_SLOTS)), Time::ORIGIN);
         let mut released = 0;
         let mut running: Vec<(u64, Time)> = Vec::new();
         let (mut t, ten) = (Time::ORIGIN, Time(Duration::from_secs(10)));
         loop {
             // The old walk keeps two jobs per slot ready.
-            while released < OLD_JOBS && policy.stats().waiting < 2 * SLOTS {
+            while released < OLD_JOBS && policy.stats().waiting < 2 * WORKER_SLOTS {
                 policy.handle(Input::Submit(job(released, nassau::group(1, 20))), t);
                 released += 1;
             }
@@ -156,7 +156,7 @@ fn young_group_behind_wide_old_group_waits_at_most_age_limit() {
     // Control: strict priority waits for the whole old group.
     let w = wait(&mut Scheduler::new(by_id(Config::default(), None)));
     assert!(
-        w.as_secs_f64() >= (OLD_JOBS as f64 / SLOTS as f64 - 1.0) * RUN.as_secs_f64(),
+        w.as_secs_f64() >= (OLD_JOBS as f64 / WORKER_SLOTS as f64 - 1.0) * RUN.as_secs_f64(),
         "strict: {w:?}"
     );
 }

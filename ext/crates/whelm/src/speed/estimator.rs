@@ -41,7 +41,7 @@ struct WorkerStat {
 /// ```
 /// use std::time::Duration;
 ///
-/// use whelm::{Input, Learn, Resources, SpeedEstimator, WorkerState};
+/// use whelm::{Input, Learn, MEMORY, Resources, SLOTS, SpeedEstimator, WorkerState, gb};
 ///
 /// let mut e = SpeedEstimator::new(Learn::default());
 /// for _ in 0..Learn::default().min_samples {
@@ -56,7 +56,7 @@ struct WorkerStat {
 /// let state = WorkerState {
 ///     id: 7,
 ///     class: "h100".into(),
-///     capacity: Resources::mem_gb(80.0).with_slots(4),
+///     capacity: Resources::new().with(MEMORY, gb(80.0)).with(SLOTS, 4),
 ///     speed: e.speed(7, "h100", 1.0),
 ///     ..Default::default()
 /// };

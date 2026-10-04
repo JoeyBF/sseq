@@ -13,9 +13,9 @@ use std::{
 
 use proptest::prelude::*;
 use whelm::{
-    Attempt, Config, Defer, Explanation, FailKind, GaveUp, Input, JobId, JobSpec, Lease, Output,
-    Policy, PolicyStats, Resources, RetryConfig, Scheduler, SharedPolicy, SpeedConfig, Time,
-    WorkerId, WorkerState,
+    Attempt, Config, Defer, Explanation, FailKind, GaveUp, Input, JobId, JobSpec, Lease, MEMORY,
+    Output, Policy, PolicyStats, Resources, RetryConfig, SLOTS, Scheduler, SharedPolicy,
+    SpeedConfig, Time, WorkerId, WorkerState, gb,
 };
 
 /// A worker of class "x".
@@ -23,7 +23,9 @@ fn worker(id: u64, slots: usize) -> WorkerState {
     WorkerState {
         id,
         class: "x".into(),
-        capacity: Resources::mem(1 << 40).with_slots(slots as u64),
+        capacity: Resources::new()
+            .with(MEMORY, 1 << 40)
+            .with(SLOTS, slots as u64),
         ..Default::default()
     }
 }
@@ -32,7 +34,7 @@ fn worker(id: u64, slots: usize) -> WorkerState {
 fn job(id: u64) -> JobSpec {
     JobSpec {
         id,
-        demand: Resources::mem(1),
+        demand: Resources::new().with(MEMORY, 1),
         ..Default::default()
     }
 }
@@ -573,7 +575,7 @@ proptest! {
         })?;
         let st = s.stats();
         prop_assert_eq!((st.waiting, st.running), (0, 0));
-        prop_assert!(st.workers.iter().all(|l| l.running == 0 && l.placed == Resources::ZERO));
+        prop_assert!(st.workers.iter().all(|l| l.running == 0 && l.placed == Resources::new()));
     }
 }
 
@@ -585,7 +587,7 @@ proptest! {
 fn stress_many_threads_with_churn() {
     const THREADS: u64 = 1000;
     const JOBS_PER_THREAD: u64 = 5;
-    const SLOTS: usize = 16;
+    const WORKER_SLOTS: usize = 16;
     let config = Config {
         retry: RetryConfig { max_attempts: 1000 },
         ..Config::default()
@@ -598,7 +600,7 @@ fn stress_many_threads_with_churn() {
     for _ in 0..6 {
         let w = next_worker.fetch_add(1, Ordering::SeqCst);
         alive.lock().unwrap().insert(w);
-        s.worker_update(worker(w, SLOTS));
+        s.worker_update(worker(w, WORKER_SLOTS));
     }
     let load: Arc<Mutex<HashMap<u64, usize>>> = Arc::new(Mutex::new(HashMap::new()));
     let running: Arc<Mutex<BTreeSet<u64>>> = Arc::new(Mutex::new(BTreeSet::new()));
@@ -631,7 +633,7 @@ fn stress_many_threads_with_churn() {
                 hit += s.worker_gone(victim).len();
                 let w = next_worker.fetch_add(1, Ordering::SeqCst);
                 alive.lock().unwrap().insert(w);
-                s.worker_update(worker(w, SLOTS));
+                s.worker_update(worker(w, WORKER_SLOTS));
             }
             hit
         })
@@ -661,7 +663,7 @@ fn stress_many_threads_with_churn() {
                             let mut l = load.lock().unwrap();
                             let n = l.entry(w).or_default();
                             *n += 1;
-                            assert!(*n <= SLOTS, "worker {w} runs {n} jobs");
+                            assert!(*n <= WORKER_SLOTS, "worker {w} runs {n} jobs");
                         }
                         rng ^= rng << 13;
                         rng ^= rng >> 7;
@@ -738,7 +740,7 @@ fn poll_p99_at_frontier_size() {
         let w = WorkerState {
             id: w,
             class: class.into(),
-            capacity: Resources::mem_gb(150.0).with_slots(16),
+            capacity: Resources::new().with(MEMORY, gb(150.0)).with(SLOTS, 16),
             ..Default::default()
         };
         p.handle(Input::Worker(w), Time::ORIGIN);
@@ -748,7 +750,7 @@ fn poll_p99_at_frontier_size() {
     let mut submit = |p: &mut Scheduler, t: Time| {
         let j = JobSpec {
             id: next,
-            demand: Resources::mem_gb(1.0 + (next % 13) as f64),
+            demand: Resources::new().with(MEMORY, gb(1.0 + (next % 13) as f64)),
             group: next / 50,
             work: Some(Duration::from_secs(60)),
             ..Default::default()

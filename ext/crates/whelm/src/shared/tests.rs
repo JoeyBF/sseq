@@ -6,8 +6,8 @@ use std::{
 };
 
 use crate::{
-    Config, FailKind, Input, JobId, JobSpec, Policy, Resources, RetryConfig, Scheduler,
-    SharedPolicy, Speculate, Time, WorkerId, WorkerState,
+    Config, FailKind, Input, JobId, JobSpec, MEMORY, Policy, Resources, RetryConfig, SLOTS,
+    Scheduler, SharedPolicy, Speculate, Time, WorkerId, WorkerState,
 };
 
 /// A one-slot worker of class "x".
@@ -15,7 +15,7 @@ fn worker(id: WorkerId) -> WorkerState {
     WorkerState {
         id,
         class: "x".into(),
-        capacity: Resources::mem(100).with_slots(1),
+        capacity: Resources::new().with(MEMORY, 100).with(SLOTS, 1),
         ..Default::default()
     }
 }
@@ -50,7 +50,7 @@ fn ticker_restarts_after_stop() {
 fn job(id: JobId) -> JobSpec {
     JobSpec {
         id,
-        demand: Resources::mem(1),
+        demand: Resources::new().with(MEMORY, 1),
         ..Default::default()
     }
 }

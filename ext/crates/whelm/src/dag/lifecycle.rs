@@ -21,11 +21,11 @@ impl<P: Policy> DagScheduler<P> {
     /// # use std::time::Duration;
     /// # use whelm::{
     /// #     Config, DagConfig, DagJob, DagScheduler, Input, JobSpec, Output, Policy, Resources,
-    /// #     Scheduler, Time, WorkerState,
+    /// #     SLOTS, Scheduler, Time, WorkerState,
     /// # };
     /// # let config = DagConfig { auto_submit: false, ..DagConfig::default() };
     /// # let mut dag = DagScheduler::new(config, Scheduler::new(Config::fifo()));
-    /// # let capacity = Resources::ZERO.with_slots(1);
+    /// # let capacity = Resources::new().with(SLOTS, 1);
     /// # let worker = WorkerState { id: 1, capacity, ..Default::default() };
     /// # dag.handle(Input::Worker(worker), Time::ORIGIN);
     /// # let job = |id, deps| DagJob {
@@ -81,10 +81,10 @@ impl<P: Policy> DagScheduler<P> {
     /// # use std::time::Duration;
     /// # use whelm::{
     /// #     Config, DagConfig, DagError, DagJob, DagScheduler, Input, JobSpec, Output, Policy,
-    /// #     Resources, Scheduler, Time, WorkerState,
+    /// #     Resources, SLOTS, Scheduler, Time, WorkerState,
     /// # };
     /// # let mut dag = DagScheduler::new(DagConfig::default(), Scheduler::new(Config::fifo()));
-    /// # let capacity = Resources::ZERO.with_slots(1);
+    /// # let capacity = Resources::new().with(SLOTS, 1);
     /// # let worker = WorkerState { id: 1, capacity, ..Default::default() };
     /// # dag.handle(Input::Worker(worker), Time::ORIGIN);
     /// # let job = |id, deps| DagJob {
@@ -145,10 +145,10 @@ impl<P: Policy> DagScheduler<P> {
     /// # use std::time::Duration;
     /// # use whelm::{
     /// #     Config, DagConfig, DagJob, DagScheduler, DagStats, Input, JobSpec, Output, Policy,
-    /// #     Resources, Scheduler, Time, WorkerState,
+    /// #     Resources, SLOTS, Scheduler, Time, WorkerState,
     /// # };
     /// # let mut dag = DagScheduler::new(DagConfig::default(), Scheduler::new(Config::fifo()));
-    /// # let capacity = Resources::ZERO.with_slots(1);
+    /// # let capacity = Resources::new().with(SLOTS, 1);
     /// # let worker = WorkerState { id: 1, capacity, ..Default::default() };
     /// # dag.handle(Input::Worker(worker), Time::ORIGIN);
     /// # let job = |id, deps| DagJob {
@@ -249,10 +249,10 @@ impl<P: Policy> DagScheduler<P> {
     /// # use std::{sync::Arc, time::Duration};
     /// # use whelm::{
     /// #     Config, DagConfig, DagJob, DagScheduler, Input, JobSpec, Output, Policy, Resources,
-    /// #     Scheduler, TemplateSpec, Time, Unit, WorkerState,
+    /// #     SLOTS, Scheduler, TemplateSpec, Time, Unit, WorkerState,
     /// # };
     /// # let mut dag = DagScheduler::new(DagConfig::default(), Scheduler::new(Config::fifo()));
-    /// # let capacity = Resources::ZERO.with_slots(1);
+    /// # let capacity = Resources::new().with(SLOTS, 1);
     /// # let worker = WorkerState { id: 1, capacity, ..Default::default() };
     /// # dag.handle(Input::Worker(worker), Time::ORIGIN);
     /// # let job = |id, deps| DagJob {

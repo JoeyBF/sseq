@@ -60,13 +60,13 @@ pub struct TaskInfo {
 /// Events can be written by hand, e.g. to script a run for [`replay`]:
 ///
 /// ```
-/// use whelm::{Input, JobSpec, Resources, Time, log::Event};
+/// use whelm::{Input, JobSpec, MEMORY, Resources, Time, gb, log::Event};
 ///
 /// let submit = Event::Input {
 ///     t: Time::ORIGIN,
 ///     input: Input::Submit(JobSpec {
 ///         id: 1,
-///         demand: Resources::mem_gb(1.0),
+///         demand: Resources::new().with(MEMORY, gb(1.0)),
 ///         ..Default::default()
 ///     }),
 ///     info: None,

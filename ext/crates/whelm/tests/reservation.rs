@@ -3,8 +3,8 @@
 use std::time::Duration;
 
 use whelm::{
-    Config, Constraint, FailKind, Holding, Input, JobId, JobSpec, Output, Policy, Reservations,
-    Resources, Scheduler, Time, Verdict, WorkerId, WorkerState,
+    Config, Constraint, FailKind, Holding, Input, JobId, JobSpec, MEMORY, Output, Policy,
+    Reservations, Resources, SLOTS, Scheduler, Time, Verdict, WorkerId, WorkerState,
 };
 
 /// The `(job, worker)` of each start in `out`.
@@ -27,8 +27,10 @@ fn worker(id: u64, slots: usize, budget: u64, used: u64) -> WorkerState {
     WorkerState {
         id,
         class: "x".into(),
-        capacity: Resources::mem(budget).with_slots(slots as u64),
-        reported_used: Resources::mem(used),
+        capacity: Resources::new()
+            .with(MEMORY, budget)
+            .with(SLOTS, slots as u64),
+        reported_used: Resources::new().with(MEMORY, used),
         ..Default::default()
     }
 }
@@ -37,7 +39,7 @@ fn worker(id: u64, slots: usize, budget: u64, used: u64) -> WorkerState {
 fn job(id: u64, demand: u64, group: u64) -> JobSpec {
     JobSpec {
         id,
-        demand: Resources::mem(demand),
+        demand: Resources::new().with(MEMORY, demand),
         group,
         ..Default::default()
     }
@@ -258,7 +260,7 @@ fn per_class_reservations() {
             Input::Worker(WorkerState {
                 id,
                 class: class.into(),
-                capacity: Resources::mem(100).with_slots(4),
+                capacity: Resources::new().with(MEMORY, 100).with(SLOTS, 4),
                 ..Default::default()
             }),
             Time::ORIGIN,

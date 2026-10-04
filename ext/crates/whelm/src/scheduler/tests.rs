@@ -3,21 +3,21 @@
 use std::time::Duration;
 
 use crate::{
-    Attempt, Config, Constraint, FailKind, Input, JobId, JobSpec, OrderTerm, Output, Policy,
-    Reservations, Resource, ResourceId, Resources, RetryConfig, Scheduler, ScoreTerm, Speculate,
-    SpeedConfig, Time, Verdict, WorkerId, WorkerState,
+    Attempt, Config, Constraint, DEVICE_MEMORY, FailKind, Input, JobId, JobSpec, MEMORY, OrderTerm,
+    Output, Policy, Rejection, Reservations, Resource, Resources, RetryConfig, SLOTS, Scheduler,
+    ScoreTerm, Speculate, SpeedConfig, Time, Verdict, WorkerId, WorkerState,
 };
 
 const GB: u64 = 1_000_000_000;
-
-const SLOTS: ResourceId = ResourceId::SLOTS;
 
 /// A worker of class "x" with a memory capacity in GB.
 fn worker(id: WorkerId, slots: u64, budget_gb: u64) -> WorkerState {
     WorkerState {
         id,
         class: "x".into(),
-        capacity: Resources::mem(budget_gb * GB).with_slots(slots),
+        capacity: Resources::new()
+            .with(MEMORY, budget_gb * GB)
+            .with(SLOTS, slots),
         ..Default::default()
     }
 }
@@ -26,7 +26,7 @@ fn worker(id: WorkerId, slots: u64, budget_gb: u64) -> WorkerState {
 fn job(id: JobId, gb: u64, group: u64) -> JobSpec {
     JobSpec {
         id,
-        demand: Resources::mem(gb * GB),
+        demand: Resources::new().with(MEMORY, gb * GB),
         group,
         ..Default::default()
     }
@@ -163,15 +163,21 @@ fn best_fit_ranks_by_the_bottleneck() {
     let w1 = WorkerState {
         id: 1,
         class: "x".into(),
-        capacity: Resources::mem(100 * GB).with_dev(10 * GB).with_slots(4),
-        reported_used: Resources::ZERO.with_dev(8 * GB),
+        capacity: Resources::new()
+            .with(MEMORY, 100 * GB)
+            .with(DEVICE_MEMORY, 10 * GB)
+            .with(SLOTS, 4),
+        reported_used: Resources::new().with(DEVICE_MEMORY, 8 * GB),
         ..Default::default()
     };
     let w2 = WorkerState {
         id: 2,
         class: "x".into(),
-        capacity: Resources::mem(100 * GB).with_dev(100 * GB).with_slots(4),
-        reported_used: Resources::mem(59 * GB),
+        capacity: Resources::new()
+            .with(MEMORY, 100 * GB)
+            .with(DEVICE_MEMORY, 100 * GB)
+            .with(SLOTS, 4),
+        reported_used: Resources::new().with(MEMORY, 59 * GB),
         ..Default::default()
     };
     let inputs = [
@@ -453,7 +459,7 @@ fn stale_messages_are_ignored() {
     assert_eq!((st.waiting, st.running, st.workers[0].running), (0, 1, 1));
     assert!(feed(&mut p, Time(Duration::from_secs(3)), [done(0, 2)]).is_empty());
     let st = p.stats();
-    assert_eq!((st.running, &st.workers[0].placed), (0, &Resources::ZERO));
+    assert_eq!((st.running, &st.workers[0].placed), (0, &Resources::new()));
     // A late duplicate of the winning report is stale too.
     assert!(feed(&mut p, Time(Duration::from_secs(4)), [done(0, 2)]).is_empty());
     assert_eq!(p.explain(0), None);
@@ -712,7 +718,7 @@ fn requires_and_forbids() {
             Input::Worker(WorkerState {
                 id,
                 class: class.into(),
-                capacity: Resources::mem(100 * GB).with_slots(4),
+                capacity: Resources::new().with(MEMORY, 100 * GB).with(SLOTS, 4),
                 ..Default::default()
             })
         })
@@ -775,13 +781,13 @@ fn prefer_class_and_loosest() {
         Input::Worker(WorkerState {
             id: 1,
             class: "a".into(),
-            capacity: Resources::mem(100 * GB).with_slots(4),
+            capacity: Resources::new().with(MEMORY, 100 * GB).with(SLOTS, 4),
             ..Default::default()
         }),
         Input::Worker(WorkerState {
             id: 2,
             class: "b".into(),
-            capacity: Resources::mem(100 * GB).with_slots(4),
+            capacity: Resources::new().with(MEMORY, 100 * GB).with(SLOTS, 4),
             ..Default::default()
         }),
         Input::Submit(JobSpec {
@@ -804,7 +810,9 @@ fn prefer_class_and_loosest() {
 
 /// The verdict of a worker with every slot taken.
 fn slots_full() -> Verdict {
-    Verdict::Full { dims: vec![SLOTS] }
+    Verdict::Full {
+        dims: vec![SLOTS.name],
+    }
 }
 
 /// Slots are a hard resource: a job takes one unless it says otherwise, and a full worker is
@@ -813,7 +821,7 @@ fn slots_full() -> Verdict {
 fn slots_are_a_hard_resource() {
     let mut p = Scheduler::new(Config::fifo());
     let greedy = JobSpec {
-        demand: Resources::ZERO.with_slots(2),
+        demand: Resources::new().with(SLOTS, 2),
         ..job(0, 1, 0)
     };
     let inputs = [
@@ -828,8 +836,8 @@ fn slots_are_a_hard_resource() {
     );
     let load = &p.stats().workers[0];
     assert_eq!(
-        (load.running, load.placed[SLOTS], load.headroom[SLOTS.0]),
-        (2, 3, Some(0))
+        (load.running, load.placed.get(SLOTS), &load.headroom[2]),
+        (2, 3, &(SLOTS.name, Some(0)))
     );
     let e = p.explain(2).unwrap();
     assert_eq!(e.waiting().unwrap().workers, [(1, slots_full())]);
@@ -840,16 +848,9 @@ fn slots_are_a_hard_resource() {
 /// anywhere; explanations name the GPUs.
 #[test]
 fn declared_gpu_count() {
-    let gpus = ResourceId(1);
+    const GPUS: Resource = Resource::new("gpus").hard();
     let config = Config {
-        resources: vec![
-            Resource::slots(),
-            Resource {
-                name: "gpus".into(),
-                hard: true,
-                ..Default::default()
-            },
-        ],
+        resources: vec![SLOTS, GPUS],
         reservations: Some(Reservations {
             reserve_after: Duration::ZERO,
             ..Reservations::default()
@@ -859,12 +860,12 @@ fn declared_gpu_count() {
     let w = |id, slots, g| WorkerState {
         id,
         class: if g > 0 { "gpu" } else { "cpu" }.into(),
-        capacity: Resources::of([(ResourceId(0), slots), (gpus, g)]),
+        capacity: Resources::new().with(SLOTS, slots).with(GPUS, g),
         ..Default::default()
     };
     let needs = |id, g| JobSpec {
         id,
-        demand: Resources::of([(gpus, g)]),
+        demand: Resources::new().with(GPUS, g),
         ..Default::default()
     };
     let mut p = Scheduler::new(config);
@@ -887,8 +888,18 @@ fn declared_gpu_count() {
     assert_eq!(
         why.waiting().unwrap().workers,
         [
-            (1, Verdict::Full { dims: vec![gpus] }),
-            (2, Verdict::Full { dims: vec![gpus] })
+            (
+                1,
+                Verdict::Full {
+                    dims: vec![GPUS.name]
+                }
+            ),
+            (
+                2,
+                Verdict::Full {
+                    dims: vec![GPUS.name]
+                }
+            )
         ]
     );
     assert!(
@@ -908,7 +919,7 @@ fn declared_gpu_count() {
 /// could never fit it.
 #[test]
 fn deferral_waits_for_hard_capacity() {
-    let gpus = ResourceId(3);
+    const GPUS: Resource = Resource::new("gpus").hard();
     let mut config = Config {
         speed: SpeedConfig {
             defer: Some(crate::Defer::default()),
@@ -916,20 +927,16 @@ fn deferral_waits_for_hard_capacity() {
         },
         ..Config::fifo()
     };
-    config.resources.push(Resource {
-        name: "gpus".into(),
-        hard: true,
-        ..Default::default()
-    });
+    config.resources.push(GPUS);
     let w = |id, g, speed| WorkerState {
         id,
-        capacity: Resources::ZERO.with_slots(4).with(gpus, g),
+        capacity: Resources::new().with(SLOTS, 4).with(GPUS, g),
         speed,
         ..Default::default()
     };
     let gpu_job = |id, work| JobSpec {
         id,
-        demand: Resources::ZERO.with(gpus, 1),
+        demand: Resources::new().with(GPUS, 1),
         work: Some(Duration::from_secs(work)),
         ..Default::default()
     };
@@ -967,4 +974,51 @@ fn speculation_needs_gain() {
         ..worker(2, 1, 100)
     };
     assert!(feed(&mut p, Time(Duration::from_secs(90)), [Input::Worker(fast)]).is_empty());
+}
+
+/// A job demanding an undeclared resource is rejected at submission and forgotten; the others
+/// are unaffected.
+#[test]
+fn undeclared_demand_is_rejected() {
+    const GPUS: Resource = Resource::new("gpus").hard();
+    let mut p = Scheduler::new(Config::fifo());
+    let stray = JobSpec {
+        demand: Resources::new().with(MEMORY, 1).with(GPUS, 1),
+        ..job(0, 1, 0)
+    };
+    let inputs = [
+        Input::Worker(worker(1, 2, 100)),
+        Input::Submit(stray),
+        Input::Submit(job(1, 1, 0)),
+    ];
+    let out = feed(&mut p, Time::ORIGIN, inputs);
+    let reason = Rejection::Undeclared {
+        resource: GPUS.name,
+    };
+    assert_eq!(out[0], Output::Rejected { job: 0, reason });
+    assert_eq!(starts(&out), vec![(1, 1)]);
+    assert_eq!((p.explain(0), p.stats().waiting), (None, 0));
+}
+
+/// A declaration naming a resource twice is refused.
+#[test]
+#[should_panic(expected = "Config::resources declares resource \"slots\" twice")]
+fn duplicate_declaration_panics() {
+    let mut config = Config::default();
+    config.resources.push(Resource::new("slots"));
+    Scheduler::new(config);
+}
+
+/// A worker reporting an undeclared resource is a caller bug.
+#[test]
+#[should_panic(expected = "worker 3 reports capacity of resource \"gpus\"")]
+fn undeclared_worker_resource_panics() {
+    let mut p = Scheduler::new(Config::default());
+    let w = WorkerState {
+        capacity: Resources::new()
+            .with(SLOTS, 1)
+            .with(Resource::new("gpus"), 1),
+        ..worker(3, 1, 1)
+    };
+    p.handle(Input::Worker(w), Time::ORIGIN);
 }

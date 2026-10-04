@@ -4,9 +4,8 @@ use std::{sync::Arc, time::Duration};
 
 use proptest::prelude::*;
 use whelm::{
-    Attempt, Config, DagConfig, DagJob, DagScheduler, DagTemplate, Input, JobId, JobSpec,
-    NodeSource, Output, Policy, ResourceId, Resources, Scheduler, TemplateSpec, Time, Unit,
-    WorkerState,
+    Attempt, Config, DagConfig, DagJob, DagScheduler, DagTemplate, Input, JobId, JobSpec, MEMORY,
+    NodeSource, Output, Policy, Resources, SLOTS, Scheduler, TemplateSpec, Time, Unit, WorkerState,
 };
 
 /// A DAG layer over the default backfill policy with one worker of `slots` slots.
@@ -20,7 +19,9 @@ fn whelm(slots: usize, config: DagConfig) -> DagScheduler<Scheduler> {
 fn join(d: &mut DagScheduler<Scheduler>, slots: usize, now: Time) {
     let w = WorkerState {
         class: "x".into(),
-        capacity: Resources::mem(1 << 40).with_slots(slots as u64),
+        capacity: Resources::new()
+            .with(MEMORY, 1 << 40)
+            .with(SLOTS, slots as u64),
         ..Default::default()
     };
     d.handle(Input::Worker(w), now);
@@ -63,7 +64,7 @@ fn walk(template: &Arc<DagTemplate>, base: JobId, entry: JobId, done: JobId) -> 
         template: template.clone(),
         deps: vec![entry],
         spec: JobSpec {
-            demand: Resources::mem(1),
+            demand: Resources::new().with(MEMORY, 1),
             group: 7,
             ..Default::default()
         },
@@ -76,7 +77,7 @@ fn plain(id: JobId, demand: u64, group: u64, deps: Vec<JobId>) -> DagJob {
     DagJob {
         spec: JobSpec {
             id,
-            demand: Resources::mem(demand),
+            demand: Resources::new().with(MEMORY, demand),
             group,
             ..Default::default()
         },
@@ -120,7 +121,7 @@ impl NodeSource for Squares {
 
     /// Leaf `i` demands `i^2 + 3` bytes.
     fn spec(&self, _unit: JobId, leaf: u32, spec: &mut JobSpec) {
-        spec.demand = Resources::mem(u64::from(leaf * leaf + 3));
+        spec.demand = Resources::new().with(MEMORY, u64::from(leaf * leaf + 3));
     }
 
     /// `Sq(i)`.
@@ -147,7 +148,7 @@ fn per_node_demand_and_label() {
     assert_eq!(d.poll(Time::ORIGIN), vec![Output::RunLocal { job: 1 }]);
     done(&mut d, 1, 0, Time::ORIGIN);
     assert_eq!(starts(&d.poll(Time::ORIGIN)).len(), 3);
-    assert_eq!(d.stats().workers[0].placed[ResourceId::MEM], 3 + 4 + 7);
+    assert_eq!(d.stats().workers[0].placed.get(MEMORY), 3 + 4 + 7);
 }
 
 /// The completion order of a walk driven to the end: every round, poll, then complete every
@@ -286,7 +287,7 @@ fn close_walk_early() {
     assert!(d.poll(Time(Duration::from_secs(3))).is_empty());
     let st = d.stats();
     assert_eq!((st.waiting, st.running), (0, 0));
-    assert_eq!(st.workers[0].placed, Resources::ZERO);
+    assert_eq!(st.workers[0].placed, Resources::new());
 }
 
 /// R11: local jobs are never submitted; they are announced as [`Output::RunLocal`], not

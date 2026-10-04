@@ -23,9 +23,9 @@ In α|β|γ notation:
   job kind and worker class). Speeds are reported, or learned online from completion times (`Learn`;
   `SpeedEstimator` is the same learner on its own).
 - **β, jobs.** A job (`JobSpec`) has
-  - a vector demand (`Resources`, one amount per resource that `Config::resources` declares: by
-    default host memory, device memory and execution slots), checked by one per-resource admission
-    rule (below);
+  - a demand (`Resources`: amounts keyed by the names of the resources that `Config::resources`
+    declares, by default `MEMORY`, `DEVICE_MEMORY` and `SLOTS`; a job naming another is rejected),
+    checked by one per-resource admission rule (below);
   - `Constraint`s on a worker or a class (`Selector`) with a `Strength`: Require and Forbid are
     hard, Avoid is soft, Prefer only ranks workers;
   - dependencies, through the DAG layer;
@@ -57,8 +57,8 @@ admit iff for every enforced resource d:
           or (d is soft and running == 0)                 // escape hatch
 ```
 
-- The configuration declares each resource (`Resource`) hard or soft, with a default demand for jobs
-  that leave it at zero. Hard resources (slots, a GPU count, a license pool) are always enforced and
+- The configuration declares each resource (`Resource`, identified by its name) hard or soft, with
+  a default demand for jobs that leave it out. Hard resources (slots, a GPU count, a license pool) are always enforced and
   have no escape hatch; a worker with zero capacity of one runs no job that demands it. A soft
   resource (memory) is enforced only where its capacity is nonzero: a zero capacity is unknown.
 - `per_task` is a per-job floor, so with a device floor and no per-job device demands the device
@@ -84,7 +84,10 @@ exactly once.
 ```rust
 use std::time::Duration;
 
-use whelm::{Config, Input, JobSpec, Output, Policy, Resources, Scheduler, Time, WorkerState};
+use whelm::{
+    Config, Input, JobSpec, MEMORY, Output, Policy, Resources, SLOTS, Scheduler, Time, WorkerState,
+    gb,
+};
 
 let mut policy = Scheduler::new(Config::default());
 // Points on the caller's clock: here, seconds since the start of the run.
@@ -95,16 +98,16 @@ policy.handle(
     Input::Worker(WorkerState {
         id: 1,
         class: "l40s".into(),
-        capacity: Resources::mem_gb(120.0).with_slots(16),
-        reported_used: Resources::mem_gb(20.0),
-        reported_baseline: Resources::mem_gb(20.0),
+        capacity: Resources::new().with(MEMORY, gb(120.0)).with(SLOTS, 16),
+        reported_used: Resources::new().with(MEMORY, gb(20.0)),
+        reported_baseline: Resources::new().with(MEMORY, gb(20.0)),
         ..Default::default()
     }),
     Time::ORIGIN,
 );
 
 // Jobs and workers are struct literals; `Default` fills in what they leave out.
-let job = |id, gb| JobSpec { id, demand: Resources::mem_gb(gb), group: 3, ..Default::default() };
+let job = |id, size| JobSpec { id, demand: Resources::new().with(MEMORY, gb(size)), group: 3, ..Default::default() };
 policy.handle(Input::Submit(job(7, 6.0)), at(1));
 policy.handle(Input::Submit(job(8, 30.0)), at(1));
 
@@ -115,6 +118,7 @@ for out in policy.poll(at(1)) {
         Output::Start { job, attempt, worker } => started.push((job, attempt, worker)),
         Output::Stop { .. } => {}   // cancel that attempt: its result is not wanted
         Output::GaveUp(_) => {}     // the job failed too often and is forgotten
+        Output::Rejected { .. } => {} // its demand names an undeclared resource
         _ => unreachable!("DAG layer only"),
     }
 }
@@ -204,16 +208,18 @@ still receives the job's retry or give-up, and its `complete` cancels the retry.
 
 ```rust
 use std::sync::Arc;
-use whelm::{Config, FailKind, JobSpec, Resources, Scheduler, SharedPolicy, WorkerState};
+use whelm::{
+    Config, FailKind, JobSpec, MEMORY, Resources, SLOTS, Scheduler, SharedPolicy, WorkerState, gb,
+};
 
 let shared = Arc::new(SharedPolicy::with_system_clock(Scheduler::new(Config::default())));
 shared.worker_update(WorkerState {
     id: 1,
     class: "l40s".into(),
-    capacity: Resources::mem_gb(120.0).with_slots(16),
+    capacity: Resources::new().with(MEMORY, gb(120.0)).with(SLOTS, 16),
     ..Default::default()
 });
-let job = JobSpec { id: 42, demand: Resources::mem_gb(6.0), group: 3, ..Default::default() };
+let job = JobSpec { id: 42, demand: Resources::new().with(MEMORY, gb(6.0)), group: 3, ..Default::default() };
 let mut lease = shared.lease(job); // blocks
 loop {
     // Send the task to `lease.worker()` and wait for the reply.
@@ -238,16 +244,16 @@ reproduces every poll; learned speeds live in the scheduler, so it relearns them
 ```rust
 use std::sync::{Arc, Mutex};
 use whelm::{
-    Config, Input, JobSpec, Policy, Resources, Scheduler, Time, WorkerState,
+    Config, Input, JobSpec, MEMORY, Policy, Resources, SLOTS, Scheduler, Time, WorkerState, gb,
     log::{self, Event, Logged},
 };
 
 let events = Arc::new(Mutex::new(Vec::<Event>::new()));
 let mut p = Logged::new(Scheduler::new(Config::default()), events.clone());
-let capacity = Resources::mem_gb(10.0).with_slots(2);
+let capacity = Resources::new().with(MEMORY, gb(10.0)).with(SLOTS, 2);
 let worker = WorkerState { id: 1, capacity, ..Default::default() };
 p.handle(Input::Worker(worker), Time::ORIGIN);
-let job = JobSpec { id: 1, demand: Resources::mem_gb(4.0), ..Default::default() };
+let job = JobSpec { id: 1, demand: Resources::new().with(MEMORY, gb(4.0)), ..Default::default() };
 p.handle(Input::Submit(job), Time::ORIGIN);
 p.poll(Time::ORIGIN);
 
@@ -300,12 +306,12 @@ is job `base + k`; other units depend on it by its id.
 use std::{sync::Arc, time::Duration};
 
 use whelm::{
-    Config, DagConfig, DagJob, DagScheduler, Input, JobSpec, Output, Policy, Resources, Scheduler,
-    TemplateSpec, Time, Unit, WorkerState,
+    Config, DagConfig, DagJob, DagScheduler, Input, JobSpec, Output, Policy, Resources, SLOTS,
+    Scheduler, TemplateSpec, Time, Unit, WorkerState,
 };
 
 let mut dag = DagScheduler::new(DagConfig::default(), Scheduler::new(Config::default()));
-let worker = WorkerState { id: 1, capacity: Resources::ZERO.with_slots(4), ..Default::default() };
+let worker = WorkerState { id: 1, capacity: Resources::new().with(SLOTS, 4), ..Default::default() };
 dag.handle(Input::Worker(worker), Time::ORIGIN);
 
 // A local job 1, then unit 10: a chain of jobs 100 -> 101 -> 102, the first checkpointed.
@@ -355,8 +361,8 @@ learned per-task device demand as the device `per_task`. Bidegrees become groups
 # fn main() {
 use std::{sync::Arc, time::Duration};
 use whelm::{
-    Config, FailKind, GroupOrder, JobSpec, Resources, Scheduler, SharedPolicy, SpeedConfig, Timing,
-    WorkerState, log::{JsonlSink, Logged, TaskInfo}, nassau,
+    Config, DEVICE_MEMORY, FailKind, GroupOrder, JobSpec, MEMORY, Resources, SLOTS, Scheduler,
+    SharedPolicy, SpeedConfig, Timing, WorkerState, gb, log::{JsonlSink, Logged, TaskInfo}, nassau,
 };
 
 // Once: restart-stable bidegree order, speeds learned per worker, every input and poll logged.
@@ -378,10 +384,13 @@ let prior = if class == "l40s" { 1.39 } else { 1.0 };
 shared.worker_update(WorkerState {
     id,
     class: class.into(),
-    capacity: Resources::mem_gb(123.7).with_dev_gb(dev_cap).with_slots(16),
-    per_task: Resources::ZERO.with_dev_gb(dev_per_task),
-    reported_used: Resources::mem_gb(rss),
-    reported_baseline: Resources::mem_gb(baseline_excl),
+    capacity: Resources::new()
+        .with(MEMORY, gb(123.7))
+        .with(DEVICE_MEMORY, gb(dev_cap))
+        .with(SLOTS, 16),
+    per_task: Resources::new().with(DEVICE_MEMORY, gb(dev_per_task)),
+    reported_used: Resources::new().with(MEMORY, gb(rss)),
+    reported_baseline: Resources::new().with(MEMORY, gb(baseline_excl)),
     speed: prior,
 });
 
@@ -393,7 +402,7 @@ shared.with(|p, _| {
 });
 let spec = JobSpec {
     id: task,
-    demand: Resources::mem_gb(est_gb),
+    demand: Resources::new().with(MEMORY, gb(est_gb)),
     group: nassau::group(s as u32, t as u32),
     work: Some(work),
     ..Default::default()

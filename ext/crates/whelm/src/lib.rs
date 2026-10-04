@@ -46,7 +46,10 @@
 //! ```
 //! use std::time::Duration;
 //!
-//! use whelm::{Config, Input, JobSpec, Output, Policy, Resources, Scheduler, Time, WorkerState};
+//! use whelm::{
+//!     Config, Input, JobSpec, MEMORY, Output, Policy, Resources, SLOTS, Scheduler, Time,
+//!     WorkerState, gb,
+//! };
 //!
 //! let mut policy = Scheduler::new(Config::default());
 //!
@@ -54,7 +57,7 @@
 //! let worker = WorkerState {
 //!     id: 1,
 //!     class: "cpu".into(),
-//!     capacity: Resources::mem_gb(16.0).with_slots(4),
+//!     capacity: Resources::new().with(MEMORY, gb(16.0)).with(SLOTS, 4),
 //!     ..Default::default()
 //! };
 //! policy.handle(Input::Worker(worker), Time::ORIGIN);
@@ -62,7 +65,7 @@
 //! // Job 7 becomes ready: it expects to use 2 GB and belongs to group 3.
 //! let job = JobSpec {
 //!     id: 7,
-//!     demand: Resources::mem_gb(2.0),
+//!     demand: Resources::new().with(MEMORY, gb(2.0)),
 //!     group: 3,
 //!     ..Default::default()
 //! };
@@ -107,11 +110,13 @@
 //!
 //! ```
 //! # use std::time::Duration;
-//! # use whelm::{Config, Input, JobSpec, Output, Policy, Resources, Scheduler, Time, WorkerState};
+//! # use whelm::{
+//! #     Config, Input, JobSpec, Output, Policy, Resources, SLOTS, Scheduler, Time, WorkerState,
+//! # };
 //! let mut policy = Scheduler::new(Config::default());
 //! let worker = WorkerState {
 //!     id: 1,
-//!     capacity: Resources::ZERO.with_slots(2),
+//!     capacity: Resources::new().with(SLOTS, 2),
 //!     ..Default::default()
 //! };
 //! policy.handle(Input::Worker(worker), Time::ORIGIN);
@@ -167,12 +172,14 @@
 //!
 //! ```
 //! # use std::time::Duration;
-//! # use whelm::{Config, Input, JobSpec, Output, Policy, Resources, Scheduler, Time, WorkerState};
+//! # use whelm::{
+//! #     Config, Input, JobSpec, Output, Policy, Resources, SLOTS, Scheduler, Time, WorkerState,
+//! # };
 //! let mut p = Scheduler::new(Config::default());
 //! p.handle(
 //!     Input::Worker(WorkerState {
 //!         id: 1,
-//!         capacity: Resources::ZERO.with_slots(4),
+//!         capacity: Resources::new().with(SLOTS, 4),
 //!         ..Default::default()
 //!     }),
 //!     Time::ORIGIN,
@@ -227,14 +234,15 @@
 //! ```
 //! # use std::time::Duration;
 //! # use whelm::{
-//! #     Config, FailKind, Input, JobSpec, Output, Policy, Resources, Scheduler, Time, WorkerState,
+//! #     Config, FailKind, Input, JobSpec, Output, Policy, Resources, SLOTS, Scheduler, Time,
+//! #     WorkerState,
 //! # };
 //! let mut p = Scheduler::new(Config::default());
 //! for id in [1, 2] {
 //!     p.handle(
 //!         Input::Worker(WorkerState {
 //!             id,
-//!             capacity: Resources::ZERO.with_slots(1),
+//!             capacity: Resources::new().with(SLOTS, 1),
 //!             ..Default::default()
 //!         }),
 //!         Time::ORIGIN,
@@ -311,7 +319,7 @@
 //! ```
 //! # use std::time::Duration;
 //! # use whelm::{
-//! #     Config, FailKind, GaveUp, Input, JobSpec, Output, Policy, Resources, RetryConfig,
+//! #     Config, FailKind, GaveUp, Input, JobSpec, Output, Policy, Resources, RetryConfig, SLOTS,
 //! #     Scheduler, Time, Tried, WorkerState,
 //! # };
 //! let config = Config {
@@ -323,7 +331,7 @@
 //!     Input::Worker(WorkerState {
 //!         id: 1,
 //!         class: "gpu".into(),
-//!         capacity: Resources::ZERO.with_slots(1),
+//!         capacity: Resources::new().with(SLOTS, 1),
 //!         ..Default::default()
 //!     }),
 //!     Time::ORIGIN,
@@ -384,12 +392,14 @@
 //!
 //! ```
 //! # use std::time::Duration;
-//! # use whelm::{Config, Input, JobSpec, Output, Policy, Resources, Scheduler, Time, WorkerState};
+//! # use whelm::{
+//! #     Config, Input, JobSpec, Output, Policy, Resources, SLOTS, Scheduler, Time, WorkerState,
+//! # };
 //! let mut p = Scheduler::new(Config::default());
 //! p.handle(
 //!     Input::Worker(WorkerState {
 //!         id: 1,
-//!         capacity: Resources::ZERO.with_slots(1),
+//!         capacity: Resources::new().with(SLOTS, 1),
 //!         ..Default::default()
 //!     }),
 //!     Time::ORIGIN,
@@ -430,14 +440,15 @@
 //! ```
 //! # use std::time::Duration;
 //! # use whelm::{
-//! #     Config, FailKind, Input, JobSpec, Output, Policy, Resources, Scheduler, Time, WorkerState,
+//! #     Config, FailKind, Input, JobSpec, Output, Policy, Resources, SLOTS, Scheduler, Time,
+//! #     WorkerState,
 //! # };
 //! let mut p = Scheduler::new(Config::default());
 //! for id in [1, 2] {
 //!     p.handle(
 //!         Input::Worker(WorkerState {
 //!             id,
-//!             capacity: Resources::ZERO.with_slots(1),
+//!             capacity: Resources::new().with(SLOTS, 1),
 //!             ..Default::default()
 //!         }),
 //!         Time::ORIGIN,
@@ -491,13 +502,15 @@
 //!
 //! ```
 //! # use std::time::Duration;
-//! # use whelm::{Config, Input, JobSpec, Output, Policy, Resources, Scheduler, Time, WorkerState};
+//! # use whelm::{
+//! #     Config, Input, JobSpec, Output, Policy, Resources, SLOTS, Scheduler, Time, WorkerState,
+//! # };
 //! let mut p = Scheduler::new(Config::default());
 //! for id in [1, 2] {
 //!     p.handle(
 //!         Input::Worker(WorkerState {
 //!             id,
-//!             capacity: Resources::ZERO.with_slots(1),
+//!             capacity: Resources::new().with(SLOTS, 1),
 //!             ..Default::default()
 //!         }),
 //!         Time::ORIGIN,
@@ -534,36 +547,28 @@
 //! # Resources and admission
 //!
 //! A configuration declares the resources its workers have and its jobs use, as a list of
-//! [`Resource`]s in [`Config::resources`]. A [`Resources`] vector holds one amount per declared
-//! resource, indexed by [`ResourceId`]: a job's [`demand`](JobSpec::demand) is what it is expected
-//! to use, and a worker's [`capacity`](WorkerState::capacity) is what it has. The default
-//! declaration is host memory ([`ResourceId::MEM`]) and device memory ([`ResourceId::DEV`]) in
-//! bytes, then execution slots ([`ResourceId::SLOTS`]), and [`Resources`] has shorthands for it:
-//! [`mem_gb`](Resources::mem_gb), [`with_dev_gb`](Resources::with_dev_gb),
-//! [`with_slots`](Resources::with_slots). A component a vector leaves out is zero.
+//! [`Resource`]s in [`Config::resources`]. A `Resource` describes one kind of resource and is
+//! identified by its name; it is usually a constant, and the default declaration is three of them:
+//! host memory ([`MEMORY`]) and device memory ([`DEVICE_MEMORY`]), in bytes, and execution slots
+//! ([`SLOTS`]). A [`Resources`] value holds amounts of resources keyed by name, built up with
+//! [`with`](Resources::with): a job's [`demand`](JobSpec::demand) is what it is expected to use,
+//! and a worker's [`capacity`](WorkerState::capacity) is what it has. A resource it leaves out has
+//! amount zero, and [`gb`] turns gigabytes into bytes.
 //!
 //! ```
-//! use whelm::{ResourceId, Resources};
+//! use whelm::{DEVICE_MEMORY, MEMORY, Resources, SLOTS, gb};
 //!
-//! let demand = Resources::mem_gb(6.0).with_dev_gb(2.0);
-//! assert_eq!(
-//!     (
-//!         demand[ResourceId::MEM],
-//!         demand[ResourceId::DEV],
-//!         demand[ResourceId::SLOTS]
-//!     ),
-//!     (6_000_000_000, 2_000_000_000, 0)
-//! );
-//! assert!(demand.fits_within(&Resources::mem_gb(8.0).with_dev_gb(2.0)));
-//! // Arithmetic saturates: bookkeeping never goes below zero.
-//! assert_eq!(
-//!     demand - Resources::mem_gb(10.0),
-//!     Resources::ZERO.with_dev_gb(2.0)
-//! );
+//! let demand = Resources::new()
+//!     .with(MEMORY, gb(6.0))
+//!     .with(DEVICE_MEMORY, gb(2.0));
+//! assert_eq!(demand.get(MEMORY), 6_000_000_000);
+//! assert_eq!(demand.get(SLOTS), 0);
+//! // Setting a resource again replaces its amount.
+//! assert_eq!(demand.with(MEMORY, 1).get(MEMORY), 1);
 //! ```
 //!
 //! A resource's [`default_demand`](Resource::default_demand) is what a job takes of it when its
-//! demand leaves it at zero: one slot, so every job takes a slot unless it asks for more. A worker
+//! demand leaves it out: one slot, so every job takes a slot unless it asks for more. A worker
 //! states its capacity whole, so its slots too; one without slots runs nothing.
 //!
 //! Whether a worker takes a job is up to an [`Admission`] rule; the default,
@@ -574,14 +579,17 @@
 //!
 //! ```
 //! # use std::time::Duration;
-//! # use whelm::{Config, Input, JobSpec, Output, Policy, Resources, Scheduler, Time, WorkerState};
-//! use whelm::{ResourceId, Status, Verdict};
+//! # use whelm::{
+//! #     Config, Input, JobSpec, MEMORY, Output, Policy, Resources, SLOTS, Scheduler, Time,
+//! #     WorkerState, gb,
+//! # };
+//! use whelm::{Status, Verdict};
 //!
 //! let mut p = Scheduler::new(Config::default());
 //! p.handle(
 //!     Input::Worker(WorkerState {
 //!         id: 1,
-//!         capacity: Resources::mem_gb(10.0).with_slots(2),
+//!         capacity: Resources::new().with(MEMORY, gb(10.0)).with(SLOTS, 2),
 //!         ..Default::default()
 //!     }),
 //!     Time::ORIGIN,
@@ -589,7 +597,7 @@
 //! p.handle(
 //!     Input::Submit(JobSpec {
 //!         id: 1,
-//!         demand: Resources::mem_gb(6.0),
+//!         demand: Resources::new().with(MEMORY, gb(6.0)),
 //!         ..Default::default()
 //!     }),
 //!     Time::ORIGIN,
@@ -597,7 +605,7 @@
 //! p.handle(
 //!     Input::Submit(JobSpec {
 //!         id: 2,
-//!         demand: Resources::mem_gb(6.0),
+//!         demand: Resources::new().with(MEMORY, gb(6.0)),
 //!         ..Default::default()
 //!     }),
 //!     Time::ORIGIN,
@@ -619,9 +627,9 @@
 //! for (worker, verdict) in &waiting.workers {
 //!     match verdict {
 //!         Verdict::Short { dims, headroom } => {
-//!             // Short of memory only, with 4 GB left.
-//!             assert_eq!((*worker, &dims[..]), (1, &[ResourceId::MEM][..]));
-//!             assert_eq!(headroom[ResourceId::MEM.0], Some(4_000_000_000));
+//!             // Short of memory only, with 4 GB left; resources are named.
+//!             assert_eq!((*worker, &dims[..]), (1, &[MEMORY.name][..]));
+//!             assert_eq!(headroom[0], (MEMORY.name, Some(4_000_000_000)));
 //!         }
 //!         other => panic!("worker {worker}: {other:?}"),
 //!     }
@@ -632,7 +640,10 @@
 //!      waiting; memory short on 1 worker(s) (best headroom 4.00 GB on worker 1)"
 //! );
 //!
-//! p.handle(Input::Done { job: 1, attempt: 1 }, Time(Duration::from_secs(50)));
+//! p.handle(
+//!     Input::Done { job: 1, attempt: 1 },
+//!     Time(Duration::from_secs(50)),
+//! );
 //! assert_eq!(
 //!     p.poll(Time(Duration::from_secs(50))),
 //!     [Output::Start {
@@ -651,18 +662,21 @@
 //!
 //! ```
 //! # use std::time::Duration;
-//! # use whelm::{Config, Input, JobSpec, Output, Policy, Resources, Scheduler, Time, WorkerState};
+//! # use whelm::{
+//! #     Config, Input, JobSpec, MEMORY, Output, Policy, Resources, SLOTS, Scheduler, Time,
+//! #     WorkerState, gb,
+//! # };
 //! let mut p = Scheduler::new(Config::default());
 //! let worker = WorkerState {
 //!     id: 1,
-//!     capacity: Resources::mem_gb(10.0).with_slots(4),
+//!     capacity: Resources::new().with(MEMORY, gb(10.0)).with(SLOTS, 4),
 //!     ..Default::default()
 //! };
 //! p.handle(Input::Worker(worker.clone()), Time::ORIGIN);
 //! p.handle(
 //!     Input::Submit(JobSpec {
 //!         id: 1,
-//!         demand: Resources::mem_gb(3.0),
+//!         demand: Resources::new().with(MEMORY, gb(3.0)),
 //!         ..Default::default()
 //!     }),
 //!     Time::ORIGIN,
@@ -678,15 +692,15 @@
 //!
 //! // Heartbeat: 8 GB resident, 1 GB of it the worker's own runtime.
 //! let heartbeat = WorkerState {
-//!     reported_used: Resources::mem_gb(8.0),
-//!     reported_baseline: Resources::mem_gb(1.0),
+//!     reported_used: Resources::new().with(MEMORY, gb(8.0)),
+//!     reported_baseline: Resources::new().with(MEMORY, gb(1.0)),
 //!     ..worker
 //! };
 //! p.handle(Input::Worker(heartbeat), Time(Duration::from_secs(5)));
 //! p.handle(
 //!     Input::Submit(JobSpec {
 //!         id: 2,
-//!         demand: Resources::mem_gb(3.0),
+//!         demand: Resources::new().with(MEMORY, gb(3.0)),
 //!         ..Default::default()
 //!     }),
 //!     Time(Duration::from_secs(5)),
@@ -701,12 +715,15 @@
 //!
 //! ```
 //! # use std::time::Duration;
-//! # use whelm::{Config, Input, JobSpec, Output, Policy, Resources, Scheduler, Time, WorkerState};
+//! # use whelm::{
+//! #     Config, Input, JobSpec, MEMORY, Output, Policy, Resources, SLOTS, Scheduler, Time,
+//! #     WorkerState, gb,
+//! # };
 //! let mut p = Scheduler::new(Config::default());
 //! p.handle(
 //!     Input::Worker(WorkerState {
 //!         id: 1,
-//!         capacity: Resources::mem_gb(10.0).with_slots(4),
+//!         capacity: Resources::new().with(MEMORY, gb(10.0)).with(SLOTS, 4),
 //!         ..Default::default()
 //!     }),
 //!     Time::ORIGIN,
@@ -714,7 +731,7 @@
 //! p.handle(
 //!     Input::Submit(JobSpec {
 //!         id: 1,
-//!         demand: Resources::mem_gb(50.0),
+//!         demand: Resources::new().with(MEMORY, gb(50.0)),
 //!         ..Default::default()
 //!     }),
 //!     Time::ORIGIN,
@@ -722,7 +739,7 @@
 //! p.handle(
 //!     Input::Submit(JobSpec {
 //!         id: 2,
-//!         demand: Resources::mem_gb(1.0),
+//!         demand: Resources::new().with(MEMORY, gb(1.0)),
 //!         ..Default::default()
 //!     }),
 //!     Time::ORIGIN,
@@ -741,7 +758,7 @@
 //! p.handle(
 //!     Input::Worker(WorkerState {
 //!         id: 2,
-//!         capacity: Resources::ZERO.with_slots(2),
+//!         capacity: Resources::new().with(SLOTS, 2),
 //!         ..Default::default()
 //!     }),
 //!     Time(Duration::from_secs(1)),
@@ -749,7 +766,7 @@
 //! p.handle(
 //!     Input::Submit(JobSpec {
 //!         id: 3,
-//!         demand: Resources::mem_gb(500.0),
+//!         demand: Resources::new().with(MEMORY, gb(500.0)),
 //!         ..Default::default()
 //!     }),
 //!     Time(Duration::from_secs(1)),
@@ -777,9 +794,7 @@
 //!     Time(Duration::from_secs(2)),
 //! );
 //! assert!(p.poll(Time(Duration::from_secs(2))).is_empty());
-//! assert!(
-//!     (p.explain(4).unwrap().to_string()).contains("slots full on 1 worker(s)")
-//! );
+//! assert!((p.explain(4).unwrap().to_string()).contains("slots full on 1 worker(s)"));
 //! ```
 //!
 //! A worker can also declare a [`per_task`](WorkerState::per_task) floor: what any one job takes
@@ -788,14 +803,17 @@
 //! worker's load and headroom as admission sees it.
 //!
 //! ```
-//! # use whelm::{Config, Input, JobSpec, Output, Policy, Resources, Scheduler, Time, WorkerState};
+//! # use whelm::{
+//! #     Config, DEVICE_MEMORY, Input, JobSpec, Output, Policy, Resources, SLOTS, Scheduler, Time,
+//! #     WorkerState, gb,
+//! # };
 //! let mut p = Scheduler::new(Config::default());
 //! // 8 slots, unknown host memory, 10 GB of device memory, at least 4 GB of it per job.
 //! let gpu = WorkerState {
-//!     per_task: Resources::ZERO.with_dev_gb(4.0),
+//!     per_task: Resources::new().with(DEVICE_MEMORY, gb(4.0)),
 //!     id: 1,
 //!     class: "gpu".into(),
-//!     capacity: Resources::ZERO.with_dev_gb(10.0).with_slots(8),
+//!     capacity: Resources::new().with(DEVICE_MEMORY, gb(10.0)).with(SLOTS, 8),
 //!     ..Default::default()
 //! };
 //! p.handle(Input::Worker(gpu), Time::ORIGIN);
@@ -810,33 +828,39 @@
 //! assert_eq!(p.poll(Time::ORIGIN).len(), 2);
 //! let load = &p.stats().workers[0];
 //! assert_eq!(load.running, 2);
-//! assert_eq!(load.headroom, [None, Some(2_000_000_000), Some(6)]);
+//! let headroom: Vec<_> = load.headroom.iter().map(|(_, h)| *h).collect();
+//! assert_eq!(headroom, [None, Some(2_000_000_000), Some(6)]); // memory, device memory, slots
 //! ```
 //!
-//! Any other resource is a declaration away. Here workers count their GPUs, a hard resource that
-//! jobs take none of unless they say so: the GPU jobs share the one worker that has GPUs, the
-//! others go anywhere, and a job no worker has a GPU left for is explained by name. A license pool
-//! per worker, or a scratch disk (soft, like memory: [`Resource::memory`]), is declared the same
-//! way.
+//! Any other resource is a declaration away: a constant, made with [`Resource::new`] and its
+//! `const` builder methods, added to [`Config::resources`]. Here workers count their GPUs, a hard
+//! resource that jobs take none of unless they say so: the GPU jobs share the one worker that has
+//! GPUs, the others go anywhere, and a job no worker has a GPU left for is explained by name. A
+//! license pool per worker, or a scratch disk (soft, like memory), is declared the same way.
+//!
+//! A resource is its name. The scheduler reads a resource's rules (hard or soft, default demand,
+//! unit) from its declaration alone, so amounts built with another constant of the same name mean
+//! the declared resource. A name the declaration lacks is a mistake the scheduler reports rather
+//! than ignores: a job demanding it is [rejected](Output::Rejected) and forgotten, and a worker
+//! state naming it is a panic ([`Input::Worker`]).
 //!
 //! ```
-//! # use whelm::{Config, Input, JobSpec, Output, Policy, Resources, Scheduler, Time, WorkerState};
-//! use whelm::{Resource, ResourceId};
+//! # use whelm::{
+//! #     Config, Input, JobSpec, Output, Policy, Resources, SLOTS, Scheduler, Time, WorkerState,
+//! # };
+//! use whelm::{Rejection, Resource};
+//!
+//! const GPUS: Resource = Resource::new("gpus").hard();
 //!
 //! let mut config = Config::default();
-//! let gpus = ResourceId(config.resources.len());
-//! config.resources.push(Resource {
-//!     name: "gpus".into(),
-//!     hard: true,
-//!     ..Default::default()
-//! });
+//! config.resources.push(GPUS);
 //! let mut p = Scheduler::new(config);
 //!
 //! // Worker 1 has no GPU, worker 2 has two; both have eight slots.
 //! for (id, n) in [(1, 0), (2, 2)] {
 //!     let worker = WorkerState {
 //!         id,
-//!         capacity: Resources::ZERO.with_slots(8).with(gpus, n),
+//!         capacity: Resources::new().with(SLOTS, 8).with(GPUS, n),
 //!         ..Default::default()
 //!     };
 //!     p.handle(Input::Worker(worker), Time::ORIGIN);
@@ -845,56 +869,72 @@
 //! for id in 1..=4 {
 //!     let job = JobSpec {
 //!         id,
-//!         demand: Resources::ZERO.with(gpus, (id < 4).into()),
+//!         demand: Resources::new().with(GPUS, (id < 4).into()),
 //!         ..Default::default()
 //!     };
 //!     p.handle(Input::Submit(job), Time::ORIGIN);
 //! }
+//! // Job 5 needs a TPU, which this configuration does not declare.
+//! let tpu_job = JobSpec {
+//!     id: 5,
+//!     demand: Resources::new().with(Resource::new("tpus"), 1),
+//!     ..Default::default()
+//! };
+//! p.handle(Input::Submit(tpu_job), Time::ORIGIN);
+//!
 //! let start = |job, worker| Output::Start {
 //!     job,
 //!     attempt: 1,
 //!     worker,
 //! };
+//! let rejected = Output::Rejected {
+//!     job: 5,
+//!     reason: Rejection::Undeclared {
+//!         resource: "tpus".into(),
+//!     },
+//! };
 //! assert_eq!(
 //!     p.poll(Time::ORIGIN),
-//!     [start(1, 2), start(2, 2), start(4, 1)]
+//!     [rejected, start(1, 2), start(2, 2), start(4, 1)]
 //! );
 //! assert_eq!(
 //!     p.explain(3).unwrap().to_string(),
 //!     "job 3 (demand [slots 1, gpus 1], group 0) waiting 0s, 0 more urgent job(s) waiting; gpus \
 //!      full on 2 worker(s)"
 //! );
+//! assert_eq!(p.explain(5), None);
 //! ```
 //!
 //! The rule can be called directly on a [`WorkerView`]: the declared resources, a worker's state,
-//! and what the scheduler has placed on it. Its methods give the pieces of the rule, such as the
-//! [`headroom`](WorkerView::headroom) per resource and the [`free_share`](WorkerView::free_share)
-//! that scores compare workers by.
+//! and what the scheduler has placed on it, as [`WorkerView::new`] builds it. A demand goes in as
+//! the scheduler holds it, with the default demands filled in ([`WorkerView::demand`]). The view's
+//! methods give the pieces of the rule per resource, such as the
+//! [`headroom`](WorkerView::headroom) and the [`free_share`](WorkerView::free_share) that scores
+//! compare workers by.
 //!
 //! ```
-//! use whelm::{Admission, Config, ProductionAdmission, Resources, WorkerState, WorkerView};
+//! use whelm::{
+//!     Admission, Config, MEMORY, ProductionAdmission, Resources, SLOTS, WorkerState, WorkerView,
+//!     gb,
+//! };
 //!
 //! let config = Config::default();
 //! let state = WorkerState {
 //!     id: 1,
-//!     capacity: Resources::mem_gb(10.0).with_slots(4),
+//!     capacity: Resources::new().with(MEMORY, gb(10.0)).with(SLOTS, 4),
 //!     ..Default::default()
 //! };
-//! // One job running, which took a slot.
-//! let view = WorkerView {
-//!     resources: &config.resources,
-//!     state: &state,
-//!     placed: &Resources::mem_gb(6.0).with_slots(1),
-//!     running: 1,
-//! };
+//! // One job running, which took 6 GB and a slot.
+//! let placed = Resources::new().with(MEMORY, gb(6.0)).with(SLOTS, 1);
+//! let view = WorkerView::new(&config.resources, &state, &placed, 1);
 //!
-//! // The scheduler asks with demands that take one slot each.
-//! let job = |gb| Resources::mem_gb(gb).with_slots(1);
+//! let job = |x| view.demand(&Resources::new().with(MEMORY, gb(x)));
 //! assert!(ProductionAdmission.admits(&job(4.0), &view));
 //! assert!(!ProductionAdmission.admits(&job(5.0), &view));
-//! assert_eq!(view.headroom(), [Some(4_000_000_000), None, Some(3)]);
+//! assert_eq!(view.headroom(MEMORY), Some(4_000_000_000));
+//! assert_eq!(view.headroom(SLOTS), Some(3));
 //! // After placing 2 GB more, a fifth of the memory would be left.
-//! assert_eq!(view.free_share(&Resources::mem_gb(2.0)), 0.2);
+//! assert_eq!(view.free_share(&job(2.0)), 0.2);
 //! ```
 //!
 //! A different rule plugs in with [`Scheduler::with_admission`]. It must be monotone in load (see
@@ -903,16 +943,16 @@
 //!
 //! ```
 //! use whelm::{
-//!     Admission, Config, Input, JobSpec, Policy, ResourceId, Resources, Scheduler, Time,
-//!     WorkerState, WorkerView,
+//!     Admission, Amounts, Config, Input, JobSpec, MEMORY, Policy, Resources, SLOTS, Scheduler,
+//!     Time, WorkerState, WorkerView, gb,
 //! };
 //!
 //! /// Admits while a slot is free, whatever the memory figures say.
 //! struct SlotsOnly;
 //!
 //! impl Admission for SlotsOnly {
-//!     fn admits(&self, _demand: &Resources, w: &WorkerView) -> bool {
-//!         (w.running as u64) < w.state.capacity[ResourceId::SLOTS]
+//!     fn admits(&self, _demand: &Amounts, w: &WorkerView) -> bool {
+//!         (w.running() as u64) < w.capacity(SLOTS)
 //!     }
 //! }
 //!
@@ -920,7 +960,7 @@
 //! p.handle(
 //!     Input::Worker(WorkerState {
 //!         id: 1,
-//!         capacity: Resources::mem_gb(10.0).with_slots(2),
+//!         capacity: Resources::new().with(MEMORY, gb(10.0)).with(SLOTS, 2),
 //!         ..Default::default()
 //!     }),
 //!     Time::ORIGIN,
@@ -928,7 +968,7 @@
 //! for id in 1..=3 {
 //!     let job = JobSpec {
 //!         id,
-//!         demand: Resources::mem_gb(50.0),
+//!         demand: Resources::new().with(MEMORY, gb(50.0)),
 //!         ..Default::default()
 //!     };
 //!     p.handle(Input::Submit(job), Time::ORIGIN);
@@ -946,7 +986,7 @@
 //! ```
 //! # use std::time::Duration;
 //! # use whelm::{
-//! #     Config, Constraint, Input, JobSpec, Output, Policy, Resources, Scheduler, Time,
+//! #     Config, Constraint, Input, JobSpec, Output, Policy, Resources, SLOTS, Scheduler, Time,
 //! #     WorkerState,
 //! # };
 //! let mut p = Scheduler::new(Config::default());
@@ -954,7 +994,7 @@
 //!     let worker = WorkerState {
 //!         id,
 //!         class: class.into(),
-//!         capacity: Resources::ZERO.with_slots(4),
+//!         capacity: Resources::new().with(SLOTS, 4),
 //!         ..Default::default()
 //!     };
 //!     p.handle(Input::Worker(worker), Time::ORIGIN);
@@ -1011,7 +1051,7 @@
 //! ```
 //! # use std::time::Duration;
 //! # use whelm::{
-//! #     Config, Constraint, Input, JobSpec, Output, Policy, Resources, Scheduler, Time,
+//! #     Config, Constraint, Input, JobSpec, Output, Policy, Resources, SLOTS, Scheduler, Time,
 //! #     WorkerState,
 //! # };
 //! let mut p = Scheduler::new(Config::default());
@@ -1019,7 +1059,7 @@
 //!     p.handle(
 //!         Input::Worker(WorkerState {
 //!             id,
-//!             capacity: Resources::ZERO.with_slots(4),
+//!             capacity: Resources::new().with(SLOTS, 4),
 //!             ..Default::default()
 //!         }),
 //!         Time::ORIGIN,
@@ -1073,7 +1113,7 @@
 //! ```
 //! # use std::time::Duration;
 //! # use whelm::{
-//! #     Config, Constraint, Input, JobSpec, Output, Policy, Resources, Scheduler, Time,
+//! #     Config, Constraint, Input, JobSpec, Output, Policy, Resources, SLOTS, Scheduler, Time,
 //! #     WorkerState,
 //! # };
 //! let mut p = Scheduler::new(Config::default());
@@ -1081,7 +1121,7 @@
 //!     p.handle(
 //!         Input::Worker(WorkerState {
 //!             id,
-//!             capacity: Resources::ZERO.with_slots(1),
+//!             capacity: Resources::new().with(SLOTS, 1),
 //!             ..Default::default()
 //!         }),
 //!         Time::ORIGIN,
@@ -1117,7 +1157,7 @@
 //! p.handle(
 //!     Input::Worker(WorkerState {
 //!         id: 2,
-//!         capacity: Resources::ZERO.with_slots(0),
+//!         capacity: Resources::new().with(SLOTS, 0),
 //!         ..Default::default()
 //!     }),
 //!     Time(Duration::from_secs(1)),
@@ -1148,8 +1188,8 @@
 //! use std::time::Duration;
 //!
 //! use whelm::{
-//!     Config, GroupOrder, Input, JobId, JobSpec, Output, Policy, Resources, Scheduler, Time,
-//!     WorkerState,
+//!     Config, GroupOrder, Input, JobId, JobSpec, Output, Policy, Resources, SLOTS, Scheduler,
+//!     Time, WorkerState,
 //! };
 //!
 //! /// The order one single-slot worker runs three jobs in under `config`.
@@ -1158,7 +1198,7 @@
 //!     p.handle(
 //!         Input::Worker(WorkerState {
 //!             id: 1,
-//!             capacity: Resources::ZERO.with_slots(1),
+//!             capacity: Resources::new().with(SLOTS, 1),
 //!             ..Default::default()
 //!         }),
 //!         Time::ORIGIN,
@@ -1222,13 +1262,14 @@
 //! ```
 //! # use std::time::Duration;
 //! # use whelm::{
-//! #     Config, Input, JobId, JobSpec, Output, Policy, Resources, Scheduler, Time, WorkerState,
+//! #     Config, Input, JobId, JobSpec, Output, Policy, Resources, SLOTS, Scheduler, Time,
+//! #     WorkerState,
 //! # };
 //! let mut p = Scheduler::new(Config::default());
 //! p.handle(
 //!     Input::Worker(WorkerState {
 //!         id: 1,
-//!         capacity: Resources::ZERO.with_slots(1),
+//!         capacity: Resources::new().with(SLOTS, 1),
 //!         ..Default::default()
 //!     }),
 //!     Time::ORIGIN,
@@ -1246,7 +1287,10 @@
 //!     for out in p.poll(now) {
 //!         if let Output::Start { job, attempt, .. } = out {
 //!             order.push(job);
-//!             p.handle(Input::Done { job, attempt }, now + Duration::from_millis(500));
+//!             p.handle(
+//!                 Input::Done { job, attempt },
+//!                 now + Duration::from_millis(500),
+//!             );
 //!         }
 //!     }
 //! }
@@ -1261,7 +1305,10 @@
 //! job where it leaves the least room and keeping large holes open for large jobs.
 //!
 //! ```
-//! # use whelm::{Config, Input, JobSpec, Output, Policy, Resources, Scheduler, Time, WorkerState};
+//! # use whelm::{
+//! #     Config, Input, JobSpec, MEMORY, Output, Policy, Resources, SLOTS, Scheduler, Time,
+//! #     WorkerState, gb,
+//! # };
 //! /// The worker a 10 GB job goes to, given a 100 GB worker 1 and a 20 GB worker 2.
 //! fn place(config: Config) -> u64 {
 //!     let mut p = Scheduler::new(config);
@@ -1269,7 +1316,7 @@
 //!         Input::Worker(WorkerState {
 //!             id: 1,
 //!             class: "big".into(),
-//!             capacity: Resources::mem_gb(100.0).with_slots(4),
+//!             capacity: Resources::new().with(MEMORY, gb(100.0)).with(SLOTS, 4),
 //!             ..Default::default()
 //!         }),
 //!         Time::ORIGIN,
@@ -1278,14 +1325,14 @@
 //!         Input::Worker(WorkerState {
 //!             id: 2,
 //!             class: "small".into(),
-//!             capacity: Resources::mem_gb(20.0).with_slots(4),
+//!             capacity: Resources::new().with(MEMORY, gb(20.0)).with(SLOTS, 4),
 //!             ..Default::default()
 //!         }),
 //!         Time::ORIGIN,
 //!     );
 //!     let job = JobSpec {
 //!         id: 1,
-//!         demand: Resources::mem_gb(10.0),
+//!         demand: Resources::new().with(MEMORY, gb(10.0)),
 //!         ..Default::default()
 //!     };
 //!     p.handle(Input::Submit(job), Time::ORIGIN);
@@ -1303,13 +1350,15 @@
 //! where speeds come from and what else they drive.
 //!
 //! ```
-//! # use whelm::{Config, Input, JobSpec, Output, Policy, Resources, Scheduler, Time, WorkerState};
+//! # use whelm::{
+//! #     Config, Input, JobSpec, Output, Policy, Resources, SLOTS, Scheduler, Time, WorkerState,
+//! # };
 //! let mut p = Scheduler::new(Config::default());
 //! p.handle(
 //!     Input::Worker(WorkerState {
 //!         id: 1,
 //!         class: "old".into(),
-//!         capacity: Resources::ZERO.with_slots(4),
+//!         capacity: Resources::new().with(SLOTS, 4),
 //!         ..Default::default()
 //!     }),
 //!     Time::ORIGIN,
@@ -1317,7 +1366,7 @@
 //! let fast = WorkerState {
 //!     id: 2,
 //!     class: "new".into(),
-//!     capacity: Resources::ZERO.with_slots(4),
+//!     capacity: Resources::new().with(SLOTS, 4),
 //!     speed: 2.5,
 //!     ..Default::default()
 //! };
@@ -1352,7 +1401,8 @@
 //! ```
 //! # use std::time::Duration;
 //! # use whelm::{
-//! #     Config, Input, JobId, JobSpec, Output, Policy, Resources, Scheduler, Time, WorkerState,
+//! #     Config, Input, JobId, JobSpec, Output, Policy, Resources, SLOTS, Scheduler, Time,
+//! #     WorkerState,
 //! # };
 //! /// The job that runs after job 1, under an age limit.
 //! fn second(age_limit: Option<Duration>) -> JobId {
@@ -1364,7 +1414,7 @@
 //!     p.handle(
 //!         Input::Worker(WorkerState {
 //!             id: 1,
-//!             capacity: Resources::ZERO.with_slots(1),
+//!             capacity: Resources::new().with(SLOTS, 1),
 //!             ..Default::default()
 //!         }),
 //!         Time::ORIGIN,
@@ -1382,7 +1432,10 @@
 //!         ..Default::default()
 //!     };
 //!     p.handle(Input::Submit(urgent), Time(Duration::from_secs(50)));
-//!     p.handle(Input::Done { job: 1, attempt: 1 }, Time(Duration::from_secs(150)));
+//!     p.handle(
+//!         Input::Done { job: 1, attempt: 1 },
+//!         Time(Duration::from_secs(150)),
+//!     );
 //!     match p.poll(Time(Duration::from_secs(150)))[..] {
 //!         [Output::Start { job, .. }] => job,
 //!         ref out => panic!("{out:?}"),
@@ -1401,15 +1454,15 @@
 //! ```
 //! # use std::time::Duration;
 //! # use whelm::{
-//! #     Config, Holding, Input, JobSpec, Output, Policy, ReservationInfo, Resources, Scheduler,
-//! #     Time, Verdict, WorkerState,
+//! #     Config, Holding, Input, JobSpec, MEMORY, Output, Policy, ReservationInfo, Resources,
+//! #     SLOTS, Scheduler, Time, Verdict, WorkerState, gb,
 //! # };
 //! let mut p = Scheduler::new(Config::default()); // reserve after 60 s
-//! let capacity = Resources::mem_gb(10.0).with_slots(3);
+//! let capacity = Resources::new().with(MEMORY, gb(10.0)).with(SLOTS, 3);
 //! let worker = WorkerState { id: 1, capacity, ..Default::default() };
 //! p.handle(Input::Worker(worker), Time::ORIGIN);
-//! let job = |id, gb| {
-//!     Input::Submit(JobSpec { id, demand: Resources::mem_gb(gb), ..Default::default() })
+//! let job = |id, size| {
+//!     Input::Submit(JobSpec { id, demand: Resources::new().with(MEMORY, gb(size)), ..Default::default() })
 //! };
 //! let start = |job| Output::Start { job, attempt: 1, worker: 1 };
 //! let done = |job| Input::Done { job, attempt: 1 };
@@ -1457,8 +1510,8 @@
 //! # use std::time::Duration;
 //! #
 //! # use whelm::{
-//! #     Config, Input, JobSpec, Output, Policy, Reservations, Resources, Scheduler, Time,
-//! #     WorkerState,
+//! #     Config, Input, JobSpec, MEMORY, Output, Policy, Reservations, Resources, SLOTS, Scheduler,
+//! #     Time, WorkerState, gb,
 //! # };
 //! let reservations = Reservations {
 //!     shadow_backfill: true,
@@ -1470,13 +1523,13 @@
 //! });
 //! let worker = WorkerState {
 //!     id: 1,
-//!     capacity: Resources::mem_gb(10.0).with_slots(3),
+//!     capacity: Resources::new().with(MEMORY, gb(10.0)).with(SLOTS, 3),
 //!     ..Default::default()
 //! };
 //! p.handle(Input::Worker(worker), Time::ORIGIN);
-//! let job = |id, gb, work| JobSpec {
+//! let job = |id, size, work| JobSpec {
 //!     id,
-//!     demand: Resources::mem_gb(gb),
+//!     demand: Resources::new().with(MEMORY, gb(size)),
 //!     work: Some(Duration::from_secs(work)),
 //!     ..Default::default()
 //! };
@@ -1520,14 +1573,14 @@
 //!
 //! ```
 //! # use whelm::{
-//! #     Config, DEFAULT_AGE_LIMIT, Input, JobSpec, Policy, Reservations, Resources, Scheduler,
-//! #     Time, WorkerState,
+//! #     Config, DEFAULT_AGE_LIMIT, Input, JobSpec, MEMORY, Policy, Reservations, Resources, SLOTS,
+//! #     Scheduler, Time, WorkerState, gb,
 //! # };
 //! let mut p = Scheduler::new(Config::default());
-//! let capacity = Resources::mem_gb(10.0).with_slots(2);
+//! let capacity = Resources::new().with(MEMORY, gb(10.0)).with(SLOTS, 2);
 //! let worker = WorkerState { id: 1, capacity, ..Default::default() };
 //! p.handle(Input::Worker(worker), Time::ORIGIN);
-//! let job = |id| JobSpec { id, demand: Resources::mem_gb(6.0), ..Default::default() };
+//! let job = |id| JobSpec { id, demand: Resources::new().with(MEMORY, gb(6.0)), ..Default::default() };
 //! p.handle(Input::Submit(job(1)), Time::ORIGIN); // runs for ever
 //! p.handle(Input::Submit(job(2)), Time::ORIGIN);
 //! p.poll(Time::ORIGIN);
@@ -1557,8 +1610,8 @@
 //!
 //! ```
 //! # use whelm::{
-//! #     Config, Input, JobSpec, Output, Policy, Resources, Scheduler, SpeedConfig, Time, Timing,
-//! #     WorkerState,
+//! #     Config, Input, JobSpec, Output, Policy, Resources, SLOTS, Scheduler, SpeedConfig, Time,
+//! #     Timing, WorkerState,
 //! # };
 //! /// The worker a job goes to, given a reference worker 1 and a worker 2 reporting speed 3.
 //! fn place(timing: Timing) -> u64 {
@@ -1573,7 +1626,7 @@
 //!         Input::Worker(WorkerState {
 //!             id: 1,
 //!             class: "a".into(),
-//!             capacity: Resources::ZERO.with_slots(4),
+//!             capacity: Resources::new().with(SLOTS, 4),
 //!             ..Default::default()
 //!         }),
 //!         Time::ORIGIN,
@@ -1581,7 +1634,7 @@
 //!     let fast = WorkerState {
 //!         id: 2,
 //!         class: "b".into(),
-//!         capacity: Resources::ZERO.with_slots(4),
+//!         capacity: Resources::new().with(SLOTS, 4),
 //!         speed: 3.0,
 //!         ..Default::default()
 //!     };
@@ -1610,8 +1663,8 @@
 //! ```
 //! # use std::time::Duration;
 //! # use whelm::{
-//! #     Config, Constraint, Input, JobSpec, Learn, Policy, Resources, Scheduler, SpeedConfig,
-//! #     Time, Timing, WorkerState,
+//! #     Config, Constraint, Input, JobSpec, Learn, Policy, Resources, SLOTS, Scheduler,
+//! #     SpeedConfig, Time, Timing, WorkerState,
 //! # };
 //! let mut p = Scheduler::new(Config {
 //!     speed: SpeedConfig {
@@ -1624,7 +1677,7 @@
 //!     let worker = WorkerState {
 //!         id,
 //!         class: class.into(),
-//!         capacity: Resources::ZERO.with_slots(1),
+//!         capacity: Resources::new().with(SLOTS, 1),
 //!         ..Default::default()
 //!     };
 //!     p.handle(Input::Worker(worker), Time::ORIGIN);
@@ -1669,8 +1722,8 @@
 //! ```
 //! # use std::time::Duration;
 //! # use whelm::{
-//! #     Config, Constraint, Input, JobSpec, Output, Policy, Resources, Scheduler, SpeedConfig,
-//! #     Time, Timing, WorkerState,
+//! #     Config, Constraint, Input, JobSpec, Output, Policy, Resources, SLOTS, Scheduler,
+//! #     SpeedConfig, Time, Timing, WorkerState,
 //! # };
 //! /// Workers 1 (class x) and 2 (class y) after training: kind "a" runs four times faster on x,
 //! /// kind "b" twice as fast on y. Returns the policy and the time.
@@ -1686,7 +1739,7 @@
 //!         let worker = WorkerState {
 //!             id,
 //!             class: class.into(),
-//!             capacity: Resources::ZERO.with_slots(1),
+//!             capacity: Resources::new().with(SLOTS, 1),
 //!             ..Default::default()
 //!         };
 //!         p.handle(Input::Worker(worker), Time::ORIGIN);
@@ -1763,8 +1816,8 @@
 //! # use std::time::Duration;
 //! #
 //! # use whelm::{
-//! #     Config, Defer, Input, JobSpec, Output, Policy, Resources, Scheduler, SpeedConfig, Time,
-//! #     WorkerState,
+//! #     Config, Defer, Input, JobSpec, Output, Policy, Resources, SLOTS, Scheduler, SpeedConfig,
+//! #     Time, WorkerState,
 //! # };
 //! let mut p = Scheduler::new(Config {
 //!     speed: SpeedConfig {
@@ -1777,7 +1830,7 @@
 //!     Input::Worker(WorkerState {
 //!         id: 1,
 //!         class: "slow".into(),
-//!         capacity: Resources::ZERO.with_slots(1),
+//!         capacity: Resources::new().with(SLOTS, 1),
 //!         ..Default::default()
 //!     }),
 //!     Time::ORIGIN,
@@ -1786,7 +1839,7 @@
 //!     id: 2,
 //!     class: "fast".into(),
 //!     speed: 4.0,
-//!     capacity: Resources::ZERO.with_slots(1),
+//!     capacity: Resources::new().with(SLOTS, 1),
 //!     ..Default::default()
 //! };
 //! p.handle(Input::Worker(fast), Time::ORIGIN);
@@ -1836,8 +1889,8 @@
 //! ```
 //! # use std::time::Duration;
 //! # use whelm::{
-//! #     Config, Input, JobSpec, Output, Policy, Resources, Scheduler, Speculate, SpeedConfig,
-//! #     Time, WorkerState,
+//! #     Config, Input, JobSpec, Output, Policy, Resources, SLOTS, Scheduler, Speculate,
+//! #     SpeedConfig, Time, WorkerState,
 //! # };
 //! let mut p = Scheduler::new(Config {
 //!     speed: SpeedConfig {
@@ -1850,7 +1903,7 @@
 //!     Input::Worker(WorkerState {
 //!         id: 1,
 //!         class: "slow".into(),
-//!         capacity: Resources::ZERO.with_slots(1),
+//!         capacity: Resources::new().with(SLOTS, 1),
 //!         ..Default::default()
 //!     }),
 //!     Time::ORIGIN,
@@ -1875,7 +1928,7 @@
 //!     id: 2,
 //!     class: "fast".into(),
 //!     speed: 4.0,
-//!     capacity: Resources::ZERO.with_slots(1),
+//!     capacity: Resources::new().with(SLOTS, 1),
 //!     ..Default::default()
 //! };
 //! p.handle(Input::Worker(fast), Time(Duration::from_secs(1)));
@@ -1914,7 +1967,7 @@
 //! use std::time::Duration;
 //!
 //! use whelm::{
-//!     Config, DagConfig, DagJob, DagScheduler, Input, JobSpec, Output, Policy, Resources,
+//!     Config, DagConfig, DagJob, DagScheduler, Input, JobSpec, Output, Policy, Resources, SLOTS,
 //!     Scheduler, Time, WorkerState,
 //! };
 //!
@@ -1922,7 +1975,7 @@
 //! dag.handle(
 //!     Input::Worker(WorkerState {
 //!         id: 1,
-//!         capacity: Resources::ZERO.with_slots(4),
+//!         capacity: Resources::new().with(SLOTS, 4),
 //!         ..Default::default()
 //!     }),
 //!     Time::ORIGIN,
@@ -1990,7 +2043,7 @@
 //! ```
 //! # use std::time::Duration;
 //! # use whelm::{
-//! #     Config, DagConfig, DagJob, DagScheduler, Input, JobSpec, Output, Policy, Resources,
+//! #     Config, DagConfig, DagJob, DagScheduler, Input, JobSpec, Output, Policy, Resources, SLOTS,
 //! #     Scheduler, Time, WorkerState,
 //! # };
 //! let config = DagConfig {
@@ -2001,7 +2054,7 @@
 //! dag.handle(
 //!     Input::Worker(WorkerState {
 //!         id: 1,
-//!         capacity: Resources::ZERO.with_slots(4),
+//!         capacity: Resources::new().with(SLOTS, 4),
 //!         ..Default::default()
 //!     }),
 //!     Time::ORIGIN,
@@ -2054,7 +2107,7 @@
 //!
 //! ```
 //! # use whelm::{
-//! #     Config, DagConfig, DagJob, DagScheduler, Input, JobSpec, Output, Policy, Resources,
+//! #     Config, DagConfig, DagJob, DagScheduler, Input, JobSpec, Output, Policy, Resources, SLOTS,
 //! #     Scheduler, Time, WorkerState,
 //! # };
 //! let config = DagConfig {
@@ -2065,7 +2118,7 @@
 //! dag.handle(
 //!     Input::Worker(WorkerState {
 //!         id: 1,
-//!         capacity: Resources::ZERO.with_slots(4),
+//!         capacity: Resources::new().with(SLOTS, 4),
 //!         ..Default::default()
 //!     }),
 //!     Time::ORIGIN,
@@ -2105,15 +2158,15 @@
 //! use std::{sync::Arc, time::Duration};
 //!
 //! use whelm::{
-//!     Config, DagConfig, DagScheduler, Input, Output, Policy, Resources, Scheduler, TemplateNode,
-//!     TemplateSpec, Time, Unit, WorkerState,
+//!     Config, DagConfig, DagScheduler, Input, Output, Policy, Resources, SLOTS, Scheduler,
+//!     TemplateNode, TemplateSpec, Time, Unit, WorkerState,
 //! };
 //!
 //! let mut dag = DagScheduler::new(DagConfig::default(), Scheduler::new(Config::default()));
 //! dag.handle(
 //!     Input::Worker(WorkerState {
 //!         id: 1,
-//!         capacity: Resources::ZERO.with_slots(4),
+//!         capacity: Resources::new().with(SLOTS, 4),
 //!         ..Default::default()
 //!     }),
 //!     Time::ORIGIN,
@@ -2183,10 +2236,10 @@
 //! ```
 //! # use std::{sync::Arc, time::Duration};
 //! # use whelm::{
-//! #     Config, DagConfig, DagScheduler, Input, JobSpec, Output, Policy, Resources, Scheduler,
-//! #     TemplateSpec, Time, Unit, WorkerState,
+//! #     Config, DagConfig, DagScheduler, Input, JobSpec, MEMORY, Output, Policy, Resources, SLOTS,
+//! #     Scheduler, TemplateSpec, Time, Unit, WorkerState, gb,
 //! # };
-//! use whelm::{JobId, NodeSource, ResourceId};
+//! use whelm::{JobId, NodeSource};
 //!
 //! /// Leaf `k` has work `10 (k + 1)` seconds and needs `k + 1` GB.
 //! struct Growing;
@@ -2196,7 +2249,7 @@
 //!         Duration::from_secs(10 * (u64::from(leaf) + 1))
 //!     }
 //!     fn spec(&self, _unit: JobId, leaf: u32, spec: &mut JobSpec) {
-//!         spec.demand = Resources::mem_gb(f64::from(leaf + 1));
+//!         spec.demand = Resources::new().with(MEMORY, gb(f64::from(leaf + 1)));
 //!     }
 //!     fn label(&self, unit: JobId, leaf: u32) -> Option<String> {
 //!         Some(format!("unit {unit} step {leaf}"))
@@ -2205,7 +2258,7 @@
 //!
 //! let mut dag = DagScheduler::new(DagConfig::default(), Scheduler::new(Config::default()))
 //!     .with_source(Arc::new(Growing));
-//! let capacity = Resources::mem_gb(100.0).with_slots(4);
+//! let capacity = Resources::new().with(MEMORY, gb(100.0)).with(SLOTS, 4);
 //! let worker = WorkerState { id: 1, capacity, ..Default::default() };
 //! dag.handle(Input::Worker(worker), Time::ORIGIN);
 //! let chain = TemplateSpec { edges: vec![(0, 1), (1, 2)], ..TemplateSpec::jobs(3) };
@@ -2219,7 +2272,7 @@
 //! dag.declare([unit], Time::ORIGIN).unwrap();
 //!
 //! assert_eq!(dag.poll(Time::ORIGIN), [Output::Start { job: 100, attempt: 1, worker: 1 }]);
-//! assert_eq!(dag.stats().workers[0].placed[ResourceId::MEM], 1_000_000_000);
+//! assert_eq!(dag.stats().workers[0].placed.get(MEMORY), 1_000_000_000);
 //! assert_eq!(
 //!     dag.explain(102).unwrap().to_string(),
 //!     "[unit 10 step 2] job 102 waits for 1 dependency within its unit"
@@ -2236,7 +2289,7 @@
 //! ```
 //! # use std::time::Duration;
 //! # use whelm::{
-//! #     Config, DagConfig, DagJob, DagScheduler, Input, JobSpec, Output, Policy, Resources,
+//! #     Config, DagConfig, DagJob, DagScheduler, Input, JobSpec, Output, Policy, Resources, SLOTS,
 //! #     Scheduler, Time, WorkerState,
 //! # };
 //! use whelm::OrderTerm;
@@ -2247,7 +2300,7 @@
 //!     dag.handle(
 //!         Input::Worker(WorkerState {
 //!             id: 1,
-//!             capacity: Resources::ZERO.with_slots(1),
+//!             capacity: Resources::new().with(SLOTS, 1),
 //!             ..Default::default()
 //!         }),
 //!         Time::ORIGIN,
@@ -2298,14 +2351,14 @@
 //! ```
 //! # use std::{sync::Arc, time::Duration};
 //! # use whelm::{
-//! #     Config, DagConfig, DagJob, DagScheduler, Input, JobSpec, Output, Policy, Resources,
+//! #     Config, DagConfig, DagJob, DagScheduler, Input, JobSpec, Output, Policy, Resources, SLOTS,
 //! #     Scheduler, TemplateSpec, Time, Unit, WorkerState,
 //! # };
 //! let mut dag = DagScheduler::new(DagConfig::default(), Scheduler::new(Config::default()));
 //! dag.handle(
 //!     Input::Worker(WorkerState {
 //!         id: 1,
-//!         capacity: Resources::ZERO.with_slots(1),
+//!         capacity: Resources::new().with(SLOTS, 1),
 //!         ..Default::default()
 //!     }),
 //!     Time::ORIGIN,
@@ -2369,13 +2422,13 @@
 //! # fn main() {
 //! # use std::time::Duration;
 //! # use whelm::{
-//! #     Config, DagConfig, DagJob, DagScheduler, Input, JobSpec, Output, Policy, Resources,
+//! #     Config, DagConfig, DagJob, DagScheduler, Input, JobSpec, Output, Policy, Resources, SLOTS,
 //! #     Scheduler, Time, WorkerState,
 //! # };
 //! let mut dag = DagScheduler::new(DagConfig::default(), Scheduler::new(Config::default()));
 //! let worker = WorkerState {
 //!     id: 1,
-//!     capacity: Resources::ZERO.with_slots(1),
+//!     capacity: Resources::new().with(SLOTS, 1),
 //!     ..Default::default()
 //! };
 //! dag.handle(Input::Worker(worker.clone()), Time::ORIGIN);
@@ -2436,12 +2489,12 @@
 //! run one after another.
 //!
 //! ```
-//! use whelm::{Config, JobSpec, Resources, Scheduler, SharedPolicy, WorkerState};
+//! use whelm::{Config, JobSpec, Resources, SLOTS, Scheduler, SharedPolicy, WorkerState};
 //!
 //! let shared = SharedPolicy::with_system_clock(Scheduler::new(Config::default()));
 //! shared.worker_update(WorkerState {
 //!     id: 1,
-//!     capacity: Resources::ZERO.with_slots(1),
+//!     capacity: Resources::new().with(SLOTS, 1),
 //!     ..Default::default()
 //! });
 //!
@@ -2472,7 +2525,8 @@
 //!
 //! ```
 //! # use whelm::{
-//! #     Config, FailKind, JobSpec, Resources, RetryConfig, Scheduler, SharedPolicy, WorkerState,
+//! #     Config, FailKind, JobSpec, Resources, RetryConfig, SLOTS, Scheduler, SharedPolicy,
+//! #     WorkerState,
 //! # };
 //! let config = Config {
 //!     retry: RetryConfig { max_attempts: 2 },
@@ -2482,7 +2536,7 @@
 //! for id in [1, 2] {
 //!     shared.worker_update(WorkerState {
 //!         id,
-//!         capacity: Resources::ZERO.with_slots(1),
+//!         capacity: Resources::new().with(SLOTS, 1),
 //!         ..Default::default()
 //!     });
 //! }
@@ -2516,7 +2570,7 @@
 //! };
 //!
 //! use whelm::{
-//!     Config, Input, JobSpec, Output, Policy, Resources, Scheduler, Time, WorkerState,
+//!     Config, Input, JobSpec, Output, Policy, Resources, SLOTS, Scheduler, Time, WorkerState,
 //!     log::{self, Event, Logged},
 //! };
 //!
@@ -2526,7 +2580,7 @@
 //! p.handle(
 //!     Input::Worker(WorkerState {
 //!         id: 1,
-//!         capacity: Resources::ZERO.with_slots(1),
+//!         capacity: Resources::new().with(SLOTS, 1),
 //!         ..Default::default()
 //!     }),
 //!     Time::ORIGIN,
@@ -2575,8 +2629,8 @@
 //! use std::time::Duration;
 //!
 //! use whelm::{
-//!     Config, DagConfig, DagScheduler, FailKind, Input, JobSpec, Output, Policy, Resources,
-//!     Scheduler, Time, WorkerState,
+//!     Config, DagConfig, DagScheduler, FailKind, Input, JobSpec, MEMORY, Output, Policy,
+//!     Resources, SLOTS, Scheduler, Time, WorkerState, gb,
 //! };
 //!
 //! /// Apply the inputs of each time, then poll; every poll's outputs, with its time.
@@ -2595,7 +2649,7 @@
 //!     let job = |id| {
 //!         Input::Submit(JobSpec {
 //!             id,
-//!             demand: Resources::mem_gb(4.0),
+//!             demand: Resources::new().with(MEMORY, gb(4.0)),
 //!             ..Default::default()
 //!         })
 //!     };
@@ -2607,7 +2661,7 @@
 //!     };
 //!     let worker = WorkerState {
 //!         id: 1,
-//!         capacity: Resources::mem_gb(8.0).with_slots(2),
+//!         capacity: Resources::new().with(MEMORY, gb(8.0)).with(SLOTS, 2),
 //!         ..Default::default()
 //!     };
 //!     vec![
@@ -2643,7 +2697,8 @@
 //! // Inspect the end state.
 //! let stats = flat.stats();
 //! assert_eq!((stats.running, stats.placements_total), (2, 4));
-//! assert_eq!(stats.workers[0].headroom[whelm::ResourceId::MEM.0], Some(0));
+//! let memory = &stats.workers[0].headroom[0];
+//! assert_eq!(memory, &(MEMORY.name, Some(0)));
 //! assert_eq!(
 //!     flat.explain(1).unwrap().status,
 //!     whelm::Status::Running {
@@ -2665,9 +2720,10 @@
 //! - [`scheduler`]: [`Scheduler`], the placement policy, and how a poll scans and places.
 //! - [`config`]: [`Config`], its presets, and every order and score term, retry, speed and
 //!   reservation setting.
-//! - [`resources`]: declaring resources ([`Resource`], [`ResourceId`]) and the [`Resources`]
-//!   vectors of amounts.
-//! - [`admission`]: the [`Admission`] contract, [`ProductionAdmission`] and [`WorkerView`].
+//! - [`resources`]: resource kinds ([`Resource`], the standard [`MEMORY`], [`DEVICE_MEMORY`] and
+//!   [`SLOTS`]) and the amounts of them, [`Resources`].
+//! - [`admission`]: the [`Admission`] contract, [`ProductionAdmission`], and the [`WorkerView`]
+//!   and [`Amounts`] a rule reads.
 //! - [`speed`]: machine models ([`Timing`]) and speed learning ([`Learn`], [`SpeedEstimator`], the
 //!   last usable on its own).
 //! - [`dag`]: [`DagScheduler`], templates, units and [`NodeSource`].
@@ -2702,7 +2758,7 @@ pub mod stats;
 pub mod time;
 pub mod worker;
 
-pub use admission::{Admission, ProductionAdmission, WorkerView};
+pub use admission::{Admission, Amounts, ProductionAdmission, Usage, WorkerView};
 pub use config::{
     Config, DEFAULT_AGE_LIMIT, Defer, GroupOrder, OrderTerm, Reservations, RetryConfig, ScoreTerm,
     Speculate, SpeedConfig,
@@ -2719,9 +2775,9 @@ pub use explain::{Explanation, Holding, Status, Verdict, Waiting};
 pub use job::{Constraint, JobId, JobSpec, Selector, Strength};
 pub use log::EventSink;
 #[doc(inline)]
-pub use message::{Attempt, FailKind, GaveUp, Input, Output, Policy, Tried};
+pub use message::{Attempt, FailKind, GaveUp, Input, Output, Policy, Rejection, Tried};
 #[doc(inline)]
-pub use resources::{Resource, ResourceId, ResourceUnit, Resources};
+pub use resources::{DEVICE_MEMORY, MEMORY, Resource, ResourceUnit, Resources, SLOTS, gb};
 pub use scheduler::Scheduler;
 pub use shared::{Lease, SharedPolicy};
 pub use speed::{Learn, Sharing, SpeedEstimator, Timing};

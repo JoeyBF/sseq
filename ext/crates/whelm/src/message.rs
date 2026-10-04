@@ -1,10 +1,14 @@
 //! The messages between a caller and a [`Policy`], and the trait itself.
 
+use std::{borrow::Cow, fmt};
+
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
 #[cfg(doc)]
-use crate::{DagConfig, DagJob, DagScheduler, Defer, RetryConfig, Scheduler, Speculate, log};
+use crate::{
+    Config, DagConfig, DagJob, DagScheduler, Defer, RetryConfig, Scheduler, Speculate, log,
+};
 use crate::{Explanation, JobId, JobSpec, PolicyStats, Time, WorkerId, WorkerState};
 
 /// The number of a job's attempt: 1 for its first start, counting retries and speculative
@@ -43,7 +47,7 @@ pub enum FailKind {
 /// use std::time::Duration;
 ///
 /// use whelm::{
-///     Config, FailKind, GaveUp, Input, JobSpec, Output, Policy, Resources, RetryConfig,
+///     Config, FailKind, GaveUp, Input, JobSpec, Output, Policy, Resources, RetryConfig, SLOTS,
 ///     Scheduler, Time, Tried, WorkerState,
 /// };
 ///
@@ -56,7 +60,7 @@ pub enum FailKind {
 ///     Input::Worker(WorkerState {
 ///         id: 3,
 ///         class: "cpu".into(),
-///         capacity: Resources::ZERO.with_slots(1),
+///         capacity: Resources::new().with(SLOTS, 1),
 ///         ..Default::default()
 ///     }),
 ///     Time::ORIGIN,
@@ -111,6 +115,60 @@ pub struct GaveUp {
     pub retryable: bool,
 }
 
+/// Why a policy refused a job at submission ([`Output::Rejected`]).
+///
+/// # Examples
+///
+/// A job demanding GPUs from a scheduler that does not declare them:
+///
+/// ```
+/// use whelm::{
+///     Config, Input, JobSpec, Output, Policy, Rejection, Resource, Resources, Scheduler, Time,
+/// };
+///
+/// const GPUS: Resource = Resource::new("gpus").hard();
+///
+/// let mut p = Scheduler::new(Config::default());
+/// let job = JobSpec {
+///     id: 1,
+///     demand: Resources::new().with(GPUS, 1),
+///     ..Default::default()
+/// };
+/// p.handle(Input::Submit(job), Time::ORIGIN);
+/// let reason = Rejection::Undeclared {
+///     resource: "gpus".into(),
+/// };
+/// assert_eq!(
+///     reason.to_string(),
+///     "its demand names resource \"gpus\", which the configuration does not declare"
+/// );
+/// assert_eq!(p.poll(Time::ORIGIN), [Output::Rejected { job: 1, reason }]);
+/// assert_eq!(p.explain(1), None);
+/// ```
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+pub enum Rejection {
+    /// The job's demand names a resource that [`Config::resources`] does not declare: the first
+    /// such name, in name order.
+    Undeclared {
+        /// The resource's name.
+        resource: Cow<'static, str>,
+    },
+}
+
+impl fmt::Display for Rejection {
+    /// The reason as a clause about the job.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Undeclared { resource } => write!(
+                f,
+                "its demand names resource {resource:?}, which the configuration does not declare"
+            ),
+        }
+    }
+}
+
 /// An event a [`Policy`] reacts to.
 ///
 /// Every input is applied by [`Policy::handle`] at once and is safe to repeat or deliver late:
@@ -139,7 +197,8 @@ pub struct GaveUp {
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
 pub enum Input {
-    /// A job became ready. An id that is already waiting or running is ignored.
+    /// A job became ready. An id that is already waiting or running is ignored, and a job whose
+    /// demand names a resource the policy does not declare is [rejected](Output::Rejected).
     Submit(JobSpec),
     /// An attempt finished: the job is complete, and every other live attempt of it is stopped
     /// ([`Output::Stop`]). Ignored unless `attempt` is live.
@@ -167,6 +226,10 @@ pub enum Input {
     /// ([`Output::Stop`]) if running. Unknown ids are ignored.
     Cancel(JobId),
     /// A worker joined, or reported a heartbeat. Its live attempts are kept.
+    ///
+    /// A [`Scheduler`] panics on a state that names a resource [`Config::resources`] does not
+    /// declare: a worker's resources are the caller's to match with the configuration, and one
+    /// left out would be ignored.
     Worker(WorkerState),
     /// A worker left: each live attempt on it fails with [`FailKind::LinkDied`], as if reported
     /// by [`Input::Failed`].
@@ -175,22 +238,25 @@ pub enum Input {
 
 /// What a [`Policy`] asks its caller to do.
 ///
-/// A flat policy such as [`Scheduler`] emits only [`Start`](Self::Start), [`Stop`](Self::Stop)
-/// and [`GaveUp`](Self::GaveUp); the other variants come from the [`DagScheduler`].
+/// A flat policy such as [`Scheduler`] emits only [`Start`](Self::Start), [`Stop`](Self::Stop),
+/// [`GaveUp`](Self::GaveUp) and [`Rejected`](Self::Rejected); the other variants come from the
+/// [`DagScheduler`].
 ///
 /// # Examples
 ///
 /// A caller's dispatch over the outputs of one poll.
 ///
 /// ```
-/// use whelm::{Config, Input, JobSpec, Output, Policy, Resources, Scheduler, Time, WorkerState};
+/// use whelm::{
+///     Config, Input, JobSpec, Output, Policy, Resources, SLOTS, Scheduler, Time, WorkerState,
+/// };
 ///
 /// let mut p = Scheduler::new(Config::default());
 /// p.handle(
 ///     Input::Worker(WorkerState {
 ///         id: 1,
 ///         class: "cpu".into(),
-///         capacity: Resources::ZERO.with_slots(2),
+///         capacity: Resources::new().with(SLOTS, 2),
 ///         ..Default::default()
 ///     }),
 ///     Time::ORIGIN,
@@ -212,6 +278,7 @@ pub enum Input {
 ///         } => sent.push((job, attempt, worker)),
 ///         Output::Stop { .. } => {} // tell the worker to drop that attempt
 ///         Output::GaveUp(_) => {}   // report the job as failed
+///         Output::Rejected { .. } => {} // report the job as malformed
 ///         Output::RunLocal { .. } | Output::Ready { .. } | Output::Passed { .. } => {}
 ///     }
 /// }
@@ -243,6 +310,13 @@ pub enum Output {
     },
     /// The job failed too often and is forgotten.
     GaveUp(GaveUp),
+    /// The job was refused at submission and is forgotten.
+    Rejected {
+        /// The job.
+        job: JobId,
+        /// Why.
+        reason: Rejection,
+    },
     /// A [local](field@DagJob::local) job is ready: run it on the caller and report it with
     /// [`Input::Done`] and attempt 0.
     RunLocal {
@@ -282,7 +356,7 @@ pub enum Output {
 ///
 /// ```
 /// use whelm::{
-///     Config, Explanation, Input, JobId, JobSpec, Output, Policy, PolicyStats, Resources,
+///     Config, Explanation, Input, JobId, JobSpec, Output, Policy, PolicyStats, Resources, SLOTS,
 ///     Scheduler, Time, WorkerState,
 /// };
 ///
@@ -327,7 +401,7 @@ pub enum Output {
 ///     Input::Worker(WorkerState {
 ///         id: 1,
 ///         class: "cpu".into(),
-///         capacity: Resources::ZERO.with_slots(4),
+///         capacity: Resources::new().with(SLOTS, 4),
 ///         ..Default::default()
 ///     }),
 ///     Time::ORIGIN,

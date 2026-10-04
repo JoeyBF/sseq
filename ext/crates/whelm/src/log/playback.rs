@@ -12,13 +12,13 @@ use crate::{Output, Policy, Time};
 ///
 /// ```
 /// use whelm::{
-///     Config, Input, JobSpec, Output, Resources, Scheduler, Time, WorkerState,
+///     Config, Input, JobSpec, MEMORY, Output, Resources, SLOTS, Scheduler, Time, WorkerState, gb,
 ///     log::{self, Event},
 /// };
 ///
 /// let w = WorkerState {
 ///     id: 1,
-///     capacity: Resources::mem_gb(8.0).with_slots(1),
+///     capacity: Resources::new().with(MEMORY, gb(8.0)).with(SLOTS, 1),
 ///     ..Default::default()
 /// };
 /// let events = vec![
@@ -31,7 +31,7 @@ use crate::{Output, Policy, Time};
 ///         t: Time::ORIGIN,
 ///         input: Input::Submit(JobSpec {
 ///             id: 1,
-///             demand: Resources::mem_gb(1.0),
+///             demand: Resources::new().with(MEMORY, gb(1.0)),
 ///             ..Default::default()
 ///         }),
 ///         info: None,

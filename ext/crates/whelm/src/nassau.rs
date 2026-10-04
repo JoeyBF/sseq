@@ -9,8 +9,8 @@
 //!
 //! ```
 //! use whelm::{
-//!     Config, GroupOrder, Input, JobSpec, Output, Policy, Resources, Scheduler, Time,
-//!     WorkerState,
+//!     Config, GroupOrder, Input, JobSpec, MEMORY, Output, Policy, Resources, SLOTS, Scheduler,
+//!     Time, WorkerState, gb,
 //!     nassau::{bidegree, group},
 //! };
 //!
@@ -20,7 +20,7 @@
 //! let submit = |id, g| {
 //!     Input::Submit(JobSpec {
 //!         id,
-//!         demand: Resources::mem_gb(1.0),
+//!         demand: Resources::new().with(MEMORY, gb(1.0)),
 //!         group: g,
 //!         ..Default::default()
 //!     })
@@ -29,7 +29,7 @@
 //! p.handle(submit(2, group(2, 40)), Time::ORIGIN);
 //! let worker = WorkerState {
 //!     id: 1,
-//!     capacity: Resources::mem_gb(8.0).with_slots(1),
+//!     capacity: Resources::new().with(MEMORY, gb(8.0)).with(SLOTS, 1),
 //!     ..Default::default()
 //! };
 //! p.handle(Input::Worker(worker), Time::ORIGIN);

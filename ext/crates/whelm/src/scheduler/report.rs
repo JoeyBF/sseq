@@ -1,10 +1,13 @@
 //! What the scheduler reports: [`Policy::stats`] and [`Policy::explain`].
 
+use std::borrow::Cow;
+
 use super::{Job, Scheduler, Worker, holds::Hold, placement::Refusal};
 #[cfg(doc)]
 use crate::Policy;
 use crate::{
-    Explanation, Holding, JobId, PolicyStats, ReservationInfo, Status, Verdict, Waiting, WorkerLoad,
+    Explanation, Holding, JobId, PolicyStats, ReservationInfo, Status, Verdict, Waiting,
+    WorkerLoad, WorkerView, resources::named,
 };
 
 impl Scheduler {
@@ -15,8 +18,8 @@ impl Scheduler {
             class: w.state.class.clone(),
             capacity: w.state.capacity.clone(),
             running: w.running(),
-            placed: w.placed.clone(),
-            headroom: w.view(&self.config.resources).headroom(),
+            placed: named(&self.config.resources, &w.placed),
+            headroom: headroom(&w.view(&self.config.resources)),
             reserved_for: w.reserved_for,
             speed: w.speed,
         }
@@ -81,7 +84,10 @@ impl Scheduler {
                     shadow,
                     running: w.running(),
                     capacity: w.state.capacity.clone(),
-                    used: w.view(&self.config.resources).used(),
+                    used: named(
+                        &self.config.resources,
+                        &w.view(&self.config.resources).used_all(),
+                    ),
                 }
             }
             Hold::Defer { worker, at, until } => Holding::Deferral {
@@ -101,7 +107,7 @@ impl Scheduler {
             .map(|(&id, w)| (id, self.verdict(j, w)))
             .collect();
         let waiting = Waiting {
-            demand: j.spec.demand.clone(),
+            demand: named(&self.config.resources, &j.demand),
             resources: self.config.resources.clone(),
             group: j.spec.group,
             since: j.since,
@@ -125,19 +131,30 @@ impl Scheduler {
             Some(Refusal::Held(by, Hold::Reserve { .. })) => Verdict::Reserved { by },
             Some(Refusal::Held(_, Hold::Defer { .. })) => Verdict::Deferred,
             Some(Refusal::Admission) => {
-                let resources = &self.config.resources;
-                let view = w.view(resources);
+                let view = w.view(&self.config.resources);
                 let (hard, soft): (Vec<_>, Vec<_>) =
-                    (view.short(&job.spec.demand)).partition(|d| resources[d.0].hard);
+                    (view.short_at(&job.demand)).partition(|&d| view.declared()[d].hard);
+                let names = |dims: Vec<usize>| {
+                    (dims.into_iter())
+                        .map(|d| view.declared()[d].name.clone())
+                        .collect()
+                };
                 if hard.is_empty() {
                     Verdict::Short {
-                        dims: soft,
-                        headroom: view.headroom(),
+                        dims: names(soft),
+                        headroom: headroom(&view),
                     }
                 } else {
-                    Verdict::Full { dims: hard }
+                    Verdict::Full { dims: names(hard) }
                 }
             }
         }
     }
+}
+
+/// The headroom of every declared resource on a worker, by name, in declaration order.
+fn headroom(view: &WorkerView) -> Vec<(Cow<'static, str>, Option<i64>)> {
+    (view.declared().iter().enumerate())
+        .map(|(d, r)| (r.name.clone(), view.headroom_at(d)))
+        .collect()
 }

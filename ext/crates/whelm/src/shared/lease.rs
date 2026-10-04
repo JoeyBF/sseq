@@ -13,8 +13,8 @@ use crate::{Attempt, FailKind, GaveUp, Input, JobId, Policy, WorkerId};
 ///
 /// ```
 /// use whelm::{
-///     Config, FailKind, JobSpec, Resources, RetryConfig, Scheduler, SharedPolicy, Time,
-///     WorkerState,
+///     Config, FailKind, JobSpec, MEMORY, Resources, RetryConfig, SLOTS, Scheduler, SharedPolicy,
+///     Time, WorkerState, gb,
 /// };
 ///
 /// let config = Config {
@@ -25,14 +25,14 @@ use crate::{Attempt, FailKind, GaveUp, Input, JobId, Policy, WorkerId};
 /// for w in [1, 2] {
 ///     shared.worker_update(WorkerState {
 ///         id: w,
-///         capacity: Resources::mem_gb(8.0).with_slots(1),
+///         capacity: Resources::new().with(MEMORY, gb(8.0)).with(SLOTS, 1),
 ///         ..Default::default()
 ///     });
 /// }
 /// // Every attempt runs out of device memory.
 /// let mut lease = shared.lease(JobSpec {
 ///     id: 7,
-///     demand: Resources::mem_gb(1.0),
+///     demand: Resources::new().with(MEMORY, gb(1.0)),
 ///     ..Default::default()
 /// });
 /// let mut workers = Vec::new();
@@ -92,17 +92,19 @@ impl<'a, P: Policy> Lease<'a, P> {
     /// [`SharedPolicy::with`]): its result is not wanted.
     ///
     /// ```
-    /// use whelm::{Config, Input, JobSpec, Policy, Resources, Scheduler, SharedPolicy, Time};
+    /// use whelm::{
+    ///     Config, Input, JobSpec, MEMORY, Policy, Resources, SLOTS, Scheduler, SharedPolicy, Time, gb,
+    /// };
     ///
     /// let shared = SharedPolicy::new(Scheduler::new(Config::default()), || Time::ORIGIN);
     /// shared.worker_update(whelm::WorkerState {
     ///     id: 1,
-    ///     capacity: Resources::mem_gb(8.0).with_slots(1),
+    ///     capacity: Resources::new().with(MEMORY, gb(8.0)).with(SLOTS, 1),
     ///     ..Default::default()
     /// });
     /// let lease = shared.lease(JobSpec {
     ///     id: 1,
-    ///     demand: Resources::mem_gb(1.0),
+    ///     demand: Resources::new().with(MEMORY, gb(1.0)),
     ///     ..Default::default()
     /// });
     /// assert!(!lease.stopped());
@@ -119,19 +121,21 @@ impl<'a, P: Policy> Lease<'a, P> {
     /// policy's retry is cancelled instead: the result is in hand.
     ///
     /// ```
-    /// use whelm::{Config, JobSpec, Resources, Scheduler, SharedPolicy, Time, WorkerState};
+    /// use whelm::{
+    ///     Config, JobSpec, MEMORY, Resources, SLOTS, Scheduler, SharedPolicy, Time, WorkerState, gb,
+    /// };
     ///
     /// let shared = SharedPolicy::new(Scheduler::new(Config::fifo()), || Time::ORIGIN);
     /// for w in [1, 2] {
     ///     shared.worker_update(WorkerState {
     ///         id: w,
-    ///         capacity: Resources::mem_gb(8.0).with_slots(1),
+    ///         capacity: Resources::new().with(MEMORY, gb(8.0)).with(SLOTS, 1),
     ///         ..Default::default()
     ///     });
     /// }
     /// let lease = shared.lease(JobSpec {
     ///     id: 7,
-    ///     demand: Resources::mem_gb(1.0),
+    ///     demand: Resources::new().with(MEMORY, gb(1.0)),
     ///     ..Default::default()
     /// });
     /// shared.worker_gone(lease.worker());
@@ -181,6 +185,7 @@ impl<'a, P: Policy> Lease<'a, P> {
             Ok(lease) => Ok(lease),
             Err(NoStart::GaveUp(g)) => Err(g),
             Err(NoStart::Timeout(_)) => unreachable!("no deadline"),
+            Err(NoStart::Rejected(_)) => unreachable!("a job is rejected only at submission"),
         }
     }
 }

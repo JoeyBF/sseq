@@ -3,8 +3,9 @@
 use std::time::Duration;
 
 use whelm::{
-    Attempt, Config, Constraint, Defer, Holding, Input, JobId, JobSpec, Output, Policy, Resources,
-    Scheduler, ScoreTerm, Speculate, SpeedConfig, Status, Time, Timing, WorkerId, WorkerState,
+    Attempt, Config, Constraint, Defer, Holding, Input, JobId, JobSpec, MEMORY, Output, Policy,
+    Resources, SLOTS, Scheduler, ScoreTerm, Speculate, SpeedConfig, Status, Time, Timing, WorkerId,
+    WorkerState,
 };
 
 /// The `(job, worker)` of each start in `out`.
@@ -35,7 +36,9 @@ fn plain_worker(id: u64, class: &str, slots: usize) -> WorkerState {
     WorkerState {
         id,
         class: class.into(),
-        capacity: Resources::mem(1000).with_slots(slots as u64),
+        capacity: Resources::new()
+            .with(MEMORY, 1000)
+            .with(SLOTS, slots as u64),
         ..Default::default()
     }
 }
@@ -44,7 +47,7 @@ fn plain_worker(id: u64, class: &str, slots: usize) -> WorkerState {
 fn job(id: JobId, work: Option<Duration>) -> JobSpec {
     JobSpec {
         id,
-        demand: Resources::mem(1),
+        demand: Resources::new().with(MEMORY, 1),
         work,
         ..Default::default()
     }
@@ -71,7 +74,7 @@ fn speed_first_picks_the_fast_worker() {
             Input::Worker(WorkerState {
                 id: 2,
                 class: "fast".into(),
-                capacity: Resources::mem(5000).with_slots(4),
+                capacity: Resources::new().with(MEMORY, 5000).with(SLOTS, 4),
                 speed: 2.4,
                 ..Default::default()
             }),

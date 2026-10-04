@@ -4,8 +4,8 @@ use std::{collections::BTreeMap, time::Duration};
 
 use proptest::prelude::*;
 use whelm::{
-    Attempt, Config, Input, JobId, JobSpec, Output, Policy, Reservations, Resources, Scheduler,
-    Time, WorkerState,
+    Attempt, Config, Input, JobId, JobSpec, MEMORY, Output, Policy, Reservations, Resources, SLOTS,
+    Scheduler, Time, WorkerState,
 };
 
 const TICK: Duration = Duration::from_secs(1);
@@ -37,7 +37,9 @@ fn run(p: &mut dyn Policy, s: &Stream) -> Option<Duration> {
             Input::Worker(WorkerState {
                 id: w as u64,
                 class: "x".into(),
-                capacity: Resources::mem(s.budget).with_slots(s.slots as u64),
+                capacity: Resources::new()
+                    .with(MEMORY, s.budget)
+                    .with(SLOTS, s.slots as u64),
                 ..Default::default()
             }),
             Time::ORIGIN,
@@ -56,7 +58,7 @@ fn run(p: &mut dyn Policy, s: &Stream) -> Option<Duration> {
             let (demand, d) = s.small[next as usize % s.small.len()];
             let small = JobSpec {
                 id: next,
-                demand: Resources::mem(demand),
+                demand: Resources::new().with(MEMORY, demand),
                 group: 1_000 + next,
                 work: Some(Duration::from_secs(d)),
                 ..Default::default()
@@ -68,7 +70,7 @@ fn run(p: &mut dyn Policy, s: &Stream) -> Option<Duration> {
         if !big_submitted && t >= s.big_at {
             let big = JobSpec {
                 id: BIG,
-                demand: Resources::mem(s.big_demand),
+                demand: Resources::new().with(MEMORY, s.big_demand),
                 priority: Some(-1),
                 ..Default::default()
             };

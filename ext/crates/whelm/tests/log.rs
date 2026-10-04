@@ -8,13 +8,13 @@ use std::{
 };
 
 use whelm::{
-    Attempt, Config, EventSink, FailKind, Input, JobId, JobSpec, Output, Policy, Resources,
-    Scheduler, Time, WorkerState,
+    Attempt, Config, EventSink, FailKind, Input, JobId, JobSpec, MEMORY, Output, Policy, Resources,
+    SLOTS, Scheduler, Time, WorkerState, gb,
     log::{Event, JsonlSink, Logged, TaskInfo, polls, replay},
 };
 
 const WORKERS: u64 = 3;
-const SLOTS: usize = 2;
+const WORKER_SLOTS: usize = 2;
 const BUDGET_GB: f64 = 10.0;
 const JOBS: u64 = 80;
 const HEARTBEAT: Duration = Duration::from_secs(60);
@@ -45,7 +45,9 @@ fn state(w: u64) -> WorkerState {
     WorkerState {
         id: w,
         class: "h200".into(),
-        capacity: Resources::mem_gb(BUDGET_GB).with_slots(SLOTS as u64),
+        capacity: Resources::new()
+            .with(MEMORY, gb(BUDGET_GB))
+            .with(SLOTS, WORKER_SLOTS as u64),
         ..Default::default()
     }
 }
@@ -94,7 +96,7 @@ fn run(sink: impl EventSink + 'static) -> Vec<(JobId, Attempt)> {
             next_arrival += 1;
             let spec = JobSpec {
                 id: i,
-                demand: Resources::mem_gb(job(i).2),
+                demand: Resources::new().with(MEMORY, gb(job(i).2)),
                 group: i / 10,
                 work: Some(job(i).1),
                 ..Default::default()

@@ -21,7 +21,8 @@ use super::Logged;
 /// };
 ///
 /// use whelm::{
-///     Config, EventSink, Input, JobSpec, Output, Policy, Resources, Scheduler, Time, WorkerState,
+///     Config, EventSink, Input, JobSpec, MEMORY, Output, Policy, Resources, SLOTS, Scheduler,
+///     Time, WorkerState, gb,
 ///     log::{Event, Logged},
 /// };
 ///
@@ -46,7 +47,7 @@ use super::Logged;
 /// );
 /// let worker = WorkerState {
 ///     id: 1,
-///     capacity: Resources::mem_gb(8.0).with_slots(2),
+///     capacity: Resources::new().with(MEMORY, gb(8.0)).with(SLOTS, 2),
 ///     ..Default::default()
 /// };
 /// p.handle(Input::Worker(worker), Time::ORIGIN);
@@ -54,7 +55,7 @@ use super::Logged;
 ///     p.handle(
 ///         Input::Submit(JobSpec {
 ///             id,
-///             demand: Resources::mem_gb(1.0),
+///             demand: Resources::new().with(MEMORY, gb(1.0)),
 ///             ..Default::default()
 ///         }),
 ///         Time::ORIGIN,
@@ -101,7 +102,7 @@ impl EventSink for std::sync::Arc<std::sync::Mutex<Vec<Event>>> {
 /// };
 ///
 /// use whelm::{
-///     Config, Input, JobSpec, Policy, Resources, Scheduler, Time, WorkerState,
+///     Config, Input, JobSpec, MEMORY, Policy, Resources, SLOTS, Scheduler, Time, WorkerState, gb,
 ///     log::{self, Event, JsonlSink, Logged},
 /// };
 ///
@@ -126,14 +127,14 @@ impl EventSink for std::sync::Arc<std::sync::Mutex<Vec<Event>>> {
 /// );
 /// let worker = WorkerState {
 ///     id: 1,
-///     capacity: Resources::mem_gb(8.0).with_slots(1),
+///     capacity: Resources::new().with(MEMORY, gb(8.0)).with(SLOTS, 1),
 ///     ..Default::default()
 /// };
 /// p.handle(Input::Worker(worker), Time::ORIGIN);
 /// p.handle(
 ///     Input::Submit(JobSpec {
 ///         id: 1,
-///         demand: Resources::mem_gb(1.0),
+///         demand: Resources::new().with(MEMORY, gb(1.0)),
 ///         ..Default::default()
 ///     }),
 ///     Time::ORIGIN,

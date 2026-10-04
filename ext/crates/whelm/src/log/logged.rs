@@ -6,7 +6,8 @@ use std::{collections::HashMap, time::Duration};
 use super::replay;
 use super::{Event, EventSink, TaskInfo};
 use crate::{
-    Explanation, Input, JobId, Output, Policy, PolicyStats, ResourceId, Time, WorkerId, WorkerState,
+    DEVICE_MEMORY, Explanation, Input, JobId, MEMORY, Output, Policy, PolicyStats, Time, WorkerId,
+    WorkerState,
 };
 
 /// A [`Policy`] that records every input it handles and every poll's outputs to an
@@ -26,7 +27,7 @@ pub struct Logged<P> {
 }
 
 /// Bytes to GB.
-fn gb(bytes: u64) -> f64 {
+fn in_gb(bytes: u64) -> f64 {
     bytes as f64 / 1e9
 }
 
@@ -59,7 +60,7 @@ impl<P: Policy> Logged<P> {
     /// };
     ///
     /// use whelm::{
-    ///     Config, Input, JobSpec, Policy, Resources, Scheduler, Time, WorkerState,
+    ///     Config, Input, JobSpec, MEMORY, Policy, Resources, SLOTS, Scheduler, Time, WorkerState, gb,
     ///     log::{Event, Logged},
     /// };
     ///
@@ -68,18 +69,18 @@ impl<P: Policy> Logged<P> {
     /// let mut p = Logged::new(inner, events.clone()).sample_every(Duration::from_secs(30));
     /// let mut w = WorkerState {
     ///     id: 1,
-    ///     capacity: Resources::mem_gb(8.0).with_slots(2),
+    ///     capacity: Resources::new().with(MEMORY, gb(8.0)).with(SLOTS, 2),
     ///     ..Default::default()
     /// };
     /// p.handle(Input::Worker(w.clone()), Time::ORIGIN);
     /// let job = JobSpec {
     ///     id: 1,
-    ///     demand: Resources::mem_gb(2.0),
+    ///     demand: Resources::new().with(MEMORY, gb(2.0)),
     ///     ..Default::default()
     /// };
     /// p.handle(Input::Submit(job), Time::ORIGIN);
     /// p.poll(Time::ORIGIN);
-    /// w.reported_used = Resources::mem_gb(1.5);
+    /// w.reported_used = Resources::new().with(MEMORY, gb(1.5));
     /// for t in [10, 20, 30] {
     ///     p.handle(Input::Worker(w.clone()), Time(Duration::from_secs(t)));
     /// }
@@ -121,7 +122,7 @@ impl<P: Policy> Logged<P> {
     /// };
     ///
     /// use whelm::{
-    ///     Config, Input, JobSpec, Policy, Resources, Scheduler, Time,
+    ///     Config, Input, JobSpec, MEMORY, Policy, Resources, Scheduler, Time, gb,
     ///     log::{Event, Logged, TaskInfo},
     /// };
     ///
@@ -136,7 +137,7 @@ impl<P: Policy> Logged<P> {
     /// p.handle(
     ///     Input::Submit(JobSpec {
     ///         id: 1,
-    ///         demand: Resources::mem_gb(1.0),
+    ///         demand: Resources::new().with(MEMORY, gb(1.0)),
     ///         ..Default::default()
     ///     }),
     ///     Time::ORIGIN,
@@ -145,7 +146,7 @@ impl<P: Policy> Logged<P> {
     /// p.handle(
     ///     Input::Submit(JobSpec {
     ///         id: 1,
-    ///         demand: Resources::mem_gb(1.0),
+    ///         demand: Resources::new().with(MEMORY, gb(1.0)),
     ///         ..Default::default()
     ///     }),
     ///     Time(Duration::from_secs(2)),
@@ -201,11 +202,11 @@ impl<P: Policy> Logged<P> {
         self.sink.record(&Event::Sample {
             t: now,
             worker: w.id.to_string(),
-            rss_gb: gb(w.reported_used[ResourceId::MEM]),
-            baseline_gb: gb(w.reported_baseline[ResourceId::MEM]),
-            reserved_gb: load.as_ref().map_or(0.0, |l| gb(l.placed[ResourceId::MEM])),
+            rss_gb: in_gb(w.reported_used.get(MEMORY)),
+            baseline_gb: in_gb(w.reported_baseline.get(MEMORY)),
+            reserved_gb: load.as_ref().map_or(0.0, |l| in_gb(l.placed.get(MEMORY))),
             running: load.map_or(0, |l| l.running),
-            dev_per_task_gb: gb(w.per_task[ResourceId::DEV]),
+            dev_per_task_gb: in_gb(w.per_task.get(DEVICE_MEMORY)),
         });
         self.last_sample.insert(w.id, now);
     }

@@ -21,15 +21,15 @@ use crate::{JobId, JobSpec};
 /// use std::time::Duration;
 ///
 /// use whelm::{
-///     Config, DagConfig, DagJob, DagScheduler, Input, JobSpec, Output, Policy, Resources,
-///     Scheduler, Time, WorkerState,
+///     Config, DagConfig, DagJob, DagScheduler, Input, JobSpec, MEMORY, Output, Policy, Resources,
+///     SLOTS, Scheduler, Time, WorkerState,
 /// };
 ///
 /// let mut dag = DagScheduler::new(DagConfig::default(), Scheduler::new(Config::fifo()));
 /// for id in [1, 2] {
 ///     let w = WorkerState {
 ///         id,
-///         capacity: Resources::mem(100).with_slots(1),
+///         capacity: Resources::new().with(MEMORY, 100).with(SLOTS, 1),
 ///         ..Default::default()
 ///     };
 ///     dag.handle(Input::Worker(w), Time::ORIGIN);
@@ -37,7 +37,7 @@ use crate::{JobId, JobSpec};
 /// let job = |id, deps| DagJob {
 ///     spec: JobSpec {
 ///         id,
-///         demand: Resources::mem(1),
+///         demand: Resources::new().with(MEMORY, 1),
 ///         ..Default::default()
 ///     },
 ///     deps,
@@ -128,7 +128,7 @@ pub struct DagJob {
     /// #
     /// # use whelm::{
     /// #     Config, DagConfig, DagJob, DagScheduler, Input, JobSpec, Output, Policy, Resources,
-    /// #     Scheduler, Time, WorkerState,
+    /// #     SLOTS, Scheduler, Time, WorkerState,
     /// # };
     /// let config = DagConfig {
     ///     record_passthrough: true,
@@ -137,7 +137,7 @@ pub struct DagJob {
     /// let mut dag = DagScheduler::new(config, Scheduler::new(Config::fifo()));
     /// let w = WorkerState {
     ///     id: 1,
-    ///     capacity: Resources::ZERO.with_slots(2),
+    ///     capacity: Resources::new().with(SLOTS, 2),
     ///     ..Default::default()
     /// };
     /// dag.handle(Input::Worker(w), Time::ORIGIN);
@@ -192,10 +192,10 @@ pub struct DagJob {
     /// # use std::time::Duration;
     /// # use whelm::{
     /// #     Config, DagConfig, DagJob, DagScheduler, Input, JobSpec, Output, Policy, Resources,
-    /// #     Scheduler, Time, WorkerState,
+    /// #     SLOTS, Scheduler, Time, WorkerState,
     /// # };
     /// # let mut dag = DagScheduler::new(DagConfig::default(), Scheduler::new(Config::fifo()));
-    /// # let capacity = Resources::ZERO.with_slots(1);
+    /// # let capacity = Resources::new().with(SLOTS, 1);
     /// # let worker = WorkerState { id: 1, capacity, ..Default::default() };
     /// # dag.handle(Input::Worker(worker), Time::ORIGIN);
     /// let job = |id, deps| DagJob {
@@ -255,8 +255,8 @@ pub struct DagJob {
 /// use std::{sync::Arc, time::Duration};
 ///
 /// use whelm::{
-///     Config, DagConfig, DagScheduler, Input, Output, Policy, Resources, Scheduler, TemplateNode,
-///     TemplateSpec, Time, Unit, WorkerState,
+///     Config, DagConfig, DagScheduler, Input, Output, Policy, Resources, SLOTS, Scheduler,
+///     TemplateNode, TemplateSpec, Time, Unit, WorkerState,
 /// };
 ///
 /// let chain = TemplateSpec {
@@ -277,7 +277,7 @@ pub struct DagJob {
 ///
 /// let mut dag = DagScheduler::new(DagConfig::default(), Scheduler::new(Config::fifo()));
 /// let worker = WorkerState {
-///     capacity: Resources::ZERO.with_slots(1),
+///     capacity: Resources::new().with(SLOTS, 1),
 ///     ..Default::default()
 /// };
 /// dag.handle(Input::Worker(worker), Time::ORIGIN);
@@ -319,12 +319,12 @@ pub struct Unit {
     /// # use std::{sync::Arc, time::Duration};
     /// # use whelm::{
     /// #     Config, DagConfig, DagJob, DagScheduler, Input, JobSpec, Output, Policy, Resources,
-    /// #     Scheduler, TemplateSpec, Time, Unit, WorkerState,
+    /// #     SLOTS, Scheduler, TemplateSpec, Time, Unit, WorkerState,
     /// # };
     /// let mut dag = DagScheduler::new(DagConfig::default(), Scheduler::new(Config::fifo()));
     /// let w = WorkerState {
     ///     id: 1,
-    ///     capacity: Resources::ZERO.with_slots(3),
+    ///     capacity: Resources::new().with(SLOTS, 3),
     ///     ..Default::default()
     /// };
     /// dag.handle(Input::Worker(w), Time::ORIGIN);
@@ -446,11 +446,11 @@ pub struct Unit {
     /// ```
     /// # use std::sync::Arc;
     /// # use whelm::{
-    /// #     Config, DagConfig, DagScheduler, Input, Output, Policy, Resources, Scheduler,
+    /// #     Config, DagConfig, DagScheduler, Input, Output, Policy, Resources, SLOTS, Scheduler,
     /// #     TemplateSpec, Time, Unit, WorkerState,
     /// # };
     /// # let mut dag = DagScheduler::new(DagConfig::default(), Scheduler::new(Config::fifo()));
-    /// # let capacity = Resources::ZERO.with_slots(1);
+    /// # let capacity = Resources::new().with(SLOTS, 1);
     /// # let worker = WorkerState { id: 1, capacity, ..Default::default() };
     /// # dag.handle(Input::Worker(worker), Time::ORIGIN);
     /// let chain = TemplateSpec {
@@ -522,7 +522,7 @@ impl From<DagJob> for Unit {
 ///
 /// use whelm::{
 ///     Config, Constraint, DagConfig, DagScheduler, Input, JobId, JobSpec, NodeSource, Output,
-///     Policy, Resources, Scheduler, TemplateSpec, Time, Unit, WorkerState,
+///     Policy, Resources, SLOTS, Scheduler, TemplateSpec, Time, Unit, WorkerState,
 /// };
 ///
 /// struct Steps;
@@ -556,7 +556,7 @@ impl From<DagJob> for Unit {
 ///     let w = WorkerState {
 ///         id,
 ///         class: class.into(),
-///         capacity: Resources::ZERO.with_slots(1),
+///         capacity: Resources::new().with(SLOTS, 1),
 ///         ..Default::default()
 ///     };
 ///     dag.handle(Input::Worker(w), Time::ORIGIN);

@@ -9,7 +9,8 @@ use std::{
 use proptest::prelude::*;
 use whelm::{
     Config, DagConfig, DagJob, DagScheduler, DagTemplate, Input, JobId, JobSpec, NodeSource,
-    Output, Policy, Resources, Scheduler, TemplateNode, TemplateSpec, Time, Unit, WorkerState,
+    Output, Policy, Resources, SLOTS, Scheduler, TemplateNode, TemplateSpec, Time, Unit,
+    WorkerState,
 };
 
 /// A small deterministic generator (splitmix64).
@@ -471,7 +472,7 @@ fn join(d: &mut DagScheduler<Scheduler>, now: Time) {
     d.handle(
         Input::Worker(WorkerState {
             class: "x".into(),
-            capacity: Resources::ZERO.with_slots(1),
+            capacity: Resources::new().with(SLOTS, 1),
             ..Default::default()
         }),
         now,

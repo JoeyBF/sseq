@@ -7,7 +7,9 @@ use std::{
 };
 
 use super::{SharedPolicy, lease::Lease};
-use crate::{Attempt, FailKind, GaveUp, Input, JobId, JobSpec, Output, Policy, Time, WorkerId};
+use crate::{
+    Attempt, FailKind, GaveUp, Input, JobId, JobSpec, Output, Policy, Rejection, Time, WorkerId,
+};
 
 /// One leased job's mailbox, from its first submission until the lease ends.
 pub(super) struct Slot {
@@ -27,6 +29,8 @@ pub(super) struct Slot {
     pub(super) started: Option<(Attempt, WorkerId)>,
     /// The policy gave the job up, not yet picked up by the thread.
     pub(super) gave_up: Option<GaveUp>,
+    /// The policy rejected the job, not yet picked up by the thread.
+    pub(super) rejected: Option<Rejection>,
 }
 
 /// The state behind the lock.
@@ -43,6 +47,7 @@ pub(super) struct State<P> {
 /// Why waiting for a start ended without one.
 pub(super) enum NoStart {
     GaveUp(GaveUp),
+    Rejected(Rejection),
     Timeout(Box<JobSpec>),
 }
 
@@ -103,6 +108,12 @@ impl<P: Policy> SharedPolicy<P> {
                             slot.cv.notify_one();
                         }
                     }
+                    Output::Rejected { job, reason } => {
+                        if let Some(slot) = s.jobs.get_mut(&job) {
+                            slot.rejected = Some(reason);
+                            slot.cv.notify_one();
+                        }
+                    }
                     Output::RunLocal { .. } | Output::Ready { .. } | Output::Passed { .. } => {}
                 }
             }
@@ -142,6 +153,10 @@ impl<P: Policy> SharedPolicy<P> {
             if let Some(g) = slot.gave_up.take() {
                 s.jobs.remove(&id);
                 return Err(NoStart::GaveUp(g));
+            }
+            if let Some(reason) = slot.rejected.take() {
+                s.jobs.remove(&id);
+                return Err(NoStart::Rejected(reason));
             }
             let cv = slot.cv.clone();
             match deadline {
@@ -183,6 +198,7 @@ impl<P: Policy> SharedPolicy<P> {
                 stopped: false,
                 started: None,
                 gave_up: None,
+                rejected: None,
             },
         );
         s.policy.handle(Input::Submit(job), now);
@@ -191,6 +207,7 @@ impl<P: Policy> SharedPolicy<P> {
             Ok(lease) => Ok(lease),
             Err(NoStart::Timeout(job)) => Err(job),
             Err(NoStart::GaveUp(_)) => unreachable!("a job is given up only after failing"),
+            Err(NoStart::Rejected(reason)) => panic!("job {id} was rejected: {reason}"),
         }
     }
 }

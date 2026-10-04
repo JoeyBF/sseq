@@ -9,7 +9,7 @@ use std::{
 use proptest::prelude::*;
 use whelm::{
     Attempt, Config, Constraint, Defer, Explanation, FailKind, GaveUp, GroupOrder, Input, JobId,
-    JobSpec, Learn, OrderTerm, Output, Policy, Reservations, Resource, ResourceId, Resources,
+    JobSpec, Learn, OrderTerm, Output, Policy, Rejection, Reservations, Resource, Resources,
     RetryConfig, Scheduler, ScoreTerm, Selector, Speculate, SpeedConfig, Status, Strength, Time,
     Timing, Tried, WorkerId, WorkerState,
 };
@@ -20,10 +20,21 @@ fn secs(x: f64) -> Duration {
     Duration::from_nanos((x * 1e9).round().max(0.0) as u64)
 }
 
+/// A declared resource as the model sees it.
+#[derive(Clone, Copy, Debug)]
+struct Decl {
+    name: &'static str,
+    hard: bool,
+    default_demand: u64,
+}
+
+/// Amounts by resource name, as the model keeps them: zero amounts left out.
+type Named = BTreeMap<&'static str, u64>;
+
 /// The configuration under test, minus speed and retries.
 #[derive(Clone, Debug)]
 struct Rule {
-    resources: Vec<Resource>,
+    resources: Vec<Decl>,
     order: Vec<OrderTerm>,
     group_order: GroupOrder,
     default_priority: i64,
@@ -36,8 +47,15 @@ struct Rule {
 impl Rule {
     /// The policy under test.
     fn build(&self, speed: SpeedConfig, retry: RetryConfig) -> Box<dyn Policy> {
+        let resources = (self.resources.iter())
+            .map(|d| Resource {
+                hard: d.hard,
+                default_demand: d.default_demand,
+                ..Resource::new(d.name)
+            })
+            .collect();
         Box::new(Scheduler::new(Config {
-            resources: self.resources.clone(),
+            resources,
             order: self.order.clone(),
             group_order: self.group_order,
             default_priority: self.default_priority,
@@ -55,18 +73,33 @@ impl Rule {
     }
 }
 
-/// The most resources a declaration has; a demand also has one component beyond it.
+/// The names a stream's resources are drawn from: a declaration takes some of them, and an amount
+/// may name any.
+const NAMES: [&str; 7] = [
+    "memory",
+    "device memory",
+    "slots",
+    "gpus",
+    "licenses",
+    "scratch",
+    "tokens",
+];
+
+/// The most resources a declaration has.
 const MAX_RESOURCES: usize = 5;
 
-/// One amount per resource, on two scales: a count for a hard resource, a size for a soft one
-/// ([`Shadow::pick`]).
+/// One amount per name of [`NAMES`], on two scales: a count for a hard resource, a size for a soft
+/// one ([`Shadow::pick`]).
 type Amounts = Vec<(u64, u64)>;
 
 #[derive(Clone, Debug)]
 enum Op {
     Submit {
-        /// Zero components take the default demand; those beyond the declaration are ignored.
+        /// Zero amounts take the default demand. Amounts of undeclared resources are dropped,
+        /// unless `stray`.
         demand: Amounts,
+        /// Keep the amounts of undeclared resources, which gets the job rejected.
+        stray: bool,
         group: u64,
         priority: Option<i64>,
         rank: Option<u8>,
@@ -134,24 +167,40 @@ fn amounts(
     prop::collection::vec(one, n)
 }
 
-/// A random resource declaration: 1 to [`MAX_RESOURCES`] resources, mixed hard and soft, with
-/// random default demands; or, a quarter of the time, the default one.
-fn resources() -> impl Strategy<Value = Vec<Resource>> {
-    let one = (any::<bool>(), prop_oneof![2 => Just(0u64), 1 => 1u64..3]).prop_map(
-        |(hard, default_demand)| Resource {
-            hard,
-            default_demand,
-            ..Resource::default()
-        },
+/// A random resource declaration: 1 to [`MAX_RESOURCES`] distinct names of [`NAMES`] in any
+/// order, mixed hard and soft, with random default demands; or, a quarter of the time, the
+/// default one.
+fn resources() -> impl Strategy<Value = Vec<Decl>> {
+    let names = prop::sample::subsequence(NAMES.to_vec(), 1..=MAX_RESOURCES).prop_shuffle();
+    let rules = prop::collection::vec(
+        (any::<bool>(), prop_oneof![2 => Just(0u64), 1 => 1u64..3]),
+        MAX_RESOURCES,
     );
-    let random = prop::collection::vec(one, 1..=MAX_RESOURCES).prop_map(|mut v| {
-        for (i, r) in v.iter_mut().enumerate() {
-            r.name = format!("r{i}");
-        }
-        v
+    let random = (names, rules).prop_map(|(names, rules)| {
+        (names.into_iter().zip(rules))
+            .map(|(name, (hard, default_demand))| Decl {
+                name,
+                hard,
+                default_demand,
+            })
+            .collect()
     });
+    let soft = |name| Decl {
+        name,
+        hard: false,
+        default_demand: 0,
+    };
+    let default = vec![
+        soft("memory"),
+        soft("device memory"),
+        Decl {
+            name: "slots",
+            hard: true,
+            default_demand: 1,
+        },
+    ];
     prop_oneof![
-        1 => Just(Config::default().resources),
+        1 => Just(default),
         3 => random,
     ]
 }
@@ -164,7 +213,11 @@ fn op() -> impl Strategy<Value = Op> {
         Just(FailKind::Timeout)
     ];
     let submit = (
-        (amounts(MAX_RESOURCES + 1, 6, 2, 1..80), 0u64..4),
+        (
+            amounts(NAMES.len(), 6, 2, 1..80),
+            0u64..4,
+            any::<prop::sample::Index>(),
+        ),
         prop::option::weighted(0.2, -2i64..3),
         prop::option::weighted(0.5, 0u8..6),
         prop_oneof![Just(1.0), Just(0.5), Just(3.0)],
@@ -174,16 +227,19 @@ fn op() -> impl Strategy<Value = Op> {
         prop::option::weighted(0.6, 0u8..3),
     )
         .prop_map(
-            |((demand, group), priority, rank, weight, due, constraints, work, kind)| Op::Submit {
-                demand,
-                group,
-                priority,
-                rank,
-                weight,
-                due,
-                constraints: constraints.unwrap_or_default(),
-                work,
-                kind,
+            |((demand, group, stray), priority, rank, weight, due, constraints, work, kind)| {
+                Op::Submit {
+                    demand,
+                    stray: stray.index(10) == 0,
+                    group,
+                    priority,
+                    rank,
+                    weight,
+                    due,
+                    constraints: constraints.unwrap_or_default(),
+                    work,
+                    kind,
+                }
             },
         );
     prop_oneof![
@@ -195,10 +251,10 @@ fn op() -> impl Strategy<Value = Op> {
         1 => index().prop_map(Op::Cancel),
         2 => (
             0u64..4,
-            amounts(MAX_RESOURCES, 2, 4, 20..150),
-            amounts(MAX_RESOURCES, 20, 1, 0..150),
-            amounts(MAX_RESOURCES, 20, 1, 0..60),
-            amounts(MAX_RESOURCES, 30, 1, 1..30),
+            amounts(NAMES.len(), 2, 4, 20..150),
+            amounts(NAMES.len(), 20, 1, 0..150),
+            amounts(NAMES.len(), 20, 1, 0..60),
+            amounts(NAMES.len(), 30, 1, 1..30),
             0u8..2,
         )
             .prop_map(|(id, capacity, used, baseline, per_task, class)| {
@@ -388,6 +444,8 @@ impl Urgency {
 #[derive(Clone, Debug)]
 struct SJob {
     spec: JobSpec,
+    /// Its demand over the declared resources, default demands filled in.
+    demand: Named,
     since: Time,
     seq: u64,
     /// The last attempt number started.
@@ -581,11 +639,21 @@ impl Speeds {
     }
 }
 
+/// A worker's reported amounts, as the model keeps them.
+#[derive(Clone, Debug)]
+struct Reported {
+    capacity: Named,
+    used: Named,
+    baseline: Named,
+    per_task: Named,
+}
+
 #[derive(Default)]
 struct Shadow {
     speeds: Speeds,
     now: Time,
     workers: BTreeMap<WorkerId, WorkerState>,
+    reported: BTreeMap<WorkerId, Reported>,
     waiting: BTreeMap<JobId, SJob>,
     running: BTreeMap<JobId, SRun>,
     /// The last attempt number ever started per job, kept after the job ends.
@@ -601,65 +669,73 @@ struct Shadow {
 
 impl Shadow {
     /// Live attempts and their summed demand on a worker.
-    fn load(&self, w: WorkerId) -> (usize, Resources) {
-        self.running
-            .values()
-            .flat_map(|r| {
-                r.live
-                    .iter()
-                    .filter(move |l| l.worker == w)
-                    .map(move |_| &r.job.spec.demand)
-            })
-            .fold((0, Resources::ZERO), |(n, m), d| (n + 1, m + d))
+    fn load(&self, w: WorkerId) -> (usize, Named) {
+        let mut placed = Named::new();
+        let mut n = 0;
+        for r in self.running.values() {
+            for _ in r.live.iter().filter(|l| l.worker == w) {
+                n += 1;
+                for (&name, &x) in &r.job.demand {
+                    *placed.entry(name).or_default() += x;
+                }
+            }
+        }
+        (n, placed)
     }
 
     /// The declared resources.
-    fn resources(&self) -> &[Resource] {
+    fn resources(&self) -> &[Decl] {
         &self.rule.as_ref().unwrap().resources
     }
 
-    /// The amounts as a vector: the count of each pair for a hard resource, its size for a soft
-    /// one or one beyond the declaration.
-    fn pick(&self, amounts: &Amounts) -> Resources {
-        let r = self.resources();
-        Resources::of(amounts.iter().enumerate().map(|(d, &(count, size))| {
-            let hard = r.get(d).is_some_and(|r| r.hard);
-            (ResourceId(d), if hard { count } else { size })
-        }))
+    /// The declared resource called `name`, if any.
+    fn decl(&self, name: &str) -> Option<&Decl> {
+        self.resources().iter().find(|d| d.name == name)
+    }
+
+    /// The amounts by name: the count of each pair for a hard resource, its size for a soft one
+    /// or an undeclared one; undeclared ones only if `stray`.
+    fn pick(&self, amounts: &Amounts, stray: bool) -> Named {
+        (NAMES.iter().zip(amounts))
+            .filter_map(|(&name, &(count, size))| {
+                let x = match self.decl(name) {
+                    Some(d) if d.hard => count,
+                    Some(_) => size,
+                    None if stray => size,
+                    None => return None,
+                };
+                (x > 0).then_some((name, x))
+            })
+            .collect()
     }
 
     /// The production rule, written out again: in every declared resource that is enforced (a
     /// hard one always, a soft one where its capacity is nonzero), each job counting at least
     /// `per_task`; a soft resource may be exceeded by a job alone on the worker, a hard one never.
-    fn admits_with(
-        &self,
-        demand: &Resources,
-        w: WorkerId,
-        running: usize,
-        placed: &Resources,
-    ) -> bool {
-        let s = &self.workers[&w];
-        self.resources().iter().enumerate().all(|(d, r)| {
-            let d = ResourceId(d);
-            let cap = s.capacity[d];
+    fn admits_with(&self, demand: &Named, w: WorkerId, running: usize, placed: &Named) -> bool {
+        let s = &self.reported[&w];
+        let get = |m: &Named, name| m.get(name).copied().unwrap_or(0);
+        self.resources().iter().all(|r| {
+            let cap = get(&s.capacity, r.name);
             if !r.hard && cap == 0 {
                 return true;
             }
-            let held = placed[d].max(running as u64 * s.per_task[d]);
-            let used = s.reported_used[d].max(s.reported_baseline[d] + held);
-            used + demand[d].max(s.per_task[d]) <= cap || (!r.hard && running == 0)
+            let per_task = get(&s.per_task, r.name);
+            let held = get(placed, r.name).max(running as u64 * per_task);
+            let used = get(&s.used, r.name).max(get(&s.baseline, r.name) + held);
+            used + get(demand, r.name).max(per_task) <= cap || (!r.hard && running == 0)
         })
     }
 
     /// [`admits_with`](Self::admits_with) the worker's current load.
-    fn admits(&self, demand: &Resources, w: WorkerId) -> bool {
+    fn admits(&self, demand: &Named, w: WorkerId) -> bool {
         let (running, placed) = self.load(w);
         self.admits_with(demand, w, running, &placed)
     }
 
     /// Whether `w` would admit `demand` if it ran nothing.
-    fn admits_empty(&self, demand: &Resources, w: WorkerId) -> bool {
-        self.admits_with(demand, w, 0, &Resources::ZERO)
+    fn admits_empty(&self, demand: &Named, w: WorkerId) -> bool {
+        self.admits_with(demand, w, 0, &Named::new())
     }
 
     /// The constraints, written out again: no Forbid selects the worker; for workers and for
@@ -694,7 +770,7 @@ impl Shadow {
         hard(s)
             && (!avoided(s)
                 || !(self.workers.values())
-                    .any(|o| self.admits_empty(&j.spec.demand, o.id) && hard(o) && !avoided(o)))
+                    .any(|o| self.admits_empty(&j.demand, o.id) && hard(o) && !avoided(o)))
     }
 
     /// Scan order: aged jobs by age, then the configured order terms (each once, at its first
@@ -789,22 +865,38 @@ impl Shadow {
         Some((j, k, r.live[k].attempt))
     }
 
-    /// Submit to both the model and the policy. The model's copy demands nothing beyond the
-    /// declared resources, and their default demands where it says nothing.
-    fn submit(&mut self, spec: JobSpec, p: &mut dyn Policy) {
+    /// Submit to both the model and the policy a job demanding `demand`: rejected, naming the
+    /// first undeclared resource by name, if it demands any; otherwise waiting, with the default
+    /// demands where it says nothing.
+    fn submit(&mut self, spec: JobSpec, demand: Named, p: &mut dyn Policy) {
+        if let Some(&name) = demand.keys().find(|n| self.decl(n).is_none()) {
+            let reason = Rejection::Undeclared {
+                resource: name.into(),
+            };
+            self.expect.push(Output::Rejected {
+                job: spec.id,
+                reason,
+            });
+            p.handle(Input::Submit(spec), self.now);
+            return;
+        }
         let seq = self.seq;
         self.seq += 1;
         self.groups.entry(spec.group).or_insert(seq);
-        let mut model = spec.clone();
-        model.demand = Resources::of(self.resources().iter().enumerate().map(|(d, r)| {
-            let d = ResourceId(d);
-            let own = spec.demand[d];
-            (d, if own == 0 { r.default_demand } else { own })
-        }));
+        let full = (self.resources().iter())
+            .map(|r| {
+                (
+                    r.name,
+                    demand.get(r.name).copied().unwrap_or(r.default_demand),
+                )
+            })
+            .filter(|&(_, x)| x > 0)
+            .collect();
         self.waiting.insert(
             spec.id,
             SJob {
-                spec: model,
+                spec: spec.clone(),
+                demand: full,
                 since: self.now,
                 seq,
                 attempts: 0,
@@ -857,6 +949,17 @@ impl Shadow {
     }
 }
 
+/// Amounts the policy reads, built with resources of the right names and the default rules, which
+/// the declaration overrides.
+fn to_policy(m: &Named) -> Resources {
+    m.iter().map(|(&n, &x)| (Resource::new(n), x)).collect()
+}
+
+/// The name of [`NAMES`] equal to `name`.
+fn name_of(name: &str) -> &'static str {
+    NAMES.iter().find(|&&n| n == name).expect("a name of NAMES")
+}
+
 /// Runs the stream, checking every invariant; returns the outputs and explanations made.
 ///
 /// Every policy is driven by the same random stream while a model, written independently of the
@@ -865,13 +968,15 @@ impl Shadow {
 ///
 /// - **messages**: `Done` completes a job and stops its other attempts, `Failed` and `WorkerGone`
 ///   retry it in its original place (softly avoiding where it failed) or give it up, `Cancel`
-///   stops every live attempt, and reports about attempts that are not live change nothing --
-///   every non-start output is exactly what the model predicts;
+///   stops every live attempt, reports about attempts that are not live change nothing, and a
+///   job demanding an undeclared resource is rejected, naming it -- every non-start output is
+///   exactly what the model predicts;
 /// - **attempts**: each start is the job's next attempt number; a job has two live attempts only
 ///   by speculation, and a job with a live attempt is never also waiting;
 /// - **no over-commit**: the production admission rule held at the moment of each start, in every
 ///   declared resource (no hard one over-used; no known capacity of a soft one exceeded, escape
-///   hatch aside), whatever the declaration;
+///   hatch aside), whatever the declaration, whose rules override those of the constants the
+///   amounts are built with;
 /// - **constraints**: no attempt runs on a worker its Requires or Forbids exclude, nor on an
 ///   avoided one while some live worker they allow is not avoided;
 /// - **escape hatch**: after a poll, no worker is empty while a job that it would admit waits;
@@ -906,6 +1011,7 @@ fn run(
         match *op {
             Op::Submit {
                 ref demand,
+                stray,
                 group,
                 priority,
                 rank,
@@ -917,9 +1023,10 @@ fn run(
             } => {
                 let id = sh.next_id;
                 sh.next_id += 1;
+                let demand = sh.pick(demand, stray);
                 let spec = JobSpec {
                     id,
-                    demand: sh.pick(demand),
+                    demand: to_policy(&demand),
                     group,
                     priority,
                     rank: rank.map(|r| Duration::from_secs(r.into())),
@@ -929,7 +1036,7 @@ fn run(
                     work: work.map(|w| Duration::from_secs(w.into())),
                     kind: kind.map(|k| format!("k{k}")),
                 };
-                sh.submit(spec, &mut *p);
+                sh.submit(spec, demand, &mut *p);
             }
             Op::Complete(i, k) => {
                 if let Some((job, k, attempt)) = sh.pick_live(i, k) {
@@ -1005,21 +1112,29 @@ fn run(
                 ref per_task,
                 class,
             } => {
+                let reported = Reported {
+                    capacity: sh.pick(capacity, false),
+                    used: sh.pick(used, false),
+                    baseline: sh.pick(baseline, false),
+                    per_task: sh.pick(per_task, false),
+                };
                 let s = WorkerState {
                     id,
                     class: format!("c{class}"),
-                    capacity: sh.pick(capacity),
-                    reported_used: sh.pick(used),
-                    reported_baseline: sh.pick(baseline),
+                    capacity: to_policy(&reported.capacity),
+                    reported_used: to_policy(&reported.used),
+                    reported_baseline: to_policy(&reported.baseline),
                     speed: class_speed(class),
-                    per_task: sh.pick(per_task),
+                    per_task: to_policy(&reported.per_task),
                 };
                 sh.speeds.refresh(id, &s.class, s.speed);
                 sh.workers.insert(id, s.clone());
+                sh.reported.insert(id, reported);
                 p.handle(Input::Worker(s), sh.now);
             }
             Op::Gone(w) => {
                 if sh.workers.remove(&w).is_some() {
+                    sh.reported.remove(&w);
                     sh.speeds.published.remove(&w);
                     // Each live attempt there fails; the caller resubmits nothing.
                     let lost: Vec<(JobId, usize)> = sh
@@ -1095,7 +1210,7 @@ fn run(
                 );
                 // No over-commit (slots included).
                 prop_assert!(
-                    sh.admits(&job.spec.demand, w),
+                    sh.admits(&job.demand, w),
                     "{rule:?}: job {j} over-commits worker {w}"
                 );
                 // Priority: every more urgent waiting job is refused here (unless this is a holder
@@ -1106,7 +1221,7 @@ fn run(
                         if a.spec.id != j && sh.urgency(a).cmp(&mine).is_lt() {
                             let refused = deferred_any.contains(&a.spec.id)
                                 || !sh.eligible(a, w)
-                                || !sh.admits(&a.spec.demand, w);
+                                || !sh.admits(&a.demand, w);
                             prop_assert!(
                                 refused,
                                 "{rule:?}: job {j} placed on {w} while more urgent job {} is \
@@ -1127,10 +1242,7 @@ fn run(
                     for &v in sh.workers.keys() {
                         let reserved =
                             (before.reservations.iter()).any(|r| r.worker == v && r.job != j);
-                        if v != w
-                            && !reserved
-                            && sh.eligible(&job, v)
-                            && sh.admits(&job.spec.demand, v)
+                        if v != w && !reserved && sh.eligible(&job, v) && sh.admits(&job.demand, v)
                         {
                             prop_assert!(
                                 !sh.speeds.faster(sh.speed(&job.spec, v), mine),
@@ -1178,7 +1290,7 @@ fn run(
                     r.live
                 );
                 prop_assert!(
-                    sh.eligible(&sjob, w) && sh.admits(&spec.demand, w),
+                    sh.eligible(&sjob, w) && sh.admits(&sjob.demand, w),
                     "job {j} speculated onto {w}, which does not take it"
                 );
                 prop_assert!(
@@ -1186,9 +1298,7 @@ fn run(
                     "speculated onto a reserved worker"
                 );
                 let wanted = sh.waiting.values().find(|a| {
-                    !deferred.contains(&a.spec.id)
-                        && sh.eligible(a, w)
-                        && sh.admits(&a.spec.demand, w)
+                    !deferred.contains(&a.spec.id) && sh.eligible(a, w) && sh.admits(&a.demand, w)
                 });
                 prop_assert!(
                     wanted.is_none(),
@@ -1234,7 +1344,7 @@ fn run(
             if sh.load(w).0 == 0 {
                 let stuck = sh.waiting.values().find(|j| {
                     sh.eligible(j, w)
-                        && sh.admits_empty(&j.spec.demand, w)
+                        && sh.admits_empty(&j.demand, w)
                         && !deferred.contains(&j.spec.id)
                 });
                 prop_assert!(
@@ -1251,7 +1361,12 @@ fn run(
         prop_assert_eq!(after.workers.len(), sh.workers.len());
         for l in &after.workers {
             let (n, m) = sh.load(l.id);
-            prop_assert_eq!((l.running, &l.placed), (n, &m), "worker {} load", l.id);
+            let placed: Named = l
+                .placed
+                .iter()
+                .map(|(name, x)| (name_of(name), x))
+                .collect();
+            prop_assert_eq!((l.running, &placed), (n, &m), "worker {} load", l.id);
             prop_assert_eq!(l.speed, sh.speeds.published[&l.id], "worker {} speed", l.id);
         }
         for (&j, r) in &sh.running {
@@ -1323,7 +1438,7 @@ fn run(
     prop_assert!(
         end.workers
             .iter()
-            .all(|l| l.running == 0 && l.placed == Resources::ZERO && l.reserved_for.is_none())
+            .all(|l| l.running == 0 && l.placed.is_empty() && l.reserved_for.is_none())
     );
     Ok(log)
 }

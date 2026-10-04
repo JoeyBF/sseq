@@ -7,8 +7,8 @@ use serde::{Deserialize, Serialize};
 
 #[cfg(doc)]
 use crate::{
-    Config, DagConfig, DagScheduler, Defer, OrderTerm, Policy, Resource, ScoreTerm, Speculate,
-    Timing,
+    Config, DagConfig, DagScheduler, Defer, OrderTerm, Output, Policy, Resource, ScoreTerm,
+    Speculate, Timing,
 };
 use crate::{Resources, Time, WorkerId, WorkerState};
 
@@ -23,12 +23,12 @@ pub type JobId = u64;
 /// # Examples
 ///
 /// ```
-/// use whelm::{Resources, Selector, WorkerState};
+/// use whelm::{Resources, SLOTS, Selector, WorkerState};
 ///
 /// let w = WorkerState {
 ///     id: 7,
 ///     class: "gpu".into(),
-///     capacity: Resources::ZERO.with_slots(1),
+///     capacity: Resources::new().with(SLOTS, 1),
 ///     ..Default::default()
 /// };
 /// assert!(Selector::Worker(7).matches(&w));
@@ -66,7 +66,8 @@ impl Selector {
 ///
 /// ```
 /// use whelm::{
-///     Config, Constraint, Input, JobSpec, Output, Policy, Resources, Scheduler, Time, WorkerState,
+///     Config, Constraint, Input, JobSpec, Output, Policy, Resources, SLOTS, Scheduler, Time,
+///     WorkerState,
 /// };
 ///
 /// let mut p = Scheduler::new(Config::default());
@@ -74,7 +75,7 @@ impl Selector {
 ///     let w = WorkerState {
 ///         id,
 ///         class: class.into(),
-///         capacity: Resources::ZERO.with_slots(1),
+///         capacity: Resources::new().with(SLOTS, 1),
 ///         ..Default::default()
 ///     };
 ///     p.handle(Input::Worker(w), Time::ORIGIN);
@@ -179,7 +180,8 @@ impl Constraint {
     ///
     /// ```
     /// use whelm::{
-    ///     Config, Constraint, Input, JobSpec, Output, Policy, Resources, Scheduler, Time, WorkerState,
+    ///     Config, Constraint, Input, JobSpec, Output, Policy, Resources, SLOTS, Scheduler, Time,
+    ///     WorkerState,
     /// };
     ///
     /// let mut p = Scheduler::new(Config::default());
@@ -187,7 +189,7 @@ impl Constraint {
     ///     let w = WorkerState {
     ///         id,
     ///         class: class.into(),
-    ///         capacity: Resources::ZERO.with_slots(1),
+    ///         capacity: Resources::new().with(SLOTS, 1),
     ///         ..Default::default()
     ///     };
     ///     p.handle(Input::Worker(w), Time::ORIGIN);
@@ -222,14 +224,14 @@ impl Constraint {
     ///
     /// ```
     /// use whelm::{
-    ///     Config, Constraint, Input, JobSpec, Policy, Resources, Scheduler, Time, WorkerState,
+    ///     Config, Constraint, Input, JobSpec, Policy, Resources, SLOTS, Scheduler, Time, WorkerState,
     /// };
     ///
     /// let mut p = Scheduler::new(Config::default());
     /// p.handle(
     ///     Input::Worker(WorkerState {
     ///         id: 1,
-    ///         capacity: Resources::ZERO.with_slots(1),
+    ///         capacity: Resources::new().with(SLOTS, 1),
     ///         ..Default::default()
     ///     }),
     ///     Time::ORIGIN,
@@ -277,14 +279,15 @@ impl Constraint {
     ///
     /// ```
     /// use whelm::{
-    ///     Config, Constraint, Input, JobSpec, Output, Policy, Resources, Scheduler, Time, WorkerState,
+    ///     Config, Constraint, Input, JobSpec, Output, Policy, Resources, SLOTS, Scheduler, Time,
+    ///     WorkerState,
     /// };
     ///
     /// let mut p = Scheduler::new(Config::default());
     /// p.handle(
     ///     Input::Worker(WorkerState {
     ///         id: 1,
-    ///         capacity: Resources::ZERO.with_slots(1),
+    ///         capacity: Resources::new().with(SLOTS, 1),
     ///         ..Default::default()
     ///     }),
     ///     Time::ORIGIN,
@@ -337,7 +340,8 @@ impl Constraint {
     ///
     /// ```
     /// use whelm::{
-    ///     Config, Constraint, Input, JobSpec, Output, Policy, Resources, Scheduler, Time, WorkerState,
+    ///     Config, Constraint, Input, JobSpec, Output, Policy, Resources, SLOTS, Scheduler, Time,
+    ///     WorkerState,
     /// };
     ///
     /// let mut p = Scheduler::new(Config::default());
@@ -345,7 +349,7 @@ impl Constraint {
     ///     p.handle(
     ///         Input::Worker(WorkerState {
     ///             id,
-    ///             capacity: Resources::ZERO.with_slots(1),
+    ///             capacity: Resources::new().with(SLOTS, 1),
     ///             ..Default::default()
     ///         }),
     ///         Time::ORIGIN,
@@ -406,11 +410,11 @@ impl Constraint {
 /// ```
 /// use std::time::Duration;
 ///
-/// use whelm::{Constraint, JobSpec, Resources};
+/// use whelm::{Constraint, JobSpec, MEMORY, Resources, gb};
 ///
 /// let job = JobSpec {
 ///     id: 42,
-///     demand: Resources::mem_gb(6.0),
+///     demand: Resources::new().with(MEMORY, gb(6.0)),
 ///     group: 3,
 ///     priority: Some(-1),
 ///     work: Some(Duration::from_secs(120)),
@@ -426,9 +430,10 @@ pub struct JobSpec {
     /// The job's id.
     pub id: JobId,
     /// What the job is expected to use while running (an estimate; it may be pessimistic). The
-    /// scheduler ignores components beyond [`Config::resources`] and fills in each zero one with
-    /// its resource's [`default_demand`](Resource::default_demand): one slot, under the default
-    /// declaration.
+    /// scheduler fills in each declared resource it leaves out with that resource's
+    /// [`default_demand`](Resource::default_demand) (one slot, under the default declaration), and
+    /// [rejects](Output::Rejected) the job if it names a resource [`Config::resources`] does not
+    /// declare.
     pub demand: Resources,
     /// Priority group, e.g. the bidegree a job belongs to ([`OrderTerm::Group`]).
     pub group: u64,
@@ -471,7 +476,7 @@ impl Default for JobSpec {
     fn default() -> Self {
         Self {
             id: 0,
-            demand: Resources::ZERO,
+            demand: Resources::new(),
             group: 0,
             priority: None,
             rank: None,

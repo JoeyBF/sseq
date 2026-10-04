@@ -4,8 +4,8 @@ use std::{sync::Arc, time::Duration};
 
 use crate::{
     Attempt, Config, DagConfig, DagError, DagJob, DagScheduler, DagStats, Explanation, FailKind,
-    GaveUp, Input, JobId, JobSpec, Output, Policy, Resources, RetryConfig, Scheduler, Status,
-    TemplateSpec, Time, Unit, WorkerId, WorkerState,
+    GaveUp, Input, JobId, JobSpec, MEMORY, Output, Policy, Resources, RetryConfig, SLOTS,
+    Scheduler, Status, TemplateSpec, Time, Unit, WorkerId, WorkerState,
 };
 
 /// A DAG over a FIFO scheduler with one one-slot worker, and `max_attempts` attempts per job.
@@ -26,7 +26,7 @@ fn worker(id: WorkerId) -> WorkerState {
     WorkerState {
         id,
         class: "x".into(),
-        capacity: Resources::mem(100).with_slots(1),
+        capacity: Resources::new().with(MEMORY, 100).with(SLOTS, 1),
         ..Default::default()
     }
 }
@@ -36,7 +36,7 @@ fn job(id: JobId, deps: &[JobId]) -> DagJob {
     DagJob {
         spec: JobSpec {
             id,
-            demand: Resources::mem(1),
+            demand: Resources::new().with(MEMORY, 1),
             ..Default::default()
         },
         deps: deps.to_vec(),
@@ -96,7 +96,7 @@ fn unit(id: JobId, base: JobId, len: usize, deps: &[JobId]) -> Unit {
         template: Arc::new(TemplateSpec::jobs(len).build().unwrap()),
         deps: deps.to_vec(),
         spec: JobSpec {
-            demand: Resources::mem(1),
+            demand: Resources::new().with(MEMORY, 1),
             ..Default::default()
         },
         scale: Some(1.0),

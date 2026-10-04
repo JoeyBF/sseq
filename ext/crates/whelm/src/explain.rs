@@ -5,14 +5,14 @@
 //! saying why that worker does not take it. Its [`Display`](fmt::Display) form is a one-line
 //! summary for logs.
 
-use std::{fmt, time::Duration};
+use std::{borrow::Cow, fmt, time::Duration};
 
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
 #[cfg(doc)]
 use crate::{Admission, DagScheduler, Defer, Policy, Reservations, Scheduler, Timing, WorkerView};
-use crate::{Attempt, JobId, Resource, ResourceId, ResourceUnit, Resources, Time, Tried, WorkerId};
+use crate::{Attempt, JobId, Resource, ResourceUnit, Resources, Time, Tried, WorkerId};
 
 /// Bytes per gigabyte, for the [`Display`](fmt::Display) form.
 const GB: f64 = 1e9;
@@ -32,8 +32,8 @@ const SHOWN_DEPS: usize = 8;
 ///
 /// ```
 /// use whelm::{
-///     Config, Explanation, Input, JobSpec, Policy, ResourceId, Resources, Scheduler, Status,
-///     Time, Verdict, WorkerState,
+///     Config, Explanation, Input, JobSpec, Policy, Resources, SLOTS, Scheduler, Status, Time,
+///     Verdict, WorkerState,
 /// };
 ///
 /// let mut p = Scheduler::new(Config::fifo());
@@ -41,7 +41,7 @@ const SHOWN_DEPS: usize = 8;
 ///     Input::Worker(WorkerState {
 ///         id: 1,
 ///         class: "cpu".into(),
-///         capacity: Resources::ZERO.with_slots(1),
+///         capacity: Resources::new().with(SLOTS, 1),
 ///         ..Default::default()
 ///     }),
 ///     Time::ORIGIN,
@@ -62,7 +62,7 @@ const SHOWN_DEPS: usize = 8;
 ///     panic!("job 2 runs");
 /// };
 /// let full = Verdict::Full {
-///     dims: vec![ResourceId::SLOTS],
+///     dims: vec![SLOTS.name],
 /// };
 /// assert_eq!(w.workers, [(1, full)]);
 /// assert_eq!(
@@ -162,8 +162,8 @@ pub enum Status {
 pub struct Waiting {
     /// Its demand, as the scheduler holds it ([`Admission`] says how).
     pub demand: Resources,
-    /// The resources the scheduler declares ([`Config::resources`](crate::Config::resources)),
-    /// which name the components of the vectors here.
+    /// The resources the scheduler declares ([`Config::resources`](crate::Config::resources)):
+    /// the order the [`Display`](fmt::Display) form lists amounts in, and their units.
     pub resources: Vec<Resource>,
     /// Its group.
     pub group: u64,
@@ -250,16 +250,19 @@ pub enum Verdict {
     /// Admission refuses for want of a [hard](Resource::hard) resource: under the default
     /// declaration, every slot is taken.
     Full {
-        /// The hard resources the job does not fit in ([`WorkerView::short`]).
-        dims: Vec<ResourceId>,
+        /// The names of the hard resources the job does not fit in ([`WorkerView::short`]), in
+        /// declaration order.
+        dims: Vec<Cow<'static, str>>,
     },
     /// Admission refuses with room in every hard resource.
     Short {
-        /// The soft resources the job does not fit in ([`WorkerView::short`]). None at all when
-        /// the [`Admission`] rule refuses for reasons of its own.
-        dims: Vec<ResourceId>,
-        /// The worker's headroom per declared resource ([`WorkerView::headroom`]).
-        headroom: Vec<Option<i64>>,
+        /// The names of the soft resources the job does not fit in ([`WorkerView::short`]), in
+        /// declaration order. None at all when the [`Admission`] rule refuses for reasons of its
+        /// own.
+        dims: Vec<Cow<'static, str>>,
+        /// The worker's headroom in each declared resource, by name, in declaration order
+        /// ([`WorkerView::headroom`]).
+        headroom: Vec<(Cow<'static, str>, Option<i64>)>,
     },
 }
 
@@ -271,11 +274,11 @@ fn amount(resource: &Resource, x: i128) -> String {
     }
 }
 
-/// A resource vector in words: each nonzero component by name, in declaration order.
+/// Amounts in words: each nonzero one by name, in declaration order.
 fn list(r: &Resources, resources: &[Resource]) -> String {
-    let parts: Vec<String> = (resources.iter().enumerate())
-        .filter(|&(d, _)| r[ResourceId(d)] > 0)
-        .map(|(d, res)| format!("{} {}", res.name, amount(res, r[ResourceId(d)].into())))
+    let parts: Vec<String> = (resources.iter())
+        .filter(|res| r.get(res) > 0)
+        .map(|res| format!("{} {}", res.name, amount(res, r.get(res).into())))
         .collect();
     format!("[{}]", parts.join(", "))
 }
@@ -409,25 +412,27 @@ impl fmt::Display for Waiting {
             write!(f, "; no workers")?;
         }
         let count = |v: &Verdict| self.workers.iter().filter(|(_, w)| w == v).count();
-        for (d, r) in self.resources.iter().enumerate() {
-            let d = ResourceId(d);
+        for r in &self.resources {
             let full = (self.workers.iter())
-                .filter(|(_, v)| matches!(v, Verdict::Full { dims } if dims.contains(&d)))
+                .filter(|(_, v)| matches!(v, Verdict::Full { dims } if dims.contains(&r.name)))
                 .count();
             if full > 0 {
                 write!(f, "; {} full on {full} worker(s)", r.name)?;
             }
         }
-        for (d, r) in self.resources.iter().enumerate() {
-            // Workers short of `d`, and the first with the most headroom there.
+        for r in &self.resources {
+            // Workers short of `r`, and the first with the most headroom there.
             let mut short = 0;
             let mut best: Option<(i64, WorkerId)> = None;
             for (id, v) in &self.workers {
                 if let Verdict::Short { dims, headroom } = v
-                    && dims.contains(&ResourceId(d))
+                    && dims.contains(&r.name)
                 {
                     short += 1;
-                    let h = headroom.get(d).copied().flatten().unwrap_or(i64::MAX);
+                    let h = (headroom.iter())
+                        .find(|(name, _)| *name == r.name)
+                        .and_then(|h| h.1)
+                        .unwrap_or(i64::MAX);
                     if best.is_none_or(|(b, _)| h > b) {
                         best = Some((h, *id));
                     }
@@ -471,12 +476,15 @@ impl fmt::Display for Waiting {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Config, FailKind};
+    use crate::{Config, DEVICE_MEMORY, FailKind, MEMORY, SLOTS, gb};
 
     /// A waiting job with one worker of each verdict.
     fn waiting() -> Explanation {
         let w = Waiting {
-            demand: Resources::mem_gb(2.0).with_dev_gb(1.0).with_slots(1),
+            demand: Resources::new()
+                .with(MEMORY, gb(2.0))
+                .with(DEVICE_MEMORY, gb(1.0))
+                .with(SLOTS, 1),
             resources: Config::default().resources,
             group: 3,
             since: Time::ORIGIN,
@@ -493,8 +501,8 @@ mod tests {
                 since: Time::ORIGIN,
                 shadow: None,
                 running: 1,
-                capacity: Resources::mem_gb(8.0).with_slots(2),
-                used: Resources::mem_gb(3.0).with_slots(1),
+                capacity: Resources::new().with(MEMORY, gb(8.0)).with(SLOTS, 2),
+                used: Resources::new().with(MEMORY, gb(3.0)).with(SLOTS, 1),
             }),
             kind: Some("k".into()),
             kind_factors: vec![("a".into(), 1.5), ("b".into(), 0.5)],
@@ -503,7 +511,7 @@ mod tests {
                 (
                     2,
                     Verdict::Full {
-                        dims: vec![ResourceId::SLOTS],
+                        dims: vec![SLOTS.name],
                     },
                 ),
                 (3, Verdict::Ineligible),
@@ -511,8 +519,12 @@ mod tests {
                 (
                     5,
                     Verdict::Short {
-                        dims: vec![ResourceId::MEM],
-                        headroom: vec![Some(1_000_000_000), None, Some(1)],
+                        dims: vec![MEMORY.name],
+                        headroom: vec![
+                            (MEMORY.name, Some(1_000_000_000)),
+                            (DEVICE_MEMORY.name, None),
+                            (SLOTS.name, Some(1)),
+                        ],
                     },
                 ),
             ],

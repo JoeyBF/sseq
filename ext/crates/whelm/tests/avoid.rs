@@ -3,8 +3,8 @@
 use std::time::Duration;
 
 use whelm::{
-    Config, Constraint, FailKind, Input, JobId, JobSpec, Output, Policy, Resources, Scheduler,
-    Time, WorkerId, WorkerState,
+    Config, Constraint, FailKind, Input, JobId, JobSpec, MEMORY, Output, Policy, Resources, SLOTS,
+    Scheduler, Time, WorkerId, WorkerState,
 };
 
 /// The `(job, worker)` of each start in `out`.
@@ -22,7 +22,7 @@ fn worker(id: WorkerId, slots: usize) -> WorkerState {
     WorkerState {
         id,
         class: "x".into(),
-        capacity: Resources::mem(100).with_slots(slots as u64),
+        capacity: Resources::new().with(MEMORY, 100).with(SLOTS, slots as u64),
         ..Default::default()
     }
 }
@@ -45,7 +45,7 @@ fn job(id: JobId, avoid: &[WorkerId], soft: bool) -> JobSpec {
     };
     JobSpec {
         id,
-        demand: Resources::mem(1),
+        demand: Resources::new().with(MEMORY, 1),
         constraints: avoid.iter().map(|&w| constraint(w)).collect(),
         ..Default::default()
     }

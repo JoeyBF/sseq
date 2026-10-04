@@ -4,7 +4,9 @@ use std::collections::BTreeMap;
 
 use super::{Job, Run, Running, Scheduler, Worker, tick_occ};
 use crate::{
-    Attempt, FailKind, GaveUp, JobId, Output, Resources, Time, Tried, WorkerId, WorkerState,
+    Attempt, FailKind, GaveUp, JobId, Output, Time, Tried, WorkerId, WorkerState,
+    admission::WorkerAmounts,
+    resources::{add, sub},
     time::secs,
 };
 
@@ -37,7 +39,7 @@ impl Scheduler {
             .get_mut(&worker)
             .expect("placing on an unknown worker");
         tick_occ(w, self.now);
-        w.placed += &r.job.spec.demand;
+        add(&mut w.placed, &r.job.demand);
         w.jobs.insert(job, attempt);
         r.live.push(Run {
             attempt,
@@ -58,12 +60,12 @@ impl Scheduler {
         workers: &mut BTreeMap<WorkerId, Worker>,
         now: Time,
         job: JobId,
-        demand: &Resources,
+        demand: &[u64],
         run: &Run,
     ) {
         if let Some(w) = workers.get_mut(&run.worker) {
             tick_occ(w, now);
-            w.placed -= demand;
+            sub(&mut w.placed, demand);
             w.jobs.remove(&job);
         }
     }
@@ -73,7 +75,7 @@ impl Scheduler {
     fn stop_running(&mut self, job: JobId, except: Option<Attempt>) -> Option<Job> {
         let r = self.running.remove(&job)?;
         for run in &r.live {
-            Self::release_run(&mut self.workers, self.now, job, &r.job.spec.demand, run);
+            Self::release_run(&mut self.workers, self.now, job, &r.job.demand, run);
             if Some(run.attempt) != except {
                 self.outbox.push(Output::Stop {
                     job,
@@ -126,7 +128,7 @@ impl Scheduler {
             r.job.retry_avoid.push(run.worker);
         }
         let idle = r.live.is_empty();
-        Self::release_run(&mut self.workers, self.now, job, &r.job.spec.demand, &run);
+        Self::release_run(&mut self.workers, self.now, job, &r.job.demand, &run);
         if !idle {
             return;
         }
@@ -145,7 +147,12 @@ impl Scheduler {
     }
 
     /// Add a worker or replace its reported state, keeping its placements.
+    ///
+    /// # Panics
+    ///
+    /// If `state` names a resource that is not declared.
     pub(super) fn worker_update(&mut self, state: WorkerState, now: Time) {
+        let amounts = WorkerAmounts::new(&self.config.resources, &state);
         let class = self.speeds.class(&state.class);
         let speed = self.speeds.worker_speed(state.id, class, state.speed);
         match self.workers.get_mut(&state.id) {
@@ -156,6 +163,7 @@ impl Scheduler {
                     .then_some(w.reserved_for)
                     .flatten();
                 w.state = state;
+                w.amounts = amounts;
                 w.class = class;
                 w.speed = speed;
                 if let Some(holder) = moved {
@@ -168,7 +176,8 @@ impl Scheduler {
                     id,
                     Worker {
                         state,
-                        placed: Resources::ZERO,
+                        amounts,
+                        placed: self.zero.clone(),
                         jobs: BTreeMap::new(),
                         reserved_for: None,
                         class,
@@ -226,7 +235,7 @@ impl Scheduler {
                         || r.job.speculated >= cfg.max_per_job
                         || !self.eligible(&r.job, w)
                         || !(self.admission)
-                            .admits(&r.job.spec.demand, &w.view(&self.config.resources))
+                            .admits(&self.demand(&r.job), &w.view(&self.config.resources))
                     {
                         continue;
                     }

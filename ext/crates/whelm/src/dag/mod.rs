@@ -56,8 +56,9 @@
 //! [`poll`](Policy::poll) returns this layer's announcements ([`Output::RunLocal`],
 //! [`Output::Ready`], [`Output::Passed`]) and then the inner policy's outputs.
 //! [`DagScheduler::announcements`] drains the announcements alone, so the caller can act on them
-//! before anything is placed. A job the inner policy gives up on ([`Output::GaveUp`]) is held
-//! again rather than forgotten: its dependents wait until it is released or cancelled.
+//! before anything is placed. A job the inner policy gives up on ([`Output::GaveUp`]) or rejects
+//! ([`Output::Rejected`]) is held again rather than forgotten: its dependents wait until it is
+//! released or cancelled.
 //!
 //! # Resuming and closing
 //!
@@ -82,8 +83,8 @@
 //! use std::{sync::Arc, time::Duration};
 //!
 //! use whelm::{
-//!     Config, DagConfig, DagScheduler, Input, Output, Policy, Resources, Scheduler, TemplateNode,
-//!     TemplateSpec, Time, Unit, WorkerState,
+//!     Config, DagConfig, DagScheduler, Input, Output, Policy, Resources, SLOTS, Scheduler,
+//!     TemplateNode, TemplateSpec, Time, Unit, WorkerState,
 //! };
 //!
 //! // Node 0 loads (on the caller), nodes 1 and 2 compute after it.
@@ -100,7 +101,7 @@
 //! dag.handle(
 //!     Input::Worker(WorkerState {
 //!         id: 1,
-//!         capacity: Resources::ZERO.with_slots(1),
+//!         capacity: Resources::new().with(SLOTS, 1),
 //!         ..Default::default()
 //!     }),
 //!     Time::ORIGIN,
@@ -164,7 +165,7 @@ use std::{
 };
 
 use crate::{
-    Attempt, Explanation, Input, JobId, JobSpec, Output, Policy, PolicyStats, Status, Time,
+    Attempt, Explanation, GaveUp, Input, JobId, JobSpec, Output, Policy, PolicyStats, Status, Time,
     WorkerId,
 };
 
@@ -320,9 +321,9 @@ impl Loc {
 /// inner policy's outputs and this layer's own: [`Output::RunLocal`], [`Output::Ready`] and
 /// [`Output::Passed`], which [`announcements`](Self::announcements) drains alone.
 ///
-/// A job the inner policy gives up on ([`Output::GaveUp`], passed through) is held again: its
-/// dependents stay pending until the caller [`release`](Self::release)s it (another round of
-/// attempts) or [`cancel`](Self::cancel)s it.
+/// A job the inner policy gives up on ([`Output::GaveUp`]) or rejects ([`Output::Rejected`]),
+/// both passed through, is held again: its dependents stay pending until the caller
+/// [`release`](Self::release)s it (another round of attempts) or [`cancel`](Self::cancel)s it.
 ///
 /// With one attempt per job, job 1's failure is a give-up; releasing it runs it again, and its
 /// dependent follows.
@@ -332,7 +333,7 @@ impl Loc {
 ///
 /// use whelm::{
 ///     Config, DagConfig, DagJob, DagScheduler, FailKind, GaveUp, Input, JobSpec, Output, Policy,
-///     Resources, RetryConfig, Scheduler, Time, WorkerState,
+///     Resources, RetryConfig, SLOTS, Scheduler, Time, WorkerState,
 /// };
 ///
 /// let config = Config {
@@ -343,7 +344,7 @@ impl Loc {
 /// dag.handle(
 ///     Input::Worker(WorkerState {
 ///         id: 1,
-///         capacity: Resources::ZERO.with_slots(1),
+///         capacity: Resources::new().with(SLOTS, 1),
 ///         ..Default::default()
 ///     }),
 ///     Time::ORIGIN,
@@ -441,14 +442,14 @@ impl<P: Policy> DagScheduler<P> {
     ///
     /// ```
     /// # use whelm::{
-    /// #     Config, DagConfig, DagScheduler, Input, JobSpec, Output, Policy, Resources, Scheduler,
-    /// #     Time, WorkerState,
+    /// #     Config, DagConfig, DagScheduler, Input, JobSpec, Output, Policy, Resources, SLOTS,
+    /// #     Scheduler, Time, WorkerState,
     /// # };
     /// let mut dag = DagScheduler::new(DagConfig::default(), Scheduler::new(Config::fifo()));
     /// dag.handle(
     ///     Input::Worker(WorkerState {
     ///         id: 1,
-    ///         capacity: Resources::ZERO.with_slots(1),
+    ///         capacity: Resources::new().with(SLOTS, 1),
     ///         ..Default::default()
     ///     }),
     ///     Time::ORIGIN,
@@ -506,10 +507,10 @@ impl<P: Policy> DagScheduler<P> {
     /// ```
     /// # use whelm::{
     /// #     Config, DagConfig, DagJob, DagScheduler, Input, JobSpec, Output, Policy, Resources,
-    /// #     Scheduler, Time, WorkerState,
+    /// #     SLOTS, Scheduler, Time, WorkerState,
     /// # };
     /// # let mut dag = DagScheduler::new(DagConfig::default(), Scheduler::new(Config::fifo()));
-    /// # let capacity = Resources::ZERO.with_slots(1);
+    /// # let capacity = Resources::new().with(SLOTS, 1);
     /// # let worker = WorkerState { id: 1, capacity, ..Default::default() };
     /// # dag.handle(Input::Worker(worker), Time::ORIGIN);
     /// # let job = |id, deps| DagJob {
@@ -642,9 +643,9 @@ impl<P: Policy> Policy for DagScheduler<P> {
                         continue;
                     }
                 }
-                Output::GaveUp(g) => {
-                    self.live.remove(&g.job);
-                    self.hold_again(g.job);
+                Output::GaveUp(GaveUp { job, .. }) | Output::Rejected { job, .. } => {
+                    self.live.remove(job);
+                    self.hold_again(*job);
                 }
                 _ => {}
             }

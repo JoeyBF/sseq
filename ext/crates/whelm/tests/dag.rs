@@ -7,8 +7,8 @@ use std::{
 
 use proptest::prelude::*;
 use whelm::{
-    Attempt, Config, DagConfig, DagError, DagJob, DagScheduler, Input, JobId, JobSpec, OrderTerm,
-    Output, Policy, Resources, RetryConfig, Scheduler, Status, Time, WorkerState,
+    Attempt, Config, DagConfig, DagError, DagJob, DagScheduler, Input, JobId, JobSpec, MEMORY,
+    OrderTerm, Output, Policy, Resources, RetryConfig, SLOTS, Scheduler, Status, Time, WorkerState,
 };
 
 /// A DAG layer over backfill with one roomy worker.
@@ -23,7 +23,9 @@ fn worker(id: u64, slots: usize, bytes: u64) -> WorkerState {
     WorkerState {
         id,
         class: "x".into(),
-        capacity: Resources::mem(bytes).with_slots(slots as u64),
+        capacity: Resources::new()
+            .with(MEMORY, bytes)
+            .with(SLOTS, slots as u64),
         ..Default::default()
     }
 }
@@ -43,7 +45,7 @@ fn job(id: JobId, deps: &[JobId]) -> DagJob {
     DagJob {
         spec: JobSpec {
             id,
-            demand: Resources::mem(1),
+            demand: Resources::new().with(MEMORY, 1),
             ..Default::default()
         },
         deps: deps.to_vec(),

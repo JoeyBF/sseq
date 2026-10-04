@@ -1,7 +1,7 @@
 //! Holds: reservations, their shadow backfill, and deferral to a faster worker.
 
 use super::{Job, Scheduler, Worker, order::ordered, placement::Score};
-use crate::{JobId, Resources, Time, WorkerId, WorkerState, WorkerView};
+use crate::{JobId, Time, WorkerId, resources::sub};
 
 /// A worker kept from a job on purpose although it might admit it: the one notion behind
 /// reservations, their shadow backfill and deferral. Each waiting job has at most one.
@@ -113,34 +113,26 @@ impl Scheduler {
     /// whose release lets the configured admission rule admit the holder (now, if it already
     /// does). `None` if some end is unknown or no release suffices.
     fn shadow_time(&self, w: &Worker, holder: JobId) -> Option<Time> {
-        let demand = &self.waiting.get(&holder)?.spec.demand;
-        let mut ends: Vec<(Time, &Resources)> = Vec::with_capacity(w.jobs.len());
+        let demand = self.demand(self.waiting.get(&holder)?);
+        let mut ends: Vec<(Time, &[u64])> = Vec::with_capacity(w.jobs.len());
         for j in w.jobs.keys() {
             let r = &self.running[j];
-            ends.push((self.expected_end(r)?, &r.job.spec.demand));
+            ends.push((self.expected_end(r)?, &r.job.demand));
         }
         ends.sort_by_key(|e| e.0);
         // The projection assumes a released job frees what it was placed with; the reported
         // usage cannot be predicted, so the hypothetical worker reports none above its baseline.
-        let state = WorkerState {
-            reported_used: Resources::ZERO,
-            ..w.state.clone()
-        };
-        let fits = |placed: &Resources, running| {
-            let view = WorkerView {
-                resources: &self.config.resources,
-                state: &state,
-                placed,
-                running,
-            };
-            self.admission.admits(demand, &view)
+        let view = w.view(&self.config.resources).without_reported_use();
+        let fits = |placed: &[u64], running| {
+            let view = view.clone().with_load(placed, running);
+            self.admission.admits(&demand, &view)
         };
         let mut placed = w.placed.clone();
         if fits(&placed, ends.len()) {
             return Some(self.now);
         }
         for (i, (end, d)) in ends.iter().enumerate() {
-            placed -= *d;
+            sub(&mut placed, d);
             if fits(&placed, ends.len() - i - 1) {
                 return Some(*end);
             }
@@ -211,10 +203,7 @@ impl Scheduler {
             {
                 continue;
             }
-            let score = (
-                ordered(-self.free_share(w, &Resources::ZERO)),
-                self.score(j, w),
-            );
+            let score = (ordered(-self.free_share(w, &self.zero)), self.score(j, w));
             if best.as_ref().is_none_or(|(b, _)| score < *b) {
                 best = Some((score, id));
             }

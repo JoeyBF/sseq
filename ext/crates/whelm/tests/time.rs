@@ -6,9 +6,9 @@ use std::{
 };
 
 use whelm::{
-    Config, DagConfig, DagJob, DagScheduler, Defer, Input, JobId, JobSpec, Output, Policy,
-    Reservations, Resources, Scheduler, SharedPolicy, Speculate, SpeedConfig, Time, WorkerState,
-    log::Logged,
+    Config, DagConfig, DagJob, DagScheduler, Defer, Input, JobId, JobSpec, MEMORY, Output, Policy,
+    Reservations, Resources, SLOTS, Scheduler, SharedPolicy, Speculate, SpeedConfig, Time,
+    WorkerState, log::Logged,
 };
 
 /// The latest representable time.
@@ -57,7 +57,7 @@ fn workers() -> [WorkerState; 2] {
     [(1, 1.0), (2, 4.0)].map(|(id, speed)| WorkerState {
         id,
         class: format!("w{id}"),
-        capacity: Resources::mem(100).with_slots(1),
+        capacity: Resources::new().with(MEMORY, 100).with(SLOTS, 1),
         speed,
         ..Default::default()
     })
@@ -67,7 +67,7 @@ fn workers() -> [WorkerState; 2] {
 fn job(id: JobId) -> JobSpec {
     JobSpec {
         id,
-        demand: Resources::mem(1),
+        demand: Resources::new().with(MEMORY, 1),
         work: Some([Duration::from_nanos(1), Duration::MAX][id as usize % 2]),
         due: Some(END),
         rank: Some(Duration::MAX),

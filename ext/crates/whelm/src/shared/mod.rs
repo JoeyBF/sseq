@@ -11,19 +11,21 @@
 //! ```
 //! use std::{sync::Arc, thread};
 //!
-//! use whelm::{Config, JobSpec, Resources, Scheduler, SharedPolicy, Time, WorkerState};
+//! use whelm::{
+//!     Config, JobSpec, MEMORY, Resources, SLOTS, Scheduler, SharedPolicy, Time, WorkerState, gb,
+//! };
 //!
 //! let shared = Arc::new(SharedPolicy::new(Scheduler::new(Config::fifo()), || {
 //!     Time::ORIGIN
 //! }));
 //! shared.worker_update(WorkerState {
 //!     id: 1,
-//!     capacity: Resources::mem_gb(8.0).with_slots(1),
+//!     capacity: Resources::new().with(MEMORY, gb(8.0)).with(SLOTS, 1),
 //!     ..Default::default()
 //! });
 //! let job = |id| JobSpec {
 //!     id,
-//!     demand: Resources::mem_gb(1.0),
+//!     demand: Resources::new().with(MEMORY, gb(1.0)),
 //!     ..Default::default()
 //! };
 //!
@@ -45,7 +47,7 @@
 //!     [(
 //!         1,
 //!         whelm::Verdict::Full {
-//!             dims: vec![whelm::ResourceId::SLOTS]
+//!             dims: vec![SLOTS.name]
 //!         }
 //!     )]
 //! );
@@ -105,7 +107,9 @@ impl<P: Policy> SharedPolicy<P> {
     ///     time::Duration,
     /// };
     ///
-    /// use whelm::{Config, JobSpec, Resources, Scheduler, SharedPolicy, Time, WorkerState};
+    /// use whelm::{
+    ///     Config, JobSpec, MEMORY, Resources, SLOTS, Scheduler, SharedPolicy, Time, WorkerState, gb,
+    /// };
     ///
     /// let time = Arc::new(Mutex::new(Time::ORIGIN));
     /// let clock = {
@@ -115,12 +119,12 @@ impl<P: Policy> SharedPolicy<P> {
     /// let shared = Arc::new(SharedPolicy::new(Scheduler::new(Config::default()), clock));
     /// shared.worker_update(WorkerState {
     ///     id: 1,
-    ///     capacity: Resources::mem_gb(8.0).with_slots(1),
+    ///     capacity: Resources::new().with(MEMORY, gb(8.0)).with(SLOTS, 1),
     ///     ..Default::default()
     /// });
     /// let job = |id| JobSpec {
     ///     id,
-    ///     demand: Resources::mem_gb(1.0),
+    ///     demand: Resources::new().with(MEMORY, gb(1.0)),
     ///     ..Default::default()
     /// };
     ///
@@ -161,17 +165,19 @@ impl<P: Policy> SharedPolicy<P> {
     /// ```
     /// use std::time::Duration;
     ///
-    /// use whelm::{Config, JobSpec, Resources, Scheduler, SharedPolicy, WorkerState};
+    /// use whelm::{
+    ///     Config, JobSpec, MEMORY, Resources, SLOTS, Scheduler, SharedPolicy, WorkerState, gb,
+    /// };
     ///
     /// let shared = SharedPolicy::with_system_clock(Scheduler::new(Config::default()));
     /// shared.worker_update(WorkerState {
     ///     id: 1,
-    ///     capacity: Resources::mem_gb(8.0).with_slots(4),
+    ///     capacity: Resources::new().with(MEMORY, gb(8.0)).with(SLOTS, 4),
     ///     ..Default::default()
     /// });
     /// let lease = shared.lease(JobSpec {
     ///     id: 1,
-    ///     demand: Resources::mem_gb(1.0),
+    ///     demand: Resources::new().with(MEMORY, gb(1.0)),
     ///     ..Default::default()
     /// });
     /// assert!(lease.waited() < Duration::from_secs(60)); // the worker was free
@@ -187,17 +193,19 @@ impl<P: Policy> SharedPolicy<P> {
     /// cancels the job.
     ///
     /// ```
-    /// use whelm::{Config, JobSpec, Resources, Scheduler, SharedPolicy, Time, WorkerState};
+    /// use whelm::{
+    ///     Config, JobSpec, MEMORY, Resources, SLOTS, Scheduler, SharedPolicy, Time, WorkerState, gb,
+    /// };
     ///
     /// let shared = SharedPolicy::new(Scheduler::new(Config::default()), || Time::ORIGIN);
     /// shared.worker_update(WorkerState {
     ///     id: 1,
-    ///     capacity: Resources::mem_gb(8.0).with_slots(1),
+    ///     capacity: Resources::new().with(MEMORY, gb(8.0)).with(SLOTS, 1),
     ///     ..Default::default()
     /// });
     /// let lease = shared.lease(JobSpec {
     ///     id: 1,
-    ///     demand: Resources::mem_gb(1.0),
+    ///     demand: Resources::new().with(MEMORY, gb(1.0)),
     ///     ..Default::default()
     /// });
     /// assert_eq!((lease.worker(), lease.attempt()), (1, 1));
@@ -208,7 +216,8 @@ impl<P: Policy> SharedPolicy<P> {
     ///
     /// # Panics
     ///
-    /// If a job with this id is already leased here.
+    /// If a job with this id is already leased here, or the policy rejects the job
+    /// ([`Output::Rejected`](crate::Output::Rejected)).
     pub fn lease(&self, job: JobSpec) -> Lease<'_, P> {
         self.lease_until(job, None)
             .unwrap_or_else(|_| unreachable!("no deadline"))
@@ -216,19 +225,20 @@ impl<P: Policy> SharedPolicy<P> {
 
     /// [`lease`](Self::lease), giving up after `timeout`: the job is then withdrawn from the
     /// policy and returned. A start made concurrently with the timeout is still returned. A
-    /// `timeout` too long for an [`Instant`](std::time::Instant) never expires.
+    /// `timeout` too long for an [`Instant`](std::time::Instant) never expires. It panics as
+    /// [`lease`](Self::lease) does.
     ///
     /// With no worker, the job never starts:
     ///
     /// ```
     /// use std::time::Duration;
     ///
-    /// use whelm::{Config, JobSpec, Resources, Scheduler, SharedPolicy, Time};
+    /// use whelm::{Config, JobSpec, MEMORY, Resources, Scheduler, SharedPolicy, Time, gb};
     ///
     /// let shared = SharedPolicy::new(Scheduler::new(Config::default()), || Time::ORIGIN);
     /// let job = JobSpec {
     ///     id: 1,
-    ///     demand: Resources::mem_gb(1.0),
+    ///     demand: Resources::new().with(MEMORY, gb(1.0)),
     ///     ..Default::default()
     /// };
     /// let back = shared
@@ -253,7 +263,9 @@ impl<P: Policy> SharedPolicy<P> {
     /// ```
     /// use std::{sync::Arc, thread};
     ///
-    /// use whelm::{Config, JobSpec, Resources, Scheduler, SharedPolicy, Time, WorkerState};
+    /// use whelm::{
+    ///     Config, JobSpec, MEMORY, Resources, SLOTS, Scheduler, SharedPolicy, Time, WorkerState, gb,
+    /// };
     ///
     /// let shared = Arc::new(SharedPolicy::new(Scheduler::new(Config::default()), || {
     ///     Time::ORIGIN
@@ -263,7 +275,7 @@ impl<P: Policy> SharedPolicy<P> {
     ///     move || {
     ///         let lease = shared.lease(JobSpec {
     ///             id: 1,
-    ///             demand: Resources::mem_gb(1.0),
+    ///             demand: Resources::new().with(MEMORY, gb(1.0)),
     ///             ..Default::default()
     ///         });
     ///         let worker = lease.worker();
@@ -276,7 +288,7 @@ impl<P: Policy> SharedPolicy<P> {
     /// }
     /// shared.worker_update(WorkerState {
     ///     id: 5,
-    ///     capacity: Resources::mem_gb(8.0).with_slots(1),
+    ///     capacity: Resources::new().with(MEMORY, gb(8.0)).with(SLOTS, 1),
     ///     ..Default::default()
     /// });
     /// assert_eq!(task.join().unwrap(), 5);
@@ -293,19 +305,22 @@ impl<P: Policy> SharedPolicy<P> {
     /// [`Lease::complete`] cancels the retry.
     ///
     /// ```
-    /// use whelm::{Config, FailKind, JobSpec, Resources, Scheduler, SharedPolicy, Time, WorkerState};
+    /// use whelm::{
+    ///     Config, FailKind, JobSpec, MEMORY, Resources, SLOTS, Scheduler, SharedPolicy, Time,
+    ///     WorkerState, gb,
+    /// };
     ///
     /// let shared = SharedPolicy::new(Scheduler::new(Config::fifo()), || Time::ORIGIN);
     /// for w in [1, 2] {
     ///     shared.worker_update(WorkerState {
     ///         id: w,
-    ///         capacity: Resources::mem_gb(8.0).with_slots(1),
+    ///         capacity: Resources::new().with(MEMORY, gb(8.0)).with(SLOTS, 1),
     ///         ..Default::default()
     ///     });
     /// }
     /// let lease = shared.lease(JobSpec {
     ///     id: 7,
-    ///     demand: Resources::mem_gb(1.0),
+    ///     demand: Resources::new().with(MEMORY, gb(1.0)),
     ///     ..Default::default()
     /// });
     /// assert_eq!(lease.worker(), 1);
@@ -357,7 +372,8 @@ impl<P: Policy> SharedPolicy<P> {
     /// };
     ///
     /// use whelm::{
-    ///     Config, JobSpec, Reservations, Resources, Scheduler, SharedPolicy, Time, WorkerState,
+    ///     Config, JobSpec, MEMORY, Reservations, Resources, SLOTS, Scheduler, SharedPolicy, Time,
+    ///     WorkerState, gb,
     /// };
     ///
     /// let time = Arc::new(Mutex::new(Time::ORIGIN));
@@ -368,12 +384,12 @@ impl<P: Policy> SharedPolicy<P> {
     /// let shared = Arc::new(SharedPolicy::new(Scheduler::new(Config::default()), clock));
     /// shared.worker_update(WorkerState {
     ///     id: 1,
-    ///     capacity: Resources::mem_gb(8.0).with_slots(4),
+    ///     capacity: Resources::new().with(MEMORY, gb(8.0)).with(SLOTS, 4),
     ///     ..Default::default()
     /// });
     /// let first = shared.lease(JobSpec {
     ///     id: 1,
-    ///     demand: Resources::mem_gb(4.0),
+    ///     demand: Resources::new().with(MEMORY, gb(4.0)),
     ///     ..Default::default()
     /// });
     /// let big = thread::spawn({
@@ -382,7 +398,7 @@ impl<P: Policy> SharedPolicy<P> {
     ///         shared
     ///             .lease(JobSpec {
     ///                 id: 2,
-    ///                 demand: Resources::mem_gb(6.0),
+    ///                 demand: Resources::new().with(MEMORY, gb(6.0)),
     ///                 ..Default::default()
     ///             })
     ///             .complete()
@@ -422,17 +438,19 @@ impl<P: Policy> SharedPolicy<P> {
     /// submitted through `f` are cancelled: nobody waits for them.
     ///
     /// ```
-    /// use whelm::{Config, Input, JobSpec, Policy, Resources, Scheduler, SharedPolicy, Time};
+    /// use whelm::{
+    ///     Config, Input, JobSpec, MEMORY, Policy, Resources, SLOTS, Scheduler, SharedPolicy, Time, gb,
+    /// };
     ///
     /// let shared = SharedPolicy::new(Scheduler::new(Config::default()), || Time::ORIGIN);
     /// shared.worker_update(whelm::WorkerState {
     ///     id: 1,
-    ///     capacity: Resources::mem_gb(8.0).with_slots(1),
+    ///     capacity: Resources::new().with(MEMORY, gb(8.0)).with(SLOTS, 1),
     ///     ..Default::default()
     /// });
     /// let job = JobSpec {
     ///     id: 1,
-    ///     demand: Resources::mem_gb(1.0),
+    ///     demand: Resources::new().with(MEMORY, gb(1.0)),
     ///     ..Default::default()
     /// };
     /// shared.with(|p, now| p.handle(Input::Submit(job), now));
@@ -472,17 +490,20 @@ impl<P: Policy + Send + 'static> SharedPolicy<P> {
     /// #     thread,
     /// #     time::Duration,
     /// # };
-    /// # use whelm::{Config, JobSpec, Resources, Scheduler, SharedPolicy, Time, WorkerState};
+    /// # use whelm::{
+    /// #     Config, JobSpec, MEMORY, Resources, SLOTS, Scheduler, SharedPolicy, Time, WorkerState,
+    /// #     gb,
+    /// # };
     /// # let time = Arc::new(Mutex::new(Time::ORIGIN));
     /// # let clock = {
     /// #     let time = time.clone();
     /// #     move || *time.lock().unwrap()
     /// # };
     /// # let shared = Arc::new(SharedPolicy::new(Scheduler::new(Config::default()), clock));
-    /// # let job = |id, gb| JobSpec { id, demand: Resources::mem_gb(gb), ..Default::default() };
+    /// # let job = |id, size| JobSpec { id, demand: Resources::new().with(MEMORY, gb(size)), ..Default::default() };
     /// # shared.worker_update(WorkerState {
     /// #     id: 1,
-    /// #     capacity: Resources::mem_gb(8.0).with_slots(4),
+    /// #     capacity: Resources::new().with(MEMORY, gb(8.0)).with(SLOTS, 4),
     /// #     ..Default::default()
     /// # });
     /// # let first = shared.lease(job(1, 4.0));
