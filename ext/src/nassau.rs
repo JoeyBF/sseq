@@ -188,6 +188,16 @@ impl MilnorSubalgebra {
             .unwrap_or(1)
     }
 
+    /// The internal degree of a signature: entry `i` stands for `xi_{i + 1}`, of degree
+    /// `2^{i + 1} - 1`.
+    fn signature_degree(signature: &[PPartEntry]) -> i32 {
+        signature
+            .iter()
+            .enumerate()
+            .map(|(i, &r)| ((1i32 << (i + 1)) - 1) * r as i32)
+            .sum()
+    }
+
     /// Give a list of basis elements in degree `degree` that has signature `signature`.
     ///
     /// Only basis elements coming from generators of degree strictly less than `max_gen_degree`
@@ -497,6 +507,197 @@ enum Magic {
     Fix = -3,
 }
 
+/// Signature-shift reuse: serving every nonzero signature's matrix from one zero-signature block.
+///
+/// For a signature `sigma` of degree `delta`, `Sq(R) g -> Sq(R - sigma) g` is a bijection from the
+/// basis elements of signature `sigma` in degree `t` onto those of signature zero in degree
+/// `t - delta`, and in the signature-graded pieces it carries the differential to the
+/// differential. So the masked matrix the signature step at `(s, t)` reduces is, row for row and
+/// column for column, a prefix of the zero-signature matrix of `d_{s - 1}` in degree `t - delta`.
+/// That matrix depends only on `(s, t - delta, profile)`, so one build serves every signature of
+/// that degree, in every bidegree of row `s` that shifts onto it.
+///
+/// The block for key `(s, d, P)` has
+///
+/// * rows: the zero-signature basis of `C_{s - 1}` in degree `d`, from every generator of degree
+///   `<= d` (no generator of higher degree has an element there);
+/// * columns: the zero-signature basis of `C_{s - 2}` in degree `d`, from every generator of
+///   degree `<= d`, stored masked.
+///
+/// A consumer at `(s, t)` reads all the rows and a prefix of the columns: its own column bound,
+/// `t - 1`, keeps exactly the generators of degree `<= d` when `delta >= 2`, and one degree fewer
+/// when `delta == 1`. Building the full block reads `C_{s - 2}`'s generators of degree `d`, which
+/// for `delta == 1` (`d = t - 1`) another worker may still be adding, so such a consumer builds a
+/// private, narrower block on a miss and does not share it.
+///
+/// A miss always rebuilds, so the cache can only change how often a block is built, never what
+/// any step computes.
+mod shift {
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    use fp::matrix::Matrix;
+    use rustc_hash::FxHashMap;
+
+    /// `(s, d, profile)`: the block of `d_{s - 1}` in degree `d` under that subalgebra.
+    ///
+    /// The profile is part of the key because neighbouring bidegrees may pick different
+    /// subalgebras, and a different zero signature is a different mask in the same degree.
+    #[derive(Clone, PartialEq, Eq, Hash, Debug)]
+    pub(super) struct Key {
+        pub s: i32,
+        pub degree: i32,
+        pub profile: Vec<u8>,
+    }
+
+    /// See the [module documentation](self).
+    pub(super) type Block = Arc<Matrix>;
+
+    /// Counters describing how blocks were obtained. All are cumulative over the resolution.
+    #[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct ShiftStats {
+        /// Signature steps that asked for a block.
+        pub lookups: usize,
+        /// Lookups served from the cache.
+        pub hits: usize,
+        /// Misses that built a full block and cached it.
+        pub shared_builds: usize,
+        /// Misses that built a private block (`delta == 1`) and did not cache it.
+        pub private_builds: usize,
+        /// Shared builds that found the key already present when inserting: two consumers raced.
+        pub duplicate_builds: usize,
+    }
+
+    /// Lock-free tallies behind [`ShiftStats`].
+    #[derive(Default)]
+    struct Counters {
+        lookups: AtomicUsize,
+        hits: AtomicUsize,
+        shared_builds: AtomicUsize,
+        private_builds: AtomicUsize,
+        duplicate_builds: AtomicUsize,
+    }
+
+    /// The per-resolution block cache.
+    pub(super) struct ShiftCache {
+        enabled: bool,
+        /// Check every block a step uses against a direct build of that step's matrix.
+        verify: bool,
+        blocks: Mutex<FxHashMap<Key, Block>>,
+        counters: Counters,
+    }
+
+    impl ShiftCache {
+        /// An empty cache, enabled.
+        pub fn new() -> Self {
+            Self {
+                enabled: true,
+                verify: false,
+                blocks: Mutex::new(FxHashMap::default()),
+                counters: Counters::default(),
+            }
+        }
+
+        /// Whether signature steps take their matrix from a block.
+        pub fn enabled(&self) -> bool {
+            self.enabled
+        }
+
+        /// See [`Self::enabled`].
+        pub fn set_enabled(&mut self, enabled: bool) {
+            self.enabled = enabled;
+        }
+
+        /// Whether every use is cross-checked against a direct build.
+        pub fn verify(&self) -> bool {
+            self.verify
+        }
+
+        /// See [`Self::verify`].
+        pub fn set_verify(&mut self, verify: bool) {
+            self.verify = verify;
+        }
+
+        /// The cached block for `key`, counting the lookup.
+        pub fn lookup(&self, key: &Key) -> Option<Block> {
+            self.counters.lookups.fetch_add(1, Ordering::Relaxed);
+            let found = self.blocks.lock().unwrap().get(key).cloned();
+            if found.is_some() {
+                self.counters.hits.fetch_add(1, Ordering::Relaxed);
+            }
+            found
+        }
+
+        /// Record a private build, which is never cached.
+        pub fn note_private_build(&self) {
+            self.counters.private_builds.fetch_add(1, Ordering::Relaxed);
+        }
+
+        /// Cache a block a consumer built on a miss.
+        pub fn insert_built(&self, key: Key, block: Block) {
+            self.counters.shared_builds.fetch_add(1, Ordering::Relaxed);
+            if self.blocks.lock().unwrap().insert(key, block).is_some() {
+                self.counters
+                    .duplicate_builds
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        /// Drop every block.
+        pub fn clear(&self) {
+            self.blocks.lock().unwrap().clear();
+        }
+
+        /// A snapshot of the counters.
+        pub fn stats(&self) -> ShiftStats {
+            let c = &self.counters;
+            ShiftStats {
+                lookups: c.lookups.load(Ordering::Relaxed),
+                hits: c.hits.load(Ordering::Relaxed),
+                shared_builds: c.shared_builds.load(Ordering::Relaxed),
+                private_builds: c.private_builds.load(Ordering::Relaxed),
+                duplicate_builds: c.duplicate_builds.load(Ordering::Relaxed),
+            }
+        }
+    }
+}
+
+pub use shift::ShiftStats;
+
+/// Full-width rows of `d_{s - 1}` on a signature's target basis, indexed by position in the
+/// signature's target mask: all of them, or only those a step reads.
+enum SigRows {
+    All(Matrix),
+    Some {
+        /// Position in `rows` of each masked index, or `usize::MAX` where it was not built.
+        pos: Vec<usize>,
+        rows: Matrix,
+    },
+}
+
+impl SigRows {
+    /// The row for masked index `i`, which must have been built.
+    fn row(&self, i: usize) -> FpSlice<'_> {
+        match self {
+            Self::All(m) => m.row(i),
+            Self::Some { pos, rows } => {
+                debug_assert_ne!(pos[i], usize::MAX, "row {i} was not built");
+                rows.row(pos[i])
+            }
+        }
+    }
+
+    /// The width of every row.
+    fn columns(&self) -> usize {
+        match self {
+            Self::All(m) => m.columns(),
+            Self::Some { rows, .. } => rows.columns(),
+        }
+    }
+}
+
 /// A resolution of `S_2` using Nassau's algorithm.
 ///
 /// This aims to have an API similar to that of
@@ -513,6 +714,7 @@ pub struct Resolution<M: ZeroModule<Algebra = MilnorAlgebra>> {
     target: Arc<FiniteChainComplex<M>>,
     chain_maps: OnceBiVec<Arc<FreeModuleHomomorphism<M>>>,
     save_dir: SaveDirectory,
+    shift: shift::ShiftCache,
 }
 
 impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
@@ -554,7 +756,25 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
             target,
             max_degree,
             save_dir,
+            shift: shift::ShiftCache::new(),
         })
+    }
+
+    /// Whether nonzero signatures take their matrix from a shared zero-signature block (see
+    /// [`ShiftStats`]). On by default; turning it off changes no result, only the work done.
+    pub fn set_shift_reuse(&mut self, enabled: bool) {
+        self.shift.set_enabled(enabled);
+    }
+
+    /// Cross-check every shared block a signature step uses against a direct build of that step's
+    /// matrix, panicking on any difference. Slow; for tests.
+    pub fn set_shift_verify(&mut self, verify: bool) {
+        self.shift.set_verify(verify);
+    }
+
+    /// How the signature steps have obtained their blocks so far.
+    pub fn shift_stats(&self) -> ShiftStats {
+        self.shift.stats()
     }
 
     fn add_generators(&self, b: Bidegree, num_new_gens: usize) {
@@ -610,7 +830,7 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
         scratch: &mut FpVector,
         signature: &[PPartEntry],
         next_mask: &[usize],
-        full_matrix: &Matrix,
+        full_rows: &SigRows,
         masked_matrix: &AugmentedMatrix<2>,
     ) -> io::Result<()> {
         let f = match f {
@@ -643,9 +863,9 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
             scratch.as_slice_mut().assign(preimage);
             scratch.to_bytes(f)?;
 
-            scratch.set_scratch_vector_size(full_matrix.columns());
+            scratch.set_scratch_vector_size(full_rows.columns());
             for (i, _) in preimage.iter_nonzero() {
-                scratch.as_slice_mut().add(full_matrix.row(i), 1);
+                scratch.as_slice_mut().add(full_rows.row(i), 1);
             }
             scratch.to_bytes(f)?;
         }
@@ -675,6 +895,73 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
             }
         }
         Ok(())
+    }
+
+    /// Build the zero-signature block of `d_{s - 1}` in degree `d` (see [`shift`]), with columns
+    /// from the generators of `C_{s - 2}` of degree `< col_bound`.
+    ///
+    /// Reads the generators of `C_{s - 1}` of degree `<= d` and those of `C_{s - 2}` of degree
+    /// `< col_bound`, all of which must be registered.
+    fn build_shift_block(
+        &self,
+        s: i32,
+        d: i32,
+        subalgebra: &MilnorSubalgebra,
+        col_bound: i32,
+    ) -> Matrix {
+        let p = self.prime();
+        let target = &*self.modules[s - 1];
+        let next = &*self.modules[s - 2];
+        let algebra = target.algebra();
+        let zero_sig = subalgebra.zero_signature();
+
+        let rows: Vec<usize> = subalgebra
+            .signature_mask(&algebra, target, d, &zero_sig, Some(d + 1))
+            .collect();
+        let cols: Vec<usize> = subalgebra
+            .signature_mask(&algebra, next, d, &zero_sig, Some(col_bound))
+            .collect();
+        // By minimality the image of a degree-`d` element involves only generators of degree `< d`,
+        // so this width holds every row.
+        let next_dim = next.dimension_from_gens_below(d, col_bound);
+
+        let full = {
+            let _guard = ParallelGuard::new();
+            self.differentials[s - 1].get_partial_matrix_restricted(d, &rows, next_dim)
+        };
+        let mut block = Matrix::new(p, rows.len(), cols.len());
+        block.as_slice_mut().add_masked(&full, &cols);
+        block
+    }
+
+    /// The block the signature step for `signature` at `b` reads, from the cache or built on a
+    /// miss. See [`shift`] for which builds may be shared.
+    fn shift_block(
+        &self,
+        b: Bidegree,
+        subalgebra: &MilnorSubalgebra,
+        signature: &[PPartEntry],
+    ) -> shift::Block {
+        let delta = MilnorSubalgebra::signature_degree(signature);
+        let d = b.t() - delta;
+        let key = shift::Key {
+            s: b.s(),
+            degree: d,
+            profile: subalgebra.profile.clone(),
+        };
+        if let Some(block) = self.shift.lookup(&key) {
+            tracing::debug!(target: "nassau::shift", %b, d, hit = true, "shift block");
+            return block;
+        }
+        tracing::debug!(target: "nassau::shift", %b, d, hit = false, "shift block");
+        if delta >= 2 {
+            let block = Arc::new(self.build_shift_block(b.s(), d, subalgebra, d + 1));
+            self.shift.insert_built(key, Arc::clone(&block));
+            block
+        } else {
+            self.shift.note_private_build();
+            Arc::new(self.build_shift_block(b.s(), d, subalgebra, b.t() - 1))
+        }
     }
 
     #[tracing::instrument(skip(self), fields(%b, %subalgebra, num_new_gens, density))]
@@ -753,6 +1040,7 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
         masked_matrix.segment(1, 1).add_identity();
         masked_matrix.row_reduce();
         let kernel = masked_matrix.compute_kernel();
+        let full_matrix = SigRows::All(full_matrix);
 
         Self::write_qi(
             &mut f,
@@ -832,20 +1120,61 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                 Some(next_bound),
             ));
 
-            let full_matrix = {
-                let _guard = ParallelGuard::new();
-                self.differentials[b.s() - 1].get_partial_matrix_restricted(
-                    b.t(),
-                    &target_mask,
-                    next_dim,
-                )
-            };
-
             let mut masked_matrix =
                 AugmentedMatrix::new(p, target_mask.len(), [next_mask.len(), target_mask.len()]);
-            masked_matrix
-                .segment(0, 0)
-                .add_masked(&full_matrix, &next_mask);
+
+            // With shift reuse the masked matrix comes from a block and only the full-width rows
+            // the lift reads are built, after the reduction says which those are.
+            let full_matrix = if self.shift.enabled() && !target_mask.is_empty() {
+                let block = self.shift_block(b, &subalgebra, &signature);
+                assert_eq!(
+                    block.rows(),
+                    target_mask.len(),
+                    "block rows at {b} {signature:?}"
+                );
+                assert!(
+                    block.columns() >= next_mask.len(),
+                    "block narrower than its consumer at {b} {signature:?}"
+                );
+                if self.shift.verify() {
+                    let direct = self.differentials[b.s() - 1].get_partial_matrix_restricted(
+                        b.t(),
+                        &target_mask,
+                        next_dim,
+                    );
+                    for (i, row) in direct.iter().enumerate() {
+                        let mut expected = FpVector::new(p, next_mask.len());
+                        expected.as_slice_mut().add_masked(row, 1, &next_mask);
+                        let mut actual = FpVector::new(p, next_mask.len());
+                        actual
+                            .as_slice_mut()
+                            .add(block.row(i).restrict(0, next_mask.len()), 1);
+                        assert_eq!(
+                            expected, actual,
+                            "shift block row {i} differs from the direct build at {b} \
+                             {signature:?}"
+                        );
+                    }
+                }
+                let mut segment = masked_matrix.segment(0, 0);
+                for (i, mut row) in segment.iter_mut().enumerate() {
+                    row.add(block.row(i).restrict(0, next_mask.len()), 1);
+                }
+                None
+            } else {
+                let full_matrix = {
+                    let _guard = ParallelGuard::new();
+                    self.differentials[b.s() - 1].get_partial_matrix_restricted(
+                        b.t(),
+                        &target_mask,
+                        next_dim,
+                    )
+                };
+                masked_matrix
+                    .segment(0, 0)
+                    .add_masked(&full_matrix, &next_mask);
+                Some(full_matrix)
+            };
             masked_matrix.segment(1, 1).add_identity();
             masked_matrix.row_reduce();
 
@@ -853,19 +1182,68 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
             let pivots = qi.pivots().unwrap();
             let preimage = qi.preimage();
 
-            for (x, dx) in xs.iter_mut().zip(&mut dxs) {
-                scratch.set_scratch_vector_size(target_mask.len());
-                let mut row = 0;
-                for (i, &v) in next_mask.iter().enumerate() {
-                    if pivots[i] < 0 {
-                        continue;
+            // Each generator's correction, in masked target coordinates. Generators are
+            // independent -- each reads only its own `dx` -- so every correction can be found
+            // before any is applied.
+            let corrections: Vec<FpVector> = dxs
+                .iter()
+                .map(|dx| {
+                    let mut correction = FpVector::new(p, target_mask.len());
+                    let mut row = 0;
+                    for (i, &v) in next_mask.iter().enumerate() {
+                        if pivots[i] < 0 {
+                            continue;
+                        }
+                        if dx.entry(v) != 0 {
+                            correction.as_slice_mut().add(preimage.row(row), 1);
+                        }
+                        row += 1;
                     }
-                    if dx.entry(v) != 0 {
-                        scratch.as_slice_mut().add(preimage.row(row), 1);
+                    correction
+                })
+                .collect();
+
+            let full_matrix = match full_matrix {
+                Some(m) => SigRows::All(m),
+                None => {
+                    // The rows the corrections touch, and those the quasi-inverse save file maps
+                    // through.
+                    let mut wanted = vec![false; target_mask.len()];
+                    for correction in &corrections {
+                        for (i, _) in correction.iter_nonzero() {
+                            wanted[i] = true;
+                        }
                     }
-                    row += 1;
+                    if f.is_some() {
+                        let end = masked_matrix.end[0];
+                        for &row in masked_matrix.pivots()[0..end].iter().filter(|&&r| r >= 0) {
+                            for (i, _) in
+                                masked_matrix.row_segment(row as usize, 1, 1).iter_nonzero()
+                            {
+                                wanted[i] = true;
+                            }
+                        }
+                    }
+                    let mut pos = vec![usize::MAX; target_mask.len()];
+                    let mut inputs = Vec::new();
+                    for (i, _) in wanted.iter().enumerate().filter(|(_, w)| **w) {
+                        pos[i] = inputs.len();
+                        inputs.push(target_mask[i]);
+                    }
+                    let rows = {
+                        let _guard = ParallelGuard::new();
+                        self.differentials[b.s() - 1].get_partial_matrix_restricted(
+                            b.t(),
+                            &inputs,
+                            next_dim,
+                        )
+                    };
+                    SigRows::Some { pos, rows }
                 }
-                for (i, _) in scratch.iter_nonzero() {
+            };
+
+            for ((x, dx), correction) in xs.iter_mut().zip(&mut dxs).zip(&corrections) {
+                for (i, _) in correction.iter_nonzero() {
                     x.add_basis_element(target_mask[i], 1);
                     dx.as_slice_mut().add(full_matrix.row(i), 1);
                 }
@@ -1250,6 +1628,7 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                 &stuck[..stuck.len().min(5)]
             );
         });
+        self.shift.clear();
     }
 }
 
@@ -1640,6 +2019,7 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> ChainComplex for Resolution<M> {
                 }
             }
         }
+        self.shift.clear();
     }
 
     fn next_homological_degree(&self) -> i32 {
@@ -1950,6 +2330,130 @@ mod tests {
             "secondary d2 chart differs between Nassau (save-backed, relaxed schedule) and \
              standard"
         );
+    }
+
+    /// Resolve `S_2` through `max`, with shift reuse on or off, optionally into a save directory.
+    fn resolve_s2(
+        max: Bidegree,
+        shift_reuse: bool,
+        verify: bool,
+        save: Option<&std::path::Path>,
+    ) -> Resolution<algebra::module::FDModule<MilnorAlgebra>> {
+        let mut res = crate::utils::construct_nassau("S_2", save.map(|p| p.to_owned())).unwrap();
+        res.set_shift_reuse(shift_reuse);
+        res.set_shift_verify(verify);
+        res.compute_through_stem(max);
+        res
+    }
+
+    /// Every generator and every differential agree, bit for bit.
+    fn assert_same_resolution<M: ZeroModule<Algebra = MilnorAlgebra>>(
+        a: &Resolution<M>,
+        b: &Resolution<M>,
+        max: Bidegree,
+    ) {
+        assert_eq!(a.graded_dimension_string(), b.graded_dimension_string());
+        let mut compared = 0;
+        for s in 0..=max.s() {
+            for t in 0..=max.n() + s {
+                let bd = Bidegree::s_t(s, t);
+                assert_eq!(
+                    a.has_computed_bidegree(bd),
+                    b.has_computed_bidegree(bd),
+                    "{bd}"
+                );
+                if !a.has_computed_bidegree(bd) {
+                    continue;
+                }
+                let n = a.number_of_gens_in_bidegree(bd);
+                assert_eq!(n, b.number_of_gens_in_bidegree(bd), "generators at {bd}");
+                for i in 0..n {
+                    assert_eq!(
+                        a.differential(s).output(t, i),
+                        b.differential(s).output(t, i),
+                        "differential on generator {i} at {bd}"
+                    );
+                    compared += 1;
+                }
+            }
+        }
+        assert!(compared > 0, "compared no differentials");
+    }
+
+    /// Every file under `root`, by relative path, with its bytes.
+    fn dir_contents(root: &std::path::Path) -> std::collections::BTreeMap<String, Vec<u8>> {
+        fn walk(
+            root: &std::path::Path,
+            dir: &std::path::Path,
+            out: &mut std::collections::BTreeMap<String, Vec<u8>>,
+        ) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    walk(root, &path, out);
+                } else {
+                    let rel = path
+                        .strip_prefix(root)
+                        .unwrap()
+                        .to_string_lossy()
+                        .into_owned();
+                    out.insert(rel, std::fs::read(&path).unwrap());
+                }
+            }
+        }
+        let mut out = std::collections::BTreeMap::new();
+        walk(root, root, &mut out);
+        out
+    }
+
+    /// Resolve with and without shift reuse, saving both, and require identical differentials and
+    /// byte-identical save files (differentials and quasi-inverses).
+    fn check_shift_reuse_identical(max: Bidegree) {
+        let dir_on = tempfile::TempDir::new().unwrap();
+        let dir_off = tempfile::TempDir::new().unwrap();
+        let on = resolve_s2(max, true, false, Some(dir_on.path()));
+        let off = resolve_s2(max, false, false, Some(dir_off.path()));
+        assert_same_resolution(&on, &off, max);
+
+        let stats = on.shift_stats();
+        assert!(stats.hits > 0, "shift reuse never hit: {stats:?}");
+        assert_eq!(off.shift_stats(), ShiftStats::default());
+
+        let files_on = dir_contents(dir_on.path());
+        let files_off = dir_contents(dir_off.path());
+        assert!(
+            files_on.keys().any(|k| k.contains("nassau_qi")),
+            "no qi files saved"
+        );
+        assert_eq!(
+            files_on.keys().collect::<Vec<_>>(),
+            files_off.keys().collect::<Vec<_>>()
+        );
+        for (name, bytes) in &files_on {
+            assert!(bytes == &files_off[name], "save file {name} differs");
+        }
+    }
+
+    /// Every block a signature step reads is a prefix of a direct build of that step's matrix.
+    #[test]
+    fn test_shift_block_matches_direct_build() {
+        let max = Bidegree::n_s(30, 12);
+        let res = resolve_s2(max, true, true, None);
+        let stats = res.shift_stats();
+        assert!(stats.hits > 0 && stats.shared_builds > 0, "{stats:?}");
+    }
+
+    #[test]
+    fn test_shift_reuse_identical() {
+        check_shift_reuse_identical(Bidegree::n_s(30, 12));
+    }
+
+    /// [`test_shift_reuse_identical`] across the `A(1)`/`A(2)` boundaries. Run with `--release
+    /// --ignored`.
+    #[test]
+    #[ignore]
+    fn test_shift_reuse_identical_large() {
+        check_shift_reuse_identical(Bidegree::n_s(80, 40));
     }
 
     #[test]
