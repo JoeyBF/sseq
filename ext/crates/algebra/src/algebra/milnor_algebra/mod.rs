@@ -58,12 +58,6 @@ pub struct MilnorAlgebraInner<F: MilnorShape> {
     multiplication_table: OnceVec<OnceVec<Vec<Vec<FpVector>>>>,
 }
 
-impl<F: MilnorShape> std::fmt::Display for MilnorAlgebraInner<F> {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(f, "MilnorAlgebra(p={})", self.prime())
-    }
-}
-
 impl<F: MilnorShape> MilnorAlgebraInner<F> {
     pub fn new(p: ValidPrime, unstable_enabled: bool) -> Self {
         Self::new_with_profile(p, MilnorProfile::default(), unstable_enabled)

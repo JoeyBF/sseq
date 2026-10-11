@@ -29,7 +29,7 @@ use anyhow::anyhow;
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use fp::{
     matrix::{AugmentedMatrix, Matrix, Subspace},
-    prime::{Prime, ValidPrime, iter::BitflagIterator},
+    prime::ValidPrime,
     vector::{FpSlice, FpSliceMut, FpVector},
 };
 use itertools::{Either, Itertools};
@@ -155,41 +155,10 @@ impl Subalgebra {
             .collect()
     }
 
-    /// The slope of the vanishing line of `Ext_B`: `Ext_B^{s, t}` vanishes for
-    /// `t >= slope * (s + 1) + top_degree` (Theorem 3.1).
-    ///
-    /// This is the slope of the steepest polynomial generator of the May spectral sequence: `v_k`
-    /// for each `Q_k`, and for each `ξ_i^{p^j}` either `h_{i, j}` at `p = 2` or `b_{i, j}` at odd
-    /// primes. The exterior `h_{i, j}` at odd primes are bounded by the top degree.
-    fn vanishing_slope(&self) -> i64 {
-        let algebra = &self.algebra;
-        let p = algebra.prime().as_i32() as i64;
-        let q = algebra.q() as i64;
-        let profile = self.algebra.profile();
-        let tau_degrees = combinatorics::tau_degrees(algebra.prime());
-        let xi_degrees = combinatorics::xi_degrees(algebra.prime());
-
-        let exterior = if algebra.has_exterior() {
-            profile.q_part
-        } else {
-            0
-        };
-        let polynomial = profile.p_part.iter().enumerate().flat_map(|(i, &e)| {
-            (0..e).map(move |j| {
-                let h = q * xi_degrees[i] as i64 * p.pow(j);
-                if p == 2 { h } else { h * p / 2 }
-            })
-        });
-        BitflagIterator::set_bit_iterator(exterior as u64)
-            .map(|k| tau_degrees[k] as i64)
-            .chain(polynomial)
-            .max()
-            .unwrap_or(0)
-    }
-
     /// Whether `b` is in the vanishing region of `self`, where the algorithm applies.
     fn is_applicable(&self, b: Bidegree) -> bool {
-        b.t() as i64 >= self.vanishing_slope() * (b.s() as i64 + 1) + self.top_degree as i64
+        let slope = self.algebra.vanishing_slope().unwrap();
+        b.t() as i64 >= slope * (b.s() as i64 + 1) + self.top_degree as i64
     }
 
     /// Give a list of basis elements in degree `degree` that has signature `signature`, i.e. whose
@@ -422,32 +391,10 @@ fn zero_signature() -> MilnorBasisElement {
     MilnorBasisElement::default()
 }
 
-/// `A(n)`, `E(Q_0..Q_n)` or `F_p` where it is one of those, and the profile otherwise.
+/// The name of the subalgebra; see [`MilnorAlgebra`]'s `Display`.
 impl std::fmt::Display for Subalgebra {
     fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let algebra = &self.algebra;
-        let MilnorProfile { q_part, p_part, .. } = algebra.profile();
-        let len = p_part.len();
-        let is_an = p_part.iter().rev().copied().eq(1..=len as PPartEntry);
-        if algebra.has_exterior() {
-            let top_q = (u32::BITS - q_part.leading_zeros()) as usize;
-            let q_is_initial = q_part.count_ones() as usize == top_q;
-            if *q_part == 0 && len == 0 {
-                write!(out, "F_{}", algebra.prime())
-            } else if is_an && q_is_initial && top_q == len + 1 {
-                write!(out, "A({len})")
-            } else if len == 0 && q_is_initial {
-                write!(out, "E(Q_0..Q_{})", top_q - 1)
-            } else {
-                write!(out, "B({q_part:#b}; {})", p_part.iter().join(","))
-            }
-        } else if len == 0 {
-            write!(out, "F_{}", algebra.prime())
-        } else if is_an {
-            write!(out, "A({})", len - 1)
-        } else {
-            write!(out, "B({})", p_part.iter().join(","))
-        }
+        self.algebra.fmt(out)
     }
 }
 
@@ -1583,10 +1530,7 @@ mod tests {
     /// $A^{\mathbb{C}}/\tau$.
     #[cfg(feature = "odd-primes")]
     fn c_tau() -> MilnorAlgebra {
-        use algebra::milnor_algebra::MilnorKind;
-
-        let profile = MilnorProfile::default();
-        MilnorAlgebra::of_kind(MilnorKind::MotivicModTau, fp::prime::TWO, profile, false).unwrap()
+        MilnorAlgebra::motivic_mod_tau(MilnorProfile::default(), false)
     }
 
     /// Resolve `target` through `max` with this and the standard algorithm, and check that the

@@ -1,8 +1,12 @@
 //! Every [`MilnorAlgebra`] as a sub-Hopf-algebra of its [kind](MilnorKind), cut out by its profile.
 
 use fp::prime::{Prime, iter::BitflagIterator};
+use itertools::Itertools;
 
-use super::{MilnorAlgebra, MilnorBasisElement, MilnorKind, MilnorProfile, PPart, PPartEntry};
+use super::{
+    Exterior, MilnorAlgebra, MilnorAlgebraInner, MilnorBasisElement, MilnorKind, MilnorProfile,
+    MilnorShape, NoExterior, PPart, PPartEntry,
+};
 use crate::algebra::{Algebra, combinatorics};
 
 impl MilnorAlgebra {
@@ -14,7 +18,15 @@ impl MilnorAlgebra {
         if !profile.is_valid() {
             return None;
         }
-        Self::of_kind(self.kind(), self.prime(), profile, false)
+        let p = self.prime();
+        Some(match self {
+            Self::Polynomial(_) => {
+                MilnorAlgebraInner::<NoExterior>::new_with_profile(p, profile, false).into()
+            }
+            Self::Exterior(_) => {
+                MilnorAlgebraInner::<Exterior>::new_with_profile(p, profile, false).into()
+            }
+        })
     }
 
     /// The trivial sub-Hopf-algebra of this algebra's kind, the ground field.
@@ -95,6 +107,39 @@ impl MilnorAlgebra {
         )
     }
 
+    /// The slope of the vanishing line of Ext over this algebra, or `None` where
+    /// [`Self::top_degree`] is: $\mathrm{Ext}^{s, t}$ vanishes for
+    /// `t >= slope * (s + 1) + top_degree` ([Nassau](https://arxiv.org/abs/1910.04063), Theorem
+    /// 3.1).
+    ///
+    /// This is the slope of the steepest polynomial generator of the May spectral sequence: `v_k`
+    /// for each `Q_k`, and for each `ξ_i^{p^j}` either `h_{i, j}` at `p = 2` or `b_{i, j}` at odd
+    /// primes. The exterior `h_{i, j}` at odd primes are bounded by the top degree.
+    pub fn vanishing_slope(&self) -> Option<i64> {
+        self.top_degree()?;
+        let p = self.prime().as_i32() as i64;
+        let q = self.q() as i64;
+        let tau_degrees = combinatorics::tau_degrees(self.prime());
+        let xi_degrees = combinatorics::xi_degrees(self.prime());
+
+        let polynomial = self
+            .profile()
+            .p_part
+            .iter()
+            .enumerate()
+            .flat_map(|(i, &e)| {
+                (0..e).map(move |j| {
+                    let h = q * xi_degrees[i] as i64 * p.pow(j);
+                    if p == 2 { h } else { h * p / 2 }
+                })
+            });
+        BitflagIterator::set_bit_iterator(self.exterior_part() as u64)
+            .map(|k| tau_degrees[k] as i64)
+            .chain(polynomial)
+            .max()
+            .or(Some(0))
+    }
+
     /// The component in this algebra of `elt`, a basis element of an algebra containing it.
     ///
     /// The component of $Q(E)P(R)$ is $Q(E \cap E')P(R \bmod p^e)$, where $E'$ and $e$ are this
@@ -142,6 +187,59 @@ impl MilnorAlgebra {
             let width = std::cmp::min(self.profile().get_p_part(i), PPart::width(i));
             mask | ((1u64 << width) - 1) << PPart::shift(i)
         }))
+    }
+}
+
+/// The whole algebra as its kind and prime, and otherwise `F_p`, `A(n)` or `E(Q_0..Q_n)` where the
+/// profile is one of those, and the profile itself where not. An unbounded tail is written `..`.
+impl<F: MilnorShape> std::fmt::Display for MilnorAlgebraInner<F> {
+    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let p = self.prime();
+        let profile = self.profile();
+        if *profile == MilnorProfile::default() {
+            return write!(
+                out,
+                "{} at p = {p}",
+                MilnorKind::from_shape(p, F::HAS_EXTERIOR)
+            );
+        }
+        let MilnorProfile {
+            truncated,
+            q_part,
+            p_part,
+        } = profile;
+        let len = p_part.len();
+        let is_an = *truncated && p_part.iter().rev().copied().eq(1..=len as PPartEntry);
+        let entries = p_part
+            .iter()
+            .map(|&e| {
+                if e == PPartEntry::MAX {
+                    "inf".to_string()
+                } else {
+                    e.to_string()
+                }
+            })
+            .chain((!truncated).then(|| "..".to_string()))
+            .join(",");
+        if F::HAS_EXTERIOR {
+            let top_q = (u32::BITS - q_part.leading_zeros()) as usize;
+            let q_is_initial = q_part.count_ones() as usize == top_q;
+            if *truncated && *q_part == 0 && len == 0 {
+                write!(out, "F_{p}")
+            } else if is_an && q_is_initial && top_q == len + 1 {
+                write!(out, "A({len})")
+            } else if *truncated && len == 0 && q_is_initial {
+                write!(out, "E(Q_0..Q_{})", top_q - 1)
+            } else {
+                write!(out, "B({q_part:#b}; {entries})")
+            }
+        } else if *truncated && len == 0 {
+            write!(out, "F_{p}")
+        } else if is_an {
+            write!(out, "A({})", len - 1)
+        } else {
+            write!(out, "B({entries})")
+        }
     }
 }
 
@@ -272,13 +370,7 @@ mod tests {
     #[cfg(feature = "odd-primes")]
     #[test]
     fn test_exterior() {
-        let c_tau = MilnorAlgebra::of_kind(
-            MilnorKind::MotivicModTau,
-            TWO,
-            MilnorProfile::default(),
-            false,
-        )
-        .unwrap();
+        let c_tau = MilnorAlgebra::motivic_mod_tau(MilnorProfile::default(), false);
         for (q_part, p_part) in [(0b1, &[][..]), (0b11, &[]), (0b11, &[1]), (0b111, &[2, 1])] {
             check(&c_tau, &sub(&c_tau, q_part, p_part), 30);
         }
@@ -304,34 +396,78 @@ mod tests {
         assert!(!sub(&p3, 0b111, &[]).is_subalgebra_of(&a1));
 
         // The reduced powers are their own kind, not a subalgebra of A.
-        let reduced = MilnorAlgebra::of_kind(
-            MilnorKind::ReducedPowers,
-            p3.prime(),
-            MilnorProfile::default(),
-            false,
-        )
-        .unwrap();
+        let reduced = MilnorAlgebra::reduced_powers(p3.prime(), MilnorProfile::default(), false);
         assert_eq!(reduced.kind(), MilnorKind::ReducedPowers);
         assert!(!reduced.is_subalgebra_of(&p3));
         check(&reduced, &sub(&reduced, 0, &[2, 1]), 60);
     }
 
-    /// Each kind exists at the primes it should, with the shape it should.
+    /// Each constructor builds the kind it names, and the names of whole algebras say so.
     #[cfg(feature = "odd-primes")]
     #[test]
     fn test_kinds() {
         let p3 = fp::prime::ValidPrime::new(3);
-        let kind = |k, p| MilnorAlgebra::of_kind(k, p, MilnorProfile::default(), false);
-        assert_eq!(MilnorAlgebra::new(TWO, false).kind(), MilnorKind::Classical);
-        assert!(kind(MilnorKind::ReducedPowers, TWO).is_none());
-        assert!(kind(MilnorKind::MotivicModTau, p3).is_none());
-        for (k, p) in [
-            (MilnorKind::Classical, TWO),
-            (MilnorKind::Classical, p3),
-            (MilnorKind::MotivicModTau, TWO),
-            (MilnorKind::ReducedPowers, p3),
+        let full = MilnorProfile::default;
+        for (algebra, kind, name) in [
+            (
+                MilnorAlgebra::new(TWO, false),
+                MilnorKind::Classical,
+                "A at p = 2",
+            ),
+            (
+                MilnorAlgebra::new(p3, false),
+                MilnorKind::Classical,
+                "A at p = 3",
+            ),
+            (
+                MilnorAlgebra::motivic_mod_tau(full(), false),
+                MilnorKind::MotivicModTau,
+                "A_C/tau at p = 2",
+            ),
+            (
+                MilnorAlgebra::reduced_powers(p3, full(), false),
+                MilnorKind::ReducedPowers,
+                "P at p = 3",
+            ),
         ] {
-            assert_eq!(kind(k, p).unwrap().kind(), k);
+            assert_eq!(algebra.kind(), kind);
+            assert_eq!(algebra.to_string(), name);
         }
+    }
+
+    /// The reduced powers do not exist at `p = 2`.
+    #[test]
+    #[should_panic(expected = "only defined at odd primes")]
+    fn test_reduced_powers_at_two() {
+        MilnorAlgebra::reduced_powers(TWO, MilnorProfile::default(), false);
+    }
+
+    /// The names of the trivial algebra, an `A(n)`, another finite profile and an infinite one.
+    #[test]
+    fn test_fmt() {
+        let ambient = ambient_at_two();
+        assert_eq!(ambient.ground_field().to_string(), "F_2");
+        assert_eq!(sub(&ambient, 0, &[3, 2, 1]).to_string(), "A(2)");
+        assert_eq!(sub(&ambient, 0, &[3, 3, 2, 1]).to_string(), "B(3,3,2,1)");
+        let infinite = MilnorProfile {
+            truncated: false,
+            q_part: !0,
+            p_part: vec![2, 1],
+        };
+        assert_eq!(
+            ambient.with_profile(infinite).unwrap().to_string(),
+            "B(2,1,..)"
+        );
+    }
+
+    /// The vanishing slope is that of the steepest May generator, and only finite algebras have
+    /// one.
+    #[test]
+    fn test_vanishing_slope() {
+        let ambient = ambient_at_two();
+        assert_eq!(ambient.vanishing_slope(), None);
+        assert_eq!(ambient.ground_field().vanishing_slope(), Some(0));
+        // h_{1,1} in A(1) has degree 2, h_{2,0} has degree 3.
+        assert_eq!(sub(&ambient, 0, &[2, 1]).vanishing_slope(), Some(3));
     }
 }
