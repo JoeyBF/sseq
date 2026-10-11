@@ -61,6 +61,8 @@ pub(crate) struct PendingRegistration {
     /// Whether to extend the chain map by zero. The main path does; the save-load path never did,
     /// and this keeps that difference rather than quietly changing it.
     extend_chain_map: bool,
+    /// The zero step's masked matrix, kept for a publication that extends it into a shift block.
+    zero_block: Option<Matrix>,
 }
 
 /// See [`resolution::SenderData`](../resolution/struct.SenderData.html).
@@ -71,6 +73,8 @@ struct SenderData {
     retry: bool,
     /// What the worker computed and the scheduler still has to register, if anything.
     pending: Option<PendingRegistration>,
+    /// Set when this reports the publication with this index rather than a computed bidegree.
+    publication: Option<u32>,
     sender: mpsc::Sender<Self>,
 }
 
@@ -86,6 +90,20 @@ impl SenderData {
                 b,
                 retry: false,
                 pending,
+                publication: None,
+                sender: sender.clone(),
+            })
+            .unwrap()
+    }
+
+    /// Report publication `id` at `b` as done, or (`retry`) hand it back to be respawned.
+    pub(crate) fn send_publication(b: Bidegree, id: u32, retry: bool, sender: mpsc::Sender<Self>) {
+        sender
+            .send(Self {
+                b,
+                retry,
+                pending: None,
+                publication: Some(id),
                 sender: sender.clone(),
             })
             .unwrap()
@@ -100,6 +118,7 @@ impl SenderData {
                 b,
                 retry: true,
                 pending: None,
+                publication: None,
                 sender: sender.clone(),
             })
             .unwrap()
@@ -196,6 +215,28 @@ impl MilnorSubalgebra {
             .enumerate()
             .map(|(i, &r)| ((1i32 << (i + 1)) - 1) * r as i32)
             .sum()
+    }
+
+    /// The distinct degrees of the nonzero signatures, ascending.
+    fn signature_degrees(&self) -> Vec<i32> {
+        let top = self.top_degree() as usize;
+        let mut reachable = vec![false; top + 1];
+        reachable[0] = true;
+        for (i, &entry) in self.profile.iter().enumerate() {
+            let weight = (1usize << (i + 1)) - 1;
+            let mut next = vec![false; top + 1];
+            for d in (0..=top).filter(|&d| reachable[d]) {
+                for r in 0..(1usize << entry) {
+                    if d + r * weight <= top {
+                        next[d + r * weight] = true;
+                    }
+                }
+            }
+            reachable = next;
+        }
+        (1..=top as i32)
+            .filter(|&d| reachable[d as usize])
+            .collect()
     }
 
     /// Give a list of basis elements in degree `degree` that has signature `signature`.
@@ -568,6 +609,17 @@ mod shift {
         pub private_builds: usize,
         /// Shared builds that found the key already present when inserting: two consumers raced.
         pub duplicate_builds: usize,
+        /// Blocks published by extending a zero step's matrix, which costs no multiply.
+        pub published_from_zero_step: usize,
+        /// Blocks published by a separate build, for a profile the zero step did not use.
+        pub published_by_build: usize,
+        /// Publications skipped: the block was already present, its consumers were all done, or
+        /// (for an extension) the zero step did not run.
+        pub publications_skipped: usize,
+        /// Blocks dropped because every consumer the schedule knows of had finished.
+        pub evictions: usize,
+        /// Blocks still held when a run ended, which a complete schedule never leaves.
+        pub dropped_at_end: usize,
     }
 
     /// Lock-free tallies behind [`ShiftStats`].
@@ -578,12 +630,20 @@ mod shift {
         shared_builds: AtomicUsize,
         private_builds: AtomicUsize,
         duplicate_builds: AtomicUsize,
+        published_from_zero_step: AtomicUsize,
+        published_by_build: AtomicUsize,
+        publications_skipped: AtomicUsize,
+        evictions: AtomicUsize,
+        dropped_at_end: AtomicUsize,
     }
 
     /// The per-resolution block cache.
     pub(super) struct ShiftCache {
         enabled: bool,
-        /// Check every block a step uses against a direct build of that step's matrix.
+        /// Whether `compute_through_stem` schedules publications.
+        publish: bool,
+        /// Check every block a step uses against a direct build of that step's matrix, and every
+        /// published extension against a fresh build.
         verify: bool,
         blocks: Mutex<FxHashMap<Key, Block>>,
         counters: Counters,
@@ -594,6 +654,7 @@ mod shift {
         pub fn new() -> Self {
             Self {
                 enabled: true,
+                publish: true,
                 verify: false,
                 blocks: Mutex::new(FxHashMap::default()),
                 counters: Counters::default(),
@@ -608,6 +669,50 @@ mod shift {
         /// See [`Self::enabled`].
         pub fn set_enabled(&mut self, enabled: bool) {
             self.enabled = enabled;
+        }
+
+        /// Whether `compute_through_stem` publishes blocks ahead of their consumers.
+        pub fn publish(&self) -> bool {
+            self.enabled && self.publish
+        }
+
+        /// See [`Self::publish`].
+        pub fn set_publish(&mut self, publish: bool) {
+            self.publish = publish;
+        }
+
+        /// Whether `key` is present, without counting a lookup.
+        pub fn contains(&self, key: &Key) -> bool {
+            self.blocks.lock().unwrap().contains_key(key)
+        }
+
+        /// Record a skipped publication.
+        pub fn note_publication_skipped(&self) {
+            self.counters
+                .publications_skipped
+                .fetch_add(1, Ordering::Relaxed);
+        }
+
+        /// Cache a block published ahead of its consumers.
+        pub fn insert_published(&self, key: Key, block: Block, from_zero_step: bool) {
+            let counter = if from_zero_step {
+                &self.counters.published_from_zero_step
+            } else {
+                &self.counters.published_by_build
+            };
+            counter.fetch_add(1, Ordering::Relaxed);
+            if self.blocks.lock().unwrap().insert(key, block).is_some() {
+                self.counters
+                    .duplicate_builds
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        /// Drop `key`, whose consumers are all done.
+        pub fn evict(&self, key: &Key) {
+            if self.blocks.lock().unwrap().remove(key).is_some() {
+                self.counters.evictions.fetch_add(1, Ordering::Relaxed);
+            }
         }
 
         /// Whether every use is cross-checked against a direct build.
@@ -645,9 +750,13 @@ mod shift {
             }
         }
 
-        /// Drop every block.
+        /// Drop every block at the end of a run.
         pub fn clear(&self) {
-            self.blocks.lock().unwrap().clear();
+            let mut blocks = self.blocks.lock().unwrap();
+            self.counters
+                .dropped_at_end
+                .fetch_add(blocks.len(), Ordering::Relaxed);
+            blocks.clear();
         }
 
         /// A snapshot of the counters.
@@ -659,6 +768,11 @@ mod shift {
                 shared_builds: c.shared_builds.load(Ordering::Relaxed),
                 private_builds: c.private_builds.load(Ordering::Relaxed),
                 duplicate_builds: c.duplicate_builds.load(Ordering::Relaxed),
+                published_from_zero_step: c.published_from_zero_step.load(Ordering::Relaxed),
+                published_by_build: c.published_by_build.load(Ordering::Relaxed),
+                publications_skipped: c.publications_skipped.load(Ordering::Relaxed),
+                evictions: c.evictions.load(Ordering::Relaxed),
+                dropped_at_end: c.dropped_at_end.load(Ordering::Relaxed),
             }
         }
     }
@@ -696,6 +810,25 @@ impl SigRows {
             Self::Some { rows, .. } => rows.columns(),
         }
     }
+}
+
+/// A shift block [`Resolution::compute_through_stem`] publishes, and the soft edges out of it.
+struct PlannedBlock {
+    key: shift::Key,
+    subalgebra: MilnorSubalgebra,
+    /// Whether the zero step of `(key.s, key.degree)` used this profile, so its matrix can be
+    /// extended into the block rather than the block built.
+    after_compute: bool,
+    /// The bidegrees with a signature step that reads this block.
+    consumers: Vec<Bidegree>,
+}
+
+/// The publication nodes of a run and their soft edges, stored explicitly.
+struct PublicationPlan {
+    /// In the order of the graph's `Phase::Publish` indices.
+    blocks: Vec<PlannedBlock>,
+    /// The inverse of `PlannedBlock::consumers`: the blocks each bidegree's steps read.
+    consumes: HashMap<Bidegree, Vec<u32>>,
 }
 
 /// A resolution of `S_2` using Nassau's algorithm.
@@ -764,6 +897,13 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
     /// [`ShiftStats`]). On by default; turning it off changes no result, only the work done.
     pub fn set_shift_reuse(&mut self, enabled: bool) {
         self.shift.set_enabled(enabled);
+    }
+
+    /// Whether [`Self::compute_through_stem`] publishes shift blocks as explicit graph nodes, ahead
+    /// of the signature steps that read them. On by default (with shift reuse); a consumer that
+    /// finds no block builds it itself, so this changes no result, only the work done.
+    pub fn set_publish_blocks(&mut self, enabled: bool) {
+        self.shift.set_publish(enabled);
     }
 
     /// Cross-check every shared block a signature step uses against a direct build of that step's
@@ -964,11 +1104,121 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
         }
     }
 
+    /// Extend the zero step's masked matrix at `(s, d)` into the full block of that degree.
+    ///
+    /// The zero step read the generators of `C_{s - 1}` of degree `< d` and those of `C_{s - 2}`
+    /// of degree `< d - 1`, so its matrix is the block's top-left corner. Below it go the
+    /// generators of `C_{s - 1}` of degree `d`, whose only element in degree `d` is the generator
+    /// itself, with its registered differential as the row. To its right go the zero-signature
+    /// elements on the generators of `C_{s - 2}` of degree `d - 1` and `d`: for a nontrivial
+    /// profile the zero-signature floor is at least 2, so those are the degree-`d` generators
+    /// themselves, which minimality keeps out of every image. Their columns are zero.
+    ///
+    /// Reads the generators of degree `d` of both rows below, which must be registered.
+    fn extend_zero_block(
+        &self,
+        s: i32,
+        d: i32,
+        subalgebra: &MilnorSubalgebra,
+        zero_block: &Matrix,
+    ) -> Matrix {
+        assert!(
+            subalgebra.zero_signature_floor() >= 2,
+            "{subalgebra} has no shift blocks"
+        );
+        let p = self.prime();
+        let target = &*self.modules[s - 1];
+        let next = &*self.modules[s - 2];
+        let algebra = target.algebra();
+        let zero_sig = subalgebra.zero_signature();
+
+        let cols: Vec<usize> = subalgebra
+            .signature_mask(&algebra, next, d, &zero_sig, Some(d + 1))
+            .collect();
+        let new_gens = target.number_of_gens_in_degree(d);
+        let mut block = Matrix::new(p, zero_block.rows() + new_gens, cols.len());
+        for (i, row) in zero_block.iter().enumerate() {
+            block
+                .row_mut(i)
+                .slice_mut(0, zero_block.columns())
+                .add(row, 1);
+        }
+        for g in 0..new_gens {
+            let dg = self.differentials[s - 1].output(d, g);
+            let mut row = block.row_mut(zero_block.rows() + g);
+            for (k, &c) in cols.iter().enumerate() {
+                if c < dg.len() && dg.entry(c) != 0 {
+                    row.set_entry(k, 1);
+                }
+            }
+        }
+        block
+    }
+
+    /// The shift blocks [`Self::compute_through_stem`] publishes through `max`, and which signature
+    /// steps read each.
+    ///
+    /// Signature step `(s, t, sigma)` reads block `(s, t - deg(sigma), P)` with `P` the
+    /// subalgebra `(s, t)` uses. A block is published only where everything it reads is in the
+    /// region; that leaves out only blocks read by `deg(sigma) == 1` steps alone, which build
+    /// privately anyway.
+    fn publication_plan(&self, max: Bidegree) -> PublicationPlan {
+        let min = self.min_degree();
+        let in_region =
+            |b: Bidegree| (0..=max.s()).contains(&b.s()) && b.t() >= min && b.n() <= max.n();
+        let profile_at =
+            |b: Bidegree| MilnorSubalgebra::optimal_for(b - Bidegree::s_t(0, self.max_degree));
+
+        let mut planned: std::collections::BTreeMap<(i32, i32, Vec<u8>), PlannedBlock> =
+            std::collections::BTreeMap::new();
+        let mut degrees: HashMap<Vec<u8>, Vec<i32>> = HashMap::new();
+        for s in 2..=max.s() {
+            for t in min..=(max.n() + s) {
+                let consumer = Bidegree::s_t(s, t);
+                let subalgebra = profile_at(consumer);
+                let deltas = degrees
+                    .entry(subalgebra.profile.clone())
+                    .or_insert_with(|| subalgebra.signature_degrees());
+                for &delta in deltas.iter().take_while(|&&delta| delta <= t) {
+                    let b = Bidegree::s_t(s, t - delta);
+                    if !in_region(b - Bidegree::s_t(2, 0)) {
+                        continue;
+                    }
+                    planned
+                        .entry((s, b.t(), subalgebra.profile.clone()))
+                        .or_insert_with(|| PlannedBlock {
+                            key: shift::Key {
+                                s,
+                                degree: b.t(),
+                                profile: subalgebra.profile.clone(),
+                            },
+                            after_compute: profile_at(b).profile == subalgebra.profile,
+                            subalgebra: subalgebra.clone(),
+                            consumers: Vec::new(),
+                        })
+                        .consumers
+                        .push(consumer);
+                }
+            }
+        }
+
+        // `(s, degree, profile)` order is the graph's bidegree order.
+        let blocks: Vec<PlannedBlock> = planned.into_values().collect();
+        let mut consumes: HashMap<Bidegree, Vec<u32>> = HashMap::new();
+        for (id, block) in blocks.iter().enumerate() {
+            for &c in &block.consumers {
+                consumes.entry(c).or_default().push(id as u32);
+            }
+        }
+        PublicationPlan { blocks, consumes }
+    }
+
     #[tracing::instrument(skip(self), fields(%b, %subalgebra, num_new_gens, density))]
     fn step_resolution_with_subalgebra(
         &self,
         b: Bidegree,
         subalgebra: MilnorSubalgebra,
+        keep_zero_block: bool,
     ) -> anyhow::Result<PendingRegistration> {
         // Takes the count rather than reading it back from the module: registration now happens in
         // a later phase, so `number_of_gens_in_bidegree` would still be zero here. `density` is
@@ -1037,6 +1287,11 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
         masked_matrix
             .segment(0, 0)
             .add_masked(&full_matrix, &next_mask);
+        let zero_block = keep_zero_block.then(|| {
+            let mut block = Matrix::new(p, target_masked_dim, next_masked_dim);
+            block.as_slice_mut().add_masked(&full_matrix, &next_mask);
+            block
+        });
         masked_matrix.segment(1, 1).add_identity();
         masked_matrix.row_reduce();
         let kernel = masked_matrix.compute_kernel();
@@ -1273,6 +1528,7 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
             target_dim,
             write_save: true,
             extend_chain_map: true,
+            zero_block,
         })
     }
 
@@ -1386,9 +1642,13 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
     ///
     /// `None` means the bidegree registered itself: rows 0 and 1 keep the strict schedule, so their
     /// row order is already guaranteed and there is nothing for the scheduler to sequence.
+    ///
+    /// `keep_zero_block` asks for the zero step's matrix back, see
+    /// [`PendingRegistration::zero_block`].
     fn step_resolution_with_result(
         &self,
         b: Bidegree,
+        keep_zero_block: bool,
     ) -> anyhow::Result<Option<PendingRegistration>> {
         let p = self.prime();
         let set_data = || {
@@ -1441,6 +1701,7 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                 // Read from a save file; rewriting it would be pointless work.
                 write_save: false,
                 extend_chain_map: false,
+                zero_block: None,
             }));
         }
 
@@ -1453,6 +1714,7 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
         let pending = self.step_resolution_with_subalgebra(
             b,
             MilnorSubalgebra::optimal_for(b - Bidegree::s_t(0, self.max_degree)),
+            keep_zero_block,
         )?;
         Ok(Some(pending))
     }
@@ -1470,6 +1732,7 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
             target_dim,
             write_save,
             extend_chain_map,
+            zero_block: _,
         } = pending;
 
         self.add_generators(b, num_new_gens);
@@ -1503,9 +1766,37 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
     }
 
     /// [`Self::step_resolution_with_result`], panicking rather than returning the error.
-    fn step_resolution(&self, b: Bidegree) -> Option<PendingRegistration> {
-        self.step_resolution_with_result(b)
+    fn step_resolution(&self, b: Bidegree, keep_zero_block: bool) -> Option<PendingRegistration> {
+        self.step_resolution_with_result(b, keep_zero_block)
             .unwrap_or_else(|e| panic!("Error computing bidegree {b}: {e}"))
+    }
+
+    /// How far back in its own row `Compute(b)` actually reads.
+    ///
+    /// The image is built at the ZERO signature, and no operation below the subalgebra's
+    /// zero-signature floor carries it, so generators within that many degrees contribute nothing
+    /// to the image and need not be registered yet. `signature_matrix` is passed the matching
+    /// bound, so the two agree by construction.
+    ///
+    /// Rows 0 and 1 keep the strict schedule: `step0` and `step1` read their targets through full
+    /// matrices rather than the signature-masked image, so this reasoning does not apply to them.
+    fn same_row_dep(&self, b: Bidegree) -> Bidegree {
+        if b.s() <= 1 {
+            return b - Bidegree::s_t(0, 1);
+        }
+        let subalgebra = MilnorSubalgebra::optimal_for(b - Bidegree::s_t(0, self.max_degree));
+        b - Bidegree::s_t(0, subalgebra.zero_signature_floor())
+    }
+
+    /// The publications of `plan`, as graph inputs.
+    fn publications(plan: &PublicationPlan) -> Vec<depgraph::Publication> {
+        plan.blocks
+            .iter()
+            .map(|block| depgraph::Publication {
+                b: Bidegree::s_t(block.key.s, block.key.degree),
+                after_compute: block.after_compute,
+            })
+            .collect()
     }
 
     /// This function resolves up till a fixed stem instead of a fixed t.
@@ -1524,25 +1815,42 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
         self.extend_through_degree(max.s());
         self.algebra().compute_basis(max.t());
 
-        // How far back in its own row `b` actually reads.
-        //
-        // The image is built at the ZERO signature, and no operation below the subalgebra's
-        // zero-signature floor carries it, so generators within that many degrees contribute
-        // nothing to the image and need not be registered yet. `signature_matrix` is passed the
-        // matching bound, so the two agree by construction.
-        //
-        // Rows 0 and 1 keep the strict schedule: `step0` and `step1` read their targets through
-        // full matrices rather than the signature-masked image, so this reasoning does not apply to
-        // them.
-        let same_row_dep = |b: Bidegree| {
-            if b.s() <= 1 {
-                return b - Bidegree::s_t(0, 1);
-            }
-            let subalgebra = MilnorSubalgebra::optimal_for(b - Bidegree::s_t(0, self.max_degree));
-            b - Bidegree::s_t(0, subalgebra.zero_signature_floor())
+        // Shift blocks: which steps read which block, so each is dropped after its last reader,
+        // and, when publishing, one `Publish` node per block.
+        let plan = self.shift.enabled().then(|| self.publication_plan(max));
+        let publications = match &plan {
+            Some(plan) if self.shift.publish() => Self::publications(plan),
+            _ => Vec::new(),
         };
+        let keep_zero_block: std::collections::HashSet<Bidegree> = publications
+            .iter()
+            .filter(|p| p.after_compute)
+            .map(|p| p.b)
+            .collect();
+        for (block, p) in plan.iter().flat_map(|plan| &plan.blocks).zip(&publications) {
+            tracing::debug!(
+                target: "nassau::depgraph",
+                node = "publish",
+                b = %p.b,
+                profile = ?block.key.profile,
+                after_compute = p.after_compute,
+                consumers = ?block.consumers,
+                "planned"
+            );
+        }
+        // Readers not yet finished, per block.
+        let mut remaining: Vec<usize> = plan
+            .iter()
+            .flat_map(|plan| &plan.blocks)
+            .map(|block| block.consumers.len())
+            .collect();
 
-        let mut graph = depgraph::Graph::new(self.min_degree(), max, same_row_dep);
+        let mut graph = depgraph::Graph::new(
+            self.min_degree(),
+            max,
+            |b| self.same_row_dep(b),
+            publications,
+        );
 
         let tracing_span = tracing::Span::current();
         maybe_rayon::in_place_scope(|scope| {
@@ -1558,17 +1866,38 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                     SenderData::send(b, None, sender);
                 } else {
                     let tracing_span = tracing_span.clone();
+                    let keep_zero_block = keep_zero_block.contains(&b);
                     scope.spawn(move |_| {
                         let _tracing_guard = tracing_span.enter();
                         if crate::utils::parallel::is_in_parallel() {
                             SenderData::send_retry(b, sender);
                             return;
                         }
-                        let pending = self.step_resolution(b);
+                        let pending = self.step_resolution(b, keep_zero_block);
                         SenderData::send(b, pending, sender);
                     });
                 }
             };
+
+            // A publication whose zero step used another profile builds its block on a worker.
+            let spawn_publication = |b: Bidegree, id: u32, sender: mpsc::Sender<SenderData>| {
+                let block = &plan.as_ref().unwrap().blocks[id as usize];
+                let tracing_span = tracing_span.clone();
+                scope.spawn(move |_| {
+                    let _tracing_guard = tracing_span.enter();
+                    if crate::utils::parallel::is_in_parallel() {
+                        SenderData::send_publication(b, id, true, sender);
+                        return;
+                    }
+                    let m = self.build_shift_block(b.s(), b.t(), &block.subalgebra, b.t() + 1);
+                    self.shift
+                        .insert_published(block.key.clone(), Arc::new(m), false);
+                    SenderData::send_publication(b, id, false, sender);
+                });
+            };
+
+            // Zero steps' matrices, waiting for the publications that extend them.
+            let mut zero_blocks: HashMap<Bidegree, Matrix> = HashMap::new();
 
             // A computed bidegree's registration, waiting for its `Register` node to come up.
             let mut payloads: HashMap<Bidegree, Option<PendingRegistration>> = HashMap::new();
@@ -1592,6 +1921,57 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                             }
                             graph.complete(node);
                         }
+                        Phase::Publish(id) => {
+                            let block = &plan.as_ref().unwrap().blocks[id as usize];
+                            let zero_block = block
+                                .after_compute
+                                .then(|| zero_blocks.remove(&b))
+                                .flatten();
+                            let wanted =
+                                remaining[id as usize] > 0 && !self.shift.contains(&block.key);
+                            tracing::debug!(
+                                target: "nassau::depgraph",
+                                node = "publish",
+                                %b,
+                                profile = ?block.key.profile,
+                                wanted,
+                                from_zero_step = zero_block.is_some(),
+                                "dispatched"
+                            );
+                            if wanted && !block.after_compute {
+                                in_flight += 1;
+                                spawn_publication(b, id, sender.clone());
+                                continue;
+                            }
+                            match zero_block.filter(|_| wanted) {
+                                Some(zero_block) => {
+                                    let m = self.extend_zero_block(
+                                        b.s(),
+                                        b.t(),
+                                        &block.subalgebra,
+                                        &zero_block,
+                                    );
+                                    if self.shift.verify() {
+                                        let built = self.build_shift_block(
+                                            b.s(),
+                                            b.t(),
+                                            &block.subalgebra,
+                                            b.t() + 1,
+                                        );
+                                        assert!(m == built, "extended zero block differs at {b}");
+                                    }
+                                    self.shift.insert_published(
+                                        block.key.clone(),
+                                        Arc::new(m),
+                                        true,
+                                    );
+                                }
+                                // Not wanted, or the zero step did not run (the bidegree was
+                                // already present or loaded): its readers build it themselves.
+                                None => self.shift.note_publication_skipped(),
+                            }
+                            graph.complete(node);
+                        }
                     }
                 }
 
@@ -1602,7 +1982,8 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                 let Ok(SenderData {
                     b,
                     retry,
-                    pending,
+                    mut pending,
+                    publication,
                     sender,
                 }) = receiver.recv()
                 else {
@@ -1611,11 +1992,34 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                 if retry {
                     // Bounced off a worker already inside a parallel section. Still in flight; hand
                     // it back out without touching the graph.
-                    spawn_compute(b, sender);
+                    match publication {
+                        Some(id) => spawn_publication(b, id, sender),
+                        None => spawn_compute(b, sender),
+                    }
                     continue;
                 }
                 in_flight -= 1;
+                if let Some(id) = publication {
+                    // Its last reader may have finished while it was being built.
+                    if remaining[id as usize] == 0 {
+                        self.shift
+                            .evict(&plan.as_ref().unwrap().blocks[id as usize].key);
+                    }
+                    graph.complete(Node::publish(b, id));
+                    continue;
+                }
+                if let Some(zero_block) = pending.as_mut().and_then(|p| p.zero_block.take()) {
+                    zero_blocks.insert(b, zero_block);
+                }
                 payloads.insert(b, pending);
+                if let Some(plan) = &plan {
+                    for &id in plan.consumes.get(&b).into_iter().flatten() {
+                        remaining[id as usize] -= 1;
+                        if remaining[id as usize] == 0 {
+                            self.shift.evict(&plan.blocks[id as usize].key);
+                        }
+                    }
+                }
                 graph.complete(Node::compute(b));
             }
 
@@ -1635,14 +2039,17 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
 mod depgraph {
     use sseq::coordinates::Bidegree;
 
-    /// Which half of a bidegree's work a [`Node`] stands for.
+    /// Which part of a bidegree's work a [`Node`] stands for.
     #[derive(Clone, Copy, PartialEq, Eq, Debug)]
     pub enum Phase {
         Compute,
         Register,
+        /// Publish the shift block with this index into the graph's publish list (see
+        /// [`Graph::new`]).
+        Publish(u32),
     }
 
-    /// One half of a bidegree's work.
+    /// One part of a bidegree's work.
     #[derive(Clone, Copy, PartialEq, Eq, Debug)]
     pub struct Node {
         pub phase: Phase,
@@ -1665,6 +2072,28 @@ mod depgraph {
                 b,
             }
         }
+
+        /// The node that publishes block `id`, named after the bidegree `b` whose degree it is.
+        pub fn publish(b: Bidegree, id: u32) -> Self {
+            Self {
+                phase: Phase::Publish(id),
+                b,
+            }
+        }
+    }
+
+    /// A shift block the graph schedules a publication of: block `(b.s(), b.t(), ..)`.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub struct Publication {
+        pub b: Bidegree,
+        /// Whether it extends the matrix `Compute(b)`'s zero step built, and so waits for it.
+        pub after_compute: bool,
+    }
+
+    /// The rows below whose registration a publication at `b` reads: the generators of
+    /// `C_{s - 1}` and `C_{s - 2}` in degree `b.t()`.
+    fn publication_reads(b: Bidegree) -> [Bidegree; 2] {
+        [b - Bidegree::s_t(1, 0), b - Bidegree::s_t(2, 0)]
     }
 
     /// One degree along a row.
@@ -1706,6 +2135,13 @@ mod depgraph {
     /// handed out when it can run immediately -- nothing blocks a worker waiting for its
     /// predecessor.
     ///
+    /// Optionally, a third kind of node publishes a shift block (see [`super::shift`]) once
+    /// everything it reads is registered. Nothing waits on a `Publish` node: its edges into the
+    /// signature steps that read the block are soft, kept by the caller rather than by this graph,
+    /// because a consumer that finds no block builds one itself. `Publish` nodes are handed out
+    /// before any other ready node, so one that becomes ready no later than its consumer is run
+    /// before that consumer is dispatched.
+    ///
     /// A node becomes ready when its count of incomplete predecessors reaches zero, so it leaves
     /// the blocked set exactly once however many predecessors release it.
     ///
@@ -1714,14 +2150,19 @@ mod depgraph {
     /// Every node has at most two predecessors, all in the region:
     ///
     /// ```text
-    /// Compute(b)   <- Register(same_row_dep(b)), Register(below(b))
-    /// Register(b)  <- Compute(b),                Register(b - STEP)
+    /// Compute(b)    <- Register(same_row_dep(b)), Register(below(b))
+    /// Register(b)   <- Compute(b),                Register(b - STEP)
+    /// Publish(b, i) <- Register(b - (1, 0)),      Register(b - (2, 0)),  [Compute(b)]
     /// ```
+    ///
+    /// with `Compute(b)` only for a publication that extends the zero step's matrix.
     ///
     /// Every row of the region is one contiguous run of `t`, so a node's slot is arithmetic rather
     /// than a hash key, and the edges are recomputed from these rules rather than stored. The only
     /// per-node state is a predecessor count and a dispatched flag. `same_row_dep` is kept because
-    /// it is the one input the rules cannot recompute cheaply.
+    /// it is the one input the rules cannot recompute cheaply; the publications are kept because
+    /// they are an input. `Publish` slots follow the `2 * total` bidegree slots, in publication
+    /// order.
     pub struct Graph {
         min_degree: i32,
         max: Bidegree,
@@ -1737,6 +2178,12 @@ mod depgraph {
         dispatched: Vec<bool>,
         /// Reused by [`Self::complete`] so releasing successors never allocates.
         succ_buf: Vec<Node>,
+        /// See [`Self::new`].
+        publications: Vec<Publication>,
+        /// Prefix offsets into `publications` by `idx`, which it is sorted by.
+        pub_offset: Vec<u32>,
+        /// Ready `Publish` slots, handed out before `ready`.
+        ready_pub: Vec<u32>,
     }
 
     impl Graph {
@@ -1745,10 +2192,14 @@ mod depgraph {
         ///
         /// `same_row_dep(b)` is the earliest bidegree in `b`'s row that `Compute(b)` reads. One
         /// outside the region imposes no edge, which is what makes the base of each row a source.
+        ///
+        /// `publications` must be sorted by bidegree (row-major), lie in rows `>= 2`, and read only
+        /// bidegrees in the region; `Phase::Publish(i)` is the `i`th.
         pub fn new(
             min_degree: i32,
             max: Bidegree,
             same_row_dep: impl Fn(Bidegree) -> Bidegree,
+            publications: Vec<Publication>,
         ) -> Self {
             let mut row_offset = Vec::with_capacity(max.s() as usize + 2);
             let mut total = 0usize;
@@ -1773,6 +2224,7 @@ mod depgraph {
                 }
             }
 
+            let num_nodes = 2 * total + publications.len();
             let mut g = Self {
                 min_degree,
                 max,
@@ -1781,19 +2233,67 @@ mod depgraph {
                 max_gap,
                 blocked: Vec::new(),
                 ready: Vec::new(),
-                dispatched: vec![false; 2 * total],
+                dispatched: vec![false; num_nodes],
                 succ_buf: Vec::new(),
+                publications: Vec::new(),
+                pub_offset: Vec::new(),
+                ready_pub: Vec::new(),
             };
-            g.blocked = (0..2 * total)
+
+            let mut pub_offset = vec![0u32; total + 1];
+            for (i, p) in publications.iter().enumerate() {
+                assert!(
+                    g.in_region(p.b) && p.b.s() >= 2,
+                    "publication {p:?} outside the region"
+                );
+                for r in publication_reads(p.b) {
+                    assert!(
+                        g.in_region(r),
+                        "publication {p:?} reads {r}, outside the region"
+                    );
+                }
+                if i > 0 {
+                    assert!(
+                        g.idx(publications[i - 1].b) <= g.idx(p.b),
+                        "publications not sorted"
+                    );
+                }
+                pub_offset[g.idx(p.b) + 1] += 1;
+            }
+            for i in 0..total {
+                pub_offset[i + 1] += pub_offset[i];
+            }
+            g.publications = publications;
+            g.pub_offset = pub_offset;
+
+            g.blocked = (0..num_nodes)
                 .map(|slot| g.predecessors(g.node_at(slot)).count() as u32)
                 .collect();
             // Descending, so `pop` hands out ascending slots and two runs are diffable.
-            g.ready = (0..2 * total)
-                .rev()
-                .filter(|&slot| g.blocked[slot] == 0)
-                .map(|slot| slot as u32)
-                .collect();
+            for slot in (0..num_nodes).rev().filter(|&slot| g.blocked[slot] == 0) {
+                if slot < 2 * total {
+                    g.ready.push(slot as u32);
+                } else {
+                    g.ready_pub.push(slot as u32);
+                }
+            }
             g
+        }
+
+        /// The number of bidegree slots, after which the `Publish` slots start.
+        fn bidegree_slots(&self) -> usize {
+            2 * self.row_offset[self.row_offset.len() - 1]
+        }
+
+        /// The publications at `b`, as `(index, publication)`.
+        fn publications_at(&self, b: Bidegree) -> impl Iterator<Item = (u32, Publication)> + '_ {
+            let range = if self.in_region(b) {
+                let idx = self.idx(b);
+                self.pub_offset[idx] as usize..self.pub_offset[idx + 1] as usize
+            } else {
+                0..0
+            };
+            range.map(|i| (i as u32, self.publications[i]))
         }
 
         /// Whether `b` is one of the bidegrees this graph schedules.
@@ -1806,13 +2306,21 @@ mod depgraph {
             self.row_offset[b.s() as usize] + (b.t() - self.min_degree) as usize
         }
 
-        /// The position of `n` in the per-node arrays, which interleave the two phases.
-        fn slot(&self, n: Node) -> usize {
-            2 * self.idx(n.b) + usize::from(n.phase == Phase::Register)
+        /// The position of `n` in the per-node arrays, which interleave the two bidegree phases.
+        pub fn slot(&self, n: Node) -> usize {
+            match n.phase {
+                Phase::Compute => 2 * self.idx(n.b),
+                Phase::Register => 2 * self.idx(n.b) + 1,
+                Phase::Publish(i) => self.bidegree_slots() + i as usize,
+            }
         }
 
         /// The inverse of [`Self::slot`].
         fn node_at(&self, slot: usize) -> Node {
+            if slot >= self.bidegree_slots() {
+                let i = slot - self.bidegree_slots();
+                return Node::publish(self.publications[i].b, i as u32);
+            }
             let idx = slot / 2;
             // The row is the last one starting at or before `idx`.
             let s = self.row_offset.partition_point(|&o| o <= idx) - 1;
@@ -1833,16 +2341,30 @@ mod depgraph {
         }
 
         /// The nodes that must complete before `n` can run.
-        fn predecessors(&self, n: Node) -> impl Iterator<Item = Node> {
+        pub fn predecessors(&self, n: Node) -> impl Iterator<Item = Node> {
             let b = n.b;
             let candidates = match n.phase {
                 Phase::Compute => [
-                    Node::register(self.same_row_dep(b)),
-                    Node::register(below(b)),
+                    Some(Node::register(self.same_row_dep(b))),
+                    Some(Node::register(below(b))),
+                    None,
                 ],
-                Phase::Register => [Node::compute(b), Node::register(b - STEP)],
+                Phase::Register => [Some(Node::compute(b)), Some(Node::register(b - STEP)), None],
+                Phase::Publish(i) => {
+                    let [r1, r2] = publication_reads(b);
+                    [
+                        Some(Node::register(r1)),
+                        Some(Node::register(r2)),
+                        self.publications[i as usize]
+                            .after_compute
+                            .then(|| Node::compute(b)),
+                    ]
+                }
             };
-            candidates.into_iter().filter(|p| self.in_region(p.b))
+            candidates
+                .into_iter()
+                .flatten()
+                .filter(|p| self.in_region(p.b))
         }
 
         /// The nodes `n` blocks: the inverse of [`Self::predecessors`].
@@ -1850,7 +2372,14 @@ mod depgraph {
             out.clear();
             let b = n.b;
             match n.phase {
-                Phase::Compute => out.push(Node::register(b)),
+                Phase::Compute => {
+                    out.push(Node::register(b));
+                    out.extend(
+                        self.publications_at(b)
+                            .filter(|(_, p)| p.after_compute)
+                            .map(|(i, p)| Node::publish(p.b, i)),
+                    );
+                }
                 Phase::Register => {
                     out.push(Node::register(b + STEP));
                     out.push(Node::compute(above(b)));
@@ -1862,15 +2391,22 @@ mod depgraph {
                             .filter(|&c| self.in_region(c) && self.same_row_dep(c) == b)
                             .map(Node::compute),
                     );
+                    for reader in [b + Bidegree::s_t(1, 0), b + Bidegree::s_t(2, 0)] {
+                        out.extend(
+                            self.publications_at(reader)
+                                .map(|(i, p)| Node::publish(p.b, i)),
+                        );
+                    }
                     out.retain(|c| self.in_region(c.b));
                 }
+                Phase::Publish(_) => {}
             }
         }
 
         /// The next node whose dependencies are all complete, or `None` if there is none right
         /// now. A node is handed out at most once, however many predecessors freed it.
         pub fn pop_ready(&mut self) -> Option<Node> {
-            while let Some(slot) = self.ready.pop() {
+            while let Some(slot) = self.ready_pub.pop().or_else(|| self.ready.pop()) {
                 let slot = slot as usize;
                 if !self.dispatched[slot] {
                     self.dispatched[slot] = true;
@@ -1892,7 +2428,11 @@ mod depgraph {
                 debug_assert!(self.blocked[slot] > 0, "releasing {d:?} twice");
                 self.blocked[slot] -= 1;
                 if self.blocked[slot] == 0 {
-                    self.ready.push(slot as u32);
+                    if matches!(d.phase, Phase::Publish(_)) {
+                        self.ready_pub.push(slot as u32);
+                    } else {
+                        self.ready.push(slot as u32);
+                    }
                 }
             }
             self.succ_buf = buf;
@@ -1913,12 +2453,35 @@ mod depgraph {
         use super::*;
 
         /// A graph whose same-row reads reach back an irregular distance, like the per-subalgebra
-        /// floors do.
+        /// floors do, with an irregular sprinkling of publications of both kinds.
         fn graph() -> Graph {
-            Graph::new(0, Bidegree::n_s(12, 6), |b| {
-                let gap = if b.s() <= 1 { 1 } else { 1 + (b.t() * 7) % 5 };
-                b - Bidegree::s_t(0, gap)
-            })
+            let max = Bidegree::n_s(12, 6);
+            let mut publications = Vec::new();
+            for s in 2..=max.s() {
+                // A publication reads two rows below, so it stops two stems short of the region.
+                for t in 0..=(max.n() + s - 2) {
+                    let b = Bidegree::s_t(s, t);
+                    match (s + 3 * t) % 4 {
+                        0 => publications.push(Publication {
+                            b,
+                            after_compute: true,
+                        }),
+                        1 => publications.extend(
+                            [true, false].map(|after_compute| Publication { b, after_compute }),
+                        ),
+                        _ => {}
+                    }
+                }
+            }
+            Graph::new(
+                0,
+                max,
+                |b| {
+                    let gap = if b.s() <= 1 { 1 } else { 1 + (b.t() * 7) % 5 };
+                    b - Bidegree::s_t(0, gap)
+                },
+                publications,
+            )
         }
 
         /// Every successor edge is a predecessor edge, and the reverse.
@@ -1940,18 +2503,25 @@ mod depgraph {
             }
         }
 
-        /// Draining the graph dispatches every node and registers each row in increasing `t`.
+        /// Draining the graph dispatches every node, registers each row in increasing `t`, and
+        /// dispatches each node only after its predecessors complete.
         #[test]
         fn drains_registering_rows_in_order() {
             let mut g = graph();
+            assert!(!g.publications.is_empty());
+            let mut done = vec![false; g.blocked.len()];
             let mut registered = vec![g.min_degree - 1; g.max.s() as usize + 1];
             // Completing the newest node first stresses the ordering more than a FIFO would.
             let mut running = Vec::new();
             loop {
                 while let Some(n) = g.pop_ready() {
+                    for p in g.predecessors(n) {
+                        assert!(done[g.slot(p)], "{n:?} dispatched before {p:?}");
+                    }
                     running.push(n);
                 }
                 let Some(n) = running.pop() else { break };
+                done[g.slot(n)] = true;
                 if n.phase == Phase::Register {
                     let last = &mut registered[n.b.s() as usize];
                     assert_eq!(*last + 1, n.b.t(), "{n:?} registered out of order");
@@ -2013,7 +2583,7 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> ChainComplex for Resolution<M> {
                 // This walks `t` then `s`, so registering each bidegree as it is computed is
                 // already in order. Dropping the returned registration would leave the generators
                 // unadded and every later bidegree reading a differential that is not there.
-                if let Some(pending) = self.step_resolution(b) {
+                if let Some(pending) = self.step_resolution(b, false) {
                     self.register(pending)
                         .unwrap_or_else(|e| panic!("Error registering bidegree {b}: {e}"));
                 }
@@ -2333,6 +2903,9 @@ mod tests {
     }
 
     /// Resolve `S_2` through `max`, with shift reuse on or off, optionally into a save directory.
+    ///
+    /// Publication is off, so every block is built by a signature step; see
+    /// [`resolve_s2_publish`].
     fn resolve_s2(
         max: Bidegree,
         shift_reuse: bool,
@@ -2341,6 +2914,7 @@ mod tests {
     ) -> Resolution<algebra::module::FDModule<MilnorAlgebra>> {
         let mut res = crate::utils::construct_nassau("S_2", save.map(|p| p.to_owned())).unwrap();
         res.set_shift_reuse(shift_reuse);
+        res.set_publish_blocks(false);
         res.set_shift_verify(verify);
         res.compute_through_stem(max);
         res
@@ -2454,6 +3028,188 @@ mod tests {
     #[ignore]
     fn test_shift_reuse_identical_large() {
         check_shift_reuse_identical(Bidegree::n_s(80, 40));
+    }
+
+    /// Resolve `S_2` through `max` with shift reuse on and publication on or off.
+    fn resolve_s2_publish(
+        max: Bidegree,
+        publish: bool,
+        verify: bool,
+        save: Option<&std::path::Path>,
+    ) -> Resolution<algebra::module::FDModule<MilnorAlgebra>> {
+        let mut res = crate::utils::construct_nassau("S_2", save.map(|p| p.to_owned())).unwrap();
+        res.set_publish_blocks(publish);
+        res.set_shift_verify(verify);
+        res.compute_through_stem(max);
+        res
+    }
+
+    /// Every published block, extended from a zero step or built, equals a fresh build of that
+    /// block, and every block a step reads is a prefix of a direct build of its matrix. The
+    /// schedule's explicit consumer lists drop every block after its last reader.
+    #[test]
+    fn test_published_blocks_match_builds() {
+        let res = resolve_s2_publish(Bidegree::n_s(30, 12), true, true, None);
+        let stats = res.shift_stats();
+        assert!(stats.published_from_zero_step > 0, "{stats:?}");
+        assert!(stats.published_by_build > 0, "{stats:?}");
+        assert_eq!(
+            stats.dropped_at_end, 0,
+            "a block outlived its readers: {stats:?}"
+        );
+        assert!(stats.evictions > 0, "{stats:?}");
+    }
+
+    /// Resolve with publication on, publication off, and shift reuse off; require identical
+    /// differentials and save files, and report how many builds publication avoided.
+    fn check_publish_identical(max: Bidegree) -> (ShiftStats, ShiftStats) {
+        let dirs: [tempfile::TempDir; 3] =
+            std::array::from_fn(|_| tempfile::TempDir::new().unwrap());
+        let on = resolve_s2_publish(max, true, false, Some(dirs[0].path()));
+        let off = resolve_s2_publish(max, false, false, Some(dirs[1].path()));
+        let none = resolve_s2(max, false, false, Some(dirs[2].path()));
+        assert_same_resolution(&on, &none, max);
+        assert_same_resolution(&off, &none, max);
+        let files = dirs.each_ref().map(|d| dir_contents(d.path()));
+        for other in &files[1..] {
+            assert_eq!(
+                files[0].keys().collect::<Vec<_>>(),
+                other.keys().collect::<Vec<_>>()
+            );
+            for (name, bytes) in &files[0] {
+                assert!(bytes == &other[name], "save file {name} differs");
+            }
+        }
+
+        let (on, off) = (on.shift_stats(), off.shift_stats());
+        let builds = |s: &ShiftStats| s.shared_builds + s.private_builds;
+        eprintln!(
+            "publish through {max}: consumer builds {} -> {} ({} avoided); on: {on:?}; off: \
+             {off:?}",
+            builds(&off),
+            builds(&on),
+            builds(&off) as isize - builds(&on) as isize,
+        );
+        assert_eq!(on.lookups, off.lookups);
+        assert!(builds(&on) < builds(&off), "publication avoided no builds");
+        assert_eq!(on.dropped_at_end, 0, "{on:?}");
+        assert_eq!(off.dropped_at_end, 0, "{off:?}");
+        (on, off)
+    }
+
+    #[test]
+    fn test_publish_identical() {
+        check_publish_identical(Bidegree::n_s(30, 12));
+    }
+
+    /// [`test_publish_identical`] across the `A(1)`/`A(2)` boundaries. Run with `--release
+    /// --ignored --nocapture` for the build counts.
+    #[test]
+    #[ignore]
+    fn test_publish_identical_large() {
+        check_publish_identical(Bidegree::n_s(80, 40));
+    }
+
+    /// A publication is soft: resuming from a save, the loaded bidegrees run no zero step, so
+    /// their publications are skipped and the readers build the blocks themselves, with the same
+    /// result as an uninterrupted run.
+    #[test]
+    fn test_publication_falls_back_when_skipped() {
+        let max = Bidegree::n_s(36, 14);
+        let dir = tempfile::TempDir::new().unwrap();
+        resolve_s2_publish(Bidegree::n_s(24, 14), true, false, Some(dir.path()));
+        let resumed = resolve_s2_publish(max, true, true, Some(dir.path()));
+        let stats = resumed.shift_stats();
+        assert!(stats.publications_skipped > 0, "{stats:?}");
+        assert!(stats.shared_builds > 0, "{stats:?}");
+        assert_eq!(stats.dropped_at_end, 0, "{stats:?}");
+
+        let fresh = resolve_s2(max, false, false, None);
+        assert_same_resolution(&resumed, &fresh, max);
+    }
+
+    /// The soft edges against the schedule: no `Compute` node ever waits on a `Publish` node, and
+    /// an extending publication is guaranteed to land before a reader whose shift reaches back at
+    /// least the reader's zero-signature floor, because everything it waits on is then an ancestor
+    /// of that reader's `Compute` node and `Publish` nodes are dispatched first.
+    #[test]
+    fn test_soft_edges_never_delay() {
+        use depgraph::{Node, Phase};
+
+        let max = Bidegree::n_s(60, 30);
+        let res = crate::utils::construct_nassau("S_2", None).unwrap();
+        res.extend_through_degree(max.s());
+        res.algebra().compute_basis(max.t());
+        let plan = res.publication_plan(max);
+        let graph = depgraph::Graph::new(
+            res.min_degree(),
+            max,
+            |b| res.same_row_dep(b),
+            Resolution::<algebra::module::FDModule<MilnorAlgebra>>::publications(&plan),
+        );
+
+        // Ancestors of each reader's `Compute` node.
+        let mut ancestors: HashMap<Bidegree, Vec<bool>> = HashMap::new();
+        let num_slots = graph.slot(Node::publish(
+            Bidegree::s_t(plan.blocks.last().unwrap().key.s, 0),
+            plan.blocks.len() as u32 - 1,
+        )) + 1;
+        let (mut guaranteed, mut extended, mut soft_edges) = (0, 0, 0);
+        for (id, block) in plan.blocks.iter().enumerate() {
+            let b = Bidegree::s_t(block.key.s, block.key.degree);
+            let publish = Node::publish(b, id as u32);
+            for &reader in &block.consumers {
+                soft_edges += 1;
+                let reader_compute = Node::compute(reader);
+                assert!(
+                    graph
+                        .predecessors(reader_compute)
+                        .all(|p| !matches!(p.phase, Phase::Publish(_))),
+                    "{reader_compute:?} waits on a publication"
+                );
+                let seen = ancestors.entry(reader).or_insert_with(|| {
+                    let mut seen = vec![false; num_slots];
+                    let mut stack = vec![reader_compute];
+                    while let Some(n) = stack.pop() {
+                        for p in graph.predecessors(n) {
+                            if !seen[graph.slot(p)] {
+                                seen[graph.slot(p)] = true;
+                                stack.push(p);
+                            }
+                        }
+                    }
+                    seen
+                });
+                let ready_first = graph.predecessors(publish).all(|p| seen[graph.slot(p)]);
+                if block.after_compute {
+                    extended += 1;
+                    let floor = MilnorSubalgebra::optimal_for(reader).zero_signature_floor();
+                    if reader.t() - b.t() >= floor {
+                        assert!(ready_first, "{publish:?} can land after {reader}");
+                    }
+                }
+                guaranteed += usize::from(ready_first && block.after_compute);
+            }
+        }
+        eprintln!(
+            "soft edges through {max}: {soft_edges}; to extending publications {extended}, of \
+             which {guaranteed} land before their reader by construction"
+        );
+        assert!(guaranteed > 0);
+    }
+
+    #[test]
+    fn test_signature_degrees() {
+        for profile in [vec![1], vec![2, 1], vec![3, 2, 1], vec![2, 2, 1]] {
+            let subalgebra = MilnorSubalgebra::new(profile);
+            let mut expected: Vec<i32> = subalgebra
+                .iter_signatures(subalgebra.top_degree())
+                .map(|sig| MilnorSubalgebra::signature_degree(&sig))
+                .collect();
+            expected.sort_unstable();
+            expected.dedup();
+            assert_eq!(subalgebra.signature_degrees(), expected, "{subalgebra}");
+        }
     }
 
     #[test]
