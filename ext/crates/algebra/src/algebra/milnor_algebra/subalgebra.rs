@@ -1,162 +1,130 @@
-//! Finite sub-Hopf-algebras of a Milnor algebra.
+//! Every [`MilnorAlgebra`] as a sub-Hopf-algebra of its [kind](MilnorKind), cut out by its profile.
 
 use fp::prime::{Prime, iter::BitflagIterator};
-use itertools::Itertools;
 
-use super::{
-    Exterior, MilnorAlgebra, MilnorAlgebraInner, MilnorBasisElement, MilnorProfile, NoExterior,
-    PPart, PPartEntry,
-};
+use super::{MilnorAlgebra, MilnorBasisElement, MilnorKind, MilnorProfile, PPart, PPartEntry};
 use crate::algebra::{Algebra, combinatorics};
 
-/// A finite sub-Hopf-algebra of a Milnor algebra, given by a profile.
-///
-/// It is a [`MilnorAlgebra`] of the same shape and prime as the algebras it sits in, and is
-/// guaranteed to be finite, so its degrees and dimension are bounded.
-pub struct MilnorSubalgebra(MilnorAlgebra);
-
-impl MilnorSubalgebra {
-    /// The algebra of `ambient`'s shape and prime with the given profile, or `None` if that is not
-    /// a finite sub-Hopf-algebra whose top degree fits in an `i32`.
+impl MilnorAlgebra {
+    /// The sub-Hopf-algebra of this algebra's kind with the given profile, at the same prime, or
+    /// `None` if the profile is not valid. Unstable support is off.
     ///
-    /// At the exterior shape, a q-part with every bit set, the default, stands for all the $Q_k$.
-    /// This does not check that the result lies in `ambient`; see [`Self::is_subalgebra_of`].
-    pub fn new(ambient: &MilnorAlgebra, profile: MilnorProfile) -> Option<Self> {
-        let p = ambient.prime();
-        let finite = profile.truncated
-            && profile.is_valid()
-            && profile.p_part.len() <= combinatorics::MAX_XI
-            && !(ambient.has_exterior() && profile.q_part == !0)
-            // A saturated entry stands for a degree past `i32::MAX`.
-            && !(ambient.has_exterior()
-                && BitflagIterator::set_bit_iterator(profile.q_part as u64)
-                    .any(|k| combinatorics::tau_degrees(p)[k] == i32::MAX))
-            && profile
-                .p_part
-                .iter()
-                .all(|&e| p.as_u32().checked_pow(e).is_some());
-        if !finite {
+    /// This need not lie in `self`; see [`Self::is_subalgebra_of`].
+    pub fn with_profile(&self, profile: MilnorProfile) -> Option<Self> {
+        if !profile.is_valid() {
             return None;
         }
-        let algebra: MilnorAlgebra = match ambient {
-            MilnorAlgebra::Polynomial(_) => {
-                MilnorAlgebraInner::<NoExterior>::new_with_profile(p, profile, false).into()
-            }
-            MilnorAlgebra::Exterior(_) => {
-                MilnorAlgebraInner::<Exterior>::new_with_profile(p, profile, false).into()
-            }
-        };
-        let subalgebra = Self(algebra);
-        i32::try_from(subalgebra.top_degree_i64()).ok()?;
-        Some(subalgebra)
+        Self::of_kind(self.kind(), self.prime(), profile, false)
     }
 
-    /// The trivial subalgebra of `ambient`, the ground field.
-    pub fn trivial(ambient: &MilnorAlgebra) -> Self {
+    /// The trivial sub-Hopf-algebra of this algebra's kind, the ground field.
+    pub fn ground_field(&self) -> Self {
         let profile = MilnorProfile {
             truncated: true,
             q_part: 0,
             p_part: vec![],
         };
-        Self::new(ambient, profile).unwrap()
+        self.with_profile(profile).unwrap()
     }
 
-    /// This subalgebra as an algebra in its own right.
-    pub fn algebra(&self) -> &MilnorAlgebra {
-        &self.0
-    }
-
-    /// The profile defining this subalgebra.
-    pub fn profile(&self) -> &MilnorProfile {
-        self.0.profile()
+    /// Whether `self` is a sub-Hopf-algebra of `other`: the same kind and prime, and a smaller
+    /// profile.
+    pub fn is_subalgebra_of(&self, other: &Self) -> bool {
+        let len = std::cmp::max(self.profile().p_part.len(), other.profile().p_part.len());
+        self.kind() == other.kind()
+            && self.prime() == other.prime()
+            && self.exterior_part() & !other.exterior_part() == 0
+            // One entry past the longer profile compares the two tails.
+            && (0..=len).all(|i| self.profile().get_p_part(i) <= other.profile().get_p_part(i))
     }
 
     /// The $Q_k$ in this algebra, as a mask of the q-part. Only the exterior shape has any.
     fn exterior_part(&self) -> u32 {
-        if self.0.has_exterior() {
+        if self.has_exterior() {
             self.profile().q_part
         } else {
             0
         }
     }
 
-    /// `p^{e_i}` for the entries `e_i` of the profile, which bound the entries of the p-part.
-    fn moduli(&self) -> impl Iterator<Item = PPartEntry> + '_ {
-        let p = self.0.prime().as_u32();
-        self.profile().p_part.iter().map(move |&e| p.pow(e))
+    /// `p^{e_i}`, which bounds entry `i` of the p-part of every basis element, or `None` if that
+    /// entry is unbounded. A bound past [`PPartEntry::MAX`] bounds nothing.
+    fn modulus(&self, i: usize) -> Option<PPartEntry> {
+        self.prime()
+            .as_u32()
+            .checked_pow(self.profile().get_p_part(i))
     }
 
-    /// See [`Self::top_degree`].
-    fn top_degree_i64(&self) -> i64 {
-        let p = self.0.prime();
+    /// The degree of the top basis element, or `None` if the algebra is infinite or that degree
+    /// does not fit in an `i32`.
+    ///
+    /// A finite sub-Hopf-algebra is a Poincaré duality algebra, so the top basis element is the
+    /// only one in its degree.
+    pub fn top_degree(&self) -> Option<i32> {
+        let p = self.prime();
+        let profile = self.profile();
+        if !profile.truncated || profile.p_part.len() > combinatorics::MAX_XI {
+            return None;
+        }
         let tau_degrees = combinatorics::tau_degrees(p);
         let xi_degrees = combinatorics::xi_degrees(p);
-        let exterior: i64 = BitflagIterator::set_bit_iterator(self.exterior_part() as u64)
-            .map(|k| tau_degrees[k] as i64)
-            .sum();
-        let polynomial: i64 = std::iter::zip(self.moduli(), xi_degrees)
-            .map(|(m, &d)| (m as i64 - 1) * d as i64)
-            .sum();
-        exterior + self.0.q() as i64 * polynomial
+
+        let mut top = 0i64;
+        for k in BitflagIterator::set_bit_iterator(self.exterior_part() as u64) {
+            // A saturated entry stands for a degree past `i32::MAX`.
+            if tau_degrees[k] == i32::MAX {
+                return None;
+            }
+            top += tau_degrees[k] as i64;
+        }
+        for (i, &d) in xi_degrees.iter().enumerate().take(profile.p_part.len()) {
+            top += self.q() as i64 * (self.modulus(i)? as i64 - 1) * d as i64;
+        }
+        i32::try_from(top).ok()
     }
 
-    /// The degree of the top basis element. This is a Poincaré duality algebra, so it is the only
-    /// basis element in its degree.
-    pub fn top_degree(&self) -> i32 {
-        self.top_degree_i64() as i32
-    }
-
-    /// The dimension of the algebra, saturating at `u64::MAX`.
-    pub fn dimension(&self) -> u64 {
-        self.moduli()
-            .fold(1u64 << self.exterior_part().count_ones(), |acc, m| {
-                acc.saturating_mul(m as u64)
-            })
-    }
-
-    /// Whether this is a sub-Hopf-algebra of `ambient`, which requires the same prime and shape.
-    pub fn is_subalgebra_of(&self, ambient: &MilnorAlgebra) -> bool {
-        let ours = self.profile();
-        let theirs = ambient.profile();
-        let their_exterior = if ambient.has_exterior() {
-            theirs.q_part
-        } else {
-            0
-        };
-        // Comparing one entry past the longer profile compares the two tails.
-        let len = std::cmp::max(ours.p_part.len(), theirs.p_part.len());
-        self.0.prime() == ambient.prime()
-            && self.0.has_exterior() == ambient.has_exterior()
-            && self.exterior_part() & !their_exterior == 0
-            && (0..=len).all(|i| ours.get_p_part(i) <= theirs.get_p_part(i))
+    /// The dimension of the algebra, saturating at `u64::MAX`, or `None` where
+    /// [`Self::top_degree`] is.
+    pub fn total_dimension(&self) -> Option<u64> {
+        self.top_degree()?;
+        let exterior = 1u64 << self.exterior_part().count_ones();
+        Some(
+            (0..self.profile().p_part.len())
+                .map(|i| self.modulus(i).unwrap() as u64)
+                .fold(exterior, u64::saturating_mul),
+        )
     }
 
     /// The component in this algebra of `elt`, a basis element of an algebra containing it.
     ///
     /// The component of $Q(E)P(R)$ is $Q(E \cap E')P(R \bmod p^e)$, where $E'$ and $e$ are this
-    /// algebra's q-part and profile. Grouping the basis of the larger algebra by component splits
-    /// it into translates of the elements whose component is $1$, one per basis element of this
-    /// algebra, which is the freeness of the larger algebra over this one.
+    /// algebra's q-part and profile, and an unbounded entry of $e$ leaves that entry of $R$ alone.
+    /// Grouping the basis of the larger algebra by component splits it into translates of the
+    /// elements whose component is $1$, one per basis element of this algebra, which is the
+    /// freeness of the larger algebra over this one.
     pub fn component(&self, elt: &MilnorBasisElement) -> MilnorBasisElement {
         let mut component = MilnorBasisElement {
             q_part: elt.q_part & self.exterior_part(),
             p_part: PPart::zero(),
             degree: 0,
         };
-        for (i, m) in self.moduli().enumerate() {
-            component.p_part.set(i, elt.p_part.get(i) % m);
+        for i in 0..PPart::MAX_LEN {
+            let entry = elt.p_part.get(i);
+            component
+                .p_part
+                .set(i, self.modulus(i).map_or(entry, |m| entry % m));
         }
-        self.0.compute_degree(&mut component);
+        self.compute_degree(&mut component);
         component
     }
 
     /// Whether the component of `elt` is `component`, without building it.
     pub fn has_component(&self, elt: &MilnorBasisElement, component: &MilnorBasisElement) -> bool {
         elt.q_part & self.exterior_part() == component.q_part
-            && self
-                .moduli()
-                .enumerate()
-                .all(|(i, m)| elt.p_part.get(i) % m == component.p_part.get(i))
+            && (0..PPart::MAX_LEN).all(|i| {
+                let entry = elt.p_part.get(i);
+                self.modulus(i).map_or(entry, |m| entry % m) == component.p_part.get(i)
+            })
     }
 
     /// A mask that compiles [`Self::has_component`] to `elt.p_part.bits() & mask ==
@@ -166,48 +134,14 @@ impl MilnorSubalgebra {
     /// Each entry occupies a fixed field of the packed word, so its residue mod $2^e$ is the low
     /// $e$ bits of that field.
     pub fn packed_component_mask(&self) -> Option<u64> {
-        if self.0.has_exterior() || self.0.prime() != 2 {
+        if self.kind() != MilnorKind::Classical || self.prime() != 2 {
             return None;
         }
-        Some(
-            self.profile()
-                .p_part
-                .iter()
-                .enumerate()
-                .fold(0, |mask, (i, &e)| {
-                    // A profile wider than the field constrains the whole field.
-                    let width = std::cmp::min(e, PPart::width(i));
-                    mask | ((1u64 << width) - 1) << PPart::shift(i)
-                }),
-        )
-    }
-}
-
-/// `A(n)`, `E(Q_0..Q_n)` or `F_p` where it is one of those, and the profile otherwise.
-impl std::fmt::Display for MilnorSubalgebra {
-    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let MilnorProfile { q_part, p_part, .. } = self.profile();
-        let len = p_part.len();
-        let is_an = p_part.iter().rev().copied().eq(1..=len as PPartEntry);
-        if self.0.has_exterior() {
-            let top_q = (u32::BITS - q_part.leading_zeros()) as usize;
-            let q_is_initial = q_part.count_ones() as usize == top_q;
-            if *q_part == 0 && len == 0 {
-                write!(out, "F_{}", self.0.prime())
-            } else if is_an && q_is_initial && top_q == len + 1 {
-                write!(out, "A({len})")
-            } else if len == 0 && q_is_initial {
-                write!(out, "E(Q_0..Q_{})", top_q - 1)
-            } else {
-                write!(out, "B({q_part:#b}; {})", p_part.iter().join(","))
-            }
-        } else if len == 0 {
-            write!(out, "F_{}", self.0.prime())
-        } else if is_an {
-            write!(out, "A({})", len - 1)
-        } else {
-            write!(out, "B({})", p_part.iter().join(","))
-        }
+        Some((0..PPart::MAX_LEN).fold(0, |mask, i| {
+            // A profile entry wider than the field, unbounded ones included, constrains all of it.
+            let width = std::cmp::min(self.profile().get_p_part(i), PPart::width(i));
+            mask | ((1u64 << width) - 1) << PPart::shift(i)
+        }))
     }
 }
 
@@ -215,44 +149,46 @@ impl std::fmt::Display for MilnorSubalgebra {
 mod tests {
     use std::collections::HashMap;
 
-    use fp::prime::{TWO, ValidPrime};
+    use fp::prime::TWO;
 
     use super::*;
 
-    /// The subalgebra of `ambient` with the given finite profile.
-    fn sub(ambient: &MilnorAlgebra, q_part: u32, p_part: &[u32]) -> MilnorSubalgebra {
+    /// The sub-Hopf-algebra of `ambient`'s kind with the given finite profile.
+    fn sub(ambient: &MilnorAlgebra, q_part: u32, p_part: &[u32]) -> MilnorAlgebra {
         let profile = MilnorProfile {
             truncated: true,
             q_part,
             p_part: p_part.to_vec(),
         };
-        MilnorSubalgebra::new(ambient, profile).unwrap()
+        ambient.with_profile(profile).unwrap()
     }
 
-    /// Check `sub`'s top degree and dimension against its basis, and its components against the
-    /// basis of `ambient` through `max_degree`.
-    fn check(ambient: &MilnorAlgebra, sub: &MilnorSubalgebra, max_degree: i32) {
+    /// Check `ambient`'s components in `sub` through `max_degree`, and if `sub` is finite its top
+    /// degree and dimension against its basis.
+    fn check(ambient: &MilnorAlgebra, sub: &MilnorAlgebra, max_degree: i32) {
         assert!(sub.is_subalgebra_of(ambient));
 
-        let algebra = sub.algebra();
         let top = sub.top_degree();
-        algebra.compute_basis(top + 4);
-        assert_eq!(algebra.dimension(top), 1, "top degree of {sub}");
-        assert!((top + 1..=top + 4).all(|t| algebra.dimension(t) == 0));
-        let total: usize = (0..=top).map(|t| algebra.dimension(t)).sum();
-        assert_eq!(sub.dimension(), total as u64);
+        if let Some(top) = top {
+            sub.compute_basis(top + 4);
+            assert_eq!(sub.dimension(top), 1, "top degree of {:?}", sub.profile());
+            assert!((top + 1..=top + 4).all(|t| sub.dimension(t) == 0));
+            let total: usize = (0..=top).map(|t| sub.dimension(t)).sum();
+            assert_eq!(sub.total_dimension(), Some(total as u64));
+        }
 
         // `counts[t][c]` is the number of basis elements of `ambient` in degree `t` whose
         // component is `c`, given by its `(degree, index)` in `sub`.
         ambient.compute_basis(max_degree);
+        sub.compute_basis(max_degree);
         let mut counts = vec![HashMap::new(); max_degree as usize + 1];
         for t in 0..=max_degree {
             for idx in 0..ambient.dimension(t) {
                 let elt = ambient.basis_element_from_index(t, idx);
                 let component = sub.component(&elt);
-                let index = algebra
+                let index = sub
                     .try_basis_element_to_index(&component)
-                    .unwrap_or_else(|| panic!("component {component} of {elt} is not in {sub}"));
+                    .unwrap_or_else(|| panic!("component {component} of {elt} is not in sub"));
                 assert!(sub.has_component(&elt, &component));
                 if let Some(mask) = sub.packed_component_mask() {
                     assert_eq!(elt.p_part.bits() & mask, component.p_part.bits());
@@ -264,104 +200,138 @@ mod tests {
         }
 
         // Freeness: the elements with component `c` are the translates of those with component 1.
+        let top = top.unwrap_or(max_degree);
         for t in 0..=max_degree {
             for k in 0..=std::cmp::min(t, top) {
-                for index in 0..algebra.dimension(k) {
+                for index in 0..sub.dimension(k) {
                     let translates = counts[(t - k) as usize].get(&(0, 0)).copied();
                     let actual = counts[t as usize].get(&(k, index)).copied();
                     assert_eq!(
                         actual.unwrap_or(0),
                         translates.unwrap_or(0),
-                        "{sub}: degree {t}, component ({k}, {index})"
+                        "degree {t}, component ({k}, {index})"
                     );
                 }
             }
         }
     }
 
+    /// The classical algebra at `p = 2`.
+    fn ambient_at_two() -> MilnorAlgebra {
+        MilnorAlgebra::new(TWO, false)
+    }
+
     /// Profiles of the classical algebra at `p = 2`, in it and in each other.
     #[test]
     fn test_polynomial_at_two() {
-        let ambient = MilnorAlgebra::new(TWO, false);
+        let ambient = ambient_at_two();
         for p_part in [&[1][..], &[2, 1], &[2, 2, 1], &[3, 2, 1]] {
             check(&ambient, &sub(&ambient, 0, p_part), 40);
         }
         // Nested finite algebras, A(1) in A(2).
         let a2 = sub(&ambient, 0, &[3, 2, 1]);
-        check(a2.algebra(), &sub(&ambient, 0, &[2, 1]), 23);
+        check(&a2, &sub(&ambient, 0, &[2, 1]), 23);
 
-        assert_eq!(sub(&ambient, 0, &[2, 1]).top_degree(), 6);
-        assert_eq!(a2.top_degree(), 23);
-        assert_eq!(a2.dimension(), 64);
+        assert_eq!(sub(&ambient, 0, &[2, 1]).top_degree(), Some(6));
+        assert_eq!(a2.top_degree(), Some(23));
+        assert_eq!(a2.total_dimension(), Some(64));
     }
 
-    /// Infinite profiles are not subalgebras.
+    /// Infinite sub-Hopf-algebras have no top degree, but components still split the ambient.
     #[test]
     fn test_infinite() {
-        let ambient = MilnorAlgebra::new(TWO, false);
-        assert!(MilnorSubalgebra::new(&ambient, MilnorProfile::default()).is_none());
-        let unbounded = MilnorProfile {
-            truncated: false,
-            q_part: !0,
-            p_part: vec![2, 1],
-        };
-        assert!(MilnorSubalgebra::new(&ambient, unbounded).is_none());
+        let ambient = ambient_at_two();
+        assert_eq!(ambient.top_degree(), None);
+        assert_eq!(ambient.total_dimension(), None);
+
+        let unbounded = ambient
+            .with_profile(MilnorProfile {
+                truncated: false,
+                q_part: !0,
+                p_part: vec![2, 1],
+            })
+            .unwrap();
+        assert_eq!(unbounded.top_degree(), None);
+        check(&ambient, &unbounded, 40);
+        check(&ambient, &ambient, 40);
     }
 
-    /// Containment compares profiles, and needs the same prime.
+    /// Containment compares profiles, and needs the same kind and prime.
     #[test]
     fn test_is_subalgebra_of() {
-        let ambient = MilnorAlgebra::new(TWO, false);
+        let ambient = ambient_at_two();
         let a1 = sub(&ambient, 0, &[2, 1]);
         let a2 = sub(&ambient, 0, &[3, 2, 1]);
-        assert!(a1.is_subalgebra_of(a2.algebra()));
-        assert!(!a2.is_subalgebra_of(a1.algebra()));
+        assert!(a1.is_subalgebra_of(&a2));
+        assert!(!a2.is_subalgebra_of(&a1));
         assert!(a2.is_subalgebra_of(&ambient));
-        assert!(!a1.is_subalgebra_of(&MilnorAlgebra::new(ValidPrime::new(3), false)));
-    }
-
-    /// The names of the trivial algebra, an `A(n)` and another profile.
-    #[test]
-    fn test_fmt() {
-        let ambient = MilnorAlgebra::new(TWO, false);
-        assert_eq!(MilnorSubalgebra::trivial(&ambient).to_string(), "F_2");
-        assert_eq!(sub(&ambient, 0, &[3, 2, 1]).to_string(), "A(2)");
-        assert_eq!(sub(&ambient, 0, &[3, 3, 2, 1]).to_string(), "B(3,3,2,1)");
+        assert!(ambient.ground_field().is_subalgebra_of(&a1));
     }
 
     /// $A^{\mathbb{C}}/\tau$ and the odd primary algebras, where the q-part counts.
     #[cfg(feature = "odd-primes")]
     #[test]
     fn test_exterior() {
-        let c_tau: MilnorAlgebra = MilnorAlgebraInner::<Exterior>::new(TWO, false).into();
+        let c_tau = MilnorAlgebra::of_kind(
+            MilnorKind::MotivicModTau,
+            TWO,
+            MilnorProfile::default(),
+            false,
+        )
+        .unwrap();
         for (q_part, p_part) in [(0b1, &[][..]), (0b11, &[]), (0b11, &[1]), (0b111, &[2, 1])] {
             check(&c_tau, &sub(&c_tau, q_part, p_part), 30);
         }
-        assert_eq!(sub(&c_tau, 0b11, &[1]).top_degree(), 6);
-        assert_eq!(MilnorSubalgebra::trivial(&c_tau).to_string(), "F_2");
-        assert_eq!(sub(&c_tau, 0b1, &[]).to_string(), "A(0)");
-        assert_eq!(sub(&c_tau, 0b11, &[1]).to_string(), "A(1)");
-        assert_eq!(sub(&c_tau, 0b11, &[]).to_string(), "E(Q_0..Q_1)");
-        assert!(MilnorSubalgebra::new(&c_tau, MilnorProfile::default()).is_none());
+        assert_eq!(sub(&c_tau, 0b11, &[1]).top_degree(), Some(6));
+        assert_eq!(c_tau.top_degree(), None);
+        // A(1) of A_C/tau is not a subalgebra of the classical A(2).
+        assert!(!sub(&c_tau, 0b11, &[1]).is_subalgebra_of(&ambient_at_two()));
 
-        let p3 = MilnorAlgebra::new(ValidPrime::new(3), false);
+        let p3 = MilnorAlgebra::new(fp::prime::ValidPrime::new(3), false);
+        assert!(!sub(&ambient_at_two(), 0, &[2, 1]).is_subalgebra_of(&p3));
         for (q_part, p_part) in [(0b1, &[][..]), (0b11, &[1])] {
             check(&p3, &sub(&p3, q_part, p_part), 60);
         }
-        assert_eq!(sub(&p3, 0b11, &[1]).top_degree(), 14);
+        assert_eq!(sub(&p3, 0b11, &[1]).top_degree(), Some(14));
 
         // |Q_19| = 2 * 3^19 - 1 does not fit in an `i32`, even on its own.
-        let q19 = MilnorProfile {
-            truncated: true,
-            q_part: 1 << 19,
-            p_part: vec![],
-        };
-        assert!(MilnorSubalgebra::new(&p3, q19).is_none());
+        assert_eq!(sub(&p3, 1 << 19, &[]).top_degree(), None);
 
         // Containment compares both parts.
         let a1 = sub(&p3, 0b11, &[1]);
-        assert!(sub(&p3, 0b11, &[]).is_subalgebra_of(a1.algebra()));
-        assert!(!a1.is_subalgebra_of(sub(&p3, 0b11, &[]).algebra()));
-        assert!(!sub(&p3, 0b111, &[]).is_subalgebra_of(a1.algebra()));
+        assert!(sub(&p3, 0b11, &[]).is_subalgebra_of(&a1));
+        assert!(!a1.is_subalgebra_of(&sub(&p3, 0b11, &[])));
+        assert!(!sub(&p3, 0b111, &[]).is_subalgebra_of(&a1));
+
+        // The reduced powers are their own kind, not a subalgebra of A.
+        let reduced = MilnorAlgebra::of_kind(
+            MilnorKind::ReducedPowers,
+            p3.prime(),
+            MilnorProfile::default(),
+            false,
+        )
+        .unwrap();
+        assert_eq!(reduced.kind(), MilnorKind::ReducedPowers);
+        assert!(!reduced.is_subalgebra_of(&p3));
+        check(&reduced, &sub(&reduced, 0, &[2, 1]), 60);
+    }
+
+    /// Each kind exists at the primes it should, with the shape it should.
+    #[cfg(feature = "odd-primes")]
+    #[test]
+    fn test_kinds() {
+        let p3 = fp::prime::ValidPrime::new(3);
+        let kind = |k, p| MilnorAlgebra::of_kind(k, p, MilnorProfile::default(), false);
+        assert_eq!(MilnorAlgebra::new(TWO, false).kind(), MilnorKind::Classical);
+        assert!(kind(MilnorKind::ReducedPowers, TWO).is_none());
+        assert!(kind(MilnorKind::MotivicModTau, p3).is_none());
+        for (k, p) in [
+            (MilnorKind::Classical, TWO),
+            (MilnorKind::Classical, p3),
+            (MilnorKind::MotivicModTau, TWO),
+            (MilnorKind::ReducedPowers, p3),
+        ] {
+            assert_eq!(kind(k, p).unwrap().kind(), k);
+        }
     }
 }

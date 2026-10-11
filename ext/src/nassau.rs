@@ -19,9 +19,7 @@ use std::{
 
 use algebra::{
     Algebra, combinatorics,
-    milnor_algebra::{
-        MilnorAlgebra, MilnorBasisElement, MilnorProfile, MilnorSubalgebra, PPart, PPartEntry,
-    },
+    milnor_algebra::{MilnorAlgebra, MilnorBasisElement, MilnorProfile, PPart, PPartEntry},
     module::{
         FreeModule, GeneratorData, Module, ZeroModule,
         homomorphism::{FreeModuleHomomorphism, FullModuleHomomorphism, ModuleHomomorphism},
@@ -82,8 +80,39 @@ const MAX_NEW_GENS: usize = 10;
 /// Candidate subalgebras whose top degree exceeds this are never applicable in practice.
 const MAX_TOP_DEGREE: i32 = 10_000;
 
-/// The parts of Nassau's algorithm that depend only on the subalgebra `B`.
-trait NassauSubalgebra: Sized {
+/// A finite sub-Hopf-algebra `B` of the algebra being resolved over, the subalgebra of [Nassau's
+/// algorithm](https://arxiv.org/abs/1910.04063).
+struct Subalgebra {
+    algebra: MilnorAlgebra,
+    /// The top degree of `algebra`, which exists because it is finite.
+    top_degree: i32,
+}
+
+impl Subalgebra {
+    /// The sub-Hopf-algebra of `ambient`'s kind with the given profile, if that is valid and
+    /// finite.
+    fn new(ambient: &MilnorAlgebra, profile: MilnorProfile) -> Option<Self> {
+        let algebra = ambient.with_profile(profile)?;
+        let top_degree = algebra.top_degree()?;
+        Some(Self {
+            algebra,
+            top_degree,
+        })
+    }
+
+    /// The trivial subalgebra of `ambient`, the ground field.
+    fn trivial(ambient: &MilnorAlgebra) -> Self {
+        Self {
+            algebra: ambient.ground_field(),
+            top_degree: 0,
+        }
+    }
+
+    /// The dimension of the subalgebra, saturating at `u64::MAX`.
+    fn dimension(&self) -> u64 {
+        self.algebra.total_dimension().unwrap()
+    }
+
     /// The candidates for the subalgebra `B` of [Nassau's
     /// algorithm](https://arxiv.org/abs/1910.04063) that lie in `ambient`, in increasing order of
     /// size, starting with the trivial subalgebra.
@@ -92,78 +121,6 @@ trait NassauSubalgebra: Sized {
     /// exterior shape they are the `A(n)` and the $E(Q_0, \dots, Q_n)$, which share the slope of
     /// $A(n)$ but apply slightly sooner. At the polynomial shape at odd primes there are none
     /// besides the trivial one, since we know no vanishing line there.
-    fn candidates(ambient: &MilnorAlgebra) -> Vec<Self>;
-
-    /// The slope of the vanishing line of `Ext_B`: `Ext_B^{s, t}` vanishes for
-    /// `t >= slope * (s + 1) + top_degree` (Theorem 3.1).
-    ///
-    /// This is the slope of the steepest polynomial generator of the May spectral sequence: `v_k`
-    /// for each `Q_k`, and for each `ξ_i^{p^j}` either `h_{i, j}` at `p = 2` or `b_{i, j}` at odd
-    /// primes. The exterior `h_{i, j}` at odd primes are bounded by the top degree.
-    fn vanishing_slope(&self) -> i64;
-
-    /// Whether `b` is in the vanishing region of `self`, where the algorithm applies.
-    fn is_applicable(&self, b: Bidegree) -> bool;
-
-    /// Give a list of basis elements in degree `degree` that has signature `signature`, i.e. whose
-    /// component in `self` is `signature`.
-    ///
-    /// Only basis elements coming from generators of degree strictly less than `max_gen_degree` are
-    /// considered; `None` imposes no restriction. Because generators are laid out in increasing
-    /// degree, a restricted result is a prefix of the unrestricted one; see
-    /// [`Resolution::step_resolution_with_subalgebra`] for why we restrict.
-    fn signature_mask<'a>(
-        &'a self,
-        algebra: &'a MilnorAlgebra,
-        module: &'a FreeModule<MilnorAlgebra>,
-        degree: i32,
-        signature: &'a MilnorBasisElement,
-        max_gen_degree: Option<i32>,
-    ) -> impl Iterator<Item = usize> + 'a;
-
-    /// Get the matrix of a free module homomorphism when restricted to the subquotient given by the
-    /// signature.
-    ///
-    /// Only generators of the target of degree strictly less than `target_max_gen_degree` are used
-    /// (see [`NassauSubalgebra::signature_mask`]).
-    fn signature_matrix(
-        &self,
-        hom: &FreeModuleHomomorphism<FreeModule<MilnorAlgebra>>,
-        degree: i32,
-        signature: &MilnorBasisElement,
-        target_max_gen_degree: i32,
-    ) -> Matrix;
-
-    /// The nonzero signatures of `self` with a representative in degree at most `degree`, which are
-    /// its basis elements, in degree order.
-    ///
-    /// Products raise the signature of their right factor, and the degree order is a linear
-    /// extension of that order (Lemma 2.4).
-    fn signatures(&self, degree: i32) -> impl Iterator<Item = MilnorBasisElement> + '_;
-
-    /// Write the profile of `self`, which is all [`NassauSubalgebra::from_bytes`] needs to
-    /// recover it.
-    ///
-    /// The q-part is only written at the exterior shape, so that the format at the polynomial shape
-    /// does not depend on it.
-    fn to_bytes(&self, buffer: &mut impl io::Write) -> io::Result<()>;
-
-    /// Read a subalgebra of `ambient` written by [`NassauSubalgebra::to_bytes`].
-    fn from_bytes(ambient: &MilnorAlgebra, data: &mut impl io::Read) -> io::Result<Self>;
-
-    /// Write a signature of `self`: its p-part, one `u16` per entry of the profile, then at the
-    /// exterior shape its q-part.
-    fn signature_to_bytes(
-        &self,
-        signature: &MilnorBasisElement,
-        buffer: &mut impl io::Write,
-    ) -> io::Result<()>;
-
-    /// Read a signature of `self` written by [`NassauSubalgebra::signature_to_bytes`].
-    fn signature_from_bytes(&self, data: &mut impl io::Read) -> io::Result<MilnorBasisElement>;
-}
-
-impl NassauSubalgebra for MilnorSubalgebra {
     fn candidates(ambient: &MilnorAlgebra) -> Vec<Self> {
         let mut profiles = Vec::new();
         if ambient.has_exterior() {
@@ -192,17 +149,23 @@ impl NassauSubalgebra for MilnorSubalgebra {
                 profiles
                     .into_iter()
                     .map_while(|b| Self::new(ambient, profile(b)))
-                    .take_while(|b| b.top_degree() <= MAX_TOP_DEGREE)
-                    .filter(|b| b.is_subalgebra_of(ambient)),
+                    .take_while(|b| b.top_degree <= MAX_TOP_DEGREE)
+                    .filter(|b| b.algebra.is_subalgebra_of(ambient)),
             )
             .collect()
     }
 
+    /// The slope of the vanishing line of `Ext_B`: `Ext_B^{s, t}` vanishes for
+    /// `t >= slope * (s + 1) + top_degree` (Theorem 3.1).
+    ///
+    /// This is the slope of the steepest polynomial generator of the May spectral sequence: `v_k`
+    /// for each `Q_k`, and for each `ξ_i^{p^j}` either `h_{i, j}` at `p = 2` or `b_{i, j}` at odd
+    /// primes. The exterior `h_{i, j}` at odd primes are bounded by the top degree.
     fn vanishing_slope(&self) -> i64 {
-        let algebra = self.algebra();
+        let algebra = &self.algebra;
         let p = algebra.prime().as_i32() as i64;
         let q = algebra.q() as i64;
-        let profile = self.profile();
+        let profile = self.algebra.profile();
         let tau_degrees = combinatorics::tau_degrees(algebra.prime());
         let xi_degrees = combinatorics::xi_degrees(algebra.prime());
 
@@ -224,10 +187,18 @@ impl NassauSubalgebra for MilnorSubalgebra {
             .unwrap_or(0)
     }
 
+    /// Whether `b` is in the vanishing region of `self`, where the algorithm applies.
     fn is_applicable(&self, b: Bidegree) -> bool {
-        b.t() as i64 >= self.vanishing_slope() * (b.s() as i64 + 1) + self.top_degree() as i64
+        b.t() as i64 >= self.vanishing_slope() * (b.s() as i64 + 1) + self.top_degree as i64
     }
 
+    /// Give a list of basis elements in degree `degree` that has signature `signature`, i.e. whose
+    /// component in `self` is `signature`.
+    ///
+    /// Only basis elements coming from generators of degree strictly less than `max_gen_degree` are
+    /// considered; `None` imposes no restriction. Because generators are laid out in increasing
+    /// degree, a restricted result is a prefix of the unrestricted one; see
+    /// [`Resolution::step_resolution_with_subalgebra`] for why we restrict.
     fn signature_mask<'a>(
         &'a self,
         algebra: &'a MilnorAlgebra,
@@ -247,7 +218,7 @@ impl NassauSubalgebra for MilnorSubalgebra {
                       }| (degree - gen_deg, offset),
             );
 
-        if let Some(mask) = self.packed_component_mask() {
+        if let Some(mask) = self.algebra.packed_component_mask() {
             // At this shape the p-part table is the basis.
             let value = signature.p_part.bits();
             Either::Left(gens.flat_map(move |(op_deg, offset)| {
@@ -261,13 +232,19 @@ impl NassauSubalgebra for MilnorSubalgebra {
             Either::Right(gens.flat_map(move |(op_deg, offset)| {
                 (0..algebra.dimension(op_deg))
                     .filter(move |&n| {
-                        self.has_component(&algebra.basis_element_from_index(op_deg, n), signature)
+                        self.algebra
+                            .has_component(&algebra.basis_element_from_index(op_deg, n), signature)
                     })
                     .map(move |n| offset + n)
             }))
         }
     }
 
+    /// Get the matrix of a free module homomorphism when restricted to the subquotient given by the
+    /// signature.
+    ///
+    /// Only generators of the target of degree strictly less than `target_max_gen_degree` are used
+    /// (see [`Subalgebra::signature_mask`]).
     fn signature_matrix(
         &self,
         hom: &FreeModuleHomomorphism<FreeModule<MilnorAlgebra>>,
@@ -310,16 +287,26 @@ impl NassauSubalgebra for MilnorSubalgebra {
         result
     }
 
+    /// The nonzero signatures of `self` with a representative in degree at most `degree`, which are
+    /// its basis elements, in degree order.
+    ///
+    /// Products raise the signature of their right factor, and the degree order is a linear
+    /// extension of that order (Lemma 2.4).
     fn signatures(&self, degree: i32) -> impl Iterator<Item = MilnorBasisElement> + '_ {
-        let algebra = self.algebra();
-        algebra.compute_basis(std::cmp::min(degree, self.top_degree()));
-        (1..=std::cmp::min(degree, self.top_degree())).flat_map(move |t| {
+        let algebra = &self.algebra;
+        algebra.compute_basis(std::cmp::min(degree, self.top_degree));
+        (1..=std::cmp::min(degree, self.top_degree)).flat_map(move |t| {
             (0..algebra.dimension(t)).map(move |idx| algebra.basis_element_from_index(t, idx))
         })
     }
 
+    /// Write the profile of `self`, which is all [`Subalgebra::from_bytes`] needs to
+    /// recover it.
+    ///
+    /// The q-part is only written at the exterior shape, so that the format at the polynomial shape
+    /// does not depend on it.
     fn to_bytes(&self, buffer: &mut impl io::Write) -> io::Result<()> {
-        let profile = self.profile();
+        let profile = self.algebra.profile();
         let len = profile.p_part.len();
         buffer.write_u64::<LittleEndian>(len as u64)?;
         for &entry in &profile.p_part {
@@ -330,12 +317,13 @@ impl NassauSubalgebra for MilnorSubalgebra {
         let padding = len - ((len / 8) * 8);
         buffer.write_all(&zeros[0..padding])?;
 
-        if self.algebra().has_exterior() {
+        if self.algebra.has_exterior() {
             buffer.write_u64::<LittleEndian>(profile.q_part as u64)?;
         }
         Ok(())
     }
 
+    /// Read a subalgebra of `ambient` written by [`Subalgebra::to_bytes`].
     fn from_bytes(ambient: &MilnorAlgebra, data: &mut impl io::Read) -> io::Result<Self> {
         // The packed p-part has no entry past `PPart::MAX_LEN`, so a longer profile cannot be
         // matched against one. This is the only place a profile is built from outside data, and the
@@ -373,12 +361,14 @@ impl NassauSubalgebra for MilnorSubalgebra {
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "not a finite subalgebra"))
     }
 
+    /// Write a signature of `self`: its p-part, one `u16` per entry of the profile, then at the
+    /// exterior shape its q-part.
     fn signature_to_bytes(
         &self,
         signature: &MilnorBasisElement,
         buffer: &mut impl io::Write,
     ) -> io::Result<()> {
-        let len = self.profile().p_part.len();
+        let len = self.algebra.profile().p_part.len();
         for i in 0..len {
             buffer.write_u16::<LittleEndian>(signature.p_part.get(i) as u16)?;
         }
@@ -389,14 +379,15 @@ impl NassauSubalgebra for MilnorSubalgebra {
             buffer.write_all(&zeros[0..padding * 2])?;
         }
 
-        if self.algebra().has_exterior() {
+        if self.algebra.has_exterior() {
             buffer.write_u64::<LittleEndian>(signature.q_part as u64)?;
         }
         Ok(())
     }
 
+    /// Read a signature of `self` written by [`Subalgebra::signature_to_bytes`].
     fn signature_from_bytes(&self, data: &mut impl io::Read) -> io::Result<MilnorBasisElement> {
-        let len = self.profile().p_part.len();
+        let len = self.algebra.profile().p_part.len();
         let mut p_part = vec![0; len];
         for entry in &mut p_part {
             *entry = data.read_u16::<LittleEndian>()? as PPartEntry;
@@ -409,7 +400,7 @@ impl NassauSubalgebra for MilnorSubalgebra {
             assert_eq!(buffer, [0; 8]);
         }
 
-        let q_part = if self.algebra().has_exterior() {
+        let q_part = if self.algebra.has_exterior() {
             data.read_u64::<LittleEndian>()? as u32
         } else {
             0
@@ -421,7 +412,7 @@ impl NassauSubalgebra for MilnorSubalgebra {
             })?,
             degree: 0,
         };
-        self.algebra().compute_degree(&mut signature);
+        self.algebra.compute_degree(&mut signature);
         Ok(signature)
     }
 }
@@ -431,9 +422,38 @@ fn zero_signature() -> MilnorBasisElement {
     MilnorBasisElement::default()
 }
 
+/// `A(n)`, `E(Q_0..Q_n)` or `F_p` where it is one of those, and the profile otherwise.
+impl std::fmt::Display for Subalgebra {
+    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let algebra = &self.algebra;
+        let MilnorProfile { q_part, p_part, .. } = algebra.profile();
+        let len = p_part.len();
+        let is_an = p_part.iter().rev().copied().eq(1..=len as PPartEntry);
+        if algebra.has_exterior() {
+            let top_q = (u32::BITS - q_part.leading_zeros()) as usize;
+            let q_is_initial = q_part.count_ones() as usize == top_q;
+            if *q_part == 0 && len == 0 {
+                write!(out, "F_{}", algebra.prime())
+            } else if is_an && q_is_initial && top_q == len + 1 {
+                write!(out, "A({len})")
+            } else if len == 0 && q_is_initial {
+                write!(out, "E(Q_0..Q_{})", top_q - 1)
+            } else {
+                write!(out, "B({q_part:#b}; {})", p_part.iter().join(","))
+            }
+        } else if len == 0 {
+            write!(out, "F_{}", algebra.prime())
+        } else if is_an {
+            write!(out, "A({})", len - 1)
+        } else {
+            write!(out, "B({})", p_part.iter().join(","))
+        }
+    }
+}
+
 /// An iterator through the p-part profiles of an increasing sequence of subalgebras at the
 /// polynomial shape at `p = 2`, from `A(0)` up through each `A(n)`. See
-/// [`NassauSubalgebra::candidates`].
+/// [`Subalgebra::candidates`].
 struct SubalgebraIterator {
     current: Vec<u8>,
 }
@@ -490,8 +510,8 @@ pub struct Resolution<M: ZeroModule<Algebra = MilnorAlgebra>> {
     /// The top degree of the target. A subalgebra applies to the target above its own vanishing
     /// line shifted by this.
     max_degree: i32,
-    /// See [`NassauSubalgebra::candidates`].
-    subalgebras: Vec<MilnorSubalgebra>,
+    /// See [`Subalgebra::candidates`].
+    subalgebras: Vec<Subalgebra>,
     modules: OnceBiVec<Arc<FreeModule<MilnorAlgebra>>>,
     zero_module: Arc<FreeModule<MilnorAlgebra>>,
     differentials: OnceBiVec<Arc<FreeModuleHomomorphism<FreeModule<MilnorAlgebra>>>>,
@@ -543,7 +563,7 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
         Ok(Self {
             lock: Mutex::new(()),
             zero_module: Arc::new(FreeModule::new(target.algebra(), "F_{-1}".to_string(), 0)),
-            subalgebras: MilnorSubalgebra::candidates(&target.algebra()),
+            subalgebras: Subalgebra::candidates(&target.algebra()),
             name: String::new(),
             modules: OnceBiVec::new(0),
             differentials: OnceBiVec::new(0),
@@ -605,7 +625,7 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
     fn write_qi(
         f: &mut Option<impl io::Write>,
         scratch: &mut FpVector,
-        subalgebra: &MilnorSubalgebra,
+        subalgebra: &Subalgebra,
         signature: &MilnorBasisElement,
         next_mask: &[usize],
         full_matrix: &Matrix,
@@ -679,7 +699,7 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
     fn step_resolution_with_subalgebra(
         &self,
         b: Bidegree,
-        subalgebra: &MilnorSubalgebra,
+        subalgebra: &Subalgebra,
     ) -> anyhow::Result<()> {
         let end = || {
             tracing::Span::current().record("num_new_gens", self.number_of_gens_in_bidegree(b));
@@ -1030,7 +1050,7 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
     }
 
     /// The largest candidate subalgebra that applies at `b`, which is not ordinary.
-    fn subalgebra_for(&self, b: Bidegree) -> &MilnorSubalgebra {
+    fn subalgebra_for(&self, b: Bidegree) -> &Subalgebra {
         let shifted = b - Bidegree::s_t(0, self.max_degree);
         self.subalgebras
             .iter()
@@ -1292,7 +1312,7 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> ChainComplex for Resolution<M> {
         let source = &self.modules[b.s()];
         let target = &self.modules[b.s() - 1];
         let algebra = target.algebra();
-        let subalgebra = &MilnorSubalgebra::from_bytes(&algebra, &mut f).unwrap();
+        let subalgebra = &Subalgebra::from_bytes(&algebra, &mut f).unwrap();
 
         let mut inputs: Vec<FpVector> = inputs.iter().map(|x| x.into().to_owned()).collect();
         let mut mask: Vec<usize> = Vec::with_capacity(zero_mask_dim + 8);
@@ -1560,12 +1580,13 @@ mod tests {
         Arc::new(FiniteChainComplex::ccdz(Arc::new(module)))
     }
 
-    /// The exterior shape at `p = 2`, which is $A^{\mathbb{C}}/\tau$.
+    /// $A^{\mathbb{C}}/\tau$.
     #[cfg(feature = "odd-primes")]
     fn c_tau() -> MilnorAlgebra {
-        use algebra::milnor_algebra::{Exterior, MilnorAlgebraInner};
+        use algebra::milnor_algebra::MilnorKind;
 
-        MilnorAlgebraInner::<Exterior>::new(fp::prime::TWO, false).into()
+        let profile = MilnorProfile::default();
+        MilnorAlgebra::of_kind(MilnorKind::MotivicModTau, fp::prime::TWO, profile, false).unwrap()
     }
 
     /// Resolve `target` through `max` with this and the standard algorithm, and check that the
@@ -1776,7 +1797,7 @@ mod tests {
             q_part: 0,
             p_part: vec![2, 1],
         };
-        let subalgebra = MilnorSubalgebra::new(&ambient, profile).unwrap();
+        let subalgebra = Subalgebra::new(&ambient, profile).unwrap();
         let signatures: Vec<_> = subalgebra.signatures(6).collect();
         let mut p_parts: Vec<Vec<PPartEntry>> = signatures
             .iter()
@@ -1804,7 +1825,7 @@ mod tests {
     #[test]
     fn test_candidates() {
         let ambient = MilnorAlgebra::new(fp::prime::TWO, false);
-        let candidates = MilnorSubalgebra::candidates(&ambient);
+        let candidates = Subalgebra::candidates(&ambient);
         assert_eq!(candidates[0].to_string(), "F_2");
         assert!(
             candidates
@@ -1821,8 +1842,8 @@ mod tests {
             },
             false,
         );
-        let capped = MilnorSubalgebra::candidates(&a2);
+        let capped = Subalgebra::candidates(&a2);
         assert_eq!(capped.last().unwrap().to_string(), "A(2)");
-        assert!(capped.iter().all(|b| b.is_subalgebra_of(&a2)));
+        assert!(capped.iter().all(|b| b.algebra.is_subalgebra_of(&a2)));
     }
 }
