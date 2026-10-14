@@ -1,5 +1,13 @@
 //! Batched lifting of many maps through one target complex, one bidegree at a time.
-use std::{any::Any, ops::Range, sync::Arc};
+use std::{
+    any::Any,
+    ops::Range,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::{Duration, Instant},
+};
 
 use algebra::module::Module;
 use fp::vector::FpVector;
@@ -58,6 +66,80 @@ pub struct LiftRequest<'a> {
     /// Called exactly once with the lifted `results` (`results[i]` lifts `inputs[i]`) to complete
     /// the step (scatter the results, record generators).
     pub finish: Box<dyn FnOnce(&[FpVector]) + 'a>,
+}
+
+/// Where [`MultiLift`] time goes, process-wide: the `prepare` half (building the vectors to lift --
+/// for a chain map, `f(d(x))`, a module-homomorphism application), the batched quasi-inverse
+/// application, and the `finish` half (scatter, save). Thread-summed, so they can exceed wall time.
+struct LiftStats {
+    cells: AtomicU64,
+    inputs: AtomicU64,
+    prepare_ns: AtomicU64,
+    solve_ns: AtomicU64,
+    finish_ns: AtomicU64,
+}
+
+impl LiftStats {
+    fn record(&self, inputs: usize, prepare: Duration, solve: Duration) {
+        self.cells.fetch_add(1, Ordering::Relaxed);
+        self.inputs.fetch_add(inputs as u64, Ordering::Relaxed);
+        self.prepare_ns
+            .fetch_add(prepare.as_nanos() as u64, Ordering::Relaxed);
+        self.solve_ns
+            .fetch_add(solve.as_nanos() as u64, Ordering::Relaxed);
+    }
+}
+
+static STATS: LiftStats = LiftStats {
+    cells: AtomicU64::new(0),
+    inputs: AtomicU64::new(0),
+    prepare_ns: AtomicU64::new(0),
+    solve_ns: AtomicU64::new(0),
+    finish_ns: AtomicU64::new(0),
+};
+
+/// Optional per-cell trace: when `EXT_LIFT_CELL_LOG` names a file, every [`MultiLift`] cell
+/// appends `s,t,n,liftables,inputs,prepare_s,solve_s,finish_s,start_s,end_s` to it, where
+/// `start_s`/`end_s` are wall-clock seconds since the first cell started. Measurement only.
+struct CellLog {
+    origin: Instant,
+    out: std::sync::Mutex<std::io::BufWriter<std::fs::File>>,
+}
+
+static CELL_LOG: std::sync::LazyLock<Option<CellLog>> = std::sync::LazyLock::new(|| {
+    let path = std::env::var_os("EXT_LIFT_CELL_LOG")?;
+    let file = std::fs::File::create(path).expect("EXT_LIFT_CELL_LOG: cannot create file");
+    let mut out = std::io::BufWriter::new(file);
+    use std::io::Write;
+    writeln!(
+        out,
+        "s,t,n,liftables,inputs,prepare_s,solve_s,finish_s,start_s,end_s"
+    )
+    .unwrap();
+    Some(CellLog {
+        origin: Instant::now(),
+        out: std::sync::Mutex::new(out),
+    })
+});
+
+/// Flush the `EXT_LIFT_CELL_LOG` trace, if any.
+pub fn flush_cell_log() {
+    use std::io::Write;
+    if let Some(log) = &*CELL_LOG {
+        log.out.lock().unwrap().flush().unwrap();
+    }
+}
+
+/// `(cells, inputs lifted, prepare s, solve s, finish s)` over every [`MultiLift`] step so far.
+pub fn stats() -> (u64, u64, f64, f64, f64) {
+    let s = |a: &AtomicU64| a.load(Ordering::Relaxed) as f64 / 1e9;
+    (
+        STATS.cells.load(Ordering::Relaxed),
+        STATS.inputs.load(Ordering::Relaxed),
+        s(&STATS.prepare_ns),
+        s(&STATS.solve_ns),
+        s(&STATS.finish_ns),
+    )
 }
 
 /// Extends several [`Liftable`]s that share one target complex, together, in bidegree-major order.
@@ -159,6 +241,7 @@ impl<CC: ChainComplex + Sync> MultiLift<CC> {
         let mut inputs: Vec<FpVector> = Vec::new();
         let mut finishers: Vec<(Box<dyn FnOnce(&[FpVector]) + '_>, Range<usize>)> = Vec::new();
 
+        let t0 = Instant::now();
         for liftable in &self.liftables {
             if let Some(mut req) = liftable.prepare(b) {
                 let start = inputs.len();
@@ -171,14 +254,42 @@ impl<CC: ChainComplex + Sync> MultiLift<CC> {
         // the target's module dimension at `b`.
         let fx_dim = self.target.module(b.s()).dimension(b.t());
         let mut results = vec![FpVector::new(p, fx_dim); inputs.len()];
+        let t1 = Instant::now();
         if !inputs.is_empty() {
             assert!(self.target.apply_quasi_inverse(&mut results, b, &inputs));
         }
+        let t2 = Instant::now();
+        STATS.record(inputs.len(), t1 - t0, t2 - t1);
+        let num_liftables = finishers.len();
+        let inputs_len = inputs.len();
         // Run every finisher, even when a liftable contributed no inputs (a zero-dimensional step):
         // its finish still has to register/extend the step so later reads of that bidegree see it.
         // A no-input finisher receives an empty `results` slice.
         for (finish, range) in finishers {
             finish(&results[range]);
+        }
+        let t3 = Instant::now();
+        STATS
+            .finish_ns
+            .fetch_add((t3 - t2).as_nanos() as u64, Ordering::Relaxed);
+        if let Some(log) = &*CELL_LOG {
+            use std::io::Write;
+            let rel = |t: Instant| t.saturating_duration_since(log.origin).as_secs_f64();
+            writeln!(
+                log.out.lock().unwrap(),
+                "{},{},{},{},{},{:.6},{:.6},{:.6},{:.6},{:.6}",
+                b.s(),
+                b.t(),
+                b.n(),
+                num_liftables,
+                inputs_len,
+                (t1 - t0).as_secs_f64(),
+                (t2 - t1).as_secs_f64(),
+                (t3 - t2).as_secs_f64(),
+                rel(t0),
+                rel(t3),
+            )
+            .unwrap();
         }
 
         // `completion` tracks the contiguous frontier of finished degrees per output row (s-value).

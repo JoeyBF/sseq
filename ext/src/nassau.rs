@@ -1065,8 +1065,14 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> ChainComplex for Resolution<M> {
         for<'a> &'a mut T: Into<FpSliceMut<'a>>,
         for<'a> &'a S: Into<FpSlice<'a>>,
     {
-        self.apply_quasi_inverse_fallible(results, b, inputs)
-            .unwrap_or_else(|e| panic!("apply_quasi_inverse failed at {b}: {e:#}"))
+        let t0 = std::time::Instant::now();
+        qi_stats::CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        qi_stats::INPUTS.fetch_add(inputs.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        let r = self
+            .apply_quasi_inverse_fallible(results, b, inputs)
+            .unwrap_or_else(|e| panic!("apply_quasi_inverse failed at {b}: {e:#}"));
+        qi_stats::add(&qi_stats::APPLY_NS, t0.elapsed());
+        r
     }
 }
 
@@ -1119,6 +1125,7 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                 return Ok(false);
             }
             None => {
+                qi_stats::RECOMPUTES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let reader = RecomputeReader::new(self, b);
                 (
                     reader.target_dim,
@@ -1290,6 +1297,39 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
     }
 }
 
+/// Process-wide timing of the quasi-inverse path, thread-summed (measurement only): calls to
+/// `apply_quasi_inverse`, how many of them recomputed, and inside the recompute the time to build
+/// the masked block of `d_s` (`get_partial_matrix`: the Milnor multiplications), to row reduce it,
+/// and to serialize its commands; `apply_ns` is the whole `apply_quasi_inverse` call, recompute
+/// included.
+pub mod qi_stats {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    pub(super) static CALLS: AtomicU64 = AtomicU64::new(0);
+    pub(super) static RECOMPUTES: AtomicU64 = AtomicU64::new(0);
+    pub(super) static INPUTS: AtomicU64 = AtomicU64::new(0);
+    pub(super) static SIGNATURES: AtomicU64 = AtomicU64::new(0);
+    pub(super) static MATRIX_NS: AtomicU64 = AtomicU64::new(0);
+    pub(super) static RREF_NS: AtomicU64 = AtomicU64::new(0);
+    pub(super) static SERIALIZE_NS: AtomicU64 = AtomicU64::new(0);
+    pub(super) static APPLY_NS: AtomicU64 = AtomicU64::new(0);
+
+    pub(super) fn add(a: &AtomicU64, d: std::time::Duration) {
+        a.fetch_add(d.as_nanos() as u64, Ordering::Relaxed);
+    }
+
+    /// Snapshot as a JSON object.
+    pub fn snapshot() -> serde_json::Value {
+        let n = |a: &AtomicU64| a.load(Ordering::Relaxed);
+        let secs = |a: &AtomicU64| a.load(Ordering::Relaxed) as f64 / 1e9;
+        serde_json::json!({
+            "calls": n(&CALLS), "recomputes": n(&RECOMPUTES), "inputs": n(&INPUTS),
+            "signatures": n(&SIGNATURES), "matrix_s": secs(&MATRIX_NS), "rref_s": secs(&RREF_NS),
+            "serialize_s": secs(&SERIALIZE_NS), "apply_total_s": secs(&APPLY_NS),
+        })
+    }
+}
+
 /// A streaming iterator that regenerates the quasi-inverse of `d_{b.s}` at bidegree `b` on the
 /// fly, as exactly the [`NassauCommand`]s that [`Resolution::write_qi`] wrote to the store.
 ///
@@ -1374,10 +1414,12 @@ impl<'a, M: ZeroModule<Algebra = MilnorAlgebra>> RecomputeReader<'a, M> {
             .signature_mask(&self.algebra, &self.res.modules[s - 1], t, signature)
             .collect();
 
+        let t0 = std::time::Instant::now();
         let full_matrix = {
             let _guard = ParallelGuard::new();
             self.res.differentials[s].get_partial_matrix(t, &src_mask)
         };
+        let t1 = std::time::Instant::now();
         let mut masked_matrix =
             AugmentedMatrix::new(p, src_mask.len(), [tgt_mask.len(), src_mask.len()]);
         masked_matrix
@@ -1385,15 +1427,21 @@ impl<'a, M: ZeroModule<Algebra = MilnorAlgebra>> RecomputeReader<'a, M> {
             .add_masked(&full_matrix, &tgt_mask);
         masked_matrix.segment(1, 1).add_identity();
         masked_matrix.row_reduce();
+        let t2 = std::time::Instant::now();
 
-        Resolution::<M>::write_qi(
+        let r = Resolution::<M>::write_qi(
             &mut Some(&mut self.pending),
             &mut self.scratch,
             signature,
             &tgt_mask,
             &full_matrix,
             &masked_matrix,
-        )
+        );
+        qi_stats::SIGNATURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        qi_stats::add(&qi_stats::MATRIX_NS, t1 - t0);
+        qi_stats::add(&qi_stats::RREF_NS, t2 - t1);
+        qi_stats::add(&qi_stats::SERIALIZE_NS, t2.elapsed());
+        r
     }
 }
 
