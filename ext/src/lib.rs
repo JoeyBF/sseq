@@ -124,6 +124,7 @@
 //! | [mahowald_invariant](../mahowald_invariant/index.html) | Compute (algebraic) Mahowald invariants. |
 //! | [massey](../massey/index.html) | Compute Massey products. |
 //! | [num_gens](../num_gens/index.html) | Compute the dimension of Ext in each bidegree. |
+//! | [q_weight_dims](../q_weight_dims/index.html) | Compute the dimension of Ext in each bidegree, split by $Q$-weight (odd primes). |
 //! | [resolution_size](../resolution_size/index.html) | Compute the size of the minimal resolution in each bidegree |
 //! | [resolve](../resolve/index.html) | Resolve a module to a fixed $(s, t)$ and potentially save the resolution. |
 //! | [resolve_through_stem](../resolve_through_stem/index.html) | Resolve a module to a fixed $(s, n)$ and potentially save the resolution. |
