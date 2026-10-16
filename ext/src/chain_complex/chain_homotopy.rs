@@ -11,6 +11,7 @@ use sseq::coordinates::{Bidegree, BidegreeRange};
 
 use crate::{
     chain_complex::{ChainComplex, FreeChainComplex},
+    lift::{LiftPrep, LiftRequest, Liftable},
     resolution_homomorphism::ResolutionHomomorphism,
     save::{SaveDirectory, SaveKind},
 };
@@ -31,6 +32,10 @@ pub struct ChainHomotopy<
     lock: Mutex<()>,
     /// Homotopies, indexed by the filtration of the target of f - g.
     homotopies: OnceBiVec<Arc<FreeModuleHomomorphism<U::Module>>>,
+    /// Save directory for this homotopy and any secondary lift built from it.
+    /// Set to a `homotopies/{left}__{right}` subgroup of the source's save_dir
+    /// when both `left` and `right` are named, `None` otherwise so that
+    /// homotopies between anonymous homs don't pollute the store.
     save_dir: SaveDirectory,
 }
 
@@ -44,23 +49,19 @@ impl<
         left: Arc<ResolutionHomomorphism<S, T>>,
         right: Arc<ResolutionHomomorphism<T, U>>,
     ) -> Self {
-        let save_dir = if left.source.save_dir().is_some()
-            && !left.name().is_empty()
+        assert!(Arc::ptr_eq(&left.target, &right.source));
+        let save_dir = if !left.name().is_empty()
             && !right.name().is_empty()
+            && let Some(parent) = left.source.save_dir().store()
         {
-            let mut save_dir = left.source.save_dir().clone();
-            save_dir.push(format!("massey/{},{}/", left.name(), right.name()));
-
-            SaveKind::ChainHomotopy
-                .create_dir(save_dir.write().unwrap())
-                .unwrap();
-
-            save_dir
+            SaveDirectory::Store(
+                parent
+                    .subgroup(&format!("homotopies/{}__{}", left.name(), right.name()))
+                    .expect("Failed to create homotopies subgroup"),
+            )
         } else {
             SaveDirectory::None
         };
-
-        assert!(Arc::ptr_eq(&left.target, &right.source));
         Self {
             homotopies: OnceBiVec::new((left.shift + right.shift).s() - 1),
             left,
@@ -153,12 +154,37 @@ impl<
     }
 
     fn extend_step(&self, source: Bidegree) -> std::ops::Range<i32> {
+        match self.prepare_step(source) {
+            HomotopyPrep::Done(range) => range,
+            HomotopyPrep::NeedsLift(mut pending) => {
+                let p = self.prime();
+                let mut outputs =
+                    vec![FpVector::new(p, pending.target_dim); pending.scratches.len()];
+                assert!(U::apply_quasi_inverse(
+                    &*self.right.target,
+                    &mut outputs,
+                    pending.target,
+                    &pending.scratches,
+                ));
+                self.finish_step(&mut pending, &outputs)
+            }
+        }
+    }
+
+    /// The part of a homotopy step *before* the quasi-inverse solve. Resolves the cases that need
+    /// no quasi-inverse (already computed, zero, or loaded from the save store) itself, returning
+    /// [`HomotopyPrep::Done`]; otherwise returns [`HomotopyPrep::NeedsLift`] with the vectors to
+    /// lift at `target = source + (1, 0) - shift`, to be completed by [`Self::finish_step`].
+    ///
+    /// Splitting the step this way lets [`MultiLift`](crate::lift::MultiLift) batch the
+    /// quasi-inverse solve of many homotopies at a shared bidegree.
+    fn prepare_step(&self, source: Bidegree) -> HomotopyPrep {
         let p = self.prime();
         let shift = self.shift();
         let target = source + Bidegree::s_t(1, 0) - shift;
 
         if self.homotopies[source.s()].next_degree() > source.t() {
-            return source.t()..source.t() + 1;
+            return HomotopyPrep::Done(source.t()..source.t() + 1);
         }
 
         let num_gens = self
@@ -175,24 +201,23 @@ impl<
         // these values.
         if target.s() == 0 || target_dim == 0 || num_gens == 0 {
             let outputs = vec![FpVector::new(p, target_dim); num_gens];
-            return self.homotopies[source.s()].add_generators_from_rows_ooo(source.t(), outputs);
+            return HomotopyPrep::Done(
+                self.homotopies[source.s()].add_generators_from_rows_ooo(source.t(), outputs),
+            );
         }
 
-        if let Some(dir) = self.save_dir.read()
-            && let Some(mut f) = self
-                .left
-                .source
-                .save_file(SaveKind::ChainHomotopy, source)
-                .open_file(dir.to_owned())
+        if let Some(store) = self.save_dir.store()
+            && let Some(data) = store.read(SaveKind::ChainHomotopy, source).unwrap()
         {
+            let mut cursor = &data[..];
             let mut outputs = Vec::with_capacity(num_gens);
             for _ in 0..num_gens {
-                outputs.push(FpVector::from_bytes(p, target_dim, &mut f).unwrap());
+                outputs.push(FpVector::from_bytes(p, target_dim, &mut cursor).unwrap());
             }
-            return self.homotopies[source.s()].add_generators_from_rows_ooo(source.t(), outputs);
+            return HomotopyPrep::Done(
+                self.homotopies[source.s()].add_generators_from_rows_ooo(source.t(), outputs),
+            );
         }
-
-        let mut outputs = vec![FpVector::new(p, target_dim); num_gens];
 
         let f = |i| {
             let mut scratch = FpVector::new(
@@ -256,24 +281,31 @@ impl<
 
         let scratches: Vec<FpVector> = (0..num_gens).into_maybe_par_iter().map(f).collect();
 
-        assert!(U::apply_quasi_inverse(
-            &*self.right.target,
-            &mut outputs,
+        HomotopyPrep::NeedsLift(PendingHomotopy {
+            source,
             target,
-            &scratches,
-        ));
+            target_dim,
+            scratches,
+        })
+    }
 
-        if let Some(dir) = self.save_dir.write() {
-            let mut f = self
-                .left
-                .source
-                .save_file(SaveKind::ChainHomotopy, source)
-                .create_file(dir.to_owned(), false);
-            for row in &outputs {
-                row.to_bytes(&mut f).unwrap();
+    /// Complete a homotopy step: persist and register the lifted `outputs`.
+    fn finish_step(
+        &self,
+        pending: &mut PendingHomotopy,
+        outputs: &[FpVector],
+    ) -> std::ops::Range<i32> {
+        if let Some(store) = self.save_dir.store() {
+            let mut buf = Vec::new();
+            for row in outputs {
+                row.to_bytes(&mut buf).unwrap();
             }
+            store
+                .write(SaveKind::ChainHomotopy, pending.source, &buf)
+                .unwrap();
         }
-        self.homotopies[source.s()].add_generators_from_rows_ooo(source.t(), outputs)
+        self.homotopies[pending.source.s()]
+            .add_generators_from_rows_ooo(pending.source.t(), outputs.to_vec())
     }
 
     pub fn homotopy(&self, source_s: i32) -> Arc<FreeModuleHomomorphism<U::Module>> {
@@ -282,6 +314,58 @@ impl<
 
     pub fn save_dir(&self) -> &SaveDirectory {
         &self.save_dir
+    }
+}
+
+/// Outcome of [`ChainHomotopy::prepare_step`]; see [`LiftPrep`].
+type HomotopyPrep = LiftPrep<PendingHomotopy>;
+
+/// A homotopy step awaiting its quasi-inverse solve; see [`ChainHomotopy::prepare_step`].
+struct PendingHomotopy {
+    source: Bidegree,
+    target: Bidegree,
+    target_dim: usize,
+    /// The vectors to lift, one per source generator.
+    scratches: Vec<FpVector>,
+}
+
+impl<
+    S: FreeChainComplex + Send + Sync + 'static,
+    T: FreeChainComplex<Algebra = S::Algebra> + Send + Sync + 'static,
+    U: ChainComplex<Algebra = S::Algebra> + Send + Sync + 'static,
+> Liftable for ChainHomotopy<S, T, U>
+{
+    fn prepare(&self, b: Bidegree) -> Option<LiftRequest<'_>> {
+        // `b` is the target bidegree where the quasi-inverse is taken; recover the source step.
+        let shift = self.shift();
+        let source = b + shift - Bidegree::s_t(1, 0);
+        // Below the bottom homotopy row, or out of the source/target computed range: no work here.
+        // (The zero row `target.s() == 0` is *not* skipped — `prepare_step` finishes it itself.)
+        if source.s() < shift.s() - 1 || !self.left.source.has_computed_bidegree(source) {
+            return None;
+        }
+        if b.s() >= 1 && !self.right.target.has_computed_bidegree(b) {
+            return None;
+        }
+        self.initialize_homotopies(source.s() + 1);
+        match self.prepare_step(source) {
+            HomotopyPrep::Done(_) => None,
+            HomotopyPrep::NeedsLift(mut pending) => {
+                let inputs = std::mem::take(&mut pending.scratches);
+                Some(LiftRequest {
+                    inputs,
+                    finish: Box::new(move |outputs| {
+                        self.finish_step(&mut pending, outputs);
+                    }),
+                })
+            }
+        }
+    }
+
+    fn lifts_through(&self, target: &dyn std::any::Any) -> bool {
+        target
+            .downcast_ref::<U>()
+            .is_some_and(|target| std::ptr::eq(target, &*self.right.target))
     }
 }
 
@@ -306,7 +390,7 @@ pub(crate) mod secondary {
     use crate::{
         chain_complex::FreeChainComplex,
         resolution_homomorphism::ResolutionHomomorphism,
-        save::{SaveDirectory, SaveKind},
+        save::SaveDirectory,
         secondary::{
             CompositeData, LAMBDA_BIDEGREE, SecondaryHomotopy, SecondaryLift,
             SecondaryResolutionHomomorphism,
@@ -568,12 +652,6 @@ pub(crate) mod secondary {
                     right_lambda.shift,
                     underlying.right().shift + LAMBDA_BIDEGREE
                 );
-            }
-
-            if let Some(p) = underlying.save_dir().write() {
-                for subdir in SaveKind::secondary_data() {
-                    subdir.create_dir(p).unwrap();
-                }
             }
 
             Self {
