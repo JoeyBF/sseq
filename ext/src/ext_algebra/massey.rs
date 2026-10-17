@@ -258,9 +258,17 @@ where
         let resolution = self.resolution();
         let unit = self.algebra().resolution();
         let shift = Self::massey_shift(a, b);
-        // Multiplication-by-`b` self-map of the unit, assembled from the ring's cached generator
-        // maps and already extended through `shift` (see `massey_b_hom`).
-        let b_hom = self.massey_b_hom(b, shift);
+
+        // Multiplication-by-`b` self-map of the unit. Built unextended so it can ride along in the
+        // first batch below (it shares the unit target with every `f_c`).
+        let b_coords: Vec<u32> = b.vec().iter().collect();
+        let b_hom = Arc::new(ResolutionHomomorphism::from_class(
+            String::new(),
+            Arc::clone(unit),
+            Arc::clone(unit),
+            b.degree(),
+            &b_coords,
+        ));
 
         // Enumerate every valid third factor `c` (kernel of `· b`) whose bracket lands in a computed,
         // non-empty bidegree, and build its realising map `f_c` and null-homotopy of `b ∘ c`.
@@ -300,16 +308,19 @@ where
             return Vec::new();
         }
 
-        // First batch: every `f_c` against the unit. The homotopies read these maps, so they must be
-        // fully extended before the homotopies are lifted. `MultiLift` bounds *output* bidegrees,
-        // and each `f_c` is read at output `shift` (its value at `tot = c_deg + shift` lands at
-        // `tot - c_deg = shift`), so bound the sweep there rather than across the whole plane.
-        // `b_hom` is already extended by `massey_b_hom`.
-        let map_liftables: Vec<Arc<dyn Liftable>> = f_cs
-            .iter()
-            .map(|f| Arc::clone(f) as Arc<dyn Liftable>)
-            .collect();
-        MultiLift::new(Arc::clone(unit), map_liftables).extend_through_stem(shift);
+        // First batch: `b_hom` and every `f_c` against the unit. The homotopies read these maps, so
+        // they must be fully extended before the homotopies are lifted. `MultiLift` bounds *output*
+        // bidegrees, and each `f_c` is read at output `shift` (its value at `tot = c_deg + shift`
+        // lands at `tot - c_deg = shift`), so bound the sweep there rather than across the whole
+        // plane. `b_hom` needs less — `massey_b_hom` builds it only up to *source* `shift` — but
+        // it rides along at the batch's bound rather than paying for a sweep of its own; the extra
+        // work is one map's worth against a batch of `f_cs.len()`.
+        let mut map_liftables: Vec<Arc<dyn Liftable>> = Vec::with_capacity(f_cs.len() + 1);
+        map_liftables.push(Arc::clone(&b_hom) as Arc<dyn Liftable>);
+        map_liftables.extend(f_cs.iter().map(|f| Arc::clone(f) as Arc<dyn Liftable>));
+        MultiLift::new(Arc::clone(unit), map_liftables)
+            .extend_through_stem(shift)
+            .unwrap_or_else(|e| panic!("massey_iter_c: {e}"));
 
         // Second batch: every null-homotopy against the unit. Each bracket is read at `tot`, i.e.
         // the homotopy's top lands at output bidegree `a.degree()`, so bound the sweep there.
@@ -317,7 +328,9 @@ where
             .iter()
             .map(|(_, _, h)| Arc::clone(h) as Arc<dyn Liftable>)
             .collect();
-        MultiLift::new(Arc::clone(unit), homotopy_liftables).extend_through_stem(a.degree());
+        MultiLift::new(Arc::clone(unit), homotopy_liftables)
+            .extend_through_stem(a.degree())
+            .unwrap_or_else(|e| panic!("massey_iter_c: {e}"));
 
         // Read off each bracket from its extended homotopy.
         let mut results = Vec::new();
