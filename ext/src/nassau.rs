@@ -421,6 +421,9 @@ pub struct Resolution<M: ZeroModule<Algebra = MilnorAlgebra>> {
     target: Arc<FiniteChainComplex<M>>,
     chain_maps: OnceBiVec<Arc<FreeModuleHomomorphism<M>>>,
     save_dir: SaveDirectory,
+    /// How many times the quasi-inverse at each bidegree was recomputed, for tests.
+    #[cfg(test)]
+    pub(crate) qi_recomputes: dashmap::DashMap<Bidegree, usize>,
 }
 
 impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
@@ -469,6 +472,8 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
             target,
             max_degree,
             save_dir,
+            #[cfg(test)]
+            qi_recomputes: dashmap::DashMap::new(),
         })
     }
 
@@ -1455,6 +1460,10 @@ struct RecomputeReader<'a, M: ZeroModule<Algebra = MilnorAlgebra>> {
 impl<'a, M: ZeroModule<Algebra = MilnorAlgebra>> RecomputeReader<'a, M> {
     /// Set up the regeneration of the quasi-inverse of `d_{b.s}` at `b`, emitting nothing yet.
     fn new(res: &'a Resolution<M>, b: Bidegree) -> Self {
+        #[cfg(test)]
+        {
+            *res.qi_recomputes.entry(b).or_default() += 1;
+        }
         let s = b.s();
         let t = b.t();
         // The subalgebra is chosen deterministically, as in `step_resolution_with_result` for the
