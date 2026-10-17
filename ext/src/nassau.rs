@@ -516,6 +516,9 @@ pub struct Resolution<M: ZeroModule<Algebra = MilnorAlgebra>> {
     load_eagerly: bool,
     /// The budget that lazily read differentials count against. See [`Self::set_load_budget`].
     load_cache: Option<Arc<OutputCache>>,
+    /// How many times the quasi-inverse at each bidegree was recomputed, for tests.
+    #[cfg(test)]
+    pub(crate) qi_recomputes: dashmap::DashMap<Bidegree, usize>,
 }
 
 impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
@@ -565,6 +568,8 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
             save_dir,
             load_eagerly: std::env::var_os("EXT_LOAD_EAGERLY").is_some_and(|v| v != "0"),
             load_cache: load_budget_from_env()?.map(OutputCache::new),
+            #[cfg(test)]
+            qi_recomputes: dashmap::DashMap::new(),
         })
     }
 
@@ -2054,6 +2059,10 @@ struct RecomputeReader<'a, M: ZeroModule<Algebra = MilnorAlgebra>> {
 
 impl<'a, M: ZeroModule<Algebra = MilnorAlgebra>> RecomputeReader<'a, M> {
     fn new(res: &'a Resolution<M>, b: Bidegree) -> anyhow::Result<Self> {
+        #[cfg(test)]
+        {
+            *res.qi_recomputes.entry(b).or_default() += 1;
+        }
         let subalgebra = res.subalgebra_for(b + Bidegree::s_t(1, 0));
         let source = &res.modules[b.s()];
         let next = &res.modules[b.s() - 1];
