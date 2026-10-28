@@ -117,6 +117,7 @@
 //! | --- | --- |
 //! | [algebra_dim](../algebra_dim/index.html) | Print the dimension of the Steenrod algebra in each degree. |
 //! | [bruner](../bruner/index.html) | Compare our basis with Bruner's. |
+//! | [chart_motivic](../chart_motivic/index.html) | Chart the C-motivic deformation spectral sequence. |
 //! | [define_module](../define_module/index.html) | Interactively define a Steenrod module. |
 //! | [differentials](../differentials/index.html) | Print all differentials in the minimal resolution. |
 //! | [filtration_one](../filtration_one/index.html) | Print all filtration one products. |
