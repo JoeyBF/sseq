@@ -66,23 +66,12 @@ impl MotivicResolution {
             "the motivic lift needs a resolution over all of A_C/τ, not {algebra}"
         );
         // δ maps `(s, t)` to `(s - 1, t)`, one stem up, so Ext at stem `n` reads the generators at
-        // stem `n + 1` and nothing beyond. A margin of one stem is therefore exact; `MOT_MARGIN`
-        // only widens it.
-        let margin: i32 = std::env::var("MOT_MARGIN")
-            .ok()
-            .and_then(|v| v.parse::<i32>().ok())
-            .map(|m| m.max(1))
-            .unwrap_or(1);
-        let compute = Bidegree::n_s(max.n() + margin, max.s());
+        // stem `n + 1`.
+        let compute = Bidegree::n_s(max.n() + 1, max.s());
         tracing::Span::current().record("compute", tracing::field::display(compute));
-        let profile = std::env::var("MOT_PROFILE").is_ok();
-        let t0 = std::time::Instant::now();
-        resolution.compute_through_stem(compute);
+        tracing::info_span!("resolve").in_scope(|| resolution.compute_through_stem(compute));
         let engine = MotivicMilnorAlgebra::new();
-        engine.compute_basis(compute.n() + compute.s());
-        if profile {
-            eprintln!("[profile] resolution: {:?}", t0.elapsed());
-        }
+        engine.compute_basis(compute.t());
 
         let mut this = Self {
             engine,
@@ -92,16 +81,8 @@ impl MotivicResolution {
             max,
             compute,
         };
-        let t1 = std::time::Instant::now();
         this.compute_weights()?;
-        if profile {
-            eprintln!("[profile] weights:    {:?}", t1.elapsed());
-        }
-        let t2 = std::time::Instant::now();
         this.lift();
-        if profile {
-            eprintln!("[profile] lift:       {:?}", t2.elapsed());
-        }
         Ok(this)
     }
 
@@ -140,8 +121,9 @@ impl MotivicResolution {
     /// Call `f` on the terms of the $A_C$ product of the operations `(t1, idx1)` and `(t2, idx2)`,
     /// in that order as $A_C/\tau$ multiplies them.
     ///
-    /// The engine orders its factors oppositely to [`MilnorAlgebra`](algebra::MilnorAlgebra), so this asks it for the
-    /// transposed product, which is $A_C$'s in [`MilnorAlgebra`](algebra::MilnorAlgebra)'s convention.
+    /// The engine orders its factors oppositely to [`MilnorAlgebra`](algebra::MilnorAlgebra), so
+    /// this asks it for the transposed product, which is $A_C$'s in
+    /// [`MilnorAlgebra`](algebra::MilnorAlgebra)'s convention.
     fn product_with<R>(
         &self,
         t1: i32,
@@ -204,38 +186,15 @@ impl MotivicResolution {
 
     /// Lift one generator's differential to $A_C$.
     ///
-    /// The corrections of a generator at stem `n` reach up to stem `n + s`, so one past the
-    /// report box's `n + s` cannot converge. Nothing in the report box reads it, so it keeps its
-    /// mod-$\tau$ support.
+    /// A generator in the stem margin past `max` keeps its mod-$\tau$ support: correcting it
+    /// needs the quasi-inverse one stem further out, which the resolution does not have.
     fn lift_generator(&self, g: BidegreeGenerator) -> BTreeSet<usize> {
         let cells = DifferentialCells(self);
-        let stem = g.t() - g.s();
-        let in_cone = stem <= self.max.n() + self.max.s();
-        if g.s() >= 2 && in_cone && self.weights.contains_key(&g) {
+        if g.s() >= 2 && g.n() <= self.max.n() {
             cells.lift_cell(g)
         } else {
             cells.seed(g)
         }
-    }
-
-    /// XOR the contribution of the $F_{s-1}$ basis element `bidx` of `d_s(g_k)` into a running
-    /// `d_{s-1} d_s` parity vector over $F_{s-2}$ in degree `t`.
-    ///
-    /// The composite is linear in the support and each output element's $\tau$-power depends on
-    /// that element alone, so toggling a support term in or out is one call here.
-    #[allow(clippy::too_many_arguments)]
-    fn accumulate_term(
-        &self,
-        s: i32,
-        t: i32,
-        f_sm1: &FreeModule<SteenrodAlgebra>,
-        f_sm2: &FreeModule<SteenrodAlgebra>,
-        _engine: &MotivicMilnorAlgebra,
-        bidx: usize,
-        parity: &mut FpVector,
-    ) {
-        // The differential preserves degree, hence an inner shift of 0.
-        self.compose_into(f_sm1, t, s - 1, &self.lifted, 0, f_sm2, bidx, parity);
     }
 
     /// Compose the basis element `bidx` of `outer_mod` with the lifted map `inner`, XORing the
@@ -287,11 +246,10 @@ impl MotivicResolution {
         let w_k = self.weights[&g_k];
         let f_sm1 = self.module(s - 1);
         let f_sm2 = self.module(s - 2);
-        let engine = &self.engine;
 
         let mut parity = FpVector::new(TWO, f_sm2.dimension(t));
         for &bidx in support {
-            self.accumulate_term(s, t, &f_sm1, &f_sm2, engine, bidx, &mut parity);
+            self.compose_into(&f_sm1, t, s - 1, &self.lifted, 0, &f_sm2, bidx, &mut parity);
         }
 
         parity
@@ -316,7 +274,7 @@ impl MotivicResolution {
     ///
     /// # Panics
     ///
-    /// If a generator is not weight-homogeneous.
+    /// If a generator is not weight-homogeneous or has zero differential.
     #[tracing::instrument(skip(self), fields(num_weights = tracing::field::Empty))]
     fn compute_weights(&mut self) -> anyhow::Result<()> {
         let mut weights: HashMap<BidegreeGenerator, i32> = HashMap::new();
@@ -350,10 +308,8 @@ impl MotivicResolution {
                         let op_w = self.op_weight(og.operation_degree, og.operation_index);
                         let tgt =
                             BidegreeGenerator::s_t(s - 1, og.generator_degree, og.generator_index);
-                        let Some(&tgt_w) = weights.get(&tgt) else {
-                            continue;
-                        };
-                        let w = op_w + tgt_w;
+                        // Targets lie at `s - 1` in lower degree, so they were weighted first.
+                        let w = op_w + weights[&tgt];
                         match weight {
                             None => weight = Some(w),
                             Some(w0) => assert_eq!(
@@ -362,9 +318,12 @@ impl MotivicResolution {
                             ),
                         }
                     }
-                    if let Some(w) = weight {
-                        weights.insert(BidegreeGenerator::s_t(s, t, idx), w);
-                    }
+                    // A minimal resolution of a cyclic module has no generator with zero
+                    // differential above `s = 0`.
+                    let w = weight.unwrap_or_else(|| {
+                        panic!("generator with zero differential at (s={s}, t={t}, idx={idx})")
+                    });
+                    weights.insert(BidegreeGenerator::s_t(s, t, idx), w);
                 }
             }
         }
@@ -502,7 +461,9 @@ trait TauLift {
             self.accumulate(g, bidx, &mut parity);
         }
 
-        for _ in 0..256 {
+        // The τ-order the previous pass cancelled; the mod-τ defect is zero.
+        let mut cancelled = 0;
+        loop {
             // The lowest τ-order among the surviving error terms.
             let Some(min_power) = parity
                 .iter_nonzero()
@@ -518,6 +479,12 @@ trait TauLift {
                 g.t(),
                 g.idx()
             );
+            // A pass that left its own order standing found no correction: the error was not a
+            // mod-τ boundary.
+            if min_power <= cancelled {
+                break;
+            }
+            cancelled = min_power;
 
             // The error at that lowest τ-order, as a defect-module vector.
             let mut e = FpVector::new(TWO, def_dim);
@@ -541,7 +508,6 @@ trait TauLift {
                 self.accumulate(g, idx, &mut parity);
             }
         }
-        // Each pass cancels the lowest τ-order, so reaching the cap means an invariant failed.
         tracing::warn!(
             "motivic lift did not converge at (s={}, t={}, idx={}); leaving a partial lift",
             g.s(),
@@ -584,8 +550,16 @@ impl TauLift for DifferentialCells<'_> {
     fn accumulate(&self, g: BidegreeGenerator, bidx: usize, parity: &mut FpVector) {
         let f_sm1 = self.0.module(g.s() - 1);
         let f_sm2 = self.0.module(g.s() - 2);
-        self.0
-            .accumulate_term(g.s(), g.t(), &f_sm1, &f_sm2, &self.0.engine, bidx, parity);
+        self.0.compose_into(
+            &f_sm1,
+            g.t(),
+            g.s() - 1,
+            &self.0.lifted,
+            0,
+            &f_sm2,
+            bidx,
+            parity,
+        );
     }
 
     fn solve(&self, g: BidegreeGenerator, e: &FpVector) -> Option<FpVector> {
