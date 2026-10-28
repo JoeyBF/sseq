@@ -66,8 +66,9 @@ impl MotivicResolution {
             "the motivic lift needs a resolution over all of A_C/τ, not {algebra}"
         );
         // δ maps `(s, t)` to `(s - 1, t)`, one stem up, so Ext at stem `n` reads the generators at
-        // stem `n + 1`.
-        let compute = Bidegree::n_s(max.n() + 1, max.s());
+        // stem `n + 1`. The lift at stem `n` reads their lifted differentials too, through δ, and
+        // lifting stem `n + 1` takes the quasi-inverses at stem `n + 2`.
+        let compute = Bidegree::n_s(max.n() + 2, max.s());
         tracing::Span::current().record("compute", tracing::field::display(compute));
         tracing::info_span!("resolve").in_scope(|| resolution.compute_through_stem(compute));
         let engine = MotivicMilnorAlgebra::new();
@@ -186,14 +187,23 @@ impl MotivicResolution {
 
     /// Lift one generator's differential to $A_C$.
     ///
-    /// A generator in the stem margin past `max` keeps its mod-$\tau$ support: correcting it
-    /// needs the quasi-inverse one stem further out, which the resolution does not have.
+    /// The last stem of `compute` keeps its mod-$\tau$ support, since correcting it needs the
+    /// quasi-inverse one stem further out. The stem before it reads those unfinished
+    /// differentials through δ and may stall on them, so it keeps whatever partial lift it
+    /// reaches. A stall inside `max` would mean the margin is too narrow, so it panics.
+    ///
+    /// # Panics
+    ///
+    /// If the lift of a generator in `max` stalls.
     fn lift_generator(&self, g: BidegreeGenerator) -> BTreeSet<usize> {
         let cells = DifferentialCells(self);
-        if g.s() >= 2 && g.n() <= self.max.n() {
-            cells.lift_cell(g)
-        } else {
-            cells.seed(g)
+        if g.s() < 2 || g.n() >= self.compute.n() {
+            return cells.seed(g);
+        }
+        match cells.lift_cell(g) {
+            Ok(support) => support,
+            Err(partial) if g.n() > self.max.n() => partial,
+            Err(_) => panic!("the motivic lift stalled at {g:?}, inside the report box"),
         }
     }
 
@@ -446,9 +456,11 @@ trait TauLift {
 
     /// Cancel the defect one weight-order at a time and return the lifted support.
     ///
-    /// A cell whose corrections leave the resolved box keeps a partial lift; nothing in the
-    /// report box reads it.
-    fn lift_cell(&self, g: BidegreeGenerator) -> BTreeSet<usize> {
+    /// # Errors
+    ///
+    /// The partial lift, if the corrections leave the resolved box or an order of the defect has
+    /// no correction.
+    fn lift_cell(&self, g: BidegreeGenerator) -> Result<BTreeSet<usize>, BTreeSet<usize>> {
         let (def_mod, def_t) = self.defect_module(g);
         let def_dim = def_mod.dimension(def_t);
         let w_k = self.source_weight(g);
@@ -470,7 +482,7 @@ trait TauLift {
                 .map(|(fidx, _)| self.defect_weight(g, fidx) - w_k)
                 .min()
             else {
-                return support;
+                return Ok(support);
             };
             assert!(
                 min_power >= 1,
@@ -496,7 +508,7 @@ trait TauLift {
 
             // Each term of `c` is forced by weight to τ-power `min_power`, cancelling this order.
             let Some(c) = self.solve(g, &e) else {
-                return support;
+                return Err(support);
             };
             for (idx, v) in c.iter_nonzero() {
                 if v == 0 {
@@ -508,13 +520,7 @@ trait TauLift {
                 self.accumulate(g, idx, &mut parity);
             }
         }
-        tracing::warn!(
-            "motivic lift did not converge at (s={}, t={}, idx={}); leaving a partial lift",
-            g.s(),
-            g.t(),
-            g.idx()
-        );
-        support
+        Err(support)
     }
 }
 
@@ -656,6 +662,12 @@ mod tests {
     #[test]
     fn the_sphere_lifts() {
         check_lift("Ctau", Bidegree::n_s(8, 5));
+    }
+
+    #[test]
+    fn the_top_stem_lifts() {
+        // The top stem here reads, through δ, a lift that needs the second stem of margin.
+        check_lift("Ctau", Bidegree::n_s(10, 5));
     }
 
     #[test]
