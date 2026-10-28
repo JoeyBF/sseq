@@ -2,7 +2,7 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
-    sync::Arc,
+    sync::{Arc, OnceLock},
 };
 
 use algebra::{
@@ -12,9 +12,16 @@ use algebra::{
 };
 use fp::{prime::TWO, vector::FpVector};
 use maybe_rayon::prelude::*;
-use sseq::coordinates::{Bidegree, BidegreeGenerator};
+use sseq::{
+    Sseq,
+    coordinates::{Bidegree, BidegreeGenerator},
+};
 
 use crate::{CCC, chain_complex::ChainComplex, resolution::Resolution};
+
+mod deformation;
+
+pub use deformation::Deformation;
 
 /// The C-motivic resolution: a minimal resolution over $A_C/\tau$, lifted to $A_C$.
 ///
@@ -41,6 +48,8 @@ pub struct MotivicResolution {
     max: Bidegree,
     /// The box actually resolved: `max` with the stem margin [`Self::certify`] accepted.
     compute: Bidegree,
+    /// Built on first use by [`Self::deformation_sseq`].
+    deformation: OnceLock<Sseq<3, Deformation>>,
 }
 
 impl MotivicResolution {
@@ -74,6 +83,7 @@ impl MotivicResolution {
             stalled: HashMap::new(),
             max,
             compute: max,
+            deformation: OnceLock::new(),
         };
         // δ maps `(s, t)` to `(s - 1, t)`, one stem up, so Ext at stem `n` reads the generators at
         // stem `n + 1`, and the lift reads their differentials in turn, each stem further out at
