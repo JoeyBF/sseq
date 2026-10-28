@@ -12,18 +12,9 @@ use algebra::{
 };
 use fp::{prime::TWO, vector::FpVector};
 use maybe_rayon::prelude::*;
-use sseq::coordinates::Bidegree;
+use sseq::coordinates::{Bidegree, BidegreeGenerator};
 
 use crate::{CCC, chain_complex::ChainComplex, resolution::Resolution};
-
-/// A generator of the resolution, identified by homological degree `s`, internal
-/// degree `t`, and index within that `(s, t)` bidegree.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct Gen {
-    pub s: i32,
-    pub t: i32,
-    pub idx: usize,
-}
 
 /// The C-motivic resolution: a minimal resolution over $A_C/\tau$, lifted to $A_C$.
 ///
@@ -40,10 +31,10 @@ pub struct MotivicResolution {
     engine: MotivicMilnorAlgebra,
     resolution: Arc<Resolution<CCC>>,
     /// Motivic weight of each generator.
-    weights: Arc<HashMap<Gen, i32>>,
+    weights: Arc<HashMap<BidegreeGenerator, i32>>,
     /// The lifted $A_C$ differential of each generator, as its support in $F_{s-1}$. Each
     /// coefficient is 1 and its $\tau$-power is forced by the weights.
-    lifted: HashMap<Gen, BTreeSet<usize>>,
+    lifted: HashMap<BidegreeGenerator, BTreeSet<usize>>,
     /// The box results are reported in.
     max: Bidegree,
     /// The box actually resolved: `max` with a stem margin for the reach of δ (see
@@ -142,7 +133,7 @@ impl MotivicResolution {
 
     /// The motivic weight of a generator (panics if out of the computed range or
     /// if the generator's weight could not be determined).
-    pub fn generator_weight(&self, g: Gen) -> i32 {
+    pub fn generator_weight(&self, g: BidegreeGenerator) -> i32 {
         self.weights[&g]
     }
 
@@ -178,11 +169,8 @@ impl MotivicResolution {
         let module = self.module(s);
         let og = module.index_to_op_gen(t, bidx);
         let op_w = self.op_weight(og.operation_degree, og.operation_index);
-        let gen_w = self.weights[&Gen {
-            s,
-            t: og.generator_degree,
-            idx: og.generator_index,
-        }];
+        let gen_w =
+            self.weights[&BidegreeGenerator::s_t(s, og.generator_degree, og.generator_index)];
         op_w + gen_w
     }
 
@@ -199,11 +187,13 @@ impl MotivicResolution {
         // independent.
         for s in 1..=self.max_s() {
             let t_max = self.compute.n() + s;
-            let gens: Vec<Gen> = (0..=t_max)
-                .flat_map(|t| (0..self.num_gens(s, t)).map(move |idx| Gen { s, t, idx }))
+            let gens: Vec<BidegreeGenerator> = (0..=t_max)
+                .flat_map(|t| {
+                    (0..self.num_gens(s, t)).map(move |idx| BidegreeGenerator::s_t(s, t, idx))
+                })
                 .collect();
             let _span = tracing::info_span!("lift_s", s, num_gens = gens.len()).entered();
-            let lifted: Vec<(Gen, BTreeSet<usize>)> = gens
+            let lifted: Vec<(BidegreeGenerator, BTreeSet<usize>)> = gens
                 .into_maybe_par_iter()
                 .map(|g| (g, self.lift_generator(g)))
                 .collect();
@@ -217,11 +207,11 @@ impl MotivicResolution {
     /// The corrections of a generator at stem `n` reach up to stem `n + s`, so one past the
     /// report box's `n + s` cannot converge. Nothing in the report box reads it, so it keeps its
     /// mod-$\tau$ support.
-    fn lift_generator(&self, g: Gen) -> BTreeSet<usize> {
+    fn lift_generator(&self, g: BidegreeGenerator) -> BTreeSet<usize> {
         let cells = DifferentialCells(self);
-        let stem = g.t - g.s;
+        let stem = g.t() - g.s();
         let in_cone = stem <= self.max.n() + self.max.s();
-        if g.s >= 2 && in_cone && self.weights.contains_key(&g) {
+        if g.s() >= 2 && in_cone && self.weights.contains_key(&g) {
             cells.lift_cell(g)
         } else {
             cells.seed(g)
@@ -261,7 +251,7 @@ impl MotivicResolution {
         outer_mod: &FreeModule<SteenrodAlgebra>,
         outer_t: i32,
         outer_s: i32,
-        inner: &HashMap<Gen, BTreeSet<usize>>,
+        inner: &HashMap<BidegreeGenerator, BTreeSet<usize>>,
         inner_shift_t: i32,
         inner_out_mod: &FreeModule<SteenrodAlgebra>,
         bidx: usize,
@@ -269,15 +259,11 @@ impl MotivicResolution {
     ) {
         let og = outer_mod.index_to_op_gen(outer_t, bidx);
         let (m_deg, m_idx) = (og.operation_degree, og.operation_index);
-        let gj = Gen {
-            s: outer_s,
-            t: og.generator_degree,
-            idx: og.generator_index,
-        };
+        let gj = BidegreeGenerator::s_t(outer_s, og.generator_degree, og.generator_index);
         let Some(gj_inner) = inner.get(&gj) else {
             return;
         };
-        let inner_t = gj.t - inner_shift_t;
+        let inner_t = gj.t() - inner_shift_t;
         for &bidx2 in gj_inner {
             let og2 = inner_out_mod.index_to_op_gen(inner_t, bidx2);
             let (mp_deg, mp_idx) = (og2.operation_degree, og2.operation_index);
@@ -294,10 +280,10 @@ impl MotivicResolution {
     }
 
     /// The composite `d_{s-1} d_s(g_k)` over $A_C$, as its surviving $F_{s-2}$ basis elements in
-    /// degree `g_k.t`, each with its forced $\tau$-power.
-    fn composite(&self, g_k: Gen, support: &BTreeSet<usize>) -> BTreeMap<usize, i32> {
-        let s = g_k.s;
-        let t = g_k.t;
+    /// degree `g_k.t()`, each with its forced $\tau$-power.
+    fn composite(&self, g_k: BidegreeGenerator, support: &BTreeSet<usize>) -> BTreeMap<usize, i32> {
+        let s = g_k.s();
+        let t = g_k.t();
         let w_k = self.weights[&g_k];
         let f_sm1 = self.module(s - 1);
         let f_sm2 = self.module(s - 2);
@@ -333,7 +319,7 @@ impl MotivicResolution {
     /// If a generator is not weight-homogeneous.
     #[tracing::instrument(skip(self), fields(num_weights = tracing::field::Empty))]
     fn compute_weights(&mut self) -> anyhow::Result<()> {
-        let mut weights: HashMap<Gen, i32> = HashMap::new();
+        let mut weights: HashMap<BidegreeGenerator, i32> = HashMap::new();
         // Only the degree-0 generator is seeded, so any other `s = 0` generator would have no
         // weight to propagate from.
         for t in 0..=self.compute.n() {
@@ -346,7 +332,7 @@ impl MotivicResolution {
                 );
             }
         }
-        weights.insert(Gen { s: 0, t: 0, idx: 0 }, 0);
+        weights.insert(BidegreeGenerator::s_t(0, 0, 0), 0);
 
         for s in 1..=self.max_s() {
             let d = self.resolution.differential(s);
@@ -362,11 +348,8 @@ impl MotivicResolution {
                         }
                         let og = target.index_to_op_gen(t, bidx);
                         let op_w = self.op_weight(og.operation_degree, og.operation_index);
-                        let tgt = Gen {
-                            s: s - 1,
-                            t: og.generator_degree,
-                            idx: og.generator_index,
-                        };
+                        let tgt =
+                            BidegreeGenerator::s_t(s - 1, og.generator_degree, og.generator_index);
                         let Some(&tgt_w) = weights.get(&tgt) else {
                             continue;
                         };
@@ -380,7 +363,7 @@ impl MotivicResolution {
                         }
                     }
                     if let Some(w) = weight {
-                        weights.insert(Gen { s, t, idx }, w);
+                        weights.insert(BidegreeGenerator::s_t(s, t, idx), w);
                     }
                 }
             }
@@ -396,24 +379,21 @@ impl MotivicResolution {
     /// differential on the free $\mathbb{F}_2[\tau]$-modules of generators, and
     /// $\mathrm{Ext}_{A_C} = H(\delta)$ is the motivic Adams $E_2$. A minimal resolution has no
     /// unit-operation part mod $\tau$; the lift's $\tau$-power corrections create it.
-    pub fn delta(&self, g: Gen) -> Vec<(Gen, u32)> {
-        let module = self.module(g.s - 1);
+    pub fn delta(&self, g: BidegreeGenerator) -> Vec<(BidegreeGenerator, u32)> {
+        let module = self.module(g.s() - 1);
         let w_k = self.weights[&g];
         let mut out = Vec::new();
         for &bidx in &self.lifted[&g] {
-            let og = module.index_to_op_gen(g.t, bidx);
+            let og = module.index_to_op_gen(g.t(), bidx);
             // The unit is the only operation in degree 0.
             if og.operation_degree == 0 {
-                let gj = Gen {
-                    s: g.s - 1,
-                    t: og.generator_degree,
-                    idx: og.generator_index,
-                };
+                let gj = BidegreeGenerator::s_t(g.s() - 1, og.generator_degree, og.generator_index);
                 let diff = self.weights[&gj] - w_k;
                 let power = u32::try_from(diff).unwrap_or_else(|_| {
                     panic!(
                         "δ must raise the weight, got τ-power {diff} at (s={}, t={})",
-                        g.s, g.t
+                        g.s(),
+                        g.t()
                     )
                 });
                 out.push((gj, power));
@@ -423,12 +403,12 @@ impl MotivicResolution {
     }
 
     /// The mod-$\tau$ support of the lifted `d_s(g)`: its terms with $\tau$-power 0.
-    fn mod_tau_support(&self, g: Gen) -> BTreeSet<usize> {
+    fn mod_tau_support(&self, g: BidegreeGenerator) -> BTreeSet<usize> {
         let w = self.weights[&g];
         self.lifted[&g]
             .iter()
             .copied()
-            .filter(|&bidx| w - self.entry_weight(g.s - 1, g.t, bidx) == 0)
+            .filter(|&bidx| w - self.entry_weight(g.s() - 1, g.t(), bidx) == 0)
             .collect()
     }
 
@@ -437,7 +417,7 @@ impl MotivicResolution {
         for s in 2..=self.max_s() {
             for t in 0..=(self.max.n() + s) {
                 for idx in 0..self.num_gens(s, t) {
-                    let g = Gen { s, t, idx };
+                    let g = BidegreeGenerator::s_t(s, t, idx);
                     let err = self.composite(g, &self.lifted[&g]);
                     assert!(
                         err.is_empty(),
@@ -454,7 +434,7 @@ impl MotivicResolution {
         for s in 1..=self.max_s() {
             for t in 0..=(self.max.n() + s) {
                 for idx in 0..self.num_gens(s, t) {
-                    let g = Gen { s, t, idx };
+                    let g = BidegreeGenerator::s_t(s, t, idx);
                     let engine_support: BTreeSet<usize> = self
                         .resolution
                         .differential(s)
@@ -484,32 +464,32 @@ impl MotivicResolution {
 /// [`Self::lift_cell`].
 trait TauLift {
     /// The weight the defect is graded against: the source generator's.
-    fn source_weight(&self, g: Gen) -> i32;
+    fn source_weight(&self, g: BidegreeGenerator) -> i32;
 
     /// The mod-$\tau$ support to start from, in the output module.
-    fn seed(&self, g: Gen) -> BTreeSet<usize>;
+    fn seed(&self, g: BidegreeGenerator) -> BTreeSet<usize>;
 
     /// The module and degree the defect lives in.
-    fn defect_module(&self, g: Gen) -> (Arc<FreeModule<SteenrodAlgebra>>, i32);
+    fn defect_module(&self, g: BidegreeGenerator) -> (Arc<FreeModule<SteenrodAlgebra>>, i32);
 
     /// The weight of defect-module basis element `bidx`.
-    fn defect_weight(&self, g: Gen, bidx: usize) -> i32;
+    fn defect_weight(&self, g: BidegreeGenerator, bidx: usize) -> i32;
 
     /// Seed the running defect with the part that does not depend on the output support.
-    fn seed_constant(&self, _g: Gen, _parity: &mut FpVector) {}
+    fn seed_constant(&self, _g: BidegreeGenerator, _parity: &mut FpVector) {}
 
     /// XOR into `parity` the defect contribution of output-support element `bidx`.
-    fn accumulate(&self, g: Gen, bidx: usize, parity: &mut FpVector);
+    fn accumulate(&self, g: BidegreeGenerator, bidx: usize, parity: &mut FpVector);
 
     /// Solve `d̄(c) = e` for a correction `c` in the output module, or `None` past the resolved
     /// box, where there is no quasi-inverse.
-    fn solve(&self, g: Gen, e: &FpVector) -> Option<FpVector>;
+    fn solve(&self, g: BidegreeGenerator, e: &FpVector) -> Option<FpVector>;
 
     /// Cancel the defect one weight-order at a time and return the lifted support.
     ///
     /// A cell whose corrections leave the resolved box keeps a partial lift; nothing in the
     /// report box reads it.
-    fn lift_cell(&self, g: Gen) -> BTreeSet<usize> {
+    fn lift_cell(&self, g: BidegreeGenerator) -> BTreeSet<usize> {
         let (def_mod, def_t) = self.defect_module(g);
         let def_dim = def_mod.dimension(def_t);
         let w_k = self.source_weight(g);
@@ -534,9 +514,9 @@ trait TauLift {
             assert!(
                 min_power >= 1,
                 "mod-τ defect ≠ 0 at (s={}, t={}, idx={}) — the model is not a complex",
-                g.s,
-                g.t,
-                g.idx
+                g.s(),
+                g.t(),
+                g.idx()
             );
 
             // The error at that lowest τ-order, as a defect-module vector.
@@ -564,9 +544,9 @@ trait TauLift {
         // Each pass cancels the lowest τ-order, so reaching the cap means an invariant failed.
         tracing::warn!(
             "motivic lift did not converge at (s={}, t={}, idx={}); leaving a partial lift",
-            g.s,
-            g.t,
-            g.idx
+            g.s(),
+            g.t(),
+            g.idx()
         );
         support
     }
@@ -578,40 +558,40 @@ trait TauLift {
 struct DifferentialCells<'a>(&'a MotivicResolution);
 
 impl TauLift for DifferentialCells<'_> {
-    fn source_weight(&self, g: Gen) -> i32 {
+    fn source_weight(&self, g: BidegreeGenerator) -> i32 {
         self.0.weights[&g]
     }
 
-    fn seed(&self, g: Gen) -> BTreeSet<usize> {
+    fn seed(&self, g: BidegreeGenerator) -> BTreeSet<usize> {
         self.0
             .resolution
-            .differential(g.s)
-            .output(g.t, g.idx)
+            .differential(g.s())
+            .output(g.t(), g.idx())
             .iter_nonzero()
             .filter(|(_, v)| *v != 0)
             .map(|(i, _)| i)
             .collect()
     }
 
-    fn defect_module(&self, g: Gen) -> (Arc<FreeModule<SteenrodAlgebra>>, i32) {
-        (self.0.module(g.s - 2), g.t)
+    fn defect_module(&self, g: BidegreeGenerator) -> (Arc<FreeModule<SteenrodAlgebra>>, i32) {
+        (self.0.module(g.s() - 2), g.t())
     }
 
-    fn defect_weight(&self, g: Gen, bidx: usize) -> i32 {
-        self.0.entry_weight(g.s - 2, g.t, bidx)
+    fn defect_weight(&self, g: BidegreeGenerator, bidx: usize) -> i32 {
+        self.0.entry_weight(g.s() - 2, g.t(), bidx)
     }
 
-    fn accumulate(&self, g: Gen, bidx: usize, parity: &mut FpVector) {
-        let f_sm1 = self.0.module(g.s - 1);
-        let f_sm2 = self.0.module(g.s - 2);
+    fn accumulate(&self, g: BidegreeGenerator, bidx: usize, parity: &mut FpVector) {
+        let f_sm1 = self.0.module(g.s() - 1);
+        let f_sm2 = self.0.module(g.s() - 2);
         self.0
-            .accumulate_term(g.s, g.t, &f_sm1, &f_sm2, &self.0.engine, bidx, parity);
+            .accumulate_term(g.s(), g.t(), &f_sm1, &f_sm2, &self.0.engine, bidx, parity);
     }
 
-    fn solve(&self, g: Gen, e: &FpVector) -> Option<FpVector> {
-        let d_prev = self.0.resolution.differential(g.s - 1);
-        let qi = d_prev.quasi_inverse(g.t)?;
-        let mut c = FpVector::new(TWO, self.0.module(g.s - 1).dimension(g.t));
+    fn solve(&self, g: BidegreeGenerator, e: &FpVector) -> Option<FpVector> {
+        let d_prev = self.0.resolution.differential(g.s() - 1);
+        let qi = d_prev.quasi_inverse(g.t())?;
+        let mut c = FpVector::new(TWO, self.0.module(g.s() - 1).dimension(g.t()));
         qi.apply(c.as_slice_mut(), 1, e.as_slice());
         Some(c)
     }
@@ -666,12 +646,12 @@ mod tests {
         let res = MotivicResolution::new(resolution(spec), max).unwrap();
 
         // The unit has weight 0, and every generator in range has a weight.
-        assert_eq!(res.generator_weight(Gen { s: 0, t: 0, idx: 0 }), 0);
+        assert_eq!(res.generator_weight(BidegreeGenerator::s_t(0, 0, 0)), 0);
         let mut count = 0;
         for s in 0..=res.max_s() {
             for t in 0..=(max.n() + s) {
                 for idx in 0..res.num_gens(s, t) {
-                    let _ = res.generator_weight(Gen { s, t, idx });
+                    let _ = res.generator_weight(BidegreeGenerator::s_t(s, t, idx));
                     count += 1;
                 }
             }
@@ -686,7 +666,7 @@ mod tests {
         for s in 1..=res.max_s() {
             for t in 0..=(max.n() + s) {
                 for idx in 0..res.num_gens(s, t) {
-                    for (_target, power) in res.delta(Gen { s, t, idx }) {
+                    for (_target, power) in res.delta(BidegreeGenerator::s_t(s, t, idx)) {
                         assert!(power >= 1, "δ entry with non-positive τ-power");
                         delta_entries += 1;
                     }
