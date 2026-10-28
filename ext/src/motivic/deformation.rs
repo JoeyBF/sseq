@@ -2,10 +2,11 @@
 
 use std::collections::HashMap;
 
-use fp::{prime::TWO, vector::FpVector};
+use fp::{matrix::Matrix, prime::TWO, vector::FpVector};
+use once::MultiIndexed;
 use sseq::{
-    Sseq, SseqProfile,
-    coordinates::{BidegreeGenerator, degree::MultiDegree, element::MultiDegreeElement},
+    Product, Sseq, SseqProfile,
+    coordinates::{Bidegree, BidegreeGenerator, degree::MultiDegree, element::MultiDegreeElement},
 };
 
 use super::MotivicResolution;
@@ -61,6 +62,49 @@ impl MotivicResolution {
             }
         }
         Grouping { groups, position }
+    }
+
+    /// Multiplication by each generator in `gens` on [`Self::deformation_sseq`], for
+    /// [`Sseq::multiply`].
+    ///
+    /// The product is that of $\mathrm{Ext}_{A_C/\tau}$, from [`Self::ext`], split by weight.
+    /// On $E_1$ it is the ring $\mathrm{Ext}_{A_C/\tau}$, and on $E_\infty$ the associated graded
+    /// of the motivic Adams $E_2$.
+    ///
+    /// # Panics
+    ///
+    /// If the resolved module is not the unit.
+    pub fn deformation_products(&self, gens: &[BidegreeGenerator]) -> Vec<Product<3>> {
+        self.assert_unit();
+        let ext = self.ext();
+        let Grouping { groups, .. } = self.sseq_grouping();
+        gens.iter()
+            .map(|&a| {
+                let a_w = self.weights[&a];
+                let a_elem = ext.generator(a);
+                let matrices = MultiIndexed::new();
+                for (&[n, s, w], sources) in &groups {
+                    let Some(full) = ext.multiply_into(&a_elem, Bidegree::n_s(n, s)) else {
+                        continue;
+                    };
+                    let targets = groups
+                        .get(&[n + a.n(), s + a.s(), w + a_w])
+                        .map(Vec::as_slice)
+                        .unwrap_or(&[]);
+                    // Row `i` is `a` times source generator `i`, in the target's coordinates.
+                    let rows: Vec<Vec<u32>> = sources
+                        .iter()
+                        .map(|&i| targets.iter().map(|&j| full.row(i).entry(j)).collect())
+                        .collect();
+                    matrices.insert(MultiDegree::from([n, s, w]), Matrix::from_vec(TWO, &rows));
+                }
+                Product {
+                    b: MultiDegree::from([a.n(), a.s(), a_w]),
+                    left: true,
+                    matrices,
+                }
+            })
+            .collect()
     }
 
     /// The deformation spectral sequence, trigraded by $(n, s, w)$ ([`Deformation`]).

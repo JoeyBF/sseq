@@ -17,11 +17,18 @@ use sseq::{
     coordinates::{Bidegree, BidegreeGenerator},
 };
 
-use crate::{CCC, chain_complex::ChainComplex, resolution::Resolution};
+use crate::{CCC, chain_complex::ChainComplex, ext_algebra::ExtModule, resolution::Resolution};
 
+mod certify;
+mod cohomology;
 mod deformation;
+mod f2tau;
+mod massey;
+mod products;
 
+pub use cohomology::TauModule;
 pub use deformation::Deformation;
+pub use massey::MotivicMassey;
 
 /// The C-motivic resolution: a minimal resolution over $A_C/\tau$, lifted to $A_C$.
 ///
@@ -39,17 +46,46 @@ pub struct MotivicResolution {
     resolution: Arc<Resolution<CCC>>,
     /// Motivic weight of each generator.
     weights: Arc<HashMap<BidegreeGenerator, i32>>,
-    /// The lifted $A_C$ differential of each generator, as its support in $F_{s-1}$. Each
-    /// coefficient is 1 and its $\tau$-power is forced by the weights.
-    lifted: HashMap<BidegreeGenerator, BTreeSet<usize>>,
-    /// The lowest $\tau$-order left in the defect of each lift that stopped short.
-    stalled: HashMap<BidegreeGenerator, i32>,
+    /// The lifted $A_C$ differential of each generator, as its support in $F_{s-1}$.
+    differential: Lifted,
+    /// The lifted product chain map $\varphi_a$ of each generator `a` asked for.
+    products: HashMap<BidegreeGenerator, Lifted>,
+    /// The lifted null-homotopy of $\varphi_b \varphi_a$ of each pair `(a, b)` asked for.
+    homotopies: HashMap<(BidegreeGenerator, BidegreeGenerator), Lifted>,
     /// The box results are reported in.
     max: Bidegree,
     /// The box actually resolved: `max` with the stem margin [`Self::certify`] accepted.
     compute: Bidegree,
+    /// Built on first use by [`Self::ext`].
+    ext: OnceLock<ExtModule<Resolution<CCC>>>,
     /// Built on first use by [`Self::deformation_sseq`].
     deformation: OnceLock<Sseq<3, Deformation>>,
+}
+
+/// A map over $A_C/\tau$ lifted to $A_C$, one generator's image at a time.
+///
+/// Each image is stored as its support; every coefficient is 1 and its $\tau$-power is forced by
+/// the weights.
+#[derive(Default)]
+struct Lifted {
+    /// The image of each generator.
+    cells: HashMap<BidegreeGenerator, BTreeSet<usize>>,
+    /// The lowest $\tau$-order left in the defect of each image that stopped short.
+    stalled: HashMap<BidegreeGenerator, i32>,
+}
+
+impl Lifted {
+    /// Record the lift of `g`'s image.
+    fn insert(&mut self, g: BidegreeGenerator, lift: Result<BTreeSet<usize>, Stalled>) {
+        let support = match lift {
+            Ok(support) => support,
+            Err(Stalled { support, order }) => {
+                self.stalled.insert(g, order);
+                support
+            }
+        };
+        self.cells.insert(g, support);
+    }
 }
 
 impl MotivicResolution {
@@ -79,37 +115,64 @@ impl MotivicResolution {
             engine: MotivicMilnorAlgebra::new(),
             resolution,
             weights: Arc::new(HashMap::new()),
-            lifted: HashMap::new(),
-            stalled: HashMap::new(),
+            differential: Lifted::default(),
+            products: HashMap::new(),
+            homotopies: HashMap::new(),
             max,
-            compute: max,
+            compute: Bidegree::n_s(max.n() + FIRST_MARGIN - 1, max.s()),
+            ext: OnceLock::new(),
             deformation: OnceLock::new(),
         };
         // δ maps `(s, t)` to `(s - 1, t)`, one stem up, so Ext at stem `n` reads the generators at
         // stem `n + 1`, and the lift reads their differentials in turn, each stem further out at
         // a higher τ-order. Widen the margin until the lifts the box reads are finished as far as
-        // it reads them. With `max.s() - 1` stems, every lift the box reads can be finished.
-        for margin in FIRST_MARGIN.. {
-            this.compute = Bidegree::n_s(max.n() + margin, max.s());
-            tracing::Span::current().record("compute", tracing::field::display(this.compute));
-            let compute = this.compute;
-            tracing::info_span!("resolve")
-                .in_scope(|| this.resolution.compute_through_stem(compute));
-            this.engine.compute_basis(compute.t());
-            this.compute_weights()?;
-            this.lift();
-            match this.certify() {
-                Ok(()) => break,
-                Err(g) if margin < max.s() - 1 => {
-                    tracing::info!(
-                        margin,
-                        "the lift of {g:?} is unfinished; widening the margin"
-                    );
-                }
-                Err(g) => panic!("the lift of {g:?} is unfinished with every lift it reads done"),
-            }
+        // it reads them.
+        this.widen()?;
+        while let Err(culprit) = this.certify(this.box_roots()) {
+            this.widen_past(culprit);
         }
         Ok(this)
+    }
+
+    /// Resolve one more stem past `max` and lift everything again.
+    ///
+    /// # Errors
+    ///
+    /// If the module is not cyclic on a single degree-0 class.
+    #[tracing::instrument(skip(self), fields(compute = tracing::field::Empty))]
+    fn widen(&mut self) -> anyhow::Result<()> {
+        self.compute = self.compute + Bidegree::n_s(1, 0);
+        let compute = self.compute;
+        tracing::Span::current().record("compute", tracing::field::display(compute));
+        tracing::info_span!("resolve").in_scope(|| self.resolution.compute_through_stem(compute));
+        self.engine.compute_basis(compute.t());
+        self.compute_weights()?;
+        self.products.clear();
+        self.homotopies.clear();
+        self.ext = OnceLock::new();
+        self.deformation = OnceLock::new();
+        self.lift();
+        Ok(())
+    }
+
+    /// Widen the margin because `culprit`'s lift is read past where it stalled.
+    ///
+    /// # Panics
+    ///
+    /// If the margin is already `max.s()` stems. Each stem a lift reads further out costs a
+    /// homological degree, so with that margin every lift the box reads can be finished.
+    fn widen_past(&mut self, culprit: (certify::Map, BidegreeGenerator)) {
+        let margin = self.compute.n() - self.max.n();
+        assert!(
+            margin < self.max.s().max(FIRST_MARGIN),
+            "the lift of {culprit:?} is unfinished with every lift it reads done"
+        );
+        tracing::info!(
+            margin,
+            "the lift of {culprit:?} is unfinished; widening the margin"
+        );
+        self.widen()
+            .expect("the module was accepted at the first margin");
     }
 
     /// The resolution over $A_C/\tau$.
@@ -194,8 +257,7 @@ impl MotivicResolution {
     /// `d_1` lands in the augmentation ideal.
     #[tracing::instrument(skip(self), fields(max = %self.max, num_lifted = tracing::field::Empty))]
     fn lift(&mut self) {
-        self.lifted.clear();
-        self.stalled.clear();
+        self.differential = Lifted::default();
         // Correcting a generator reads only `s - 1` data, so the generators at one `s` are
         // independent.
         for s in 1..=self.max_s() {
@@ -211,17 +273,10 @@ impl MotivicResolution {
                 .map(|g| (g, self.lift_generator(g)))
                 .collect();
             for (g, lift) in lifted {
-                let support = match lift {
-                    Ok(support) => support,
-                    Err(Stalled { support, order }) => {
-                        self.stalled.insert(g, order);
-                        support
-                    }
-                };
-                self.lifted.insert(g, support);
+                self.differential.insert(g, lift);
             }
         }
-        tracing::Span::current().record("num_lifted", self.lifted.len());
+        tracing::Span::current().record("num_lifted", self.differential.cells.len());
     }
 
     /// Lift one generator's differential to $A_C$.
@@ -236,80 +291,6 @@ impl MotivicResolution {
             return Ok(cells.seed(g));
         }
         cells.lift_cell(g)
-    }
-
-    /// Check that every lift the box reads is finished through the $\tau$-order it is read at.
-    ///
-    /// A box generator's lift is read in full, and through the highest $\tau$-order its
-    /// $d_{s-1} d_s$ can have. A term $\tau^P m \otimes g'$ of a lift read through order $R$
-    /// reads $g'$'s lift through order $R - P$, and nothing higher can reach order $R$. So if
-    /// every stalled lift is finished through the order it is read at, keeping each lift through
-    /// that order and solving the orders above it again, with `s` ascending, gives a lift of the
-    /// whole resolution that agrees with this one on the box.
-    ///
-    /// # Errors
-    ///
-    /// The first generator whose lift is read past where it stalled.
-    fn certify(&self) -> Result<(), BidegreeGenerator> {
-        let max_op_weight: Vec<i32> = (0..=self.compute.t())
-            .map(|t| {
-                (0..self.engine.dimension(t))
-                    .map(|idx| self.op_weight(t, idx))
-                    .max()
-                    .unwrap_or(i32::MIN)
-            })
-            .collect();
-        // The highest weight of an $F_s$ basis element in degree `t`.
-        let max_entry_weight = |s: i32, t: i32| {
-            let module = self.module(s);
-            // Only generators through `compute` have weights; `FIRST_MARGIN` keeps all of the
-            // box's in range.
-            (0..=t.min(self.compute.n() + s))
-                .flat_map(|gen_t| {
-                    (0..module.number_of_gens_in_degree(gen_t)).map(move |idx| (gen_t, idx))
-                })
-                .map(|(gen_t, idx)| {
-                    self.weights[&BidegreeGenerator::s_t(s, gen_t, idx)]
-                        + max_op_weight[(t - gen_t) as usize]
-                })
-                .max()
-                .unwrap_or(i32::MIN)
-        };
-
-        // The order through which each generator's lift is read, gathered from `s` above.
-        let mut read: HashMap<BidegreeGenerator, i32> = HashMap::new();
-        for s in (2..=self.max_s()).rev() {
-            for t in 0..=self.max.n() + s {
-                let top = max_entry_weight(s - 2, t);
-                for idx in 0..self.num_gens(s, t) {
-                    let g = BidegreeGenerator::s_t(s, t, idx);
-                    let order = top - self.weights[&g];
-                    let r = read.entry(g).or_insert(order);
-                    *r = (*r).max(order);
-                }
-            }
-            let at_s: Vec<(BidegreeGenerator, i32)> = read
-                .iter()
-                .filter(|(g, r)| g.s() == s && **r >= 1)
-                .map(|(&g, &r)| (g, r))
-                .collect();
-            let source = self.module(s - 1);
-            for (g, r) in at_s {
-                if self.stalled.get(&g).is_some_and(|&order| order <= r) {
-                    return Err(g);
-                }
-                let w = self.weights[&g];
-                for &bidx in &self.lifted[&g] {
-                    let og = source.index_to_op_gen(g.t(), bidx);
-                    let target =
-                        BidegreeGenerator::s_t(s - 1, og.generator_degree, og.generator_index);
-                    let power = self.entry_weight(s - 1, g.t(), bidx) - w;
-                    let e = read.entry(target).or_insert(i32::MIN);
-                    *e = (*e).max(r - power);
-                }
-            }
-        }
-        Ok(())
     }
 
     /// Compose the basis element `bidx` of `outer_mod` with the lifted map `inner`, XORing the
@@ -364,7 +345,16 @@ impl MotivicResolution {
 
         let mut parity = FpVector::new(TWO, f_sm2.dimension(t));
         for &bidx in support {
-            self.compose_into(&f_sm1, t, s - 1, &self.lifted, 0, &f_sm2, bidx, &mut parity);
+            self.compose_into(
+                &f_sm1,
+                t,
+                s - 1,
+                &self.differential.cells,
+                0,
+                &f_sm2,
+                bidx,
+                &mut parity,
+            );
         }
 
         parity
@@ -457,7 +447,7 @@ impl MotivicResolution {
         let module = self.module(g.s() - 1);
         let w_k = self.weights[&g];
         let mut out = Vec::new();
-        for &bidx in &self.lifted[&g] {
+        for &bidx in &self.differential.cells[&g] {
             let og = module.index_to_op_gen(g.t(), bidx);
             // The unit is the only operation in degree 0.
             if og.operation_degree == 0 {
@@ -479,7 +469,7 @@ impl MotivicResolution {
     /// The mod-$\tau$ support of the lifted `d_s(g)`: its terms with $\tau$-power 0.
     fn mod_tau_support(&self, g: BidegreeGenerator) -> BTreeSet<usize> {
         let w = self.weights[&g];
-        self.lifted[&g]
+        self.differential.cells[&g]
             .iter()
             .copied()
             .filter(|&bidx| w - self.entry_weight(g.s() - 1, g.t(), bidx) == 0)
@@ -492,7 +482,7 @@ impl MotivicResolution {
             for t in 0..=(self.max.n() + s) {
                 for idx in 0..self.num_gens(s, t) {
                     let g = BidegreeGenerator::s_t(s, t, idx);
-                    let err = self.composite(g, &self.lifted[&g]);
+                    let err = self.composite(g, &self.differential.cells[&g]);
                     assert!(
                         err.is_empty(),
                         "d² ≠ 0 at (s={s}, t={t}, idx={idx}): {} surviving terms",
@@ -685,7 +675,7 @@ impl TauLift for DifferentialCells<'_> {
             &f_sm1,
             g.t(),
             g.s() - 1,
-            &self.0.lifted,
+            &self.0.differential.cells,
             0,
             &f_sm2,
             bidx,
@@ -703,7 +693,7 @@ impl TauLift for DifferentialCells<'_> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use algebra::{Algebra, MilnorAlgebra};
 
     use super::*;
@@ -733,8 +723,18 @@ mod tests {
     }
 
     /// The ordinary resolution of a module spec, unresolved.
-    fn resolution(spec: &str) -> Arc<Resolution<CCC>> {
+    pub(super) fn resolution(spec: &str) -> Arc<Resolution<CCC>> {
         Arc::new(crate::utils::construct_standard::<false, _, _>(spec, None).unwrap())
+    }
+
+    /// The sphere `Ctau`, lifted through `max`.
+    pub(super) fn sphere(max: Bidegree) -> MotivicResolution {
+        MotivicResolution::new(resolution("Ctau"), max).unwrap()
+    }
+
+    /// The Hopf element $h_i$.
+    pub(super) fn h(i: u32) -> BidegreeGenerator {
+        BidegreeGenerator::n_s((1 << i) - 1, 1, 0)
     }
 
     #[test]
@@ -793,6 +793,19 @@ mod tests {
     fn the_top_stem_lifts() {
         // The top stem here reads, through δ, a lift that needs the second stem of margin.
         check_lift("Ctau", Bidegree::n_s(10, 5));
+    }
+
+    /// The box's certificate rejects a box cell that stalled.
+    #[test]
+    fn a_stalled_box_cell_fails_the_certificate() {
+        let mut res = sphere(Bidegree::n_s(8, 5));
+        assert!(res.certify(res.box_roots()).is_ok());
+        let g = BidegreeGenerator::s_t(4, 8, 0);
+        res.differential.stalled.insert(g, 1);
+        assert_eq!(
+            res.certify(res.box_roots()),
+            Err((certify::Map::Differential, g))
+        );
     }
 
     #[test]
