@@ -128,8 +128,11 @@ impl MotivicResolution {
         self.resolution.module(s)
     }
 
-    /// The motivic weight of a generator (panics if out of the computed range or
-    /// if the generator's weight could not be determined).
+    /// The motivic weight of a generator.
+    ///
+    /// # Panics
+    ///
+    /// If `g` is outside the resolved range.
     pub fn generator_weight(&self, g: BidegreeGenerator) -> i32 {
         self.weights[&g]
     }
