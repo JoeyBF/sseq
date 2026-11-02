@@ -2,6 +2,7 @@
 mod affine;
 mod matrix_inner;
 mod quasi_inverse;
+pub mod rref_verify;
 mod subquotient;
 mod subspace;
 
@@ -18,5 +19,6 @@ pub mod arbitrary {
 pub use affine::AffineSubspace;
 pub use matrix_inner::{AugmentedMatrix, Matrix, MatrixSliceMut};
 pub use quasi_inverse::QuasiInverse;
+pub use rref_verify::RrefVerifyError;
 pub use subquotient::Subquotient;
 pub use subspace::Subspace;
