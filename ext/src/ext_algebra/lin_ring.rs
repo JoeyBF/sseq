@@ -70,25 +70,18 @@ impl RingRange {
 /// The name of the chain map of the monomial with these `factors`: `lin_ring/` and the factors as
 /// `x_(n, s, i)`, joined by `.`. Basis monomials and their classes depend only on the resolution,
 /// so the name identifies the same map in any range.
-pub fn map_name(gens: &[Generator], factors: &[u32]) -> String {
+pub fn map_name(gens: &[BidegreeGenerator], factors: &[u32]) -> String {
     let parts: Vec<String> = factors
         .iter()
-        .map(|&j| format!("x_{}", gens[j as usize].generator()))
+        .map(|&j| format!("x_{}", gens[j as usize]))
         .collect();
     format!("lin_ring/{}", parts.join("."))
 }
 
-/// A generator `a_i`: the generator `idx` of the resolution at `b`; `h = Some(k)` for `h_k`.
-pub struct Generator {
-    pub b: Bidegree,
-    pub idx: usize,
-    pub h: Option<u32>,
-}
-
-impl Generator {
-    pub fn generator(&self) -> BidegreeGenerator {
-        BidegreeGenerator::new(self.b, self.idx)
-    }
+/// `Some(k)` if the generator `g` is `h_k`. Every generator in filtration 1 is an `h_k`, `k = log_2 t`
+/// ([`compute`] checks this).
+fn h_index(g: BidegreeGenerator) -> Option<u32> {
+    (g.s() == 1).then(|| g.t().trailing_zeros())
 }
 
 /// How a basis monomial was built.
@@ -163,7 +156,7 @@ pub struct WindowStats {
 
 /// The ring through the range, with the chain maps it lifted.
 pub struct Ring<CC: FreeChainComplex> {
-    pub gens: Vec<Generator>,
+    pub gens: Vec<BidegreeGenerator>,
     pub basis: Vec<Monomial>,
     /// Per bidegree: its basis monomials, and the inverse of their matrix (row `y` = the
     /// `B`-coordinates of the resolution generator `y`).
@@ -250,16 +243,16 @@ where
     /// `a_j m` read directly: an `h_k` from the differentials, otherwise `f_m` at `|a_j|`
     /// (requires `j <= lo(m)`).
     fn direct(&self, j: usize, m: usize) -> FpVector {
-        let g = &self.gens[j];
+        let g = self.gens[j];
         let mono = &self.basis[m];
-        let target = g.b + mono.b;
+        let target = g.degree() + mono.b;
         let d = self.dim(target);
         if let Repr::Unit = mono.repr {
             let mut v = FpVector::new(TWO, d);
-            v.set_entry(g.idx, 1);
+            v.set_entry(g.idx(), 1);
             return v;
         }
-        if let Some(k) = g.h {
+        if let Some(k) = h_index(g) {
             return match self.h_rows.get(&(k, mono.b)) {
                 Some(rows) => Self::apply(&mono.vec, rows, d),
                 None => FpVector::new(TWO, d),
@@ -269,7 +262,7 @@ where
         let map = &self.maps[mono.map.expect("monomial has no chain map")];
         let mut v = FpVector::new(TWO, d);
         if d > 0 {
-            map.hom.act(v.as_slice_mut(), 1, g.generator());
+            map.hom.act(v.as_slice_mut(), 1, g);
         }
         v
     }
@@ -280,7 +273,7 @@ where
             return v.clone();
         }
         let v = match self.basis[m].repr {
-            _ if self.gens[j].h.is_some() || j <= self.basis[m].lo() => self.direct(j, m),
+            _ if h_index(self.gens[j]).is_some() || j <= self.basis[m].lo() => self.direct(j, m),
             Repr::Unit => unreachable!(),
             // a_j a_l = a_l a_j with l < j <= lo(a_j).
             Repr::Gen(l) => {
@@ -289,7 +282,7 @@ where
             }
             Repr::Mul(k, m1) => {
                 let w = self.mul(j, m1);
-                let wb = self.gens[j].b + self.basis[m1].b;
+                let wb = self.gens[j].degree() + self.basis[m1].b;
                 self.mul_vec(k, wb, &w)
             }
         };
@@ -299,7 +292,7 @@ where
 
     /// `a_k w` for `w ∈ Ext(b)`.
     pub fn mul_vec(&mut self, k: usize, b: Bidegree, w: &FpVector) -> FpVector {
-        let d = self.dim(b + self.gens[k].b);
+        let d = self.dim(b + self.gens[k].degree());
         let mut out = FpVector::new(TWO, d);
         for e in self.coords(b, w) {
             let p = self.mul(k, e);
@@ -310,8 +303,7 @@ where
 
     /// The basis monomial of the generator `a_j`.
     fn gen_monomial(&self, j: usize) -> usize {
-        let g = &self.gens[j];
-        self.cells[&g.b]
+        self.cells[&self.gens[j].degree()]
             .0
             .iter()
             .copied()
@@ -397,16 +389,16 @@ where
                 continue;
             };
             for j in 0..self.gens.len() {
-                if self.gens[j].h.is_none() || j <= k {
+                if h_index(self.gens[j]).is_none() || j <= k {
                     continue;
                 }
-                let target = self.gens[j].b + self.basis[m].b;
+                let target = self.gens[j].degree() + self.basis[m].b;
                 if !self.range.contains(target) {
                     continue;
                 }
                 let free = self.direct(j, m);
                 let w = self.mul(j, m1);
-                let wb = self.gens[j].b + self.basis[m1].b;
+                let wb = self.gens[j].degree() + self.basis[m1].b;
                 let via = self.mul_vec(k, wb, &w);
                 checks += 1;
                 if free != via {
@@ -553,7 +545,7 @@ where
                 // Candidates a_k m', k <= lo(m'), in increasing monomial order.
                 let mut cands: Vec<(Vec<u32>, usize, usize)> = vec![];
                 for (k, g) in ring.gens.iter().enumerate() {
-                    let c = b - g.b;
+                    let c = b - g.degree();
                     let Some((ids, _)) = ring.cells.get(&c) else {
                         continue;
                     };
@@ -612,16 +604,16 @@ where
                 }
                 for idx in (0..d).filter(|&i| !pivot[i]) {
                     let j = ring.gens.len();
-                    let h = (s == 1).then(|| t.trailing_zeros());
+                    let g = BidegreeGenerator::new(b, idx);
                     ensure!(
                         s != 1 || (t as u32).is_power_of_two(),
                         "a generator at {b} in filtration 1 is not an h_i"
                     );
                     ensure!(
-                        h.is_some() || t >= WINDOW_T,
+                        s == 1 || t >= WINDOW_T,
                         "a generator at {b} off the h_i line below t = {WINDOW_T}"
                     );
-                    ring.gens.push(Generator { b, idx, h });
+                    ring.gens.push(g);
                     ring.standard.insert(vec![j as u32]);
                     let mut v = FpVector::new(TWO, d);
                     v.set_entry(idx, 1);
@@ -643,11 +635,11 @@ where
                     // Only generators whose product with `m` is in range are ever read off `f_m`.
                     for g in ring.gens[..=lo]
                         .iter()
-                        .filter(|g| g.h.is_none() && in_range(b + g.b))
+                        .filter(|g| h_index(**g).is_none() && in_range(b + g.degree()))
                     {
                         // Row s' <= s_g through stem t_g - s', within the target range.
-                        for (sp, row) in stair.iter_mut().enumerate().take(g.b.s() as usize + 1) {
-                            let n = (g.b.t() - sp as i32).min(max_n - b.n());
+                        for (sp, row) in stair.iter_mut().enumerate().take(g.s() as usize + 1) {
+                            let n = (g.t() - sp as i32).min(max_n - b.n());
                             *row = (*row).max(n);
                         }
                     }
