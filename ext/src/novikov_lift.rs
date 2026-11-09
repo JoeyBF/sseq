@@ -777,7 +777,11 @@ where
     // The lifted coboundary of each basis cochain, by target generator, over Z/2^64.
     let mut cache: FxHashMap<(i32, i32, u32), Arc<Vec<FxHashMap<Gen, BpElt>>>> =
         FxHashMap::default();
+    // Every weight is read on its own, so the cache holds one weight at a time.
     let mut coboundaries = |a: i32, u: i32, k: u32| -> Arc<Vec<FxHashMap<Gen, BpElt>>> {
+        if cache.keys().next().is_some_and(|key| key.1 != u) {
+            cache.clear();
+        }
         if let Some(hit) = cache.get(&(a, u, k)) {
             return Arc::clone(hit);
         }
