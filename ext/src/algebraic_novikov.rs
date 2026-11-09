@@ -550,9 +550,10 @@ pub fn unit_module() -> FDModule<MilnorAlgebra> {
 
 /// The classical (stem, s) a backbone must be resolved through for [`ctau_e2_untwisted_on`].
 ///
-/// The weight $u$ runs up to `(max_n + max_s) / 2` and δ out of filtration $a$ reads $P_{a+1}$.
+/// $\delta^a$ at weight $u$ reads generators of $P_a$ and $P_{a+1}$ in degrees up to $u$, and is
+/// only needed for $u \leq$ `(max_n + a + 1) / 2`, so they lie in stems up to `(max_n + 1) / 2`.
 pub fn untwisted_backbone_range(max_n: i32, max_s: i32) -> Bidegree {
-    Bidegree::n_s((max_n + max_s) / 2, max_s + 1)
+    Bidegree::n_s((max_n + 2) / 2, max_s + 1)
 }
 
 /// `prefix[d][j]`: the number of $v_0$-free monomials of degree `d` and length at most `j`,
@@ -769,7 +770,7 @@ where
     let max_u = (max_n + max_s) / 2;
     let range = untwisted_backbone_range(max_n, max_s);
     assert!(
-        res.has_computed_bidegree(Bidegree::s_t(range.s(), max_u)),
+        res.has_computed_bidegree(range),
         "the backbone must be resolved through {range}"
     );
 
@@ -822,7 +823,8 @@ where
         if large.is_empty() && small.is_empty() {
             continue;
         }
-        let slice = differential_slice(res, a, max_u);
+        // The largest weight δ^a is read at, from the inverse of `untwisted_filtrations`.
+        let slice = differential_slice(res, a, max_u.min((max_n + a + 1) / 2));
         let small_ranks: Vec<_> = small
             .into_maybe_par_iter()
             .map(|m: &UntwistedMatrix| ((m.k, m.u, m.a), rank(m, &slice)))
