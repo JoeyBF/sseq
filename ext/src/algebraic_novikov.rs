@@ -29,7 +29,7 @@ type XiMonomial = Vec<u32>;
 pub type VMonomial = Vec<u32>;
 
 /// A polynomial over $\mathbb{F}_2$ in the $\xi_j$: the set of monomials with coefficient 1.
-type XiPoly = FxHashSet<XiMonomial>;
+pub(crate) type XiPoly = FxHashSet<XiMonomial>;
 
 /// Drops trailing zeros, so exponent vectors compare and hash canonically.
 fn trim(mut v: Vec<u32>) -> Vec<u32> {
@@ -52,14 +52,14 @@ fn add_exponents(a: &[u32], b: &[u32]) -> Vec<u32> {
 }
 
 /// Adds `x` to a set of terms with coefficient 1, over $\mathbb{F}_2$.
-fn toggle<T: Eq + std::hash::Hash>(set: &mut FxHashSet<T>, x: T) {
+pub(crate) fn toggle<T: Eq + std::hash::Hash>(set: &mut FxHashSet<T>, x: T) {
     if !set.remove(&x) {
         set.insert(x);
     }
 }
 
 /// The product of two polynomials.
-fn poly_mul(a: &XiPoly, b: &XiPoly) -> XiPoly {
+pub(crate) fn poly_mul(a: &XiPoly, b: &XiPoly) -> XiPoly {
     let mut r = XiPoly::default();
     for x in a {
         for y in b {
@@ -79,14 +79,14 @@ fn xi(j: usize) -> XiPoly {
 }
 
 /// The Frobenius $f \mapsto f^{2^i}$.
-fn frobenius(f: &XiPoly, i: u32) -> XiPoly {
+pub(crate) fn frobenius(f: &XiPoly, i: u32) -> XiPoly {
     f.iter()
         .map(|m| m.iter().map(|&e| e << i).collect())
         .collect()
 }
 
 /// $\chi \xi_j$ for `j` in `0..=max`, from $\sum_{i=0}^{j} \xi_{j-i}^{2^i} \chi\xi_i = 0$.
-fn conjugates(max: usize) -> Vec<XiPoly> {
+pub(crate) fn conjugates(max: usize) -> Vec<XiPoly> {
     let mut chi: Vec<XiPoly> = vec![xi(0)];
     for j in 1..=max {
         let mut c = XiPoly::default();
@@ -171,21 +171,21 @@ pub fn monomials(max_len: u32, cap: impl Fn(u32) -> i32) -> Vec<Vec<VMonomial>> 
 
 /// A monomial in the $\xi_j$, packed as [`XI_BITS`]-bit exponents of $\xi_1, \xi_2, \dots$ so that
 /// multiplying monomials is adding.
-type PackedXi = u128;
+pub(crate) type PackedXi = u128;
 
 /// The bits per exponent in a [`PackedXi`]; [`Coaction::new`] checks the degree keeps every
 /// exponent and every $\xi_j$ in range.
-const XI_BITS: u32 = 12;
+pub(crate) const XI_BITS: u32 = 12;
 
 /// Packs an exponent vector.
-fn pack(r: &[u32]) -> PackedXi {
+pub(crate) fn pack(r: &[u32]) -> PackedXi {
     r.iter()
         .enumerate()
         .fold(0, |acc, (j, &e)| acc | (e as u128) << (j as u32 * XI_BITS))
 }
 
 /// Unpacks into a trimmed exponent vector.
-fn unpack(mut r: PackedXi) -> Vec<u32> {
+pub(crate) fn unpack(mut r: PackedXi) -> Vec<u32> {
     let mut v = Vec::new();
     while r != 0 {
         v.push((r & ((1 << XI_BITS) - 1)) as u32);
@@ -733,10 +733,10 @@ fn differential_slice<CC: FreeChainComplex>(
 }
 
 /// The highest $v_i$ a [`QDown`] monomial can hold; its degree bounds the weights it supports.
-const QDOWN_VARS: usize = 11;
+pub(crate) const QDOWN_VARS: usize = 11;
 
 /// A monomial in $v_0, \dots, v_{10}$, as exponents.
-type QMono = [u16; QDOWN_VARS];
+pub(crate) type QMono = [u16; QDOWN_VARS];
 
 /// The bases of $Q_k^\vee$ for every `k <= max_len`, with the action of $A$ computed on demand.
 ///
@@ -753,12 +753,12 @@ pub struct QDown {
 }
 
 /// The length of a monomial.
-fn qmono_len(m: &QMono) -> u32 {
+pub(crate) fn qmono_len(m: &QMono) -> u32 {
     m.iter().map(|&e| e as u32).sum()
 }
 
 /// Whether every exponent of `s` is at most that of `r`.
-fn packed_fits(s: PackedXi, r: PackedXi) -> bool {
+pub(crate) fn packed_fits(s: PackedXi, r: PackedXi) -> bool {
     let mask = (1u128 << XI_BITS) - 1;
     (0..128 / XI_BITS).all(|j| (s >> (j * XI_BITS)) & mask <= (r >> (j * XI_BITS)) & mask)
 }
