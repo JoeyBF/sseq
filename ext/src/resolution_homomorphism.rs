@@ -390,11 +390,13 @@ where
             .filter(|&k| !d_source.output(input.t(), k).is_zero())
             .collect();
 
+        let terms = terms_log::Cell::default();
         let compute_fdx_vector = |k: usize| {
             let dx_vector = d_source.output(input.t(), k);
             if dx_vector.is_zero() {
                 None
             } else {
+                let start = terms_log::enabled().then(std::time::Instant::now);
                 let mut fdx_vector = FpVector::new(p, fdx_dimension);
                 f_prev.apply(
                     fdx_vector.as_slice_mut(),
@@ -402,6 +404,28 @@ where
                     input.t(),
                     dx_vector.as_slice(),
                 );
+                if let Some(start) = start {
+                    let elapsed = start.elapsed();
+                    let source = f_prev.source();
+                    let (mut dx_terms, mut products, mut max_fw, mut op_deg_sum) = (0, 0, 0, 0);
+                    for (idx, _) in dx_vector.iter_nonzero() {
+                        let og = source.index_to_op_gen(input.t(), idx);
+                        dx_terms += 1;
+                        // As in `apply`: generators below the map's range map to zero.
+                        if og.generator_degree < f_prev.min_degree() {
+                            continue;
+                        }
+                        let fw = f_prev
+                            .output(og.generator_degree, og.generator_index)
+                            .iter_nonzero()
+                            .count() as u64;
+                        products += fw;
+                        max_fw = max_fw.max(fw);
+                        op_deg_sum += fw * og.operation_degree as u64;
+                    }
+                    let fdx_nnz = fdx_vector.iter_nonzero().count() as u64;
+                    terms.add(dx_terms, products, max_fw, op_deg_sum, fdx_nnz, elapsed);
+                }
                 Some(fdx_vector)
             }
         };
@@ -412,6 +436,8 @@ where
                 .into_iter()
                 .flatten()
                 .collect();
+
+        terms.write(input, output, fdx_vectors.len());
 
         StepPrep::NeedsLift(PendingStep {
             input,
@@ -1029,6 +1055,103 @@ pub(crate) mod secondary {
             );
 
             output_class
+        }
+    }
+}
+
+/// Measurement only: when `EXT_LIFT_TERMS_LOG` names a file, every lift step's `prepare` appends
+/// `in_s,in_t,out_s,out_t,gens,dx_terms,products,max_fw,op_deg_sum,fdx_nnz,fdx_ns,end_s`, where
+/// `products` = Σ over the terms `a·w` of every `d x` of `nnz(f(w))` (the Milnor products
+/// `f(d x)` costs), `max_fw` the largest such `nnz(f(w))`, `op_deg_sum` = Σ `nnz(f(w))·|a|`,
+/// `fdx_nnz` the non-zeros of the results, `fdx_ns` the thread time computing them, and `end_s`
+/// the wall time since the first step.
+mod terms_log {
+    use std::{
+        io::Write,
+        sync::{
+            LazyLock, Mutex,
+            atomic::{AtomicU64, Ordering::Relaxed},
+        },
+        time::{Duration, Instant},
+    };
+
+    use sseq::coordinates::Bidegree;
+
+    struct Log {
+        origin: Instant,
+        out: Mutex<std::io::BufWriter<std::fs::File>>,
+    }
+
+    static LOG: LazyLock<Option<Log>> = LazyLock::new(|| {
+        let path = std::env::var_os("EXT_LIFT_TERMS_LOG")?;
+        let mut out = std::io::BufWriter::new(std::fs::File::create(path).unwrap());
+        writeln!(
+            out,
+            "in_s,in_t,out_s,out_t,gens,dx_terms,products,max_fw,op_deg_sum,fdx_nnz,fdx_ns,end_s"
+        )
+        .unwrap();
+        Some(Log {
+            origin: Instant::now(),
+            out: Mutex::new(out),
+        })
+    });
+
+    pub(super) fn enabled() -> bool {
+        LOG.is_some()
+    }
+
+    #[derive(Default)]
+    pub(super) struct Cell {
+        dx_terms: AtomicU64,
+        products: AtomicU64,
+        max_fw: AtomicU64,
+        op_deg_sum: AtomicU64,
+        fdx_nnz: AtomicU64,
+        fdx_ns: AtomicU64,
+    }
+
+    impl Cell {
+        pub(super) fn add(
+            &self,
+            dx_terms: u64,
+            products: u64,
+            max_fw: u64,
+            op_deg_sum: u64,
+            fdx_nnz: u64,
+            elapsed: Duration,
+        ) {
+            self.dx_terms.fetch_add(dx_terms, Relaxed);
+            self.products.fetch_add(products, Relaxed);
+            self.max_fw.fetch_max(max_fw, Relaxed);
+            self.op_deg_sum.fetch_add(op_deg_sum, Relaxed);
+            self.fdx_nnz.fetch_add(fdx_nnz, Relaxed);
+            self.fdx_ns.fetch_add(elapsed.as_nanos() as u64, Relaxed);
+        }
+
+        pub(super) fn write(&self, input: Bidegree, output: Bidegree, gens: usize) {
+            let Some(log) = &*LOG else { return };
+            let g = |a: &AtomicU64| a.load(Relaxed);
+            let mut out = log.out.lock().unwrap();
+            writeln!(
+                out,
+                "{},{},{},{},{gens},{},{},{},{},{},{},{:.3}",
+                input.s(),
+                input.t(),
+                output.s(),
+                output.t(),
+                g(&self.dx_terms),
+                g(&self.products),
+                g(&self.max_fw),
+                g(&self.op_deg_sum),
+                g(&self.fdx_nnz),
+                g(&self.fdx_ns),
+                log.origin.elapsed().as_secs_f64()
+            )
+            .unwrap();
+            // Flush often enough that a killed run keeps its data.
+            if log.origin.elapsed().as_secs() % 10 == 0 {
+                out.flush().unwrap();
+            }
         }
     }
 }
