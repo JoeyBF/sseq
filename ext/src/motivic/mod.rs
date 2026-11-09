@@ -6,8 +6,8 @@ use std::{
 };
 
 use algebra::{
-    SteenrodAlgebra, SteenrodKind,
-    module::{FreeModule, Module, homomorphism::ModuleHomomorphism},
+    Algebra, MilnorAlgebra, SteenrodAlgebra, SteenrodKind,
+    module::{FDModule, FreeModule, Module},
     motivic::MotivicMilnorAlgebra,
 };
 use fp::{prime::TWO, vector::FpVector};
@@ -17,11 +17,53 @@ use sseq::{
     coordinates::{Bidegree, BidegreeGenerator},
 };
 
-use crate::{CCC, chain_complex::ChainComplex, resolution::Resolution};
+use crate::{
+    CCC,
+    chain_complex::{ChainComplex, FreeChainComplex},
+    resolution::Resolution,
+};
 
 mod deformation;
 
 pub use deformation::Deformation;
+
+/// A minimal resolution over $A_C/\tau$ the lift can read: the standard one, or Nassau's, whose
+/// quasi-inverses live in its save directory.
+pub trait CtauResolution: FreeChainComplex + Send + Sync {
+    /// Whether it is over all of $A_C/\tau$.
+    fn is_all_of_ctau(&self) -> bool;
+
+    /// Resolve through stem `max.n()` and homological degree `max.s()`.
+    fn resolve_through_stem(&self, max: Bidegree);
+}
+
+/// Whether `algebra` is all of $A_C/\tau$.
+fn milnor_is_all_of_ctau(algebra: &MilnorAlgebra) -> bool {
+    algebra.kind() == SteenrodKind::MotivicModTau && algebra.profile().is_trivial()
+}
+
+impl CtauResolution for Resolution<CCC> {
+    fn is_all_of_ctau(&self) -> bool {
+        match &*self.algebra() {
+            SteenrodAlgebra::MilnorAlgebra(a) => milnor_is_all_of_ctau(a),
+            SteenrodAlgebra::AdemAlgebra(_) => false,
+        }
+    }
+
+    fn resolve_through_stem(&self, max: Bidegree) {
+        self.compute_through_stem(max);
+    }
+}
+
+impl CtauResolution for crate::nassau::Resolution<FDModule<MilnorAlgebra>> {
+    fn is_all_of_ctau(&self) -> bool {
+        milnor_is_all_of_ctau(&self.algebra())
+    }
+
+    fn resolve_through_stem(&self, max: Bidegree) {
+        self.compute_through_stem(max);
+    }
+}
 
 /// The C-motivic resolution: a minimal resolution over $A_C/\tau$, lifted to $A_C$.
 ///
@@ -32,11 +74,11 @@ pub use deformation::Deformation;
 /// a term $m \otimes g_j$ of $d_s(g_k)$ carries $\tau^{\,w(g_k) - w(m) - w(g_j)}$. So a lifted
 /// differential is stored as an $\mathbb{F}_2$ support plus the weights, and its $\tau$-powers are
 /// reconstructed on demand.
-pub struct MotivicResolution {
+pub struct MotivicResolution<CC: CtauResolution = Resolution<CCC>> {
     /// The $A_C$ product engine, which recovers the $\tau$-powers the resolution discards. It
     /// indexes each degree as $A_C/\tau$ does, so the resolution's operation indices are its own.
     engine: MotivicMilnorAlgebra,
-    resolution: Arc<Resolution<CCC>>,
+    resolution: Arc<CC>,
     /// Motivic weight of each generator.
     weights: Arc<HashMap<BidegreeGenerator, i32>>,
     /// The lifted $A_C$ differential of each generator, as its support in $F_{s-1}$. Each
@@ -52,7 +94,7 @@ pub struct MotivicResolution {
     deformation: OnceLock<Sseq<3, Deformation>>,
 }
 
-impl MotivicResolution {
+impl<CC: CtauResolution> MotivicResolution<CC> {
     /// Resolve through the box `max` and lift the resolution to $A_C$.
     ///
     /// `resolution` is an ordinary resolution over all of $A_C/\tau$, such as
@@ -63,17 +105,11 @@ impl MotivicResolution {
     /// If `resolution` is not over all of $A_C/\tau$, or if its module is not cyclic on a single
     /// class in degree 0, the only cell the lift seeds a weight on.
     #[tracing::instrument(skip(resolution), fields(max = %max, compute = tracing::field::Empty))]
-    pub fn new(resolution: Arc<Resolution<CCC>>, max: Bidegree) -> anyhow::Result<Self> {
-        let algebra = resolution.algebra();
-        let full_ctau = match &*algebra {
-            SteenrodAlgebra::MilnorAlgebra(a) => {
-                a.kind() == SteenrodKind::MotivicModTau && a.profile().is_trivial()
-            }
-            SteenrodAlgebra::AdemAlgebra(_) => false,
-        };
+    pub fn new(resolution: Arc<CC>, max: Bidegree) -> anyhow::Result<Self> {
         anyhow::ensure!(
-            full_ctau,
-            "the motivic lift needs a resolution over all of A_C/τ, not {algebra}"
+            resolution.is_all_of_ctau(),
+            "the motivic lift needs a resolution over all of A_C/τ, not {}",
+            resolution.algebra().prefix()
         );
         let mut this = Self {
             engine: MotivicMilnorAlgebra::new(),
@@ -94,7 +130,7 @@ impl MotivicResolution {
             tracing::Span::current().record("compute", tracing::field::display(this.compute));
             let compute = this.compute;
             tracing::info_span!("resolve")
-                .in_scope(|| this.resolution.compute_through_stem(compute));
+                .in_scope(|| this.resolution.resolve_through_stem(compute));
             this.engine.compute_basis(compute.t());
             this.compute_weights()?;
             this.lift();
@@ -113,7 +149,7 @@ impl MotivicResolution {
     }
 
     /// The resolution over $A_C/\tau$.
-    pub fn resolution(&self) -> &Resolution<CCC> {
+    pub fn resolution(&self) -> &CC {
         &self.resolution
     }
 
@@ -134,7 +170,7 @@ impl MotivicResolution {
     }
 
     /// The free module $F_s$.
-    fn module(&self, s: i32) -> Arc<FreeModule<SteenrodAlgebra>> {
+    fn module(&self, s: i32) -> Arc<FreeModule<CC::Algebra>> {
         self.resolution.module(s)
     }
 
@@ -322,12 +358,12 @@ impl MotivicResolution {
     #[allow(clippy::too_many_arguments)]
     fn compose_into(
         &self,
-        outer_mod: &FreeModule<SteenrodAlgebra>,
+        outer_mod: &FreeModule<CC::Algebra>,
         outer_t: i32,
         outer_s: i32,
         inner: &HashMap<BidegreeGenerator, BTreeSet<usize>>,
         inner_shift_t: i32,
-        inner_out_mod: &FreeModule<SteenrodAlgebra>,
+        inner_out_mod: &FreeModule<CC::Algebra>,
         bidx: usize,
         parity: &mut FpVector,
     ) {
@@ -537,6 +573,9 @@ impl MotivicResolution {
 /// correction to a single $\tau$-power. An implementor supplies the defect and inherits
 /// [`Self::lift_cell`].
 trait TauLift {
+    /// The algebra the resolution is over.
+    type Algebra: algebra::MuAlgebra<false>;
+
     /// The weight the defect is graded against: the source generator's.
     fn source_weight(&self, g: BidegreeGenerator) -> i32;
 
@@ -544,7 +583,7 @@ trait TauLift {
     fn seed(&self, g: BidegreeGenerator) -> BTreeSet<usize>;
 
     /// The module and degree the defect lives in.
-    fn defect_module(&self, g: BidegreeGenerator) -> (Arc<FreeModule<SteenrodAlgebra>>, i32);
+    fn defect_module(&self, g: BidegreeGenerator) -> (Arc<FreeModule<Self::Algebra>>, i32);
 
     /// The weight of defect-module basis element `bidx`.
     fn defect_weight(&self, g: BidegreeGenerator, bidx: usize) -> i32;
@@ -652,9 +691,11 @@ const FIRST_MARGIN: i32 = 2;
 /// [`TauLift`] for the differential: lift `d_s(g)` so that `d_{s-1} d_s(g) = 0` over $A_C$.
 ///
 /// The output module is $F_{s-1}$ and the defect is the composite in $F_{s-2}$.
-struct DifferentialCells<'a>(&'a MotivicResolution);
+struct DifferentialCells<'a, CC: CtauResolution>(&'a MotivicResolution<CC>);
 
-impl TauLift for DifferentialCells<'_> {
+impl<CC: CtauResolution> TauLift for DifferentialCells<'_, CC> {
+    type Algebra = CC::Algebra;
+
     fn source_weight(&self, g: BidegreeGenerator) -> i32 {
         self.0.weights[&g]
     }
@@ -670,7 +711,7 @@ impl TauLift for DifferentialCells<'_> {
             .collect()
     }
 
-    fn defect_module(&self, g: BidegreeGenerator) -> (Arc<FreeModule<SteenrodAlgebra>>, i32) {
+    fn defect_module(&self, g: BidegreeGenerator) -> (Arc<FreeModule<CC::Algebra>>, i32) {
         (self.0.module(g.s() - 2), g.t())
     }
 
@@ -694,11 +735,14 @@ impl TauLift for DifferentialCells<'_> {
     }
 
     fn solve(&self, g: BidegreeGenerator, e: &FpVector) -> Option<FpVector> {
-        let d_prev = self.0.resolution.differential(g.s() - 1);
-        let qi = d_prev.quasi_inverse(g.t())?;
-        let mut c = FpVector::new(TWO, self.0.module(g.s() - 1).dimension(g.t()));
-        qi.apply(c.as_slice_mut(), 1, e.as_slice());
-        Some(c)
+        let mut c = [FpVector::new(
+            TWO,
+            self.0.module(g.s() - 1).dimension(g.t()),
+        )];
+        self.0
+            .resolution
+            .apply_quasi_inverse(&mut c, Bidegree::s_t(g.s() - 1, g.t()), &[e.as_slice()])
+            .then(|| c.into_iter().next().unwrap())
     }
 }
 
@@ -798,5 +842,37 @@ mod tests {
     #[test]
     fn the_moore_space_lifts() {
         check_lift("C2_sm_Ctau", Bidegree::n_s(8, 5));
+    }
+
+    /// The dimensions of every page at every `(n, s, w)` of `res`'s deformation spectral sequence.
+    fn page_dims<CC: CtauResolution>(res: &MotivicResolution<CC>) -> Vec<([i32; 3], Vec<usize>)> {
+        let sseq = res.deformation_sseq();
+        let mut out: Vec<_> = sseq
+            .iter_degrees()
+            .filter(|b| b.coords()[0] <= res.max().n() && b.coords()[1] < res.max().s())
+            .map(|b| {
+                let dims = (1..=res.max().s())
+                    .map(|r| sseq.page_data(b).get_max(r).dimension())
+                    .collect();
+                (b.coords(), dims)
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// Nassau's resolution, through its save directory, lifts to the same spectral sequence as
+    /// the standard one, and so does a run resumed from that directory.
+    #[test]
+    fn nassau_lifts_alike() {
+        let max = Bidegree::n_s(30, 17);
+        let standard = MotivicResolution::new(resolution("Ctau"), max).unwrap();
+        let dir = tempfile::TempDir::new().unwrap();
+        for _ in 0..2 {
+            let nassau =
+                crate::utils::construct_nassau("Ctau", Some(dir.path().to_owned())).unwrap();
+            let nassau = MotivicResolution::new(Arc::new(nassau), max).unwrap();
+            assert_eq!(page_dims(&standard), page_dims(&nassau));
+        }
     }
 }

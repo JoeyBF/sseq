@@ -28,7 +28,20 @@ fn main() -> anyhow::Result<()> {
     );
     let page: i32 = query::with_default("Page", "1", str::parse);
 
-    let resolution = ext::utils::construct_standard::<false, _, _>(module.as_str(), None)?;
+    // Nassau's resolution keeps its quasi-inverses only on disk, so it needs a save directory.
+    let save_dir = query::optional("Save directory", |s| {
+        Ok::<_, std::convert::Infallible>(std::path::PathBuf::from(s))
+    });
+    #[cfg(feature = "nassau")]
+    let resolution = {
+        anyhow::ensure!(
+            save_dir.is_some(),
+            "Nassau's algorithm needs a save directory for the lift's quasi-inverses"
+        );
+        ext::utils::construct_nassau(module.as_str(), save_dir)?
+    };
+    #[cfg(not(feature = "nassau"))]
+    let resolution = ext::utils::construct_standard::<false, _, _>(module.as_str(), save_dir)?;
     let res = MotivicResolution::new(Arc::new(resolution), max)?;
     let sseq = res.deformation_sseq();
 

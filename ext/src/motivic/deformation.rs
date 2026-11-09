@@ -8,7 +8,7 @@ use sseq::{
     coordinates::{BidegreeGenerator, degree::MultiDegree, element::MultiDegreeElement},
 };
 
-use super::MotivicResolution;
+use super::{CtauResolution, MotivicResolution};
 
 /// The direction of the deformation spectral sequence, trigraded by (stem $n$, Adams filtration
 /// $s$, weight $w$).
@@ -44,7 +44,7 @@ struct Grouping {
     position: HashMap<BidegreeGenerator, (MultiDegree<3>, usize)>,
 }
 
-impl MotivicResolution {
+impl<CC: CtauResolution> MotivicResolution<CC> {
     /// Group the resolved generators by multidegree `(n, s, w)`.
     fn sseq_grouping(&self) -> Grouping {
         let mut groups: HashMap<[i32; 3], Vec<usize>> = HashMap::new();
@@ -196,6 +196,14 @@ impl MotivicResolution {
             }
             let mut added = false;
             for (b, source, target) in to_add {
+                // Adding a d_r extends the pages at the targets of every shorter differential from
+                // `b`, so those must be registered even when they hold no classes.
+                for r0 in 1..r {
+                    let p = Deformation::profile(r0, b);
+                    if !sseq.defined(p) {
+                        sseq.set_dimension(p, 0);
+                    }
+                }
                 if sseq.add_differential(r, &MultiDegreeElement::new(b, source), target.as_slice())
                 {
                     added = true;

@@ -973,6 +973,10 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
         if b.s() > 0 {
             self.modules[b.s() - 1].compute_basis(b.t());
         }
+        // A computed step extends `C_{s-2}` too, so a loaded one does, for readers of `d^2`.
+        if b.s() > 1 {
+            self.modules[b.s() - 2].compute_basis(b.t());
+        }
         self.target.compute_through_bidegree(b);
 
         // A save file holds only the differential, which determines the step above `s = 0`, where
@@ -1350,14 +1354,8 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> ChainComplex for Resolution<M> {
         // Make sure we have finished reading everything
         drop(f);
 
-        for dx in inputs {
-            assert!(
-                dx.is_zero(),
-                "remainder non-zero at {b}\nAlgebra: {subalgebra}\ndx: {}",
-                target.element_to_string(b.t(), dx.as_slice())
-            );
-        }
-        true
+        // A remainder means some input is not a boundary.
+        inputs.iter().all(|dx| dx.is_zero())
     }
 }
 
