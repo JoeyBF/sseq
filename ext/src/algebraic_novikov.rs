@@ -592,10 +592,14 @@ pub fn q_prefix(max_len: u32, cap: impl Fn(u32) -> i32) -> Vec<Vec<usize>> {
         .collect()
 }
 
-/// One coboundary $\delta^a$ of the untwisted complex for $Q_k$ at weight $u$.
+/// One coboundary $\delta^a$ of the untwisted complex at weight $u$, for $Q_k$ with the largest
+/// $k$ it is read for.
+///
+/// $\psi$ never lengthens a monomial, so the coboundary for a smaller $k$ is this one restricted
+/// to the columns of length at most $k$, and one reduction serves every $k$.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UntwistedMatrix {
-    /// The length of $Q_k$.
+    /// The largest length of $Q_k$ it is read for.
     pub k: i32,
     /// The weight.
     pub u: i32,
@@ -648,34 +652,39 @@ pub fn untwisted_plan<CC: FreeChainComplex>(
     let prefix = q_prefix(max_s as u32, |j| {
         untwisted_max_weight(max_n, max_s, j as i32)
     });
-    let q_dim = |k: i32| {
-        let prefix = &prefix;
-        move |d: i32| {
-            usize::try_from(d)
-                .ok()
-                .and_then(|d| prefix.get(d))
-                .map_or(0, |p| p[k as usize])
-        }
-    };
     let mut plan = Vec::new();
-    for k in 0..=max_s {
-        for u in 0..=untwisted_max_weight(max_n, max_s, k) {
-            for a in untwisted_filtrations(max_n, max_s, k, u) {
-                let cols = cochain_blocks(res, q_dim(k), a, u).1;
-                let rows = cochain_blocks(res, q_dim(k), a + 1, u).1;
-                if rows > 0 && cols > 0 {
-                    plan.push(UntwistedMatrix {
-                        k,
-                        u,
-                        a,
-                        rows,
-                        cols,
-                    });
-                }
+    for a in 0..=max_s {
+        for u in 0..=(max_n + max_s) / 2 {
+            let Some(k) = untwisted_max_length(max_n, max_s, a, u) else {
+                continue;
+            };
+            let q_dim = |d: i32| {
+                usize::try_from(d)
+                    .ok()
+                    .and_then(|d| prefix.get(d))
+                    .map_or(0, |p| p[k as usize])
+            };
+            let cols = cochain_blocks(res, q_dim, a, u).1;
+            let rows = cochain_blocks(res, q_dim, a + 1, u).1;
+            if rows > 0 && cols > 0 {
+                plan.push(UntwistedMatrix {
+                    k,
+                    u,
+                    a,
+                    rows,
+                    cols,
+                });
             }
         }
     }
     plan
+}
+
+/// The largest $k$ for which $\delta^a$ at weight $u$ is read, if any: the inverse of
+/// [`untwisted_max_weight`] and [`untwisted_filtrations`].
+fn untwisted_max_length(max_n: i32, max_s: i32, a: i32, u: i32) -> Option<i32> {
+    let k = (max_s - a).min(max_n + max_s - 2 * u);
+    (k >= 0 && a >= 2 * u - max_n - 1).then_some(k)
 }
 
 /// A term $P(R) x_i$ of some $d z_l$, packed.
@@ -965,11 +974,35 @@ where
     // Column (x_i, m) of δ^a has a 1 in row (z_l, m_γ) when P(R) x_i is a term of d z_l and
     // ξ^R ⊗ m_γ is a term of the conjugate coaction on m.
     // The action depends on neither k nor u, so one memo serves every matrix of a pass.
-    let rank = |m: &UntwistedMatrix, inverted: &InvertedSlice, memo: &ActMemo| -> usize {
+    // The ranks of δ^a at weight u for Q_k, for every k up to `m.k`. Columns are ordered by
+    // length, so the rank for k is the number of pivots among the columns of length at most k.
+    let ranks_of = |m: &UntwistedMatrix, inverted: &InvertedSlice, memo: &ActMemo| -> Vec<usize> {
         let (u, k_u) = (m.u, m.k as u32);
         let q_dim = |d: i32| twisted.dimension(d, k_u);
         let (src, _) = cochain_blocks(res, q_dim, m.a, u);
         let (tgt, _) = cochain_blocks(res, q_dim, m.a + 1, u);
+
+        // The position of each source cochain once sorted by length, and how many have each
+        // length at most j.
+        let mut lengths = Vec::with_capacity(m.cols);
+        for (t_i, &(_, gens)) in src.iter().enumerate() {
+            let d = u - t_i as i32;
+            for _ in 0..gens {
+                for idx in 0..q_dim(d) {
+                    lengths.push(qmono_len(twisted.monomial(d, idx)));
+                }
+            }
+        }
+        let mut order: Vec<usize> = (0..lengths.len()).collect();
+        order.sort_by_key(|&c| lengths[c]);
+        let mut position = vec![0; order.len()];
+        for (new, &old) in order.iter().enumerate() {
+            position[old] = new;
+        }
+        let up_to: Vec<usize> = (0..=m.k as u32)
+            .map(|j| lengths.iter().filter(|&&l| l <= j).count())
+            .collect();
+
         let mut matrix = Matrix::new(p, m.rows, m.cols);
         for (t_i, &(src_off, gens)) in src.iter().enumerate() {
             let t_i = t_i as i32;
@@ -982,7 +1015,7 @@ where
                     continue;
                 };
                 for idx in 0..block {
-                    let col = src_off + i * block + idx;
+                    let col = position[src_off + i * block + idx];
                     let mono = twisted.monomial(u - t_i, idx);
                     for (r, targets) in terms {
                         let gammas = twisted.act_memo(*r, mono, memo, options.memo_limit);
@@ -1005,7 +1038,12 @@ where
                 }
             }
         }
-        matrix.row_reduce()
+        matrix.row_reduce();
+        let pivots = matrix.pivots();
+        up_to
+            .iter()
+            .map(|&c| pivots[..c].iter().filter(|&&r| r >= 0).count())
+            .collect()
     };
 
     let mut ranks: FxHashMap<(i32, i32, i32), usize> = FxHashMap::default();
@@ -1025,11 +1063,13 @@ where
         let memo = ActMemo::default();
         let small_ranks: Vec<_> = small
             .into_maybe_par_iter()
-            .map(|m: &UntwistedMatrix| ((m.k, m.u, m.a), rank(m, &slice, &memo)))
+            .map(|m: &UntwistedMatrix| (m, ranks_of(m, &slice, &memo)))
             .collect();
-        ranks.extend(small_ranks);
-        for m in large {
-            ranks.insert((m.k, m.u, m.a), rank(m, &slice, &memo));
+        let large_ranks = large.into_iter().map(|m| (m, ranks_of(m, &slice, &memo)));
+        for (m, by_k) in small_ranks.into_iter().chain(large_ranks) {
+            for (k, r) in by_k.into_iter().enumerate() {
+                ranks.insert((k as i32, m.u, m.a), r);
+            }
         }
     }
 
