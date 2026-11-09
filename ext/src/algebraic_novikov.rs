@@ -723,6 +723,172 @@ fn differential_slice<CC: FreeChainComplex>(
         .collect()
 }
 
+/// The highest $v_i$ a [`QDown`] monomial can hold; its degree bounds the weights it supports.
+const QDOWN_VARS: usize = 11;
+
+/// A monomial in $v_0, \dots, v_{10}$, as exponents.
+type QMono = [u16; QDOWN_VARS];
+
+/// The bases of $Q_k^\vee$ for every `k <= max_len`, with the action of $A$ computed on demand.
+///
+/// [`QDual`] stores every action, which outgrows memory at large weights. This stores only
+/// the bases, ordered as in [`monomials`], and computes which $m_\gamma$ the term
+/// $\xi^R \otimes m_\gamma$ of $\psi(m)$ reaches when asked for a given $R$ and $m$.
+pub struct QDown {
+    /// The monomials of each degree, sorted by length and then exponents.
+    by_degree: Vec<Vec<QMono>>,
+    /// `prefix[d][j]` is the number of monomials of degree `d` of length at most `j`.
+    prefix: Vec<Vec<usize>>,
+    /// `factors[n]` lists the terms $(\xi^S, i)$ of $\psi(v_n) = \sum \xi^S \otimes v_i$.
+    factors: Vec<Vec<(PackedXi, usize)>>,
+}
+
+/// The length of a monomial.
+fn qmono_len(m: &QMono) -> u32 {
+    m.iter().map(|&e| e as u32).sum()
+}
+
+/// Whether every exponent of `s` is at most that of `r`.
+fn packed_fits(s: PackedXi, r: PackedXi) -> bool {
+    let mask = (1u128 << XI_BITS) - 1;
+    (0..128 / XI_BITS).all(|j| (s >> (j * XI_BITS)) & mask <= (r >> (j * XI_BITS)) & mask)
+}
+
+impl QDown {
+    /// The bases under the coaction of `convention`, keeping a monomial of length `j` only in
+    /// degrees up to `cap(j)`, which must be non-increasing.
+    pub fn new(max_len: u32, cap: impl Fn(u32) -> i32, convention: Convention) -> Self {
+        let max_degree = cap(0);
+        assert!(
+            max_degree < (1 << (QDOWN_VARS - 1)),
+            "degree {max_degree} needs more than v_{}",
+            QDOWN_VARS - 1
+        );
+        let mut by_degree: Vec<Vec<QMono>> = monomials(max_len, cap)
+            .into_iter()
+            .map(|bucket| {
+                bucket
+                    .into_iter()
+                    .map(|m| {
+                        let mut q = [0u16; QDOWN_VARS];
+                        for (i, &e) in m.iter().enumerate() {
+                            q[i] = e as u16;
+                        }
+                        q
+                    })
+                    .collect()
+            })
+            .collect();
+        for bucket in &mut by_degree {
+            bucket.sort_by_key(|m| (qmono_len(m), *m));
+        }
+        let prefix = by_degree
+            .iter()
+            .map(|b| {
+                (0..=max_len)
+                    .map(|j| b.partition_point(|m| qmono_len(m) <= j))
+                    .collect()
+            })
+            .collect();
+        let factors = Coaction::new(max_degree, convention).factors;
+        Self {
+            by_degree,
+            prefix,
+            factors,
+        }
+    }
+
+    /// The dimension of $Q_k^\vee$ in degree `d`, zero outside the truncation.
+    pub fn dimension(&self, d: i32, k: u32) -> usize {
+        usize::try_from(d)
+            .ok()
+            .and_then(|d| self.prefix.get(d))
+            .map_or(0, |p| p[k as usize])
+    }
+
+    /// The `idx`th basis monomial of degree `d`.
+    fn monomial(&self, d: i32, idx: usize) -> &QMono {
+        &self.by_degree[d as usize][idx]
+    }
+
+    /// The index of `m` among the monomials of degree `d`.
+    fn index(&self, d: i32, m: &QMono) -> usize {
+        self.by_degree[d as usize]
+            .binary_search_by_key(&(qmono_len(m), *m), |x| (qmono_len(x), *x))
+            .expect("a term of ψ is in the basis")
+    }
+
+    /// The $m_\gamma$ for which $\xi^R \otimes m_\gamma$ has coefficient 1 in $\psi(m)$.
+    ///
+    /// Expands $\psi(m) = \prod \psi(v_n)$ one factor at a time, keeping only partial products
+    /// whose $\xi$-part still fits inside $R$.
+    fn act_down(&self, r: PackedXi, m: &QMono) -> Vec<QMono> {
+        let mut states: FxHashMap<(PackedXi, QMono), ()> = FxHashMap::default();
+        states.insert((r, [0; QDOWN_VARS]), ());
+        for (n, &e) in m.iter().enumerate().skip(1) {
+            // In characteristic 2, ψ(v_n^e) is the product over the binary digits j of e of
+            // ψ(v_n)^{2^j}, whose terms are those of ψ(v_n) with every exponent doubled j times.
+            for j in (0..16).filter(|j| e >> j & 1 == 1) {
+                let mut next: FxHashMap<(PackedXi, QMono), ()> = FxHashMap::default();
+                for &(rest, part) in states.keys() {
+                    for &(s, i) in &self.factors[n] {
+                        let s = s << j;
+                        if !packed_fits(s, rest) {
+                            continue;
+                        }
+                        let mut part = part;
+                        if i > 0 {
+                            part[i] += 1 << j;
+                        }
+                        let key = (rest - s, part);
+                        if next.remove(&key).is_none() {
+                            next.insert(key, ());
+                        }
+                    }
+                }
+                states = next;
+            }
+        }
+        states
+            .into_keys()
+            .filter(|&(rest, _)| rest == 0)
+            .map(|(_, part)| part)
+            .collect()
+    }
+}
+
+/// The terms of each backbone differential landing on a generator $x_i$ of $P_a$, grouped by
+/// operation: `(t_i, i)` maps to `(R, [(t_l, l)])` for each $z_l$ with $P(R) x_i$ in $d z_l$.
+type InvertedSlice = FxHashMap<(i32, u32), Vec<(PackedXi, Vec<(i32, u32)>)>>;
+
+/// Inverts a [`differential_slice`] of filtration `a`.
+fn invert_slice(algebra: &MilnorAlgebra, slice: &[Vec<Vec<DifferentialTerm>>]) -> InvertedSlice {
+    let mut ops: FxHashMap<(u16, u32), PackedXi> = FxHashMap::default();
+    let mut grouped: FxHashMap<(i32, u32), BTreeMap<PackedXi, Vec<(i32, u32)>>> =
+        FxHashMap::default();
+    for (t_l, gens) in slice.iter().enumerate() {
+        for (l, dz) in gens.iter().enumerate() {
+            for term in dz {
+                let r = *ops.entry((term.op_deg, term.op_idx)).or_insert_with(|| {
+                    let elt =
+                        algebra.basis_element_from_index(term.op_deg as i32, term.op_idx as usize);
+                    pack(&elt.p_part.iter().collect::<Vec<_>>())
+                });
+                grouped
+                    .entry((term.gen_deg as i32, term.gen_idx))
+                    .or_default()
+                    .entry(r)
+                    .or_default()
+                    .push((t_l as i32, l as u32));
+            }
+        }
+    }
+    grouped
+        .into_iter()
+        .map(|(k, v)| (k, v.into_iter().collect()))
+        .collect()
+}
+
 /// Options for [`ctau_e2_untwisted_with`].
 #[derive(Debug, Clone, Copy)]
 pub struct UntwistedOptions {
@@ -774,38 +940,60 @@ where
         "the backbone must be resolved through {range}"
     );
 
-    let twisted = QDual::new(
-        &algebra,
+    let twisted = QDown::new(
         max_s as u32,
         |j| untwisted_max_weight(max_n, max_s, j as i32),
-        &Coaction::new(max_u, Convention::Conjugate),
+        Convention::Conjugate,
     );
     let plan = untwisted_plan(res, max_n, max_s);
 
-    let rank = |m: &UntwistedMatrix, slice: &[Vec<Vec<DifferentialTerm>>]| -> usize {
+    // Column (x_i, m) of δ^a has a 1 in row (z_l, m_γ) when P(R) x_i is a term of d z_l and
+    // ξ^R ⊗ m_γ is a term of the conjugate coaction on m.
+    // act_down(R, m) depends on neither k nor u, so one cache serves every matrix of a pass.
+    type DownCache = dashmap::DashMap<(PackedXi, i32, usize), std::sync::Arc<Vec<QMono>>>;
+    let rank = |m: &UntwistedMatrix, inverted: &InvertedSlice, cache: &DownCache| -> usize {
         let (u, k_u) = (m.u, m.k as u32);
         let q_dim = |d: i32| twisted.dimension(d, k_u);
         let (src, _) = cochain_blocks(res, q_dim, m.a, u);
         let (tgt, _) = cochain_blocks(res, q_dim, m.a + 1, u);
         let mut matrix = Matrix::new(p, m.rows, m.cols);
-        for t_l in 0..=u {
-            let (tgt_off, _) = tgt[t_l as usize];
-            let block = q_dim(u - t_l);
-            for (l, dz) in slice[t_l as usize].iter().enumerate() {
-                for gamma in 0..block {
-                    let mut row = matrix.row_mut(tgt_off + l * block + gamma);
-                    for term in dz {
-                        let gen_deg = term.gen_deg as i32;
-                        let out_dim = q_dim(u - gen_deg);
-                        let start = src[gen_deg as usize].0 + term.gen_idx as usize * out_dim;
-                        for out in twisted.act(
-                            term.op_deg as i32,
-                            term.op_idx as usize,
-                            u - t_l,
-                            gamma,
-                            k_u,
-                        ) {
-                            row.add_basis_element(start + out, 1);
+        for (t_i, &(src_off, gens)) in src.iter().enumerate() {
+            let t_i = t_i as i32;
+            let block = q_dim(u - t_i);
+            if block == 0 {
+                continue;
+            }
+            for i in 0..gens {
+                let Some(terms) = inverted.get(&(t_i, i as u32)) else {
+                    continue;
+                };
+                for idx in 0..block {
+                    let col = src_off + i * block + idx;
+                    let mono = twisted.monomial(u - t_i, idx);
+                    for (r, targets) in terms {
+                        let key = (*r, u - t_i, idx);
+                        let gammas = match cache.get(&key) {
+                            Some(g) => std::sync::Arc::clone(&g),
+                            None => {
+                                let g = std::sync::Arc::new(twisted.act_down(*r, mono));
+                                cache.insert(key, std::sync::Arc::clone(&g));
+                                g
+                            }
+                        };
+                        if gammas.is_empty() {
+                            continue;
+                        }
+                        for &(t_l, l) in targets {
+                            if t_l > u {
+                                continue;
+                            }
+                            let (tgt_off, _) = tgt[t_l as usize];
+                            let tgt_block = q_dim(u - t_l);
+                            for gamma in gammas.iter() {
+                                let g = twisted.index(u - t_l, gamma);
+                                let row = tgt_off + l as usize * tgt_block + g;
+                                matrix.row_mut(row).add_basis_element(col, 1);
+                            }
                         }
                     }
                 }
@@ -824,14 +1012,18 @@ where
             continue;
         }
         // The largest weight δ^a is read at, from the inverse of `untwisted_filtrations`.
-        let slice = differential_slice(res, a, max_u.min((max_n + a + 1) / 2));
+        let slice = invert_slice(
+            &algebra,
+            &differential_slice(res, a, max_u.min((max_n + a + 1) / 2)),
+        );
+        let cache = DownCache::default();
         let small_ranks: Vec<_> = small
             .into_maybe_par_iter()
-            .map(|m: &UntwistedMatrix| ((m.k, m.u, m.a), rank(m, &slice)))
+            .map(|m: &UntwistedMatrix| ((m.k, m.u, m.a), rank(m, &slice, &cache)))
             .collect();
         ranks.extend(small_ranks);
         for m in large {
-            ranks.insert((m.k, m.u, m.a), rank(m, &slice));
+            ranks.insert((m.k, m.u, m.a), rank(m, &slice, &cache));
         }
     }
 
