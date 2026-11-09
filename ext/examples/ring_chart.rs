@@ -50,22 +50,29 @@ fn main() -> anyhow::Result<()> {
             "unknown format '{x}'; expected one of svg, tikz, seqsee"
         )),
     });
-    let max_n = res.iter_stem().map(|b| b.n()).max().unwrap_or(0);
     let max_s = res.iter_stem().map(|b| b.s()).max().unwrap_or(0);
-    let max_t: i32 = query::with_default("Ring through internal degree t", "150", str::parse);
+    let ring_n: i32 = query::with_default("Ring through stem", "150", str::parse);
+    let max_t: i32 = query::with_default(
+        "Ring through internal degree t",
+        &(ring_n + max_s).to_string(),
+        str::parse,
+    );
     let max_stem: i32 = query::with_default("Largest stem of a multiplier", "20", str::parse);
 
     let ext = ExtAlgebra::new(Arc::clone(&res));
     let start = std::time::Instant::now();
     ext.compute_ring(RingRange {
-        max_n,
+        max_n: ring_n,
         max_s,
         max_t,
     })?;
     eprintln!(
-        "ring through t = {max_t} in {:.1} s",
+        "ring through stem {ring_n}, t {max_t} in {:.1} s",
         start.elapsed().as_secs_f64()
     );
+    for g in ext.indecomposables().unwrap() {
+        eprintln!("indecomposable x_{g}");
+    }
 
     let mut products = Vec::new();
     for i in 0..4 {

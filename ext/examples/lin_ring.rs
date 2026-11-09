@@ -35,6 +35,7 @@ fn main() -> anyhow::Result<()> {
     let res = Arc::new(query_module(Some(AlgebraType::Milnor), true)?);
     let max_n = res.iter_stem().map(|b| b.n()).max().unwrap_or(0);
     let max_s = res.iter_stem().map(|b| b.s()).max().unwrap_or(0);
+    let max_n: i32 = query::with_default("Ring through stem", &max_n.to_string(), str::parse);
     let max_t = query::with_default(
         "Ring through internal degree t",
         &(max_n + max_s).to_string(),
