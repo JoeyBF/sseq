@@ -50,6 +50,23 @@ use crate::{
 /// [`compute`] checks that no generator off the `h_i` line has smaller `t`.
 pub const WINDOW_T: i32 = 11;
 
+/// The bidegrees `0 <= n <= max_n`, `0 <= s <= max_s`, `t <= max_t` over which a [`Ring`] is
+/// computed. A product is known when both factors and the product lie in the range.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RingRange {
+    pub max_n: i32,
+    pub max_s: i32,
+    pub max_t: i32,
+}
+
+impl RingRange {
+    pub fn contains(&self, b: Bidegree) -> bool {
+        (0..=self.max_s).contains(&b.s())
+            && (0..=self.max_n).contains(&b.n())
+            && b.t() <= self.max_t
+    }
+}
+
 /// A generator `a_i`: the generator `idx` of the resolution at `b`; `h = Some(k)` for `h_k`.
 pub struct Generator {
     pub b: Bidegree,
@@ -92,7 +109,7 @@ impl Monomial {
 
 /// A chain map lifted only over a downward-closed staircase of output bidegrees: row `s` through
 /// stem `stair[s]` (`-1`: nothing), `stair[s - 1] >= stair[s]`.
-struct Staircase<CC: FreeChainComplex + AugmentedChainComplex> {
+struct Staircase<CC: FreeChainComplex> {
     hom: ResolutionHomomorphism<CC, CC>,
     stair: Arc<[AtomicI32]>,
 }
@@ -134,7 +151,7 @@ pub struct WindowStats {
 }
 
 /// The ring through the range, with the chain maps it lifted.
-pub struct Ring<CC: FreeChainComplex + AugmentedChainComplex> {
+pub struct Ring<CC: FreeChainComplex> {
     pub gens: Vec<Generator>,
     pub basis: Vec<Monomial>,
     /// Per bidegree: its basis monomials, and the inverse of their matrix (row `y` = the
@@ -146,7 +163,7 @@ pub struct Ring<CC: FreeChainComplex + AugmentedChainComplex> {
     memo: HashMap<(usize, usize), FpVector>,
     /// [`Ring::monomial_block`]'s memo.
     block_memo: HashMap<(usize, Bidegree), Arc<[FpVector]>>,
-    in_range: Box<dyn Fn(Bidegree) -> bool + Send + Sync>,
+    range: RingRange,
     res: Arc<CC>,
     pub windows: Vec<WindowStats>,
     /// `(b, dim Ext(b), dim D(b))` for every non-zero bidegree in range.
@@ -190,10 +207,10 @@ fn invert(rows: &[FpVector]) -> Vec<FpVector> {
 
 impl<CC> Ring<CC>
 where
-    CC: FreeChainComplex + AugmentedChainComplex + Send + Sync + 'static,
+    CC: FreeChainComplex + AugmentedChainComplex,
 {
     fn dim(&self, b: Bidegree) -> usize {
-        if (self.in_range)(b) {
+        if self.range.contains(b) {
             self.res.number_of_gens_in_bidegree(b)
         } else {
             0
@@ -335,7 +352,7 @@ where
 
     /// The products `e_x e_y` of the dual basis elements of `Ext(b)` and `Ext(c)` (the resolution's
     /// generators): `result[x][y] ∈ Ext(b + c)`. This is what a chain map per basis element (as in
-    /// [`crate::ext_algebra::ExtModule::extend_all_products`]) computes, here by associativity
+    /// [`super::ExtModule::extend_all_products`]) computes, here by associativity
     /// from the generator maps; zero blocks when `b + c` is out of range.
     pub fn basis_block(&mut self, b: Bidegree, c: Bidegree) -> Vec<Vec<FpVector>> {
         let (db, dc, dbc) = (self.dim(b), self.dim(c), self.dim(b + c));
@@ -374,7 +391,7 @@ where
                     continue;
                 }
                 let target = self.gens[j].b + self.basis[m].b;
-                if !(self.in_range)(target) {
+                if !self.range.contains(target) {
                     continue;
                 }
                 let free = self.direct(j, m);
@@ -388,6 +405,11 @@ where
             }
         }
         (checks, fails)
+    }
+
+    /// The range this ring was computed over.
+    pub fn range(&self) -> RingRange {
+        self.range
     }
 
     pub fn maps(&self) -> usize {
@@ -408,22 +430,19 @@ where
     }
 }
 
-/// Compute the ring through `n <= max_n`, `s <= max_s`, `t <= max_t`, given the `h_i` products
-/// `hi` (every `k` with `2^k <= max_t`). `res` must be computed through `(max_n, max_s)`.
-pub fn compute<CC>(
-    res: &Arc<CC>,
-    hi: &[HiBlock],
-    max_n: i32,
-    max_s: i32,
-    max_t: i32,
-) -> anyhow::Result<Ring<CC>>
+/// Compute the ring through `range`, given the `h_i` products `hi` (every `k` with
+/// `2^k <= range.max_t`). `res` must be computed through `(range.max_n, range.max_s)`.
+pub fn compute<CC>(res: &Arc<CC>, hi: &[HiBlock], range: RingRange) -> anyhow::Result<Ring<CC>>
 where
     CC: FreeChainComplex + AugmentedChainComplex + Send + Sync + 'static,
 {
     ensure!(res.prime() == 2, "lin_ring works at the prime 2");
-    let in_range = move |b: Bidegree| {
-        (0..=max_s).contains(&b.s()) && (0..=max_n).contains(&b.n()) && b.t() <= max_t
-    };
+    let RingRange {
+        max_n,
+        max_s,
+        max_t,
+    } = range;
+    let in_range = move |b: Bidegree| range.contains(b);
     let mut ring = Ring {
         gens: vec![],
         basis: vec![],
@@ -432,7 +451,7 @@ where
         h_rows: HashMap::new(),
         memo: HashMap::new(),
         block_memo: HashMap::new(),
-        in_range: Box::new(in_range),
+        range,
         res: Arc::clone(res),
         windows: vec![],
         decomposables: vec![],
@@ -496,7 +515,7 @@ where
             })
             .collect();
         if !liftables.is_empty() {
-            MultiLift::new(Arc::clone(res), liftables).extend_through_stem(bound);
+            MultiLift::new(Arc::clone(res), liftables).extend_through_stem(bound)?;
         }
         let lift_s = t_lift.elapsed().as_secs_f64();
 
