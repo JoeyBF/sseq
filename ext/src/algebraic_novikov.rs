@@ -5,7 +5,7 @@ use std::{collections::BTreeMap, sync::Arc};
 use algebra::{
     Algebra, MilnorAlgebra,
     milnor_algebra::{MilnorBasisElement, PPart},
-    module::{FDModule, OperationGeneratorPair},
+    module::FDModule,
 };
 use bivec::BiVec;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -271,7 +271,7 @@ impl QDual {
                     .map(|j| b.partition_point(|m| m.iter().sum::<u32>() <= j))
                     .collect()
             })
-            .collect();
+            .collect::<Vec<Vec<usize>>>();
         let mut offsets = vec![0];
         for b in &basis {
             offsets.push(offsets.last().unwrap() + b.len());
@@ -555,9 +555,209 @@ pub fn untwisted_backbone_range(max_n: i32, max_s: i32) -> Bidegree {
     Bidegree::n_s((max_n + max_s) / 2, max_s + 1)
 }
 
+/// `prefix[d][j]`: the number of $v_0$-free monomials of degree `d` and length at most `j`,
+/// keeping a monomial of length `j` only in degrees up to `cap(j)`.
+///
+/// These are the dimensions of the $Q_k^\vee$ that [`QDual`] builds, counted without listing
+/// the monomials.
+pub fn q_prefix(max_len: u32, cap: impl Fn(u32) -> i32) -> Vec<Vec<usize>> {
+    let max_degree = cap(0).max(0) as usize;
+    let len = max_len as usize;
+    // exact[d][j]: monomials in v_1, v_2, ... of degree d and length exactly j.
+    let mut exact = vec![vec![0usize; len + 1]; max_degree + 1];
+    exact[0][0] = 1;
+    for i in (1..).take_while(|&i| v_degree(i) as usize <= max_degree) {
+        let part = v_degree(i) as usize;
+        for d in part..=max_degree {
+            for j in 1..=len {
+                exact[d][j] += exact[d - part][j - 1];
+            }
+        }
+    }
+    exact
+        .iter()
+        .enumerate()
+        .map(|(d, row)| {
+            let mut total = 0;
+            (0..=len)
+                .map(|j| {
+                    if d as i32 <= cap(j as u32) {
+                        total += row[j];
+                    }
+                    total
+                })
+                .collect()
+        })
+        .collect()
+}
+
+/// One coboundary $\delta^a$ of the untwisted complex for $Q_k$ at weight $u$.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UntwistedMatrix {
+    /// The length of $Q_k$.
+    pub k: i32,
+    /// The weight.
+    pub u: i32,
+    /// The source filtration; the target is `a + 1`.
+    pub a: i32,
+    /// The dimension of the target cochains.
+    pub rows: usize,
+    /// The dimension of the source cochains.
+    pub cols: usize,
+}
+
+/// The cochains of filtration `a` at weight `u`: the offset and generator count of each block
+/// $x_i \otimes Q_k^\vee$, by generator degree, and the total dimension.
+fn cochain_blocks<CC: FreeChainComplex>(
+    res: &CC,
+    q_dim: impl Fn(i32) -> usize,
+    a: i32,
+    u: i32,
+) -> (Vec<(usize, usize)>, usize) {
+    let mut blocks = Vec::with_capacity(u as usize + 1);
+    let mut total = 0;
+    for t in 0..=u {
+        let gens = res.number_of_gens_in_bidegree(Bidegree::s_t(a, t));
+        blocks.push((total, gens));
+        total += gens * q_dim(u - t);
+    }
+    (blocks, total)
+}
+
+/// The largest weight read for $Q_k$: $\mathrm{Ext}^{a, u}(Q_k)$ is wanted for
+/// $a \leq$ `max_s - k` and stem $2u - a \leq$ `max_n`.
+fn untwisted_max_weight(max_n: i32, max_s: i32, k: i32) -> i32 {
+    (max_n + max_s - k) / 2
+}
+
+/// The filtrations whose coboundary is read at `(k, u)`: from one below the lowest wanted
+/// filtration, for the coboundary into it, to the highest.
+fn untwisted_filtrations(max_n: i32, max_s: i32, k: i32, u: i32) -> std::ops::RangeInclusive<i32> {
+    (2 * u - max_n - 1).max(0)..=max_s - k
+}
+
+/// Every coboundary [`ctau_e2_untwisted_on`] reduces, from the generator counts of `res` alone.
+///
+/// Builds nothing, so it sizes a run, against the backbone it will use, before starting it.
+pub fn untwisted_plan<CC: FreeChainComplex>(
+    res: &CC,
+    max_n: i32,
+    max_s: i32,
+) -> Vec<UntwistedMatrix> {
+    let prefix = q_prefix(max_s as u32, |j| {
+        untwisted_max_weight(max_n, max_s, j as i32)
+    });
+    let q_dim = |k: i32| {
+        let prefix = &prefix;
+        move |d: i32| {
+            usize::try_from(d)
+                .ok()
+                .and_then(|d| prefix.get(d))
+                .map_or(0, |p| p[k as usize])
+        }
+    };
+    let mut plan = Vec::new();
+    for k in 0..=max_s {
+        for u in 0..=untwisted_max_weight(max_n, max_s, k) {
+            for a in untwisted_filtrations(max_n, max_s, k, u) {
+                let cols = cochain_blocks(res, q_dim(k), a, u).1;
+                let rows = cochain_blocks(res, q_dim(k), a + 1, u).1;
+                if rows > 0 && cols > 0 {
+                    plan.push(UntwistedMatrix {
+                        k,
+                        u,
+                        a,
+                        rows,
+                        cols,
+                    });
+                }
+            }
+        }
+    }
+    plan
+}
+
+/// A term $P(R) x_i$ of some $d z_l$, packed.
+#[derive(Clone, Copy)]
+struct DifferentialTerm {
+    /// The index of $P(R)$ in its degree.
+    op_idx: u32,
+    /// The index of $x_i$ in its degree.
+    gen_idx: u32,
+    /// The degree of $P(R)$.
+    op_deg: u16,
+    /// The degree of $x_i$.
+    gen_deg: u16,
+}
+
+/// The terms of $d z_l$ for every generator $z_l$ of $P_{a+1}$ in degrees up to `max_t`, indexed
+/// by degree then generator.
+fn differential_slice<CC: FreeChainComplex>(
+    res: &CC,
+    a: i32,
+    max_t: i32,
+) -> Vec<Vec<Vec<DifferentialTerm>>> {
+    let d = res.differential(a + 1);
+    let source = res.module(a);
+    (0..=max_t)
+        .map(|t| {
+            let gens = res.number_of_gens_in_bidegree(Bidegree::s_t(a + 1, t));
+            (0..gens)
+                .map(|l| {
+                    d.output(t, l)
+                        .iter_nonzero()
+                        .map(|(idx, _)| {
+                            let og = source.index_to_op_gen(t, idx);
+                            DifferentialTerm {
+                                op_idx: og.operation_index as u32,
+                                gen_idx: og.generator_index as u32,
+                                op_deg: og.operation_degree as u16,
+                                gen_deg: og.generator_degree as u16,
+                            }
+                        })
+                        .collect()
+                })
+                .collect()
+        })
+        .collect()
+}
+
+/// Options for [`ctau_e2_untwisted_with`].
+#[derive(Debug, Clone, Copy)]
+pub struct UntwistedOptions {
+    /// Coboundaries with more entries than this are built and reduced one at a time, so only one
+    /// is ever held; smaller ones run in parallel. Raising it trades memory for parallelism.
+    pub serial_above: usize,
+}
+
+impl Default for UntwistedOptions {
+    fn default() -> Self {
+        Self {
+            serial_above: 1 << 30,
+        }
+    }
+}
+
 /// [`ctau_e2_untwisted`] on an existing resolution `res` of the classical $\mathbb{F}_2$, computed
 /// through [`untwisted_backbone_range`].
 pub fn ctau_e2_untwisted_on<CC>(res: &CC, max_n: i32, max_s: i32) -> TrigradedDims
+where
+    CC: FreeChainComplex<Algebra = MilnorAlgebra> + Sync,
+{
+    ctau_e2_untwisted_with(res, max_n, max_s, UntwistedOptions::default())
+}
+
+/// [`ctau_e2_untwisted_on`] with `options`.
+///
+/// Filtration by filtration, it reads the differential out of $P_{a+1}$, reduces every
+/// $\delta^a$ that needs it and keeps only the ranks, so neither the whole resolution nor more
+/// than one large coboundary is held at once.
+pub fn ctau_e2_untwisted_with<CC>(
+    res: &CC,
+    max_n: i32,
+    max_s: i32,
+    options: UntwistedOptions,
+) -> TrigradedDims
 where
     CC: FreeChainComplex<Algebra = MilnorAlgebra> + Sync,
 {
@@ -573,118 +773,82 @@ where
         "the backbone must be resolved through {range}"
     );
 
-    // The terms of each d z_l, read once and shared by every k and u.
-    let terms: Vec<Vec<Vec<Vec<OperationGeneratorPair>>>> = (0..=max_s)
-        .map(|a| {
-            let d = res.differential(a + 1);
-            let source = res.module(a);
-            (0..=max_u)
-                .map(|t| {
-                    let gens = res.number_of_gens_in_bidegree(Bidegree::s_t(a + 1, t));
-                    (0..gens)
-                        .map(|l| {
-                            d.output(t, l)
-                                .iter_nonzero()
-                                .map(|(idx, _)| source.index_to_op_gen(t, idx))
-                                .collect()
-                        })
-                        .collect()
-                })
-                .collect()
-        })
-        .collect();
-
-    // Ext^{a, u}(Q_k) is wanted for a <= max_s - k and n = 2u - a <= max_n.
-    let max_weight = |k: i32| (max_n + max_s - k) / 2;
     let twisted = QDual::new(
         &algebra,
         max_s as u32,
-        |j| max_weight(j as i32),
+        |j| untwisted_max_weight(max_n, max_s, j as i32),
         &Coaction::new(max_u, Convention::Conjugate),
     );
-    // One cochain complex per (k, u), each independent of the others.
-    let pairs: Vec<(i32, i32)> = (0..=max_s)
-        .flat_map(|k| (0..=max_weight(k)).map(move |u| (k, u)))
-        .collect();
-    let complex = |&(k, u): &(i32, i32)| {
-        let max_a = max_s - k;
-        // The lowest a with 2u - a <= max_n, less one for the δ into it.
-        let min_a = (2 * u - max_n - 1).max(0);
-        let k_u = k as u32;
-        let mut found = Vec::new();
-        // Offsets of the blocks x_i ⊗ Q_k^∨ in the cochains of filtration a at weight u.
-        let offsets = |a: i32| {
-            let mut table = Vec::new();
-            let mut total = 0;
-            for t in 0..=u {
-                let gens = res.number_of_gens_in_bidegree(Bidegree::s_t(a, t));
-                table.push((total, gens));
-                total += gens * twisted.dimension(u - t, k_u);
-            }
-            (table, total)
-        };
-        let cochains: Vec<_> = (0..=max_a + 1)
-            .map(|a| {
-                if a < min_a {
-                    (Vec::new(), 0)
-                } else {
-                    offsets(a)
-                }
-            })
-            .collect();
-        let mut ranks = vec![0; max_a as usize + 1];
-        for a in 0..=max_a {
-            let (src, src_dim) = &cochains[a as usize];
-            let (tgt, tgt_dim) = &cochains[a as usize + 1];
-            if *src_dim == 0 || *tgt_dim == 0 {
-                continue;
-            }
-            let mut matrix = Matrix::new(p, *tgt_dim, *src_dim);
-            for t_l in 0..=u {
-                let (tgt_off, _) = tgt[t_l as usize];
-                let block = twisted.dimension(u - t_l, k_u);
-                for (l, dz) in terms[a as usize][t_l as usize].iter().enumerate() {
-                    for gamma in 0..block {
-                        let mut row = matrix.row_mut(tgt_off + l * block + gamma);
-                        for og in dz {
-                            let out_dim = twisted.dimension(u - og.generator_degree, k_u);
-                            let start =
-                                src[og.generator_degree as usize].0 + og.generator_index * out_dim;
-                            for out in twisted.act(
-                                og.operation_degree,
-                                og.operation_index,
-                                u - t_l,
-                                gamma,
-                                k_u,
-                            ) {
-                                row.add_basis_element(start + out, 1);
-                            }
+    let plan = untwisted_plan(res, max_n, max_s);
+
+    let rank = |m: &UntwistedMatrix, slice: &[Vec<Vec<DifferentialTerm>>]| -> usize {
+        let (u, k_u) = (m.u, m.k as u32);
+        let q_dim = |d: i32| twisted.dimension(d, k_u);
+        let (src, _) = cochain_blocks(res, q_dim, m.a, u);
+        let (tgt, _) = cochain_blocks(res, q_dim, m.a + 1, u);
+        let mut matrix = Matrix::new(p, m.rows, m.cols);
+        for t_l in 0..=u {
+            let (tgt_off, _) = tgt[t_l as usize];
+            let block = q_dim(u - t_l);
+            for (l, dz) in slice[t_l as usize].iter().enumerate() {
+                for gamma in 0..block {
+                    let mut row = matrix.row_mut(tgt_off + l * block + gamma);
+                    for term in dz {
+                        let gen_deg = term.gen_deg as i32;
+                        let out_dim = q_dim(u - gen_deg);
+                        let start = src[gen_deg as usize].0 + term.gen_idx as usize * out_dim;
+                        for out in twisted.act(
+                            term.op_deg as i32,
+                            term.op_idx as usize,
+                            u - t_l,
+                            gamma,
+                            k_u,
+                        ) {
+                            row.add_basis_element(start + out, 1);
                         }
                     }
                 }
             }
-            ranks[a as usize] = matrix.row_reduce();
         }
-        for a in 0..=max_a {
-            let n = 2 * u - a;
-            if n > max_n || n < 0 {
-                continue;
-            }
-            let prev = if a > 0 { ranks[a as usize - 1] } else { 0 };
-            let d = cochains[a as usize].1 - ranks[a as usize] - prev;
-            if d > 0 {
-                found.push(((n, a + k, u), d));
-            }
-        }
-        found
+        matrix.row_reduce()
     };
+
+    let mut ranks: FxHashMap<(i32, i32, i32), usize> = FxHashMap::default();
+    for a in 0..=max_s {
+        let (large, small): (Vec<_>, Vec<_>) = plan
+            .iter()
+            .filter(|m| m.a == a)
+            .partition(|m| m.rows * m.cols > options.serial_above);
+        if large.is_empty() && small.is_empty() {
+            continue;
+        }
+        let slice = differential_slice(res, a, max_u);
+        let small_ranks: Vec<_> = small
+            .into_maybe_par_iter()
+            .map(|m: &UntwistedMatrix| ((m.k, m.u, m.a), rank(m, &slice)))
+            .collect();
+        ranks.extend(small_ranks);
+        for m in large {
+            ranks.insert((m.k, m.u, m.a), rank(m, &slice));
+        }
+    }
+
     let mut dims = TrigradedDims::default();
-    for found in pairs
-        .into_maybe_par_iter()
-        .map(|x| complex(&x))
-        .collect::<Vec<_>>()
-    {
-        dims.0.extend(found);
+    for k in 0..=max_s {
+        let q_dim = |d: i32| twisted.dimension(d, k as u32);
+        for u in 0..=untwisted_max_weight(max_n, max_s, k) {
+            for a in untwisted_filtrations(max_n, max_s, k, u) {
+                let n = 2 * u - a;
+                if n > max_n || n < 0 {
+                    continue;
+                }
+                let rank_of = |a| ranks.get(&(k, u, a)).copied().unwrap_or(0);
+                let d = cochain_blocks(res, q_dim, a, u).1 - rank_of(a) - rank_of(a - 1);
+                if d > 0 {
+                    dims.0.insert((n, a + k, u), d);
+                }
+            }
+        }
     }
     dims
 }
@@ -827,6 +991,29 @@ mod tests {
         ] {
             assert_eq!(dims.0.get(&(n, s, w)), Some(&1), "({n}, {s}, {w})");
         }
+    }
+
+    /// [`q_prefix`] counts the bases [`monomials`] lists.
+    #[test]
+    fn q_prefix_counts_monomials() {
+        let cap = |j: u32| 40 - j as i32 / 2;
+        let listed = monomials(12, cap);
+        let counted = q_prefix(12, cap);
+        for (d, bucket) in listed.iter().enumerate() {
+            for j in 0..=12 {
+                let n = bucket.iter().filter(|m| m.iter().sum::<u32>() <= j).count();
+                assert_eq!(counted[d][j as usize], n, "degree {d}, length {j}");
+            }
+        }
+    }
+
+    /// Running every coboundary one at a time changes nothing.
+    #[test]
+    fn serial_matches_parallel() {
+        let res = crate::nassau::Resolution::new(Arc::new(unit_module()));
+        res.compute_through_stem(untwisted_backbone_range(30, 15));
+        let serial = ctau_e2_untwisted_with(&res, 30, 15, UntwistedOptions { serial_above: 0 });
+        assert_eq!(serial, ctau_e2_untwisted_on(&res, 30, 15));
     }
 
     /// The $\xi$ convention gives a module for small `k`.
