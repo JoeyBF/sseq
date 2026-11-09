@@ -1,11 +1,11 @@
 //! The $C\tau$ Adams $E_2$ page from classical data, via Miller's square.
 
-use std::{collections::BTreeMap, sync::Arc};
+use std::{cell::RefCell, collections::BTreeMap, rc::Rc, sync::Arc};
 
 use algebra::{
     Algebra, MilnorAlgebra,
     milnor_algebra::{MilnorBasisElement, PPart},
-    module::FDModule,
+    module::{FDModule, OperationGeneratorPair},
 };
 use bivec::BiVec;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -113,8 +113,12 @@ pub fn monomial_degree(m: &[u32]) -> i32 {
         .sum()
 }
 
-/// All monomials of length `k` and degree at most `max_degree`, bucketed by degree.
-pub fn monomials(k: u32, max_degree: i32) -> Vec<Vec<VMonomial>> {
+/// The monomials free of $v_0$ with length at most `max_len` and degree at most `max_degree`,
+/// bucketed by degree and sorted by length within each bucket.
+///
+/// $m \mapsto v_0^{k - |m|} m$ identifies those of length at most `k` with a basis of $Q_k$, so
+/// each $Q_k$ is a prefix of every bucket.
+pub fn monomials(max_len: u32, max_degree: i32) -> Vec<Vec<VMonomial>> {
     // The largest i with |v_i| <= max_degree.
     let top = (0..)
         .take_while(|&i| v_degree(i) <= max_degree)
@@ -122,7 +126,7 @@ pub fn monomials(k: u32, max_degree: i32) -> Vec<Vec<VMonomial>> {
         .unwrap_or(0);
     let mut out = vec![Vec::new(); max_degree as usize + 1];
     let mut current = vec![0u32; top + 1];
-    /// Chooses the exponent of `v_i`, then recurses on `v_{i-1}`; `v_0` takes what is left.
+    /// Chooses the exponent of `v_i`, then recurses on `v_{i-1}`, stopping before `v_0`.
     fn rec(
         i: usize,
         remaining: u32,
@@ -132,9 +136,7 @@ pub fn monomials(k: u32, max_degree: i32) -> Vec<Vec<VMonomial>> {
         out: &mut Vec<Vec<VMonomial>>,
     ) {
         if i == 0 {
-            current[0] = remaining;
             out[degree as usize].push(trim(current.clone()));
-            current[0] = 0;
             return;
         }
         let d = v_degree(i);
@@ -153,26 +155,34 @@ pub fn monomials(k: u32, max_degree: i32) -> Vec<Vec<VMonomial>> {
         }
         current[i] = 0;
     }
-    rec(top, k, 0, max_degree, &mut current, &mut out);
+    rec(top, max_len, 0, max_degree, &mut current, &mut out);
     for bucket in &mut out {
-        bucket.sort();
+        bucket.sort_by_key(|m| (m.iter().sum::<u32>(), m.clone()));
     }
     out
 }
 
-/// The coaction on $Q$, memoised per monomial.
+/// The coaction on $Q$, memoised on monomials free of $v_0$.
+///
+/// $v_0$ is primitive, so $\psi(v_0^e m) = v_0^e \psi(m)$ and one table serves every $Q_k$.
 pub struct Coaction {
     /// `factors[n]` is $\psi(v_n)$ as a list of $(\text{coefficient}, i)$ meaning
     /// $\text{coefficient} \otimes v_i$.
     factors: Vec<Vec<(XiPoly, usize)>>,
+    /// $\psi(m)$ for the $v_0$-free monomials computed so far.
+    memo: RefCell<FxHashMap<VMonomial, Rc<CoactionValue>>>,
 }
 
 /// $\psi(m)$ as the set of $(R, m')$ with $\xi^R \otimes m'$ having coefficient 1.
 pub type CoactionValue = FxHashSet<(XiMonomial, VMonomial)>;
 
 impl Coaction {
-    /// The coaction on $v_0, \dots, v_{\text{max\_n}}$ and their products.
-    pub fn new(max_n: usize, convention: Convention) -> Self {
+    /// The coaction on monomials of degree at most `max_degree`.
+    pub fn new(max_degree: i32, convention: Convention) -> Self {
+        let max_n = (0..)
+            .take_while(|&i| v_degree(i) <= max_degree)
+            .last()
+            .unwrap_or(0);
         let gens: Vec<XiPoly> = match convention {
             Convention::Xi => (0..=max_n).map(xi).collect(),
             Convention::Conjugate => conjugates(max_n),
@@ -184,16 +194,25 @@ impl Coaction {
                     .collect()
             })
             .collect();
-        Self { factors }
+        Self {
+            factors,
+            memo: RefCell::default(),
+        }
     }
 
-    /// $\psi(m)$ for a monomial $m$.
-    pub fn apply(&self, m: &[u32]) -> CoactionValue {
-        let mut acc: CoactionValue = std::iter::once((Vec::new(), Vec::new())).collect();
-        for (n, &e) in m.iter().enumerate() {
-            for _ in 0..e {
+    /// $\psi(m)$ for a monomial $m$ with no $v_0$, as $\psi(v_n) \psi(m / v_n)$ for its top $v_n$.
+    pub fn v0_free(&self, m: &[u32]) -> Rc<CoactionValue> {
+        if let Some(v) = self.memo.borrow().get(m) {
+            return Rc::clone(v);
+        }
+        let value = match m.iter().rposition(|&e| e > 0) {
+            None => std::iter::once((Vec::new(), Vec::new())).collect(),
+            Some(n) => {
+                let mut rest = m.to_vec();
+                rest[n] -= 1;
+                let rest = self.v0_free(&trim(rest));
                 let mut next = CoactionValue::default();
-                for (r, mm) in &acc {
+                for (r, mm) in rest.iter() {
                     for (poly, i) in &self.factors[n] {
                         let mut mm2 = mm.clone();
                         if mm2.len() <= *i {
@@ -205,10 +224,128 @@ impl Coaction {
                         }
                     }
                 }
-                acc = next;
+                next
+            }
+        };
+        let value = Rc::new(value);
+        self.memo.borrow_mut().insert(m.to_vec(), Rc::clone(&value));
+        value
+    }
+}
+
+/// The action of $A$ on the bases of $Q_k^\vee$ for every `k <= max_len`, in degrees
+/// `<= max_degree`.
+///
+/// The basis in each degree is dual to [`monomials`], whose length ordering makes the basis of
+/// each $Q_k^\vee$ a prefix. $P(R)$ sends $m'^*$ to the sum of the $m^*$ for which
+/// $\xi^R \otimes m'$ appears in $\psi(m)$. Since $v_0$ is primitive this does not depend on $k$,
+/// so restricting to a prefix gives $Q_k^\vee$.
+pub struct QDual {
+    /// `prefix[d][j]` is the number of basis elements of degree `d` of length at most `j`.
+    prefix: Vec<Vec<usize>>,
+    /// `actions[d][i]` maps the operation `(op_deg, op_idx)` to the outputs it hits from basis
+    /// element `i` of degree `d`, in increasing order, each with coefficient 1.
+    actions: Vec<Vec<FxHashMap<(i32, usize), Vec<usize>>>>,
+}
+
+impl QDual {
+    /// The basis action table under `coaction`.
+    pub fn new(
+        algebra: &MilnorAlgebra,
+        max_len: u32,
+        max_degree: i32,
+        coaction: &Coaction,
+    ) -> Self {
+        let basis = monomials(max_len, max_degree);
+        algebra.compute_basis(max_degree);
+        let index: FxHashMap<&VMonomial, usize> = basis
+            .iter()
+            .flat_map(|b| b.iter().enumerate().map(|(i, m)| (m, i)))
+            .collect();
+        let prefix = basis
+            .iter()
+            .map(|b| {
+                (0..=max_len)
+                    .map(|j| b.partition_point(|m| m.iter().sum::<u32>() <= j))
+                    .collect()
+            })
+            .collect();
+        let mut actions: Vec<Vec<_>> = basis
+            .iter()
+            .map(|b| vec![FxHashMap::default(); b.len()])
+            .collect();
+        for (out_deg, bucket) in basis.iter().enumerate() {
+            let out_deg = out_deg as i32;
+            for (out_idx, m) in bucket.iter().enumerate() {
+                for (r, m_in) in coaction.v0_free(m).iter() {
+                    let in_deg = monomial_degree(m_in);
+                    let op_deg = out_deg - in_deg;
+                    if op_deg == 0 {
+                        continue;
+                    }
+                    let mut free = m_in.clone();
+                    if let Some(e) = free.first_mut() {
+                        *e = 0;
+                    }
+                    let op_idx = algebra.basis_element_to_index(&MilnorBasisElement {
+                        q_part: 0,
+                        p_part: PPart::from_slice(r),
+                        degree: op_deg,
+                    });
+                    actions[in_deg as usize][index[&trim(free)]]
+                        .entry((op_deg, op_idx))
+                        .or_insert_with(Vec::new)
+                        .push(out_idx);
+                }
             }
         }
-        acc
+        Self { prefix, actions }
+    }
+
+    /// The dimension of $Q_k^\vee$ in degree `d`, zero outside the truncation.
+    pub fn dimension(&self, d: i32, k: u32) -> usize {
+        usize::try_from(d)
+            .ok()
+            .and_then(|d| self.prefix.get(d))
+            .map_or(0, |p| p[k as usize])
+    }
+
+    /// The basis elements of $Q_k^\vee$ hit by operation `(op_deg, op_idx)` from basis element
+    /// `idx` of degree `d`.
+    pub fn act(&self, op_deg: i32, op_idx: usize, d: i32, idx: usize, k: u32) -> &[usize] {
+        let outs = self.actions[d as usize][idx]
+            .get(&(op_deg, op_idx))
+            .map_or(&[][..], Vec::as_slice);
+        let dim = self.dimension(d + op_deg, k);
+        &outs[..outs.partition_point(|&o| o < dim)]
+    }
+
+    /// $Q_k^\vee$ as a module.
+    pub fn module(&self, algebra: Arc<MilnorAlgebra>, k: u32) -> FDModule<MilnorAlgebra> {
+        let top = (0..self.prefix.len() as i32)
+            .rev()
+            .find(|&d| self.dimension(d, k) > 0)
+            .unwrap_or(0);
+        let mut graded_dimension = BiVec::new(0);
+        for d in 0..=top {
+            graded_dimension.push(self.dimension(d, k));
+        }
+        let mut module = FDModule::new(algebra, format!("Q_{k}^dual"), graded_dimension);
+        for in_deg in 0..=top {
+            for in_idx in 0..self.dimension(in_deg, k) {
+                for &(op_deg, op_idx) in self.actions[in_deg as usize][in_idx].keys() {
+                    if in_deg + op_deg > top {
+                        continue;
+                    }
+                    let outs = self.act(op_deg, op_idx, in_deg, in_idx, k);
+                    let v = module.action_mut(op_deg, op_idx, in_deg, in_idx);
+                    for &out in outs {
+                        v.add_basis_element(out, 1);
+                    }
+                }
+            }
+        }
+        module
     }
 }
 
@@ -219,67 +356,14 @@ impl Coaction {
 /// infinite, but the part above `max_degree` is a submodule, so truncating leaves
 /// $\mathrm{Ext}^{a, u}$ unchanged for $u \leq$ `max_degree`.
 ///
-/// The basis in each degree is the dual basis to [`monomials`]; $P(R)$ sends $m'^*$ to the sum
-/// of the $m^*$ for which $\xi^R \otimes m'$ appears in $\psi(m)$.
+/// [`QDual`] describes the action.
 pub fn q_dual_module(
     algebra: Arc<MilnorAlgebra>,
     k: u32,
     max_degree: i32,
-    convention: Convention,
+    coaction: &Coaction,
 ) -> FDModule<MilnorAlgebra> {
-    let basis = monomials(k, max_degree);
-    let top = basis
-        .iter()
-        .rposition(|b| !b.is_empty())
-        .map_or(0, |d| d as i32);
-    algebra.compute_basis(top);
-
-    let mut graded_dimension = BiVec::new(0);
-    for d in 0..=top {
-        graded_dimension.push(basis[d as usize].len());
-    }
-    let mut module = FDModule::new(
-        Arc::clone(&algebra),
-        format!("Q_{k}^dual"),
-        graded_dimension,
-    );
-    for (d, bucket) in basis.iter().enumerate().take(top as usize + 1) {
-        for (idx, m) in bucket.iter().enumerate() {
-            module.set_basis_element_name(d as i32, idx, format!("{m:?}*"));
-        }
-    }
-
-    let max_n = basis.iter().flatten().map(|m| m.len()).max().unwrap_or(1);
-    let coaction = Coaction::new(max_n, convention);
-
-    let index: FxHashMap<&VMonomial, usize> = basis
-        .iter()
-        .flat_map(|b| b.iter().enumerate().map(|(i, m)| (m, i)))
-        .collect();
-
-    // For each output m, read off ψ(m) and record its contribution to P(R)·m'*.
-    for (out_deg, bucket) in basis.iter().enumerate().take(top as usize + 1) {
-        let out_deg = out_deg as i32;
-        for (out_idx, m) in bucket.iter().enumerate() {
-            for (r, m_in) in coaction.apply(m) {
-                let in_deg = monomial_degree(&m_in);
-                let op_deg = out_deg - in_deg;
-                if op_deg == 0 {
-                    continue;
-                }
-                let elt = MilnorBasisElement {
-                    q_part: 0,
-                    p_part: PPart::from_slice(&r),
-                    degree: op_deg,
-                };
-                let op_idx = algebra.basis_element_to_index(&elt);
-                let in_idx = index[&m_in];
-                let v = module.action_mut(op_deg, op_idx, in_deg, in_idx);
-                v.add_basis_element(out_idx, 1);
-            }
-        }
-    }
-    module
+    QDual::new(&algebra, k, max_degree, coaction).module(algebra, k)
 }
 
 /// The trigraded dimensions of $\mathrm{Ext}_{A/\tau}(\mathbb{F}_2)$, keyed by (stem, s, weight).
@@ -320,15 +404,16 @@ where
     let algebra = Arc::new(MilnorAlgebra::new(fp::prime::TWO, false));
     // n = 2u - a <= max_n and a <= max_s give u <= (max_n + max_s) / 2.
     let max_u = (max_n + max_s) / 2;
+    let table = QDual::new(
+        &algebra,
+        max_s as u32,
+        max_u,
+        &Coaction::new(max_u, convention),
+    );
     let mut dims = TrigradedDims::default();
     for k in 0..=max_s {
         let max_a = max_s - k;
-        let module = Arc::new(q_dual_module(
-            Arc::clone(&algebra),
-            k as u32,
-            max_u,
-            convention,
-        ));
+        let module = Arc::new(table.module(Arc::clone(&algebra), k as u32));
         let gens = resolve(module, Bidegree::n_s(max_u, max_a));
         for a in 0..=max_a {
             for u in a..=max_u {
@@ -353,6 +438,136 @@ pub fn ctau_e2(max_n: i32, max_s: i32, convention: Convention) -> TrigradedDims 
         res.compute_through_stem(through);
         Box::new(move |b| res.number_of_gens_in_bidegree(b))
     })
+}
+
+/// [`ctau_e2_with`] by the untwisted tensor resolution on one shared resolution of $\mathbb{F}_2$.
+///
+/// $P_\bullet \otimes Q_k^\vee$ is a free, non-minimal resolution of $Q_k^\vee$, and after
+/// untwisting the diagonal action its cochains have basis $x_i \otimes m_\alpha$ and coboundary
+/// $\delta_{(i, \alpha), (l, \gamma)} = [m_\alpha](\chi(a_{li}) \cdot m_\gamma)$, where
+/// $d z_l = \sum_i a_{li} x_i$. Since $A_*$ is commutative, acting by $\chi(P(R))$ on
+/// $Q_k^\vee$ is pairing $P(R)$ with the coaction whose coefficients are conjugated, which is the
+/// [`Convention::Conjugate`] table; that table is not a module, but only its basis actions are
+/// read here.
+pub fn ctau_e2_untwisted(max_n: i32, max_s: i32) -> TrigradedDims {
+    use fp::matrix::Matrix;
+    use maybe_rayon::prelude::*;
+
+    let p = fp::prime::TWO;
+    let algebra = Arc::new(MilnorAlgebra::new(p, false));
+    let max_u = (max_n + max_s) / 2;
+    let mut unit = BiVec::new(0);
+    unit.push(1);
+    let res = crate::nassau::Resolution::new(Arc::new(FDModule::new(
+        Arc::clone(&algebra),
+        "F2".into(),
+        unit,
+    )));
+    // δ out of filtration a reads the generators of P_{a+1}.
+    res.compute_through_stem(Bidegree::n_s(max_u, max_s + 1));
+
+    // The terms of each d z_l, read once and shared by every k and u.
+    let terms: Vec<Vec<Vec<Vec<OperationGeneratorPair>>>> = (0..=max_s)
+        .map(|a| {
+            let d = res.differential(a + 1);
+            let source = res.module(a);
+            (0..=max_u)
+                .map(|t| {
+                    let gens = res.number_of_gens_in_bidegree(Bidegree::s_t(a + 1, t));
+                    (0..gens)
+                        .map(|l| {
+                            d.output(t, l)
+                                .iter_nonzero()
+                                .map(|(idx, _)| source.index_to_op_gen(t, idx))
+                                .collect()
+                        })
+                        .collect()
+                })
+                .collect()
+        })
+        .collect();
+
+    let twisted = QDual::new(
+        &algebra,
+        max_s as u32,
+        max_u,
+        &Coaction::new(max_u, Convention::Conjugate),
+    );
+    // One cochain complex per (k, u), each independent of the others.
+    let pairs: Vec<(i32, i32)> = (0..=max_s)
+        .flat_map(|k| (0..=max_u).map(move |u| (k, u)))
+        .collect();
+    let complex = |&(k, u): &(i32, i32)| {
+        let max_a = max_s - k;
+        let k_u = k as u32;
+        let mut found = Vec::new();
+        // Offsets of the blocks x_i ⊗ Q_k^∨ in the cochains of filtration a at weight u.
+        let offsets = |a: i32| {
+            let mut table = Vec::new();
+            let mut total = 0;
+            for t in 0..=u {
+                let gens = res.number_of_gens_in_bidegree(Bidegree::s_t(a, t));
+                table.push((total, gens));
+                total += gens * twisted.dimension(u - t, k_u);
+            }
+            (table, total)
+        };
+        let cochains: Vec<_> = (0..=max_a + 1).map(offsets).collect();
+        let mut ranks = vec![0; max_a as usize + 1];
+        for a in 0..=max_a {
+            let (src, src_dim) = &cochains[a as usize];
+            let (tgt, tgt_dim) = &cochains[a as usize + 1];
+            if *src_dim == 0 || *tgt_dim == 0 {
+                continue;
+            }
+            let mut matrix = Matrix::new(p, *tgt_dim, *src_dim);
+            for t_l in 0..=u {
+                let (tgt_off, _) = tgt[t_l as usize];
+                let block = twisted.dimension(u - t_l, k_u);
+                for (l, dz) in terms[a as usize][t_l as usize].iter().enumerate() {
+                    for gamma in 0..block {
+                        let mut row = matrix.row_mut(tgt_off + l * block + gamma);
+                        for og in dz {
+                            let out_dim = twisted.dimension(u - og.generator_degree, k_u);
+                            let start =
+                                src[og.generator_degree as usize].0 + og.generator_index * out_dim;
+                            for &out in twisted.act(
+                                og.operation_degree,
+                                og.operation_index,
+                                u - t_l,
+                                gamma,
+                                k_u,
+                            ) {
+                                row.add_basis_element(start + out, 1);
+                            }
+                        }
+                    }
+                }
+            }
+            ranks[a as usize] = matrix.row_reduce();
+        }
+        for a in 0..=max_a {
+            let n = 2 * u - a;
+            if n > max_n || n < 0 {
+                continue;
+            }
+            let prev = if a > 0 { ranks[a as usize - 1] } else { 0 };
+            let d = cochains[a as usize].1 - ranks[a as usize] - prev;
+            if d > 0 {
+                found.push(((n, a + k, u), d));
+            }
+        }
+        found
+    };
+    let mut dims = TrigradedDims::default();
+    for found in pairs
+        .into_maybe_par_iter()
+        .map(|x| complex(&x))
+        .collect::<Vec<_>>()
+    {
+        dims.0.extend(found);
+    }
+    dims
 }
 
 /// $\mathrm{Ext}_{A/\tau}(\mathbb{F}_2)$ by resolving over $A/\tau$ with Nassau's algorithm, keyed by
@@ -393,7 +608,7 @@ mod tests {
         assert_eq!(c[2], expected);
     }
 
-    /// Length 2, degree at most 3: $v_0^2$, $v_0 v_1$, $v_1^2$, $v_0 v_2$.
+    /// Length at most 2, degree at most 3: $1$, $v_1$, $v_1^2$, $v_2$.
     #[test]
     fn monomial_counts() {
         let m = monomials(2, 3);
@@ -451,6 +666,12 @@ mod tests {
 
     /// Agrees with a minimal resolution over $A/\tau$ in every (stem, s).
     #[test]
+    fn untwisted_matches_direct_resolution() {
+        assert_eq!(ctau_e2_untwisted(30, 15).bigraded(), ctau_e2_direct(30, 15));
+    }
+
+    /// Agrees with a minimal resolution over $A/\tau$ in every (stem, s).
+    #[test]
     fn matches_direct_resolution() {
         let ours = ctau_e2(30, 15, Convention::Xi).bigraded();
         assert_eq!(ours, ctau_e2_direct(30, 15));
@@ -461,7 +682,12 @@ mod tests {
     #[should_panic(expected = "not a module")]
     fn conjugate_convention_is_not_a_module() {
         let algebra = Arc::new(MilnorAlgebra::new(fp::prime::TWO, false));
-        check_associative(&q_dual_module(algebra, 1, 12, Convention::Conjugate));
+        check_associative(&q_dual_module(
+            algebra,
+            1,
+            12,
+            &Coaction::new(12, Convention::Conjugate),
+        ));
     }
 
     /// Classes whose motivic weight is known land in the right weight.
@@ -489,7 +715,12 @@ mod tests {
     fn q_dual_is_a_module() {
         let algebra = Arc::new(MilnorAlgebra::new(fp::prime::TWO, false));
         for k in 1..=3 {
-            let m = q_dual_module(Arc::clone(&algebra), k, 12, Convention::Xi);
+            let m = q_dual_module(
+                Arc::clone(&algebra),
+                k,
+                12,
+                &Coaction::new(12, Convention::Xi),
+            );
             check_associative(&m);
         }
     }

@@ -1,21 +1,21 @@
 //! Compares $\mathrm{Ext}_{A/\tau}(\mathbb{F}_2)$ computed from classical data with a direct resolution.
 //!
-//! Usage: `ctau_from_classical <max_n> <max_s> [xi|conjugate] [direct]`. Prints each (stem, s)
-//! where the two disagree, then `n,s,w,dim` for every class.
+//! Usage: `ctau_from_classical <max_n> <max_s> [split|untwisted] [direct]`. `split` resolves each
+//! $Q_k^\vee$ on its own; `untwisted` uses one resolution of $\mathbb{F}_2$. Prints each (stem, s)
+//! where the result disagrees with the direct resolution, then `n,s,w,dim` for every class.
 use std::time::Instant;
 
-use ext::algebraic_novikov::{Convention, ctau_e2, ctau_e2_direct};
+use ext::algebraic_novikov::{Convention, ctau_e2, ctau_e2_direct, ctau_e2_untwisted};
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let max_n: i32 = args[1].parse().unwrap();
     let max_s: i32 = args[2].parse().unwrap();
-    let convention = match args.get(3).map(String::as_str) {
-        Some("conjugate") => Convention::Conjugate,
-        _ => Convention::Xi,
-    };
     let start = Instant::now();
-    let tri = ctau_e2(max_n, max_s, convention);
+    let tri = match args.get(3).map(String::as_str) {
+        Some("untwisted") => ctau_e2_untwisted(max_n, max_s),
+        _ => ctau_e2(max_n, max_s, Convention::Xi),
+    };
     eprintln!("Ext_P(Q): {:?}", start.elapsed());
     if args.get(4).map(String::as_str) == Some("direct") {
         let start = Instant::now();
