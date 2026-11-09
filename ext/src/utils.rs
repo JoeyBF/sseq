@@ -428,8 +428,8 @@ pub fn unicode_num(n: usize) -> char {
 /// - `load_quasi_inverse`: Whether or not the quasi-inverses of the resolution should be stored.
 ///   Note that if there is a save directory, then quasi-inverses will never be stored in memory;
 ///   they must be accessed via `apply_quasi_inverse`. With the `nassau` feature this has no effect:
-///   Nassau's resolution never holds quasi-inverses in memory, and `apply_quasi_inverse` reads them
-///   from the save directory or, without one, recomputes them on demand.
+///   Nassau's resolution never holds quasi-inverses in memory, and `apply_quasi_inverse` reads one
+///   from the save directory when it holds it and otherwise recomputes it on demand.
 ///
 /// # Returns
 /// A [`QueryModuleResolution`]. Note that this type depends on whether the `nassau` feature is
@@ -463,8 +463,8 @@ pub fn query_module_only(
         resolution.load_quasi_inverse = load_quasi_inverse;
     }
 
-    // Nassau's `apply_quasi_inverse` recomputes a quasi-inverse on demand when there is no save
-    // directory to read it from, so a caller that will lift needs nothing from us here.
+    // Nassau's `apply_quasi_inverse` recomputes a quasi-inverse on demand when there is no saved
+    // one to read, so a caller that will lift needs nothing from us here.
     #[cfg(feature = "nassau")]
     let _ = load_quasi_inverse;
 

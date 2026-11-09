@@ -72,10 +72,10 @@ pub struct LiftRequest<'a> {
 /// A [`MultiLift`] sweep stopped because the shared target could not lift at a bidegree.
 ///
 /// [`ChainComplex::apply_quasi_inverse`] returns `false` when the quasi-inverse it needs is not
-/// available, e.g. a save directory that is missing quasi-inverses. The sweep then stops scheduling
-/// new bidegrees, lets the ones already running finish, and reports the first failure here. The
-/// liftables are left extended up to (not including) the failed bidegree and whatever else had
-/// already finished.
+/// available, e.g. a [`Resolution`](crate::resolution::Resolution) that neither keeps its
+/// quasi-inverses nor has them saved. The sweep then stops scheduling new bidegrees, lets the ones
+/// already running finish, and reports the first failure here. The liftables are left extended up
+/// to (not including) the failed bidegree and whatever else had already finished.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LiftError {
     /// The output (target) bidegree at which the quasi-inverse was unavailable.
@@ -403,28 +403,15 @@ mod tests {
         MultiLift::new(other, vec![hom as Arc<dyn Liftable>]);
     }
 
-    /// A target that cannot lift at some bidegree (here, a Nassau save with quasi-inverses deleted)
-    /// makes the sweep return an error naming that bidegree, instead of panicking on a worker and
-    /// leaving the caller waiting.
+    /// A target that cannot lift at some bidegree (here, a resolution that keeps no quasi-inverses
+    /// and has no save directory) makes the sweep return an error naming that bidegree, instead of
+    /// panicking on a worker and leaving the caller waiting.
     #[test]
     fn missing_quasi_inverse_is_an_error() {
-        let tempdir = tempfile::TempDir::new().unwrap();
-        let res = Arc::new(
-            crate::utils::construct_nassau("S_2", Some(tempdir.path().to_owned())).unwrap(),
-        );
+        let mut res = construct_standard::<false, _, _>("S_2", None).unwrap();
+        res.load_quasi_inverse = false;
+        let res = Arc::new(res);
         res.compute_through_stem(Bidegree::n_s(12, 6));
-
-        // Delete every saved quasi-inverse at `s = 2`.
-        let mut deleted = 0;
-        for entry in std::fs::read_dir(tempdir.path().join("qi")).unwrap() {
-            let path = entry.unwrap().path();
-            let qi = path.join(crate::save::SaveKind::NassauQi.name());
-            if path.to_str().unwrap().ends_with("_s2") && qi.exists() {
-                std::fs::remove_dir_all(qi).unwrap();
-                deleted += 1;
-            }
-        }
-        assert!(deleted > 0);
 
         let h0 = Arc::new(ResolutionHomomorphism::from_class(
             String::new(),
@@ -436,8 +423,68 @@ mod tests {
         let error = MultiLift::new(res, vec![h0 as Arc<dyn Liftable>])
             .extend_all()
             .unwrap_err();
-        assert_eq!(error.b.s(), 2, "{error}");
+        assert!(error.b.s() > 0, "{error}");
         assert!(error.to_string().contains("failed to lift"));
+    }
+
+    /// A Nassau save missing some quasi-inverses recomputes exactly those, and lifts through them
+    /// to the same maps as a complete save.
+    #[test]
+    fn missing_quasi_inverse_is_recomputed() {
+        let max = Bidegree::n_s(12, 6);
+        let lift_h0 = |delete_s2: bool| {
+            let tempdir = tempfile::TempDir::new().unwrap();
+            let res = Arc::new(
+                crate::utils::construct_nassau("S_2", Some(tempdir.path().to_owned())).unwrap(),
+            );
+            res.compute_through_stem(max);
+
+            if delete_s2 {
+                let mut deleted = 0;
+                for entry in std::fs::read_dir(tempdir.path().join("qi")).unwrap() {
+                    let path = entry.unwrap().path();
+                    let qi = path.join(crate::save::SaveKind::NassauQi.name());
+                    if path.to_str().unwrap().ends_with("_s2") && qi.exists() {
+                        std::fs::remove_dir_all(qi).unwrap();
+                        deleted += 1;
+                    }
+                }
+                assert!(deleted > 0);
+            }
+
+            let h0 = Arc::new(ResolutionHomomorphism::from_class(
+                String::new(),
+                Arc::clone(&res),
+                Arc::clone(&res),
+                Bidegree::n_s(0, 1),
+                &[1],
+            ));
+            MultiLift::new(Arc::clone(&res), vec![Arc::clone(&h0) as Arc<dyn Liftable>])
+                .extend_all()
+                .unwrap();
+
+            let recomputed: Vec<Bidegree> = res.qi_recomputes.iter().map(|e| *e.key()).collect();
+            let maps: Vec<Vec<FpVector>> = res
+                .iter_stem()
+                .filter(|&b| b.s() >= 1 && h0.get_map(b.s()).next_degree() > b.t())
+                .map(|b| {
+                    let map = h0.get_map(b.s());
+                    (0..res.number_of_gens_in_bidegree(b))
+                        .map(|i| map.output(b.t(), i).clone())
+                        .collect()
+                })
+                .collect();
+            (recomputed, maps)
+        };
+
+        let (recomputed, maps) = lift_h0(true);
+        assert!(!maps.is_empty());
+        assert!(!recomputed.is_empty());
+        assert!(recomputed.iter().all(|b| b.s() == 2), "{recomputed:?}");
+
+        let (recomputed, expected) = lift_h0(false);
+        assert!(recomputed.is_empty(), "{recomputed:?}");
+        assert_eq!(maps, expected);
     }
 
     /// The point of [`MultiLift`]: with quasi-inverses recomputed on demand, a batch of maps

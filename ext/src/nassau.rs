@@ -385,7 +385,8 @@ impl Iterator for SubalgebraIterator {
 
 /// Whether to persist quasi-inverses to the save store during resolution. Disabled by
 /// `EXT_NASSAU_NO_SAVE_QI`, in which case only the differentials are written — they are orders of
-/// magnitude smaller — and every downstream lift recomputes its quasi-inverse on demand.
+/// magnitude smaller. Reading is unaffected: `apply_quasi_inverse` uses a saved quasi-inverse when
+/// the store has one and recomputes it on demand otherwise.
 static SAVE_QI: LazyLock<bool> =
     LazyLock::new(|| std::env::var_os("EXT_NASSAU_NO_SAVE_QI").is_none());
 
@@ -1231,22 +1232,23 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> ChainComplex for Resolution<M> {
         for<'a> &'a S: Into<FpSlice<'a>>,
     {
         self.apply_quasi_inverse_fallible(results, b, inputs)
-            .unwrap_or_else(|e| panic!("apply_quasi_inverse failed at {b}: {e:#}"))
+            .unwrap_or_else(|e| panic!("apply_quasi_inverse failed at {b}: {e:#}"));
+        true
     }
 }
 
 impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
     /// The fallible core of [`ChainComplex::apply_quasi_inverse`].
     ///
-    /// Returns `Ok(false)` when the store should hold this quasi-inverse but does not, `Ok(true)`
-    /// when the qi was successfully applied, and propagates `anyhow::Error` from the structured
-    /// zarr reader or `FpVector::update_from_bytes`.
+    /// Reads the quasi-inverse at `b` from the save store when the store holds it, and otherwise
+    /// regenerates it with a [`RecomputeReader`], so a quasi-inverse is always available. The errors
+    /// are those of the structured zarr reader and `FpVector::update_from_bytes`.
     fn apply_quasi_inverse_fallible<T, S>(
         &self,
         results: &mut [T],
         b: Bidegree,
         inputs: &[S],
-    ) -> anyhow::Result<bool>
+    ) -> anyhow::Result<()>
     where
         for<'a> &'a mut T: Into<FpSliceMut<'a>>,
         for<'a> &'a S: Into<FpSlice<'a>>,
@@ -1256,17 +1258,11 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
         let target = &self.modules[b.s() - 1];
         let algebra = target.algebra();
 
-        // Read the saved quasi-inverse unless recomputation is forced or nothing was persisted.
-        // `RecomputeReader` regenerates the same command stream from `differentials[b.s]`, so the
-        // loop below is unchanged either way.
-        let force_recompute = *RECOMPUTE_QI || !*SAVE_QI;
-        let store = self.save_dir.store();
-        let saved = if force_recompute {
-            None
-        } else if let Some(store) = store {
-            store.nassau_qi_reader(b)?
-        } else {
-            None
+        // `RecomputeReader` yields the same kind of command stream as the store, so the loop below
+        // is unchanged either way.
+        let saved = match self.save_dir.store() {
+            Some(store) if !*RECOMPUTE_QI => store.nassau_qi_reader(b)?,
+            _ => None,
         };
         type Commands<'r> = Box<dyn Iterator<Item = anyhow::Result<NassauCommand>> + 'r>;
         let saved_subalgebra;
@@ -1281,17 +1277,6 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                         &saved_subalgebra,
                         Box::new(reader),
                     )
-                }
-                // A store that should hold this quasi-inverse but doesn't is an incomplete store,
-                // not an invitation to spend the resolution cost again silently: report failure.
-                // Nassau writes qi(s, t) while computing (s + 1, t), so an absent qi is legitimate
-                // exactly when that step was never taken — at the top of the computed region,
-                // where lifting into (s, t) is still well-defined.
-                None if !force_recompute
-                    && store.is_some()
-                    && self.has_computed_bidegree(b + Bidegree::s_t(1, 0)) =>
-                {
-                    return Ok(false);
                 }
                 None => {
                     let reader = RecomputeReader::new(self, b);
@@ -1462,7 +1447,7 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                 target.element_to_string(b.t(), dx.as_slice())
             );
         }
-        Ok(true)
+        Ok(())
     }
 }
 
