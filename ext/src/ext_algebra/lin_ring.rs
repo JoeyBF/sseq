@@ -68,15 +68,12 @@ impl RingRange {
 }
 
 /// The name of the chain map of the monomial with these `factors`: `lin_ring/` and the factors as
-/// `x_<n>_<s>_<i>`, joined by `.`. Basis monomials and their classes depend only on the resolution,
+/// `x_(n, s, i)`, joined by `.`. Basis monomials and their classes depend only on the resolution,
 /// so the name identifies the same map in any range.
 pub fn map_name(gens: &[Generator], factors: &[u32]) -> String {
     let parts: Vec<String> = factors
         .iter()
-        .map(|&j| {
-            let g = &gens[j as usize];
-            format!("x_{}_{}_{}", g.b.n(), g.b.s(), g.idx)
-        })
+        .map(|&j| format!("x_{}", gens[j as usize].generator()))
         .collect();
     format!("lin_ring/{}", parts.join("."))
 }
@@ -89,8 +86,8 @@ pub struct Generator {
 }
 
 impl Generator {
-    pub fn name(&self) -> String {
-        format!("x_{}_{}_{}", self.b.n(), self.b.s(), self.idx)
+    pub fn generator(&self) -> BidegreeGenerator {
+        BidegreeGenerator::new(self.b, self.idx)
     }
 }
 
@@ -272,8 +269,7 @@ where
         let map = &self.maps[mono.map.expect("monomial has no chain map")];
         let mut v = FpVector::new(TWO, d);
         if d > 0 {
-            map.hom
-                .act(v.as_slice_mut(), 1, BidegreeGenerator::new(g.b, g.idx));
+            map.hom.act(v.as_slice_mut(), 1, g.generator());
         }
         v
     }
