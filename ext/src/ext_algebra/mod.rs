@@ -165,7 +165,11 @@ where
     pub fn known_product(&self, x: &BidegreeElement) -> sseq::Product<2> {
         let matrices = once::MultiIndexed::new();
         for b in self.resolution.iter_stem() {
-            if self.dimension(b) == 0 || self.dimension(b + x.degree()) == 0 {
+            let target = b + x.degree();
+            if !self.resolution.has_computed_bidegree(target)
+                || self.dimension(b) == 0
+                || self.dimension(target) == 0
+            {
                 continue;
             }
             if let Some(m) = self.known_multiply_into(x, b) {

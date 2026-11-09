@@ -21,21 +21,25 @@ use sseq::{
     coordinates::{Bidegree, BidegreeGenerator},
 };
 
-/// Customary names of the indecomposables in the lowest stems, where each bidegree has one.
-fn name(g: BidegreeGenerator) -> String {
+/// Customary names of the indecomposables in the lowest stems. `alone` says `g` is the only
+/// indecomposable in its bidegree, so the name is unambiguous whatever its index there.
+fn name(g: BidegreeGenerator, alone: bool) -> String {
     let known = match (g.n(), g.s()) {
         (8, 3) => Some("c_0"),
         (9, 5) => Some("Ph_1"),
         (11, 5) => Some("Ph_2"),
         (14, 4) => Some("d_0"),
+        (16, 7) => Some("Pc_0"),
         (17, 4) => Some("e_0"),
+        (17, 9) => Some("P^2h_1"),
         (18, 4) => Some("f_0"),
         (19, 3) => Some("c_1"),
+        (19, 9) => Some("P^2h_2"),
         (20, 4) => Some("g"),
         _ => None,
     };
     match known {
-        Some(n) if g.idx() == 0 => n.to_string(),
+        Some(n) if alone => n.to_string(),
         _ => format!("x_{g}"),
     }
 }
@@ -82,9 +86,11 @@ fn main() -> anyhow::Result<()> {
             products.push((format!("h_{i}"), ext.known_product(&h)));
         }
     }
-    for g in ext.indecomposables().unwrap() {
+    let gens = ext.indecomposables().unwrap();
+    for &g in &gens {
         if g.s() >= 2 && g.n() <= max_stem {
-            products.push((name(g), ext.known_product(&ext.generator(g))));
+            let alone = gens.iter().filter(|h| h.degree() == g.degree()).count() == 1;
+            products.push((name(g, alone), ext.known_product(&ext.generator(g))));
         }
     }
     for (name, p) in &products {
