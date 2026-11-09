@@ -163,12 +163,7 @@ where
     pub fn indecomposables(&self) -> Option<Vec<BidegreeGenerator>> {
         let guard = self.ring.lock().unwrap();
         let ring = guard.as_ref()?;
-        Some(
-            ring.gens
-                .iter()
-                .map(|g| BidegreeGenerator::new(g.b, g.idx))
-                .collect(),
-        )
+        Some(ring.gens.iter().map(|g| g.generator()).collect())
     }
 
     /// Run `f` on the ring from [`compute_ring`](Self::compute_ring), for its statistics and
