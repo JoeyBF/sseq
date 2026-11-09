@@ -3,7 +3,7 @@
 use std::{ops::Range, sync::Arc};
 
 use algebra::{
-    MuAlgebra,
+    Algebra, MuAlgebra,
     module::{
         Module,
         homomorphism::{ModuleHomomorphism, MuFreeModuleHomomorphism},
@@ -436,12 +436,53 @@ where
         };
 
         // Same order as `qi_rows` (ascending generator index over non-zero differentials).
-        let fdx_vectors: Vec<FpVector> =
-            crate::utils::parallel::guarded_map(qi_rows.len(), |i| compute_fdx_vector(qi_rows[i]))
+        let fdx_vectors: Vec<FpVector> = self
+            .shared_fdx_vectors(input, &qi_rows, fdx_dimension)
+            .unwrap_or_else(|| {
+                crate::utils::parallel::guarded_map(qi_rows.len(), |i| {
+                    compute_fdx_vector(qi_rows[i])
+                })
                 .into_iter()
                 .flatten()
-                .collect();
+                .collect()
+            });
 
+        if terms_log::enabled() {
+            // The (a, w) pairs of all the d x at this step: positions in the source's basis. With
+            // a·f(w) shared across generators, f(d x) would cost one product per pair and term.
+            let source = f_prev.source();
+            let target = f_prev.target();
+            let algebra = source.algebra();
+            let mut union = vec![false; source.dimension(input.t())];
+            for &k in &qi_rows {
+                for (idx, _) in d_source.output(input.t(), k).iter_nonzero() {
+                    union[idx] = true;
+                }
+            }
+            let (mut distinct, mut shared) = (0, 0);
+            for idx in (0..union.len()).filter(|&i| union[i]) {
+                distinct += 1;
+                let og = source.index_to_op_gen(input.t(), idx);
+                if og.generator_degree < f_prev.min_degree() {
+                    continue;
+                }
+                let fw = f_prev.output(og.generator_degree, og.generator_index);
+                let fw_degree = og.generator_degree - f_prev.degree_shift();
+                for (j, _) in fw.iter_nonzero() {
+                    shared += 1;
+                    if terms_log::sample_pair() {
+                        terms_log::write_pair(
+                            og.operation_degree,
+                            &algebra
+                                .basis_element_to_string(og.operation_degree, og.operation_index),
+                            fw_degree,
+                            &target.basis_element_to_string(fw_degree, j),
+                        );
+                    }
+                }
+            }
+            terms.add_shared(distinct, shared);
+        }
         terms.write(input, output, fdx_vectors.len());
 
         StepPrep::NeedsLift(PendingStep {
@@ -452,6 +493,83 @@ where
             qi_rows,
             fx_dimension,
         })
+    }
+
+    /// `f(d x)` for the generators `qi_rows` at `input`, computing each product `a·f(w)` once even
+    /// when several of the `d x` contain the term `a·w`.
+    ///
+    /// The terms are grouped by which of the `d x` contain them. For each group `S`, one
+    /// application of `f` gives `f(Σ_{a·w ∈ S} a·w)`, and `f(d x_k)` is the sum of the groups
+    /// containing `x_k`. `None` when this does not apply (an odd prime, fewer than two generators,
+    /// or too many groups for the sums to be cheap), or with `EXT_LIFT_SHARE=0`.
+    fn shared_fdx_vectors(
+        &self,
+        input: Bidegree,
+        qi_rows: &[usize],
+        fdx_dimension: usize,
+    ) -> Option<Vec<FpVector>> {
+        /// At most this many groups: each costs one dense sum per generator containing it.
+        const MAX_GROUPS: usize = 256;
+        static SHARE: std::sync::LazyLock<bool> =
+            std::sync::LazyLock::new(|| std::env::var("EXT_LIFT_SHARE").map_or(true, |v| v != "0"));
+
+        let p = self.source.prime();
+        if p != 2 || qi_rows.len() < 2 || qi_rows.len() > 64 || !*SHARE {
+            return None;
+        }
+        let d_source = self.source.differential(input.s());
+        let f_prev = self.get_map(input.s() - 1);
+
+        // (term, the d x containing it), then one group per set of d x.
+        let mut terms: Vec<(usize, u64)> = vec![];
+        for (j, &k) in qi_rows.iter().enumerate() {
+            terms.extend(
+                d_source
+                    .output(input.t(), k)
+                    .iter_nonzero()
+                    .map(|(idx, _)| (idx, 1u64 << j)),
+            );
+        }
+        terms.sort_unstable_by_key(|&(idx, _)| idx);
+        let mut groups: std::collections::HashMap<u64, Vec<usize>> = Default::default();
+        let mut i = 0;
+        while i < terms.len() {
+            let idx = terms[i].0;
+            let mut mask = 0;
+            while i < terms.len() && terms[i].0 == idx {
+                mask |= terms[i].1;
+                i += 1;
+            }
+            groups.entry(mask).or_default().push(idx);
+        }
+        if groups.len() > MAX_GROUPS {
+            return None;
+        }
+        let groups: Vec<(u64, Vec<usize>)> = groups.into_iter().collect();
+
+        let source_dimension = f_prev.source().dimension(input.t());
+        let sums = crate::utils::parallel::guarded_map(groups.len(), |g| {
+            let mut indicator = FpVector::new(p, source_dimension);
+            for &idx in &groups[g].1 {
+                indicator.set_entry(idx, 1);
+            }
+            let mut sum = FpVector::new(p, fdx_dimension);
+            f_prev.apply(sum.as_slice_mut(), 1, input.t(), indicator.as_slice());
+            sum
+        });
+        Some(
+            (0..qi_rows.len())
+                .map(|j| {
+                    let mut v = FpVector::new(p, fdx_dimension);
+                    for ((mask, _), sum) in groups.iter().zip(&sums) {
+                        if mask >> j & 1 == 1 {
+                            v.add(sum, 1);
+                        }
+                    }
+                    v
+                })
+                .collect(),
+        )
     }
 
     /// Complete a lift step: scatter the lifted `results` into the pending outputs, persist the
@@ -1071,7 +1189,12 @@ pub(crate) mod secondary {
 /// `products` = Σ over the terms `a·w` of every `d x` of `nnz(f(w))` (the Milnor products
 /// `f(d x)` costs), `max_fw` the largest such `nnz(f(w))`, `op_deg_sum` = Σ `nnz(f(w))·|a|`,
 /// `fdx_nnz` the non-zeros of the results, `fdx_ns` the thread time computing them, and `end_s`
-/// the wall time since the first step.
+/// the wall time since the first step, then `distinct_terms` (the (a, w) pairs over all the step's
+/// `d x`) and `shared_products` (Σ `nnz(f(w))` over those pairs).
+///
+/// `EXT_LIFT_PAIRS_LOG=<file>` additionally samples one product `a·b` in every
+/// `EXT_LIFT_PAIRS_EVERY` (default 1000000), `b` a term of `f(w)`, as `|a|,a,|f(w)|,b` with `b`
+/// written as its module element (operation and generator).
 mod terms_log {
     use std::{
         io::Write,
@@ -1094,7 +1217,8 @@ mod terms_log {
         let mut out = std::io::BufWriter::new(std::fs::File::create(path).unwrap());
         writeln!(
             out,
-            "in_s,in_t,out_s,out_t,gens,dx_terms,products,max_fw,op_deg_sum,fdx_nnz,fdx_ns,end_s"
+            "in_s,in_t,out_s,out_t,gens,dx_terms,products,max_fw,op_deg_sum,fdx_nnz,fdx_ns,end_s,\
+             distinct_terms,shared_products"
         )
         .unwrap();
         Some(Log {
@@ -1107,6 +1231,33 @@ mod terms_log {
         LOG.is_some()
     }
 
+    static PAIRS: LazyLock<Option<(u64, Mutex<std::io::BufWriter<std::fs::File>>)>> =
+        LazyLock::new(|| {
+            let path = std::env::var_os("EXT_LIFT_PAIRS_LOG")?;
+            let every = std::env::var("EXT_LIFT_PAIRS_EVERY")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(1_000_000);
+            let mut out = std::io::BufWriter::new(std::fs::File::create(path).unwrap());
+            writeln!(out, "deg_a,a,deg_b,b").unwrap();
+            Some((every, Mutex::new(out)))
+        });
+    static PAIR_COUNT: AtomicU64 = AtomicU64::new(0);
+
+    pub(super) fn sample_pair() -> bool {
+        PAIRS
+            .as_ref()
+            .is_some_and(|(every, _)| PAIR_COUNT.fetch_add(1, Relaxed) % every == 0)
+    }
+
+    pub(super) fn write_pair(deg_a: i32, a: &str, deg_b: i32, b: &str) {
+        if let Some((_, out)) = &*PAIRS {
+            let mut out = out.lock().unwrap();
+            writeln!(out, "{deg_a},\"{a}\",{deg_b},\"{b}\"").unwrap();
+            out.flush().unwrap();
+        }
+    }
+
     #[derive(Default)]
     pub(super) struct Cell {
         dx_terms: AtomicU64,
@@ -1115,6 +1266,8 @@ mod terms_log {
         op_deg_sum: AtomicU64,
         fdx_nnz: AtomicU64,
         fdx_ns: AtomicU64,
+        distinct_terms: AtomicU64,
+        shared_products: AtomicU64,
     }
 
     impl Cell {
@@ -1135,13 +1288,18 @@ mod terms_log {
             self.fdx_ns.fetch_add(elapsed.as_nanos() as u64, Relaxed);
         }
 
+        pub(super) fn add_shared(&self, distinct_terms: u64, shared_products: u64) {
+            self.distinct_terms.fetch_add(distinct_terms, Relaxed);
+            self.shared_products.fetch_add(shared_products, Relaxed);
+        }
+
         pub(super) fn write(&self, input: Bidegree, output: Bidegree, gens: usize) {
             let Some(log) = &*LOG else { return };
             let g = |a: &AtomicU64| a.load(Relaxed);
             let mut out = log.out.lock().unwrap();
             writeln!(
                 out,
-                "{},{},{},{},{gens},{},{},{},{},{},{},{:.3}",
+                "{},{},{},{},{gens},{},{},{},{},{},{},{:.3},{},{}",
                 input.s(),
                 input.t(),
                 output.s(),
@@ -1152,7 +1310,9 @@ mod terms_log {
                 g(&self.op_deg_sum),
                 g(&self.fdx_nnz),
                 g(&self.fdx_ns),
-                log.origin.elapsed().as_secs_f64()
+                log.origin.elapsed().as_secs_f64(),
+                g(&self.distinct_terms),
+                g(&self.shared_products),
             )
             .unwrap();
             // Flush often enough that a killed run keeps its data.
