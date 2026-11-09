@@ -818,44 +818,55 @@ impl QDown {
             .expect("a term of ψ is in the basis")
     }
 
-    /// The $m_\gamma$ for which $\xi^R \otimes m_\gamma$ has coefficient 1 in $\psi(m)$.
+    /// The $m_\gamma$ for which $\xi^R \otimes m_\gamma$ has coefficient 1 in $\psi(m)$, memoised in
+    /// `memo` on every intermediate $(R', m')$.
     ///
-    /// Expands $\psi(m) = \prod \psi(v_n)$ one factor at a time, keeping only partial products
-    /// whose $\xi$-part still fits inside $R$.
-    fn act_down(&self, r: PackedXi, m: &QMono) -> Vec<QMono> {
-        let mut states: FxHashMap<(PackedXi, QMono), ()> = FxHashMap::default();
-        states.insert((r, [0; QDOWN_VARS]), ());
-        for (n, &e) in m.iter().enumerate().skip(1) {
-            // In characteristic 2, ψ(v_n^e) is the product over the binary digits j of e of
-            // ψ(v_n)^{2^j}, whose terms are those of ψ(v_n) with every exponent doubled j times.
-            for j in (0..16).filter(|j| e >> j & 1 == 1) {
-                let mut next: FxHashMap<(PackedXi, QMono), ()> = FxHashMap::default();
-                for &(rest, part) in states.keys() {
-                    for &(s, i) in &self.factors[n] {
-                        let s = s << j;
-                        if !packed_fits(s, rest) {
-                            continue;
-                        }
-                        let mut part = part;
-                        if i > 0 {
-                            part[i] += 1 << j;
-                        }
-                        let key = (rest - s, part);
-                        if next.remove(&key).is_none() {
-                            next.insert(key, ());
-                        }
-                    }
+    /// Peels the largest binary chunk $v_n^{2^j}$ off $m$:
+    /// $\psi(m) = \psi(m / v_n^{2^j})\, \psi(v_n)^{2^j}$, so the products shared by different
+    /// monomials and operations are computed once. `memo` is cleared when it passes
+    /// `memo_limit` entries, trading recomputation for bounded memory.
+    fn act_memo(
+        &self,
+        r: PackedXi,
+        m: &QMono,
+        memo: &ActMemo,
+        memo_limit: usize,
+    ) -> std::sync::Arc<Vec<QMono>> {
+        use std::sync::Arc;
+        let Some(n) = m.iter().rposition(|&e| e > 0).filter(|&n| n > 0) else {
+            return Arc::new(if r == 0 { vec![*m] } else { Vec::new() });
+        };
+        if let Some(hit) = memo.get(&(r, *m)) {
+            return Arc::clone(&hit);
+        }
+        let j = 15 - m[n].leading_zeros();
+        let mut rest = *m;
+        rest[n] -= 1 << j;
+        let mut out: FxHashSet<QMono> = FxHashSet::default();
+        for &(s, i) in &self.factors[n] {
+            let s = s << j;
+            if !packed_fits(s, r) {
+                continue;
+            }
+            for gamma in self.act_memo(r - s, &rest, memo, memo_limit).iter() {
+                let mut gamma = *gamma;
+                if i > 0 {
+                    gamma[i] += 1 << j;
                 }
-                states = next;
+                toggle(&mut out, gamma);
             }
         }
-        states
-            .into_keys()
-            .filter(|&(rest, _)| rest == 0)
-            .map(|(_, part)| part)
-            .collect()
+        let out = Arc::new(out.into_iter().collect::<Vec<_>>());
+        if memo.len() > memo_limit {
+            memo.clear();
+        }
+        memo.insert((r, *m), Arc::clone(&out));
+        out
     }
 }
+
+/// The memo of [`QDown::act_memo`].
+type ActMemo = dashmap::DashMap<(PackedXi, QMono), std::sync::Arc<Vec<QMono>>>;
 
 /// The terms of each backbone differential landing on a generator $x_i$ of $P_a$, grouped by
 /// operation: `(t_i, i)` maps to `(R, [(t_l, l)])` for each $z_l$ with $P(R) x_i$ in $d z_l$.
@@ -895,12 +906,16 @@ pub struct UntwistedOptions {
     /// Coboundaries with more entries than this are built and reduced one at a time, so only one
     /// is ever held; smaller ones run in parallel. Raising it trades memory for parallelism.
     pub serial_above: usize,
+    /// The most entries the action memo holds before it is cleared. Raising it trades memory
+    /// for less recomputation.
+    pub memo_limit: usize,
 }
 
 impl Default for UntwistedOptions {
     fn default() -> Self {
         Self {
             serial_above: 1 << 30,
+            memo_limit: 1 << 24,
         }
     }
 }
@@ -949,9 +964,8 @@ where
 
     // Column (x_i, m) of δ^a has a 1 in row (z_l, m_γ) when P(R) x_i is a term of d z_l and
     // ξ^R ⊗ m_γ is a term of the conjugate coaction on m.
-    // act_down(R, m) depends on neither k nor u, so one cache serves every matrix of a pass.
-    type DownCache = dashmap::DashMap<(PackedXi, i32, usize), std::sync::Arc<Vec<QMono>>>;
-    let rank = |m: &UntwistedMatrix, inverted: &InvertedSlice, cache: &DownCache| -> usize {
+    // The action depends on neither k nor u, so one memo serves every matrix of a pass.
+    let rank = |m: &UntwistedMatrix, inverted: &InvertedSlice, memo: &ActMemo| -> usize {
         let (u, k_u) = (m.u, m.k as u32);
         let q_dim = |d: i32| twisted.dimension(d, k_u);
         let (src, _) = cochain_blocks(res, q_dim, m.a, u);
@@ -971,15 +985,7 @@ where
                     let col = src_off + i * block + idx;
                     let mono = twisted.monomial(u - t_i, idx);
                     for (r, targets) in terms {
-                        let key = (*r, u - t_i, idx);
-                        let gammas = match cache.get(&key) {
-                            Some(g) => std::sync::Arc::clone(&g),
-                            None => {
-                                let g = std::sync::Arc::new(twisted.act_down(*r, mono));
-                                cache.insert(key, std::sync::Arc::clone(&g));
-                                g
-                            }
-                        };
+                        let gammas = twisted.act_memo(*r, mono, memo, options.memo_limit);
                         if gammas.is_empty() {
                             continue;
                         }
@@ -1016,14 +1022,14 @@ where
             &algebra,
             &differential_slice(res, a, max_u.min((max_n + a + 1) / 2)),
         );
-        let cache = DownCache::default();
+        let memo = ActMemo::default();
         let small_ranks: Vec<_> = small
             .into_maybe_par_iter()
-            .map(|m: &UntwistedMatrix| ((m.k, m.u, m.a), rank(m, &slice, &cache)))
+            .map(|m: &UntwistedMatrix| ((m.k, m.u, m.a), rank(m, &slice, &memo)))
             .collect();
         ranks.extend(small_ranks);
         for m in large {
-            ranks.insert((m.k, m.u, m.a), rank(m, &slice, &cache));
+            ranks.insert((m.k, m.u, m.a), rank(m, &slice, &memo));
         }
     }
 
@@ -1206,7 +1212,15 @@ mod tests {
     fn serial_matches_parallel() {
         let res = crate::nassau::Resolution::new(Arc::new(unit_module()));
         res.compute_through_stem(untwisted_backbone_range(30, 15));
-        let serial = ctau_e2_untwisted_with(&res, 30, 15, UntwistedOptions { serial_above: 0 });
+        let serial = ctau_e2_untwisted_with(
+            &res,
+            30,
+            15,
+            UntwistedOptions {
+                serial_above: 0,
+                memo_limit: 16,
+            },
+        );
         assert_eq!(serial, ctau_e2_untwisted_on(&res, 30, 15));
     }
 
