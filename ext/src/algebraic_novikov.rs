@@ -450,21 +450,46 @@ pub fn ctau_e2(max_n: i32, max_s: i32, convention: Convention) -> TrigradedDims 
 /// [`Convention::Conjugate`] table; that table is not a module, but only its basis actions are
 /// read here.
 pub fn ctau_e2_untwisted(max_n: i32, max_s: i32) -> TrigradedDims {
+    let res = crate::nassau::Resolution::new(Arc::new(unit_module()));
+    res.compute_through_stem(untwisted_backbone_range(max_n, max_s));
+    ctau_e2_untwisted_on(&res, max_n, max_s)
+}
+
+/// The classical $\mathbb{F}_2$, the module a backbone for [`ctau_e2_untwisted_on`] resolves.
+pub fn unit_module() -> FDModule<MilnorAlgebra> {
+    let mut unit = BiVec::new(0);
+    unit.push(1);
+    FDModule::new(
+        Arc::new(MilnorAlgebra::new(fp::prime::TWO, false)),
+        "F2".into(),
+        unit,
+    )
+}
+
+/// The classical (stem, s) a backbone must be resolved through for [`ctau_e2_untwisted_on`].
+///
+/// The weight $u$ runs up to `(max_n + max_s) / 2` and δ out of filtration $a$ reads $P_{a+1}$.
+pub fn untwisted_backbone_range(max_n: i32, max_s: i32) -> Bidegree {
+    Bidegree::n_s((max_n + max_s) / 2, max_s + 1)
+}
+
+/// [`ctau_e2_untwisted`] on an existing resolution `res` of the classical $\mathbb{F}_2$, computed
+/// through [`untwisted_backbone_range`].
+pub fn ctau_e2_untwisted_on<CC>(res: &CC, max_n: i32, max_s: i32) -> TrigradedDims
+where
+    CC: FreeChainComplex<Algebra = MilnorAlgebra> + Sync,
+{
     use fp::matrix::Matrix;
     use maybe_rayon::prelude::*;
 
     let p = fp::prime::TWO;
-    let algebra = Arc::new(MilnorAlgebra::new(p, false));
+    let algebra = res.algebra();
     let max_u = (max_n + max_s) / 2;
-    let mut unit = BiVec::new(0);
-    unit.push(1);
-    let res = crate::nassau::Resolution::new(Arc::new(FDModule::new(
-        Arc::clone(&algebra),
-        "F2".into(),
-        unit,
-    )));
-    // δ out of filtration a reads the generators of P_{a+1}.
-    res.compute_through_stem(Bidegree::n_s(max_u, max_s + 1));
+    let range = untwisted_backbone_range(max_n, max_s);
+    assert!(
+        res.has_computed_bidegree(Bidegree::s_t(range.s(), max_u)),
+        "the backbone must be resolved through {range}"
+    );
 
     // The terms of each d z_l, read once and shared by every k and u.
     let terms: Vec<Vec<Vec<Vec<OperationGeneratorPair>>>> = (0..=max_s)
