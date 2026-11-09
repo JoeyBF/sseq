@@ -12,7 +12,7 @@
 //!   then the left index, which drops from `j` to `k` at equal degree.
 //!
 //! So `f_m` is needed only at the outputs of generators `<= a_{lo(m)}` (a corner `t' <= t_{lo(m)}`),
-//! and not at all when those are all `h_i` (read off the differentials, [`crate::hi_products`]):
+//! and not at all when those are all `h_i` (read off the differentials, [`super::h_product`]):
 //! every monomial with `lo(m) ∈ {h_0, .., h_3}` is free, since the first other generator, `c_0`,
 //! has `t = 11`.
 //!
@@ -36,12 +36,12 @@ use std::{
 };
 
 use anyhow::ensure;
-use fp::{prime::TWO, vector::FpVector};
+use fp::{matrix::Matrix, prime::TWO, vector::FpVector};
+use maybe_rayon::prelude::*;
 use sseq::coordinates::{Bidegree, BidegreeGenerator};
 
 use crate::{
     chain_complex::{AugmentedChainComplex, FreeChainComplex},
-    hi_products::HiBlock,
     lift::{LiftRequest, Liftable, MultiLift},
     resolution_homomorphism::ResolutionHomomorphism,
 };
@@ -163,7 +163,7 @@ pub struct Ring<CC: FreeChainComplex> {
     cells: HashMap<Bidegree, (Vec<usize>, Vec<FpVector>)>,
     maps: Vec<Arc<Staircase<CC>>>,
     /// `h_k` blocks by source: rows over the generators of the target.
-    h_rows: HashMap<(u32, Bidegree), Vec<FpVector>>,
+    h_rows: HashMap<(u32, Bidegree), Matrix>,
     memo: HashMap<(usize, usize), FpVector>,
     /// [`Ring::monomial_block`]'s memo.
     block_memo: HashMap<(usize, Bidegree), Arc<[FpVector]>>,
@@ -230,6 +230,15 @@ where
         out
     }
 
+    /// `Σ_y v_y matrix[y]`.
+    fn apply_matrix(v: &FpVector, matrix: &Matrix, dim: usize) -> FpVector {
+        let mut out = FpVector::new(TWO, dim);
+        for (y, _) in v.iter_nonzero() {
+            out.as_slice_mut().add(matrix.row(y), 1);
+        }
+        out
+    }
+
     /// `B`-coordinates of `v ∈ Ext(b)`.
     fn coords(&self, b: Bidegree, v: &FpVector) -> Vec<usize> {
         let Some((ids, inv)) = self.cells.get(&b) else {
@@ -254,7 +263,7 @@ where
         }
         if let Some(k) = h_index(g) {
             return match self.h_rows.get(&(k, mono.b)) {
-                Some(rows) => Self::apply(&mono.vec, rows, d),
+                Some(rows) => Self::apply_matrix(&mono.vec, rows, d),
                 None => FpVector::new(TWO, d),
             };
         }
@@ -432,18 +441,13 @@ where
     }
 }
 
-/// Compute the ring through `range`, given the `h_i` products `hi` (every `k` with
-/// `2^k <= range.max_t`). `res` must be computed through `(range.max_n, range.max_s)`.
+/// Compute the ring through `range`. `res` must be a minimal resolution of `F_2` over the Milnor
+/// basis, computed through `(range.max_n, range.max_s)`.
 ///
 /// With `save_maps`, each chain map is named after its monomial ([`map_name`]), so a resolution
 /// with a save store keeps the map's steps under `products/<name>` and a later computation, over
 /// this range or a larger one, reads them back instead of lifting them again.
-pub fn compute<CC>(
-    res: &Arc<CC>,
-    hi: &[HiBlock],
-    range: RingRange,
-    save_maps: bool,
-) -> anyhow::Result<Ring<CC>>
+pub fn compute<CC>(res: &Arc<CC>, range: RingRange, save_maps: bool) -> anyhow::Result<Ring<CC>>
 where
     CC: FreeChainComplex + AugmentedChainComplex + Send + Sync + 'static,
 {
@@ -470,25 +474,28 @@ where
         gb_size: 0,
         standard: [vec![]].into_iter().collect(),
     };
-    for block in hi {
-        let target = block.source + Bidegree::s_t(1, 1 << block.k);
-        if !in_range(target) {
-            continue;
-        }
-        let d = ring.dim(target);
-        let rows = block
-            .prod
-            .iter()
-            .map(|prod| {
-                let mut v = FpVector::new(TWO, d);
-                for &j in prod {
-                    v.set_entry(j, 1);
-                }
-                v
-            })
-            .collect();
-        ring.h_rows.insert((block.k, block.source), rows);
-    }
+    // The `h_k` blocks with source and target in range, read off the differentials.
+    let jobs: Vec<(u32, Bidegree)> = (0..=max_t.max(1).ilog2())
+        .flat_map(|k| {
+            res.iter_stem()
+                .filter(move |&b| {
+                    let target = b + Bidegree::s_t(1, 1 << k);
+                    in_range(b)
+                        && in_range(target)
+                        && res.number_of_gens_in_bidegree(b) > 0
+                        && res.number_of_gens_in_bidegree(target) > 0
+                })
+                .map(move |b| (k, b))
+        })
+        .collect();
+    ring.h_rows = jobs
+        .into_maybe_par_iter()
+        .map(|(k, b)| {
+            let m = super::h_product(&**res, k, b)
+                .ok_or_else(|| anyhow::anyhow!("h_{k} products at {b} are not readable"))?;
+            Ok(((k, b), m))
+        })
+        .collect::<anyhow::Result<_>>()?;
     // The unit.
     let mut one = FpVector::new(TWO, 1);
     one.set_entry(0, 1);

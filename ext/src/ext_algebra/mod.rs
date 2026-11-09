@@ -21,7 +21,6 @@ pub use self::{
 };
 use crate::{
     chain_complex::{AugmentedChainComplex, FreeChainComplex},
-    hi_products::hi_products,
     lift::{LiftError, Liftable, MultiLift},
     resolution_homomorphism::ResolutionHomomorphism,
     utils::{QueryModuleResolution, get_unit},
@@ -145,9 +144,7 @@ where
     where
         CC: Send + Sync + 'static,
     {
-        let ks: Vec<u32> = (0..=range.max_t.max(1).ilog2()).collect();
-        let hi = hi_products(&*self.resolution, range.max_n, range.max_s, &ks)?;
-        let ring = lin_ring::compute(&self.resolution, &hi, range, save_maps)?;
+        let ring = lin_ring::compute(&self.resolution, range, save_maps)?;
         *self.ring.lock().unwrap() = Some(ring);
         Ok(())
     }
@@ -294,33 +291,17 @@ where
         Some(matrix)
     }
 
-    /// `x · g_j` for the generators `g_j` at `b` when `x` is `h_i`: the coefficient of `Sq(2^i)` on
-    /// `g_j` in the differentials one filtration up (see [`crate::hi_products`]).
+    /// `x · g_j` for the generators `g_j` at `b` when `x` is `h_k` (see [`h_product`]).
     fn h_multiply_into(&self, x: &BidegreeElement, b: Bidegree) -> Option<Matrix> {
         let a = x.degree();
-        let algebra = self.resolution.algebra();
-        if self.prime() != 2
-            || algebra.prefix() != "milnor"
-            || a.s() != 1
+        if a.s() != 1
             || !(a.t() as u32).is_power_of_two()
             || self.dimension(a) != 1
             || x.vec().is_zero()
         {
             return None;
         }
-        let (_, op_idx) = algebra.basis_element_from_string(&format!("Sq{}", a.t()))?;
-        let rows = self
-            .resolution
-            .try_filtration_one_product(a.t(), op_idx, b)
-            .ok()?;
-        let target_dim = self.dimension(a + b);
-        let mut matrix = Matrix::new(self.prime(), rows.len(), target_dim);
-        for (j, row) in rows.iter().enumerate() {
-            for (k, &v) in row.iter().enumerate() {
-                matrix.row_mut(j).set_entry(k, v);
-            }
-        }
-        Some(matrix)
+        h_product(&*self.resolution, a.t().trailing_zeros(), b)
     }
 
     /// The ring product `x · y` (both in $\Ext(k, k)$) if it lies in the computed range, else
@@ -721,6 +702,47 @@ where
 /// The shared body of `multiply_into`: left-multiplication by `x` (a class in `Ext(source, k)`)
 /// applied to every generator of `Ext(target, k)` at bidegree `b`. Products land in `Ext(source,
 /// k)` at `b + x.degree()`. Returns `None` when out of the computed range.
+/// Multiplication by `h_k` out of bidegree `b`, read off the differentials of a minimal resolution
+/// `F` of `F_2` over the Milnor basis: row `j` is `h_k · x_(b, j)` in the generators at
+/// `b + (1, 2^k)`. No chain map is lifted.
+///
+/// `h_k` is dual to the generator of `F_1` with `d = Sq(2^k) ι`, and for `x ∈ Ext^{s,t}` dual to the
+/// generator `g_x` of `F_s`,
+///
+/// ```text
+///     h_k x = Σ_j <Sq(2^k) g_x, d g_j> g_j^*      (g_j the generators of F_{s+1} in degree t + 2^k)
+/// ```
+///
+/// i.e. the coefficient of `Sq(2^k)` on `g_x` in `d g_j`, which is
+/// [`FreeChainComplex::try_filtration_one_product`]. (`Sq(2^k)` is the only Milnor basis element of
+/// degree `2^k` pairing non-trivially with `ξ_1^{2^k}`, the cobar representative of `h_k`; in the
+/// admissible basis this fails.) `None` off the Milnor basis at `p = 2`, or when `b` or the target
+/// has not been computed.
+pub fn h_product<CC: FreeChainComplex>(res: &CC, k: u32, b: Bidegree) -> Option<Matrix> {
+    let algebra = res.algebra();
+    if res.prime() != 2 || algebra.prefix() != "milnor" {
+        return None;
+    }
+    let deg = 1 << k;
+    let target = b + Bidegree::s_t(1, deg);
+    if !res.has_computed_bidegree(b) || !res.has_computed_bidegree(target) {
+        return None;
+    }
+    let (_, op_idx) = algebra.basis_element_from_string(&format!("Sq{deg}"))?;
+    let rows = res.try_filtration_one_product(deg, op_idx, b).ok()?;
+    let mut matrix = Matrix::new(
+        res.prime(),
+        res.number_of_gens_in_bidegree(b),
+        res.number_of_gens_in_bidegree(target),
+    );
+    for (j, row) in rows.iter().enumerate() {
+        for (i, &v) in row.iter().enumerate() {
+            matrix.row_mut(j).set_entry(i, v);
+        }
+    }
+    Some(matrix)
+}
+
 fn products_into<CC>(
     source: &Arc<CC>,
     target: &Arc<CC>,
