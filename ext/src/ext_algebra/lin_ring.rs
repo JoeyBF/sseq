@@ -621,7 +621,11 @@ where
                 for &m in &ids {
                     let lo = ring.basis[m].lo();
                     let mut stair = vec![-1i32; (max_s - s + 1) as usize];
-                    for g in ring.gens[..=lo].iter().filter(|g| g.h.is_none()) {
+                    // Only generators whose product with `m` is in range are ever read off `f_m`.
+                    for g in ring.gens[..=lo]
+                        .iter()
+                        .filter(|g| g.h.is_none() && in_range(b + g.b))
+                    {
                         // Row s' <= s_g through stem t_g - s', within the target range.
                         for (sp, row) in stair.iter_mut().enumerate().take(g.b.s() as usize + 1) {
                             let n = (g.b.t() - sp as i32).min(max_n - b.n());

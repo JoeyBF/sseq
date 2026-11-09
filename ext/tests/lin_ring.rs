@@ -102,3 +102,56 @@ fn lin_ring_matches_all_products() {
     }
     assert_eq!(compared, 7029, "products compared");
 }
+
+/// A ring capped in `t` lifts each map only over the generators whose product stays in range; its
+/// products agree with the uncapped ring wherever both are defined.
+#[test]
+fn lin_ring_t_cap_agrees() {
+    let (max_n, max_s, max_t) = (36, 14, 34);
+    let res = Arc::new(construct("S_2@milnor", None).unwrap());
+    res.compute_through_stem(Bidegree::n_s(max_n, max_s));
+
+    let full = ExtAlgebra::new(Arc::clone(&res));
+    full.compute_ring(RingRange {
+        max_n,
+        max_s,
+        max_t: max_n + max_s,
+    })
+    .unwrap();
+    let capped = ExtAlgebra::new(Arc::clone(&res));
+    let range = RingRange {
+        max_n,
+        max_s,
+        max_t,
+    };
+    capped.compute_ring(range).unwrap();
+    assert_eq!(capped.with_ring(|r| r.check_h_associativity().1), Some(0));
+    assert!(
+        capped.with_ring(|r| r.corner_cells()).unwrap()
+            < full.with_ring(|r| r.corner_cells()).unwrap()
+    );
+
+    let bidegrees: Vec<Bidegree> = res
+        .iter_stem()
+        .filter(|&b| range.contains(b) && res.number_of_gens_in_bidegree(b) > 0)
+        .collect();
+    let mut compared = 0;
+    for &b in &bidegrees {
+        for &c in &bidegrees {
+            if !range.contains(b + c) {
+                continue;
+            }
+            for g in capped.basis(b) {
+                let ours = capped.known_multiply_into(&capped.generator(g), c).unwrap();
+                let theirs = full.known_multiply_into(&full.generator(g), c).unwrap();
+                for y in 0..ours.rows() {
+                    let a: Vec<u32> = ours.row(y).iter().collect();
+                    let e: Vec<u32> = theirs.row(y).iter().collect();
+                    assert_eq!(a, e, "x_{g} · x_{c}_{y}");
+                    compared += 1;
+                }
+            }
+        }
+    }
+    assert!(compared > 1000, "only {compared} products compared");
+}
