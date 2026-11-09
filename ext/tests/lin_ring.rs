@@ -1,13 +1,12 @@
-//! [`ext::lin_ring`] against a chain map per basis element ([`ExtModule::extend_all_products`]):
+//! [`ExtAlgebra`]'s products from [`ExtAlgebra::compute_ring`] (W. Lin's method, and `h_i` read off
+//! the differentials) against a chain map per basis element ([`ExtModule::extend_all_products`]):
 //! every product of two basis elements in range agrees.
 
 use std::sync::Arc;
 
 use ext::{
     chain_complex::{ChainComplex, FreeChainComplex},
-    ext_algebra::ExtModule,
-    hi_products::hi_products,
-    lin_ring::compute,
+    ext_algebra::{ExtAlgebra, ExtModule, RingRange},
     utils::construct,
 };
 use sseq::coordinates::{Bidegree, BidegreeGenerator};
@@ -18,13 +17,22 @@ fn lin_ring_matches_all_products() {
     let res = Arc::new(construct("S_2@milnor", None).unwrap());
     res.compute_through_stem(Bidegree::n_s(max_n, max_s));
 
-    let ks: Vec<u32> = (0..=(max_n + max_s).ilog2()).collect();
-    let hi = hi_products(&*res, max_n, max_s, &ks).unwrap();
-    let mut ring = compute(&res, &hi, max_n, max_s, max_n + max_s).unwrap();
-    assert_eq!(ring.check_h_associativity().1, 0);
+    let ring = ExtAlgebra::new(Arc::clone(&res));
+    ring.compute_ring(RingRange {
+        max_n,
+        max_s,
+        max_t: max_n + max_s,
+    })
+    .unwrap();
+    assert_eq!(ring.with_ring(|r| r.check_h_associativity().1), Some(0));
 
     // The indecomposables through (n, s) = (36, 14), as listed by G. Wu's chart of Ext.
-    let mut gens: Vec<(i32, i32)> = ring.gens.iter().map(|g| (g.b.n(), g.b.s())).collect();
+    let mut gens: Vec<(i32, i32)> = ring
+        .indecomposables()
+        .unwrap()
+        .iter()
+        .map(|g| (g.n(), g.s()))
+        .collect();
     gens.sort_unstable();
     let known = [
         (0, 1),
@@ -67,7 +75,7 @@ fn lin_ring_matches_all_products() {
     assert_eq!(gens, known);
 
     let e2 = ExtModule::intrinsic(Arc::clone(&res));
-    e2.extend_all_products();
+    e2.extend_all_products().unwrap();
     let bidegrees: Vec<Bidegree> = res
         .iter_stem()
         .filter(|&b| res.number_of_gens_in_bidegree(b) > 0)
@@ -79,12 +87,11 @@ fn lin_ring_matches_all_products() {
             if bc.n() > max_n || bc.s() > max_s {
                 continue;
             }
-            let block = ring.basis_block(b, c);
-            for (x, rows) in block.iter().enumerate() {
-                let expected = e2
-                    .multiply_into(&e2.generator(BidegreeGenerator::new(b, x)), c)
-                    .unwrap();
-                for (y, row) in rows.iter().enumerate() {
+            for x in 0..ring.dimension(b) {
+                let g = BidegreeGenerator::new(b, x);
+                let ours = ring.known_multiply_into(&ring.generator(g), c).unwrap();
+                let expected = e2.multiply_into(&e2.generator(g), c).unwrap();
+                for (y, row) in ours.iter().enumerate() {
                     let ours: Vec<u32> = row.iter().collect();
                     let theirs: Vec<u32> = expected.row(y).iter().collect();
                     assert_eq!(ours, theirs, "x_{b}_{x} · x_{c}_{y}");

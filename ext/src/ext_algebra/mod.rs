@@ -1,10 +1,12 @@
 //! Ext as a bigraded ring and its modules.
 
+pub mod lin_ring;
 pub mod massey;
 pub mod secondary;
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
+use algebra::Algebra;
 use dashmap::DashMap;
 use fp::{
     matrix::{AugmentedMatrix, Matrix, Subquotient, Subspace},
@@ -13,9 +15,13 @@ use fp::{
 };
 use sseq::coordinates::{Bidegree, BidegreeElement, BidegreeGenerator};
 
-pub use self::secondary::{SecondaryExtAlgebra, SecondaryProduct};
+pub use self::{
+    lin_ring::{Ring, RingRange},
+    secondary::{SecondaryExtAlgebra, SecondaryProduct},
+};
 use crate::{
     chain_complex::{AugmentedChainComplex, FreeChainComplex},
+    hi_products::hi_products,
     lift::{LiftError, Liftable, MultiLift},
     resolution_homomorphism::ResolutionHomomorphism,
     utils::{QueryModuleResolution, get_unit},
@@ -47,11 +53,18 @@ pub trait ExtDifferential: Send + Sync {
 /// computes the products of that class with all of $\Ext(k, k)$ at once. One such map is cached per
 /// generator; a product by a general class is assembled from them on request (see
 /// [`class_product_map`](Self::class_product_map)). Products are computed up to a sign.
+///
+/// Two cheaper sources are used first when they apply (see [`multiply_into`](Self::multiply_into)):
+/// over the Milnor basis at `p = 2`, products by `h_i` are read off the differentials, and once
+/// [`compute_ring`](Self::compute_ring) has run, every product inside its range comes from the
+/// [`Ring`] by W. Lin's method, which lifts far less than a chain map per generator.
 pub struct ExtAlgebra<CC: FreeChainComplex> {
     /// Resolution of the base field `k`. Ring products live here.
     resolution: Arc<CC>,
     /// One multiplication map per generator of $\Ext(k, k)$, `res(k) → res(k)`, built on demand.
     products: DashMap<BidegreeGenerator, Arc<ResolutionHomomorphism<CC, CC>>>,
+    /// The multiplicative structure through a range, from [`compute_ring`](Self::compute_ring).
+    ring: Mutex<Option<Ring<CC>>>,
 }
 
 impl<CC: FreeChainComplex> ExtAlgebra<CC> {
@@ -60,6 +73,7 @@ impl<CC: FreeChainComplex> ExtAlgebra<CC> {
         Self {
             resolution,
             products: DashMap::new(),
+            ring: Mutex::new(None),
         }
     }
 
@@ -103,6 +117,68 @@ impl<CC> ExtAlgebra<CC>
 where
     CC: FreeChainComplex + AugmentedChainComplex,
 {
+    /// Compute the multiplicative structure through `range` by W. Lin's method (see
+    /// [`lin_ring`]) and keep it, replacing any earlier one. The resolution must be computed through
+    /// `(range.max_n, range.max_s)`, over the Milnor basis at `p = 2`.
+    ///
+    /// Afterwards [`multiply_into`](Self::multiply_into) answers every product inside the range
+    /// from the ring, and [`indecomposables`](Self::indecomposables) lists the algebra generators.
+    pub fn compute_ring(&self, range: RingRange) -> anyhow::Result<()>
+    where
+        CC: Send + Sync + 'static,
+    {
+        let ks: Vec<u32> = (0..=range.max_t.max(1).ilog2()).collect();
+        let hi = hi_products(&*self.resolution, range.max_n, range.max_s, &ks)?;
+        let ring = lin_ring::compute(&self.resolution, &hi, range)?;
+        *self.ring.lock().unwrap() = Some(ring);
+        Ok(())
+    }
+
+    /// The range of the ring from [`compute_ring`](Self::compute_ring), if it has run.
+    pub fn ring_range(&self) -> Option<RingRange> {
+        self.ring.lock().unwrap().as_ref().map(|r| r.range())
+    }
+
+    /// The indecomposables of $\Ext(k, k)$ through the ring's range, ordered by `(t, s)`: a
+    /// generator at each of them together with the products of earlier ones spans its bidegree.
+    /// `None` until [`compute_ring`](Self::compute_ring) has run.
+    pub fn indecomposables(&self) -> Option<Vec<BidegreeGenerator>> {
+        let guard = self.ring.lock().unwrap();
+        let ring = guard.as_ref()?;
+        Some(
+            ring.gens
+                .iter()
+                .map(|g| BidegreeGenerator::new(g.b, g.idx))
+                .collect(),
+        )
+    }
+
+    /// Run `f` on the ring from [`compute_ring`](Self::compute_ring), for its statistics and
+    /// monomial basis. `None` if it has not run.
+    pub fn with_ring<R>(&self, f: impl FnOnce(&mut Ring<CC>) -> R) -> Option<R> {
+        self.ring.lock().unwrap().as_mut().map(f)
+    }
+
+    /// Multiplication by `x` as an [`sseq::Product`], over every bidegree where
+    /// [`known_multiply_into`](Self::known_multiply_into) applies (no chain map is lifted), for
+    /// charting.
+    pub fn known_product(&self, x: &BidegreeElement) -> sseq::Product<2> {
+        let matrices = once::MultiIndexed::new();
+        for b in self.resolution.iter_stem() {
+            if self.dimension(b) == 0 || self.dimension(b + x.degree()) == 0 {
+                continue;
+            }
+            if let Some(m) = self.known_multiply_into(x, b) {
+                matrices.insert(b, m);
+            }
+        }
+        sseq::Product {
+            b: Bidegree::x_y(x.degree().n(), x.degree().s()),
+            left: true,
+            matrices,
+        }
+    }
+
     /// The multiplication map for a single generator `g` of $\Ext(k, k)$ (`res(k) → res(k)`), built
     /// and cached on first use. The returned map is *not* guaranteed to be extended.
     pub fn generator_product_map(
@@ -155,7 +231,13 @@ where
 
     /// Left-multiplication by `x ∈ Ext(k, k)`, applied to every basis generator of $\Ext(k, k)$ at
     /// bidegree `b`. See [`ExtModule::multiply_into`] for the return convention.
+    ///
+    /// Uses [`known_multiply_into`](Self::known_multiply_into) when it applies, and otherwise lifts
+    /// the product maps of `x`'s generators over the whole computed range.
     pub fn multiply_into(&self, x: &BidegreeElement, b: Bidegree) -> Option<Matrix> {
+        if let Some(m) = self.known_multiply_into(x, b) {
+            return Some(m);
+        }
         products_into(
             &self.resolution,
             &self.resolution,
@@ -164,6 +246,64 @@ where
             x,
             b,
         )
+    }
+
+    /// [`multiply_into`](Self::multiply_into) without lifting a chain map: `Some` only when the
+    /// product is an `h_i` product read off the differentials (Milnor basis, `p = 2`) or lies in the
+    /// range of the [`Ring`] from [`compute_ring`](Self::compute_ring).
+    pub fn known_multiply_into(&self, x: &BidegreeElement, b: Bidegree) -> Option<Matrix> {
+        let target = x.degree() + b;
+        if !self.resolution.has_computed_bidegree(b)
+            || !self.resolution.has_computed_bidegree(target)
+        {
+            return None;
+        }
+        if let Some(m) = self.h_multiply_into(x, b) {
+            return Some(m);
+        }
+        let mut guard = self.ring.lock().unwrap();
+        let ring = guard.as_mut()?;
+        let range = ring.range();
+        if !(range.contains(x.degree()) && range.contains(b) && range.contains(target)) {
+            return None;
+        }
+        let block = ring.basis_block(x.degree(), b);
+        let mut matrix = Matrix::new(self.prime(), self.dimension(b), self.dimension(target));
+        for (i, c) in x.vec().iter_nonzero() {
+            for (j, row) in block[i].iter().enumerate() {
+                matrix.row_mut(j).add(row.as_slice(), c);
+            }
+        }
+        Some(matrix)
+    }
+
+    /// `x · g_j` for the generators `g_j` at `b` when `x` is `h_i`: the coefficient of `Sq(2^i)` on
+    /// `g_j` in the differentials one filtration up (see [`crate::hi_products`]).
+    fn h_multiply_into(&self, x: &BidegreeElement, b: Bidegree) -> Option<Matrix> {
+        let a = x.degree();
+        let algebra = self.resolution.algebra();
+        if self.prime() != 2
+            || algebra.prefix() != "milnor"
+            || a.s() != 1
+            || !(a.t() as u32).is_power_of_two()
+            || self.dimension(a) != 1
+            || x.vec().is_zero()
+        {
+            return None;
+        }
+        let (_, op_idx) = algebra.basis_element_from_string(&format!("Sq{}", a.t()))?;
+        let rows = self
+            .resolution
+            .try_filtration_one_product(a.t(), op_idx, b)
+            .ok()?;
+        let target_dim = self.dimension(a + b);
+        let mut matrix = Matrix::new(self.prime(), rows.len(), target_dim);
+        for (j, row) in rows.iter().enumerate() {
+            for (k, &v) in row.iter().enumerate() {
+                matrix.row_mut(j).set_entry(k, v);
+            }
+        }
+        Some(matrix)
     }
 
     /// The ring product `x · y` (both in $\Ext(k, k)$) if it lies in the computed range, else
