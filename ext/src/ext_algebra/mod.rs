@@ -127,9 +127,27 @@ where
     where
         CC: Send + Sync + 'static,
     {
+        self.compute_ring_inner(range, false)
+    }
+
+    /// [`compute_ring`](Self::compute_ring), keeping its chain maps in the resolution's save store
+    /// (under `products/lin_ring/...`, see [`lin_ring::map_name`]) so that a later computation, of
+    /// this range or a larger one, resumes them instead of lifting them again. Without a save store
+    /// this is [`compute_ring`](Self::compute_ring).
+    pub fn compute_ring_saving_maps(&self, range: RingRange) -> anyhow::Result<()>
+    where
+        CC: Send + Sync + 'static,
+    {
+        self.compute_ring_inner(range, true)
+    }
+
+    fn compute_ring_inner(&self, range: RingRange, save_maps: bool) -> anyhow::Result<()>
+    where
+        CC: Send + Sync + 'static,
+    {
         let ks: Vec<u32> = (0..=range.max_t.max(1).ilog2()).collect();
         let hi = hi_products(&*self.resolution, range.max_n, range.max_s, &ks)?;
-        let ring = lin_ring::compute(&self.resolution, &hi, range)?;
+        let ring = lin_ring::compute(&self.resolution, &hi, range, save_maps)?;
         *self.ring.lock().unwrap() = Some(ring);
         Ok(())
     }

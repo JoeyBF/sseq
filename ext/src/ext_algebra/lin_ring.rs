@@ -67,6 +67,20 @@ impl RingRange {
     }
 }
 
+/// The name of the chain map of the monomial with these `factors`: `lin_ring/` and the factors as
+/// `x_<n>_<s>_<i>`, joined by `.`. Basis monomials and their classes depend only on the resolution,
+/// so the name identifies the same map in any range.
+pub fn map_name(gens: &[Generator], factors: &[u32]) -> String {
+    let parts: Vec<String> = factors
+        .iter()
+        .map(|&j| {
+            let g = &gens[j as usize];
+            format!("x_{}_{}_{}", g.b.n(), g.b.s(), g.idx)
+        })
+        .collect();
+    format!("lin_ring/{}", parts.join("."))
+}
+
 /// A generator `a_i`: the generator `idx` of the resolution at `b`; `h = Some(k)` for `h_k`.
 pub struct Generator {
     pub b: Bidegree,
@@ -432,7 +446,16 @@ where
 
 /// Compute the ring through `range`, given the `h_i` products `hi` (every `k` with
 /// `2^k <= range.max_t`). `res` must be computed through `(range.max_n, range.max_s)`.
-pub fn compute<CC>(res: &Arc<CC>, hi: &[HiBlock], range: RingRange) -> anyhow::Result<Ring<CC>>
+///
+/// With `save_maps`, each chain map is named after its monomial ([`map_name`]), so a resolution
+/// with a save store keeps the map's steps under `products/<name>` and a later computation, over
+/// this range or a larger one, reads them back instead of lifting them again.
+pub fn compute<CC>(
+    res: &Arc<CC>,
+    hi: &[HiBlock],
+    range: RingRange,
+    save_maps: bool,
+) -> anyhow::Result<Ring<CC>>
 where
     CC: FreeChainComplex + AugmentedChainComplex + Send + Sync + 'static,
 {
@@ -637,8 +660,13 @@ where
                     }
                     let mono = &ring.basis[m];
                     let class: Vec<u32> = mono.vec.iter().collect();
+                    let name = if save_maps {
+                        map_name(&ring.gens, &mono.factors)
+                    } else {
+                        String::new()
+                    };
                     let hom = ResolutionHomomorphism::from_class(
-                        String::new(),
+                        name,
                         Arc::clone(res),
                         Arc::clone(res),
                         b,
