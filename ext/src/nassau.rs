@@ -1,6 +1,9 @@
 //! Minimal resolutions by [Nassau's algorithm](https://arxiv.org/abs/1910.04063).
 
-use std::sync::{Arc, Mutex, mpsc};
+use std::{
+    collections::VecDeque,
+    sync::{Arc, LazyLock, Mutex, mpsc},
+};
 
 use algebra::{
     Algebra, combinatorics,
@@ -380,6 +383,77 @@ impl Iterator for SubalgebraIterator {
     }
 }
 
+/// Whether to persist quasi-inverses to the save store during resolution. Disabled by
+/// `EXT_NASSAU_NO_SAVE_QI`, in which case only the differentials are written — they are orders of
+/// magnitude smaller — and every downstream lift recomputes its quasi-inverse on demand.
+static SAVE_QI: LazyLock<bool> =
+    LazyLock::new(|| std::env::var_os("EXT_NASSAU_NO_SAVE_QI").is_none());
+
+/// Force `apply_quasi_inverse` to recompute rather than read a saved quasi-inverse, even when one
+/// exists in the store. Used to measure the recompute cost in isolation.
+static RECOMPUTE_QI: LazyLock<bool> =
+    LazyLock::new(|| std::env::var_os("EXT_NASSAU_RECOMPUTE_QI").is_some());
+
+/// Destination of the commands of a quasi-inverse: the zarr [`NassauQiWriter`] during resolution,
+/// or an in-memory queue when [`RecomputeReader`] regenerates a quasi-inverse on demand.
+trait QiSink {
+    /// Start the block of `signature`, encoded by [`Subalgebra::signature_to_store`].
+    fn write_signature(&mut self, signature: &[u16]) -> anyhow::Result<()>;
+
+    /// Record that column `col` of the target lifts to `lift`, whose image is `image`.
+    fn write_pivot(&mut self, col: u64, lift: FpSlice, image: FpSlice) -> anyhow::Result<()>;
+}
+
+impl QiSink for NassauQiWriter {
+    /// Forward to [`NassauQiWriter::write_signature`].
+    fn write_signature(&mut self, signature: &[u16]) -> anyhow::Result<()> {
+        Self::write_signature(self, signature)
+    }
+
+    /// Forward to [`NassauQiWriter::write_pivot`].
+    fn write_pivot(&mut self, col: u64, lift: FpSlice, image: FpSlice) -> anyhow::Result<()> {
+        Self::write_pivot(self, col, lift, image)
+    }
+}
+
+impl<W: QiSink + ?Sized> QiSink for &mut W {
+    /// Forward to `W`.
+    fn write_signature(&mut self, signature: &[u16]) -> anyhow::Result<()> {
+        (**self).write_signature(signature)
+    }
+
+    /// Forward to `W`.
+    fn write_pivot(&mut self, col: u64, lift: FpSlice, image: FpSlice) -> anyhow::Result<()> {
+        (**self).write_pivot(col, lift, image)
+    }
+}
+
+/// The in-memory sink yields exactly the [`NassauCommand`]s that [`NassauQiReader`] would parse
+/// back from the store, so the apply loop consumes both through the same code path.
+///
+/// [`NassauQiReader`]: crate::save::NassauQiReader
+impl QiSink for VecDeque<NassauCommand> {
+    /// Queue a [`NassauCommand::Signature`].
+    fn write_signature(&mut self, signature: &[u16]) -> anyhow::Result<()> {
+        self.push_back(NassauCommand::Signature(signature.to_vec()));
+        Ok(())
+    }
+
+    /// Queue a [`NassauCommand::Pivot`], serialising the vectors as the store does.
+    fn write_pivot(&mut self, col: u64, lift: FpSlice, image: FpSlice) -> anyhow::Result<()> {
+        let mut lift_bytes = Vec::new();
+        lift.to_owned().to_bytes(&mut lift_bytes)?;
+        let mut image_bytes = Vec::new();
+        image.to_owned().to_bytes(&mut image_bytes)?;
+        self.push_back(NassauCommand::Pivot {
+            col,
+            lift_bytes,
+            image_bytes,
+        });
+        Ok(())
+    }
+}
+
 /// A resolution of a bounded module over a [`MilnorAlgebra`] using Nassau's algorithm.
 ///
 /// This aims to have an API similar to that of
@@ -405,6 +479,9 @@ pub struct Resolution<M: ZeroModule<Algebra = MilnorAlgebra>> {
     target: Arc<FiniteChainComplex<M>>,
     chain_maps: OnceBiVec<Arc<FreeModuleHomomorphism<M>>>,
     save_dir: SaveDirectory,
+    /// How many times the quasi-inverse at each bidegree was recomputed, for tests.
+    #[cfg(test)]
+    pub(crate) qi_recomputes: dashmap::DashMap<Bidegree, usize>,
 }
 
 impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
@@ -454,6 +531,8 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
             target,
             max_degree,
             save_dir,
+            #[cfg(test)]
+            qi_recomputes: dashmap::DashMap::new(),
         })
     }
 
@@ -505,8 +584,8 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
     }
 
     #[tracing::instrument(skip_all)]
-    fn write_qi(
-        w: &mut Option<NassauQiWriter>,
+    fn write_qi<W: QiSink>(
+        w: &mut Option<W>,
         scratch: &mut FpVector,
         subalgebra: &Subalgebra,
         signature: &MilnorBasisElement,
@@ -617,7 +696,9 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
         next.compute_basis(b.t());
         let next_dim = next.dimension_from_gens_below(b.t(), next_bound);
 
-        let mut f = if let Some(store) = self.save_dir.store() {
+        // Skip writing the quasi-inverse when `EXT_NASSAU_NO_SAVE_QI` is set; `apply_quasi_inverse`
+        // recomputes it on demand from the differential (see `RecomputeReader`).
+        let mut f = if *SAVE_QI && let Some(store) = self.save_dir.store() {
             Some(store.nassau_qi_writer(
                 b - Bidegree::s_t(1, 0),
                 next_dim as u64,
@@ -1157,9 +1238,9 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> ChainComplex for Resolution<M> {
 impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
     /// The fallible core of [`ChainComplex::apply_quasi_inverse`].
     ///
-    /// Returns `Ok(false)` when no quasi-inverse is available (no save store or no saved qi for
-    /// this bidegree), `Ok(true)` when the qi was successfully applied, and propagates
-    /// `anyhow::Error` from the structured zarr reader or `FpVector::update_from_bytes`.
+    /// Returns `Ok(false)` when the store should hold this quasi-inverse but does not, `Ok(true)`
+    /// when the qi was successfully applied, and propagates `anyhow::Error` from the structured
+    /// zarr reader or `FpVector::update_from_bytes`.
     fn apply_quasi_inverse_fallible<T, S>(
         &self,
         results: &mut [T],
@@ -1170,21 +1251,58 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
         for<'a> &'a mut T: Into<FpSliceMut<'a>>,
         for<'a> &'a S: Into<FpSlice<'a>>,
     {
-        let Some(store) = self.save_dir.store() else {
-            return Ok(false);
-        };
-        let Some(reader) = store.nassau_qi_reader(b)? else {
-            return Ok(false);
-        };
-
         let p = self.prime();
-
-        let target_dim = reader.target_dim() as usize;
-        let zero_mask_dim = reader.zero_mask_dim() as usize;
         let source = &self.modules[b.s()];
         let target = &self.modules[b.s() - 1];
         let algebra = target.algebra();
-        let subalgebra = &Subalgebra::from_store_profile(&algebra, reader.subalgebra_profile())?;
+
+        // Read the saved quasi-inverse unless recomputation is forced or nothing was persisted.
+        // `RecomputeReader` regenerates the same command stream from `differentials[b.s]`, so the
+        // loop below is unchanged either way.
+        let force_recompute = *RECOMPUTE_QI || !*SAVE_QI;
+        let store = self.save_dir.store();
+        let saved = if force_recompute {
+            None
+        } else if let Some(store) = store {
+            store.nassau_qi_reader(b)?
+        } else {
+            None
+        };
+        type Commands<'r> = Box<dyn Iterator<Item = anyhow::Result<NassauCommand>> + 'r>;
+        let saved_subalgebra;
+        let (target_dim, zero_mask_dim, subalgebra, commands): (_, _, &Subalgebra, Commands<'_>) =
+            match saved {
+                Some(reader) => {
+                    saved_subalgebra =
+                        Subalgebra::from_store_profile(&algebra, reader.subalgebra_profile())?;
+                    (
+                        reader.target_dim() as usize,
+                        reader.zero_mask_dim() as usize,
+                        &saved_subalgebra,
+                        Box::new(reader),
+                    )
+                }
+                // A store that should hold this quasi-inverse but doesn't is an incomplete store,
+                // not an invitation to spend the resolution cost again silently: report failure.
+                // Nassau writes qi(s, t) while computing (s + 1, t), so an absent qi is legitimate
+                // exactly when that step was never taken — at the top of the computed region,
+                // where lifting into (s, t) is still well-defined.
+                None if !force_recompute
+                    && store.is_some()
+                    && self.has_computed_bidegree(b + Bidegree::s_t(1, 0)) =>
+                {
+                    return Ok(false);
+                }
+                None => {
+                    let reader = RecomputeReader::new(self, b);
+                    (
+                        reader.target_dim,
+                        reader.zero_mask_dim,
+                        reader.subalgebra,
+                        Box::new(reader),
+                    )
+                }
+            };
 
         let mut inputs: Vec<FpVector> = inputs.iter().map(|x| x.into().to_owned()).collect();
         let mut mask: Vec<usize> = Vec::with_capacity(zero_mask_dim + 8);
@@ -1240,7 +1358,7 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
             (Vec::new(), AugmentedMatrix::<3>::new(p, 0, [0, 0, 0]))
         };
 
-        for cmd in reader {
+        for cmd in commands {
             match cmd? {
                 NassauCommand::Signature(words) => {
                     let signature = subalgebra.signature_from_store(&words)?;
@@ -1345,6 +1463,131 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
             );
         }
         Ok(true)
+    }
+}
+
+/// A streaming iterator that regenerates the quasi-inverse of `d_{b.s}` at bidegree `b` on the
+/// fly, as the [`NassauCommand`]s that [`Resolution::write_qi`] writes to the store.
+///
+/// This lets [`ChainComplex::apply_quasi_inverse`] consume a recomputed quasi-inverse through the
+/// same code path as a saved one; only the source of commands differs. The quasi-inverse is
+/// re-derived from `differentials[b.s]` alone (plus the module bases and the subalgebra that the
+/// step at `(s + 1, t)` used), never the rest of the resolution.
+///
+/// It advances one signature at a time, holding only that signature's matrices plus the commands
+/// they serialize to, so its peak memory is on the order of what resolving this bidegree
+/// originally required, never the whole quasi-inverse.
+///
+/// A lift is only requested once `differentials[b.s]` is complete at `b.t()`, so the recomputed
+/// quasi-inverse is computed on the full target and never emits a [`NassauCommand::Fix`].
+struct RecomputeReader<'a, M: ZeroModule<Algebra = MilnorAlgebra>> {
+    res: &'a Resolution<M>,
+    b: Bidegree,
+    subalgebra: &'a Subalgebra,
+    algebra: Arc<MilnorAlgebra>,
+    /// Target dimension of the qi (dimension of `F_{s-1}` at `t`).
+    target_dim: usize,
+    /// Dimension of the zero-signature masked source.
+    zero_mask_dim: usize,
+    signatures: std::vec::IntoIter<MilnorBasisElement>,
+    scratch: FpVector,
+    pending: VecDeque<NassauCommand>,
+}
+
+impl<'a, M: ZeroModule<Algebra = MilnorAlgebra>> RecomputeReader<'a, M> {
+    /// Set up the regeneration of the quasi-inverse of `d_{b.s}` at `b`, emitting nothing yet.
+    fn new(res: &'a Resolution<M>, b: Bidegree) -> Self {
+        #[cfg(test)]
+        {
+            *res.qi_recomputes.entry(b).or_default() += 1;
+        }
+        let (s, t) = (b.s(), b.t());
+        // The qi at `b` is the one the step at `(s + 1, t)` writes, so use that step's subalgebra.
+        let subalgebra = res.subalgebra_for(b + Bidegree::s_t(1, 0));
+        // `src` is the source of `d_s` (= F_s), `tgt` its target (= F_{s-1}).
+        let src = &res.modules[s];
+        let tgt = &res.modules[s - 1];
+        src.compute_basis(t);
+        tgt.compute_basis(t);
+        let algebra = tgt.algebra();
+
+        let target_dim = tgt.dimension(t);
+        let zero_mask_dim = subalgebra
+            .signature_mask(&algebra, src, t, &zero_signature(), None)
+            .count();
+
+        // Zero signature first, then the rest, matching the write order.
+        let signatures: Vec<MilnorBasisElement> = std::iter::once(zero_signature())
+            .chain(subalgebra.signatures(t))
+            .collect();
+
+        Self {
+            res,
+            b,
+            subalgebra,
+            algebra,
+            target_dim,
+            zero_mask_dim,
+            signatures: signatures.into_iter(),
+            scratch: FpVector::new(res.prime(), 0),
+            pending: VecDeque::new(),
+        }
+    }
+
+    /// Row-reduce `d_s` restricted to `signature` and queue the resulting commands, as `write_qi`
+    /// does during resolution. Queues nothing if the block has no pivots.
+    fn write_signature(&mut self, signature: &MilnorBasisElement) -> anyhow::Result<()> {
+        let (s, t) = (self.b.s(), self.b.t());
+        let p = self.res.prime();
+
+        let src_mask: Vec<usize> = self
+            .subalgebra
+            .signature_mask(&self.algebra, &self.res.modules[s], t, signature, None)
+            .collect();
+        let tgt_mask: Vec<usize> = self
+            .subalgebra
+            .signature_mask(&self.algebra, &self.res.modules[s - 1], t, signature, None)
+            .collect();
+
+        let full_matrix = {
+            let _guard = ParallelGuard::new();
+            self.res.differentials[s].get_partial_matrix(t, &src_mask)
+        };
+        let mut masked_matrix =
+            AugmentedMatrix::new(p, src_mask.len(), [tgt_mask.len(), src_mask.len()]);
+        masked_matrix
+            .segment(0, 0)
+            .add_masked(&full_matrix, &tgt_mask);
+        masked_matrix.segment(1, 1).add_identity();
+        masked_matrix.row_reduce();
+
+        Resolution::<M>::write_qi(
+            &mut Some(&mut self.pending),
+            &mut self.scratch,
+            self.subalgebra,
+            signature,
+            &tgt_mask,
+            &full_matrix,
+            &masked_matrix,
+        )
+    }
+}
+
+impl<M: ZeroModule<Algebra = MilnorAlgebra>> Iterator for RecomputeReader<'_, M> {
+    type Item = anyhow::Result<NassauCommand>;
+
+    /// Hand out the next command of the quasi-inverse, regenerating the next signature's block
+    /// whenever the queue runs dry. Returns `None` once every signature has been processed.
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if let Some(cmd) = self.pending.pop_front() {
+                return Some(Ok(cmd));
+            }
+            let signature = self.signatures.next()?;
+            if let Err(e) = self.write_signature(&signature) {
+                return Some(Err(e));
+            }
+        }
     }
 }
 
