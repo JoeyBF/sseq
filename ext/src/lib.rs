@@ -171,7 +171,6 @@
 
 pub mod chain_complex;
 pub mod ext_algebra;
-pub mod hi_products;
 pub mod lift;
 pub mod resolution;
 pub mod resolution_homomorphism;
