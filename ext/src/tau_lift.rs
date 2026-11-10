@@ -26,6 +26,164 @@ use crate::{
 /// generator $z$ of $C_a$, and the monomial $K$ whose dual is $\gamma_K$.
 pub type Gen = (i32, (i32, u32), QMono);
 
+/// A free resolution of $\mathbb{F}_2$ over $P$, read through the classical Milnor basis.
+pub trait Backbone {
+    /// The number of generators of $C_a$ in degree `t`.
+    fn num_gens(&self, a: i32, t: i32) -> usize;
+    /// The terms $P(R)\, x$ of the differential on generator `z` of $C_a$ in degree `t`.
+    fn terms(&self, a: i32, t: i32, z: u32) -> Vec<(PackedXi, (i32, u32))>;
+    /// The top filtration, if the resolution is truncated there.
+    fn top(&self) -> Option<i32> {
+        None
+    }
+}
+
+/// A computed resolution as a [`Backbone`].
+pub struct Resolved<'a, CC>(pub &'a CC);
+
+impl<CC: FreeChainComplex<Algebra = MilnorAlgebra>> Backbone for Resolved<'_, CC> {
+    fn num_gens(&self, a: i32, t: i32) -> usize {
+        if a > self.0.next_homological_degree() - 1 {
+            return 0;
+        }
+        self.0.number_of_gens_in_bidegree(Bidegree::s_t(a, t))
+    }
+
+    fn terms(&self, a: i32, t: i32, z: u32) -> Vec<(PackedXi, (i32, u32))> {
+        let src = self.0.module(a - 1);
+        let algebra = self.0.algebra();
+        self.0
+            .differential(a)
+            .output(t, z as usize)
+            .iter_nonzero()
+            .map(|(e, _)| {
+                let og = src.index_to_op_gen(t, e);
+                let r: Vec<u32> = algebra
+                    .basis_element_from_index(og.operation_degree, og.operation_index)
+                    .p_part
+                    .iter()
+                    .collect();
+                (pack(&r), (og.generator_degree, og.generator_index as u32))
+            })
+            .collect()
+    }
+}
+
+/// The bar resolution of $\mathbb{F}_2$ over $P$, truncated at filtration `top`: $C_a$ is free
+/// on the $[p_1 | \dots | p_a]$ with each $p_i$ a Milnor basis element of positive degree.
+pub struct Bar {
+    /// The generators of $C_a$ in degree $t$, at `gens[a][t]`.
+    pub gens: Vec<Vec<Vec<Vec<PackedXi>>>>,
+    /// The index of each generator in its degree.
+    index: FxHashMap<Vec<PackedXi>, u32>,
+    /// $P(R) P(S)$ in the Milnor basis.
+    products: FxHashMap<(PackedXi, PackedXi), Vec<PackedXi>>,
+    /// The top filtration.
+    top: i32,
+}
+
+impl Bar {
+    /// The bar resolution through filtration `top` and degree `max_t`.
+    pub fn new(top: i32, max_t: i32) -> Self {
+        let algebra = MilnorAlgebra::new(TWO, false);
+        algebra.compute_basis(max_t);
+        let basis: Vec<Vec<PackedXi>> = (0..=max_t)
+            .map(|d| {
+                (0..algebra.dimension(d))
+                    .map(|i| {
+                        let r: Vec<u32> = algebra
+                            .basis_element_from_index(d, i)
+                            .p_part
+                            .iter()
+                            .collect();
+                        pack(&r)
+                    })
+                    .collect()
+            })
+            .collect();
+        let mut gens = vec![vec![Vec::new(); max_t as usize + 1]; top as usize + 1];
+        gens[0][0].push(Vec::new());
+        for a in 1..=top as usize {
+            for t in 0..=max_t as usize {
+                let mut out = Vec::new();
+                for d in 1..=t {
+                    for &p in &basis[d] {
+                        for rest in &gens[a - 1][t - d] {
+                            let mut g = vec![p];
+                            g.extend(rest);
+                            out.push(g);
+                        }
+                    }
+                }
+                gens[a][t] = out;
+            }
+        }
+        let mut index = FxHashMap::default();
+        for by_t in &gens {
+            for list in by_t {
+                for (i, g) in list.iter().enumerate() {
+                    index.insert(g.clone(), i as u32);
+                }
+            }
+        }
+        let mut products = FxHashMap::default();
+        for d1 in 1..=max_t {
+            for d2 in 1..=max_t - d1 {
+                for i1 in 0..algebra.dimension(d1) {
+                    for i2 in 0..algebra.dimension(d2) {
+                        let mut v = FpVector::new(TWO, algebra.dimension(d1 + d2));
+                        algebra.multiply_basis_elements(v.as_slice_mut(), 1, d1, i1, d2, i2);
+                        products.insert(
+                            (basis[d1 as usize][i1], basis[d2 as usize][i2]),
+                            v.iter_nonzero()
+                                .map(|(j, _)| basis[(d1 + d2) as usize][j])
+                                .collect(),
+                        );
+                    }
+                }
+            }
+        }
+        Self {
+            gens,
+            index,
+            products,
+            top,
+        }
+    }
+}
+
+impl Backbone for Bar {
+    fn num_gens(&self, a: i32, t: i32) -> usize {
+        self.gens
+            .get(a as usize)
+            .and_then(|g| g.get(t as usize))
+            .map_or(0, Vec::len)
+    }
+
+    fn terms(&self, a: i32, t: i32, z: u32) -> Vec<(PackedXi, (i32, u32))> {
+        let g = &self.gens[a as usize][t as usize][z as usize];
+        let deg = |p: &[PackedXi]| p.iter().map(|&r| packed_halved_degree(r)).sum::<i32>();
+        let mut out = Vec::new();
+        // p_1 [p_2 | ... | p_a].
+        let rest = g[1..].to_vec();
+        out.push((g[0], (deg(&rest), self.index[&rest])));
+        // [... | p_i p_{i+1} | ...].
+        for i in 0..g.len() - 1 {
+            for &q in &self.products[&(g[i], g[i + 1])] {
+                let mut h = g[..i].to_vec();
+                h.push(q);
+                h.extend(&g[i + 2..]);
+                out.push((0, (t, self.index[&h])));
+            }
+        }
+        out
+    }
+
+    fn top(&self) -> Option<i32> {
+        Some(self.top)
+    }
+}
+
 /// The halved degree of a monomial in the $v_i$.
 fn qdeg(k: &QMono) -> i32 {
     k.iter()
@@ -69,19 +227,17 @@ pub struct TauLift {
     correction: Vec<FxHashMap<(i32, usize), FpVector>>,
     /// The largest motivic degree.
     max_t: i32,
+    /// The top filtration of the backbone, if it is truncated: generators there are not
+    /// corrected.
+    top: Option<i32>,
 }
 
 impl TauLift {
     /// Builds $M_0, \dots, M_{\text{max\_h}}$ through motivic degree `max_t` from the classical
     /// resolution `res`, and lifts the differential.
-    pub fn new<CC>(res: &CC, max_h: i32, max_t: i32) -> Self
-    where
-        CC: FreeChainComplex<Algebra = MilnorAlgebra>,
-    {
-        assert!(res.has_computed_bidegree(Bidegree::s_t(max_h, max_t / 2)));
+    pub fn new<B: Backbone>(res: &B, max_h: i32, max_t: i32) -> Self {
         let algebra = Arc::new(MilnorAlgebra::motivic_mod_tau(Default::default(), false));
         algebra.compute_basis(max_t);
-        let backbone = res.algebra();
 
         // Q monomials by (length, halved degree), with v_0 explicit.
         let max_d = max_t / 2;
@@ -143,7 +299,7 @@ impl TauLift {
             for a in 0..=h {
                 let j = (h - a) as u32;
                 for t_z in 0..=max_t / 2 {
-                    for z in 0..res.number_of_gens_in_bidegree(Bidegree::s_t(a, t_z)) as u32 {
+                    for z in 0..res.num_gens(a, t_z) as u32 {
                         for dd in 0..=max_d {
                             let t = 2 * t_z + 2 * dd + j as i32;
                             if t > max_t {
@@ -200,21 +356,9 @@ impl TauLift {
                         }
                         // The backbone part.
                         if a > 0 {
-                            let dz = res.differential(a);
-                            let src = res.module(a - 1);
-                            for (e, _) in dz.output(t_z, z as usize).iter_nonzero() {
-                                let og = src.index_to_op_gen(t_z, e);
-                                let r: Vec<u32> = backbone
-                                    .basis_element_from_index(
-                                        og.operation_degree,
-                                        og.operation_index,
-                                    )
-                                    .p_part
-                                    .iter()
-                                    .collect();
-                                let x = (og.generator_degree, og.generator_index as u32);
-                                for r1 in splits(pack(&r)) {
-                                    let r2 = pack(&r) - r1;
+                            for (r, x) in res.terms(a, t_z, z) {
+                                for r1 in splits(r) {
+                                    let r2 = r - r1;
                                     let op = p_elt(&algebra, r1);
                                     let op_idx = algebra.basis_element_to_index(&op);
                                     for &s in chi.get(&r2).into_iter().flatten() {
@@ -248,7 +392,9 @@ impl TauLift {
             gens,
             correction: vec![FxHashMap::default(); max_h as usize + 1],
             max_t,
+            top: None,
         };
+        lift.top = res.top();
         lift.correct();
         lift
     }
@@ -317,6 +463,10 @@ impl TauLift {
                         }
                     }
                     let mut c = FpVector::new(TWO, mid.dimension(t));
+                    if Some(self.gens[h][&t][i].0) == self.top {
+                        self.correction[h].insert((t, i), c);
+                        continue;
+                    }
                     if !e.is_zero() {
                         let qi = self.d[h - 1].quasi_inverse(t).unwrap();
                         qi.apply(c.as_slice_mut(), 1, e.as_slice());
@@ -404,6 +554,22 @@ impl TauLift {
             })
             .count();
         (pairs.len(), local)
+    }
+
+    /// Every term of $\delta_1$: the generator $z \otimes \gamma_K$ and the $x \otimes \gamma_{K'}$
+    /// in its correction with coefficient 1.
+    pub fn delta1_terms(&self) -> Vec<(Gen, Gen)> {
+        let mut out = Vec::new();
+        for h in 2..self.modules.len() {
+            for (&(t, i), c) in &self.correction[h] {
+                let g = self.gens[h][&t][i];
+                for j in self.constants(h, t, c) {
+                    out.push((g, self.gens[h - 1][&t][j]));
+                }
+            }
+        }
+        out.sort();
+        out
     }
 
     /// The motivic weight of a generator.
@@ -589,6 +755,11 @@ fn cohomology(
         .into_iter()
         .filter(|k| basis.insert(k.clone()))
         .collect()
+}
+
+/// The exponents of a packed $P(R)$.
+pub fn unpack_r(r: PackedXi) -> Vec<u32> {
+    unpack(r)
 }
 
 /// The halved degree of a packed $P(R)$.
