@@ -1,7 +1,7 @@
 //! Runs the $v_n$-Bockstein spectral sequences $Q^{(0)} \to Q^{(1)} \to \dots$ and writes each page.
 //!
 //! Usage: `vn_bockstein <max_n> <max_s> <max_stage> <out_dir>`, with `CTAU_BACKBONE=<dir>` to
-//! load or save the resolution of $\mathbb{F}_2$. For each stage `n` it prints the size of $E_1$,
+//! load or save the resolution of $\mathbb{F}_2$. For each stage `n` it prints the size of the complex, of $E_1$,
 //! the number of $d_r$ for each `r` and the size of $E_\infty$, and writes
 //! `<out_dir>/e1_<n>.csv`, `einf_<n>.csv` and `d_<n>.csv` as `stem,s,u,dim` (with `r` in front
 //! for the differentials, keyed by their source).
@@ -39,11 +39,13 @@ fn main() {
         let einf = page_dims(&pages, i32::MAX, max_n, max_s);
         let mut by_r: BTreeMap<i32, usize> = BTreeMap::new();
         let mut d_rows = Vec::new();
+        let mut cochains = 0;
         for &(k, u, a) in pages.chains.keys() {
             let stem = 2 * u - a;
             if !(0..=max_n).contains(&stem) || a + k > max_s {
                 continue;
             }
+            cochains += pages.chains[&(k, u, a)];
             for (r, c) in pages.differentials((k, u, a)) {
                 if r > 0 {
                     *by_r.entry(r).or_insert(0) += c;
@@ -53,7 +55,7 @@ fn main() {
         }
         let total = |m: &BTreeMap<(i32, i32, i32), usize>| m.values().sum::<usize>();
         println!(
-            "stage {n}: E1 {}, E∞ {}, d_r {:?} ({:?})",
+            "stage {n}: cochains {cochains}, E1 {}, E∞ {}, d_r {:?} ({:?})",
             total(&e1),
             total(&einf),
             by_r,
