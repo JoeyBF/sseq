@@ -612,23 +612,42 @@ mod logging {
         }
     }
 
+    /// The `ext` subscriber: `RUST_LOG`-filtered logs on stderr, and with `EXT_STEP_LOG=<file>` the
+    /// lifting steps (target `ext::lift::steps`) appended to that file, one line per event.
     #[cfg(feature = "logging")]
     pub fn ext_tracing_subscriber() -> impl tracing::Subscriber {
         use std::io::IsTerminal;
 
         use tracing_subscriber::{
-            filter::EnvFilter,
-            fmt::{Subscriber, format::FmtSpan},
+            Layer,
+            filter::{EnvFilter, LevelFilter, Targets},
+            fmt::{self, format::FmtSpan},
+            layer::SubscriberExt,
         };
 
-        Subscriber::builder()
+        let env = EnvFilter::try_from_default_env()
+            .unwrap_or_default()
+            .add_directive("ext::lift::steps=off".parse().unwrap());
+        let stderr = fmt::layer()
             .with_ansi(std::io::stderr().is_terminal())
             .with_writer(std::io::stderr)
-            .with_max_level(tracing::Level::INFO)
             .with_span_events(FmtSpan::NEW | FmtSpan::CLOSE)
             .with_thread_ids(true)
-            .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_default())
-            .finish()
+            .with_filter(LevelFilter::INFO)
+            .with_filter(env);
+        let steps = std::env::var_os("EXT_STEP_LOG").map(|path| {
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+                .unwrap_or_else(|e| panic!("EXT_STEP_LOG {path:?}: {e}"));
+            fmt::layer()
+                .with_ansi(false)
+                .with_target(false)
+                .with_writer(std::sync::Mutex::new(file))
+                .with_filter(Targets::new().with_target("ext::lift::steps", tracing::Level::INFO))
+        });
+        tracing_subscriber::registry().with(stderr).with(steps)
     }
 
     #[cfg(not(feature = "logging"))]
