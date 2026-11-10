@@ -649,7 +649,7 @@ pub struct UntwistedMatrix {
 
 /// The cochains of filtration `a` at weight `u`: the offset and generator count of each block
 /// $x_i \otimes Q_k^\vee$, by generator degree, and the total dimension.
-fn cochain_blocks<CC: FreeChainComplex>(
+pub(crate) fn cochain_blocks<CC: FreeChainComplex>(
     res: &CC,
     q_dim: impl Fn(i32) -> usize,
     a: i32,
@@ -667,13 +667,18 @@ fn cochain_blocks<CC: FreeChainComplex>(
 
 /// The largest weight read for $Q_k$: $\mathrm{Ext}^{a, u}(Q_k)$ is wanted for
 /// $a \leq$ `max_s - k` and stem $2u - a \leq$ `max_n`.
-fn untwisted_max_weight(max_n: i32, max_s: i32, k: i32) -> i32 {
+pub(crate) fn untwisted_max_weight(max_n: i32, max_s: i32, k: i32) -> i32 {
     (max_n + max_s - k) / 2
 }
 
 /// The filtrations whose coboundary is read at `(k, u)`: from one below the lowest wanted
 /// filtration, for the coboundary into it, to the highest.
-fn untwisted_filtrations(max_n: i32, max_s: i32, k: i32, u: i32) -> std::ops::RangeInclusive<i32> {
+pub(crate) fn untwisted_filtrations(
+    max_n: i32,
+    max_s: i32,
+    k: i32,
+    u: i32,
+) -> std::ops::RangeInclusive<i32> {
     (2 * u - max_n - 1).max(0)..=max_s - k
 }
 
@@ -718,7 +723,7 @@ pub fn untwisted_plan<CC: FreeChainComplex>(
 
 /// The largest $k$ for which $\delta^a$ at weight $u$ is read, if any: the inverse of
 /// [`untwisted_max_weight`] and [`untwisted_filtrations`].
-fn untwisted_max_length(max_n: i32, max_s: i32, a: i32, u: i32) -> Option<i32> {
+pub(crate) fn untwisted_max_length(max_n: i32, max_s: i32, a: i32, u: i32) -> Option<i32> {
     let k = (max_s - a).min(max_n + max_s - 2 * u);
     (k >= 0 && a >= 2 * u - max_n - 1).then_some(k)
 }
@@ -843,6 +848,25 @@ impl QDown {
         }
     }
 
+    /// Keeps only the monomials in $v_0, \dots, v_n$: the bases for the subcomodule
+    /// $\mathbb{F}_2[v_0, \dots, v_n]$, which $\psi$ preserves.
+    pub(crate) fn restrict_to(mut self, n: usize) -> Self {
+        let max_len = self.prefix.first().map_or(0, |p| p.len() - 1) as u32;
+        for bucket in &mut self.by_degree {
+            bucket.retain(|m| m[n + 1..].iter().all(|&e| e == 0));
+        }
+        self.prefix = self
+            .by_degree
+            .iter()
+            .map(|b| {
+                (0..=max_len)
+                    .map(|j| b.partition_point(|m| qmono_len(m) <= j))
+                    .collect()
+            })
+            .collect();
+        self
+    }
+
     /// The dimension of $Q_k^\vee$ in degree `d`, zero outside the truncation.
     pub fn dimension(&self, d: i32, k: u32) -> usize {
         usize::try_from(d)
@@ -852,12 +876,12 @@ impl QDown {
     }
 
     /// The `idx`th basis monomial of degree `d`.
-    fn monomial(&self, d: i32, idx: usize) -> &QMono {
+    pub(crate) fn monomial(&self, d: i32, idx: usize) -> &QMono {
         &self.by_degree[d as usize][idx]
     }
 
     /// The index of `m` among the monomials of degree `d`.
-    fn index(&self, d: i32, m: &QMono) -> usize {
+    pub(crate) fn index(&self, d: i32, m: &QMono) -> usize {
         self.by_degree[d as usize]
             .binary_search_by_key(&(qmono_len(m), *m), |x| (qmono_len(x), *x))
             .expect("a term of ψ is in the basis")
