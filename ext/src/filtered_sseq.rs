@@ -53,15 +53,34 @@ fn xor(a: &[u32], b: &[u32]) -> Vec<u32> {
 impl FilteredMap {
     /// The persistence pairs of the sources in `keep`: the differentials of the spectral
     /// sequence, one per pair, with $d_0$ the pairs of gap zero.
-    ///
-    /// Sources are reduced in increasing filtration, each against the earlier ones, and paired
-    /// with the target of highest filtration left in it. Only earlier sources are added, so
-    /// each reduced source stays in its filtration, and the pairing is that of the spectral
-    /// sequence whatever order breaks ties.
     pub fn pairs(&self, keep: impl Fn(usize) -> bool) -> Vec<Pair> {
-        // Targets renumbered so that the highest filtration comes first.
+        self.reduce(keep, false).0
+    }
+
+    /// [`Self::pairs`], and a cocycle for each kept source that pairs with nothing: the sources,
+    /// sorted, whose sum $\delta$ kills, among them that source and otherwise only earlier ones.
+    pub fn pairs_and_cycles(
+        &self,
+        keep: impl Fn(usize) -> bool,
+    ) -> (Vec<Pair>, Vec<(usize, Vec<u32>)>) {
+        self.reduce(keep, true)
+    }
+
+    /// Reduces the sources in `keep` in increasing filtration, each against the earlier ones,
+    /// pairing each with the target of highest filtration left in it, and tracks which sources
+    /// each reduced one sums if `track`.
+    ///
+    /// Only earlier sources are added, so each reduced source stays in its filtration, and the
+    /// pairing is that of the spectral sequence whatever order breaks ties.
+    fn reduce(
+        &self,
+        keep: impl Fn(usize) -> bool,
+        track: bool,
+    ) -> (Vec<Pair>, Vec<(usize, Vec<u32>)>) {
+        // Targets renumbered in the reverse of the order sources are reduced in, so that the
+        // target a source pairs with is the one the next coboundary reduces last.
         let mut order: Vec<u32> = (0..self.target.len() as u32).collect();
-        order.sort_by_key(|&t| (std::cmp::Reverse(self.target[t as usize]), t));
+        order.sort_by_key(|&t| std::cmp::Reverse((self.target[t as usize], t)));
         let mut rank = vec![0u32; order.len()];
         for (new, &old) in order.iter().enumerate() {
             rank[old as usize] = new as u32;
@@ -69,14 +88,21 @@ impl FilteredMap {
         let mut sources: Vec<usize> = (0..self.source.len()).filter(|&s| keep(s)).collect();
         sources.sort_by_key(|&s| (self.source[s], s));
 
-        let mut reduced: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
+        let mut reduced: BTreeMap<u32, (Vec<u32>, Vec<u32>)> = BTreeMap::new();
         let mut pairs = Vec::new();
+        let mut cycles = Vec::new();
         for s in sources {
             let mut col: Vec<u32> = self.columns[s].iter().map(|&t| rank[t as usize]).collect();
             col.sort_unstable();
+            let mut sum = if track { vec![s as u32] } else { Vec::new() };
             while let Some(&low) = col.first() {
                 match reduced.get(&low) {
-                    Some(prev) => col = xor(&col, prev),
+                    Some((prev, prev_sum)) => {
+                        col = xor(&col, prev);
+                        if track {
+                            sum = xor(&sum, prev_sum);
+                        }
+                    }
                     None => break,
                 }
             }
@@ -87,10 +113,12 @@ impl FilteredMap {
                     target,
                     r: self.source[s] - self.target[target],
                 });
-                reduced.insert(low, col);
+                reduced.insert(low, (col, sum));
+            } else if track {
+                cycles.push((s, sum));
             }
         }
-        pairs
+        (pairs, cycles)
     }
 }
 
