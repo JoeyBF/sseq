@@ -140,11 +140,28 @@ where
         self.compute_ring_inner(range, true)
     }
 
+    /// [`compute_ring`](Self::compute_ring) (or, with `save_maps`,
+    /// [`compute_ring_saving_maps`](Self::compute_ring_saving_maps)), calling `on_window` after each
+    /// window of internal degrees as described at [`lin_ring::compute`].
+    pub fn compute_ring_with(
+        &self,
+        range: RingRange,
+        save_maps: bool,
+        on_window: &mut dyn FnMut(&mut Ring<CC>, i32, i32) -> anyhow::Result<()>,
+    ) -> anyhow::Result<()>
+    where
+        CC: Send + Sync + 'static,
+    {
+        let ring = lin_ring::compute(&self.resolution, range, save_maps, on_window)?;
+        *self.ring.lock().unwrap() = Some(ring);
+        Ok(())
+    }
+
     fn compute_ring_inner(&self, range: RingRange, save_maps: bool) -> anyhow::Result<()>
     where
         CC: Send + Sync + 'static,
     {
-        let ring = lin_ring::compute(&self.resolution, range, save_maps)?;
+        let ring = lin_ring::compute(&self.resolution, range, save_maps, &mut |_, _, _| Ok(()))?;
         *self.ring.lock().unwrap() = Some(ring);
         Ok(())
     }
