@@ -17,16 +17,62 @@ use crate::{
 
 /// A cochain of $\mathrm{Hom}(C, Q^{(n)})$ at a fixed weight: the degree and index of the
 /// generator of $C$ it is dual to, and the monomial.
-type Cochain = (i32, u32, QMono);
+pub(crate) type Cochain = (i32, u32, QMono);
 
-/// The complexes $\mathrm{Hom}(C, Q_k^{(n)})$ of one stage, filtered by the exponent of $v_n$.
-struct Stage<'a, CC> {
+/// A layer of $Q$ with the filtration whose spectral sequence builds it from a smaller one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Layer {
+    /// $Q^{(n)} = \mathbb{F}_2[v_0, \dots, v_n]$, filtered by the exponent of $v_n$: from
+    /// $\mathrm{Ext}(Q^{(n-1)})[v_n]$.
+    Adjoin(usize),
+    /// $Q/I_m = \mathbb{F}_2[v_m, v_{m+1}, \dots]$, filtered by the powers of $v_m$, which is
+    /// primitive there: from $\mathrm{Ext}(Q/I_{m+1})[v_m]$.
+    Quotient(usize),
+}
+
+impl Layer {
+    /// Whether `m` is in the basis of the layer.
+    fn contains(self, m: &QMono) -> bool {
+        match self {
+            Self::Adjoin(n) => m[n + 1..].iter().all(|&e| e == 0),
+            Self::Quotient(lo) => m[1..lo.max(1)].iter().all(|&e| e == 0),
+        }
+    }
+
+    /// Whether the cochains on $Q_k$ are those of length exactly $k$.
+    fn exact_length(self) -> bool {
+        matches!(self, Self::Quotient(lo) if lo > 0)
+    }
+
+    /// Whether a monomial of length `len` is a cochain of the layer on $Q_k$: for a quotient
+    /// by $v_0$, only those without $v_0$.
+    fn on_length(self, len: u32, k: u32) -> bool {
+        if self.exact_length() {
+            len == k
+        } else {
+            len <= k
+        }
+    }
+
+    /// The filtration of `m`: increasing, with $\delta$ never raising it. For $Q/I_0$ the power of
+    /// $v_0$ is the length deficit, so the length serves, shifted by a constant.
+    fn filtration(self, m: &QMono) -> i32 {
+        match self {
+            Self::Adjoin(n) => m[n] as i32,
+            Self::Quotient(0) => qmono_len(m) as i32,
+            Self::Quotient(lo) => -(m[lo] as i32),
+        }
+    }
+}
+
+/// The complexes $\mathrm{Hom}(C, Q_k)$ of one [`Layer`].
+pub(crate) struct Stage<'a, CC> {
     /// The backbone.
     res: &'a CC,
-    /// The bases of $Q_k^{(n)}$.
+    /// The bases of the layer.
     q: QDown,
-    /// The stage.
-    n: usize,
+    /// The layer.
+    layer: Layer,
 }
 
 impl<CC> Stage<'_, CC>
@@ -35,7 +81,7 @@ where
 {
     /// The cochains of filtration `a` at weight `u` on $Q_{k_\max}$, in the order of
     /// [`cochain_blocks`].
-    fn cochains(&self, a: i32, u: i32, k_max: u32) -> Vec<Cochain> {
+    pub(crate) fn cochains(&self, a: i32, u: i32, k_max: u32) -> Vec<Cochain> {
         let q_dim = |d: i32| self.q.dimension(d, k_max);
         let (blocks, _) = cochain_blocks(self.res, q_dim, a, u);
         let mut out = Vec::new();
@@ -52,7 +98,7 @@ where
 
     /// The filtered coboundary $\delta^a$ at weight `u` on $Q_{k_\max}$, with its source and
     /// target cochains.
-    fn build(
+    pub(crate) fn build(
         &self,
         a: i32,
         u: i32,
@@ -60,14 +106,14 @@ where
         inverted: &InvertedSlice,
         memo: &ActMemo,
     ) -> (FilteredMap, Vec<Cochain>, Vec<Cochain>) {
-        let (q, n) = (&self.q, self.n);
+        let (q, layer) = (&self.q, self.layer);
         let q_dim = |d: i32| q.dimension(d, k_max);
         let (tgt, _) = cochain_blocks(self.res, q_dim, a + 1, u);
         let sources = self.cochains(a, u, k_max);
         let targets = self.cochains(a + 1, u, k_max);
         let mut map = FilteredMap {
-            source: sources.iter().map(|c| c.2[n] as i32).collect(),
-            target: targets.iter().map(|c| c.2[n] as i32).collect(),
+            source: sources.iter().map(|c| layer.filtration(&c.2)).collect(),
+            target: targets.iter().map(|c| layer.filtration(&c.2)).collect(),
             columns: Vec::with_capacity(sources.len()),
         };
         for (t_i, i, mono) in &sources {
@@ -81,6 +127,12 @@ where
                     let (off, _) = tgt[t_l as usize];
                     let tb = q_dim(u - t_l);
                     for g in gammas.iter() {
+                        // In a quotient, terms outside its basis vanish.
+                        if !layer.on_length(qmono_len(g), qmono_len(mono))
+                            || !q.contains(u - t_l, g)
+                        {
+                            continue;
+                        }
                         col.push((off + l as usize * tb + q.index(u - t_l, g)) as u32);
                     }
                 }
@@ -112,8 +164,8 @@ fn fresh_lengths(k_max: i32, cochains: &[&[Cochain]]) -> Vec<i32> {
         .collect()
 }
 
-/// The stage `n` and its bases, after checking the backbone reaches far enough.
-fn stage<CC>(res: &CC, n: usize, max_n: i32, max_s: i32) -> Stage<'_, CC>
+/// The bases of `layer`, after checking the backbone reaches far enough.
+pub(crate) fn stage<CC>(res: &CC, layer: Layer, max_n: i32, max_s: i32) -> Stage<'_, CC>
 where
     CC: FreeChainComplex<Algebra = MilnorAlgebra> + Sync,
 {
@@ -127,12 +179,12 @@ where
         |j| untwisted_max_weight(max_n, max_s, j as i32),
         Convention::Conjugate,
     )
-    .restrict_to(n);
-    Stage { res, q, n }
+    .restrict(|m| layer.contains(m));
+    Stage { res, q, layer }
 }
 
 /// The differential slice of $P_{a+1}$ that the coboundaries out of filtration `a` read.
-fn slice<CC>(res: &CC, a: i32, max_n: i32, max_s: i32) -> InvertedSlice
+pub(crate) fn slice<CC>(res: &CC, a: i32, max_n: i32, max_s: i32) -> InvertedSlice
 where
     CC: FreeChainComplex<Algebra = MilnorAlgebra>,
 {
@@ -143,18 +195,20 @@ where
     )
 }
 
-/// The spectral sequence of $\mathrm{Hom}(C, Q^{(n)})$, $Q^{(n)} = \mathbb{F}_2[v_0, \dots, v_n]$,
-/// filtered by the exponent of $v_n$, keyed by the degree `(k, u, a)` of the untwisted complex.
+/// The spectral sequence of $\mathrm{Hom}(C, L)$ for the [`Layer`] $L$, keyed by the degree
+/// `(k, u, a)` of the untwisted complex.
 ///
-/// $\psi$ never raises the exponent of $v_n$, so the monomials with exponent at most $j$ span a
-/// subcomodule whose quotients are copies of $Q^{(n-1)}$ shifted by $v_n^j$: $E_1$ is
-/// $\mathrm{Ext}(Q^{(n-1)})[v_n]$ and $E_\infty$ is $\mathrm{Ext}(Q^{(n)})$.
-pub fn vn_bockstein<CC>(res: &CC, n: usize, max_n: i32, max_s: i32) -> Pages<(i32, i32, i32)>
+/// For [`Layer::Adjoin`], $\psi$ never raises the exponent of $v_n$, so the monomials with
+/// exponent at most $j$ span a subcomodule whose quotients are copies of $Q^{(n-1)}$ shifted by
+/// $v_n^j$: $E_1$ is $\mathrm{Ext}(Q^{(n-1)})[v_n]$ and $E_\infty$ is $\mathrm{Ext}(Q^{(n)})$.
+/// For [`Layer::Quotient`], the multiples of $v_m^j$ form a subcomodule with quotients copies of
+/// $Q/I_{m+1}$: $E_1$ is $\mathrm{Ext}(Q/I_{m+1})[v_m]$ and $E_\infty$ is $\mathrm{Ext}(Q/I_m)$.
+pub fn vn_bockstein<CC>(res: &CC, layer: Layer, max_n: i32, max_s: i32) -> Pages<(i32, i32, i32)>
 where
     CC: FreeChainComplex<Algebra = MilnorAlgebra> + Sync,
 {
     let max_u = (max_n + max_s) / 2;
-    let stage = stage(res, n, max_n, max_s);
+    let stage = stage(res, layer, max_n, max_s);
     let mut pages = Pages::default();
     for a in 0..=max_s {
         let jobs: Vec<(i32, i32)> = (0..=max_u)
@@ -173,12 +227,21 @@ where
                 // The reductions for different k are independent.
                 let pairs: BTreeMap<i32, Vec<Pair>> = fresh_lengths(k_max, &[&sources, &targets])
                     .into_maybe_par_iter()
-                    .map(|k| (k, map.pairs(|s| src_len[s] <= k as u32)))
+                    .map(|k| (k, map.pairs(|s| layer.on_length(src_len[s], k as u32))))
                     .collect();
                 (0..=k_max)
                     .map(|k| {
-                        let (_, p) = pairs.range(..=k).next_back().unwrap();
-                        let dim = src_len.iter().filter(|&&l| l <= k as u32).count();
+                        let p = match pairs.get(&k) {
+                            Some(p) => p,
+                            // Without cochains of length k, a layer on exact lengths is empty
+                            // there and any other repeats the last length that has some.
+                            None if layer.exact_length() => &Vec::new(),
+                            None => pairs.range(..=k).next_back().unwrap().1,
+                        };
+                        let dim = src_len
+                            .iter()
+                            .filter(|&&l| layer.on_length(l, k as u32))
+                            .count();
                         (k, u, dim, p.clone())
                     })
                     .collect::<Vec<_>>()
@@ -193,7 +256,11 @@ where
         for u in 0..=untwisted_max_weight(max_n, max_s, k) {
             for a in untwisted_filtrations(max_n, max_s, k, u) {
                 pages.chains.entry((k, u, a)).or_insert_with(|| {
-                    cochain_blocks(res, |d| stage.q.dimension(d, k as u32), a, u).1
+                    stage
+                        .cochains(a, u, k as u32)
+                        .iter()
+                        .filter(|c| layer.on_length(qmono_len(&c.2), k as u32))
+                        .count()
                 });
             }
         }
@@ -231,12 +298,12 @@ pub struct CycleShape {
 /// The reduction adds only sources of filtration at most that of the leading term, so the
 /// cocycle is a leading term plus the zig-zag that the perturbation lemma would build from the
 /// lower filtrations. It is one choice among many and its support is an upper bound.
-pub fn cycle_shapes<CC>(res: &CC, n: usize, max_n: i32, max_s: i32) -> Vec<CycleShape>
+pub fn cycle_shapes<CC>(res: &CC, layer: Layer, max_n: i32, max_s: i32) -> Vec<CycleShape>
 where
     CC: FreeChainComplex<Algebra = MilnorAlgebra> + Sync,
 {
     let max_u = (max_n + max_s) / 2;
-    let stage = stage(res, n, max_n, max_s);
+    let stage = stage(res, layer, max_n, max_s);
     let mut out = Vec::new();
     let mut below: Option<InvertedSlice> = None;
     for a in 0..=max_s {
@@ -264,12 +331,12 @@ where
                     if a + k > max_s {
                         break;
                     }
-                    let keep = |s: usize| len[s] <= k as u32;
+                    let keep = |s: usize| layer.on_length(len[s], k as u32);
                     let (_, cycles) = map.pairs_and_cycles(keep);
                     let killed: rustc_hash::FxHashSet<usize> = lower
                         .as_ref()
                         .map(|(m, src, tgt)| {
-                            m.pairs(|s| qmono_len(&src[s].2) <= k as u32)
+                            m.pairs(|s| layer.on_length(qmono_len(&src[s].2), k as u32))
                                 .iter()
                                 .map(|p| position[&tgt[p.target]])
                                 .collect()
@@ -278,7 +345,7 @@ where
                     let dim = (0..sources.len()).filter(|&s| keep(s)).count();
                     let dim_generators = sources
                         .iter()
-                        .filter(|c| qmono_len(&c.2) <= k as u32)
+                        .filter(|c| layer.on_length(qmono_len(&c.2), k as u32))
                         .map(|c| (c.0, c.1))
                         .collect::<rustc_hash::FxHashSet<_>>()
                         .len();
@@ -358,7 +425,7 @@ mod tests {
         let full = ctau_e2_untwisted_on(&res, max_n, max_s);
         let mut prev_einf = None;
         for n in 0..=5 {
-            let pages = vn_bockstein(&res, n, max_n, max_s);
+            let pages = vn_bockstein(&res, Layer::Adjoin(n), max_n, max_s);
             let e1 = page_dims(&pages, 1, max_n, max_s);
             let einf = page_dims(&pages, i32::MAX, max_n, max_s);
             if let Some(prev) = prev_einf {
@@ -380,5 +447,43 @@ mod tests {
         }
         let full: BTreeMap<_, _> = full.0.into_iter().collect();
         assert_eq!(prev_einf.unwrap(), full);
+    }
+
+    /// The quotient layers, from $Q/I_m$ with $v_m$ beyond the range down to $Q/I_0 = Q$: each
+    /// $E_1$ is the previous $E_\infty$ tensored with $\mathbb{F}_2[v_m]$, and the last $E_\infty$
+    /// is $\mathrm{Ext}_P(Q)$.
+    #[test]
+    fn quotients_converge() {
+        let (max_n, max_s) = (30, 15);
+        let res = crate::nassau::Resolution::new(std::sync::Arc::new(
+            crate::algebraic_novikov::unit_module(),
+        ));
+        res.compute_through_stem(untwisted_backbone_range(max_n, max_s));
+        let full = ctau_e2_untwisted_on(&res, max_n, max_s);
+        let top = 5;
+        let mut prev = page_dims(
+            &vn_bockstein(&res, Layer::Quotient(top + 1), max_n, max_s),
+            i32::MAX,
+            max_n,
+            max_s,
+        );
+        for m in (0..=top).rev() {
+            let pages = vn_bockstein(&res, Layer::Quotient(m), max_n, max_s);
+            let vm = (1 << m) - 1;
+            let mut expect: BTreeMap<(i32, i32, i32), usize> = BTreeMap::new();
+            for (&(stem, s, u), &d) in &prev {
+                for j in 0.. {
+                    let key = (stem + 2 * j * vm, s + j, u + j * vm);
+                    if key.0 > max_n || key.1 > max_s {
+                        break;
+                    }
+                    *expect.entry(key).or_insert(0) += d;
+                }
+            }
+            assert_eq!(page_dims(&pages, 1, max_n, max_s), expect, "E_1 of Q/I_{m}");
+            prev = page_dims(&pages, i32::MAX, max_n, max_s);
+        }
+        let full: BTreeMap<_, _> = full.0.into_iter().collect();
+        assert_eq!(prev, full);
     }
 }

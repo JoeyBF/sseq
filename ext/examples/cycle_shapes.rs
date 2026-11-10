@@ -7,7 +7,7 @@ use std::{io::Write, sync::Arc, time::Instant};
 
 use ext::{
     algebraic_novikov::{unit_module, untwisted_backbone_range},
-    vn_bockstein::cycle_shapes,
+    vn_bockstein::{Layer, cycle_shapes},
 };
 
 fn main() {
@@ -25,7 +25,7 @@ fn main() {
 
     for n in min_stage..=max_stage {
         let start = Instant::now();
-        let shapes = cycle_shapes(&res, n, max_n, max_s);
+        let shapes = cycle_shapes(&res, Layer::Adjoin(n), max_n, max_s);
         let path = out.join(format!("shapes_{n}.csv"));
         let mut f = std::io::BufWriter::new(std::fs::File::create(path).unwrap());
         for c in &shapes {

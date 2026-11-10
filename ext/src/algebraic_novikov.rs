@@ -848,12 +848,12 @@ impl QDown {
         }
     }
 
-    /// Keeps only the monomials in $v_0, \dots, v_n$: the bases for the subcomodule
-    /// $\mathbb{F}_2[v_0, \dots, v_n]$, which $\psi$ preserves.
-    pub(crate) fn restrict_to(mut self, n: usize) -> Self {
+    /// Keeps only the monomials `keep` accepts, which must span a subcomodule or the basis of a
+    /// quotient comodule.
+    pub(crate) fn restrict(mut self, keep: impl Fn(&QMono) -> bool) -> Self {
         let max_len = self.prefix.first().map_or(0, |p| p.len() - 1) as u32;
         for bucket in &mut self.by_degree {
-            bucket.retain(|m| m[n + 1..].iter().all(|&e| e == 0));
+            bucket.retain(&keep);
         }
         self.prefix = self
             .by_degree
@@ -865,6 +865,13 @@ impl QDown {
             })
             .collect();
         self
+    }
+
+    /// Whether `m` is a basis monomial.
+    pub(crate) fn contains(&self, d: i32, m: &QMono) -> bool {
+        self.by_degree[d as usize]
+            .binary_search_by_key(&(qmono_len(m), *m), |x| (qmono_len(x), *x))
+            .is_ok()
     }
 
     /// The dimension of $Q_k^\vee$ in degree `d`, zero outside the truncation.

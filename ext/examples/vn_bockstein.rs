@@ -2,7 +2,7 @@
 //!
 //! Usage: `vn_bockstein <max_n> <max_s> <max_stage> <out_dir>`, with `CTAU_BACKBONE=<dir>` to
 //! load or save the resolution of $\mathbb{F}_2$ and `MIN_STAGE=<n>` to skip the stages below
-//! `n`. For each stage `n` it prints the size of the complex, of $E_1$ and of $E_\infty$ and the
+//! `n`. For each stage `n` it prints the size of the complex and of its largest degree, of $E_1$ and of $E_\infty$ and the
 //! number of $d_r$ for each `r`, and writes `<out_dir>/e1_<n>.csv`, `einf_<n>.csv` and
 //! `d_<n>.csv` as `stem,s,u,dim` (with `r` in front
 //! for the differentials, keyed by their source).
@@ -10,7 +10,7 @@ use std::{collections::BTreeMap, io::Write, sync::Arc, time::Instant};
 
 use ext::{
     algebraic_novikov::{unit_module, untwisted_backbone_range},
-    vn_bockstein::{page_dims, vn_bockstein},
+    vn_bockstein::{Layer, page_dims, vn_bockstein},
 };
 
 /// Writes `rows` as CSV lines to `path`.
@@ -39,18 +39,29 @@ fn main() {
         .unwrap_or(0);
     for n in min_stage..=max_stage {
         let start = Instant::now();
-        let pages = vn_bockstein(&res, n, max_n, max_s);
+        // QUOTIENT=1 runs the quotient layers Q/I_n instead, from the top stage down.
+        let layer = if std::env::var_os("QUOTIENT").is_some() {
+            Layer::Quotient(max_stage - n)
+        } else {
+            Layer::Adjoin(n)
+        };
+        let n = match layer {
+            Layer::Adjoin(n) | Layer::Quotient(n) => n,
+        };
+        let pages = vn_bockstein(&res, layer, max_n, max_s);
         let e1 = page_dims(&pages, 1, max_n, max_s);
         let einf = page_dims(&pages, i32::MAX, max_n, max_s);
         let mut by_r: BTreeMap<i32, usize> = BTreeMap::new();
         let mut d_rows = Vec::new();
         let mut cochains = 0;
+        let mut largest = 0;
         for &(k, u, a) in pages.chains.keys() {
             let stem = 2 * u - a;
             if !(0..=max_n).contains(&stem) || a + k > max_s {
                 continue;
             }
             cochains += pages.chains[&(k, u, a)];
+            largest = largest.max(pages.chains[&(k, u, a)]);
             for (r, c) in pages.differentials((k, u, a)) {
                 if r > 0 {
                     *by_r.entry(r).or_insert(0) += c;
@@ -60,7 +71,7 @@ fn main() {
         }
         let total = |m: &BTreeMap<(i32, i32, i32), usize>| m.values().sum::<usize>();
         println!(
-            "stage {n}: cochains {cochains}, E1 {}, E∞ {}, d_r {:?} ({:?})",
+            "stage {n}: cochains {cochains} (largest degree {largest}), E1 {}, E∞ {}, d_r {:?} ({:?})",
             total(&e1),
             total(&einf),
             by_r,
