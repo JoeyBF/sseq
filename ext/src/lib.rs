@@ -175,6 +175,7 @@ pub mod novikov_lift;
 pub mod resolution;
 pub mod resolution_homomorphism;
 pub mod save;
+pub mod tau_lift;
 pub mod untwisted_module;
 
 pub mod yoneda;
