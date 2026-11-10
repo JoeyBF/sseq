@@ -905,6 +905,11 @@ impl QDown {
         self
     }
 
+    /// The largest degree of a basis monomial.
+    pub(crate) fn max_degree(&self) -> i32 {
+        self.by_degree.len() as i32 - 1
+    }
+
     /// Fills [`Self::positions`] from the bases.
     fn index_positions(&mut self) {
         self.positions = self
@@ -961,37 +966,13 @@ impl QDown {
         true
     }
 
-    /// $\psi(m)$ as the basis $m_\gamma$ paired with each $\xi^R$, keeping only $R$ with every
-    /// exponent at most that of `cap`, memoised in `memo` on every monomial it passes through.
+    /// $\psi(m \cdot v_n^{2^j})$ from $\psi(m)$, as the basis $m_\gamma$ paired with each $\xi^R$,
+    /// keeping only $R$ with every exponent at most that of `cap`. `d` is the degree of $m$.
     ///
-    /// Peels the largest binary chunk $v_n^{2^j}$ off $m$ as [`Self::act_memo`] does, but keeps
-    /// every $R$ at once, so one pass serves every operation that acts on $m$. A term outside
-    /// the truncated basis is dropped as soon as it appears: the factors still to come only
-    /// lengthen it or leave it as it is, so it never comes back.
-    pub(crate) fn psi(&self, m: &QMono, cap: PackedXi, memo: &PsiMemo) -> std::sync::Arc<Psi> {
-        use std::sync::Arc;
-        let degree = |m: &QMono| -> i32 {
-            m.iter()
-                .enumerate()
-                .map(|(i, &e)| e as i32 * ((1 << i) - 1))
-                .sum()
-        };
-        let Some(n) = m.iter().rposition(|&e| e > 0).filter(|&n| n > 0) else {
-            return Arc::new(Psi {
-                keys: vec![0],
-                starts: vec![0, 1],
-                gammas: vec![self.index(0, m) as u32],
-            });
-        };
-        if let Some(hit) = memo.map.get(m) {
-            return Arc::clone(&hit);
-        }
-        let j = 15 - m[n].leading_zeros();
-        let mut rest = *m;
-        rest[n] -= 1 << j;
-        let below = self.psi(&rest, cap, memo);
-        let d_rest = degree(&rest);
-        let d_m = degree(m);
+    /// A term outside the truncated basis is dropped as soon as it appears: the factors still to
+    /// come only lengthen it or leave it as it is, so it never comes back.
+    fn psi_step(&self, below: &Psi, d: i32, n: usize, j: u32, cap: PackedXi) -> Psi {
+        let d_m = d + (1 << j) * ((1 << n) - 1);
         // Every (R, γ) produced; a pair produced twice cancels.
         let mut pairs: Vec<(PackedXi, u32)> = Vec::new();
         for &(s, i) in &self.factors[n] {
@@ -1004,7 +985,7 @@ impl QDown {
                 if !packed_fits(r_new, cap) {
                     continue;
                 }
-                let (d_old, d_new) = (d_rest - xi_degree(r), d_m - xi_degree(r_new));
+                let (d_old, d_new) = (d - xi_degree(r), d_m - xi_degree(r_new));
                 for &g in gammas {
                     let mut gamma = *self.monomial(d_old, g as usize);
                     if i > 0 {
@@ -1016,65 +997,79 @@ impl QDown {
                 }
             }
         }
-        // Only the operations asked for matter once no longer monomial is built on this one.
-        if !memo.ops.is_empty() && !self.extendable(m) {
-            pairs.retain(|(r, _)| memo.ops.contains(r));
-        }
-        pairs.sort_unstable();
-        let mut psi = Psi {
-            keys: Vec::new(),
-            starts: vec![0],
-            gammas: Vec::with_capacity(pairs.len()),
-        };
-        let mut k = 0;
-        while k < pairs.len() {
-            let r = pairs[k].0;
-            let start = psi.gammas.len();
-            while k < pairs.len() && pairs[k].0 == r {
-                let g = pairs[k].1;
-                let mut count = 0;
-                while k < pairs.len() && pairs[k] == (r, g) {
-                    count += 1;
-                    k += 1;
-                }
-                if count % 2 == 1 {
-                    psi.gammas.push(g);
-                }
-            }
-            if psi.gammas.len() > start {
-                psi.keys.push(r);
-                psi.starts.push(psi.gammas.len() as u32);
-            }
-        }
-        let size = psi.gammas.len() + psi.keys.len();
-        let out = Arc::new(psi);
-        use std::sync::atomic::Ordering::Relaxed;
-        if memo.held.fetch_add(size, Relaxed) + size > PSI_MEMO_LIMIT {
-            memo.map.clear();
-            memo.held.store(0, Relaxed);
-        }
-        memo.map.insert(*m, Arc::clone(&out));
-        out
+        Psi::from_pairs(pairs)
     }
 
-    /// Whether [`Self::psi`] can peel a chunk off a basis monomial and leave `m`: whether some
-    /// chunk $v_n^{2^j}$ that it would peel first fits on top of `m` within the largest degree.
-    fn extendable(&self, m: &QMono) -> bool {
-        let degree: i32 = m
+    /// $\psi(m)$ for every basis monomial $m$ of degree $d$ and length at most `wanted[d]`, by
+    /// degree and index, keeping only the $R$ in `ops`; the other entries are empty.
+    ///
+    /// Peeling the largest binary chunk $v_n^{2^j}$ off each monomial makes the monomials a
+    /// tree, and $\psi$ of a child is [`Self::psi_step`] of $\psi$ of its parent. A depth-first
+    /// walk computes each once, holds the whole coaction, below the exponents of `ops`, only
+    /// along the current path, and enters only subtrees holding a wanted monomial.
+    pub(crate) fn psi_table(&self, ops: &FxHashSet<PackedXi>, wanted: &[i32]) -> Vec<Vec<Psi>> {
+        let cap = ops.iter().copied().fold(0, packed_max);
+        // reach[d]: the longest wanted monomial of degree d or more, which is as far as the
+        // monomials of degree d can still lead.
+        let mut reach = vec![-1; self.by_degree.len() + 1];
+        for d in (0..self.by_degree.len()).rev() {
+            reach[d] = reach[d + 1].max(wanted.get(d).copied().unwrap_or(-1));
+        }
+        let table: Vec<Vec<std::sync::OnceLock<Psi>>> = self
+            .by_degree
             .iter()
-            .enumerate()
-            .map(|(i, &e)| e as i32 * ((1 << i) - 1))
-            .sum();
-        let room = self.by_degree.len() as i32 - 1 - degree;
-        let Some(n) = m.iter().rposition(|&e| e > 0).filter(|&n| n > 0) else {
-            return true;
+            .map(|b| (0..b.len()).map(|_| std::sync::OnceLock::new()).collect())
+            .collect();
+        let walk = Walk {
+            q: self,
+            cap,
+            ops,
+            wanted,
+            reach: &reach,
+            table: &table,
         };
-        let j = 15 - m[n].leading_zeros();
-        // The smallest chunk peeled before the top one of m: the next power of the same
-        // variable, or the next variable.
-        let same = (1 << (j + 1)) * ((1 << n) - 1);
-        let next = (1 << (n + 1)) - 1;
-        room >= same.min(next)
+        let root = [0u16; QDOWN_VARS];
+        walk.visit(
+            root,
+            0,
+            Psi::from_pairs(vec![(0, self.index(0, &root) as u32)]),
+        );
+        table
+            .into_iter()
+            .map(|b| {
+                b.into_iter()
+                    .map(|c| c.into_inner().unwrap_or_default())
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// The basis monomials whose largest binary chunk, peeled off, leaves `m` of degree `d`:
+    /// each with its degree and the chunk $v_n^{2^j}$.
+    fn children(&self, m: &QMono, d: i32) -> Vec<(QMono, i32, usize, u32)> {
+        let top = m.iter().rposition(|&e| e > 0).filter(|&n| n > 0);
+        let mut out = Vec::new();
+        for n in top.unwrap_or(1)..QDOWN_VARS {
+            // For the top variable the chunk must exceed every power already there.
+            let first = match top {
+                Some(t) if t == n => 16 - m[n].leading_zeros(),
+                _ => 0,
+            };
+            for j in first..16 {
+                let d_child = d + (1 << j) * ((1 << n) - 1);
+                if d_child as usize >= self.by_degree.len() {
+                    break;
+                }
+                let mut child = *m;
+                child[n] += 1 << j;
+                // Longer and higher still is outside the truncation too.
+                if self.try_index(d_child, &child).is_none() {
+                    break;
+                }
+                out.push((child, d_child, n, j));
+            }
+        }
+        out
     }
 
     /// The index of `m` among the monomials of degree `d`, if it is one.
@@ -1132,8 +1127,48 @@ impl QDown {
     }
 }
 
+/// The state of [`QDown::psi_table`]'s walk down the tree of monomials.
+struct Walk<'a> {
+    /// The bases and coaction.
+    q: &'a QDown,
+    /// Every exponent of every operation in `ops`.
+    cap: PackedXi,
+    /// The operations kept.
+    ops: &'a FxHashSet<PackedXi>,
+    /// The longest wanted monomial in each degree, or -1.
+    wanted: &'a [i32],
+    /// The longest wanted monomial in each degree or above.
+    reach: &'a [i32],
+    /// The coaction on each wanted monomial, by degree and index.
+    table: &'a [Vec<std::sync::OnceLock<Psi>>],
+}
+
+impl Walk<'_> {
+    /// Records `psi`, the coaction on `m` of degree `d`, if `m` is wanted, then visits the
+    /// children of `m` that lead to wanted monomials, in parallel.
+    fn visit(&self, m: QMono, d: i32, psi: Psi) {
+        use maybe_rayon::prelude::*;
+        let children: Vec<_> = self
+            .q
+            .children(&m, d)
+            .into_iter()
+            .filter(|(c, d_c, _, _)| qmono_len(c) as i32 <= self.reach[*d_c as usize])
+            .collect();
+        children
+            .into_maybe_par_iter()
+            .for_each(|(child, d_child, n, j)| {
+                let child_psi = self.q.psi_step(&psi, d, n, j, self.cap);
+                self.visit(child, d_child, child_psi);
+            });
+        if qmono_len(&m) as i32 <= self.wanted.get(d as usize).copied().unwrap_or(-1) {
+            let _ = self.table[d as usize][self.q.index(d, &m)].set(psi.restricted(self.ops));
+        }
+    }
+}
+
 /// $\psi(m)$ for one monomial $m$: for each $\xi^R$, by increasing $R$, the indices of the
 /// $m_\gamma$ paired with it among the monomials of their degree.
+#[derive(Default)]
 pub(crate) struct Psi {
     /// The $R$ that occur.
     keys: Vec<PackedXi>,
@@ -1144,6 +1179,47 @@ pub(crate) struct Psi {
 }
 
 impl Psi {
+    /// The coaction from its (R, index) pairs, a pair occurring twice cancelling.
+    fn from_pairs(mut pairs: Vec<(PackedXi, u32)>) -> Self {
+        pairs.sort_unstable();
+        let mut psi = Self {
+            keys: Vec::new(),
+            starts: vec![0],
+            gammas: Vec::with_capacity(pairs.len()),
+        };
+        let mut k = 0;
+        while k < pairs.len() {
+            let r = pairs[k].0;
+            let start = psi.gammas.len();
+            while k < pairs.len() && pairs[k].0 == r {
+                let g = pairs[k].1;
+                let mut count = 0;
+                while k < pairs.len() && pairs[k] == (r, g) {
+                    count += 1;
+                    k += 1;
+                }
+                if count % 2 == 1 {
+                    psi.gammas.push(g);
+                }
+            }
+            if psi.gammas.len() > start {
+                psi.keys.push(r);
+                psi.starts.push(psi.gammas.len() as u32);
+            }
+        }
+        psi
+    }
+
+    /// The part with $R$ in `ops`.
+    fn restricted(&self, ops: &FxHashSet<PackedXi>) -> Self {
+        Self::from_pairs(
+            self.iter()
+                .filter(|(r, _)| ops.contains(r))
+                .flat_map(|(r, g)| g.iter().map(move |&g| (r, g)))
+                .collect(),
+        )
+    }
+
     /// The indices of the $m_\gamma$ paired with $\xi^R$.
     pub(crate) fn get(&self, r: PackedXi) -> &[u32] {
         match self.keys.binary_search(&r) {
@@ -1167,32 +1243,6 @@ impl Psi {
         })
     }
 }
-
-/// The memo of [`QDown::psi`], with how many indices and keys it holds in all.
-#[derive(Default)]
-pub(crate) struct PsiMemo {
-    /// The coaction on each monomial.
-    map: dashmap::DashMap<QMono, std::sync::Arc<Psi>, rustc_hash::FxBuildHasher>,
-    /// The number of indices and keys in `map`.
-    held: std::sync::atomic::AtomicUsize,
-    /// The operations ever asked for, if known: the coaction on a monomial that is never the
-    /// rest of a longer one keeps only these.
-    ops: FxHashSet<PackedXi>,
-}
-
-impl PsiMemo {
-    /// An empty memo for a caller that asks only for the operations in `ops`.
-    pub(crate) fn for_ops(ops: FxHashSet<PackedXi>) -> Self {
-        Self {
-            ops,
-            ..Default::default()
-        }
-    }
-}
-
-/// The most indices and keys a [`PsiMemo`] holds before it is cleared. Raising it trades memory for
-/// less recomputation.
-const PSI_MEMO_LIMIT: usize = 1 << 30;
 
 /// The memo of [`QDown::act_memo`].
 pub(crate) type ActMemo =

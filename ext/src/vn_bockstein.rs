@@ -9,7 +9,7 @@ use rustc_hash::FxHashMap;
 use crate::{
     algebraic_novikov::{
         Convention, InvertedSlice, PackedXi, QDown, QMono, cochain_blocks, differential_slice,
-        invert_slice, packed_max, qmono_len, untwisted_backbone_range, untwisted_filtrations,
+        invert_slice, qmono_len, untwisted_backbone_range, untwisted_filtrations,
         untwisted_max_length, untwisted_max_weight, xi_degree,
     },
     chain_complex::FreeChainComplex,
@@ -70,11 +70,9 @@ impl Layer {
 pub(crate) struct Stage<'a, CC> {
     /// The backbone.
     res: &'a CC,
-    /// The coaction on each monomial met so far.
-    psi_memo: crate::algebraic_novikov::PsiMemo,
-    /// Every exponent of every operation [`Self::build`] is given: the coaction is kept only
-    /// below it.
-    cap: PackedXi,
+    /// The coaction on each basis monomial, by degree and index, cut down to the operations
+    /// [`Self::build`] is given; filled by [`Self::bound_by`].
+    psi: Vec<Vec<crate::algebraic_novikov::Psi>>,
     /// The bases of the layer.
     q: QDown,
     /// The layer.
@@ -85,15 +83,38 @@ impl<CC> Stage<'_, CC>
 where
     CC: FreeChainComplex<Algebra = MilnorAlgebra> + Sync,
 {
-    /// Bounds the coaction kept by the operations in `slices`, which must include every
-    /// operation [`Self::build`] will be given.
-    pub(crate) fn bound_by(mut self, slices: &[InvertedSlice]) -> Self {
+    /// Tabulates the coaction for [`Self::build`], given every operation it will meet in
+    /// `slices` and the longest monomial it reads at each `(a, u)`, or `None` where it reads
+    /// nothing.
+    pub(crate) fn bound_by(
+        mut self,
+        slices: &[InvertedSlice],
+        max_len: impl Fn(i32, i32) -> Option<u32>,
+    ) -> Self {
         let ops: rustc_hash::FxHashSet<PackedXi> = slices
             .iter()
             .flat_map(|s| s.values().flatten().map(|(r, _)| *r))
             .collect();
-        self.cap = ops.iter().copied().fold(0, packed_max);
-        self.psi_memo = crate::algebraic_novikov::PsiMemo::for_ops(ops);
+        // The longest monomial read in each degree: a block at (a, t) of weight u reads degree
+        // u - t.
+        let max_u = self.q.max_degree();
+        let mut wanted = vec![-1i32; max_u as usize + 1];
+        for a in 0..slices.len() as i32 {
+            for u in 0..=max_u {
+                let Some(k) = max_len(a, u) else { continue };
+                for t in 0..=u {
+                    if self
+                        .res
+                        .number_of_gens_in_bidegree(sseq::coordinates::Bidegree::s_t(a, t))
+                        > 0
+                    {
+                        let w = &mut wanted[(u - t) as usize];
+                        *w = (*w).max(k as i32);
+                    }
+                }
+            }
+        }
+        self.psi = self.q.psi_table(&ops, &wanted);
         self
     }
 
@@ -162,12 +183,11 @@ where
                 })
                 .collect();
             let mut images: Vec<Vec<usize>> = vec![Vec::new(); ops.len()];
-            let (cap, psi_memo) = (self.cap, &self.psi_memo);
             for idx in 0..block {
                 let mono = q.monomial(u - t_i, idx);
                 // P(R) x_i lies in degree t_i + |R|, the degree of every z_l it appears in.
                 let d_out = |r: PackedXi| u - t_i - xi_degree(r);
-                let psi = q.psi(mono, cap, psi_memo);
+                let psi = &self.psi[(u - t_i) as usize][idx];
                 let len = qmono_len(mono);
                 // In a quotient, terms outside its basis vanish.
                 let fill = |image: &mut Vec<usize>, r: PackedXi, gammas: &[u32]| {
@@ -259,8 +279,7 @@ where
     .restrict(|m| layer.contains(m));
     Stage {
         res,
-        psi_memo: Default::default(),
-        cap: PackedXi::MAX,
+        psi: Vec::new(),
         q,
         layer,
     }
@@ -292,7 +311,9 @@ where
 {
     let max_u = (max_n + max_s) / 2;
     let all: Vec<InvertedSlice> = (0..=max_s).map(|a| slice(res, a, max_n, max_s)).collect();
-    let stage = stage(res, layer, max_n, max_s).bound_by(&all);
+    let stage = stage(res, layer, max_n, max_s).bound_by(&all, |a, u| {
+        untwisted_max_length(max_n, max_s, a, u).map(|k| k as u32)
+    });
     let mut pages = Pages::default();
     for a in 0..=max_s {
         let jobs: Vec<(i32, i32)> = (0..=max_u)
@@ -387,7 +408,9 @@ where
 {
     let max_u = (max_n + max_s) / 2;
     let all: Vec<InvertedSlice> = (0..=max_s).map(|a| slice(res, a, max_n, max_s)).collect();
-    let stage = stage(res, layer, max_n, max_s).bound_by(&all);
+    let stage = stage(res, layer, max_n, max_s).bound_by(&all, |a, u| {
+        untwisted_max_length(max_n, max_s, a, u).map(|k| k as u32)
+    });
     let mut out = Vec::new();
     let mut below: Option<&InvertedSlice> = None;
     for a in 0..=max_s {

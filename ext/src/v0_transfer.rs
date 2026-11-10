@@ -151,7 +151,13 @@ where
         .into_maybe_par_iter()
         .map(|a| slice(res, a, max_n, max_s))
         .collect();
-    let stage = stage.bound_by(&slices);
+    // The lengths `weight` builds with: see `k_of` there.
+    let stage = stage.bound_by(&slices, |a, u| {
+        (a >= (2 * u - max_n - 1).max(0))
+            .then(|| (max_s - a).min(max_n + max_s - 2 * u))
+            .filter(|&k| k >= 0)
+            .map(|k| k as u32)
+    });
     let per_u: Vec<BTreeMap<(i32, i32, i32), usize>> = (0..=max_u)
         .into_maybe_par_iter()
         .map(|u| weight(&stage, &slices, u, max_n, max_s))
