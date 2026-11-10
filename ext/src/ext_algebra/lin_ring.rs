@@ -30,7 +30,7 @@ use std::{
     collections::HashMap,
     sync::{
         Arc,
-        atomic::{AtomicI32, Ordering},
+        atomic::{AtomicI32, AtomicU64, Ordering},
     },
     time::Instant,
 };
@@ -116,6 +116,30 @@ impl Monomial {
 struct Staircase<CC: FreeChainComplex> {
     hom: ResolutionHomomorphism<CC, CC>,
     stair: Arc<[AtomicI32]>,
+    /// [`map_name`] of the monomial, for the step log whether or not the map is saved.
+    name: String,
+    /// Steps prepared and their thread time since the last [`Staircase::take_window`].
+    steps: AtomicU64,
+    prepare_ns: AtomicU64,
+}
+
+/// `EXT_STEP_LOG_MIN_MS` (default 1): the shortest map step the step log records individually.
+static STEP_LOG_MIN_NS: std::sync::LazyLock<u64> = std::sync::LazyLock::new(|| {
+    let ms: f64 = std::env::var("EXT_STEP_LOG_MIN_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1.0);
+    (ms * 1e6) as u64
+});
+
+impl<CC: FreeChainComplex> Staircase<CC> {
+    /// The steps prepared and their thread time in seconds since the last call, resetting both.
+    fn take_window(&self) -> (u64, f64) {
+        (
+            self.steps.swap(0, Ordering::Relaxed),
+            self.prepare_ns.swap(0, Ordering::Relaxed) as f64 / 1e9,
+        )
+    }
 }
 
 impl<CC: FreeChainComplex + AugmentedChainComplex> Staircase<CC> {
@@ -134,7 +158,23 @@ where
         if !self.covers(b) {
             return None;
         }
-        self.hom.prepare(b)
+        let start = Instant::now();
+        let req = self.hom.prepare(b)?;
+        let ns = start.elapsed().as_nanos() as u64;
+        self.steps.fetch_add(1, Ordering::Relaxed);
+        self.prepare_ns.fetch_add(ns, Ordering::Relaxed);
+        if ns >= *STEP_LOG_MIN_NS {
+            tracing::info!(
+                target: "ext::lift::steps",
+                kind = "step",
+                map = ?self.name,
+                n = b.n(),
+                s = b.s(),
+                inputs = req.inputs.len(),
+                prepare_ms = ns as f64 / 1e6,
+            );
+        }
+        Some(req)
     }
 
     fn lifts_through(&self, target: &dyn std::any::Any) -> bool {
@@ -570,6 +610,20 @@ where
         if !liftables.is_empty() {
             MultiLift::new(Arc::clone(res), liftables).extend_through_stem(bound)?;
         }
+        for map in &ring.maps {
+            let (steps, prepare_s) = map.take_window();
+            if steps > 0 {
+                tracing::info!(
+                    target: "ext::lift::steps",
+                    kind = "map_window",
+                    map = ?map.name,
+                    t0,
+                    t1,
+                    steps,
+                    prepare_s,
+                );
+            }
+        }
         let lift_s = t_lift.elapsed().as_secs_f64();
 
         let t_decide = Instant::now();
@@ -686,8 +740,9 @@ where
                     let stair = vec![-1i32; (max_s - s + 1) as usize];
                     let mono = &ring.basis[m];
                     let class: Vec<u32> = mono.vec.iter().collect();
+                    let label = map_name(&ring.gens, &mono.factors);
                     let name = if save_maps {
-                        map_name(&ring.gens, &mono.factors)
+                        label.clone()
                     } else {
                         String::new()
                     };
@@ -703,6 +758,9 @@ where
                     cursor.push(0);
                     ring.maps.push(Arc::new(Staircase {
                         hom,
+                        name: label,
+                        steps: AtomicU64::new(0),
+                        prepare_ns: AtomicU64::new(0),
                         stair: stair.into_iter().map(AtomicI32::new).collect(),
                     }));
                 }

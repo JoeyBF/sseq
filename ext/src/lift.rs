@@ -219,6 +219,7 @@ impl<CC: ChainComplex + Sync> MultiLift<CC> {
         let mut inputs: Vec<FpVector> = Vec::new();
         let mut finishers: Vec<(Box<dyn FnOnce(&[FpVector]) + Send + '_>, Range<usize>)> =
             Vec::new();
+        let start = std::time::Instant::now();
 
         // Each `prepare` reads only shared data and returns its own pending state, so the
         // liftables are independent; collecting them in order keeps the batch deterministic.
@@ -233,6 +234,7 @@ impl<CC: ChainComplex + Sync> MultiLift<CC> {
         // Every liftable at output `b` lifts through the same quasi-inverse, so all results have
         // the target's module dimension at `b`.
         let fx_dim = self.target.module(b.s()).dimension(b.t());
+        let prepared = std::time::Instant::now();
         let mut results = vec![FpVector::new(p, fx_dim); inputs.len()];
         if !inputs.is_empty() && !self.target.apply_quasi_inverse(&mut results, b, &inputs) {
             // Drop the finishers unrun: finishing with unlifted (zero) results would record wrong
@@ -243,8 +245,24 @@ impl<CC: ChainComplex + Sync> MultiLift<CC> {
         // Run every finisher, even when a liftable contributed no inputs (a zero-dimensional step):
         // its finish still has to register/extend the step so later reads of that bidegree see it.
         // A no-input finisher receives an empty `results` slice.
+        let solved = std::time::Instant::now();
+        let maps = finishers.len();
         for (finish, range) in finishers {
             finish(&results[range]);
+        }
+        if maps > 0 {
+            let ms = |a: std::time::Instant, z: std::time::Instant| (z - a).as_secs_f64() * 1e3;
+            tracing::info!(
+                target: "ext::lift::steps",
+                kind = "cell",
+                n = b.n(),
+                s = b.s(),
+                maps,
+                inputs = inputs.len(),
+                prepare_ms = ms(start, prepared),
+                solve_ms = ms(prepared, solved),
+                finish_ms = ms(solved, std::time::Instant::now()),
+            );
         }
 
         // `completion` tracks the contiguous frontier of finished degrees per output row (s-value).
