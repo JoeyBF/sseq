@@ -100,6 +100,42 @@ pub(crate) fn conjugates(max: usize) -> Vec<XiPoly> {
     chi
 }
 
+/// `chi[S]` lists the $R$ of degree at most `max_degree` with $\xi^S$ in $\chi(\xi^R)$, so that
+/// $\chi(P(S)) = \sum_{R \in \mathtt{chi}[S]} P(R)$.
+pub(crate) fn chi_table(max_degree: i32) -> FxHashMap<PackedXi, Vec<PackedXi>> {
+    let top = (0..)
+        .take_while(|&i| v_degree(i) <= max_degree)
+        .last()
+        .unwrap_or(0);
+    let chi_xi = conjugates(top);
+    let algebra = MilnorAlgebra::new(fp::prime::TWO, false);
+    algebra.compute_basis(max_degree);
+    let mut chi: FxHashMap<PackedXi, FxHashSet<PackedXi>> = FxHashMap::default();
+    for d in 0..=max_degree {
+        for idx in 0..algebra.dimension(d) {
+            let r: Vec<u32> = algebra
+                .basis_element_from_index(d, idx)
+                .p_part
+                .iter()
+                .collect();
+            let mut poly: XiPoly = std::iter::once(Vec::new()).collect();
+            for (j, &e) in r.iter().enumerate() {
+                for bit in 0..32 {
+                    if e >> bit & 1 == 1 {
+                        poly = poly_mul(&poly, &frobenius(&chi_xi[j + 1], bit));
+                    }
+                }
+            }
+            for m in poly {
+                toggle(chi.entry(pack(&m)).or_default(), pack(&r));
+            }
+        }
+    }
+    chi.into_iter()
+        .map(|(k, v)| (k, v.into_iter().collect()))
+        .collect()
+}
+
 /// $|v_i| = 2^i - 1$ in halved degrees.
 pub fn v_degree(i: usize) -> i32 {
     (1 << i) - 1
@@ -689,7 +725,7 @@ fn untwisted_max_length(max_n: i32, max_s: i32, a: i32, u: i32) -> Option<i32> {
 
 /// A term $P(R) x_i$ of some $d z_l$, packed.
 #[derive(Clone, Copy)]
-struct DifferentialTerm {
+pub(crate) struct DifferentialTerm {
     /// The index of $P(R)$ in its degree.
     op_idx: u32,
     /// The index of $x_i$ in its degree.
@@ -702,7 +738,7 @@ struct DifferentialTerm {
 
 /// The terms of $d z_l$ for every generator $z_l$ of $P_{a+1}$ in degrees up to `max_t`, indexed
 /// by degree then generator.
-fn differential_slice<CC: FreeChainComplex>(
+pub(crate) fn differential_slice<CC: FreeChainComplex>(
     res: &CC,
     a: i32,
     max_t: i32,
@@ -834,7 +870,7 @@ impl QDown {
     /// $\psi(m) = \psi(m / v_n^{2^j})\, \psi(v_n)^{2^j}$, so the products shared by different
     /// monomials and operations are computed once. `memo` is cleared when it passes
     /// `memo_limit` entries, trading recomputation for bounded memory.
-    fn act_memo(
+    pub(crate) fn act_memo(
         &self,
         r: PackedXi,
         m: &QMono,
@@ -875,14 +911,17 @@ impl QDown {
 }
 
 /// The memo of [`QDown::act_memo`].
-type ActMemo = dashmap::DashMap<(PackedXi, QMono), std::sync::Arc<Vec<QMono>>>;
+pub(crate) type ActMemo = dashmap::DashMap<(PackedXi, QMono), std::sync::Arc<Vec<QMono>>>;
 
 /// The terms of each backbone differential landing on a generator $x_i$ of $P_a$, grouped by
 /// operation: `(t_i, i)` maps to `(R, [(t_l, l)])` for each $z_l$ with $P(R) x_i$ in $d z_l$.
-type InvertedSlice = FxHashMap<(i32, u32), Vec<(PackedXi, Vec<(i32, u32)>)>>;
+pub(crate) type InvertedSlice = FxHashMap<(i32, u32), Vec<(PackedXi, Vec<(i32, u32)>)>>;
 
 /// Inverts a [`differential_slice`] of filtration `a`.
-fn invert_slice(algebra: &MilnorAlgebra, slice: &[Vec<Vec<DifferentialTerm>>]) -> InvertedSlice {
+pub(crate) fn invert_slice(
+    algebra: &MilnorAlgebra,
+    slice: &[Vec<Vec<DifferentialTerm>>],
+) -> InvertedSlice {
     let mut ops: FxHashMap<(u16, u32), PackedXi> = FxHashMap::default();
     let mut grouped: FxHashMap<(i32, u32), BTreeMap<PackedXi, Vec<(i32, u32)>>> =
         FxHashMap::default();

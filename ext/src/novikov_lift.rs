@@ -3,7 +3,7 @@
 use std::{collections::BTreeMap, sync::Arc};
 
 use algebra::{
-    Algebra, MilnorAlgebra,
+    MilnorAlgebra,
     milnor_algebra::{MilnorBasisElement, PPart},
     module::{Module, homomorphism::ModuleHomomorphism},
 };
@@ -17,8 +17,8 @@ use sseq::coordinates::Bidegree;
 
 use crate::{
     algebraic_novikov::{
-        PackedXi, QDOWN_VARS, QMono, XI_BITS, XiPoly, conjugates, frobenius, monomials, pack,
-        packed_fits, poly_mul, qmono_len, toggle, unpack, v_degree,
+        PackedXi, QDOWN_VARS, QMono, XI_BITS, chi_table, monomials, pack, packed_fits, qmono_len,
+        toggle, unpack, v_degree,
     },
     bp::BpHopfAlgebroid,
     chain_complex::FreeChainComplex,
@@ -244,35 +244,7 @@ impl BpModI2 {
             delta_first.push(first);
         }
 
-        // χ(ξ^R) for every R of degree at most max_degree.
-        let chi_xi = conjugates(n);
-        let algebra = MilnorAlgebra::new(TWO, false);
-        algebra.compute_basis(max_degree);
-        let mut chi: FxHashMap<PackedXi, FxHashSet<PackedXi>> = FxHashMap::default();
-        for d in 0..=max_degree {
-            for idx in 0..algebra.dimension(d) {
-                let r: Vec<u32> = algebra
-                    .basis_element_from_index(d, idx)
-                    .p_part
-                    .iter()
-                    .collect();
-                let mut poly: XiPoly = std::iter::once(Vec::new()).collect();
-                for (j, &e) in r.iter().enumerate() {
-                    for bit in 0..32 {
-                        if e >> bit & 1 == 1 {
-                            poly = poly_mul(&poly, &frobenius(&chi_xi[j + 1], bit));
-                        }
-                    }
-                }
-                for m in poly {
-                    toggle(chi.entry(pack(&m)).or_default(), pack(&r));
-                }
-            }
-        }
-        let chi = chi
-            .into_iter()
-            .map(|(k, v)| (k, v.into_iter().collect()))
-            .collect();
+        let chi = chi_table(max_degree);
 
         Self {
             max_degree,
@@ -959,6 +931,8 @@ impl Echelon {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use algebra::Algebra;
+
     use crate::chain_complex::ChainComplex;
 
     /// The backbone through weight `max_u` and homological degree `max_s`.
