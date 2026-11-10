@@ -32,7 +32,7 @@ use algebra::AlgebraType;
 use anyhow::Context;
 use ext::{
     chain_complex::{ChainComplex, FreeChainComplex},
-    ext_algebra::{ExtAlgebra, RingRange},
+    ext_algebra::{ExtAlgebra, Ring, RingRange},
     utils::query_module,
 };
 use fp::vector::FpSlice;
@@ -110,21 +110,18 @@ fn main() -> anyhow::Result<()> {
         max_t,
     };
     let ext = ExtAlgebra::new(Arc::clone(&res));
-    let start = std::time::Instant::now();
-    if save_maps {
-        ext.compute_ring_saving_maps(range)?;
-    } else {
-        ext.compute_ring(range)?;
-    }
-    let ring_s = start.elapsed().as_secs_f64();
-    eprintln!("ring through stem {ring_n}, t {max_t} in {ring_s:.1} s");
+    let max_n = res.iter_stem().map(|b| b.n()).max().unwrap_or(0);
 
     let mut all: Vec<Bidegree> = res
         .iter_stem()
         .filter(|&b| res.number_of_gens_in_bidegree(b) > 0)
         .collect();
     all.sort_by_key(|b| (b.n(), b.s()));
-    let in_ring: Vec<Bidegree> = all.iter().copied().filter(|&b| range.contains(b)).collect();
+    // The bidegrees in the ring's range by internal degree, each list in (n, s) order.
+    let mut by_t: std::collections::HashMap<i32, Vec<Bidegree>> = Default::default();
+    for &b in all.iter().filter(|&&b| range.contains(b)) {
+        by_t.entry(b.t()).or_default().push(b);
+    }
 
     let mut w = csv(&dir, "rank.csv", "stem,Adams_filtration,rank")?;
     for &b in &all {
@@ -132,103 +129,194 @@ fn main() -> anyhow::Result<()> {
     }
     w.flush()?;
 
-    // The h_i through the whole range, then the ring's other indecomposables.
-    let mut gens: Vec<(BidegreeGenerator, String)> = vec![];
+    // The h_i and their products need no ring: write them through the whole range first.
+    let mut indec = csv(
+        &dir,
+        "indecomposables.csv",
+        "stem,Adams_filtration,index,name",
+    )?;
+    let mut gen_w = csv(&dir, "generator_products.csv", PRODUCT_HEADER)?;
+    let mut gen_products = 0;
+    let mut n_indec = 0;
     for i in 0.. {
         let b = Bidegree::s_t(1, 1 << i);
         if !res.has_computed_bidegree(b) {
             break;
         }
-        if ext.dimension(b) == 1 {
-            gens.push((BidegreeGenerator::new(b, 0), format!("h_{i}")));
+        if ext.dimension(b) != 1 {
+            continue;
         }
-    }
-    for g in ext.indecomposables().unwrap() {
-        if g.s() != 1 {
-            gens.push((g, String::new()));
-        }
-    }
-    gens.sort_by_key(|(g, _)| (g.n(), g.s(), g.idx()));
-    let mut w = csv(
-        &dir,
-        "indecomposables.csv",
-        "stem,Adams_filtration,index,name",
-    )?;
-    for (g, name) in &gens {
-        writeln!(w, "{},{},{},{name}", g.n(), g.s(), g.idx())?;
-    }
-    w.flush()?;
-
-    let t = std::time::Instant::now();
-    let mut w = csv(&dir, "generator_products.csv", PRODUCT_HEADER)?;
-    let mut gen_products = 0;
-    for (g, _) in &gens {
-        let x = ext.generator(*g);
+        let g = BidegreeGenerator::new(b, 0);
+        writeln!(indec, "{},{},{},h_{i}", g.n(), g.s(), g.idx())?;
+        n_indec += 1;
+        let x = ext.generator(g);
         for &c in &all {
             if let Some(m) = ext.known_multiply_into(&x, c) {
-                gen_products += write_rows(&mut w, *g, c, m.iter(), 0)?;
+                gen_products += write_rows(&mut gen_w, g, c, m.iter(), 0)?;
             }
         }
     }
-    w.flush()?;
-    eprintln!(
-        "generator_products.csv: {gen_products} rows in {:.1} s",
-        t.elapsed().as_secs_f64()
-    );
-
+    indec.flush()?;
+    gen_w.flush()?;
+    let mut full_w = if full {
+        Some(csv(&dir, "products.csv", PRODUCT_HEADER)?)
+    } else {
+        None
+    };
     let mut products = 0;
-    if full {
+
+    let start = std::time::Instant::now();
+    let write_spec = |decided_t: i32,
+                      done: bool,
+                      gens_n: usize,
+                      basis_n: usize,
+                      maps_n: usize,
+                      gen_products: usize,
+                      products: usize|
+     -> anyhow::Result<()> {
+        let mut w = BufWriter::new(File::create(dir.join("SPEC.md"))?);
+        writeln!(
+            w,
+            "# Ext_A(F_2, F_2): ranks and products\n\n\
+             Computed with ext-rs ({}) by W. Lin's method (`ext::ext_algebra::lin_ring`).\n\n\
+             - Status: {} through internal degree t <= {decided_t}, after {:.0} s.\n\
+             - Resolution: stems 0..={max_n}, Adams filtration 0..={max_s}. `rank.csv` covers it \
+             all.\n\
+             - Ring range: stem <= {ring_n}, Adams filtration <= {max_s}, t <= {max_t}; so far \
+             {gens_n} indecomposables, {basis_n} basis monomials, {maps_n} chain maps.\n\
+             - `x_(n, s, i)` is the dual of the i-th generator of the resolution in bidegree (n, \
+             s).\n\
+             - `indecomposables.csv`: the h_i through the whole range, then the others as they are \
+             found. Others are indecomposable modulo products of earlier generators (by t, then \
+             s).\n\
+             - `generator_products.csv`: {gen_products} non-zero products indecomposable x basis \
+             element; h_i over the whole range, the rest over the decided part of the ring range.\n\
+             - `products.csv`: {} non-zero products of pairs of basis elements in the decided part \
+             of the ring range, each unordered pair once.\n\
+             - Rows are grouped by the window of internal degrees in which the product lands. \
+             Products of a pair whose product leaves the range are absent, not zero.",
+            env!("CARGO_PKG_VERSION"),
+            if done {
+                "complete"
+            } else {
+                "in progress, decided"
+            },
+            start.elapsed().as_secs_f64(),
+            if full {
+                products.to_string()
+            } else {
+                "(not written)".to_string()
+            }
+        )?;
+        Ok(())
+    };
+
+    let mut last_t = 0;
+    let mut on_window = |ring: &mut Ring<_>, t0: i32, t1: i32| -> anyhow::Result<()> {
         let t = std::time::Instant::now();
-        let mut w = csv(&dir, "products.csv", PRODUCT_HEADER)?;
-        for (i, &b) in in_ring.iter().enumerate() {
-            // Unordered pairs: c >= b as (n, s); within b itself, y >= x.
-            for &c in &in_ring[i..] {
-                if !range.contains(b + c) || ext.dimension(b + c) == 0 {
-                    continue;
-                }
-                // `block[x][y]` = x_(b, x) · x_(c, y), one ring lookup per pair of bidegrees.
-                let block = ext.with_ring(|r| r.basis_block(b, c)).unwrap();
-                for (x, rows) in block.iter().enumerate() {
-                    let g = BidegreeGenerator::new(b, x);
-                    let first = if c == b { x } else { 0 };
-                    products += write_rows(&mut w, g, c, rows.iter().map(|v| v.as_slice()), first)?;
+        // Indecomposables found in this window (the h_i are already written).
+        for g in ring
+            .gens
+            .iter()
+            .filter(|g| g.s() != 1 && (t0..=t1).contains(&g.t()))
+        {
+            writeln!(indec, "{},{},{},", g.n(), g.s(), g.idx())?;
+            n_indec += 1;
+        }
+        // Products by the other indecomposables landing in this window, one ring lookup per pair
+        // of bidegrees.
+        let mut degrees: Vec<Bidegree> = ring
+            .gens
+            .iter()
+            .filter(|g| g.s() != 1)
+            .map(|g| g.degree())
+            .collect();
+        degrees.dedup();
+        for &b in &degrees {
+            let gens_here: Vec<usize> = ring
+                .gens
+                .iter()
+                .filter(|g| g.degree() == b)
+                .map(|g| g.idx())
+                .collect();
+            for tt in t0..=t1 {
+                for &c in by_t.get(&(tt - b.t())).into_iter().flatten() {
+                    if !ring.range().contains(b + c) || res.number_of_gens_in_bidegree(b + c) == 0 {
+                        continue;
+                    }
+                    let block = ring.basis_block(b, c);
+                    for &x in &gens_here {
+                        let rows = block[x].iter().map(|v| v.as_slice());
+                        gen_products +=
+                            write_rows(&mut gen_w, BidegreeGenerator::new(b, x), c, rows, 0)?;
+                    }
                 }
             }
         }
-        w.flush()?;
-        eprintln!(
-            "products.csv: {products} rows in {:.1} s",
-            t.elapsed().as_secs_f64()
+        if let Some(w) = &mut full_w {
+            // Unordered pairs b <= c as (n, s) whose product lands in this window.
+            for tt in t0..=t1 {
+                for tb in 0..=tt / 2 {
+                    for &b in by_t.get(&tb).into_iter().flatten() {
+                        for &c in by_t.get(&(tt - tb)).into_iter().flatten() {
+                            if (c.n(), c.s()) < (b.n(), b.s())
+                                || !ring.range().contains(b + c)
+                                || res.number_of_gens_in_bidegree(b + c) == 0
+                            {
+                                continue;
+                            }
+                            let block = ring.basis_block(b, c);
+                            for (x, rows) in block.iter().enumerate() {
+                                let first = if c == b { x } else { 0 };
+                                let rows = rows.iter().map(|v| v.as_slice());
+                                products +=
+                                    write_rows(w, BidegreeGenerator::new(b, x), c, rows, first)?;
+                            }
+                        }
+                    }
+                }
+            }
+            w.flush()?;
+        }
+        indec.flush()?;
+        gen_w.flush()?;
+        last_t = t1;
+        write_spec(
+            t1,
+            false,
+            ring.gens.len(),
+            ring.basis.len(),
+            ring.maps(),
+            gen_products,
+            products,
+        )?;
+        tracing::info!(
+            t0,
+            t1,
+            export_s = t.elapsed().as_secs_f64(),
+            gen_products,
+            "ring_export window"
         );
-    }
-
-    let max_n = all.iter().map(|b| b.n()).max().unwrap_or(0);
+        Ok(())
+    };
+    ext.compute_ring_with(range, save_maps, &mut on_window)?;
+    let done = ext.ring_range().is_some_and(|r| r.max_t == max_t);
     let (gens_n, basis_n, maps_n) = ext
         .with_ring(|r| (r.gens.len(), r.basis.len(), r.maps()))
         .unwrap();
-    let mut w = BufWriter::new(File::create(dir.join("SPEC.md"))?);
-    writeln!(
-        w,
-        "# Ext_A(F_2, F_2): ranks and products\n\n\
-         Computed with ext-rs ({}) by W. Lin's method (`ext::ext_algebra::lin_ring`).\n\n\
-         - Resolution: stems 0..={max_n}, Adams filtration 0..={max_s}. `rank.csv` covers it all.\n\
-         - Ring range: stem <= {ring_n}, Adams filtration <= {max_s}, t <= {max_t}; {gens_n} \
-         indecomposables, {basis_n} basis monomials, {maps_n} chain maps, {ring_s:.0} s.\n\
-         - `x_(n, s, i)` is the dual of the i-th generator of the resolution in bidegree (n, s).\n\
-         - `indecomposables.csv`: the h_i through the whole range, the others through the ring \
-         range. Others are indecomposable modulo products of earlier generators (by t, then s).\n\
-         - `generator_products.csv`: {gen_products} non-zero products indecomposable x basis \
-         element; h_i over the whole range, the rest over the ring range.\n\
-         - `products.csv`: {} non-zero products of pairs of basis elements in the ring range, each \
-         unordered pair once.\n\
-         - Products of a pair whose product leaves the range are absent, not zero.",
-        env!("CARGO_PKG_VERSION"),
-        if full {
-            products.to_string()
-        } else {
-            "(not written)".to_string()
-        }
+    write_spec(
+        last_t,
+        done,
+        gens_n,
+        basis_n,
+        maps_n,
+        gen_products,
+        products,
     )?;
-    w.flush()?;
+    eprintln!(
+        "ring through stem {ring_n}, t {last_t} in {:.1} s; {n_indec} indecomposables, \
+         {gen_products} generator products",
+        start.elapsed().as_secs_f64()
+    );
     Ok(())
 }

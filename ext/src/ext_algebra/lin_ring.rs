@@ -447,7 +447,18 @@ where
 /// With `save_maps`, each chain map is named after its monomial ([`map_name`]), so a resolution
 /// with a save store keeps the map's steps under `products/<name>` and a later computation, over
 /// this range or a larger one, reads them back instead of lifting them again.
-pub fn compute<CC>(res: &Arc<CC>, range: RingRange, save_maps: bool) -> anyhow::Result<Ring<CC>>
+///
+/// Each map is lifted only as far as the next window reads it, so the decided degrees advance at
+/// the same pace whatever the range. After each window `on_window(ring, t0, t1)` runs, with every
+/// product landing in internal degrees `t0..=t1` available. If the file named by
+/// `EXT_LIN_RING_STOP` exists after a window, the computation stops there and the ring's range is
+/// cut to the degrees decided.
+pub fn compute<CC>(
+    res: &Arc<CC>,
+    range: RingRange,
+    save_maps: bool,
+    on_window: &mut dyn FnMut(&mut Ring<CC>, i32, i32) -> anyhow::Result<()>,
+) -> anyhow::Result<Ring<CC>>
 where
     CC: FreeChainComplex + AugmentedChainComplex + Send + Sync + 'static,
 {
@@ -508,30 +519,54 @@ where
     });
     ring.cells.insert(Bidegree::s_t(0, 0), (vec![0], vec![one]));
 
-    let mut pending: Vec<usize> = vec![]; // maps created since the last lift
+    // Per map: its monomial, and how many of the generators it reads have been added to its
+    // staircase. The generators are in `(t, s)` order, so those `f_m` must reach by degree `t` are
+    // a prefix of the ones up to `lo(m)`.
+    let mut map_mono: Vec<usize> = vec![];
+    let mut cursor: Vec<usize> = vec![];
+    let stop_file = std::env::var_os("EXT_LIN_RING_STOP").map(std::path::PathBuf::from);
     let t_end = max_t.min(max_n + max_s);
     let mut t0 = 1;
     while t0 <= t_end {
         let t1 = (t0 + WINDOW_T - 1).min(t_end);
-        // Lift every map created in earlier windows over its whole corner.
+        // Extend every map to the generators this window reads: `a_j <= a_lo(m)` with
+        // `|m| + |a_j|` in range and `t <= t1`.
         let t_lift = Instant::now();
         let mut bound = Bidegree::n_s(-1, -1);
         let mut cells = 0;
-        let maps_lifted = pending.len();
-        let liftables: Vec<Arc<dyn Liftable>> = std::mem::take(&mut pending)
-            .into_iter()
-            .map(|i| {
-                let m = &ring.maps[i];
-                for (s, r) in m.stair.iter().enumerate() {
-                    let n = r.load(Ordering::Relaxed);
-                    if n >= 0 {
-                        bound = Bidegree::n_s(bound.n().max(n), bound.s().max(s as i32));
-                        cells += (n + 1) as usize;
+        let mut liftables: Vec<Arc<dyn Liftable>> = vec![];
+        for (i, map) in ring.maps.iter().enumerate() {
+            let mono = &ring.basis[map_mono[i]];
+            let (b, lo) = (mono.b, mono.lo());
+            let mut grew = false;
+            while cursor[i] <= lo && ring.gens[cursor[i]].t() <= t1 - b.t() {
+                let g = ring.gens[cursor[i]];
+                cursor[i] += 1;
+                if h_index(g).is_some() || !in_range(b + g.degree()) {
+                    continue;
+                }
+                // Row s' <= s_g through stem t_g - s', within the target range.
+                for (sp, row) in map.stair.iter().enumerate().take(g.s() as usize + 1) {
+                    let n = (g.t() - sp as i32).min(max_n - b.n());
+                    let old = row.load(Ordering::Relaxed);
+                    if n > old {
+                        row.store(n, Ordering::Relaxed);
+                        cells += (n - old.max(-1)) as usize;
+                        grew = true;
                     }
                 }
-                Arc::clone(m) as Arc<dyn Liftable>
-            })
-            .collect();
+            }
+            if grew {
+                for (sp, r) in map.stair.iter().enumerate() {
+                    let n = r.load(Ordering::Relaxed);
+                    if n >= 0 {
+                        bound = Bidegree::n_s(bound.n().max(n), bound.s().max(sp as i32));
+                    }
+                }
+                liftables.push(Arc::clone(map) as Arc<dyn Liftable>);
+            }
+        }
+        let maps_lifted = liftables.len();
         if !liftables.is_empty() {
             MultiLift::new(Arc::clone(res), liftables).extend_through_stem(bound)?;
         }
@@ -638,21 +673,17 @@ where
                 // New monomials whose corner holds a generator off the h_i line get a chain map.
                 for &m in &ids {
                     let lo = ring.basis[m].lo();
-                    let mut stair = vec![-1i32; (max_s - s + 1) as usize];
-                    // Only generators whose product with `m` is in range are ever read off `f_m`.
-                    for g in ring.gens[..=lo]
-                        .iter()
-                        .filter(|g| h_index(**g).is_none() && in_range(b + g.degree()))
-                    {
-                        // Row s' <= s_g through stem t_g - s', within the target range.
-                        for (sp, row) in stair.iter_mut().enumerate().take(g.s() as usize + 1) {
-                            let n = (g.t() - sp as i32).min(max_n - b.n());
-                            *row = (*row).max(n);
-                        }
-                    }
-                    if stair.iter().all(|&n| n < 0) {
+                    // A map exists if some generator it would be read at (off the h_i line, product
+                    // in range) gives it a non-empty corner; it starts empty and grows per window.
+                    let reads_any = ring.gens[..=lo].iter().any(|&g| {
+                        h_index(g).is_none()
+                            && in_range(b + g.degree())
+                            && (0..=g.s()).any(|sp| (g.t() - sp).min(max_n - b.n()) >= 0)
+                    });
+                    if !reads_any {
                         continue;
                     }
+                    let stair = vec![-1i32; (max_s - s + 1) as usize];
                     let mono = &ring.basis[m];
                     let class: Vec<u32> = mono.vec.iter().collect();
                     let name = if save_maps {
@@ -668,7 +699,8 @@ where
                         &class,
                     );
                     ring.basis[m].map = Some(ring.maps.len());
-                    pending.push(ring.maps.len());
+                    map_mono.push(m);
+                    cursor.push(0);
                     ring.maps.push(Arc::new(Staircase {
                         hom,
                         stair: stair.into_iter().map(AtomicI32::new).collect(),
@@ -700,6 +732,12 @@ where
             "lin_ring window"
         );
         ring.windows.push(stats);
+        on_window(&mut ring, t0, t1)?;
+        if t1 < t_end && stop_file.as_ref().is_some_and(|f| f.exists()) {
+            tracing::info!(t = t1, "lin_ring stopped by EXT_LIN_RING_STOP");
+            ring.range.max_t = t1;
+            break;
+        }
         t0 = t1 + 1;
     }
     Ok(ring)
