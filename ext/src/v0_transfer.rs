@@ -7,9 +7,7 @@ use maybe_rayon::prelude::*;
 use rustc_hash::FxHashMap;
 
 use crate::{
-    algebraic_novikov::{
-        ActMemo, InvertedSlice, qmono_len, untwisted_filtrations, untwisted_max_weight,
-    },
+    algebraic_novikov::{InvertedSlice, qmono_len, untwisted_filtrations, untwisted_max_weight},
     chain_complex::FreeChainComplex,
     vn_bockstein::{Cochain, Layer, Stage, slice, stage},
 };
@@ -149,6 +147,7 @@ where
         .into_maybe_par_iter()
         .map(|a| slice(res, a, max_n, max_s))
         .collect();
+    let stage = stage.bound_by(&slices);
     let per_u: Vec<BTreeMap<(i32, i32, i32), usize>> = (0..=max_u)
         .into_maybe_par_iter()
         .map(|u| weight(&stage, &slices, u, max_n, max_s))
@@ -172,9 +171,9 @@ where
     if a_lo > max_s {
         return BTreeMap::new();
     }
-    let memo = ActMemo::default();
-    // Lengths j <= max_s - a are all a class of s <= max_s can use.
-    let k_of = |a: i32| (max_s - a).max(0) as u32;
+    // A class of s <= max_s and weight u has length at most max_s - a and, by
+    // `untwisted_max_weight`, at most max_n + max_s - 2u.
+    let k_of = |a: i32| (max_s - a).min(max_n + max_s - 2 * u).max(0) as u32;
 
     // Cochains of each degree by length: (length, index in its slice) of each, and the slices.
     let mut slot: BTreeMap<i32, FxHashMap<Cochain, (u32, usize)>> = BTreeMap::new();
@@ -196,7 +195,7 @@ where
     // δ^a as columns by source slot: (target length, index) of each term, for the targets kept.
     let mut delta: BTreeMap<i32, FxHashMap<(u32, usize), Vec<(u32, usize)>>> = BTreeMap::new();
     for a in a_lo..=max_s {
-        let (map, sources, targets) = stage.build(a, u, k_of(a), &inverted[a as usize], &memo);
+        let (map, sources, targets) = stage.build(a, u, k_of(a), &inverted[a as usize]);
         let mut cols = FxHashMap::default();
         for (s, c) in sources.iter().enumerate() {
             let Some(&src) = slot[&a].get(c) else {
@@ -279,79 +278,122 @@ where
         }
     }
 
-    // δ applied to a vector of slice (a, j): the δ_0 part, and the δ' part by target length.
-    let apply = |a: i32, j: u32, v: &Bits| -> (Bits, BTreeMap<u32, Bits>) {
-        let mut d0 = zeros(dim(a + 1, j));
-        let mut rest: BTreeMap<u32, Bits> = BTreeMap::new();
-        for i in ones(v) {
-            for &(jt, t) in &delta[&a][&(j, i)] {
-                if jt == j {
-                    flip(&mut d0, t);
-                } else {
-                    flip(rest.entry(jt).or_insert_with(|| zeros(dim(a + 1, jt))), t);
-                }
-            }
-        }
-        (d0, rest)
-    };
+    // The columns of δ out of a cochain of slice (a, j), as (target length, index).
+    let column = |a: i32, j: u32, i: usize| -> &[(u32, usize)] { &delta[&a][&(j, i)] };
 
-    // D out of each class of (a, j): its components in the classes of (a + 1, j') for j' < j.
-    // D^a as columns over the classes of degree a + 1, numbered by length then index.
-    let class_offset = |a: i32| -> (BTreeMap<u32, usize>, usize) {
-        let mut off = BTreeMap::new();
-        let mut total = 0;
-        for j in 0..=k_of(a) {
-            off.insert(j, total);
-            total += slices.get(&(a, j)).map_or(0, |s| s.classes.len());
+    // p and h of each basis cochain of each slice (a, j) with a above the lowest degree.
+    let mut ph: FxHashMap<(i32, u32), (Vec<Bits>, Vec<Bits>)> = FxHashMap::default();
+    for (&(a, j), slice) in &slices {
+        if a == a_lo {
+            continue;
         }
-        (off, total)
-    };
+        let below = dim(a - 1, j);
+        let cols = (0..slice.dim)
+            .map(|c| {
+                let mut e = zeros(slice.dim);
+                flip(&mut e, c);
+                let mut dc = zeros(dim(a + 1, j));
+                for &(jt, t) in column(a, j, c) {
+                    if jt == j {
+                        flip(&mut dc, t);
+                    }
+                }
+                slice.p_h(&e, dc, below)
+            })
+            .unzip();
+        ph.insert((a, j), cols);
+    }
+
+    // D^a for all classes of degree a at once: a matrix whose columns are the classes of degree
+    // a, by length then index, carried down the lengths of degree a + 1 from the top.
     let mut out = BTreeMap::new();
     let mut ranks: BTreeMap<(i32, u32), usize> = BTreeMap::new();
     for a in a_lo..=max_s {
-        let (target_off, target_total) = class_offset(a + 1);
+        // Source classes by length then index, and where each length starts.
+        let mut first: BTreeMap<u32, usize> = BTreeMap::new();
+        let mut n_src = 0;
+        for j in 0..=k_of(a) {
+            first.insert(j, n_src);
+            n_src += slices.get(&(a, j)).map_or(0, |s| s.classes.len());
+        }
+        let k_top = k_of(a + 1);
+        // y[jt]: rows are the cochains of (a + 1, jt), each a set of source classes.
+        let mut y: Vec<Vec<Bits>> = (0..=k_top + 1)
+            .map(|jt| vec![zeros(n_src); dim(a + 1, jt)])
+            .collect();
+        // Rows of D by target class: (length, index) to a set of source classes.
+        let mut d_rows: Vec<Bits> = Vec::new();
+        // y = δ'(i x) for every class x.
+        for j in 0..=k_of(a) {
+            let Some(slice) = slices.get(&(a, j)) else {
+                continue;
+            };
+            for (c, x) in slice.classes.iter().enumerate() {
+                let col = first[&j] + c;
+                for i in ones(x) {
+                    for &(jt, t) in column(a, j, i) {
+                        if jt < j {
+                            flip(&mut y[jt as usize][t], col);
+                        }
+                    }
+                }
+            }
+        }
+        // From the top length down: collect p(y), and send δ'(h y) to the lower lengths.
+        for jt in (0..=k_top).rev() {
+            let Some((p_cols, h_cols)) = ph.get(&(a + 1, jt)) else {
+                continue;
+            };
+            let n_cls = slices[&(a + 1, jt)].classes.len();
+            let mut p_rows = vec![zeros(n_src); n_cls];
+            let mut h_rows = vec![zeros(n_src); dim(a, jt)];
+            let rows = std::mem::take(&mut y[jt as usize]);
+            for (c, row) in rows.iter().enumerate() {
+                if low(row).is_none() {
+                    continue;
+                }
+                for t in ones(&p_cols[c]) {
+                    add(&mut p_rows[t], row);
+                }
+                for t in ones(&h_cols[c]) {
+                    add(&mut h_rows[t], row);
+                }
+            }
+            for (i, row) in h_rows.iter().enumerate() {
+                if low(row).is_none() {
+                    continue;
+                }
+                for &(jn, t) in column(a, jt, i) {
+                    if jn < jt {
+                        add(&mut y[jn as usize][t], row);
+                    }
+                }
+            }
+            d_rows.extend(p_rows);
+        }
+        // Columns of D, by source class, over the target classes.
+        let n_tgt = d_rows.len();
+        let mut d_cols = vec![zeros(n_tgt); n_src];
+        for (t, row) in d_rows.iter().enumerate() {
+            for c in ones(row) {
+                flip(&mut d_cols[c], t);
+            }
+        }
+        // Rank of D^a restricted to sources of length at most j, incrementally.
         let mut table: FxHashMap<usize, Bits> = FxHashMap::default();
         let mut rank = 0;
         for j in 0..=k_of(a) {
-            if let Some(slice) = slices.get(&(a, j)) {
-                for x in &slice.classes {
-                    // y = δ'(i x), then repeatedly collect p(y) and continue with δ'(h y).
-                    let mut col: Bits = zeros(target_total);
-                    let (_, mut y) = apply(a, j, x);
-                    while !y.is_empty() {
-                        let mut next: BTreeMap<u32, Bits> = BTreeMap::new();
-                        for (jt, v) in y {
-                            let Some(t) = slices.get(&(a + 1, jt)) else {
-                                continue;
-                            };
-                            let (dv, _) = apply(a + 1, jt, &v);
-                            let (p, h) = t.p_h(&v, dv, dim(a, jt));
-                            for c in ones(&p) {
-                                flip(&mut col, target_off[&jt] + c);
-                            }
-                            if low(&h).is_some() {
-                                let (_, rest) = apply(a, jt, &h);
-                                for (jn, w) in rest {
-                                    add(
-                                        next.entry(jn).or_insert_with(|| zeros(dim(a + 1, jn))),
-                                        &w,
-                                    );
-                                }
-                            }
-                        }
-                        y = next;
+            let end = first.range(j + 1..).next().map_or(n_src, |(_, &e)| e);
+            for mut col in d_cols[first[&j]..end].iter().cloned() {
+                while let Some(l) = low(&col) {
+                    match table.get(&l) {
+                        Some(v) => add(&mut col, v),
+                        None => break,
                     }
-                    // Rank of D^a restricted to sources of length at most j, incrementally.
-                    while let Some(l) = low(&col) {
-                        match table.get(&l) {
-                            Some(v) => add(&mut col, v),
-                            None => break,
-                        }
-                    }
-                    if let Some(l) = low(&col) {
-                        table.insert(l, col);
-                        rank += 1;
-                    }
+                }
+                if let Some(l) = low(&col) {
+                    table.insert(l, col);
+                    rank += 1;
                 }
             }
             ranks.insert((a, j), rank);

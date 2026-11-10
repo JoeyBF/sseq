@@ -4,12 +4,13 @@ use std::collections::BTreeMap;
 
 use algebra::MilnorAlgebra;
 use maybe_rayon::prelude::*;
+use rustc_hash::FxHashMap;
 
 use crate::{
     algebraic_novikov::{
-        ActMemo, Convention, InvertedSlice, QDown, QMono, cochain_blocks, differential_slice,
-        invert_slice, qmono_len, untwisted_backbone_range, untwisted_filtrations,
-        untwisted_max_length, untwisted_max_weight,
+        Convention, InvertedSlice, PackedXi, QDown, QMono, cochain_blocks, differential_slice,
+        invert_slice, packed_max, qmono_len, untwisted_backbone_range, untwisted_filtrations,
+        untwisted_max_length, untwisted_max_weight, xi_degree,
     },
     chain_complex::FreeChainComplex,
     filtered_sseq::{FilteredMap, Pages, Pair},
@@ -69,6 +70,11 @@ impl Layer {
 pub(crate) struct Stage<'a, CC> {
     /// The backbone.
     res: &'a CC,
+    /// The coaction on each monomial met so far.
+    psi_memo: crate::algebraic_novikov::PsiMemo,
+    /// Every exponent of every operation [`Self::build`] is given: the coaction is kept only
+    /// below it.
+    cap: PackedXi,
     /// The bases of the layer.
     q: QDown,
     /// The layer.
@@ -79,6 +85,16 @@ impl<CC> Stage<'_, CC>
 where
     CC: FreeChainComplex<Algebra = MilnorAlgebra> + Sync,
 {
+    /// Bounds the coaction kept by the exponents of the operations in `slices`, which must
+    /// include every operation [`Self::build`] will be given.
+    pub(crate) fn bound_by(mut self, slices: &[InvertedSlice]) -> Self {
+        self.cap = slices
+            .iter()
+            .flat_map(|s| s.values().flatten().map(|(r, _)| *r))
+            .fold(0, packed_max);
+        self
+    }
+
     /// The cochains of filtration `a` at weight `u` on $Q_{k_\max}$, in the order of
     /// [`cochain_blocks`].
     pub(crate) fn cochains(&self, a: i32, u: i32, k_max: u32) -> Vec<Cochain> {
@@ -104,7 +120,6 @@ where
         u: i32,
         k_max: u32,
         inverted: &InvertedSlice,
-        memo: &ActMemo,
     ) -> (FilteredMap, Vec<Cochain>, Vec<Cochain>) {
         let (q, layer) = (&self.q, self.layer);
         let q_dim = |d: i32| q.dimension(d, k_max);
@@ -116,38 +131,83 @@ where
             target: targets.iter().map(|c| layer.filtration(&c.2)).collect(),
             columns: Vec::with_capacity(sources.len()),
         };
-        for (t_i, i, mono) in &sources {
-            let mut col = Vec::new();
-            for (r, targets) in inverted.get(&(*t_i, *i)).into_iter().flatten() {
-                let gammas = q.act_memo(*r, mono, memo, 1 << 24);
-                for &(t_l, l) in targets {
-                    if t_l > u {
-                        continue;
-                    }
-                    let (off, _) = tgt[t_l as usize];
-                    let tb = q_dim(u - t_l);
-                    for g in gammas.iter() {
-                        // In a quotient, terms outside its basis vanish.
-                        if !layer.on_length(qmono_len(g), qmono_len(mono))
-                            || !q.contains(u - t_l, g)
-                        {
+        map.columns = vec![Vec::new(); sources.len()];
+        let (src, _) = cochain_blocks(self.res, q_dim, a, u);
+        for (t_i, &(src_off, gens)) in src.iter().enumerate() {
+            let t_i = t_i as i32;
+            let block = q_dim(u - t_i);
+            if block == 0 || gens == 0 {
+                continue;
+            }
+            // The operations any generator of this degree needs, each acted once per monomial.
+            let mut ops: Vec<PackedXi> = Vec::new();
+            let mut op_index: FxHashMap<PackedXi, usize> = FxHashMap::default();
+            let terms: Vec<Vec<(usize, &[(i32, u32)])>> = (0..gens)
+                .map(|i| {
+                    inverted
+                        .get(&(t_i, i as u32))
+                        .into_iter()
+                        .flatten()
+                        .filter(|(_, targets)| targets.iter().any(|&(t_l, _)| t_l <= u))
+                        .map(|(r, targets)| {
+                            let k = *op_index.entry(*r).or_insert_with(|| {
+                                ops.push(*r);
+                                ops.len() - 1
+                            });
+                            (k, targets.as_slice())
+                        })
+                        .collect()
+                })
+                .collect();
+            let mut images: Vec<Vec<usize>> = vec![Vec::new(); ops.len()];
+            let (cap, psi_memo) = (self.cap, &self.psi_memo);
+            for idx in 0..block {
+                let mono = q.monomial(u - t_i, idx);
+                // P(R) x_i lies in degree t_i + |R|, the degree of every z_l it appears in.
+                let d_out = |r: PackedXi| u - t_i - xi_degree(r);
+                let psi = q.psi(mono, cap, psi_memo);
+                let len = qmono_len(mono);
+                for (k, &r) in ops.iter().enumerate() {
+                    images[k].clear();
+                    let d = d_out(r);
+                    // In a quotient, terms outside its basis vanish.
+                    images[k].extend(
+                        psi.get(r)
+                            .iter()
+                            .map(|&g| g as usize)
+                            .filter(|&g| layer.on_length(qmono_len(q.monomial(d, g)), len)),
+                    );
+                }
+                for (i, gen_terms) in terms.iter().enumerate() {
+                    let mut col = Vec::new();
+                    for &(k, targets) in gen_terms {
+                        if images[k].is_empty() {
                             continue;
                         }
-                        col.push((off + l as usize * tb + q.index(u - t_l, g)) as u32);
+                        for &(t_l, l) in targets {
+                            if t_l > u {
+                                continue;
+                            }
+                            let (off, _) = tgt[t_l as usize];
+                            let tb = q_dim(u - t_l);
+                            col.extend(
+                                images[k].iter().map(|g| (off + l as usize * tb + g) as u32),
+                            );
+                        }
                     }
+                    col.sort_unstable();
+                    // Terms reached twice cancel.
+                    let mut dedup: Vec<u32> = Vec::with_capacity(col.len());
+                    for c in col {
+                        if dedup.last() == Some(&c) {
+                            dedup.pop();
+                        } else {
+                            dedup.push(c);
+                        }
+                    }
+                    map.columns[src_off + i * block + idx] = dedup;
                 }
             }
-            col.sort_unstable();
-            // Terms reached twice cancel.
-            let mut dedup: Vec<u32> = Vec::with_capacity(col.len());
-            for c in col {
-                if dedup.last() == Some(&c) {
-                    dedup.pop();
-                } else {
-                    dedup.push(c);
-                }
-            }
-            map.columns.push(dedup);
         }
         (map, sources, targets)
     }
@@ -180,7 +240,13 @@ where
         Convention::Conjugate,
     )
     .restrict(|m| layer.contains(m));
-    Stage { res, q, layer }
+    Stage {
+        res,
+        psi_memo: Default::default(),
+        cap: PackedXi::MAX,
+        q,
+        layer,
+    }
 }
 
 /// The differential slice of $P_{a+1}$ that the coboundaries out of filtration `a` read.
@@ -208,7 +274,8 @@ where
     CC: FreeChainComplex<Algebra = MilnorAlgebra> + Sync,
 {
     let max_u = (max_n + max_s) / 2;
-    let stage = stage(res, layer, max_n, max_s);
+    let all: Vec<InvertedSlice> = (0..=max_s).map(|a| slice(res, a, max_n, max_s)).collect();
+    let stage = stage(res, layer, max_n, max_s).bound_by(&all);
     let mut pages = Pages::default();
     for a in 0..=max_s {
         let jobs: Vec<(i32, i32)> = (0..=max_u)
@@ -217,12 +284,11 @@ where
         if jobs.is_empty() {
             continue;
         }
-        let inverted = slice(res, a, max_n, max_s);
-        let memo = ActMemo::default();
+        let inverted = &all[a as usize];
         let results: Vec<_> = jobs
             .into_maybe_par_iter()
             .map(|(u, k_max)| {
-                let (map, sources, targets) = stage.build(a, u, k_max as u32, &inverted, &memo);
+                let (map, sources, targets) = stage.build(a, u, k_max as u32, inverted);
                 let src_len: Vec<u32> = sources.iter().map(|c| qmono_len(&c.2)).collect();
                 // The reductions for different k are independent.
                 let pairs: BTreeMap<i32, Vec<Pair>> = fresh_lengths(k_max, &[&sources, &targets])
@@ -303,12 +369,12 @@ where
     CC: FreeChainComplex<Algebra = MilnorAlgebra> + Sync,
 {
     let max_u = (max_n + max_s) / 2;
-    let stage = stage(res, layer, max_n, max_s);
+    let all: Vec<InvertedSlice> = (0..=max_s).map(|a| slice(res, a, max_n, max_s)).collect();
+    let stage = stage(res, layer, max_n, max_s).bound_by(&all);
     let mut out = Vec::new();
-    let mut below: Option<InvertedSlice> = None;
+    let mut below: Option<&InvertedSlice> = None;
     for a in 0..=max_s {
-        let inverted = slice(res, a, max_n, max_s);
-        let memo = ActMemo::default();
+        let inverted = &all[a as usize];
         let jobs: Vec<(i32, i32)> = (0..=max_u)
             .filter_map(|u| untwisted_max_length(max_n, max_s, a, u).map(|k| (u, k)))
             .filter(|&(u, _)| 2 * u - a <= max_n)
@@ -316,11 +382,11 @@ where
         let shapes: Vec<CycleShape> = jobs
             .into_maybe_par_iter()
             .flat_map(|(u, k_max)| {
-                let (map, sources, _) = stage.build(a, u, k_max as u32, &inverted, &memo);
+                let (map, sources, _) = stage.build(a, u, k_max as u32, inverted);
                 // δ^{a-1}, to know which cocycles are coboundaries.
-                let lower = below.as_ref().and_then(|b| {
+                let lower = below.and_then(|b| {
                     let k = untwisted_max_length(max_n, max_s, a - 1, u)?;
-                    let (m, src, tgt) = stage.build(a - 1, u, k as u32, b, &memo);
+                    let (m, src, tgt) = stage.build(a - 1, u, k as u32, b);
                     Some((m, src, tgt))
                 });
                 let position: rustc_hash::FxHashMap<Cochain, usize> =

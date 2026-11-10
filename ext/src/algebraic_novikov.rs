@@ -791,11 +791,30 @@ pub struct QDown {
     prefix: Vec<Vec<usize>>,
     /// `factors[n]` lists the terms $(\xi^S, i)$ of $\psi(v_n) = \sum \xi^S \otimes v_i$.
     factors: Vec<Vec<(PackedXi, usize)>>,
+    /// `reach[n][k]` is the largest exponent of $\xi_{k+1}$ in a term of $\psi(v_n)$.
+    reach: Vec<Vec<u32>>,
 }
 
 /// The length of a monomial.
 pub(crate) fn qmono_len(m: &QMono) -> u32 {
     m.iter().map(|&e| e as u32).sum()
+}
+
+/// The degree of $\xi^R$, halved: $\sum_k r_k (2^k - 1)$.
+pub(crate) fn xi_degree(r: PackedXi) -> i32 {
+    let mask = (1u128 << XI_BITS) - 1;
+    (0..128 / XI_BITS)
+        .map(|k| ((r >> (k * XI_BITS)) & mask) as i32 * ((1 << (k + 1)) - 1))
+        .sum()
+}
+
+/// The exponentwise maximum of `a` and `b`.
+pub(crate) fn packed_max(a: PackedXi, b: PackedXi) -> PackedXi {
+    let mask = (1u128 << XI_BITS) - 1;
+    (0..128 / XI_BITS).fold(0, |out, k| {
+        let shift = k * XI_BITS;
+        out | (((a >> shift) & mask).max((b >> shift) & mask) << shift)
+    })
 }
 
 /// Whether every exponent of `s` is at most that of `r`.
@@ -841,10 +860,23 @@ impl QDown {
             })
             .collect();
         let factors = Coaction::new(max_degree, convention).factors;
+        let reach = factors
+            .iter()
+            .map(|terms| {
+                let mut most = vec![0u32; (128 / XI_BITS) as usize];
+                for &(s, _) in terms {
+                    for (k, e) in unpack(s).into_iter().enumerate() {
+                        most[k] = most[k].max(e);
+                    }
+                }
+                most
+            })
+            .collect();
         Self {
             by_degree,
             prefix,
             factors,
+            reach,
         }
     }
 
@@ -867,13 +899,6 @@ impl QDown {
         self
     }
 
-    /// Whether `m` is a basis monomial.
-    pub(crate) fn contains(&self, d: i32, m: &QMono) -> bool {
-        self.by_degree[d as usize]
-            .binary_search_by_key(&(qmono_len(m), *m), |x| (qmono_len(x), *x))
-            .is_ok()
-    }
-
     /// The dimension of $Q_k^\vee$ in degree `d`, zero outside the truncation.
     pub fn dimension(&self, d: i32, k: u32) -> usize {
         usize::try_from(d)
@@ -892,6 +917,124 @@ impl QDown {
         self.by_degree[d as usize]
             .binary_search_by_key(&(qmono_len(m), *m), |x| (qmono_len(x), *x))
             .expect("a term of ψ is in the basis")
+    }
+
+    /// Whether $\xi^R$ can occur in $\psi(m)$ at all: each exponent of $R$ is at most what the
+    /// factors $\psi(v_n)^{e_n}$ can supply together. Most operations fail this, and it costs
+    /// no memo traffic.
+    pub(crate) fn can_reach(&self, r: PackedXi, m: &QMono) -> bool {
+        let mask = (1u128 << XI_BITS) - 1;
+        let mut r = r;
+        let mut k = 0;
+        while r != 0 {
+            let want = (r & mask) as u32;
+            if want > 0 {
+                let have: u32 = m
+                    .iter()
+                    .enumerate()
+                    .skip(1)
+                    .filter(|(_, e)| **e > 0)
+                    .map(|(n, &e)| e as u32 * self.reach[n][k])
+                    .sum();
+                if have < want {
+                    return false;
+                }
+            }
+            r >>= XI_BITS;
+            k += 1;
+        }
+        true
+    }
+
+    /// $\psi(m)$ as the basis $m_\gamma$ paired with each $\xi^R$, keeping only $R$ with every
+    /// exponent at most that of `cap`, memoised in `memo` on every monomial it passes through.
+    ///
+    /// Peels the largest binary chunk $v_n^{2^j}$ off $m$ as [`Self::act_memo`] does, but keeps
+    /// every $R$ at once, so one pass serves every operation that acts on $m$. A term outside
+    /// the truncated basis is dropped as soon as it appears: the factors still to come only
+    /// lengthen it or leave it as it is, so it never comes back.
+    pub(crate) fn psi(&self, m: &QMono, cap: PackedXi, memo: &PsiMemo) -> std::sync::Arc<Psi> {
+        use std::sync::Arc;
+        let degree = |m: &QMono| -> i32 {
+            m.iter()
+                .enumerate()
+                .map(|(i, &e)| e as i32 * ((1 << i) - 1))
+                .sum()
+        };
+        let Some(n) = m.iter().rposition(|&e| e > 0).filter(|&n| n > 0) else {
+            return Arc::new(Psi {
+                keys: vec![0],
+                starts: vec![0, 1],
+                gammas: vec![self.index(0, m) as u32],
+            });
+        };
+        if let Some(hit) = memo.map.get(m) {
+            return Arc::clone(&hit);
+        }
+        let j = 15 - m[n].leading_zeros();
+        let mut rest = *m;
+        rest[n] -= 1 << j;
+        let below = self.psi(&rest, cap, memo);
+        let d_rest = degree(&rest);
+        let d_m = degree(m);
+        let mut out: FxHashMap<PackedXi, FxHashSet<u32>> = FxHashMap::default();
+        for &(s, i) in &self.factors[n] {
+            let s = s << j;
+            if !packed_fits(s, cap) {
+                continue;
+            }
+            for (r, gammas) in below.iter() {
+                let r_new = r + s;
+                if !packed_fits(r_new, cap) {
+                    continue;
+                }
+                let (d_old, d_new) = (d_rest - xi_degree(r), d_m - xi_degree(r_new));
+                let entry = out.entry(r_new).or_default();
+                for &g in gammas {
+                    let mut gamma = *self.monomial(d_old, g as usize);
+                    if i > 0 {
+                        gamma[i] += 1 << j;
+                    }
+                    if let Some(idx) = self.try_index(d_new, &gamma) {
+                        toggle(entry, idx as u32);
+                    }
+                }
+            }
+        }
+        let mut entries: Vec<(PackedXi, Vec<u32>)> = out
+            .into_iter()
+            .filter(|(_, g)| !g.is_empty())
+            .map(|(r, g)| (r, g.into_iter().collect()))
+            .collect();
+        entries.sort_unstable_by_key(|e| e.0);
+        let mut psi = Psi {
+            keys: Vec::with_capacity(entries.len()),
+            starts: Vec::with_capacity(entries.len() + 1),
+            gammas: Vec::new(),
+        };
+        psi.starts.push(0);
+        for (r, g) in entries {
+            psi.keys.push(r);
+            psi.gammas.extend(g);
+            psi.starts.push(psi.gammas.len() as u32);
+        }
+        let size = psi.gammas.len() + psi.keys.len();
+        let out = Arc::new(psi);
+        use std::sync::atomic::Ordering::Relaxed;
+        if memo.held.fetch_add(size, Relaxed) + size > PSI_MEMO_LIMIT {
+            memo.map.clear();
+            memo.held.store(0, Relaxed);
+        }
+        memo.map.insert(*m, Arc::clone(&out));
+        out
+    }
+
+    /// The index of `m` among the monomials of degree `d`, if it is one.
+    fn try_index(&self, d: i32, m: &QMono) -> Option<usize> {
+        self.by_degree
+            .get(usize::try_from(d).ok()?)?
+            .binary_search_by_key(&(qmono_len(m), *m), |x| (qmono_len(x), *x))
+            .ok()
     }
 
     /// The $m_\gamma$ for which $\xi^R \otimes m_\gamma$ has coefficient 1 in $\psi(m)$, memoised in
@@ -941,8 +1084,53 @@ impl QDown {
     }
 }
 
+/// $\psi(m)$ for one monomial $m$: for each $\xi^R$, by increasing $R$, the indices of the
+/// $m_\gamma$ paired with it among the monomials of their degree.
+pub(crate) struct Psi {
+    /// The $R$ that occur.
+    keys: Vec<PackedXi>,
+    /// Where the indices for each $R$ start in `gammas`, and their end.
+    starts: Vec<u32>,
+    /// The indices, for one $R$ after another.
+    gammas: Vec<u32>,
+}
+
+impl Psi {
+    /// The indices of the $m_\gamma$ paired with $\xi^R$.
+    pub(crate) fn get(&self, r: PackedXi) -> &[u32] {
+        match self.keys.binary_search(&r) {
+            Ok(i) => &self.gammas[self.starts[i] as usize..self.starts[i + 1] as usize],
+            Err(_) => &[],
+        }
+    }
+
+    /// Each $R$ with its indices.
+    fn iter(&self) -> impl Iterator<Item = (PackedXi, &[u32])> {
+        self.keys.iter().enumerate().map(|(i, &r)| {
+            (
+                r,
+                &self.gammas[self.starts[i] as usize..self.starts[i + 1] as usize],
+            )
+        })
+    }
+}
+
+/// The memo of [`QDown::psi`], with how many indices and keys it holds in all.
+#[derive(Default)]
+pub(crate) struct PsiMemo {
+    /// The coaction on each monomial.
+    map: dashmap::DashMap<QMono, std::sync::Arc<Psi>, rustc_hash::FxBuildHasher>,
+    /// The number of indices and keys in `map`.
+    held: std::sync::atomic::AtomicUsize,
+}
+
+/// The most indices and keys a [`PsiMemo`] holds before it is cleared. Raising it trades memory for
+/// less recomputation.
+const PSI_MEMO_LIMIT: usize = 1 << 29;
+
 /// The memo of [`QDown::act_memo`].
-pub(crate) type ActMemo = dashmap::DashMap<(PackedXi, QMono), std::sync::Arc<Vec<QMono>>>;
+pub(crate) type ActMemo =
+    dashmap::DashMap<(PackedXi, QMono), std::sync::Arc<Vec<QMono>>, rustc_hash::FxBuildHasher>;
 
 /// The terms of each backbone differential landing on a generator $x_i$ of $P_a$, grouped by
 /// operation: `(t_i, i)` maps to `(R, [(t_l, l)])` for each $z_l$ with $P(R) x_i$ in $d z_l$.
@@ -1088,6 +1276,9 @@ where
                     let col = position[src_off + i * block + idx];
                     let mono = twisted.monomial(u - t_i, idx);
                     for (r, targets) in terms {
+                        if !twisted.can_reach(*r, mono) {
+                            continue;
+                        }
                         let gammas = twisted.act_memo(*r, mono, memo, options.memo_limit);
                         if gammas.is_empty() {
                             continue;

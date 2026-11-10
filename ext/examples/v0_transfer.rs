@@ -2,7 +2,8 @@
 //! compares with the direct reduction.
 //!
 //! Usage: `v0_transfer <max_n> <max_s> [direct]`, with `CTAU_BACKBONE=<dir>` to load or save the
-//! resolution of $\mathbb{F}_2$. Prints the number of classes and the time of each method.
+//! resolution of $\mathbb{F}_2$ and `CHECK_CSV=<file>` to compare with rows `stem,s,u,dim`.
+//! Prints the number of classes and the time of each method.
 use std::{sync::Arc, time::Instant};
 
 use ext::{
@@ -25,6 +26,23 @@ fn main() {
         ours.values().sum::<usize>(),
         start.elapsed()
     );
+    // CHECK_CSV=<file> compares with rows `stem,s,u,dim` computed before.
+    if let Ok(path) = std::env::var("CHECK_CSV") {
+        let text = std::fs::read_to_string(path).unwrap();
+        let mut theirs = std::collections::BTreeMap::new();
+        for line in text.lines() {
+            let f: Vec<i64> = line.split(',').map(|x| x.trim().parse().unwrap()).collect();
+            let (n, s, u, d) = (f[0] as i32, f[1] as i32, f[2] as i32, f[3] as usize);
+            if n <= max_n && s <= max_s && d > 0 {
+                theirs.insert((n, s, u), d);
+            }
+        }
+        println!(
+            "against the file: {} classes; equal: {}",
+            theirs.values().sum::<usize>(),
+            theirs == ours
+        );
+    }
     if args.get(3).map(String::as_str) == Some("direct") {
         let start = Instant::now();
         let direct: std::collections::BTreeMap<_, _> = ctau_e2_untwisted_on(&res, max_n, max_s)
