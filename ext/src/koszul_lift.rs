@@ -21,6 +21,33 @@ use crate::{
 /// element of $A/\tau$ in the Milnor basis.
 type Elem = FxHashMap<Gen, FpVector>;
 
+/// A coefficient in $A_\mathbb{C}$: by power of $\tau$, an element of one degree of the basis.
+type TauCoef = BTreeMap<u32, FpVector>;
+
+/// An element of the free $A_\mathbb{C}$-module on the generators.
+type TElem = FxHashMap<Gen, TauCoef>;
+
+/// Adds $\tau^e w$ to the coefficient of `g`.
+fn add_tau(e: &mut TElem, g: Gen, pow: u32, w: &FpVector) {
+    let c = e.entry(g).or_default();
+    match c.get_mut(&pow) {
+        Some(v) => {
+            v.add(w, 1);
+            if v.is_zero() {
+                c.remove(&pow);
+            }
+        }
+        None => {
+            if !w.is_zero() {
+                c.insert(pow, w.clone());
+            }
+        }
+    }
+    if c.is_empty() {
+        e.remove(&g);
+    }
+}
+
 /// The halved degree of a monomial in the $v_i$.
 fn qdeg(k: &QMono) -> i32 {
     k.iter()
@@ -565,6 +592,223 @@ impl KoszulLift {
             }
         }
         bad
+    }
+}
+
+impl KoszulLift {
+    /// The differential of the untwisted resolution lifted to all of $A_\mathbb{C}$, by the same
+    /// perturbation to every order: $D_m = h(\sum_{i + j = m} D_i D_j + D_m D_0)$ for $m \geq 2$,
+    /// with every product exact in $A_\mathbb{C}$. Returns, for each generator $g$, the
+    /// generators $g'$ with a constant $\tau^e g'$ in $D g$: the cochain differential
+    /// $\delta = \sum_e \tau^e \delta_e$.
+    pub fn all_orders(&self) -> FxHashMap<Gen, Vec<(Gen, u32)>> {
+        let max_t = *self.gens[0].keys().max().unwrap();
+        let engine = MotivicMilnorAlgebra::new();
+        engine.compute_basis(max_t);
+        // a · b in A_C, the Milnor algebra's order: the engine's is opposite.
+        let mul = |d1: i32, i1: usize, d2: i32, i2: usize| -> Vec<(usize, u32)> {
+            engine
+                .product_indexed(d2, i2, d1, i1)
+                .into_iter()
+                .map(|idx| (idx, engine.tau_exponent(d2, i2, d1, i1, idx)))
+                .collect()
+        };
+        let dim = |d: i32| self.algebra.dimension(d);
+        // c · e, for c a coefficient of degree dc and e of total degree t.
+        let left = |c: &TauCoef, dc: i32, e: &TElem, t: i32| -> TElem {
+            let mut out = TElem::default();
+            for (g, v) in e {
+                let vd = t - gen_degree(g);
+                for (&e1, cv) in c {
+                    for (i1, _) in cv.iter_nonzero() {
+                        for (&e2, w) in v {
+                            for (i2, _) in w.iter_nonzero() {
+                                for (idx, x) in mul(dc, i1, vd, i2) {
+                                    let mut u = FpVector::new(TWO, dim(dc + vd));
+                                    u.set_entry(idx, 1);
+                                    add_tau(&mut out, *g, e1 + e2 + x, &u);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            out
+        };
+        let unit = |d: i32, idx: usize| -> TauCoef {
+            let mut v = FpVector::new(TWO, dim(d));
+            v.set_entry(idx, 1);
+            [(0, v)].into_iter().collect()
+        };
+        let p_of = |r: PackedXi| -> (i32, usize) {
+            let p: Vec<_> = unpack(r).into_iter().map(|x| x as _).collect();
+            let mut e = MilnorBasisElement {
+                q_part: 0,
+                p_part: PPart::from_slice(&p),
+                degree: 0,
+            };
+            self.algebra.compute_degree(&mut e);
+            (e.degree, self.algebra.basis_element_to_index(&e))
+        };
+        let q_of = |i: usize| -> (i32, usize) {
+            let mut e = MilnorBasisElement {
+                q_part: 1 << i,
+                p_part: PPart::from_slice(&[]),
+                degree: 0,
+            };
+            self.algebra.compute_degree(&mut e);
+            (e.degree, self.algebra.basis_element_to_index(&e))
+        };
+        // D_1 on an element of total degree t: each coefficient times P(R') at the target.
+        let apply_d1 = |e: &TElem, t: i32| -> TElem {
+            let mut out = TElem::default();
+            for (g, v) in e {
+                let vd = t - gen_degree(g);
+                for &(r1, g1) in &self.d1[g] {
+                    let (pd, pi) = p_of(r1);
+                    for (&e1, w) in v {
+                        for (i, _) in w.iter_nonzero() {
+                            for (idx, x) in mul(vd, i, pd, pi) {
+                                let mut u = FpVector::new(TWO, dim(vd + pd));
+                                u.set_entry(idx, 1);
+                                add_tau(&mut out, g1, e1 + x, &u);
+                            }
+                        }
+                    }
+                }
+            }
+            out
+        };
+        // The Koszul contraction, power by power of τ.
+        let contract = |e: &TElem, t: i32| -> TElem {
+            let mut out = TElem::default();
+            for (g, c) in e {
+                for (&pow, w) in c {
+                    let single: Elem = [(*g, w.clone())].into_iter().collect();
+                    for (g2, v) in self.contract(&single, t) {
+                        add_tau(&mut out, g2, pow, &v);
+                    }
+                }
+            }
+            out
+        };
+
+        let mut order: Vec<Gen> = self.d1.keys().copied().collect();
+        order.sort_by_key(|g| (g.0, qmono_len(&g.2), *g));
+        let max_a = order.iter().map(|g| g.0).max().unwrap_or(0) as usize;
+        // d[m][g] = D_m(g), for m >= 1.
+        let mut d: Vec<FxHashMap<Gen, TElem>> = vec![FxHashMap::default(); max_a + 1];
+        for &g in &order {
+            let _ = gen_degree(&g);
+            let mut e = TElem::default();
+            for &(r1, g1) in &self.d1[&g] {
+                let (pd, pi) = p_of(r1);
+                for (pow, v) in unit(pd, pi) {
+                    add_tau(&mut e, g1, pow, &v);
+                }
+            }
+            d[1].insert(g, e);
+        }
+        for &g in &order {
+            let t = gen_degree(&g);
+            for m in 2..=g.0 as usize {
+                let mut arg = TElem::default();
+                for i in 1..m {
+                    let inner = &d[m - i][&g];
+                    let term = if i == 1 {
+                        apply_d1(inner, t)
+                    } else {
+                        let mut acc = TElem::default();
+                        for (g2, c) in inner {
+                            let dc = t - gen_degree(g2);
+                            if let Some(dg2) = d[i].get(g2) {
+                                for (g3, v) in left(c, dc, dg2, gen_degree(g2)) {
+                                    for (pow, w) in v {
+                                        add_tau(&mut acc, g3, pow, &w);
+                                    }
+                                }
+                            }
+                        }
+                        acc
+                    };
+                    for (g3, v) in term {
+                        for (pow, w) in v {
+                            add_tau(&mut arg, g3, pow, &w);
+                        }
+                    }
+                }
+                for (i, gi) in lower(&g) {
+                    if let Some(dm) = d[m].get(&gi) {
+                        let (qd, qi) = q_of(i);
+                        for (g3, v) in left(&unit(qd, qi), qd, dm, gen_degree(&gi)) {
+                            for (pow, w) in v {
+                                add_tau(&mut arg, g3, pow, &w);
+                            }
+                        }
+                    }
+                }
+                let dm = contract(&arg, t);
+                d[m].insert(g, dm);
+            }
+        }
+
+        // The constant terms of every D_m.
+        let mut delta: FxHashMap<Gen, Vec<(Gen, u32)>> = FxHashMap::default();
+        for dm in &d {
+            for (g, e) in dm {
+                for (g2, c) in e {
+                    if gen_degree(g2) != gen_degree(g) {
+                        continue;
+                    }
+                    for (&pow, v) in c {
+                        if v.entry(0) == 1 {
+                            delta.entry(*g).or_default().push((*g2, pow));
+                        }
+                    }
+                }
+            }
+        }
+        delta
+    }
+
+    /// $\mathrm{Ext}$ of the cochain complex with differential $\delta$ at $\tau = 1$, by
+    /// (stem, $s$), for $s$ below the top: the classical $\mathrm{Ext}_A$.
+    pub fn classical(
+        &self,
+        delta: &FxHashMap<Gen, Vec<(Gen, u32)>>,
+    ) -> BTreeMap<(i32, i32), usize> {
+        let top = self.gens.len() - 2;
+        let max_t = *self.gens[0].keys().max().unwrap();
+        let mut out = BTreeMap::new();
+        for t in 0..=max_t {
+            let n = |h: usize| self.gens[h][&t].len();
+            let rank = |h: usize| -> usize {
+                // δ: V^h → V^{h+1}, row g2 (in V^h) has entries at the g in V^{h+1}.
+                let index: FxHashMap<Gen, usize> = self.gens[h][&t]
+                    .iter()
+                    .enumerate()
+                    .map(|(i, g)| (*g, i))
+                    .collect();
+                let mut rows = vec![FpVector::new(TWO, n(h + 1)); n(h)];
+                for (j, g) in self.gens[h + 1][&t].iter().enumerate() {
+                    for (g2, _) in delta.get(g).into_iter().flatten() {
+                        if let Some(&i) = index.get(g2) {
+                            rows[i].add_basis_element(j, 1);
+                        }
+                    }
+                }
+                let mut ech = Echelon::default();
+                rows.into_iter().filter(|r| ech.insert(r.clone())).count()
+            };
+            let ranks: Vec<usize> = (0..=top).map(rank).collect();
+            for h in 0..top {
+                let dim = n(h) - ranks[h] - if h > 0 { ranks[h - 1] } else { 0 };
+                if dim > 0 {
+                    out.insert((t - h as i32, h as i32), dim);
+                }
+            }
+        }
+        out
     }
 }
 

@@ -50,8 +50,16 @@ fn main() {
             "δ_0 δ_1 + δ_1 δ_0 fails on {} cochains",
             lift.check_cocycle()
         );
-        for ((n, s, w), (dim, rank)) in lift.pages() {
-            println!("{n},{s},{w},{dim},{rank}");
+        if std::env::var("CLASSICAL").is_ok() {
+            let delta = lift.all_orders();
+            eprintln!("all orders: {:?}", start.elapsed());
+            for ((n, s), d) in lift.classical(&delta) {
+                println!("{n},{s},{d}");
+            }
+        } else {
+            for ((n, s, w), (dim, rank)) in lift.pages() {
+                println!("{n},{s},{w},{dim},{rank}");
+            }
         }
         eprintln!("total {:?}", start.elapsed());
         return;
