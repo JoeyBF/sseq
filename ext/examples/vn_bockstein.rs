@@ -1,9 +1,10 @@
 //! Runs the $v_n$-Bockstein spectral sequences $Q^{(0)} \to Q^{(1)} \to \dots$ and writes each page.
 //!
 //! Usage: `vn_bockstein <max_n> <max_s> <max_stage> <out_dir>`, with `CTAU_BACKBONE=<dir>` to
-//! load or save the resolution of $\mathbb{F}_2$. For each stage `n` it prints the size of the complex, of $E_1$,
-//! the number of $d_r$ for each `r` and the size of $E_\infty$, and writes
-//! `<out_dir>/e1_<n>.csv`, `einf_<n>.csv` and `d_<n>.csv` as `stem,s,u,dim` (with `r` in front
+//! load or save the resolution of $\mathbb{F}_2$ and `MIN_STAGE=<n>` to skip the stages below
+//! `n`. For each stage `n` it prints the size of the complex, of $E_1$ and of $E_\infty$ and the
+//! number of $d_r$ for each `r`, and writes `<out_dir>/e1_<n>.csv`, `einf_<n>.csv` and
+//! `d_<n>.csv` as `stem,s,u,dim` (with `r` in front
 //! for the differentials, keyed by their source).
 use std::{collections::BTreeMap, io::Write, sync::Arc, time::Instant};
 
@@ -32,7 +33,11 @@ fn main() {
     let res = ext::nassau::Resolution::new_with_save(Arc::new(unit_module()), save).unwrap();
     res.compute_through_stem(untwisted_backbone_range(max_n, max_s));
 
-    for n in 0..=max_stage {
+    let min_stage: usize = std::env::var("MIN_STAGE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    for n in min_stage..=max_stage {
         let start = Instant::now();
         let pages = vn_bockstein(&res, n, max_n, max_s);
         let e1 = page_dims(&pages, 1, max_n, max_s);

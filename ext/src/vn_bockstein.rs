@@ -12,7 +12,7 @@ use crate::{
         untwisted_max_length, untwisted_max_weight,
     },
     chain_complex::FreeChainComplex,
-    filtered_sseq::{FilteredMap, Pages},
+    filtered_sseq::{FilteredMap, Pages, Pair},
 };
 
 /// The spectral sequence of $\mathrm{Hom}(C, Q^{(n)})$, $Q^{(n)} = \mathbb{F}_2[v_0, \dots, v_n]$,
@@ -113,12 +113,23 @@ where
         let results: Vec<_> = jobs
             .into_maybe_par_iter()
             .map(|(u, k_max)| {
-                let (map, src_len, _) = build(a, u, k_max as u32, &inverted, &memo);
+                let (map, src_len, tgt_len) = build(a, u, k_max as u32, &inverted, &memo);
+                // The complex for Q_k changes only at the lengths some cochain has, and the
+                // reductions for different k are independent.
+                let lengths: std::collections::BTreeSet<u32> =
+                    src_len.iter().chain(&tgt_len).copied().collect();
+                let fresh: Vec<i32> = (0..=k_max)
+                    .filter(|&k| k == 0 || lengths.contains(&(k as u32)))
+                    .collect();
+                let pairs: BTreeMap<i32, Vec<Pair>> = fresh
+                    .into_maybe_par_iter()
+                    .map(|k| (k, map.pairs(|s| src_len[s] <= k as u32)))
+                    .collect();
                 (0..=k_max)
                     .map(|k| {
-                        let pairs = map.pairs(|s| src_len[s] <= k as u32);
+                        let (_, p) = pairs.range(..=k).next_back().unwrap();
                         let dim = src_len.iter().filter(|&&l| l <= k as u32).count();
-                        (k, u, dim, pairs)
+                        (k, u, dim, p.clone())
                     })
                     .collect::<Vec<_>>()
             })
