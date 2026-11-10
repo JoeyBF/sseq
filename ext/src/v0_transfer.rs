@@ -12,6 +12,10 @@ use crate::{
     vn_bockstein::{Cochain, Layer, Stage, slice, stage},
 };
 
+/// The bits of a packed term of a coboundary that hold the index within its slice; the length
+/// takes the rest.
+const INDEX_BITS: u32 = 24;
+
 /// A vector over $\mathbb{F}_2$ as packed bits.
 type Bits = Vec<u64>;
 
@@ -192,23 +196,34 @@ where
     }
     let dim = |a: i32, j: u32| dims.get(&(a, j)).copied().unwrap_or(0);
 
-    // δ^a as columns by source slot: (target length, index) of each term, for the targets kept.
-    let mut delta: BTreeMap<i32, FxHashMap<(u32, usize), Vec<(u32, usize)>>> = BTreeMap::new();
+    // δ^a as columns, by source length then index: each term as its target length above
+    // `INDEX_BITS` and its index below.
+    let mut delta: BTreeMap<i32, Vec<Vec<Vec<u32>>>> = BTreeMap::new();
     for a in a_lo..=max_s {
         let (map, sources, targets) = stage.build(a, u, k_of(a), &inverted[a as usize]);
-        let mut cols = FxHashMap::default();
+        let mut cols: Vec<Vec<Vec<u32>>> =
+            (0..=k_of(a)).map(|j| vec![Vec::new(); dim(a, j)]).collect();
         for (s, c) in sources.iter().enumerate() {
-            let Some(&src) = slot[&a].get(c) else {
+            let Some(&(j, i)) = slot[&a].get(c) else {
                 continue;
             };
-            let col: Vec<(u32, usize)> = map.columns[s]
+            cols[j as usize][i] = map.columns[s]
                 .iter()
-                .filter_map(|&t| slot[&(a + 1)].get(&targets[t as usize]).copied())
+                .filter_map(|&t| slot[&(a + 1)].get(&targets[t as usize]))
+                .map(|&(jt, t)| {
+                    assert!(t < 1 << INDEX_BITS, "a slice outgrew INDEX_BITS");
+                    jt << INDEX_BITS | t as u32
+                })
                 .collect();
-            cols.insert(src, col);
         }
         delta.insert(a, cols);
     }
+    // The terms of δ out of cochain i of slice (a, j), as (target length, index).
+    let column = |a: i32, j: u32, i: usize| {
+        delta[&a][j as usize][i]
+            .iter()
+            .map(|&p| (p >> INDEX_BITS, (p & ((1 << INDEX_BITS) - 1)) as usize))
+    };
 
     // Reduce each slice of δ_0 and retract it onto its cohomology.
     let mut slices: BTreeMap<(i32, u32), Slice> = BTreeMap::new();
@@ -223,7 +238,7 @@ where
             let mut kernel = Vec::new();
             for i in 0..n {
                 let mut y = zeros(dim(a + 1, j));
-                for &(jt, t) in &delta[&a][&(j, i)] {
+                for (jt, t) in column(a, j, i) {
                     if jt == j {
                         flip(&mut y, t);
                     }
@@ -278,9 +293,6 @@ where
         }
     }
 
-    // The columns of δ out of a cochain of slice (a, j), as (target length, index).
-    let column = |a: i32, j: u32, i: usize| -> &[(u32, usize)] { &delta[&a][&(j, i)] };
-
     // p and h of each basis cochain of each slice (a, j) with a above the lowest degree.
     let mut ph: FxHashMap<(i32, u32), (Vec<Bits>, Vec<Bits>)> = FxHashMap::default();
     for (&(a, j), slice) in &slices {
@@ -293,7 +305,7 @@ where
                 let mut e = zeros(slice.dim);
                 flip(&mut e, c);
                 let mut dc = zeros(dim(a + 1, j));
-                for &(jt, t) in column(a, j, c) {
+                for (jt, t) in column(a, j, c) {
                     if jt == j {
                         flip(&mut dc, t);
                     }
@@ -331,7 +343,7 @@ where
             for (c, x) in slice.classes.iter().enumerate() {
                 let col = first[&j] + c;
                 for i in ones(x) {
-                    for &(jt, t) in column(a, j, i) {
+                    for (jt, t) in column(a, j, i) {
                         if jt < j {
                             flip(&mut y[jt as usize][t], col);
                         }
@@ -363,7 +375,7 @@ where
                 if low(row).is_none() {
                     continue;
                 }
-                for &(jn, t) in column(a, jt, i) {
+                for (jn, t) in column(a, jt, i) {
                     if jn < jt {
                         add(&mut y[jn as usize][t], row);
                     }

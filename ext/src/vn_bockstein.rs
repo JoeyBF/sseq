@@ -85,13 +85,15 @@ impl<CC> Stage<'_, CC>
 where
     CC: FreeChainComplex<Algebra = MilnorAlgebra> + Sync,
 {
-    /// Bounds the coaction kept by the exponents of the operations in `slices`, which must
-    /// include every operation [`Self::build`] will be given.
+    /// Bounds the coaction kept by the operations in `slices`, which must include every
+    /// operation [`Self::build`] will be given.
     pub(crate) fn bound_by(mut self, slices: &[InvertedSlice]) -> Self {
-        self.cap = slices
+        let ops: rustc_hash::FxHashSet<PackedXi> = slices
             .iter()
             .flat_map(|s| s.values().flatten().map(|(r, _)| *r))
-            .fold(0, packed_max);
+            .collect();
+        self.cap = ops.iter().copied().fold(0, packed_max);
+        self.psi_memo = crate::algebraic_novikov::PsiMemo::for_ops(ops);
         self
     }
 
@@ -167,16 +169,31 @@ where
                 let d_out = |r: PackedXi| u - t_i - xi_degree(r);
                 let psi = q.psi(mono, cap, psi_memo);
                 let len = qmono_len(mono);
-                for (k, &r) in ops.iter().enumerate() {
-                    images[k].clear();
+                // In a quotient, terms outside its basis vanish.
+                let fill = |image: &mut Vec<usize>, r: PackedXi, gammas: &[u32]| {
                     let d = d_out(r);
-                    // In a quotient, terms outside its basis vanish.
-                    images[k].extend(
-                        psi.get(r)
+                    image.clear();
+                    image.extend(
+                        gammas
                             .iter()
                             .map(|&g| g as usize)
                             .filter(|&g| layer.on_length(qmono_len(q.monomial(d, g)), len)),
                     );
+                };
+                // Walk whichever is shorter: the operations, or the terms of ψ(m).
+                if psi.len() < ops.len() {
+                    for image in &mut images {
+                        image.clear();
+                    }
+                    for (r, gammas) in psi.iter() {
+                        if let Some(&k) = op_index.get(&r) {
+                            fill(&mut images[k], r, gammas);
+                        }
+                    }
+                } else {
+                    for (k, &r) in ops.iter().enumerate() {
+                        fill(&mut images[k], r, psi.get(r));
+                    }
                 }
                 for (i, gen_terms) in terms.iter().enumerate() {
                     let mut col = Vec::new();
