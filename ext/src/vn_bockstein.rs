@@ -449,6 +449,59 @@ pub struct CycleShape {
     pub dim_generators: usize,
 }
 
+/// One differential of the spectral sequence of a [`Layer`], placed by the degree of its source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Differential {
+    /// The length $k$ of the complex $\mathrm{Hom}(C, L_k)$ it lives on.
+    pub k: i32,
+    /// The weight.
+    pub u: i32,
+    /// The filtration of the backbone; the target is one higher.
+    pub a: i32,
+    /// The filtration of the source in the spectral sequence.
+    pub from: i32,
+    /// The filtration of the target.
+    pub to: i32,
+}
+
+/// Every differential of [`vn_bockstein`] within stem `max_n` and `s <= max_s`, with the
+/// filtrations of its source and target, for locating each end on $E_1$.
+pub fn differentials<CC>(res: &CC, layer: Layer, max_n: i32, max_s: i32) -> Vec<Differential>
+where
+    CC: FreeChainComplex<Algebra = MilnorAlgebra> + Sync,
+{
+    let max_u = (max_n + max_s) / 2;
+    let all: Vec<InvertedSlice> = (0..=max_s).map(|a| slice(res, a, max_n, max_s)).collect();
+    let stage = stage(res, layer, max_n, max_s).bound_by(&all, |a, u| {
+        untwisted_max_length(max_n, max_s, a, u).map(|k| k as u32)
+    });
+    let jobs: Vec<(i32, i32, i32)> = (0..=max_s)
+        .flat_map(|a| {
+            (0..=max_u)
+                .filter_map(move |u| untwisted_max_length(max_n, max_s, a, u).map(|k| (a, u, k)))
+        })
+        .collect();
+    jobs.into_maybe_par_iter()
+        .flat_map(|(a, u, k_max)| {
+            let (map, sources, _) = stage.build(a, u, k_max as u32, &all[a as usize]);
+            let len: Vec<u32> = sources.iter().map(|c| qmono_len(&c.2)).collect();
+            let mut out = Vec::new();
+            for k in 0..=k_max.min(max_s - a) {
+                for p in map.pairs(|s| layer.on_length(len[s], k as u32)) {
+                    out.push(Differential {
+                        k,
+                        u,
+                        a,
+                        from: map.source[p.source],
+                        to: map.target[p.target],
+                    });
+                }
+            }
+            out
+        })
+        .collect()
+}
+
 /// A cocycle for every class of $\mathrm{Ext}(Q^{(n)})$ within stem `max_n` and `s <= max_s`, as
 /// the persistence reduction of [`vn_bockstein`] leaves it, described by [`CycleShape`].
 ///
