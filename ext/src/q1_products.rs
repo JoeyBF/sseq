@@ -62,6 +62,8 @@ pub struct Decomposables {
     pub leibniz_v1: (usize, usize),
     /// Pairs of a class and an $h_i$ on which $d_1(h_i x) = h_i d_1(x)$ holds, and fails.
     pub linear_h: (usize, usize),
+    /// Products $h_i x$ that the classical reading off the differential gets right, and wrong.
+    pub read_off: (usize, usize),
 }
 
 /// The rank of a list of vectors.
@@ -135,9 +137,38 @@ pub fn decomposables(res: Arc<Backbone>, max_n: i32, max_s: i32, h: &[u32]) -> D
         .collect();
 
     // The coaction table covers the operations of the differentials and of the maps alike.
+    // The classical reading of h_i x off the differential: the coefficient of P(2^i) = Sq^{2^i}
+    // in d(z), acting as a scalar. Over F_2 it is the product; over Q/I_1 it is a test.
+    let read_off: Vec<(i32, Vec<InvertedSlice>)> = h_maps
+        .iter()
+        .map(|(t, _)| {
+            let sq = crate::algebraic_novikov::pack(&[*t as u32]);
+            let slices = diff
+                .iter()
+                .map(|d| {
+                    d.iter()
+                        .filter_map(|(k, terms)| {
+                            let kept: Vec<_> = terms
+                                .iter()
+                                .filter(|(r, _)| *r == sq)
+                                .map(|(_, z)| (0, z.clone()))
+                                .collect();
+                            (!kept.is_empty()).then(|| (*k, kept))
+                        })
+                        .collect()
+                })
+                .collect();
+            (*t, slices)
+        })
+        .collect();
     let merged: Vec<InvertedSlice> = (0..=max_s as usize)
         .map(|a| {
             let mut m = diff[a].clone();
+            for (_, slices) in &read_off {
+                for (k, v) in &slices[a] {
+                    m.entry(*k).or_default().extend(v.iter().cloned());
+                }
+            }
             for (_, slices) in &h_maps {
                 for (k, v) in &slices[a] {
                     m.entry(*k).or_default().extend(v.iter().cloned());
@@ -321,10 +352,10 @@ pub fn decomposables(res: Arc<Backbone>, max_n: i32, max_s: i32, h: &[u32]) -> D
             .collect();
         v1_map.insert((u, a, k), images);
     }
-    // Products by h_i: (u, a, k) to (u + 2^i, a + 1, k).
-    let mut h_map: FxHashMap<i32, ClassMap> = FxHashMap::default();
-    for (t, slices) in &h_maps {
-        let map = h_map.entry(*t).or_default();
+    // Products along the maps in `slices` (a lift of h_i, or the read-off): (u, a, k) to
+    // (u + t, a + 1, k).
+    let mut along = |t: i32, slices: &[InvertedSlice]| -> ClassMap {
+        let mut map: ClassMap = FxHashMap::default();
         for u in 0..=max_u - t {
             for a in a_lo(u)..=max_s {
                 let cols = pullback(u, a, &slices[a as usize], (a + 1, u + t));
@@ -356,7 +387,16 @@ pub fn decomposables(res: Arc<Backbone>, max_n: i32, max_s: i32, h: &[u32]) -> D
                 }
             }
         }
-    }
+        map
+    };
+    let h_map: FxHashMap<i32, ClassMap> = h_maps
+        .iter()
+        .map(|(t, slices)| (*t, along(*t, slices)))
+        .collect();
+    let read_off_map: FxHashMap<i32, ClassMap> = read_off
+        .iter()
+        .map(|(t, slices)| (*t, along(*t, slices)))
+        .collect();
     // d_1 of the v_0-Bockstein: the part of the coboundary of Q that lowers the length by one,
     // from (u, a, k) to (u, a + 1, k - 1).
     let q_stage = crate::vn_bockstein::stage(
@@ -475,6 +515,20 @@ pub fn decomposables(res: Arc<Backbone>, max_n: i32, max_s: i32, h: &[u32]) -> D
                     &mut out.linear_h.0
                 } else {
                     &mut out.linear_h.1
+                } += 1;
+            }
+        }
+    }
+
+    // Does the read-off agree with the product, class by class?
+    for (t, map) in &h_map {
+        for (d, images) in map {
+            for (i, x) in images.iter().enumerate() {
+                let y = read_off_map[t].get(d).and_then(|v| v[i].clone());
+                *if same(x.clone(), y) {
+                    &mut out.read_off.0
+                } else {
+                    &mut out.read_off.1
                 } += 1;
             }
         }

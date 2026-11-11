@@ -42,6 +42,10 @@ fn main() {
         "d_1(v_1 x) = h_0 x + v_1 d_1(x): holds {}, fails {}; d_1(h_i x) = h_i d_1(x): holds {}, fails {}",
         d.leibniz_v1.0, d.leibniz_v1.1, d.linear_h.0, d.linear_h.1
     );
+    println!(
+        "h_i x read off the differential (P(2^i) coefficient as a scalar): right {}, wrong {}",
+        d.read_off.0, d.read_off.1
+    );
     let reference = page_dims(
         &vn_bockstein(&*res, Layer::Quotient(1), max_n, max_s),
         i32::MAX,
