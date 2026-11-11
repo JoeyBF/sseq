@@ -174,6 +174,7 @@ pub mod ext_algebra;
 pub mod filtered_sseq;
 pub mod koszul_lift;
 pub mod novikov_lift;
+pub mod q1_products;
 pub mod resolution;
 pub mod resolution_homomorphism;
 pub mod save;

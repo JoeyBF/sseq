@@ -175,11 +175,28 @@ where
         k_max: u32,
         inverted: &InvertedSlice,
     ) -> (FilteredMap, Vec<Cochain>, Vec<Cochain>) {
+        self.build_map(a, u, k_max, inverted, (a + 1, u))
+    }
+
+    /// The pullback along a map of the backbone from filtration `target.0` to `a`, given by
+    /// `inverted` as [`invert_slice`] gives it, from the cochains of filtration `a` at weight `u`
+    /// to those of filtration `target.0` at weight `target.1`. The coboundary is the pullback
+    /// along the differential; a chain map lifting a class of internal degree t gives the
+    /// product with that class, shifting the weight by t.
+    pub(crate) fn build_map(
+        &self,
+        a: i32,
+        u: i32,
+        k_max: u32,
+        inverted: &InvertedSlice,
+        target: (i32, i32),
+    ) -> (FilteredMap, Vec<Cochain>, Vec<Cochain>) {
         let (q, layer) = (&self.q, self.layer);
+        let (a_out, u_out) = target;
         let q_dim = |d: i32| q.dimension(d, k_max);
-        let (tgt, _) = cochain_blocks(self.res, q_dim, a + 1, u);
+        let (tgt, _) = cochain_blocks(self.res, q_dim, a_out, u_out);
         let sources = self.cochains(a, u, k_max);
-        let targets = self.cochains(a + 1, u, k_max);
+        let targets = self.cochains(a_out, u_out, k_max);
         let mut map = FilteredMap {
             source: sources.iter().map(|c| layer.filtration(&c.2)).collect(),
             target: targets.iter().map(|c| layer.filtration(&c.2)).collect(),
@@ -202,7 +219,7 @@ where
                         .get(&(t_i, i as u32))
                         .into_iter()
                         .flatten()
-                        .filter(|(_, targets)| targets.iter().any(|&(t_l, _)| t_l <= u))
+                        .filter(|(_, targets)| targets.iter().any(|&(t_l, _)| t_l <= u_out))
                         .map(|(r, targets)| {
                             let k = *op_index.entry(*r).or_insert_with(|| {
                                 ops.push(*r);
@@ -257,11 +274,11 @@ where
                             continue;
                         }
                         for &(t_l, l) in targets {
-                            if t_l > u {
+                            if t_l > u_out {
                                 continue;
                             }
                             let (off, _) = tgt[t_l as usize];
-                            let tb = q_dim(u - t_l);
+                            let tb = q_dim(u_out - t_l);
                             col.extend(
                                 images[k].iter().map(|g| (off + l as usize * tb + g) as u32),
                             );

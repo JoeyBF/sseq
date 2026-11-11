@@ -17,27 +17,27 @@ use crate::{
 const INDEX_BITS: u32 = 24;
 
 /// A vector over $\mathbb{F}_2$ as packed bits.
-type Bits = Vec<u64>;
+pub(crate) type Bits = Vec<u64>;
 
 /// The zero vector of dimension `n`.
-fn zeros(n: usize) -> Bits {
+pub(crate) fn zeros(n: usize) -> Bits {
     vec![0; n.div_ceil(64)]
 }
 
 /// Flips bit `i`.
-fn flip(v: &mut Bits, i: usize) {
+pub(crate) fn flip(v: &mut Bits, i: usize) {
     v[i / 64] ^= 1 << (i % 64);
 }
 
 /// Adds `b` to `a`.
-fn add(a: &mut Bits, b: &Bits) {
+pub(crate) fn add(a: &mut Bits, b: &Bits) {
     for (x, y) in a.iter_mut().zip(b) {
         *x ^= y;
     }
 }
 
 /// The lowest set bit.
-fn low(v: &Bits) -> Option<usize> {
+pub(crate) fn low(v: &Bits) -> Option<usize> {
     v.iter()
         .enumerate()
         .find(|(_, w)| **w != 0)
@@ -45,7 +45,7 @@ fn low(v: &Bits) -> Option<usize> {
 }
 
 /// The set bits.
-fn ones(v: &Bits) -> impl Iterator<Item = usize> + '_ {
+pub(crate) fn ones(v: &Bits) -> impl Iterator<Item = usize> + '_ {
     v.iter().enumerate().flat_map(|(i, &w)| {
         let mut w = w;
         std::iter::from_fn(move || {

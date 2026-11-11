@@ -773,6 +773,43 @@ pub(crate) fn differential_slice<CC: FreeChainComplex>(
         .collect()
 }
 
+/// The terms $P(R) x_i$ of $f(z_l)$ for a map $f$ from the generators of some free module, of
+/// internal degree `shift`, into $P_a$, indexed by the degree of $z_l$ then $l$: the shape of
+/// [`differential_slice`], for [`invert_slice`].
+///
+/// `gens(t)` is the number of generators $z_l$ in degree `t`, and `image(t, l)` the indices of the
+/// basis elements of $P_a$ in degree `t - shift` that $f(z_l)$ has coefficient 1 on.
+pub(crate) fn map_slice<CC: FreeChainComplex>(
+    res: &CC,
+    a: i32,
+    max_t: i32,
+    shift: i32,
+    gens: impl Fn(i32) -> usize,
+    image: impl Fn(i32, usize) -> Vec<usize>,
+) -> Vec<Vec<Vec<DifferentialTerm>>> {
+    let target = res.module(a);
+    (0..=max_t)
+        .map(|t| {
+            (0..gens(t))
+                .map(|l| {
+                    image(t, l)
+                        .into_iter()
+                        .map(|idx| {
+                            let og = target.index_to_op_gen(t - shift, idx);
+                            DifferentialTerm {
+                                op_idx: og.operation_index as u32,
+                                gen_idx: og.generator_index as u32,
+                                op_deg: og.operation_degree as u16,
+                                gen_deg: og.generator_degree as u16,
+                            }
+                        })
+                        .collect()
+                })
+                .collect()
+        })
+        .collect()
+}
+
 /// The highest $v_i$ a [`QDown`] monomial can hold; its degree bounds the weights it supports.
 pub(crate) const QDOWN_VARS: usize = 11;
 
