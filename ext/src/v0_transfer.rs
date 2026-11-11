@@ -140,8 +140,24 @@ pub fn ext_q_by_v0_transfer<CC>(
 where
     CC: FreeChainComplex<Algebra = MilnorAlgebra> + Sync,
 {
+    ext_q_by_v0_transfer_in_bands(res, max_n, max_s, 1)
+}
+
+/// [`ext_q_by_v0_transfer`] with the weights taken in `bands` bands, one after another.
+///
+/// The coaction table each band needs shrinks with the band (see `Stage::tabulate`), so more bands
+/// trade a walk down the tree of monomials per band for memory.
+pub fn ext_q_by_v0_transfer_in_bands<CC>(
+    res: &CC,
+    max_n: i32,
+    max_s: i32,
+    bands: usize,
+) -> BTreeMap<(i32, i32, i32), usize>
+where
+    CC: FreeChainComplex<Algebra = MilnorAlgebra> + Sync,
+{
     let max_u = (max_n + max_s) / 2;
-    let stage = stage(
+    let mut stage = stage(
         res,
         Layer::Adjoin(crate::algebraic_novikov::QDOWN_VARS - 1),
         max_n,
@@ -152,17 +168,32 @@ where
         .map(|a| slice(res, a, max_n, max_s))
         .collect();
     // The lengths `weight` builds with: see `k_of` there.
-    let stage = stage.bound_by(&slices, |a, u| {
+    let max_len = |a: i32, u: i32| {
         (a >= (2 * u - max_n - 1).max(0))
             .then(|| (max_s - a).min(max_n + max_s - 2 * u))
             .filter(|&k| k >= 0)
             .map(|k| k as u32)
-    });
-    let per_u: Vec<BTreeMap<(i32, i32, i32), usize>> = (0..=max_u)
-        .into_maybe_par_iter()
-        .map(|u| weight(&stage, &slices, u, max_n, max_s))
+    };
+    // Bands of equal width: the table is largest for the middle weights, where the generators
+    // that act carry the most operations, so no fixed skew suits every range.
+    let ends: Vec<i32> = (1..=bands as i32)
+        .map(|i| (max_u + 1) * i / bands as i32 - 1)
         .collect();
-    per_u.into_iter().flatten().collect()
+    let mut out = BTreeMap::new();
+    let mut lo = 0;
+    for hi in ends {
+        if hi < lo {
+            continue;
+        }
+        stage.tabulate(&slices, max_len, lo..=hi);
+        let per_u: Vec<BTreeMap<(i32, i32, i32), usize>> = (lo..=hi)
+            .into_maybe_par_iter()
+            .map(|u| weight(&stage, &slices, u, max_n, max_s))
+            .collect();
+        out.extend(per_u.into_iter().flatten());
+        lo = hi + 1;
+    }
+    out
 }
 
 /// [`ext_q_by_v0_transfer`] at weight `u`.
@@ -460,5 +491,6 @@ mod tests {
             .into_iter()
             .collect();
         assert_eq!(ext_q_by_v0_transfer(&res, max_n, max_s), direct);
+        assert_eq!(ext_q_by_v0_transfer_in_bands(&res, max_n, max_s, 3), direct);
     }
 }

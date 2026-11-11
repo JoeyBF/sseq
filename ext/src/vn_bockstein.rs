@@ -72,7 +72,9 @@ pub(crate) struct Stage<'a, CC> {
     res: &'a CC,
     /// The coaction on each basis monomial, by degree and index, cut down to the operations
     /// [`Self::build`] is given; filled by [`Self::bound_by`].
-    psi: Vec<Vec<crate::algebraic_novikov::Psi>>,
+    psi: Vec<Vec<crate::algebraic_novikov::Psi<u32>>>,
+    /// The number of each operation in the backbone, as `psi` keys them.
+    op_ids: FxHashMap<PackedXi, u32>,
     /// The bases of the layer.
     q: QDown,
     /// The layer.
@@ -91,16 +93,42 @@ where
         slices: &[InvertedSlice],
         max_len: impl Fn(i32, i32) -> Option<u32>,
     ) -> Self {
-        let ops: rustc_hash::FxHashSet<PackedXi> = slices
-            .iter()
-            .flat_map(|s| s.values().flatten().map(|(r, _)| *r))
-            .collect();
-        // The longest monomial read in each degree: a block at (a, t) of weight u reads degree
-        // u - t.
+        let max_u = self.q.max_degree();
+        self.tabulate(slices, max_len, 0..=max_u);
+        self
+    }
+
+    /// [`Self::bound_by`] for the builds at the weights in `weights` only, replacing the table.
+    ///
+    /// A weight u reads degree d only through the generators of degree u - d, so a narrow band of
+    /// weights needs, in each degree, only the operations of a narrow band of generators: the
+    /// table shrinks with the band, at the cost of one walk per band.
+    pub(crate) fn tabulate(
+        &mut self,
+        slices: &[InvertedSlice],
+        max_len: impl Fn(i32, i32) -> Option<u32>,
+        weights: std::ops::RangeInclusive<i32>,
+    ) {
+        self.psi = Vec::new();
+        // Every operation, numbered, and the operations on the generators of each degree.
+        let mut op_ids: FxHashMap<PackedXi, u32> = FxHashMap::default();
+        let mut ops_by_t: FxHashMap<i32, Vec<u32>> = FxHashMap::default();
+        for slice in slices {
+            for (&(t, _), terms) in slice {
+                for (r, _) in terms {
+                    let next = op_ids.len() as u32;
+                    let id = *op_ids.entry(*r).or_insert(next);
+                    ops_by_t.entry(t).or_default().push(id);
+                }
+            }
+        }
+        // The longest monomial read in each degree, and the operations acting on it: a block at
+        // (a, t) of weight u reads degree u - t with the operations on the generators of degree t.
         let max_u = self.q.max_degree();
         let mut wanted = vec![-1i32; max_u as usize + 1];
+        let mut allowed = vec![vec![false; op_ids.len()]; max_u as usize + 1];
         for a in 0..slices.len() as i32 {
-            for u in 0..=max_u {
+            for u in weights.clone() {
                 let Some(k) = max_len(a, u) else { continue };
                 for t in 0..=u {
                     if self
@@ -108,14 +136,17 @@ where
                         .number_of_gens_in_bidegree(sseq::coordinates::Bidegree::s_t(a, t))
                         > 0
                     {
-                        let w = &mut wanted[(u - t) as usize];
-                        *w = (*w).max(k as i32);
+                        let d = (u - t) as usize;
+                        wanted[d] = wanted[d].max(k as i32);
+                        for &id in ops_by_t.get(&t).into_iter().flatten() {
+                            allowed[d][id as usize] = true;
+                        }
                     }
                 }
             }
         }
-        self.psi = self.q.psi_table(&ops, &wanted);
-        self
+        self.psi = self.q.psi_table(&op_ids, &allowed, &wanted);
+        self.op_ids = op_ids;
     }
 
     /// The cochains of filtration `a` at weight `u` on $Q_{k_\max}$, in the order of
@@ -183,6 +214,10 @@ where
                 })
                 .collect();
             let mut images: Vec<Vec<usize>> = vec![Vec::new(); ops.len()];
+            // Each operation's number in the table, and back.
+            let ids: Vec<u32> = ops.iter().map(|r| self.op_ids[r]).collect();
+            let by_id: FxHashMap<u32, usize> =
+                ids.iter().enumerate().map(|(k, &id)| (id, k)).collect();
             for idx in 0..block {
                 let mono = q.monomial(u - t_i, idx);
                 // P(R) x_i lies in degree t_i + |R|, the degree of every z_l it appears in.
@@ -205,14 +240,14 @@ where
                     for image in &mut images {
                         image.clear();
                     }
-                    for (r, gammas) in psi.iter() {
-                        if let Some(&k) = op_index.get(&r) {
-                            fill(&mut images[k], r, gammas);
+                    for (id, gammas) in psi.iter() {
+                        if let Some(&k) = by_id.get(&id) {
+                            fill(&mut images[k], ops[k], gammas);
                         }
                     }
                 } else {
                     for (k, &r) in ops.iter().enumerate() {
-                        fill(&mut images[k], r, psi.get(r));
+                        fill(&mut images[k], r, psi.get(ids[k]));
                     }
                 }
                 for (i, gen_terms) in terms.iter().enumerate() {
@@ -280,6 +315,7 @@ where
     Stage {
         res,
         psi: Vec::new(),
+        op_ids: FxHashMap::default(),
         q,
         layer,
     }

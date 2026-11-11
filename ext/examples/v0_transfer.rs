@@ -2,13 +2,14 @@
 //! compares with the direct reduction.
 //!
 //! Usage: `v0_transfer <max_n> <max_s> [direct]`, with `CTAU_BACKBONE=<dir>` to load or save the
-//! resolution of $\mathbb{F}_2$ and `CHECK_CSV=<file>` to compare with rows `stem,s,u,dim`.
+//! resolution of $\mathbb{F}_2$, `CHECK_CSV=<file>` to compare with rows `stem,s,u,dim`, and
+//! `CTAU_PSI_BANDS=<n>` to take the weights in `n` bands, trading time for memory.
 //! Prints the number of classes and the time of each method.
 use std::{sync::Arc, time::Instant};
 
 use ext::{
     algebraic_novikov::{ctau_e2_untwisted_on, unit_module, untwisted_backbone_range},
-    v0_transfer::ext_q_by_v0_transfer,
+    v0_transfer::ext_q_by_v0_transfer_in_bands,
 };
 
 fn main() {
@@ -20,7 +21,11 @@ fn main() {
     res.compute_through_stem(untwisted_backbone_range(max_n, max_s));
 
     let start = Instant::now();
-    let ours = ext_q_by_v0_transfer(&res, max_n, max_s);
+    let bands = std::env::var("CTAU_PSI_BANDS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1);
+    let ours = ext_q_by_v0_transfer_in_bands(&res, max_n, max_s, bands);
     println!(
         "transfer: {} classes ({:?})",
         ours.values().sum::<usize>(),

@@ -1001,21 +1001,27 @@ impl QDown {
     }
 
     /// $\psi(m)$ for every basis monomial $m$ of degree $d$ and length at most `wanted[d]`, by
-    /// degree and index, keeping only the $R$ in `ops`; the other entries are empty.
+    /// degree and index, keeping only the operations `ops` numbers that `allowed[d]` marks, keyed
+    /// by their numbers; the other entries are empty.
     ///
     /// Peeling the largest binary chunk $v_n^{2^j}$ off each monomial makes the monomials a
     /// tree, and $\psi$ of a child is [`Self::psi_step`] of $\psi$ of its parent. A depth-first
     /// walk computes each once, holds the whole coaction, below the exponents of `ops`, only
     /// along the current path, and enters only subtrees holding a wanted monomial.
-    pub(crate) fn psi_table(&self, ops: &FxHashSet<PackedXi>, wanted: &[i32]) -> Vec<Vec<Psi>> {
-        let cap = ops.iter().copied().fold(0, packed_max);
+    pub(crate) fn psi_table(
+        &self,
+        ops: &FxHashMap<PackedXi, u32>,
+        allowed: &[Vec<bool>],
+        wanted: &[i32],
+    ) -> Vec<Vec<Psi<u32>>> {
+        let cap = ops.keys().copied().fold(0, packed_max);
         // reach[d]: the longest wanted monomial of degree d or more, which is as far as the
         // monomials of degree d can still lead.
         let mut reach = vec![-1; self.by_degree.len() + 1];
         for d in (0..self.by_degree.len()).rev() {
             reach[d] = reach[d + 1].max(wanted.get(d).copied().unwrap_or(-1));
         }
-        let table: Vec<Vec<std::sync::OnceLock<Psi>>> = self
+        let table: Vec<Vec<std::sync::OnceLock<Psi<u32>>>> = self
             .by_degree
             .iter()
             .map(|b| (0..b.len()).map(|_| std::sync::OnceLock::new()).collect())
@@ -1024,6 +1030,7 @@ impl QDown {
             q: self,
             cap,
             ops,
+            allowed,
             wanted,
             reach: &reach,
             table: &table,
@@ -1133,14 +1140,16 @@ struct Walk<'a> {
     q: &'a QDown,
     /// Every exponent of every operation in `ops`.
     cap: PackedXi,
-    /// The operations kept.
-    ops: &'a FxHashSet<PackedXi>,
+    /// The operations kept, numbered.
+    ops: &'a FxHashMap<PackedXi, u32>,
+    /// For each degree, which numbered operations act on its monomials.
+    allowed: &'a [Vec<bool>],
     /// The longest wanted monomial in each degree, or -1.
     wanted: &'a [i32],
     /// The longest wanted monomial in each degree or above.
     reach: &'a [i32],
     /// The coaction on each wanted monomial, by degree and index.
-    table: &'a [Vec<std::sync::OnceLock<Psi>>],
+    table: &'a [Vec<std::sync::OnceLock<Psi<u32>>>],
 }
 
 impl Walk<'_> {
@@ -1161,7 +1170,8 @@ impl Walk<'_> {
                 self.visit(child, d_child, child_psi);
             });
         if qmono_len(&m) as i32 <= self.wanted.get(d as usize).copied().unwrap_or(-1) {
-            let _ = self.table[d as usize][self.q.index(d, &m)].set(psi.restricted(self.ops));
+            let kept = psi.restricted(self.ops, &self.allowed[d as usize]);
+            let _ = self.table[d as usize][self.q.index(d, &m)].set(kept);
         }
     }
 }
@@ -1169,18 +1179,18 @@ impl Walk<'_> {
 /// $\psi(m)$ for one monomial $m$: for each $\xi^R$, by increasing $R$, the indices of the
 /// $m_\gamma$ paired with it among the monomials of their degree.
 #[derive(Default)]
-pub(crate) struct Psi {
-    /// The $R$ that occur.
-    keys: Vec<PackedXi>,
+pub(crate) struct Psi<K = PackedXi> {
+    /// The $R$ that occur, or their indices among the operations kept.
+    keys: Vec<K>,
     /// Where the indices for each $R$ start in `gammas`, and their end.
     starts: Vec<u32>,
     /// The indices, for one $R$ after another.
     gammas: Vec<u32>,
 }
 
-impl Psi {
+impl<K: Ord + Copy> Psi<K> {
     /// The coaction from its (R, index) pairs, a pair occurring twice cancelling.
-    fn from_pairs(mut pairs: Vec<(PackedXi, u32)>) -> Self {
+    fn from_pairs(mut pairs: Vec<(K, u32)>) -> Self {
         pairs.sort_unstable();
         let mut psi = Self {
             keys: Vec::new(),
@@ -1210,18 +1220,8 @@ impl Psi {
         psi
     }
 
-    /// The part with $R$ in `ops`.
-    fn restricted(&self, ops: &FxHashSet<PackedXi>) -> Self {
-        Self::from_pairs(
-            self.iter()
-                .filter(|(r, _)| ops.contains(r))
-                .flat_map(|(r, g)| g.iter().map(move |&g| (r, g)))
-                .collect(),
-        )
-    }
-
     /// The indices of the $m_\gamma$ paired with $\xi^R$.
-    pub(crate) fn get(&self, r: PackedXi) -> &[u32] {
+    pub(crate) fn get(&self, r: K) -> &[u32] {
         match self.keys.binary_search(&r) {
             Ok(i) => &self.gammas[self.starts[i] as usize..self.starts[i + 1] as usize],
             Err(_) => &[],
@@ -1234,13 +1234,28 @@ impl Psi {
     }
 
     /// Each $R$ with its indices.
-    pub(crate) fn iter(&self) -> impl Iterator<Item = (PackedXi, &[u32])> {
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (K, &[u32])> {
         self.keys.iter().enumerate().map(|(i, &r)| {
             (
                 r,
                 &self.gammas[self.starts[i] as usize..self.starts[i + 1] as usize],
             )
         })
+    }
+}
+
+impl Psi {
+    /// The part on the operations `ops` numbers and `allowed` marks, keyed by their numbers.
+    fn restricted(&self, ops: &FxHashMap<PackedXi, u32>, allowed: &[bool]) -> Psi<u32> {
+        Psi::from_pairs(
+            self.iter()
+                .filter_map(|(r, g)| {
+                    let &id = ops.get(&r)?;
+                    allowed[id as usize].then_some((id, g))
+                })
+                .flat_map(|(id, g)| g.iter().map(move |&g| (id, g)))
+                .collect(),
+        )
     }
 }
 
