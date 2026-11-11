@@ -64,6 +64,20 @@ pub struct Decomposables {
     pub linear_h: (usize, usize),
     /// Products $h_i x$ that the classical reading off the differential gets right, and wrong.
     pub read_off: (usize, usize),
+    /// The classes of $\mathrm{Ext}_P(Q)$ whose images were taken, if asked.
+    pub q_classes: usize,
+    /// Images of classes of $\mathrm{Ext}_P(Q)$ that are not cocycles, or fall outside the range.
+    pub unread: (usize, usize),
+    /// The dimension of the span of the Frobenius images, in each degree.
+    pub by_frobenius: BTreeMap<(i32, i32, i32), usize>,
+    /// The dimension of the span of the reductions mod $v_0$, in each degree.
+    pub by_reduction: BTreeMap<(i32, i32, i32), usize>,
+    /// The dimension of the span of the products and the Frobenius images.
+    pub by_any_or_frobenius: BTreeMap<(i32, i32, i32), usize>,
+    /// The dimension of the span of the products and the reductions.
+    pub by_any_or_reduction: BTreeMap<(i32, i32, i32), usize>,
+    /// The dimension of the span of the products, the Frobenius images and the reductions.
+    pub by_everything: BTreeMap<(i32, i32, i32), usize>,
 }
 
 /// The rank of a list of vectors.
@@ -91,8 +105,15 @@ fn rank(vectors: &[Bits]) -> usize {
 /// $Q/I_1$, so it multiplies cochains coefficientwise. $h_i$ lifts to a chain map
 /// $f \colon C_{a+1} \to C_a$ of internal degree $2^i$, and its product is the pullback along $f$,
 /// which has the shape of a coboundary. `res` must be resolved through `s = max_s + 2` and internal
-/// degree `(max_n + max_s) / 2 + 2^max(h) + 2`.
-pub fn decomposables(res: Arc<Backbone>, max_n: i32, max_s: i32, h: &[u32]) -> Decomposables {
+/// degree `(max_n + max_s) / 2 + 2^max(h) + 2`. With `from_q`, also the images of
+/// $\mathrm{Ext}_P(Q)$ under [`frobenius_images`] and [`reduction_images`].
+pub fn decomposables(
+    res: Arc<Backbone>,
+    max_n: i32,
+    max_s: i32,
+    h: &[u32],
+    from_q: bool,
+) -> Decomposables {
     let max_u = (max_n + max_s) / 2;
     let mut stage = stage(&*res, Layer::Quotient(1), max_n, max_s);
     let diff: Vec<InvertedSlice> = (0..=max_s).map(|a| slice(&*res, a, max_n, max_s)).collect();
@@ -553,6 +574,40 @@ pub fn decomposables(res: Arc<Backbone>, max_n: i32, max_s: i32, h: &[u32]) -> D
         }
     }
     out.dropped = dropped;
+    // The classes of the images of Ext(Q), by degree, under each map.
+    let mut read_images = |images: Vec<(Deg, Vec<Cochain>)>| {
+        let mut by: FxHashMap<Deg, Vec<Bits>> = FxHashMap::default();
+        for (d, cochains) in images {
+            if !counted(d) {
+                out.unread.1 += 1;
+                continue;
+            }
+            let into = &basis[&(d.0, d.1)];
+            let mut v = zeros(dim(d));
+            for c in &cochains {
+                let &(k, i) = into.get(c).expect("an image is a cochain in range");
+                assert_eq!(k, d.2);
+                flip(&mut v, i);
+            }
+            match classes.get(&d).map(|c| c.of(v)) {
+                Some(Some(x)) => by.entry(d).or_default().push(x),
+                // A degree without cochains has no classes, and only a zero image.
+                None if cochains.is_empty() => {}
+                _ => out.unread.0 += 1,
+            }
+        }
+        by
+    };
+    let (mut frob, mut red) = if from_q {
+        let cocycles = q_cocycles(&res, max_n, max_s);
+        out.q_classes = cocycles.len();
+        (
+            read_images(frobenius_images(&res, &cocycles, max_u)),
+            read_images(reduction_images(&cocycles)),
+        )
+    } else {
+        Default::default()
+    };
     for (&d, cls) in &classes {
         if !counted(d) || cls.count == 0 {
             continue;
@@ -565,8 +620,175 @@ pub fn decomposables(res: Arc<Backbone>, max_n: i32, max_s: i32, h: &[u32]) -> D
         out.by_v1.insert(key, rank(&v1));
         out.by_h.insert(key, rank(&hs));
         out.by_any.insert(key, rank(&all));
+        if from_q {
+            let f = frob.remove(&d).unwrap_or_default();
+            let r = red.remove(&d).unwrap_or_default();
+            out.by_frobenius.insert(key, rank(&f));
+            out.by_reduction.insert(key, rank(&r));
+            let with = |extra: &[Bits]| rank(&[all.as_slice(), extra].concat());
+            out.by_any_or_frobenius.insert(key, with(&f));
+            out.by_any_or_reduction.insert(key, with(&r));
+            out.by_everything.insert(key, with(&[f, r].concat()));
+        }
     }
     out
+}
+
+/// A cocycle of $\mathrm{Hom}(C, Q)$ for each class of $\mathrm{Ext}_P(Q)$ within stem `max_n` and
+/// `s <= max_s`, by degree `(u, a, k)`: monomials of length below `k` carry the missing $v_0$s.
+fn q_cocycles(res: &Backbone, max_n: i32, max_s: i32) -> Vec<(Deg, Vec<Cochain>)> {
+    use crate::algebraic_novikov::QDOWN_VARS;
+    let max_len = |a: i32, u: i32| untwisted_max_length(max_n, max_s, a, u).map(|k| k as u32);
+    let diff: Vec<InvertedSlice> = (0..=max_s).map(|a| slice(res, a, max_n, max_s)).collect();
+    let q_stage = stage(res, Layer::Adjoin(QDOWN_VARS - 1), max_n, max_s).bound_by(&diff, max_len);
+    let mut out = Vec::new();
+    for a in 0..=max_s {
+        for u in 0..=(max_n + max_s) / 2 {
+            let Some(k_max) = max_len(a, u) else { continue };
+            let (map, sources, _) = q_stage.build(a, u, k_max, &diff[a as usize]);
+            // The coboundaries into (a, u), with their targets among this degree's cochains.
+            let below = (a > 0)
+                .then(|| {
+                    max_len(a - 1, u).map(|km| q_stage.build(a - 1, u, km, &diff[a as usize - 1]))
+                })
+                .flatten();
+            let at: FxHashMap<Cochain, usize> =
+                sources.iter().enumerate().map(|(i, c)| (*c, i)).collect();
+            for k in 0..=k_max {
+                if 2 * u - a > max_n || a + k as i32 > max_s {
+                    continue;
+                }
+                // Q_k is spanned by the monomials of length at most k, and the leads of the cycles
+                // that no coboundary reaches pick out a basis of the cohomology.
+                let keep = |c: &Cochain| qmono_len(&c.2) <= k;
+                let (_, cycles) = map.pairs_and_cycles(|s| keep(&sources[s]));
+                let hit: rustc_hash::FxHashSet<usize> = below
+                    .as_ref()
+                    .map(|(m, src, tgt)| {
+                        m.pairs(|s| keep(&src[s]))
+                            .into_iter()
+                            .map(|p| at[&tgt[p.target]])
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                for (lead, sum) in cycles {
+                    if !hit.contains(&lead) {
+                        out.push((
+                            (u, a, k),
+                            sum.iter().map(|&i| sources[i as usize]).collect(),
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The images in $\mathrm{Hom}(C, Q/I_1)$ of the cocycles `cocycles` of $\mathrm{Hom}(C, Q)$ under
+/// the Frobenius, by target degree, for those landing within weight `max_u`.
+///
+/// $Q/I_1 \cong \Phi_* Q$ by $v_i \mapsto v_{i+1}$, a comodule over $P$ through the Frobenius
+/// $\xi_i \mapsto \xi_i^2$. A chain map $f \colon C \to C$ of $A$-modules over the Verschiebung,
+/// lifting the identity on $\mathbb{F}_2$, takes a cocycle $x$ of $\mathrm{Hom}(C, Q)$ to the
+/// cocycle $\sigma \circ x \circ f$ of $\mathrm{Hom}(C, Q/I_1)$, where $\sigma$ shifts every $v_i$
+/// up, $v_0$ included. Weight `u` and length `k` go to weight `2u + k` and length `k`; the
+/// filtration stays.
+fn frobenius_images(
+    res: &Arc<Backbone>,
+    cocycles: &[(Deg, Vec<Cochain>)],
+    max_u: i32,
+) -> Vec<(Deg, Vec<Cochain>)> {
+    use crate::{
+        algebraic_novikov::{ActMemo, QDOWN_VARS, QDown, monomial_degree, pack},
+        double::DoubleChainComplex,
+    };
+    let max_a = cocycles.iter().map(|((_, a, _), _)| *a).max().unwrap_or(0);
+    // The lift of Sq^0: z of degree T goes to a sum of P(R) x_i in degree T / 2.
+    let doubled = Arc::new(DoubleChainComplex::new(Arc::clone(res)));
+    doubled.compute_through_bidegree(Bidegree::s_t(max_a, 0));
+    let hom = ResolutionHomomorphism::new(
+        String::from("Sq0"),
+        Arc::clone(res),
+        doubled,
+        Bidegree::zero(),
+    );
+    hom.extend_step_raw(
+        Bidegree::zero(),
+        Some(vec![fp::vector::FpVector::from_slice(res.prime(), &[1])]),
+    );
+    hom.extend(Bidegree::s_t(max_a, max_u));
+    let algebra = res.algebra();
+    // For each filtration, x_i to the terms (R, z) of f(z) it appears in.
+    type Terms = FxHashMap<(i32, u32), Vec<(crate::algebraic_novikov::PackedXi, i32, u32)>>;
+    let inverted: Vec<Terms> = (0..=max_a)
+        .map(|a| {
+            let map = hom.get_map(a);
+            let module = res.module(a);
+            let mut out: Terms = FxHashMap::default();
+            for big_t in (0..=max_u).step_by(2) {
+                for l in 0..res.number_of_gens_in_bidegree(Bidegree::s_t(a, big_t)) {
+                    for (idx, _) in map.output(big_t, l).iter_nonzero() {
+                        let og = module.index_to_op_gen(big_t / 2, idx);
+                        let elt = algebra
+                            .basis_element_from_index(og.operation_degree, og.operation_index);
+                        let r = pack(&elt.p_part.iter().collect::<Vec<_>>());
+                        out.entry((og.generator_degree, og.generator_index as u32))
+                            .or_default()
+                            .push((r, big_t, l as u32));
+                    }
+                }
+            }
+            out
+        })
+        .collect();
+
+    let max_k = cocycles.iter().map(|((_, _, k), _)| *k).max().unwrap_or(0);
+    let q = QDown::new(
+        max_k,
+        |_| max_u,
+        crate::algebraic_novikov::Convention::Conjugate,
+    );
+    let memo = ActMemo::default();
+    let mut images = Vec::new();
+    for &((u, a, k), ref x) in cocycles {
+        if 2 * u + k as i32 > max_u {
+            continue;
+        }
+        let mut image: rustc_hash::FxHashSet<Cochain> = Default::default();
+        for &(t_i, g, m) in x {
+            for &(r, big_t, l) in inverted[a as usize].get(&(t_i, g)).into_iter().flatten() {
+                for gamma in q.act_memo(r, &m, &memo, 1 << 20).iter() {
+                    let mut sigma = [0u16; QDOWN_VARS];
+                    sigma[1] = (k - qmono_len(gamma)) as u16;
+                    assert_eq!(gamma[QDOWN_VARS - 1], 0, "σ needs another v_i");
+                    sigma[2..].copy_from_slice(&gamma[1..QDOWN_VARS - 1]);
+                    let e: Vec<u32> = sigma.iter().map(|&e| e as u32).collect();
+                    debug_assert_eq!(big_t + monomial_degree(&e), 2 * u + k as i32);
+                    crate::algebraic_novikov::toggle(&mut image, (big_t, l, sigma));
+                }
+            }
+        }
+        images.push(((2 * u + k as i32, a, k), image.into_iter().collect()));
+    }
+    images
+}
+
+/// The images in $\mathrm{Hom}(C, Q/I_1)$ of the cocycles `cocycles` of $\mathrm{Hom}(C, Q)$ under
+/// reduction mod $v_0$: the monomials of full length.
+fn reduction_images(cocycles: &[(Deg, Vec<Cochain>)]) -> Vec<(Deg, Vec<Cochain>)> {
+    cocycles
+        .iter()
+        .map(|&(d, ref x)| {
+            (
+                d,
+                x.iter()
+                    .filter(|c| qmono_len(&c.2) == d.2)
+                    .copied()
+                    .collect(),
+            )
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -577,8 +799,9 @@ mod tests {
         vn_bockstein::{page_dims, vn_bockstein},
     };
 
-    /// The classes are those of the quotient layer $Q/I_1$, and $d_1$ of the $v_0$-Bockstein is a
-    /// derivation with $d_1(v_1) = h_0$, linear over the $h_i$.
+    /// The classes are those of the quotient layer $Q/I_1$, $d_1$ of the $v_0$-Bockstein is a
+    /// derivation with $d_1(v_1) = h_0$, linear over the $h_i$, and the maps from
+    /// $\mathrm{Ext}_P(Q)$ land on cocycles.
     #[test]
     fn classes_and_leibniz() {
         let (max_n, max_s) = (24, 12);
@@ -587,7 +810,7 @@ mod tests {
             Arc::new(unit_module()),
         ))));
         res.compute_through_bidegree(Bidegree::s_t(max_s + 2, max_u + 16 + 2));
-        let d = decomposables(Arc::clone(&res), max_n, max_s, &[0, 1, 2, 3, 4]);
+        let d = decomposables(Arc::clone(&res), max_n, max_s, &[0, 1, 2, 3, 4], true);
         let layer = page_dims(
             &vn_bockstein(&*res, Layer::Quotient(1), max_n, max_s),
             i32::MAX,
@@ -598,5 +821,7 @@ mod tests {
         assert_eq!(d.dropped, 0);
         assert!(d.leibniz_v1.0 > 0 && d.leibniz_v1.1 == 0);
         assert!(d.linear_h.0 > 0 && d.linear_h.1 == 0);
+        // The Frobenius and reduction images of Ext(Q) are cocycles.
+        assert!(d.q_classes > 0 && d.unread.0 == 0);
     }
 }

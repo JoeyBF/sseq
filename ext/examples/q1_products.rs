@@ -1,8 +1,9 @@
 //! How much of $\mathrm{Ext}_P(Q/I_1)$ is decomposable under $v_1$ and the $h_i$, and how many
 //! module generators remain.
 //!
-//! Usage: `q1_products <max_n> <max_s>`. Prints totals, the generators by filtration, and checks
-//! the class count against the quotient-layer spectral sequence.
+//! Usage: `q1_products <max_n> <max_s>`. Prints totals, the generators by filtration, checks
+//! the class count against the quotient-layer spectral sequence, and counts the generators in
+//! the images of $\mathrm{Ext}_P(Q)$ under the Frobenius and reduction mod $v_0$.
 use std::sync::Arc;
 
 use ext::{
@@ -26,7 +27,7 @@ fn main() {
     ))));
     res.compute_through_bidegree(Bidegree::s_t(max_s + 2, max_u + top + 2));
 
-    let d = decomposables(Arc::clone(&res), max_n, max_s, &h);
+    let d = decomposables(Arc::clone(&res), max_n, max_s, &h, true);
     let sum = |m: &std::collections::BTreeMap<(i32, i32, i32), usize>| m.values().sum::<usize>();
     let classes = sum(&d.classes);
     println!(
@@ -67,6 +68,26 @@ fn main() {
     println!("by s: (classes, generators)");
     for (s, (c, g)) in gens_by_s {
         print!(" {s}:({c},{g})");
+    }
+    println!();
+    let gens = classes - sum(&d.by_any);
+    println!(
+        "Ext(Q): {} classes; images not cocycles {}, outside range {}",
+        d.q_classes, d.unread.0, d.unread.1
+    );
+    println!(
+        "generators accounted for, of {gens}: by the Frobenius {}, by reduction mod v_0 {}, by both {}",
+        sum(&d.by_any_or_frobenius) - sum(&d.by_any),
+        sum(&d.by_any_or_reduction) - sum(&d.by_any),
+        sum(&d.by_everything) - sum(&d.by_any),
+    );
+    // The generators neither accounts for, by degree (stem, s, u).
+    print!("generators missed:");
+    for (key, &c) in &d.classes {
+        let missed = c - d.by_everything[key];
+        if missed > 0 {
+            print!(" {key:?}x{missed}");
+        }
     }
     println!();
 }

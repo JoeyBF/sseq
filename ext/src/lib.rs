@@ -170,6 +170,7 @@
 pub mod algebraic_novikov;
 pub mod bp;
 pub mod chain_complex;
+pub mod double;
 pub mod ext_algebra;
 pub mod filtered_sseq;
 pub mod koszul_lift;
