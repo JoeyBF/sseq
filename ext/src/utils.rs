@@ -1,5 +1,8 @@
 //! A module containing various utility functions related to user interaction in some way.
-use std::{path::PathBuf, sync::Arc};
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use algebra::{
     AlgebraType, MilnorAlgebra, SteenrodAlgebra,
@@ -13,17 +16,19 @@ use crate::{
     CCC,
     chain_complex::{AugmentedChainComplex, BoundedChainComplex, ChainComplex, FiniteChainComplex},
     resolution::{Resolution, UnstableResolution},
-    save::SaveDirectory,
+    save::{SaveDirectory, ZarrSaveStore},
 };
 
 // We build docs with --all-features so the docs are at the feature = "nassau" version
 #[cfg(not(feature = "nassau"))]
 pub type QueryModuleResolution = Resolution<CCC>;
 
-/// The type returned by [`query_module`]. The value of this type depends on whether
-/// [`nassau`](crate::nassau) is enabled. In any case, it is an augmented free chain complex over
-/// either [`SteenrodAlgebra`] or [`MilnorAlgebra`] and supports the `compute_through_stem`
-/// function.
+/// The type returned by [`query_module`], which depends on whether the `nassau` feature is enabled.
+///
+/// Either way it is an augmented free chain complex over [`SteenrodAlgebra`] or [`MilnorAlgebra`]
+/// that supports `compute_through_stem`. Switching the type with a feature rather than through
+/// polymorphism is not what features are for, but it is the easiest way to let every example
+/// script use either resolution; with `nassau` enabled they all use [`crate::nassau::Resolution`].
 #[cfg(feature = "nassau")]
 pub type QueryModuleResolution = crate::nassau::Resolution<FDModule<MilnorAlgebra>>;
 
@@ -152,7 +157,7 @@ impl<T: TryInto<AlgebraType>> TryFrom<(Value, T)> for Config {
 /// the `nassau` feature is enabled.
 pub fn construct<T, E>(
     module_spec: T,
-    save_dir: impl Into<SaveDirectory>,
+    save_dir: impl TryInto<SaveDirectory, Error: Into<anyhow::Error>>,
 ) -> anyhow::Result<QueryModuleResolution>
 where
     anyhow::Error: From<E>,
@@ -172,7 +177,7 @@ where
 /// See [`construct`]
 pub fn construct_nassau<T, E>(
     module_spec: T,
-    save_dir: impl Into<SaveDirectory>,
+    save_dir: impl TryInto<SaveDirectory, Error: Into<anyhow::Error>>,
 ) -> anyhow::Result<crate::nassau::Resolution<FDModule<MilnorAlgebra>>>
 where
     anyhow::Error: From<E>,
@@ -187,33 +192,32 @@ where
     if spec.basis(algebra)? == AlgebraType::Adem {
         return Err(anyhow!("Nassau's algorithm requires Milnor's basis"));
     }
-    if spec.profile.is_some() {
-        return Err(anyhow!(
-            "Nassau's algorithm does not support non-trivial profile"
-        ));
-    }
-    if spec.p != 2 {
-        return Err(anyhow!("Nassau's algorithm does not support odd primes"));
-    }
     if json["type"].as_str() != Some("finite dimensional module") {
         return Err(anyhow!(
             "Nassau's algorithm only supports finite dimensional modules"
         ));
     }
 
-    let algebra = Arc::new(MilnorAlgebra::new(fp::prime::TWO, false));
+    let SteenrodAlgebra::MilnorAlgebra(algebra) =
+        SteenrodAlgebra::from_json(&json, AlgebraType::Milnor, false)?
+    else {
+        return Err(anyhow!("Nassau's algorithm requires Milnor's basis"));
+    };
+    let algebra = Arc::new(algebra);
     let module = Arc::new(FDModule::from_json(Arc::clone(&algebra), &json)?);
 
     if !json["cofiber"].is_null() {
         return Err(anyhow!("Nassau's algorithm does not support cofiber"));
     }
-    crate::nassau::Resolution::new_with_save(module, save_dir)
+    let resolution = crate::nassau::Resolution::new_with_save(module, save_dir)?;
+    bind_module_spec(resolution.save_dir(), &json)?;
+    Ok(resolution)
 }
 
 /// See [`construct`]
 pub fn construct_standard<const U: bool, T, E>(
     module_spec: T,
-    save_dir: impl Into<SaveDirectory>,
+    save_dir: impl TryInto<SaveDirectory, Error: Into<anyhow::Error>>,
 ) -> anyhow::Result<crate::resolution::MuResolution<U, CCC>>
 where
     anyhow::Error: From<E>,
@@ -294,7 +298,42 @@ where
         chain_complex = Arc::new(yoneda.map(|m| steenrod_module::erase(m.clone())));
     }
 
-    crate::resolution::MuResolution::new_with_save(chain_complex, save_dir)
+    let resolution = crate::resolution::MuResolution::new_with_save(chain_complex, save_dir)?;
+    bind_module_spec(resolution.save_dir(), &json)?;
+    Ok(resolution)
+}
+
+/// Pin the save store (if any) to `spec` and record it in the store.
+///
+/// The directory then rejects reuse for a different complex and describes itself.
+fn bind_module_spec(save_dir: &SaveDirectory, spec: &Value) -> anyhow::Result<()> {
+    if let Some(store) = save_dir.store() {
+        store.bind_module_spec(spec)?;
+    }
+    Ok(())
+}
+
+/// Reconstruct a resolution from a save directory alone, without re-supplying the module spec.
+///
+/// Rebuilds the [`Config`] from the `module_spec` and `algebra_prefix` that [`construct`] recorded,
+/// and resolves into the same directory. A directory with no recorded spec, such as one made by
+/// `new_with_save` directly, is an error.
+pub fn construct_from_save(save_dir: impl AsRef<Path>) -> anyhow::Result<QueryModuleResolution> {
+    let save_dir = save_dir.as_ref().to_owned();
+    let attrs = ZarrSaveStore::read_root_attributes(&save_dir)
+        .with_context(|| format!("Failed to open save store at {save_dir:?}"))?;
+    let module = attrs.get("module_spec").cloned().with_context(|| {
+        format!(
+            "Save store at {save_dir:?} has no recorded module spec; it was not created through \
+             `construct`, so the complex cannot be reconstructed from the directory alone"
+        )
+    })?;
+    let algebra = attrs
+        .get("algebra_prefix")
+        .and_then(|v| v.as_str())
+        .with_context(|| format!("Save store at {save_dir:?} has no recorded algebra"))?;
+    let config: Config = (module, algebra).try_into()?;
+    construct(config, Some(save_dir))
 }
 
 /// Load a module specification from a JSON file.
