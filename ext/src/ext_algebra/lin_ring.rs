@@ -11,7 +11,8 @@
 //! * `a_k (a_j m')` for `m = a_k m'`, `k = lo(m) < j`, otherwise -- by induction on the degree and
 //!   then the left index, which drops from `j` to `k` at equal degree.
 //!
-//! So `f_m` is needed only at the outputs of generators `<= a_{lo(m)}` (a corner `t' <= t_{lo(m)}`),
+//! So `f_m` is needed only at the outputs of generators `<= a_{lo(m)}`: reaching `a_j` takes the rows
+//! `s' <= s_j` through stem `n_j`, since lifting goes by stem as resolving does,
 //! and not at all when those are all `h_i` (read off the differentials, [`super::h_product`]):
 //! every monomial with `lo(m) ∈ {h_0, .., h_3}` is free, since the first other generator, `c_0`,
 //! has `t = 11`.
@@ -758,9 +759,12 @@ where
                 if h_index(g).is_some() || !in_range(b + g.degree()) {
                     continue;
                 }
-                // Row s' <= s_g through stem t_g - s', within the target range.
-                for (sp, row) in map.stair.iter().enumerate().take(g.s() as usize + 1) {
-                    let n = (g.t() - sp as i32).min(max_n - b.n());
+                // Rows s' <= s_g through stem n_g, within the target range. That is all reading at
+                // `g` needs: a resolution is minimal, so `d` of a generator involves only generators
+                // of lower degree, and a lift step at stem `n` reads the row below through stem `n`
+                // (as resolving through a stem does).
+                for row in map.stair.iter().take(g.s() as usize + 1) {
+                    let n = g.n().min(max_n - b.n());
                     let old = row.load(Ordering::Relaxed);
                     if n > old {
                         row.store(n, Ordering::Relaxed);
@@ -979,7 +983,7 @@ where
                     let reads_any = ring.gens[..=lo].iter().any(|&g| {
                         h_index(g).is_none()
                             && in_range(b + g.degree())
-                            && (0..=g.s()).any(|sp| (g.t() - sp).min(max_n - b.n()) >= 0)
+                            && g.n().min(max_n - b.n()) >= 0
                     });
                     if !reads_any {
                         continue;
