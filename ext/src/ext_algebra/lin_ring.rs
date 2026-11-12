@@ -352,8 +352,32 @@ impl Dispatch {
     }
 }
 
+/// The order of the generators, which fixes Lin's monomial basis and the corners of the maps.
+///
+/// `T`, by `(t, s)`, is the order the generators are found in. `Stem`, by `(n, s)`, reads every
+/// product at its factor of smaller stem, so no map is lifted past stem `max_n / 2` and every
+/// quasi-inverse used lies there. Both give the same generators, products and ranks; the basis
+/// monomials and so the map names differ.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GenOrder {
+    T,
+    Stem,
+}
+
+impl GenOrder {
+    /// `EXT_LIN_RING_ORDER`: `t` (the default) or `stem`.
+    fn from_env() -> anyhow::Result<Self> {
+        match std::env::var("EXT_LIN_RING_ORDER").as_deref() {
+            Err(_) | Ok("t") => Ok(Self::T),
+            Ok("stem") => Ok(Self::Stem),
+            Ok(v) => anyhow::bail!("EXT_LIN_RING_ORDER={v:?}: expected t or stem"),
+        }
+    }
+}
+
 /// The ring through the range, with the chain maps it lifted.
 pub struct Ring<CC: FreeChainComplex> {
+    order: GenOrder,
     pub gens: Vec<BidegreeGenerator>,
     pub basis: Vec<Monomial>,
     /// Per bidegree: its basis monomials, and the inverse of their matrix (row `y` = the
@@ -411,6 +435,20 @@ impl<CC> Ring<CC>
 where
     CC: FreeChainComplex + AugmentedChainComplex,
 {
+    /// The sort key of generator `j` in [`GenOrder`].
+    fn key(&self, j: usize) -> (i32, i32, usize) {
+        let g = self.gens[j];
+        match self.order {
+            GenOrder::T => (g.t(), g.s(), g.idx()),
+            GenOrder::Stem => (g.n(), g.s(), g.idx()),
+        }
+    }
+
+    /// `a_j <= a_lo`, with `lo` from [`Monomial::lo`] (the unit's `usize::MAX` is above all).
+    fn le(&self, j: usize, lo: usize) -> bool {
+        lo == usize::MAX || self.key(j) <= self.key(lo)
+    }
+
     fn dim(&self, b: Bidegree) -> usize {
         if self.range.contains(b) {
             self.res.number_of_gens_in_bidegree(b)
@@ -465,7 +503,7 @@ where
                 None => FpVector::new(TWO, d),
             };
         }
-        assert!(j <= mono.lo(), "direct product needs j <= lo(m)");
+        assert!(self.le(j, mono.lo()), "direct product needs a_j <= a_lo(m)");
         let map = &self.maps[mono.map.expect("monomial has no chain map")];
         let mut v = FpVector::new(TWO, d);
         if d > 0 {
@@ -480,9 +518,11 @@ where
             return v.clone();
         }
         let v = match self.basis[m].repr {
-            _ if h_index(self.gens[j]).is_some() || j <= self.basis[m].lo() => self.direct(j, m),
+            _ if h_index(self.gens[j]).is_some() || self.le(j, self.basis[m].lo()) => {
+                self.direct(j, m)
+            }
             Repr::Unit => unreachable!(),
-            // a_j a_l = a_l a_j with l < j <= lo(a_j).
+            // a_j a_l = a_l a_j with a_l < a_j = a_lo(a_j).
             Repr::Gen(l) => {
                 let mj = self.gen_monomial(j);
                 self.direct(l, mj)
@@ -596,7 +636,7 @@ where
                 continue;
             };
             for j in 0..self.gens.len() {
-                if h_index(self.gens[j]).is_none() || j <= k {
+                if h_index(self.gens[j]).is_none() || self.le(j, k) {
                     continue;
                 }
                 let target = self.gens[j].degree() + self.basis[m].b;
@@ -677,6 +717,7 @@ where
     } = range;
     let in_range = move |b: Bidegree| range.contains(b);
     let mut ring = Ring {
+        order: GenOrder::from_env()?,
         gens: vec![],
         basis: vec![],
         cells: HashMap::new(),
@@ -753,10 +794,10 @@ where
             let mono = &ring.basis[map_mono[i]];
             let (b, lo) = (mono.b, mono.lo());
             let mut grew = false;
-            while cursor[i] <= lo && ring.gens[cursor[i]].t() <= t1 - b.t() {
-                let g = ring.gens[cursor[i]];
+            while cursor[i] < ring.gens.len() && ring.gens[cursor[i]].t() <= t1 - b.t() {
+                let (j, g) = (cursor[i], ring.gens[cursor[i]]);
                 cursor[i] += 1;
-                if h_index(g).is_some() || !in_range(b + g.degree()) {
+                if !ring.le(j, lo) || h_index(g).is_some() || !in_range(b + g.degree()) {
                     continue;
                 }
                 // Rows s' <= s_g through stem n_g, within the target range. That is all reading at
@@ -898,7 +939,7 @@ where
                     };
                     for &m in ids {
                         let mono = &ring.basis[m];
-                        if mono.factors.is_empty() || k > mono.lo() {
+                        if mono.factors.is_empty() || !ring.le(k, mono.lo()) {
                             continue;
                         }
                         let mut f = Vec::with_capacity(mono.factors.len() + 1);
@@ -907,7 +948,9 @@ where
                         cands.push((f, k, m));
                     }
                 }
-                cands.sort();
+                cands.sort_by_cached_key(|(f, _, _)| {
+                    f.iter().map(|&j| ring.key(j as usize)).collect::<Vec<_>>()
+                });
                 let mut ids = vec![];
                 let mut rows: Vec<FpVector> = vec![];
                 let mut ech: Vec<(usize, FpVector)> = vec![];
@@ -980,11 +1023,20 @@ where
                     let lo = ring.basis[m].lo();
                     // A map exists if some generator it would be read at (off the h_i line, product
                     // in range) gives it a non-empty corner; it starts empty and grows per window.
-                    let reads_any = ring.gens[..=lo].iter().any(|&g| {
-                        h_index(g).is_none()
-                            && in_range(b + g.degree())
-                            && g.n().min(max_n - b.n()) >= 0
-                    });
+                    //
+                    // In stem order a generator found later (larger t) can still be below a_lo, so
+                    // there the test is whether c_0 = x_(8, 3, 0), the first generator off the h_i
+                    // line by stem, is below a_lo and could be read.
+                    let reads_any = match ring.order {
+                        GenOrder::T => ring.gens[..=lo].iter().any(|&g| {
+                            h_index(g).is_none()
+                                && in_range(b + g.degree())
+                                && g.n().min(max_n - b.n()) >= 0
+                        }),
+                        GenOrder::Stem => {
+                            ring.key(lo) >= (8, 3, 0) && in_range(b + Bidegree::n_s(8, 3))
+                        }
+                    };
                     if !reads_any {
                         continue;
                     }
