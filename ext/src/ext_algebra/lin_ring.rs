@@ -194,6 +194,163 @@ pub struct WindowStats {
     pub new_monomials: usize,
 }
 
+/// One map's share of a window's lift, as [`compute`] hands it to `EXT_LIN_RING_DISPATCH` and
+/// [`lift_jobs`] takes it back: the monomial's map, its staircase for the window, and what lifting
+/// it cost in the window before.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MapJob {
+    /// The map's [`map_name`], which is where its steps are saved.
+    pub name: String,
+    pub b: Bidegree,
+    /// The monomial's class in the resolution's dual basis of `Ext(b)`.
+    pub class: Vec<u32>,
+    /// Row `s` of the staircase through stem `stair[s]`, as in [`Staircase`].
+    pub stair: Vec<i32>,
+    /// Thread seconds the map's lift took in the window before; 0 if unknown.
+    pub cost_s: f64,
+}
+
+impl MapJob {
+    /// One tab-separated line: name, stem, filtration, class as a string of digits, staircase
+    /// comma-separated, cost. Map names hold no tabs.
+    pub fn to_line(&self) -> String {
+        let class: String = self.class.iter().map(|c| c.to_string()).collect();
+        let stair: Vec<String> = self.stair.iter().map(|n| n.to_string()).collect();
+        format!(
+            "{}\t{}\t{}\t{}\t{}\t{}",
+            self.name,
+            self.b.n(),
+            self.b.s(),
+            class,
+            stair.join(","),
+            self.cost_s
+        )
+    }
+
+    /// The inverse of [`MapJob::to_line`].
+    pub fn parse(line: &str) -> anyhow::Result<Self> {
+        let f: Vec<&str> = line.trim_end_matches(['\n', '\r']).split('\t').collect();
+        ensure!(
+            f.len() == 6,
+            "a map job has 6 fields, not {}: {line:?}",
+            f.len()
+        );
+        let class = f[3]
+            .chars()
+            .map(|c| {
+                c.to_digit(10)
+                    .ok_or_else(|| anyhow::anyhow!("bad class digit in {line:?}"))
+            })
+            .collect::<anyhow::Result<_>>()?;
+        let stair = f[4].split(',').map(str::parse).collect::<Result<_, _>>()?;
+        Ok(Self {
+            name: f[0].to_string(),
+            b: Bidegree::n_s(f[1].parse()?, f[2].parse()?),
+            class,
+            stair,
+            cost_s: f[5].parse()?,
+        })
+    }
+}
+
+/// Lift the maps of `jobs` over their staircases, saving each step in `res`'s store under the map's
+/// name, and return each map's name and the thread seconds its new steps took. Steps the store
+/// already has are read rather than lifted, so this resumes a partial run, and a map's earlier
+/// windows must be in the store. This is a worker's half of `EXT_LIN_RING_DISPATCH` (see
+/// [`compute`]); the result is the store.
+pub fn lift_jobs<CC>(res: &Arc<CC>, jobs: &[MapJob]) -> anyhow::Result<Vec<(String, f64)>>
+where
+    CC: FreeChainComplex + AugmentedChainComplex + Send + Sync + 'static,
+{
+    ensure!(
+        res.save_dir().store().is_some(),
+        "lifting map jobs needs a save store to read and keep their steps"
+    );
+    let mut bound = Bidegree::n_s(-1, -1);
+    let mut maps = vec![];
+    for job in jobs {
+        let hom = ResolutionHomomorphism::from_class(
+            job.name.clone(),
+            Arc::clone(res),
+            Arc::clone(res),
+            job.b,
+            &job.class,
+        );
+        for (sp, &n) in job.stair.iter().enumerate() {
+            if n >= 0 {
+                bound = Bidegree::n_s(bound.n().max(n), bound.s().max(sp as i32));
+            }
+        }
+        maps.push(Arc::new(Staircase {
+            hom,
+            name: job.name.clone(),
+            steps: AtomicU64::new(0),
+            prepare_ns: AtomicU64::new(0),
+            stair: job.stair.iter().map(|&n| AtomicI32::new(n)).collect(),
+        }));
+    }
+    if !maps.is_empty() {
+        let liftables = maps
+            .iter()
+            .map(|m| Arc::clone(m) as Arc<dyn Liftable>)
+            .collect();
+        MultiLift::new(Arc::clone(res), liftables).extend_through_stem(bound)?;
+    }
+    Ok(maps
+        .iter()
+        .map(|m| (m.name.clone(), m.take_window().1))
+        .collect())
+}
+
+/// The dispatch settings of [`compute`], from the environment.
+struct Dispatch {
+    /// `EXT_LIN_RING_DISPATCH`: the command, run with the jobs file as its one argument.
+    command: std::ffi::OsString,
+    /// `EXT_LIN_RING_DISPATCH_DIR`: where the jobs files go.
+    dir: std::path::PathBuf,
+    /// `EXT_LIN_RING_DISPATCH_MIN_S` (default 60): the cost from which a map is dispatched.
+    min_s: f64,
+    /// `EXT_LIN_RING_DISPATCH_COSTS`: `name<TAB>seconds` lines, the costs of maps lifted before
+    /// this process started (for instance the last window's `map_window` events of the step log).
+    hints: HashMap<String, f64>,
+}
+
+impl Dispatch {
+    fn from_env() -> anyhow::Result<Option<Self>> {
+        let Some(command) = std::env::var_os("EXT_LIN_RING_DISPATCH") else {
+            return Ok(None);
+        };
+        let dir = std::env::var_os("EXT_LIN_RING_DISPATCH_DIR")
+            .ok_or_else(|| {
+                anyhow::anyhow!("EXT_LIN_RING_DISPATCH needs EXT_LIN_RING_DISPATCH_DIR")
+            })?
+            .into();
+        let min_s = match std::env::var("EXT_LIN_RING_DISPATCH_MIN_S") {
+            Ok(v) => v
+                .parse()
+                .map_err(|e| anyhow::anyhow!("EXT_LIN_RING_DISPATCH_MIN_S={v:?}: {e}"))?,
+            Err(_) => 60.0,
+        };
+        let mut hints = HashMap::new();
+        if let Some(path) = std::env::var_os("EXT_LIN_RING_DISPATCH_COSTS") {
+            let text = std::fs::read_to_string(&path)
+                .map_err(|e| anyhow::anyhow!("EXT_LIN_RING_DISPATCH_COSTS {path:?}: {e}"))?;
+            for line in text.lines().filter(|l| !l.is_empty()) {
+                let (name, cost) = line
+                    .rsplit_once('\t')
+                    .ok_or_else(|| anyhow::anyhow!("bad cost line {line:?}"))?;
+                hints.insert(name.to_string(), cost.parse()?);
+            }
+        }
+        Ok(Some(Self {
+            command,
+            dir,
+            min_s,
+            hints,
+        }))
+    }
+}
+
 /// The ring through the range, with the chain maps it lifted.
 pub struct Ring<CC: FreeChainComplex> {
     pub gens: Vec<BidegreeGenerator>,
@@ -493,6 +650,15 @@ where
 /// product landing in internal degrees `t0..=t1` available. If the file named by
 /// `EXT_LIN_RING_STOP` exists after a window, the computation stops there and the ring's range is
 /// cut to the degrees decided.
+///
+/// With `EXT_LIN_RING_DISPATCH` set (and `save_maps`), each window's maps that cost at least
+/// `EXT_LIN_RING_DISPATCH_MIN_S` seconds in their last window are handed to that command, as
+/// [`MapJob`] lines in a file under `EXT_LIN_RING_DISPATCH_DIR`, while this process lifts the rest.
+/// The command is to lift them elsewhere ([`lift_jobs`]) and put their steps in this store before
+/// it exits; it may write the maps' new costs, as `name<TAB>seconds` lines, to the jobs file's
+/// name with `.costs` appended. Afterwards the dispatched maps are lifted here too, which reads the
+/// steps the command saved and computes any it did not, so a failed dispatch costs time, never
+/// correctness.
 pub fn compute<CC>(
     res: &Arc<CC>,
     range: RingRange,
@@ -565,6 +731,13 @@ where
     let mut map_mono: Vec<usize> = vec![];
     let mut cursor: Vec<usize> = vec![];
     let stop_file = std::env::var_os("EXT_LIN_RING_STOP").map(std::path::PathBuf::from);
+    let dispatch = Dispatch::from_env()?;
+    ensure!(
+        dispatch.is_none() || save_maps,
+        "EXT_LIN_RING_DISPATCH hands maps over through the store, so it needs save_maps"
+    );
+    // Per map: the thread seconds its last lift took, which decides whether it is dispatched.
+    let mut last_cost: Vec<f64> = vec![];
     let t_end = max_t.min(max_n + max_s);
     let mut t0 = 1;
     while t0 <= t_end {
@@ -574,7 +747,7 @@ where
         let t_lift = Instant::now();
         let mut bound = Bidegree::n_s(-1, -1);
         let mut cells = 0;
-        let mut liftables: Vec<Arc<dyn Liftable>> = vec![];
+        let mut grown: Vec<usize> = vec![];
         for (i, map) in ring.maps.iter().enumerate() {
             let mono = &ring.basis[map_mono[i]];
             let (b, lo) = (mono.b, mono.lo());
@@ -603,16 +776,90 @@ where
                         bound = Bidegree::n_s(bound.n().max(n), bound.s().max(sp as i32));
                     }
                 }
-                liftables.push(Arc::clone(map) as Arc<dyn Liftable>);
+                grown.push(i);
             }
         }
-        let maps_lifted = liftables.len();
-        if !liftables.is_empty() {
-            MultiLift::new(Arc::clone(res), liftables).extend_through_stem(bound)?;
+        let maps_lifted = grown.len();
+        let (remote, local): (Vec<usize>, Vec<usize>) = match &dispatch {
+            Some(d) => grown.into_iter().partition(|&i| last_cost[i] >= d.min_s),
+            None => (vec![], grown),
+        };
+        let lift = |which: &[usize]| -> anyhow::Result<()> {
+            if !which.is_empty() {
+                let liftables = which
+                    .iter()
+                    .map(|&i| Arc::clone(&ring.maps[i]) as Arc<dyn Liftable>)
+                    .collect();
+                MultiLift::new(Arc::clone(res), liftables).extend_through_stem(bound)?;
+            }
+            Ok(())
+        };
+        if let Some(d) = dispatch.as_ref().filter(|_| !remote.is_empty()) {
+            let jobs_path = d.dir.join(format!("window_{t0}.tsv"));
+            let mut text = String::new();
+            for &i in &remote {
+                let map = &ring.maps[i];
+                let mono = &ring.basis[map_mono[i]];
+                let job = MapJob {
+                    name: map.name.clone(),
+                    b: mono.b,
+                    class: mono.vec.iter().collect(),
+                    stair: map
+                        .stair
+                        .iter()
+                        .map(|r| r.load(Ordering::Relaxed))
+                        .collect(),
+                    cost_s: last_cost[i],
+                };
+                text.push_str(&job.to_line());
+                text.push('\n');
+            }
+            std::fs::create_dir_all(&d.dir)?;
+            std::fs::write(&jobs_path, text)?;
+            tracing::info!(
+                t0,
+                remote = remote.len(),
+                local = local.len(),
+                remote_cost_s = remote.iter().map(|&i| last_cost[i]).sum::<f64>(),
+                jobs = ?jobs_path,
+                "lin_ring dispatch"
+            );
+            let child = std::process::Command::new(&d.command)
+                .arg(&jobs_path)
+                .spawn();
+            lift(&local)?;
+            match child.and_then(|mut c| c.wait()) {
+                Ok(status) if status.success() => {}
+                Ok(status) => tracing::warn!(%status, "lin_ring dispatch failed; lifting here"),
+                Err(e) => tracing::warn!(%e, "lin_ring dispatch did not run; lifting here"),
+            }
+            let mut costs_path = jobs_path.into_os_string();
+            costs_path.push(".costs");
+            if let Ok(text) = std::fs::read_to_string(&costs_path) {
+                let by_name: HashMap<&str, usize> =
+                    remote.iter().map(|&i| (&*ring.maps[i].name, i)).collect();
+                for line in text.lines() {
+                    if let Some((name, cost)) = line.rsplit_once('\t')
+                        && let (Some(&i), Ok(cost)) = (by_name.get(name), cost.parse::<f64>())
+                    {
+                        last_cost[i] = cost;
+                    }
+                }
+            }
+            let start = Instant::now();
+            lift(&remote)?;
+            tracing::info!(
+                t0,
+                merge_s = start.elapsed().as_secs_f64(),
+                "lin_ring dispatched maps read back"
+            );
+        } else {
+            lift(&local)?;
         }
-        for map in &ring.maps {
+        for (i, map) in ring.maps.iter().enumerate() {
             let (steps, prepare_s) = map.take_window();
             if steps > 0 {
+                last_cost[i] = prepare_s;
                 tracing::info!(
                     target: "ext::lift::steps",
                     kind = "map_window",
@@ -756,6 +1003,12 @@ where
                     ring.basis[m].map = Some(ring.maps.len());
                     map_mono.push(m);
                     cursor.push(0);
+                    last_cost.push(
+                        dispatch
+                            .as_ref()
+                            .and_then(|d| d.hints.get(&label).copied())
+                            .unwrap_or(0.0),
+                    );
                     ring.maps.push(Arc::new(Staircase {
                         hom,
                         name: label,
