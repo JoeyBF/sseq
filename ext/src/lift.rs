@@ -543,21 +543,12 @@ mod tests {
         );
         res.compute_through_stem(Bidegree::n_s(12, 6));
 
-        // Delete every saved quasi-inverse at `s = 2`.
-        let qi_dir = tempdir
-            .path()
-            .join(format!("{}s", crate::save::SaveKind::NassauQi.name()));
+        // Delete every saved quasi-inverse at `s = 2`: the store keeps one at `qi/n{n}_s{s}`.
         let mut deleted = 0;
-        for entry in std::fs::read_dir(&qi_dir).unwrap() {
+        for entry in std::fs::read_dir(tempdir.path().join("qi")).unwrap() {
             let path = entry.unwrap().path();
-            if path
-                .file_name()
-                .unwrap()
-                .to_str()
-                .unwrap()
-                .starts_with("2_")
-            {
-                std::fs::remove_file(path).unwrap();
+            if path.file_name().unwrap().to_str().unwrap().ends_with("_s2") {
+                std::fs::remove_dir_all(path).unwrap();
                 deleted += 1;
             }
         }
