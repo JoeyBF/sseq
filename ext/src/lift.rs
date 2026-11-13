@@ -244,7 +244,11 @@ impl<CC: ChainComplex + Sync> MultiLift<CC> {
         let mut chunks: Vec<std::ops::Range<usize>> = vec![];
         let (mut start, mut acc) = (0, 0);
         for (i, d) in deferred.iter().enumerate() {
-            assert_eq!(d.out_cols(), out_cols, "steps at one bidegree share their width");
+            assert_eq!(
+                d.out_cols(),
+                out_cols,
+                "steps at one bidegree share their width"
+            );
             let n = terms(d);
             if i > start && acc + n > cap {
                 chunks.push(start..i);
@@ -318,8 +322,9 @@ impl<CC: ChainComplex + Sync> MultiLift<CC> {
 
         // Each `prepare` reads only shared data and returns its own pending state, so the
         // liftables are independent; collecting them in order keeps the batch deterministic.
-        let prepared =
-            parallel::guarded_map(self.liftables.len(), |i| self.liftables[i].prepare_batched(b));
+        let prepared = parallel::guarded_map(self.liftables.len(), |i| {
+            self.liftables[i].prepare_batched(b)
+        });
         let mut requests = Vec::with_capacity(prepared.len());
         let mut deferred = vec![];
         for p in prepared {

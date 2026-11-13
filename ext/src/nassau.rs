@@ -1359,34 +1359,34 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
         let target = &self.modules[b.s() - 1];
         let algebra = target.algebra();
         type Commands<'r> = Box<dyn Iterator<Item = anyhow::Result<NassauCommand>> + 'r>;
-        let (target_dim, zero_mask_dim, subalgebra, commands): (_, _, _, Commands<'_>) =
-            match saved {
-                Some(reader) => (
-                    reader.target_dim() as usize,
-                    reader.zero_mask_dim() as usize,
-                    Subalgebra::from_store_profile(&algebra, reader.subalgebra_profile())?,
+        let (target_dim, zero_mask_dim, subalgebra, commands): (_, _, _, Commands<'_>) = match saved
+        {
+            Some(reader) => (
+                reader.target_dim() as usize,
+                reader.zero_mask_dim() as usize,
+                Subalgebra::from_store_profile(&algebra, reader.subalgebra_profile())?,
+                Box::new(reader),
+            ),
+            // A store that should hold this quasi-inverse but does not is incomplete, not an
+            // invitation to spend the resolution's cost again silently. Nassau writes qi(s, t)
+            // while computing (s + 1, t), so it is legitimately absent exactly at the top of
+            // the computed region.
+            None if !force_recompute
+                && store.is_some()
+                && self.has_computed_bidegree(b + Bidegree::s_t(1, 0)) =>
+            {
+                return Ok(false);
+            }
+            None => {
+                let reader = RecomputeReader::new(self, b)?;
+                (
+                    reader.target_dim,
+                    reader.zero_mask_dim,
+                    Subalgebra::from_store_profile(&algebra, &reader.profile)?,
                     Box::new(reader),
-                ),
-                // A store that should hold this quasi-inverse but does not is incomplete, not an
-                // invitation to spend the resolution's cost again silently. Nassau writes qi(s, t)
-                // while computing (s + 1, t), so it is legitimately absent exactly at the top of
-                // the computed region.
-                None if !force_recompute
-                    && store.is_some()
-                    && self.has_computed_bidegree(b + Bidegree::s_t(1, 0)) =>
-                {
-                    return Ok(false);
-                }
-                None => {
-                    let reader = RecomputeReader::new(self, b)?;
-                    (
-                        reader.target_dim,
-                        reader.zero_mask_dim,
-                        Subalgebra::from_store_profile(&algebra, &reader.profile)?,
-                        Box::new(reader),
-                    )
-                }
-            };
+                )
+            }
+        };
         let subalgebra = &subalgebra;
 
         let p = self.prime();
@@ -1552,7 +1552,6 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
         Ok(true)
     }
 }
-
 
 impl<M: ZeroModule<Algebra = MilnorAlgebra>> AugmentedChainComplex for Resolution<M> {
     type ChainMap = FreeModuleHomomorphism<M>;

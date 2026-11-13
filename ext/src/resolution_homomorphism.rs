@@ -373,14 +373,18 @@ where
                     }),
                 );
             }
-            return Ok(StepPrep::Done(f_cur.add_generators_from_rows_ooo(input.t(), outputs)));
+            return Ok(StepPrep::Done(
+                f_cur.add_generators_from_rows_ooo(input.t(), outputs),
+            ));
         }
 
         if output.s() == 0 {
             let outputs =
                 extra_images.unwrap_or_else(|| vec![FpVector::new(p, fx_dimension); num_gens]);
             self.save_chain_map(input, &outputs);
-            return Ok(StepPrep::Done(f_cur.add_generators_from_rows_ooo(input.t(), outputs)));
+            return Ok(StepPrep::Done(
+                f_cur.add_generators_from_rows_ooo(input.t(), outputs),
+            ));
         }
 
         let mut outputs = vec![FpVector::new(p, fx_dimension); num_gens];
@@ -1675,14 +1679,14 @@ pub mod lift_batch {
             .unwrap_or(0);
         algebra.compute_seqno_tables(degree);
         let out = batch::multiply_batch(algebra, out_cols, None, num_rows, products);
-        let rows = out.iter_rows().map(|limbs| vector(out_cols, limbs)).collect();
+        let rows = out
+            .iter_rows()
+            .map(|limbs| vector(out_cols, limbs))
+            .collect();
         MULTIPLY_NS.fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
         CALLS.fetch_add(1, Ordering::Relaxed);
         TERMS.fetch_add(
-            products
-                .iter()
-                .map(|p| p.term_indices.len() as u64)
-                .sum(),
+            products.iter().map(|p| p.term_indices.len() as u64).sum(),
             Ordering::Relaxed,
         );
         rows
