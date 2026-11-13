@@ -56,6 +56,35 @@ pub trait Liftable: Sync + Send {
     /// shares one. Implementors compare it against their own target by identity, not by value: two
     /// equal-looking complexes have unrelated quasi-inverse stores.
     fn lifts_through(&self, target: &dyn Any) -> bool;
+
+    /// As [`Liftable::prepare`], but the products `a·f(w)` of the step may be left to the caller, so
+    /// that [`MultiLift`] can multiply those of every liftable at `b` in one batch (on a GPU; see
+    /// [`crate::resolution_homomorphism::lift_batch`]). The default never defers.
+    fn prepare_batched(&self, b: Bidegree) -> Prepared<'_> {
+        Prepared::Ready(self.prepare(b))
+    }
+}
+
+/// What [`Liftable::prepare_batched`] returns.
+pub enum Prepared<'a> {
+    /// As [`Liftable::prepare`] would have returned.
+    Ready(Option<LiftRequest<'a>>),
+    /// The step's products, to be multiplied by the caller, and how to finish preparing it.
+    Deferred(Box<dyn DeferredPrepare<'a> + 'a>),
+}
+
+/// A step whose products are left to [`MultiLift`]; see [`Liftable::prepare_batched`].
+pub trait DeferredPrepare<'a>: Send {
+    /// The width of every row of products: the dimension of the step's `f(d x)`.
+    fn out_cols(&self) -> usize;
+    /// The products, row `p.row` of `0..num_rows()` each.
+    fn products(&self) -> &[crate::resolution_homomorphism::lift_batch::Product];
+    fn num_rows(&self) -> usize;
+    /// The algebra the products are in.
+    fn algebra(&self) -> std::sync::Arc<algebra::MilnorAlgebra>;
+    /// The request [`Liftable::prepare`] would have returned, given each row's sum of products, or
+    /// `None` when they could not be multiplied (then they are computed here).
+    fn finish(self: Box<Self>, rows: Option<&[FpVector]>) -> Option<LiftRequest<'a>>;
 }
 
 /// The inputs to lift at one bidegree together with a continuation to finish the step; see
@@ -198,6 +227,72 @@ impl<CC: ChainComplex + Sync> MultiLift<CC> {
         sweep.failure.into_result()
     }
 
+    /// Multiply the products of every deferred step at a bidegree in one batch, and finish preparing
+    /// each step with its rows.
+    fn multiply_deferred<'a>(
+        deferred: Vec<Box<dyn DeferredPrepare<'a> + 'a>>,
+    ) -> Vec<Option<LiftRequest<'a>>> {
+        use crate::resolution_homomorphism::lift_batch;
+
+        let out_cols = deferred[0].out_cols();
+        // Consecutive steps up to `EXT_LIFT_GPU_BATCH_TERMS` terms per call (and at least one step),
+        // so that a bidegree of many large steps does not hold all their products at once.
+        let terms = |d: &Box<dyn DeferredPrepare<'a> + 'a>| -> usize {
+            d.products().iter().map(|p| p.term_indices.len()).sum()
+        };
+        let cap = lift_batch::batch_terms();
+        let mut chunks: Vec<std::ops::Range<usize>> = vec![];
+        let (mut start, mut acc) = (0, 0);
+        for (i, d) in deferred.iter().enumerate() {
+            assert_eq!(d.out_cols(), out_cols, "steps at one bidegree share their width");
+            let n = terms(d);
+            if i > start && acc + n > cap {
+                chunks.push(start..i);
+                (start, acc) = (i, 0);
+            }
+            acc += n;
+        }
+        chunks.push(start..deferred.len());
+
+        let mut slots: Vec<Option<Box<dyn DeferredPrepare<'a> + 'a>>> =
+            deferred.into_iter().map(Some).collect();
+        let mut out = Vec::with_capacity(slots.len());
+        for chunk in chunks {
+            let mut offsets = Vec::with_capacity(chunk.len());
+            let mut num_rows = 0;
+            for d in slots[chunk.clone()].iter().flatten() {
+                offsets.push(num_rows);
+                num_rows += d.num_rows();
+            }
+            let products: Vec<lift_batch::Product> = slots[chunk.clone()]
+                .iter()
+                .flatten()
+                .zip(&offsets)
+                .flat_map(|(d, &off)| {
+                    d.products().iter().map(move |p| lift_batch::Product {
+                        row: p.row + off,
+                        ..p.clone()
+                    })
+                })
+                .collect();
+            let algebra = slots[chunk.start].as_ref().unwrap().algebra();
+            let rows = lift_batch::multiply(&algebra, out_cols, num_rows, &products);
+            drop(products);
+            let jobs: Vec<std::sync::Mutex<Option<_>>> = slots[chunk]
+                .iter_mut()
+                .map(|d| d.take().unwrap())
+                .zip(offsets)
+                .map(|j| std::sync::Mutex::new(Some(j)))
+                .collect();
+            out.extend(parallel::guarded_map(jobs.len(), |i| {
+                let (d, off) = jobs[i].lock().unwrap().take().unwrap();
+                let n = d.num_rows();
+                d.finish(Some(&rows[off..off + n]))
+            }));
+        }
+        out
+    }
+
     /// Process one output bidegree: gather every participating liftable's inputs, do one batched
     /// lift, then finish each. Returns the newly-contiguous frontier of this output row.
     ///
@@ -223,8 +318,19 @@ impl<CC: ChainComplex + Sync> MultiLift<CC> {
 
         // Each `prepare` reads only shared data and returns its own pending state, so the
         // liftables are independent; collecting them in order keeps the batch deterministic.
-        let requests =
-            parallel::guarded_map(self.liftables.len(), |i| self.liftables[i].prepare(b));
+        let prepared =
+            parallel::guarded_map(self.liftables.len(), |i| self.liftables[i].prepare_batched(b));
+        let mut requests = Vec::with_capacity(prepared.len());
+        let mut deferred = vec![];
+        for p in prepared {
+            match p {
+                Prepared::Ready(r) => requests.push(r),
+                Prepared::Deferred(d) => deferred.push(d),
+            }
+        }
+        if !deferred.is_empty() {
+            requests.extend(Self::multiply_deferred(deferred));
+        }
         for mut req in requests.into_iter().flatten() {
             let start = inputs.len();
             inputs.append(&mut req.inputs);

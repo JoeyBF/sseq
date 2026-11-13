@@ -181,6 +181,21 @@ where
     fn lifts_through(&self, target: &dyn std::any::Any) -> bool {
         self.hom.lifts_through(target)
     }
+
+    /// As the map's own, inside the staircase; a deferred step is counted but not timed, since its
+    /// products are multiplied with the other maps' at the bidegree.
+    fn prepare_batched(&self, b: Bidegree) -> crate::lift::Prepared<'_> {
+        use crate::lift::Prepared;
+        if !self.covers(b) {
+            return Prepared::Ready(None);
+        }
+        let start = Instant::now();
+        let prepared = self.hom.prepare_batched(b);
+        self.steps.fetch_add(1, Ordering::Relaxed);
+        self.prepare_ns
+            .fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        prepared
+    }
 }
 
 /// Per-window timings and sizes.
@@ -1091,6 +1106,13 @@ where
             new_generators,
             new_monomials,
         };
+        if crate::resolution_homomorphism::lift_batch::enabled() {
+            tracing::info!(
+                t1,
+                "{}",
+                crate::resolution_homomorphism::lift_batch::summary()
+            );
+        }
         tracing::info!(
             ?stats,
             gens = ring.gens.len(),

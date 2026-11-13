@@ -320,6 +320,21 @@ where
         input: Bidegree,
         extra_images: Option<Vec<FpVector>>,
     ) -> StepPrep {
+        match self.prepare_step_inner(input, extra_images, false) {
+            Ok(step) => step,
+            Err(_) => unreachable!("a step is deferred only when asked to"),
+        }
+    }
+
+    /// [`Self::prepare_step`], which with `defer` (see [`lift_batch`]) returns the step's
+    /// products instead of multiplying them, as `Err`, to be finished by
+    /// [`DeferredStep::finish`] once multiplied.
+    fn prepare_step_inner(
+        &self,
+        input: Bidegree,
+        extra_images: Option<Vec<FpVector>>,
+        defer: bool,
+    ) -> Result<StepPrep, Box<DeferredStep>> {
         let output = input - self.shift;
         assert!(self.target.has_computed_bidegree(output));
         assert!(self.source.has_computed_bidegree(input));
@@ -329,7 +344,7 @@ where
         if input.t() < f_cur.next_degree() {
             assert!(extra_images.is_none());
             // We need to signal to compute the dependents of this
-            return StepPrep::Done(input.t()..input.t() + 1);
+            return Ok(StepPrep::Done(input.t()..input.t() + 1));
         }
 
         let p = self.source.prime();
@@ -338,10 +353,10 @@ where
         let fx_dimension = f_cur.target().dimension(output.t());
 
         if num_gens == 0 || fx_dimension == 0 {
-            return StepPrep::Done(f_cur.add_generators_from_rows_ooo(
+            return Ok(StepPrep::Done(f_cur.add_generators_from_rows_ooo(
                 input.t(),
                 vec![FpVector::new(p, fx_dimension); num_gens],
-            ));
+            )));
         }
 
         if let Some(store) = self.save_dir.store()
@@ -358,14 +373,14 @@ where
                     }),
                 );
             }
-            return StepPrep::Done(f_cur.add_generators_from_rows_ooo(input.t(), outputs));
+            return Ok(StepPrep::Done(f_cur.add_generators_from_rows_ooo(input.t(), outputs)));
         }
 
         if output.s() == 0 {
             let outputs =
                 extra_images.unwrap_or_else(|| vec![FpVector::new(p, fx_dimension); num_gens]);
             self.save_chain_map(input, &outputs);
-            return StepPrep::Done(f_cur.add_generators_from_rows_ooo(input.t(), outputs));
+            return Ok(StepPrep::Done(f_cur.add_generators_from_rows_ooo(input.t(), outputs)));
         }
 
         let mut outputs = vec![FpVector::new(p, fx_dimension); num_gens];
@@ -394,6 +409,38 @@ where
         let qi_rows: Vec<usize> = (0..num_gens)
             .filter(|&k| !d_source.output(input.t(), k).is_zero())
             .collect();
+
+        if defer && lift_batch::enabled() && p == 2 {
+            let dx: Vec<Vec<usize>> = qi_rows
+                .iter()
+                .map(|&k| {
+                    d_source
+                        .output(input.t(), k)
+                        .iter_nonzero()
+                        .map(|(i, _)| i)
+                        .collect()
+                })
+                .collect();
+            if let Some(batch) = lift_batch::build_shared(
+                &*f_prev.source(),
+                &*f_prev.target(),
+                f_prev.min_degree(),
+                f_prev.degree_shift(),
+                input.t(),
+                &dx,
+                &|deg, idx| f_prev.output(deg, idx).clone(),
+            ) {
+                return Err(Box::new(DeferredStep {
+                    input,
+                    output,
+                    outputs,
+                    qi_rows,
+                    fx_dimension,
+                    fdx_dimension,
+                    batch,
+                }));
+            }
+        }
 
         let terms = terms_log::Cell::default();
         let compute_fdx_vector = |k: usize| {
@@ -485,14 +532,40 @@ where
         }
         terms.write(input, output, fdx_vectors.len());
 
-        StepPrep::NeedsLift(PendingStep {
+        Ok(StepPrep::NeedsLift(PendingStep {
             input,
             output,
             outputs,
             fdx_vectors,
             qi_rows,
             fx_dimension,
-        })
+        }))
+    }
+
+    /// `f(d x)` for the generators `qi_rows` at `input`, on this CPU: as [`Self::prepare_step`]
+    /// computes it, without the measurement hooks.
+    fn cpu_fdx_vectors(
+        &self,
+        input: Bidegree,
+        qi_rows: &[usize],
+        fdx_dimension: usize,
+    ) -> Vec<FpVector> {
+        let p = self.source.prime();
+        let d_source = self.source.differential(input.s());
+        let f_prev = self.get_map(input.s() - 1);
+        self.shared_fdx_vectors(input, qi_rows, fdx_dimension)
+            .unwrap_or_else(|| {
+                crate::utils::parallel::guarded_map(qi_rows.len(), |i| {
+                    let mut v = FpVector::new(p, fdx_dimension);
+                    f_prev.apply(
+                        v.as_slice_mut(),
+                        1,
+                        input.t(),
+                        d_source.output(input.t(), qi_rows[i]).as_slice(),
+                    );
+                    v
+                })
+            })
     }
 
     /// `f(d x)` for the generators `qi_rows` at `input`, computing each product `a·f(w)` once even
@@ -606,6 +679,90 @@ where
 /// Outcome of [`MuResolutionHomomorphism::prepare_step`]; see [`LiftPrep`].
 pub(crate) type StepPrep = LiftPrep<PendingStep>;
 
+/// A lift step whose products `a·f(w)` were left to the caller; see
+/// [`crate::lift::Liftable::prepare_batched`].
+pub(crate) struct DeferredStep {
+    input: Bidegree,
+    output: Bidegree,
+    outputs: Vec<FpVector>,
+    qi_rows: Vec<usize>,
+    fx_dimension: usize,
+    fdx_dimension: usize,
+    batch: lift_batch::SharedBatch,
+}
+
+/// A [`DeferredStep`] together with the map it belongs to, for [`crate::lift::MultiLift`].
+struct DeferredLift<'a, const U: bool, CC1: FreeChainComplex<U>, CC2>
+where
+    CC1::Algebra: MuAlgebra<U>,
+    CC2: ChainComplex<Algebra = CC1::Algebra>,
+{
+    hom: &'a MuResolutionHomomorphism<U, CC1, CC2>,
+    step: Box<DeferredStep>,
+}
+
+impl<'a, const U: bool, CC1, CC2> crate::lift::DeferredPrepare<'a> for DeferredLift<'a, U, CC1, CC2>
+where
+    CC1: FreeChainComplex<U>,
+    CC1::Algebra: MuAlgebra<U>,
+    CC2: ChainComplex<Algebra = CC1::Algebra> + 'static,
+{
+    fn out_cols(&self) -> usize {
+        self.step.fdx_dimension
+    }
+
+    fn products(&self) -> &[lift_batch::Product] {
+        &self.step.batch.products
+    }
+
+    fn num_rows(&self) -> usize {
+        self.step.batch.num_rows
+    }
+
+    fn algebra(&self) -> Arc<algebra::MilnorAlgebra> {
+        Arc::clone(&self.step.batch.algebra)
+    }
+
+    fn finish(self: Box<Self>, rows: Option<&[FpVector]>) -> Option<crate::lift::LiftRequest<'a>> {
+        let Self { hom, step } = *self;
+        let DeferredStep {
+            input,
+            output,
+            outputs,
+            qi_rows,
+            fx_dimension,
+            fdx_dimension,
+            batch: _,
+        } = *step;
+        let fdx_vectors = match rows {
+            Some(rows) => rows.to_vec(),
+            None => hom.cpu_fdx_vectors(input, &qi_rows, fdx_dimension),
+        };
+        if lift_batch::check() {
+            assert_eq!(
+                fdx_vectors,
+                hom.cpu_fdx_vectors(input, &qi_rows, fdx_dimension),
+                "a batched lift step differs from the CPU at {input}"
+            );
+        }
+        let mut pending = PendingStep {
+            input,
+            output,
+            outputs,
+            fdx_vectors,
+            qi_rows,
+            fx_dimension,
+        };
+        let inputs = std::mem::take(&mut pending.fdx_vectors);
+        Some(crate::lift::LiftRequest {
+            inputs,
+            finish: Box::new(move |results| {
+                hom.finish_step(&mut pending, results);
+            }),
+        })
+    }
+}
+
 /// A lift step awaiting its quasi-inverse solve; see [`MuResolutionHomomorphism::prepare_step`].
 pub(crate) struct PendingStep {
     input: Bidegree,
@@ -652,6 +809,30 @@ where
         target
             .downcast_ref::<CC2>()
             .is_some_and(|target| std::ptr::eq(target, &*self.target))
+    }
+
+    fn prepare_batched(&self, b: Bidegree) -> crate::lift::Prepared<'_> {
+        use crate::lift::Prepared;
+        let input = b + self.shift;
+        if input.s() < self.shift.s()
+            || !self.source.has_computed_bidegree(input)
+            || !self.target.has_computed_bidegree(b)
+        {
+            return Prepared::Ready(None);
+        }
+        match self.prepare_step_inner(input, None, true) {
+            Ok(StepPrep::Done(_)) => Prepared::Ready(None),
+            Ok(StepPrep::NeedsLift(mut pending)) => {
+                let inputs = std::mem::take(&mut pending.fdx_vectors);
+                Prepared::Ready(Some(crate::lift::LiftRequest {
+                    inputs,
+                    finish: Box::new(move |results| {
+                        self.finish_step(&mut pending, results);
+                    }),
+                }))
+            }
+            Err(step) => Prepared::Deferred(Box::new(DeferredLift { hom: self, step })),
+        }
     }
 }
 
@@ -1320,5 +1501,201 @@ mod terms_log {
                 out.flush().unwrap();
             }
         }
+    }
+}
+
+/// Lift steps' products `a·f(w)` as Milnor multiply batches ([`algebra::milnor_algebra::batch`]),
+/// which run on a GPU when there is one.
+///
+/// With `EXT_LIFT_BATCH` set to `1`, or unset with a GPU present, a lift step through
+/// [`crate::lift::MultiLift`] leaves its products to the sweep
+/// ([`crate::lift::Liftable::prepare_batched`]), which multiplies those of every map at a bidegree
+/// together, `EXT_LIFT_BATCH_TERMS` terms at a time. `EXT_LIFT_BATCH=0` computes every step's
+/// products on its own, on the CPU. `EXT_LIFT_BATCH_CHECK=1` compares every batched step with that.
+pub mod lift_batch {
+    use std::{
+        collections::HashMap,
+        sync::{
+            Arc, LazyLock,
+            atomic::{AtomicU64, Ordering},
+        },
+        time::Instant,
+    };
+
+    pub use algebra::milnor_algebra::batch::BatchProduct as Product;
+    use algebra::{
+        MilnorAlgebra,
+        milnor_algebra::batch,
+        module::{FreeModule, Module},
+    };
+    use fp::{prime::TWO, vector::FpVector};
+
+    static ENABLED: LazyLock<bool> = LazyLock::new(|| match std::env::var("EXT_LIFT_BATCH") {
+        Ok(v) => v != "0",
+        Err(_) => batch::gpu_available(),
+    });
+    static CHECK: LazyLock<bool> =
+        LazyLock::new(|| std::env::var("EXT_LIFT_BATCH_CHECK").is_ok_and(|v| v != "0"));
+
+    /// Batches multiplied, their terms, and nanoseconds building them and multiplying them.
+    static CALLS: AtomicU64 = AtomicU64::new(0);
+    static TERMS: AtomicU64 = AtomicU64::new(0);
+    static BUILD_NS: AtomicU64 = AtomicU64::new(0);
+    static MULTIPLY_NS: AtomicU64 = AtomicU64::new(0);
+
+    /// Whether lift steps leave their products to batches.
+    pub fn enabled() -> bool {
+        *ENABLED
+    }
+
+    pub(super) fn check() -> bool {
+        *CHECK
+    }
+
+    /// `EXT_LIFT_BATCH_TERMS` (default 10^8): the most terms one multiply takes.
+    pub fn batch_terms() -> usize {
+        static CAP: LazyLock<usize> = LazyLock::new(|| {
+            std::env::var("EXT_LIFT_BATCH_TERMS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(100_000_000)
+        });
+        *CAP
+    }
+
+    /// One line with the counters, for logs.
+    pub fn summary() -> String {
+        format!(
+            "lift_batch calls={} terms={} build_s={:.1} multiply_s={:.1} gpu_launches={}",
+            CALLS.load(Ordering::Relaxed),
+            TERMS.load(Ordering::Relaxed),
+            BUILD_NS.load(Ordering::Relaxed) as f64 / 1e9,
+            MULTIPLY_NS.load(Ordering::Relaxed) as f64 / 1e9,
+            batch::gpu_launches(),
+        )
+    }
+
+    /// A step's products: row `k` is `f(d x_k)`, holding `a·f(w)` for every term `a·w` of
+    /// `d x_k`.
+    ///
+    /// A row per distinct term instead, summed into the `f(d x)` afterwards, multiplies each
+    /// product once but reads back a full-width row per term, almost all zeros: on a GPU that
+    /// readback, not the multiply, was the cost.
+    pub struct SharedBatch {
+        pub algebra: Arc<MilnorAlgebra>,
+        pub products: Vec<Product>,
+        pub num_rows: usize,
+    }
+
+    /// The batch of a step whose `d x_k` have the source basis indices `dx[k]` (ascending), each
+    /// `f(w)`'s blocks built once and shared; `None` unless both modules are free over the Milnor
+    /// algebra and it takes batches, or when nothing is multiplied.
+    pub(super) fn build_shared(
+        source: &dyn std::any::Any,
+        target: &dyn std::any::Any,
+        min_degree: i32,
+        shift: i32,
+        t: i32,
+        dx: &[Vec<usize>],
+        f_prev: &dyn Fn(i32, usize) -> FpVector,
+    ) -> Option<SharedBatch> {
+        let start = Instant::now();
+        let source = source.downcast_ref::<FreeModule<MilnorAlgebra>>()?;
+        let target = target.downcast_ref::<FreeModule<MilnorAlgebra>>()?;
+        let algebra = target.algebra();
+        if !batch::batch_applicable(&algebra) {
+            return None;
+        }
+        let out_t = t - shift;
+        type Blocks = Arc<Vec<(i32, Arc<[usize]>, usize)>>;
+        let mut blocks: HashMap<(i32, usize), Blocks> = HashMap::new();
+        let mut products = vec![];
+        // A row's terms are ascending, so a cursor decodes them without a search per term.
+        let mut cursor = source.opgen_cursor(t);
+        for (row, terms) in dx.iter().enumerate() {
+            for &idx in terms {
+                let og = cursor.get(idx);
+                if og.generator_degree < min_degree || og.operation_degree == 0 {
+                    continue;
+                }
+                let w = blocks
+                    .entry((og.generator_degree, og.generator_index))
+                    .or_insert_with(|| {
+                        let fw = f_prev(og.generator_degree, og.generator_index);
+                        let fw_degree = og.generator_degree - shift;
+                        Arc::new(
+                            target
+                                .iter_slices(fw_degree, fw.as_slice())
+                                .filter_map(|(h_deg, h_idx, op_deg, slice)| {
+                                    let ts: Arc<[usize]> =
+                                        slice.iter_nonzero().map(|(i, _)| i).collect();
+                                    (!ts.is_empty()).then(|| {
+                                        (op_deg, ts, target.generator_offset(out_t, h_deg, h_idx))
+                                    })
+                                })
+                                .collect(),
+                        )
+                    })
+                    .clone();
+                for (s_degree, ts, out_offset) in w.iter() {
+                    products.push(Product {
+                        r_degree: og.operation_degree,
+                        r_idx: og.operation_index,
+                        s_degree: *s_degree,
+                        term_indices: Arc::clone(ts),
+                        row,
+                        out_offset: *out_offset,
+                    });
+                }
+            }
+        }
+        if products.is_empty() {
+            return None;
+        }
+        BUILD_NS.fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        Some(SharedBatch {
+            algebra,
+            products,
+            num_rows: dx.len(),
+        })
+    }
+
+    /// Multiply `products` over `num_rows` rows of `out_cols` columns, on a GPU if there is one.
+    pub fn multiply(
+        algebra: &MilnorAlgebra,
+        out_cols: usize,
+        num_rows: usize,
+        products: &[Product],
+    ) -> Vec<FpVector> {
+        let start = Instant::now();
+        let degree = products
+            .iter()
+            .map(|p| p.r_degree + p.s_degree)
+            .max()
+            .unwrap_or(0);
+        algebra.compute_seqno_tables(degree);
+        let out = batch::multiply_batch(algebra, out_cols, None, num_rows, products);
+        let rows = out.iter_rows().map(|limbs| vector(out_cols, limbs)).collect();
+        MULTIPLY_NS.fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        CALLS.fetch_add(1, Ordering::Relaxed);
+        TERMS.fetch_add(
+            products
+                .iter()
+                .map(|p| p.term_indices.len() as u64)
+                .sum(),
+            Ordering::Relaxed,
+        );
+        rows
+    }
+
+    /// An `FpVector` of length `len` from bit-packed `u32` limbs (entry `i` at limb `i / 32`, bit
+    /// `i % 32`), read as the little-endian `u64` limbs `FpVector::from_bytes` takes.
+    fn vector(len: usize, limbs: &[u32]) -> FpVector {
+        let mut bytes = Vec::with_capacity(len.div_ceil(64) * 8);
+        for &l in limbs {
+            bytes.extend_from_slice(&l.to_le_bytes());
+        }
+        bytes.resize(len.div_ceil(64) * 8, 0);
+        FpVector::from_bytes(TWO, len, &mut &bytes[..]).expect("limbs cover the row")
     }
 }
