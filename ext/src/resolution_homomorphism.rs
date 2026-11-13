@@ -1678,6 +1678,15 @@ pub mod lift_batch {
     }
 
     /// One line with the counters, for logs.
+    /// The product terms multiplied so far and the thread time spent multiplying them, in
+    /// nanoseconds.
+    pub fn multiply_totals() -> (u64, u64) {
+        (
+            TERMS.load(Ordering::Relaxed),
+            MULTIPLY_NS.load(Ordering::Relaxed),
+        )
+    }
+
     pub fn summary() -> String {
         format!(
             "lift_batch calls={} terms={} build_s={:.1} multiply_s={:.1} gpu_launches={}",

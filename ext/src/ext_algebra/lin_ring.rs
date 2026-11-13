@@ -45,8 +45,8 @@ use sseq::coordinates::{Bidegree, BidegreeGenerator};
 
 use crate::{
     chain_complex::{AugmentedChainComplex, FreeChainComplex},
-    lift::{LiftRequest, Liftable, MultiLift},
-    resolution_homomorphism::ResolutionHomomorphism,
+    lift::{DeferredPrepare, LiftRequest, Liftable, MultiLift},
+    resolution_homomorphism::{ResolutionHomomorphism, lift_batch},
 };
 
 /// Width of the `t` windows: the internal degree of `c_0`, the first generator off the `h_i` line.
@@ -126,9 +126,71 @@ struct Staircase<CC: FreeChainComplex> {
     stair: Arc<[AtomicI32]>,
     /// [`map_name`] of the monomial, for the step log whether or not the map is saved.
     name: String,
-    /// Steps prepared and their thread time since the last [`Staircase::take_window`].
+    /// Steps prepared and their thread time since the last [`Staircase::take_window`], building
+    /// the products of deferred steps included.
     steps: AtomicU64,
     prepare_ns: AtomicU64,
+    /// The product terms of its deferred steps since the last [`Staircase::take_window`]. Their
+    /// multiplication is shared with other maps' steps, so it is costed by terms (see
+    /// [`window_cost`]).
+    terms: AtomicU64,
+}
+
+/// A map's thread seconds in a window: its own preparation, and its share of the multiplications by
+/// its product terms at `ns_per_term`.
+fn window_cost(prepare_s: f64, terms: u64, ns_per_term: f64) -> f64 {
+    prepare_s + terms as f64 * ns_per_term / 1e9
+}
+
+/// The thread nanoseconds per multiplied term since `start`, a value of
+/// [`lift_batch::multiply_totals`].
+fn ns_per_term(start: (u64, u64)) -> f64 {
+    let (terms, ns) = lift_batch::multiply_totals();
+    let terms = terms - start.0;
+    if terms == 0 {
+        0.0
+    } else {
+        (ns - start.1) as f64 / terms as f64
+    }
+}
+
+/// A deferred step of a [`Staircase`], counting the terms and time of building its products.
+struct Counted<'a> {
+    inner: Box<dyn DeferredPrepare<'a> + 'a>,
+    terms: &'a AtomicU64,
+    prepare_ns: &'a AtomicU64,
+}
+
+impl<'a> DeferredPrepare<'a> for Counted<'a> {
+    fn out_cols(&self) -> usize {
+        self.inner.out_cols()
+    }
+
+    fn build(&self) -> Vec<lift_batch::Product> {
+        let start = Instant::now();
+        let products = self.inner.build();
+        self.prepare_ns
+            .fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        let terms: usize = products.iter().map(|p| p.term_indices.len()).sum();
+        self.terms.fetch_add(terms as u64, Ordering::Relaxed);
+        products
+    }
+
+    fn size(&self) -> usize {
+        self.inner.size()
+    }
+
+    fn num_rows(&self) -> usize {
+        self.inner.num_rows()
+    }
+
+    fn algebra(&self) -> Arc<algebra::MilnorAlgebra> {
+        self.inner.algebra()
+    }
+
+    fn finish(self: Box<Self>, rows: Option<&[FpVector]>) -> Option<crate::lift::LiftRequest<'a>> {
+        self.inner.finish(rows)
+    }
 }
 
 /// `EXT_STEP_LOG_MIN_MS` (default 1): the shortest map step the step log records individually.
@@ -141,11 +203,13 @@ static STEP_LOG_MIN_NS: std::sync::LazyLock<u64> = std::sync::LazyLock::new(|| {
 });
 
 impl<CC: FreeChainComplex> Staircase<CC> {
-    /// The steps prepared and their thread time in seconds since the last call, resetting both.
-    fn take_window(&self) -> (u64, f64) {
+    /// The steps prepared, their thread time in seconds and their deferred product terms since
+    /// the last call, resetting all three.
+    fn take_window(&self) -> (u64, f64, u64) {
         (
             self.steps.swap(0, Ordering::Relaxed),
             self.prepare_ns.swap(0, Ordering::Relaxed) as f64 / 1e9,
+            self.terms.swap(0, Ordering::Relaxed),
         )
     }
 }
@@ -202,7 +266,14 @@ where
         self.steps.fetch_add(1, Ordering::Relaxed);
         self.prepare_ns.fetch_add(ns, Ordering::Relaxed);
         // A deferred step is logged with its product terms when they are built.
-        prepared
+        match prepared {
+            Prepared::Deferred(inner) => Prepared::Deferred(Box::new(Counted {
+                inner,
+                terms: &self.terms,
+                prepare_ns: &self.prepare_ns,
+            })),
+            ready => ready,
+        }
     }
 }
 
@@ -310,9 +381,11 @@ where
             name: job.name.clone(),
             steps: AtomicU64::new(0),
             prepare_ns: AtomicU64::new(0),
+            terms: AtomicU64::new(0),
             stair: job.stair.iter().map(|&n| AtomicI32::new(n)).collect(),
         }));
     }
+    let start = lift_batch::multiply_totals();
     if !maps.is_empty() {
         let liftables = maps
             .iter()
@@ -320,9 +393,13 @@ where
             .collect();
         MultiLift::new(Arc::clone(res), liftables).extend_through_stem(bound)?;
     }
+    let rate = ns_per_term(start);
     Ok(maps
         .iter()
-        .map(|m| (m.name.clone(), m.take_window().1))
+        .map(|m| {
+            let (_, prepare_s, terms) = m.take_window();
+            (m.name.clone(), window_cost(prepare_s, terms, rate))
+        })
         .collect())
 }
 
@@ -861,6 +938,7 @@ where
         // Extend every map to the generators this window reads: `a_j <= a_lo(m)` with
         // `|m| + |a_j|` in range and in the window or before.
         let t_lift = Instant::now();
+        let multiplied = lift_batch::multiply_totals();
         let mut bound = Bidegree::n_s(-1, -1);
         let mut cells = 0;
         let mut grown: Vec<usize> = vec![];
@@ -979,9 +1057,11 @@ where
         } else {
             lift(&local)?;
         }
+        let rate = ns_per_term(multiplied);
         for (i, map) in ring.maps.iter().enumerate() {
-            let (steps, prepare_s) = map.take_window();
+            let (steps, prepare_s, terms) = map.take_window();
             if steps > 0 {
+                let prepare_s = window_cost(prepare_s, terms, rate);
                 if !costed_remotely[i] {
                     last_cost[i] = prepare_s;
                 }
@@ -1156,6 +1236,7 @@ where
                         name: label,
                         steps: AtomicU64::new(0),
                         prepare_ns: AtomicU64::new(0),
+                        terms: AtomicU64::new(0),
                         stair: stair.into_iter().map(AtomicI32::new).collect(),
                     }));
                 }
