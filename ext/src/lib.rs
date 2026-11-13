@@ -121,6 +121,7 @@
 //! | [differentials](../differentials/index.html) | Print all differentials in the minimal resolution. |
 //! | [filtration_one](../filtration_one/index.html) | Print all filtration one products. |
 //! | [lift_hom](../lift_hom/index.html) | Compute the map $\Ext(N, k) \to \Ext(M, k)$ induced by an element in $\Ext(M, N)$. |
+//! | [lin_ring](../lin_ring/index.html) | Compute the ring structure of $\Ext_A(\F_2, \F_2)$ by Lin's method. |
 //! | [mahowald_invariant](../mahowald_invariant/index.html) | Compute (algebraic) Mahowald invariants. |
 //! | [massey](../massey/index.html) | Compute Massey products. |
 //! | [num_gens](../num_gens/index.html) | Compute the dimension of Ext in each bidegree. |
@@ -169,6 +170,9 @@
 
 pub mod chain_complex;
 pub mod ext_algebra;
+pub mod hi_products;
+pub mod lift;
+pub mod lin_ring;
 pub mod resolution;
 pub mod resolution_homomorphism;
 pub mod save;
