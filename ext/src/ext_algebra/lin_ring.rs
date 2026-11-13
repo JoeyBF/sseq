@@ -19,7 +19,9 @@
 //!
 //! [`compute`] sweeps internal degrees `t` in windows of [`WINDOW_T`]: a product read off a map lands
 //! at least `t(c_0) = 11` above the monomial, so maps of monomials found in a window are lifted (over
-//! their whole corner, one batched [`MultiLift`] sweep) before the next. At each bidegree the
+//! their whole corner, one batched [`MultiLift`] sweep) before the next. With the generators in
+//! [`GenOrder::Stem`] it sweeps stems instead, in windows of [`WINDOW_N`] = `n(c_0)` = 8, so that
+//! after each window the whole ring is known through a stem. At each bidegree the
 //! candidates `a_k m'` (`m' ∈ B`, `k <= lo(m')`, all directly readable) span the decomposables;
 //! taken in increasing order, the independent ones are the new basis monomials (the standard
 //! monomials: a monomial is standard iff it is independent of the smaller ones, and every standard
@@ -50,6 +52,11 @@ use crate::{
 /// Width of the `t` windows: the internal degree of `c_0`, the first generator off the `h_i` line.
 /// [`compute`] checks that no generator off the `h_i` line has smaller `t`.
 pub const WINDOW_T: i32 = 11;
+
+/// Width of the stem windows of a [`GenOrder::Stem`] computation: the stem of `c_0`, the first
+/// generator off the `h_i` line by stem. [`compute`] checks that no generator off the `h_i` line has
+/// smaller stem.
+pub const WINDOW_N: i32 = 8;
 
 /// The bidegrees `0 <= n <= max_n`, `0 <= s <= max_s`, `t <= max_t` over which a [`Ring`] is
 /// computed. A product is known when both factors and the product lie in the range.
@@ -450,6 +457,15 @@ impl<CC> Ring<CC>
 where
     CC: FreeChainComplex + AugmentedChainComplex,
 {
+    /// The degree [`compute`]'s windows sweep: `t` in [`GenOrder::T`], the stem in
+    /// [`GenOrder::Stem`].
+    pub fn window_degree(&self, b: Bidegree) -> i32 {
+        match self.order {
+            GenOrder::T => b.t(),
+            GenOrder::Stem => b.n(),
+        }
+    }
+
     /// The sort key of generator `j` in [`GenOrder`].
     fn key(&self, j: usize) -> (i32, i32, usize) {
         let g = self.gens[j];
@@ -795,12 +811,20 @@ where
     );
     // Per map: the thread seconds its last lift took, which decides whether it is dispatched.
     let mut last_cost: Vec<f64> = vec![];
-    let t_end = max_t.min(max_n + max_s);
-    let mut t0 = 1;
+    // Windows of `t` in the `t` order, of stems in the stem order, so that the order in which
+    // generators are found is the order they are compared in. `t0..=t1` is the window, in that
+    // degree.
+    let by_stem = ring.order == GenOrder::Stem;
+    let (width, t_end, mut t0) = if by_stem {
+        (WINDOW_N, max_n, 0)
+    } else {
+        (WINDOW_T, max_t.min(max_n + max_s), 1)
+    };
+    let deg = move |b: Bidegree| if by_stem { b.n() } else { b.t() };
     while t0 <= t_end {
-        let t1 = (t0 + WINDOW_T - 1).min(t_end);
+        let t1 = (t0 + width - 1).min(t_end);
         // Extend every map to the generators this window reads: `a_j <= a_lo(m)` with
-        // `|m| + |a_j|` in range and `t <= t1`.
+        // `|m| + |a_j|` in range and in the window or before.
         let t_lift = Instant::now();
         let mut bound = Bidegree::n_s(-1, -1);
         let mut cells = 0;
@@ -809,7 +833,7 @@ where
             let mono = &ring.basis[map_mono[i]];
             let (b, lo) = (mono.b, mono.lo());
             let mut grew = false;
-            while cursor[i] < ring.gens.len() && ring.gens[cursor[i]].t() <= t1 - b.t() {
+            while cursor[i] < ring.gens.len() && deg(ring.gens[cursor[i]].degree()) <= t1 - deg(b) {
                 let (j, g) = (cursor[i], ring.gens[cursor[i]]);
                 cursor[i] += 1;
                 if !ring.le(j, lo) || h_index(g).is_some() || !in_range(b + g.degree()) {
@@ -935,10 +959,16 @@ where
 
         let t_decide = Instant::now();
         let (mut new_generators, mut new_monomials) = (0, 0);
-        for t in t0..=t1 {
-            for s in 0..=t.min(max_s) {
-                let b = Bidegree::s_t(s, t);
-                if !in_range(b) {
+        for w in t0..=t1 {
+            for s in 0..=if by_stem { max_s } else { w.min(max_s) } {
+                let b = if by_stem {
+                    Bidegree::n_s(w, s)
+                } else {
+                    Bidegree::s_t(s, w)
+                };
+                let t = b.t();
+                // The unit is in place from the start.
+                if !in_range(b) || (b.n() == 0 && s == 0) {
                     continue;
                 }
                 let d = ring.dim(b);
@@ -1015,8 +1045,8 @@ where
                         "a generator at {b} in filtration 1 is not an h_i"
                     );
                     ensure!(
-                        s == 1 || t >= WINDOW_T,
-                        "a generator at {b} off the h_i line below t = {WINDOW_T}"
+                        s == 1 || deg(b) >= width,
+                        "a generator at {b} off the h_i line below the window width {width}"
                     );
                     ring.gens.push(g);
                     ring.standard.insert(vec![j as u32]);
@@ -1123,8 +1153,12 @@ where
         ring.windows.push(stats);
         on_window(&mut ring, t0, t1)?;
         if t1 < t_end && stop_file.as_ref().is_some_and(|f| f.exists()) {
-            tracing::info!(t = t1, "lin_ring stopped by EXT_LIN_RING_STOP");
-            ring.range.max_t = t1;
+            tracing::info!(window_end = t1, "lin_ring stopped by EXT_LIN_RING_STOP");
+            if by_stem {
+                ring.range.max_n = t1;
+            } else {
+                ring.range.max_t = t1;
+            }
             break;
         }
         t0 = t1 + 1;

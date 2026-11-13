@@ -118,9 +118,13 @@ fn main() -> anyhow::Result<()> {
         .collect();
     all.sort_by_key(|b| (b.n(), b.s()));
     // The bidegrees in the ring's range by internal degree, each list in (n, s) order.
+    // The ring is computed in windows of `t`, or of stems with `EXT_LIN_RING_ORDER=stem`; each
+    // window's rows are written when it is done.
+    let by_stem = std::env::var("EXT_LIN_RING_ORDER").is_ok_and(|v| v == "stem");
+    let deg = move |b: Bidegree| if by_stem { b.n() } else { b.t() };
     let mut by_t: std::collections::HashMap<i32, Vec<Bidegree>> = Default::default();
     for &b in all.iter().filter(|&&b| range.contains(b)) {
-        by_t.entry(b.t()).or_default().push(b);
+        by_t.entry(deg(b)).or_default().push(b);
     }
 
     let mut w = csv(&dir, "rank.csv", "stem,Adams_filtration,rank")?;
@@ -179,7 +183,7 @@ fn main() -> anyhow::Result<()> {
             w,
             "# Ext_A(F_2, F_2): ranks and products\n\n\
              Computed with ext-rs ({}) by W. Lin's method (`ext::ext_algebra::lin_ring`).\n\n\
-             - Status: {} through internal degree t <= {decided_t}, after {:.0} s.\n\
+             - Status: {} through {} <= {decided_t}, after {:.0} s.\n\
              - Resolution: stems 0..={max_n}, Adams filtration 0..={max_s}. `rank.csv` covers it \
              all.\n\
              - Ring range: stem <= {ring_n}, Adams filtration <= {max_s}, t <= {max_t}; so far \
@@ -187,13 +191,12 @@ fn main() -> anyhow::Result<()> {
              - `x_(n, s, i)` is the dual of the i-th generator of the resolution in bidegree (n, \
              s).\n\
              - `indecomposables.csv`: the h_i through the whole range, then the others as they are \
-             found. Others are indecomposable modulo products of earlier generators (by t, then \
-             s).\n\
+             found. Others are indecomposable modulo products of earlier generators ({}).\n\
              - `generator_products.csv`: {gen_products} non-zero products indecomposable x basis \
              element; h_i over the whole range, the rest over the decided part of the ring range.\n\
              - `products.csv`: {} non-zero products of pairs of basis elements in the decided part \
              of the ring range, each unordered pair once.\n\
-             - Rows are grouped by the window of internal degrees in which the product lands. \
+             - Rows are grouped by the window ({}) in which the product lands. \
              Products of a pair whose product leaves the range are absent, not zero.",
             env!("CARGO_PKG_VERSION"),
             if done {
@@ -201,12 +204,23 @@ fn main() -> anyhow::Result<()> {
             } else {
                 "in progress, decided"
             },
+            if by_stem { "stem" } else { "internal degree t" },
             start.elapsed().as_secs_f64(),
+            if by_stem {
+                "by stem, then s"
+            } else {
+                "by t, then s"
+            },
             if full {
                 products.to_string()
             } else {
                 "(not written)".to_string()
-            }
+            },
+            if by_stem {
+                "of 8 stems"
+            } else {
+                "of 11 internal degrees"
+            },
         )?;
         Ok(())
     };
@@ -218,7 +232,7 @@ fn main() -> anyhow::Result<()> {
         for g in ring
             .gens
             .iter()
-            .filter(|g| g.s() != 1 && (t0..=t1).contains(&g.t()))
+            .filter(|g| g.s() != 1 && (t0..=t1).contains(&deg(g.degree())))
         {
             writeln!(indec, "{},{},{},", g.n(), g.s(), g.idx())?;
             n_indec += 1;
@@ -240,7 +254,7 @@ fn main() -> anyhow::Result<()> {
                 .map(|g| g.idx())
                 .collect();
             for tt in t0..=t1 {
-                for &c in by_t.get(&(tt - b.t())).into_iter().flatten() {
+                for &c in by_t.get(&(tt - deg(b))).into_iter().flatten() {
                     if !ring.range().contains(b + c) || res.number_of_gens_in_bidegree(b + c) == 0 {
                         continue;
                     }
@@ -300,7 +314,9 @@ fn main() -> anyhow::Result<()> {
         Ok(())
     };
     ext.compute_ring_with(range, save_maps, &mut on_window)?;
-    let done = ext.ring_range().is_some_and(|r| r.max_t == max_t);
+    let done = ext
+        .ring_range()
+        .is_some_and(|r| r.max_t == max_t && r.max_n == ring_n);
     let (gens_n, basis_n, maps_n) = ext
         .with_ring(|r| (r.gens.len(), r.basis.len(), r.maps()))
         .unwrap();
