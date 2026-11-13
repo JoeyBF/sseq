@@ -332,6 +332,16 @@ impl<CC: ChainComplex + Sync> MultiLift<CC> {
         min_t: i32,
         failure: &Failure,
     ) -> Range<i32> {
+        /// Cells being stepped right now, across all sweeps, for the step log.
+        static IN_FLIGHT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        struct InFlight;
+        impl Drop for InFlight {
+            fn drop(&mut self) {
+                IN_FLIGHT.fetch_sub(1, Ordering::Relaxed);
+            }
+        }
+        let in_flight = IN_FLIGHT.fetch_add(1, Ordering::Relaxed) + 1;
+        let _in_flight = InFlight;
         if failure.is_set() {
             return b.t()..b.t();
         }
@@ -385,12 +395,21 @@ impl<CC: ChainComplex + Sync> MultiLift<CC> {
         }
         if maps > 0 {
             let ms = |a: std::time::Instant, z: std::time::Instant| (z - a).as_secs_f64() * 1e3;
+            let mib = |vs: &[FpVector]| {
+                vs.iter()
+                    .map(|v| 8 * FpVector::num_limbs(v.prime(), v.len()) as u64)
+                    .sum::<u64>() as f64
+                    / (1u64 << 20) as f64
+            };
             tracing::info!(
                 target: "ext::lift::steps",
                 kind = "cell",
                 n = b.n(),
                 s = b.s(),
                 maps,
+                in_flight,
+                inputs_mib = mib(&inputs),
+                results_mib = mib(&results),
                 inputs = inputs.len(),
                 prepare_ms = ms(start, prepared),
                 solve_ms = ms(prepared, solved),
