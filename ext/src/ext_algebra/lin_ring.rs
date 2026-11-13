@@ -1206,6 +1206,27 @@ where
         );
         ring.windows.push(stats);
         on_window(&mut ring, t0, t1)?;
+        // The product memos only speed up reading products within a window (the export reads
+        // each window's products once); kept, they would grow into the whole table, densely.
+        {
+            let bytes = |v: &FpVector| 8 * FpVector::num_limbs(TWO, v.len()) as u64;
+            let memo: u64 = ring.memo.values().map(bytes).sum();
+            let block_memo: u64 = ring
+                .block_memo
+                .values()
+                .map(|b| b.iter().map(bytes).sum::<u64>())
+                .sum();
+            tracing::info!(
+                t1,
+                memo_entries = ring.memo.len(),
+                memo_gib = memo as f64 / (1u64 << 30) as f64,
+                block_memo_entries = ring.block_memo.len(),
+                block_memo_gib = block_memo as f64 / (1u64 << 30) as f64,
+                "lin_ring memos cleared"
+            );
+            ring.memo = HashMap::new();
+            ring.block_memo = HashMap::new();
+        }
         if t1 < t_end && stop_file.as_ref().is_some_and(|f| f.exists()) {
             tracing::info!(window_end = t1, "lin_ring stopped by EXT_LIN_RING_STOP");
             if by_stem {
