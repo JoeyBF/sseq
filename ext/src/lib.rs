@@ -169,6 +169,12 @@
 #![allow(clippy::upper_case_acronyms)]
 #![deny(clippy::use_self, unsafe_op_in_unsafe_fn)]
 
+/// jemalloc as the allocator (feature `jemalloc`), profiled through `_RJEM_MALLOC_CONF` with feature
+/// `heapprof`.
+#[cfg(feature = "jemalloc")]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 pub mod chain_complex;
 pub mod ext_algebra;
 pub mod lift;

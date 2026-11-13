@@ -1646,6 +1646,18 @@ pub mod lift_batch {
         *MIN
     }
 
+    /// `EXT_LIFT_BATCH_PRODUCTS` (default 2 * 10^7): the most products one multiply takes. Each is
+    /// a few dozen bytes, so this bounds the memory of a bidegree's chunk.
+    pub fn batch_products() -> usize {
+        static CAP: LazyLock<usize> = LazyLock::new(|| {
+            std::env::var("EXT_LIFT_BATCH_PRODUCTS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(20_000_000)
+        });
+        *CAP
+    }
+
     /// `EXT_LIFT_BATCH_TERMS` (default 10^8): the most terms one multiply takes.
     pub fn batch_terms() -> usize {
         static CAP: LazyLock<usize> = LazyLock::new(|| {

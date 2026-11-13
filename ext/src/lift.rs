@@ -237,11 +237,14 @@ impl<CC: ChainComplex + Sync> MultiLift<CC> {
     ) -> Vec<Option<LiftRequest<'a>>> {
         use crate::resolution_homomorphism::lift_batch;
 
-        /// Steps built at once, in parallel, before their products join the chunk.
+        /// At most this many steps are built at once, in parallel, before their products join the
+        /// chunk; fewer when their `d x` hold `GROUP_TERMS` terms between them.
         const GROUP: usize = 16;
+        const GROUP_TERMS: usize = 1 << 20;
         let out_cols = deferred[0].out_cols();
         let algebra = deferred[0].algebra();
         let cap = lift_batch::batch_terms();
+        let product_cap = lift_batch::batch_products();
         let mut out: Vec<Option<LiftRequest<'a>>> = Vec::with_capacity(deferred.len());
         // The chunk: its steps with their first rows, its products and their terms. Steps are built
         // in groups of `GROUP` and multiplied once the chunk holds `cap` terms, so a bidegree holds
@@ -279,8 +282,13 @@ impl<CC: ChainComplex + Sync> MultiLift<CC> {
         };
         let mut steps = deferred.into_iter().peekable();
         while steps.peek().is_some() {
-            let group: Vec<Box<dyn DeferredPrepare<'a> + 'a>> =
-                steps.by_ref().take(GROUP).collect();
+            let mut group: Vec<Box<dyn DeferredPrepare<'a> + 'a>> = vec![];
+            let mut group_terms = 0;
+            while group.len() < GROUP && group_terms < GROUP_TERMS {
+                let Some(d) = steps.next() else { break };
+                group_terms += d.size();
+                group.push(d);
+            }
             for d in &group {
                 assert_eq!(
                     d.out_cols(),
@@ -299,7 +307,9 @@ impl<CC: ChainComplex + Sync> MultiLift<CC> {
                 }));
                 chunk.push((d, off));
             }
-            if terms >= cap {
+            // A product is a few dozen bytes however few its terms, so the chunk is bounded in
+            // products as well as in terms.
+            if terms >= cap || products.len() >= product_cap {
                 flush(
                     &mut chunk,
                     &mut products,

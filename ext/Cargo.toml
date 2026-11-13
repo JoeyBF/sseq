@@ -13,6 +13,8 @@ license = "(MIT OR Apache-2.0)"
 resolver = "2"
 
 [dependencies]
+# jemalloc as the global allocator (features `jemalloc`, `heapprof`).
+tikv-jemallocator = { version = "0.6", optional = true }
 algebra = { path = "crates/algebra", default-features = false }
 bivec = { path = "crates/bivec" }
 fp = { path = "crates/fp", default-features = false }
@@ -60,6 +62,12 @@ tempfile = "3.20.0"
 crate-type = ["cdylib", "rlib"]
 
 [features]
+# jemalloc as the global allocator. glibc's malloc keeps the memory of many threads' large,
+# short-lived vectors: a stem-swept Lin ring held 2-7x its live heap and ran out of memory.
+jemalloc = ["dep:tikv-jemallocator"]
+# Diagnostic: jemalloc with heap profiling, dumped with
+# `_RJEM_MALLOC_CONF=prof:true,lg_prof_interval:35,prof_prefix:<path>`.
+heapprof = ["jemalloc", "tikv-jemallocator/profiling"]
 default = ["odd-primes"]
 cache-multiplication = ["algebra/cache-multiplication"]
 concurrent = [
