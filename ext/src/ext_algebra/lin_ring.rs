@@ -812,6 +812,40 @@ where
     );
     // Per map: the thread seconds its last lift took, which decides whether it is dispatched.
     let mut last_cost: Vec<f64> = vec![];
+    // Every minute, where the memory is: the resolution's differentials held for good, the lazy
+    // maps' cache, and the process's resident set.
+    let memory_log = {
+        let res = Arc::clone(res);
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop = Arc::clone(&done);
+        let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
+        std::thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                for _ in 0..60 {
+                    std::thread::sleep(std::time::Duration::from_secs(1));
+                    if stop.load(Ordering::Relaxed) {
+                        return;
+                    }
+                }
+                let differentials: u64 = (0..res.next_homological_degree())
+                    .map(|s| res.differential(s).resident_bytes())
+                    .sum();
+                let map_cache = crate::resolution_homomorphism::lazy_maps::cache()
+                    .map_or(0, |c| c.resident_bytes());
+                let rss = std::fs::read_to_string("/proc/self/statm")
+                    .ok()
+                    .and_then(|s| s.split_whitespace().nth(1)?.parse::<u64>().ok())
+                    .map_or(0, |pages| pages * 4096);
+                tracing::info!(
+                    differentials_gib = gib(differentials),
+                    map_cache_gib = gib(map_cache),
+                    rss_gib = gib(rss),
+                    "lin_ring memory sample"
+                );
+            }
+        });
+        done
+    };
     // Windows of `t` in the `t` order, of stems in the stem order, so that the order in which
     // generators are found is the order they are compared in. `t0..=t1` is the window, in that
     // degree.
@@ -1183,5 +1217,6 @@ where
         }
         t0 = t1 + 1;
     }
+    memory_log.store(true, Ordering::Relaxed);
     Ok(ring)
 }
