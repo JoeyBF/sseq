@@ -1144,6 +1144,25 @@ where
                 crate::resolution_homomorphism::lift_batch::summary()
             );
         }
+        {
+            // Where the memory is: the maps' values held for good, the lazy maps' cache, and the
+            // process's resident set.
+            let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
+            let maps_resident: u64 = ring.maps.iter().map(|m| m.hom.resident_bytes()).sum();
+            let map_cache = crate::resolution_homomorphism::lazy_maps::cache()
+                .map_or(0, |c| c.resident_bytes());
+            let rss = std::fs::read_to_string("/proc/self/statm")
+                .ok()
+                .and_then(|s| s.split_whitespace().nth(1)?.parse::<u64>().ok())
+                .map_or(0, |pages| pages * 4096);
+            tracing::info!(
+                t1,
+                maps_resident_gib = gib(maps_resident),
+                map_cache_gib = gib(map_cache),
+                rss_gib = gib(rss),
+                "lin_ring memory"
+            );
+        }
         tracing::info!(
             ?stats,
             gens = ring.gens.len(),

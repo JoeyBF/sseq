@@ -273,6 +273,24 @@ where
         self.outputs.push_checked(Slot::lazy(cache), degree);
     }
 
+    /// [`Self::add_generators_lazily`] out of order, as [`Self::add_generators_from_rows_ooo`].
+    pub fn add_generators_lazily_ooo(&self, degree: i32) -> std::ops::Range<i32> {
+        assert!(self.loader.get().is_some(), "lazy degree without a loader");
+        let cache = self.loader.get().and_then(|(_, cache)| cache.as_ref());
+        self.outputs.push_ooo(Slot::lazy(cache), degree)
+    }
+
+    /// Whether this homomorphism reads degrees through a loader.
+    pub fn has_loader(&self) -> bool {
+        self.loader.get().is_some()
+    }
+
+    /// Bytes held for good by the contiguous degrees: computed, read eagerly, or read lazily
+    /// without a cache. Degrees under an [`OutputCache`] count against it instead.
+    pub fn resident_bytes(&self) -> u64 {
+        self.outputs.values().map(Slot::resident_bytes).sum()
+    }
+
     /// A truncating variant of [`ModuleHomomorphism::apply_to_basis_element`] that allows `result`
     /// to span only a prefix of the target's degree-`(input_degree - degree_shift)` basis, rather
     /// than the whole thing.

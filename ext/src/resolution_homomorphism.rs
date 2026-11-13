@@ -87,13 +87,49 @@ where
     fn get_map_ensure_length(&self, input_s: i32) -> &MuFreeModuleHomomorphism<U, CC2::Module> {
         self.maps.extend(input_s, |input_s| {
             let output_s = input_s - self.shift.s();
-            Arc::new(MuFreeModuleHomomorphism::new(
+            let map = MuFreeModuleHomomorphism::new(
                 self.source.module(input_s),
                 self.target.module(output_s),
                 self.shift.t(),
-            ))
+            );
+            if let Some(cache) = lazy_maps::cache()
+                && let Some(store) = self.save_dir.store_arc()
+            {
+                let (source, target) = (self.source.module(input_s), self.target.module(output_s));
+                let (p, shift_t, name) = (self.source.prime(), self.shift.t(), self.name.clone());
+                map.set_loader(
+                    Arc::new(move |t| {
+                        let input = Bidegree::s_t(input_s, t);
+                        let data = store
+                            .read(SaveKind::ChainMap, input)
+                            .unwrap_or_else(|e| {
+                                panic!("reading chain map {name:?} at {input}: {e:#}")
+                            })
+                            .unwrap_or_else(|| {
+                                panic!("chain map {name:?} at {input} is not saved")
+                            });
+                        let dim = target.dimension(t - shift_t);
+                        let mut cursor = &data[..];
+                        (0..source.number_of_gens_in_degree(t))
+                            .map(|_| {
+                                FpVector::from_bytes(p, dim, &mut cursor).unwrap_or_else(|e| {
+                                    panic!("decoding chain map {name:?} at {input}: {e}")
+                                })
+                            })
+                            .collect()
+                    }),
+                    Some(Arc::clone(cache)),
+                );
+            }
+            Arc::new(map)
         });
         &self.maps[input_s]
+    }
+
+    /// Bytes this map holds for good: its steps that are not read through
+    /// [`lazy_maps`]'s cache.
+    pub fn resident_bytes(&self) -> u64 {
+        self.maps.values().map(|m| m.resident_bytes()).sum()
     }
 
     /// Returns the chain map on the `s`th source module.
@@ -357,6 +393,16 @@ where
                 input.t(),
                 vec![FpVector::new(p, fx_dimension); num_gens],
             )));
+        }
+
+        if f_cur.has_loader()
+            && let Some(store) = self.save_dir.store()
+            && store
+                .read_prefix(SaveKind::ChainMap, input, 0)
+                .unwrap_or_else(|e| panic!("reading chain map {:?} at {input}: {e:#}", self.name))
+                .is_some()
+        {
+            return Ok(StepPrep::Done(f_cur.add_generators_lazily_ooo(input.t())));
         }
 
         if let Some(store) = self.save_dir.store()
@@ -655,8 +701,17 @@ where
             pending.outputs[k].assign(result);
         }
         self.save_chain_map(pending.input, &pending.outputs);
-        self.get_map(pending.input.s())
-            .add_generators_from_rows_ooo(pending.input.t(), std::mem::take(&mut pending.outputs))
+        let map = self.get_map(pending.input.s());
+        if map.has_loader() {
+            // Saved just now; read back through the cache when next needed.
+            pending.outputs.clear();
+            map.add_generators_lazily_ooo(pending.input.t())
+        } else {
+            map.add_generators_from_rows_ooo(
+                pending.input.t(),
+                std::mem::take(&mut pending.outputs),
+            )
+        }
     }
 
     /// Write the chain map's value at `input` to the save store, if there is one to write to.
@@ -1749,5 +1804,31 @@ pub mod lift_batch {
         }
         bytes.resize(len.div_ceil(64) * 8, 0);
         FpVector::from_bytes(TWO, len, &mut &bytes[..]).expect("limbs cover the row")
+    }
+}
+
+/// Chain maps whose steps are read back from the save store on demand, under a byte budget
+/// (`EXT_LIFT_MAP_BUDGET_GIB`), rather than all kept in memory. Only maps with a save store, whose
+/// steps are saved as they are computed, read lazily.
+pub mod lazy_maps {
+    use std::sync::{Arc, LazyLock};
+
+    use algebra::module::homomorphism::OutputCache;
+
+    static CACHE: LazyLock<Option<Arc<OutputCache>>> = LazyLock::new(|| {
+        let gib: f64 = std::env::var("EXT_LIFT_MAP_BUDGET_GIB")
+            .ok()?
+            .parse()
+            .unwrap_or_else(|e| panic!("EXT_LIFT_MAP_BUDGET_GIB is not a number: {e}"));
+        assert!(
+            gib.is_finite() && gib > 0.0,
+            "EXT_LIFT_MAP_BUDGET_GIB must be a positive number of GiB"
+        );
+        Some(OutputCache::new((gib * (1u64 << 30) as f64) as u64))
+    });
+
+    /// The cache every lazily read chain map shares, if `EXT_LIFT_MAP_BUDGET_GIB` is set.
+    pub fn cache() -> Option<&'static Arc<OutputCache>> {
+        CACHE.as_ref()
     }
 }

@@ -195,6 +195,20 @@ impl Slot {
         }
     }
 
+    /// The bytes held for good: a resident degree's values once present. A cached degree counts
+    /// against its [`OutputCache`] instead.
+    pub(super) fn resident_bytes(&self) -> u64 {
+        match self {
+            Self::Resident(values) => values.get().map_or(0, |values| {
+                values
+                    .iter()
+                    .map(|v| 8 * FpVector::num_limbs(v.prime(), v.len()) as u64)
+                    .sum()
+            }),
+            Self::Cached(_) => 0,
+        }
+    }
+
     /// Whether the values are in memory.
     pub(super) fn is_loaded(&self) -> bool {
         match self {
