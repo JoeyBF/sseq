@@ -74,11 +74,14 @@ pub enum Prepared<'a> {
 }
 
 /// A step whose products are left to [`MultiLift`]; see [`Liftable::prepare_batched`].
-pub trait DeferredPrepare<'a>: Send {
+pub trait DeferredPrepare<'a>: Send + Sync {
     /// The width of every row of products: the dimension of the step's `f(d x)`.
     fn out_cols(&self) -> usize;
-    /// The products, row `p.row` of `0..num_rows()` each.
-    fn products(&self) -> &[crate::resolution_homomorphism::lift_batch::Product];
+    /// The products, row `p.row` of `0..num_rows()` each, built when called: a step holds none
+    /// until its chunk is multiplied.
+    fn build(&self) -> Vec<crate::resolution_homomorphism::lift_batch::Product>;
+    /// A cheap measure of the step's size, for grouping: the terms of its `d x`.
+    fn size(&self) -> usize;
     fn num_rows(&self) -> usize;
     /// The algebra the products are in.
     fn algebra(&self) -> std::sync::Arc<algebra::MilnorAlgebra>;
@@ -234,58 +237,37 @@ impl<CC: ChainComplex + Sync> MultiLift<CC> {
     ) -> Vec<Option<LiftRequest<'a>>> {
         use crate::resolution_homomorphism::lift_batch;
 
+        /// Steps built at once, in parallel, before their products join the chunk.
+        const GROUP: usize = 16;
         let out_cols = deferred[0].out_cols();
-        // Consecutive steps up to `EXT_LIFT_GPU_BATCH_TERMS` terms per call (and at least one step),
-        // so that a bidegree of many large steps does not hold all their products at once.
-        let terms = |d: &Box<dyn DeferredPrepare<'a> + 'a>| -> usize {
-            d.products().iter().map(|p| p.term_indices.len()).sum()
-        };
+        let algebra = deferred[0].algebra();
         let cap = lift_batch::batch_terms();
-        let mut chunks: Vec<std::ops::Range<usize>> = vec![];
-        let (mut start, mut acc) = (0, 0);
-        for (i, d) in deferred.iter().enumerate() {
-            assert_eq!(
-                d.out_cols(),
-                out_cols,
-                "steps at one bidegree share their width"
-            );
-            let n = terms(d);
-            if i > start && acc + n > cap {
-                chunks.push(start..i);
-                (start, acc) = (i, 0);
+        let mut out: Vec<Option<LiftRequest<'a>>> = Vec::with_capacity(deferred.len());
+        // The chunk: its steps with their first rows, its products and their terms. Steps are built
+        // in groups of `GROUP` and multiplied once the chunk holds `cap` terms, so a bidegree holds
+        // one chunk's products at a time, not all of its steps'.
+        let mut chunk: Vec<(Box<dyn DeferredPrepare<'a> + 'a>, usize)> = vec![];
+        let mut products: Vec<lift_batch::Product> = vec![];
+        let (mut num_rows, mut terms) = (0, 0);
+        let flush = |chunk: &mut Vec<(Box<dyn DeferredPrepare<'a> + 'a>, usize)>,
+                     products: &mut Vec<lift_batch::Product>,
+                     num_rows: &mut usize,
+                     terms: &mut usize,
+                     out: &mut Vec<Option<LiftRequest<'a>>>| {
+            if chunk.is_empty() {
+                return;
             }
-            acc += n;
-        }
-        chunks.push(start..deferred.len());
-
-        let mut slots: Vec<Option<Box<dyn DeferredPrepare<'a> + 'a>>> =
-            deferred.into_iter().map(Some).collect();
-        let mut out = Vec::with_capacity(slots.len());
-        for chunk in chunks {
-            let mut offsets = Vec::with_capacity(chunk.len());
-            let mut num_rows = 0;
-            for d in slots[chunk.clone()].iter().flatten() {
-                offsets.push(num_rows);
-                num_rows += d.num_rows();
-            }
-            let products: Vec<lift_batch::Product> = slots[chunk.clone()]
-                .iter()
-                .flatten()
-                .zip(&offsets)
-                .flat_map(|(d, &off)| {
-                    d.products().iter().map(move |p| lift_batch::Product {
-                        row: p.row + off,
-                        ..p.clone()
-                    })
-                })
-                .collect();
-            let algebra = slots[chunk.start].as_ref().unwrap().algebra();
-            let rows = lift_batch::multiply(&algebra, out_cols, num_rows, &products);
-            drop(products);
-            let jobs: Vec<std::sync::Mutex<Option<_>>> = slots[chunk]
-                .iter_mut()
-                .map(|d| d.take().unwrap())
-                .zip(offsets)
+            // A chunk with nothing to multiply (every term on a generator the map is zero on)
+            // gives zero rows without a call.
+            let rows = if products.is_empty() {
+                vec![FpVector::new(fp::prime::TWO, out_cols); *num_rows]
+            } else {
+                lift_batch::multiply(&algebra, out_cols, *num_rows, products)
+            };
+            products.clear();
+            products.shrink_to_fit();
+            let jobs: Vec<std::sync::Mutex<Option<_>>> = chunk
+                .drain(..)
                 .map(|j| std::sync::Mutex::new(Some(j)))
                 .collect();
             out.extend(parallel::guarded_map(jobs.len(), |i| {
@@ -293,7 +275,47 @@ impl<CC: ChainComplex + Sync> MultiLift<CC> {
                 let n = d.num_rows();
                 d.finish(Some(&rows[off..off + n]))
             }));
+            (*num_rows, *terms) = (0, 0);
+        };
+        let mut steps = deferred.into_iter().peekable();
+        while steps.peek().is_some() {
+            let group: Vec<Box<dyn DeferredPrepare<'a> + 'a>> =
+                steps.by_ref().take(GROUP).collect();
+            for d in &group {
+                assert_eq!(
+                    d.out_cols(),
+                    out_cols,
+                    "steps at one bidegree share their width"
+                );
+            }
+            let built = parallel::guarded_map(group.len(), |i| group[i].build());
+            for (d, ps) in group.into_iter().zip(built) {
+                let off = num_rows;
+                num_rows += d.num_rows();
+                terms += ps.iter().map(|p| p.term_indices.len()).sum::<usize>();
+                products.extend(ps.into_iter().map(|p| lift_batch::Product {
+                    row: p.row + off,
+                    ..p
+                }));
+                chunk.push((d, off));
+            }
+            if terms >= cap {
+                flush(
+                    &mut chunk,
+                    &mut products,
+                    &mut num_rows,
+                    &mut terms,
+                    &mut out,
+                );
+            }
         }
+        flush(
+            &mut chunk,
+            &mut products,
+            &mut num_rows,
+            &mut terms,
+            &mut out,
+        );
         out
     }
 

@@ -140,15 +140,6 @@ static STEP_LOG_MIN_NS: std::sync::LazyLock<u64> = std::sync::LazyLock::new(|| {
     (ms * 1e6) as u64
 });
 
-/// `EXT_STEP_LOG_MIN_TERMS` (default 10^6): the fewest product terms a batched step has for the
-/// step log to record it, whatever its preparation took.
-static STEP_LOG_MIN_TERMS: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
-    std::env::var("EXT_STEP_LOG_MIN_TERMS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(1_000_000)
-});
-
 impl<CC: FreeChainComplex> Staircase<CC> {
     /// The steps prepared and their thread time in seconds since the last call, resetting both.
     fn take_window(&self) -> (u64, f64) {
@@ -210,23 +201,7 @@ where
         let ns = start.elapsed().as_nanos() as u64;
         self.steps.fetch_add(1, Ordering::Relaxed);
         self.prepare_ns.fetch_add(ns, Ordering::Relaxed);
-        // A deferred step's products are multiplied with the bidegree's other steps; its terms are
-        // what it costs there.
-        let terms: usize = match &prepared {
-            Prepared::Deferred(d) => d.products().iter().map(|p| p.term_indices.len()).sum(),
-            Prepared::Ready(_) => 0,
-        };
-        if ns >= *STEP_LOG_MIN_NS || terms >= *STEP_LOG_MIN_TERMS {
-            tracing::info!(
-                target: "ext::lift::steps",
-                kind = "step",
-                map = ?self.name,
-                n = b.n(),
-                s = b.s(),
-                terms,
-                prepare_ms = ns as f64 / 1e6,
-            );
-        }
+        // A deferred step is logged with its product terms when they are built.
         prepared
     }
 }

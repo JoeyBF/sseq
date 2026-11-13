@@ -425,15 +425,7 @@ where
                         .collect()
                 })
                 .collect();
-            if let Some(batch) = lift_batch::build_shared(
-                &*f_prev.source(),
-                &*f_prev.target(),
-                f_prev.min_degree(),
-                f_prev.degree_shift(),
-                input.t(),
-                &dx,
-                &|deg, idx| f_prev.output(deg, idx).clone(),
-            ) {
+            if let Some(algebra) = lift_batch::applicable(&*f_prev.source(), &*f_prev.target()) {
                 return Err(Box::new(DeferredStep {
                     input,
                     output,
@@ -441,7 +433,8 @@ where
                     qi_rows,
                     fx_dimension,
                     fdx_dimension,
-                    batch,
+                    dx,
+                    algebra,
                 }));
             }
         }
@@ -692,7 +685,9 @@ pub(crate) struct DeferredStep {
     qi_rows: Vec<usize>,
     fx_dimension: usize,
     fdx_dimension: usize,
-    batch: lift_batch::SharedBatch,
+    /// The source basis indices of each `d x`, in `qi_rows` order.
+    dx: Vec<Vec<usize>>,
+    algebra: Arc<algebra::MilnorAlgebra>,
 }
 
 /// A [`DeferredStep`] together with the map it belongs to, for [`crate::lift::MultiLift`].
@@ -715,16 +710,43 @@ where
         self.step.fdx_dimension
     }
 
-    fn products(&self) -> &[lift_batch::Product] {
-        &self.step.batch.products
+    fn build(&self) -> Vec<lift_batch::Product> {
+        let step = &*self.step;
+        let f_prev = self.hom.get_map(step.input.s() - 1);
+        let products = lift_batch::build_shared(
+            &*f_prev.source(),
+            &*f_prev.target(),
+            f_prev.min_degree(),
+            f_prev.degree_shift(),
+            step.input.t(),
+            &step.dx,
+            &|deg, idx| f_prev.output(deg, idx).clone(),
+        )
+        .map_or_else(Vec::new, |batch| batch.products);
+        let terms: usize = products.iter().map(|p| p.term_indices.len()).sum();
+        if terms >= lift_batch::step_log_min_terms() {
+            tracing::info!(
+                target: "ext::lift::steps",
+                kind = "step",
+                map = self.hom.name(),
+                n = step.output.n(),
+                s = step.output.s(),
+                terms,
+            );
+        }
+        products
+    }
+
+    fn size(&self) -> usize {
+        self.step.dx.iter().map(Vec::len).sum()
     }
 
     fn num_rows(&self) -> usize {
-        self.step.batch.num_rows
+        self.step.dx.len()
     }
 
     fn algebra(&self) -> Arc<algebra::MilnorAlgebra> {
-        Arc::clone(&self.step.batch.algebra)
+        Arc::clone(&self.step.algebra)
     }
 
     fn finish(self: Box<Self>, rows: Option<&[FpVector]>) -> Option<crate::lift::LiftRequest<'a>> {
@@ -736,7 +758,8 @@ where
             qi_rows,
             fx_dimension,
             fdx_dimension,
-            batch: _,
+            dx: _,
+            algebra: _,
         } = *step;
         let fdx_vectors = match rows {
             Some(rows) => rows.to_vec(),
@@ -1556,6 +1579,18 @@ pub mod lift_batch {
         *CHECK
     }
 
+    /// `EXT_STEP_LOG_MIN_TERMS` (default 10^6): the fewest product terms a batched step has for the
+    /// step log to record it.
+    pub(crate) fn step_log_min_terms() -> usize {
+        static MIN: LazyLock<usize> = LazyLock::new(|| {
+            std::env::var("EXT_STEP_LOG_MIN_TERMS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(1_000_000)
+        });
+        *MIN
+    }
+
     /// `EXT_LIFT_BATCH_TERMS` (default 10^8): the most terms one multiply takes.
     pub fn batch_terms() -> usize {
         static CAP: LazyLock<usize> = LazyLock::new(|| {
@@ -1589,6 +1624,19 @@ pub mod lift_batch {
         pub algebra: Arc<MilnorAlgebra>,
         pub products: Vec<Product>,
         pub num_rows: usize,
+    }
+
+    /// The algebra of a step's products, when both its modules are free over the Milnor algebra
+    /// and that algebra takes batches.
+    pub(super) fn applicable(
+        source: &dyn std::any::Any,
+        target: &dyn std::any::Any,
+    ) -> Option<Arc<MilnorAlgebra>> {
+        source.downcast_ref::<FreeModule<MilnorAlgebra>>()?;
+        let algebra = target
+            .downcast_ref::<FreeModule<MilnorAlgebra>>()?
+            .algebra();
+        batch::batch_applicable(&algebra).then_some(algebra)
     }
 
     /// The batch of a step whose `d x_k` have the source basis indices `dx[k]` (ascending), each
