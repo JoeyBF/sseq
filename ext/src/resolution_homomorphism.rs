@@ -461,16 +461,10 @@ where
             .collect();
 
         if defer && lift_batch::enabled() && p == 2 {
-            let dx: Vec<Vec<usize>> = qi_rows
+            let dx_terms = qi_rows
                 .iter()
-                .map(|&k| {
-                    d_source
-                        .output(input.t(), k)
-                        .iter_nonzero()
-                        .map(|(i, _)| i)
-                        .collect()
-                })
-                .collect();
+                .map(|&k| d_source.output(input.t(), k).iter_nonzero().count())
+                .sum();
             if let Some(algebra) = lift_batch::applicable(&*f_prev.source(), &*f_prev.target()) {
                 return Err(Box::new(DeferredStep {
                     input,
@@ -479,7 +473,7 @@ where
                     qi_rows,
                     fx_dimension,
                     fdx_dimension,
-                    dx,
+                    dx_terms,
                     algebra,
                 }));
             }
@@ -740,8 +734,10 @@ pub(crate) struct DeferredStep {
     qi_rows: Vec<usize>,
     fx_dimension: usize,
     fdx_dimension: usize,
-    /// The source basis indices of each `d x`, in `qi_rows` order.
-    dx: Vec<Vec<usize>>,
+    /// The number of terms of the `d x` of `qi_rows`. The terms themselves are listed only when
+    /// the step is built: a bidegree defers all of its maps' steps at once, and their lists held
+    /// from then until multiplication took most of the memory of the n400 ring.
+    dx_terms: usize,
     algebra: Arc<algebra::MilnorAlgebra>,
 }
 
@@ -768,13 +764,25 @@ where
     fn build(&self) -> Vec<lift_batch::Product> {
         let step = &*self.step;
         let f_prev = self.hom.get_map(step.input.s() - 1);
+        let d_source = self.hom.source.differential(step.input.s());
+        let dx: Vec<Vec<usize>> = step
+            .qi_rows
+            .iter()
+            .map(|&k| {
+                d_source
+                    .output(step.input.t(), k)
+                    .iter_nonzero()
+                    .map(|(i, _)| i)
+                    .collect()
+            })
+            .collect();
         let products = lift_batch::build_shared(
             &*f_prev.source(),
             &*f_prev.target(),
             f_prev.min_degree(),
             f_prev.degree_shift(),
             step.input.t(),
-            &step.dx,
+            &dx,
             &|deg, idx| f_prev.output(deg, idx).clone(),
         )
         .map_or_else(Vec::new, |batch| batch.products);
@@ -793,11 +801,11 @@ where
     }
 
     fn size(&self) -> usize {
-        self.step.dx.iter().map(Vec::len).sum()
+        self.step.dx_terms
     }
 
     fn num_rows(&self) -> usize {
-        self.step.dx.len()
+        self.step.qi_rows.len()
     }
 
     fn algebra(&self) -> Arc<algebra::MilnorAlgebra> {
@@ -813,7 +821,7 @@ where
             qi_rows,
             fx_dimension,
             fdx_dimension,
-            dx: _,
+            dx_terms: _,
             algebra: _,
         } = *step;
         let fdx_vectors = match rows {
