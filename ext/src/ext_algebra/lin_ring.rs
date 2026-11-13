@@ -899,6 +899,9 @@ where
             }
         }
         let maps_lifted = grown.len();
+        // Maps whose cost this window comes from the processes they were dispatched to, not from
+        // reading their steps back here.
+        let mut costed_remotely = vec![false; ring.maps.len()];
         let (remote, local): (Vec<usize>, Vec<usize>) = match &dispatch {
             Some(d) => grown.into_iter().partition(|&i| last_cost[i] >= d.min_s),
             None => (vec![], grown),
@@ -962,6 +965,7 @@ where
                         && let (Some(&i), Ok(cost)) = (by_name.get(name), cost.parse::<f64>())
                     {
                         last_cost[i] = cost;
+                        costed_remotely[i] = true;
                     }
                 }
             }
@@ -978,7 +982,9 @@ where
         for (i, map) in ring.maps.iter().enumerate() {
             let (steps, prepare_s) = map.take_window();
             if steps > 0 {
-                last_cost[i] = prepare_s;
+                if !costed_remotely[i] {
+                    last_cost[i] = prepare_s;
+                }
                 tracing::info!(
                     target: "ext::lift::steps",
                     kind = "map_window",
