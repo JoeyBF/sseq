@@ -71,7 +71,7 @@ where
         let mut left_result = FpVector::new(p, 0);
         let mut right_result = FpVector::new(p, 0);
 
-        for (op_deg_l, op_idx_l, op_deg_r, op_idx_r) in coproduct {
+        for (op_deg_l, op_idx_l, op_deg_r, op_idx_r, c) in coproduct {
             let mut idx = 0;
             for left_deg in self.left.min_degree()..=(mod_degree - self.right.min_degree()) {
                 let right_deg = mod_degree - left_deg;
@@ -100,7 +100,7 @@ where
                 for i in 0..left_source_dim {
                     self.left.act_on_basis(
                         left_result.as_slice_mut(),
-                        coeff,
+                        coeff * c % p,
                         op_deg_l,
                         op_idx_l,
                         left_deg,

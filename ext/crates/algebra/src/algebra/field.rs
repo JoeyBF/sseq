@@ -72,8 +72,8 @@ impl Algebra for Field {
 }
 
 impl Bialgebra for Field {
-    fn coproduct(&self, _op_deg: i32, _op_idx: usize) -> Vec<(i32, usize, i32, usize)> {
-        vec![(1, 0, 1, 0)]
+    fn coproduct(&self, _op_deg: i32, _op_idx: usize) -> Vec<(i32, usize, i32, usize, u32)> {
+        vec![(1, 0, 1, 0, 1)]
     }
 
     fn decompose(&self, _op_deg: i32, _op_idx: usize) -> Vec<(i32, usize)> {

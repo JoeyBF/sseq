@@ -1,15 +1,16 @@
 # Comodules and Cotor: design
 
-Status: proposal, on the experimental branch `comodules`. Nothing here is implemented yet.
+Status: experimental, on the branch `comodules`. Step 1 of the [plan](#plan) is implemented:
+`algebra::comodule` and `ext::cotor`.
 
 ## Goal
 
 Add comodules over the dual Steenrod algebra and its quotient Hopf algebras to the `algebra`
 crate, as first-class objects alongside the implementors of `algebra::module::Module`, and compute
 
-$$\mathrm{Cotor}_\Gamma(\mathbb{F}_p, M) \cong \mathrm{Ext}_A(\mathbb{F}_p, M)$$
+$$\mathrm{Cotor}_\Gamma(M, \mathbb{F}_p) \cong \mathrm{Ext}_A(\mathbb{F}_p, M)$$
 
-for bounded-below comodules $M$ of finite type, in `ext`.
+for bounded-below right comodules $M$ of finite type, in `ext`.
 
 The motivating case is $\mathrm{Ext}_P(Q)$ with $Q = \mathbb{F}_2[v_0, v_1, \dots]$, which by
 Nassau's untwisting is the $E_2$ page for $C\tau$ (and through the $v_0$-Bockstein, much of the
@@ -25,11 +26,17 @@ a tensor product for a Cartan–Eilenberg spectral sequence) is an implementor a
 ### Comodules as lowering modules
 
 Let $\Gamma$ be $A_*$, a quotient Hopf algebra of it, or a sub-Hopf algebra of it, and
-$A = \Gamma^\vee$. A left
-$\Gamma$-comodule $M$ has a coaction $\psi\colon M \to \Gamma \otimes M$. When $M$ is bounded below
-and of finite type, it is the same thing as a *locally finite* left $A$-module, through
+$A = \Gamma^\vee$. A right $\Gamma$-comodule $M$ has a coaction $\psi\colon M \to M \otimes \Gamma$.
+When $M$ is bounded below and of finite type, it is the same thing as a *locally finite* left
+$A$-module, through
 
-$$a \cdot m = \sum \langle a, \gamma_i \rangle\, m_i \qquad \text{where } \psi(m) = \sum \gamma_i \otimes m_i.$$
+$$a \cdot m = \sum m_i \langle a, \gamma_i \rangle \qquad \text{where } \psi(m) = \sum m_i \otimes \gamma_i.$$
+
+Coassociativity, $(\psi \otimes 1)\psi = (1 \otimes \Delta)\psi$, makes this a left action because
+$\Delta$ is dual to the product of $A$. A *left* comodule gives a right $A$-module the same way,
+and becomes a left one only through the antipode; this is the source of the $\xi$ versus
+$\chi\xi$ confusion recorded below. The `Comodule` trait therefore presents right comodules, and
+the Cotor computed is $\mathrm{Cotor}_\Gamma(M, \mathbb{F}_p)$.
 
 This action **lowers** degree: $A_n \otimes M_d \to M_{d-n}$. That is the reason a comodule is not
 a `Module`. A `Module` is bounded below and its operations raise degree; the dual $M^\vee$ of $Q$
@@ -40,7 +47,7 @@ algorithm in `ext` that walks degrees upwards from `min_degree` would be wrong f
 
 With $C \to \mathbb{F}_p$ the minimal free $A$-resolution that `ext` already computes,
 
-$$\mathrm{Cotor}^{s,u}_\Gamma(\mathbb{F}_p, M) = H^s\big(\mathrm{Hom}_A(C, M)\big)_u,$$
+$$\mathrm{Cotor}^{s,u}_\Gamma(M, \mathbb{F}_p) = H^s\big(\mathrm{Hom}_A(C, M)\big)_u,$$
 
 where a cochain of weight $u$ assigns to each generator $x$ of $C_s$ an element
 $f(x) \in M_{u - |x|}$, and the coboundary is
@@ -108,9 +115,10 @@ Everything here is of finite type, so $\Gamma$ is the graded dual of an `Algebra
 structure of $\Gamma$ is that algebra's:
 
 - the coproduct of $\Gamma$ is dual to `Algebra::multiply_basis_elements`;
-- the product of $\Gamma$ is dual to `Bialgebra::coproduct`, which `MilnorAlgebra` implements
-  (at $p = 2$; for the Milnor basis it splits $P(R)$ into $P(S) \otimes P(T)$ with $S + T = R$,
-  so the product of $A_*$ adds exponents);
+- the product of $\Gamma$ is dual to `Bialgebra::coproduct`, which carries coefficients and which
+  `MilnorAlgebra` implements at every prime and for both shapes: it splits $Q(E) P(R)$ into
+  $\pm Q(E') P(S) \otimes Q(E'') P(T)$ over $E = E' \sqcup E''$ and $R = S + T$, the sign that of
+  the shuffle of the $\tau$s, so the product of the dual adds exponents;
 - the basis of $\Gamma$ is the dual of the algebra's basis, with the same `(degree, index)`.
 
 So a comodule names its coalgebra by its dual algebra, as a `Module` names its algebra, and
@@ -132,37 +140,24 @@ needs it, which converts at the boundary with the algebra's `basis_element_from_
 
 ### Comodule
 
-```rust
-pub trait Comodule: std::fmt::Display + Send + Sync + 'static {
-    /// The dual of the coalgebra.
-    type Algebra: Bialgebra;
-    fn algebra(&self) -> Arc<Self::Algebra>;
-    fn min_degree(&self) -> i32;
-    fn compute_basis(&self, degree: i32);
-    fn max_computed_degree(&self) -> i32;
-    fn dimension(&self, degree: i32) -> usize;
-    fn basis_element_to_string(&self, degree: i32, idx: usize) -> String;
+The trait, in `algebra::comodule`, mirrors `Module`:
 
-    /// The lowering action of one operation on one basis element, added into `result`, which
-    /// lives in degree `degree - op.degree`.
-    fn act_on_basis(&self, result: FpSliceMut, coeff: u32, op: OpId, degree: i32, idx: usize);
-
-    /// The action of every operation in `ops` on every basis element of `degree`.
-    ///
-    /// The batch is the unit of work: implementors share work across the operations and across
-    /// the basis elements of a degree, and the caller decides how long the result lives.
-    fn act_batch(&self, ops: &OpSet, degree: i32) -> ActionBlock {
-        // Default: one `act_on_basis` per pair.
-    }
-}
-```
+- `type Algebra: Algebra`, the dual algebra; only constructions that need the coproduct, such as
+  tensor products, ask for `Bialgebra`.
+- `min_degree`, `compute_basis`, `max_computed_degree`, `dimension`, `basis_element_to_string`,
+  `max_degree`, as for `Module`.
+- `act_on_basis(result, coeff, op_degree, op_index, degree, idx)`, with `result` in degree
+  `degree - op_degree`, and `act` on a general element.
+- `act_batch(&OpSet, degree) -> ActionBlock`: the action of every operation of a set on every
+  basis element of one degree. This is the unit of work: an implementor shares work across the
+  operations and across the basis, and the caller decides how long the block lives. The default
+  calls `act_on_basis` once per pair.
 
 - `OpSet` is a set of operations, sorted by degree, with a dense local numbering so that an
-  `ActionBlock` can be indexed by `(local op, basis index)` without hashing. It also exposes its
-  down-closure (below), which implementors may use to prune.
+  `ActionBlock` can be indexed by `(local op, basis index)` without hashing. Its down-closure
+  (below), for implementors that prune, is still to come.
 - `ActionBlock` is the sparse matrix of each operation in the set on $M_d$, stored as one
-  compressed row per basis element: the existing `Psi<u32>` layout (keys, starts, targets),
-  promoted to a public type. At $p > 2$ it carries coefficients; at $p = 2$ it does not.
+  compressed row per basis element, in the layout of `Psi<u32>` (keys, starts, targets). At $p > 2$ it carries coefficients; at $p = 2$ it does not.
 - The full coaction $\psi(m)$ is deliberately not a required method. For $Q$ it involves every
   $\xi^R$ below the degree of $m$, which is far more than any consumer reads. A comodule that can
   produce it cheaply (a finite one) offers it as an inherent method.
@@ -210,7 +205,7 @@ Mirroring `algebra::module`:
 
 | implementor | contents | replaces |
 |---|---|---|
-| `FiniteComodule` | dense tables of the action, read from JSON like `FDModule` | — |
+| `FiniteComodule` | dense tables of the action of every operation; `coregular` gives $\Gamma$ truncated | — |
 | `PolynomialComodule` | a polynomial comodule algebra given by its generators and their coactions | `Coaction`, `QDual`, `QDown` |
 | `TensorComodule` | diagonal coaction, through `Bialgebra::coproduct` | the tensor modules in the CESS check |
 | `SubComodule`, `QuotientComodule` | filtration pieces of a `FilteredComodule` | `Layer::Adjoin`, `Layer::Quotient` |
@@ -275,13 +270,23 @@ The $v_0$-transfer, the $v_n$-Bocksteins and the products of `q1_products` then 
 
 ## Tests
 
-- **Unit**: $\mathrm{Cotor}_{A_*}(\mathbb{F}_2, \mathbb{F}_2)$ against `ext`'s Ext of the sphere.
-- **Change of rings**: $\mathrm{Cotor}_{A_*}(\mathbb{F}_2, A/\!/A(1)_*)$ against
-  $\mathrm{Ext}_{A(1)}(\mathbb{F}_2, \mathbb{F}_2)$ from a resolution over the profile algebra,
-  and $A/\!/E(0)_*$ against $\mathbb{F}_2[h_0]$. These exercise `PolynomialComodule` on a
-  comodule other than $Q$, with a coaction that is not self-conjugate.
-- **Finite**: `FiniteComodule` from the dual of an existing `FDModule` (for example $C\eta$)
-  against `ext`'s Ext of that module, with the grading reversed.
+Implemented:
+
+- **Coproduct**: multiplicative, with Koszul signs, at $p = 2, 3, 5$ for both Milnor shapes.
+- **Coregular**: $\Gamma$ truncated is a left module (associativity checked on every pair of
+  operations), its batched action agrees with the single one, and its Cotor is the ground field
+  in degree zero.
+- **Unit**: Cotor of the ground field against `ext`'s Ext of the sphere.
+- **Change of rings**: the dual of $A(1) \backslash A$, built by `ext::cotor::coinduced` as a
+  `FiniteComodule`, against $\mathrm{Ext}_{A(1)}(\mathbb{F}_2, \mathbb{F}_2)$ from a resolution
+  over the profile algebra.
+
+To come:
+
+- **Change of rings for `PolynomialComodule`**: $A/\!/A(1)_*$ and $A/\!/E(0)_*$ presented by
+  generators, against the same answers; their coactions are not self-conjugate.
+- **Finite comodules from modules**: the dual of an `FDModule` needs the antipode to become a
+  left module, so this waits for one.
 - **Regression**: $\mathrm{Ext}_P(Q)$ and $\mathrm{Ext}_P(Q/I_1)$ through `CotorComplex` against
   `ctau_e2_untwisted_on` and the saved CSVs, at small stems in the test suite and at large stems
   by hand.
@@ -289,8 +294,8 @@ The $v_0$-transfer, the $v_n$-Bocksteins and the products of `q1_products` then 
 
 ## Plan
 
-1. `OpId`; `Comodule`, `OpSet`, `ActionBlock`; `FiniteComodule`.
-   Cotor of the unit and of a finite comodule in `ext`, with the global policy only.
+1. *Done.* `OpId`; `Comodule`, `OpSet`, `ActionBlock`; `FiniteComodule`; the coproduct with
+   coefficients at every prime. Cotor in `ext` with the global policy only.
 2. `PolynomialComodule` with the pruned walk; the change-of-rings tests; $\mathrm{Ext}_P(Q)$
    regression against the existing code.
 3. `FilteredComodule`, sub and quotient comodules; port `vn_bockstein` and `v0_transfer` onto
@@ -308,9 +313,10 @@ The $v_0$-transfer, the $v_n$-Bocksteins and the products of `q1_products` then 
 - **Motivic and multigraded coalgebras.** The motivic $A_*$ is bigraded and has
   $\tau$-torsion-free but non-polynomial structure. `OpId` with a single degree does not cover it;
   the multigrade work may settle what a degree is before this needs to.
-- **Right comodules and the opposite convention.** $\mathrm{Cotor}(M, \mathbb{F}_p)$ and two-sided
-  Cotor are not needed yet. A right comodule is a left one over $\Gamma$ with the conjugate
-  coproduct; whether that is a wrapper or a parameter can wait for the first user.
+- **Left comodules.** The trait presents right comodules. A left comodule, such as $A/\!/A(1)_*$
+  as usually written, becomes a right one through the antipode, which `MilnorAlgebra` does not
+  have yet. Whether that is a wrapper comodule or a constructor can wait for the first user;
+  `ext::cotor::coinduced` sidesteps it by building the right comodule directly.
 - **Whether `act_on_basis` earns its place.** Every consumer so far wants batches. It is kept
   because it makes `FiniteComodule` and the tests simple, and because it is the method a
   newcomer reaches for; if it invites slow code it should go.

@@ -4,14 +4,13 @@ use crate::algebra::Algebra;
 /// bialgebra.
 #[enum_dispatch::enum_dispatch]
 pub trait Bialgebra: Algebra {
-    /// Computes a coproduct $\Delta(x)$, expressed as
+    /// Computes a coproduct $\Delta(x) = \sum_j c_j A_j \otimes B_j$ as the list of
+    /// `(deg A_j, idx A_j, deg B_j, idx B_j, c_j)`.
     ///
-    /// $$ Delta(x)_i = \sum_j A_{ij} \otimes B_{ij}. $$
-    ///
-    /// The return value is a list of these pairs of basis elements.
-    ///
-    /// `x` must have been returned by [`Bialgebra::decompose()`].
-    fn coproduct(&self, op_deg: i32, op_idx: usize) -> Vec<(i32, usize, i32, usize)>;
+    /// `x` must have been returned by [`Bialgebra::decompose()`]. An algebra whose `decompose`
+    /// returns each basis element unchanged has a coproduct on every basis element, which makes
+    /// it the dual of a coalgebra in the same basis.
+    fn coproduct(&self, op_deg: i32, op_idx: usize) -> Vec<(i32, usize, i32, usize, u32)>;
 
     /// Decomposes an element of the algebra into a product of elements, each of
     /// which we can compute a coproduct on efficiently.

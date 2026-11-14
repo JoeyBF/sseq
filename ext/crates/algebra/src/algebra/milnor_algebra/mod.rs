@@ -351,15 +351,13 @@ impl MilnorAlgebra {
     }
 }
 
-/// Forwards to the classical shape, which is the only one with a coproduct.
+/// Forwards to the inner algebra.
 impl Bialgebra for MilnorAlgebra {
-    /// See [`MilnorAlgebraInner::coproduct`].
-    fn coproduct(&self, op_deg: i32, op_idx: usize) -> Vec<(i32, usize, i32, usize)> {
+    /// See the implementation for [`MilnorAlgebraInner`].
+    fn coproduct(&self, op_deg: i32, op_idx: usize) -> Vec<(i32, usize, i32, usize, u32)> {
         match self {
             Self::Polynomial(a) => a.coproduct(op_deg, op_idx),
-            Self::Exterior(_) => {
-                unimplemented!("Coproduct is only supported for the classical algebra at p = 2")
-            }
+            Self::Exterior(a) => a.coproduct(op_deg, op_idx),
         }
     }
 

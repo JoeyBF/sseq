@@ -1392,10 +1392,10 @@ impl Bialgebra for AdemAlgebra {
         }
     }
 
-    fn coproduct(&self, op_deg: i32, op_idx: usize) -> Vec<(i32, usize, i32, usize)> {
+    fn coproduct(&self, op_deg: i32, op_idx: usize) -> Vec<(i32, usize, i32, usize, u32)> {
         if self.generic {
             if op_deg == 1 {
-                vec![(1, 0, 0, 0), (0, 0, 1, 0)]
+                vec![(1, 0, 0, 0, 1), (0, 0, 1, 0, 1)]
             } else {
                 let q = self.prime() * 2 - 2;
                 let op_deg = op_deg as u32;
@@ -1405,14 +1405,14 @@ impl Bialgebra for AdemAlgebra {
                     .map(|j| {
                         let first = self.beps_pn(0, j);
                         let last = self.beps_pn(0, op_deg / q - j);
-                        (first.0, first.1, last.0, last.1)
+                        (first.0, first.1, last.0, last.1, 1)
                     })
                     .collect::<Vec<_>>()
             }
         } else {
             assert_eq!(op_idx, 0);
             (0..=op_deg)
-                .map(|j| (j, 0, op_deg - j, 0))
+                .map(|j| (j, 0, op_deg - j, 0, 1))
                 .collect::<Vec<_>>()
         }
     }
