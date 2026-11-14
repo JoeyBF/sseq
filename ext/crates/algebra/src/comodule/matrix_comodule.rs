@@ -426,6 +426,45 @@ impl Comodule for MatrixQComodule {
     }
 }
 
+/// A comodule over the dual of the Milnor algebra that can also act through its antipode-free
+/// side: $m \cdot P(M) = \chi(P(M)) \cdot m$, the right action of the left coaction it comes from.
+///
+/// With a backbone whose differential coefficients are rewritten as $\chi(a)$ once, the
+/// coboundary needs only this action and never the antipode.
+pub trait ConjugateAction: Comodule<Algebra = MilnorAlgebra> {
+    /// Calls `emit` with the index and coefficient of each term of $\chi(P(M))$ applied to basis
+    /// element `idx` of `degree`, in degree `degree - |P(M)|`.
+    fn act_by_conjugate(&self, m: PPart, degree: i32, idx: usize, emit: &mut dyn FnMut(usize, u32));
+}
+
+/// $v^S \cdot P(M) = \sum_{S'} [P(S) \in P(M) P(S')]\, v^{S'}$: one [`for_each_column`] with the
+/// rows fixed to $M$.
+impl ConjugateAction for MatrixQComodule {
+    fn act_by_conjugate(
+        &self,
+        m: PPart,
+        degree: i32,
+        idx: usize,
+        emit: &mut dyn FnMut(usize, u32),
+    ) {
+        let target = degree - self.antipode.degree(m);
+        let mut terms: Vec<Monomial> = Vec::new();
+        for_each_column(m, &self.basis[degree as usize][idx], |cols| {
+            terms.push(*cols)
+        });
+        terms.sort_unstable();
+        for chunk in terms.chunk_by(|a, b| a == b) {
+            if chunk.len() % 2 == 1 {
+                emit(
+                    self.index(target, &chunk[0])
+                        .expect("a term outside the basis"),
+                    1,
+                );
+            }
+        }
+    }
+}
+
 /// Filtered by length, which the coaction does not raise.
 impl FilteredComodule for MatrixQComodule {
     fn filtration(&self, degree: i32, idx: usize) -> i32 {

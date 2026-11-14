@@ -4,7 +4,8 @@ use std::sync::{Arc, OnceLock};
 
 use algebra::{
     Algebra,
-    comodule::{ActionBlock, Comodule, FilteredComodule, OpId, OpSet},
+    comodule::{ActionBlock, Comodule, ConjugateAction, FilteredComodule, OpId, OpSet},
+    milnor_algebra::PPart,
 };
 use fp::{matrix::Matrix, vector::FpVector};
 use sseq::coordinates::Bidegree;
@@ -26,6 +27,21 @@ pub struct CotorComplex<CC, M: Comodule> {
     /// The action of [`Self::ops`] on each degree of the comodule, computed when first needed and
     /// kept.
     actions: Vec<OnceLock<ActionBlock>>,
+    /// If set, the backbone conjugated: the coboundary reads its coefficients from here and acts
+    /// by [`ConjugateAction`], and [`Self::actions`] is never filled.
+    conjugate: Option<Conjugate>,
+}
+
+/// The differentials of a backbone with each coefficient $a$ rewritten as $\chi(a)$, and the
+/// comodule's action by those, for [`CotorComplex::new_conjugate`].
+struct Conjugate {
+    /// `slices[s][t][l]` lists, for generator `l` of degree `t` in filtration `s + 1`, each
+    /// generator $x$ of filtration `s` with $\chi(a_{zx})$ nonzero, as its degree, its index and
+    /// the $M$ of the $P(M)$ in $\chi(a_{zx})$.
+    slices: Vec<Vec<Vec<Vec<(i32, usize, Vec<PPart>)>>>>,
+    /// The action by $\chi(P(M))$ on a basis element, through [`ConjugateAction`].
+    #[allow(clippy::type_complexity)]
+    act: Box<dyn Fn(PPart, i32, usize, &mut dyn FnMut(usize, u32)) + Send + Sync>,
 }
 
 impl<CC, M> CotorComplex<CC, M>
@@ -64,6 +80,7 @@ where
             comodule,
             ops: ops.into_iter().collect(),
             actions: (0..=max_d.max(0)).map(|_| OnceLock::new()).collect(),
+            conjugate: None,
         }
     }
 
@@ -114,6 +131,9 @@ where
 
     /// The coboundary from filtration `s` to `s + 1` at weight `u`, one row per source cochain.
     pub fn coboundary(&self, s: i32, u: i32) -> Matrix {
+        if let Some(conjugate) = &self.conjugate {
+            return self.coboundary_conjugate(conjugate, s, u);
+        }
         let p = self.comodule.prime();
         let (src, src_dim) = self.blocks(s, u);
         let (tgt, tgt_dim) = self.blocks(s + 1, u);
@@ -151,6 +171,38 @@ where
         matrix
     }
 
+    /// [`Self::coboundary`] from the conjugated backbone: $(\delta f)(z) = \sum_x f(x) \cdot
+    /// \chi(a_{zx})$, with no antipode applied to the comodule.
+    fn coboundary_conjugate(&self, conjugate: &Conjugate, s: i32, u: i32) -> Matrix {
+        let p = self.comodule.prime();
+        let (src, src_dim) = self.blocks(s, u);
+        let (tgt, tgt_dim) = self.blocks(s + 1, u);
+        let mut matrix = Matrix::new(p, src_dim, tgt_dim);
+        let src_offset = |t: i32| src.iter().find(|b| b.0 == t).map(|b| b.2);
+        for &(t_z, gens_z, offset_z) in &tgt {
+            let dim_z = self.comodule.dimension(u - t_z);
+            for l in 0..gens_z {
+                let column_base = offset_z + l * dim_z;
+                for (t_x, x, terms) in &conjugate.slices[s as usize][t_z as usize][l] {
+                    let Some(offset_x) = src_offset(*t_x) else {
+                        continue;
+                    };
+                    let d_x = u - t_x;
+                    let row_base = offset_x + x * self.comodule.dimension(d_x);
+                    for m in 0..self.comodule.dimension(d_x) {
+                        let mut row = matrix.row_mut(row_base + m);
+                        for &r in terms {
+                            (conjugate.act)(r, d_x, m, &mut |target, v| {
+                                row.add_basis_element(column_base + target, v);
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        matrix
+    }
+
     /// The rank of [`Self::coboundary`].
     pub fn coboundary_rank(&self, s: i32, u: i32) -> usize {
         let mut m = self.coboundary(s, u);
@@ -168,6 +220,89 @@ where
             0
         };
         self.cochain_dimension(s, u) - self.coboundary_rank(s, u) - incoming
+    }
+}
+
+impl<CC, M> CotorComplex<CC, M>
+where
+    CC: FreeChainComplex<Algebra = algebra::MilnorAlgebra> + Sync,
+    M: ConjugateAction + Sync,
+{
+    /// [`Self::new`] reading the backbone with each differential coefficient $a_{zx}$ rewritten
+    /// once as $\chi(a_{zx})$ in the Milnor basis, so that the comodule acts by its
+    /// antipode-free side, [`ConjugateAction`], and no table of its action is kept.
+    ///
+    /// The coboundary is the same matrix: $a \cdot f(x) = f(x) \cdot \chi(a)$.
+    pub fn new_conjugate(backbone: Arc<CC>, comodule: Arc<M>, max_s: i32, max_u: i32) -> Self {
+        use algebra::MilnorAntipode;
+        use maybe_rayon::prelude::*;
+        let mut out = Self::new(Arc::clone(&backbone), Arc::clone(&comodule), max_s, max_u);
+        let max_t = max_u - comodule.min_degree();
+        let algebra = backbone.algebra();
+        let chi = MilnorAntipode::new(Arc::clone(&algebra));
+        let slices: Vec<Vec<Vec<Vec<(i32, usize, Vec<PPart>)>>>> = (0..=max_s)
+            .into_maybe_par_iter()
+            .map(|s| {
+                let d = backbone.differential(s + 1);
+                let target = backbone.module(s);
+                (0..=max_t)
+                    .map(|t| {
+                        if !backbone.has_computed_bidegree(Bidegree::s_t(s + 1, t)) {
+                            return Vec::new();
+                        }
+                        (0..backbone.number_of_gens_in_bidegree(Bidegree::s_t(s + 1, t)))
+                            .map(|l| {
+                                // chi of each coefficient, summed mod 2 over its terms.
+                                let mut odd: rustc_hash::FxHashMap<(i32, usize, PPart), bool> =
+                                    Default::default();
+                                for (idx, _) in d.output(t, l).iter_nonzero() {
+                                    let og = target.index_to_op_gen(t, idx);
+                                    let r = algebra
+                                        .basis_element_from_index(
+                                            og.operation_degree,
+                                            og.operation_index,
+                                        )
+                                        .p_part;
+                                    for &(m, _) in chi.of(r).iter() {
+                                        let e = odd
+                                            .entry((og.generator_degree, og.generator_index, m))
+                                            .or_insert(false);
+                                        *e = !*e;
+                                    }
+                                }
+                                let mut by_x: std::collections::BTreeMap<(i32, usize), Vec<PPart>> =
+                                    Default::default();
+                                for ((tx, x, m), keep) in odd {
+                                    if keep {
+                                        by_x.entry((tx, x)).or_default().push(m);
+                                    }
+                                }
+                                by_x.into_iter().map(|((tx, x), ms)| (tx, x, ms)).collect()
+                            })
+                            .collect()
+                    })
+                    .collect()
+            })
+            .collect();
+        let acting = Arc::clone(&comodule);
+        out.conjugate = Some(Conjugate {
+            slices,
+            act: Box::new(move |r, d, idx, emit| acting.act_by_conjugate(r, d, idx, emit)),
+        });
+        out
+    }
+
+    /// The number of terms of the conjugated backbone.
+    pub fn conjugate_terms(&self) -> usize {
+        self.conjugate.as_ref().map_or(0, |c| {
+            c.slices
+                .iter()
+                .flatten()
+                .flatten()
+                .flatten()
+                .map(|x| x.2.len())
+                .sum()
+        })
     }
 }
 
@@ -767,5 +902,40 @@ mod tests {
             }
         }
         assert!(nonzero > 1000);
+    }
+
+    /// The conjugated backbone with the antipode-free action gives the same coboundaries as the
+    /// backbone with the action through the antipode, and so the same Ext of $Q$.
+    #[test]
+    fn conjugate_backbone_matches() {
+        use algebra::comodule::MatrixQComodule;
+
+        use crate::algebraic_novikov::{unit_module, untwisted_backbone_range};
+        let (max_n, max_s) = (30, 10);
+        let res = Arc::new(crate::nassau::Resolution::new(Arc::new(unit_module())));
+        let max_u = (max_n + max_s) / 2;
+        res.compute_through_stem(untwisted_backbone_range(max_n, max_s));
+        let m = Arc::new(MatrixQComodule::new(res.algebra(), max_u));
+        let plain = CotorComplex::new(Arc::clone(&res), Arc::clone(&m), max_s, max_u);
+        let conj = CotorComplex::new_conjugate(Arc::clone(&res), Arc::clone(&m), max_s, max_u);
+        let mut checked = 0;
+        for u in 0..=max_u {
+            for a in 0..max_s {
+                if 2 * u - a > max_n + 1 {
+                    continue;
+                }
+                let (x, y) = (plain.coboundary(a, u), conj.coboundary(a, u));
+                assert_eq!((x.rows(), x.columns()), (y.rows(), y.columns()));
+                for i in 0..x.rows() {
+                    assert_eq!(
+                        x.row(i).iter_nonzero().collect::<Vec<_>>(),
+                        y.row(i).iter_nonzero().collect::<Vec<_>>(),
+                        "(a, u) = ({a}, {u}), row {i}"
+                    );
+                }
+                checked += x.rows();
+            }
+        }
+        assert!(checked > 500);
     }
 }

@@ -3,7 +3,8 @@
 //! Usage: `cotor_q <max_n> <max_s> [compare|old]`, with `CTAU_BACKBONE=<dir>` to load or save the
 //! resolution of $\mathbb{F}_2$. Prints the number of classes and the time, and with `compare`
 //! checks against `ctau_e2_untwisted_on`; with `old` runs only that. `CTAU_MATRIX=1` computes
-//! the action inline from Milnor matrices (`MatrixQComodule`) instead of by the walk.
+//! the action inline from Milnor matrices (`MatrixQComodule`) instead of by the walk, and
+//! `CTAU_CONJUGATE=1` does so from the conjugated backbone, with no antipode on the comodule.
 use std::{collections::BTreeMap, sync::Arc, time::Instant};
 
 use ext::{
@@ -37,7 +38,20 @@ fn main() {
         return;
     }
     let start = Instant::now();
-    let ours = if std::env::var_os("CTAU_MATRIX").is_some() {
+    let ours = if std::env::var_os("CTAU_CONJUGATE").is_some() {
+        let m = Arc::new(algebra::comodule::MatrixQComodule::new(
+            res.algebra(),
+            max_u,
+        ));
+        let t = Instant::now();
+        let cx = CotorComplex::new_conjugate(Arc::clone(&res), m, max_s, max_u);
+        println!(
+            "conjugated backbone: {} terms ({:?})",
+            cx.conjugate_terms(),
+            t.elapsed()
+        );
+        ranks_to_ext(&cx, max_n, max_s)
+    } else if std::env::var_os("CTAU_MATRIX").is_some() {
         let m = Arc::new(algebra::comodule::MatrixQComodule::new(
             res.algebra(),
             max_u,
@@ -85,6 +99,20 @@ where
     // A coboundary at (a, u) reads degrees u - t with t at least a, and 2u - a <= max_n + 1.
     let nnz = cx.precompute_actions((max_n + 1) / 2);
     println!("action: {nnz} entries ({:?})", t_act.elapsed());
+    ranks_to_ext(&cx, max_n, max_s)
+}
+
+/// $\mathrm{Ext}_P(Q_k)$ for every $k$ from the ranks of the coboundaries of `cx`.
+fn ranks_to_ext<CC, M>(
+    cx: &CotorComplex<CC, M>,
+    max_n: i32,
+    max_s: i32,
+) -> BTreeMap<(i32, i32, i32), usize>
+where
+    CC: ext::chain_complex::FreeChainComplex<Algebra = algebra::MilnorAlgebra> + Sync,
+    M: algebra::comodule::FilteredComodule<Algebra = algebra::MilnorAlgebra> + Sync,
+{
+    let max_u = (max_n + max_s) / 2;
     // The coboundary from filtration a at weight u is read for Q_k with k up to the most any
     // class at (a, u) or (a + 1, u) needs.
     let wanted: Vec<(i32, i32)> = (0..=max_u)
