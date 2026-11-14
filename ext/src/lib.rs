@@ -182,6 +182,7 @@ pub mod resolution;
 pub mod resolution_homomorphism;
 pub mod save;
 pub mod tau_lift;
+pub mod twisted;
 pub mod untwisted_module;
 pub mod v0_transfer;
 pub mod vn_bockstein;
