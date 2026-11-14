@@ -38,6 +38,10 @@ fn main() {
     let start = Instant::now();
     let m = Arc::new(q_mod_v0_comodule(res.algebra(), max_u));
     let cx = CotorComplex::new(Arc::clone(&res), m, max_s, max_u);
+    let t_act = Instant::now();
+    // A coboundary at (a, u) reads degrees u - t with t at least a, and 2u - a <= max_n + 1.
+    let nnz = cx.precompute_actions((max_n + 1) / 2);
+    println!("action: {nnz} entries ({:?})", t_act.elapsed());
     // The coboundary from filtration a at weight u is read for Q_k with k up to the most any
     // class at (a, u) or (a + 1, u) needs.
     let wanted: Vec<(i32, i32)> = (0..=max_u)

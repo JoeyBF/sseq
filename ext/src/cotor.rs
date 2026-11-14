@@ -72,6 +72,18 @@ where
         self.actions[d as usize].get_or_init(|| self.comodule.act_batch(&self.ops, d))
     }
 
+    /// Computes the action on every degree up to `max_d` at once, through
+    /// [`Comodule::act_batches`], and returns the number of stored entries.
+    pub fn precompute_actions(&self, max_d: i32) -> usize {
+        let max_d = max_d.min(self.actions.len() as i32 - 1);
+        let mut nnz = 0;
+        for (d, block) in self.comodule.act_batches(&self.ops, max_d).into_iter().enumerate() {
+            nnz += block.nnz();
+            let _ = self.actions[d].set(block);
+        }
+        nnz
+    }
+
     /// The generators of $C_s$ that carry cochains of weight `u`, as `(degree, count, offset)`,
     /// and the total dimension.
     fn blocks(&self, s: i32, u: i32) -> (Vec<(i32, usize, usize)>, usize) {

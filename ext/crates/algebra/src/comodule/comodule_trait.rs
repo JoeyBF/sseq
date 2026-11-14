@@ -118,4 +118,21 @@ pub trait Comodule: std::fmt::Display + Send + Sync + 'static {
         }
         block
     }
+
+    /// [`Self::act_batch`] on every degree up to `max_degree`, indexed by degree from zero, empty
+    /// below the minimum degree.
+    ///
+    /// An implementor whose action is cheaper to produce for all degrees at once, such as one
+    /// that walks a tree of monomials, overrides this. The default calls `act_batch` per degree.
+    fn act_batches(&self, ops: &OpSet, max_degree: i32) -> Vec<ActionBlock> {
+        (0..=max_degree)
+            .map(|d| {
+                if d < self.min_degree() {
+                    ActionBlock::new(self.prime())
+                } else {
+                    self.act_batch(ops, d)
+                }
+            })
+            .collect()
+    }
 }

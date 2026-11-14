@@ -34,8 +34,8 @@ impl MilnorQuotientAlgebra {
     pub fn new(inner: MilnorAlgebra, exponents: Vec<Option<u32>>) -> Self {
         for (k, &e) in exponents.iter().enumerate() {
             let Some(e) = e else { continue };
-            for i in 0..k {
-                let lower = exponents[i].expect("a kept xi_k needs every xi_i below it");
+            for (i, &lower) in exponents.iter().enumerate().take(k) {
+                let lower = lower.expect("a kept xi_k needs every xi_i below it");
                 assert!(
                     lower <= e + (k - i) as u32 && lower <= e,
                     "the exponents do not give a sub-Hopf algebra at xi_{}",
