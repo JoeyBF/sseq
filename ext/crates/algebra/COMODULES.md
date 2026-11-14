@@ -345,9 +345,9 @@ generality, not speed.
 - **Make the transfer generic.** `Stage` builds its coboundaries from `QDown` bases and the
   `Psi` table; written against a `FilteredComodule` and `ActionBlock`s, the transfer and the
   Bocksteins would run on any filtered comodule, and `QDown` and `QDual` could go.
-- **Prune the walk to the down-closure** of the requested operations instead of their
-  componentwise maximum. This is the remaining lever on the walk's intermediates, which
-  are about half of the transfer's peak.
+- **Find what sets the transfer's peak.** Pruning the walk to the exact down-closure of the
+  requested operations, instead of their componentwise maximum, was tried at target 200 and
+  changed neither the peak (650 MB) nor the time, so the walk's intermediates are not it there.
 - **Spill the table to the backbone's store** for targets where it does not fit in memory.
 - **The Cartan–Eilenberg check**, $\mathrm{Ext}_P(Q \otimes M) \Rightarrow \mathrm{Ext}_P(\Phi_* M)$,
   through `TensorComodule`.
