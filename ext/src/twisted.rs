@@ -54,6 +54,14 @@ pub struct TwistedResolution {
     kpos: Vec<(i32, usize)>,
     /// Preimages under $d_0$ from length `q + 1` to `q`, by `(q, degree)`.
     kqi: FxHashMap<(i32, i32), QuasiInverse>,
+    /// Whether the $d_k$ are solved by the canonical contracting homotopy rather than by
+    /// arbitrary preimages.
+    canonical: bool,
+    /// The basis of each degree of $A$ as products $P(2R) \lambda_E$: the $P(2R)$ as `(degree,
+    /// index)` and $E$ as a mask of the $t$ with $P^0_t$ in $\lambda_E$.
+    lam_basis: Vec<Vec<(i32, usize, u32)>>,
+    /// Coordinates of a Milnor basis vector in [`Self::lam_basis`], by degree.
+    lam_qi: Vec<Option<QuasiInverse>>,
     /// Backbone generators doubled: `(p, doubled degree, index in the backbone)`.
     w: Vec<(i32, i32, usize)>,
     /// The doubled differential of each backbone generator: `(op degree, op index, target w)`.
@@ -73,6 +81,19 @@ impl TwistedResolution {
     /// a minimal resolution `backbone` of $\mathbb{F}_2$ computed through stem `max_t / 2` and
     /// filtration `max_n`.
     pub fn new<CC>(backbone: &CC, max_n: i32, max_t: i32) -> Self
+    where
+        CC: FreeChainComplex<Algebra = MilnorAlgebra>,
+    {
+        Self::new_with(backbone, max_n, max_t, false)
+    }
+
+    /// [`Self::new`], solving each $d_k$ with the canonical contracting homotopy of the rows if
+    /// `canonical` is set: the row $A \otimes_\Lambda K$ is $s(B) \otimes K$ as a complex, through
+    /// the basis $P(2R) \lambda_E$ of $A$, and $K$ is the tensor product over $t$ of the Koszul
+    /// complexes $E(y_t) \otimes \Gamma(x_t)$, whose homotopy $y x^{(s)} \mapsto x^{(s+1)}$
+    /// combines into $h(y^E x^S) = y^{E - i} x^{S + e_i}$ for the first $i$ at which $y^E x^S$ is
+    /// not 1, if that $i$ is in $E$, and 0 otherwise.
+    pub fn new_with<CC>(backbone: &CC, max_n: i32, max_t: i32, canonical: bool) -> Self
     where
         CC: FreeChainComplex<Algebra = MilnorAlgebra>,
     {
@@ -204,6 +225,9 @@ impl TwistedResolution {
             kmods,
             kpos,
             kqi: FxHashMap::default(),
+            canonical,
+            lam_basis: Vec::new(),
+            lam_qi: Vec::new(),
             w,
             w_diff,
             xmods: Vec::new(),
@@ -213,6 +237,7 @@ impl TwistedResolution {
             terms_by_k: vec![0; max_n as usize + 2],
         };
         me.koszul_quasi_inverses();
+        me.lambda_basis();
         me.build_total();
         me
     }
@@ -307,6 +332,138 @@ impl TwistedResolution {
                 self.kqi.insert((q, t), m.compute_quasi_inverse());
             }
         }
+    }
+
+    /// $\lambda_E$, the product of the $P^0_t$ for $t$ in the mask `e`, as a Milnor vector.
+    fn lambda(&self, e: u32) -> (i32, FpVector) {
+        let p = self.algebra.prime();
+        let mut deg = 0;
+        let mut v = FpVector::new(p, 1);
+        v.set_entry(0, 1);
+        for t in 1..32 {
+            if e & (1 << (t - 1)) == 0 {
+                continue;
+            }
+            let (od, oi) = self.primitive(t);
+            let mut out = FpVector::new(p, self.algebra.dimension(deg + od));
+            self.algebra.multiply_element_by_basis_element(
+                out.as_slice_mut(),
+                1,
+                deg,
+                v.as_slice(),
+                od,
+                oi,
+            );
+            deg += od;
+            v = out;
+        }
+        (deg, v)
+    }
+
+    /// $P(2R) \lambda_E$ as a Milnor vector in degree `bd + |E|`.
+    fn product(&self, bd: i32, bi: usize, e: u32) -> FpVector {
+        let (ld, lv) = self.lambda(e);
+        let mut out = FpVector::new(self.algebra.prime(), self.algebra.dimension(bd + ld));
+        self.algebra.multiply_basis_element_by_element(
+            out.as_slice_mut(),
+            1,
+            bd,
+            bi,
+            ld,
+            lv.as_slice(),
+        );
+        out
+    }
+
+    /// The basis $P(2R) \lambda_E$ of each degree and the coordinates in it.
+    fn lambda_basis(&mut self) {
+        let p = self.algebra.prime();
+        let prims: Vec<i32> = (1..)
+            .map(|t| (1 << t) - 1)
+            .take_while(|&d| d <= self.max_t)
+            .collect();
+        for d in 0..=self.max_t {
+            let mut basis = Vec::new();
+            for e in 0..(1u32 << prims.len()) {
+                let ld: i32 = (0..prims.len())
+                    .filter(|i| e & (1 << i) != 0)
+                    .map(|i| prims[i])
+                    .sum();
+                let bd = d - ld;
+                if bd < 0 {
+                    continue;
+                }
+                for bi in 0..self.algebra.dimension(bd) {
+                    let elt = self.algebra.basis_element_from_index(bd, bi);
+                    if elt.q_part == 0 && elt.p_part.iter().all(|r| r % 2 == 0) {
+                        basis.push((bd, bi, e));
+                    }
+                }
+            }
+            let dim = self.algebra.dimension(d);
+            assert_eq!(
+                basis.len(),
+                dim,
+                "P(2R) lambda_E is not a basis in degree {d}"
+            );
+            let qi = (dim > 0).then(|| {
+                let mut m = AugmentedMatrix::<2>::new(p, dim, [dim, dim]);
+                for (i, &(bd, bi, e)) in basis.iter().enumerate() {
+                    m.segment(0, 0)
+                        .row_mut(i)
+                        .add(self.product(bd, bi, e).as_slice(), 1);
+                    m.segment(1, 1).row_mut(i).set_entry(i, 1);
+                }
+                m.row_reduce();
+                m.compute_quasi_inverse()
+            });
+            self.lam_basis.push(basis);
+            self.lam_qi.push(qi);
+        }
+    }
+
+    /// The canonical contracting homotopy of the row: from Koszul length `q` to `q + 1` in degree
+    /// `t`.
+    fn h_row(&self, q: i32, t: i32, input: &FpVector) -> FpVector {
+        let p = self.algebra.prime();
+        let src = &self.kmods[q as usize];
+        let up = &self.kmods[q as usize + 1];
+        let mut out = FpVector::new(p, up.dimension(t));
+        for (i, c) in input.iter_nonzero() {
+            let og = src.index_to_op_gen(t, i);
+            let s_idx = self.koszul_at(q, og.generator_degree, og.generator_index);
+            let s_exp = &self.koszul[s_idx].0;
+            // The operation in the basis P(2R) lambda_E.
+            let od = og.operation_degree;
+            let mut milnor = FpVector::new(p, self.algebra.dimension(od));
+            milnor.set_entry(og.operation_index, 1);
+            let mut coords = FpVector::new(p, self.lam_basis[od as usize].len());
+            if let Some(qi) = &self.lam_qi[od as usize] {
+                qi.apply(coords.as_slice_mut(), 1, milnor.as_slice());
+            }
+            for (j, cj) in coords.iter_nonzero() {
+                let (bd, bi, e) = self.lam_basis[od as usize][j];
+                // The first index at which y^E x^S is not 1.
+                let first = (0..s_exp.len().max(32))
+                    .find(|&k| e & (1 << k) != 0 || s_exp.get(k).copied().unwrap_or(0) > 0);
+                let Some(k) = first else { continue };
+                if e & (1 << k) == 0 {
+                    continue;
+                }
+                let mut s2 = s_exp.clone();
+                s2[k] += 1;
+                let Some(&target) = self.koszul_index.get(&s2) else {
+                    continue;
+                };
+                let (gd, gi) = self.kpos[target];
+                let prod = self.product(bd, bi, e & !(1 << k));
+                for (m, cm) in prod.iter_nonzero() {
+                    let idx = up.operation_generator_to_index(od - (1 << (k + 1)) + 1, m, gd, gi);
+                    out.add_basis_element(idx, c * cj % p * cm % p);
+                }
+            }
+        }
+        out
     }
 
     /// The total complex and its differential.
@@ -450,7 +607,9 @@ impl TwistedResolution {
                     }
                     let up = &self.kmods[q_low as usize + 1];
                     let mut pre = FpVector::new(pr, up.dimension(kt));
-                    if let Some(qi) = self.kqi.get(&(q_low, kt)) {
+                    if self.canonical {
+                        pre = self.h_row(q_low, kt, &r);
+                    } else if let Some(qi) = self.kqi.get(&(q_low, kt)) {
                         qi.apply(pre.as_slice_mut(), 1, r.as_slice());
                     }
                     // Embed the preimage into X_{n-1}, row `row`.
@@ -506,6 +665,42 @@ impl TwistedResolution {
             }
         }
         (gens, by_k)
+    }
+
+    /// [`Self::counts_by_stem`] with each coefficient, the element of $A$ multiplying a target
+    /// generator, counted by its terms in the basis $P(2R) \lambda_E$ instead of the Milnor basis.
+    pub fn counts_by_stem_lambda(&self, max_stem: i32, max_n: i32) -> Vec<usize> {
+        let p = self.algebra.prime();
+        let mut by_k = vec![0; self.max_n as usize + 1];
+        for n in 1..=max_n.min(self.max_n) {
+            for t in n..=(max_stem + n).min(self.max_t) {
+                let lower = &self.xmods[n as usize - 1];
+                for (i, v) in self.d[n as usize][t as usize].iter().enumerate() {
+                    let g = self.xgens[n as usize][t as usize][i];
+                    // The coefficient of each target generator, as a Milnor vector.
+                    let mut coeffs: FxHashMap<(i32, usize), FpVector> = FxHashMap::default();
+                    for (j, c) in v.iter_nonzero() {
+                        let og = lower.index_to_op_gen(t, j);
+                        coeffs
+                            .entry((og.generator_degree, og.generator_index))
+                            .or_insert_with(|| {
+                                FpVector::new(p, self.algebra.dimension(og.operation_degree))
+                            })
+                            .add_basis_element(og.operation_index, c);
+                    }
+                    for ((gd, gi), a) in coeffs {
+                        let h = self.xgens[n as usize - 1][gd as usize][gi];
+                        let od = t - gd;
+                        let mut coords = FpVector::new(p, self.lam_basis[od as usize].len());
+                        if let Some(qi) = &self.lam_qi[od as usize] {
+                            qi.apply(coords.as_slice_mut(), 1, a.as_slice());
+                        }
+                        by_k[(g.p - h.p) as usize] += coords.iter_nonzero().count();
+                    }
+                }
+            }
+        }
+        by_k
     }
 
     /// Checks $d^2 = 0$ on every generator.
@@ -569,7 +764,8 @@ mod tests {
         });
         let res = crate::nassau::Resolution::new(Arc::new(unit_module()));
         res.compute_through_stem(Bidegree::n_s(max_t, max_n + 1));
-        let x = TwistedResolution::new(&res, max_n, max_t);
+        let canonical = std::env::var_os("ZZ_CANONICAL").is_some();
+        let x = TwistedResolution::new_with(&res, max_n, max_t, canonical);
         x.check_d_squared().unwrap();
         // Ext at (n, t) needs X_{n+1} at t, so it is checked on the triangle t <= max_t.
         for n in 0..max_n {
@@ -590,6 +786,10 @@ mod tests {
             .sum();
         eprintln!(
             "TWIST s <= {max_n}, stem <= {max_stem}: generators {gens} (minimal {minimal}), terms by k {by_k:?}"
+        );
+        eprintln!(
+            "TWIST in the basis P(2R) lambda_E: {:?}",
+            x.counts_by_stem_lambda(max_stem, max_n)
         );
     }
 }
