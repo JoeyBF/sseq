@@ -105,47 +105,6 @@ impl<A: Algebra> FiniteComodule<A> {
         }
         m
     }
-
-    /// Checks that the action is associative, $a \cdot (b \cdot m) = (ab) \cdot m$, on every
-    /// pair of basis operations and basis element.
-    pub fn check_validity(&self) -> Result<(), String> {
-        let p = self.prime();
-        let alg = &self.algebra;
-        let (min, max) = (self.min_degree(), self.graded_dimension.max_degree());
-        for d in min..=max {
-            for idx in 0..self.dimension(d) {
-                for nb in 1..=d - min {
-                    for na in 1..=d - min - nb {
-                        let out_dim = self.dimension(d - na - nb);
-                        if out_dim == 0 {
-                            continue;
-                        }
-                        for b in 0..alg.dimension(nb) {
-                            let mut bm = FpVector::new(p, self.dimension(d - nb));
-                            self.act_on_basis(bm.as_slice_mut(), 1, nb, b, d, idx);
-                            for a in 0..alg.dimension(na) {
-                                let mut lhs = FpVector::new(p, out_dim);
-                                self.act(lhs.as_slice_mut(), 1, na, a, d - nb, bm.as_slice());
-                                let mut ab = FpVector::new(p, alg.dimension(na + nb));
-                                alg.multiply_basis_elements(ab.as_slice_mut(), 1, na, a, nb, b);
-                                let mut rhs = FpVector::new(p, out_dim);
-                                for (k, c) in ab.iter_nonzero() {
-                                    self.act_on_basis(rhs.as_slice_mut(), c, na + nb, k, d, idx);
-                                }
-                                if lhs != rhs {
-                                    return Err(format!(
-                                        "a = ({na}, {a}), b = ({nb}, {b}) on ({d}, {idx}): \
-                                         {lhs} != {rhs}"
-                                    ));
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        Ok(())
-    }
 }
 
 impl<A: Algebra> Comodule for FiniteComodule<A> {
@@ -214,7 +173,7 @@ mod tests {
     fn coregular_is_a_module(#[case] p: u32, #[case] max_degree: i32) {
         let alg = Arc::new(MilnorAlgebra::new(ValidPrime::new(p), false));
         let m = FiniteComodule::coregular(alg, max_degree);
-        m.check_validity().unwrap();
+        crate::comodule::check_associativity(&m, max_degree).unwrap();
     }
 
     #[test]

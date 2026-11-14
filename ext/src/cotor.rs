@@ -288,4 +288,92 @@ mod tests {
             }
         }
     }
+
+    /// The Cotor of $\mathbb{F}_2[\xi_1^4, \xi_2^2, \xi_3, \dots]$, presented by generators, is the
+    /// Ext of $A(1)$, and that of $\mathbb{F}_2[\xi_1^2, \xi_2, \dots]$ is $\mathbb{F}_2[h_0]$.
+    #[test]
+    fn change_of_rings_by_generators() {
+        use algebra::comodule::PolynomialComodule;
+
+        use crate::algebraic_novikov::unit_module;
+        let res = Arc::new(crate::nassau::Resolution::new(Arc::new(unit_module())));
+        let (max_s, max_u) = (5, 20);
+        res.compute_through_stem(Bidegree::n_s(max_u + 1, max_s + 2));
+        let alg = res.algebra();
+
+        let a1 = serde_json::json!({
+            "p": 2,
+            "algebra": { "profile": { "truncated": true, "p_part": [2, 1] } },
+            "type": "finite dimensional module",
+            "gens": { "x0": 0 },
+            "actions": []
+        });
+        let a1_res = construct((a1, algebra::AlgebraType::Milnor), None).unwrap();
+        a1_res.compute_through_stem(Bidegree::n_s(max_u, max_s + 1));
+        let e = [2, 1];
+        let m = Arc::new(PolynomialComodule::dual_steenrod_subalgebra(
+            Arc::clone(&alg),
+            move |k| e.get(k - 1).copied().unwrap_or(0),
+            max_u,
+        ));
+        let cx = CotorComplex::new(Arc::clone(&res), m, max_s, max_u);
+        for s in 0..=max_s {
+            for u in 0..=max_u {
+                let gens = a1_res.number_of_gens_in_bidegree(Bidegree::s_t(s, u));
+                assert_eq!(cx.cotor(s, u), gens, "A(1) at (s, u) = ({s}, {u})");
+            }
+        }
+
+        let m = Arc::new(PolynomialComodule::dual_steenrod_subalgebra(
+            Arc::clone(&alg),
+            |k| (k == 1) as u32,
+            max_u,
+        ));
+        let cx = CotorComplex::new(Arc::clone(&res), m, max_s, max_u);
+        for s in 0..=max_s {
+            for u in 0..=max_u {
+                assert_eq!(
+                    cx.cotor(s, u),
+                    usize::from(u == s),
+                    "E(0) at (s, u) = ({s}, {u})"
+                );
+            }
+        }
+    }
+
+    /// $\mathrm{Ext}_P(Q)$ through [`CotorComplex`] agrees with [`ctau_e2_untwisted_on`].
+    ///
+    /// [`ctau_e2_untwisted_on`]: crate::algebraic_novikov::ctau_e2_untwisted_on
+    #[test]
+    fn ext_of_q_matches_untwisted() {
+        use crate::algebraic_novikov::{
+            ctau_e2_untwisted_on, q_comodule, unit_module, untwisted_backbone_range,
+        };
+        let (max_n, max_s) = (24, 8);
+        let res = Arc::new(crate::nassau::Resolution::new(Arc::new(unit_module())));
+        let max_u = (max_n + max_s) / 2;
+        res.compute_through_stem(untwisted_backbone_range(max_n, max_s));
+        res.compute_through_stem(Bidegree::n_s(max_u + 1, max_s + 2));
+        let expected = ctau_e2_untwisted_on(&*res, max_n, max_s).0;
+
+        let mut ours = std::collections::BTreeMap::new();
+        for k in 0..=max_s {
+            let max_u_k = (max_n + max_s - k) / 2;
+            let m = Arc::new(q_comodule(res.algebra(), k as u32, max_u_k));
+            let cx = CotorComplex::new(Arc::clone(&res), m, max_s - k, max_u_k);
+            for u in 0..=max_u_k {
+                for a in 0..=max_s - k {
+                    let n = 2 * u - a;
+                    if !(0..=max_n).contains(&n) {
+                        continue;
+                    }
+                    let d = cx.cotor(a, u);
+                    if d > 0 {
+                        ours.insert((n, a + k, u), d);
+                    }
+                }
+            }
+        }
+        assert_eq!(ours, expected);
+    }
 }

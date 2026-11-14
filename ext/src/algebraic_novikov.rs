@@ -230,6 +230,49 @@ pub(crate) fn unpack(mut r: PackedXi) -> Vec<u32> {
     v
 }
 
+/// $Q_k$, the span of the monomials of length `k` in $Q = \mathbb{F}_2[v_0, v_1, \dots]$, in
+/// halved degrees up to `max_degree`, as a right comodule over the dual Steenrod algebra.
+///
+/// The left coaction $\psi(v_n) = \sum_i \xi_{n-i}^{2^i} \otimes v_i$ becomes the right coaction
+/// $\sum_i v_i \otimes \zeta_{n-i}^{2^i}$ through the antipode, $\zeta = \chi\xi$.
+pub fn q_comodule(
+    algebra: Arc<MilnorAlgebra>,
+    k: u32,
+    max_degree: i32,
+) -> algebra::comodule::PolynomialComodule {
+    use algebra::comodule::{Generator, MAX_GENERATORS, PolynomialComodule};
+    let max_n = (0..)
+        .take_while(|&n| v_degree(n) <= max_degree)
+        .last()
+        .unwrap_or(0);
+    assert!(
+        max_n < MAX_GENERATORS,
+        "degree {max_degree} needs too many generators"
+    );
+    let zeta = conjugates(max_n);
+    let generators: Vec<Generator> = (0..=max_n)
+        .map(|n| Generator {
+            name: format!("v{n}"),
+            degree: v_degree(n),
+            weight: 1,
+        })
+        .collect();
+    let coaction: Vec<Vec<_>> = (0..=max_n)
+        .map(|n| {
+            (0..=n)
+                .flat_map(|i| {
+                    let mut m = [0u16; MAX_GENERATORS];
+                    m[i] = 1;
+                    frobenius(&zeta[n - i], i as u32)
+                        .into_iter()
+                        .map(move |r| (m, r, 1))
+                })
+                .collect()
+        })
+        .collect();
+    PolynomialComodule::new(algebra, format!("Q_{k}"), &generators, &coaction, Some(k))
+}
+
 /// The coaction $\psi(v_n) = \sum_i c_{n,i} \otimes v_i$ on the generators of $Q$.
 pub struct Coaction {
     /// `factors[n]` lists the monomials of each $c_{n,i}$, as $(\xi^R, i)$.
