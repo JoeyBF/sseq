@@ -19,6 +19,7 @@ once = { path = "../once" }
 anyhow = "1.0.98"
 arc-swap = "1.7.1"
 auto_impl = "1.3.0"
+dashmap = "6.1.0"
 hashbrown = "0.15.4"
 itertools = { version = "0.14.0", default-features = false, features = [
     "use_alloc",

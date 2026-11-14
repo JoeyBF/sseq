@@ -1283,7 +1283,7 @@ impl QDown {
     }
 
     /// The index of `m` among the monomials of degree `d`, if it is one.
-    fn try_index(&self, d: i32, m: &QMono) -> Option<usize> {
+    pub(crate) fn try_index(&self, d: i32, m: &QMono) -> Option<usize> {
         self.positions
             .get(usize::try_from(d).ok()?)?
             .get(m)

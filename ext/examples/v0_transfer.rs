@@ -3,7 +3,9 @@
 //!
 //! Usage: `v0_transfer <max_n> <max_s> [direct]`, with `CTAU_BACKBONE=<dir>` to load or save the
 //! resolution of $\mathbb{F}_2$, `CHECK_CSV=<file>` to compare with rows `stem,s,u,dim`, and
-//! `CTAU_PSI_BANDS=<n>` to take the weights in `n` bands, trading time for memory.
+//! `CTAU_PSI_BANDS=<n>` to take the weights in `n` bands, trading time for memory, and
+//! `CTAU_CONJUGATE=1` to read the conjugated backbone, computed here or loaded from
+//! `CTAU_CONJUGATED=<dir>`, with the action computed inline and no table of it.
 //! Prints the number of classes and the time of each method.
 use std::{sync::Arc, time::Instant};
 
@@ -25,7 +27,21 @@ fn main() {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(1);
-    let ours = ext_q_by_v0_transfer_in_bands(&res, max_n, max_s, bands);
+    let ours = if std::env::var_os("CTAU_CONJUGATE").is_some() {
+        let conjugated = match std::env::var_os("CTAU_CONJUGATED") {
+            Some(dir) => ext::conjugate::ConjugatedBackbone::load(dir.as_ref(), max_s).unwrap(),
+            None => {
+                let t = Instant::now();
+                let (c, _) =
+                    ext::conjugate::ConjugatedBackbone::compute(&res, max_s, (max_n + max_s) / 2);
+                println!("conjugated: {} terms ({:?})", c.terms(), t.elapsed());
+                c
+            }
+        };
+        ext::v0_transfer::ext_q_by_v0_transfer_conjugated(&res, &conjugated, max_n, max_s, bands)
+    } else {
+        ext_q_by_v0_transfer_in_bands(&res, max_n, max_s, bands)
+    };
     println!(
         "transfer: {} classes ({:?})",
         ours.values().sum::<usize>(),

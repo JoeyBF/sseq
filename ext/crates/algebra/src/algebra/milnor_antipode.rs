@@ -1,7 +1,8 @@
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
+use dashmap::DashMap;
 use fp::{prime::Prime, vector::FpVector};
-use rustc_hash::FxHashMap;
+use rustc_hash::FxBuildHasher;
 
 use crate::algebra::{
     Algebra, MilnorAlgebra,
@@ -19,7 +20,8 @@ pub type PPartSum = Vec<(PPart, u32)>;
 /// under the coproduct, so their antipodes stay among them.
 pub struct MilnorAntipode {
     algebra: Arc<MilnorAlgebra>,
-    memo: Mutex<FxHashMap<PPart, Arc<PPartSum>>>,
+    /// $\chi(P(R))$ for every $R$ met, shared by every thread.
+    memo: DashMap<PPart, Arc<PPartSum>, FxBuildHasher>,
 }
 
 impl MilnorAntipode {
@@ -27,7 +29,7 @@ impl MilnorAntipode {
     pub fn new(algebra: Arc<MilnorAlgebra>) -> Self {
         Self {
             algebra,
-            memo: Mutex::new(FxHashMap::default()),
+            memo: DashMap::default(),
         }
     }
 
@@ -51,8 +53,8 @@ impl MilnorAntipode {
         if r.is_empty() {
             return Arc::new(vec![(r, 1)]);
         }
-        if let Some(v) = self.memo.lock().unwrap().get(&r) {
-            return Arc::clone(v);
+        if let Some(v) = self.memo.get(&r) {
+            return Arc::clone(&v);
         }
         let p = self.algebra.prime();
         let degree = self.degree(r);
@@ -82,8 +84,8 @@ impl MilnorAntipode {
             .map(|(i, c)| (self.algebra.basis_element_from_index(degree, i).p_part, c))
             .collect();
         let out = Arc::new(out);
-        self.memo.lock().unwrap().insert(r, Arc::clone(&out));
-        out
+        // Another thread may have finished the same R; keep whichever landed first.
+        Arc::clone(self.memo.entry(r).or_insert(out).value())
     }
 }
 

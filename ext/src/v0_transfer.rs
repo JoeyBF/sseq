@@ -156,6 +156,36 @@ pub fn ext_q_by_v0_transfer_in_bands<CC>(
 where
     CC: FreeChainComplex<Algebra = MilnorAlgebra> + Sync,
 {
+    transfer(res, max_n, max_s, bands, None)
+}
+
+/// [`ext_q_by_v0_transfer_in_bands`] from a conjugated backbone, with the action computed inline
+/// by Milnor matrices and no table of it: `conjugated` must cover the differentials out of
+/// filtrations up to `max_s + 1` from generators of degree up to `(max_n + max_s) / 2`.
+pub fn ext_q_by_v0_transfer_conjugated<CC>(
+    res: &CC,
+    conjugated: &crate::conjugate::ConjugatedBackbone,
+    max_n: i32,
+    max_s: i32,
+    bands: usize,
+) -> BTreeMap<(i32, i32, i32), usize>
+where
+    CC: FreeChainComplex<Algebra = MilnorAlgebra> + Sync,
+{
+    transfer(res, max_n, max_s, bands, Some(conjugated))
+}
+
+/// The transfer, reading the backbone or, if given, the conjugated backbone.
+fn transfer<CC>(
+    res: &CC,
+    max_n: i32,
+    max_s: i32,
+    bands: usize,
+    conjugated: Option<&crate::conjugate::ConjugatedBackbone>,
+) -> BTreeMap<(i32, i32, i32), usize>
+where
+    CC: FreeChainComplex<Algebra = MilnorAlgebra> + Sync,
+{
     let max_u = (max_n + max_s) / 2;
     let mut stage = stage(
         res,
@@ -163,9 +193,13 @@ where
         max_n,
         max_s,
     );
+    stage.inline = conjugated.is_some();
     let slices: Vec<InvertedSlice> = (0..=max_s)
         .into_maybe_par_iter()
-        .map(|a| slice(res, a, max_n, max_s))
+        .map(|a| match conjugated {
+            Some(c) => crate::vn_bockstein::conjugated_slice(c, a, max_n, max_s),
+            None => slice(res, a, max_n, max_s),
+        })
         .collect();
     // The lengths `weight` builds with: see `k_of` there.
     let max_len = |a: i32, u: i32| {
@@ -492,5 +526,11 @@ mod tests {
             .collect();
         assert_eq!(ext_q_by_v0_transfer(&res, max_n, max_s), direct);
         assert_eq!(ext_q_by_v0_transfer_in_bands(&res, max_n, max_s, 3), direct);
+        let (conjugated, _) =
+            crate::conjugate::ConjugatedBackbone::compute(&res, max_s, (max_n + max_s) / 2);
+        assert_eq!(
+            ext_q_by_v0_transfer_conjugated(&res, &conjugated, max_n, max_s, 1),
+            direct
+        );
     }
 }

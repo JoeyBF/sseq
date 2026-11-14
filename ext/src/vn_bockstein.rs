@@ -8,9 +8,9 @@ use rustc_hash::FxHashMap;
 
 use crate::{
     algebraic_novikov::{
-        Convention, InvertedSlice, PackedXi, QDown, QMono, cochain_blocks, differential_slice,
-        invert_slice, qmono_len, untwisted_backbone_range, untwisted_filtrations,
-        untwisted_max_length, untwisted_max_weight, xi_degree,
+        Convention, InvertedSlice, PackedXi, QDOWN_VARS, QDown, QMono, cochain_blocks,
+        differential_slice, invert_slice, qmono_len, unpack, untwisted_backbone_range,
+        untwisted_filtrations, untwisted_max_length, untwisted_max_weight, xi_degree,
     },
     chain_complex::FreeChainComplex,
     filtered_sseq::{FilteredMap, Pages, Pair},
@@ -75,6 +75,9 @@ pub(crate) struct Stage<'a, CC> {
     psi: Vec<Vec<crate::algebraic_novikov::Psi<u32>>>,
     /// The number of each operation in the backbone, as `psi` keys them.
     op_ids: FxHashMap<PackedXi, u32>,
+    /// Whether the slices carry the conjugated backbone's coefficients, $\chi(a_{zx})$, to be
+    /// applied by the antipode-free right action, computed inline instead of read from `psi`.
+    pub(crate) inline: bool,
     /// The bases of the layer.
     q: QDown,
     /// The layer.
@@ -110,6 +113,9 @@ where
         weights: std::ops::RangeInclusive<i32>,
     ) {
         self.psi = Vec::new();
+        if self.inline {
+            return;
+        }
         // Every operation, numbered, and the operations on the generators of each degree.
         let mut op_ids: FxHashMap<PackedXi, u32> = FxHashMap::default();
         let mut ops_by_t: FxHashMap<i32, Vec<u32>> = FxHashMap::default();
@@ -239,14 +245,17 @@ where
                 .collect();
             let mut images: Vec<Vec<usize>> = vec![Vec::new(); ops.len()];
             // Each operation's number in the table, and back.
-            let ids: Vec<u32> = ops.iter().map(|r| self.op_ids[r]).collect();
+            let ids: Vec<u32> = if self.inline {
+                Vec::new()
+            } else {
+                ops.iter().map(|r| self.op_ids[r]).collect()
+            };
             let by_id: FxHashMap<u32, usize> =
                 ids.iter().enumerate().map(|(k, &id)| (id, k)).collect();
             for idx in 0..block {
                 let mono = q.monomial(u - t_i, idx);
                 // P(R) x_i lies in degree t_i + |R|, the degree of every z_l it appears in.
                 let d_out = |r: PackedXi| u - t_i - xi_degree(r);
-                let psi = &self.psi[(u - t_i) as usize][idx];
                 let len = qmono_len(mono);
                 // In a quotient, terms outside its basis vanish.
                 let fill = |image: &mut Vec<usize>, r: PackedXi, gammas: &[u32]| {
@@ -259,19 +268,41 @@ where
                             .filter(|&g| layer.on_length(qmono_len(q.monomial(d, g)), len)),
                     );
                 };
-                // Walk whichever is shorter: the operations, or the terms of ψ(m).
-                if psi.len() < ops.len() {
-                    for image in &mut images {
-                        image.clear();
-                    }
-                    for (id, gammas) in psi.iter() {
-                        if let Some(&k) = by_id.get(&id) {
-                            fill(&mut images[k], ops[k], gammas);
-                        }
+                if self.inline {
+                    // The operations are chi(a) for the conjugated backbone: m P(M) by one
+                    // enumeration of Milnor matrices per operation.
+                    let ours = qmono_to_monomial(mono);
+                    for (k, &r) in ops.iter().enumerate() {
+                        let d = d_out(r);
+                        let m = algebra::milnor_algebra::PPart::from_slice(&unpack(r));
+                        let mut terms: Vec<QMono> = Vec::new();
+                        algebra::comodule::for_each_column(m, &ours, |cols| {
+                            terms.push(monomial_to_qmono(cols));
+                        });
+                        terms.sort_unstable();
+                        let gammas: Vec<u32> = terms
+                            .chunk_by(|a, b| a == b)
+                            .filter(|c| c.len() % 2 == 1)
+                            .filter_map(|c| q.try_index(d, &c[0]).map(|g| g as u32))
+                            .collect();
+                        fill(&mut images[k], r, &gammas);
                     }
                 } else {
-                    for (k, &r) in ops.iter().enumerate() {
-                        fill(&mut images[k], r, psi.get(ids[k]));
+                    let psi = &self.psi[(u - t_i) as usize][idx];
+                    // Walk whichever is shorter: the operations, or the terms of ψ(m).
+                    if psi.len() < ops.len() {
+                        for image in &mut images {
+                            image.clear();
+                        }
+                        for (id, gammas) in psi.iter() {
+                            if let Some(&k) = by_id.get(&id) {
+                                fill(&mut images[k], ops[k], gammas);
+                            }
+                        }
+                    } else {
+                        for (k, &r) in ops.iter().enumerate() {
+                            fill(&mut images[k], r, psi.get(ids[k]));
+                        }
                     }
                 }
                 for (i, gen_terms) in terms.iter().enumerate() {
@@ -340,6 +371,7 @@ where
         res,
         psi: Vec::new(),
         op_ids: FxHashMap::default(),
+        inline: false,
         q,
         layer,
     }
@@ -355,6 +387,59 @@ where
         &res.algebra(),
         &differential_slice(res, a, max_u.min((max_n + a + 1) / 2)),
     )
+}
+
+/// The differential slice of $P_{a+1}$ that the coboundaries out of filtration `a` read, from the
+/// conjugated backbone: the same shape as [`slice`], with each $\chi(a_{zx})$ in place of $a_{zx}$,
+/// for a [`Stage`] with `inline` set.
+pub(crate) fn conjugated_slice(
+    conjugated: &crate::conjugate::ConjugatedBackbone,
+    a: i32,
+    max_n: i32,
+    max_s: i32,
+) -> InvertedSlice {
+    let max_u = (max_n + max_s) / 2;
+    let max_t = max_u.min((max_n + a + 1) / 2);
+    let mut grouped: FxHashMap<(i32, u32), std::collections::BTreeMap<PackedXi, Vec<(i32, u32)>>> =
+        FxHashMap::default();
+    for t in 0..=max_t {
+        for l in 0.. {
+            let out = conjugated.output(a, t, l);
+            if out.is_empty() && conjugated.output_len(a, t) <= l {
+                break;
+            }
+            for (tx, x, ms) in out {
+                for m in ms {
+                    grouped
+                        .entry((*tx, *x as u32))
+                        .or_default()
+                        .entry(crate::algebraic_novikov::pack(
+                            &m.iter().collect::<Vec<_>>(),
+                        ))
+                        .or_default()
+                        .push((t, l as u32));
+                }
+            }
+        }
+    }
+    grouped
+        .into_iter()
+        .map(|(k, v)| (k, v.into_iter().collect()))
+        .collect()
+}
+
+/// A [`QMono`], which has a slot for $v_0$, as a monomial in $v_1, v_2, \dots$, dropping $v_0$.
+fn qmono_to_monomial(m: &QMono) -> algebra::comodule::Monomial {
+    let mut out = [0u16; algebra::comodule::MAX_GENERATORS];
+    out[..QDOWN_VARS - 1].copy_from_slice(&m[1..]);
+    out
+}
+
+/// A monomial in $v_1, v_2, \dots$ as a [`QMono`] without $v_0$.
+fn monomial_to_qmono(m: &algebra::comodule::Monomial) -> QMono {
+    let mut out = [0u16; QDOWN_VARS];
+    out[1..].copy_from_slice(&m[..QDOWN_VARS - 1]);
+    out
 }
 
 /// The spectral sequence of $\mathrm{Hom}(C, L)$ for the [`Layer`] $L$, keyed by the degree

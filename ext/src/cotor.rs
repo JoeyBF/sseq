@@ -32,13 +32,10 @@ pub struct CotorComplex<CC, M: Comodule> {
     conjugate: Option<Conjugate>,
 }
 
-/// The differentials of a backbone with each coefficient $a$ rewritten as $\chi(a)$, and the
-/// comodule's action by those, for [`CotorComplex::new_conjugate`].
+/// A conjugated backbone and the comodule's action by its coefficients, for
+/// [`CotorComplex::with_conjugated`].
 struct Conjugate {
-    /// `slices[s][t][l]` lists, for generator `l` of degree `t` in filtration `s + 1`, each
-    /// generator $x$ of filtration `s` with $\chi(a_{zx})$ nonzero, as its degree, its index and
-    /// the $M$ of the $P(M)$ in $\chi(a_{zx})$.
-    slices: Vec<Vec<Vec<Vec<(i32, usize, Vec<PPart>)>>>>,
+    backbone: Arc<crate::conjugate::ConjugatedBackbone>,
     /// The action by $\chi(P(M))$ on a basis element, through [`ConjugateAction`].
     #[allow(clippy::type_complexity)]
     act: Box<dyn Fn(PPart, i32, usize, &mut dyn FnMut(usize, u32)) + Send + Sync>,
@@ -183,7 +180,7 @@ where
             let dim_z = self.comodule.dimension(u - t_z);
             for l in 0..gens_z {
                 let column_base = offset_z + l * dim_z;
-                for (t_x, x, terms) in &conjugate.slices[s as usize][t_z as usize][l] {
+                for (t_x, x, terms) in conjugate.backbone.output(s, t_z, l) {
                     let Some(offset_x) = src_offset(*t_x) else {
                         continue;
                     };
@@ -234,75 +231,31 @@ where
     ///
     /// The coboundary is the same matrix: $a \cdot f(x) = f(x) \cdot \chi(a)$.
     pub fn new_conjugate(backbone: Arc<CC>, comodule: Arc<M>, max_s: i32, max_u: i32) -> Self {
-        use algebra::MilnorAntipode;
-        use maybe_rayon::prelude::*;
-        let mut out = Self::new(Arc::clone(&backbone), Arc::clone(&comodule), max_s, max_u);
         let max_t = max_u - comodule.min_degree();
-        let algebra = backbone.algebra();
-        let chi = MilnorAntipode::new(Arc::clone(&algebra));
-        let slices: Vec<Vec<Vec<Vec<(i32, usize, Vec<PPart>)>>>> = (0..=max_s)
-            .into_maybe_par_iter()
-            .map(|s| {
-                let d = backbone.differential(s + 1);
-                let target = backbone.module(s);
-                (0..=max_t)
-                    .map(|t| {
-                        if !backbone.has_computed_bidegree(Bidegree::s_t(s + 1, t)) {
-                            return Vec::new();
-                        }
-                        (0..backbone.number_of_gens_in_bidegree(Bidegree::s_t(s + 1, t)))
-                            .map(|l| {
-                                // chi of each coefficient, summed mod 2 over its terms.
-                                let mut odd: rustc_hash::FxHashMap<(i32, usize, PPart), bool> =
-                                    Default::default();
-                                for (idx, _) in d.output(t, l).iter_nonzero() {
-                                    let og = target.index_to_op_gen(t, idx);
-                                    let r = algebra
-                                        .basis_element_from_index(
-                                            og.operation_degree,
-                                            og.operation_index,
-                                        )
-                                        .p_part;
-                                    for &(m, _) in chi.of(r).iter() {
-                                        let e = odd
-                                            .entry((og.generator_degree, og.generator_index, m))
-                                            .or_insert(false);
-                                        *e = !*e;
-                                    }
-                                }
-                                let mut by_x: std::collections::BTreeMap<(i32, usize), Vec<PPart>> =
-                                    Default::default();
-                                for ((tx, x, m), keep) in odd {
-                                    if keep {
-                                        by_x.entry((tx, x)).or_default().push(m);
-                                    }
-                                }
-                                by_x.into_iter().map(|((tx, x), ms)| (tx, x, ms)).collect()
-                            })
-                            .collect()
-                    })
-                    .collect()
-            })
-            .collect();
-        let acting = Arc::clone(&comodule);
+        let (conjugated, _) =
+            crate::conjugate::ConjugatedBackbone::compute(&*backbone, max_s, max_t);
+        Self::with_conjugated(backbone, comodule, max_s, max_u, Arc::new(conjugated))
+    }
+
+    /// [`Self::new_conjugate`] with the conjugated backbone already computed, or loaded.
+    pub fn with_conjugated(
+        backbone: Arc<CC>,
+        comodule: Arc<M>,
+        max_s: i32,
+        max_u: i32,
+        conjugated: Arc<crate::conjugate::ConjugatedBackbone>,
+    ) -> Self {
+        let mut out = Self::new(backbone, Arc::clone(&comodule), max_s, max_u);
         out.conjugate = Some(Conjugate {
-            slices,
-            act: Box::new(move |r, d, idx, emit| acting.act_by_conjugate(r, d, idx, emit)),
+            backbone: conjugated,
+            act: Box::new(move |r, d, idx, emit| comodule.act_by_conjugate(r, d, idx, emit)),
         });
         out
     }
 
     /// The number of terms of the conjugated backbone.
     pub fn conjugate_terms(&self) -> usize {
-        self.conjugate.as_ref().map_or(0, |c| {
-            c.slices
-                .iter()
-                .flatten()
-                .flatten()
-                .flatten()
-                .map(|x| x.2.len())
-                .sum()
-        })
+        self.conjugate.as_ref().map_or(0, |c| c.backbone.terms())
     }
 }
 
