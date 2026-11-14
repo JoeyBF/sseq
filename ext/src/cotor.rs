@@ -303,7 +303,7 @@ pub fn coinduced<A: Algebra>(
 
 #[cfg(test)]
 mod tests {
-    use algebra::comodule::FiniteComodule;
+    use algebra::comodule::{Comodule, FiniteComodule};
 
     use super::*;
     use crate::{chain_complex::ChainComplex, utils::construct};
@@ -500,5 +500,27 @@ mod tests {
             }
         }
         assert_eq!(ours, expected);
+    }
+
+    /// $M \otimes \Gamma$ is cofree, so its Cotor is $M$ in filtration zero.
+    #[test]
+    fn tensor_with_coregular_is_cofree() {
+        use algebra::comodule::TensorComodule;
+
+        use crate::algebraic_novikov::{q_comodule, unit_module};
+        let res = Arc::new(crate::nassau::Resolution::new(Arc::new(unit_module())));
+        let (max_s, max_u) = (4, 14);
+        res.compute_through_stem(Bidegree::n_s(max_u + 1, max_s + 2));
+        let m = Arc::new(q_comodule(res.algebra(), 2, max_u));
+        let gamma = Arc::new(FiniteComodule::coregular(res.algebra(), max_u));
+        let t = Arc::new(TensorComodule::new(Arc::clone(&m), gamma));
+        let cx = CotorComplex::new(Arc::clone(&res), t, max_s, max_u);
+        m.compute_basis(max_u);
+        for s in 0..=max_s {
+            for u in 0..=max_u {
+                let expected = if s == 0 { m.dimension(u) } else { 0 };
+                assert_eq!(cx.cotor(s, u), expected, "(s, u) = ({s}, {u})");
+            }
+        }
     }
 }
