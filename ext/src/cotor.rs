@@ -318,6 +318,79 @@ pub fn coinduced<A: Algebra>(
     m
 }
 
+/// The dual $N^\vee$ of a finite module over the Milnor algebra at $p = 2$, with
+/// $(a \cdot f)(n) = f(\chi(a) n)$, in the degrees of $N$ with the basis dual to its.
+///
+/// Its Cotor is $\mathrm{Ext}_A(N, \mathbb{F}_2)$: the vector-space dual of a module is a left
+/// comodule, and the antipode makes it the right one a [`Comodule`] presents.
+pub fn dual_comodule(
+    module: &algebra::module::FDModule<algebra::MilnorAlgebra>,
+) -> algebra::comodule::FiniteComodule<algebra::MilnorAlgebra> {
+    use algebra::{
+        MilnorAlgebra,
+        milnor_algebra::{MilnorBasisElement, PPart},
+        module::Module,
+    };
+
+    use crate::algebraic_novikov::{chi_table, pack, unpack, xi_degree};
+    let algebra: Arc<MilnorAlgebra> = module.algebra();
+    assert_eq!(
+        algebra.prime(),
+        2,
+        "the antipode is only implemented at p = 2"
+    );
+    let (min, max) = (module.min_degree(), module.max_degree().unwrap());
+    let span = max - min;
+    algebra.compute_basis(span);
+    // chi[S] lists the R with chi(P(S)) = sum of P(R).
+    let chi = chi_table(span);
+    let index_of = |r: u128| -> (i32, usize) {
+        let d = xi_degree(r);
+        let elt = MilnorBasisElement {
+            q_part: 0,
+            p_part: PPart::from_slice(&unpack(r)),
+            degree: d,
+        };
+        (d, algebra.basis_element_to_index(&elt))
+    };
+    let dims = bivec::BiVec::from_vec(min, (min..=max).map(|d| module.dimension(d)).collect());
+    let mut m =
+        algebra::comodule::FiniteComodule::new(Arc::clone(&algebra), format!("D{module}"), dims);
+    let p = algebra.prime();
+    for d in min..=max {
+        for n in 1..=d - min {
+            for a in 0..algebra.dimension(n) {
+                let s: Vec<u32> = algebra
+                    .basis_element_from_index(n, a)
+                    .p_part
+                    .iter()
+                    .collect();
+                let chi_a: Vec<usize> = chi
+                    .get(&pack(&s))
+                    .into_iter()
+                    .flatten()
+                    .map(|&r| index_of(r).1)
+                    .collect();
+                // a . f_c = sum over b of [coefficient of n_c in chi(a) n_b] f_b.
+                let mut images = vec![vec![0u32; module.dimension(d - n)]; module.dimension(d)];
+                for b in 0..module.dimension(d - n) {
+                    let mut v = FpVector::new(p, module.dimension(d));
+                    for &r in &chi_a {
+                        module.act_on_basis(v.as_slice_mut(), 1, n, r, d - n, b);
+                    }
+                    for (c, x) in v.iter_nonzero() {
+                        images[c][b] = x;
+                    }
+                }
+                for (c, image) in images.iter().enumerate() {
+                    m.set_action(n, a, d, c, image);
+                }
+            }
+        }
+    }
+    m
+}
+
 #[cfg(test)]
 mod tests {
     use algebra::comodule::{Comodule, FiniteComodule};
@@ -613,6 +686,39 @@ mod tests {
                     count.get(&(s, t)).copied().unwrap_or(0),
                     "F2[xi1] at (s, t) = ({s}, {t})"
                 );
+            }
+        }
+    }
+
+    /// The Cotor of the dual of a finite module is the module's Ext.
+    #[test]
+    fn dual_of_module_gives_its_ext() {
+        use algebra::{MilnorAlgebra, module::FDModule};
+
+        use crate::{algebraic_novikov::unit_module, utils::load_module_json};
+        let res = Arc::new(crate::nassau::Resolution::new(Arc::new(unit_module())));
+        let (max_s, max_u) = (5, 20);
+        res.compute_through_stem(Bidegree::n_s(max_u + 1, max_s + 2));
+        for name in ["Ceta", "Cnu", "Joker", "C2", "RP4"] {
+            let json = load_module_json(name).unwrap();
+            let module: FDModule<MilnorAlgebra> =
+                FDModule::from_json(res.algebra(), &json).unwrap();
+            let theirs = construct(name, None).unwrap();
+            theirs.compute_through_stem(Bidegree::n_s(max_u, max_s));
+            let m = Arc::new(dual_comodule(&module));
+            let cx = CotorComplex::new(Arc::clone(&res), m, max_s, max_u);
+            for s in 0..=max_s {
+                for u in s..=max_u {
+                    let t = u;
+                    if t - s > max_u - max_s {
+                        continue;
+                    }
+                    assert_eq!(
+                        cx.cotor(s, u),
+                        theirs.number_of_gens_in_bidegree(Bidegree::s_t(s, t)),
+                        "{name} at (s, u) = ({s}, {u})"
+                    );
+                }
             }
         }
     }

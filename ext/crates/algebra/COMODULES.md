@@ -288,8 +288,8 @@ To come:
 
 - **Change of rings for `PolynomialComodule`**: $A/\!/A(1)_*$ and $A/\!/E(0)_*$ presented by
   generators, against the same answers; their coactions are not self-conjugate.
-- **Finite comodules from modules**: the dual of an `FDModule` needs the antipode to become a
-  left module, so this waits for one.
+- **Finite comodules from modules**: done, see `ext::cotor::dual_comodule` under
+  [What is left](#what-is-left).
 - **Regression**: $\mathrm{Ext}_P(Q)$ and $\mathrm{Ext}_P(Q/I_1)$ through `CotorComplex` against
   `ctau_e2_untwisted_on` and the saved CSVs, at small stems in the test suite and at large stems
   by hand.
@@ -351,8 +351,11 @@ generality, not speed.
 - **Spill the table to the backbone's store** for targets where it does not fit in memory.
 - **The Cartan–Eilenberg check**, $\mathrm{Ext}_P(Q \otimes M) \Rightarrow \mathrm{Ext}_P(\Phi_* M)$,
   through `TensorComodule`.
-- **An antipode** for `MilnorAlgebra`, to make a left comodule (the dual of an `FDModule`) a
-  right one.
+- **An antipode in `algebra`.** `ext::cotor::dual_comodule` makes the dual of an `FDModule` a
+  right comodule through the $p = 2$ antipode table of `ext::algebraic_novikov`; its Cotor is
+  the module's Ext (checked for $C\eta$, $C\nu$, the Joker, $C2$ and $\mathbb{R}P^4$, and the
+  Joker fails without the antipode). An antipode on `MilnorAlgebra` itself, at every prime,
+  would make this a constructor of `FiniteComodule`.
 
 ## Open questions
 
