@@ -77,7 +77,12 @@ where
     pub fn precompute_actions(&self, max_d: i32) -> usize {
         let max_d = max_d.min(self.actions.len() as i32 - 1);
         let mut nnz = 0;
-        for (d, block) in self.comodule.act_batches(&self.ops, max_d).into_iter().enumerate() {
+        for (d, block) in self
+            .comodule
+            .act_batches(&self.ops, max_d)
+            .into_iter()
+            .enumerate()
+        {
             nnz += block.nnz();
             let _ = self.actions[d].set(block);
         }
@@ -202,9 +207,9 @@ where
         }
         let forward = self.coboundary(s, u);
         let mut transposed = Matrix::new(p, forward.columns(), forward.rows());
-        for i in 0..forward.rows() {
+        for (i, &pos) in position.iter().enumerate() {
             for (j, v) in forward.row(i).iter_nonzero() {
-                transposed.row_mut(j).set_entry(position[i], v);
+                transposed.row_mut(j).set_entry(pos, v);
             }
         }
         let rank_upto = if transposed.rows() > 0 && transposed.columns() > 0 {

@@ -145,7 +145,14 @@ where
                 }
             }
         }
-        self.psi = self.q.psi_table(&op_ids, &allowed, &wanted);
+        // The comodule's walk identifies the basis with Q/(v_0 - 1), which a quotient by v_0 is not.
+        let v0_is_one = matches!(self.layer, Layer::Adjoin(_) | Layer::Quotient(0));
+        self.psi = if v0_is_one && std::env::var_os("CTAU_QDOWN_WALK").is_none() {
+            self.q
+                .psi_table_by_comodule(&self.res.algebra(), &op_ids, &allowed, &wanted)
+        } else {
+            self.q.psi_table(&op_ids, &allowed, &wanted)
+        };
         self.op_ids = op_ids;
     }
 

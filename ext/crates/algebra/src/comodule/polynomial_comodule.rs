@@ -397,10 +397,48 @@ impl PolynomialComodule {
             .collect()
     }
 
-    /// Visits `m`, of degree `degree` and weight `weight` with coaction `psi`, and the monomials
-    /// obtained from it by multiplying by powers $x_n^{p^j}$ larger than every power already in
-    /// it, so that each monomial is visited once, from the monomial [`Self::act`] peels it to.
-    /// Returns the row of the action of `ops` on each basis monomial visited.
+    /// Calls `sink(degree, index, psi)` with the coaction of every basis monomial of degree at
+    /// most `max_degree` and, where `max_weight` is given, of weight at most
+    /// `max_weight[degree]`, keeping only the terms whose $R$ is at most `cap` in every entry.
+    ///
+    /// The monomials are visited as a tree from 1, each child obtained by multiplying by a power
+    /// $x_n^{p^j}$ larger than every power already present, so that each is visited once, from
+    /// the monomial [`Self::act`] peels it to; its coaction is its parent's times the Frobenius
+    /// twist of the generator's. Weight never falls along the tree, so a branch is cut once no
+    /// degree it can reach admits its weight. Branches run in parallel, so `sink` is called
+    /// concurrently and in no particular order.
+    pub fn walk_coactions(
+        &self,
+        cap: PPart,
+        max_degree: i32,
+        max_weight: Option<&[i32]>,
+        sink: &(dyn Fn(i32, usize, &[(PPart, Monomial, u32)]) + Sync),
+    ) {
+        self.compute_basis(max_degree);
+        // reach[d]: the largest weight admitted in any degree from d up.
+        let mut reach = vec![i32::MAX; max_degree as usize + 2];
+        if let Some(w) = max_weight {
+            reach[max_degree as usize + 1] = -1;
+            for d in (0..=max_degree as usize).rev() {
+                reach[d] = reach[d + 1].max(w.get(d).copied().unwrap_or(-1));
+            }
+        }
+        let root = [0u16; MAX_GENERATORS];
+        self.walk(
+            root,
+            0,
+            0,
+            &[(PPart::zero(), root, 1)],
+            cap,
+            max_degree,
+            max_weight,
+            &reach,
+            sink,
+        );
+    }
+
+    /// Visits `m`, of degree `degree` and weight `weight` with coaction `psi`, and its subtree;
+    /// see [`Self::walk_coactions`].
     #[allow(clippy::too_many_arguments)]
     fn walk(
         &self,
@@ -408,26 +446,21 @@ impl PolynomialComodule {
         degree: i32,
         weight: u32,
         psi: &[(PPart, Monomial, u32)],
-        local: &FxHashMap<PPart, u32>,
         cap: PPart,
         max_degree: i32,
-    ) -> Vec<(i32, usize, Vec<(u32, u32, u32)>)> {
+        max_weight: Option<&[i32]>,
+        reach: &[i32],
+        sink: &(dyn Fn(i32, usize, &[(PPart, Monomial, u32)]) + Sync),
+    ) {
         use maybe_rayon::prelude::*;
         let p = self.prime().as_u32();
-        let mut out = Vec::new();
-        if self.weight.is_none_or(|w| w == weight)
+        let admitted = max_weight
+            .is_none_or(|w| weight as i32 <= w.get(degree as usize).copied().unwrap_or(-1));
+        if admitted
+            && self.weight.is_none_or(|w| w == weight)
             && let Some(idx) = self.index(degree, &m)
         {
-            let mut row: Vec<(u32, u32, u32)> = psi
-                .iter()
-                .filter_map(|(r, target, c)| {
-                    let &l = local.get(r)?;
-                    let t = self.index(self.degree_of(target), target)?;
-                    Some((l, t as u32, *c))
-                })
-                .collect();
-            row.sort_unstable();
-            out.push((degree, idx, row));
+            sink(degree, idx, psi);
         }
         // The largest power already present: the last generator, its top p-adic digit.
         let last = (0..self.degrees.len()).rev().find(|&n| m[n] > 0);
@@ -447,8 +480,7 @@ impl PolynomialComodule {
                     break;
                 }
                 let allowed = if Some(n) == last {
-                    let e = m[n] as u32;
-                    let (mut top, mut x) = (0, e);
+                    let (mut top, mut x) = (0, m[n] as u32);
                     while x >= p {
                         x /= p;
                         top += 1;
@@ -457,7 +489,7 @@ impl PolynomialComodule {
                 } else {
                     true
                 };
-                if allowed {
+                if allowed && cw as i32 <= reach[cd as usize] {
                     children.push((n, pj, cd, cw));
                 }
                 if d == 0 && w == 0 {
@@ -467,17 +499,14 @@ impl PolynomialComodule {
                 j += 1;
             }
         }
-        let rest: Vec<Vec<_>> = children
-            .into_maybe_par_iter()
-            .map(|(n, pj, cd, cw)| {
-                let mut child = m;
-                child[n] += pj as u16;
-                let child_psi = self.multiply_coactions(psi, &self.chunk_coaction(n, pj), cap);
-                self.walk(child, cd, cw, &child_psi, local, cap, max_degree)
-            })
-            .collect();
-        out.extend(rest.into_iter().flatten());
-        out
+        children.into_maybe_par_iter().for_each(|(n, pj, cd, cw)| {
+            let mut child = m;
+            child[n] += pj as u16;
+            let child_psi = self.multiply_coactions(psi, &self.chunk_coaction(n, pj), cap);
+            self.walk(
+                child, cd, cw, &child_psi, cap, max_degree, max_weight, reach, sink,
+            );
+        });
     }
 
     /// The polynomial part of an operation, or `None` if it has an exterior part.
@@ -617,28 +646,34 @@ impl Comodule for PolynomialComodule {
                 }
             }
         }
-        let root = [0u16; MAX_GENERATORS];
-        let rows = self.walk(
-            root,
-            0,
-            0,
-            &[(PPart::zero(), root, 1)],
-            &local,
-            cap,
-            max_degree,
-        );
-        let mut by_degree: Vec<Vec<Option<Vec<(u32, u32, u32)>>>> = (0..=max_degree)
-            .map(|d| vec![None; self.dimension(d)])
+        type Row = Vec<(u32, u32, u32)>;
+        let rows: Vec<Vec<std::sync::OnceLock<Row>>> = (0..=max_degree)
+            .map(|d| {
+                (0..self.dimension(d))
+                    .map(|_| std::sync::OnceLock::new())
+                    .collect()
+            })
             .collect();
-        for (d, idx, row) in rows {
-            by_degree[d as usize][idx] = Some(row);
-        }
-        by_degree
-            .into_iter()
+        self.walk_coactions(cap, max_degree, None, &|d, idx, psi| {
+            let mut row: Row = psi
+                .iter()
+                .filter_map(|(r, target, c)| {
+                    let &l = local.get(r)?;
+                    let t = self.index(self.degree_of(target), target)?;
+                    Some((l, t as u32, *c))
+                })
+                .collect();
+            row.sort_unstable();
+            let _ = rows[d as usize][idx].set(row);
+        });
+        rows.into_iter()
             .map(|rows| {
                 let mut block = ActionBlock::new(self.prime());
                 for row in rows {
-                    block.push_row(row.expect("the walk visits every basis monomial"));
+                    block.push_row(
+                        row.into_inner()
+                            .expect("the walk visits every basis monomial"),
+                    );
                 }
                 block
             })

@@ -1133,6 +1133,76 @@ impl QDown {
         Psi::from_pairs(pairs)
     }
 
+    /// [`Self::psi_table`] for a basis of $Q$ with $v_0$ set to 1, computed as the action of
+    /// [`q_mod_v0_comodule`] by its walk over monomials.
+    ///
+    /// The basis here is a set of $v_0$-free monomials standing for $Q_k$, so the identification
+    /// is that of $Q/(v_0 - 1)$; it is wrong for a quotient by $v_0$. Terms leaving the basis are
+    /// dropped, as there.
+    pub(crate) fn psi_table_by_comodule(
+        &self,
+        algebra: &Arc<MilnorAlgebra>,
+        ops: &FxHashMap<PackedXi, u32>,
+        allowed: &[Vec<bool>],
+        wanted: &[i32],
+    ) -> Vec<Vec<Psi<u32>>> {
+        use algebra::{comodule::Monomial, milnor_algebra::PPart};
+        let table: Vec<Vec<std::sync::OnceLock<Psi<u32>>>> = self
+            .by_degree
+            .iter()
+            .map(|b| (0..b.len()).map(|_| std::sync::OnceLock::new()).collect())
+            .collect();
+        let finish = |table: Vec<Vec<std::sync::OnceLock<Psi<u32>>>>| {
+            table
+                .into_iter()
+                .map(|b| {
+                    b.into_iter()
+                        .map(|c| c.into_inner().unwrap_or_default())
+                        .collect()
+                })
+                .collect()
+        };
+        let Some(max_d) = wanted.iter().rposition(|&w| w >= 0) else {
+            return finish(table);
+        };
+        let max_d = (max_d as i32).min(self.max_degree());
+        let comodule = q_mod_v0_comodule(Arc::clone(algebra), max_d);
+        let mut by_r: FxHashMap<PPart, u32> = FxHashMap::default();
+        let mut cap = PPart::zero();
+        for (&r, &id) in ops {
+            let r = PPart::from_slice(&unpack(r));
+            for i in 0..r.len() {
+                cap.set(i, cap.get(i).max(r.get(i)));
+            }
+            by_r.insert(r, id);
+        }
+        // The basis's monomials in v_0, v_1, ... with v_0 absent, from ours in v_1, v_2, ...
+        let theirs = |m: &Monomial| -> QMono {
+            let mut out = [0u16; QDOWN_VARS];
+            out[1..].copy_from_slice(&m[..QDOWN_VARS - 1]);
+            debug_assert!(m[QDOWN_VARS - 1..].iter().all(|&e| e == 0));
+            out
+        };
+        comodule.walk_coactions(cap, max_d, Some(wanted), &|d, idx, psi| {
+            let Some(q_idx) = self.try_index(d, &theirs(&comodule.basis(d)[idx])) else {
+                return;
+            };
+            let pairs: Vec<(u32, u32)> = psi
+                .iter()
+                .filter_map(|(r, target, _)| {
+                    let &id = by_r.get(r)?;
+                    if !allowed[d as usize][id as usize] {
+                        return None;
+                    }
+                    let g = self.try_index(comodule.degree_of(target), &theirs(target))?;
+                    Some((id, g as u32))
+                })
+                .collect();
+            let _ = table[d as usize][q_idx].set(Psi::from_pairs(pairs));
+        });
+        finish(table)
+    }
+
     /// $\psi(m)$ for every basis monomial $m$ of degree $d$ and length at most `wanted[d]`, by
     /// degree and index, keeping only the operations `ops` numbers that `allowed[d]` marks, keyed
     /// by their numbers; the other entries are empty.
