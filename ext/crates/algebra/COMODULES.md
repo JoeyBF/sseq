@@ -1,7 +1,7 @@
 # Comodules and Cotor: design
 
-Status: experimental, on the branch `comodules`. Step 1 of the [plan](#plan) is implemented:
-`algebra::comodule` and `ext::cotor`.
+Status: experimental, on the branch `comodules`. The [plan](#plan) is implemented except where
+it says otherwise: `algebra::comodule`, `algebra::MilnorQuotientAlgebra` and `ext::cotor`.
 
 ## Goal
 
@@ -152,6 +152,9 @@ The trait, in `algebra::comodule`, mirrors `Module`:
   basis element of one degree. This is the unit of work: an implementor shares work across the
   operations and across the basis, and the caller decides how long the block lives. The default
   calls `act_on_basis` once per pair.
+- `act_batches(&OpSet, max_degree) -> Vec<ActionBlock>`: the same for every degree at once, for
+  an implementor that produces them together; `PolynomialComodule` does it in one walk over its
+  monomials (`walk_coactions`, which also serves callers that want the raw coaction).
 
 - `OpSet` is a set of operations, sorted by degree, with a dense local numbering so that an
   `ActionBlock` can be indexed by `(local op, basis index)` without hashing. Its down-closure
@@ -210,7 +213,7 @@ Mirroring `algebra::module`:
 | `TensorComodule` | diagonal coaction, through `Bialgebra::coproduct` | the tensor modules in the CESS check |
 | `SubComodule`, `QuotientComodule` | filtration pieces of a `FilteredComodule` | `Layer::Adjoin`, `Layer::Quotient` |
 | `SuspensionComodule` | a shift of degree | — |
-| `ExtendedComodule` | $\Gamma \otimes V$, for change-of-rings tests | — |
+| `ExtendedComodule` | $\Gamma \otimes V$; covered for now by `TensorComodule` with `FiniteComodule::coregular` | — |
 
 ### `PolynomialComodule` and the walk
 
@@ -295,15 +298,61 @@ To come:
 ## Plan
 
 1. *Done.* `OpId`; `Comodule`, `OpSet`, `ActionBlock`; `FiniteComodule`; the coproduct with
-   coefficients at every prime. Cotor in `ext` with the global policy only.
-2. `PolynomialComodule` with the pruned walk; the change-of-rings tests; $\mathrm{Ext}_P(Q)$
-   regression against the existing code.
-3. `FilteredComodule`, sub and quotient comodules; port `vn_bockstein` and `v0_transfer` onto
-   `CotorComplex`, and retire `QDown`, `QDual` and `Stage`.
-4. The per-weight and spilled policies, measured at targets 240 and 320.
-5. `TensorComodule` and the Cartan–Eilenberg check.
-6. Quotient algebras of $A$ as a restricting profile, checked against a known case such as
-   $P$ (which must reproduce $\mathrm{Ext}_A$ with doubled degrees).
+   coefficients at every prime. Cotor in `ext` with the global policy.
+2. *Done.* `PolynomialComodule`, with `dual_steenrod_subalgebra` for the change-of-rings tests,
+   and `ext::algebraic_novikov::q_comodule`; $\mathrm{Ext}_P(Q)$ through `CotorComplex` agrees
+   with `ctau_e2_untwisted_on`.
+3. *Done in part.* `FilteredComodule`, `SubComodule`, `QuotientComodule`;
+   `CotorComplex::cotor_by_filtration`, and `q_mod_v0_comodule`, whose pieces are every $Q_k$
+   at once. The transfer's coaction table (`Stage` for the layers that set $v_0 = 1$) comes from
+   the comodule walk. `Stage`, `QDown` and the transfer itself are not yet generic over a
+   comodule, and the quotients by $v_0$ keep the `QDown` walk.
+4. *Global policy only.* `CotorComplex::precompute_actions` fills the cache in one walk. The
+   per-weight and spilled policies are not written: with the walk, the action is no longer what
+   limits the direct computation (see below), and for the transfer its table is the same size
+   as before.
+5. *Done in part.* `TensorComodule`, checked by associativity at $p = 2, 3$ (the Koszul sign is
+   needed at 3) and by the cofree comodule $M \otimes \Gamma$. The Cartan–Eilenberg check is
+   not written.
+6. *Done.* `MilnorQuotientAlgebra`, the quotient dual to $\mathbb{F}_p[\xi_k^{p^{e_k}}]$,
+   resolved by `ext` as it stands: the quotient dual to $\mathbb{F}_2[\xi_k^2]$ gives
+   $\mathrm{Ext}_A$ doubled, and the one dual to $\mathbb{F}_2[\xi_1]$ gives
+   $\mathbb{F}_2[h_{1j}]$.
+
+### Measurements of the implementation
+
+$\mathrm{Ext}_P(Q)$ by the direct method, `cotor_q` against `ctau_e2_untwisted_on`, four threads,
+same classes:
+
+| target | action | total | old total |
+|---|---|---|---|
+| 80 | 0.02 s | 0.04 s | 0.53 s |
+| 120 | 0.33 s | 0.85 s | 18.4 s |
+| 140 | 1.2 s | 3.1 s | 100.7 s |
+| 160 | 3.4 s | 11.6 s | |
+| 200 | 24.7 s | 122 s | |
+
+Most of the old time was the action, recomputed per pair of operation and monomial through a
+memo. The walk computes each monomial's coaction once, from its parent's. At 200 the reductions
+dominate, and the $v_0$-transfer, which avoids most of them, is the faster method.
+
+For the transfer, at target 200 the comodule walk and the `QDown` walk give the same classes in
+70 s and 74 s, both peaking at 649 MB: the two walks are the same algorithm, so this gains
+generality, not speed.
+
+### What is left
+
+- **Make the transfer generic.** `Stage` builds its coboundaries from `QDown` bases and the
+  `Psi` table; written against a `FilteredComodule` and `ActionBlock`s, the transfer and the
+  Bocksteins would run on any filtered comodule, and `QDown` and `QDual` could go.
+- **Prune the walk to the down-closure** of the requested operations instead of their
+  componentwise maximum. This is the remaining lever on the walk's intermediates, which
+  are about half of the transfer's peak.
+- **Spill the table to the backbone's store** for targets where it does not fit in memory.
+- **The Cartan–Eilenberg check**, $\mathrm{Ext}_P(Q \otimes M) \Rightarrow \mathrm{Ext}_P(\Phi_* M)$,
+  through `TensorComodule`.
+- **An antipode** for `MilnorAlgebra`, to make a left comodule (the dual of an `FDModule`) a
+  right one.
 
 ## Open questions
 
