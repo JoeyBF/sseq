@@ -5,6 +5,7 @@ mod check;
 mod comodule_trait;
 mod filtered;
 mod finite_comodule;
+mod matrix_comodule;
 mod polynomial_comodule;
 mod tensor_comodule;
 
@@ -13,5 +14,6 @@ pub use check::check_associativity;
 pub use comodule_trait::Comodule;
 pub use filtered::{FilteredComodule, QuotientComodule, SubComodule};
 pub use finite_comodule::FiniteComodule;
+pub use matrix_comodule::{MatrixQComodule, for_each_column};
 pub use polynomial_comodule::{Generator, MAX_GENERATORS, Monomial, PolynomialComodule};
 pub use tensor_comodule::TensorComodule;

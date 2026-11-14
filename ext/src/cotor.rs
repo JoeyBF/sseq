@@ -372,16 +372,18 @@ pub fn dual_comodule(
                     .map(|&r| index_of(r).1)
                     .collect();
                 // a . f_c = sum over b of [coefficient of n_c in chi(a) n_b] f_b.
-                let mut images = vec![vec![0u32; module.dimension(d - n)]; module.dimension(d)];
-                for b in 0..module.dimension(d - n) {
-                    let mut v = FpVector::new(p, module.dimension(d));
-                    for &r in &chi_a {
-                        module.act_on_basis(v.as_slice_mut(), 1, n, r, d - n, b);
-                    }
-                    for (c, x) in v.iter_nonzero() {
-                        images[c][b] = x;
-                    }
-                }
+                let products: Vec<FpVector> = (0..module.dimension(d - n))
+                    .map(|b| {
+                        let mut v = FpVector::new(p, module.dimension(d));
+                        for &r in &chi_a {
+                            module.act_on_basis(v.as_slice_mut(), 1, n, r, d - n, b);
+                        }
+                        v
+                    })
+                    .collect();
+                let images: Vec<Vec<u32>> = (0..module.dimension(d))
+                    .map(|c| products.iter().map(|v| v.entry(c)).collect())
+                    .collect();
                 for (c, image) in images.iter().enumerate() {
                     m.set_action(n, a, d, c, image);
                 }
@@ -721,5 +723,49 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The action of [`algebra::comodule::MatrixQComodule`], from Milnor matrices and the
+    /// antipode, agrees entry by entry with the walk of the same comodule presented by
+    /// generators.
+    #[test]
+    fn matrix_action_matches_generators() {
+        use algebra::{
+            MilnorAlgebra,
+            comodule::{MatrixQComodule, OpId},
+        };
+
+        use crate::algebraic_novikov::q_mod_v0_comodule;
+        let max = 40;
+        let alg = Arc::new(MilnorAlgebra::new(fp::prime::TWO, false));
+        alg.compute_basis(max);
+        let ops: OpSet = (0..=max)
+            .flat_map(|n| {
+                (0..alg.dimension(n)).map(move |i| OpId {
+                    degree: n,
+                    index: i as u32,
+                })
+            })
+            .collect();
+        let walk = q_mod_v0_comodule(Arc::clone(&alg), max).act_batches(&ops, max);
+        let matrix = MatrixQComodule::new(Arc::clone(&alg), max);
+        matrix.compute_basis(max);
+        let mut nonzero = 0;
+        for d in 0..=max {
+            let block = matrix.act_batch(&ops, d);
+            for idx in 0..matrix.dimension(d) {
+                let a: Vec<_> = walk[d as usize]
+                    .row(idx)
+                    .map(|(l, e)| (l, e.iter().collect::<Vec<_>>()))
+                    .collect();
+                let b: Vec<_> = block
+                    .row(idx)
+                    .map(|(l, e)| (l, e.iter().collect::<Vec<_>>()))
+                    .collect();
+                nonzero += b.len();
+                assert_eq!(a, b, "degree {d}, index {idx}");
+            }
+        }
+        assert!(nonzero > 1000);
     }
 }
