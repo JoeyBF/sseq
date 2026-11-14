@@ -24,7 +24,8 @@ a tensor product for a Cartan–Eilenberg spectral sequence) is an implementor a
 
 ### Comodules as lowering modules
 
-Let $\Gamma$ be $A_*$ or a quotient Hopf algebra of it, and $A = \Gamma^\vee$. A left
+Let $\Gamma$ be $A_*$, a quotient Hopf algebra of it, or a sub-Hopf algebra of it, and
+$A = \Gamma^\vee$. A left
 $\Gamma$-comodule $M$ has a coaction $\psi\colon M \to \Gamma \otimes M$. When $M$ is bounded below
 and of finite type, it is the same thing as a *locally finite* left $A$-module, through
 
@@ -64,8 +65,9 @@ and it gives up the independence of bidegrees.
   coaction is honestly written with $\xi$. An implementor states its coaction in one convention
   and the tests fix which one the induced action uses. Every comodule test must include a
   non-self-conjugate case, because the two conventions agree on small examples.
-- **Grading.** At $p = 2$ the $C\tau$ work uses $P$ with degrees halved. The coalgebra carries its
-  own degree function; a halved $P$ is a coalgebra in its own right, not a flag on $A_*$.
+- **Grading.** At $p = 2$ the $C\tau$ work uses $P$ with degrees halved, which is $A_*$ again.
+  Whether $P$ is named as the quotient of $A$ dual to $\mathbb{F}_2[\xi_i^2]$ or as $A$ with a
+  halved grading is a choice for the first user; the two must give the same Cotor.
 
 ## Measurements that shape the design
 
@@ -100,32 +102,27 @@ everything up front.
 
 ## Interface
 
-### Coalgebra
+### The coalgebra is named by its dual
+
+Everything here is of finite type, so $\Gamma$ is the graded dual of an `Algebra`, and the
+structure of $\Gamma$ is that algebra's:
+
+- the coproduct of $\Gamma$ is dual to `Algebra::multiply_basis_elements`;
+- the product of $\Gamma$ is dual to `Bialgebra::coproduct`, which `MilnorAlgebra` implements
+  (at $p = 2$; for the Milnor basis it splits $P(R)$ into $P(S) \otimes P(T)$ with $S + T = R$,
+  so the product of $A_*$ adds exponents);
+- the basis of $\Gamma$ is the dual of the algebra's basis, with the same `(degree, index)`.
+
+So a comodule names its coalgebra by its dual algebra, as a `Module` names its algebra, and
+`TensorComodule` uses `Bialgebra` exactly as `TensorModule` does. A comodule over a subalgebra
+of $A_*$, that is over a quotient algebra of $A$, needs that quotient as an `Algebra` (see
+[Quotient algebras](#quotient-algebras-of-a)).
 
 ```rust
-/// A graded connected Hopf algebra over F_p, the dual of an `Algebra` in the same basis.
-pub trait Coalgebra: Send + Sync + 'static {
-    type Dual: Algebra;
-    fn dual(&self) -> Arc<Self::Dual>;
-    fn prime(&self) -> ValidPrime;
-    fn compute_basis(&self, degree: i32);
-    fn dimension(&self, degree: i32) -> usize;
-    /// The coproduct of a basis element, as pairs of basis elements.
-    fn coproduct_on_basis(&self, degree: i32, idx: usize) -> Vec<(OpId, OpId)>;
-    /// The product of two basis elements, dual to the coproduct of `Dual`.
-    fn multiply_basis_elements(&self, a: OpId, b: OpId) -> Option<OpId>;
-    fn basis_element_to_string(&self, degree: i32, idx: usize) -> String;
-}
-
-/// A basis element of a coalgebra: its degree and its index in the basis of the dual algebra.
+/// An operation of the dual algebra, as the resolution's differentials name it.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct OpId { pub degree: i32, pub index: u32 }
 ```
-
-The first implementor is `MilnorCoalgebra`, wrapping an `Arc<MilnorAlgebra>` (any profile, so
-$A(n)_*$ and $P$ come for free). It reuses the algebra's basis and indexing, so pairing is the
-identity on indices. The product of $A_*$ is polynomial, so `multiply_basis_elements` adds
-exponents and is single-valued at $p = 2$ (hence `Option`, for exceeding a profile).
 
 **Why `OpId` is (degree, index) and not a packed exponent vector.** The consumer of a comodule is
 a free resolution, whose differentials already name operations as `(operation_degree,
@@ -137,8 +134,9 @@ needs it, which converts at the boundary with the algebra's `basis_element_from_
 
 ```rust
 pub trait Comodule: std::fmt::Display + Send + Sync + 'static {
-    type Coalgebra: Coalgebra;
-    fn coalgebra(&self) -> Arc<Self::Coalgebra>;
+    /// The dual of the coalgebra.
+    type Algebra: Bialgebra;
+    fn algebra(&self) -> Arc<Self::Algebra>;
     fn min_degree(&self) -> i32;
     fn compute_basis(&self, degree: i32);
     fn max_computed_degree(&self) -> i32;
@@ -182,6 +180,30 @@ This is what `Layer::filtration` is today. Sub and quotient comodules cut out by
 value are then generic (below), and the Bockstein and Cartan–Eilenberg spectral sequences become
 consumers of a `FilteredComodule` rather than of $Q$ specifically.
 
+### Quotient algebras of $A$
+
+Sub-Hopf algebras of $A$ are dual to quotient Hopf algebras of $A_*$; `MilnorProfile` covers them,
+and they are already resolvable. Quotient Hopf algebras $B$ of $A$ are dual to sub-Hopf algebras
+$B_* \subset A_*$, and $\mathrm{Ext}_B(\mathbb{F}_2, \mathbb{F}_2) = \mathrm{Cotor}_{B_*}(\mathbb{F}_2,
+\mathbb{F}_2)$. Examples:
+
+- $P = \mathbb{F}_2[\xi_i^2]$, dual to $A /\!/ E(Q_0, Q_1, \dots)$;
+- $\mathbb{F}_2[\xi_1, \dots, \xi_n]$, closed under the coproduct because $\Delta\xi_k$ involves
+  only $\xi_j$ with $j \le k$;
+- generally $\mathbb{F}_2[\xi_i^{2^{e_i}}]$ for exponents satisfying the closure condition dual to
+  that of a profile.
+
+Computing Cotor over $B_*$ by the route above needs a resolution over $B$, so $B$ must be an
+`Algebra`. Reusing the resolution over $A$ does not work: $B \otimes_A C$ is free over $B$ but not
+exact, since $\mathrm{Tor}^A(B, \mathbb{F}_2) \neq \mathbb{F}_2$, and passing from $A$ to $B$
+gives a Cartan–Eilenberg spectral sequence rather than an isomorphism.
+
+For the monomial family $B$ is cheap. The kernel of $A \to B$ is spanned by the $P(R)$ with
+$\xi^R \notin B_*$, because the Milnor basis is dual to the monomials. So $B$ is the Milnor basis
+restricted to the admissible $R$, with the Milnor product and the inadmissible terms dropped:
+a second kind of profile, restricting which exponents occur where `MilnorProfile` truncates them.
+It implements `Bialgebra` by the same splitting of exponents, so tensor products work over it too.
+
 ## Implementors
 
 Mirroring `algebra::module`:
@@ -190,7 +212,7 @@ Mirroring `algebra::module`:
 |---|---|---|
 | `FiniteComodule` | dense tables of the action, read from JSON like `FDModule` | — |
 | `PolynomialComodule` | a polynomial comodule algebra given by its generators and their coactions | `Coaction`, `QDual`, `QDown` |
-| `TensorComodule` | diagonal coaction, through `Coalgebra::multiply_basis_elements` | the tensor modules in the CESS check |
+| `TensorComodule` | diagonal coaction, through `Bialgebra::coproduct` | the tensor modules in the CESS check |
 | `SubComodule`, `QuotientComodule` | filtration pieces of a `FilteredComodule` | `Layer::Adjoin`, `Layer::Quotient` |
 | `SuspensionComodule` | a shift of degree | — |
 | `ExtendedComodule` | $\Gamma \otimes V$, for change-of-rings tests | — |
@@ -267,7 +289,7 @@ The $v_0$-transfer, the $v_n$-Bocksteins and the products of `q1_products` then 
 
 ## Plan
 
-1. `Coalgebra`, `OpId`, `MilnorCoalgebra`; `Comodule`, `OpSet`, `ActionBlock`; `FiniteComodule`.
+1. `OpId`; `Comodule`, `OpSet`, `ActionBlock`; `FiniteComodule`.
    Cotor of the unit and of a finite comodule in `ext`, with the global policy only.
 2. `PolynomialComodule` with the pruned walk; the change-of-rings tests; $\mathrm{Ext}_P(Q)$
    regression against the existing code.
@@ -275,6 +297,8 @@ The $v_0$-transfer, the $v_n$-Bocksteins and the products of `q1_products` then 
    `CotorComplex`, and retire `QDown`, `QDual` and `Stage`.
 4. The per-weight and spilled policies, measured at targets 240 and 320.
 5. `TensorComodule` and the Cartan–Eilenberg check.
+6. Quotient algebras of $A$ as a restricting profile, checked against a known case such as
+   $P$ (which must reproduce $\mathrm{Ext}_A$ with doubled degrees).
 
 ## Open questions
 
