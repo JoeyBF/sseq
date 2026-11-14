@@ -1067,11 +1067,14 @@ where
             lift(&local)?;
         }
         let rate = ns_per_term(multiplied);
+        // Before the first dispatched window a resumed run only reads saved steps, which would
+        // replace the costs given in EXT_LIN_RING_DISPATCH_COSTS with those of reading.
+        let replaying = dispatch.as_ref().is_some_and(|d| t1 < d.from);
         for (i, map) in ring.maps.iter().enumerate() {
             let (steps, prepare_s, terms) = map.take_window();
             if steps > 0 {
                 let prepare_s = window_cost(prepare_s, terms, rate);
-                if !costed_remotely[i] {
+                if !costed_remotely[i] && !replaying {
                     last_cost[i] = prepare_s;
                 }
                 tracing::info!(
