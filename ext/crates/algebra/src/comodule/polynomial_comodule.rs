@@ -7,7 +7,7 @@ use fp::{
 use once::OnceVec;
 use rustc_hash::FxHashMap;
 
-use super::{ActionBlock, Comodule, OpSet};
+use super::{ActionBlock, Comodule, FilteredComodule, OpSet};
 use crate::algebra::{
     Algebra, MilnorAlgebra,
     combinatorics::xi_degrees,
@@ -70,9 +70,10 @@ impl PolynomialComodule {
     /// as terms `(m, R, c)` of $\psi(x_n) = \sum c\, m \otimes \xi^R$, and cut down to the
     /// monomials of total weight `weight` if it is set.
     ///
-    /// The coaction must be counital, with the term $x_n \otimes 1$, must preserve degree and
-    /// weight, and, without `weight`, every generator must have positive degree so that each
-    /// degree is finite.
+    /// The coaction must be counital, with the term $x_n \otimes 1$, and must preserve degree.
+    /// With `weight` it must preserve weight; without, it must not raise weight, which makes the
+    /// weight a filtration (see [`FilteredComodule`]), and every generator must have positive
+    /// degree so that each degree is finite.
     pub fn new(
         algebra: Arc<MilnorAlgebra>,
         name: String,
@@ -101,7 +102,11 @@ impl PolynomialComodule {
                     degrees[n],
                     "a term of the coaction on generator {n} has the wrong degree"
                 );
-                assert_eq!(monomial_weight(&weights, m), weights[n]);
+                if weight.is_some() {
+                    assert_eq!(monomial_weight(&weights, m), weights[n]);
+                } else {
+                    assert!(monomial_weight(&weights, m) <= weights[n]);
+                }
                 let entry: &mut Poly = actions[n].entry(PPart::from_slice(r)).or_default();
                 entry.push((*m, c));
             }
@@ -201,12 +206,13 @@ impl PolynomialComodule {
         monomial_degree(&self.degrees, m)
     }
 
-    /// The monomials of `degree` and, if set, of weight `self.weight`, sorted.
+    /// The monomials of `degree` and, if set, of weight `self.weight`, sorted by weight and then
+    /// exponents.
     fn enumerate(&self, degree: i32) -> Vec<Monomial> {
         let mut out = Vec::new();
         let mut m = [0u16; MAX_GENERATORS];
         self.enumerate_from(0, degree, self.weight, &mut m, &mut out);
-        out.sort_unstable();
+        out.sort_unstable_by_key(|m| (monomial_weight(&self.weights, m), *m));
         out
     }
 
@@ -474,6 +480,13 @@ impl Comodule for PolynomialComodule {
     }
 }
 
+/// Filtered by weight, which the coaction does not raise.
+impl FilteredComodule for PolynomialComodule {
+    fn filtration(&self, degree: i32, idx: usize) -> i32 {
+        monomial_weight(&self.weights, &self.basis[degree as usize][idx]) as i32
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use fp::vector::FpVector;
@@ -570,6 +583,103 @@ mod tests {
                         block.act(idx, local as u32).iter().collect();
                     assert_eq!(from_block, v.iter_nonzero().collect::<Vec<_>>());
                 }
+            }
+        }
+    }
+
+    /// The coalgebra filtered by giving $\xi_k$ weight $2^{k-1}$, which the coaction does not
+    /// raise.
+    fn weighted_dual_steenrod(max: i32) -> PolynomialComodule {
+        let alg = Arc::new(MilnorAlgebra::new(ValidPrime::new(2), false));
+        let plain = PolynomialComodule::dual_steenrod_subalgebra(Arc::clone(&alg), |_| 0, max);
+        let gens: Vec<Generator> = plain
+            .degrees
+            .iter()
+            .enumerate()
+            .map(|(k, &d)| Generator {
+                name: format!("xi{}", k + 1),
+                degree: d,
+                weight: 1 << k,
+            })
+            .collect();
+        // Rebuild the coaction on generators from the action of the plain comodule.
+        let coaction: Vec<Vec<(Monomial, Vec<u32>, u32)>> = plain
+            .actions
+            .iter()
+            .map(|a| {
+                a.iter()
+                    .flat_map(|(r, poly)| {
+                        let r: Vec<u32> = r.iter().collect();
+                        poly.iter().map(move |(m, c)| (*m, r.clone(), *c))
+                    })
+                    .collect()
+            })
+            .collect();
+        let mut coaction = coaction;
+        for (n, terms) in coaction.iter_mut().enumerate() {
+            let mut m = [0u16; MAX_GENERATORS];
+            m[n] = 1;
+            terms.push((m, vec![], 1));
+        }
+        PolynomialComodule::new(alg, "weighted".to_string(), &gens, &coaction, None)
+    }
+
+    #[test]
+    fn sub_and_quotient_are_modules() {
+        use crate::comodule::{FilteredComodule, QuotientComodule, SubComodule};
+        let max = 20;
+        let m = Arc::new(weighted_dual_steenrod(max));
+        m.compute_basis(max);
+        for d in 0..=max {
+            for i in 1..m.dimension(d) {
+                assert!(m.filtration(d, i - 1) <= m.filtration(d, i));
+            }
+        }
+        let alg = m.algebra();
+        let ops: OpSet = (1..=max)
+            .flat_map(|n| {
+                (0..alg.dimension(n)).map(move |i| OpId {
+                    degree: n,
+                    index: i as u32,
+                })
+            })
+            .collect();
+        for f in [1, 2, 3, 5] {
+            let sub = SubComodule::new(Arc::clone(&m), f);
+            let quo = QuotientComodule::new(Arc::clone(&m), f);
+            check_associativity(&sub, max).unwrap();
+            check_associativity(&quo, max).unwrap();
+            for d in [max - 1, max] {
+                assert_eq!(sub.dimension(d) + quo.dimension(d), m.dimension(d));
+                let check = |c: &dyn Fn(&mut FpVector, i32, u32, usize),
+                             block: &ActionBlock,
+                             dim: usize,
+                             tgt: &dyn Fn(i32) -> usize| {
+                    for idx in 0..dim {
+                        for (local, op) in ops.iter().enumerate() {
+                            if op.degree > d {
+                                continue;
+                            }
+                            let mut v = FpVector::new(alg.prime(), tgt(d - op.degree));
+                            c(&mut v, op.degree, op.index, idx);
+                            let from_block: Vec<(usize, u32)> =
+                                block.act(idx, local as u32).iter().collect();
+                            assert_eq!(from_block, v.iter_nonzero().collect::<Vec<_>>(), "f = {f}");
+                        }
+                    }
+                };
+                check(
+                    &|v, n, i, idx| sub.act_on_basis(v.as_slice_mut(), 1, n, i as usize, d, idx),
+                    &sub.act_batch(&ops, d),
+                    sub.dimension(d),
+                    &|e| sub.dimension(e),
+                );
+                check(
+                    &|v, n, i, idx| quo.act_on_basis(v.as_slice_mut(), 1, n, i as usize, d, idx),
+                    &quo.act_batch(&ops, d),
+                    quo.dimension(d),
+                    &|e| quo.dimension(e),
+                );
             }
         }
     }

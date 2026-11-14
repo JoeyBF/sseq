@@ -4,7 +4,7 @@ use std::sync::{Arc, OnceLock};
 
 use algebra::{
     Algebra,
-    comodule::{ActionBlock, Comodule, OpId, OpSet},
+    comodule::{ActionBlock, Comodule, FilteredComodule, OpId, OpSet},
 };
 use fp::{matrix::Matrix, vector::FpVector};
 use sseq::coordinates::Bidegree;
@@ -147,6 +147,81 @@ where
             0
         };
         self.cochain_dimension(s, u) - self.coboundary_rank(s, u) - incoming
+    }
+}
+
+impl<CC, M> CotorComplex<CC, M>
+where
+    CC: FreeChainComplex,
+    M: FilteredComodule<Algebra = CC::Algebra>,
+{
+    /// The filtration of each cochain of filtration `s` and weight `u`, in cochain order.
+    fn cochain_filtrations(&self, s: i32, u: i32) -> Vec<i32> {
+        let (blocks, dim) = self.blocks(s, u);
+        let mut out = Vec::with_capacity(dim);
+        for &(t, gens, _) in &blocks {
+            for _ in 0..gens {
+                out.extend(
+                    (0..self.comodule.dimension(u - t)).map(|i| self.comodule.filtration(u - t, i)),
+                );
+            }
+        }
+        out
+    }
+
+    /// The rank of the coboundary from filtration `s` at weight `u` restricted to the cochains
+    /// valued in the filtration piece $F_f$, for each `f` in `0..=max_f`.
+    ///
+    /// The action does not raise filtration, so this is the coboundary of the complex of the
+    /// subcomodule $F_f$; one reduction, with the source cochains ordered by filtration, gives
+    /// every `f` at once.
+    pub fn coboundary_ranks_by_filtration(&self, s: i32, u: i32, max_f: i32) -> Vec<usize> {
+        let p = self.comodule.prime();
+        let filtrations = self.cochain_filtrations(s, u);
+        let mut order: Vec<usize> = (0..filtrations.len()).collect();
+        order.sort_by_key(|&i| filtrations[i]);
+        let mut position = vec![0; order.len()];
+        for (new, &old) in order.iter().enumerate() {
+            position[old] = new;
+        }
+        let forward = self.coboundary(s, u);
+        let mut transposed = Matrix::new(p, forward.columns(), forward.rows());
+        for i in 0..forward.rows() {
+            for (j, v) in forward.row(i).iter_nonzero() {
+                transposed.row_mut(j).set_entry(position[i], v);
+            }
+        }
+        let rank_upto = if transposed.rows() > 0 && transposed.columns() > 0 {
+            transposed.row_reduce();
+            let pivots = transposed.pivots();
+            let mut prefix = vec![0; order.len() + 1];
+            for c in 0..order.len() {
+                prefix[c + 1] = prefix[c] + usize::from(pivots[c] >= 0);
+            }
+            prefix
+        } else {
+            vec![0; order.len() + 1]
+        };
+        (0..=max_f)
+            .map(|f| rank_upto[filtrations.iter().filter(|&&x| x <= f).count()])
+            .collect()
+    }
+
+    /// The dimension of $\mathrm{Cotor}^{s, u}(F_f)$ for each `f` in `0..=max_f`.
+    pub fn cotor_by_filtration(&self, s: i32, u: i32, max_f: i32) -> Vec<usize> {
+        let out_ranks = self.coboundary_ranks_by_filtration(s, u, max_f);
+        let in_ranks = if s > 0 {
+            self.coboundary_ranks_by_filtration(s - 1, u, max_f)
+        } else {
+            vec![0; max_f as usize + 1]
+        };
+        let filtrations = self.cochain_filtrations(s, u);
+        (0..=max_f)
+            .map(|f| {
+                let dim = filtrations.iter().filter(|&&x| x <= f).count();
+                dim - out_ranks[f as usize] - in_ranks[f as usize]
+            })
+            .collect()
     }
 }
 
@@ -369,6 +444,46 @@ mod tests {
                     }
                     let d = cx.cotor(a, u);
                     if d > 0 {
+                        ours.insert((n, a + k, u), d);
+                    }
+                }
+            }
+        }
+        assert_eq!(ours, expected);
+    }
+
+    /// $\mathrm{Ext}_P(Q_k)$ for every $k$ at once, as the filtration pieces of $Q/(v_0 - 1)$,
+    /// agrees with [`ctau_e2_untwisted_on`].
+    ///
+    /// [`ctau_e2_untwisted_on`]: crate::algebraic_novikov::ctau_e2_untwisted_on
+    #[test]
+    fn ext_of_q_by_length_matches_untwisted() {
+        use crate::algebraic_novikov::{
+            ctau_e2_untwisted_on, q_mod_v0_comodule, unit_module, untwisted_backbone_range,
+        };
+        let (max_n, max_s) = (24, 8);
+        let res = Arc::new(crate::nassau::Resolution::new(Arc::new(unit_module())));
+        let max_u = (max_n + max_s) / 2;
+        res.compute_through_stem(untwisted_backbone_range(max_n, max_s));
+        res.compute_through_stem(Bidegree::n_s(max_u + 1, max_s + 2));
+        let expected = ctau_e2_untwisted_on(&*res, max_n, max_s).0;
+
+        let m = Arc::new(q_mod_v0_comodule(res.algebra(), max_u));
+        let cx = CotorComplex::new(Arc::clone(&res), m, max_s, max_u);
+        let mut ours = std::collections::BTreeMap::new();
+        for u in 0..=max_u {
+            for a in 0..=max_s {
+                let n = 2 * u - a;
+                if !(0..=max_n).contains(&n) {
+                    continue;
+                }
+                for (k, d) in cx
+                    .cotor_by_filtration(a, u, max_s - a)
+                    .into_iter()
+                    .enumerate()
+                {
+                    let k = k as i32;
+                    if d > 0 && 2 * u - a <= max_n && u <= (max_n + max_s - k) / 2 {
                         ours.insert((n, a + k, u), d);
                     }
                 }

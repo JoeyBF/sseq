@@ -154,6 +154,26 @@ impl ActionBlock {
         }
     }
 
+    /// The block of the rows in `rows` and the targets in `targets`, renumbered from the start of
+    /// each range.
+    pub fn restrict(&self, rows: std::ops::Range<usize>, targets: std::ops::Range<usize>) -> Self {
+        let mut out = Self::new(self.prime);
+        for idx in rows {
+            let row: Vec<(u32, u32, u32)> = self
+                .row(idx)
+                .flat_map(|(op, entry)| {
+                    entry
+                        .iter()
+                        .filter(|(t, _)| targets.contains(t))
+                        .map(|(t, c)| (op, (t - targets.start) as u32, c))
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+            out.push_row(row);
+        }
+        out
+    }
+
     /// The number of stored `(operation, target)` pairs, a measure of the block's size.
     pub fn nnz(&self) -> usize {
         self.targets.len()

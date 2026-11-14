@@ -273,6 +273,59 @@ pub fn q_comodule(
     PolynomialComodule::new(algebra, format!("Q_{k}"), &generators, &coaction, Some(k))
 }
 
+/// $Q/(v_0 - 1) = \mathbb{F}_2[v_1, v_2, \dots]$ in halved degrees up to `max_degree`, as a right
+/// comodule over the dual Steenrod algebra filtered by length.
+///
+/// $v_0$ is primitive, so $v_0 - 1$ spans a subcomodule and the quotient is a comodule algebra,
+/// with $\psi(v_n) = 1 \otimes \zeta_n + \sum_{i \geq 1} v_i \otimes \zeta_{n-i}^{2^i}$. Multiplying by
+/// a power of $v_0$ identifies its part of length at most $k$ with [`q_comodule`]`(k)`, so one
+/// comodule, and one table of its action, serves every $Q_k$.
+pub fn q_mod_v0_comodule(
+    algebra: Arc<MilnorAlgebra>,
+    max_degree: i32,
+) -> algebra::comodule::PolynomialComodule {
+    use algebra::comodule::{Generator, MAX_GENERATORS, PolynomialComodule};
+    let max_n = (1..)
+        .take_while(|&n| v_degree(n) <= max_degree)
+        .last()
+        .unwrap_or(0);
+    assert!(
+        max_n <= MAX_GENERATORS,
+        "degree {max_degree} needs too many generators"
+    );
+    let zeta = conjugates(max_n);
+    let generators: Vec<Generator> = (1..=max_n)
+        .map(|n| Generator {
+            name: format!("v{n}"),
+            degree: v_degree(n),
+            weight: 1,
+        })
+        .collect();
+    let coaction: Vec<Vec<_>> = (1..=max_n)
+        .map(|n| {
+            (0..=n)
+                .flat_map(|i| {
+                    // v_0 becomes 1, and v_i for i >= 1 is generator i - 1.
+                    let mut m = [0u16; MAX_GENERATORS];
+                    if i > 0 {
+                        m[i - 1] = 1;
+                    }
+                    frobenius(&zeta[n - i], i as u32)
+                        .into_iter()
+                        .map(move |r| (m, r, 1))
+                })
+                .collect()
+        })
+        .collect();
+    PolynomialComodule::new(
+        algebra,
+        "Q/(v_0 - 1)".to_string(),
+        &generators,
+        &coaction,
+        None,
+    )
+}
+
 /// The coaction $\psi(v_n) = \sum_i c_{n,i} \otimes v_i$ on the generators of $Q$.
 pub struct Coaction {
     /// `factors[n]` lists the monomials of each $c_{n,i}$, as $(\xi^R, i)$.
