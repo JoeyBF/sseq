@@ -482,6 +482,32 @@ impl TwistedResolution {
             .unwrap()
     }
 
+    /// The generators of stem at most `max_stem` in homological degrees up to `max_n`, and the
+    /// terms of their differentials by $k$, the rows they drop ($k = 0$ is the Koszul part).
+    pub fn counts_by_stem(&self, max_stem: i32, max_n: i32) -> (usize, Vec<usize>) {
+        let mut gens = 0;
+        let mut by_k = vec![0; self.max_n as usize + 1];
+        for n in 0..=max_n.min(self.max_n) {
+            for t in n..=(max_stem + n).min(self.max_t) {
+                gens += self.xgens[n as usize][t as usize].len();
+                if n == 0 {
+                    continue;
+                }
+                let lower = &self.xmods[n as usize - 1];
+                for (i, v) in self.d[n as usize][t as usize].iter().enumerate() {
+                    let g = self.xgens[n as usize][t as usize][i];
+                    for (j, _) in v.iter_nonzero() {
+                        let og = lower.index_to_op_gen(t, j);
+                        let h = self.xgens[n as usize - 1][og.generator_degree as usize]
+                            [og.generator_index];
+                        by_k[(g.p - h.p) as usize] += 1;
+                    }
+                }
+            }
+        }
+        (gens, by_k)
+    }
+
     /// Checks $d^2 = 0$ on every generator.
     pub fn check_d_squared(&self) -> Result<(), String> {
         for n in 2..=self.max_n {
@@ -545,6 +571,7 @@ mod tests {
         res.compute_through_stem(Bidegree::n_s(max_t, max_n + 1));
         let x = TwistedResolution::new(&res, max_n, max_t);
         x.check_d_squared().unwrap();
+        // Ext at (n, t) needs X_{n+1} at t, so it is checked on the triangle t <= max_t.
         for n in 0..max_n {
             for t in n..=max_t {
                 assert_eq!(
@@ -554,14 +581,15 @@ mod tests {
                 );
             }
         }
-        let gens: usize = x.xgens.iter().flatten().map(Vec::len).sum();
+        // Counted on the stems every filtration reaches.
+        let max_stem = max_t - max_n;
+        let (gens, by_k) = x.counts_by_stem(max_stem, max_n);
         let minimal: usize = (0..=max_n)
-            .flat_map(|n| (0..=max_t).map(move |t| (n, t)))
+            .flat_map(|n| (n..=max_stem + n).map(move |t| (n, t)))
             .map(|(n, t)| res.number_of_gens_in_bidegree(Bidegree::s_t(n, t)))
             .sum();
         eprintln!(
-            "TWIST max_n {max_n} max_t {max_t}: generators {gens} (minimal {minimal}), d_k terms {:?}",
-            x.terms_by_k
+            "TWIST s <= {max_n}, stem <= {max_stem}: generators {gens} (minimal {minimal}), terms by k {by_k:?}"
         );
     }
 }
