@@ -16,7 +16,9 @@ pub mod field;
 pub use field::Field;
 
 pub mod milnor_algebra;
+pub mod milnor_quotient;
 pub use milnor_algebra::{MilnorAlgebra, SteenrodKind};
+pub use milnor_quotient::MilnorQuotientAlgebra;
 
 pub mod motivic;
 pub use motivic::MotivicMilnorAlgebra;

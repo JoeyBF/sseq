@@ -523,4 +523,80 @@ mod tests {
             }
         }
     }
+
+    /// Resolutions over quotients of the Milnor algebra: the quotient dual to
+    /// $\mathbb{F}_2[\xi_k^2]$ is the Steenrod algebra doubled, and the one dual to
+    /// $\mathbb{F}_2[\xi_1]$ has Ext $\mathbb{F}_2[h_{1j}]$ with $h_{1j}$ in $(1, 2^j)$.
+    #[test]
+    fn ext_of_quotient_algebras() {
+        use algebra::{MilnorAlgebra, MilnorQuotientAlgebra, module::FDModule};
+        use bivec::BiVec;
+
+        use crate::{chain_complex::FiniteChainComplex, resolution::Resolution};
+
+        /// The resolution of the ground field over `algebra` through `(stem, s)`.
+        fn resolve<A: algebra::Algebra>(
+            algebra: A,
+            max: Bidegree,
+        ) -> Resolution<FiniteChainComplex<FDModule<A>>> {
+            let unit = FDModule::new(Arc::new(algebra), "F2".into(), BiVec::from_vec(0, vec![1]));
+            let res = Resolution::new(Arc::new(FiniteChainComplex::ccdz(Arc::new(unit))));
+            res.compute_through_stem(max);
+            res
+        }
+
+        let p = fp::prime::ValidPrime::new(2);
+        let (max_n, max_s) = (20, 6);
+        let sphere = resolve(MilnorAlgebra::new(p, false), Bidegree::n_s(max_n, max_s));
+        let doubled = resolve(
+            MilnorQuotientAlgebra::new(MilnorAlgebra::new(p, false), vec![Some(1); 6]),
+            Bidegree::n_s(2 * max_n + max_s, max_s),
+        );
+        for s in 0..=max_s {
+            for t in 0..=2 * (max_n + s) {
+                let expected = if t % 2 == 0 && t / 2 - s <= max_n {
+                    sphere.number_of_gens_in_bidegree(Bidegree::s_t(s, t / 2))
+                } else {
+                    0
+                };
+                if t - s <= 2 * max_n + max_s {
+                    assert_eq!(
+                        doubled.number_of_gens_in_bidegree(Bidegree::s_t(s, t)),
+                        expected,
+                        "doubled at (s, t) = ({s}, {t})"
+                    );
+                }
+            }
+        }
+
+        let (max_t, max_s) = (24, 5);
+        let xi1 = resolve(
+            MilnorQuotientAlgebra::new(MilnorAlgebra::new(p, false), vec![Some(0)]),
+            Bidegree::n_s(max_t, max_s),
+        );
+        // Monomials in h_{1j}, of degree (1, 2^j), counted by (s, t).
+        let mut count = std::collections::BTreeMap::new();
+        count.insert((0, 0), 1usize);
+        for j in 0..5 {
+            let w = 1 << j;
+            let old = count.clone();
+            for ((s, t), c) in old {
+                for e in 1.. {
+                    if s + e > max_s || t + e * w > max_t {
+                        break;
+                    }
+                    *count.entry((s + e, t + e * w)).or_default() += c;
+                }
+            }
+        }
+        for s in 0..=max_s {
+            for t in s..=max_t {
+                assert_eq!(
+                    xi1.number_of_gens_in_bidegree(Bidegree::s_t(s, t)),
+                    count.get(&(s, t)).copied().unwrap_or(0),
+                    "F2[xi1] at (s, t) = ({s}, {t})"
+                );
+            }
+        }
+    }
 }
