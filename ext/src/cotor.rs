@@ -33,8 +33,9 @@ where
     CC: FreeChainComplex,
     M: Comodule<Algebra = CC::Algebra>,
 {
-    /// The complex for weights up to `max_u` and filtrations up to `max_s`, which reads the
-    /// backbone through filtration `max_s + 1` and internal degree `max_u - M.min_degree()`.
+    /// The complex for weights up to `max_u` and filtrations up to `max_s`, which reads the part
+    /// of the backbone already computed through filtration `max_s + 1` and internal degree
+    /// `max_u - M.min_degree()`; a coboundary that needs more of it panics.
     pub fn new(backbone: Arc<CC>, comodule: Arc<M>, max_s: i32, max_u: i32) -> Self {
         let max_t = max_u - comodule.min_degree();
         comodule.compute_basis(max_u - backbone.min_degree());
@@ -43,6 +44,9 @@ where
             let d = backbone.differential(s);
             let target = backbone.module(s - 1);
             for t in 0..=max_t {
+                if !backbone.has_computed_bidegree(Bidegree::s_t(s, t)) {
+                    continue;
+                }
                 for l in 0..backbone.number_of_gens_in_bidegree(Bidegree::s_t(s, t)) {
                     for (idx, _) in d.output(t, l).iter_nonzero() {
                         let og = target.index_to_op_gen(t, idx);
@@ -207,6 +211,15 @@ where
             .collect()
     }
 
+    /// The dimension of the cochains of filtration `s` and weight `u` valued in $F_f$, for each
+    /// `f` in `0..=max_f`.
+    pub fn cochain_dimensions_by_filtration(&self, s: i32, u: i32, max_f: i32) -> Vec<usize> {
+        let filtrations = self.cochain_filtrations(s, u);
+        (0..=max_f)
+            .map(|f| filtrations.iter().filter(|&&x| x <= f).count())
+            .collect()
+    }
+
     /// The dimension of $\mathrm{Cotor}^{s, u}(F_f)$ for each `f` in `0..=max_f`.
     pub fn cotor_by_filtration(&self, s: i32, u: i32, max_f: i32) -> Vec<usize> {
         let out_ranks = self.coboundary_ranks_by_filtration(s, u, max_f);
@@ -215,12 +228,9 @@ where
         } else {
             vec![0; max_f as usize + 1]
         };
-        let filtrations = self.cochain_filtrations(s, u);
-        (0..=max_f)
-            .map(|f| {
-                let dim = filtrations.iter().filter(|&&x| x <= f).count();
-                dim - out_ranks[f as usize] - in_ranks[f as usize]
-            })
+        let dims = self.cochain_dimensions_by_filtration(s, u, max_f);
+        (0..=max_f as usize)
+            .map(|f| dims[f] - out_ranks[f] - in_ranks[f])
             .collect()
     }
 }
