@@ -78,13 +78,28 @@ impl RingRange {
 /// The name of the chain map of the monomial with these `factors`: `lin_ring/` and the factors as
 /// `x_(n, s, i)`, joined by `.`. Basis monomials and their classes depend only on the resolution,
 /// so the name identifies the same map in any range.
+///
+/// The name is a directory of the save store, so a name longer than [`MAX_NAME`] bytes after
+/// `lin_ring/` is shortened: its first [`MAX_NAME`]` - 17` bytes, `~`, and a 64-bit FNV-1a hash of
+/// the whole name in hex. Shorter names are unchanged, so maps saved before keep their names.
 pub fn map_name(gens: &[BidegreeGenerator], factors: &[u32]) -> String {
     let parts: Vec<String> = factors
         .iter()
         .map(|&j| format!("x_{}", gens[j as usize]))
         .collect();
-    format!("lin_ring/{}", parts.join("."))
+    let name = parts.join(".");
+    if name.len() <= MAX_NAME {
+        return format!("lin_ring/{name}");
+    }
+    let hash = name.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |h, b| {
+        (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
+    });
+    // The factors are ASCII, so any byte offset is a character boundary.
+    format!("lin_ring/{}~{hash:016x}", &name[..MAX_NAME - 17])
 }
+
+/// The longest map name after `lin_ring/`, in bytes: file names are at most 255 bytes.
+const MAX_NAME: usize = 240;
 
 /// `Some(k)` if the generator `g` is `h_k`. Every generator in filtration 1 is an `h_k`, `k = log_2 t`
 /// ([`compute`] checks this).
