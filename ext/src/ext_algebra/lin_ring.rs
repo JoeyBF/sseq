@@ -414,6 +414,10 @@ struct Dispatch {
     /// `EXT_LIN_RING_DISPATCH_COSTS`: `name<TAB>seconds` lines, the costs of maps lifted before
     /// this process started (for instance the last window's `map_window` events of the step log).
     hints: HashMap<String, f64>,
+    /// `EXT_LIN_RING_DISPATCH_FROM` (default 0): the first window, by its first degree, whose
+    /// maps are dispatched. Earlier windows are lifted here: when resuming they only read saved
+    /// steps, which is no work to hand out.
+    from: i32,
 }
 
 impl Dispatch {
@@ -443,11 +447,16 @@ impl Dispatch {
                 hints.insert(name.to_string(), cost.parse()?);
             }
         }
+        let from = match std::env::var("EXT_LIN_RING_DISPATCH_FROM") {
+            Ok(v) => v.parse()?,
+            Err(_) => 0,
+        };
         Ok(Some(Self {
             command,
             dir,
             min_s,
             hints,
+            from,
         }))
     }
 }
@@ -981,8 +990,8 @@ where
         // reading their steps back here.
         let mut costed_remotely = vec![false; ring.maps.len()];
         let (remote, local): (Vec<usize>, Vec<usize>) = match &dispatch {
-            Some(d) => grown.into_iter().partition(|&i| last_cost[i] >= d.min_s),
-            None => (vec![], grown),
+            Some(d) if t0 >= d.from => grown.into_iter().partition(|&i| last_cost[i] >= d.min_s),
+            _ => (vec![], grown),
         };
         let lift = |which: &[usize]| -> anyhow::Result<()> {
             if !which.is_empty() {
