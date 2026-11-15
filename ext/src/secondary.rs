@@ -731,12 +731,12 @@ pub type SecondaryHomotopyPrep = LiftPrep<SecondaryPending>;
 /// A secondary homotopy step awaiting its quasi-inverse solve; see
 /// [`SecondaryLift::prepare_homotopy_step`].
 pub struct SecondaryPending {
-    b: Bidegree,
-    target_b: Bidegree,
-    num_gens: usize,
-    target_dim: usize,
+    pub b: Bidegree,
+    pub target_b: Bidegree,
+    pub num_gens: usize,
+    pub target_dim: usize,
     /// The intermediates to lift, one per source generator.
-    intermediates: Vec<FpVector>,
+    pub intermediates: Vec<FpVector>,
     /// Copy of the intermediates taken before the solve, for the lift-validity check; `Some` only
     /// at the bottom non-trivial row `b.s() == shift.s() + 1`.
     presolve_intermediates: Option<Vec<FpVector>>,
