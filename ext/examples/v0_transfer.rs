@@ -5,7 +5,7 @@
 //! resolution of $\mathbb{F}_2$, `CHECK_CSV=<file>` to compare with rows `stem,s,u,dim`, and
 //! `CTAU_PSI_BANDS=<n>` to take the weights in `n` bands, trading time for memory, and
 //! `CTAU_CONJUGATE=1` to read the conjugated backbone, computed here or loaded from
-//! `CTAU_CONJUGATED=<dir>`, with the action computed inline and no table of it.
+//! `CTAU_CONJUGATED=<dir>`, with the action tabulated from Milnor matrices.
 //! Prints the number of classes and the time of each method.
 use std::{sync::Arc, time::Instant};
 

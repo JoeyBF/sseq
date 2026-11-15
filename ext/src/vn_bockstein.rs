@@ -70,13 +70,14 @@ impl Layer {
 pub(crate) struct Stage<'a, CC> {
     /// The backbone.
     res: &'a CC,
-    /// The coaction on each basis monomial, by degree and index, cut down to the operations
-    /// [`Self::build`] is given; filled by [`Self::bound_by`].
-    psi: Vec<Vec<crate::algebraic_novikov::Psi<u32>>>,
+    /// The action of each operation [`Self::build`] is given on the basis monomials, by degree;
+    /// filled by [`Self::bound_by`].
+    psi: Vec<ByOperation>,
     /// The number of each operation in the backbone, as `psi` keys them.
     op_ids: FxHashMap<PackedXi, u32>,
     /// Whether the slices carry the conjugated backbone's coefficients, $\chi(a_{zx})$, to be
-    /// applied by the antipode-free right action, computed inline instead of read from `psi`.
+    /// applied by the antipode-free right action, which `psi` then tabulates from Milnor matrices
+    /// instead of from the coaction.
     pub(crate) inline: bool,
     /// The bases of the layer.
     q: QDown,
@@ -113,9 +114,6 @@ where
         weights: std::ops::RangeInclusive<i32>,
     ) {
         self.psi = Vec::new();
-        if self.inline {
-            return;
-        }
         // Every operation, numbered, and the operations on the generators of each degree.
         let mut op_ids: FxHashMap<PackedXi, u32> = FxHashMap::default();
         let mut ops_by_t: FxHashMap<i32, Vec<u32>> = FxHashMap::default();
@@ -151,15 +149,88 @@ where
                 }
             }
         }
+        if self.inline {
+            self.psi = self.tabulate_inline(&op_ids, &allowed, &wanted);
+            self.op_ids = op_ids;
+            return;
+        }
         // The comodule's walk identifies the basis with Q/(v_0 - 1), which a quotient by v_0 is not.
         let v0_is_one = matches!(self.layer, Layer::Adjoin(_) | Layer::Quotient(0));
-        self.psi = if v0_is_one && std::env::var_os("CTAU_QDOWN_WALK").is_none() {
+        let table = if v0_is_one && std::env::var_os("CTAU_QDOWN_WALK").is_none() {
             self.q
                 .psi_table_by_comodule(&self.res.algebra(), &op_ids, &allowed, &wanted)
         } else {
             self.q.psi_table(&op_ids, &allowed, &wanted)
         };
+        self.psi = table
+            .into_maybe_par_iter()
+            .map(|d| ByOperation::new(&d))
+            .collect();
         self.op_ids = op_ids;
+    }
+
+    /// The table [`Self::tabulate`] makes for the conjugated backbone: for each degree and each
+    /// operation `allowed` marks there, $m P(M)$ for every basis monomial $m$ of length at most
+    /// `wanted`, by one enumeration of Milnor matrices per pair.
+    fn tabulate_inline(
+        &self,
+        op_ids: &FxHashMap<PackedXi, u32>,
+        allowed: &[Vec<bool>],
+        wanted: &[i32],
+    ) -> Vec<ByOperation> {
+        let mut ops: Vec<(u32, PackedXi)> = op_ids.iter().map(|(&r, &id)| (id, r)).collect();
+        ops.sort_unstable();
+        let q = &self.q;
+        (0..wanted.len())
+            .into_maybe_par_iter()
+            .map(|d| {
+                let mut out = ByOperation::empty();
+                if wanted[d] < 0 {
+                    return out;
+                }
+                let d_i = d as i32;
+                let n = q.dimension(d_i, wanted[d] as u32);
+                let monos: Vec<algebra::comodule::Monomial> = (0..n)
+                    .map(|i| qmono_to_monomial(q.monomial(d_i, i)))
+                    .collect();
+                let mut terms: Vec<QMono> = Vec::new();
+                let mut gammas: Vec<u32> = Vec::new();
+                for &(id, r) in &ops {
+                    if !allowed[d][id as usize] || xi_degree(r) > d_i {
+                        continue;
+                    }
+                    let d_out = d_i - xi_degree(r);
+                    let m = algebra::milnor_algebra::PPart::from_slice(&unpack(r));
+                    let first = out.monomials.len();
+                    for (idx, ours) in monos.iter().enumerate() {
+                        terms.clear();
+                        algebra::comodule::for_each_column(m, ours, |cols| {
+                            terms.push(monomial_to_qmono(cols));
+                        });
+                        if terms.is_empty() {
+                            continue;
+                        }
+                        terms.sort_unstable();
+                        gammas.clear();
+                        gammas.extend(
+                            terms
+                                .chunk_by(|a, b| a == b)
+                                .filter(|c| c.len() % 2 == 1)
+                                .filter_map(|c| q.try_index(d_out, &c[0]).map(|g| g as u32)),
+                        );
+                        if !gammas.is_empty() {
+                            out.push(idx as u32, &gammas);
+                        }
+                    }
+                    if out.monomials.len() > first {
+                        out.ids.push(id);
+                        out.starts.push(first as u32);
+                    }
+                }
+                out.starts.push(out.monomials.len() as u32);
+                out
+            })
+            .collect()
     }
 
     /// The cochains of filtration `a` at weight `u` on $Q_{k_\max}$, in the order of
@@ -243,100 +314,175 @@ where
                         .collect()
                 })
                 .collect();
-            let mut images: Vec<Vec<usize>> = vec![Vec::new(); ops.len()];
-            // Each operation's number in the table, and back.
-            let ids: Vec<u32> = if self.inline {
-                Vec::new()
-            } else {
-                ops.iter().map(|r| self.op_ids[r]).collect()
-            };
-            let by_id: FxHashMap<u32, usize> =
-                ids.iter().enumerate().map(|(k, &id)| (id, k)).collect();
-            for idx in 0..block {
-                let mono = q.monomial(u - t_i, idx);
-                // P(R) x_i lies in degree t_i + |R|, the degree of every z_l it appears in.
-                let d_out = |r: PackedXi| u - t_i - xi_degree(r);
-                let len = qmono_len(mono);
-                // In a quotient, terms outside its basis vanish.
-                let fill = |image: &mut Vec<usize>, r: PackedXi, gammas: &[u32]| {
-                    let d = d_out(r);
-                    image.clear();
-                    image.extend(
-                        gammas
-                            .iter()
-                            .map(|&g| g as usize)
-                            .filter(|&g| layer.on_length(qmono_len(q.monomial(d, g)), len)),
-                    );
-                };
-                if self.inline {
-                    // The operations are chi(a) for the conjugated backbone: m P(M) by one
-                    // enumeration of Milnor matrices per operation.
-                    let ours = qmono_to_monomial(mono);
-                    for (k, &r) in ops.iter().enumerate() {
-                        let d = d_out(r);
-                        let m = algebra::milnor_algebra::PPart::from_slice(&unpack(r));
-                        let mut terms: Vec<QMono> = Vec::new();
-                        algebra::comodule::for_each_column(m, &ours, |cols| {
-                            terms.push(monomial_to_qmono(cols));
-                        });
-                        terms.sort_unstable();
-                        let gammas: Vec<u32> = terms
-                            .chunk_by(|a, b| a == b)
-                            .filter(|c| c.len() % 2 == 1)
-                            .filter_map(|c| q.try_index(d, &c[0]).map(|g| g as u32))
-                            .collect();
-                        fill(&mut images[k], r, &gammas);
-                    }
-                } else {
-                    let psi = &self.psi[(u - t_i) as usize][idx];
-                    // Walk whichever is shorter: the operations, or the terms of ψ(m).
-                    if psi.len() < ops.len() {
-                        for image in &mut images {
-                            image.clear();
-                        }
-                        for (id, gammas) in psi.iter() {
-                            if let Some(&k) = by_id.get(&id) {
-                                fill(&mut images[k], ops[k], gammas);
-                            }
-                        }
-                    } else {
-                        for (k, &r) in ops.iter().enumerate() {
-                            fill(&mut images[k], r, psi.get(ids[k]));
-                        }
-                    }
+            // The terms of each operation: the generator whose column it feeds and its targets.
+            let mut by_op: Vec<Vec<(usize, &[(i32, u32)])>> = vec![Vec::new(); ops.len()];
+            for (i, gen_terms) in terms.iter().enumerate() {
+                for &(k, targets) in gen_terms {
+                    by_op[k].push((i, targets));
                 }
-                for (i, gen_terms) in terms.iter().enumerate() {
-                    let mut col = Vec::new();
-                    for &(k, targets) in gen_terms {
-                        if images[k].is_empty() {
-                            continue;
-                        }
+            }
+            // Each operation's number in the table, and back.
+            let ids: Vec<u32> = ops.iter().map(|r| self.op_ids[r]).collect();
+            let filtered = layer.exact_length();
+            // Operation by operation, through the monomials it acts on nontrivially.
+            let d = u - t_i;
+            // A degree no build reads with any operation has no table.
+            let Some(table) = self.psi.get(d as usize) else {
+                assert!(ops.is_empty(), "no coaction tabulated in degree {d}");
+                continue;
+            };
+            let mut image: Vec<u32> = Vec::new();
+            for (k, &r) in ops.iter().enumerate() {
+                let d_r = d - xi_degree(r);
+                // The table may reach longer monomials than this build; they come last.
+                for (idx, gammas) in table.get(ids[k]) {
+                    if idx as usize >= block {
+                        break;
+                    }
+                    let gammas = if filtered {
+                        let len = qmono_len(q.monomial(d, idx as usize));
+                        image.clear();
+                        image.extend(gammas.iter().copied().filter(|&g| {
+                            layer.on_length(qmono_len(q.monomial(d_r, g as usize)), len)
+                        }));
+                        &image[..]
+                    } else {
+                        gammas
+                    };
+                    if gammas.is_empty() {
+                        continue;
+                    }
+                    for &(i, targets) in &by_op[k] {
+                        let col = &mut map.columns[src_off + i * block + idx as usize];
                         for &(t_l, l) in targets {
                             if t_l > u_out {
                                 continue;
                             }
                             let (off, _) = tgt[t_l as usize];
                             let tb = q_dim(u_out - t_l);
-                            col.extend(
-                                images[k].iter().map(|g| (off + l as usize * tb + g) as u32),
-                            );
+                            col.extend(gammas.iter().map(|&g| (off + l as usize * tb) as u32 + g));
                         }
                     }
-                    col.sort_unstable();
-                    // Terms reached twice cancel.
-                    let mut dedup: Vec<u32> = Vec::with_capacity(col.len());
-                    for c in col {
-                        if dedup.last() == Some(&c) {
-                            dedup.pop();
-                        } else {
-                            dedup.push(c);
-                        }
-                    }
-                    map.columns[src_off + i * block + idx] = dedup;
                 }
+            }
+            for col in &mut map.columns[src_off..src_off + gens * block] {
+                cancel_pairs(col);
             }
         }
         (map, sources, targets)
+    }
+}
+
+/// Sorts `v` and removes the entries that occur an even number of times.
+fn cancel_pairs(v: &mut Vec<u32>) {
+    v.sort_unstable();
+    let mut out = 0;
+    for i in 0..v.len() {
+        if out > 0 && v[out - 1] == v[i] {
+            out -= 1;
+        } else {
+            v[out] = v[i];
+            out += 1;
+        }
+    }
+    v.truncate(out);
+}
+
+/// The coaction on the monomials of one degree, by operation: for each operation number, the
+/// monomials whose coaction has a term with it, and the images.
+#[derive(Default)]
+pub(crate) struct ByOperation {
+    /// The operation numbers that occur, sorted.
+    ids: Vec<u32>,
+    /// Where each operation's entries start in `monomials`, and their end.
+    starts: Vec<u32>,
+    /// The index of the monomial of each entry.
+    monomials: Vec<u32>,
+    /// Where each entry's images start in `gammas`, and their end.
+    image_starts: Vec<u32>,
+    /// The images, entry after entry.
+    gammas: Vec<u32>,
+}
+
+impl ByOperation {
+    /// No entries, ready for [`Self::push`] operation by operation.
+    fn empty() -> Self {
+        Self {
+            image_starts: vec![0],
+            ..Default::default()
+        }
+    }
+
+    /// Appends an entry for monomial `idx` with images `gammas`.
+    fn push(&mut self, idx: u32, gammas: &[u32]) {
+        self.monomials.push(idx);
+        self.gammas.extend_from_slice(gammas);
+        self.image_starts.push(self.gammas.len() as u32);
+    }
+
+    /// Transposes the coaction of each monomial of a degree, in index order.
+    fn new(table: &[crate::algebraic_novikov::Psi<u32>]) -> Self {
+        // A counting sort by operation number, which keeps the monomials in index order.
+        let top = table
+            .iter()
+            .flat_map(|psi| psi.iter().map(|(id, _)| id))
+            .max()
+            .map_or(0, |m| m as usize + 1);
+        let mut count = vec![0u32; top + 1];
+        let mut image_count = vec![0u32; top + 1];
+        for psi in table {
+            for (id, g) in psi.iter() {
+                count[id as usize + 1] += 1;
+                image_count[id as usize + 1] += g.len() as u32;
+            }
+        }
+        for i in 0..top {
+            count[i + 1] += count[i];
+            image_count[i + 1] += image_count[i];
+        }
+        let entries = count[top] as usize;
+        let mut out = Self {
+            ids: Vec::new(),
+            starts: Vec::new(),
+            monomials: vec![0; entries],
+            image_starts: vec![0; entries + 1],
+            gammas: vec![0; image_count[top] as usize],
+        };
+        // Each entry's place, and where its images go.
+        let (mut next, mut next_image) = (count.clone(), image_count.clone());
+        for (idx, psi) in table.iter().enumerate() {
+            for (id, g) in psi.iter() {
+                let (e, i) = (next[id as usize] as usize, next_image[id as usize] as usize);
+                out.monomials[e] = idx as u32;
+                out.image_starts[e] = i as u32;
+                out.gammas[i..i + g.len()].copy_from_slice(g);
+                next[id as usize] += 1;
+                next_image[id as usize] += g.len() as u32;
+            }
+        }
+        out.image_starts[entries] = out.gammas.len() as u32;
+        for id in 0..top {
+            if count[id + 1] > count[id] {
+                out.ids.push(id as u32);
+                out.starts.push(count[id]);
+            }
+        }
+        out.starts.push(entries as u32);
+        out
+    }
+
+    /// The monomials whose coaction has a term with operation `id`, each with its images.
+    fn get(&self, id: u32) -> impl Iterator<Item = (u32, &[u32])> {
+        let range = match self.ids.binary_search(&id) {
+            Ok(j) => self.starts[j] as usize..self.starts[j + 1] as usize,
+            Err(_) => 0..0,
+        };
+        range.map(move |e| {
+            (
+                self.monomials[e],
+                &self.gammas[self.image_starts[e] as usize..self.image_starts[e + 1] as usize],
+            )
+        })
     }
 }
 

@@ -159,9 +159,10 @@ where
     transfer(res, max_n, max_s, bands, None)
 }
 
-/// [`ext_q_by_v0_transfer_in_bands`] from a conjugated backbone, with the action computed inline
-/// by Milnor matrices and no table of it: `conjugated` must cover the differentials out of
-/// filtrations up to `max_s + 1` from generators of degree up to `(max_n + max_s) / 2`.
+/// [`ext_q_by_v0_transfer_in_bands`] from a conjugated backbone, with the action tabulated band by
+/// band from Milnor matrices instead of from the coaction: `conjugated` must cover the
+/// differentials out of filtrations up to `max_s + 1` from generators of degree up to
+/// `(max_n + max_s) / 2`.
 pub fn ext_q_by_v0_transfer_conjugated<CC>(
     res: &CC,
     conjugated: &crate::conjugate::ConjugatedBackbone,

@@ -1423,19 +1423,6 @@ impl<K: Ord + Copy> Psi<K> {
         psi
     }
 
-    /// The indices of the $m_\gamma$ paired with $\xi^R$.
-    pub(crate) fn get(&self, r: K) -> &[u32] {
-        match self.keys.binary_search(&r) {
-            Ok(i) => &self.gammas[self.starts[i] as usize..self.starts[i + 1] as usize],
-            Err(_) => &[],
-        }
-    }
-
-    /// The number of $R$ that occur.
-    pub(crate) fn len(&self) -> usize {
-        self.keys.len()
-    }
-
     /// Each $R$ with its indices.
     pub(crate) fn iter(&self) -> impl Iterator<Item = (K, &[u32])> {
         self.keys.iter().enumerate().map(|(i, &r)| {
