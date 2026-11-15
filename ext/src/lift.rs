@@ -301,10 +301,18 @@ impl<CC: ChainComplex + Sync> MultiLift<CC> {
                 let off = num_rows;
                 num_rows += d.num_rows();
                 terms += ps.iter().map(|p| p.term_indices.len()).sum::<usize>();
-                products.extend(ps.into_iter().map(|p| lift_batch::Product {
-                    row: p.row + off,
-                    ..p
-                }));
+                let mut ps = ps;
+                if off > 0 {
+                    let off = u32::try_from(off).expect("a chunk's rows exceed u32");
+                    ps.iter_mut().for_each(|p| p.row += off);
+                }
+                // One step can make hundreds of millions of products: the chunk's first takes its
+                // list as it is, rather than a copy alive beside it.
+                if products.is_empty() {
+                    products = ps;
+                } else {
+                    products.append(&mut ps);
+                }
                 chunk.push((d, off));
             }
             // A product is a few dozen bytes however few its terms, so the chunk is bounded in

@@ -1782,11 +1782,11 @@ pub mod lift_batch {
                 for (s_degree, ts, out_offset) in w.iter() {
                     products.push(Product {
                         r_degree: og.operation_degree,
-                        r_idx: og.operation_index,
+                        r_idx: batch::narrow(og.operation_index),
                         s_degree: *s_degree,
                         term_indices: ts.clone(),
-                        row,
-                        out_offset: *out_offset,
+                        row: batch::narrow(row),
+                        out_offset: batch::narrow(*out_offset),
                     });
                 }
             }

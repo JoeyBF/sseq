@@ -294,12 +294,12 @@ impl Device {
             .map(|p| algebra.dimension(p.r_degree + p.s_degree) > 0 && !p.term_indices.is_empty())
             .collect();
         let mut r_bits = Vec::with_capacity(products.len());
-        let mut last: Option<((i32, usize), u64)> = None;
+        let mut last: Option<((i32, u32), u64)> = None;
         for p in products {
             let key = (p.r_degree, p.r_idx);
             let bits = match last {
                 Some((k, b)) if k == key => b,
-                _ => algebra.basis_element_from_index(key.0, key.1).p_part.bits(),
+                _ => algebra.basis_element_from_index(key.0, key.1 as usize).p_part.bits(),
             };
             last = Some((key, bits));
             r_bits.push(bits);
@@ -480,9 +480,9 @@ impl Launch<'_> {
                 .extend(std::iter::repeat_n(local, p.term_indices.len()));
             a.prod_r.push(self.r_bits[i]);
             a.prod_row_base
-                .push(((p.row - row0) * self.num_limbs) as u32);
+                .push(((p.row as usize - row0) * self.num_limbs) as u32);
             a.prod_out_offset
-                .push(u32::try_from(p.out_offset).context("a column offset exceeds u32")?);
+                .push(p.out_offset);
         }
         Ok(a)
     }
@@ -582,9 +582,10 @@ fn row_blocks(
     let mut blocks = Vec::new();
     let (mut row0, mut p0) = (0, 0);
     for (i, p) in products.iter().enumerate() {
-        if p.row >= row0 + max_rows {
-            blocks.push((row0, p.row, p0, i));
-            (row0, p0) = (p.row, i);
+        let row = p.row as usize;
+        if row >= row0 + max_rows {
+            blocks.push((row0, row, p0, i));
+            (row0, p0) = (row, i);
         }
     }
     blocks.push((row0, num_rows, p0, products.len()));
@@ -865,7 +866,7 @@ mod tests {
         let mut next = (0, 0);
         for &(r0, r1, p0, p1) in &blocks {
             assert_eq!((r0, p0), next);
-            assert!(products[p0..p1].iter().all(|p| (r0..r1).contains(&p.row)));
+            assert!(products[p0..p1].iter().all(|p| (r0..r1).contains(&(p.row as usize))));
             next = (r1, p1);
         }
         assert_eq!(next, (40, products.len()));

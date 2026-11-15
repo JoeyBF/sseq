@@ -13,7 +13,7 @@ use std::{collections::HashMap, sync::Arc};
 use algebra::{
     MilnorAlgebra,
     milnor_algebra::batch::{
-        BatchProduct, COL_MAP_DROP, batch_applicable, gpu_available, multiply_batch,
+        BatchProduct, COL_MAP_DROP, Terms, batch_applicable, gpu_available, multiply_batch, narrow,
     },
     module::{
         FreeModule, Module,
@@ -134,7 +134,7 @@ fn extract(
     let mut scratch = col_mask.map(|_| FpVector::new(hom.prime(), target_dim));
     // `d(g)` restricted to one target generator block, shared by every product that multiplies
     // it: keyed by the generator and the start of the block.
-    let mut lists: HashMap<(i32, usize, usize), Option<Arc<[usize]>>> = HashMap::new();
+    let mut lists: HashMap<(i32, usize, usize), Option<Terms>> = HashMap::new();
     let mut list_bytes = 0;
 
     let mut row = start;
@@ -179,10 +179,12 @@ fn extract(
                 .entry(key)
                 .or_insert_with(|| {
                     let s = output.as_slice().restrict(input_start, block.end[0]);
-                    let terms: Option<Arc<[usize]>> =
-                        (!s.is_zero()).then(|| s.iter_nonzero().map(|(i, _)| i).collect());
-                    list_bytes += 64 + terms.as_ref().map_or(0, |t| size_of_val(&**t));
-                    terms
+                    list_bytes += 64;
+                    (!s.is_zero()).then(|| {
+                        let t: Arc<[usize]> = s.iter_nonzero().map(|(i, _)| i).collect();
+                        list_bytes += size_of_val(&*t);
+                        Terms::from(t)
+                    })
                 })
                 .clone();
             let Some(term_indices) = terms else {
@@ -190,11 +192,11 @@ fn extract(
             };
             products.push(BatchProduct {
                 r_degree: op_gen.operation_degree,
-                r_idx: op_gen.operation_index,
+                r_idx: narrow(op_gen.operation_index),
                 s_degree: input_degree - block.gen_deg,
-                term_indices: term_indices.into(),
-                row: r - start,
-                out_offset: output_start,
+                term_indices,
+                row: narrow(r - start),
+                out_offset: narrow(output_start),
             });
         }
         // Whole rows per chunk: a row's products go in one batch.

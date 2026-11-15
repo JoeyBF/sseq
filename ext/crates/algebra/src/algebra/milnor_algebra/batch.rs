@@ -29,23 +29,41 @@ pub const COL_MAP_DROP: u32 = u32::MAX;
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct BatchProduct {
     pub r_degree: i32,
-    pub r_idx: usize,
     pub s_degree: i32,
+    /// `u32`s, as is the [`Terms`] handle a pointer: one lift step can make hundreds of millions
+    /// of products, so their size is much of a lift's memory (32 bytes each, from 72).
+    pub r_idx: u32,
+    pub row: u32,
+    pub out_offset: u32,
     /// Shared, because one list usually serves many products: it depends only on the element
     /// being multiplied, not on the operation or the row.
     pub term_indices: Terms,
-    pub row: usize,
-    pub out_offset: usize,
+}
+
+// A lift's memory is mostly its products (see `BatchProduct`); keep them this small.
+const _: () = assert!(size_of::<BatchProduct>() <= 32);
+
+/// A product's index, row or column as the `u32` [`BatchProduct`] keeps.
+///
+/// # Panics
+///
+/// If it does not fit, which no lift comes near (a chunk's rows, a degree's Milnor basis, a
+/// bidegree's width are all far below `u32::MAX`).
+pub fn narrow(i: usize) -> u32 {
+    u32::try_from(i).expect("a product's index exceeds u32")
 }
 
 /// The basis elements of a product's element `s`: listed, or the set bits of a range of a vector.
 ///
 /// Either way it is shared, because one element usually serves many products. A chain map's value
 /// on a generator is dense (about a fifth of its bits set at the n400 ring's stems), so listing its
-/// set bits as indices takes ~14 times the memory of the bits themselves; [`Terms::Bits`] keeps the
+/// set bits as indices takes ~14 times the memory of the bits themselves; [`Terms::bits`] keeps the
 /// bits and reads them where the products are evaluated.
 #[derive(Clone, Debug)]
-pub enum Terms {
+pub struct Terms(Arc<TermsKind>);
+
+#[derive(Debug)]
+enum TermsKind {
     Indices(Arc<[usize]>),
     /// The set bits of `vec[start..end]`, as indices from `start`; `len` of them.
     Bits {
@@ -60,18 +78,18 @@ impl Terms {
     /// The set bits of `vec[start..end]`.
     pub fn bits(vec: Arc<FpVector>, start: usize, end: usize) -> Self {
         let len = vec.slice(start, end).iter_nonzero().count();
-        Self::Bits {
+        Self(Arc::new(TermsKind::Bits {
             vec,
             start,
             end,
             len,
-        }
+        }))
     }
 
     pub fn len(&self) -> usize {
-        match self {
-            Self::Indices(v) => v.len(),
-            Self::Bits { len, .. } => *len,
+        match &*self.0 {
+            TermsKind::Indices(v) => v.len(),
+            TermsKind::Bits { len, .. } => *len,
         }
     }
 
@@ -81,9 +99,9 @@ impl Terms {
 
     /// Calls `f` on each index, in ascending order.
     pub fn for_each(&self, mut f: impl FnMut(usize)) {
-        match self {
-            Self::Indices(v) => v.iter().for_each(|&i| f(i)),
-            Self::Bits {
+        match &*self.0 {
+            TermsKind::Indices(v) => v.iter().for_each(|&i| f(i)),
+            TermsKind::Bits {
                 vec, start, end, ..
             } => vec.slice(*start, *end).iter_nonzero().for_each(|(i, _)| f(i)),
         }
@@ -114,7 +132,7 @@ impl std::hash::Hash for Terms {
 
 impl From<Arc<[usize]>> for Terms {
     fn from(v: Arc<[usize]>) -> Self {
-        Self::Indices(v)
+        Self(Arc::new(TermsKind::Indices(v)))
     }
 }
 
@@ -272,14 +290,14 @@ pub fn cpu_multiply_batch(
             continue;
         }
         let r = algebra
-            .basis_element_from_index(prod.r_degree, prod.r_idx)
+            .basis_element_from_index(prod.r_degree, prod.r_idx as usize)
             .p_part;
-        let row = &mut limbs[prod.row * num_limbs..][..num_limbs];
+        let row = &mut limbs[prod.row as usize * num_limbs..][..num_limbs];
         prod.term_indices.for_each(|ti| {
             let s = algebra.basis_element_from_index(prod.s_degree, ti).p_part;
             antidiagonal::for_each_term(degree, r, s, |t: PPart| {
                 let idx = tables.rank(t, degree);
-                if let Some(bit) = output_bit(prod.out_offset, idx, col_map, num_limbs) {
+                if let Some(bit) = output_bit(prod.out_offset as usize, idx, col_map, num_limbs) {
                     row[bit / 32] ^= 1 << (bit % 32);
                 }
             });
@@ -381,11 +399,11 @@ pub(super) mod tests {
                 }
                 products.push(BatchProduct {
                     r_degree,
-                    r_idx: rng.range(0, r_dim - 1),
+                    r_idx: rng.range(0, r_dim - 1) as u32,
                     s_degree,
                     term_indices: Arc::<[usize]>::from(terms).into(),
-                    row,
-                    out_offset: b * block,
+                    row: row as u32,
+                    out_offset: (b * block) as u32,
                 });
             }
             width = width.max(blocks_per_row * block);
@@ -450,13 +468,13 @@ pub(super) mod tests {
                     prod.as_slice_mut(),
                     1,
                     p.r_degree,
-                    p.r_idx,
+                    p.r_idx as usize,
                     p.s_degree,
                     i,
                 );
             }
             for (i, c) in prod.iter_nonzero() {
-                want[p.row].add_basis_element(p.out_offset + i, c);
+                want[p.row as usize].add_basis_element(p.out_offset as usize + i, c);
             }
         }
         for (row, (got, want)) in out.iter_rows().zip(&want).enumerate() {
