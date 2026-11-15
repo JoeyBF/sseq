@@ -169,66 +169,68 @@ where
         self.op_ids = op_ids;
     }
 
-    /// The table [`Self::tabulate`] makes for the conjugated backbone: for each degree and each
-    /// operation `allowed` marks there, $m P(M)$ for every basis monomial $m$ of length at most
-    /// `wanted`, by one enumeration of Milnor matrices per pair.
+    /// The table [`Self::tabulate`] makes for the conjugated backbone: for each degree, $m P(M)$
+    /// for every basis monomial $m$ of length at most `wanted` and every operation $M$ `allowed`
+    /// marks there, from one enumeration of the Milnor matrices of each $m$, which reaches only
+    /// the operations that act on it nontrivially.
     fn tabulate_inline(
         &self,
         op_ids: &FxHashMap<PackedXi, u32>,
         allowed: &[Vec<bool>],
         wanted: &[i32],
     ) -> Vec<ByOperation> {
-        let mut ops: Vec<(u32, PackedXi)> = op_ids.iter().map(|(&r, &id)| (id, r)).collect();
-        ops.sort_unstable();
+        use algebra::milnor_algebra::PPart;
+        let by_m: FxHashMap<PPart, u32> = op_ids
+            .iter()
+            .map(|(&r, &id)| (PPart::from_slice(&unpack(r)), id))
+            .collect();
+        let mut deg_of = vec![0; op_ids.len()];
+        for (&r, &id) in op_ids {
+            deg_of[id as usize] = xi_degree(r);
+        }
         let q = &self.q;
         (0..wanted.len())
             .into_maybe_par_iter()
             .map(|d| {
-                let mut out = ByOperation::empty();
                 if wanted[d] < 0 {
-                    return out;
+                    return ByOperation::empty();
                 }
                 let d_i = d as i32;
-                let n = q.dimension(d_i, wanted[d] as u32);
-                let monos: Vec<algebra::comodule::Monomial> = (0..n)
-                    .map(|i| qmono_to_monomial(q.monomial(d_i, i)))
-                    .collect();
-                let mut terms: Vec<QMono> = Vec::new();
-                let mut gammas: Vec<u32> = Vec::new();
-                for &(id, r) in &ops {
-                    if !allowed[d][id as usize] || xi_degree(r) > d_i {
-                        continue;
-                    }
-                    let d_out = d_i - xi_degree(r);
-                    let m = algebra::milnor_algebra::PPart::from_slice(&unpack(r));
-                    let first = out.monomials.len();
-                    for (idx, ours) in monos.iter().enumerate() {
-                        terms.clear();
-                        algebra::comodule::for_each_column(m, ours, |cols| {
-                            terms.push(monomial_to_qmono(cols));
-                        });
-                        if terms.is_empty() {
-                            continue;
+                // No operation allowed here has an entry above the cap.
+                let mut cap = PPart::zero();
+                for (m, &id) in &by_m {
+                    if allowed[d][id as usize] {
+                        for i in 0..m.len() {
+                            cap.set(i, cap.get(i).max(m.get(i)));
                         }
-                        terms.sort_unstable();
-                        gammas.clear();
-                        gammas.extend(
-                            terms
-                                .chunk_by(|a, b| a == b)
-                                .filter(|c| c.len() % 2 == 1)
-                                .filter_map(|c| q.try_index(d_out, &c[0]).map(|g| g as u32)),
-                        );
-                        if !gammas.is_empty() {
-                            out.push(idx as u32, &gammas);
-                        }
-                    }
-                    if out.monomials.len() > first {
-                        out.ids.push(id);
-                        out.starts.push(first as u32);
                     }
                 }
-                out.starts.push(out.monomials.len() as u32);
-                out
+                let n = q.dimension(d_i, wanted[d] as u32);
+                // (operation, monomial, image) for every nonzero term, monomial by monomial.
+                let mut entries: Vec<(u32, u32, u32)> = Vec::new();
+                let mut terms: Vec<(u32, QMono)> = Vec::new();
+                for idx in 0..n {
+                    let ours = qmono_to_monomial(q.monomial(d_i, idx));
+                    terms.clear();
+                    algebra::comodule::for_each_matrix(&ours, cap, |m, cols| {
+                        if let Some(&id) = by_m.get(&m)
+                            && allowed[d][id as usize]
+                        {
+                            terms.push((id, monomial_to_qmono(cols)));
+                        }
+                    });
+                    terms.sort_unstable();
+                    for c in terms.chunk_by(|a, b| a == b) {
+                        if c.len() % 2 == 1 {
+                            let (id, target) = c[0];
+                            let d_out = d_i - deg_of[id as usize];
+                            if let Some(g) = q.try_index(d_out, &target) {
+                                entries.push((id, idx as u32, g as u32));
+                            }
+                        }
+                    }
+                }
+                ByOperation::from_entries(entries)
             })
             .collect()
     }
@@ -418,6 +420,23 @@ impl ByOperation {
         self.monomials.push(idx);
         self.gammas.extend_from_slice(gammas);
         self.image_starts.push(self.gammas.len() as u32);
+    }
+
+    /// Collects `(operation, monomial, image)` triples, in increasing order of monomial.
+    fn from_entries(mut entries: Vec<(u32, u32, u32)>) -> Self {
+        // Stable, so each operation's monomials stay in order.
+        entries.sort_by_key(|e| e.0);
+        let mut out = Self::empty();
+        for group in entries.chunk_by(|a, b| a.0 == b.0) {
+            out.ids.push(group[0].0);
+            out.starts.push(out.monomials.len() as u32);
+            for same in group.chunk_by(|a, b| a.1 == b.1) {
+                let images: Vec<u32> = same.iter().map(|e| e.2).collect();
+                out.push(same[0].1, &images);
+            }
+        }
+        out.starts.push(out.monomials.len() as u32);
+        out
     }
 
     /// Transposes the coaction of each monomial of a degree, in index order.

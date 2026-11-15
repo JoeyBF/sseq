@@ -1,15 +1,18 @@
 //! Conjugates a saved backbone: replaces each differential coefficient by its antipode, as
 //! `ext::conjugate::ConjugatedBackbone`, and reports the cost by stem.
 //!
-//! Usage: `conjugate_backbone <max_stem> <max_s> [out_dir]`, with `CTAU_BACKBONE=<dir>` the saved
-//! resolution of $\mathbb{F}_2$, read through classical stem `max_stem` and filtration
-//! `max_s + 1`. Prints, for each band of stems, the Milnor terms read, the antipode terms summed
+//! Usage: `conjugate_backbone <max_n> <max_s> [out_dir]`, with the targets of `v0_transfer` and
+//! `CTAU_BACKBONE=<dir>` the saved resolution of $\mathbb{F}_2$: conjugates exactly what
+//! `v0_transfer` reads, the differentials out of filtrations up to `max_s + 1` from generators of
+//! degree up to `(max_n + max_s) / 2`. Prints, for each band of stems, the Milnor terms read, the antipode terms summed
 //! before cancelling, the terms kept and the summed time of the bidegrees, then the totals, the
 //! wall time and the peak memory. With `out_dir`, writes the result there.
 use std::{sync::Arc, time::Instant};
 
-use ext::{algebraic_novikov::unit_module, conjugate::ConjugatedBackbone};
-use sseq::coordinates::Bidegree;
+use ext::{
+    algebraic_novikov::{unit_module, untwisted_backbone_range},
+    conjugate::ConjugatedBackbone,
+};
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -18,11 +21,11 @@ fn main() {
     let save = std::env::var_os("CTAU_BACKBONE").map(std::path::PathBuf::from);
     let res = ext::nassau::Resolution::new_with_save(Arc::new(unit_module()), save).unwrap();
     let start = Instant::now();
-    res.compute_through_stem(Bidegree::n_s(max_n, max_s + 1));
+    res.compute_through_stem(untwisted_backbone_range(max_n, max_s));
     println!("backbone: {:?}", start.elapsed());
 
     let start = Instant::now();
-    let (conj, stats) = ConjugatedBackbone::compute(&res, max_s, max_n + max_s + 1);
+    let (conj, stats) = ConjugatedBackbone::compute(&res, max_s, (max_n + max_s) / 2);
     let wall = start.elapsed();
     let band = 20;
     let mut bands: std::collections::BTreeMap<i32, (usize, usize, usize, f64)> = Default::default();
