@@ -79,6 +79,10 @@ pub(crate) struct Stage<'a, CC> {
     /// applied by the antipode-free right action, which `psi` then tabulates from Milnor matrices
     /// instead of from the coaction.
     pub(crate) inline: bool,
+    /// Whether to compute the action block by block instead of tabulating it, at the conjugated
+    /// backbone only: each block enumerates the Milnor matrices of the monomials it reads, capped
+    /// by its own operations.
+    pub(crate) per_block: bool,
     /// The bases of the layer.
     q: QDown,
     /// The layer.
@@ -149,6 +153,10 @@ where
                 }
             }
         }
+        if self.per_block {
+            self.op_ids = op_ids;
+            return;
+        }
         if self.inline {
             self.psi = self.tabulate_inline(&op_ids, &allowed, &wanted);
             self.op_ids = op_ids;
@@ -167,6 +175,60 @@ where
             .map(|d| ByOperation::new(&d))
             .collect();
         self.op_ids = op_ids;
+    }
+
+    /// $m P(M)$ for the first `n` basis monomials $m$ of degree `d` and the operations $M$ of
+    /// `ops`, numbered by their place there, by one enumeration of the Milnor matrices of each $m$
+    /// capped by `ops`.
+    fn act_on_degree(&self, d: i32, n: usize, ops: &[PackedXi]) -> ByOperation {
+        use algebra::milnor_algebra::PPart;
+        let by_m: FxHashMap<PPart, u32> = ops
+            .iter()
+            .enumerate()
+            .map(|(k, &r)| (PPart::from_slice(&unpack(r)), k as u32))
+            .collect();
+        let mut cap = PPart::zero();
+        for m in by_m.keys() {
+            for i in 0..m.len() {
+                cap.set(i, cap.get(i).max(m.get(i)));
+            }
+        }
+        let q = &self.q;
+        let mut entries: Vec<(u32, u32, u32)> = Vec::new();
+        let mut terms: Vec<(u32, QMono)> = Vec::new();
+        for idx in 0..n {
+            let ours = qmono_to_monomial(q.monomial(d, idx));
+            terms.clear();
+            algebra::comodule::for_each_matrix(&ours, cap, |m, cols| {
+                if let Some(&k) = by_m.get(&m) {
+                    terms.push((k, monomial_to_qmono(cols)));
+                }
+            });
+            terms.sort_unstable();
+            for c in terms.chunk_by(|a, b| a == b) {
+                if c.len() % 2 == 1 {
+                    let (k, target) = c[0];
+                    if let Some(g) = q.try_index(d - xi_degree(ops[k as usize]), &target) {
+                        entries.push((k, idx as u32, g as u32));
+                    }
+                }
+            }
+        }
+        ByOperation::from_entries(entries)
+    }
+
+    /// The memory the table of the action holds, in bytes.
+    pub(crate) fn table_bytes(&self) -> usize {
+        self.psi
+            .iter()
+            .map(|b| {
+                4 * (b.ids.len()
+                    + b.starts.len()
+                    + b.monomials.len()
+                    + b.image_starts.len()
+                    + b.gammas.len())
+            })
+            .sum()
     }
 
     /// The table [`Self::tabulate`] makes for the conjugated backbone: for each degree, $m P(M)$
@@ -277,19 +339,51 @@ where
         inverted: &InvertedSlice,
         target: (i32, i32),
     ) -> (FilteredMap, Vec<Cochain>, Vec<Cochain>) {
+        let layer = self.layer;
+        let sources = self.cochains(a, u, k_max);
+        let targets = self.cochains(target.0, target.1, k_max);
+        let map = FilteredMap {
+            source: sources.iter().map(|c| layer.filtration(&c.2)).collect(),
+            target: targets.iter().map(|c| layer.filtration(&c.2)).collect(),
+            columns: self.build_columns(a, u, k_max, inverted, target),
+        };
+        (map, sources, targets)
+    }
+
+    /// The length of the monomial of each cochain of filtration `a` at weight `u` on
+    /// $Q_{k_\max}$, in the order of [`Self::cochains`].
+    pub(crate) fn lengths(&self, a: i32, u: i32, k_max: u32) -> Vec<u32> {
+        let q_dim = |d: i32| self.q.dimension(d, k_max);
+        let (blocks, total) = cochain_blocks(self.res, q_dim, a, u);
+        let mut out = Vec::with_capacity(total);
+        for (t, &(_, gens)) in blocks.iter().enumerate() {
+            let d = u - t as i32;
+            let lens: Vec<u32> = (0..q_dim(d))
+                .map(|idx| qmono_len(self.q.monomial(d, idx)))
+                .collect();
+            for _ in 0..gens {
+                out.extend_from_slice(&lens);
+            }
+        }
+        out
+    }
+
+    /// The columns of [`Self::build_map`]: for each cochain of filtration `a` at weight `u`, in
+    /// the order of [`Self::cochains`], the indices of the target cochains in its image.
+    pub(crate) fn build_columns(
+        &self,
+        a: i32,
+        u: i32,
+        k_max: u32,
+        inverted: &InvertedSlice,
+        target: (i32, i32),
+    ) -> Vec<Vec<u32>> {
         let (q, layer) = (&self.q, self.layer);
         let (a_out, u_out) = target;
         let q_dim = |d: i32| q.dimension(d, k_max);
         let (tgt, _) = cochain_blocks(self.res, q_dim, a_out, u_out);
-        let sources = self.cochains(a, u, k_max);
-        let targets = self.cochains(a_out, u_out, k_max);
-        let mut map = FilteredMap {
-            source: sources.iter().map(|c| layer.filtration(&c.2)).collect(),
-            target: targets.iter().map(|c| layer.filtration(&c.2)).collect(),
-            columns: Vec::with_capacity(sources.len()),
-        };
-        map.columns = vec![Vec::new(); sources.len()];
-        let (src, _) = cochain_blocks(self.res, q_dim, a, u);
+        let (src, total) = cochain_blocks(self.res, q_dim, a, u);
+        let mut columns: Vec<Vec<u32>> = vec![Vec::new(); total];
         for (t_i, &(src_off, gens)) in src.iter().enumerate() {
             let t_i = t_i as i32;
             let block = q_dim(u - t_i);
@@ -328,10 +422,19 @@ where
             let filtered = layer.exact_length();
             // Operation by operation, through the monomials it acts on nontrivially.
             let d = u - t_i;
-            // A degree no build reads with any operation has no table.
-            let Some(table) = self.psi.get(d as usize) else {
-                assert!(ops.is_empty(), "no coaction tabulated in degree {d}");
-                continue;
+            // Without a table, the block's own operations on the monomials it reads, numbered by
+            // their place in `ops`.
+            let own;
+            let (table, ids): (&ByOperation, Vec<u32>) = if self.per_block {
+                own = self.act_on_degree(d, block, &ops);
+                (&own, (0..ops.len() as u32).collect())
+            } else {
+                // A degree no build reads with any operation has no table.
+                let Some(table) = self.psi.get(d as usize) else {
+                    assert!(ops.is_empty(), "no coaction tabulated in degree {d}");
+                    continue;
+                };
+                (table, ids.clone())
             };
             let mut image: Vec<u32> = Vec::new();
             for (k, &r) in ops.iter().enumerate() {
@@ -355,7 +458,7 @@ where
                         continue;
                     }
                     for &(i, targets) in &by_op[k] {
-                        let col = &mut map.columns[src_off + i * block + idx as usize];
+                        let col = &mut columns[src_off + i * block + idx as usize];
                         for &(t_l, l) in targets {
                             if t_l > u_out {
                                 continue;
@@ -367,11 +470,11 @@ where
                     }
                 }
             }
-            for col in &mut map.columns[src_off..src_off + gens * block] {
+            for col in &mut columns[src_off..src_off + gens * block] {
                 cancel_pairs(col);
             }
         }
-        (map, sources, targets)
+        columns
     }
 }
 
@@ -535,6 +638,7 @@ where
     Stage {
         res,
         psi: Vec::new(),
+        per_block: false,
         op_ids: FxHashMap::default(),
         inline: false,
         q,

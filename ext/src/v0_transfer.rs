@@ -7,9 +7,9 @@ use maybe_rayon::prelude::*;
 use rustc_hash::FxHashMap;
 
 use crate::{
-    algebraic_novikov::{InvertedSlice, qmono_len, untwisted_filtrations, untwisted_max_weight},
+    algebraic_novikov::{InvertedSlice, untwisted_filtrations, untwisted_max_weight},
     chain_complex::FreeChainComplex,
-    vn_bockstein::{Cochain, Layer, Stage, slice, stage},
+    vn_bockstein::{Layer, Stage, slice, stage},
 };
 
 /// The bits of a packed term of a coboundary that hold the index within its slice; the length
@@ -156,7 +156,7 @@ pub fn ext_q_by_v0_transfer_in_bands<CC>(
 where
     CC: FreeChainComplex<Algebra = MilnorAlgebra> + Sync,
 {
-    transfer(res, max_n, max_s, bands, None)
+    transfer(res, max_n, max_s, bands, None, false)
 }
 
 /// [`ext_q_by_v0_transfer_in_bands`] from a conjugated backbone, with the action tabulated band by
@@ -173,16 +173,21 @@ pub fn ext_q_by_v0_transfer_conjugated<CC>(
 where
     CC: FreeChainComplex<Algebra = MilnorAlgebra> + Sync,
 {
-    transfer(res, max_n, max_s, bands, Some(conjugated))
+    // `CTAU_PER_BLOCK` trades time for memory: no table of the action is kept, and each block
+    // computes the action of its own operations.
+    let per_block = std::env::var_os("CTAU_PER_BLOCK").is_some();
+    transfer(res, max_n, max_s, bands, Some(conjugated), per_block)
 }
 
-/// The transfer, reading the backbone or, if given, the conjugated backbone.
+/// The transfer, reading the backbone or, if given, the conjugated backbone, whose action is
+/// computed block by block with `per_block` instead of tabulated.
 fn transfer<CC>(
     res: &CC,
     max_n: i32,
     max_s: i32,
     bands: usize,
     conjugated: Option<&crate::conjugate::ConjugatedBackbone>,
+    per_block: bool,
 ) -> BTreeMap<(i32, i32, i32), usize>
 where
     CC: FreeChainComplex<Algebra = MilnorAlgebra> + Sync,
@@ -195,6 +200,7 @@ where
         max_s,
     );
     stage.inline = conjugated.is_some();
+    stage.per_block = per_block;
     let slices: Vec<InvertedSlice> = (0..=max_s)
         .into_maybe_par_iter()
         .map(|a| match conjugated {
@@ -214,13 +220,23 @@ where
     let ends: Vec<i32> = (1..=bands as i32)
         .map(|i| (max_u + 1) * i / bands as i32 - 1)
         .collect();
+    let timing = std::env::var_os("CTAU_TIMING").is_some();
     let mut out = BTreeMap::new();
     let mut lo = 0;
     for hi in ends {
         if hi < lo {
             continue;
         }
+        let mut clock = std::time::Instant::now();
         stage.tabulate(&slices, max_len, lo..=hi);
+        lap(0, &mut clock);
+        if timing {
+            eprintln!(
+                "weights {lo}..={hi}: table {} MB, resident {} MB",
+                stage.table_bytes() >> 20,
+                memory("VmRSS") >> 10
+            );
+        }
         let per_u: Vec<BTreeMap<(i32, i32, i32), usize>> = (lo..=hi)
             .into_maybe_par_iter()
             .map(|u| weight(&stage, &slices, u, max_n, max_s))
@@ -228,7 +244,79 @@ where
         out.extend(per_u.into_iter().flatten());
         lo = hi + 1;
     }
+    if timing {
+        let report: Vec<String> = PHASE_NAMES
+            .iter()
+            .zip(&PHASES)
+            .map(|(name, t)| {
+                let t = t.swap(0, std::sync::atomic::Ordering::Relaxed);
+                format!("{name} {:.1}", t as f64 * 1e-9)
+            })
+            .collect();
+        eprintln!(
+            "transfer seconds, summed over weights: {}",
+            report.join(", ")
+        );
+        eprintln!("peak resident {} MB", memory("VmHWM") >> 10);
+    }
     out
+}
+
+/// What the transfer spent, summed over the weights, in nanoseconds; printed by [`transfer`] when
+/// `CTAU_TIMING` is set, with the size of the action's table for each band of weights and the
+/// memory resident after tabulating it.
+static PHASES: [std::sync::atomic::AtomicU64; PHASE_NAMES.len()] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; PHASE_NAMES.len()];
+
+/// The phases of [`PHASES`]: tabulating the action, then the steps of [`weight`].
+const PHASE_NAMES: [&str; 6] = ["tabulate", "cochains", "build", "slices", "p and h", "D"];
+
+/// The field `name` of `/proc/self/status`, in kB, or 0 where there is none.
+fn memory(name: &str) -> u64 {
+    std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|s| {
+            s.lines()
+                .find(|l| l.starts_with(name))
+                .and_then(|l| l.split_whitespace().nth(1)?.parse().ok())
+        })
+        .unwrap_or(0)
+}
+
+/// Adds the time since `start` to phase `i` of [`PHASES`], and restarts `start`.
+fn lap(i: usize, start: &mut std::time::Instant) {
+    let now = std::time::Instant::now();
+    PHASES[i].fetch_add(
+        (now - *start).as_nanos() as u64,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    *start = now;
+}
+
+/// A coboundary out of one slice, column by column: the terms of column `i` are
+/// `data[offsets[i]..offsets[i + 1]]`, each a target length above [`INDEX_BITS`] and an index in
+/// its slice below.
+#[derive(Default)]
+struct Columns {
+    offsets: Vec<u32>,
+    data: Vec<u32>,
+}
+
+/// Each cochain's slice and index in it, packed as the terms of [`Columns`], from the lengths of
+/// the cochains in order: within a length, the order is that of the cochains.
+fn positions(lengths: &[u32], dims: &mut Vec<usize>) -> Vec<u32> {
+    lengths
+        .iter()
+        .map(|&j| {
+            if dims.len() <= j as usize {
+                dims.resize(j as usize + 1, 0);
+            }
+            let i = dims[j as usize];
+            assert!(i < 1 << INDEX_BITS, "a slice outgrew INDEX_BITS");
+            dims[j as usize] += 1;
+            j << INDEX_BITS | i as u32
+        })
+        .collect()
 }
 
 /// [`ext_q_by_v0_transfer`] at weight `u`.
@@ -247,248 +335,268 @@ where
     if a_lo > max_s {
         return BTreeMap::new();
     }
+    let mut clock = std::time::Instant::now();
     // A class of s <= max_s and weight u has length at most max_s - a and, by
     // `untwisted_max_weight`, at most max_n + max_s - 2u.
     let k_of = |a: i32| (max_s - a).min(max_n + max_s - 2 * u).max(0) as u32;
+    let index = |a: i32| (a - a_lo) as usize;
 
-    // Cochains of each degree by length: (length, index in its slice) of each, and the slices.
-    let mut slot: BTreeMap<i32, FxHashMap<Cochain, (u32, usize)>> = BTreeMap::new();
-    let mut dims: BTreeMap<(i32, u32), usize> = BTreeMap::new();
-    for a in a_lo..=max_s + 1 {
-        let mut m = FxHashMap::default();
-        // A degree also holds the length one past its own, as the target of the degree below.
-        let k = if a == 0 { k_of(0) } else { k_of(a - 1) };
-        for c in stage.cochains(a, u, k) {
-            let j = qmono_len(&c.2);
-            let d = dims.entry((a, j)).or_insert(0);
-            m.insert(c, (j, *d));
-            *d += 1;
-        }
-        slot.insert(a, m);
-    }
-    let dim = |a: i32, j: u32| dims.get(&(a, j)).copied().unwrap_or(0);
+    // The cochains of each degree, by length. A degree also holds the length one past its own,
+    // as the target of the degree below.
+    let targets: Vec<(Vec<usize>, Vec<u32>)> = (a_lo..=max_s + 1)
+        .into_maybe_par_iter()
+        .map(|a| {
+            let k = if a == 0 { k_of(0) } else { k_of(a - 1) };
+            let mut dims = Vec::new();
+            let pos = positions(&stage.lengths(a, u, k), &mut dims);
+            (dims, pos)
+        })
+        .collect();
+    let dim = |a: i32, j: u32| {
+        targets
+            .get(index(a))
+            .and_then(|(d, _)| d.get(j as usize))
+            .copied()
+            .unwrap_or(0)
+    };
+    lap(1, &mut clock);
 
-    // δ^a as columns, by source length then index: each term as its target length above
-    // `INDEX_BITS` and its index below.
-    let mut delta: BTreeMap<i32, Vec<Vec<Vec<u32>>>> = BTreeMap::new();
-    for a in a_lo..=max_s {
-        let (map, sources, targets) = stage.build(a, u, k_of(a), &inverted[a as usize]);
-        let mut cols: Vec<Vec<Vec<u32>>> =
-            (0..=k_of(a)).map(|j| vec![Vec::new(); dim(a, j)]).collect();
-        for (s, c) in sources.iter().enumerate() {
-            let Some(&(j, i)) = slot[&a].get(c) else {
-                continue;
-            };
-            cols[j as usize][i] = map.columns[s]
-                .iter()
-                .filter_map(|&t| slot[&(a + 1)].get(&targets[t as usize]))
-                .map(|&(jt, t)| {
-                    assert!(t < 1 << INDEX_BITS, "a slice outgrew INDEX_BITS");
-                    jt << INDEX_BITS | t as u32
+    // δ^a out of each slice (a, j).
+    let delta: Vec<Vec<Columns>> = (a_lo..=max_s)
+        .into_maybe_par_iter()
+        .map(|a| {
+            let k = k_of(a);
+            let mut src_dims = Vec::new();
+            let src = positions(&stage.lengths(a, u, k), &mut src_dims);
+            let columns = stage.build_columns(a, u, k, &inverted[a as usize], (a + 1, u));
+            let to = &targets[index(a + 1)].1;
+            let mut out: Vec<Columns> = (0..=k)
+                .map(|_| Columns {
+                    offsets: vec![0],
+                    data: Vec::new(),
                 })
                 .collect();
-        }
-        delta.insert(a, cols);
-    }
+            for (s, col) in src.iter().zip(columns) {
+                let c = &mut out[(s >> INDEX_BITS) as usize];
+                c.data.extend(col.iter().map(|&t| to[t as usize]));
+                c.offsets.push(c.data.len() as u32);
+            }
+            out
+        })
+        .collect();
     // The terms of δ out of cochain i of slice (a, j), as (target length, index).
     let column = |a: i32, j: u32, i: usize| {
-        delta[&a][j as usize][i]
+        let c = &delta[index(a)][j as usize];
+        c.data[c.offsets[i] as usize..c.offsets[i + 1] as usize]
             .iter()
             .map(|&p| (p >> INDEX_BITS, (p & ((1 << INDEX_BITS) - 1)) as usize))
     };
+    lap(2, &mut clock);
 
-    // Reduce each slice of δ_0 and retract it onto its cohomology.
-    let mut slices: BTreeMap<(i32, u32), Slice> = BTreeMap::new();
-    for a in a_lo..=max_s {
-        for j in 0..=k_of(a) {
-            let n = dim(a, j);
-            if n == 0 {
-                continue;
-            }
-            // δ_0 out of (a, j): reduce its columns, keeping preimages; zero columns are cocycles.
-            let mut out = Image::default();
-            let mut kernel = Vec::new();
-            for i in 0..n {
-                let mut y = zeros(dim(a + 1, j));
-                for (jt, t) in column(a, j, i) {
-                    if jt == j {
-                        flip(&mut y, t);
-                    }
+    // Reduce each slice of δ_0 and retract it onto its cohomology; the lengths are independent,
+    // and each degree reads the one below.
+    let slices: FxHashMap<(i32, u32), Slice> = (0..=k_of(a_lo))
+        .into_maybe_par_iter()
+        .flat_map_iter(|j| {
+            let mut done: Vec<((i32, u32), Slice)> = Vec::new();
+            for a in a_lo..=max_s {
+                if j > k_of(a) {
+                    break;
                 }
-                let mut pre = zeros(n);
-                flip(&mut pre, i);
-                while let Some(l) = low(&y) {
-                    match out.by_low.get(&l) {
-                        Some((v, p)) => {
-                            add(&mut y, v);
-                            add(&mut pre, p);
+                let n = dim(a, j);
+                if n == 0 {
+                    continue;
+                }
+                // δ_0 out of (a, j): reduce its columns, keeping preimages; zero columns are
+                // cocycles.
+                let mut out = Image::default();
+                let mut kernel = Vec::new();
+                for i in 0..n {
+                    let mut y = zeros(dim(a + 1, j));
+                    for (jt, t) in column(a, j, i) {
+                        if jt == j {
+                            flip(&mut y, t);
                         }
-                        None => break,
+                    }
+                    let mut pre = zeros(n);
+                    flip(&mut pre, i);
+                    out.reduce(&mut y, &mut pre);
+                    match low(&y) {
+                        Some(l) => {
+                            out.by_low.insert(l, (y, pre));
+                        }
+                        None => kernel.push(pre),
                     }
                 }
-                match low(&y) {
-                    Some(l) => {
-                        out.by_low.insert(l, (y, pre));
-                    }
-                    None => kernel.push(pre),
-                }
-            }
-            // The coboundaries into (a, j), from the slice below, then classes completing them.
-            let mut cycles: FxHashMap<usize, (Bits, Cycle)> = FxHashMap::default();
-            if let Some(below) = slices.get(&(a - 1, j)) {
-                for (l, (v, p)) in &below.out.by_low {
-                    cycles.insert(*l, (v.clone(), Cycle::Boundary(p.clone())));
-                }
-            }
-            let mut classes = Vec::new();
-            for mut z in kernel {
-                while let Some(l) = low(&z) {
-                    match cycles.get(&l) {
-                        Some((v, _)) => add(&mut z, &v.clone()),
-                        None => break,
+                // The coboundaries into (a, j), from the slice below, then classes completing
+                // them.
+                let mut cycles: FxHashMap<usize, (Bits, Cycle)> = FxHashMap::default();
+                if let Some((_, below)) = done.last().filter(|((b, _), _)| *b == a - 1) {
+                    for (l, (v, p)) in &below.out.by_low {
+                        cycles.insert(*l, (v.clone(), Cycle::Boundary(p.clone())));
                     }
                 }
-                if let Some(l) = low(&z) {
-                    cycles.insert(l, (z.clone(), Cycle::Class(classes.len())));
-                    classes.push(z);
+                let mut classes = Vec::new();
+                for mut z in kernel {
+                    while let Some(l) = low(&z) {
+                        match cycles.get(&l) {
+                            Some((v, _)) => add(&mut z, v),
+                            None => break,
+                        }
+                    }
+                    if let Some(l) = low(&z) {
+                        cycles.insert(l, (z.clone(), Cycle::Class(classes.len())));
+                        classes.push(z);
+                    }
                 }
+                done.push((
+                    (a, j),
+                    Slice {
+                        dim: n,
+                        out,
+                        cycles,
+                        classes,
+                    },
+                ));
             }
-            slices.insert(
-                (a, j),
-                Slice {
-                    dim: n,
-                    out,
-                    cycles,
-                    classes,
-                },
-            );
-        }
-    }
+            done
+        })
+        .collect();
+    lap(3, &mut clock);
 
     // p and h of each basis cochain of each slice (a, j) with a above the lowest degree.
-    let mut ph: FxHashMap<(i32, u32), (Vec<Bits>, Vec<Bits>)> = FxHashMap::default();
-    for (&(a, j), slice) in &slices {
-        if a == a_lo {
-            continue;
-        }
-        let below = dim(a - 1, j);
-        let cols = (0..slice.dim)
-            .map(|c| {
-                let mut e = zeros(slice.dim);
-                flip(&mut e, c);
-                let mut dc = zeros(dim(a + 1, j));
-                for (jt, t) in column(a, j, c) {
-                    if jt == j {
-                        flip(&mut dc, t);
+    let ph: FxHashMap<(i32, u32), (Vec<Bits>, Vec<Bits>)> = slices
+        .iter()
+        .filter(|((a, _), _)| *a > a_lo)
+        .collect::<Vec<_>>()
+        .into_maybe_par_iter()
+        .map(|(&(a, j), slice)| {
+            let below = dim(a - 1, j);
+            let cols = (0..slice.dim)
+                .map(|c| {
+                    let mut e = zeros(slice.dim);
+                    flip(&mut e, c);
+                    let mut dc = zeros(dim(a + 1, j));
+                    for (jt, t) in column(a, j, c) {
+                        if jt == j {
+                            flip(&mut dc, t);
+                        }
                     }
-                }
-                slice.p_h(&e, dc, below)
-            })
-            .unzip();
-        ph.insert((a, j), cols);
-    }
+                    slice.p_h(&e, dc, below)
+                })
+                .unzip();
+            ((a, j), cols)
+        })
+        .collect();
+    lap(4, &mut clock);
 
     // D^a for all classes of degree a at once: a matrix whose columns are the classes of degree
-    // a, by length then index, carried down the lengths of degree a + 1 from the top.
-    let mut out = BTreeMap::new();
-    let mut ranks: BTreeMap<(i32, u32), usize> = BTreeMap::new();
-    for a in a_lo..=max_s {
-        // Source classes by length then index, and where each length starts.
-        let mut first: BTreeMap<u32, usize> = BTreeMap::new();
-        let mut n_src = 0;
-        for j in 0..=k_of(a) {
-            first.insert(j, n_src);
-            n_src += slices.get(&(a, j)).map_or(0, |s| s.classes.len());
-        }
-        let k_top = k_of(a + 1);
-        // y[jt]: rows are the cochains of (a + 1, jt), each a set of source classes.
-        let mut y: Vec<Vec<Bits>> = (0..=k_top + 1)
-            .map(|jt| vec![zeros(n_src); dim(a + 1, jt)])
-            .collect();
-        // Rows of D by target class: (length, index) to a set of source classes.
-        let mut d_rows: Vec<Bits> = Vec::new();
-        // y = δ'(i x) for every class x.
-        for j in 0..=k_of(a) {
-            let Some(slice) = slices.get(&(a, j)) else {
-                continue;
-            };
-            for (c, x) in slice.classes.iter().enumerate() {
-                let col = first[&j] + c;
-                for i in ones(x) {
-                    for (jt, t) in column(a, j, i) {
-                        if jt < j {
-                            flip(&mut y[jt as usize][t], col);
+    // a, by length then index, carried down the lengths of degree a + 1 from the top. Returns the
+    // rank of D^a restricted to sources of length at most j, for each j.
+    let ranks: Vec<Vec<usize>> = (a_lo..=max_s)
+        .into_maybe_par_iter()
+        .map(|a| {
+            // Source classes by length then index, and where each length starts.
+            let mut first: BTreeMap<u32, usize> = BTreeMap::new();
+            let mut n_src = 0;
+            for j in 0..=k_of(a) {
+                first.insert(j, n_src);
+                n_src += slices.get(&(a, j)).map_or(0, |s| s.classes.len());
+            }
+            let k_top = k_of(a + 1);
+            // y[jt]: rows are the cochains of (a + 1, jt), each a set of source classes.
+            let mut y: Vec<Vec<Bits>> = (0..=k_top + 1)
+                .map(|jt| vec![zeros(n_src); dim(a + 1, jt)])
+                .collect();
+            // Rows of D by target class: (length, index) to a set of source classes.
+            let mut d_rows: Vec<Bits> = Vec::new();
+            // y = δ'(i x) for every class x.
+            for j in 0..=k_of(a) {
+                let Some(slice) = slices.get(&(a, j)) else {
+                    continue;
+                };
+                for (c, x) in slice.classes.iter().enumerate() {
+                    let col = first[&j] + c;
+                    for i in ones(x) {
+                        for (jt, t) in column(a, j, i) {
+                            if jt < j {
+                                flip(&mut y[jt as usize][t], col);
+                            }
                         }
                     }
                 }
             }
-        }
-        // From the top length down: collect p(y), and send δ'(h y) to the lower lengths.
-        for jt in (0..=k_top).rev() {
-            let Some((p_cols, h_cols)) = ph.get(&(a + 1, jt)) else {
-                continue;
-            };
-            let n_cls = slices[&(a + 1, jt)].classes.len();
-            let mut p_rows = vec![zeros(n_src); n_cls];
-            let mut h_rows = vec![zeros(n_src); dim(a, jt)];
-            let rows = std::mem::take(&mut y[jt as usize]);
-            for (c, row) in rows.iter().enumerate() {
-                if low(row).is_none() {
+            // From the top length down: collect p(y), and send δ'(h y) to the lower lengths.
+            for jt in (0..=k_top).rev() {
+                let Some((p_cols, h_cols)) = ph.get(&(a + 1, jt)) else {
                     continue;
-                }
-                for t in ones(&p_cols[c]) {
-                    add(&mut p_rows[t], row);
-                }
-                for t in ones(&h_cols[c]) {
-                    add(&mut h_rows[t], row);
-                }
-            }
-            for (i, row) in h_rows.iter().enumerate() {
-                if low(row).is_none() {
-                    continue;
-                }
-                for (jn, t) in column(a, jt, i) {
-                    if jn < jt {
-                        add(&mut y[jn as usize][t], row);
+                };
+                let n_cls = slices[&(a + 1, jt)].classes.len();
+                let mut p_rows = vec![zeros(n_src); n_cls];
+                let mut h_rows = vec![zeros(n_src); dim(a, jt)];
+                let rows = std::mem::take(&mut y[jt as usize]);
+                for (c, row) in rows.iter().enumerate() {
+                    if low(row).is_none() {
+                        continue;
+                    }
+                    for t in ones(&p_cols[c]) {
+                        add(&mut p_rows[t], row);
+                    }
+                    for t in ones(&h_cols[c]) {
+                        add(&mut h_rows[t], row);
                     }
                 }
-            }
-            d_rows.extend(p_rows);
-        }
-        // Columns of D, by source class, over the target classes.
-        let n_tgt = d_rows.len();
-        let mut d_cols = vec![zeros(n_tgt); n_src];
-        for (t, row) in d_rows.iter().enumerate() {
-            for c in ones(row) {
-                flip(&mut d_cols[c], t);
-            }
-        }
-        // Rank of D^a restricted to sources of length at most j, incrementally.
-        let mut table: FxHashMap<usize, Bits> = FxHashMap::default();
-        let mut rank = 0;
-        for j in 0..=k_of(a) {
-            let end = first.range(j + 1..).next().map_or(n_src, |(_, &e)| e);
-            for mut col in d_cols[first[&j]..end].iter().cloned() {
-                while let Some(l) = low(&col) {
-                    match table.get(&l) {
-                        Some(v) => add(&mut col, v),
-                        None => break,
+                for (i, row) in h_rows.iter().enumerate() {
+                    if low(row).is_none() {
+                        continue;
+                    }
+                    for (jn, t) in column(a, jt, i) {
+                        if jn < jt {
+                            add(&mut y[jn as usize][t], row);
+                        }
                     }
                 }
-                if let Some(l) = low(&col) {
-                    table.insert(l, col);
-                    rank += 1;
+                d_rows.extend(p_rows);
+            }
+            // Columns of D, by source class, over the target classes.
+            let n_tgt = d_rows.len();
+            let mut d_cols = vec![zeros(n_tgt); n_src];
+            for (t, row) in d_rows.iter().enumerate() {
+                for c in ones(row) {
+                    flip(&mut d_cols[c], t);
                 }
             }
-            ranks.insert((a, j), rank);
-        }
-    }
+            // Rank of D^a restricted to sources of length at most j, incrementally.
+            let mut table: FxHashMap<usize, Bits> = FxHashMap::default();
+            let mut rank = 0;
+            let mut out = Vec::new();
+            for j in 0..=k_of(a) {
+                let end = first.range(j + 1..).next().map_or(n_src, |(_, &e)| e);
+                for mut col in d_cols[first[&j]..end].iter().cloned() {
+                    while let Some(l) = low(&col) {
+                        match table.get(&l) {
+                            Some(v) => add(&mut col, v),
+                            None => break,
+                        }
+                    }
+                    if let Some(l) = low(&col) {
+                        table.insert(l, col);
+                        rank += 1;
+                    }
+                }
+                out.push(rank);
+            }
+            out
+        })
+        .collect();
+    lap(5, &mut clock);
+
     let rank = |a: i32, k: u32| -> usize {
         ranks
-            .range((a, 0)..=(a, k))
-            .next_back()
-            .map_or(0, |(_, &r)| r)
+            .get(index(a))
+            .map_or(0, |r| r[(k as usize).min(r.len() - 1)])
     };
+    let mut out = BTreeMap::new();
     for k in 0..=max_s {
         if u > untwisted_max_weight(max_n, max_s, k) {
             continue;
@@ -515,7 +623,8 @@ mod tests {
     use super::*;
     use crate::algebraic_novikov::{ctau_e2_untwisted_on, unit_module, untwisted_backbone_range};
 
-    /// The transfer reproduces $\mathrm{Ext}_P(Q)$.
+    /// The transfer reproduces $\mathrm{Ext}_P(Q)$, from the backbone and from the conjugated
+    /// backbone with the action tabulated or computed block by block.
     #[test]
     fn matches_direct() {
         let (max_n, max_s) = (40, 20);
@@ -531,6 +640,10 @@ mod tests {
             crate::conjugate::ConjugatedBackbone::compute(&res, max_s, (max_n + max_s) / 2);
         assert_eq!(
             ext_q_by_v0_transfer_conjugated(&res, &conjugated, max_n, max_s, 1),
+            direct
+        );
+        assert_eq!(
+            transfer(&res, max_n, max_s, 1, Some(&conjugated), true),
             direct
         );
     }
