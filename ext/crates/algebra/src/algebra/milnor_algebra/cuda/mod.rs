@@ -474,7 +474,8 @@ impl Launch<'_> {
             let local = a.prod_r.len() as u32;
             let base = self.tables.basis_start[p.s_degree as usize];
             a.term_gei
-                .extend(p.term_indices.iter().map(|&t| base + t as u32));
+                .reserve(p.term_indices.len());
+            p.term_indices.for_each(|t| a.term_gei.push(base + t as u32));
             a.term_prod
                 .extend(std::iter::repeat_n(local, p.term_indices.len()));
             a.prod_r.push(self.r_bits[i]);

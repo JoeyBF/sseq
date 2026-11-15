@@ -1743,7 +1743,7 @@ pub mod lift_batch {
             return None;
         }
         let out_t = t - shift;
-        type Blocks = Arc<Vec<(i32, Arc<[usize]>, usize)>>;
+        type Blocks = Arc<Vec<(i32, batch::Terms, usize)>>;
         let mut blocks: HashMap<(i32, usize), Blocks> = HashMap::new();
         let mut products = vec![];
         // A row's terms are ascending, so a cursor decodes them without a search per term.
@@ -1757,14 +1757,20 @@ pub mod lift_batch {
                 let w = blocks
                     .entry((og.generator_degree, og.generator_index))
                     .or_insert_with(|| {
-                        let fw = f_prev(og.generator_degree, og.generator_index);
+                        // f(w) is kept once and its blocks read as bit ranges of it: listing its set
+                        // bits (about a fifth of them) as indices took ~14 times its memory.
+                        let fw = Arc::new(f_prev(og.generator_degree, og.generator_index));
                         let fw_degree = og.generator_degree - shift;
                         Arc::new(
                             target
                                 .iter_slices(fw_degree, fw.as_slice())
                                 .filter_map(|(h_deg, h_idx, op_deg, slice)| {
-                                    let ts: Arc<[usize]> =
-                                        slice.iter_nonzero().map(|(i, _)| i).collect();
+                                    let start = target.generator_offset(fw_degree, h_deg, h_idx);
+                                    let ts = batch::Terms::bits(
+                                        Arc::clone(&fw),
+                                        start,
+                                        start + slice.len(),
+                                    );
                                     (!ts.is_empty()).then(|| {
                                         (op_deg, ts, target.generator_offset(out_t, h_deg, h_idx))
                                     })
@@ -1778,7 +1784,7 @@ pub mod lift_batch {
                         r_degree: og.operation_degree,
                         r_idx: og.operation_index,
                         s_degree: *s_degree,
-                        term_indices: Arc::clone(ts),
+                        term_indices: ts.clone(),
                         row,
                         out_offset: *out_offset,
                     });

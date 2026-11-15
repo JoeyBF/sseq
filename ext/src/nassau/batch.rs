@@ -192,7 +192,7 @@ fn extract(
                 r_degree: op_gen.operation_degree,
                 r_idx: op_gen.operation_index,
                 s_degree: input_degree - block.gen_deg,
-                term_indices,
+                term_indices: term_indices.into(),
                 row: r - start,
                 out_offset: output_start,
             });

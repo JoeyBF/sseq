@@ -13,6 +13,8 @@
 
 use std::sync::Arc;
 
+use fp::vector::FpVector;
+
 use super::{MilnorAlgebra, PPart, antidiagonal};
 use crate::algebra::Algebra;
 
@@ -31,9 +33,89 @@ pub struct BatchProduct {
     pub s_degree: i32,
     /// Shared, because one list usually serves many products: it depends only on the element
     /// being multiplied, not on the operation or the row.
-    pub term_indices: Arc<[usize]>,
+    pub term_indices: Terms,
     pub row: usize,
     pub out_offset: usize,
+}
+
+/// The basis elements of a product's element `s`: listed, or the set bits of a range of a vector.
+///
+/// Either way it is shared, because one element usually serves many products. A chain map's value
+/// on a generator is dense (about a fifth of its bits set at the n400 ring's stems), so listing its
+/// set bits as indices takes ~14 times the memory of the bits themselves; [`Terms::Bits`] keeps the
+/// bits and reads them where the products are evaluated.
+#[derive(Clone, Debug)]
+pub enum Terms {
+    Indices(Arc<[usize]>),
+    /// The set bits of `vec[start..end]`, as indices from `start`; `len` of them.
+    Bits {
+        vec: Arc<FpVector>,
+        start: usize,
+        end: usize,
+        len: usize,
+    },
+}
+
+impl Terms {
+    /// The set bits of `vec[start..end]`.
+    pub fn bits(vec: Arc<FpVector>, start: usize, end: usize) -> Self {
+        let len = vec.slice(start, end).iter_nonzero().count();
+        Self::Bits {
+            vec,
+            start,
+            end,
+            len,
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        match self {
+            Self::Indices(v) => v.len(),
+            Self::Bits { len, .. } => *len,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Calls `f` on each index, in ascending order.
+    pub fn for_each(&self, mut f: impl FnMut(usize)) {
+        match self {
+            Self::Indices(v) => v.iter().for_each(|&i| f(i)),
+            Self::Bits {
+                vec, start, end, ..
+            } => vec.slice(*start, *end).iter_nonzero().for_each(|(i, _)| f(i)),
+        }
+    }
+}
+
+/// Terms are equal when they list the same indices, however they are stored.
+impl PartialEq for Terms {
+    fn eq(&self, other: &Self) -> bool {
+        if self.len() != other.len() {
+            return false;
+        }
+        let (mut a, mut b) = (Vec::with_capacity(self.len()), Vec::with_capacity(other.len()));
+        self.for_each(|i| a.push(i));
+        other.for_each(|i| b.push(i));
+        a == b
+    }
+}
+
+impl Eq for Terms {}
+
+impl std::hash::Hash for Terms {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.len().hash(state);
+        self.for_each(|i| i.hash(state));
+    }
+}
+
+impl From<Arc<[usize]>> for Terms {
+    fn from(v: Arc<[usize]>) -> Self {
+        Self::Indices(v)
+    }
 }
 
 /// One block of output limbs, row-major.
@@ -193,7 +275,7 @@ pub fn cpu_multiply_batch(
             .basis_element_from_index(prod.r_degree, prod.r_idx)
             .p_part;
         let row = &mut limbs[prod.row * num_limbs..][..num_limbs];
-        for &ti in prod.term_indices.iter() {
+        prod.term_indices.for_each(|ti| {
             let s = algebra.basis_element_from_index(prod.s_degree, ti).p_part;
             antidiagonal::for_each_term(degree, r, s, |t: PPart| {
                 let idx = tables.rank(t, degree);
@@ -201,7 +283,7 @@ pub fn cpu_multiply_batch(
                     row[bit / 32] ^= 1 << (bit % 32);
                 }
             });
-        }
+        });
     }
     BatchOutput::from_limbs(limbs, num_limbs)
 }
@@ -301,7 +383,7 @@ pub(super) mod tests {
                     r_degree,
                     r_idx: rng.range(0, r_dim - 1),
                     s_degree,
-                    term_indices: terms.into(),
+                    term_indices: Arc::<[usize]>::from(terms).into(),
                     row,
                     out_offset: b * block,
                 });
@@ -318,6 +400,36 @@ pub(super) mod tests {
         algebra
     }
 
+    /// A product whose terms are the set bits of a range of a vector gives what the same terms
+    /// listed give.
+    #[test]
+    fn bit_terms_match_listed_terms() {
+        let max_degree = 60;
+        let algebra = algebra(max_degree);
+        let mut rng = TestRng::new(7);
+        let (products, width) = random_batch(&algebra, &mut rng, max_degree, 16, 3);
+        let as_bits: Vec<BatchProduct> = products
+            .iter()
+            .map(|p| {
+                // The terms as the set bits of a vector with a few unrelated bits before them.
+                let pad = 5;
+                let dim = algebra.dimension(p.s_degree);
+                let mut v = FpVector::new(fp::prime::TWO, pad + dim + 3);
+                v.set_entry(1, 1);
+                v.set_entry(pad + dim + 1, 1);
+                p.term_indices.for_each(|i| v.set_entry(pad + i, 1));
+                BatchProduct {
+                    term_indices: Terms::bits(Arc::new(v), pad, pad + dim),
+                    ..p.clone()
+                }
+            })
+            .collect();
+        assert_eq!(as_bits, products);
+        let want = cpu_multiply_batch(&algebra, width, None, 16, &products);
+        let got = cpu_multiply_batch(&algebra, width, None, 16, &as_bits);
+        assert_eq!(got.iter_rows().collect::<Vec<_>>(), want.iter_rows().collect::<Vec<_>>());
+    }
+
     /// The batch against one multiplication per term.
     #[test]
     fn cpu_batch_matches_multiply() {
@@ -331,9 +443,7 @@ pub(super) mod tests {
         for p in &products {
             let degree = p.r_degree + p.s_degree;
             let mut s = FpVector::new(TWO, algebra.dimension(p.s_degree));
-            for &i in p.term_indices.iter() {
-                s.set_entry(i, 1);
-            }
+            p.term_indices.for_each(|i| s.set_entry(i, 1));
             let mut prod = FpVector::new(TWO, algebra.dimension(degree));
             for (i, _) in s.iter_nonzero() {
                 algebra.multiply_basis_elements(
