@@ -7,7 +7,9 @@
 //! `CTAU_CONJUGATE=1` to read the conjugated backbone, computed here or loaded from
 //! `CTAU_CONJUGATED=<dir>`, with the action tabulated from Milnor matrices, or with
 //! `CTAU_PER_BLOCK=1` computed block by block and not kept, which is slower and leaner.
-//! `CTAU_TIMING=1` prints the time of each phase, the size of the table and the peak memory.
+//! `CTAU_TIMING=1` prints the time of each phase, the size of the table, the peak memory and what
+//! the largest weight held at once. `CTAU_WEIGHTS_AT_ONCE=<n>` computes at most `n` weights
+//! together, trading the parallelism across weights for memory.
 //! Prints the number of classes and the time of each method.
 use std::{sync::Arc, time::Instant};
 

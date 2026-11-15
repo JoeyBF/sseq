@@ -384,96 +384,111 @@ where
         let (tgt, _) = cochain_blocks(self.res, q_dim, a_out, u_out);
         let (src, total) = cochain_blocks(self.res, q_dim, a, u);
         let mut columns: Vec<Vec<u32>> = vec![Vec::new(); total];
+        // Each degree of generators owns a run of the columns, so the degrees build in parallel.
+        let mut parts: Vec<(i32, usize, &mut [Vec<u32>])> = Vec::with_capacity(src.len());
+        let mut rest: &mut [Vec<u32>] = &mut columns;
+        let mut taken = 0;
         for (t_i, &(src_off, gens)) in src.iter().enumerate() {
-            let t_i = t_i as i32;
-            let block = q_dim(u - t_i);
-            if block == 0 || gens == 0 {
-                continue;
-            }
-            // The operations any generator of this degree needs, each acted once per monomial.
-            let mut ops: Vec<PackedXi> = Vec::new();
-            let mut op_index: FxHashMap<PackedXi, usize> = FxHashMap::default();
-            let terms: Vec<Vec<(usize, &[(i32, u32)])>> = (0..gens)
-                .map(|i| {
-                    inverted
-                        .get(&(t_i, i as u32))
-                        .into_iter()
-                        .flatten()
-                        .filter(|(_, targets)| targets.iter().any(|&(t_l, _)| t_l <= u_out))
-                        .map(|(r, targets)| {
-                            let k = *op_index.entry(*r).or_insert_with(|| {
-                                ops.push(*r);
-                                ops.len() - 1
-                            });
-                            (k, targets.as_slice())
-                        })
-                        .collect()
-                })
-                .collect();
-            // The terms of each operation: the generator whose column it feeds and its targets.
-            let mut by_op: Vec<Vec<(usize, &[(i32, u32)])>> = vec![Vec::new(); ops.len()];
-            for (i, gen_terms) in terms.iter().enumerate() {
-                for &(k, targets) in gen_terms {
-                    by_op[k].push((i, targets));
+            let (_, tail) = rest.split_at_mut(src_off - taken);
+            let len = gens * q_dim(u - t_i as i32);
+            let (mine, tail) = tail.split_at_mut(len);
+            parts.push((t_i as i32, gens, mine));
+            rest = tail;
+            taken = src_off + len;
+        }
+        parts
+            .into_maybe_par_iter()
+            .for_each(|(t_i, gens, columns)| {
+                let block = q_dim(u - t_i);
+                if block == 0 || gens == 0 {
+                    return;
                 }
-            }
-            // Each operation's number in the table, and back.
-            let ids: Vec<u32> = ops.iter().map(|r| self.op_ids[r]).collect();
-            let filtered = layer.exact_length();
-            // Operation by operation, through the monomials it acts on nontrivially.
-            let d = u - t_i;
-            // Without a table, the block's own operations on the monomials it reads, numbered by
-            // their place in `ops`.
-            let own;
-            let (table, ids): (&ByOperation, Vec<u32>) = if self.per_block {
-                own = self.act_on_degree(d, block, &ops);
-                (&own, (0..ops.len() as u32).collect())
-            } else {
-                // A degree no build reads with any operation has no table.
-                let Some(table) = self.psi.get(d as usize) else {
-                    assert!(ops.is_empty(), "no coaction tabulated in degree {d}");
-                    continue;
-                };
-                (table, ids.clone())
-            };
-            let mut image: Vec<u32> = Vec::new();
-            for (k, &r) in ops.iter().enumerate() {
-                let d_r = d - xi_degree(r);
-                // The table may reach longer monomials than this build; they come last.
-                for (idx, gammas) in table.get(ids[k]) {
-                    if idx as usize >= block {
-                        break;
+                // The operations any generator of this degree needs, each acted once per monomial.
+                let mut ops: Vec<PackedXi> = Vec::new();
+                let mut op_index: FxHashMap<PackedXi, usize> = FxHashMap::default();
+                let terms: Vec<Vec<(usize, &[(i32, u32)])>> = (0..gens)
+                    .map(|i| {
+                        inverted
+                            .get(&(t_i, i as u32))
+                            .into_iter()
+                            .flatten()
+                            .filter(|(_, targets)| targets.iter().any(|&(t_l, _)| t_l <= u_out))
+                            .map(|(r, targets)| {
+                                let k = *op_index.entry(*r).or_insert_with(|| {
+                                    ops.push(*r);
+                                    ops.len() - 1
+                                });
+                                (k, targets.as_slice())
+                            })
+                            .collect()
+                    })
+                    .collect();
+                // The terms of each operation: the generator whose column it feeds and its targets.
+                let mut by_op: Vec<Vec<(usize, &[(i32, u32)])>> = vec![Vec::new(); ops.len()];
+                for (i, gen_terms) in terms.iter().enumerate() {
+                    for &(k, targets) in gen_terms {
+                        by_op[k].push((i, targets));
                     }
-                    let gammas = if filtered {
-                        let len = qmono_len(q.monomial(d, idx as usize));
-                        image.clear();
-                        image.extend(gammas.iter().copied().filter(|&g| {
-                            layer.on_length(qmono_len(q.monomial(d_r, g as usize)), len)
-                        }));
-                        &image[..]
-                    } else {
-                        gammas
+                }
+                // Each operation's number in the table, and back.
+                let ids: Vec<u32> = ops.iter().map(|r| self.op_ids[r]).collect();
+                let filtered = layer.exact_length();
+                // Operation by operation, through the monomials it acts on nontrivially.
+                let d = u - t_i;
+                // Without a table, the block's own operations on the monomials it reads, numbered by
+                // their place in `ops`.
+                let own;
+                let (table, ids): (&ByOperation, Vec<u32>) = if self.per_block {
+                    own = self.act_on_degree(d, block, &ops);
+                    (&own, (0..ops.len() as u32).collect())
+                } else {
+                    // A degree no build reads with any operation has no table.
+                    let Some(table) = self.psi.get(d as usize) else {
+                        assert!(ops.is_empty(), "no coaction tabulated in degree {d}");
+                        return;
                     };
-                    if gammas.is_empty() {
-                        continue;
-                    }
-                    for &(i, targets) in &by_op[k] {
-                        let col = &mut columns[src_off + i * block + idx as usize];
-                        for &(t_l, l) in targets {
-                            if t_l > u_out {
-                                continue;
+                    (table, ids.clone())
+                };
+                let mut image: Vec<u32> = Vec::new();
+                for (k, &r) in ops.iter().enumerate() {
+                    let d_r = d - xi_degree(r);
+                    // The table may reach longer monomials than this build; they come last.
+                    for (idx, gammas) in table.get(ids[k]) {
+                        if idx as usize >= block {
+                            break;
+                        }
+                        let gammas = if filtered {
+                            let len = qmono_len(q.monomial(d, idx as usize));
+                            image.clear();
+                            image.extend(gammas.iter().copied().filter(|&g| {
+                                layer.on_length(qmono_len(q.monomial(d_r, g as usize)), len)
+                            }));
+                            &image[..]
+                        } else {
+                            gammas
+                        };
+                        if gammas.is_empty() {
+                            continue;
+                        }
+                        for &(i, targets) in &by_op[k] {
+                            let col = &mut columns[i * block + idx as usize];
+                            for &(t_l, l) in targets {
+                                if t_l > u_out {
+                                    continue;
+                                }
+                                let (off, _) = tgt[t_l as usize];
+                                let tb = q_dim(u_out - t_l);
+                                col.extend(
+                                    gammas.iter().map(|&g| (off + l as usize * tb) as u32 + g),
+                                );
                             }
-                            let (off, _) = tgt[t_l as usize];
-                            let tb = q_dim(u_out - t_l);
-                            col.extend(gammas.iter().map(|&g| (off + l as usize * tb) as u32 + g));
                         }
                     }
                 }
-            }
-            for col in &mut columns[src_off..src_off + gens * block] {
-                cancel_pairs(col);
-            }
-        }
+                for col in columns.iter_mut() {
+                    cancel_pairs(col);
+                }
+            });
         columns
     }
 }
