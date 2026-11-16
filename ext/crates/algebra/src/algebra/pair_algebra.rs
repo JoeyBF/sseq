@@ -561,20 +561,25 @@ impl MilnorAlgebraInner<NoExterior> {
                     continue;
                 }
                 let degree_shift = (1 << k) + (1 << l) - 1;
+                let a_degree = r_degree + degree_shift - 1;
+                // The product is bilinear and every A(r, Y_{k, l}) has degree `a_degree`, so sum
+                // them over the terms r first and multiply once.
+                let mut a_y = FpVector::new(TWO, self.dimension(a_degree));
                 for (r_idx, c) in r.iter_nonzero() {
                     let r = self.basis_element_from_index(r_degree, r_idx);
-                    let a_degree = r_degree + degree_shift - 1;
-                    a_y_cached(self, r, k, l, |v| {
-                        self.multiply_element_by_element(
-                            result.copy(),
-                            coeff * c,
-                            a_degree,
-                            v.as_slice(),
-                            s_degree - degree_shift,
-                            vec.as_slice(),
-                        )
-                    });
+                    a_y_cached(self, r, k, l, |v| a_y.add(v, c));
                 }
+                if a_y.is_zero() {
+                    continue;
+                }
+                self.multiply_element_by_element(
+                    result.copy(),
+                    coeff,
+                    a_degree,
+                    a_y.as_slice(),
+                    s_degree - degree_shift,
+                    vec.as_slice(),
+                );
             }
         }
     }
