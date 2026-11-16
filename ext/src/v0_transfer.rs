@@ -374,10 +374,40 @@ fn slices_bytes(slices: &FxHashMap<u32, Slice>) -> usize {
 }
 
 /// The bytes p and h of the slices of a degree hold.
-fn ph_bytes(ph: &FxHashMap<u32, (Vec<Bits>, Vec<Bits>)>) -> usize {
+fn ph_bytes(ph: &FxHashMap<u32, (Sparse, Sparse)>) -> usize {
     ph.values()
-        .map(|(p, h)| p.iter().chain(h).map(|v| v.len() * 8).sum::<usize>())
+        .map(|(p, h)| 4 * (p.offsets.len() + p.data.len() + h.offsets.len() + h.data.len()))
         .sum()
+}
+
+/// Sparse vectors over $\mathbb{F}_2$, one after another: vector `i` has its ones at
+/// `data[offsets[i]..offsets[i + 1]]`.
+struct Sparse {
+    offsets: Vec<u32>,
+    data: Vec<u32>,
+}
+
+impl Default for Sparse {
+    fn default() -> Self {
+        Self {
+            offsets: vec![0],
+            data: Vec::new(),
+        }
+    }
+}
+
+impl Sparse {
+    /// Appends a vector with ones at `ones`.
+    fn push(&mut self, ones: impl Iterator<Item = usize>) {
+        self.data.extend(ones.map(|i| i as u32));
+        self.offsets
+            .push(u32::try_from(self.data.len()).expect("sparse vectors outgrew u32"));
+    }
+
+    /// The ones of vector `i`.
+    fn get(&self, i: usize) -> &[u32] {
+        &self.data[self.offsets[i] as usize..self.offsets[i + 1] as usize]
+    }
 }
 
 /// Row `t` of length `jt` of `y`, made as a zero vector of dimension `n` if it is not yet.
@@ -452,7 +482,6 @@ where
         let k = k_of(a);
         let mut src_dims = Vec::new();
         let src = positions(&stage.lengths(a, u, k), &mut src_dims);
-        let columns = stage.build_columns(a, u, k, &inverted[a as usize], (a + 1, u));
         let to = &targets[index(a + 1)].1;
         let mut out: Vec<Columns> = (0..=k)
             .map(|_| Columns {
@@ -460,11 +489,40 @@ where
                 data: Vec::new(),
             })
             .collect();
-        for (s, col) in src.iter().zip(columns) {
-            let c = &mut out[(s >> INDEX_BITS) as usize];
-            c.data.extend(col.iter().map(|&t| to[t as usize]));
-            c.offsets.push(c.data.len() as u32);
+        // Appends the column of each cochain in `range`, its terms read off `entries`, the
+        // cochain's place in its run above 32 bits and the target below.
+        let append = |out: &mut Vec<Columns>, range: std::ops::Range<usize>, entries: &[u64]| {
+            let mut e = 0;
+            for (c, &s) in src[range].iter().enumerate() {
+                let col = &mut out[(s >> INDEX_BITS) as usize];
+                while e < entries.len() && (entries[e] >> 32) as usize == c {
+                    col.data.push(to[entries[e] as u32 as usize]);
+                    e += 1;
+                }
+                col.offsets
+                    .push(u32::try_from(col.data.len()).expect("a slice's coboundary outgrew u32"));
+            }
+        };
+        // The degrees of generators a few at a time, in parallel, each appended in order, so
+        // that only those in flight hold their terms twice.
+        let blocks = stage.column_blocks(a, u, k);
+        let group = std::thread::available_parallelism().map_or(1, |n| n.get());
+        let mut next = 0;
+        for some in blocks.chunks(group) {
+            let parts: Vec<Vec<u64>> = some
+                .to_vec()
+                .into_maybe_par_iter()
+                .map(|(t_i, _, _)| {
+                    stage.block_entries(a, u, k, &inverted[a as usize], (a + 1, u), t_i)
+                })
+                .collect();
+            for (&(_, start, len), entries) in some.iter().zip(parts) {
+                append(&mut out, next..start, &[]);
+                append(&mut out, start..start + len, &entries);
+                next = start + len;
+            }
         }
+        append(&mut out, next..src.len(), &[]);
         out
     };
 
@@ -537,27 +595,28 @@ where
     let p_and_h = |a: i32,
                    delta: &[Columns],
                    slices: &FxHashMap<u32, Slice>|
-     -> FxHashMap<u32, (Vec<Bits>, Vec<Bits>)> {
+     -> FxHashMap<u32, (Sparse, Sparse)> {
         slices
             .iter()
             .collect::<Vec<_>>()
             .into_maybe_par_iter()
             .map(|(&j, slice)| {
                 let below = dim(a - 1, j);
-                let cols = (0..slice.dim)
-                    .map(|c| {
-                        let mut e = zeros(slice.dim);
-                        flip(&mut e, c);
-                        let mut dc = zeros(dim(a + 1, j));
-                        for (jt, t) in terms(&delta[j as usize], c) {
-                            if jt == j {
-                                flip(&mut dc, t);
-                            }
+                let (mut p, mut h) = (Sparse::default(), Sparse::default());
+                for c in 0..slice.dim {
+                    let mut e = zeros(slice.dim);
+                    flip(&mut e, c);
+                    let mut dc = zeros(dim(a + 1, j));
+                    for (jt, t) in terms(&delta[j as usize], c) {
+                        if jt == j {
+                            flip(&mut dc, t);
                         }
-                        slice.p_h(&e, dc, below)
-                    })
-                    .unzip();
-                (j, cols)
+                    }
+                    let (pc, hc) = slice.p_h(&e, dc, below);
+                    p.push(ones(&pc));
+                    h.push(ones(&hc));
+                }
+                (j, (p, h))
             })
             .collect()
     };
@@ -569,7 +628,7 @@ where
                    delta: &[Columns],
                    slices: &FxHashMap<u32, Slice>,
                    above: Option<&FxHashMap<u32, Slice>>,
-                   ph: &FxHashMap<u32, (Vec<Bits>, Vec<Bits>)>|
+                   ph: &FxHashMap<u32, (Sparse, Sparse)>|
      -> Vec<usize> {
         // Source classes by length then index, and where each length starts.
         let mut first: BTreeMap<u32, usize> = BTreeMap::new();
@@ -625,10 +684,12 @@ where
                         if low(row).is_none() {
                             continue;
                         }
-                        for t in ones(&p_cols[c]) {
+                        for &t in p_cols.get(c) {
+                            let t = t as usize;
                             add(&mut p_rows[t], row);
                         }
-                        for t in ones(&h_cols[c]) {
+                        for &t in h_cols.get(c) {
+                            let t = t as usize;
                             add(h_rows[t].get_or_insert_with(|| zeros(n)), row);
                         }
                     }
