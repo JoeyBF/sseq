@@ -51,8 +51,11 @@ pub struct SecondaryComposite<A: PairAlgebra> {
     target: Arc<FreeModule<A>>,
     degree: i32,
     /// The component of the map on the R_B portion.
-    /// gen_deg -> gen_idx -> coefficient
-    composite: BiVec<Vec<A::Element>>,
+    /// gen_deg -> gen_idx -> coefficient, `None` when zero.
+    ///
+    /// A composite hits few of the target's generators, and a pair element is many vectors over
+    /// the algebra, so the zero ones are not allocated.
+    composite: BiVec<Vec<Option<A::Element>>>,
 }
 
 impl<A: PairAlgebra> SecondaryComposite<A> {
@@ -61,7 +64,6 @@ impl<A: PairAlgebra> SecondaryComposite<A> {
     }
 
     pub fn new(target: Arc<FreeModule<A>>, degree: i32, hit_generator: bool) -> Self {
-        let algebra = target.algebra();
         let min_degree = target.min_degree();
 
         let mut composite = BiVec::with_capacity(min_degree, degree);
@@ -70,7 +72,7 @@ impl<A: PairAlgebra> SecondaryComposite<A> {
         for t_ in min_degree..end {
             let num_gens = target.number_of_gens_in_degree(t_);
             let mut c = Vec::with_capacity(num_gens);
-            c.resize_with(num_gens, || algebra.new_pair_element(degree - t_));
+            c.resize_with(num_gens, || None);
             composite.push(c);
         }
 
@@ -83,10 +85,15 @@ impl<A: PairAlgebra> SecondaryComposite<A> {
 
     pub fn to_bytes(&self, buffer: &mut impl io::Write) -> io::Result<()> {
         let algebra = self.target.algebra();
-        for composites in self.composite.iter() {
+        for (gen_deg, composites) in self.composite.iter_enum() {
             buffer.write_u64::<LittleEndian>(composites.len() as u64)?;
+            // Zero elements are written out in full, keeping the format dense.
+            let mut zero = None;
             for composite in composites {
-                algebra.element_to_bytes(composite, buffer)?;
+                let elt = composite.as_ref().unwrap_or_else(|| {
+                    zero.get_or_insert_with(|| algebra.new_pair_element(self.degree - gen_deg))
+                });
+                algebra.element_to_bytes(elt, buffer)?;
             }
         }
         Ok(())
@@ -107,7 +114,8 @@ impl<A: PairAlgebra> SecondaryComposite<A> {
             let num_gens = buffer.read_u64::<LittleEndian>()? as usize;
             let mut c = Vec::with_capacity(num_gens);
             for _ in 0..num_gens {
-                c.push(algebra.element_from_bytes(degree - t, buffer)?);
+                let elt = algebra.element_from_bytes(degree - t, buffer)?;
+                c.push((!A::element_is_zero(&elt)).then_some(elt));
             }
             composite.push(c);
         }
@@ -121,7 +129,7 @@ impl<A: PairAlgebra> SecondaryComposite<A> {
 
     pub fn finalize(&mut self) {
         for r in self.composite.iter_mut() {
-            for r in r.iter_mut() {
+            for r in r.iter_mut().flatten() {
                 A::finalize_element(r);
             }
         }
@@ -160,8 +168,10 @@ impl<A: PairAlgebra> SecondaryComposite<A> {
                 if slice2.is_zero() {
                     continue;
                 }
+                let degree = self.degree;
                 algebra.sigma_multiply(
-                    &mut self.composite[gen_deg2][gen_idx2],
+                    self.composite[gen_deg2][gen_idx2]
+                        .get_or_insert_with(|| algebra.new_pair_element(degree - gen_deg2)),
                     coeff,
                     op_deg1,
                     slice1,
@@ -177,6 +187,9 @@ impl<A: PairAlgebra> SecondaryComposite<A> {
         for (gen_deg, row) in self.composite.iter_enum() {
             let module_op_deg = self.degree - gen_deg;
             for (gen_idx, c) in row.iter().enumerate() {
+                let Some(c) = c else {
+                    continue;
+                };
                 if gen_deg > self.target.max_computed_degree() {
                     // If we are resolving up to a stem then the target might be missing some
                     // degrees. This is fine but we want to assert that c is zero.
