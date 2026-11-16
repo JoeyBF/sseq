@@ -97,7 +97,7 @@ use crate::{
     MilnorAlgebra,
     milnor_algebra::{
         MilnorAlgebraInner, MilnorBasisElement as MilnorElt, NoExterior, PPart, PPartAllocation,
-        PPartMultiplier,
+        for_each_term_mod4,
     },
 };
 
@@ -239,18 +239,14 @@ impl PairAlgebra for MilnorAlgebraInner<NoExterior> {
             }
 
             // Now the product terms
-            let mut multiplier = PPartMultiplier::<true>::new_from_allocation(
-                TWO,
-                r.p_part,
-                s.p_part,
-                allocation,
-                0,
-                r.degree + s.degree,
-            );
-
+            let degree = r.degree + s.degree;
             // coeff should always be 1, so no need to optimize the even case.
-            while let Some(c) = multiplier.next() {
-                let idx = self.basis_element_to_index(&multiplier.ans);
+            for_each_term_mod4(degree, r.p_part, s.p_part, |p_part, c| {
+                let idx = self.basis_element_to_index(&MilnorElt {
+                    q_part: 0,
+                    p_part,
+                    degree,
+                });
                 let c = c * coeff;
                 // TODO: optimize
                 if c == 2 {
@@ -262,8 +258,8 @@ impl PairAlgebra for MilnorAlgebraInner<NoExterior> {
                     result.ones.set_entry(idx, c & 1);
                     result.twos.add_basis_element(idx, (c >> 1) & 1);
                 }
-            }
-            multiplier.into_allocation()
+            });
+            allocation
         });
     }
 

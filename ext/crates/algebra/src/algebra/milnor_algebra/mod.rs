@@ -27,6 +27,7 @@ mod seqno;
 mod shape;
 mod subalgebra;
 
+pub(crate) use antidiagonal::for_each_term_mod4;
 pub use basis_element::MilnorBasisElement;
 pub use kind::SteenrodKind;
 pub use multiplication::{PPartAllocation, PPartMultiplier, next_disjoint};
