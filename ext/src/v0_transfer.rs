@@ -299,7 +299,15 @@ static TIMING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::ne
 static LARGEST: std::sync::Mutex<([usize; 4], i32)> = std::sync::Mutex::new(([0; 4], 0));
 
 /// The phases of [`PHASES`]: tabulating the action, then the steps of [`weight`].
-const PHASE_NAMES: [&str; 6] = ["tabulate", "cochains", "build", "slices", "p and h", "D"];
+const PHASE_NAMES: [&str; 7] = [
+    "tabulate",
+    "cochains",
+    "build",
+    "slices",
+    "p and h",
+    "D",
+    "of which D's rank",
+];
 
 /// The field `name` of `/proc/self/status`, in kB, or 0 where there is none.
 fn memory(name: &str) -> u64 {
@@ -374,40 +382,10 @@ fn slices_bytes(slices: &FxHashMap<u32, Slice>) -> usize {
 }
 
 /// The bytes p and h of the slices of a degree hold.
-fn ph_bytes(ph: &FxHashMap<u32, (Sparse, Sparse)>) -> usize {
+fn ph_bytes(ph: &FxHashMap<u32, (Vec<Bits>, Vec<Bits>)>) -> usize {
     ph.values()
-        .map(|(p, h)| 4 * (p.offsets.len() + p.data.len() + h.offsets.len() + h.data.len()))
+        .map(|(p, h)| p.iter().chain(h).map(|v| v.len() * 8).sum::<usize>())
         .sum()
-}
-
-/// Sparse vectors over $\mathbb{F}_2$, one after another: vector `i` has its ones at
-/// `data[offsets[i]..offsets[i + 1]]`.
-struct Sparse {
-    offsets: Vec<u32>,
-    data: Vec<u32>,
-}
-
-impl Default for Sparse {
-    fn default() -> Self {
-        Self {
-            offsets: vec![0],
-            data: Vec::new(),
-        }
-    }
-}
-
-impl Sparse {
-    /// Appends a vector with ones at `ones`.
-    fn push(&mut self, ones: impl Iterator<Item = usize>) {
-        self.data.extend(ones.map(|i| i as u32));
-        self.offsets
-            .push(u32::try_from(self.data.len()).expect("sparse vectors outgrew u32"));
-    }
-
-    /// The ones of vector `i`.
-    fn get(&self, i: usize) -> &[u32] {
-        &self.data[self.offsets[i] as usize..self.offsets[i + 1] as usize]
-    }
 }
 
 /// Row `t` of length `jt` of `y`, made as a zero vector of dimension `n` if it is not yet.
@@ -595,28 +573,27 @@ where
     let p_and_h = |a: i32,
                    delta: &[Columns],
                    slices: &FxHashMap<u32, Slice>|
-     -> FxHashMap<u32, (Sparse, Sparse)> {
+     -> FxHashMap<u32, (Vec<Bits>, Vec<Bits>)> {
         slices
             .iter()
             .collect::<Vec<_>>()
             .into_maybe_par_iter()
             .map(|(&j, slice)| {
                 let below = dim(a - 1, j);
-                let (mut p, mut h) = (Sparse::default(), Sparse::default());
-                for c in 0..slice.dim {
-                    let mut e = zeros(slice.dim);
-                    flip(&mut e, c);
-                    let mut dc = zeros(dim(a + 1, j));
-                    for (jt, t) in terms(&delta[j as usize], c) {
-                        if jt == j {
-                            flip(&mut dc, t);
+                let cols = (0..slice.dim)
+                    .map(|c| {
+                        let mut e = zeros(slice.dim);
+                        flip(&mut e, c);
+                        let mut dc = zeros(dim(a + 1, j));
+                        for (jt, t) in terms(&delta[j as usize], c) {
+                            if jt == j {
+                                flip(&mut dc, t);
+                            }
                         }
-                    }
-                    let (pc, hc) = slice.p_h(&e, dc, below);
-                    p.push(ones(&pc));
-                    h.push(ones(&hc));
-                }
-                (j, (p, h))
+                        slice.p_h(&e, dc, below)
+                    })
+                    .unzip();
+                (j, cols)
             })
             .collect()
     };
@@ -628,7 +605,7 @@ where
                    delta: &[Columns],
                    slices: &FxHashMap<u32, Slice>,
                    above: Option<&FxHashMap<u32, Slice>>,
-                   ph: &FxHashMap<u32, (Sparse, Sparse)>|
+                   ph: &FxHashMap<u32, (Vec<Bits>, Vec<Bits>)>|
      -> Vec<usize> {
         // Source classes by length then index, and where each length starts.
         let mut first: BTreeMap<u32, usize> = BTreeMap::new();
@@ -684,12 +661,10 @@ where
                         if low(row).is_none() {
                             continue;
                         }
-                        for &t in p_cols.get(c) {
-                            let t = t as usize;
+                        for t in ones(&p_cols[c]) {
                             add(&mut p_rows[t], row);
                         }
-                        for &t in h_cols.get(c) {
-                            let t = t as usize;
+                        for t in ones(&h_cols[c]) {
                             add(h_rows[t].get_or_insert_with(|| zeros(n)), row);
                         }
                     }
@@ -714,6 +689,7 @@ where
                 }
             }
         }
+        let mut rank_clock = std::time::Instant::now();
         // Rank of D^a restricted to sources of length at most j, incrementally.
         let mut table: FxHashMap<usize, Bits> = FxHashMap::default();
         let mut rank = 0;
@@ -734,6 +710,7 @@ where
             }
             out.push(rank);
         }
+        lap(6, &mut rank_clock);
         out
     };
 

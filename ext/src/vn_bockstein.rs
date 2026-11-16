@@ -519,9 +519,38 @@ where
                 }
             }
         }
-        cancel_pairs(&mut out);
-        out
+        group_by_column(out, gens * block)
     }
+}
+
+/// Sorts terms packed as a column below `columns` above 32 bits and a target below, and removes
+/// those that occur an even number of times: a counting sort by column, then a sort of each
+/// column's few targets, which is cheaper than sorting all the terms at once.
+fn group_by_column(terms: Vec<u64>, columns: usize) -> Vec<u64> {
+    let mut starts = vec![0u32; columns + 1];
+    for &t in &terms {
+        starts[(t >> 32) as usize + 1] += 1;
+    }
+    for c in 0..columns {
+        starts[c + 1] += starts[c];
+    }
+    let mut targets = vec![0u32; terms.len()];
+    let mut next = starts.clone();
+    for &t in &terms {
+        let c = (t >> 32) as usize;
+        targets[next[c] as usize] = t as u32;
+        next[c] += 1;
+    }
+    drop(terms);
+    let mut out = Vec::with_capacity(targets.len());
+    let mut column = Vec::new();
+    for c in 0..columns {
+        column.clear();
+        column.extend_from_slice(&targets[starts[c] as usize..starts[c + 1] as usize]);
+        cancel_pairs(&mut column);
+        out.extend(column.iter().map(|&t| (c as u64) << 32 | t as u64));
+    }
+    out
 }
 
 /// Sorts `v` and removes the entries that occur an even number of times.
