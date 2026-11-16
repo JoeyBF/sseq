@@ -17,7 +17,13 @@ use crate::{Algebra, combinatorics};
 
 type HashMap<K, V> = hashbrown::HashMap<K, V, std::hash::BuildHasherDefault<FxHasher>>;
 
-use std::io;
+use std::{
+    io,
+    sync::{
+        Arc, LazyLock, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
+};
 
 /// A lift of an algebra to a split pair algebra. See module introduction for more.
 // We can't use `enum_dispatch` here because of the associated type.
@@ -212,6 +218,260 @@ impl PairAlgebra for MilnorAlgebraInner<NoExterior> {
         #[cfg(debug_assertions)]
         assert_eq!(r_degree + s_degree, result.degree);
 
+        // The cached terms are those of the product with coefficient 1, which is the only
+        // coefficient the composites pass.
+        if coeff != 1 || !*SIGMA_CACHE_ENABLED {
+            self.sigma_multiply_basis_direct(result, coeff, r_degree, r_idx, s_degree, s_idx);
+            return;
+        }
+        let key = (r_degree, r_idx as u32, s_degree, s_idx as u32);
+        let terms = self.sigma_cache.get(key).unwrap_or_else(|| {
+            let degree = r_degree + s_degree;
+            let mut scratch = self
+                .sigma_cache
+                .take_scratch(degree)
+                .unwrap_or_else(|| self.new_pair_element(degree));
+            self.sigma_multiply_basis_direct(&mut scratch, 1, r_degree, r_idx, s_degree, s_idx);
+            let terms = SigmaCache::terms(&scratch);
+            SigmaCache::clear_terms(&mut scratch, &terms);
+            self.sigma_cache.put_scratch(degree, scratch);
+            self.sigma_cache.insert(key, Arc::clone(&terms));
+            terms
+        });
+        SigmaCache::add_terms(result, &terms);
+    }
+
+    fn a_multiply(
+        &self,
+        result: FpSliceMut,
+        coeff: u32,
+        r_degree: i32,
+        r: FpSlice<'_>,
+        s_degree: i32,
+        s: &Self::Element,
+    ) {
+        self.a_multiply_impl(result, coeff, r_degree, r, s_degree, s);
+    }
+
+    fn element_to_bytes(&self, elt: &Self::Element, buffer: &mut impl io::Write) -> io::Result<()> {
+        elt.twos.to_bytes(buffer)?;
+        for row in &elt.ys {
+            for v in row {
+                v.to_bytes(buffer)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn element_from_bytes(
+        &self,
+        degree: i32,
+        buffer: &mut impl io::Read,
+    ) -> io::Result<Self::Element> {
+        let p = self.prime();
+        assert_eq!(p, TWO);
+
+        let max_k = if degree == 0 {
+            0
+        } else {
+            fp::prime::log2(degree as usize) + 1
+        };
+
+        let twos = FpVector::from_bytes(p, self.dimension(degree), buffer)?;
+
+        let mut ys = Vec::with_capacity(max_k);
+        for k in 0..max_k {
+            let rem_degree = degree as usize + 1 - (1 << k);
+            let max_l = fp::prime::log2(rem_degree) + 1;
+            let mut row = Vec::with_capacity(max_l);
+            for l in 0..max_l {
+                row.push(FpVector::from_bytes(
+                    p,
+                    self.dimension((rem_degree - (1 << l)) as i32),
+                    buffer,
+                )?);
+            }
+            ys.push(row);
+        }
+
+        Ok(MilnorPairElement {
+            ones: FpVector::new(p, 0),
+            twos,
+            ys,
+            #[cfg(debug_assertions)]
+            degree,
+        })
+    }
+}
+
+/// Whether [`SigmaCache`] is used. `EXT_SIGMA_CACHE=0` turns it off, to compare against.
+static SIGMA_CACHE_ENABLED: LazyLock<bool> =
+    LazyLock::new(|| std::env::var("EXT_SIGMA_CACHE").as_deref() != Ok("0"));
+
+/// The most products [`SigmaCache`] keeps, from `EXT_SIGMA_CACHE_MAX`; unbounded by default.
+static SIGMA_CACHE_MAX: LazyLock<usize> = LazyLock::new(|| {
+    std::env::var("EXT_SIGMA_CACHE_MAX")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(usize::MAX)
+});
+
+/// The number of shards of [`SigmaCache`]. More shards make two threads less likely to want the
+/// same lock at once.
+const SIGMA_SHARDS: usize = 256;
+
+/// One shard of [`SigmaCache`], on cache lines of its own so that taking one shard's lock does not
+/// stall threads using its neighbours.
+#[repr(align(128))]
+#[derive(Default)]
+struct SigmaShard(Mutex<HashMap<(i32, u32, i32, u32), Arc<[u64]>>>);
+
+/// The terms of products of pairs of basis elements in the pair algebra, keyed by the two basis
+/// elements.
+///
+/// Building a secondary composite multiplies the same pairs of basis elements over and over, from
+/// different generators, and a product is a few dozen Milnor products. A product's terms are
+/// encoded as `u64`s: a coefficient mod 4 of the product part is `KIND_MOD4 | c << 32 | idx`, and
+/// a nonzero entry of `ys[i][j]` is `KIND_Y | i << 40 | j << 32 | idx`.
+pub(crate) struct SigmaCache {
+    shards: Box<[SigmaShard]>,
+    len: AtomicUsize,
+    /// Zero pair elements by degree, to compute missing products into without allocating.
+    scratch: Box<[ScratchShard]>,
+}
+
+/// One shard of [`SigmaCache::scratch`], padded like [`SigmaShard`].
+#[repr(align(128))]
+#[derive(Default)]
+struct ScratchShard(Mutex<HashMap<i32, Vec<MilnorPairElement>>>);
+
+const KIND_MOD4: u64 = 0;
+const KIND_Y: u64 = 1 << 63;
+
+impl Default for SigmaCache {
+    fn default() -> Self {
+        Self {
+            shards: (0..SIGMA_SHARDS).map(|_| SigmaShard::default()).collect(),
+            len: AtomicUsize::new(0),
+            scratch: (0..SIGMA_SHARDS).map(|_| ScratchShard::default()).collect(),
+        }
+    }
+}
+
+impl SigmaCache {
+    /// The shard holding `key`.
+    fn shard(
+        &self,
+        key: &(i32, u32, i32, u32),
+    ) -> &Mutex<HashMap<(i32, u32, i32, u32), Arc<[u64]>>> {
+        let mut hasher = FxHasher::default();
+        key.hash(&mut hasher);
+        &self.shards[(hasher.finish() >> 32) as usize % SIGMA_SHARDS].0
+    }
+
+    /// The cached terms of the product keyed by `key`, if any.
+    fn get(&self, key: (i32, u32, i32, u32)) -> Option<Arc<[u64]>> {
+        self.shard(&key).lock().unwrap().get(&key).cloned()
+    }
+
+    /// Cache `terms` under `key`, unless the cache already holds [`SIGMA_CACHE_MAX`] products.
+    fn insert(&self, key: (i32, u32, i32, u32), terms: Arc<[u64]>) {
+        if self.len.load(Ordering::Relaxed) >= *SIGMA_CACHE_MAX {
+            return;
+        }
+        if self
+            .shard(&key)
+            .lock()
+            .unwrap()
+            .insert(key, terms)
+            .is_none()
+        {
+            self.len.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// A zero pair element of degree `degree` returned by [`Self::put_scratch`], if any.
+    fn take_scratch(&self, degree: i32) -> Option<MilnorPairElement> {
+        let shard = &self.scratch[degree as usize % SIGMA_SHARDS].0;
+        shard.lock().unwrap().get_mut(&degree)?.pop()
+    }
+
+    /// Keep `elt`, which must be zero, for [`Self::take_scratch`].
+    fn put_scratch(&self, degree: i32, elt: MilnorPairElement) {
+        let shard = &self.scratch[degree as usize % SIGMA_SHARDS].0;
+        shard.lock().unwrap().entry(degree).or_default().push(elt);
+    }
+
+    /// Zero the entries of `elt` named by `terms`, its terms from [`Self::terms`].
+    fn clear_terms(elt: &mut MilnorPairElement, terms: &[u64]) {
+        for &t in terms {
+            let idx = (t & 0xffff_ffff) as usize;
+            if t & KIND_Y != 0 {
+                let i = ((t >> 40) & 0xff) as usize;
+                let j = ((t >> 32) & 0xff) as usize;
+                elt.ys[i][j].set_entry(idx, 0);
+            } else {
+                elt.ones.set_entry(idx, 0);
+                elt.twos.set_entry(idx, 0);
+            }
+        }
+    }
+
+    /// The nonzero terms of `elt`, which must start from zero in a pair element.
+    fn terms(elt: &MilnorPairElement) -> Arc<[u64]> {
+        let mut terms = Vec::new();
+        let mut indices: Vec<usize> = elt
+            .ones
+            .iter_nonzero()
+            .chain(elt.twos.iter_nonzero())
+            .map(|(idx, _)| idx)
+            .collect();
+        indices.sort_unstable();
+        indices.dedup();
+        for idx in indices {
+            let c = elt.ones.entry(idx) + 2 * elt.twos.entry(idx);
+            terms.push(KIND_MOD4 | u64::from(c) << 32 | idx as u64);
+        }
+        for (i, row) in elt.ys.iter().enumerate() {
+            for (j, v) in row.iter().enumerate() {
+                for (idx, _) in v.iter_nonzero() {
+                    terms.push(KIND_Y | (i as u64) << 40 | (j as u64) << 32 | idx as u64);
+                }
+            }
+        }
+        terms.into()
+    }
+
+    /// Add terms recorded by [`Self::terms`] to `result`.
+    fn add_terms(result: &mut MilnorPairElement, terms: &[u64]) {
+        for &t in terms {
+            let idx = (t & 0xffff_ffff) as usize;
+            if t & KIND_Y != 0 {
+                let i = ((t >> 40) & 0xff) as usize;
+                let j = ((t >> 32) & 0xff) as usize;
+                result.ys[i][j].add_basis_element(idx, 1);
+            } else {
+                // Add c mod 4 to the digit pair (ones, twos).
+                let c = ((t >> 32) & 0x3) as u32;
+                let sum = result.ones.entry(idx) + c;
+                result.ones.set_entry(idx, sum & 1);
+                result.twos.add_basis_element(idx, (sum >> 1) & 1);
+            }
+        }
+    }
+}
+
+impl MilnorAlgebraInner<NoExterior> {
+    /// [`PairAlgebra::sigma_multiply_basis`] computed from scratch.
+    fn sigma_multiply_basis_direct(
+        &self,
+        result: &mut MilnorPairElement,
+        coeff: u32,
+        r_degree: i32,
+        r_idx: usize,
+        s_degree: i32,
+        s_idx: usize,
+    ) {
         // First write the Y terms
         let mut r = self.basis_element_from_index(r_degree, r_idx);
         let mut s = self.basis_element_from_index(s_degree, s_idx);
@@ -263,14 +523,15 @@ impl PairAlgebra for MilnorAlgebraInner<NoExterior> {
         });
     }
 
-    fn a_multiply(
+    /// [`PairAlgebra::a_multiply`].
+    fn a_multiply_impl(
         &self,
         mut result: FpSliceMut,
         coeff: u32,
         r_degree: i32,
         r: FpSlice<'_>,
         s_degree: i32,
-        s: &Self::Element,
+        s: &MilnorPairElement,
     ) {
         assert!(s.ones.is_zero());
 
@@ -316,56 +577,6 @@ impl PairAlgebra for MilnorAlgebraInner<NoExterior> {
                 }
             }
         }
-    }
-
-    fn element_to_bytes(&self, elt: &Self::Element, buffer: &mut impl io::Write) -> io::Result<()> {
-        elt.twos.to_bytes(buffer)?;
-        for row in &elt.ys {
-            for v in row {
-                v.to_bytes(buffer)?;
-            }
-        }
-        Ok(())
-    }
-
-    fn element_from_bytes(
-        &self,
-        degree: i32,
-        buffer: &mut impl io::Read,
-    ) -> io::Result<Self::Element> {
-        let p = self.prime();
-        assert_eq!(p, TWO);
-
-        let max_k = if degree == 0 {
-            0
-        } else {
-            fp::prime::log2(degree as usize) + 1
-        };
-
-        let twos = FpVector::from_bytes(p, self.dimension(degree), buffer)?;
-
-        let mut ys = Vec::with_capacity(max_k);
-        for k in 0..max_k {
-            let rem_degree = degree as usize + 1 - (1 << k);
-            let max_l = fp::prime::log2(rem_degree) + 1;
-            let mut row = Vec::with_capacity(max_l);
-            for l in 0..max_l {
-                row.push(FpVector::from_bytes(
-                    p,
-                    self.dimension((rem_degree - (1 << l)) as i32),
-                    buffer,
-                )?);
-            }
-            ys.push(row);
-        }
-
-        Ok(MilnorPairElement {
-            ones: FpVector::new(p, 0),
-            twos,
-            ys,
-            #[cfg(debug_assertions)]
-            degree,
-        })
     }
 }
 

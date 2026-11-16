@@ -63,6 +63,10 @@ pub struct MilnorAlgebraInner<F: MilnorShape> {
     /// Populated only when seqno is applicable (p=2, trivial profile, stable)
     seqno_tables: arc_swap::ArcSwapOption<seqno::SeqnoTables>,
 
+    /// The terms of each product of basis elements in the pair algebra computed so far; see
+    /// [`SigmaCache`](crate::pair_algebra::SigmaCache).
+    pub(crate) sigma_cache: crate::pair_algebra::SigmaCache,
+
     #[cfg(feature = "cache-multiplication")]
     /// source_deg -> target_deg -> source_op -> target_op
     multiplication_table: OnceVec<OnceVec<Vec<Vec<FpVector>>>>,
@@ -85,6 +89,7 @@ impl<F: MilnorShape> MilnorAlgebraInner<F> {
             excess_table: OnceVec::new(),
             basis_element_to_index_map: OnceVec::new(),
             seqno_tables: arc_swap::ArcSwapOption::empty(),
+            sigma_cache: Default::default(),
             #[cfg(feature = "cache-multiplication")]
             multiplication_table: OnceVec::new(),
         }
