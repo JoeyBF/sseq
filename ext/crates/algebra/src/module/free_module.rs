@@ -159,7 +159,7 @@ impl<const U: bool, A: MuAlgebra<U>> Module for MuFreeModule<U, A> {
     fn basis_element_to_string(&self, degree: i32, idx: usize) -> String {
         let opgen = self.index_to_op_gen(degree, idx);
         let mut op_str = self
-            .algebra()
+            .algebra
             .basis_element_to_string(opgen.operation_degree, opgen.operation_index);
         if &*op_str == "1" {
             op_str = "".to_string();
@@ -190,7 +190,7 @@ impl<const U: bool, A: MuAlgebra<U>> Module for MuFreeModule<U, A> {
 
         // Now all of the output elements are going to be of the form s * x. Find where such things go in the output vector.
         let num_ops = self
-            .algebra()
+            .algebra
             .dimension(module_operation_degree + op_degree);
         let output_block_min = self.operation_generator_to_index(
             module_operation_degree + op_degree,
@@ -201,7 +201,7 @@ impl<const U: bool, A: MuAlgebra<U>> Module for MuFreeModule<U, A> {
         let output_block_max = output_block_min + num_ops;
 
         // Now we multiply s * r and write the result to the appropriate position.
-        self.algebra().multiply_basis_elements_unstable(
+        self.algebra.multiply_basis_elements_unstable(
             result.slice_mut(output_block_min, output_block_max),
             coeff,
             op_degree,
@@ -247,7 +247,7 @@ impl<const U: bool, A: MuAlgebra<U>> Module for MuFreeModule<U, A> {
     /*    #[cfg(not(feature = "cache-multiplication"))]
     fn act(&self, result : FpSliceMut, coeff : u32, op_degree : i32, op_index : usize, input_degree : i32, input : FpSlice){
         if *self.prime() == 2 {
-            if let SteenrodAlgebra::MilnorAlgebra(m) = &*self.algebra() {
+            if let SteenrodAlgebra::MilnorAlgebra(m) = &*self.algebra {
                 self.custom_milnor_act(m, result, coeff, op_degree, op_index, input_degree, input);
             } else {
                 self.standard_act(result, coeff, op_degree, op_index, input_degree, input);
@@ -478,7 +478,7 @@ impl<const U: bool, A: MuAlgebra<U>> MuFreeModule<U, A> {
     ) -> FpSlice<'a> {
         let start = self.generator_offset(degree, gen_degree, gen_index);
         let len = self
-            .algebra()
+            .algebra
             .dimension_unstable(degree - gen_degree, gen_degree);
         v.restrict(
             std::cmp::min(v.len(), start),
