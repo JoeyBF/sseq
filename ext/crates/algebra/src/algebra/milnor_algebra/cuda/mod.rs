@@ -1137,8 +1137,10 @@ mod sigma_tests {
     /// Device against one CPU thread on products of real d2 composites, as `d2_dump` writes them:
     /// `SIGMA_DUMP` the records, `SIGMA_DUMP_INDEX` the index. Each generator's records are one
     /// launch, one row per g2. `SIGMA_DUMP_CPU_MAX` (default 200000) caps the records the CPU
-    /// times, and the device's output is checked against it when it covers the generator. Run with
-    /// `--ignored --nocapture`.
+    /// times, and the device's output is checked against it when it covers the generator. With
+    /// `SIGMA_DUMP_REPEAT` = R > 1 each generator's records are also run R times over in one launch,
+    /// and the extra time per extra pair is the steady-state cost of a pair, without the launch's
+    /// fixed cost and tail. Run with `--ignored --nocapture`.
     #[test]
     #[ignore]
     fn sigma_dump_bench() {
@@ -1147,6 +1149,8 @@ mod sigma_tests {
             std::fs::read_to_string(std::env::var("SIGMA_DUMP_INDEX").expect("index")).unwrap();
         let cpu_max: usize =
             std::env::var("SIGMA_DUMP_CPU_MAX").map_or(200_000, |v| v.parse().unwrap());
+        let repeat: usize = std::env::var("SIGMA_DUMP_REPEAT").map_or(1, |v| v.parse().unwrap());
+        let (mut marginal_total, mut marginal_pairs) = (0.0, 0usize);
         let bytes = std::fs::read(path).unwrap();
         let record = |k: usize| {
             let b = &bytes[k * 24..][..24];
@@ -1202,6 +1206,18 @@ mod sigma_tests {
             )
             .unwrap();
             let gpu_s = start.elapsed().as_secs_f64();
+            let mut marginal_ns = f64::NAN;
+            if repeat > 1 {
+                let many: Vec<SigmaItem> =
+                    items.iter().copied().cycle().take(records * repeat).collect();
+                let start = std::time::Instant::now();
+                sigma_batch(&algebra, &layout, PART_PRODUCT | PART_Y, &many, num_rows, row_bits)
+                    .unwrap();
+                let extra = start.elapsed().as_secs_f64() - gpu_s;
+                marginal_ns = extra / ((repeat - 1) * records) as f64 * 1e9;
+                marginal_total += extra;
+                marginal_pairs += (repeat - 1) * records;
+            }
 
             let degree_of = |p: PPart| -> i32 {
                 p.iter()
@@ -1255,7 +1271,8 @@ mod sigma_tests {
             let cpu_per = cpu_s / timed as f64;
             println!(
                 "SIGMADUMP ({n},{s},{idx}) records={records} rows={num_rows} gpu_s={gpu_s:.4} \
-                 gpu_ns_per_pair={:.1} cpu1_ns_per_pair={:.1} gpu_over_cpu1={:.1} checked={}",
+                 gpu_ns_per_pair={:.1} marginal_ns_per_pair={marginal_ns:.1} \
+                 cpu1_ns_per_pair={:.1} gpu_over_cpu1={:.1} checked={}",
                 gpu_s / records as f64 * 1e9,
                 cpu_per * 1e9,
                 cpu_per * records as f64 / gpu_s,
@@ -1269,8 +1286,9 @@ mod sigma_tests {
         let cpu_per = cpu_total / cpu_records_total as f64;
         println!(
             "SIGMADUMP total records={records_total} gpu_ns_per_pair={:.1} \
-             cpu1_ns_per_pair={:.1} gpu_over_cpu1={:.1}",
+             marginal_ns_per_pair={:.1} cpu1_ns_per_pair={:.1} gpu_over_cpu1={:.1}",
             gpu_total / records_total as f64 * 1e9,
+            marginal_total / marginal_pairs as f64 * 1e9,
             cpu_per * 1e9,
             cpu_per * records_total as f64 / gpu_total
         );
