@@ -43,6 +43,9 @@ use crate::algebra::Algebra;
 
 const SRC: &str = include_str!("multiply.cu");
 
+/// The pair-algebra product's mod-4 terms; compiled after [`SRC`], whose helpers it uses.
+const SIGMA_SRC: &str = include_str!("sigma.cu");
+
 /// Walk widths the kernel is instantiated for: `multiply_antidiag_6` to `_10`.
 const WIDTHS: RangeInclusive<usize> = 6..=PPart::MAX_LEN;
 
@@ -158,6 +161,8 @@ struct Device {
     ctx: Arc<CudaContext>,
     /// Indexed by width minus [`WIDTHS`]`.start()`.
     kernels: Vec<Kernel>,
+    /// `sigma_mod4` of `sigma.cu`.
+    sigma_mod4: CudaFunction,
     tables: Mutex<Option<Arc<Tables>>>,
     budget: Budget,
     pinned: PinnedPool,
@@ -198,7 +203,8 @@ impl Device {
             ],
             ..Default::default()
         };
-        let ptx = compile_ptx_with_opts(SRC, opts).map_err(|e| match &e {
+        let src = format!("{SRC}\n{SIGMA_SRC}");
+        let ptx = compile_ptx_with_opts(src, opts).map_err(|e| match &e {
             CompileError::CompileError { log, .. } => {
                 anyhow!(
                     "NVRTC failed to compile multiply.cu:\n{}",
@@ -233,8 +239,10 @@ impl Device {
             });
         }
 
+        let sigma_mod4 = module.load_function("sigma_mod4")?;
         let total = ctx.total_mem()?;
         Ok(Self {
+            sigma_mod4,
             budget: Budget::new(total.saturating_sub(RESERVED_BYTES).max(1 << 30)),
             pinned: PinnedPool::new(ctx.clone()),
             tables: Mutex::new(None),
@@ -776,6 +784,180 @@ impl LimbBlock for Pinned {
         // The copy into it completed before the block was returned (`Launch::block` synchronizes),
         // so this does not wait.
         &buf.0.as_slice().expect("pinned output buffer")[..self.len]
+    }
+}
+
+/// One product of a [`sigma_mod4_batch`]: the terms of `P(r) P(s)` over Z/4, added at column
+/// `col` onwards of row `row`.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Mod4Item {
+    pub r: PPart,
+    pub s: PPart,
+    pub degree: i32,
+    pub row: u32,
+    pub col: u32,
+}
+
+/// The product terms over Z/4 of every item, summed mod 4 into the bit planes `(ones, twos)` of
+/// `num_rows` rows of `num_cols` bits: each term of
+/// [`for_each_term_mod4`](super::antidiagonal::for_each_term_mod4) at `col` plus its index.
+pub(crate) fn sigma_mod4_batch(
+    algebra: &MilnorAlgebra,
+    items: &[Mod4Item],
+    num_rows: usize,
+    num_cols: usize,
+) -> anyhow::Result<(Vec<u32>, Vec<u32>)> {
+    let device = device().context("no CUDA device")?;
+    anyhow::ensure!(
+        items.iter().all(|i| (i.row as usize) < num_rows),
+        "an item's row is out of range"
+    );
+    let max_degree = items.iter().map(|i| i.degree).max().unwrap_or(0);
+    let tables = device.tables(algebra, max_degree, 0)?;
+    let stream = device.ctx.per_thread_stream();
+    let num_limbs = num_limbs(num_cols);
+    let r: Vec<u64> = items.iter().map(|i| i.r.bits()).collect();
+    let s: Vec<u64> = items.iter().map(|i| i.s.bits()).collect();
+    let degree: Vec<i32> = items.iter().map(|i| i.degree).collect();
+    let row: Vec<u32> = items.iter().map(|i| i.row).collect();
+    let col: Vec<u32> = items.iter().map(|i| i.col).collect();
+    let (r, s) = (stream.clone_htod(&r)?, stream.clone_htod(&s)?);
+    let degree = stream.clone_htod(&degree)?;
+    let (row, col) = (stream.clone_htod(&row)?, stream.clone_htod(&col)?);
+    let mut ones = stream.alloc_zeros::<u32>((num_rows * num_limbs).max(1))?;
+    let mut twos = stream.alloc_zeros::<u32>((num_rows * num_limbs).max(1))?;
+    let num_items = u32::try_from(items.len()).context("too many items")?;
+    let num_limbs_u32 = u32::try_from(num_limbs).context("rows too long")?;
+    const BLOCK: u32 = 128;
+    let cfg = LaunchConfig {
+        grid_dim: (num_items.div_ceil(BLOCK).max(1), 1, 1),
+        block_dim: (BLOCK, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let mut builder = stream.launch_builder(&device.sigma_mod4);
+    builder
+        .arg(&r)
+        .arg(&s)
+        .arg(&degree)
+        .arg(&row)
+        .arg(&col)
+        .arg(&num_items)
+        .arg(&tables.g)
+        .arg(&tables.xi)
+        .arg(&tables.width)
+        .arg(&mut ones)
+        .arg(&mut twos)
+        .arg(&num_limbs_u32);
+    // SAFETY: the arguments match `sigma_mod4`'s parameters in order and type. The item arrays
+    // hold `num_items` entries, every row is below `num_rows` (checked above), the kernel drops
+    // columns past `num_limbs`, and `g` and `xi` cover every item's degree.
+    unsafe { builder.launch(cfg) }.context("launching sigma_mod4")?;
+    LAUNCHES.fetch_add(1, Ordering::Relaxed);
+    let ones = stream.clone_dtoh(&ones)?;
+    let twos = stream.clone_dtoh(&twos)?;
+    stream.synchronize()?;
+    Ok((ones, twos))
+}
+
+#[cfg(test)]
+mod sigma_tests {
+    use super::*;
+    use crate::algebra::milnor_algebra::antidiagonal::for_each_term_mod4;
+
+    /// The polynomial degree of `P(x)`.
+    fn degree(x: PPart) -> i32 {
+        x.iter()
+            .enumerate()
+            .map(|(i, e)| ((1 << (i + 1)) - 1) * e as i32)
+            .sum()
+    }
+
+    /// Every pair of basis elements of total degree `total`, one row per product of degree
+    /// `total`, run on the device and on the CPU.
+    fn run(algebra: &MilnorAlgebra, total: i32, max_pairs: usize) -> (f64, f64, usize) {
+        let mut items = Vec::new();
+        for a in 0..=total {
+            for &r in algebra.ppart_table(a) {
+                for &s in algebra.ppart_table(total - a) {
+                    if items.len() == max_pairs {
+                        break;
+                    }
+                    let row = (items.len() % 4096) as u32;
+                    items.push(Mod4Item { r, s, degree: total, row, col: 0 });
+                }
+            }
+        }
+        let num_rows = 4096.min(items.len()).max(1);
+        let num_cols = algebra.dimension(total);
+
+        let start = std::time::Instant::now();
+        let before = LAUNCHES.load(Ordering::Relaxed);
+        let (ones, twos) = sigma_mod4_batch(algebra, &items, num_rows, num_cols).unwrap();
+        let gpu_s = start.elapsed().as_secs_f64();
+        assert!(LAUNCHES.load(Ordering::Relaxed) > before, "nothing was launched");
+
+        let start = std::time::Instant::now();
+        let num_limbs = num_limbs(num_cols);
+        let mut want = vec![0u8; num_rows * num_cols];
+        for it in &items {
+            for_each_term_mod4(degree(it.r) + degree(it.s), it.r, it.s, |t, c| {
+                let idx = algebra.basis_element_to_index(&super::super::MilnorBasisElement {
+                    q_part: 0,
+                    p_part: t,
+                    degree: total,
+                });
+                let cell = &mut want[it.row as usize * num_cols + idx];
+                *cell = (*cell + c as u8) % 4;
+            });
+        }
+        let cpu_s = start.elapsed().as_secs_f64();
+        for row in 0..num_rows {
+            for col in 0..num_cols {
+                let w = row * num_limbs + col / 32;
+                let bit = |v: &[u32]| (v[w] >> (col % 32)) & 1;
+                let got = bit(&ones) + 2 * bit(&twos);
+                assert_eq!(
+                    got as u8,
+                    want[row * num_cols + col],
+                    "degree {total}, row {row}, column {col}"
+                );
+            }
+        }
+        (gpu_s, cpu_s, items.len())
+    }
+
+    #[test]
+    fn sigma_mod4_matches_cpu() {
+        let algebra = MilnorAlgebra::new(fp::prime::TWO, false);
+        algebra.compute_basis(80);
+        for total in [1, 2, 7, 15, 31, 40, 63, 80] {
+            run(&algebra, total, usize::MAX);
+        }
+    }
+
+    /// Device against one CPU thread on every pair of total degree `SIGMA_BENCH_DEGREES` (default
+    /// 100..=160 by 20), at most `SIGMA_BENCH_MAX_PAIRS` pairs each. Run with `--ignored
+    /// --nocapture`.
+    #[test]
+    #[ignore]
+    fn sigma_mod4_bench() {
+        let degrees: Vec<i32> = std::env::var("SIGMA_BENCH_DEGREES")
+            .map(|v| v.split(',').map(|d| d.parse().unwrap()).collect())
+            .unwrap_or_else(|_| vec![100, 120, 140, 160]);
+        let max_pairs = std::env::var("SIGMA_BENCH_MAX_PAIRS")
+            .map_or(2_000_000, |v| v.parse().unwrap());
+        let algebra = MilnorAlgebra::new(fp::prime::TWO, false);
+        algebra.compute_basis(*degrees.iter().max().unwrap());
+        // Warm the device and its compiled module.
+        run(&algebra, 10, usize::MAX);
+        for total in degrees {
+            let (gpu_s, cpu_s, n) = run(&algebra, total, max_pairs);
+            println!(
+                "SIGMABENCH degree={total} pairs={n} gpu_s={gpu_s:.4} cpu1_s={cpu_s:.4} \
+                 gpu_over_cpu1={:.1}",
+                cpu_s / gpu_s
+            );
+        }
     }
 }
 
