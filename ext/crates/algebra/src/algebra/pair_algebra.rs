@@ -129,11 +129,11 @@ macro_rules! unsub {
 }
 
 pub struct MilnorPairElement {
-    ones: FpVector,
-    twos: FpVector,
+    pub(crate) ones: FpVector,
+    pub(crate) twos: FpVector,
     #[cfg(debug_assertions)]
     degree: i32,
-    ys: Vec<Vec<FpVector>>,
+    pub(crate) ys: Vec<Vec<FpVector>>,
 }
 
 /// Forward a [`PairAlgebra`] method to the classical shape, which is the only one that has one.
@@ -463,7 +463,7 @@ impl SigmaCache {
 
 impl MilnorAlgebraInner<NoExterior> {
     /// [`PairAlgebra::sigma_multiply_basis`] computed from scratch.
-    fn sigma_multiply_basis_direct(
+    pub(crate) fn sigma_multiply_basis_direct(
         &self,
         result: &mut MilnorPairElement,
         coeff: u32,
@@ -472,10 +472,22 @@ impl MilnorAlgebraInner<NoExterior> {
         s_degree: i32,
         s_idx: usize,
     ) {
-        // First write the Y terms
-        let mut r = self.basis_element_from_index(r_degree, r_idx);
-        let mut s = self.basis_element_from_index(s_degree, s_idx);
+        let r = self.basis_element_from_index(r_degree, r_idx);
+        let s = self.basis_element_from_index(s_degree, s_idx);
+        self.sigma_y_terms(result, coeff, r, s);
+        self.sigma_product_terms(result, coeff, &r, &s);
+    }
 
+    /// The Y terms of `sigma(r, s)`: for each `k` with `s_{k+1} > 0` and `0 <= m < n`, the
+    /// product `P(r - 2^k (e_m + e_n)) P(s - e_{k+1})` mod 2, added into `ys[m + k][n + k]`, where
+    /// `e_0` subtracts nothing.
+    pub(crate) fn sigma_y_terms(
+        &self,
+        result: &mut MilnorPairElement,
+        coeff: u32,
+        mut r: MilnorElt,
+        mut s: MilnorElt,
+    ) {
         PPartAllocation::with_local(|mut allocation| {
             for k in 0..s.p_part.len() {
                 sub!(s, k + 1, 0);
@@ -497,29 +509,36 @@ impl MilnorAlgebraInner<NoExterior> {
                 }
                 unsub!(s, k + 1, 0);
             }
-
-            // Now the product terms
-            let degree = r.degree + s.degree;
-            // coeff should always be 1, so no need to optimize the even case.
-            for_each_term_mod4(degree, r.p_part, s.p_part, |p_part, c| {
-                let idx = self.basis_element_to_index(&MilnorElt {
-                    q_part: 0,
-                    p_part,
-                    degree,
-                });
-                let c = c * coeff;
-                // TODO: optimize
-                if c == 2 {
-                    result.twos.add_basis_element(idx, 1);
-                } else {
-                    // c = 1 or 3
-                    let existing = result.ones.entry(idx);
-                    let c = c + existing;
-                    result.ones.set_entry(idx, c & 1);
-                    result.twos.add_basis_element(idx, (c >> 1) & 1);
-                }
-            });
             allocation
+        });
+    }
+
+    /// The product terms of `sigma(r, s)`: `P(r) P(s)` over Z/4, into `(ones, twos)`.
+    pub(crate) fn sigma_product_terms(
+        &self,
+        result: &mut MilnorPairElement,
+        coeff: u32,
+        r: &MilnorElt,
+        s: &MilnorElt,
+    ) {
+        let degree = r.degree + s.degree;
+        // coeff should always be 1, so no need to optimize the even case.
+        for_each_term_mod4(degree, r.p_part, s.p_part, |p_part, c| {
+            let idx = self.basis_element_to_index(&MilnorElt {
+                q_part: 0,
+                p_part,
+                degree,
+            });
+            let c = c * coeff;
+            if c == 2 {
+                result.twos.add_basis_element(idx, 1);
+            } else {
+                // c = 1 or 3
+                let existing = result.ones.entry(idx);
+                let c = c + existing;
+                result.ones.set_entry(idx, c & 1);
+                result.twos.add_basis_element(idx, (c >> 1) & 1);
+            }
         });
     }
 
@@ -714,6 +733,58 @@ mod tests {
             q_part: 0,
             p_part: PPart::from_slice(p_part),
             degree,
+        }
+    }
+
+    /// One CPU thread's time for the Y terms and for the product terms of `sigma(r, s)`, on
+    /// `SIGMA_SPLIT_PAIRS` (default 20000) random pairs of each total degree `SIGMA_SPLIT_DEGREES`
+    /// (default 100,200,300), the degree of `r` uniform. Run with `--ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn sigma_split_bench() {
+        let degrees: Vec<i32> = std::env::var("SIGMA_SPLIT_DEGREES")
+            .map(|v| v.split(',').map(|d| d.parse().unwrap()).collect())
+            .unwrap_or_else(|_| vec![100, 200, 300]);
+        let pairs: usize = std::env::var("SIGMA_SPLIT_PAIRS").map_or(20000, |v| v.parse().unwrap());
+        let algebra = MilnorAlgebraInner::<NoExterior>::new(TWO, false);
+        algebra.compute_basis(*degrees.iter().max().unwrap() + 1);
+        let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut rand = move |n: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % n as u64) as usize
+        };
+        for total in degrees {
+            let mut sample = Vec::with_capacity(pairs);
+            while sample.len() < pairs {
+                let a = 1 + rand(total as usize - 1) as i32;
+                let (da, db) = (algebra.dimension(a), algebra.dimension(total - a));
+                if da == 0 || db == 0 {
+                    continue;
+                }
+                sample.push((
+                    algebra.basis_element_from_index(a, rand(da)),
+                    algebra.basis_element_from_index(total - a, rand(db)),
+                ));
+            }
+            let mut result = algebra.new_pair_element(total);
+            let start = std::time::Instant::now();
+            for (r, s) in &sample {
+                algebra.sigma_y_terms(&mut result, 1, *r, *s);
+            }
+            let y_s = start.elapsed().as_secs_f64();
+            let start = std::time::Instant::now();
+            for (r, s) in &sample {
+                algebra.sigma_product_terms(&mut result, 1, r, s);
+            }
+            let p_s = start.elapsed().as_secs_f64();
+            println!(
+                "SIGMASPLIT degree={total} pairs={pairs} y_us={:.2} product_us={:.2} y_share={:.2}",
+                y_s / pairs as f64 * 1e6,
+                p_s / pairs as f64 * 1e6,
+                y_s / (y_s + p_s)
+            );
         }
     }
 

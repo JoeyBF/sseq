@@ -89,6 +89,14 @@ fn shared_bytes(n: usize) -> usize {
     state.next_multiple_of(16) + warps * (64 * 16 + 4)
 }
 
+/// Shared memory of one block of the width-`n` sigma kernel: the walk state (`SIG_STATE_BYTES`)
+/// and the queue, as in [`shared_bytes`].
+fn sigma_shared_bytes(n: usize) -> usize {
+    let state = (3 * (n * (n - 1) / 2) + 2 * (n + 1)) * size_of::<u16>() * THREADS as usize;
+    let warps = THREADS as usize / 32;
+    state.next_multiple_of(16) + warps * (64 * 16 + 4)
+}
+
 /// Evaluate a batch on the device, or `None` if it should run on the CPU: no device, an algebra
 /// the kernel does not support, or a batch too small to be worth a launch.
 pub(super) fn multiply_batch(
@@ -161,8 +169,10 @@ struct Device {
     ctx: Arc<CudaContext>,
     /// Indexed by width minus [`WIDTHS`]`.start()`.
     kernels: Vec<Kernel>,
-    /// `sigma_mod4` of `sigma.cu`.
-    sigma_mod4: CudaFunction,
+    /// `sigma_step_6` to `_10` of `sigma.cu`, indexed by walk width minus the least.
+    sigma_kernels: Vec<Kernel>,
+    /// `sigma_pair` of `sigma.cu`.
+    sigma_pair: CudaFunction,
     tables: Mutex<Option<Arc<Tables>>>,
     budget: Budget,
     pinned: PinnedPool,
@@ -239,10 +249,34 @@ impl Device {
             });
         }
 
-        let sigma_mod4 = module.load_function("sigma_mod4")?;
+        let sigma_pair = module.load_function("sigma_pair")?;
+        let mut sigma_kernels = Vec::new();
+        for n in WIDTHS {
+            let name = format!("sigma_step_{n}");
+            let function = module.load_function(&name)?;
+            let shared_bytes = sigma_shared_bytes(n);
+            function.set_attribute(
+                sys::CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                shared_bytes as i32,
+            )?;
+            let per_sm = function.occupancy_max_active_blocks_per_multiprocessor(
+                THREADS,
+                shared_bytes,
+                None,
+            )?;
+            if per_sm == 0 {
+                bail!("{name}: a block of {THREADS} threads does not fit on an SM");
+            }
+            sigma_kernels.push(Kernel {
+                function,
+                shared_bytes,
+                grid: per_sm * sm_count,
+            });
+        }
         let total = ctx.total_mem()?;
         Ok(Self {
-            sigma_mod4,
+            sigma_pair,
+            sigma_kernels,
             budget: Budget::new(total.saturating_sub(RESERVED_BYTES).max(1 << 30)),
             pinned: PinnedPool::new(ctx.clone()),
             tables: Mutex::new(None),
@@ -787,10 +821,69 @@ impl LimbBlock for Pinned {
     }
 }
 
-/// One product of a [`sigma_mod4_batch`]: the terms of `P(r) P(s)` over Z/4, added at column
-/// `col` onwards of row `row`.
+/// Row stride of [`PairLayout::yoff`]; mirrored by `Y_STRIDE` in `sigma.cu`.
+const Y_STRIDE: usize = 16;
+
+/// A `ys[i][j]` a pair element of that degree does not have; mirrored by `Y_ABSENT`.
+const Y_ABSENT: u32 = u32::MAX;
+
+/// The product terms of sigma, over Z/4; mirrored by `PART_PRODUCT`.
+pub(crate) const PART_PRODUCT: u32 = 1;
+
+/// The Y terms of sigma, mod 2; mirrored by `PART_Y`.
+pub(crate) const PART_Y: u32 = 2;
+
+/// Where the parts of a pair element of each degree sit in a row of a [`sigma_batch`] output: its
+/// product terms from bit 0, then each `ys[i][j]` of
+/// [`new_pair_element`](crate::pair_algebra::PairAlgebra::new_pair_element), in its order.
+pub(crate) struct PairLayout {
+    /// The first bit of `ys[i][j]` of degree `D` at `(D * Y_STRIDE + i) * Y_STRIDE + j`, or
+    /// [`Y_ABSENT`].
+    yoff: Vec<u32>,
+    /// The bits a pair element of each degree takes.
+    bits: Vec<usize>,
+}
+
+impl PairLayout {
+    /// The layout of pair elements of every degree through `max_degree`.
+    pub(crate) fn new(algebra: &MilnorAlgebra, max_degree: i32) -> Self {
+        let n = max_degree as usize + 1;
+        let mut yoff = vec![Y_ABSENT; n * Y_STRIDE * Y_STRIDE];
+        let mut bits = Vec::with_capacity(n);
+        for d in 0..n {
+            let mut off = algebra.dimension(d as i32);
+            if d > 0 {
+                for k in 0..=fp::prime::log2(d) {
+                    let rem = d + 1 - (1 << k);
+                    for l in 0..=fp::prime::log2(rem) {
+                        yoff[(d * Y_STRIDE + k) * Y_STRIDE + l] =
+                            u32::try_from(off).expect("a pair element exceeds u32 bits");
+                        off += algebra.dimension((rem - (1 << l)) as i32);
+                    }
+                }
+            }
+            bits.push(off);
+        }
+        Self { yoff, bits }
+    }
+
+    /// The bits a pair element of `degree` takes.
+    pub(crate) fn bits(&self, degree: i32) -> usize {
+        self.bits[degree as usize]
+    }
+
+    /// The first bit of `ys[i][j]` of a pair element of `degree`.
+    pub(crate) fn y_offset(&self, degree: i32, i: usize, j: usize) -> usize {
+        let off = self.yoff[(degree as usize * Y_STRIDE + i) * Y_STRIDE + j];
+        assert_ne!(off, Y_ABSENT, "no ys[{i}][{j}] in degree {degree}");
+        off as usize
+    }
+}
+
+/// One product of a [`sigma_batch`]: `sigma(P(r), P(s))`, of total degree `degree`, added into
+/// row `row` from bit `col` on, laid out as [`PairLayout`] says.
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct Mod4Item {
+pub(crate) struct SigmaItem {
     pub r: PPart,
     pub s: PPart,
     pub degree: i32,
@@ -798,12 +891,14 @@ pub(crate) struct Mod4Item {
     pub col: u32,
 }
 
-/// The product terms over Z/4 of every item, summed mod 4 into the bit planes `(ones, twos)` of
-/// `num_rows` rows of `num_cols` bits: each term of
-/// [`for_each_term_mod4`](super::antidiagonal::for_each_term_mod4) at `col` plus its index.
-pub(crate) fn sigma_mod4_batch(
+/// The parts `parts` ([`PART_PRODUCT`], [`PART_Y`]) of the pair-algebra product of every item,
+/// summed into `num_rows` rows of `num_cols` bits as the bit planes `(ones, twos)`. The product
+/// terms are summed mod 4 across both planes, the Y terms mod 2 in `ones`.
+pub(crate) fn sigma_batch(
     algebra: &MilnorAlgebra,
-    items: &[Mod4Item],
+    layout: &PairLayout,
+    parts: u32,
+    items: &[SigmaItem],
     num_rows: usize,
     num_cols: usize,
 ) -> anyhow::Result<(Vec<u32>, Vec<u32>)> {
@@ -813,6 +908,10 @@ pub(crate) fn sigma_mod4_batch(
         "an item's row is out of range"
     );
     let max_degree = items.iter().map(|i| i.degree).max().unwrap_or(0);
+    anyhow::ensure!(
+        (max_degree as usize) < layout.bits.len(),
+        "the layout stops below degree {max_degree}"
+    );
     let tables = device.tables(algebra, max_degree, 0)?;
     let stream = device.ctx.per_thread_stream();
     let num_limbs = num_limbs(num_cols);
@@ -824,34 +923,78 @@ pub(crate) fn sigma_mod4_batch(
     let (r, s) = (stream.clone_htod(&r)?, stream.clone_htod(&s)?);
     let degree = stream.clone_htod(&degree)?;
     let (row, col) = (stream.clone_htod(&row)?, stream.clone_htod(&col)?);
+    let yoff = stream.clone_htod(&layout.yoff)?;
     let mut ones = stream.alloc_zeros::<u32>((num_rows * num_limbs).max(1))?;
     let mut twos = stream.alloc_zeros::<u32>((num_rows * num_limbs).max(1))?;
     let num_items = u32::try_from(items.len()).context("too many items")?;
     let num_limbs_u32 = u32::try_from(num_limbs).context("rows too long")?;
-    const BLOCK: u32 = 128;
-    let cfg = LaunchConfig {
-        grid_dim: (num_items.div_ceil(BLOCK).max(1), 1, 1),
-        block_dim: (BLOCK, 1, 1),
-        shared_mem_bytes: 0,
-    };
-    let mut builder = stream.launch_builder(&device.sigma_mod4);
-    builder
-        .arg(&r)
-        .arg(&s)
-        .arg(&degree)
-        .arg(&row)
-        .arg(&col)
-        .arg(&num_items)
-        .arg(&tables.g)
-        .arg(&tables.xi)
-        .arg(&tables.width)
-        .arg(&mut ones)
-        .arg(&mut twos)
-        .arg(&num_limbs_u32);
-    // SAFETY: the arguments match `sigma_mod4`'s parameters in order and type. The item arrays
-    // hold `num_items` entries, every row is below `num_rows` (checked above), the kernel drops
-    // columns past `num_limbs`, and `g` and `xi` cover every item's degree.
-    unsafe { builder.launch(cfg) }.context("launching sigma_mod4")?;
+    anyhow::ensure!(
+        num_rows * num_limbs < 1 << 32 && num_cols < 1 << 29,
+        "the output is too large for the kernel's u32 words and 29-bit columns"
+    );
+    if std::env::var("SIGMA_KERNEL").is_ok_and(|v| v == "pair") {
+        const BLOCK: u32 = 128;
+        let cfg = LaunchConfig {
+            grid_dim: (num_items.div_ceil(BLOCK).max(1), 1, 1),
+            block_dim: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut builder = stream.launch_builder(&device.sigma_pair);
+        builder
+            .arg(&r)
+            .arg(&s)
+            .arg(&degree)
+            .arg(&row)
+            .arg(&col)
+            .arg(&num_items)
+            .arg(&tables.g)
+            .arg(&tables.xi)
+            .arg(&tables.width)
+            .arg(&yoff)
+            .arg(&parts)
+            .arg(&mut ones)
+            .arg(&mut twos)
+            .arg(&num_limbs_u32);
+        // SAFETY: the arguments match `sigma_pair`'s parameters in order and type. The item
+        // arrays hold `num_items` entries, every row is below `num_rows` (checked above), the
+        // kernel drops columns past `num_limbs`, `yoff` and the tables `g` and `xi` cover every
+        // item's degree (checked above, and by `tables`), and the kernel skips a `ys[i][j]` with
+        // `i` or `j` past `Y_STRIDE`.
+        unsafe { builder.launch(cfg) }.context("launching sigma_pair")?;
+    } else {
+        let kernel = &device.sigma_kernels[width_for_degree(max_degree) - WIDTHS.start()];
+        let mut counter = stream.alloc_zeros::<u32>(1)?;
+        let cfg = LaunchConfig {
+            grid_dim: (kernel.grid, 1, 1),
+            block_dim: (THREADS, 1, 1),
+            shared_mem_bytes: kernel.shared_bytes as u32,
+        };
+        let mut builder = stream.launch_builder(&kernel.function);
+        builder
+            .arg(&r)
+            .arg(&s)
+            .arg(&degree)
+            .arg(&row)
+            .arg(&col)
+            .arg(&num_items)
+            .arg(&mut counter)
+            .arg(&tables.g)
+            .arg(&tables.xi)
+            .arg(&tables.width)
+            .arg(&yoff)
+            .arg(&parts)
+            .arg(&mut ones)
+            .arg(&mut twos)
+            .arg(&num_limbs_u32);
+        // SAFETY: the arguments match `sigma_step_N`'s parameters in order and type, and the
+        // block's dynamic shared memory is the `sigma_shared_bytes(N)` the kernel lays out. The
+        // item arrays hold `num_items` entries, handed out once each by `counter`, which starts at
+        // zero; every row is below `num_rows` and the row words and columns fit the kernel's
+        // `u32`s and 29 bits (checked above); the kernel drops columns past `num_limbs`; `yoff`
+        // and the tables `g` and `xi` cover every item's degree, and the width `N` every entry of
+        // a product of degree at most `max_degree`.
+        unsafe { builder.launch(cfg) }.context("launching sigma_step")?;
+    }
     LAUNCHES.fetch_add(1, Ordering::Relaxed);
     let ones = stream.clone_dtoh(&ones)?;
     let twos = stream.clone_dtoh(&twos)?;
@@ -861,102 +1004,305 @@ pub(crate) fn sigma_mod4_batch(
 
 #[cfg(test)]
 mod sigma_tests {
-    use super::*;
-    use crate::algebra::milnor_algebra::antidiagonal::for_each_term_mod4;
+    use std::collections::HashMap;
 
-    /// The polynomial degree of `P(x)`.
-    fn degree(x: PPart) -> i32 {
-        x.iter()
-            .enumerate()
-            .map(|(i, e)| ((1 << (i + 1)) - 1) * e as i32)
-            .sum()
+    use super::*;
+    use crate::{algebra::milnor_algebra::MilnorBasisElement, pair_algebra::PairAlgebra};
+
+    /// A basis element of `degree` from its `PPart`.
+    fn elt(algebra: &MilnorAlgebra, p_part: PPart, degree: i32) -> (i32, usize) {
+        let idx = algebra.basis_element_to_index(&MilnorBasisElement {
+            q_part: 0,
+            p_part,
+            degree,
+        });
+        (degree, idx)
     }
 
-    /// Every pair of basis elements of total degree `total`, one row per product of degree
-    /// `total`, run on the device and on the CPU.
-    fn run(algebra: &MilnorAlgebra, total: i32, max_pairs: usize) -> (f64, f64, usize) {
-        let mut items = Vec::new();
+    /// Every `stride`-th pair of basis elements of total degree `total`, the stride chosen to
+    /// keep at most `max_pairs`.
+    fn pairs(algebra: &MilnorAlgebra, total: i32, max_pairs: usize) -> Vec<(i32, PPart, PPart)> {
+        let count: usize = (0..=total)
+            .map(|a| algebra.dimension(a) * algebra.dimension(total - a))
+            .sum();
+        let stride = count.div_ceil(max_pairs).max(1);
+        let mut kept = Vec::new();
+        let mut n = 0;
         for a in 0..=total {
             for &r in algebra.ppart_table(a) {
                 for &s in algebra.ppart_table(total - a) {
-                    if items.len() == max_pairs {
-                        break;
+                    if n % stride == 0 {
+                        kept.push((a, r, s));
                     }
-                    let row = (items.len() % 4096) as u32;
-                    items.push(Mod4Item { r, s, degree: total, row, col: 0 });
+                    n += 1;
                 }
             }
         }
-        let num_rows = 4096.min(items.len()).max(1);
-        let num_cols = algebra.dimension(total);
+        kept
+    }
+
+    /// Runs `sigma(r, s)` of `pairs` of total degree `total` on the device and, unless `check` is
+    /// false, on one CPU thread with `sigma_multiply_basis_direct`, and compares every bit. The
+    /// pairs are summed into `rows` rows, so carries between pairs are exercised. Returns the
+    /// device's seconds, the CPU's and the number of pairs.
+    fn run(
+        algebra: &MilnorAlgebra,
+        total: i32,
+        max_pairs: usize,
+        rows: usize,
+        parts: u32,
+        check: bool,
+    ) -> (f64, f64, usize) {
+        let MilnorAlgebra::Polynomial(inner) = algebra else {
+            unreachable!()
+        };
+        let pairs = pairs(algebra, total, max_pairs);
+        let num_rows = rows.min(pairs.len()).max(1);
+        let layout = PairLayout::new(algebra, total);
+        let num_cols = layout.bits(total);
+        let items: Vec<SigmaItem> = pairs
+            .iter()
+            .enumerate()
+            .map(|(n, &(_, r, s))| SigmaItem {
+                r,
+                s,
+                degree: total,
+                row: (n % num_rows) as u32,
+                col: 0,
+            })
+            .collect();
 
         let start = std::time::Instant::now();
         let before = LAUNCHES.load(Ordering::Relaxed);
-        let (ones, twos) = sigma_mod4_batch(algebra, &items, num_rows, num_cols).unwrap();
+        let (ones, twos) =
+            sigma_batch(algebra, &layout, parts, &items, num_rows, num_cols).unwrap();
         let gpu_s = start.elapsed().as_secs_f64();
-        assert!(LAUNCHES.load(Ordering::Relaxed) > before, "nothing was launched");
+        assert!(
+            LAUNCHES.load(Ordering::Relaxed) > before,
+            "nothing was launched"
+        );
+        if !check {
+            return (gpu_s, 0.0, pairs.len());
+        }
 
         let start = std::time::Instant::now();
-        let num_limbs = num_limbs(num_cols);
-        let mut want = vec![0u8; num_rows * num_cols];
-        for it in &items {
-            for_each_term_mod4(degree(it.r) + degree(it.s), it.r, it.s, |t, c| {
-                let idx = algebra.basis_element_to_index(&super::super::MilnorBasisElement {
-                    q_part: 0,
-                    p_part: t,
-                    degree: total,
-                });
-                let cell = &mut want[it.row as usize * num_cols + idx];
-                *cell = (*cell + c as u8) % 4;
-            });
+        let mut want: Vec<_> = (0..num_rows)
+            .map(|_| inner.new_pair_element(total))
+            .collect();
+        for (n, &(a, r, s)) in pairs.iter().enumerate() {
+            let (rd, ri) = elt(algebra, r, a);
+            let (sd, si) = elt(algebra, s, total - a);
+            inner.sigma_multiply_basis_direct(&mut want[n % num_rows], 1, rd, ri, sd, si);
         }
         let cpu_s = start.elapsed().as_secs_f64();
-        for row in 0..num_rows {
-            for col in 0..num_cols {
-                let w = row * num_limbs + col / 32;
-                let bit = |v: &[u32]| (v[w] >> (col % 32)) & 1;
-                let got = bit(&ones) + 2 * bit(&twos);
-                assert_eq!(
-                    got as u8,
-                    want[row * num_cols + col],
-                    "degree {total}, row {row}, column {col}"
-                );
+
+        let num_limbs = num_limbs(num_cols);
+        let bit =
+            |v: &[u32], row: usize, col: usize| (v[row * num_limbs + col / 32] >> (col % 32)) & 1;
+        for (row, w) in want.iter().enumerate() {
+            if parts & PART_PRODUCT != 0 {
+                for col in 0..w.ones.len() {
+                    let got = bit(&ones, row, col) + 2 * bit(&twos, row, col);
+                    let want = w.ones.entry(col) + 2 * w.twos.entry(col);
+                    assert_eq!(got, want, "degree {total}, row {row}, product term {col}");
+                }
+            }
+            if parts & PART_Y != 0 {
+                for (i, ys) in w.ys.iter().enumerate() {
+                    for (j, y) in ys.iter().enumerate() {
+                        let off = layout.y_offset(total, i, j);
+                        for x in 0..y.len() {
+                            assert_eq!(
+                                bit(&ones, row, off + x),
+                                y.entry(x),
+                                "degree {total}, row {row}, ys[{i}][{j}] term {x}"
+                            );
+                        }
+                    }
+                }
             }
         }
-        (gpu_s, cpu_s, items.len())
+        (gpu_s, cpu_s, pairs.len())
     }
 
     #[test]
-    fn sigma_mod4_matches_cpu() {
+    fn sigma_matches_cpu() {
         let algebra = MilnorAlgebra::new(fp::prime::TWO, false);
-        algebra.compute_basis(80);
-        for total in [1, 2, 7, 15, 31, 40, 63, 80] {
-            run(&algebra, total, usize::MAX);
+        algebra.compute_basis(130);
+        for total in [1, 2, 7, 15, 31, 40, 63, 80, 130] {
+            run(&algebra, total, 200_000, 64, PART_PRODUCT | PART_Y, true);
         }
     }
 
-    /// Device against one CPU thread on every pair of total degree `SIGMA_BENCH_DEGREES` (default
-    /// 100..=160 by 20), at most `SIGMA_BENCH_MAX_PAIRS` pairs each. Run with `--ignored
-    /// --nocapture`.
+    /// Device against one CPU thread on products of real d2 composites, as `d2_dump` writes them:
+    /// `SIGMA_DUMP` the records, `SIGMA_DUMP_INDEX` the index. Each generator's records are one
+    /// launch, one row per g2. `SIGMA_DUMP_CPU_MAX` (default 200000) caps the records the CPU
+    /// times, and the device's output is checked against it when it covers the generator. Run with
+    /// `--ignored --nocapture`.
     #[test]
     #[ignore]
-    fn sigma_mod4_bench() {
+    fn sigma_dump_bench() {
+        let path = std::env::var("SIGMA_DUMP").expect("SIGMA_DUMP");
+        let index =
+            std::fs::read_to_string(std::env::var("SIGMA_DUMP_INDEX").expect("index")).unwrap();
+        let cpu_max: usize =
+            std::env::var("SIGMA_DUMP_CPU_MAX").map_or(200_000, |v| v.parse().unwrap());
+        let bytes = std::fs::read(path).unwrap();
+        let record = |k: usize| {
+            let b = &bytes[k * 24..][..24];
+            let u64_at = |o: usize| u64::from_le_bytes(b[o..o + 8].try_into().unwrap());
+            let u32_at = |o: usize| u32::from_le_bytes(b[o..o + 4].try_into().unwrap());
+            (
+                PPart::from_bits(u64_at(0)),
+                PPart::from_bits(u64_at(8)),
+                u32_at(16) as i32,
+                u32_at(20),
+            )
+        };
+        let gens: Vec<Vec<usize>> = index
+            .lines()
+            .map(|l| l.split_whitespace().map(|x| x.parse().unwrap()).collect())
+            .collect();
+        let max_degree = gens.iter().map(|g| g[0] + g[1]).max().unwrap() as i32;
+        let algebra = MilnorAlgebra::new(fp::prime::TWO, false);
+        algebra.compute_basis(max_degree + 1);
+        let MilnorAlgebra::Polynomial(inner) = &algebra else {
+            unreachable!()
+        };
+        let layout = PairLayout::new(&algebra, max_degree);
+        run(&algebra, 10, usize::MAX, 64, PART_PRODUCT | PART_Y, false);
+        let (mut gpu_total, mut cpu_total, mut cpu_records_total, mut records_total) =
+            (0.0, 0.0, 0usize, 0usize);
+        for g in &gens {
+            let (n, s, idx, records, first, num_rows) = (g[0], g[1], g[2], g[3], g[4], g[5]);
+            if records == 0 {
+                continue;
+            }
+            let recs: Vec<_> = (first..first + records).map(record).collect();
+            let row_degree: HashMap<u32, i32> = recs.iter().map(|r| (r.3, r.2)).collect();
+            let row_bits = row_degree.values().map(|&d| layout.bits(d)).max().unwrap();
+            let items: Vec<SigmaItem> = recs
+                .iter()
+                .map(|&(r, s, degree, row)| SigmaItem {
+                    r,
+                    s,
+                    degree,
+                    row,
+                    col: 0,
+                })
+                .collect();
+            let start = std::time::Instant::now();
+            let (ones, twos) = sigma_batch(
+                &algebra,
+                &layout,
+                PART_PRODUCT | PART_Y,
+                &items,
+                num_rows,
+                row_bits,
+            )
+            .unwrap();
+            let gpu_s = start.elapsed().as_secs_f64();
+
+            let degree_of = |p: PPart| -> i32 {
+                p.iter()
+                    .enumerate()
+                    .map(|(i, e)| ((1 << (i + 1)) - 1) * e as i32)
+                    .sum()
+            };
+            let timed = records.min(cpu_max);
+            let mut want: HashMap<u32, _> = HashMap::new();
+            let start = std::time::Instant::now();
+            for &(r, s, degree, row) in &recs[..timed] {
+                let w = want
+                    .entry(row)
+                    .or_insert_with(|| inner.new_pair_element(degree));
+                let (rd, sd) = (degree_of(r), degree_of(s));
+                let ri = algebra.basis_element_to_index(&MilnorBasisElement {
+                    q_part: 0,
+                    p_part: r,
+                    degree: rd,
+                });
+                let si = algebra.basis_element_to_index(&MilnorBasisElement {
+                    q_part: 0,
+                    p_part: s,
+                    degree: sd,
+                });
+                inner.sigma_multiply_basis_direct(w, 1, rd, ri, sd, si);
+            }
+            let cpu_s = start.elapsed().as_secs_f64();
+            if timed == records {
+                let num_limbs = num_limbs(row_bits);
+                let bit = |v: &[u32], row: usize, col: usize| {
+                    (v[row * num_limbs + col / 32] >> (col % 32)) & 1
+                };
+                for (&row, w) in &want {
+                    let row = row as usize;
+                    for col in 0..w.ones.len() {
+                        let got = bit(&ones, row, col) + 2 * bit(&twos, row, col);
+                        assert_eq!(got, w.ones.entry(col) + 2 * w.twos.entry(col));
+                    }
+                    let degree = row_degree[&(row as u32)];
+                    for (i, ys) in w.ys.iter().enumerate() {
+                        for (j, y) in ys.iter().enumerate() {
+                            let off = layout.y_offset(degree, i, j);
+                            for x in 0..y.len() {
+                                assert_eq!(bit(&ones, row, off + x), y.entry(x));
+                            }
+                        }
+                    }
+                }
+            }
+            let cpu_per = cpu_s / timed as f64;
+            println!(
+                "SIGMADUMP ({n},{s},{idx}) records={records} rows={num_rows} gpu_s={gpu_s:.4} \
+                 gpu_ns_per_pair={:.1} cpu1_ns_per_pair={:.1} gpu_over_cpu1={:.1} checked={}",
+                gpu_s / records as f64 * 1e9,
+                cpu_per * 1e9,
+                cpu_per * records as f64 / gpu_s,
+                timed == records
+            );
+            gpu_total += gpu_s;
+            cpu_total += cpu_s;
+            cpu_records_total += timed;
+            records_total += records;
+        }
+        let cpu_per = cpu_total / cpu_records_total as f64;
+        println!(
+            "SIGMADUMP total records={records_total} gpu_ns_per_pair={:.1} \
+             cpu1_ns_per_pair={:.1} gpu_over_cpu1={:.1}",
+            gpu_total / records_total as f64 * 1e9,
+            cpu_per * 1e9,
+            cpu_per * records_total as f64 / gpu_total
+        );
+    }
+
+    /// Device against one CPU thread on pairs of each total degree `SIGMA_BENCH_DEGREES` (default
+    /// 100..=300 by 100), at most `SIGMA_BENCH_MAX_PAIRS` of them, for the product terms, the Y
+    /// terms and both. `SIGMA_BENCH_CHECK=0` skips the CPU. Run with `--ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn sigma_bench() {
         let degrees: Vec<i32> = std::env::var("SIGMA_BENCH_DEGREES")
             .map(|v| v.split(',').map(|d| d.parse().unwrap()).collect())
-            .unwrap_or_else(|_| vec![100, 120, 140, 160]);
-        let max_pairs = std::env::var("SIGMA_BENCH_MAX_PAIRS")
-            .map_or(2_000_000, |v| v.parse().unwrap());
+            .unwrap_or_else(|_| vec![100, 200, 300]);
+        let max_pairs =
+            std::env::var("SIGMA_BENCH_MAX_PAIRS").map_or(1_000_000, |v| v.parse().unwrap());
+        let check = std::env::var("SIGMA_BENCH_CHECK").map_or(true, |v| v != "0");
         let algebra = MilnorAlgebra::new(fp::prime::TWO, false);
-        algebra.compute_basis(*degrees.iter().max().unwrap());
+        algebra.compute_basis(*degrees.iter().max().unwrap() + 1);
         // Warm the device and its compiled module.
-        run(&algebra, 10, usize::MAX);
+        run(&algebra, 10, usize::MAX, 64, PART_PRODUCT | PART_Y, false);
         for total in degrees {
-            let (gpu_s, cpu_s, n) = run(&algebra, total, max_pairs);
-            println!(
-                "SIGMABENCH degree={total} pairs={n} gpu_s={gpu_s:.4} cpu1_s={cpu_s:.4} \
-                 gpu_over_cpu1={:.1}",
-                cpu_s / gpu_s
-            );
+            for (name, parts) in [("product", PART_PRODUCT), ("y", PART_Y), ("both", 3)] {
+                let (gpu_s, cpu_s, n) =
+                    run(&algebra, total, max_pairs, 4096, parts, check && parts == 3);
+                println!(
+                    "SIGMABENCH degree={total} parts={name} pairs={n} gpu_s={gpu_s:.4} \
+                     gpu_ns_per_pair={:.1} cpu1_s={cpu_s:.4} gpu_over_cpu1={:.1}",
+                    gpu_s / n as f64 * 1e9,
+                    cpu_s / gpu_s
+                );
+            }
         }
     }
 }
