@@ -66,6 +66,7 @@ gpu = ["fp/gpu"]
 members = [
     "crates/algebra",
     "crates/bivec",
+    "crates/derivations",
     "crates/fp",
     "crates/maybe-rayon",
     "crates/once",

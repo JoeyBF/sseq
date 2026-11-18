@@ -1,0 +1,10 @@
+[package]
+name = "derivations"
+version = "0.1.0"
+edition = "2024"
+description = "Spaces of derivations of degree (-1, 2) on the Adams E2 page (Leibniz propagation)"
+license = "(MIT OR Apache-2.0)"
+
+[dependencies]
+rayon = "1.10"
+rustc-hash = "2.1.1"
