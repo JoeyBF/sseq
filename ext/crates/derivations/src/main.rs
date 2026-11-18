@@ -479,7 +479,17 @@ fn var(ext: &Ext, v: &Vars, c: u32, r: usize, k: usize) -> u32 {
     v.off[c as usize] + (r * dp + k) as u32
 }
 
-fn equations(ext: &Ext, p: &Products, v: &Vars, gens_only: bool) -> Vec<Vec<u32>> {
+/// Where a Leibniz equation comes from: coordinate `k` of the relation for `x_(a, i) * x_(b, j)`.
+#[derive(Clone, Copy)]
+struct Origin {
+    a: u32,
+    b: u32,
+    i: u8,
+    j: u8,
+    k: u8,
+}
+
+fn equations(ext: &Ext, p: &Products, v: &Vars, gens_only: bool) -> (Vec<Vec<u32>>, Vec<Origin>) {
     let t = Instant::now();
     let nb = ext.deg.len() as u32;
     let pairs: Vec<(u32, u32)> = (0..nb)
@@ -487,7 +497,7 @@ fn equations(ext: &Ext, p: &Products, v: &Vars, gens_only: bool) -> Vec<Vec<u32>
         .filter(|&(a, b)| p.rank_of[a as usize] <= p.rank_of[b as usize])
         .filter(|&(a, b)| ext.sum(a, b).and_then(|c| ext.prime(c)).is_some())
         .collect();
-    let eqs: Vec<Vec<u32>> = pairs
+    let (eqs, origins): (Vec<Vec<u32>>, Vec<Origin>) = pairs
         .par_iter()
         .flat_map_iter(|&(a, b)| {
             let c = ext.sum(a, b).unwrap();
@@ -549,7 +559,16 @@ fn equations(ext: &Ext, p: &Products, v: &Vars, gens_only: bool) -> Vec<Vec<u32>
                             }
                         }
                         if !red.is_empty() {
-                            out.push(red);
+                            out.push((
+                                red,
+                                Origin {
+                                    a,
+                                    b,
+                                    i: i as u8,
+                                    j: j as u8,
+                                    k: k as u8,
+                                },
+                            ));
                         }
                     }
                     let _ = dc;
@@ -557,7 +576,7 @@ fn equations(ext: &Ext, p: &Products, v: &Vars, gens_only: bool) -> Vec<Vec<u32>
             }
             out
         })
-        .collect();
+        .unzip();
     let terms: usize = eqs.iter().map(|e| e.len()).sum();
     let mut hist = BTreeMap::new();
     for e in &eqs {
@@ -571,26 +590,43 @@ fn equations(ext: &Ext, p: &Products, v: &Vars, gens_only: bool) -> Vec<Vec<u32>
         t.elapsed().as_secs_f64(),
         hist
     );
-    eqs
+    (eqs, origins)
 }
 
 /// Echelon form (pivot = smallest column). Returns the pivot flag per column.
-fn eliminate(nvars: u32, mut eqs: Vec<Vec<u32>>) -> Vec<bool> {
+///
+/// With `track`, also returns for every row the equation it started from and the rows it was
+/// reduced by, so that any combination of rows can be expanded back into equations.
+fn eliminate(
+    nvars: u32,
+    eqs: &[Vec<u32>],
+    track: bool,
+) -> (Vec<u32>, Vec<Vec<u32>>, Vec<(u32, Vec<u32>)>) {
     let t = Instant::now();
-    eqs.sort_by_key(|e| e.len());
+    let mut order: Vec<u32> = (0..eqs.len() as u32).collect();
+    order.sort_by_key(|&e| eqs[e as usize].len());
     let mut pivot: Vec<u32> = vec![u32::MAX; nvars as usize];
     let mut rows: Vec<Vec<u32>> = vec![];
+    let mut prov: Vec<(u32, Vec<u32>)> = vec![];
     let (mut xors, mut maxlen) = (0usize, 0usize);
-    for (n, mut r) in eqs.into_iter().enumerate() {
+    for (n, &e) in order.iter().enumerate() {
+        let mut r = eqs[e as usize].clone();
+        let mut used = vec![];
         while let Some(&c) = r.first() {
             let p = pivot[c as usize];
             if p == u32::MAX {
                 maxlen = maxlen.max(r.len());
                 pivot[c as usize] = rows.len() as u32;
                 rows.push(r);
+                if track {
+                    prov.push((e, used));
+                }
                 break;
             }
             r = xor_sorted(&r, &rows[p as usize]);
+            if track {
+                used.push(p);
+            }
             xors += 1;
         }
         if n % 1_000_000 == 0 && n > 0 {
@@ -611,7 +647,44 @@ fn eliminate(nvars: u32, mut eqs: Vec<Vec<u32>>) -> Vec<bool> {
         fill,
         t.elapsed().as_secs_f64()
     );
-    pivot.iter().map(|&p| p != u32::MAX).collect()
+    (pivot, rows, prov)
+}
+
+/// Number of nonzero coordinates of each vector of the reduced basis of the kernel: the vector of a
+/// free column is 1 there, 0 on the other free columns, and solved on the pivots. Lanes of 64 free
+/// columns are back-substituted at once.
+fn kernel_density(pivot: &[u32], rows: &[Vec<u32>]) -> Vec<(u32, usize)> {
+    let free: Vec<u32> = (0..pivot.len() as u32)
+        .filter(|&c| pivot[c as usize] == u32::MAX)
+        .collect();
+    let pivcols: Vec<u32> = (0..pivot.len() as u32)
+        .rev()
+        .filter(|&c| pivot[c as usize] != u32::MAX)
+        .collect();
+    let chunks: Vec<&[u32]> = free.chunks(64).collect();
+    chunks
+        .par_iter()
+        .flat_map_iter(|chunk| {
+            let mut val = vec![0u64; pivot.len()];
+            for (l, &f) in chunk.iter().enumerate() {
+                val[f as usize] = 1 << l;
+            }
+            // a pivot row's other entries are at larger columns, already solved
+            for &p in &pivcols {
+                let r = &rows[pivot[p as usize] as usize];
+                val[p as usize] = r[1..].iter().fold(0, |acc, &c| acc ^ val[c as usize]);
+            }
+            let mut nnz = vec![0usize; chunk.len()];
+            for &x in &val {
+                let mut x = x;
+                while x != 0 {
+                    nnz[x.trailing_zeros() as usize] += 1;
+                    x &= x - 1;
+                }
+            }
+            chunk.iter().copied().zip(nnz).collect::<Vec<_>>()
+        })
+        .collect()
 }
 
 /// Evaluates every equation at a known d2 (`stem,Adams_filtration,index,target` in this basis).
@@ -670,6 +743,157 @@ fn check_d2(ext: &Ext, v: &Vars, eqs: &[Vec<u32>], path: &str) {
     );
 }
 
+/// Names a variable: coordinate `k` of `d(x_(n, f, r))`.
+fn var_name(ext: &Ext, v: &Vars, y: u32) -> String {
+    let (c, _) = v
+        .off
+        .iter()
+        .enumerate()
+        .filter(|&(_, &o)| o != u32::MAX && o <= y)
+        .max_by_key(|&(_, &o)| o)
+        .unwrap();
+    let dp = ext.dim[ext.prime(c as u32).unwrap() as usize];
+    let rel = (y - v.off[c]) as usize;
+    let (n, f) = ext.deg[c];
+    format!("d(x_({n},{f},{}))[{}]", rel / dp, rel % dp)
+}
+
+/// Whether `target` lies in the span of the equations `set`.
+fn implied(eqs: &[Vec<u32>], set: &[u32], target: &[u32]) -> bool {
+    let mut piv: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
+    for &e in set {
+        let mut r = eqs[e as usize].clone();
+        while let Some(&c) = r.first() {
+            match piv.get(&c) {
+                Some(p) => r = xor_sorted(&r, p),
+                None => {
+                    piv.insert(c, r);
+                    break;
+                }
+            }
+        }
+    }
+    let mut r = target.to_vec();
+    while let Some(&c) = r.first() {
+        match piv.get(&c) {
+            Some(p) => r = xor_sorted(&r, p),
+            None => return false,
+        }
+    }
+    true
+}
+
+/// Writes a set of Leibniz equations whose sum expresses the variable `x` through the free
+/// variables, shrunk greedily, each with the product it comes from.
+#[allow(clippy::too_many_arguments)]
+fn certificate(
+    ext: &Ext,
+    p: &Products,
+    v: &Vars,
+    eqs: &[Vec<u32>],
+    origins: &[Origin],
+    pivot: &[u32],
+    rows: &[Vec<u32>],
+    prov: &[(u32, Vec<u32>)],
+    x: u32,
+) {
+    let t = Instant::now();
+    assert_ne!(
+        pivot[x as usize],
+        u32::MAX,
+        "{} is free",
+        var_name(ext, v, x)
+    );
+    // back-substitute: x + (free variables), as a sum of rows
+    let mut rp = vec![false; rows.len()];
+    let mut e = rows[pivot[x as usize] as usize].clone();
+    rp[pivot[x as usize] as usize] = true;
+    loop {
+        let Some(&c) = e.iter().find(|&&c| c != x && pivot[c as usize] != u32::MAX) else {
+            break;
+        };
+        let r = pivot[c as usize] as usize;
+        e = xor_sorted(&e, &rows[r]);
+        rp[r] ^= true;
+    }
+    let rel: Vec<String> = e.iter().map(|&y| var_name(ext, v, y)).collect();
+    println!("relation: {} = 0", rel.join(" + "));
+    // expand rows into equations, latest row first
+    let mut ep = vec![false; eqs.len()];
+    for r in (0..rows.len()).rev() {
+        if rp[r] {
+            ep[prov[r].0 as usize] ^= true;
+            for &u in &prov[r].1 {
+                rp[u as usize] ^= true;
+            }
+        }
+    }
+    let mut set: Vec<u32> = (0..eqs.len() as u32).filter(|&i| ep[i as usize]).collect();
+    let sum = set.iter().fold(vec![], |acc: Vec<u32>, &i| {
+        xor_sorted(&acc, &eqs[i as usize])
+    });
+    assert_eq!(sum, e, "certificate does not sum to the relation");
+    println!(
+        "certificate: {} equations ({:.1}s)",
+        set.len(),
+        t.elapsed().as_secs_f64()
+    );
+    // greedy shrink, longest equations first
+    if set.len() <= 20_000 {
+        set.sort_by_key(|&i| std::cmp::Reverse(eqs[i as usize].len()));
+        let mut k = 0;
+        while k < set.len() {
+            let trial: Vec<u32> = set
+                .iter()
+                .enumerate()
+                .filter(|&(j, _)| j != k)
+                .map(|(_, &i)| i)
+                .collect();
+            if implied(eqs, &trial, &e) {
+                set = trial;
+            } else {
+                k += 1;
+            }
+        }
+        // the minimal set implies e; recover the combination that sums to it
+        println!(
+            "shrunk: {} equations ({:.1}s)",
+            set.len(),
+            t.elapsed().as_secs_f64()
+        );
+    }
+    let cls = |b: u32, i: u8| {
+        let (n, f) = ext.deg[b as usize];
+        format!("x_({n},{f},{i})")
+    };
+    let mut set = set;
+    set.sort_by_key(|&i| {
+        let o = origins[i as usize];
+        let (n, f) = ext.deg[ext.sum(o.a, o.b).unwrap() as usize];
+        (n, f)
+    });
+    for &i in &set {
+        let o = origins[i as usize];
+        let c = ext.sum(o.a, o.b).unwrap();
+        let (cn, cf) = ext.deg[c as usize];
+        let prod = p.mul(ext, o.a, o.i as usize, o.b, o.j as usize);
+        let terms: Vec<String> = eqs[i as usize]
+            .iter()
+            .map(|&y| var_name(ext, v, y))
+            .collect();
+        println!(
+            "  {} * {} = {:?} in ({cn},{cf}); coordinate {} of d: {} = 0",
+            cls(o.a, o.i),
+            cls(o.b, o.j),
+            (0..ext.dim[c as usize])
+                .map(|r| prod >> r & 1)
+                .collect::<Vec<_>>(),
+            o.k,
+            terms.join(" + ")
+        );
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let dir = &args[1];
@@ -681,11 +905,110 @@ fn main() {
     check_products(&ext, &p);
     let v = vars(&ext);
     eprintln!("dim H = {}", v.n);
-    let eqs = equations(&ext, &p, &v, gens_only);
+    let (eqs, origins) = equations(&ext, &p, &v, gens_only);
     if let Some(i) = args.iter().position(|a| a == "--check-d2") {
         check_d2(&ext, &v, &eqs, &args[i + 1]);
     }
-    let piv = eliminate(v.n, eqs);
+    let cert = args.iter().position(|a| a == "--certificate");
+    let (pivot, rows, prov) = eliminate(v.n, &eqs, cert.is_some());
+    if let Some(i) = cert {
+        let q: Vec<i32> = args[i + 1..i + 5]
+            .iter()
+            .map(|a| a.parse().unwrap())
+            .collect();
+        let c = ext.get(q[0], q[1]).unwrap();
+        let x = var(&ext, &v, c, q[2] as usize, q[3] as usize);
+        certificate(&ext, &p, &v, &eqs, &origins, &pivot, &rows, &prov, x);
+    }
+    let piv: Vec<bool> = pivot.iter().map(|&p| p != u32::MAX).collect();
+    if args.iter().any(|a| a == "--density") {
+        let mut dens = kernel_density(&pivot, &rows);
+        dens.sort_by_key(|&(_, n)| std::cmp::Reverse(n));
+        // free column -> source bidegree and coordinate
+        let describe = |x: u32| {
+            let (c, _) = v
+                .off
+                .iter()
+                .enumerate()
+                .filter(|&(_, &o)| o != u32::MAX && o <= x)
+                .max_by_key(|&(_, &o)| o)
+                .unwrap();
+            let cp = ext.prime(c as u32).unwrap();
+            let dp = ext.dim[cp as usize];
+            let rel = (x - v.off[c]) as usize;
+            let (n, f) = ext.deg[c];
+            let (pn, pf) = ext.deg[cp as usize];
+            format!("x_({n},{f},{}) -> x_({pn},{pf},{})", rel / dp, rel % dp)
+        };
+        for &(x, n) in dens.iter().take(12) {
+            eprintln!("density {n:>8}  {}", describe(x));
+        }
+        let mut hist = BTreeMap::new();
+        for &(_, n) in &dens {
+            *hist.entry(n.next_power_of_two()).or_insert(0usize) += 1;
+        }
+        eprintln!("density histogram (<= power of two): {hist:?}");
+    }
+    // --explain n f i k: express the coordinate k of d(x_(n,f,i)) in the free coordinates
+    if let Some(i) = args.iter().position(|a| a == "--explain") {
+        let q: Vec<i32> = args[i + 1..i + 5]
+            .iter()
+            .map(|a| a.parse().unwrap())
+            .collect();
+        let c = ext.get(q[0], q[1]).unwrap();
+        let x = var(&ext, &v, c, q[2] as usize, q[3] as usize);
+        let free: Vec<u32> = (0..v.n)
+            .filter(|&c| pivot[c as usize] == u32::MAX)
+            .collect();
+        let deps: Vec<u32> = free
+            .par_chunks(64)
+            .flat_map_iter(|chunk| {
+                let mut val = vec![0u64; v.n as usize];
+                for (l, &f) in chunk.iter().enumerate() {
+                    val[f as usize] = 1 << l;
+                }
+                for p in (0..v.n).rev().filter(|&c| pivot[c as usize] != u32::MAX) {
+                    let r = &rows[pivot[p as usize] as usize];
+                    val[p as usize] = r[1..].iter().fold(0, |acc, &c| acc ^ val[c as usize]);
+                }
+                let m = val[x as usize];
+                chunk
+                    .iter()
+                    .enumerate()
+                    .filter(move |&(l, _)| m >> l & 1 == 1)
+                    .map(|(_, &f)| f)
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        let name = |y: u32| {
+            let (c, _) = v
+                .off
+                .iter()
+                .enumerate()
+                .filter(|&(_, &o)| o != u32::MAX && o <= y)
+                .max_by_key(|&(_, &o)| o)
+                .unwrap();
+            let dp = ext.dim[ext.prime(c as u32).unwrap() as usize];
+            let rel = (y - v.off[c]) as usize;
+            let (n, f) = ext.deg[c];
+            format!("d(x_({n},{f},{}))[{}]", rel / dp, rel % dp)
+        };
+        let pivot_or_free = if pivot[x as usize] == u32::MAX {
+            "free"
+        } else {
+            "pivot"
+        };
+        let terms: Vec<String> = deps.iter().map(|&y| name(y)).collect();
+        println!(
+            "explain: {} ({pivot_or_free}) = {}",
+            name(x),
+            if terms.is_empty() {
+                "0".into()
+            } else {
+                terms.join(" + ")
+            }
+        );
+    }
     let free_total = piv.iter().filter(|&&x| !x).count();
     println!(
         "N={n_max} F={f_max} gens_only={gens_only} dimE2={} dimH={} dimD={free_total}",
