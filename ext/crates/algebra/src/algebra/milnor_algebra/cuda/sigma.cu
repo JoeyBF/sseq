@@ -306,15 +306,19 @@ extern "C" __global__ void sigma_pair(const u64 *__restrict__ item_r, const u64 
 // one step of `multiply.cu`'s walk for every live lane, so the lanes of a warp stay in step however
 // unevenly their pairs' work falls.
 //
-// The walk state is u16 in shared memory with stride NT, as in `antidiag_body`, plus FLG per cell:
-// the carry and parity bits of the mod-4 coefficient before the cell (zero mod 2). Terms are queued
+// The walk state is u16 in shared memory with stride NT, as in `antidiag_body`. BEF also holds the
+// carry and parity bits of the mod-4 coefficient before the cell (zero mod 2) above BEF_SUM_BITS,
+// which a diagonal's sum never reaches (it is at most `PPart::MAX_DEGREE`). Terms are queued
 // per warp with their target word's offset and a code: SIG_Y for a Y term, else the coefficient
 // mod 4, and emitted 32 at a time.
 
 // Bytes of shared memory the sigma walk state of a block takes (16-byte aligned); the queue
 // follows. Mirrored by `sigma_shared_bytes` in `mod.rs`.
-#define SIG_STATE_U16(N) (3 * ((N) * ((N) - 1) / 2) + 2 * ((N) + 1))
+#define SIG_STATE_U16(N) (2 * ((N) * ((N) - 1) / 2) + 2 * ((N) + 1))
 #define SIG_STATE_BYTES(N) (((SIG_STATE_U16(N) * 2u * NT) + 15u) & ~15u)
+
+#define BEF_SUM_BITS 14
+#define BEF_SUM_MASK ((1u << BEF_SUM_BITS) - 1u)
 
 // The code of a Y term in the queue: plain XOR into `ones`.
 #define SIG_Y 4u
@@ -376,9 +380,8 @@ __device__ __forceinline__ void sigma_body(const u64 *__restrict__ item_r,
 #define CELL(d, i) (((d) - 2) * ((d) - 1) / 2 + (i) - 1)
 #define VAL(c) base[(c) * NT]
 #define BEF(c) base[(CELLS + (c)) * NT]
-#define FLG(c) base[(2 * CELLS + (c)) * NT]
-#define RL(k) base[(3 * CELLS + (k)) * NT]
-#define SL(k) base[(3 * CELLS + N + 1 + (k)) * NT]
+#define RL(k) base[(2 * CELLS + (k)) * NT]
+#define SL(k) base[(2 * CELLS + N + 1 + (k)) * NT]
 #define LO(d) max(1, (int)(d) - (int)cols)
 #define HI(d) min((int)rows, (int)(d) - 1)
 
@@ -535,8 +538,7 @@ __device__ __forceinline__ void sigma_body(const u64 *__restrict__ item_r,
             u32 used = 0, ufl = 0;
             if (!back) {
                 // ENTER: value 0 changes nothing.
-                BEF(c) = (u16)tally;
-                FLG(c) = (u16)flags;
+                BEF(c) = (u16)(tally | (flags << BEF_SUM_BITS));
                 VAL(c) = 0;
                 used = tally;
                 ufl = flags;
@@ -545,8 +547,9 @@ __device__ __forceinline__ void sigma_body(const u64 *__restrict__ item_r,
                 // BACKTRACK: the next value of this cell the coefficient allows, if it still fits
                 // what is left of row i and column j; else give the cell up.
                 u32 v = VAL(c);
-                u32 mask = BEF(c);
-                u32 bfl = FLG(c);
+                u32 bef = BEF(c);
+                u32 mask = bef & BEF_SUM_MASK;
+                u32 bfl = bef >> BEF_SUM_BITS;
                 u64 next;
                 if (mod4) {
                     M4 st = {mask, bfl & F_CARRIED, (bfl & F_ODD) ? 1u : 0u};
@@ -644,7 +647,6 @@ __device__ __forceinline__ void sigma_body(const u64 *__restrict__ item_r,
 #undef CELL
 #undef VAL
 #undef BEF
-#undef FLG
 #undef RL
 #undef SL
 #undef LO

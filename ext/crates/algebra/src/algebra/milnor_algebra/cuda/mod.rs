@@ -92,7 +92,7 @@ fn shared_bytes(n: usize) -> usize {
 /// Shared memory of one block of the width-`n` sigma kernel: the walk state (`SIG_STATE_BYTES`)
 /// and the queue, as in [`shared_bytes`].
 fn sigma_shared_bytes(n: usize) -> usize {
-    let state = (3 * (n * (n - 1) / 2) + 2 * (n + 1)) * size_of::<u16>() * THREADS as usize;
+    let state = (n * (n - 1) + 2 * (n + 1)) * size_of::<u16>() * THREADS as usize;
     let warps = THREADS as usize / 32;
     state.next_multiple_of(16) + warps * (64 * 16 + 4)
 }
