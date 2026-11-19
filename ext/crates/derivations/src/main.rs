@@ -666,7 +666,7 @@ fn eliminate(
 /// Number of nonzero coordinates of each vector of the reduced basis of the kernel: the vector of a
 /// free column is 1 there, 0 on the other free columns, and solved on the pivots. Lanes of 64 free
 /// columns are back-substituted at once.
-fn kernel_density(pivot: &[u32], rows: &[Vec<u32>]) -> Vec<(u32, usize)> {
+fn kernel_density(pivot: &[u32], rows: &[Vec<u32>], stem: &[i32]) -> Vec<(u32, usize, i32, i32)> {
     let free: Vec<u32> = (0..pivot.len() as u32)
         .filter(|&c| pivot[c as usize] == u32::MAX)
         .collect();
@@ -688,14 +688,21 @@ fn kernel_density(pivot: &[u32], rows: &[Vec<u32>]) -> Vec<(u32, usize)> {
                 val[p as usize] = r[1..].iter().fold(0, |acc, &c| acc ^ val[c as usize]);
             }
             let mut nnz = vec![0usize; chunk.len()];
-            for &x in &val {
+            let mut lo = vec![i32::MAX; chunk.len()];
+            let mut hi = vec![i32::MIN; chunk.len()];
+            for (c, &x) in val.iter().enumerate() {
                 let mut x = x;
                 while x != 0 {
-                    nnz[x.trailing_zeros() as usize] += 1;
+                    let l = x.trailing_zeros() as usize;
+                    nnz[l] += 1;
+                    lo[l] = lo[l].min(stem[c]);
+                    hi[l] = hi[l].max(stem[c]);
                     x &= x - 1;
                 }
             }
-            chunk.iter().copied().zip(nnz).collect::<Vec<_>>()
+            (0..chunk.len())
+                .map(|l| (chunk[l], nnz[l], lo[l], hi[l]))
+                .collect::<Vec<_>>()
         })
         .collect()
 }
@@ -1018,8 +1025,8 @@ fn main() {
     }
     let piv: Vec<bool> = pivot.iter().map(|&p| p != u32::MAX).collect();
     if args.iter().any(|a| a == "--density") {
-        let mut dens = kernel_density(&pivot, &rows);
-        dens.sort_by_key(|&(_, n)| std::cmp::Reverse(n));
+        let mut dens = kernel_density(&pivot, &rows, &v.stem);
+        dens.sort_by_key(|&(_, n, _, _)| std::cmp::Reverse(n));
         // free column -> source bidegree and coordinate
         let describe = |x: u32| {
             let (c, _) = v
@@ -1036,11 +1043,25 @@ fn main() {
             let (pn, pf) = ext.deg[cp as usize];
             format!("x_({n},{f},{}) -> x_({pn},{pf},{})", rel / dp, rel % dp)
         };
-        for &(x, n) in dens.iter().take(12) {
+        if let Some(j) = args.iter().position(|a| a == "--density-dump") {
+            use std::io::Write;
+            let mut w = std::io::BufWriter::new(File::create(&args[j + 1]).unwrap());
+            writeln!(w, "pivot,pivot_stem,nnz,min_stem,max_stem").unwrap();
+            for &(x, n, lo, hi) in &dens {
+                writeln!(
+                    w,
+                    "{},{},{n},{lo},{hi}",
+                    var_name(&ext, &v, x),
+                    v.stem[x as usize]
+                )
+                .unwrap();
+            }
+        }
+        for &(x, n, _, _) in dens.iter().take(12) {
             eprintln!("density {n:>8}  {}", describe(x));
         }
         let mut hist = BTreeMap::new();
-        for &(_, n) in &dens {
+        for &(_, n, _, _) in &dens {
             *hist.entry(n.next_power_of_two()).or_insert(0usize) += 1;
         }
         eprintln!("density histogram (<= power of two): {hist:?}");
