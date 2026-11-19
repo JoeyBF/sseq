@@ -89,6 +89,11 @@ fn main() -> anyhow::Result<()> {
         Ok::<_, anyhow::Error>(s.to_string())
     });
     let save = (save != "-").then(|| PathBuf::from(save));
+    // With the sphere's indecomposables (a ring export's `indecomposables.csv`), only their action
+    // is computed and the sphere's own products are left to the ring export.
+    let inds_path: String = query::with_default("S indecomposables (- for all products)", "-", |s| {
+        Ok::<_, anyhow::Error>(s.to_string())
+    });
     std::fs::create_dir_all(&dir)?;
 
     let t_max = max_n + max_s + 2;
@@ -185,9 +190,94 @@ fn main() -> anyhow::Result<()> {
         Ok(rows)
     }
 
-    let mut w = csv(&dir, "products.csv", header)?;
-    let n = action(&ext_s, &bidegrees, &dim_s, &in_range, &mut w)?;
-    eprintln!("S: {n} products");
+    let top = Bidegree::n_s(max_n, max_s);
+    let inds: Option<Vec<BidegreeGenerator>> = (inds_path != "-").then(|| {
+        std::fs::read_to_string(&inds_path)
+            .expect("indecomposables file")
+            .lines()
+            .skip(1)
+            .filter_map(|l| {
+                let v: Vec<&str> = l.split(',').collect();
+                let (n, s, i): (i32, i32, usize) =
+                    (v[0].parse().ok()?, v[1].parse().ok()?, v[2].parse().ok()?);
+                (n <= max_n && s <= max_s && i < dim_s(Bidegree::n_s(n, s)))
+                    .then(|| BidegreeGenerator::new(Bidegree::n_s(n, s), i))
+            })
+            .collect()
+    });
+    if inds.is_none() {
+        let mut w = csv(&dir, "products.csv", header)?;
+        let n = action(&ext_s, &bidegrees, &dim_s, &in_range, &mut w)?;
+        eprintln!("S: {n} products");
+    }
+
+    /// Writes the action of the given sphere classes (indecomposables) on `ext`, by cupping each
+    /// cocycle with the classes' self-maps.
+    fn ind_action<
+        CC: ext::chain_complex::FreeChainComplex + ext::chain_complex::AugmentedChainComplex,
+    >(
+        ext: &ExtAlgebra<CC>,
+        inds: &[BidegreeGenerator],
+        bidegrees: &[Bidegree],
+        in_range: &(dyn Fn(Bidegree) -> bool + Sync),
+        top: Bidegree,
+        w: &mut BufWriter<File>,
+    ) -> anyhow::Result<usize> {
+        use maybe_rayon::prelude::*;
+        let cup = std::sync::Arc::clone(ext.cup().expect("a cup product"));
+        // one thread per self-map: extending one map from two threads races in its `OnceVec`s
+        inds.to_vec().into_maybe_par_iter().for_each(|g| {
+            ext.unit_self_map(g).extend_through_stem(top);
+        });
+        let dim = |b: Bidegree| ext.cohomology_dimension(b).unwrap_or(0);
+        let chunks: Vec<Vec<String>> = bidegrees
+            .to_vec()
+            .into_maybe_par_iter()
+            .map(|c| {
+                let mut out = vec![];
+                let dc = dim(c);
+                if dc == 0 {
+                    return out;
+                }
+                let lifts: Vec<Cochain> = (0..dc)
+                    .map(|x| ext.lift(&ext.generator(BidegreeGenerator::new(c, x))))
+                    .collect();
+                for g in inds {
+                    let t = c + g.degree();
+                    if !in_range(t) || dim(t) == 0 {
+                        continue;
+                    }
+                    let f = ext.unit_self_map(*g);
+                    let mat = cup.cup_matrix(&f, c.s(), c.t(), g.degree());
+                    for (x, l) in lifts.iter().enumerate() {
+                        let mut v = FpVector::new(ext.prime(), ext.cochain_dimension(t));
+                        mat.apply(v.as_slice_mut(), 1, l.vec());
+                        let cls = ext.project(&Cochain::new(t, v));
+                        if !cls.vec().is_zero() {
+                            out.push(format!(
+                                "{},{},{},{},{},{x},{}",
+                                g.degree().n(),
+                                g.degree().s(),
+                                g.idx(),
+                                c.n(),
+                                c.s(),
+                                vector(cls.vec().iter())
+                            ));
+                        }
+                    }
+                }
+                out
+            })
+            .collect();
+        let mut rows = 0;
+        for chunk in chunks {
+            for l in chunk {
+                writeln!(w, "{l}")?;
+                rows += 1;
+            }
+        }
+        Ok(rows)
+    }
 
     for spec in specs.split(',') {
         let (name, k) = spec.split_once(':').context("name:k")?;
@@ -203,8 +293,13 @@ fn main() -> anyhow::Result<()> {
                 writeln!(w, "{},{},{}", b.n(), b.s(), dim_m(b))?;
             }
         }
-        let mut w = csv(&dir, &format!("{name}_action.csv"), header)?;
-        let n = action(&ext_m, &bidegrees, &dim_s, &in_range, &mut w)?;
+        let n = if let Some(inds) = &inds {
+            let mut w = csv(&dir, &format!("{name}_indaction.csv"), header)?;
+            ind_action(&ext_m, inds, &bidegrees, &in_range, top, &mut w)?
+        } else {
+            let mut w = csv(&dir, &format!("{name}_action.csv"), header)?;
+            action(&ext_m, &bidegrees, &dim_s, &in_range, &mut w)?
+        };
 
         // i_*: g^* ↦ (g, x_0)^*, then project
         let mut wi = csv(&dir, &format!("{name}_istar.csv"), "stem,Adams_filtration,index,image")?;
