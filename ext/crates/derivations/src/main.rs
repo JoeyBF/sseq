@@ -59,6 +59,16 @@ impl Ext {
         let (bn, bf) = self.deg[b as usize];
         self.get(an + bn, af + bf)
     }
+    /// The bidegree `(A + B)'` where `d(xy)` lives, which can be non-zero even when `A + B` is.
+    fn sum_prime(&self, a: u32, b: u32) -> Option<u32> {
+        let (an, af) = self.deg[a as usize];
+        let (bn, bf) = self.deg[b as usize];
+        let (n, f) = (an + bn, af + bf);
+        if !self.in_range(n, f) {
+            return None;
+        }
+        self.get(n - 1, f + 2)
+    }
     /// target of d: (n - 1, f + 2)
     fn prime(&self, a: u32) -> Option<u32> {
         let (n, f) = self.deg[a as usize];
@@ -495,17 +505,17 @@ fn equations(ext: &Ext, p: &Products, v: &Vars, gens_only: bool) -> (Vec<Vec<u32
     let pairs: Vec<(u32, u32)> = (0..nb)
         .flat_map(|a| (0..nb).map(move |b| (a, b)))
         .filter(|&(a, b)| p.rank_of[a as usize] <= p.rank_of[b as usize])
-        .filter(|&(a, b)| ext.sum(a, b).and_then(|c| ext.prime(c)).is_some())
+        .filter(|&(a, b)| ext.sum_prime(a, b).is_some())
         .collect();
     let (eqs, origins): (Vec<Vec<u32>>, Vec<Origin>) = pairs
         .par_iter()
         .flat_map_iter(|&(a, b)| {
-            let c = ext.sum(a, b).unwrap();
-            let cp = ext.prime(c).unwrap();
-            let (da, db, dc, dcp) = (
+            // `A + B` may be zero-dimensional (`xy = 0` for degree reasons)
+            let c = ext.sum(a, b);
+            let cp = ext.sum_prime(a, b).unwrap();
+            let (da, db, dcp) = (
                 ext.dim[a as usize],
                 ext.dim[b as usize],
-                ext.dim[c as usize],
                 ext.dim[cp as usize],
             );
             let ap = ext.prime(a);
@@ -522,7 +532,11 @@ fn equations(ext: &Ext, p: &Products, v: &Vars, gens_only: bool) -> (Vec<Vec<u32
                     {
                         continue;
                     }
-                    let xy = p.mul(ext, a, i, b, j);
+                    let xy = if c.is_some() {
+                        p.mul(ext, a, i, b, j)
+                    } else {
+                        0
+                    };
                     for k in 0..dcp {
                         let mut eq: Vec<u32> = vec![];
                         // (e_i e_j) d^C
@@ -530,7 +544,7 @@ fn equations(ext: &Ext, p: &Products, v: &Vars, gens_only: bool) -> (Vec<Vec<u32
                         while m != 0 {
                             let r = m.trailing_zeros() as usize;
                             m &= m - 1;
-                            eq.push(var(ext, v, c, r, k));
+                            eq.push(var(ext, v, c.unwrap(), r, k));
                         }
                         // d(e_i) e_j: sum_c x^A_{i,c} [e_c e_j]_k
                         if let Some(ap) = ap {
@@ -571,7 +585,6 @@ fn equations(ext: &Ext, p: &Products, v: &Vars, gens_only: bool) -> (Vec<Vec<u32
                             ));
                         }
                     }
-                    let _ = dc;
                 }
             }
             out
@@ -796,7 +809,7 @@ fn certificate(
     rows: &[Vec<u32>],
     prov: &[(u32, Vec<u32>)],
     x: u32,
-) {
+) -> (Vec<u32>, Vec<u32>) {
     let t = Instant::now();
     assert_ne!(
         pivot[x as usize],
@@ -866,17 +879,23 @@ fn certificate(
         let (n, f) = ext.deg[b as usize];
         format!("x_({n},{f},{i})")
     };
+    let deg_sum = |o: Origin| {
+        let (an, af) = ext.deg[o.a as usize];
+        let (bn, bf) = ext.deg[o.b as usize];
+        (an + bn, af + bf)
+    };
     let mut set = set;
-    set.sort_by_key(|&i| {
-        let o = origins[i as usize];
-        let (n, f) = ext.deg[ext.sum(o.a, o.b).unwrap() as usize];
-        (n, f)
-    });
+    set.sort_by_key(|&i| deg_sum(origins[i as usize]));
     for &i in &set {
         let o = origins[i as usize];
-        let c = ext.sum(o.a, o.b).unwrap();
-        let (cn, cf) = ext.deg[c as usize];
-        let prod = p.mul(ext, o.a, o.i as usize, o.b, o.j as usize);
+        let (cn, cf) = deg_sum(o);
+        let c = ext.sum(o.a, o.b);
+        let prod = if c.is_some() {
+            p.mul(ext, o.a, o.i as usize, o.b, o.j as usize)
+        } else {
+            0
+        };
+        let dc = c.map_or(0, |c| ext.dim[c as usize]);
         let terms: Vec<String> = eqs[i as usize]
             .iter()
             .map(|&y| var_name(ext, v, y))
@@ -885,13 +904,79 @@ fn certificate(
             "  {} * {} = {:?} in ({cn},{cf}); coordinate {} of d: {} = 0",
             cls(o.a, o.i),
             cls(o.b, o.j),
-            (0..ext.dim[c as usize])
-                .map(|r| prod >> r & 1)
-                .collect::<Vec<_>>(),
+            (0..dc).map(|r| prod >> r & 1).collect::<Vec<_>>(),
             o.k,
             terms.join(" + ")
         );
     }
+    (e, set)
+}
+
+/// Writes a pool of equations around a certificate for an exact minimum search: the equations
+/// meeting the certificate's variables, and those lying entirely in the variables these reach.
+/// Format: `relation <vars>`, `name <var> <name>`, then `eq <id> <origin> : <vars>`.
+fn dump_pool(
+    ext: &Ext,
+    v: &Vars,
+    eqs: &[Vec<u32>],
+    origins: &[Origin],
+    rel: &[u32],
+    set: &[u32],
+    path: &str,
+) {
+    use std::io::Write;
+    let mut v0 = vec![false; v.n as usize];
+    for &i in set {
+        for &y in &eqs[i as usize] {
+            v0[y as usize] = true;
+        }
+    }
+    let touching: Vec<u32> = (0..eqs.len() as u32)
+        .into_par_iter()
+        .filter(|&i| eqs[i as usize].iter().any(|&y| v0[y as usize]))
+        .collect();
+    let mut v1 = v0.clone();
+    for &i in &touching {
+        for &y in &eqs[i as usize] {
+            v1[y as usize] = true;
+        }
+    }
+    let pool: Vec<u32> = (0..eqs.len() as u32)
+        .into_par_iter()
+        .filter(|&i| eqs[i as usize].iter().all(|&y| v1[y as usize]))
+        .collect();
+    let mut w = std::io::BufWriter::new(File::create(path).unwrap());
+    let rel_s: Vec<String> = rel.iter().map(|y| y.to_string()).collect();
+    writeln!(w, "relation {}", rel_s.join(" ")).unwrap();
+    let mut named = vec![false; v.n as usize];
+    for &i in &pool {
+        for &y in &eqs[i as usize] {
+            if !named[y as usize] {
+                named[y as usize] = true;
+                writeln!(w, "name {y} {}", var_name(ext, v, y)).unwrap();
+            }
+        }
+    }
+    for &i in &pool {
+        let o = origins[i as usize];
+        let (an, af) = ext.deg[o.a as usize];
+        let (bn, bf) = ext.deg[o.b as usize];
+        let vs: Vec<String> = eqs[i as usize].iter().map(|y| y.to_string()).collect();
+        writeln!(
+            w,
+            "eq {i} x_({an},{af},{})*x_({bn},{bf},{})[{}] : {}",
+            o.i,
+            o.j,
+            o.k,
+            vs.join(" ")
+        )
+        .unwrap();
+    }
+    eprintln!(
+        "pool: {} touching, {} in the closure, written to {path}",
+        touching.len(),
+        pool.len()
+    );
 }
 
 fn main() {
@@ -918,7 +1003,10 @@ fn main() {
             .collect();
         let c = ext.get(q[0], q[1]).unwrap();
         let x = var(&ext, &v, c, q[2] as usize, q[3] as usize);
-        certificate(&ext, &p, &v, &eqs, &origins, &pivot, &rows, &prov, x);
+        let (rel, set) = certificate(&ext, &p, &v, &eqs, &origins, &pivot, &rows, &prov, x);
+        if let Some(j) = args.iter().position(|a| a == "--dump-pool") {
+            dump_pool(&ext, &v, &eqs, &origins, &rel, &set, &args[j + 1]);
+        }
     }
     let piv: Vec<bool> = pivot.iter().map(|&p| p != u32::MAX).collect();
     if args.iter().any(|a| a == "--density") {
