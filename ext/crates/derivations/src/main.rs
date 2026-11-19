@@ -455,15 +455,465 @@ fn check_products(ext: &Ext, p: &Products) {
     assert_eq!(bad, 0);
 }
 
+/// The E2 page of a two-cell complex `S ∪ e^{shift+1}`, as a module over the sphere's, with the
+/// maps induced by the bottom-cell inclusion and the top-cell collapse (files written by ext's
+/// `cofiber_export` example in the sphere's basis).
+struct Module {
+    name: String,
+    shift: i32,
+    bid: FxHashMap<(i32, i32), u32>,
+    deg: Vec<(i32, i32)>,
+    dim: Vec<usize>,
+    off: Vec<u32>,
+    /// (sphere indecomposable, module basis element) -> product
+    ind_act: FxHashMap<(u32, u32), u64>,
+    /// sphere basis element -> image under `i_*`, in the same bidegree
+    istar: FxHashMap<u32, u64>,
+    /// module basis element -> image under `p_*`, `shift` stems lower in the sphere
+    pstar: FxHashMap<u32, Mask>,
+    /// (sphere bidegree, module bidegree) -> products, `dim A x dim B`
+    act: FxHashMap<(u32, u32), Vec<u64>>,
+}
+
+impl Module {
+    fn get(&self, ext: &Ext, n: i32, f: i32) -> Option<u32> {
+        if !ext.in_range(n, f) {
+            return None;
+        }
+        self.bid.get(&(n, f)).copied()
+    }
+    fn prime(&self, ext: &Ext, b: u32) -> Option<u32> {
+        let (n, f) = self.deg[b as usize];
+        self.get(ext, n - 1, f + 2)
+    }
+    fn gid(&self, b: u32, i: usize) -> u32 {
+        self.off[b as usize] + i as u32
+    }
+    /// The module bidegree of (sphere bidegree `a`) · (module bidegree `b`).
+    fn sum(&self, ext: &Ext, a: u32, b: u32) -> Option<u32> {
+        let (an, af) = ext.deg[a as usize];
+        let (bn, bf) = self.deg[b as usize];
+        self.get(ext, an + bn, af + bf)
+    }
+    /// `(A + B)'`, which can be non-zero even when `A + B` is.
+    fn sum_prime(&self, ext: &Ext, a: u32, b: u32) -> Option<u32> {
+        let (an, af) = ext.deg[a as usize];
+        let (bn, bf) = self.deg[b as usize];
+        if !ext.in_range(an + bn, af + bf) {
+            return None;
+        }
+        self.get(ext, an + bn - 1, af + bf + 2)
+    }
+    fn mul(&self, a: u32, i: usize, b: u32, j: usize) -> u64 {
+        self.act
+            .get(&(a, b))
+            .map_or(0, |bl| bl[i * self.dim[b as usize] + j])
+    }
+}
+
+fn parse_vec64(s: &str) -> u64 {
+    let s = s
+        .trim()
+        .trim_matches('"')
+        .trim_start_matches('[')
+        .trim_end_matches(']');
+    let mut m = 0;
+    for (k, e) in s.split(',').enumerate() {
+        if e.trim() == "1" {
+            m |= 1 << k;
+        }
+    }
+    m
+}
+
+fn load_module(ext: &Ext, dir: &str, name: &str, shift: i32) -> Module {
+    let mut m = Module {
+        name: name.to_string(),
+        shift,
+        bid: FxHashMap::default(),
+        deg: vec![],
+        dim: vec![],
+        off: vec![],
+        ind_act: FxHashMap::default(),
+        istar: FxHashMap::default(),
+        pstar: FxHashMap::default(),
+        act: FxHashMap::default(),
+    };
+    let mut total = 0u32;
+    for line in BufReader::new(File::open(format!("{dir}/{name}_rank.csv")).unwrap())
+        .lines()
+        .skip(1)
+    {
+        let v: Vec<i32> = line
+            .unwrap()
+            .split(',')
+            .map(|x| x.parse().unwrap())
+            .collect();
+        if v[2] > 0 && ext.in_range(v[0], v[1]) {
+            assert!(
+                v[2] <= 64,
+                "{name} has rank {} > 64 at ({},{})",
+                v[2],
+                v[0],
+                v[1]
+            );
+            m.bid.insert((v[0], v[1]), m.deg.len() as u32);
+            m.deg.push((v[0], v[1]));
+            m.dim.push(v[2] as usize);
+            m.off.push(total);
+            total += v[2] as u32;
+        }
+    }
+    let (mut ni, mut nm) = (0, 0);
+    for line in BufReader::new(File::open(format!("{dir}/{name}_indaction.csv")).unwrap())
+        .lines()
+        .skip(1)
+    {
+        let line = line.unwrap();
+        let (v, rest) = fields(&line);
+        let (Some(a), Some(b)) = (ext.get(v[0], v[1]), m.get(ext, v[3], v[4])) else {
+            continue;
+        };
+        if m.get(ext, v[0] + v[3], v[1] + v[4]).is_none() {
+            continue;
+        }
+        let g = ext.gid(a, v[2] as usize);
+        assert!(
+            ext.indec[g as usize],
+            "{name}: action by a non-indecomposable"
+        );
+        m.ind_act
+            .insert((g, m.gid(b, v[5] as usize)), parse_vec64(rest));
+        ni += 1;
+    }
+    for (file, is_i) in [("istar", true), ("pstar", false)] {
+        for line in BufReader::new(File::open(format!("{dir}/{name}_{file}.csv")).unwrap())
+            .lines()
+            .skip(1)
+        {
+            let line = line.unwrap();
+            let mut it = line.splitn(4, ',');
+            let n: i32 = it.next().unwrap().parse().unwrap();
+            let f: i32 = it.next().unwrap().parse().unwrap();
+            let i: usize = it.next().unwrap().parse().unwrap();
+            let img = it.next().unwrap();
+            if is_i {
+                if let (Some(b), Some(_)) = (ext.get(n, f), m.get(ext, n, f)) {
+                    m.istar.insert(ext.gid(b, i), parse_vec64(img));
+                }
+            } else if let (Some(b), Some(_)) = (m.get(ext, n, f), ext.get(n - shift, f)) {
+                m.pstar.insert(m.gid(b, i), parse_vec(img));
+                nm += 1;
+            }
+        }
+    }
+    eprintln!(
+        "module {name}: {} bidegrees, dim {total}, {ni} indecomposable products, {} i_*, {nm} p_*",
+        m.deg.len(),
+        m.istar.len()
+    );
+    m
+}
+
+/// The action of every sphere class on the module, from the indecomposables' action and the
+/// sphere's recipes: `(Σ ind + Σ g·y)·m = Σ ind·m + Σ g·(y·m)`, with the sphere bidegrees taken
+/// by internal degree so that `y·m` is already known.
+fn build_action(ext: &Ext, p: &Products, m: &mut Module) {
+    let t = Instant::now();
+    let mut order: Vec<u32> = (0..ext.deg.len() as u32).collect();
+    order.sort_by_key(|&a| p.rank_of[a as usize]);
+    for &a in &order {
+        let unit = ext.deg[a as usize] == (0, 0);
+        let rec = if unit { vec![] } else { recipes(ext, a) };
+        let partners: Vec<u32> = (0..m.deg.len() as u32)
+            .filter(|&b| m.sum(ext, a, b).is_some())
+            .collect();
+        let mm: &Module = m;
+        let new: Vec<((u32, u32), Vec<u64>)> = partners
+            .par_iter()
+            .map(|&b| {
+                let db = mm.dim[b as usize];
+                let mut bl = vec![0u64; ext.dim[a as usize] * db];
+                for j in 0..db {
+                    let mj = mm.gid(b, j);
+                    if unit {
+                        bl[j] = 1 << j;
+                        continue;
+                    }
+                    for (i, ri) in rec.iter().enumerate() {
+                        let mut out = 0;
+                        for term in ri {
+                            match *term {
+                                Term::Ind(g) => {
+                                    out ^= mm.ind_act.get(&(g, mj)).copied().unwrap_or(0)
+                                }
+                                Term::Prod(g, y) => {
+                                    let yb = ext.basis_bid[y as usize];
+                                    let yi = (y - ext.off[yb as usize]) as usize;
+                                    let mut v = mm.mul(yb, yi, b, j);
+                                    if v != 0 {
+                                        let tgt = mm.sum(ext, yb, b).unwrap();
+                                        while v != 0 {
+                                            let u = v.trailing_zeros() as usize;
+                                            v &= v - 1;
+                                            out ^= mm
+                                                .ind_act
+                                                .get(&(g, mm.gid(tgt, u)))
+                                                .copied()
+                                                .unwrap_or(0);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        bl[i * db + j] = out;
+                    }
+                }
+                ((a, b), bl)
+            })
+            .collect();
+        m.act.extend(new);
+    }
+    eprintln!(
+        "module {}: action rebuilt, {} blocks, {:.1}s",
+        m.name,
+        m.act.len(),
+        t.elapsed().as_secs_f64()
+    );
+}
+
+/// Compares the rebuilt action with a full `<name>_action.csv`, if the directory has one.
+fn check_action(ext: &Ext, m: &Module, dir: &str) {
+    let path = format!("{dir}/{}_action.csv", m.name);
+    let Ok(file) = File::open(&path) else { return };
+    let (mut same, mut bad) = (0, 0);
+    for line in BufReader::new(file).lines().skip(1) {
+        let line = line.unwrap();
+        let (v, rest) = fields(&line);
+        let (Some(a), Some(b)) = (ext.get(v[0], v[1]), m.get(ext, v[3], v[4])) else {
+            continue;
+        };
+        if m.get(ext, v[0] + v[3], v[1] + v[4]).is_none() {
+            continue;
+        }
+        if m.mul(a, v[2] as usize, b, v[5] as usize) == parse_vec64(rest) {
+            same += 1;
+        } else {
+            bad += 1;
+        }
+    }
+    let nonzero: usize = m
+        .act
+        .values()
+        .map(|bl| bl.iter().filter(|&&x| x != 0).count())
+        .sum();
+    eprintln!(
+        "module {}: {same} products agree with {path}, {bad} differ; {nonzero} non-zero rebuilt",
+        m.name
+    );
+    assert_eq!(bad, 0);
+}
+
+/// Iterates the set bits of `x`.
+fn bits(x: u64) -> impl Iterator<Item = usize> {
+    let mut x = x;
+    std::iter::from_fn(move || {
+        (x != 0).then(|| {
+            let k = x.trailing_zeros() as usize;
+            x &= x - 1;
+            k
+        })
+    })
+}
+
+/// Sorts an equation and cancels repeated variables; keeps it if anything is left.
+fn push_eq(
+    eqs: &mut Vec<Vec<u32>>,
+    origins: &mut Vec<Origin>,
+    eq: Vec<u32>,
+    origin: Origin,
+) -> bool {
+    let mut eq = eq;
+    eq.sort_unstable();
+    let mut red: Vec<u32> = Vec::with_capacity(eq.len());
+    for x in eq {
+        if red.last() == Some(&x) {
+            red.pop();
+        } else {
+            red.push(x);
+        }
+    }
+    if red.is_empty() {
+        return false;
+    }
+    eqs.push(red);
+    origins.push(origin);
+    true
+}
+
+/// The module Leibniz rule `d(a·m) = d(a)·m + a·d(m)` (with `gens_only`, `a` indecomposable),
+/// and naturality `d(i_* x) = i_*(d x)`, `d(p_* m) = p_*(d m)`. Their origins have
+/// `a = u32::MAX - 1`, `b` the module and `k` the kind (0, 1, 2).
+#[allow(clippy::too_many_arguments)]
+fn module_equations(
+    ext: &Ext,
+    mods: &[Module],
+    mi: usize,
+    v: &Vars,
+    gens_only: bool,
+    eqs: &mut Vec<Vec<u32>>,
+    origins: &mut Vec<Origin>,
+) {
+    let m = &mods[mi];
+    let origin = |k: u8| Origin {
+        a: u32::MAX - 1,
+        b: mi as u32,
+        i: 0,
+        j: 0,
+        k,
+    };
+    let mut counts = [0usize; 3];
+    for a in 0..ext.deg.len() as u32 {
+        let ap = ext.prime(a);
+        for b in 0..m.deg.len() as u32 {
+            let Some(cp) = m.sum_prime(ext, a, b) else {
+                continue;
+            };
+            let c = m.sum(ext, a, b);
+            let bp = m.prime(ext, b);
+            for i in 0..ext.dim[a as usize] {
+                if gens_only && !ext.indec[ext.gid(a, i) as usize] {
+                    continue;
+                }
+                for j in 0..m.dim[b as usize] {
+                    let am = c.map_or(0, |_| m.mul(a, i, b, j));
+                    for k in 0..m.dim[cp as usize] {
+                        let mut eq = vec![];
+                        for r in bits(am) {
+                            eq.push(mvar(ext, mods, v, mi, c.unwrap(), r, k));
+                        }
+                        if let Some(ap) = ap {
+                            for cc in 0..ext.dim[ap as usize] {
+                                if m.mul(ap, cc, b, j) >> k & 1 == 1 {
+                                    eq.push(var(ext, v, a, i, cc));
+                                }
+                            }
+                        }
+                        if let Some(bp) = bp {
+                            for cc in 0..m.dim[bp as usize] {
+                                if m.mul(a, i, bp, cc) >> k & 1 == 1 {
+                                    eq.push(mvar(ext, mods, v, mi, b, j, cc));
+                                }
+                            }
+                        }
+                        counts[0] += push_eq(eqs, origins, eq, origin(0)) as usize;
+                    }
+                }
+            }
+        }
+    }
+    // naturality of i: S -> M
+    for b in 0..ext.deg.len() as u32 {
+        let (n, f) = ext.deg[b as usize];
+        let Some(mbp) = m.get(ext, n - 1, f + 2) else {
+            continue;
+        };
+        let mb = m.get(ext, n, f);
+        let sbp = ext.prime(b);
+        for i in 0..ext.dim[b as usize] {
+            let ix = mb.map_or(0, |_| m.istar.get(&ext.gid(b, i)).copied().unwrap_or(0));
+            for k in 0..m.dim[mbp as usize] {
+                let mut eq = vec![];
+                for r in bits(ix) {
+                    eq.push(mvar(ext, mods, v, mi, mb.unwrap(), r, k));
+                }
+                if let Some(sbp) = sbp {
+                    for cc in 0..ext.dim[sbp as usize] {
+                        let icc = m.istar.get(&ext.gid(sbp, cc)).copied().unwrap_or(0);
+                        if icc >> k & 1 == 1 {
+                            eq.push(var(ext, v, b, i, cc));
+                        }
+                    }
+                }
+                counts[1] += push_eq(eqs, origins, eq, origin(1)) as usize;
+            }
+        }
+    }
+    // naturality of p: M -> S^{shift + 1}
+    for b in 0..m.deg.len() as u32 {
+        let (n, f) = m.deg[b as usize];
+        let Some(tp) = ext.get(n - m.shift - 1, f + 2) else {
+            continue;
+        };
+        let t = ext.get(n - m.shift, f);
+        let bp = m.prime(ext, b);
+        for j in 0..m.dim[b as usize] {
+            let pm = t.map_or(0, |_| m.pstar.get(&m.gid(b, j)).copied().unwrap_or(0));
+            for k in 0..ext.dim[tp as usize] {
+                let mut eq = vec![];
+                for r in bits(pm as u64) {
+                    eq.push(var(ext, v, t.unwrap(), r, k));
+                }
+                if let Some(bp) = bp {
+                    for cc in 0..m.dim[bp as usize] {
+                        let pcc = m.pstar.get(&m.gid(bp, cc)).copied().unwrap_or(0);
+                        if pcc >> k & 1 == 1 {
+                            eq.push(mvar(ext, mods, v, mi, b, j, cc));
+                        }
+                    }
+                }
+                counts[2] += push_eq(eqs, origins, eq, origin(2)) as usize;
+            }
+        }
+    }
+    eprintln!(
+        "module {}: {} module Leibniz, {} i-naturality, {} p-naturality equations",
+        m.name, counts[0], counts[1], counts[2]
+    );
+}
+
 struct Vars {
     /// variable offset of each bidegree A (with A' in range), else u32::MAX
     off: Vec<u32>,
     n: u32,
     /// source stem of each variable
     stem: Vec<i32>,
+    /// The modules' unknowns come first, `0..m_total`, so that the free columns among the
+    /// sphere's still count the projection of the solutions onto the sphere.
+    m_total: u32,
+    /// per module, per bidegree id: variable offset, else u32::MAX
+    m_off: Vec<Vec<u32>>,
+    /// `(first variable, module, stem, filtration, target dimension)` of each module block, by
+    /// first variable
+    m_blocks: Vec<(u32, usize, i32, i32, usize)>,
+    m_names: Vec<String>,
 }
 
-fn vars(ext: &Ext) -> Vars {
+fn vars(ext: &Ext, mods: &[Module]) -> Vars {
+    let mut m_off = vec![];
+    let mut m_blocks = vec![];
+    let mut m_total = 0u32;
+    let mut stem = vec![];
+    for (mi, m) in mods.iter().enumerate() {
+        let mut off = vec![u32::MAX; m.deg.len()];
+        let mut ids: Vec<u32> = (0..m.deg.len() as u32)
+            .filter(|&b| m.prime(ext, b).is_some())
+            .collect();
+        ids.sort_by_key(|&b| {
+            let (n, f) = m.deg[b as usize];
+            (-n, f)
+        });
+        for b in ids {
+            off[b as usize] = m_total;
+            let dp = m.dim[m.prime(ext, b).unwrap() as usize];
+            let (bn, bf) = m.deg[b as usize];
+            m_blocks.push((m_total, mi, bn, bf, dp));
+            let k = m.dim[b as usize] * dp;
+            m_total += k as u32;
+            stem.extend(std::iter::repeat_n(m.deg[b as usize].0, k));
+        }
+        m_off.push(off);
+    }
     let nb = ext.deg.len();
     let mut ids: Vec<u32> = (0..nb as u32).filter(|&a| ext.prime(a).is_some()).collect();
     // decreasing stem: high stems are pivoted first
@@ -472,15 +922,30 @@ fn vars(ext: &Ext) -> Vars {
         (-n, f)
     });
     let mut off = vec![u32::MAX; nb];
-    let mut n = 0u32;
-    let mut stem = vec![];
+    let mut n = m_total;
     for a in ids {
         off[a as usize] = n;
         let k = ext.dim[a as usize] * ext.dim[ext.prime(a).unwrap() as usize];
         n += k as u32;
         stem.extend(std::iter::repeat_n(ext.deg[a as usize].0, k));
     }
-    Vars { off, n, stem }
+    let m_names = mods.iter().map(|m| m.name.clone()).collect();
+    Vars {
+        off,
+        n,
+        stem,
+        m_total,
+        m_off,
+        m_blocks,
+        m_names,
+    }
+}
+
+/// variable: the k-th coordinate of d(m_r), m_r in bidegree `b` of module `mi`
+fn mvar(ext: &Ext, mods: &[Module], v: &Vars, mi: usize, b: u32, r: usize, k: usize) -> u32 {
+    let m = &mods[mi];
+    let dp = m.dim[m.prime(ext, b).unwrap() as usize];
+    v.m_off[mi][b as usize] + (r * dp + k) as u32
 }
 
 /// variable: the k-th coordinate of d(e_r), e_r in bidegree c
@@ -766,6 +1231,17 @@ fn var_name(ext: &Ext, v: &Vars, y: u32) -> String {
     if y == v.n {
         return "1".into();
     }
+    if y < v.m_total {
+        let i = v.m_blocks.partition_point(|&(start, ..)| start <= y) - 1;
+        let (start, mi, n, f, dp) = v.m_blocks[i];
+        let rel = (y - start) as usize;
+        return format!(
+            "d_{}(x_({n},{f},{}))[{}]",
+            v.m_names[mi],
+            rel / dp,
+            rel % dp
+        );
+    }
     let (c, _) = v
         .off
         .iter()
@@ -892,6 +1368,9 @@ fn certificate(
         if o.a == u32::MAX {
             return ext.deg[o.b as usize];
         }
+        if o.a == u32::MAX - 1 {
+            return (i32::MAX, o.k as i32);
+        }
         let (an, af) = ext.deg[o.a as usize];
         let (bn, bf) = ext.deg[o.b as usize];
         (an + bn, af + bf)
@@ -906,6 +1385,15 @@ fn certificate(
             .collect();
         if o.a == u32::MAX {
             println!("  seed {}: {} = 0", cls(o.b, o.i), terms.join(" + "));
+            continue;
+        }
+        if o.a == u32::MAX - 1 {
+            let kind = ["module Leibniz", "i-naturality", "p-naturality"][o.k as usize];
+            println!(
+                "  {kind} ({}): {} = 0",
+                v.m_names[o.b as usize],
+                terms.join(" + ")
+            );
             continue;
         }
         let (cn, cf) = deg_sum(o);
@@ -983,6 +1471,10 @@ fn dump_pool(
     for &i in &pool {
         let o = origins[i as usize];
         let vs: Vec<String> = eqs[i as usize].iter().map(|y| y.to_string()).collect();
+        if o.a == u32::MAX - 1 {
+            writeln!(w, "eq {i} module{}k{} : {}", o.b, o.k, vs.join(" ")).unwrap();
+            continue;
+        }
         if o.a == u32::MAX {
             let (bn, bf) = ext.deg[o.b as usize];
             writeln!(
@@ -1151,9 +1643,24 @@ fn main() {
     let ext = load(dir, n_max, f_max);
     let p = build_products(&ext);
     check_products(&ext, &p);
-    let v = vars(&ext);
+    // --modules <dir> <name:shift,...>: two-cell complexes from ext's cofiber_export
+    let mut mods: Vec<Module> = vec![];
+    if let Some(i) = args.iter().position(|a| a == "--modules") {
+        let mdir = &args[i + 1];
+        for spec in args[i + 2].split(',') {
+            let (name, k) = spec.split_once(':').unwrap();
+            let mut m = load_module(&ext, mdir, name, k.parse().unwrap());
+            build_action(&ext, &p, &mut m);
+            check_action(&ext, &m, mdir);
+            mods.push(m);
+        }
+    }
+    let v = vars(&ext, &mods);
     eprintln!("dim H = {}", v.n);
     let (mut eqs, mut origins) = equations(&ext, &p, &v, gens_only);
+    for mi in 0..mods.len() {
+        module_equations(&ext, &mods, mi, &v, gens_only, &mut eqs, &mut origins);
+    }
     // --seed-d2 <file> <max stem> <max filtration>
     let seed = args.iter().position(|a| a == "--seed-d2");
     if let Some(i) = seed {
@@ -1306,7 +1813,7 @@ fn main() {
             }
         );
     }
-    let free_total = piv.iter().filter(|&&x| !x).count();
+    let free_total = piv[v.m_total as usize..].iter().filter(|&&x| !x).count();
     println!(
         "N={n_max} F={f_max} gens_only={gens_only} dimE2={} dimH={} dimD={free_total}",
         ext.basis_bid.len(),
@@ -1315,7 +1822,7 @@ fn main() {
     // D_s = free columns in stems <= s
     let mut free_by_stem = vec![0usize; n_max as usize + 1];
     for (c, &is_piv) in piv.iter().enumerate() {
-        if !is_piv {
+        if !is_piv && c >= v.m_total as usize {
             free_by_stem[v.stem[c] as usize] += 1;
         }
     }
