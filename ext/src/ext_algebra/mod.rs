@@ -671,7 +671,7 @@ where
     /// already-computed self-maps: once the unit's product ring has been saved to disk, every
     /// module's cup path *reloads* the lifts instead of recomputing them (the expensive,
     /// `M`-independent part), leaving only the closed-form cup untwist per module.
-    pub(crate) fn unit_self_map(
+    pub fn unit_self_map(
         &self,
         g: BidegreeGenerator,
     ) -> Arc<ResolutionHomomorphism<CC, CC>> {

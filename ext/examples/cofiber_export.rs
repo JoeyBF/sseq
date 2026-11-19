@@ -114,41 +114,66 @@ fn main() -> anyhow::Result<()> {
     }
     let header = "stem_1,Adams_filtration_1,index_1,stem_2,Adams_filtration_2,index_2,product";
 
-    /// Writes the action of `Ext(S)` on `ext` (rows: S-class, M-class, product).
+    /// Writes the action of `Ext(S)` on `ext` (rows: S-class, M-class, product), in parallel over
+    /// the bidegrees of `ext`.
     fn action<CC: ext::chain_complex::FreeChainComplex + ext::chain_complex::AugmentedChainComplex>(
         ext: &ExtAlgebra<CC>,
         bidegrees: &[Bidegree],
-        dim_s: &dyn Fn(Bidegree) -> usize,
-        in_range: &dyn Fn(Bidegree) -> bool,
+        dim_s: &(dyn Fn(Bidegree) -> usize + Sync),
+        in_range: &(dyn Fn(Bidegree) -> bool + Sync),
         w: &mut BufWriter<File>,
     ) -> anyhow::Result<usize> {
-        let mut rows = 0;
-        for &c in bidegrees {
-            let dc = ext.cohomology_dimension(c).unwrap_or(0);
-            for x in 0..dc {
-                let xe = ext.generator(BidegreeGenerator::new(c, x));
-                for &b in bidegrees {
-                    let t = b + c;
-                    if dim_s(b) == 0 || !in_range(t) || ext.cohomology_dimension(t).unwrap_or(0) == 0 {
-                        continue;
-                    }
-                    let Some(m) = ext.multiply_into(&xe, b) else { continue };
-                    for j in 0..m.rows() {
-                        let row = m.row(j);
-                        if row.iter().any(|v| v != 0) {
-                            writeln!(
-                                w,
-                                "{},{},{j},{},{},{x},{}",
-                                b.n(),
-                                b.s(),
-                                c.n(),
-                                c.s(),
-                                vector(row.iter())
-                            )?;
-                            rows += 1;
+        use maybe_rayon::prelude::*;
+        // Extend every generator's self-map to the whole range first, each map on its own thread:
+        // extending one map from two threads at once races in its `OnceVec`s.
+        let top = bidegrees.iter().copied().max_by_key(|b| (b.s(), b.n())).unwrap();
+        let gens: Vec<BidegreeGenerator> = bidegrees
+            .iter()
+            .flat_map(|&b| (0..dim_s(b)).map(move |j| BidegreeGenerator::new(b, j)))
+            .collect();
+        gens.into_maybe_par_iter().for_each(|g| {
+            ext.unit_self_map(g).extend_through_stem(top);
+        });
+        let chunks: Vec<Vec<String>> = bidegrees
+            .to_vec()
+            .into_maybe_par_iter()
+            .map(|c| {
+                let mut out = vec![];
+                let dc = ext.cohomology_dimension(c).unwrap_or(0);
+                for x in 0..dc {
+                    let xe = ext.generator(BidegreeGenerator::new(c, x));
+                    for &b in bidegrees {
+                        let t = b + c;
+                        if dim_s(b) == 0
+                            || !in_range(t)
+                            || ext.cohomology_dimension(t).unwrap_or(0) == 0
+                        {
+                            continue;
+                        }
+                        let Some(m) = ext.multiply_into(&xe, b) else { continue };
+                        for j in 0..m.rows() {
+                            let row = m.row(j);
+                            if row.iter().any(|v| v != 0) {
+                                out.push(format!(
+                                    "{},{},{j},{},{},{x},{}",
+                                    b.n(),
+                                    b.s(),
+                                    c.n(),
+                                    c.s(),
+                                    vector(row.iter())
+                                ));
+                            }
                         }
                     }
                 }
+                out
+            })
+            .collect();
+        let mut rows = 0;
+        for chunk in chunks {
+            for l in chunk {
+                writeln!(w, "{l}")?;
+                rows += 1;
             }
         }
         Ok(rows)
