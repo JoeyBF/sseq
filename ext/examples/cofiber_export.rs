@@ -83,10 +83,16 @@ fn main() -> anyhow::Result<()> {
         "C2:1,Ceta:2,Cnu:4,Csigma:8",
         |s| Ok::<_, anyhow::Error>(s.to_string()),
     );
+    // The sphere's self-maps are shared between the Ext algebras through this directory (each
+    // algebra keeps its own in-memory cache, so without it every complex rebuilds them).
+    let save: String = query::with_default("Save directory (- for none)", "-", |s| {
+        Ok::<_, anyhow::Error>(s.to_string())
+    });
+    let save = (save != "-").then(|| PathBuf::from(save));
     std::fs::create_dir_all(&dir)?;
 
     let t_max = max_n + max_s + 2;
-    let res = Arc::new(construct_standard::<false, _, _>("S_2", None)?);
+    let res = Arc::new(construct_standard::<false, _, _>("S_2", save)?);
     res.compute_through_bidegree(Bidegree::s_t(max_s + 2, t_max));
     res.algebra().compute_basis(t_max + 1);
     let algebra = res.algebra();
