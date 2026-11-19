@@ -606,7 +606,9 @@ fn equations(ext: &Ext, p: &Products, v: &Vars, gens_only: bool) -> (Vec<Vec<u32
     (eqs, origins)
 }
 
-/// Echelon form (pivot = smallest column). Returns the pivot flag per column.
+/// Echelon form (pivot = smallest column) of equations over the columns `0..nvars` and the
+/// constant column `nvars`, which sorts last so it is never a pivot. A row that reduces to the
+/// constant alone is a contradiction; their equation ids are returned.
 ///
 /// With `track`, also returns for every row the equation it started from and the rows it was
 /// reduced by, so that any combination of rows can be expanded back into equations.
@@ -614,11 +616,12 @@ fn eliminate(
     nvars: u32,
     eqs: &[Vec<u32>],
     track: bool,
-) -> (Vec<u32>, Vec<Vec<u32>>, Vec<(u32, Vec<u32>)>) {
+) -> (Vec<u32>, Vec<Vec<u32>>, Vec<(u32, Vec<u32>)>, Vec<u32>) {
     let t = Instant::now();
     let mut order: Vec<u32> = (0..eqs.len() as u32).collect();
     order.sort_by_key(|&e| eqs[e as usize].len());
-    let mut pivot: Vec<u32> = vec![u32::MAX; nvars as usize];
+    let mut pivot: Vec<u32> = vec![u32::MAX; nvars as usize + 1];
+    let mut contradictions = vec![];
     let mut rows: Vec<Vec<u32>> = vec![];
     let mut prov: Vec<(u32, Vec<u32>)> = vec![];
     let (mut xors, mut maxlen) = (0usize, 0usize);
@@ -626,6 +629,10 @@ fn eliminate(
         let mut r = eqs[e as usize].clone();
         let mut used = vec![];
         while let Some(&c) = r.first() {
+            if c == nvars {
+                contradictions.push(e);
+                break;
+            }
             let p = pivot[c as usize];
             if p == u32::MAX {
                 maxlen = maxlen.max(r.len());
@@ -660,7 +667,14 @@ fn eliminate(
         fill,
         t.elapsed().as_secs_f64()
     );
-    (pivot, rows, prov)
+    if !contradictions.is_empty() {
+        eprintln!(
+            "CONTRADICTION: {} equations reduce to 1 = 0",
+            contradictions.len()
+        );
+    }
+    pivot.truncate(nvars as usize);
+    (pivot, rows, prov, contradictions)
 }
 
 /// Number of nonzero coordinates of each vector of the reduced basis of the kernel: the vector of a
@@ -678,7 +692,7 @@ fn kernel_density(pivot: &[u32], rows: &[Vec<u32>], stem: &[i32]) -> Vec<(u32, u
     chunks
         .par_iter()
         .flat_map_iter(|chunk| {
-            let mut val = vec![0u64; pivot.len()];
+            let mut val = vec![0u64; pivot.len() + 1];
             for (l, &f) in chunk.iter().enumerate() {
                 val[f as usize] = 1 << l;
             }
@@ -690,7 +704,7 @@ fn kernel_density(pivot: &[u32], rows: &[Vec<u32>], stem: &[i32]) -> Vec<(u32, u
             let mut nnz = vec![0usize; chunk.len()];
             let mut lo = vec![i32::MAX; chunk.len()];
             let mut hi = vec![i32::MIN; chunk.len()];
-            for (c, &x) in val.iter().enumerate() {
+            for (c, &x) in val[..pivot.len()].iter().enumerate() {
                 let mut x = x;
                 while x != 0 {
                     let l = x.trailing_zeros() as usize;
@@ -709,7 +723,8 @@ fn kernel_density(pivot: &[u32], rows: &[Vec<u32>], stem: &[i32]) -> Vec<(u32, u
 
 /// Evaluates every equation at a known d2 (`stem,Adams_filtration,index,target` in this basis).
 fn check_d2(ext: &Ext, v: &Vars, eqs: &[Vec<u32>], path: &str) {
-    let mut val = vec![false; v.n as usize];
+    let mut val = vec![false; v.n as usize + 1];
+    val[v.n as usize] = true;
     for line in BufReader::new(File::open(path).unwrap()).lines().skip(1) {
         let line = line.unwrap();
         let mut it = line.splitn(4, ',');
@@ -727,24 +742,7 @@ fn check_d2(ext: &Ext, v: &Vars, eqs: &[Vec<u32>], path: &str) {
         }
     }
     // var -> (source bidegree, r, k) for reporting violations
-    let describe = |x: u32| {
-        let (c, _) = v
-            .off
-            .iter()
-            .enumerate()
-            .filter(|&(_, &o)| o != u32::MAX && o <= x)
-            .max_by_key(|&(_, &o)| o)
-            .unwrap();
-        let dp = ext.dim[ext.prime(c as u32).unwrap() as usize];
-        let rel = (x - v.off[c]) as usize;
-        let (n, f) = ext.deg[c];
-        format!(
-            "d(x_({n},{f},{}))[{}]={}",
-            rel / dp,
-            rel % dp,
-            val[x as usize] as u8
-        )
-    };
+    let describe = |x: u32| format!("{}={}", var_name(ext, v, x), val[x as usize] as u8);
     for e in eqs
         .iter()
         .filter(|e| e.iter().fold(false, |acc, &x| acc ^ val[x as usize]))
@@ -752,7 +750,7 @@ fn check_d2(ext: &Ext, v: &Vars, eqs: &[Vec<u32>], path: &str) {
         let terms: Vec<String> = e.iter().map(|&x| describe(x)).collect();
         println!("violated: {}", terms.join(" + "));
     }
-    let nonzero = val.iter().filter(|&&x| x).count();
+    let nonzero = val[..v.n as usize].iter().filter(|&&x| x).count();
     let bad = eqs
         .iter()
         .filter(|e| e.iter().fold(false, |acc, &x| acc ^ val[x as usize]))
@@ -765,6 +763,9 @@ fn check_d2(ext: &Ext, v: &Vars, eqs: &[Vec<u32>], path: &str) {
 
 /// Names a variable: coordinate `k` of `d(x_(n, f, r))`.
 fn var_name(ext: &Ext, v: &Vars, y: u32) -> String {
+    if y == v.n {
+        return "1".into();
+    }
     let (c, _) = v
         .off
         .iter()
@@ -886,7 +887,11 @@ fn certificate(
         let (n, f) = ext.deg[b as usize];
         format!("x_({n},{f},{i})")
     };
+    // seeds (a = u32::MAX) sort by their own bidegree
     let deg_sum = |o: Origin| {
+        if o.a == u32::MAX {
+            return ext.deg[o.b as usize];
+        }
         let (an, af) = ext.deg[o.a as usize];
         let (bn, bf) = ext.deg[o.b as usize];
         (an + bn, af + bf)
@@ -895,6 +900,14 @@ fn certificate(
     set.sort_by_key(|&i| deg_sum(origins[i as usize]));
     for &i in &set {
         let o = origins[i as usize];
+        let terms: Vec<String> = eqs[i as usize]
+            .iter()
+            .map(|&y| var_name(ext, v, y))
+            .collect();
+        if o.a == u32::MAX {
+            println!("  seed {}: {} = 0", cls(o.b, o.i), terms.join(" + "));
+            continue;
+        }
         let (cn, cf) = deg_sum(o);
         let c = ext.sum(o.a, o.b);
         let prod = if c.is_some() {
@@ -903,10 +916,6 @@ fn certificate(
             0
         };
         let dc = c.map_or(0, |c| ext.dim[c as usize]);
-        let terms: Vec<String> = eqs[i as usize]
-            .iter()
-            .map(|&y| var_name(ext, v, y))
-            .collect();
         println!(
             "  {} * {} = {:?} in ({cn},{cf}); coordinate {} of d: {} = 0",
             cls(o.a, o.i),
@@ -934,7 +943,7 @@ fn dump_pool(
     closure: bool,
 ) {
     use std::io::Write;
-    let mut v0 = vec![false; v.n as usize];
+    let mut v0 = vec![false; v.n as usize + 1];
     for &i in set {
         for &y in &eqs[i as usize] {
             v0[y as usize] = true;
@@ -962,7 +971,7 @@ fn dump_pool(
     let mut w = std::io::BufWriter::new(File::create(path).unwrap());
     let rel_s: Vec<String> = rel.iter().map(|y| y.to_string()).collect();
     writeln!(w, "relation {}", rel_s.join(" ")).unwrap();
-    let mut named = vec![false; v.n as usize];
+    let mut named = vec![false; v.n as usize + 1];
     for &i in &pool {
         for &y in &eqs[i as usize] {
             if !named[y as usize] {
@@ -973,9 +982,21 @@ fn dump_pool(
     }
     for &i in &pool {
         let o = origins[i as usize];
+        let vs: Vec<String> = eqs[i as usize].iter().map(|y| y.to_string()).collect();
+        if o.a == u32::MAX {
+            let (bn, bf) = ext.deg[o.b as usize];
+            writeln!(
+                w,
+                "eq {i} seed x_({bn},{bf},{})[{}] : {}",
+                o.i,
+                o.k,
+                vs.join(" ")
+            )
+            .unwrap();
+            continue;
+        }
         let (an, af) = ext.deg[o.a as usize];
         let (bn, bf) = ext.deg[o.b as usize];
-        let vs: Vec<String> = eqs[i as usize].iter().map(|y| y.to_string()).collect();
         writeln!(
             w,
             "eq {i} x_({an},{af},{})*x_({bn},{bf},{})[{}] : {}",
@@ -993,6 +1014,134 @@ fn dump_pool(
     );
 }
 
+/// Seed equations `d(x) = c` from a d2 file (`stem,Adams_filtration,index,target`) for the
+/// classes in stems `<= max_n` and filtrations `<= max_f`. Their origin has `a = u32::MAX`.
+fn seed_equations(
+    ext: &Ext,
+    v: &Vars,
+    path: &str,
+    max_n: i32,
+    max_f: i32,
+) -> (Vec<Vec<u32>>, Vec<Origin>) {
+    let mut eqs = vec![];
+    let mut origins = vec![];
+    let mut classes = 0;
+    for line in BufReader::new(File::open(path).unwrap()).lines().skip(1) {
+        let line = line.unwrap();
+        let mut it = line.splitn(4, ',');
+        let n: i32 = it.next().unwrap().parse().unwrap();
+        let f: i32 = it.next().unwrap().parse().unwrap();
+        let i: usize = it.next().unwrap().parse().unwrap();
+        let m = parse_vec(it.next().unwrap());
+        if n > max_n || f > max_f {
+            continue;
+        }
+        let Some(c) = ext.get(n, f) else { continue };
+        let Some(cp) = ext.prime(c) else { continue };
+        classes += 1;
+        for k in 0..ext.dim[cp as usize] {
+            let mut e = vec![var(ext, v, c, i, k)];
+            if m >> k & 1 == 1 {
+                e.push(v.n);
+            }
+            eqs.push(e);
+            origins.push(Origin {
+                a: u32::MAX,
+                b: c,
+                i: i as u8,
+                j: 0,
+                k: k as u8,
+            });
+        }
+    }
+    eprintln!(
+        "seeds: {classes} classes, {} coordinates from {path}",
+        eqs.len()
+    );
+    (eqs, origins)
+}
+
+/// Writes, for every class with a non-zero target bidegree, whether the equations force its
+/// differential and to what, and prints a per-stem summary.
+fn solution(ext: &Ext, v: &Vars, pivot: &[u32], rows: &[Vec<u32>], path: &str, from_stem: i32) {
+    use std::io::Write;
+    let n = v.n as usize;
+    let pivcols: Vec<u32> = (0..v.n)
+        .rev()
+        .filter(|&c| pivot[c as usize] != u32::MAX)
+        .collect();
+    let back = |val: &mut [u64]| {
+        for &p in &pivcols {
+            let r = &rows[pivot[p as usize] as usize];
+            val[p as usize] = r[1..].iter().fold(0, |acc, &c| acc ^ val[c as usize]);
+        }
+    };
+    // particular solution: constant 1, free columns 0
+    let mut part = vec![0u64; n + 1];
+    part[n] = 1;
+    back(&mut part);
+    // dependence on the free columns, 64 at a time
+    let free: Vec<u32> = (0..v.n)
+        .filter(|&c| pivot[c as usize] == u32::MAX)
+        .collect();
+    let dep: Vec<bool> = free
+        .par_chunks(64)
+        .map(|chunk| {
+            let mut val = vec![0u64; n + 1];
+            for (l, &f) in chunk.iter().enumerate() {
+                val[f as usize] = 1 << l;
+            }
+            back(&mut val);
+            val.iter().map(|&x| x != 0).collect::<Vec<bool>>()
+        })
+        .reduce(
+            || vec![false; n + 1],
+            |a, b| a.iter().zip(&b).map(|(x, y)| x | y).collect(),
+        );
+    let mut w = std::io::BufWriter::new(File::create(path).unwrap());
+    writeln!(w, "stem,Adams_filtration,index,status,target").unwrap();
+    // stem -> (classes, determined, determined non-zero)
+    let mut summary: BTreeMap<i32, (usize, usize, usize)> = BTreeMap::new();
+    let mut bids: Vec<u32> = (0..ext.deg.len() as u32)
+        .filter(|&c| ext.prime(c).is_some())
+        .collect();
+    bids.sort_by_key(|&c| ext.deg[c as usize]);
+    for c in bids {
+        let (sn, sf) = ext.deg[c as usize];
+        let dp = ext.dim[ext.prime(c).unwrap() as usize];
+        for r in 0..ext.dim[c as usize] {
+            let vs: Vec<usize> = (0..dp).map(|k| var(ext, v, c, r, k) as usize).collect();
+            let determined = vs.iter().all(|&x| !dep[x]);
+            let target: Vec<String> = vs.iter().map(|&x| (part[x] & 1).to_string()).collect();
+            let e = summary.entry(sn).or_default();
+            e.0 += 1;
+            if determined {
+                e.1 += 1;
+                if vs.iter().any(|&x| part[x] & 1 == 1) {
+                    e.2 += 1;
+                }
+            }
+            let status = if determined { "determined" } else { "open" };
+            writeln!(w, "{sn},{sf},{r},{status},\"[{}]\"", target.join(", ")).unwrap();
+        }
+    }
+    let (mut tc, mut td, mut tz) = (0, 0, 0);
+    println!("stem,classes,determined,determined_nonzero");
+    for (s, (c, d, z)) in summary {
+        if s >= from_stem {
+            println!("{s},{c},{d},{z}");
+            tc += c;
+            td += d;
+            tz += z;
+        }
+    }
+    println!(
+        "total stems >= {from_stem}: {tc} classes, {td} determined ({} nonzero), {} open",
+        tz,
+        tc - td
+    );
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let dir = &args[1];
@@ -1004,12 +1153,43 @@ fn main() {
     check_products(&ext, &p);
     let v = vars(&ext);
     eprintln!("dim H = {}", v.n);
-    let (eqs, origins) = equations(&ext, &p, &v, gens_only);
+    let (mut eqs, mut origins) = equations(&ext, &p, &v, gens_only);
+    // --seed-d2 <file> <max stem> <max filtration>
+    let seed = args.iter().position(|a| a == "--seed-d2");
+    if let Some(i) = seed {
+        let (se, so) = seed_equations(
+            &ext,
+            &v,
+            &args[i + 1],
+            args[i + 2].parse().unwrap(),
+            args[i + 3].parse().unwrap(),
+        );
+        eqs.extend(se);
+        origins.extend(so);
+    }
     if let Some(i) = args.iter().position(|a| a == "--check-d2") {
         check_d2(&ext, &v, &eqs, &args[i + 1]);
     }
     let cert = args.iter().position(|a| a == "--certificate");
-    let (pivot, rows, prov) = eliminate(v.n, &eqs, cert.is_some());
+    let (pivot, rows, prov, contradictions) = eliminate(v.n, &eqs, cert.is_some());
+    for &e in contradictions.iter().take(10) {
+        let terms: Vec<String> = eqs[e as usize]
+            .iter()
+            .map(|&y| var_name(&ext, &v, y))
+            .collect();
+        eprintln!("  contradiction from {}: {} = 0", e, terms.join(" + "));
+    }
+    // --solution <file> <from stem>
+    if let Some(i) = args.iter().position(|a| a == "--solution") {
+        solution(
+            &ext,
+            &v,
+            &pivot,
+            &rows,
+            &args[i + 1],
+            args[i + 2].parse().unwrap(),
+        );
+    }
     if let Some(i) = cert {
         let q: Vec<i32> = args[i + 1..i + 5]
             .iter()
@@ -1080,7 +1260,7 @@ fn main() {
         let deps: Vec<u32> = free
             .par_chunks(64)
             .flat_map_iter(|chunk| {
-                let mut val = vec![0u64; v.n as usize];
+                let mut val = vec![0u64; v.n as usize + 1];
                 for (l, &f) in chunk.iter().enumerate() {
                     val[f as usize] = 1 << l;
                 }
