@@ -34,6 +34,11 @@ const ARCH: &str = "compute_90a";
 ///
 /// Needs `libnvrtc`, but no GPU.
 pub fn compile_kernel() -> anyhow::Result<Ptx> {
+    compile_kernel_with(Vec::new())
+}
+
+/// [`compile_kernel`] with extra NVRTC options, such as `-DACC_BIT=1` (see `matmul_b1.cu`).
+pub fn compile_kernel_with(extra: Vec<String>) -> anyhow::Result<Ptx> {
     // SAFETY: `is_culib_present` only `dlopen`s the candidate library names and reports whether
     // one resolved; it dereferences nothing. cudarc panics on the first missing symbol, so the
     // probe has to come before any other nvrtc call.
@@ -49,7 +54,7 @@ pub fn compile_kernel() -> anyhow::Result<Ptx> {
         arch: Some(ARCH),
         // Names the program, so NVRTC's diagnostics say matmul_b1.cu rather than "default_program".
         name: Some("matmul_b1.cu".to_string()),
-        options: params::defines(),
+        options: params::defines().into_iter().chain(extra).collect(),
         ..Default::default()
     };
 
@@ -108,7 +113,18 @@ pub struct GpuContext {
 impl GpuContext {
     /// Open device `device_id` and load the kernel onto it.
     pub fn new(device_id: usize) -> anyhow::Result<Self> {
-        let ptx = kernel_ptx()?;
+        Self::with_ptx(device_id, kernel_ptx()?)
+    }
+
+    /// Open device `device_id` with a kernel whose C holds bit `bit` of each entry's popcount
+    /// instead of bit 0: with `bit = 1`, [`Matrix::cuda_mul`] gives the second bit of the integer
+    /// product of the 0/1 operands.
+    pub fn with_acc_bit(device_id: usize, bit: u32) -> anyhow::Result<Self> {
+        Self::with_ptx(device_id, compile_kernel_with(vec![format!("-DACC_BIT={bit}")])?)
+    }
+
+    /// Open device `device_id` and load `ptx` onto it.
+    fn with_ptx(device_id: usize, ptx: Ptx) -> anyhow::Result<Self> {
         let ctx = CudaContext::new(device_id)?;
         let module = ctx.load_module(ptx)?;
         let kernel = module.load_function("matmul_b1_kernel")?;

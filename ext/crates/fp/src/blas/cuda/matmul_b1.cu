@@ -25,6 +25,12 @@
 // The CTAs are independent: no thread-block cluster, no TMA multicast, so the grid carries no
 // placement constraint. Clusters were tried and removed; see EXPERIMENTS.md.
 
+// Which bit of each output entry's popcount C holds: 0 for the product over F_2, 1 for the second
+// bit of the integer product, which with bit 0 gives the product mod 4 of 0/1 operands.
+#ifndef ACC_BIT
+#define ACC_BIT 0
+#endif
+
 // The tuning knobs are defined in src/params.rs and arrive as -D options.
 #if !defined(MSTRIPS) || !defined(MW) || !defined(TK) || !defined(NB) || !defined(STAGES) || \
     !defined(GROUP_M) || !defined(THREADS_PER_WG)
@@ -383,10 +389,10 @@ extern "C" __global__ void matmul_b1_kernel(
                     int c0 = cb + gi*8, c1 = c0 + 1;
                     int l0 = c0 >> 6, b0p = c0 & 63;
                     int l1 = c1 >> 6, b1p = c1 & 63;
-                    lo[l0] |= (uint64_t)(acc[si][gi*4+0]&1) << b0p;
-                    lo[l1] |= (uint64_t)(acc[si][gi*4+1]&1) << b1p;
-                    hi[l0] |= (uint64_t)(acc[si][gi*4+2]&1) << b0p;
-                    hi[l1] |= (uint64_t)(acc[si][gi*4+3]&1) << b1p;
+                    lo[l0] |= (uint64_t)((acc[si][gi*4+0]>>ACC_BIT)&1) << b0p;
+                    lo[l1] |= (uint64_t)((acc[si][gi*4+1]>>ACC_BIT)&1) << b1p;
+                    hi[l0] |= (uint64_t)((acc[si][gi*4+2]>>ACC_BIT)&1) << b0p;
+                    hi[l1] |= (uint64_t)((acc[si][gi*4+3]>>ACC_BIT)&1) << b1p;
                 }
                 // Row-major sC[row*NG + limb]; padded limbs (out-of-range columns)
                 // get zero popcounts from the zero-padded B, so they store harmless

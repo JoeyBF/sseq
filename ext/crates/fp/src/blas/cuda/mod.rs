@@ -7,7 +7,7 @@ use crate::{matrix::Matrix, prime::TWO};
 mod kernel;
 mod params;
 
-pub use kernel::{GpuContext, compile_kernel};
+pub use kernel::{GpuContext, compile_kernel, compile_kernel_with};
 
 /// Smallest `min(m, k, n)` for which we attempt the GPU.
 ///

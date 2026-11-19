@@ -136,6 +136,14 @@ pub struct MilnorPairElement {
     pub(crate) ys: Vec<Vec<FpVector>>,
 }
 
+impl MilnorPairElement {
+    /// The product terms' coefficients mod 4 as the bit planes `(ones, twos)`, and the Y vectors
+    /// `ys[k][l]`.
+    pub fn parts(&self) -> (&FpVector, &FpVector, &[Vec<FpVector>]) {
+        (&self.ones, &self.twos, &self.ys)
+    }
+}
+
 /// Forward a [`PairAlgebra`] method to the classical shape, which is the only one that has one.
 macro_rules! dispatch_pair_milnor {
     () => {};
