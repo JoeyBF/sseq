@@ -33,6 +33,8 @@ def load(path):
 
 
 def main():
+    import functools, builtins
+    globals()["print"] = functools.partial(builtins.print, flush=True)
     rel, names, eqs = load(sys.argv[1])
     t = time.time()
     occ = defaultdict(list)

@@ -913,7 +913,8 @@ fn certificate(
 }
 
 /// Writes a pool of equations around a certificate for an exact minimum search: the equations
-/// meeting the certificate's variables, and those lying entirely in the variables these reach.
+/// meeting the certificate's variables, and with `closure` also those lying entirely in the
+/// variables these reach.
 /// Format: `relation <vars>`, `name <var> <name>`, then `eq <id> <origin> : <vars>`.
 fn dump_pool(
     ext: &Ext,
@@ -923,6 +924,7 @@ fn dump_pool(
     rel: &[u32],
     set: &[u32],
     path: &str,
+    closure: bool,
 ) {
     use std::io::Write;
     let mut v0 = vec![false; v.n as usize];
@@ -941,10 +943,15 @@ fn dump_pool(
             v1[y as usize] = true;
         }
     }
-    let pool: Vec<u32> = (0..eqs.len() as u32)
-        .into_par_iter()
-        .filter(|&i| eqs[i as usize].iter().all(|&y| v1[y as usize]))
-        .collect();
+    // the closure can be most of the system when h0 / h1 multiplications connect everything
+    let pool: Vec<u32> = if closure {
+        (0..eqs.len() as u32)
+            .into_par_iter()
+            .filter(|&i| eqs[i as usize].iter().all(|&y| v1[y as usize]))
+            .collect()
+    } else {
+        touching.clone()
+    };
     let mut w = std::io::BufWriter::new(File::create(path).unwrap());
     let rel_s: Vec<String> = rel.iter().map(|y| y.to_string()).collect();
     writeln!(w, "relation {}", rel_s.join(" ")).unwrap();
@@ -1005,7 +1012,8 @@ fn main() {
         let x = var(&ext, &v, c, q[2] as usize, q[3] as usize);
         let (rel, set) = certificate(&ext, &p, &v, &eqs, &origins, &pivot, &rows, &prov, x);
         if let Some(j) = args.iter().position(|a| a == "--dump-pool") {
-            dump_pool(&ext, &v, &eqs, &origins, &rel, &set, &args[j + 1]);
+            let closure = !args.iter().any(|a| a == "--pool-touching");
+            dump_pool(&ext, &v, &eqs, &origins, &rel, &set, &args[j + 1], closure);
         }
     }
     let piv: Vec<bool> = pivot.iter().map(|&p| p != u32::MAX).collect();
