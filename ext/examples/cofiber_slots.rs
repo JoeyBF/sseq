@@ -238,11 +238,40 @@ fn main() -> anyhow::Result<()> {
         };
         let dim = |b: Bidegree| parts.get(&b).map_or(0, |p| p.coker.len() + p.ker.len());
 
-        let mut ia = BufWriter::new(File::create(dir.join(format!("{name}_indaction.csv")))?);
-        writeln!(ia, "stem_1,Adams_filtration_1,index_1,stem_2,Adams_filtration_2,index_2,product")?;
-        let mut un = BufWriter::new(File::create(dir.join(format!("{name}_unknown.csv")))?);
-        writeln!(un, "stem_1,Adams_filtration_1,index_1,stem_2,Adams_filtration_2,index_2,reason")?;
-        let (mut known, mut no_map, mut no_step) = (0usize, 0usize, 0usize);
+        // The Sq(2^j) slot of the saved map `ms` (of a class in bidegree `mb`) at the top class
+        // `z ⊗ top`, `z ∈ ker(h_j)` at `zb`: the bottom part of the product, or `None` if that step
+        // was never lifted.
+        let slot = |ms: &ext::save::ZarrSaveStore,
+                    mb: Bidegree,
+                    zb: Bidegree,
+                    z: V|
+         -> anyhow::Result<Option<V>> {
+            let input = Bidegree::s_t(zb.s() + mb.s(), zb.t() + mb.t() + k);
+            if gens(input) == 0 {
+                return Ok(Some(0));
+            }
+            Ok(ms.read(SaveKind::ChainMap, input)?.map(|data| {
+                let src = res.module(zb.s());
+                let fx_dim = src.dimension(zb.t() + k);
+                let mut cur = &data[..];
+                let mut star: V = 0;
+                for l in 0..gens(input) {
+                    let fv = fp::vector::FpVector::from_bytes(res.prime(), fx_dim, &mut cur).unwrap();
+                    let mut c = 0;
+                    for i in 0..gens(zb) {
+                        if z >> i & 1 == 1 {
+                            c ^= fv.entry(src.operation_generator_to_index(k, op_idx, zb.t(), i));
+                        }
+                    }
+                    star |= (c as V) << l;
+                }
+                star
+            }))
+        };
+        type Cls = (Bidegree, usize);
+        // x[(g, u)]: the indecomposable g times the basis element u of Ext(C_j)
+        let mut x: HashMap<(Cls, Cls), V> = HashMap::new();
+        let mut unknown: HashMap<(Cls, Cls), &str> = HashMap::new();
         for &(gb, gi) in &inds {
             let g = (gb, gi);
             let map = format!("products/lin_ring/x_({}, {}, {})", gb.n(), gb.s(), gi);
@@ -250,67 +279,176 @@ fn main() -> anyhow::Result<()> {
             let mstore = has_map.then(|| store.subgroup(&map)).transpose()?;
             for &b in &bidegrees {
                 let t = b + gb;
-                let dc = dim(b);
-                if dc == 0 || !in_range(t) || dim(t) == 0 {
+                if dim(b) == 0 || !in_range(t) || dim(t) == 0 {
                     continue;
                 }
                 let p = &parts[&b];
-                for (x, &c) in p.coker.iter().enumerate() {
-                    // bottom: ordinary product
-                    let out = coords(t, mul(g, b, 1 << c), 0);
-                    if out != 0 {
-                        writeln!(ia, "{},{},{gi},{},{},{x},{}", gb.n(), gb.s(), b.n(), b.s(), vector(out, dim(t)))?;
-                    }
-                    known += 1;
+                for (xc, &c) in p.coker.iter().enumerate() {
+                    x.insert((g, (b, xc)), coords(t, mul(g, b, 1 << c), 0));
                 }
                 let zb = Bidegree::n_s(b.n() - k, b.s());
                 for (xi, &z) in p.ker.iter().enumerate() {
-                    let x = p.coker.len() + xi;
-                    let top_part = mul(g, zb, z);
-                    // z ⋆ g at the bottom of t: input bidegree of f_g is (s_z + s_g, t_z + t_g + k)
-                    let input = Bidegree::s_t(zb.s() + gb.s(), zb.t() + gb.t() + k);
-                    let star = if gens(input) == 0 {
-                        Some(0)
-                    } else if let Some(ms) = &mstore {
-                        ms.read(SaveKind::ChainMap, input)?.map(|data| {
-                            let src = res.module(zb.s());
-                            let fx_dim = src.dimension(zb.t() + k);
-                            let mut cur = &data[..];
-                            let mut star: V = 0;
-                            for l in 0..gens(input) {
-                                let fv = fp::vector::FpVector::from_bytes(res.prime(), fx_dim, &mut cur)
-                                    .unwrap();
-                                let mut c = 0;
-                                for i in 0..gens(zb) {
-                                    if z >> i & 1 == 1 {
-                                        let idx = src.operation_generator_to_index(k, op_idx, zb.t(), i);
-                                        c ^= fv.entry(idx);
-                                    }
-                                }
-                                star |= (c as V) << l;
-                            }
-                            star
-                        })
-                    } else {
-                        None
+                    let u = (b, p.coker.len() + xi);
+                    let star = match &mstore {
+                        Some(ms) => slot(ms, gb, zb, z)?,
+                        None => None,
                     };
                     match star {
                         Some(star) => {
-                            let out = coords(t, star, top_part);
-                            if out != 0 {
-                                writeln!(ia, "{},{},{gi},{},{},{x},{}", gb.n(), gb.s(), b.n(), b.s(), vector(out, dim(t)))?;
-                            }
-                            known += 1;
+                            x.insert((g, u), coords(t, star, mul(g, zb, z)));
                         }
                         None => {
-                            let reason = if has_map { "no step" } else { "no map" };
-                            if has_map { no_step += 1 } else { no_map += 1 }
-                            writeln!(un, "{},{},{gi},{},{},{x},{reason}", gb.n(), gb.s(), b.n(), b.s())?;
+                            unknown.insert((g, u), if has_map { "no step" } else { "no map" });
                         }
                     }
                 }
             }
         }
+        let direct_unknown = unknown.len();
+        // Every saved monomial map m = f_1 ⋯ f_r gives m·(z ⊗ top) on its corner. The top part is the
+        // ring product z·f_1⋯f_r, the bottom part the slot.
+        let lin = store.path().join("products/lin_ring");
+        let mut mons: Vec<(Vec<Cls>, Cls, V)> = vec![];
+        for entry in std::fs::read_dir(&lin)? {
+            let name = entry?.file_name().into_string().unwrap();
+            let factors: Vec<Cls> = name
+                .split('.')
+                .filter_map(|f| {
+                    let v: Vec<i32> = f
+                        .trim_start_matches("x_(")
+                        .trim_end_matches(')')
+                        .split(", ")
+                        .map(|t| t.parse().ok())
+                        .collect::<Option<_>>()?;
+                    Some((Bidegree::n_s(v[0], v[1]), v[2] as usize))
+                })
+                .collect();
+            if factors.len() < 2 {
+                continue;
+            }
+            let mb = factors.iter().fold(Bidegree::n_s(0, 0), |a, f| a + f.0);
+            if !in_range(mb) {
+                continue;
+            }
+            let ms = store.subgroup(&format!("products/lin_ring/{name}"))?;
+            for &b in &bidegrees {
+                let t = b + mb;
+                if dim(b) == 0 || !in_range(t) || dim(t) == 0 {
+                    continue;
+                }
+                let p = &parts[&b];
+                let zb = Bidegree::n_s(b.n() - k, b.s());
+                for (xi, &z) in p.ker.iter().enumerate() {
+                    let Some(star) = slot(&ms, mb, zb, z)? else { continue };
+                    let (mut w, mut wb) = (z, zb);
+                    for &f in &factors {
+                        w = mul(f, wb, w);
+                        wb = wb + f.0;
+                    }
+                    mons.push((factors.clone(), (b, p.coker.len() + xi), coords(t, star, w)));
+                }
+            }
+        }
+        // Associativity closure: m·c = f·((m/f)·c) for each factor f is linear in the unknown x(f, ·).
+        let bits = |v: V| (0..64).filter(move |&i| v >> i & 1 == 1);
+        let (mut rounds, mut consistent, mut inconsistent) = (0, 0usize, 0usize);
+        loop {
+            rounds += 1;
+            let mut groups: HashMap<(Cls, Bidegree), Vec<(V, V)>> = HashMap::new();
+            consistent = 0;
+            inconsistent = 0;
+            for (factors, (b, xc), val) in &mons {
+                for fi in 0..factors.len() {
+                    let f = factors[fi];
+                    let (mut v, mut vb, mut ok) = (1 << xc, *b, true);
+                    for (gi, &g) in factors.iter().enumerate() {
+                        if gi == fi {
+                            continue;
+                        }
+                        let mut nv = 0;
+                        for u in bits(v) {
+                            match x.get(&(g, (vb, u))) {
+                                Some(p) => nv ^= p,
+                                None => ok = false,
+                            }
+                        }
+                        if !ok {
+                            break;
+                        }
+                        v = nv;
+                        vb = vb + g.0;
+                    }
+                    if !ok {
+                        continue;
+                    }
+                    let (mut mask, mut rhs) = (0, *val);
+                    for u in bits(v) {
+                        match x.get(&(f, (vb, u))) {
+                            Some(p) => rhs ^= p,
+                            None => mask |= 1 << u,
+                        }
+                    }
+                    if mask == 0 {
+                        if rhs == 0 { consistent += 1 } else { inconsistent += 1 }
+                    } else {
+                        groups.entry((f, vb)).or_default().push((mask, rhs));
+                    }
+                }
+            }
+            let mut progress = false;
+            for ((f, vb), rows) in groups {
+                let mut ech: Vec<(V, V)> = vec![];
+                for (mut m, mut r) in rows {
+                    for &(em, er) in &ech {
+                        if m >> em.trailing_zeros() & 1 == 1 {
+                            m ^= em;
+                            r ^= er;
+                        }
+                    }
+                    if m == 0 {
+                        if r != 0 {
+                            inconsistent += 1;
+                        }
+                        continue;
+                    }
+                    let p = m.trailing_zeros();
+                    for e in ech.iter_mut() {
+                        if e.0 >> p & 1 == 1 {
+                            e.0 ^= m;
+                            e.1 ^= r;
+                        }
+                    }
+                    ech.push((m, r));
+                }
+                for (m, r) in ech {
+                    if m.count_ones() == 1 {
+                        let u = (vb, m.trailing_zeros() as usize);
+                        if unknown.remove(&(f, u)).is_some() {
+                            x.insert((f, u), r);
+                            progress = true;
+                        }
+                    }
+                }
+            }
+            if !progress {
+                break;
+            }
+        }
+        let mut ia = BufWriter::new(File::create(dir.join(format!("{name}_indaction.csv")))?);
+        writeln!(ia, "stem_1,Adams_filtration_1,index_1,stem_2,Adams_filtration_2,index_2,product")?;
+        for (&((gb, gi), (b, xc)), &v) in &x {
+            if v != 0 {
+                writeln!(ia, "{},{},{gi},{},{},{xc},{}", gb.n(), gb.s(), b.n(), b.s(), vector(v, dim(b + gb)))?;
+            }
+        }
+        let mut un = BufWriter::new(File::create(dir.join(format!("{name}_unknown.csv")))?);
+        writeln!(un, "stem_1,Adams_filtration_1,index_1,stem_2,Adams_filtration_2,index_2,reason")?;
+        let (mut no_map, mut no_step) = (0, 0);
+        for (&((gb, gi), (b, xc)), &reason) in &unknown {
+            if reason == "no map" { no_map += 1 } else { no_step += 1 }
+            writeln!(un, "{},{},{gi},{},{},{xc},{reason}", gb.n(), gb.s(), b.n(), b.s())?;
+        }
+        let known = x.len();
         // i_*: bottom; p_*: the kernel part
         let mut wi = BufWriter::new(File::create(dir.join(format!("{name}_istar.csv")))?);
         writeln!(wi, "stem,Adams_filtration,index,image")?;
@@ -330,8 +468,12 @@ fn main() -> anyhow::Result<()> {
             }
         }
         eprintln!(
-            "{name}: products known {known}, unknown {} (no map {no_map}, step not lifted {no_step})",
-            no_map + no_step
+            "{name}: products known {known}, unknown {} (no map {no_map}, step not lifted {no_step}); \
+             {} unknown before closure; {} monomial products, closure {rounds} rounds, {consistent} \
+             equations consistent, {inconsistent} inconsistent",
+            no_map + no_step,
+            direct_unknown,
+            mons.len()
         );
     }
     Ok(())
