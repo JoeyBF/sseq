@@ -473,6 +473,10 @@ struct Module {
     pstar: FxHashMap<u32, Mask>,
     /// (sphere bidegree, module bidegree) -> products, `dim A x dim B`
     act: FxHashMap<(u32, u32), Vec<u64>>,
+    /// (sphere indecomposable, module basis element) pairs whose product is unknown
+    unk_ind: rustc_hash::FxHashSet<(u32, u32)>,
+    /// per block of `act`: which products are unknown (they then hold 0)
+    act_unk: FxHashMap<(u32, u32), Vec<bool>>,
 }
 
 impl Module {
@@ -503,6 +507,11 @@ impl Module {
             return None;
         }
         self.get(ext, an + bn - 1, af + bf + 2)
+    }
+    fn known(&self, a: u32, i: usize, b: u32, j: usize) -> bool {
+        self.act_unk
+            .get(&(a, b))
+            .is_none_or(|bl| !bl[i * self.dim[b as usize] + j])
     }
     fn mul(&self, a: u32, i: usize, b: u32, j: usize) -> u64 {
         self.act
@@ -538,6 +547,8 @@ fn load_module(ext: &Ext, dir: &str, name: &str, shift: i32) -> Module {
         istar: FxHashMap::default(),
         pstar: FxHashMap::default(),
         act: FxHashMap::default(),
+        unk_ind: Default::default(),
+        act_unk: FxHashMap::default(),
     };
     let mut total = 0u32;
     for line in BufReader::new(File::open(format!("{dir}/{name}_rank.csv")).unwrap())
@@ -586,6 +597,16 @@ fn load_module(ext: &Ext, dir: &str, name: &str, shift: i32) -> Module {
             .insert((g, m.gid(b, v[5] as usize)), parse_vec64(rest));
         ni += 1;
     }
+    if let Ok(f) = File::open(format!("{dir}/{name}_unknown.csv")) {
+        for line in BufReader::new(f).lines().skip(1) {
+            let line = line.unwrap();
+            let (v, _) = fields(&line);
+            if let (Some(a), Some(b)) = (ext.get(v[0], v[1]), m.get(ext, v[3], v[4])) {
+                m.unk_ind
+                    .insert((ext.gid(a, v[2] as usize), m.gid(b, v[5] as usize)));
+            }
+        }
+    }
     for (file, is_i) in [("istar", true), ("pstar", false)] {
         for line in BufReader::new(File::open(format!("{dir}/{name}_{file}.csv")).unwrap())
             .lines()
@@ -608,8 +629,10 @@ fn load_module(ext: &Ext, dir: &str, name: &str, shift: i32) -> Module {
         }
     }
     eprintln!(
-        "module {name}: {} bidegrees, dim {total}, {ni} indecomposable products, {} i_*, {nm} p_*",
+        "module {name}: {} bidegrees, dim {total}, {ni} indecomposable products ({} unknown), {} i_*, \
+         {nm} p_*",
         m.deg.len(),
+        m.unk_ind.len(),
         m.istar.len()
     );
     m
@@ -629,11 +652,12 @@ fn build_action(ext: &Ext, p: &Products, m: &mut Module) {
             .filter(|&b| m.sum(ext, a, b).is_some())
             .collect();
         let mm: &Module = m;
-        let new: Vec<((u32, u32), Vec<u64>)> = partners
+        let new: Vec<((u32, u32), Vec<u64>, Vec<bool>)> = partners
             .par_iter()
             .map(|&b| {
                 let db = mm.dim[b as usize];
                 let mut bl = vec![0u64; ext.dim[a as usize] * db];
+                let mut unk = vec![false; ext.dim[a as usize] * db];
                 for j in 0..db {
                     let mj = mm.gid(b, j);
                     if unit {
@@ -642,20 +666,24 @@ fn build_action(ext: &Ext, p: &Products, m: &mut Module) {
                     }
                     for (i, ri) in rec.iter().enumerate() {
                         let mut out = 0;
+                        let mut u_ = false;
                         for term in ri {
                             match *term {
                                 Term::Ind(g) => {
+                                    u_ |= mm.unk_ind.contains(&(g, mj));
                                     out ^= mm.ind_act.get(&(g, mj)).copied().unwrap_or(0)
                                 }
                                 Term::Prod(g, y) => {
                                     let yb = ext.basis_bid[y as usize];
                                     let yi = (y - ext.off[yb as usize]) as usize;
+                                    u_ |= !mm.known(yb, yi, b, j);
                                     let mut v = mm.mul(yb, yi, b, j);
                                     if v != 0 {
                                         let tgt = mm.sum(ext, yb, b).unwrap();
                                         while v != 0 {
                                             let u = v.trailing_zeros() as usize;
                                             v &= v - 1;
+                                            u_ |= mm.unk_ind.contains(&(g, mm.gid(tgt, u)));
                                             out ^= mm
                                                 .ind_act
                                                 .get(&(g, mm.gid(tgt, u)))
@@ -667,15 +695,27 @@ fn build_action(ext: &Ext, p: &Products, m: &mut Module) {
                             }
                         }
                         bl[i * db + j] = out;
+                        unk[i * db + j] = u_;
                     }
                 }
-                ((a, b), bl)
+                ((a, b), bl, unk)
             })
             .collect();
-        m.act.extend(new);
+        for (key, bl, unk) in new {
+            m.act.insert(key, bl);
+            if unk.iter().any(|&u| u) {
+                m.act_unk.insert(key, unk);
+            }
+        }
     }
+    let unknown: usize = m
+        .act_unk
+        .values()
+        .map(|u| u.iter().filter(|&&x| x).count())
+        .sum();
+    let total: usize = m.act.values().map(|bl| bl.len()).sum();
     eprintln!(
-        "module {}: action rebuilt, {} blocks, {:.1}s",
+        "module {}: action rebuilt, {} blocks, {unknown} of {total} products unknown, {:.1}s",
         m.name,
         m.act.len(),
         t.elapsed().as_secs_f64()
@@ -694,6 +734,9 @@ fn check_action(ext: &Ext, m: &Module, dir: &str) {
             continue;
         };
         if m.get(ext, v[0] + v[3], v[1] + v[4]).is_none() {
+            continue;
+        }
+        if !m.known(a, v[2] as usize, b, v[5] as usize) {
             continue;
         }
         if m.mul(a, v[2] as usize, b, v[5] as usize) == parse_vec64(rest) {
@@ -773,6 +816,7 @@ fn module_equations(
         k,
     };
     let mut counts = [0usize; 3];
+    let mut counts_dropped = 0usize;
     for a in 0..ext.deg.len() as u32 {
         let ap = ext.prime(a);
         for b in 0..m.deg.len() as u32 {
@@ -786,6 +830,18 @@ fn module_equations(
                     continue;
                 }
                 for j in 0..m.dim[b as usize] {
+                    // an equation is only sound if every product in it is known
+                    if c.is_some() && !m.known(a, i, b, j)
+                        || ap.is_some_and(|ap| {
+                            (0..ext.dim[ap as usize]).any(|cc| !m.known(ap, cc, b, j))
+                        })
+                        || bp.is_some_and(|bp| {
+                            (0..m.dim[bp as usize]).any(|cc| !m.known(a, i, bp, cc))
+                        })
+                    {
+                        counts_dropped += 1;
+                        continue;
+                    }
                     let am = c.map_or(0, |_| m.mul(a, i, b, j));
                     for k in 0..m.dim[cp as usize] {
                         let mut eq = vec![];
@@ -867,7 +923,8 @@ fn module_equations(
         }
     }
     eprintln!(
-        "module {}: {} module Leibniz, {} i-naturality, {} p-naturality equations",
+        "module {}: {} module Leibniz ({counts_dropped} pairs dropped for unknown products), {} \
+         i-naturality, {} p-naturality equations",
         m.name, counts[0], counts[1], counts[2]
     );
 }
