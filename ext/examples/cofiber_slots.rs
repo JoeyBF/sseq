@@ -270,9 +270,15 @@ fn main() -> anyhow::Result<()> {
         };
         type Cls = (Bidegree, usize);
         // x[(g, u)]: the indecomposable g times the basis element u of Ext(C_j)
+        use maybe_rayon::prelude::*;
         let mut x: HashMap<(Cls, Cls), V> = HashMap::new();
         let mut unknown: HashMap<(Cls, Cls), &str> = HashMap::new();
-        for &(gb, gi) in &inds {
+        let per_ind: Vec<anyhow::Result<(Vec<((Cls, Cls), V)>, Vec<((Cls, Cls), &str)>)>> = inds
+            .clone()
+            .into_maybe_par_iter()
+            .map(|(gb, gi)| {
+            let mut x = vec![];
+            let mut unknown = vec![];
             let g = (gb, gi);
             let map = format!("products/lin_ring/x_({}, {}, {})", gb.n(), gb.s(), gi);
             let has_map = store.path().join(&map).join("zarr.json").exists();
@@ -284,7 +290,7 @@ fn main() -> anyhow::Result<()> {
                 }
                 let p = &parts[&b];
                 for (xc, &c) in p.coker.iter().enumerate() {
-                    x.insert((g, (b, xc)), coords(t, mul(g, b, 1 << c), 0));
+                    x.push(((g, (b, xc)), coords(t, mul(g, b, 1 << c), 0)));
                 }
                 let zb = Bidegree::n_s(b.n() - k, b.s());
                 for (xi, &z) in p.ker.iter().enumerate() {
@@ -295,22 +301,34 @@ fn main() -> anyhow::Result<()> {
                     };
                     match star {
                         Some(star) => {
-                            x.insert((g, u), coords(t, star, mul(g, zb, z)));
+                            x.push(((g, u), coords(t, star, mul(g, zb, z))));
                         }
                         None => {
-                            unknown.insert((g, u), if has_map { "no step" } else { "no map" });
+                            unknown.push(((g, u), if has_map { "no step" } else { "no map" }));
                         }
                     }
                 }
             }
+            Ok((x, unknown))
+            })
+            .collect();
+        for r in per_ind {
+            let (xs, us) = r?;
+            x.extend(xs);
+            unknown.extend(us);
         }
         let direct_unknown = unknown.len();
+        eprintln!("{name}: indecomposables read, {} known, {direct_unknown} unknown", x.len());
         // Every saved monomial map m = f_1 ⋯ f_r gives m·(z ⊗ top) on its corner. The top part is the
         // ring product z·f_1⋯f_r, the bottom part the slot.
         let lin = store.path().join("products/lin_ring");
-        let mut mons: Vec<(Vec<Cls>, Cls, V)> = vec![];
-        for entry in std::fs::read_dir(&lin)? {
-            let name = entry?.file_name().into_string().unwrap();
+        let names: Vec<String> = std::fs::read_dir(&lin)?
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        let per_map: Vec<anyhow::Result<Vec<(Vec<Cls>, Cls, V)>>> = names
+            .into_maybe_par_iter()
+            .map(|name| {
+            let mut mons = vec![];
             let factors: Vec<Cls> = name
                 .split('.')
                 .filter_map(|f| {
@@ -324,11 +342,11 @@ fn main() -> anyhow::Result<()> {
                 })
                 .collect();
             if factors.len() < 2 {
-                continue;
+                return Ok(mons);
             }
             let mb = factors.iter().fold(Bidegree::n_s(0, 0), |a, f| a + f.0);
             if !in_range(mb) {
-                continue;
+                return Ok(mons);
             }
             let ms = store.subgroup(&format!("products/lin_ring/{name}"))?;
             for &b in &bidegrees {
@@ -348,7 +366,14 @@ fn main() -> anyhow::Result<()> {
                     mons.push((factors.clone(), (b, p.coker.len() + xi), coords(t, star, w)));
                 }
             }
+            Ok(mons)
+            })
+            .collect();
+        let mut mons: Vec<(Vec<Cls>, Cls, V)> = vec![];
+        for r in per_map {
+            mons.extend(r?);
         }
+        eprintln!("{name}: {} monomial products read", mons.len());
         // Associativity closure: m·c = f·((m/f)·c) for each factor f is linear in the unknown x(f, ·).
         let bits = |v: V| (0..64).filter(move |&i| v >> i & 1 == 1);
         let (mut rounds, mut consistent, mut inconsistent) = (0, 0usize, 0usize);
