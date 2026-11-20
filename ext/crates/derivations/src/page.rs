@@ -238,6 +238,7 @@ fn var(ext: &Ext, e3: &E3, b: u32, k: usize, l: usize) -> u32 {
 /// Leibniz on E3 for every pair of E3 basis classes: d3[xy] = d3[x][y] + [x]d3[y].
 fn equations(ext: &Ext, p: &Products, e3: &E3) -> Vec<Vec<u32>> {
     let t = Instant::now();
+    let ablate_zero = std::env::var("E3_ABLATE_ZERO").is_ok_and(|v| v == "1");
     let bids: Vec<u32> = (0..ext.deg.len() as u32)
         .filter(|&b| e3.dim(b) > 0)
         .collect();
@@ -277,11 +278,17 @@ fn equations(ext: &Ext, p: &Products, e3: &E3) -> Vec<Vec<u32>> {
                     for (j, &y) in pg_c.reps.iter().enumerate().skip(j0) {
                         // per target coordinate r, the variables of the equation
                         let mut terms: Vec<Vec<u32>> = vec![vec![]; m];
-                        if let Some(s) = s {
-                            let pr = proj(
+                        // E3_ABLATE_ZERO=1 drops the pairs whose product is 0 in E3: an ablation
+                        let pr = s.map_or(0, |s| {
+                            proj(
                                 e3.page[s as usize].as_ref().unwrap(),
                                 mul_vec(ext, p, a, x, c, y),
-                            );
+                            )
+                        });
+                        if pr == 0 && ablate_zero {
+                            continue;
+                        }
+                        if let Some(s) = s {
                             for q in (0..e3.dim(s)).filter(|&q| pr >> q & 1 == 1) {
                                 for (r, tr) in terms.iter_mut().enumerate() {
                                     tr.push(var(ext, e3, s, q, r));
