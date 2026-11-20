@@ -1,4 +1,5 @@
-//! Adams d3 on E3 = H(E2, d2), constrained by the Leibniz rule on E3 (`--e3`).
+//! Adams d_r on E_r = H(E_{r-1}, d_{r-1}) for r >= 3, constrained by the Leibniz rule on E_r
+//! (`--e3`).
 
 use std::{
     collections::BTreeMap,
@@ -12,12 +13,14 @@ use rustc_hash::FxHashMap;
 
 use crate::{Ext, Mask, Products, eliminate, parse_vec};
 
-/// E3 at one bidegree: representatives of a basis of Z3/B3, and an echelon form of
-/// `B3 + span(reps)` that projects any d2-cycle onto those representatives.
+/// E_r at one bidegree: representatives of a basis of Z_r/B_r, and an echelon form of
+/// `B_r + span(reps)` that projects any element of Z_r onto those representatives.
 #[derive(Default)]
 struct Page {
-    /// E2 masks of the E3 basis representatives
+    /// E2 masks of the E_r basis representatives
     reps: Vec<Mask>,
+    /// E2 masks spanning B_r
+    bnd: Vec<Mask>,
     /// lowest set bit -> (row, its expression in the representatives modulo B3)
     rows: FxHashMap<u32, (Mask, Mask)>,
 }
@@ -133,10 +136,12 @@ fn mul_vec(ext: &Ext, p: &Products, a: u32, u: Mask, c: u32, w: Mask) -> Mask {
     out
 }
 
+/// The page E_r over the loaded range, with the unknowns d_r.
 struct E3 {
-    /// bidegree id -> E3 there (`None`: E3 not determined by the loaded d2)
+    r: i32,
+    /// bidegree id -> E_r there (`None`: not determined by the earlier differentials)
     page: Vec<Option<Page>>,
-    /// bidegree id -> first variable of d3 on it, `u32::MAX` if none
+    /// bidegree id -> first variable of d_r on it, `u32::MAX` if none
     off: Vec<u32>,
     nvars: u32,
 }
@@ -185,7 +190,9 @@ fn build_e3(ext: &Ext, d2: &FxHashMap<u32, Mask>) -> E3 {
         let mut pg = Page::default();
         if let Some(a) = into {
             for i in 0..ext.dim[a as usize] {
-                pg.insert(d2_of(ext.gid(a, i)).unwrap(), 0);
+                let v = d2_of(ext.gid(a, i)).unwrap();
+                pg.insert(v, 0);
+                pg.bnd.push(v);
             }
         }
         for z in kernel(&images) {
@@ -197,37 +204,102 @@ fn build_e3(ext: &Ext, d2: &FxHashMap<u32, Mask>) -> E3 {
         page[b as usize] = Some(pg);
     }
     let mut e3 = E3 {
+        r: 3,
         page,
         off: vec![u32::MAX; nb],
         nvars: 0,
     };
-    // variables by decreasing source stem
-    let mut order: Vec<u32> = (0..nb as u32).filter(|&b| e3.dim(b) > 0).collect();
-    order.sort_by_key(|&b| std::cmp::Reverse(ext.deg[b as usize]));
-    for b in order {
-        let (n, f) = ext.deg[b as usize];
-        if let Some(Some(t)) = known(ext, &e3, n - 1, f + 3) {
-            let m = e3.dim(t);
-            if m > 0 {
-                e3.off[b as usize] = e3.nvars;
-                e3.nvars += (e3.dim(b) * m) as u32;
-            }
-        }
-    }
-    let total: usize = (0..nb as u32).map(|b| e3.dim(b)).sum();
-    eprintln!(
-        "E3: {} bidegrees known, dim E3 {total}, {cycles_missing} bidegrees without d2 data, {} \
-         d3 variables",
-        e3.page.iter().filter(|p| p.is_some()).count(),
-        e3.nvars
-    );
+    eprintln!("E3: {cycles_missing} bidegrees without d2 data");
+    assign_vars(ext, &mut e3);
     e3
 }
 
-/// The d3 target bidegree of `b`, if E3 is known there (`Some(None)`: zero).
+/// Numbers the unknowns of d_r, by decreasing source stem.
+fn assign_vars(ext: &Ext, e: &mut E3) {
+    let nb = ext.deg.len();
+    let mut order: Vec<u32> = (0..nb as u32).filter(|&b| e.dim(b) > 0).collect();
+    order.sort_by_key(|&b| std::cmp::Reverse(ext.deg[b as usize]));
+    for b in order {
+        if let Some(Some(t)) = target(ext, e, b) {
+            let m = e.dim(t);
+            if m > 0 {
+                e.off[b as usize] = e.nvars;
+                e.nvars += (e.dim(b) * m) as u32;
+            }
+        }
+    }
+    let total: usize = (0..nb as u32).map(|b| e.dim(b)).sum();
+    eprintln!(
+        "E{}: {} bidegrees known, dim {total}, {} d{} variables",
+        e.r,
+        e.page.iter().filter(|p| p.is_some()).count(),
+        e.nvars,
+        e.r
+    );
+}
+
+/// E_{r+1} wherever d_r is forced both out of and into the bidegree. `dr[b][k]` is the forced
+/// d_r of the k-th E_r class at `b`, in E_r coordinates of the target (`None`: open).
+fn next_page(ext: &Ext, cur: &E3, dr: &FxHashMap<u32, Vec<Option<Mask>>>) -> E3 {
+    let nb = ext.deg.len();
+    let r = cur.r;
+    // d_r on all of E_r at b, if forced (zero when the target is zero)
+    let images = |b: u32| -> Option<Vec<Mask>> {
+        match target(ext, cur, b)? {
+            Some(t) if cur.dim(t) > 0 => dr.get(&b)?.iter().copied().collect(),
+            _ => Some(vec![0; cur.dim(b)]),
+        }
+    };
+    let as_e2 = |b: u32, coords: Mask| -> Mask {
+        let reps = &cur.page[b as usize].as_ref().unwrap().reps;
+        (0..reps.len())
+            .filter(|&l| coords >> l & 1 == 1)
+            .fold(0, |acc, l| acc ^ reps[l])
+    };
+    let page: Vec<Option<Page>> = (0..nb as u32)
+        .map(|b| {
+            let pg = cur.page[b as usize].as_ref()?;
+            let out = images(b)?;
+            let (n, f) = ext.deg[b as usize];
+            let src = known(ext, cur, n + 1, f - r)?;
+            let into = match src {
+                Some(a) => images(a)?,
+                None => vec![],
+            };
+            let mut next = Page::default();
+            for &v in &pg.bnd {
+                next.insert(v, 0);
+                next.bnd.push(v);
+            }
+            for &img in &into {
+                let v = as_e2(b, img);
+                next.insert(v, 0);
+                next.bnd.push(v);
+            }
+            for z in kernel(&out) {
+                let v = as_e2(b, z);
+                let k = next.reps.len();
+                if next.insert(v, 1 << k) {
+                    next.reps.push(v);
+                }
+            }
+            Some(next)
+        })
+        .collect();
+    let mut e = E3 {
+        r: r + 1,
+        page,
+        off: vec![u32::MAX; nb],
+        nvars: 0,
+    };
+    assign_vars(ext, &mut e);
+    e
+}
+
+/// The d_r target bidegree of `b`, if E_r is known there (`Some(None)`: zero).
 fn target(ext: &Ext, e3: &E3, b: u32) -> Option<Option<u32>> {
     let (n, f) = ext.deg[b as usize];
-    known(ext, e3, n - 1, f + 3)
+    known(ext, e3, n - 1, f + e3.r)
 }
 
 fn var(ext: &Ext, e3: &E3, b: u32, k: usize, l: usize) -> u32 {
@@ -250,7 +322,7 @@ fn equations(ext: &Ext, p: &Products, e3: &E3) -> Vec<Vec<u32>> {
             for &c in bids.iter().filter(|&&c| c >= a) {
                 let (cn, cf) = ext.deg[c as usize];
                 // every bidegree involved must have known E3 (or be zero)
-                let Some(Some(sp)) = known(ext, e3, an + cn - 1, af + cf + 3) else {
+                let Some(Some(sp)) = known(ext, e3, an + cn - 1, af + cf + e3.r) else {
                     continue;
                 };
                 let Some(s) = known(ext, e3, an + cn, af + cf) else {
@@ -269,7 +341,9 @@ fn equations(ext: &Ext, p: &Products, e3: &E3) -> Vec<Vec<u32>> {
                 let proj = |pg: &Page, v: Mask| {
                     pg.project(v).unwrap_or_else(|| {
                         panic!(
-                            "a product of d2-cycles is not a d2-cycle: the d2 data is not Leibniz"
+                            "a product of E_{} cycles is not a cycle: the earlier differentials \
+                             are not Leibniz",
+                            e3.r
                         )
                     })
                 };
@@ -344,7 +418,8 @@ fn equations(ext: &Ext, p: &Products, e3: &E3) -> Vec<Vec<u32>> {
         })
         .collect();
     eprintln!(
-        "E3 Leibniz: {} nontrivial equations, {:.1}s",
+        "E{} Leibniz: {} nontrivial equations, {:.1}s",
+        e3.r,
         eqs.len(),
         t.elapsed().as_secs_f64()
     );
@@ -385,23 +460,27 @@ fn read_statements(path: &str) -> Vec<Statement> {
     out
 }
 
-/// The equations `d3[src] = [tgt]` (affine: the constant column is `nvars`).
+/// The equations `d_r[src] = [tgt]` (affine: the constant column is `nvars`).
 fn statement_equations(ext: &Ext, e3: &E3, st: &Statement) -> Result<Vec<Vec<u32>>, String> {
     let b = ext.get(st.n, st.f).ok_or("source bidegree empty")?;
     let pg = e3.page[b as usize].as_ref().ok_or("E3 unknown at source")?;
-    let s = pg.project(st.src).ok_or("source is not a d2-cycle")?;
+    let s = pg
+        .project(st.src)
+        .ok_or("source is not a cycle on this page")?;
     let tb = match target(ext, e3, b).ok_or("E3 unknown at target")? {
         Some(t) => t,
         None => return Ok(vec![]),
     };
     let tpg = e3.page[tb as usize].as_ref().unwrap();
-    let tc = tpg.project(st.tgt).ok_or("target is not a d2-cycle")?;
+    let tc = tpg
+        .project(st.tgt)
+        .ok_or("target is not a cycle on this page")?;
     let m = e3.dim(tb);
     if s == 0 {
         return Err(if tc == 0 {
-            "source is a d2-boundary".into()
+            "source is a boundary on this page".into()
         } else {
-            "source is a d2-boundary but target is not".into()
+            "source is a boundary but target is not".into()
         });
     }
     if e3.off[b as usize] == u32::MAX {
@@ -475,152 +554,196 @@ fn evaluate(
         .collect()
 }
 
+/// `(page, path)` pairs from repeatable `<flag> r:path` arguments, plus the legacy page-3 flag.
+fn page_files(args: &[String], flag: &str, legacy: &str) -> Vec<(i32, String)> {
+    let mut out = vec![];
+    for (i, a) in args.iter().enumerate() {
+        if a == flag {
+            let (r, path) = args[i + 1].split_once(':').expect("expected r:path");
+            out.push((r.parse().unwrap(), path.to_string()));
+        } else if a == legacy {
+            out.push((3, args[i + 1].clone()));
+        }
+    }
+    out
+}
+
 pub(crate) fn run(ext: &Ext, p: &Products, args: &[String]) {
     let arg = |flag: &str| args.iter().position(|a| a == flag).map(|i| &args[i + 1]);
+    let last: i32 = arg("--pages").map_or(3, |s| s.parse().unwrap());
+    let seeds = page_files(args, "--seed", "--seed-d3");
+    let check_files = page_files(args, "--check", "--check-d3");
     let d2 = load_d2(ext, arg("--e3").unwrap());
-    let e3 = build_e3(ext, &d2);
-    let mut eqs = equations(ext, p, &e3);
-    if let Some(path) = arg("--seed-d3") {
-        for st in read_statements(path) {
-            match statement_equations(ext, &e3, &st) {
-                Ok(se) => {
-                    eprintln!(
-                        "seed d3 at ({},{}) {}: {} equations",
-                        st.n,
-                        st.f,
-                        st.label,
-                        se.len()
-                    );
-                    eqs.extend(se);
+    let mut e = build_e3(ext, &d2);
+    loop {
+        let r = e.r;
+        let mut eqs = equations(ext, p, &e);
+        for (_, path) in seeds.iter().filter(|(sr, _)| *sr == r) {
+            for st in read_statements(path) {
+                match statement_equations(ext, &e, &st) {
+                    Ok(se) => {
+                        eprintln!(
+                            "seed d{r} at ({},{}) {}: {} equations",
+                            st.n,
+                            st.f,
+                            st.label,
+                            se.len()
+                        );
+                        eqs.extend(se);
+                    }
+                    Err(err) => {
+                        eprintln!(
+                            "seed d{r} at ({},{}) {} skipped: {err}",
+                            st.n, st.f, st.label
+                        )
+                    }
                 }
-                Err(e) => eprintln!("seed at ({},{}) {} skipped: {e}", st.n, st.f, st.label),
             }
         }
-    }
-    let (pivot, rows, _, contradictions) = eliminate(e3.nvars, &eqs, false);
-    let free = pivot.iter().filter(|&&x| x == u32::MAX).count();
-    eprintln!(
-        "d3 solution space: dimension {free}, {} contradictions",
-        contradictions.len()
-    );
+        let (pivot, rows, _, contradictions) = eliminate(e.nvars, &eqs, false);
+        let free = pivot.iter().filter(|&&x| x == u32::MAX).count();
+        eprintln!(
+            "d{r} solution space: dimension {free}, {} contradictions",
+            contradictions.len()
+        );
 
-    // per E3 basis class with a known target: is d3 forced, and to what
-    let mut classes: Vec<(u32, usize)> = vec![];
-    let mut queries: Vec<Vec<u32>> = vec![];
-    let mut bids: Vec<u32> = (0..ext.deg.len() as u32)
-        .filter(|&b| e3.off[b as usize] != u32::MAX)
-        .collect();
-    bids.sort_by_key(|&b| ext.deg[b as usize]);
-    for &b in &bids {
-        let m = e3.dim(target(ext, &e3, b).unwrap().unwrap());
-        for k in 0..e3.dim(b) {
-            classes.push((b, k));
-            for r in 0..m {
-                queries.push(vec![var(ext, &e3, b, k, r)]);
+        // per E_r basis class with a known target: is d_r forced, and to what
+        let mut classes: Vec<(u32, usize)> = vec![];
+        let mut queries: Vec<Vec<u32>> = vec![];
+        let mut bids: Vec<u32> = (0..ext.deg.len() as u32)
+            .filter(|&b| e.off[b as usize] != u32::MAX)
+            .collect();
+        bids.sort_by_key(|&b| ext.deg[b as usize]);
+        for &b in &bids {
+            let m = e.dim(target(ext, &e, b).unwrap().unwrap());
+            for k in 0..e.dim(b) {
+                classes.push((b, k));
+                for t in 0..m {
+                    queries.push(vec![var(ext, &e, b, k, t)]);
+                }
             }
         }
-    }
-    let n_class_queries = queries.len();
-    let checks: Vec<(Statement, Result<Vec<Vec<u32>>, String>)> = arg("--check-d3")
-        .map(|path| {
-            read_statements(path)
-                .into_iter()
-                .map(|st| {
-                    let r = statement_equations(ext, &e3, &st);
-                    (st, r)
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-    // a check holds iff each of its affine equations evaluates to 0 (constant column moved over)
-    for (_, r) in &checks {
-        if let Ok(se) = r {
-            for e in se {
-                queries.push(e.iter().copied().filter(|&v| v != e3.nvars).collect());
+        let n_class_queries = queries.len();
+        let checks: Vec<(Statement, Result<Vec<Vec<u32>>, String>)> = check_files
+            .iter()
+            .filter(|(cr, _)| *cr == r)
+            .flat_map(|(_, path)| read_statements(path))
+            .map(|st| {
+                let res = statement_equations(ext, &e, &st);
+                (st, res)
+            })
+            .collect();
+        // a check holds iff each of its affine equations evaluates to its constant
+        for (_, res) in &checks {
+            if let Ok(se) = res {
+                for eq in se {
+                    queries.push(eq.iter().copied().filter(|&v| v != e.nvars).collect());
+                }
             }
         }
-    }
-    let vals = evaluate(e3.nvars, &pivot, &rows, &queries);
+        let vals = evaluate(e.nvars, &pivot, &rows, &queries);
 
-    let mut summary: BTreeMap<i32, (usize, usize, usize)> = BTreeMap::new();
-    let mut w = arg("--solution3").map(|p| BufWriter::new(File::create(p).unwrap()));
-    if let Some(w) = w.as_mut() {
-        writeln!(w, "stem,Adams_filtration,rep,status,target").unwrap();
-    }
-    let mut qi = 0;
-    for &(b, k) in &classes {
-        let m = e3.dim(target(ext, &e3, b).unwrap().unwrap());
-        let vs = &vals[qi..qi + m];
-        qi += m;
-        let det = vs.iter().all(|&(_, d)| d);
-        let nonzero = vs.iter().any(|&(v, _)| v);
-        let (n, f) = ext.deg[b as usize];
-        let e = summary.entry(n).or_default();
-        e.0 += 1;
-        if det {
-            e.1 += 1;
-            if nonzero {
-                e.2 += 1;
-            }
+        let mut summary: BTreeMap<i32, (usize, usize, usize)> = BTreeMap::new();
+        let out_path = if r == 3 {
+            arg("--solution3").cloned()
+        } else {
+            None
         }
+        .or_else(|| arg("--solution-pages").map(|pre| format!("{pre}_d{r}.csv")));
+        let mut w = out_path.map(|p| BufWriter::new(File::create(p).unwrap()));
         if let Some(w) = w.as_mut() {
-            let rep = e3.page[b as usize].as_ref().unwrap().reps[k];
-            let tgt: Vec<String> = vs.iter().map(|&(v, _)| (v as u8).to_string()).collect();
-            writeln!(
-                w,
-                "{n},{f},\"{rep:#b}\",{},\"[{}]\"",
-                if det { "determined" } else { "open" },
-                tgt.join(",")
-            )
-            .unwrap();
+            writeln!(w, "stem,Adams_filtration,rep,status,target").unwrap();
         }
-    }
-    assert_eq!(qi, n_class_queries);
-    println!("stem,E3_classes_with_target,determined,determined_nonzero");
-    let (mut tc, mut td, mut tz) = (0, 0, 0);
-    for (s, (c, d, z)) in &summary {
-        println!("{s},{c},{d},{z}");
-        tc += c;
-        td += d;
-        tz += z;
-    }
-    println!(
-        "total: {tc} classes, {td} determined ({tz} nonzero), {} open",
-        tc - td
-    );
-
-    if !checks.is_empty() {
-        let (mut ok, mut bad, mut open, mut skipped) = (0, 0, 0, 0);
-        for (st, r) in &checks {
-            match r {
-                Err(e) => {
-                    skipped += 1;
-                    println!("check ({},{}) {}: skipped ({e})", st.n, st.f, st.label);
-                }
-                Ok(se) => {
-                    let vs = &vals[qi..qi + se.len()];
-                    qi += se.len();
-                    // equation e holds iff (sum of variables) == constant
-                    let holds = se.iter().zip(vs).map(|(e, &(v, d))| {
-                        let c = e.contains(&e3.nvars);
-                        (d, v == c)
-                    });
-                    let all_det = holds.clone().all(|(d, _)| d);
-                    let all_ok = holds.clone().all(|(d, h)| !d || h);
-                    let status = if !all_ok {
-                        bad += 1;
-                        "WRONG"
-                    } else if all_det {
-                        ok += 1;
-                        "correct"
-                    } else {
-                        open += 1;
-                        "open"
-                    };
-                    println!("check ({},{}) {}: {status}", st.n, st.f, st.label);
+        let mut dr: FxHashMap<u32, Vec<Option<Mask>>> = FxHashMap::default();
+        let mut qi = 0;
+        for &(b, k) in &classes {
+            let m = e.dim(target(ext, &e, b).unwrap().unwrap());
+            let vs = &vals[qi..qi + m];
+            qi += m;
+            let det = vs.iter().all(|&(_, d)| d);
+            let value: Mask = vs
+                .iter()
+                .enumerate()
+                .filter(|(_, (v, _))| *v)
+                .fold(0, |acc, (t, _)| acc | 1 << t);
+            dr.entry(b).or_default().push(det.then_some(value));
+            let (n, f) = ext.deg[b as usize];
+            let s = summary.entry(n).or_default();
+            s.0 += 1;
+            if det {
+                s.1 += 1;
+                if value != 0 {
+                    s.2 += 1;
                 }
             }
+            if let Some(w) = w.as_mut() {
+                let rep = e.page[b as usize].as_ref().unwrap().reps[k];
+                let tgt: Vec<String> = vs.iter().map(|&(v, _)| (v as u8).to_string()).collect();
+                writeln!(
+                    w,
+                    "{n},{f},\"{rep:#b}\",{},\"[{}]\"",
+                    if det { "determined" } else { "open" },
+                    tgt.join(",")
+                )
+                .unwrap();
+            }
         }
-        println!("checks: {ok} correct and forced, {bad} wrong, {open} open, {skipped} skipped");
+        assert_eq!(qi, n_class_queries);
+        println!("page {r}");
+        println!("stem,E{r}_classes_with_target,determined,determined_nonzero");
+        let (mut tc, mut td, mut tz) = (0, 0, 0);
+        for (s, (c, d, z)) in &summary {
+            println!("{s},{c},{d},{z}");
+            tc += c;
+            td += d;
+            tz += z;
+        }
+        println!(
+            "total d{r}: {tc} classes, {td} determined ({tz} nonzero), {} open",
+            tc - td
+        );
+
+        if !checks.is_empty() {
+            let (mut ok, mut bad, mut open, mut skipped) = (0, 0, 0, 0);
+            for (st, res) in &checks {
+                match res {
+                    Err(err) => {
+                        skipped += 1;
+                        println!(
+                            "check d{r} ({},{}) {}: skipped ({err})",
+                            st.n, st.f, st.label
+                        );
+                    }
+                    Ok(se) => {
+                        let vs = &vals[qi..qi + se.len()];
+                        qi += se.len();
+                        let holds = se.iter().zip(vs).map(|(eq, &(v, d))| {
+                            let c = eq.contains(&e.nvars);
+                            (d, v == c)
+                        });
+                        let all_det = holds.clone().all(|(d, _)| d);
+                        let all_ok = holds.clone().all(|(d, h)| !d || h);
+                        let status = if !all_ok {
+                            bad += 1;
+                            "WRONG"
+                        } else if all_det {
+                            ok += 1;
+                            "correct"
+                        } else {
+                            open += 1;
+                            "open"
+                        };
+                        println!("check d{r} ({},{}) {}: {status}", st.n, st.f, st.label);
+                    }
+                }
+            }
+            println!(
+                "checks d{r}: {ok} correct and forced, {bad} wrong, {open} open, {skipped} skipped"
+            );
+        }
+        if r >= last {
+            break;
+        }
+        e = next_page(ext, &e, &dr);
     }
 }
