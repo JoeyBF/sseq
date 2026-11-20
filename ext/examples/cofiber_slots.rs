@@ -250,13 +250,26 @@ fn main() -> anyhow::Result<()> {
             if gens(input) == 0 {
                 return Ok(Some(0));
             }
-            Ok(ms.read(SaveKind::ChainMap, input)?.map(|data| {
+            Ok(ms.read(SaveKind::ChainMap, input)?.and_then(|data| {
                 let src = res.module(zb.s());
                 let fx_dim = src.dimension(zb.t() + k);
                 let mut cur = &data[..];
                 let mut star: V = 0;
                 for l in 0..gens(input) {
-                    let fv = fp::vector::FpVector::from_bytes(res.prime(), fx_dim, &mut cur).unwrap();
+                    let Ok(fv) = fp::vector::FpVector::from_bytes(res.prime(), fx_dim, &mut cur) else {
+                        eprintln!(
+                            "SHORT {} input ({}, {}) target s {} t {}: {} bytes, gens {} fx_dim {}",
+                            ms.path().display(),
+                            input.n(),
+                            input.s(),
+                            zb.s(),
+                            zb.t() + k,
+                            data.len(),
+                            gens(input),
+                            fx_dim
+                        );
+                        return None;
+                    };
                     let mut c = 0;
                     for i in 0..gens(zb) {
                         if z >> i & 1 == 1 {
@@ -265,7 +278,7 @@ fn main() -> anyhow::Result<()> {
                     }
                     star |= (c as V) << l;
                 }
-                star
+                Some(star)
             }))
         };
         type Cls = (Bidegree, usize);
@@ -329,18 +342,23 @@ fn main() -> anyhow::Result<()> {
             .into_maybe_par_iter()
             .map(|name| {
             let mut mons = vec![];
-            let factors: Vec<Cls> = name
+            // All factors must parse: names too long for the filesystem are stored truncated
+            // (`…x_~<hash>`), and their hidden factors would give the wrong bidegree.
+            let Some(factors) = name
                 .split('.')
-                .filter_map(|f| {
+                .map(|f| {
                     let v: Vec<i32> = f
-                        .trim_start_matches("x_(")
-                        .trim_end_matches(')')
+                        .strip_prefix("x_(")?
+                        .strip_suffix(')')?
                         .split(", ")
                         .map(|t| t.parse().ok())
                         .collect::<Option<_>>()?;
-                    Some((Bidegree::n_s(v[0], v[1]), v[2] as usize))
+                    (v.len() == 3).then(|| (Bidegree::n_s(v[0], v[1]), v[2] as usize))
                 })
-                .collect();
+                .collect::<Option<Vec<Cls>>>()
+            else {
+                return Ok(mons);
+            };
             if factors.len() < 2 {
                 return Ok(mons);
             }
