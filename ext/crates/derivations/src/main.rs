@@ -25,6 +25,8 @@ use std::{
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 
+mod page;
+
 type Mask = u32;
 
 struct Ext {
@@ -1739,6 +1741,11 @@ fn main() {
     let ext = load(dir, n_max, f_max);
     let p = build_products(&ext);
     check_products(&ext, &p);
+    // --e3 <d2 file> [--seed-d3 f] [--check-d3 f] [--solution3 out]: d3 on E3 instead
+    if args.iter().any(|a| a == "--e3") {
+        page::run(&ext, &p, &args);
+        return;
+    }
     // --modules <dir> <name:shift,...>: two-cell complexes from ext's cofiber_export
     let mut mods: Vec<Module> = vec![];
     if let Some(i) = args.iter().position(|a| a == "--modules") {
