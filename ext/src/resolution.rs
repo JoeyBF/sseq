@@ -1007,6 +1007,13 @@ pub(crate) mod secondary {
         /// s -> t -> idx -> homotopy
         pub(crate) homotopies: OnceBiVec<SecondaryHomotopy<CC::Algebra>>,
         intermediates: DashMap<BidegreeGenerator, FpVector>,
+        /// Whether composites may hit same-degree generators — see
+        /// [`SecondaryLift::hit_generator`]. `false` for a minimal resolution (the default,
+        /// and required when resolving to a stem); `true` for a **non-minimal** resolution such
+        /// as an untwisted `TensorResolution`, whose differential has identity components so
+        /// $\partial\partial$ genuinely lands on same-degree generators. `true` requires the
+        /// resolution be computed as a full rectangle, not truncated to a stem.
+        hit_generator: bool,
     }
 
     impl<CC: FreeChainComplex> SecondaryLift for SecondaryResolution<CC>
@@ -1017,6 +1024,10 @@ pub(crate) mod secondary {
         type Source = CC;
         type Target = CC;
         type Underlying = CC;
+
+        fn hit_generator(&self) -> bool {
+            self.hit_generator
+        }
 
         fn underlying(&self) -> Arc<CC> {
             Arc::clone(&self.underlying)
@@ -1090,10 +1101,19 @@ pub(crate) mod secondary {
         CC::Algebra: PairAlgebra,
     {
         pub fn new(cc: Arc<CC>) -> Self {
+            Self::new_with_hit_generator(cc, false)
+        }
+
+        /// Like [`new`](Self::new) but for a **non-minimal** resolution: the composite
+        /// $\partial\partial$ may hit same-degree generators, so `hit_generator` must be `true`
+        /// (see [`SecondaryLift::hit_generator`]). The resolution must be computed as a full
+        /// rectangle, not truncated to a stem.
+        pub fn new_with_hit_generator(cc: Arc<CC>, hit_generator: bool) -> Self {
             Self {
                 underlying: cc,
                 homotopies: OnceBiVec::new(2),
                 intermediates: DashMap::new(),
+                hit_generator,
             }
         }
 

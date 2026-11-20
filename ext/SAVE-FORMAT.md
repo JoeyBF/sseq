@@ -46,8 +46,16 @@ into shards with a CRC32C each. An empty element means nothing is saved there.
 | `secondary_composite` | generator | `SecondaryComposite::to_bytes` |
 | `secondary_intermediate` | generator | `len: u64`, then the intermediate vector |
 | `secondary_homotopy` | bidegree | the value on each generator |
+| `tensor_differential` | bidegree | `module_fingerprint: u32, rows: u64, cols: u64`, then the rows of `δ_Q` |
 
 A `kernel` is deleted once the next filtration is computed.
+
+A `tensor_differential` is the cochain coboundary `δ_Q` of an untwisted tensor resolution
+`P• ⊗ M`, where `P•` is a resolution of the base field and `M` is any module. It depends on `M`,
+which the store does not bind, so a store must be dedicated to one `M`. The fingerprint is an
+Adler-32 checksum of the `Display` name of `M`, its minimum degree and its dimension in every degree
+up to `t`; a reader with a different fingerprint panics instead of returning a wrong `Ext`. The
+shape is stored because the cochain dimensions depend on `M`, and the reader checks it.
 
 ## Stream tier
 

@@ -1494,6 +1494,11 @@ pub enum SaveKind {
     ChainHomotopy,
     NassauDifferential,
     NassauQi,
+    /// The closed-form coboundary `δ_Q` of an untwisted tensor resolution `Q• = P• ⊗ M`.
+    ///
+    /// It depends on `M`, which the store does not bind, so each payload carries a fingerprint of
+    /// `M`.
+    TensorDifferential,
 }
 
 impl SaveKind {
@@ -1511,6 +1516,7 @@ impl SaveKind {
             Self::ChainHomotopy => "chain_homotopy",
             Self::NassauDifferential => "nassau_differential",
             Self::NassauQi => "nassau_qi",
+            Self::TensorDifferential => "tensor_differential",
         }
     }
 
