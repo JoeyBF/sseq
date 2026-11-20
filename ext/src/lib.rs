@@ -171,6 +171,7 @@
 
 pub mod chain_complex;
 pub mod ctau;
+pub mod ctau_scale;
 pub mod ext_algebra;
 pub mod lift;
 pub mod resolution;

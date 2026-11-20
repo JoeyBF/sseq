@@ -145,8 +145,16 @@ pub struct QAlgebra {
     /// `factors[n]` lists the terms $(\xi^S, i)$ of $q_n \mapsto \sum \chi(\xi_{n-i}^{2^i})
     /// \otimes q_i$.
     factors: Vec<Vec<(PackedXi, usize)>>,
+    /// The position of each monomial in its degree.
+    index: FxHashMap<QMono, u32>,
+    /// `shorter[d][l]` is the number of monomials of degree `d` shorter than `l`.
+    shorter: Vec<Vec<u32>>,
     /// The memo of [`Self::act`].
     memo: DashMap<(PackedXi, QMono), Arc<QPoly>>,
+    /// The number of entries at which the memo is emptied; see [`Self::set_memo_limit`].
+    memo_limit: usize,
+    /// The insertions into the memo since it was last emptied.
+    memo_count: std::sync::atomic::AtomicUsize,
 }
 
 impl QAlgebra {
@@ -205,11 +213,50 @@ impl QAlgebra {
                     .collect()
             })
             .collect();
+        let index = by_degree
+            .iter()
+            .flat_map(|b| b.iter().enumerate().map(|(i, &m)| (m, i as u32)))
+            .collect();
+        let shorter = by_degree
+            .iter()
+            .map(|b| {
+                let top = b.last().map_or(0, mono_len);
+                (0..=top + 1)
+                    .map(|l| b.partition_point(|m| mono_len(m) < l) as u32)
+                    .collect()
+            })
+            .collect();
         Self {
             by_degree,
             factors,
+            index,
+            shorter,
             memo: DashMap::default(),
+            memo_limit: usize::MAX,
+            memo_count: Default::default(),
         }
+    }
+
+    /// Bounds the memo of [`Self::act`]: it is emptied when it passes `limit` entries, trading
+    /// recomputation for memory.
+    pub fn set_memo_limit(&mut self, limit: usize) {
+        self.memo_limit = limit;
+    }
+
+    /// The position of `m` among the monomials of its degree.
+    pub fn index(&self, m: &QMono) -> usize {
+        self.index[m] as usize
+    }
+
+    /// The number of monomials of degree `d` of length less than `l`.
+    pub fn shorter(&self, d: i32, l: u32) -> usize {
+        let row = &self.shorter[d as usize];
+        row[(l as usize).min(row.len() - 1)] as usize
+    }
+
+    /// The largest length of a monomial of degree `d`, if there is one.
+    pub fn max_len(&self, d: i32) -> Option<u32> {
+        self.monomials(d).last().map(mono_len)
     }
 
     /// The monomials of degree `d`, sorted by length; empty outside the range.
@@ -249,6 +296,15 @@ impl QAlgebra {
             }
         }
         let out = Arc::new(out.into_iter().collect::<Vec<_>>());
+        if self
+            .memo_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            > self.memo_limit
+        {
+            self.memo_count
+                .store(0, std::sync::atomic::Ordering::Relaxed);
+            self.memo.clear();
+        }
         self.memo.insert((r, *m), Arc::clone(&out));
         out
     }
