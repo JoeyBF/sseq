@@ -170,6 +170,7 @@
 #![deny(clippy::use_self, unsafe_op_in_unsafe_fn)]
 
 pub mod chain_complex;
+pub mod ctau;
 pub mod ext_algebra;
 pub mod lift;
 pub mod resolution;
