@@ -707,204 +707,265 @@ pub(crate) fn run(ext: &Ext, p: &Products, args: &[String]) {
     let seeds = page_files(args, "--seed", "--seed-d3");
     let check_files = page_files(args, "--check", "--check-d3");
     let d2 = load_d2(ext, arg("--e3").unwrap());
-    let mut e = build_e3(ext, &d2);
-    loop {
-        let r = e.r;
-        let mut eqs = equations(ext, p, &e);
-        for (_, path) in seeds.iter().filter(|(sr, _)| *sr == r) {
-            for st in read_statements(path) {
-                match statement_equations(ext, &e, &st) {
-                    Ok(se) => {
-                        eprintln!(
-                            "seed d{r} at ({},{}) {}: {} equations",
-                            st.n,
-                            st.f,
-                            st.label,
-                            se.len()
-                        );
-                        eqs.extend(se);
-                    }
-                    Err(err) => {
-                        eprintln!(
-                            "seed d{r} at ({},{}) {} skipped: {err}",
-                            st.n, st.f, st.label
-                        )
-                    }
+    // Facts d_r(y) = 0 learned from page r + 1 (page -> (stem, filtration, E2 vector of y)).
+    // They are kept as E2 vectors because the page bases change from one pass to the next.
+    let mut back: FxHashMap<i32, std::collections::BTreeSet<(i32, i32, Mask)>> =
+        FxHashMap::default();
+    for pass in 1.. {
+        let facts_before: usize = back.values().map(|s| s.len()).sum();
+        println!("pass {pass}");
+        let mut e = build_e3(ext, &d2);
+        loop {
+            let r = e.r;
+            let mut eqs = equations(ext, p, &e);
+            let mut n_back = 0;
+            for &(n, f, src) in back.get(&r).into_iter().flatten() {
+                let st = Statement {
+                    n,
+                    f,
+                    src,
+                    tgt: 0,
+                    label: String::new(),
+                };
+                if let Ok(se) = statement_equations(ext, &e, &st) {
+                    eqs.extend(se);
+                    n_back += 1;
                 }
             }
-        }
-        let (pivot, rows, _, contradictions) = eliminate(e.nvars, &eqs, false);
-        let free = pivot.iter().filter(|&&x| x == u32::MAX).count();
-        eprintln!(
-            "d{r} solution space: dimension {free}, {} contradictions",
-            contradictions.len()
-        );
-
-        // per source class with a known target: what is known of d_r
-        let mut classes: Vec<(u32, usize)> = vec![];
-        let mut queries: Vec<Vec<u32>> = vec![];
-        let mut bids: Vec<u32> = (0..ext.deg.len() as u32)
-            .filter(|&b| e.off[b as usize] != u32::MAX)
-            .collect();
-        bids.sort_by_key(|&b| ext.deg[b as usize]);
-        for &b in &bids {
-            let m = e.tdim(target(ext, &e, b).unwrap().unwrap());
-            for k in 0..e.dim(b) {
-                classes.push((b, k));
-                for t in 0..m {
-                    queries.push(vec![var(ext, &e, b, k, t)]);
-                }
+            if n_back > 0 {
+                eprintln!("d{r}: {n_back} backward facts d{r}(y) = 0 used");
             }
-        }
-        let n_class_queries = queries.len();
-        let checks: Vec<(Statement, Result<Vec<Vec<u32>>, String>)> = check_files
-            .iter()
-            .filter(|(cr, _)| *cr == r)
-            .flat_map(|(_, path)| read_statements(path))
-            .map(|st| {
-                let res = statement_equations(ext, &e, &st);
-                (st, res)
-            })
-            .collect();
-        // a check holds iff each of its affine equations evaluates to its constant
-        for (_, res) in &checks {
-            if let Ok(se) = res {
-                for eq in se {
-                    queries.push(eq.iter().copied().filter(|&v| v != e.nvars).collect());
-                }
-            }
-        }
-        let vals = evaluate(e.nvars, &pivot, &rows, &queries);
-
-        let mut summary: BTreeMap<i32, (usize, usize, usize)> = BTreeMap::new();
-        let out_path = if r == 3 {
-            arg("--solution3").cloned()
-        } else {
-            None
-        }
-        .or_else(|| arg("--solution-pages").map(|pre| format!("{pre}_d{r}.csv")));
-        let mut w = out_path.map(|p| BufWriter::new(File::create(p).unwrap()));
-        if let Some(w) = w.as_mut() {
-            writeln!(w, "stem,Adams_filtration,rep,status,target").unwrap();
-        }
-        let mut dr: FxHashMap<u32, Vec<Val>> = FxHashMap::default();
-        let mut qi = 0;
-        for &(b, k) in &classes {
-            let m = e.tdim(target(ext, &e, b).unwrap().unwrap());
-            let vs = &vals[qi..qi + m];
-            qi += m;
-            let mut v = Val::default();
-            let mut dirs: BTreeMap<u32, Mask> = BTreeMap::new();
-            for (t, (val, deps)) in vs.iter().enumerate() {
-                if *val {
-                    v.part |= 1 << t;
-                    v.keys.push(t as u64);
-                }
-                for &f in deps {
-                    *dirs.entry(f).or_default() |= 1 << t;
-                    v.keys.push(64 + (f as u64) * 64 + t as u64);
-                }
-            }
-            v.keys.sort_unstable();
-            v.dirs = dirs.into_values().collect();
-            let det = v.dirs.is_empty();
-            let (n, f) = ext.deg[b as usize];
-            let s = summary.entry(n).or_default();
-            s.0 += 1;
-            if det {
-                s.1 += 1;
-                if v.part != 0 {
-                    s.2 += 1;
-                }
-            }
-            if let Some(w) = w.as_mut() {
-                let rep = e.page[b as usize].as_ref().unwrap().reps[k];
-                let tgt: Vec<String> = vs.iter().map(|(v, _)| (*v as u8).to_string()).collect();
-                writeln!(
-                    w,
-                    "{n},{f},\"{rep:#b}\",{},\"[{}]\"",
-                    if det { "determined" } else { "open" },
-                    tgt.join(",")
-                )
-                .unwrap();
-            }
-            dr.entry(b).or_default().push(v);
-        }
-        assert_eq!(qi, n_class_queries);
-        println!("page {r}");
-        println!("stem,E{r}_classes_with_target,determined,determined_nonzero");
-        let (mut tc, mut td, mut tz) = (0, 0, 0);
-        for (s, (c, d, z)) in &summary {
-            println!("{s},{c},{d},{z}");
-            tc += c;
-            td += d;
-            tz += z;
-        }
-        println!(
-            "total d{r}: {tc} classes, {td} determined ({tz} nonzero), {} open",
-            tc - td
-        );
-
-        if !checks.is_empty() {
-            let (mut ok, mut bad, mut open, mut skipped, mut exact_ok) = (0, 0, 0, 0, 0);
-            for (st, res) in &checks {
-                match res {
-                    Err(err) => {
-                        skipped += 1;
-                        println!(
-                            "check d{r} ({},{}) {}: skipped ({err})",
-                            st.n, st.f, st.label
-                        );
-                    }
-                    Ok(se) => {
-                        let vs = &vals[qi..qi + se.len()];
-                        qi += se.len();
-                        let holds = se.iter().zip(vs).map(|(eq, (v, deps))| {
-                            let c = eq.contains(&e.nvars);
-                            (deps.is_empty(), *v == c)
-                        });
-                        let all_det = holds.clone().all(|(d, _)| d);
-                        let all_ok = holds.clone().all(|(d, h)| !d || h);
-                        let status = if !all_ok {
-                            bad += 1;
-                            "WRONG"
-                        } else if all_det {
-                            ok += 1;
-                            "correct"
-                        } else {
-                            open += 1;
-                            "open"
-                        };
-                        // exact: the target page has no boundary uncertainty, so the verdict is
-                        // about the true E_r rather than its quotient by the possible boundaries
-                        let exact = ext
-                            .get(st.n, st.f)
-                            .and_then(|b| target(ext, &e, b))
-                            .flatten()
-                            .is_none_or(|t| e.page[t as usize].as_ref().unwrap().exact);
-                        if status == "correct" && exact {
-                            exact_ok += 1;
+            for (_, path) in seeds.iter().filter(|(sr, _)| *sr == r) {
+                for st in read_statements(path) {
+                    // a seed d_r(src) = tgt also says that src and tgt survive to E_r
+                    if r > 3 {
+                        let set = back.entry(r - 1).or_default();
+                        set.insert((st.n, st.f, st.src));
+                        if st.tgt != 0 {
+                            set.insert((st.n - 1, st.f + r, st.tgt));
                         }
-                        let how = if exact {
-                            "exact"
-                        } else {
-                            "modulo possible boundaries"
-                        };
-                        println!(
-                            "check d{r} ({},{}) {}: {status} ({how})",
-                            st.n, st.f, st.label
-                        );
+                    }
+                    match statement_equations(ext, &e, &st) {
+                        Ok(se) => {
+                            eprintln!(
+                                "seed d{r} at ({},{}) {}: {} equations",
+                                st.n,
+                                st.f,
+                                st.label,
+                                se.len()
+                            );
+                            eqs.extend(se);
+                        }
+                        Err(err) => {
+                            eprintln!(
+                                "seed d{r} at ({},{}) {} skipped: {err}",
+                                st.n, st.f, st.label
+                            )
+                        }
                     }
                 }
+            }
+            let (pivot, rows, _, contradictions) = eliminate(e.nvars, &eqs, false);
+            let free = pivot.iter().filter(|&&x| x == u32::MAX).count();
+            eprintln!(
+                "d{r} solution space: dimension {free}, {} contradictions",
+                contradictions.len()
+            );
+
+            // per source class with a known target: what is known of d_r
+            let mut classes: Vec<(u32, usize)> = vec![];
+            let mut queries: Vec<Vec<u32>> = vec![];
+            let mut bids: Vec<u32> = (0..ext.deg.len() as u32)
+                .filter(|&b| e.off[b as usize] != u32::MAX)
+                .collect();
+            bids.sort_by_key(|&b| ext.deg[b as usize]);
+            for &b in &bids {
+                let m = e.tdim(target(ext, &e, b).unwrap().unwrap());
+                for k in 0..e.dim(b) {
+                    classes.push((b, k));
+                    for t in 0..m {
+                        queries.push(vec![var(ext, &e, b, k, t)]);
+                    }
+                }
+            }
+            let n_class_queries = queries.len();
+            let checks: Vec<(Statement, Result<Vec<Vec<u32>>, String>)> = check_files
+                .iter()
+                .filter(|(cr, _)| *cr == r)
+                .flat_map(|(_, path)| read_statements(path))
+                .map(|st| {
+                    let res = statement_equations(ext, &e, &st);
+                    (st, res)
+                })
+                .collect();
+            // a check holds iff each of its affine equations evaluates to its constant
+            for (_, res) in &checks {
+                if let Ok(se) = res {
+                    for eq in se {
+                        queries.push(eq.iter().copied().filter(|&v| v != e.nvars).collect());
+                    }
+                }
+            }
+            let vals = evaluate(e.nvars, &pivot, &rows, &queries);
+
+            let mut summary: BTreeMap<i32, (usize, usize, usize)> = BTreeMap::new();
+            let out_path = if r == 3 {
+                arg("--solution3").cloned()
+            } else {
+                None
+            }
+            .or_else(|| arg("--solution-pages").map(|pre| format!("{pre}_d{r}.csv")));
+            let mut w = out_path.map(|p| BufWriter::new(File::create(p).unwrap()));
+            if let Some(w) = w.as_mut() {
+                writeln!(w, "stem,Adams_filtration,rep,status,target").unwrap();
+            }
+            let mut dr: FxHashMap<u32, Vec<Val>> = FxHashMap::default();
+            let mut qi = 0;
+            for &(b, k) in &classes {
+                let m = e.tdim(target(ext, &e, b).unwrap().unwrap());
+                let vs = &vals[qi..qi + m];
+                qi += m;
+                let mut v = Val::default();
+                let mut dirs: BTreeMap<u32, Mask> = BTreeMap::new();
+                for (t, (val, deps)) in vs.iter().enumerate() {
+                    if *val {
+                        v.part |= 1 << t;
+                        v.keys.push(t as u64);
+                    }
+                    for &f in deps {
+                        *dirs.entry(f).or_default() |= 1 << t;
+                        v.keys.push(64 + (f as u64) * 64 + t as u64);
+                    }
+                }
+                v.keys.sort_unstable();
+                v.dirs = dirs.into_values().collect();
+                let det = v.dirs.is_empty();
+                let (n, f) = ext.deg[b as usize];
+                let s = summary.entry(n).or_default();
+                s.0 += 1;
+                if det {
+                    s.1 += 1;
+                    if v.part != 0 {
+                        s.2 += 1;
+                    }
+                }
+                if let Some(w) = w.as_mut() {
+                    let rep = e.page[b as usize].as_ref().unwrap().reps[k];
+                    let tgt: Vec<String> = vs.iter().map(|(v, _)| (*v as u8).to_string()).collect();
+                    writeln!(
+                        w,
+                        "{n},{f},\"{rep:#b}\",{},\"[{}]\"",
+                        if det { "determined" } else { "open" },
+                        tgt.join(",")
+                    )
+                    .unwrap();
+                }
+                dr.entry(b).or_default().push(v);
+            }
+            // a forced value d_r(x) = y in a target without boundary uncertainty is a true
+            // d_{r-1}-cycle: d_{r-1}(y) = 0
+            if r > 3 {
+                for (&b, vs) in &dr {
+                    let Some(Some(t)) = target(ext, &e, b) else {
+                        continue;
+                    };
+                    let tp = e.page[t as usize].as_ref().unwrap();
+                    if !tp.exact {
+                        continue;
+                    }
+                    let (tn, tf) = ext.deg[t as usize];
+                    for v in vs.iter().filter(|v| v.dirs.is_empty() && v.part != 0) {
+                        let y = (0..tp.treps.len())
+                            .filter(|&l| v.part >> l & 1 == 1)
+                            .fold(0, |acc, l| acc ^ tp.treps[l]);
+                        back.entry(r - 1).or_default().insert((tn, tf, y));
+                    }
+                }
+            }
+            assert_eq!(qi, n_class_queries);
+            println!("page {r}");
+            println!("stem,E{r}_classes_with_target,determined,determined_nonzero");
+            let (mut tc, mut td, mut tz) = (0, 0, 0);
+            for (s, (c, d, z)) in &summary {
+                println!("{s},{c},{d},{z}");
+                tc += c;
+                td += d;
+                tz += z;
             }
             println!(
-                "checks d{r}: {ok} correct and forced ({exact_ok} exact), {bad} wrong, {open} \
-                 open, {skipped} skipped"
+                "total d{r}: {tc} classes, {td} determined ({tz} nonzero), {} open",
+                tc - td
             );
+
+            if !checks.is_empty() {
+                let (mut ok, mut bad, mut open, mut skipped, mut exact_ok) = (0, 0, 0, 0, 0);
+                for (st, res) in &checks {
+                    match res {
+                        Err(err) => {
+                            skipped += 1;
+                            println!(
+                                "check d{r} ({},{}) {}: skipped ({err})",
+                                st.n, st.f, st.label
+                            );
+                        }
+                        Ok(se) => {
+                            let vs = &vals[qi..qi + se.len()];
+                            qi += se.len();
+                            let holds = se.iter().zip(vs).map(|(eq, (v, deps))| {
+                                let c = eq.contains(&e.nvars);
+                                (deps.is_empty(), *v == c)
+                            });
+                            let all_det = holds.clone().all(|(d, _)| d);
+                            let all_ok = holds.clone().all(|(d, h)| !d || h);
+                            let status = if !all_ok {
+                                bad += 1;
+                                "WRONG"
+                            } else if all_det {
+                                ok += 1;
+                                "correct"
+                            } else {
+                                open += 1;
+                                "open"
+                            };
+                            // exact: the target page has no boundary uncertainty, so the verdict is
+                            // about the true E_r rather than its quotient by the possible boundaries
+                            let exact = ext
+                                .get(st.n, st.f)
+                                .and_then(|b| target(ext, &e, b))
+                                .flatten()
+                                .is_none_or(|t| e.page[t as usize].as_ref().unwrap().exact);
+                            if status == "correct" && exact {
+                                exact_ok += 1;
+                            }
+                            let how = if exact {
+                                "exact"
+                            } else {
+                                "modulo possible boundaries"
+                            };
+                            println!(
+                                "check d{r} ({},{}) {}: {status} ({how})",
+                                st.n, st.f, st.label
+                            );
+                        }
+                    }
+                }
+                println!(
+                    "checks d{r}: {ok} correct and forced ({exact_ok} exact), {bad} wrong, {open} \
+                 open, {skipped} skipped"
+                );
+            }
+            if r >= last {
+                break;
+            }
+            e = next_page(ext, &e, &dr);
         }
-        if r >= last {
+        let facts: usize = back.values().map(|s| s.len()).sum();
+        eprintln!(
+            "pass {pass}: {facts} backward facts ({} new)",
+            facts - facts_before
+        );
+        if facts == facts_before {
             break;
         }
-        e = next_page(ext, &e, &dr);
     }
 }
