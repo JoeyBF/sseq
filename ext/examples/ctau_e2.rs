@@ -1,21 +1,4 @@
 //! Exports the Adams E2 page of Cτ and of its two-cell complexes, from a saved resolution of the classical sphere.
-//!
-//! Nothing is resolved or lifted: the run stops if the save lacks a bidegree it would read, and a
-//! product whose chain map step was never saved is reported as unknown.
-//!
-//! Tridegrees are motivic `stem,filtration,weight`, and a class is an index into the basis of its
-//! tridegree; vectors list coordinates in the target's basis. Files, in the output directory:
-//! * `classical_rank.csv`: the generators of the backbone (`filtration,degree,rank`);
-//! * `Ctau_rank.csv`, and `<C>_rank.csv` for each complex `<C>` among `C2`, `Ceta`, `Cnu`,
-//!   `Csigma` (`Ctau` smashed with the cofiber of `2`, `η`, `ν`, `σ`);
-//! * `<C>_h.csv`: the action of `h_0, ..., h_4` (`j,class,product`);
-//! * `<C>_istar.csv`, `<C>_pstar.csv`: the maps induced by the bottom cell `Ctau → C` and the top
-//!   cell `C → Σ^{|cell|} Ctau`;
-//! * `Ctau_indaction.csv`: the action of the classical indecomposables with a saved chain map,
-//!   which act as classes of twice the stem plus the filtration (`classical class,class,product`),
-//!   and `Ctau_unknown.csv`, the pairs whose step is not saved;
-//! * `Ctau_products.csv`: the products `β · α` for every `β` of weight up to the product bound
-//!   (`β,α,product`), and `Ctau_commutativity.txt`, the comparison of `β · α` with `α · β`.
 
 use std::{
     fs::File,
@@ -72,6 +55,24 @@ fn write_rows(
     Ok(n)
 }
 
+/// Reads the range and the save, and writes the export.
+///
+/// Nothing is resolved or lifted: the run stops if the save lacks a bidegree it would read, and a
+/// product whose chain map step was never saved is reported as unknown.
+///
+/// Tridegrees are motivic `stem,filtration,weight`, and a class is an index into the basis of its
+/// tridegree; vectors list coordinates in the target's basis. Files, in the output directory:
+/// * `classical_rank.csv`: the generators of the backbone (`filtration,degree,rank`);
+/// * `Ctau_rank.csv`, and `<C>_rank.csv` for each complex `<C>` among `C2`, `Ceta`, `Cnu`,
+///   `Csigma` (`Ctau` smashed with the cofiber of `2`, `η`, `ν`, `σ`);
+/// * `<C>_h.csv`: the action of `h_0, ..., h_4` (`j,class,product`);
+/// * `<C>_istar.csv`, `<C>_pstar.csv`: the maps induced by the bottom cell `Ctau → C` and the top
+///   cell `C → Σ^{|cell|} Ctau`;
+/// * `Ctau_indaction.csv`: the action of the classical indecomposables with a saved chain map,
+///   which act as classes of twice the stem plus the filtration (`classical class,class,product`),
+///   and `Ctau_unknown.csv`, the pairs whose step is not saved;
+/// * `Ctau_products.csv`: the products `β · α` for every `β` of weight up to the product bound
+///   (`β,α,product`), and `Ctau_commutativity.txt`, the comparison of `β · α` with `α · β`.
 fn main() -> anyhow::Result<()> {
     ext::utils::init_logging()?;
     let res = Arc::new(query_module_only(
@@ -84,7 +85,7 @@ fn main() -> anyhow::Result<()> {
     });
     let max_n: i32 = query::with_default("Max motivic stem", "60", str::parse);
     let max_s: i32 = query::with_default("Max filtration", "30", str::parse);
-    let specs: String = query::with_default("Complexes", "C2,Ceta,Cnu,Csigma", |s| {
+    let specs: String = query::with_default("Complexes (- for none)", "C2,Ceta,Cnu,Csigma", |s| {
         Ok::<_, anyhow::Error>(s.to_string())
     });
     let product_weight: i32 = query::with_default("Product bound (weight of β)", "0", str::parse);
@@ -141,6 +142,9 @@ fn main() -> anyhow::Result<()> {
         start.elapsed().as_secs_f64()
     );
 
+    let (cochains, entries) = ctau.coboundary_stats();
+    eprintln!("Ctau: {cochains} cochains, {entries} nonzero coboundary entries");
+
     /// Writes the ranks and the action of `h_0, ..., h_4` on `ext`.
     fn ranks_and_h(
         dir: &std::path::Path,
@@ -158,19 +162,34 @@ fn main() -> anyhow::Result<()> {
         for &x in &classes {
             writeln!(w, "{},{}", tri(x), ext.dimension(x))?;
         }
-        let rows: Vec<Vec<(usize, Tri, Vec<Vec<u32>>)>> = classes
-            .clone()
+        // one cochain map per filtration and weight serves every polynomial degree
+        let mut groups: std::collections::BTreeMap<(i32, i32), Vec<Tri>> = Default::default();
+        for &x in &classes {
+            groups.entry((x.a, x.u)).or_default().push(x);
+        }
+        let rows: Vec<Vec<(usize, Tri, Vec<Vec<u32>>)>> = groups
+            .into_iter()
+            .collect::<Vec<_>>()
             .into_maybe_par_iter()
-            .map(|x| {
+            .map(|((a, u), xs)| {
                 let mut out = Vec::new();
-                if !ext.cells.mod_q0
-                    && let Some(m) = ext.h0(x)
-                {
-                    out.push((0, x, m));
+                if !ext.cells.mod_q0 {
+                    for &x in &xs {
+                        if let Some(m) = ext.h0(x) {
+                            out.push((0, x, m));
+                        }
+                    }
                 }
                 for j in 0..4 {
-                    if let Some(m) = ext.h(q, bb, j, x) {
-                        out.push((j as usize + 1, x, m));
+                    let by = Tri::new(1, 1 << j, 0);
+                    let Some(op) = ext.operator(q, bb, a, u, by, |t, l| bb.d(a + 1, t, l), 1 << j)
+                    else {
+                        continue;
+                    };
+                    for &x in &xs {
+                        if let Some(m) = ext.induced(x, x + by, &op) {
+                            out.push((j as usize + 1, x, m));
+                        }
                     }
                 }
                 out
@@ -203,7 +222,7 @@ fn main() -> anyhow::Result<()> {
     ranks_and_h(&dir, "Ctau", &ctau, &q, &bb)?;
     eprintln!("Ctau h_j: {:.1} s", start.elapsed().as_secs_f64());
 
-    for name in specs.split(',').filter(|s| !s.is_empty()) {
+    for name in specs.split(',').filter(|s| !s.is_empty() && *s != "-") {
         let start = Instant::now();
         let cells = match name {
             "C2" => Cells::moore(),

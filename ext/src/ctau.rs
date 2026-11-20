@@ -23,7 +23,7 @@ use crate::chain_complex::FreeChainComplex;
 /// It bounds the weights [`QAlgebra::new`] accepts: the first generator left out must not fit.
 pub const Q_VARS: usize = 9;
 
-/// A monomial in $q_1, \dots, q_9$ as exponents; the power of $q_0$ is implicit.
+/// A monomial in $q_1, q_2, \dots$ as [`Q_VARS`] exponents; the power of $q_0$ is implicit.
 ///
 /// $Q = \mathbb{F}_2[q_0, q_1, \dots]$ is graded by polynomial degree $k$, and $m \mapsto
 /// q_0^{k - |m|} m$ identifies the $q_0$-free monomials of length at most $k$ with a basis of
@@ -287,6 +287,7 @@ pub struct OpTable {
 }
 
 impl OpTable {
+    /// An empty table for `algebra`, which must be the Milnor basis at the prime 2.
     pub fn new(algebra: Arc<MilnorAlgebra>) -> Self {
         Self {
             algebra,
@@ -463,6 +464,7 @@ pub struct Space {
 }
 
 impl Space {
+    /// The cochains of `cells` on `bb` with monomials of length at most `max_len`.
     fn new(bb: &Backbone, q: &QAlgebra, cells: &Cells, max_len: u32, a: i32, u: i32) -> Self {
         let mut basis = Vec::new();
         for (c, &e) in cells.degrees.iter().enumerate() {
@@ -526,6 +528,7 @@ pub struct Tri {
 }
 
 impl Tri {
+    /// From the coordinates of the computation.
     pub fn new(a: i32, u: i32, k: i32) -> Self {
         Self { a, u, k }
     }
@@ -536,14 +539,17 @@ impl Tri {
         Self { a, u: w, k: s - a }
     }
 
+    /// The motivic stem.
     pub fn stem(&self) -> i32 {
         2 * self.u - self.a
     }
 
+    /// The Adams filtration.
     pub fn filtration(&self) -> i32 {
         self.a + self.k
     }
 
+    /// The motivic weight.
     pub fn weight(&self) -> i32 {
         self.u
     }
@@ -552,6 +558,7 @@ impl Tri {
 impl std::ops::Add for Tri {
     type Output = Self;
 
+    /// The tridegree of a product.
     fn add(self, o: Self) -> Self {
         Self::new(self.a + o.a, self.u + o.u, self.k + o.k)
     }
@@ -665,7 +672,7 @@ impl CtauExt {
         let max_len = max_s as u32;
         let mut keys = Vec::new();
         for a in 0..=max_s + 1 {
-            // weights a - 1 reads, so that it holds the coboundaries into filtration a
+            // the weights filtration a + 1 reads, for the coboundaries into its cochains
             for u in 0..=this.max_u(a + 1).min(this.max_u(max_s)) {
                 keys.push((a, u));
             }
@@ -712,6 +719,22 @@ impl CtauExt {
             .collect();
         this.coh = tris.into_iter().zip(coh).collect();
         this
+    }
+
+    /// The number of cochains over every filtration and weight held, and the number of nonzero
+    /// entries of the coboundaries between them.
+    pub fn coboundary_stats(&self) -> (usize, usize) {
+        let cochains = self.spaces.values().map(Space::dim).sum();
+        let entries = self
+            .delta
+            .values()
+            .map(|d| {
+                (0..d.rows())
+                    .map(|r| d.row(r).iter_nonzero().count())
+                    .sum::<usize>()
+            })
+            .sum();
+        (cochains, entries)
     }
 
     /// The cochains of filtration `a` and weight `u`.
@@ -893,12 +916,13 @@ pub fn bottom_cell(s: &CtauExt, c: &CtauExt, x: Tri) -> Option<Vec<Vec<u32>>> {
 }
 
 /// The map induced by collapsing onto the top cell, $C\tau \wedge C \to \Sigma C\tau$, from `x`,
-/// with its target; `delta` is the coboundary of $C\tau$ out of `(x.a, x.u)`, read only when
-/// $q_0$ is killed.
+/// with its target.
+///
+/// On a Hopf cofiber it reads the coordinates on the top cell. When $q_0$ is killed it is the
+/// Bockstein: the coboundary in $C\tau$ of a cocycle modulo $q_0$, which is shorter by one.
 pub fn top_cell(s: &CtauExt, c: &CtauExt, x: Tri) -> Option<(Tri, Vec<Vec<u32>>)> {
     let src = c.space(x.a, x.u)?;
     if c.cells.mod_q0 {
-        // the Bockstein: lift to length k, take the coboundary, which is shorter
         let y = Tri::new(x.a + 1, x.u, x.k - 1);
         s.cohomology(y)?;
         let d = s.delta.get(&(x.a, x.u))?;
@@ -1052,6 +1076,7 @@ pub struct BarComparison<'a, CC: FreeChainComplex<Algebra = MilnorAlgebra>> {
 }
 
 impl<'a, CC: FreeChainComplex<Algebra = MilnorAlgebra>> BarComparison<'a, CC> {
+    /// An empty comparison on `res`; sections are computed as words ask for them.
     pub fn new(res: &'a CC, ops: &'a OpTable) -> Self {
         Self {
             res,
@@ -1301,5 +1326,110 @@ impl BarCocycle {
             }
         }
         Some(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every exponent sequence of degree `d`.
+    fn sequences(algebra: &MilnorAlgebra, d: i32) -> Vec<PackedXi> {
+        (0..algebra.dimension(d))
+            .map(|i| pack(algebra.basis_element_from_index(d, i).p_part.iter()))
+            .collect()
+    }
+
+    /// $P(R)(P(S) m) = (P(R) P(S)) m$, with the product taken in the Milnor basis.
+    #[test]
+    fn q_is_a_module() {
+        let max = 14;
+        let algebra = Arc::new(MilnorAlgebra::new(TWO, false));
+        algebra.compute_basis(max);
+        let ops = OpTable::new(Arc::clone(&algebra));
+        let q = QAlgebra::new(max, 4);
+        for d in 0..=max {
+            for m in q.monomials(d) {
+                for d1 in 1..=d {
+                    for d2 in 1..=d - d1 {
+                        for (i1, &r) in sequences(&algebra, d1).iter().enumerate() {
+                            for (i2, &s) in sequences(&algebra, d2).iter().enumerate() {
+                                let mut lhs: FxHashSet<QMono> = FxHashSet::default();
+                                poly_add(&mut lhs, q.act_poly(r, &q.act(s, m)));
+                                let mut prod = FpVector::new(TWO, algebra.dimension(d1 + d2));
+                                algebra.multiply_basis_elements(
+                                    prod.as_slice_mut(),
+                                    1,
+                                    d1,
+                                    i1,
+                                    d2,
+                                    i2,
+                                );
+                                let mut rhs: FxHashSet<QMono> = FxHashSet::default();
+                                for (i, _) in prod.iter_nonzero() {
+                                    poly_add(
+                                        &mut rhs,
+                                        q.act(ops.pack(d1 + d2, i), m).iter().copied(),
+                                    );
+                                }
+                                assert_eq!(lhs, rhs, "P({r:x}) P({s:x}) on {m:?}");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// $P(R)(m m') = \sum_{R' + R'' = R} P(R') m \cdot P(R'') m'$.
+    #[test]
+    fn q_satisfies_cartan() {
+        let max = 12;
+        let algebra = MilnorAlgebra::new(TWO, false);
+        algebra.compute_basis(max);
+        let q = QAlgebra::new(max, 4);
+        let all: Vec<PackedXi> = (0..=max).flat_map(|d| sequences(&algebra, d)).collect();
+        for d1 in 0..=max {
+            for d2 in 0..=max - d1 {
+                for m1 in q.monomials(d1).iter().filter(|m| mono_len(m) <= 2) {
+                    for m2 in q.monomials(d2).iter().filter(|m| mono_len(m) <= 2) {
+                        for &r in all.iter().filter(|&&r| xi_degree(r) <= d1 + d2) {
+                            let lhs: FxHashSet<QMono> =
+                                q.act(r, &mono_mul(m1, m2)).iter().copied().collect();
+                            let mut rhs: FxHashSet<QMono> = FxHashSet::default();
+                            for &r1 in all.iter().filter(|&&r1| fits(r1, r)) {
+                                for x in q.act(r1, m1).iter() {
+                                    for y in q.act(r - r1, m2).iter() {
+                                        toggle(&mut rhs, mono_mul(x, y));
+                                    }
+                                }
+                            }
+                            assert_eq!(lhs, rhs, "P({r:x}) on {m1:?} {m2:?}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The action lowers the degree by that of the operation and never lengthens a monomial.
+    #[test]
+    fn q_action_degrees() {
+        let max = 20;
+        let algebra = MilnorAlgebra::new(TWO, false);
+        algebra.compute_basis(max);
+        let q = QAlgebra::new(max, 6);
+        for d in 0..=max {
+            for m in q.monomials(d) {
+                for e in 1..=d {
+                    for r in sequences(&algebra, e) {
+                        for g in q.act(r, m).iter() {
+                            assert_eq!(mono_degree(g), d - e);
+                            assert!(mono_len(g) <= mono_len(m));
+                        }
+                    }
+                }
+            }
+        }
     }
 }
