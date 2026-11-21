@@ -1,6 +1,9 @@
 # The Adams E2 page of Cτ from the classical resolution
 
-Design and results for `src/ctau.rs`, `examples/ctau_e2.rs`, `ctau_check.py` and `ctau_plan.py`.
+Design and results for `src/ctau.rs` and `examples/ctau_e2.rs` (the dense reference),
+`src/ctau_scale.rs`, `examples/ctau_scale.rs` and `fp::matrix::SparseEchelon` (the sparse
+implementation), and the scripts `ctau_check.py`, `ctau_compare.py`, `ctau_legacy.py`,
+`ctau_towers_check.py` and `ctau_plan.py`.
 Everything here is 2-primary and C-motivic. Numbers were measured on `sfx7` against a copy of the
 stem ≤ 100 subset of the stem-400 resolution, on 24 threads at `nice 19`, unless stated otherwise.
 
@@ -23,11 +26,22 @@ stem ≤ 100 subset of the stem-400 resolution, on 24 threads at `nice 19`, unle
   cochains, with the maps of the bottom and top cell and the action of the `h_j`.
 * Against Isaksen's tables through stem 70: 64 of 65 generator tridegrees, and all 70 of the
   `h_0`, `h_1`, `h_2` extensions. The one miss is a misprint in the paper (section 5).
-* The limit is linear algebra, not data. The complete E2 page costs about 17 CPU-hours through
-  stem 300 and about 2000 through stem 400; at stem 798 the largest coboundary is 2.5e7 square,
-  far out of reach of dense elimination. What is in reach near stem 800 is the part of bounded
-  Chow degree `k = stem + filtration - 2 weight`, which contains everything of Adams filtration at
-  most `k`: about 225 CPU-hours for `k ≤ 10` and 1e4 for `k ≤ 15` (section 7).
+* A native Nassau resolution over `A_C/τ` (upstream master) agrees on every rank by tridegree
+  and on the ranks of `h_0, ..., h_3` through stem 140, filtration 70: 82967 classes, no
+  mismatch (section 8).
+* `src/ctau_scale.rs` is the implementation that scales: a sparse reduction per (filtration,
+  weight) ordered by polynomial degree, which yields the `h_0`-towers directly, on a backbone
+  streamed from the save. Stem 200 for `Cτ` reduces in 2 s where the dense reference took 1725
+  s and 207 GB. Exports are archived through stem 280 for `Cτ` and its four two-cell complexes
+  and through stem 350 for `Cτ` (sections 7, 9, 10).
+* The coboundaries are 0.4% to 0.7% dense at every size, so the cost is the size of the output,
+  which grows about five times per 40 stems. Stem 400 is about a day per complex after two
+  storage changes; the complete page at stem 800 is out of reach of any elimination, and the
+  part of Chow degree `k = stem + filtration - 2 weight` at most 10 to 15 at stem 800 (which
+  contains everything of Adams filtration at most `k`) is the size of the stem 350 to 400
+  computations (section 11).
+* General products are validated but not yet at scale: algebra generators of weight at most 16
+  and their products are archived through stem 160.
 
 ## 2. The isomorphism
 
@@ -108,9 +122,7 @@ does not depend on `k`, and multiplication by `q_0` is the inclusion `Q_k ⊂ Q_
   (all that is complete in the stem-70 export). This tests the coaction and the linear algebra
   independently of anything motivic.
 * The identification with `A_mot/τ`, weights included: Isaksen's tables (section 5).
-* Not re-run here: branch `ctau-plan-n400` has a test comparing the bigraded ranks with a minimal
-  resolution over `A_mot/τ` through (stem 30, filtration 15). Running it resolves over `A_mot/τ`,
-  which the rules for this work forbid without asking.
+* A native minimal resolution over `A_C/τ`: section 8.
 
 ## 3. The computation
 
@@ -221,7 +233,7 @@ The tables state the `h_i` extensions as hidden extensions between named classes
 that the product is nonzero between the two tridegrees; it does not match names to basis
 vectors.
 
-## 6. Measured costs
+## 6. The dense reference: costs, and the size of the problem
 
 The export of ranks and `h_0, ..., h_4` on `Cτ` (no cofibers, no products):
 
@@ -273,70 +285,251 @@ coboundaries are sparse and of low rank relative to their size, and the GPU row 
 for the stem-400 resolution applies to every matrix here that fits a card. They do not include
 reading the backbone: `nassau_differential` of the stem-400 snapshot is 104 GB on disk.
 
-## 7. Reaching stem 800
+## 7. The sparse implementation
 
-**What the saved data covers.** The resolution: everything, through motivic stem 800. Lin's
-chain maps: not needed. They were saved only where Lin's ring algorithm reads them (the map of
-`c_0` has steps for input stems 8 to 23 and filtrations below 8, for instance), which decides the
-classical ring but leaves most of the action on `Q` unknown: through stem 70, 408 nonzero
-products are decided by saved steps and 978 pairs are not. The bar cocycle products need no
-chain maps.
+`src/ctau.rs` is the reference: dense matrices, one cohomology per polynomial degree, written to
+be checked. `src/ctau_scale.rs` and `examples/ctau_scale.rs` are what runs at scale, and they
+agree with it on every rank of every complex through stem 70 and on the ranks of `Cτ` through
+stem 120.
 
-**What limits the stem.** The size of the coboundaries, which is the number of generators of the
-backbone times the number of monomials of `Q`. The complete page is in reach through stem 400
-(2e3 CPU-hours, or far less on GPUs: the largest matrix is 16 GiB) and not beyond about stem 500
-by dense elimination on any hardware here.
+**Towers, one reduction per (filtration, weight).** The coboundary never lengthens a monomial,
+so the cochains of a filtration and weight are filtered by polynomial degree and
+`⊕_k Ext^{a,u}(Q_k)` is a module over `F_2[q_0] = F_2[h_0]`. Number the cochains by the level at
+which they first appear and reduce the coboundary by columns, taking sources in order of level
+and pivoting at the latest row. That is the matrix reduction of persistent homology: a reduced
+column is a cocycle born at the level of its pivot that becomes a coboundary at the level of its
+source, so it generates the tower `g, h_0 g, ..., h_0^{r-1} g` with `r` the difference. No
+polynomial degree is reduced twice, and no kernel is computed: the complex is acyclic in the
+limit `k → ∞` (above the lowest filtration), so every cocycle is a combination of reduced
+columns. The class of a cocycle at level `k` is the set of columns its reduction used that are
+still alive at `k`. Every map that commutes with `q_0` is determined by its values on tower
+generators, and the export is in that form.
 
-**Proposal.**
+A cochain that is the pivot of a coboundary into its own filtration is skipped (its coboundary
+reduces to zero), which halves the work.
 
-1. Stem 400, complete, all `k`. Needs the single-pass reduction and a backbone reader that streams
-   one filtration at a time instead of loading the resolution (the loader holds every
-   differential densely). About 2e3 CPU-hours of reduction at most.
-2. Stem 798 in bounded Chow degree, raising `k` while the cost allows: `k ≤ 10` is about 225
-   CPU-hours and contains every class of filtration at most 10; `k ≤ 15` about 1e4 CPU-hours (or
-   GPU: 13 GiB matrices); `k ≤ 20` wants GPUs throughout. A bound on `k` also thins the backbone
-   that has to be read, because an operation `P(R)` acts on monomials of length at most `k`
-   through products of at most `k` coefficients of the coaction, and most of the Milnor basis
-   acts by zero.
-3. Products at scale: `h_0` free, `h_{j+1}` one extra pass over each differential, any class of
-   low degree by its bar cocycle. The cost of a product by `β` grows with the number of chains of
-   length `a'(β)` in the backbone, so classes of Novikov filtration 1 and 2 (the `h_j`, the
-   image of J, `c_0`, `d_0`, `g`) are cheap everywhere, and a class of large `a'` is better
-   written as a product.
-4. Beyond dense elimination: the coboundary is strictly triangular for the filtration by the
-   degree in `Q` (the algebraic Atiyah–Hirzebruch filtration, `E_1 = Ext_A ⊗ Q`), with `d_1 = Σ
-   h_j ⊗ P(2^j)`. Elimination in that order, or the chain of Bockstein spectral sequences
-   `Ext(Q/(q_0, ..., q_n)) ⊗ F_2[q_n] ⇒ Ext(Q/(q_0, ..., q_{n-1}))` starting from classical Ext,
-   keeps intermediate pages near the size of the answer. Neither is implemented or measured, and
-   the complete page at stem 800 depends on one of them working.
+`Cτ ∧ C(2)` is the cone of `q_0` here, not `Q/q_0`: the top cell carries the cochains of `Cτ`
+one filtration down and one level up, with the identity as attaching term. Its towers all have
+length 1, as they must since `h_0` acts by zero.
 
-A resolution over `A_mot/τ` directly is not proposed: its ranks are the answer, but its modules
-have the dimensions of the classical Steenrod algebra in degrees up to 800 and more, orders of
-magnitude past the stem-400 computation.
+**`fp::matrix::SparseEchelon`.** A column echelon form over `F_2` with columns stored as sorted
+row indices, the pivot of a column its largest index, and reduction only at the leading entry.
+The caller owns both orders, rows by numbering and columns by insertion, which is all the
+persistence reduction needs, and it has no other dependency on this problem. The working column
+is a bit set scanned downward from its last pivot (`SparseWorkspace`).
 
-## 8. Not done here
+**Pivot order.** The level must come first. Within a level the order is free, and it decides
+the amount of elimination. The coboundary raises the degree of the generator, so it is strictly
+triangular for the algebraic Atiyah–Hirzebruch filtration (by the degree in `Q`), with `E_1 =
+Ext_A ⊗ Q` and `d_1 = Σ h_j ⊗ P(2^j)`. Rows are numbered so that, within a level, the generators
+of lowest degree come last: the pivot of a coboundary is then its shortest Atiyah–Hirzebruch
+differential, and the short differentials, which cancel most of `Ext_A ⊗ Q`, are cleared first
+with short columns. Measured on `Cτ` through stem 160, in entries of the columns added during
+elimination:
 
-* The E2 page of the motivic sphere, and with it the maps `S → Cτ → S^{1,-1}` on E2 pages. The
-  sphere's Ext acts on `Ext(Cτ)` through the unit map, whose image is the classes that survive
-  the τ-Bockstein spectral sequence; the action of that image is covered by the products above,
-  but the image itself is not identified. Branch `ctau-plan-n400` computes τ-Bockstein differentials from
-  the backbone as ranks (`koszul_lift`, `tau_lift`); they would have to be redone on the bases of
-  this export.
-* The Adams differentials of `Cτ` (the algebraic Novikov differentials). `novikov_lift` on the
-  same branch has the first one, again as ranks.
-* Products on the cofibers by classes other than the `h_j`, and two-cell complexes on other
-  attaching maps. Both are the formulas of section 3 with more cells.
-* Names. Classes are indexed by basis vectors; nothing matches them to Isaksen's names.
+| order within a level | entries added | reduced entries kept |
+|---|---|---|
+| pivot at the highest generator degree | 4.8e8 | 2.0e7 |
+| pivot at the lowest generator degree (used) | 1.0e8 | 1.2e7 |
+| the same, sources in the opposite order | 2.6e8 | 1.3e7 |
+
+A further ordering by Chow degree is already there (it is the level), and the Bockstein tower in
+`q_n` was not tried: the measurements below say elimination is no longer the first cost.
+
+**Bit set against heap.** Finding the largest entry of the working column through a binary heap
+of its entries made the C2 reduction at stem 200 take 107 s; a bit set scanned from the top takes
+6.4 s for the same 7.3e9 added entries. Columns here are short (tens to thousands of entries in
+spaces of tens of thousands of rows), which is the regime where toggling one bit per entry beats
+both a heap and dense rows.
+
+**Building the coboundary.** After the changes above this was the whole cost: for each cochain
+`x ↦ m`, the operations landing on `x` have to be matched with the operations that act
+nontrivially on `m`, and both lists run to thousands while the matches are tens. `OpTables`
+computes the coaction on every monomial once and files it by operation, keeping only the
+operations that occur in the backbone and only in the degrees where a generator they land on
+carries monomials. A block of cochains (one generator, all monomials of one degree) is then built
+by walking the generator's operations once, at a cost of the entries produced. The same tables
+give the `h_j` as whole cochain maps applied to the tower generators.
+
+**Streaming the backbone.** `StreamedBackbone::read` reads each bidegree's differential off the
+save, keeps its nonzero terms, filed by the generator they land on, and drops the vector. The
+resolution is never loaded. Stem 0 is synthesised (`d x_a = Sq^1 x_{a-1}`): the motivic
+`h_1`-tower needs it up to filtration `N`, far above what a save holds, and nothing between
+stem 0 and the vanishing line is read. Through classical stem 120 the backbone is 2.1e6 terms;
+the part of the stem-400 snapshot through classical stem 207 is 155 MB on disk (the snapshot's
+104 GB is nearly all in stems above 300).
+
+**Products.** `h_0` is the tower structure and `h_1, ..., h_4` come with every complex. For
+other classes, `products` in the example finds algebra generators weight by weight (a tower
+generator is one unless it is a sum of products already computed and multiples of `h_0`) and
+multiplies by each through its bar cocycle. Through stem 70 it finds 27 generators of weight at
+most 16 and agrees with the `h_j` from the differential (5625 products) and with commutativity
+(351 pairs). It is not at scale: `bar_cup` still matches operations one cochain at a time, and
+at stem 200 it had done 5 generators in ten minutes when it was stopped. The fix is the one
+that worked for the coboundary: a bar word is a composite of the maps `c ↦ d^*_{(R)} c`, one
+per letter, and each is a table-driven block map.
+
+## 8. Reference: a native resolution over A_C/τ
+
+`ctau_compare.py` compares an export with the generators of a minimal resolution of `F_2` over
+`A_C/τ`: ranks by tridegree (the weight of a generator is read off its differential, which is
+homogeneous), and the ranks of `h_0, ..., h_3` out of each tridegree (the coefficient of
+`Sq^{2^j}`). The resolution is Nassau's algorithm on upstream master (`construct_nassau("Ctau")`,
+which works since "Run Nassau's algorithm over any Milnor algebra"; the tree of #288 itself
+still refuses a non-classical algebra in `construct_nassau`), built with
+`concurrent,logging,nassau` and run with `RUST_LOG=info EXT_NASSAU_NO_SAVE_QI=1` and no save
+directory. Bounded by stem.
+
+| box | tridegrees | classes | `h_0, h_1, h_2, h_3` total rank | mismatches | reference cost |
+|---|---|---|---|---|---|
+| stem ≤ 100, filtration ≤ 50 | 9157 | 19317 | 1380, 16529, 1066, 451 | 0 | 236 s, 1.5 GB (Nassau, 16 threads) |
+| stem ≤ 140, filtration ≤ 70 | 25661 | 82967 | 4285, 73820, 3709, 1648 | 0 | 12889 s, 34 GB (Nassau, 16 threads, while the exports ran) |
+
+The classical algorithm on the #288 tree gives the same ranks through stem 100 (3865 s, 39.5
+GB). The export of the same box takes under a second.
+
+## 9. Measured costs
+
+Sparse export of `Cτ`, `C(2)`, `C(η)`, `C(ν)`, `C(σ)` with `h_1..h_4` and both cell maps, on
+`sfx7` at `nice 19` (24 to 28 threads, a shared node, other jobs of mine running in some rows):
+
+| stem | `Cτ` cochains | coboundary entries | entries added | reduced kept | `Cτ` reduction | all five complexes | peak memory | dense prototype, `Cτ` only |
+|---|---|---|---|---|---|---|---|---|
+| 120 | 2.6e5 | 1.9e6 | 3.8e6 | 1.4e6 | < 0.1 s | 2 s | 0.2 GB | 7 s, 2 GB |
+| 160 | 1.1e6 | 2.2e7 | 1.0e8 | 1.2e7 | 0.3 s | 13 s | 1.1 GB | 105 s, 22 GB |
+| 200 | 3.5e6 | 2.0e8 | 1.9e9 | 8.3e7 | 1.9 s | 70 s | 5.4 GB | 2241 s, 207 GB |
+| 240 | 9.8e6 | 1.4e9 | 2.4e10 | 4.6e8 | 24 s | 745 s | 26 GB | |
+| 280 | 2.4e7 | 7.7e9 | 2.2e11 | 2.1e9 | 153 s | 5630 s | 96 GB | |
+| 350 | 9.9e7 | 1.3e11 | 8.6e12 | 2.5e10 | 4474 s | `Cτ` only; `h_j` still running at this commit | over 247 GB | |
+
+At stem 350 the operation tables hold 6.0e9 entries and take 1000 s and 134 GB to build (the
+coactions they are filtered from are the peak); at stem 280, 7.6e8 entries and 110 s. The
+products by the 27 algebra generators of weight at most 16 take 35 s through stem 120 and 1177 s
+through stem 160, on 6 threads.
+
+The density of the coboundaries is 0.4% to 0.7% throughout (7.5, 20, 58, 140, 315, 1330 entries
+per cochain where the largest space has 1.7e3, 4.9e3, 1.3e4, 3.0e4, 6.1e4, 1.8e5), so they are
+sparse in proportion but not in absolute terms: entries grow like the square of the dimension.
+Elimination adds 2, 5, 9, 17, 29, 65 times the input and keeps 0.7, 0.5, 0.4, 0.34, 0.28, 0.19
+of it: there is no fill-in, and the cost is chains of short additions. Per 40 stems, the
+entries grow about 5 times, the additions 8 to 9 times and the reduced columns 4 to 5 times.
+
+**Stem 400.** Not run. From stem 350, 50 stems further is about 8 times the entries (1e12), 14
+times the additions (1e14, about a day of reduction at the measured rate) and 6 times the
+reduced columns (1.4e11 entries, 570 GB as stored now), with operation tables of about 3e10
+entries. That is over a terabyte in the present layout and `sfx7` is shared, so the driver
+script refuses it. It fits with two changes that are bookkeeping, not research: store reduced
+columns as byte-coded gaps (they are sorted indices, a fourfold saving), and drop a weight's
+columns once the maps into it are computed. With those, `Cτ` through stem 400 is about a day
+on one node, and each cofiber three to five times that.
+
+## 10. Results and where they are
+
+Under `/rs/rs_grp_csht/resolutions/ctau_e2/`:
+
+| archive | contents |
+|---|---|
+| `towers_n240.tar.zst` | stem ≤ 240: towers, `h_1..h_4`, cell maps for `Cτ`, `C(2)`, `C(η)`, `C(ν)`, `C(σ)` |
+| `towers_n280.tar.zst` | the same through stem 280 |
+| `ctau_n350.tar.zst` | stem ≤ 350, `Cτ` only: towers and `h_1..h_4`. Being written at this commit |
+| `products_n120.tar.zst`, `products_n160.tar.zst` | the five complexes through stem 120 and 160, with `Ctau_generators.csv` and `Ctau_products.csv` (weight ≤ 16) |
+
+Through stem 350, `Cτ` has 8540409 towers (2605517 through stem 280). Stem 400 was not run; see
+"Stem 400" in the section before.
+
+Each archive is one `tar | zstd` file; nothing is unpacked on panfs. The scratch copies under
+`/dev/shm` are not kept.
+
+## 11. Reaching stem 800
+
+**Data.** The backbone through classical stem 400 covers motivic stem 800 (section 4). It is 104
+GB on disk and, by the count through stem 120, of the order of 1e10 to 1e11 terms: it has to be
+streamed one filtration at a time, which `StreamedBackbone` does not do yet (it keeps every
+term).
+
+**Size.** With a density of 0.7% and the dimensions of `ctau_plan.py` (the sum of rows times
+columns over the coboundaries), rounded to a power of ten or so:
+
+| range | largest coboundary | coboundary entries |
+|---|---|---|
+| stem ≤ 350, complete (measured) | 1.8e5 square | 1.3e11 |
+| stem ≤ 400, complete | 3.6e5 square | 1e12 |
+| stem ≤ 800, `k ≤ 10` | 8.8e4 square | 1e11 |
+| stem ≤ 800, `k ≤ 15` | 3.4e5 square | 1e12 |
+| stem ≤ 800, `k ≤ 20` | 8.3e5 square | 6e12 |
+| stem ≤ 800, complete | 2.5e7 square | 2e15 |
+
+The same recipe gives 2e11 for stem 400 where the measured trend gives 1e12, so read the table as low by up to five times. The density at bounded `k` has not been measured and may differ. The complete page at stem 800
+is petabytes of coboundary: sparse elimination does not change that, because the matrices are
+not sparse enough. What it changes is everything up to there. The part of bounded Chow degree
+`k` at stem 800 (which contains everything of Adams filtration at most `k`) is, for `k ≤ 10`
+and `k ≤ 15`, the size of the stem-350 and stem-400 computations.
+
+**What is needed for stem 800 at bounded `k`**, in order:
+
+1. A `max_k` in `Space`: levels above the bound are simply not built. Each `k` is its own
+   complex, so this is exact.
+2. Streaming the backbone by filtration, and keeping a weight's reduced columns only while the
+   maps into that weight are computed. Reduced columns are the memory: 0.34 of the input and
+   growing 5 to 6 times per 40 stems.
+3. Operation tables by degree on demand. They grow 5 to 6 times per 20 degrees and at degree 200
+   the full coaction has 1e5 terms per monomial; at bounded `k` only monomials of length at most
+   `k` are needed, which is a different and much smaller table.
+4. Products through tables (section 7).
+
+**Complete page beyond stem 400.** The limit is the output. A structured reduction that never
+forms the cochains (the Bockstein tower `Ext(Q/(q_0..q_n))[q_n] ⇒ Ext(Q/(q_0..q_{n-1}))`
+starting from classical Ext) is the only route I see, and it is not started.
+
+## 12. Fitting together with the native route (#288, #289, #290)
+
+The upstream stack resolves over `A_C/τ` natively (#288), lifts the differential to `A_C` so
+that it becomes `d + δ` with `δ` divisible by `τ`, runs the τ-Bockstein (deformation) spectral
+sequence with `E_1 = Ext_{A_C/τ}` by weight (#289), and takes the cohomology of `δ` with
+products (#290). The two routes compute the same `E_1`; section 8 is that comparison.
+
+* **Scale.** The native resolution costs like a classical resolution to the same stem (the
+  algebra has the same dimensions): 236 s to stem 100 with Nassau's algorithm, and stem 400
+  would be a computation of the size of the classical stem-400 one. The untwisted route reads
+  that range off the classical resolution through stem 200 in minutes. So the native route is
+  the reference at low stems and the untwisted one the source at high stems.
+* **What the untwisted complex is.** `Hom_A(P, Q)` is `Hom_{A_C/τ}(K, F_2)` for the free,
+  non-minimal resolution `K = (A_C/τ) ⊗_E Koszul ⊗ P`-style complex whose generators are
+  (backbone generator, dual monomial). #289 and #290 are written against a minimal resolution,
+  where `E_1` is the generators. To run them here they need two changes: take `E_1` as the
+  cohomology of the mod-τ complex with chosen cocycles (the tower generators of this export)
+  instead of the generators themselves, and take `δ` as a lift of the differential of `K`.
+* **The lift exists in this repository.** Branch `ctau-plan-n400` (`koszul_lift`, `tau_lift`)
+  lifts exactly that differential to `A_C` in a Koszul gauge and gets the τ-Bockstein
+  differentials at every τ-order from the backbone, as ranks. It needs products in `A_C` in the
+  degrees of the operations only, no new resolution. Redone as a cochain map on the spaces of
+  `ctau_scale` (it has the shape of `pullback_columns` with a different table), it gives `d_1`
+  on tower generators, and the zig-zag of #289 gives the higher `d_r`.
+* **Proposal.** Make #289's page-turning and #290's `F_2[τ]`-module and product code generic
+  over "a complex over `A_C/τ` with weights, chosen cocycles and a lifted differential", with
+  the native resolution as one instance and the Koszul-on-backbone complex as the other; check
+  the second against the first through stem 100 to 140; then run the second at scale. I have
+  not read #289 and #290 closely enough to say how invasive that is.
+
+## 13. Not done here
+
+* General products at scale (section 7), and products on the cofibers beyond `h_1..h_4`.
+* The E2 page of the motivic sphere and the maps `S → Cτ → S^{1,-1}` on E2 pages (section 12);
+  the Adams differentials of `Cτ`; names. Not started, as agreed.
 * Massey products, by request.
 
-## 9. Running it
+## 14. Running it
 
-    cargo build --release --no-default-features --features concurrent,logging,nassau --example ctau_e2
-    printf 'S_2\n<copy of the save>\n<out>\n70\n36\nC2,Ceta,Cnu,Csigma\n18\ny\n' | target/release/examples/ctau_e2
-    python3 -I ctau_check.py <out> <stemlit>/out/tables
+    cargo build --release --no-default-features --features concurrent,logging,nassau \
+        --example ctau_scale --example ctau_e2
+    printf 'S_2\n<copy of the save>\n<out>\n240\nC2,Ceta,Cnu,Csigma\n0\n' | target/release/examples/ctau_scale
+    python3 -I ctau_legacy.py <out> <out>/legacy 100 50     # per-tridegree format, small ranges
+    python3 -I ctau_compare.py <out>/legacy <reference>     # against a native resolution
+    python3 -I ctau_towers_check.py <out>                   # products, when asked for
+    python3 -I ctau_check.py <dense or legacy export> <stemlit>/out/tables
     python3 -I ctau_plan.py <rank.csv> 798 10
 
-The prompts are the module, its save directory (a copy: loaders can write), the output directory,
-the largest motivic stem and filtration, the complexes, the largest weight of a class `β` to
-multiply by (0 for none), and whether to read Lin's maps. The files are described at the top of
-`examples/ctau_e2.rs`.
+`ctau_scale` asks for the module, its save directory (a copy: it opens the store), the output
+directory, the largest motivic stem, the complexes and the largest weight of an algebra generator
+to multiply by (0 for none). `ctau_e2` is the dense reference and also reads Lin's maps. The
+file formats are described on `main` in each example.
