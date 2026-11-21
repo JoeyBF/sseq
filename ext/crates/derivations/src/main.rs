@@ -1453,14 +1453,21 @@ fn certificate(
     let mut e = rows[pivot[x as usize] as usize].clone();
     rp[pivot[x as usize] as usize] = true;
     loop {
-        let Some(&c) = e.iter().find(|&&c| c != x && pivot[c as usize] != u32::MAX) else {
+        // the constant column (seeds) is never a pivot
+        let Some(&c) = e
+            .iter()
+            .find(|&&c| c != x && c != v.n && pivot[c as usize] != u32::MAX)
+        else {
             break;
         };
         let r = pivot[c as usize] as usize;
         e = xor_sorted(&e, &rows[r]);
         rp[r] ^= true;
     }
-    let rel: Vec<String> = e.iter().map(|&y| var_name(ext, v, y)).collect();
+    let rel: Vec<String> = e
+        .iter()
+        .map(|&y| if y == v.n { "1".into() } else { var_name(ext, v, y) })
+        .collect();
     println!("relation: {} = 0", rel.join(" + "));
     // expand rows into equations, latest row first
     let mut ep = vec![false; eqs.len()];

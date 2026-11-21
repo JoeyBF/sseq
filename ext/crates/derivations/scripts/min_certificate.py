@@ -3,12 +3,31 @@
 A certificate is a set of Leibniz equations whose sum (over F2) is the target relation. Selector
 y_e marks equation e as used; for every variable, the parity of the selected equations containing
 it must equal its coefficient in the relation (hard XOR constraints, Tseitin-encoded); each y_e is
-a soft clause of weight 1, so the optimum is a certificate with the fewest equations.
+a soft clause of weight 1, so the optimum is a certificate with the fewest equations. With
+`--weights`, each equation instead costs its complexity (see `weight`), so the optimum is the
+certificate that is easiest to check by hand rather than the shortest.
 
-Usage: python3 min_certificate.py <pool file>
+Usage: python3 min_certificate.py <pool file> [--weights]
 """
 
+import re
 import sys
+
+
+def weight(origin, vs):
+    """How hard an equation is to check: extra terms, a multiplier of high Adams filtration (not
+    high stem: h_i is cheap for every i), factors that are not the first class of their bidegree,
+    and module or naturality equations rather than plain sphere Leibniz."""
+    w = 1 + 2 * max(len(vs) - 2, 0)
+    factors = [tuple(map(int, f)) for f in re.findall(r"x_\((\d+),(\d+),(\d+)\)", origin)]
+    if "*" in origin and len(factors) >= 2:
+        w += min(s for _, s, _ in factors[:2]) - 1
+        w += sum(1 for _, _, i in factors[:2] if i > 0)
+    if "module" in origin:
+        w += 2
+    elif "naturality" in origin:
+        w += 1
+    return w
 import time
 from collections import defaultdict
 
@@ -59,8 +78,9 @@ def main():
 
     for v, lits in occ.items():
         xor_to(lits, v in target)
-    for k in range(len(eqs)):
-        wcnf.append([-(k + 1)], weight=1)
+    weighted = "--weights" in sys.argv
+    for k, (_, origin, vs) in enumerate(eqs):
+        wcnf.append([-(k + 1)], weight=weight(origin, vs) if weighted else 1)
     print(f"pool: {len(eqs)} equations, {len(occ)} variables, {len(wcnf.hard)} hard clauses")
     with RC2(wcnf, solver="cd19") as rc2:
         model = rc2.compute()
@@ -72,7 +92,11 @@ def main():
         for v in vs:
             par[v] ^= 1
     assert {v for v, p in par.items() if p} == target
-    print(f"minimum certificate: {len(chosen)} equations ({time.time() - t:.1f}s)")
+    cost = sum(weight(o, vs) for _, o, vs in chosen)
+    print(
+        f"minimum certificate: {len(chosen)} equations, total weight {cost} "
+        f"({time.time() - t:.1f}s)"
+    )
     print("relation: " + " + ".join(names.get(v, str(v)) for v in rel) + " = 0")
     for eid, origin, vs in chosen:
         print(f"  {origin}: " + " + ".join(names.get(v, str(v)) for v in vs) + " = 0")
