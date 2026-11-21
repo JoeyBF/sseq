@@ -1292,7 +1292,7 @@ fn eliminate(
 /// Expresses the sum of the variables `q` through the free columns: reduces by pivot rows,
 /// smallest pivot column first (a pivot row's other entries are at larger columns). The result
 /// holds free columns and possibly the constant column `n`.
-fn reduce_to_free(n: u32, pivot: &[u32], rows: &[Vec<u32>], q: &[u32]) -> Vec<u32> {
+pub(crate) fn reduce_to_free(n: u32, pivot: &[u32], rows: &[Vec<u32>], q: &[u32]) -> Vec<u32> {
     let mut s: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
     let toggle = |s: &mut std::collections::BTreeSet<u32>, y: u32| {
         if !s.remove(&y) {
@@ -1315,14 +1315,19 @@ fn reduce_to_free(n: u32, pivot: &[u32], rows: &[Vec<u32>], q: &[u32]) -> Vec<u3
     s.into_iter().collect()
 }
 
-/// Whether each variable depends on some free column, in one back-substitution pass instead of
-/// one per 64 free columns. Each free column gets a pseudo-random 64-bit tag; a variable's
-/// fingerprint is the XOR of the tags of the free columns in its expression, so a non-zero
-/// fingerprint proves dependence. An OR pass over the same rows proves independence. The few
-/// variables on which the two disagree (cancellation, or a 2^-64 fingerprint collision) are
-/// reduced exactly, so the answer is exact.
-fn dependence(n: u32, pivot: &[u32], rows: &[Vec<u32>]) -> Vec<bool> {
-    let t = Instant::now();
+/// One back-substitution pass over a solved system, giving per column (the constant column `n`
+/// included): whether its expression through the free columns can involve one (`reach`, an OR
+/// over the rows), a fingerprint of that expression (`tag`, the XOR of pseudo-random tags of the
+/// free columns in it) and its value at the particular solution with every free column 0
+/// (`part`). A non-zero fingerprint proves dependence and `reach` false proves independence;
+/// when they disagree (cancellation, or a 2^-64 collision) only an exact reduction decides.
+pub(crate) struct Fingerprints {
+    pub(crate) reach: Vec<bool>,
+    pub(crate) tag: Vec<u64>,
+    pub(crate) part: Vec<bool>,
+}
+
+pub(crate) fn fingerprints(n: u32, pivot: &[u32], rows: &[Vec<u32>]) -> Fingerprints {
     let mix = |mut z: u64| {
         // splitmix64
         z = z.wrapping_add(0x9e37_79b9_7f4a_7c15);
@@ -1332,6 +1337,8 @@ fn dependence(n: u32, pivot: &[u32], rows: &[Vec<u32>]) -> Vec<bool> {
     };
     let mut reach = vec![false; n as usize + 1];
     let mut tag = vec![0u64; n as usize + 1];
+    let mut part = vec![false; n as usize + 1];
+    part[n as usize] = true;
     for c in 0..n {
         if pivot[c as usize] == u32::MAX {
             reach[c as usize] = true;
@@ -1340,14 +1347,23 @@ fn dependence(n: u32, pivot: &[u32], rows: &[Vec<u32>]) -> Vec<bool> {
     }
     for p in (0..n).rev().filter(|&c| pivot[c as usize] != u32::MAX) {
         let r = &rows[pivot[p as usize] as usize];
-        let (mut any, mut h) = (false, 0u64);
+        let (mut any, mut h, mut v) = (false, 0u64, false);
         for &c in &r[1..] {
             any |= reach[c as usize];
             h ^= tag[c as usize];
+            v ^= part[c as usize];
         }
         reach[p as usize] = any;
         tag[p as usize] = h;
+        part[p as usize] = v;
     }
+    Fingerprints { reach, tag, part }
+}
+
+/// Whether each variable depends on some free column, exactly, from its [`fingerprints`].
+fn dependence(n: u32, pivot: &[u32], rows: &[Vec<u32>]) -> Vec<bool> {
+    let t = Instant::now();
+    let Fingerprints { reach, tag, .. } = fingerprints(n, pivot, rows);
     let unsure: Vec<u32> = (0..n)
         .filter(|&x| reach[x as usize] && tag[x as usize] == 0)
         .collect();
@@ -1545,7 +1561,13 @@ fn certificate(
     }
     let rel: Vec<String> = e
         .iter()
-        .map(|&y| if y == v.n { "1".into() } else { var_name(ext, v, y) })
+        .map(|&y| {
+            if y == v.n {
+                "1".into()
+            } else {
+                var_name(ext, v, y)
+            }
+        })
         .collect();
     println!("relation: {} = 0", rel.join(" + "));
     // expand rows into equations, latest row first
@@ -1901,7 +1923,7 @@ fn main() {
     let ext = load(dir, n_max, f_max);
     let p = build_products(&ext);
     check_products(&ext, &p);
-    // --e3 <d2 files> [--compare ...] or --diagram <file>: d_r for r >= 3 instead
+    // --diagram <file> [--from-e2]: d_r on a diagram of spectra, from page 2 or from d2 files
     if args.iter().any(|a| a == "--e3" || a == "--diagram") {
         page::run(&ext, &p, &args);
         return;

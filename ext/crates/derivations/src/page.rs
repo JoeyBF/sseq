@@ -1,4 +1,4 @@
-//! Adams d_r for r >= 3 on a diagram of spectra (`--e3`, `--diagram`), each page known as bounds.
+//! Adams d_r for r >= 2 on a diagram of spectra (`--diagram`, `--e3`), each page known as bounds.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -14,6 +14,10 @@ use crate::{Ext, Module, Products, bits, eliminate, parse_vec64};
 
 /// A vector over the E2 basis of one bidegree, or a set of page coordinates.
 type V = u64;
+
+/// Source bidegrees whose equations are generated together before they are absorbed: larger
+/// chunks parallelise better, smaller ones hold fewer equations in memory at once.
+const CHUNK: usize = 64;
 
 /// An echelon form keyed by lowest set bit; each row remembers which basis vectors it combines.
 #[derive(Default, Clone)]
@@ -419,17 +423,48 @@ fn build_e3(node: &Node, d2: &FxHashMap<u32, V>) -> Pages {
     Pages::new(3, page)
 }
 
-/// E3 as bounds from E2 and what is known of d2: a class whose d2 is not in the files may have
-/// any value.
-fn bounds_e3(node: &Node, d2: &FxHashMap<u32, V>) -> Pages {
-    let nb = node.nb();
-    let page = (0..nb as u32)
+/// E2: every class is a certain cycle and nothing is a boundary.
+fn e2_pages(node: &Node) -> Pages {
+    let page = (0..node.nb() as u32)
         .map(|b| {
             let basis: Vec<V> = (0..node.dim(b)).map(|i| 1 << i).collect();
             Some(Page::new(vec![], vec![], &basis, &basis, true, false))
         })
         .collect();
-    let e2 = Pages::new(2, page);
+    Pages::new(2, page)
+}
+
+/// The equations `d2(x) = t` for the classes whose d2 a file gives, on the E2 page.
+fn d2_fact_equations(node: &Node, e: &Pages, d2: &FxHashMap<u32, V>, one: u32) -> Vec<Vec<u32>> {
+    let mut out = vec![];
+    for b in 0..node.nb() as u32 {
+        if e.off[b as usize] == u32::MAX {
+            continue;
+        }
+        for i in 0..node.dim(b) {
+            let Some(&t) = d2.get(&node.gid(b, i)) else {
+                continue;
+            };
+            for l in 0..e.stride[b as usize] as usize {
+                let mut eq = vec![e.var(b, i, l)];
+                if t >> l & 1 == 1 {
+                    eq.push(one);
+                }
+                out.push(eq);
+            }
+        }
+    }
+    if !out.is_empty() {
+        eprintln!("{}: {} d2 coordinates from files", node.name, out.len());
+    }
+    out
+}
+
+/// E3 as bounds from E2 and what is known of d2: a class whose d2 is not in the files may have
+/// any value.
+fn bounds_e3(node: &Node, d2: &FxHashMap<u32, V>) -> Pages {
+    let nb = node.nb();
+    let e2 = e2_pages(node);
     let mut vals: FxHashMap<u32, Vec<Val>> = FxHashMap::default();
     let mut fresh = 0u64;
     let mut open = 0;
@@ -604,213 +639,239 @@ fn reduce_eq(mut tr: Vec<u32>) -> Vec<u32> {
 /// Leibniz on E_r of a ring for every pair of source classes: d_r[xy] = d_r[x][y] + [x]d_r[y],
 /// projected onto the target bounds. A term d_r[x][y] is only well defined when the target of x
 /// has no boundary uncertainty, so pairs without that are skipped.
-fn ring_equations(node: &Node, e3: &Pages) -> Vec<Vec<u32>> {
+fn ring_equations(node: &Node, e3: &Pages, gens: bool, sink: &mut dyn FnMut(Vec<Vec<u32>>)) {
     let Alg::Ring(ext, p) = node.alg else {
         unreachable!()
     };
     let t = Instant::now();
     let ablate_zero = std::env::var("E3_ABLATE_ZERO").is_ok_and(|v| v == "1");
     let bids: Vec<u32> = (0..node.nb() as u32).filter(|&b| e3.dim(b) > 0).collect();
-    let eqs: Vec<Vec<u32>> = bids
-        .par_iter()
-        .flat_map_iter(|&a| {
-            let mut out = vec![];
-            let (an, af) = node.deg(a);
-            for &c in bids.iter().filter(|&&c| c >= a) {
-                let (cn, cf) = node.deg(c);
-                let Some(Some(sp)) = known(node, e3, an + cn - 1, af + cf + e3.r) else {
-                    continue;
-                };
-                let Some(s) = known(node, e3, an + cn, af + cf) else {
-                    continue;
-                };
-                let (Some(ap), Some(cp)) = (target(node, e3, a), target(node, e3, c)) else {
-                    continue;
-                };
-                if !e3.exact_or_zero(ap) || !e3.exact_or_zero(cp) {
-                    continue;
-                }
-                let m = e3.tdim(sp);
-                if m == 0 {
-                    continue;
-                }
-                let pg_a = e3.pg(a);
-                let pg_c = e3.pg(c);
-                let pg_sp = e3.pg(sp);
-                'pair: for (k, &x) in pg_a.reps.iter().enumerate() {
-                    let j0 = if a == c { k } else { 0 };
-                    for (j, &y) in pg_c.reps.iter().enumerate().skip(j0) {
-                        // per target coordinate, the variables of the equation
-                        let mut terms: Vec<Vec<u32>> = vec![vec![]; m];
-                        // the product as a combination of source classes, if it is certain
-                        let pr = match s {
-                            None => 0,
-                            Some(s) => match e3.pg(s).src.project(mul_vec(ext, p, a, x, c, y)) {
-                                Some(pr) => pr,
-                                None => continue,
-                            },
-                        };
-                        // E3_ABLATE_ZERO=1 drops the pairs whose product is 0 in E_r: an ablation
-                        if pr == 0 && ablate_zero {
-                            continue;
-                        }
-                        if let Some(s) = s {
-                            for q in bits(pr) {
-                                for (r, tr) in terms.iter_mut().enumerate() {
-                                    tr.push(e3.var(s, q, r));
+    // on E2 the source classes are the basis vectors, whose indecomposability is known
+    let indec = |b: u32, x: V| ext.indec[node.gid(b, x.trailing_zeros() as usize) as usize];
+    let mut count = 0;
+    for chunk in bids.chunks(CHUNK) {
+        let eqs: Vec<Vec<u32>> = chunk
+            .par_iter()
+            .flat_map_iter(|&a| {
+                let mut out = vec![];
+                let (an, af) = node.deg(a);
+                for &c in bids.iter().filter(|&&c| c >= a) {
+                    let (cn, cf) = node.deg(c);
+                    let Some(Some(sp)) = known(node, e3, an + cn - 1, af + cf + e3.r) else {
+                        continue;
+                    };
+                    let Some(s) = known(node, e3, an + cn, af + cf) else {
+                        continue;
+                    };
+                    let (Some(ap), Some(cp)) = (target(node, e3, a), target(node, e3, c)) else {
+                        continue;
+                    };
+                    if !e3.exact_or_zero(ap) || !e3.exact_or_zero(cp) {
+                        continue;
+                    }
+                    let m = e3.tdim(sp);
+                    if m == 0 {
+                        continue;
+                    }
+                    let pg_a = e3.pg(a);
+                    let pg_c = e3.pg(c);
+                    let pg_sp = e3.pg(sp);
+                    'pair: for (k, &x) in pg_a.reps.iter().enumerate() {
+                        let j0 = if a == c { k } else { 0 };
+                        for (j, &y) in pg_c.reps.iter().enumerate().skip(j0) {
+                            if gens && !indec(a, x) && !indec(c, y) {
+                                continue;
+                            }
+                            // per target coordinate, the variables of the equation
+                            let mut terms: Vec<Vec<u32>> = vec![vec![]; m];
+                            // the product as a combination of source classes, if it is certain
+                            let pr = match s {
+                                None => 0,
+                                Some(s) => {
+                                    match e3.pg(s).src.project(mul_vec(ext, p, a, x, c, y)) {
+                                        Some(pr) => pr,
+                                        None => continue,
+                                    }
+                                }
+                            };
+                            // E3_ABLATE_ZERO=1 drops the pairs whose product is 0 in E_r: an ablation
+                            if pr == 0 && ablate_zero {
+                                continue;
+                            }
+                            if let Some(s) = s {
+                                for q in bits(pr) {
+                                    for (r, tr) in terms.iter_mut().enumerate() {
+                                        tr.push(e3.var(s, q, r));
+                                    }
                                 }
                             }
-                        }
-                        if let Some(ap) = ap {
-                            for (l, &z) in e3.pg(ap).treps.iter().enumerate() {
-                                let Some(q) = pg_sp.tgt.project(mul_vec(ext, p, ap, z, c, y))
-                                else {
-                                    continue 'pair;
-                                };
-                                for r in bits(q) {
-                                    terms[r].push(e3.var(a, k, l));
+                            if let Some(ap) = ap {
+                                for (l, &z) in e3.pg(ap).treps.iter().enumerate() {
+                                    let Some(q) = pg_sp.tgt.project(mul_vec(ext, p, ap, z, c, y))
+                                    else {
+                                        continue 'pair;
+                                    };
+                                    for r in bits(q) {
+                                        terms[r].push(e3.var(a, k, l));
+                                    }
                                 }
                             }
-                        }
-                        if let Some(cp) = cp {
-                            for (l, &z) in e3.pg(cp).treps.iter().enumerate() {
-                                let Some(q) = pg_sp.tgt.project(mul_vec(ext, p, a, x, cp, z))
-                                else {
-                                    continue 'pair;
-                                };
-                                for r in bits(q) {
-                                    terms[r].push(e3.var(c, j, l));
+                            if let Some(cp) = cp {
+                                for (l, &z) in e3.pg(cp).treps.iter().enumerate() {
+                                    let Some(q) = pg_sp.tgt.project(mul_vec(ext, p, a, x, cp, z))
+                                    else {
+                                        continue 'pair;
+                                    };
+                                    for r in bits(q) {
+                                        terms[r].push(e3.var(c, j, l));
+                                    }
                                 }
                             }
-                        }
-                        for tr in terms {
-                            let e = reduce_eq(tr);
-                            if !e.is_empty() {
-                                out.push(e);
+                            for tr in terms {
+                                let e = reduce_eq(tr);
+                                if !e.is_empty() {
+                                    out.push(e);
+                                }
                             }
                         }
                     }
                 }
-            }
-            out
-        })
-        .collect();
+                out
+            })
+            .collect();
+        count += eqs.len();
+        sink(eqs);
+    }
     eprintln!(
-        "{}: E{} Leibniz: {} nontrivial equations, {:.1}s",
+        "{}: E{} Leibniz: {count} nontrivial equations, {:.1}s",
         node.name,
         e3.r,
-        eqs.len(),
         t.elapsed().as_secs_f64()
     );
-    eqs
 }
 
 /// The module Leibniz rule on E_r, d_r[a m] = d_r[a] m + a d_r[m] for every source class `a` of
 /// the ring and `m` of the module, projected onto the target bounds. As for a ring, each term
 /// needs the target of its unknown to have no boundary uncertainty, and every product it uses
 /// must be known (an unknown product drops the pair).
-fn module_equations(mn: &Node, em: &Pages, rn: &Node, er: &Pages) -> Vec<Vec<u32>> {
-    let Alg::Module(m, _) = mn.alg else {
+fn module_equations(
+    mn: &Node,
+    em: &Pages,
+    rn: &Node,
+    er: &Pages,
+    gens: bool,
+    sink: &mut dyn FnMut(Vec<Vec<u32>>),
+) {
+    let (Alg::Module(m, _), Alg::Ring(ext, _)) = (&mn.alg, &rn.alg) else {
         unreachable!()
     };
     let t = Instant::now();
     let abids: Vec<u32> = (0..rn.nb() as u32).filter(|&a| er.dim(a) > 0).collect();
     let bbids: Vec<u32> = (0..mn.nb() as u32).filter(|&b| em.dim(b) > 0).collect();
     let r = em.r;
-    let (eqs, dropped): (Vec<Vec<Vec<u32>>>, Vec<usize>) = abids
-        .par_iter()
-        .map(|&a| {
-            let mut out = vec![];
-            let mut dropped = 0;
-            let (an, af) = rn.deg(a);
-            let Some(ap) = target(rn, er, a) else {
-                return (out, 0);
-            };
-            if !er.exact_or_zero(ap) {
-                return (out, 0);
-            }
-            for &b in &bbids {
-                let (bn, bf) = mn.deg(b);
-                let Some(Some(sp)) = known(mn, em, an + bn - 1, af + bf + r) else {
-                    continue;
+    let (mut count, mut n_dropped) = (0, 0);
+    for chunk in abids.chunks(CHUNK) {
+        let (eqs, dropped): (Vec<Vec<Vec<u32>>>, Vec<usize>) = chunk
+            .par_iter()
+            .map(|&a| {
+                let mut out = vec![];
+                let mut dropped = 0;
+                let (an, af) = rn.deg(a);
+                let Some(ap) = target(rn, er, a) else {
+                    return (out, 0);
                 };
-                let Some(s) = known(mn, em, an + bn, af + bf) else {
-                    continue;
-                };
-                let Some(bp) = target(mn, em, b) else {
-                    continue;
-                };
-                if !em.exact_or_zero(bp) {
-                    continue;
+                if !er.exact_or_zero(ap) {
+                    return (out, 0);
                 }
-                let dm = em.tdim(sp);
-                if dm == 0 {
-                    continue;
-                }
-                let pg_sp = em.pg(sp);
-                for (k, &x) in er.pg(a).reps.iter().enumerate() {
-                    'pair: for (j, &y) in em.pg(b).reps.iter().enumerate() {
-                        let mut terms: Vec<Vec<u32>> = vec![vec![]; dm];
-                        if let Some(s) = s {
-                            let Some(pr) = act(m, a, x, b, y).and_then(|v| em.pg(s).src.project(v))
-                            else {
-                                dropped += 1;
-                                continue;
-                            };
-                            for q in bits(pr) {
-                                for (l, tr) in terms.iter_mut().enumerate() {
-                                    tr.push(em.var(s, q, l));
-                                }
-                            }
+                for &b in &bbids {
+                    let (bn, bf) = mn.deg(b);
+                    let Some(Some(sp)) = known(mn, em, an + bn - 1, af + bf + r) else {
+                        continue;
+                    };
+                    let Some(s) = known(mn, em, an + bn, af + bf) else {
+                        continue;
+                    };
+                    let Some(bp) = target(mn, em, b) else {
+                        continue;
+                    };
+                    if !em.exact_or_zero(bp) {
+                        continue;
+                    }
+                    let dm = em.tdim(sp);
+                    if dm == 0 {
+                        continue;
+                    }
+                    let pg_sp = em.pg(sp);
+                    for (k, &x) in er.pg(a).reps.iter().enumerate() {
+                        // on E2 the ring classes are basis vectors
+                        if gens && !ext.indec[rn.gid(a, x.trailing_zeros() as usize) as usize] {
+                            continue;
                         }
-                        if let Some(ap) = ap {
-                            for (l, &z) in er.pg(ap).treps.iter().enumerate() {
-                                let Some(q) =
-                                    act(m, ap, z, b, y).and_then(|v| pg_sp.tgt.project(v))
+                        'pair: for (j, &y) in em.pg(b).reps.iter().enumerate() {
+                            let mut terms: Vec<Vec<u32>> = vec![vec![]; dm];
+                            if let Some(s) = s {
+                                let Some(pr) =
+                                    act(m, a, x, b, y).and_then(|v| em.pg(s).src.project(v))
                                 else {
                                     dropped += 1;
-                                    continue 'pair;
+                                    continue;
                                 };
-                                for c in bits(q) {
-                                    terms[c].push(er.var(a, k, l));
+                                for q in bits(pr) {
+                                    for (l, tr) in terms.iter_mut().enumerate() {
+                                        tr.push(em.var(s, q, l));
+                                    }
                                 }
                             }
-                        }
-                        if let Some(bp) = bp {
-                            for (l, &z) in em.pg(bp).treps.iter().enumerate() {
-                                let Some(q) =
-                                    act(m, a, x, bp, z).and_then(|v| pg_sp.tgt.project(v))
-                                else {
-                                    dropped += 1;
-                                    continue 'pair;
-                                };
-                                for c in bits(q) {
-                                    terms[c].push(em.var(b, j, l));
+                            if let Some(ap) = ap {
+                                for (l, &z) in er.pg(ap).treps.iter().enumerate() {
+                                    let Some(q) =
+                                        act(m, ap, z, b, y).and_then(|v| pg_sp.tgt.project(v))
+                                    else {
+                                        dropped += 1;
+                                        continue 'pair;
+                                    };
+                                    for c in bits(q) {
+                                        terms[c].push(er.var(a, k, l));
+                                    }
                                 }
                             }
-                        }
-                        for tr in terms {
-                            let e = reduce_eq(tr);
-                            if !e.is_empty() {
-                                out.push(e);
+                            if let Some(bp) = bp {
+                                for (l, &z) in em.pg(bp).treps.iter().enumerate() {
+                                    let Some(q) =
+                                        act(m, a, x, bp, z).and_then(|v| pg_sp.tgt.project(v))
+                                    else {
+                                        dropped += 1;
+                                        continue 'pair;
+                                    };
+                                    for c in bits(q) {
+                                        terms[c].push(em.var(b, j, l));
+                                    }
+                                }
+                            }
+                            for tr in terms {
+                                let e = reduce_eq(tr);
+                                if !e.is_empty() {
+                                    out.push(e);
+                                }
                             }
                         }
                     }
                 }
-            }
-            (out, dropped)
-        })
-        .unzip();
-    let eqs: Vec<Vec<u32>> = eqs.into_iter().flatten().collect();
+                (out, dropped)
+            })
+            .unzip();
+        let eqs: Vec<Vec<u32>> = eqs.into_iter().flatten().collect();
+        count += eqs.len();
+        n_dropped += dropped.iter().sum::<usize>();
+        sink(eqs);
+    }
     eprintln!(
-        "{}: E{r} module Leibniz over {}: {} nontrivial equations, {} pairs dropped, {:.1}s",
+        "{}: E{r} module Leibniz over {}: {count} nontrivial equations, {n_dropped} pairs \
+         dropped, {:.1}s",
         mn.name,
         rn.name,
-        eqs.len(),
-        dropped.iter().sum::<usize>(),
         t.elapsed().as_secs_f64()
     );
-    eqs
 }
 
 /// Naturality d_r(f x) = f(d_r x) along a filtration-0 map, for every source class `x`,
@@ -980,56 +1041,57 @@ pub(crate) fn evaluate(
     rows: &[Vec<u32>],
     queries: &[Vec<u32>],
 ) -> Vec<(bool, Vec<u32>)> {
-    let pivcols: Vec<u32> = (0..nvars)
-        .rev()
-        .filter(|&c| pivot[c as usize] != u32::MAX)
-        .collect();
-    let back = |val: &mut [u64]| {
-        for &pc in &pivcols {
-            let r = &rows[pivot[pc as usize] as usize];
-            val[pc as usize] = r[1..].iter().fold(0, |acc, &c| acc ^ val[c as usize]);
-        }
-    };
-    let n = nvars as usize;
-    let mut part = vec![0u64; n + 1];
-    part[n] = 1;
-    back(&mut part);
+    evaluate_with(nvars, pivot, rows, queries, |_| true)
+        .into_iter()
+        .map(|(v, _, d)| (v, d))
+        .collect()
+}
+
+/// Per query: its value at the particular solution, whether it is determined (the same on the
+/// whole solution space), and, when `want_deps` asks for them and it is not determined, the free
+/// columns (by index among the free columns) of its expression. Determination comes from one
+/// fingerprint pass ([`crate::fingerprints`]); a query is reduced exactly only for its
+/// dependencies or when the fingerprint and the OR pass disagree.
+pub(crate) fn evaluate_with(
+    nvars: u32,
+    pivot: &[u32],
+    rows: &[Vec<u32>],
+    queries: &[Vec<u32>],
+    want_deps: impl Fn(usize) -> bool + Sync,
+) -> Vec<(bool, bool, Vec<u32>)> {
+    let t = Instant::now();
+    let fp = crate::fingerprints(nvars, pivot, rows);
     let free: Vec<u32> = (0..nvars)
         .filter(|&c| pivot[c as usize] == u32::MAX)
         .collect();
-    let deps: Vec<(usize, u32)> = free
-        .par_chunks(64)
+    let out: Vec<(bool, bool, Vec<u32>)> = queries
+        .par_iter()
         .enumerate()
-        .flat_map_iter(|(ci, chunk)| {
-            let mut val = vec![0u64; n + 1];
-            for (l, &f) in chunk.iter().enumerate() {
-                val[f as usize] = 1 << l;
+        .map(|(qi, q)| {
+            let value = q.iter().fold(false, |acc, &v| acc ^ fp.part[v as usize]);
+            let reach = q.iter().any(|&v| fp.reach[v as usize]);
+            let tag = q.iter().fold(0, |acc, &v| acc ^ fp.tag[v as usize]);
+            if !reach {
+                return (value, true, vec![]);
             }
-            back(&mut val);
-            let mut out = vec![];
-            for (qi, q) in queries.iter().enumerate() {
-                let mut m = q.iter().fold(0, |acc, &v| acc ^ val[v as usize]);
-                while m != 0 {
-                    out.push((qi, (ci * 64) as u32 + m.trailing_zeros()));
-                    m &= m - 1;
-                }
+            if tag != 0 && !want_deps(qi) {
+                return (value, false, vec![]);
             }
-            out
+            let deps: Vec<u32> = crate::reduce_to_free(nvars, pivot, rows, q)
+                .into_iter()
+                .filter(|&c| c != nvars)
+                .map(|c| free.binary_search(&c).unwrap() as u32)
+                .collect();
+            (value, deps.is_empty(), deps)
         })
         .collect();
-    let mut res: Vec<(bool, Vec<u32>)> = queries
-        .iter()
-        .map(|q| {
-            (
-                q.iter().fold(0, |acc, &v| acc ^ part[v as usize]) & 1 == 1,
-                vec![],
-            )
-        })
-        .collect();
-    for (qi, f) in deps {
-        res[qi].1.push(f);
-    }
-    res
+    eprintln!(
+        "evaluate: {} queries, {} determined, {:.1}s",
+        out.len(),
+        out.iter().filter(|x| x.1).count(),
+        t.elapsed().as_secs_f64()
+    );
+    out
 }
 
 /// `(page, node, path)` from repeatable `<flag> r:[node:]path` arguments, plus the legacy page-3
@@ -1069,7 +1131,8 @@ fn page_files(
 /// - `map <from> <to> <map csv>`: a filtration-0 ring map on E2, in the format of
 ///   `compare::load_iota`.
 ///
-/// d2 files are comma-separated, `-` for none.
+/// d2 files are comma-separated, `-` for none. With `--from-e2` d2 is solved from E2 and the
+/// files only add facts to its equations; otherwise E3 is built from them.
 #[derive(Default)]
 struct Spec {
     rings: Vec<(String, String, String)>,
@@ -1112,6 +1175,13 @@ pub(crate) fn run(ext: &Ext, p: &Products, args: &[String]) {
     let arg = |flag: &str| args.iter().position(|a| a == flag).map(|i| &args[i + 1]);
     let last: i32 = arg("--pages").map_or(3, |s| s.parse().unwrap());
     let from_bounds = args.iter().any(|a| a == "--e3-bounds");
+    // --from-e2: solve d2 too, starting from E2; d2 files are then facts among the equations
+    let from_e2 = args.iter().any(|a| a == "--from-e2");
+    let first = if from_e2 { 2 } else { 3 };
+    let gens_only = args.iter().any(|a| a == "--gens-only");
+    // open d2 classes get exact dependence vectors (otherwise every coordinate of an open class
+    // is a fresh unknown on E3, as for d2 files with open classes)
+    let exact_e2 = args.iter().any(|a| a == "--e2-exact-deps");
     let spec = read_spec(args);
     assert_eq!(spec.rings[0].1, "-", "the main ring must be the first node");
 
@@ -1243,6 +1313,8 @@ pub(crate) fn run(ext: &Ext, p: &Products, args: &[String]) {
     // next.
     let mut back: Vec<FxHashMap<i32, BTreeSet<(i32, i32, V)>>> =
         vec![FxHashMap::default(); nodes.len()];
+    // d2 is solved again only when page 2 has new backward facts: (their number, d2 per node)
+    let mut cache2: Option<(usize, Vec<FxHashMap<u32, Vec<Val>>>)> = None;
     for pass in 1.. {
         let t_pass = Instant::now();
         let facts_before: usize = back.iter().flat_map(|b| b.values()).map(|s| s.len()).sum();
@@ -1251,7 +1323,9 @@ pub(crate) fn run(ext: &Ext, p: &Products, args: &[String]) {
             .iter()
             .zip(&d2s)
             .map(|(n, d2)| {
-                if from_bounds {
+                if from_e2 {
+                    e2_pages(n)
+                } else if from_bounds {
                     bounds_e3(n, d2)
                 } else {
                     build_e3(n, d2)
@@ -1260,22 +1334,46 @@ pub(crate) fn run(ext: &Ext, p: &Products, args: &[String]) {
             .collect();
         loop {
             let r = es[0].r;
+            let facts2: usize = back.iter().filter_map(|b| b.get(&2)).map(|s| s.len()).sum();
+            if r == 2 && last > 2 {
+                if let Some((n2, dr)) = &cache2 {
+                    if *n2 == facts2 {
+                        eprintln!("d2: no new page-2 facts, reusing the d2 solution");
+                        es = nodes
+                            .iter()
+                            .zip(&es)
+                            .zip(dr)
+                            .map(|((n, e), d)| next_page(n, e, d))
+                            .collect();
+                        continue;
+                    }
+                }
+            }
             let mut total = 0;
             for (n, e) in nodes.iter().zip(es.iter_mut()) {
                 total = assign_vars(n, e, total);
             }
-            let mut eqs: Vec<Vec<u32>> = vec![];
+            // equations are absorbed as they are generated and never stored together
+            let mut prop = crate::propagate::Propagator::new(total);
+            let gens = r == 2 && gens_only;
             for (n, e) in nodes.iter().zip(&es) {
                 match n.alg {
-                    Alg::Ring(..) => eqs.extend(ring_equations(n, e)),
+                    Alg::Ring(..) => ring_equations(n, e, gens, &mut |c| prop.absorb(&c)),
                     Alg::Module(_, ring) => {
-                        eqs.extend(module_equations(n, e, &nodes[ring], &es[ring]))
+                        module_equations(n, e, &nodes[ring], &es[ring], gens, &mut |c| {
+                            prop.absorb(&c)
+                        })
                     }
                 }
             }
             for edge in &edges {
                 let (x, y) = (edge.from, edge.to);
-                eqs.extend(map_equations(edge, &nodes[x], &es[x], &nodes[y], &es[y]));
+                prop.absorb(&map_equations(edge, &nodes[x], &es[x], &nodes[y], &es[y]));
+            }
+            if r == 2 {
+                for ((n, e), d2) in nodes.iter().zip(&es).zip(&d2s) {
+                    prop.absorb(&d2_fact_equations(n, e, d2, total));
+                }
             }
             for (ni, (n, e)) in nodes.iter().zip(&es).enumerate() {
                 let mut n_back = 0;
@@ -1288,7 +1386,7 @@ pub(crate) fn run(ext: &Ext, p: &Products, args: &[String]) {
                         label: String::new(),
                     };
                     if let Ok(se) = statement_equations(n, e, &st, total) {
-                        eqs.extend(se);
+                        prop.absorb(&se);
                         n_back += 1;
                     }
                 }
@@ -1300,7 +1398,7 @@ pub(crate) fn run(ext: &Ext, p: &Products, args: &[String]) {
                 let (n, e) = (&nodes[*ni], &es[*ni]);
                 for st in read_statements(path) {
                     // a seed d_r(src) = tgt also says that src and tgt survive to E_r
-                    if r > 3 {
+                    if r > first {
                         let set = back[*ni].entry(r - 1).or_default();
                         set.insert((st.n, st.f, st.src));
                         if st.tgt != 0 {
@@ -1317,7 +1415,7 @@ pub(crate) fn run(ext: &Ext, p: &Products, args: &[String]) {
                                 st.label,
                                 se.len()
                             );
-                            eqs.extend(se);
+                            prop.absorb(&se);
                         }
                         Err(err) => {
                             eprintln!(
@@ -1328,13 +1426,13 @@ pub(crate) fn run(ext: &Ext, p: &Products, args: &[String]) {
                     }
                 }
             }
+            let (eqs, short_contradictions) = prop.finish();
             let (pivot, rows, _, contradictions) = eliminate(total, &eqs, false);
+            drop(eqs);
+            let n_contradictions = contradictions.len() + short_contradictions;
             let free = pivot.iter().filter(|&&x| x == u32::MAX).count();
-            eprintln!(
-                "d{r} solution space: dimension {free}, {} contradictions",
-                contradictions.len()
-            );
-            println!("d{r}: {} contradictions", contradictions.len());
+            eprintln!("d{r} solution space: dimension {free}, {n_contradictions} contradictions");
+            println!("d{r}: {n_contradictions} contradictions");
 
             // per node, per source class with a known target: what is known of d_r
             let mut classes: Vec<(usize, u32, usize)> = vec![];
@@ -1371,7 +1469,9 @@ pub(crate) fn run(ext: &Ext, p: &Products, args: &[String]) {
                     }
                 }
             }
-            let vals = evaluate(total, &pivot, &rows, &queries);
+            let vals = evaluate_with(total, &pivot, &rows, &queries, |qi| {
+                r > 2 || exact_e2 || qi >= n_class_queries
+            });
 
             let mut summary: Vec<BTreeMap<i32, (usize, usize, usize)>> =
                 vec![BTreeMap::new(); nodes.len()];
@@ -1393,7 +1493,9 @@ pub(crate) fn run(ext: &Ext, p: &Products, args: &[String]) {
                         format!("{pre}_{name}.csv")
                     };
                     let mut w = BufWriter::new(File::create(path).unwrap());
-                    writeln!(w, "stem,Adams_filtration,rep,status,target").unwrap();
+                    // E2 classes are basis vectors: d2 files name them by index
+                    let col = if r == 2 { "index" } else { "rep" };
+                    writeln!(w, "stem,Adams_filtration,{col},status,target").unwrap();
                     Some(w)
                 })
                 .collect();
@@ -1401,30 +1503,42 @@ pub(crate) fn run(ext: &Ext, p: &Products, args: &[String]) {
             // per node: coordinates, forced, forced to 1
             let mut coords = vec![(0, 0, 0); nodes.len()];
             let mut qi = 0;
+            let mut fresh = 0u64;
             for &(ni, b, k) in &classes {
                 let e = &es[ni];
                 let m = e.stride[b as usize] as usize;
                 let vs = &vals[qi..qi + m];
                 qi += m;
-                for (v, d) in vs {
+                for (v, det, _) in vs {
                     coords[ni].0 += 1;
-                    coords[ni].1 += d.is_empty() as usize;
-                    coords[ni].2 += (d.is_empty() && *v) as usize;
+                    coords[ni].1 += *det as usize;
+                    coords[ni].2 += (*det && *v) as usize;
                 }
                 let mut v = Val::default();
-                let mut dirs: BTreeMap<u32, V> = BTreeMap::new();
-                for (t, (val, deps)) in vs.iter().enumerate() {
-                    if *val {
-                        v.part |= 1 << t;
-                        v.keys.push(t as u64);
+                if r == 2 && !exact_e2 && vs.iter().any(|x| !x.1) {
+                    // an open d2 class: every coordinate is a fresh unknown
+                    v.dirs = (0..m).map(|t| 1 << t).collect();
+                    v.keys = (0..m)
+                        .map(|t| {
+                            fresh += 1;
+                            64 + fresh * 64 + t as u64
+                        })
+                        .collect();
+                } else {
+                    let mut dirs: BTreeMap<u32, V> = BTreeMap::new();
+                    for (t, (val, _, deps)) in vs.iter().enumerate() {
+                        if *val {
+                            v.part |= 1 << t;
+                            v.keys.push(t as u64);
+                        }
+                        for &f in deps {
+                            *dirs.entry(f).or_default() |= 1 << t;
+                            v.keys.push(64 + (f as u64) * 64 + t as u64);
+                        }
                     }
-                    for &f in deps {
-                        *dirs.entry(f).or_default() |= 1 << t;
-                        v.keys.push(64 + (f as u64) * 64 + t as u64);
-                    }
+                    v.keys.sort_unstable();
+                    v.dirs = dirs.into_values().collect();
                 }
-                v.keys.sort_unstable();
-                v.dirs = dirs.into_values().collect();
                 let det = v.dirs.is_empty();
                 let (n, f) = nodes[ni].deg(b);
                 let s = summary[ni].entry(n).or_default();
@@ -1437,21 +1551,26 @@ pub(crate) fn run(ext: &Ext, p: &Products, args: &[String]) {
                 }
                 if let Some(w) = ws[ni].as_mut() {
                     let rep = e.pg(b).reps[k];
-                    let tgt: Vec<String> = vs.iter().map(|(v, _)| (*v as u8).to_string()).collect();
-                    writeln!(
-                        w,
-                        "{n},{f},\"{rep:#b}\",{},\"[{}]\"",
-                        if det { "determined" } else { "open" },
-                        tgt.join(",")
-                    )
-                    .unwrap();
+                    let tgt: Vec<String> =
+                        vs.iter().map(|(v, ..)| (*v as u8).to_string()).collect();
+                    let status = if det { "determined" } else { "open" };
+                    if r == 2 {
+                        let i = rep.trailing_zeros();
+                        writeln!(w, "{n},{f},{i},{status},\"[{}]\"", tgt.join(", ")).unwrap();
+                    } else {
+                        writeln!(w, "{n},{f},\"{rep:#b}\",{status},\"[{}]\"", tgt.join(","))
+                            .unwrap();
+                    }
                 }
                 dr[ni].entry(b).or_default().push(v);
             }
             assert_eq!(qi, n_class_queries);
+            if r == 2 {
+                cache2 = Some((facts2, dr.clone()));
+            }
             // a forced value d_r(x) = y in a target without boundary uncertainty is a true
             // d_{r-1}-cycle: d_{r-1}(y) = 0
-            if r > 3 {
+            if r > first {
                 for (ni, (n, e)) in nodes.iter().zip(&es).enumerate() {
                     for (&b, vs) in &dr[ni] {
                         let Some(Some(t)) = target(n, e, b) else {
@@ -1515,9 +1634,9 @@ pub(crate) fn run(ext: &Ext, p: &Products, args: &[String]) {
                         Ok(se) => {
                             let vs = &vals[qi..qi + se.len()];
                             qi += se.len();
-                            let holds = se.iter().zip(vs).map(|(eq, (v, deps))| {
+                            let holds = se.iter().zip(vs).map(|(eq, (v, det, _))| {
                                 let c = eq.contains(&total);
-                                (deps.is_empty(), *v == c)
+                                (*det, *v == c)
                             });
                             let all_det = holds.clone().all(|(d, _)| d);
                             let all_ok = holds.clone().all(|(d, h)| !d || h);
