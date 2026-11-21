@@ -33,6 +33,8 @@ pub struct SparseWorkspace {
     bits: Vec<u64>,
     /// Every row toggled since the last reduction, possibly more than once, possibly cleared again.
     heap: BinaryHeap<u32>,
+    /// The entries of the echelon columns added since [`Self::take_additions`].
+    additions: usize,
 }
 
 impl SparseWorkspace {
@@ -41,7 +43,14 @@ impl SparseWorkspace {
         Self {
             bits: vec![0; rows.div_ceil(64)],
             heap: BinaryHeap::new(),
+            additions: 0,
         }
+    }
+
+    /// The number of entries of the echelon columns added by reductions since the last call: the
+    /// work elimination did, as opposed to the size of what it was given.
+    pub fn take_additions(&mut self) -> usize {
+        std::mem::take(&mut self.additions)
     }
 
     /// Grows to hold `rows` rows.
@@ -151,6 +160,7 @@ impl SparseEchelon {
             if let Some(used) = used.as_deref_mut() {
                 used.push(c);
             }
+            ws.additions += self.columns[c as usize].len();
             for &r in self.columns[c as usize].iter() {
                 ws.toggle(r);
             }

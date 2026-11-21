@@ -149,12 +149,52 @@ pub struct QAlgebra {
     index: FxHashMap<QMono, u32>,
     /// `shorter[d][l]` is the number of monomials of degree `d` shorter than `l`.
     shorter: Vec<Vec<u32>>,
-    /// The memo of [`Self::act`].
-    memo: DashMap<(PackedXi, QMono), Arc<QPoly>>,
-    /// The number of entries at which the memo is emptied; see [`Self::set_memo_limit`].
+    /// The memo of [`Self::coaction`].
+    memo: DashMap<QMono, Arc<Coaction>>,
+    /// The number of terms at which the memo is emptied; see [`Self::set_memo_limit`].
     memo_limit: usize,
-    /// The insertions into the memo since it was last emptied.
+    /// The terms put into the memo since it was last emptied.
     memo_count: std::sync::atomic::AtomicUsize,
+}
+
+/// The coaction on one monomial $m$: the terms $\xi^R \otimes m'$ with coefficient 1, with the
+/// coefficients already conjugated, grouped by $R$.
+pub struct Coaction {
+    /// The range of `gammas` for each $R$ that occurs.
+    index: FxHashMap<PackedXi, (u32, u32)>,
+    /// Each $m'$ as its position among the monomials of its degree, and its length.
+    gammas: Vec<(u32, u16)>,
+}
+
+impl Coaction {
+    /// $P(R) \cdot m$, as the position of each monomial in its degree, and its length.
+    pub fn get(&self, r: PackedXi) -> &[(u32, u16)] {
+        self.index
+            .get(&r)
+            .map_or(&[], |&(lo, hi)| &self.gammas[lo as usize..hi as usize])
+    }
+
+    /// The number of terms.
+    pub fn len(&self) -> usize {
+        self.gammas.len()
+    }
+
+    /// The number of distinct $R$.
+    pub fn num_ops(&self) -> usize {
+        self.index.len()
+    }
+
+    /// Each $R$ that occurs with $P(R) \cdot m$, as in [`Self::get`].
+    pub fn iter(&self) -> impl Iterator<Item = (PackedXi, &[(u32, u16)])> {
+        self.index
+            .iter()
+            .map(|(&r, &(lo, hi))| (r, &self.gammas[lo as usize..hi as usize]))
+    }
+
+    /// Whether there are no terms; there is always $1 \otimes m$.
+    pub fn is_empty(&self) -> bool {
+        self.gammas.is_empty()
+    }
 }
 
 impl QAlgebra {
@@ -237,7 +277,7 @@ impl QAlgebra {
         }
     }
 
-    /// Bounds the memo of [`Self::act`]: it is emptied when it passes `limit` entries, trading
+    /// Bounds the memo of [`Self::coaction`]: it is emptied when it passes `limit` terms, trading
     /// recomputation for memory.
     pub fn set_memo_limit(&mut self, limit: usize) {
         self.memo_limit = limit;
@@ -267,46 +307,74 @@ impl QAlgebra {
             .map_or(&[], |b| b)
     }
 
-    /// $P(R) \cdot m$.
+    /// The whole coaction on `m`, from which [`Self::act`] reads $P(R) \cdot m$ for any $R$.
     ///
     /// Peels the largest binary chunk $q_n^{2^j}$ off $m$ and uses that the coaction is
-    /// multiplicative, so that the products shared by different monomials are computed once.
-    pub fn act(&self, r: PackedXi, m: &QMono) -> Arc<QPoly> {
-        let Some(n) = m.iter().rposition(|&e| e > 0) else {
-            return Arc::new(if r == 0 { vec![*m] } else { Vec::new() });
-        };
-        if let Some(hit) = self.memo.get(&(r, *m)) {
+    /// multiplicative, so the coaction on what is left is shared between monomials.
+    pub fn coaction(&self, m: &QMono) -> Arc<Coaction> {
+        if let Some(hit) = self.memo.get(m) {
             return Arc::clone(&hit);
         }
-        let j = 15 - m[n].leading_zeros();
-        let mut rest = *m;
-        rest[n] -= 1 << j;
-        let mut out: FxHashSet<QMono> = FxHashSet::default();
-        for &(s, i) in &self.factors[n + 1] {
-            let s = s << j;
-            if !fits(s, r) {
-                continue;
-            }
-            for gamma in self.act(r - s, &rest).iter() {
-                let mut gamma = *gamma;
-                if i > 0 {
-                    gamma[i - 1] += 1 << j;
+        let mut terms: Vec<(PackedXi, QMono)> = match m.iter().rposition(|&e| e > 0) {
+            None => vec![(0, *m)],
+            Some(n) => {
+                let j = 15 - m[n].leading_zeros();
+                let mut rest = *m;
+                rest[n] -= 1 << j;
+                let rest_degree = mono_degree(&rest);
+                let rest = self.coaction(&rest);
+                let mut set: FxHashSet<(PackedXi, QMono)> = FxHashSet::default();
+                for (&r, &(lo, hi)) in &rest.index {
+                    let bucket = &self.by_degree[(rest_degree - xi_degree(r)) as usize];
+                    for &(idx, _) in &rest.gammas[lo as usize..hi as usize] {
+                        for &(s, i) in &self.factors[n + 1] {
+                            let mut gamma = bucket[idx as usize];
+                            if i > 0 {
+                                gamma[i - 1] += 1 << j;
+                            }
+                            toggle(&mut set, (r + (s << j), gamma));
+                        }
+                    }
                 }
-                toggle(&mut out, gamma);
+                set.into_iter().collect()
             }
+        };
+        terms.sort_unstable();
+        let mut index = FxHashMap::default();
+        let mut lo = 0u32;
+        for run in terms.chunk_by(|x, y| x.0 == y.0) {
+            index.insert(run[0].0, (lo, lo + run.len() as u32));
+            lo += run.len() as u32;
         }
-        let out = Arc::new(out.into_iter().collect::<Vec<_>>());
+        let out = Arc::new(Coaction {
+            index,
+            gammas: terms
+                .into_iter()
+                .map(|x| (self.index[&x.1], mono_len(&x.1) as u16))
+                .collect(),
+        });
         if self
             .memo_count
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            .fetch_add(out.gammas.len(), std::sync::atomic::Ordering::Relaxed)
             > self.memo_limit
         {
             self.memo_count
                 .store(0, std::sync::atomic::Ordering::Relaxed);
             self.memo.clear();
         }
-        self.memo.insert((r, *m), Arc::clone(&out));
+        self.memo.insert(*m, Arc::clone(&out));
         out
+    }
+
+    /// $P(R) \cdot m$.
+    pub fn act(&self, r: PackedXi, m: &QMono) -> QPoly {
+        let psi = self.coaction(m);
+        let terms = psi.get(r);
+        if terms.is_empty() {
+            return Vec::new();
+        }
+        let bucket = &self.by_degree[(mono_degree(m) - xi_degree(r)) as usize];
+        terms.iter().map(|&(idx, _)| bucket[idx as usize]).collect()
     }
 
     /// $P(R) \cdot f$.
@@ -321,7 +389,7 @@ impl QAlgebra {
         out.into_iter().collect()
     }
 
-    /// Forgets the memo of [`Self::act`], which otherwise only grows.
+    /// Forgets the memo of [`Self::coaction`].
     pub fn clear_memo(&self) {
         self.memo.clear();
     }
@@ -1118,7 +1186,7 @@ pub struct BarCocycle {
     /// The value on each bar word $[\theta_{a'} | \dots | \theta_1]$ on which it is nonzero.
     pub values: FxHashMap<Vec<PackedXi>, QPoly>,
     /// For each proper suffix of a word of `values`, the letters that extend it to the left.
-    extensions: FxHashMap<Vec<PackedXi>, Vec<PackedXi>>,
+    pub(crate) extensions: FxHashMap<Vec<PackedXi>, Vec<PackedXi>>,
 }
 
 /// Sections of the differentials of a resolution in low degrees, for pulling a cocycle back to
@@ -1222,6 +1290,12 @@ impl<'a, CC: FreeChainComplex<Algebra = MilnorAlgebra>> BarComparison<'a, CC> {
             let (_, t, i, m) = space.basis[pos];
             g.entry((t, i)).or_default().push(m);
         }
+        self.cocycle_of(q, x, &g)
+    }
+
+    /// The pullback to the bar resolution of the cocycle $P_a \to Q_k$ with the values `g` on
+    /// generators, by degree and index, of weight `x.u`.
+    pub fn cocycle_of(&self, q: &QAlgebra, x: Tri, g: &FxHashMap<(i32, u32), QPoly>) -> BarCocycle {
         let algebra = self.res.algebra();
         algebra.compute_basis(x.u);
         let module = self.res.module(x.a);
@@ -1235,7 +1309,7 @@ impl<'a, CC: FreeChainComplex<Algebra = MilnorAlgebra>> BarComparison<'a, CC> {
             .collect();
         let mut values = FxHashMap::default();
         let mut word = Vec::new();
-        self.enumerate(q, &module, &g, &letters, x, &mut word, 0, &mut values);
+        self.enumerate(q, &module, g, &letters, x, &mut word, 0, &mut values);
         let mut extensions: FxHashMap<Vec<PackedXi>, Vec<PackedXi>> = FxHashMap::default();
         for w in values.keys() {
             for i in 0..w.len() {

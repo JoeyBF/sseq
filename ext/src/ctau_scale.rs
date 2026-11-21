@@ -9,11 +9,13 @@ use fp::{
     prime::TWO,
     vector::FpVector,
 };
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use sseq::coordinates::Bidegree;
 
 use crate::{
-    ctau::{OpTable, PackedXi, QAlgebra, QMono, fits, mono_degree, mono_len, xi_degree},
+    ctau::{
+        BarCocycle, OpTable, PackedXi, QAlgebra, QMono, fits, mono_degree, mono_len, xi_degree,
+    },
     save::{SaveKind, ZarrSaveStore},
 };
 
@@ -26,6 +28,63 @@ pub struct InvTerm {
     pub l: u32,
 }
 
+/// The terms of the differentials of $P_a$ that land on one generator $x$ of $P_{a-1}$, grouped
+/// by operation.
+#[derive(Default)]
+pub struct GenTerms {
+    /// Each operation $P(R)$ with its degree and its range of `targets`, sorted by degree.
+    ops: Vec<(PackedXi, u16, u32, u32)>,
+    /// The position in `ops` of each operation.
+    by_op: FxHashMap<PackedXi, u32>,
+    /// The generators $z_l$, as (degree, index), with $P(R) x$ in $d z_l$.
+    targets: Vec<(u16, u32)>,
+}
+
+impl GenTerms {
+    /// Groups `terms`, which land on a generator of degree `t`.
+    fn new(mut terms: Vec<InvTerm>, t: u16) -> Self {
+        terms.sort_unstable_by_key(|x| (x.t, x.op, x.l));
+        let mut ops = Vec::new();
+        let mut targets = Vec::with_capacity(terms.len());
+        for run in terms.chunk_by(|x, y| x.t == y.t && x.op == y.op) {
+            let lo = targets.len() as u32;
+            targets.extend(run.iter().map(|x| (x.t, x.l)));
+            ops.push((run[0].op, run[0].t - t, lo, targets.len() as u32));
+        }
+        let by_op = ops
+            .iter()
+            .enumerate()
+            .map(|(i, x)| (x.0, i as u32))
+            .collect();
+        Self {
+            ops,
+            by_op,
+            targets,
+        }
+    }
+
+    /// The generators $z_l$ with $P(R) x$ in $d z_l$.
+    pub fn targets(&self, op: PackedXi) -> &[(u16, u32)] {
+        self.by_op.get(&op).map_or(&[], |&i| {
+            let (_, _, lo, hi) = self.ops[i as usize];
+            &self.targets[lo as usize..hi as usize]
+        })
+    }
+
+    /// The operations of degree at most `degree`, each with its degree and its generators.
+    pub fn ops(&self, degree: i32) -> impl Iterator<Item = (PackedXi, i32, &[(u16, u32)])> {
+        self.ops
+            .iter()
+            .take_while(move |x| x.1 as i32 <= degree)
+            .map(|&(op, d, lo, hi)| (op, d as i32, &self.targets[lo as usize..hi as usize]))
+    }
+
+    /// The number of distinct operations.
+    pub fn num_ops(&self) -> usize {
+        self.ops.len()
+    }
+}
+
 /// The generators and differentials of a saved minimal resolution, read straight off the save
 /// one bidegree at a time and kept only as sparse terms, grouped by the generator they land on.
 ///
@@ -35,7 +94,7 @@ pub struct StreamedBackbone {
     gens: Vec<Vec<u32>>,
     /// `inv[a]` files the terms of the differentials of the generators of $P_a$ under the
     /// generators `(t, i)` of $P_{a-1}$, each list sorted by the degree of $z_l$.
-    inv: Vec<FxHashMap<(u16, u32), Vec<InvTerm>>>,
+    inv: Vec<FxHashMap<(u16, u32), GenTerms>>,
     terms: usize,
 }
 
@@ -83,12 +142,12 @@ impl StreamedBackbone {
             })
             .collect();
         let gens: Vec<Vec<u32>> = gens.into_iter().collect::<anyhow::Result<_>>()?;
-        let inv: Vec<anyhow::Result<FxHashMap<(u16, u32), Vec<InvTerm>>>> = (0..=max_a)
+        let inv: Vec<anyhow::Result<FxHashMap<(u16, u32), GenTerms>>> = (0..=max_a)
             .into_maybe_par_iter()
             .map(|a| {
                 let mut by_gen: FxHashMap<(u16, u32), Vec<InvTerm>> = FxHashMap::default();
                 if a == 0 {
-                    return Ok(by_gen);
+                    return Ok(FxHashMap::default());
                 }
                 let target = FreeModule::new(Arc::clone(algebra), format!("P{}", a - 1), 0);
                 for (t, &n) in gens[a as usize - 1].iter().enumerate() {
@@ -131,13 +190,16 @@ impl StreamedBackbone {
                         }
                     }
                 }
-                Ok(by_gen)
+                Ok(by_gen
+                    .into_iter()
+                    .map(|(key, terms)| (key, GenTerms::new(terms, key.0)))
+                    .collect())
             })
             .collect();
         let inv: Vec<_> = inv.into_iter().collect::<anyhow::Result<_>>()?;
         let terms = inv
             .iter()
-            .map(|m| m.values().map(Vec::len).sum::<usize>())
+            .map(|m| m.values().map(|g| g.targets.len()).sum::<usize>())
             .sum();
         Ok(Self { gens, inv, terms })
     }
@@ -154,12 +216,9 @@ impl StreamedBackbone {
     }
 
     /// The terms of the differentials of $P_a$ that land on generator `i` of degree `t` of
-    /// $P_{a-1}$, sorted by the degree of their source.
-    pub fn inv(&self, a: i32, t: i32, i: u32) -> &[InvTerm] {
-        self.inv
-            .get(a as usize)
-            .and_then(|m| m.get(&(t as u16, i)))
-            .map_or(&[], |v| v)
+    /// $P_{a-1}$, if there are any.
+    pub fn inv(&self, a: i32, t: i32, i: u32) -> Option<&GenTerms> {
+        self.inv.get(a as usize)?.get(&(t as u16, i))
     }
 
     /// The number of terms held.
@@ -236,6 +295,12 @@ struct Block {
 /// The cochains of a [`Complex`] at one filtration and weight, numbered by level (the polynomial
 /// degree at which a cochain first appears), then by block, then by monomial.
 ///
+/// The level must come first for the reduction to find the towers. Within a level the order is
+/// free, and it decides how much the elimination has to add: the coboundary raises the degree
+/// of the generator (it is strictly triangular for the algebraic Atiyah–Hirzebruch filtration),
+/// and blocks are ordered by decreasing generator degree so that the pivot of a coboundary is
+/// its shortest Atiyah–Hirzebruch differential. `MOTIVIC_CTAU.md` has the measurements.
+///
 /// Positions are computed, not stored: the monomials of one degree and length are consecutive in
 /// [`QAlgebra::monomials`].
 pub struct Space {
@@ -274,6 +339,9 @@ impl Space {
                 }
             }
         }
+        // Later rows are preferred as pivots, so within a level the generators of lowest degree
+        // come last: a coboundary is then cleared at the term of its lowest operation.
+        blocks.sort_by_key(|b| (std::cmp::Reverse(b.t), b.cell, b.i));
         let block_id = blocks
             .iter()
             .enumerate()
@@ -320,13 +388,27 @@ impl Space {
         (self.level_start.partition_point(|&s| s <= pos) - 1) as u16
     }
 
+    /// The block of the generator `i` of degree `t` on a cell.
+    pub fn block(&self, cell: usize, t: u16, i: u32) -> usize {
+        self.block_id[&(cell as u8, t, i)] as usize
+    }
+
+    /// The position in block `b` of the monomial of length `len` at `idx` in its degree.
+    pub fn pos_in(&self, q: &QAlgebra, b: usize, idx: u32, len: u16) -> u32 {
+        let block = self.blocks[b];
+        let level = (len as i32 + self.dk[block.cell as usize]) as usize;
+        self.base[level * self.blocks.len() + b] + idx
+            - q.shorter(block.e as i32, len as u32) as u32
+    }
+
     /// The position of $x \mapsto m$ on a cell, for the generator `i` of degree `t`.
     pub fn pos(&self, q: &QAlgebra, cell: usize, t: u16, i: u32, m: &QMono) -> u32 {
-        let b = self.block_id[&(cell as u8, t, i)] as usize;
-        let len = mono_len(m);
-        let level = (len as i32 + self.dk[cell]) as usize;
-        let e = self.blocks[b].e as i32;
-        self.base[level * self.blocks.len() + b] + (q.index(m) - q.shorter(e, len)) as u32
+        self.pos_in(
+            q,
+            self.block(cell, t, i),
+            q.index(m) as u32,
+            mono_len(m) as u16,
+        )
     }
 
     /// The cell, generator and monomial at a position, and its level.
@@ -369,17 +451,34 @@ pub fn pullback_column(
         }
     }
     let most = moves.iter().map(|x| x.1).max().unwrap();
-    for term in bb.inv(src.a + da + 1, t as i32, i) {
-        let op_degree = (term.t - t) as i32;
-        if op_degree - most > e {
-            break;
-        }
-        for &(s, s_degree, c2) in &moves {
-            if op_degree - s_degree > e || !fits(s, term.op) {
-                continue;
+    if let Some(terms) = bb.inv(src.a + da + 1, t as i32, i) {
+        let psi = q.coaction(&m);
+        let mut emit = |c2: usize, gammas: &[(u32, u16)], targets: &[(u16, u32)]| {
+            for &(t_l, l) in targets {
+                let b = tgt.block(c2, t_l, l);
+                for &(idx, len) in gammas {
+                    out.push(tgt.pos_in(q, b, idx, len));
+                }
             }
-            for gamma in q.act(term.op - s, &m).iter() {
-                out.push(tgt.pos(q, c2, term.t, term.l, gamma));
+        };
+        // Join the operations of the differentials with those of the coaction from the
+        // smaller side.
+        if psi.num_ops() * moves.len() < terms.num_ops() {
+            for (r, gammas) in psi.iter() {
+                for &(s, _, c2) in &moves {
+                    emit(c2, gammas, terms.targets(r + s));
+                }
+            }
+        } else {
+            for (op, op_degree, targets) in terms.ops(e + most) {
+                for &(s, s_degree, c2) in &moves {
+                    if op_degree - s_degree <= e && fits(s, op) {
+                        let gammas = psi.get(op - s);
+                        if !gammas.is_empty() {
+                            emit(c2, gammas, targets);
+                        }
+                    }
+                }
             }
         }
     }
@@ -499,6 +598,8 @@ pub struct ReduceStats {
     pub longest: usize,
     /// The largest cochain space.
     pub largest: usize,
+    /// The entries of the columns added during reduction.
+    pub additions: usize,
 }
 
 impl ReduceStats {
@@ -510,6 +611,7 @@ impl ReduceStats {
             reduced_entries: self.reduced_entries + o.reduced_entries,
             longest: self.longest.max(o.longest),
             largest: self.largest.max(o.largest),
+            additions: self.additions + o.additions,
         }
     }
 }
@@ -530,6 +632,7 @@ pub fn reduce_weight(
     a_lo: i32,
     a_hi: i32,
 ) -> (Vec<((i32, i32), Reduced)>, ReduceStats) {
+    use maybe_rayon::prelude::*;
     let mut out: Vec<((i32, i32), Reduced)> = Vec::new();
     let mut stats = ReduceStats::default();
     let mut ws = SparseWorkspace::new(0);
@@ -544,45 +647,52 @@ pub fn reduce_weight(
             .last()
             .filter(|(key, _)| key.0 == a)
             .map(|(_, r)| &r.echelon);
-        let mut column = Vec::new();
         let mut used = Vec::new();
         stats.cochains += src.dim();
         stats.largest = stats.largest.max(src.dim());
-        for level in 0..src.level_start.len().saturating_sub(1) {
-            for pos in src.level_start[level]..src.level_start[level + 1] {
-                if cleared.is_some_and(|e| e.pivot_column(pos as usize).is_some()) {
-                    continue;
-                }
-                column.clear();
+        // The columns are built in parallel and reduced in order.
+        let sources: Vec<u32> = (0..src.dim() as u32)
+            .filter(|&pos| !cleared.is_some_and(|e| e.pivot_column(pos as usize).is_some()))
+            .collect();
+        let columns: Vec<Vec<u32>> = sources
+            .clone()
+            .into_maybe_par_iter()
+            .map(|pos| {
+                let mut column = Vec::new();
                 pullback_column(q, bb, cx, &src, &tgt, pos, 0, &mut column);
-                stats.input_entries += column.len();
-                used.clear();
-                let track = essential.is_some().then_some(&mut used);
-                let rest = red.echelon.reduce(&mut ws, column.iter().copied(), track);
-                let combo = essential.is_some().then(|| {
-                    let mut set = std::collections::BTreeSet::from([pos]);
-                    for &c in &used {
-                        for &r in &combos[c as usize] {
-                            if !set.remove(&r) {
-                                set.insert(r);
-                            }
+                column
+            })
+            .collect();
+        for (pos, column) in sources.into_iter().zip(columns) {
+            let level = src.level(pos);
+            stats.input_entries += column.len();
+            used.clear();
+            let track = essential.is_some().then_some(&mut used);
+            let rest = red.echelon.reduce(&mut ws, column, track);
+            stats.additions += ws.take_additions();
+            let combo = essential.is_some().then(|| {
+                let mut set = std::collections::BTreeSet::from([pos]);
+                for &c in &used {
+                    for &r in &combos[c as usize] {
+                        if !set.remove(&r) {
+                            set.insert(r);
                         }
                     }
-                    set.into_iter().collect::<Vec<u32>>()
-                });
-                if rest.is_empty() {
-                    if let (Some(ess), Some(combo)) = (essential.as_mut(), combo) {
-                        ess.push(combo, level as u16, NEVER);
-                    }
-                    continue;
                 }
-                stats.reduced_entries += rest.len();
-                stats.longest = stats.longest.max(rest.len());
-                let birth = tgt.level(*rest.last().unwrap());
-                red.push(rest, birth, level as u16);
-                if let Some(combo) = combo {
-                    combos.push(combo);
+                set.into_iter().collect::<Vec<u32>>()
+            });
+            if rest.is_empty() {
+                if let (Some(ess), Some(combo)) = (essential.as_mut(), combo) {
+                    ess.push(combo, level, NEVER);
                 }
+                continue;
+            }
+            stats.reduced_entries += rest.len();
+            stats.longest = stats.longest.max(rest.len());
+            let birth = tgt.level(*rest.last().unwrap());
+            red.push(rest, birth, level);
+            if let Some(combo) = combo {
+                combos.push(combo);
             }
         }
         if let Some(ess) = essential {
@@ -603,6 +713,8 @@ pub struct ScaledExt {
     /// The id of the first tower of each filtration and weight, in the order of
     /// [`Self::keys`].
     first: FxHashMap<(i32, i32), u32>,
+    /// The cochain spaces asked for so far.
+    spaces: dashmap::DashMap<(i32, i32), Arc<Space>>,
     keys: Vec<(i32, i32)>,
     pub stats: ReduceStats,
 }
@@ -651,9 +763,32 @@ impl ScaledExt {
             max_n,
             reduced,
             first,
+            spaces: Default::default(),
             keys,
             stats,
         }
+    }
+
+    /// The cochains at filtration `a` and weight `u`, built on first use and kept.
+    pub fn space(&self, q: &QAlgebra, bb: &StreamedBackbone, a: i32, u: i32) -> Arc<Space> {
+        if let Some(hit) = self.spaces.get(&(a, u)) {
+            return Arc::clone(&hit);
+        }
+        let space = Arc::new(Space::new(bb, q, &self.cx, a, u));
+        self.spaces.insert((a, u), Arc::clone(&space));
+        space
+    }
+
+    /// Drops the spaces [`Self::space`] keeps.
+    pub fn clear_spaces(&self) {
+        self.spaces.clear();
+    }
+
+    /// The tower generator of id `id`: its filtration, weight and index there.
+    pub fn locate(&self, id: u32) -> (i32, i32, usize) {
+        let k = self.keys.partition_point(|key| self.first[key] <= id) - 1;
+        let (a, u) = self.keys[k];
+        (a, u, (id - self.first[&(a, u)]) as usize)
     }
 
     /// The filtrations and weights held, by stem and then filtration.
@@ -719,4 +854,83 @@ pub fn induced(
             })
             .collect(),
     )
+}
+
+/// The cocycle representing $\beta \cdot [c]$ for the cocycle `c` of $C\tau$ in `src`, in `tgt`,
+/// which must be `src` shifted by the degree of `gamma`; see [`BarCocycle`] for the formula. A
+/// row may repeat, and then cancels.
+pub fn bar_cup(
+    q: &QAlgebra,
+    bb: &StreamedBackbone,
+    gamma: &BarCocycle,
+    src: &Space,
+    tgt: &Space,
+    c: &[u32],
+) -> Vec<u32> {
+    type Lift = FxHashMap<Vec<PackedXi>, FxHashSet<QMono>>;
+    let mut lifts: FxHashMap<(u16, u32), Lift> = FxHashMap::default();
+    for &pos in c {
+        let (_, t, i, m, _) = src.decode(q, pos);
+        lifts
+            .entry((t, i))
+            .or_default()
+            .entry(Vec::new())
+            .or_default()
+            .insert(m);
+    }
+    for j in 1..=gamma.degree.a {
+        let mut next: FxHashMap<(u16, u32), Lift> = FxHashMap::default();
+        for (&(t, i), lift) in &lifts {
+            let Some(terms) = bb.inv(src.a + j, t as i32, i) else {
+                continue;
+            };
+            for (w, f) in lift {
+                let Some(letters) = gamma.extensions.get(w) else {
+                    continue;
+                };
+                let f: Vec<QMono> = f.iter().copied().collect();
+                for (op, _, targets) in terms.ops(tgt.u - t as i32) {
+                    for &r in letters {
+                        if !fits(r, op) {
+                            continue;
+                        }
+                        let image = q.act_poly(op - r, &f);
+                        if image.is_empty() {
+                            continue;
+                        }
+                        let mut w2 = Vec::with_capacity(w.len() + 1);
+                        w2.push(r);
+                        w2.extend_from_slice(w);
+                        for &target in targets {
+                            let slot = next
+                                .entry(target)
+                                .or_default()
+                                .entry(w2.clone())
+                                .or_default();
+                            for m in &image {
+                                if !slot.remove(m) {
+                                    slot.insert(*m);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        lifts = next;
+    }
+    let mut out = Vec::new();
+    for ((t, i), lift) in lifts {
+        for (w, f) in lift {
+            let Some(value) = gamma.values.get(&w) else {
+                continue;
+            };
+            for x in value {
+                for y in &f {
+                    out.push(tgt.pos(q, 0, t, i, &crate::ctau::mono_mul(x, y)));
+                }
+            }
+        }
+    }
+    out
 }

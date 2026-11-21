@@ -10,8 +10,9 @@ use std::{
 use algebra::AlgebraType;
 use ext::{
     chain_complex::ChainComplex,
-    ctau::{OpTable, QAlgebra},
-    ctau_scale::{Complex, NEVER, ScaledExt, Space, StreamedBackbone, induced, pullback_column},
+    ctau::{BarComparison, OpTable, QAlgebra, QPoly, Tri},
+    ctau_scale::{Complex, NEVER, ScaledExt, StreamedBackbone, bar_cup, induced, pullback_column},
+    save::SaveKind,
     utils::query_module_only,
 };
 use fp::matrix::SparseWorkspace;
@@ -49,6 +50,144 @@ fn peak_gb() -> f64 {
         .map_or(0.0, |kb| kb / 1e6)
 }
 
+/// Finds the tower generators of `ctau` of weight at most `bound` that are not sums of products
+/// of generators of lower weight and multiples of `h_0`, and writes them and their products
+/// with every tower generator.
+///
+/// A product by `β` goes through a cocycle of `β` on the bar resolution, which needs the
+/// resolution itself in the degrees of `β`: `res` is loaded that far, and no further.
+fn products(
+    dir: &std::path::Path,
+    res: &ext::utils::QueryModuleResolution,
+    ops: &OpTable,
+    q: &QAlgebra,
+    bb: &StreamedBackbone,
+    ctau: &ScaledExt,
+    bound: i32,
+) -> anyhow::Result<()> {
+    use std::collections::BTreeSet;
+
+    use sseq::coordinates::Bidegree;
+    let start = Instant::now();
+    let store = res.save_dir().store().expect("a saved resolution");
+    for s in 1..=bound + 1 {
+        for n in 0..=bound {
+            anyhow::ensure!(
+                store.exists(SaveKind::NassauDifferential, Bidegree::n_s(n, s)),
+                "the save lacks ({n}, {s}); refusing to resolve"
+            );
+        }
+    }
+    res.compute_through_stem(Bidegree::n_s(bound, bound + 1));
+    let cmp = BarComparison::new(res, ops);
+    // landing[(a, u)]: the products that land there, by level
+    let mut landing: std::collections::HashMap<(i32, i32), Vec<(u16, Vec<u32>)>> =
+        Default::default();
+    let mut wg = csv(dir, "Ctau_generators.csv", "id,stem,filtration,weight")?;
+    let mut wp = csv(dir, "Ctau_products.csv", "generator,source,targets")?;
+    let (mut count, mut nonzero) = (0, 0);
+    for weight in 1..=bound {
+        let keys: Vec<(i32, i32)> = ctau
+            .keys()
+            .iter()
+            .copied()
+            .filter(|key| key.1 == weight)
+            .collect();
+        for (a, u) in keys {
+            let red = ctau.reduced(a, u).unwrap();
+            let space = ctau.space(q, bb, a, u);
+            // the span, at each level, of the products and of the generators chosen so far,
+            // modulo the towers born below the level, as vectors with distinct largest entries
+            let mut spans: std::collections::HashMap<u16, Vec<BTreeSet<u32>>> = Default::default();
+            let birth_of = |id: u32| red.tower((id - ctau.tower_id(a, u, 0)) as usize).0;
+            let reduce = |span: &[BTreeSet<u32>], mut v: BTreeSet<u32>| {
+                while let Some(&top) = v.last() {
+                    match span.iter().find(|b| b.last() == Some(&top)) {
+                        Some(b) => v = v.symmetric_difference(b).copied().collect(),
+                        None => break,
+                    }
+                }
+                v
+            };
+            for (level, ids) in landing.remove(&(a, u)).unwrap_or_default() {
+                let v: BTreeSet<u32> = ids.into_iter().filter(|&t| birth_of(t) == level).collect();
+                let span = spans.entry(level).or_default();
+                let v = reduce(span, v);
+                if !v.is_empty() {
+                    span.push(v);
+                }
+            }
+            for i in 0..red.towers.len() {
+                let (birth, _) = red.tower(i);
+                let id = ctau.tower_id(a, u, i as u32);
+                let span = spans.entry(birth).or_default();
+                let v = reduce(span, BTreeSet::from([id]));
+                if v.is_empty() {
+                    continue;
+                }
+                span.push(v);
+                writeln!(wg, "{id},{},{},{u}", 2 * u - a, a + birth as i32)?;
+                count += 1;
+                let mut g: rustc_hash::FxHashMap<(i32, u32), QPoly> = Default::default();
+                for &pos in red.generator(i) {
+                    let (_, t, x, m, _) = space.decode(q, pos);
+                    g.entry((t as i32, x)).or_default().push(m);
+                }
+                let gamma = cmp.cocycle_of(q, Tri::new(a, u, birth as i32), &g);
+                let rows: Vec<(Rows, (i32, i32), Vec<(u16, Vec<u32>)>)> = ctau
+                    .keys()
+                    .to_vec()
+                    .into_maybe_par_iter()
+                    .map(|(a0, u0)| {
+                        let (a2, u2) = (a0 + a, u0 + u);
+                        let from = ctau.reduced(a0, u0).unwrap();
+                        let Some(to) = ctau.reduced(a2, u2) else {
+                            return (Vec::new(), (a2, u2), Vec::new());
+                        };
+                        if from.towers.is_empty() {
+                            return (Vec::new(), (a2, u2), Vec::new());
+                        }
+                        let src = ctau.space(q, bb, a0, u0);
+                        let tgt = ctau.space(q, bb, a2, u2);
+                        let mut ws = SparseWorkspace::new(0);
+                        let mut rows = Vec::new();
+                        let mut landed = Vec::new();
+                        for j in 0..from.towers.len() {
+                            let entries = bar_cup(q, bb, &gamma, &src, &tgt, from.generator(j));
+                            let level = from.tower(j).0 + birth;
+                            let targets: Vec<u32> = to
+                                .class(&mut ws, entries, level)
+                                .into_iter()
+                                .map(|t| ctau.tower_id(a2, u2, t))
+                                .collect();
+                            if !targets.is_empty() {
+                                landed.push((level, targets.clone()));
+                            }
+                            rows.push((ctau.tower_id(a0, u0, j as u32), targets));
+                        }
+                        (rows, (a2, u2), landed)
+                    })
+                    .collect();
+                for (rows, key, landed) in rows {
+                    nonzero += rows.iter().filter(|r| !r.1.is_empty()).count();
+                    write_rows(&mut wp, &format!("{id},"), &rows)?;
+                    if key.1 <= bound && key.1 > weight {
+                        landing.entry(key).or_default().extend(landed);
+                    }
+                }
+            }
+        }
+        q.clear_memo();
+    }
+    eprintln!(
+        "products: {count} generators of weight <= {bound}, {nonzero} nonzero products: {:.1} s, \
+         peak {:.1} GB",
+        start.elapsed().as_secs_f64(),
+        peak_gb()
+    );
+    Ok(())
+}
+
 /// Reads the range and the save, and writes the export.
 ///
 /// Nothing is resolved or lifted, and the resolution is not loaded: its differentials are read
@@ -63,7 +202,9 @@ fn peak_gb() -> f64 {
 ///   `source` is the sum of the classes of the towers `targets` in the tridegree of the product.
 ///   Multiplication by `h_0` is the tower structure;
 /// * `<C>_istar.csv`, `<C>_pstar.csv`: the same for the bottom cell `Ctau → C` (sources are
-///   towers of `Ctau`) and the top cell `C → Σ Ctau` (targets are towers of `Ctau`).
+///   towers of `Ctau`) and the top cell `C → Σ Ctau` (targets are towers of `Ctau`);
+/// * `Ctau_generators.csv`, `Ctau_products.csv`: the algebra generators up to the product bound
+///   (see [`products`]) and `generator,source,targets` for their products.
 ///
 /// Every map commutes with `h_0`, so its value on `h_0^i g` is the sum of the classes of the
 /// same targets, those whose tower still holds a class in that tridegree.
@@ -77,6 +218,8 @@ fn main() -> anyhow::Result<()> {
     let specs: String = query::with_default("Complexes (- for none)", "C2,Ceta,Cnu,Csigma", |s| {
         Ok::<_, anyhow::Error>(s.to_string())
     });
+    let product_weight: i32 =
+        query::with_default("Product bound (weight of β, 0 for none)", "0", str::parse);
     std::fs::create_dir_all(&dir)?;
     let store = res.save_dir().store().expect("a saved resolution");
     let algebra = res.algebra();
@@ -110,13 +253,14 @@ fn main() -> anyhow::Result<()> {
         let s = ext.stats;
         eprintln!(
             "{name}: {} towers; {} cochains (largest space {}), {} coboundary entries, {} reduced \
-             entries (longest column {}): {:.1} s, peak {:.1} GB",
+             entries (longest column {}), {} entries added: {:.1} s, peak {:.1} GB",
             ext.num_towers(),
             s.cochains,
             s.largest,
             s.input_entries,
             s.reduced_entries,
             s.longest,
+            s.additions,
             start.elapsed().as_secs_f64(),
             peak_gb()
         );
@@ -153,14 +297,14 @@ fn main() -> anyhow::Result<()> {
                 if ext.reduced(a, u).unwrap().towers.is_empty() {
                     return out;
                 }
-                let src = Space::new(bb, q, &ext.cx, a, u);
+                let src = ext.space(q, bb, a, u);
                 let mut ws = SparseWorkspace::new(0);
                 for j in 0..4u32 {
                     let (a2, u2) = (a + 1, u + (1 << j));
                     if ext.reduced(a2, u2).is_none() {
                         continue;
                     }
-                    let tgt = Space::new(bb, q, &ext.cx, a2, u2);
+                    let tgt = ext.space(q, bb, a2, u2);
                     let images = induced(&ext, &ext, (a, u), (a2, u2), 0, &mut ws, |pos, out| {
                         pullback_column(q, bb, &ext.cx, &src, &tgt, pos, 1 << j, out)
                     })
@@ -198,6 +342,7 @@ fn main() -> anyhow::Result<()> {
             "Csigma" => Complex::hopf(name, 2),
             _ => anyhow::bail!("unknown complex {name}"),
         };
+        ctau.clear_spaces();
         let cof = export(&dir, &q, &bb, cx, max_n)?;
         let start = Instant::now();
         let top = cof.cx.cells.len() - 1;
@@ -211,8 +356,8 @@ fn main() -> anyhow::Result<()> {
                 if ctau.reduced(a, u).unwrap().towers.is_empty() || cof.reduced(a, u).is_none() {
                     return Vec::new();
                 }
-                let src = Space::new(&bb, &q, &ctau.cx, a, u);
-                let tgt = Space::new(&bb, &q, &cof.cx, a, u);
+                let src = ctau.space(&q, &bb, a, u);
+                let tgt = cof.space(&q, &bb, a, u);
                 let mut ws = SparseWorkspace::new(0);
                 induced(&ctau, &cof, (a, u), (a, u), 0, &mut ws, |pos, out| {
                     let (_, t, i, m, _) = src.decode(&q, pos);
@@ -239,8 +384,8 @@ fn main() -> anyhow::Result<()> {
                 if cof.reduced(a, u).unwrap().towers.is_empty() || ctau.reduced(a2, u2).is_none() {
                     return Vec::new();
                 }
-                let src = Space::new(&bb, &q, &cof.cx, a, u);
-                let tgt = Space::new(&bb, &q, &ctau.cx, a2, u2);
+                let src = cof.space(&q, &bb, a, u);
+                let tgt = ctau.space(&q, &bb, a2, u2);
                 let mut ws = SparseWorkspace::new(0);
                 induced(&cof, &ctau, (a, u), (a2, u2), -dk, &mut ws, |pos, out| {
                     let (cell, t, i, m, _) = src.decode(&q, pos);
@@ -264,6 +409,9 @@ fn main() -> anyhow::Result<()> {
             start.elapsed().as_secs_f64(),
             peak_gb()
         );
+    }
+    if product_weight > 0 {
+        products(&dir, &res, &ops, &q, &bb, &ctau, product_weight)?;
     }
     eprintln!(
         "total {:.1} s, peak {:.1} GB",
