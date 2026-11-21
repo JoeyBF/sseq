@@ -86,6 +86,9 @@ enum Kind {
     Echelon,
     /// The columns that generate towers only: the sources of the maps out.
     Generators,
+    /// The cocycles that are coboundaries within the bound on the polynomial degree, waiting
+    /// for the next filtration to find the others.
+    Partial,
 }
 
 /// One append-only file of records, indexed in memory, so that what is written sequentially is
@@ -164,6 +167,25 @@ impl Spill {
             let count = get_varint(&mut cursor) as usize;
             Reduced::from_columns(rows, decode(&mut cursor, count))
         }))
+    }
+
+    /// The record of [`Self::put_partial`], if it was written.
+    fn partial(&self, a: i32, u: i32) -> anyhow::Result<Option<Reduced>> {
+        Ok(self.get((Kind::Partial, a, u))?.map(|data| {
+            let mut cursor = &data[..];
+            let rows = get_varint(&mut cursor) as usize;
+            let count = get_varint(&mut cursor) as usize;
+            Reduced::from_columns(rows, decode(&mut cursor, count))
+        }))
+    }
+
+    /// Writes every column of `red`, to be completed by the next filtration.
+    fn put_partial(&self, a: i32, u: i32, red: &Reduced) -> anyhow::Result<()> {
+        let mut data = Vec::new();
+        put_varint(&mut data, red.echelon.rows() as u64);
+        put_varint(&mut data, red.echelon.len() as u64);
+        encode(&mut data, red.columns());
+        self.put((Kind::Partial, a, u), &data)
     }
 
     /// Writes the tower generators of `red`, and all of its columns if `whole`.
@@ -270,10 +292,11 @@ impl Pass<'_> {
         }
         for i in 0..red.towers.len() {
             let (birth, length) = red.tower(i);
-            let length = if length == NEVER {
-                "inf".to_string()
-            } else {
-                length.to_string()
+            let length = match (length, self.cx.max_k) {
+                // a tower still standing at the bound: its length is at least this
+                (NEVER, Some(k)) if (a, u) != (0, 0) => format!("{}+", k as i32 + 1 - birth as i32),
+                (NEVER, _) => "inf".to_string(),
+                _ => length.to_string(),
             };
             writeln!(
                 rows.towers,
@@ -447,7 +470,13 @@ pub fn export(
     let min_a = cx.min_a();
     // the lowest source filtration read at weight u, and one past the highest
     let a_lo = |u: i32| (2 * u - max_n - 1).max(min_a);
-    let a_hi = |u: i32| u.max(a_lo(u) + 1);
+    let bounded = cx.max_k.is_some();
+    anyhow::ensure!(
+        !bounded || cx.cells.iter().all(|c| c[2] == 0),
+        "a bound on the polynomial degree needs cells that do not shift it"
+    );
+    // With a bound, the cocycles of a filtration are complete one filtration later.
+    let a_hi = |u: i32| u.max(a_lo(u) + 1) + i32::from(bounded);
     let shifts: Vec<i32> = {
         let mut v: Vec<i32> = cx.cells.iter().map(|c| c[0]).collect();
         v.sort_unstable();
@@ -464,12 +493,16 @@ pub fn export(
         if weights.is_empty() {
             continue;
         }
-        // the differentials out of the filtrations the cells put above a, and only those
-        slices.retain(|&f, _| f > a);
+        // The differentials out of the filtrations the cells put above a, and only those. With
+        // a bound the maps into filtration a are computed in this pass too, and they read one
+        // filtration lower.
+        let lowest = a + 1 - i32::from(bounded);
+        slices.retain(|&f, _| f >= lowest);
         for &da in &shifts {
-            let f = a + da + 1;
-            if !slices.contains_key(&f) {
-                slices.insert(f, Arc::new(source.slice(f)?));
+            for f in lowest + da..=a + da + 1 {
+                if !slices.contains_key(&f) {
+                    slices.insert(f, Arc::new(source.slice(f)?));
+                }
             }
         }
         let window = source.window(slices.iter().map(|(&f, s)| (f, Arc::clone(s))).collect());
@@ -498,8 +531,8 @@ pub fn export(
                     let src = Space::new(pass.bb, q, &cx, a, u);
                     let tgt = Space::new(pass.bb, q, &cx, a + 1, u);
                     let skip = cleared.get(&u);
-                    let mut ws = SparseWorkspace::new(0);
                     let mut local = ReduceStats::default();
+                    let track = bounded || a == min_a;
                     let (red, essential) = reduce_step(
                         q,
                         pass.bb,
@@ -510,11 +543,40 @@ pub fn export(
                         |pos| {
                             skip.is_some_and(|bits| bits[pos as usize / 64] >> (pos % 64) & 1 == 1)
                         },
-                        &mut ws,
+                        track,
                         &mut local,
                     );
                     drop((src, tgt));
                     let bits = pivots(&red);
+                    if bounded {
+                        // The cocycles at (a, u): the coboundaries found one filtration ago,
+                        // and those that are not coboundaries within the bound, found now.
+                        let before = if a == min_a {
+                            Some(Reduced::from_columns(0, std::iter::empty()))
+                        } else {
+                            pass.spill.partial(a, u)?
+                        };
+                        let mut rows = Rows::default();
+                        if let (Some(before), Some(ess)) = (before, essential.as_ref()) {
+                            let mut whole = Reduced::from_columns(
+                                ess.echelon.rows(),
+                                before
+                                    .columns()
+                                    .map(|(c, birth, death)| (c.to_vec(), birth, death)),
+                            );
+                            for (c, birth, death) in ess.columns() {
+                                whole.push(c.to_vec(), birth, death);
+                            }
+                            pass.spill.put_reduced(a, u, &whole, pass.keep_echelons)?;
+                            pass.maps_into(a, u, &whole, &mut rows)?;
+                            let mut s = stats.lock().unwrap();
+                            s.towers += whole.towers.len();
+                        }
+                        pass.spill.put_partial(a + 1, u, &red)?;
+                        let mut s = stats.lock().unwrap();
+                        s.reduce = s.reduce.merge(local);
+                        return Ok((u, bits, rows, None));
+                    }
                     pass.spill.put_reduced(a + 1, u, &red, pass.keep_echelons)?;
                     if let Some(ess) = &essential {
                         pass.spill.put_reduced(a, u, ess, pass.keep_echelons)?;

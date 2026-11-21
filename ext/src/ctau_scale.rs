@@ -473,6 +473,12 @@ pub struct Complex {
     /// $(c, c')$ when the coboundary of a cochain on cell `c` contains the same cochain on `c'`:
     /// the cone of multiplication by $q_0$.
     pub attach: Vec<(usize, usize)>,
+    /// The largest polynomial degree (Chow degree) computed, if bounded. The [`QAlgebra`] used
+    /// must then hold the monomials of length up to this and no longer.
+    ///
+    /// Each polynomial degree is its own complex, so the bound is exact on what it keeps. A
+    /// tower that would run past it shows up as a cocycle that never becomes a coboundary.
+    pub max_k: Option<u32>,
 }
 
 impl Complex {
@@ -483,6 +489,7 @@ impl Complex {
             cells: vec![[0, 0, 0]],
             actions: Vec::new(),
             attach: Vec::new(),
+            max_k: None,
         }
     }
 
@@ -494,6 +501,7 @@ impl Complex {
             cells: vec![[0, 0, 0], [1, 0, 1]],
             actions: Vec::new(),
             attach: vec![(1, 0)],
+            max_k: None,
         }
     }
 
@@ -510,6 +518,7 @@ impl Complex {
             cells: vec![[0, 0, 0], [0, 1 << j, 0]],
             actions: vec![(1 << j, 1, 0)],
             attach: Vec::new(),
+            max_k: None,
         }
     }
 }
@@ -857,7 +866,7 @@ impl Reduced {
     }
 
     /// Adds a reduced cocycle born at `birth` that dies at `death`.
-    fn push(&mut self, column: Vec<u32>, birth: u16, death: u16) {
+    pub(crate) fn push(&mut self, column: Vec<u32>, birth: u16, death: u16) {
         let id = self.echelon.insert(column);
         debug_assert_eq!(id, self.birth.len());
         self.birth.push(birth);
@@ -965,11 +974,23 @@ impl ReduceStats {
     }
 }
 
+/// The sources reduced against a frozen echelon at a time; see [`reduce_step`].
+const REDUCE_BATCH: usize = 4096;
+
+/// The sources one thread takes of a batch.
+const REDUCE_PIECE: usize = 64;
+
 /// Reduces the coboundary from `src` to `tgt`, skipping the sources `cleared` accepts, and
-/// returns the cocycles of `tgt`, and those of `src` if it is the lowest filtration of `cx`.
+/// returns the cocycles of `tgt`, and with `track` the cocycles of `src` that are no
+/// coboundary of anything: the sources whose coboundary reduces to zero, each as the
+/// combination of sources that has zero coboundary.
 ///
 /// Sources are taken in order of level and rows are numbered by level, so a reduced column is a
 /// cocycle born at the level of its pivot that becomes a coboundary at the level of its source.
+///
+/// A batch of sources is first reduced in parallel against the columns found before the batch,
+/// which does nearly all the additions, and then in order against the columns of the batch
+/// itself. Larger batches leave more to the second, sequential, step.
 #[allow(clippy::too_many_arguments)]
 pub fn reduce_step(
     q: &QAlgebra,
@@ -979,48 +1000,76 @@ pub fn reduce_step(
     src: &Space,
     tgt: &Space,
     cleared: impl Fn(u32) -> bool + Sync,
-    ws: &mut SparseWorkspace,
+    track: bool,
     stats: &mut ReduceStats,
 ) -> (Reduced, Option<Reduced>) {
+    use maybe_rayon::prelude::*;
     let mut red = Reduced::new(tgt.dim());
-    // in the lowest filtration, the combination of sources each column is the coboundary of
+    // with `track`, the combination of sources each column is the coboundary of
     let mut combos: Vec<Vec<u32>> = Vec::new();
-    let mut essential = (src.a == cx.min_a()).then(|| Reduced::new(src.dim()));
-    let mut used = Vec::new();
+    let mut essential = track.then(|| Reduced::new(src.dim()));
     stats.cochains += src.dim();
     stats.largest = stats.largest.max(src.dim());
-    // The columns are built a block at a time, in parallel, and reduced in order.
+    // The columns are built a block at a time, in parallel.
     let columns = pullback_columns(q, bb, tables, cx, src, tgt, 0, cleared);
-    for (pos, column) in columns {
-        let level = src.level(pos);
-        stats.input_entries += column.len();
-        used.clear();
-        let track = essential.is_some().then_some(&mut used);
-        let rest = red.echelon.reduce(ws, column, track);
-        stats.additions += ws.take_additions();
-        let combo = essential.is_some().then(|| {
-            let mut set = std::collections::BTreeSet::from([pos]);
-            for &c in &used {
-                for &r in &combos[c as usize] {
-                    if !set.remove(&r) {
-                        set.insert(r);
+    let mut ws = SparseWorkspace::new(tgt.dim());
+    for batch in columns.chunks(REDUCE_BATCH) {
+        let echelon = &red.echelon;
+        let pieces: Vec<&[(u32, Vec<u32>)]> = batch.chunks(REDUCE_PIECE).collect();
+        let first: Vec<Vec<(Vec<u32>, Vec<u32>, usize)>> = pieces
+            .into_maybe_par_iter()
+            .map(|piece| {
+                let mut ws = SparseWorkspace::new(echelon.rows());
+                piece
+                    .iter()
+                    .map(|(_, column)| {
+                        let mut used = Vec::new();
+                        let rest = echelon.reduce(
+                            &mut ws,
+                            column.iter().copied(),
+                            track.then_some(&mut used),
+                        );
+                        (rest, used, ws.take_additions())
+                    })
+                    .collect()
+            })
+            .collect();
+        for ((pos, column), (rest, mut used, added)) in
+            batch.iter().zip(first.into_iter().flatten())
+        {
+            let level = src.level(*pos);
+            stats.input_entries += column.len();
+            let rest = if rest.is_empty() {
+                rest
+            } else {
+                red.echelon
+                    .reduce(&mut ws, rest, track.then_some(&mut used))
+            };
+            stats.additions += added + ws.take_additions();
+            let combo = track.then(|| {
+                let mut set = std::collections::BTreeSet::from([*pos]);
+                for &c in &used {
+                    for &r in &combos[c as usize] {
+                        if !set.remove(&r) {
+                            set.insert(r);
+                        }
                     }
                 }
+                set.into_iter().collect::<Vec<u32>>()
+            });
+            if rest.is_empty() {
+                if let (Some(ess), Some(combo)) = (essential.as_mut(), combo) {
+                    ess.push(combo, level, NEVER);
+                }
+                continue;
             }
-            set.into_iter().collect::<Vec<u32>>()
-        });
-        if rest.is_empty() {
-            if let (Some(ess), Some(combo)) = (essential.as_mut(), combo) {
-                ess.push(combo, level, NEVER);
+            stats.reduced_entries += rest.len();
+            stats.longest = stats.longest.max(rest.len());
+            let birth = tgt.level(*rest.last().unwrap());
+            red.push(rest, birth, level);
+            if let Some(combo) = combo {
+                combos.push(combo);
             }
-            continue;
-        }
-        stats.reduced_entries += rest.len();
-        stats.longest = stats.longest.max(rest.len());
-        let birth = tgt.level(*rest.last().unwrap());
-        red.push(rest, birth, level);
-        if let Some(combo) = combo {
-            combos.push(combo);
         }
     }
     (red, essential)
@@ -1045,7 +1094,6 @@ pub fn reduce_weight(
 ) -> (Vec<((i32, i32), Reduced)>, ReduceStats) {
     let mut out: Vec<((i32, i32), Reduced)> = Vec::new();
     let mut stats = ReduceStats::default();
-    let mut ws = SparseWorkspace::new(0);
     let mut src = Space::new(bb, q, cx, a_lo, u);
     for a in a_lo..a_hi {
         let tgt = Space::new(bb, q, cx, a + 1, u);
@@ -1061,7 +1109,7 @@ pub fn reduce_weight(
             &src,
             &tgt,
             |pos| cleared.is_some_and(|e| e.pivot_column(pos as usize).is_some()),
-            &mut ws,
+            a == cx.min_a(),
             &mut stats,
         );
         if let Some(ess) = essential {

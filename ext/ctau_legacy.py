@@ -33,7 +33,7 @@ def load(name):
     basis = defaultdict(list)
     for r in rows(f"{src}/{name}_towers.csv"):
         n, s, w = int(r["stem"]), int(r["filtration"]), int(r["weight"])
-        length = max_s + 1 - s if r["length"] == "inf" else int(r["length"])
+        length = max_s + 1 - s if r["length"] == "inf" else int(r["length"].rstrip("+"))
         towers[r["id"]] = (n, s, w, length)
         if n > max_n:
             continue
