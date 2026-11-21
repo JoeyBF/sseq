@@ -1653,8 +1653,19 @@ fn seed_equations(
 }
 
 /// Writes, for every class with a non-zero target bidegree, whether the equations force its
-/// differential and to what, and prints a per-stem summary.
-fn solution(ext: &Ext, v: &Vars, pivot: &[u32], rows: &[Vec<u32>], path: &str, from_stem: i32) {
+/// differential and to what, and prints a per-stem summary. With `mod_prefix`, also writes each
+/// module's d2 in the same format to `<mod_prefix>_<name>.csv`, targets over the module basis.
+#[allow(clippy::too_many_arguments)]
+fn solution(
+    ext: &Ext,
+    mods: &[Module],
+    v: &Vars,
+    pivot: &[u32],
+    rows: &[Vec<u32>],
+    path: &str,
+    from_stem: i32,
+    mod_prefix: Option<&str>,
+) {
     use std::io::Write;
     let n = v.n as usize;
     let pivcols: Vec<u32> = (0..v.n)
@@ -1731,6 +1742,37 @@ fn solution(ext: &Ext, v: &Vars, pivot: &[u32], rows: &[Vec<u32>], path: &str, f
         tz,
         tc - td
     );
+    let Some(prefix) = mod_prefix else { return };
+    for (mi, m) in mods.iter().enumerate() {
+        let mut w =
+            std::io::BufWriter::new(File::create(format!("{prefix}_{}.csv", m.name)).unwrap());
+        writeln!(w, "stem,Adams_filtration,index,status,target").unwrap();
+        let (mut c, mut d) = (0, 0);
+        let mut bids: Vec<u32> = (0..m.deg.len() as u32)
+            .filter(|&b| m.prime(ext, b).is_some())
+            .collect();
+        bids.sort_by_key(|&b| m.deg[b as usize]);
+        for b in bids {
+            let (sn, sf) = m.deg[b as usize];
+            let dp = m.dim[m.prime(ext, b).unwrap() as usize];
+            for r in 0..m.dim[b as usize] {
+                let vs: Vec<usize> = (0..dp)
+                    .map(|k| mvar(ext, mods, v, mi, b, r, k) as usize)
+                    .collect();
+                let determined = vs.iter().all(|&x| !dep[x]);
+                let target: Vec<String> = vs.iter().map(|&x| (part[x] & 1).to_string()).collect();
+                c += 1;
+                d += determined as usize;
+                let status = if determined { "determined" } else { "open" };
+                writeln!(w, "{sn},{sf},{r},{status},\"[{}]\"", target.join(", ")).unwrap();
+            }
+        }
+        println!(
+            "module {} d2: {c} classes, {d} determined, {} open",
+            m.name,
+            c - d
+        );
+    }
 }
 
 fn main() {
@@ -1742,13 +1784,9 @@ fn main() {
     let ext = load(dir, n_max, f_max);
     let p = build_products(&ext);
     check_products(&ext, &p);
-    // --e3 <d2 file> [--seed-d3 f] [--check-d3 f] [--solution3 out]: d3 on E3 instead
-    if args.iter().any(|a| a == "--e3") {
-        if args.iter().any(|a| a == "--compare") {
-            page::run_joint(&ext, &p, &args);
-        } else {
-            page::run(&ext, &p, &args);
-        }
+    // --e3 <d2 files> [--compare ...] or --diagram <file>: d_r for r >= 3 instead
+    if args.iter().any(|a| a == "--e3" || a == "--diagram") {
+        page::run(&ext, &p, &args);
         return;
     }
     // --modules <dir> <name:shift,...>: two-cell complexes from ext's cofiber_export
@@ -1801,13 +1839,20 @@ fn main() {
     }
     // --solution <file> <from stem>
     if let Some(i) = args.iter().position(|a| a == "--solution") {
+        // --module-solution <prefix>: the modules' d2 as well
+        let mod_prefix = args
+            .iter()
+            .position(|a| a == "--module-solution")
+            .map(|k| args[k + 1].as_str());
         solution(
             &ext,
+            &mods,
             &v,
             &pivot,
             &rows,
             &args[i + 1],
             args[i + 2].parse().unwrap(),
+            mod_prefix,
         );
     }
     if let Some(i) = cert {
