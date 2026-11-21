@@ -25,6 +25,7 @@ use std::{
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 
+mod compare;
 mod page;
 
 type Mask = u32;
@@ -1776,6 +1777,11 @@ fn main() {
         );
         eqs.extend(se);
         origins.extend(so);
+    }
+    // --compare <ring dir> <iota csv> [--compare-solution out]: joint d2 with a comparison ring
+    if args.iter().any(|a| a == "--compare") {
+        compare::run(&ext, &v, eqs, gens_only, &args);
+        return;
     }
     if let Some(i) = args.iter().position(|a| a == "--check-d2") {
         check_d2(&ext, &v, &eqs, &args[i + 1]);

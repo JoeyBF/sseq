@@ -629,7 +629,7 @@ fn statement_equations(ext: &Ext, e3: &E3, st: &Statement) -> Result<Vec<Vec<u32
 
 /// Evaluates linear combinations of variables on the solution space: the value at the
 /// particular solution, and the free columns (by index among the free columns) it depends on.
-fn evaluate(
+pub(crate) fn evaluate(
     nvars: u32,
     pivot: &[u32],
     rows: &[Vec<u32>],
