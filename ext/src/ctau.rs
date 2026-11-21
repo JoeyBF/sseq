@@ -205,23 +205,37 @@ impl Coaction {
 impl QAlgebra {
     /// The monomials of degree at most `max_degree` and length at most `max_len`.
     pub fn new(max_degree: i32, max_len: u32) -> Self {
+        Self::quotient(max_degree, max_len, 0)
+    }
+
+    /// [`Self::new`] for the quotient $Q / (q_0, \dots, q_{n-1})$, for `n > 0`: the monomials
+    /// in $q_n, q_{n+1}, \dots$, and the coaction with every term in the ideal dropped.
+    ///
+    /// The ideal is invariant, so this is again an algebra over the Steenrod algebra; it is
+    /// the associated graded of $BP_*/I_n$. Since $q_0$ is killed nothing shortens a monomial:
+    /// each length is its own module.
+    pub fn quotient(max_degree: i32, max_len: u32, n: usize) -> Self {
         assert!(
             max_degree < q_degree(Q_VARS + 1) && max_degree < 1 << XI_BITS,
             "degree {max_degree} needs more than q_{Q_VARS}"
         );
         let mut by_degree = vec![Vec::new(); max_degree.max(0) as usize + 1];
         /// Chooses the exponent of `q_{i+1}`, then recurses downwards.
+        #[allow(clippy::too_many_arguments)]
         fn rec(
             i: usize,
             remaining: u32,
             degree: i32,
             max_degree: i32,
+            first: usize,
             current: &mut QMono,
             out: &mut Vec<Vec<QMono>>,
         ) {
             let d = q_degree(i + 1);
             let mut e = 0;
-            while e <= remaining && degree + e as i32 * d <= max_degree {
+            // q_{i+1} is killed when it comes before q_first
+            let most = if i + 1 < first { 0 } else { remaining };
+            while e <= most && degree + e as i32 * d <= max_degree {
                 current[i] = e as u16;
                 if i == 0 {
                     out[(degree + e as i32 * d) as usize].push(*current);
@@ -231,6 +245,7 @@ impl QAlgebra {
                         remaining - e,
                         degree + e as i32 * d,
                         max_degree,
+                        first,
                         current,
                         out,
                     );
@@ -244,6 +259,7 @@ impl QAlgebra {
             max_len,
             0,
             max_degree,
+            n,
             &mut [0; Q_VARS],
             &mut by_degree,
         );
@@ -252,9 +268,10 @@ impl QAlgebra {
         }
         let chi = conjugates(Q_VARS);
         let factors = (0..=Q_VARS)
-            .map(|n| {
-                (0..=n)
-                    .flat_map(|i| chi[n - i].iter().map(move |&m| (m << i, i)))
+            .map(|m| {
+                (0..=m)
+                    .filter(|&i| n == 0 || i >= n)
+                    .flat_map(|i| chi[m - i].iter().map(move |&x| (x << i, i)))
                     .collect()
             })
             .collect();

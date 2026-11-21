@@ -216,6 +216,7 @@ fn lazy(
     ops: &OpTable,
     max_n: i32,
     max_k: Option<u32>,
+    quotient: usize,
     specs: &str,
     options: LazyOptions,
 ) -> anyhow::Result<()> {
@@ -248,7 +249,7 @@ fn lazy(
     );
     let q_degree = max_n / 2 + 2;
     // with a bound on the Chow degree, only the monomials that short exist
-    let q = QAlgebra::new(q_degree, max_k.unwrap_or(q_degree as u32));
+    let q = QAlgebra::quotient(q_degree, max_k.unwrap_or(q_degree as u32), quotient);
     let start = Instant::now();
     let tables = OpTables::new(&q, &needed_operations(operations, &SHIFTS), q_degree);
     eprintln!(
@@ -287,11 +288,12 @@ fn lazy(
         &tables,
         Complex {
             max_k,
+            quotient,
             ..Complex::sphere()
         },
         max_n,
         None,
-        !names.is_empty(),
+        !names.is_empty() || quotient > 0,
         dir,
         &options,
     )?;
@@ -304,6 +306,7 @@ fn lazy(
             &tables,
             Complex {
                 max_k,
+                quotient,
                 ..complex(name)?
             },
             max_n,
@@ -365,6 +368,8 @@ fn main() -> anyhow::Result<()> {
         Ok::<_, anyhow::Error>(s.to_string())
     });
     let max_k: Option<u32> = (max_k != "-").then(|| max_k.parse()).transpose()?;
+    let quotient: usize =
+        query::with_default("Kill q_0, ..., q_{n-1} for n (0 for none)", "0", str::parse);
     std::fs::create_dir_all(&dir)?;
     if let Some(d) = &spill_dir {
         std::fs::create_dir_all(d)?;
@@ -387,6 +392,7 @@ fn main() -> anyhow::Result<()> {
             &ops,
             max_n,
             max_k,
+            quotient,
             &specs,
             LazyOptions {
                 in_flight,

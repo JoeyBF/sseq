@@ -479,6 +479,10 @@ pub struct Complex {
     /// Each polynomial degree is its own complex, so the bound is exact on what it keeps. A
     /// tower that would run past it shows up as a cocycle that never becomes a coboundary.
     pub max_k: Option<u32>,
+    /// `n` when the [`QAlgebra`] used is the quotient by $q_0, \dots, q_{n-1}$, and 0 for all
+    /// of $Q$. In a quotient no cochain is shorter than its source, so every class is a tower
+    /// of length one.
+    pub quotient: usize,
 }
 
 impl Complex {
@@ -490,6 +494,7 @@ impl Complex {
             actions: Vec::new(),
             attach: Vec::new(),
             max_k: None,
+            quotient: 0,
         }
     }
 
@@ -502,6 +507,7 @@ impl Complex {
             actions: Vec::new(),
             attach: vec![(1, 0)],
             max_k: None,
+            quotient: 0,
         }
     }
 
@@ -519,6 +525,7 @@ impl Complex {
             actions: vec![(1 << j, 1, 0)],
             attach: Vec::new(),
             max_k: None,
+            quotient: 0,
         }
     }
 }

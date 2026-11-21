@@ -293,6 +293,7 @@ impl Pass<'_> {
         for i in 0..red.towers.len() {
             let (birth, length) = red.tower(i);
             let length = match (length, self.cx.max_k) {
+                (NEVER, _) if self.cx.quotient > 0 => "1".to_string(),
                 // a tower still standing at the bound: its length is at least this
                 (NEVER, Some(k)) if (a, u) != (0, 0) => format!("{}+", k as i32 + 1 - birth as i32),
                 (NEVER, _) => "inf".to_string(),
@@ -306,7 +307,6 @@ impl Pass<'_> {
                 a + birth as i32
             )?;
         }
-        let mut ws = SparseWorkspace::new(0);
         let targets = |towers: Vec<u32>| -> String {
             let ids: Vec<String> = towers
                 .into_iter()
@@ -347,11 +347,15 @@ impl Pass<'_> {
                 ) {
                     columns[pos as usize] = column;
                 }
-                for (i, (column, birth, _)) in gens.iter().enumerate() {
+                let images = classes(red, gens.len(), |i| {
+                    let (column, birth, _) = &gens[i];
                     let entries = column
                         .iter()
-                        .flat_map(|&pos| columns[pos as usize].iter().copied());
-                    let image = red.class(&mut ws, entries, *birth);
+                        .flat_map(|&pos| columns[pos as usize].iter().copied())
+                        .collect();
+                    (entries, *birth)
+                });
+                for (i, image) in images.into_iter().enumerate() {
                     if !image.is_empty() {
                         writeln!(
                             rows.h,
@@ -370,12 +374,18 @@ impl Pass<'_> {
         // bottom cell: the same cochain on cell 0
         if let Some(gens) = base.spill.generators(a, u)? {
             let src = Space::new(self.bb, self.q, &base.cx, a, u);
-            for (i, (column, birth, _)) in gens.iter().enumerate() {
-                let entries = column.iter().map(|&pos| {
-                    let (_, t, x, m, _) = src.decode(self.q, pos);
-                    tgt.pos(self.q, 0, t, x, &m)
-                });
-                let image = red.class(&mut ws, entries, *birth);
+            let images = classes(red, gens.len(), |i| {
+                let (column, birth, _) = &gens[i];
+                let entries = column
+                    .iter()
+                    .map(|&pos| {
+                        let (_, t, x, m, _) = src.decode(self.q, pos);
+                        tgt.pos(self.q, 0, t, x, &m)
+                    })
+                    .collect();
+                (entries, *birth)
+            });
+            for (i, image) in images.into_iter().enumerate() {
                 if !image.is_empty() {
                     writeln!(rows.istar, "{},{}", tower_id(a, u, i), targets(image))?;
                 }
@@ -392,7 +402,7 @@ impl Pass<'_> {
             return Ok(());
         };
         let down = Space::new(self.bb, self.q, &base.cx, a2, u2);
-        for i in 0..red.towers.len() {
+        let images = classes(&below, red.towers.len(), |i| {
             let entries: Vec<u32> = red
                 .generator(i)
                 .iter()
@@ -402,11 +412,10 @@ impl Pass<'_> {
                 })
                 .collect();
             let level = red.tower(i).0 as i32 - dk;
-            if level < 0 {
-                assert!(entries.is_empty());
-                continue;
-            }
-            let image = below.class(&mut ws, entries, level as u16);
+            assert!(level >= 0 || entries.is_empty());
+            (entries, level.max(0) as u16)
+        });
+        for (i, image) in images.into_iter().enumerate() {
             if !image.is_empty() {
                 let ids: Vec<String> = image
                     .into_iter()
@@ -417,6 +426,31 @@ impl Pass<'_> {
         }
         Ok(())
     }
+}
+
+/// The classes in `red` of `count` cocycles, each given by `cocycle` as its entries and the
+/// level to take its class at, in parallel.
+fn classes(
+    red: &Reduced,
+    count: usize,
+    cocycle: impl Fn(usize) -> (Vec<u32>, u16) + Sync,
+) -> Vec<Vec<u32>> {
+    use maybe_rayon::prelude::*;
+    /// The cocycles one thread takes at a time, on one workspace.
+    const PIECE: usize = 16;
+    let pieces: Vec<Vec<Vec<u32>>> = (0..count.div_ceil(PIECE))
+        .into_maybe_par_iter()
+        .map(|p| {
+            let mut ws = SparseWorkspace::new(red.echelon.rows());
+            (p * PIECE..((p + 1) * PIECE).min(count))
+                .map(|i| {
+                    let (entries, level) = cocycle(i);
+                    red.class(&mut ws, entries, level)
+                })
+                .collect()
+        })
+        .collect();
+    pieces.into_iter().flatten().collect()
 }
 
 /// The rows of a bit set over `rows` positions that are pivots of `red`.
@@ -467,10 +501,17 @@ pub fn export(
         )),
         None => None,
     };
+    // q_n acts on the quotient by the q before it; reading it back needs the cocycles kept
+    let mut w_q = if cx.quotient > 0 && keep_echelons {
+        Some(open("q", "source,targets")?)
+    } else {
+        None
+    };
     let min_a = cx.min_a();
     // the lowest source filtration read at weight u, and one past the highest
     let a_lo = |u: i32| (2 * u - max_n - 1).max(min_a);
-    let bounded = cx.max_k.is_some();
+    // In a quotient, as with a bound, a cocycle that is no coboundary is not a reduced column.
+    let bounded = cx.max_k.is_some() || cx.quotient > 0;
     anyhow::ensure!(
         !bounded || cx.cells.iter().all(|c| c[2] == 0),
         "a bound on the polynomial degree needs cells that do not shift it"
@@ -620,6 +661,57 @@ pub fn export(
             if let Some((wi, wp)) = w_cells.as_mut() {
                 wi.write_all(rows.istar.as_bytes())?;
                 wp.write_all(rows.pstar.as_bytes())?;
+            }
+        }
+        // Multiplication by q_n, which is invariant in the quotient by the q before it: on
+        // cochains it multiplies the monomial. It maps within filtration a, whose cocycles are
+        // complete now, so it is read back.
+        if let Some(w) = w_q.as_mut() {
+            let n = cx.quotient;
+            let d = (1 << n) - 1;
+            let lines: Vec<anyhow::Result<String>> = (0..=max_n)
+                .collect::<Vec<i32>>()
+                .into_maybe_par_iter()
+                .map(|u| {
+                    use std::fmt::Write;
+                    let mut out = String::new();
+                    if !pass.in_range(a, u) || !pass.in_range(a, u - d) {
+                        return Ok(out);
+                    }
+                    let (Some(gens), Some(target)) =
+                        (spill.generators(a, u - d)?, spill.echelon(a, u)?)
+                    else {
+                        return Ok(out);
+                    };
+                    let src = Space::new(pass.bb, q, &cx, a, u - d);
+                    let tgt = Space::new(pass.bb, q, &cx, a, u);
+                    let mut ws = SparseWorkspace::new(0);
+                    for (i, (column, birth, _)) in gens.iter().enumerate() {
+                        if cx.max_k.is_some_and(|k| *birth as u32 >= k) {
+                            continue;
+                        }
+                        let entries: Vec<u32> = column
+                            .iter()
+                            .map(|&pos| {
+                                let (cell, t, x, mut m, _) = src.decode(q, pos);
+                                m[n - 1] += 1;
+                                tgt.pos(q, cell, t, x, &m)
+                            })
+                            .collect();
+                        let image = target.class(&mut ws, entries, birth + 1);
+                        if !image.is_empty() {
+                            let ids: Vec<String> = image
+                                .into_iter()
+                                .map(|t| tower_id(a, u, t as usize))
+                                .collect();
+                            writeln!(out, "{},{}", tower_id(a, u - d, i), ids.join(" "))?;
+                        }
+                    }
+                    Ok(out)
+                })
+                .collect();
+            for line in lines {
+                w.write_all(line?.as_bytes())?;
             }
         }
         cleared = next_cleared;
