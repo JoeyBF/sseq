@@ -217,47 +217,72 @@ fn lazy(
     max_n: i32,
     max_k: Option<u32>,
     quotient: usize,
+    ranks: Option<&std::path::Path>,
     specs: &str,
     options: LazyOptions,
 ) -> anyhow::Result<()> {
     let begin = Instant::now();
     let (max_a, max_t) = ScaledExt::backbone_range(max_n);
-    let source = BackboneSource::open(store, algebra, ops, max_a, &max_t)?;
-    // One pass over the backbone for the operations that occur; the terms are dropped.
-    let reach = ScaledExt::reach(max_n);
-    let found: Vec<anyhow::Result<(rustc_hash::FxHashMap<u128, i32>, usize)>> = (1..=max_a)
-        .into_maybe_par_iter()
-        .map(|a| {
-            let slice = source.slice(a)?;
-            let mut out = Default::default();
-            add_operations(&mut out, &slice, a, &reach);
-            Ok((out, slice.len()))
-        })
-        .collect();
-    let mut operations: rustc_hash::FxHashMap<u128, i32> = Default::default();
-    for f in found {
-        for (op, r) in f?.0 {
-            let slot = operations.entry(op).or_insert(i32::MIN);
-            *slot = (*slot).max(r);
+    let ranks = match ranks {
+        Some(path) => {
+            let mut map = rustc_hash::FxHashMap::default();
+            for line in std::fs::read_to_string(path)?.lines().skip(1) {
+                let v: Vec<&str> = line.split(',').collect();
+                let (n, s, r): (i32, i32, u32) = (v[0].parse()?, v[1].parse()?, v[2].parse()?);
+                map.insert((s, n + s), r);
+            }
+            Some(map)
         }
-    }
-    eprintln!(
-        "backbone: {} operations: {:.1} s, peak {:.1} GB",
-        operations.len(),
-        begin.elapsed().as_secs_f64(),
-        peak_gb()
-    );
+        None => None,
+    };
+    let source = BackboneSource::open(store, algebra, ops, max_a, &max_t, ranks.as_ref())?;
     let q_degree = max_n / 2 + 2;
     // with a bound on the Chow degree, only the monomials that short exist
     let q = QAlgebra::quotient(q_degree, max_k.unwrap_or(q_degree as u32), quotient);
+    // The tables hold the operations that both occur in the backbone and act on a monomial.
+    // In a quotient by q_1 and more the monomials are few and their coactions short, so the
+    // tables are built from them alone and the backbone is filtered by the tables; otherwise
+    // one pass over the backbone lists its operations first, a few filtrations at a time.
+    let from_monomials = quotient >= 2;
     let start = Instant::now();
-    let tables = OpTables::new(&q, &needed_operations(operations, &SHIFTS), q_degree);
+    let tables = if from_monomials {
+        OpTables::new(&q, None, q_degree)
+    } else {
+        let reach = ScaledExt::reach(max_n);
+        let mut operations: rustc_hash::FxHashMap<u128, i32> = Default::default();
+        for chunk in (1..=max_a).collect::<Vec<i32>>().chunks(8) {
+            let found: Vec<anyhow::Result<rustc_hash::FxHashMap<u128, i32>>> = chunk
+                .to_vec()
+                .into_maybe_par_iter()
+                .map(|a| {
+                    let slice = source.slice(a, &|_| true)?;
+                    let mut out = Default::default();
+                    add_operations(&mut out, &slice, a, &reach);
+                    Ok(out)
+                })
+                .collect();
+            for f in found {
+                for (op, r) in f? {
+                    let slot = operations.entry(op).or_insert(i32::MIN);
+                    *slot = (*slot).max(r);
+                }
+            }
+        }
+        eprintln!(
+            "backbone: {} operations: {:.1} s, peak {:.1} GB",
+            operations.len(),
+            begin.elapsed().as_secs_f64(),
+            peak_gb()
+        );
+        OpTables::new(&q, Some(&needed_operations(operations, &SHIFTS)), q_degree)
+    };
     eprintln!(
         "operation tables: {} entries: {:.1} s, peak {:.1} GB",
         tables.entries(),
         start.elapsed().as_secs_f64(),
         peak_gb()
     );
+    let keep = |op: u128| !from_monomials || tables.relevant(op, &SHIFTS);
     let names: Vec<&str> = specs
         .split(',')
         .filter(|s| !s.is_empty() && *s != "-")
@@ -294,6 +319,7 @@ fn lazy(
         max_n,
         None,
         !names.is_empty() || quotient > 0,
+        &keep,
         dir,
         &options,
     )?;
@@ -312,6 +338,7 @@ fn lazy(
             max_n,
             Some(&ctau),
             false,
+            &keep,
             dir,
             &options,
         )?;
@@ -370,6 +397,12 @@ fn main() -> anyhow::Result<()> {
     let max_k: Option<u32> = (max_k != "-").then(|| max_k.parse()).transpose()?;
     let quotient: usize =
         query::with_default("Kill q_0, ..., q_{n-1} for n (0 for none)", "0", str::parse);
+    let ranks: String = query::with_default(
+        "Ranks of the backbone as stem,filtration,rank (- to read the save)",
+        "-",
+        |s| Ok::<_, anyhow::Error>(s.to_string()),
+    );
+    let ranks = (ranks != "-").then(|| PathBuf::from(ranks));
     std::fs::create_dir_all(&dir)?;
     if let Some(d) = &spill_dir {
         std::fs::create_dir_all(d)?;
@@ -393,6 +426,7 @@ fn main() -> anyhow::Result<()> {
             max_n,
             max_k,
             quotient,
+            ranks.as_deref(),
             &specs,
             LazyOptions {
                 in_flight,
@@ -414,7 +448,10 @@ fn main() -> anyhow::Result<()> {
     // the shifts are those of h_1, ..., h_4, the cell actions of the Hopf cofibers, and their sums
     let tables = OpTables::new(
         &q,
-        &needed_operations(bb.operations(ScaledExt::reach(max_n)), &SHIFTS),
+        Some(&needed_operations(
+            bb.operations(ScaledExt::reach(max_n)),
+            &SHIFTS,
+        )),
         q_degree,
     );
     q.clear_memo();

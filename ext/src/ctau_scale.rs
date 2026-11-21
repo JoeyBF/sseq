@@ -123,12 +123,17 @@ pub struct BackboneSource<'a> {
 impl<'a> BackboneSource<'a> {
     /// Reads the generators of $P_a$ for `a <= max_a` in degrees up to `max_t(a + 1)`, where
     /// `max_t` must not decrease. Fails, rather than resolve, if the save lacks a bidegree.
+    ///
+    /// With `ranks`, the number of generators by (filtration, degree), nothing is read here:
+    /// the save holds the count at the head of each differential, and a differential at a high
+    /// stem is large. [`Self::slice`] checks the counts it meets.
     pub fn open(
         store: &'a ZarrSaveStore,
         algebra: &Arc<MilnorAlgebra>,
         ops: &'a OpTable,
         max_a: i32,
         max_t: impl Fn(i32) -> i32 + Sync + 'a,
+        ranks: Option<&FxHashMap<(i32, i32), u32>>,
     ) -> anyhow::Result<Self> {
         use maybe_rayon::prelude::*;
         algebra.compute_basis(max_t(max_a + 1));
@@ -143,6 +148,8 @@ impl<'a> BackboneSource<'a> {
                             0
                         } else if t == a {
                             1
+                        } else if let Some(ranks) = ranks {
+                            ranks.get(&(a, t)).copied().unwrap_or(0)
                         } else {
                             (&blob(store, a, t)?[..]).read_u64::<LittleEndian>()? as u32
                         })
@@ -175,9 +182,11 @@ impl<'a> BackboneSource<'a> {
             .map_or(0, |&n| n as usize)
     }
 
-    /// The differentials of $P_a$, read off the save.
-    pub fn slice(&self, a: i32) -> anyhow::Result<Slice> {
-        let mut by_gen: FxHashMap<(u16, u32), Vec<InvTerm>> = FxHashMap::default();
+    /// The differentials of $P_a$, read off the save, keeping only the terms $P(R) x$ with
+    /// `keep(R)`: a term whose operation acts by zero on everything it could meet need not be
+    /// held, and at high stems most do.
+    pub fn slice(&self, a: i32, keep: &(dyn Fn(PackedXi) -> bool + Sync)) -> anyhow::Result<Slice> {
+        use maybe_rayon::prelude::*;
         if a <= 0 || a > self.max_a() {
             return Ok(Slice::default());
         }
@@ -187,40 +196,65 @@ impl<'a> BackboneSource<'a> {
             target.add_generators(t as i32, n as usize, None);
         }
         target.compute_basis(max_t);
-        for t in a..=max_t {
-            if self.gens[a as usize][t as usize] == 0 {
-                continue;
-            }
-            if t == a {
-                by_gen.entry((a as u16 - 1, 0)).or_default().push(InvTerm {
-                    op: 1,
-                    t: t as u16,
-                    l: 0,
-                });
-                continue;
-            }
-            let data = blob(self.store, a, t)?;
-            let mut cursor = &data[..];
-            let n = cursor.read_u64::<LittleEndian>()? as usize;
-            let dim = cursor.read_u64::<LittleEndian>()? as usize;
-            anyhow::ensure!(
-                dim <= target.dimension(t),
-                "({a}, {t}): saved dimension {dim} exceeds {}",
-                target.dimension(t)
-            );
-            for l in 0..n {
-                let v = FpVector::from_bytes(TWO, dim, &mut cursor)?;
-                for (idx, _) in v.iter_nonzero() {
-                    let og = target.index_to_op_gen(t, idx);
-                    by_gen
-                        .entry((og.generator_degree as u16, og.generator_index as u32))
-                        .or_default()
-                        .push(InvTerm {
-                            op: self.ops.pack(og.operation_degree, og.operation_index),
-                            t: t as u16,
-                            l: l as u32,
-                        });
+        // each degree as (generator landed on, term), read in parallel
+        let read: Vec<anyhow::Result<Vec<((u16, u32), InvTerm)>>> = (a..=max_t)
+            .into_maybe_par_iter()
+            .map(|t| {
+                let mut out = Vec::new();
+                if self.gens[a as usize][t as usize] == 0 {
+                    return Ok(out);
                 }
+                if t == a {
+                    if keep(1) {
+                        out.push((
+                            (a as u16 - 1, 0),
+                            InvTerm {
+                                op: 1,
+                                t: t as u16,
+                                l: 0,
+                            },
+                        ));
+                    }
+                    return Ok(out);
+                }
+                let data = blob(self.store, a, t)?;
+                let mut cursor = &data[..];
+                let n = cursor.read_u64::<LittleEndian>()? as usize;
+                let dim = cursor.read_u64::<LittleEndian>()? as usize;
+                anyhow::ensure!(
+                    n == self.gens[a as usize][t as usize] as usize,
+                    "({a}, {t}): the save has {n} generators, the ranks {}",
+                    self.gens[a as usize][t as usize]
+                );
+                anyhow::ensure!(
+                    dim <= target.dimension(t),
+                    "({a}, {t}): saved dimension {dim} exceeds {}",
+                    target.dimension(t)
+                );
+                for l in 0..n {
+                    let v = FpVector::from_bytes(TWO, dim, &mut cursor)?;
+                    for (idx, _) in v.iter_nonzero() {
+                        let og = target.index_to_op_gen(t, idx);
+                        let op = self.ops.pack(og.operation_degree, og.operation_index);
+                        if keep(op) {
+                            out.push((
+                                (og.generator_degree as u16, og.generator_index as u32),
+                                InvTerm {
+                                    op,
+                                    t: t as u16,
+                                    l: l as u32,
+                                },
+                            ));
+                        }
+                    }
+                }
+                Ok(out)
+            })
+            .collect();
+        let mut by_gen: FxHashMap<(u16, u32), Vec<InvTerm>> = FxHashMap::default();
+        for terms in read {
+            for (key, term) in terms? {
+                by_gen.entry(key).or_default().push(term);
             }
         }
         Ok(by_gen
@@ -294,10 +328,10 @@ impl StreamedBackbone {
         max_t: impl Fn(i32) -> i32 + Sync,
     ) -> anyhow::Result<Self> {
         use maybe_rayon::prelude::*;
-        let source = BackboneSource::open(store, algebra, ops, max_a, max_t)?;
+        let source = BackboneSource::open(store, algebra, ops, max_a, max_t, None)?;
         let inv: Vec<anyhow::Result<Slice>> = (0..=max_a)
             .into_maybe_par_iter()
-            .map(|a| source.slice(a))
+            .map(|a| source.slice(a, &|_| true))
             .collect();
         let inv: Vec<Slice> = inv.into_iter().collect::<anyhow::Result<_>>()?;
         let terms = inv
@@ -375,6 +409,8 @@ pub struct OpTables {
     /// For each degree, the nonzero $P(R) \cdot m \ni m'$ as the positions of $m$ and $m'$ in
     /// their degrees, by operation and then by $m$.
     pairs: Vec<Vec<[u16; 2]>>,
+    /// The operations that act in some degree.
+    acting: FxHashSet<PackedXi>,
     entries: usize,
 }
 
@@ -385,7 +421,10 @@ impl OpTables {
     ///
     /// The coaction on each monomial is computed, filtered and dropped; nothing of it is kept
     /// but the table.
-    pub fn new(q: &QAlgebra, needed: &FxHashMap<PackedXi, i32>, max_degree: i32) -> Self {
+    ///
+    /// Without `needed`, every operation that acts is kept: the tables then depend on the
+    /// monomials alone, which is the cheaper side when they are few (a quotient of $Q$).
+    pub fn new(q: &QAlgebra, needed: Option<&FxHashMap<PackedXi, i32>>, max_degree: i32) -> Self {
         use maybe_rayon::prelude::*;
         let mut index = Vec::new();
         let mut pairs = Vec::new();
@@ -397,7 +436,7 @@ impl OpTables {
                 .into_maybe_par_iter()
                 .map(|idx| {
                     q.coaction_filtered(&monos[idx], |r| {
-                        needed.get(&r).is_some_and(|&reach| e <= reach)
+                        needed.is_none_or(|n| n.get(&r).is_some_and(|&reach| e <= reach))
                     })
                     .into_iter()
                     .map(|(r, g)| (r, q.index(&g) as u16))
@@ -420,9 +459,11 @@ impl OpTables {
             index.push(table);
             pairs.push(all.into_iter().map(|x| [x.1, x.2]).collect());
         }
+        let acting = index.iter().flat_map(|t| t.keys().copied()).collect();
         Self {
             index,
             pairs,
+            acting,
             entries,
         }
     }
@@ -438,6 +479,14 @@ impl OpTables {
     /// The number of entries over every degree and operation.
     pub fn entries(&self) -> usize {
         self.entries
+    }
+
+    /// Whether $P(R)$, or $P(R - S)$ for one of `shifts`, acts on some monomial held.
+    pub fn relevant(&self, r: PackedXi, shifts: &[PackedXi]) -> bool {
+        self.acting.contains(&r)
+            || shifts
+                .iter()
+                .any(|&s| fits(s, r) && self.acting.contains(&(r - s)))
     }
 }
 

@@ -471,7 +471,8 @@ fn pivots(red: &Reduced) -> Vec<u64> {
 /// yields are computed while they are in memory, and they are written to the spill file and
 /// dropped. What stays in memory between filtrations is one bit per cochain (the pivots, which
 /// the next filtration skips). A map out of a filtration reads the generators back; the top
-/// cell reads the sphere's cocycles back.
+/// cell reads the sphere's cocycles back. `keep` says which terms of the differentials to hold
+/// (see [`BackboneSource::slice`]).
 #[allow(clippy::too_many_arguments)]
 pub fn export(
     q: &QAlgebra,
@@ -481,6 +482,7 @@ pub fn export(
     max_n: i32,
     base: Option<&Exported>,
     keep_echelons: bool,
+    keep: &(dyn Fn(crate::ctau::PackedXi) -> bool + Sync),
     dir: &Path,
     options: &LazyOptions,
 ) -> anyhow::Result<(Exported, LazyStats)> {
@@ -542,7 +544,7 @@ pub fn export(
         for &da in &shifts {
             for f in lowest + da..=a + da + 1 {
                 if !slices.contains_key(&f) {
-                    slices.insert(f, Arc::new(source.slice(f)?));
+                    slices.insert(f, Arc::new(source.slice(f, keep)?));
                 }
             }
         }
