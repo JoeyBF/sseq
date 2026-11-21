@@ -1289,6 +1289,85 @@ fn eliminate(
     (pivot, rows, prov, contradictions)
 }
 
+/// Expresses the sum of the variables `q` through the free columns: reduces by pivot rows,
+/// smallest pivot column first (a pivot row's other entries are at larger columns). The result
+/// holds free columns and possibly the constant column `n`.
+fn reduce_to_free(n: u32, pivot: &[u32], rows: &[Vec<u32>], q: &[u32]) -> Vec<u32> {
+    let mut s: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
+    let toggle = |s: &mut std::collections::BTreeSet<u32>, y: u32| {
+        if !s.remove(&y) {
+            s.insert(y);
+        }
+    };
+    for &y in q {
+        toggle(&mut s, y);
+    }
+    let mut cur = 0;
+    while let Some(&c) = s
+        .range(cur..)
+        .find(|&&c| c != n && pivot[c as usize] != u32::MAX)
+    {
+        for &y in &rows[pivot[c as usize] as usize] {
+            toggle(&mut s, y);
+        }
+        cur = c + 1;
+    }
+    s.into_iter().collect()
+}
+
+/// Whether each variable depends on some free column, in one back-substitution pass instead of
+/// one per 64 free columns. Each free column gets a pseudo-random 64-bit tag; a variable's
+/// fingerprint is the XOR of the tags of the free columns in its expression, so a non-zero
+/// fingerprint proves dependence. An OR pass over the same rows proves independence. The few
+/// variables on which the two disagree (cancellation, or a 2^-64 fingerprint collision) are
+/// reduced exactly, so the answer is exact.
+fn dependence(n: u32, pivot: &[u32], rows: &[Vec<u32>]) -> Vec<bool> {
+    let t = Instant::now();
+    let mix = |mut z: u64| {
+        // splitmix64
+        z = z.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        z ^ (z >> 31)
+    };
+    let mut reach = vec![false; n as usize + 1];
+    let mut tag = vec![0u64; n as usize + 1];
+    for c in 0..n {
+        if pivot[c as usize] == u32::MAX {
+            reach[c as usize] = true;
+            tag[c as usize] = mix(c as u64) | 1;
+        }
+    }
+    for p in (0..n).rev().filter(|&c| pivot[c as usize] != u32::MAX) {
+        let r = &rows[pivot[p as usize] as usize];
+        let (mut any, mut h) = (false, 0u64);
+        for &c in &r[1..] {
+            any |= reach[c as usize];
+            h ^= tag[c as usize];
+        }
+        reach[p as usize] = any;
+        tag[p as usize] = h;
+    }
+    let unsure: Vec<u32> = (0..n)
+        .filter(|&x| reach[x as usize] && tag[x as usize] == 0)
+        .collect();
+    let exact: Vec<bool> = unsure
+        .par_iter()
+        .map(|&x| reduce_to_free(n, pivot, rows, &[x]).iter().any(|&c| c != n))
+        .collect();
+    let mut dep: Vec<bool> = (0..=n as usize).map(|x| tag[x] != 0).collect();
+    for (&x, e) in unsure.iter().zip(exact) {
+        dep[x as usize] = e;
+    }
+    dep[n as usize] = false;
+    eprintln!(
+        "dependence: one pass, {} cancellations resolved exactly, {:.1}s",
+        unsure.len(),
+        t.elapsed().as_secs_f64()
+    );
+    dep
+}
+
 /// Number of nonzero coordinates of each vector of the reduced basis of the kernel: the vector of a
 /// free column is 1 there, 0 on the other free columns, and solved on the pivots. Lanes of 64 free
 /// columns are back-substituted at once.
@@ -1726,24 +1805,7 @@ fn solution(ext: &Ext, v: &Vars, pivot: &[u32], rows: &[Vec<u32>], path: &str, f
     let mut part = vec![0u64; n + 1];
     part[n] = 1;
     back(&mut part);
-    // dependence on the free columns, 64 at a time
-    let free: Vec<u32> = (0..v.n)
-        .filter(|&c| pivot[c as usize] == u32::MAX)
-        .collect();
-    let dep: Vec<bool> = free
-        .par_chunks(64)
-        .map(|chunk| {
-            let mut val = vec![0u64; n + 1];
-            for (l, &f) in chunk.iter().enumerate() {
-                val[f as usize] = 1 << l;
-            }
-            back(&mut val);
-            val.iter().map(|&x| x != 0).collect::<Vec<bool>>()
-        })
-        .reduce(
-            || vec![false; n + 1],
-            |a, b| a.iter().zip(&b).map(|(x, y)| x | y).collect(),
-        );
+    let dep = dependence(v.n, pivot, rows);
     let mut w = std::io::BufWriter::new(File::create(path).unwrap());
     writeln!(w, "stem,Adams_filtration,index,status,target").unwrap();
     // stem -> (classes, determined, determined non-zero)
@@ -1972,28 +2034,9 @@ fn main() {
             .collect();
         let c = ext.get(q[0], q[1]).unwrap();
         let x = var(&ext, &v, c, q[2] as usize, q[3] as usize);
-        let free: Vec<u32> = (0..v.n)
-            .filter(|&c| pivot[c as usize] == u32::MAX)
-            .collect();
-        let deps: Vec<u32> = free
-            .par_chunks(64)
-            .flat_map_iter(|chunk| {
-                let mut val = vec![0u64; v.n as usize + 1];
-                for (l, &f) in chunk.iter().enumerate() {
-                    val[f as usize] = 1 << l;
-                }
-                for p in (0..v.n).rev().filter(|&c| pivot[c as usize] != u32::MAX) {
-                    let r = &rows[pivot[p as usize] as usize];
-                    val[p as usize] = r[1..].iter().fold(0, |acc, &c| acc ^ val[c as usize]);
-                }
-                let m = val[x as usize];
-                chunk
-                    .iter()
-                    .enumerate()
-                    .filter(move |&(l, _)| m >> l & 1 == 1)
-                    .map(|(_, &f)| f)
-                    .collect::<Vec<_>>()
-            })
+        let deps: Vec<u32> = reduce_to_free(v.n, &pivot, &rows, &[x])
+            .into_iter()
+            .filter(|&c| c != v.n)
             .collect();
         let name = |y: u32| {
             let (c, _) = v
