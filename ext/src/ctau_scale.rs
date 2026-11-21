@@ -226,13 +226,20 @@ impl StreamedBackbone {
         self.terms
     }
 
-    /// Every operation that occurs in a differential.
-    pub fn operations(&self) -> FxHashSet<PackedXi> {
-        self.inv
-            .iter()
-            .flat_map(|m| m.values())
-            .flat_map(|g| g.ops.iter().map(|x| x.0))
-            .collect()
+    /// Every operation that occurs in a differential, with the largest of `reach(g, t)` over
+    /// the generators of $P_g$ of degree `t` it lands on.
+    pub fn operations(&self, reach: impl Fn(i32, i32) -> i32) -> FxHashMap<PackedXi, i32> {
+        let mut out: FxHashMap<PackedXi, i32> = FxHashMap::default();
+        for (a, m) in self.inv.iter().enumerate() {
+            for (&(t, _), g) in m {
+                let r = reach(a as i32 - 1, t as i32);
+                for x in &g.ops {
+                    let slot = out.entry(x.0).or_insert(i32::MIN);
+                    *slot = (*slot).max(r);
+                }
+            }
+        }
+        out
     }
 }
 
@@ -242,7 +249,9 @@ impl StreamedBackbone {
 /// The coboundary of a whole block of cochains (one generator, every monomial of one degree) is
 /// read off these by walking the operations that land on the generator, so that building a
 /// coboundary costs its number of entries rather than a search per cochain. The coaction on a
-/// monomial has far more terms than the backbone has operations, and only the latter are kept.
+/// monomial has far more terms than the backbone has operations, and only the latter are kept,
+/// and only in the degrees where a generator they land on carries monomials: the monomials of
+/// high degree sit on the generators of low degree, which few operations reach.
 pub struct OpTables {
     /// For each degree, each operation $P(R)$ with the nonzero $P(R) \cdot m \ni m'$ as (position
     /// of $m$, position of $m'$ in its degree, length of $m'$), sorted by $m$.
@@ -252,18 +261,27 @@ pub struct OpTables {
 
 impl OpTables {
     /// The tables through `max_degree` for the operations of `bb`, and for each of them with
-    /// each of `shifts` taken off, as the cell actions and cup products do.
-    pub fn new(q: &QAlgebra, bb: &StreamedBackbone, shifts: &[PackedXi], max_degree: i32) -> Self {
+    /// each of `shifts` taken off, as the cell actions and cup products do. An operation is kept
+    /// in the degrees up to the largest `reach(g, t)` over the generators of $P_g$ of degree `t`
+    /// that it lands on: the largest degree of the monomials such a generator carries.
+    pub fn new(
+        q: &QAlgebra,
+        bb: &StreamedBackbone,
+        shifts: &[PackedXi],
+        max_degree: i32,
+        reach: impl Fn(i32, i32) -> i32,
+    ) -> Self {
         use maybe_rayon::prelude::*;
-        let mut needed = bb.operations();
-        for op in needed.clone() {
+        let mut needed = bb.operations(reach);
+        for (op, r) in needed.clone() {
             for &s in shifts {
                 if fits(s, op) {
-                    needed.insert(op - s);
+                    let slot = needed.entry(op - s).or_insert(i32::MIN);
+                    *slot = (*slot).max(r);
                 }
             }
         }
-        needed.insert(0);
+        needed.insert(0, i32::MAX);
         let mut by_degree = Vec::new();
         let mut entries = 0;
         for e in 0..=max_degree {
@@ -274,7 +292,7 @@ impl OpTables {
                     let psi = q.coaction(&monos[idx]);
                     let mut kept = Vec::new();
                     for (r, gammas) in psi.iter() {
-                        if needed.contains(&r) {
+                        if needed.get(&r).is_some_and(|&reach| e <= reach) {
                             kept.extend(gammas.iter().map(|&(g, len)| (r, g, len)));
                         }
                     }
@@ -957,6 +975,14 @@ impl ScaledExt {
         let k = self.keys.partition_point(|key| self.first[key] <= id) - 1;
         let (a, u) = self.keys[k];
         (a, u, (id - self.first[&(a, u)]) as usize)
+    }
+
+    /// The largest degree of the monomials that a generator of $P_g$ of degree `t` carries in
+    /// any cochain space read for stems up to `max_n`, for [`OpTables::new`].
+    pub fn reach(max_n: i32) -> impl Fn(i32, i32) -> i32 {
+        // a space at filtration a and weight u is read when 2u - a <= max_n + 1, and the
+        // generator sits in filtration a or, on a cell shifted down, a + 1
+        move |g, t| (max_n + 1 + g) / 2 - t
     }
 
     /// The filtrations and weights held, by stem and then filtration.

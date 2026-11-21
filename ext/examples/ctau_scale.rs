@@ -241,7 +241,13 @@ fn main() -> anyhow::Result<()> {
     q.set_memo_limit(1 << 31);
     let start = Instant::now();
     // the shifts are those of h_1, ..., h_4, the cell actions of the Hopf cofibers, and their sums
-    let tables = OpTables::new(&q, &bb, &[1, 2, 3, 4, 5, 6, 8, 9, 10, 12], q_degree);
+    let tables = OpTables::new(
+        &q,
+        &bb,
+        &[1, 2, 3, 4, 5, 6, 8, 9, 10, 12],
+        q_degree,
+        ScaledExt::reach(max_n),
+    );
     q.clear_memo();
     eprintln!(
         "operation tables: {} entries: {:.1} s, peak {:.1} GB",
