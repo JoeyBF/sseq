@@ -17,8 +17,9 @@ enum Image {
 
 /// Solves for a ring map `iota: Ext(S) -> Ext(R)` on E2 above the stems where it is given.
 ///
-/// `--solve-map <ring dir> <seed csv> <seed max stem> <out prefix>`: the seed (in the format of
-/// `compare::load_iota`) is trusted through `seed max stem`; above it every coordinate of
+/// `--solve-map <ring dir> <seed csv> <seed max stem> <out prefix> [--seed-max-f F]`: the seed (in
+/// the format of `compare::load_iota`) is trusted through `seed max stem` and filtration `F`;
+/// outside that every coordinate of
 /// `iota(x)` is an unknown. Each product `g x` of a sphere indecomposable `g` and a basis class `x`
 /// gives `iota(g x) = iota(g) iota(x)`, linear whenever `iota(g)` or `iota(x)` is known, which is
 /// every product below twice the seed's range. Writes `<out prefix>.csv` (determined images, in
@@ -29,6 +30,11 @@ pub(crate) fn run(ext: &Ext, args: &[String]) {
     let i = args.iter().position(|a| a == "--solve-map").unwrap();
     let (dir, seed_path, out) = (&args[i + 1], &args[i + 2], &args[i + 4]);
     let seed_max: i32 = args[i + 3].parse().unwrap();
+    // --seed-max-f F: the seed only covers filtrations <= F
+    let seed_max_f: i32 = args
+        .iter()
+        .position(|a| a == "--seed-max-f")
+        .map_or(i32::MAX, |j| args[j + 1].parse().unwrap());
     let rb = load(dir, ext.n_max, ext.f_max);
     let pb = build_products(&rb);
     check_products(&rb, &pb);
@@ -44,7 +50,7 @@ pub(crate) fn run(ext: &Ext, args: &[String]) {
         let Some(tb) = rb.get(n, f) else { continue };
         for k in 0..ext.dim[b as usize] {
             let g = ext.gid(b, k) as usize;
-            image[g] = Some(if n <= seed_max {
+            image[g] = Some(if n <= seed_max && f <= seed_max_f {
                 Image::Known(seed.get(&(n, f, k)).copied().unwrap_or(0))
             } else {
                 unknown.push((b, k, tb));

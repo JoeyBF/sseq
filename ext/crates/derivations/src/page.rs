@@ -301,15 +301,18 @@ struct Edge {
     to: usize,
     /// stem of the image minus stem of the source
     stem: i32,
-    /// source global basis id -> image over the target basis
+    /// source global basis id -> image over the target basis (absent: zero)
     img: FxHashMap<u32, V>,
+    /// source global basis ids whose image is not known
+    unknown: rustc_hash::FxHashSet<u32>,
 }
 
 impl Edge {
-    /// Image of an E2 vector of source bidegree `b`.
-    fn apply(&self, x: &Node, b: u32, v: V) -> V {
-        bits(v).fold(0, |acc, i| {
-            acc ^ self.img.get(&x.gid(b, i)).copied().unwrap_or(0)
+    /// Image of an E2 vector of source bidegree `b`, unless it involves an unknown image.
+    fn apply(&self, x: &Node, b: u32, v: V) -> Option<V> {
+        bits(v).try_fold(0, |acc, i| {
+            let g = x.gid(b, i);
+            (!self.unknown.contains(&g)).then(|| acc ^ self.img.get(&g).copied().unwrap_or(0))
         })
     }
 }
@@ -1024,7 +1027,7 @@ fn map_equations(
                 .pg(t)
                 .treps
                 .iter()
-                .map(|&z| ey.pg(yt).tgt.project(edge.apply(xn, t, z)))
+                .map(|&z| edge.apply(xn, t, z).and_then(|v| ey.pg(yt).tgt.project(v)))
                 .collect(),
         };
         let Some(t_images) = t_images else {
@@ -1034,7 +1037,7 @@ fn map_equations(
         for (k, &x) in ex.pg(c).reps.iter().enumerate() {
             let src = match yb {
                 None => 0,
-                Some(yb) => match ey.pg(yb).src.project(edge.apply(xn, c, x)) {
+                Some(yb) => match edge.apply(xn, c, x).and_then(|v| ey.pg(yb).src.project(v)) {
                     Some(s) => s,
                     None => {
                         dropped += 1;
@@ -1564,12 +1567,30 @@ pub(crate) fn run(ext: &Ext, p: &Products, args: &[String]) {
                 img.insert(nodes[x].gid(b, i), v as V);
             }
         }
+        // a `--solve-map` map lists its open classes in `<map>_status.csv`
+        let mut unknown = rustc_hash::FxHashSet::default();
+        let status = format!("{}_status.csv", path.trim_end_matches(".csv"));
+        if let Ok(file) = File::open(&status) {
+            for line in BufReader::new(file).lines().skip(1) {
+                let line = line.unwrap();
+                let w: Vec<&str> = line.splitn(5, ',').collect();
+                if w[3] != "open" {
+                    continue;
+                }
+                let (n, f): (i32, i32) = (w[0].parse().unwrap(), w[1].parse().unwrap());
+                if let Some(b) = nodes[x].get(n, f) {
+                    unknown.insert(nodes[x].gid(b, w[2].parse().unwrap()));
+                }
+            }
+            eprintln!("{from}->{to}: {} classes with unknown image", unknown.len());
+        }
         edges.push(Edge {
             name: format!("{from}->{to}"),
             from: x,
             to: y,
             stem: 0,
             img,
+            unknown,
         });
     }
     for (mi, m) in mods.iter().enumerate() {
@@ -1580,6 +1601,7 @@ pub(crate) fn run(ext: &Ext, p: &Products, args: &[String]) {
             to: x,
             stem: 0,
             img: m.istar.clone(),
+            unknown: Default::default(),
         });
         edges.push(Edge {
             name: format!("p:{}->{}", m.name, names[ring]),
@@ -1587,6 +1609,7 @@ pub(crate) fn run(ext: &Ext, p: &Products, args: &[String]) {
             to: ring,
             stem: -m.shift,
             img: m.pstar.iter().map(|(&k, &v)| (k, v as V)).collect(),
+            unknown: Default::default(),
         });
     }
     let d2s: Vec<FxHashMap<u32, V>> = nodes
