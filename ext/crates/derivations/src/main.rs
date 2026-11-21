@@ -27,6 +27,7 @@ use rustc_hash::FxHashMap;
 
 mod compare;
 mod page;
+mod propagate;
 
 type Mask = u32;
 
@@ -1063,6 +1064,93 @@ struct Origin {
     k: u8,
 }
 
+/// The Leibniz equations `d(e_i e_j) = d(e_i) e_j + e_i d(e_j)` for one pair of bidegrees.
+fn pair_equations(
+    ext: &Ext,
+    p: &Products,
+    v: &Vars,
+    gens_only: bool,
+    a: u32,
+    b: u32,
+) -> Vec<(Vec<u32>, Origin)> {
+    // `A + B` may be zero-dimensional (`xy = 0` for degree reasons)
+    let c = ext.sum(a, b);
+    let cp = ext.sum_prime(a, b).unwrap();
+    let (da, db, dcp) = (
+        ext.dim[a as usize],
+        ext.dim[b as usize],
+        ext.dim[cp as usize],
+    );
+    let ap = ext.prime(a);
+    let bp = ext.prime(b);
+    let mut out = vec![];
+    for i in 0..da {
+        for j in 0..db {
+            if a == b && j < i {
+                continue;
+            }
+            if gens_only && !ext.indec[ext.gid(a, i) as usize] && !ext.indec[ext.gid(b, j) as usize]
+            {
+                continue;
+            }
+            let xy = if c.is_some() {
+                p.mul(ext, a, i, b, j)
+            } else {
+                0
+            };
+            for k in 0..dcp {
+                let mut eq: Vec<u32> = vec![];
+                // (e_i e_j) d^C
+                let mut m = xy;
+                while m != 0 {
+                    let r = m.trailing_zeros() as usize;
+                    m &= m - 1;
+                    eq.push(var(ext, v, c.unwrap(), r, k));
+                }
+                // d(e_i) e_j: sum_c x^A_{i,c} [e_c e_j]_k
+                if let Some(ap) = ap {
+                    for cc in 0..ext.dim[ap as usize] {
+                        if p.mul(ext, ap, cc, b, j) >> k & 1 == 1 {
+                            eq.push(var(ext, v, a, i, cc));
+                        }
+                    }
+                }
+                // e_i d(e_j)
+                if let Some(bp) = bp {
+                    for cc in 0..ext.dim[bp as usize] {
+                        if p.mul(ext, a, i, bp, cc) >> k & 1 == 1 {
+                            eq.push(var(ext, v, b, j, cc));
+                        }
+                    }
+                }
+                eq.sort_unstable();
+                // cancel pairs (a = b, i = j gives d(x^2) = 2 x d(x) = 0 terms)
+                let mut red: Vec<u32> = Vec::with_capacity(eq.len());
+                for x in eq {
+                    if red.last() == Some(&x) {
+                        red.pop();
+                    } else {
+                        red.push(x);
+                    }
+                }
+                if !red.is_empty() {
+                    out.push((
+                        red,
+                        Origin {
+                            a,
+                            b,
+                            i: i as u8,
+                            j: j as u8,
+                            k: k as u8,
+                        },
+                    ));
+                }
+            }
+        }
+    }
+    out
+}
+
 fn equations(ext: &Ext, p: &Products, v: &Vars, gens_only: bool) -> (Vec<Vec<u32>>, Vec<Origin>) {
     let t = Instant::now();
     let nb = ext.deg.len() as u32;
@@ -1073,86 +1161,7 @@ fn equations(ext: &Ext, p: &Products, v: &Vars, gens_only: bool) -> (Vec<Vec<u32
         .collect();
     let (eqs, origins): (Vec<Vec<u32>>, Vec<Origin>) = pairs
         .par_iter()
-        .flat_map_iter(|&(a, b)| {
-            // `A + B` may be zero-dimensional (`xy = 0` for degree reasons)
-            let c = ext.sum(a, b);
-            let cp = ext.sum_prime(a, b).unwrap();
-            let (da, db, dcp) = (
-                ext.dim[a as usize],
-                ext.dim[b as usize],
-                ext.dim[cp as usize],
-            );
-            let ap = ext.prime(a);
-            let bp = ext.prime(b);
-            let mut out = vec![];
-            for i in 0..da {
-                for j in 0..db {
-                    if a == b && j < i {
-                        continue;
-                    }
-                    if gens_only
-                        && !ext.indec[ext.gid(a, i) as usize]
-                        && !ext.indec[ext.gid(b, j) as usize]
-                    {
-                        continue;
-                    }
-                    let xy = if c.is_some() {
-                        p.mul(ext, a, i, b, j)
-                    } else {
-                        0
-                    };
-                    for k in 0..dcp {
-                        let mut eq: Vec<u32> = vec![];
-                        // (e_i e_j) d^C
-                        let mut m = xy;
-                        while m != 0 {
-                            let r = m.trailing_zeros() as usize;
-                            m &= m - 1;
-                            eq.push(var(ext, v, c.unwrap(), r, k));
-                        }
-                        // d(e_i) e_j: sum_c x^A_{i,c} [e_c e_j]_k
-                        if let Some(ap) = ap {
-                            for cc in 0..ext.dim[ap as usize] {
-                                if p.mul(ext, ap, cc, b, j) >> k & 1 == 1 {
-                                    eq.push(var(ext, v, a, i, cc));
-                                }
-                            }
-                        }
-                        // e_i d(e_j)
-                        if let Some(bp) = bp {
-                            for cc in 0..ext.dim[bp as usize] {
-                                if p.mul(ext, a, i, bp, cc) >> k & 1 == 1 {
-                                    eq.push(var(ext, v, b, j, cc));
-                                }
-                            }
-                        }
-                        eq.sort_unstable();
-                        // cancel pairs (a = b, i = j gives d(x^2) = 2 x d(x) = 0 terms)
-                        let mut red: Vec<u32> = Vec::with_capacity(eq.len());
-                        for x in eq {
-                            if red.last() == Some(&x) {
-                                red.pop();
-                            } else {
-                                red.push(x);
-                            }
-                        }
-                        if !red.is_empty() {
-                            out.push((
-                                red,
-                                Origin {
-                                    a,
-                                    b,
-                                    i: i as u8,
-                                    j: j as u8,
-                                    k: k as u8,
-                                },
-                            ));
-                        }
-                    }
-                }
-            }
-            out
-        })
+        .flat_map_iter(|&(a, b)| pair_equations(ext, p, v, gens_only, a, b))
         .unzip();
     let terms: usize = eqs.iter().map(|e| e.len()).sum();
     let mut hist = BTreeMap::new();
@@ -1168,6 +1177,45 @@ fn equations(ext: &Ext, p: &Products, v: &Vars, gens_only: bool) -> (Vec<Vec<u32
         hist
     );
     (eqs, origins)
+}
+
+/// The Leibniz equations of [`equations`], generated a chunk of bidegree pairs at a time and
+/// absorbed into `prop` as they come, so that they are never stored together.
+fn equations_into(
+    ext: &Ext,
+    p: &Products,
+    v: &Vars,
+    gens_only: bool,
+    prop: &mut propagate::Propagator,
+) {
+    /// Pairs of bidegrees generated together; a chunk's equations are the peak memory.
+    const PAIRS_PER_CHUNK: usize = 4096;
+    let t = Instant::now();
+    let nb = ext.deg.len() as u32;
+    let pairs: Vec<(u32, u32)> = (0..nb)
+        .flat_map(|a| (0..nb).map(move |b| (a, b)))
+        .filter(|&(a, b)| p.rank_of[a as usize] <= p.rank_of[b as usize])
+        .filter(|&(a, b)| ext.sum_prime(a, b).is_some())
+        .collect();
+    let mut total = 0usize;
+    for chunk in pairs.chunks(PAIRS_PER_CHUNK) {
+        let eqs: Vec<Vec<u32>> = chunk
+            .par_iter()
+            .flat_map_iter(|&(a, b)| {
+                pair_equations(ext, p, v, gens_only, a, b)
+                    .into_iter()
+                    .map(|(e, _)| e)
+            })
+            .collect();
+        total += eqs.len();
+        prop.absorb(&eqs);
+    }
+    eprintln!(
+        "equations: {total} nontrivial ({} pairs of bidegrees), generated and absorbed in \
+         {:.1}s",
+        pairs.len(),
+        t.elapsed().as_secs_f64()
+    );
 }
 
 /// Echelon form (pivot = smallest column) of equations over the columns `0..nvars` and the
@@ -1803,23 +1851,51 @@ fn main() {
     }
     let v = vars(&ext, &mods);
     eprintln!("dim H = {}", v.n);
-    let (mut eqs, mut origins) = equations(&ext, &p, &v, gens_only);
-    for mi in 0..mods.len() {
-        module_equations(&ext, &mods, mi, &v, gens_only, &mut eqs, &mut origins);
-    }
-    // --seed-d2 <file> <max stem> <max filtration>
+    // Unless a mode needs every equation, equations are generated and absorbed into the
+    // propagator a chunk at a time and never stored together (DERIV_PROPAGATE=0 disables it).
+    let needs_all = ["--certificate", "--check-d2", "--dump-pool", "--compare"]
+        .iter()
+        .any(|f| args.iter().any(|a| a == f));
+    let stream = !needs_all && std::env::var("DERIV_PROPAGATE").map_or(true, |x| x != "0");
     let seed = args.iter().position(|a| a == "--seed-d2");
-    if let Some(i) = seed {
-        let (se, so) = seed_equations(
-            &ext,
-            &v,
-            &args[i + 1],
-            args[i + 2].parse().unwrap(),
-            args[i + 3].parse().unwrap(),
-        );
-        eqs.extend(se);
-        origins.extend(so);
-    }
+    let seeds = || {
+        seed.map(|i| {
+            seed_equations(
+                &ext,
+                &v,
+                &args[i + 1],
+                args[i + 2].parse().unwrap(),
+                args[i + 3].parse().unwrap(),
+            )
+        })
+    };
+    let (eqs, origins) = if stream {
+        let mut prop = propagate::Propagator::new(v.n);
+        equations_into(&ext, &p, &v, gens_only, &mut prop);
+        for mi in 0..mods.len() {
+            let (mut e, mut o) = (vec![], vec![]);
+            module_equations(&ext, &mods, mi, &v, gens_only, &mut e, &mut o);
+            prop.absorb(&e);
+        }
+        if let Some((se, _)) = seeds() {
+            prop.absorb(&se);
+        }
+        let (sys, c) = prop.finish();
+        if c > 0 {
+            eprintln!("CONTRADICTION: {c} short equations reduce to 1 = 0");
+        }
+        (sys, vec![])
+    } else {
+        let (mut eqs, mut origins) = equations(&ext, &p, &v, gens_only);
+        for mi in 0..mods.len() {
+            module_equations(&ext, &mods, mi, &v, gens_only, &mut eqs, &mut origins);
+        }
+        if let Some((se, so)) = seeds() {
+            eqs.extend(se);
+            origins.extend(so);
+        }
+        (eqs, origins)
+    };
     // --compare <ring dir> <iota csv> [--compare-solution out]: joint d2 with a comparison ring
     if args.iter().any(|a| a == "--compare") {
         compare::run(&ext, &v, eqs, gens_only, &args);
@@ -1829,9 +1905,24 @@ fn main() {
         check_d2(&ext, &v, &eqs, &args[i + 1]);
     }
     let cert = args.iter().position(|a| a == "--certificate");
-    let (pivot, rows, prov, contradictions) = eliminate(v.n, &eqs, cert.is_some());
+    // Short equations are absorbed in a union-find first (DERIV_PROPAGATE=0 disables it; never with
+    // --certificate, which needs every equation's provenance)
+    let propagated;
+    let sys: &[Vec<u32>] =
+        if !stream && cert.is_none() && std::env::var("DERIV_PROPAGATE").map_or(true, |x| x != "0")
+        {
+            let (p, c) = propagate::propagate(v.n, &eqs);
+            if c > 0 {
+                eprintln!("CONTRADICTION: {c} short equations reduce to 1 = 0");
+            }
+            propagated = p;
+            &propagated
+        } else {
+            &eqs
+        };
+    let (pivot, rows, prov, contradictions) = eliminate(v.n, sys, cert.is_some());
     for &e in contradictions.iter().take(10) {
-        let terms: Vec<String> = eqs[e as usize]
+        let terms: Vec<String> = sys[e as usize]
             .iter()
             .map(|&y| var_name(&ext, &v, y))
             .collect();
