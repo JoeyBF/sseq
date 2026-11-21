@@ -969,3 +969,202 @@ pub(crate) fn run(ext: &Ext, p: &Products, args: &[String]) {
         }
     }
 }
+
+/// d3 on the sphere and on a comparison ring spectrum, solved jointly with naturality
+/// d3(iota x) = iota(d3 x) on E3 (`--e3 <sphere d2> --compare <ring dir> <iota csv> <its d2>`).
+/// Both pages must be exact (all d2 known), which holds wherever the d2 files are complete.
+pub(crate) fn run_joint(ext: &Ext, p: &Products, args: &[String]) {
+    let arg = |flag: &str| args.iter().position(|a| a == flag).map(|i| &args[i + 1]);
+    let ci = args.iter().position(|a| a == "--compare").unwrap();
+    let (dir, iota_path, d2_b) = (&args[ci + 1], &args[ci + 2], &args[ci + 3]);
+    let ext_b = crate::load(dir, ext.n_max, ext.f_max);
+    let p_b = crate::build_products(&ext_b);
+    let iota = crate::compare::load_iota(iota_path);
+    // iota of an E2 vector of the sphere, as an E2 vector of the comparison spectrum
+    let iota_vec = |b: u32, v: Mask| -> Mask {
+        let (n, f) = ext.deg[b as usize];
+        (0..ext.dim[b as usize])
+            .filter(|&i| v >> i & 1 == 1)
+            .fold(0, |acc, i| acc ^ iota.get(&(n, f, i)).copied().unwrap_or(0))
+    };
+    let e_s = build_e3(ext, &load_d2(ext, arg("--e3").unwrap()));
+    let e_r = build_e3(&ext_b, &load_d2(&ext_b, d2_b));
+    let shift = e_s.nvars;
+    let joint = e_s.nvars + e_r.nvars;
+    let fix_s = |e: Vec<u32>| -> Vec<u32> {
+        e.into_iter()
+            .map(|x| if x == e_s.nvars { joint } else { x })
+            .collect()
+    };
+    let mut all: Vec<Vec<u32>> = equations(ext, p, &e_s).into_iter().map(fix_s).collect();
+    let eqs_r = equations(&ext_b, &p_b, &e_r);
+    let n_r = eqs_r.len();
+    all.extend(
+        eqs_r
+            .into_iter()
+            .map(|e| e.into_iter().map(|x| x + shift).collect::<Vec<u32>>()),
+    );
+    for (_, path) in page_files(args, "--seed", "--seed-d3")
+        .iter()
+        .filter(|(r, _)| *r == 3)
+    {
+        for st in read_statements(path) {
+            if let Ok(se) = statement_equations(ext, &e_s, &st) {
+                all.extend(se.into_iter().map(fix_s));
+            }
+        }
+    }
+    // naturality on E3, for every sphere source class with a known target
+    let mut n_nat = 0;
+    for c in 0..ext.deg.len() as u32 {
+        let Some(pg) = e_s.page[c as usize].as_ref() else {
+            continue;
+        };
+        let Some(t) = target(ext, &e_s, c) else {
+            continue;
+        };
+        let (n, f) = ext.deg[c as usize];
+        // the comparison bidegrees: source b, d3 target bt (must have a known E3)
+        let Some(Some(bt)) = known(&ext_b, &e_r, n - 1, f + 3) else {
+            continue;
+        };
+        let Some(b) = known(&ext_b, &e_r, n, f) else {
+            continue;
+        };
+        let pg_bt = e_r.page[bt as usize].as_ref().unwrap();
+        let m = e_r.tdim(bt);
+        if m == 0 {
+            continue;
+        }
+        // iota of the sphere's target classes, in comparison target coordinates
+        let t_images: Vec<Mask> = match t {
+            Some(t) if e_s.off[c as usize] != u32::MAX => e_s.page[t as usize]
+                .as_ref()
+                .unwrap()
+                .treps
+                .iter()
+                .map(|&z| pg_bt.tgt.project(iota_vec(t, z)).expect("iota of a cycle"))
+                .collect(),
+            _ => vec![],
+        };
+        for (k, &x) in pg.reps.iter().enumerate() {
+            let ix = iota_vec(c, x);
+            let src: Mask = match b {
+                Some(b) => e_r.page[b as usize]
+                    .as_ref()
+                    .unwrap()
+                    .src
+                    .project(ix)
+                    .expect("iota of a d2-cycle is a d2-cycle"),
+                None => 0,
+            };
+            for r in 0..m {
+                let mut e: Vec<u32> = vec![];
+                if let Some(b) = b {
+                    for q in (0..e_r.dim(b)).filter(|&q| src >> q & 1 == 1) {
+                        e.push(var(&ext_b, &e_r, b, q, r) + shift);
+                    }
+                }
+                for (l, &img) in t_images.iter().enumerate() {
+                    if img >> r & 1 == 1 {
+                        e.push(var(ext, &e_s, c, k, l));
+                    }
+                }
+                e.sort_unstable();
+                let mut d: Vec<u32> = vec![];
+                for v in e {
+                    if d.last() == Some(&v) {
+                        d.pop();
+                    } else {
+                        d.push(v);
+                    }
+                }
+                if !d.is_empty() {
+                    all.push(d);
+                    n_nat += 1;
+                }
+            }
+        }
+    }
+    eprintln!(
+        "joint E3: {} + {} d3 variables, {n_r} comparison Leibniz and {n_nat} naturality equations",
+        e_s.nvars, e_r.nvars
+    );
+    let (pivot, rows, _, contradictions) = eliminate(joint, &all, false);
+    eprintln!("joint E3: {} contradictions", contradictions.len());
+
+    // forced d3 on both spectra, and the sphere's holdout checks
+    let count = |ext: &Ext, e: &E3, off: u32| -> Vec<Vec<u32>> {
+        let mut q = vec![];
+        for b in 0..ext.deg.len() as u32 {
+            if e.off[b as usize] == u32::MAX {
+                continue;
+            }
+            let m = e.tdim(target(ext, e, b).unwrap().unwrap());
+            for k in 0..e.dim(b) {
+                for r in 0..m {
+                    q.push(vec![var(ext, e, b, k, r) + off]);
+                }
+            }
+        }
+        q
+    };
+    let mut queries = count(ext, &e_s, 0);
+    let n_s = queries.len();
+    queries.extend(count(&ext_b, &e_r, shift));
+    let n_sr = queries.len();
+    let checks: Vec<(Statement, Vec<Vec<u32>>)> = page_files(args, "--check", "--check-d3")
+        .iter()
+        .filter(|(r, _)| *r == 3)
+        .flat_map(|(_, path)| read_statements(path))
+        .filter_map(|st| {
+            let se = statement_equations(ext, &e_s, &st).ok()?;
+            Some((st, se.into_iter().map(fix_s).collect()))
+        })
+        .collect();
+    for (_, se) in &checks {
+        for eq in se {
+            queries.push(eq.iter().copied().filter(|&v| v != joint).collect());
+        }
+    }
+    let vals = evaluate(joint, &pivot, &rows, &queries);
+    let forced = |range: std::ops::Range<usize>| {
+        let n = range.len();
+        let f = vals[range.clone()]
+            .iter()
+            .filter(|(_, d)| d.is_empty())
+            .count();
+        let z = vals[range]
+            .iter()
+            .filter(|(v, d)| d.is_empty() && *v)
+            .count();
+        (n, f, z)
+    };
+    let (a, b, c) = forced(0..n_s);
+    println!("sphere d3 coordinates: {a}, forced {b} ({c} equal to 1)");
+    let (a, b, c) = forced(n_s..n_sr);
+    println!("comparison d3 coordinates: {a}, forced {b} ({c} equal to 1)");
+    let (mut ok, mut bad, mut open) = (0, 0, 0);
+    let mut qi = n_sr;
+    for (st, se) in &checks {
+        let vs = &vals[qi..qi + se.len()];
+        qi += se.len();
+        let mut status = "correct";
+        for (eq, (v, d)) in se.iter().zip(vs) {
+            if !d.is_empty() {
+                if status == "correct" {
+                    status = "open";
+                }
+            } else if *v != eq.contains(&joint) {
+                status = "WRONG";
+            }
+        }
+        match status {
+            "correct" => ok += 1,
+            "WRONG" => bad += 1,
+            _ => open += 1,
+        }
+        println!("check d3 ({},{}) {}: {status}", st.n, st.f, st.label);
+    }
+    println!("checks d3 (joint): {ok} correct and forced, {bad} wrong, {open} open");
+}

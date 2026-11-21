@@ -1744,7 +1744,11 @@ fn main() {
     check_products(&ext, &p);
     // --e3 <d2 file> [--seed-d3 f] [--check-d3 f] [--solution3 out]: d3 on E3 instead
     if args.iter().any(|a| a == "--e3") {
-        page::run(&ext, &p, &args);
+        if args.iter().any(|a| a == "--compare") {
+            page::run_joint(&ext, &p, &args);
+        } else {
+            page::run(&ext, &p, &args);
+        }
         return;
     }
     // --modules <dir> <name:shift,...>: two-cell complexes from ext's cofiber_export

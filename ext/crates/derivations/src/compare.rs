@@ -16,7 +16,7 @@ use crate::{
 
 /// The map on E2, `(stem, filtration, index)` of a sphere basis element -> its image over the
 /// comparison basis of the same bidegree. Missing rows are zero.
-fn load_iota(path: &str) -> FxHashMap<(i32, i32, usize), Mask> {
+pub(crate) fn load_iota(path: &str) -> FxHashMap<(i32, i32, usize), Mask> {
     let mut out = FxHashMap::default();
     for line in BufReader::new(File::open(path).unwrap()).lines().skip(1) {
         let line = line.unwrap();
