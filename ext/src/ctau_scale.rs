@@ -225,6 +225,81 @@ impl StreamedBackbone {
     pub fn terms(&self) -> usize {
         self.terms
     }
+
+    /// Every operation that occurs in a differential.
+    pub fn operations(&self) -> FxHashSet<PackedXi> {
+        self.inv
+            .iter()
+            .flat_map(|m| m.values())
+            .flat_map(|g| g.ops.iter().map(|x| x.0))
+            .collect()
+    }
+}
+
+/// The action of the operations that occur in a backbone on the monomials of each degree,
+/// filed by operation.
+///
+/// The coboundary of a whole block of cochains (one generator, every monomial of one degree) is
+/// read off these by walking the operations that land on the generator, so that building a
+/// coboundary costs its number of entries rather than a search per cochain. The coaction on a
+/// monomial has far more terms than the backbone has operations, and only the latter are kept.
+pub struct OpTables {
+    /// For each degree, each operation $P(R)$ with the nonzero $P(R) \cdot m \ni m'$ as (position
+    /// of $m$, position of $m'$ in its degree, length of $m'$), sorted by $m$.
+    by_degree: Vec<FxHashMap<PackedXi, Vec<(u32, u32, u16)>>>,
+    entries: usize,
+}
+
+impl OpTables {
+    /// The tables through `max_degree` for the operations of `bb`, and for each of them with
+    /// each of `shifts` taken off, as the cell actions and cup products do.
+    pub fn new(q: &QAlgebra, bb: &StreamedBackbone, shifts: &[PackedXi], max_degree: i32) -> Self {
+        use maybe_rayon::prelude::*;
+        let mut needed = bb.operations();
+        for op in needed.clone() {
+            for &s in shifts {
+                if fits(s, op) {
+                    needed.insert(op - s);
+                }
+            }
+        }
+        needed.insert(0);
+        let mut by_degree = Vec::new();
+        let mut entries = 0;
+        for e in 0..=max_degree {
+            let monos = q.monomials(e);
+            let rows: Vec<Vec<(PackedXi, u32, u16)>> = (0..monos.len())
+                .into_maybe_par_iter()
+                .map(|idx| {
+                    let psi = q.coaction(&monos[idx]);
+                    let mut kept = Vec::new();
+                    for (r, gammas) in psi.iter() {
+                        if needed.contains(&r) {
+                            kept.extend(gammas.iter().map(|&(g, len)| (r, g, len)));
+                        }
+                    }
+                    kept
+                })
+                .collect();
+            let mut table: FxHashMap<PackedXi, Vec<(u32, u32, u16)>> = FxHashMap::default();
+            for (idx, row) in rows.into_iter().enumerate() {
+                entries += row.len();
+                for (r, g, len) in row {
+                    table.entry(r).or_default().push((idx as u32, g, len));
+                }
+            }
+            for list in table.values_mut() {
+                list.shrink_to_fit();
+            }
+            by_degree.push(table);
+        }
+        Self { by_degree, entries }
+    }
+
+    /// The number of entries over every degree and operation.
+    pub fn entries(&self) -> usize {
+        self.entries
+    }
 }
 
 /// A finite complex smashed with $C\tau$, as cells on which the cochains of $C\tau$ are copied.
@@ -411,6 +486,16 @@ impl Space {
         )
     }
 
+    /// The block of a position and the position of its monomial in its degree.
+    pub fn locate(&self, q: &QAlgebra, pos: u32) -> (usize, u32) {
+        let level = self.level(pos) as usize;
+        let row = &self.base[level * self.blocks.len()..(level + 1) * self.blocks.len()];
+        let b = row.partition_point(|&s| s <= pos) - 1;
+        let block = self.blocks[b];
+        let len = (level as i32 - self.dk[block.cell as usize]) as u32;
+        (b, pos - row[b] + q.shorter(block.e as i32, len) as u32)
+    }
+
     /// The cell, generator and monomial at a position, and its level.
     pub fn decode(&self, q: &QAlgebra, pos: u32) -> (usize, u16, u32, QMono, u16) {
         let level = self.level(pos) as usize;
@@ -489,6 +574,92 @@ pub fn pullback_column(
             }
         }
     }
+}
+
+/// The cochain map of [`pullback_column`] on every basis cochain of `src` that `skip` does not
+/// reject, as (position, entries of its image), sorted by position.
+///
+/// A block at a time: for each generator, the operations that land on it are walked once and
+/// their action on every monomial of the block is read off `tables`, which must hold `shift`
+/// and its sums with the cell actions of `cx`.
+#[allow(clippy::too_many_arguments)]
+pub fn pullback_columns(
+    q: &QAlgebra,
+    bb: &StreamedBackbone,
+    tables: &OpTables,
+    cx: &Complex,
+    src: &Space,
+    tgt: &Space,
+    shift: PackedXi,
+    skip: impl Fn(u32) -> bool + Sync,
+) -> Vec<(u32, Vec<u32>)> {
+    use maybe_rayon::prelude::*;
+    let shift_degree = xi_degree(shift);
+    let built: Vec<Vec<(u32, Vec<u32>)>> = (0..src.blocks.len())
+        .into_maybe_par_iter()
+        .map(|b| {
+            let block = src.blocks[b];
+            let (e, cell) = (block.e as i32, block.cell as usize);
+            let monos = q.monomials(e);
+            // the position of each monomial of the block, unless it is cleared
+            let positions: Vec<Option<u32>> = monos
+                .iter()
+                .enumerate()
+                .map(|(idx, m)| {
+                    let pos = src.pos_in(q, b, idx as u32, mono_len(m) as u16);
+                    (!skip(pos)).then_some(pos)
+                })
+                .collect();
+            let mut local: Vec<Vec<u32>> = vec![Vec::new(); monos.len()];
+            let mut moves = vec![(shift, shift_degree, cell)];
+            for &(r, c, c2) in &cx.actions {
+                if c == cell {
+                    moves.push((shift + r, shift_degree + xi_degree(r), c2));
+                }
+            }
+            let most = moves.iter().map(|x| x.1).max().unwrap();
+            let da = cx.cells[cell][0];
+            if let Some(terms) = bb.inv(src.a + da + 1, block.t as i32, block.i) {
+                let table = &tables.by_degree[e as usize];
+                for (op, op_degree, targets) in terms.ops(e + most) {
+                    for &(s, s_degree, c2) in &moves {
+                        if op_degree - s_degree > e || !fits(s, op) {
+                            continue;
+                        }
+                        let Some(list) = table.get(&(op - s)) else {
+                            continue;
+                        };
+                        for &(t_l, l) in targets {
+                            let tb = tgt.block(c2, t_l, l);
+                            for &(m, g, len) in list {
+                                if positions[m as usize].is_some() {
+                                    local[m as usize].push(tgt.pos_in(q, tb, g, len));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            for &(c, c2) in &cx.attach {
+                if c == cell && shift == 0 {
+                    let tb = tgt.block(c2, block.t, block.i);
+                    for (idx, m) in monos.iter().enumerate() {
+                        if positions[idx].is_some() {
+                            local[idx].push(tgt.pos_in(q, tb, idx as u32, mono_len(m) as u16));
+                        }
+                    }
+                }
+            }
+            positions
+                .into_iter()
+                .zip(local)
+                .filter_map(|(pos, column)| Some((pos?, column)))
+                .collect()
+        })
+        .collect();
+    let mut columns: Vec<(u32, Vec<u32>)> = built.into_iter().flatten().collect();
+    columns.sort_unstable_by_key(|x| x.0);
+    columns
 }
 
 /// Marks a column that generates no tower.
@@ -627,12 +798,12 @@ impl ReduceStats {
 pub fn reduce_weight(
     q: &QAlgebra,
     bb: &StreamedBackbone,
+    tables: &OpTables,
     cx: &Complex,
     u: i32,
     a_lo: i32,
     a_hi: i32,
 ) -> (Vec<((i32, i32), Reduced)>, ReduceStats) {
-    use maybe_rayon::prelude::*;
     let mut out: Vec<((i32, i32), Reduced)> = Vec::new();
     let mut stats = ReduceStats::default();
     let mut ws = SparseWorkspace::new(0);
@@ -650,20 +821,11 @@ pub fn reduce_weight(
         let mut used = Vec::new();
         stats.cochains += src.dim();
         stats.largest = stats.largest.max(src.dim());
-        // The columns are built in parallel and reduced in order.
-        let sources: Vec<u32> = (0..src.dim() as u32)
-            .filter(|&pos| !cleared.is_some_and(|e| e.pivot_column(pos as usize).is_some()))
-            .collect();
-        let columns: Vec<Vec<u32>> = sources
-            .clone()
-            .into_maybe_par_iter()
-            .map(|pos| {
-                let mut column = Vec::new();
-                pullback_column(q, bb, cx, &src, &tgt, pos, 0, &mut column);
-                column
-            })
-            .collect();
-        for (pos, column) in sources.into_iter().zip(columns) {
+        // The columns are built a block at a time, in parallel, and reduced in order.
+        let columns = pullback_columns(q, bb, tables, cx, &src, &tgt, 0, |pos| {
+            cleared.is_some_and(|e| e.pivot_column(pos as usize).is_some())
+        });
+        for (pos, column) in columns {
             let level = src.level(pos);
             stats.input_entries += column.len();
             used.clear();
@@ -727,7 +889,13 @@ impl ScaledExt {
     }
 
     /// Computes the towers of `cx` in stems `0..=max_n`.
-    pub fn new(q: &QAlgebra, bb: &StreamedBackbone, cx: Complex, max_n: i32) -> Self {
+    pub fn new(
+        q: &QAlgebra,
+        bb: &StreamedBackbone,
+        tables: &OpTables,
+        cx: Complex,
+        max_n: i32,
+    ) -> Self {
         use maybe_rayon::prelude::*;
         // heaviest weights first, so that they do not all end together
         let mut weights: Vec<i32> = (0..=max_n).collect();
@@ -737,7 +905,7 @@ impl ScaledExt {
             .map(|u| {
                 // stem 2u - a <= max_n, and the coboundary into the lowest such filtration
                 let a_lo = (2 * u - max_n - 1).max(cx.min_a());
-                reduce_weight(q, bb, &cx, u, a_lo, u.max(a_lo + 1))
+                reduce_weight(q, bb, tables, &cx, u, a_lo, u.max(a_lo + 1))
             })
             .collect();
         let mut reduced = FxHashMap::default();
@@ -814,7 +982,7 @@ impl ScaledExt {
 
 /// The image of each tower generator of `src` at filtration `a` and weight `u` under a cochain
 /// map into `tgt` at `(a2, u2)` that shifts the level by `dk`, as tower ids of `tgt`. `map`
-/// appends the entries of the image of a basis cochain.
+/// appends the entries of the image of a cochain.
 ///
 /// The map commutes with $q_0$, so this determines it on every class. `None` if the target is
 /// out of range.
@@ -826,7 +994,7 @@ pub fn induced(
     (a2, u2): (i32, i32),
     dk: i32,
     ws: &mut SparseWorkspace,
-    mut map: impl FnMut(u32, &mut Vec<u32>),
+    mut map: impl FnMut(&[u32], &mut Vec<u32>),
 ) -> Option<Vec<Vec<u32>>> {
     let from = src.reduced(a, u)?;
     let to = tgt.reduced(a2, u2)?;
@@ -835,9 +1003,7 @@ pub fn induced(
         (0..from.towers.len())
             .map(|i| {
                 entries.clear();
-                for &pos in from.generator(i) {
-                    map(pos, &mut entries);
-                }
+                map(from.generator(i), &mut entries);
                 let level = from.tower(i).0 as i32 + dk;
                 if level < 0 {
                     assert!(

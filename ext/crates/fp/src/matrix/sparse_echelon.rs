@@ -1,5 +1,3 @@
-use std::collections::BinaryHeap;
-
 /// A column echelon form over $\mathbb{F}_2$ of sparse columns, each stored as its sorted row
 /// indices.
 ///
@@ -24,15 +22,22 @@ pub struct SparseEchelon {
 /// Marks a row that is not a pivot.
 const NO_COLUMN: u32 = u32::MAX;
 
-/// The scratch space of [`SparseEchelon::reduce`]: a dense accumulator and the candidates for its
-/// largest entry.
+/// The scratch space of [`SparseEchelon::reduce`]: a dense accumulator, and the range of its
+/// words that may be nonzero.
+///
+/// Adding a sparse column to it costs one word per entry, and the largest entry is found by
+/// scanning down from the last one, which never moves up during a reduction. A heap of the
+/// entries would cost a comparison chain per entry instead; `ext/MOTIVIC_CTAU.md` has the
+/// measurement.
 ///
 /// One workspace serves any number of reductions on echelon forms of at most its number of rows,
 /// and leaves no state between them.
 pub struct SparseWorkspace {
     bits: Vec<u64>,
-    /// Every row toggled since the last reduction, possibly more than once, possibly cleared again.
-    heap: BinaryHeap<u32>,
+    /// Every word from `high` on is zero.
+    high: usize,
+    /// Every word before `low` is zero.
+    low: usize,
     /// The entries of the echelon columns added since [`Self::take_additions`].
     additions: usize,
 }
@@ -42,7 +47,8 @@ impl SparseWorkspace {
     pub fn new(rows: usize) -> Self {
         Self {
             bits: vec![0; rows.div_ceil(64)],
-            heap: BinaryHeap::new(),
+            high: 0,
+            low: usize::MAX,
             additions: 0,
         }
     }
@@ -61,22 +67,41 @@ impl SparseWorkspace {
     }
 
     /// Adds the basis vector of `row`.
+    #[inline]
     fn toggle(&mut self, row: u32) {
-        let (word, bit) = (row as usize / 64, row % 64);
-        self.bits[word] ^= 1 << bit;
-        if self.bits[word] >> bit & 1 == 1 {
-            self.heap.push(row);
+        let word = row as usize / 64;
+        self.bits[word] ^= 1 << (row % 64);
+        self.high = self.high.max(word + 1);
+        self.low = self.low.min(word);
+    }
+
+    /// The largest row set, if any, lowering `high` to just above it.
+    fn largest(&mut self) -> Option<u32> {
+        while self.high > 0 && self.high > self.low && self.bits[self.high - 1] == 0 {
+            self.high -= 1;
         }
+        if self.high == 0 || self.high <= self.low {
+            return None;
+        }
+        let word = self.bits[self.high - 1];
+        Some(((self.high - 1) * 64 + 63 - word.leading_zeros() as usize) as u32)
     }
 
-    /// Whether `row` is set.
-    fn get(&self, row: u32) -> bool {
-        self.bits[row as usize / 64] >> (row % 64) & 1 == 1
-    }
-
-    /// Clears `row`.
-    fn clear(&mut self, row: u32) {
-        self.bits[row as usize / 64] &= !(1 << (row % 64));
+    /// Removes every row set and returns them, sorted.
+    fn drain(&mut self) -> Vec<u32> {
+        let mut rest = Vec::new();
+        if self.low < self.high {
+            for w in self.low..self.high {
+                let mut word = std::mem::take(&mut self.bits[w]);
+                while word != 0 {
+                    rest.push((w * 64) as u32 + word.trailing_zeros());
+                    word &= word - 1;
+                }
+            }
+        }
+        self.high = 0;
+        self.low = usize::MAX;
+        rest
     }
 }
 
@@ -137,24 +162,9 @@ impl SparseEchelon {
         for row in entries {
             ws.toggle(row);
         }
-        let mut rest = Vec::new();
-        while let Some(row) = ws.heap.pop() {
-            if !ws.get(row) {
-                continue;
-            }
+        while let Some(row) = ws.largest() {
             let c = self.pivot_column[row as usize];
             if c == NO_COLUMN {
-                // The largest entry is no pivot: collect the remainder, which empties the
-                // workspace. A stale duplicate of a collected row finds its bit cleared.
-                rest.push(row);
-                ws.clear(row);
-                while let Some(row) = ws.heap.pop() {
-                    if ws.get(row) {
-                        rest.push(row);
-                        ws.clear(row);
-                    }
-                }
-                rest.reverse();
                 break;
             }
             if let Some(used) = used.as_deref_mut() {
@@ -165,7 +175,7 @@ impl SparseEchelon {
                 ws.toggle(r);
             }
         }
-        rest
+        ws.drain()
     }
 
     /// Appends a reduced, nonempty column and returns its id.

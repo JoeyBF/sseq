@@ -160,8 +160,9 @@ pub struct QAlgebra {
 /// The coaction on one monomial $m$: the terms $\xi^R \otimes m'$ with coefficient 1, with the
 /// coefficients already conjugated, grouped by $R$.
 pub struct Coaction {
-    /// The range of `gammas` for each $R$ that occurs.
-    index: FxHashMap<PackedXi, (u32, u32)>,
+    /// Each $R$ that occurs with the start of its range of `gammas`, sorted, and then a sentinel
+    /// holding the length of `gammas`.
+    index: Vec<(PackedXi, u32)>,
     /// Each $m'$ as its position among the monomials of its degree, and its length.
     gammas: Vec<(u32, u16)>,
 }
@@ -169,9 +170,11 @@ pub struct Coaction {
 impl Coaction {
     /// $P(R) \cdot m$, as the position of each monomial in its degree, and its length.
     pub fn get(&self, r: PackedXi) -> &[(u32, u16)] {
-        self.index
-            .get(&r)
-            .map_or(&[], |&(lo, hi)| &self.gammas[lo as usize..hi as usize])
+        let ops = &self.index[..self.index.len() - 1];
+        match ops.binary_search_by_key(&r, |x| x.0) {
+            Ok(i) => &self.gammas[self.index[i].1 as usize..self.index[i + 1].1 as usize],
+            Err(_) => &[],
+        }
     }
 
     /// The number of terms.
@@ -181,14 +184,14 @@ impl Coaction {
 
     /// The number of distinct $R$.
     pub fn num_ops(&self) -> usize {
-        self.index.len()
+        self.index.len() - 1
     }
 
     /// Each $R$ that occurs with $P(R) \cdot m$, as in [`Self::get`].
     pub fn iter(&self) -> impl Iterator<Item = (PackedXi, &[(u32, u16)])> {
         self.index
-            .iter()
-            .map(|(&r, &(lo, hi))| (r, &self.gammas[lo as usize..hi as usize]))
+            .windows(2)
+            .map(|w| (w[0].0, &self.gammas[w[0].1 as usize..w[1].1 as usize]))
     }
 
     /// Whether there are no terms; there is always $1 \otimes m$.
@@ -324,9 +327,9 @@ impl QAlgebra {
                 let rest_degree = mono_degree(&rest);
                 let rest = self.coaction(&rest);
                 let mut set: FxHashSet<(PackedXi, QMono)> = FxHashSet::default();
-                for (&r, &(lo, hi)) in &rest.index {
+                for (r, gammas) in rest.iter() {
                     let bucket = &self.by_degree[(rest_degree - xi_degree(r)) as usize];
-                    for &(idx, _) in &rest.gammas[lo as usize..hi as usize] {
+                    for &(idx, _) in gammas {
                         for &(s, i) in &self.factors[n + 1] {
                             let mut gamma = bucket[idx as usize];
                             if i > 0 {
@@ -340,12 +343,13 @@ impl QAlgebra {
             }
         };
         terms.sort_unstable();
-        let mut index = FxHashMap::default();
+        let mut index = Vec::new();
         let mut lo = 0u32;
         for run in terms.chunk_by(|x, y| x.0 == y.0) {
-            index.insert(run[0].0, (lo, lo + run.len() as u32));
+            index.push((run[0].0, lo));
             lo += run.len() as u32;
         }
+        index.push((PackedXi::MAX, lo));
         let out = Arc::new(Coaction {
             index,
             gammas: terms

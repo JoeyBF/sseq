@@ -11,7 +11,9 @@ use algebra::AlgebraType;
 use ext::{
     chain_complex::ChainComplex,
     ctau::{BarComparison, OpTable, QAlgebra, QPoly, Tri},
-    ctau_scale::{Complex, NEVER, ScaledExt, StreamedBackbone, bar_cup, induced, pullback_column},
+    ctau_scale::{
+        Complex, NEVER, OpTables, ScaledExt, StreamedBackbone, bar_cup, induced, pullback_columns,
+    },
     save::SaveKind,
     utils::query_module_only,
 };
@@ -236,19 +238,30 @@ fn main() -> anyhow::Result<()> {
     );
     let q_degree = max_n / 2 + 2;
     let mut q = QAlgebra::new(q_degree, q_degree as u32);
-    q.set_memo_limit(1 << 26);
+    q.set_memo_limit(1 << 31);
+    let start = Instant::now();
+    // the shifts are those of h_1, ..., h_4, the cell actions of the Hopf cofibers, and their sums
+    let tables = OpTables::new(&q, &bb, &[1, 2, 3, 4, 5, 6, 8, 9, 10, 12], q_degree);
+    q.clear_memo();
+    eprintln!(
+        "operation tables: {} entries: {:.1} s, peak {:.1} GB",
+        tables.entries(),
+        start.elapsed().as_secs_f64(),
+        peak_gb()
+    );
 
     /// Reduces `cx` and writes its towers and the action of `h_1, ..., h_4`.
     fn export(
         dir: &std::path::Path,
         q: &QAlgebra,
         bb: &StreamedBackbone,
+        tables: &OpTables,
         cx: Complex,
         max_n: i32,
     ) -> anyhow::Result<ScaledExt> {
         let start = Instant::now();
         let name = cx.name.clone();
-        let ext = ScaledExt::new(q, bb, cx, max_n);
+        let ext = ScaledExt::new(q, bb, tables, cx, max_n);
         q.clear_memo();
         let s = ext.stats;
         eprintln!(
@@ -305,8 +318,26 @@ fn main() -> anyhow::Result<()> {
                         continue;
                     }
                     let tgt = ext.space(q, bb, a2, u2);
-                    let images = induced(&ext, &ext, (a, u), (a2, u2), 0, &mut ws, |pos, out| {
-                        pullback_column(q, bb, &ext.cx, &src, &tgt, pos, 1 << j, out)
+                    // the whole cochain map, then its value on each generator
+                    let red = ext.reduced(a, u).unwrap();
+                    let mut wanted = vec![false; src.dim()];
+                    for i in 0..red.towers.len() {
+                        for &pos in red.generator(i) {
+                            wanted[pos as usize] = true;
+                        }
+                    }
+                    let mut columns: Vec<Vec<u32>> = vec![Vec::new(); src.dim()];
+                    for (pos, column) in
+                        pullback_columns(q, bb, tables, &ext.cx, &src, &tgt, 1 << j, |pos| {
+                            !wanted[pos as usize]
+                        })
+                    {
+                        columns[pos as usize] = column;
+                    }
+                    let images = induced(&ext, &ext, (a, u), (a2, u2), 0, &mut ws, |c, out| {
+                        for &pos in c {
+                            out.extend_from_slice(&columns[pos as usize]);
+                        }
                     })
                     .unwrap();
                     let rows = images
@@ -332,7 +363,7 @@ fn main() -> anyhow::Result<()> {
         Ok(ext)
     }
 
-    let ctau = export(&dir, &q, &bb, Complex::sphere(), max_n)?;
+    let ctau = export(&dir, &q, &bb, &tables, Complex::sphere(), max_n)?;
 
     for name in specs.split(',').filter(|s| !s.is_empty() && *s != "-") {
         let cx = match name {
@@ -343,7 +374,7 @@ fn main() -> anyhow::Result<()> {
             _ => anyhow::bail!("unknown complex {name}"),
         };
         ctau.clear_spaces();
-        let cof = export(&dir, &q, &bb, cx, max_n)?;
+        let cof = export(&dir, &q, &bb, &tables, cx, max_n)?;
         let start = Instant::now();
         let top = cof.cx.cells.len() - 1;
         let [da, du, dk] = cof.cx.cells[top];
@@ -359,9 +390,11 @@ fn main() -> anyhow::Result<()> {
                 let src = ctau.space(&q, &bb, a, u);
                 let tgt = cof.space(&q, &bb, a, u);
                 let mut ws = SparseWorkspace::new(0);
-                induced(&ctau, &cof, (a, u), (a, u), 0, &mut ws, |pos, out| {
-                    let (_, t, i, m, _) = src.decode(&q, pos);
-                    out.push(tgt.pos(&q, 0, t, i, &m));
+                induced(&ctau, &cof, (a, u), (a, u), 0, &mut ws, |c, out| {
+                    for &pos in c {
+                        let (_, t, i, m, _) = src.decode(&q, pos);
+                        out.push(tgt.pos(&q, 0, t, i, &m));
+                    }
                 })
                 .unwrap()
                 .into_iter()
@@ -387,10 +420,12 @@ fn main() -> anyhow::Result<()> {
                 let src = cof.space(&q, &bb, a, u);
                 let tgt = ctau.space(&q, &bb, a2, u2);
                 let mut ws = SparseWorkspace::new(0);
-                induced(&cof, &ctau, (a, u), (a2, u2), -dk, &mut ws, |pos, out| {
-                    let (cell, t, i, m, _) = src.decode(&q, pos);
-                    if cell == top {
-                        out.push(tgt.pos(&q, 0, t, i, &m));
+                induced(&cof, &ctau, (a, u), (a2, u2), -dk, &mut ws, |c, out| {
+                    for &pos in c {
+                        let (cell, t, i, m, _) = src.decode(&q, pos);
+                        if cell == top {
+                            out.push(tgt.pos(&q, 0, t, i, &m));
+                        }
                     }
                 })
                 .unwrap()
