@@ -21,6 +21,14 @@
 //! `<out>_timing.csv`, and prints the `h_i`-linearity checks. With `products`, also writes the
 //! Yoneda products in `Ext_B(M, F_2)` by `Ext_B(F_2, F_2)` classes listed in `RESTRICT_PRODUCTS`
 //! (only for `M = F_2`, where `R` is also the target).
+//!
+//! `restrict_unit ring <B save> <max n> <max s> <out dir>` exports `Ext_B(F_2, F_2)` as a ring.
+//! `restrict_unit cofibers <B save> <max n> <max s> <ring dir> <out dir> [C2:1,Ceta:2,Cnu:4]
+//! [box n] [box s]` exports `Ext_B(H^*C)` for the two-cell complexes `C = S ∪_{h_j} e^{k+1}` as
+//! modules over that ring export, in its basis and in the format of `cofiber_export`; the untwisted
+//! tensor complex over the minimal `R` needs only the chain maps of the ring's indecomposables.
+//! Check the result with `restrict_unit_validate_cofibers.py` (long exact sequence) and
+//! `restrict_unit_validate_cofibers_br.py` (Bruner-Rognes Tables 1.5-1.7).
 
 use std::{
     collections::BTreeMap,
@@ -323,6 +331,9 @@ struct LiftOut {
     /// `(source s, source t) -> per source generator, coefficients of the target generators at
     /// (s - s_shift, t - t_shift)`.
     coeffs: BTreeMap<(i32, i32), Vec<Vec<u32>>>,
+    /// `(source s, source t) -> per entry of `op_degs`, per source generator, coefficients of
+    /// `Sq(d) e` for the target generators `e` of degree `t - t_shift - d`.
+    ops: BTreeMap<(i32, i32), Vec<Vec<Vec<u32>>>>,
     /// stem of the source -> summed seconds of bidegree work.
     secs: BTreeMap<i32, f64>,
 }
@@ -339,8 +350,24 @@ fn lift(
     max_n: i32,
     max_s: i32,
     verify: bool,
+    op_degs: &[i32],
 ) -> LiftOut {
     let tgt_alg = tgt.alg();
+    // the Milnor index of Sq(d), for each d in `op_degs`
+    let op_idx: Vec<usize> = op_degs
+        .iter()
+        .map(|&d| {
+            tgt_alg.compute_basis(d);
+            (0..tgt_alg.dimension(d))
+                .find(|&i| {
+                    let e = tgt_alg.basis_element_from_index(d, i);
+                    let p: Vec<u32> = e.p_part.iter().collect();
+                    e.q_part == 0 && p.first() == Some(&(d as u32)) && p[1..].iter().all(|&x| x == 0)
+                })
+                .unwrap_or_else(|| panic!("no Sq({d}) in the target algebra"))
+        })
+        .collect();
+    let mut ops = BTreeMap::new();
     let src_alg = &src.alg;
     let mut coeffs = BTreeMap::new();
     let secs: Mutex<BTreeMap<i32, f64>> = Mutex::new(BTreeMap::new());
@@ -435,6 +462,34 @@ fn lift(
                 })
                 .collect();
             coeffs.insert((ss, t), c);
+            if !op_degs.is_empty() {
+                let o: Vec<Vec<Vec<u32>>> = op_degs
+                    .iter()
+                    .zip(&op_idx)
+                    .map(|(&d, &oi)| {
+                        let gd = tt - d;
+                        let ng = if gd >= 0 {
+                            tgt_m.number_of_gens_in_degree(gd)
+                        } else {
+                            0
+                        };
+                        ys.iter()
+                            .map(|y| {
+                                (0..ng)
+                                    .map(|i| {
+                                        if y.is_empty() {
+                                            0
+                                        } else {
+                                            y.entry(tgt_m.operation_generator_to_index(d, oi, gd, i))
+                                        }
+                                    })
+                                    .collect()
+                            })
+                            .collect()
+                    })
+                    .collect();
+                ops.insert((ss, t), o);
+            }
             next[t as usize] = ys;
         }
         prev = next;
@@ -442,6 +497,7 @@ fn lift(
     }
     LiftOut {
         coeffs,
+        ops,
         secs: secs.into_inner().unwrap(),
     }
 }
@@ -536,7 +592,7 @@ fn products_by(r: &SubRes, (yn, ys, yi): (i32, i32, usize), max_n: i32, max_s: i
         }
         v
     };
-    let prod = lift(r, r, ys, yt, &init, max_n, max_s - ys, false);
+    let prod = lift(r, r, ys, yt, &init, max_n, max_s - ys, false, &[]);
     let mut out = BTreeMap::new();
     for ((ss, t), per_q) in &prod.coeffs {
         let s = ss - ys;
@@ -686,9 +742,588 @@ fn ring_export(r: &SubRes, max_n: i32, max_s: i32, dir: &std::path::Path) -> any
     Ok(())
 }
 
+/// A vector over `F_2` of dimension at most 64, coordinate `i` in bit `i`.
+type Bits = u64;
+
+fn bits_of(v: &[u32]) -> Bits {
+    assert!(v.len() <= 64);
+    v.iter()
+        .enumerate()
+        .fold(0, |acc, (i, &c)| acc | (((c & 1) as u64) << i))
+}
+
+/// Parses `[1]` or `"[0, 1, 1]"` into bits.
+fn parse_bits(s: &str) -> Bits {
+    let s = s
+        .trim()
+        .trim_matches('"')
+        .trim_start_matches('[')
+        .trim_end_matches(']');
+    s.split(',')
+        .enumerate()
+        .fold(0, |acc, (i, e)| acc | (u64::from(e.trim() == "1") << i))
+}
+
+/// `[1]`, or `"[1, 0]"` when the vector has more than one entry (the cofiber export notation).
+fn fmt_bits(v: Bits, dim: usize) -> String {
+    let e: Vec<u32> = (0..dim).map(|i| ((v >> i) & 1) as u32).collect();
+    fmt_ring_vec(&e)
+}
+
+/// Fully reduced echelon form of the span of `rows`: `(pivot bit, row)`, the pivot being the
+/// row's lowest set bit and clear in every other row.
+fn rref_bits(rows: impl IntoIterator<Item = Bits>) -> Vec<(u32, Bits)> {
+    let mut out: Vec<(u32, Bits)> = Vec::new();
+    for mut r in rows {
+        for &(p, b) in &out {
+            if (r >> p) & 1 == 1 {
+                r ^= b;
+            }
+        }
+        if r == 0 {
+            continue;
+        }
+        let p = r.trailing_zeros();
+        for (_, b) in out.iter_mut() {
+            if (*b >> p) & 1 == 1 {
+                *b ^= r;
+            }
+        }
+        out.push((p, r));
+    }
+    out.sort_unstable();
+    out
+}
+
+/// The kernel of the map sending basis vector `i` to `images[i]`.
+fn kernel_bits(images: &[Bits]) -> Vec<Bits> {
+    let mut kernel = Vec::new();
+    // (pivot, image, source), eliminated on the image part
+    let mut done: Vec<(u32, Bits, Bits)> = Vec::new();
+    for (i, &f0) in images.iter().enumerate() {
+        let (mut f, mut src) = (f0, 1 << i);
+        for &(p, g, s) in &done {
+            if (f >> p) & 1 == 1 {
+                f ^= g;
+                src ^= s;
+            }
+        }
+        if f == 0 {
+            kernel.push(src);
+        } else {
+            done.push((f.trailing_zeros(), f, src));
+        }
+    }
+    kernel
+}
+
+/// XOR of `m[i]` over the set bits `i` of `x`.
+fn apply_bits(m: Option<&Vec<Bits>>, x: Bits, what: &str) -> Bits {
+    let mut out = 0;
+    let mut x = x;
+    while x != 0 {
+        let i = x.trailing_zeros() as usize;
+        x &= x - 1;
+        out ^= m.unwrap_or_else(|| panic!("missing {what}"))[i];
+    }
+    out
+}
+
+/// The chain map `g_y: R_{s + y_s} -> R_s` of a class `y` of `Ext_B(F_2, F_2)`, read as the
+/// product `x -> y x` and, for each `k` asked for, the `Sq(k)` part of `g_y` that a two-cell
+/// module with top class in degree `k` sees.
+struct YMap {
+    y: (i32, i32, usize),
+    /// `(n, s)` of `x` -> per basis element of `Ext^{n,s}`, `y x` over `Ext^{n + y_n, s + y_s}`.
+    prod: BTreeMap<(i32, i32), Vec<Bits>>,
+    /// `(k, n, s)` -> per generator `e_l` of `R_s` in degree `n + s`, the coefficients of
+    /// `Sq(k) e_l` in `g_y(e')` over the generators `e'` of `Ext^{n + y_n + k, s + y_s}`.
+    cross: BTreeMap<(i32, i32, i32), Vec<Bits>>,
+}
+
+fn ymap(r: &SubRes, y: (i32, i32, usize), ks: &[i32], max_n: i32, max_s: i32) -> YMap {
+    let (yn, ys, yi) = y;
+    let yt = yn + ys;
+    let q0 = Arc::clone(&r.modules[0]);
+    let init = |t: i32, i: usize| -> FpVector {
+        let mut v = FpVector::new(TWO, q0.dimension(t - yt));
+        if t == yt && i == yi {
+            v.set_entry(q0.generator_offset(0, 0, 0), 1);
+        }
+        v
+    };
+    let out = lift(r, r, ys, yt, &init, max_n, max_s - ys, false, ks);
+    let mut prod = BTreeMap::new();
+    for ((ss, t), per_q) in &out.coeffs {
+        let s = ss - ys;
+        let tx = t - yt;
+        if tx < s {
+            continue;
+        }
+        let v: Vec<Bits> = (0..r.gens(s, tx))
+            .map(|k| {
+                per_q
+                    .iter()
+                    .enumerate()
+                    .fold(0, |a, (q, c)| a | ((c[k] as u64) << q))
+            })
+            .collect();
+        prod.insert((tx - s, s), v);
+    }
+    let mut cross = BTreeMap::new();
+    for ((ss, t), per_op) in &out.ops {
+        let s = ss - ys;
+        for (oi, &k) in ks.iter().enumerate() {
+            let tv = t - yt - k;
+            if tv < s {
+                continue;
+            }
+            let per_q = &per_op[oi];
+            let v: Vec<Bits> = (0..r.gens(s, tv))
+                .map(|l| {
+                    per_q
+                        .iter()
+                        .enumerate()
+                        .fold(0, |a, (q, c)| a | ((c[l] as u64) << q))
+                })
+                .collect();
+            cross.insert((k, tv - s, s), v);
+        }
+    }
+    YMap { y, prod, cross }
+}
+
+/// One bidegree of `Ext_B(H^*C)` for `C = S ∪_{h_j} e^{k+1}` (cohomology `x_0`, `x_k = Sq^k x_0`).
+///
+/// `R` is minimal, so the untwisted tensor complex `Hom_B(R ⊗ H^*C, F_2)` is `Ext(S) ⊕ Ext(S)[k]`
+/// (cochains on `(e, x_0)` and on `(e, x_k)`) with the one differential `(e, x_k)^* ↦ h_j e^*`.
+/// The basis: first the bottom-cell classes `e_p^*` for the positions `p` outside the pivots of
+/// `im h_j` (in increasing `p`), then the top-cell classes `(κ, x_k)` for the reduced echelon basis
+/// `κ` of `ker h_j` (in increasing pivot).
+struct CBid {
+    img: Vec<(u32, Bits)>,
+    free: Vec<u32>,
+    ker: Vec<(u32, Bits)>,
+}
+
+impl CBid {
+    fn dim(&self) -> usize {
+        self.free.len() + self.ker.len()
+    }
+
+    /// The cocycle `(u on x_0, v on x_k)` of basis element `c`.
+    fn rep(&self, c: usize) -> (Bits, Bits) {
+        if c < self.free.len() {
+            (1 << self.free[c], 0)
+        } else {
+            (0, self.ker[c - self.free.len()].1)
+        }
+    }
+
+    /// The class of the cocycle `(u, v)`.
+    fn project(&self, mut u: Bits, mut v: Bits) -> Bits {
+        let nf = self.free.len();
+        let mut out = 0;
+        for (i, &(p, kv)) in self.ker.iter().enumerate() {
+            if (v >> p) & 1 == 1 {
+                v ^= kv;
+                out |= 1 << (nf + i);
+            }
+        }
+        assert_eq!(v, 0, "not a cocycle: top-cell part outside ker h_j");
+        for &(p, b) in &self.img {
+            if (u >> p) & 1 == 1 {
+                u ^= b;
+            }
+        }
+        for (c, &p) in self.free.iter().enumerate() {
+            if (u >> p) & 1 == 1 {
+                out |= 1 << c;
+            }
+        }
+        out
+    }
+}
+
+/// `y` times the cocycle `(u, v)` at `(n, s)` of the two-cell module with top degree `k`, as a
+/// cocycle at `(n + y_n, s + y_s)`: `(y ψ)(e', m) = Σ_l ψ(e_l, χ(b_l) m)` for `g_y(e') = Σ b_l e_l`,
+/// and `χ(b) x_0` is the `Sq(k)`-coefficient of `b` times `x_k` (for `k = 4`, `χ(Sq(4)) = Sq(4) +
+/// Sq(1, 1)` and `Sq(1, 1) x_0 = 0`).
+fn act_cocycle(y: &YMap, k: i32, n: i32, s: i32, (u, v): (Bits, Bits)) -> (Bits, Bits) {
+    let u2 = apply_bits(y.prod.get(&(n, s)), u, "product (bottom)")
+        ^ apply_bits(y.cross.get(&(k, n - k, s)), v, "Sq(k) cross term");
+    let v2 = apply_bits(y.prod.get(&(n - k, s)), v, "product (top)");
+    (u2, v2)
+}
+
+/// Export `Ext_B(H^*C)` for the two-cell complexes `C = S ∪_{h_j} e^{k+1}` in the format of ext's
+/// `cofiber_export` (`<C>_rank.csv`, `<C>_indaction.csv`, `<C>_istar.csv`, `<C>_pstar.csv`,
+/// `<C>_unknown.csv`), in the basis of the ring export in `ring_dir` (same save, same generators).
+/// With `box_n, box_s > 0` it also writes `<C>_action.csv`: the action of every class of
+/// `Ext_B(F_2, F_2)` in stems `<= box_n` and filtrations `<= box_s`, each by its own chain map
+/// (zero products included), for the diagram engine's action check.
+#[allow(clippy::too_many_arguments)]
+fn cofiber_export(
+    r: &SubRes,
+    max_n: i32,
+    max_s: i32,
+    ring_dir: &std::path::Path,
+    dir: &std::path::Path,
+    specs: &[(String, i32)],
+    box_n: i32,
+    box_s: i32,
+) -> anyhow::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    let start = Instant::now();
+    r.prepare_target(max_s);
+    eprintln!("quasi-inverses in {:.1}s", start.elapsed().as_secs_f64());
+    let dim_s = |n: i32, s: i32| -> usize {
+        if n < 0 || s < 0 || n > max_n || s > max_s + 1 {
+            0
+        } else {
+            r.gens(s, n + s)
+        }
+    };
+
+    // Same resolution as the ring export: the ranks agree.
+    let mut ring_rank = BTreeMap::new();
+    for l in std::fs::read_to_string(ring_dir.join("rank.csv"))?
+        .lines()
+        .skip(1)
+    {
+        let v: Vec<i32> = l.split(',').map(|x| x.parse().unwrap()).collect();
+        ring_rank.insert((v[0], v[1]), v[2] as usize);
+    }
+    let mut bad = 0;
+    for n in 0..=max_n {
+        for s in 0..=max_s {
+            if ring_rank.get(&(n, s)).copied().unwrap_or(0) != dim_s(n, s) {
+                bad += 1;
+            }
+        }
+    }
+    ensure!(bad == 0, "{bad} ranks differ from the ring export");
+
+    let inds: Vec<(i32, i32, usize)> =
+        std::fs::read_to_string(ring_dir.join("indecomposables.csv"))?
+            .lines()
+            .skip(1)
+            .map(|l| {
+                let v: Vec<&str> = l.split(',').collect();
+                (
+                    v[0].parse().unwrap(),
+                    v[1].parse().unwrap(),
+                    v[2].parse().unwrap(),
+                )
+            })
+            .collect();
+    let ks: Vec<i32> = specs.iter().map(|(_, k)| *k).collect();
+    let t0 = Instant::now();
+    let ymaps: Vec<YMap> = inds
+        .iter()
+        .map(|&y| {
+            let t = Instant::now();
+            let m = ymap(r, y, &ks, max_n, max_s);
+            eprintln!("chain map of {y:?} in {:.1}s", t.elapsed().as_secs_f64());
+            m
+        })
+        .collect();
+    eprintln!(
+        "indecomposable chain maps in {:.1}s",
+        t0.elapsed().as_secs_f64()
+    );
+
+    // Our products agree with the ring export's generator products (same basis).
+    {
+        let mut ring: BTreeMap<((i32, i32, usize), (i32, i32, usize)), Bits> = BTreeMap::new();
+        for l in std::fs::read_to_string(ring_dir.join("generator_products.csv"))?
+            .lines()
+            .skip(1)
+        {
+            let v: Vec<&str> = l.splitn(7, ',').collect();
+            let p = |i: usize| v[i].parse::<i32>().unwrap();
+            ring.insert(
+                ((p(0), p(1), p(2) as usize), (p(3), p(4), p(5) as usize)),
+                parse_bits(v[6]),
+            );
+        }
+        let (mut same, mut diff) = (0, 0);
+        for ym in &ymaps {
+            for (&(n, s), per_x) in &ym.prod {
+                if n + ym.y.0 > max_n || s + ym.y.1 > max_s {
+                    continue;
+                }
+                for (k, &p) in per_x.iter().enumerate() {
+                    let theirs = ring.get(&(ym.y, (n, s, k))).copied().unwrap_or(0);
+                    if theirs == p {
+                        same += 1;
+                    } else {
+                        diff += 1;
+                        if diff < 10 {
+                            eprintln!(
+                                "product {:?} * ({n},{s},{k}): ours {p:b} ring {theirs:b}",
+                                ym.y
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        eprintln!("products vs ring export: {same} agree, {diff} differ");
+        ensure!(diff == 0, "products differ from the ring export");
+    }
+
+    // h_i: Ext^{n,s} -> Ext^{n + 2^i - 1, s + 1}, from the differential
+    let hmat = |i: u32, n: i32, s: i32| -> Vec<Bits> {
+        if dim_s(n, s) == 0 {
+            return vec![];
+        }
+        h_matrix(
+            &r.alg,
+            &r.modules[s as usize],
+            &r.modules[(s + 1) as usize],
+            &r.d[(s + 1) as usize],
+            i,
+            n + s,
+        )
+        .iter()
+        .map(|row| bits_of(row))
+        .collect()
+    };
+
+    for (name, k) in specs {
+        let k = *k;
+        let j = k.trailing_zeros();
+        ensure!(k == 1 << j && j <= 2, "{name}: k = {k} is not 1, 2 or 4");
+        let t1 = Instant::now();
+        let mut cb: BTreeMap<(i32, i32), CBid> = BTreeMap::new();
+        for n in 0..=max_n {
+            for s in 0..=max_s {
+                let d = dim_s(n, s);
+                let img = if s >= 1 && n - k + 1 >= 0 {
+                    rref_bits(hmat(j, n - k + 1, s - 1))
+                } else {
+                    vec![]
+                };
+                let free: Vec<u32> = (0..d as u32)
+                    .filter(|&p| img.iter().all(|&(q, _)| q != p))
+                    .collect();
+                let ker = if n - k >= 0 {
+                    rref_bits(kernel_bits(&hmat(j, n - k, s)))
+                } else {
+                    vec![]
+                };
+                let c = CBid { img, free, ker };
+                if c.dim() > 0 {
+                    ensure!(c.dim() <= 64, "{name}: rank {} at ({n},{s})", c.dim());
+                    cb.insert((n, s), c);
+                }
+            }
+        }
+        let csv = |suffix: &str, header: &str| -> anyhow::Result<BufWriter<std::fs::File>> {
+            let mut w = BufWriter::new(std::fs::File::create(
+                dir.join(format!("{name}_{suffix}.csv")),
+            )?);
+            writeln!(w, "{header}")?;
+            Ok(w)
+        };
+        let mut w = csv("rank", "stem,Adams_filtration,rank")?;
+        let mut total = 0;
+        for (&(n, s), c) in &cb {
+            writeln!(w, "{n},{s},{}", c.dim())?;
+            total += c.dim();
+        }
+        w.flush()?;
+
+        let mut w = csv("istar", "stem,Adams_filtration,index,image")?;
+        for (&(n, s), c) in &cb {
+            for g in 0..dim_s(n, s) {
+                let img = c.project(1 << g, 0);
+                if img != 0 {
+                    writeln!(w, "{n},{s},{g},{}", fmt_bits(img, c.dim()))?;
+                }
+            }
+        }
+        w.flush()?;
+        let mut w = csv("pstar", "stem,Adams_filtration,index,image")?;
+        for (&(n, s), c) in &cb {
+            for x in 0..c.dim() {
+                let (_, v) = c.rep(x);
+                if v != 0 {
+                    writeln!(w, "{n},{s},{x},{}", fmt_bits(v, dim_s(n - k, s)))?;
+                }
+            }
+        }
+        w.flush()?;
+
+        // `y` times the module vector `v` at `(n, s)`, if the target is in range
+        let act = |y: &YMap, n: i32, s: i32, v: Bits| -> Option<Bits> {
+            let (tn, ts) = (n + y.y.0, s + y.y.1);
+            if tn > max_n || ts > max_s {
+                return None;
+            }
+            let src = cb.get(&(n, s))?;
+            let tgt = cb.get(&(tn, ts))?;
+            let (mut u, mut w) = (0, 0);
+            for x in 0..src.dim() {
+                if (v >> x) & 1 == 1 {
+                    let (a, b) = act_cocycle(y, k, n, s, src.rep(x));
+                    u ^= a;
+                    w ^= b;
+                }
+            }
+            Some(tgt.project(u, w))
+        };
+
+        let header = "stem_1,Adams_filtration_1,index_1,stem_2,Adams_filtration_2,index_2,product";
+        let mut w = csv("indaction", header)?;
+        let mut rows = 0;
+        for y in &ymaps {
+            for (&(n, s), c) in &cb {
+                for x in 0..c.dim() {
+                    if let Some(p) = act(y, n, s, 1 << x)
+                        && p != 0
+                    {
+                        let tdim = cb[&(n + y.y.0, s + y.y.1)].dim();
+                        writeln!(
+                            w,
+                            "{},{},{},{n},{s},{x},{}",
+                            y.y.0,
+                            y.y.1,
+                            y.y.2,
+                            fmt_bits(p, tdim)
+                        )?;
+                        rows += 1;
+                    }
+                }
+            }
+        }
+        w.flush()?;
+        // every product in range is known
+        let mut w = csv(
+            "unknown",
+            "stem_1,Adams_filtration_1,index_1,stem_2,Adams_filtration_2,index_2,reason",
+        )?;
+        w.flush()?;
+
+        // The action is a module action of a commutative ring: y (z x) = z (y x).
+        let (mut ok, mut bad) = (0usize, 0usize);
+        for (a, y) in ymaps.iter().enumerate() {
+            for z in &ymaps[a + 1..] {
+                for (&(n, s), c) in &cb {
+                    for x in 0..c.dim() {
+                        let yz =
+                            act(z, n, s, 1 << x).and_then(|v| act(y, n + z.y.0, s + z.y.1, v));
+                        let zy =
+                            act(y, n, s, 1 << x).and_then(|v| act(z, n + y.y.0, s + y.y.1, v));
+                        match (yz, zy) {
+                            (Some(p), Some(q)) if p == q => ok += 1,
+                            (Some(_), Some(_)) => {
+                                bad += 1;
+                                if bad < 10 {
+                                    eprintln!(
+                                        "{name}: {:?} {:?} ({n},{s},{x}) not commutative",
+                                        y.y, z.y
+                                    );
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        }
+        eprintln!("{name}: commutativity y(zx) = z(yx): {ok} agree, {bad} differ");
+        ensure!(bad == 0, "{name}: action not commutative");
+        eprintln!(
+            "{name}: {} bidegrees, dim {total}, {rows} indecomposable action rows, {:.1}s",
+            cb.len(),
+            t1.elapsed().as_secs_f64()
+        );
+
+        if box_n > 0 && box_s > 0 {
+            let t2 = Instant::now();
+            let mut w = csv("action", header)?;
+            let ys: Vec<(i32, i32, usize)> = (0..=box_n)
+                .flat_map(|n| (1..=box_s).map(move |s| (n, s)))
+                .flat_map(|(n, s)| (0..dim_s(n, s)).map(move |i| (n, s, i)))
+                .collect();
+            let maps: Vec<YMap> = ys
+                .into_maybe_par_iter()
+                .map(|y| ymap(r, y, &[k], box_n, box_s))
+                .collect();
+            let mut rows = 0;
+            for y in &maps {
+                for (&(n, s), c) in &cb {
+                    if n + y.y.0 > box_n || s + y.y.1 > box_s {
+                        continue;
+                    }
+                    for x in 0..c.dim() {
+                        if let Some(p) = act(y, n, s, 1 << x) {
+                            let tdim = cb[&(n + y.y.0, s + y.y.1)].dim();
+                            writeln!(
+                                w,
+                                "{},{},{},{n},{s},{x},{}",
+                                y.y.0,
+                                y.y.1,
+                                y.y.2,
+                                fmt_bits(p, tdim)
+                            )?;
+                            rows += 1;
+                        }
+                    }
+                }
+            }
+            w.flush()?;
+            eprintln!(
+                "{name}: action of {} classes in stems <= {box_n}, filtrations <= {box_s}: {rows} \
+                 rows, {:.1}s",
+                maps.len(),
+                t2.elapsed().as_secs_f64()
+            );
+        }
+    }
+    Ok(())
+}
+
 fn main() -> anyhow::Result<()> {
     ext::utils::init_logging()?;
     let args: Vec<String> = std::env::args().collect();
+    if args.get(1).is_some_and(|a| a == "cofibers") {
+        // restrict_unit cofibers <B save> <max n> <max s> <ring dir> <out dir> [name:k,...]
+        // [box n] [box s]
+        ensure!(
+            args.len() >= 7,
+            "usage: restrict_unit cofibers <B save> <max n> <max s> <ring dir> <out dir> \
+             [name:k,...] [box n] [box s]"
+        );
+        let max_n: i32 = args[3].parse()?;
+        let max_s: i32 = args[4].parse()?;
+        let specs: Vec<(String, i32)> = args
+            .get(7)
+            .map_or("C2:1,Ceta:2,Cnu:4", |s| s.as_str())
+            .split(',')
+            .map(|sp| {
+                let (a, b) = sp.split_once(':').expect("name:k");
+                (a.to_string(), b.parse().expect("k"))
+            })
+            .collect();
+        let box_n: i32 = args.get(8).map_or(Ok(0), |s| s.parse())?;
+        let box_s: i32 = args.get(9).map_or(Ok(0), |s| s.parse())?;
+        // one filtration more, for ker h_j at the top
+        let r = SubRes::load(std::path::Path::new(&args[2]), max_n, max_s + 1)?;
+        eprintln!("d^2 = 0 on {} generators", r.check_dd());
+        return cofiber_export(
+            &r,
+            max_n,
+            max_s,
+            std::path::Path::new(&args[5]),
+            std::path::Path::new(&args[6]),
+            &specs,
+            box_n,
+            box_s,
+        );
+    }
     if args.get(1).is_some_and(|a| a == "ring") {
         // restrict_unit ring <B save> <max n> <max s> <out dir>
         ensure!(
@@ -751,7 +1386,7 @@ fn main() -> anyhow::Result<()> {
     };
     let target = PTarget(Arc::clone(&res));
     let t2 = Instant::now();
-    let iota = lift(&r, &target, 0, 0, &init, max_n, max_s, verify);
+    let iota = lift(&r, &target, 0, 0, &init, max_n, max_s, verify, &[]);
     let lift_secs = t2.elapsed().as_secs_f64();
     eprintln!(
         "lift in {lift_secs:.1}s wall; thread-seconds: multiply {:.1}, solve {:.1}, verify {:.1}",
@@ -954,7 +1589,7 @@ fn main() -> anyhow::Result<()> {
                 v
             };
             let start = Instant::now();
-            let prod = lift(&r, &r, ys, yt, &init, max_n, max_s - ys, verify);
+            let prod = lift(&r, &r, ys, yt, &init, max_n, max_s - ys, verify, &[]);
             for ((ss, t), per_q) in &prod.coeffs {
                 let s = ss - ys;
                 let tx = t - yt;
