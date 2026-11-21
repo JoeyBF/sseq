@@ -2,7 +2,9 @@
 
     python3 -I ctau_legacy.py <tower export> <output directory> <max stem> <max filtration>
 
-The basis of a tridegree is the classes `h_0^i g` it holds, ordered by the id of the tower. Every
+The basis of a tridegree is the classes `h_0^i g` it holds, ordered by the id of the tower, which
+is an opaque string (a number from the in-memory driver, `filtration_weight_index` from the
+spilling one). Every
 map of the tower export commutes with `h_0`, so its value on `h_0^i g` is the sum of the targets
 of `g` whose towers still hold a class in the tridegree of the image. The output can be checked
 with `ctau_check.py` and `ctau_compare.py`; it is for small ranges.
@@ -32,12 +34,12 @@ def load(name):
     for r in rows(f"{src}/{name}_towers.csv"):
         n, s, w = int(r["stem"]), int(r["filtration"]), int(r["weight"])
         length = max_s + 1 - s if r["length"] == "inf" else int(r["length"])
-        towers[int(r["id"])] = (n, s, w, length)
+        towers[r["id"]] = (n, s, w, length)
         if n > max_n:
             continue
         for i in range(length):
             if s + i <= max_s:
-                basis[(n, s + i, w)].append(int(r["id"]))
+                basis[(n, s + i, w)].append(r["id"])
     for b in basis.values():
         b.sort()
     return towers, basis
@@ -77,13 +79,13 @@ for name in names:
             expand(w, "0,", hdeg[0], data[name], data[name], {g: [g] for g in towers})
         by_j = defaultdict(dict)
         for r in rows(f"{src}/{name}_h.csv"):
-            by_j[int(r["j"])][int(r["source"])] = [int(t) for t in r["targets"].split()]
+            by_j[int(r["j"])][r["source"]] = r["targets"].split()
         for j in sorted(by_j):
             expand(w, f"{j},", hdeg[j], data[name], data[name], by_j[j])
     if name == "Ctau":
         continue
     for kind, a, b, sign in (("istar", "Ctau", name, 0), ("pstar", name, "Ctau", -1)):
-        table = {int(r["source"]): [int(t) for t in r["targets"].split()] for r in rows(f"{src}/{name}_{kind}.csv")}
+        table = {r["source"]: r["targets"].split() for r in rows(f"{src}/{name}_{kind}.csv")}
         shift = tuple(sign * c for c in top[name])
         with open(f"{out}/{name}_{kind}.csv", "w") as w:
             w.write("stem,filtration,weight,index,image\n")

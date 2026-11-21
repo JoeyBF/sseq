@@ -149,6 +149,8 @@ pub struct QAlgebra {
     index: FxHashMap<QMono, u32>,
     /// `shorter[d][l]` is the number of monomials of degree `d` shorter than `l`.
     shorter: Vec<Vec<u32>>,
+    /// The coaction on each power of a generator asked for; see [`Self::power_coaction`].
+    powers: DashMap<(usize, u16), Arc<Vec<(PackedXi, QMono)>>>,
     /// The memo of [`Self::coaction`].
     memo: DashMap<QMono, Arc<Coaction>>,
     /// The number of terms at which the memo is emptied; see [`Self::set_memo_limit`].
@@ -274,6 +276,7 @@ impl QAlgebra {
             factors,
             index,
             shorter,
+            powers: DashMap::default(),
             memo: DashMap::default(),
             memo_limit: usize::MAX,
             memo_count: Default::default(),
@@ -308,6 +311,81 @@ impl QAlgebra {
             .ok()
             .and_then(|d| self.by_degree.get(d))
             .map_or(&[], |b| b)
+    }
+
+    /// The length of the monomial at `idx` in degree `d`.
+    pub fn len_at(&self, d: i32, idx: u32) -> u16 {
+        mono_len(&self.by_degree[d as usize][idx as usize]) as u16
+    }
+
+    /// The coaction on $q_n^e$ as terms $(\xi^R, m')$: the product over the binary digits of
+    /// `e` of Frobenius twists of the coaction on $q_n$. Kept, since few `(n, e)` occur.
+    fn power_coaction(&self, n: usize, e: u16) -> Arc<Vec<(PackedXi, QMono)>> {
+        if let Some(hit) = self.powers.get(&(n, e)) {
+            return Arc::clone(&hit);
+        }
+        let mut acc: FxHashSet<(PackedXi, QMono)> = std::iter::once((0, [0; Q_VARS])).collect();
+        for j in 0..16 {
+            if e >> j & 1 == 0 {
+                continue;
+            }
+            let mut next = FxHashSet::default();
+            for &(r, m) in &acc {
+                for &(s, i) in &self.factors[n + 1] {
+                    let mut m = m;
+                    if i > 0 {
+                        m[i - 1] += 1 << j;
+                    }
+                    toggle(&mut next, (r + (s << j), m));
+                }
+            }
+            acc = next;
+        }
+        let out = Arc::new(acc.into_iter().collect::<Vec<_>>());
+        self.powers.insert((n, e), Arc::clone(&out));
+        out
+    }
+
+    /// The terms $(\xi^R, m')$ of the coaction on `m` with `keep(R)`, computed from scratch and
+    /// not kept: the product of the coactions on the powers of each generator, filtered as the
+    /// last factor is multiplied in.
+    ///
+    /// Unlike [`Self::coaction`] this holds nothing between calls, which is what tabulating
+    /// every monomial of a degree needs.
+    pub fn coaction_filtered(
+        &self,
+        m: &QMono,
+        keep: impl Fn(PackedXi) -> bool,
+    ) -> Vec<(PackedXi, QMono)> {
+        let mut factors: Vec<Arc<Vec<(PackedXi, QMono)>>> = m
+            .iter()
+            .enumerate()
+            .filter(|x| *x.1 > 0)
+            .map(|(n, &e)| self.power_coaction(n, e))
+            .collect();
+        factors.sort_by_key(|f| f.len());
+        let Some(last) = factors.pop() else {
+            return if keep(0) { vec![(0, *m)] } else { Vec::new() };
+        };
+        let mut acc: Vec<(PackedXi, QMono)> = vec![(0, [0; Q_VARS])];
+        for f in &factors {
+            let mut next: FxHashSet<(PackedXi, QMono)> = FxHashSet::default();
+            for &(r, x) in &acc {
+                for &(s, y) in f.iter() {
+                    toggle(&mut next, (r + s, mono_mul(&x, &y)));
+                }
+            }
+            acc = next.into_iter().collect();
+        }
+        let mut out: FxHashSet<(PackedXi, QMono)> = FxHashSet::default();
+        for &(r, x) in &acc {
+            for &(s, y) in last.iter() {
+                if keep(r + s) {
+                    toggle(&mut out, (r + s, mono_mul(&x, &y)));
+                }
+            }
+        }
+        out.into_iter().collect()
     }
 
     /// The whole coaction on `m`, from which [`Self::act`] reads $P(R) \cdot m$ for any $R$.

@@ -11,8 +11,10 @@ use algebra::AlgebraType;
 use ext::{
     chain_complex::ChainComplex,
     ctau::{BarComparison, OpTable, QAlgebra, QPoly, Tri},
+    ctau_lazy::{LazyOptions, export},
     ctau_scale::{
-        Complex, NEVER, OpTables, ScaledExt, StreamedBackbone, bar_cup, induced, pullback_columns,
+        BackboneSource, Complex, NEVER, OpTables, ScaledExt, StreamedBackbone, add_operations,
+        bar_cup, induced, needed_operations, pullback_columns,
     },
     save::SaveKind,
     utils::query_module_only,
@@ -190,6 +192,128 @@ fn products(
     Ok(())
 }
 
+/// The shifts the operation tables hold: those of `h_1, ..., h_4`, the cell actions of the Hopf
+/// cofibers, and their sums.
+const SHIFTS: [u128; 10] = [1, 2, 3, 4, 5, 6, 8, 9, 10, 12];
+
+/// The complex of a name.
+fn complex(name: &str) -> anyhow::Result<Complex> {
+    Ok(match name {
+        "C2" => Complex::moore(),
+        "Ceta" => Complex::hopf(name, 0),
+        "Cnu" => Complex::hopf(name, 1),
+        "Csigma" => Complex::hopf(name, 2),
+        _ => anyhow::bail!("unknown complex {name}"),
+    })
+}
+
+/// The export in bounded memory: see [`ext::ctau_lazy::export`]. Tower ids are
+/// `filtration_weight_index` here, since nothing counts the towers ahead.
+fn lazy(
+    dir: &std::path::Path,
+    store: &ext::save::ZarrSaveStore,
+    algebra: &std::sync::Arc<algebra::MilnorAlgebra>,
+    ops: &OpTable,
+    max_n: i32,
+    specs: &str,
+    options: LazyOptions,
+) -> anyhow::Result<()> {
+    let begin = Instant::now();
+    let (max_a, max_t) = ScaledExt::backbone_range(max_n);
+    let source = BackboneSource::open(store, algebra, ops, max_a, &max_t)?;
+    // One pass over the backbone for the operations that occur; the terms are dropped.
+    let reach = ScaledExt::reach(max_n);
+    let found: Vec<anyhow::Result<(rustc_hash::FxHashMap<u128, i32>, usize)>> = (1..=max_a)
+        .into_maybe_par_iter()
+        .map(|a| {
+            let slice = source.slice(a)?;
+            let mut out = Default::default();
+            add_operations(&mut out, &slice, a, &reach);
+            Ok((out, slice.len()))
+        })
+        .collect();
+    let mut operations: rustc_hash::FxHashMap<u128, i32> = Default::default();
+    for f in found {
+        for (op, r) in f?.0 {
+            let slot = operations.entry(op).or_insert(i32::MIN);
+            *slot = (*slot).max(r);
+        }
+    }
+    eprintln!(
+        "backbone: {} operations: {:.1} s, peak {:.1} GB",
+        operations.len(),
+        begin.elapsed().as_secs_f64(),
+        peak_gb()
+    );
+    let q_degree = max_n / 2 + 2;
+    let q = QAlgebra::new(q_degree, q_degree as u32);
+    let start = Instant::now();
+    let tables = OpTables::new(&q, &needed_operations(operations, &SHIFTS), q_degree);
+    eprintln!(
+        "operation tables: {} entries: {:.1} s, peak {:.1} GB",
+        tables.entries(),
+        start.elapsed().as_secs_f64(),
+        peak_gb()
+    );
+    let names: Vec<&str> = specs
+        .split(',')
+        .filter(|s| !s.is_empty() && *s != "-")
+        .collect();
+    let report = |name: &str, stats: &ext::ctau_lazy::LazyStats, start: Instant| {
+        let s = stats.reduce;
+        eprintln!(
+            "{name}: {} towers; {} cochains (largest space {}), {} coboundary entries, {} \
+             reduced entries (longest column {}), {} entries added; spill {:.2} GB written, \
+             {:.2} GB read: {:.1} s, peak {:.1} GB",
+            stats.towers,
+            s.cochains,
+            s.largest,
+            s.input_entries,
+            s.reduced_entries,
+            s.longest,
+            s.additions,
+            stats.written as f64 / 1e9,
+            stats.read as f64 / 1e9,
+            start.elapsed().as_secs_f64(),
+            peak_gb()
+        );
+    };
+    let start = Instant::now();
+    let (ctau, stats) = export(
+        &q,
+        &source,
+        &tables,
+        Complex::sphere(),
+        max_n,
+        None,
+        !names.is_empty(),
+        dir,
+        &options,
+    )?;
+    report("Ctau", &stats, start);
+    for name in names {
+        let start = Instant::now();
+        let (_, stats) = export(
+            &q,
+            &source,
+            &tables,
+            complex(name)?,
+            max_n,
+            Some(&ctau),
+            false,
+            dir,
+            &options,
+        )?;
+        report(name, &stats, start);
+    }
+    eprintln!(
+        "total {:.1} s, peak {:.1} GB",
+        begin.elapsed().as_secs_f64(),
+        peak_gb()
+    );
+    Ok(())
+}
+
 /// Reads the range and the save, and writes the export.
 ///
 /// Nothing is resolved or lifted, and the resolution is not loaded: its differentials are read
@@ -222,13 +346,41 @@ fn main() -> anyhow::Result<()> {
     });
     let product_weight: i32 =
         query::with_default("Product bound (weight of β, 0 for none)", "0", str::parse);
+    let spill_dir: String = query::with_default(
+        "Spill directory (- to keep everything in memory)",
+        "-",
+        |s| Ok::<_, anyhow::Error>(s.to_string()),
+    );
+    let spill_dir = (spill_dir != "-").then(|| PathBuf::from(spill_dir));
+    let in_flight: usize = query::with_default("Weights in flight", "8", str::parse);
     std::fs::create_dir_all(&dir)?;
+    if let Some(d) = &spill_dir {
+        std::fs::create_dir_all(d)?;
+    }
     let store = res.save_dir().store().expect("a saved resolution");
     let algebra = res.algebra();
 
     let begin = Instant::now();
     let ops = OpTable::new(algebra.clone());
     let (max_a, max_t) = ScaledExt::backbone_range(max_n);
+    if let Some(spill_dir) = spill_dir {
+        anyhow::ensure!(
+            product_weight == 0,
+            "products need the in-memory driver: give - as the spill directory"
+        );
+        return lazy(
+            &dir,
+            store,
+            &algebra,
+            &ops,
+            max_n,
+            &specs,
+            LazyOptions {
+                in_flight,
+                spill_dir,
+            },
+        );
+    }
     let bb = StreamedBackbone::read(store, &algebra, &ops, max_a, &max_t)?;
     eprintln!(
         "backbone: {} terms: {:.1} s, peak {:.1} GB",
@@ -243,10 +395,8 @@ fn main() -> anyhow::Result<()> {
     // the shifts are those of h_1, ..., h_4, the cell actions of the Hopf cofibers, and their sums
     let tables = OpTables::new(
         &q,
-        &bb,
-        &[1, 2, 3, 4, 5, 6, 8, 9, 10, 12],
+        &needed_operations(bb.operations(ScaledExt::reach(max_n)), &SHIFTS),
         q_degree,
-        ScaledExt::reach(max_n),
     );
     q.clear_memo();
     eprintln!(
@@ -372,13 +522,7 @@ fn main() -> anyhow::Result<()> {
     let ctau = export(&dir, &q, &bb, &tables, Complex::sphere(), max_n)?;
 
     for name in specs.split(',').filter(|s| !s.is_empty() && *s != "-") {
-        let cx = match name {
-            "C2" => Complex::moore(),
-            "Ceta" => Complex::hopf(name, 0),
-            "Cnu" => Complex::hopf(name, 1),
-            "Csigma" => Complex::hopf(name, 2),
-            _ => anyhow::bail!("unknown complex {name}"),
-        };
+        let cx = complex(name)?;
         ctau.clear_spaces();
         let cof = export(&dir, &q, &bb, &tables, cx, max_n)?;
         let start = Instant::now();

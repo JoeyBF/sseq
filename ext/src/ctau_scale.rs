@@ -85,44 +85,53 @@ impl GenTerms {
     }
 }
 
-/// The generators and differentials of a saved minimal resolution, read straight off the save
-/// one bidegree at a time and kept only as sparse terms, grouped by the generator they land on.
-///
-/// The resolution itself is never loaded: its loader holds every differential as a dense vector.
-pub struct StreamedBackbone {
-    /// `gens[a][t]`.
-    gens: Vec<Vec<u32>>,
-    /// `inv[a]` files the terms of the differentials of the generators of $P_a$ under the
-    /// generators `(t, i)` of $P_{a-1}$, each list sorted by the degree of $z_l$.
-    inv: Vec<FxHashMap<(u16, u32), GenTerms>>,
-    terms: usize,
+/// What the cochains read of a minimal resolution: its generators, and the terms of its
+/// differentials filed by the generator they land on.
+pub trait Backbone: Sync {
+    /// The number of generators of $P_a$ in degree `t`, zero outside the range read.
+    fn gens(&self, a: i32, t: i32) -> usize;
+
+    /// The terms of the differentials of $P_a$ that land on generator `i` of degree `t` of
+    /// $P_{a-1}$, if there are any.
+    ///
+    /// # Panics
+    ///
+    /// If the differentials of $P_a$ are not held.
+    fn inv(&self, a: i32, t: i32, i: u32) -> Option<&GenTerms>;
 }
 
-impl StreamedBackbone {
-    /// Reads $P_a$ for `a <= max_a` in degrees up to `max_t(a)`, which must not decrease with
-    /// `a`. Fails, rather than resolve, if the save lacks a bidegree.
-    ///
-    /// Bidegrees strictly between stem 0 and the Adams vanishing line are not read, and neither
-    /// is stem 0, where $P_a$ has the one generator $x_a$ with $d x_a = Sq^1 x_{a-1}$: the
-    /// motivic $h_1$-tower needs it far above the filtrations a save holds.
-    pub fn read(
-        store: &ZarrSaveStore,
+/// The terms of the differentials of one $P_a$, filed under the generators `(t, i)` of
+/// $P_{a-1}$.
+pub type Slice = FxHashMap<(u16, u32), GenTerms>;
+
+/// The generators of a saved minimal resolution, and a way to read the differentials of one
+/// filtration at a time straight off the save, keeping only sparse terms.
+///
+/// The resolution itself is never loaded: its loader holds every differential as a dense vector.
+/// Bidegrees strictly between stem 0 and the Adams vanishing line are not read, and neither is
+/// stem 0, where $P_a$ has the one generator $x_a$ with $d x_a = Sq^1 x_{a-1}$: the motivic
+/// $h_1$-tower needs it far above the filtrations a save holds.
+pub struct BackboneSource<'a> {
+    store: &'a ZarrSaveStore,
+    algebra: Arc<MilnorAlgebra>,
+    ops: &'a OpTable,
+    /// `gens[a][t]`.
+    gens: Vec<Vec<u32>>,
+    max_t: Box<dyn Fn(i32) -> i32 + Sync + 'a>,
+}
+
+impl<'a> BackboneSource<'a> {
+    /// Reads the generators of $P_a$ for `a <= max_a` in degrees up to `max_t(a + 1)`, where
+    /// `max_t` must not decrease. Fails, rather than resolve, if the save lacks a bidegree.
+    pub fn open(
+        store: &'a ZarrSaveStore,
         algebra: &Arc<MilnorAlgebra>,
-        ops: &OpTable,
+        ops: &'a OpTable,
         max_a: i32,
-        max_t: impl Fn(i32) -> i32 + Sync,
+        max_t: impl Fn(i32) -> i32 + Sync + 'a,
     ) -> anyhow::Result<Self> {
         use maybe_rayon::prelude::*;
         algebra.compute_basis(max_t(max_a + 1));
-        // Ext^{a, t} vanishes for 0 < t - a < 2a - 3.
-        let vanishes = |a: i32, t: i32| t - a > 0 && t - a < 2 * a - 3;
-        let blob = |a: i32, t: i32| -> anyhow::Result<Vec<u8>> {
-            store
-                .read(SaveKind::NassauDifferential, Bidegree::s_t(a, t))?
-                .ok_or_else(|| anyhow::anyhow!("the save lacks ({a}, {t}); refusing to resolve"))
-        };
-        // P_a is the target of the differentials of P_{a+1}, which index its basis through the
-        // degrees they are read in.
         let gens: Vec<anyhow::Result<Vec<u32>>> = (0..=max_a)
             .into_maybe_par_iter()
             .map(|a| {
@@ -135,73 +144,24 @@ impl StreamedBackbone {
                         } else if t == a {
                             1
                         } else {
-                            (&blob(a, t)?[..]).read_u64::<LittleEndian>()? as u32
+                            (&blob(store, a, t)?[..]).read_u64::<LittleEndian>()? as u32
                         })
                     })
                     .collect()
             })
             .collect();
-        let gens: Vec<Vec<u32>> = gens.into_iter().collect::<anyhow::Result<_>>()?;
-        let inv: Vec<anyhow::Result<FxHashMap<(u16, u32), GenTerms>>> = (0..=max_a)
-            .into_maybe_par_iter()
-            .map(|a| {
-                let mut by_gen: FxHashMap<(u16, u32), Vec<InvTerm>> = FxHashMap::default();
-                if a == 0 {
-                    return Ok(FxHashMap::default());
-                }
-                let target = FreeModule::new(Arc::clone(algebra), format!("P{}", a - 1), 0);
-                for (t, &n) in gens[a as usize - 1].iter().enumerate() {
-                    target.add_generators(t as i32, n as usize, None);
-                }
-                target.compute_basis(max_t(a));
-                for t in a..=max_t(a) {
-                    if gens[a as usize][t as usize] == 0 {
-                        continue;
-                    }
-                    if t == a {
-                        by_gen.entry((a as u16 - 1, 0)).or_default().push(InvTerm {
-                            op: 1,
-                            t: t as u16,
-                            l: 0,
-                        });
-                        continue;
-                    }
-                    let data = blob(a, t)?;
-                    let mut cursor = &data[..];
-                    let n = cursor.read_u64::<LittleEndian>()? as usize;
-                    let dim = cursor.read_u64::<LittleEndian>()? as usize;
-                    anyhow::ensure!(
-                        dim <= target.dimension(t),
-                        "({a}, {t}): saved dimension {dim} exceeds {}",
-                        target.dimension(t)
-                    );
-                    for l in 0..n {
-                        let v = FpVector::from_bytes(TWO, dim, &mut cursor)?;
-                        for (idx, _) in v.iter_nonzero() {
-                            let og = target.index_to_op_gen(t, idx);
-                            by_gen
-                                .entry((og.generator_degree as u16, og.generator_index as u32))
-                                .or_default()
-                                .push(InvTerm {
-                                    op: ops.pack(og.operation_degree, og.operation_index),
-                                    t: t as u16,
-                                    l: l as u32,
-                                });
-                        }
-                    }
-                }
-                Ok(by_gen
-                    .into_iter()
-                    .map(|(key, terms)| (key, GenTerms::new(terms, key.0)))
-                    .collect())
-            })
-            .collect();
-        let inv: Vec<_> = inv.into_iter().collect::<anyhow::Result<_>>()?;
-        let terms = inv
-            .iter()
-            .map(|m| m.values().map(|g| g.targets.len()).sum::<usize>())
-            .sum();
-        Ok(Self { gens, inv, terms })
+        Ok(Self {
+            store,
+            algebra: Arc::clone(algebra),
+            ops,
+            gens: gens.into_iter().collect::<anyhow::Result<_>>()?,
+            max_t: Box::new(max_t),
+        })
+    }
+
+    /// The largest filtration held.
+    pub fn max_a(&self) -> i32 {
+        self.gens.len() as i32 - 1
     }
 
     /// The number of generators of $P_a$ in degree `t`, zero outside the range read.
@@ -215,10 +175,140 @@ impl StreamedBackbone {
             .map_or(0, |&n| n as usize)
     }
 
-    /// The terms of the differentials of $P_a$ that land on generator `i` of degree `t` of
-    /// $P_{a-1}$, if there are any.
-    pub fn inv(&self, a: i32, t: i32, i: u32) -> Option<&GenTerms> {
-        self.inv.get(a as usize)?.get(&(t as u16, i))
+    /// The differentials of $P_a$, read off the save.
+    pub fn slice(&self, a: i32) -> anyhow::Result<Slice> {
+        let mut by_gen: FxHashMap<(u16, u32), Vec<InvTerm>> = FxHashMap::default();
+        if a <= 0 || a > self.max_a() {
+            return Ok(Slice::default());
+        }
+        let max_t = (self.max_t)(a);
+        let target = FreeModule::new(Arc::clone(&self.algebra), format!("P{}", a - 1), 0);
+        for (t, &n) in self.gens[a as usize - 1].iter().enumerate() {
+            target.add_generators(t as i32, n as usize, None);
+        }
+        target.compute_basis(max_t);
+        for t in a..=max_t {
+            if self.gens[a as usize][t as usize] == 0 {
+                continue;
+            }
+            if t == a {
+                by_gen.entry((a as u16 - 1, 0)).or_default().push(InvTerm {
+                    op: 1,
+                    t: t as u16,
+                    l: 0,
+                });
+                continue;
+            }
+            let data = blob(self.store, a, t)?;
+            let mut cursor = &data[..];
+            let n = cursor.read_u64::<LittleEndian>()? as usize;
+            let dim = cursor.read_u64::<LittleEndian>()? as usize;
+            anyhow::ensure!(
+                dim <= target.dimension(t),
+                "({a}, {t}): saved dimension {dim} exceeds {}",
+                target.dimension(t)
+            );
+            for l in 0..n {
+                let v = FpVector::from_bytes(TWO, dim, &mut cursor)?;
+                for (idx, _) in v.iter_nonzero() {
+                    let og = target.index_to_op_gen(t, idx);
+                    by_gen
+                        .entry((og.generator_degree as u16, og.generator_index as u32))
+                        .or_default()
+                        .push(InvTerm {
+                            op: self.ops.pack(og.operation_degree, og.operation_index),
+                            t: t as u16,
+                            l: l as u32,
+                        });
+                }
+            }
+        }
+        Ok(by_gen
+            .into_iter()
+            .map(|(key, terms)| (key, GenTerms::new(terms, key.0)))
+            .collect())
+    }
+
+    /// The backbone with the differentials of the given filtrations.
+    pub fn window(&self, slices: Vec<(i32, Arc<Slice>)>) -> BackboneWindow<'_> {
+        BackboneWindow {
+            gens: &self.gens,
+            slices: slices.into_iter().collect(),
+        }
+    }
+}
+
+/// $\mathrm{Ext}^{a, t}$ vanishes for $0 < t - a < 2a - 3$.
+fn vanishes(a: i32, t: i32) -> bool {
+    t - a > 0 && t - a < 2 * a - 3
+}
+
+/// The saved differential of a bidegree, or an error rather than a resolution if it is missing.
+fn blob(store: &ZarrSaveStore, a: i32, t: i32) -> anyhow::Result<Vec<u8>> {
+    store
+        .read(SaveKind::NassauDifferential, Bidegree::s_t(a, t))?
+        .ok_or_else(|| anyhow::anyhow!("the save lacks ({a}, {t}); refusing to resolve"))
+}
+
+/// A [`BackboneSource`] with the differentials of a few filtrations in memory.
+pub struct BackboneWindow<'a> {
+    gens: &'a [Vec<u32>],
+    slices: FxHashMap<i32, Arc<Slice>>,
+}
+
+impl Backbone for BackboneWindow<'_> {
+    fn gens(&self, a: i32, t: i32) -> usize {
+        if a < 0 || t < 0 {
+            return 0;
+        }
+        self.gens
+            .get(a as usize)
+            .and_then(|g| g.get(t as usize))
+            .map_or(0, |&n| n as usize)
+    }
+
+    fn inv(&self, a: i32, t: i32, i: u32) -> Option<&GenTerms> {
+        self.slices
+            .get(&a)
+            .unwrap_or_else(|| panic!("the differentials of P_{a} are not held"))
+            .get(&(t as u16, i))
+    }
+}
+
+/// A backbone with every differential in memory, for small ranges.
+pub struct StreamedBackbone {
+    /// `gens[a][t]`.
+    gens: Vec<Vec<u32>>,
+    /// `inv[a]` files the terms of the differentials of the generators of $P_a$.
+    inv: Vec<Slice>,
+    terms: usize,
+}
+
+impl StreamedBackbone {
+    /// Reads $P_a$ for `a <= max_a` in degrees up to `max_t(a)`; see [`BackboneSource`].
+    pub fn read(
+        store: &ZarrSaveStore,
+        algebra: &Arc<MilnorAlgebra>,
+        ops: &OpTable,
+        max_a: i32,
+        max_t: impl Fn(i32) -> i32 + Sync,
+    ) -> anyhow::Result<Self> {
+        use maybe_rayon::prelude::*;
+        let source = BackboneSource::open(store, algebra, ops, max_a, max_t)?;
+        let inv: Vec<anyhow::Result<Slice>> = (0..=max_a)
+            .into_maybe_par_iter()
+            .map(|a| source.slice(a))
+            .collect();
+        let inv: Vec<Slice> = inv.into_iter().collect::<anyhow::Result<_>>()?;
+        let terms = inv
+            .iter()
+            .map(|m| m.values().map(|g| g.targets.len()).sum::<usize>())
+            .sum();
+        Ok(Self {
+            gens: source.gens.clone(),
+            inv,
+            terms,
+        })
     }
 
     /// The number of terms held.
@@ -229,17 +319,44 @@ impl StreamedBackbone {
     /// Every operation that occurs in a differential, with the largest of `reach(g, t)` over
     /// the generators of $P_g$ of degree `t` it lands on.
     pub fn operations(&self, reach: impl Fn(i32, i32) -> i32) -> FxHashMap<PackedXi, i32> {
-        let mut out: FxHashMap<PackedXi, i32> = FxHashMap::default();
+        let mut out = FxHashMap::default();
         for (a, m) in self.inv.iter().enumerate() {
-            for (&(t, _), g) in m {
-                let r = reach(a as i32 - 1, t as i32);
-                for x in &g.ops {
-                    let slot = out.entry(x.0).or_insert(i32::MIN);
-                    *slot = (*slot).max(r);
-                }
-            }
+            add_operations(&mut out, m, a as i32, &reach);
         }
         out
+    }
+}
+
+/// Adds the operations of the differentials of $P_a$ to `out`, each with the largest
+/// `reach(a - 1, t)` over the generators of degree `t` it lands on.
+pub fn add_operations(
+    out: &mut FxHashMap<PackedXi, i32>,
+    slice: &Slice,
+    a: i32,
+    reach: &impl Fn(i32, i32) -> i32,
+) {
+    for (&(t, _), g) in slice {
+        let r = reach(a - 1, t as i32);
+        for x in &g.ops {
+            let slot = out.entry(x.0).or_insert(i32::MIN);
+            *slot = (*slot).max(r);
+        }
+    }
+}
+
+impl Backbone for StreamedBackbone {
+    fn gens(&self, a: i32, t: i32) -> usize {
+        if a < 0 || t < 0 {
+            return 0;
+        }
+        self.gens
+            .get(a as usize)
+            .and_then(|g| g.get(t as usize))
+            .map_or(0, |&n| n as usize)
+    }
+
+    fn inv(&self, a: i32, t: i32, i: u32) -> Option<&GenTerms> {
+        self.inv.get(a as usize)?.get(&(t as u16, i))
     }
 }
 
@@ -253,71 +370,93 @@ impl StreamedBackbone {
 /// and only in the degrees where a generator they land on carries monomials: the monomials of
 /// high degree sit on the generators of low degree, which few operations reach.
 pub struct OpTables {
-    /// For each degree, each operation $P(R)$ with the nonzero $P(R) \cdot m \ni m'$ as (position
-    /// of $m$, position of $m'$ in its degree, length of $m'$), sorted by $m$.
-    by_degree: Vec<FxHashMap<PackedXi, Vec<(u32, u32, u16)>>>,
+    /// For each degree, the range of `pairs` of each operation that acts.
+    index: Vec<FxHashMap<PackedXi, (u32, u32)>>,
+    /// For each degree, the nonzero $P(R) \cdot m \ni m'$ as the positions of $m$ and $m'$ in
+    /// their degrees, by operation and then by $m$.
+    pairs: Vec<Vec<[u16; 2]>>,
     entries: usize,
 }
 
 impl OpTables {
-    /// The tables through `max_degree` for the operations of `bb`, and for each of them with
-    /// each of `shifts` taken off, as the cell actions and cup products do. An operation is kept
-    /// in the degrees up to the largest `reach(g, t)` over the generators of $P_g$ of degree `t`
-    /// that it lands on: the largest degree of the monomials such a generator carries.
-    pub fn new(
-        q: &QAlgebra,
-        bb: &StreamedBackbone,
-        shifts: &[PackedXi],
-        max_degree: i32,
-        reach: impl Fn(i32, i32) -> i32,
-    ) -> Self {
+    /// The tables through `max_degree` for the operations `needed`, each kept in the degrees up
+    /// to its value there: the largest degree of the monomials carried by a generator it lands
+    /// on (see [`ScaledExt::reach`]).
+    ///
+    /// The coaction on each monomial is computed, filtered and dropped; nothing of it is kept
+    /// but the table.
+    pub fn new(q: &QAlgebra, needed: &FxHashMap<PackedXi, i32>, max_degree: i32) -> Self {
         use maybe_rayon::prelude::*;
-        let mut needed = bb.operations(reach);
-        for (op, r) in needed.clone() {
-            for &s in shifts {
-                if fits(s, op) {
-                    let slot = needed.entry(op - s).or_insert(i32::MIN);
-                    *slot = (*slot).max(r);
-                }
-            }
-        }
-        needed.insert(0, i32::MAX);
-        let mut by_degree = Vec::new();
+        let mut index = Vec::new();
+        let mut pairs = Vec::new();
         let mut entries = 0;
         for e in 0..=max_degree {
             let monos = q.monomials(e);
-            let rows: Vec<Vec<(PackedXi, u32, u16)>> = (0..monos.len())
+            assert!(monos.len() <= u16::MAX as usize, "degree {e} overflows u16");
+            let rows: Vec<Vec<(PackedXi, u16)>> = (0..monos.len())
                 .into_maybe_par_iter()
                 .map(|idx| {
-                    let psi = q.coaction(&monos[idx]);
-                    let mut kept = Vec::new();
-                    for (r, gammas) in psi.iter() {
-                        if needed.get(&r).is_some_and(|&reach| e <= reach) {
-                            kept.extend(gammas.iter().map(|&(g, len)| (r, g, len)));
-                        }
-                    }
-                    kept
+                    q.coaction_filtered(&monos[idx], |r| {
+                        needed.get(&r).is_some_and(|&reach| e <= reach)
+                    })
+                    .into_iter()
+                    .map(|(r, g)| (r, q.index(&g) as u16))
+                    .collect()
                 })
                 .collect();
-            let mut table: FxHashMap<PackedXi, Vec<(u32, u32, u16)>> = FxHashMap::default();
-            for (idx, row) in rows.into_iter().enumerate() {
-                entries += row.len();
-                for (r, g, len) in row {
-                    table.entry(r).or_default().push((idx as u32, g, len));
-                }
+            let mut all: Vec<(PackedXi, u16, u16)> = rows
+                .into_iter()
+                .enumerate()
+                .flat_map(|(idx, row)| row.into_iter().map(move |(r, g)| (r, idx as u16, g)))
+                .collect();
+            all.sort_unstable();
+            entries += all.len();
+            let mut table = FxHashMap::default();
+            let mut lo = 0u32;
+            for run in all.chunk_by(|x, y| x.0 == y.0) {
+                table.insert(run[0].0, (lo, lo + run.len() as u32));
+                lo += run.len() as u32;
             }
-            for list in table.values_mut() {
-                list.shrink_to_fit();
-            }
-            by_degree.push(table);
+            index.push(table);
+            pairs.push(all.into_iter().map(|x| [x.1, x.2]).collect());
         }
-        Self { by_degree, entries }
+        Self {
+            index,
+            pairs,
+            entries,
+        }
+    }
+
+    /// The nonzero $P(R) \cdot m \ni m'$ for the monomials $m$ of degree `e`, as positions of
+    /// $m$ and $m'$ in their degrees, sorted by $m$.
+    pub fn get(&self, e: i32, r: PackedXi) -> &[[u16; 2]] {
+        self.index[e as usize].get(&r).map_or(&[], |&(lo, hi)| {
+            &self.pairs[e as usize][lo as usize..hi as usize]
+        })
     }
 
     /// The number of entries over every degree and operation.
     pub fn entries(&self) -> usize {
         self.entries
     }
+}
+
+/// The operations `ops` (with their reach) and each of them with each of `shifts` taken off,
+/// as the cell actions and cup products do, and the identity: what [`OpTables::new`] is to hold.
+pub fn needed_operations(
+    mut ops: FxHashMap<PackedXi, i32>,
+    shifts: &[PackedXi],
+) -> FxHashMap<PackedXi, i32> {
+    for (op, r) in ops.clone() {
+        for &s in shifts {
+            if fits(s, op) {
+                let slot = ops.entry(op - s).or_insert(i32::MIN);
+                *slot = (*slot).max(r);
+            }
+        }
+    }
+    ops.insert(0, i32::MAX);
+    ops
 }
 
 /// A finite complex smashed with $C\tau$, as cells on which the cochains of $C\tau$ are copied.
@@ -411,7 +550,7 @@ pub struct Space {
 
 impl Space {
     /// The cochains of `cx` on `bb` at filtration `a` and weight `u`.
-    pub fn new(bb: &StreamedBackbone, q: &QAlgebra, cx: &Complex, a: i32, u: i32) -> Self {
+    pub fn new(bb: &dyn Backbone, q: &QAlgebra, cx: &Complex, a: i32, u: i32) -> Self {
         let mut blocks = Vec::new();
         let mut levels = 0;
         for (c, &[da, du, dk]) in cx.cells.iter().enumerate() {
@@ -534,7 +673,7 @@ impl Space {
 #[allow(clippy::too_many_arguments)]
 pub fn pullback_column(
     q: &QAlgebra,
-    bb: &StreamedBackbone,
+    bb: &dyn Backbone,
     cx: &Complex,
     src: &Space,
     tgt: &Space,
@@ -603,7 +742,7 @@ pub fn pullback_column(
 #[allow(clippy::too_many_arguments)]
 pub fn pullback_columns(
     q: &QAlgebra,
-    bb: &StreamedBackbone,
+    bb: &dyn Backbone,
     tables: &OpTables,
     cx: &Complex,
     src: &Space,
@@ -638,20 +777,23 @@ pub fn pullback_columns(
             let most = moves.iter().map(|x| x.1).max().unwrap();
             let da = cx.cells[cell][0];
             if let Some(terms) = bb.inv(src.a + da + 1, block.t as i32, block.i) {
-                let table = &tables.by_degree[e as usize];
                 for (op, op_degree, targets) in terms.ops(e + most) {
                     for &(s, s_degree, c2) in &moves {
                         if op_degree - s_degree > e || !fits(s, op) {
                             continue;
                         }
-                        let Some(list) = table.get(&(op - s)) else {
+                        let list = tables.get(e, op - s);
+                        if list.is_empty() {
                             continue;
-                        };
+                        }
+                        // the degree of the monomials P(R - S) lands in
+                        let below = e - (op_degree - s_degree);
                         for &(t_l, l) in targets {
                             let tb = tgt.block(c2, t_l, l);
-                            for &(m, g, len) in list {
+                            for &[m, g] in list {
                                 if positions[m as usize].is_some() {
-                                    local[m as usize].push(tgt.pos_in(q, tb, g, len));
+                                    let len = q.len_at(below, g as u32);
+                                    local[m as usize].push(tgt.pos_in(q, tb, g as u32, len));
                                 }
                             }
                         }
@@ -726,6 +868,24 @@ impl Reduced {
         } else {
             self.tower_of.push(NO_TOWER);
         }
+    }
+
+    /// The cocycles on `rows` cochains with the given reduced columns, each with the levels at
+    /// which it is born and dies, in the order they were found.
+    pub fn from_columns(
+        rows: usize,
+        columns: impl IntoIterator<Item = (Vec<u32>, u16, u16)>,
+    ) -> Self {
+        let mut this = Self::new(rows);
+        for (column, birth, death) in columns {
+            this.push(column, birth, death);
+        }
+        this
+    }
+
+    /// Each reduced column with the levels at which it is born and dies.
+    pub fn columns(&self) -> impl Iterator<Item = (&[u32], u16, u16)> {
+        (0..self.birth.len()).map(|c| (self.echelon.column(c), self.birth[c], self.death[c]))
     }
 
     /// The level at which tower `i` is born, and its length ([`NEVER`] if infinite).
@@ -805,6 +965,67 @@ impl ReduceStats {
     }
 }
 
+/// Reduces the coboundary from `src` to `tgt`, skipping the sources `cleared` accepts, and
+/// returns the cocycles of `tgt`, and those of `src` if it is the lowest filtration of `cx`.
+///
+/// Sources are taken in order of level and rows are numbered by level, so a reduced column is a
+/// cocycle born at the level of its pivot that becomes a coboundary at the level of its source.
+#[allow(clippy::too_many_arguments)]
+pub fn reduce_step(
+    q: &QAlgebra,
+    bb: &dyn Backbone,
+    tables: &OpTables,
+    cx: &Complex,
+    src: &Space,
+    tgt: &Space,
+    cleared: impl Fn(u32) -> bool + Sync,
+    ws: &mut SparseWorkspace,
+    stats: &mut ReduceStats,
+) -> (Reduced, Option<Reduced>) {
+    let mut red = Reduced::new(tgt.dim());
+    // in the lowest filtration, the combination of sources each column is the coboundary of
+    let mut combos: Vec<Vec<u32>> = Vec::new();
+    let mut essential = (src.a == cx.min_a()).then(|| Reduced::new(src.dim()));
+    let mut used = Vec::new();
+    stats.cochains += src.dim();
+    stats.largest = stats.largest.max(src.dim());
+    // The columns are built a block at a time, in parallel, and reduced in order.
+    let columns = pullback_columns(q, bb, tables, cx, src, tgt, 0, cleared);
+    for (pos, column) in columns {
+        let level = src.level(pos);
+        stats.input_entries += column.len();
+        used.clear();
+        let track = essential.is_some().then_some(&mut used);
+        let rest = red.echelon.reduce(ws, column, track);
+        stats.additions += ws.take_additions();
+        let combo = essential.is_some().then(|| {
+            let mut set = std::collections::BTreeSet::from([pos]);
+            for &c in &used {
+                for &r in &combos[c as usize] {
+                    if !set.remove(&r) {
+                        set.insert(r);
+                    }
+                }
+            }
+            set.into_iter().collect::<Vec<u32>>()
+        });
+        if rest.is_empty() {
+            if let (Some(ess), Some(combo)) = (essential.as_mut(), combo) {
+                ess.push(combo, level, NEVER);
+            }
+            continue;
+        }
+        stats.reduced_entries += rest.len();
+        stats.longest = stats.longest.max(rest.len());
+        let birth = tgt.level(*rest.last().unwrap());
+        red.push(rest, birth, level);
+        if let Some(combo) = combo {
+            combos.push(combo);
+        }
+    }
+    (red, essential)
+}
+
 /// Reduces the coboundaries of `cx` at weight `u` out of filtrations `a_lo..a_hi`, and returns
 /// the cocycles of filtrations `a_lo + 1..=a_hi`, and of `a_lo` if that is the lowest filtration
 /// of `cx`.
@@ -815,7 +1036,7 @@ impl ReduceStats {
 /// coboundary reduces to zero.
 pub fn reduce_weight(
     q: &QAlgebra,
-    bb: &StreamedBackbone,
+    bb: &dyn Backbone,
     tables: &OpTables,
     cx: &Complex,
     u: i32,
@@ -828,53 +1049,21 @@ pub fn reduce_weight(
     let mut src = Space::new(bb, q, cx, a_lo, u);
     for a in a_lo..a_hi {
         let tgt = Space::new(bb, q, cx, a + 1, u);
-        let mut red = Reduced::new(tgt.dim());
-        // in the lowest filtration, the combination of sources each column is the coboundary of
-        let mut combos: Vec<Vec<u32>> = Vec::new();
-        let mut essential = (a == cx.min_a()).then(|| Reduced::new(src.dim()));
         let cleared = out
             .last()
             .filter(|(key, _)| key.0 == a)
             .map(|(_, r)| &r.echelon);
-        let mut used = Vec::new();
-        stats.cochains += src.dim();
-        stats.largest = stats.largest.max(src.dim());
-        // The columns are built a block at a time, in parallel, and reduced in order.
-        let columns = pullback_columns(q, bb, tables, cx, &src, &tgt, 0, |pos| {
-            cleared.is_some_and(|e| e.pivot_column(pos as usize).is_some())
-        });
-        for (pos, column) in columns {
-            let level = src.level(pos);
-            stats.input_entries += column.len();
-            used.clear();
-            let track = essential.is_some().then_some(&mut used);
-            let rest = red.echelon.reduce(&mut ws, column, track);
-            stats.additions += ws.take_additions();
-            let combo = essential.is_some().then(|| {
-                let mut set = std::collections::BTreeSet::from([pos]);
-                for &c in &used {
-                    for &r in &combos[c as usize] {
-                        if !set.remove(&r) {
-                            set.insert(r);
-                        }
-                    }
-                }
-                set.into_iter().collect::<Vec<u32>>()
-            });
-            if rest.is_empty() {
-                if let (Some(ess), Some(combo)) = (essential.as_mut(), combo) {
-                    ess.push(combo, level, NEVER);
-                }
-                continue;
-            }
-            stats.reduced_entries += rest.len();
-            stats.longest = stats.longest.max(rest.len());
-            let birth = tgt.level(*rest.last().unwrap());
-            red.push(rest, birth, level);
-            if let Some(combo) = combo {
-                combos.push(combo);
-            }
-        }
+        let (red, essential) = reduce_step(
+            q,
+            bb,
+            tables,
+            cx,
+            &src,
+            &tgt,
+            |pos| cleared.is_some_and(|e| e.pivot_column(pos as usize).is_some()),
+            &mut ws,
+            &mut stats,
+        );
         if let Some(ess) = essential {
             out.push(((a, u), ess));
         }
@@ -909,7 +1098,7 @@ impl ScaledExt {
     /// Computes the towers of `cx` in stems `0..=max_n`.
     pub fn new(
         q: &QAlgebra,
-        bb: &StreamedBackbone,
+        bb: &dyn Backbone,
         tables: &OpTables,
         cx: Complex,
         max_n: i32,
@@ -956,7 +1145,7 @@ impl ScaledExt {
     }
 
     /// The cochains at filtration `a` and weight `u`, built on first use and kept.
-    pub fn space(&self, q: &QAlgebra, bb: &StreamedBackbone, a: i32, u: i32) -> Arc<Space> {
+    pub fn space(&self, q: &QAlgebra, bb: &dyn Backbone, a: i32, u: i32) -> Arc<Space> {
         if let Some(hit) = self.spaces.get(&(a, u)) {
             return Arc::clone(&hit);
         }
@@ -1053,7 +1242,7 @@ pub fn induced(
 /// row may repeat, and then cancels.
 pub fn bar_cup(
     q: &QAlgebra,
-    bb: &StreamedBackbone,
+    bb: &dyn Backbone,
     gamma: &BarCocycle,
     src: &Space,
     tgt: &Space,
