@@ -36,8 +36,10 @@ stem ≤ 100 subset of the stem-400 resolution, on 24 threads at `nice 19`, unle
   through stem 320 for `Cτ` with `h_1..h_4`, and through stem 350 for the towers of `Cτ`
   (sections 7, 9, 10).
 * The coboundaries are 0.4% to 0.7% dense at every size, so the cost is the size of the output,
-  which grows about five times per 40 stems. Stem 400 is about a day per complex after two
-  storage changes and a batch job of its own; the complete page at stem 800 is out of reach of
+  which grows about five times per 40 stems. `src/ctau_lazy.rs` runs the same export in bounded
+  memory (12.5 GB instead of 96 GB at stem 280) at twice the time; stem 350 and 400 now wait on
+  a parallel reduction, not on memory. The
+ the complete page at stem 800 is out of reach of
   any elimination, and the
   part of Chow degree `k = stem + filtration - 2 weight` at most 10 to 15 at stem 800 (which
   contains everything of Adams filtration at most `k`) is the size of the stem 350 to 400
@@ -424,13 +426,51 @@ Elimination adds 2, 5, 9, 17, 29, 65 times the input and keeps 0.7, 0.5, 0.4, 0.
 of it: there is no fill-in, and the cost is chains of short additions. Per 40 stems, the
 entries grow about 5 times, the additions 8 to 9 times and the reduced columns 4 to 5 times.
 
-**Stem 400.** Not run. From stem 350, 50 stems further is about 8 times the entries (1e12), 14
-times the additions (1e14, about a day of reduction at the measured rate) and 6 times the
-reduced columns (1.4e11 entries, 570 GB as stored now), with operation tables of about 3e10
-entries. That is over a terabyte in the present layout, so the driver script refuses it. It fits with two changes that are bookkeeping, not research: store reduced
-columns as byte-coded gaps (they are sorted indices, a fourfold saving), and drop a weight's
-columns once the maps into it are computed. With those, `Cτ` through stem 400 is about a day
-on one node, and each cofiber three to five times that.
+**Stem 350 and 400 with the lazy driver.** Not run. Peak memory grew 4 and 3.5 times per 40
+stems, most of it tables at the top: about 60 to 80 GB at stem 350 with 6 weights in flight,
+and about 200 GB at stem 400. Time is the problem. At the measured rates `Cτ` alone is about 6
+hours at stem 350 and the four cofibers 15 times that; stem 400 is about 12 times stem 350.
+The reduction of one coboundary has to be made parallel (the chunked reduction of persistent
+homology applies as it stands: reduce chunks of columns independently against the columns
+before them, then merge) before either run is worth a batch job.
+
+**Bounded memory (`src/ctau_lazy.rs`, the spill directory prompt of `ctau_scale`).** The
+in-memory driver keeps every reduced column, the whole backbone and the coactions the tables
+are filtered from. The lazy driver goes filtration by filtration instead:
+
+* the differentials of one filtration of the backbone are read, used and dropped (two when a
+  cell is shifted in filtration);
+* each weight's coboundary out of that filtration is reduced, the maps into the cocycles it
+  yields (`h_j`, bottom cell, top cell) are computed while they are in memory, and they are
+  written to one append-only spill file as byte-coded gaps and dropped. A later map reads back
+  only the tower generators of its source, and the top cell reads back the sphere's cocycles of
+  one filtration and weight;
+* between filtrations only one bit per cochain stays (the pivots, which the next filtration
+  skips);
+* the coaction on a monomial is computed, filtered and dropped (no memo), and a table entry is
+  two 16-bit positions.
+
+Same machine, all five complexes with `h_1..h_4` and both cell maps, 24 threads:
+
+| stem | peak, in memory | peak, lazy | wall, in memory | wall, lazy | weights in flight | spill written | spill read |
+|---|---|---|---|---|---|---|---|
+| 200 | 5.4 GB | 0.9 GB | 70 s | 159 s | 24 | 0.2 GB | 0.5 GB |
+| 240 | 26 GB | 3.6 GB | 745 s | 1457 s | 24 | 0.9 GB | 2.5 GB |
+| 280 | 96 GB | 12.5 GB | 5630 s | 12244 s | 12 | 4.0 GB | 11.2 GB |
+
+The towers at stem 200 are those of the in-memory driver, and at stem 70 the ranks of every
+complex, the exactness of the cofiber sequences and the comparison with the native reference
+all hold as before. Disk traffic is small because only reduced columns are spilled, they are
+0.2 to 0.3 of the input, and gaps take little more than a byte each: 2.5 GB for the 2.1e9
+reduced entries of `Cτ` at stem 280.
+
+What is still held throughout: the operation tables (3 GB at stem 280, 24 GB expected at 350,
+about 120 GB at 400), which every filtration reads in every degree, so dropping a degree means
+rebuilding it for each filtration or spilling the unreduced coboundaries instead (hundreds of
+GB at stem 350); and, transiently, the whole unreduced coboundary of the weights in flight. The
+lazy driver is about twice as slow, because the weights of one filtration are few and each
+reduction is sequential: it used 4 to 8 of 24 cores. That, not memory, is now what limits stem
+350 and 400 (section 11).
 
 ## 10. Results and where they are
 
