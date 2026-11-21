@@ -27,6 +27,7 @@ use rustc_hash::FxHashMap;
 
 mod cert;
 mod compare;
+mod iota;
 mod page;
 mod propagate;
 
@@ -1924,6 +1925,11 @@ fn main() {
     let ext = load(dir, n_max, f_max);
     let p = build_products(&ext);
     check_products(&ext, &p);
+    // --solve-map <ring dir> <seed csv> <seed max stem> <out prefix>: a ring map on E2 by multiplicativity
+    if args.iter().any(|a| a == "--solve-map") {
+        iota::run(&ext, &args);
+        return;
+    }
     // --diagram <file> [--from-e2]: d_r on a diagram of spectra, from page 2 or from d2 files
     if args.iter().any(|a| a == "--e3" || a == "--diagram") {
         page::run(&ext, &p, &args);
