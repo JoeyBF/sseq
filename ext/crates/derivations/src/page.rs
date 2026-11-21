@@ -15,6 +15,65 @@ use crate::{Ext, Module, Products, bits, eliminate, parse_vec64};
 /// A vector over the E2 basis of one bidegree, or a set of page coordinates.
 type V = u64;
 
+/// Where an equation comes from, kept compact (rendered by [`Labels::origin`]) because a
+/// certificate run keeps one per equation.
+#[derive(Clone, Copy)]
+enum Origin {
+    /// Leibniz for the classes `(a, k)` and `(c, j)` of a ring node; `row` is the target
+    /// coordinate of the product's d_r.
+    Ring {
+        node: u16,
+        a: u32,
+        k: u8,
+        c: u32,
+        j: u8,
+        row: u8,
+    },
+    /// Module Leibniz for the ring class `(a, k)` and the module class `(b, j)`.
+    Module {
+        node: u16,
+        a: u32,
+        k: u8,
+        b: u32,
+        j: u8,
+        row: u8,
+    },
+    /// Naturality along an edge at the class `(c, k)` of its source.
+    Map { edge: u16, c: u32, k: u8, row: u8 },
+    /// A seed (0), a backward fact (1) or a d2 file entry (2) at `(n, f)`.
+    Fact {
+        kind: u8,
+        node: u16,
+        n: i32,
+        f: i32,
+        k: u8,
+        row: u8,
+    },
+}
+
+/// Where generated equations go: into the propagator, or kept with their origins.
+enum Sink {
+    Prop(crate::propagate::Propagator),
+    Keep(Vec<Vec<u32>>, Vec<Origin>),
+}
+
+impl Sink {
+    fn add(&mut self, eqs: Vec<(Vec<u32>, Origin)>) {
+        match self {
+            Sink::Prop(p) => {
+                let eqs: Vec<Vec<u32>> = eqs.into_iter().map(|(e, _)| e).collect();
+                p.absorb(&eqs);
+            }
+            Sink::Keep(e, o) => {
+                for (eq, or) in eqs {
+                    e.push(eq);
+                    o.push(or);
+                }
+            }
+        }
+    }
+}
+
 /// Source bidegrees whose equations are generated together before they are absorbed: larger
 /// chunks parallelise better, smaller ones hold fewer equations in memory at once.
 const CHUNK: usize = 64;
@@ -435,7 +494,13 @@ fn e2_pages(node: &Node) -> Pages {
 }
 
 /// The equations `d2(x) = t` for the classes whose d2 a file gives, on the E2 page.
-fn d2_fact_equations(node: &Node, e: &Pages, d2: &FxHashMap<u32, V>, one: u32) -> Vec<Vec<u32>> {
+fn d2_fact_equations(
+    ni: usize,
+    node: &Node,
+    e: &Pages,
+    d2: &FxHashMap<u32, V>,
+    one: u32,
+) -> Vec<(Vec<u32>, Origin)> {
     let mut out = vec![];
     for b in 0..node.nb() as u32 {
         if e.off[b as usize] == u32::MAX {
@@ -450,7 +515,19 @@ fn d2_fact_equations(node: &Node, e: &Pages, d2: &FxHashMap<u32, V>, one: u32) -
                 if t >> l & 1 == 1 {
                     eq.push(one);
                 }
-                out.push(eq);
+                let (n, f) = node.deg(b);
+                let (node, k, row) = (ni as u16, i as u8, l as u8);
+                out.push((
+                    eq,
+                    Origin::Fact {
+                        kind: 2,
+                        node,
+                        n,
+                        f,
+                        k,
+                        row,
+                    },
+                ));
             }
         }
     }
@@ -639,7 +716,13 @@ fn reduce_eq(mut tr: Vec<u32>) -> Vec<u32> {
 /// Leibniz on E_r of a ring for every pair of source classes: d_r[xy] = d_r[x][y] + [x]d_r[y],
 /// projected onto the target bounds. A term d_r[x][y] is only well defined when the target of x
 /// has no boundary uncertainty, so pairs without that are skipped.
-fn ring_equations(node: &Node, e3: &Pages, gens: bool, sink: &mut dyn FnMut(Vec<Vec<u32>>)) {
+fn ring_equations(
+    ni: usize,
+    node: &Node,
+    e3: &Pages,
+    gens: bool,
+    sink: &mut dyn FnMut(Vec<(Vec<u32>, Origin)>),
+) {
     let Alg::Ring(ext, p) = node.alg else {
         unreachable!()
     };
@@ -650,7 +733,7 @@ fn ring_equations(node: &Node, e3: &Pages, gens: bool, sink: &mut dyn FnMut(Vec<
     let indec = |b: u32, x: V| ext.indec[node.gid(b, x.trailing_zeros() as usize) as usize];
     let mut count = 0;
     for chunk in bids.chunks(CHUNK) {
-        let eqs: Vec<Vec<u32>> = chunk
+        let eqs: Vec<(Vec<u32>, Origin)> = chunk
             .par_iter()
             .flat_map_iter(|&a| {
                 let mut out = vec![];
@@ -727,10 +810,22 @@ fn ring_equations(node: &Node, e3: &Pages, gens: bool, sink: &mut dyn FnMut(Vec<
                                     }
                                 }
                             }
-                            for tr in terms {
+                            for (row, tr) in terms.into_iter().enumerate() {
                                 let e = reduce_eq(tr);
                                 if !e.is_empty() {
-                                    out.push(e);
+                                    let (k, j, row) = (k as u8, j as u8, row as u8);
+                                    let node = ni as u16;
+                                    out.push((
+                                        e,
+                                        Origin::Ring {
+                                            node,
+                                            a,
+                                            k,
+                                            c,
+                                            j,
+                                            row,
+                                        },
+                                    ));
                                 }
                             }
                         }
@@ -755,12 +850,13 @@ fn ring_equations(node: &Node, e3: &Pages, gens: bool, sink: &mut dyn FnMut(Vec<
 /// needs the target of its unknown to have no boundary uncertainty, and every product it uses
 /// must be known (an unknown product drops the pair).
 fn module_equations(
+    ni: usize,
     mn: &Node,
     em: &Pages,
     rn: &Node,
     er: &Pages,
     gens: bool,
-    sink: &mut dyn FnMut(Vec<Vec<u32>>),
+    sink: &mut dyn FnMut(Vec<(Vec<u32>, Origin)>),
 ) {
     let (Alg::Module(m, _), Alg::Ring(ext, _)) = (&mn.alg, &rn.alg) else {
         unreachable!()
@@ -771,7 +867,7 @@ fn module_equations(
     let r = em.r;
     let (mut count, mut n_dropped) = (0, 0);
     for chunk in abids.chunks(CHUNK) {
-        let (eqs, dropped): (Vec<Vec<Vec<u32>>>, Vec<usize>) = chunk
+        let (eqs, dropped): (Vec<Vec<(Vec<u32>, Origin)>>, Vec<usize>) = chunk
             .par_iter()
             .map(|&a| {
                 let mut out = vec![];
@@ -848,10 +944,22 @@ fn module_equations(
                                     }
                                 }
                             }
-                            for tr in terms {
+                            for (row, tr) in terms.into_iter().enumerate() {
                                 let e = reduce_eq(tr);
                                 if !e.is_empty() {
-                                    out.push(e);
+                                    let (k, j, row) = (k as u8, j as u8, row as u8);
+                                    let node = ni as u16;
+                                    out.push((
+                                        e,
+                                        Origin::Module {
+                                            node,
+                                            a,
+                                            k,
+                                            b,
+                                            j,
+                                            row,
+                                        },
+                                    ));
                                 }
                             }
                         }
@@ -860,7 +968,7 @@ fn module_equations(
                 (out, dropped)
             })
             .unzip();
-        let eqs: Vec<Vec<u32>> = eqs.into_iter().flatten().collect();
+        let eqs: Vec<(Vec<u32>, Origin)> = eqs.into_iter().flatten().collect();
         count += eqs.len();
         n_dropped += dropped.iter().sum::<usize>();
         sink(eqs);
@@ -878,7 +986,14 @@ fn module_equations(
 /// projected onto the target bounds of the image. f(d_r x) is only well defined when the target
 /// of x has no boundary uncertainty (f of a possible boundary need not be a possible boundary of
 /// the image); f x must be a certain cycle of the image to name its d_r.
-fn map_equations(edge: &Edge, xn: &Node, ex: &Pages, yn: &Node, ey: &Pages) -> Vec<Vec<u32>> {
+fn map_equations(
+    ei: usize,
+    edge: &Edge,
+    xn: &Node,
+    ex: &Pages,
+    yn: &Node,
+    ey: &Pages,
+) -> Vec<(Vec<u32>, Origin)> {
     let r = ex.r;
     let mut out = vec![];
     let mut dropped = 0;
@@ -939,7 +1054,8 @@ fn map_equations(edge: &Edge, xn: &Node, ex: &Pages, yn: &Node, ey: &Pages) -> V
                 }
                 let e = reduce_eq(e);
                 if !e.is_empty() {
-                    out.push(e);
+                    let (edge, k, row) = (ei as u16, k as u8, row as u8);
+                    out.push((e, Origin::Map { edge, c, k, row }));
                 }
             }
         }
@@ -1092,6 +1208,179 @@ pub(crate) fn evaluate_with(
         t.elapsed().as_secs_f64()
     );
     out
+}
+
+/// Which coordinate a certificate is asked for.
+struct CertSpec {
+    r: i32,
+    node: usize,
+    n: i32,
+    f: i32,
+    k: usize,
+    l: usize,
+}
+
+/// Names variables and equation origins of one page of the diagram.
+struct Labels<'a, 'b> {
+    nodes: &'a [Node<'b>],
+    es: &'a [Pages],
+    edges: &'a [Edge],
+    starts: &'a [u32],
+    total: u32,
+}
+
+impl Labels<'_, '_> {
+    /// `d<r>_<node>(x_(n,f,k))[l]`: coordinate `l` of d_r of class `k` at `(n, f)` (E2 basis index
+    /// on page 2, page class otherwise).
+    fn var(&self, y: u32) -> String {
+        if y == self.total {
+            return "1".into();
+        }
+        let ni = self.starts.partition_point(|&s| s <= y) - 1;
+        let e = &self.es[ni];
+        let b = (0..e.off.len())
+            .filter(|&b| e.off[b] != u32::MAX && e.off[b] <= y)
+            .max_by_key(|&b| e.off[b])
+            .unwrap();
+        let rel = (y - e.off[b]) as usize;
+        let stride = e.stride[b] as usize;
+        let (n, f) = self.nodes[ni].deg(b as u32);
+        format!(
+            "d{}_{}(x_({n},{f},{}))[{}]",
+            e.r,
+            self.nodes[ni].name,
+            rel / stride,
+            rel % stride
+        )
+    }
+
+    fn class(&self, ni: u16, b: u32, k: u8) -> String {
+        let (n, f) = self.nodes[ni as usize].deg(b);
+        format!("x_({n},{f},{k})")
+    }
+
+    /// An equation's origin, in the form `scripts/min_certificate.py` weighs.
+    fn origin(&self, o: Origin) -> String {
+        match o {
+            Origin::Ring {
+                node,
+                a,
+                k,
+                c,
+                j,
+                row,
+            } => format!(
+                "{}: {}*{}[{row}]",
+                self.nodes[node as usize].name,
+                self.class(node, a, k),
+                self.class(node, c, j)
+            ),
+            Origin::Module {
+                node,
+                a,
+                k,
+                b,
+                j,
+                row,
+            } => {
+                let Alg::Module(_, ring) = self.nodes[node as usize].alg else {
+                    unreachable!()
+                };
+                format!(
+                    "{} module over {}: {}*{}[{row}]",
+                    self.nodes[node as usize].name,
+                    self.nodes[ring].name,
+                    self.class(ring as u16, a, k),
+                    self.class(node, b, j)
+                )
+            }
+            Origin::Map { edge, c, k, row } => {
+                let e = &self.edges[edge as usize];
+                format!(
+                    "naturality {}: {}[{row}]",
+                    e.name,
+                    self.class(e.from as u16, c, k)
+                )
+            }
+            Origin::Fact {
+                kind,
+                node,
+                n,
+                f,
+                k,
+                row,
+            } => format!(
+                "{} {} x_({n},{f},{k})[{row}]",
+                ["seed", "backward", "d2 file"][kind as usize],
+                self.nodes[node as usize].name
+            ),
+        }
+    }
+}
+
+/// Prints the certificate for `spec` (shrunk, ordered by stem) and, with `--dump-pool <file>`,
+/// writes the pool around it.
+#[allow(clippy::too_many_arguments)]
+fn certify(
+    spec: &CertSpec,
+    labels: &Labels,
+    eqs: &[Vec<u32>],
+    origins: &[Origin],
+    pivot: &[u32],
+    rows: &[Vec<u32>],
+    prov: &[(u32, Vec<u32>)],
+    args: &[String],
+) {
+    let (node, e) = (&labels.nodes[spec.node], &labels.es[spec.node]);
+    let b = node
+        .get(spec.n, spec.f)
+        .expect("certificate: empty bidegree");
+    assert!(
+        e.off[b as usize] != u32::MAX
+            && spec.k < e.dim(b)
+            && (spec.l as u32) < e.stride[b as usize],
+        "certificate: no such d{} coordinate",
+        spec.r
+    );
+    let x = e.var(b, spec.k, spec.l);
+    let (rel, mut set) = crate::cert::certificate(eqs, pivot, rows, prov, x, labels.total);
+    let terms: Vec<String> = rel.iter().map(|&y| labels.var(y)).collect();
+    println!("relation: {} = 0", terms.join(" + "));
+    let stem = |i: u32| match origins[i as usize] {
+        Origin::Ring { node, a, c, .. } => {
+            let nd = &labels.nodes[node as usize];
+            nd.deg(a).0 + nd.deg(c).0
+        }
+        Origin::Module { node, b, .. } => labels.nodes[node as usize].deg(b).0,
+        Origin::Map { edge, c, .. } => {
+            let e = &labels.edges[edge as usize];
+            labels.nodes[e.from].deg(c).0
+        }
+        Origin::Fact { n, .. } => n,
+    };
+    set.sort_by_key(|&i| stem(i));
+    println!("certificate: {} equations", set.len());
+    for &i in &set {
+        let terms: Vec<String> = eqs[i as usize].iter().map(|&y| labels.var(y)).collect();
+        println!(
+            "  {}: {} = 0",
+            labels.origin(origins[i as usize]),
+            terms.join(" + ")
+        );
+    }
+    if let Some(i) = args.iter().position(|a| a == "--dump-pool") {
+        let closure = !args.iter().any(|a| a == "--pool-touching");
+        crate::cert::dump_pool(
+            labels.total,
+            eqs,
+            &rel,
+            &set,
+            &args[i + 1],
+            closure,
+            &|y| labels.var(y),
+            &|i| labels.origin(origins[i as usize]),
+        );
+    }
 }
 
 /// `(page, node, path)` from repeatable `<flag> r:[node:]path` arguments, plus the legacy page-3
@@ -1306,6 +1595,19 @@ pub(crate) fn run(ext: &Ext, p: &Products, args: &[String]) {
         .map(|(n, paths)| load_d2(n, paths))
         .collect();
     let seeds = page_files(args, "--seed", "--seed-d3", &names);
+    // --certificate r:node:n:f:k:l: the equations proving coordinate l of d_r of class k at (n, f)
+    let cert = arg("--certificate").map(|s| {
+        let w: Vec<&str> = s.split(':').collect();
+        let num = |i: usize| w[i].parse::<i32>().unwrap();
+        CertSpec {
+            r: num(0),
+            node: node_idx(w[1]),
+            n: num(2),
+            f: num(3),
+            k: num(4) as usize,
+            l: num(5) as usize,
+        }
+    });
     let check_files = page_files(args, "--check", "--check-d3", &names);
 
     // Facts d_r(y) = 0 learned from page r + 1, per node (page -> (stem, filtration, E2 vector
@@ -1350,31 +1652,61 @@ pub(crate) fn run(ext: &Ext, p: &Products, args: &[String]) {
                 }
             }
             let mut total = 0;
+            let mut starts = vec![];
             for (n, e) in nodes.iter().zip(es.iter_mut()) {
+                starts.push(total);
                 total = assign_vars(n, e, total);
             }
-            // equations are absorbed as they are generated and never stored together
-            let mut prop = crate::propagate::Propagator::new(total);
+            // equations are absorbed as they are generated and never stored together, unless a
+            // certificate on this page needs each one with its origin
+            let cert_here = cert.as_ref().filter(|c| c.r == r);
+            let mut sink = if cert_here.is_some() {
+                Sink::Keep(vec![], vec![])
+            } else {
+                Sink::Prop(crate::propagate::Propagator::new(total))
+            };
             let gens = r == 2 && gens_only;
-            for (n, e) in nodes.iter().zip(&es) {
+            for (ni, (n, e)) in nodes.iter().zip(&es).enumerate() {
                 match n.alg {
-                    Alg::Ring(..) => ring_equations(n, e, gens, &mut |c| prop.absorb(&c)),
+                    Alg::Ring(..) => ring_equations(ni, n, e, gens, &mut |c| sink.add(c)),
                     Alg::Module(_, ring) => {
-                        module_equations(n, e, &nodes[ring], &es[ring], gens, &mut |c| {
-                            prop.absorb(&c)
+                        module_equations(ni, n, e, &nodes[ring], &es[ring], gens, &mut |c| {
+                            sink.add(c)
                         })
                     }
                 }
             }
-            for edge in &edges {
+            for (ei, edge) in edges.iter().enumerate() {
                 let (x, y) = (edge.from, edge.to);
-                prop.absorb(&map_equations(edge, &nodes[x], &es[x], &nodes[y], &es[y]));
+                sink.add(map_equations(
+                    ei, edge, &nodes[x], &es[x], &nodes[y], &es[y],
+                ));
             }
             if r == 2 {
-                for ((n, e), d2) in nodes.iter().zip(&es).zip(&d2s) {
-                    prop.absorb(&d2_fact_equations(n, e, d2, total));
+                for (ni, ((n, e), d2)) in nodes.iter().zip(&es).zip(&d2s).enumerate() {
+                    sink.add(d2_fact_equations(ni, n, e, d2, total));
                 }
             }
+            let fact = |kind: u8, ni: usize, st: &Statement, se: Vec<Vec<u32>>| {
+                let (node, n, f) = (ni as u16, st.n, st.f);
+                se.into_iter()
+                    .enumerate()
+                    .map(|(row, e)| {
+                        let row = row as u8;
+                        (
+                            e,
+                            Origin::Fact {
+                                kind,
+                                node,
+                                n,
+                                f,
+                                k: 0,
+                                row,
+                            },
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            };
             for (ni, (n, e)) in nodes.iter().zip(&es).enumerate() {
                 let mut n_back = 0;
                 for &(sn, sf, src) in back[ni].get(&r).into_iter().flatten() {
@@ -1386,7 +1718,7 @@ pub(crate) fn run(ext: &Ext, p: &Products, args: &[String]) {
                         label: String::new(),
                     };
                     if let Ok(se) = statement_equations(n, e, &st, total) {
-                        prop.absorb(&se);
+                        sink.add(fact(1, ni, &st, se));
                         n_back += 1;
                     }
                 }
@@ -1415,7 +1747,7 @@ pub(crate) fn run(ext: &Ext, p: &Products, args: &[String]) {
                                 st.label,
                                 se.len()
                             );
-                            prop.absorb(&se);
+                            sink.add(fact(0, *ni, &st, se));
                         }
                         Err(err) => {
                             eprintln!(
@@ -1426,10 +1758,26 @@ pub(crate) fn run(ext: &Ext, p: &Products, args: &[String]) {
                     }
                 }
             }
-            let (eqs, short_contradictions) = prop.finish();
-            let (pivot, rows, _, contradictions) = eliminate(total, &eqs, false);
-            drop(eqs);
-            let n_contradictions = contradictions.len() + short_contradictions;
+            let (pivot, rows, n_contradictions) = match sink {
+                Sink::Prop(prop) => {
+                    let (eqs, short) = prop.finish();
+                    let (pivot, rows, _, c) = eliminate(total, &eqs, false);
+                    (pivot, rows, c.len() + short)
+                }
+                Sink::Keep(eqs, origins) => {
+                    let (pivot, rows, prov, c) = eliminate(total, &eqs, true);
+                    let labels = Labels {
+                        nodes: &nodes,
+                        es: &es,
+                        edges: &edges,
+                        starts: &starts,
+                        total,
+                    };
+                    let spec = cert_here.unwrap();
+                    certify(spec, &labels, &eqs, &origins, &pivot, &rows, &prov, args);
+                    (pivot, rows, c.len())
+                }
+            };
             let free = pivot.iter().filter(|&&x| x == u32::MAX).count();
             eprintln!("d{r} solution space: dimension {free}, {n_contradictions} contradictions");
             println!("d{r}: {n_contradictions} contradictions");

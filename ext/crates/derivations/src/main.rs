@@ -25,6 +25,7 @@ use std::{
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 
+mod cert;
 mod compare;
 mod page;
 mod propagate;
