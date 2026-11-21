@@ -1151,26 +1151,42 @@ pub(crate) fn run(ext: &Ext, p: &Products, args: &[String]) {
             m
         })
         .collect();
+    // A node's range stops where its data does: past the last stem or filtration with a class,
+    // Ext would read as zero where it was never computed.
+    let extent = |deg: &[(i32, i32)], n_max: i32, f_max: i32| {
+        let n = deg.iter().map(|d| d.0).max().unwrap_or(0);
+        let f = deg.iter().map(|d| d.1).max().unwrap_or(0);
+        (n_max.min(n), f_max.min(f))
+    };
     let mut nodes: Vec<Node> = vec![];
     let mut d2_paths: Vec<&str> = vec![];
     for (i, (name, _, d2)) in spec.rings.iter().enumerate() {
         let (e, pr) = ring_of(i);
+        let (n_max, f_max) = extent(&e.deg, e.n_max, e.f_max);
         nodes.push(Node {
             name: name.clone(),
             alg: Alg::Ring(e, pr),
-            n_max: e.n_max,
-            f_max: e.f_max,
+            n_max,
+            f_max,
         });
         d2_paths.push(d2);
     }
     for (m, (name, ring, _, _, d2)) in mods.iter().zip(&spec.modules) {
+        let ring = ring_idx(ring);
+        let (n_max, f_max) = extent(&m.deg, nodes[ring].n_max, nodes[ring].f_max);
         nodes.push(Node {
             name: name.clone(),
-            alg: Alg::Module(m, ring_idx(ring)),
-            n_max: ext.n_max,
-            f_max: ext.f_max,
+            alg: Alg::Module(m, ring),
+            n_max,
+            f_max,
         });
         d2_paths.push(d2);
+    }
+    for n in &nodes {
+        eprintln!(
+            "node {}: stems <= {}, filtrations <= {}",
+            n.name, n.n_max, n.f_max
+        );
     }
     let names: Vec<String> = nodes.iter().map(|n| n.name.clone()).collect();
     let node_idx = |name: &str| {
