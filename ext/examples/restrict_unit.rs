@@ -488,9 +488,219 @@ fn fmt_vec(v: &[u32]) -> String {
     )
 }
 
+/// A vector in the ring export's notation: `[1]`, or `"[1, 0]"` (quoted when it has a comma).
+fn fmt_ring_vec(v: &[u32]) -> String {
+    let inner = v
+        .iter()
+        .map(|x| x.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    if v.len() > 1 {
+        format!("\"[{inner}]\"")
+    } else {
+        format!("[{inner}]")
+    }
+}
+
+/// Names of the Bruner-Rognes generators of Ext_{A(2)}, by (stem, s).
+fn br_name(n: i32, s: i32) -> Option<&'static str> {
+    Some(match (n, s) {
+        (0, 1) => "h0",
+        (1, 1) => "h1",
+        (3, 1) => "h2",
+        (8, 3) => "c0",
+        (8, 4) => "w1",
+        (12, 3) => "alpha",
+        (15, 3) => "beta",
+        (14, 4) => "d0",
+        (17, 4) => "e0",
+        (20, 4) => "g",
+        (25, 5) => "gamma",
+        (32, 7) => "delta",
+        (48, 8) => "w2",
+        _ => return None,
+    })
+}
+
+type Prods = BTreeMap<(i32, i32, usize), Vec<u32>>;
+
+/// Products y * x for `y = x_(yn, ys, yi)` and every basis element `x`, by one chain map on the
+/// resolution: `(xn, xs, xk) -> product vector`, zero products omitted.
+fn products_by(r: &SubRes, (yn, ys, yi): (i32, i32, usize), max_n: i32, max_s: i32) -> Prods {
+    let yt = yn + ys;
+    let q0 = Arc::clone(&r.modules[0]);
+    let init = |t: i32, i: usize| -> FpVector {
+        let mut v = FpVector::new(TWO, q0.dimension(t - yt));
+        if t == yt && i == yi {
+            v.set_entry(q0.generator_offset(0, 0, 0), 1);
+        }
+        v
+    };
+    let prod = lift(r, r, ys, yt, &init, max_n, max_s - ys, false);
+    let mut out = BTreeMap::new();
+    for ((ss, t), per_q) in &prod.coeffs {
+        let s = ss - ys;
+        let tx = t - yt;
+        if tx < s {
+            continue;
+        }
+        for k in 0..r.gens(s, tx) {
+            let row: Vec<u32> = per_q.iter().map(|c| c[k]).collect();
+            if row.iter().any(|&c| c != 0) {
+                out.insert((tx - s, s, k), row);
+            }
+        }
+    }
+    out
+}
+
+fn rank_of(rows: &[Vec<u32>], d: usize) -> usize {
+    if rows.is_empty() {
+        return 0;
+    }
+    let mut m = Matrix::new(TWO, rows.len(), d);
+    for (i, v) in rows.iter().enumerate() {
+        for (j, &c) in v.iter().enumerate() {
+            m.row_mut(i).set_entry(j, c);
+        }
+    }
+    m.row_reduce()
+}
+
+/// Export Ext_B(F_2, F_2) as a ring: rank.csv, indecomposables.csv, generator_products.csv.
+fn ring_export(r: &SubRes, max_n: i32, max_s: i32, dir: &std::path::Path) -> anyhow::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    let start = Instant::now();
+    r.prepare_target(max_s);
+    eprintln!("quasi-inverses in {:.1}s", start.elapsed().as_secs_f64());
+
+    let mut w = BufWriter::new(std::fs::File::create(dir.join("rank.csv"))?);
+    writeln!(w, "stem,Adams_filtration,rank")?;
+    let mut max_rank = 0;
+    for n in 0..=max_n {
+        for s in 0..=max_s {
+            let d = r.gens(s, n + s);
+            if d > 0 {
+                max_rank = max_rank.max(d);
+                writeln!(w, "{n},{s},{d}")?;
+            }
+        }
+    }
+    w.flush()?;
+    eprintln!("max rank {max_rank}");
+
+    // Indecomposables by (stem, s): basis elements completing the decomposables.
+    let mut gens: Vec<((i32, i32, usize), String, Prods)> = Vec::new();
+    for n in 0..=max_n {
+        for s in 1..=max_s {
+            let d = r.gens(s, n + s);
+            if d == 0 {
+                continue;
+            }
+            let mut rows: Vec<Vec<u32>> = Vec::new();
+            for ((yn, ys, _), _, pr) in &gens {
+                let (xn, xs) = (n - yn, s - ys);
+                if xs < 1 || xn < 0 {
+                    continue;
+                }
+                for k in 0..r.gens(xs, xn + xs) {
+                    if let Some(v) = pr.get(&(xn, xs, k)) {
+                        rows.push(v.clone());
+                    }
+                }
+            }
+            let dec = rank_of(&rows, d);
+            let mut cur_rank = dec;
+            // For delta, prefer the basis element with h0 x != 0 and h1 x != 0 (BR's delta).
+            let mut order: Vec<usize> = (0..d).collect();
+            if br_name(n, s) == Some("delta") {
+                let hx = |hn: i32, k: usize| -> bool {
+                    gens.iter()
+                        .find(|(y, _, _)| *y == (hn, 1, 0))
+                        .is_some_and(|(_, _, pr)| pr.contains_key(&(n, s, k)))
+                };
+                order.sort_by_key(|&k| !(hx(0, k) && hx(1, k)));
+            }
+            let mut new = Vec::new();
+            for k in order {
+                if cur_rank >= d {
+                    break;
+                }
+                let mut e = vec![0; d];
+                e[k] = 1;
+                rows.push(e);
+                let rk = rank_of(&rows, d);
+                if rk > cur_rank {
+                    cur_rank = rk;
+                    new.push(k);
+                } else {
+                    rows.pop();
+                }
+            }
+            for k in new {
+                let name = match br_name(n, s) {
+                    Some(nm) => nm.to_string(),
+                    None => {
+                        eprintln!("WARNING: unexpected indecomposable at ({n},{s}) index {k}");
+                        String::new()
+                    }
+                };
+                let t0 = Instant::now();
+                let pr = products_by(r, (n, s, k), max_n, max_s);
+                eprintln!(
+                    "indecomposable x_({n},{s},{k}) {name}: decomposables rank {dec} of {d}; {} \
+                     nonzero products in {:.1}s",
+                    pr.len(),
+                    t0.elapsed().as_secs_f64()
+                );
+                gens.push(((n, s, k), name, pr));
+            }
+        }
+    }
+
+    let mut w = BufWriter::new(std::fs::File::create(dir.join("indecomposables.csv"))?);
+    writeln!(w, "stem,Adams_filtration,index,name")?;
+    for ((n, s, k), name, _) in &gens {
+        writeln!(w, "{n},{s},{k},{name}")?;
+    }
+    w.flush()?;
+
+    let mut w = BufWriter::new(std::fs::File::create(dir.join("generator_products.csv"))?);
+    writeln!(
+        w,
+        "stem_1,Adams_filtration_1,index_1,stem_2,Adams_filtration_2,index_2,product"
+    )?;
+    let mut count = 0;
+    for ((n, s, k), _, pr) in &gens {
+        for ((xn, xs, xk), v) in pr {
+            writeln!(w, "{n},{s},{k},{xn},{xs},{xk},{}", fmt_ring_vec(v))?;
+            count += 1;
+        }
+    }
+    w.flush()?;
+    eprintln!(
+        "ring export: {} indecomposables, {count} products, {:.1}s",
+        gens.len(),
+        start.elapsed().as_secs_f64()
+    );
+    Ok(())
+}
+
 fn main() -> anyhow::Result<()> {
     ext::utils::init_logging()?;
     let args: Vec<String> = std::env::args().collect();
+    if args.get(1).is_some_and(|a| a == "ring") {
+        // restrict_unit ring <B save> <max n> <max s> <out dir>
+        ensure!(
+            args.len() >= 6,
+            "usage: restrict_unit ring <B save> <max n> <max s> <out dir>"
+        );
+        let max_n: i32 = args[3].parse()?;
+        let max_s: i32 = args[4].parse()?;
+        let r = SubRes::load(std::path::Path::new(&args[2]), max_n, max_s)?;
+        eprintln!("d^2 = 0 on {} generators", r.check_dd());
+        return ring_export(&r, max_n, max_s, std::path::Path::new(&args[5]));
+    }
     ensure!(
         args.len() >= 6,
         "usage: restrict_unit <P save> <R save> <max n> <max s> <out prefix> [products]"
