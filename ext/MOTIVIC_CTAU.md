@@ -38,9 +38,8 @@ stem ≤ 100 subset of the stem-400 resolution, on 24 threads at `nice 19`, unle
 * The coboundaries are 0.4% to 0.7% dense at every size, so the cost is the size of the output,
   which grows about five times per 40 stems. `src/ctau_lazy.rs` runs the same export in bounded
   memory (12.5 GB instead of 96 GB at stem 280) at twice the time; stem 350 and 400 now wait on
-  a parallel reduction, not on memory. The
- the complete page at stem 800 is out of reach of
-  any elimination, and the
+  a parallel reduction, not on memory. The complete page at stem 800 is out of reach of any
+  elimination, and the
   part of Chow degree `k = stem + filtration - 2 weight` at most 10 to 15 at stem 800 (which
   contains everything of Adams filtration at most `k`) is the size of the stem 350 to 400
   computations (section 11).
