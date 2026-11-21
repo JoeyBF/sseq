@@ -114,77 +114,110 @@ fn absorb(uf: &mut UnionFind, eq: &[u32], one: u32, contradictions: &mut usize) 
     }
 }
 
+/// Absorbs equations batch by batch, keeping only the union-find and the long remainder, so
+/// equations can be generated, absorbed and dropped without ever being stored together.
+pub(crate) struct Propagator {
+    uf: UnionFind,
+    one: u32,
+    long: Vec<Vec<u32>>,
+    contradictions: usize,
+    absorbed: usize,
+    start: std::time::Instant,
+}
+
+impl Propagator {
+    pub(crate) fn new(nvars: u32) -> Self {
+        Self {
+            uf: UnionFind::new(nvars as usize + 1),
+            one: nvars,
+            long: vec![],
+            contradictions: 0,
+            absorbed: 0,
+            start: std::time::Instant::now(),
+        }
+    }
+
+    pub(crate) fn absorb(&mut self, eqs: &[Vec<u32>]) {
+        self.absorbed += eqs.len();
+        for batch in eqs.chunks(BATCH) {
+            let uf = &self.uf;
+            let one = self.one;
+            let rewritten: Vec<Vec<u32>> = batch.par_iter().map(|e| uf.rewrite(e, one)).collect();
+            self.settle(rewritten);
+        }
+    }
+
+    /// Applies rewritten equations in order: short ones to the union-find, long ones kept.
+    fn settle(&mut self, rewritten: Vec<Vec<u32>>) {
+        for eq in rewritten {
+            // rewrite again: earlier equations of the batch may have merged its variables
+            let eq = if eq.len() <= 2 {
+                self.uf.rewrite(&eq, self.one)
+            } else {
+                eq
+            };
+            if !absorb(&mut self.uf, &eq, self.one, &mut self.contradictions) {
+                self.long.push(eq);
+            }
+        }
+    }
+
+    /// The equivalent system (long equations plus one row per merged variable) and the number
+    /// of contradictions found.
+    pub(crate) fn finish(mut self) -> (Vec<Vec<u32>>, usize) {
+        // the long equations were rewritten against older states: repeat until nothing shrinks
+        loop {
+            let long = std::mem::take(&mut self.long);
+            let before = long.len();
+            let (uf, one) = (&self.uf, self.one);
+            let rewritten: Vec<Vec<u32>> = long.par_iter().map(|e| uf.rewrite(e, one)).collect();
+            drop(long);
+            self.settle(rewritten);
+            if self.long.len() == before {
+                break;
+            }
+        }
+        let (uf, one) = (&self.uf, self.one);
+        let merged: Vec<u32> = (0..one).filter(|&x| uf.parent[x as usize] != x).collect();
+        // one row per merged variable: x + root (+ 1) = 0
+        let mut out: Vec<Vec<u32>> = merged
+            .iter()
+            .map(|&x| {
+                let (r, p) = uf.find(x);
+                let mut e = vec![x, r];
+                if p == 1 {
+                    e.push(one);
+                }
+                e.sort_unstable();
+                let mut d: Vec<u32> = vec![];
+                for v in e {
+                    if d.last() == Some(&v) {
+                        d.pop();
+                    } else {
+                        d.push(v);
+                    }
+                }
+                d
+            })
+            .collect();
+        let n_long = self.long.len();
+        out.append(&mut self.long);
+        eprintln!(
+            "propagate: {} equations -> {} merged variables + {n_long} long equations, {} \
+             contradictions, {:.1}s",
+            self.absorbed,
+            merged.len(),
+            self.contradictions,
+            self.start.elapsed().as_secs_f64()
+        );
+        (out, self.contradictions)
+    }
+}
+
 /// An equivalent system for `nvars` variables (constant column `nvars`), with every short
 /// equation absorbed. Also returns the number of contradictions found while absorbing.
 pub(crate) fn propagate(nvars: u32, eqs: &[Vec<u32>]) -> (Vec<Vec<u32>>, usize) {
-    let t = std::time::Instant::now();
-    let one = nvars;
-    let mut uf = UnionFind::new(nvars as usize + 1);
-    let mut long: Vec<Vec<u32>> = vec![];
-    let mut contradictions = 0;
-    for batch in eqs.chunks(BATCH) {
-        let rewritten: Vec<Vec<u32>> = batch.par_iter().map(|e| uf.rewrite(e, one)).collect();
-        for eq in rewritten {
-            // rewrite again: earlier equations of this batch may have merged its variables
-            let eq = if eq.len() <= 2 {
-                uf.rewrite(&eq, one)
-            } else {
-                eq
-            };
-            if !absorb(&mut uf, &eq, one, &mut contradictions) {
-                long.push(eq);
-            }
-        }
-    }
-    // the long equations were rewritten against older states: repeat until nothing shrinks
-    loop {
-        let rewritten: Vec<Vec<u32>> = long.par_iter().map(|e| uf.rewrite(e, one)).collect();
-        let before = long.len();
-        long = vec![];
-        for eq in rewritten {
-            let eq = if eq.len() <= 2 {
-                uf.rewrite(&eq, one)
-            } else {
-                eq
-            };
-            if !absorb(&mut uf, &eq, one, &mut contradictions) {
-                long.push(eq);
-            }
-        }
-        if long.len() == before {
-            break;
-        }
-    }
-    let merged = (0..nvars).filter(|&x| uf.parent[x as usize] != x).count();
-    // one row per merged variable: x + root (+ 1) = 0
-    let mut out: Vec<Vec<u32>> = (0..nvars)
-        .filter(|&x| uf.parent[x as usize] != x)
-        .map(|x| {
-            let (r, p) = uf.find(x);
-            let mut e = vec![x, r];
-            if p == 1 {
-                e.push(one);
-            }
-            e.sort_unstable();
-            let mut d: Vec<u32> = vec![];
-            for v in e {
-                if d.last() == Some(&v) {
-                    d.pop();
-                } else {
-                    d.push(v);
-                }
-            }
-            d
-        })
-        .collect();
-    let n_long = long.len();
-    out.extend(long);
-    eprintln!(
-        "propagate: {} equations -> {merged} merged variables + {n_long} long equations, {} \
-         contradictions, {:.1}s",
-        eqs.len(),
-        contradictions,
-        t.elapsed().as_secs_f64()
-    );
-    (out, contradictions)
+    let mut p = Propagator::new(nvars);
+    p.absorb(eqs);
+    p.finish()
 }
