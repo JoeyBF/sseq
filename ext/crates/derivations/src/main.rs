@@ -27,6 +27,7 @@ use rustc_hash::FxHashMap;
 
 mod compare;
 mod page;
+mod propagate;
 
 type Mask = u32;
 
@@ -1791,9 +1792,23 @@ fn main() {
         check_d2(&ext, &v, &eqs, &args[i + 1]);
     }
     let cert = args.iter().position(|a| a == "--certificate");
-    let (pivot, rows, prov, contradictions) = eliminate(v.n, &eqs, cert.is_some());
+    // Short equations are absorbed in a union-find first (DERIV_PROPAGATE=0 disables it; never with
+    // --certificate, which needs every equation's provenance)
+    let propagated;
+    let sys: &[Vec<u32>] =
+        if cert.is_none() && std::env::var("DERIV_PROPAGATE").map_or(true, |x| x != "0") {
+            let (p, c) = propagate::propagate(v.n, &eqs);
+            if c > 0 {
+                eprintln!("CONTRADICTION: {c} short equations reduce to 1 = 0");
+            }
+            propagated = p;
+            &propagated
+        } else {
+            &eqs
+        };
+    let (pivot, rows, prov, contradictions) = eliminate(v.n, sys, cert.is_some());
     for &e in contradictions.iter().take(10) {
-        let terms: Vec<String> = eqs[e as usize]
+        let terms: Vec<String> = sys[e as usize]
             .iter()
             .map(|&y| var_name(&ext, &v, y))
             .collect();
