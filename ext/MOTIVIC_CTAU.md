@@ -32,11 +32,13 @@ stem ≤ 100 subset of the stem-400 resolution, on 24 threads at `nice 19`, unle
 * `src/ctau_scale.rs` is the implementation that scales: a sparse reduction per (filtration,
   weight) ordered by polynomial degree, which yields the `h_0`-towers directly, on a backbone
   streamed from the save. Stem 200 for `Cτ` reduces in 2 s where the dense reference took 1725
-  s and 207 GB. Exports are archived through stem 280 for `Cτ` and its four two-cell complexes
-  and through stem 350 for `Cτ` (sections 7, 9, 10).
+  s and 207 GB. Exports are archived through stem 280 for `Cτ` and its four two-cell complexes,
+  through stem 320 for `Cτ` with `h_1..h_4`, and through stem 350 for the towers of `Cτ`
+  (sections 7, 9, 10).
 * The coboundaries are 0.4% to 0.7% dense at every size, so the cost is the size of the output,
   which grows about five times per 40 stems. Stem 400 is about a day per complex after two
-  storage changes; the complete page at stem 800 is out of reach of any elimination, and the
+  storage changes and a batch job of its own; the complete page at stem 800 is out of reach of
+  any elimination, and the
   part of Chow degree `k = stem + filtration - 2 weight` at most 10 to 15 at stem 800 (which
   contains everything of Adams filtration at most `k`) is the size of the stem 350 to 400
   computations (section 11).
@@ -400,7 +402,15 @@ Sparse export of `Cτ`, `C(2)`, `C(η)`, `C(ν)`, `C(σ)` with `h_1..h_4` and bo
 | 200 | 3.5e6 | 2.0e8 | 1.9e9 | 8.3e7 | 1.9 s | 70 s | 5.4 GB | 2241 s, 207 GB |
 | 240 | 9.8e6 | 1.4e9 | 2.4e10 | 4.6e8 | 24 s | 745 s | 26 GB | |
 | 280 | 2.4e7 | 7.7e9 | 2.2e11 | 2.1e9 | 153 s | 5630 s | 96 GB | |
-| 350 | 9.9e7 | 1.3e11 | 8.6e12 | 2.5e10 | 4474 s | `Cτ` only; `h_j` still running at this commit | over 247 GB | |
+| 320 | 5.6e7 | 4.1e10 | 1.9e12 | 8.9e9 | 948 s | `Cτ` with `h_j`: 1930 s; killed in `C(2)` | 140 GB for `Cτ` | |
+| 350 | 9.9e7 | 1.3e11 | 8.6e12 | 2.5e10 | 4474 s | killed in the `h_j` of `Cτ` | 210 GB after the reduction | |
+
+The runs at 320 and 350 were killed by the kernel at 344 GB: sessions on `sfx7` here live in the
+memory cgroup of a Slurm job (`nassau_coord_cpu`, 400 GB, shared with the production
+coordinator), not in the node's 1.5 TB. Three runs hit that limit before I saw it (stem 350 for
+`Cτ`, stem 320 in `C(2)`, stem 350 again); twice the kernel also killed one other small
+process in the cgroup. The job itself is still running. Nothing above about 150 GB should be run
+from such a session again; it belongs in its own batch job.
 
 At stem 350 the operation tables hold 6.0e9 entries and take 1000 s and 134 GB to build (the
 coactions they are filtered from are the peak); at stem 280, 7.6e8 entries and 110 s. The
@@ -417,8 +427,7 @@ entries grow about 5 times, the additions 8 to 9 times and the reduced columns 4
 **Stem 400.** Not run. From stem 350, 50 stems further is about 8 times the entries (1e12), 14
 times the additions (1e14, about a day of reduction at the measured rate) and 6 times the
 reduced columns (1.4e11 entries, 570 GB as stored now), with operation tables of about 3e10
-entries. That is over a terabyte in the present layout and `sfx7` is shared, so the driver
-script refuses it. It fits with two changes that are bookkeeping, not research: store reduced
+entries. That is over a terabyte in the present layout, so the driver script refuses it. It fits with two changes that are bookkeeping, not research: store reduced
 columns as byte-coded gaps (they are sorted indices, a fourfold saving), and drop a weight's
 columns once the maps into it are computed. With those, `Cτ` through stem 400 is about a day
 on one node, and each cofiber three to five times that.
@@ -431,10 +440,11 @@ Under `/rs/rs_grp_csht/resolutions/ctau_e2/`:
 |---|---|
 | `towers_n240.tar.zst` | stem ≤ 240: towers, `h_1..h_4`, cell maps for `Cτ`, `C(2)`, `C(η)`, `C(ν)`, `C(σ)` |
 | `towers_n280.tar.zst` | the same through stem 280 |
-| `ctau_n350.tar.zst` | stem ≤ 350, `Cτ` only: towers and `h_1..h_4`. Being written at this commit |
+| `ctau_n320.tar.zst` | stem ≤ 320: towers and `h_1..h_4` of `Cτ`, and the towers of `C(2)` without its maps (the run was killed there) |
+| `ctau_n350.tar.zst` | stem ≤ 350: the towers of `Cτ` only (the run was killed in `h_j`) |
 | `products_n120.tar.zst`, `products_n160.tar.zst` | the five complexes through stem 120 and 160, with `Ctau_generators.csv` and `Ctau_products.csv` (weight ≤ 16) |
 
-Through stem 350, `Cτ` has 8540409 towers (2605517 through stem 280). Stem 400 was not run; see
+Through stem 350, `Cτ` has 8540409 towers (5272324 through stem 320, 2605517 through 280). Stem 400 was not run; see
 "Stem 400" in the section before.
 
 Each archive is one `tar | zstd` file; nothing is unpacked on panfs. The scratch copies under
@@ -480,6 +490,51 @@ and `k ≤ 15`, the size of the stem-350 and stem-400 computations.
 **Complete page beyond stem 400.** The limit is the output. A structured reduction that never
 forms the cochains (the Bockstein tower `Ext(Q/(q_0..q_n))[q_n] ⇒ Ext(Q/(q_0..q_{n-1}))`
 starting from classical Ext) is the only route I see, and it is not started.
+
+**`Cτ ∧ C(η)` as the target.** Most of `Ext(Cτ)` is `h_1`-towers, and they collapse in the
+cofiber of `h_1`: 64172 towers against 1180528 at stem 240, 141763 against 2605517 at stem 280,
+eighteen times fewer at both. The reduction does not get cheaper, because the complex here is
+the cone of `h_1` on the cochains of `Cτ`, twice the cochains:
+
+| stem | complex | cochains | coboundary entries | entries added | reduced kept | reduction | `h_j` |
+|---|---|---|---|---|---|---|---|
+| 200 | `Cτ` | 3.5e6 | 2.0e8 | 1.9e9 | 8.3e7 | 1.9 s | 2.0 s |
+| 200 | `Cτ ∧ C(η)` | 6.8e6 | 6.5e8 | 5.3e9 | 2.3e8 | 8.6 s | 2.0 s |
+| 240 | `Cτ` | 9.8e6 | 1.4e9 | 2.4e10 | 4.6e8 | 24 s | 17 s |
+| 240 | `Cτ ∧ C(η)` | 1.9e7 | 4.4e9 | 6.3e10 | 1.3e9 | 60 s | 12 s |
+| 280 | `Cτ` | 2.4e7 | 7.7e9 | 2.2e11 | 2.1e9 | 153 s | 130 s |
+| 280 | `Cτ ∧ C(η)` | 4.8e7 | 2.5e10 | 5.8e11 | 6.0e9 | 727 s | 113 s |
+
+So the cone costs 3 times the input, 2.6 to 2.8 times the additions, 2.9 times the memory and 2.5
+to 4.8 times the reduction time of `Cτ`; only what comes after the reduction (the `h_j`, the
+export, everything downstream) gets the eighteenfold saving. The engine can use `Cτ ∧ C(η)` as a
+node in its own right, with `S ∧ C(η) → Cτ ∧ C(η)` for naturality, and never needs `Cτ`
+rebuilt from it; the `Cτ` reduction then need not be kept in memory, which removes one of the
+two echelons the cell maps hold.
+
+Can the input shrink too? Three things were considered, none measured.
+
+* Resolving the cofiber instead of coning it. `h_1` is the classical `h_0`, so `Cτ ∧ C(η)` is
+  `Ext_A(F_2, Q ⊗ D M)` for the classical mod 2 Moore module `M`, and with a minimal resolution
+  `P'` of `M` the cochains are `Hom_A(P', Q)`: one copy, with the generators of `Ext_A(M)` in
+  place of those of `Ext_A(F_2)`. That is about the size of the `Cτ` complex instead of twice
+  it, a gain of 2 to 3, not of 18: the cochains are large because `Q` is, not because of the
+  `h_1`-towers. Only the block on the stem-0 generators `h_0^a` goes away, and the large spaces
+  sit at Novikov filtration 5 to 11 where it is a small part. It also needs a minimal resolution
+  of the classical Moore spectrum through stem 400, which is not on `/rs` as far as I know and
+  which the rules do not let me compute.
+* `h_1`-periodicity. Above a line the multiplication by `h_1` is an isomorphism, so `Ext(Cτ)`
+  there is determined by one column. In these coordinates that region is high Novikov
+  filtration, where the cochain spaces are already small; the cost is elsewhere.
+* The `h_1`-local closed form (Guillou–Isaksen). It gives the infinite `h_1`-towers without
+  computing, which is a check on the tower counts of `Cτ` and a way to skip exporting them, but
+  for the same reason it does not touch the large spaces.
+
+So the plan for stem 800 with `Cτ ∧ C(η)` as the target is the plan above with every cost
+multiplied by about 3 on the input side and divided by 18 on the output side: at bounded Chow
+degree, `k ≤ 10` is about three stem-350-sized reductions and `k ≤ 15` about three of stem 400;
+the complete page stays out of reach, since its obstacle is the input. With a minimal resolution
+of the classical Moore spectrum the factor 3 becomes about 1.
 
 ## 12. Fitting together with the native route (#288, #289, #290)
 
