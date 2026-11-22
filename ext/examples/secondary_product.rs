@@ -33,10 +33,13 @@ use sseq::coordinates::{Bidegree, BidegreeGenerator};
 
 fn main() -> anyhow::Result<()> {
     ext::utils::init_logging()?;
+    let t0 = std::time::Instant::now();
+    let phase = |name: &str| eprintln!("PHASE {name} at {:.1}s", t0.elapsed().as_secs_f64());
 
     let resolution = Arc::new(query_module(Some(algebra::AlgebraType::Milnor), true)?);
     let e2 = Arc::new(ExtModule::from_resolution(Arc::clone(&resolution))?);
 
+    phase("resolution loaded");
     let name: String = query::raw("Name of product", str::parse);
     let shift = Bidegree::n_s(
         query::raw(&format!("n of Ext class {name}"), str::parse),
@@ -63,6 +66,7 @@ fn main() -> anyhow::Result<()> {
 
     let sec_e2 = Arc::new(SecondaryExtAlgebra::new(Arc::clone(&e2)));
     sec_e2.extend_all();
+    phase("sphere secondary resolution extended");
 
     // Check that the class survives to E3 (supports no d2).
     let x_survives = sec_e2
@@ -77,6 +81,12 @@ fn main() -> anyhow::Result<()> {
         lift.compute_partial(s);
         return Ok(());
     }
+
+    // Timing: extend the product lift once up front so its cost is separated from the loop.
+    lift.underlying().extend_all();
+    phase("primary product lift extended");
+    lift.extend_all();
+    phase("secondary product lift extended");
 
     // `x` multiplies on the left; the printed name is bracketed as in the original output.
     let disp = format!("[{name}]");
@@ -123,5 +133,6 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
+    phase("products printed");
     Ok(())
 }
