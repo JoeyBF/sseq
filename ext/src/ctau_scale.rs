@@ -302,7 +302,7 @@ impl<'a> BackboneSource<'a> {
     /// held, and at high stems most do.
     pub fn slice(&self, a: i32, keep: &(dyn Fn(PackedXi) -> bool + Sync)) -> anyhow::Result<Slice> {
         let mut by_gen: FxHashMap<(u16, u32), Vec<InvTerm>> = FxHashMap::default();
-        for (t, terms) in self.terms(a, keep)? {
+        for (t, terms) in self.terms(a, keep, &|t, terms| (t, terms))? {
             for (l, op, tx, i) in terms {
                 by_gen
                     .entry((tx, i))
@@ -317,35 +317,60 @@ impl<'a> BackboneSource<'a> {
     }
 
     /// The differentials of [`Self::slice`], filed under the generators they are the
-    /// differentials of, which is how the save holds them: nothing is filed twice.
-    pub fn forward(
+    /// differentials of, which is how the save holds them, and resolved for each of `shifts`
+    /// (see [`Resolved`]): a term $P(R) x$ is held for the shift $S$ when $R \geq S$ and
+    /// $P(R - S)$ acts on some monomial of `tables`, as the number of that operation there.
+    ///
+    /// The terms are resolved as each degree is read and nothing else of them is kept. A
+    /// differential is walked once for every weight its generator has cochains in, and most of
+    /// its terms act in none of the degrees met there: looking each up by number, and not at
+    /// all when it never acts, is what makes the walk cheap.
+    pub fn resolved(
         &self,
         a: i32,
         keep: &(dyn Fn(PackedXi) -> bool + Sync),
-    ) -> anyhow::Result<Forward> {
-        let mut out = Forward::default();
-        for (t, terms) in self.terms(a, keep)? {
+        tables: &OpTables,
+        shifts: &[PackedXi],
+    ) -> anyhow::Result<FxHashMap<PackedXi, Resolved>> {
+        type Lists = Vec<((u16, u32), Vec<(u32, u16, u16, u32)>)>;
+        let degrees: Vec<u16> = shifts.iter().map(|&s| xi_degree(s) as u16).collect();
+        let read: Vec<Vec<Lists>> = self.terms(a, keep, &|t, terms| {
+            let mut out: Vec<Lists> = vec![Vec::new(); shifts.len()];
             for run in terms.chunk_by(|x, y| x.0 == y.0) {
-                out.insert(
-                    (t, run[0].0),
-                    run.iter()
-                        .map(|&(_, op, tx, i)| (op, t - tx, tx, i))
-                        .collect(),
-                );
+                for (k, &shift) in shifts.iter().enumerate() {
+                    let acting: Vec<(u32, u16, u16, u32)> = run
+                        .iter()
+                        .filter(|x| fits(shift, x.1))
+                        .filter_map(|&(_, op, tx, i)| {
+                            Some((tables.id(op - shift)?, t - tx - degrees[k], tx, i))
+                        })
+                        .collect();
+                    if !acting.is_empty() {
+                        out[k].push(((t, run[0].0), acting));
+                    }
+                }
+            }
+            out
+        })?;
+        let mut plans: Vec<Resolved> = vec![Resolved::default(); shifts.len()];
+        for by_shift in read {
+            for (k, lists) in by_shift.into_iter().enumerate() {
+                plans[k].extend(lists);
             }
         }
-        Ok(out)
+        Ok(shifts.iter().copied().zip(plans).collect())
     }
 
     /// The terms $P(R) x$ with `keep(R)` of the differentials of $P_a$, by the degree `t` of
-    /// the generator: each as the index of the generator, $R$, and the degree and index of $x$,
-    /// in the order of the generators.
+    /// the generator, each degree passed to `each` as it is read: a term as the index of the
+    /// generator, $R$, and the degree and index of $x$, in the order of the generators.
     #[allow(clippy::type_complexity)]
-    fn terms(
+    fn terms<T: Send>(
         &self,
         a: i32,
         keep: &(dyn Fn(PackedXi) -> bool + Sync),
-    ) -> anyhow::Result<Vec<(u16, Vec<(u32, PackedXi, u16, u32)>)>> {
+        each: &(dyn Fn(u16, Vec<(u32, PackedXi, u16, u32)>) -> T + Sync),
+    ) -> anyhow::Result<Vec<T>> {
         use maybe_rayon::prelude::*;
         if a <= 0 || a > self.max_a() {
             return Ok(Vec::new());
@@ -356,19 +381,19 @@ impl<'a> BackboneSource<'a> {
             target.add_generators(t as i32, n as usize, None);
         }
         target.compute_basis(max_t);
-        let read: Vec<anyhow::Result<(u16, Vec<(u32, PackedXi, u16, u32)>)>> =
+        let read: Vec<anyhow::Result<T>> =
             (a..=max_t)
                 .into_maybe_par_iter()
                 .map(|t| {
                     let mut out = Vec::new();
                     if self.gens[a as usize][t as usize] == 0 {
-                        return Ok((t as u16, out));
+                        return Ok(each(t as u16, out));
                     }
                     if t == a {
                         if keep(1) {
                             out.push((0, 1, a as u16 - 1, 0));
                         }
-                        return Ok((t as u16, out));
+                        return Ok(each(t as u16, out));
                     }
                     let data = blob(self.store, a, t)?;
                     let mut cursor = &data[..];
@@ -404,8 +429,7 @@ impl<'a> BackboneSource<'a> {
                             }
                         }
                     }
-                    out.shrink_to_fit();
-                    Ok((t as u16, out))
+                    Ok(each(t as u16, out))
                 })
                 .collect();
         read.into_iter().collect()
@@ -425,43 +449,10 @@ fn vanishes(a: i32, t: i32) -> bool {
     t - a > 0 && t - a < 2 * a - 3
 }
 
-/// The terms of the differentials of one $P_a$ filed under its own generators `(t, l)`: each
-/// term $P(R) x$ of $d z_l$ as the operation, its degree, and the generator `(t, i)` of $x$.
-pub type Forward = FxHashMap<(u16, u32), Vec<(PackedXi, u16, u16, u32)>>;
-
-/// The terms of a [`Forward`] whose operation, with a shift taken off, acts on some monomial:
-/// each as the number of that operation in the tables, its degree, and the generator of $x$.
+/// The terms $P(R) x$ of the differentials of one $P_a$, filed under its own generators
+/// `(t, l)`, whose operation with a shift taken off acts on some monomial: each as the number
+/// of that operation in the tables, its degree, and the generator `(t, i)` of $x$.
 pub type Resolved = FxHashMap<(u16, u32), Vec<(u32, u16, u16, u32)>>;
-
-/// The terms $P(R) x$ of `differentials` with $R \geq S$ for the exponents `shift` of $S$ and
-/// $P(R - S)$ acting on some monomial of `tables`.
-///
-/// A differential is walked once for every weight its generator has cochains in, and most of
-/// its terms act in none of the degrees met there: looking each up by number, and not at all
-/// when it never acts, is what makes the walk cheap.
-pub fn resolve(differentials: &Forward, tables: &OpTables, shift: PackedXi) -> Resolved {
-    use maybe_rayon::prelude::*;
-    let shift_degree = xi_degree(shift) as u16;
-    let generators: Vec<(&(u16, u32), &Vec<(PackedXi, u16, u16, u32)>)> =
-        differentials.iter().collect();
-    let resolved: Vec<((u16, u32), Vec<(u32, u16, u16, u32)>)> = generators
-        .into_maybe_par_iter()
-        .map(|(&z, terms)| {
-            let acting = terms
-                .iter()
-                .filter(|x| fits(shift, x.0))
-                .filter_map(|&(op, degree, t, i)| {
-                    Some((tables.id(op - shift)?, degree - shift_degree, t, i))
-                })
-                .collect();
-            (z, acting)
-        })
-        .collect();
-    resolved
-        .into_iter()
-        .filter(|x: &(_, Vec<_>)| !x.1.is_empty())
-        .collect()
-}
 
 /// The saved differential of a bidegree, or an error rather than a resolution if it is missing.
 fn blob(store: &ZarrSaveStore, a: i32, t: i32) -> anyhow::Result<Vec<u8>> {
@@ -1148,7 +1139,7 @@ pub fn cancel_pairs(v: &mut Vec<u32>) {
 /// A block of `tgt` at a time: the differential of its generator is walked once, and the
 /// action of each term on the monomials is read off `tables` as in [`pullback_columns`].
 /// `plans` holds the differentials resolved for `shift` and for its sum with each cell action
-/// of `cx` ([`resolve`]). A list of the tables is sorted by row and then by the level of the
+/// of `cx` ([`BackboneSource::resolved`]). A list of the tables is sorted by row and then by the level of the
 /// source, so a row is read as far as its depth and no further. The distances from the end put the first position of
 /// `src` last in its row, where [`SparseEchelon`] takes its pivot.
 ///

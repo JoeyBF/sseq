@@ -14,8 +14,7 @@ use rustc_hash::FxHashMap;
 use crate::{
     ctau::{PackedXi, QAlgebra},
     ctau_scale::{
-        BackboneSource, Complex, NEVER, OpTables, Phase, Resolved, Space, pullback_rows, resolve,
-        timed,
+        BackboneSource, Complex, NEVER, OpTables, Phase, Resolved, Space, pullback_rows, timed,
     },
 };
 
@@ -690,23 +689,19 @@ pub fn export(
         if weights.is_empty() {
             continue;
         }
-        let plans = timed(Phase::Slices, || -> anyhow::Result<_> {
-            let differentials = source.forward(a + 1, keep)?;
-            // the coboundary, the products unless only a cell map is wanted, and each with
-            // the cell actions
-            let mut shifts: Vec<PackedXi> = vec![0];
-            if !matches!(maps, Maps::BottomCell(_)) {
-                shifts.extend((0..4).map(|j| 1 << j));
-            }
-            for s in shifts.clone() {
-                shifts.extend(cx.actions.iter().map(|x| s + x.0));
-            }
-            shifts.sort_unstable();
-            shifts.dedup();
-            Ok(shifts
-                .into_iter()
-                .map(|s| (s, resolve(&differentials, tables, s)))
-                .collect::<FxHashMap<PackedXi, Resolved>>())
+        // the coboundary, the products unless only a cell map is wanted, and each with the
+        // cell actions
+        let mut shifts: Vec<PackedXi> = vec![0];
+        if !matches!(maps, Maps::BottomCell(_)) {
+            shifts.extend((0..4).map(|j| 1 << j));
+        }
+        for s in shifts.clone() {
+            shifts.extend(cx.actions.iter().map(|x| s + x.0));
+        }
+        shifts.sort_unstable();
+        shifts.dedup();
+        let plans = timed(Phase::Slices, || {
+            source.resolved(a + 1, keep, tables, &shifts)
         })?;
         // the spaces read the generators of the backbone and nothing else of it
         let window = source.window(Vec::new());
