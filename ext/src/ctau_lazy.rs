@@ -17,8 +17,8 @@ use rustc_hash::FxHashMap;
 use crate::{
     ctau::QAlgebra,
     ctau_scale::{
-        Backbone, BackboneSource, Complex, NEVER, OpTables, ReduceStats, Reduced, Slice, Space,
-        pullback_columns, reduce_step,
+        Backbone, BackboneSource, Complex, NEVER, OpTables, Phase, ReduceStats, Reduced, Slice,
+        Space, pullback_columns, reduce_step, timed,
     },
 };
 
@@ -286,6 +286,17 @@ impl Pass<'_> {
     /// generators one filtration down, the bottom cell from the sphere's generators, and the
     /// top cell into the sphere's cocycles.
     fn maps_into(&self, a: i32, u: i32, red: &Reduced, rows: &mut Rows) -> anyhow::Result<()> {
+        timed(Phase::Maps, || self.maps_into_untimed(a, u, red, rows))
+    }
+
+    /// [`Self::maps_into`].
+    fn maps_into_untimed(
+        &self,
+        a: i32,
+        u: i32,
+        red: &Reduced,
+        rows: &mut Rows,
+    ) -> anyhow::Result<()> {
         use std::fmt::Write;
         if !self.in_range(a, u) {
             return Ok(());
@@ -335,16 +346,18 @@ impl Pass<'_> {
                     }
                 }
                 let mut columns: Vec<Vec<u32>> = vec![Vec::new(); src.dim()];
-                for (pos, column) in pullback_columns(
-                    self.q,
-                    self.bb,
-                    self.tables,
-                    self.cx,
-                    &src,
-                    &tgt,
-                    1 << j,
-                    |pos| !wanted[pos as usize],
-                ) {
+                for (pos, column) in timed(Phase::MapBuild, || {
+                    pullback_columns(
+                        self.q,
+                        self.bb,
+                        self.tables,
+                        self.cx,
+                        &src,
+                        &tgt,
+                        1 << j,
+                        |pos| !wanted[pos as usize],
+                    )
+                }) {
                     columns[pos as usize] = column;
                 }
                 let images = classes(red, gens.len(), |i| {
@@ -544,7 +557,7 @@ pub fn export(
         for &da in &shifts {
             for f in lowest + da..=a + da + 1 {
                 if !slices.contains_key(&f) {
-                    slices.insert(f, Arc::new(source.slice(f, keep)?));
+                    slices.insert(f, Arc::new(timed(Phase::Slices, || source.slice(f, keep))?));
                 }
             }
         }

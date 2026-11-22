@@ -171,6 +171,7 @@
 
 pub mod chain_complex;
 pub mod ctau;
+pub mod ctau_dual;
 pub mod ctau_lazy;
 pub mod ctau_scale;
 pub mod ext_algebra;

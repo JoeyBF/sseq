@@ -11,10 +11,11 @@ use algebra::AlgebraType;
 use ext::{
     chain_complex::ChainComplex,
     ctau::{BarComparison, OpTable, QAlgebra, QPoly, Tri},
+    ctau_dual::DualOptions,
     ctau_lazy::{LazyOptions, export},
     ctau_scale::{
         BackboneSource, Complex, NEVER, OpTables, ScaledExt, StreamedBackbone, add_operations,
-        bar_cup, induced, needed_operations, pullback_columns,
+        bar_cup, induced, needed_operations, pullback_columns, take_phase_seconds,
     },
     save::SaveKind,
     utils::query_module_only,
@@ -220,6 +221,7 @@ fn lazy(
     ranks: Option<&std::path::Path>,
     specs: &str,
     options: LazyOptions,
+    transposed: bool,
 ) -> anyhow::Result<()> {
     let begin = Instant::now();
     let (max_a, max_t) = ScaledExt::backbone_range(max_n);
@@ -291,8 +293,8 @@ fn lazy(
         let s = stats.reduce;
         eprintln!(
             "{name}: {} towers; {} cochains (largest space {}), {} coboundary entries, {} \
-             reduced entries (longest column {}), {} entries added; spill {:.2} GB written, \
-             {:.2} GB read: {:.1} s, peak {:.1} GB",
+             reduced entries (longest column {}), {} entries added ({} in order); spill {:.2} \
+             GB written, {:.2} GB read: {:.1} s, peak {:.1} GB",
             stats.towers,
             s.cochains,
             s.largest,
@@ -300,12 +302,66 @@ fn lazy(
             s.reduced_entries,
             s.longest,
             s.additions,
+            s.ordered_additions,
             stats.written as f64 / 1e9,
             stats.read as f64 / 1e9,
             start.elapsed().as_secs_f64(),
             peak_gb()
         );
+        let phases: Vec<String> = take_phase_seconds()
+            .into_iter()
+            .map(|(p, t)| format!("{p:?} {t:.0}"))
+            .collect();
+        eprintln!("{name}: task seconds: {}", phases.join(", "));
     };
+    if transposed {
+        let options = DualOptions {
+            in_flight: options.in_flight,
+        };
+        let mut complexes = vec![Complex::sphere()];
+        for name in &names {
+            complexes.push(complex(name)?);
+        }
+        for cx in complexes {
+            let start = Instant::now();
+            let cx = Complex {
+                max_k,
+                quotient,
+                ..cx
+            };
+            let s = ext::ctau_dual::export(&q, &source, &tables, &cx, max_n, &keep, dir, &options)?;
+            eprintln!(
+                "{}: {} towers; {} cochains (largest space {}), {} rows of {} entries ({} \
+                 reduced as they stand), {} entries added, {} reduced entries; h_j: {} entries \
+                 pulled back, {} added, {} products: {:.1} s, peak {:.1} GB",
+                cx.name,
+                s.towers,
+                s.cochains,
+                s.largest,
+                s.rows,
+                s.input_entries,
+                s.apparent,
+                s.additions,
+                s.reduced_entries,
+                s.map_entries,
+                s.map_additions,
+                s.products,
+                start.elapsed().as_secs_f64(),
+                peak_gb()
+            );
+            let phases: Vec<String> = take_phase_seconds()
+                .into_iter()
+                .map(|(p, t)| format!("{p:?} {t:.0}"))
+                .collect();
+            eprintln!("{}: task seconds: {}", cx.name, phases.join(", "));
+        }
+        eprintln!(
+            "total {:.1} s, peak {:.1} GB",
+            begin.elapsed().as_secs_f64(),
+            peak_gb()
+        );
+        return Ok(());
+    }
     let start = Instant::now();
     let (ctau, stats) = export(
         &q,
@@ -403,6 +459,12 @@ fn main() -> anyhow::Result<()> {
         |s| Ok::<_, anyhow::Error>(s.to_string()),
     );
     let ranks = (ranks != "-").then(|| PathBuf::from(ranks));
+    let transposed: String = query::with_default(
+        "Reduce the transposed coboundaries from the top filtration down (y/n)",
+        "n",
+        |s| Ok::<_, anyhow::Error>(s.to_string()),
+    );
+    let transposed = transposed == "y";
     std::fs::create_dir_all(&dir)?;
     if let Some(d) = &spill_dir {
         std::fs::create_dir_all(d)?;
@@ -432,6 +494,7 @@ fn main() -> anyhow::Result<()> {
                 in_flight,
                 spill_dir,
             },
+            transposed,
         );
     }
     let bb = StreamedBackbone::read(store, &algebra, &ops, max_a, &max_t)?;

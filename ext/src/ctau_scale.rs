@@ -1,6 +1,9 @@
 //! The $C\tau$ Adams $E_2$ page at scale: one sparse reduction per filtration and weight.
 
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
 
 use algebra::{Algebra, MilnorAlgebra, module::FreeModule, module::Module};
 use byteorder::{LittleEndian, ReadBytesExt};
@@ -18,6 +21,63 @@ use crate::{
     },
     save::{SaveKind, ZarrSaveStore},
 };
+
+/// A part of the export whose time is measured; see [`timed`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Phase {
+    /// Reading the differentials of a filtration off the save.
+    Slices,
+    /// Building the coboundary columns.
+    Build,
+    /// Sorting them.
+    Sort,
+    /// Reducing them, all of it.
+    Solve,
+    /// The part of the reduction that is done in order on one thread.
+    Ordered,
+    /// The maps into the cocycles found, all of it.
+    Maps,
+    /// Building the columns of those maps.
+    MapBuild,
+}
+
+impl Phase {
+    pub const ALL: [Self; 7] = [
+        Self::Slices,
+        Self::Build,
+        Self::Sort,
+        Self::Solve,
+        Self::Ordered,
+        Self::Maps,
+        Self::MapBuild,
+    ];
+}
+
+/// The wall time of each [`Phase`] in nanoseconds, summed over the tasks that ran it. Tasks run
+/// side by side, so the sum over phases is not the wall time of the run; it says where the
+/// tasks spend theirs.
+static PHASE_NANOS: [AtomicU64; Phase::ALL.len()] = [const { AtomicU64::new(0) }; Phase::ALL.len()];
+
+/// Runs `f` and charges its wall time to `phase`.
+pub fn timed<T>(phase: Phase, f: impl FnOnce() -> T) -> T {
+    let start = std::time::Instant::now();
+    let out = f();
+    PHASE_NANOS[phase as usize].fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    out
+}
+
+/// The seconds charged to each phase since the last call.
+pub fn take_phase_seconds() -> Vec<(Phase, f64)> {
+    Phase::ALL
+        .iter()
+        .map(|&p| {
+            (
+                p,
+                PHASE_NANOS[p as usize].swap(0, Ordering::Relaxed) as f64 / 1e9,
+            )
+        })
+        .collect()
+}
 
 /// A term $P(R) x$ of $d z_l$, filed under the generator $x$ it lands on: `l` indexes $z_l$ among
 /// the generators of degree `t`.
@@ -275,6 +335,23 @@ impl<'a> BackboneSource<'a> {
 /// $\mathrm{Ext}^{a, t}$ vanishes for $0 < t - a < 2a - 3$.
 fn vanishes(a: i32, t: i32) -> bool {
     t - a > 0 && t - a < 2 * a - 3
+}
+
+/// The terms of the differentials of one $P_a$ filed under its own generators `(t, l)`: each
+/// term $P(R) x$ of $d z_l$ as the operation, its degree, and the generator `(t, i)` of $x$.
+pub type Forward = FxHashMap<(u16, u32), Vec<(PackedXi, u16, u16, u32)>>;
+
+/// The terms of `slice`, filed under the generators whose differentials they belong to.
+pub fn forward(slice: &Slice) -> Forward {
+    let mut out = Forward::default();
+    for (&(t, i), terms) in slice {
+        for &(op, degree, lo, hi) in &terms.ops {
+            for &z in &terms.targets[lo as usize..hi as usize] {
+                out.entry(z).or_default().push((op, degree, t, i));
+            }
+        }
+    }
+    out
 }
 
 /// The saved differential of a bidegree, or an error rather than a resolution if it is missing.
@@ -685,6 +762,11 @@ impl Space {
         (self.level_start.partition_point(|&s| s <= pos) - 1) as u16
     }
 
+    /// The number of positions of level at most `level`.
+    pub fn level_end(&self, level: usize) -> usize {
+        self.level_start[(level + 1).min(self.level_start.len() - 1)] as usize
+    }
+
     /// The block of the generator `i` of degree `t` on a cell.
     pub fn block(&self, cell: usize, t: u16, i: u32) -> usize {
         self.block_id[&(cell as u8, t, i)] as usize
@@ -887,6 +969,118 @@ pub fn pullback_columns(
     columns
 }
 
+/// Sorts `v` and removes its entries in pairs of equal ones: the support of a sum over
+/// $\mathbb{F}_2$.
+pub fn cancel_pairs(v: &mut Vec<u32>) {
+    v.sort_unstable();
+    let mut kept = 0;
+    let mut i = 0;
+    while i < v.len() {
+        let mut j = i + 1;
+        while j < v.len() && v[j] == v[i] {
+            j += 1;
+        }
+        if (j - i) % 2 == 1 {
+            v[kept] = v[i];
+            kept += 1;
+        }
+        i = j;
+    }
+    v.truncate(kept);
+}
+
+/// The cochain map of [`pullback_column`] by rows: for each position of `tgt` that `wanted`
+/// accepts, the positions of `src` whose image contains it, sorted, as distances from the last
+/// position of `src`. Other rows are empty.
+///
+/// A block of `tgt` at a time: the differential of its generator is walked once, and the
+/// action of each term on the monomials is read off `tables` as in [`pullback_columns`]. The
+/// distances from the end put the first position of `src` last in its row, where
+/// [`SparseEchelon`] takes its pivot.
+///
+/// # Panics
+///
+/// If `cx` has an attaching term.
+#[allow(clippy::too_many_arguments)]
+pub fn pullback_rows(
+    q: &QAlgebra,
+    differentials: &Forward,
+    tables: &OpTables,
+    cx: &Complex,
+    src: &Space,
+    tgt: &Space,
+    shift: PackedXi,
+    wanted: impl Fn(u32) -> bool + Sync,
+) -> Vec<Vec<u32>> {
+    use maybe_rayon::prelude::*;
+    assert!(cx.attach.is_empty(), "rows of an attaching term");
+    let shift_degree = xi_degree(shift);
+    let last = src.dim() as u32;
+    let built: Vec<Vec<(u32, Vec<u32>)>> = (0..tgt.blocks.len())
+        .into_maybe_par_iter()
+        .map(|b| {
+            let block = tgt.blocks[b];
+            let (e2, cell2) = (block.e as i32, block.cell as usize);
+            let monos = q.monomials(e2);
+            let positions: Vec<Option<u32>> = monos
+                .iter()
+                .enumerate()
+                .map(|(idx, m)| {
+                    let pos = tgt.pos_in(q, b, idx as u32, mono_len(m) as u16);
+                    wanted(pos).then_some(pos)
+                })
+                .collect();
+            if positions.iter().all(Option::is_none) {
+                return Vec::new();
+            }
+            let mut local: Vec<Vec<u32>> = vec![Vec::new(); monos.len()];
+            // the cell stays, or an action moves another cell here
+            let mut moves = vec![(shift, shift_degree, cell2)];
+            for &(r, c, c2) in &cx.actions {
+                if c2 == cell2 {
+                    moves.push((shift + r, shift_degree + xi_degree(r), c));
+                }
+            }
+            for &(op, op_degree, t, i) in differentials
+                .get(&(block.t, block.i))
+                .map_or(&[][..], |v| &v[..])
+            {
+                for &(s, s_degree, cell) in &moves {
+                    let degree = op_degree as i32 - s_degree;
+                    if degree < 0 || !fits(s, op) {
+                        continue;
+                    }
+                    let Some(&sb) = src.block_id.get(&(cell as u8, t, i)) else {
+                        continue;
+                    };
+                    let e = e2 + degree;
+                    debug_assert_eq!(src.blocks[sb as usize].e as i32, e);
+                    for &[m, g] in tables.get(e, op - s) {
+                        if positions[g as usize].is_some() {
+                            let len = q.len_at(e, m as u32);
+                            local[g as usize]
+                                .push(last - 1 - src.pos_in(q, sb as usize, m as u32, len));
+                        }
+                    }
+                }
+            }
+            positions
+                .into_iter()
+                .zip(local)
+                .filter_map(|(pos, mut row)| {
+                    cancel_pairs(&mut row);
+                    Some((pos?, row))
+                })
+                .collect()
+        })
+        .collect();
+    let mut rows = vec![Vec::new(); tgt.dim()];
+    for (pos, row) in built.into_iter().flatten() {
+        rows[pos as usize] = row;
+    }
+    rows
+}
+
 /// Marks a column that generates no tower.
 const NO_TOWER: u32 = u32::MAX;
 
@@ -1014,6 +1208,8 @@ pub struct ReduceStats {
     pub largest: usize,
     /// The entries of the columns added during reduction.
     pub additions: usize,
+    /// Those of them added in order, on one thread.
+    pub ordered_additions: usize,
 }
 
 impl ReduceStats {
@@ -1026,15 +1222,126 @@ impl ReduceStats {
             longest: self.longest.max(o.longest),
             largest: self.largest.max(o.largest),
             additions: self.additions + o.additions,
+            ordered_additions: self.ordered_additions + o.ordered_additions,
         }
     }
 }
 
-/// The sources reduced against a frozen echelon at a time; see [`reduce_step`].
-const REDUCE_BATCH: usize = 4096;
+/// The sources [`Elimination::solve`] takes in order on one thread. Smaller leaves leave less to
+/// the sequential step and split more often.
+const REDUCE_LEAF: usize = 16;
 
-/// The sources one thread takes of a batch.
-const REDUCE_PIECE: usize = 64;
+/// The pieces a range of sources is cut into for one parallel update.
+const REDUCE_PIECES: usize = 128;
+
+/// A coboundary column on its way through [`Elimination::solve`].
+struct Pending {
+    /// What is left of the column, sorted.
+    rest: Vec<u32>,
+    /// The echelon columns added so far, if they are tracked.
+    used: Vec<u32>,
+    /// The entries of the echelon columns added so far.
+    added: usize,
+}
+
+impl Pending {
+    /// Reduces the column as far as `echelon` goes. Costs nothing when the leading entry is no
+    /// pivot, which is what makes repeated updates cheap.
+    fn advance(&mut self, echelon: &SparseEchelon, ws: &mut Option<SparseWorkspace>, track: bool) {
+        let Some(&top) = self.rest.last() else {
+            return;
+        };
+        if echelon.pivot_column(top as usize).is_none() {
+            return;
+        }
+        let ws = ws.get_or_insert_with(|| SparseWorkspace::new(echelon.rows()));
+        let rest = std::mem::take(&mut self.rest);
+        self.rest = echelon.reduce(ws, rest, track.then_some(&mut self.used));
+        self.added += ws.take_additions();
+    }
+}
+
+/// The state of one [`reduce_step`].
+struct Elimination<'a> {
+    src: &'a Space,
+    tgt: &'a Space,
+    red: Reduced,
+    /// With `essential`, the combination of sources each column of `red` is the coboundary of.
+    combos: Vec<Vec<u32>>,
+    essential: Option<Reduced>,
+    ws: Option<SparseWorkspace>,
+    stats: &'a mut ReduceStats,
+}
+
+impl Elimination<'_> {
+    /// Reduces the sources at `positions`, which every earlier source has been reduced before
+    /// and whose columns are reduced against all of those, and files the results in order.
+    ///
+    /// The first half is solved, the second half is reduced against it in parallel, and the
+    /// second half is solved. A column is always reduced at its leading entry by the one
+    /// earlier column with that pivot, so the result is that of taking the sources one by one;
+    /// only the additions by a column of the same leaf are made in order.
+    fn solve(&mut self, positions: &[u32], pending: &mut [Pending]) {
+        use maybe_rayon::prelude::*;
+        let track = self.essential.is_some();
+        if pending.len() <= REDUCE_LEAF {
+            timed(Phase::Ordered, || {
+                for (&pos, p) in positions.iter().zip(pending) {
+                    let before = p.added;
+                    p.advance(&self.red.echelon, &mut self.ws, track);
+                    self.stats.ordered_additions += p.added - before;
+                    self.finish(pos, p);
+                }
+            });
+            return;
+        }
+        let mid = pending.len() / 2;
+        let (head, tail) = pending.split_at_mut(mid);
+        self.solve(&positions[..mid], head);
+        let echelon = &self.red.echelon;
+        tail.maybe_par_chunks_mut(tail.len().div_ceil(REDUCE_PIECES))
+            .for_each(|piece| {
+                let mut ws = None;
+                for p in piece {
+                    p.advance(echelon, &mut ws, track);
+                }
+            });
+        self.solve(&positions[mid..], tail);
+    }
+
+    /// Files a fully reduced column: a cocycle of the target, or with nothing left a cocycle of
+    /// the source that is no coboundary.
+    fn finish(&mut self, pos: u32, p: &mut Pending) {
+        let level = self.src.level(pos);
+        self.stats.additions += p.added;
+        let rest = std::mem::take(&mut p.rest);
+        let combo = self.essential.is_some().then(|| {
+            let mut set = std::collections::BTreeSet::from([pos]);
+            for &c in &p.used {
+                for &r in &self.combos[c as usize] {
+                    if !set.remove(&r) {
+                        set.insert(r);
+                    }
+                }
+            }
+            set.into_iter().collect::<Vec<u32>>()
+        });
+        p.used = Vec::new();
+        if rest.is_empty() {
+            if let (Some(ess), Some(combo)) = (self.essential.as_mut(), combo) {
+                ess.push(combo, level, NEVER);
+            }
+            return;
+        }
+        self.stats.reduced_entries += rest.len();
+        self.stats.longest = self.stats.longest.max(rest.len());
+        let birth = self.tgt.level(*rest.last().unwrap());
+        self.red.push(rest, birth, level);
+        if let Some(combo) = combo {
+            self.combos.push(combo);
+        }
+    }
+}
 
 /// Reduces the coboundary from `src` to `tgt`, skipping the sources `cleared` accepts, and
 /// returns the cocycles of `tgt`, and with `track` the cocycles of `src` that are no
@@ -1043,10 +1350,8 @@ const REDUCE_PIECE: usize = 64;
 ///
 /// Sources are taken in order of level and rows are numbered by level, so a reduced column is a
 /// cocycle born at the level of its pivot that becomes a coboundary at the level of its source.
-///
-/// A batch of sources is first reduced in parallel against the columns found before the batch,
-/// which does nearly all the additions, and then in order against the columns of the batch
-/// itself. Larger batches leave more to the second, sequential, step.
+/// The columns are built a block at a time and reduced by [`Elimination::solve`], both in
+/// parallel.
 #[allow(clippy::too_many_arguments)]
 pub fn reduce_step(
     q: &QAlgebra,
@@ -1060,75 +1365,39 @@ pub fn reduce_step(
     stats: &mut ReduceStats,
 ) -> (Reduced, Option<Reduced>) {
     use maybe_rayon::prelude::*;
-    let mut red = Reduced::new(tgt.dim());
-    // with `track`, the combination of sources each column is the coboundary of
-    let mut combos: Vec<Vec<u32>> = Vec::new();
-    let mut essential = track.then(|| Reduced::new(src.dim()));
     stats.cochains += src.dim();
     stats.largest = stats.largest.max(src.dim());
-    // The columns are built a block at a time, in parallel.
-    let columns = pullback_columns(q, bb, tables, cx, src, tgt, 0, cleared);
-    let mut ws = SparseWorkspace::new(tgt.dim());
-    for batch in columns.chunks(REDUCE_BATCH) {
-        let echelon = &red.echelon;
-        let pieces: Vec<&[(u32, Vec<u32>)]> = batch.chunks(REDUCE_PIECE).collect();
-        let first: Vec<Vec<(Vec<u32>, Vec<u32>, usize)>> = pieces
+    let columns = timed(Phase::Build, || {
+        pullback_columns(q, bb, tables, cx, src, tgt, 0, cleared)
+    });
+    stats.input_entries += columns.iter().map(|c| c.1.len()).sum::<usize>();
+    let positions: Vec<u32> = columns.iter().map(|c| c.0).collect();
+    // sorted, with repeated rows cancelled
+    let empty = SparseEchelon::new(tgt.dim());
+    let mut pending: Vec<Pending> = timed(Phase::Sort, || {
+        columns
             .into_maybe_par_iter()
-            .map(|piece| {
-                let mut ws = SparseWorkspace::new(echelon.rows());
-                piece
-                    .iter()
-                    .map(|(_, column)| {
-                        let mut used = Vec::new();
-                        let rest = echelon.reduce(
-                            &mut ws,
-                            column.iter().copied(),
-                            track.then_some(&mut used),
-                        );
-                        (rest, used, ws.take_additions())
-                    })
-                    .collect()
+            .map(|(_, column)| {
+                let mut ws = SparseWorkspace::new(empty.rows());
+                Pending {
+                    rest: empty.reduce(&mut ws, column, None),
+                    used: Vec::new(),
+                    added: 0,
+                }
             })
-            .collect();
-        for ((pos, column), (rest, mut used, added)) in
-            batch.iter().zip(first.into_iter().flatten())
-        {
-            let level = src.level(*pos);
-            stats.input_entries += column.len();
-            let rest = if rest.is_empty() {
-                rest
-            } else {
-                red.echelon
-                    .reduce(&mut ws, rest, track.then_some(&mut used))
-            };
-            stats.additions += added + ws.take_additions();
-            let combo = track.then(|| {
-                let mut set = std::collections::BTreeSet::from([*pos]);
-                for &c in &used {
-                    for &r in &combos[c as usize] {
-                        if !set.remove(&r) {
-                            set.insert(r);
-                        }
-                    }
-                }
-                set.into_iter().collect::<Vec<u32>>()
-            });
-            if rest.is_empty() {
-                if let (Some(ess), Some(combo)) = (essential.as_mut(), combo) {
-                    ess.push(combo, level, NEVER);
-                }
-                continue;
-            }
-            stats.reduced_entries += rest.len();
-            stats.longest = stats.longest.max(rest.len());
-            let birth = tgt.level(*rest.last().unwrap());
-            red.push(rest, birth, level);
-            if let Some(combo) = combo {
-                combos.push(combo);
-            }
-        }
-    }
-    (red, essential)
+            .collect()
+    });
+    let mut state = Elimination {
+        src,
+        tgt,
+        red: Reduced::new(tgt.dim()),
+        combos: Vec::new(),
+        essential: track.then(|| Reduced::new(src.dim())),
+        ws: None,
+        stats,
+    };
+    timed(Phase::Solve, || state.solve(&positions, &mut pending));
+    (state.red, state.essential)
 }
 
 /// Reduces the coboundaries of `cx` at weight `u` out of filtrations `a_lo..a_hi`, and returns
