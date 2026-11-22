@@ -498,7 +498,8 @@ pub struct OpTables {
     /// For each degree, the range of `pairs` of each operation that acts.
     index: Vec<FxHashMap<PackedXi, (u32, u32)>>,
     /// For each degree, the nonzero $P(R) \cdot m \ni m'$ as the positions of $m$ and $m'$ in
-    /// their degrees, by operation and then by $m$.
+    /// their degrees, by operation, then by $m'$, then by $m$: the rows of a map are read
+    /// one $m'$ at a time, and its columns read a whole list either way.
     pairs: Vec<Vec<[u16; 2]>>,
     /// The operations that act in some degree.
     acting: FxHashSet<PackedXi>,
@@ -537,7 +538,7 @@ impl OpTables {
             let mut all: Vec<(PackedXi, u16, u16)> = rows
                 .into_iter()
                 .enumerate()
-                .flat_map(|(idx, row)| row.into_iter().map(move |(r, g)| (r, idx as u16, g)))
+                .flat_map(|(idx, row)| row.into_iter().map(move |(r, g)| (r, g, idx as u16)))
                 .collect();
             all.sort_unstable();
             entries += all.len();
@@ -548,7 +549,7 @@ impl OpTables {
                 lo += run.len() as u32;
             }
             index.push(table);
-            pairs.push(all.into_iter().map(|x| [x.1, x.2]).collect());
+            pairs.push(all.into_iter().map(|x| [x.2, x.1]).collect());
         }
         let acting = index.iter().flat_map(|t| t.keys().copied()).collect();
         Self {
@@ -560,7 +561,7 @@ impl OpTables {
     }
 
     /// The nonzero $P(R) \cdot m \ni m'$ for the monomials $m$ of degree `e`, as positions of
-    /// $m$ and $m'$ in their degrees, sorted by $m$.
+    /// $m$ and $m'$ in their degrees, sorted by $m'$ and then $m$.
     pub fn get(&self, e: i32, r: PackedXi) -> &[[u16; 2]] {
         self.index[e as usize].get(&r).map_or(&[], |&(lo, hi)| {
             &self.pairs[e as usize][lo as usize..hi as usize]
@@ -983,6 +984,10 @@ pub fn pullback_columns(
     columns
 }
 
+/// A list of [`OpTables`] is searched for each wanted row, rather than read through, when it is
+/// this many times longer than the rows wanted are.
+const SEEK_RATIO: usize = 16;
+
 /// Sorts `v` and removes its entries in pairs of equal ones: the support of a sum over
 /// $\mathbb{F}_2$.
 pub fn cancel_pairs(v: &mut Vec<u32>) {
@@ -1048,6 +1053,10 @@ pub fn pullback_rows(
             if positions.iter().all(Option::is_none) {
                 return (Vec::new(), 0);
             }
+            // the monomials whose rows are wanted
+            let sought: Vec<u16> = (0..monos.len() as u16)
+                .filter(|&g| positions[g as usize].is_some())
+                .collect();
             let mut local: Vec<Vec<u32>> = vec![Vec::new(); monos.len()];
             // the cell stays, or an action moves another cell here
             let mut moves = vec![(shift, shift_degree, cell2)];
@@ -1070,11 +1079,25 @@ pub fn pullback_rows(
                     };
                     let e = e2 + degree;
                     debug_assert_eq!(src.blocks[sb as usize].e as i32, e);
-                    for &[m, g] in tables.get(e, op - s) {
-                        if positions[g as usize].is_some() {
-                            let len = q.len_at(e, m as u32);
-                            local[g as usize]
-                                .push(last - 1 - src.pos_in(q, sb as usize, m as u32, len));
+                    let list = tables.get(e, op - s);
+                    let mut push = |m: u16, g: u16| {
+                        let len = q.len_at(e, m as u32);
+                        local[g as usize]
+                            .push(last - 1 - src.pos_in(q, sb as usize, m as u32, len));
+                    };
+                    if sought.len() * SEEK_RATIO < list.len() {
+                        // few rows are wanted: find each in the list, which is sorted by row
+                        for &g in &sought {
+                            let from = list.partition_point(|x| x[1] < g);
+                            for x in list[from..].iter().take_while(|x| x[1] == g) {
+                                push(x[0], g);
+                            }
+                        }
+                    } else {
+                        for &[m, g] in list {
+                            if positions[g as usize].is_some() {
+                                push(m, g);
+                            }
                         }
                     }
                 }
