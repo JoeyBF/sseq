@@ -1069,6 +1069,8 @@ pub fn pullback_rows(
                 .zip(local)
                 .filter_map(|(pos, mut row)| {
                     cancel_pairs(&mut row);
+                    // the rows are kept for as long as their weight is reduced
+                    row.shrink_to_fit();
                     Some((pos?, row))
                 })
                 .collect()
