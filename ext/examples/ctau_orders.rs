@@ -110,7 +110,20 @@ struct Cost {
     /// The reduced rows that were added to a later one, and their entries.
     reused: usize,
     reused_entries: usize,
+    /// The entries of the rows at cochains of the level of the row itself, and up to the
+    /// level of its pivot: what finding the pair reads of a row that is reduced as it stands.
+    level_entries: usize,
+    paired_entries: usize,
+    /// The entries of the rows by the number of levels between the row and the source, the
+    /// last for [`DROPS`] and more.
+    by_drop: [usize; DROPS + 1],
+    /// The entries within as many levels of their row as the longest tower of their space:
+    /// what building every row of a space to one depth, just deep enough, reads.
+    uniform_entries: usize,
 }
+
+/// The level differences counted one by one in [`Cost::by_drop`].
+const DROPS: usize = 6;
 
 impl Cost {
     fn merge(self, o: Self) -> Self {
@@ -124,6 +137,10 @@ impl Cost {
             psi: self.psi + o.psi,
             reused: self.reused + o.reused,
             reused_entries: self.reused_entries + o.reused_entries,
+            level_entries: self.level_entries + o.level_entries,
+            paired_entries: self.paired_entries + o.paired_entries,
+            by_drop: std::array::from_fn(|d| self.by_drop[d] + o.by_drop[d]),
+            uniform_entries: self.uniform_entries + o.uniform_entries,
         }
     }
 }
@@ -233,6 +250,9 @@ fn reduce_dual(
             psi: Vec::new(),
             towers: Vec::new(),
         };
+        // the entries of this coboundary by level difference, and its longest finite tower
+        let mut drops: Vec<usize> = Vec::new();
+        let mut longest = 0;
         for pos in (0..tgt.dim() as u32).rev() {
             if cleared.as_ref().is_some_and(|c| c[pos as usize]) {
                 continue;
@@ -240,8 +260,22 @@ fn reduce_dual(
             let row = std::mem::take(&mut rows[pos as usize]);
             cost.input += row.len();
             cost.columns += 1;
+            // the entries of the row at levels up to `level`, as built
+            let upto = |level: usize| {
+                let from = (src.dim() - src.level_end(level)) as u32;
+                row.iter().filter(|&&r| r >= from).count()
+            };
+            let own = upto(tgt.level(pos) as usize);
+            let all = row.len();
+            for &r in &row {
+                let drop = (src.level(flip(r)) - tgt.level(pos)) as usize;
+                if drops.len() <= drop {
+                    drops.resize(drop + 1, 0);
+                }
+                drops[drop] += 1;
+            }
             let mut used = Vec::new();
-            let rest = echelon.reduce(&mut ws, row, Some(&mut used));
+            let rest = echelon.reduce(&mut ws, row.iter().copied(), Some(&mut used));
             let added = ws.take_additions();
             cost.additions += added;
             cost.apparent += usize::from(added == 0);
@@ -259,13 +293,17 @@ fn reduce_dual(
                     }
                 }
             }
+            cost.level_entries += own;
             let Some(&pivot) = rest.last() else {
                 // only in the lowest filtration, where a cocycle need not be a coboundary
+                cost.paired_entries += all;
                 continue;
             };
+            cost.paired_entries += upto(src.level(flip(pivot)) as usize);
             cost.kept += rest.len();
             cost.psi += psi.len();
             let (birth, death) = (tgt.level(pos), src.level(flip(pivot)));
+            longest = longest.max((death - birth) as usize);
             if birth < death {
                 cost.towers += 1;
                 step.towers.push((step.rows.len() as u32, birth, death));
@@ -275,6 +313,12 @@ fn reduce_dual(
             step.rows.push(rest);
             reused.push(false);
             step.psi.push((pos, psi.into_iter().collect()));
+        }
+        for (d, &n) in drops.iter().enumerate() {
+            cost.by_drop[d.min(DROPS)] += n;
+            if d <= longest {
+                cost.uniform_entries += n;
+            }
         }
         cleared = Some(next_cleared);
         steps.push(step);
@@ -455,7 +499,9 @@ fn main() -> anyhow::Result<()> {
     println!(
         "transposed, from the top filtration down: {} columns of {} entries, {} entries added, {} \
          kept, {} towers; {} columns needed no addition, the functionals have {} entries, {} \
-         rows of {} entries were added to a later one: {:.1} s",
+         rows of {} entries were added to a later one; {} entries are at the level of their \
+         row and {} up to the level of its pivot; by level difference {:?}, and {} within the \
+         longest tower of their space: {:.1} s",
         cost.columns,
         cost.input,
         cost.additions,
@@ -465,6 +511,10 @@ fn main() -> anyhow::Result<()> {
         cost.psi,
         cost.reused,
         cost.reused_entries,
+        cost.level_entries,
+        cost.paired_entries,
+        cost.by_drop,
+        cost.uniform_entries,
         start.elapsed().as_secs_f64()
     );
     for j in 0..3u32 {
