@@ -7,6 +7,7 @@ use fp::{
     vector::{FpSlice, FpVector},
 };
 use once::MultiIndexed;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::{
     coordinates::{Bidegree, BidegreeGenerator, degree::MultiDegree, element::MultiDegreeElement},
@@ -510,6 +511,81 @@ impl<const N: usize, P: SseqProfile<N>> Sseq<N, P> {
     }
 }
 
+/// What a spectral sequence is built from: dimensions, the differentials as (page, degree,
+/// source, target), and the permanent classes. Everything else (pages, validity, the reduced form of
+/// the differentials) is derived from these by [`Sseq::update`], so this is what (de)serialization
+/// stores.
+#[derive(Serialize, Deserialize)]
+#[serde(bound = "")]
+struct SseqFacts<const N: usize> {
+    p: u32,
+    dimensions: Vec<(MultiDegree<N>, usize)>,
+    differentials: Vec<(i32, MultiDegree<N>, Vec<u32>, Vec<u32>)>,
+    permanent_classes: Vec<(MultiDegree<N>, Vec<u32>)>,
+}
+
+impl<const N: usize, P: SseqProfile<N>> Sseq<N, P> {
+    /// The defining facts, in an order that [`Self::from_facts`] can replay: differentials by
+    /// increasing page.
+    fn facts(&self) -> SseqFacts<N> {
+        use fp::prime::Prime;
+        let mut dimensions = vec![];
+        let mut differentials = vec![];
+        let mut permanent_classes = vec![];
+        for (b, data) in self.data.iter() {
+            let b: MultiDegree<N> = b.into();
+            dimensions.push((b, data.dimension));
+            for r in data.differentials.range() {
+                for (source, target) in data.differentials[r].get_source_target_pairs() {
+                    differentials.push((r, b, source.iter().collect(), target.iter().collect()));
+                }
+            }
+            for v in data.permanent_classes.basis() {
+                permanent_classes.push((b, v.iter().collect()));
+            }
+        }
+        differentials.sort_by_key(|d| d.0);
+        SseqFacts {
+            p: self.p.as_u32(),
+            dimensions,
+            differentials,
+            permanent_classes,
+        }
+    }
+
+    fn from_facts(facts: SseqFacts<N>) -> Self {
+        let p = ValidPrime::new(facts.p);
+        let mut sseq = Self::new(p);
+        for (b, dim) in facts.dimensions {
+            sseq.set_dimension(b, dim);
+        }
+        for (r, b, source, target) in facts.differentials {
+            let source = MultiDegreeElement::new(b, FpVector::from_slice(p, &source));
+            sseq.add_differential(r, &source, FpVector::from_slice(p, &target).as_slice());
+        }
+        for (b, v) in facts.permanent_classes {
+            sseq.add_permanent_class(&MultiDegreeElement::new(b, FpVector::from_slice(p, &v)));
+        }
+        sseq.update();
+        sseq
+    }
+}
+
+/// Serializes the defining facts only (see `SseqFacts`), so the format does not depend on how
+/// pages and differentials are stored.
+impl<const N: usize, P: SseqProfile<N>> Serialize for Sseq<N, P> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.facts().serialize(serializer)
+    }
+}
+
+/// Rebuilds the spectral sequence by replaying its defining facts.
+impl<'de, const N: usize, P: SseqProfile<N>> Deserialize<'de> for Sseq<N, P> {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Ok(Self::from_facts(SseqFacts::deserialize(deserializer)?))
+    }
+}
+
 /// Bigraded-specific methods (charting support).
 impl<P: SseqProfile<2>> Sseq<2, P> {
     /// This shifts the sseq horizontally so that the minimum x is 0.
@@ -665,6 +741,65 @@ mod tests {
         assert_eq!(sseq.page_data(x)[3].dimension(), 0);
         assert_eq!(sseq.page_data(y)[3].dimension(), 0);
         assert_eq!(sseq.page_data(y)[2].dimension(), 1);
+    }
+
+    /// A round trip through serde gives the same pages and differentials.
+    #[test]
+    fn test_serde_round_trip() {
+        let p = ValidPrime::new(2);
+        let mut sseq = Sseq::<3, SyntheticAdams>::new(p);
+        let deg = |n, s| MultiDegree::new([n, s, 0]);
+        for n in -1..=3 {
+            for s in 0..=6 {
+                sseq.set_dimension(
+                    deg(n, s),
+                    if (0..=2).contains(&n) && s <= 3 { 2 } else { 0 },
+                );
+            }
+        }
+        let el = |n, s, v: &[u32]| MultiDegreeElement::new(deg(n, s), FpVector::from_slice(p, v));
+        sseq.add_differential(
+            2,
+            &el(2, 0, &[1, 0]),
+            FpVector::from_slice(p, &[0, 1]).as_slice(),
+        );
+        sseq.add_differential(
+            2,
+            &el(2, 1, &[1, 1]),
+            FpVector::from_slice(p, &[1, 0]).as_slice(),
+        );
+        sseq.add_differential(
+            3,
+            &el(2, 0, &[0, 1]),
+            FpVector::from_slice(p, &[1, 1]).as_slice(),
+        );
+        sseq.add_permanent_class(&el(0, 0, &[1, 0]));
+        sseq.update();
+
+        let json = serde_json::to_string(&sseq).unwrap();
+        let back: Sseq<3, SyntheticAdams> = serde_json::from_str(&json).unwrap();
+        for b in sseq.iter_degrees() {
+            assert_eq!(sseq.dimension(b), back.dimension(b));
+            let (pa, pb) = (sseq.page_data(b), back.page_data(b));
+            assert_eq!(pa.range(), pb.range(), "{b}");
+            for r in pa.range() {
+                assert_eq!(pa[r].to_string(), pb[r].to_string(), "{b} page {r}");
+            }
+            let (da, db) = (sseq.differentials(b), back.differentials(b));
+            assert_eq!(da.range(), db.range(), "{b}");
+            for r in da.range() {
+                assert_eq!(
+                    da[r].get_source_target_pairs(),
+                    db[r].get_source_target_pairs(),
+                    "{b} d{r}"
+                );
+            }
+            assert_eq!(
+                sseq.permanent_classes(b).to_string(),
+                back.permanent_classes(b).to_string()
+            );
+        }
+        assert_eq!(json, serde_json::to_string(&back).unwrap());
     }
 
     /// Motivic d_r preserve the weight.

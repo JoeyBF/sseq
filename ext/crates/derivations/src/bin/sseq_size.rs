@@ -119,6 +119,20 @@ fn run<const N: usize, P: SseqProfile<N>>(deg: impl Fn(i32, i32) -> MultiDegree<
     }
     let t_add = t.elapsed().as_secs_f64();
     sseq.update();
+    // SSEQ_SAVE=<path>: serialize, reload, and check the reload serializes identically
+    if let Ok(path) = std::env::var("SSEQ_SAVE") {
+        let t0 = Instant::now();
+        let json = serde_json::to_vec(&sseq).unwrap();
+        std::fs::write(&path, &json).unwrap();
+        let t_save = t0.elapsed().as_secs_f64();
+        let back: Sseq<N, P> = serde_json::from_slice(&json).unwrap();
+        let t_load = t0.elapsed().as_secs_f64() - t_save;
+        let same = serde_json::to_vec(&back).unwrap() == json;
+        println!(
+            "serialized {:.1} MB in {t_save:.1}s, reloaded in {t_load:.1}s, identical: {same}",
+            json.len() as f64 / 1e6
+        );
+    }
     println!(
         "{classes} classes, {d2s} d2, {zeros} stand-in zero d_r (r < {pages}); dims {t_dims:.1}s, \
          d2 {:.1}s, zeros {:.1}s, update {:.1}s; peak {:.0} MB",
