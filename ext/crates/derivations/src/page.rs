@@ -2028,6 +2028,10 @@ pub(crate) fn run(ext: &Ext, p: &Products, args: &[String]) {
     }
     for (mi, m) in mods.iter().enumerate() {
         let (x, ring) = (spec.rings.len() + mi, ring_idx(&spec.modules[mi].1));
+        // a module that is not a two-cell complex has no cell maps
+        if m.istar.is_empty() && m.pstar.is_empty() {
+            continue;
+        }
         edges.push(Edge {
             name: format!("i:{}->{}", names[ring], m.name),
             from: ring,

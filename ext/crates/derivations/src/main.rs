@@ -613,6 +613,29 @@ fn load_module(ext: &Ext, dir: &str, name: &str, shift: i32) -> Module {
             }
         }
     }
+    // `<name>_unknown_all` (a marker file): the indecomposable products not given are unknown
+    // rather than zero, for a module whose action was computed only for some indecomposables
+    if std::path::Path::new(&format!("{dir}/{name}_unknown_all")).exists() {
+        for a in 0..ext.deg.len() as u32 {
+            for i in 0..ext.dim[a as usize] {
+                let g = ext.gid(a, i);
+                if !ext.indec[g as usize] {
+                    continue;
+                }
+                for b in 0..m.deg.len() as u32 {
+                    if m.sum(ext, a, b).is_none() {
+                        continue;
+                    }
+                    for j in 0..m.dim[b as usize] {
+                        let u = m.gid(b, j);
+                        if !m.ind_act.contains_key(&(g, u)) {
+                            m.unk_ind.insert((g, u));
+                        }
+                    }
+                }
+            }
+        }
+    }
     // DERIV_THIN=q,seed marks each known (indecomposable, module basis element) product unknown
     // with probability q, deterministically in (pair, seed): a coverage-ablation experiment.
     if let Ok(spec) = std::env::var("DERIV_THIN") {
