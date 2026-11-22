@@ -8,3 +8,5 @@ license = "(MIT OR Apache-2.0)"
 [dependencies]
 rayon = "1.10"
 rustc-hash = "2.1.1"
+fp = { path = "../fp/" }
+sseq = { path = "../sseq/" }

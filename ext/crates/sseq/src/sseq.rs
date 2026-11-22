@@ -39,6 +39,56 @@ impl SseqProfile<2> for Adams {
     }
 }
 
+/// The Adams spectral sequence of a synthetic spectrum, read as its λ-Bockstein spectral sequence.
+///
+/// Degrees are (stem, filtration, λ-offset). The synthetic weight of a class in stem `n` and
+/// filtration `s` is `n + s` plus its λ-offset, and λ lowers the weight by one: E2 classes have
+/// offset 0, and `λ^k` times one has offset `-k` in the same stem and filtration. A d_r raises the
+/// weight by `r - 1` and `n + s` by as much, so it preserves the offset; that its target is
+/// λ^{r - 1}-torsion is read off the filtration jump. A product of offset-0 classes landing on
+/// `λ^k` times a class (offset `-k` in that class's column) is a hidden extension jumping `k`
+/// filtrations.
+///
+/// The offset rather than the weight is the third coordinate so that all of E2 sits in one value
+/// of it: storage is indexed from small coordinates, and the weight `n + s` would spread it out.
+pub struct SyntheticAdams;
+
+impl SseqProfile<3> for SyntheticAdams {
+    const MIN_R: i32 = 2;
+
+    fn profile(r: i32, b: MultiDegree<3>) -> MultiDegree<3> {
+        b + MultiDegree::new([-1, r, 0])
+    }
+
+    fn profile_inverse(r: i32, b: MultiDegree<3>) -> MultiDegree<3> {
+        b + MultiDegree::new([1, -r, 0])
+    }
+
+    fn differential_length(offset: MultiDegree<3>) -> i32 {
+        offset.s()
+    }
+}
+
+/// The ℂ-motivic Adams spectral sequence: degrees are (stem, filtration, motivic weight), and every
+/// d_r preserves the weight.
+pub struct MotivicAdams;
+
+impl SseqProfile<3> for MotivicAdams {
+    const MIN_R: i32 = 2;
+
+    fn profile(r: i32, b: MultiDegree<3>) -> MultiDegree<3> {
+        b + MultiDegree::new([-1, r, 0])
+    }
+
+    fn profile_inverse(r: i32, b: MultiDegree<3>) -> MultiDegree<3> {
+        b + MultiDegree::new([1, -r, 0])
+    }
+
+    fn differential_length(offset: MultiDegree<3>) -> i32 {
+        offset.s()
+    }
+}
+
 pub struct Product<const N: usize> {
     pub b: MultiDegree<N>,
     /// Whether the product acts on the left or not. This affects the sign in the Leibniz rule.
@@ -592,6 +642,41 @@ mod tests {
 
     use super::*;
     use crate::coordinates::BidegreeElement;
+
+    /// d_r in the synthetic profile preserves the λ-offset and cuts the pages like the bigraded
+    /// Adams spectral sequence does.
+    #[test]
+    fn test_synthetic_profile() {
+        let p = ValidPrime::new(2);
+        let mut sseq = Sseq::<3, SyntheticAdams>::new(p);
+        let x = MultiDegree::new([15, 1, 0]);
+        let y = MultiDegree::new([14, 3, 0]);
+        assert_eq!(SyntheticAdams::profile(2, x), y);
+        assert_eq!(SyntheticAdams::profile_inverse(2, y), x);
+        assert_eq!(SyntheticAdams::differential_length(y - x), 2);
+        sseq.set_dimension(x, 1);
+        sseq.set_dimension(y, 1);
+        sseq.add_differential(
+            2,
+            &MultiDegreeElement::new(x, FpVector::from_slice(p, &[1])),
+            FpVector::from_slice(p, &[1]).as_slice(),
+        );
+        sseq.update();
+        assert_eq!(sseq.page_data(x)[3].dimension(), 0);
+        assert_eq!(sseq.page_data(y)[3].dimension(), 0);
+        assert_eq!(sseq.page_data(y)[2].dimension(), 1);
+    }
+
+    /// Motivic d_r preserve the weight.
+    #[test]
+    fn test_motivic_profile() {
+        let x = MultiDegree::new([30, 6, 16]);
+        assert_eq!(MotivicAdams::profile(3, x), MultiDegree::new([29, 9, 16]));
+        assert_eq!(
+            MotivicAdams::profile_inverse(3, MotivicAdams::profile(3, x)),
+            x
+        );
+    }
 
     #[test]
     fn test_sseq_differential() {
