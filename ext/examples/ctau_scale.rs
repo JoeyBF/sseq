@@ -14,8 +14,8 @@ use ext::{
     ctau_dual::{DualOptions, Exported, Maps},
     ctau_lazy::{LazyOptions, export},
     ctau_scale::{
-        BackboneSource, Complex, NEVER, OpTables, ScaledExt, StreamedBackbone, add_operations,
-        bar_cup, induced, needed_operations, pullback_columns, take_phase_seconds,
+        BackboneSource, Complex, NEVER, OpFilter, OpTables, ScaledExt, StreamedBackbone,
+        add_operations, bar_cup, induced, needed_operations, pullback_columns, take_phase_seconds,
     },
     save::SaveKind,
     utils::query_module_only,
@@ -238,7 +238,7 @@ fn lazy(
         }
         None => None,
     };
-    let source = BackboneSource::open(store, algebra, ops, max_a, &max_t, ranks.as_ref())?;
+    let mut source = BackboneSource::open(store, algebra, ops, max_a, &max_t, ranks.as_ref())?;
     let q_degree = max_n / 2 + 2;
     // with a bound on the Chow degree, only the monomials that short exist
     let q = QAlgebra::quotient(q_degree, max_k.unwrap_or(q_degree as u32), quotient);
@@ -286,6 +286,12 @@ fn lazy(
         start.elapsed().as_secs_f64(),
         peak_gb()
     );
+    if from_monomials {
+        // nearly every term of the backbone acts on nothing held: tell before unpacking it
+        let degree = source.max_operation_degree();
+        source.set_filter(OpFilter::new(ops, &tables, &SHIFTS, degree));
+    }
+    let source = source;
     let keep = |op: u128| !from_monomials || tables.relevant(op, &SHIFTS);
     let names: Vec<&str> = specs
         .split(',')

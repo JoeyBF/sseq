@@ -178,6 +178,49 @@ pub struct BackboneSource<'a> {
     /// `gens[a][t]`.
     gens: Vec<Vec<u32>>,
     max_t: Box<dyn Fn(i32) -> i32 + Sync + 'a>,
+    /// The operations worth reading, if only some are.
+    filter: Option<OpFilter>,
+}
+
+/// The operations that act on some monomial of a set of tables, or do so with a shift taken
+/// off, as one bit for each basis element of the Steenrod algebra by degree and index.
+///
+/// Reading a differential meets every one of its terms, and with few monomials nearly none of
+/// them acts: this answers from the degree and index of the operation as the save has them,
+/// before the operation is unpacked into its exponents.
+pub struct OpFilter {
+    bits: Vec<Vec<u64>>,
+}
+
+impl OpFilter {
+    /// The operations $P(R)$ of degree at most `max_degree` such that $P(R)$, or $P(R - S)$ for
+    /// one of `shifts`, acts on a monomial of `tables`.
+    pub fn new(ops: &OpTable, tables: &OpTables, shifts: &[PackedXi], max_degree: i32) -> Self {
+        let mut bits: Vec<Vec<u64>> = vec![Vec::new(); max_degree as usize + 1];
+        for &acting in tables.ids.keys() {
+            for s in std::iter::once(0).chain(shifts.iter().copied()) {
+                let r = acting + s;
+                if xi_degree(r) > max_degree {
+                    continue;
+                }
+                let (degree, idx) = ops.index(r);
+                let row = &mut bits[degree as usize];
+                if row.len() <= idx / 64 {
+                    row.resize(idx / 64 + 1, 0);
+                }
+                row[idx / 64] |= 1 << (idx % 64);
+            }
+        }
+        Self { bits }
+    }
+
+    /// Whether the basis element `idx` of degree `degree` is one of the operations.
+    pub fn contains(&self, degree: i32, idx: usize) -> bool {
+        self.bits
+            .get(degree as usize)
+            .and_then(|row| row.get(idx / 64))
+            .is_some_and(|word| word >> (idx % 64) & 1 == 1)
+    }
 }
 
 impl<'a> BackboneSource<'a> {
@@ -223,7 +266,19 @@ impl<'a> BackboneSource<'a> {
             ops,
             gens: gens.into_iter().collect::<anyhow::Result<_>>()?,
             max_t: Box::new(max_t),
+            filter: None,
         })
+    }
+
+    /// Reads only the terms whose operation is in `filter` from now on. Whatever `keep` a
+    /// reader passes still applies to those.
+    pub fn set_filter(&mut self, filter: OpFilter) {
+        self.filter = Some(filter);
+    }
+
+    /// The largest degree of an operation in a differential read.
+    pub fn max_operation_degree(&self) -> i32 {
+        (self.max_t)(self.max_a())
     }
 
     /// The largest filtration held.
@@ -301,52 +356,58 @@ impl<'a> BackboneSource<'a> {
             target.add_generators(t as i32, n as usize, None);
         }
         target.compute_basis(max_t);
-        let read: Vec<anyhow::Result<(u16, Vec<(u32, PackedXi, u16, u32)>)>> = (a..=max_t)
-            .into_maybe_par_iter()
-            .map(|t| {
-                let mut out = Vec::new();
-                if self.gens[a as usize][t as usize] == 0 {
-                    return Ok((t as u16, out));
-                }
-                if t == a {
-                    if keep(1) {
-                        out.push((0, 1, a as u16 - 1, 0));
+        let read: Vec<anyhow::Result<(u16, Vec<(u32, PackedXi, u16, u32)>)>> =
+            (a..=max_t)
+                .into_maybe_par_iter()
+                .map(|t| {
+                    let mut out = Vec::new();
+                    if self.gens[a as usize][t as usize] == 0 {
+                        return Ok((t as u16, out));
                     }
-                    return Ok((t as u16, out));
-                }
-                let data = blob(self.store, a, t)?;
-                let mut cursor = &data[..];
-                let n = cursor.read_u64::<LittleEndian>()? as usize;
-                let dim = cursor.read_u64::<LittleEndian>()? as usize;
-                anyhow::ensure!(
-                    n == self.gens[a as usize][t as usize] as usize,
-                    "({a}, {t}): the save has {n} generators, the ranks {}",
-                    self.gens[a as usize][t as usize]
-                );
-                anyhow::ensure!(
-                    dim <= target.dimension(t),
-                    "({a}, {t}): saved dimension {dim} exceeds {}",
-                    target.dimension(t)
-                );
-                for l in 0..n {
-                    let v = FpVector::from_bytes(TWO, dim, &mut cursor)?;
-                    for (idx, _) in v.iter_nonzero() {
-                        let og = target.index_to_op_gen(t, idx);
-                        let op = self.ops.pack(og.operation_degree, og.operation_index);
-                        if keep(op) {
-                            out.push((
-                                l as u32,
-                                op,
-                                og.generator_degree as u16,
-                                og.generator_index as u32,
-                            ));
+                    if t == a {
+                        if keep(1) {
+                            out.push((0, 1, a as u16 - 1, 0));
+                        }
+                        return Ok((t as u16, out));
+                    }
+                    let data = blob(self.store, a, t)?;
+                    let mut cursor = &data[..];
+                    let n = cursor.read_u64::<LittleEndian>()? as usize;
+                    let dim = cursor.read_u64::<LittleEndian>()? as usize;
+                    anyhow::ensure!(
+                        n == self.gens[a as usize][t as usize] as usize,
+                        "({a}, {t}): the save has {n} generators, the ranks {}",
+                        self.gens[a as usize][t as usize]
+                    );
+                    anyhow::ensure!(
+                        dim <= target.dimension(t),
+                        "({a}, {t}): saved dimension {dim} exceeds {}",
+                        target.dimension(t)
+                    );
+                    for l in 0..n {
+                        let v = FpVector::from_bytes(TWO, dim, &mut cursor)?;
+                        for (idx, _) in v.iter_nonzero() {
+                            let og = target.index_to_op_gen(t, idx);
+                            if self.filter.as_ref().is_some_and(|f| {
+                                !f.contains(og.operation_degree, og.operation_index)
+                            }) {
+                                continue;
+                            }
+                            let op = self.ops.pack(og.operation_degree, og.operation_index);
+                            if keep(op) {
+                                out.push((
+                                    l as u32,
+                                    op,
+                                    og.generator_degree as u16,
+                                    og.generator_index as u32,
+                                ));
+                            }
                         }
                     }
-                }
-                out.shrink_to_fit();
-                Ok((t as u16, out))
-            })
-            .collect();
+                    out.shrink_to_fit();
+                    Ok((t as u16, out))
+                })
+                .collect();
         read.into_iter().collect()
     }
 
