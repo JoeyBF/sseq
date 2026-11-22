@@ -72,7 +72,6 @@ fn main() -> anyhow::Result<()> {
             (i, b, survives)
         })
         .collect();
-    let max_hi_t = hs.iter().map(|&(_, b, _)| b.t()).max().unwrap_or(0);
 
     // One job per (bidegree, class): surviving E3 gens (the `subspace_gens` basis, exactly as
     // `secondary_product` iterates them) and non-cycle basis vectors (complement pivots).
@@ -124,24 +123,32 @@ fn main() -> anyhow::Result<()> {
                 &ys,
             ));
             let res = &resolution;
-            let top_s =
-                (b.s() + if survives { 2 } else { 1 }).min(res.next_homological_degree() - 1);
-            // One t bound for every row: the secondary intermediates read the row two below at
-            // the same t (minus one), so the rows must not shrink going down. Products landing in
-            // the top computed stem are lost to this; resolve one stem past the range wanted.
-            let t_cap = (b.s()..=top_s)
-                .map(|s| {
-                    let src = res.module(s).max_computed_degree();
-                    let tgt = res.module(s - b.s()).max_computed_degree() + b.t();
-                    src.min(tgt)
-                })
-                .min()
-                .unwrap()
-                .min(b.t() + max_hi_t + 2);
-            underlying.extend(Bidegree::s_t(top_s, t_cap));
-
+            // The largest t any row s_y..=top can reach. One t bound serves every row: the
+            // secondary intermediates read the row two below at the same t (minus one), so rows
+            // must not shrink going down. Products landing in the top computed stem are lost to
+            // this; resolve one stem past the range wanted.
+            let cap = |top: i32, want: i32| {
+                (b.s()..=top)
+                    .map(|s| {
+                        let src = res.module(s).max_computed_degree();
+                        let tgt = res.module(s - b.s()).max_computed_degree() + b.t();
+                        src.min(tgt)
+                    })
+                    .min()
+                    .unwrap()
+                    .min(want)
+            };
             let mut lines = Vec::new();
-            if survives && top_s == b.s() + 2 {
+
+            // Secondary part: only h_i surviving to E3 (h0..h3) have a [h_i], so the two-row
+            // lift and the secondary homotopy are needed only up to their t, not h7's.
+            let sec_t = hs.iter().filter(|h| h.2).map(|h| h.1.t()).max();
+            let top_sec = b.s() + 2;
+            if survives
+                && let Some(sec_t) = sec_t
+                && top_sec < res.next_homological_degree()
+            {
+                underlying.extend(Bidegree::s_t(top_sec, cap(top_sec, b.t() + sec_t + 2)));
                 let lift = SecondaryResolutionHomomorphism::new(
                     Arc::clone(&res_lift),
                     Arc::clone(&res_lift),
@@ -152,7 +159,8 @@ fn main() -> anyhow::Result<()> {
                 for &(i, hb, h_survives) in &hs {
                     let target = b + hb;
                     let lambda_target = target + LAMBDA_BIDEGREE;
-                    if !res.has_computed_bidegree(lambda_target)
+                    if !h_survives
+                        || !res.has_computed_bidegree(lambda_target)
                         || underlying.get_map(target.s()).next_degree() <= target.t()
                         || lift.homotopy(lambda_target.s()).homotopies.next_degree()
                             <= lambda_target.t()
@@ -164,34 +172,42 @@ fn main() -> anyhow::Result<()> {
                     if ext_dim == 0 && lambda_dim == 0 {
                         continue;
                     }
-                    if h_survives {
-                        let h = FpVector::from_slice(p, &[1]);
-                        let mut out = FpVector::new(p, ext_dim + lambda_dim);
-                        lift.hom_k(
-                            Some(&lambda_page),
-                            hb,
-                            std::iter::once(h.as_slice()),
-                            std::iter::once(out.as_slice_mut()),
-                        );
-                        let e = out.slice(0, ext_dim).to_owned();
-                        let l = out.slice(ext_dim, ext_dim + lambda_dim).to_owned();
-                        lines.push(format!("[{y_name}] [h{i}] = {e} + λ {l}"));
-                    } else if ext_dim > 0 {
+                    let h = FpVector::from_slice(p, &[1]);
+                    let mut out = FpVector::new(p, ext_dim + lambda_dim);
+                    lift.hom_k(
+                        Some(&lambda_page),
+                        hb,
+                        std::iter::once(h.as_slice()),
+                        std::iter::once(out.as_slice_mut()),
+                    );
+                    let e = out.slice(0, ext_dim).to_owned();
+                    let l = out.slice(ext_dim, ext_dim + lambda_dim).to_owned();
+                    lines.push(format!("[{y_name}] [h{i}] = {e} + λ {l}"));
+                }
+            }
+
+            // Primary part (λ times the primary product): for every h_i when y is not a d2-cycle,
+            // and for the h_i that do not survive otherwise. One row of lift suffices.
+            let lam_his: Vec<(i32, Bidegree)> = hs
+                .iter()
+                .filter(|h| !survives || !h.2)
+                .map(|h| (h.0, h.1))
+                .collect();
+            if let Some(lam_t) = lam_his.iter().map(|h| h.1.t()).max() {
+                let top = b.s() + 1;
+                if top < res.next_homological_degree() {
+                    underlying.extend(Bidegree::s_t(top, cap(top, b.t() + lam_t)));
+                    for &(i, hb) in &lam_his {
+                        let target = b + hb;
+                        if !res.has_computed_bidegree(target)
+                            || underlying.get_map(target.s()).next_degree() <= target.t()
+                            || res.number_of_gens_in_bidegree(target) == 0
+                        {
+                            continue;
+                        }
                         let m0 = underlying.get_map(target.s()).hom_k(hb.t());
                         lines.push(format!("λ [{y_name}] [h{i}] = λ {:?}", m0[0]));
                     }
-                }
-            } else {
-                for &(i, hb, _) in &hs {
-                    let target = b + hb;
-                    if !res.has_computed_bidegree(target)
-                        || underlying.get_map(target.s()).next_degree() <= target.t()
-                        || res.number_of_gens_in_bidegree(target) == 0
-                    {
-                        continue;
-                    }
-                    let m0 = underlying.get_map(target.s()).hom_k(hb.t());
-                    lines.push(format!("λ [{y_name}] [h{i}] = λ {:?}", m0[0]));
                 }
             }
             let secs = start.elapsed().as_secs_f64();
