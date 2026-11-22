@@ -984,8 +984,8 @@ pub fn pullback_columns(
     columns
 }
 
-/// A list of [`OpTables`] is searched for each wanted row, rather than read through, when it is
-/// this many times longer than the rows wanted are.
+/// A list of [`OpTables`] is searched for each row built, rather than read through, when it is
+/// this many times longer than the rows built are.
 const SEEK_RATIO: usize = 16;
 
 /// Sorts `v` and removes its entries in pairs of equal ones: the support of a sum over
@@ -1008,15 +1008,16 @@ pub fn cancel_pairs(v: &mut Vec<u32>) {
     v.truncate(kept);
 }
 
-/// The cochain map of [`pullback_column`] by rows: for each position of `tgt` that `wanted`
-/// accepts, the positions of `src` whose image contains it, sorted, as distances from the last
-/// position of `src`. Other rows are empty. Also returns the number of entries built, of which
-/// those that repeat cancel in pairs.
+/// The cochain map of [`pullback_column`] by rows: for each position of `tgt`, the positions
+/// of `src` of level below `depth` of it whose image contains it, sorted, as distances from the
+/// last position of `src`. A row of depth zero is not built and is empty. Also returns the
+/// number of entries built, of which those that repeat cancel in pairs.
 ///
 /// A block of `tgt` at a time: the differential of its generator is walked once, and the
-/// action of each term on the monomials is read off `tables` as in [`pullback_columns`]. The
-/// distances from the end put the first position of `src` last in its row, where
-/// [`SparseEchelon`] takes its pivot.
+/// action of each term on the monomials is read off `tables` as in [`pullback_columns`]. A
+/// list of the tables is sorted by row and then by the level of the source, so a row is read
+/// as far as its depth and no further. The distances from the end put the first position of
+/// `src` last in its row, where [`SparseEchelon`] takes its pivot.
 ///
 /// # Panics
 ///
@@ -1030,7 +1031,7 @@ pub fn pullback_rows(
     src: &Space,
     tgt: &Space,
     shift: PackedXi,
-    wanted: impl Fn(u32) -> bool + Sync,
+    depth: impl Fn(u32) -> u16 + Sync,
 ) -> (Vec<Vec<u32>>, usize) {
     use maybe_rayon::prelude::*;
     assert!(cx.attach.is_empty(), "rows of an attaching term");
@@ -1042,21 +1043,22 @@ pub fn pullback_rows(
             let block = tgt.blocks[b];
             let (e2, cell2) = (block.e as i32, block.cell as usize);
             let monos = q.monomials(e2);
-            let positions: Vec<Option<u32>> = monos
+            // the position of each monomial and the depth of its row
+            let rows: Vec<(u32, u16)> = monos
                 .iter()
                 .enumerate()
                 .map(|(idx, m)| {
                     let pos = tgt.pos_in(q, b, idx as u32, mono_len(m) as u16);
-                    wanted(pos).then_some(pos)
+                    (pos, depth(pos))
                 })
                 .collect();
-            if positions.iter().all(Option::is_none) {
+            // the monomials whose rows are built
+            let sought: Vec<u16> = (0..monos.len() as u16)
+                .filter(|&g| rows[g as usize].1 > 0)
+                .collect();
+            if sought.is_empty() {
                 return (Vec::new(), 0);
             }
-            // the monomials whose rows are wanted
-            let sought: Vec<u16> = (0..monos.len() as u16)
-                .filter(|&g| positions[g as usize].is_some())
-                .collect();
             let mut local: Vec<Vec<u32>> = vec![Vec::new(); monos.len()];
             // the cell stays, or an action moves another cell here
             let mut moves = vec![(shift, shift_degree, cell2)];
@@ -1080,37 +1082,44 @@ pub fn pullback_rows(
                     let e = e2 + degree;
                     debug_assert_eq!(src.blocks[sb as usize].e as i32, e);
                     let list = tables.get(e, op - s);
-                    let mut push = |m: u16, g: u16| {
-                        let len = q.len_at(e, m as u32);
-                        local[g as usize]
-                            .push(last - 1 - src.pos_in(q, sb as usize, m as u32, len));
+                    // Reads the run of `g` in `list` from `from`, as far as the depth of its
+                    // row; the sources of a run are in order of level.
+                    let mut read = |from: usize, g: u16| {
+                        let bound = rows[g as usize].1;
+                        for x in list[from..].iter().take_while(|x| x[1] == g) {
+                            let len = q.len_at(e, x[0] as u32);
+                            if len >= bound {
+                                break;
+                            }
+                            local[g as usize]
+                                .push(last - 1 - src.pos_in(q, sb as usize, x[0] as u32, len));
+                        }
                     };
                     if sought.len() * SEEK_RATIO < list.len() {
-                        // few rows are wanted: find each in the list, which is sorted by row
+                        // few rows are built: find each in the list
                         for &g in &sought {
-                            let from = list.partition_point(|x| x[1] < g);
-                            for x in list[from..].iter().take_while(|x| x[1] == g) {
-                                push(x[0], g);
-                            }
+                            read(list.partition_point(|x| x[1] < g), g);
                         }
                     } else {
-                        for &[m, g] in list {
-                            if positions[g as usize].is_some() {
-                                push(m, g);
-                            }
+                        let mut from = 0;
+                        while from < list.len() {
+                            let g = list[from][1];
+                            read(from, g);
+                            from += list[from..].partition_point(|x| x[1] <= g);
                         }
                     }
                 }
             }
             let count = local.iter().map(Vec::len).sum();
-            let rows = positions
+            let rows = rows
                 .into_iter()
                 .zip(local)
-                .filter_map(|(pos, mut row)| {
+                .filter(|(row, _)| row.1 > 0)
+                .map(|((pos, _), mut row)| {
                     cancel_pairs(&mut row);
                     // the rows are kept for as long as their weight is reduced
                     row.shrink_to_fit();
-                    Some((pos?, row))
+                    (pos, row)
                 })
                 .collect();
             (rows, count)

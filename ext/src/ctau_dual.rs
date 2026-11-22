@@ -213,7 +213,7 @@ impl Step<'_> {
                 &src,
                 &tgt,
                 0,
-                |pos| !is_cleared(pos),
+                |pos| if is_cleared(pos) { 0 } else { u16::MAX },
             )
         });
         let mut stats = DualStats {
@@ -514,10 +514,11 @@ impl Step<'_> {
                 continue;
             }
             let tgt = Space::new(self.bb, self.q, self.cx, a + 1, weight);
-            let mut wanted = vec![0u64; tgt.dim().div_ceil(64)];
+            // each row is read as far as the towers that use it live
+            let mut depth = vec![0u16; tgt.dim()];
             for tower in towers.iter() {
                 for &p in &tower.psi {
-                    wanted[p as usize / 64] |= 1 << (p % 64);
+                    depth[p as usize] = depth[p as usize].max(tower.death);
                 }
             }
             let shift: PackedXi = 1 << j;
@@ -530,7 +531,7 @@ impl Step<'_> {
                     &src,
                     &tgt,
                     shift,
-                    |pos| wanted[pos as usize / 64] >> (pos % 64) & 1 == 1,
+                    |pos| depth[pos as usize],
                 )
             });
             stats.map_built_entries += built_entries;
