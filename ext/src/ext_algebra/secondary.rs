@@ -225,6 +225,23 @@ where
             .expect("call extend_all() first (and query a computed bidegree)")
     }
 
+    /// The secondary resolution of the module.
+    pub fn res_lift(&self) -> &Arc<SecondaryResolution<CC>> {
+        &self.res_lift
+    }
+
+    /// The secondary resolution of the unit (the same `Arc` as [`res_lift`](Self::res_lift) when
+    /// the module is the unit).
+    pub fn unit_lift(&self) -> &Arc<SecondaryResolution<CC>> {
+        &self.unit_lift
+    }
+
+    /// The $E_3$-page subquotient of $\Ext(M, k)$ at `b`, or `None` where it is not known; the
+    /// form [`SecondaryResolutionHomomorphism::hom_k`] takes for reducing the λ part.
+    pub fn page_data_opt(&self, b: Bidegree) -> Option<Subquotient> {
+        self.alg_d2.cohomology_subquotient(b)
+    }
+
     /// The $E_3$-page subquotient of the unit $\Ext(k, k)$ at bidegree `b`.
     pub fn unit_page_data(&self, b: Bidegree) -> Subquotient {
         self.unit_d2

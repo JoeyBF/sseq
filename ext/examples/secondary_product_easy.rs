@@ -1,0 +1,214 @@
+//! Secondary products $[y] \cdot [h_i]$, $i = 0, \ldots, 7$, for every class $y$ of the sphere
+//! in range, computed "the easy way": the chain map of $y$ is lifted by only two homological
+//! degrees (enough for the secondary homotopy one row above the product), and the result is read
+//! off by composing with $h_i$, which on $P_1$ is the dual of a single generator.
+//!
+//! Each $y$ is an independent, small lift, so the work runs in parallel over $y$. The secondary
+//! resolution of the sphere (composites and homotopies) is read from the save directory once.
+//!
+//! # Usage
+//! Same prompts as `secondary_product` for the module (S_2, save dir, max n, max s). Optional
+//! env `EASY_MAX_I` (default 7) caps $i$, `EASY_MIN_N`/`EASY_MAX_N` restrict the stems of $y$.
+//!
+//! # Output (stdout), one line per (y, h_i) with a nonzero target or λ-target
+//! - `[y] [h_i] = E + λ L`: $y$ survives to $E_3$ (a basis element of the $E_3$ cycles at its
+//!   bidegree, written in the $E_2$ basis), and so does $h_i$. `E` is in the $E_2$ basis at
+//!   $(n_y + 2^i - 1, s_y + 1)$, `L` in the basis at $(n_y + 2^i - 1, s_y + 2)$ reduced modulo the
+//!   image of $d_2$. $y$ multiplies on the LEFT with the sign twist $(-1)^{s_y t_{h_i}}$ (that is
+//!   [`SecondaryResolutionHomomorphism::hom_k`]'s convention, the same as `secondary_product`
+//!   with the roles of the two factors swapped).
+//! - `λ [y] [h_i] = λ E`: one factor does not survive $d_2$ (here: $y$ a non-cycle basis vector,
+//!   or $i \geq 4$); only $\lambda$ times the primary product is defined.
+//!
+//! Timings per $y$ go to stderr as `TIME y=<bidegree> idx=<k> secs=<f>`.
+
+use std::{sync::Arc, time::Instant};
+
+use algebra::module::Module;
+
+use ext::{
+    chain_complex::{ChainComplex, FreeChainComplex},
+    ext_algebra::{ExtModule, SecondaryExtAlgebra},
+    resolution_homomorphism::ResolutionHomomorphism,
+    secondary::{LAMBDA_BIDEGREE, SecondaryLift, SecondaryResolutionHomomorphism},
+    utils::query_module,
+};
+use fp::vector::FpVector;
+use maybe_rayon::prelude::*;
+use sseq::coordinates::{Bidegree, BidegreeElement};
+
+fn env_i32(name: &str, default: i32) -> i32 {
+    std::env::var(name)
+        .ok()
+        .map_or(default, |v| v.parse().expect("bad integer env"))
+}
+
+fn main() -> anyhow::Result<()> {
+    ext::utils::init_logging()?;
+    let t0 = Instant::now();
+    let phase = |name: &str| eprintln!("PHASE {name} at {:.1}s", t0.elapsed().as_secs_f64());
+
+    let resolution = Arc::new(query_module(Some(algebra::AlgebraType::Milnor), true)?);
+    phase("resolution loaded");
+    let e2 = Arc::new(ExtModule::from_resolution(Arc::clone(&resolution))?);
+    assert!(e2.is_unit(), "this driver is for the sphere");
+    let p = resolution.prime();
+
+    let sec_e2 = Arc::new(SecondaryExtAlgebra::new(Arc::clone(&e2)));
+    sec_e2.extend_all();
+    phase("sphere secondary resolution extended");
+
+    let max_i = env_i32("EASY_MAX_I", 7);
+    let min_n = env_i32("EASY_MIN_N", 0);
+    let max_n = env_i32("EASY_MAX_N", i32::MAX);
+
+    // h_i at (2^i - 1, 1), and whether it survives to E3.
+    let hs: Vec<(i32, Bidegree, bool)> = (0..=max_i)
+        .map(|i| (i, Bidegree::n_s((1 << i) - 1, 1)))
+        .filter(|&(_, b)| resolution.has_computed_bidegree(b))
+        .map(|(i, b)| {
+            let h = e2.element(b, &[1]);
+            let survives = sec_e2.survives(&h).unwrap_or(false);
+            (i, b, survives)
+        })
+        .collect();
+    let max_hi_t = hs.iter().map(|&(_, b, _)| b.t()).max().unwrap_or(0);
+
+    // One job per (bidegree, class): surviving E3 gens (the `subspace_gens` basis, exactly as
+    // `secondary_product` iterates them) and non-cycle basis vectors (complement pivots).
+    let mut jobs: Vec<(Bidegree, usize, FpVector, bool)> = Vec::new();
+    for b in resolution.iter_nonzero_stem() {
+        if b.s() < 1 || b.n() < min_n || b.n() > max_n {
+            continue;
+        }
+        // Need some h_i product target in range.
+        if !hs
+            .iter()
+            .any(|&(_, hb, _)| resolution.has_computed_bidegree(b + hb))
+        {
+            continue;
+        }
+        // At the top of the computed region the incoming d2 is unknown, so the E3 page is too.
+        let Some(page) = sec_e2.page_data_opt(b) else {
+            eprintln!("SKIP y={b}: E3 page unknown");
+            continue;
+        };
+        for (k, g) in page.subspace_gens().enumerate() {
+            jobs.push((b, k, g.to_owned(), true));
+        }
+        for (k, i) in page.complement_pivots().enumerate() {
+            let mut v = FpVector::new(p, e2.dimension(b));
+            v.set_entry(i, 1);
+            jobs.push((b, 1000 + k, v, false));
+        }
+    }
+    eprintln!("JOBS {}", jobs.len());
+    phase("jobs enumerated");
+
+    let res_lift = Arc::clone(sec_e2.res_lift());
+    let results: Vec<(Vec<String>, f64)> = jobs
+        .into_maybe_par_iter()
+        .map(|(b, k, y, survives)| {
+            let start = Instant::now();
+            let ys: Vec<u32> = y.iter().collect();
+            let y_el = BidegreeElement::new(b, y.clone());
+            let y_name = y_el.to_basis_string();
+
+            // Lift y's chain map by two homological degrees, through the t needed by every h_i.
+            // An empty name keeps the lift out of the save directory.
+            let underlying = Arc::new(ResolutionHomomorphism::from_class(
+                String::new(),
+                Arc::clone(&resolution),
+                Arc::clone(&resolution),
+                b,
+                &ys,
+            ));
+            let res = &resolution;
+            let top_s =
+                (b.s() + if survives { 2 } else { 1 }).min(res.next_homological_degree() - 1);
+            // One t bound for every row: the secondary intermediates read the row two below at
+            // the same t (minus one), so the rows must not shrink going down. Products landing in
+            // the top computed stem are lost to this; resolve one stem past the range wanted.
+            let t_cap = (b.s()..=top_s)
+                .map(|s| {
+                    let src = res.module(s).max_computed_degree();
+                    let tgt = res.module(s - b.s()).max_computed_degree() + b.t();
+                    src.min(tgt)
+                })
+                .min()
+                .unwrap()
+                .min(b.t() + max_hi_t + 2);
+            underlying.extend(Bidegree::s_t(top_s, t_cap));
+
+            let mut lines = Vec::new();
+            if survives && top_s == b.s() + 2 {
+                let lift = SecondaryResolutionHomomorphism::new(
+                    Arc::clone(&res_lift),
+                    Arc::clone(&res_lift),
+                    Arc::clone(&underlying),
+                );
+                lift.extend_all();
+                let lambda_page = |bd: Bidegree| sec_e2.page_data_opt(bd);
+                for &(i, hb, h_survives) in &hs {
+                    let target = b + hb;
+                    let lambda_target = target + LAMBDA_BIDEGREE;
+                    if !res.has_computed_bidegree(lambda_target)
+                        || underlying.get_map(target.s()).next_degree() <= target.t()
+                        || lift.homotopy(lambda_target.s()).homotopies.next_degree()
+                            <= lambda_target.t()
+                    {
+                        continue;
+                    }
+                    let ext_dim = res.number_of_gens_in_bidegree(target);
+                    let lambda_dim = res.number_of_gens_in_bidegree(lambda_target);
+                    if ext_dim == 0 && lambda_dim == 0 {
+                        continue;
+                    }
+                    if h_survives {
+                        let h = FpVector::from_slice(p, &[1]);
+                        let mut out = FpVector::new(p, ext_dim + lambda_dim);
+                        lift.hom_k(
+                            Some(&lambda_page),
+                            hb,
+                            std::iter::once(h.as_slice()),
+                            std::iter::once(out.as_slice_mut()),
+                        );
+                        let e = out.slice(0, ext_dim).to_owned();
+                        let l = out.slice(ext_dim, ext_dim + lambda_dim).to_owned();
+                        lines.push(format!("[{y_name}] [h{i}] = {e} + λ {l}"));
+                    } else if ext_dim > 0 {
+                        let m0 = underlying.get_map(target.s()).hom_k(hb.t());
+                        lines.push(format!("λ [{y_name}] [h{i}] = λ {:?}", m0[0]));
+                    }
+                }
+            } else {
+                for &(i, hb, _) in &hs {
+                    let target = b + hb;
+                    if !res.has_computed_bidegree(target)
+                        || underlying.get_map(target.s()).next_degree() <= target.t()
+                        || res.number_of_gens_in_bidegree(target) == 0
+                    {
+                        continue;
+                    }
+                    let m0 = underlying.get_map(target.s()).hom_k(hb.t());
+                    lines.push(format!("λ [{y_name}] [h{i}] = λ {:?}", m0[0]));
+                }
+            }
+            let secs = start.elapsed().as_secs_f64();
+            eprintln!("TIME y={b} idx={k} surv={survives} secs={secs:.3}");
+            (lines, secs)
+        })
+        .collect();
+    phase("products computed");
+
+    let mut total = 0.0;
+    for (lines, secs) in &results {
+        total += secs;
+        for l in lines {
+            println!("{l}");
+        }
+    }
+    eprintln!("SUM_JOB_SECS {total:.1}");
+    phase("done");
+    Ok(())
+}
