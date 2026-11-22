@@ -158,15 +158,25 @@ struct Ech {
 }
 
 impl Ech {
-    /// Reduces `v`; returns the remainder and the basis coefficients used.
+    /// Reduces `v` to its normal form (no pivot bit set); returns the remainder and the basis
+    /// coefficients used. Every row's bits lie at or above its pivot, so clearing pivots in
+    /// increasing order never sets a pivot already passed.
     fn reduce(&self, mut v: V) -> (V, V) {
         let mut coef = 0;
-        while v != 0 {
-            let Some(&(row, c)) = self.rows.get(&v.trailing_zeros()) else {
+        let mut passed: V = 0;
+        loop {
+            let rest = v & !passed;
+            if rest == 0 {
                 break;
-            };
-            v ^= row;
-            coef ^= c;
+            }
+            let p = rest.trailing_zeros();
+            match self.rows.get(&p) {
+                Some(&(row, c)) => {
+                    v ^= row;
+                    coef ^= c;
+                }
+                None => passed |= 1 << p,
+            }
         }
         (v, coef)
     }
@@ -715,7 +725,10 @@ fn next_page(node: &Node, cur: &Pages, vals: &FxHashMap<u32, Vec<Val>>) -> Pages
             let (cycles, open_here): (Vec<V>, bool) = match target(node, cur, b) {
                 None => (vec![], !pg.reps.is_empty()),
                 Some(None) => (pg.reps.clone(), false),
-                Some(Some(t)) if cur.tdim(t) == 0 => (pg.reps.clone(), false),
+                // no target coordinates means every class there is a possible boundary; d_r is
+                // then certainly zero only if they are all certain boundaries
+                Some(Some(t)) if cur.tdim(t) == 0 && cur.pg(t).exact => (pg.reps.clone(), false),
+                Some(Some(t)) if cur.tdim(t) == 0 => (vec![], !pg.reps.is_empty()),
                 Some(Some(t)) => {
                     let vs = vals.get(&b).map_or(&[][..], |v| &v[..]);
                     let any_open = vs.iter().any(|v| !v.dirs.is_empty());
@@ -1290,6 +1303,9 @@ fn coupling_equations(
         return vec![];
     };
     let r = e.r;
+    if std::env::var("SEC_RMAX").is_ok_and(|v| r > v.parse::<i32>().unwrap()) {
+        return vec![];
+    }
     let mut out = vec![];
     let mut used = 0;
     for s in sec {
@@ -1375,6 +1391,22 @@ fn coupling_equations(
                 eq.push(one);
             }
             let eq = reduce_eq(eq);
+            if std::env::var("SEC_DEBUG")
+                .is_ok_and(|d| eq == [one] || d == format!("{},{}", s.n, s.f))
+            {
+                eprintln!(
+                    "SECDBG ({},{}) y={:b} h{} L={l:b} coef={coef:b} zb={:?} treps={:?} lhs={lhs:?} \
+                     rhs={rhs:b} row={c} ind={:?} tdim={}",
+                    s.n,
+                    s.f,
+                    s.y,
+                    s.i,
+                    node.deg(zb),
+                    e.pg(zb).treps,
+                    ind.rows,
+                    tp.treps.len()
+                );
+            }
             if !eq.is_empty() {
                 let (node, i, row) = (ni as u16, s.i as u8, c as u8);
                 out.push((
@@ -2067,6 +2099,11 @@ pub(crate) fn run(ext: &Ext, p: &Products, args: &[String]) {
                 if let Some((n2, dr)) = &cache2 {
                     if *n2 == facts2 {
                         eprintln!("d2: no new page-2 facts, reusing the d2 solution");
+                        // the variable layout the coupling reads on the previous page
+                        let mut total = 0;
+                        for (n, e) in nodes.iter().zip(es.iter_mut()) {
+                            total = assign_vars(n, e, total);
+                        }
                         let next = nodes
                             .iter()
                             .zip(&es)
@@ -2083,6 +2120,35 @@ pub(crate) fn run(ext: &Ext, p: &Products, args: &[String]) {
             for (n, e) in nodes.iter().zip(es.iter_mut()) {
                 starts.push(total);
                 total = assign_vars(n, e, total);
+            }
+            // PAGE_DEBUG=node:n:f,...: the bounds at those bidegrees
+            if let Ok(spec) = std::env::var("PAGE_DEBUG") {
+                for w in spec.split(',') {
+                    let w: Vec<&str> = w.split(':').collect();
+                    let Some(ni) = nodes.iter().position(|x| x.name == w[0]) else {
+                        continue;
+                    };
+                    let (n, f) = (w[1].parse().unwrap(), w[2].parse().unwrap());
+                    let Some(b) = nodes[ni].get(n, f) else {
+                        eprintln!("PAGEDBG E{r} {} ({n},{f}): not in range/zero", w[0]);
+                        continue;
+                    };
+                    match es[ni].page[b as usize].as_ref() {
+                        None => eprintln!("PAGEDBG E{r} {} ({n},{f}): unknown", w[0]),
+                        Some(pg) => eprintln!(
+                            "PAGEDBG E{r} {} ({n},{f}) dim {}: reps {:?} treps {:?} bcert {:?} \
+                             bmax {:?} exact {} uncertain {}",
+                            w[0],
+                            nodes[ni].dim(b),
+                            pg.reps,
+                            pg.treps,
+                            pg.bcert,
+                            pg.bmax,
+                            pg.exact,
+                            pg.uncertain
+                        ),
+                    }
+                }
             }
             // equations are absorbed as they are generated and never stored together, unless a
             // certificate on this page needs each one with its origin
