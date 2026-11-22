@@ -1,0 +1,248 @@
+//! Compares the secondary composites of the untwisted tensor resolution $Q = P \otimes M$ of a
+//! two-cell module with the naive untwisting of the sphere's composites, generator by generator.
+//!
+//! A composite is the lift of $d \circ d$ to the pair algebra; a finalized Milnor pair element is
+//! a `2a` part and $Y_{k,l} b$ parts. The naive untwisting applies the primary rule of
+//! $\partial_Q$ to each term of the sphere's composite at $g \to h$: the algebra factor $a$ (or $b$)
+//! is coproducted and $a'$ (with the `2` or $Y_{k,l}$ in front) kept where $\chi(a'')$ carries $m$
+//! to $m'$, giving the coefficient of $h \otimes m'$ in the composite at $g \otimes m$. Prints the
+//! symmetric difference with $Q$'s actual composite: the defect a secondary untwisting must add.
+//!
+//! # Usage
+//! Prompts as `secondary` (S_2, save dir, max n, max s); env `COMP_MODULE` (default `Cnu`),
+//! `COMP_MAX_N`, `COMP_MAX_S`; `COMP_DUMP=1` also prints every composite.
+
+use std::{collections::BTreeSet, sync::Arc};
+
+use algebra::{
+    Algebra, MilnorAlgebra,
+    module::{FDModule, Module},
+    pair_algebra::MilnorPairElement,
+};
+use ext::{
+    chain_complex::ChainComplex,
+    ext_algebra::tensor_resolution::{Antipode, FullCoproduct, TensorResolutionSecondary},
+    secondary::{SecondaryLift, SecondaryResolution},
+    utils::{load_module_json, query_module},
+};
+use sseq::coordinates::Bidegree;
+
+/// A term of a pair element: (kind, degree of the algebra factor, its index); kind is `(9, 9)`
+/// for `2a` and `(k, l)` for $Y_{k,l} b$.
+type Term = ((usize, usize), i32, usize);
+
+fn terms(deg: i32, e: &MilnorPairElement) -> BTreeSet<Term> {
+    let mut out = BTreeSet::new();
+    for (i, c) in e.twos().iter().enumerate() {
+        if c != 0 {
+            out.insert(((9, 9), deg, i));
+        }
+    }
+    for (k, row) in e.ys().iter().enumerate() {
+        for (l, v) in row.iter().enumerate() {
+            let d = deg + 1 - (1 << k) - (1 << l);
+            for (i, c) in v.iter().enumerate() {
+                if c != 0 {
+                    out.insert(((k, l), d, i));
+                }
+            }
+        }
+    }
+    out
+}
+
+fn show(alg: &MilnorAlgebra, ts: &BTreeSet<Term>) -> String {
+    ts.iter()
+        .map(|&((k, l), d, i)| {
+            let a = alg.basis_element_to_string(d, i);
+            if k == 9 { format!("2{a}") } else { format!("Y{k}{l}.{a}") }
+        })
+        .collect::<Vec<_>>()
+        .join(" + ")
+}
+
+fn main() -> anyhow::Result<()> {
+    ext::utils::init_logging()?;
+    let res = Arc::new(query_module(Some(algebra::AlgebraType::Milnor), false)?);
+    let name = std::env::var("COMP_MODULE").unwrap_or_else(|_| "Cnu".to_string());
+    let max_n: i32 = std::env::var("COMP_MAX_N").map_or(20, |v| v.parse().unwrap());
+    let max_s: i32 = std::env::var("COMP_MAX_S").map_or(8, |v| v.parse().unwrap());
+    let dump = std::env::var("COMP_DUMP").is_ok();
+    let algebra = res.algebra();
+    let json = load_module_json(&name)?;
+    let m = FDModule::from_json(Arc::clone(&algebra), &json)?;
+    let top = m.max_degree().unwrap_or(0);
+    let tmax = max_n + max_s + top + 8;
+    algebra.compute_basis(tmax);
+    m.compute_basis(tmax);
+    let module = Arc::new(m);
+
+    let sres = Arc::new(SecondaryResolution::new(Arc::clone(&res)));
+    sres.extend_all();
+    let trs = TensorResolutionSecondary::new(Arc::clone(&res), Arc::clone(&module));
+    trs.compute_through_stem(Bidegree::n_s(max_n + top, max_s));
+    let qsec = trs.secondary();
+    let cop = FullCoproduct::new(Arc::clone(&algebra));
+    let chi = Antipode::new(Arc::clone(&algebra));
+
+    // Q_s's generators of degree exactly t, in order: (P generator degree, index, M degree, M idx)
+    let qgens = |s: i32, t: i32| -> Vec<(i32, usize, i32, usize)> {
+        let mut out = vec![];
+        for (d, i) in res.module(s).iter_gens(t) {
+            if d > t {
+                continue;
+            }
+            for mi in 0..module.dimension(t - d) {
+                out.push((d, i, t - d, mi));
+            }
+        }
+        out.into_iter().filter(|g| g.0 + g.2 == t).collect()
+    };
+    // the M-coordinates of chi(op) acting on basis element (md, mi)
+    let act = |op_deg: i32, op_idx: usize, md: i32, mi: usize| -> Vec<usize> {
+        let c = chi.apply(op_deg, op_idx);
+        let mut v = fp::vector::FpVector::new(algebra.prime(), module.dimension(md + op_deg));
+        for (o, oc) in c.iter_nonzero() {
+            module.act_on_basis(v.as_slice_mut(), oc, op_deg, o, md, mi);
+        }
+        v.iter_nonzero().map(|(i, _)| i).collect()
+    };
+
+    let (mut total, mut differ) = (0, 0);
+    for s in 2..=max_s {
+        let hom = qsec.homotopy(s);
+        for n in 0..=max_n + top {
+            let t = n + s;
+            if hom.composites.max_degree() < t {
+                continue;
+            }
+            for (qi, &(d, i, md, mi)) in qgens(s, t).iter().enumerate() {
+                let comp = hom.composite(t, qi);
+                let pc = sres.homotopy(s).composite(d, i);
+                for tt in 0..t {
+                    for (ti, &(hd, hi, hmd, hmi)) in qgens(s - 2, tt).iter().enumerate() {
+                        let actual = comp
+                            .coefficient(tt, ti)
+                            .map_or_else(BTreeSet::new, |e| terms(t - tt, e));
+                        // naive: untwist the sphere's coefficient at g -> h
+                        let mut naive: BTreeSet<Term> = BTreeSet::new();
+                        if hmd >= md {
+                            if let Some(e) = pc.coefficient(hd, hi) {
+                                for (kind, ad, ai) in terms(d - hd, e) {
+                                    for &(ld, li, rd, ri) in cop.terms(ad, ai).iter() {
+                                        if md + rd != hmd || !act(rd, ri, md, mi).contains(&hmi) {
+                                            continue;
+                                        }
+                                        let key = (kind, ld, li);
+                                        if !naive.remove(&key) {
+                                            naive.insert(key);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        if actual.is_empty() && naive.is_empty() {
+                            continue;
+                        }
+                        total += 1;
+                        if dump {
+                            println!(
+                                "s={s} t={t} q=({d},{i})m{md} -> ({hd},{hi})m{hmd}: {}",
+                                show(&algebra, &actual)
+                            );
+                        }
+                        if actual != naive {
+                            differ += 1;
+                            let extra: BTreeSet<Term> = actual.difference(&naive).copied().collect();
+                            let missing: BTreeSet<Term> = naive.difference(&actual).copied().collect();
+                            println!(
+                                "DEFECT s={s} t={t} q=({d},{i})m{md} -> h=({hd},{hi})m{hmd}: actual \
+                                 has [{}] beyond naive, lacks [{}]",
+                                show(&algebra, &extra),
+                                show(&algebra, &missing)
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+    println!("{name}: {total} composite coefficients, {differ} differ from the naive untwisting");
+
+    // The homotopies: H_Q(g . m) against the untwisting of H_P(g), as free-module elements of
+    // Q_{s-2} in degree t - 1, block by block (target generator h . m', algebra element).
+    let (mut htotal, mut hdiffer) = (0, 0);
+    for s in 2..=max_s {
+        let hq = &qsec.homotopy(s).homotopies;
+        let hp = &sres.homotopy(s).homotopies;
+        let qtarget = trs.resolution().module(s - 2);
+        let ptarget = res.module(s - 2);
+        for n in 0..=max_n + top {
+            let t = n + s;
+            if hq.next_degree() <= t {
+                continue;
+            }
+            for (qi, &(d, i, md, mi)) in qgens(s, t).iter().enumerate() {
+                if hp.next_degree() <= d {
+                    continue;
+                }
+                let out_deg = t - 1;
+                let actual = hq.output(t, qi);
+                let mut naive = fp::vector::FpVector::new(algebra.prime(), actual.len());
+                let pout = hp.output(d, i);
+                // blocks of H_P(g): P_{s-2} generators x of degree xd <= d - 1
+                for xd in 0..d {
+                    for xi in 0..ptarget.number_of_gens_in_degree(xd) {
+                        let cdeg = d - 1 - xd;
+                        let off = ptarget.generator_offset(d - 1, xd, xi);
+                        for ci in 0..algebra.dimension(cdeg) {
+                            if pout.entry(off + ci) == 0 {
+                                continue;
+                            }
+                            for &(ld, li, rd, ri) in cop.terms(cdeg, ci).iter() {
+                                for m2i in act(rd, ri, md, mi) {
+                                    // the Q generator x . m'' with |m''| = md + rd
+                                    let qd = xd + md + rd;
+                                    let Some(qx) = qgens(s - 2, qd)
+                                        .iter()
+                                        .position(|&g| g == (xd, xi, md + rd, m2i))
+                                    else {
+                                        continue;
+                                    };
+                                    let qoff = qtarget.generator_offset(out_deg, qd, qx);
+                                    naive.add_basis_element(qoff + li, 1);
+                                    debug_assert_eq!(ld, out_deg - qd);
+                                }
+                            }
+                        }
+                    }
+                }
+                htotal += 1;
+                if (0..naive.len()).any(|k| naive.entry(k) != actual.entry(k)) {
+                    hdiffer += 1;
+                    // decode the difference block by block
+                    let mut parts = vec![];
+                    for qd in 0..=out_deg {
+                        for (qx, &(xd, xi, xmd, _)) in qgens(s - 2, qd).iter().enumerate() {
+                            let off = qtarget.generator_offset(out_deg, qd, qx);
+                            for ci in 0..algebra.dimension(out_deg - qd) {
+                                if actual.entry(off + ci) != naive.entry(off + ci) {
+                                    parts.push(format!(
+                                        "{}.(({xd},{xi})m{xmd})",
+                                        algebra.basis_element_to_string(out_deg - qd, ci)
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                    println!(
+                        "HDEFECT s={s} t={t} q=({d},{i})m{md}: {}",
+                        parts.join(" + ")
+                    );
+                }
+            }
+        }
+    }
+    println!("{name}: {htotal} homotopy values, {hdiffer} differ from the untwisted H_P");
+    Ok(())
+}

@@ -1,0 +1,162 @@
+//! The Cartan defect of the split pair algebra on a module: for Milnor basis elements $a, b$ and
+//! a basis element $m$ of a finite module $M$,
+//! $$ D(a, b) = \sum \sigma(a')\sigma(b') [\chi(b'')\chi(a'') m] - \mathrm{untwist}(\sigma(a)\sigma(b)), $$
+//! where untwisting a pair element coproducts the algebra factor of each term (`1`, `2` or
+//! $Y_{k,l}$ in front) and keeps $c'$ where $\chi(c'')$ carries $m$ to $m''$. The secondary
+//! composites of the untwisted tensor resolution $P \otimes M$ differ from the untwisted sphere
+//! composites by sums of these along $d \circ d$.
+//!
+//! # Usage
+//! `pair_cartan_defect <module> <max degree of a b>`; prints one line per nonzero cross defect.
+
+use std::{collections::BTreeSet, sync::Arc};
+
+use algebra::{
+    Algebra, MilnorAlgebra,
+    module::{FDModule, Module},
+    pair_algebra::{MilnorPairElement, PairAlgebra},
+};
+use ext::{
+    ext_algebra::tensor_resolution::{Antipode, FullCoproduct},
+    utils::load_module_json,
+};
+use fp::vector::FpVector;
+
+type Term = ((usize, usize), i32, usize);
+
+/// kind `(8, 8)`: mod 2 part; `(9, 9)`: `2a`; `(k, l)`: $Y_{k,l} b$.
+fn terms(deg: i32, e: &MilnorPairElement) -> BTreeSet<Term> {
+    let mut out = BTreeSet::new();
+    for (i, c) in e.ones().iter().enumerate() {
+        if c != 0 {
+            out.insert(((8, 8), deg, i));
+        }
+    }
+    for (i, c) in e.twos().iter().enumerate() {
+        if c != 0 {
+            out.insert(((9, 9), deg, i));
+        }
+    }
+    for (k, row) in e.ys().iter().enumerate() {
+        for (l, v) in row.iter().enumerate() {
+            let d = deg + 1 - (1 << k) - (1 << l);
+            for (i, c) in v.iter().enumerate() {
+                if c != 0 {
+                    out.insert(((k, l), d, i));
+                }
+            }
+        }
+    }
+    out
+}
+
+fn show(alg: &MilnorAlgebra, ts: &BTreeSet<Term>) -> String {
+    ts.iter()
+        .map(|&((k, l), d, i)| {
+            let a = alg.basis_element_to_string(d, i);
+            match k {
+                8 => a,
+                9 => format!("2{a}"),
+                _ => format!("Y{k}{l}.{a}"),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" + ")
+}
+
+fn toggle(set: &mut BTreeSet<Term>, t: Term) {
+    if !set.remove(&t) {
+        set.insert(t);
+    }
+}
+
+fn main() -> anyhow::Result<()> {
+    let args: Vec<String> = std::env::args().collect();
+    let name = &args[1];
+    let max_deg: i32 = args[2].parse()?;
+    let algebra = Arc::new(MilnorAlgebra::new(fp::prime::TWO, false));
+    algebra.compute_basis(max_deg + 2);
+    let json = load_module_json(name)?;
+    let m = FDModule::from_json(Arc::clone(&algebra), &json)?;
+    let top = m.max_degree().unwrap_or(0);
+    m.compute_basis(max_deg + top + 2);
+    let cop = FullCoproduct::new(Arc::clone(&algebra));
+    let chi = Antipode::new(Arc::clone(&algebra));
+    // the M-coordinates (degree md + op_deg) of chi(op) acting on a vector v of degree md
+    let act = |op_deg: i32, op_idx: usize, md: i32, v: &FpVector| -> FpVector {
+        let c = chi.apply(op_deg, op_idx);
+        let mut out = FpVector::new(algebra.prime(), m.dimension(md + op_deg));
+        for (mi, mc) in v.iter_nonzero() {
+            for (o, oc) in c.iter_nonzero() {
+                m.act_on_basis(out.as_slice_mut(), oc * mc, op_deg, o, md, mi);
+            }
+        }
+        out
+    };
+    let unit = |md: i32, mi: usize| {
+        let mut v = FpVector::new(algebra.prime(), m.dimension(md));
+        v.set_entry(mi, 1);
+        v
+    };
+    let mut count = 0;
+    for ad in 1..max_deg {
+        for bd in 1..=(max_deg - ad) {
+            for ai in 0..algebra.dimension(ad) {
+                for bi in 0..algebra.dimension(bd) {
+                    for md in 0..=top {
+                        for mi in 0..m.dimension(md) {
+                            for m2d in (md + 1)..=top {
+                                // the cross part m -> m'' only
+                                let jump = m2d - md;
+                                for m2i in 0..m.dimension(m2d) {
+                                    let mut d: BTreeSet<Term> = BTreeSet::new();
+                                    // actual: sum over the coproducts of a and b
+                                    for &(al, ali, ar, ari) in cop.terms(ad, ai).iter() {
+                                        for &(bl, bli, br, bri) in cop.terms(bd, bi).iter() {
+                                            if ar + br != jump {
+                                                continue;
+                                            }
+                                            let v = act(br, bri, md + ar, &act(ar, ari, md, &unit(md, mi)));
+                                            if v.entry(m2i) == 0 {
+                                                continue;
+                                            }
+                                            let mut e = algebra.new_pair_element(al + bl);
+                                            algebra.sigma_multiply_basis(&mut e, 1, al, ali, bl, bli);
+                                            for t in terms(al + bl, &e) {
+                                                toggle(&mut d, t);
+                                            }
+                                        }
+                                    }
+                                    // naive: untwist sigma(a) sigma(b)
+                                    let mut e = algebra.new_pair_element(ad + bd);
+                                    algebra.sigma_multiply_basis(&mut e, 1, ad, ai, bd, bi);
+                                    for (kind, cd, ci) in terms(ad + bd, &e) {
+                                        for &(cl, cli, cr, cri) in cop.terms(cd, ci).iter() {
+                                            if cr != jump {
+                                                continue;
+                                            }
+                                            if act(cr, cri, md, &unit(md, mi)).entry(m2i) != 0 {
+                                                toggle(&mut d, (kind, cl, cli));
+                                            }
+                                        }
+                                    }
+                                    if !d.is_empty() {
+                                        count += 1;
+                                        println!(
+                                            "D({}, {}) m{md} -> m{m2d}: {}",
+                                            algebra.basis_element_to_string(ad, ai),
+                                            algebra.basis_element_to_string(bd, bi),
+                                            show(&algebra, &d)
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    println!("{name}: {count} nonzero cross defects");
+    Ok(())
+}
