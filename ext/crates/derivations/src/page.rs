@@ -12,6 +12,71 @@ use rustc_hash::FxHashMap;
 
 use crate::{Ext, Module, Products, bits, eliminate, parse_vec64};
 
+/// Determined differentials of one page, for the export: (node, source bidegree, source, target),
+/// both as E2 vectors.
+type Exported = Vec<(usize, u32, V, V)>;
+
+/// Writes each node's determined differentials as an `Sseq<3, SyntheticAdams>` (stem, filtration,
+/// λ-offset 0) to `<dir>/<node>.json`, and reports the degrees sseq finds inconsistent: sseq
+/// recomputes the pages itself, so any would mean the engine's differentials disagree.
+fn export_sseq(dir: &str, nodes: &[Node], pages: &BTreeMap<i32, Exported>) {
+    use fp::{prime::ValidPrime, vector::FpVector};
+    use sseq::{
+        Sseq, SyntheticAdams,
+        coordinates::{degree::MultiDegree, element::MultiDegreeElement},
+    };
+    std::fs::create_dir_all(dir).unwrap();
+    let p = ValidPrime::new(2);
+    let r_max = pages.keys().copied().max().unwrap_or(2);
+    let vector = |v: V, dim: usize| -> FpVector {
+        let mut out = FpVector::new(p, dim);
+        for i in bits(v) {
+            out.set_entry(i, 1);
+        }
+        out
+    };
+    for (ni, node) in nodes.iter().enumerate() {
+        let t = Instant::now();
+        let dim = |n: i32, f: i32| node.get(n, f).map_or(0, |b| node.dim(b));
+        let mut sseq = Sseq::<3, SyntheticAdams>::new(p);
+        for n in -1..=node.n_max + 1 {
+            for f in 0..=node.f_max + r_max + 1 {
+                sseq.set_dimension(MultiDegree::new([n, f, 0]), dim(n, f));
+            }
+        }
+        let mut count = 0;
+        for (&r, items) in pages {
+            for &(_, b, src, tgt) in items.iter().filter(|x| x.0 == ni) {
+                let (n, f) = node.deg(b);
+                let source =
+                    MultiDegreeElement::new(MultiDegree::new([n, f, 0]), vector(src, dim(n, f)));
+                let target = vector(tgt, dim(n - 1, f + r));
+                sseq.add_differential(r, &source, target.as_slice());
+                count += 1;
+            }
+        }
+        sseq.update();
+        let bad = sseq
+            .iter_degrees()
+            .filter(|&b| sseq.inconsistent(b))
+            .count();
+        let path = format!("{dir}/{}.json", node.name);
+        let json = serde_json::to_vec(&sseq).unwrap();
+        std::fs::write(&path, &json).unwrap();
+        eprintln!(
+            "{}: exported {count} differentials to {path} ({:.1} MB), {bad} inconsistent degrees, \
+             {:.1}s",
+            node.name,
+            json.len() as f64 / 1e6,
+            t.elapsed().as_secs_f64()
+        );
+        println!(
+            "export {}: {count} differentials, {bad} inconsistent degrees",
+            node.name
+        );
+    }
+}
+
 /// A vector over the E2 basis of one bidegree, or a set of page coordinates.
 type V = u64;
 
@@ -1125,7 +1190,11 @@ fn read_secondary(path: &str) -> Vec<Secondary> {
             (n, f) = (w[0], w[1]);
             y ^= 1 << w[2];
         }
-        out.push(Secondary { n, f, y, i, l });
+        // SEC_I_MIN: skip products with h_i for i below it
+        let i_min: u32 = std::env::var("SEC_I_MIN").map_or(0, |v| v.parse().unwrap());
+        if i >= i_min {
+            out.push(Secondary { n, f, y, i, l });
+        }
     }
     eprintln!(
         "secondary products: {} with vanishing E2 product",
@@ -1803,6 +1872,9 @@ pub(crate) fn run(ext: &Ext, p: &Products, args: &[String]) {
     let exact_e2 = args.iter().any(|a| a == "--e2-exact-deps");
     // --secondary <file>: secondary products of the first node (`secondary_product_easy`)
     let secondary = arg("--secondary").map(|p| read_secondary(p));
+    // --export-sseq <dir>: write the final pass's determined differentials as Sseq<3>s
+    let export = arg("--export-sseq");
+    let mut exported: BTreeMap<i32, Exported> = BTreeMap::new();
     let spec = read_spec(args);
     assert_eq!(spec.rings[0].1, "-", "the main ring must be the first node");
 
@@ -2113,7 +2185,9 @@ pub(crate) fn run(ext: &Ext, p: &Products, args: &[String]) {
                     }
                 }
             }
-            if let (Some(sec), Some((ep, drp))) = (&secondary, &prev) {
+            // SEC_PARTS=fwd|back|both (default both): which half of the coupling to use
+            let sec_parts = std::env::var("SEC_PARTS").unwrap_or_else(|_| "both".into());
+            if let (Some(sec), Some((ep, drp)), true) = (&secondary, &prev, sec_parts != "back") {
                 sink.add(coupling_equations(
                     0, &nodes[0], &es[0], &ep[0], &drp[0], sec, total,
                 ));
@@ -2135,6 +2209,20 @@ pub(crate) fn run(ext: &Ext, p: &Products, args: &[String]) {
                     };
                     let spec = cert_here.unwrap();
                     certify(spec, &labels, &eqs, &origins, &pivot, &rows, &prov, args);
+                    // the equations behind the first few contradictions
+                    for &e in c.iter().take(3) {
+                        let set = crate::cert::contradiction(&eqs, &pivot, &rows, &prov, e, total);
+                        println!("contradiction: {} equations", set.len());
+                        for &i in &set {
+                            let terms: Vec<String> =
+                                eqs[i as usize].iter().map(|&y| labels.var(y)).collect();
+                            println!(
+                                "  {}: {} = 0",
+                                labels.origin(origins[i as usize]),
+                                terms.join(" + ")
+                            );
+                        }
+                    }
                     (pivot, rows, c.len())
                 }
             };
@@ -2276,6 +2364,26 @@ pub(crate) fn run(ext: &Ext, p: &Products, args: &[String]) {
             if r == 2 {
                 cache2 = Some((facts2, dr.clone()));
             }
+            // differentials known exactly: determined, into a target without boundary uncertainty
+            if export.is_some() {
+                let mut page = vec![];
+                for (ni, (n, e)) in nodes.iter().zip(&es).enumerate() {
+                    for (&b, vs) in &dr[ni] {
+                        let Some(Some(t)) = target(n, e, b) else {
+                            continue;
+                        };
+                        let tp = e.pg(t);
+                        if !tp.exact {
+                            continue;
+                        }
+                        for (k, v) in vs.iter().enumerate().filter(|(_, v)| v.dirs.is_empty()) {
+                            let y = bits(v.part).fold(0, |acc, l| acc ^ tp.treps[l]);
+                            page.push((ni, b, e.pg(b).reps[k], y));
+                        }
+                    }
+                }
+                exported.insert(r, page);
+            }
             // a forced value d_r(x) = y in a target without boundary uncertainty is a true
             // d_{r-1}-cycle: d_{r-1}(y) = 0
             if r > first {
@@ -2386,7 +2494,7 @@ pub(crate) fn run(ext: &Ext, p: &Products, args: &[String]) {
                      {open} open, {skipped} skipped"
                 );
             }
-            if let (Some(sec), Some((ep, drp))) = (&secondary, &prev) {
+            if let (Some(sec), Some((ep, drp)), true) = (&secondary, &prev, sec_parts != "fwd") {
                 let facts = coupling_facts(&nodes[0], &es[0], &ep[0], &drp[0], &dr[0], sec);
                 if !facts.is_empty() {
                     eprintln!("S: d{r}: {} secondary facts for d{}", facts.len(), r - 1);
@@ -2413,5 +2521,8 @@ pub(crate) fn run(ext: &Ext, p: &Products, args: &[String]) {
         if facts == facts_before {
             break;
         }
+    }
+    if let Some(dir) = export {
+        export_sseq(dir, &nodes, &exported);
     }
 }

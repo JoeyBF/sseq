@@ -82,6 +82,57 @@ pub(crate) fn certificate(
     (e, set)
 }
 
+/// A set of equations summing to `1 = 0`, from the equation `e` that reduced to the constant: the
+/// rows it was reduced by, expanded into equations, then shrunk greedily.
+pub(crate) fn contradiction(
+    eqs: &[Vec<u32>],
+    pivot: &[u32],
+    rows: &[Vec<u32>],
+    prov: &[(u32, Vec<u32>)],
+    e: u32,
+    one: u32,
+) -> Vec<u32> {
+    let mut rp = vec![false; rows.len()];
+    let mut r = eqs[e as usize].clone();
+    while let Some(&c) = r.first() {
+        if c == one {
+            break;
+        }
+        let row = pivot[c as usize] as usize;
+        r = xor_sorted(&r, &rows[row]);
+        rp[row] ^= true;
+    }
+    let mut ep = vec![false; eqs.len()];
+    ep[e as usize] = true;
+    for row in (0..rows.len()).rev() {
+        if rp[row] {
+            ep[prov[row].0 as usize] ^= true;
+            for &u in &prov[row].1 {
+                rp[u as usize] ^= true;
+            }
+        }
+    }
+    let mut set: Vec<u32> = (0..eqs.len() as u32).filter(|&i| ep[i as usize]).collect();
+    if set.len() <= 20_000 {
+        set.sort_by_key(|&i| std::cmp::Reverse(eqs[i as usize].len()));
+        let mut k = 0;
+        while k < set.len() {
+            let trial: Vec<u32> = set
+                .iter()
+                .enumerate()
+                .filter(|&(j, _)| j != k)
+                .map(|(_, &i)| i)
+                .collect();
+            if implied(eqs, &trial, &[one]) {
+                set = trial;
+            } else {
+                k += 1;
+            }
+        }
+    }
+    set
+}
+
 /// Writes the pool `scripts/min_certificate.py` minimises over: the relation, a name per variable,
 /// and every equation sharing a variable with the certificate `set` (with `closure`, every
 /// equation inside the variables those touch).
