@@ -1,9 +1,10 @@
 # The Adams E2 page of Cτ from the classical resolution
 
 Design and results for `src/ctau.rs` and `examples/ctau_e2.rs` (the dense reference),
-`src/ctau_scale.rs`, `examples/ctau_scale.rs` and `fp::matrix::SparseEchelon` (the sparse
-implementation), and the scripts `ctau_check.py`, `ctau_compare.py`, `ctau_legacy.py`,
-`ctau_towers_check.py` and `ctau_plan.py`.
+`src/ctau_scale.rs`, `src/ctau_lazy.rs`, `src/ctau_dual.rs`, `examples/ctau_scale.rs`,
+`examples/ctau_orders.rs` and `fp::matrix::SparseEchelon` (the sparse implementations), and the
+scripts `ctau_check.py`, `ctau_compare.py`, `ctau_rank_compare.py`, `ctau_legacy.py`,
+`ctau_towers_check.py`, `ctau_quotient_check.py`, `ctau_plan.py` and `ctau_plan_quotients.py`.
 Everything here is 2-primary and C-motivic. Numbers were measured on `sfx7` against a copy of the
 stem ≤ 100 subset of the stem-400 resolution, on 24 threads at `nice 19`, unless stated otherwise.
 
@@ -34,15 +35,34 @@ stem ≤ 100 subset of the stem-400 resolution, on 24 threads at `nice 19`, unle
   streamed from the save. Stem 200 for `Cτ` reduces in 2 s where the dense reference took 1725
   s and 207 GB. Exports are archived through stem 280 for `Cτ` and its four two-cell complexes,
   through stem 320 for `Cτ` with `h_1..h_4`, and through stem 350 for the towers of `Cτ`
-  (sections 7, 9, 10).
-* The coboundaries are 0.4% to 0.7% dense at every size, so the cost is the size of the output,
-  which grows about five times per 40 stems. `src/ctau_lazy.rs` runs the same export in bounded
-  memory (12.5 GB instead of 96 GB at stem 280) at twice the time; stem 350 and 400 now wait on
-  a parallel reduction, not on memory. The complete page at stem 800 is out of reach of any
-  elimination, and the
-  part of Chow degree `k = stem + filtration - 2 weight` at most 10 to 15 at stem 800 (which
-  contains everything of Adams filtration at most `k`) is the size of the stem 350 to 400
-  computations (section 11).
+  (sections 7, 9, 10). The transposed export (section 11) adds `Cτ` and `Cτ ∧ C(η)`
+  with `h_1..h_4` and both cell maps through stem 350, and `Cτ ∧ C(2)` through stem 350.
+* The cost of the reduction by columns was its elimination, which adds 5 to 65 times the
+  input and grows like the 15th power of the stem. **Reducing the transposed coboundaries from
+  the top filtration down finds the same towers with additions of about the size of the
+  input**: 17, 36, 71 and 105 times fewer at stems 160, 200, 240 and 280, four rows in five
+  reduced as they stand. `src/ctau_dual.rs` is the export on it, with `h_1..h_4` and both cell
+  maps computed on functionals instead of cocycles; it agrees with the reduction by columns
+  and with the native resolution on every rank and on the rank of every map (section 11).
+  `Cτ` with `h_1..h_4` takes 42 s through stem 280, 3 minutes through 320 and under 15
+  through 350 (plus 3, 12 and 26 minutes of tables), where the reduction by columns took
+  405 s, 32 minutes and 140 GB, and 75 minutes and 210 GB without the `h_j`. What is left is
+  building the coboundary, which grows like the 11th to 13th power.
+* Each polynomial degree is its own complex, so a bound on the Chow degree `k = stem +
+  filtration - 2 weight` is exact. `k <= 4`, `8`, `12` through stem 400 take 81 s, 243 s and
+  1330 s for `Cτ` and `Cτ ∧ C(η)` together, and their cost grows like `N^8` to `N^9`: a bound
+  buys two orders of magnitude at a given stem and two to four in the power. At stem 798,
+  `k <= 4` was stopped by the memory of a session here and is a batch job (section 12).
+* The quotients `Q/(q_0, ..., q_{n-1})` cost little. `n = 1` is `Cτ ∧ C(2)`, which as the cone
+  of `q_0` was the most expensive complex and as the quotient is the cheapest: 17 million
+  classes through stem 350 in 169 s. `n = 4` is done through stem 798, the first of these
+  computations at the end of the range: 3.7 million classes in 81 minutes (section 12).
+* The complete page has about `N^5.3` towers through stem `N`, about 7e8 at stem 800: the
+  output is not the obstacle. The entries built for the coboundaries grow like `N^11` to
+  `N^13`, which is what the transposed export costs, and the operation tables like `N^9`.
+  Section 13 has the cost models: the complete page of `Cτ` is under an hour at stem 400 and
+  half a day to a day at 500; stem 800 is node-years as the code stands, and 96% of what is
+  built there lies beyond what the pairing reads, which is the next thing to remove.
 * General products are validated but not yet at scale: algebra generators of weight at most 16
   and their products are archived through stem 160.
 
@@ -425,13 +445,9 @@ Elimination adds 2, 5, 9, 17, 29, 65 times the input and keeps 0.7, 0.5, 0.4, 0.
 of it: there is no fill-in, and the cost is chains of short additions. Per 40 stems, the
 entries grow about 5 times, the additions 8 to 9 times and the reduced columns 4 to 5 times.
 
-**Stem 350 and 400 with the lazy driver.** Not run. Peak memory grew 4 and 3.5 times per 40
-stems, most of it tables at the top: about 60 to 80 GB at stem 350 with 6 weights in flight,
-and about 200 GB at stem 400. Time is the problem. At the measured rates `Cτ` alone is about 6
-hours at stem 350 and the four cofibers 15 times that; stem 400 is about 12 times stem 350.
-The reduction of one coboundary has to be made parallel (the chunked reduction of persistent
-homology applies as it stands: reduce chunks of columns independently against the columns
-before them, then merge) before either run is worth a batch job.
+**Stem 350 and 400 by columns.** Not run with the lazy driver: at the measured rates `Cτ`
+alone is about 6 hours at stem 350 and the four cofibers 15 times that, and stem 400 is about
+12 times stem 350. Section 11 replaces the reduction, and these estimates with it.
 
 **Bounded memory (`src/ctau_lazy.rs`, the spill directory prompt of `ctau_scale`).** The
 in-memory driver keeps every reduced column, the whole backbone and the coactions the tables
@@ -468,8 +484,41 @@ about 120 GB at 400), which every filtration reads in every degree, so dropping 
 rebuilding it for each filtration or spilling the unreduced coboundaries instead (hundreds of
 GB at stem 350); and, transiently, the whole unreduced coboundary of the weights in flight. The
 lazy driver is about twice as slow, because the weights of one filtration are few and each
-reduction is sequential: it used 4 to 8 of 24 cores. That, not memory, is now what limits stem
-350 and 400 (section 11).
+reduction is sequential: it used 4 to 8 of 24 cores.
+
+**The reduction by columns in parallel.** A profile of the lazy driver at stem 280 has 97% of
+its samples in the reduction of one column against the columns before it. Two ways of
+spreading that over threads were built. Both give the result of taking the sources one by
+one, bit for bit (a column is always reduced at its leading entry by the one earlier column
+with that pivot, so only the order in which the additions happen changes):
+
+* batches: 4096 sources are reduced in parallel against the columns before the batch, then
+  in order against the batch itself. The profile above is of this one: nearly every addition
+  is by a column of the same batch, so the parallel step does 3% of the work;
+* halves (`Elimination::solve`, in use): solve the first half of the sources, reduce the
+  second half against it in parallel, solve the second half, down to leaves of 16 sources.
+  Additions by a column of the same leaf are all that is left in order: 18%, 16% and 13% of
+  them for `Cτ` at stems 200, 240, 280, and 4% to 6% for `Cτ ∧ C(η)`.
+
+Wall time of the lazy driver with `h_1..h_4`, 24 threads, 12 weights in flight (the node was
+shared with other jobs of mine, more heavily in the later columns):
+
+| stem | complex | one column at a time | batches | halves |
+|---|---|---|---|---|
+| 200 | `Cτ` | 11.6 s | 8.9 s | 9.6 s |
+| 200 | `Cτ ∧ C(η)` | 20.7 s | 17.6 s | 15.9 s |
+| 240 | `Cτ` | 100 s | 70 s | 58 s |
+| 240 | `Cτ ∧ C(η)` | 209 s | 154 s | 114 s |
+| 280 | `Cτ` | 717 s | 576 s | 405 s |
+| 280 | `Cτ ∧ C(η)` | 1686 s | 1455 s | not run |
+
+So 1.8 times at stem 280, not the 6 that the idle cores promised. The clocks on the phases
+say why: at stem 280 the tasks of `Cτ` spend 439 s building coboundaries, 423 s reducing them
+(90 s of it in order) and 1107 s on the maps `h_j` (368 s building them, the rest taking
+classes, which is one more reduction per tower generator and map). With the reduction
+parallel, the classes are the cost, and they are sequential per class and long. This line was
+not pushed further, because the transposed reduction (section 11) removes the additions
+themselves.
 
 ## 10. Results and where they are
 
@@ -483,99 +532,509 @@ Under `/rs/rs_grp_csht/resolutions/ctau_e2/`:
 | `ctau_n350.tar.zst` | stem ≤ 350: the towers of `Cτ` only (the run was killed in `h_j`) |
 | `products_n120.tar.zst`, `products_n160.tar.zst` | the five complexes through stem 120 and 160, with `Ctau_generators.csv` and `Ctau_products.csv` (weight ≤ 16) |
 
-Through stem 350, `Cτ` has 8540409 towers (5272324 through stem 320, 2605517 through 280). Stem 400 was not run; see
-"Stem 400" in the section before.
+Through stem 350, `Cτ` has 8540409 towers (5272324 through stem 320, 2605517 through 280).
 
 Each archive is one `tar | zstd` file; nothing is unpacked on panfs. The scratch copies under
 `/dev/shm` are not kept.
 
-## 11. Reaching stem 800
+From the transposed export (section 11), whose bases are dual to the towers and so are not
+those of the archives above, tower for tower as they may correspond:
 
-**Data.** The backbone through classical stem 400 covers motivic stem 800 (section 4). It is 104
-GB on disk and, by the count through stem 120, of the order of 1e10 to 1e11 terms: it has to be
-streamed one filtration at a time, which `StreamedBackbone` does not do yet (it keeps every
-term).
+| archive | contents |
+|---|---|
+| `transposed_n320.tar.zst` | stem ≤ 320: towers and `h_1..h_4` of `Cτ` and `Cτ ∧ C(η)`, and both cell maps |
+| `transposed_n350.tar.zst` | the same through stem 350 |
+| `transposed_c2_n350.tar.zst` | stem ≤ 350: `Cτ ∧ C(2)` as `Q/q_0` (files named `Ctau_*`; every tower has length one), with `h_1..h_4` |
+| `quotient4_n798.tar.zst` | stem ≤ 798: `Cτ/I_4`, with `h_1..h_4` and multiplication by `q_4`, by columns |
 
-**Size.** With a density of 0.7% and the dimensions of `ctau_plan.py` (the sum of rows times
-columns over the coboundaries), rounded to a power of ten or so:
+Through stem 350, `Cτ ∧ C(η)` has 476050 towers (289276 through stem 320) and `Cτ ∧ C(2)` has
+16949321 classes.
 
-| range | largest coboundary | coboundary entries |
+## 11. The transposed reduction
+
+### The measurement
+
+The towers are the pairs of the persistence reduction (section 7), and the pairs do not depend
+on how the matrix is reduced: by columns with the pivot at the last row, or by rows with the
+pivot at the first column, taking the rows from the last to the first. The work does. In the
+second form the pivots of one coboundary are the rows that the coboundary one filtration
+*down* need not reduce, so the filtrations are taken from the top. `examples/ctau_orders.rs`
+runs both on the same matrices, one column or row at a time, and counts the entries of what
+is added:
+
+| stem | complex | by columns: entries added | transposed: entries added | ratio | rows reduced as they stand |
+|---|---|---|---|---|---|
+| 160 | `Cτ` | 1.02e8 | 6.0e6 | 17 | 86% |
+| 200 | `Cτ` | 1.90e9 | 5.3e7 | 36 | 84% |
+| 240 | `Cτ` | 2.38e10 | 3.4e8 | 71 | 82% |
+| 280 | `Cτ` | 2.21e11 | 2.1e9 | 105 | 81% |
+| 200 | `Cτ ∧ C(η)` | 5.29e9 | 1.17e8 | 45 | 90% |
+| 240 | `Cτ ∧ C(η)` | 6.28e10 | 7.7e8 | 81 | 89% |
+| 280 | `Cτ ∧ C(η)` | 5.84e11 | 4.9e9 | 119 | 88% |
+
+By columns the additions are 9, 17 and 29 times the entries built at stems 200, 240, 280 and
+the factor grows; transposed they are 0.6, 0.7, 1.0, 1.4 and 1.7 times the entries of the rows
+reduced at stems 200 to 350. The pairs agree in number at every stem, and as multisets of
+(stem, filtration, weight, length) through stem 280 (2605517 towers).
+
+The transposition does not make the matrix smaller. Building it is reading `P(R) · m ∋ m'`
+off the tables for every term `P(R) x` of a differential, and the entries built that way
+repeat: 3.2, 4.0 and 4.9 are built for each one left at stems 200, 240, 280, the rest
+cancelling in pairs, by columns and by rows alike. What changes is that building is nearly all
+that is left to do.
+
+This is the choice between the homology and the cohomology algorithm of persistent homology,
+where the difference is as large and as hard to predict; for these complexes the columns were
+the wrong side. The same example compares ten orders of the cochains within a level for the
+reduction by columns (by generator degree, by the exponent of `q_1`, by the exponents of
+`q_1, q_2, ...`, each way and in either precedence): at stem 160 they add between 1.01e8 and
+4.8e8 entries, and the order in use (section 7) is within 1% of the best. No order within a
+level changes the growth; the transposition does.
+
+### What it computes
+
+Write `M_a: C^a → C^{a+1}` for the coboundary at one weight, with the cochains numbered by
+level as before. Row `τ` of `M_a` is the functional `e_τ^* ∘ δ` on `C^a`. The reduction keeps,
+for each cochain `τ` of `C^{a+1}` that is not skipped,
+
+    R_τ = ψ_τ ∘ δ,      ψ_τ = e_τ^* + (coordinates of cochains after τ),
+
+with the first cochain `σ` of `R_τ` its pivot, distinct for distinct `τ`. Then:
+
+* `(σ, τ)` is a pair: a tower in `C^{a+1}` born at the level of `τ` that dies at the level of
+  `σ`, a class in the polynomial degrees in between. A row that reduces to zero is a class
+  that never dies (in the lowest filtration, or with a bound on the Chow degree);
+* `ψ_τ` is the tower as a **functional**. `R_τ` starts at `σ`, so it vanishes on the cochains
+  of level below that of `σ`: for `k` from the level of `τ` up to there, `ψ_τ` vanishes on the
+  coboundaries of `Q_k` and is a functional on `H^{a+1}(Q_k)`. The towers alive at `k` are a
+  basis of the dual of `H^{a+1}(Q_k)`;
+* the cochains `σ` are skipped as rows of `M_{a-1}`: every cochain of `C^a` is either the
+  pivot of a row out of `C^a` or starts a functional `ψ` on `C^a`, so the two families
+  together are a basis of the dual of `C^a`, triangular for the order of the cochains.
+
+No cocycle is produced. What replaces "the class of a cocycle" is "the value of the tower
+functionals on it", and what replaces a cochain map `F` applied to a generator is `F`
+transposed applied to a tower: for a tower `τ'` of the target, `y = ψ_{τ'} ∘ F` is written in
+the triangular basis of the source space,
+
+    y = Σ α R + Σ β_τ ψ_τ,
+
+and `β_τ` is the coefficient of the tower `τ'` in `F` of the tower `τ`, in the bases of
+cohomology dual to the towers. Two facts make this cheap and correct:
+
+* *Only the levels where `τ'` lives matter.* The coefficients on cochains of level at most
+  `k` depend on `y` restricted to those cochains, and nothing is wanted beyond the level at
+  which `τ'` dies, so `y` and every row added to it are cut there. Most towers have length
+  one, so this is one level of a space that has many. At stem 200, `h_1` on `Cτ` costs 7.3e8
+  added entries without the cut and 2.2e6 with it.
+* *No dead functional appears.* Below the level at which `τ'` dies, `y` is a functional on
+  cohomology: `y ∘ δ = R_{τ'} ∘ F`, which starts at or after the level of the pivot of
+  `R_{τ'}`. The functionals of towers that have died by level `k` are independent on the
+  coboundaries of `Q_k`, and those alive vanish there, so `β_τ = 0` for every `τ` that dies
+  before `τ'` does. The export checks this on every coefficient it computes
+  (`Step::finish`), which is a test of the whole construction on every product.
+
+The two steps of writing `y` are done a filtration apart. The rows out of `C^a` are in memory
+when `M_a` has been reduced, and that is when `y` is reduced by them, which leaves a few
+cochains at which functionals of `C^a` start (`Step::pull`); the functionals themselves are
+found when `M_{a-1}` is reduced, and finish the job (`Step::finish`). So the reduced rows,
+which are the bulk (as large as the matrix), are never stored: they live while their weight
+is in flight. The functionals are nearly coordinates: 1.4 to 2 cochains each on average.
+
+`h_{j+1}` is `F = d^*_{(2^j)}` from `C^a` at weight `u` to `C^{a+1}` at weight `u + 2^j`,
+built by rows (`pullback_rows`: the differential of the generator of a block of targets is
+walked once) and only at the rows the towers use. Weights are taken from the highest down
+within a filtration, so that the towers a product lands on are there.
+
+The cell maps of a two-cell complex are maps within a filtration, which need the rows out of
+their source and the towers of their target; those are found a step apart in two exports. So
+the top cell is pulled back while the cofiber is reduced, from the towers of the sphere
+(exported first), and the bottom cell while the sphere is reduced a second time, from the
+towers of the cofiber. The second reduction of the sphere costs a sixth to a third of the
+cofiber.
+
+### What it does not give
+
+* **Cocycles.** The basis of a tridegree is the one dual to the towers, not a list of
+  cocycles, and it is not the basis of the reduction by columns (the two are related by a
+  triangular matrix; the towers correspond). Everything linear is unaffected: ranks, `h_0`
+  (the tower structure), `h_1..h_4`, cell maps, and their composites are matrices in these
+  bases. What needs a cocycle is the product by a general class through its bar cocycle
+  (section 3), and anything downstream that lifts a class to cochains. A cocycle dual to one
+  tower is one triangular solve against the rows and functionals of its space; that is not
+  written, and it is the price of using this export for general products.
+* **The cell maps of `Cτ ∧ C(2)`.** The export takes cells that are not shifted in filtration
+  or polynomial degree, which is the Hopf cofibers; `C(2)` as the cone of `q_0` is shifted in
+  both. As the quotient `Q/q_0` it is exported, and cheaply (section 12), with `h_1..h_4` and
+  without the maps to and from `Cτ`: reduction modulo `q_0` and the Bockstein.
+
+### Validation
+
+`ctau_rank_compare.py` compares two exports up to a change of basis: every rank, and the rank
+of every `h_j`, of every composite `h_i h_j` and of both cell maps out of every tridegree.
+
+| range | complexes | result |
 |---|---|---|
-| stem ≤ 350, complete (measured) | 1.8e5 square | 1.3e11 |
-| stem ≤ 400, complete | 3.6e5 square | 1e12 |
-| stem ≤ 800, `k ≤ 10` | 8.8e4 square | 1e11 |
-| stem ≤ 800, `k ≤ 15` | 3.4e5 square | 1e12 |
-| stem ≤ 800, `k ≤ 20` | 8.3e5 square | 6e12 |
-| stem ≤ 800, complete | 2.5e7 square | 2e15 |
+| stem ≤ 100 | `Cτ`, `C(η)`, `C(ν)`, `C(σ)` against the reduction by columns | 91105 classes; 43473 `h_j`, 45111 composites, 36358 cell maps: no rank differs |
+| stem ≤ 160 | `Cτ`, `C(η)` against the reduction by columns | 176776 classes; 68852 `h_j`, 79451 composites, 18173 cell maps: no rank differs |
+| stem ≤ 140, filtration ≤ 70 | `Cτ` against the native resolution (section 8) | 82967 classes, `h_0, ..., h_3` of total rank 4285, 73820, 3709, 1648: no mismatch |
+| stem ≤ 200, Chow degree ≤ 8 | `Cτ`, `C(η)` against the reduction by columns | 67607 classes, with `h_j`, composites and cell maps: no rank differs |
+| stem ≤ 120, quotient by `q_0, q_1` | `Cτ`, `C(η)` against the reduction by columns | 13986 classes: no rank differs |
+| stem ≤ 280 | `Cτ` against the reduction by columns | the 2605517 towers agree as a multiset |
 
-The same recipe gives 2e11 for stem 400 where the measured trend gives 1e12, so read the table as low by up to five times. The density at bounded `k` has not been measured and may differ. The complete page at stem 800
-is petabytes of coboundary: sparse elimination does not change that, because the matrices are
-not sparse enough. What it changes is everything up to there. The part of bounded Chow degree
-`k` at stem 800 (which contains everything of Adams filtration at most `k`) is, for `k ≤ 10`
-and `k ≤ 15`, the size of the stem-350 and stem-400 computations.
+### Measured
 
-**What is needed for stem 800 at bounded `k`**, in order:
+The export with `h_1..h_4` and the cell maps, 24 threads, 12 weights in flight through stem
+280, 8 at 320 and 6 at 350, on a node that other jobs of mine loaded to between one and two
+times its cores, so that the same run varies by half from one time to the next. "Built"
+counts entries before the repeated ones cancel, for the coboundary and for the maps; the rows
+reduced are counted after.
 
-1. A `max_k` in `Space`: levels above the bound are simply not built. Each `k` is its own
-   complex, so this is exact.
-2. Streaming the backbone by filtration, and keeping a weight's reduced columns only while the
-   maps into that weight are computed. Reduced columns are the memory: 0.34 of the input and
-   growing 5 to 6 times per 40 stems.
-3. Operation tables by degree on demand. They grow 5 to 6 times per 20 degrees and at degree 200
-   the full coaction has 1e5 terms per monomial; at bounded `k` only monomials of length at most
-   `k` are needed, which is a different and much smaller table.
-4. Products through tables (section 7).
-
-**Complete page beyond stem 400.** The limit is the output. A structured reduction that never
-forms the cochains (the Bockstein tower `Ext(Q/(q_0..q_n))[q_n] ⇒ Ext(Q/(q_0..q_{n-1}))`
-starting from classical Ext) is the only route I see, and it is not started.
-
-**`Cτ ∧ C(η)` as the target.** Most of `Ext(Cτ)` is `h_1`-towers, and they collapse in the
-cofiber of `h_1`: 64172 towers against 1180528 at stem 240, 141763 against 2605517 at stem 280,
-eighteen times fewer at both. The reduction does not get cheaper, because the complex here is
-the cone of `h_1` on the cochains of `Cτ`, twice the cochains:
-
-| stem | complex | cochains | coboundary entries | entries added | reduced kept | reduction | `h_j` |
+| stem | complex | built | rows reduced, their entries | entries added | by columns (section 9) | transposed | peak of the run |
 |---|---|---|---|---|---|---|---|
-| 200 | `Cτ` | 3.5e6 | 2.0e8 | 1.9e9 | 8.3e7 | 1.9 s | 2.0 s |
-| 200 | `Cτ ∧ C(η)` | 6.8e6 | 6.5e8 | 5.3e9 | 2.3e8 | 8.6 s | 2.0 s |
-| 240 | `Cτ` | 9.8e6 | 1.4e9 | 2.4e10 | 4.6e8 | 24 s | 17 s |
-| 240 | `Cτ ∧ C(η)` | 1.9e7 | 4.4e9 | 6.3e10 | 1.3e9 | 60 s | 12 s |
-| 280 | `Cτ` | 2.4e7 | 7.7e9 | 2.2e11 | 2.1e9 | 153 s | 130 s |
-| 280 | `Cτ ∧ C(η)` | 4.8e7 | 2.5e10 | 5.8e11 | 6.0e9 | 727 s | 113 s |
+| 200 | `Cτ` | 2.8e8, 4.8e6 | 1.7e6, 8.8e7 | 5.3e7 | 9.6 s | 2.3 s | 0.5 GB |
+| 200 | `Cτ ∧ C(η)`, top cell | 7.4e8, 1.3e7 | 3.3e6, 2.4e8 | 1.2e8 | 15.9 s | 2.9 s | |
+| 200 | the bottom cell | 2.8e8 | | | | 1.6 s | |
+| 240 | `Cτ` | 1.9e9, 2.0e7 | 4.8e6, 4.7e8 | 3.4e8 | 58 s | 7.2 s | 1.7 GB |
+| 240 | `Cτ ∧ C(η)`, top cell | 5.0e9, 5.3e7 | 9.4e6, 1.3e9 | 7.7e8 | 114 s | 13.6 s | |
+| 240 | the bottom cell | 1.9e9 | | | | 5.1 s | |
+| 280 | `Cτ` | 1.0e10, 1.3e8 | 1.2e7, 2.1e9 | 2.1e9 | 405 s | 42 s | 6.2 GB |
+| 280 | `Cτ ∧ C(η)`, top cell | 2.8e10, 3.8e8 | 2.4e7, 6.0e9 | 4.9e9 | 1455 s | 105 s | |
+| 280 | the bottom cell | 1.0e10 | | | | 33 s | |
+| 320 | `Cτ` | 5.5e10, 7.1e8 | 2.8e7, 8.7e9 | 1.2e10 | 1930 s in memory, 140 GB | 180 s | 22 GB |
+| 320 | `Cτ ∧ C(η)`, top cell | 1.5e11, 2.1e9 | 5.4e7, 2.5e10 | 2.7e10 | never finished | 428 s | |
+| 320 | the bottom cell | 5.5e10 | | | | 176 s | |
+| 350 | `Cτ` | 1.7e11, 1.3e11 | 4.9e7, 2.4e10 | 4.0e10 | 4474 s for the reduction alone, 210 GB | 878 s (earlier builder) | 52 GB |
+| 350 | `Cτ ∧ C(η)`, top cell | 4.8e11, 2.9e11 | 9.6e7, 6.9e10 | 8.9e10 | not attempted | 2413 s | |
+| 350 | the bottom cell | 1.7e11 | | | | 459 s | |
 
-So the cone costs 3 times the input, 2.6 to 2.8 times the additions, 2.9 times the memory and 2.5
-to 4.8 times the reduction time of `Cτ`; only what comes after the reduction (the `h_j`, the
-export, everything downstream) gets the eighteenfold saving. The engine can use `Cτ ∧ C(η)` as a
-node in its own right, with `S ∧ C(η) → Cτ ∧ C(η)` for naturality, and never needs `Cτ`
-rebuilt from it; the `Cτ` reduction then need not be kept in memory, which removes one of the
-two echelons the cell maps hold.
+The operation tables are extra and shared: 9 s, 36 s, 3 min, 12 min and 26 min at stems 200
+to 350.
 
-Can the input shrink too? Three things were considered, none measured.
+The rows at stem 350 were run before three changes to the builder, which the other rows
+have. At stem 320 they took `Cτ` from 460 s to 180 s, `Cτ ∧ C(η)` from 944 s to 428 s and the
+peak from 55 GB to 22 GB (the last by shrinking each row to its length):
 
-* Resolving the cofiber instead of coning it. `h_1` is the classical `h_0`, so `Cτ ∧ C(η)` is
-  `Ext_A(F_2, Q ⊗ D M)` for the classical mod 2 Moore module `M`, and with a minimal resolution
-  `P'` of `M` the cochains are `Hom_A(P', Q)`: one copy, with the generators of `Ext_A(M)` in
-  place of those of `Ext_A(F_2)`. That is about the size of the `Cτ` complex instead of twice
-  it, a gain of 2 to 3, not of 18: the cochains are large because `Q` is, not because of the
-  `h_1`-towers. Only the block on the stem-0 generators `h_0^a` goes away, and the large spaces
-  sit at Novikov filtration 5 to 11 where it is a small part. It also needs a minimal resolution
-  of the classical Moore spectrum through stem 400, which is not on `/rs` as far as I know and
-  which the rules do not let me compute.
-* `h_1`-periodicity. Above a line the multiplication by `h_1` is an isomorphism, so `Ext(Cτ)`
-  there is determined by one column. In these coordinates that region is high Novikov
-  filtration, where the cochain spaces are already small; the cost is elsewhere.
-* The `h_1`-local closed form (Guillou–Isaksen). It gives the infinite `h_1`-towers without
-  computing, which is a check on the tower counts of `Cτ` and a way to skip exporting them, but
-  for the same reason it does not touch the large spaces.
+* a row of a map is read only as deep as the towers that use it live (the sources of a row
+  are listed in order of level): the entries built for the `h_j` of `Cτ` at stem 280 go from
+  6.8e9 to 1.3e8;
+* the tables are sorted by row, and a list much longer than the rows wanted is searched for
+  each of them;
+* the terms of a differential are resolved once per filtration and shift to the operation's
+  number in the tables, or dropped if it never acts; before, every visit of a term (one per
+  weight) looked it up by its exponents.
 
-So the plan for stem 800 with `Cτ ∧ C(η)` as the target is the plan above with every cost
-multiplied by about 3 on the input side and divided by 18 on the output side: at bounded Chow
-degree, `k ≤ 10` is about three stem-350-sized reductions and `k ≤ 15` about three of stem 400;
-the complete page stays out of reach, since its obstacle is the input. With a minimal resolution
-of the classical Moore spectrum the factor 3 becomes about 1.
+So the times at stem 350 are high by a factor of two to three for what the code now does.
 
-## 12. Fitting together with the native route (#288, #289, #290)
+At stem 280 the tasks of `Cτ` now spend 314 s building rows, 21 s reducing them and 90 s on
+the `h_j`: the elimination is 5% of the work, and what is left is reading the coboundary off
+the tables. The additions grow faster than the rows (about `N^13` against `N^11`), but an
+added entry costs a thirtieth of an entry built, so they do not matter before stem 600.
+
+At stem 320 the whole export, `Cτ` and `Cτ ∧ C(η)` with `h_1..h_4` and both cell maps, takes
+25 minutes, 12 of them the tables, and 22 GB; by columns `Cτ` alone took 32 minutes and 140 GB
+in memory, and `Cτ ∧ C(η)` had not been computed at this stem. At stem 350, with the earlier
+builder, `Cτ` with `h_1..h_4` took 15 minutes after the tables, where the reduction by columns
+took 75 minutes and was killed at 210 GB before the `h_j`; `Cτ ∧ C(η)` with its top cell took
+40 minutes and the bottom cell 8, and the whole run 90 minutes and 52 GB. Through stem 350,
+`Cτ ∧ C(η)` has 476050 towers against the 8540409 of `Cτ`.
+
+## 12. Bounded Chow degree, and the quotients of `Q`
+
+### Bounded Chow degree
+
+With a bound `K` on the polynomial degree the monomials longer than `K` do not exist and the
+export is of `⊕_{k ≤ K} Ext_A(F_2, Q_k)`, exactly (section 4). The complex is no longer
+acyclic, so a cocycle need not be a coboundary: by columns the others are found one filtration
+later, as the sources whose coboundary reduces to zero, and transposed as the rows that reduce
+to zero. A tower still standing at the bound is exported with length `K + 1 - k+`.
+
+Differentials: the Adams `d_r` of `Cτ` (the algebraic Novikov `d_r`) raises the Novikov
+filtration by one and the Chow degree by `r - 1`. So the part of Chow degree at most `K` is a
+quotient of the spectral sequence, in which a class of Chow degree `k` has its `d_r` for
+`r ≤ K - k + 1`; it is the algebraic Novikov spectral sequence of `BP_*/I^{K+1}`. It contains
+every class of Adams filtration at most `K`.
+
+`Cτ` and `Cτ ∧ C(η)` with `h_1..h_4` and cell maps, by columns, 24 threads, on the copy of
+the backbone through classical stem 207 (wall time includes reading it); for each bound the
+largest space, the coboundary entries of `Cτ`, and the time for both complexes:
+
+| stem | `K = 4` | `K = 8` | `K = 12` | all `k`, `Cτ` |
+|---|---|---|---|---|
+| 200 | 154, 1.2e6, 1.4 s | 806, 1.4e7, 2.4 s | 1934, 4.4e7, 4.4 s | 12908, 2.0e8 |
+| 280 | 312, 1.2e7, 7.3 s | 1677, 1.9e8, 15 s | 4732, 8.0e8, 41 s | 61006, 7.7e9 |
+| 360 | 542, 7.9e7, 37 s | 3683, 1.8e9, 107 s | 10691, 9.6e9, 422 s | about 2.1e5, 1.9e11 |
+| 400 | 643, 1.6e8, 81 s | 4739, 4.2e9, 243 s | 14906, 2.5e10, 1330 s | about 3.6e5, 6e11 |
+
+At stem 400, `Cτ` has 157797, 542374 and 1206295 towers within the three bounds, and the peak
+memory is 5 GB, 5 GB and 15.6 GB. The spaces are small and grow slowly (like `N^2` to `N^3`),
+but the entries grow like `N^7` to `N^8`, `N^8.3` and `N^9.2`: a bound makes the computation
+at stem 400 smaller by 4000, 140 and 24 times and lowers the power of the growth by two to
+four, not more. The coboundary gets denser at a fixed bound too (13, 151 and 767 entries per
+cochain for `K = 4` at stems 200, 400, 600), because the differentials of the backbone get
+longer whatever the monomials are.
+
+How much of the page a bound holds, from the towers through stem 280 (the share of classes of
+Chow degree at most `K` among those of the stems in the band):
+
+| stems | `Cτ`: `K = 4` | `8` | `12` | `20` | `30` | `50` | `Cτ ∧ C(η)`: `K = 4` | `8` | `12` | `20` | `30` | `50` |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 1 to 100 | 15% | 36% | 56% | 82% | 96% | 100% | 26% | 45% | 60% | 80% | 94% | 100% |
+| 101 to 200 | 3.3% | 11% | 22% | 47% | 71% | 93% | 14% | 27% | 39% | 57% | 74% | 92% |
+| 201 to 280 | 1.5% | 5.1% | 11% | 28% | 51% | 81% | 10% | 23% | 34% | 50% | 65% | 84% |
+
+The transposed export takes a bound as well (validated, section 11) but gains less there: a
+tower standing at the bound never dies, so its products are computed on every level, and with
+few monomials the time goes to walking the differentials rather than to the entries. At stem
+400 with `K = 8`, `Cτ` takes 178 s transposed on 8 threads against 78 s by columns on 24:
+about the same work. What it gains is memory on the whole backbone (below).
+
+**The whole backbone.** Beyond stem 414 the backbone is the whole snapshot, 104 GB on local
+disk, read one filtration at a time with the terms filtered as they are read
+(`BackboneSource::slice`). The filter needs the operations that act on some monomial held,
+and listing the operations of the backbone first, as the unbounded export does, is not
+possible there (the differentials are too large to hold unfiltered). So the tables are built
+from the monomials alone, as for the quotients: with `K = 4` and `8` at stem 400 that is
+3.3e5 and 2.4e7 entries where the tables filtered by the backbone have 2.4e5 and 1.6e7.
+A bound selects that.
+
+`K = 4` on the whole backbone, `Cτ` with `h_1..h_4`:
+
+| stem | export | towers | largest space | entries built | time | peak |
+|---|---|---|---|---|---|---|
+| 600 | by columns, 12 threads | 809498 | 1981 | 4.4e9 | 22 min | 17.7 GB |
+| 798 | by columns, 16 threads | | | | stopped after 20 min | 67 GB and growing |
+| 798 | transposed, 24 threads | 2464904 through Novikov filtration 30 | | | stopped after 24 min | 57 GB and growing |
+
+Stem 798 at `K = 4` was not finished. By columns the terms of the differentials are filed by
+the generator they land on, two filtrations at a time, and that alone held 67 GB after 20
+minutes. The transposed export got through the Novikov filtrations from 399 down to 30 in 24
+minutes, and was stopped at 57 GB, growing by 3 GB a minute, with the 30 filtrations that
+hold four fifths of the differentials still to come: it would have passed the 100 GB allowed
+to a run from a session here. What it holds is the terms of one filtration that act on some
+monomial, once for each of the five shifts of the coboundary and the `h_j`, 12 bytes each; at
+stem 798 that is billions of terms even for monomials of length four. It is a batch job of
+about 250 GB and a few hours as it stands, and a leaner one if the terms are held once and
+the shifts read off them.
+
+Getting that far took four changes, all in the reading of the backbone, which was the whole
+of the cost there:
+
+* the terms of a differential are resolved to the operation's number in the tables once per
+  filtration, or dropped, in place of a lookup by exponents on every visit (section 11);
+* a term is tested by the degree and index of its operation, as the save has them, before
+  it is unpacked into exponents: with few monomials nearly none acts (`OpFilter`). Unpacking
+  and looking up every term was 82% of the run;
+* the differentials are read as the save holds them, by generator, and resolved by the
+  thread that read each degree, so that a filtration is held once
+  (`BackboneSource::resolved`);
+* the memo of unpacked operations is read without its lock.
+
+The first pass of these took `K = 4` through stem 400 from 59 s to 32 s on 8 threads, and the
+filtrations from 399 to 37 at stem 798 from 106 minutes to 17.
+
+### The quotients `Q/(q_0, ..., q_{n-1})`
+
+`q_n` is invariant modulo `q_0, ..., q_{n-1}`, so the quotient `Q/I_n` is a comodule algebra
+and `Ext_A(F_2, Q/I_n)` is the E2 page of `Cτ` smashed with the algebraic `S/(2, v_1, ...,
+v_{n-1})`: `n = 1` is `Cτ ∧ C(2)`. In a quotient no cochain is shorter than its source, every
+tower has length one, and multiplication by `q_n` is a map of exports (`Ctau_q.csv`).
+`ctau_quotient_check.py` checks consecutive quotients against each other through the long
+exact sequence of `q_n`.
+
+`Cτ/I_n` and `Cτ/I_n ∧ C(η)`, by columns, tables from the monomials:
+
+| stem | `n = 2`: classes, time | `n = 3` | `n = 4` |
+|---|---|---|---|
+| 200 | 76616, 1.0 s | 15749, 0.9 s | 5249, 0.9 s |
+| 280 | 373144, 3.8 s | 65376, 2.8 s | 18884, 2.4 s |
+| 360 | 1394169, 14 s | 212386, 8.3 s | 54821, 6.6 s |
+| 400 | 2508868, 28 s | 356054, 16 s | 86861, 13 s |
+| 500 (whole backbone) | | | 254760, 45 s |
+| 600 | | | 691587, 249 s |
+| 798 | | | 3682138, 81 min |
+
+The last row is the first of these computations at the end of the range: the E2 page of
+`Cτ/I_4` through motivic stem 798, on the whole stem-400 backbone, in 81 minutes and 16 GB.
+Its coboundaries have 1.4e7 entries in all; the time is the pass over the 104 GB of
+differentials, of which nearly every term is read and dropped.
+
+The coboundaries of `Q/I_2` have 7 entries per cochain at stem 400 where those of `Q` have a
+thousand: the density of the full complex is in `q_0` and `q_1`.
+
+**`Cτ ∧ C(2)` is `n = 1`.** As the cone of `q_0` it was the most expensive of the five
+complexes (3191 s at stem 280 by columns, twice the cochains of `Cτ`, never finished at stem
+320). As `Q/q_0`, transposed, it is the cheapest by far: the coboundary of `Q/q_0` is the part
+of the coboundary of `Q` that keeps the length of the monomial, a twentieth of it and less.
+With `h_1..h_4`, 12 threads, tables included:
+
+| stem | classes | entries built | time | peak |
+|---|---|---|---|---|
+| 200 | 949306 | 1.5e7 | 3.3 s | 0.1 GB |
+| 240 | 2336379 | 7.9e7 | 6.5 s | 0.3 GB |
+| 280 | 5162929 | 3.5e8 | 35 s | 0.7 GB |
+| 320 | 10457233 | 1.5e9 | 75 s | 1.5 GB |
+| 350 | 16949321 | 4.2e9 | 169 s | 2.7 GB |
+
+The classes at stems 200, 240, 280 are the towers the cone had there, and the ranks of the
+two agree at every tridegree through stem 120 (27039 tridegrees, 77515 classes). The entries
+grow like `N^11` as for `Cτ`, from a twenty-fifth of the size: the same model puts stem 400
+at ten minutes and stem 600 at a day on one node.
+
+## 13. Growth, cost models, and stem 800
+
+### How things grow
+
+Fitted on the ladders of sections 9 and 11 (stems 200 to 350), as powers of the stem `N`.
+The powers are not constant: these are counts of monomials and of Milnor basis elements, and
+every one of the powers below rises slowly with the stem, so the last column is an order of
+magnitude at best.
+
+| quantity | growth, 200 to 350 | stem 280 | stem 350 | stem 400 | stem 800 |
+|---|---|---|---|---|---|
+| towers of `Cτ` | `N^5.3` | 2.6e6 | 8.5e6 | 1.7e7 | 7e8 |
+| cochains of `Cτ` | `N^6` | 2.4e7 | 9.9e7 | 2e8 | 1.3e10 |
+| largest cochain space (from the ranks, `ctau_plan.py`) | | 6.1e4 | 1.8e5 | 3.6e5 | 2.5e7 |
+| coboundary entries built, by columns | `N^11.6` | 7.7e9 | 1.3e11 | 6e11 | 1.5e15 |
+| entries added, by columns | `N^15` | 2.2e11 | 8.6e12 | 5e13 | 1.5e18 |
+| coboundary entries built, transposed | `N^10.4`, `11.1`, `12.5`, `12.8` from rung to rung | 1.0e10 | 1.7e11 | 1e12 | 1e15 to 1e16 |
+| entries of the rows reduced, after cancelling | `N^9.2` rising to `N^11.2` | 2.1e9 | 2.4e10 | 1e11 | 2e14 to 1e15 |
+| entries added, transposed | `N^13` | 2.1e9 | 4.0e10 | 2e11 | 2e15 |
+| operation tables | `N^9` | 7.6e8 | 6.0e9 | 2e10 | 1e13 |
+
+"Eight times per 40 stems" was the reduction by columns at stems 240 to 350; as a power it is
+the 15th. The output is the smallest line of the table by far: a page of 7e8 towers at stem
+800 is a file of tens of GB. What stands between is the density of the coboundary in the
+basis of monomials and generators (a thousand entries per cochain at stem 350, growing as
+fast as the cochains do), and that most of what is built cancels or is never read; not the
+size of the answer.
+
+### Cost model: the complete page, transposed
+
+The time is the entries built: 3.3e-9 s each on one node of 24 threads at stem 320 (180 s for
+5.5e10), with the node shared. `Cτ ∧ C(η)` with its top cell takes 2.4 times `Cτ` and the
+bottom cell as much as `Cτ` again, so the three together 4.4 times. With the powers of the
+table, the lower figure for the 11th and the higher for the 13th:
+
+| stem | `Cτ` | `Cτ`, `Cτ ∧ C(η)` and both cell maps | tables | memory |
+|---|---|---|---|---|
+| 280 (measured) | 42 s | 3 min | 7.6e8 entries, 3 min | 6 GB |
+| 320 (measured) | 3 min | 13 min | 2.6e9 entries, 12 min | 22 GB |
+| 350 | 8 to 10 min (15 measured, earlier builder) | 40 min | 6.0e9 entries, 26 min | 30 to 50 GB |
+| 400 | 35 to 55 min | 2.5 to 4 h | 2e10 entries, 1.5 h | tables 80 GB (110 GB while they are built) and 30 to 100 GB in flight: a batch job of 250 GB |
+| 500 | 7 to 18 h | 1.5 to 3.5 days | 1.6e11 entries | tables by degree; 100 to 200 GB in flight |
+| 600 | 2 to 10 days | 1 to 6 weeks | 8e11 entries | the same, and the largest coboundaries out of core |
+| 800 | 2 months to 2 years | 1 to 9 years | 1e13 entries | one coboundary is 3e12 entries: rows built when asked for, not stored |
+
+The lines at 500 and beyond assume the tables are restructured. They are times on one node,
+and the weights of a filtration are independent tasks, so a cluster divides them. As the code
+stands, stem 500 is a batch job, stem 600 a campaign, and stem 800 out of reach; what would
+change that is below.
+
+**The next factor: rows built only as deep as their pair.** The entries of a row are at
+cochains of its own level and of every level above, and its pivot is its first entry. A row
+that is reduced as it stands is read no further than its pivot, and three pairs in four
+have both ends at one level. `ctau_orders` counts the entries by the number of levels between
+a row and the source:
+
+| stem | built | at the level of the row | up to the level of its pivot | one, two, ..., five levels up | six and more | within the longest tower of the space |
+|---|---|---|---|---|---|---|
+| 160 | 2.9e7 | 2.5e6, 8.4% | 2.7e6, 9.2% | 2.1e6, 2.6e6, 1.9e6, 2.7e6, 1.8e6 | 1.6e7 | 8.7e6, 30% |
+| 200 | 2.8e8 | 1.5e7, 5.4% | 1.6e7, 5.7% | 1.6e7, 2.0e7, 1.7e7, 2.2e7, 1.7e7 | 1.7e8 | 6.8e7, 24% |
+| 240 | 1.9e9 | 7.9e7, 4.2% | 8.1e7, 4.3% | 9.7e7, 1.2e8, 1.1e8, 1.3e8, 1.1e8 | 1.2e9 | 4.2e8, 22% |
+
+So 91% to 96% of what is built lies beyond the pivot of its row, and the share that does not
+shrinks as the stem grows (about `N^-1.7`). The level of the row alone is the complex of
+`Q/q_0`, which is why `Cτ ∧ C(2)` as that quotient costs so little (section 12): the towers
+of `Cτ` are the Bockstein spectral sequence of `q_0` on it, and nearly all of the coboundary
+is read to compute differentials that turn out short. An export that builds each row level by
+level, as far as its pair and the rows that use it need, would build a twentieth of the
+entries at stem 240 and less beyond; one that builds every row of a space as deep as the
+longest tower there, which is simpler, a fifth. It needs the tables sorted by the number of
+levels dropped (a prefix of each list is then a depth), rows built again one at a time, and a
+reduction that knows how far each row is exact. It is the first thing to build next, and it
+is not started.
+
+Three things stand between this and stem 800, in order:
+
+1. **Tables.** They are global, `N^9`, and every filtration reads every degree. Past stem
+   400 they have to be built per degree when a block needs them and dropped, or replaced by
+   the coaction computed per block. The row builder reads them in the same pattern as the
+   column builder, so either works for both.
+2. **Memory of one coboundary.** The reduced rows of a weight in flight are as large as its
+   matrix: 1 GB at stem 350, 5 GB at 400, terabytes at 800. Four rows in five are never
+   changed, and a row is needed again only when a later row or a product lands on its pivot:
+   a third of the rows are (30% and 34% of them, with 35% and 40% of the entries, at stems
+   200 and 240; `ctau_orders` counts them), and the products add a twentieth of what the
+   reduction does. So the rows need not be kept: keep the pivot of each and the functionals
+   that are not coordinates, and build a row again from the differential of its generator
+   when it is asked for, as Ripser does with its apparent pairs. The rows added are about as
+   many as the rows, so that costs about one more build of the matrix, and it leaves a few
+   words per cochain in memory.
+3. **Distribution.** Per weight, the chain of filtrations from the top down is one task with
+   a small state between steps (a bit per cochain, and the products pulled back). Stem `N +
+   40` continues every chain of stem `N` downward and adds new weights, so nothing is redone
+   when the range grows.
+
+### Cost model: bounded Chow degree at stem 800
+
+From the ladder of section 12 and the entries built, `Cτ` and `Cτ ∧ C(η)` together on one
+node:
+
+| bound | entries of `Cτ` at stem 400 | growth | at stem 600 | at stem 800 | time at stem 800 | largest space at 800 |
+|---|---|---|---|---|---|---|
+| `K ≤ 4` | 1.6e8 | `N^8` | 4.4e9 (measured) | 4.5e10 | half a day | 4.6e3 |
+| `K ≤ 8` | 4.2e9 | `N^8.3` | 1.2e11 | 1.3e12 | one to two days | 4.1e4 |
+| `K ≤ 12` | 2.5e10 | `N^9.2` | 1e12 | 1.5e13 | one to two weeks | 1.6e5 |
+| all `k` | 6e11 | `N^11` to `N^13` | 1e14 | 1e15 to 1e16 | node-years | 2.5e7 |
+
+The times follow the entries. The times of the ladder itself grow more slowly (`N^5.8`,
+`N^6.7`, `N^8.2`), because reading the backbone dominates its low rungs, and would put the
+last column at 1.3 hours, 7 hours and 4.5 days; the one point beyond the ladder, `K = 4` at
+stem 600, took 22 minutes for `Cτ` alone on 12 threads where those powers give 14 minutes
+for both complexes on 24, so the entries are the ones to trust. Each complex also costs one
+pass over the backbone, which took 80 minutes at stem 798 for the quotient by `q_0, ..., q_3`
+(the last row of the quotients in section 12 is little else). The row for `K ≤ 4` at stem
+800 was tried and not finished (section 12): reading the backbone, not the entries, is what
+a small bound costs there, and the memory of one filtration of it, more than 60 GB as the
+code stands, is what stopped the run.
+
+### What else was considered
+
+* **Orders within a level** (section 11): ten tried, no gain.
+* **The Bockstein tower.** `Ext(Q/I_{n+1})[q_n] ⇒ Ext(Q/I_n)` from the cheap quotients
+  down to `Q`. The top of it is cheap (seconds), but the last two steps are where everything
+  is: `Ext(Q/I_2)[q_1]` has about as many classes as `Q/q_0` has cochains (`q_1` has degree one), so
+  the first page of that step is no smaller than the complex it replaces, and its
+  differentials need the cochains of `Q/q_0` anyway. Transferring the differential to
+  cohomology at each step (homological perturbation) gives a complex 3 to 10 times smaller
+  whose differentials each cost a reduction in the larger one: a constant, not a power, and
+  the transposition already took more.
+* **The structure of `Q` as a comodule.** `Q_k` is the dual of the free unstable module
+  `F(k)` desuspended `k` times (the monomials of length at most `k` in the `ζ_i`), so the
+  page is `⊕_k Ext_A(Σ^{-k} F(k), F_2)` and the towers are the spectral sequence of the
+  length filtration of the dual Steenrod algebra, which converges to `F_2`: that is the
+  acyclicity the reduction uses. Multiplication by `q_n` is linear only modulo `q_0, ...,
+  q_{n-1}`. That linearity is not used for `n ≥ 1`: for `Cτ ∧ C(2) = Q/q_0`, all weights are
+  one persistence module over `F_2[q_1]` on the cochains of `Q/I_2`, 24 times fewer than
+  those of `Q/q_0` at stem 280. That would make `C(2)` cheaper again than the quotient export
+  of section 12, which is already cheap enough that it is not the place to work. For `Q`
+  itself only `q_0` is invariant, and its towers are what is computed.
+* **Change of rings.** `Q/q_0` is a comodule over the double of the Steenrod algebra, and
+  the Cartan–Eilenberg spectral sequence over it has `E_2 = Ext_A(F_2, Q ⊗ Q)` in halved
+  degrees again, with differentials: a larger coefficient module and a spectral sequence in
+  exchange for half the stem. Not pursued.
+* **Periodicity and known towers.** Above the lowest filtration the complex is acyclic, and
+  both reductions already skip every cochain that is known to be a pivot; four rows in five
+  are forced in the transposed form. The `h_1`-periodic region is at high Novikov filtration,
+  where the spaces are small. Nothing left to skip is large.
+* **`Cτ ∧ C(η)` as the target.** It has 18 times fewer towers than `Cτ` (141763 against
+  2605517 at stem 280) and costs 3 times as much to compute, in either reduction: the complex
+  is the cone, twice the cochains. With a minimal resolution of the classical Moore module in
+  place of the backbone it would be one copy; that resolution is not on `/rs` through stem
+  400 and may not be computed here.
+
+## 14. Fitting together with the native route (#288, #289, #290)
 
 The upstream stack resolves over `A_C/τ` natively (#288), lifts the differential to `A_C` so
 that it becomes `d + δ` with `δ` divisible by `τ`, runs the τ-Bockstein (deformation) spectral
@@ -605,14 +1064,21 @@ products (#290). The two routes compute the same `E_1`; section 8 is that compar
   the second against the first through stem 100 to 140; then run the second at scale. I have
   not read #289 and #290 closely enough to say how invasive that is.
 
-## 13. Not done here
+## 15. Not done here
 
-* General products at scale (section 7), and products on the cofibers beyond `h_1..h_4`.
-* The E2 page of the motivic sphere and the maps `S → Cτ → S^{1,-1}` on E2 pages (section 12);
+* General products at scale (section 7), and products on the cofibers beyond `h_1..h_4`. With
+  the transposed export they need one more piece: a cocycle for each algebra generator, or the
+  bar construction transposed (section 11).
+* The maps between `Cτ` and `Cτ ∧ C(2)` in the transposed export, and `Q/q_0` as one module
+  over `F_2[q_1]` (sections 11, 13).
+* Operation tables by degree, rows built again when asked for instead of kept, and chains of
+  filtrations per weight as separate tasks: what the complete page needs past stem 400 (section
+  13).
+* The E2 page of the motivic sphere and the maps `S → Cτ → S^{1,-1}` on E2 pages (section 14);
   the Adams differentials of `Cτ`; names. Not started, as agreed.
 * Massey products, by request.
 
-## 14. Running it
+## 16. Running it
 
     cargo build --release --no-default-features --features concurrent,logging,nassau \
         --example ctau_scale --example ctau_e2
@@ -625,5 +1091,14 @@ products (#290). The two routes compute the same `E_1`; section 8 is that compar
 
 `ctau_scale` asks for the module, its save directory (a copy: it opens the store), the output
 directory, the largest motivic stem, the complexes and the largest weight of an algebra generator
-to multiply by (0 for none). `ctau_e2` is the dense reference and also reads Lin's maps. The
-file formats are described on `main` in each example.
+to multiply by (0 for none); then the spill directory (`-` for the in-memory driver, which is
+the one with general products), the weights in flight, the largest Chow degree (`-` for all),
+the `n` of a quotient by `q_0, ..., q_{n-1}` (0 for none), a file of ranks of the backbone (`-`
+to read them off the save) and whether to reduce the transposed coboundaries (`y` is
+`src/ctau_dual.rs`, which takes the Hopf cofibers and not `C2`). `ctau_e2` is the dense
+reference and also reads Lin's maps. The file formats are described on `main` in each example.
+
+    # the transposed export of Cτ and Cτ ∧ C(η) through stem 280
+    printf 'S_2\n<copy of the save>\n<out>\n280\nCeta\n0\n<spill dir>\n12\n-\n0\n-\ny\n' | target/release/examples/ctau_scale
+    python3 -I ctau_rank_compare.py <legacy of one export> <legacy of another> Ctau Ceta
+    printf 'S_2\n<copy of the save>\n200\nCtau\n10\n' | target/release/examples/ctau_orders
