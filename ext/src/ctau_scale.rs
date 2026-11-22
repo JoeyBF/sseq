@@ -326,12 +326,12 @@ impl<'a> BackboneSource<'a> {
         let mut out = Forward::default();
         for (t, terms) in self.terms(a, keep)? {
             for run in terms.chunk_by(|x, y| x.0 == y.0) {
-                let mut terms: Vec<(PackedXi, u16, u16, u32)> = run
-                    .iter()
-                    .map(|&(_, op, tx, i)| (op, t - tx, tx, i))
-                    .collect();
-                terms.sort_unstable();
-                out.insert((t, run[0].0), terms);
+                out.insert(
+                    (t, run[0].0),
+                    run.iter()
+                        .map(|&(_, op, tx, i)| (op, t - tx, tx, i))
+                        .collect(),
+                );
             }
         }
         Ok(out)
@@ -426,8 +426,7 @@ fn vanishes(a: i32, t: i32) -> bool {
 }
 
 /// The terms of the differentials of one $P_a$ filed under its own generators `(t, l)`: each
-/// term $P(R) x$ of $d z_l$ as the operation, its degree, and the generator `(t, i)` of $x$,
-/// sorted by operation.
+/// term $P(R) x$ of $d z_l$ as the operation, its degree, and the generator `(t, i)` of $x$.
 pub type Forward = FxHashMap<(u16, u32), Vec<(PackedXi, u16, u16, u32)>>;
 
 /// The terms of a [`Forward`] whose operation, with a shift taken off, acts on some monomial:

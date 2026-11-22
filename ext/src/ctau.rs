@@ -520,6 +520,10 @@ impl OpTable {
 
     /// The exponents of the basis element `idx` of degree `degree`.
     pub fn pack(&self, degree: i32, idx: usize) -> PackedXi {
+        // nearly every call finds its answer, and many threads ask at once: read first
+        if let Some(packed) = self.packed.get(&(degree, idx)) {
+            return *packed;
+        }
         *self.packed.entry((degree, idx)).or_insert_with(|| {
             pack(
                 self.algebra
