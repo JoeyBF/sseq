@@ -2121,6 +2121,29 @@ pub(crate) fn run(ext: &Ext, p: &Products, args: &[String]) {
                 starts.push(total);
                 total = assign_vars(n, e, total);
             }
+            // PAGE_DUMP=<prefix>: the first node's bounds per bidegree, to <prefix>_E<r>.csv
+            if let Ok(prefix) = std::env::var("PAGE_DUMP") {
+                use std::io::Write;
+                let mut w =
+                    std::io::BufWriter::new(File::create(format!("{prefix}_E{r}.csv")).unwrap());
+                writeln!(w, "stem,filtration,dim,known,reps,treps,exact,uncertain").unwrap();
+                for b in 0..nodes[0].nb() as u32 {
+                    let (n, f) = nodes[0].deg(b);
+                    let d = nodes[0].dim(b);
+                    match es[0].page[b as usize].as_ref() {
+                        None => writeln!(w, "{n},{f},{d},0,0,0,0,1").unwrap(),
+                        Some(pg) => writeln!(
+                            w,
+                            "{n},{f},{d},1,{},{},{},{}",
+                            pg.reps.len(),
+                            pg.treps.len(),
+                            pg.exact as u8,
+                            pg.uncertain as u8
+                        )
+                        .unwrap(),
+                    }
+                }
+            }
             // PAGE_DEBUG=node:n:f,...: the bounds at those bidegrees
             if let Ok(spec) = std::env::var("PAGE_DEBUG") {
                 for w in spec.split(',') {
