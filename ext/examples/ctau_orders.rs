@@ -107,6 +107,9 @@ struct Cost {
     apparent: usize,
     /// The entries of the functionals the transposed reduction keeps.
     psi: usize,
+    /// The reduced rows that were added to a later one, and their entries.
+    reused: usize,
+    reused_entries: usize,
 }
 
 impl Cost {
@@ -119,6 +122,8 @@ impl Cost {
             input: self.input + o.input,
             apparent: self.apparent + o.apparent,
             psi: self.psi + o.psi,
+            reused: self.reused + o.reused,
+            reused_entries: self.reused_entries + o.reused_entries,
         }
     }
 }
@@ -220,6 +225,8 @@ fn reduce_dual(
         let mut echelon = SparseEchelon::new(src.dim());
         let mut ws = SparseWorkspace::new(src.dim());
         let mut next_cleared = vec![false; src.dim()];
+        // the reduced rows that have been added to another
+        let mut reused: Vec<bool> = Vec::new();
         let mut step = DualStep {
             a,
             rows: Vec::new(),
@@ -239,6 +246,12 @@ fn reduce_dual(
             cost.additions += added;
             cost.apparent += usize::from(added == 0);
             let mut psi = std::collections::BTreeSet::from([pos]);
+            for &c in &used {
+                if !std::mem::replace(&mut reused[c as usize], true) {
+                    cost.reused += 1;
+                    cost.reused_entries += step.rows[c as usize].len();
+                }
+            }
             for c in used {
                 for &r in &step.psi[c as usize].1 {
                     if !psi.remove(&r) {
@@ -260,6 +273,7 @@ fn reduce_dual(
             next_cleared[flip(pivot) as usize] = true;
             echelon.insert(rest.clone());
             step.rows.push(rest);
+            reused.push(false);
             step.psi.push((pos, psi.into_iter().collect()));
         }
         cleared = Some(next_cleared);
@@ -440,7 +454,8 @@ fn main() -> anyhow::Result<()> {
         .fold(Cost::default(), Cost::merge);
     println!(
         "transposed, from the top filtration down: {} columns of {} entries, {} entries added, {} \
-         kept, {} towers; {} columns needed no addition, the functionals have {} entries: {:.1} s",
+         kept, {} towers; {} columns needed no addition, the functionals have {} entries, {} \
+         rows of {} entries were added to a later one: {:.1} s",
         cost.columns,
         cost.input,
         cost.additions,
@@ -448,6 +463,8 @@ fn main() -> anyhow::Result<()> {
         cost.towers,
         cost.apparent,
         cost.psi,
+        cost.reused,
+        cost.reused_entries,
         start.elapsed().as_secs_f64()
     );
     for j in 0..3u32 {
