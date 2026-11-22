@@ -991,7 +991,8 @@ pub fn cancel_pairs(v: &mut Vec<u32>) {
 
 /// The cochain map of [`pullback_column`] by rows: for each position of `tgt` that `wanted`
 /// accepts, the positions of `src` whose image contains it, sorted, as distances from the last
-/// position of `src`. Other rows are empty.
+/// position of `src`. Other rows are empty. Also returns the number of entries built, of which
+/// those that repeat cancel in pairs.
 ///
 /// A block of `tgt` at a time: the differential of its generator is walked once, and the
 /// action of each term on the monomials is read off `tables` as in [`pullback_columns`]. The
@@ -1011,12 +1012,12 @@ pub fn pullback_rows(
     tgt: &Space,
     shift: PackedXi,
     wanted: impl Fn(u32) -> bool + Sync,
-) -> Vec<Vec<u32>> {
+) -> (Vec<Vec<u32>>, usize) {
     use maybe_rayon::prelude::*;
     assert!(cx.attach.is_empty(), "rows of an attaching term");
     let shift_degree = xi_degree(shift);
     let last = src.dim() as u32;
-    let built: Vec<Vec<(u32, Vec<u32>)>> = (0..tgt.blocks.len())
+    let built: Vec<(Vec<(u32, Vec<u32>)>, usize)> = (0..tgt.blocks.len())
         .into_maybe_par_iter()
         .map(|b| {
             let block = tgt.blocks[b];
@@ -1031,7 +1032,7 @@ pub fn pullback_rows(
                 })
                 .collect();
             if positions.iter().all(Option::is_none) {
-                return Vec::new();
+                return (Vec::new(), 0);
             }
             let mut local: Vec<Vec<u32>> = vec![Vec::new(); monos.len()];
             // the cell stays, or an action moves another cell here
@@ -1064,7 +1065,8 @@ pub fn pullback_rows(
                     }
                 }
             }
-            positions
+            let count = local.iter().map(Vec::len).sum();
+            let rows = positions
                 .into_iter()
                 .zip(local)
                 .filter_map(|(pos, mut row)| {
@@ -1073,14 +1075,19 @@ pub fn pullback_rows(
                     row.shrink_to_fit();
                     Some((pos?, row))
                 })
-                .collect()
+                .collect();
+            (rows, count)
         })
         .collect();
     let mut rows = vec![Vec::new(); tgt.dim()];
-    for (pos, row) in built.into_iter().flatten() {
-        rows[pos as usize] = row;
+    let mut count = 0;
+    for (block, n) in built {
+        count += n;
+        for (pos, row) in block {
+            rows[pos as usize] = row;
+        }
     }
-    rows
+    (rows, count)
 }
 
 /// Marks a column that generates no tower.

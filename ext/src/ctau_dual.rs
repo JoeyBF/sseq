@@ -102,7 +102,11 @@ pub struct DualStats {
     /// The rows reduced, and those of them that needed no addition.
     pub rows: usize,
     pub apparent: usize,
-    /// The entries of the rows built, of the rows added during reduction, and of the reduced
+    /// The entries built for the coboundaries and for the maps, before those that repeat
+    /// cancel: the work of reading them off the tables.
+    pub built_entries: usize,
+    pub map_built_entries: usize,
+    /// The entries of the rows reduced, of the rows added during reduction, and of the reduced
     /// rows.
     pub input_entries: usize,
     pub additions: usize,
@@ -124,6 +128,8 @@ impl DualStats {
             largest: self.largest.max(o.largest),
             rows: self.rows + o.rows,
             apparent: self.apparent + o.apparent,
+            built_entries: self.built_entries + o.built_entries,
+            map_built_entries: self.map_built_entries + o.map_built_entries,
             input_entries: self.input_entries + o.input_entries,
             additions: self.additions + o.additions,
             reduced_entries: self.reduced_entries + o.reduced_entries,
@@ -199,7 +205,7 @@ impl Step<'_> {
         let tgt = Space::new(self.bb, self.q, self.cx, a + 1, u);
         let is_cleared =
             |pos: u32| cleared.is_some_and(|bits| bits[pos as usize / 64] >> (pos % 64) & 1 == 1);
-        let mut built = timed(Phase::Build, || {
+        let (mut built, built_entries) = timed(Phase::Build, || {
             pullback_rows(
                 self.q,
                 self.differentials,
@@ -214,6 +220,7 @@ impl Step<'_> {
         let mut stats = DualStats {
             cochains: tgt.dim(),
             largest: tgt.dim(),
+            built_entries,
             ..DualStats::default()
         };
         let flip = |pos: u32| src.dim() as u32 - 1 - pos;
@@ -515,7 +522,7 @@ impl Step<'_> {
                 }
             }
             let shift: PackedXi = 1 << j;
-            let rows = timed(Phase::MapBuild, || {
+            let (rows, built_entries) = timed(Phase::MapBuild, || {
                 pullback_rows(
                     self.q,
                     self.differentials,
@@ -527,6 +534,7 @@ impl Step<'_> {
                     |pos| wanted[pos as usize / 64] >> (pos % 64) & 1 == 1,
                 )
             });
+            stats.map_built_entries += built_entries;
             for (i, tower) in towers.iter().enumerate() {
                 let mut positions = tower
                     .psi

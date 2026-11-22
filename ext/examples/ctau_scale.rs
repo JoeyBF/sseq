@@ -331,17 +331,20 @@ fn lazy(
                 &q, &source, &tables, cx, max_n, maps, &keep, dir, &options,
             )?;
             eprintln!(
-                "{label}: {} towers; {} cochains (largest space {}), {} rows of {} entries ({} \
-                 reduced as they stand), {} entries added, {} reduced entries; maps: {} entries \
-                 pulled back, {} added, {} products: {:.1} s, peak {:.1} GB",
+                "{label}: {} towers; {} cochains (largest space {}), {} entries built, {} rows \
+                 of {} entries ({} reduced as they stand), {} entries added, {} reduced \
+                 entries; maps: {} entries built, {} pulled back, {} added, {} products: {:.1} \
+                 s, peak {:.1} GB",
                 s.towers,
                 s.cochains,
                 s.largest,
+                s.built_entries,
                 s.rows,
                 s.input_entries,
                 s.apparent,
                 s.additions,
                 s.reduced_entries,
+                s.map_built_entries,
                 s.map_entries,
                 s.map_additions,
                 s.products,
