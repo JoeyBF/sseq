@@ -242,10 +242,11 @@ fn lazy(
     // with a bound on the Chow degree, only the monomials that short exist
     let q = QAlgebra::quotient(q_degree, max_k.unwrap_or(q_degree as u32), quotient);
     // The tables hold the operations that both occur in the backbone and act on a monomial.
-    // In a quotient by q_1 and more the monomials are few and their coactions short, so the
-    // tables are built from them alone and the backbone is filtered by the tables; otherwise
-    // one pass over the backbone lists its operations first, a few filtrations at a time.
-    let from_monomials = quotient >= 2 || std::env::var_os("CTAU_FROM_MONOMIALS").is_some();
+    // In a quotient by q_1 and more, or with a bound on the Chow degree, the monomials are few
+    // and their coactions short, so the tables are built from them alone and the backbone is
+    // filtered by the tables; otherwise one pass over the backbone lists its operations
+    // first, a few filtrations at a time, which holds them unfiltered.
+    let from_monomials = quotient >= 2 || max_k.is_some();
     let start = Instant::now();
     let tables = if from_monomials {
         OpTables::new(&q, None, q_degree)
