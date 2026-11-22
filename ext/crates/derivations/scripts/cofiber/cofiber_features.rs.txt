@@ -1,0 +1,127 @@
+//! Cheap local cochain operators from the sphere's resolution, as candidate terms for the
+//! cross term of the cofiber $C(h_j)$'s secondary differential.
+//!
+//! For each $j \leq 3$, each sphere bidegree $(n, s)$ and each basis cochain $e_x$ there, writes
+//! the value at $(n + 2^j - 1, s + 2)$ (over the generators $g$ of $P_{s+2}$) of
+//! - `d:a.e1|b.e2`: $g \mapsto \sum_y [e_1](dg)_y\,[e_2](dy)_x$, over Milnor basis elements $e_1$
+//!   of degree $a$ and $e_2$ of degree $b$ with $a + b = 2^j + 1$;
+//! - `H:e`: $g \mapsto [e](H g)_x$, with $H\colon P_{s+2} \to P_s$ the sphere's secondary
+//!   homotopy and $e$ of degree $2^j$.
+//!
+//! # Usage
+//! Prompts as `secondary` (S_2, save dir, max n, max s); env `FEAT_MAX_N`, `FEAT_MAX_S`.
+//!
+//! # Output (stdout)
+//! `j,stem,Adams_filtration,index,feature,value`.
+
+use std::{collections::BTreeMap, sync::Arc};
+
+use algebra::{Algebra, module::Module};
+use ext::{
+    chain_complex::{ChainComplex, FreeChainComplex},
+    ext_algebra::{ExtModule, SecondaryExtAlgebra},
+    utils::query_module,
+};
+use sseq::coordinates::Bidegree;
+
+fn main() -> anyhow::Result<()> {
+    ext::utils::init_logging()?;
+    let res = Arc::new(query_module(Some(algebra::AlgebraType::Milnor), true)?);
+    let e2 = Arc::new(ExtModule::from_resolution(Arc::clone(&res))?);
+    let sec_e2 = Arc::new(SecondaryExtAlgebra::new(Arc::clone(&e2)));
+    sec_e2.extend_all();
+    let res_lift = Arc::clone(sec_e2.res_lift());
+    let algebra = res.algebra();
+    let max_n: i32 = std::env::var("FEAT_MAX_N").map_or(58, |v| v.parse().unwrap());
+    let max_s: i32 = std::env::var("FEAT_MAX_S").map_or(28, |v| v.parse().unwrap());
+    println!("j,stem,Adams_filtration,index,feature,value");
+    for j in 0..=3 {
+        let jump = (1 << j) + 1;
+        for s in 0..=max_s {
+            for n in 0..=max_n {
+                let b0 = Bidegree::n_s(n, s);
+                let tb = Bidegree::n_s(n + (1 << j) - 1, s + 2);
+                if !res.has_computed_bidegree(b0) || !res.has_computed_bidegree(tb) {
+                    continue;
+                }
+                let dim = res.number_of_gens_in_bidegree(b0);
+                let tdim = res.number_of_gens_in_bidegree(tb);
+                if dim == 0 || tdim == 0 {
+                    continue;
+                }
+                let tz = b0.t();
+                let tg = tz + jump;
+                debug_assert_eq!(tg, tb.t());
+                // feature name -> matrix [x][g]
+                let mut feats: BTreeMap<String, Vec<Vec<u32>>> = BTreeMap::new();
+                let mut add = |name: String, x: usize, g: usize| {
+                    let m = feats.entry(name).or_insert_with(|| vec![vec![0; tdim]; dim]);
+                    m[x][g] ^= 1;
+                };
+                let p_s1 = res.module(s + 1);
+                let p_s = res.module(s);
+                let d2 = res.differential(s + 2);
+                let d1 = res.differential(s + 1);
+                for g in 0..tdim {
+                    // two-step coefficient products
+                    let dg = d2.output(tg, g);
+                    for (ty, yi) in p_s1.iter_gens(tg - 1) {
+                        if ty <= tz {
+                            continue;
+                        }
+                        let a = tg - ty;
+                        let off = p_s1.generator_offset(tg, ty, yi);
+                        for e1 in 0..algebra.dimension(a) {
+                            if dg.entry(off + e1) == 0 {
+                                continue;
+                            }
+                            let dy = d1.output(ty, yi);
+                            let b = ty - tz;
+                            let offx = p_s.generator_offset(ty, tz, 0);
+                            for x in 0..dim {
+                                for e2 in 0..algebra.dimension(b) {
+                                    if dy.entry(offx + x * algebra.dimension(b) + e2) != 0 {
+                                        let name = format!(
+                                            "d:{}|{}",
+                                            algebra.basis_element_to_string(a, e1),
+                                            algebra.basis_element_to_string(b, e2)
+                                        );
+                                        add(name, x, g);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    // the secondary homotopy's coefficients of degree 2^j
+                    let hom = &res_lift.homotopy(s + 2).homotopies;
+                    if hom.next_degree() > tg {
+                        let hg = hom.output(tg, g);
+                        let c = 1 << j;
+                        if hg.len() == p_s.dimension(tg - 1) {
+                            let offx = p_s.generator_offset(tg - 1, tz, 0);
+                            for x in 0..dim {
+                                for e in 0..algebra.dimension(c) {
+                                    if hg.entry(offx + x * algebra.dimension(c) + e) != 0 {
+                                        add(
+                                            format!("H:{}", algebra.basis_element_to_string(c, e)),
+                                            x,
+                                            g,
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                for (name, m) in &feats {
+                    for (x, row) in m.iter().enumerate() {
+                        if row.iter().any(|&v| v != 0) {
+                            println!("{j},{n},{s},{x},{name},\"{row:?}\"");
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
