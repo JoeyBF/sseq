@@ -546,6 +546,7 @@ those of the archives above, tower for tower as they may correspond:
 | `transposed_n350.tar.zst` | the same through stem 350 |
 | `transposed_c2_n350.tar.zst` | stem ≤ 350: `Cτ ∧ C(2)` as `Q/q_0` (files named `Ctau_*`; every tower has length one), with `h_1..h_4` |
 | `quotient4_n798.tar.zst` | stem ≤ 798: `Cτ/I_4`, with `h_1..h_4` and multiplication by `q_4`, by columns |
+| `bounded4_ctau_n600.tar.zst` | stem ≤ 600, Chow degree ≤ 4: towers and `h_1..h_4` of `Cτ`, by columns |
 
 Through stem 350, `Cτ ∧ C(η)` has 476050 towers (289276 through stem 320) and `Cτ ∧ C(2)` has
 16949321 classes.
