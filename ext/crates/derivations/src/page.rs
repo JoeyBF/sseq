@@ -49,6 +49,14 @@ enum Origin {
         k: u8,
         row: u8,
     },
+    /// The secondary-product coupling of pages r - 1 and r for `h_i` and the class at `(n, f)`.
+    Coupling {
+        node: u16,
+        n: i32,
+        f: i32,
+        i: u8,
+        row: u8,
+    },
 }
 
 /// Where generated equations go: into the propagator, or kept with their origins.
@@ -1071,6 +1079,320 @@ fn map_equations(
     out
 }
 
+/// A secondary product `y h_i = E + lambda L` with `E = 0`: `y` (an E2 vector at `(n, f)`) is a
+/// d2-cycle, and `L` is the E2 vector at `(n + 2^i - 1, f + 2)` (modulo the image of d2).
+struct Secondary {
+    n: i32,
+    f: i32,
+    y: V,
+    i: u32,
+    l: V,
+}
+
+/// Reads the lines `[y] [h_i] = [E] + λ [L]` of `secondary_product_easy` (y a sum of
+/// `x_(n, s, k)`) whose `E` vanishes; the other lines carry no coupling.
+fn read_secondary(path: &str) -> Vec<Secondary> {
+    let vec = |s: &str| -> V {
+        s.split(',')
+            .map(str::trim)
+            .enumerate()
+            .filter(|(_, x)| *x == "1")
+            .fold(0, |acc, (k, _)| acc | 1 << k)
+    };
+    let mut out = vec![];
+    for line in BufReader::new(File::open(path).unwrap()).lines() {
+        let line = line.unwrap();
+        if !line.starts_with('[') {
+            continue;
+        }
+        // [y] [hI] = [E] + λ [L]
+        let (lhs, rhs) = line.split_once(" = ").unwrap();
+        let (ys, hs) = lhs.rsplit_once("] [h").unwrap();
+        let i: u32 = hs.trim_end_matches(']').parse().unwrap();
+        let (e, l) = rhs.split_once(" + λ ").unwrap();
+        if vec(e.trim_matches(|c| c == '[' || c == ']')) != 0 {
+            continue;
+        }
+        let l = vec(l.trim_matches(|c| c == '[' || c == ']'));
+        let (mut n, mut f, mut y) = (0, 0, 0);
+        for term in ys.trim_start_matches('[').split(" + ") {
+            let w: Vec<i32> = term
+                .trim_start_matches("x_(")
+                .trim_end_matches(')')
+                .split(',')
+                .map(|x| x.trim().parse().unwrap())
+                .collect();
+            (n, f) = (w[0], w[1]);
+            y ^= 1 << w[2];
+        }
+        out.push(Secondary { n, f, y, i, l });
+    }
+    eprintln!(
+        "secondary products: {} with vanishing E2 product",
+        out.len()
+    );
+    out
+}
+
+/// `L` for the lift of `h_i` that comes from homotopy: the table's `L` is for the standard lift in
+/// Cλ², which can differ from it by `lambda c_i` with `c_i` at `(2^i - 1, 2)`; `SEC_LIFT` (bit `i`:
+/// `c_i` is the class there) chooses `c_i`, changing `L` by `c_i y`.
+fn true_l(node: &Node, s: &Secondary) -> V {
+    let Alg::Ring(ext, p) = node.alg else {
+        return s.l;
+    };
+    let mask: u32 = std::env::var("SEC_LIFT").map_or(0, |v| v.parse().unwrap());
+    if mask >> s.i & 1 == 0 {
+        return s.l;
+    }
+    match (node.get((1 << s.i) - 1, 2), node.get(s.n, s.f)) {
+        (Some(cb), Some(b)) => s.l ^ mul_vec(ext, p, cb, 1, b, s.y),
+        _ => s.l,
+    }
+}
+
+/// The bidegree of `h_i`.
+fn h_bidegree(node: &Node, i: u32) -> Option<u32> {
+    node.get((1 << i) - 1, 1)
+}
+
+/// The value of d_r on a combination `c` of the page classes at `b`, if determined.
+fn determined(dr: &FxHashMap<u32, Vec<Val>>, b: u32, c: V) -> Option<V> {
+    let vs = dr.get(&b).map_or(&[][..], |v| &v[..]);
+    bits(c).try_fold(0, |acc, k| {
+        let v = vs.get(k)?;
+        v.dirs.is_empty().then_some(acc ^ v.part)
+    })
+}
+
+/// The ambiguity of `d_{r-1}(L)` (page r - 1 target coordinates at `tb`): `L` is only defined
+/// modulo `h_i` times E2 at `(n, f + 1)` (the choice of lift of `y`), so it is d_{r-1} of every
+/// certain cycle in that span. `None` when it cannot be bounded: page r - 1 unknown or uncertain
+/// at `L`'s bidegree, or one of those d_{r-1} not determined.
+fn lift_ambiguity(
+    node: &Node,
+    ep: &Pages,
+    drp: &FxHashMap<u32, Vec<Val>>,
+    s: &Secondary,
+    hb: u32,
+) -> Option<Ech> {
+    let Alg::Ring(ext, p) = node.alg else {
+        return None;
+    };
+    let mut ind = Ech::default();
+    let hn = (1 << s.i) - 1;
+    let (Some(wb), Some(lb)) = (node.get(s.n, s.f + 1), node.get(s.n + hn, s.f + 2)) else {
+        return Some(ind);
+    };
+    let lp = ep.page[lb as usize].as_ref()?;
+    if lp.uncertain {
+        return None;
+    }
+    let images: Vec<V> = (0..node.dim(wb))
+        .map(|j| mul_vec(ext, p, hb, 1, wb, 1 << j))
+        .collect();
+    let rest: Vec<V> = images.iter().map(|&v| lp.src.reduce(v).0).collect();
+    for c in kernel(&rest) {
+        let v = bits(c).fold(0, |acc, j| acc ^ images[j]);
+        let coef = lp.src.project(v)?;
+        if coef == 0 || ep.off[lb as usize] == u32::MAX {
+            continue;
+        }
+        ind.insert(determined(drp, lb, coef)?, 0);
+    }
+    Some(ind)
+}
+
+/// For a secondary product `y h_i = lambda L` and a class `y` surviving to E_r with `d_r y = z`,
+/// the lambda-Bockstein gives `h_i z = d_{r-1}(L)` in E_{r-1} at `(n + 2^i - 2, f + r + 1)`,
+/// modulo `h_i` times the image of d_{r-1} from `(n, f + 1)` (the choice of lift of `y`). With
+/// d_{r-1} known on page `ep`, these are affine equations on the d_r unknowns of `e`. Only used
+/// where every page involved is exact and every d_{r-1} value is determined.
+fn coupling_equations(
+    ni: usize,
+    node: &Node,
+    e: &Pages,
+    ep: &Pages,
+    drp: &FxHashMap<u32, Vec<Val>>,
+    sec: &[Secondary],
+    one: u32,
+) -> Vec<(Vec<u32>, Origin)> {
+    let Alg::Ring(ext, p) = node.alg else {
+        return vec![];
+    };
+    let r = e.r;
+    let mut out = vec![];
+    let mut used = 0;
+    for s in sec {
+        let Some(b) = node.get(s.n, s.f) else {
+            continue;
+        };
+        if e.off[b as usize] == u32::MAX {
+            continue;
+        }
+        let Some(coef) = e.page[b as usize]
+            .as_ref()
+            .and_then(|pg| pg.src.project(s.y))
+        else {
+            continue;
+        };
+        if coef == 0 {
+            continue;
+        }
+        let Some(Some(zb)) = target(node, e, b) else {
+            continue;
+        };
+        if !e.pg(zb).exact || ep.page[zb as usize].is_none() {
+            continue;
+        }
+        let Some(hb) = h_bidegree(node, s.i) else {
+            continue;
+        };
+        let hn = (1 << s.i) - 1;
+        let Some(Some(tb)) = known(node, ep, s.n + hn - 1, s.f + r + 1) else {
+            continue;
+        };
+        let tp = ep.pg(tb);
+        if !tp.exact {
+            continue;
+        }
+        // d_{r-1}(L), in page r - 1 target coordinates at tb
+        let l = true_l(node, s);
+        let rhs = if l == 0 {
+            0
+        } else {
+            let Some(lb) = node.get(s.n + hn, s.f + 2) else {
+                continue;
+            };
+            let Some(cl) = ep.page[lb as usize]
+                .as_ref()
+                .and_then(|pg| pg.src.project(l))
+            else {
+                continue;
+            };
+            if ep.off[lb as usize] == u32::MAX {
+                0
+            } else {
+                let Some(v) = determined(drp, lb, cl) else {
+                    continue;
+                };
+                v
+            }
+        };
+        let Some(ind) = lift_ambiguity(node, ep, drp, s, hb) else {
+            continue;
+        };
+        // h_i times each target coordinate of d_r
+        let lhs: Option<Vec<V>> = e
+            .pg(zb)
+            .treps
+            .iter()
+            .map(|&z| tp.tgt.project(mul_vec(ext, p, hb, 1, zb, z)))
+            .map(|c| c.map(|c| ind.reduce(c).0))
+            .collect();
+        let Some(lhs) = lhs else { continue };
+        let rhs = ind.reduce(rhs).0;
+        used += 1;
+        for c in 0..tp.treps.len() {
+            let mut eq: Vec<u32> = vec![];
+            for k in bits(coef) {
+                for (l, &h) in lhs.iter().enumerate() {
+                    if h >> c & 1 == 1 {
+                        eq.push(e.var(b, k, l));
+                    }
+                }
+            }
+            if rhs >> c & 1 == 1 {
+                eq.push(one);
+            }
+            let eq = reduce_eq(eq);
+            if !eq.is_empty() {
+                let (node, i, row) = (ni as u16, s.i as u8, c as u8);
+                out.push((
+                    eq,
+                    Origin::Coupling {
+                        node,
+                        n: s.n,
+                        f: s.f,
+                        i,
+                        row,
+                    },
+                ));
+            }
+        }
+    }
+    eprintln!(
+        "{}: d{r} secondary coupling with d{}: {used} products used, {} equations",
+        node.name,
+        r - 1,
+        out.len()
+    );
+    out
+}
+
+/// The backward half of [`coupling_equations`]: a forced `d_r y = z` gives `d_{r-1}(L) = h_i z`
+/// on page r - 1, as a fact `(stem, filtration, L, h_i z)`. Only where nothing on page r - 1
+/// leaves `(n, f + 1)` (no ambiguity from the lift of `y`).
+fn coupling_facts(
+    node: &Node,
+    e: &Pages,
+    ep: &Pages,
+    drp: &FxHashMap<u32, Vec<Val>>,
+    dr: &FxHashMap<u32, Vec<Val>>,
+    sec: &[Secondary],
+) -> Vec<(i32, i32, V, V)> {
+    let Alg::Ring(ext, p) = node.alg else {
+        return vec![];
+    };
+    let mut out = vec![];
+    for s in sec {
+        let l = true_l(node, s);
+        if l == 0 {
+            continue;
+        }
+        let Some(b) = node.get(s.n, s.f) else {
+            continue;
+        };
+        if e.off[b as usize] == u32::MAX {
+            continue;
+        }
+        let Some(coef) = e.page[b as usize]
+            .as_ref()
+            .and_then(|pg| pg.src.project(s.y))
+        else {
+            continue;
+        };
+        if coef == 0 {
+            continue;
+        }
+        let Some(Some(zb)) = target(node, e, b) else {
+            continue;
+        };
+        if !e.pg(zb).exact {
+            continue;
+        }
+        let Some(hb) = h_bidegree(node, s.i) else {
+            continue;
+        };
+        match lift_ambiguity(node, ep, drp, s, hb) {
+            Some(ind) if ind.rows.is_empty() => {}
+            _ => continue,
+        }
+        let vs = dr.get(&b).map_or(&[][..], |v| &v[..]);
+        let Some(z) = bits(coef).try_fold(0, |acc, k| {
+            let v = vs.get(k)?;
+            v.dirs.is_empty().then_some(acc ^ v.part)
+        }) else {
+            continue;
+        };
+        let ze = bits(z).fold(0, |acc, l| acc ^ e.pg(zb).treps[l]);
+        let tgt = mul_vec(ext, p, hb, 1, zb, ze);
+        let hn = (1 << s.i) - 1;
+        out.push((s.n + hn, s.f + 2, l, tgt));
+    }
+    out
+}
+
 /// A statement read from a file: E2 vectors of a source and its d_r target.
 struct Statement {
     n: i32,
@@ -1317,6 +1639,10 @@ impl Labels<'_, '_> {
                 ["seed", "backward", "d2 file"][kind as usize],
                 self.nodes[node as usize].name
             ),
+            Origin::Coupling { node, n, f, i, row } => format!(
+                "secondary {}: h{i} * x_({n},{f},0)[{row}]",
+                self.nodes[node as usize].name
+            ),
         }
     }
 }
@@ -1360,6 +1686,7 @@ fn certify(
             labels.nodes[e.from].deg(c).0
         }
         Origin::Fact { n, .. } => n,
+        Origin::Coupling { n, .. } => n,
     };
     set.sort_by_key(|&i| stem(i));
     println!("certificate: {} equations", set.len());
@@ -1474,6 +1801,8 @@ pub(crate) fn run(ext: &Ext, p: &Products, args: &[String]) {
     // open d2 classes get exact dependence vectors (otherwise every coordinate of an open class
     // is a fresh unknown on E3, as for d2 files with open classes)
     let exact_e2 = args.iter().any(|a| a == "--e2-exact-deps");
+    // --secondary <file>: secondary products of the first node (`secondary_product_easy`)
+    let secondary = arg("--secondary").map(|p| read_secondary(p));
     let spec = read_spec(args);
     assert_eq!(spec.rings[0].1, "-", "the main ring must be the first node");
 
@@ -1636,7 +1965,7 @@ pub(crate) fn run(ext: &Ext, p: &Products, args: &[String]) {
     // Facts d_r(y) = 0 learned from page r + 1, per node (page -> (stem, filtration, E2 vector
     // of y)). They are kept as E2 vectors because the page bases change from one pass to the
     // next.
-    let mut back: Vec<FxHashMap<i32, BTreeSet<(i32, i32, V)>>> =
+    let mut back: Vec<FxHashMap<i32, BTreeSet<(i32, i32, V, V)>>> =
         vec![FxHashMap::default(); nodes.len()];
     // d2 is solved again only when page 2 has new backward facts: (their number, d2 per node)
     let mut cache2: Option<(usize, Vec<FxHashMap<u32, Vec<Val>>>)> = None;
@@ -1657,6 +1986,8 @@ pub(crate) fn run(ext: &Ext, p: &Products, args: &[String]) {
                 }
             })
             .collect();
+        // the previous page and its d_r, for the secondary coupling
+        let mut prev: Option<(Vec<Pages>, Vec<FxHashMap<u32, Vec<Val>>>)> = None;
         loop {
             let r = es[0].r;
             let facts2: usize = back.iter().filter_map(|b| b.get(&2)).map(|s| s.len()).sum();
@@ -1664,12 +1995,13 @@ pub(crate) fn run(ext: &Ext, p: &Products, args: &[String]) {
                 if let Some((n2, dr)) = &cache2 {
                     if *n2 == facts2 {
                         eprintln!("d2: no new page-2 facts, reusing the d2 solution");
-                        es = nodes
+                        let next = nodes
                             .iter()
                             .zip(&es)
                             .zip(dr)
                             .map(|((n, e), d)| next_page(n, e, d))
                             .collect();
+                        prev = Some((std::mem::replace(&mut es, next), dr.clone()));
                         continue;
                     }
                 }
@@ -1732,12 +2064,12 @@ pub(crate) fn run(ext: &Ext, p: &Products, args: &[String]) {
             };
             for (ni, (n, e)) in nodes.iter().zip(&es).enumerate() {
                 let mut n_back = 0;
-                for &(sn, sf, src) in back[ni].get(&r).into_iter().flatten() {
+                for &(sn, sf, src, tgt) in back[ni].get(&r).into_iter().flatten() {
                     let st = Statement {
                         n: sn,
                         f: sf,
                         src,
-                        tgt: 0,
+                        tgt,
                         label: String::new(),
                     };
                     if let Ok(se) = statement_equations(n, e, &st, total) {
@@ -1755,9 +2087,9 @@ pub(crate) fn run(ext: &Ext, p: &Products, args: &[String]) {
                     // a seed d_r(src) = tgt also says that src and tgt survive to E_r
                     if r > first {
                         let set = back[*ni].entry(r - 1).or_default();
-                        set.insert((st.n, st.f, st.src));
+                        set.insert((st.n, st.f, st.src, 0));
                         if st.tgt != 0 {
-                            set.insert((st.n - 1, st.f + r, st.tgt));
+                            set.insert((st.n - 1, st.f + r, st.tgt, 0));
                         }
                     }
                     match statement_equations(n, e, &st, total) {
@@ -1780,6 +2112,11 @@ pub(crate) fn run(ext: &Ext, p: &Products, args: &[String]) {
                         }
                     }
                 }
+            }
+            if let (Some(sec), Some((ep, drp))) = (&secondary, &prev) {
+                sink.add(coupling_equations(
+                    0, &nodes[0], &es[0], &ep[0], &drp[0], sec, total,
+                ));
             }
             let (pivot, rows, n_contradictions) = match sink {
                 Sink::Prop(prop) => {
@@ -1954,7 +2291,7 @@ pub(crate) fn run(ext: &Ext, p: &Products, args: &[String]) {
                         let (tn, tf) = n.deg(t);
                         for v in vs.iter().filter(|v| v.dirs.is_empty() && v.part != 0) {
                             let y = bits(v.part).fold(0, |acc, l| acc ^ tp.treps[l]);
-                            back[ni].entry(r - 1).or_default().insert((tn, tf, y));
+                            back[ni].entry(r - 1).or_default().insert((tn, tf, y, 0));
                         }
                     }
                 }
@@ -2049,15 +2386,23 @@ pub(crate) fn run(ext: &Ext, p: &Products, args: &[String]) {
                      {open} open, {skipped} skipped"
                 );
             }
+            if let (Some(sec), Some((ep, drp))) = (&secondary, &prev) {
+                let facts = coupling_facts(&nodes[0], &es[0], &ep[0], &drp[0], &dr[0], sec);
+                if !facts.is_empty() {
+                    eprintln!("S: d{r}: {} secondary facts for d{}", facts.len(), r - 1);
+                }
+                back[0].entry(r - 1).or_default().extend(facts);
+            }
             if r >= last {
                 break;
             }
-            es = nodes
+            let next = nodes
                 .iter()
                 .zip(&es)
                 .zip(&dr)
                 .map(|((n, e), d)| next_page(n, e, d))
                 .collect();
+            prev = Some((std::mem::replace(&mut es, next), dr));
         }
         let facts: usize = back.iter().flat_map(|b| b.values()).map(|s| s.len()).sum();
         eprintln!(
