@@ -210,6 +210,7 @@ fn complex(name: &str) -> anyhow::Result<Complex> {
 
 /// The export in bounded memory: see [`ext::ctau_lazy::export`]. Tower ids are
 /// `filtration_weight_index` here, since nothing counts the towers ahead.
+#[allow(clippy::too_many_arguments)]
 fn lazy(
     dir: &std::path::Path,
     store: &ext::save::ZarrSaveStore,

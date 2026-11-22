@@ -556,8 +556,8 @@ pub fn export(
         slices.retain(|&f, _| f >= lowest);
         for &da in &shifts {
             for f in lowest + da..=a + da + 1 {
-                if !slices.contains_key(&f) {
-                    slices.insert(f, Arc::new(timed(Phase::Slices, || source.slice(f, keep))?));
+                if let std::collections::hash_map::Entry::Vacant(slot) = slices.entry(f) {
+                    slot.insert(Arc::new(timed(Phase::Slices, || source.slice(f, keep))?));
                 }
             }
         }
