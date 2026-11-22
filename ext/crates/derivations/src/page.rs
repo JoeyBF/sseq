@@ -623,6 +623,99 @@ fn d2_fact_equations(
     out
 }
 
+/// d2 of single module classes known modulo `i_*` of the sphere's d2 image out of their bidegree:
+/// rows `stem,Adams_filtration,index,target` of `path` (target over the module basis at
+/// `(stem - 1, filtration + 2)`). These are values that pin the cofiber's pages without being
+/// exact on cochains (the cofiber d2 on lifts of non-d2-cycles, from `h_j`'s side).
+fn modb_equations(
+    ni: usize,
+    mn: &Node,
+    e: &Pages,
+    rn: &Node,
+    d2: &FxHashMap<u32, V>,
+    path: &str,
+    one: u32,
+) -> Vec<(Vec<u32>, Origin)> {
+    let Alg::Module(m, _) = mn.alg else {
+        return vec![];
+    };
+    let istar = |n: i32, f: i32, v: V| -> V {
+        let Some(sb) = rn.get(n, f) else {
+            return 0;
+        };
+        bits(v).fold(0, |acc, l| {
+            acc ^ m.istar.get(&rn.gid(sb, l)).copied().unwrap_or(0) as V
+        })
+    };
+    let mut out = vec![];
+    let (mut used, mut skipped) = (0, 0);
+    for st in read_statements(path) {
+        let (n, f) = (st.n, st.f);
+        let Some(b) = mn.get(n, f) else {
+            continue;
+        };
+        if e.off[b as usize] == u32::MAX || mn.get(n - 1, f + 2).is_none() {
+            continue;
+        }
+        let mut ind = Ech::default();
+        let mut known = true;
+        // a d2 file has no rows where the sphere's d2 target is empty
+        if let (Some(ab), Some(_)) = (rn.get(n, f), rn.get(n - 1, f + 2)) {
+            for k in 0..rn.dim(ab) {
+                match d2.get(&rn.gid(ab, k)) {
+                    Some(&w) => {
+                        ind.insert(istar(n - 1, f + 2, w), 0);
+                    }
+                    None => known = false,
+                }
+            }
+        }
+        if !known {
+            skipped += 1;
+            continue;
+        }
+        let rhs = ind.reduce(st.tgt).0;
+        let cols: Vec<V> = (0..e.stride[b as usize] as usize)
+            .map(|l| ind.reduce(1 << l).0)
+            .collect();
+        used += 1;
+        for cc in 0..cols.len() {
+            let mut eq = vec![];
+            for k in bits(st.src) {
+                for (l, &col) in cols.iter().enumerate() {
+                    if col >> cc & 1 == 1 {
+                        eq.push(e.var(b, k, l));
+                    }
+                }
+            }
+            if rhs >> cc & 1 == 1 {
+                eq.push(one);
+            }
+            let eq = reduce_eq(eq);
+            if !eq.is_empty() {
+                let (node, k, row) = (ni as u16, st.src.trailing_zeros() as u8, cc as u8);
+                out.push((
+                    eq,
+                    Origin::Fact {
+                        kind: 3,
+                        node,
+                        n,
+                        f,
+                        k,
+                        row,
+                    },
+                ));
+            }
+        }
+    }
+    eprintln!(
+        "{}: {used} d2 values mod i_*(B2) from {path} ({skipped} skipped), {} equations",
+        mn.name,
+        out.len()
+    );
+    out
+}
+
 /// The d2 of a cofiber `C(h_i)` (a module over the first node with `shift = 2^i`) on lifts of
 /// its top cell, from the sphere alone: for `y` a d2-cycle with `y h_i = lambda L` in Cλ²
 /// (vanishing E2 product), every module class `ȳ` with `p_* ȳ = y` has `d2(ȳ) = i_*(L)` modulo
@@ -2313,6 +2406,20 @@ pub(crate) fn run(ext: &Ext, p: &Products, args: &[String]) {
             if r == 2 {
                 for (ni, ((n, e), d2)) in nodes.iter().zip(&es).zip(&d2s).enumerate() {
                     sink.add(d2_fact_equations(ni, n, e, d2, total));
+                }
+                // COF_D2_MODB=name:path,...: module d2 values known mod i_*(B2)
+                if let Ok(spec) = std::env::var("COF_D2_MODB") {
+                    for item in spec.split(',') {
+                        let (name, path) = item.split_once(':').expect("COF_D2_MODB=name:path");
+                        let Some(ni) = nodes.iter().position(|x| x.name == name) else {
+                            continue;
+                        };
+                        if let Alg::Module(_, 0) = nodes[ni].alg {
+                            sink.add(modb_equations(
+                                ni, &nodes[ni], &es[ni], &nodes[0], &d2s[0], path, total,
+                            ));
+                        }
+                    }
                 }
                 // COF_D2=0 switches off the cofiber d2 from secondary products
                 let cof = std::env::var("COF_D2").map_or(true, |v| v != "0");
