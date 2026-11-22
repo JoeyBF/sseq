@@ -540,6 +540,11 @@ pub trait SecondaryLift: Sync + Sized {
     fn try_compute_homotopy_step(&self, b: Bidegree) -> anyhow::Result<std::ops::Range<i32>> {
         match self.prepare_homotopy_step(b) {
             SecondaryHomotopyPrep::Done(range) => Ok(range),
+            // No generators: nothing to lift, so skip the quasi-inverse, which a Nassau
+            // resolution without saved quasi-inverses would otherwise recompute in full.
+            SecondaryHomotopyPrep::NeedsLift(pending) if pending.num_gens == 0 => {
+                self.finish_homotopy_step(pending, &[])
+            }
             SecondaryHomotopyPrep::NeedsLift(pending) => {
                 let p = self.prime();
                 let mut results = vec![FpVector::new(p, pending.target_dim); pending.num_gens];
