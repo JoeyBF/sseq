@@ -1,0 +1,123 @@
+//! The cochain-level secondary products with $h_j$ that determine the $d_2$ of every two-cell
+//! cofiber $C(h_j)$.
+//!
+//! For each $j \leq$ `CONE_MAX_J` (default 3), the chain map of $h_j$ is lifted through the
+//! resolution and then to the secondary level, and every basis vector $e$ of every bidegree is
+//! multiplied by it: $e \cdot h_j = E + \lambda L$, with $L$ exact on cochains (not reduced by the
+//! image of $d_2$), for every $e$ whether or not it is a $d_2$-cycle. On the cochains
+//! $\mathrm{Hom}(P)\cdot\mathrm{bottom} \oplus \mathrm{Hom}(P)\cdot\mathrm{top}$ of $C(h_j)$, the
+//! $d_2$ is then $d_2(v\cdot\mathrm{bottom}) = d_2(v)\cdot\mathrm{bottom}$ and
+//! $d_2(z\cdot\mathrm{top}) = d_2(z)\cdot\mathrm{top} + L(z)\cdot\mathrm{bottom}$.
+//!
+//! # Usage
+//! Same prompts as `secondary` for the sphere (S_2, save dir with the secondary resolution, max
+//! n, max s). Env `CONE_MAX_J` caps $j$, `CONE_MAX_N` the stem of $e$.
+//!
+//! # Output (stdout)
+//! `j,stem,Adams_filtration,index,E,L`: $E$ over the basis at $(n + 2^j - 1, s + 1)$, $L$ over
+//! the basis at $(n + 2^j - 1, s + 2)$.
+
+use std::{sync::Arc, time::Instant};
+
+use ext::{
+    chain_complex::{ChainComplex, FreeChainComplex},
+    ext_algebra::{ExtModule, SecondaryExtAlgebra},
+    resolution_homomorphism::ResolutionHomomorphism,
+    secondary::{LAMBDA_BIDEGREE, SecondaryLift, SecondaryResolutionHomomorphism},
+    utils::query_module,
+};
+use fp::vector::FpVector;
+use sseq::coordinates::Bidegree;
+
+fn env_i32(name: &str, default: i32) -> i32 {
+    std::env::var(name)
+        .ok()
+        .map_or(default, |v| v.parse().expect("bad integer env"))
+}
+
+fn main() -> anyhow::Result<()> {
+    ext::utils::init_logging()?;
+    let t0 = Instant::now();
+    let phase = |name: &str| eprintln!("PHASE {name} at {:.1}s", t0.elapsed().as_secs_f64());
+
+    let resolution = Arc::new(query_module(Some(algebra::AlgebraType::Milnor), true)?);
+    let e2 = Arc::new(ExtModule::from_resolution(Arc::clone(&resolution))?);
+    assert!(e2.is_unit(), "this driver is for the sphere");
+    let p = resolution.prime();
+    let sec_e2 = Arc::new(SecondaryExtAlgebra::new(Arc::clone(&e2)));
+    sec_e2.extend_all();
+    let res_lift = Arc::clone(sec_e2.res_lift());
+    phase("sphere secondary resolution extended");
+
+    let max_j = env_i32("CONE_MAX_J", 3);
+    let max_n = env_i32("CONE_MAX_N", i32::MAX);
+    let res = &resolution;
+    println!("j,stem,Adams_filtration,index,E,L");
+    for j in 0..=max_j {
+        let hb = Bidegree::n_s((1 << j) - 1, 1);
+        let underlying = Arc::new(ResolutionHomomorphism::from_class(
+            String::new(),
+            Arc::clone(res),
+            Arc::clone(res),
+            hb,
+            &[1],
+        ));
+        underlying.extend_all();
+        phase(&format!("h{j}: chain map lifted"));
+        let lift = SecondaryResolutionHomomorphism::new(
+            Arc::clone(&res_lift),
+            Arc::clone(&res_lift),
+            Arc::clone(&underlying),
+        );
+        lift.extend_all();
+        phase(&format!("h{j}: secondary lift extended"));
+
+        let mut count = 0;
+        for b in res.iter_nonzero_stem() {
+            if b.n() > max_n {
+                continue;
+            }
+            let target = b + hb;
+            let lambda_target = target + LAMBDA_BIDEGREE;
+            if !res.has_computed_bidegree(lambda_target)
+                || underlying.get_map(target.s()).next_degree() <= target.t()
+                || lift.homotopy(lambda_target.s()).homotopies.next_degree() <= lambda_target.t()
+            {
+                continue;
+            }
+            let dim = res.number_of_gens_in_bidegree(b);
+            let ext_dim = res.number_of_gens_in_bidegree(target);
+            let lambda_dim = res.number_of_gens_in_bidegree(lambda_target);
+            if dim == 0 {
+                continue;
+            }
+            let inputs: Vec<FpVector> = (0..dim)
+                .map(|k| {
+                    let mut v = FpVector::new(p, dim);
+                    v.set_entry(k, 1);
+                    v
+                })
+                .collect();
+            let mut outputs: Vec<FpVector> =
+                (0..dim).map(|_| FpVector::new(p, ext_dim + lambda_dim)).collect();
+            lift.hom_k(
+                None,
+                b,
+                inputs.iter().map(|v| v.as_slice()),
+                outputs.iter_mut().map(|v| v.as_slice_mut()),
+            );
+            for (k, out) in outputs.iter().enumerate() {
+                let e: Vec<u32> = out.slice(0, ext_dim).iter().collect();
+                let l: Vec<u32> = out.slice(ext_dim, ext_dim + lambda_dim).iter().collect();
+                println!(
+                    "{j},{},{},{k},\"{e:?}\",\"{l:?}\"",
+                    b.n(),
+                    b.s()
+                );
+                count += 1;
+            }
+        }
+        phase(&format!("h{j}: {count} products written"));
+    }
+    Ok(())
+}

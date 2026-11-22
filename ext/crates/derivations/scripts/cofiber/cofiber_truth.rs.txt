@@ -1,0 +1,113 @@
+//! Ground truth for the $d_2$ of the two-cell cofibers $C(h_j)$ on the cochains
+//! $\mathrm{Hom}(P)\cdot\mathrm{bottom} \oplus \mathrm{Hom}(P)\cdot\mathrm{top}$ of the untwisted
+//! tensor resolution $Q = P \otimes M$, from a full secondary resolution of $Q$.
+//!
+//! For every sphere basis cochain $e$ at $(n, s)$, applies $Q$'s secondary homotopy to the cochain
+//! $e\cdot\mathrm{top}$ (in the cofiber's bidegree $(n + 2^j, s)$) and splits the result:
+//! `top` over the sphere basis at $(n - 1, s + 2)$ (it should be $d_2(e)$) and `bottom` over the
+//! sphere basis at $(n + 2^j - 1, s + 2)$ (the true $K(e)$).
+//!
+//! # Usage
+//! Prompts as `secondary` for the sphere (S_2, save dir, max n, max s); env `TRUTH_MODULES`
+//! (default `C2:0,Ceta:1,Cnu:2,Csigma:3`), `TRUTH_MAX_N`, `TRUTH_MAX_S`.
+//!
+//! # Output (stdout)
+//! `j,stem,Adams_filtration,index,top,bottom`.
+
+use std::sync::Arc;
+
+use algebra::{
+    Algebra,
+    module::{FDModule, Module},
+};
+use ext::{
+    chain_complex::{ChainComplex, FreeChainComplex},
+    ext_algebra::tensor_resolution::TensorResolutionSecondary,
+    utils::{load_module_json, query_module},
+};
+use sseq::coordinates::Bidegree;
+
+fn main() -> anyhow::Result<()> {
+    ext::utils::init_logging()?;
+    let res = Arc::new(query_module(Some(algebra::AlgebraType::Milnor), false)?);
+    let max_n: i32 = std::env::var("TRUTH_MAX_N").map_or(60, |v| v.parse().unwrap());
+    let max_s: i32 = std::env::var("TRUTH_MAX_S").map_or(30, |v| v.parse().unwrap());
+    let specs = std::env::var("TRUTH_MODULES")
+        .unwrap_or_else(|_| "C2:0,Ceta:1,Cnu:2,Csigma:3".to_string());
+    let algebra = res.algebra();
+    let t_max = max_n + max_s + 12;
+    algebra.compute_basis(t_max + 1);
+    println!("j,stem,Adams_filtration,index,top,bottom");
+    for spec in specs.split(',') {
+        let (name, j) = spec.split_once(':').unwrap();
+        let j: i32 = j.parse()?;
+        let top_deg = 1 << j;
+        let json = load_module_json(name)?;
+        let m = FDModule::from_json(Arc::clone(&algebra), &json)?;
+        m.compute_basis(t_max);
+        let module = Arc::new(m);
+        let trs = TensorResolutionSecondary::new(Arc::clone(&res), Arc::clone(&module));
+        trs.compute_through_stem(Bidegree::n_s(max_n + top_deg, max_s));
+        eprintln!("{name}: secondary resolution of P (x) M computed");
+        let q = trs.resolution();
+        let sec = trs.secondary();
+        // position of (generator g of P_s, M-basis element alpha) among Q_s's generators at t
+        let index = |s: i32, t: i32, g: (i32, usize), alpha: usize| -> Option<usize> {
+            let mut idx = 0;
+            for (d, i) in res.module(s).iter_gens(t) {
+                let dm = module.dimension(t - d);
+                if (d, i) == g {
+                    return (alpha < dm).then_some(idx + alpha);
+                }
+                idx += dm;
+            }
+            None
+        };
+        for s in 0..=max_s {
+            for n in 0..=max_n {
+                let b0 = Bidegree::n_s(n, s);
+                if !res.has_computed_bidegree(b0) {
+                    continue;
+                }
+                let dim = res.number_of_gens_in_bidegree(b0);
+                let b = b0 + Bidegree::n_s(top_deg, 0); // the cofiber bidegree of e . top
+                let tgt = b + Bidegree::n_s(-1, 2);
+                if dim == 0 || !q.has_computed_bidegree(tgt) {
+                    continue;
+                }
+                let hom = sec.homotopy(s + 2);
+                if hom.homotopies.next_degree() <= b.t() {
+                    continue;
+                }
+                let mat = hom.homotopies.hom_k(b.t());
+                // the target's generators split into top (P gen degree t' - 2^j) and bottom (t')
+                let tops: Vec<(i32, usize)> = res
+                    .module(s + 2)
+                    .iter_gens(tgt.t() - top_deg)
+                    .filter(|&(d, _)| d == tgt.t() - top_deg)
+                    .collect();
+                let bottoms: Vec<(i32, usize)> = res
+                    .module(s + 2)
+                    .iter_gens(tgt.t())
+                    .filter(|&(d, _)| d == tgt.t())
+                    .collect();
+                for l in 0..dim {
+                    let Some(ci) = index(s, b.t(), (b0.t(), l), 0) else {
+                        continue;
+                    };
+                    let row = &mat[ci];
+                    let top: Vec<u32> = tops
+                        .iter()
+                        .map(|&g| index(s + 2, tgt.t(), g, 0).map_or(0, |k| row[k]))
+                        .collect();
+                    let bottom: Vec<u32> = bottoms
+                        .iter()
+                        .map(|&g| index(s + 2, tgt.t(), g, 0).map_or(0, |k| row[k]))
+                        .collect();
+                    println!("{j},{n},{s},{l},\"{top:?}\",\"{bottom:?}\"");
+                }
+            }
+        }
+    }
+    Ok(())
+}
