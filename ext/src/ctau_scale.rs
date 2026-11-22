@@ -271,12 +271,12 @@ impl<'a> BackboneSource<'a> {
         let mut out = Forward::default();
         for (t, terms) in self.terms(a, keep)? {
             for run in terms.chunk_by(|x, y| x.0 == y.0) {
-                out.insert(
-                    (t, run[0].0),
-                    run.iter()
-                        .map(|&(_, op, tx, i)| (op, t - tx, tx, i))
-                        .collect(),
-                );
+                let mut terms: Vec<(PackedXi, u16, u16, u32)> = run
+                    .iter()
+                    .map(|&(_, op, tx, i)| (op, t - tx, tx, i))
+                    .collect();
+                terms.sort_unstable();
+                out.insert((t, run[0].0), terms);
             }
         }
         Ok(out)
@@ -365,8 +365,43 @@ fn vanishes(a: i32, t: i32) -> bool {
 }
 
 /// The terms of the differentials of one $P_a$ filed under its own generators `(t, l)`: each
-/// term $P(R) x$ of $d z_l$ as the operation, its degree, and the generator `(t, i)` of $x$.
+/// term $P(R) x$ of $d z_l$ as the operation, its degree, and the generator `(t, i)` of $x$,
+/// sorted by operation.
 pub type Forward = FxHashMap<(u16, u32), Vec<(PackedXi, u16, u16, u32)>>;
+
+/// The terms of a [`Forward`] whose operation, with a shift taken off, acts on some monomial:
+/// each as the number of that operation in the tables, its degree, and the generator of $x$.
+pub type Resolved = FxHashMap<(u16, u32), Vec<(u32, u16, u16, u32)>>;
+
+/// The terms $P(R) x$ of `differentials` with $R \geq S$ for the exponents `shift` of $S$ and
+/// $P(R - S)$ acting on some monomial of `tables`.
+///
+/// A differential is walked once for every weight its generator has cochains in, and most of
+/// its terms act in none of the degrees met there: looking each up by number, and not at all
+/// when it never acts, is what makes the walk cheap.
+pub fn resolve(differentials: &Forward, tables: &OpTables, shift: PackedXi) -> Resolved {
+    use maybe_rayon::prelude::*;
+    let shift_degree = xi_degree(shift) as u16;
+    let generators: Vec<(&(u16, u32), &Vec<(PackedXi, u16, u16, u32)>)> =
+        differentials.iter().collect();
+    let resolved: Vec<((u16, u32), Vec<(u32, u16, u16, u32)>)> = generators
+        .into_maybe_par_iter()
+        .map(|(&z, terms)| {
+            let acting = terms
+                .iter()
+                .filter(|x| fits(shift, x.0))
+                .filter_map(|&(op, degree, t, i)| {
+                    Some((tables.id(op - shift)?, degree - shift_degree, t, i))
+                })
+                .collect();
+            (z, acting)
+        })
+        .collect();
+    resolved
+        .into_iter()
+        .filter(|x: &(_, Vec<_>)| !x.1.is_empty())
+        .collect()
+}
 
 /// The saved differential of a bidegree, or an error rather than a resolution if it is missing.
 fn blob(store: &ZarrSaveStore, a: i32, t: i32) -> anyhow::Result<Vec<u8>> {
@@ -503,6 +538,11 @@ pub struct OpTables {
     pairs: Vec<Vec<[u16; 2]>>,
     /// The operations that act in some degree.
     acting: FxHashSet<PackedXi>,
+    /// The number of each operation that acts, in `ranges`.
+    ids: FxHashMap<PackedXi, u32>,
+    /// For each operation that acts, the first degree in which it does and its range of
+    /// `pairs` in each degree from there on.
+    ranges: Vec<(u16, Vec<(u32, u32)>)>,
     entries: usize,
 }
 
@@ -552,10 +592,25 @@ impl OpTables {
             pairs.push(all.into_iter().map(|x| [x.2, x.1]).collect());
         }
         let acting = index.iter().flat_map(|t| t.keys().copied()).collect();
+        let mut ids: FxHashMap<PackedXi, u32> = FxHashMap::default();
+        let mut ranges: Vec<(u16, Vec<(u32, u32)>)> = Vec::new();
+        for (e, table) in index.iter().enumerate() {
+            for (&op, &range) in table {
+                let id = *ids.entry(op).or_insert_with(|| {
+                    ranges.push((e as u16, Vec::new()));
+                    ranges.len() as u32 - 1
+                });
+                let (first, list) = &mut ranges[id as usize];
+                list.resize(e - *first as usize, (0, 0));
+                list.push(range);
+            }
+        }
         Self {
             index,
             pairs,
             acting,
+            ids,
+            ranges,
             entries,
         }
     }
@@ -566,6 +621,23 @@ impl OpTables {
         self.index[e as usize].get(&r).map_or(&[], |&(lo, hi)| {
             &self.pairs[e as usize][lo as usize..hi as usize]
         })
+    }
+
+    /// The number of an operation, for [`Self::at`], if it acts in some degree.
+    pub fn id(&self, r: PackedXi) -> Option<u32> {
+        self.ids.get(&r).copied()
+    }
+
+    /// [`Self::get`] for the operation numbered `id`: no search.
+    pub fn at(&self, e: i32, id: u32) -> &[[u16; 2]] {
+        let (first, list) = &self.ranges[id as usize];
+        match usize::try_from(e - *first as i32)
+            .ok()
+            .and_then(|i| list.get(i))
+        {
+            Some(&(lo, hi)) => &self.pairs[e as usize][lo as usize..hi as usize],
+            None => &[],
+        }
     }
 
     /// The number of entries over every degree and operation.
@@ -1014,9 +1086,10 @@ pub fn cancel_pairs(v: &mut Vec<u32>) {
 /// number of entries built, of which those that repeat cancel in pairs.
 ///
 /// A block of `tgt` at a time: the differential of its generator is walked once, and the
-/// action of each term on the monomials is read off `tables` as in [`pullback_columns`]. A
-/// list of the tables is sorted by row and then by the level of the source, so a row is read
-/// as far as its depth and no further. The distances from the end put the first position of
+/// action of each term on the monomials is read off `tables` as in [`pullback_columns`].
+/// `plans` holds the differentials resolved for `shift` and for its sum with each cell action
+/// of `cx` ([`resolve`]). A list of the tables is sorted by row and then by the level of the
+/// source, so a row is read as far as its depth and no further. The distances from the end put the first position of
 /// `src` last in its row, where [`SparseEchelon`] takes its pivot.
 ///
 /// # Panics
@@ -1025,7 +1098,7 @@ pub fn cancel_pairs(v: &mut Vec<u32>) {
 #[allow(clippy::too_many_arguments)]
 pub fn pullback_rows(
     q: &QAlgebra,
-    differentials: &Forward,
+    plans: &FxHashMap<PackedXi, Resolved>,
     tables: &OpTables,
     cx: &Complex,
     src: &Space,
@@ -1067,46 +1140,48 @@ pub fn pullback_rows(
                     moves.push((shift + r, shift_degree + xi_degree(r), c));
                 }
             }
-            for &(op, op_degree, t, i) in differentials
-                .get(&(block.t, block.i))
-                .map_or(&[][..], |v| &v[..])
-            {
-                for &(s, s_degree, cell) in &moves {
-                    let degree = op_degree as i32 - s_degree;
-                    if degree < 0 || !fits(s, op) {
+            // Reads the action of one operation, from the monomials of degree `e` on the
+            // block `sb` of `src`, into the rows built.
+            let mut emit = |e: i32, sb: usize, list: &[[u16; 2]]| {
+                debug_assert_eq!(src.blocks[sb].e as i32, e);
+                // Reads the run of `g` in `list` from `from`, as far as the depth of its row;
+                // the sources of a run are in order of level.
+                let mut read = |from: usize, g: u16| {
+                    let bound = rows[g as usize].1;
+                    for x in list[from..].iter().take_while(|x| x[1] == g) {
+                        let len = q.len_at(e, x[0] as u32);
+                        if len >= bound {
+                            break;
+                        }
+                        local[g as usize].push(last - 1 - src.pos_in(q, sb, x[0] as u32, len));
+                    }
+                };
+                if sought.len() * SEEK_RATIO < list.len() {
+                    // few rows are built: find each in the list
+                    for &g in &sought {
+                        read(list.partition_point(|x| x[1] < g), g);
+                    }
+                } else {
+                    let mut from = 0;
+                    while from < list.len() {
+                        let g = list[from][1];
+                        read(from, g);
+                        from += list[from..].partition_point(|x| x[1] <= g);
+                    }
+                }
+            };
+            for &(s, _, cell) in &moves {
+                let terms = plans[&s]
+                    .get(&(block.t, block.i))
+                    .map_or(&[][..], |v| &v[..]);
+                for &(id, degree, t, i) in terms {
+                    let e = e2 + degree as i32;
+                    let list = tables.at(e, id);
+                    if list.is_empty() {
                         continue;
                     }
-                    let Some(&sb) = src.block_id.get(&(cell as u8, t, i)) else {
-                        continue;
-                    };
-                    let e = e2 + degree;
-                    debug_assert_eq!(src.blocks[sb as usize].e as i32, e);
-                    let list = tables.get(e, op - s);
-                    // Reads the run of `g` in `list` from `from`, as far as the depth of its
-                    // row; the sources of a run are in order of level.
-                    let mut read = |from: usize, g: u16| {
-                        let bound = rows[g as usize].1;
-                        for x in list[from..].iter().take_while(|x| x[1] == g) {
-                            let len = q.len_at(e, x[0] as u32);
-                            if len >= bound {
-                                break;
-                            }
-                            local[g as usize]
-                                .push(last - 1 - src.pos_in(q, sb as usize, x[0] as u32, len));
-                        }
-                    };
-                    if sought.len() * SEEK_RATIO < list.len() {
-                        // few rows are built: find each in the list
-                        for &g in &sought {
-                            read(list.partition_point(|x| x[1] < g), g);
-                        }
-                    } else {
-                        let mut from = 0;
-                        while from < list.len() {
-                            let g = list[from][1];
-                            read(from, g);
-                            from += list[from..].partition_point(|x| x[1] <= g);
-                        }
+                    if let Some(&sb) = src.block_id.get(&(cell as u8, t, i)) {
+                        emit(e, sb as usize, list);
                     }
                 }
             }

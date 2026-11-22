@@ -14,7 +14,8 @@ use rustc_hash::FxHashMap;
 use crate::{
     ctau::{PackedXi, QAlgebra},
     ctau_scale::{
-        BackboneSource, Complex, Forward, NEVER, OpTables, Phase, Space, pullback_rows, timed,
+        BackboneSource, Complex, NEVER, OpTables, Phase, Resolved, Space, pullback_rows, resolve,
+        timed,
     },
 };
 
@@ -162,8 +163,9 @@ struct Step<'a> {
     maps: &'a Maps<'a>,
     /// The source filtration of the coboundary reduced.
     a: i32,
-    /// The differentials of the backbone out of filtration `a + 1`.
-    differentials: &'a Forward,
+    /// The differentials of the backbone out of filtration `a + 1`, resolved for the shift of
+    /// each map computed and its sums with the cell actions.
+    plans: &'a FxHashMap<PackedXi, Resolved>,
     bb: &'a dyn crate::ctau_scale::Backbone,
 }
 
@@ -207,7 +209,7 @@ impl Step<'_> {
         let (mut built, built_entries) = timed(Phase::Build, || {
             pullback_rows(
                 self.q,
-                self.differentials,
+                self.plans,
                 self.tables,
                 self.cx,
                 &src,
@@ -525,7 +527,7 @@ impl Step<'_> {
             let (rows, built_entries) = timed(Phase::MapBuild, || {
                 pullback_rows(
                     self.q,
-                    self.differentials,
+                    self.plans,
                     self.tables,
                     self.cx,
                     &src,
@@ -688,7 +690,24 @@ pub fn export(
         if weights.is_empty() {
             continue;
         }
-        let differentials = timed(Phase::Slices, || source.forward(a + 1, keep))?;
+        let plans = timed(Phase::Slices, || -> anyhow::Result<_> {
+            let differentials = source.forward(a + 1, keep)?;
+            // the coboundary, the products unless only a cell map is wanted, and each with
+            // the cell actions
+            let mut shifts: Vec<PackedXi> = vec![0];
+            if !matches!(maps, Maps::BottomCell(_)) {
+                shifts.extend((0..4).map(|j| 1 << j));
+            }
+            for s in shifts.clone() {
+                shifts.extend(cx.actions.iter().map(|x| s + x.0));
+            }
+            shifts.sort_unstable();
+            shifts.dedup();
+            Ok(shifts
+                .into_iter()
+                .map(|s| (s, resolve(&differentials, tables, s)))
+                .collect::<FxHashMap<PackedXi, Resolved>>())
+        })?;
         // the spaces read the generators of the backbone and nothing else of it
         let window = source.window(Vec::new());
         let step = Step {
@@ -698,7 +717,7 @@ pub fn export(
             max_n,
             maps,
             a,
-            differentials: &differentials,
+            plans: &plans,
             bb: &window,
         };
         // A product into weight u + 2^j is pulled back to weight u, so the higher weights go
