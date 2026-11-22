@@ -246,9 +246,54 @@ impl<'a> BackboneSource<'a> {
     /// `keep(R)`: a term whose operation acts by zero on everything it could meet need not be
     /// held, and at high stems most do.
     pub fn slice(&self, a: i32, keep: &(dyn Fn(PackedXi) -> bool + Sync)) -> anyhow::Result<Slice> {
+        let mut by_gen: FxHashMap<(u16, u32), Vec<InvTerm>> = FxHashMap::default();
+        for (t, terms) in self.terms(a, keep)? {
+            for (l, op, tx, i) in terms {
+                by_gen
+                    .entry((tx, i))
+                    .or_default()
+                    .push(InvTerm { op, t, l });
+            }
+        }
+        Ok(by_gen
+            .into_iter()
+            .map(|(key, terms)| (key, GenTerms::new(terms, key.0)))
+            .collect())
+    }
+
+    /// The differentials of [`Self::slice`], filed under the generators they are the
+    /// differentials of, which is how the save holds them: nothing is filed twice.
+    pub fn forward(
+        &self,
+        a: i32,
+        keep: &(dyn Fn(PackedXi) -> bool + Sync),
+    ) -> anyhow::Result<Forward> {
+        let mut out = Forward::default();
+        for (t, terms) in self.terms(a, keep)? {
+            for run in terms.chunk_by(|x, y| x.0 == y.0) {
+                out.insert(
+                    (t, run[0].0),
+                    run.iter()
+                        .map(|&(_, op, tx, i)| (op, t - tx, tx, i))
+                        .collect(),
+                );
+            }
+        }
+        Ok(out)
+    }
+
+    /// The terms $P(R) x$ with `keep(R)` of the differentials of $P_a$, by the degree `t` of
+    /// the generator: each as the index of the generator, $R$, and the degree and index of $x$,
+    /// in the order of the generators.
+    #[allow(clippy::type_complexity)]
+    fn terms(
+        &self,
+        a: i32,
+        keep: &(dyn Fn(PackedXi) -> bool + Sync),
+    ) -> anyhow::Result<Vec<(u16, Vec<(u32, PackedXi, u16, u32)>)>> {
         use maybe_rayon::prelude::*;
         if a <= 0 || a > self.max_a() {
-            return Ok(Slice::default());
+            return Ok(Vec::new());
         }
         let max_t = (self.max_t)(a);
         let target = FreeModule::new(Arc::clone(&self.algebra), format!("P{}", a - 1), 0);
@@ -256,26 +301,18 @@ impl<'a> BackboneSource<'a> {
             target.add_generators(t as i32, n as usize, None);
         }
         target.compute_basis(max_t);
-        // each degree as (generator landed on, term), read in parallel
-        let read: Vec<anyhow::Result<Vec<((u16, u32), InvTerm)>>> = (a..=max_t)
+        let read: Vec<anyhow::Result<(u16, Vec<(u32, PackedXi, u16, u32)>)>> = (a..=max_t)
             .into_maybe_par_iter()
             .map(|t| {
                 let mut out = Vec::new();
                 if self.gens[a as usize][t as usize] == 0 {
-                    return Ok(out);
+                    return Ok((t as u16, out));
                 }
                 if t == a {
                     if keep(1) {
-                        out.push((
-                            (a as u16 - 1, 0),
-                            InvTerm {
-                                op: 1,
-                                t: t as u16,
-                                l: 0,
-                            },
-                        ));
+                        out.push((0, 1, a as u16 - 1, 0));
                     }
-                    return Ok(out);
+                    return Ok((t as u16, out));
                 }
                 let data = blob(self.store, a, t)?;
                 let mut cursor = &data[..];
@@ -298,29 +335,19 @@ impl<'a> BackboneSource<'a> {
                         let op = self.ops.pack(og.operation_degree, og.operation_index);
                         if keep(op) {
                             out.push((
-                                (og.generator_degree as u16, og.generator_index as u32),
-                                InvTerm {
-                                    op,
-                                    t: t as u16,
-                                    l: l as u32,
-                                },
+                                l as u32,
+                                op,
+                                og.generator_degree as u16,
+                                og.generator_index as u32,
                             ));
                         }
                     }
                 }
-                Ok(out)
+                out.shrink_to_fit();
+                Ok((t as u16, out))
             })
             .collect();
-        let mut by_gen: FxHashMap<(u16, u32), Vec<InvTerm>> = FxHashMap::default();
-        for terms in read {
-            for (key, term) in terms? {
-                by_gen.entry(key).or_default().push(term);
-            }
-        }
-        Ok(by_gen
-            .into_iter()
-            .map(|(key, terms)| (key, GenTerms::new(terms, key.0)))
-            .collect())
+        read.into_iter().collect()
     }
 
     /// The backbone with the differentials of the given filtrations.
@@ -340,19 +367,6 @@ fn vanishes(a: i32, t: i32) -> bool {
 /// The terms of the differentials of one $P_a$ filed under its own generators `(t, l)`: each
 /// term $P(R) x$ of $d z_l$ as the operation, its degree, and the generator `(t, i)` of $x$.
 pub type Forward = FxHashMap<(u16, u32), Vec<(PackedXi, u16, u16, u32)>>;
-
-/// The terms of `slice`, filed under the generators whose differentials they belong to.
-pub fn forward(slice: &Slice) -> Forward {
-    let mut out = Forward::default();
-    for (&(t, i), terms) in slice {
-        for &(op, degree, lo, hi) in &terms.ops {
-            for &z in &terms.targets[lo as usize..hi as usize] {
-                out.entry(z).or_default().push((op, degree, t, i));
-            }
-        }
-    }
-    out
-}
 
 /// The saved differential of a bidegree, or an error rather than a resolution if it is missing.
 fn blob(store: &ZarrSaveStore, a: i32, t: i32) -> anyhow::Result<Vec<u8>> {

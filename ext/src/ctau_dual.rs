@@ -14,8 +14,7 @@ use rustc_hash::FxHashMap;
 use crate::{
     ctau::{PackedXi, QAlgebra},
     ctau_scale::{
-        BackboneSource, Complex, Forward, NEVER, OpTables, Phase, Space, forward, pullback_rows,
-        timed,
+        BackboneSource, Complex, Forward, NEVER, OpTables, Phase, Space, pullback_rows, timed,
     },
 };
 
@@ -688,9 +687,9 @@ pub fn export(
         if weights.is_empty() {
             continue;
         }
-        let slice = Arc::new(timed(Phase::Slices, || source.slice(a + 1, keep))?);
-        let differentials = forward(&slice);
-        let window = source.window(vec![(a + 1, slice)]);
+        let differentials = timed(Phase::Slices, || source.forward(a + 1, keep))?;
+        // the spaces read the generators of the backbone and nothing else of it
+        let window = source.window(Vec::new());
         let step = Step {
             q,
             tables,
