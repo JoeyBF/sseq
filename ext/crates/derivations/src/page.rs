@@ -623,6 +623,114 @@ fn d2_fact_equations(
     out
 }
 
+/// The d2 of a cofiber `C(h_i)` (a module over the first node with `shift = 2^i`) on lifts of
+/// its top cell, from the sphere alone: for `y` a d2-cycle with `y h_i = lambda L` in Cλ²
+/// (vanishing E2 product), every module class `ȳ` with `p_* ȳ = y` has `d2(ȳ) = i_*(L)` modulo
+/// `i_*` of the sphere's d2 out of the bidegree of `ȳ`. Changing the lift of `y` moves `L` by
+/// `h_i w`, which `i_*` kills; changing `ȳ` by `i_*(a)` moves `d2(ȳ)` by `i_*(d2 a)`.
+fn cofiber_d2_equations(
+    ni: usize,
+    mn: &Node,
+    e: &Pages,
+    rn: &Node,
+    d2: &FxHashMap<u32, V>,
+    sec: &[Secondary],
+    one: u32,
+) -> Vec<(Vec<u32>, Origin)> {
+    let Alg::Module(m, _) = mn.alg else {
+        return vec![];
+    };
+    if m.shift <= 0 || m.shift & (m.shift - 1) != 0 {
+        return vec![];
+    }
+    let hi = m.shift.trailing_zeros();
+    // i_* of a sphere vector at (n, f), if every image it needs is known
+    let istar = |n: i32, f: i32, v: V| -> V {
+        let Some(sb) = rn.get(n, f) else {
+            return 0;
+        };
+        bits(v).fold(0, |acc, l| {
+            acc ^ m.istar.get(&rn.gid(sb, l)).copied().unwrap_or(0) as V
+        })
+    };
+    let mut out = vec![];
+    let mut used = 0;
+    for s in sec.iter().filter(|s| s.i == hi) {
+        let (n, f) = (s.n + m.shift, s.f);
+        let Some(b) = mn.get(n, f) else {
+            continue;
+        };
+        if e.off[b as usize] == u32::MAX || mn.get(n - 1, f + 2).is_none() {
+            continue;
+        }
+        // a module class ȳ with p_* ȳ = y
+        let mut pre = Ech::default();
+        for j in 0..mn.dim(b) {
+            let img = m.pstar.get(&mn.gid(b, j)).copied().unwrap_or(0) as V;
+            pre.insert(img, 1 << j);
+        }
+        let Some(c) = pre.project(s.y) else {
+            continue;
+        };
+        // the ambiguity: i_* d2 of the sphere at (n, f); every d2 there must be known
+        let mut ind = Ech::default();
+        let mut known = true;
+        if let Some(ab) = rn.get(n, f) {
+            for k in 0..rn.dim(ab) {
+                match d2.get(&rn.gid(ab, k)) {
+                    Some(&w) => {
+                        ind.insert(istar(n - 1, f + 2, w), 0);
+                    }
+                    None => known = false,
+                }
+            }
+        }
+        if !known {
+            continue;
+        }
+        let rhs = ind.reduce(istar(n - 1, f + 2, s.l)).0;
+        let cols: Vec<V> = (0..e.stride[b as usize] as usize)
+            .map(|l| ind.reduce(1 << l).0)
+            .collect();
+        used += 1;
+        for cc in 0..cols.len() {
+            let mut eq = vec![];
+            for k in bits(c) {
+                for (l, &col) in cols.iter().enumerate() {
+                    if col >> cc & 1 == 1 {
+                        eq.push(e.var(b, k, l));
+                    }
+                }
+            }
+            if rhs >> cc & 1 == 1 {
+                eq.push(one);
+            }
+            let eq = reduce_eq(eq);
+            if !eq.is_empty() {
+                let (node, k, row) = (ni as u16, c.trailing_zeros() as u8, cc as u8);
+                out.push((
+                    eq,
+                    Origin::Fact {
+                        kind: 3,
+                        node,
+                        n,
+                        f,
+                        k,
+                        row,
+                    },
+                ));
+            }
+        }
+    }
+    eprintln!(
+        "{}: d2 on top-cell lifts from the sphere's secondary products: {used} lifts, {} \
+         equations",
+        mn.name,
+        out.len()
+    );
+    out
+}
+
 /// E3 as bounds from E2 and what is known of d2: a class whose d2 is not in the files may have
 /// any value.
 fn bounds_e3(node: &Node, d2: &FxHashMap<u32, V>) -> Pages {
@@ -1737,7 +1845,7 @@ impl Labels<'_, '_> {
                 row,
             } => format!(
                 "{} {} x_({n},{f},{k})[{row}]",
-                ["seed", "backward", "d2 file"][kind as usize],
+                ["seed", "backward", "d2 file", "cofiber secondary"][kind as usize],
                 self.nodes[node as usize].name
             ),
             Origin::Coupling { node, n, f, i, row } => format!(
@@ -2205,6 +2313,17 @@ pub(crate) fn run(ext: &Ext, p: &Products, args: &[String]) {
             if r == 2 {
                 for (ni, ((n, e), d2)) in nodes.iter().zip(&es).zip(&d2s).enumerate() {
                     sink.add(d2_fact_equations(ni, n, e, d2, total));
+                }
+                // COF_D2=0 switches off the cofiber d2 from secondary products
+                let cof = std::env::var("COF_D2").map_or(true, |v| v != "0");
+                if let (Some(sec), true) = (&secondary, cof) {
+                    for (ni, (n, e)) in nodes.iter().zip(&es).enumerate() {
+                        if let Alg::Module(_, 0) = n.alg {
+                            sink.add(cofiber_d2_equations(
+                                ni, n, e, &nodes[0], &d2s[0], sec, total,
+                            ));
+                        }
+                    }
                 }
             }
             let fact = |kind: u8, ni: usize, st: &Statement, se: Vec<Vec<u32>>| {
