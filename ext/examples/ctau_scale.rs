@@ -11,7 +11,7 @@ use algebra::AlgebraType;
 use ext::{
     chain_complex::ChainComplex,
     ctau::{BarComparison, OpTable, QAlgebra, QPoly, Tri},
-    ctau_dual::DualOptions,
+    ctau_dual::{DualOptions, Exported, Maps},
     ctau_lazy::{LazyOptions, export},
     ctau_scale::{
         BackboneSource, Complex, NEVER, OpTables, ScaledExt, StreamedBackbone, add_operations,
@@ -245,7 +245,7 @@ fn lazy(
     // In a quotient by q_1 and more the monomials are few and their coactions short, so the
     // tables are built from them alone and the backbone is filtered by the tables; otherwise
     // one pass over the backbone lists its operations first, a few filtrations at a time.
-    let from_monomials = quotient >= 2;
+    let from_monomials = quotient >= 2 || std::env::var_os("CTAU_FROM_MONOMIALS").is_some();
     let start = Instant::now();
     let tables = if from_monomials {
         OpTables::new(&q, None, q_degree)
@@ -318,23 +318,20 @@ fn lazy(
         let options = DualOptions {
             in_flight: options.in_flight,
         };
-        let mut complexes = vec![Complex::sphere()];
-        for name in &names {
-            complexes.push(complex(name)?);
-        }
-        for cx in complexes {
+        let bound = |cx: Complex| Complex {
+            max_k,
+            quotient,
+            ..cx
+        };
+        let run = |cx: &Complex, maps: &Maps, label: &str| -> anyhow::Result<Exported> {
             let start = Instant::now();
-            let cx = Complex {
-                max_k,
-                quotient,
-                ..cx
-            };
-            let s = ext::ctau_dual::export(&q, &source, &tables, &cx, max_n, &keep, dir, &options)?;
+            let (exported, s) = ext::ctau_dual::export(
+                &q, &source, &tables, cx, max_n, maps, &keep, dir, &options,
+            )?;
             eprintln!(
-                "{}: {} towers; {} cochains (largest space {}), {} rows of {} entries ({} \
-                 reduced as they stand), {} entries added, {} reduced entries; h_j: {} entries \
+                "{label}: {} towers; {} cochains (largest space {}), {} rows of {} entries ({} \
+                 reduced as they stand), {} entries added, {} reduced entries; maps: {} entries \
                  pulled back, {} added, {} products: {:.1} s, peak {:.1} GB",
-                cx.name,
                 s.towers,
                 s.cochains,
                 s.largest,
@@ -353,7 +350,19 @@ fn lazy(
                 .into_iter()
                 .map(|(p, t)| format!("{p:?} {t:.0}"))
                 .collect();
-            eprintln!("{}: task seconds: {}", cx.name, phases.join(", "));
+            eprintln!("{label}: task seconds: {}", phases.join(", "));
+            Ok(exported)
+        };
+        let sphere = bound(Complex::sphere());
+        let ctau = run(&sphere, &Maps::Products, "Ctau")?;
+        for name in &names {
+            let cx = bound(complex(name)?);
+            let cofiber = run(&cx, &Maps::WithTopCell(&ctau), name)?;
+            run(
+                &sphere,
+                &Maps::BottomCell(&cofiber),
+                &format!("Ctau -> {name}"),
+            )?;
         }
         eprintln!(
             "total {:.1} s, peak {:.1} GB",

@@ -45,14 +45,45 @@ struct Functionals {
     towers: Vec<u32>,
 }
 
+/// A tower of an exported complex, as a functional: see [`Functional`].
+pub struct Tower {
+    psi: Vec<u32>,
+    death: u16,
+}
+
+/// A complex that has been exported, as what a later export reads of it: its towers by
+/// filtration and weight.
+pub struct Exported {
+    pub cx: Complex,
+    towers: FxHashMap<(i32, i32), Arc<Vec<Tower>>>,
+}
+
+/// The maps an export computes.
+pub enum Maps<'a> {
+    /// The towers and $h_1, \dots, h_4$.
+    Products,
+    /// Those, and the top cell of a two-cell complex into the sphere, already exported.
+    WithTopCell(&'a Exported),
+    /// Only the bottom cell, out of the sphere into a two-cell complex already exported: no
+    /// tower of the sphere is written. A map within a filtration needs the rows out of its
+    /// source and the towers of its target, which the two exports find a step apart, so the
+    /// sphere is reduced again for this one.
+    BottomCell(&'a Exported),
+}
+
+/// The index of the top cell map among the maps of [`Pulled::map`].
+const TOP_CELL: u8 = 4;
+
+/// The index of the bottom cell map.
+const BOTTOM_CELL: u8 = 5;
+
 /// The image of a tower functional under the transpose of a cochain map, reduced by the rows
 /// out of its source space: what is left for the functionals of that space to account for.
 struct Pulled {
-    /// The map: $h_{j+1}$.
-    j: u8,
-    /// The weight and index of the tower pulled back, one filtration up.
-    weight: i32,
-    tower: u32,
+    /// The map: $h_{j+1}$ for `j` below 4, [`TOP_CELL`] or [`BOTTOM_CELL`].
+    map: u8,
+    /// The filtration, weight and index of the tower pulled back.
+    target: (i32, i32, u32),
     death: u16,
     /// Positions of the source space below `cut`, sorted.
     entries: Vec<u32>,
@@ -123,6 +154,7 @@ struct Step<'a> {
     tables: &'a OpTables,
     cx: &'a Complex,
     max_n: i32,
+    maps: &'a Maps<'a>,
     /// The source filtration of the coboundary reduced.
     a: i32,
     /// The differentials of the backbone out of filtration `a + 1`.
@@ -136,11 +168,13 @@ struct Reduction {
     /// The reduced rows, as functionals on the source space with positions counted from its
     /// end.
     rows: SparseEchelon,
-    functionals: Arc<Functionals>,
+    /// The towers one filtration up.
+    towers: Arc<Vec<Tower>>,
     /// The positions of the source space that are pivots, as a bit set.
     pivots: Vec<u64>,
     towers_csv: String,
     h_csv: String,
+    cell_csv: String,
     stats: DualStats,
 }
 
@@ -245,6 +279,8 @@ impl Step<'_> {
         drop(built);
         let mut towers_csv = String::new();
         let mut h_csv = String::new();
+        let mut cell_csv = String::new();
+        let mut towers = Vec::new();
         if self.in_range(a + 1, u) {
             stats.towers = functionals.towers.len();
             for (i, &f) in functionals.towers.iter().enumerate() {
@@ -265,20 +301,33 @@ impl Step<'_> {
                     2 * u - a - 1,
                     a + 1 + f.birth as i32
                 )?;
+                towers.push(Tower {
+                    psi: f.psi.clone(),
+                    death: f.death,
+                });
             }
             if let Some(pulled) = pulled {
                 timed(Phase::Maps, || {
-                    self.finish_products(u, &tgt, &functionals, pulled, &mut h_csv, &mut stats)
+                    self.finish(
+                        u,
+                        &tgt,
+                        &functionals,
+                        pulled,
+                        &mut h_csv,
+                        &mut cell_csv,
+                        &mut stats,
+                    )
                 })?;
             }
         }
         Ok(Reduction {
             u,
             rows,
-            functionals: Arc::new(functionals),
+            towers: Arc::new(towers),
             pivots,
             towers_csv,
             h_csv,
+            cell_csv,
             stats,
         })
     }
@@ -290,13 +339,15 @@ impl Step<'_> {
     /// Below the level at which the tower pulled back dies its image is a functional on
     /// cohomology, so it involves no functional that has died by then: this is checked, and it
     /// is what makes the coefficients products.
-    fn finish_products(
+    #[allow(clippy::too_many_arguments)]
+    fn finish(
         &self,
         u: i32,
         space: &Space,
         functionals: &Functionals,
         pulled: &[Pulled],
         h_csv: &mut String,
+        cell_csv: &mut String,
         stats: &mut DualStats,
     ) -> anyhow::Result<()> {
         use std::fmt::Write;
@@ -310,7 +361,7 @@ impl Step<'_> {
         for (i, &f) in functionals.towers.iter().enumerate() {
             tower_of[f as usize] = i as u32;
         }
-        // (j, source tower) -> target ids
+        // (map, source tower) -> target ids
         let mut products: BTreeMap<(u8, u32), Vec<String>> = BTreeMap::new();
         for p in pulled {
             let mut rest: std::collections::BTreeSet<u32> = p.entries.iter().copied().collect();
@@ -329,9 +380,9 @@ impl Step<'_> {
                     p.death
                 );
                 products
-                    .entry((p.j, tower_of[i as usize]))
+                    .entry((p.map, tower_of[i as usize]))
                     .or_default()
-                    .push(tower_id(a + 1, p.weight, p.tower as usize));
+                    .push(tower_id(p.target.0, p.target.1, p.target.2 as usize));
                 for &x in &f.psi[1..] {
                     if x < p.cut && !rest.remove(&x) {
                         rest.insert(x);
@@ -339,27 +390,71 @@ impl Step<'_> {
                 }
             }
         }
-        for ((j, source), targets) in products {
-            stats.products += targets.len();
-            writeln!(
-                h_csv,
-                "{},{},{}",
-                j + 1,
-                tower_id(a, u, source as usize),
-                targets.join(" ")
-            )?;
+        for ((map, source), targets) in products {
+            let source = tower_id(a, u, source as usize);
+            if map < TOP_CELL {
+                stats.products += targets.len();
+                writeln!(h_csv, "{},{source},{}", map + 1, targets.join(" "))?;
+            } else {
+                writeln!(cell_csv, "{source},{}", targets.join(" "))?;
+            }
         }
         Ok(())
     }
 
-    /// Pulls the towers one filtration up back along $h_1, \dots, h_4$ to the source space of
-    /// `red`, and reduces each by the rows of `red` as far as the tower lives: what is left is
-    /// on the positions where a functional of the source space starts, for
-    /// [`Self::finish_products`] one step later.
-    fn pull_products(
+    /// Reduces a functional on the source space of `red`, held in `bits` at the positions
+    /// from `keep_from` on (counted from the end), by the rows of `red`, and returns the
+    /// positions left, which are those where a functional of the source space starts. `high`
+    /// is one past the last word of `bits` that may be nonzero; `bits` is left zero.
+    fn eliminate(
+        red: &Reduction,
+        bits: &mut [u64],
+        mut high: usize,
+        keep_from: u32,
+        stats: &mut DualStats,
+    ) -> Vec<u32> {
+        let dim = red.rows.rows() as u32;
+        let mut entries = Vec::new();
+        let low = keep_from as usize / 64;
+        while high > low {
+            let word = bits[high - 1];
+            if word == 0 {
+                high -= 1;
+                continue;
+            }
+            let r = (high - 1) * 64 + 63 - word.leading_zeros() as usize;
+            if (r as u32) < keep_from {
+                bits[high - 1] = 0;
+                high -= 1;
+                continue;
+            }
+            match red.rows.pivot_column(r) {
+                Some(c) => {
+                    let row = red.rows.column(c);
+                    let from = row.partition_point(|&x| x < keep_from);
+                    stats.map_additions += row.len() - from;
+                    for &x in &row[from..] {
+                        bits[x as usize / 64] ^= 1 << (x % 64);
+                    }
+                }
+                None => {
+                    bits[r / 64] ^= 1 << (r % 64);
+                    entries.push(dim - 1 - r as u32);
+                }
+            }
+        }
+        entries
+    }
+
+    /// Pulls towers back to the source space of `red` along the maps of `self.maps`: those one
+    /// filtration up (in `above`, by weight) along $h_1, \dots, h_4$, and those of another
+    /// complex in the same filtration along a cell map. Each is reduced by the rows of `red`
+    /// as far as the tower lives; what is left is on the positions where a functional of the
+    /// source space starts, for [`Self::finish`] one step later.
+    fn pull(
         &self,
         red: &Reduction,
-        above: &FxHashMap<i32, Arc<Functionals>>,
+        above: &FxHashMap<i32, Arc<Vec<Tower>>>,
         stats: &mut DualStats,
     ) -> Vec<Pulled> {
         let (a, u) = (self.a, red.u);
@@ -370,18 +465,52 @@ impl Step<'_> {
         let src = Space::new(self.bb, self.q, self.cx, a, u);
         let dim = src.dim() as u32;
         let mut bits = vec![0u64; src.dim().div_ceil(64)];
-        for j in 0..4u8 {
+        // Reduces the functional with the given positions of `src`, counted from the end (a
+        // repeated one cancels), kept below the level at which the tower `target` dies.
+        let mut pull_one = |map: u8,
+                            target: (i32, i32, u32),
+                            death: u16,
+                            positions: &mut dyn Iterator<Item = u32>,
+                            stats: &mut DualStats| {
+            let cut = if death == NEVER {
+                dim
+            } else {
+                src.level_end(death as usize - 1) as u32
+            };
+            // positions from the end at which the image is kept
+            let keep_from = dim - cut;
+            let mut high = 0;
+            for r in positions {
+                if r >= keep_from {
+                    bits[r as usize / 64] ^= 1 << (r % 64);
+                    high = high.max(r as usize / 64 + 1);
+                    stats.map_entries += 1;
+                }
+            }
+            let entries = Self::eliminate(red, &mut bits, high, keep_from, stats);
+            if !entries.is_empty() {
+                out.push(Pulled {
+                    map,
+                    target,
+                    death,
+                    entries,
+                    cut,
+                });
+            }
+        };
+        let products = !matches!(self.maps, Maps::BottomCell(_));
+        for j in (0..4u8).filter(|_| products) {
             let weight = u + (1 << j);
             let Some(towers) = above.get(&weight).filter(|_| self.in_range(a + 1, weight)) else {
                 continue;
             };
-            if towers.towers.is_empty() {
+            if towers.is_empty() {
                 continue;
             }
             let tgt = Space::new(self.bb, self.q, self.cx, a + 1, weight);
             let mut wanted = vec![0u64; tgt.dim().div_ceil(64)];
-            for &f in &towers.towers {
-                for &p in &towers.list[f as usize].psi {
+            for tower in towers.iter() {
+                for &p in &tower.psi {
                     wanted[p as usize / 64] |= 1 << (p % 64);
                 }
             }
@@ -398,63 +527,64 @@ impl Step<'_> {
                     |pos| wanted[pos as usize / 64] >> (pos % 64) & 1 == 1,
                 )
             });
-            for (i, &f) in towers.towers.iter().enumerate() {
-                let f = &towers.list[f as usize];
-                let cut = if f.death == NEVER {
-                    dim
-                } else {
-                    src.level_end(f.death as usize - 1) as u32
-                };
-                // positions from the end at which the image is kept
-                let keep_from = dim - cut;
-                let mut high = 0;
-                for &p in &f.psi {
-                    for &r in &rows[p as usize] {
-                        if r >= keep_from {
-                            bits[r as usize / 64] ^= 1 << (r % 64);
-                            high = high.max(r as usize / 64 + 1);
-                            stats.map_entries += 1;
-                        }
+            for (i, tower) in towers.iter().enumerate() {
+                let mut positions = tower
+                    .psi
+                    .iter()
+                    .flat_map(|&p| rows[p as usize].iter().copied());
+                pull_one(
+                    j,
+                    (a + 1, weight, i as u32),
+                    tower.death,
+                    &mut positions,
+                    stats,
+                );
+            }
+        }
+        match self.maps {
+            Maps::Products => {}
+            // the coordinates on the top cell are a cochain of the sphere
+            Maps::WithTopCell(base) => {
+                let top = self.cx.cells.len() - 1;
+                let weight = u - self.cx.cells[top][1];
+                if let Some(towers) = base
+                    .towers
+                    .get(&(a, weight))
+                    .filter(|_| self.in_range(a, weight))
+                {
+                    let down = Space::new(self.bb, self.q, &base.cx, a, weight);
+                    for (i, tower) in towers.iter().enumerate() {
+                        let mut positions = tower.psi.iter().map(|&p| {
+                            let (_, t, x, m, _) = down.decode(self.q, p);
+                            dim - 1 - src.pos(self.q, top, t, x, &m)
+                        });
+                        pull_one(
+                            TOP_CELL,
+                            (a, weight, i as u32),
+                            tower.death,
+                            &mut positions,
+                            stats,
+                        );
                     }
                 }
-                let mut entries = Vec::new();
-                let low = keep_from as usize / 64;
-                while high > low {
-                    let word = bits[high - 1];
-                    if word == 0 {
-                        high -= 1;
-                        continue;
+            }
+            // a cochain of the sphere is one on the bottom cell
+            Maps::BottomCell(cofiber) => {
+                if let Some(towers) = cofiber.towers.get(&(a, u)) {
+                    let up = Space::new(self.bb, self.q, &cofiber.cx, a, u);
+                    for (i, tower) in towers.iter().enumerate() {
+                        let mut positions = tower.psi.iter().filter_map(|&p| {
+                            let (cell, t, x, m, _) = up.decode(self.q, p);
+                            (cell == 0).then(|| dim - 1 - src.pos(self.q, 0, t, x, &m))
+                        });
+                        pull_one(
+                            BOTTOM_CELL,
+                            (a, u, i as u32),
+                            tower.death,
+                            &mut positions,
+                            stats,
+                        );
                     }
-                    let r = (high - 1) * 64 + 63 - word.leading_zeros() as usize;
-                    if (r as u32) < keep_from {
-                        bits[high - 1] = 0;
-                        high -= 1;
-                        continue;
-                    }
-                    match red.rows.pivot_column(r) {
-                        Some(c) => {
-                            let row = red.rows.column(c);
-                            let from = row.partition_point(|&x| x < keep_from);
-                            stats.map_additions += row.len() - from;
-                            for &x in &row[from..] {
-                                bits[x as usize / 64] ^= 1 << (x % 64);
-                            }
-                        }
-                        None => {
-                            bits[r / 64] ^= 1 << (r % 64);
-                            entries.push(dim - 1 - r as u32);
-                        }
-                    }
-                }
-                if !entries.is_empty() {
-                    out.push(Pulled {
-                        j,
-                        weight,
-                        tower: i as u32,
-                        death: f.death,
-                        entries,
-                        cut,
-                    });
                 }
             }
         }
@@ -490,10 +620,11 @@ pub fn export(
     tables: &OpTables,
     cx: &Complex,
     max_n: i32,
+    maps: &Maps,
     keep: &(dyn Fn(PackedXi) -> bool + Sync),
     dir: &Path,
     options: &DualOptions,
-) -> anyhow::Result<DualStats> {
+) -> anyhow::Result<(Exported, DualStats)> {
     use maybe_rayon::prelude::*;
     assert!(
         cx.cells.iter().all(|c| c[0] == 0 && c[2] == 0),
@@ -505,8 +636,27 @@ pub fn export(
         writeln!(w, "{header}")?;
         Ok(w)
     };
-    let mut w_towers = open("towers", "id,stem,filtration,weight,length")?;
-    let mut w_h = open("h", "j,source,targets")?;
+    let mut w_own = match maps {
+        Maps::BottomCell(_) => None,
+        _ => Some((
+            open("towers", "id,stem,filtration,weight,length")?,
+            open("h", "j,source,targets")?,
+        )),
+    };
+    let mut w_cell = match maps {
+        Maps::Products => None,
+        Maps::WithTopCell(_) => Some(open("pstar", "source,targets")?),
+        Maps::BottomCell(cofiber) => {
+            let path = dir.join(format!("{}_istar.csv", cofiber.cx.name));
+            let mut w = BufWriter::new(File::create(path)?);
+            writeln!(w, "source,targets")?;
+            Some(w)
+        }
+    };
+    let mut exported = Exported {
+        cx: cx.clone(),
+        towers: FxHashMap::default(),
+    };
     let min_a = cx.min_a();
     // the lowest source filtration read at weight u
     let a_lo = |u: i32| (2 * u - max_n - 1).max(min_a);
@@ -538,6 +688,7 @@ pub fn export(
             tables,
             cx,
             max_n,
+            maps,
             a,
             differentials: &differentials,
             bb: &window,
@@ -545,7 +696,7 @@ pub fn export(
         // A product into weight u + 2^j is pulled back to weight u, so the higher weights go
         // first.
         weights.sort_unstable_by_key(|&u| std::cmp::Reverse(u));
-        let mut above: FxHashMap<i32, Arc<Functionals>> = FxHashMap::default();
+        let mut above: FxHashMap<i32, Arc<Vec<Tower>>> = FxHashMap::default();
         let mut next_cleared: FxHashMap<i32, Vec<u64>> = FxHashMap::default();
         let mut next_pulled: FxHashMap<i32, Vec<Pulled>> = FxHashMap::default();
         for group in weights.chunks(options.in_flight.max(1)) {
@@ -556,16 +707,26 @@ pub fn export(
                 .collect();
             let reduced: Vec<Reduction> = reduced.into_iter().collect::<anyhow::Result<_>>()?;
             for red in &reduced {
-                above.insert(red.u, Arc::clone(&red.functionals));
-                w_towers.write_all(red.towers_csv.as_bytes())?;
-                w_h.write_all(red.h_csv.as_bytes())?;
+                above.insert(red.u, Arc::clone(&red.towers));
+                if !red.towers.is_empty() {
+                    exported
+                        .towers
+                        .insert((a + 1, red.u), Arc::clone(&red.towers));
+                }
+                if let Some((w_towers, w_h)) = w_own.as_mut() {
+                    w_towers.write_all(red.towers_csv.as_bytes())?;
+                    w_h.write_all(red.h_csv.as_bytes())?;
+                }
+                if let Some(w) = w_cell.as_mut() {
+                    w.write_all(red.cell_csv.as_bytes())?;
+                }
                 stats = stats.merge(red.stats);
             }
             let maps: Vec<(i32, Vec<u64>, Vec<Pulled>, DualStats)> = reduced
                 .into_maybe_par_iter()
                 .map(|red| {
                     let mut local = DualStats::default();
-                    let out = timed(Phase::Maps, || step.pull_products(&red, &above, &mut local));
+                    let out = timed(Phase::Maps, || step.pull(&red, &above, &mut local));
                     (red.u, red.pivots, out, local)
                 })
                 .collect();
@@ -578,5 +739,5 @@ pub fn export(
         cleared = next_cleared;
         pulled = next_pulled;
     }
-    Ok(stats)
+    Ok((exported, stats))
 }
