@@ -1,0 +1,91 @@
+//! The A-map obstruction 3-cochain of a two-cell module: for Milnor basis elements a1, a2, a3 with
+//! |a1| + |a2| + |a3| = top + 1, whether A(a1, sigma(a2) sigma(a3)) (its twos part through kappa
+//! and its Y part through A_Y, as sseq's pair algebra computes them) carries the bottom cell to the
+//! top cell.  Prints `twos`, `y` and `total` lines as `a1|a2|a3`.
+//!
+//! Usage: `amap_obstruction <module> <top degree>`.
+
+use std::sync::Arc;
+
+use algebra::{
+    Algebra, MilnorAlgebra,
+    module::{FDModule, Module},
+    pair_algebra::PairAlgebra,
+};
+use ext::utils::load_module_json;
+use fp::vector::FpVector;
+
+fn main() -> anyhow::Result<()> {
+    let args: Vec<String> = std::env::args().collect();
+    let name = &args[1];
+    let top: i32 = args[2].parse()?;
+    let algebra = Arc::new(MilnorAlgebra::new(fp::prime::TWO, false));
+    algebra.compute_basis(top + 4);
+    let m = FDModule::from_json(Arc::clone(&algebra), &load_module_json(name)?)?;
+    m.compute_basis(top + 2);
+    let hits = |deg: i32, v: &FpVector| -> bool {
+        // does the degree-`deg` element v carry the bottom cell (degree 0) to the top cell?
+        let mut out = FpVector::new(fp::prime::TWO, m.dimension(deg));
+        for (i, c) in v.iter_nonzero() {
+            m.act_on_basis(out.as_slice_mut(), c, deg, i, 0, 0);
+        }
+        out.entry(0) != 0
+    };
+    let s = |d: i32, i: usize| algebra.basis_element_to_string(d, i);
+    for d1 in 1..=top {
+        for d2 in 1..=top {
+            let d3 = top + 1 - d1 - d2;
+            if d3 < 1 {
+                continue;
+            }
+            for i2 in 0..algebra.dimension(d2) {
+                for i3 in 0..algebra.dimension(d3) {
+                    let mut e = algebra.new_pair_element(d2 + d3);
+                    algebra.sigma_multiply_basis(&mut e, 1, d2, i2, d3, i3);
+                    // a_multiply only takes the twos and Y parts
+                    for i1 in 0..algebra.dimension(d1) {
+                        let mut r = FpVector::new(fp::prime::TWO, algebra.dimension(d1));
+                        r.set_entry(i1, 1);
+                        let mut out_t = FpVector::new(fp::prime::TWO, algebra.dimension(top));
+                        let mut out_y = FpVector::new(fp::prime::TWO, algebra.dimension(top));
+                        let (tw, ys) = split(&algebra, &e, d2 + d3);
+                        algebra.a_multiply(out_t.as_slice_mut(), 1, d1, r.as_slice(), d2 + d3, &tw);
+                        algebra.a_multiply(out_y.as_slice_mut(), 1, d1, r.as_slice(), d2 + d3, &ys);
+                        let (ht, hy) = (hits(top, &out_t), hits(top, &out_y));
+                        let lab = format!("{}|{}|{}", s(d1, i1), s(d2, i2), s(d3, i3));
+                        if ht {
+                            println!("twos {lab}");
+                        }
+                        if hy {
+                            println!("y {lab}");
+                        }
+                        if ht != hy {
+                            println!("total {lab}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Splits a pair element into (twos only, Y only) copies, with the ones part cleared.
+fn split(
+    algebra: &MilnorAlgebra,
+    e: &algebra::pair_algebra::MilnorPairElement,
+    degree: i32,
+) -> (algebra::pair_algebra::MilnorPairElement, algebra::pair_algebra::MilnorPairElement) {
+    let mut tw = algebra.new_pair_element(degree);
+    let mut ys = algebra.new_pair_element(degree);
+    tw.twos_mut().add(e.twos(), 1);
+    for (k, row) in e.ys().iter().enumerate() {
+        for (l, v) in row.iter().enumerate() {
+            ys.ys_mut()[k][l].add(v, 1);
+        }
+    }
+    <MilnorAlgebra as PairAlgebra>::finalize_element(&mut tw);
+    <MilnorAlgebra as PairAlgebra>::finalize_element(&mut ys);
+    let _ = algebra;
+    (tw, ys)
+}

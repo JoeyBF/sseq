@@ -36,12 +36,20 @@ fn main() -> anyhow::Result<()> {
     let max_s: i32 = std::env::var("FEAT_MAX_S").map_or(28, |v| v.parse().unwrap());
     println!("j,stem,Adams_filtration,index,feature,value");
     let max_j: i32 = std::env::var("FEAT_MAX_J").map_or(3, |v| v.parse().unwrap());
-    for j in 0..=max_j {
-        let jump = (1 << j) + 1;
+    // FEAT_DEGS=c,c,...: cross degrees c (H:e with |e| = c, d-paths of total degree c + 1); the
+    // first column is then c instead of j
+    let degs: Vec<i32> = std::env::var("FEAT_DEGS").map_or_else(
+        |_| (0..=max_j).map(|j| 1 << j).collect(),
+        |v| v.split(',').map(|x| x.parse().unwrap()).collect(),
+    );
+    let by_deg = std::env::var("FEAT_DEGS").is_ok();
+    for &c_deg in &degs {
+        let j = if by_deg { c_deg } else { c_deg.trailing_zeros() as i32 };
+        let jump = c_deg + 1;
         for s in 0..=max_s {
             for n in 0..=max_n {
                 let b0 = Bidegree::n_s(n, s);
-                let tb = Bidegree::n_s(n + (1 << j) - 1, s + 2);
+                let tb = Bidegree::n_s(n + c_deg - 1, s + 2);
                 if !res.has_computed_bidegree(b0) || !res.has_computed_bidegree(tb) {
                     continue;
                 }
@@ -135,7 +143,7 @@ fn main() -> anyhow::Result<()> {
                     let hom = &res_lift.homotopy(s + 2).homotopies;
                     if hom.next_degree() > tg {
                         let hg = hom.output(tg, g);
-                        let c = 1 << j;
+                        let c = c_deg;
                         if hg.len() == p_s.dimension(tg - 1) {
                             let offx = p_s.generator_offset(tg - 1, tz, 0);
                             for x in 0..dim {
@@ -153,7 +161,7 @@ fn main() -> anyhow::Result<()> {
                     }
                 }
                 // E:h: the product h_j e_x at (n + 2^j - 1, s + 1), the Sq^{2^j} coefficient of d
-                {
+                if !by_deg {
                     let hb = Bidegree::n_s(n + (1 << j) - 1, s + 1);
                     if res.has_computed_bidegree(hb) {
                         let hdim = res.number_of_gens_in_bidegree(hb);

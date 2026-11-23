@@ -1,0 +1,30 @@
+//! The antipode on the Milnor basis: `#chi,degree,e,term;term;...` for degrees 1..=max.
+//!
+//! Usage: `chi_table <max degree>`.
+
+use std::sync::Arc;
+
+use algebra::{Algebra, MilnorAlgebra};
+use ext::ext_algebra::tensor_resolution::Antipode;
+
+fn main() -> anyhow::Result<()> {
+    let max: i32 = std::env::args().nth(1).map_or(8, |v| v.parse().unwrap());
+    let algebra = Arc::new(MilnorAlgebra::new(fp::prime::TWO, false));
+    algebra.compute_basis(max + 1);
+    let chi = Antipode::new(Arc::clone(&algebra));
+    for d in 1..=max {
+        for i in 0..algebra.dimension(d) {
+            let v = chi.apply(d, i);
+            let terms: Vec<String> = v
+                .iter_nonzero()
+                .map(|(o, _)| algebra.basis_element_to_string(d, o).replace(", ", ";"))
+                .collect();
+            println!(
+                "#chi,{d},{},{}",
+                algebra.basis_element_to_string(d, i).replace(", ", ";"),
+                terms.join(" ")
+            );
+        }
+    }
+    Ok(())
+}
