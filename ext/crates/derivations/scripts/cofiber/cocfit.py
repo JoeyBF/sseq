@@ -108,7 +108,22 @@ for (c, b) in blocks:
     names = sorted({f for k, fs in F.items() if k[0] == delta for f in fs
                     if not (SHEAR and f.startswith('H:'))})
     unknowns += [(c, b, f) for f in names]
+# COMBOS=<file>: the unknowns are whole homogeneous solutions `name#c>b:op+op#c>b:op...`
+COMBO = {}
+if os.environ.get("COMBOS"):
+    for line in open(os.environ["COMBOS"]):
+        parts = line.strip().split("#")
+        COMBO[parts[0]] = {tuple(map(int, p.split(":", 1)[0].split(">"))): p.split(":", 1)[1].split("+")
+                           for p in parts[1:]}
+    unknowns = [(None, None, name) for name in COMBO]
 ucol = {u: i for i, u in enumerate(unknowns)}
+
+
+def combo_mask(name, c, b, n, l, s):
+    m = 0
+    for f in COMBO[name].get((c[0], b[0]), []):
+        m ^= F.get((c[0] - b[0], n, s, l), {}).get(f, 0)
+    return m
 
 
 def basis(s, T):
@@ -277,8 +292,11 @@ for s in range(0, max_s - 1):
             cols = {}
             for u in unknowns:
                 c0, b0, f = u
-                fv = apply(Z, lambda c, b, n, l: F.get((c0[0] - b0[0], n, s, l), {}).get(f, 0)
-                           if (c, b) == (c0, b0) else 0)
+                if c0 is None:
+                    fv = apply(Z, lambda c, b, n, l: combo_mask(f, c, b, n, l, s) if c[0] > b[0] else 0)
+                else:
+                    fv = apply(Z, lambda c, b, n, l: F.get((c0[0] - b0[0], n, s, l), {}).get(f, 0)
+                               if (c, b) == (c0, b0) else 0)
                 if fv:
                     cols[u] = fv
             width = max([rhs.bit_length()] + [v.bit_length() for v in cols.values()])
@@ -331,3 +349,6 @@ undet = defaultdict(int)
 for u in free:
     undet[(u[0], u[1])] += 1
 print("  undetermined per block:", dict(undet))
+if COMBO:
+    print("  combos used:", [unknowns[i][2] for i in range(nc) if sol >> i & 1])
+    print("  combos undetermined:", [unknowns[p][2] for p in range(nc) if p not in piv])

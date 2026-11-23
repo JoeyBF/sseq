@@ -163,6 +163,24 @@ fn main() -> anyhow::Result<()> {
             }
         }
     }
+    // NORM=nopath: W vanishes on blocks (c, b) with c not in A·b
+    if std::env::var("NORM").is_ok_and(|v| v == "nopath") {
+        for &(c, b) in &blocks {
+            let delta = c.0 - b.0;
+            let connected = (0..algebra.dimension(delta)).any(|i| act(&basis_vec(delta, i), b, c) != 0);
+            if connected {
+                continue;
+            }
+            for (k, u) in unk_list.iter().enumerate() {
+                if (u.0, u.1) == (c, b) {
+                    let mut row = vec![0u64; words];
+                    set(&mut row, k);
+                    labels.push(format!("norm {c:?}->{b:?}"));
+                    rows.push(row);
+                }
+            }
+        }
+    }
     // Gaussian elimination, rhs in the last bit
     let rhs = |r: &Vec<u64>| r[n / 64 + 1] >> 63 & 1;
     let top_bit = |r: &Vec<u64>| -> Option<usize> {
@@ -237,6 +255,38 @@ fn main() -> anyhow::Result<()> {
     }
     for ((cd, bd), v) in spec {
         println!("{cd}>{bd}:{}", if v.is_empty() { "0".to_string() } else { v.join("+") });
+    }
+    // NULL_OUT=<file>: a basis of the homogeneous solutions, one per free variable, as
+    // `name|c>b:op+op|c>b:op...`
+    if let Ok(path) = std::env::var("NULL_OUT") {
+        use std::io::Write;
+        let mut f = std::fs::File::create(path)?;
+        for free in (0..n).filter(|k| !piv.contains_key(k)) {
+            let mut sol = vec![0u64; words];
+            sol[free / 64] |= 1 << (free % 64);
+            for (&p, r) in &piv {
+                let mut v = 0;
+                for k in 0..p {
+                    if r[k / 64] >> (k % 64) & 1 != 0 && sol[k / 64] >> (k % 64) & 1 != 0 {
+                        v ^= 1;
+                    }
+                }
+                if v != 0 {
+                    sol[p / 64] |= 1 << (p % 64);
+                }
+            }
+            let mut by: BTreeMap<(i32, i32), Vec<String>> = BTreeMap::new();
+            for (k, &(c, b, d1, i1, d2, i2)) in unk_list.iter().enumerate() {
+                if sol[k / 64] >> (k % 64) & 1 != 0 {
+                    by.entry((c.0, b.0)).or_default().push(format!("d:{}|{}", s(d1, i1), s(d2, i2)));
+                }
+            }
+            let (c, b, d1, i1, d2, i2) = unk_list[free];
+            let name = format!("{}>{}:{}|{}", c.0, b.0, s(d1, i1), s(d2, i2));
+            let blocks: Vec<String> =
+                by.iter().map(|((cd, bd), v)| format!("{cd}>{bd}:{}", v.join("+"))).collect();
+            writeln!(f, "{name}#{}", blocks.join("#"))?;
+        }
     }
     Ok(())
 }

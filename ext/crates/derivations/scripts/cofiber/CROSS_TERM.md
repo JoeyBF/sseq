@@ -74,3 +74,20 @@ cells), and `twisted_w`'s free-variable choice takes it, which fails (82 places)
 on both ν-blocks, `W_{4→1} = 0` and fitting only `W_{5→0}` is consistent (115). The equation fixes
 `W` up to `Ext^{2,δ+1}` classes per block, which is the secondary-structure freedom θ; the rule
 picking the representative for sseq's split structure is open.
+
+## The secondary structure θ: normalization (`twisted_w` with `NORM=nopath`, `thetafit.sh`)
+
+W has internal degree 1 as an End(M)-valued 2-cochain, so the homogeneous solutions of the twisted
+equation modulo twisted coboundaries are `Ext^{2,1}_A(M, M)`: the torsor of secondary structures.
+Fitting only the homogeneous directions (`COMBOS`, `thetafit.sh`) on C2 ∧ Cν: of 12 directions
+exactly one is visible in the stem-66 data, it is `h1² ⊗ (x1 → x4)` (cells with no primary action
+between them), and sseq's structure uses it. The rule that reproduces sseq's split structure:
+
+    W_{c→b} = 0 whenever c ∉ A·b
+
+With it the derived W, with nothing fitted, is consistent with the ground truth for C2 ∧ Cν (115
+nonzero cross d₂ mod B, stem 66), C2 ∧ Cσ (32, stem 56; 116 failures without the rule), Cη ∧ Cν
+(172, stem 56), C2_eta (106), the Joker (109) and C2 ∧ Cη (204). A non-split structure (e.g. the
+cofiber of a class α in Adams filtration 2, whose module is split) adds its cocycle (for C(α), the
+cobar representative of α on the top → bottom block). The Joker's single contradictory equation
+remains: the derived W still matches its truth, so the missing obstruction term is invisible there.
