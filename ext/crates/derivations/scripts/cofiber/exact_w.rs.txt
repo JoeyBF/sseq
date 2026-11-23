@@ -1,0 +1,375 @@
+//! The cross term of `P ⊗ M` from the exact s = 3 liftability condition on the bar resolution.
+//!
+//! On `B ⊗ M` the free choice is `H_2([x|y] ⊗ b) = Σ_m F(x, y; b → m) · ([] ⊗ m)`, `F` valued in
+//! `A`. The step at s = 3 lifts iff for every `[a1|a2|a3] ⊗ b`
+//!
+//!   Σ_{(a1)} a1'·ε H_2([a2|a3] ⊗ χ(a1'') b) + ε H_2([a1 a2|a3] ⊗ b) + ε H_2([a1|a2 a3] ⊗ b)
+//!     = ε A_Q([a1|a2|a3] ⊗ b)          (the right side from `bar_o`)
+//!
+//! with `ε H_2([x|y] ⊗ b) = Σ_m F(x, y; b → m) · m`. The path weight of the cross term is the unit
+//! part of `F`. Env: `EXACT` (bar_o output), `NORM=nopath`, `SPEC_OUT`, `NULL_OUT`.
+//!
+//! Usage: `exact_w <module>`.
+
+use std::{
+    collections::{BTreeMap, HashSet},
+    sync::Arc,
+};
+
+use algebra::{
+    Algebra, MilnorAlgebra,
+    module::{FDModule, Module},
+};
+use ext::{
+    ext_algebra::tensor_resolution::{Antipode, FullCoproduct},
+    utils::load_module_json,
+};
+use fp::vector::FpVector;
+
+type Cell = (i32, usize);
+/// (x, y, b, m, e): the coefficient of the Milnor basis element `e` in `F(x, y; b → m)`
+type Unk = ((i32, usize), (i32, usize), Cell, Cell, (i32, usize));
+
+fn main() -> anyhow::Result<()> {
+    let name = std::env::args().nth(1).unwrap();
+    let algebra = Arc::new(MilnorAlgebra::new(fp::prime::TWO, false));
+    let m = FDModule::from_json(Arc::clone(&algebra), &load_module_json(&name)?)?;
+    let top = m.max_degree().unwrap();
+    let bot = m.min_degree();
+    algebra.compute_basis(top - bot + 4);
+    m.compute_basis(top + 2);
+    let chi = Antipode::new(Arc::clone(&algebra));
+    let cop = FullCoproduct::new(Arc::clone(&algebra));
+    let cells: Vec<Cell> = (bot..=top).flat_map(|d| (0..m.dimension(d)).map(move |i| (d, i))).collect();
+    let s = |d: i32, i: usize| algebra.basis_element_to_string(d, i);
+    // <c, v · b> for v in degree |c| - |b|
+    let act = |v: &FpVector, b: Cell, c: Cell| -> u32 {
+        let d = c.0 - b.0;
+        if d == 0 {
+            return (b == c && v.entry(0) != 0) as u32;
+        }
+        let mut out = FpVector::new(fp::prime::TWO, m.dimension(c.0));
+        for (i, x) in v.iter_nonzero() {
+            m.act_on_basis(out.as_slice_mut(), x, d, i, b.0, b.1);
+        }
+        out.entry(c.1)
+    };
+    let unit = |d: i32, i: usize| {
+        let mut v = FpVector::new(fp::prime::TWO, algebra.dimension(d));
+        v.set_entry(i, 1);
+        v
+    };
+    let mul = |a: (i32, usize), b: (i32, usize)| {
+        let mut v = FpVector::new(fp::prime::TWO, algebra.dimension(a.0 + b.0));
+        algebra.multiply_basis_elements(v.as_slice_mut(), 1, a.0, a.1, b.0, b.1);
+        v
+    };
+    let exact: HashSet<(String, Cell, Cell)> = std::fs::read_to_string(std::env::var("EXACT")?)?
+        .lines()
+        .skip(1)
+        .map(|l| {
+            let f: Vec<&str> = l.rsplitn(5, ',').collect();
+            let p = |i: usize| f[i].parse::<i32>().unwrap();
+            (f[4].to_string(), (p(3), p(2) as usize), (p(1), p(0) as usize))
+        })
+        .collect();
+
+    // unknowns: F(x, y; b → mm)_e with |e| = |x| + |y| - 1 - (|mm| - |b|) >= 0
+    let maxd = top - bot + 1;
+    let mut unk: BTreeMap<Unk, usize> = BTreeMap::new();
+    let mut list: Vec<Unk> = vec![];
+    for &b in &cells {
+        for &mm in &cells {
+            if mm.0 < b.0 {
+                continue;
+            }
+            for xd in 1..=maxd {
+                for yd in 1..=maxd - xd + 1 {
+                    let ed = xd + yd - 1 - (mm.0 - b.0);
+                    if ed < 0 || b.0 + xd + yd - 1 > top {
+                        continue;
+                    }
+                    for xi in 0..algebra.dimension(xd) {
+                        for yi in 0..algebra.dimension(yd) {
+                            for ei in 0..algebra.dimension(ed) {
+                                let u = ((xd, xi), (yd, yi), b, mm, (ed, ei));
+                                unk.insert(u, list.len());
+                                list.push(u);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let n = list.len();
+    let words = n / 64 + 2;
+    let set = |row: &mut Vec<u64>, k: usize| row[k / 64] ^= 1 << (k % 64);
+    let mut rows: Vec<(Vec<u64>, u32)> = vec![];
+    // ε H_2([x|y] ⊗ b) at c, for an algebra element `pre` applied after: Σ_mm Σ_e (pre·e)·mm at c
+    let add_eps = |row: &mut Vec<u64>, x: (i32, usize), y: (i32, usize), b: Cell, c: Cell, pre: (i32, usize)| {
+        for &mm in &cells {
+            if mm.0 < b.0 || mm.0 > c.0 {
+                continue;
+            }
+            let ed = x.0 + y.0 - 1 - (mm.0 - b.0);
+            if ed < 0 || ed + pre.0 != c.0 - mm.0 {
+                continue;
+            }
+            for ei in 0..algebra.dimension(ed) {
+                let Some(&k) = unk.get(&(x, y, b, mm, (ed, ei))) else { continue };
+                let v = if pre.0 == 0 { unit(ed, ei) } else { mul(pre, (ed, ei)) };
+                if act(&v, mm, c) != 0 {
+                    set(row, k);
+                }
+            }
+        }
+    };
+    for &b in &cells {
+        for &c in &cells {
+            let delta = c.0 - b.0;
+            if delta < 0 {
+                continue;
+            }
+            // triples with |a1| + |a2| + |a3| = delta + 1
+            for d1 in 1..=delta + 1 {
+                for d2 in 1..=delta + 1 - d1 {
+                    let d3 = delta + 1 - d1 - d2;
+                    if d3 < 1 {
+                        continue;
+                    }
+                    for i1 in 0..algebra.dimension(d1) {
+                        for i2 in 0..algebra.dimension(d2) {
+                            for i3 in 0..algebra.dimension(d3) {
+                                let mut row = vec![0u64; words];
+                                // Σ_{(a1)} a1' · ε H_2([a2|a3] ⊗ χ(a1'') b)
+                                for &(ld, li, rd, ri) in cop.terms(d1, i1).iter() {
+                                    for &mm in &cells {
+                                        if mm.0 != b.0 + rd {
+                                            continue;
+                                        }
+                                        let al = if rd == 0 {
+                                            (mm == b) as u32
+                                        } else {
+                                            act(&chi.apply(rd, ri), b, mm)
+                                        };
+                                        if al != 0 {
+                                            add_eps(&mut row, (d2, i2), (d3, i3), mm, c, (ld, li));
+                                        }
+                                    }
+                                }
+                                for (e, _) in mul((d1, i1), (d2, i2)).iter_nonzero() {
+                                    add_eps(&mut row, (d1 + d2, e), (d3, i3), b, c, (0, 0));
+                                }
+                                for (e, _) in mul((d2, i2), (d3, i3)).iter_nonzero() {
+                                    add_eps(&mut row, (d1, i1), (d2 + d3, e), b, c, (0, 0));
+                                }
+                                let lab = format!("{}|{}|{}", s(d1, i1), s(d2, i2), s(d3, i3));
+                                let o = exact.contains(&(lab, b, c)) as u32;
+                                rows.push((row, o));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // NORM=nopath: the unit part vanishes on blocks with c ∉ A·b
+    if std::env::var("NORM").is_ok_and(|v| v == "nopath") {
+        for (k, &(x, y, b, mm, e)) in list.iter().enumerate() {
+            if e.0 != 0 || mm == b {
+                continue;
+            }
+            let delta = mm.0 - b.0;
+            let _ = (x, y);
+            let connected = (0..algebra.dimension(delta)).any(|i| act(&unit(delta, i), b, mm) != 0);
+            if !connected {
+                let mut row = vec![0u64; words];
+                set(&mut row, k);
+                rows.push((row, 0));
+            }
+        }
+    }
+    // NORM=minimal: sseq takes H_2 = 0 on P ⊗ M for the minimal P, i.e. F vanishes on the
+    // minimal resolution's 2-paths g → y → ι
+    if std::env::var("NORM").is_ok_and(|v| v == "minimal") {
+        use ext::chain_complex::{ChainComplex, FreeChainComplex};
+        let res = ext::utils::construct("S_2", None)?;
+        let tmax = maxd + 2;
+        res.compute_through_bidegree(sseq::coordinates::Bidegree::s_t(2, tmax));
+        let p1 = res.module(1);
+        let d2 = res.differential(2);
+        let d1 = res.differential(1);
+        for tg in 2..=tmax {
+            for gi in 0..res.module(2).number_of_gens_in_degree(tg) {
+                let dg = d2.output(tg, gi);
+                // the pairs (a1, a2) over the paths g → y → ι
+                let mut pairs: Vec<((i32, usize), (i32, usize))> = vec![];
+                for (ty, yi) in p1.iter_gens(tg - 1) {
+                    let a = tg - ty;
+                    let off = p1.generator_offset(tg, ty, yi);
+                    let dy = d1.output(ty, yi);
+                    for e1 in 0..algebra.dimension(a) {
+                        if dg.entry(off + e1) == 0 {
+                            continue;
+                        }
+                        for e2 in 0..algebra.dimension(ty) {
+                            if dy.entry(e2) != 0 {
+                                pairs.push(((a, e1), (ty, e2)));
+                            }
+                        }
+                    }
+                }
+                for &b in &cells {
+                    for &mm in &cells {
+                        if mm.0 < b.0 {
+                            continue;
+                        }
+                        let ed = tg - 1 - (mm.0 - b.0);
+                        if ed < 0 {
+                            continue;
+                        }
+                        for ei in 0..algebra.dimension(ed) {
+                            let mut row = vec![0u64; words];
+                            let mut any = false;
+                            for &(x, y) in &pairs {
+                                if let Some(&k) = unk.get(&(x, y, b, mm, (ed, ei))) {
+                                    set(&mut row, k);
+                                    any = true;
+                                }
+                            }
+                            if any {
+                                rows.push((row, 0));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // elimination with rhs in bit n
+    let mut piv: BTreeMap<usize, (Vec<u64>, u32)> = BTreeMap::new();
+    let mut bad = 0;
+    let top_bit = |r: &Vec<u64>| (0..n).rev().find(|&k| r[k / 64] >> (k % 64) & 1 != 0);
+    for (mut r, mut o) in rows {
+        loop {
+            match top_bit(&r) {
+                None => {
+                    bad += o as usize;
+                    break;
+                }
+                Some(p) => match piv.get(&p) {
+                    Some((pr, po)) => {
+                        for w in 0..words {
+                            r[w] ^= pr[w];
+                        }
+                        o ^= po;
+                    }
+                    None => {
+                        piv.insert(p, (r, o));
+                        break;
+                    }
+                },
+            }
+        }
+    }
+    eprintln!(
+        "{name}: {n} unknowns, rank {}, {}",
+        piv.len(),
+        if bad == 0 { "CONSISTENT".to_string() } else { format!("INCONSISTENT ({bad})") }
+    );
+    let solve = |free: Option<usize>| -> Vec<u64> {
+        let mut sol = vec![0u64; words];
+        if let Some(f) = free {
+            sol[f / 64] |= 1 << (f % 64);
+        }
+        for (&p, (r, o)) in &piv {
+            let mut v = if free.is_some() { 0 } else { *o };
+            for k in 0..p {
+                if r[k / 64] >> (k % 64) & 1 != 0 && sol[k / 64] >> (k % 64) & 1 != 0 {
+                    v ^= 1;
+                }
+            }
+            if v != 0 {
+                sol[p / 64] |= 1 << (p % 64);
+            }
+        }
+        sol
+    };
+    // the unit part of F, per block
+    let blocks_of = |sol: &Vec<u64>| -> BTreeMap<(Cell, Cell), Vec<String>> {
+        let mut by: BTreeMap<(Cell, Cell), Vec<String>> = BTreeMap::new();
+        for (k, &(x, y, b, mm, e)) in list.iter().enumerate() {
+            if e.0 == 0 && mm != b && sol[k / 64] >> (k % 64) & 1 != 0 {
+                by.entry((mm, b)).or_default().push(format!("d:{}|{}", s(x.0, x.1), s(y.0, y.1)));
+            }
+        }
+        by
+    };
+    let sol = solve(None);
+    let by = blocks_of(&sol);
+    // degree-keyed spec on stdout (for cocfit), full spec to SPEC_OUT (for module_d2)
+    let mut by_deg: BTreeMap<(i32, i32), Vec<String>> = BTreeMap::new();
+    for &c in &cells {
+        for &b in &cells {
+            if c.0 > b.0 {
+                by_deg.entry((c.0, b.0)).or_default();
+            }
+        }
+    }
+    for ((c, b), v) in &by {
+        by_deg.get_mut(&(c.0, b.0)).unwrap().extend(v.iter().cloned());
+    }
+    for ((cd, bd), v) in &by_deg {
+        println!("{cd}>{bd}:{}", if v.is_empty() { "0".to_string() } else { v.join("+") });
+    }
+    if let Ok(path) = std::env::var("SPEC_OUT") {
+        use std::io::Write;
+        let mut f = std::fs::File::create(path)?;
+        writeln!(f, "module,{name}")?;
+        for &c in &cells {
+            writeln!(f, "block,{},{},{},{},H:1", c.0, c.1, c.0, c.1)?;
+        }
+        for &c in &cells {
+            for &b in &cells {
+                if c.0 <= b.0 {
+                    continue;
+                }
+                let delta = c.0 - b.0;
+                let mut ops = vec![];
+                for e in 0..algebra.dimension(delta) {
+                    if act(&chi.apply(delta, e), b, c) != 0 {
+                        ops.push(format!("H:{}", s(delta, e)));
+                    }
+                }
+                if let Some(v) = by.get(&(c, b)) {
+                    ops.extend(v.iter().cloned());
+                }
+                if !ops.is_empty() {
+                    writeln!(f, "block,{},{},{},{},{}", c.0, c.1, b.0, b.1, ops.join("+"))?;
+                }
+            }
+        }
+    }
+    if let Ok(path) = std::env::var("NULL_OUT") {
+        use std::io::Write;
+        let mut f = std::fs::File::create(path)?;
+        let mut seen = HashSet::new();
+        for free in (0..n).filter(|k| !piv.contains_key(k)) {
+            let by = blocks_of(&solve(Some(free)));
+            if by.is_empty() {
+                continue;
+            }
+            let mut deg: BTreeMap<(i32, i32), Vec<String>> = BTreeMap::new();
+            for ((c, b), v) in by {
+                deg.entry((c.0, b.0)).or_default().extend(v);
+            }
+            let blocks: Vec<String> = deg.iter().map(|((cd, bd), v)| format!("{cd}>{bd}:{}", v.join("+"))).collect();
+            let key = blocks.join("#");
+            if seen.insert(key.clone()) {
+                writeln!(f, "free{free}#{key}")?;
+            }
+        }
+    }
+    Ok(())
+}

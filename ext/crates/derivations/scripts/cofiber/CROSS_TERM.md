@@ -102,3 +102,23 @@ reads of the sphere's `d` and `H`: no lifting, no tensor resolution. `md2check.s
 identical for all ten modules (C2, Cη, Cν, Cσ to stem 38; C2_eta, Joker, C2 ∧ Cη, C2 ∧ Cν to
 stem 66; C2 ∧ Cσ, Cη ∧ Cν to stem 56). Cost to stem 190 (s ≤ 96): about 17 s and 7.7 GB per module,
 mostly loading the sphere's secondary data.
+
+## Deriving the W-equation from sseq's recursion (`bar_o`, `exact_w`)
+
+`twisted_w`'s equation was a guess; it is contradictory for modules where P(3) and Q1 both join two
+cells (Joker, its dual, DA1, J⊗J, Z). The derivation runs sseq's own secondary algorithm on the
+reduced bar resolution `B` of `F_2` (generators `[a1|...|as]`, `d = a1[a2|..] + Σ[..|a_i a_{i+1}|..]`),
+whose 2-paths are the universal d∘d paths. sseq fixes `H_2 = 0`; on `B ⊗ M` that fails (no lift at
+s = 3) exactly for the modules with nonzero W, because the cross term lives at s = 2 there. `H_2` is
+a free choice, `H_2([x|y] ⊗ b) = Σ_m F(x, y; b → m)·([] ⊗ m)` with `F` valued in `A`, subject to the
+s = 3 step lifting:
+
+    Σ_{(a1)} a1'·εH_2([a2|a3] ⊗ χ(a1'')b) + εH_2([a1a2|a3] ⊗ b) + εH_2([a1|a2a3] ⊗ b) = ε A_Q([a1|a2|a3] ⊗ b)
+
+(`ε: Q_0 → M`; the right side from `bar_o`, sseq's actual A-term on `B ⊗ M`). The path weight is
+the unit part of `F`. With `F` in all degrees (`exact_w`) the system is consistent for every module
+tried, including the Joker (was 1 contradiction), J⊗J (was 73) and its dual, and the ground truth
+lies in its solution space for all eleven modules (fitting homogeneous directions). Neither
+normalization tried (`nopath`; `minimal`: F vanishes on the minimal resolution's 2-paths) picks the
+truth's solution for the Joker, its dual, C2 ∧ Cν and C2 ∧ Cσ. Since Ext^{2,1}(J, J) = 0 the s = 3
+condition cannot be all: liftability at s = 4 (through H_3) must constrain H_2 further. Open.

@@ -1,0 +1,118 @@
+//! The A-term defect of the untwisted tensor resolution: for each generator `G = g ⊗ b` of
+//! `Q_s`, `Ω(G) = Φ(A_Q(∂_Q G, c_Q)) − A_P(∂_P g, c_P) ⊗ b`, in `⊕_m P_{s-3} ⊗ m`.
+//!
+//! # Usage
+//! Prompts as `resolve` for the sphere (S_2, save dir, max n, max s); env `PROBE_MODULE`,
+//! `PROBE_MAX_N`, `PROBE_MAX_S`.
+//!
+//! # Output (stdout)
+//! `s,g_deg,g_idx,b_deg,b_idx,m_deg,m_idx,x_deg,x_idx,op` per nonzero term of `Ω`.
+
+use std::sync::Arc;
+
+use algebra::{
+    Algebra,
+    module::{FDModule, Module},
+};
+use ext::{
+    chain_complex::ChainComplex,
+    ext_algebra::tensor_resolution::TensorResolutionSecondary,
+    secondary::{SecondaryLift, SecondaryResolution},
+    utils::{load_module_json, query_module},
+};
+use fp::vector::FpVector;
+use sseq::coordinates::Bidegree;
+
+fn main() -> anyhow::Result<()> {
+    ext::utils::init_logging()?;
+    let res = Arc::new(query_module(Some(algebra::AlgebraType::Milnor), false)?);
+    let name = std::env::var("PROBE_MODULE").unwrap_or_else(|_| "Joker".to_string());
+    let max_n: i32 = std::env::var("PROBE_MAX_N").map_or(20, |v| v.parse().unwrap());
+    let max_s: i32 = std::env::var("PROBE_MAX_S").map_or(8, |v| v.parse().unwrap());
+    let algebra = res.algebra();
+    let t_max = max_n + max_s + 16;
+    algebra.compute_basis(t_max + 1);
+    let m = FDModule::from_json(Arc::clone(&algebra), &load_module_json(&name)?)?;
+    m.compute_basis(t_max);
+    let module = Arc::new(m);
+    let top = module.max_degree().unwrap_or(0);
+
+    let trs = TensorResolutionSecondary::new(Arc::clone(&res), Arc::clone(&module));
+    trs.resolution().set_pstem_max(max_n + top + 2);
+    trs.compute_through_stem(Bidegree::n_s(max_n + top, max_s));
+    let q = trs.resolution();
+    let qsec = trs.secondary();
+
+    let psec = SecondaryResolution::new(Arc::clone(&res));
+    psec.initialize_homotopies();
+    psec.compute_composites();
+
+    println!("s,g_deg,g_idx,b_deg,b_idx,m_deg,m_idx,x_deg,x_idx,op");
+    for s in 3..=max_s {
+        let p_s3 = res.module(s - 3);
+        for n in 0..=max_n {
+            let tg = n + s;
+            if !res.has_computed_bidegree(Bidegree::s_t(s, tg)) {
+                continue;
+            }
+            for (gd, gi) in res.module(s).iter_gens(tg) {
+                if gd != tg {
+                    continue;
+                }
+                // A_P(∂_P g, c_P) in (P_{s-3})_{tg-1}
+                let mut ap = FpVector::new(fp::prime::TWO, p_s3.dimension(tg - 1));
+                psec.homotopy(s - 1).act(
+                    ap.as_slice_mut(),
+                    1,
+                    tg,
+                    res.differential(s).output(tg, gi).as_slice(),
+                    false,
+                );
+                for bd in module.min_degree()..=top {
+                    for bi in 0..module.dimension(bd) {
+                        let t = tg + bd;
+                        let Some(qi) = q.q_gen_index(s, t, tg, gi, bi) else {
+                            continue;
+                        };
+                        if !q.has_computed_bidegree(Bidegree::s_t(s, t))
+                            || qsec.homotopy(s - 1).composites.max_degree() < t - 1
+                        {
+                            continue;
+                        }
+                        let tgt = q.module(s - 3);
+                        let mut aq = FpVector::new(fp::prime::TWO, tgt.dimension(t - 1));
+                        qsec.homotopy(s - 1).act(
+                            aq.as_slice_mut(),
+                            1,
+                            t,
+                            q.differential(s).output(t, qi).as_slice(),
+                            false,
+                        );
+                        let mut omega = q.phi(s - 3, t - 1, aq.as_slice());
+                        omega[(bd - module.min_degree()) as usize][bi].add(&ap, 1);
+                        for (ei, comps) in omega.iter().enumerate() {
+                            let md = module.min_degree() + ei as i32;
+                            for (mi, v) in comps.iter().enumerate() {
+                                for (k, _) in v.iter_nonzero() {
+                                    let og = p_s3.index_to_op_gen(t - 1 - md, k);
+                                    println!(
+                                        "{s},{tg},{gi},{bd},{bi},{md},{mi},{},{},{}",
+                                        og.generator_degree,
+                                        og.generator_index,
+                                        algebra
+                                            .basis_element_to_string(
+                                                og.operation_degree,
+                                                og.operation_index
+                                            )
+                                            .replace(", ", ";")
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
