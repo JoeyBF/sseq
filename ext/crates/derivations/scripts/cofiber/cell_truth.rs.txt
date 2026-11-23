@@ -50,6 +50,10 @@ fn main() -> anyhow::Result<()> {
         trs.resolution().set_pstem_max(pmax);
         trs.compute_through_stem(Bidegree::n_s(max_n + top_deg, max_s));
         eprintln!("{name}: secondary resolution of P (x) M computed");
+        for s in 2..=max_s + 2 {
+            let h = trs.secondary().homotopy(s);
+            eprintln!("homotopy s={s}: next_degree {} composites max {}", h.homotopies.next_degree(), h.composites.max_degree());
+        }
         // the module's action: #act,module,a,b_deg,b_idx,c_deg,c_idx for <c, a b> = 1
         for bd in min_deg..=top_deg {
             for cd in bd + 1..=top_deg {
@@ -139,7 +143,7 @@ fn main() -> anyhow::Result<()> {
                         continue;
                     }
                     let hom = sec.homotopy(s + 2);
-                    if hom.homotopies.next_degree() <= t {
+                    if hom.homotopies.next_degree() <= t + 1 {
                         continue;
                     }
                     let mat = hom.homotopies.hom_k(t);

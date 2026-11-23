@@ -62,6 +62,12 @@ for line in open(cell_p):
         cells |= {b, c}
         U[(n, s, l, c, b)] = mask(vec(r[8]))
 cells = sorted(cells)
+UALT = {}
+if os.environ.get("ALT"):
+    for line in open(os.environ["ALT"]):
+        if line.startswith(module + ","):
+            r = line.strip().split(",", 8)
+            UALT[(int(r[1]), int(r[2]), int(r[3]), (int(r[4]), int(r[5])), (int(r[6]), int(r[7])))] = mask(vec(r[8]))
 
 F = defaultdict(dict)  # (delta, n, s, l) -> {name: mask}
 pat = re.compile(r'^(\d+),(\d+),(\d+),(\d+),(.*),"(\[.*\])"$')
@@ -73,7 +79,7 @@ for line in open(feat_p):
 blocks = [(c, b) for c in cells for b in cells if c[0] > b[0]]
 SHEAR = os.environ.get('SHEAR')  # 'chi' (antipode shear) or 'plain'
 CHI = defaultdict(list)
-for line in open(os.environ.get('CHI', 'chi6.txt')):
+for line in open(os.environ.get('CHI', 'chi10.txt')):
     f = line.strip().split(",")
     CHI[norm(f[2])] = [norm(x) for x in f[3].split()]
 shear = defaultdict(list)  # (c, b) -> H features fixed by the shear
@@ -179,6 +185,8 @@ class Echelon:
 
 
 def fixed_mask(c, b, n, l, s):
+    if os.environ.get("ALT"):
+        return UALT.get((n, s, l, c, b), 0)
     spec = fixed.get((c[0], b[0]))
     if c[0] == b[0]:
         return U.get((n, s, l, c, b), 0)

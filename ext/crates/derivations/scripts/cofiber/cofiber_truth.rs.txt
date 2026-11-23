@@ -84,7 +84,7 @@ fn main() -> anyhow::Result<()> {
                     continue;
                 }
                 let hom = sec.homotopy(s + 2);
-                if hom.homotopies.next_degree() <= b.t() {
+                if hom.homotopies.next_degree() <= b.t() + 1 {
                     continue;
                 }
                 let mat = hom.homotopies.hom_k(b.t());

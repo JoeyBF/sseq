@@ -38,6 +38,17 @@ i.e. the cobar representative of `d₂(h_j) = h0 h_{j-1}²` (the Z/4 Bockstein o
 `CARRY_j + Q_j` satisfies `δW = O` exactly (`cobar.py`); every solution solved from scratch
 (`solveW.py`) gives the same agreement with the stem-58 ground truth (0 failures mod B2 + h_j E2).
 
+## Computing the ground truth cheaply (`tensor_shear_lifting.patch`, against `cofiber-export`)
+
+As a complex of vector spaces `P ⊗ M = ⊕_m P ⊗ m`, and `∂_Q = Ψ (∂_P ⊗ 1) Φ`, so
+`TensorResolution::apply_quasi_inverse` lifts through `∂_Q` with the sphere's own (saved Nassau)
+quasi-inverses: Φ splits the input per basis element of `M`, each piece is lifted in `P`, Ψ
+reassembles. No row reduction of `∂_Q`. Under the P-stem truncation at `n`, generators whose P-stem
+exceeds `n - 2` are untrusted (`ChainComplex::generator_trusted`) and get a zero homotopy.
+`TENSOR_DENSE_QI=1` restores the dense path. Stem 40, seven modules: 6.5 s (dense: 28 s), equal on
+cocycles mod coboundaries; stem 70, four multi-cell modules: 404 s, 2.1 GB (dense: over an hour for
+the first module, unfinished).
+
 ## Multi-cell results (`cell_truth`, `cocfit.py`, cocycles mod coboundaries, χ-twisted δ_Q)
 
 Ground truth to stem 40 (s ≤ 20), tested to stem 36:
@@ -55,3 +66,11 @@ them C2 ∧ Cν is solvable and the Joker has one contradictory equation, from t
 `(Sq1 | · | Sq1)` around `χ(P(3)) = P(3) + Q1`, which carries `x1 → x4` twice: Q reduces that
 coefficient mod 2 before lifting, the P-level A-map does not. That is where M's own Z/4 lift
 (its secondary structure θ) has to enter `O`.
+
+At stem 66 (s ≤ 26, from the stem-70 truth) the derived `W` stays consistent for C2_eta (106
+nonzero cross d₂ mod B), the Joker (109) and C2 ∧ Cη (204). For C2 ∧ Cν the equation leaves a
+visible freedom: `W_{4→1}` may carry the cocycle `[ξ1²|ξ1²]` (h1², no attaching map between those
+cells), and `twisted_w`'s free-variable choice takes it, which fails (82 places). Taking Cν's `W`
+on both ν-blocks, `W_{4→1} = 0` and fitting only `W_{5→0}` is consistent (115). The equation fixes
+`W` up to `Ext^{2,δ+1}` classes per block, which is the secondary-structure freedom θ; the rule
+picking the representative for sseq's split structure is open.
